@@ -31,7 +31,7 @@ LDFLAGS="-Wl,-O3,--as-needed"
 ASFLAGS="-D__AVX__=1 -D__AVX2__=1 -D__FMA__=1"
 </CODE>
 
-for LLVM (use minimal CFLAGS/CXXFLAGS, -O2 -march=native, for the first run and fort he second build, use the following flags as Polly is not usable that way with the default LLVM toolchain):
+for LLVM (use minimal CFLAGS/CXXFLAGS, -O2 -march=native, for the first run and for the second build, use the following flags as Polly is not usable that way with the default LLVM toolchain):
 <CODE>
 export CC=clang
 export CXX=clang++
