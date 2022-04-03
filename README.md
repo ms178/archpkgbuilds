@@ -9,7 +9,7 @@ I've used the following compiler flags in my /etc/makepkg.conf,
 
 for GCC, linux-api-headers and the Linux Kernel:
 <CODE>
-CFLAGS="-O3 -mtune=native -march=native -fno-semantic-interposition -falign-functions=32 -fipa-pta -flive-range-shrinkage -fno-math-errno -fno-trapping-math -mtls-dialect=gnu2 -feliminate-unused-debug-types -floop-nest-optimize -fgraphite-identity -fcf-protection=none -fdevirtualize-at-ltrans -mharden-sls=none"
+CFLAGS="-O3 -mtune=native -march=native -fno-semantic-interposition -falign-functions=32 -fipa-pta -flive-range-shrinkage -fno-math-errno -fno-trapping-math -mtls-dialect=gnu2 -feliminate-unused-debug-types -floop-nest-optimize -fgraphite-identity -fcf-protection=none -fdevirtualize-at-ltrans -mharden-sls=none" [#-mharden-sls=none is only supported from GCC-12 onwards, delete this option for the first run]
 CXXFLAGS="$CFLAGS"
 LDFLAGS="-Wl,-O3,--as-needed,-Bsymbolic-functions" [#add -B/usr/libexec/mold here to use the Mold linker for the first GCC-12 build]
 ASFLAGS="-D__AVX__=1 -D__AVX2__=1 -D__FMA__=1"
