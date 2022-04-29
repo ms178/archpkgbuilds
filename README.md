@@ -5,13 +5,7 @@ The toolchain folder contains everything you need to build an optimized GCC and 
 
 The build order is:
 
-linux-api-headers
-glibc
-binutils
-gcc
-glibc
-binutils
-gcc
+linux-api-headers > glibc > binutils > gcc > glibc > binutils > gcc
 
 If you want to speed up the LLVM build process considerably at the cost of around 25 MB of disk space, you should use ThinLTO (-flto=thin) as that makes multi-threaded linking possible wheras FullLTO is single-threaded.
 
