@@ -1,7 +1,19 @@
 # archpkgbuilds
 This repository is highly experimental and contains a couple of customized PKGBUILDs for Arch Linux. It is meant to demonstrate some ideas for further refinements which could trickle down to the official or respective AUR PKGBUILDS eventually. These PKGBUILDS used to produce working binaries at the time they were uploaded. Nevertheless, you need to take a look at them anyway, the ones with custom patches need manual adjustment to the file path, sorry, I wasn't clever enough to get a relative path to work yet. As packages targeting the head of a development branch are a fast moving target, it can happen that you end up with an unusable toolchain even though everything went smoothly at first. Be prepared to get back to a safe state. I also cannot guarantee that they work everywhere and at any future point in time. I'll try to keep them up to date as long as I use them myself. I cannot make any promises for timely future updates though.
 
-The toolchain folder contains everything you need to build an optimized GCC and LLVM toolchain on Arch Linux. As I took the liberty to slim them down a bit (e.g. language support and some subprojects are missing, but the packages should work for most users), you can take them as a source of inspiration and edit the official PKGBUILDS with some of my alterations if you want to try out some ideas yourself on a productive system. While I did some research on my changes and took some inspiration from Clear Linux and Allen McRae's alternative GCC toolchain for Arch, I know that they work for me and my purposes only, your mileage my vary. As I cut some corners regarding the checks, you should use either less aggressive compiler flags for both toolchains to play it safe or run the checks to verify that your toolchain works as expected. Be aware that a profiledbootstrap with GCC takes a lot of time, even more so when including the checks. For GCC, I strongly advise you to use the new mold linker to speed up the linking process, it really helped. Also the build flags below for LLVM are very slow as FullLTO is used which only supports single-threaded linking. If you want to speed up the LLVM build process at the cost of around 25 MB of disk space, you can use ThinLTO instead (-flto=thin) which speeds up the build times considerably.
+The toolchain folder contains everything you need to build an optimized GCC and LLVM toolchain on Arch Linux. As I took the liberty to slim them down a bit (e.g. language support and some subprojects are missing, but the packages should work for most users), you can take them as a source of inspiration and edit the official PKGBUILDS with some of my alterations if you want to try out some ideas yourself on a productive system. While I did some research on my changes and took some inspiration from Clear Linux and Allen McRae's alternative GCC toolchain for Arch, I know that they work for me and my purposes only, your mileage my vary. As I cut some corners regarding the checks, you should use either less aggressive compiler flags for both toolchains to play it safe or run the checks to verify that your toolchain works as expected. Be aware that a profiledbootstrap with GCC takes a lot of time, even more so when including the checks. For GCC, I strongly advise you to use the new mold linker to speed up the linking process, it really helped.
+
+The build order is:
+
+linux-api-headers
+glibc
+binutils
+gcc
+glibc
+binutils
+gcc
+
+If you want to speed up the LLVM build process considerably at the cost of around 25 MB of disk space, you should use ThinLTO (-flto=thin) as that makes multi-threaded linking possible wheras FullLTO is single-threaded.
 
 Another important change is that the GCC, LLVM and kernel packages are optimized for Intel's Haswell CPU architecture, they also require the latest Glibc and a brand new 5.17 Kernel, if you want to optimize these packages for another CPU architecture or older Kernels, you need to edit the PKGBUILD for GCC, Glibc and the Kernel or the haswell.patch for LLVM. As for any additional patches used, these were mainly taken or adapted from Clear Linux for both toolchains. 
 
