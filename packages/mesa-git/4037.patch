@@ -1,0 +1,253 @@
+From 8bc1638a6dd69f08bff9574f0364f277e0d0a92d Mon Sep 17 00:00:00 2001
+From: Jason Ekstrand <jason@jlekstrand.net>
+Date: Mon, 15 Mar 2021 12:19:54 -0500
+Subject: [PATCH 1/2] vulkan/wsi: Set memory ownership after signaling fences
+ and semaphores
+
+This isn't a functional change today because the set of drivers which
+use set_ownership and those that use signal_fence/semaphore_for_memory
+are mutually exclusive.  It's important for the next commit, though.
+
+Reviewed-by: Lionel Landwerlin <lionel.g.landwerlin@intel.com>
+---
+ src/vulkan/wsi/wsi_common.c | 9 +++------
+ 1 file changed, 3 insertions(+), 6 deletions(-)
+
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index 16f2de219218..e9e8c1369f5a 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -863,12 +863,6 @@ wsi_common_acquire_next_image2(const struct wsi_device *wsi,
+                                                    pImageIndex);
+    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
+       return result;
+-
+-   if (wsi->set_memory_ownership) {
+-      VkDeviceMemory mem = swapchain->get_wsi_image(swapchain, *pImageIndex)->memory;
+-      wsi->set_memory_ownership(swapchain->device, mem, true);
+-   }
+-
+    struct wsi_image *image =
+       swapchain->get_wsi_image(swapchain, *pImageIndex);
+ 
+@@ -888,6 +882,9 @@ wsi_common_acquire_next_image2(const struct wsi_device *wsi,
+          return signal_result;
+    }
+ 
++   if (wsi->set_memory_ownership)
++      wsi->set_memory_ownership(swapchain->device, image->memory, true);
++
+    return result;
+ }
+ 
+-- 
+GitLab
+
+
+From 86b558566443f6632451f45c7886396a06c399b7 Mon Sep 17 00:00:00 2001
+From: Jason Ekstrand <jason@jlekstrand.net>
+Date: Mon, 15 Mar 2021 12:06:53 -0500
+Subject: [PATCH 2/2] vulkan/wsi: Signal semaphores and fences from the dma-buf
+
+Instead of attempting to signal based on the memory object, use the new
+DMA_BUF_IOCTL_EXPORT_SYNC_FILE to get a sync_file for the dma-buf and
+use that to signal the semaphore or fence.  Because this happens before
+we transfer ownership back to the driver, the resulting sync_file should
+only contain dma_fences from the compositor and/or display and shouldn't
+be mixed up with the driver in any way.  This gives us a real semaphore
+and fence (as opposed to the dummy objects we've used int the past)
+without over-synchronization.
+
+Reviewed-by: Simon Ser <contact@emersion.fr>
+---
+ src/vulkan/wsi/wsi_common.c         | 16 +++++
+ src/vulkan/wsi/wsi_common.h         |  2 +
+ src/vulkan/wsi/wsi_common_drm.c     | 94 +++++++++++++++++++++++++++++
+ src/vulkan/wsi/wsi_common_private.h |  6 ++
+ 4 files changed, 118 insertions(+)
+
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index e9e8c1369f5a..0d16bd3bb1f2 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -110,6 +110,8 @@ wsi_device_init(struct wsi_device *wsi,
+    WSI_GET_CB(GetPhysicalDeviceFormatProperties);
+    WSI_GET_CB(GetPhysicalDeviceFormatProperties2KHR);
+    WSI_GET_CB(GetPhysicalDeviceImageFormatProperties2);
++   WSI_GET_CB(ImportFenceFdKHR);
++   WSI_GET_CB(ImportSemaphoreFdKHR);
+    WSI_GET_CB(ResetFences);
+    WSI_GET_CB(QueueSubmit);
+    WSI_GET_CB(WaitForFences);
+@@ -824,6 +826,13 @@ wsi_signal_semaphore_for_image(struct vk_device *device,
+ {
+    VK_FROM_HANDLE(vk_semaphore, semaphore, _semaphore);
+ 
++#ifndef _WIN32
++   VkResult result = wsi_signal_semaphore_for_dma_buf(chain, _semaphore,
++                                                      image->dma_buf_fd);
++   if (result != VK_ERROR_FEATURE_NOT_PRESENT)
++      return result;
++#endif
++
+    if (!chain->wsi->signal_fence_with_memory)
+       return VK_SUCCESS;
+ 
+@@ -841,6 +850,13 @@ wsi_signal_fence_for_image(struct vk_device *device,
+ {
+    VK_FROM_HANDLE(vk_fence, fence, _fence);
+ 
++#ifndef _WIN32
++   VkResult result = wsi_signal_fence_for_dma_buf(chain, _fence,
++                                                  image->dma_buf_fd);
++   if (result != VK_ERROR_FEATURE_NOT_PRESENT)
++      return result;
++#endif
++
+    if (!chain->wsi->signal_fence_with_memory)
+       return VK_SUCCESS;
+ 
+diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
+index f96632308df1..45f92acdb332 100644
+--- a/src/vulkan/wsi/wsi_common.h
++++ b/src/vulkan/wsi/wsi_common.h
+@@ -209,6 +209,8 @@ struct wsi_device {
+    WSI_CB(GetPhysicalDeviceFormatProperties);
+    WSI_CB(GetPhysicalDeviceFormatProperties2KHR);
+    WSI_CB(GetPhysicalDeviceImageFormatProperties2);
++   WSI_CB(ImportFenceFdKHR);
++   WSI_CB(ImportSemaphoreFdKHR);
+    WSI_CB(ResetFences);
+    WSI_CB(QueueSubmit);
+    WSI_CB(WaitForFences);
+diff --git a/src/vulkan/wsi/wsi_common_drm.c b/src/vulkan/wsi/wsi_common_drm.c
+index 2f82963841da..dc4c826e78b7 100644
+--- a/src/vulkan/wsi/wsi_common_drm.c
++++ b/src/vulkan/wsi/wsi_common_drm.c
+@@ -30,12 +30,106 @@
+ #include "vk_util.h"
+ #include "drm-uapi/drm_fourcc.h"
+ 
++#include <errno.h>
++#include <linux/dma-buf.h>
++#include <linux/sync_file.h>
+ #include <time.h>
+ #include <unistd.h>
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <xf86drm.h>
+ 
++struct dma_buf_sync_file_wsi {
++   __u32 flags;
++   __s32 fd;
++};
++
++#define DMA_BUF_IOCTL_EXPORT_SYNC_FILE_WSI   _IOWR(DMA_BUF_BASE, 2, struct dma_buf_sync_file_wsi)
++
++static VkResult
++wsi_dma_buf_export_sync_file(int dma_buf_fd, int *sync_file_fd)
++{
++   /* Don't keep trying an IOCTL that doesn't exist. */
++   static bool no_dma_buf_sync_file = false;
++   if (no_dma_buf_sync_file)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   struct dma_buf_sync_file_wsi dma_buf_sync_file_export = {
++      .flags = DMA_BUF_SYNC_WRITE,
++      .fd = -1,
++   };
++   int ret = drmIoctl(dma_buf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE_WSI,
++                      &dma_buf_sync_file_export);
++   if (ret) {
++      if (errno == ENOTTY) {
++         no_dma_buf_sync_file = true;
++         return VK_ERROR_FEATURE_NOT_PRESENT;
++      } else {
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
++   }
++
++   *sync_file_fd = dma_buf_sync_file_export.fd;
++
++   return VK_SUCCESS;
++}
++
++VkResult
++wsi_signal_semaphore_for_dma_buf(const struct wsi_swapchain *chain,
++                                 VkSemaphore semaphore, int dma_buf_fd)
++{
++   if (chain->wsi->ImportSemaphoreFdKHR == NULL)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   int sync_file_fd = -1;
++   VkResult result = wsi_dma_buf_export_sync_file(dma_buf_fd, &sync_file_fd);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const VkImportSemaphoreFdInfoKHR import_info = {
++      .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
++      .semaphore = semaphore,
++      .flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
++      .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
++
++      /* vkImportSemaphoreFdKHR takes ownership of the fd */
++      .fd = sync_file_fd,
++   };
++   result = chain->wsi->ImportSemaphoreFdKHR(chain->device, &import_info);
++   if (result != VK_SUCCESS)
++      close(sync_file_fd);
++
++   return result;
++}
++
++VkResult
++wsi_signal_fence_for_dma_buf(const struct wsi_swapchain *chain,
++                             VkFence fence, int dma_buf_fd)
++{
++   if (chain->wsi->ImportFenceFdKHR == NULL)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   int sync_file_fd = -1;
++   VkResult result = wsi_dma_buf_export_sync_file(dma_buf_fd, &sync_file_fd);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const VkImportFenceFdInfoKHR import_info = {
++      .sType = VK_STRUCTURE_TYPE_IMPORT_FENCE_FD_INFO_KHR,
++      .fence = fence,
++      .flags = VK_FENCE_IMPORT_TEMPORARY_BIT,
++      .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
++
++      /* vkImportFenceFdKHR takes ownership of the fd */
++      .fd = sync_file_fd,
++   };
++   result = chain->wsi->ImportFenceFdKHR(chain->device, &import_info);
++   if (result != VK_SUCCESS)
++      close(sync_file_fd);
++
++   return result;
++}
++
+ bool
+ wsi_common_drm_devices_equal(int fd_a, int fd_b)
+ {
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+index ae0b196b3aa4..9f745fbd1fe8 100644
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -189,6 +189,12 @@ void
+ wsi_destroy_image(const struct wsi_swapchain *chain,
+                   struct wsi_image *image);
+ 
++VkResult
++wsi_signal_semaphore_for_dma_buf(const struct wsi_swapchain *chain,
++                                 VkSemaphore semaphore, int dma_buf_fd);
++VkResult
++wsi_signal_fence_for_dma_buf(const struct wsi_swapchain *chain,
++                             VkFence fence, int dma_buf_fd);
+ 
+ struct wsi_interface {
+    VkResult (*get_support)(VkIcdSurfaceBase *surface,
+-- 
+GitLab
+

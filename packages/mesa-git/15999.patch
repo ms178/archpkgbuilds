@@ -1,0 +1,347 @@
+From 9ed383b773b723e38885e862834793e08f02e5b4 Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Sun, 17 Apr 2022 21:17:18 +0200
+Subject: [PATCH 1/5] aco/ra: Static assert that changing instruction type to
+ VOP2 is valid.
+
+It's not obvious that this is correct.
+
+Signed-off-by: Georg Lehmann <dadschoorse@gmail.com>
+---
+ src/amd/compiler/aco_register_allocation.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/amd/compiler/aco_register_allocation.cpp b/src/amd/compiler/aco_register_allocation.cpp
+index 108dfd04b8c2..3dab810e8f52 100644
+--- a/src/amd/compiler/aco_register_allocation.cpp
++++ b/src/amd/compiler/aco_register_allocation.cpp
+@@ -2691,6 +2691,10 @@ register_allocation(Program* program, std::vector<IDSet>& live_out_per_block, ra
+                   use_vop2 = false;
+             }
+             if (use_vop2) {
++               static_assert(sizeof(VOP2_instruction) <= sizeof(VOP3_instruction),
++                             "Invalid direct instruction cast.");
++               static_assert(sizeof(VOP2_instruction) <= sizeof(VOP3P_instruction),
++                             "Invalid direct instruction cast.");
+                instr->format = Format::VOP2;
+                switch (instr->opcode) {
+                case aco_opcode::v_mad_f32: instr->opcode = aco_opcode::v_mac_f32; break;
+-- 
+GitLab
+
+
+From b75e2a9349e6b33879bab5d1740fd066108a5fa8 Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Sun, 17 Apr 2022 21:09:15 +0200
+Subject: [PATCH 2/5] aco/ir: Pad SOP2 and SOPC to the same size as SOPK.
+
+Being able to directly cast instructions simplifies optimizations.
+
+Signed-off-by: Georg Lehmann <dadschoorse@gmail.com>
+---
+ src/amd/compiler/aco_ir.h | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/src/amd/compiler/aco_ir.h b/src/amd/compiler/aco_ir.h
+index 3016a753a135..de436591cf1a 100644
+--- a/src/amd/compiler/aco_ir.h
++++ b/src/amd/compiler/aco_ir.h
+@@ -1342,14 +1342,18 @@ struct SOPP_instruction : public Instruction {
+ };
+ static_assert(sizeof(SOPP_instruction) == sizeof(Instruction) + 8, "Unexpected padding");
+ 
+-struct SOPC_instruction : public Instruction {};
+-static_assert(sizeof(SOPC_instruction) == sizeof(Instruction) + 0, "Unexpected padding");
++struct SOPC_instruction : public Instruction {
++   uint32_t padding;
++};
++static_assert(sizeof(SOPC_instruction) == sizeof(Instruction) + 4, "Unexpected padding");
+ 
+ struct SOP1_instruction : public Instruction {};
+ static_assert(sizeof(SOP1_instruction) == sizeof(Instruction) + 0, "Unexpected padding");
+ 
+-struct SOP2_instruction : public Instruction {};
+-static_assert(sizeof(SOP2_instruction) == sizeof(Instruction) + 0, "Unexpected padding");
++struct SOP2_instruction : public Instruction {
++   uint32_t padding;
++};
++static_assert(sizeof(SOP2_instruction) == sizeof(Instruction) + 4, "Unexpected padding");
+ 
+ /**
+  * Scalar Memory Format:
+-- 
+GitLab
+
+
+From 4200710b52ec4d9710b0b74191c5b853635f8f34 Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Sun, 17 Apr 2022 13:17:20 +0200
+Subject: [PATCH 3/5] aco/ra: Optimize some SOP2 instructions with literal to
+ SOPK.
+
+Signed-off-by: Georg Lehmann <dadschoorse@gmail.com>
+---
+ src/amd/compiler/aco_register_allocation.cpp | 57 +++++++++++++++++++-
+ 1 file changed, 56 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/compiler/aco_register_allocation.cpp b/src/amd/compiler/aco_register_allocation.cpp
+index 3dab810e8f52..ca31cdf6e06d 100644
+--- a/src/amd/compiler/aco_register_allocation.cpp
++++ b/src/amd/compiler/aco_register_allocation.cpp
+@@ -2715,6 +2715,60 @@ register_allocation(Program* program, std::vector<IDSet>& live_out_per_block, ra
+             }
+          }
+ 
++         /* try to optimize sop2 with literal source to sopk */
++         if (instr->opcode == aco_opcode::s_add_i32 || instr->opcode == aco_opcode::s_mul_i32 ||
++             instr->opcode == aco_opcode::s_cselect_b32) {
++
++            bool use_sopk = true;
++            uint32_t literal_idx = 0;
++
++            if (instr->opcode != aco_opcode::s_cselect_b32 && instr->operands[1].isLiteral())
++               literal_idx = 1;
++
++            unsigned def_id = instr->definitions[0].tempId();
++            if (ctx.assignments[def_id].affinity) {
++               assignment& affinity = ctx.assignments[ctx.assignments[def_id].affinity];
++               if (affinity.assigned && affinity.reg != instr->operands[!literal_idx].physReg() &&
++                   !register_file.test(affinity.reg, instr->operands[!literal_idx].bytes()))
++                  use_sopk = false;
++            }
++
++            if (!instr->operands[!literal_idx].isTemp() ||
++                !instr->operands[!literal_idx].isKillBeforeDef() ||
++                instr->operands[!literal_idx].getTemp().type() != RegType::sgpr)
++               use_sopk = false;
++
++            if (!instr->operands[literal_idx].isLiteral()) {
++               use_sopk = false;
++            } else {
++               const uint32_t i16_mask = 0xffff8000u;
++               uint32_t value = instr->operands[literal_idx].constantValue();
++               if ((value & i16_mask) && (value & i16_mask) != i16_mask)
++                  use_sopk = false;
++            }
++
++            if (use_sopk) {
++               static_assert(sizeof(SOPK_instruction) <= sizeof(SOP2_instruction),
++                             "Invalid direct instruction cast.");
++               instr->format = Format::SOPK;
++               SOPK_instruction* instr_sopk = &instr->sopk();
++
++               instr_sopk->imm = instr_sopk->operands[literal_idx].constantValue() & 0xffff;
++               if (literal_idx == 0)
++                  std::swap(instr_sopk->operands[0], instr_sopk->operands[1]);
++               if (instr_sopk->operands.size() > 2)
++                  std::swap(instr_sopk->operands[1], instr_sopk->operands[2]);
++               instr_sopk->operands.pop_back();
++
++               switch (instr_sopk->opcode) {
++               case aco_opcode::s_add_i32: instr_sopk->opcode = aco_opcode::s_addk_i32; break;
++               case aco_opcode::s_mul_i32: instr_sopk->opcode = aco_opcode::s_mulk_i32; break;
++               case aco_opcode::s_cselect_b32: instr_sopk->opcode = aco_opcode::s_cmovk_i32; break;
++               default: unreachable("illegal instruction");
++               }
++            }
++         }
++
+          /* Handle definitions which must have the same register as an operand.
+           * We expect that the definition has the same size as the operand, otherwise the new
+           * location for the operand (if it's not killed) might intersect with the old one.
+@@ -2734,7 +2788,8 @@ register_allocation(Program* program, std::vector<IDSet>& live_out_per_block, ra
+                    instr->operands[2].regClass() == v1);
+             instr->definitions[0].setFixed(instr->operands[2].physReg());
+          } else if (instr->opcode == aco_opcode::s_addk_i32 ||
+-                    instr->opcode == aco_opcode::s_mulk_i32) {
++                    instr->opcode == aco_opcode::s_mulk_i32 ||
++                    instr->opcode == aco_opcode::s_cmovk_i32) {
+             assert(instr->definitions[0].bytes() == instr->operands[0].bytes());
+             instr->definitions[0].setFixed(instr->operands[0].physReg());
+          } else if (instr->isMUBUF() && instr->definitions.size() == 1 &&
+-- 
+GitLab
+
+
+From d9e7fe08088e24a246b0ca9ff529f0e7c0bc7576 Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Sun, 17 Apr 2022 14:32:34 +0200
+Subject: [PATCH 4/5] aco/optimizer: Convert s_add_u32 with literals to
+ s_add_i32 if carry is not used.
+
+To allow further optimizations to s_addk_i32.
+
+Signed-off-by: Georg Lehmann <dadschoorse@gmail.com>
+---
+ src/amd/compiler/aco_optimizer.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/amd/compiler/aco_optimizer.cpp b/src/amd/compiler/aco_optimizer.cpp
+index cddc3f194b16..224881dcbd51 100644
+--- a/src/amd/compiler/aco_optimizer.cpp
++++ b/src/amd/compiler/aco_optimizer.cpp
+@@ -4498,6 +4498,11 @@ apply_literals(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+       }
+    }
+ 
++   /* allow more s_addk_i32 optimizations if carry isn't used */
++   if (instr->opcode == aco_opcode::s_add_u32 && ctx.uses[instr->definitions[1].tempId()] == 0 &&
++       (instr->operands[0].isLiteral() || instr->operands[1].isLiteral()))
++      instr->opcode = aco_opcode::s_add_i32;
++
+    ctx.instructions.emplace_back(std::move(instr));
+ }
+ 
+-- 
+GitLab
+
+
+From b7a74360cfe09759a1ab16de2dd8c8c939bbee56 Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Sun, 17 Apr 2022 22:14:30 +0200
+Subject: [PATCH 5/5] aco/optimizer: Optimize SOPC with literal to SOPK.
+
+Signed-off-by: Georg Lehmann <dadschoorse@gmail.com>
+---
+ src/amd/compiler/aco_optimizer.cpp | 118 +++++++++++++++++++++++++++++
+ 1 file changed, 118 insertions(+)
+
+diff --git a/src/amd/compiler/aco_optimizer.cpp b/src/amd/compiler/aco_optimizer.cpp
+index 224881dcbd51..a8fb563665bd 100644
+--- a/src/amd/compiler/aco_optimizer.cpp
++++ b/src/amd/compiler/aco_optimizer.cpp
+@@ -4440,6 +4440,121 @@ select_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+    }
+ }
+ 
++static aco_opcode
++sopk_opcode_for_sopc(aco_opcode opcode)
++{
++#define CTOK(op)                                                                                   \
++   case aco_opcode::s_cmp_##op##_i32: return aco_opcode::s_cmpk_##op##_i32;                        \
++   case aco_opcode::s_cmp_##op##_u32: return aco_opcode::s_cmpk_##op##_u32;
++   switch (opcode) {
++      CTOK(eq)
++      CTOK(lg)
++      CTOK(gt)
++      CTOK(ge)
++      CTOK(lt)
++      CTOK(le)
++   default: return aco_opcode::num_opcodes;
++   }
++#undef CTOK
++}
++
++static bool
++sopc_is_signed(aco_opcode opcode)
++{
++#define SOPC(op)                                                                                   \
++   case aco_opcode::s_cmp_##op##_i32: return true;                                                 \
++   case aco_opcode::s_cmp_##op##_u32: return false;
++   switch (opcode) {
++      SOPC(eq)
++      SOPC(lg)
++      SOPC(gt)
++      SOPC(ge)
++      SOPC(lt)
++      SOPC(le)
++   default: return false;
++   }
++#undef SOPC
++}
++
++static aco_opcode
++sopc_32_inverse(aco_opcode opcode)
++{
++#define SOPC(op1, op2)                                                                             \
++   case aco_opcode::s_cmp_##op1##_i32: return aco_opcode::s_cmp_##op2##_i32;                       \
++   case aco_opcode::s_cmp_##op1##_u32: return aco_opcode::s_cmp_##op2##_u32;
++   switch (opcode) {
++      SOPC(eq, eq)
++      SOPC(lg, lg)
++      SOPC(gt, le)
++      SOPC(ge, lt)
++      SOPC(lt, ge)
++      SOPC(le, gt)
++   default: return aco_opcode::num_opcodes;
++   }
++#undef SOPC
++}
++
++static aco_opcode
++sopc_32_eq_lg_invert_sign(aco_opcode opcode)
++{
++#define SOPC(op)                                                                                   \
++   case aco_opcode::s_cmp_##op##_i32: return aco_opcode::s_cmp_##op##_u32;                         \
++   case aco_opcode::s_cmp_##op##_u32: return aco_opcode::s_cmp_##op##_i32;
++   switch (opcode) {
++      SOPC(eq)
++      SOPC(lg)
++   default: return aco_opcode::num_opcodes;
++   }
++#undef SOPC
++}
++
++static void
++try_convert_sopc_to_sopk(aco_ptr<Instruction>& instr)
++{
++   if (sopk_opcode_for_sopc(instr->opcode) == aco_opcode::num_opcodes)
++      return;
++
++   if (instr->operands[0].isLiteral()) {
++      std::swap(instr->operands[0], instr->operands[1]);
++      instr->opcode = sopc_32_inverse(instr->opcode);
++   }
++
++   if (!instr->operands[1].isLiteral())
++      return;
++
++   if (instr->operands[0].isConstant())
++      return;
++
++   uint32_t value = instr->operands[1].constantValue();
++
++   const uint32_t i16_mask = 0xffff8000u;
++
++   bool value_is_i16 = (value & i16_mask) == 0 || (value & i16_mask) == i16_mask;
++   bool value_is_u16 = !(value & 0xffff0000u);
++
++   aco_opcode inverse_sign = sopc_32_eq_lg_invert_sign(instr->opcode);
++
++   if (!value_is_i16 && sopc_is_signed(instr->opcode)) {
++      if (inverse_sign == aco_opcode::num_opcodes || !value_is_u16)
++         return;
++      instr->opcode = inverse_sign;
++   }
++   if (!value_is_u16 && !sopc_is_signed(instr->opcode)) {
++      if (inverse_sign == aco_opcode::num_opcodes || !value_is_i16)
++         return;
++      instr->opcode = inverse_sign;
++   }
++
++   static_assert(sizeof(SOPK_instruction) <= sizeof(SOPC_instruction),
++                 "Invalid direct instruction cast.");
++   instr->format = Format::SOPK;
++   SOPK_instruction* instr_sopk = &instr->sopk();
++
++   instr_sopk->imm = instr_sopk->operands[1].constantValue() & 0xffff;
++   instr_sopk->opcode = sopk_opcode_for_sopc(instr_sopk->opcode);
++   instr_sopk->operands.pop_back();
++}
++
+ void
+ apply_literals(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+ {
+@@ -4498,6 +4613,9 @@ apply_literals(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+       }
+    }
+ 
++   if (instr->isSOPC())
++      try_convert_sopc_to_sopk(instr);
++
+    /* allow more s_addk_i32 optimizations if carry isn't used */
+    if (instr->opcode == aco_opcode::s_add_u32 && ctx.uses[instr->definitions[1].tempId()] == 0 &&
+        (instr->operands[0].isLiteral() || instr->operands[1].isLiteral()))
+-- 
+GitLab
+
