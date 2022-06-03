@@ -1,0 +1,938 @@
+From d2cdb743aa7e1001568903a7cadd44e5a9564158 Mon Sep 17 00:00:00 2001
+From: Zhihao Cheng <chengzhihao1@huawei.com>
+Date: Tue, 10 May 2022 21:38:05 +0800
+Subject: [PATCH 26/38] =?UTF-8?q?fs-writeback:=20writeback=5Fsb=5Finodes?=
+ =?UTF-8?q?=EF=BC=9ARecalculate=20'wrote'=20according=20skipped=20pages?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Commit 505a666ee3fc ("writeback: plug writeback in wb_writeback() and
+writeback_inodes_wb()") has us holding a plug during wb_writeback, which
+may cause a potential ABBA dead lock:
+
+    wb_writeback		fat_file_fsync
+blk_start_plug(&plug)
+for (;;) {
+  iter i-1: some reqs have been added into plug->mq_list  // LOCK A
+  iter i:
+    progress = __writeback_inodes_wb(wb, work)
+    . writeback_sb_inodes // fat's bdev
+    .   __writeback_single_inode
+    .   . generic_writepages
+    .   .   __block_write_full_page
+    .   .   . . 	    __generic_file_fsync
+    .   .   . . 	      sync_inode_metadata
+    .   .   . . 	        writeback_single_inode
+    .   .   . . 		  __writeback_single_inode
+    .   .   . . 		    fat_write_inode
+    .   .   . . 		      __fat_write_inode
+    .   .   . . 		        sync_dirty_buffer	// fat's bdev
+    .   .   . . 			  lock_buffer(bh)	// LOCK B
+    .   .   . . 			    submit_bh
+    .   .   . . 			      blk_mq_get_tag	// LOCK A
+    .   .   . trylock_buffer(bh)  // LOCK B
+    .   .   .   redirty_page_for_writepage
+    .   .   .     wbc->pages_skipped++
+    .   .   --wbc->nr_to_write
+    .   wrote += write_chunk - wbc.nr_to_write  // wrote > 0
+    .   requeue_inode
+    .     redirty_tail_locked
+    if (progress)    // progress > 0
+      continue;
+  iter i+1:
+      queue_io
+      // similar process with iter i, infinite for-loop !
+}
+blk_finish_plug(&plug)   // flush plug won't be called
+
+Above process triggers a hungtask like:
+[  399.044861] INFO: task bb:2607 blocked for more than 30 seconds.
+[  399.046824]       Not tainted 5.18.0-rc1-00005-gefae4d9eb6a2-dirty
+[  399.051539] task:bb              state:D stack:    0 pid: 2607 ppid:
+2426 flags:0x00004000
+[  399.051556] Call Trace:
+[  399.051570]  __schedule+0x480/0x1050
+[  399.051592]  schedule+0x92/0x1a0
+[  399.051602]  io_schedule+0x22/0x50
+[  399.051613]  blk_mq_get_tag+0x1d3/0x3c0
+[  399.051640]  __blk_mq_alloc_requests+0x21d/0x3f0
+[  399.051657]  blk_mq_submit_bio+0x68d/0xca0
+[  399.051674]  __submit_bio+0x1b5/0x2d0
+[  399.051708]  submit_bio_noacct+0x34e/0x720
+[  399.051718]  submit_bio+0x3b/0x150
+[  399.051725]  submit_bh_wbc+0x161/0x230
+[  399.051734]  __sync_dirty_buffer+0xd1/0x420
+[  399.051744]  sync_dirty_buffer+0x17/0x20
+[  399.051750]  __fat_write_inode+0x289/0x310
+[  399.051766]  fat_write_inode+0x2a/0xa0
+[  399.051783]  __writeback_single_inode+0x53c/0x6f0
+[  399.051795]  writeback_single_inode+0x145/0x200
+[  399.051803]  sync_inode_metadata+0x45/0x70
+[  399.051856]  __generic_file_fsync+0xa3/0x150
+[  399.051880]  fat_file_fsync+0x1d/0x80
+[  399.051895]  vfs_fsync_range+0x40/0xb0
+[  399.051929]  __x64_sys_fsync+0x18/0x30
+
+In my test, 'need_resched()' (which is imported by 590dca3a71 "fs-writeback:
+unplug before cond_resched in writeback_sb_inodes") in function
+'writeback_sb_inodes()' seldom comes true, unless cond_resched() is deleted
+from write_cache_pages().
+
+Fix it by correcting wrote number according number of skipped pages
+in writeback_sb_inodes().
+
+Goto Link to find a reproducer.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=215837
+Cc: stable@vger.kernel.org # v4.3
+Signed-off-by: Zhihao Cheng <chengzhihao1@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20220510133805.1988292-1-chengzhihao1@huawei.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ fs/fs-writeback.c | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/fs/fs-writeback.c b/fs/fs-writeback.c
+index 1fae01962..a1074a26e 100644
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@ -1779,11 +1779,12 @@ static long writeback_sb_inodes(struct super_block *sb,
+ 	};
+ 	unsigned long start_time = jiffies;
+ 	long write_chunk;
+-	long wrote = 0;  /* count both pages and inodes */
++	long total_wrote = 0;  /* count both pages and inodes */
+
+ 	while (!list_empty(&wb->b_io)) {
+ 		struct inode *inode = wb_inode(wb->b_io.prev);
+ 		struct bdi_writeback *tmp_wb;
++		long wrote;
+
+ 		if (inode->i_sb != sb) {
+ 			if (work->sb) {
+@@ -1859,7 +1860,9 @@ static long writeback_sb_inodes(struct super_block *sb,
+
+ 		wbc_detach_inode(&wbc);
+ 		work->nr_pages -= write_chunk - wbc.nr_to_write;
+-		wrote += write_chunk - wbc.nr_to_write;
++		wrote = write_chunk - wbc.nr_to_write - wbc.pages_skipped;
++		wrote = wrote < 0 ? 0 : wrote;
++		total_wrote += wrote;
+
+ 		if (need_resched()) {
+ 			/*
+@@ -1881,7 +1884,7 @@ static long writeback_sb_inodes(struct super_block *sb,
+ 		tmp_wb = inode_to_wb_and_lock_list(inode);
+ 		spin_lock(&inode->i_lock);
+ 		if (!(inode->i_state & I_DIRTY_ALL))
+-			wrote++;
++			total_wrote++;
+ 		requeue_inode(inode, tmp_wb, &wbc);
+ 		inode_sync_complete(inode);
+ 		spin_unlock(&inode->i_lock);
+@@ -1895,14 +1898,14 @@ static long writeback_sb_inodes(struct super_block *sb,
+ 		 * bail out to wb_writeback() often enough to check
+ 		 * background threshold and other termination conditions.
+ 		 */
+-		if (wrote) {
++		if (total_wrote) {
+ 			if (time_is_before_jiffies(start_time + HZ / 10UL))
+ 				break;
+ 			if (work->nr_pages <= 0)
+ 				break;
+ 		}
+ 	}
+-	return wrote;
++	return total_wrote;
+ }
+
+ static long __writeback_inodes_wb(struct bdi_writeback *wb,
+--
+2.36.1.203.g1bcf4f6271
+
+From 23b3db23756074da680ba3d1c52b9d7f0cc27bdc Mon Sep 17 00:00:00 2001
+From: Vincent Ray <vray@kalrayinc.com>
+Date: Wed, 25 May 2022 17:17:46 -0700
+Subject: [PATCH 33/38] net: sched: fixed barrier to prevent skbuff sticking in
+ qdisc backlog
+
+In qdisc_run_begin(), smp_mb__before_atomic() used before test_bit()
+does not provide any ordering guarantee as test_bit() is not an atomic
+operation. This, added to the fact that the spin_trylock() call at
+the beginning of qdisc_run_begin() does not guarantee acquire
+semantics if it does not grab the lock, makes it possible for the
+following statement :
+
+if (test_bit(__QDISC_STATE_MISSED, &qdisc->state))
+
+to be executed before an enqueue operation called before
+qdisc_run_begin().
+
+As a result the following race can happen :
+
+           CPU 1                             CPU 2
+
+      qdisc_run_begin()               qdisc_run_begin() /* true */
+        set(MISSED)                            .
+      /* returns false */                      .
+          .                            /* sees MISSED = 1 */
+          .                            /* so qdisc not empty */
+          .                            __qdisc_run()
+          .                                    .
+          .                              pfifo_fast_dequeue()
+ ----> /* may be done here */                  .
+|         .                                clear(MISSED)
+|         .                                    .
+|         .                                smp_mb __after_atomic();
+|         .                                    .
+|         .                                /* recheck the queue */
+|         .                                /* nothing => exit   */
+|   enqueue(skb1)
+|         .
+|   qdisc_run_begin()
+|         .
+|     spin_trylock() /* fail */
+|         .
+|     smp_mb__before_atomic() /* not enough */
+|         .
+ ---- if (test_bit(MISSED))
+        return false;   /* exit */
+
+In the above scenario, CPU 1 and CPU 2 both try to grab the
+qdisc->seqlock at the same time. Only CPU 2 succeeds and enters the
+bypass code path, where it emits its skb then calls __qdisc_run().
+
+CPU1 fails, sets MISSED and goes down the traditionnal enqueue() +
+dequeue() code path. But when executing qdisc_run_begin() for the
+second time, after enqueuing its skbuff, it sees the MISSED bit still
+set (by itself) and consequently chooses to exit early without setting
+it again nor trying to grab the spinlock again.
+
+Meanwhile CPU2 has seen MISSED = 1, cleared it, checked the queue
+and found it empty, so it returned.
+
+At the end of the sequence, we end up with skb1 enqueued in the
+backlog, both CPUs out of __dev_xmit_skb(), the MISSED bit not set,
+and no __netif_schedule() called made. skb1 will now linger in the
+qdisc until somebody later performs a full __qdisc_run(). Associated
+to the bypass capacity of the qdisc, and the ability of the TCP layer
+to avoid resending packets which it knows are still in the qdisc, this
+can lead to serious traffic "holes" in a TCP connection.
+
+We fix this by replacing the smp_mb__before_atomic() / test_bit() /
+set_bit() / smp_mb__after_atomic() sequence inside qdisc_run_begin()
+by a single test_and_set_bit() call, which is more concise and
+enforces the needed memory barriers.
+
+Fixes: 89837eb4b246 ("net: sched: add barrier to ensure correct ordering for lockless qdisc")
+Signed-off-by: Vincent Ray <vray@kalrayinc.com>
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+---
+ include/net/sch_generic.h | 36 ++++++++----------------------------
+ 1 file changed, 8 insertions(+), 28 deletions(-)
+
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index 9bab396c1..80973ce82 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -187,37 +187,17 @@ static inline bool qdisc_run_begin(struct Qdisc *qdisc)
+ 		if (spin_trylock(&qdisc->seqlock))
+ 			return true;
+
+-		/* Paired with smp_mb__after_atomic() to make sure
+-		 * STATE_MISSED checking is synchronized with clearing
+-		 * in pfifo_fast_dequeue().
++		/* No need to insist if the MISSED flag was already set.
++		 * Note that test_and_set_bit() also gives us memory ordering
++		 * guarantees wrt potential earlier enqueue() and below
++		 * spin_trylock(), both of which are necessary to prevent races
+ 		 */
+-		smp_mb__before_atomic();
+-
+-		/* If the MISSED flag is set, it means other thread has
+-		 * set the MISSED flag before second spin_trylock(), so
+-		 * we can return false here to avoid multi cpus doing
+-		 * the set_bit() and second spin_trylock() concurrently.
+-		 */
+-		if (test_bit(__QDISC_STATE_MISSED, &qdisc->state))
++		if (test_and_set_bit(__QDISC_STATE_MISSED, &qdisc->state))
+ 			return false;
+
+-		/* Set the MISSED flag before the second spin_trylock(),
+-		 * if the second spin_trylock() return false, it means
+-		 * other cpu holding the lock will do dequeuing for us
+-		 * or it will see the MISSED flag set after releasing
+-		 * lock and reschedule the net_tx_action() to do the
+-		 * dequeuing.
+-		 */
+-		set_bit(__QDISC_STATE_MISSED, &qdisc->state);
+-
+-		/* spin_trylock() only has load-acquire semantic, so use
+-		 * smp_mb__after_atomic() to ensure STATE_MISSED is set
+-		 * before doing the second spin_trylock().
+-		 */
+-		smp_mb__after_atomic();
+-
+-		/* Retry again in case other CPU may not see the new flag
+-		 * after it releases the lock at the end of qdisc_run_end().
++		/* Try to take the lock again to make sure that we will either
++		 * grab it or the CPU that still has it will see MISSED set
++		 * when testing it in qdisc_run_end()
+ 		 */
+ 		return spin_trylock(&qdisc->seqlock);
+ 	}
+--
+2.36.1.203.g1bcf4f6271
+
+From 1ad105fd30a0192e2c11b1a77d2d12cb603ce939 Mon Sep 17 00:00:00 2001
+From: Mel Gorman <mgorman@techsingularity.net>
+Date: Thu, 26 May 2022 10:12:10 +0100
+Subject: [PATCH 32/38] mm/page_alloc: Always attempt to allocate at least one
+ page during bulk allocation
+
+Peter Pavlisko reported the following problem on kernel bugzilla 216007.
+
+	When I try to extract an uncompressed tar archive (2.6 milion
+	files, 760.3 GiB in size) on newly created (empty) XFS file system,
+	after first low tens of gigabytes extracted the process hangs in
+	iowait indefinitely. One CPU core is 100% occupied with iowait,
+	the other CPU core is idle (on 2-core Intel Celeron G1610T).
+
+It was bisected to c9fa563072e1 ("xfs: use alloc_pages_bulk_array() for
+buffers") but XFS is only the messenger. The problem is that nothing
+is waking kswapd to reclaim some pages at a time the PCP lists cannot
+be refilled until some reclaim happens. The bulk allocator checks that
+there are some pages in the array and the original intent was that a bulk
+allocator did not necessarily need all the requested pages and it was
+best to return as quickly as possible. This was fine for the first user
+of the API but both NFS and XFS require the requested number of pages
+be available before making progress. Both could be adjusted to call the
+page allocator directly if a bulk allocation fails but it puts a burden on
+users of the API. Adjust the semantics to attempt at least one allocation
+via __alloc_pages() before returning so kswapd is woken if necessary.
+
+It was reported via bugzilla that the patch addressed the problem and
+that the tar extraction completed successfully. This may also address
+bug 215975 but has yet to be confirmed.
+
+BugLink: https://bugzilla.kernel.org/show_bug.cgi?id=216007
+BugLink: https://bugzilla.kernel.org/show_bug.cgi?id=215975
+Fixes: 387ba26fb1cb ("mm/page_alloc: add a bulk page allocator")
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Cc: <stable@vger.kernel.org> # v5.13+
+---
+ mm/page_alloc.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index c3418eb76..81a6943d9 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -5351,8 +5351,8 @@ unsigned long __alloc_pages_bulk(gfp_t gfp, int preferred_nid,
+ 		page = __rmqueue_pcplist(zone, 0, ac.migratetype, alloc_flags,
+ 								pcp, pcp_list);
+ 		if (unlikely(!page)) {
+-			/* Try and get at least one page */
+-			if (!nr_populated)
++			/* Try and allocate at least one page */
++			if (!nr_account)
+ 				goto failed_irq;
+ 			break;
+ 		}
+--
+2.36.1.203.g1bcf4f6271
+
+From e1e9b621edbaf3f06619624d7930a325900d39c8 Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Mon, 16 May 2022 17:24:08 +0200
+Subject: [PATCH 07/38] fm-5.18: port mm kswapd patches
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ include/linux/pageblock-flags.h |  2 +-
+ mm/internal.h                   |  1 +
+ mm/page_alloc.c                 | 49 +++++++++++++++++++++++++--------
+ mm/vmscan.c                     | 20 ++++++++++----
+ 4 files changed, 54 insertions(+), 18 deletions(-)
+
+diff --git a/include/linux/pageblock-flags.h b/include/linux/pageblock-flags.h
+index 83c724805..d2b8741ea 100644
+--- a/include/linux/pageblock-flags.h
++++ b/include/linux/pageblock-flags.h
+@@ -48,7 +48,7 @@ extern unsigned int pageblock_order;
+ #else /* CONFIG_HUGETLB_PAGE */
+
+ /* If huge pages are not used, group by MAX_ORDER_NR_PAGES */
+-#define pageblock_order		(MAX_ORDER-1)
++#define pageblock_order		PAGE_ALLOC_COSTLY_ORDER
+
+ #endif /* CONFIG_HUGETLB_PAGE */
+
+diff --git a/mm/internal.h b/mm/internal.h
+index cf16280ce..b9ad231c8 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -256,6 +256,7 @@ extern void prep_compound_page(struct page *page, unsigned int order);
+ extern void post_alloc_hook(struct page *page, unsigned int order,
+ 					gfp_t gfp_flags);
+ extern int user_min_free_kbytes;
++extern atomic_long_t kswapd_waiters;
+
+ extern void free_unref_page(struct page *page, unsigned int order);
+ extern void free_unref_page_list(struct list_head *list);
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 0e4203838..c3418eb76 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -121,6 +121,8 @@ typedef int __bitwise fpi_t;
+  */
+ #define FPI_SKIP_KASAN_POISON	((__force fpi_t)BIT(2))
+
++atomic_long_t kswapd_waiters = ATOMIC_LONG_INIT(0);
++
+ /* prevent >1 _updater_ of zone percpu pageset ->high and ->batch fields */
+ static DEFINE_MUTEX(pcp_batch_high_lock);
+ #define MIN_PERCPU_PAGELIST_HIGH_FRACTION (8)
+@@ -341,7 +343,7 @@ compound_page_dtor * const compound_page_dtors[NR_COMPOUND_DTORS] = {
+
+ int min_free_kbytes = 1024;
+ int user_min_free_kbytes = -1;
+-int watermark_boost_factor __read_mostly = 15000;
++int watermark_boost_factor __read_mostly;
+ int watermark_scale_factor = 10;
+
+ static unsigned long nr_kernel_pages __initdata;
+@@ -2686,8 +2688,11 @@ static void steal_suitable_fallback(struct zone *zone, struct page *page,
+ 	 * likelihood of future fallbacks. Wake kswapd now as the node
+ 	 * may be balanced overall and kswapd will not wake naturally.
+ 	 */
+-	if (boost_watermark(zone) && (alloc_flags & ALLOC_KSWAPD))
+-		set_bit(ZONE_BOOSTED_WATERMARK, &zone->flags);
++	if (alloc_flags & ALLOC_KSWAPD) {
++		boost_watermark(zone);
++		if (zone->watermark_boost)
++			set_bit(ZONE_BOOSTED_WATERMARK, &zone->flags);
++	}
+
+ 	/* We are not allowed to try stealing from the whole block */
+ 	if (!whole_block)
+@@ -3019,15 +3024,16 @@ __rmqueue(struct zone *zone, unsigned int order, int migratetype,
+ }
+
+ /*
+- * Obtain a specified number of elements from the buddy allocator, all under
+- * a single hold of the lock, for efficiency.  Add them to the supplied list.
+- * Returns the number of new pages which were placed at *list.
++ * Obtain a specified number of elements from the buddy allocator, and relax the
++ * zone lock when needed. Add them to the supplied list. Returns the number of
++ * new pages which were placed at *list.
+  */
+ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+ 			unsigned long count, struct list_head *list,
+ 			int migratetype, unsigned int alloc_flags)
+ {
+-	int i, allocated = 0;
++	const bool can_resched = !preempt_count() && !irqs_disabled();
++	int i, allocated = 0, last_mod = 0;
+
+ 	/*
+ 	 * local_lock_irq held so equivalent to spin_lock_irqsave for
+@@ -3040,6 +3046,18 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+ 		if (unlikely(page == NULL))
+ 			break;
+
++		/* Reschedule and ease the contention on the lock if needed */
++		if (i + 1 < count && ((can_resched && need_resched()) ||
++				      spin_needbreak(&zone->lock))) {
++			__mod_zone_page_state(zone, NR_FREE_PAGES,
++					      -((i + 1 - last_mod) << order));
++			last_mod = i + 1;
++			spin_unlock(&zone->lock);
++			if (can_resched)
++				cond_resched();
++			spin_lock(&zone->lock);
++		}
++
+ 		if (unlikely(check_pcp_refill(page, order)))
+ 			continue;
+
+@@ -3066,7 +3084,7 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+ 	 * on i. Do not confuse with 'allocated' which is the number of
+ 	 * pages added to the pcp list.
+ 	 */
+-	__mod_zone_page_state(zone, NR_FREE_PAGES, -(i << order));
++	__mod_zone_page_state(zone, NR_FREE_PAGES, -((i - last_mod) << order));
+ 	spin_unlock(&zone->lock);
+ 	return allocated;
+ }
+@@ -4897,6 +4915,7 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 	int no_progress_loops;
+ 	unsigned int cpuset_mems_cookie;
+ 	int reserve_flags;
++	bool woke_kswapd = false;
+
+ 	/*
+ 	 * We also sanity check to catch abuse of atomic reserves being used by
+@@ -4943,8 +4962,13 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 			goto nopage;
+ 	}
+
+-	if (alloc_flags & ALLOC_KSWAPD)
++	if (alloc_flags & ALLOC_KSWAPD) {
++		if (!woke_kswapd) {
++			atomic_long_inc(&kswapd_waiters);
++			woke_kswapd = true;
++		}
+ 		wake_all_kswapds(order, gfp_mask, ac);
++	}
+
+ 	/*
+ 	 * The adjusted alloc_flags might result in immediate success, so try
+@@ -5149,9 +5173,12 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 		goto retry;
+ 	}
+ fail:
+-	warn_alloc(gfp_mask, ac->nodemask,
+-			"page allocation failure: order:%u", order);
+ got_pg:
++	if (woke_kswapd)
++		atomic_long_dec(&kswapd_waiters);
++	if (!page)
++		warn_alloc(gfp_mask, ac->nodemask,
++				"page allocation failure: order:%u", order);
+ 	return page;
+ }
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 1678802e0..f8c20a80a 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -3584,7 +3584,7 @@ static unsigned long do_try_to_free_pages(struct zonelist *zonelist,
+ 	return 0;
+ }
+
+-static bool allow_direct_reclaim(pg_data_t *pgdat)
++static bool allow_direct_reclaim(pg_data_t *pgdat, bool using_kswapd)
+ {
+ 	struct zone *zone;
+ 	unsigned long pfmemalloc_reserve = 0;
+@@ -3613,6 +3613,10 @@ static bool allow_direct_reclaim(pg_data_t *pgdat)
+
+ 	wmark_ok = free_pages > pfmemalloc_reserve / 2;
+
++	/* The throttled direct reclaimer is now a kswapd waiter */
++	if (unlikely(!using_kswapd && !wmark_ok))
++		atomic_long_inc(&kswapd_waiters);
++
+ 	/* kswapd must be awake if processes are being throttled */
+ 	if (!wmark_ok && waitqueue_active(&pgdat->kswapd_wait)) {
+ 		if (READ_ONCE(pgdat->kswapd_highest_zoneidx) > ZONE_NORMAL)
+@@ -3678,7 +3682,7 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
+
+ 		/* Throttle based on the first usable node */
+ 		pgdat = zone->zone_pgdat;
+-		if (allow_direct_reclaim(pgdat))
++		if (allow_direct_reclaim(pgdat, gfp_mask & __GFP_KSWAPD_RECLAIM))
+ 			goto out;
+ 		break;
+ 	}
+@@ -3700,11 +3704,14 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
+ 	 */
+ 	if (!(gfp_mask & __GFP_FS))
+ 		wait_event_interruptible_timeout(pgdat->pfmemalloc_wait,
+-			allow_direct_reclaim(pgdat), HZ);
++			allow_direct_reclaim(pgdat, true), HZ);
+ 	else
+ 		/* Throttle until kswapd wakes the process */
+ 		wait_event_killable(zone->zone_pgdat->pfmemalloc_wait,
+-			allow_direct_reclaim(pgdat));
++			allow_direct_reclaim(pgdat, true));
++
++	if (unlikely(!(gfp_mask & __GFP_KSWAPD_RECLAIM)))
++		atomic_long_dec(&kswapd_waiters);
+
+ 	if (fatal_signal_pending(current))
+ 		return true;
+@@ -4197,14 +4204,15 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
+ 		 * able to safely make forward progress. Wake them
+ 		 */
+ 		if (waitqueue_active(&pgdat->pfmemalloc_wait) &&
+-				allow_direct_reclaim(pgdat))
++				allow_direct_reclaim(pgdat, true))
+ 			wake_up_all(&pgdat->pfmemalloc_wait);
+
+ 		/* Check if kswapd should be suspending */
+ 		__fs_reclaim_release(_THIS_IP_);
+ 		ret = try_to_freeze();
+ 		__fs_reclaim_acquire(_THIS_IP_);
+-		if (ret || kthread_should_stop())
++		if (ret || kthread_should_stop() ||
++		    !atomic_long_read(&kswapd_waiters))
+ 			break;
+
+ 		/*
+--
+2.36.1.203.g1bcf4f6271
+
+From 9d04b01b59a11b4e7b06f6150d851576d17b418e Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Mon, 21 Mar 2022 14:08:29 +0100
+Subject: [PATCH 08/38] Disable stack conservation for GCC
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ Makefile | 5 -----
+ 1 file changed, 5 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 2bb168acb..b0883d5cf 100644
+--- a/Makefile
++++ b/Makefile
+@@ -987,11 +987,6 @@ KBUILD_CFLAGS	+= -fno-strict-overflow
+ # Make sure -fstack-check isn't enabled (like gentoo apparently did)
+ KBUILD_CFLAGS  += -fno-stack-check
+
+-# conserve stack if available
+-ifdef CONFIG_CC_IS_GCC
+-KBUILD_CFLAGS   += -fconserve-stack
+-endif
+-
+ # Prohibit date/time macros, which would make the build non-deterministic
+ KBUILD_CFLAGS   += -Werror=date-time
+
+--
+2.36.1.203.g1bcf4f6271
+
+From d4fafb4f04e387a4a49c8c3583fc590c579bfda7 Mon Sep 17 00:00:00 2001
+From: Yury Norov <yury.norov@gmail.com>
+Date: Sun, 30 Jan 2022 17:46:48 -0800
+Subject: [PATCH 10/38] kernel/cpu.c: fix init_cpu_online
+
+cpu_online_mask has an associate counter of online cpus, which must be
+initialized in init_cpu_online().
+
+Fixes: 0c09ab96fc82010 (cpu/hotplug: Cache number of online CPUs)
+Signed-off-by: Yury Norov <yury.norov@gmail.com>
+---
+ kernel/cpu.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/kernel/cpu.c b/kernel/cpu.c
+index d0a9aa0b4..abfa31a85 100644
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@ -2627,6 +2627,7 @@ void init_cpu_possible(const struct cpumask *src)
+ void init_cpu_online(const struct cpumask *src)
+ {
+ 	cpumask_copy(&__cpu_online_mask, src);
++	atomic_set(&__num_online_cpus, cpumask_weight(cpu_online_mask));
+ }
+
+ void set_cpu_online(unsigned int cpu, bool online)
+--
+2.36.1.203.g1bcf4f6271
+
+Link: https://lkml.kernel.org/r/20220414150855.2407137-3-dinechin@redhat.com
+Signed-off-by: Christophe de Dinechin <christophe@dinechin.org>
+Signed-off-by: Christophe de Dinechin <dinechin@redhat.com>
+Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Ben Segall <bsegall@google.com>
+Cc: "Michael S. Tsirkin" <mst@redhat.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Dietmar Eggemann <dietmar.eggemann@arm.com>
+Cc: Vincent Guittot <vincent.guittot@linaro.org>
+Cc: Paolo Bonzini <pbonzini@redhat.com>
+Cc: Daniel Bristot de Oliveira <bristot@redhat.com>
+Cc: Jason Wang <jasowang@redhat.com>
+Cc: Zhen Lei <thunder.leizhen@huawei.com>
+Cc: Juri Lelli <juri.lelli@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ include/linux/nodemask.h | 13 ++++++-------
+ 1 file changed, 6 insertions(+), 7 deletions(-)
+
+diff --git a/include/linux/nodemask.h b/include/linux/nodemask.h
+index 567c3ddba..c6199dbe2 100644
+--- a/include/linux/nodemask.h
++++ b/include/linux/nodemask.h
+@@ -375,14 +375,13 @@ static inline void __nodes_fold(nodemask_t *dstp, const nodemask_t *origp,
+ }
+
+ #if MAX_NUMNODES > 1
+-#define for_each_node_mask(node, mask)			\
+-	for ((node) = first_node(mask);			\
+-		(node) < MAX_NUMNODES;			\
+-		(node) = next_node((node), (mask)))
++#define for_each_node_mask(node, mask)				    \
++	for ((node) = first_node(mask);				    \
++	     (node >= 0) && (node) < MAX_NUMNODES;		    \
++	     (node) = next_node((node), (mask)))
+ #else /* MAX_NUMNODES == 1 */
+-#define for_each_node_mask(node, mask)			\
+-	if (!nodes_empty(mask))				\
+-		for ((node) = 0; (node) < 1; (node)++)
++#define for_each_node_mask(node, mask)                                  \
++	for ((node) = 0; (node) < 1 && !nodes_empty(mask); (node)++)
+ #endif /* MAX_NUMNODES */
+
+ /*
+--
+2.36.1.203.g1bcf4f6271
+
+From c5921e89d8bf7d2c747cf651f476abf168cc8973 Mon Sep 17 00:00:00 2001
+From: Tianchen Ding <dtcccc@linux.alibaba.com>
+Date: Thu, 2 Jun 2022 12:06:44 +0800
+Subject: [PATCH 37/38] sched: Fix the check of nr_running at queue wakelist
+
+The commit 2ebb17717550 ("sched/core: Offload wakee task activation if it
+the wakee is descheduling") checked nr_running <= 1 to avoid task
+stacking when WF_ON_CPU. Consider the order of p->on_rq and p->on_cpu,
+if we have WF_ON_CPU here then we must have !p->on_rq, so the deactivate
+has happened, thus the task being alone on the rq implies nr_running==0.
+Change the check to !cpu_rq(cpu)->nr_running to fix it.
+
+Signed-off-by: Tianchen Ding <dtcccc@linux.alibaba.com>
+---
+ kernel/sched/core.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 96f6a4f3e..e9bc4ce4e 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3833,7 +3833,7 @@ static inline bool ttwu_queue_cond(int cpu, int wake_flags)
+ 	 * the soon-to-be-idle CPU as the current CPU is likely busy.
+ 	 * nr_running is checked to avoid unnecessary task stacking.
+ 	 */
+-	if ((wake_flags & WF_ON_CPU) && cpu_rq(cpu)->nr_running <= 1)
++	if ((wake_flags & WF_ON_CPU) && !cpu_rq(cpu)->nr_running)
+ 		return true;
+
+ 	return false;
+--
+2.36.1.203.g1bcf4f6271
+
+From b22e89f5be4dd1fdd70a84669d8c0c74d3f2d1a2 Mon Sep 17 00:00:00 2001
+From: Tianchen Ding <dtcccc@linux.alibaba.com>
+Date: Thu, 2 Jun 2022 12:06:45 +0800
+Subject: [PATCH 38/38] sched: Remove the limitation of WF_ON_CPU on wakelist
+ if wakee cpu is idle
+
+Wakelist can help avoid cache bouncing and offload the overhead of waker
+cpu. So far, using wakelist within the same llc only happens on
+WF_ON_CPU, and this limitation could be removed to further improve
+wakeup performance.
+
+The commit 518cd6234178 ("sched: Only queue remote wakeups when
+crossing cache boundaries") disabled queuing tasks on wakelist when
+the cpus share llc. This is because, at that time, the scheduler must
+send IPIs to do ttwu_queue_wakelist. Nowadays, ttwu_queue_wakelist also
+supports TIF_POLLING, so this is not a problem now when the wakee cpu is
+in idle polling.
+
+Benefits:
+  Queuing the task on idle cpu can help improving performance on waker cpu
+  and utilization on wakee cpu, and further improve locality because
+  the wakee cpu can handle its own rq. This patch helps improving rt on
+  our real java workloads where wakeup happens frequently.
+
+  Consider the normal condition (CPU0 and CPU1 share same llc)
+  Before this patch:
+
+         CPU0                                       CPU1
+
+    select_task_rq()                                idle
+    rq_lock(CPU1->rq)
+    enqueue_task(CPU1->rq)
+    notify CPU1 (by sending IPI or CPU1 polling)
+
+                                                    resched()
+
+  After this patch:
+
+         CPU0                                       CPU1
+
+    select_task_rq()                                idle
+    add to wakelist of CPU1
+    notify CPU1 (by sending IPI or CPU1 polling)
+
+                                                    rq_lock(CPU1->rq)
+                                                    enqueue_task(CPU1->rq)
+                                                    resched()
+
+  We see CPU0 can finish its work earlier. It only needs to put task to
+  wakelist and return.
+  While CPU1 is idle, so let itself handle its own runqueue data.
+
+This patch brings no difference about IPI.
+  This patch only takes effect when the wakee cpu is:
+  1) idle polling
+  2) idle not polling
+
+  For 1), there will be no IPI with or without this patch.
+
+  For 2), there will always be an IPI before or after this patch.
+  Before this patch: waker cpu will enqueue task and check preempt. Since
+  "idle" will be sure to be preempted, waker cpu must send a resched IPI.
+  After this patch: waker cpu will put the task to the wakelist of wakee
+  cpu, and send an IPI.
+
+Benchmark:
+We've tested schbench, unixbench, and hachbench on both x86 and arm64.
+
+On x86 (Intel Xeon Platinum 8269CY):
+  schbench -m 2 -t 8
+
+    Latency percentiles (usec)             before         after
+        50.0000th:                            8             6
+        75.0000th:                           10             7
+        90.0000th:                           11             8
+        95.0000th:                           12             8
+        *99.0000th:                          15            10
+        99.5000th:                           16            11
+        99.9000th:                           20            14
+
+  Unixbench with full threads (104)
+                                            before        after
+    Dhrystone 2 using register variables  3004614211    3004725417   0.00%
+    Double-Precision Whetstone              616764.3      617355.9   0.10%
+    Execl Throughput                         26449.2       26468.6   0.07%
+    File Copy 1024 bufsize 2000 maxblocks   832763.3      824099.4  -1.04%
+    File Copy 256 bufsize 500 maxblocks     210718.7      211775.1   0.50%
+    File Copy 4096 bufsize 8000 maxblocks  2393528.2     2398755.4   0.22%
+    Pipe Throughput                      144559102.7   144605068.8   0.03%
+    Pipe-based Context Switching           3192192.9     3571238.1  11.87%
+    Process Creation                         95270.5       98865.4   3.77%
+    Shell Scripts (1 concurrent)            113780.6      113924.7   0.13%
+    Shell Scripts (8 concurrent)             15557.2       15508.9  -0.31%
+    System Call Overhead                   5359984.1     5356711.4  -0.06%
+
+  hackbench -g 1 -l 100000
+                                            before        after
+    Time                                     3.246        2.251
+
+On arm64 (Ampere Altra):
+  schbench -m 2 -t 8
+
+    Latency percentiles (usec)             before         after
+        50.0000th:                           14            10
+        75.0000th:                           19            14
+        90.0000th:                           22            16
+        95.0000th:                           23            16
+        *99.0000th:                          24            17
+        99.5000th:                           24            17
+        99.9000th:                           31            25
+
+  Unixbench with full threads (80)
+                                            before        after
+    Dhrystone 2 using register variables  3536787968    3536476016  -0.01%
+    Double-Precision Whetstone              629370.6      629333.3  -0.01%
+    Execl Throughput                         66615.9       66288.8  -0.49%
+    File Copy 1024 bufsize 2000 maxblocks  1038402.1     1050181.2   1.13%
+    File Copy 256 bufsize 500 maxblocks     311054.2      310317.2  -0.24%
+    File Copy 4096 bufsize 8000 maxblocks  2276795.6       2297703   0.92%
+    Pipe Throughput                      130409359.9   130390848.7  -0.01%
+    Pipe-based Context Switching           3148440.7     3383705.1   7.47%
+    Process Creation                        111574.3      119728.6   7.31%
+    Shell Scripts (1 concurrent)            122980.7      122657.4  -0.26%
+    Shell Scripts (8 concurrent)             17482.8       17476.8  -0.03%
+    System Call Overhead                   4424103.4     4430062.6   0.13%
+
+  hackbench -g 1 -l 100000
+                                            before        after
+    Time                                     4.217        2.916
+
+Our patch has improvement on schbench, hackbench
+and Pipe-based Context Switching of unixbench
+when there exists idle cpus,
+and no obvious regression on other tests of unixbench.
+This can help improve rt in scenes where wakeup happens frequently.
+
+Signed-off-by: Tianchen Ding <dtcccc@linux.alibaba.com>
+---
+ kernel/sched/core.c  | 27 ++++++++++++++++-----------
+ kernel/sched/sched.h |  1 -
+ 2 files changed, 16 insertions(+), 12 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index e9bc4ce4e..6257ecdbe 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3811,7 +3811,7 @@ bool cpus_share_cache(int this_cpu, int that_cpu)
+ 	return per_cpu(sd_llc_id, this_cpu) == per_cpu(sd_llc_id, that_cpu);
+ }
+
+-static inline bool ttwu_queue_cond(int cpu, int wake_flags)
++static inline bool ttwu_queue_cond(int cpu)
+ {
+ 	/*
+ 	 * Do not complicate things with the async wake_list while the CPU is
+@@ -3827,13 +3827,21 @@ static inline bool ttwu_queue_cond(int cpu, int wake_flags)
+ 	if (!cpus_share_cache(smp_processor_id(), cpu))
+ 		return true;
+
++	if (cpu == smp_processor_id())
++		return false;
++
+ 	/*
+-	 * If the task is descheduling and the only running task on the
+-	 * CPU then use the wakelist to offload the task activation to
+-	 * the soon-to-be-idle CPU as the current CPU is likely busy.
+-	 * nr_running is checked to avoid unnecessary task stacking.
++	 * If the wakee cpu is idle, or the task is descheduling and the
++	 * only running task on the CPU, then use the wakelist to offload
++	 * the task activation to the idle (or soon-to-be-idle) CPU as
++	 * the current CPU is likely busy. nr_running is checked to
++	 * avoid unnecessary task stacking.
++	 *
++	 * Note that we can only get here with (wakee) p->on_rq=0,
++	 * p->on_cpu can be whatever, we've done the dequeue, so
++	 * the wakee has been accounted out of ->nr_running.
+ 	 */
+-	if ((wake_flags & WF_ON_CPU) && !cpu_rq(cpu)->nr_running)
++	if (!cpu_rq(cpu)->nr_running)
+ 		return true;
+
+ 	return false;
+@@ -3841,10 +3849,7 @@ static inline bool ttwu_queue_cond(int cpu, int wake_flags)
+
+ static bool ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
+ {
+-	if (sched_feat(TTWU_QUEUE) && ttwu_queue_cond(cpu, wake_flags)) {
+-		if (WARN_ON_ONCE(cpu == smp_processor_id()))
+-			return false;
+-
++	if (sched_feat(TTWU_QUEUE) && ttwu_queue_cond(cpu)) {
+ 		sched_clock_cpu(cpu); /* Sync clocks across CPUs */
+ 		__ttwu_queue_wakelist(p, cpu, wake_flags);
+ 		return true;
+@@ -4166,7 +4171,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
+ 	 * scheduling.
+ 	 */
+ 	if (smp_load_acquire(&p->on_cpu) &&
+-	    ttwu_queue_wakelist(p, task_cpu(p), wake_flags | WF_ON_CPU))
++	    ttwu_queue_wakelist(p, task_cpu(p), wake_flags))
+ 		goto unlock;
+
+ 	/*
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 1234589ac..1d1c78841 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -2037,7 +2037,6 @@ static inline int task_on_rq_migrating(struct task_struct *p)
+
+ #define WF_SYNC     0x10 /* Waker goes to sleep after wakeup */
+ #define WF_MIGRATED 0x20 /* Internal use, task got migrated */
+-#define WF_ON_CPU   0x40 /* Wakee is on_cpu */
+
+ #ifdef CONFIG_SMP
+ static_assert(WF_EXEC == SD_BALANCE_EXEC);
+--
+2.36.1.203.g1bcf4f6271
