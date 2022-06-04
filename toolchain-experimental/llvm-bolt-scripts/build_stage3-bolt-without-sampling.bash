@@ -28,6 +28,7 @@ echo "== Build with stage2-prof-use-lto instrumented clang -- $CPATH"
 cmake -G Ninja ../llvm-project/llvm \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLVM_HOST_TRIPLE=x86_64-unknown-linux \
+    -DCMAKE_PREFIX_PATH=${TOPLEV}/stage3-without-sampling/lib/cmake/llvm \
     -DLLVM_BUILD_RUNTIME=ON \
     -DLLVM_POLLY_LINK_INTO_TOOLS=ON \
     -DLLVM_ENABLE_RUNTIMES="openmp" \
