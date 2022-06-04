@@ -6,11 +6,12 @@ The full_workflow.bash will autodetect if your CPU supports special profiling fe
 
 ## How to build
 
-    Download this repository via the main Github page under >Code >Download ZIP and extract the ZIP archive to a location on your disk where you want it, delete the stuff you don't want
+    Download this repository via the main Github page under >Code >Download ZIP and extract the ZIP archive
+    delete the other stuff of this repo in the directory tree you don't want
     locate the llvm-bolt-scripts directory
     execute the bash script with ./full_workflow.bash
 
-You will get a toolchain directory in your home directory with the build compilers. If something went wrong during the build process, simply delete some or all of folders there. The script is clever enough to detect the already built stage1 compiler if you want to keep that.
+You will gain a toolchain directory in your home directory with several build compilers. If something went wrong during the build process, simply delete some or all of these folders. The script is clever enough to detect the already built stage1 compiler if you want to keep that to safe some time.
 
 This sequence will give you (hopefully) a faster LLVM toolchain.
 Technologies used:
