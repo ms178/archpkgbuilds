@@ -1,13 +1,12 @@
 # How does it work
 
-This set of scripts creates a 60% faster LLVM toolchain that can be customly
-trained to any project.
+This set of scripts (credits go to @JonasToth and @ptr1337) that create a 60% faster LLVM toolchain that can be customly trained to any project.
 
 The full_workflow.bash will autodetect, if your machine supports LBR or not and choose the correct script which suits to your hardware.
 
 ## How to build
 
-    git clone https://github.com/ptr1337/llvm-bolt-scripts.git
+    git clone https://github.com/ms178/archpkgbuilds/toolchain-experimental/llvm-bolt-scripts/llvm-bolt-scripts.git
     cd llvm-bolt-scripts
     ./full_workflow.bash
 
@@ -18,8 +17,7 @@ Technologies used:
 -   Binary Instrumentation and Profile-Guided-Optimization (PGO)
 -   perf-measurement and branch-sampling/profiling and final binary reordering (BOLT)
 
-The goal of the techniques is to utilize the CPU black magic better and layout
-the code in a way, that allows faster execution.
+The goal of the techniques is to utilize the CPU better and layout the code in a way, that allows faster execution.
 
 Measure performance gains and evaluate if its worth the hazzle :)
 You can experiment with technologies, maybe `ThinLTO` is better then `FullLTO`,
