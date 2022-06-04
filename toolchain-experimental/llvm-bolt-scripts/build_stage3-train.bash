@@ -22,6 +22,7 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -DCMAKE_CXX_COMPILER=${CPATH}/clang++ \
     -DLLVM_USE_LINKER=${CPATH}/ld.lld \
     -DCMAKE_RANLIB=${CPATH}/llvm-ranlib \
+    -DCMAKE_PREFIX_PATH=${TOPLEV}/stage1/lib/cmake/llvm \
     -DLLVM_HOST_TRIPLE=x86_64-unknown-linux \
     -DLLVM_BUILD_RUNTIME=ON \
     -DLLVM_POLLY_LINK_INTO_TOOLS=ON \

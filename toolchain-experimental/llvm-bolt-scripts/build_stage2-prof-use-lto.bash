@@ -37,7 +37,7 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -D CLANG_LINK_CLANG_DYLIB=ON \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLVM_ENABLE_WARNINGS=OFF \
-    -DCMAKE_PREFIX_PATH=${TOPLEV}/stage2-prof-use-lto/lib/cmake/llvm \
+    -DCMAKE_PREFIX_PATH=${TOPLEV}/stage1/lib/cmake/llvm \
     -DCMAKE_INSTALL_PREFIX=${TOPLEV}/stage2-prof-use-lto/install \
     -DLLVM_PROFDATA_FILE=${TOPLEV}/stage2-prof-gen/profiles/clang.profdata \
     -DLLVM_ENABLE_LTO=Thin \

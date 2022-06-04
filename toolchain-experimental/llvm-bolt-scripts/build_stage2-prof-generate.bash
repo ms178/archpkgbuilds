@@ -27,7 +27,7 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -DCMAKE_RANLIB=${CPATH}/llvm-ranlib \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLVM_ENABLE_WARNINGS=OFF \
-    -DCMAKE_PREFIX_PATH=${TOPLEV}/stage2-prof-gen/lib/cmake/llvm \
+    -DCMAKE_PREFIX_PATH=${TOPLEV}/stage1/lib/cmake/llvm \
     -DCMAKE_INSTALL_PREFIX=${TOPLEV}/stage2-prof-gen/install \
     -DLLVM_BUILD_INSTRUMENTED=IR \
     -DLLVM_LINK_LLVM_DYLIB=ON \

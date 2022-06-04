@@ -25,6 +25,7 @@ cmake -G Ninja \
     -DLLVM_TABLEGEN=${CPATH}/llvm-tblgen \
     -DCMAKE_RANLIB=${CPATH}/llvm-ranlib \
     -DLLVM_HOST_TRIPLE=x86_64-unknown-linux \
+    -DCMAKE_PREFIX_PATH=${TOPLEV}/stage1/lib/cmake/llvm \
     -DLLVM_BUILD_RUNTIME=ON \
     -DLLVM_POLLY_LINK_INTO_TOOLS=ON \
     -DLLVM_ENABLE_RUNTIMES="openmp" \
