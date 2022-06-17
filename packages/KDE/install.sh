@@ -1,0 +1,95 @@
+#!/bin/sh
+# You need to adjust the path in the following line where you placed all of these packages and make this script executable first with "chmod +x", then execute with "./install.sh". Beware of the dangers, the build order is important but not taken into account yet. Hence it will only work if you already have these packages installed manually in the correct order at least once before.
+cd /home/marcus/Downloads/KDE
+for pkg in attica-git \
+baloo-git \
+breeze-git \
+breeze-icons-git \
+extra-cmake-modules-git \
+frameworkintegration-git \
+kactivities-git \
+kactivities-stats-git \
+kactivitymanagerd-git \
+karchive-git \
+kauth-git \
+kbookmarks-git \
+kcmutils-git \
+kcodecs-git \
+kcompletion-git \
+kconfig-git \
+kconfigwidgets-git \
+kcoreaddons-git \
+kcrash-git \
+kdbusaddons-git \
+kde-cli-tools-git \
+kdeclarative-git \
+kdecoration-git \
+kded-git \
+kdelibs4support-git \
+kdesignerplugin-git \
+kdesu-git \
+kdoctools-git \
+kemoticons-git \
+kfilemetadata-git \
+kglobalaccel-git \
+kguiaddons-git \
+kholidays-git \
+ki18n-git \
+kiconthemes-git \
+kidletime-git \
+kinit-git \
+kio-git \
+kirigami2-git \
+kitemmodels-git \
+kitemviews-git \
+kjobwidgets-git \
+kmenuedit-git \
+knewstuff-git \
+knotifications-git \
+knotifyconfig-git \
+kpackage-git \
+kparts-git \
+kpeople-git \
+kpty-git \
+kquickcharts-git \
+krunner-git \
+kscreenlocker-git \
+kservice-git \
+ktexteditor-git \
+ktextwidgets-git \
+kunitconversion-git \
+kuserfeedback-git \
+kwallet-git \
+kwayland-git \
+kwayland-server-git \
+kwidgetsaddons-git \
+kwindowsystem-git \
+kxmlgui-git \
+layer-shell-qt-git \
+libkscreen-git \
+libksysguard-git \
+libqaccessibilityclient-git \
+milou-git \
+networkmanager-qt-git \
+phonon-git \
+plasma-desktop-git \
+plasma-framework-git \
+plasma-integration-git \
+plasma-wayland-protocols-git \
+plasma-workspace-git \
+polkit-kde-agent-git \
+polkit-qt5-git \
+prison-git \
+qqc2-desktop-style-git \
+solid-git \
+sonnet-git \
+syndication-git \
+syntax-highlighting-git \
+systemsettings-git \
+threadweaver-git \
+; do
+  cd $pkg
+  rm -f *.zst
+  makepkg -si --cleanbuild --skippgpcheck --skipchecksums --noconfirm
+  cd ..
+done
