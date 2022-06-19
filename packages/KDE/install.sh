@@ -92,6 +92,9 @@ plasma-disks-git \
 modemmanager-qt-git \
 plasma-nm-git \
 plasma-pa-git \
+dolphin-git \
+kate-git \
+konsole-git \
 ; do
   cd $pkg
   rm -f *.zst
