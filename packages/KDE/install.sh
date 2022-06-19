@@ -87,6 +87,11 @@ syndication-git \
 syntax-highlighting-git \
 systemsettings-git \
 threadweaver-git \
+qca-qt5-git \
+plasma-disks-git \
+modemmanager-qt-git \
+plasma-nm-git \
+plasma-pa-git \
 ; do
   cd $pkg
   rm -f *.zst
