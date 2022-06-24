@@ -539,117 +539,249 @@ index 1234589ac..1d1c78841 100644
 --
 2.36.1.203.g1bcf4f6271
 
-From 8bcf0ef0e7710c3c39073d2af8331d6c7c0c6c7b Mon Sep 17 00:00:00 2001
-From: Peter Zijlstra <peterz@infradead.org>
-Date: Tue, 7 Jun 2022 22:41:55 +0200
-Subject: [PATCH 34/34] sched: Fix balance_push() vs __sched_setscheduler()
+We use cpu_cgrp_subsys->fork() to set task group for the new fair task
+in cgroup_post_fork().
 
-The purpose of balance_push() is to act as a filter on task selection
-in the case of CPU hotplug, specifically when taking the CPU out.
+Since commit b1e8206582f9 ("sched: Fix yet more sched_fork() races")
+has already set task group for the new fair task in sched_cgroup_fork(),
+so cpu_cgrp_subsys->fork() can be removed.
 
-It does this by (ab)using the balance callback infrastructure, with
-the express purpose of keeping all the unlikely/odd cases in a single
-place.
+  cgroup_can_fork()	--> pin parent's sched_task_group
+  sched_cgroup_fork()
+    __set_task_cpu	--> set task group
+  cgroup_post_fork()
+    ss->fork() := cpu_cgroup_fork()	--> set again
 
-In order to serve its purpose, the balance_push_callback needs to be
-(exclusively) on the callback list at all times (noting that the
-callback always places itself back on the list the moment it runs,
-also noting that when the CPU goes down, regular balancing concerns
-are moot, so ignoring them is fine).
+After this change, task_change_group_fair() only need to care about
+task cgroup migration, make the code much simplier.
 
-And here-in lies the problem, __sched_setscheduler()'s use of
-splice_balance_callbacks() takes the callbacks off the list across a
-lock-break, making it possible for, an interleaving, __schedule() to
-see an empty list and not get filtered.
+This patch move the task se depth setting to set_task_rq(), which
+is called when task moves across CPUs/groups, is a better place than
+attach_entity_cfs_rq(). The latter is also used when change task's
+sched_class, in which case the group/depth doesn't change actually.
 
-Fixes: ae7927023243 ("sched: Optimize finish_lock_switch()")
-Reported-by: Jing-Ting Wu <jing-ting.wu@mediatek.com>
-Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
-Tested-by: Jing-Ting Wu <jing-ting.wu@mediatek.com>
-Link: https://lkml.kernel.org/r/20220519134706.GH2578@worktop.programming.kicks-ass.net
+Signed-off-by: Chengming Zhou <zhouchengming@xxxxxxxxxxxxx>
 ---
- kernel/sched/core.c  | 36 +++++++++++++++++++++++++++++++++---
- kernel/sched/sched.h |  5 +++++
- 2 files changed, 38 insertions(+), 3 deletions(-)
+ kernel/sched/core.c  | 27 ++++-----------------------
+ kernel/sched/fair.c  | 31 +------------------------------
+ kernel/sched/sched.h |  6 ++----
+ 3 files changed, 7 insertions(+), 57 deletions(-)
 
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index 5536e4acb..89255d252 100644
+index c16f8cc5de08..f44bc5b889ab 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
-@@ -4760,25 +4760,55 @@ static void do_balance_callbacks(struct rq *rq, struct callback_head *head)
-
- static void balance_push(struct rq *rq);
-
-+/*
-+ * balance_push_callback is a right abuse of the callback interface and plays
-+ * by significantly different rules.
-+ *
-+ * Where the normal balance_callback's purpose is to be ran in the same context
-+ * that queued it (only later, when it's safe to drop rq->lock again),
-+ * balance_push_callback is specifically targeted at __schedule().
-+ *
-+ * This abuse is tolerated because it places all the unlikely/odd cases behind
-+ * a single test, namely: rq->balance_callback == NULL.
-+ */
- struct callback_head balance_push_callback = {
- 	.next = NULL,
- 	.func = (void (*)(struct callback_head *))balance_push,
- };
-
--static inline struct callback_head *splice_balance_callbacks(struct rq *rq)
-+static inline struct callback_head *
-+__splice_balance_callbacks(struct rq *rq, bool split)
- {
- 	struct callback_head *head = rq->balance_callback;
-
-+	if (likely(!head))
-+		return NULL;
-+
- 	lockdep_assert_rq_held(rq);
--	if (head)
-+	/*
-+	 * Must not take balance_push_callback off the list when
-+	 * splice_balance_callbacks() and balance_callbacks() are not
-+	 * in the same rq->lock section.
-+	 *
-+	 * In that case it would be possible for __schedule() to interleave
-+	 * and observe the list empty.
-+	 */
-+	if (split && head == &balance_push_callback)
-+		head = NULL;
-+	else
- 		rq->balance_callback = NULL;
-
- 	return head;
+@@ -481,8 +481,7 @@ sched_core_dequeue(struct rq *rq, struct task_struct *p, int flags) { }
+  *				p->se.load, p->rt_priority,
+  *				p->dl.dl_{runtime, deadline, period, flags, bw, density}
+  *  - sched_setnuma():		p->numa_preferred_nid
+- *  - sched_move_task()/
+- *    cpu_cgroup_fork():	p->sched_task_group
++ *  - sched_move_task():	p->sched_task_group
+  *  - uclamp_update_active()	p->uclamp*
+  *
+  * p->state <- TASK_*:
+@@ -10098,7 +10097,7 @@ void sched_release_group(struct task_group *tg)
+ 	spin_unlock_irqrestore(&task_group_lock, flags);
  }
 
-+static inline struct callback_head *splice_balance_callbacks(struct rq *rq)
-+{
-+	return __splice_balance_callbacks(rq, true);
-+}
-+
- static void __balance_callbacks(struct rq *rq)
+-static void sched_change_group(struct task_struct *tsk, int type)
++static void sched_change_group(struct task_struct *tsk)
  {
--	do_balance_callbacks(rq, splice_balance_callbacks(rq));
-+	do_balance_callbacks(rq, __splice_balance_callbacks(rq, false));
+ 	struct task_group *tg;
+
+@@ -10114,7 +10113,7 @@ static void sched_change_group(struct task_struct *tsk, int type)
+
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	if (tsk->sched_class->task_change_group)
+-		tsk->sched_class->task_change_group(tsk, type);
++		tsk->sched_class->task_change_group(tsk);
+ 	else
+ #endif
+ 		set_task_rq(tsk, task_cpu(tsk));
+@@ -10145,7 +10144,7 @@ void sched_move_task(struct task_struct *tsk)
+ 	if (running)
+ 		put_prev_task(rq, tsk);
+
+-	sched_change_group(tsk, TASK_MOVE_GROUP);
++	sched_change_group(tsk);
+
+ 	if (queued)
+ 		enqueue_task(rq, tsk, queue_flags);
+@@ -10223,23 +10222,6 @@ static void cpu_cgroup_css_free(struct cgroup_subsys_state *css)
+ 	sched_unregister_group(tg);
  }
 
- static inline void balance_callbacks(struct rq *rq, struct callback_head *head)
+-/*
+- * This is called before wake_up_new_task(), therefore we really only
+- * have to set its group bits, all the other stuff does not apply.
+- */
+-static void cpu_cgroup_fork(struct task_struct *task)
+-{
+-	struct rq_flags rf;
+-	struct rq *rq;
+-
+-	rq = task_rq_lock(task, &rf);
+-
+-	update_rq_clock(rq);
+-	sched_change_group(task, TASK_SET_GROUP);
+-
+-	task_rq_unlock(rq, task, &rf);
+-}
+-
+ static int cpu_cgroup_can_attach(struct cgroup_taskset *tset)
+ {
+ 	struct task_struct *task;
+@@ -11136,7 +11118,6 @@ struct cgroup_subsys cpu_cgrp_subsys = {
+ 	.css_released	= cpu_cgroup_css_released,
+ 	.css_free	= cpu_cgroup_css_free,
+ 	.css_extra_stat_show = cpu_extra_stat_show,
+-	.fork		= cpu_cgroup_fork,
+ 	.can_attach	= cpu_cgroup_can_attach,
+ 	.attach		= cpu_cgroup_attach,
+ 	.legacy_cftypes	= cpu_legacy_files,
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 8bed75757e65..fdb9125fe34e 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -11325,14 +11325,6 @@ static void attach_entity_cfs_rq(struct sched_entity *se)
+ {
+ 	struct cfs_rq *cfs_rq = cfs_rq_of(se);
+
+-#ifdef CONFIG_FAIR_GROUP_SCHED
+-	/*
+-	 * Since the real-depth could have been changed (only FAIR
+-	 * class maintain depth value), reset depth properly.
+-	 */
+-	se->depth = se->parent ? se->parent->depth + 1 : 0;
+-#endif
+-
+ 	/* Synchronize entity with its cfs_rq */
+ 	update_load_avg(cfs_rq, se, sched_feat(ATTACH_AGE_LOAD) ? 0 : SKIP_AGE_LOAD);
+ 	attach_entity_load_avg(cfs_rq, se);
+@@ -11431,15 +11423,7 @@ void init_cfs_rq(struct cfs_rq *cfs_rq)
+ }
+
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+-static void task_set_group_fair(struct task_struct *p)
+-{
+-	struct sched_entity *se = &p->se;
+-
+-	set_task_rq(p, task_cpu(p));
+-	se->depth = se->parent ? se->parent->depth + 1 : 0;
+-}
+-
+-static void task_move_group_fair(struct task_struct *p)
++static void task_change_group_fair(struct task_struct *p)
+ {
+ 	detach_task_cfs_rq(p);
+ 	set_task_rq(p, task_cpu(p));
+@@ -11451,19 +11435,6 @@ static void task_move_group_fair(struct task_struct *p)
+ 	attach_task_cfs_rq(p);
+ }
+
+-static void task_change_group_fair(struct task_struct *p, int type)
+-{
+-	switch (type) {
+-	case TASK_SET_GROUP:
+-		task_set_group_fair(p);
+-		break;
+-
+-	case TASK_MOVE_GROUP:
+-		task_move_group_fair(p);
+-		break;
+-	}
+-}
+-
+ void free_fair_sched_group(struct task_group *tg)
+ {
+ 	int i;
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index 98df4e72d..870d3d730 100644
+index 317480d535b0..8433e22da3ab 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
-@@ -1686,6 +1686,11 @@ queue_balance_callback(struct rq *rq,
- {
- 	lockdep_assert_rq_held(rq);
+@@ -1901,6 +1901,7 @@ static inline void set_task_rq(struct task_struct *p, unsigned int cpu)
+ 	set_task_rq_fair(&p->se, p->se.cfs_rq, tg->cfs_rq[cpu]);
+ 	p->se.cfs_rq = tg->cfs_rq[cpu];
+ 	p->se.parent = tg->se[cpu];
++	p->se.depth = tg->se[cpu] ? tg->se[cpu]->depth + 1 : 0;
+ #endif
 
-+	/*
-+	 * Don't (re)queue an already queued item; nor queue anything when
-+	 * balance_push() is active, see the comment with
-+	 * balance_push_callback.
-+	 */
- 	if (unlikely(head->next || rq->balance_callback == &balance_push_callback))
- 		return;
+ #ifdef CONFIG_RT_GROUP_SCHED
+@@ -2163,11 +2164,8 @@ struct sched_class {
+
+ 	void (*update_curr)(struct rq *rq);
+
+-#define TASK_SET_GROUP		0
+-#define TASK_MOVE_GROUP		1
+-
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+-	void (*task_change_group)(struct task_struct *p, int type);
++	void (*task_change_group)(struct task_struct *p);
+ #endif
+ };
 
 --
-2.36.1.203.g1bcf4f6271
+2.36.1
+
+The rng's random_init() function contributes the real time to the rng at
+boot time, so that events can at least start in relation to something
+particular in the real world. But this clock might not yet be set that
+point in boot, so nothing is contributed. In addition, the relation
+between minor clock changes from, say, NTP, and the cycle counter is
+potentially useful entropic data.
+
+This commit addresses this by mixing in a time stamp on calls to
+settimeofday and adjtimex. No entropy is credited in doing so, so it
+doesn't make initialization faster, but it is still useful input to
+have.
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Cc: stable@xxxxxxxxxxxxxxx
+Signed-off-by: Jason A. Donenfeld <Jason@xxxxxxxxx>
+---
+ kernel/time/timekeeping.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
+index 8e4b3c32fcf9..f72b9f1de178 100644
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -23,6 +23,7 @@
+ #include <linux/pvclock_gtod.h>
+ #include <linux/compiler.h>
+ #include <linux/audit.h>
++#include <linux/random.h>
+
+ #include "tick-internal.h"
+ #include "ntp_internal.h"
+@@ -1343,8 +1344,10 @@ int do_settimeofday64(const struct timespec64 *ts)
+ 	/* Signal hrtimers about time change */
+ 	clock_was_set(CLOCK_SET_WALL);
+
+-	if (!ret)
++	if (!ret) {
+ 		audit_tk_injoffset(ts_delta);
++		add_device_randomness(ts, sizeof(*ts));
++	}
+
+ 	return ret;
+ }
+@@ -2430,6 +2433,7 @@ int do_adjtimex(struct __kernel_timex *txc)
+ 	ret = timekeeping_validate_timex(txc);
+ 	if (ret)
+ 		return ret;
++	add_device_randomness(txc, sizeof(*txc));
+
+ 	if (txc->modes & ADJ_SETOFFSET) {
+ 		struct timespec64 delta;
+@@ -2447,6 +2451,7 @@ int do_adjtimex(struct __kernel_timex *txc)
+ 	audit_ntp_init(&ad);
+
+ 	ktime_get_real_ts64(&ts);
++	add_device_randomness(&ts, sizeof(ts));
+
+ 	raw_spin_lock_irqsave(&timekeeper_lock, flags);
+ 	write_seqcount_begin(&tk_core.seq);
+--
+2.35.1
