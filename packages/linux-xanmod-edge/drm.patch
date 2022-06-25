@@ -61,3 +61,334 @@ index 3070466f54e1..cdd599a08125 100644
  static int vega10_ih_hw_fini(void *handle)
 --
 2.25.1
+
+This function should drop the fence refcount when it extracts the
+fence from the fence array, just as it's done in amdgpu_fence_process.
+
+Signed-off-by: Andrey Grodzovsky <andrey.grodzovsky at amd.com>
+Reviewed-by: Christian König <christian.koenig at amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+index 957437a5558c..a9ae3beaa1d3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -595,8 +595,10 @@ void amdgpu_fence_driver_clear_job_fences(struct amdgpu_ring *ring)
+ 	for (i = 0; i <= ring->fence_drv.num_fences_mask; i++) {
+ 		ptr = &ring->fence_drv.fences[i];
+ 		old = rcu_dereference_protected(*ptr, 1);
+-		if (old && old->ops == &amdgpu_job_fence_ops)
++		if (old && old->ops == &amdgpu_job_fence_ops) {
+ 			RCU_INIT_POINTER(*ptr, NULL);
++			dma_fence_put(old);
++		}
+ 	}
+ }
+
+--
+2.25.1
+
+Problem:
+After we start handling timed out jobs we assume there fences won't be
+signaled but we cannot be sure and sometimes they fire late. We need
+to prevent concurrent accesses to fence array from
+amdgpu_fence_driver_clear_job_fences during GPU reset and amdgpu_fence_process
+from a late EOP interrupt.
+
+Fix:
+Before accessing fence array in GPU disable EOP interrupt and flush
+all pending interrupt handlers for amdgpu device's interrupt line.
+
+v2: Switch from irq_get/put to full enable/disable_irq for amdgpu
+
+Signed-off-by: Andrey Grodzovsky <andrey.grodzovsky at amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  4 ++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c  | 18 ++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h   |  1 +
+ 3 files changed, 23 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index eacecc672a4d..03519d58e630 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -4605,6 +4605,8 @@ int amdgpu_device_pre_asic_reset(struct amdgpu_device *adev,
+ 		amdgpu_virt_fini_data_exchange(adev);
+ 	}
+
++	amdgpu_fence_driver_isr_toggle(adev, true);
++
+ 	/* block all schedulers and reset given job's ring */
+ 	for (i = 0; i < AMDGPU_MAX_RINGS; ++i) {
+ 		struct amdgpu_ring *ring = adev->rings[i];
+@@ -4620,6 +4622,8 @@ int amdgpu_device_pre_asic_reset(struct amdgpu_device *adev,
+ 		amdgpu_fence_driver_force_completion(ring);
+ 	}
+
++	amdgpu_fence_driver_isr_toggle(adev, false);
++
+ 	if (job && job->vm)
+ 		drm_sched_increase_karma(&job->base);
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+index a9ae3beaa1d3..c1d04ea3c67f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -532,6 +532,24 @@ void amdgpu_fence_driver_hw_fini(struct amdgpu_device *adev)
+ 	}
+ }
+
++/* Will either stop and flush handlers for amdgpu interrupt or reanble it */
++void amdgpu_fence_driver_isr_toggle(struct amdgpu_device *adev, bool stop)
++{
++	int i;
++
++	for (i = 0; i < AMDGPU_MAX_RINGS; i++) {
++		struct amdgpu_ring *ring = adev->rings[i];
++
++		if (!ring || !ring->fence_drv.initialized || !ring->fence_drv.irq_src)
++			continue;
++
++		if (stop)
++			disable_irq(adev->irq.irq);
++		else
++			enable_irq(adev->irq.irq);
++	}
++}
++
+ void amdgpu_fence_driver_sw_fini(struct amdgpu_device *adev)
+ {
+ 	unsigned int i, j;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+index 7d89a52091c0..82c178a9033a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+@@ -143,6 +143,7 @@ signed long amdgpu_fence_wait_polling(struct amdgpu_ring *ring,
+ 				      uint32_t wait_seq,
+ 				      signed long timeout);
+ unsigned amdgpu_fence_count_emitted(struct amdgpu_ring *ring);
++void amdgpu_fence_driver_isr_toggle(struct amdgpu_device *adev, bool stop);
+
+ /*
+  * Rings.
+--
+2.25.1
+
+Problem:
+This patch caused negative refcount as described in [1] because
+for that case parent fence did not signal by the time of drm_sched_stop and hence
+kept in pending list the assumption was they will not signal and
+so fence was put to account for the s_fence->parent refcount but for
+amdgpu which has embedded HW fence (always same parent fence)
+drm_sched_fence_release_scheduled was always called and would
+still drop the count for parent fence once more. For jobs that
+never signaled this imbalance was masked by refcount bug in
+amdgpu_fence_driver_clear_job_fences that would not drop
+refcount on the fences that were removed from fence drive
+fences array (against prevois insertion into the array in
+get in amdgpu_fence_emit).
+
+Fix:
+Revert this patch and by setting s_job->s_fence->parent to NULL
+as before prevent the extra refcount drop in amdgpu when
+drm_sched_fence_release_scheduled is called on job release.
+
+Also - align behaviour in drm_sched_resubmit_jobs_ext with that of
+drm_sched_main when submitting jobs - take a refcount for the
+new parent fence pointer and drop refcount for original kref_init
+for new HW fence creation (or fake new HW fence in amdgpu - see next patch).
+
+[1] - https://lore.kernel.org/all/731b7ff1-3cc9-e314-df2a-7c51b76d4db0@amd.com/t/#r00c728fcc069b1276642c325bfa9d82bf8fa21a3
+
+Signed-off-by: Andrey Grodzovsky <andrey.grodzovsky at amd.com>
+Tested-by: Yiqing Yao <yiqing.yao at amd.com>
+---
+ drivers/gpu/drm/scheduler/sched_main.c | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/scheduler/sched_main.c b/drivers/gpu/drm/scheduler/sched_main.c
+index b81fceb0b8a2..c5437ee03e3f 100644
+--- a/drivers/gpu/drm/scheduler/sched_main.c
++++ b/drivers/gpu/drm/scheduler/sched_main.c
+@@ -419,6 +419,8 @@ void drm_sched_stop(struct drm_gpu_scheduler *sched, struct drm_sched_job *bad)
+ 		if (s_job->s_fence->parent &&
+ 		    dma_fence_remove_callback(s_job->s_fence->parent,
+ 					      &s_job->cb)) {
++			dma_fence_put(s_job->s_fence->parent);
++			s_job->s_fence->parent = NULL;
+ 			atomic_dec(&sched->hw_rq_count);
+ 		} else {
+ 			/*
+@@ -548,7 +550,6 @@ void drm_sched_resubmit_jobs_ext(struct drm_gpu_scheduler *sched, int max)
+ 		if (found_guilty && s_job->s_fence->scheduled.context == guilty_context)
+ 			dma_fence_set_error(&s_fence->finished, -ECANCELED);
+
+-		dma_fence_put(s_job->s_fence->parent);
+ 		fence = sched->ops->run_job(s_job);
+ 		i++;
+
+@@ -558,7 +559,11 @@ void drm_sched_resubmit_jobs_ext(struct drm_gpu_scheduler *sched, int max)
+
+ 			s_job->s_fence->parent = NULL;
+ 		} else {
+-			s_job->s_fence->parent = fence;
++
++			s_job->s_fence->parent = dma_fence_get(fence);
++
++			/* Drop for orignal kref_init */
++			dma_fence_put(fence);
+ 		}
+ 	}
+ }
+@@ -952,6 +957,9 @@ static int drm_sched_main(void *param)
+
+ 		if (!IS_ERR_OR_NULL(fence)) {
+ 			s_fence->parent = dma_fence_get(fence);
++			/* Drop for original kref_init of the fence */
++			dma_fence_put(fence);
++
+ 			r = dma_fence_add_callback(fence, &sched_job->cb,
+ 						   drm_sched_job_done_cb);
+ 			if (r == -ENOENT)
+@@ -959,7 +967,6 @@ static int drm_sched_main(void *param)
+ 			else if (r)
+ 				DRM_DEV_ERROR(sched->dev, "fence add callback failed (%d)\n",
+ 					  r);
+-			dma_fence_put(fence);
+ 		} else {
+ 			if (IS_ERR(fence))
+ 				dma_fence_set_error(&s_fence->finished, PTR_ERR(fence));
+--
+2.25.1
+
+Align refcount behaviour for amdgpu_job embedded HW fence with
+classic pointer style HW fences by increasing refcount each
+time emit is called so amdgpu code doesn't need to make workarounds
+using amdgpu_job.job_run_counter to keep the HW fence refcount balanced.
+
+Also since in the previous patch we resumed setting s_fence->parent to NULL
+in drm_sched_stop switch to directly checking if job->hw_fence is
+signaled to short circuit reset if already signed.
+
+Signed-off-by: Andrey Grodzovsky <andrey.grodzovsky at amd.com>
+Tested-by: Yiqing Yao <yiqing.yao at amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c |  2 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 27 +++++++++++++++++-----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c  |  7 +++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_job.c    |  4 ----
+ 4 files changed, 29 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+index 44da025502ac..567597469a8a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+@@ -684,6 +684,8 @@ int amdgpu_amdkfd_submit_ib(struct amdgpu_device *adev,
+ 		goto err_ib_sched;
+ 	}
+
++	/* Drop the initial kref_init count (see drm_sched_main as example) */
++	dma_fence_put(f);
+ 	ret = dma_fence_wait(f, false);
+
+ err_ib_sched:
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 03519d58e630..a2c268d48edd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -5009,16 +5009,32 @@ static void amdgpu_device_recheck_guilty_jobs(
+
+ 		/* clear job's guilty and depend the folowing step to decide the real one */
+ 		drm_sched_reset_karma(s_job);
+-		/* for the real bad job, it will be resubmitted twice, adding a dma_fence_get
+-		 * to make sure fence is balanced */
+-		dma_fence_get(s_job->s_fence->parent);
+ 		drm_sched_resubmit_jobs_ext(&ring->sched, 1);
+
++		if (!s_job->s_fence->parent) {
++			DRM_WARN("Failed to get a HW fence for job!");
++			continue;
++		}
++
+ 		ret = dma_fence_wait_timeout(s_job->s_fence->parent, false, ring->sched.timeout);
+ 		if (ret == 0) { /* timeout */
+ 			DRM_ERROR("Found the real bad job! ring:%s, job_id:%llx\n",
+ 						ring->sched.name, s_job->id);
+
++
++			amdgpu_fence_driver_isr_toggle(adev, true);
++
++			/* Clear this failed job from fence array */
++			amdgpu_fence_driver_clear_job_fences(ring);
++
++			amdgpu_fence_driver_isr_toggle(adev, false);
++
++			/* Since the job won't signal and we go for
++			 * another resubmit drop this parent pointer
++			 */
++			dma_fence_put(s_job->s_fence->parent);
++			s_job->s_fence->parent = NULL;
++
+ 			/* set guilty */
+ 			drm_sched_increase_karma(s_job);
+ retry:
+@@ -5047,7 +5063,6 @@ static void amdgpu_device_recheck_guilty_jobs(
+
+ 		/* got the hw fence, signal finished fence */
+ 		atomic_dec(ring->sched.score);
+-		dma_fence_put(s_job->s_fence->parent);
+ 		dma_fence_get(&s_job->s_fence->finished);
+ 		dma_fence_signal(&s_job->s_fence->finished);
+ 		dma_fence_put(&s_job->s_fence->finished);
+@@ -5220,8 +5235,8 @@ int amdgpu_device_gpu_recover(struct amdgpu_device *adev,
+ 	 *
+ 	 * job->base holds a reference to parent fence
+ 	 */
+-	if (job && job->base.s_fence->parent &&
+-	    dma_fence_is_signaled(job->base.s_fence->parent)) {
++	if (job && (job->hw_fence.ops != NULL) &&
++	    dma_fence_is_signaled(&job->hw_fence)) {
+ 		job_signaled = true;
+ 		dev_info(adev->dev, "Guilty job already signaled, skipping HW reset");
+ 		goto skip_hw_reset;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+index c1d04ea3c67f..39597ab807d1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -164,11 +164,16 @@ int amdgpu_fence_emit(struct amdgpu_ring *ring, struct dma_fence **f, struct amd
+ 	if (job && job->job_run_counter) {
+ 		/* reinit seq for resubmitted jobs */
+ 		fence->seqno = seq;
++		/* TO be inline with external fence creation and other drivers */
++		dma_fence_get(fence);
+ 	} else {
+-		if (job)
++		if (job) {
+ 			dma_fence_init(fence, &amdgpu_job_fence_ops,
+ 				       &ring->fence_drv.lock,
+ 				       adev->fence_context + ring->idx, seq);
++			/* Against remove in amdgpu_job_{free, free_cb} */
++			dma_fence_get(fence);
++		}
+ 		else
+ 			dma_fence_init(fence, &amdgpu_fence_ops,
+ 				       &ring->fence_drv.lock,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+index 10aa073600d4..df437b3a58e4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -263,10 +263,6 @@ static struct dma_fence *amdgpu_job_run(struct drm_sched_job *sched_job)
+ 			DRM_ERROR("Error scheduling IBs (%d)\n", r);
+ 	}
+
+-	if (!job->job_run_counter)
+-		dma_fence_get(fence);
+-	else if (finished->error < 0)
+-		dma_fence_put(&job->hw_fence);
+ 	job->job_run_counter++;
+ 	amdgpu_job_free_resources(job);
+
+--
+2.25.1
