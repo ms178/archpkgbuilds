@@ -1,0 +1,192 @@
+From d96d930cce53d9ae022aed894bd8b264d2864651 Mon Sep 17 00:00:00 2001
+From: Dave Airlie <airlied@redhat.com>
+Date: Mon, 11 Apr 2022 17:24:48 +1000
+Subject: [PATCH 1/2] radv/cmd_buffer: reduce the scope of the vertex bindings
+ memset
+
+This contains bitfields that need to be set to 0, the other fields
+will be overwritten by the subsequent loops.
+
+Reduces overheads on command recording with dynamic vertex state.
+---
+ src/amd/vulkan/radv_cmd_buffer.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index bedc13ce1642..9b468ef77480 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -5571,7 +5571,7 @@ radv_CmdSetVertexInputEXT(VkCommandBuffer commandBuffer, uint32_t vertexBindingD
+ 
+    cmd_buffer->state.vbo_misaligned_mask = 0;
+ 
+-   memset(state, 0, sizeof(*state));
++   memset(state, 0, offsetof(struct radv_vs_input_state, bindings[0]));
+ 
+    enum chip_class chip = cmd_buffer->device->physical_device->rad_info.chip_class;
+    for (unsigned i = 0; i < vertexAttributeDescriptionCount; i++) {
+-- 
+GitLab
+
+
+From ab262066de7f9d4a7644b780b8362b9a6975c46f Mon Sep 17 00:00:00 2001
+From: Dave Airlie <airlied@redhat.com>
+Date: Mon, 11 Apr 2022 15:37:01 +1000
+Subject: [PATCH 2/2] radv: add a dynamic vertex format cache.
+
+With dynamic vertex bindings the vertex format lookups are a lot
+more frequent (vs being baked in the pipeline). Add a simple lookup
+cache using a dynamic array to keep track of the hw values, and
+avoid repeated translation.
+
+This also reduces the memset to just the bitfields since all
+the others will be overwritten.
+
+Seen in perf traces gputest gimark with zink on radv.
+---
+ src/amd/vulkan/radv_cmd_buffer.c | 65 +++++++++++++++++++++-----------
+ src/amd/vulkan/radv_private.h    | 11 ++++++
+ 2 files changed, 54 insertions(+), 22 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index 9b468ef77480..139d206a7ec0 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -406,6 +406,8 @@ radv_destroy_cmd_buffer(struct radv_cmd_buffer *cmd_buffer)
+ {
+    list_del(&cmd_buffer->pool_link);
+ 
++   util_dynarray_fini(&cmd_buffer->cached_vertex_formats);
++
+    list_for_each_entry_safe(struct radv_cmd_buffer_upload, up, &cmd_buffer->upload.list, list)
+    {
+       cmd_buffer->device->ws->buffer_destroy(cmd_buffer->device->ws, up->upload_bo);
+@@ -474,6 +476,8 @@ radv_create_cmd_buffer(struct radv_device *device, struct radv_cmd_pool *pool,
+    vk_object_base_init(&device->vk, &cmd_buffer->meta_push_descriptors.base,
+                        VK_OBJECT_TYPE_DESCRIPTOR_SET);
+ 
++   util_dynarray_init(&cmd_buffer->cached_vertex_formats, NULL);
++
+    for (unsigned i = 0; i < MAX_BIND_POINTS; i++)
+       vk_object_base_init(&device->vk, &cmd_buffer->descriptors[i].push_set.set.base,
+                           VK_OBJECT_TYPE_DESCRIPTOR_SET);
+@@ -5578,10 +5582,6 @@ radv_CmdSetVertexInputEXT(VkCommandBuffer commandBuffer, uint32_t vertexBindingD
+       const VkVertexInputAttributeDescription2EXT *attrib = &pVertexAttributeDescriptions[i];
+       const VkVertexInputBindingDescription2EXT *binding = bindings[attrib->binding];
+       unsigned loc = attrib->location;
+-      const struct util_format_description *format_desc = vk_format_description(attrib->format);
+-      unsigned nfmt, dfmt;
+-      bool post_shuffle;
+-      enum radv_vs_input_alpha_adjust alpha_adjust;
+ 
+       state->attribute_mask |= 1u << loc;
+       state->bindings[loc] = attrib->binding;
+@@ -5594,37 +5594,58 @@ radv_CmdSetVertexInputEXT(VkCommandBuffer commandBuffer, uint32_t vertexBindingD
+       cmd_buffer->vertex_bindings[attrib->binding].stride = binding->stride;
+       state->offsets[loc] = attrib->offset;
+ 
+-      radv_translate_vertex_format(cmd_buffer->device->physical_device, attrib->format, format_desc,
+-                                   &dfmt, &nfmt, &post_shuffle, &alpha_adjust);
+-
+-      state->formats[loc] = dfmt | (nfmt << 4);
+-      const uint8_t format_align_req_minus_1 = format_desc->channel[0].size >= 32 ? 3 :
+-                                               (format_desc->block.bits / 8u - 1);
+-      state->format_align_req_minus_1[loc] = format_align_req_minus_1;
+-      state->format_sizes[loc] = format_desc->block.bits / 8u;
++      struct dynamic_vertex_format_cache *found = NULL;
++      util_dynarray_foreach(&cmd_buffer->cached_vertex_formats,
++                            struct dynamic_vertex_format_cache,
++                            vf) {
++         if (vf->format == attrib->format) {
++            found = vf;
++            break;
++         }
++      }
++      if (!found) {
++         unsigned nfmt, dfmt;
++         bool post_shuffle;
++         enum radv_vs_input_alpha_adjust alpha_adjust;
++         const struct util_format_description *format_desc = vk_format_description(attrib->format);
++
++         found = util_dynarray_grow(&cmd_buffer->cached_vertex_formats,
++                                    struct dynamic_vertex_format_cache, 1);
++         radv_translate_vertex_format(cmd_buffer->device->physical_device, attrib->format, format_desc,
++                                      &dfmt, &nfmt, &post_shuffle, &alpha_adjust);
++         found->format = attrib->format;
++         found->hw_fmt = dfmt | (nfmt << 4);
++         const uint8_t format_align_req_minus_1 = format_desc->channel[0].size >= 32 ? 3 :
++            (format_desc->block.bits / 8u - 1);
++         found->fmt_align_req_minus_1 = format_align_req_minus_1;
++         found->fmt_size = format_desc->block.bits / 8u;
++         found->post_shuffle = post_shuffle;
++         found->alpha_adjust_lo = alpha_adjust & 0x1;
++         found->alpha_adjust_hi = (alpha_adjust >> 1) & 0x1;
++      }
++
++      state->formats[loc] = found->hw_fmt;
++      state->format_align_req_minus_1[loc] = found->fmt_align_req_minus_1;
++      state->format_sizes[loc] = found->fmt_size;
++      state->alpha_adjust_lo |= found->alpha_adjust_lo << loc;
++      state->alpha_adjust_hi |= found->alpha_adjust_hi << loc;
++      if (found->post_shuffle)
++         state->post_shuffle |= 1u << loc;
+ 
+       if (chip == GFX6 || chip >= GFX10) {
+          const struct radv_vertex_binding *vb = cmd_buffer->vertex_bindings;
+          unsigned bit = 1u << loc;
+-         if (binding->stride & format_align_req_minus_1) {
++         if (binding->stride & found->fmt_align_req_minus_1) {
+             state->misaligned_mask |= bit;
+             if (cmd_buffer->state.vbo_bound_mask & bit)
+                cmd_buffer->state.vbo_misaligned_mask |= bit;
+          } else {
+             state->possibly_misaligned_mask |= bit;
+             if (cmd_buffer->state.vbo_bound_mask & bit &&
+-                ((vb[attrib->binding].offset + state->offsets[loc]) & format_align_req_minus_1))
++                ((vb[attrib->binding].offset + state->offsets[loc]) & found->fmt_align_req_minus_1))
+                cmd_buffer->state.vbo_misaligned_mask |= bit;
+          }
+       }
+-
+-      if (alpha_adjust) {
+-         state->alpha_adjust_lo |= (alpha_adjust & 0x1) << loc;
+-         state->alpha_adjust_hi |= (alpha_adjust >> 1) << loc;
+-      }
+-
+-      if (post_shuffle)
+-         state->post_shuffle |= 1u << loc;
+    }
+ 
+    cmd_buffer->state.dirty |= RADV_CMD_DIRTY_VERTEX_BUFFER |
+diff --git a/src/amd/vulkan/radv_private.h b/src/amd/vulkan/radv_private.h
+index f774ac951c07..e8c601d91521 100644
+--- a/src/amd/vulkan/radv_private.h
++++ b/src/amd/vulkan/radv_private.h
+@@ -1510,6 +1510,16 @@ enum radv_cmd_buffer_status {
+    RADV_CMD_BUFFER_STATUS_PENDING,
+ };
+ 
++struct dynamic_vertex_format_cache {
++   VkFormat format;
++   uint8_t hw_fmt;
++   uint8_t fmt_align_req_minus_1;
++   uint8_t fmt_size;
++   bool post_shuffle;
++   bool alpha_adjust_lo;
++   bool alpha_adjust_hi;
++};
++
+ struct radv_cmd_buffer {
+    struct vk_command_buffer vk;
+ 
+@@ -1518,6 +1528,7 @@ struct radv_cmd_buffer {
+    struct radv_cmd_pool *pool;
+    struct list_head pool_link;
+ 
++   struct util_dynarray cached_vertex_formats;
+    VkCommandBufferUsageFlags usage_flags;
+    enum radv_cmd_buffer_status status;
+    struct radeon_cmdbuf *cs;
+-- 
+GitLab
+
