@@ -1,0 +1,154 @@
+From fd5735aca03857d9b5e2d144e79956ceecc2ed04 Mon Sep 17 00:00:00 2001
+From: Mike Blumenkrantz <michael.blumenkrantz@gmail.com>
+Date: Wed, 6 Jul 2022 12:21:34 -0400
+Subject: [PATCH] mesa: fix SignalSemaphoreEXT behavior
+
+the EXT_external_object spec originally was underspecified with regards
+to this function, leaving room for synchronization errors where:
+* app calls SignalSemaphoreEXT to signal a semaphore
+* mesa defers pipe_context::fence_server_signal with threaded context
+* driver defers gpu submission
+* SignalSemaphoreEXT has long since returned, app submits vk cmdbuf waiting on semaphore
+* spec violation / device lost
+
+to prevent this, the spec is being changed to:
+1) require an implicit flush when calling SignalSemaphoreEXT
+2) require that this implicit flush also forces GPU submission before SignalSemaphoreEXT returns
+
+all affected drivers have been updated
+
+fixes #6568
+
+cc: mesa-stable
+---
+ .../auxiliary/util/u_threaded_context.c       | 19 +++----------------
+ .../auxiliary/util/u_threaded_context_calls.h |  1 -
+ src/gallium/drivers/crocus/crocus_fence.c     |  2 ++
+ src/gallium/drivers/iris/iris_fence.c         |  2 ++
+ src/gallium/drivers/radeonsi/si_fence.c       |  2 +-
+ src/gallium/drivers/zink/zink_fence.c         |  7 +++++--
+ src/mesa/main/externalobjects.c               |  2 +-
+ 7 files changed, 14 insertions(+), 21 deletions(-)
+
+diff --git a/src/gallium/auxiliary/util/u_threaded_context.c b/src/gallium/auxiliary/util/u_threaded_context.c
+index b532749e194a..a9f69b465802 100644
+--- a/src/gallium/auxiliary/util/u_threaded_context.c
++++ b/src/gallium/auxiliary/util/u_threaded_context.c
+@@ -2841,27 +2841,14 @@ tc_fence_server_sync(struct pipe_context *_pipe,
+    screen->fence_reference(screen, &call->fence, fence);
+ }
+ 
+-static uint16_t
+-tc_call_fence_server_signal(struct pipe_context *pipe, void *call, uint64_t *last)
+-{
+-   struct pipe_fence_handle *fence = to_call(call, tc_fence_call)->fence;
+-
+-   pipe->fence_server_signal(pipe, fence);
+-   pipe->screen->fence_reference(pipe->screen, &fence, NULL);
+-   return call_size(tc_fence_call);
+-}
+-
+ static void
+ tc_fence_server_signal(struct pipe_context *_pipe,
+                            struct pipe_fence_handle *fence)
+ {
+    struct threaded_context *tc = threaded_context(_pipe);
+-   struct pipe_screen *screen = tc->pipe->screen;
+-   struct tc_fence_call *call = tc_add_call(tc, TC_CALL_fence_server_signal,
+-                                            tc_fence_call);
+-
+-   call->fence = NULL;
+-   screen->fence_reference(screen, &call->fence, fence);
++   struct pipe_context *pipe = tc->pipe;
++   tc_sync(tc);
++   pipe->fence_server_signal(pipe, fence);
+ }
+ 
+ static struct pipe_video_codec *
+diff --git a/src/gallium/auxiliary/util/u_threaded_context_calls.h b/src/gallium/auxiliary/util/u_threaded_context_calls.h
+index ab78d3de3aeb..2dbdd885a598 100644
+--- a/src/gallium/auxiliary/util/u_threaded_context_calls.h
++++ b/src/gallium/auxiliary/util/u_threaded_context_calls.h
+@@ -1,7 +1,6 @@
+ CALL(flush)
+ CALL(callback)
+ CALL(fence_server_sync)
+-CALL(fence_server_signal)
+ CALL(destroy_query)
+ CALL(begin_query)
+ CALL(end_query)
+diff --git a/src/gallium/drivers/crocus/crocus_fence.c b/src/gallium/drivers/crocus/crocus_fence.c
+index 2e3ad4ba6c67..7d7617c08c8e 100644
+--- a/src/gallium/drivers/crocus/crocus_fence.c
++++ b/src/gallium/drivers/crocus/crocus_fence.c
+@@ -551,6 +551,8 @@ crocus_fence_signal(struct pipe_context *ctx, struct pipe_fence_handle *fence)
+          crocus_batch_add_syncobj(&ice->batches[b], fine->syncobj,
+                                   I915_EXEC_FENCE_SIGNAL);
+       }
++      if (ice->batches[b].contains_fence_signal)
++         crocus_batch_flush(&ice->batches[b]);
+    }
+ }
+ 
+diff --git a/src/gallium/drivers/iris/iris_fence.c b/src/gallium/drivers/iris/iris_fence.c
+index 935232407f7b..c6e13663eb28 100644
+--- a/src/gallium/drivers/iris/iris_fence.c
++++ b/src/gallium/drivers/iris/iris_fence.c
+@@ -604,6 +604,8 @@ iris_fence_signal(struct pipe_context *ctx,
+          batch->contains_fence_signal = true;
+          iris_batch_add_syncobj(batch, fine->syncobj, I915_EXEC_FENCE_SIGNAL);
+       }
++      if (batch->contains_fence_signal)
++         iris_batch_flush(batch);
+    }
+ }
+ 
+diff --git a/src/gallium/drivers/radeonsi/si_fence.c b/src/gallium/drivers/radeonsi/si_fence.c
+index 86ea3d37c719..ea9727540c49 100644
+--- a/src/gallium/drivers/radeonsi/si_fence.c
++++ b/src/gallium/drivers/radeonsi/si_fence.c
+@@ -561,7 +561,7 @@ static void si_fence_server_signal(struct pipe_context *ctx, struct pipe_fence_h
+       si_add_syncobj_signal(sctx, sfence->gfx);
+ 
+    /**
+-    * The spec does not require a flush here. We insert a flush
++    * The spec requires a flush here. We insert a flush
+     * because syncobj based signals are not directly placed into
+     * the command stream. Instead the signal happens when the
+     * submission associated with the syncobj finishes execution.
+diff --git a/src/gallium/drivers/zink/zink_fence.c b/src/gallium/drivers/zink/zink_fence.c
+index 65e94eb49687..a6a9277a5fc2 100644
+--- a/src/gallium/drivers/zink/zink_fence.c
++++ b/src/gallium/drivers/zink/zink_fence.c
+@@ -197,10 +197,13 @@ zink_fence_server_signal(struct pipe_context *pctx, struct pipe_fence_handle *pf
+    struct zink_tc_fence *mfence = (struct zink_tc_fence *)pfence;
+ 
+    assert(!ctx->batch.state->signal_semaphore);
+-   /* this is a deferred flush to reduce overhead */
+    ctx->batch.state->signal_semaphore = mfence->sem;
+    ctx->batch.has_work = true;
+-   pctx->flush(pctx, NULL, PIPE_FLUSH_ASYNC);
++   struct zink_batch_state *bs = ctx->batch.state;
++   /* this must produce a synchronous flush that completes before the function returns */
++   pctx->flush(pctx, NULL, 0);
++   if (zink_screen(ctx->base.screen)->threaded)
++      util_queue_fence_wait(&bs->flush_completed);
+ }
+ 
+ void
+diff --git a/src/mesa/main/externalobjects.c b/src/mesa/main/externalobjects.c
+index 4a0894132a04..9029d06867c5 100644
+--- a/src/mesa/main/externalobjects.c
++++ b/src/mesa/main/externalobjects.c
+@@ -730,7 +730,7 @@ server_signal_semaphore(struct gl_context *ctx,
+          pipe->flush_resource(pipe, texObj->pt);
+    }
+ 
+-   /* The driver is allowed to flush during fence_server_signal, be prepared */
++   /* The driver must flush during fence_server_signal, be prepared */
+    st_flush_bitmap_cache(st);
+    pipe->fence_server_signal(pipe, semObj->fence);
+ }
+-- 
+GitLab
+

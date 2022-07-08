@@ -1,0 +1,268 @@
+From 77a8e7465432b5a59a9a5966d18650b0e2ce7aad Mon Sep 17 00:00:00 2001
+From: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+Date: Thu, 7 Jul 2022 10:28:57 +0200
+Subject: [PATCH] radv: fix wide points/lines by configuring the guardband
+ correctly
+
+Fixes all remaining wide points/lines failures with Zink.
+
+Closes: https://gitlab.freedesktop.org/mesa/mesa/-/issues/6121
+Signed-off-by: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+---
+ src/amd/vulkan/radv_cmd_buffer.c              | 19 ++++++--
+ src/amd/vulkan/radv_pipeline.c                | 47 ++++---------------
+ src/amd/vulkan/radv_private.h                 | 22 ++++++++-
+ src/amd/vulkan/si_cmd_buffer.c                | 31 +++++++++---
+ .../drivers/zink/ci/zink-radv-fails.txt       | 14 ------
+ 5 files changed, 68 insertions(+), 65 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index d58dd39a1755..ae90eb43a77f 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -1344,7 +1344,8 @@ radv_emit_graphics_pipeline(struct radv_cmd_buffer *cmd_buffer)
+    cmd_buffer->scratch_waves_wanted = MAX2(cmd_buffer->scratch_waves_wanted, pipeline->base.max_waves);
+ 
+    if (!cmd_buffer->state.emitted_graphics_pipeline ||
+-       cmd_buffer->state.emitted_graphics_pipeline->can_use_guardband != pipeline->can_use_guardband)
++       cmd_buffer->state.emitted_graphics_pipeline->uses_prim_points_or_lines != pipeline->uses_prim_points_or_lines ||
++       cmd_buffer->state.emitted_graphics_pipeline->line_width != pipeline->line_width)
+       cmd_buffer->state.dirty |= RADV_CMD_DIRTY_DYNAMIC_SCISSOR;
+ 
+    if (!cmd_buffer->state.emitted_graphics_pipeline ||
+@@ -1464,7 +1465,8 @@ radv_emit_scissor(struct radv_cmd_buffer *cmd_buffer)
+ 
+    si_write_scissors(cmd_buffer->cs, 0, count, cmd_buffer->state.dynamic.scissor.scissors,
+                      cmd_buffer->state.dynamic.viewport.viewports,
+-                     cmd_buffer->state.emitted_graphics_pipeline->can_use_guardband);
++                     cmd_buffer->state.dynamic.primitive_topology,
++                     cmd_buffer->state.dynamic.line_width);
+ 
+    cmd_buffer->state.context_roll_without_scissor_emitted = false;
+ }
+@@ -5345,6 +5347,9 @@ radv_CmdSetLineWidth(VkCommandBuffer commandBuffer, float lineWidth)
+ {
+    RADV_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+ 
++   if (cmd_buffer->state.dynamic.line_width != lineWidth)
++      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_DYNAMIC_SCISSOR;
++
+    cmd_buffer->state.dynamic.line_width = lineWidth;
+    cmd_buffer->state.dirty |= RADV_CMD_DIRTY_DYNAMIC_LINE_WIDTH;
+ }
+@@ -5506,11 +5511,15 @@ radv_CmdSetPrimitiveTopology(VkCommandBuffer commandBuffer, VkPrimitiveTopology
+    RADV_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+    struct radv_cmd_state *state = &cmd_buffer->state;
+    unsigned primitive_topology = si_translate_prim(primitiveTopology);
+-   bool old_is_linestrip = (state->dynamic.primitive_topology == V_008958_DI_PT_LINESTRIP);
+-   bool new_is_linestrip = (primitive_topology == V_008958_DI_PT_LINESTRIP);
+ 
+-   if (old_is_linestrip != new_is_linestrip)
++   if ((state->dynamic.primitive_topology == V_008958_DI_PT_LINESTRIP) !=
++       (primitive_topology == V_008958_DI_PT_LINESTRIP))
+       state->dirty |= RADV_CMD_DIRTY_DYNAMIC_LINE_STIPPLE;
++
++   if (radv_prim_is_points_or_lines(state->dynamic.primitive_topology) !=
++       radv_prim_is_points_or_lines(primitive_topology))
++      state->dirty |= RADV_CMD_DIRTY_DYNAMIC_SCISSOR;
++
+    state->dynamic.primitive_topology = primitive_topology;
+ 
+    state->dirty |= RADV_CMD_DIRTY_DYNAMIC_PRIMITIVE_TOPOLOGY;
+diff --git a/src/amd/vulkan/radv_pipeline.c b/src/amd/vulkan/radv_pipeline.c
+index 1e130f56ec29..838a121212fa 100644
+--- a/src/amd/vulkan/radv_pipeline.c
++++ b/src/amd/vulkan/radv_pipeline.c
+@@ -1208,28 +1208,6 @@ gfx103_pipeline_init_vrs_state(struct radv_graphics_pipeline *pipeline,
+    }
+ }
+ 
+-static bool
+-radv_prim_can_use_guardband(uint32_t topology)
+-{
+-   switch (topology) {
+-   case V_008958_DI_PT_POINTLIST:
+-   case V_008958_DI_PT_LINELIST:
+-   case V_008958_DI_PT_LINESTRIP:
+-   case V_008958_DI_PT_LINELIST_ADJ:
+-   case V_008958_DI_PT_LINESTRIP_ADJ:
+-      return false;
+-   case V_008958_DI_PT_TRILIST:
+-   case V_008958_DI_PT_TRISTRIP:
+-   case V_008958_DI_PT_TRIFAN:
+-   case V_008958_DI_PT_TRILIST_ADJ:
+-   case V_008958_DI_PT_TRISTRIP_ADJ:
+-   case V_008958_DI_PT_PATCH:
+-      return true;
+-   default:
+-      unreachable("unhandled primitive type");
+-   }
+-}
+-
+ static uint32_t
+ si_conv_tess_prim_to_gs_out(enum tess_primitive_mode prim)
+ {
+@@ -1972,20 +1950,6 @@ static void
+ radv_pipeline_init_input_assembly_state(struct radv_graphics_pipeline *pipeline,
+                                         const struct radv_graphics_pipeline_info *info)
+ {
+-   struct radv_shader *tes = pipeline->base.shaders[MESA_SHADER_TESS_EVAL];
+-   struct radv_shader *gs = pipeline->base.shaders[MESA_SHADER_GEOMETRY];
+-
+-   pipeline->can_use_guardband = radv_prim_can_use_guardband(info->ia.primitive_topology);
+-
+-   if (radv_pipeline_has_stage(pipeline, MESA_SHADER_GEOMETRY)) {
+-      if (si_conv_gl_prim_to_gs_out(gs->info.gs.output_prim) == V_028A6C_TRISTRIP)
+-         pipeline->can_use_guardband = true;
+-   } else if (radv_pipeline_has_stage(pipeline, MESA_SHADER_TESS_CTRL)) {
+-      if (!tes->info.tes.point_mode &&
+-          tes->info.tes._primitive_mode != TESS_PRIMITIVE_ISOLINES)
+-         pipeline->can_use_guardband = true;
+-   }
+-
+    pipeline->ia_multi_vgt_param = radv_compute_ia_multi_vgt_param_helpers(pipeline);
+ }
+ 
+@@ -6893,7 +6857,7 @@ radv_pipeline_init_extra(struct radv_graphics_pipeline *pipeline,
+       struct radv_dynamic_state *dynamic = &pipeline->dynamic_state;
+       dynamic->primitive_topology = V_008958_DI_PT_RECTLIST;
+ 
+-      pipeline->can_use_guardband = true;
++      pipeline->uses_prim_points_or_lines = false;
+ 
+       *vgt_gs_out_prim_type = V_028A6C_TRISTRIP;
+       if (radv_pipeline_has_ngg(pipeline))
+@@ -7034,6 +6998,15 @@ radv_graphics_pipeline_init(struct radv_graphics_pipeline *pipeline, struct radv
+       pipeline->base.shaders[pipeline->last_vgt_api_stage]->info.force_vrs_per_vertex;
+    pipeline->uses_user_sample_locations = info.ms.sample_locs_enable;
+ 
++   if (!(pipeline->dynamic_states & RADV_DYNAMIC_PRIMITIVE_TOPOLOGY)) {
++      pipeline->uses_prim_points_or_lines =
++         radv_prim_is_points_or_lines(info.ia.primitive_topology);
++   }
++
++   if (!(pipeline->dynamic_states & RADV_DYNAMIC_LINE_WIDTH)) {
++      pipeline->line_width = info.rs.line_width;
++   }
++
+    pipeline->base.push_constant_size = pipeline_layout->push_constant_size;
+    pipeline->base.dynamic_offset_count = pipeline_layout->dynamic_offset_count;
+ 
+diff --git a/src/amd/vulkan/radv_private.h b/src/amd/vulkan/radv_private.h
+index b681087e247d..bc4b3a28e202 100644
+--- a/src/amd/vulkan/radv_private.h
++++ b/src/amd/vulkan/radv_private.h
+@@ -1613,7 +1613,8 @@ void si_emit_compute(struct radv_device *device, struct radeon_cmdbuf *cs);
+ void cik_create_gfx_config(struct radv_device *device);
+ 
+ void si_write_scissors(struct radeon_cmdbuf *cs, int first, int count, const VkRect2D *scissors,
+-                       const VkViewport *viewports, bool can_use_guardband);
++                       const VkViewport *viewports, unsigned primitive_topology, float line_width);
++
+ uint32_t si_get_ia_multi_vgt_param(struct radv_cmd_buffer *cmd_buffer, bool instanced_draw,
+                                    bool indirect_draw, bool count_from_stream_output,
+                                    uint32_t draw_vertex_count, unsigned topology,
+@@ -2098,13 +2099,13 @@ struct radv_graphics_pipeline {
+    bool disable_out_of_order_rast_for_occlusion;
+    bool uses_drawid;
+    bool uses_baseinstance;
+-   bool can_use_guardband;
+    bool uses_dynamic_stride;
+    bool uses_conservative_overestimate;
+    bool negative_one_to_one;
+    bool use_per_attribute_vb_descs;
+    bool can_use_simple_input;
+    bool uses_user_sample_locations;
++   bool uses_prim_points_or_lines;
+ 
+    /* Whether the pipeline forces per-vertex VRS (GFX10.3+). */
+    bool force_vrs_per_vertex;
+@@ -2115,6 +2116,8 @@ struct radv_graphics_pipeline {
+ 
+    /* Not NULL if graphics pipeline uses streamout. */
+    struct radv_shader *streamout_shader;
++
++   float line_width;
+ };
+ 
+ struct radv_compute_pipeline {
+@@ -2990,6 +2993,21 @@ si_translate_prim(unsigned topology)
+    }
+ }
+ 
++static inline bool
++radv_prim_is_points_or_lines(unsigned topology)
++{
++   switch (topology) {
++   case V_008958_DI_PT_POINTLIST:
++   case V_008958_DI_PT_LINELIST:
++   case V_008958_DI_PT_LINESTRIP:
++   case V_008958_DI_PT_LINELIST_ADJ:
++   case V_008958_DI_PT_LINESTRIP_ADJ:
++      return true;
++   default:
++      return false;
++   }
++}
++
+ static inline uint32_t
+ si_translate_stencil_op(enum VkStencilOp op)
+ {
+diff --git a/src/amd/vulkan/si_cmd_buffer.c b/src/amd/vulkan/si_cmd_buffer.c
+index 28eeccbac2c5..7238e7f91a24 100644
+--- a/src/amd/vulkan/si_cmd_buffer.c
++++ b/src/amd/vulkan/si_cmd_buffer.c
+@@ -715,10 +715,11 @@ si_intersect_scissor(const VkRect2D *a, const VkRect2D *b)
+ 
+ void
+ si_write_scissors(struct radeon_cmdbuf *cs, int first, int count, const VkRect2D *scissors,
+-                  const VkViewport *viewports, bool can_use_guardband)
++                  const VkViewport *viewports, unsigned primitive_topology, float line_width)
+ {
+    int i;
+    float scale[3], translate[3], guardband_x = INFINITY, guardband_y = INFINITY;
++   float discard_x = 1.0f, discard_y = 1.0f;
+    const float max_range = 32767.0f;
+    if (!count)
+       return;
+@@ -744,17 +745,33 @@ si_write_scissors(struct radeon_cmdbuf *cs, int first, int count, const VkRect2D
+                          S_028250_WINDOW_OFFSET_DISABLE(1));
+       radeon_emit(cs, S_028254_BR_X(scissor.offset.x + scissor.extent.width) |
+                          S_028254_BR_Y(scissor.offset.y + scissor.extent.height));
+-   }
+-   if (!can_use_guardband) {
+-      guardband_x = 1.0;
+-      guardband_y = 1.0;
++
++      if (radv_prim_is_points_or_lines(primitive_topology)) {
++         /* When rendering wide points or lines, we need to be more conservative about when to
++          * discard them entirely. */
++         float pixels;
++
++         if (primitive_topology == V_008958_DI_PT_POINTLIST) {
++            pixels = 8191.875f;
++         } else {
++            pixels = line_width;
++         }
++
++         /* Add half the point size / line width. */
++         discard_x += pixels / (2.0 * scale[0]);
++         discard_y += pixels / (2.0 * scale[1]);
++
++         /* Discard primitives that would lie entirely outside the clip region. */
++         discard_x = MIN2(discard_x, guardband_x);
++         discard_y = MIN2(discard_y, guardband_y);
++      }
+    }
+ 
+    radeon_set_context_reg_seq(cs, R_028BE8_PA_CL_GB_VERT_CLIP_ADJ, 4);
+    radeon_emit(cs, fui(guardband_y));
+-   radeon_emit(cs, fui(1.0));
++   radeon_emit(cs, fui(discard_y));
+    radeon_emit(cs, fui(guardband_x));
+-   radeon_emit(cs, fui(1.0));
++   radeon_emit(cs, fui(discard_x));
+ }
+ 
+ static inline unsigned
+
