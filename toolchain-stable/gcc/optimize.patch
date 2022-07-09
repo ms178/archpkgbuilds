@@ -1,47 +1,3 @@
-From 28e56e571f903b9e5dd306081f45c393d0cd0947 Mon Sep 17 00:00:00 2001
-From: William Douglas <william.douglas@intel.com>
-Date: Tue, 5 Apr 2022 09:54:10 -0700
-Subject: [PATCH] Make optimize increasing only
-
-This patch is trying to catch the cases where we as OS pass -O3 and
-then some package makefile overrides with -O2.
-
-And let O0 go through as a special case.
----
- gcc/opts.cc | 10 ++++++++--
- 1 file changed, 8 insertions(+), 2 deletions(-)
-
-diff --git a/gcc/opts.cc b/gcc/opts.cc
-index ef5fe9b11..1fc265e2f 100644
---- a/gcc/opts.cc
-+++ b/gcc/opts.cc
-@@ -713,7 +713,8 @@ default_options_optimization (struct gcc_options *opts,
- 	case OPT_O:
- 	  if (*opt->arg == '\0')
- 	    {
--	      opts->x_optimize = 1;
-+	      if (opts->x_optimize == 0)
-+		opts->x_optimize = 1;
- 	      opts->x_optimize_size = 0;
- 	      opts->x_optimize_fast = 0;
- 	      opts->x_optimize_debug = 0;
-@@ -726,7 +727,12 @@ default_options_optimization (struct gcc_options *opts,
- 			       "integer, %<g%>, %<s%>, %<z%> or %<fast%>");
- 	      else
- 		{
--		  opts->x_optimize = optimize_val;
-+		  /* Keep higher opts value */
-+		  if (optimize_val > opts->x_optimize)
-+		    opts->x_optimize = optimize_val;
-+		  /* But honors 0 opts  */
-+		  if (optimize_val == 0)
-+		    opts->x_optimize = optimize_val;
- 		  if ((unsigned int) opts->x_optimize > 255)
- 		    opts->x_optimize = 255;
- 		  opts->x_optimize_size = 0;
---
-2.35.1
-
 From 5bd6b6f0e7d630c597900e82fe04bb2bc7a1e3d4 Mon Sep 17 00:00:00 2001
 From: Thomas Rodgers <trodgers@redhat.com>
 Date: Tue, 5 Jul 2022 17:42:42 -0700
@@ -411,3 +367,2266 @@ index 0324ff60a0f..c531f1f12fd 100644
    bitmap_obstack_release (&loop_renamer_obstack);
 --
 2.35.3
+
+Rather than traversing the all_files linked list for every include,
+this factors out the quick idempotency checks (modification time
+and size) to be the keys in a hash table so we can find matching
+files quickly.
+
+The hash table value type is a linked list, in case more than one
+file matches the quick check.
+
+The table is only built if a once-only file is seen, so include
+guard performance is not affected.
+
+My laptop would previously complete Ricardo's benchmark from the
+PR in ~1.1s using #pragma once, and ~0.35s using include guards.
+
+After this change, both benchmarks now complete in ~0.35s. I did
+have to randomize the modification dates on the benchmark headers
+so the files did not all end up in the same hash table list, but
+that would likely not come up outside of the contrived benchmark.
+
+libcpp/ChangeLog:
+
+	PR preprocessor/58770
+	* internal.h: Add hash table for #pragma once
+	* files.cc: Optimize #pragma once with the hash table
+---
+ libcpp/files.cc   | 113 +++++++++++++++++++++++++++++++++++++++++++---
+ libcpp/internal.h |   3 ++
+ 2 files changed, 110 insertions(+), 6 deletions(-)
+
+diff --git a/libcpp/files.cc b/libcpp/files.cc
+index 24208f7b0f8..51901aa31dd 100644
+--- a/libcpp/files.cc
++++ b/libcpp/files.cc
+@@ -167,6 +167,33 @@ struct file_hash_entry_pool
+   struct cpp_file_hash_entry pool[FILE_HASH_POOL_SIZE];
+ };
+
++/* A set of attributes designed to quickly identify obviously different files
++   in a hashtable.  Just in case there are collisions, we still maintain a
++   list.  These sub-lists can then be checked for #pragma once rather than
++   interating through all_files.  */
++struct file_quick_idempotency_attrs
++{
++  file_quick_idempotency_attrs(const _cpp_file *f)
++    : mtime(f->st.st_mtime), size(f->st.st_size) {}
++
++  time_t mtime;
++  off_t size;
++
++  static hashval_t hash (/* _cpp_file* */ const void *p);
++};
++
++/* Sub-list of very similar files kept in a hashtable to check for #pragma
++   once.  */
++struct file_sublist
++{
++  _cpp_file *f;
++  file_sublist *next;
++
++  static int eq (/* _cpp_file* */ const void *p,
++		 /* file_sublist* */ const void *q);
++  static void del (/* file_sublist* */ void *p);
++};
++
+ static bool open_file (_cpp_file *file);
+ static bool pch_open_file (cpp_reader *pfile, _cpp_file *file,
+ 			   bool *invalid_pch);
+@@ -849,17 +876,18 @@ has_unique_contents (cpp_reader *pfile, _cpp_file *file, bool import,
+   if (!pfile->seen_once_only)
+     return true;
+
+-  /* We may have read the file under a different name.  Look
+-     for likely candidates and compare file contents to be sure.  */
+-  for (_cpp_file *f = pfile->all_files; f; f = f->next_file)
++  /* We may have read the file under a different name.  We've kept
++     similar looking files in this lists under this hash table, so
++     check those more thoroughly.  */
++  void* ent = htab_find(pfile->pragma_once_files, file);
++  for (file_sublist *e = reinterpret_cast<file_sublist*> (ent); e; e = e->next)
+     {
++      _cpp_file *f = e->f;
+       if (f == file)
+ 	continue; /* It'sa me!  */
+
+       if ((import || f->once_only)
+-	  && f->err_no == 0
+-	  && f->st.st_mtime == file->st.st_mtime
+-	  && f->st.st_size == file->st.st_size)
++	  && f->err_no == 0)
+ 	{
+ 	  _cpp_file *ref_file;
+
+@@ -895,6 +923,36 @@ has_unique_contents (cpp_reader *pfile, _cpp_file *file, bool import,
+   return true;
+ }
+
++/* Add the given file to the #pragma once table so it can be
++   quickly identified and excluded the next time it's seen.  */
++static void
++update_pragma_once_table (cpp_reader *pfile, _cpp_file *file)
++{
++  void **slot = htab_find_slot (pfile->pragma_once_files, file, INSERT);
++  if (slot)
++    {
++      if (!*slot)
++	*slot = xcalloc(1, sizeof(file_sublist));
++
++      file_sublist *e = reinterpret_cast<file_sublist*> (*slot);
++      while (e->f)
++	{
++	  if (!e->next)
++	    e->next = reinterpret_cast<file_sublist*> (
++			xcalloc(1, sizeof(file_sublist)));
++	  e = e->next;
++	}
++
++      e->f = file;
++    }
++  else
++    {
++      cpp_error (pfile, CPP_DL_ERROR,
++		 "Unable to create #pragma once table space for %s",
++		 _cpp_get_file_name(file));
++    }
++}
++
+ /* Place the file referenced by FILE into a new buffer on the buffer
+    stack if possible.  Returns true if a buffer is stacked.  Use LOC
+    for any diagnostics.  */
+@@ -950,6 +1008,9 @@ _cpp_stack_file (cpp_reader *pfile, _cpp_file *file, include_type type,
+       if (!has_unique_contents (pfile, file, type == IT_IMPORT, loc))
+ 	return false;
+
++      if (pfile->seen_once_only && file->once_only)
++	update_pragma_once_table(pfile, file);
++
+       if (pfile->buffer && file->dir)
+ 	sysp = MAX (pfile->buffer->sysp, file->dir->sysp);
+
+@@ -1434,6 +1495,41 @@ nonexistent_file_hash_eq (const void *p, const void *q)
+   return filename_cmp ((const char *) p, (const char *) q) == 0;
+ }
+
++/* Hasher for the #pragma once hash table.  */
++hashval_t
++file_quick_idempotency_attrs::hash (const void *p)
++{
++  const _cpp_file *f = reinterpret_cast<const _cpp_file*> (p);
++  file_quick_idempotency_attrs kh (f);
++  return iterative_hash_object (kh, 0);
++}
++
++/* Equality checker for the #pragma once hash table.  */
++int
++file_sublist::eq (const void *p, const void *q)
++{
++  /* Just check if the file q would be in the list p. Every
++     file in the list should have these attributes the same,
++     so we don't need to traverse.  */
++  const file_sublist *e = reinterpret_cast<const file_sublist*> (p);
++  const _cpp_file *f = reinterpret_cast<const _cpp_file*> (q);
++  return f->st.st_mtime == e->f->st.st_mtime
++	 && f->st.st_size == e->f->st.st_size;
++}
++
++/* Cleanup for a file sub-list. Does not free the _cpp_file
++   structures within.  */
++void
++file_sublist::del (void *p)
++{
++  file_sublist *e = reinterpret_cast<file_sublist*> (p);
++  if (e->next)
++    {
++      file_sublist::del (e->next);
++      free (e->next);
++    }
++}
++
+ /* Initialize everything in this source file.  */
+ void
+ _cpp_init_files (cpp_reader *pfile)
+@@ -1442,6 +1538,10 @@ _cpp_init_files (cpp_reader *pfile)
+ 					NULL, xcalloc, free);
+   pfile->dir_hash = htab_create_alloc (127, file_hash_hash, file_hash_eq,
+ 					NULL, xcalloc, free);
++  pfile->pragma_once_files = htab_create_alloc (127,
++					file_quick_idempotency_attrs::hash,
++					file_sublist::eq, file_sublist::del,
++					xcalloc, free);
+   allocate_file_hash_entries (pfile);
+   pfile->nonexistent_file_hash = htab_create_alloc (127, htab_hash_string,
+ 						    nonexistent_file_hash_eq,
+@@ -1456,6 +1556,7 @@ _cpp_cleanup_files (cpp_reader *pfile)
+ {
+   htab_delete (pfile->file_hash);
+   htab_delete (pfile->dir_hash);
++  htab_delete (pfile->pragma_once_files);
+   htab_delete (pfile->nonexistent_file_hash);
+   obstack_free (&pfile->nonexistent_file_ob, 0);
+   free_file_hash_entries (pfile);
+diff --git a/libcpp/internal.h b/libcpp/internal.h
+index badfd1b40da..9c3c46df335 100644
+--- a/libcpp/internal.h
++++ b/libcpp/internal.h
+@@ -485,6 +485,9 @@ struct cpp_reader
+      been used.  */
+   bool seen_once_only;
+
++  /* Optimization for #pragma once.  */
++  struct htab *pragma_once_files;
++
+   /* Multiple include optimization.  */
+   const cpp_hashnode *mi_cmacro;
+   const cpp_hashnode *mi_ind_cmacro;
+--
+2.19.1
+
+From fb268a37704b1598a84051c735514ff38adad038 Mon Sep 17 00:00:00 2001
+From: Frederik Harwath <frederik@codesourcery.com>
+Date: Wed, 18 May 2022 07:59:42 +0200
+Subject: [PATCH] graphite: Extend SCoP detection dump output
+
+Extend dump output to make understanding why Graphite rejects to
+include a loop in a SCoP easier (for GCC developers).
+
+gcc/ChangeLog:
+
+	* graphite-scop-detection.cc (scop_detection::can_represent_loop):
+	Output reason for failure to dump file.
+	(scop_detection::harmful_loop_in_region): Likewise.
+	(scop_detection::graphite_can_represent_expr): Likewise.
+	(scop_detection::stmt_has_simple_data_refs_p): Likewise.
+	(scop_detection::stmt_simple_for_scop_p): Likewise.
+	(print_sese_loop_numbers): New function.
+	(scop_detection::add_scop): Use from here.
+
+gcc/testsuite/ChangeLog:
+
+	* gcc.dg/graphite/scop-22a.c: New test.
+---
+ gcc/graphite-scop-detection.cc           | 184 ++++++++++++++++++++---
+ gcc/testsuite/gcc.dg/graphite/scop-22a.c |  56 +++++++
+ 2 files changed, 219 insertions(+), 21 deletions(-)
+ create mode 100644 gcc/testsuite/gcc.dg/graphite/scop-22a.c
+
+diff --git a/gcc/graphite-scop-detection.cc b/gcc/graphite-scop-detection.cc
+index 8c0ee9975579..9792d87ee0ae 100644
+--- a/gcc/graphite-scop-detection.cc
++++ b/gcc/graphite-scop-detection.cc
+@@ -69,12 +69,27 @@ public:
+     fprintf (output.dump_file, "%d", i);
+     return output;
+   }
++
+   friend debug_printer &
+   operator<< (debug_printer &output, const char *s)
+   {
+     fprintf (output.dump_file, "%s", s);
+     return output;
+   }
++
++  friend debug_printer &
++  operator<< (debug_printer &output, gimple* stmt)
++  {
++    print_gimple_stmt (output.dump_file, stmt, 0, TDF_VOPS | TDF_MEMSYMS);
++    return output;
++  }
++
++  friend debug_printer &
++  operator<< (debug_printer &output, tree t)
++  {
++    print_generic_expr (output.dump_file, t, TDF_SLIM);
++    return output;
++  }
+ } dp;
+
+ #define DEBUG_PRINT(args) do \
+@@ -506,6 +521,27 @@ scop_detection::merge_sese (sese_l first, sese_l second) const
+   return combined;
+ }
+
++/* Print the loop numbers of the loops contained in SESE to FILE. */
++
++static void
++print_sese_loop_numbers (FILE *file, sese_l sese)
++{
++  bool first_loop = true;
++  for (loop_p nest = sese.entry->dest->loop_father; nest; nest = nest->next)
++    {
++      if (!loop_in_sese_p (nest, sese))
++        break;
++
++      for (auto loop : loops_list (cfun, LI_INCLUDE_ROOT, nest))
++        {
++          gcc_assert (loop_in_sese_p (loop, sese));
++
++          fprintf (file, "%s%d", first_loop ? "" : ", ", loop->num);
++          first_loop = false;
++        }
++    }
++}
++
+ /* Build scop outer->inner if possible.  */
+
+ void
+@@ -519,6 +555,10 @@ scop_detection::build_scop_depth (loop_p loop)
+       if (! next
+ 	  || harmful_loop_in_region (next))
+ 	{
++	  if (next)
++	    DEBUG_PRINT (dp << "[scop-detection] Discarding SCoP on loops ";
++			 print_sese_loop_numbers (dump_file, next);
++			 dp << " because of harmful loops\n");
+ 	  if (s)
+ 	    add_scop (s);
+ 	  build_scop_depth (loop);
+@@ -560,14 +600,63 @@ scop_detection::can_represent_loop (loop_p loop, sese_l scop)
+       || !single_pred_p (loop->latch)
+       || exit->src != single_pred (loop->latch)
+       || !empty_block_p (loop->latch))
+-    return false;
++    {
++      DEBUG_PRINT (dp << "[can_represent_loop-fail] Loop shape unsupported.\n");
++      return false;
++    }
++
++  bool edge_irreducible = (loop_preheader_edge (loop)->flags
++			   & EDGE_IRREDUCIBLE_LOOP);
++  if (edge_irreducible)
++    {
++      DEBUG_PRINT (dp << "[can_represent_loop-fail] "
++			 "Loop is not a natural loop.\n");
++      return false;
++    }
++
++  bool niter_is_unconditional = number_of_iterations_exit (loop,
++							   single_exit (loop),
++							   &niter_desc, false);
++
++  if (!niter_is_unconditional)
++    {
++      DEBUG_PRINT (dp << "[can_represent_loop-fail] "
++			 "Loop niter not unconditional.\n"
++			 "Condition: " << niter_desc.assumptions << "\n");
++      return false;
++    }
++
++  niter = number_of_latch_executions (loop);
++  if (!niter)
++    {
++      DEBUG_PRINT (dp << "[can_represent_loop-fail] Loop niter unknown.\n");
++      return false;
++    }
++  if (!niter_desc.control.no_overflow)
++    {
++      DEBUG_PRINT (dp << "[can_represent_loop-fail] Loop niter can overflow.\n");
++      return false;
++    }
+
+-  return !(loop_preheader_edge (loop)->flags & EDGE_IRREDUCIBLE_LOOP)
+-    && number_of_iterations_exit (loop, single_exit (loop), &niter_desc, false)
+-    && niter_desc.control.no_overflow
+-    && (niter = number_of_latch_executions (loop))
+-    && !chrec_contains_undetermined (niter)
+-    && graphite_can_represent_expr (scop, loop, niter);
++  bool undetermined_coefficients = chrec_contains_undetermined (niter);
++  if (undetermined_coefficients)
++    {
++      DEBUG_PRINT (dp << "[can_represent_loop-fail] "
++			 "Loop niter chrec contains undetermined "
++			 "coefficients.\n");
++      return false;
++    }
++
++  bool can_represent_expr = graphite_can_represent_expr (scop, loop, niter);
++  if (!can_represent_expr)
++    {
++      DEBUG_PRINT (dp << "[can_represent_loop-fail] "
++		      << "Loop niter expression cannot be represented: "
++		      << niter << "\n");
++      return false;
++    }
++
++  return true;
+ }
+
+ /* Return true when BEGIN is the preheader edge of a loop with a single exit
+@@ -640,6 +729,13 @@ scop_detection::add_scop (sese_l s)
+
+   scops.safe_push (s);
+   DEBUG_PRINT (dp << "[scop-detection] Adding SCoP: "; print_sese (dump_file, s));
++
++  if (dump_file && dump_flags & TDF_DETAILS)
++    {
++      fprintf (dump_file, "Loops in SCoP: ");
++      print_sese_loop_numbers (dump_file, s);
++      fprintf (dump_file, "\n");
++    }
+ }
+
+ /* Return true when a statement in SCOP cannot be represented by Graphite.  */
+@@ -665,7 +761,12 @@ scop_detection::harmful_loop_in_region (sese_l scop) const
+
+       /* The basic block should not be part of an irreducible loop.  */
+       if (bb->flags & BB_IRREDUCIBLE_LOOP)
+-	return true;
++	{
++	  DEBUG_PRINT (dp << "[scop-detection-fail] Found bb in irreducible "
++			     "loop.\n");
++
++	  return true;
++	}
+
+       /* Check for unstructured control flow: CFG not generated by structured
+ 	 if-then-else.  */
+@@ -676,7 +777,11 @@ scop_detection::harmful_loop_in_region (sese_l scop) const
+ 	  FOR_EACH_EDGE (e, ei, bb->succs)
+ 	    if (!dominated_by_p (CDI_POST_DOMINATORS, bb, e->dest)
+ 		&& !dominated_by_p (CDI_DOMINATORS, e->dest, bb))
+-	      return true;
++	      {
++		DEBUG_PRINT (dp << "[scop-detection-fail] Found unstructured "
++				   "control flow.\n");
++		return true;
++	      }
+ 	}
+
+       /* Collect all loops in the current region.  */
+@@ -688,7 +793,11 @@ scop_detection::harmful_loop_in_region (sese_l scop) const
+       for (gimple_stmt_iterator gsi = gsi_start_bb (bb);
+ 	   !gsi_end_p (gsi); gsi_next (&gsi))
+ 	if (!stmt_simple_for_scop_p (scop, gsi_stmt (gsi), bb))
+-	  return true;
++	  {
++	    DEBUG_PRINT (dp << "[scop-detection-fail] "
++			       "Found harmful statement.\n");
++	    return true;
++	  }
+
+       for (basic_block dom = first_dom_son (CDI_DOMINATORS, bb);
+ 	   dom;
+@@ -731,9 +840,10 @@ scop_detection::harmful_loop_in_region (sese_l scop) const
+ 	  && ! loop_nest_has_data_refs (loop))
+ 	{
+ 	  DEBUG_PRINT (dp << "[scop-detection-fail] loop_" << loop->num
+-		       << "does not have any data reference.\n");
++		       << " does not have any data reference.\n");
+ 	  return true;
+ 	}
++      DEBUG_PRINT (dp << "[scop-detection] loop_" << loop->num << " is harmless.\n");
+     }
+
+   return false;
+@@ -922,7 +1032,21 @@ scop_detection::graphite_can_represent_expr (sese_l scop, loop_p loop,
+ 					     tree expr)
+ {
+   tree scev = cached_scalar_evolution_in_region (scop, loop, expr);
+-  return graphite_can_represent_scev (scop, scev);
++  bool can_represent = graphite_can_represent_scev (scop, scev);
++
++  if (!can_represent)
++    {
++      if (dump_file)
++	{
++	  fprintf (dump_file,
++		   "[graphite_can_represent_expr] Cannot represent scev \"");
++	  print_generic_expr (dump_file, scev, TDF_SLIM);
++	  fprintf (dump_file, "\" of expression ");
++	  print_generic_expr (dump_file, expr, TDF_SLIM);
++	  fprintf (dump_file, " in loop %d\n", loop->num);
++	}
++    }
++  return can_represent;
+ }
+
+ /* Return true if the data references of STMT can be represented by Graphite.
+@@ -938,7 +1062,11 @@ scop_detection::stmt_has_simple_data_refs_p (sese_l scop, gimple *stmt)
+
+   auto_vec<data_reference_p> drs;
+   if (! graphite_find_data_references_in_stmt (nest, loop, stmt, &drs))
+-    return false;
++    {
++      DEBUG_PRINT (dp << "[stmt_has_simple_data_refs_p] "
++			 "Unanalyzable statement.\n");
++      return false;
++    }
+
+   int j;
+   data_reference_p dr;
+@@ -946,7 +1074,12 @@ scop_detection::stmt_has_simple_data_refs_p (sese_l scop, gimple *stmt)
+     {
+       for (unsigned i = 0; i < DR_NUM_DIMENSIONS (dr); ++i)
+ 	if (! graphite_can_represent_scev (scop, DR_ACCESS_FN (dr, i)))
+-	  return false;
++	  {
++	    DEBUG_PRINT (dp << "[stmt_has_simple_data_refs_p] "
++			       "Cannot represent access function SCEV: "
++			    << DR_ACCESS_FN (dr, i) << "\n");
++	    return false;
++	  }
+     }
+
+   return true;
+@@ -1027,14 +1160,23 @@ scop_detection::stmt_simple_for_scop_p (sese_l scop, gimple *stmt,
+ 	for (unsigned i = 0; i < 2; ++i)
+ 	  {
+ 	    tree op = gimple_op (stmt, i);
+-	    if (!graphite_can_represent_expr (scop, loop, op)
+-		/* We can only constrain on integer type.  */
+-		|| ! INTEGRAL_TYPE_P (TREE_TYPE (op)))
++	    if (!graphite_can_represent_expr (scop, loop, op))
++	      {
++		DEBUG_PRINT (dump_printf_loc (MSG_MISSED_OPTIMIZATION, stmt,
++					      "[scop-detection-fail] "
++					      "Graphite cannot represent cond "
++					      "stmt operator expression.\n"));
++		DEBUG_PRINT (dp << op << "\n");
++		return false;
++	      }
++
++	    if (! INTEGRAL_TYPE_P (TREE_TYPE (op)))
+ 	      {
+-		DEBUG_PRINT (dp << "[scop-detection-fail] "
+-				<< "Graphite cannot represent stmt:\n";
+-			     print_gimple_stmt (dump_file, stmt, 0,
+-						TDF_VOPS | TDF_MEMSYMS));
++		DEBUG_PRINT (dump_printf_loc (MSG_MISSED_OPTIMIZATION, stmt,
++					      "[scop-detection-fail] "
++					      "Graphite cannot represent cond "
++					      "statement operator. "
++					      "Type must be integral.\n"));
+ 		return false;
+ 	      }
+ 	  }
+diff --git a/gcc/testsuite/gcc.dg/graphite/scop-22a.c b/gcc/testsuite/gcc.dg/graphite/scop-22a.c
+new file mode 100644
+index 000000000000..00d4b5315aeb
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/graphite/scop-22a.c
+@@ -0,0 +1,56 @@
++/* { dg-require-effective-target size32plus } */
++double u[1782225];
++
++void foo(int N, int *res)
++{
++  int i, j;
++  double a, b;
++  double sum = 0.0;
++
++  for (j = 3; j < N; j = j * j)
++    {
++      sum += a + b;
++    }
++
++  /* Next two loops form first SCoP */
++  for (i = 0; i < N; i++)
++    sum += u[i];
++
++  for (i = 0; i < N; i++)
++    {
++      a = u[i];
++      u[i] = i * i;
++      b = u[i];
++      sum += a + b;
++    }
++
++  for (j = 3; j < N; j = j * j)
++    {
++      sum += a + b;
++    }
++
++  for (j = 3; j < N; j = j * j)
++    {
++      sum += a + b;
++    }
++
++  /* Next two loop-nests form second SCoP */
++  for (i = 0; i < N; i++)
++    sum += u[i];
++
++  for (i = 0; i < N; i++)
++    for (j = 0; j < N; j++)
++      {
++	a = u[i];
++	u[i] = i * i;
++	b = u[j];
++	sum += a + b;
++      }
++
++  *res = sum + N;
++}
++
++/* { dg-final { scan-tree-dump-times "number of SCoPs: 2" 1 "graphite"} } */
++/* { dg-final { scan-tree-dump-times "Loops in SCoP" 2 "graphite"} } */
++/* { dg-final { scan-tree-dump "Loops in SCoP: 2, 3" "graphite"} } */
++/* { dg-final { scan-tree-dump "Loops in SCoP: 6, 7, 8" "graphite"} } */
+--
+2.36.0
+
+graphite: Rename isl_id_for_ssa_name
+
+The SSA names for which this function gets used are always SCoP
+parameters and hence "isl_id_for_parameter" is a better name.  It also
+explains the prefix "P_" for those names in the ISL representation.
+
+gcc/ChangeLog:
+
+	* graphite-sese-to-poly.cc (isl_id_for_ssa_name): Rename to ...
+	(isl_id_for_parameter): ... this new function name.
+	(build_scop_context): Adjust function use.
+
+ gcc/graphite-sese-to-poly.cc | 21 +++++++++++----------
+ 1 file changed, 11 insertions(+), 10 deletions(-)
+
+diff --git a/gcc/graphite-sese-to-poly.cc b/gcc/graphite-sese-to-poly.cc
+index 5a6d779052c..ea67b267e1c 100644
+--- a/gcc/graphite-sese-to-poly.cc
++++ b/gcc/graphite-sese-to-poly.cc
+@@ -100,14 +100,15 @@ extract_affine_mul (scop_p s, tree e, __isl_take isl_space *space)
+   return isl_pw_aff_mul (lhs, rhs);
+ }
+
+-/* Return an isl identifier from the name of the ssa_name E.  */
++/* Return an isl identifier for the parameter P.  */
+
+ static isl_id *
+-isl_id_for_ssa_name (scop_p s, tree e)
++isl_id_for_parameter (scop_p s, tree p)
+ {
+-  char name1[14];
+-  snprintf (name1, sizeof (name1), "P_%d", SSA_NAME_VERSION (e));
+-  return isl_id_alloc (s->isl_context, name1, e);
++  gcc_checking_assert (TREE_CODE (p) == SSA_NAME);
++  char name[14];
++  snprintf (name, sizeof (name), "P_%d", SSA_NAME_VERSION (p));
++  return isl_id_alloc (s->isl_context, name, p);
+ }
+
+ /* Return an isl identifier for the data reference DR.  Data references and
+@@ -898,15 +899,15 @@ build_scop_context (scop_p scop)
+   isl_space *space = isl_space_set_alloc (scop->isl_context, nbp, 0);
+
+   unsigned i;
+-  tree e;
+-  FOR_EACH_VEC_ELT (region->params, i, e)
++  tree p;
++  FOR_EACH_VEC_ELT (region->params, i, p)
+     space = isl_space_set_dim_id (space, isl_dim_param, i,
+-                                  isl_id_for_ssa_name (scop, e));
++				  isl_id_for_parameter (scop, p));
+
+   scop->param_context = isl_set_universe (space);
+
+-  FOR_EACH_VEC_ELT (region->params, i, e)
+-    add_param_constraints (scop, i, e);
++  FOR_EACH_VEC_ELT (region->params, i, p)
++    add_param_constraints (scop, i, p);
+ }
+
+ /* Return true when loop A is nested in loop B.  */
+
+graphite: Fix minor mistakes in comments
+
+gcc/ChangeLog:
+
+	* graphite-sese-to-poly.cc (build_poly_sr_1): Fix a typo and
+	a reference to a variable which does not exist.
+	* graphite-isl-ast-to-gimple.cc (gsi_insert_earliest): Fix typo
+	in comment.
+
+ gcc/graphite-isl-ast-to-gimple.cc | 2 +-
+ gcc/graphite-sese-to-poly.cc      | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/gcc/graphite-isl-ast-to-gimple.cc b/gcc/graphite-isl-ast-to-gimple.cc
+index 45ed7704807..844b6d4e2b5 100644
+--- a/gcc/graphite-isl-ast-to-gimple.cc
++++ b/gcc/graphite-isl-ast-to-gimple.cc
+@@ -1014,7 +1014,7 @@ gsi_insert_earliest (gimple_seq seq)
+   basic_block begin_bb = get_entry_bb (codegen_region);
+
+   /* Inserting the gimple statements in a vector because gimple_seq behave
+-     in strage ways when inserting the stmts from it into different basic
++     in strange ways when inserting the stmts from it into different basic
+      blocks one at a time.  */
+   auto_vec<gimple *, 3> stmts;
+   for (gimple_stmt_iterator gsi = gsi_start (seq); !gsi_end_p (gsi);
+diff --git a/gcc/graphite-sese-to-poly.cc b/gcc/graphite-sese-to-poly.cc
+index ea67b267e1c..51ba3af204f 100644
+--- a/gcc/graphite-sese-to-poly.cc
++++ b/gcc/graphite-sese-to-poly.cc
+@@ -649,14 +649,14 @@ build_poly_sr_1 (poly_bb_p pbb, gimple *stmt, tree var, enum poly_dr_type kind,
+ 		 isl_map *acc, isl_set *subscript_sizes)
+ {
+   scop_p scop = PBB_SCOP (pbb);
+-  /* Each scalar variables has a unique alias set number starting from
++  /* Each scalar variable has a unique alias set number starting from
+      the maximum alias set assigned to a dr.  */
+   int alias_set = scop->max_alias_set + SSA_NAME_VERSION (var);
+   subscript_sizes = isl_set_fix_si (subscript_sizes, isl_dim_set, 0,
+ 				    alias_set);
+
+   /* Add a constrain to the ACCESSES polyhedron for the alias set of
+-     data reference DR.  */
++     the reference.  */
+   isl_constraint *c
+     = isl_equality_alloc (isl_local_space_from_space (isl_map_get_space (acc)));
+   c = isl_constraint_set_constant_si (c, -alias_set);
+
+The code to remove LC PHI nodes in clean_up_loop_closed_phi does not handle
+virtual operands because may_propagate_copy generally returns false
+for them.  The following copies the merge_blocks variant for
+dealing with them.
+
+This fixes a missed jump threading in gcc.dg/auto-init-uninit-4.c
+which manifests in bogus uninit diagnostics.
+
+Bootstrap and regtest pending on x86_64-unknown-linux-gnu.
+
+	PR tree-optimization/106186
+	* tree-ssa-propagate.cc (clean_up_loop_closed_phi):
+	Properly handle virtual PHI nodes.
+---
+ gcc/tree-ssa-propagate.cc | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/gcc/tree-ssa-propagate.cc b/gcc/tree-ssa-propagate.cc
+index 163b24f0e69..9dc4bfd85bf 100644
+--- a/gcc/tree-ssa-propagate.cc
++++ b/gcc/tree-ssa-propagate.cc
+@@ -1272,7 +1272,21 @@ clean_up_loop_closed_phi (function *fun)
+ 	      rhs = gimple_phi_arg_def (phi, 0);
+ 	      lhs = gimple_phi_result (phi);
+
+-	      if (rhs && may_propagate_copy (lhs, rhs))
++	      if (virtual_operand_p (rhs))
++		{
++		  imm_use_iterator iter;
++		  use_operand_p use_p;
++		  gimple *stmt;
++
++		  FOR_EACH_IMM_USE_STMT (stmt, iter, lhs)
++		    FOR_EACH_IMM_USE_ON_STMT (use_p, iter)
++		      SET_USE (use_p, rhs);
++
++		  if (SSA_NAME_OCCURS_IN_ABNORMAL_PHI (lhs))
++		    SSA_NAME_OCCURS_IN_ABNORMAL_PHI (rhs) = 1;
++		  remove_phi_node (&gsi, true);
++		}
++	      else if (may_propagate_copy (lhs, rhs))
+ 		{
+ 		  /* Dump details.  */
+ 		  if (dump_file && (dump_flags & TDF_DETAILS))
+--
+2.35.3
+
+The following avoids copying and using blocks_to_update to
+the interesting_blocks sbitmap when doing update_ssa as it is
+unused besides the redundant query in the domwalk.
+
+Bootstrapped and tested on x86_64-unknown-linux-gnu, pushed.
+
+	* tree-into-ssa.cc (rewrite_update_dom_walker::before_dom_children):
+	Do not look at interesting_blocks which is a copy of
+	blocks_to_update.
+	(update_ssa): Do not initialize it.
+	(pass_build_ssa::execute): Set interesting_blocks to NULL
+	after releasing it.
+---
+ gcc/tree-into-ssa.cc | 22 ++++++----------------
+ 1 file changed, 6 insertions(+), 16 deletions(-)
+
+diff --git a/gcc/tree-into-ssa.cc b/gcc/tree-into-ssa.cc
+index c4e40e8fb08..c90651c3a89 100644
+--- a/gcc/tree-into-ssa.cc
++++ b/gcc/tree-into-ssa.cc
+@@ -2214,15 +2214,11 @@ rewrite_update_dom_walker::before_dom_children (basic_block bb)
+     }
+
+   /* Step 2.  Rewrite every variable used in each statement in the block.  */
+-  if (bitmap_bit_p (interesting_blocks, bb->index))
+-    {
+-      gcc_checking_assert (bitmap_bit_p (blocks_to_update, bb->index));
+-      for (gimple_stmt_iterator gsi = gsi_start_bb (bb); !gsi_end_p (gsi); )
+-	if (rewrite_update_stmt (gsi_stmt (gsi), gsi))
+-	  gsi_remove (&gsi, true);
+-	else
+-	  gsi_next (&gsi);
+-    }
++  for (gimple_stmt_iterator gsi = gsi_start_bb (bb); !gsi_end_p (gsi); )
++    if (rewrite_update_stmt (gsi_stmt (gsi), gsi))
++      gsi_remove (&gsi, true);
++    else
++      gsi_next (&gsi);
+
+   /* Step 3.  Update PHI nodes.  */
+   rewrite_update_phi_arguments (bb);
+@@ -2460,6 +2456,7 @@ pass_build_ssa::execute (function *fun)
+   free (dfs);
+
+   sbitmap_free (interesting_blocks);
++  interesting_blocks = NULL;
+
+   fini_ssa_renamer ();
+
+@@ -3503,15 +3500,8 @@ update_ssa (unsigned update_flags)
+     get_var_info (sym)->info.current_def = NULL_TREE;
+
+   /* Now start the renaming process at START_BB.  */
+-  interesting_blocks = sbitmap_alloc (last_basic_block_for_fn (cfun));
+-  bitmap_clear (interesting_blocks);
+-  EXECUTE_IF_SET_IN_BITMAP (blocks_to_update, 0, i, bi)
+-    bitmap_set_bit (interesting_blocks, i);
+-
+   rewrite_blocks (start_bb, REWRITE_UPDATE);
+
+-  sbitmap_free (interesting_blocks);
+-
+   /* Debugging dumps.  */
+   if (dump_file)
+     {
+--
+2.35.3
+
+The following avoids the need to massage the target optimization
+node at WPA time when we fixup the optimization node, copying
+FP related flags from callee to caller.  The target is already
+set up to fixup, but that only works when not switching between
+functions.  After fixing that the fixup is then done at LTRANS
+time when materializing the function.
+
+Bootstrapped and tested on x86_64-unknown-linux-gnu, ok?
+
+Thanks,
+Richard.
+
+2022-07-01  Richard Biener  <rguenthert@suse.de>
+
+	PR target/105459
+	* config/i386/i386-options.cc (ix86_set_current_function):
+	Rebuild the target optimization node whenever necessary,
+	not only when the optimization node didn't change.
+
+	* gcc.dg/lto/pr105459_0.c: New testcase.
+---
+ gcc/config/i386/i386-options.cc       | 32 ++++++++++--------------
+ gcc/testsuite/gcc.dg/lto/pr105459_0.c | 35 +++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+), 19 deletions(-)
+ create mode 100644 gcc/testsuite/gcc.dg/lto/pr105459_0.c
+
+diff --git a/gcc/config/i386/i386-options.cc b/gcc/config/i386/i386-options.cc
+index e11f68186f5..acb2291e70f 100644
+--- a/gcc/config/i386/i386-options.cc
++++ b/gcc/config/i386/i386-options.cc
+@@ -3232,28 +3232,22 @@ ix86_set_current_function (tree fndecl)
+   if (new_tree == NULL_TREE)
+     new_tree = target_option_default_node;
+
+-  if (old_tree != new_tree)
++  bool fp_flag_change
++    = (flag_unsafe_math_optimizations
++       != TREE_TARGET_OPTION (new_tree)->x_ix86_unsafe_math_optimizations
++       || (flag_excess_precision
++	   != TREE_TARGET_OPTION (new_tree)->x_ix86_excess_precision));
++  if (old_tree != new_tree || fp_flag_change)
+     {
+       cl_target_option_restore (&global_options, &global_options_set,
+ 				TREE_TARGET_OPTION (new_tree));
+-      if (TREE_TARGET_GLOBALS (new_tree))
+-	restore_target_globals (TREE_TARGET_GLOBALS (new_tree));
+-      else if (new_tree == target_option_default_node)
+-	restore_target_globals (&default_target_globals);
+-      else
+-	TREE_TARGET_GLOBALS (new_tree) = save_target_globals_default_opts ();
+-    }
+-  else if (flag_unsafe_math_optimizations
+-	   != TREE_TARGET_OPTION (new_tree)->x_ix86_unsafe_math_optimizations
+-	   || (flag_excess_precision
+-	       != TREE_TARGET_OPTION (new_tree)->x_ix86_excess_precision))
+-    {
+-      cl_target_option_restore (&global_options, &global_options_set,
+-				TREE_TARGET_OPTION (new_tree));
+-      ix86_excess_precision = flag_excess_precision;
+-      ix86_unsafe_math_optimizations = flag_unsafe_math_optimizations;
+-      DECL_FUNCTION_SPECIFIC_TARGET (fndecl) = new_tree
+-	= build_target_option_node (&global_options, &global_options_set);
++      if (fp_flag_change)
++	{
++	  ix86_excess_precision = flag_excess_precision;
++	  ix86_unsafe_math_optimizations = flag_unsafe_math_optimizations;
++	  DECL_FUNCTION_SPECIFIC_TARGET (fndecl) = new_tree
++	    = build_target_option_node (&global_options, &global_options_set);
++	}
+       if (TREE_TARGET_GLOBALS (new_tree))
+ 	restore_target_globals (TREE_TARGET_GLOBALS (new_tree));
+       else if (new_tree == target_option_default_node)
+diff --git a/gcc/testsuite/gcc.dg/lto/pr105459_0.c b/gcc/testsuite/gcc.dg/lto/pr105459_0.c
+new file mode 100644
+index 00000000000..c799e6ef23d
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/lto/pr105459_0.c
+@@ -0,0 +1,35 @@
++/* { dg-lto-do link } */
++/* { dg-lto-options { { -flto -O1 } } } */
++
++double m;
++int n;
++
++__attribute__ ((optimize ("-funsafe-math-optimizations")))
++void
++bar (int x)
++{
++  n = x;
++  m = n;
++}
++
++__attribute__ ((flatten))
++void
++foo (int x)
++{
++  bar (x);
++}
++
++void
++quux (void)
++{
++  ++n;
++}
++
++int
++main (void)
++{
++  foo (0);
++  quux ();
++
++  return 0;
++}
+--
+2.35.3
+
+1. Add a predicate for constant vectors which can be converted to integer
+constants suitable for constant integer stores.  For a 8-byte constant
+vector, the converted 64-bit integer must be valid for store with 64-bit
+immediate, which is a 64-bit integer sign-extended from a 32-bit integer.
+2. Add a new pattern to allow 2-byte, 4-byte and 8-byte constant vector
+stores, like
+
+(set (mem:V2HI (reg:DI 84))
+     (const_vector:V2HI [(const_int 0 [0]) (const_int 1 [0x1])]))
+
+3. After reload, convert constant vector stores to constant integer
+stores, like
+
+(set (mem:SI (reg:DI 5 di [84]))
+     (const_int 65536 [0x10000]))
+
+For
+
+void
+foo (short * c)
+{
+  c[0] = 0;
+  c[1] = 1;
+}
+
+it generates
+
+	movl	$65536, (%rdi)
+
+instead of
+
+	movl	.LC0(%rip), %eax
+	movl	%eax, (%rdi)
+
+gcc/
+
+	PR target/106022
+	* config/i386/i386-protos.h (ix86_convert_const_vector_to_integer):
+	New.
+	* config/i386/i386.cc (ix86_convert_const_vector_to_integer):
+	New.
+	* config/i386/mmx.md (V_16_32_64): New.
+	(*mov<mode>_imm): New patterns for stores with 16-bit, 32-bit
+	and 64-bit constant vector.
+	* config/i386/predicates.md (x86_64_const_vector_operand): New.
+
+gcc/testsuite/
+
+	PR target/106022
+	* gcc.target/i386/pr106022-1.c: New test.
+	* gcc.target/i386/pr106022-2.c: Likewise.
+	* gcc.target/i386/pr106022-3.c: Likewise.
+	* gcc.target/i386/pr106022-4.c: Likewise.
+---
+ gcc/config/i386/i386-protos.h              |  2 +
+ gcc/config/i386/i386.cc                    | 47 ++++++++++++++++++++++
+ gcc/config/i386/mmx.md                     | 37 +++++++++++++++++
+ gcc/config/i386/predicates.md              | 11 +++++
+ gcc/testsuite/gcc.target/i386/pr106022-1.c | 13 ++++++
+ gcc/testsuite/gcc.target/i386/pr106022-2.c | 14 +++++++
+ gcc/testsuite/gcc.target/i386/pr106022-3.c | 14 +++++++
+ gcc/testsuite/gcc.target/i386/pr106022-4.c | 14 +++++++
+ 8 files changed, 152 insertions(+)
+ create mode 100644 gcc/testsuite/gcc.target/i386/pr106022-1.c
+ create mode 100644 gcc/testsuite/gcc.target/i386/pr106022-2.c
+ create mode 100644 gcc/testsuite/gcc.target/i386/pr106022-3.c
+ create mode 100644 gcc/testsuite/gcc.target/i386/pr106022-4.c
+
+diff --git a/gcc/config/i386/i386-protos.h b/gcc/config/i386/i386-protos.h
+index 3596ce81ecf..cf847751ac5 100644
+--- a/gcc/config/i386/i386-protos.h
++++ b/gcc/config/i386/i386-protos.h
+@@ -122,6 +122,8 @@ extern void ix86_expand_unary_operator (enum rtx_code, machine_mode,
+ 					rtx[]);
+ extern rtx ix86_build_const_vector (machine_mode, bool, rtx);
+ extern rtx ix86_build_signbit_mask (machine_mode, bool, bool);
++extern HOST_WIDE_INT ix86_convert_const_vector_to_integer (rtx,
++							   machine_mode);
+ extern void ix86_split_convert_uns_si_sse (rtx[]);
+ extern void ix86_expand_convert_uns_didf_sse (rtx, rtx);
+ extern void ix86_expand_convert_uns_sixf_sse (rtx, rtx);
+diff --git a/gcc/config/i386/i386.cc b/gcc/config/i386/i386.cc
+index b15b4893bb9..0cfe9962f75 100644
+--- a/gcc/config/i386/i386.cc
++++ b/gcc/config/i386/i386.cc
+@@ -15723,6 +15723,53 @@ ix86_build_signbit_mask (machine_mode mode, bool vect, bool invert)
+   return force_reg (vec_mode, v);
+ }
+
++/* Return HOST_WIDE_INT for const vector OP in MODE.  */
++
++HOST_WIDE_INT
++ix86_convert_const_vector_to_integer (rtx op, machine_mode mode)
++{
++  if (GET_MODE_SIZE (mode) > UNITS_PER_WORD)
++    gcc_unreachable ();
++
++  int nunits = GET_MODE_NUNITS (mode);
++  wide_int val = wi::zero (GET_MODE_BITSIZE (mode));
++  machine_mode innermode = GET_MODE_INNER (mode);
++  unsigned int innermode_bits = GET_MODE_BITSIZE (innermode);
++
++  switch (mode)
++    {
++    case E_V2QImode:
++    case E_V4QImode:
++    case E_V2HImode:
++    case E_V8QImode:
++    case E_V4HImode:
++    case E_V2SImode:
++      for (int i = 0; i < nunits; ++i)
++	{
++	  int v = INTVAL (XVECEXP (op, 0, i));
++	  wide_int wv = wi::shwi (v, innermode_bits);
++	  val = wi::insert (val, wv, innermode_bits * i, innermode_bits);
++	}
++      break;
++    case E_V2HFmode:
++    case E_V4HFmode:
++    case E_V2SFmode:
++      for (int i = 0; i < nunits; ++i)
++	{
++	  rtx x = XVECEXP (op, 0, i);
++	  int v = real_to_target (NULL, CONST_DOUBLE_REAL_VALUE (x),
++				  REAL_MODE_FORMAT (innermode));
++	  wide_int wv = wi::shwi (v, innermode_bits);
++	  val = wi::insert (val, wv, innermode_bits * i, innermode_bits);
++	}
++      break;
++    default:
++      gcc_unreachable ();
++    }
++
++  return val.to_shwi ();
++}
++
+ /* Return TRUE or FALSE depending on whether the first SET in INSN
+    has source and destination with matching CC modes, and that the
+    CC mode is at least as constrained as REQ_MODE.  */
+diff --git a/gcc/config/i386/mmx.md b/gcc/config/i386/mmx.md
+index ba53007a35e..3294c1e6274 100644
+--- a/gcc/config/i386/mmx.md
++++ b/gcc/config/i386/mmx.md
+@@ -69,6 +69,12 @@ (define_mode_iterator VI_16_32 [V4QI V2QI V2HI])
+ ;; 4-byte and 2-byte QImode vector modes
+ (define_mode_iterator VI1_16_32 [V4QI V2QI])
+
++;; All 2-byte, 4-byte and 8-byte vector modes with more than 1 element
++(define_mode_iterator V_16_32_64
++   [V2QI V4QI V2HI V2HF
++    (V8QI "TARGET_64BIT") (V4HI "TARGET_64BIT") (V4HF "TARGET_64BIT")
++    (V2SI "TARGET_64BIT") (V2SF "TARGET_64BIT")])
++
+ ;; V2S* modes
+ (define_mode_iterator V2FI [V2SF V2SI])
+
+@@ -331,6 +337,37 @@ (define_insn "*mov<mode>_internal"
+ 	   ]
+ 	   (symbol_ref "true")))])
+
++;; 16-bit, 32-bit and 64-bit constant vector stores.  After reload,
++;; convert them to immediate integer stores.
++(define_insn_and_split "*mov<mode>_imm"
++  [(set (match_operand:V_16_32_64 0 "memory_operand" "=m")
++	(match_operand:V_16_32_64 1 "x86_64_const_vector_operand" "i"))]
++  ""
++  "#"
++  "&& reload_completed"
++  [(set (match_dup 0) (match_dup 1))]
++{
++  HOST_WIDE_INT val = ix86_convert_const_vector_to_integer (operands[1],
++							    <MODE>mode);
++  operands[1] = GEN_INT (val);
++  machine_mode mode;
++  switch (GET_MODE_SIZE (<MODE>mode))
++    {
++    case 2:
++      mode = HImode;
++      break;
++    case 4:
++      mode = SImode;
++      break;
++    case 8:
++      mode = DImode;
++      break;
++    default:
++      gcc_unreachable ();
++    }
++  operands[0] = lowpart_subreg (mode, operands[0], <MODE>mode);
++})
++
+ ;; For TARGET_64BIT we always round up to 8 bytes.
+ (define_insn "*push<mode>2_rex64"
+   [(set (match_operand:V_32 0 "push_operand" "=X,X")
+diff --git a/gcc/config/i386/predicates.md b/gcc/config/i386/predicates.md
+index 128144f1050..c71c453cceb 100644
+--- a/gcc/config/i386/predicates.md
++++ b/gcc/config/i386/predicates.md
+@@ -1194,6 +1194,17 @@ (define_predicate "reg_or_const_vector_operand"
+   (ior (match_operand 0 "register_operand")
+        (match_code "const_vector")))
+
++;; Return true when OP is CONST_VECTOR which can be converted to a
++;; sign extended 32-bit integer.
++(define_predicate "x86_64_const_vector_operand"
++  (match_code "const_vector")
++{
++  if (GET_MODE_SIZE (mode) > UNITS_PER_WORD)
++    return false;
++  HOST_WIDE_INT val = ix86_convert_const_vector_to_integer (op, mode);
++  return trunc_int_for_mode (val, SImode) == val;
++})
++
+ ;; Return true when OP is nonimmediate or standard SSE constant.
+ (define_predicate "nonimmediate_or_sse_const_operand"
+   (ior (match_operand 0 "nonimmediate_operand")
+diff --git a/gcc/testsuite/gcc.target/i386/pr106022-1.c b/gcc/testsuite/gcc.target/i386/pr106022-1.c
+new file mode 100644
+index 00000000000..6643b4c30f1
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/i386/pr106022-1.c
+@@ -0,0 +1,13 @@
++/* { dg-do compile } */
++/* { dg-options "-O2 -march=x86-64" } */
++
++void
++foo (char *c)
++{
++  c[0] = 0;
++  c[1] = 1;
++  c[2] = 2;
++  c[3] = 3;
++}
++
++/* { dg-final { scan-assembler-times "movl\[ \\t\]+\\\$50462976," 1 } } */
+diff --git a/gcc/testsuite/gcc.target/i386/pr106022-2.c b/gcc/testsuite/gcc.target/i386/pr106022-2.c
+new file mode 100644
+index 00000000000..0e79fb53297
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/i386/pr106022-2.c
+@@ -0,0 +1,14 @@
++/* { dg-do compile } */
++/* { dg-options "-O2 -march=x86-64" } */
++
++void
++foo (int *c)
++{
++  c = __builtin_assume_aligned (c, 16);
++  c[0] = -1;
++  c[1] = -1;
++}
++
++/* { dg-final { scan-assembler-times "movq\[ \\t\]+\[^\n\]*%xmm" 2 { target { ia32 } } } } */
++/* { dg-final { scan-assembler-times "movq\[ \\t\]+\\\$-1," 1 { target { ! ia32 } } } } */
++/* { dg-final { scan-assembler-not "xmm" { target { ! ia32 } } } } */
+diff --git a/gcc/testsuite/gcc.target/i386/pr106022-3.c b/gcc/testsuite/gcc.target/i386/pr106022-3.c
+new file mode 100644
+index 00000000000..8b0c2a8f6d8
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/i386/pr106022-3.c
+@@ -0,0 +1,14 @@
++/* { dg-do compile } */
++/* { dg-options "-O2 -march=x86-64" } */
++
++void
++foo (int *c)
++{
++  c[0] = 0;
++  c[1] = 1;
++  c[2] = 2;
++  c[3] = 3;
++}
++
++/* { dg-final { scan-assembler-times "movdqa\[ \\t\]+\[^\n\]*%xmm" 1 } } */
++/* { dg-final { scan-assembler-times "movups\[ \\t\]+\[^\n\]*%xmm" 1 } } */
+diff --git a/gcc/testsuite/gcc.target/i386/pr106022-4.c b/gcc/testsuite/gcc.target/i386/pr106022-4.c
+new file mode 100644
+index 00000000000..8ecda170af3
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/i386/pr106022-4.c
+@@ -0,0 +1,14 @@
++/* { dg-do compile } */
++/* { dg-options "-O2 -march=x86-64" } */
++
++void
++foo (float *c)
++{
++  c[0] = 2.3;
++  c[1] = 0.0;
++}
++
++/* { dg-final { scan-assembler-times "movl\[ \\t\]+\\\$0x40133333" 1 { target { ia32 } } } } */
++/* { dg-final { scan-assembler-times "movl\[ \\t\]+\\\$0x00000000" 1 { target { ia32 } } } } */
++/* { dg-final { scan-assembler-times "movq\[ \\t\]+\\\$1075000115," 1 { target { ! ia32 } } } } */
++/* { dg-final { scan-assembler-not "xmm" } } */
+--
+2.36.1
+
+As the testcase in PR 105860 shows, the code that tries to re-use the
+handled_component chains in SRA can be horribly confused by unions,
+where it thinks it has found a compatible structure under which it can
+chain the references, but in fact it found the type it was looking
+for elsewhere in a union and generated a write to a completely wrong
+part of an aggregate.
+
+I don't remember whether the plan was to support unions at all in
+build_reconstructed_reference but it can work, to an extent, if we
+make sure that we start the search only outside the outermost union,
+which is what the patch does (and the extra testcase verifies).
+
+Bootstrapped and tested on x86_64-linux.  OK for trunk and then for
+release branches?
+
+Thanks,
+
+Martin
+
+
+gcc/ChangeLog:
+
+2022-07-01  Martin Jambor  <mjambor@suse.cz>
+
+	PR tree-optimization/105860
+	* tree-sra.cc (build_reconstructed_reference): Start expr
+	traversal only just below the outermost union.
+
+gcc/testsuite/ChangeLog:
+
+2022-07-01  Martin Jambor  <mjambor@suse.cz>
+
+	PR tree-optimization/105860
+	* gcc.dg/tree-ssa/alias-access-path-13.c: New test.
+	* gcc.dg/tree-ssa/pr105860.c: Likewise.
+---
+ .../gcc.dg/tree-ssa/alias-access-path-13.c    | 31 +++++++++
+ gcc/testsuite/gcc.dg/tree-ssa/pr105860.c      | 63 +++++++++++++++++++
+ gcc/tree-sra.cc                               | 13 +++-
+ 3 files changed, 106 insertions(+), 1 deletion(-)
+ create mode 100644 gcc/testsuite/gcc.dg/tree-ssa/alias-access-path-13.c
+ create mode 100644 gcc/testsuite/gcc.dg/tree-ssa/pr105860.c
+
+diff --git a/gcc/testsuite/gcc.dg/tree-ssa/alias-access-path-13.c b/gcc/testsuite/gcc.dg/tree-ssa/alias-access-path-13.c
+new file mode 100644
+index 00000000000..e502a97bc75
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/tree-ssa/alias-access-path-13.c
+@@ -0,0 +1,31 @@
++/* { dg-do compile } */
++/* { dg-options "-O2 -fdump-tree-fre1" } */
++
++struct inn
++{
++  int val;
++};
++
++union foo
++{
++  struct inn inn;
++  long int baz;
++} *fooptr;
++
++struct bar
++{
++  union foo foo;
++  int val2;
++} *barptr;
++
++int
++test ()
++{
++  union foo foo;
++  foo.inn.val = 0;
++  barptr->val2 = 123;
++  *fooptr = foo;
++  return barptr->val2;
++}
++
++/* { dg-final { scan-tree-dump-times "return 123" 1 "fre1"} } */
+diff --git a/gcc/testsuite/gcc.dg/tree-ssa/pr105860.c b/gcc/testsuite/gcc.dg/tree-ssa/pr105860.c
+new file mode 100644
+index 00000000000..77bcb4a6739
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/tree-ssa/pr105860.c
+@@ -0,0 +1,63 @@
++/* { dg-do run } */
++/* { dg-options "-O1" } */
++
++struct S1  {
++        unsigned int _0;
++        unsigned int _1;
++} ;
++struct S2  {
++        struct S1 _s1;
++        unsigned long _x2;
++} ;
++
++struct ufld_type1  {
++        unsigned int _u1t;
++        struct S2 _s2;
++} ;
++
++struct ufld_type2  {
++        unsigned int _u2t;
++        struct S1 _s1;
++} ;
++struct parm_type {
++        union {
++                struct ufld_type1 var_1;
++                struct ufld_type2 var_2;
++        } U;
++};
++
++struct parm_type  bad_function( struct parm_type arg0 )
++{
++        struct parm_type rv;
++        struct S2 var4;
++        switch( arg0.U.var_2._u2t ) {
++        case 4294967041:
++                var4._s1 = arg0.U.var_1._s2._s1;
++                rv.U.var_1._u1t = 4294967041;
++                rv.U.var_1._s2 = var4;
++                break;
++        case 4294967043:
++                rv.U.var_2._u2t = 4294967043;
++                rv.U.var_2._s1 = arg0.U.var_2._s1;
++                break;
++        default:
++                break;
++        }
++        return rv;
++}
++
++int main() {
++        struct parm_type val;
++        struct parm_type out;
++        val.U.var_2._u2t = 4294967043;
++        val.U.var_2._s1._0 = 0x01010101;
++        val.U.var_2._s1._1 = 0x02020202;
++        out = bad_function(val);
++	if (val.U.var_2._u2t != 4294967043)
++	  __builtin_abort ();
++        if (out.U.var_2._s1._0 != 0x01010101)
++	  __builtin_abort ();
++        if (val.U.var_2._s1._1 != 0x02020202 )
++	  __builtin_abort ();
++	return 0;
++}
+diff --git a/gcc/tree-sra.cc b/gcc/tree-sra.cc
+index 081c51b58a4..099e8dbe873 100644
+--- a/gcc/tree-sra.cc
++++ b/gcc/tree-sra.cc
+@@ -1667,7 +1667,18 @@ build_ref_for_offset (location_t loc, tree base, poly_int64 offset,
+ static tree
+ build_reconstructed_reference (location_t, tree base, struct access *model)
+ {
+-  tree expr = model->expr, prev_expr = NULL;
++  tree expr = model->expr;
++  /* We have to make sure to start just below the outermost union.  */
++  tree start_expr = expr;
++  while (handled_component_p (expr))
++    {
++      if (TREE_CODE (TREE_TYPE (TREE_OPERAND (expr, 0))) == UNION_TYPE)
++	start_expr = expr;
++      expr = TREE_OPERAND (expr, 0);
++    }
++
++  expr = start_expr;
++  tree prev_expr = NULL_TREE;
+   while (!types_compatible_p (TREE_TYPE (expr), TREE_TYPE (base)))
+     {
+       if (!handled_component_p (expr))
+--
+2.36.1
+
+From 842ab824d565d5ab823bb6da55ad7adb36f87bf3 Mon Sep 17 00:00:00 2001
+From: Haochen Jiang <haochen.jiang@intel.com>
+Date: Mon, 30 May 2022 17:12:31 +0800
+Subject: [PATCH] i386: Extend cvtps2pd to memory
+
+gcc/ChangeLog:
+
+	PR target/43618
+	* config/i386/sse.md (extendv2sfv2df2): New define_expand.
+	(sse2_cvtps2pd_<mask_name>): Change constraint of operands[1].
+	(*sse2_cvtps2pd_<mask_name>_1): Rename from extendvsdfv2df2.
+
+gcc/testsuite/ChangeLog:
+
+	PR target/43618
+	* gcc.target/i386/pr43618-1.c: New test.
+---
+ gcc/config/i386/sse.md                    | 26 ++++++++++++++++++-----
+ gcc/testsuite/gcc.target/i386/pr43618-1.c | 12 +++++++++++
+ 2 files changed, 33 insertions(+), 5 deletions(-)
+ create mode 100644 gcc/testsuite/gcc.target/i386/pr43618-1.c
+
+diff --git a/gcc/config/i386/sse.md b/gcc/config/i386/sse.md
+index 8b2602bfa79..742bb6c222c 100644
+--- a/gcc/config/i386/sse.md
++++ b/gcc/config/i386/sse.md
+@@ -9175,11 +9175,27 @@
+    (set_attr "prefix" "evex")
+    (set_attr "mode" "<sseinsnmode>")])
+
++(define_expand "extendv2sfv2df2"
++  [(set (match_operand:V2DF 0 "register_operand")
++	(float_extend:V2DF
++	  (match_operand:V2SF 1 "nonimmediate_operand")))]
++  "TARGET_MMX_WITH_SSE"
++{
++  if (!MEM_P (operands[1]))
++    {
++      operands[1] = lowpart_subreg (V4SFmode,
++				    force_reg (V2SFmode, operands[1]),
++				    V2SFmode);
++      emit_insn (gen_sse2_cvtps2pd (operands[0], operands[1]));
++      DONE;
++    }
++})
++
+ (define_insn "sse2_cvtps2pd<mask_name>"
+   [(set (match_operand:V2DF 0 "register_operand" "=v")
+ 	(float_extend:V2DF
+ 	  (vec_select:V2SF
+-	    (match_operand:V4SF 1 "vector_operand" "vm")
++	    (match_operand:V4SF 1 "register_operand" "v")
+ 	    (parallel [(const_int 0) (const_int 1)]))))]
+   "TARGET_SSE2 && <mask_avx512vl_condition>"
+   "%vcvtps2pd\t{%1, %0<mask_operand2>|%0<mask_operand2>, %q1}"
+@@ -9191,12 +9207,12 @@
+    (set_attr "prefix" "maybe_vex")
+    (set_attr "mode" "V2DF")])
+
+-(define_insn "extendv2sfv2df2"
++(define_insn "*sse2_cvtps2pd<mask_name>_1"
+   [(set (match_operand:V2DF 0 "register_operand" "=v")
+ 	(float_extend:V2DF
+-	  (match_operand:V2SF 1 "register_operand" "v")))]
+-  "TARGET_MMX_WITH_SSE"
+-  "%vcvtps2pd\t{%1, %0|%0, %1}"
++	  (match_operand:V2SF 1 "memory_operand" "m")))]
++  "TARGET_SSE2 && <mask_avx512vl_condition>"
++  "%vcvtps2pd\t{%1, %0<mask_operand2>|%0<mask_operand2>, %q1}"
+   [(set_attr "type" "ssecvt")
+    (set_attr "amdfam10_decode" "direct")
+    (set_attr "athlon_decode" "double")
+diff --git a/gcc/testsuite/gcc.target/i386/pr43618-1.c b/gcc/testsuite/gcc.target/i386/pr43618-1.c
+new file mode 100644
+index 00000000000..7d16f0e0cf9
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/i386/pr43618-1.c
+@@ -0,0 +1,12 @@
++/* { dg-do compile { target { ! ia32 } } } */
++/* { dg-options "-O2" } */
++/* { dg-final { scan-assembler-not "movq" } } */
++/* { dg-final { scan-assembler "cvtps2pd" } } */
++
++void
++foo (float a[2], double b[2])
++{
++    int i;
++    for (i = 0; i < 2; i++)
++      b[i] = a[i];
++}
+--
+2.18.1
+
+diff --git a/gcc/config/i386/sse.md b/gcc/config/i386/sse.md
+index 3396ff748da..5b91c7be54e 100644
+--- a/gcc/config/i386/sse.md
++++ b/gcc/config/i386/sse.md
+@@ -9208,7 +9208,7 @@
+    (set_attr "prefix" "maybe_vex")
+    (set_attr "mode" "V2DF")])
+
+-(define_insn "*sse2_cvtps2pd<mask_name>_1"
++(define_insn "sse2_cvtps2pd<mask_name>_1"
+   [(set (match_operand:V2DF 0 "register_operand" "=v")
+ 	(float_extend:V2DF
+ 	  (match_operand:V2SF 1 "memory_operand" "m")))]
+@@ -9270,7 +9270,15 @@
+ 	  (vec_select:V2SF
+ 	    (match_operand:V4SF 1 "vector_operand")
+ 	    (parallel [(const_int 0) (const_int 1)]))))]
+-  "TARGET_SSE2")
++  "TARGET_SSE2"
++{
++  if (MEM_P (operands[1]))
++    {
++      operands[1] = adjust_address_nv (operands[1], V2SFmode, 0);
++      emit_insn (gen_sse2_cvtps2pd_1 (operands[0], operands[1]));
++      DONE;
++    }
++})
+
+ (define_expand "vec_unpacks_lo_v8sf"
+   [(set (match_operand:V4DF 0 "register_operand")
+diff --git a/gcc/testsuite/g++.target/i386/pr106180-1.C b/gcc/testsuite/g++.target/i386/pr106180-1.C
+new file mode 100644
+index 00000000000..7f734536001
+--- /dev/null
++++ b/gcc/testsuite/g++.target/i386/pr106180-1.C
+@@ -0,0 +1,31 @@
++/* { dg-do compile } */
++/* { dg-options "-O3 -c -ffloat-store  -std=c++11" } */
++
++struct PointT
++{
++  double x, y;
++};
++using PointF = PointT;
++
++template <int _Nm> struct __array_traits { typedef PointT _Type[_Nm]; };
++template <int _Nm> struct array
++{
++  typename __array_traits<_Nm>::_Type _M_elems;
++};
++
++float SampleGrid_low, SampleGrid_high;
++using QuadrilateralF = array<4>;
++struct PerspectiveTransform
++{
++  PerspectiveTransform (QuadrilateralF, QuadrilateralF);
++};
++
++void SampleGrid()
++{
++  PerspectiveTransform
++  {
++    { PointF {SampleGrid_high, SampleGrid_low},
++      SampleGrid_low, SampleGrid_high },
++    {}
++  };
++}
+--
+2.18.2
+
+The target optimize pragma path to initialize extra target specific
+builtins missed handling of the pure_p flag which in turn causes
+extra clobber side-effects of gather builtins leading to unexpected
+issues downhill.
+
+Bootstrap and regtest running on x86_64-unknown-linux-gnu, will push
+as obvious if that succeeds.
+
+	* config/i386/i386-builtins.cc (ix86_add_new_builtins): Properly
+	set DECL_PURE_P.
+
+	* g++.dg/pr106219.C: New testcase.
+---
+ gcc/config/i386/i386-builtins.cc |  2 ++
+ gcc/testsuite/g++.dg/pr106219.C  | 31 +++++++++++++++++++++++++++++++
+ 2 files changed, 33 insertions(+)
+ create mode 100644 gcc/testsuite/g++.dg/pr106219.C
+
+diff --git a/gcc/config/i386/i386-builtins.cc b/gcc/config/i386/i386-builtins.cc
+index 96743e6122d..fe7243c3837 100644
+--- a/gcc/config/i386/i386-builtins.cc
++++ b/gcc/config/i386/i386-builtins.cc
+@@ -385,6 +385,8 @@ ix86_add_new_builtins (HOST_WIDE_INT isa, HOST_WIDE_INT isa2)
+ 	  ix86_builtins[i] = decl;
+ 	  if (ix86_builtins_isa[i].const_p)
+ 	    TREE_READONLY (decl) = 1;
++	  if (ix86_builtins_isa[i].pure_p)
++	    DECL_PURE_P (decl) = 1;
+ 	}
+     }
+
+diff --git a/gcc/testsuite/g++.dg/pr106219.C b/gcc/testsuite/g++.dg/pr106219.C
+new file mode 100644
+index 00000000000..3cad1507d5f
+--- /dev/null
++++ b/gcc/testsuite/g++.dg/pr106219.C
+@@ -0,0 +1,31 @@
++// { dg-do compile }
++// { dg-options "-O3" }
++// { dg-additional-options "-march=bdver2" { target x86_64-*-* } }
++
++int max(int __b) {
++  if (0 < __b)
++    return __b;
++  return 0;
++}
++struct Plane {
++  Plane(int, int);
++  int *Row();
++};
++#ifdef __x86_64__
++#pragma GCC target "sse2,ssse3,avx,avx2"
++#endif
++float *ConvolveXSampleAndTranspose_rowp;
++int ConvolveXSampleAndTranspose_res, ConvolveXSampleAndTranspose_r;
++void ConvolveXSampleAndTranspose() {
++  Plane out(0, ConvolveXSampleAndTranspose_res);
++  for (int y;;) {
++    float sum;
++    for (int i = ConvolveXSampleAndTranspose_r; i; ++i)
++      sum += i;
++    for (; ConvolveXSampleAndTranspose_r; ++ConvolveXSampleAndTranspose_r)
++      sum +=
++          ConvolveXSampleAndTranspose_rowp[max(ConvolveXSampleAndTranspose_r)] *
++          ConvolveXSampleAndTranspose_r;
++    out.Row()[y] = sum;
++  }
++}
+--
+2.35.3
+
+diff --git a/gcc/ipa-visibility.cc b/gcc/ipa-visibility.cc
+index 8a27e7bcd..3ed2b7cf6 100644
+--- a/gcc/ipa-visibility.cc
++++ b/gcc/ipa-visibility.cc
+@@ -873,6 +873,25 @@ function_and_variable_visibility (bool whole_program)
+ 	}
+     }
+
++  if (symtab->state >= IPA_SSA)
++    {
++      FOR_EACH_VARIABLE (vnode)
++	{
++	  tree decl = vnode->decl;
++
++	  /* Upgrade TLS access model based on optimized visibility status,
++	     unless it was specified explicitly or no references remain.  */
++	  if (DECL_THREAD_LOCAL_P (decl)
++	      && !lookup_attribute ("tls_model", DECL_ATTRIBUTES (decl))
++	      && vnode->ref_list.referring.length ())
++	    {
++	      enum tls_model new_model = decl_default_tls_model (decl);
++	      gcc_checking_assert (new_model >= decl_tls_model (decl));
++	      set_decl_tls_model (decl, new_model);
++	    }
++	}
++    }
++
+   if (dump_file)
+     {
+       fprintf (dump_file, "\nMarking local functions:");
+diff --git a/gcc/varasm.cc b/gcc/varasm.cc
+index 4db8506b1..de149e82c 100644
+--- a/gcc/varasm.cc
++++ b/gcc/varasm.cc
+@@ -6679,6 +6679,36 @@ init_varasm_once (void)
+ #endif
+ }
+
++/* Determine whether SYMBOL is used in any optimized function.  */
++
++static bool
++have_optimized_refs (struct symtab_node *symbol)
++{
++  struct ipa_ref *ref;
++
++  for (int i = 0; symbol->iterate_referring (i, ref); i++)
++    {
++      cgraph_node *cnode = dyn_cast <cgraph_node *> (ref->referring);
++
++      if (cnode && opt_for_fn (cnode->decl, optimize))
++	return true;
++    }
++
++  return false;
++}
++
++/* Check if promoting general-dynamic TLS access model to local-dynamic is
++   desirable for DECL.  */
++
++static bool
++optimize_dyn_tls_for_decl_p (const_tree decl)
++{
++  if (optimize)
++    return true;
++  return symtab->state >= IPA && have_optimized_refs (symtab_node::get (decl));
++}
++
++
+ enum tls_model
+ decl_default_tls_model (const_tree decl)
+ {
+@@ -6696,7 +6726,7 @@ decl_default_tls_model (const_tree decl)
+
+   /* Local dynamic is inefficient when we're not combining the
+      parts of the address.  */
+-  else if (optimize && is_local)
++  else if (is_local && optimize_dyn_tls_for_decl_p (decl))
+     kind = TLS_MODEL_LOCAL_DYNAMIC;
+   else
+     kind = TLS_MODEL_GLOBAL_DYNAMIC;
+diff --git a/gcc/testsuite/gcc.dg/tls/vis-attr-gd.c b/gcc/testsuite/gcc.dg/tls/vis-attr-gd.c
+new file mode 100644
+index 000000000..89a248a80
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/tls/vis-attr-gd.c
+@@ -0,0 +1,12 @@
++/* { dg-do compile } */
++/* { dg-require-effective-target fpic } */
++/* { dg-require-effective-target tls } */
++/* { dg-options "-O2 -fPIC -fdump-ipa-whole-program" } */
++
++// tls_model should be global-dynamic due to explicitly specified attribute
++__attribute__((tls_model("global-dynamic")))
++__thread int x;
++
++void reference() { x++; }
++
++/* { dg-final { scan-ipa-dump "Varpool flags: tls-global-dynamic" "whole-program" } } */
+diff --git a/gcc/testsuite/gcc.dg/tls/vis-attr-hidden-gd.c b/gcc/testsuite/gcc.dg/tls/vis-attr-hidden-gd.c
+new file mode 100644
+index 000000000..e32565588
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/tls/vis-attr-hidden-gd.c
+@@ -0,0 +1,13 @@
++/* { dg-do compile } */
++/* { dg-require-effective-target fpic } */
++/* { dg-require-effective-target tls } */
++/* { dg-options "-O2 -fPIC -fdump-ipa-whole-program" } */
++
++// tls_model should be global-dynamic due to explicitly specified attribute
++__attribute__((visibility("hidden")))
++__attribute__((tls_model("global-dynamic")))
++__thread int x;
++
++void reference() { x++; }
++
++/* { dg-final { scan-ipa-dump "Varpool flags: tls-global-dynamic" "whole-program" } } */
+diff --git a/gcc/testsuite/gcc.dg/tls/vis-attr-hidden.c b/gcc/testsuite/gcc.dg/tls/vis-attr-hidden.c
+new file mode 100644
+index 000000000..0d43fc565
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/tls/vis-attr-hidden.c
+@@ -0,0 +1,12 @@
++/* { dg-do compile } */
++/* { dg-require-effective-target fpic } */
++/* { dg-require-effective-target tls } */
++/* { dg-options "-O2 -fPIC -fdump-ipa-whole-program" } */
++
++//tls_model should be local-dynamic due to visibility("hidden")
++__attribute__((visibility("hidden")))
++__thread int x;
++
++void reference() { x++; }
++
++/* { dg-final { scan-ipa-dump "Varpool flags: tls-local-dynamic" "whole-program" } } */
+diff --git a/gcc/testsuite/gcc.dg/tls/vis-flag-hidden-gd.c b/gcc/testsuite/gcc.dg/tls/vis-flag-hidden-gd.c
+new file mode 100644
+index 000000000..cad41e0c8
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/tls/vis-flag-hidden-gd.c
+@@ -0,0 +1,13 @@
++/* { dg-do compile } */
++/* { dg-require-effective-target fpic } */
++/* { dg-require-effective-target tls } */
++/* { dg-options "-O2 -fPIC -fdump-ipa-whole-program -fvisibility=hidden" } */
++
++
++// tls_model should be global-dynamic due to explicitly specified attribute
++__attribute__((tls_model("global-dynamic")))
++__thread int x;
++
++void reference() { x++; }
++
++/* { dg-final { scan-ipa-dump "Varpool flags: tls-global-dynamic" "whole-program" } } */
+diff --git a/gcc/testsuite/gcc.dg/tls/vis-flag-hidden.c b/gcc/testsuite/gcc.dg/tls/vis-flag-hidden.c
+new file mode 100644
+index 000000000..a15df092d
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/tls/vis-flag-hidden.c
+@@ -0,0 +1,12 @@
++/* { dg-do compile } */
++/* { dg-require-effective-target fpic } */
++/* { dg-require-effective-target tls } */
++/* { dg-options "-O2 -fPIC -fdump-ipa-whole-program -fvisibility=hidden" } */
++
++
++// tls_model should be local-dynamic due to -fvisibility=hidden
++__thread int x;
++
++void reference() { x++; }
++
++/* { dg-final { scan-ipa-dump "Varpool flags: tls-local-dynamic" "whole-program" } } */
+diff --git a/gcc/testsuite/gcc.dg/tls/vis-pragma-hidden-gd.c b/gcc/testsuite/gcc.dg/tls/vis-pragma-hidden-gd.c
+new file mode 100644
+index 000000000..3b3598134
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/tls/vis-pragma-hidden-gd.c
+@@ -0,0 +1,17 @@
++/* { dg-do compile } */
++/* { dg-require-effective-target fpic } */
++/* { dg-require-effective-target tls } */
++/* { dg-options "-O2 -fPIC -fdump-ipa-whole-program" } */
++
++
++#pragma GCC visibility push(hidden)
++
++// tls_model should be global-dynamic due to explicitly specified attribute
++__attribute__((tls_model("global-dynamic")))
++__thread int x;
++
++#pragma GCC visibility pop
++
++void reference() { x++; }
++
++/* { dg-final { scan-ipa-dump "Varpool flags: tls-global-dynamic" "whole-program" } } */
+diff --git a/gcc/testsuite/gcc.dg/tls/vis-pragma-hidden.c b/gcc/testsuite/gcc.dg/tls/vis-pragma-hidden.c
+new file mode 100644
+index 000000000..1be976442
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/tls/vis-pragma-hidden.c
+@@ -0,0 +1,16 @@
++/* { dg-do compile } */
++/* { dg-require-effective-target fpic } */
++/* { dg-require-effective-target tls } */
++/* { dg-options "-O2 -fPIC -fdump-ipa-whole-program" } */
++
++
++#pragma GCC visibility push(hidden)
++
++// tls_model should be local-dynamic due to a pragma
++__thread int x;
++
++#pragma GCC visibility pop
++
++void reference() { x++; }
++
++/* { dg-final { scan-ipa-dump "Varpool flags: tls-local-dynamic" "whole-program" } } */
+--
+2.35.1
+
+This patch allows for strchr(x, c) to the replace with memchr(x, c,
+strlen(x) + 1) if strlen(x) has already been computed earlier in the
+tree.
+
+Handles PR95821: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=95821
+
+Since memchr doesn't need to re-find the null terminator it is faster
+than strchr.
+
+bootstrapped and tested on x86_64-linux.
+
+	PR tree-optimization/95821
+
+gcc/
+
+	* tree-ssa-strlen.cc (strlen_pass::handle_builtin_strchr): Emit
+	memchr instead of strchr if strlen already computed.
+
+gcc/testsuite/
+
+	* c-c++-common/pr95821-1.c: New test.
+	* c-c++-common/pr95821-2.c: New test.
+	* c-c++-common/pr95821-3.c: New test.
+	* c-c++-common/pr95821-4.c: New test.
+	* c-c++-common/pr95821-5.c: New test.
+	* c-c++-common/pr95821-6.c: New test.
+	* c-c++-common/pr95821-7.c: New test.
+	* c-c++-common/pr95821-8.c: New test.
+---
+ gcc/testsuite/c-c++-common/pr95821-1.c |  15 ++++
+ gcc/testsuite/c-c++-common/pr95821-2.c |  17 ++++
+ gcc/testsuite/c-c++-common/pr95821-3.c |  17 ++++
+ gcc/testsuite/c-c++-common/pr95821-4.c |  16 ++++
+ gcc/testsuite/c-c++-common/pr95821-5.c |  19 +++++
+ gcc/testsuite/c-c++-common/pr95821-6.c |  18 ++++
+ gcc/testsuite/c-c++-common/pr95821-7.c |  18 ++++
+ gcc/testsuite/c-c++-common/pr95821-8.c |  19 +++++
+ gcc/tree-ssa-strlen.cc                 | 113 ++++++++++++++++++++-----
+ 9 files changed, 233 insertions(+), 19 deletions(-)
+ create mode 100644 gcc/testsuite/c-c++-common/pr95821-1.c
+ create mode 100644 gcc/testsuite/c-c++-common/pr95821-2.c
+ create mode 100644 gcc/testsuite/c-c++-common/pr95821-3.c
+ create mode 100644 gcc/testsuite/c-c++-common/pr95821-4.c
+ create mode 100644 gcc/testsuite/c-c++-common/pr95821-5.c
+ create mode 100644 gcc/testsuite/c-c++-common/pr95821-6.c
+ create mode 100644 gcc/testsuite/c-c++-common/pr95821-7.c
+ create mode 100644 gcc/testsuite/c-c++-common/pr95821-8.c
+
+diff --git a/gcc/testsuite/c-c++-common/pr95821-1.c b/gcc/testsuite/c-c++-common/pr95821-1.c
+new file mode 100644
+index 00000000000..e0beb609ea2
+--- /dev/null
++++ b/gcc/testsuite/c-c++-common/pr95821-1.c
+@@ -0,0 +1,15 @@
++/* { dg-do compile } */
++/* { dg-options "-O2" } */
++/* { dg-final { scan-assembler "memchr" } } */
++
++#include <stddef.h>
++
++char *
++foo (char *s, char c)
++{
++	size_t slen = __builtin_strlen(s);
++	if(slen < 1000)
++		return NULL;
++
++	return __builtin_strchr(s, c);
++}
+diff --git a/gcc/testsuite/c-c++-common/pr95821-2.c b/gcc/testsuite/c-c++-common/pr95821-2.c
+new file mode 100644
+index 00000000000..5429f0586be
+--- /dev/null
++++ b/gcc/testsuite/c-c++-common/pr95821-2.c
+@@ -0,0 +1,17 @@
++/* { dg-do compile } */
++/* { dg-options "-O2" } */
++/* { dg-final { scan-assembler-not "memchr" } } */
++
++#include <stddef.h>
++
++char *
++foo (char *s, char c, char * other)
++{
++	size_t slen = __builtin_strlen(s);
++	if(slen < 1000)
++		return NULL;
++
++	*other = 0;
++
++	return __builtin_strchr(s, c);
++}
+diff --git a/gcc/testsuite/c-c++-common/pr95821-3.c b/gcc/testsuite/c-c++-common/pr95821-3.c
+new file mode 100644
+index 00000000000..bc929c6044b
+--- /dev/null
++++ b/gcc/testsuite/c-c++-common/pr95821-3.c
+@@ -0,0 +1,17 @@
++/* { dg-do compile } */
++/* { dg-options "-O2" } */
++/* { dg-final { scan-assembler "memchr" } } */
++
++#include <stddef.h>
++
++char *
++foo (char * __restrict s, char c, char * __restrict other)
++{
++	size_t slen = __builtin_strlen(s);
++	if(slen < 1000)
++		return NULL;
++
++	*other = 0;
++
++	return __builtin_strchr(s, c);
++}
+diff --git a/gcc/testsuite/c-c++-common/pr95821-4.c b/gcc/testsuite/c-c++-common/pr95821-4.c
+new file mode 100644
+index 00000000000..684b41d5b70
+--- /dev/null
++++ b/gcc/testsuite/c-c++-common/pr95821-4.c
+@@ -0,0 +1,16 @@
++/* { dg-do compile } */
++/* { dg-options "-O2" } */
++/* { dg-final { scan-assembler "memchr" } } */
++
++#include <stddef.h>
++#include <string.h>
++
++char *
++foo (char *s, char c)
++{
++	size_t slen = strlen(s);
++	if(slen < 1000)
++		return NULL;
++
++	return strchr(s, c);
++}
+diff --git a/gcc/testsuite/c-c++-common/pr95821-5.c b/gcc/testsuite/c-c++-common/pr95821-5.c
+new file mode 100644
+index 00000000000..00c1d93b614
+--- /dev/null
++++ b/gcc/testsuite/c-c++-common/pr95821-5.c
+@@ -0,0 +1,19 @@
++/* { dg-do compile } */
++/* { dg-options "-O2" } */
++/* { dg-final { scan-assembler-not "memchr" } } */
++
++#include <stddef.h>
++#include <string.h>
++
++char *
++foo (char *s, char c, char * other)
++{
++	size_t slen = strlen(s);
++	if(slen < 1000)
++		return NULL;
++
++	*other = 0;
++
++	return strchr(s, c);
++}
++int main() {}
+diff --git a/gcc/testsuite/c-c++-common/pr95821-6.c b/gcc/testsuite/c-c++-common/pr95821-6.c
+new file mode 100644
+index 00000000000..dec839de5ea
+--- /dev/null
++++ b/gcc/testsuite/c-c++-common/pr95821-6.c
+@@ -0,0 +1,18 @@
++/* { dg-do compile } */
++/* { dg-options "-O2" } */
++/* { dg-final { scan-assembler "memchr" } } */
++
++#include <stddef.h>
++#include <string.h>
++
++char *
++foo (char * __restrict s, char c, char * __restrict other)
++{
++	size_t slen = strlen(s);
++	if(slen < 1000)
++		return NULL;
++
++	*other = 0;
++
++	return strchr(s, c);
++}
+diff --git a/gcc/testsuite/c-c++-common/pr95821-7.c b/gcc/testsuite/c-c++-common/pr95821-7.c
+new file mode 100644
+index 00000000000..9da0fff7250
+--- /dev/null
++++ b/gcc/testsuite/c-c++-common/pr95821-7.c
+@@ -0,0 +1,18 @@
++/* { dg-do compile } */
++/* { dg-options "-O2" } */
++/* { dg-final { scan-assembler "memchr" } } */
++
++#include <stddef.h>
++#include <string.h>
++
++char *
++foo (char * __restrict s, char c, char * __restrict other)
++{
++	size_t slen = strlen(s);
++	if(slen < 1000 || c == 0)
++		return NULL;
++
++	*other = 0;
++
++	return strchr(s, c);
++}
+diff --git a/gcc/testsuite/c-c++-common/pr95821-8.c b/gcc/testsuite/c-c++-common/pr95821-8.c
+new file mode 100644
+index 00000000000..5eb02c6fea4
+--- /dev/null
++++ b/gcc/testsuite/c-c++-common/pr95821-8.c
+@@ -0,0 +1,19 @@
++/* { dg-do compile } */
++/* { dg-options "-O2" } */
++/* { dg-final { scan-assembler-not "strchr" } } */
++/* { dg-final { scan-assembler-not "memchr" } } */
++
++#include <stddef.h>
++#include <string.h>
++
++char *
++foo (char * __restrict s, int c, char * __restrict other)
++{
++	size_t slen = strlen(s);
++	if(slen < 1000 || c != 0x100)
++		return NULL;
++
++	*other = 0;
++
++	return strchr(s, c);
++}
+diff --git a/gcc/tree-ssa-strlen.cc b/gcc/tree-ssa-strlen.cc
+index 1d4c0f78fbf..3c26ea7eb83 100644
+--- a/gcc/tree-ssa-strlen.cc
++++ b/gcc/tree-ssa-strlen.cc
+@@ -2405,9 +2405,12 @@ strlen_pass::handle_builtin_strlen ()
+     }
+ }
+
+-/* Handle a strchr call.  If strlen of the first argument is known, replace
+-   the strchr (x, 0) call with the endptr or x + strlen, otherwise remember
+-   that lhs of the call is endptr and strlen of the argument is endptr - x.  */
++/* Handle a strchr call.  If strlen of the first argument is known,
++   replace the strchr (x, 0) call with the endptr or x + strlen,
++   otherwise remember that lhs of the call is endptr and strlen of the
++   argument is endptr - x.  If strlen of x is not know but has been
++   computed earlier in the tree then replace strchr (x, c) to
++   memchr (x, c, strlen + 1).  */
+
+ void
+ strlen_pass::handle_builtin_strchr ()
+@@ -2418,8 +2421,12 @@ strlen_pass::handle_builtin_strchr ()
+   if (lhs == NULL_TREE)
+     return;
+
+-  if (!integer_zerop (gimple_call_arg (stmt, 1)))
+-    return;
++  tree chr = gimple_call_arg (stmt, 1);
++  /* strchr only uses the lower char of input so to check if its
++     strchr (s, zerop) only take into account the lower char.  */
++  bool is_strchr_zerop
++    = (TREE_CODE (chr) == INTEGER_CST
++       && integer_zerop (fold_convert (char_type_node, chr)));
+
+   tree src = gimple_call_arg (stmt, 0);
+
+@@ -2452,32 +2459,96 @@ strlen_pass::handle_builtin_strchr ()
+ 	      fprintf (dump_file, "Optimizing: ");
+ 	      print_gimple_stmt (dump_file, stmt, 0, TDF_SLIM);
+ 	    }
+-	  if (si != NULL && si->endptr != NULL_TREE)
++	  /* Three potential optimizations assume t=strlen (s) has already been
++	     computed:
++	        1. strchr (s, chr) where chr is known to be zero -> t
++	        2. strchr (s, chr) where chr is known not to be zero ->
++	           memchr (s, chr, t)
++	        3. strchr (s, chr) where chr is not known to be zero or
++	           non-zero -> memchr (s, chr, t + 1).  */
++	  if (!is_strchr_zerop)
+ 	    {
+-	      rhs = unshare_expr (si->endptr);
+-	      if (!useless_type_conversion_p (TREE_TYPE (lhs),
+-					      TREE_TYPE (rhs)))
+-		rhs = fold_convert_loc (loc, TREE_TYPE (lhs), rhs);
++	      /* If its not strchr (s, zerop) then try and convert to
++	         memchr since strlen has already been computed.  */
++	      tree fn = builtin_decl_explicit (BUILT_IN_MEMCHR);
++
++	      /* Only need to check length strlen (s) + 1 if chr may be zero.
++	         Otherwise the last chr (which is known to be zero) can never
++	         be a match.  */
++	      bool chr_nonzero = false;
++	      if (TREE_CODE (chr) == INTEGER_CST
++		  && integer_nonzerop (fold_convert (char_type_node, chr)))
++		chr_nonzero = true;
++	      else if (TREE_CODE (chr) == SSA_NAME
++		       && CHAR_TYPE_SIZE < INT_TYPE_SIZE)
++		{
++		  value_range r;
++		  /* Try to determine using ranges if (char) chr must
++		     be always 0.  That is true e.g. if all the subranges
++		     have the INT_TYPE_SIZE - CHAR_TYPE_SIZE bits
++		     the same on lower and upper bounds.  */
++		  if (get_range_query (cfun)->range_of_expr (r, chr, stmt)
++		      && r.kind () == VR_RANGE)
++		    {
++		      wide_int mask
++			  = wi::mask (CHAR_TYPE_SIZE, true, INT_TYPE_SIZE);
++		      for (unsigned i = 0; i < r.num_pairs (); ++i)
++			if ((r.lower_bound (i) & mask)
++			    != (r.upper_bound (i) & mask))
++			  {
++			    chr_nonzero = false;
++			    break;
++			  }
++		    }
++		}
++	      if (!chr_nonzero)
++		{
++		  tree one = build_int_cst (TREE_TYPE (rhs), 1);
++		  rhs = fold_build2_loc (loc, PLUS_EXPR, TREE_TYPE (rhs),
++					 unshare_expr (rhs), one);
++		  tree size = make_ssa_name (TREE_TYPE (rhs));
++		  gassign *size_stmt = gimple_build_assign (size, rhs);
++		  gsi_insert_before (&m_gsi, size_stmt, GSI_SAME_STMT);
++		  rhs = size;
++		}
++	      if (!update_gimple_call (&m_gsi, fn, 3, src, chr, rhs))
++		return;
+ 	    }
+ 	  else
+ 	    {
+-	      rhs = fold_convert_loc (loc, sizetype, unshare_expr (rhs));
+-	      rhs = fold_build2_loc (loc, POINTER_PLUS_EXPR,
+-				     TREE_TYPE (src), src, rhs);
+-	      if (!useless_type_conversion_p (TREE_TYPE (lhs),
+-					      TREE_TYPE (rhs)))
+-		rhs = fold_convert_loc (loc, TREE_TYPE (lhs), rhs);
++	      if (si != NULL && si->endptr != NULL_TREE)
++		{
++		  rhs = unshare_expr (si->endptr);
++		  if (!useless_type_conversion_p (TREE_TYPE (lhs),
++						  TREE_TYPE (rhs)))
++		    rhs = fold_convert_loc (loc, TREE_TYPE (lhs), rhs);
++		}
++	      else
++		{
++		  rhs = fold_convert_loc (loc, sizetype, unshare_expr (rhs));
++		  rhs = fold_build2_loc (loc, POINTER_PLUS_EXPR,
++					 TREE_TYPE (src), src, rhs);
++		  if (!useless_type_conversion_p (TREE_TYPE (lhs),
++						  TREE_TYPE (rhs)))
++		    rhs = fold_convert_loc (loc, TREE_TYPE (lhs), rhs);
++		}
++	      gimplify_and_update_call_from_tree (&m_gsi, rhs);
+ 	    }
+-	  gimplify_and_update_call_from_tree (&m_gsi, rhs);
++
+ 	  stmt = gsi_stmt (m_gsi);
+ 	  update_stmt (stmt);
++
+ 	  if (dump_file && (dump_flags & TDF_DETAILS) != 0)
+ 	    {
+ 	      fprintf (dump_file, "into: ");
+ 	      print_gimple_stmt (dump_file, stmt, 0, TDF_SLIM);
+ 	    }
+-	  if (si != NULL
+-	      && si->endptr == NULL_TREE
++
++	  /* Don't update strlen of lhs if search-char wasn't know to be zero.  */
++	  if (!is_strchr_zerop)
++	    return;
++
++	  if (si != NULL && si->endptr == NULL_TREE
+ 	      && !SSA_NAME_OCCURS_IN_ABNORMAL_PHI (lhs))
+ 	    {
+ 	      si = unshare_strinfo (si);
+@@ -2487,6 +2558,10 @@ strlen_pass::handle_builtin_strchr ()
+ 	  return;
+ 	}
+     }
++
++  if (!is_strchr_zerop)
++    return;
++
+   if (SSA_NAME_OCCURS_IN_ABNORMAL_PHI (lhs))
+     return;
+   if (TREE_CODE (src) != SSA_NAME || !SSA_NAME_OCCURS_IN_ABNORMAL_PHI (src))
+--
+2.34.1
