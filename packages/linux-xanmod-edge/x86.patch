@@ -1,3 +1,61 @@
+Use try_cmpxchg instead of cmpxchg in set_pfnblock_flags_mask.
+x86 CMPXCHG instruction returns success in ZF flag, so this
+change saves a compare after cmpxchg (and related move instruction
+in front of cmpxchg). The main loop improves from:
+
+    1c5d:	48 89 c2             	mov    %rax,%rdx
+    1c60:	48 89 c1             	mov    %rax,%rcx
+    1c63:	48 21 fa             	and    %rdi,%rdx
+    1c66:	4c 09 c2             	or     %r8,%rdx
+    1c69:	f0 48 0f b1 16       	lock cmpxchg %rdx,(%rsi)
+    1c6e:	48 39 c1             	cmp    %rax,%rcx
+    1c71:	75 ea                	jne    1c5d <...>
+
+to:
+
+    1c60:	48 89 ca             	mov    %rcx,%rdx
+    1c63:	48 21 c2             	and    %rax,%rdx
+    1c66:	4c 09 c2             	or     %r8,%rdx
+    1c69:	f0 48 0f b1 16       	lock cmpxchg %rdx,(%rsi)
+    1c6e:	75 f0                	jne    1c60 <...>
+
+Signed-off-by: Uros Bizjak <ubizjak@xxxxxxxxx>
+Cc: Andrew Morton <akpm@xxxxxxxxxxxxxxxxxxxx>
+---
+ mm/page_alloc.c | 10 +++-------
+ 1 file changed, 3 insertions(+), 7 deletions(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index e008a3df0485..d415d5b539b7 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -524,7 +524,7 @@ void set_pfnblock_flags_mask(struct page *page, unsigned long flags,
+ {
+ 	unsigned long *bitmap;
+ 	unsigned long bitidx, word_bitidx;
+-	unsigned long old_word, word;
++	unsigned long word;
+
+ 	BUILD_BUG_ON(NR_PAGEBLOCK_BITS != 4);
+ 	BUILD_BUG_ON(MIGRATE_TYPES > (1 << PB_migratetype_bits));
+@@ -540,12 +540,8 @@ void set_pfnblock_flags_mask(struct page *page, unsigned long flags,
+ 	flags <<= bitidx;
+
+ 	word = READ_ONCE(bitmap[word_bitidx]);
+-	for (;;) {
+-		old_word = cmpxchg(&bitmap[word_bitidx], word, (word & ~mask) | flags);
+-		if (word == old_word)
+-			break;
+-		word = old_word;
+-	}
++	do {
++	} while (!try_cmpxchg(&bitmap[word_bitidx], &word, (word & ~mask) | flags));
+ }
+
+ void set_pageblock_migratetype(struct page *page, int migratetype)
+--
+2.35.3
+
 Some devices need more MSIs. To support this the number must be
 increased.
 
@@ -1679,40 +1737,273 @@ flush_tlb_info. As a result, try_to_unmap_one() would not perform any
 TLB flushes.
 
 Fix it by checking whether f->new_tlb_gen is nonzero. Zero value is
-anyhow is an invalid generation value.
+anyhow is an invalid generation value. To avoid future confusions,
+introduce TLB_GENERATION_INVALID constant and use it properly. Add some
+assertions to check no partial flushes are done with
+TLB_GENERATION_INVALID or when f->mm is NULL, since this does not make
+any sense.
 
-In addition, add the missing unlikely() and jump to get tracing right.
+In addition, add the missing unlikely().
 
 Fixes: aa44284960d5 ("x86/mm/tlb: Avoid reading mm_tlb_gen when possible")
 Reported-by: Hugh Dickins <hughd@xxxxxxxxxx>
+Tested-by: Hugh Dickins <hughd@xxxxxxxxxx>
 Cc: Dave Hansen <dave.hansen@xxxxxxxxxxxxxxx>
 Cc: Peter Zijlstra (Intel) <peterz@xxxxxxxxxxxxx>
 Cc: Andy Lutomirski <luto@xxxxxxxxxx>
 Signed-off-by: Nadav Amit <namit@xxxxxxxxxx>
----
- arch/x86/mm/tlb.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
 
+---
+
+v1 -> v2:
+* Introduce TLB_GENERATION_INVALID to clarify intent.
+* Leave the early return and do not "goto out".
+* Add some assertions to check and document in code the relationship
+  between TLB_GENERATION_INVALID and TLB_FLUSH_ALL.
+---
+ arch/x86/include/asm/tlbflush.h |  1 +
+ arch/x86/mm/tlb.c               | 15 ++++++++++++---
+ 2 files changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/include/asm/tlbflush.h b/arch/x86/include/asm/tlbflush.h
+index 4af5579c7ef7..cda3118f3b27 100644
+--- a/arch/x86/include/asm/tlbflush.h
++++ b/arch/x86/include/asm/tlbflush.h
+@@ -16,6 +16,7 @@
+ void __flush_tlb_all(void);
+
+ #define TLB_FLUSH_ALL	-1UL
++#define TLB_GENERATION_INVALID	0
+
+ void cr4_update_irqsoff(unsigned long set, unsigned long clear);
+ unsigned long cr4_read_shadow(void);
 diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
-index d9314cc8b81f..d81b4084bb8a 100644
+index d9314cc8b81f..0f346c51dd99 100644
 --- a/arch/x86/mm/tlb.c
 +++ b/arch/x86/mm/tlb.c
-@@ -771,14 +771,14 @@ static void flush_tlb_func(void *info)
+@@ -771,7 +771,8 @@ static void flush_tlb_func(void *info)
  		return;
  	}
 
 -	if (f->new_tlb_gen <= local_tlb_gen) {
-+	if (unlikely(f->new_tlb_gen != 0 && f->new_tlb_gen <= local_tlb_gen)) {
++	if (unlikely(f->new_tlb_gen != TLB_GENERATION_INVALID &&
++		     f->new_tlb_gen <= local_tlb_gen)) {
  		/*
  		 * The TLB is already up to date in respect to f->new_tlb_gen.
  		 * While the core might be still behind mm_tlb_gen, checking
- 		 * mm_tlb_gen unnecessarily would have negative caching effects
- 		 * so avoid it.
+@@ -843,6 +844,12 @@ static void flush_tlb_func(void *info)
+ 		/* Partial flush */
+ 		unsigned long addr = f->start;
+
++		/* Partial flush cannot have invalid generations */
++		VM_BUG_ON(f->new_tlb_gen == TLB_GENERATION_INVALID);
++
++		/* Partial flush must have valid mm */
++		VM_BUG_ON(f->mm == NULL);
++
+ 		nr_invalidate = (f->end - f->start) >> f->stride_shift;
+
+ 		while (addr < f->end) {
+@@ -1045,7 +1052,8 @@ void flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ 		struct flush_tlb_info *info;
+
+ 		preempt_disable();
+-		info = get_flush_tlb_info(NULL, start, end, 0, false, 0);
++		info = get_flush_tlb_info(NULL, start, end, 0, false,
++					  TLB_GENERATION_INVALID);
+
+ 		on_each_cpu(do_kernel_range_flush, info, 1);
+
+@@ -1214,7 +1222,8 @@ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+
+ 	int cpu = get_cpu();
+
+-	info = get_flush_tlb_info(NULL, 0, TLB_FLUSH_ALL, 0, false, 0);
++	info = get_flush_tlb_info(NULL, 0, TLB_FLUSH_ALL, 0, false,
++				  TLB_GENERATION_INVALID);
+ 	/*
+ 	 * flush_tlb_multi() is not optimized for the common case in which only
+ 	 * a local TLB flush is needed. Optimize this use-case by calling
+--
+2.25.1
+
+From: Nadav Amit <namit@xxxxxxxxxx>
+
+Currently, if flush_tlb_func() does not flush for some reason, the
+tracing of the flush will be done only in certain cases, depending on
+the reason of the flush. Be consistent and just do not trace in all
+cases when the flush was eventually not done.
+
+Suggested-by: Dave Hansen <dave.hansen@xxxxxxxxxxxxxxx>
+Cc: Peter Zijlstra (Intel) <peterz@xxxxxxxxxxxxx>
+Cc: Andy Lutomirski <luto@xxxxxxxxxx>
+Signed-off-by: Nadav Amit <namit@xxxxxxxxxx>
+---
+ arch/x86/mm/tlb.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
+index 0f346c51dd99..5c17b86b928d 100644
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -736,7 +736,7 @@ static void flush_tlb_func(void *info)
+ 	u32 loaded_mm_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
+ 	u64 local_tlb_gen = this_cpu_read(cpu_tlbstate.ctxs[loaded_mm_asid].tlb_gen);
+ 	bool local = smp_processor_id() == f->initiating_cpu;
+-	unsigned long nr_invalidate = 0;
++	unsigned long nr_invalidate;
+ 	u64 mm_tlb_gen;
+
+ 	/* This code cannot presently handle being reentered. */
+@@ -795,7 +795,7 @@ static void flush_tlb_func(void *info)
+ 		 * be handled can catch us all the way up, leaving no work for
+ 		 * the second flush.
  		 */
--		return;
-+		goto done;
+-		goto done;
++		return;
  	}
 
- 	/*
+ 	WARN_ON_ONCE(local_tlb_gen > mm_tlb_gen);
+@@ -871,7 +871,6 @@ static void flush_tlb_func(void *info)
+ 	this_cpu_write(cpu_tlbstate.ctxs[loaded_mm_asid].tlb_gen, mm_tlb_gen);
+
+ 	/* Tracing is done in a unified manner to reduce the code size */
+-done:
+ 	trace_tlb_flush(!local ? TLB_REMOTE_SHOOTDOWN :
+ 				(f->mm == NULL) ? TLB_LOCAL_SHOOTDOWN :
+ 						  TLB_LOCAL_MM_SHOOTDOWN,
+--
+2.25.1
+
+We add a macro MEMCHR_MASK_GEN() so that both memchr_inv()
+and memchr() can use it to generate a 8 bytes mask.
+
+Signed-off-by: Yu-Jen Chang <arthurchang09@xxxxxxxxx>
+Signed-off-by: Ching-Chun (Jim) Huang <jserv@xxxxxxxxxxxxxxxx>
+---
+ lib/string.c | 34 ++++++++++++++++++++++++----------
+ 1 file changed, 24 insertions(+), 10 deletions(-)
+
+diff --git a/lib/string.c b/lib/string.c
+index 485777c9d..80469e6c3 100644
+--- a/lib/string.c
++++ b/lib/string.c
+@@ -879,6 +879,29 @@ char *strnstr(const char *s1, const char *s2, size_t len)
+ EXPORT_SYMBOL(strnstr);
+ #endif
+
++#if defined(CONFIG_ARCH_HAS_FAST_MULTIPLIER) && BITS_PER_LONG == 64
++
++#define MEMCHR_MASK_GEN(mask) (mask *= 0x0101010101010101ULL)
++
++#elif defined(CONFIG_ARCH_HAS_FAST_MULTIPLIER)
++
++#define MEMCHR_MASK_GEN(mask)                                                  \
++	do {                                                                   \
++		mask *= 0x01010101;                                            \
++		mask |= mask << 32;                                            \
++	} while (0)
++
++#else
++
++#define MEMCHR_MASK_GEN(mask)                                                  \
++	do {                                                                   \
++		mask |= mask << 8;                                             \
++		mask |= mask << 16;                                            \
++		mask |= mask << 32;                                            \
++	} while (0)
++
++#endif
++
+ #ifndef __HAVE_ARCH_MEMCHR
+ /**
+  * memchr - Find a character in an area of memory.
+@@ -932,16 +955,7 @@ void *memchr_inv(const void *start, int c, size_t bytes)
+ 		return check_bytes8(start, value, bytes);
+
+ 	value64 = value;
+-#if defined(CONFIG_ARCH_HAS_FAST_MULTIPLIER) && BITS_PER_LONG == 64
+-	value64 *= 0x0101010101010101ULL;
+-#elif defined(CONFIG_ARCH_HAS_FAST_MULTIPLIER)
+-	value64 *= 0x01010101;
+-	value64 |= value64 << 32;
+-#else
+-	value64 |= value64 << 8;
+-	value64 |= value64 << 16;
+-	value64 |= value64 << 32;
+-#endif
++	MEMCHR_MASK_GEN(value64);
+
+ 	prefix = (unsigned long)start % 8;
+ 	if (prefix) {
+--
+2.25.1
+
+The original version of memchr() is implemented with the byte-wise
+comparing technique, which does not fully use 64-bits or 32-bits
+registers in CPU. We use word-wide comparing so that 8 characters
+can be compared at the same time on CPU. This code is base on
+David Laight's implementation.
+
+We create two files to measure the performance. The first file
+contains on average 10 characters ahead the target character.
+The second file contains at least 1000 characters ahead the
+target character. Our implementation of “memchr()” is slightly
+better in the first test and nearly 4x faster than the orginal
+implementation in the second test.
+
+Signed-off-by: Yu-Jen Chang <arthurchang09@xxxxxxxxx>
+Signed-off-by: Ching-Chun (Jim) Huang <jserv@xxxxxxxxxxxxxxxx>
+---
+ lib/string.c | 28 +++++++++++++++++++++-------
+ 1 file changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/lib/string.c b/lib/string.c
+index 80469e6c3..8ca965431 100644
+--- a/lib/string.c
++++ b/lib/string.c
+@@ -905,21 +905,35 @@ EXPORT_SYMBOL(strnstr);
+ #ifndef __HAVE_ARCH_MEMCHR
+ /**
+  * memchr - Find a character in an area of memory.
+- * @s: The memory area
++ * @p: The memory area
+  * @c: The byte to search for
+- * @n: The size of the area.
++ * @length: The size of the area.
+  *
+  * returns the address of the first occurrence of @c, or %NULL
+  * if @c is not found
+  */
+-void *memchr(const void *s, int c, size_t n)
++void *memchr(const void *p, int c, unsigned long length)
+ {
+-	const unsigned char *p = s;
+-	while (n-- != 0) {
+-        	if ((unsigned char)c == *p++) {
+-			return (void *)(p - 1);
++	u64 mask, val;
++	const void *end = p + length;
++
++	c &= 0xff;
++	if (p <= end - 8) {
++		mask = c;
++		MEMCHR_MASK_GEN(mask);
++
++		for (; p <= end - 8; p += 8) {
++			val = *(u64 *)p ^ mask;
++			if ((val + 0xfefefefefefefeffu) &
++			    (~val & 0x8080808080808080u))
++				break;
+ 		}
+ 	}
++
++	for (; p < end; p++)
++		if (*(unsigned char *)p == c)
++			return (void *)p;
++
+ 	return NULL;
+ }
+ EXPORT_SYMBOL(memchr);
 --
 2.25.1

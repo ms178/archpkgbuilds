@@ -2814,3 +2814,890 @@ index 2d2ccae933c2..52f2c873a7d4 100644
  /* The typedef is in types.h but we want the documentation here */
 --
 2.34.1
+
+From: Yu Kuai <yukuai3@xxxxxxxxxx>
+
+__sbq_wake_up		__sbq_wake_up
+ sbq_wake_ptr -> assume	0
+			 sbq_wake_ptr -> 0
+ atomic_dec_return
+			atomic_dec_return
+ atomic_cmpxchg -> succeed
+			 atomic_cmpxchg -> failed
+			  return true
+
+			__sbq_wake_up
+			 sbq_wake_ptr
+			  atomic_read(&sbq->wake_index) -> still 0
+ sbq_index_atomic_inc -> inc to 1
+			  if (waitqueue_active(&ws->wait))
+			   if (wake_index != atomic_read(&sbq->wake_index))
+			    atomic_set -> reset from 1 to 0
+ wake_up_nr -> wake up first waitqueue
+			    // continue to wake up in first waitqueue
+
+Fix the problem by using atomic_cmpxchg() instead of atomic_set()
+to update 'wake_index'.
+
+Fixes: 417232880c8a ("sbitmap: Replace cmpxchg with xchg")
+Signed-off-by: Yu Kuai <yukuai3@xxxxxxxxxx>
+---
+ lib/sbitmap.c | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/lib/sbitmap.c b/lib/sbitmap.c
+index 29eb0484215a..b46fce1beb3a 100644
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@ -579,19 +579,24 @@ EXPORT_SYMBOL_GPL(sbitmap_queue_min_shallow_depth);
+
+ static struct sbq_wait_state *sbq_wake_ptr(struct sbitmap_queue *sbq)
+ {
+-	int i, wake_index;
++	int i, wake_index, old_wake_index;
+
++again:
+ 	if (!atomic_read(&sbq->ws_active))
+ 		return NULL;
+
+-	wake_index = atomic_read(&sbq->wake_index);
++	old_wake_index = wake_index = atomic_read(&sbq->wake_index);
+ 	for (i = 0; i < SBQ_WAIT_QUEUES; i++) {
+ 		struct sbq_wait_state *ws = &sbq->ws[wake_index];
+
+ 		if (waitqueue_active(&ws->wait)) {
+-			if (wake_index != atomic_read(&sbq->wake_index))
+-				atomic_set(&sbq->wake_index, wake_index);
+-			return ws;
++			if (wake_index == old_wake_index)
++				return ws;
++
++			if (atomic_cmpxchg(&sbq->wake_index, old_wake_index,
++					   wake_index) == old_wake_index)
++				return ws;
++			goto again;
+ 		}
+
+ 		wake_index = sbq_index_inc(wake_index);
+--
+2.31.1
+
+From: Yu Kuai <yukuai3@xxxxxxxxxx>
+
+For example, 2 * wake_batch tags are put, while only wake_batch threads
+are woken:
+
+__sbq_wake_up
+ atomic_cmpxchg -> reset wait_cnt
+			__sbq_wake_up -> decrease wait_cnt
+			...
+			__sbq_wake_up -> wait_cnt is decreased to 0 again
+			 atomic_cmpxchg
+			 sbq_index_atomic_inc -> increase wake_index
+			 wake_up_nr -> wake up and waitqueue might be empty
+ sbq_index_atomic_inc -> increase again, one waitqueue is skipped
+ wake_up_nr -> invalid wake up because old wakequeue might be empty
+
+To fix the problem, increasing 'wake_index' before resetting 'wait_cnt'.
+
+Fixes: 88459642cba4 ("blk-mq: abstract tag allocation out into sbitmap library")
+Signed-off-by: Yu Kuai <yukuai3@xxxxxxxxxx>
+---
+ lib/sbitmap.c | 45 +++++++++++++++++++++++----------------------
+ 1 file changed, 23 insertions(+), 22 deletions(-)
+
+diff --git a/lib/sbitmap.c b/lib/sbitmap.c
+index b46fce1beb3a..57095dd88a33 100644
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@ -616,32 +616,33 @@ static bool __sbq_wake_up(struct sbitmap_queue *sbq)
+ 		return false;
+
+ 	wait_cnt = atomic_dec_return(&ws->wait_cnt);
+-	if (wait_cnt <= 0) {
+-		int ret;
++	if (wait_cnt > 0)
++		return false;
+
+-		wake_batch = READ_ONCE(sbq->wake_batch);
++	/*
++	 * For concurrent callers of this, callers should call this function
++	 * again to wakeup a new batch on a different 'ws'.
++	 */
++	if (wait_cnt < 0)
++		return true;
+
+-		/*
+-		 * Pairs with the memory barrier in sbitmap_queue_resize() to
+-		 * ensure that we see the batch size update before the wait
+-		 * count is reset.
+-		 */
+-		smp_mb__before_atomic();
++	wake_batch = READ_ONCE(sbq->wake_batch);
+
+-		/*
+-		 * For concurrent callers of this, the one that failed the
+-		 * atomic_cmpxhcg() race should call this function again
+-		 * to wakeup a new batch on a different 'ws'.
+-		 */
+-		ret = atomic_cmpxchg(&ws->wait_cnt, wait_cnt, wake_batch);
+-		if (ret == wait_cnt) {
+-			sbq_index_atomic_inc(&sbq->wake_index);
+-			wake_up_nr(&ws->wait, wake_batch);
+-			return false;
+-		}
++	/*
++	 * Pairs with the memory barrier in sbitmap_queue_resize() to
++	 * ensure that we see the batch size update before the wait
++	 * count is reset.
++	 */
++	smp_mb__before_atomic();
+
+-		return true;
+-	}
++	/*
++	 * Increase wake_index before updating wait_cnt, otherwise concurrent
++	 * callers can see valid wait_cnt in old waitqueue, which can cause
++	 * invalid wakeup on the old waitqueue.
++	 */
++	sbq_index_atomic_inc(&sbq->wake_index);
++	atomic_set(&ws->wait_cnt, wake_batch);
++	wake_up_nr(&ws->wait, wake_batch);
+
+ 	return false;
+ }
+--
+2.31.1
+
+From: Yu Kuai <yukuai3@xxxxxxxxxx>
+
+As pointed out by Jan Kara, following race is still possible:
+
+CPU1				CPU2
+__sbq_wake_up			 __sbq_wake_up
+ sbq_wake_ptr()			 sbq_wake_ptr() -> the same
+ wait_cnt = atomic_dec_return()
+ /* decreased to 0 */
+ sbq_index_atomic_inc()
+ /* move to next waitqueue */
+ atomic_set()
+ /* reset wait_cnt */
+ wake_up_nr()
+ /* wake up on the old waitqueue */
+				 wait_cnt = atomic_dec_return()
+				 /*
+				  * decrease wait_cnt in the old
+				  * waitqueue, while it can be
+				  * empty.
+				  */
+
+Fix the problem by waking up before updating 'wake_index' and
+'wait_cnt'.
+
+With this patch, noted that 'wait_cnt' is still decreased in the old
+empty waitqueue, however, the wakeup is redirected to a active waitqueue,
+and the extra decrement on the old empty waitqueue is not handled.
+
+Fixes: 88459642cba4 ("blk-mq: abstract tag allocation out into sbitmap library")
+Signed-off-by: Yu Kuai <yukuai3@xxxxxxxxxx>
+---
+ lib/sbitmap.c | 20 +++++++++++++++-----
+ 1 file changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/lib/sbitmap.c b/lib/sbitmap.c
+index 57095dd88a33..55826ebbe7db 100644
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@ -616,22 +616,33 @@ static bool __sbq_wake_up(struct sbitmap_queue *sbq)
+ 		return false;
+
+ 	wait_cnt = atomic_dec_return(&ws->wait_cnt);
+-	if (wait_cnt > 0)
+-		return false;
+-
+ 	/*
+ 	 * For concurrent callers of this, callers should call this function
+ 	 * again to wakeup a new batch on a different 'ws'.
+ 	 */
+-	if (wait_cnt < 0)
++	if (wait_cnt < 0 || !waitqueue_active(&ws->wait))
+ 		return true;
+
++	if (wait_cnt > 0)
++		return false;
++
+ 	wake_batch = READ_ONCE(sbq->wake_batch);
+
++	/*
++	 * Wake up first in case that concurrent callers decrease wait_cnt
++	 * while waitqueue is empty.
++	 */
++	wake_up_nr(&ws->wait, wake_batch);
++
+ 	/*
+ 	 * Pairs with the memory barrier in sbitmap_queue_resize() to
+ 	 * ensure that we see the batch size update before the wait
+ 	 * count is reset.
++	 *
++	 * Also pairs with the implicit barrier between becrementing wait_cnt
++	 * and checking for waitqueue_active() to make sure waitqueue_active()
++	 * sees result of the wakeup if atomic_dec_return() has seen the result
++	 * of atomic_set().
+ 	 */
+ 	smp_mb__before_atomic();
+
+@@ -642,7 +653,6 @@ static bool __sbq_wake_up(struct sbitmap_queue *sbq)
+ 	 */
+ 	sbq_index_atomic_inc(&sbq->wake_index);
+ 	atomic_set(&ws->wait_cnt, wake_batch);
+-	wake_up_nr(&ws->wait, wake_batch);
+
+ 	return false;
+ }
+--
+2.31.1
+
+Kernel lacks for a function that searches for Nth bit in a bitmap.
+Usually people do it like this:
+	for_each_set_bit(bit, mask, size)
+		if (--n == 0)
+			return bit;
+
+We can do it more efficiently, if we:
+1. find a word containing Nth bit, using hweight(); and
+2. find the bit, using a helper fns(), that works similarly to
+   __ffs() and ffz().
+
+fns() is implemented as a simple loop. For x86_64, there's PDEP instruction
+to do that: ret = clz(pdep(1 << idx, num)). However, for large bitmaps the
+most of improvement comes from using hweight(), so I kept fns() simple.
+
+New find_nth_bit() is ~70 times faster on x86_64/kvm:
+find_nth_bit:                  7154190 ns,  16411 iterations
+for_each_bit:                505493126 ns,  16315 iterations
+
+With all that, a family of 3 new functions is added, and used where
+appropriate in the following patches.
+
+Signed-off-by: Yury Norov <yury.norov@xxxxxxxxx>
+---
+ include/linux/bitops.h | 19 ++++++++++
+ include/linux/find.h   | 83 ++++++++++++++++++++++++++++++++++++++++++
+ lib/find_bit.c         | 20 ++++++++++
+ 3 files changed, 122 insertions(+)
+
+diff --git a/include/linux/bitops.h b/include/linux/bitops.h
+index cf9bf65039f2..8b2189878afa 100644
+--- a/include/linux/bitops.h
++++ b/include/linux/bitops.h
+@@ -246,6 +246,25 @@ static inline unsigned long __ffs64(u64 word)
+ 	return __ffs((unsigned long)word);
+ }
+
++/**
++ * fns - find N'th set bit in a word
++ * @word: The word to search
++ * @n: Bit to find
++ */
++static inline unsigned long fns(unsigned long word, unsigned int n)
++{
++	unsigned int bit;
++
++	while (word) {
++		bit = __ffs(word);
++		if (n-- == 0)
++			return bit;
++		__clear_bit(bit, &word);
++	}
++
++	return BITS_PER_LONG;
++}
++
+ /**
+  * assign_bit - Assign value to a bit in memory
+  * @nr: the bit to set
+diff --git a/include/linux/find.h b/include/linux/find.h
+index 424ef67d4a42..4c7f82dcc38a 100644
+--- a/include/linux/find.h
++++ b/include/linux/find.h
+@@ -12,6 +12,8 @@ extern unsigned long _find_next_bit(const unsigned long *addr1,
+ 		const unsigned long *addr2, unsigned long nbits,
+ 		unsigned long start, unsigned long invert, unsigned long le);
+ extern unsigned long _find_first_bit(const unsigned long *addr, unsigned long size);
++unsigned long _find_nth_bit(const unsigned long *addr1, const unsigned long *addr2,
++				unsigned long size, unsigned long n, unsigned long invert);
+ extern unsigned long _find_first_and_bit(const unsigned long *addr1,
+ 					 const unsigned long *addr2, unsigned long size);
+ extern unsigned long _find_first_zero_bit(const unsigned long *addr, unsigned long size);
+@@ -125,6 +127,87 @@ unsigned long find_first_bit(const unsigned long *addr, unsigned long size)
+ }
+ #endif
+
++/**
++ * find_nth_bit - find N'th set bit in a memory region
++ * @addr: The address to start the search at
++ * @size: The maximum number of bits to search
++ * @n: The number of set bit, which position is needed, counting from 0
++ *
++ * The following is semantically equivalent:
++ *	 idx = find_nth_bit(addr, size, 0);
++ *	 idx = find_first_bit(addr, size);
++ *
++ * Returns the bit number of the N'th set bit.
++ * If no such, returns @size.
++ */
++static inline
++unsigned long find_nth_bit(const unsigned long *addr, unsigned long size, unsigned long n)
++{
++	if (n >= size)
++		return size;
++
++	if (small_const_nbits(size)) {
++		unsigned long val =  *addr & GENMASK(size - 1, 0);
++
++		return val ? fns(val, n) : size;
++	}
++
++	return _find_nth_bit(addr, NULL, size, n, 0UL);
++}
++
++/**
++ * find_nth_and_bit - find N'th set bit in 2 memory regions
++ * @addr1: The 1st address to start the search at
++ * @addr2: The 2nd address to start the search at
++ * @size: The maximum number of bits to search
++ * @n: The number of set bit, which position is needed, counting from 0
++ *
++ * Returns the bit number of the N'th set bit.
++ * If no such, returns @size.
++ */
++static inline
++unsigned long find_nth_and_bit(const unsigned long *addr1, const unsigned long *addr2,
++				unsigned long size, unsigned long n)
++{
++	if (n >= size)
++		return size;
++
++	if (small_const_nbits(size)) {
++		unsigned long val =  *addr1 & *addr2 & GENMASK(size - 1, 0);
++
++		return val ? fns(val, n) : size;
++	}
++
++	return _find_nth_bit(addr1, addr2, size, n, 0UL);
++}
++
++/**
++ * find_nth_andnot_bit - find N'th set bit in 2 memory regions,
++ *			 flipping bits in 2nd region
++ * @addr1: The 1st address to start the search at
++ * @addr2: The 2nd address to start the search at
++ * @size: The maximum number of bits to search
++ * @n: The number of set bit, which position is needed, counting from 0
++ *
++ * Returns the bit number of the N'th set bit.
++ * If no such, returns @size.
++ */
++static inline
++unsigned long find_nth_andnot_bit(const unsigned long *addr1, const unsigned long *addr2,
++				unsigned long size, unsigned long n)
++{
++	if (n >= size)
++		return size;
++
++	if (small_const_nbits(size)) {
++		unsigned long val =  *addr1 & (~*addr2) & GENMASK(size - 1, 0);
++
++		return val ? fns(val, n) : size;
++	}
++
++	return _find_nth_bit(addr1, addr2, size, n, ~0UL);
++}
++
+ #ifndef find_first_and_bit
+ /**
+  * find_first_and_bit - find the first set bit in both memory regions
+diff --git a/lib/find_bit.c b/lib/find_bit.c
+index 1b8e4b2a9cba..43cb1f781056 100644
+--- a/lib/find_bit.c
++++ b/lib/find_bit.c
+@@ -89,6 +89,26 @@ unsigned long _find_first_bit(const unsigned long *addr, unsigned long size)
+ EXPORT_SYMBOL(_find_first_bit);
+ #endif
+
++unsigned long _find_nth_bit(const unsigned long *addr1, const unsigned long *addr2,
++				unsigned long size, unsigned long n, unsigned long invert)
++{
++	unsigned long val, idx, w;
++
++	for (idx = 0; idx * BITS_PER_LONG < size; idx++, n -= w) {
++		val = addr1[idx];
++		if (addr2)
++			val &= addr2[idx] ^ invert;
++
++		w = hweight_long(val);
++		if (w > n)
++			return min(idx * BITS_PER_LONG + fns(val, n), size);
++	}
++
++	return size;
++
++}
++EXPORT_SYMBOL(_find_nth_bit);
++
+ #ifndef find_first_and_bit
+ /*
+  * Find the first set bit in two memory regions.
+--
+2.34.1
+
+Add functional and performance tests for find_nth_bit().
+
+Signed-off-by: Yury Norov <yury.norov@xxxxxxxxx>
+---
+ lib/find_bit_benchmark.c | 17 +++++++++++++++++
+ lib/test_bitmap.c        | 36 ++++++++++++++++++++++++++++++++++--
+ 2 files changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/lib/find_bit_benchmark.c b/lib/find_bit_benchmark.c
+index db904b57d4b8..a17a0ad0f783 100644
+--- a/lib/find_bit_benchmark.c
++++ b/lib/find_bit_benchmark.c
+@@ -115,6 +115,22 @@ static int __init test_find_last_bit(const void *bitmap, unsigned long len)
+ 	return 0;
+ }
+
++static int __init test_find_nth_bit(const unsigned long *bitmap, unsigned long len)
++{
++	unsigned long l, n, w = bitmap_weight(bitmap, len);
++	ktime_t time;
++
++	time = ktime_get();
++	for (n = 0; n < w; n++) {
++		l = find_nth_bit(bitmap, len, n);
++		WARN_ON(l >= len);
++	}
++	time = ktime_get() - time;
++	pr_err("find_nth_bit:       %18llu ns, %6ld iterations\n", time, w);
++
++	return 0;
++}
++
+ static int __init test_find_next_and_bit(const void *bitmap,
+ 		const void *bitmap2, unsigned long len)
+ {
+@@ -142,6 +158,7 @@ static int __init find_bit_test(void)
+ 	test_find_next_bit(bitmap, BITMAP_LEN);
+ 	test_find_next_zero_bit(bitmap, BITMAP_LEN);
+ 	test_find_last_bit(bitmap, BITMAP_LEN);
++	test_find_nth_bit(bitmap, BITMAP_LEN/10);
+
+ 	/*
+ 	 * test_find_first_bit() may take some time, so
+diff --git a/lib/test_bitmap.c b/lib/test_bitmap.c
+index 25967cfa4ab2..8ac8c1df818c 100644
+--- a/lib/test_bitmap.c
++++ b/lib/test_bitmap.c
+@@ -16,6 +16,8 @@
+
+ #include "../tools/testing/selftests/kselftest_module.h"
+
++#define EXP1_IN_BITS	(sizeof(exp1) * 8)
++
+ KSTM_MODULE_GLOBALS();
+
+ static char pbl_buffer[PAGE_SIZE] __initdata;
+@@ -219,6 +221,36 @@ static void __init test_zero_clear(void)
+ 	expect_eq_pbl("", bmap, 1024);
+ }
+
++static void __init test_find_nth_bit(void)
++{
++	unsigned long b, bit, cnt = 0;
++	DECLARE_BITMAP(bmap, 64 * 3);
++
++	bitmap_zero(bmap, 64 * 3);
++	__set_bit(10, bmap);
++	__set_bit(20, bmap);
++	__set_bit(30, bmap);
++	__set_bit(40, bmap);
++	__set_bit(50, bmap);
++	__set_bit(60, bmap);
++	__set_bit(80, bmap);
++	__set_bit(123, bmap);
++
++	expect_eq_uint(10,  find_nth_bit(bmap, 64 * 3, 0));
++	expect_eq_uint(20,  find_nth_bit(bmap, 64 * 3, 1));
++	expect_eq_uint(30,  find_nth_bit(bmap, 64 * 3, 2));
++	expect_eq_uint(40,  find_nth_bit(bmap, 64 * 3, 3));
++	expect_eq_uint(50,  find_nth_bit(bmap, 64 * 3, 4));
++	expect_eq_uint(60,  find_nth_bit(bmap, 64 * 3, 5));
++	expect_eq_uint(80,  find_nth_bit(bmap, 64 * 3, 6));
++	expect_eq_uint(123, find_nth_bit(bmap, 64 * 3, 7));
++
++	for_each_set_bit(bit, exp1, EXP1_IN_BITS) {
++		b = find_nth_bit(exp1, EXP1_IN_BITS, cnt++);
++		expect_eq_uint(b, bit);
++	}
++}
++
+ static void __init test_fill_set(void)
+ {
+ 	DECLARE_BITMAP(bmap, 1024);
+@@ -557,8 +589,6 @@ static void __init test_bitmap_parse(void)
+ 	}
+ }
+
+-#define EXP1_IN_BITS	(sizeof(exp1) * 8)
+-
+ static void __init test_bitmap_arr32(void)
+ {
+ 	unsigned int nbits, next_bit;
+@@ -946,6 +976,8 @@ static void __init selftest(void)
+ 	test_bitmap_cut();
+ 	test_bitmap_print_buf();
+ 	test_bitmap_const_eval();
++
++	test_find_nth_bit();
+ }
+
+ KSTM_MODULE_LOADERS(test_bitmap);
+--
+2.34.1
+
+Now that we have find_nth_bit(), we can drop bitmap_ord_to_pos().
+
+Signed-off-by: Yury Norov <yury.norov@xxxxxxxxx>
+---
+ include/linux/bitmap.h |  1 -
+ lib/bitmap.c           | 36 +++---------------------------------
+ lib/nodemask.c         |  3 +--
+ 3 files changed, 4 insertions(+), 36 deletions(-)
+
+diff --git a/include/linux/bitmap.h b/include/linux/bitmap.h
+index 035d4ac66641..0de6f6a101a9 100644
+--- a/include/linux/bitmap.h
++++ b/include/linux/bitmap.h
+@@ -222,7 +222,6 @@ void bitmap_copy_le(unsigned long *dst, const unsigned long *src, unsigned int n
+ #else
+ #define bitmap_copy_le bitmap_copy
+ #endif
+-unsigned int bitmap_ord_to_pos(const unsigned long *bitmap, unsigned int ord, unsigned int nbits);
+ int bitmap_print_to_pagebuf(bool list, char *buf,
+ 				   const unsigned long *maskp, int nmaskbits);
+
+diff --git a/lib/bitmap.c b/lib/bitmap.c
+index b580b381eca1..0b1082aa0b2c 100644
+--- a/lib/bitmap.c
++++ b/lib/bitmap.c
+@@ -956,36 +956,6 @@ static int bitmap_pos_to_ord(const unsigned long *buf, unsigned int pos, unsigne
+ 	return __bitmap_weight(buf, pos);
+ }
+
+-/**
+- * bitmap_ord_to_pos - find position of n-th set bit in bitmap
+- *	@buf: pointer to bitmap
+- *	@ord: ordinal bit position (n-th set bit, n >= 0)
+- *	@nbits: number of valid bit positions in @buf
+- *
+- * Map the ordinal offset of bit @ord in @buf to its position in @buf.
+- * Value of @ord should be in range 0 <= @ord < weight(buf). If @ord
+- * >= weight(buf), returns @nbits.
+- *
+- * If for example, just bits 4 through 7 are set in @buf, then @ord
+- * values 0 through 3 will get mapped to 4 through 7, respectively,
+- * and all other @ord values returns @nbits.  When @ord value 3
+- * gets mapped to (returns) @pos value 7 in this example, that means
+- * that the 3rd set bit (starting with 0th) is at position 7 in @buf.
+- *
+- * The bit positions 0 through @nbits-1 are valid positions in @buf.
+- */
+-unsigned int bitmap_ord_to_pos(const unsigned long *buf, unsigned int ord, unsigned int nbits)
+-{
+-	unsigned int pos;
+-
+-	for (pos = find_first_bit(buf, nbits);
+-	     pos < nbits && ord;
+-	     pos = find_next_bit(buf, nbits, pos + 1))
+-		ord--;
+-
+-	return pos;
+-}
+-
+ /**
+  * bitmap_remap - Apply map defined by a pair of bitmaps to another bitmap
+  *	@dst: remapped result
+@@ -1035,7 +1005,7 @@ void bitmap_remap(unsigned long *dst, const unsigned long *src,
+ 		if (n < 0 || w == 0)
+ 			set_bit(oldbit, dst);	/* identity map */
+ 		else
+-			set_bit(bitmap_ord_to_pos(new, n % w, nbits), dst);
++			set_bit(find_nth_bit(new, nbits, n % w), dst);
+ 	}
+ }
+ EXPORT_SYMBOL(bitmap_remap);
+@@ -1074,7 +1044,7 @@ int bitmap_bitremap(int oldbit, const unsigned long *old,
+ 	if (n < 0 || w == 0)
+ 		return oldbit;
+ 	else
+-		return bitmap_ord_to_pos(new, n % w, bits);
++		return find_nth_bit(new, bits, n % w);
+ }
+ EXPORT_SYMBOL(bitmap_bitremap);
+
+@@ -1198,7 +1168,7 @@ void bitmap_onto(unsigned long *dst, const unsigned long *orig,
+ 	 * The following code is a more efficient, but less
+ 	 * obvious, equivalent to the loop:
+ 	 *	for (m = 0; m < bitmap_weight(relmap, bits); m++) {
+-	 *		n = bitmap_ord_to_pos(orig, m, bits);
++	 *		n = find_nth_bit(orig, bits, m);
+ 	 *		if (test_bit(m, orig))
+ 	 *			set_bit(n, dst);
+ 	 *	}
+diff --git a/lib/nodemask.c b/lib/nodemask.c
+index e22647f5181b..7dad4ce8ff59 100644
+--- a/lib/nodemask.c
++++ b/lib/nodemask.c
+@@ -24,8 +24,7 @@ int node_random(const nodemask_t *maskp)
+
+ 	w = nodes_weight(*maskp);
+ 	if (w)
+-		bit = bitmap_ord_to_pos(maskp->bits,
+-			get_random_int() % w, MAX_NUMNODES);
++		bit = find_nth_bit(maskp->bits, MAX_NUMNODES, get_random_int() % w);
+ 	return bit;
+ }
+ #endif
+--
+2.34.1
+
+Add cpumask_nth_{,and,andnot} as wrappers around corresponding
+find functions, and use it in cpumask_local_spread().
+
+Signed-off-by: Yury Norov <yury.norov@xxxxxxxxx>
+---
+ include/linux/cpumask.h | 44 +++++++++++++++++++++++++++++++++++++++++
+ lib/cpumask.c           | 26 +++++++++++-------------
+ 2 files changed, 55 insertions(+), 15 deletions(-)
+
+diff --git a/include/linux/cpumask.h b/include/linux/cpumask.h
+index 80627362c774..86c7e6c6e473 100644
+--- a/include/linux/cpumask.h
++++ b/include/linux/cpumask.h
+@@ -379,6 +379,50 @@ unsigned int cpumask_any_but(const struct cpumask *mask, unsigned int cpu)
+ }
+ #endif /* SMP */
+
++/**
++ * cpumask_nth - get the first cpu in a cpumask
++ * @srcp: the cpumask pointer
++ * @cpu: the N'th cpu to find, starting from 0
++ *
++ * Returns >= nr_cpu_ids if such cpu doesn't exist.
++ */
++static inline unsigned int cpumask_nth(unsigned int cpu, const struct cpumask *srcp)
++{
++	return find_nth_bit(cpumask_bits(srcp), nr_cpumask_bits, cpumask_check(cpu));
++}
++
++/**
++ * cpumask_nth_and - get the first cpu in 2 cpumasks
++ * @srcp1: the cpumask pointer
++ * @srcp2: the cpumask pointer
++ * @cpu: the N'th cpu to find, starting from 0
++ *
++ * Returns >= nr_cpu_ids if such cpu doesn't exist.
++ */
++static inline
++unsigned int cpumask_nth_and(unsigned int cpu, const struct cpumask *srcp1,
++							const struct cpumask *srcp2)
++{
++	return find_nth_and_bit(cpumask_bits(srcp1), cpumask_bits(srcp2),
++				nr_cpumask_bits, cpumask_check(cpu));
++}
++
++/**
++ * cpumask_nth_andnot - get the first cpu set in 1st cpumask, and clear in 2nd.
++ * @srcp1: the cpumask pointer
++ * @srcp2: the cpumask pointer
++ * @cpu: the N'th cpu to find, starting from 0
++ *
++ * Returns >= nr_cpu_ids if such cpu doesn't exist.
++ */
++static inline
++unsigned int cpumask_nth_andnot(unsigned int cpu, const struct cpumask *srcp1,
++							const struct cpumask *srcp2)
++{
++	return find_nth_andnot_bit(cpumask_bits(srcp1), cpumask_bits(srcp2),
++				nr_cpumask_bits, cpumask_check(cpu));
++}
++
+ #define CPU_BITS_NONE						\
+ {								\
+ 	[0 ... BITS_TO_LONGS(NR_CPUS)-1] = 0UL			\
+diff --git a/lib/cpumask.c b/lib/cpumask.c
+index f0ae119be8c4..062821dbf65f 100644
+--- a/lib/cpumask.c
++++ b/lib/cpumask.c
+@@ -128,23 +128,19 @@ unsigned int cpumask_local_spread(unsigned int i, int node)
+ 	i %= num_online_cpus();
+
+ 	if (node == NUMA_NO_NODE) {
+-		for_each_cpu(cpu, cpu_online_mask)
+-			if (i-- == 0)
+-				return cpu;
++		cpu = cpumask_nth(i, cpu_online_mask);
++		if (cpu < nr_cpu_ids)
++			return cpu;
+ 	} else {
+ 		/* NUMA first. */
+-		for_each_cpu_and(cpu, cpumask_of_node(node), cpu_online_mask)
+-			if (i-- == 0)
+-				return cpu;
+-
+-		for_each_cpu(cpu, cpu_online_mask) {
+-			/* Skip NUMA nodes, done above. */
+-			if (cpumask_test_cpu(cpu, cpumask_of_node(node)))
+-				continue;
+-
+-			if (i-- == 0)
+-				return cpu;
+-		}
++		cpu = cpumask_nth_and(i, cpu_online_mask, cpumask_of_node(node));
++		if (cpu < nr_cpu_ids)
++			return cpu;
++
++		/* Skip NUMA nodes, done above. */
++		cpu = cpumask_nth_andnot(i, cpu_online_mask, cpumask_of_node(node));
++		if (cpu < nr_cpu_ids)
++			return cpu;
+ 	}
+ 	BUG();
+ }
+--
+2.34.1
+
+The functions are pretty thin wrappers around find_bit engine, and
+keeping them in c-file prevents compiler from small_const_nbits()
+optimization, which must take place for all systems with MAX_NUMNODES
+less than BITS_PER_LONG (default is 16 for me).
+
+Moving them in header file doesn't blow up the kernel size:
+add/remove: 1/2 grow/shrink: 9/5 up/down: 968/-88 (880)
+
+Signed-off-by: Yury Norov <yury.norov@xxxxxxxxx>
+---
+ MAINTAINERS              |  1 -
+ include/linux/nodemask.h | 27 ++++++++++++++++++++++-----
+ lib/Makefile             |  2 +-
+ lib/nodemask.c           | 30 ------------------------------
+ 4 files changed, 23 insertions(+), 37 deletions(-)
+ delete mode 100644 lib/nodemask.c
+
+diff --git a/include/linux/nodemask.h b/include/linux/nodemask.h
+index 0f233b76c9ce..48ebe4007955 100644
+--- a/include/linux/nodemask.h
++++ b/include/linux/nodemask.h
+@@ -94,6 +94,7 @@
+ #include <linux/bitmap.h>
+ #include <linux/minmax.h>
+ #include <linux/numa.h>
++#include <linux/random.h>
+
+ typedef struct { DECLARE_BITMAP(bits, MAX_NUMNODES); } nodemask_t;
+ extern nodemask_t _unused_nodemask_arg_;
+@@ -276,7 +277,14 @@ static inline unsigned int __next_node(int n, const nodemask_t *srcp)
+  * the first node in src if needed.  Returns MAX_NUMNODES if src is empty.
+  */
+ #define next_node_in(n, src) __next_node_in((n), &(src))
+-unsigned int __next_node_in(int node, const nodemask_t *srcp);
++static inline unsigned int __next_node_in(int node, const nodemask_t *srcp)
++{
++	unsigned int ret = __next_node(node, srcp);
++
++	if (ret == MAX_NUMNODES)
++		ret = __first_node(srcp);
++	return ret;
++}
+
+ static inline void init_nodemask_of_node(nodemask_t *mask, int node)
+ {
+@@ -493,14 +501,23 @@ static inline int num_node_state(enum node_states state)
+
+ #endif
+
++/*
++ * Return the bit number of a random bit set in the nodemask.
++ * (returns NUMA_NO_NODE if nodemask is empty)
++ */
++static inline int node_random(const nodemask_t *maskp)
++{
+ #if defined(CONFIG_NUMA) && (MAX_NUMNODES > 1)
+-extern int node_random(const nodemask_t *maskp);
++	int w, bit = NUMA_NO_NODE;
++
++	w = nodes_weight(*maskp);
++	if (w)
++		bit = find_nth_bit(maskp->bits, MAX_NUMNODES, get_random_int() % w);
++	return bit;
+ #else
+-static inline int node_random(const nodemask_t *mask)
+-{
+ 	return 0;
+-}
+ #endif
++}
+
+ #define node_online_map 	node_states[N_ONLINE]
+ #define node_possible_map 	node_states[N_POSSIBLE]
+diff --git a/lib/Makefile b/lib/Makefile
+index f99bf61f8bbc..731cea0342d1 100644
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@ -33,7 +33,7 @@ lib-y := ctype.o string.o vsprintf.o cmdline.o \
+ 	 flex_proportions.o ratelimit.o show_mem.o \
+ 	 is_single_threaded.o plist.o decompress.o kobject_uevent.o \
+ 	 earlycpio.o seq_buf.o siphash.o dec_and_lock.o \
+-	 nmi_backtrace.o nodemask.o win_minmax.o memcat_p.o \
++	 nmi_backtrace.o win_minmax.o memcat_p.o \
+ 	 buildid.o
+
+ lib-$(CONFIG_PRINTK) += dump_stack.o
+diff --git a/lib/nodemask.c b/lib/nodemask.c
+deleted file mode 100644
+index 7dad4ce8ff59..000000000000
+--- a/lib/nodemask.c
++++ /dev/null
+@@ -1,30 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-#include <linux/nodemask.h>
+-#include <linux/module.h>
+-#include <linux/random.h>
+-
+-unsigned int __next_node_in(int node, const nodemask_t *srcp)
+-{
+-	unsigned int ret = __next_node(node, srcp);
+-
+-	if (ret == MAX_NUMNODES)
+-		ret = __first_node(srcp);
+-	return ret;
+-}
+-EXPORT_SYMBOL(__next_node_in);
+-
+-#ifdef CONFIG_NUMA
+-/*
+- * Return the bit number of a random bit set in the nodemask.
+- * (returns NUMA_NO_NODE if nodemask is empty)
+- */
+-int node_random(const nodemask_t *maskp)
+-{
+-	int w, bit = NUMA_NO_NODE;
+-
+-	w = nodes_weight(*maskp);
+-	if (w)
+-		bit = find_nth_bit(maskp->bits, MAX_NUMNODES, get_random_int() % w);
+-	return bit;
+-}
+-#endif
+--
+2.34.1
