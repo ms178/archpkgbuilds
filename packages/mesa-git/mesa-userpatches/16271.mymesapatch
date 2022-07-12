@@ -1,0 +1,1606 @@
+From d6ecf25beea6be5921023b9bf22547fd113946db Mon Sep 17 00:00:00 2001
+From: Tatsuyuki Ishi <ishitatsuyuki@gmail.com>
+Date: Sun, 10 Jul 2022 16:24:57 +0900
+Subject: [PATCH 1/9] radv: Add internal queue mappings for vk_queue_to_radv.
+
+Also introduce a reverse mapping, radv_queue_to_vk, in order to get the
+queue family index for such queues.
+---
+ src/amd/vulkan/radv_device.c  | 18 ++++++++++--------
+ src/amd/vulkan/radv_private.h |  9 ++++++++-
+ 2 files changed, 18 insertions(+), 9 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+index fe6752ff841b..abfe8818f11b 100644
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -594,18 +594,20 @@ static void
+ radv_physical_device_init_queue_table(struct radv_physical_device *pdevice)
+ {
+    int idx = 0;
+-   pdevice->vk_queue_to_radv[idx] = RADV_QUEUE_GENERAL;
+-   idx++;
+-
+-   for (unsigned i = 1; i < RADV_MAX_QUEUE_FAMILIES; i++)
+-      pdevice->vk_queue_to_radv[i] = RADV_MAX_QUEUE_FAMILIES + 1;
++   int hidden_idx = RADV_MAX_QUEUE_FAMILIES - 1;
++   pdevice->vk_queue_to_radv[idx++] = RADV_QUEUE_GENERAL;
+ 
+    if (pdevice->rad_info.ip[AMD_IP_COMPUTE].num_queues > 0 &&
+        !(pdevice->instance->debug_flags & RADV_DEBUG_NO_COMPUTE_QUEUE)) {
+-      pdevice->vk_queue_to_radv[idx] = RADV_QUEUE_COMPUTE;
+-      idx++;
++      pdevice->vk_queue_to_radv[idx++] = RADV_QUEUE_COMPUTE;
++   } else {
++      pdevice->vk_queue_to_radv[hidden_idx--] = RADV_QUEUE_COMPUTE;
+    }
+-   pdevice->num_queues = idx;
++   pdevice->vk_queue_to_radv[hidden_idx--] = RADV_QUEUE_TRANSFER;
++   assert(idx == hidden_idx + 1);
++
++   for (unsigned i = 0; i < RADV_MAX_QUEUE_FAMILIES; i++)
++      pdevice->radv_queue_to_vk[pdevice->vk_queue_to_radv[i]] = i;
+ }
+ 
+ static VkResult
+diff --git a/src/amd/vulkan/radv_private.h b/src/amd/vulkan/radv_private.h
+index 95034773a75c..29d3a87c619b 100644
+--- a/src/amd/vulkan/radv_private.h
++++ b/src/amd/vulkan/radv_private.h
+@@ -328,8 +328,15 @@ struct radv_physical_device {
+ 
+    nir_shader_compiler_options nir_options[MESA_VULKAN_SHADER_STAGES];
+ 
++   /* Queue mapping between Vulkan queue family indices and RADV queue family constants.
++    * Some queue types are not exposed to the applications (e.g. TRANSFER (SDMA) queues), but
++    * Vulkan does not allow holes in queue family indices, hence the mapping is necessary.
++    * Note that we still assign internal queue family indices for these hidden types in
++    * radv_physical_device_init_queue_table for internal use, by mapping them to indices higher than
++    * the exposed count in VkQueueFamilyProperties.
++    */
+    enum radv_queue_family vk_queue_to_radv[RADV_MAX_QUEUE_FAMILIES];
+-   uint32_t num_queues;
++   uint32_t radv_queue_to_vk[RADV_MAX_QUEUE_FAMILIES];
+ 
+    uint32_t gs_table_depth;
+ 
+-- 
+GitLab
+
+
+From c7c0caf570565714488ecd30df154f299f43fbe2 Mon Sep 17 00:00:00 2001
+From: Tatsuyuki Ishi <ishitatsuyuki@gmail.com>
+Date: Sun, 10 Jul 2022 16:27:52 +0900
+Subject: [PATCH 2/9] radv: Add radv_internal_queue_init and use it for private
+ SDMA queue.
+
+For use cases like asynchronous shader uploads where the application
+doesn't supply a queue since it's not a cmdbuf/queue operation.
+
+The return type of radv_queue_init is changed to VkResult for consistency.
+
+This also fixes a bug where vk_queue_to_radv could be written out-of-bound
+if more than one VkDevice is created from the same VkPhysicalDevice.
+
+Fixes: 177805cc ("radv: try and fix internal transfer queue mapping")
+---
+ src/amd/vulkan/radv_device.c  | 55 ++++++++++++++++++++++++++++++++++-
+ src/amd/vulkan/radv_private.h | 10 +++++--
+ src/amd/vulkan/radv_wsi.c     | 14 +--------
+ 3 files changed, 62 insertions(+), 17 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+index abfe8818f11b..6a464f10e9b9 100644
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -2762,7 +2762,60 @@ radv_get_queue_global_priority(const VkDeviceQueueGlobalPriorityCreateInfoEXT *p
+    }
+ }
+ 
+-int
++static int
++radv_get_next_internal_queue_idx(struct radv_device *device, enum radv_queue_family qf)
++{
++   uint32_t queue_idx = device->internal_queue_count[qf]++;
++   uint32_t num_queues =
++      device->physical_device->rad_info.ip[radv_queue_family_to_ring(device->physical_device, qf)]
++         .num_queues;
++   assert(num_queues != 0);
++   /* Start from rings with the highest index to reduce contention with application queues. */
++   return num_queues - 1 - queue_idx % num_queues;
++}
++
++VkResult
++radv_internal_queue_init(struct radv_device *device, struct radv_queue *queue,
++                         enum radv_queue_family qf)
++{
++   float prio = 0.5f;
++
++   const VkDeviceQueueCreateInfo queue_create = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = device->physical_device->radv_queue_to_vk[qf],
++      /*
++       * HACK: Pretend that we are creating a queue for each ring, so that this will not trip the
++       *       assertion in vk_queue_init().
++       */
++      .queueCount = device->physical_device->rad_info
++                       .ip[radv_queue_family_to_ring(device->physical_device, qf)]
++                       .num_queues,
++      .pQueuePriorities = &prio,
++   };
++
++   /*
++    * A hw_ctx is only created for the priorities the application has requested, so
++    * global_priority == NULL might not always work. Here, we try to pick a valid priority value.
++    * For now, assume that driver internal work should have the highest priority.
++    * If there are priority inversion issues, we can revisit the selection logic.
++    */
++   VkDeviceQueueGlobalPriorityCreateInfoEXT queue_prio_crinfo = {
++      .globalPriority = VK_QUEUE_GLOBAL_PRIORITY_REALTIME_EXT,
++   };
++   while (!device->hw_ctx[radv_get_queue_global_priority(&queue_prio_crinfo)]) {
++      queue_prio_crinfo.globalPriority >>= 1;
++   }
++
++   VkResult result = radv_queue_init(device, queue, radv_get_next_internal_queue_idx(device, qf),
++                                     &queue_create, &queue_prio_crinfo);
++   if (result == VK_SUCCESS) {
++      /* Hide this queue from the application. The freeing should be handled in radv_DestroyDevice. */
++      list_delinit(&queue->vk.link);
++   }
++   return result;
++}
++
++VkResult
+ radv_queue_init(struct radv_device *device, struct radv_queue *queue, int idx,
+                 const VkDeviceQueueCreateInfo *create_info,
+                 const VkDeviceQueueGlobalPriorityCreateInfoEXT *global_priority)
+diff --git a/src/amd/vulkan/radv_private.h b/src/amd/vulkan/radv_private.h
+index 29d3a87c619b..d0762c6f85e8 100644
+--- a/src/amd/vulkan/radv_private.h
++++ b/src/amd/vulkan/radv_private.h
+@@ -804,6 +804,7 @@ struct radv_device {
+ 
+    struct radv_queue *queues[RADV_MAX_QUEUE_FAMILIES];
+    int queue_count[RADV_MAX_QUEUE_FAMILIES];
++   int internal_queue_count[RADV_MAX_QUEUE_FAMILIES];
+ 
+    bool pbb_allowed;
+    uint32_t scratch_waves;
+@@ -2843,9 +2844,12 @@ void radv_pc_get_results(const struct radv_pc_query_pool *pc_pool, const uint64_
+ 
+ bool radv_queue_internal_submit(struct radv_queue *queue, struct radeon_cmdbuf *cs);
+ 
+-int radv_queue_init(struct radv_device *device, struct radv_queue *queue, int idx,
+-                    const VkDeviceQueueCreateInfo *create_info,
+-                    const VkDeviceQueueGlobalPriorityCreateInfoEXT *global_priority);
++VkResult radv_internal_queue_init(struct radv_device *device, struct radv_queue *queue,
++                                  enum radv_queue_family qf);
++
++VkResult radv_queue_init(struct radv_device *device, struct radv_queue *queue, int idx,
++                         const VkDeviceQueueCreateInfo *create_info,
++                         const VkDeviceQueueGlobalPriorityCreateInfoEXT *global_priority);
+ 
+ void radv_set_descriptor_set(struct radv_cmd_buffer *cmd_buffer, VkPipelineBindPoint bind_point,
+                              struct radv_descriptor_set *set, unsigned idx);
+diff --git a/src/amd/vulkan/radv_wsi.c b/src/amd/vulkan/radv_wsi.c
+index 8d72865ffc84..555463ef9f6a 100644
+--- a/src/amd/vulkan/radv_wsi.c
++++ b/src/amd/vulkan/radv_wsi.c
+@@ -60,23 +60,11 @@ radv_wsi_get_prime_blit_queue(VkDevice _device)
+ 
+    if (device->physical_device->rad_info.gfx_level >= GFX9 &&
+        !(device->physical_device->instance->debug_flags & RADV_DEBUG_NO_DMA_BLIT)) {
+-
+-      device->physical_device->vk_queue_to_radv[device->physical_device->num_queues++] = RADV_QUEUE_TRANSFER;
+-      const VkDeviceQueueCreateInfo queue_create = {
+-         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+-         .queueFamilyIndex = device->physical_device->num_queues - 1,
+-         .queueCount = 1,
+-      };
+-
+       device->private_sdma_queue = vk_zalloc(&device->vk.alloc, sizeof(struct radv_queue), 8,
+                                              VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+ 
+-      VkResult result = radv_queue_init(device, device->private_sdma_queue, 0, &queue_create, NULL);
++      VkResult result = radv_internal_queue_init(device, device->private_sdma_queue, RADV_QUEUE_TRANSFER);
+       if (result == VK_SUCCESS) {
+-         /* Remove the queue from our queue list because it'll be cleared manually
+-          * in radv_DestroyDevice.
+-          */
+-         list_delinit(&device->private_sdma_queue->vk.link);
+          return vk_queue_to_handle(&device->private_sdma_queue->vk);
+       } else {
+          vk_free(&device->vk.alloc, device->private_sdma_queue);
+-- 
+GitLab
+
+
+From 2954c9efbd298af687cdcd4322e295af047ef6a8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Thu, 16 Jun 2022 14:45:01 +0200
+Subject: [PATCH 3/9] radv: Refactor some CP DMA functions to work with
+ radeon_cmdbuf.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Allow emitting these packets without a radv_cmd_buffer object.
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+---
+ src/amd/vulkan/radv_private.h  |  2 +
+ src/amd/vulkan/si_cmd_buffer.c | 71 +++++++++++++++++++++-------------
+ 2 files changed, 47 insertions(+), 26 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_private.h b/src/amd/vulkan/radv_private.h
+index d0762c6f85e8..7cc3d3fb7417 100644
+--- a/src/amd/vulkan/radv_private.h
++++ b/src/amd/vulkan/radv_private.h
+@@ -1665,6 +1665,8 @@ void si_emit_set_predication_state(struct radv_cmd_buffer *cmd_buffer, bool draw
+                                    unsigned pred_op, uint64_t va);
+ void si_cp_dma_buffer_copy(struct radv_cmd_buffer *cmd_buffer, uint64_t src_va, uint64_t dest_va,
+                            uint64_t size);
++void si_cs_cp_dma_prefetch(struct radv_device *device, struct radeon_cmdbuf *cs,
++                           uint64_t va, unsigned size, bool predicating);
+ void si_cp_dma_prefetch(struct radv_cmd_buffer *cmd_buffer, uint64_t va, unsigned size);
+ void si_cp_dma_clear_buffer(struct radv_cmd_buffer *cmd_buffer, uint64_t va, uint64_t size,
+                             unsigned value);
+diff --git a/src/amd/vulkan/si_cmd_buffer.c b/src/amd/vulkan/si_cmd_buffer.c
+index 28eeccbac2c5..440439b626bb 100644
+--- a/src/amd/vulkan/si_cmd_buffer.c
++++ b/src/amd/vulkan/si_cmd_buffer.c
+@@ -1498,9 +1498,8 @@ si_emit_set_predication_state(struct radv_cmd_buffer *cmd_buffer, bool draw_visi
+ 
+ /* The max number of bytes that can be copied per packet. */
+ static inline unsigned
+-cp_dma_max_byte_count(struct radv_cmd_buffer *cmd_buffer)
++cp_dma_max_byte_count(enum amd_gfx_level gfx_level)
+ {
+-   enum amd_gfx_level gfx_level = cmd_buffer->device->physical_device->rad_info.gfx_level;
+    unsigned max = gfx_level >= GFX11 ? 32767 :
+                   gfx_level >= GFX9 ? S_415_BYTE_COUNT_GFX9(~0u) : S_415_BYTE_COUNT_GFX6(~0u);
+ 
+@@ -1513,16 +1512,15 @@ cp_dma_max_byte_count(struct radv_cmd_buffer *cmd_buffer)
+  * clear value.
+  */
+ static void
+-si_emit_cp_dma(struct radv_cmd_buffer *cmd_buffer, uint64_t dst_va, uint64_t src_va, unsigned size,
+-               unsigned flags)
++si_cs_emit_cp_dma(struct radv_device *device, struct radeon_cmdbuf *cs, bool predicating,
++                  uint64_t dst_va, uint64_t src_va, unsigned size, unsigned flags)
+ {
+-   struct radeon_cmdbuf *cs = cmd_buffer->cs;
+    uint32_t header = 0, command = 0;
+ 
+-   assert(size <= cp_dma_max_byte_count(cmd_buffer));
++   assert(size <= cp_dma_max_byte_count(device->physical_device->rad_info.gfx_level));
+ 
+-   radeon_check_space(cmd_buffer->device->ws, cmd_buffer->cs, 9);
+-   if (cmd_buffer->device->physical_device->rad_info.gfx_level >= GFX9)
++   radeon_check_space(device->ws, cs, 9);
++   if (device->physical_device->rad_info.gfx_level >= GFX9)
+       command |= S_415_BYTE_COUNT_GFX9(size);
+    else
+       command |= S_415_BYTE_COUNT_GFX6(size);
+@@ -1531,7 +1529,7 @@ si_emit_cp_dma(struct radv_cmd_buffer *cmd_buffer, uint64_t dst_va, uint64_t src
+    if (flags & CP_DMA_SYNC)
+       header |= S_411_CP_SYNC(1);
+    else {
+-      if (cmd_buffer->device->physical_device->rad_info.gfx_level >= GFX9)
++      if (device->physical_device->rad_info.gfx_level >= GFX9)
+          command |= S_415_DISABLE_WR_CONFIRM_GFX9(1);
+       else
+          command |= S_415_DISABLE_WR_CONFIRM_GFX6(1);
+@@ -1541,7 +1539,7 @@ si_emit_cp_dma(struct radv_cmd_buffer *cmd_buffer, uint64_t dst_va, uint64_t src
+       command |= S_415_RAW_WAIT(1);
+ 
+    /* Src and dst flags. */
+-   if (cmd_buffer->device->physical_device->rad_info.gfx_level >= GFX9 && !(flags & CP_DMA_CLEAR) &&
++   if (device->physical_device->rad_info.gfx_level >= GFX9 && !(flags & CP_DMA_CLEAR) &&
+        src_va == dst_va)
+       header |= S_411_DST_SEL(V_411_NOWHERE); /* prefetch only */
+    else if (flags & CP_DMA_USE_L2)
+@@ -1552,8 +1550,8 @@ si_emit_cp_dma(struct radv_cmd_buffer *cmd_buffer, uint64_t dst_va, uint64_t src
+    else if (flags & CP_DMA_USE_L2)
+       header |= S_411_SRC_SEL(V_411_SRC_ADDR_TC_L2);
+ 
+-   if (cmd_buffer->device->physical_device->rad_info.gfx_level >= GFX7) {
+-      radeon_emit(cs, PKT3(PKT3_DMA_DATA, 5, cmd_buffer->state.predicating));
++   if (device->physical_device->rad_info.gfx_level >= GFX7) {
++      radeon_emit(cs, PKT3(PKT3_DMA_DATA, 5, predicating));
+       radeon_emit(cs, header);
+       radeon_emit(cs, src_va);       /* SRC_ADDR_LO [31:0] */
+       radeon_emit(cs, src_va >> 32); /* SRC_ADDR_HI [31:0] */
+@@ -1563,13 +1561,24 @@ si_emit_cp_dma(struct radv_cmd_buffer *cmd_buffer, uint64_t dst_va, uint64_t src
+    } else {
+       assert(!(flags & CP_DMA_USE_L2));
+       header |= S_411_SRC_ADDR_HI(src_va >> 32);
+-      radeon_emit(cs, PKT3(PKT3_CP_DMA, 4, cmd_buffer->state.predicating));
++      radeon_emit(cs, PKT3(PKT3_CP_DMA, 4, predicating));
+       radeon_emit(cs, src_va);                  /* SRC_ADDR_LO [31:0] */
+       radeon_emit(cs, header);                  /* SRC_ADDR_HI [15:0] + flags. */
+       radeon_emit(cs, dst_va);                  /* DST_ADDR_LO [31:0] */
+       radeon_emit(cs, (dst_va >> 32) & 0xffff); /* DST_ADDR_HI [15:0] */
+       radeon_emit(cs, command);
+    }
++}
++
++static void
++si_emit_cp_dma(struct radv_cmd_buffer *cmd_buffer, uint64_t dst_va, uint64_t src_va, unsigned size,
++               unsigned flags)
++{
++   struct radeon_cmdbuf *cs = cmd_buffer->cs;
++   struct radv_device *device = cmd_buffer->device;
++   bool predicating = cmd_buffer->state.predicating;
++
++   si_cs_emit_cp_dma(device, cs, predicating, dst_va, src_va, size, flags);
+ 
+    /* CP DMA is executed in ME, but index buffers are read by PFP.
+     * This ensures that ME (CP DMA) is idle before PFP starts fetching
+@@ -1591,23 +1600,25 @@ si_emit_cp_dma(struct radv_cmd_buffer *cmd_buffer, uint64_t dst_va, uint64_t src
+ }
+ 
+ void
+-si_cp_dma_prefetch(struct radv_cmd_buffer *cmd_buffer, uint64_t va, unsigned size)
++si_cs_cp_dma_prefetch(struct radv_device *device, struct radeon_cmdbuf *cs,
++                      uint64_t va, unsigned size, bool predicating)
+ {
+-   uint64_t aligned_va, aligned_size;
+-   struct radeon_cmdbuf *cs = cmd_buffer->cs;
++   struct radeon_winsys *ws = device->ws;
++   enum amd_gfx_level gfx_level = device->physical_device->rad_info.gfx_level;
+    uint32_t header = 0, command = 0;
+ 
+-   if (cmd_buffer->device->physical_device->rad_info.gfx_level >= GFX11)
++   if (gfx_level >= GFX11)
+       size = MIN2(size, 32768 - SI_CPDMA_ALIGNMENT);
+ 
+-   assert(size <= cp_dma_max_byte_count(cmd_buffer));
++   assert(size <= cp_dma_max_byte_count(gfx_level));
+ 
+-   radeon_check_space(cmd_buffer->device->ws, cmd_buffer->cs, 9);
++   radeon_check_space(ws, cs, 9);
+ 
+-   aligned_va = va & ~(SI_CPDMA_ALIGNMENT - 1);
+-   aligned_size = ((va + size + SI_CPDMA_ALIGNMENT - 1) & ~(SI_CPDMA_ALIGNMENT - 1)) - aligned_va;
++   uint64_t aligned_va = va & ~(SI_CPDMA_ALIGNMENT - 1);
++   uint64_t aligned_size =
++      ((va + size + SI_CPDMA_ALIGNMENT - 1) & ~(SI_CPDMA_ALIGNMENT - 1)) - aligned_va;
+ 
+-   if (cmd_buffer->device->physical_device->rad_info.gfx_level >= GFX9) {
++   if (gfx_level >= GFX9) {
+       command |= S_415_BYTE_COUNT_GFX9(aligned_size) |
+                  S_415_DISABLE_WR_CONFIRM_GFX9(1);
+       header |= S_411_DST_SEL(V_411_NOWHERE);
+@@ -1619,13 +1630,19 @@ si_cp_dma_prefetch(struct radv_cmd_buffer *cmd_buffer, uint64_t va, unsigned siz
+ 
+    header |= S_411_SRC_SEL(V_411_SRC_ADDR_TC_L2);
+ 
+-   radeon_emit(cs, PKT3(PKT3_DMA_DATA, 5, cmd_buffer->state.predicating));
++   radeon_emit(cs, PKT3(PKT3_DMA_DATA, 5, predicating));
+    radeon_emit(cs, header);
+    radeon_emit(cs, aligned_va);       /* SRC_ADDR_LO [31:0] */
+    radeon_emit(cs, aligned_va >> 32); /* SRC_ADDR_HI [31:0] */
+    radeon_emit(cs, aligned_va);       /* DST_ADDR_LO [31:0] */
+    radeon_emit(cs, aligned_va >> 32); /* DST_ADDR_HI [31:0] */
+    radeon_emit(cs, command);
++}
++
++void
++si_cp_dma_prefetch(struct radv_cmd_buffer *cmd_buffer, uint64_t va, unsigned size)
++{
++   si_cs_cp_dma_prefetch(cmd_buffer->device, cmd_buffer->cs, va, size, cmd_buffer->state.predicating);
+ 
+    if (unlikely(cmd_buffer->device->trace_bo))
+       radv_cmd_buffer_trace_emit(cmd_buffer);
+@@ -1676,6 +1693,7 @@ void
+ si_cp_dma_buffer_copy(struct radv_cmd_buffer *cmd_buffer, uint64_t src_va, uint64_t dest_va,
+                       uint64_t size)
+ {
++   enum amd_gfx_level gfx_level = cmd_buffer->device->physical_device->rad_info.gfx_level;
+    uint64_t main_src_va, main_dest_va;
+    uint64_t skipped_size = 0, realign_size = 0;
+ 
+@@ -1707,7 +1725,7 @@ si_cp_dma_buffer_copy(struct radv_cmd_buffer *cmd_buffer, uint64_t src_va, uint6
+ 
+    while (size) {
+       unsigned dma_flags = 0;
+-      unsigned byte_count = MIN2(size, cp_dma_max_byte_count(cmd_buffer));
++      unsigned byte_count = MIN2(size, cp_dma_max_byte_count(gfx_level));
+ 
+       if (cmd_buffer->device->physical_device->rad_info.gfx_level >= GFX9) {
+          /* DMA operations via L2 are coherent and faster.
+@@ -1750,17 +1768,18 @@ void
+ si_cp_dma_clear_buffer(struct radv_cmd_buffer *cmd_buffer, uint64_t va, uint64_t size,
+                        unsigned value)
+ {
+-
+    if (!size)
+       return;
+ 
+    assert(va % 4 == 0 && size % 4 == 0);
+ 
++   enum amd_gfx_level gfx_level = cmd_buffer->device->physical_device->rad_info.gfx_level;
++
+    /* Assume that we are not going to sync after the last DMA operation. */
+    cmd_buffer->state.dma_is_busy = true;
+ 
+    while (size) {
+-      unsigned byte_count = MIN2(size, cp_dma_max_byte_count(cmd_buffer));
++      unsigned byte_count = MIN2(size, cp_dma_max_byte_count(gfx_level));
+       unsigned dma_flags = CP_DMA_CLEAR;
+ 
+       if (cmd_buffer->device->physical_device->rad_info.gfx_level >= GFX9) {
+-- 
+GitLab
+
+
+From bb1d27a4256696bd91216a3363d0cb737810c0e2 Mon Sep 17 00:00:00 2001
+From: Tatsuyuki Ishi <ishitatsuyuki@gmail.com>
+Date: Sun, 10 Jul 2022 18:04:12 +0900
+Subject: [PATCH 4/9] radv: Add a radeon_cmdbuf variant for CP DMA copy helper.
+
+For use in shader uploads. We want to avoid radv_cmd_buffer due to the
+heavyweight state initialization as well as more verbose object management.
+---
+ src/amd/vulkan/radv_private.h  |  2 ++
+ src/amd/vulkan/si_cmd_buffer.c | 31 +++++++++++++++++++++++++++++++
+ 2 files changed, 33 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_private.h b/src/amd/vulkan/radv_private.h
+index 7cc3d3fb7417..fb7ad0830a40 100644
+--- a/src/amd/vulkan/radv_private.h
++++ b/src/amd/vulkan/radv_private.h
+@@ -1665,6 +1665,8 @@ void si_emit_set_predication_state(struct radv_cmd_buffer *cmd_buffer, bool draw
+                                    unsigned pred_op, uint64_t va);
+ void si_cp_dma_buffer_copy(struct radv_cmd_buffer *cmd_buffer, uint64_t src_va, uint64_t dest_va,
+                            uint64_t size);
++void si_cs_cp_dma_buffer_copy(struct radv_device *device, struct radeon_cmdbuf *cs, uint64_t src_va,
++                              uint64_t dest_va, uint64_t size);
+ void si_cs_cp_dma_prefetch(struct radv_device *device, struct radeon_cmdbuf *cs,
+                            uint64_t va, unsigned size, bool predicating);
+ void si_cp_dma_prefetch(struct radv_cmd_buffer *cmd_buffer, uint64_t va, unsigned size);
+diff --git a/src/amd/vulkan/si_cmd_buffer.c b/src/amd/vulkan/si_cmd_buffer.c
+index 440439b626bb..998ad716d4e1 100644
+--- a/src/amd/vulkan/si_cmd_buffer.c
++++ b/src/amd/vulkan/si_cmd_buffer.c
+@@ -1764,6 +1764,37 @@ si_cp_dma_buffer_copy(struct radv_cmd_buffer *cmd_buffer, uint64_t src_va, uint6
+       si_cp_dma_realign_engine(cmd_buffer, realign_size);
+ }
+ 
++/* A simplified version of si_cp_dma_buffer_copy for internal copies.
++ * Differences:
++ * - src_va, dest_va, size must be aligned to SI_CPDMA_ALIGNMENT.
++ * - Automatically syncs after the copy.
++ */
++void
++si_cs_cp_dma_buffer_copy(struct radv_device *device, struct radeon_cmdbuf *cs, uint64_t src_va,
++                         uint64_t dest_va, uint64_t size)
++{
++   enum amd_gfx_level gfx_level = device->physical_device->rad_info.gfx_level;
++
++   while (size) {
++      unsigned dma_flags = 0;
++      unsigned byte_count = MIN2(size, cp_dma_max_byte_count(gfx_level));
++
++      if (device->physical_device->rad_info.gfx_level >= GFX9) {
++         /* See si_cp_dma_buffer_copy above for reason to use L2. */
++         dma_flags |= CP_DMA_USE_L2;
++      }
++
++      if (byte_count == size)
++         dma_flags |= CP_DMA_SYNC;
++
++      si_cs_emit_cp_dma(device, cs, false, dest_va, src_va, byte_count, dma_flags);
++
++      size -= byte_count;
++      src_va += byte_count;
++      dest_va += byte_count;
++   }
++}
++
+ void
+ si_cp_dma_clear_buffer(struct radv_cmd_buffer *cmd_buffer, uint64_t va, uint64_t size,
+                        unsigned value)
+-- 
+GitLab
+
+
+From ac52d0f3decd9c1127c6b82988c736becb102dc9 Mon Sep 17 00:00:00 2001
+From: Tatsuyuki Ishi <ishitatsuyuki@gmail.com>
+Date: Sun, 10 Jul 2022 18:34:04 +0900
+Subject: [PATCH 5/9] radv: Add waits and signals to
+ radv_queue_internal_submit.
+
+This is for use in shader uploads which signals a semaphore.
+---
+ src/amd/vulkan/radv_device.c  | 7 +++++--
+ src/amd/vulkan/radv_private.h | 4 +++-
+ src/amd/vulkan/radv_sqtt.c    | 4 ++--
+ 3 files changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+index 6a464f10e9b9..6b6823abd2e2 100644
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -5074,7 +5074,9 @@ fail:
+ }
+ 
+ bool
+-radv_queue_internal_submit(struct radv_queue *queue, struct radeon_cmdbuf *cs)
++radv_queue_internal_submit(struct radv_queue *queue, struct radeon_cmdbuf *cs, uint32_t wait_count,
++                           const struct vk_sync_wait *waits, uint32_t signal_count,
++                           const struct vk_sync_signal *signals)
+ {
+    struct radeon_winsys_ctx *ctx = queue->hw_ctx;
+    struct radv_winsys_submit_info submit = {
+@@ -5084,7 +5086,8 @@ radv_queue_internal_submit(struct radv_queue *queue, struct radeon_cmdbuf *cs)
+       .cs_count = 1,
+    };
+ 
+-   VkResult result = queue->device->ws->cs_submit(ctx, 1, &submit, 0, NULL, 0, NULL, false);
++   VkResult result = queue->device->ws->cs_submit(ctx, 1, &submit, wait_count, waits, signal_count,
++                                                  signals, false);
+    if (result != VK_SUCCESS)
+       return false;
+ 
+diff --git a/src/amd/vulkan/radv_private.h b/src/amd/vulkan/radv_private.h
+index fb7ad0830a40..025add355734 100644
+--- a/src/amd/vulkan/radv_private.h
++++ b/src/amd/vulkan/radv_private.h
+@@ -2846,7 +2846,9 @@ void radv_pc_end_query(struct radv_cmd_buffer *cmd_buffer, struct radv_pc_query_
+                        uint64_t va);
+ void radv_pc_get_results(const struct radv_pc_query_pool *pc_pool, const uint64_t *data, void *out);
+ 
+-bool radv_queue_internal_submit(struct radv_queue *queue, struct radeon_cmdbuf *cs);
++bool radv_queue_internal_submit(struct radv_queue *queue, struct radeon_cmdbuf *cs,
++                                uint32_t wait_count, const struct vk_sync_wait *waits,
++                                uint32_t signal_count, const struct vk_sync_signal *signals);
+ 
+ VkResult radv_internal_queue_init(struct radv_device *device, struct radv_queue *queue,
+                                   enum radv_queue_family qf);
+diff --git a/src/amd/vulkan/radv_sqtt.c b/src/amd/vulkan/radv_sqtt.c
+index 3961f72deeaf..48acc0e77334 100644
+--- a/src/amd/vulkan/radv_sqtt.c
++++ b/src/amd/vulkan/radv_sqtt.c
+@@ -591,7 +591,7 @@ radv_begin_thread_trace(struct radv_queue *queue)
+ 
+    device->thread_trace.start_cs[family] = cs;
+ 
+-   return radv_queue_internal_submit(queue, cs);
++   return radv_queue_internal_submit(queue, cs, 0, NULL, 0, NULL);
+ }
+ 
+ bool
+@@ -653,7 +653,7 @@ radv_end_thread_trace(struct radv_queue *queue)
+ 
+    device->thread_trace.stop_cs[family] = cs;
+ 
+-   return radv_queue_internal_submit(queue, cs);
++   return radv_queue_internal_submit(queue, cs, 0, NULL, 0, NULL);
+ }
+ 
+ bool
+-- 
+GitLab
+
+
+From 887a3ec597e84f727813e27f72c0251e3cebee2c Mon Sep 17 00:00:00 2001
+From: Tatsuyuki Ishi <ishitatsuyuki@gmail.com>
+Date: Sun, 10 Jul 2022 22:36:07 +0900
+Subject: [PATCH 6/9] radv: Make radv_upload_shaders return bool instead of
+ VkResult.
+
+In a following patch we're going to call radv_queue_internal_submit which
+returns a bool that can map to multiple VkResult.
+
+The error codes were synthetic and the caller didn't care about the kind of
+the error anyway, so simplify it to return a boolean instead.
+---
+ src/amd/vulkan/radv_pipeline.c       | 10 +++++-----
+ src/amd/vulkan/radv_pipeline_cache.c |  5 ++---
+ src/amd/vulkan/radv_private.h        |  6 +++---
+ 3 files changed, 10 insertions(+), 11 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_pipeline.c b/src/amd/vulkan/radv_pipeline.c
+index 1e130f56ec29..8ba105a54d95 100644
+--- a/src/amd/vulkan/radv_pipeline.c
++++ b/src/amd/vulkan/radv_pipeline.c
+@@ -4088,7 +4088,7 @@ non_uniform_access_callback(const nir_src *src, void *_)
+ }
+ 
+ 
+-VkResult
++bool
+ radv_upload_shaders(struct radv_device *device, struct radv_pipeline *pipeline,
+                     struct radv_shader_binary **binaries, struct radv_shader_binary *gs_copy_binary)
+ {
+@@ -4110,7 +4110,7 @@ radv_upload_shaders(struct radv_device *device, struct radv_pipeline *pipeline,
+    /* Allocate memory for all shader binaries. */
+    pipeline->slab = radv_pipeline_slab_create(device, pipeline, code_size);
+    if (!pipeline->slab)
+-      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++      return false;
+ 
+    pipeline->slab_bo = pipeline->slab->alloc->arena->bo;
+ 
+@@ -4128,7 +4128,7 @@ radv_upload_shaders(struct radv_device *device, struct radv_pipeline *pipeline,
+ 
+       void *dest_ptr = slab_ptr + slab_offset;
+       if (!radv_shader_binary_upload(device, binaries[i], shader, dest_ptr))
+-         return VK_ERROR_OUT_OF_HOST_MEMORY;
++         return false;
+ 
+       slab_offset += align(shader->code_size, RADV_SHADER_ALLOC_ALIGNMENT);
+    }
+@@ -4138,10 +4138,10 @@ radv_upload_shaders(struct radv_device *device, struct radv_pipeline *pipeline,
+ 
+       void *dest_ptr = slab_ptr + slab_offset;
+       if (!radv_shader_binary_upload(device, gs_copy_binary, pipeline->gs_copy_shader, dest_ptr))
+-         return VK_ERROR_OUT_OF_HOST_MEMORY;
++         return false;
+    }
+ 
+-   return VK_SUCCESS;
++   return true;
+ }
+ 
+ static bool
+diff --git a/src/amd/vulkan/radv_pipeline_cache.c b/src/amd/vulkan/radv_pipeline_cache.c
+index 2d73211925f5..2c1cb1b7c992 100644
+--- a/src/amd/vulkan/radv_pipeline_cache.c
++++ b/src/amd/vulkan/radv_pipeline_cache.c
+@@ -316,7 +316,6 @@ radv_create_shaders_from_pipeline_cache(
+    uint32_t *num_stack_sizes, bool *found_in_application_cache)
+ {
+    struct cache_entry *entry;
+-   VkResult result;
+ 
+    if (!cache) {
+       cache = device->mem_cache;
+@@ -396,7 +395,7 @@ radv_create_shaders_from_pipeline_cache(
+    }
+ 
+    if (needs_upload) {
+-      result = radv_upload_shaders(device, pipeline, binaries, gs_copy_binary);
++      bool upload_result = radv_upload_shaders(device, pipeline, binaries, gs_copy_binary);
+ 
+       for (int i = 0; i < MESA_VULKAN_SHADER_STAGES; ++i) {
+          if (pipeline->shaders[i])
+@@ -404,7 +403,7 @@ radv_create_shaders_from_pipeline_cache(
+       }
+       free(gs_copy_binary);
+ 
+-      if (result != VK_SUCCESS) {
++      if (!upload_result) {
+          radv_pipeline_cache_unlock(cache);
+          return false;
+       }
+diff --git a/src/amd/vulkan/radv_private.h b/src/amd/vulkan/radv_private.h
+index 025add355734..e12cef509e8f 100644
+--- a/src/amd/vulkan/radv_private.h
++++ b/src/amd/vulkan/radv_private.h
+@@ -414,9 +414,9 @@ void radv_pipeline_cache_insert_shaders(
+    struct radv_pipeline *pipeline, struct radv_shader_binary *const *binaries,
+    const struct radv_pipeline_shader_stack_size *stack_sizes, uint32_t num_stack_sizes);
+ 
+-VkResult radv_upload_shaders(struct radv_device *device, struct radv_pipeline *pipeline,
+-                             struct radv_shader_binary **binaries,
+-                             struct radv_shader_binary *gs_copy_binary);
++bool radv_upload_shaders(struct radv_device *device, struct radv_pipeline *pipeline,
++                         struct radv_shader_binary **binaries,
++                         struct radv_shader_binary *gs_copy_binary);
+ 
+ enum radv_blit_ds_layout {
+    RADV_BLIT_DS_LAYOUT_TILE_ENABLE,
+-- 
+GitLab
+
+
+From d6e83f18bff395ccc29e85d5ab3b26768582f464 Mon Sep 17 00:00:00 2001
+From: Tatsuyuki Ishi <ishitatsuyuki@gmail.com>
+Date: Tue, 12 Jul 2022 17:21:15 +0900
+Subject: [PATCH 7/9] radv: Upload shaders to invisible VRAM on small BAR
+ systems.
+
+Following PAL's implementation, this patch avoids allocating shader code
+buffers in BAR and use compute DMA to upload them to invisible VRAM
+directly.
+
+For some games like HZD, shaders can take as much as 400MB, which exceeds
+the non-resizable BAR size (256MB) and cause inconsistent spilling
+behavior. The kernel will normally move these to invisible VRAM on its own,
+but there are a few cases that it does not reliably happen. This patch does
+the moving explicitly in the driver to ensure predictable results.
+
+In this patch, we upload the shaders synchronously; so the shader will be
+ready as soon as vkCreate*Pipeline returns. A following patch will make
+this asynchronous and don't block until we see a use of the pipeline.
+
+As a side effect, when SQTT is used we now store the shaders on a cacheable
+buffer which would speed up writing the trace to the disk.
+---
+ src/amd/vulkan/radv_constants.h |   2 +
+ src/amd/vulkan/radv_device.c    |  19 ++-
+ src/amd/vulkan/radv_pipeline.c  |  49 +++++--
+ src/amd/vulkan/radv_private.h   |  22 +++
+ src/amd/vulkan/radv_shader.c    | 240 +++++++++++++++++++++++++++++---
+ src/amd/vulkan/radv_shader.h    |  11 +-
+ 6 files changed, 303 insertions(+), 40 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_constants.h b/src/amd/vulkan/radv_constants.h
+index 38af1d448da7..ebbd84b0555f 100644
+--- a/src/amd/vulkan/radv_constants.h
++++ b/src/amd/vulkan/radv_constants.h
+@@ -136,4 +136,6 @@
+ #define PERF_CTR_BO_LOCK_OFFSET  0
+ #define PERF_CTR_BO_FENCE_OFFSET 8
+ 
++#define RADV_SHADER_UPLOAD_CS_COUNT 16
++
+ #endif /* RADV_CONSTANTS_H */
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+index 6b6823abd2e2..d6149cd4d0a3 100644
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -50,6 +50,8 @@
+ #include "radv_private.h"
+ #include "radv_shader.h"
+ #include "vk_util.h"
++#include "vk_common_entrypoints.h"
++#include "vk_semaphore.h"
+ #ifdef _WIN32
+ typedef void *drmDevicePtr;
+ #include <io.h>
+@@ -2863,7 +2865,7 @@ radv_queue_state_finish(struct radv_queue_state *queue, struct radeon_winsys *ws
+       ws->buffer_destroy(ws, queue->compute_scratch_bo);
+ }
+ 
+-static void
++void
+ radv_queue_finish(struct radv_queue *queue)
+ {
+    radv_queue_state_finish(&queue->state, queue->device->ws);
+@@ -3419,8 +3421,6 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
+ 
+    device->primitives_generated_query = primitives_generated_query;
+ 
+-   radv_init_shader_arenas(device);
+-
+    device->overallocation_disallowed = overallocation_disallowed;
+    mtx_init(&device->overallocation_mutex, mtx_plain);
+ 
+@@ -3436,7 +3436,7 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
+ 
+       result = device->ws->ctx_create(device->ws, priority, &device->hw_ctx[priority]);
+       if (result != VK_SUCCESS)
+-         goto fail;
++         goto fail_queue;
+    }
+ 
+    for (unsigned i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
+@@ -3450,7 +3450,7 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
+                   VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+       if (!device->queues[qfi]) {
+          result = VK_ERROR_OUT_OF_HOST_MEMORY;
+-         goto fail;
++         goto fail_queue;
+       }
+ 
+       memset(device->queues[qfi], 0, queue_create->queueCount * sizeof(struct radv_queue));
+@@ -3460,11 +3460,16 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
+       for (unsigned q = 0; q < queue_create->queueCount; q++) {
+          result = radv_queue_init(device, &device->queues[qfi][q], q, queue_create, global_priority);
+          if (result != VK_SUCCESS)
+-            goto fail;
++            goto fail_queue;
+       }
+    }
+    device->private_sdma_queue = VK_NULL_HANDLE;
+ 
++   device->shader_use_invisible_vram = radv_shader_use_invisible_vram(&device->physical_device->rad_info, device->instance->perftest_flags);
++   device->keep_shader_staging_buf = radv_thread_trace_enabled();
++   if ((result = radv_init_shader_arenas(device)) != VK_SUCCESS)
++      goto fail;
++
+    device->pbb_allowed = device->physical_device->rad_info.gfx_level >= GFX9 &&
+                          !(device->instance->debug_flags & RADV_DEBUG_NOBINNING);
+ 
+@@ -3674,6 +3679,8 @@ fail:
+    radv_device_finish_vs_prologs(device);
+    radv_device_finish_border_color(device);
+ 
++   radv_destroy_shader_arenas(device);
++fail_queue:
+    for (unsigned i = 0; i < RADV_MAX_QUEUE_FAMILIES; i++) {
+       for (unsigned q = 0; q < device->queue_count[i]; q++)
+          radv_queue_finish(&device->queues[i][q]);
+diff --git a/src/amd/vulkan/radv_pipeline.c b/src/amd/vulkan/radv_pipeline.c
+index 8ba105a54d95..7937d4e50901 100644
+--- a/src/amd/vulkan/radv_pipeline.c
++++ b/src/amd/vulkan/radv_pipeline.c
+@@ -4093,6 +4093,7 @@ radv_upload_shaders(struct radv_device *device, struct radv_pipeline *pipeline,
+                     struct radv_shader_binary **binaries, struct radv_shader_binary *gs_copy_binary)
+ {
+    uint32_t code_size = 0;
++   char *staging = NULL;
+ 
+    /* Compute the total code size. */
+    for (int i = 0; i < MESA_VULKAN_SHADER_STAGES; i++) {
+@@ -4110,38 +4111,60 @@ radv_upload_shaders(struct radv_device *device, struct radv_pipeline *pipeline,
+    /* Allocate memory for all shader binaries. */
+    pipeline->slab = radv_pipeline_slab_create(device, pipeline, code_size);
+    if (!pipeline->slab)
+-      return false;
++      goto err;
++
++   staging = calloc(1, code_size);
+ 
+    pipeline->slab_bo = pipeline->slab->alloc->arena->bo;
+ 
+    /* Upload shader binaries. */
+-   uint64_t slab_va = radv_buffer_get_va(pipeline->slab_bo);
+-   uint32_t slab_offset = pipeline->slab->alloc->offset;
+-   char *slab_ptr = pipeline->slab->alloc->arena->ptr;
++   uint64_t slab_va = radv_buffer_get_va(pipeline->slab_bo) + pipeline->slab->alloc->offset;
++   uint32_t offset = 0;
++   char *slab_ptr = pipeline->slab->alloc->arena->ptr + pipeline->slab->alloc->offset;
+ 
+    for (int i = 0; i < MESA_VULKAN_SHADER_STAGES; ++i) {
+       struct radv_shader *shader = pipeline->shaders[i];
+       if (!shader)
+          continue;
+ 
+-      shader->va = slab_va + slab_offset;
++      shader->va = slab_va + offset;
+ 
+-      void *dest_ptr = slab_ptr + slab_offset;
+-      if (!radv_shader_binary_upload(device, binaries[i], shader, dest_ptr))
+-         return false;
++      if (!radv_shader_binary_reloc(device, binaries[i], shader, staging + offset))
++         goto err;
+ 
+-      slab_offset += align(shader->code_size, RADV_SHADER_ALLOC_ALIGNMENT);
++      if (device->keep_shader_staging_buf) {
++         shader->code_ptr = (uint8_t *)staging + offset;
++      }
++
++      offset += align(shader->code_size, RADV_SHADER_ALLOC_ALIGNMENT);
+    }
+ 
+    if (pipeline->gs_copy_shader) {
+-      pipeline->gs_copy_shader->va = slab_va + slab_offset;
++      struct radv_shader *shader = pipeline->gs_copy_shader;
++      shader->va = slab_va + offset;
+ 
+-      void *dest_ptr = slab_ptr + slab_offset;
+-      if (!radv_shader_binary_upload(device, gs_copy_binary, pipeline->gs_copy_shader, dest_ptr))
+-         return false;
++      if (!radv_shader_binary_reloc(device, gs_copy_binary, shader, staging + offset))
++         goto err;
++
++      if (device->keep_shader_staging_buf) {
++         shader->code_ptr = (uint8_t *)staging + offset;
++      }
++   }
++
++   if (radv_shader_binary_upload(device, pipeline->slab->alloc->arena->bo, slab_va, slab_ptr,
++                                  staging, code_size, NULL) != VK_SUCCESS)
++      goto err;
++
++   if (device->keep_shader_staging_buf) {
++      pipeline->shader_upload_buf = staging;
++   } else {
++      free(staging);
+    }
+ 
+    return true;
++err:
++   free(staging);
++   return false;
+ }
+ 
+ static bool
+diff --git a/src/amd/vulkan/radv_private.h b/src/amd/vulkan/radv_private.h
+index e12cef509e8f..d200b51b150f 100644
+--- a/src/amd/vulkan/radv_private.h
++++ b/src/amd/vulkan/radv_private.h
+@@ -765,6 +765,13 @@ struct radv_queue {
+    struct radv_queue_state state;
+ };
+ 
++struct radv_shader_upload_cs {
++   struct radeon_cmdbuf *cs;
++   struct radeon_winsys_bo *bo;
++   uint64_t bo_size;
++   void *map;
++};
++
+ #define RADV_BORDER_COLOR_COUNT       4096
+ #define RADV_BORDER_COLOR_BUFFER_SIZE (sizeof(VkClearColorValue) * RADV_BORDER_COLOR_COUNT)
+ 
+@@ -847,6 +854,17 @@ struct radv_device {
+    struct list_head shader_block_obj_pool;
+    mtx_t shader_arena_mutex;
+ 
++   mtx_t shader_upload_queue_mutex;
++   struct radv_queue *shader_upload_queue;
++   uint64_t shader_upload_sem_val;
++   VkSemaphore shader_upload_sem;
++   struct radv_shader_upload_cs shader_upload_cs[RADV_SHADER_UPLOAD_CS_COUNT];
++
++   /* Whether to DMA shaders to invisible VRAM or to upload directly through BAR. */
++   bool shader_use_invisible_vram;
++   /* If true, retain shaders in system RAM to allow dumping to SQTT traces. */
++   bool keep_shader_staging_buf;
++
+    /* For detecting VM faults reported by dmesg. */
+    uint64_t dmesg_timestamp;
+ 
+@@ -2074,6 +2092,8 @@ struct radv_pipeline {
+    struct radv_shader *shaders[MESA_VULKAN_SHADER_STAGES];
+    struct radv_shader *gs_copy_shader;
+ 
++   char *shader_upload_buf;
++
+    struct radeon_cmdbuf cs;
+    uint32_t ctx_cs_hash;
+    struct radeon_cmdbuf ctx_cs;
+@@ -2857,6 +2877,8 @@ VkResult radv_queue_init(struct radv_device *device, struct radv_queue *queue, i
+                          const VkDeviceQueueCreateInfo *create_info,
+                          const VkDeviceQueueGlobalPriorityCreateInfoEXT *global_priority);
+ 
++void radv_queue_finish(struct radv_queue *queue);
++
+ void radv_set_descriptor_set(struct radv_cmd_buffer *cmd_buffer, VkPipelineBindPoint bind_point,
+                              struct radv_descriptor_set *set, unsigned idx);
+ 
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index 9d31ba7bd20b..1ba3bdf5c5ae 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -33,6 +33,7 @@
+ #include "util/memstream.h"
+ #include "util/mesa-sha1.h"
+ #include "util/u_atomic.h"
++#include "radv_cs.h"
+ #include "radv_debug.h"
+ #include "radv_meta.h"
+ #include "radv_private.h"
+@@ -45,6 +46,8 @@
+ #include "aco_interface.h"
+ #include "sid.h"
+ #include "vk_format.h"
++#include "vk_sync.h"
++#include "vk_semaphore.h"
+ 
+ #include "aco_shader_info.h"
+ #include "radv_aco_shader_info.h"
+@@ -1384,6 +1387,13 @@ free_block_obj(struct radv_device *device, union radv_shader_arena_block *block)
+    list_add(&block->pool, &device->shader_block_obj_pool);
+ }
+ 
++bool
++radv_shader_use_invisible_vram(const struct radeon_info *info, uint32_t perftest)
++{
++   return !(perftest & RADV_PERFTEST_SAM) &&
++          ((perftest & RADV_PERFTEST_NO_SAM) || !info->all_vram_visible);
++}
++
+ /* Segregated fit allocator, implementing a good-fit allocation policy.
+  *
+  * This is an variation of sequential fit allocation with several lists of free blocks ("holes")
+@@ -1459,20 +1469,32 @@ radv_alloc_shader_memory(struct radv_device *device, uint32_t size, void *ptr)
+       MAX2(RADV_SHADER_ALLOC_MIN_ARENA_SIZE
+               << MIN2(RADV_SHADER_ALLOC_MAX_ARENA_SIZE_SHIFT, device->shader_arena_shift),
+            size);
+-   VkResult result = device->ws->buffer_create(
+-      device->ws, arena_size, RADV_SHADER_ALLOC_ALIGNMENT, RADEON_DOMAIN_VRAM,
+-      RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_32BIT |
+-         (device->physical_device->rad_info.cpdma_prefetch_writes_memory ? 0
+-                                                                         : RADEON_FLAG_READ_ONLY),
+-      RADV_BO_PRIORITY_SHADER, 0, &arena->bo);
++   bool use_invisible = device->shader_use_invisible_vram;
++   VkResult result;
++   if (use_invisible) {
++      result = device->ws->buffer_create(
++         device->ws, arena_size, RADV_SHADER_ALLOC_ALIGNMENT, RADEON_DOMAIN_VRAM,
++         RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_32BIT | RADEON_FLAG_NO_CPU_ACCESS,
++         RADV_BO_PRIORITY_SHADER, 0, &arena->bo);
++   } else {
++      result = device->ws->buffer_create(
++         device->ws, arena_size, RADV_SHADER_ALLOC_ALIGNMENT, RADEON_DOMAIN_VRAM,
++         RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_32BIT | RADEON_FLAG_CPU_ACCESS |
++            (device->physical_device->rad_info.cpdma_prefetch_writes_memory
++                ? 0
++                : RADEON_FLAG_READ_ONLY),
++         RADV_BO_PRIORITY_SHADER, 0, &arena->bo);
++   }
+    if (result != VK_SUCCESS)
+       goto fail;
+ 
+    list_inithead(&arena->entries);
+ 
+-   arena->ptr = (char *)device->ws->buffer_map(arena->bo);
+-   if (!arena->ptr)
+-      goto fail;
++   if (!use_invisible) {
++      arena->ptr = (char *)device->ws->buffer_map(arena->bo);
++      if (!arena->ptr)
++         goto fail;
++   }
+ 
+    alloc = alloc_block_obj(device);
+    hole = arena_size - size > 0 ? alloc_block_obj(device) : alloc;
+@@ -1567,9 +1589,15 @@ radv_free_shader_memory(struct radv_device *device, union radv_shader_arena_bloc
+    mtx_unlock(&device->shader_arena_mutex);
+ }
+ 
+-void
++VkResult
+ radv_init_shader_arenas(struct radv_device *device)
+ {
++   VkDevice vk_device = radv_device_to_handle(device);
++   struct radeon_winsys *ws = device->ws;
++
++   const struct vk_device_dispatch_table *disp = &device->vk.dispatch_table;
++   VkResult result = VK_SUCCESS;
++
+    mtx_init(&device->shader_arena_mutex, mtx_plain);
+ 
+    device->shader_free_list_mask = 0;
+@@ -1578,11 +1606,64 @@ radv_init_shader_arenas(struct radv_device *device)
+    list_inithead(&device->shader_block_obj_pool);
+    for (unsigned i = 0; i < RADV_SHADER_ALLOC_NUM_FREE_LISTS; i++)
+       list_inithead(&device->shader_free_lists[i]);
++
++   if (device->shader_use_invisible_vram) {
++      enum radv_queue_family qf = RADV_QUEUE_COMPUTE;
++      mtx_init(&device->shader_upload_queue_mutex, mtx_plain);
++      device->shader_upload_queue = vk_zalloc(&device->vk.alloc, sizeof(struct radv_queue), 8,
++                                              VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++      if (!device->shader_upload_queue)
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      result = radv_internal_queue_init(device, device->shader_upload_queue, qf);
++      if (result != VK_SUCCESS)
++         return result;
++
++      for (unsigned i = 0; i < RADV_SHADER_UPLOAD_CS_COUNT; i++) {
++         device->shader_upload_cs[i].cs =
++            ws->cs_create(ws, radv_queue_family_to_ring(device->physical_device, qf));
++         if (!device->shader_upload_cs[i].cs) {
++            return VK_ERROR_OUT_OF_HOST_MEMORY;
++         }
++      }
++
++      const VkSemaphoreTypeCreateInfo sem_type = {
++         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
++         .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
++         .initialValue = 0,
++      };
++      const VkSemaphoreCreateInfo sem_create = {
++         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
++         .pNext = &sem_type,
++      };
++      result = disp->CreateSemaphore(vk_device, &sem_create, NULL, &device->shader_upload_sem);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
++   return VK_SUCCESS;
+ }
+ 
+ void
+ radv_destroy_shader_arenas(struct radv_device *device)
+ {
++   struct vk_device_dispatch_table *disp = &device->vk.dispatch_table;
++   struct radeon_winsys *ws = device->ws;
++
++   /* Upload queue should be idle assuming that pipelines are not leaked */
++   if (device->shader_upload_sem)
++      disp->DestroySemaphore(radv_device_to_handle(device), device->shader_upload_sem, NULL);
++   for (unsigned i = 0; i < RADV_SHADER_UPLOAD_CS_COUNT; i++) {
++      if (device->shader_upload_cs[i].cs)
++         ws->cs_destroy(device->shader_upload_cs[i].cs);
++      if (device->shader_upload_cs[i].bo)
++         ws->buffer_destroy(ws, device->shader_upload_cs[i].bo);
++   }
++   if (device->shader_upload_queue) {
++      radv_queue_finish(device->shader_upload_queue);
++      vk_free(&device->vk.alloc, device->shader_upload_queue);
++      mtx_destroy(&device->shader_upload_queue_mutex);
++   }
++
+    list_for_each_entry_safe(union radv_shader_arena_block, block, &device->shader_block_obj_pool,
+                             pool) free(block);
+ 
+@@ -1932,7 +2013,7 @@ radv_open_rtld_binary(struct radv_device *device, const struct radv_shader *shad
+ }
+ 
+ bool
+-radv_shader_binary_upload(struct radv_device *device, const struct radv_shader_binary *binary,
++radv_shader_binary_reloc(struct radv_device *device, const struct radv_shader_binary *binary,
+                           struct radv_shader *shader, void *dest_ptr)
+ {
+    if (binary->type == RADV_BINARY_TYPE_RTLD) {
+@@ -1955,7 +2036,6 @@ radv_shader_binary_upload(struct radv_device *device, const struct radv_shader_b
+          return false;
+       }
+ 
+-      shader->code_ptr = dest_ptr;
+       ac_rtld_close(&rtld_binary);
+    } else {
+       struct radv_shader_binary_legacy *bin = (struct radv_shader_binary_legacy *)binary;
+@@ -1965,13 +2045,118 @@ radv_shader_binary_upload(struct radv_device *device, const struct radv_shader_b
+       uint32_t *ptr32 = (uint32_t *)dest_ptr + bin->code_size / 4;
+       for (unsigned i = 0; i < DEBUGGER_NUM_MARKERS; i++)
+          ptr32[i] = DEBUGGER_END_OF_CODE_MARKER;
+-
+-      shader->code_ptr = dest_ptr;
+    }
+ 
+    return true;
+ }
+ 
++/**
++ * When using invisible VRAM for shaders, schedule the upload using DMA. Otherwise, memcpy staging
++ * to mapped.
++ * If out_sem_val is NULL, this function blocks until the DMA is complete. Otherwise, the semaphore
++ * value to wait on device->shader_upload_sem is stored in *out_sem_val.
++ */
++VkResult
++radv_shader_binary_upload(struct radv_device *device, struct radeon_winsys_bo *bo, uint64_t va,
++                          char *mapped, char *staging, unsigned len, uint64_t *out_sem_val)
++{
++   if (!device->shader_use_invisible_vram) {
++      memcpy(mapped, staging, len);
++      return VK_SUCCESS;
++   }
++
++   struct vk_device_dispatch_table *disp = &device->vk.dispatch_table;
++
++   uint64_t sem_val = p_atomic_inc_return(&device->shader_upload_sem_val);
++   uint64_t i = sem_val % RADV_SHADER_UPLOAD_CS_COUNT;
++
++   struct radv_shader_upload_cs *upload_cs = &device->shader_upload_cs[i];
++   struct radeon_cmdbuf *cs = upload_cs->cs;
++   struct radeon_winsys *ws = device->ws;
++
++   VkResult result;
++
++   /* Make sure we don't reset an in-flight command buffer */
++   uint64_t wait_val = MAX2(RADV_SHADER_UPLOAD_CS_COUNT, sem_val) - RADV_SHADER_UPLOAD_CS_COUNT;
++   const VkSemaphoreWaitInfo wait_info = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
++      .pSemaphores = &device->shader_upload_sem,
++      .semaphoreCount = 1,
++      .pValues = &wait_val,
++   };
++   result = disp->WaitSemaphores(radv_device_to_handle(device), &wait_info, UINT64_MAX);
++   if (unlikely(result != VK_SUCCESS))
++      return result;
++
++   ws->cs_reset(cs);
++
++   const enum amd_gfx_level gfx_level = device->physical_device->rad_info.gfx_level;
++   const bool is_mec = device->shader_upload_queue->state.qf == RADV_QUEUE_COMPUTE && gfx_level >= GFX7;
++   enum rgp_flush_bits sqtt_flush_bits = 0;
++   enum radv_cmd_flush_bits flush_bits = RADV_CMD_FLAG_INV_L2;
++   radeon_check_space(ws, cs, 32);
++   if (device->physical_device->rad_info.gfx_level >= GFX9 &&
++       device->physical_device->rad_info.gfx_level < GFX11) {
++      radeon_set_uconfig_reg(cs, R_0301EC_CP_COHER_START_DELAY,
++                             device->physical_device->rad_info.gfx_level >= GFX10 ? 0x20 : 0);
++   }
++   si_cs_emit_cache_flush(cs, gfx_level, NULL, 0, is_mec, flush_bits, &sqtt_flush_bits, 0);
++
++   if (upload_cs->bo_size < len) {
++      if (upload_cs->bo) {
++         ws->buffer_destroy(ws, upload_cs->bo);
++      }
++      result = ws->buffer_create(ws, len, RADV_SHADER_ALLOC_ALIGNMENT, ws->cs_domain(ws),
++                                 RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING |
++                                    RADEON_FLAG_32BIT | RADEON_FLAG_GTT_WC,
++                                 RADV_BO_PRIORITY_UPLOAD_BUFFER, 0, &upload_cs->bo);
++      if (unlikely(result != VK_SUCCESS))
++         return result;
++      upload_cs->map = ws->buffer_map(upload_cs->bo);
++      upload_cs->bo_size = len;
++   }
++   memcpy(upload_cs->map, staging, len);
++   radv_cs_add_buffer(ws, cs, upload_cs->bo);
++   radv_cs_add_buffer(ws, cs, bo);
++   /* Compute-based copy requires shaders which might not have been uploaded yet, so use CP DMA
++    * even if it might be slightly slower */
++   si_cs_cp_dma_buffer_copy(device, cs, radv_buffer_get_va(upload_cs->bo), va, len);
++
++   result = ws->cs_finalize(cs);
++   if (unlikely(result != VK_SUCCESS))
++      return result;
++
++   struct vk_semaphore *semaphore = vk_semaphore_from_handle(device->shader_upload_sem);
++   struct vk_sync *sync = vk_semaphore_get_active_sync(semaphore);
++   const struct vk_sync_signal signal_info = {
++      .sync = sync,
++      .signal_value = sem_val,
++      .stage_mask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++   };
++   mtx_lock(&device->shader_upload_queue_mutex);
++   if (!radv_queue_internal_submit(device->shader_upload_queue, cs, 0, NULL, 1, &signal_info)) {
++      mtx_unlock(&device->shader_upload_queue_mutex);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++   mtx_unlock(&device->shader_upload_queue_mutex);
++
++   if (out_sem_val) {
++      *out_sem_val = sem_val;
++   } else {
++      const VkSemaphoreWaitInfo sync_wait_info = {
++         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
++         .pSemaphores = &device->shader_upload_sem,
++         .semaphoreCount = 1,
++         .pValues = &sem_val,
++      };
++      result = disp->WaitSemaphores(radv_device_to_handle(device), &sync_wait_info, UINT64_MAX);
++      if (unlikely(result != VK_SUCCESS))
++         return result;
++   }
++
++   return VK_SUCCESS;
++}
++
+ struct radv_shader *
+ radv_shader_create(struct radv_device *device, const struct radv_shader_binary *binary,
+                    bool keep_shader_info, bool from_cache, const struct radv_shader_args *args)
+@@ -2293,10 +2478,18 @@ radv_create_trap_handler_shader(struct radv_device *device)
+    trap->alloc = radv_alloc_shader_memory(device, shader->code_size, NULL);
+ 
+    trap->bo = trap->alloc->arena->bo;
++   uint64_t dest_va = radv_buffer_get_va(trap->alloc->arena->bo) + trap->alloc->offset;
+    char *dest_ptr = trap->alloc->arena->ptr + trap->alloc->offset;
+ 
+    struct radv_shader_binary_legacy *bin = (struct radv_shader_binary_legacy *)binary;
+-   memcpy(dest_ptr, bin->data, bin->code_size);
++   if (radv_shader_binary_upload(device, trap->bo, dest_va, dest_ptr, (char *)bin->data,
++                                 bin->code_size, NULL) != VK_SUCCESS) {
++      radv_free_shader_memory(device, trap->alloc);
++      ralloc_free(b.shader);
++      free(shader);
++      free(binary);
++      return NULL;
++   }
+ 
+    ralloc_free(b.shader);
+    free(shader);
+@@ -2324,7 +2517,7 @@ static struct radv_shader_part *
+ upload_shader_part(struct radv_device *device, struct radv_shader_part_binary *bin, unsigned wave_size)
+ {
+    uint32_t code_size = radv_get_shader_binary_size(bin->code_size);
+-   struct radv_shader_part *shader_part = malloc(sizeof(struct radv_shader_part));
++   struct radv_shader_part *shader_part = calloc(1, sizeof(struct radv_shader_part));
+    if (!shader_part)
+       return NULL;
+ 
+@@ -2337,10 +2530,11 @@ upload_shader_part(struct radv_device *device, struct radv_shader_part_binary *b
+    shader_part->bo = shader_part->alloc->arena->bo;
+    char *dest_ptr = shader_part->alloc->arena->ptr + shader_part->alloc->offset;
+ 
+-   memcpy(dest_ptr, bin->data, bin->code_size);
++   char *staging = calloc(1, code_size);
++   memcpy(staging, bin->data, bin->code_size);
+ 
+    /* Add end-of-code markers for the UMR disassembler. */
+-   uint32_t *ptr32 = (uint32_t *)dest_ptr + bin->code_size / 4;
++   uint32_t *ptr32 = (uint32_t *)staging + bin->code_size / 4;
+    for (unsigned i = 0; i < DEBUGGER_NUM_MARKERS; i++)
+       ptr32[i] = DEBUGGER_END_OF_CODE_MARKER;
+ 
+@@ -2349,6 +2543,16 @@ upload_shader_part(struct radv_device *device, struct radv_shader_part_binary *b
+    shader_part->num_preserved_sgprs = bin->num_preserved_sgprs;
+    shader_part->disasm_string = NULL;
+ 
++   uint64_t slab_va = radv_buffer_get_va(shader_part->alloc->arena->bo);
++   uint32_t slab_offset = shader_part->alloc->offset;
++   if (radv_shader_binary_upload(device, shader_part->bo, slab_va + slab_offset, dest_ptr, staging,
++                                 bin->code_size, NULL) != VK_SUCCESS) {
++      free(staging);
++      free(shader_part);
++      return NULL;
++   }
++   free(staging);
++
+    return shader_part;
+ }
+ 
+diff --git a/src/amd/vulkan/radv_shader.h b/src/amd/vulkan/radv_shader.h
+index bcca4aa430b4..c0809f12f5dd 100644
+--- a/src/amd/vulkan/radv_shader.h
++++ b/src/amd/vulkan/radv_shader.h
+@@ -531,7 +531,7 @@ void radv_nir_lower_abi(nir_shader *shader, enum amd_gfx_level gfx_level,
+                         const struct radv_shader_info *info, const struct radv_shader_args *args,
+                         const struct radv_pipeline_key *pl_key, bool use_llvm);
+ 
+-void radv_init_shader_arenas(struct radv_device *device);
++VkResult radv_init_shader_arenas(struct radv_device *device);
+ void radv_destroy_shader_arenas(struct radv_device *device);
+ 
+ struct radv_pipeline_shader_stack_size;
+@@ -559,8 +559,13 @@ struct radv_shader *radv_shader_nir_to_asm(
+    int shader_count, const struct radv_pipeline_key *key, bool keep_shader_info, bool keep_statistic_info,
+    struct radv_shader_binary **binary_out);
+ 
+-bool radv_shader_binary_upload(struct radv_device *device, const struct radv_shader_binary *binary,
+-                               struct radv_shader *shader, void *dest_ptr);
++bool radv_shader_binary_reloc(struct radv_device *device, const struct radv_shader_binary *binary,
++                              struct radv_shader *shader, void *dest_ptr);
++VkResult radv_shader_binary_upload(struct radv_device *device, struct radeon_winsys_bo *bo,
++                                   uint64_t va, char *mapped, char *staging, unsigned len,
++                                   uint64_t *out_sem_val);
++
++bool radv_shader_use_invisible_vram(const struct radeon_info *info, uint32_t perftest);
+ 
+ union radv_shader_arena_block *radv_alloc_shader_memory(struct radv_device *device, uint32_t size,
+                                                         void *ptr);
+-- 
+GitLab
+
+
+From 645e1b22e49f969de85a8818b8b957d2719db497 Mon Sep 17 00:00:00 2001
+From: Tatsuyuki Ishi <ishitatsuyuki@gmail.com>
+Date: Tue, 12 Jul 2022 17:25:00 +0900
+Subject: [PATCH 8/9] radv: Wait for shader uploads asynchronously.
+
+This introduces tracking of the required semaphore values in pipelines,
+which is then propagated to cmd_buffers on bind. Each queue also keeps
+track the maximum count it has waited for, so that we can avoid the waiting
+overhead once all the shaders are loaded and referenced.
+---
+ src/amd/vulkan/radv_cmd_buffer.c |  8 ++++++++
+ src/amd/vulkan/radv_device.c     | 30 ++++++++++++++++++++++++++++++
+ src/amd/vulkan/radv_pipeline.c   | 17 ++++++++++++++++-
+ src/amd/vulkan/radv_private.h    |  5 +++++
+ src/amd/vulkan/radv_shader.c     | 13 ++++++++++++-
+ src/amd/vulkan/radv_shader.h     |  1 +
+ 6 files changed, 72 insertions(+), 2 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index d58dd39a1755..f4f9226599be 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -513,6 +513,7 @@ radv_reset_cmd_buffer(struct radv_cmd_buffer *cmd_buffer)
+    cmd_buffer->gds_needed = false;
+    cmd_buffer->gds_oa_needed = false;
+    cmd_buffer->sample_positions_needed = false;
++   cmd_buffer->shader_upload_sem_val = 0;
+ 
+    if (cmd_buffer->upload.upload_bo)
+       radv_cs_add_buffer(cmd_buffer->device->ws, cmd_buffer->cs, cmd_buffer->upload.upload_bo);
+@@ -3065,6 +3066,7 @@ radv_emit_vertex_input(struct radv_cmd_buffer *cmd_buffer, bool pipeline_is_dirt
+       cmd_buffer->record_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+       return;
+    }
++   cmd_buffer->shader_upload_sem_val = MAX2(cmd_buffer->shader_upload_sem_val, prolog->upload_sem_val);
+    emit_prolog_regs(cmd_buffer, vs_shader, prolog, pipeline_is_dirty);
+    emit_prolog_inputs(cmd_buffer, vs_shader, nontrivial_divisors, pipeline_is_dirty);
+ 
+@@ -5194,6 +5196,10 @@ radv_CmdBindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipeline
+    RADV_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+    RADV_FROM_HANDLE(radv_pipeline, pipeline, _pipeline);
+ 
++   if (pipeline)
++      cmd_buffer->shader_upload_sem_val =
++         MAX2(cmd_buffer->shader_upload_sem_val, pipeline->upload_sem_val);
++
+    switch (pipelineBindPoint) {
+    case VK_PIPELINE_BIND_POINT_COMPUTE: {
+       struct radv_compute_pipeline *compute_pipeline = radv_pipeline_to_compute(pipeline);
+@@ -5831,6 +5837,8 @@ radv_CmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t commandBufferCou
+       if (secondary->gds_needed)
+          primary->gds_needed = true;
+ 
++      primary->shader_upload_sem_val = MAX2(primary->shader_upload_sem_val, secondary->shader_upload_sem_val);
++
+       if (!secondary->state.framebuffer && primary->state.pass && (primary->state.dirty & RADV_CMD_DIRTY_FRAMEBUFFER)) {
+          /* Emit the framebuffer state from primary if secondary
+           * has been recorded without a framebuffer, otherwise
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+index d6149cd4d0a3..e103785cdb9c 100644
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -5051,6 +5051,9 @@ static VkResult
+ radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
+ {
+    struct radv_queue *queue = (struct radv_queue *)vqueue;
++   struct vk_sync_wait *orig_waits = submission->waits;
++   uint32_t orig_wait_count = submission->wait_count;
++   uint64_t shader_upload_sem_val = 0;
+    VkResult result;
+ 
+    result = radv_queue_submit_bind_sparse_memory(queue->device, submission);
+@@ -5060,12 +5063,39 @@ radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
+    if (!submission->command_buffer_count && !submission->wait_count && !submission->signal_count)
+       return VK_SUCCESS;
+ 
++   for (uint32_t i = 0; i < submission->command_buffer_count; i++) {
++      struct radv_cmd_buffer *cmd_buffer = (struct radv_cmd_buffer *)submission->command_buffers[i];
++      shader_upload_sem_val = MAX2(shader_upload_sem_val, cmd_buffer->shader_upload_sem_val);
++   }
++   if (shader_upload_sem_val > queue->state.last_shader_upload_sem_val) {
++      uint32_t wait_count = submission->wait_count;
++      struct vk_semaphore *semaphore = vk_semaphore_from_handle(queue->device->shader_upload_sem);
++      struct vk_sync *sync = vk_semaphore_get_active_sync(semaphore);
++      struct vk_sync_wait *new_waits = alloca(sizeof(struct vk_sync_wait) * (wait_count + 1));
++      memcpy(new_waits, submission->waits, sizeof(struct vk_sync_wait) * wait_count);
++      new_waits[wait_count] = (struct vk_sync_wait){
++         .sync = sync,
++         .wait_value = shader_upload_sem_val,
++         .stage_mask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++      };
++      submission->waits = new_waits;
++      submission->wait_count = wait_count + 1;
++   }
++
+    if (!submission->command_buffer_count) {
+       result = radv_queue_submit_empty(queue, submission);
+    } else {
+       result = radv_queue_submit_normal(queue, submission);
+    }
+ 
++   /* Restore any patching we have done to not break caller assumptions. */
++   submission->waits = orig_waits;
++   submission->wait_count = orig_wait_count;
++
++   if (result == VK_SUCCESS)
++      queue->state.last_shader_upload_sem_val =
++         MAX2(queue->state.last_shader_upload_sem_val, shader_upload_sem_val);
++
+ fail:
+    if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
+       /* When something bad happened during the submission, such as
+diff --git a/src/amd/vulkan/radv_pipeline.c b/src/amd/vulkan/radv_pipeline.c
+index 7937d4e50901..2b9fb4be2170 100644
+--- a/src/amd/vulkan/radv_pipeline.c
++++ b/src/amd/vulkan/radv_pipeline.c
+@@ -191,6 +191,18 @@ void
+ radv_pipeline_destroy(struct radv_device *device, struct radv_pipeline *pipeline,
+                       const VkAllocationCallbacks *allocator)
+ {
++   if (device->shader_use_invisible_vram) {
++      /* Wait for any pending uploads to complete */
++      const VkSemaphoreWaitInfo wait_info = {
++         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
++         .pSemaphores = &device->shader_upload_sem,
++         .semaphoreCount = 1,
++         .pValues = &pipeline->upload_sem_val,
++      };
++      device->vk.dispatch_table.WaitSemaphores(radv_device_to_handle(device), &wait_info,
++                                               UINT64_MAX);
++   }
++
+    if (pipeline->type == RADV_PIPELINE_COMPUTE) {
+       struct radv_compute_pipeline *compute_pipeline = radv_pipeline_to_compute(pipeline);
+ 
+@@ -222,6 +234,9 @@ radv_pipeline_destroy(struct radv_device *device, struct radv_pipeline *pipeline
+    if (pipeline->gs_copy_shader)
+       radv_shader_destroy(device, pipeline->gs_copy_shader);
+ 
++   if (pipeline->shader_upload_buf)
++      free(pipeline->shader_upload_buf);
++
+    if (pipeline->cs.buf)
+       free(pipeline->cs.buf);
+ 
+@@ -4152,7 +4167,7 @@ radv_upload_shaders(struct radv_device *device, struct radv_pipeline *pipeline,
+    }
+ 
+    if (radv_shader_binary_upload(device, pipeline->slab->alloc->arena->bo, slab_va, slab_ptr,
+-                                  staging, code_size, NULL) != VK_SUCCESS)
++                                  staging, code_size, &pipeline->upload_sem_val) != VK_SUCCESS)
+       goto err;
+ 
+    if (device->keep_shader_staging_buf) {
+diff --git a/src/amd/vulkan/radv_private.h b/src/amd/vulkan/radv_private.h
+index d200b51b150f..2084176f020d 100644
+--- a/src/amd/vulkan/radv_private.h
++++ b/src/amd/vulkan/radv_private.h
+@@ -741,6 +741,8 @@ struct radv_queue_state {
+    enum radv_queue_family qf;
+    struct radv_queue_ring_info ring_info;
+ 
++   uint64_t last_shader_upload_sem_val;
++
+    struct radeon_winsys_bo *scratch_bo;
+    struct radeon_winsys_bo *descriptor_bo;
+    struct radeon_winsys_bo *compute_scratch_bo;
+@@ -1646,6 +1648,8 @@ struct radv_cmd_buffer {
+     * Bitmask of pending active query flushes.
+     */
+    enum radv_cmd_flush_bits active_query_flush_bits;
++
++   uint64_t shader_upload_sem_val;
+ };
+ 
+ struct radv_image;
+@@ -2093,6 +2097,7 @@ struct radv_pipeline {
+    struct radv_shader *gs_copy_shader;
+ 
+    char *shader_upload_buf;
++   uint64_t upload_sem_val;
+ 
+    struct radeon_cmdbuf cs;
+    uint32_t ctx_cs_hash;
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index 1ba3bdf5c5ae..2e42f663be6d 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -2546,7 +2546,7 @@ upload_shader_part(struct radv_device *device, struct radv_shader_part_binary *b
+    uint64_t slab_va = radv_buffer_get_va(shader_part->alloc->arena->bo);
+    uint32_t slab_offset = shader_part->alloc->offset;
+    if (radv_shader_binary_upload(device, shader_part->bo, slab_va + slab_offset, dest_ptr, staging,
+-                                 bin->code_size, NULL) != VK_SUCCESS) {
++                                 bin->code_size, &shader_part->upload_sem_val) != VK_SUCCESS) {
+       free(staging);
+       free(shader_part);
+       return NULL;
+@@ -2667,6 +2667,17 @@ radv_shader_part_destroy(struct radv_device *device, struct radv_shader_part *sh
+    if (!shader_part)
+       return;
+ 
++   if (device->shader_use_invisible_vram) {
++      const VkSemaphoreWaitInfo wait_info = {
++         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
++         .pSemaphores = &device->shader_upload_sem,
++         .semaphoreCount = 1,
++         .pValues = &shader_part->upload_sem_val,
++      };
++      device->vk.dispatch_table.WaitSemaphores(radv_device_to_handle(device), &wait_info,
++                                               UINT64_MAX);
++   }
++
+    radv_free_shader_memory(device, shader_part->alloc);
+    free(shader_part->disasm_string);
+    free(shader_part);
+diff --git a/src/amd/vulkan/radv_shader.h b/src/amd/vulkan/radv_shader.h
+index c0809f12f5dd..5d820e5a1b56 100644
+--- a/src/amd/vulkan/radv_shader.h
++++ b/src/amd/vulkan/radv_shader.h
+@@ -503,6 +503,7 @@ struct radv_shader_part {
+    uint32_t rsrc1;
+    uint8_t num_preserved_sgprs;
+    bool nontrivial_divisors;
++   uint64_t upload_sem_val;
+ 
+    /* debug only */
+    char *disasm_string;
+-- 
+GitLab
+
+
+From 085108e877eced704ed52063b7d77048b68f7696 Mon Sep 17 00:00:00 2001
+From: Tatsuyuki Ishi <ishitatsuyuki@gmail.com>
+Date: Sun, 10 Jul 2022 23:16:39 +0900
+Subject: [PATCH 9/9] radv: Assume all_vram_vis in null winsys.
+
+To disable the staged-upload mechanism which requires GPU command execution
+to operate.
+---
+ src/amd/vulkan/winsys/null/radv_null_winsys.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/amd/vulkan/winsys/null/radv_null_winsys.c b/src/amd/vulkan/winsys/null/radv_null_winsys.c
+index c7bc1f3bb4c0..11a49089652d 100644
+--- a/src/amd/vulkan/winsys/null/radv_null_winsys.c
++++ b/src/amd/vulkan/winsys/null/radv_null_winsys.c
+@@ -136,6 +136,8 @@ radv_null_winsys_query_info(struct radeon_winsys *rws, struct radeon_info *info)
+    info->max_render_backends = gpu_info[info->family].num_render_backends;
+ 
+    info->has_dedicated_vram = gpu_info[info->family].has_dedicated_vram;
++   /* Avoid use of staged shader uploads which requires CS submissions */
++   info->all_vram_visible = true;
+    info->has_packed_math_16bit = info->gfx_level >= GFX9;
+ 
+    info->has_image_load_dcc_bug =
+-- 
+GitLab
+
