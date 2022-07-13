@@ -1,0 +1,1192 @@
+From 17fdfa5a15d296786380b1c40e4483c58aadbe42 Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Sat, 4 Jun 2022 15:56:31 +0200
+Subject: [PATCH 1/5] nir: Rewrite and merge 16bit tex folding pass with 16bit
+ image folding pass.
+
+Allow folding constants/undef sources by sharing more code with the image_store
+16bit folding pass.
+
+Allow more than one set of sources because RADV wants two, one for
+G16 (ddx/ddy) and one for A16 (all other sources).
+
+Allow folding cube sampling destination conversions on radeonsi/radv because
+I think the limitation only applies to sources.
+
+Signed-off-by: Georg Lehmann <dadschoorse@gmail.com>
+---
+ src/amd/vulkan/radv_pipeline.c                |  13 +-
+ src/compiler/nir/nir.h                        |  19 +-
+ src/compiler/nir/nir_lower_mediump.c          | 404 +++++++++---------
+ src/freedreno/ir3/ir3_nir.c                   |  35 +-
+ src/gallium/drivers/radeonsi/si_shader_nir.c  |  23 +-
+ src/gallium/frontends/lavapipe/lvp_pipeline.c |   7 +-
+ 6 files changed, 254 insertions(+), 247 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_pipeline.c b/src/amd/vulkan/radv_pipeline.c
+index 1e130f56ec29..898d02ebfe09 100644
+--- a/src/amd/vulkan/radv_pipeline.c
++++ b/src/amd/vulkan/radv_pipeline.c
+@@ -4915,15 +4915,14 @@ radv_create_shaders(struct radv_pipeline *pipeline, struct radv_pipeline_layout
+          }
+          if (((stages[i].nir->info.bit_sizes_int | stages[i].nir->info.bit_sizes_float) & 16) &&
+              device->physical_device->rad_info.gfx_level >= GFX9) {
+-            uint32_t sampler_dims = UINT32_MAX;
+-            /* Skip because AMD doesn't support 16-bit types with these. */
+-            sampler_dims &= ~BITFIELD_BIT(GLSL_SAMPLER_DIM_CUBE);
+             // TODO: also optimize the tex srcs. see radeonSI for reference */
+-            /* Skip if there are potentially conflicting rounding modes */
+-            if (!nir_has_any_rounding_mode_enabled(stages[i].nir->info.float_controls_execution_mode))
+-               NIR_PASS(_, stages[i].nir, nir_fold_16bit_sampler_conversions, 0, sampler_dims);
++            struct nir_fold_16bit_tex_image_options fold_16bit_options = {
++               .rounding_mode = nir_rounding_mode_undef, /* TODO what rounding mode does D16 use? */
++               .fold_tex_dest = true,
++               .fold_image_load_store_data = true,
++            };
++            NIR_PASS(_, stages[i].nir, nir_fold_16bit_tex_image, &fold_16bit_options);
+ 
+-            NIR_PASS(_, stages[i].nir, nir_fold_16bit_image_load_store_conversions);
+             NIR_PASS(_, stages[i].nir, nir_opt_vectorize, opt_vectorize_callback, device);
+          }
+ 
+diff --git a/src/compiler/nir/nir.h b/src/compiler/nir/nir.h
+index 08ffa825b5be..6bb3f64da3e1 100644
+--- a/src/compiler/nir/nir.h
++++ b/src/compiler/nir/nir.h
+@@ -5331,9 +5331,22 @@ bool nir_lower_mediump_io(nir_shader *nir, nir_variable_mode modes,
+ bool nir_force_mediump_io(nir_shader *nir, nir_variable_mode modes,
+                           nir_alu_type types);
+ bool nir_unpack_16bit_varying_slots(nir_shader *nir, nir_variable_mode modes);
+-bool nir_fold_16bit_sampler_conversions(nir_shader *nir,
+-                                        unsigned tex_src_types, uint32_t sampler_dims);
+-bool nir_fold_16bit_image_load_store_conversions(nir_shader *nir);
++
++struct nir_fold_tex_srcs_options {
++   unsigned sampler_dims;
++   unsigned src_types;
++};
++
++struct nir_fold_16bit_tex_image_options {
++   nir_rounding_mode rounding_mode;
++   bool fold_tex_dest;
++   bool fold_image_load_store_data;
++   unsigned fold_srcs_options_count;
++   struct nir_fold_tex_srcs_options *fold_srcs_options;
++};
++
++bool nir_fold_16bit_tex_image(nir_shader *nir,
++                              struct nir_fold_16bit_tex_image_options *options);
+ 
+ typedef struct {
+    bool legalize_type;         /* whether this src should be legalized */
+diff --git a/src/compiler/nir/nir_lower_mediump.c b/src/compiler/nir/nir_lower_mediump.c
+index 5c6f84ec9beb..54ad83b7cb0f 100644
+--- a/src/compiler/nir/nir_lower_mediump.c
++++ b/src/compiler/nir/nir_lower_mediump.c
+@@ -376,7 +376,6 @@ static bool
+ is_f32_to_f16_conversion(nir_instr *instr)
+ {
+    return is_n_to_m_conversion(instr, 32, nir_op_f2f16) ||
+-          is_n_to_m_conversion(instr, 32, nir_op_f2f16_rtne) ||
+           is_n_to_m_conversion(instr, 32, nir_op_f2fmp);
+ }
+ 
+@@ -396,156 +395,8 @@ static bool
+ is_i32_to_i16_conversion(nir_instr *instr)
+ {
+    return is_n_to_m_conversion(instr, 32, nir_op_i2i16) ||
+-      is_n_to_m_conversion(instr, 32, nir_op_u2u16);
+-}
+-
+-static void
+-replace_with_mov(nir_builder *b, nir_instr *instr, nir_src *src,
+-                 nir_alu_instr *alu)
+-{
+-   nir_ssa_def *mov = nir_mov_alu(b, alu->src[0],
+-                                  nir_dest_num_components(alu->dest.dest));
+-   assert(!alu->dest.saturate);
+-   nir_instr_rewrite_src_ssa(instr, src, mov);
+-}
+-
+-/**
+- * If texture source operands use f16->f32 conversions or return values are
+- * followed by f16->f32 or f32->f16, remove those conversions. This benefits
+- * drivers that have texture opcodes that can accept and return 16-bit types.
+- *
+- * "tex_src_types" is a mask of nir_tex_src_* operands that should be handled.
+- * It's always done for the destination.
+- *
+- * This should be run after late algebraic optimizations.
+- * Copy propagation and DCE should be run after this.
+- */
+-bool
+-nir_fold_16bit_sampler_conversions(nir_shader *nir,
+-                                   unsigned tex_src_types,
+-                                   uint32_t sampler_dims)
+-{
+-   bool changed = false;
+-   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+-   assert(impl);
+-
+-   nir_builder b;
+-   nir_builder_init(&b, impl);
+-
+-   nir_foreach_block_safe (block, impl) {
+-      nir_foreach_instr_safe (instr, block) {
+-         if (instr->type != nir_instr_type_tex)
+-            continue;
+-
+-         nir_tex_instr *tex = nir_instr_as_tex(instr);
+-         nir_instr *src;
+-         nir_alu_instr *src_alu;
+-
+-         /* Skip sparse residency */
+-         if (tex->is_sparse)
+-            continue;
+-
+-         if ((tex->op == nir_texop_txs ||
+-              tex->op == nir_texop_query_levels) ||
+-             !(sampler_dims & BITFIELD_BIT(tex->sampler_dim)))
+-            continue;
+-
+-         /* Optimize source operands. */
+-         for (unsigned i = 0; i < tex->num_srcs; i++) {
+-            /* Filter out sources that should be ignored. */
+-            if (!(BITFIELD_BIT(tex->src[i].src_type) & tex_src_types))
+-               continue;
+-
+-            src = tex->src[i].src.ssa->parent_instr;
+-            if (src->type != nir_instr_type_alu)
+-               continue;
+-
+-            src_alu = nir_instr_as_alu(src);
+-            b.cursor = nir_before_instr(src);
+-
+-            nir_alu_type src_type = nir_tex_instr_src_type(tex, i);
+-
+-            /* Handle vector sources that are made of scalar instructions. */
+-            if (nir_op_is_vec(src_alu->op)) {
+-               /* See if the vector is made of f16->f32 opcodes. */
+-               unsigned num = nir_dest_num_components(src_alu->dest.dest);
+-               bool is_f16_to_f32 = src_type == nir_type_float;
+-               bool is_u16_to_u32 = src_type & (nir_type_int | nir_type_uint);
+-
+-               for (unsigned comp = 0; comp < num; comp++) {
+-                  nir_instr *instr = src_alu->src[comp].src.ssa->parent_instr;
+-                  is_f16_to_f32 &= is_f16_to_f32_conversion(instr);
+-                  /* Zero-extension (u16) and sign-extension (i16) have
+-                   * the same behavior here - txf returns 0 if bit 15 is set
+-                   * because it's out of bounds and the higher bits don't
+-                   * matter.
+-                   */
+-                  is_u16_to_u32 &= is_u16_to_u32_conversion(instr) ||
+-                                   is_i16_to_i32_conversion(instr);
+-               }
+-
+-               if (!is_f16_to_f32 && !is_u16_to_u32)
+-                  continue;
+-
+-               nir_alu_instr *new_vec = nir_alu_instr_clone(nir, src_alu);
+-               nir_instr_insert_after(&src_alu->instr, &new_vec->instr);
+-
+-               /* Replace conversions with mov. */
+-               for (unsigned comp = 0; comp < num; comp++) {
+-                  nir_instr *instr = new_vec->src[comp].src.ssa->parent_instr;
+-                  replace_with_mov(&b, &new_vec->instr,
+-                                   &new_vec->src[comp].src,
+-                                   nir_instr_as_alu(instr));
+-               }
+-
+-               new_vec->dest.dest.ssa.bit_size =
+-                  new_vec->src[0].src.ssa->bit_size;
+-               nir_instr_rewrite_src_ssa(&tex->instr, &tex->src[i].src,
+-                                         &new_vec->dest.dest.ssa);
+-               changed = true;
+-            } else if ((is_f16_to_f32_conversion(&src_alu->instr) &&
+-                        src_type == nir_type_float) ||
+-                       ((is_u16_to_u32_conversion(&src_alu->instr) ||
+-                         is_i16_to_i32_conversion(&src_alu->instr)) &&
+-                        src_type & (nir_type_int | nir_type_uint))) {
+-               /* Handle scalar sources. */
+-               replace_with_mov(&b, &tex->instr, &tex->src[i].src, src_alu);
+-               changed = true;
+-            }
+-         }
+-
+-         /* Optimize the destination. */
+-         bool is_f32_to_f16 = tex->dest_type & nir_type_float;
+-         /* same behavior for int and uint */
+-         bool is_i32_to_i16 = tex->dest_type & (nir_type_int | nir_type_uint);
+-
+-         nir_foreach_use(use, &tex->dest.ssa) {
+-            is_f32_to_f16 &= is_f32_to_f16_conversion(use->parent_instr);
+-            is_i32_to_i16 &= is_i32_to_i16_conversion(use->parent_instr);
+-         }
+-
+-         if (is_f32_to_f16 || is_i32_to_i16) {
+-            /* All uses are the same conversions. Replace them with mov. */
+-            nir_foreach_use(use, &tex->dest.ssa) {
+-               nir_alu_instr *conv = nir_instr_as_alu(use->parent_instr);
+-               conv->op = nir_op_mov;
+-               tex->dest.ssa.bit_size = conv->dest.dest.ssa.bit_size;
+-               tex->dest_type = (tex->dest_type & (~16 & ~32 & ~64)) |
+-                                conv->dest.dest.ssa.bit_size;
+-            }
+-            changed = true;
+-         }
+-      }
+-   }
+-
+-   if (changed) {
+-      nir_metadata_preserve(impl, nir_metadata_dominance |
+-                                  nir_metadata_block_index);
+-   } else {
+-      nir_metadata_preserve(impl, nir_metadata_all);
+-   }
+-
+-   return changed;
++          is_n_to_m_conversion(instr, 32, nir_op_u2u16) ||
++          is_n_to_m_conversion(instr, 32, nir_op_i2imp);
+ }
+ 
+ /**
+@@ -663,56 +514,84 @@ const_is_i16(nir_ssa_scalar scalar)
+ }
+ 
+ static bool
+-fold_16bit_store_data(nir_builder *b, nir_intrinsic_instr *instr)
++can_fold_16bit_src(nir_ssa_def *ssa, nir_alu_type src_type, bool sext_matters)
+ {
+-   nir_alu_type src_type = nir_intrinsic_src_type(instr);
+-   nir_src *data_src = &instr->src[3];
+-
+-   b->cursor = nir_before_instr(&instr->instr);
+-
+    bool fold_f16 = src_type == nir_type_float32;
+-   bool fold_u16 = src_type == nir_type_uint32;
+-   bool fold_i16 = src_type == nir_type_int32;
+-
+-   nir_ssa_scalar comps[NIR_MAX_VEC_COMPONENTS];
+-   for (unsigned i = 0; i < instr->num_components; i++) {
+-      comps[i] = nir_ssa_scalar_resolved(data_src->ssa, i);
+-      if (comps[i].def->parent_instr->type == nir_instr_type_ssa_undef)
++   bool fold_u16 = src_type == nir_type_uint32 && sext_matters;
++   bool fold_i16 = src_type == nir_type_int32 && sext_matters;
++   bool fold_i16_u16 = (src_type == nir_type_uint32 || src_type == nir_type_int32) && !sext_matters;
++
++   bool can_fold = fold_f16 || fold_u16 || fold_i16 || fold_i16_u16;
++   for (unsigned i = 0; can_fold && i < ssa->num_components; i++) {
++      nir_ssa_scalar comp = nir_ssa_scalar_resolved(ssa, i);
++      if (comp.def->parent_instr->type == nir_instr_type_ssa_undef)
+          continue;
+-      else if (nir_ssa_scalar_is_const(comps[i])) {
+-         fold_f16 &= const_is_f16(comps[i]);
+-         fold_u16 &= const_is_u16(comps[i]);
+-         fold_i16 &= const_is_i16(comps[i]);
++      else if (nir_ssa_scalar_is_const(comp)) {
++         if (fold_f16)
++            can_fold &= const_is_f16(comp);
++         else if (fold_u16)
++            can_fold &= const_is_u16(comp);
++         else if (fold_i16)
++            can_fold &= const_is_i16(comp);
++         else if (fold_i16_u16)
++            can_fold &= (const_is_u16(comp) || const_is_i16(comp));
+       } else {
+-         fold_f16 &= is_f16_to_f32_conversion(comps[i].def->parent_instr);
+-         fold_u16 &= is_u16_to_u32_conversion(comps[i].def->parent_instr);
+-         fold_i16 &= is_i16_to_i32_conversion(comps[i].def->parent_instr);
++         if (fold_f16)
++            can_fold &= is_f16_to_f32_conversion(comp.def->parent_instr);
++         else if (fold_u16)
++            can_fold &= is_u16_to_u32_conversion(comp.def->parent_instr);
++         else if (fold_i16)
++            can_fold &= is_i16_to_i32_conversion(comp.def->parent_instr);
++         else if (fold_i16_u16)
++            can_fold &= (is_i16_to_i32_conversion(comp.def->parent_instr) ||
++                         is_u16_to_u32_conversion(comp.def->parent_instr));
+       }
+    }
+ 
+-   if (!fold_f16 && !fold_u16 && !fold_i16)
+-      return false;
++   return can_fold;
++}
++
++static void
++fold_16bit_src(nir_builder *b, nir_instr *instr, nir_src *src, nir_alu_type src_type)
++{
++   b->cursor = nir_before_instr(instr);
+ 
+    nir_ssa_scalar new_comps[NIR_MAX_VEC_COMPONENTS];
+-   for (unsigned i = 0; i < instr->num_components; i++) {
+-      if (comps[i].def->parent_instr->type == nir_instr_type_ssa_undef)
++   for (unsigned i = 0; i < src->ssa->num_components; i++) {
++      nir_ssa_scalar comp = nir_ssa_scalar_resolved(src->ssa, i);
++
++      if (comp.def->parent_instr->type == nir_instr_type_ssa_undef)
+          new_comps[i] = nir_get_ssa_scalar(nir_ssa_undef(b, 1, 16), 0);
+-      else if (nir_ssa_scalar_is_const(comps[i])) {
++      else if (nir_ssa_scalar_is_const(comp)) {
+          nir_ssa_def *constant;
+          if (src_type == nir_type_float32)
+-            constant = nir_imm_float16(b, nir_ssa_scalar_as_float(comps[i]));
++            constant = nir_imm_float16(b, nir_ssa_scalar_as_float(comp));
+          else
+-            constant = nir_imm_intN_t(b, nir_ssa_scalar_as_uint(comps[i]), 16);
++            constant = nir_imm_intN_t(b, nir_ssa_scalar_as_uint(comp), 16);
+          new_comps[i] = nir_get_ssa_scalar(constant, 0);
+       } else {
+          /* conversion instruction */
+-         new_comps[i] = nir_ssa_scalar_chase_alu_src(comps[i], 0);
++         new_comps[i] = nir_ssa_scalar_chase_alu_src(comp, 0);
+       }
+    }
+ 
+-   nir_ssa_def *new_vec = nir_vec_scalars(b, new_comps, instr->num_components);
++   nir_ssa_def *new_vec = nir_vec_scalars(b, new_comps, src->ssa->num_components);
++
++   nir_instr_rewrite_src_ssa(instr, src, new_vec);
++}
++
++static bool
++fold_16bit_store_data(nir_builder *b, nir_intrinsic_instr *instr)
++{
++   nir_alu_type src_type = nir_intrinsic_src_type(instr);
++   nir_src *data_src = &instr->src[3];
++
++   b->cursor = nir_before_instr(&instr->instr);
++
++   if (!can_fold_16bit_src(data_src->ssa, src_type, true))
++      return false;
+ 
+-   nir_instr_rewrite_src_ssa(&instr->instr, data_src, new_vec);
++   fold_16bit_src(b, &instr->instr, data_src, src_type);
+ 
+    nir_intrinsic_set_src_type(instr, (src_type & ~32) | 16);
+ 
+@@ -720,70 +599,169 @@ fold_16bit_store_data(nir_builder *b, nir_intrinsic_instr *instr)
+ }
+ 
+ static bool
+-fold_16bit_load_data(nir_builder *b, nir_intrinsic_instr *instr)
++fold_16bit_destination(nir_ssa_def *ssa, nir_alu_type dest_type,
++                       unsigned exec_mode, nir_rounding_mode rdm)
+ {
+-   nir_alu_type dest_type = nir_intrinsic_dest_type(instr);
+-
+-   if (dest_type == nir_type_float32 &&
+-       nir_has_any_rounding_mode_enabled(b->shader->info.float_controls_execution_mode))
+-      return false;
+-
+    bool is_f32_to_f16 = dest_type == nir_type_float32;
+    bool is_i32_to_i16 = dest_type == nir_type_int32 || dest_type == nir_type_uint32;
+ 
+-   nir_foreach_use(use, &instr->dest.ssa) {
+-      is_f32_to_f16 &= is_f32_to_f16_conversion(use->parent_instr);
+-      is_i32_to_i16 &= is_i32_to_i16_conversion(use->parent_instr);
++   nir_rounding_mode src_rdm =
++      nir_get_rounding_mode_from_float_controls(exec_mode, nir_type_float16);
++   bool allow_standard = (src_rdm == rdm || src_rdm == nir_rounding_mode_undef);
++   bool allow_rtz = rdm == nir_rounding_mode_rtz;
++   bool allow_rtne = rdm == nir_rounding_mode_rtne;
++
++   nir_foreach_use(use, ssa) {
++      nir_instr *instr = use->parent_instr;
++      is_f32_to_f16 &= (allow_standard && is_f32_to_f16_conversion(instr)) ||
++                       (allow_rtz && is_n_to_m_conversion(instr, 32, nir_op_f2f16_rtz)) ||
++                       (allow_rtne && is_n_to_m_conversion(instr, 32, nir_op_f2f16_rtne));
++      is_i32_to_i16 &= is_i32_to_i16_conversion(instr);
+    }
+ 
+    if (!is_f32_to_f16 && !is_i32_to_i16)
+       return false;
+ 
+    /* All uses are the same conversions. Replace them with mov. */
+-   nir_foreach_use(use, &instr->dest.ssa) {
++   nir_foreach_use(use, ssa) {
+       nir_alu_instr *conv = nir_instr_as_alu(use->parent_instr);
+       conv->op = nir_op_mov;
+    }
+ 
+-   instr->dest.ssa.bit_size = 16;
++   ssa->bit_size = 16;
++   return true;
++}
++
++static bool
++fold_16bit_load_data(nir_builder *b, nir_intrinsic_instr *instr,
++                     unsigned exec_mode, nir_rounding_mode rdm)
++{
++   nir_alu_type dest_type = nir_intrinsic_dest_type(instr);
++
++   if (!fold_16bit_destination(&instr->dest.ssa, dest_type, exec_mode, rdm))
++      return false;
++
+    nir_intrinsic_set_dest_type(instr, (dest_type & ~32) | 16);
+ 
+    return true;
+ }
+ 
+ static bool
+-fold_16bit_image_load_store(nir_builder *b, nir_instr *instr, UNUSED void *unused)
++fold_16bit_tex_dest(nir_tex_instr *tex, unsigned exec_mode,
++                    nir_rounding_mode rdm)
+ {
+-   if (instr->type != nir_instr_type_intrinsic)
++   /* Skip sparse residency */
++   if (tex->is_sparse)
+       return false;
+ 
+-   nir_intrinsic_instr *intrinsic = nir_instr_as_intrinsic(instr);
++   if (tex->op != nir_texop_tex &&
++       tex->op != nir_texop_txb &&
++       tex->op != nir_texop_txd &&
++       tex->op != nir_texop_txl &&
++       tex->op != nir_texop_txf &&
++       tex->op != nir_texop_txf_ms &&
++       tex->op != nir_texop_tg4 &&
++       tex->op != nir_texop_tex_prefetch &&
++       tex->op != nir_texop_fragment_fetch_amd)
++      return false;
+ 
++   if (!fold_16bit_destination(&tex->dest.ssa, tex->dest_type, exec_mode, rdm))
++      return false;
++
++   tex->dest_type = (tex->dest_type & ~32) | 16;
++   return true;
++}
++
++
++static bool
++fold_16bit_tex_srcs(nir_builder *b, nir_tex_instr *tex,
++                    struct nir_fold_tex_srcs_options *options)
++{
++   if (tex->op != nir_texop_tex &&
++       tex->op != nir_texop_txb &&
++       tex->op != nir_texop_txd &&
++       tex->op != nir_texop_txl &&
++       tex->op != nir_texop_txf &&
++       tex->op != nir_texop_txf_ms &&
++       tex->op != nir_texop_tg4 &&
++       tex->op != nir_texop_tex_prefetch &&
++       tex->op != nir_texop_fragment_fetch_amd &&
++       tex->op != nir_texop_fragment_mask_fetch_amd)
++      return false;
++
++   if (!(options->sampler_dims & BITFIELD_BIT(tex->sampler_dim)))
++      return false;
++
++   bool changed = false;
++   for (unsigned i = 0; i < tex->num_srcs; i++) {
++      /* Filter out sources that should be ignored. */
++      if (!(BITFIELD_BIT(tex->src[i].src_type) & options->src_types))
++         continue;
++
++      nir_src *src = &tex->src[i].src;
++
++      nir_alu_type src_type = nir_tex_instr_src_type(tex, i) | src->ssa->bit_size;
++
++      /* Zero-extension (u16) and sign-extension (i16) have
++       * the same behavior here - txf returns 0 if bit 15 is set
++       * because it's out of bounds and the higher bits don't
++       * matter.
++       */
++      if (!can_fold_16bit_src(src->ssa, src_type, false))
++         continue;
++
++      fold_16bit_src(b, &tex->instr, src, src_type);
++      changed = true;
++   }
++
++   return changed;
++}
++
++static bool
++fold_16bit_tex_image(nir_builder *b, nir_instr *instr, void *params)
++{
++   struct nir_fold_16bit_tex_image_options *options = params;
++   unsigned exec_mode = b->shader->info.float_controls_execution_mode;
+    bool progress = false;
+ 
+-   switch (intrinsic->intrinsic) {
+-   case nir_intrinsic_bindless_image_store:
+-   case nir_intrinsic_image_deref_store:
+-   case nir_intrinsic_image_store:
+-      progress |= fold_16bit_store_data(b, intrinsic);
+-      break;
+-   case nir_intrinsic_bindless_image_load:
+-   case nir_intrinsic_image_deref_load:
+-   case nir_intrinsic_image_load:
+-      progress |= fold_16bit_load_data(b, intrinsic);
+-      break;
+-   default:
+-      break;
++   if (instr->type == nir_instr_type_intrinsic) {
++      nir_intrinsic_instr *intrinsic = nir_instr_as_intrinsic(instr);
++
++      switch (intrinsic->intrinsic) {
++      case nir_intrinsic_bindless_image_store:
++      case nir_intrinsic_image_deref_store:
++      case nir_intrinsic_image_store:
++         if (options->fold_image_load_store_data)
++            progress |= fold_16bit_store_data(b, intrinsic);
++         break;
++      case nir_intrinsic_bindless_image_load:
++      case nir_intrinsic_image_deref_load:
++      case nir_intrinsic_image_load:
++         if (options->fold_image_load_store_data)
++            progress |= fold_16bit_load_data(b, intrinsic, exec_mode, options->rounding_mode);
++         break;
++      default:
++         break;
++      }
++   } else if (instr->type == nir_instr_type_tex) {
++      nir_tex_instr *tex = nir_instr_as_tex(instr);
++
++      if (options->fold_tex_dest)
++         progress |= fold_16bit_tex_dest(tex, exec_mode, options->rounding_mode);
++
++      for (unsigned i = 0; i < options->fold_srcs_options_count; i++) {
++         progress |= fold_16bit_tex_srcs(b, tex, &options->fold_srcs_options[i]);
++      }
+    }
+ 
+    return progress;
+ }
+ 
+-bool
+-nir_fold_16bit_image_load_store_conversions(nir_shader *nir)
++bool nir_fold_16bit_tex_image(nir_shader *nir,
++                              struct nir_fold_16bit_tex_image_options *options)
+ {
+    return nir_shader_instructions_pass(nir,
+-                                       fold_16bit_image_load_store,
++                                       fold_16bit_tex_image,
+                                        nir_metadata_block_index | nir_metadata_dominance,
+-                                       NULL);
++                                       options);
+ }
+diff --git a/src/freedreno/ir3/ir3_nir.c b/src/freedreno/ir3/ir3_nir.c
+index 0b0cc73bd5fd..1b81e80c90bf 100644
+--- a/src/freedreno/ir3/ir3_nir.c
++++ b/src/freedreno/ir3/ir3_nir.c
+@@ -771,20 +771,27 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so, nir_shader *s)
+           * coordinates that had been upconverted to 32-bits just for the
+           * sampler to just be 16-bit texture sources.
+           */
+-         OPT(s, nir_fold_16bit_sampler_conversions,
+-            (1 << nir_tex_src_coord) |
+-            (1 << nir_tex_src_lod) |
+-            (1 << nir_tex_src_bias) |
+-            (1 << nir_tex_src_comparator) |
+-            (1 << nir_tex_src_min_lod) |
+-            (1 << nir_tex_src_ms_index) |
+-            (1 << nir_tex_src_ddx) |
+-            (1 << nir_tex_src_ddy),
+-            ~0);
+-
+-         /* blob dumps have no half regs on pixel 2's ldib or stib, so only enable for a6xx+. */
+-         if (so->compiler->gen >= 6)
+-            OPT(s, nir_fold_16bit_image_load_store_conversions);
++         struct nir_fold_tex_srcs_options fold_srcs_options = {
++            .sampler_dims = ~0,
++            .src_types = (1 << nir_tex_src_coord) |
++                         (1 << nir_tex_src_lod) |
++                         (1 << nir_tex_src_bias) |
++                         (1 << nir_tex_src_comparator) |
++                         (1 << nir_tex_src_min_lod) |
++                         (1 << nir_tex_src_ms_index) |
++                         (1 << nir_tex_src_ddx) |
++                         (1 << nir_tex_src_ddy),
++         };
++         struct nir_fold_16bit_tex_image_options fold_16bit_options = {
++            .rounding_mode = nir_rounding_mode_rtz,
++            .fold_tex_dest = true,
++            /* blob dumps have no half regs on pixel 2's ldib or stib, so only enable for a6xx+. */
++            .fold_image_load_store_data = so->compiler->gen >= 6,
++            .fold_srcs_options_count = 1,
++            .fold_srcs_options = &fold_srcs_options,
++         };
++         OPT(s, nir_fold_16bit_tex_image, &fold_16bit_options);
++
+ 
+          /* Now that we stripped off the 16-bit conversions, legalize so that we
+           * don't have a mix of 16- and 32-bit args that will need to be
+diff --git a/src/gallium/drivers/radeonsi/si_shader_nir.c b/src/gallium/drivers/radeonsi/si_shader_nir.c
+index 0c64689ccef3..e7883583e110 100644
+--- a/src/gallium/drivers/radeonsi/si_shader_nir.c
++++ b/src/gallium/drivers/radeonsi/si_shader_nir.c
+@@ -186,15 +186,22 @@ static void si_late_optimize_16bit_samplers(struct si_screen *sscreen, nir_shade
+    };
+    bool changed = false;
+ 
+-   uint32_t sampler_dims = UINT32_MAX;
+-   /* Skip because AMD doesn't support 16-bit types with these. */
+-   sampler_dims &= ~BITFIELD_BIT(GLSL_SAMPLER_DIM_CUBE);
+-   NIR_PASS(changed, nir, nir_fold_16bit_sampler_conversions,
+-            (1 << nir_tex_src_coord) |
+-            (has_g16 ? 1 << nir_tex_src_ddx : 0),
+-            sampler_dims);
++   struct nir_fold_tex_srcs_options fold_srcs_options = {
++      .sampler_dims = ~BITFIELD_BIT(GLSL_SAMPLER_DIM_CUBE),
++      .src_types = (1 << nir_tex_src_coord) |
++                   (has_g16 ? 1 << nir_tex_src_ddx : 0),
++   };
++   struct nir_fold_16bit_tex_image_options fold_16bit_options = {
++      .rounding_mode = nir_rounding_mode_undef, /* TODO what rounding mode does D16 use? */
++      .fold_tex_dest = true,
++      .fold_image_load_store_data = true,
++      .fold_srcs_options_count = 1,
++      .fold_srcs_options = &fold_srcs_options,
++   };
++   NIR_PASS(changed, nir, nir_fold_16bit_tex_image, &fold_16bit_options);
++
+    NIR_PASS(changed, nir, nir_legalize_16bit_sampler_srcs, tex_constraints);
+-   NIR_PASS(changed, nir, nir_fold_16bit_image_load_store_conversions);
++
+ 
+    if (changed) {
+       si_nir_opts(sscreen, nir, false);
+diff --git a/src/gallium/frontends/lavapipe/lvp_pipeline.c b/src/gallium/frontends/lavapipe/lvp_pipeline.c
+index 12185cb280d0..f128c05dcff2 100644
+--- a/src/gallium/frontends/lavapipe/lvp_pipeline.c
++++ b/src/gallium/frontends/lavapipe/lvp_pipeline.c
+@@ -1081,8 +1081,11 @@ lvp_shader_compile_to_ir(struct lvp_pipeline *pipeline,
+ 
+    // TODO: also optimize the tex srcs. see radeonSI for reference */
+    /* Skip if there are potentially conflicting rounding modes */
+-   if (!nir_has_any_rounding_mode_enabled(nir->info.float_controls_execution_mode))
+-      NIR_PASS_V(nir, nir_fold_16bit_sampler_conversions, 0, UINT32_MAX);
++   struct nir_fold_16bit_tex_image_options fold_16bit_options = {
++      .rounding_mode_matches_shader = false,
++      .fold_tex_dest = true,
++   };
++   NIR_PASS_V(nir, nir_fold_16bit_tex_image, &fold_16bit_options);
+ 
+    lvp_shader_optimize(nir);
+ 
+-- 
+GitLab
+
+
+From 5f29a7a14451ada16d68b98c580a227682db3bf0 Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Wed, 6 Jul 2022 17:00:34 +0200
+Subject: [PATCH 2/5] nir/lower_mediump: Add an option to only fold if all tex
+ sources can be folded.
+
+Signed-off-by: Georg Lehmann <dadschoorse@gmail.com>
+---
+ src/compiler/nir/nir.h               |  1 +
+ src/compiler/nir/nir_lower_mediump.c | 15 ++++++++++-----
+ 2 files changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/src/compiler/nir/nir.h b/src/compiler/nir/nir.h
+index 6bb3f64da3e1..b5d34d8e4c5d 100644
+--- a/src/compiler/nir/nir.h
++++ b/src/compiler/nir/nir.h
+@@ -5335,6 +5335,7 @@ bool nir_unpack_16bit_varying_slots(nir_shader *nir, nir_variable_mode modes);
+ struct nir_fold_tex_srcs_options {
+    unsigned sampler_dims;
+    unsigned src_types;
++   bool only_fold_all; /* Only fold sources if all of them can be folded. */
+ };
+ 
+ struct nir_fold_16bit_tex_image_options {
+diff --git a/src/compiler/nir/nir_lower_mediump.c b/src/compiler/nir/nir_lower_mediump.c
+index 54ad83b7cb0f..7a89827cb196 100644
+--- a/src/compiler/nir/nir_lower_mediump.c
++++ b/src/compiler/nir/nir_lower_mediump.c
+@@ -692,7 +692,7 @@ fold_16bit_tex_srcs(nir_builder *b, nir_tex_instr *tex,
+    if (!(options->sampler_dims & BITFIELD_BIT(tex->sampler_dim)))
+       return false;
+ 
+-   bool changed = false;
++   unsigned fold_srcs = 0;
+    for (unsigned i = 0; i < tex->num_srcs; i++) {
+       /* Filter out sources that should be ignored. */
+       if (!(BITFIELD_BIT(tex->src[i].src_type) & options->src_types))
+@@ -707,14 +707,19 @@ fold_16bit_tex_srcs(nir_builder *b, nir_tex_instr *tex,
+        * because it's out of bounds and the higher bits don't
+        * matter.
+        */
+-      if (!can_fold_16bit_src(src->ssa, src_type, false))
+-         continue;
++      if (can_fold_16bit_src(src->ssa, src_type, false))
++         fold_srcs |= (1 << i);
++      else if (options->only_fold_all)
++         return false;
++   }
+ 
++   u_foreach_bit(i, fold_srcs) {
++      nir_src *src = &tex->src[i].src;
++      nir_alu_type src_type = nir_tex_instr_src_type(tex, i) | src->ssa->bit_size;
+       fold_16bit_src(b, &tex->instr, src, src_type);
+-      changed = true;
+    }
+ 
+-   return changed;
++   return !!fold_srcs;
+ }
+ 
+ static bool
+-- 
+GitLab
+
+
+From 12c8dced5825a08da8c4d29f139fa6d62b6d81a0 Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Sat, 4 Jun 2022 19:50:00 +0200
+Subject: [PATCH 3/5] aco: Add G16 opcodes.
+
+Signed-off-by: Georg Lehmann <dadschoorse@gmail.com>
+---
+ src/amd/compiler/aco_opcodes.py | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/src/amd/compiler/aco_opcodes.py b/src/amd/compiler/aco_opcodes.py
+index 820e09b1989e..2a375d999bf0 100644
+--- a/src/amd/compiler/aco_opcodes.py
++++ b/src/amd/compiler/aco_opcodes.py
+@@ -1483,6 +1483,21 @@ IMAGE_SAMPLE = {
+ for (code, name) in IMAGE_SAMPLE:
+    opcode(name, code, code, code, Format.MIMG, InstrClass.VMem)
+ 
++IMAGE_SAMPLE_G16 = {
++   (0xa2, "image_sample_d_g16"),
++   (0xa3, "image_sample_d_cl_g16"),
++   (0xaa, "image_sample_c_d_g16"),
++   (0xab, "image_sample_c_d_cl_g16"),
++   (0xb2, "image_sample_d_o_g16"),
++   (0xb3, "image_sample_d_cl_o_g16"),
++   (0xba, "image_sample_c_d_o_g16"),
++   (0xbb, "image_sample_c_d_cl_o_g16"),
++}
++
++# (gfx6, gfx7, gfx8, gfx9, gfx10, name) = (-1, -1, -1, -1, code, name)
++for (code, name) in IMAGE_SAMPLE_G16:
++   opcode(name, -1, -1, code, Format.MIMG, InstrClass.VMem)
++
+ IMAGE_GATHER4 = {
+    (0x40, "image_gather4"),
+    (0x41, "image_gather4_cl"),
+-- 
+GitLab
+
+
+From 50d87a1260c4fbce98fdd126c003fc6e845ba13e Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Mon, 6 Jun 2022 17:04:14 +0200
+Subject: [PATCH 4/5] aco: Support 16bit sources for texture ops.
+
+Signed-off-by: Georg Lehmann <dadschoorse@gmail.com>
+---
+ .../compiler/aco_instruction_selection.cpp    | 178 ++++++++++++++----
+ 1 file changed, 137 insertions(+), 41 deletions(-)
+
+diff --git a/src/amd/compiler/aco_instruction_selection.cpp b/src/amd/compiler/aco_instruction_selection.cpp
+index 66adb1651950..5513aad8d2da 100644
+--- a/src/amd/compiler/aco_instruction_selection.cpp
++++ b/src/amd/compiler/aco_instruction_selection.cpp
+@@ -5924,6 +5924,41 @@ visit_load_constant(isel_context* ctx, nir_intrinsic_instr* instr)
+    load_buffer(ctx, instr->num_components, size, dst, rsrc, offset, size, 0);
+ }
+ 
++/* Packs multiple Temps of different sizes in to a vector of v1 Temps.
++ * The byte count of each input Temp must be a multiple of 2.
++ */
++static std::vector<Temp>
++emit_pack_v1(isel_context* ctx, const std::vector<Temp>& unpacked)
++{
++   Builder bld(ctx->program, ctx->block);
++   std::vector<Temp> packed;
++   Temp low = Temp();
++   for (Temp tmp : unpacked) {
++      assert(tmp.bytes() % 2 == 0);
++      unsigned byte_idx = 0;
++      while (byte_idx < tmp.bytes()) {
++         if (low != Temp()) {
++            Temp high = emit_extract_vector(ctx, tmp, byte_idx / 2, v2b);
++            Temp dword = bld.pseudo(aco_opcode::p_create_vector, bld.def(v1), low, high);
++            low = Temp();
++            packed.push_back(dword);
++            byte_idx += 2;
++         } else if (byte_idx % 4 == 0 && (byte_idx + 4) <= tmp.bytes()) {
++            packed.emplace_back(emit_extract_vector(ctx, tmp, byte_idx / 4, v1));
++            byte_idx += 4;
++         } else {
++            low = emit_extract_vector(ctx, tmp, byte_idx / 2, v2b);
++            byte_idx += 2;
++         }
++      }
++   }
++   if (low != Temp()) {
++      Temp dword = bld.pseudo(aco_opcode::p_create_vector, bld.def(v1), low, Operand(v2b));
++      packed.push_back(dword);
++   }
++   return packed;
++}
++
+ static bool
+ should_declare_array(isel_context* ctx, enum glsl_sampler_dim sampler_dim, bool is_array)
+ {
+@@ -9315,9 +9350,10 @@ prepare_cube_coords(isel_context* ctx, std::vector<Temp>& coords, Temp* ddx, Tem
+       tc = bld.vop2(aco_opcode::v_add_f32, bld.def(v1), Operand::c32(0x3fc00000u /*1.5*/), tc);
+    }
+ 
+-   if (is_array)
++   if (is_array) {
+       id = bld.vop2(madmk, bld.def(v1), coords[3], id, Operand::c32(0x41000000u /*8.0*/));
+-   coords.resize(3);
++      coords.erase(coords.begin() + 3);
++   }
+    coords[0] = sc;
+    coords[1] = tc;
+    coords[2] = id;
+@@ -9348,7 +9384,8 @@ visit_tex(isel_context* ctx, nir_tex_instr* instr)
+         has_offset = false, has_ddx = false, has_ddy = false, has_derivs = false,
+         has_sample_index = false, has_clamped_lod = false;
+    Temp resource, sampler, bias = Temp(), compare = Temp(), sample_index = Temp(), lod = Temp(),
+-                           offset = Temp(), ddx = Temp(), ddy = Temp(), clamped_lod = Temp();
++                           offset = Temp(), ddx = Temp(), ddy = Temp(), clamped_lod = Temp(),
++                           coord = Temp();
+    std::vector<Temp> coords;
+    std::vector<Temp> derivs;
+    nir_const_value* const_offset[4] = {NULL, NULL, NULL, NULL};
+@@ -9370,15 +9407,25 @@ visit_tex(isel_context* ctx, nir_tex_instr* instr)
+    bool tg4_integer_cube_workaround =
+       tg4_integer_workarounds && instr->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+ 
++   bool a16 = false, g16 = false;
++
++   int coord_idx = nir_tex_instr_src_index(instr, nir_tex_src_coord);
++   if (coord_idx > 0)
++      a16 = instr->src[coord_idx].src.ssa->bit_size == 16;
++
++   int ddx_idx = nir_tex_instr_src_index(instr, nir_tex_src_ddx);
++   if (ddx_idx > 0)
++      g16 = instr->src[ddx_idx].src.ssa->bit_size == 16;
++
+    for (unsigned i = 0; i < instr->num_srcs; i++) {
+       switch (instr->src[i].src_type) {
+       case nir_tex_src_coord: {
+-         Temp coord = get_ssa_temp(ctx, instr->src[i].src.ssa);
+-         for (unsigned j = 0; j < coord.size(); j++)
+-            coords.emplace_back(emit_extract_vector(ctx, coord, j, v1));
++         assert(instr->src[i].src.ssa->bit_size == (a16 ? 16 : 32));
++         coord = get_ssa_temp(ctx, instr->src[i].src.ssa);
+          break;
+       }
+       case nir_tex_src_bias:
++         assert(instr->src[i].src.ssa->bit_size == (a16 ? 16 : 32));
+          bias = get_ssa_temp(ctx, instr->src[i].src.ssa);
+          has_bias = true;
+          break;
+@@ -9386,35 +9433,42 @@ visit_tex(isel_context* ctx, nir_tex_instr* instr)
+          if (nir_src_is_const(instr->src[i].src) && nir_src_as_uint(instr->src[i].src) == 0) {
+             level_zero = true;
+          } else {
++            assert(instr->src[i].src.ssa->bit_size == (a16 ? 16 : 32));
+             lod = get_ssa_temp(ctx, instr->src[i].src.ssa);
+             has_lod = true;
+          }
+          break;
+       }
+       case nir_tex_src_min_lod:
++         assert(instr->src[i].src.ssa->bit_size == (a16 ? 16 : 32));
+          clamped_lod = get_ssa_temp(ctx, instr->src[i].src.ssa);
+          has_clamped_lod = true;
+          break;
+       case nir_tex_src_comparator:
+          if (instr->is_shadow) {
++            assert(instr->src[i].src.ssa->bit_size == 32);
+             compare = get_ssa_temp(ctx, instr->src[i].src.ssa);
+             has_compare = true;
+          }
+          break;
+       case nir_tex_src_offset:
++         assert(instr->src[i].src.ssa->bit_size == 32);
+          offset = get_ssa_temp(ctx, instr->src[i].src.ssa);
+          get_const_vec(instr->src[i].src.ssa, const_offset);
+          has_offset = true;
+          break;
+       case nir_tex_src_ddx:
++         assert(instr->src[i].src.ssa->bit_size == (g16 ? 16 : 32));
+          ddx = get_ssa_temp(ctx, instr->src[i].src.ssa);
+          has_ddx = true;
+          break;
+       case nir_tex_src_ddy:
++         assert(instr->src[i].src.ssa->bit_size == (g16 ? 16 : 32));
+          ddy = get_ssa_temp(ctx, instr->src[i].src.ssa);
+          has_ddy = true;
+          break;
+       case nir_tex_src_ms_index:
++         assert(instr->src[i].src.ssa->bit_size == (a16 ? 16 : 32));
+          sample_index = get_ssa_temp(ctx, instr->src[i].src.ssa);
+          has_sample_index = true;
+          break;
+@@ -9499,34 +9553,63 @@ visit_tex(isel_context* ctx, nir_tex_instr* instr)
+          offset = pack;
+    }
+ 
++   unsigned wqm_coord_count = 0;
++   std::vector<Temp> unpacked_coord;
++   if (ctx->options->gfx_level == GFX9 && instr->sampler_dim == GLSL_SAMPLER_DIM_1D &&
++       instr->op != nir_texop_lod && instr->coord_components) {
++      RegClass rc = a16 ? v2b : v1;
++      for (unsigned i = 0; i < coord.bytes() / rc.bytes(); i++)
++         unpacked_coord.emplace_back(emit_extract_vector(ctx, coord, i, rc));
++
++      assert(unpacked_coord.size() > 0 && unpacked_coord.size() < 3);
++
++      Operand coord2d;
++      /* 0.5 for floating point coords, 0 for integer. */
++      if (a16)
++         coord2d = instr->op == nir_texop_txf ? Operand::c16(0) : Operand::c16(0x3800);
++      else
++         coord2d = instr->op == nir_texop_txf ? Operand::c32(0) : Operand::c32(0x3f000000);
++      unpacked_coord.insert(std::next(unpacked_coord.begin()), bld.copy(bld.def(rc), coord2d));
++      wqm_coord_count = a16 ? DIV_ROUND_UP(unpacked_coord.size(), 2) : unpacked_coord.size();
++   } else if (coord != Temp()) {
++      unpacked_coord.push_back(coord);
++      wqm_coord_count = DIV_ROUND_UP(coord.bytes(), 4);
++   }
++
++   if (has_sample_index)
++      unpacked_coord.push_back(sample_index);
++   if (has_lod)
++      unpacked_coord.push_back(lod);
++   if (has_clamped_lod)
++      unpacked_coord.push_back(clamped_lod);
++
++   coords = emit_pack_v1(ctx, unpacked_coord);
++
++   assert(instr->sampler_dim != GLSL_SAMPLER_DIM_CUBE || !a16);
+    if (instr->sampler_dim == GLSL_SAMPLER_DIM_CUBE && instr->coord_components)
+       prepare_cube_coords(ctx, coords, &ddx, &ddy, instr->op == nir_texop_txd,
+                           instr->is_array && instr->op != nir_texop_lod);
+ 
+    /* pack derivatives */
+    if (has_ddx || has_ddy) {
+-      if (instr->sampler_dim == GLSL_SAMPLER_DIM_1D && ctx->options->gfx_level == GFX9) {
+-         assert(has_ddx && has_ddy && ddx.size() == 1 && ddy.size() == 1);
+-         Temp zero = bld.copy(bld.def(v1), Operand::zero());
+-         derivs = {ddx, zero, ddy, zero};
+-      } else {
+-         for (unsigned i = 0; has_ddx && i < ddx.size(); i++)
+-            derivs.emplace_back(emit_extract_vector(ctx, ddx, i, v1));
+-         for (unsigned i = 0; has_ddy && i < ddy.size(); i++)
+-            derivs.emplace_back(emit_extract_vector(ctx, ddy, i, v1));
++      RegClass rc = g16 ? v2b : v1;
++      assert(a16 == g16 || ctx->options->gfx_level >= GFX10);
++      std::array<Temp, 2> ddxddy = {ddx, ddy};
++      for (Temp tmp : ddxddy) {
++         if (tmp == Temp())
++            continue;
++         std::vector<Temp> unpacked = {tmp};
++         if (instr->sampler_dim == GLSL_SAMPLER_DIM_1D && ctx->options->gfx_level == GFX9) {
++            assert(has_ddx && has_ddy);
++            Temp zero = bld.copy(bld.def(rc), Operand::zero(rc.bytes()));
++            unpacked.push_back(zero);
++         }
++         for (Temp derv : emit_pack_v1(ctx, unpacked))
++            derivs.push_back(derv);
+       }
+       has_derivs = true;
+    }
+ 
+-   if (ctx->options->gfx_level == GFX9 && instr->sampler_dim == GLSL_SAMPLER_DIM_1D &&
+-       instr->op != nir_texop_lod && instr->coord_components) {
+-      assert(coords.size() > 0 && coords.size() < 3);
+-
+-      coords.insert(std::next(coords.begin()),
+-                    bld.copy(bld.def(v1), instr->op == nir_texop_txf ? Operand::c32(0)
+-                                                                     : Operand::c32(0x3f000000)));
+-   }
+-
+    bool da = should_declare_array(ctx, instr->sampler_dim, instr->is_array);
+ 
+    /* Build tex instruction */
+@@ -9726,22 +9809,15 @@ visit_tex(isel_context* ctx, nir_tex_instr* instr)
+       args.emplace_back(offset);
+    }
+    if (has_bias)
+-      args.emplace_back(bias);
++      args.emplace_back(emit_pack_v1(ctx, {bias})[0]);
+    if (has_compare)
+       args.emplace_back(compare);
+    if (has_derivs)
+       args.insert(args.end(), derivs.begin(), derivs.end());
+ 
+-   wqm_mask |= u_bit_consecutive(args.size(), coords.size());
++   wqm_mask |= u_bit_consecutive(args.size(), wqm_coord_count);
+    args.insert(args.end(), coords.begin(), coords.end());
+ 
+-   if (has_sample_index)
+-      args.emplace_back(sample_index);
+-   if (has_lod)
+-      args.emplace_back(lod);
+-   if (has_clamped_lod)
+-      args.emplace_back(clamped_lod);
+-
+    if (instr->op == nir_texop_txf || instr->op == nir_texop_fragment_fetch_amd ||
+        instr->op == nir_texop_fragment_mask_fetch_amd) {
+       aco_opcode op = level_zero || instr->sampler_dim == GLSL_SAMPLER_DIM_MS ||
+@@ -9760,6 +9836,7 @@ visit_tex(isel_context* ctx, nir_tex_instr* instr)
+       tex->da = da;
+       tex->tfe = instr->is_sparse;
+       tex->d16 = d16;
++      tex->a16 = a16;
+ 
+       if (instr->op == nir_texop_fragment_mask_fetch_amd) {
+          /* Use 0x76543210 if the image doesn't have FMASK. */
+@@ -9785,26 +9862,34 @@ visit_tex(isel_context* ctx, nir_tex_instr* instr)
+       return;
+    }
+ 
++   bool separate_g16 = ctx->options->gfx_level >= GFX10 && g16;
++
+    // TODO: would be better to do this by adding offsets, but needs the opcodes ordered.
+    aco_opcode opcode = aco_opcode::image_sample;
+    if (has_offset) { /* image_sample_*_o */
+       if (has_clamped_lod) {
+          if (has_compare) {
+             opcode = aco_opcode::image_sample_c_cl_o;
+-            if (has_derivs)
++            if (separate_g16)
++               opcode = aco_opcode::image_sample_c_d_cl_o_g16;
++            else if (has_derivs)
+                opcode = aco_opcode::image_sample_c_d_cl_o;
+             if (has_bias)
+                opcode = aco_opcode::image_sample_c_b_cl_o;
+          } else {
+             opcode = aco_opcode::image_sample_cl_o;
+-            if (has_derivs)
++            if (separate_g16)
++               opcode = aco_opcode::image_sample_d_cl_o_g16;
++            else if (has_derivs)
+                opcode = aco_opcode::image_sample_d_cl_o;
+             if (has_bias)
+                opcode = aco_opcode::image_sample_b_cl_o;
+          }
+       } else if (has_compare) {
+          opcode = aco_opcode::image_sample_c_o;
+-         if (has_derivs)
++         if (separate_g16)
++            opcode = aco_opcode::image_sample_c_d_o_g16;
++         else if (has_derivs)
+             opcode = aco_opcode::image_sample_c_d_o;
+          if (has_bias)
+             opcode = aco_opcode::image_sample_c_b_o;
+@@ -9814,7 +9899,9 @@ visit_tex(isel_context* ctx, nir_tex_instr* instr)
+             opcode = aco_opcode::image_sample_c_l_o;
+       } else {
+          opcode = aco_opcode::image_sample_o;
+-         if (has_derivs)
++         if (separate_g16)
++            opcode = aco_opcode::image_sample_d_o_g16;
++         else if (has_derivs)
+             opcode = aco_opcode::image_sample_d_o;
+          if (has_bias)
+             opcode = aco_opcode::image_sample_b_o;
+@@ -9826,13 +9913,17 @@ visit_tex(isel_context* ctx, nir_tex_instr* instr)
+    } else if (has_clamped_lod) { /* image_sample_*_cl */
+       if (has_compare) {
+          opcode = aco_opcode::image_sample_c_cl;
+-         if (has_derivs)
++         if (separate_g16)
++            opcode = aco_opcode::image_sample_c_d_cl_g16;
++         else if (has_derivs)
+             opcode = aco_opcode::image_sample_c_d_cl;
+          if (has_bias)
+             opcode = aco_opcode::image_sample_c_b_cl;
+       } else {
+          opcode = aco_opcode::image_sample_cl;
+-         if (has_derivs)
++         if (separate_g16)
++            opcode = aco_opcode::image_sample_d_cl_g16;
++         else if (has_derivs)
+             opcode = aco_opcode::image_sample_d_cl;
+          if (has_bias)
+             opcode = aco_opcode::image_sample_b_cl;
+@@ -9840,7 +9931,9 @@ visit_tex(isel_context* ctx, nir_tex_instr* instr)
+    } else { /* no offset */
+       if (has_compare) {
+          opcode = aco_opcode::image_sample_c;
+-         if (has_derivs)
++         if (separate_g16)
++            opcode = aco_opcode::image_sample_c_d_g16;
++         else if (has_derivs)
+             opcode = aco_opcode::image_sample_c_d;
+          if (has_bias)
+             opcode = aco_opcode::image_sample_c_b;
+@@ -9850,7 +9943,9 @@ visit_tex(isel_context* ctx, nir_tex_instr* instr)
+             opcode = aco_opcode::image_sample_c_l;
+       } else {
+          opcode = aco_opcode::image_sample;
+-         if (has_derivs)
++         if (separate_g16)
++            opcode = aco_opcode::image_sample_d_g16;
++         else if (has_derivs)
+             opcode = aco_opcode::image_sample_d;
+          if (has_bias)
+             opcode = aco_opcode::image_sample_b;
+@@ -9907,6 +10002,7 @@ visit_tex(isel_context* ctx, nir_tex_instr* instr)
+    tex->da = da;
+    tex->tfe = instr->is_sparse;
+    tex->d16 = d16;
++   tex->a16 = a16;
+ 
+    if (tg4_integer_cube_workaround) {
+       assert(tmp_dst.id() != dst.id());
+-- 
+GitLab
+
+
+From d9f9a118d07f778ee04faf32c168b44e306c1b18 Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Wed, 6 Jul 2022 17:13:30 +0200
+Subject: [PATCH 5/5] radv: Fold 16bit tex sources.
+
+Signed-off-by: Georg Lehmann <dadschoorse@gmail.com>
+---
+ src/amd/vulkan/radv_pipeline.c | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/vulkan/radv_pipeline.c b/src/amd/vulkan/radv_pipeline.c
+index 898d02ebfe09..70bdd6ea25c3 100644
+--- a/src/amd/vulkan/radv_pipeline.c
++++ b/src/amd/vulkan/radv_pipeline.c
+@@ -4915,11 +4915,27 @@ radv_create_shaders(struct radv_pipeline *pipeline, struct radv_pipeline_layout
+          }
+          if (((stages[i].nir->info.bit_sizes_int | stages[i].nir->info.bit_sizes_float) & 16) &&
+              device->physical_device->rad_info.gfx_level >= GFX9) {
+-            // TODO: also optimize the tex srcs. see radeonSI for reference */
++            bool separate_g16 = device->physical_device->rad_info.gfx_level >= GFX10;
++            struct nir_fold_tex_srcs_options fold_srcs_options[] = {
++               {
++                  .sampler_dims =
++                     ~(BITFIELD_BIT(GLSL_SAMPLER_DIM_CUBE) | BITFIELD_BIT(GLSL_SAMPLER_DIM_BUF)),
++                  .src_types = (1 << nir_tex_src_coord) | (1 << nir_tex_src_lod) |
++                               (1 << nir_tex_src_bias) | (1 << nir_tex_src_min_lod) |
++                               (1 << nir_tex_src_ms_index) |
++                               (separate_g16 ? 0 : (1 << nir_tex_src_ddx) | (1 << nir_tex_src_ddy)),
++               },
++               {
++                  .sampler_dims = ~0,
++                  .src_types = (1 << nir_tex_src_ddx) | (1 << nir_tex_src_ddy),
++               },
++            };
+             struct nir_fold_16bit_tex_image_options fold_16bit_options = {
+                .rounding_mode = nir_rounding_mode_undef, /* TODO what rounding mode does D16 use? */
+                .fold_tex_dest = true,
+                .fold_image_load_store_data = true,
++               .fold_srcs_options_count = separate_g16 ? 2 : 1,
++               .fold_srcs_options = fold_srcs_options,
+             };
+             NIR_PASS(_, stages[i].nir, nir_fold_16bit_tex_image, &fold_16bit_options);
+ 
+-- 
+GitLab
+
