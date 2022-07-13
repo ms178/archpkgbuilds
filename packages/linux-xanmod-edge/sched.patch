@@ -1,3 +1,109 @@
+When we are migrating task out of the CPU, we can combine detach and
+propagation into dequeue_entity() to save the detach_entity_cfs_rq()
+in migrate_task_rq_fair().
+
+This optimization is like combining DO_ATTACH in the enqueue_entity()
+when migrating task to the CPU.
+
+So we don't have to traverse the CFS tree extra time to do the
+detach_entity_cfs_rq() -> propagate_entity_cfs_rq() call, which
+wouldn't be called anymore with this patch's change.
+
+detach_task()
+  deactivate_task()
+    dequeue_task_fair()
+      for_each_sched_entity(se)
+        dequeue_entity()
+          update_load_avg() /* (1) */
+            detach_entity_load_avg()
+
+  set_task_cpu()
+    migrate_task_rq_fair()
+      detach_entity_cfs_rq() /* (2) */
+        update_load_avg();
+        detach_entity_load_avg();
+        propagate_entity_cfs_rq();
+          for_each_sched_entity()
+            update_load_avg()
+
+This patch save the detach_entity_cfs_rq() called in (2) by doing
+the detach_entity_load_avg() for a CPU migrating task inside (1)
+(the task being the first se in the loop)
+
+Signed-off-by: Chengming Zhou <zhouchengming@xxxxxxxxxxxxx>
+Reviewed-by: Vincent Guittot <vincent.guittot@xxxxxxxxxx>
+---
+ kernel/sched/fair.c | 30 +++++++++++++++++-------------
+ 1 file changed, 17 insertions(+), 13 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index a78d2e3b9d49..0689b94ed70b 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -4003,6 +4003,7 @@ static void detach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *s
+ #define UPDATE_TG	0x1
+ #define SKIP_AGE_LOAD	0x2
+ #define DO_ATTACH	0x4
++#define DO_DETACH	0x8
+
+ /* Update task and its cfs_rq load average */
+ static inline void update_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+@@ -4020,7 +4021,14 @@ static inline void update_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *s
+ 	decayed  = update_cfs_rq_load_avg(now, cfs_rq);
+ 	decayed |= propagate_entity_load_avg(se);
+
+-	if (!se->avg.last_update_time && (flags & DO_ATTACH)) {
++	if (flags & DO_DETACH) {
++		/*
++		 * DO_DETACH means we're here from dequeue_entity()
++		 * and we are migrating task out of the CPU.
++		 */
++		detach_entity_load_avg(cfs_rq, se);
++		update_tg_load_avg(cfs_rq);
++	} else if (!se->avg.last_update_time && (flags & DO_ATTACH)) {
+
+ 		/*
+ 		 * DO_ATTACH means we're here from enqueue_entity().
+@@ -4292,6 +4300,7 @@ static inline bool cfs_rq_is_decayed(struct cfs_rq *cfs_rq)
+ #define UPDATE_TG	0x0
+ #define SKIP_AGE_LOAD	0x0
+ #define DO_ATTACH	0x0
++#define DO_DETACH	0x0
+
+ static inline void update_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se, int not_used1)
+ {
+@@ -4511,6 +4520,11 @@ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq);
+ static void
+ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ {
++	int action = UPDATE_TG;
++
++	if (entity_is_task(se) && task_on_rq_migrating(task_of(se)))
++		action |= DO_DETACH;
++
+ 	/*
+ 	 * Update run-time statistics of the 'current'.
+ 	 */
+@@ -4524,7 +4538,7 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 	 *   - For group entity, update its weight to reflect the new share
+ 	 *     of its group cfs_rq.
+ 	 */
+-	update_load_avg(cfs_rq, se, UPDATE_TG);
++	update_load_avg(cfs_rq, se, action);
+ 	se_update_runnable(se);
+
+ 	update_stats_dequeue_fair(cfs_rq, se, flags);
+@@ -7076,8 +7090,6 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 	return new_cpu;
+ }
+
+-static void detach_entity_cfs_rq(struct sched_entity *se);
+-
+ /*
+  * Called immediately before a task is migrated to a new CPU; task_cpu(p) and
+  * cfs_rq_of(p) references at time of call are still valid and identify the
+
+
 When reading the sched_avg related code, I found the comments in
 enqueue/dequeue_entity() are not updated with the current code.
 
@@ -39,6 +145,214 @@ index 0689b94ed70b..2a3e12ead144 100644
 --
 2.36.1
 
+Previously we only maintain task se depth in task_move_group_fair(),
+if a !fair task change task group, its se depth will not be updated,
+so commit eb7a59b2c888 ("sched/fair: Reset se-depth when task switched to FAIR")
+fix the problem by updating se depth in switched_to_fair() too.
+
+This patch move task se depth maintainence to set_task_rq(), which will be
+called when CPU/cgroup change, so its depth will always be correct.
+
+This patch is preparation for the next patch.
+
+Signed-off-by: Chengming Zhou <zhouchengming@xxxxxxxxxxxxx>
+---
+ kernel/sched/fair.c  | 8 --------
+ kernel/sched/sched.h | 1 +
+ 2 files changed, 1 insertion(+), 8 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 2a3e12ead144..bf595b622656 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -11539,14 +11539,6 @@ static void attach_entity_cfs_rq(struct sched_entity *se)
+ {
+ 	struct cfs_rq *cfs_rq = cfs_rq_of(se);
+
+-#ifdef CONFIG_FAIR_GROUP_SCHED
+-	/*
+-	 * Since the real-depth could have been changed (only FAIR
+-	 * class maintain depth value), reset depth properly.
+-	 */
+-	se->depth = se->parent ? se->parent->depth + 1 : 0;
+-#endif
+-
+ 	/* Synchronize entity with its cfs_rq */
+ 	update_load_avg(cfs_rq, se, sched_feat(ATTACH_AGE_LOAD) ? 0 : SKIP_AGE_LOAD);
+ 	attach_entity_load_avg(cfs_rq, se);
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index aad7f5ee9666..8cc3eb7b86cd 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1940,6 +1940,7 @@ static inline void set_task_rq(struct task_struct *p, unsigned int cpu)
+ 	set_task_rq_fair(&p->se, p->se.cfs_rq, tg->cfs_rq[cpu]);
+ 	p->se.cfs_rq = tg->cfs_rq[cpu];
+ 	p->se.parent = tg->se[cpu];
++	p->se.depth = tg->se[cpu] ? tg->se[cpu]->depth + 1 : 0;
+ #endif
+
+ #ifdef CONFIG_RT_GROUP_SCHED
+--
+2.36.1
+
+We use cpu_cgrp_subsys->fork() to set task group for the new fair task
+in cgroup_post_fork().
+
+Since commit b1e8206582f9 ("sched: Fix yet more sched_fork() races")
+has already set task group for the new fair task in sched_cgroup_fork(),
+so cpu_cgrp_subsys->fork() can be removed.
+
+  cgroup_can_fork()	--> pin parent's sched_task_group
+  sched_cgroup_fork()
+    __set_task_cpu	--> set task group
+  cgroup_post_fork()
+    ss->fork() := cpu_cgroup_fork()	--> set again
+
+After this patch's change, task_change_group_fair() only need to
+care about task cgroup migration, make the code much simplier.
+
+Signed-off-by: Chengming Zhou <zhouchengming@xxxxxxxxxxxxx>
+Reviewed-by: Vincent Guittot <vincent.guittot@xxxxxxxxxx>
+---
+ kernel/sched/core.c  | 27 ++++-----------------------
+ kernel/sched/fair.c  | 23 +----------------------
+ kernel/sched/sched.h |  5 +----
+ 3 files changed, 6 insertions(+), 49 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index c215b5adc707..d85fdea51e3a 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -481,8 +481,7 @@ sched_core_dequeue(struct rq *rq, struct task_struct *p, int flags) { }
+  *				p->se.load, p->rt_priority,
+  *				p->dl.dl_{runtime, deadline, period, flags, bw, density}
+  *  - sched_setnuma():		p->numa_preferred_nid
+- *  - sched_move_task()/
+- *    cpu_cgroup_fork():	p->sched_task_group
++ *  - sched_move_task():	p->sched_task_group
+  *  - uclamp_update_active()	p->uclamp*
+  *
+  * p->state <- TASK_*:
+@@ -10127,7 +10126,7 @@ void sched_release_group(struct task_group *tg)
+ 	spin_unlock_irqrestore(&task_group_lock, flags);
+ }
+
+-static void sched_change_group(struct task_struct *tsk, int type)
++static void sched_change_group(struct task_struct *tsk)
+ {
+ 	struct task_group *tg;
+
+@@ -10143,7 +10142,7 @@ static void sched_change_group(struct task_struct *tsk, int type)
+
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	if (tsk->sched_class->task_change_group)
+-		tsk->sched_class->task_change_group(tsk, type);
++		tsk->sched_class->task_change_group(tsk);
+ 	else
+ #endif
+ 		set_task_rq(tsk, task_cpu(tsk));
+@@ -10174,7 +10173,7 @@ void sched_move_task(struct task_struct *tsk)
+ 	if (running)
+ 		put_prev_task(rq, tsk);
+
+-	sched_change_group(tsk, TASK_MOVE_GROUP);
++	sched_change_group(tsk);
+
+ 	if (queued)
+ 		enqueue_task(rq, tsk, queue_flags);
+@@ -10252,23 +10251,6 @@ static void cpu_cgroup_css_free(struct cgroup_subsys_state *css)
+ 	sched_unregister_group(tg);
+ }
+
+-/*
+- * This is called before wake_up_new_task(), therefore we really only
+- * have to set its group bits, all the other stuff does not apply.
+- */
+-static void cpu_cgroup_fork(struct task_struct *task)
+-{
+-	struct rq_flags rf;
+-	struct rq *rq;
+-
+-	rq = task_rq_lock(task, &rf);
+-
+-	update_rq_clock(rq);
+-	sched_change_group(task, TASK_SET_GROUP);
+-
+-	task_rq_unlock(rq, task, &rf);
+-}
+-
+ static int cpu_cgroup_can_attach(struct cgroup_taskset *tset)
+ {
+ 	struct task_struct *task;
+@@ -11134,7 +11116,6 @@ struct cgroup_subsys cpu_cgrp_subsys = {
+ 	.css_released	= cpu_cgroup_css_released,
+ 	.css_free	= cpu_cgroup_css_free,
+ 	.css_extra_stat_show = cpu_extra_stat_show,
+-	.fork		= cpu_cgroup_fork,
+ 	.can_attach	= cpu_cgroup_can_attach,
+ 	.attach		= cpu_cgroup_attach,
+ 	.legacy_cftypes	= cpu_legacy_files,
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index bf595b622656..8992ce5e73d2 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -11634,15 +11634,7 @@ void init_cfs_rq(struct cfs_rq *cfs_rq)
+ }
+
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+-static void task_set_group_fair(struct task_struct *p)
+-{
+-	struct sched_entity *se = &p->se;
+-
+-	set_task_rq(p, task_cpu(p));
+-	se->depth = se->parent ? se->parent->depth + 1 : 0;
+-}
+-
+-static void task_move_group_fair(struct task_struct *p)
++static void task_change_group_fair(struct task_struct *p)
+ {
+ 	detach_task_cfs_rq(p);
+ 	set_task_rq(p, task_cpu(p));
+@@ -11654,19 +11646,6 @@ static void task_move_group_fair(struct task_struct *p)
+ 	attach_task_cfs_rq(p);
+ }
+
+-static void task_change_group_fair(struct task_struct *p, int type)
+-{
+-	switch (type) {
+-	case TASK_SET_GROUP:
+-		task_set_group_fair(p);
+-		break;
+-
+-	case TASK_MOVE_GROUP:
+-		task_move_group_fair(p);
+-		break;
+-	}
+-}
+-
+ void free_fair_sched_group(struct task_group *tg)
+ {
+ 	int i;
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 8cc3eb7b86cd..19e0076e4245 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -2203,11 +2203,8 @@ struct sched_class {
+
+ 	void (*update_curr)(struct rq *rq);
+
+-#define TASK_SET_GROUP		0
+-#define TASK_MOVE_GROUP		1
+-
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+-	void (*task_change_group)(struct task_struct *p, int type);
++	void (*task_change_group)(struct task_struct *p);
+ #endif
+ };
+
+--
+2.36.1
+
 set_task_rq() -> set_task_rq_fair() will try to synchronize the blocked
 task's sched_avg when migrate, which is not needed for already detached
 task.
@@ -72,6 +386,173 @@ index 8992ce5e73d2..171bc22bc142 100644
 --
 2.36.1
 
+There are three types of attach_entity_cfs_rq():
+
+1. task migrate to CPU
+2. task move to cgroup
+3. task switched to fair from !fair
+
+The case1 and case2 already have sched_avg last_update_time
+reset to 0 when attach_entity_cfs_rq().
+
+We will make case3 also have last_update_time reset to 0 when
+attach_entity_cfs_rq() in the following patches.
+
+So it makes no difference whether SKIP_AGE_LOAD is set or not.
+
+Signed-off-by: Chengming Zhou <zhouchengming@xxxxxxxxxxxxx>
+---
+ kernel/sched/fair.c | 10 ++++------
+ 1 file changed, 4 insertions(+), 6 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 171bc22bc142..29811869c1fe 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -4001,9 +4001,8 @@ static void detach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *s
+  * Optional action to be done while updating the load average
+  */
+ #define UPDATE_TG	0x1
+-#define SKIP_AGE_LOAD	0x2
+-#define DO_ATTACH	0x4
+-#define DO_DETACH	0x8
++#define DO_ATTACH	0x2
++#define DO_DETACH	0x4
+
+ /* Update task and its cfs_rq load average */
+ static inline void update_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+@@ -4015,7 +4014,7 @@ static inline void update_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *s
+ 	 * Track task load average for carrying it to new CPU after migrated, and
+ 	 * track group sched_entity load average for task_h_load calc in migration
+ 	 */
+-	if (se->avg.last_update_time && !(flags & SKIP_AGE_LOAD))
++	if (se->avg.last_update_time)
+ 		__update_load_avg_se(now, cfs_rq, se);
+
+ 	decayed  = update_cfs_rq_load_avg(now, cfs_rq);
+@@ -4298,7 +4297,6 @@ static inline bool cfs_rq_is_decayed(struct cfs_rq *cfs_rq)
+ }
+
+ #define UPDATE_TG	0x0
+-#define SKIP_AGE_LOAD	0x0
+ #define DO_ATTACH	0x0
+ #define DO_DETACH	0x0
+
+@@ -11540,7 +11538,7 @@ static void attach_entity_cfs_rq(struct sched_entity *se)
+ 	struct cfs_rq *cfs_rq = cfs_rq_of(se);
+
+ 	/* Synchronize entity with its cfs_rq */
+-	update_load_avg(cfs_rq, se, sched_feat(ATTACH_AGE_LOAD) ? 0 : SKIP_AGE_LOAD);
++	update_load_avg(cfs_rq, se, 0);
+ 	attach_entity_load_avg(cfs_rq, se);
+ 	update_tg_load_avg(cfs_rq);
+ 	propagate_entity_cfs_rq(se);
+--
+2.36.1
+
+Since update_load_avg() support DO_ATTACH and DO_DETACH now, we can
+use update_load_avg() to implement attach/detach entity load_avg.
+
+Another advantage of using update_load_avg() is that it will check
+last_update_time before attach or detach, instead of unconditional
+attach/detach in the current code.
+
+This way can avoid some corner problematic cases of load tracking,
+like twice attach problem, detach unattached NEW task problem.
+
+1. switch to fair class (twice attach problem)
+
+p->sched_class = fair_class;  --> p.se->avg.last_update_time = 0
+if (queued)
+  enqueue_task(p);
+    ...
+      enqueue_entity()
+        update_load_avg(UPDATE_TG | DO_ATTACH)
+          if (!se->avg.last_update_time && (flags & DO_ATTACH))  --> true
+            attach_entity_load_avg()  --> attached, will set last_update_time
+check_class_changed()
+  switched_from() (!fair)
+  switched_to()   (fair)
+    switched_to_fair()
+      attach_entity_load_avg()  --> unconditional attach again!
+
+2. change cgroup of NEW task (detach unattached task problem)
+
+sched_move_group(p)
+  if (queued)
+    dequeue_task()
+  task_move_group_fair()
+    detach_task_cfs_rq()
+      detach_entity_load_avg()  --> detach unattached NEW task
+    set_task_rq()
+    attach_task_cfs_rq()
+      attach_entity_load_avg()
+  if (queued)
+    enqueue_task()
+
+These problems have been fixed in commit 7dc603c9028e
+("sched/fair: Fix PELT integrity for new tasks"), which also
+bring its own problems.
+
+First, it add a new task state TASK_NEW and an unnessary limitation
+that we would fail when change the cgroup of TASK_NEW tasks.
+
+Second, it attach entity load_avg in post_init_entity_util_avg(),
+in which we only set sched_avg last_update_time for !fair tasks,
+will cause PELT integrity problem when switched_to_fair().
+
+This patch make update_load_avg() the only location of attach/detach,
+and can handle these corner cases like change cgroup of NEW tasks,
+by checking last_update_time before attach/detach.
+
+Signed-off-by: Chengming Zhou <zhouchengming@xxxxxxxxxxxxx>
+---
+ kernel/sched/fair.c | 15 +++------------
+ 1 file changed, 3 insertions(+), 12 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 29811869c1fe..51fc20c161a3 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -4307,11 +4307,6 @@ static inline void update_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *s
+
+ static inline void remove_entity_load_avg(struct sched_entity *se) {}
+
+-static inline void
+-attach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) {}
+-static inline void
+-detach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) {}
+-
+ static inline int newidle_balance(struct rq *rq, struct rq_flags *rf)
+ {
+ 	return 0;
+@@ -11527,9 +11522,7 @@ static void detach_entity_cfs_rq(struct sched_entity *se)
+ 	struct cfs_rq *cfs_rq = cfs_rq_of(se);
+
+ 	/* Catch up with the cfs_rq and remove our load when we leave */
+-	update_load_avg(cfs_rq, se, 0);
+-	detach_entity_load_avg(cfs_rq, se);
+-	update_tg_load_avg(cfs_rq);
++	update_load_avg(cfs_rq, se, UPDATE_TG | DO_DETACH);
+ 	propagate_entity_cfs_rq(se);
+ }
+
+@@ -11537,10 +11530,8 @@ static void attach_entity_cfs_rq(struct sched_entity *se)
+ {
+ 	struct cfs_rq *cfs_rq = cfs_rq_of(se);
+
+-	/* Synchronize entity with its cfs_rq */
+-	update_load_avg(cfs_rq, se, 0);
+-	attach_entity_load_avg(cfs_rq, se);
+-	update_tg_load_avg(cfs_rq);
++	/* Synchronize entity with its cfs_rq and attach our load */
++	update_load_avg(cfs_rq, se, UPDATE_TG | DO_ATTACH);
+ 	propagate_entity_cfs_rq(se);
+ }
+
+--
+2.36.1
+
 New forked !fair task will set its sched_avg last_update_time to
 the pelt_clock of cfs_rq, after a while in switched_to_fair():
 
@@ -94,7 +575,7 @@ Signed-off-by: Chengming Zhou <zhouchengming@xxxxxxxxxxxxx>
  1 file changed, 2 insertions(+), 16 deletions(-)
 
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 171bc22bc142..153a2c6c1069 100644
+index 51fc20c161a3..50f65a2ede32 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -849,22 +849,8 @@ void post_init_entity_util_avg(struct task_struct *p)
@@ -147,10 +628,10 @@ Signed-off-by: Chengming Zhou <zhouchengming@xxxxxxxxxxxxx>
  1 file changed, 5 insertions(+)
 
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 153a2c6c1069..ca714eedeec5 100644
+index 50f65a2ede32..576028f5a09e 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
-@@ -11563,6 +11563,11 @@ static void attach_task_cfs_rq(struct task_struct *p)
+@@ -11552,6 +11552,11 @@ static void attach_task_cfs_rq(struct task_struct *p)
  static void switched_from_fair(struct rq *rq, struct task_struct *p)
  {
  	detach_task_cfs_rq(p);
@@ -165,6 +646,42 @@ index 153a2c6c1069..ca714eedeec5 100644
 --
 2.36.1
 
+set_task_rq() is used when move task across CPUs/groups to change
+its cfs_rq and parent entity, and it will call set_task_rq_fair()
+to sync blocked task load_avg just before change its cfs_rq.
+
+1. task migrate CPU: will detach/remove from prev cfs_rq and reset
+   its sched_avg last_update_time to 0, so don't need to sync again.
+
+2. task migrate cgroup: will detach from prev cfs_rq and reset its
+   sched_avg last_update_time to 0, so don't need to sync too.
+
+3. !fair task migrate CPU/cgroup: we stop load tracking for !fair task,
+   reset sched_avg last_update_time to 0 when switched_from_fair(), so
+   don't need it too.
+
+So set_task_rq_fair() is not needed anymore, this patch delete it.
+And delete unused ATTACH_AGE_LOAD feature together.
+
+Signed-off-by: Chengming Zhou <zhouchengming@xxxxxxxxxxxxx>
+---
+ kernel/sched/fair.c     | 31 -------------------------------
+ kernel/sched/features.h |  1 -
+ kernel/sched/sched.h    |  8 --------
+ 3 files changed, 40 deletions(-)
+
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index ee7f23c76bd3..fb92431d496f 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -85,7 +85,6 @@ SCHED_FEAT(RT_PUSH_IPI, true)
+
+ SCHED_FEAT(RT_RUNTIME_SHARE, false)
+ SCHED_FEAT(LB_MIN, false)
+-SCHED_FEAT(ATTACH_AGE_LOAD, true)
+
+ SCHED_FEAT(WA_IDLE, true)
+ SCHED_FEAT(WA_WEIGHT, true)
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
 index 19e0076e4245..a8ec7af4bd51 100644
 --- a/kernel/sched/sched.h
@@ -194,97 +711,6 @@ index 19e0076e4245..a8ec7af4bd51 100644
 --
 2.36.1
 
-All three attach_entity_cfs_rq() types:
-
-1. task migrate CPU
-2. task migrate cgroup
-3. task switched to fair
-
-have its sched_avg last_update_time reset to 0 when
-attach_entity_cfs_rq() -> update_load_avg(), so it makes
-no difference whether SKIP_AGE_LOAD is set or not.
-
-This patch delete the superfluous SKIP_AGE_LOAD, and the unused
-feature ATTACH_AGE_LOAD together.
-
-Signed-off-by: Chengming Zhou <zhouchengming@xxxxxxxxxxxxx>
----
- kernel/sched/fair.c     | 18 ++++++------------
- kernel/sched/features.h |  1 -
- 2 files changed, 6 insertions(+), 13 deletions(-)
-
-diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index b0bde895ba96..b91643a2143e 100644
---- a/kernel/sched/fair.c
-+++ b/kernel/sched/fair.c
-@@ -3956,9 +3956,8 @@ static void detach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *s
-  * Optional action to be done while updating the load average
-  */
- #define UPDATE_TG	0x1
--#define SKIP_AGE_LOAD	0x2
--#define DO_ATTACH	0x4
--#define DO_DETACH	0x8
-+#define DO_ATTACH	0x2
-+#define DO_DETACH	0x4
-
- /* Update task and its cfs_rq load average */
- static inline void update_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
-@@ -3970,7 +3969,7 @@ static inline void update_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *s
- 	 * Track task load average for carrying it to new CPU after migrated, and
- 	 * track group sched_entity load average for task_h_load calc in migration
- 	 */
--	if (se->avg.last_update_time && !(flags & SKIP_AGE_LOAD))
-+	if (se->avg.last_update_time)
- 		__update_load_avg_se(now, cfs_rq, se);
-
- 	decayed  = update_cfs_rq_load_avg(now, cfs_rq);
-@@ -4253,7 +4252,6 @@ static inline bool cfs_rq_is_decayed(struct cfs_rq *cfs_rq)
- }
-
- #define UPDATE_TG	0x0
--#define SKIP_AGE_LOAD	0x0
- #define DO_ATTACH	0x0
- #define DO_DETACH	0x0
-
-@@ -11484,9 +11482,7 @@ static void detach_entity_cfs_rq(struct sched_entity *se)
- 	struct cfs_rq *cfs_rq = cfs_rq_of(se);
-
- 	/* Catch up with the cfs_rq and remove our load when we leave */
--	update_load_avg(cfs_rq, se, 0);
--	detach_entity_load_avg(cfs_rq, se);
--	update_tg_load_avg(cfs_rq);
-+	update_load_avg(cfs_rq, se, UPDATE_TG | DO_DETACH);
- 	propagate_entity_cfs_rq(se);
- }
-
-@@ -11494,10 +11490,8 @@ static void attach_entity_cfs_rq(struct sched_entity *se)
- {
- 	struct cfs_rq *cfs_rq = cfs_rq_of(se);
-
--	/* Synchronize entity with its cfs_rq */
--	update_load_avg(cfs_rq, se, sched_feat(ATTACH_AGE_LOAD) ? 0 : SKIP_AGE_LOAD);
--	attach_entity_load_avg(cfs_rq, se);
--	update_tg_load_avg(cfs_rq);
-+	/* Synchronize entity with its cfs_rq and attach our load */
-+	update_load_avg(cfs_rq, se, UPDATE_TG | DO_ATTACH);
- 	propagate_entity_cfs_rq(se);
- }
-
-diff --git a/kernel/sched/features.h b/kernel/sched/features.h
-index ee7f23c76bd3..fb92431d496f 100644
---- a/kernel/sched/features.h
-+++ b/kernel/sched/features.h
-@@ -85,7 +85,6 @@ SCHED_FEAT(RT_PUSH_IPI, true)
-
- SCHED_FEAT(RT_RUNTIME_SHARE, false)
- SCHED_FEAT(LB_MIN, false)
--SCHED_FEAT(ATTACH_AGE_LOAD, true)
-
- SCHED_FEAT(WA_IDLE, true)
- SCHED_FEAT(WA_WEIGHT, true)
---
-2.36.1
-
 Signed-off-by: Libo Chen <libo.chen@xxxxxxxxxx>
 ---
  kernel/sched/fair.c | 4 +++-
@@ -307,3 +733,198 @@ index 794c2cb945f8..59b210d2cdb5 100644
  	int new_cpu = prev_cpu;
 --
 2.31.1
+
+Commit 95158a89dd50 ("sched,rt: Use the full cpumask for balancing")
+allow find_lock_lowest_rq to pick a task with migration disabled.
+This commit is intended to push the current running task on this CPU
+away.
+
+There is a race scenarios, which allows a migration disabled task to
+be migrated to another CPU.
+
+When there is a RT task with higher priority, rt sched class was
+intended to migrate higher priority task to lowest rq via push_rt_tasks,
+this BUG will happen here.
+
+With the system running on PREEMPT_RT, rt_spin_lock will disable
+migration, this will make the problem easier to reproduce.
+
+I have seen this crash on PREEMPT_RT, from the logs, there is a race
+when trying to migrate higher priority tasks to the lowest rq.
+
+Please refer to the following scenarios.
+
+           CPU0                                  CPU1
+------------------------------------------------------------------
+push_rt_task
+  check is_migration_disabled(next_task)
+                                        task not running and
+                                        migration_disabled == 0
+  find_lock_lowest_rq(next_task, rq);
+    _double_lock_balance(this_rq, busiest);
+      raw_spin_rq_unlock(this_rq);
+      double_rq_lock(this_rq, busiest);
+        <<wait for busiest rq>>
+                                            <wakeup>
+                                        task become running
+                                        migrate_disable();
+                                          <context out>
+  deactivate_task(rq, next_task, 0);
+  set_task_cpu(next_task, lowest_rq->cpu);
+    WARN_ON_ONCE(is_migration_disabled(p));
+      ---------OOPS-------------
+
+Crash logs as fellowing:
+[123671.996430] WARNING: CPU: 2 PID: 13470 at kernel/sched/core.c:2485
+set_task_cpu+0x8c/0x108
+[123671.996800] pstate: 20400009 (nzCv daif +PAN -UAO -TCO BTYPE=--)
+[123671.996811] pc : set_task_cpu+0x8c/0x108
+[123671.996820] lr : set_task_cpu+0x7c/0x108
+[123671.996828] sp : ffff80001268bd30
+[123671.996832] pmr_save: 00000060
+[123671.996835] x29: ffff80001268bd30 x28: ffff0001a3d68e80
+[123671.996844] x27: ffff80001225f4a8 x26: ffff800010ab62cb
+[123671.996854] x25: ffff80026d95e000 x24: 0000000000000005
+[123671.996864] x23: ffff00019746c1b0 x22: 0000000000000000
+[123671.996873] x21: ffff00027ee33a80 x20: 0000000000000000
+[123671.996882] x19: ffff00019746ba00 x18: 0000000000000000
+[123671.996890] x17: 0000000000000000 x16: 0000000000000000
+[123671.996899] x15: 000000000000000a x14: 000000000000349e
+[123671.996908] x13: ffff800012f4503d x12: 0000000000000001
+[123671.996916] x11: 0000000000000000 x10: 0000000000000000
+[123671.996925] x9 : 00000000000c0000 x8 : ffff00027ee58700
+[123671.996933] x7 : ffff00027ee8da80 x6 : ffff00027ee8e580
+[123671.996942] x5 : ffff00027ee8dcc0 x4 : 0000000000000005
+[123671.996951] x3 : ffff00027ee8e338 x2 : 0000000000000000
+[123671.996959] x1 : 00000000000000ff x0 : 0000000000000002
+[123671.996969] Call trace:
+[123671.996975]  set_task_cpu+0x8c/0x108
+[123671.996984]  push_rt_task.part.0+0x144/0x184
+[123671.996995]  push_rt_tasks+0x28/0x3c
+[123671.997002]  task_woken_rt+0x58/0x68
+[123671.997009]  ttwu_do_wakeup+0x5c/0xd0
+[123671.997019]  ttwu_do_activate+0xc0/0xd4
+[123671.997028]  try_to_wake_up+0x244/0x288
+[123671.997036]  wake_up_process+0x18/0x24
+[123671.997045]  __irq_wake_thread+0x64/0x80
+[123671.997056]  __handle_irq_event_percpu+0x110/0x124
+[123671.997064]  handle_irq_event_percpu+0x50/0xac
+[123671.997072]  handle_irq_event+0x84/0xfc
+
+To fix it, we need to check migration_disabled flag again to avoid
+bad migration.
+
+Fixes: 95158a89dd50 ("sched,rt: Use the full cpumask for balancing")
+
+Signed-off-by: Schspa Shi <schspa@xxxxxxxxx>
+
+--
+
+Changelog:
+v1 -> v2:
+        - Modify commit message to add fixed commit information.
+        - Going to retry to push the current running task on this CPU
+          away, instead doing nothing for this migrate disabled task.
+v2 -> v3:
+        - Change migration disabled check to the correct position
+v3 -> v4:
+        - Check migrate disabled in find_lock_lowest_rq to avoid not
+        necessary check when task rq is not released as Steven advised.
+v4 -> v5:
+        - Adjust the comment as Steve advised to make it clear.
+v5 -> v6:
+        - Adjust the comment again as Steve advised.
+---
+ kernel/sched/deadline.c | 1 +
+ kernel/sched/rt.c       | 4 ++++
+ 2 files changed, 5 insertions(+)
+
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index b5152961b7432..cb3b886a081c3 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -2238,6 +2238,7 @@ static struct rq *find_lock_later_rq(struct task_struct *task, struct rq *rq)
+ 				     !cpumask_test_cpu(later_rq->cpu, &task->cpus_mask) ||
+ 				     task_running(rq, task) ||
+ 				     !dl_task(task) ||
++				     is_migration_disabled(task) ||
+ 				     !task_on_rq_queued(task))) {
+ 				double_unlock_balance(rq, later_rq);
+ 				later_rq = NULL;
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 8c9ed96648409..7bd3e6ecbe45e 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -1998,11 +1998,15 @@ static struct rq *find_lock_lowest_rq(struct task_struct *task, struct rq *rq)
+ 			 * the mean time, task could have
+ 			 * migrated already or had its affinity changed.
+ 			 * Also make sure that it wasn't scheduled on its rq.
++			 * It is possible the task was scheduled, set
++			 * "migrate_disabled" and then got preempted, so we must
++			 * check the task migration disable flag here too.
+ 			 */
+ 			if (unlikely(task_rq(task) != rq ||
+ 				     !cpumask_test_cpu(lowest_rq->cpu, &task->cpus_mask) ||
+ 				     task_running(rq, task) ||
+ 				     !rt_task(task) ||
++				     is_migration_disabled(task) ||
+ 				     !task_on_rq_queued(task))) {
+
+ 				double_unlock_balance(rq, lowest_rq);
+--
+2.37.0
+
+When the task to push disable migration, retry to push the current
+running task on this CPU away, instead doing nothing for this migrate
+disabled task.
+
+Signed-off-by: Schspa Shi <schspa@xxxxxxxxx>
+---
+ kernel/sched/core.c | 13 ++++++++++++-
+ kernel/sched/rt.c   |  6 ++++++
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index da0bf6fe9ecdc..af90cc558b8ea 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2509,8 +2509,19 @@ int push_cpu_stop(void *arg)
+ 	if (p->sched_class->find_lock_rq)
+ 		lowest_rq = p->sched_class->find_lock_rq(p, rq);
+
+-	if (!lowest_rq)
++	if (!lowest_rq) {
++		/*
++		 * The find_lock_rq function above could have released the rq
++		 * lock and allow p to schedule and be preempted again, and
++		 * that lowest_rq could be NULL because p now has the
++		 * migrate_disable flag set and not because it could not find
++		 * the lowest rq. So we must check task migration flag again.
++		 */
++		if (unlikely(is_migration_disabled(p)))
++			p->migration_flags |= MDF_PUSH;
++
+ 		goto out_unlock;
++	}
+
+ 	// XXX validate p is still the highest prio task
+ 	if (task_rq(p) == rq) {
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 7bd3e6ecbe45e..e2d7b085a93d9 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -2136,6 +2136,12 @@ static int push_rt_task(struct rq *rq, bool pull)
+ 		 */
+ 		task = pick_next_pushable_task(rq);
+ 		if (task == next_task) {
++			/*
++			 * If next task has now disabled migrating, see if we
++			 * can push the current task.
++			 */
++			if (unlikely(is_migration_disabled(task)))
++				goto retry;
+ 			/*
+ 			 * The task hasn't migrated, and is still the next
+ 			 * eligible task, but we failed to find a run-queue
+--
+2.37.0
