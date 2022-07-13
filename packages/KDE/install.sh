@@ -97,6 +97,14 @@ dolphin-git \
 kate-git \
 konsole-git \
 gwenview \
+bluez-qt-git \
+kde-gtk-config-git \
+khotkeys-git \
+kinfocenter-git \
+ksystemstats-git \
+kwallet-pam-git \
+powerdevil-git \
+sddm-kcm-git \
 ; do
   cd $pkg
   rm -f *.zst
