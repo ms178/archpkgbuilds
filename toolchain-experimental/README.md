@@ -1,29 +1,23 @@
-# How does it work
+# Experimental Toolchain Section
 
-This set of scripts creates a 60% faster LLVM toolchain that can be customly
-trained to any project.
+While my other packages are also somewhat experimental, the toolchain in this directory is even a step up from this. This set of scripts which were made originally by JonasToth and ptr1337 create a 60% faster LLVM toolchain that can be trained to any project.
 
-The full_workflow.bash will autodetect, if your machine supports LBR or not and choose the correct script which suits to your hardware.
+The full_workflow.bash will autodetect if your CPU supports a special profiling instruction (LBR - Intel CPUs as of Haswell but not on even very recent AMD CPUs) and choose the correct script which suits to your hardware.
 
 ## LLVM
 
 ### How to build
 
-Be sure to have jemalloc installed, it is used to improve llvm-bolt's memory handling.
+Be sure to have jemalloc and perf installed.
 
-git clone https://github.com/ptr1337/llvm-bolt-scripts.git
+Download the scripts via the Code > Download option
+extract the archive into a directory
 cd llvm-bolt-scripts
 ./full_workflow.bash
 
-This sequence will give you (hopefully) a faster LLVM toolchain.
-Technologies used:
+Instead of the default above, I use the following line with additional optimizations which are overriden or extended in specific bash scripts: CC=clang CFLAGS="-O3 -march=native -fno-math-errno -fno-trapping-math -falign-functions=32 -fno-semantic-interposition -fcf-protection=none -mharden-sls=none -flto=thin" CXX=clang++ CXXFLAGS="-O3 -march=native -fno-math-errno -fno-trapping-math -falign-functions=32 -fno-semantic-interposition -fcf-protection=none -mharden-sls=none -flto=thin" LDFLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -flto=thin -fuse-ld=lld" ./full_workflow.bash
 
-- LLVM Link Time Optimization (LTO)
-- Binary Instrumentation and Profile-Guided-Optimization (PGO)
-- perf-measurement and branch-sampling/profiling and final binary reordering (BOLT)
-
-The goal of the techniques is to utilize the CPU black magic better and layout
-the code in a way, that allows faster execution.
+The goal of all of these techniques is to utilize the CPU better that allows faster code execution.
 
 Measure performance gains and evaluate if its worth the hazzle :)
 You can experiment with technologies, maybe `ThinLTO` is better then `FullLTO`,
@@ -33,39 +27,36 @@ and nothing else! The same goes for `BOLT`.
 
 ## GCC
 
-If you want to bolt gcc, you need to disable when building gcc the language `lto`, you can still use the gcc lto function but gcc itself wont build with lto. Enabling lto will crash llvm-bolt.
+If you want to bolt gcc, you need to disable the language `lto` in the GCC PKGBUILD, you can still use the gcc lto function but gcc itself wont build with lto. Enabling lto will crash llvm-bolt.
 
 Also you need to add following to your compileflags:
 
 ```
-CXXFLAGS+="-fno-reorder-blocks-and-partition"
 LDFLAGS+="--emit-relocs"
 ```
 
-The compileflas should be used for any binary you compile and want to optimize the binary with bolt.
-
 ### Bolting other binarys/\*.so files
 
-Ive included a script which makes it possible to bolt any binary or .so file which got compiled with --emit-relocs.
-ust change the binary name and the path to your suits and the STAGE number.
+There is an included script which makes it possible to bolt any binary or .so file which got compiled with --emit-relocs.
+You need to adjust it with the target binary name, its path and the STAGE number.
 
-After you did run stage 1 you need to run a workload with the instrumented binary/.so file.
+After you ran stage 1 you need to run a workload with the instrumented binary/.so file.
 
-When the workload is running, you will see that in the FDATA path many profiles are created. These will be in the STAGE2 process merged and then on your binary/.so file used and bolt will optimize it.
+When the workload is running, you will see that many profiles are created in the FDATA path. In STAGE2 these files will be merged and then used on your binary/.so file.
 
 #### Example:
 
-We will now take for example llvm:
+As an example we want to BOLT LLVM:
 
     - Compile it with relocations (LDFLAGS+="--emit-relocs") enabled
     - Install your package
     - Change the to BINARY=libLLVM.so and the BINARYPATH=/usr/lib to your suits to the target you want to optimize and set STAGE=1
     - Run the script
-    - After you did run it, it will backup your file and will move the instrumented target to the original path
-    - Run a workload with the target, so compile something with clang
-    - You will get several files into the FDATA path, when you run the workload !!! ATTENTION !!! the size of the data can get quite big, so take a watch at the folder
-    - After youre done with the workload change at the script to STAGE=1
-    - Run the script again and the created data from the instrumentiation will be merged and then used for llvm-bolt to optimize the target
-    - After that it will automatically move it tor your systembinary/libary, a backup and the bolted binary can be found at the binarypath.
-    - Thats it, now repeat the worklow for other targets you want top optimize.
-    - Tip: if you for example instrumented libLLVM the profile is also useable for other llvm based files which where active in the recording process
+    - After that it will backup your file and will move the instrumented target to the original path
+    - Run a workload with the target, in this case compile something with clang
+    - You will get several files into the FDATA path, when you run the workload !!! ATTENTION !!! the size of the data can get quite big, so be prepared to have enough disk capacity left
+    - After you are done with the workload edit the script to STAGE=1
+    - Execute the script again and the created data from the instrumentiation will be merged and used for llvm-bolt to optimize the target
+    - After that it will automatically move it tor your binary/libary location, a backup and the bolted binary can be found at the binary path.
+    - That's it, now repeat the worklow for other targets you want to optimize.
+    - Tip: if you for example instrumented libLLVM the profile is also useable for other llvm based files which where active in the profiling process
