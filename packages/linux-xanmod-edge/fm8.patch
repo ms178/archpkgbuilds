@@ -1495,96 +1495,6 @@ index 8dfa36a99c74..b3bff6d26dcc 100644
 --
 2.35.3
 
-As Chris explains, the comment above exit_itimers() is not correct,
-we can race with proc_timers_seq_ops. Change exit_itimers() to clear
-signal->posix_timers with ->siglock held.
-
-Cc: <stable@xxxxxxxxxxxxxxx>
-Reported-by: chris@xxxxxxxxxxxxxxxx
-Signed-off-by: Oleg Nesterov <oleg@xxxxxxxxxx>
----
- fs/exec.c                  |  2 +-
- include/linux/sched/task.h |  2 +-
- kernel/exit.c              |  2 +-
- kernel/time/posix-timers.c | 19 ++++++++++++++-----
- 4 files changed, 17 insertions(+), 8 deletions(-)
-
-diff --git a/fs/exec.c b/fs/exec.c
-index 0989fb8472a1..778123259e42 100644
---- a/fs/exec.c
-+++ b/fs/exec.c
-@@ -1301,7 +1301,7 @@ int begin_new_exec(struct linux_binprm * bprm)
- 	bprm->mm = NULL;
-
- #ifdef CONFIG_POSIX_TIMERS
--	exit_itimers(me->signal);
-+	exit_itimers(me);
- 	flush_itimer_signals();
- #endif
-
-diff --git a/include/linux/sched/task.h b/include/linux/sched/task.h
-index 505aaf9fe477..81cab4b01edc 100644
---- a/include/linux/sched/task.h
-+++ b/include/linux/sched/task.h
-@@ -85,7 +85,7 @@ static inline void exit_thread(struct task_struct *tsk)
- extern __noreturn void do_group_exit(int);
-
- extern void exit_files(struct task_struct *);
--extern void exit_itimers(struct signal_struct *);
-+extern void exit_itimers(struct task_struct *);
-
- extern pid_t kernel_clone(struct kernel_clone_args *kargs);
- struct task_struct *create_io_thread(int (*fn)(void *), void *arg, int node);
-diff --git a/kernel/exit.c b/kernel/exit.c
-index f072959fcab7..64c938ce36fe 100644
---- a/kernel/exit.c
-+++ b/kernel/exit.c
-@@ -766,7 +766,7 @@ void __noreturn do_exit(long code)
-
- #ifdef CONFIG_POSIX_TIMERS
- 		hrtimer_cancel(&tsk->signal->real_timer);
--		exit_itimers(tsk->signal);
-+		exit_itimers(tsk);
- #endif
- 		if (tsk->mm)
- 			setmax_mm_hiwater_rss(&tsk->signal->maxrss, tsk->mm);
-diff --git a/kernel/time/posix-timers.c b/kernel/time/posix-timers.c
-index 1cd10b102c51..5dead89308b7 100644
---- a/kernel/time/posix-timers.c
-+++ b/kernel/time/posix-timers.c
-@@ -1051,15 +1051,24 @@ static void itimer_delete(struct k_itimer *timer)
- }
-
- /*
-- * This is called by do_exit or de_thread, only when there are no more
-- * references to the shared signal_struct.
-+ * This is called by do_exit or de_thread, only when nobody else can
-+ * modify the signal->posix_timers list. Yet we need sighand->siglock
-+ * to prevent the race with /proc/pid/timers.
-  */
--void exit_itimers(struct signal_struct *sig)
-+void exit_itimers(struct task_struct *tsk)
- {
-+	struct list_head timers;
- 	struct k_itimer *tmr;
-
--	while (!list_empty(&sig->posix_timers)) {
--		tmr = list_entry(sig->posix_timers.next, struct k_itimer, list);
-+	if (list_empty(&tsk->signal->posix_timers))
-+		return;
-+
-+	spin_lock_irq(&tsk->sighand->siglock);
-+	list_replace_init(&tsk->signal->posix_timers, &timers);
-+	spin_unlock_irq(&tsk->sighand->siglock);
-+
-+	while (!list_empty(&timers)) {
-+		tmr = list_first_entry(&timers, struct k_itimer, list);
- 		itimer_delete(tmr);
- 	}
- }
---
-2.25.1.362.g51ebf55
-
 Use atomic_try_cmpxchg instead of atomic_cmpxchg (*ptr, old, new) == old
 in blkcg_unuse_delay, blkcg_set_delay and blkcg_clear_delay and
 atomic64_try_cmpxchg in blkcg_scale_delay.  x86 CMPXCHG instruction
@@ -2076,3 +1986,186 @@ index dbdf87bc0b78..cd57af9e5ff6 100644
  			}
 --
 2.25.1
+
+A\B\C is task.
+L1\L2 is lock.
+adj: means rt_mutex_adjust_prio_chain()
+
+key process:
+    1. A owns L1,and blocked on L2.
+    2. B blocked on L1,B execute mutex_lock or spinlock will adjust A's
+       priority by execute adj func.
+    3. before execute adj,it will unlock L1->wait_lock
+    4. If at this point,C release L2.A owns L2,and finish the whole thread
+       work very quickly,Finally the B thread exited.In this process,
+       unlock L1 will assign 0x1 to L1->owner,what orign value is A
+       task_struct.But in adj func,the parameter of task is still A's
+       pointer.becaues of A already exited,put_task_struct will release
+       task A.
+    5. If local page.lock is locked,it will cause a BUG_ON,becaues one
+       task A be blocked on two lock.
+
+    ====A================B===============C================
+        |                |               |->owns L2
+        |->owns L1       |               |
+        |->block on L2   |->lock L1.rawspin_wait_lock
+        |                |->block on L1  |
+        |                |               |->unlock L2
+        |                |->get A task_truct
+        |->owns L2       |->unlocked L1.rawspin_wait_lock
+        |->lock L1.rawspin_wait_lock
+        |->unlock L1     |               |
+        |                |               |
+        |->unlock L1.rawspin_wait_lock
+        |->release L2    |               |
+        |->A exit & not free
+        |                |->put A task_struct
+        |                |        ↓
+                                 [5]
+
+Signed-off-by: yuxin.ye <yeyuxin0925@xxxxxxxxx>
+---
+ kernel/locking/rtmutex.c | 8 --------
+ 1 file changed, 8 deletions(-)
+
+diff --git a/kernel/locking/rtmutex.c b/kernel/locking/rtmutex.c
+index 7779ee8ab..52e9cebc3 100644
+--- a/kernel/locking/rtmutex.c
++++ b/kernel/locking/rtmutex.c
+@@ -1175,13 +1175,9 @@ static int __sched task_blocks_on_rt_mutex(struct rt_mutex_base *lock,
+ 	 */
+ 	get_task_struct(owner);
+
+-	raw_spin_unlock_irq(&lock->wait_lock);
+-
+ 	res = rt_mutex_adjust_prio_chain(owner, chwalk, lock,
+ 					 next_lock, waiter, task);
+
+-	raw_spin_lock_irq(&lock->wait_lock);
+-
+ 	return res;
+ }
+
+@@ -1461,12 +1457,8 @@ static void __sched remove_waiter(struct rt_mutex_base *lock,
+ 	/* gets dropped in rt_mutex_adjust_prio_chain()! */
+ 	get_task_struct(owner);
+
+-	raw_spin_unlock_irq(&lock->wait_lock);
+-
+ 	rt_mutex_adjust_prio_chain(owner, RT_MUTEX_MIN_CHAINWALK, lock,
+ 				   next_lock, NULL, current);
+-
+-	raw_spin_lock_irq(&lock->wait_lock);
+ }
+
+ /**
+--
+2.17.1
+
+If the gfp flag used for the memory allocation already has __GFP_ZERO,
+then there is no need to explicitly clear the "struct devres_node". It is
+already zeroed.
+
+This saves a few cycles when using devm_zalloc() and co.
+
+In the case of devres_alloc() (which calls __devres_alloc_node()), the
+compiler could remove the test and the memset() because it should be able
+to see that the __GFP_ZERO flag is set.
+So this would make the code both faster and smaller.
+
+Signed-off-by: Christophe JAILLET <christophe.jaillet@xxxxxxxxxx>
+---
+ drivers/base/devres.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/base/devres.c b/drivers/base/devres.c
+index 864d0b3f566e..4ab2b50ee38f 100644
+--- a/drivers/base/devres.c
++++ b/drivers/base/devres.c
+@@ -117,7 +117,9 @@ static __always_inline struct devres * alloc_dr(dr_release_t release,
+ 	if (unlikely(!dr))
+ 		return NULL;
+
+-	memset(dr, 0, offsetof(struct devres, data));
++	/* No need to clear memory twice */
++	if (!(gfp & __GFP_ZERO))
++		memset(dr, 0, offsetof(struct devres, data));
+
+ 	INIT_LIST_HEAD(&dr->node.entry);
+ 	dr->node.release = release;
+--
+2.34.1
+
+This problem occurs when malloc element failed on the first time.
+At this time, the counter i is 0. When it's released, we subtract 1
+in advance without checking, which will cause i to become UINT_MAX,
+resulting in array overflow.
+
+Signed-off-by: John Sanpe <sanpeqf@xxxxxxxxx>
+---
+ lib/lru_cache.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/lru_cache.c b/lib/lru_cache.c
+index 52313acbfa62..04d95de92602 100644
+--- a/lib/lru_cache.c
++++ b/lib/lru_cache.c
+@@ -147,7 +147,7 @@ struct lru_cache *lc_create(const char *name, struct kmem_cache *cache,
+ 		return lc;
+
+ 	/* else: could not allocate all elements, give up */
+-	for (i--; i; i--) {
++	while (i--) {
+ 		void *p = element[i];
+ 		kmem_cache_free(cache, p - e_off);
+ 	}
+--
+2.36.1
+
+There are sleep in atomic context bugs in timer handlers of sctp
+such as sctp_generate_t3_rtx_event(), sctp_generate_probe_event(),
+sctp_generate_t1_init_event(), sctp_generate_timeout_event(),
+sctp_generate_t3_rtx_event() and so on.
+
+The root cause is sctp_sched_prio_init_sid() with GFP_KERNEL parameter
+that may sleep could be called by different timer handlers which is in
+interrupt context.
+
+One of the call paths that could trigger bug is shown below:
+
+      (interrupt context)
+sctp_generate_probe_event
+  sctp_do_sm
+    sctp_side_effects
+      sctp_cmd_interpreter
+        sctp_outq_teardown
+          sctp_outq_init
+            sctp_sched_set_sched
+              n->init_sid(..,GFP_KERNEL)
+                sctp_sched_prio_init_sid //may sleep
+
+This patch changes gfp_t parameter of init_sid in sctp_sched_set_sched()
+from GFP_KERNEL to GFP_ATOMIC in order to prevent sleep in atomic
+context bugs.
+
+Fixes: 5bbbbe32a431 ("sctp: introduce stream scheduler foundations")
+Signed-off-by: Duoming Zhou <duoming@xxxxxxxxxx>
+---
+ net/sctp/stream_sched.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/net/sctp/stream_sched.c b/net/sctp/stream_sched.c
+index 518b1b9bf89..1ad565ed562 100644
+--- a/net/sctp/stream_sched.c
++++ b/net/sctp/stream_sched.c
+@@ -160,7 +160,7 @@ int sctp_sched_set_sched(struct sctp_association *asoc,
+ 		if (!SCTP_SO(&asoc->stream, i)->ext)
+ 			continue;
+
+-		ret = n->init_sid(&asoc->stream, i, GFP_KERNEL);
++		ret = n->init_sid(&asoc->stream, i, GFP_ATOMIC);
+ 		if (ret)
+ 			goto err;
+ 	}
+--
+2.17.1
