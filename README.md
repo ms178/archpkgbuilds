@@ -3,7 +3,7 @@ This repository contains a couple of customized PKGBUILDs for Arch Linux. Some a
 
 ***WARNING: Be aware that the toolchain packages, the Kernel and my used compiler flags deliberatly favor performance over security. You might want to change some options/compiler flags for your machine.***
 
-For a more in-depth-look on optimizing your Arch Linux installation, take a look over at my Linux gaming tweaks series in my personal Blog.
+For a more in-depth-look on optimizing your Arch Linux installation, take a look over at my Linux gaming tweaks series in my personal Blog (https://seylaw.blogspot.com/search/label/Gaming).
 
 Both toolchain folders contain everything you need to build an optimized GCC and LLVM on Arch Linux. As I took the liberty to slim them down a bit (e.g. language support and some subprojects are missing, but the packages should work for most users only interested in C/C++), you can take them as a source of inspiration and edit the official PKGBUILDS with some of my alterations if you want to try out some ideas yourself. While I did some research on my changes and took some inspiration from Clear Linux and Allen McRae's alternative GCC toolchain for Arch (https://github.com/allanmcrae/toolchain), I know that they work for me and my purposes only, your mileage my vary. As I cut some corners regarding the checks, you should use either less aggressive compiler flags for both toolchains to play it safe or run the checks to verify that your toolchain works as expected. Be aware that a profiledbootstrap with GCC takes a lot of time (1 hour on my 18-Core Xeon), even more so when including the checks.
 
