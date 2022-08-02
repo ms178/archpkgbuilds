@@ -1,4 +1,5 @@
 #!/bin/sh
+# Maintainer: Marcus Seyfarth <marcus85@gmx.de>
 # You need to adjust the path in the first line to the folder where you placed all of these packages and make this script executable with "chmod +x". I haven't found a way to say "Yes" automatically to pacman, hence you need to install all of the following packages manually in the correct order at first and use this script for updates. Execute it with "./install.sh". Beware of the dangers, the build order is important and this is now tested to be the correct order. As my plasma-workspace-git depends on Kwinft-git, you need that package and its dependancies (wrapland-git, disman-git, kdisplay-git) in addition to be installed, too. You can integrate these packages above plasma-workspace-git in this script if you like.
 cd /home/marcus/Downloads/KDE
 for pkg in extra-cmake-modules-git \
