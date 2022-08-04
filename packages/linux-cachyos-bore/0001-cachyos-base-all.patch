@@ -60147,3 +60147,685 @@ index 28516881a1b2..ca72220eedd9 100644
  		}
 --
 2.27.0
+
+From: xu xin <xu.xin16@xxxxxxxxxx>
+
+Add a new running state auto-mode to ksm. This is to pave the way
+for subsequent real optimization features.
+
+Use it by: echo 8 > /sys/kernel/mm/ksm/run
+
+Signed-off-by: xu xin <xu.xin16@xxxxxxxxxx>
+Signed-off-by: CGEL <cgel.zte@xxxxxxxxx>
+---
+ mm/ksm.c | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 2f315c69fa2c..c80d908221a4 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -290,6 +290,7 @@ static int ksm_nr_node_ids = 1;
+ #define KSM_RUN_MERGE	1
+ #define KSM_RUN_UNMERGE	2
+ #define KSM_RUN_OFFLINE	4
++#define KSM_RUN_AUTO	8
+ static unsigned long ksm_run = KSM_RUN_STOP;
+ static void wait_while_offlining(void);
+
+@@ -2416,7 +2417,9 @@ static void ksm_do_scan(unsigned int scan_npages)
+
+ static int ksmd_should_run(void)
+ {
+-	return (ksm_run & KSM_RUN_MERGE) && !list_empty(&ksm_mm_head.mm_list);
++	if (!list_empty(&ksm_mm_head.mm_list))
++		return ksm_run & KSM_RUN_AUTO || ksm_run & KSM_RUN_MERGE;
++	return 0;
+ }
+
+ static int ksm_scan_thread(void *nothing)
+@@ -2916,7 +2919,7 @@ static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
+ 	err = kstrtouint(buf, 10, &flags);
+ 	if (err)
+ 		return -EINVAL;
+-	if (flags > KSM_RUN_UNMERGE)
++	if (flags > KSM_RUN_UNMERGE && flags != KSM_RUN_AUTO)
+ 		return -EINVAL;
+
+ 	/*
+@@ -2942,7 +2945,7 @@ static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
+ 	}
+ 	mutex_unlock(&ksm_thread_mutex);
+
+-	if (flags & KSM_RUN_MERGE)
++	if (flags & KSM_RUN_MERGE || flags & KSM_RUN_AUTO)
+ 		wake_up_interruptible(&ksm_thread_wait);
+
+ 	return count;
+--
+2.25.1
+
+From: xu xin <xu.xin16@xxxxxxxxxx>
+
+Implement the scan-enhanced algorithm of auto mode. In this algorithm,
+after every time of scanning, if new ksm pages are obtained, it will
+double pages_to_scan for the next scanning until the general
+multiplying factor is not less than max_scanning_factor. If no new ksm
+pages are obtained, then reset pages_to_scan to the default value.
+
+We add the sysfs klob of max_scanning_factor to limit scanning factor's
+excessive growth.
+
+Signed-off-by: CGEL <cgel.zte@xxxxxxxxx>
+Signed-off-by: xu xin <xu.xin16@xxxxxxxxxx>
+---
+ mm/ksm.c | 88 ++++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 86 insertions(+), 2 deletions(-)
+
+diff --git a/mm/ksm.c b/mm/ksm.c
+index c80d908221a4..8acc893e4d61 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -131,6 +131,8 @@ struct mm_slot {
+  * @address: the next address inside that to be scanned
+  * @rmap_list: link to the next rmap to be scanned in the rmap_list
+  * @seqnr: count of completed full scans (needed when removing unstable node)
++ * @new_ksmpages_of_this_scanning: count of the new merged KSM pages in the
++ *		current scanning of mm_lists (cleared after ksm_do_scan() ends)
+  *
+  * There is only the one ksm_scan instance of this cursor structure.
+  */
+@@ -139,6 +141,7 @@ struct ksm_scan {
+ 	unsigned long address;
+ 	struct rmap_item **rmap_list;
+ 	unsigned long seqnr;
++	unsigned long new_ksmpages_of_this_scanning;
+ };
+
+ /**
+@@ -277,6 +280,20 @@ static unsigned int zero_checksum __read_mostly;
+ /* Whether to merge empty (zeroed) pages with actual zero pages */
+ static bool ksm_use_zero_pages __read_mostly;
+
++/*
++ * Work in auto-mode.
++ * Maximum number of multiplicative factor of pages_to_scan.
++ */
++static unsigned int ksm_max_scanning_factor = 32;
++
++/*
++ * Work in auto-mode.
++ * The multiplicative factor of pages_to_scan.
++ * Real pages to scan equals to the product of scanning_factor
++ * and pages_to_scan
++ */
++static unsigned int scanning_factor = 1;
++
+ #ifdef CONFIG_NUMA
+ /* Zeroed when merging across nodes is not allowed */
+ static unsigned int ksm_merge_across_nodes = 1;
+@@ -2031,6 +2048,8 @@ static void stable_tree_append(struct rmap_item *rmap_item,
+ 	rmap_item->address |= STABLE_FLAG;
+ 	hlist_add_head(&rmap_item->hlist, &stable_node->hlist);
+
++	ksm_scan.new_ksmpages_of_this_scanning++;
++
+ 	if (rmap_item->hlist.next)
+ 		ksm_pages_sharing++;
+ 	else
+@@ -2396,6 +2415,23 @@ static struct rmap_item *scan_get_next_rmap_item(struct page **page)
+ 	return NULL;
+ }
+
++/*
++ * enhance_scanning_factor():
++ * double the values of scanning_factor, but not more than
++ * ksm_max_scanning_factor.
++ */
++static inline void enhance_scanning_factor(void)
++{
++	scanning_factor = scanning_factor << 1;
++	if (scanning_factor > ksm_max_scanning_factor)
++		scanning_factor = ksm_max_scanning_factor;
++}
++
++static inline void reset_scanning_factor(void)
++{
++	scanning_factor = 1;
++}
++
+ /**
+  * ksm_do_scan  - the ksm scanner main worker function.
+  * @scan_npages:  number of pages we want to scan before we return.
+@@ -2432,10 +2468,31 @@ static int ksm_scan_thread(void *nothing)
+ 	while (!kthread_should_stop()) {
+ 		mutex_lock(&ksm_thread_mutex);
+ 		wait_while_offlining();
+-		if (ksmd_should_run())
+-			ksm_do_scan(ksm_thread_pages_to_scan);
++		if (ksmd_should_run()) {
++			if (ksm_run & KSM_RUN_AUTO)
++				ksm_do_scan(ksm_thread_pages_to_scan * scanning_factor);
++			else
++				ksm_do_scan(ksm_thread_pages_to_scan);
++		}
+ 		mutex_unlock(&ksm_thread_mutex);
+
++		/*
++		 * If there are new ksm pages after scanning, then we
++		 * can enhance scanning_factor to improve ksm_thread's
++		 * pages_to_scan to speed up scanning. Otherwaise, we
++		 * reset scanning_factor to be one, so that to recover
++		 * the normal state because there is greater probability
++		 * of getting no new KsmPages in the next scanning.
++		 */
++		if (ksm_run & KSM_RUN_AUTO) {
++			if (ksm_scan.new_ksmpages_of_this_scanning > 0)
++				enhance_scanning_factor();
++			else
++				reset_scanning_factor();
++
++			ksm_scan.new_ksmpages_of_this_scanning = 0;
++		}
++
+ 		try_to_freeze();
+
+ 		if (ksmd_should_run()) {
+@@ -2952,6 +3009,32 @@ static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
+ }
+ KSM_ATTR(run);
+
++static ssize_t max_scanning_factor_show(struct kobject *kobj,
++						struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", ksm_max_scanning_factor);
++}
++
++static ssize_t max_scanning_factor_store(struct kobject *kobj,
++								struct kobj_attribute *attr,
++								const char *buf, size_t count)
++{
++		unsigned int value;
++		int err;
++
++		err = kstrtouint(buf, 10, &value);
++		if (err)
++			return -EINVAL;
++
++		if (value < 1)
++			return -EINVAL;
++
++		ksm_max_scanning_factor = value;
++
++		return count;
++}
++KSM_ATTR(max_scanning_factor);
++
+ #ifdef CONFIG_NUMA
+ static ssize_t merge_across_nodes_show(struct kobject *kobj,
+ 				       struct kobj_attribute *attr, char *buf)
+@@ -3162,6 +3245,7 @@ static struct attribute *ksm_attrs[] = {
+ 	&sleep_millisecs_attr.attr,
+ 	&pages_to_scan_attr.attr,
+ 	&run_attr.attr,
++	&max_scanning_factor_attr.attr,
+ 	&pages_shared_attr.attr,
+ 	&pages_sharing_attr.attr,
+ 	&pages_unshared_attr.attr,
+--
+2.25.1
+
+From: xu xin <xu.xin16@xxxxxxxxxx>
+
+When memory is sufficient, merging pages to save memory is not very
+much needed, and it also inceases delays of COW for user application.
+
+So set a memory threshold, when free memory is lower than the threshold,
+ksmd will be triggered to compare and merge pages. And to avoid ping-pong
+effect due to the threshold, ksmd needs to try to merge pages until free
+memory is larger than (threshold + total_memory * 1/16).
+
+Before free memory is lower than the threshold, ksmd will still scan pages
+at a very low speed, to calculate their checksum but not to compare and
+merge pages.
+
+        |
+        |       ----(Threshold + total_memory/16)--------
+        |                              |
+------Threshold------                 |
+        |                              |
+        |_____ksmd try to merge pages__|
+
+We also add a new sysfs klob auto_threshold_percent for user to be able
+to tune.
+
+Signed-off-by: xu xin <xu.xin16@xxxxxxxxxx>
+Signed-off-by: CGEL <cgel.zte@xxxxxxxxx>
+---
+ mm/ksm.c | 95 ++++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 92 insertions(+), 3 deletions(-)
+
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 8acc893e4d61..78819b56efec 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -294,6 +294,17 @@ static unsigned int ksm_max_scanning_factor = 32;
+  */
+ static unsigned int scanning_factor = 1;
+
++/*
++ * Work in auto-mode.
++ * Default ksm_auto_threshold_percent: 20, means 20%. When free memory
++ * is lower than total memory * ksm_auto_threshold_percent/100, ksmd will
++ * be triggered to compare and merge pages.
++ */
++unsigned int ksm_auto_threshold_percent = 20;
++
++/* Work in auto-mode. Whether trigger ksmd to compare and merge pages */
++static bool auto_triggered;
++
+ #ifdef CONFIG_NUMA
+ /* Zeroed when merging across nodes is not allowed */
+ static unsigned int ksm_merge_across_nodes = 1;
+@@ -2446,11 +2457,46 @@ static void ksm_do_scan(unsigned int scan_npages)
+ 		rmap_item = scan_get_next_rmap_item(&page);
+ 		if (!rmap_item)
+ 			return;
+-		cmp_and_merge_page(page, rmap_item);
++		if (ksm_run & KSM_RUN_AUTO  && !auto_triggered) {
++			/*
++			 * This should happens only when ksm_run is KSM_RUN_AUTO
++			 * and free memory threshold still not reached.
++			 * The reason to calculate it's checksum is to reduce the
++			 * waiting time the rmap_item is added to unstable tree.
++			 */
++			rmap_item->oldchecksum = calc_checksum(page);
++		} else
++			cmp_and_merge_page(page, rmap_item);
++
+ 		put_page(page);
+ 	}
+ }
+
++/* Work in auto mode, should reset auto_triggered ? */
++static bool should_untrigger_ksmd_to_merge(void)
++{
++	unsigned long total_ram_pages, free_pages;
++
++	total_ram_pages = totalram_pages();
++	free_pages = global_zone_page_state(NR_FREE_PAGES);
++
++	return free_pages > (total_ram_pages *
++						ksm_auto_threshold_percent / 100) +
++						(total_ram_pages >> 4);
++}
++
++/* Work in auto mode, should ksmd start to merge ? */
++static bool should_trigger_ksmd_to_merge(void)
++{
++	unsigned long total_ram_pages, free_pages;
++
++	total_ram_pages = totalram_pages();
++	free_pages = global_zone_page_state(NR_FREE_PAGES);
++
++	return free_pages < (total_ram_pages *
++						ksm_auto_threshold_percent / 100);
++}
++
+ static int ksmd_should_run(void)
+ {
+ 	if (!list_empty(&ksm_mm_head.mm_list))
+@@ -2469,8 +2515,18 @@ static int ksm_scan_thread(void *nothing)
+ 		mutex_lock(&ksm_thread_mutex);
+ 		wait_while_offlining();
+ 		if (ksmd_should_run()) {
+-			if (ksm_run & KSM_RUN_AUTO)
+-				ksm_do_scan(ksm_thread_pages_to_scan * scanning_factor);
++			if (ksm_run & KSM_RUN_AUTO) {
++				/*
++				 * If free memory is not lower than threshold, we only scan
++				 * 5 pages and just calculate pages' checksum and not compare
++				 * and merge them. Otherwise, do real scanning and merging as
++				 * scanning-enhanced algorithm.
++				 */
++				if (!auto_triggered)
++					ksm_do_scan(5);
++				else
++					ksm_do_scan(ksm_thread_pages_to_scan * scanning_factor);
++			}
+ 			else
+ 				ksm_do_scan(ksm_thread_pages_to_scan);
+ 		}
+@@ -2491,6 +2547,11 @@ static int ksm_scan_thread(void *nothing)
+ 				reset_scanning_factor();
+
+ 			ksm_scan.new_ksmpages_of_this_scanning = 0;
++
++			if (should_trigger_ksmd_to_merge())
++				auto_triggered = true;
++			else if (should_untrigger_ksmd_to_merge())
++				auto_triggered = false;
+ 		}
+
+ 		try_to_freeze();
+@@ -3035,6 +3096,32 @@ static ssize_t max_scanning_factor_store(struct kobject *kobj,
+ }
+ KSM_ATTR(max_scanning_factor);
+
++static ssize_t auto_threshold_percent_show(struct kobject *kobj,
++						struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", ksm_auto_threshold_percent);
++}
++
++static ssize_t auto_threshold_percent_store(struct kobject *kobj,
++								struct kobj_attribute *attr,
++								const char *buf, size_t count)
++{
++	unsigned int value;
++	int err;
++
++	err = kstrtouint(buf, 10, &value);
++	if (err)
++		return -EINVAL;
++
++	if (value > 100)
++		return -EINVAL;
++
++	ksm_auto_threshold_percent = value;
++
++	return count;
++}
++KSM_ATTR(auto_threshold_percent);
++
+ #ifdef CONFIG_NUMA
+ static ssize_t merge_across_nodes_show(struct kobject *kobj,
+ 				       struct kobj_attribute *attr, char *buf)
+@@ -3246,6 +3333,7 @@ static struct attribute *ksm_attrs[] = {
+ 	&pages_to_scan_attr.attr,
+ 	&run_attr.attr,
+ 	&max_scanning_factor_attr.attr,
++	&auto_threshold_percent_attr.attr,
+ 	&pages_shared_attr.attr,
+ 	&pages_sharing_attr.attr,
+ 	&pages_unshared_attr.attr,
+@@ -3277,6 +3365,7 @@ static int __init ksm_init(void)
+ 	zero_checksum = calc_checksum(ZERO_PAGE(0));
+ 	/* Default to false for backwards compatibility */
+ 	ksm_use_zero_pages = false;
++	auto_triggered = false;
+
+ 	err = ksm_slab_init();
+ 	if (err)
+--
+2.25.1
+
+From: xu xin <xu.xin16@xxxxxxxxxx>
+
+Add a sysfs interface of ksmd_status to show some details related
+with auto-mode.
+
+Signed-off-by: xu xin <xu.xin16@xxxxxxxxxx>
+Signed-off-by: CGEL <cgel.zte@xxxxxxxxx>
+---
+ mm/ksm.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 78819b56efec..6417bc034a3d 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -3070,6 +3070,29 @@ static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
+ }
+ KSM_ATTR(run);
+
++static ssize_t ksmd_status_show(struct kobject *kobj,
++				struct kobj_attribute *attr, char *buf)
++{
++	int len = 0;
++
++	if (ksm_run & KSM_RUN_AUTO) {
++		len += sysfs_emit_at(buf, len, "mode: auto\n");
++		len += sysfs_emit_at(buf, len, "auto_triggered %d\n",
++							auto_triggered);
++		len += sysfs_emit_at(buf, len, "scanning_factor: %u\n",
++							scanning_factor);
++	} else if (ksm_run & KSM_RUN_MERGE)
++		len += sysfs_emit_at(buf, len, "mode: on\n");
++	else if (ksm_run & KSM_RUN_UNMERGE)
++		len += sysfs_emit_at(buf, len, "mode: unmerge\n");
++	else
++		len += sysfs_emit_at(buf, len, "mode: off\n");
++
++
++	return len;
++}
++KSM_ATTR_RO(ksmd_status);
++
+ static ssize_t max_scanning_factor_show(struct kobject *kobj,
+ 						struct kobj_attribute *attr, char *buf)
+ {
+@@ -3332,6 +3355,7 @@ static struct attribute *ksm_attrs[] = {
+ 	&sleep_millisecs_attr.attr,
+ 	&pages_to_scan_attr.attr,
+ 	&run_attr.attr,
++	&ksmd_status_attr.attr,
+ 	&max_scanning_factor_attr.attr,
+ 	&auto_threshold_percent_attr.attr,
+ 	&pages_shared_attr.attr,
+--
+2.25.1
+
+From: Yu Kuai <yukuai3@xxxxxxxxxx>
+
+There are two problems can lead to lost wakeup:
+
+1) invalid wakeup on the wrong waitqueue:
+
+For example, 2 * wake_batch tags are put, while only wake_batch threads
+are woken:
+
+__sbq_wake_up
+ atomic_cmpxchg -> reset wait_cnt
+			__sbq_wake_up -> decrease wait_cnt
+			...
+			__sbq_wake_up -> wait_cnt is decreased to 0 again
+			 atomic_cmpxchg
+			 sbq_index_atomic_inc -> increase wake_index
+			 wake_up_nr -> wake up and waitqueue might be empty
+ sbq_index_atomic_inc -> increase again, one waitqueue is skipped
+ wake_up_nr -> invalid wake up because old wakequeue might be empty
+
+To fix the problem, increasing 'wake_index' before resetting 'wait_cnt'.
+
+2) 'wait_cnt' can be decreased while waitqueue is empty
+
+As pointed out by Jan Kara, following race is possible:
+
+CPU1				CPU2
+__sbq_wake_up			 __sbq_wake_up
+ sbq_wake_ptr()			 sbq_wake_ptr() -> the same
+ wait_cnt = atomic_dec_return()
+ /* decreased to 0 */
+ sbq_index_atomic_inc()
+ /* move to next waitqueue */
+ atomic_set()
+ /* reset wait_cnt */
+ wake_up_nr()
+ /* wake up on the old waitqueue */
+				 wait_cnt = atomic_dec_return()
+				 /*
+				  * decrease wait_cnt in the old
+				  * waitqueue, while it can be
+				  * empty.
+				  */
+
+Fix the problem by waking up before updating 'wake_index' and
+'wait_cnt'.
+
+With this patch, noted that 'wait_cnt' is still decreased in the old
+empty waitqueue, however, the wakeup is redirected to a active waitqueue,
+and the extra decrement on the old empty waitqueue is not handled.
+
+Fixes: 88459642cba4 ("blk-mq: abstract tag allocation out into sbitmap library")
+Signed-off-by: Yu Kuai <yukuai3@xxxxxxxxxx>
+Reviewed-by: Jan Kara <jack@xxxxxxx>
+---
+Changes in official version:
+- fix spelling mistake in comments
+- add review tag
+Changes in rfc v4:
+ - remove patch 1, which improve fairness with overhead
+ - merge patch2 and patch 3
+Changes in rfc v3:
+ - rename patch 2, and add some comments.
+ - add patch 3, which fixes a new issue pointed out by Jan Kara.
+Changes in rfc v2:
+ - split to spearate patches for different problem.
+ - add fix tag
+
+ previous versions:
+rfc v1: https://lore.kernel.org/all/20220617141125.3024491-1-yukuai3@xxxxxxxxxx/
+rfc v2: https://lore.kernel.org/all/20220619080309.1630027-1-yukuai3@xxxxxxxxxx/
+rfc v3: https://lore.kernel.org/all/20220710042200.20936-1-yukuai1@xxxxxxxxxxxxxxx/
+rfc v4: https://lore.kernel.org/all/20220723024122.2990436-1-yukuai1@xxxxxxxxxxxxxxx/
+ lib/sbitmap.c | 55 ++++++++++++++++++++++++++++++---------------------
+ 1 file changed, 33 insertions(+), 22 deletions(-)
+
+diff --git a/lib/sbitmap.c b/lib/sbitmap.c
+index 29eb0484215a..1aa55806f6a5 100644
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@ -611,32 +611,43 @@ static bool __sbq_wake_up(struct sbitmap_queue *sbq)
+ 		return false;
+
+ 	wait_cnt = atomic_dec_return(&ws->wait_cnt);
+-	if (wait_cnt <= 0) {
+-		int ret;
++	/*
++	 * For concurrent callers of this, callers should call this function
++	 * again to wakeup a new batch on a different 'ws'.
++	 */
++	if (wait_cnt < 0 || !waitqueue_active(&ws->wait))
++		return true;
+
+-		wake_batch = READ_ONCE(sbq->wake_batch);
++	if (wait_cnt > 0)
++		return false;
+
+-		/*
+-		 * Pairs with the memory barrier in sbitmap_queue_resize() to
+-		 * ensure that we see the batch size update before the wait
+-		 * count is reset.
+-		 */
+-		smp_mb__before_atomic();
++	wake_batch = READ_ONCE(sbq->wake_batch);
+
+-		/*
+-		 * For concurrent callers of this, the one that failed the
+-		 * atomic_cmpxhcg() race should call this function again
+-		 * to wakeup a new batch on a different 'ws'.
+-		 */
+-		ret = atomic_cmpxchg(&ws->wait_cnt, wait_cnt, wake_batch);
+-		if (ret == wait_cnt) {
+-			sbq_index_atomic_inc(&sbq->wake_index);
+-			wake_up_nr(&ws->wait, wake_batch);
+-			return false;
+-		}
++	/*
++	 * Wake up first in case that concurrent callers decrease wait_cnt
++	 * while waitqueue is empty.
++	 */
++	wake_up_nr(&ws->wait, wake_batch);
+
+-		return true;
+-	}
++	/*
++	 * Pairs with the memory barrier in sbitmap_queue_resize() to
++	 * ensure that we see the batch size update before the wait
++	 * count is reset.
++	 *
++	 * Also pairs with the implicit barrier between decrementing wait_cnt
++	 * and checking for waitqueue_active() to make sure waitqueue_active()
++	 * sees result of the wakeup if atomic_dec_return() has seen the result
++	 * of atomic_set().
++	 */
++	smp_mb__before_atomic();
++
++	/*
++	 * Increase wake_index before updating wait_cnt, otherwise concurrent
++	 * callers can see valid wait_cnt in old waitqueue, which can cause
++	 * invalid wakeup on the old waitqueue.
++	 */
++	sbq_index_atomic_inc(&sbq->wake_index);
++	atomic_set(&ws->wait_cnt, wake_batch);
+
+ 	return false;
+ }
+--
+2.31.1
+
+It seems unnecessary to search pages with order < alloc_order in
+fallback allocation.
+
+Signed-off-by: Abel Wu <wuyun.abel@xxxxxxxxxxxxx>
+---
+ mm/page_alloc.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index e008a3df0485..0abafc2fc3e0 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -2934,7 +2934,7 @@ __rmqueue_fallback(struct zone *zone, int order, int start_migratetype,
+ 	 * i.e. orders < pageblock_order. If there are no local zones free,
+ 	 * the zonelists will be reiterated without ALLOC_NOFRAGMENT.
+ 	 */
+-	if (alloc_flags & ALLOC_NOFRAGMENT)
++	if (order < pageblock_order && alloc_flags & ALLOC_NOFRAGMENT)
+ 		min_order = pageblock_order;
+
+ 	/*
+--
+2.31.1
+
+These bits should only be valid when the ptes are present.  Introducing two
+booleans for it and set it to false when !pte_present().
+
+Cc: Konstantin Khlebnikov <khlebnikov@xxxxxxxxxx>
+Fixes: b1d4d9e0cbd0 ("proc/smaps: carefully handle migration entries", 2012-05-31)
+Signed-off-by: Peter Xu <peterx@xxxxxxxxxx>
+---
+ fs/proc/task_mmu.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index 9913f3be9fd2..482f91577f8c 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -527,10 +527,12 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
+ 	struct vm_area_struct *vma = walk->vma;
+ 	bool locked = !!(vma->vm_flags & VM_LOCKED);
+ 	struct page *page = NULL;
+-	bool migration = false;
++	bool migration = false, young = false, dirty = false;
+
+ 	if (pte_present(*pte)) {
+ 		page = vm_normal_page(vma, addr, *pte);
++		young = pte_young(*pte);
++		dirty = pte_dirty(*pte);
+ 	} else if (is_swap_pte(*pte)) {
+ 		swp_entry_t swpent = pte_to_swp_entry(*pte);
+
+@@ -560,8 +562,7 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
+ 	if (!page)
+ 		return;
+
+-	smaps_account(mss, page, false, pte_young(*pte), pte_dirty(*pte),
+-		      locked, migration);
++	smaps_account(mss, page, false, young, dirty, locked, migration);
+ }
+
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+--
+2.32.0
