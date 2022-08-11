@@ -20,31 +20,30 @@ The Linux Kernel builds carry some additional patches on top, mostly from the Li
 I've used the following compiler flags in my /etc/makepkg.conf,
 
 for GCC, linux-api-headers and the Linux Kernel:
-<CODE>
+``
 CFLAGS="-O3 -march=native -fno-semantic-interposition -falign-functions=32 -fipa-pta -flive-range-shrinkage -fno-math-errno -fno-trapping-math -mtls-dialect=gnu2 -feliminate-unused-debug-types -floop-nest-optimize -fgraphite-identity -fcf-protection=none -fdevirtualize-at-ltrans -mharden-sls=none"
 CXXFLAGS="$CFLAGS"
 LDFLAGS="-Wl,-O3,--as-needed,-Bsymbolic-functions"
 ASFLAGS="-D__AVX__=1 -D__AVX2__=1 -D__FMA__=1"
-</CODE>
+``
 
 for Binutils:
-<CODE>
+``
 CFLAGS="-O3 -march=native -fno-semantic-interposition -falign-functions=32 -fipa-pta -flive-range-shrinkage -fno-math-errno -fno-trapping-math -mtls-dialect=gnu2 -feliminate-unused-debug-types -floop-nest-optimize -fgraphite-identity -fcf-protection=none -pipe -flto=auto -floop-parallelize-all -ftree-parallelize-loops=18 -fdevirtualize-at-ltrans -mharden-sls=none"
 CXXFLAGS="$CFLAGS"
 LDFLAGS="-Wl,-O3,--as-needed,-Bsymbolic-functions,-flto=auto -fopenmp"
 ASFLAGS="-D__AVX__=1 -D__AVX2__=1 -D__FMA__=1"
-</CODE>
+``
 
 for Glibc:
-<CODE>
+``
 CFLAGS="-O3 -march=native -falign-functions=32 -fipa-pta -flive-range-shrinkage -fno-math-errno -fno-trapping-math -mtls-dialect=gnu2 -feliminate-unused-debug-types -floop-nest-optimize -fgraphite-identity -fcf-protection=none -fdevirtualize-at-ltrans -mharden-sls=none"
 CXXFLAGS="$CFLAGS"
 LDFLAGS="-Wl,-O3,--as-needed"
-ASFLAGS="-D__AVX__=1 -D__AVX2__=1 -D__FMA__=1"
-</CODE>
+``
 
 for LLVM (use a minimal CFLAGS/CXXFLAGS, e.g. -O2 -march=native, for the first run and for the second build, use the following flags as Polly becomes usable directly):
-<CODE>
+``
 export CC=clang
 export CXX=clang++
 export CC_LD=lld
@@ -59,8 +58,8 @@ export RANLIB=llvm-ranlib
 export HOSTCC=clang
 export HOSTCXX=clang++
 export HOSTAR=llvm-ar
-export CFLAGS="-O3 -march=native -mllvm -polly -mllvm -polly-position=early -mllvm -polly-parallel=true -fopenmp -fopenmp-version=50 -mllvm -polly-dependences-computeout=0 -mllvm -polly-detect-profitability-min-per-loop-insts=40 -mllvm -polly-tiling=true -mllvm -polly-prevect-width=256 -mllvm -polly-vectorizer=stripmine -mllvm -polly-omp-backend=LLVM -mllvm -polly-num-threads=36 -mllvm -polly-scheduling=dynamic -mllvm -polly-scheduling-chunksize=1 -mllvm -polly-ast-use-context -mllvm -polly-invariant-load-hoisting -mllvm -polly-loopfusion-greedy -mllvm -polly-run-inliner -mllvm -polly-run-dce -mllvm -polly-enable-delicm=true -mllvm -extra-vectorizer-passes -mllvm -enable-cond-stores-vec -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -interleave-small-loop-scalar-reduction -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -fno-math-errno -fno-trapping-math -falign-functions=32 -fno-semantic-interposition -fcf-protection=none -mharden-sls=none -fomit-frame-pointer -flto=thin"
+export CFLAGS="-O3 -march=native -mllvm -extra-vectorizer-passes -mllvm -enable-cond-stores-vec -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -interleave-small-loop-scalar-reduction -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -fno-math-errno -fno-trapping-math -falign-functions=32 -fno-semantic-interposition -fcf-protection=none -mharden-sls=none -fomit-frame-pointer -flto"
 export CXXFLAGS="${CFLAGS}"
-export LDFLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -mllvm -extra-vectorizer-passes -mllvm -enable-cond-stores-vec -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -interleave-small-loop-scalar-reduction -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -flto=thin -fuse-ld=lld"
+export LDFLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -Wl,-mllvm,-march=native -mllvm -extra-vectorizer-passes -mllvm -enable-cond-stores-vec -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -interleave-small-loop-scalar-reduction -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -flto -fuse-ld=lld"
 export ASFLAGS="-D__AVX__=1 -D__AVX2__=1 -msse2avx -D__FMA__=1"
-</CODE>
+``
