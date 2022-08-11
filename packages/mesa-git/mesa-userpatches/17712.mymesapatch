@@ -1,0 +1,325 @@
+From 29172afb77af0b615fe312425288c2c398df4334 Mon Sep 17 00:00:00 2001
+From: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+Date: Fri, 22 Jul 2022 15:54:24 +0200
+Subject: [PATCH 1/2] radv: fix setting AMDGPU pstate in presence of multiple
+ logical devices
+
+AMDGPU pstate is per-device, not per Vulkan logical devices. The same
+AMDGPU device is shared accross logical devices because the driver
+creates only one winsys per fd. The kernel only allows one context
+at a time per AMDGPU device, otherwise it returns -EBUSY. Fixes this
+by moving the mutex logic to the winsys.
+
+Found while trying to capture RGP with Halo Infinite.
+
+Signed-off-by: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+---
+ src/amd/vulkan/radv_device.c                  | 51 +------------------
+ src/amd/vulkan/radv_private.h                 |  7 +--
+ src/amd/vulkan/radv_sqtt.c                    | 20 +++++++-
+ src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c | 19 ++++++-
+ .../vulkan/winsys/amdgpu/radv_amdgpu_winsys.c |  5 ++
+ .../vulkan/winsys/amdgpu/radv_amdgpu_winsys.h |  4 ++
+ 6 files changed, 49 insertions(+), 57 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+index 34719878170c..2c345891fa99 100644
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -3437,7 +3437,6 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
+    device->instance = physical_device->instance;
+    device->physical_device = physical_device;
+    simple_mtx_init(&device->trace_mtx, mtx_plain);
+-   simple_mtx_init(&device->pstate_mtx, mtx_plain);
+ 
+    device->ws = physical_device->ws;
+    vk_device_set_drm_fd(&device->vk, device->ws->get_fd(device->ws));
+@@ -3740,7 +3739,6 @@ fail:
+          device->ws->ctx_destroy(device->hw_ctx[i]);
+    }
+ 
+-   simple_mtx_destroy(&device->pstate_mtx);
+    simple_mtx_destroy(&device->trace_mtx);
+    mtx_destroy(&device->overallocation_mutex);
+ 
+@@ -3786,7 +3784,6 @@ radv_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+    }
+ 
+    mtx_destroy(&device->overallocation_mutex);
+-   simple_mtx_destroy(&device->pstate_mtx);
+    simple_mtx_destroy(&device->trace_mtx);
+ 
+    radv_device_finish_meta(device);
+@@ -7312,55 +7309,11 @@ radv_GetPhysicalDeviceFragmentShadingRatesKHR(
+    return vk_outarray_status(&out);
+ }
+ 
+-static bool
+-radv_thread_trace_set_pstate(struct radv_device *device, bool enable)
+-{
+-   struct radeon_winsys *ws = device->ws;
+-   enum radeon_ctx_pstate pstate = enable ? RADEON_CTX_PSTATE_PEAK : RADEON_CTX_PSTATE_NONE;
+-
+-   if (device->physical_device->rad_info.has_stable_pstate) {
+-      /* pstate is per-device; setting it for one ctx is sufficient.
+-       * We pick the first initialized one below. */
+-      for (unsigned i = 0; i < RADV_NUM_HW_CTX; i++)
+-         if (device->hw_ctx[i])
+-            return ws->ctx_set_pstate(device->hw_ctx[i], pstate) >= 0;
+-   }
+-
+-   return true;
+-}
+-
+-bool
+-radv_device_acquire_performance_counters(struct radv_device *device)
+-{
+-   bool result = true;
+-   simple_mtx_lock(&device->pstate_mtx);
+-
+-   if (device->pstate_cnt == 0) {
+-      result = radv_thread_trace_set_pstate(device, true);
+-      if (result)
+-         ++device->pstate_cnt;
+-   }
+-
+-   simple_mtx_unlock(&device->pstate_mtx);
+-   return result;
+-}
+-
+-void
+-radv_device_release_performance_counters(struct radv_device *device)
+-{
+-   simple_mtx_lock(&device->pstate_mtx);
+-
+-   if (--device->pstate_cnt == 0)
+-      radv_thread_trace_set_pstate(device, false);
+-
+-   simple_mtx_unlock(&device->pstate_mtx);
+-}
+-
+ VKAPI_ATTR VkResult VKAPI_CALL
+ radv_AcquireProfilingLockKHR(VkDevice _device, const VkAcquireProfilingLockInfoKHR *pInfo)
+ {
+    RADV_FROM_HANDLE(radv_device, device, _device);
+-   bool result = radv_device_acquire_performance_counters(device);
++   bool result = radv_thread_trace_set_pstate(device, true);
+    return result ? VK_SUCCESS : VK_ERROR_UNKNOWN;
+ }
+ 
+@@ -7368,5 +7321,5 @@ VKAPI_ATTR void VKAPI_CALL
+ radv_ReleaseProfilingLockKHR(VkDevice _device)
+ {
+    RADV_FROM_HANDLE(radv_device, device, _device);
+-   radv_device_release_performance_counters(device);
++   radv_thread_trace_set_pstate(device, false);
+ }
+diff --git a/src/amd/vulkan/radv_private.h b/src/amd/vulkan/radv_private.h
+index 9204ca670f0d..11473c52e48b 100644
+--- a/src/amd/vulkan/radv_private.h
++++ b/src/amd/vulkan/radv_private.h
+@@ -924,9 +924,6 @@ struct radv_device {
+    /* Whether shaders created through application entrypoints are considered internal. */
+    bool app_shaders_internal;
+ 
+-   simple_mtx_t pstate_mtx;
+-   unsigned pstate_cnt;
+-
+    /* BO to contain some performance counter helpers:
+     * - A lock for profiling cmdbuffers.
+     * - a temporary fence for the end query synchronization.
+@@ -940,9 +937,6 @@ struct radv_device {
+    bool uses_device_generated_commands;
+ };
+ 
+-bool radv_device_acquire_performance_counters(struct radv_device *device);
+-void radv_device_release_performance_counters(struct radv_device *device);
+-
+ struct radv_device_memory {
+    struct vk_object_base base;
+    struct radeon_winsys_bo *bo;
+@@ -2972,6 +2966,7 @@ void radv_thread_trace_finish(struct radv_device *device);
+ bool radv_begin_thread_trace(struct radv_queue *queue);
+ bool radv_end_thread_trace(struct radv_queue *queue);
+ bool radv_get_thread_trace(struct radv_queue *queue, struct ac_thread_trace *thread_trace);
++bool radv_thread_trace_set_pstate(struct radv_device *device, bool enable);
+ void radv_emit_thread_trace_userdata(struct radv_cmd_buffer *cmd_buffer, const void *data,
+                                      uint32_t num_dwords);
+ bool radv_is_instruction_timing_enabled(void);
+diff --git a/src/amd/vulkan/radv_sqtt.c b/src/amd/vulkan/radv_sqtt.c
+index 3961f72deeaf..958d2d71903f 100644
+--- a/src/amd/vulkan/radv_sqtt.c
++++ b/src/amd/vulkan/radv_sqtt.c
+@@ -465,7 +465,7 @@ radv_thread_trace_init(struct radv_device *device)
+    if (!radv_thread_trace_init_bo(device))
+       return false;
+ 
+-   if (!radv_device_acquire_performance_counters(device))
++   if (!radv_thread_trace_set_pstate(device, true))
+       return false;
+ 
+    list_inithead(&thread_trace_data->rgp_pso_correlation.record);
+@@ -704,3 +704,21 @@ radv_get_thread_trace(struct radv_queue *queue, struct ac_thread_trace *thread_t
+    thread_trace->data = &device->thread_trace;
+    return true;
+ }
++
++bool
++radv_thread_trace_set_pstate(struct radv_device *device, bool enable)
++{
++   struct radeon_winsys *ws = device->ws;
++   enum radeon_ctx_pstate pstate = enable ? RADEON_CTX_PSTATE_PEAK : RADEON_CTX_PSTATE_NONE;
++
++   if (device->physical_device->rad_info.has_stable_pstate) {
++      /* pstate is per-device; setting it for one ctx is sufficient.
++       * We pick the first initialized one below. */
++      for (unsigned i = 0; i < RADV_NUM_HW_CTX; i++)
++         if (device->hw_ctx[i]) {
++            return ws->ctx_set_pstate(device->hw_ctx[i], pstate) >= 0;
++         }
++   }
++
++   return true;
++}
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
+index 31fd7f1535e8..5bd11e67e79f 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
+@@ -1639,7 +1639,24 @@ radv_amdgpu_ctx_set_pstate(struct radeon_winsys_ctx *rwctx, enum radeon_ctx_psta
+ {
+    struct radv_amdgpu_ctx *ctx = (struct radv_amdgpu_ctx *)rwctx;
+    uint32_t amdgpu_pstate = radv_to_amdgpu_pstate(pstate);
+-   return amdgpu_cs_ctx_stable_pstate(ctx->ctx, AMDGPU_CTX_OP_SET_STABLE_PSTATE, amdgpu_pstate, NULL);
++   struct radv_amdgpu_winsys *ws = ctx->ws;
++   int r = 0;
++
++   assert(pstate == RADEON_CTX_PSTATE_PEAK || pstate == RADEON_CTX_PSTATE_NONE);
++
++   simple_mtx_lock(&ws->pstate_mtx);
++
++   /* AMDGPU pstate is per-device and only one context at a time can set it. */
++   if (ws->current_pstate != amdgpu_pstate) {
++      r = amdgpu_cs_ctx_stable_pstate(ctx->ctx, AMDGPU_CTX_OP_SET_STABLE_PSTATE,
++                                      amdgpu_pstate, NULL);
++      if (!r)
++         ws->current_pstate = amdgpu_pstate;
++   }
++
++   simple_mtx_unlock(&ws->pstate_mtx);
++
++   return r;
+ }
+ 
+ static void *
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
+index 409f77aada1f..48dfc122796a 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
+@@ -170,6 +170,8 @@ radv_amdgpu_winsys_destroy(struct radeon_winsys *rws)
+    if (ws->reserve_vmid)
+       amdgpu_vm_unreserve_vmid(ws->dev, 0);
+ 
++   simple_mtx_destroy(&ws->pstate_mtx);
++
+    u_rwlock_destroy(&ws->log_bo_list_lock);
+    ac_addrlib_destroy(ws->addrlib);
+    amdgpu_device_deinitialize(ws->dev);
+@@ -276,6 +278,9 @@ radv_amdgpu_winsys_create(int fd, uint64_t debug_flags, uint64_t perftest_flags,
+    ws->sync_types[num_sync_types++] = NULL;
+    assert(num_sync_types <= ARRAY_SIZE(ws->sync_types));
+ 
++   simple_mtx_init(&ws->pstate_mtx, mtx_plain);
++   ws->current_pstate = AMDGPU_CTX_STABLE_PSTATE_NONE;
++
+    ws->perftest = perftest_flags;
+    ws->zero_all_vram_allocs = debug_flags & RADV_DEBUG_ZERO_VRAM;
+    u_rwlock_init(&ws->global_bo_list.lock);
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.h b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.h
+index 18b3761679f2..f14efc80a805 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.h
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.h
+@@ -32,6 +32,7 @@
+ #include <pthread.h>
+ #include "util/list.h"
+ #include "util/rwlock.h"
++#include "util/simple_mtx.h"
+ #include "ac_gpu_info.h"
+ #include "radv_radeon_winsys.h"
+ 
+@@ -73,6 +74,9 @@ struct radv_amdgpu_winsys {
+    struct vk_sync_type syncobj_sync_type;
+    struct vk_sync_timeline_type emulated_timeline_sync_type;
+ 
++   simple_mtx_t pstate_mtx;
++   uint32_t current_pstate;
++
+    uint32_t refcount;
+ };
+ 
+-- 
+GitLab
+
+
+From eb211e2337b9589f2bacd6767bf6bef9e3f0f5a5 Mon Sep 17 00:00:00 2001
+From: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+Date: Fri, 22 Jul 2022 15:58:54 +0200
+Subject: [PATCH 2/2] radv: restore AMDGPU pstate when SQTT is de-initialized
+
+This was missing. Note that we have to call radv_thread_trace_finish()
+after destroying meta objects to make sure all pipelines are
+unregistered and before the hw context is destroyed.
+
+Signed-off-by: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+---
+ src/amd/vulkan/radv_device.c | 7 +++----
+ src/amd/vulkan/radv_sqtt.c   | 2 ++
+ 2 files changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+index 2c345891fa99..efa52d77e1dc 100644
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -3766,6 +3766,9 @@ radv_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+    radv_device_finish_vs_prologs(device);
+    radv_device_finish_border_color(device);
+    radv_device_finish_vrs_image(device);
++   radv_device_finish_meta(device);
++
++   radv_thread_trace_finish(device);
+ 
+    for (unsigned i = 0; i < RADV_MAX_QUEUE_FAMILIES; i++) {
+       for (unsigned q = 0; q < device->queue_count[i]; q++)
+@@ -3786,8 +3789,6 @@ radv_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+    mtx_destroy(&device->overallocation_mutex);
+    simple_mtx_destroy(&device->trace_mtx);
+ 
+-   radv_device_finish_meta(device);
+-
+    VkPipelineCache pc = radv_pipeline_cache_to_handle(device->mem_cache);
+    radv_DestroyPipelineCache(radv_device_to_handle(device), pc, NULL);
+ 
+@@ -3796,8 +3797,6 @@ radv_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+ 
+    radv_destroy_shader_arenas(device);
+ 
+-   radv_thread_trace_finish(device);
+-
+    radv_spm_finish(device);
+ 
+    vk_device_finish(&device->vk);
+diff --git a/src/amd/vulkan/radv_sqtt.c b/src/amd/vulkan/radv_sqtt.c
+index 958d2d71903f..cdf703186b49 100644
+--- a/src/amd/vulkan/radv_sqtt.c
++++ b/src/amd/vulkan/radv_sqtt.c
+@@ -497,6 +497,8 @@ radv_thread_trace_finish(struct radv_device *device)
+          ws->cs_destroy(device->thread_trace.stop_cs[i]);
+    }
+ 
++   radv_thread_trace_set_pstate(device, false);
++
+    assert(thread_trace_data->rgp_pso_correlation.record_count == 0);
+    simple_mtx_destroy(&thread_trace_data->rgp_pso_correlation.lock);
+ 
+-- 
+GitLab
+
