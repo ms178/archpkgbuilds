@@ -10270,3 +10270,1466 @@ index 3b4c19412625..c11657b5915f 100644
 
 --
 2.37.1
+
+[PATCH AUTOSEL 5.19 092/105] drm/amdkfd: Process notifier release callback don't take mutex
+Sasha Levin sashal at kernel.org
+Thu Aug 11 15:28:16 UTC 2022
+Previous message (by thread): [PATCH AUTOSEL 5.19 091/105] drm/amdkfd: Correct mmu_notifier_get failure handling
+Next message (by thread): [PATCH AUTOSEL 5.18 11/93] drm/amd/display: fix system hang when PSR exits
+Messages sorted by: [ date ] [ thread ] [ subject ] [ author ]
+From: Philip Yang <Philip.Yang at amd.com>
+
+[ Upstream commit 74097f9fd2f5ebdae04fcba59da345386415cbf3 ]
+
+Move process queues cleanup to deferred work kfd_process_wq_release, to
+avoid potential deadlock circular locking warning:
+
+ WARNING: possible circular locking dependency detected
+               the existing dependency chain (in reverse order) is:
+      -> #2
+        ((work_completion)(&svms->deferred_list_work)){+.+.}-{0:0}:
+        __flush_work+0x343/0x4a0
+        svm_range_list_lock_and_flush_work+0x39/0xc0
+        svm_range_set_attr+0xe8/0x1080 [amdgpu]
+        kfd_ioctl+0x19b/0x600 [amdgpu]
+        __x64_sys_ioctl+0x81/0xb0
+        do_syscall_64+0x34/0x80
+        entry_SYSCALL_64_after_hwframe+0x44/0xae
+
+      -> #1 (&info->lock#2){+.+.}-{3:3}:
+        __mutex_lock+0xa4/0x940
+        amdgpu_amdkfd_gpuvm_acquire_process_vm+0x2e3/0x590
+        kfd_process_device_init_vm+0x61/0x200 [amdgpu]
+        kfd_ioctl_acquire_vm+0x83/0xb0 [amdgpu]
+        kfd_ioctl+0x19b/0x600 [amdgpu]
+        __x64_sys_ioctl+0x81/0xb0
+        do_syscall_64+0x34/0x80
+       entry_SYSCALL_64_after_hwframe+0x44/0xae
+
+      -> #0 (&process->mutex){+.+.}-{3:3}:
+        __lock_acquire+0x1365/0x23d0
+        lock_acquire+0xc9/0x2e0
+        __mutex_lock+0xa4/0x940
+        kfd_process_notifier_release+0x96/0xe0 [amdgpu]
+        __mmu_notifier_release+0x94/0x210
+        exit_mmap+0x35/0x1f0
+        mmput+0x63/0x120
+        svm_range_deferred_list_work+0x177/0x2c0 [amdgpu]
+        process_one_work+0x2a4/0x600
+        worker_thread+0x39/0x3e0
+        kthread+0x16d/0x1a0
+
+  Possible unsafe locking scenario:
+
+      CPU0                    CPU1
+        ----                    ----
+   lock((work_completion)(&svms->deferred_list_work));
+                                lock(&info->lock#2);
+             lock((work_completion)(&svms->deferred_list_work));
+   lock(&process->mutex);
+
+Signed-off-by: Philip Yang <Philip.Yang at amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Sasha Levin <sashal at kernel.org>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c | 21 +++++++++------------
+ 1 file changed, 9 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index b8b185e242d3..9ad293fb95af 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -1114,6 +1114,15 @@ static void kfd_process_wq_release(struct work_struct *work)
+ 	struct kfd_process *p = container_of(work, struct kfd_process,
+ 					     release_work);
+
++	kfd_process_dequeue_from_all_devices(p);
++	pqm_uninit(&p->pqm);
++
++	/* Signal the eviction fence after user mode queues are
++	 * destroyed. This allows any BOs to be freed without
++	 * triggering pointless evictions or waiting for fences.
++	 */
++	dma_fence_signal(p->ef);
++
+ 	kfd_process_remove_sysfs(p);
+ 	kfd_iommu_unbind_process(p);
+
+@@ -1178,20 +1187,8 @@ static void kfd_process_notifier_release(struct mmu_notifier *mn,
+ 	cancel_delayed_work_sync(&p->eviction_work);
+ 	cancel_delayed_work_sync(&p->restore_work);
+
+-	mutex_lock(&p->mutex);
+-
+-	kfd_process_dequeue_from_all_devices(p);
+-	pqm_uninit(&p->pqm);
+-
+ 	/* Indicate to other users that MM is no longer valid */
+ 	p->mm = NULL;
+-	/* Signal the eviction fence after user mode queues are
+-	 * destroyed. This allows any BOs to be freed without
+-	 * triggering pointless evictions or waiting for fences.
+-	 */
+-	dma_fence_signal(p->ef);
+-
+-	mutex_unlock(&p->mutex);
+
+ 	mmu_notifier_put(&p->mmu_notifier);
+ }
+--
+2.35.1
+
+From: Philip Yang <Philip.Yang at amd.com>
+
+[ Upstream commit 0593ad215359d51514c1e6c81ce28ea598efed6b ]
+
+If process has signal pending, mmu_notifier_get_locked fails and calls
+ops->free_notifier, kfd_process_free_notifier will schedule
+kfd_process_wq_release as process refcount is 1, but process structure
+is already freed. This use after free bug causes system crash with
+different backtrace.
+
+The fix is to increase process refcount and then decrease the refcount
+after mmu_notifier_get success.
+
+Signed-off-by: Philip Yang <Philip.Yang at amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Sasha Levin <sashal at kernel.org>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index e3d64ec8c353..b8b185e242d3 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -1404,6 +1404,11 @@ static struct kfd_process *create_process(const struct task_struct *thread)
+ 	hash_add_rcu(kfd_processes_table, &process->kfd_processes,
+ 			(uintptr_t)process->mm);
+
++	/* Avoid free_notifier to start kfd_process_wq_release if
++	 * mmu_notifier_get failed because of pending signal.
++	 */
++	kref_get(&process->ref);
++
+ 	/* MMU notifier registration must be the last call that can fail
+ 	 * because after this point we cannot unwind the process creation.
+ 	 * After this point, mmu_notifier_put will trigger the cleanup by
+@@ -1416,6 +1421,7 @@ static struct kfd_process *create_process(const struct task_struct *thread)
+ 	}
+ 	BUG_ON(mn != &process->mmu_notifier);
+
++	kfd_unref_process(process);
+ 	get_task_struct(process->lead_thread);
+
+ 	return process;
+--
+2.35.1
+
+From: lin cao <lin.cao at amd.com>
+
+[ Upstream commit 748262eb400e809aa13e3485f4983c3db3d0ebb3 ]
+
+In the case of SRIOV, the register smnMp1_PMI_3_FIFO will get an invalid
+value which will cause the "shift out of bound". In Ubuntu22.04, this
+issue will be checked an related call trace will be reported in dmesg.
+
+Signed-off-by: lin cao <lin.cao at amd.com>
+Reviewed-by: Jingwen Chen <Jingwen.Chen2 at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Sasha Levin <sashal at kernel.org>
+---
+ drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c b/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c
+index 78f3d9e722bb..4db7e32efd08 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c
+@@ -886,6 +886,7 @@ static void sienna_cichlid_stb_init(struct smu_context *smu);
+
+ static int sienna_cichlid_init_smc_tables(struct smu_context *smu)
+ {
++	struct amdgpu_device *adev = smu->adev;
+ 	int ret = 0;
+
+ 	ret = sienna_cichlid_tables_init(smu);
+@@ -896,7 +897,8 @@ static int sienna_cichlid_init_smc_tables(struct smu_context *smu)
+ 	if (ret)
+ 		return ret;
+
+-	sienna_cichlid_stb_init(smu);
++	if (!amdgpu_sriov_vf(adev))
++		sienna_cichlid_stb_init(smu);
+
+ 	return smu_v11_0_init_smc_tables(smu);
+ }
+--
+2.35.1
+
+From: Alex Deucher <alexander.deucher at amd.com>
+
+[ Upstream commit 0a94608f0f7de9b1135ffea3546afe68eafef57f ]
+
+Drop execute.
+
+Bug: https://gitlab.freedesktop.org/drm/amd/-/issues/2085
+Reviewed-by: Guchun Chen <guchun.chen at amd.com>
+Reviewed-by: Christian König <christian.koenig at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Sasha Levin <sashal at kernel.org>
+---
+ drivers/gpu/drm/amd/include/asic_reg/clk/clk_11_0_1_offset.h   | 0
+ drivers/gpu/drm/amd/include/asic_reg/clk/clk_11_0_1_sh_mask.h  | 0
+ drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_2_0_3_offset.h    | 0
+ drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_2_0_3_sh_mask.h   | 0
+ drivers/gpu/drm/amd/include/asic_reg/dpcs/dpcs_2_0_3_offset.h  | 0
+ drivers/gpu/drm/amd/include/asic_reg/dpcs/dpcs_2_0_3_sh_mask.h | 0
+ 6 files changed, 0 insertions(+), 0 deletions(-)
+ mode change 100755 => 100644 drivers/gpu/drm/amd/include/asic_reg/clk/clk_11_0_1_offset.h
+ mode change 100755 => 100644 drivers/gpu/drm/amd/include/asic_reg/clk/clk_11_0_1_sh_mask.h
+ mode change 100755 => 100644 drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_2_0_3_offset.h
+ mode change 100755 => 100644 drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_2_0_3_sh_mask.h
+ mode change 100755 => 100644 drivers/gpu/drm/amd/include/asic_reg/dpcs/dpcs_2_0_3_offset.h
+ mode change 100755 => 100644 drivers/gpu/drm/amd/include/asic_reg/dpcs/dpcs_2_0_3_sh_mask.h
+
+diff --git a/drivers/gpu/drm/amd/include/asic_reg/clk/clk_11_0_1_offset.h b/drivers/gpu/drm/amd/include/asic_reg/clk/clk_11_0_1_offset.h
+old mode 100755
+new mode 100644
+diff --git a/drivers/gpu/drm/amd/include/asic_reg/clk/clk_11_0_1_sh_mask.h b/drivers/gpu/drm/amd/include/asic_reg/clk/clk_11_0_1_sh_mask.h
+old mode 100755
+new mode 100644
+diff --git a/drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_2_0_3_offset.h b/drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_2_0_3_offset.h
+old mode 100755
+new mode 100644
+diff --git a/drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_2_0_3_sh_mask.h b/drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_2_0_3_sh_mask.h
+old mode 100755
+new mode 100644
+diff --git a/drivers/gpu/drm/amd/include/asic_reg/dpcs/dpcs_2_0_3_offset.h b/drivers/gpu/drm/amd/include/asic_reg/dpcs/dpcs_2_0_3_offset.h
+old mode 100755
+new mode 100644
+diff --git a/drivers/gpu/drm/amd/include/asic_reg/dpcs/dpcs_2_0_3_sh_mask.h b/drivers/gpu/drm/amd/include/asic_reg/dpcs/dpcs_2_0_3_sh_mask.h
+old mode 100755
+new mode 100644
+--
+2.35.1
+
+From: xinhui pan <xinhui.pan at amd.com>
+
+[ Upstream commit cc3cb791f19ad0c4f951f38c98aa513b042ab329 ]
+
+Queue would be freed when create_queue_cpsch fails
+So lets do queue cleanup otherwise various list and memory issues
+happen.
+
+Signed-off-by: xinhui pan <xinhui.pan at amd.com>
+Reviewed-by: Philip Yang <Philip.Yang at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Sasha Levin <sashal at kernel.org>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c | 11 +++++------
+ 1 file changed, 5 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index e017b4240472..06417c7abca4 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -1666,14 +1666,13 @@ static int create_queue_cpsch(struct device_queue_manager *dqm, struct queue *q,
+ 	if (q->properties.is_active) {
+ 		increment_queue_count(dqm, qpd, q);
+
+-		if (!dqm->dev->shared_resources.enable_mes) {
++		if (!dqm->dev->shared_resources.enable_mes)
+ 			retval = execute_queues_cpsch(dqm,
+-					     KFD_UNMAP_QUEUES_FILTER_DYNAMIC_QUEUES, 0);
+-		} else {
++					KFD_UNMAP_QUEUES_FILTER_DYNAMIC_QUEUES, 0);
++		else
+ 			retval = add_queue_mes(dqm, q, qpd);
+-			if (retval)
+-				goto cleanup_queue;
+-		}
++		if (retval)
++			goto cleanup_queue;
+ 	}
+
+ 	/*
+--
+2.35.1
+
+From: Dmytro Laktyushkin <Dmytro.Laktyushkin at amd.com>
+
+[ Upstream commit 8a077d9caa3a274de36ee2fe7b608041f5690343 ]
+
+This w/a has a bad interaction with seamless boot toggling an
+active stream. Most panels recover, however some fail leading
+to display corruption.
+
+Reviewed-by: Charlene Liu <Charlene.Liu at amd.com>
+Acked-by: Rodrigo Siqueira <Rodrigo.Siqueira at amd.com>
+Signed-off-by: Dmytro Laktyushkin <Dmytro.Laktyushkin at amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Sasha Levin <sashal at kernel.org>
+---
+ .../gpu/drm/amd/display/dc/clk_mgr/dcn315/dcn315_clk_mgr.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn315/dcn315_clk_mgr.c b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn315/dcn315_clk_mgr.c
+index f4381725b210..36b0cd47c1c7 100644
+--- a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn315/dcn315_clk_mgr.c
++++ b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn315/dcn315_clk_mgr.c
+@@ -173,11 +173,14 @@ static void dcn315_update_clocks(struct clk_mgr *clk_mgr_base,
+ 	}
+
+ 	if (should_set_clock(safe_to_lower, new_clocks->dispclk_khz, clk_mgr_base->clks.dispclk_khz)) {
+-		dcn315_disable_otg_wa(clk_mgr_base, true);
++		/* No need to apply the w/a if we haven't taken over from bios yet */
++		if (clk_mgr_base->clks.dispclk_khz)
++			dcn315_disable_otg_wa(clk_mgr_base, true);
+
+ 		clk_mgr_base->clks.dispclk_khz = new_clocks->dispclk_khz;
+ 		dcn315_smu_set_dispclk(clk_mgr, clk_mgr_base->clks.dispclk_khz);
+-		dcn315_disable_otg_wa(clk_mgr_base, false);
++		if (clk_mgr_base->clks.dispclk_khz)
++			dcn315_disable_otg_wa(clk_mgr_base, false);
+
+ 		update_dispclk = true;
+ 	}
+--
+2.35.1
+
+From: Fangzhi Zuo <Jerry.Zuo at amd.com>
+
+[ Upstream commit 22676bc500c27d987a0b42cbe162aebf783f1c38 ]
+
+[Why]
+Unexpected change of aux hw mapping causes dmub soft hang when
+initiate aux transation at wrong aux channel.
+
+ddc_channel stands for hw dp aux index which is from vbios,
+but link_index is pure software concept for link count depending on which link
+is probed first. They are not interchangeable.
+
+dmub aux transaction could pass if happens eDP link_index gets
+the same value as vbios ddc_channel, e.g., ddc_channel = 1, link_index = 1
+if they gets different, e.g., ddc_channel = 2, link_index = 0, overwrite
+ddc_channel with link_index will have wrong ddc channel being used for aux
+transaction in dmub PSR, cause aux transaction soft hang.
+
+[How]
+ddc_channel mapping to each link is determined by vbios and further
+parsed in dc. Such info. should not be touched in any kind, otherwise
+the mapping is screwed up leading to aux transaction timeout.
+
+Reviewed-by: Aurabindo Jayamohanan Pillai <Aurabindo.Pillai at amd.com>
+Acked-by: Rodrigo Siqueira <Rodrigo.Siqueira at amd.com>
+Signed-off-by: Fangzhi Zuo <Jerry.Zuo at amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Sasha Levin <sashal at kernel.org>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 3087dd1a1856..a6efd5c1fa2a 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -8538,7 +8538,7 @@ static int amdgpu_dm_i2c_xfer(struct i2c_adapter *i2c_adap,
+
+ 	if (dc_submit_i2c(
+ 			ddc_service->ctx->dc,
+-			ddc_service->ddc_pin->hw_info.ddc_channel,
++			ddc_service->link->link_index,
+ 			&cmd))
+ 		result = num;
+
+@@ -8574,8 +8574,6 @@ create_i2c(struct ddc_service *ddc_service,
+ 	snprintf(i2c->base.name, sizeof(i2c->base.name), "AMDGPU DM i2c hw bus %d", link_index);
+ 	i2c_set_adapdata(&i2c->base, i2c);
+ 	i2c->ddc_service = ddc_service;
+-	if (i2c->ddc_service->ddc_pin)
+-		i2c->ddc_service->ddc_pin->hw_info.ddc_channel = link_index;
+
+ 	return i2c;
+ }
+--
+2.35.1
+
+From: Nicholas Kazlauskas <nicholas.kazlauskas at amd.com>
+
+[ Upstream commit bc19909f19fdc8253d720d11c948935786fbfa08 ]
+
+[Why]
+In the case where we don't support DMUB aux but we have DPIA links
+in the configuration we might try to message AUX using the legacy
+path - where DDC pin is NULL. This causes a NULL pointer dereference.
+
+[How]
+Guard against NULL DDC pin, return a failure for aux engine acquire.
+
+Reviewed-by: Michael Strauss <Michael.Strauss at amd.com>
+Acked-by: Rodrigo Siqueira <Rodrigo.Siqueira at amd.com>
+Signed-off-by: Nicholas Kazlauskas <nicholas.kazlauskas at amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Sasha Levin <sashal at kernel.org>
+---
+ drivers/gpu/drm/amd/display/dc/dce/dce_aux.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c b/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c
+index 9e39cd7b203e..49d3145ae8fb 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c
+@@ -572,6 +572,11 @@ int dce_aux_transfer_raw(struct ddc_service *ddc,
+
+ 	memset(&aux_req, 0, sizeof(aux_req));
+
++	if (ddc_pin == NULL) {
++		*operation_result = AUX_RET_ERROR_ENGINE_ACQUIRE;
++		return -1;
++	}
++
+ 	aux_engine = ddc->ctx->dc->res_pool->engines[ddc_pin->pin_data->en];
+ 	if (!acquire(aux_engine, ddc_pin)) {
+ 		*operation_result = AUX_RET_ERROR_ENGINE_ACQUIRE;
+--
+2.35.1
+
+From: "Stanley.Yang" <Stanley.Yang at amd.com>
+
+[ Upstream commit e0e146d5567317d6ba7d0169bed55d1d9ea05a61 ]
+
+It should not init whole ras bad page framework on sriov guest side
+due to it is handled on host side.
+
+Signed-off-by: Stanley.Yang <Stanley.Yang at amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang at amd.com>
+Reviewed-by: Tao Zhou <tao.zhou1 at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Sasha Levin <sashal at kernel.org>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+index dac202ae864d..465e7921bba1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+@@ -2148,7 +2148,7 @@ int amdgpu_ras_recovery_init(struct amdgpu_device *adev)
+ 	bool exc_err_limit = false;
+ 	int ret;
+
+-	if (!con)
++	if (!con || amdgpu_sriov_vf(adev))
+ 		return 0;
+
+ 	/* Allow access to RAS EEPROM via debugfs, when the ASIC
+--
+2.35.1
+
+From: Rahul Kumar <rahul.kumar1 at amd.com>
+
+[ Upstream commit 1c4dae3e4639540fb567e570cc56a3c292afb6fe ]
+
+We observed hard hang due to NULL derefrence This issue is seen after
+running system all the time after two or three days
+
+struct dc *dc = plane_state->ctx->dc; Randomly in long run we found
+plane_state or plane_state->ctx is found NULL which causes exception.
+
+BUG: kernel NULL pointer dereference, address: 0000000000000000
+PF: supervisor read access in kernel mode
+PF: error_code(0x0000) - not-present page
+PGD 1dc7f2067 P4D 1dc7f2067 PUD 222c75067 PMD 0
+Oops: 0000 [#1] SMP NOPTI
+CPU: 5 PID: 29855 Comm: kworker/u16:4 ...
+...
+Workqueue: events_unbound commit_work [drm_kms_helper]
+RIP: 0010:dcn10_update_pending_status+0x1f/0xee [amdgpu]
+Code: 41 5f c3 0f 1f 44 00 00 b0 01 c3 0f 1f 44 00 00 41 55 41 54 55 53 48 8b 1f 4c 8b af f8 00 00 00 48 8b 83 88 03 00 00 48 85 db <4c> 8b 20 0f 84 bf 00 00 00 48 89 fd 48 8b bf b8 00 00 00 48 8b 07
+RSP: 0018:ffff942941997ab8 EFLAGS: 00010286
+RAX: 0000000000000000 RBX: ffff8d7fd98d2000 RCX: 0000000000000000
+RDX: 0000000000000000 RSI: ffff8d7e3e87c708 RDI: ffff8d7f2d8c0690
+RBP: ffff8d7f2d8c0000 R08: ffff942941997a34 R09: 00000000ffffffff
+R10: 0000000000005000 R11: 00000000000000f0 R12: ffff8d7f2d8c0690
+R13: ffff8d8035a41680 R14: 00000000000186a0 R15: ffff8d7f2d8c1dd8
+FS:  0000000000000000(0000) GS:ffff8d8037340000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 0000000000000000 CR3: 0000000148030000 CR4: 00000000003406e0
+Call Trace:
+ dc_commit_state+0x6a2/0x7f0 [amdgpu]
+ amdgpu_dm_atomic_commit_tail+0x460/0x19bb [amdgpu]
+
+Tested-by: Rodrigo Siqueira <Rodrigo.Siqueira at amd.com>
+Reviewed-by: Harry Wentland <harry.wentland at amd.com>
+Signed-off-by: Rahul Kumar <rahul.kumar1 at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Sasha Levin <sashal at kernel.org>
+---
+ drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index e3a62873c0e7..ffe496131635 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@ -3242,7 +3242,7 @@ void dcn10_update_pending_status(struct pipe_ctx *pipe_ctx)
+ 	struct dc_plane_state *plane_state = pipe_ctx->plane_state;
+ 	struct timing_generator *tg = pipe_ctx->stream_res.tg;
+ 	bool flip_pending;
+-	struct dc *dc = plane_state->ctx->dc;
++	struct dc *dc = pipe_ctx->stream->ctx->dc;
+
+ 	if (plane_state == NULL)
+ 		return;
+--
+2.35.1
+
+From: Darren Powell <darren.powell at amd.com>
+
+[ Upstream commit ceb180361e3851007547c55035cd1de03f108f75 ]
+
+ [v2]
+simplified fix after Lijo's feedback
+ removed clocks.num_levels from calculation of loop count
+   removed unsafe accesses to shim table freq_values
+ retained corner case output only min,now if
+   clocks.num_levels == 1 && now > min
+
+ [v1]
+added a check to populate and use SCLK shim table freq_values only
+   if using dpm_level == AMD_DPM_FORCED_LEVEL_MANUAL or
+                         AMD_DPM_FORCED_LEVEL_PERF_DETERMINISM
+removed clocks.num_levels from calculation of shim table size
+removed unsafe accesses to shim table freq_values
+   output gfx_table values if using other dpm levels
+added check for freq_match when using freq_values for when now == min_clk
+
+== Test ==
+LOGFILE=aldebaran-sclk.test.log
+AMDGPU_PCI_ADDR=`lspci -nn | grep "VGA\|Display" | cut -d " " -f 1`
+AMDGPU_HWMON=`ls -la /sys/class/hwmon | grep $AMDGPU_PCI_ADDR | awk '{print $9}'`
+HWMON_DIR=/sys/class/hwmon/${AMDGPU_HWMON}
+
+lspci -nn | grep "VGA\|Display"  > $LOGFILE
+FILES="pp_od_clk_voltage
+pp_dpm_sclk"
+
+for f in $FILES
+do
+  echo === $f === >> $LOGFILE
+  cat $HWMON_DIR/device/$f >> $LOGFILE
+done
+cat $LOGFILE
+
+Signed-off-by: Darren Powell <darren.powell at amd.com>
+Reviewed-by: Kenneth Feng <kenneth.feng at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Sasha Levin <sashal at kernel.org>
+---
+ .../drm/amd/pm/swsmu/smu13/aldebaran_ppt.c    | 34 +++++++------------
+ 1 file changed, 12 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu13/aldebaran_ppt.c b/drivers/gpu/drm/amd/pm/swsmu/smu13/aldebaran_ppt.c
+index fb130409309c..f6ff7942e1b7 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu13/aldebaran_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu13/aldebaran_ppt.c
+@@ -739,7 +739,7 @@ static int aldebaran_print_clk_levels(struct smu_context *smu,
+ 	struct smu_13_0_dpm_table *single_dpm_table;
+ 	struct smu_dpm_context *smu_dpm = &smu->smu_dpm;
+ 	struct smu_13_0_dpm_context *dpm_context = NULL;
+-	uint32_t display_levels;
++	int display_levels;
+ 	uint32_t freq_values[3] = {0};
+ 	uint32_t min_clk, max_clk;
+
+@@ -771,7 +771,7 @@ static int aldebaran_print_clk_levels(struct smu_context *smu,
+ 			return ret;
+ 		}
+
+-		display_levels = clocks.num_levels;
++		display_levels = (clocks.num_levels == 1) ? 1 : 2;
+
+ 		min_clk = pstate_table->gfxclk_pstate.curr.min;
+ 		max_clk = pstate_table->gfxclk_pstate.curr.max;
+@@ -781,30 +781,20 @@ static int aldebaran_print_clk_levels(struct smu_context *smu,
+
+ 		/* fine-grained dpm has only 2 levels */
+ 		if (now > min_clk && now < max_clk) {
+-			display_levels = clocks.num_levels + 1;
++			display_levels++;
+ 			freq_values[2] = max_clk;
+ 			freq_values[1] = now;
+ 		}
+
+-		/*
+-		 * For DPM disabled case, there will be only one clock level.
+-		 * And it's safe to assume that is always the current clock.
+-		 */
+-		if (display_levels == clocks.num_levels) {
+-			for (i = 0; i < clocks.num_levels; i++)
+-				size += sysfs_emit_at(buf, size, "%d: %uMhz %s\n", i,
+-					freq_values[i],
+-					(clocks.num_levels == 1) ?
+-						"*" :
+-						(aldebaran_freqs_in_same_level(
+-							 freq_values[i], now) ?
+-							 "*" :
+-							 ""));
+-		} else {
+-			for (i = 0; i < display_levels; i++)
+-				size += sysfs_emit_at(buf, size, "%d: %uMhz %s\n", i,
+-						freq_values[i], i == 1 ? "*" : "");
+-		}
++		for (i = 0; i < display_levels; i++)
++			size += sysfs_emit_at(buf, size, "%d: %uMhz %s\n", i,
++				freq_values[i],
++				(display_levels == 1) ?
++					"*" :
++					(aldebaran_freqs_in_same_level(
++						 freq_values[i], now) ?
++						 "*" :
++						 ""));
+
+ 		break;
+
+--
+2.35.1
+
+From: Philip Yang <Philip.Yang at amd.com>
+
+[ Upstream commit ab8529b0cdb271d9b222cbbddb2641f3fca5df8f ]
+
+After queue unmap or remove from MES successfully, free queue sysfs
+entries, doorbell and remove from queue list. Otherwise, application may
+destroy queue again, cause below kernel warning or crash backtrace.
+
+For outstanding queues, either application forget to destroy or failed
+to destroy, kfd_process_notifier_release will remove queue sysfs
+entries, kfd_process_wq_release will free queue doorbell.
+
+v2: decrement_queue_count for MES queue
+
+ refcount_t: underflow; use-after-free.
+ WARNING: CPU: 7 PID: 3053 at lib/refcount.c:28
+  Call Trace:
+   kobject_put+0xd6/0x1a0
+   kfd_procfs_del_queue+0x27/0x30 [amdgpu]
+   pqm_destroy_queue+0xeb/0x240 [amdgpu]
+   kfd_ioctl_destroy_queue+0x32/0x70 [amdgpu]
+   kfd_ioctl+0x27d/0x500 [amdgpu]
+   do_syscall_64+0x35/0x80
+
+ WARNING: CPU: 2 PID: 3053 at drivers/gpu/drm/amd/amdgpu/../amdkfd/kfd_device_queue_manager.c:400
+  Call Trace:
+   deallocate_doorbell.isra.0+0x39/0x40 [amdgpu]
+   destroy_queue_cpsch+0xb3/0x270 [amdgpu]
+   pqm_destroy_queue+0x108/0x240 [amdgpu]
+   kfd_ioctl_destroy_queue+0x32/0x70 [amdgpu]
+   kfd_ioctl+0x27d/0x500 [amdgpu]
+
+ general protection fault, probably for non-canonical address
+0xdead000000000108:
+ Call Trace:
+  pqm_destroy_queue+0xf0/0x200 [amdgpu]
+  kfd_ioctl_destroy_queue+0x2f/0x60 [amdgpu]
+  kfd_ioctl+0x19b/0x600 [amdgpu]
+
+Signed-off-by: Philip Yang <Philip.Yang at amd.com>
+Reviewed-by: Graham Sider <Graham.Sider at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Sasha Levin <sashal at kernel.org>
+---
+ .../drm/amd/amdkfd/kfd_device_queue_manager.c | 28 +++++++++++--------
+ .../amd/amdkfd/kfd_process_queue_manager.c    |  2 +-
+ 2 files changed, 18 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index e1797657b04c..e017b4240472 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -1873,6 +1873,22 @@ static int destroy_queue_cpsch(struct device_queue_manager *dqm,
+
+ 	}
+
++	if (q->properties.is_active) {
++		if (!dqm->dev->shared_resources.enable_mes) {
++			retval = execute_queues_cpsch(dqm,
++						      KFD_UNMAP_QUEUES_FILTER_DYNAMIC_QUEUES, 0);
++			if (retval == -ETIME)
++				qpd->reset_wavefronts = true;
++		} else {
++			retval = remove_queue_mes(dqm, q, qpd);
++		}
++
++		if (retval)
++			goto failed_unmap_queue;
++
++		decrement_queue_count(dqm, qpd, q);
++	}
++
+ 	mqd_mgr = dqm->mqd_mgrs[get_mqd_type_from_queue_type(
+ 			q->properties.type)];
+
+@@ -1886,17 +1902,6 @@ static int destroy_queue_cpsch(struct device_queue_manager *dqm,
+
+ 	list_del(&q->list);
+ 	qpd->queue_count--;
+-	if (q->properties.is_active) {
+-		if (!dqm->dev->shared_resources.enable_mes) {
+-			decrement_queue_count(dqm, qpd, q);
+-			retval = execute_queues_cpsch(dqm,
+-						      KFD_UNMAP_QUEUES_FILTER_DYNAMIC_QUEUES, 0);
+-			if (retval == -ETIME)
+-				qpd->reset_wavefronts = true;
+-		} else {
+-			retval = remove_queue_mes(dqm, q, qpd);
+-		}
+-	}
+
+ 	/*
+ 	 * Unconditionally decrement this counter, regardless of the queue's
+@@ -1913,6 +1918,7 @@ static int destroy_queue_cpsch(struct device_queue_manager *dqm,
+
+ 	return retval;
+
++failed_unmap_queue:
+ failed_try_destroy_debugged_queue:
+
+ 	dqm_unlock(dqm);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+index dc00484ff484..99f2a6412201 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+@@ -419,7 +419,6 @@ int pqm_destroy_queue(struct process_queue_manager *pqm, unsigned int qid)
+ 	}
+
+ 	if (pqn->q) {
+-		kfd_procfs_del_queue(pqn->q);
+ 		dqm = pqn->q->device->dqm;
+ 		retval = dqm->ops.destroy_queue(dqm, &pdd->qpd, pqn->q);
+ 		if (retval) {
+@@ -439,6 +438,7 @@ int pqm_destroy_queue(struct process_queue_manager *pqm, unsigned int qid)
+ 		if (dev->shared_resources.enable_mes)
+ 			amdgpu_amdkfd_free_gtt_mem(dev->adev,
+ 						   pqn->q->gang_ctx_bo);
++		kfd_procfs_del_queue(pqn->q);
+ 		uninit_queue(pqn->q);
+ 	}
+
+--
+2.35.1
+
+From: Shah Dharati <dharshah at amd.com>
+
+[ Upstream commit b840b64bc8ed3fc46f6d6aa7f97c43862a33bea5 ]
+
+[Why & How]
+For a some specific monitors, when connected on boot or hot plug,
+monitor flash for 1/2 seconds can happen during first HDCP query
+operation. Ading some delay in the init sequence for these monitors
+fixes the issue, so it is implemented as monitor specific patch.
+
+Co-authored-by: Shah Dharati <dharshah at amd.com>
+Reviewed-by: Hansen Dsouza <Hansen.Dsouza at amd.com>
+Reviewed-by: Nicholas Kazlauskas <Nicholas.Kazlauskas at amd.com>
+Acked-by: Hamza Mahfooz <hamza.mahfooz at amd.com>
+Signed-off-by: Shah Dharati <dharshah at amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Sasha Levin <sashal at kernel.org>
+---
+ drivers/gpu/drm/amd/display/modules/hdcp/hdcp2_transition.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/display/modules/hdcp/hdcp2_transition.c b/drivers/gpu/drm/amd/display/modules/hdcp/hdcp2_transition.c
+index 1f4095b26409..c5f6c11de7e5 100644
+--- a/drivers/gpu/drm/amd/display/modules/hdcp/hdcp2_transition.c
++++ b/drivers/gpu/drm/amd/display/modules/hdcp/hdcp2_transition.c
+@@ -524,7 +524,7 @@ enum mod_hdcp_status mod_hdcp_hdcp2_dp_transition(struct mod_hdcp *hdcp,
+ 			set_watchdog_in_ms(hdcp, 3000, output);
+ 			set_state_id(hdcp, output, D2_A6_WAIT_FOR_RX_ID_LIST);
+ 		} else {
+-			callback_in_ms(0, output);
++			callback_in_ms(1, output);
+ 			set_state_id(hdcp, output, D2_SEND_CONTENT_STREAM_TYPE);
+ 		}
+ 		break;
+--
+2.35.1
+
+From: Rodrigo Siqueira <Rodrigo.Siqueira at amd.com>
+
+[ Upstream commit c55300ad4a1814bac9191a4d2c7b0d74273aec7c ]
+
+GCC throw warnings for the function dcn20_update_bounding_box due to its
+frame size that looks like this:
+
+ error: the frame size of 1936 bytes is larger than 1024 bytes [-Werror=frame-larger-than=]
+
+This commit fixes this issue by eliminating an intermediary variable
+that creates a large array.
+
+Cc: Stephen Rothwell <sfr at canb.auug.org.au>
+Cc: Hamza Mahfooz <hamza.mahfooz at amd.com>
+Cc: Aurabindo Pillai <aurabindo.pillai at amd.com>
+Reviewed-by: Harry Wentland <harry.wentland at amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Rodrigo Siqueira <Rodrigo.Siqueira at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Sasha Levin <sashal at kernel.org>
+---
+ .../drm/amd/display/dc/dml/dcn20/dcn20_fpu.c  | 38 +++++++++----------
+ 1 file changed, 18 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.c b/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.c
+index f79dd40f8d81..48df4f225ac7 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.c
++++ b/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.c
+@@ -1428,21 +1428,20 @@ void dcn20_calculate_wm(
+ void dcn20_update_bounding_box(struct dc *dc, struct _vcs_dpi_soc_bounding_box_st *bb,
+ 		struct pp_smu_nv_clock_table *max_clocks, unsigned int *uclk_states, unsigned int num_states)
+ {
+-	struct _vcs_dpi_voltage_scaling_st calculated_states[DC__VOLTAGE_STATES];
+-	int i;
+ 	int num_calculated_states = 0;
+ 	int min_dcfclk = 0;
++	int i;
+
+ 	dc_assert_fp_enabled();
+
+ 	if (num_states == 0)
+ 		return;
+
+-	memset(calculated_states, 0, sizeof(calculated_states));
++	memset(bb->clock_limits, 0, sizeof(bb->clock_limits));
+
+-	if (dc->bb_overrides.min_dcfclk_mhz > 0)
++	if (dc->bb_overrides.min_dcfclk_mhz > 0) {
+ 		min_dcfclk = dc->bb_overrides.min_dcfclk_mhz;
+-	else {
++	} else {
+ 		if (ASICREV_IS_NAVI12_P(dc->ctx->asic_id.hw_internal_rev))
+ 			min_dcfclk = 310;
+ 		else
+@@ -1453,36 +1452,35 @@ void dcn20_update_bounding_box(struct dc *dc, struct _vcs_dpi_soc_bounding_box_s
+
+ 	for (i = 0; i < num_states; i++) {
+ 		int min_fclk_required_by_uclk;
+-		calculated_states[i].state = i;
+-		calculated_states[i].dram_speed_mts = uclk_states[i] * 16 / 1000;
++		bb->clock_limits[i].state = i;
++		bb->clock_limits[i].dram_speed_mts = uclk_states[i] * 16 / 1000;
+
+ 		// FCLK:UCLK ratio is 1.08
+ 		min_fclk_required_by_uclk = div_u64(((unsigned long long)uclk_states[i]) * 1080,
+ 			1000000);
+
+-		calculated_states[i].fabricclk_mhz = (min_fclk_required_by_uclk < min_dcfclk) ?
++		bb->clock_limits[i].fabricclk_mhz = (min_fclk_required_by_uclk < min_dcfclk) ?
+ 				min_dcfclk : min_fclk_required_by_uclk;
+
+-		calculated_states[i].socclk_mhz = (calculated_states[i].fabricclk_mhz > max_clocks->socClockInKhz / 1000) ?
+-				max_clocks->socClockInKhz / 1000 : calculated_states[i].fabricclk_mhz;
++		bb->clock_limits[i].socclk_mhz = (bb->clock_limits[i].fabricclk_mhz > max_clocks->socClockInKhz / 1000) ?
++				max_clocks->socClockInKhz / 1000 : bb->clock_limits[i].fabricclk_mhz;
+
+-		calculated_states[i].dcfclk_mhz = (calculated_states[i].fabricclk_mhz > max_clocks->dcfClockInKhz / 1000) ?
+-				max_clocks->dcfClockInKhz / 1000 : calculated_states[i].fabricclk_mhz;
++		bb->clock_limits[i].dcfclk_mhz = (bb->clock_limits[i].fabricclk_mhz > max_clocks->dcfClockInKhz / 1000) ?
++				max_clocks->dcfClockInKhz / 1000 : bb->clock_limits[i].fabricclk_mhz;
+
+-		calculated_states[i].dispclk_mhz = max_clocks->displayClockInKhz / 1000;
+-		calculated_states[i].dppclk_mhz = max_clocks->displayClockInKhz / 1000;
+-		calculated_states[i].dscclk_mhz = max_clocks->displayClockInKhz / (1000 * 3);
++		bb->clock_limits[i].dispclk_mhz = max_clocks->displayClockInKhz / 1000;
++		bb->clock_limits[i].dppclk_mhz = max_clocks->displayClockInKhz / 1000;
++		bb->clock_limits[i].dscclk_mhz = max_clocks->displayClockInKhz / (1000 * 3);
+
+-		calculated_states[i].phyclk_mhz = max_clocks->phyClockInKhz / 1000;
++		bb->clock_limits[i].phyclk_mhz = max_clocks->phyClockInKhz / 1000;
+
+ 		num_calculated_states++;
+ 	}
+
+-	calculated_states[num_calculated_states - 1].socclk_mhz = max_clocks->socClockInKhz / 1000;
+-	calculated_states[num_calculated_states - 1].fabricclk_mhz = max_clocks->socClockInKhz / 1000;
+-	calculated_states[num_calculated_states - 1].dcfclk_mhz = max_clocks->dcfClockInKhz / 1000;
++	bb->clock_limits[num_calculated_states - 1].socclk_mhz = max_clocks->socClockInKhz / 1000;
++	bb->clock_limits[num_calculated_states - 1].fabricclk_mhz = max_clocks->socClockInKhz / 1000;
++	bb->clock_limits[num_calculated_states - 1].dcfclk_mhz = max_clocks->dcfClockInKhz / 1000;
+
+-	memcpy(bb->clock_limits, calculated_states, sizeof(bb->clock_limits));
+ 	bb->num_states = num_calculated_states;
+
+ 	// Duplicate the last state, DML always an extra state identical to max state to work
+--
+2.35.1
+
+From: Duncan Ma <duncan.ma at amd.com>
+
+[ Upstream commit d4965c53b95d7533dfc2309d2fc25838bd33220e ]
+
+[Why]
+When switching from 1 pipe to 4to1 mpc combine,
+DppDtoClk aren't enabled for the disabled pipes
+pior to programming the pipes. Upon optimizing
+bandwidth, DppDto are enabled causing intermittent
+underflow.
+
+[How]
+Update dppclk dto whenever pipe are flagged to
+enable.
+
+Reviewed-by: Dmytro Laktyushkin <Dmytro.Laktyushkin at amd.com>
+Reviewed-by: Nicholas Kazlauskas <Nicholas.Kazlauskas at amd.com>
+Reviewed-by: Hansen Dsouza <Hansen.Dsouza at amd.com>
+Acked-by: Hamza Mahfooz <hamza.mahfooz at amd.com>
+Signed-off-by: Duncan Ma <duncan.ma at amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Sasha Levin <sashal at kernel.org>
+---
+ drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+index ec6aa8d8b251..8b2c15a3cd92 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+@@ -1412,11 +1412,15 @@ static void dcn20_update_dchubp_dpp(
+ 	struct hubp *hubp = pipe_ctx->plane_res.hubp;
+ 	struct dpp *dpp = pipe_ctx->plane_res.dpp;
+ 	struct dc_plane_state *plane_state = pipe_ctx->plane_state;
++	struct dccg *dccg = dc->res_pool->dccg;
+ 	bool viewport_changed = false;
+
+ 	if (pipe_ctx->update_flags.bits.dppclk)
+ 		dpp->funcs->dpp_dppclk_control(dpp, false, true);
+
++	if (pipe_ctx->update_flags.bits.enable)
++		dccg->funcs->update_dpp_dto(dccg, dpp->inst, pipe_ctx->plane_res.bw.dppclk_khz);
++
+ 	/* TODO: Need input parameter to tell current DCHUB pipe tie to which OTG
+ 	 * VTG is within DCHUBBUB which is commond block share by each pipe HUBP.
+ 	 * VTG is 1:1 mapping with OTG. Each pipe HUBP will select which VTG
+--
+2.35.1
+
+From: Duncan Ma <duncan.ma at amd.com>
+
+[ Upstream commit 0c56705d8aae9696348cc320b71d531ede001b79 ]
+
+[Why]
+In 3-way mpo pipes, there is a case that we
+overbook the CRB buffer size. At rare instances,
+overbooking the crb will cause underflow. This only
+happens when det_size changes dynamically
+based on pipe_cnt.
+
+[How]
+Set min compbuff size to 1 segment when preparing BW.
+
+Reviewed-by: Dmytro Laktyushkin <Dmytro.Laktyushkin at amd.com>
+Acked-by: Hamza Mahfooz <hamza.mahfooz at amd.com>
+Signed-off-by: Duncan Ma <duncan.ma at amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Sasha Levin <sashal at kernel.org>
+---
+ drivers/gpu/drm/amd/display/dc/dml/dcn31/dcn31_fpu.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dml/dcn31/dcn31_fpu.c b/drivers/gpu/drm/amd/display/dc/dml/dcn31/dcn31_fpu.c
+index 54db2eca9e6b..1b02f0ebe957 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml/dcn31/dcn31_fpu.c
++++ b/drivers/gpu/drm/amd/display/dc/dml/dcn31/dcn31_fpu.c
+@@ -201,7 +201,7 @@ struct _vcs_dpi_ip_params_st dcn3_15_ip = {
+ 	.hostvm_max_page_table_levels = 2,
+ 	.rob_buffer_size_kbytes = 64,
+ 	.det_buffer_size_kbytes = DCN3_15_DEFAULT_DET_SIZE,
+-	.min_comp_buffer_size_kbytes = DCN3_15_MIN_COMPBUF_SIZE_KB,
++	.min_comp_buffer_size_kbytes = 64,
+ 	.config_return_buffer_size_in_kbytes = 1024,
+ 	.compressed_buffer_segment_size_in_kbytes = 64,
+ 	.meta_fifo_size_in_kentries = 32,
+@@ -297,6 +297,7 @@ struct _vcs_dpi_ip_params_st dcn3_16_ip = {
+ 	.hostvm_max_page_table_levels = 2,
+ 	.rob_buffer_size_kbytes = 64,
+ 	.det_buffer_size_kbytes = DCN3_16_DEFAULT_DET_SIZE,
++	.min_comp_buffer_size_kbytes = 64,
+ 	.config_return_buffer_size_in_kbytes = 1024,
+ 	.compressed_buffer_segment_size_in_kbytes = 64,
+ 	.meta_fifo_size_in_kentries = 32,
+--
+2.35.1
+
+From: Wayne Lin <Wayne.Lin at amd.com>
+
+[ Upstream commit 453b0016a054df0f442fda8a145b97a33816cab9 ]
+
+[Why]
+Once mst topology is constructed, later on new connected monitors
+are reported to source by CSN message. Within CSN, there is no
+carried info of DPCD_REV comparing to LINK_ADDRESS reply. As the
+result, we might leave some ports connected to DP but without DPCD
+revision number which will affect us determining the capability of
+the DP Rx.
+
+[How]
+Send out remote DPCD read when the port's dpcd_rev is 0x0 in
+detect_ctx(). Firstly, read out the value from DPCD 0x2200. If the
+return value is 0x0, it's likely the DP1.2 DP Rx then we reques
+revision from DPCD 0x0 again.
+
+Reviewed-by: Hersen Wu <hersenwu at amd.com>
+Acked-by: Hamza Mahfooz <hamza.mahfooz at amd.com>
+Signed-off-by: Wayne Lin <Wayne.Lin at amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Sasha Levin <sashal at kernel.org>
+---
+ .../display/amdgpu_dm/amdgpu_dm_mst_types.c   | 38 ++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
+index 2b9b095e5f03..1c02d873950d 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
+@@ -361,12 +361,48 @@ dm_dp_mst_detect(struct drm_connector *connector,
+ {
+ 	struct amdgpu_dm_connector *aconnector = to_amdgpu_dm_connector(connector);
+ 	struct amdgpu_dm_connector *master = aconnector->mst_port;
++	struct drm_dp_mst_port *port = aconnector->port;
++	int connection_status;
+
+ 	if (drm_connector_is_unregistered(connector))
+ 		return connector_status_disconnected;
+
+-	return drm_dp_mst_detect_port(connector, ctx, &master->mst_mgr,
++	connection_status = drm_dp_mst_detect_port(connector, ctx, &master->mst_mgr,
+ 				      aconnector->port);
++
++	if (port->pdt != DP_PEER_DEVICE_NONE && !port->dpcd_rev) {
++		uint8_t dpcd_rev;
++		int ret;
++
++		ret = drm_dp_dpcd_readb(&port->aux, DP_DP13_DPCD_REV, &dpcd_rev);
++
++		if (ret == 1) {
++			port->dpcd_rev = dpcd_rev;
++
++			/* Could be DP1.2 DP Rx case*/
++			if (!dpcd_rev) {
++				ret = drm_dp_dpcd_readb(&port->aux, DP_DPCD_REV, &dpcd_rev);
++
++				if (ret == 1)
++					port->dpcd_rev = dpcd_rev;
++			}
++
++			if (!dpcd_rev)
++				DRM_DEBUG_KMS("Can't decide DPCD revision number!");
++		}
++
++		/*
++		 * Could be legacy sink, logical port etc on DP1.2.
++		 * Will get Nack under these cases when issue remote
++		 * DPCD read.
++		 */
++		if (ret != 1)
++			DRM_DEBUG_KMS("Can't access DPCD");
++	} else if (port->pdt == DP_PEER_DEVICE_NONE) {
++		port->dpcd_rev = 0;
++	}
++
++	return connection_status;
+ }
+
+ static int dm_dp_mst_atomic_check(struct drm_connector *connector,
+--
+2.35.1
+
+From: David Zhang <dingchen.zhang at amd.com>
+
+[ Upstream commit 6cc5c77300afbb285c4f41e04f3435ae3c484c40 ]
+
+[why]
+When DC driver send PSR exit dmub command to DMUB FW, it might not
+wait until PSR exit. Then it may hit the following deadlock situation.
+1. DC driver send HW LOCK command to DMUB FW due to frame update
+2. DMUB FW Set the HW lock
+3. DMUB execute PSR exit sequence and stuck at polling DPG Pending
+register due to the HW Lock is set
+4. DC driver ask DMUB FW to unlock HW lock, but DMUB FW is polling
+DPG pending register
+
+[how]
+The reason why DC driver doesn't wait until PSR exit is because some of
+the PSR state machine state is not update the dc driver. So when DC
+driver read back the PSR state, it take the state for PSR inactive.
+
+Signed-off-by: David Zhang <dingchen.zhang at amd.com>
+Acked-by: Leo Li <sunpeng.li at amd.com>
+Reviewed-by: Harry Wentland <harry.wentland at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Signed-off-by: Sasha Levin <sashal at kernel.org>
+---
+ drivers/gpu/drm/amd/display/dc/dc_types.h     |  7 +++++++
+ drivers/gpu/drm/amd/display/dc/dce/dmub_psr.c | 16 ++++++++++++++++
+ 2 files changed, 23 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_types.h b/drivers/gpu/drm/amd/display/dc/dc_types.h
+index 2ba9f528c0fe..f1f11b3c205f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_types.h
+@@ -657,10 +657,17 @@ enum dc_psr_state {
+ 	PSR_STATE4b,
+ 	PSR_STATE4c,
+ 	PSR_STATE4d,
++	PSR_STATE4_FULL_FRAME,
++	PSR_STATE4a_FULL_FRAME,
++	PSR_STATE4b_FULL_FRAME,
++	PSR_STATE4c_FULL_FRAME,
++	PSR_STATE4_FULL_FRAME_POWERUP,
+ 	PSR_STATE5,
+ 	PSR_STATE5a,
+ 	PSR_STATE5b,
+ 	PSR_STATE5c,
++	PSR_STATE_HWLOCK_MGR,
++	PSR_STATE_POLLVUPDATE,
+ 	PSR_STATE_INVALID = 0xFF
+ };
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dmub_psr.c b/drivers/gpu/drm/amd/display/dc/dce/dmub_psr.c
+index 1d4f0c45b536..f941aa107dc6 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dmub_psr.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dmub_psr.c
+@@ -74,6 +74,22 @@ static enum dc_psr_state convert_psr_state(uint32_t raw_state)
+ 		state = PSR_STATE5b;
+ 	else if (raw_state == 0x53)
+ 		state = PSR_STATE5c;
++	else if (raw_state == 0x4A)
++		state = PSR_STATE4_FULL_FRAME;
++	else if (raw_state == 0x4B)
++		state = PSR_STATE4a_FULL_FRAME;
++	else if (raw_state == 0x4C)
++		state = PSR_STATE4b_FULL_FRAME;
++	else if (raw_state == 0x4D)
++		state = PSR_STATE4c_FULL_FRAME;
++	else if (raw_state == 0x4E)
++		state = PSR_STATE4_FULL_FRAME_POWERUP;
++	else if (raw_state == 0x60)
++		state = PSR_STATE_HWLOCK_MGR;
++	else if (raw_state == 0x61)
++		state = PSR_STATE_POLLVUPDATE;
++	else
++		state = PSR_STATE_INVALID;
+
+ 	return state;
+ }
+--
+2.35.1
+
+If usize > ksize, usize may be not valid and if(!access_ok()) will return
+-EFAULT. But ksize may be valid, copy_to_user() should be executed.And
+also, copy_to_user() will calls access_ok() to test whether a block of
+memory is a valid user space address.
+
+Signed-off-by: Tuo Cao <91tuocao@xxxxxxxxx>
+---
+ kernel/sched/core.c | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index ee28253c9ac0..fe6a65a54626 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -7975,9 +7975,6 @@ sched_attr_copy_to_user(struct sched_attr __user *uattr,
+ {
+ 	unsigned int ksize = sizeof(*kattr);
+
+-	if (!access_ok(uattr, usize))
+-		return -EFAULT;
+-
+ 	/*
+ 	 * sched_getattr() ABI forwards and backwards compatibility:
+ 	 *
+--
+2.17.1
+
+Fixes: 90af0ca047f3 ("drm/amdgpu: Protect the amdgpu_bo_list list with a mutex v2")
+Reported-by: Mikhail Gavrilov <mikhail.v.gavrilov@xxxxxxxxx>
+Signed-off-by: Maíra Canal <mairacanal@xxxxxxxxxx>
+---
+Thanks Melissa and Christian for the feedback on mutex_unlock.
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c | 8 ++------
+ 1 file changed, 2 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index d8f1335bc68f..b7bae833c804 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -837,16 +837,12 @@ static int amdgpu_cs_vm_handling(struct amdgpu_cs_parser *p)
+ 			continue;
+
+ 		r = amdgpu_vm_bo_update(adev, bo_va, false);
+-		if (r) {
+-			mutex_unlock(&p->bo_list->bo_list_mutex);
++		if (r)
+ 			return r;
+-		}
+
+ 		r = amdgpu_sync_fence(&p->job->sync, bo_va->last_pt_update);
+-		if (r) {
+-			mutex_unlock(&p->bo_list->bo_list_mutex);
++		if (r)
+ 			return r;
+-		}
+ 	}
+
+ 	r = amdgpu_vm_handle_moved(adev, vm);
+--
+2.37.2
+
+The find_min_pfn_with_active_regions() is only called in free_area_init(),
+Move PHYS_PFN(memblock_start_of_DRAM()) into free_area_init(), and kill
+find_min_pfn_with_active_regions().
+
+Signed-off-by: Kefeng Wang <wangkefeng.wang@xxxxxxxxxx>
+---
+ include/linux/mm.h |  1 -
+ mm/page_alloc.c    | 13 +------------
+ 2 files changed, 1 insertion(+), 13 deletions(-)
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 3bedc449c14d..59144ad0a54c 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -2488,7 +2488,6 @@ extern unsigned long absent_pages_in_range(unsigned long start_pfn,
+ 						unsigned long end_pfn);
+ extern void get_pfn_range_for_nid(unsigned int nid,
+ 			unsigned long *start_pfn, unsigned long *end_pfn);
+-extern unsigned long find_min_pfn_with_active_regions(void);
+
+ #ifndef CONFIG_NUMA
+ static inline int early_pfn_to_nid(unsigned long pfn)
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index e5486d47406e..34eda5c18fdb 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -7908,17 +7908,6 @@ unsigned long __init node_map_pfn_alignment(void)
+ 	return ~accl_mask + 1;
+ }
+
+-/**
+- * find_min_pfn_with_active_regions - Find the minimum PFN registered
+- *
+- * Return: the minimum PFN based on information provided via
+- * memblock_set_node().
+- */
+-unsigned long __init find_min_pfn_with_active_regions(void)
+-{
+-	return PHYS_PFN(memblock_start_of_DRAM());
+-}
+-
+ /*
+  * early_calculate_totalpages()
+  * Sum pages in active regions for movable zone.
+@@ -8211,7 +8200,7 @@ void __init free_area_init(unsigned long *max_zone_pfn)
+ 	memset(arch_zone_highest_possible_pfn, 0,
+ 				sizeof(arch_zone_highest_possible_pfn));
+
+-	start_pfn = find_min_pfn_with_active_regions();
++	start_pfn = PHYS_PFN(memblock_start_of_DRAM());
+ 	descending = arch_has_descending_max_zone_pfns();
+
+ 	for (i = 0; i < MAX_NR_ZONES; i++) {
+--
+2.35.3
+
+If m is NULL, we will end up referencing a NULL pointer in the
+subsequent m elements like extcpu, bank and status. Pull the NULL
+check out and do it first before referencing m's elements.
+
+Signed-off-by: Kent Russell <kent.russell at amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+index ab9ba5a9c33d..028495fdfa62 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+@@ -2838,12 +2838,15 @@ static int amdgpu_bad_page_notifier(struct notifier_block *nb,
+ 	struct eeprom_table_record err_rec;
+ 	uint64_t retired_page;
+
++	if (!m)
++		return NOTIFY_DONE;
++
+ 	/*
+ 	 * If the error was generated in UMC_V2, which belongs to GPU UMCs,
+ 	 * and error occurred in DramECC (Extended error code = 0) then only
+ 	 * process the error, else bail out.
+ 	 */
+-	if (!m || !((smca_get_bank_type(m->extcpu, m->bank) == SMCA_UMC_V2) &&
++	if (!((smca_get_bank_type(m->extcpu, m->bank) == SMCA_UMC_V2) &&
+ 		    (XEC(m->status, 0x3f) == 0x0)))
+ 		return NOTIFY_DONE;
+
+--
+2.25.1
+
+For CPU with VMX feature, if there's no crash kernel loaded and
+crash_kexec_post_notifiers is true, then it will endup call
+nmi_shootdown_cpus() twice. This will crash the system because it double
+register the same nmi callback
+
+The first call is:
+
+    nmi_shootdown_cpus+0x21/0xc0
+    kdump_nmi_shootdown_cpus+0x15/0x20
+    crash_smp_send_stop+0x23/0x40
+    __panic+0xec/0x2d0
+
+The second call is:
+
+    nmi_shootdown_cpus+0x21/0xc0
+    native_machine_emergency_restart+0x7d/0x270
+    machine_emergency_restart+0x1c/0x20
+    emergency_restart+0x1a/0x20
+    __panic+0x231/0x2d0
+
+Fixes: d176720d34c7 ("x86: disable VMX on all CPUs on reboot")
+Fixes: 2340b62f77c7 ("kdump: forcibly disable VMX and SVM on machine_crash_shutdown()")
+Signed-off-by: Weinan Liu <wnliu@xxxxxxxxxx>
+---
+ arch/x86/kernel/reboot.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
+index c3636ea4aa71..f9890e299750 100644
+--- a/arch/x86/kernel/reboot.c
++++ b/arch/x86/kernel/reboot.c
+@@ -837,7 +837,17 @@ static int crash_nmi_callback(unsigned int val, struct pt_regs *regs)
+  */
+ void nmi_shootdown_cpus(nmi_shootdown_cb callback)
+ {
++	static bool cpus_shutdown;
+ 	unsigned long msecs;
++
++	/*
++	 * Only shutdown CPUs once. Double register nmi callback will crash the
++	 * system
++	 */
++	if (cpus_shutdown)
++		return;
++	cpus_shutdown = true;
++
+ 	local_irq_disable();
+
+ 	/* Make a note of crashing cpu. Will be used in NMI callback. */
+--
+2.37.1.595.g718a3a8f04-goog
+
+There are no backing hardware registers for ih_soft ring.
+As a result, don't try to access hardware registers for read
+and write pointers when processing interrupts on the IH soft
+ring.
+
+Signed-off-by: Mukul Joshi <mukul.joshi at amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/navi10_ih.c | 7 ++++++-
+ drivers/gpu/drm/amd/amdgpu/vega10_ih.c | 7 ++++++-
+ drivers/gpu/drm/amd/amdgpu/vega20_ih.c | 7 ++++++-
+ 3 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/navi10_ih.c b/drivers/gpu/drm/amd/amdgpu/navi10_ih.c
+index 4b5396d3e60f..eec13cb5bf75 100644
+--- a/drivers/gpu/drm/amd/amdgpu/navi10_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/navi10_ih.c
+@@ -409,9 +409,11 @@ static u32 navi10_ih_get_wptr(struct amdgpu_device *adev,
+ 	u32 wptr, tmp;
+ 	struct amdgpu_ih_regs *ih_regs;
+
+-	if (ih == &adev->irq.ih) {
++	if (ih == &adev->irq.ih || ih == &adev->irq.ih_soft) {
+ 		/* Only ring0 supports writeback. On other rings fall back
+ 		 * to register-based code with overflow checking below.
++		 * ih_soft ring doesn't have any backing hardware registers,
++		 * update wptr and return.
+ 		 */
+ 		wptr = le32_to_cpu(*ih->wptr_cpu);
+
+@@ -483,6 +485,9 @@ static void navi10_ih_set_rptr(struct amdgpu_device *adev,
+ {
+ 	struct amdgpu_ih_regs *ih_regs;
+
++	if (ih == &adev->irq.ih_soft)
++		return;
++
+ 	if (ih->use_doorbell) {
+ 		/* XXX check if swapping is necessary on BE */
+ 		*ih->rptr_cpu = ih->rptr;
+diff --git a/drivers/gpu/drm/amd/amdgpu/vega10_ih.c b/drivers/gpu/drm/amd/amdgpu/vega10_ih.c
+index cdd599a08125..03b7066471f9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vega10_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/vega10_ih.c
+@@ -334,9 +334,11 @@ static u32 vega10_ih_get_wptr(struct amdgpu_device *adev,
+ 	u32 wptr, tmp;
+ 	struct amdgpu_ih_regs *ih_regs;
+
+-	if (ih == &adev->irq.ih) {
++	if (ih == &adev->irq.ih || ih == &adev->irq.ih_soft) {
+ 		/* Only ring0 supports writeback. On other rings fall back
+ 		 * to register-based code with overflow checking below.
++		 * ih_soft ring doesn't have any backing hardware registers,
++		 * update wptr and return.
+ 		 */
+ 		wptr = le32_to_cpu(*ih->wptr_cpu);
+
+@@ -409,6 +411,9 @@ static void vega10_ih_set_rptr(struct amdgpu_device *adev,
+ {
+ 	struct amdgpu_ih_regs *ih_regs;
+
++	if (ih == &adev->irq.ih_soft)
++		return;
++
+ 	if (ih->use_doorbell) {
+ 		/* XXX check if swapping is necessary on BE */
+ 		*ih->rptr_cpu = ih->rptr;
+diff --git a/drivers/gpu/drm/amd/amdgpu/vega20_ih.c b/drivers/gpu/drm/amd/amdgpu/vega20_ih.c
+index 3b4eb8285943..2022ffbb8dba 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vega20_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/vega20_ih.c
+@@ -385,9 +385,11 @@ static u32 vega20_ih_get_wptr(struct amdgpu_device *adev,
+ 	u32 wptr, tmp;
+ 	struct amdgpu_ih_regs *ih_regs;
+
+-	if (ih == &adev->irq.ih) {
++	if (ih == &adev->irq.ih || ih == &adev->irq.ih_soft) {
+ 		/* Only ring0 supports writeback. On other rings fall back
+ 		 * to register-based code with overflow checking below.
++		 * ih_soft ring doesn't have any backing hardware registers,
++		 * update wptr and return.
+ 		 */
+ 		wptr = le32_to_cpu(*ih->wptr_cpu);
+
+@@ -461,6 +463,9 @@ static void vega20_ih_set_rptr(struct amdgpu_device *adev,
+ {
+ 	struct amdgpu_ih_regs *ih_regs;
+
++	if (ih == &adev->irq.ih_soft)
++		return;
++
+ 	if (ih->use_doorbell) {
+ 		/* XXX check if swapping is necessary on BE */
+ 		*ih->rptr_cpu = ih->rptr;
+--
+2.35.1
