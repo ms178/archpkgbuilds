@@ -23,10 +23,12 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -DCMAKE_C_COMPILER=${CPATH}/clang \
     -DCMAKE_CXX_COMPILER=${CPATH}/clang++ \
     -DLLVM_USE_LINKER=${CPATH}/ld.lld \
-        -D LLVM_ENABLE_PROJECTS="polly;lld;compiler-rt;clang" \
-        -D LLVM_ENABLE_RUNTIMES="openmp" \
-        -D CMAKE_CXX_STANDARD=17 \
-        -D CMAKE_C_STANDARD=17 \
+        -D CMAKE_C_FLAGS="-O3 -march=native -mllvm -extra-vectorizer-passes -mllvm -enable-cond-stores-vec -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -interleave-small-loop-scalar-reduction -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -fno-math-errno -fno-trapping-math -falign-functions=32 -fno-semantic-interposition -fcf-protection=none -mharden-sls=none -flto=thin" \
+        -D CMAKE_CXX_FLAGS="-O3 -march=native -mllvm -extra-vectorizer-passes -mllvm -enable-cond-stores-vec -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -interleave-small-loop-scalar-reduction -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -fno-math-errno -fno-trapping-math -falign-functions=32 -fno-semantic-interposition -fcf-protection=none -mharden-sls=none -flto=thin" \
+        -D CMAKE_EXE_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -Wl,-mllvm,-march=native -mllvm -extra-vectorizer-passes -mllvm -enable-cond-stores-vec -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -interleave-small-loop-scalar-reduction -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -fuse-ld=lld -flto=thin -Wl,--emit-relocs" \
+        -D CMAKE_MODULE_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -Wl,-mllvm,-march=native -mllvm -extra-vectorizer-passes -mllvm -enable-cond-stores-vec -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -interleave-small-loop-scalar-reduction -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -fuse-ld=lld -flto=thin -Wl,--emit-relocs" \
+        -D CMAKE_SHARED_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -Wl,-mllvm,-march=native -mllvm -extra-vectorizer-passes -mllvm -enable-cond-stores-vec -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -interleave-small-loop-scalar-reduction -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -fuse-ld=lld -flto=thin -Wl,--emit-relocs" \
+        -D LLVM_ENABLE_PROJECTS="polly;lld;compiler-rt;clang;openmp" \
         -D LLVM_TARGETS_TO_BUILD="AMDGPU;X86" \
         -D CLANG_ENABLE_ARCMT:BOOL=OFF \
         -D CLANG_ENABLE_STATIC_ANALYZER:BOOL=OFF \
@@ -51,7 +53,6 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -DCMAKE_INSTALL_PREFIX=${TOPLEV}/stage2-prof-use-lto/install \
     -DLLVM_PROFDATA_FILE=${TOPLEV}/stage2-prof-gen/profiles/clang.profdata \
     -DLLVM_ENABLE_LTO=Thin \
-    -DCMAKE_EXE_LINKER_FLAGS="-Wl,--emit-relocs" \
     -DLLVM_ENABLE_PLUGINS=ON \
     -DLLVM_ENABLE_TERMINFO=OFF  || (echo "Could not configure project!"; exit 1)
 
