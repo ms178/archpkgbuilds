@@ -1,0 +1,229 @@
+From 9a1a1aca8bd8d4bc561b41b1289b5bf5001896ec Mon Sep 17 00:00:00 2001
+From: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+Date: Mon, 15 Aug 2022 11:59:03 +0200
+Subject: [PATCH] radv: compact MRTs to save PS export memory space
+
+If there are holes between color outputs (e.g. a shader exports MRT1,
+but not MRT0), we can remove the holes by moving higher MRTs lower.
+
+The hardware will remap the MRTs to their correct locations if we remove
+holes in SPI_SHADER_COL_FORMAT but not CB_SHADER_MASK.
+
+This is good for performance because the hardware will allocate less
+space for color MRTs.
+
+Signed-off-by: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+---
+ .../compiler/aco_instruction_selection.cpp    | 19 ++++++++---
+ src/amd/vulkan/radv_nir_to_llvm.c             | 18 +++++-----
+ src/amd/vulkan/radv_pipeline.c                | 34 +++++++++++++------
+ 3 files changed, 46 insertions(+), 25 deletions(-)
+
+diff --git a/src/amd/compiler/aco_instruction_selection.cpp b/src/amd/compiler/aco_instruction_selection.cpp
+index 252b4d42a5b4..743a7862a71a 100644
+--- a/src/amd/compiler/aco_instruction_selection.cpp
++++ b/src/amd/compiler/aco_instruction_selection.cpp
+@@ -11419,6 +11419,8 @@ create_fs_exports(isel_context* ctx)
+    if (ctx->program->info.ps.has_epilog) {
+       create_fs_jump_to_epilog(ctx);
+    } else {
++      unsigned compacted_mrt_index = 0;
++
+       /* Export all color render targets. */
+       for (unsigned i = FRAG_RESULT_DATA0; i < FRAG_RESULT_DATA7 + 1; ++i) {
+          if (!ctx->outputs.mask[i])
+@@ -11426,9 +11428,9 @@ create_fs_exports(isel_context* ctx)
+ 
+          struct mrt_color_export out = {0};
+ 
+-         out.slot = i - FRAG_RESULT_DATA0;
++         out.slot = compacted_mrt_index;
+          out.write_mask = ctx->outputs.mask[i];
+-         out.col_format = (ctx->options->key.ps.col_format >> (4 * out.slot)) & 0xf;
++         out.col_format = (ctx->options->key.ps.col_format >> (4 * (i - FRAG_RESULT_DATA0))) & 0xf;
+ 
+          for (unsigned c = 0; c < 4; ++c) {
+             if (out.write_mask & (1 << c)) {
+@@ -11438,7 +11440,10 @@ create_fs_exports(isel_context* ctx)
+             }
+          }
+ 
+-         exported |= export_fs_mrt_color(ctx, &out, false);
++         if (export_fs_mrt_color(ctx, &out, false)) {
++            compacted_mrt_index++;
++            exported = true;
++         }
+       }
+ 
+       if (!exported)
+@@ -12538,6 +12543,7 @@ select_ps_epilog(Program* program, const struct aco_ps_epilog_key* key, ac_shade
+    Builder bld(ctx.program, ctx.block);
+ 
+    /* Export all color render targets */
++   unsigned compacted_mrt_index = 0;
+    bool exported = false;
+ 
+    for (unsigned i = 0; i < 8; i++) {
+@@ -12548,7 +12554,7 @@ select_ps_epilog(Program* program, const struct aco_ps_epilog_key* key, ac_shade
+ 
+       struct mrt_color_export out;
+ 
+-      out.slot = i;
++      out.slot = compacted_mrt_index;
+       out.write_mask = 0xf;
+       out.col_format = col_format;
+       out.is_int8 = (key->color_is_int8 >> i) & 1;
+@@ -12560,7 +12566,10 @@ select_ps_epilog(Program* program, const struct aco_ps_epilog_key* key, ac_shade
+          out.values[c] = Operand(emit_extract_vector(&ctx, inputs, c, v1));
+       }
+ 
+-      exported |= export_fs_mrt_color(&ctx, &out, true);
++      if (export_fs_mrt_color(&ctx, &out, true)) {
++         compacted_mrt_index++;
++         exported = true;
++      }
+    }
+ 
+    if (!exported)
+diff --git a/src/amd/vulkan/radv_nir_to_llvm.c b/src/amd/vulkan/radv_nir_to_llvm.c
+index 7b36799be3d8..e840bddb8b40 100644
+--- a/src/amd/vulkan/radv_nir_to_llvm.c
++++ b/src/amd/vulkan/radv_nir_to_llvm.c
+@@ -570,7 +570,8 @@ scan_shader_output_decl(struct radv_shader_context *ctx, struct nir_variable *va
+ /* Initialize arguments for the shader export intrinsic */
+ static void
+ si_llvm_init_export_args(struct radv_shader_context *ctx, LLVMValueRef *values,
+-                         unsigned enabled_channels, unsigned target, struct ac_export_args *args)
++                         unsigned enabled_channels, unsigned target, unsigned index,
++                         struct ac_export_args *args)
+ {
+    /* Specify the channels that are enabled. */
+    args->enabled_channels = enabled_channels;
+@@ -595,7 +596,6 @@ si_llvm_init_export_args(struct radv_shader_context *ctx, LLVMValueRef *values,
+ 
+    bool is_16bit = ac_get_type_size(LLVMTypeOf(values[0])) == 2;
+    if (ctx->stage == MESA_SHADER_FRAGMENT) {
+-      unsigned index = target - V_008DFC_SQ_EXP_MRT;
+       unsigned col_format = (ctx->options->key.ps.col_format >> (4 * index)) & 0xf;
+       bool is_int8 = (ctx->options->key.ps.is_int8 >> index) & 1;
+       bool is_int10 = (ctx->options->key.ps.is_int10 >> index) & 1;
+@@ -735,7 +735,7 @@ radv_export_param(struct radv_shader_context *ctx, unsigned index, LLVMValueRef
+ {
+    struct ac_export_args args;
+ 
+-   si_llvm_init_export_args(ctx, values, enabled_channels, V_008DFC_SQ_EXP_PARAM + index, &args);
++   si_llvm_init_export_args(ctx, values, enabled_channels, V_008DFC_SQ_EXP_PARAM + index, 0, &args);
+    ac_build_export(&ctx->ac, &args);
+ }
+ 
+@@ -907,7 +907,7 @@ radv_llvm_export_vs(struct radv_shader_context *ctx, struct radv_shader_output_v
+    for (i = 0; i < noutput; i++) {
+       switch (outputs[i].slot_name) {
+       case VARYING_SLOT_POS:
+-         si_llvm_init_export_args(ctx, outputs[i].values, 0xf, V_008DFC_SQ_EXP_POS, &pos_args[0]);
++         si_llvm_init_export_args(ctx, outputs[i].values, 0xf, V_008DFC_SQ_EXP_POS, 0, &pos_args[0]);
+          break;
+       case VARYING_SLOT_PSIZ:
+          psize_value = outputs[i].values[0];
+@@ -924,7 +924,7 @@ radv_llvm_export_vs(struct radv_shader_context *ctx, struct radv_shader_output_v
+       case VARYING_SLOT_CLIP_DIST0:
+       case VARYING_SLOT_CLIP_DIST1:
+          index = 2 + outputs[i].slot_index;
+-         si_llvm_init_export_args(ctx, outputs[i].values, 0xf, V_008DFC_SQ_EXP_POS + index,
++         si_llvm_init_export_args(ctx, outputs[i].values, 0xf, V_008DFC_SQ_EXP_POS + index, 0,
+                                   &pos_args[index]);
+          break;
+       default:
+@@ -1055,11 +1055,11 @@ handle_vs_outputs_post(struct radv_shader_context *ctx, bool export_prim_id, boo
+ }
+ 
+ static bool
+-si_export_mrt_color(struct radv_shader_context *ctx, LLVMValueRef *color, unsigned index,
+-                    struct ac_export_args *args)
++si_export_mrt_color(struct radv_shader_context *ctx, LLVMValueRef *color, unsigned target,
++                    unsigned index, struct ac_export_args *args)
+ {
+    /* Export */
+-   si_llvm_init_export_args(ctx, color, 0xf, V_008DFC_SQ_EXP_MRT + index, args);
++   si_llvm_init_export_args(ctx, color, 0xf, V_008DFC_SQ_EXP_MRT + target, index, args);
+    if (!args->enabled_channels)
+       return false; /* unnecessary NULL export */
+ 
+@@ -1096,7 +1096,7 @@ handle_fs_outputs_post(struct radv_shader_context *ctx)
+       for (unsigned j = 0; j < 4; j++)
+          values[j] = ac_to_float(&ctx->ac, radv_load_output(ctx, i, j));
+ 
+-      bool ret = si_export_mrt_color(ctx, values, i - FRAG_RESULT_DATA0, &color_args[index]);
++      bool ret = si_export_mrt_color(ctx, values, index, i - FRAG_RESULT_DATA0, &color_args[index]);
+       if (ret)
+          index++;
+    }
+diff --git a/src/amd/vulkan/radv_pipeline.c b/src/amd/vulkan/radv_pipeline.c
+index d7bbf8e9f695..75ae56ea0327 100644
+--- a/src/amd/vulkan/radv_pipeline.c
++++ b/src/amd/vulkan/radv_pipeline.c
+@@ -528,6 +528,24 @@ format_is_float32(VkFormat format)
+           desc->channel[channel].type == UTIL_FORMAT_TYPE_FLOAT && desc->channel[channel].size == 32;
+ }
+ 
++static unsigned radv_get_spi_shader_col_format(unsigned spi_shader_col_format)
++{
++   unsigned value = 0, num_mrts = 0;
++   unsigned i, num_targets = DIV_ROUND_UP(util_last_bit(spi_shader_col_format), 4);
++
++   /* Remove holes in spi_shader_col_format. */
++   for (i = 0; i < num_targets; i++) {
++      unsigned spi_format = (spi_shader_col_format >> (i * 4)) & 0xf;
++
++      if (spi_format) {
++         value |= spi_format << (num_mrts * 4);
++         num_mrts++;
++      }
++   }
++
++   return value;
++}
++
+ static void
+ radv_pipeline_compute_spi_color_formats(const struct radv_graphics_pipeline *pipeline,
+                                         const VkGraphicsPipelineCreateInfo *pCreateInfo,
+@@ -535,7 +553,6 @@ radv_pipeline_compute_spi_color_formats(const struct radv_graphics_pipeline *pip
+                                         const struct radv_graphics_pipeline_info *info)
+ {
+    unsigned col_format = 0, is_int8 = 0, is_int10 = 0, is_float32 = 0;
+-   unsigned num_targets;
+ 
+    for (unsigned i = 0; i < info->ri.color_att_count; ++i) {
+       unsigned cf;
+@@ -568,16 +585,6 @@ radv_pipeline_compute_spi_color_formats(const struct radv_graphics_pipeline *pip
+       col_format |= V_028714_SPI_SHADER_32_AR;
+    }
+ 
+-   /* If the i-th target format is set, all previous target formats must
+-    * be non-zero to avoid hangs.
+-    */
+-   num_targets = (util_last_bit(col_format) + 3) / 4;
+-   for (unsigned i = 0; i < num_targets; i++) {
+-      if (!(col_format & (0xfu << (i * 4)))) {
+-         col_format |= V_028714_SPI_SHADER_32_R << (i * 4);
+-      }
+-   }
+-
+    /* The output for dual source blending should have the same format as
+     * the first output.
+     */
+@@ -7026,6 +7033,11 @@ radv_graphics_pipeline_init(struct radv_graphics_pipeline *pipeline, struct radv
+          blend.spi_shader_col_format = V_028714_SPI_SHADER_32_R;
+    }
+ 
++   /* Compact spi_shader_col_format because MRT holes are removed during compilation for optimal
++    * performance.
++    */
++   blend.spi_shader_col_format = radv_get_spi_shader_col_format(blend.spi_shader_col_format);
++
+    pipeline->col_format = blend.spi_shader_col_format;
+    pipeline->cb_target_mask = blend.cb_target_mask;
+ 
+-- 
+GitLab
+
