@@ -5181,155 +5181,6 @@ index 28516881a1b2..ca72220eedd9 100644
 --
 2.27.0
 
-From: Yu Kuai <yukuai3@xxxxxxxxxx>
-
-There are two problems can lead to lost wakeup:
-
-1) invalid wakeup on the wrong waitqueue:
-
-For example, 2 * wake_batch tags are put, while only wake_batch threads
-are woken:
-
-__sbq_wake_up
- atomic_cmpxchg -> reset wait_cnt
-			__sbq_wake_up -> decrease wait_cnt
-			...
-			__sbq_wake_up -> wait_cnt is decreased to 0 again
-			 atomic_cmpxchg
-			 sbq_index_atomic_inc -> increase wake_index
-			 wake_up_nr -> wake up and waitqueue might be empty
- sbq_index_atomic_inc -> increase again, one waitqueue is skipped
- wake_up_nr -> invalid wake up because old wakequeue might be empty
-
-To fix the problem, increasing 'wake_index' before resetting 'wait_cnt'.
-
-2) 'wait_cnt' can be decreased while waitqueue is empty
-
-As pointed out by Jan Kara, following race is possible:
-
-CPU1				CPU2
-__sbq_wake_up			 __sbq_wake_up
- sbq_wake_ptr()			 sbq_wake_ptr() -> the same
- wait_cnt = atomic_dec_return()
- /* decreased to 0 */
- sbq_index_atomic_inc()
- /* move to next waitqueue */
- atomic_set()
- /* reset wait_cnt */
- wake_up_nr()
- /* wake up on the old waitqueue */
-				 wait_cnt = atomic_dec_return()
-				 /*
-				  * decrease wait_cnt in the old
-				  * waitqueue, while it can be
-				  * empty.
-				  */
-
-Fix the problem by waking up before updating 'wake_index' and
-'wait_cnt'.
-
-With this patch, noted that 'wait_cnt' is still decreased in the old
-empty waitqueue, however, the wakeup is redirected to a active waitqueue,
-and the extra decrement on the old empty waitqueue is not handled.
-
-Fixes: 88459642cba4 ("blk-mq: abstract tag allocation out into sbitmap library")
-Signed-off-by: Yu Kuai <yukuai3@xxxxxxxxxx>
-Reviewed-by: Jan Kara <jack@xxxxxxx>
----
-Changes in official version:
-- fix spelling mistake in comments
-- add review tag
-Changes in rfc v4:
- - remove patch 1, which improve fairness with overhead
- - merge patch2 and patch 3
-Changes in rfc v3:
- - rename patch 2, and add some comments.
- - add patch 3, which fixes a new issue pointed out by Jan Kara.
-Changes in rfc v2:
- - split to spearate patches for different problem.
- - add fix tag
-
- previous versions:
-rfc v1: https://lore.kernel.org/all/20220617141125.3024491-1-yukuai3@xxxxxxxxxx/
-rfc v2: https://lore.kernel.org/all/20220619080309.1630027-1-yukuai3@xxxxxxxxxx/
-rfc v3: https://lore.kernel.org/all/20220710042200.20936-1-yukuai1@xxxxxxxxxxxxxxx/
-rfc v4: https://lore.kernel.org/all/20220723024122.2990436-1-yukuai1@xxxxxxxxxxxxxxx/
- lib/sbitmap.c | 55 ++++++++++++++++++++++++++++++---------------------
- 1 file changed, 33 insertions(+), 22 deletions(-)
-
-diff --git a/lib/sbitmap.c b/lib/sbitmap.c
-index 29eb0484215a..1aa55806f6a5 100644
---- a/lib/sbitmap.c
-+++ b/lib/sbitmap.c
-@@ -611,32 +611,43 @@ static bool __sbq_wake_up(struct sbitmap_queue *sbq)
- 		return false;
-
- 	wait_cnt = atomic_dec_return(&ws->wait_cnt);
--	if (wait_cnt <= 0) {
--		int ret;
-+	/*
-+	 * For concurrent callers of this, callers should call this function
-+	 * again to wakeup a new batch on a different 'ws'.
-+	 */
-+	if (wait_cnt < 0 || !waitqueue_active(&ws->wait))
-+		return true;
-
--		wake_batch = READ_ONCE(sbq->wake_batch);
-+	if (wait_cnt > 0)
-+		return false;
-
--		/*
--		 * Pairs with the memory barrier in sbitmap_queue_resize() to
--		 * ensure that we see the batch size update before the wait
--		 * count is reset.
--		 */
--		smp_mb__before_atomic();
-+	wake_batch = READ_ONCE(sbq->wake_batch);
-
--		/*
--		 * For concurrent callers of this, the one that failed the
--		 * atomic_cmpxhcg() race should call this function again
--		 * to wakeup a new batch on a different 'ws'.
--		 */
--		ret = atomic_cmpxchg(&ws->wait_cnt, wait_cnt, wake_batch);
--		if (ret == wait_cnt) {
--			sbq_index_atomic_inc(&sbq->wake_index);
--			wake_up_nr(&ws->wait, wake_batch);
--			return false;
--		}
-+	/*
-+	 * Wake up first in case that concurrent callers decrease wait_cnt
-+	 * while waitqueue is empty.
-+	 */
-+	wake_up_nr(&ws->wait, wake_batch);
-
--		return true;
--	}
-+	/*
-+	 * Pairs with the memory barrier in sbitmap_queue_resize() to
-+	 * ensure that we see the batch size update before the wait
-+	 * count is reset.
-+	 *
-+	 * Also pairs with the implicit barrier between decrementing wait_cnt
-+	 * and checking for waitqueue_active() to make sure waitqueue_active()
-+	 * sees result of the wakeup if atomic_dec_return() has seen the result
-+	 * of atomic_set().
-+	 */
-+	smp_mb__before_atomic();
-+
-+	/*
-+	 * Increase wake_index before updating wait_cnt, otherwise concurrent
-+	 * callers can see valid wait_cnt in old waitqueue, which can cause
-+	 * invalid wakeup on the old waitqueue.
-+	 */
-+	sbq_index_atomic_inc(&sbq->wake_index);
-+	atomic_set(&ws->wait_cnt, wake_batch);
-
- 	return false;
- }
---
-2.31.1
-
 It seems unnecessary to search pages with order < alloc_order in
 fallback allocation.
 
@@ -6186,133 +6037,6 @@ index 37f79e912d01..eed488aad1b0 100644
 --
 2.35.1
 
-The commit c23d92b80e0b ("igb: Teardown SR-IOV before
-unregister_netdev()") places the unregister_netdev() call after the
-igb_disable_sriov() call to avoid functionality issue.
-
-However, it introduces several race conditions when detaching a device.
-For example, when .remove() is called, the below interleaving leads to
-use-after-free.
-
- (FREE from device detaching)      |   (USE from netdev core)
-igb_remove                         |  igb_ndo_get_vf_config
- igb_disable_sriov                 |  vf >= adapter->vfs_allocated_count?
-  kfree(adapter->vf_data)          |
-  adapter->vfs_allocated_count = 0 |
-                                   |    memcpy(... adapter->vf_data[vf]
-
-Moreover, the igb_disable_sriov() also suffers from data race with the
-requests from VF driver.
-
- (FREE from device detaching)      |   (USE from requests)
-igb_remove                         |  igb_msix_other
- igb_disable_sriov                 |   igb_msg_task
-  kfree(adapter->vf_data)          |    vf < adapter->vfs_allocated_count
-  adapter->vfs_allocated_count = 0 |
-
-To this end, this commit first eliminates the data races from netdev
-core by using rtnl_lock (similar to commit 719479230893 ("dpaa2-eth: add
-MAC/PHY support through phylink")). And then adds a spinlock to
-eliminate races from driver requests. (similar to commit 1e53834ce541
-("ixgbe: Add locking to prevent panic when setting sriov_numvfs to zero")
-
-
-Fixes: c23d92b80e0b ("igb: Teardown SR-IOV before unregister_netdev()")
-Signed-off-by: Lin Ma <linma@xxxxxxxxxx>
----
-V2 -> V3:  make the commit message much clear
-V1 -> V2:  fix typo in title idb -> igb
-V0 -> V1:  change title from "Add rtnl_lock" to "Add lock"
-           add additional spinlock as suggested by Jakub, according to
-           1e53834ce541 ("ixgbe: Add locking to prevent panic when setting
-           sriov_numvfs to zero")
-
- drivers/net/ethernet/intel/igb/igb.h      |  2 ++
- drivers/net/ethernet/intel/igb/igb_main.c | 12 +++++++++++-
- 2 files changed, 13 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/net/ethernet/intel/igb/igb.h b/drivers/net/ethernet/intel/igb/igb.h
-index 2d3daf022651..015b78144114 100644
---- a/drivers/net/ethernet/intel/igb/igb.h
-+++ b/drivers/net/ethernet/intel/igb/igb.h
-@@ -664,6 +664,8 @@ struct igb_adapter {
- 	struct igb_mac_addr *mac_table;
- 	struct vf_mac_filter vf_macs;
- 	struct vf_mac_filter *vf_mac_list;
-+	/* lock for VF resources */
-+	spinlock_t vfs_lock;
- };
-
- /* flags controlling PTP/1588 function */
-diff --git a/drivers/net/ethernet/intel/igb/igb_main.c b/drivers/net/ethernet/intel/igb/igb_main.c
-index d8b836a85cc3..2796e81d2726 100644
---- a/drivers/net/ethernet/intel/igb/igb_main.c
-+++ b/drivers/net/ethernet/intel/igb/igb_main.c
-@@ -3637,6 +3637,7 @@ static int igb_disable_sriov(struct pci_dev *pdev)
- 	struct net_device *netdev = pci_get_drvdata(pdev);
- 	struct igb_adapter *adapter = netdev_priv(netdev);
- 	struct e1000_hw *hw = &adapter->hw;
-+	unsigned long flags;
-
- 	/* reclaim resources allocated to VFs */
- 	if (adapter->vf_data) {
-@@ -3649,12 +3650,13 @@ static int igb_disable_sriov(struct pci_dev *pdev)
- 			pci_disable_sriov(pdev);
- 			msleep(500);
- 		}
--
-+		spin_lock_irqsave(&adapter->vfs_lock, flags);
- 		kfree(adapter->vf_mac_list);
- 		adapter->vf_mac_list = NULL;
- 		kfree(adapter->vf_data);
- 		adapter->vf_data = NULL;
- 		adapter->vfs_allocated_count = 0;
-+		spin_unlock_irqrestore(&adapter->vfs_lock, flags);
- 		wr32(E1000_IOVCTL, E1000_IOVCTL_REUSE_VFQ);
- 		wrfl();
- 		msleep(100);
-@@ -3814,7 +3816,9 @@ static void igb_remove(struct pci_dev *pdev)
- 	igb_release_hw_control(adapter);
-
- #ifdef CONFIG_PCI_IOV
-+	rtnl_lock();
- 	igb_disable_sriov(pdev);
-+	rtnl_unlock();
- #endif
-
- 	unregister_netdev(netdev);
-@@ -3974,6 +3978,9 @@ static int igb_sw_init(struct igb_adapter *adapter)
-
- 	spin_lock_init(&adapter->nfc_lock);
- 	spin_lock_init(&adapter->stats64_lock);
-+
-+	/* init spinlock to avoid concurrency of VF resources */
-+	spin_lock_init(&adapter->vfs_lock);
- #ifdef CONFIG_PCI_IOV
- 	switch (hw->mac.type) {
- 	case e1000_82576:
-@@ -7958,8 +7965,10 @@ static void igb_rcv_msg_from_vf(struct igb_adapter *adapter, u32 vf)
- static void igb_msg_task(struct igb_adapter *adapter)
- {
- 	struct e1000_hw *hw = &adapter->hw;
-+	unsigned long flags;
- 	u32 vf;
-
-+	spin_lock_irqsave(&adapter->vfs_lock, flags);
- 	for (vf = 0; vf < adapter->vfs_allocated_count; vf++) {
- 		/* process any reset requests */
- 		if (!igb_check_for_rst(hw, vf))
-@@ -7973,6 +7982,7 @@ static void igb_msg_task(struct igb_adapter *adapter)
- 		if (!igb_check_for_ack(hw, vf))
- 			igb_rcv_ack_from_vf(adapter, vf);
- 	}
-+	spin_unlock_irqrestore(&adapter->vfs_lock, flags);
- }
-
- /**
---
-2.36.1
-
 From: Shaoqin Huang <shaoqin.huang@xxxxxxxxx>
 
 Replace three calls to compound_head() with one.
@@ -6467,72 +6191,6 @@ index 14439806b5ef..0dfed9d7b273 100644
 
 --
 2.35.3
-
-With jackpoll_in_suspend flag set, there is a possibility that
-jack poll worker thread will run even after system suspend was
-completed. Any register access after system pm callback flow
-will result in kernel crash as still jack poll worker thread
-tries to access registers.
-
-To fix the crash issue during system flow, cancel the jack poll
-worker thread during system pm prepare callback and cancel the
-worker thread at start of runtime suspend callback and re-schedule
-at last to avoid any unwarranted access of register by worker thread
-during suspend flow.
-
-Signed-off-by: Mohan Kumar <mkumard@xxxxxxxxxx>
----
- sound/pci/hda/hda_codec.c | 14 +++++++++-----
- 1 file changed, 9 insertions(+), 5 deletions(-)
-
-diff --git a/sound/pci/hda/hda_codec.c b/sound/pci/hda/hda_codec.c
-index 7b2e62fa82d5..384426d7e9dd 100644
---- a/sound/pci/hda/hda_codec.c
-+++ b/sound/pci/hda/hda_codec.c
-@@ -2940,8 +2940,7 @@ static int hda_codec_runtime_suspend(struct device *dev)
- 	if (!codec->card)
- 		return 0;
-
--	if (!codec->bus->jackpoll_in_suspend)
--		cancel_delayed_work_sync(&codec->jackpoll_work);
-+	cancel_delayed_work_sync(&codec->jackpoll_work);
-
- 	state = hda_call_codec_suspend(codec);
- 	if (codec->link_down_at_suspend ||
-@@ -2949,6 +2948,11 @@ static int hda_codec_runtime_suspend(struct device *dev)
- 	     (state & AC_PWRST_CLK_STOP_OK)))
- 		snd_hdac_codec_link_down(&codec->core);
- 	snd_hda_codec_display_power(codec, false);
-+
-+	if (codec->bus->jackpoll_in_suspend &&
-+		(dev->power.power_state.event != PM_EVENT_SUSPEND))
-+		schedule_delayed_work(&codec->jackpoll_work,
-+					codec->jackpoll_interval);
- 	return 0;
- }
-
-@@ -2972,6 +2976,9 @@ static int hda_codec_runtime_resume(struct device *dev)
- #ifdef CONFIG_PM_SLEEP
- static int hda_codec_pm_prepare(struct device *dev)
- {
-+	struct hda_codec *codec = dev_to_hda_codec(dev);
-+
-+	cancel_delayed_work_sync(&codec->jackpoll_work);
- 	dev->power.power_state = PMSG_SUSPEND;
- 	return pm_runtime_suspended(dev);
- }
-@@ -2991,9 +2998,6 @@ static void hda_codec_pm_complete(struct device *dev)
-
- static int hda_codec_pm_suspend(struct device *dev)
- {
--	struct hda_codec *codec = dev_to_hda_codec(dev);
--
--	cancel_delayed_work_sync(&codec->jackpoll_work);
- 	dev->power.power_state = PMSG_SUSPEND;
- 	return pm_runtime_force_suspend(dev);
- }
---
-2.17.1
 
 There are scenarios where non-affine wakeups are incorrectly counted as
 affine wakeups by schedstats.
@@ -14698,3 +14356,1656 @@ index 818821d068af..e7080a3100a6 100644
  #endif /* CONFIG_FREE_USER_PTE */
 --
 2.20.1
+
+During load balance, we try at most env->loop_max time to move a task.
+But it can happen that the loop_max LRU tasks (ie tail of
+the cfs_tasks list) can't be moved to dst_cpu because of affinity.
+In this case, loop in the list until we found at least one.
+
+The maximum of detached tasks remained the same as before.
+
+Signed-off-by: Vincent Guittot <vincent.guittot@xxxxxxxxxx>
+---
+ kernel/sched/fair.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index da388657d5ac..02b7b808e186 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -8052,8 +8052,12 @@ static int detach_tasks(struct lb_env *env)
+ 		p = list_last_entry(tasks, struct task_struct, se.group_node);
+
+ 		env->loop++;
+-		/* We've more or less seen every task there is, call it quits */
+-		if (env->loop > env->loop_max)
++		/*
++		 * We've more or less seen every task there is, call it quits
++		 * unless we haven't found any movable task yet.
++		 */
++		if (env->loop > env->loop_max &&
++		    !(env->flags & LBF_ALL_PINNED))
+ 			break;
+
+ 		/* take a breather every nr_migrate tasks */
+@@ -10182,7 +10186,9 @@ static int load_balance(int this_cpu, struct rq *this_rq,
+
+ 		if (env.flags & LBF_NEED_BREAK) {
+ 			env.flags &= ~LBF_NEED_BREAK;
+-			goto more_balance;
++			/* Stop if we tried all running tasks */
++			if (env.loop < busiest->nr_running)
++				goto more_balance;
+ 		}
+
+ 		/*
+--
+2.17.1
+
+sched_nr_migrate_break is set to a fix value and never changes so we can
+replace it by a define SCHED_NR_MIGRATE_BREAK.
+
+Also, we adjust SCHED_NR_MIGRATE_BREAK to be aligned with the init value
+of sysctl_sched_nr_migrate which can be init to different values.
+
+Then, use SCHED_NR_MIGRATE_BREAK to init sysctl_sched_nr_migrate.
+
+The behavior stays unchanged unless you modify sysctl_sched_nr_migrate
+trough debugfs.
+
+Signed-off-by: Vincent Guittot <vincent.guittot@xxxxxxxxxx>
+---
+ kernel/sched/core.c  |  6 +-----
+ kernel/sched/fair.c  | 11 ++++-------
+ kernel/sched/sched.h |  6 ++++++
+ 3 files changed, 11 insertions(+), 12 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 64c08993221b..a21e817bdd1c 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -142,11 +142,7 @@ __read_mostly int sysctl_resched_latency_warn_once = 1;
+  * Number of tasks to iterate in a single balance run.
+  * Limited because this is done with IRQs disabled.
+  */
+-#ifdef CONFIG_PREEMPT_RT
+-const_debug unsigned int sysctl_sched_nr_migrate = 8;
+-#else
+-const_debug unsigned int sysctl_sched_nr_migrate = 32;
+-#endif
++const_debug unsigned int sysctl_sched_nr_migrate = SCHED_NR_MIGRATE_BREAK;
+
+ __read_mostly int scheduler_running;
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 02b7b808e186..6972a1a29a48 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -8012,8 +8012,6 @@ static struct task_struct *detach_one_task(struct lb_env *env)
+ 	return NULL;
+ }
+
+-static const unsigned int sched_nr_migrate_break = 32;
+-
+ /*
+  * detach_tasks() -- tries to detach up to imbalance load/util/tasks from
+  * busiest_rq, as part of a balancing operation within domain "sd".
+@@ -8062,7 +8060,7 @@ static int detach_tasks(struct lb_env *env)
+
+ 		/* take a breather every nr_migrate tasks */
+ 		if (env->loop > env->loop_break) {
+-			env->loop_break += sched_nr_migrate_break;
++			env->loop_break += SCHED_NR_MIGRATE_BREAK;
+ 			env->flags |= LBF_NEED_BREAK;
+ 			break;
+ 		}
+@@ -10103,14 +10101,13 @@ static int load_balance(int this_cpu, struct rq *this_rq,
+ 	struct rq *busiest;
+ 	struct rq_flags rf;
+ 	struct cpumask *cpus = this_cpu_cpumask_var_ptr(load_balance_mask);
+-
+ 	struct lb_env env = {
+ 		.sd		= sd,
+ 		.dst_cpu	= this_cpu,
+ 		.dst_rq		= this_rq,
+ 		.dst_grpmask    = sched_group_span(sd->groups),
+ 		.idle		= idle,
+-		.loop_break	= sched_nr_migrate_break,
++		.loop_break	= SCHED_NR_MIGRATE_BREAK,
+ 		.cpus		= cpus,
+ 		.fbq_type	= all,
+ 		.tasks		= LIST_HEAD_INIT(env.tasks),
+@@ -10219,7 +10216,7 @@ static int load_balance(int this_cpu, struct rq *this_rq,
+ 			env.dst_cpu	 = env.new_dst_cpu;
+ 			env.flags	&= ~LBF_DST_PINNED;
+ 			env.loop	 = 0;
+-			env.loop_break	 = sched_nr_migrate_break;
++			env.loop_break	 = SCHED_NR_MIGRATE_BREAK;
+
+ 			/*
+ 			 * Go back to "more_balance" rather than "redo" since we
+@@ -10251,7 +10248,7 @@ static int load_balance(int this_cpu, struct rq *this_rq,
+ 			 */
+ 			if (!cpumask_subset(cpus, env.dst_grpmask)) {
+ 				env.loop = 0;
+-				env.loop_break = sched_nr_migrate_break;
++				env.loop_break = SCHED_NR_MIGRATE_BREAK;
+ 				goto redo;
+ 			}
+ 			goto out_all_pinned;
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 3ccd35c22f0f..d5cfd1b5bfe9 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -2423,6 +2423,12 @@ extern void deactivate_task(struct rq *rq, struct task_struct *p, int flags);
+
+ extern void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags);
+
++#ifdef CONFIG_PREEMPT_RT
++#define SCHED_NR_MIGRATE_BREAK 8
++#else
++#define SCHED_NR_MIGRATE_BREAK 32
++#endif
++
+ extern const_debug unsigned int sysctl_sched_nr_migrate;
+ extern const_debug unsigned int sysctl_sched_migration_cost;
+
+--
+2.17.1
+
+Move the call to list_last_entry() in detach_tasks() after testing
+loop_max and loop_break.
+
+Signed-off-by: Vincent Guittot <vincent.guittot@xxxxxxxxxx>
+---
+ kernel/sched/fair.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 6972a1a29a48..260a55ac462f 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -8047,8 +8047,6 @@ static int detach_tasks(struct lb_env *env)
+ 		if (env->idle != CPU_NOT_IDLE && env->src_rq->nr_running <= 1)
+ 			break;
+
+-		p = list_last_entry(tasks, struct task_struct, se.group_node);
+-
+ 		env->loop++;
+ 		/*
+ 		 * We've more or less seen every task there is, call it quits
+@@ -8065,6 +8063,8 @@ static int detach_tasks(struct lb_env *env)
+ 			break;
+ 		}
+
++		p = list_last_entry(tasks, struct task_struct, se.group_node);
++
+ 		if (!can_migrate_task(p, env))
+ 			goto next;
+
+--
+2.17.1
+
+In presence of a lot of small weight tasks like sched_idle tasks, normal
+or high weight tasks can see their ideal runtime (sched_slice) to increase
+to hundreds ms whereas it normally stays below sysctl_sched_latency.
+
+2 normal tasks running on a CPU will have a max sched_slice of 12ms
+(half of the sched_period). This means that they will make progress
+every sysctl_sched_latency period.
+
+If we now add 1000 idle tasks on the CPU, the sched_period becomes
+3006 ms and the ideal runtime of the normal tasks becomes 609 ms.
+It will even become 1500ms if the idle tasks belongs to an idle cgroup.
+This means that the scheduler will look for picking another waiting task
+after 609ms running time (1500ms respectively). The idle tasks change
+significantly the way the 2 normal tasks interleave their running time
+slot whereas they should have a small impact.
+
+Such long sched_slice can delay significantly the release of resources
+as the tasks can wait hundreds of ms before the next running slot just
+because of idle tasks queued on the rq.
+
+Cap the ideal_runtime to sysctl_sched_latency when comparing to the next
+waiting task to make sure that tasks will regularly make progress and will
+not be significantly impacted by idle/background tasks queued on the rq.
+
+Signed-off-by: Vincent Guittot <vincent.guittot@xxxxxxxxxx>
+---
+
+While studying the problem, I have also considered to substract
+cfs.idle_h_nr_running before computing the sched_slice but we can have
+quite similar problem with low weight bormal task/cgroup so I have decided
+to keep this solution.
+
+Also, this solution doesn't completly remove the impact of idle tasks
+in the scheduling pattern but cap the running slice of a task to a max
+value of 2*sysctl_sched_latency.
+
+ kernel/sched/fair.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 260a55ac462f..96fedd0ab5fa 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -4599,6 +4599,8 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 	if (delta < 0)
+ 		return;
+
++	ideal_runtime =  min_t(u64, ideal_runtime, sysctl_sched_latency);
++
+ 	if (delta > ideal_runtime)
+ 		resched_curr(rq_of(cfs_rq));
+ }
+--
+2.17.1
+
+When the destination CPU is an SMT sibling and idle, it can only help the
+busiest group if all of its other SMT siblings are also idle. Otherwise,
+there is not increase in throughput.
+
+It does not matter whether the busiest group has SMT siblings. Simply
+check if there are any tasks running on the local group before proceeding.
+
+Cc: Ben Segall <bsegall@xxxxxxxxxx>
+Cc: Daniel Bristot de Oliveira <bristot@xxxxxxxxxx>
+Cc: Dietmar Eggemann <dietmar.eggemann@xxxxxxx>
+Cc: Len Brown <len.brown@xxxxxxxxx>
+Cc: Mel Gorman <mgorman@xxxxxxx>
+Cc: Rafael J. Wysocki <rafael.j.wysocki@xxxxxxxxx>
+Cc: Srinivas Pandruvada <srinivas.pandruvada@xxxxxxxxxxxxxxx>
+Cc: Steven Rostedt <rostedt@xxxxxxxxxxx>
+Cc: Tim C. Chen <tim.c.chen@xxxxxxxxx>
+Cc: Valentin Schneider <vschneid@xxxxxxxxxx>
+Cc: x86@xxxxxxxxxx
+Cc: linux-kernel@xxxxxxxxxxxxxxx
+Reviewed-by: Len Brown <len.brown@xxxxxxxxx>
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@xxxxxxxxxxxxxxx>
+---
+ kernel/sched/fair.c | 29 +++++++++--------------------
+ 1 file changed, 9 insertions(+), 20 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 77b2048a9326..91f271ea02d2 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -8603,12 +8603,10 @@ static bool asym_smt_can_pull_tasks(int dst_cpu, struct sd_lb_stats *sds,
+ 				    struct sched_group *sg)
+ {
+ #ifdef CONFIG_SCHED_SMT
+-	bool local_is_smt, sg_is_smt;
++	bool local_is_smt;
+ 	int sg_busy_cpus;
+
+ 	local_is_smt = sds->local->flags & SD_SHARE_CPUCAPACITY;
+-	sg_is_smt = sg->flags & SD_SHARE_CPUCAPACITY;
+-
+ 	sg_busy_cpus = sgs->group_weight - sgs->idle_cpus;
+
+ 	if (!local_is_smt) {
+@@ -8629,25 +8627,16 @@ static bool asym_smt_can_pull_tasks(int dst_cpu, struct sd_lb_stats *sds,
+ 		return sched_asym_prefer(dst_cpu, sg->asym_prefer_cpu);
+ 	}
+
+-	/* @dst_cpu has SMT siblings. */
+-
+-	if (sg_is_smt) {
+-		int local_busy_cpus = sds->local->group_weight -
+-				      sds->local_stat.idle_cpus;
+-		int busy_cpus_delta = sg_busy_cpus - local_busy_cpus;
+-
+-		if (busy_cpus_delta == 1)
+-			return sched_asym_prefer(dst_cpu, sg->asym_prefer_cpu);
+-
+-		return false;
+-	}
+-
+ 	/*
+-	 * @sg does not have SMT siblings. Ensure that @sds::local does not end
+-	 * up with more than one busy SMT sibling and only pull tasks if there
+-	 * are not busy CPUs (i.e., no CPU has running tasks).
++	 * @dst_cpu has SMT siblings. When both @dst_cpu and the busiest core
++	 * have one or more busy siblings, moving tasks between them results
++	 * in the same throughput. Only if all the siblings of @dst_cpu are
++	 * idle throughput can increase.
++	 *
++	 * If the difference in the number of busy CPUs is two or more, let
++	 * find_busiest_group() take care of it.
+ 	 */
+-	if (!sds->local_stat.sum_nr_running)
++	if (sg_busy_cpus == 1 && !sds->local_stat.sum_nr_running)
+ 		return sched_asym_prefer(dst_cpu, sg->asym_prefer_cpu);
+
+ 	return false;
+--
+2.25.1
+
+We may be here because the busiest group is composed of SMT siblings and
+more than one is busy.
+
+An idle CPU with lower priority can help the higher-priority busiest
+scheduling group by pulling tasks from it. The tasks that remain in the
+busiest group will run with higher performance.
+
+This scenario is observed, for instance, on Intel hybrid processors. PCores
+have two SMT siblings and have higher priority than the ECores, which do
+not have SMT siblings.
+
+Cc: Ben Segall <bsegall@xxxxxxxxxx>
+Cc: Daniel Bristot de Oliveira <bristot@xxxxxxxxxx>
+Cc: Dietmar Eggemann <dietmar.eggemann@xxxxxxx>
+Cc: Len Brown <len.brown@xxxxxxxxx>
+Cc: Mel Gorman <mgorman@xxxxxxx>
+Cc: Rafael J. Wysocki <rafael.j.wysocki@xxxxxxxxx>
+Cc: Srinivas Pandruvada <srinivas.pandruvada@xxxxxxxxxxxxxxx>
+Cc: Steven Rostedt <rostedt@xxxxxxxxxxx>
+Cc: Tim C. Chen <tim.c.chen@xxxxxxxxx>
+Cc: Valentin Schneider <vschneid@xxxxxxxxxx>
+Cc: x86@xxxxxxxxxx
+Cc: linux-kernel@xxxxxxxxxxxxxxx
+Reviewed-by: Len Brown <len.brown@xxxxxxxxx>
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@xxxxxxxxxxxxxxx>>
+---
+ kernel/sched/fair.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 91f271ea02d2..810645eb58ed 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -9662,10 +9662,14 @@ static struct rq *find_busiest_queue(struct lb_env *env,
+ 		    nr_running == 1)
+ 			continue;
+
+-		/* Make sure we only pull tasks from a CPU of lower priority */
++		/*
++		 * Make sure we only pull tasks from a CPU of lower priority.
++		 * Except for scheduling groups composed of SMT siblings.
++		 */
+ 		if ((env->sd->flags & SD_ASYM_PACKING) &&
+ 		    sched_asym_prefer(i, env->dst_cpu) &&
+-		    nr_running == 1)
++		    nr_running == 1 &&
++		    !(group->flags & SD_SHARE_CPUCAPACITY))
+ 			continue;
+
+ 		switch (env->migration_type) {
+--
+2.25.1
+
+When more than one SMT siblings of a physical core are busy, an idle CPU
+of lower priority can help.
+
+Indicate that the low priority CPU can do active balancing from the high-
+priority CPU only if they belong to separate cores.
+
+Cc: Ben Segall <bsegall@xxxxxxxxxx>
+Cc: Daniel Bristot de Oliveira <bristot@xxxxxxxxxx>
+Cc: Dietmar Eggemann <dietmar.eggemann@xxxxxxx>
+Cc: Len Brown <len.brown@xxxxxxxxx>
+Cc: Mel Gorman <mgorman@xxxxxxx>
+Cc: Rafael J. Wysocki <rafael.j.wysocki@xxxxxxxxx>
+Cc: Srinivas Pandruvada <srinivas.pandruvada@xxxxxxxxxxxxxxx>
+Cc: Steven Rostedt <rostedt@xxxxxxxxxxx>
+Cc: Tim C. Chen <tim.c.chen@xxxxxxxxx>
+Cc: Valentin Schneider <vschneid@xxxxxxxxxx>
+Cc: x86@xxxxxxxxxx
+Cc: linux-kernel@xxxxxxxxxxxxxxx
+Reviewed-by: Len Brown <len.brown@xxxxxxxxx>
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@xxxxxxxxxxxxxxx>
+---
+ kernel/sched/fair.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 810645eb58ed..9b608b31080f 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -9759,9 +9759,14 @@ asym_active_balance(struct lb_env *env)
+ 	 * ASYM_PACKING needs to force migrate tasks from busy but
+ 	 * lower priority CPUs in order to pack all tasks in the
+ 	 * highest priority CPUs.
++	 *
++	 * If the busy CPU has higher priority but is an SMT sibling
++	 * in which other SMT siblings are also busy, a lower-priority
++	 * CPU in a separate core can help.
+ 	 */
+ 	return env->idle != CPU_NOT_IDLE && (env->sd->flags & SD_ASYM_PACKING) &&
+-	       sched_asym_prefer(env->dst_cpu, env->src_cpu);
++	       (sched_asym_prefer(env->dst_cpu, env->src_cpu) ||
++		!(env->sd->flags & SD_SHARE_CPUCAPACITY));
+ }
+
+ static inline bool
+--
+2.25.1
+
+Having different priorities for each SMT sibling triggers unnecessary
+load balancing towards the higher-priority sibling.
+
+The scheduler now has logic to allow lower-priority CPUs to relieve load
+from scheduling groups composed of SMT siblings with more than one busy
+sibling.
+
+Hence, it is no longer necessary to give different priorities to each of
+the SMT siblings of a physical core.
+
+Cc: Ben Segall <bsegall@xxxxxxxxxx>
+Cc: Daniel Bristot de Oliveira <bristot@xxxxxxxxxx>
+Cc: Dietmar Eggemann <dietmar.eggemann@xxxxxxx>
+Cc: Len Brown <len.brown@xxxxxxxxx>
+Cc: Mel Gorman <mgorman@xxxxxxx>
+Cc: Rafael J. Wysocki <rafael.j.wysocki@xxxxxxxxx>
+Cc: Srinivas Pandruvada <srinivas.pandruvada@xxxxxxxxxxxxxxx>
+Cc: Steven Rostedt <rostedt@xxxxxxxxxxx>
+Cc: Tim C. Chen <tim.c.chen@xxxxxxxxx>
+Cc: Valentin Schneider <vschneid@xxxxxxxxxx>
+Cc: x86@xxxxxxxxxx
+Cc: linux-kernel@xxxxxxxxxxxxxxx
+Reviewed-by: Len Brown <len.brown@xxxxxxxxx>
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@xxxxxxxxxxxxxxx>
+---
+ arch/x86/kernel/itmt.c | 23 +++++------------------
+ 1 file changed, 5 insertions(+), 18 deletions(-)
+
+diff --git a/arch/x86/kernel/itmt.c b/arch/x86/kernel/itmt.c
+index 9ff480e94511..6510883c5e81 100644
+--- a/arch/x86/kernel/itmt.c
++++ b/arch/x86/kernel/itmt.c
+@@ -174,32 +174,19 @@ int arch_asym_cpu_priority(int cpu)
+
+ /**
+  * sched_set_itmt_core_prio() - Set CPU priority based on ITMT
+- * @prio:	Priority of cpu core
+- * @core_cpu:	The cpu number associated with the core
++ * @prio:	Priority of @cpu
++ * @cpu:	The CPU number
+  *
+  * The pstate driver will find out the max boost frequency
+  * and call this function to set a priority proportional
+- * to the max boost frequency. CPU with higher boost
++ * to the max boost frequency. CPUs with higher boost
+  * frequency will receive higher priority.
+  *
+  * No need to rebuild sched domain after updating
+  * the CPU priorities. The sched domains have no
+  * dependency on CPU priorities.
+  */
+-void sched_set_itmt_core_prio(int prio, int core_cpu)
++void sched_set_itmt_core_prio(int prio, int cpu)
+ {
+-	int cpu, i = 1;
+-
+-	for_each_cpu(cpu, topology_sibling_cpumask(core_cpu)) {
+-		int smt_prio;
+-
+-		/*
+-		 * Ensure that the siblings are moved to the end
+-		 * of the priority chain and only used when
+-		 * all other high priority cpus are out of capacity.
+-		 */
+-		smt_prio = prio * smp_num_siblings / (i * i);
+-		per_cpu(sched_core_priority, cpu) = smt_prio;
+-		i++;
+-	}
++	per_cpu(sched_core_priority, cpu) = prio;
+ }
+--
+2.25.1
+
+affine_move_task() assumes task_rq_lock() has been called and it does
+an implicit task_rq_unlock() before returning. Add the appropriate
+__releases annotations to make this clear.
+
+A typo error in comment is also fixed.
+
+Signed-off-by: Waiman Long <longman@xxxxxxxxxx>
+---
+ kernel/sched/core.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index ee28253c9ac0..b351e6d173b7 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2696,6 +2696,8 @@ void release_user_cpus_ptr(struct task_struct *p)
+  */
+ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flags *rf,
+ 			    int dest_cpu, unsigned int flags)
++	__releases(rq->lock)
++	__releases(p->pi_lock)
+ {
+ 	struct set_affinity_pending my_pending = { }, *pending = NULL;
+ 	bool stop_pending, complete = false;
+@@ -3005,7 +3007,7 @@ static int restrict_cpus_allowed_ptr(struct task_struct *p,
+
+ /*
+  * Restrict the CPU affinity of task @p so that it is a subset of
+- * task_cpu_possible_mask() and point @p->user_cpu_ptr to a copy of the
++ * task_cpu_possible_mask() and point @p->user_cpus_ptr to a copy of the
+  * old affinity mask. If the resulting mask is empty, we warn and walk
+  * up the cpuset hierarchy until we find a suitable mask.
+  */
+--
+2.31.1
+
+The user_cpus_ptr field is added by commit b90ca8badbd1 ("sched:
+Introduce task_struct::user_cpus_ptr to track requested affinity"). It
+is currently used only by arm64 arch due to possible asymmetric CPU
+setup. This patch extends its usage to save user provided cpumask
+when sched_setaffinity() is called for all arches. With this patch
+applied, user_cpus_ptr, once allocated after a successful call to
+sched_setaffinity(), will only be freed when the task exits.
+
+Since user_cpus_ptr is supposed to be used for "requested
+affinity", there is actually no point to save current cpu affinity in
+restrict_cpus_allowed_ptr() if sched_setaffinity() has never been called.
+Modify the logic to set user_cpus_ptr only in sched_setaffinity() and use
+it in restrict_cpus_allowed_ptr() and relax_compatible_cpus_allowed_ptr()
+if defined but not changing it.
+
+This will be some changes in behavior for arm64 systems with asymmetric
+CPUs in some corner cases. For instance, if sched_setaffinity()
+has never been called and there is a cpuset change before
+relax_compatible_cpus_allowed_ptr() is called, its subsequent call will
+follow what the cpuset allows but not what the previous cpu affinity
+setting allows.
+
+As a call to sched_setaffinity() will no longer clear user_cpus_ptr
+but set it instead, the SCA_USER flag is no longer necessary and can
+be removed.
+
+Signed-off-by: Waiman Long <longman@xxxxxxxxxx>
+---
+ kernel/sched/core.c  | 87 +++++++++++++++++++-------------------------
+ kernel/sched/sched.h |  8 +++-
+ 2 files changed, 45 insertions(+), 50 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index b351e6d173b7..ac2b103d69dc 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2850,7 +2850,6 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+ 	const struct cpumask *cpu_allowed_mask = task_cpu_possible_mask(p);
+ 	const struct cpumask *cpu_valid_mask = cpu_active_mask;
+ 	bool kthread = p->flags & PF_KTHREAD;
+-	struct cpumask *user_mask = NULL;
+ 	unsigned int dest_cpu;
+ 	int ret = 0;
+
+@@ -2909,14 +2908,7 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+
+ 	__do_set_cpus_allowed(p, new_mask, flags);
+
+-	if (flags & SCA_USER)
+-		user_mask = clear_user_cpus_ptr(p);
+-
+-	ret = affine_move_task(rq, p, rf, dest_cpu, flags);
+-
+-	kfree(user_mask);
+-
+-	return ret;
++	return affine_move_task(rq, p, rf, dest_cpu, flags);
+
+ out:
+ 	task_rq_unlock(rq, p, rf);
+@@ -2951,8 +2943,10 @@ EXPORT_SYMBOL_GPL(set_cpus_allowed_ptr);
+
+ /*
+  * Change a given task's CPU affinity to the intersection of its current
+- * affinity mask and @subset_mask, writing the resulting mask to @new_mask
+- * and pointing @p->user_cpus_ptr to a copy of the old mask.
++ * affinity mask and @subset_mask, writing the resulting mask to @new_mask.
++ * If user_cpus_ptr is defined, use it as the basis for restricting CPU
++ * affinity or use cpu_online_mask instead.
++ *
+  * If the resulting mask is empty, leave the affinity unchanged and return
+  * -EINVAL.
+  */
+@@ -2960,17 +2954,10 @@ static int restrict_cpus_allowed_ptr(struct task_struct *p,
+ 				     struct cpumask *new_mask,
+ 				     const struct cpumask *subset_mask)
+ {
+-	struct cpumask *user_mask = NULL;
+ 	struct rq_flags rf;
+ 	struct rq *rq;
+ 	int err;
+
+-	if (!p->user_cpus_ptr) {
+-		user_mask = kmalloc(cpumask_size(), GFP_KERNEL);
+-		if (!user_mask)
+-			return -ENOMEM;
+-	}
+-
+ 	rq = task_rq_lock(p, &rf);
+
+ 	/*
+@@ -2983,25 +2970,15 @@ static int restrict_cpus_allowed_ptr(struct task_struct *p,
+ 		goto err_unlock;
+ 	}
+
+-	if (!cpumask_and(new_mask, &p->cpus_mask, subset_mask)) {
++	if (!cpumask_and(new_mask, task_user_cpus(p), subset_mask)) {
+ 		err = -EINVAL;
+ 		goto err_unlock;
+ 	}
+
+-	/*
+-	 * We're about to butcher the task affinity, so keep track of what
+-	 * the user asked for in case we're able to restore it later on.
+-	 */
+-	if (user_mask) {
+-		cpumask_copy(user_mask, p->cpus_ptr);
+-		p->user_cpus_ptr = user_mask;
+-	}
+-
+ 	return __set_cpus_allowed_ptr_locked(p, new_mask, 0, rq, &rf);
+
+ err_unlock:
+ 	task_rq_unlock(rq, p, &rf);
+-	kfree(user_mask);
+ 	return err;
+ }
+
+@@ -3051,34 +3028,22 @@ void force_compatible_cpus_allowed_ptr(struct task_struct *p)
+ }
+
+ static int
+-__sched_setaffinity(struct task_struct *p, const struct cpumask *mask);
++__sched_setaffinity(struct task_struct *p, const struct cpumask *mask, bool save_mask);
+
+ /*
+  * Restore the affinity of a task @p which was previously restricted by a
+- * call to force_compatible_cpus_allowed_ptr(). This will clear (and free)
+- * @p->user_cpus_ptr.
++ * call to force_compatible_cpus_allowed_ptr().
+  *
+  * It is the caller's responsibility to serialise this with any calls to
+  * force_compatible_cpus_allowed_ptr(@p).
+  */
+ void relax_compatible_cpus_allowed_ptr(struct task_struct *p)
+ {
+-	struct cpumask *user_mask = p->user_cpus_ptr;
+-	unsigned long flags;
+-
+ 	/*
+-	 * Try to restore the old affinity mask. If this fails, then
+-	 * we free the mask explicitly to avoid it being inherited across
+-	 * a subsequent fork().
++	 * Try to restore the old affinity mask with __sched_setaffinity().
++	 * Cpuset masking will be done there too.
+ 	 */
+-	if (!user_mask || !__sched_setaffinity(p, user_mask))
+-		return;
+-
+-	raw_spin_lock_irqsave(&p->pi_lock, flags);
+-	user_mask = clear_user_cpus_ptr(p);
+-	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+-
+-	kfree(user_mask);
++	__sched_setaffinity(p, task_user_cpus(p), false);
+ }
+
+ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
+@@ -8081,10 +8046,11 @@ int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
+ #endif
+
+ static int
+-__sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
++__sched_setaffinity(struct task_struct *p, const struct cpumask *mask, bool save_mask)
+ {
+ 	int retval;
+ 	cpumask_var_t cpus_allowed, new_mask;
++	struct cpumask *user_mask = NULL;
+
+ 	if (!alloc_cpumask_var(&cpus_allowed, GFP_KERNEL))
+ 		return -ENOMEM;
+@@ -8100,8 +8066,22 @@ __sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
+ 	retval = dl_task_check_affinity(p, new_mask);
+ 	if (retval)
+ 		goto out_free_new_mask;
++
++	/*
++	 * Save the user requested mask internally now and then update
++	 * user_cpus_ptr later after making sure this call will be
++	 * successful, i.e. retval == 0.
++	 */
++	if (save_mask) {
++		user_mask = kmalloc(cpumask_size(), GFP_KERNEL);
++		if (!user_mask) {
++			retval = -ENOMEM;
++			goto out_free_new_mask;
++		}
++		cpumask_copy(user_mask, mask);
++	}
+ again:
+-	retval = __set_cpus_allowed_ptr(p, new_mask, SCA_CHECK | SCA_USER);
++	retval = __set_cpus_allowed_ptr(p, new_mask, SCA_CHECK);
+ 	if (retval)
+ 		goto out_free_new_mask;
+
+@@ -8115,7 +8095,16 @@ __sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
+ 		goto again;
+ 	}
+
++	if (save_mask) {
++		unsigned long flags;
++
++		/* Use pi_lock to synchronize changes to user_cpus_ptr */
++		raw_spin_lock_irqsave(&p->pi_lock, flags);
++		swap(p->user_cpus_ptr, user_mask);
++		raw_spin_unlock_irqrestore(&p->pi_lock, flags);
++	}
+ out_free_new_mask:
++	kfree(user_mask);
+ 	free_cpumask_var(new_mask);
+ out_free_cpus_allowed:
+ 	free_cpumask_var(cpus_allowed);
+@@ -8158,7 +8147,7 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
+ 	if (retval)
+ 		goto out_put_task;
+
+-	retval = __sched_setaffinity(p, in_mask);
++	retval = __sched_setaffinity(p, in_mask, true);
+ out_put_task:
+ 	put_task_struct(p);
+ 	return retval;
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index e26688d387ae..a49c17e1c7ea 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1881,6 +1881,13 @@ static inline void dirty_sched_domain_sysctl(int cpu)
+ #endif
+
+ extern int sched_update_scaling(void);
++
++static inline const struct cpumask *task_user_cpus(struct task_struct *p)
++{
++	if (!p->user_cpus_ptr)
++		return cpu_possible_mask; /* &init_task.cpus_mask */
++	return p->user_cpus_ptr;
++}
+ #endif /* CONFIG_SMP */
+
+ #include "stats.h"
+@@ -2283,7 +2290,6 @@ extern struct task_struct *pick_next_task_idle(struct rq *rq);
+ #define SCA_CHECK		0x01
+ #define SCA_MIGRATE_DISABLE	0x02
+ #define SCA_MIGRATE_ENABLE	0x04
+-#define SCA_USER		0x08
+
+ #ifdef CONFIG_SMP
+
+--
+2.31.1
+
+It was found that the user requested affinity via sched_setaffinity()
+can be easily overwritten by other kernel subsystems without an easy way
+to reset it back to what the user requested. For example, any change
+to the current cpuset hierarchy may reset the cpumask of the tasks in
+the affected cpusets to the default cpuset value even if those tasks
+have pre-existing user requested affinity. That is especially easy to
+trigger under a cgroup v2 environment where writing "+cpuset" to the
+root cgroup's cgroup.subtree_control file will reset the cpus affinity
+of all the processes in the system.
+
+That is problematic in a nohz_full environment where the tasks running
+in the nohz_full CPUs usually have their cpus affinity explicitly set
+and will behave incorrectly if cpus affinity changes.
+
+Fix this problem by looking at user_cpus_ptr in __set_cpus_allowed_ptr()
+and use it to restrcit the given cpumask unless there is no overlap. In
+that case, it will fallback to the given one.
+
+All callers of set_cpus_allowed_ptr() will be affected by this change.
+A scratch cpumask is added to percpu runqueues structure for doing
+additional masking when user_cpus_ptr is set. The scratch cpumask should
+get allocated during cpu activation. A fallback atomic memory allocation
+in __set_cpus_allowed_ptr() is also added in case set_cpus_allowed_ptr()
+is called before the scratch cpumask is properly allocated.
+
+Signed-off-by: Waiman Long <longman@xxxxxxxxxx>
+---
+ kernel/sched/core.c  | 36 +++++++++++++++++++++++++++++++++++-
+ kernel/sched/sched.h |  3 +++
+ 2 files changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index ac2b103d69dc..1c2f548e5369 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2928,11 +2928,40 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+ static int __set_cpus_allowed_ptr(struct task_struct *p,
+ 				  const struct cpumask *new_mask, u32 flags)
+ {
++	struct cpumask *alloc_mask = NULL;
+ 	struct rq_flags rf;
+ 	struct rq *rq;
++	int ret;
+
+ 	rq = task_rq_lock(p, &rf);
+-	return __set_cpus_allowed_ptr_locked(p, new_mask, flags, rq, &rf);
++	if (p->user_cpus_ptr) {
++
++		/*
++		 * A scratch cpumask is allocated on the percpu runqueues
++		 * to enable additional masking with user_cpus_ptr. This
++		 * cpumask, once allocated, will not be freed.
++		 */
++		if (unlikely(!rq->scratch_mask)) {
++			alloc_mask = kmalloc(cpumask_size(), GFP_ATOMIC);
++			if (!rq->scratch_mask && alloc_mask) {
++				rq->scratch_mask = alloc_mask;
++				alloc_mask = NULL;
++			}
++		}
++		/*
++		 * Ignore user_cpus_ptr if atomic memory allocation fails
++		 * or it doesn't intersect new_mask.
++		 */
++		if (rq->scratch_mask &&
++		    cpumask_and(rq->scratch_mask, new_mask, p->user_cpus_ptr))
++			new_mask = rq->scratch_mask;
++	}
++
++
++	ret = __set_cpus_allowed_ptr_locked(p, new_mask, flags, rq, &rf);
++	if (unlikely(alloc_mask))
++		kfree(alloc_mask);
++	return ret;
+ }
+
+ int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask)
+@@ -9352,6 +9381,11 @@ int sched_cpu_activate(unsigned int cpu)
+ 		sched_update_numa(cpu, true);
+ 		sched_domains_numa_masks_set(cpu);
+ 		cpuset_cpu_active();
++		/*
++		 * Preallocated scratch cpumask
++		 */
++		if (!rq->scratch_mask)
++			rq->scratch_mask = kmalloc(cpumask_size(), GFP_KERNEL);
+ 	}
+
+ 	/*
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index a49c17e1c7ea..66a6bfddd716 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1159,6 +1159,9 @@ struct rq {
+ 	unsigned int		core_forceidle_occupation;
+ 	u64			core_forceidle_start;
+ #endif
++
++	/* Scratch cpumask to be temporarily used under rq_lock */
++	struct cpumask		*scratch_mask;
+ };
+
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+--
+2.31.1
+
+Racing is possible between set_cpus_allowed_ptr() and sched_setaffinity()
+or between multiple sched_setaffinity() calls from different CPUs. To
+resolve these race conditions, we need to update both user_cpus_ptr
+and cpus_mask in a single lock critical section instead of separated
+ones. This requires moving the user_cpus_ptr update to
+affine_move_task() before doing task_rq_unlock().
+
+A new argument puser_mask is added to affine_move_task(),
+__set_cpus_allowed_ptr_locked() and __set_cpus_allowed_ptr() to do that.
+
+Ideally, user_cpus_ptr should only be updated if the sched_setaffinity()
+is successful. However, this patch will update user_cpus_ptr when the
+first call to __set_cpus_allowed_ptr() is successful. However, if there
+is racing between sched_setaffinity() and cpuset update, the subsequent
+calls to __set_cpus_allowed_ptr() may fail but the user_cpus_ptr will
+still be updated in this corner case.
+
+Signed-off-by: Waiman Long <longman@xxxxxxxxxx>
+---
+ kernel/sched/core.c | 66 ++++++++++++++++++++++++++++-----------------
+ 1 file changed, 42 insertions(+), 24 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 1c2f548e5369..6cd1177fbcea 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2199,7 +2199,7 @@ __do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32
+
+ static int __set_cpus_allowed_ptr(struct task_struct *p,
+ 				  const struct cpumask *new_mask,
+-				  u32 flags);
++				  u32 flags, struct cpumask **puser_mask);
+
+ static void migrate_disable_switch(struct rq *rq, struct task_struct *p)
+ {
+@@ -2249,7 +2249,7 @@ void migrate_enable(void)
+ 	 */
+ 	preempt_disable();
+ 	if (p->cpus_ptr != &p->cpus_mask)
+-		__set_cpus_allowed_ptr(p, &p->cpus_mask, SCA_MIGRATE_ENABLE);
++		__set_cpus_allowed_ptr(p, &p->cpus_mask, SCA_MIGRATE_ENABLE, NULL);
+ 	/*
+ 	 * Mustn't clear migration_disabled() until cpus_ptr points back at the
+ 	 * regular cpus_mask, otherwise things that race (eg.
+@@ -2618,6 +2618,15 @@ void release_user_cpus_ptr(struct task_struct *p)
+ 	kfree(clear_user_cpus_ptr(p));
+ }
+
++static inline void swap_user_cpus_ptr(struct task_struct *p,
++				      struct cpumask **puser_mask)
++{
++	if (!puser_mask)
++		return;
++
++	swap(p->user_cpus_ptr, *puser_mask);
++}
++
+ /*
+  * This function is wildly self concurrent; here be dragons.
+  *
+@@ -2693,9 +2702,12 @@ void release_user_cpus_ptr(struct task_struct *p)
+  * Note that the above is safe vs a concurrent migrate_enable(), as any
+  * pending affinity completion is preceded by an uninstallation of
+  * p->migration_pending done with p->pi_lock held.
++ *
++ * The puser_mask pointer, if defined, will cause its swap with the current
++ * user_cpus_ptr value if operation succeeds.
+  */
+ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flags *rf,
+-			    int dest_cpu, unsigned int flags)
++			    int dest_cpu, unsigned int flags, struct cpumask **puser_mask)
+ 	__releases(rq->lock)
+ 	__releases(p->pi_lock)
+ {
+@@ -2722,6 +2734,7 @@ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flag
+ 			complete = true;
+ 		}
+
++		swap_user_cpus_ptr(p, puser_mask);
+ 		task_rq_unlock(rq, p, rf);
+
+ 		if (push_task) {
+@@ -2793,6 +2806,7 @@ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flag
+ 		if (flags & SCA_MIGRATE_ENABLE)
+ 			p->migration_flags &= ~MDF_PUSH;
+
++		swap_user_cpus_ptr(p, puser_mask);
+ 		task_rq_unlock(rq, p, rf);
+
+ 		if (!stop_pending) {
+@@ -2813,6 +2827,8 @@ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flag
+ 				complete = true;
+ 			}
+ 		}
++
++		swap_user_cpus_ptr(p, puser_mask);
+ 		task_rq_unlock(rq, p, rf);
+
+ 		if (complete)
+@@ -2843,7 +2859,8 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+ 					 const struct cpumask *new_mask,
+ 					 u32 flags,
+ 					 struct rq *rq,
+-					 struct rq_flags *rf)
++					 struct rq_flags *rf,
++					 struct cpumask **puser_mask)
+ 	__releases(rq->lock)
+ 	__releases(p->pi_lock)
+ {
+@@ -2908,7 +2925,7 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+
+ 	__do_set_cpus_allowed(p, new_mask, flags);
+
+-	return affine_move_task(rq, p, rf, dest_cpu, flags);
++	return affine_move_task(rq, p, rf, dest_cpu, flags, puser_mask);
+
+ out:
+ 	task_rq_unlock(rq, p, rf);
+@@ -2926,7 +2943,8 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+  * call is not atomic; no spinlocks may be held.
+  */
+ static int __set_cpus_allowed_ptr(struct task_struct *p,
+-				  const struct cpumask *new_mask, u32 flags)
++				  const struct cpumask *new_mask, u32 flags,
++				  struct cpumask **puser_mask)
+ {
+ 	struct cpumask *alloc_mask = NULL;
+ 	struct rq_flags rf;
+@@ -2934,8 +2952,11 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
+ 	int ret;
+
+ 	rq = task_rq_lock(p, &rf);
+-	if (p->user_cpus_ptr) {
+
++	/*
++	 * user_cpus_ptr masking is skipped if puser_mask is defined.
++	 */
++	if (p->user_cpus_ptr && !puser_mask) {
+ 		/*
+ 		 * A scratch cpumask is allocated on the percpu runqueues
+ 		 * to enable additional masking with user_cpus_ptr. This
+@@ -2958,7 +2979,8 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
+ 	}
+
+
+-	ret = __set_cpus_allowed_ptr_locked(p, new_mask, flags, rq, &rf);
++	ret = __set_cpus_allowed_ptr_locked(p, new_mask, flags, rq, &rf,
++					    puser_mask);
+ 	if (unlikely(alloc_mask))
+ 		kfree(alloc_mask);
+ 	return ret;
+@@ -2966,7 +2988,7 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
+
+ int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask)
+ {
+-	return __set_cpus_allowed_ptr(p, new_mask, 0);
++	return __set_cpus_allowed_ptr(p, new_mask, 0, NULL);
+ }
+ EXPORT_SYMBOL_GPL(set_cpus_allowed_ptr);
+
+@@ -3004,7 +3026,7 @@ static int restrict_cpus_allowed_ptr(struct task_struct *p,
+ 		goto err_unlock;
+ 	}
+
+-	return __set_cpus_allowed_ptr_locked(p, new_mask, 0, rq, &rf);
++	return __set_cpus_allowed_ptr_locked(p, new_mask, 0, rq, &rf, NULL);
+
+ err_unlock:
+ 	task_rq_unlock(rq, p, &rf);
+@@ -3551,7 +3573,7 @@ void sched_set_stop_task(int cpu, struct task_struct *stop)
+
+ static inline int __set_cpus_allowed_ptr(struct task_struct *p,
+ 					 const struct cpumask *new_mask,
+-					 u32 flags)
++					 u32 flags, struct cpumask **puser_mask)
+ {
+ 	return set_cpus_allowed_ptr(p, new_mask);
+ }
+@@ -8109,29 +8131,25 @@ __sched_setaffinity(struct task_struct *p, const struct cpumask *mask, bool save
+ 		}
+ 		cpumask_copy(user_mask, mask);
+ 	}
+-again:
+-	retval = __set_cpus_allowed_ptr(p, new_mask, SCA_CHECK);
++
++	retval = __set_cpus_allowed_ptr(p, new_mask, SCA_CHECK,
++					user_mask ? &user_mask : NULL);
+ 	if (retval)
+ 		goto out_free_new_mask;
+
+-	cpuset_cpus_allowed(p, cpus_allowed);
+-	if (!cpumask_subset(new_mask, cpus_allowed)) {
++	for (;;) {
++		cpuset_cpus_allowed(p, cpus_allowed);
++		if (cpumask_subset(new_mask, cpus_allowed))
++			break;
++
+ 		/*
+ 		 * We must have raced with a concurrent cpuset update.
+ 		 * Just reset the cpumask to the cpuset's cpus_allowed.
+ 		 */
+ 		cpumask_copy(new_mask, cpus_allowed);
+-		goto again;
++		retval = __set_cpus_allowed_ptr(p, new_mask, SCA_CHECK, NULL);
+ 	}
+
+-	if (save_mask) {
+-		unsigned long flags;
+-
+-		/* Use pi_lock to synchronize changes to user_cpus_ptr */
+-		raw_spin_lock_irqsave(&p->pi_lock, flags);
+-		swap(p->user_cpus_ptr, user_mask);
+-		raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+-	}
+ out_free_new_mask:
+ 	kfree(user_mask);
+ 	free_cpumask_var(new_mask);
+--
+2.31.1
+
+sched_setaffinity() can also race with a concurrent fork/clone() syscall
+calling dup_user_cpus_ptr(). That may lead to a use after free problem.
+Fix that by protecting the cpumask copying using pi_lock of the source
+task.
+
+Signed-off-by: Waiman Long <longman@xxxxxxxxxx>
+---
+ kernel/sched/core.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 6cd1177fbcea..71a3fdcb6b6b 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2593,6 +2593,8 @@ void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
+ int dup_user_cpus_ptr(struct task_struct *dst, struct task_struct *src,
+ 		      int node)
+ {
++	unsigned long flags;
++
+ 	if (!src->user_cpus_ptr)
+ 		return 0;
+
+@@ -2600,7 +2602,10 @@ int dup_user_cpus_ptr(struct task_struct *dst, struct task_struct *src,
+ 	if (!dst->user_cpus_ptr)
+ 		return -ENOMEM;
+
++	/* Use pi_lock to protect content of user_cpus_ptr */
++	raw_spin_lock_irqsave(&src->pi_lock, flags);
+ 	cpumask_copy(dst->user_cpus_ptr, src->user_cpus_ptr);
++	raw_spin_unlock_irqrestore(&src->pi_lock, flags);
+ 	return 0;
+ }
+
+--
+2.31.1
+
+remove unnecessary struct sg_lb_stats declaration
+
+Fixes: 57abff067a08 ("sched/fair: Rework find_idlest_group()")
+Signed-off-by: Hui Su <suhui_kernel@xxxxxxx>
+---
+ kernel/sched/fair.c | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 914096c5b1ae..54bacf635362 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -9050,9 +9050,6 @@ static inline enum fbq_type fbq_classify_rq(struct rq *rq)
+ }
+ #endif /* CONFIG_NUMA_BALANCING */
+
+-
+-struct sg_lb_stats;
+-
+ /*
+  * task_running_on_cpu - return 1 if @p is running on @cpu.
+  */
+--
+2.34.1
+
+From: Liu Song <liusong@xxxxxxxxxxxxxxxxx>
+
+If "nr + nr_tags <= map_depth", then the value of nr_tags will not be
+greater than map_depth, so no additional comparison is required.
+
+Signed-off-by: Liu Song <liusong@xxxxxxxxxxxxxxxxx>
+---
+ lib/sbitmap.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/lib/sbitmap.c b/lib/sbitmap.c
+index 29eb048..34c904b 100644
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@ -533,10 +533,9 @@ unsigned long __sbitmap_queue_get_batch(struct sbitmap_queue *sbq, int nr_tags,
+ 		nr = find_first_zero_bit(&map->word, map_depth);
+ 		if (nr + nr_tags <= map_depth) {
+ 			atomic_long_t *ptr = (atomic_long_t *) &map->word;
+-			int map_tags = min_t(int, nr_tags, map_depth);
+ 			unsigned long val, ret;
+
+-			get_mask = ((1UL << map_tags) - 1) << nr;
++			get_mask = ((1UL << nr_tags) - 1) << nr;
+ 			do {
+ 				val = READ_ONCE(map->word);
+ 				if ((val & ~get_mask) != val)
+@@ -547,7 +546,7 @@ unsigned long __sbitmap_queue_get_batch(struct sbitmap_queue *sbq, int nr_tags,
+ 			if (get_mask) {
+ 				*offset = nr + (index << sb->shift);
+ 				update_alloc_hint_after_get(sb, depth, hint,
+-							*offset + map_tags - 1);
++							*offset + nr_tags - 1);
+ 				return get_mask;
+ 			}
+ 		}
+--
+1.8.3.1
+
+HDP flush is used early in the init sequence as part of memory controller
+block initialization. Hence remapping of HDP registers needed for flush
+needs to happen earlier.
+
+This also fixes the AER error reported as Unsupported Request during
+driver load.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=216373
+
+Reported-by: Tom Seewald <tseewald at gmail.com>
+Signed-off-by: Lijo Lazar <lijo.lazar at amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 9 +++++++++
+ drivers/gpu/drm/amd/amdgpu/nv.c            | 6 ------
+ drivers/gpu/drm/amd/amdgpu/soc15.c         | 6 ------
+ drivers/gpu/drm/amd/amdgpu/soc21.c         | 6 ------
+ 4 files changed, 9 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index ce7d117efdb5..53d753e94a71 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2376,6 +2376,15 @@ static int amdgpu_device_ip_init(struct amdgpu_device *adev)
+ 				DRM_ERROR("amdgpu_vram_scratch_init failed %d\n", r);
+ 				goto init_failed;
+ 			}
++
++			/* remap HDP registers to a hole in mmio space,
++			 * for the purpose of expose those registers
++			 * to process space. This is needed for any early HDP
++			 * flush operation during gmc initialization.
++			 */
++			if (adev->nbio.funcs->remap_hdp_registers && !amdgpu_sriov_vf(adev))
++				adev->nbio.funcs->remap_hdp_registers(adev);
++
+ 			r = adev->ip_blocks[i].version->funcs->hw_init((void *)adev);
+ 			if (r) {
+ 				DRM_ERROR("hw_init %d failed %d\n", i, r);
+diff --git a/drivers/gpu/drm/amd/amdgpu/nv.c b/drivers/gpu/drm/amd/amdgpu/nv.c
+index b3fba8dea63c..3ac7fef74277 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nv.c
++++ b/drivers/gpu/drm/amd/amdgpu/nv.c
+@@ -1032,12 +1032,6 @@ static int nv_common_hw_init(void *handle)
+ 	nv_program_aspm(adev);
+ 	/* setup nbio registers */
+ 	adev->nbio.funcs->init_registers(adev);
+-	/* remap HDP registers to a hole in mmio space,
+-	 * for the purpose of expose those registers
+-	 * to process space
+-	 */
+-	if (adev->nbio.funcs->remap_hdp_registers && !amdgpu_sriov_vf(adev))
+-		adev->nbio.funcs->remap_hdp_registers(adev);
+ 	/* enable the doorbell aperture */
+ 	nv_enable_doorbell_aperture(adev, true);
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/soc15.c b/drivers/gpu/drm/amd/amdgpu/soc15.c
+index fde6154f2009..a0481e37d7cf 100644
+--- a/drivers/gpu/drm/amd/amdgpu/soc15.c
++++ b/drivers/gpu/drm/amd/amdgpu/soc15.c
+@@ -1240,12 +1240,6 @@ static int soc15_common_hw_init(void *handle)
+ 	soc15_program_aspm(adev);
+ 	/* setup nbio registers */
+ 	adev->nbio.funcs->init_registers(adev);
+-	/* remap HDP registers to a hole in mmio space,
+-	 * for the purpose of expose those registers
+-	 * to process space
+-	 */
+-	if (adev->nbio.funcs->remap_hdp_registers && !amdgpu_sriov_vf(adev))
+-		adev->nbio.funcs->remap_hdp_registers(adev);
+
+ 	/* enable the doorbell aperture */
+ 	soc15_enable_doorbell_aperture(adev, true);
+diff --git a/drivers/gpu/drm/amd/amdgpu/soc21.c b/drivers/gpu/drm/amd/amdgpu/soc21.c
+index 55284b24f113..16b447055102 100644
+--- a/drivers/gpu/drm/amd/amdgpu/soc21.c
++++ b/drivers/gpu/drm/amd/amdgpu/soc21.c
+@@ -660,12 +660,6 @@ static int soc21_common_hw_init(void *handle)
+ 	soc21_program_aspm(adev);
+ 	/* setup nbio registers */
+ 	adev->nbio.funcs->init_registers(adev);
+-	/* remap HDP registers to a hole in mmio space,
+-	 * for the purpose of expose those registers
+-	 * to process space
+-	 */
+-	if (adev->nbio.funcs->remap_hdp_registers)
+-		adev->nbio.funcs->remap_hdp_registers(adev);
+ 	/* enable the doorbell aperture */
+ 	soc21_enable_doorbell_aperture(adev, true);
+
+--
+2.25.1
+
+Make sure the register offsets used for HDP flush in VF is
+initialized early so that it works fine during any early HDP flush
+sequence. For that, move the offset initialization to *_remap_hdp.
+
+Signed-off-by: Lijo Lazar <lijo.lazar at amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  2 +-
+ drivers/gpu/drm/amd/amdgpu/nbio_v2_3.c     | 23 +++++++++++++--------
+ drivers/gpu/drm/amd/amdgpu/nbio_v4_3.c     | 12 +++++++----
+ drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c     | 23 +++++++++++++--------
+ drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c     | 21 ++++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/nbio_v7_2.c     | 24 ++++++++++++++--------
+ drivers/gpu/drm/amd/amdgpu/nbio_v7_4.c     | 23 +++++++++++++--------
+ 7 files changed, 84 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 53d753e94a71..c0bb2e9616c5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2382,7 +2382,7 @@ static int amdgpu_device_ip_init(struct amdgpu_device *adev)
+ 			 * to process space. This is needed for any early HDP
+ 			 * flush operation during gmc initialization.
+ 			 */
+-			if (adev->nbio.funcs->remap_hdp_registers && !amdgpu_sriov_vf(adev))
++			if (adev->nbio.funcs->remap_hdp_registers)
+ 				adev->nbio.funcs->remap_hdp_registers(adev);
+
+ 			r = adev->ip_blocks[i].version->funcs->hw_init((void *)adev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v2_3.c b/drivers/gpu/drm/amd/amdgpu/nbio_v2_3.c
+index b465baa26762..20fa2c5ad510 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v2_3.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v2_3.c
+@@ -65,10 +65,21 @@
+
+ static void nbio_v2_3_remap_hdp_registers(struct amdgpu_device *adev)
+ {
+-	WREG32_SOC15(NBIO, 0, mmREMAP_HDP_MEM_FLUSH_CNTL,
+-		adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL);
+-	WREG32_SOC15(NBIO, 0, mmREMAP_HDP_REG_FLUSH_CNTL,
+-		adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_REG_FLUSH_CNTL);
++	if (amdgpu_sriov_vf(adev))
++		adev->rmmio_remap.reg_offset =
++			SOC15_REG_OFFSET(
++				NBIO, 0,
++				mmBIF_BX_DEV0_EPF0_VF0_HDP_MEM_COHERENCY_FLUSH_CNTL)
++			<< 2;
++
++	if (!amdgpu_sriov_vf(adev)) {
++		WREG32_SOC15(NBIO, 0, mmREMAP_HDP_MEM_FLUSH_CNTL,
++			     adev->rmmio_remap.reg_offset +
++				     KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL);
++		WREG32_SOC15(NBIO, 0, mmREMAP_HDP_REG_FLUSH_CNTL,
++			     adev->rmmio_remap.reg_offset +
++				     KFD_MMIO_REMAP_HDP_REG_FLUSH_CNTL);
++	}
+ }
+
+ static u32 nbio_v2_3_get_rev_id(struct amdgpu_device *adev)
+@@ -338,10 +349,6 @@ static void nbio_v2_3_init_registers(struct amdgpu_device *adev)
+
+ 	if (def != data)
+ 		WREG32_PCIE(smnPCIE_CONFIG_CNTL, data);
+-
+-	if (amdgpu_sriov_vf(adev))
+-		adev->rmmio_remap.reg_offset = SOC15_REG_OFFSET(NBIO, 0,
+-			mmBIF_BX_DEV0_EPF0_VF0_HDP_MEM_COHERENCY_FLUSH_CNTL) << 2;
+ }
+
+ #define NAVI10_PCIE__LC_L0S_INACTIVITY_DEFAULT		0x00000000 // off by default, no gains over L1
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v4_3.c b/drivers/gpu/drm/amd/amdgpu/nbio_v4_3.c
+index 982a89f841d5..e011d9856794 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v4_3.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v4_3.c
+@@ -30,10 +30,14 @@
+
+ static void nbio_v4_3_remap_hdp_registers(struct amdgpu_device *adev)
+ {
+-	WREG32_SOC15(NBIO, 0, regBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL,
+-		adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL);
+-	WREG32_SOC15(NBIO, 0, regBIF_BX0_REMAP_HDP_REG_FLUSH_CNTL,
+-		adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_REG_FLUSH_CNTL);
++	if (!amdgpu_sriov_vf(adev)) {
++		WREG32_SOC15(NBIO, 0, regBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL,
++			     adev->rmmio_remap.reg_offset +
++				     KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL);
++		WREG32_SOC15(NBIO, 0, regBIF_BX0_REMAP_HDP_REG_FLUSH_CNTL,
++			     adev->rmmio_remap.reg_offset +
++				     KFD_MMIO_REMAP_HDP_REG_FLUSH_CNTL);
++	}
+ }
+
+ static u32 nbio_v4_3_get_rev_id(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c b/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c
+index f7f6ddebd3e4..7536ca3fcd69 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c
+@@ -55,10 +55,21 @@
+
+ static void nbio_v6_1_remap_hdp_registers(struct amdgpu_device *adev)
+ {
+-	WREG32_SOC15(NBIO, 0, mmREMAP_HDP_MEM_FLUSH_CNTL,
+-		adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL);
+-	WREG32_SOC15(NBIO, 0, mmREMAP_HDP_REG_FLUSH_CNTL,
+-		adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_REG_FLUSH_CNTL);
++	if (amdgpu_sriov_vf(adev))
++		adev->rmmio_remap.reg_offset =
++			SOC15_REG_OFFSET(
++				NBIO, 0,
++				mmBIF_BX_DEV0_EPF0_VF0_HDP_MEM_COHERENCY_FLUSH_CNTL)
++			<< 2;
++
++	if (!amdgpu_sriov_vf(adev)) {
++		WREG32_SOC15(NBIO, 0, mmREMAP_HDP_MEM_FLUSH_CNTL,
++			     adev->rmmio_remap.reg_offset +
++				     KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL);
++		WREG32_SOC15(NBIO, 0, mmREMAP_HDP_REG_FLUSH_CNTL,
++			     adev->rmmio_remap.reg_offset +
++				     KFD_MMIO_REMAP_HDP_REG_FLUSH_CNTL);
++	}
+ }
+
+ static u32 nbio_v6_1_get_rev_id(struct amdgpu_device *adev)
+@@ -276,10 +287,6 @@ static void nbio_v6_1_init_registers(struct amdgpu_device *adev)
+
+ 	if (def != data)
+ 		WREG32_PCIE(smnPCIE_CI_CNTL, data);
+-
+-	if (amdgpu_sriov_vf(adev))
+-		adev->rmmio_remap.reg_offset = SOC15_REG_OFFSET(NBIO, 0,
+-			mmBIF_BX_DEV0_EPF0_VF0_HDP_MEM_COHERENCY_FLUSH_CNTL) << 2;
+ }
+
+ static void nbio_v6_1_program_ltr(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c b/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c
+index aa0326d00c72..6b4ac16a8466 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c
+@@ -35,10 +35,20 @@
+
+ static void nbio_v7_0_remap_hdp_registers(struct amdgpu_device *adev)
+ {
+-	WREG32_SOC15(NBIO, 0, mmREMAP_HDP_MEM_FLUSH_CNTL,
+-		adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL);
+-	WREG32_SOC15(NBIO, 0, mmREMAP_HDP_REG_FLUSH_CNTL,
+-		adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_REG_FLUSH_CNTL);
++	if (amdgpu_sriov_vf(adev))
++		adev->rmmio_remap.reg_offset =
++			SOC15_REG_OFFSET(NBIO, 0,
++					 mmHDP_MEM_COHERENCY_FLUSH_CNTL)
++			<< 2;
++
++	if (!amdgpu_sriov_vf(adev)) {
++		WREG32_SOC15(NBIO, 0, mmREMAP_HDP_MEM_FLUSH_CNTL,
++			     adev->rmmio_remap.reg_offset +
++				     KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL);
++		WREG32_SOC15(NBIO, 0, mmREMAP_HDP_REG_FLUSH_CNTL,
++			     adev->rmmio_remap.reg_offset +
++				     KFD_MMIO_REMAP_HDP_REG_FLUSH_CNTL);
++	}
+ }
+
+ static u32 nbio_v7_0_get_rev_id(struct amdgpu_device *adev)
+@@ -273,9 +283,6 @@ const struct nbio_hdp_flush_reg nbio_v7_0_hdp_flush_reg = {
+
+ static void nbio_v7_0_init_registers(struct amdgpu_device *adev)
+ {
+-	if (amdgpu_sriov_vf(adev))
+-		adev->rmmio_remap.reg_offset =
+-			SOC15_REG_OFFSET(NBIO, 0, mmHDP_MEM_COHERENCY_FLUSH_CNTL) << 2;
+ }
+
+ const struct amdgpu_nbio_funcs nbio_v7_0_funcs = {
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v7_2.c b/drivers/gpu/drm/amd/amdgpu/nbio_v7_2.c
+index 31776b12e4c4..fb4be72eade7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v7_2.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v7_2.c
+@@ -49,10 +49,21 @@
+
+ static void nbio_v7_2_remap_hdp_registers(struct amdgpu_device *adev)
+ {
+-	WREG32_SOC15(NBIO, 0, regBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL,
+-		adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL);
+-	WREG32_SOC15(NBIO, 0, regBIF_BX0_REMAP_HDP_REG_FLUSH_CNTL,
+-		adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_REG_FLUSH_CNTL);
++	if (amdgpu_sriov_vf(adev))
++		adev->rmmio_remap.reg_offset =
++			SOC15_REG_OFFSET(
++				NBIO, 0,
++				regBIF_BX_PF0_HDP_MEM_COHERENCY_FLUSH_CNTL)
++			<< 2;
++
++	if (!amdgpu_sriov_vf(adev)) {
++		WREG32_SOC15(NBIO, 0, regBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL,
++			     adev->rmmio_remap.reg_offset +
++				     KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL);
++		WREG32_SOC15(NBIO, 0, regBIF_BX0_REMAP_HDP_REG_FLUSH_CNTL,
++			     adev->rmmio_remap.reg_offset +
++				     KFD_MMIO_REMAP_HDP_REG_FLUSH_CNTL);
++	}
+ }
+
+ static u32 nbio_v7_2_get_rev_id(struct amdgpu_device *adev)
+@@ -369,6 +380,7 @@ const struct nbio_hdp_flush_reg nbio_v7_2_hdp_flush_reg = {
+ static void nbio_v7_2_init_registers(struct amdgpu_device *adev)
+ {
+ 	uint32_t def, data;
++
+ 	switch (adev->ip_versions[NBIO_HWIP][0]) {
+ 	case IP_VERSION(7, 2, 1):
+ 	case IP_VERSION(7, 3, 0):
+@@ -393,10 +405,6 @@ static void nbio_v7_2_init_registers(struct amdgpu_device *adev)
+ 			WREG32_PCIE_PORT(SOC15_REG_OFFSET(NBIO, 0, regPCIE_CONFIG_CNTL), data);
+ 		break;
+ 	}
+-
+-	if (amdgpu_sriov_vf(adev))
+-		adev->rmmio_remap.reg_offset = SOC15_REG_OFFSET(NBIO, 0,
+-			regBIF_BX_PF0_HDP_MEM_COHERENCY_FLUSH_CNTL) << 2;
+ }
+
+ const struct amdgpu_nbio_funcs nbio_v7_2_funcs = {
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v7_4.c b/drivers/gpu/drm/amd/amdgpu/nbio_v7_4.c
+index 11848d1e238b..3c11af99582f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v7_4.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v7_4.c
+@@ -101,10 +101,21 @@ static void nbio_v7_4_query_ras_error_count(struct amdgpu_device *adev,
+
+ static void nbio_v7_4_remap_hdp_registers(struct amdgpu_device *adev)
+ {
+-	WREG32_SOC15(NBIO, 0, mmREMAP_HDP_MEM_FLUSH_CNTL,
+-		adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL);
+-	WREG32_SOC15(NBIO, 0, mmREMAP_HDP_REG_FLUSH_CNTL,
+-		adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_REG_FLUSH_CNTL);
++	if (amdgpu_sriov_vf(adev))
++		adev->rmmio_remap.reg_offset =
++			SOC15_REG_OFFSET(
++				NBIO, 0,
++				mmBIF_BX_DEV0_EPF0_VF0_HDP_MEM_COHERENCY_FLUSH_CNTL)
++			<< 2;
++
++	if (!amdgpu_sriov_vf(adev)) {
++		WREG32_SOC15(NBIO, 0, mmREMAP_HDP_MEM_FLUSH_CNTL,
++			     adev->rmmio_remap.reg_offset +
++				     KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL);
++		WREG32_SOC15(NBIO, 0, mmREMAP_HDP_REG_FLUSH_CNTL,
++			     adev->rmmio_remap.reg_offset +
++				     KFD_MMIO_REMAP_HDP_REG_FLUSH_CNTL);
++	}
+ }
+
+ static u32 nbio_v7_4_get_rev_id(struct amdgpu_device *adev)
+@@ -343,10 +354,6 @@ static void nbio_v7_4_init_registers(struct amdgpu_device *adev)
+ {
+ 	uint32_t baco_cntl;
+
+-	if (amdgpu_sriov_vf(adev))
+-		adev->rmmio_remap.reg_offset = SOC15_REG_OFFSET(NBIO, 0,
+-			mmBIF_BX_DEV0_EPF0_VF0_HDP_MEM_COHERENCY_FLUSH_CNTL) << 2;
+-
+ 	if (adev->ip_versions[NBIO_HWIP][0] == IP_VERSION(7, 4, 4) &&
+ 	    !amdgpu_sriov_vf(adev)) {
+ 		baco_cntl = RREG32_SOC15(NBIO, 0, mmBACO_CNTL);
+--
+2.25.1
+
+Like in f4f03f299a56ce4d73c5431e0327b3b6cb55ebb9
+"um: Cleanup syscall_handler_t definition/cast, fix warning",
+remove the cast to to fix the compiler warning.
+
+Signed-off-by: Lukas Straub <lukasstraub2@xxxxxx>
+---
+ arch/x86/um/shared/sysdep/syscalls_32.h | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/um/shared/sysdep/syscalls_32.h b/arch/x86/um/shared/sysdep/syscalls_32.h
+index 68fd2cf526fd..f6e9f84397e7 100644
+--- a/arch/x86/um/shared/sysdep/syscalls_32.h
++++ b/arch/x86/um/shared/sysdep/syscalls_32.h
+@@ -6,10 +6,9 @@
+ #include <asm/unistd.h>
+ #include <sysdep/ptrace.h>
+
+-typedef long syscall_handler_t(struct pt_regs);
++typedef long syscall_handler_t(struct syscall_args);
+
+ extern syscall_handler_t *sys_call_table[];
+
+ #define EXECUTE_SYSCALL(syscall, regs) \
+-	((long (*)(struct syscall_args)) \
+-	 (*sys_call_table[syscall]))(SYSCALL_ARGS(&regs->regs))
++	((*sys_call_table[syscall]))(SYSCALL_ARGS(&regs->regs))
+--
+2.37.2
+
+arch.tls_array is statically allocated so checking for NULL doesn't
+make sense. This causes the compiler warning below.
+
+Remove the checks to silence these warnings.
+
+../arch/x86/um/tls_32.c: In function 'get_free_idx':
+../arch/x86/um/tls_32.c:68:13: warning: the comparison will always evaluate as 'true' for the address of 'tls_array' will never be NULL [-Waddress]
+   68 |         if (!t->arch.tls_array)
+      |             ^
+In file included from ../arch/x86/um/asm/processor.h:10,
+                 from ../include/linux/rcupdate.h:30,
+                 from ../include/linux/rculist.h:11,
+                 from ../include/linux/pid.h:5,
+                 from ../include/linux/sched.h:14,
+                 from ../arch/x86/um/tls_32.c:7:
+../arch/x86/um/asm/processor_32.h:22:31: note: 'tls_array' declared here
+   22 |         struct uml_tls_struct tls_array[GDT_ENTRY_TLS_ENTRIES];
+      |                               ^~~~~~~~~
+../arch/x86/um/tls_32.c: In function 'get_tls_entry':
+../arch/x86/um/tls_32.c:243:13: warning: the comparison will always evaluate as 'true' for the address of 'tls_array' will never be NULL [-Waddress]
+  243 |         if (!t->arch.tls_array)
+      |             ^
+../arch/x86/um/asm/processor_32.h:22:31: note: 'tls_array' declared here
+   22 |         struct uml_tls_struct tls_array[GDT_ENTRY_TLS_ENTRIES];
+      |                               ^~~~~~~~~
+
+Signed-off-by: Lukas Straub <lukasstraub2@xxxxxx>
+---
+ arch/x86/um/tls_32.c | 6 ------
+ 1 file changed, 6 deletions(-)
+
+diff --git a/arch/x86/um/tls_32.c b/arch/x86/um/tls_32.c
+index ac8eee093f9c..66162eafd8e8 100644
+--- a/arch/x86/um/tls_32.c
++++ b/arch/x86/um/tls_32.c
+@@ -65,9 +65,6 @@ static int get_free_idx(struct task_struct* task)
+ 	struct thread_struct *t = &task->thread;
+ 	int idx;
+
+-	if (!t->arch.tls_array)
+-		return GDT_ENTRY_TLS_MIN;
+-
+ 	for (idx = 0; idx < GDT_ENTRY_TLS_ENTRIES; idx++)
+ 		if (!t->arch.tls_array[idx].present)
+ 			return idx + GDT_ENTRY_TLS_MIN;
+@@ -240,9 +237,6 @@ static int get_tls_entry(struct task_struct *task, struct user_desc *info,
+ {
+ 	struct thread_struct *t = &task->thread;
+
+-	if (!t->arch.tls_array)
+-		goto clear;
+-
+ 	if (idx < GDT_ENTRY_TLS_MIN || idx > GDT_ENTRY_TLS_MAX)
+ 		return -EINVAL;
+
+--
+2.37.2
