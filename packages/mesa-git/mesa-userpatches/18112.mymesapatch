@@ -1,0 +1,381 @@
+From dd1c7e2d6105e1f19aae91d4bc1a1e93a51706fb Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Sch=C3=BCrmann?= <daniel@schuermann.dev>
+Date: Mon, 15 Aug 2022 21:42:05 +0200
+Subject: [PATCH 1/4] aco: implement custom memory resource
+
+This basic allocator implements an arena allocation strategy
+and cannot free individual allocations.
+It is intended for very fast memory allocations in situations
+where memory is used to build up a few objects and then is
+released all at once.
+
+This class mimiks std::pmr::monotonic_buffer_resource.
+---
+ src/amd/compiler/aco_util.h | 80 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 80 insertions(+)
+
+diff --git a/src/amd/compiler/aco_util.h b/src/amd/compiler/aco_util.h
+index 2b32e94a805f..3952b3a599de 100644
+--- a/src/amd/compiler/aco_util.h
++++ b/src/amd/compiler/aco_util.h
+@@ -27,6 +27,7 @@
+ #define ACO_UTIL_H
+ 
+ #include "util/bitscan.h"
++#include "util/u_math.h"
+ 
+ #include <cassert>
+ #include <cstddef>
+@@ -379,6 +380,85 @@ IDSet::Iterator::operator*() const
+    return (word << 6) | bit;
+ }
+ 
++/*
++ * Light-weight memory resource which allows to sequentially allocate from
++ * a buffer. Both, the release() method and the destructor release all managed
++ * memory.
++ *
++ * The memory resource is not thread-safe.
++ * This class mimiks std::pmr::monotonic_buffer_resource
++ */
++class monotonic_buffer_resource {
++public:
++   explicit monotonic_buffer_resource(size_t size = initial_size)
++   {
++      buffer = (Buffer*)malloc(size);
++      buffer->next = nullptr;
++      buffer->buffer_size = size - sizeof(Buffer);
++      buffer->current_idx = 0;
++   }
++
++   ~monotonic_buffer_resource()
++   {
++      assert(buffer);
++      release();
++      free(buffer);
++      buffer = nullptr;
++   }
++
++   /* delete copy-constructor and -assigment to avoid double free() */
++   monotonic_buffer_resource(const monotonic_buffer_resource&) = delete;
++   monotonic_buffer_resource& operator=(const monotonic_buffer_resource&) = delete;
++
++   void* allocate(size_t size, size_t alignment)
++   {
++      assert(buffer);
++      buffer->current_idx = align(buffer->current_idx, alignment);
++      if (buffer->current_idx + size <= buffer->buffer_size) {
++         uint8_t* ptr = &buffer->data[buffer->current_idx];
++         buffer->current_idx += size;
++         return ptr;
++      }
++
++      /* create new larger buffer */
++      uint32_t buffer_size = buffer->buffer_size + sizeof(Buffer);
++      do {
++         buffer_size *= 2;
++      } while (buffer_size < size);
++      Buffer* next = buffer;
++      buffer = (Buffer*)malloc(buffer_size);
++      buffer->next = next;
++      buffer->buffer_size = buffer_size - sizeof(Buffer);
++      buffer->current_idx = 0;
++
++      return allocate(size, alignment);
++   }
++
++   void release()
++   {
++      assert(buffer);
++      while (buffer->next) {
++         Buffer* next = buffer->next;
++         free(buffer);
++         buffer = next;
++      }
++      buffer->current_idx = 0;
++   }
++
++   bool operator==(const monotonic_buffer_resource& other) { return buffer == other.buffer; }
++
++private:
++   struct Buffer {
++      Buffer* next;
++      uint32_t current_idx;
++      uint32_t buffer_size;
++      uint8_t data[];
++   };
++
++   Buffer* buffer;
++   static constexpr size_t initial_size = 4096;
++};
++
+ } // namespace aco
+ 
+ #endif // ACO_UTIL_H
+-- 
+GitLab
+
+
+From a5f5befc9caf2552269756186fac91019d395b4b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Sch=C3=BCrmann?= <daniel@schuermann.dev>
+Date: Mon, 15 Aug 2022 21:42:19 +0200
+Subject: [PATCH 2/4] aco: use monotonic_buffer_resource for instructions
+
+As monotonic_buffer_resource is not thread-safe,
+we use a thread_local instance which gets allocated once.
+---
+ src/amd/compiler/aco_interface.cpp |  6 ++++++
+ src/amd/compiler/aco_ir.cpp        |  2 ++
+ src/amd/compiler/aco_ir.h          | 12 +++++++++---
+ 3 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/src/amd/compiler/aco_interface.cpp b/src/amd/compiler/aco_interface.cpp
+index 03544424c2e7..89d3bc6ea896 100644
+--- a/src/amd/compiler/aco_interface.cpp
++++ b/src/amd/compiler/aco_interface.cpp
+@@ -257,6 +257,8 @@ aco_compile_shader(const struct aco_compiler_options* options,
+    if (program->collect_statistics)
+       stats_size = aco::num_statistics * sizeof(uint32_t);
+ 
++   aco::instruction_buffer.release();
++
+    (*build_binary)(binary,
+                    shaders[shader_count - 1]->info.stage,
+                    args->is_gs_copy_shader,
+@@ -308,6 +310,8 @@ aco_compile_vs_prolog(const struct aco_compiler_options* options,
+    if (get_disasm)
+       disasm = get_disasm_string(program.get(), code, exec_size);
+ 
++   aco::instruction_buffer.release();
++
+    (*build_prolog)(binary,
+                    config.num_sgprs,
+                    config.num_vgprs,
+@@ -353,6 +357,8 @@ aco_compile_ps_epilog(const struct aco_compiler_options* options,
+    if (get_disasm)
+       disasm = get_disasm_string(program.get(), code, exec_size);
+ 
++   aco::instruction_buffer.release();
++
+    (*build_epilog)(binary,
+                    config.num_sgprs,
+                    config.num_vgprs,
+diff --git a/src/amd/compiler/aco_ir.cpp b/src/amd/compiler/aco_ir.cpp
+index dd0c5960e8a0..eb410e40f754 100644
+--- a/src/amd/compiler/aco_ir.cpp
++++ b/src/amd/compiler/aco_ir.cpp
+@@ -32,6 +32,8 @@
+ 
+ namespace aco {
+ 
++thread_local aco::monotonic_buffer_resource instruction_buffer{65536};
++
+ uint64_t debug_flags = 0;
+ 
+ static const struct debug_control aco_debug_options[] = {{"validateir", DEBUG_VALIDATE_IR},
+diff --git a/src/amd/compiler/aco_ir.h b/src/amd/compiler/aco_ir.h
+index 89fd0dd7e27c..fefa00dd2150 100644
+--- a/src/amd/compiler/aco_ir.h
++++ b/src/amd/compiler/aco_ir.h
+@@ -1725,8 +1725,13 @@ struct Pseudo_reduction_instruction : public Instruction {
+ static_assert(sizeof(Pseudo_reduction_instruction) == sizeof(Instruction) + 4,
+               "Unexpected padding");
+ 
++extern thread_local aco::monotonic_buffer_resource instruction_buffer;
++
+ struct instr_deleter_functor {
+-   void operator()(void* p) { free(p); }
++   /* Don't yet free any instructions. They will be de-allocated
++    * all at once after compilation finished.
++    */
++   void operator()(void* p) { return; }
+ };
+ 
+ template <typename T> using aco_ptr = std::unique_ptr<T, instr_deleter_functor>;
+@@ -1738,13 +1743,14 @@ create_instruction(aco_opcode opcode, Format format, uint32_t num_operands,
+ {
+    std::size_t size =
+       sizeof(T) + num_operands * sizeof(Operand) + num_definitions * sizeof(Definition);
+-   char* data = (char*)calloc(1, size);
++   void* data = instruction_buffer.allocate(size, alignof(uint32_t));
++   memset(data, 0, size);
+    T* inst = (T*)data;
+ 
+    inst->opcode = opcode;
+    inst->format = format;
+ 
+-   uint16_t operands_offset = data + sizeof(T) - (char*)&inst->operands;
++   uint16_t operands_offset = sizeof(T) - offsetof(Instruction, operands);
+    inst->operands = aco::span<Operand>(operands_offset, num_operands);
+    uint16_t definitions_offset = (char*)inst->operands.end() - (char*)&inst->definitions;
+    inst->definitions = aco::span<Definition>(definitions_offset, num_definitions);
+-- 
+GitLab
+
+
+From 4a48d7c332da4d0178195f13854bf722ca2fe09d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Sch=C3=BCrmann?= <daniel@schuermann.dev>
+Date: Mon, 22 Aug 2022 14:37:59 +0200
+Subject: [PATCH 3/4] aco: implement allocator_traits for
+ monotonic_allocator<T>
+
+For easier usage, this patch also adds aliases for std::map
+and std::unordered_map using this allocator.
+---
+ src/amd/compiler/aco_util.h | 68 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 68 insertions(+)
+
+diff --git a/src/amd/compiler/aco_util.h b/src/amd/compiler/aco_util.h
+index 3952b3a599de..92a2798cba5f 100644
+--- a/src/amd/compiler/aco_util.h
++++ b/src/amd/compiler/aco_util.h
+@@ -31,7 +31,10 @@
+ 
+ #include <cassert>
+ #include <cstddef>
++#include <functional>
+ #include <iterator>
++#include <map>
++#include <unordered_map>
+ #include <vector>
+ 
+ namespace aco {
+@@ -459,6 +462,71 @@ private:
+    static constexpr size_t initial_size = 4096;
+ };
+ 
++/*
++ * Small memory allocator which wraps monotonic_buffer_resource
++ * in order to implement <allocator_traits>.
++ */
++template <typename T> class monotonic_allocator {
++public:
++   monotonic_allocator() = delete;
++   monotonic_allocator(monotonic_buffer_resource& m) : memory_resource(m) {}
++   template <typename U>
++   explicit monotonic_allocator(const monotonic_allocator<U>& rhs)
++       : memory_resource(rhs.memory_resource)
++   {}
++
++   /* memory allocation */
++   T* allocate(size_t size)
++   {
++      uint32_t bytes = sizeof(T) * size;
++      return (T*)memory_resource.get().allocate(bytes, alignof(T));
++   }
++
++   /* memory will be freed on destruction of memory_resource */
++   void deallocate(T* ptr, size_t size) {}
++
++   /* implement <allocator_traits> */
++   using value_type = T;
++   template <class U> struct rebind {
++      using other = monotonic_allocator<U>;
++   };
++
++   typedef std::true_type propagate_on_container_copy_assignment;
++   typedef std::true_type propagate_on_container_move_assignment;
++   typedef std::true_type propagate_on_container_swap;
++
++   template <typename> friend class monotonic_allocator;
++   template <typename X, typename Y>
++   friend bool operator==(monotonic_allocator<X> const& a, monotonic_allocator<Y> const& b);
++   template <typename X, typename Y>
++   friend bool operator!=(monotonic_allocator<X> const& a, monotonic_allocator<Y> const& b);
++
++private:
++   std::reference_wrapper<monotonic_buffer_resource> memory_resource;
++};
++
++template <typename T, typename T2>
++inline bool
++operator==(monotonic_allocator<T> const& a, monotonic_allocator<T2> const& b)
++{
++   return a.memory_resource.get() == b.memory_resource.get();
++}
++template <typename T, typename T2>
++inline bool
++operator!=(monotonic_allocator<T> const& a, monotonic_allocator<T2> const& b)
++{
++   return !(a == b);
++}
++
++/* aco::map - alias for std::map with monotonic_allocator */
++template <class Key, class T, class Compare = std::less<Key>>
++using map = std::map<Key, T, Compare, aco::monotonic_allocator<std::pair<const Key, T>>>;
++
++/* aco::unordered_map - alias for std::unordered_map with monotonic_allocator */
++template <class Key, class T, class Hash = std::hash<Key>, class Pred = std::equal_to<Key>>
++using unordered_map =
++   std::unordered_map<Key, T, Hash, Pred, aco::monotonic_allocator<std::pair<const Key, T>>>;
++
+ } // namespace aco
+ 
+ #endif // ACO_UTIL_H
+-- 
+GitLab
+
+
+From 5c74d7e36c66a313c7e5f4470cb536e603575124 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Sch=C3=BCrmann?= <daniel@schuermann.dev>
+Date: Mon, 22 Aug 2022 17:26:34 +0200
+Subject: [PATCH 4/4] aco/opt_value_numbering: use monotonic_allocator for
+ unordered_map
+
+This patch also changes the rename map to unordered.
+Roughly halves the time spent on CSE in ACO.
+---
+ src/amd/compiler/aco_opt_value_numbering.cpp | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/src/amd/compiler/aco_opt_value_numbering.cpp b/src/amd/compiler/aco_opt_value_numbering.cpp
+index 98aab2cb5af4..1842094fbff4 100644
+--- a/src/amd/compiler/aco_opt_value_numbering.cpp
++++ b/src/amd/compiler/aco_opt_value_numbering.cpp
+@@ -23,8 +23,8 @@
+  */
+ 
+ #include "aco_ir.h"
++#include "aco_util.h"
+ 
+-#include <map>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -284,12 +284,13 @@ struct InstrPred {
+    }
+ };
+ 
+-using expr_set = std::unordered_map<Instruction*, uint32_t, InstrHash, InstrPred>;
++using expr_set = aco::unordered_map<Instruction*, uint32_t, InstrHash, InstrPred>;
+ 
+ struct vn_ctx {
+    Program* program;
++   monotonic_buffer_resource m;
+    expr_set expr_values;
+-   std::map<uint32_t, Temp> renames;
++   aco::unordered_map<uint32_t, Temp> renames;
+ 
+    /* The exec id should be the same on the same level of control flow depth.
+     * Together with the check for dominator relations, it is safe to assume
+@@ -298,7 +299,7 @@ struct vn_ctx {
+     */
+    uint32_t exec_id = 1;
+ 
+-   vn_ctx(Program* program_) : program(program_)
++   vn_ctx(Program* program_) : program(program_), m(), expr_values(m), renames(m)
+    {
+       static_assert(sizeof(Temp) == 4, "Temp must fit in 32bits");
+       unsigned size = 0;
+@@ -433,7 +434,7 @@ process_block(vn_ctx& ctx, Block& block)
+ }
+ 
+ void
+-rename_phi_operands(Block& block, std::map<uint32_t, Temp>& renames)
++rename_phi_operands(Block& block, aco::unordered_map<uint32_t, Temp>& renames)
+ {
+    for (aco_ptr<Instruction>& phi : block.instructions) {
+       if (phi->opcode != aco_opcode::p_phi && phi->opcode != aco_opcode::p_linear_phi)
+-- 
+GitLab
+
