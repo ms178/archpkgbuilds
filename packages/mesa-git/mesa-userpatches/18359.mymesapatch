@@ -1,0 +1,385 @@
+From 762716bcdd2ac44af6ef0ae302354bd856e2637c Mon Sep 17 00:00:00 2001
+From: Sebastian Wick <sebastian.wick@redhat.com>
+Date: Thu, 1 Sep 2022 00:49:23 +0200
+Subject: [PATCH 1/4] util: Add timespec_sub_saturated to avoid negative time
+ for deadlines
+
+Signed-off-by: Sebastian Wick <sebastian.wick@redhat.com>
+---
+ src/util/timespec.h | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/src/util/timespec.h b/src/util/timespec.h
+index 378ebbba9e54..2022ab56dce5 100644
+--- a/src/util/timespec.h
++++ b/src/util/timespec.h
+@@ -79,6 +79,24 @@ timespec_sub(struct timespec *r,
+    }
+ }
+ 
++/**
++ * Saturated subtract timespecs
++ *
++ * \param r[out] result: max(a - b, 0)
++ * \param a[in] operand
++ * \param b[in] operand
++ */
++static inline void
++timespec_sub_saturated(struct timespec *r,
++                       const struct timespec *a, const struct timespec *b)
++{
++   timespec_sub(r, a, b);
++   if (r->tv_sec < 0) {
++      r->tv_sec = 0;
++      r->tv_nsec = 0;
++   }
++}
++
+ #define TIME_T_MAX \
+    ((time_t)(((time_t)-1) > 0 ? u_uintN_max(sizeof(time_t) * 8) : \
+                                 u_intN_max(sizeof(time_t) * 8)))
+-- 
+GitLab
+
+
+From 7a61e86df8f22fe378e67683233972a6a8252fa1 Mon Sep 17 00:00:00 2001
+From: Sebastian Wick <sebastian.wick@redhat.com>
+Date: Thu, 1 Sep 2022 00:59:52 +0200
+Subject: [PATCH 2/4] vulkan/wsi/wayland: Add fallback
+ wl_display_dispatch_queue_timeout
+
+This is almost a 1:1 copy of the same function in libwayland. If the version
+with the symbol propagates far enough the fallback can be removed again.
+
+Signed-off-by: Sebastian Wick <sebastian.wick@redhat.com>
+---
+ meson.build                         |  6 ++
+ src/vulkan/wsi/wsi_common_wayland.c | 86 +++++++++++++++++++++++++++++
+ 2 files changed, 92 insertions(+)
+
+diff --git a/meson.build b/meson.build
+index 492142f05705..1c13a9b14db2 100644
+--- a/meson.build
++++ b/meson.build
+@@ -2054,6 +2054,12 @@ if with_platform_wayland
+     'linux-dmabuf', 'linux-dmabuf-unstable-v1.xml'
+   )
+   pre_args += '-DWL_HIDE_DEPRECATED'
++  if cc.has_function(
++      'wl_display_dispatch_queue_timeout',
++      prefix : '#include <wayland-client.h>',
++      dependencies: dep_wayland_client)
++    pre_args += ['-DHAVE_WL_DISPATCH_QUEUE_TIMEOUT']
++  endif
+ endif
+ 
+ dep_x11 = null_dep
+diff --git a/src/vulkan/wsi/wsi_common_wayland.c b/src/vulkan/wsi/wsi_common_wayland.c
+index 7faeb43083c5..a524f0336dc6 100644
+--- a/src/vulkan/wsi/wsi_common_wayland.c
++++ b/src/vulkan/wsi/wsi_common_wayland.c
+@@ -954,6 +954,92 @@ wsi_wl_swapchain_get_wsi_image(struct wsi_swapchain *wsi_chain,
+    return &chain->images[image_index].base;
+ }
+ 
++#ifndef HAVE_WL_DISPATCH_QUEUE_TIMEOUT
++static int
++wl_display_poll(struct wl_display *display,
++                short int events,
++                struct timespec *timeout)
++{
++   int ret;
++   struct pollfd pfd[1];
++
++   pfd[0].fd = wl_display_get_fd(display);
++   pfd[0].events = events;
++   do {
++      ret = ppoll(pfd, 1, timeout, NULL);
++   } while (ret == -1 && errno == EINTR);
++
++   if (ret == 0)
++      return -2;
++
++   return ret;
++}
++
++static int
++wl_display_dispatch_queue_timeout(struct wl_display *display,
++                                  struct wl_event_queue *queue,
++                                  struct timespec *timeout)
++{
++   int ret;
++   struct timespec now;
++   struct timespec target_time = {0};
++
++   if (timeout)
++      fprintf(stderr, "timeout %ld, %ld\n", timeout->tv_sec, timeout->tv_nsec);
++
++   if (timeout) {
++      clock_gettime(CLOCK_MONOTONIC, &now);
++      timespec_add(&target_time, &now, timeout);
++   }
++
++   if (wl_display_prepare_read_queue(display, queue) == -1)
++      return wl_display_dispatch_queue_pending(display, queue);
++
++   while (true) {
++      ret = wl_display_flush(display);
++
++      if (ret != -1 || errno != EAGAIN)
++         break;
++
++      ret = wl_display_poll(display, POLLOUT, timeout);
++
++      if (timeout) {
++         clock_gettime(CLOCK_MONOTONIC, &now);
++         timespec_sub_saturated(timeout, &target_time, &now);
++      }
++
++      if (ret < 0) {
++         wl_display_cancel_read(display);
++         return ret;
++      }
++   }
++
++   /* Don't stop if flushing hits an EPIPE; continue so we can read any
++    * protocol error that may have triggered it. */
++   if (ret < 0 && errno != EPIPE) {
++      wl_display_cancel_read(display);
++      return -1;
++   }
++
++   ret = wl_display_poll(display, POLLIN, timeout);
++
++   if (timeout) {
++      clock_gettime(CLOCK_MONOTONIC, &now);
++      timespec_sub_saturated(timeout, &target_time, &now);
++   }
++
++   if (ret < 0) {
++      wl_display_cancel_read(display);
++      return ret;
++   }
++
++   if (wl_display_read_events(display) == -1)
++      return -1;
++
++   return wl_display_dispatch_queue_pending(display, queue);
++}
++#endif
++
+ static VkResult
+ wsi_wl_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
+                                     const VkAcquireNextImageInfoKHR *info,
+-- 
+GitLab
+
+
+From ce6ca9458e5bee4fed3b4c3064ecee4a41c4eeaf Mon Sep 17 00:00:00 2001
+From: Sebastian Wick <sebastian.wick@redhat.com>
+Date: Thu, 1 Sep 2022 01:04:21 +0200
+Subject: [PATCH 3/4] vulkan/wsi/wayland: Use dispatch_queue_timeout in
+ acquire_next_image
+
+Signed-off-by: Sebastian Wick <sebastian.wick@redhat.com>
+---
+ src/vulkan/wsi/wsi_common_wayland.c | 64 ++++++-----------------------
+ 1 file changed, 13 insertions(+), 51 deletions(-)
+
+diff --git a/src/vulkan/wsi/wsi_common_wayland.c b/src/vulkan/wsi/wsi_common_wayland.c
+index a524f0336dc6..7453cdaac613 100644
+--- a/src/vulkan/wsi/wsi_common_wayland.c
++++ b/src/vulkan/wsi/wsi_common_wayland.c
+@@ -1046,22 +1046,15 @@ wsi_wl_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
+                                     uint32_t *image_index)
+ {
+    struct wsi_wl_swapchain *chain = (struct wsi_wl_swapchain *)wsi_chain;
+-   struct timespec start_time, end_time;
+-   struct timespec rel_timeout;
+-   int wl_fd = wl_display_get_fd(chain->display->wl_display);
++   struct timespec ts;
++   struct timespec *timeout = NULL;
+ 
+-   timespec_from_nsec(&rel_timeout, info->timeout);
+-
+-   clock_gettime(CLOCK_MONOTONIC, &start_time);
+-   timespec_add(&end_time, &rel_timeout, &start_time);
++   if (info->timeout > -1) {
++      timespec_from_nsec(&ts, info->timeout);
++      timeout = &ts;
++   }
+ 
+    while (1) {
+-      /* Try to dispatch potential events. */
+-      int ret = wl_display_dispatch_queue_pending(chain->display->wl_display,
+-                                                  chain->display->queue);
+-      if (ret < 0)
+-         return VK_ERROR_OUT_OF_DATE_KHR;
+-
+       /* Try to find a free image. */
+       for (uint32_t i = 0; i < chain->base.image_count; i++) {
+          if (!chain->images[i].busy) {
+@@ -1072,46 +1065,15 @@ wsi_wl_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
+          }
+       }
+ 
+-      /* Check for timeout. */
+-      struct timespec current_time;
+-      clock_gettime(CLOCK_MONOTONIC, &current_time);
+-      if (timespec_after(&current_time, &end_time))
+-         return VK_NOT_READY;
+-
+-      /* Try to read events from the server. */
+-      ret = wl_display_prepare_read_queue(chain->display->wl_display,
+-                                          chain->display->queue);
+-      if (ret < 0) {
+-         /* Another thread might have read events for our queue already. Go
+-          * back to dispatch them.
+-          */
+-         if (errno == EAGAIN)
+-            continue;
++      /* Try to dispatch potential events. */
++      int ret = wl_display_dispatch_queue_timeout(chain->display->wl_display,
++                                                  chain->display->queue,
++                                                  timeout);
++      if (ret == -1)
+          return VK_ERROR_OUT_OF_DATE_KHR;
+-      }
+ 
+-      struct pollfd pollfd = {
+-         .fd = wl_fd,
+-         .events = POLLIN
+-      };
+-      timespec_sub(&rel_timeout, &end_time, &current_time);
+-      ret = ppoll(&pollfd, 1, &rel_timeout, NULL);
+-      if (ret <= 0) {
+-         int lerrno = errno;
+-         wl_display_cancel_read(chain->display->wl_display);
+-         if (ret < 0) {
+-            /* If ppoll() was interrupted, try again. */
+-            if (lerrno == EINTR || lerrno == EAGAIN)
+-               continue;
+-            return VK_ERROR_OUT_OF_DATE_KHR;
+-         }
+-         assert(ret == 0);
+-         continue;
+-      }
+-
+-      ret = wl_display_read_events(chain->display->wl_display);
+-      if (ret < 0)
+-         return VK_ERROR_OUT_OF_DATE_KHR;
++      if (ret == -2)
++         return VK_NOT_READY;
+    }
+ }
+ 
+-- 
+GitLab
+
+
+From 1ad8ecf1ae790574089460858ba1ca26fb0187fa Mon Sep 17 00:00:00 2001
+From: Sebastian Wick <sebastian.wick@redhat.com>
+Date: Thu, 1 Sep 2022 01:53:39 +0200
+Subject: [PATCH 4/4] vulkan/wsi/wayland: Guarantee 1Hz progress for FIFO
+ present mode
+
+Signed-off-by: Sebastian Wick <sebastian.wick@redhat.com>
+---
+ src/vulkan/wsi/wsi_common_wayland.c | 46 +++++++++++++++++++++++++----
+ 1 file changed, 40 insertions(+), 6 deletions(-)
+
+diff --git a/src/vulkan/wsi/wsi_common_wayland.c b/src/vulkan/wsi/wsi_common_wayland.c
+index 7453cdaac613..883d860ccac6 100644
+--- a/src/vulkan/wsi/wsi_common_wayland.c
++++ b/src/vulkan/wsi/wsi_common_wayland.c
+@@ -940,6 +940,9 @@ struct wsi_wl_swapchain {
+ 
+    VkPresentModeKHR                             present_mode;
+    bool                                         fifo_ready;
++   struct timespec                              lowest_tick_rate;
++   struct timespec                              last_frame_callback;
++   struct timespec                              last_queue_present;
+ 
+    struct wsi_wl_image                          images[0];
+ };
+@@ -1081,9 +1084,21 @@ static void
+ frame_handle_done(void *data, struct wl_callback *callback, uint32_t serial)
+ {
+    struct wsi_wl_swapchain *chain = data;
++   struct timespec deadline;
++   struct timespec now;
+ 
+    chain->frame = NULL;
+-   chain->fifo_ready = true;
++
++   clock_gettime(CLOCK_MONOTONIC, &now);
++   timespec_add(&deadline,
++                &chain->last_frame_callback,
++                &chain->lowest_tick_rate);
++
++   if (!timespec_after(&now, &deadline))
++      chain->fifo_ready = true;
++
++   chain->last_frame_callback.tv_sec = now.tv_sec;
++   chain->last_frame_callback.tv_nsec = now.tv_nsec;
+ 
+    wl_callback_destroy(callback);
+ }
+@@ -1105,11 +1120,22 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
+              image->base.row_pitches[0] * chain->extent.height);
+    }
+    if (chain->base.present_mode == VK_PRESENT_MODE_FIFO_KHR) {
++      struct timespec deadline;
++      struct timespec now;
++      struct timespec timeout;
++
++      clock_gettime(CLOCK_MONOTONIC, &now);
++      timespec_add(&deadline, &chain->last_queue_present, &chain->lowest_tick_rate);
++      timespec_sub_saturated(&timeout, &deadline, &now);
++
+       while (!chain->fifo_ready) {
+-         int ret = wl_display_dispatch_queue(chain->display->wl_display,
+-                                             chain->display->queue);
+-         if (ret < 0)
++         int ret = wl_display_dispatch_queue_timeout(chain->display->wl_display,
++                                                     chain->display->queue,
++                                                     &timeout);
++         if (ret == -1)
+             return VK_ERROR_OUT_OF_DATE_KHR;
++         if (ret == -2)
++            break;
+       }
+    }
+ 
+@@ -1130,11 +1156,15 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
+    }
+ 
+    if (chain->base.present_mode == VK_PRESENT_MODE_FIFO_KHR) {
+-      chain->frame = wl_surface_frame(chain->surface);
+-      wl_callback_add_listener(chain->frame, &frame_listener, chain);
++      if (chain->frame == NULL) {
++         chain->frame = wl_surface_frame(chain->surface);
++         wl_callback_add_listener(chain->frame, &frame_listener, chain);
++      }
+       chain->fifo_ready = false;
+    }
+ 
++   clock_gettime(CLOCK_MONOTONIC, &chain->last_queue_present);
++
+    chain->images[image_index].busy = true;
+    wl_surface_commit(chain->surface);
+    wl_display_flush(chain->display->wl_display);
+@@ -1393,6 +1423,10 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+    }
+ 
+    chain->fifo_ready = true;
++   chain->lowest_tick_rate.tv_sec = 1;
++   chain->lowest_tick_rate.tv_nsec = 0;
++   clock_gettime(CLOCK_MONOTONIC, &chain->last_frame_callback);
++   clock_gettime(CLOCK_MONOTONIC, &chain->last_queue_present);
+ 
+    switch (chain->buffer_type) {
+    case WSI_WL_BUFFER_NATIVE:
+-- 
+GitLab
+
