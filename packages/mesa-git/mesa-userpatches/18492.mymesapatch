@@ -1,0 +1,226 @@
+From 743080953c51a0fea30c97fff8e5c7116d6f95b7 Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Thu, 8 Sep 2022 11:24:27 +0200
+Subject: [PATCH 1/2] aco: Combine v_cvt_u32_f32 with insert to
+ v_cvt_pk_u8_f32.
+
+Signed-off-by: Georg Lehmann <dadschoorse@gmail.com>
+---
+ src/amd/compiler/aco_optimizer.cpp | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/src/amd/compiler/aco_optimizer.cpp b/src/amd/compiler/aco_optimizer.cpp
+index 3b3233b1b22f..e7258d58598d 100644
+--- a/src/amd/compiler/aco_optimizer.cpp
++++ b/src/amd/compiler/aco_optimizer.cpp
+@@ -610,15 +610,15 @@ can_apply_sgprs(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+ }
+ 
+ void
+-to_VOP3(opt_ctx& ctx, aco_ptr<Instruction>& instr)
++to_VOP3(opt_ctx& ctx, aco_ptr<Instruction>& instr, unsigned add_operands = 0)
+ {
+    if (instr->isVOP3())
+       return;
+ 
+    aco_ptr<Instruction> tmp = std::move(instr);
+    Format format = asVOP3(tmp->format);
+-   instr.reset(create_instruction<VOP3_instruction>(tmp->opcode, format, tmp->operands.size(),
+-                                                    tmp->definitions.size()));
++   instr.reset(create_instruction<VOP3_instruction>(
++      tmp->opcode, format, tmp->operands.size() + add_operands, tmp->definitions.size()));
+    std::copy(tmp->operands.cbegin(), tmp->operands.cend(), instr->operands.begin());
+    for (unsigned i = 0; i < instr->definitions.size(); i++) {
+       instr->definitions[i] = tmp->definitions[i];
+@@ -3245,8 +3245,15 @@ apply_insert(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+    SubdwordSel sel = parse_insert(def_info.instr);
+    assert(sel);
+ 
+-   if (instr->isVOP3() && sel.size() == 2 && !sel.sign_extend() &&
+-       can_use_opsel(ctx.program->gfx_level, instr->opcode, -1)) {
++   if (instr->opcode == aco_opcode::v_cvt_u32_f32 && !instr->usesModifiers() &&
++       !sel.sign_extend() && sel.size() == 1) {
++      to_VOP3(ctx, instr, 2);
++      instr->format = Format::VOP3;
++      instr->opcode = aco_opcode::v_cvt_pk_u8_f32;
++      instr->operands[1] = Operand::c32(sel.offset());
++      instr->operands[2] = Operand::zero();
++   } else if (instr->isVOP3() && sel.size() == 2 && !sel.sign_extend() &&
++              can_use_opsel(ctx.program->gfx_level, instr->opcode, -1)) {
+       if (instr->vop3().opsel & (1 << 3))
+          return false;
+       if (sel.offset())
+-- 
+GitLab
+
+
+From 11a28cc41c17b87274f60f1b224ff598931a272b Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Thu, 8 Sep 2022 14:01:47 +0200
+Subject: [PATCH 2/2] aco: Combine v_or with v_cvt_pk_u8_f32.
+
+This isn't as good as I would like. :(
+
+Consider this pattern:
+v1: %37 = v_cvt_pk_u8_f32 (kill)%28, 0, 0
+v1: %39 = v_cvt_pk_u8_f32 (kill)%29, 1, 0
+v1: %42 = v_cvt_pk_u8_f32 (kill)%30, 2, 0
+v1: %44 = v_cvt_pk_u8_f32 (kill)%31, 3, 0
+v1: %40 = v_or_b32 (kill)%39, (kill)%37
+v1: %45 = v_or_b32 (kill)%44, (kill)%42
+v1: %46 = v_or_b32 (kill)%45, (kill)%40
+
+This patch only manages to reduce it to:
+v1: %39 = v_cvt_pk_u8_f32 (kill)%29, 1, 0
+v1: %44 = v_cvt_pk_u8_f32 (kill)%31, 3, 0
+v1: %40 = v_cvt_pk_u8_f32 (kill)%28, 0, (kill)%39
+v1: %45 = v_cvt_pk_u8_f32 (kill)%30, 2, (kill)%44
+v1: %46 = v_or_b32 (kill)%45, (kill)%40
+
+Optimal would be:
+v1: %39 = v_cvt_pk_u8_f32 (kill)%28, 0, 0
+v1: %40 = v_cvt_pk_u8_f32 (kill)%29, 1, (kill)%39
+v1: %44 = v_cvt_pk_u8_f32 (kill)%30, 2, (kill)%40
+v1: %46 = v_cvt_pk_u8_f32 (kill)%31, 3, (kill)%44
+
+Signed-off-by: Georg Lehmann <dadschoorse@gmail.com>
+---
+ src/amd/compiler/aco_optimizer.cpp | 82 +++++++++++++++++++++++++++---
+ 1 file changed, 74 insertions(+), 8 deletions(-)
+
+diff --git a/src/amd/compiler/aco_optimizer.cpp b/src/amd/compiler/aco_optimizer.cpp
+index e7258d58598d..9f6fa9c970b5 100644
+--- a/src/amd/compiler/aco_optimizer.cpp
++++ b/src/amd/compiler/aco_optimizer.cpp
+@@ -124,12 +124,13 @@ enum Label {
+    label_f2f32 = 1ull << 37,
+    label_f2f16 = 1ull << 38,
+    label_split = 1ull << 39,
++   label_cvtu8pk = 1ull << 40,
+ };
+ 
+ static constexpr uint64_t instr_usedef_labels =
+    label_vec | label_mul | label_mad | label_add_sub | label_vop3p | label_bitwise |
+    label_uniform_bitwise | label_minmax | label_vopc | label_usedef | label_extract | label_dpp16 |
+-   label_dpp8 | label_f2f32;
++   label_dpp8 | label_f2f32 | label_cvtu8pk;
+ static constexpr uint64_t instr_mod_labels =
+    label_omod2 | label_omod4 | label_omod5 | label_clamp | label_insert | label_f2f16;
+ 
+@@ -456,6 +457,14 @@ struct ssa_info {
+ 
+    bool is_f2f32() { return label & label_f2f32; }
+ 
++   void set_cvtu8pk(Instruction* cvt)
++   {
++      add_label(label_cvtu8pk);
++      instr = cvt;
++   }
++
++   bool is_cvtu8pk() { return label & label_cvtu8pk; }
++
+    void set_extract(Instruction* extract)
+    {
+       add_label(label_extract);
+@@ -2655,6 +2664,59 @@ combine_add_or_then_and_lshl(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+    return false;
+ }
+ 
++unsigned
++nzmask_v_cvt_pk_u8_f32(opt_ctx& ctx, Instruction* instr)
++{
++   unsigned non_zero_mask = 1 << (instr->operands[1].constantValue() & 0x3);
++   if (instr->operands[2].isConstant()) {
++      uint32_t c = instr->operands[2].constantValue();
++      for (unsigned i = 0; i < 4; i++) {
++         if (c & (0xff << (i * 8)))
++            non_zero_mask |= 1 << i;
++      }
++      return non_zero_mask;
++   }
++   Instruction* other = follow_operand(ctx, instr->operands[2]);
++   if (!other || other->opcode != aco_opcode::v_cvt_pk_u8_f32)
++      return -1; /* TODO handle SWDA and p_insert? */
++   else
++      return nzmask_v_cvt_pk_u8_f32(ctx, other) | non_zero_mask;
++}
++
++/* v_or_b32( v_cvt_pk_u8_f32(..., 0), v_cvt_pk_u8_f32(..., x)) -> v_cvt_pk_u8_f32(...,
++ * v_cvt_pk_u8_f32(..., x)) */
++bool
++combine_or_cvt_pk_u8_f32(opt_ctx& ctx, aco_ptr<Instruction>& instr)
++{
++   if (instr->isSDWA() || instr->isDPP())
++      return false;
++
++   unsigned pull_down = ~0u;
++   Instruction* cvts[2];
++   for (unsigned i = 0; i < 2; i++) {
++      cvts[i] = follow_operand(ctx, instr->operands[i]);
++      if (!cvts[i] || cvts[i]->opcode != aco_opcode::v_cvt_pk_u8_f32 ||
++          !cvts[i]->operands[1].isConstant())
++         return false;
++      if (ctx.uses[instr->operands[i].tempId()] == 1 && cvts[i]->operands[2].isConstant() &&
++          cvts[i]->operands[2].constantValue() == 0)
++         pull_down = i;
++   }
++   if (pull_down == ~0u)
++      return false;
++
++   if (nzmask_v_cvt_pk_u8_f32(ctx, cvts[!pull_down]) & nzmask_v_cvt_pk_u8_f32(ctx, cvts[pull_down]))
++      return false;
++
++   ctx.uses[instr->operands[pull_down].tempId()]--;
++   Operand operands[3] = {cvts[pull_down]->operands[0], cvts[pull_down]->operands[1],
++                          instr->operands[!pull_down]};
++   create_vop3_for_op3(ctx, aco_opcode::v_cvt_pk_u8_f32, instr, operands,
++                       cvts[pull_down]->vop3().neg, cvts[pull_down]->vop3().abs, 0, 0, 0);
++   ctx.info[instr->definitions[0].tempId()].set_cvtu8pk(instr.get());
++   return true;
++}
++
+ bool
+ combine_minmax(opt_ctx& ctx, aco_ptr<Instruction>& instr, aco_opcode opposite, aco_opcode minmax3)
+ {
+@@ -3252,6 +3314,7 @@ apply_insert(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+       instr->opcode = aco_opcode::v_cvt_pk_u8_f32;
+       instr->operands[1] = Operand::c32(sel.offset());
+       instr->operands[2] = Operand::zero();
++      ctx.info[def_info.instr->definitions[0].tempId()].set_cvtu8pk(instr.get());
+    } else if (instr->isVOP3() && sel.size() == 2 && !sel.sign_extend() &&
+               can_use_opsel(ctx.program->gfx_level, instr->opcode, -1)) {
+       if (instr->vop3().opsel & (1 << 3))
+@@ -3269,7 +3332,7 @@ apply_insert(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+    }
+ 
+    instr->definitions[0].swapTemp(def_info.instr->definitions[0]);
+-   ctx.info[instr->definitions[0].tempId()].label = 0;
++   ctx.info[instr->definitions[0].tempId()].label &= label_cvtu8pk;
+    ctx.uses[def_info.instr->definitions[0].tempId()]--;
+ 
+    return true;
+@@ -4153,12 +4216,15 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+             return;
+          }
+       }
+-   } else if (instr->opcode == aco_opcode::v_or_b32 && ctx.program->gfx_level >= GFX9) {
+-      if (combine_three_valu_op(ctx, instr, aco_opcode::s_or_b32, aco_opcode::v_or3_b32, "012",
+-                                1 | 2)) {
+-      } else if (combine_three_valu_op(ctx, instr, aco_opcode::v_or_b32, aco_opcode::v_or3_b32,
+-                                       "012", 1 | 2)) {
+-      } else if (combine_add_or_then_and_lshl(ctx, instr)) {
++   } else if (instr->opcode == aco_opcode::v_or_b32) {
++      if (combine_or_cvt_pk_u8_f32(ctx, instr)) {
++      } else if (ctx.program->gfx_level >= GFX9) {
++         if (combine_three_valu_op(ctx, instr, aco_opcode::s_or_b32, aco_opcode::v_or3_b32, "012",
++                                   1 | 2)) {
++         } else if (combine_three_valu_op(ctx, instr, aco_opcode::v_or_b32, aco_opcode::v_or3_b32,
++                                          "012", 1 | 2)) {
++         } else if (combine_add_or_then_and_lshl(ctx, instr)) {
++         }
+       }
+    } else if (instr->opcode == aco_opcode::v_xor_b32 && ctx.program->gfx_level >= GFX10) {
+       if (combine_three_valu_op(ctx, instr, aco_opcode::v_xor_b32, aco_opcode::v_xor3_b32, "012",
+-- 
+GitLab
+
