@@ -1,0 +1,199 @@
+From 078887f04766f44c3235ff592ce285689173a42e Mon Sep 17 00:00:00 2001
+From: Roman Gilg <subdiff@gmail.com>
+Date: Mon, 24 Jan 2022 17:14:44 +0100
+Subject: [PATCH 1/2] loader/dri3: Simplify buffer age query
+
+The ternary operator is hard to read. Instead initialize the return variable
+to zero and adjust its value in an if-clause.
+---
+ src/loader/loader_dri3_helper.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/loader/loader_dri3_helper.c b/src/loader/loader_dri3_helper.c
+index 81245f4372bc..7219c4f01e24 100644
+--- a/src/loader/loader_dri3_helper.c
++++ b/src/loader/loader_dri3_helper.c
+@@ -1209,11 +1209,11 @@ int
+ loader_dri3_query_buffer_age(struct loader_dri3_drawable *draw)
+ {
+    struct loader_dri3_buffer *back = dri3_find_back_alloc(draw);
+-   int ret;
++   int ret = 0;
+ 
+    mtx_lock(&draw->mtx);
+-   ret = (!back || back->last_swap == 0) ? 0 :
+-      draw->send_sbc - back->last_swap + 1;
++   if (back && back->last_swap != 0)
++      ret = draw->send_sbc - back->last_swap + 1;
+    mtx_unlock(&draw->mtx);
+ 
+    return ret;
+-- 
+GitLab
+
+
+From ea66fad6e8b90a0f50c8aa726edfc7bc5f44733e Mon Sep 17 00:00:00 2001
+From: Roman Gilg <subdiff@gmail.com>
+Date: Sun, 23 Jan 2022 14:04:05 +0100
+Subject: [PATCH 2/2] loader/dri3: Add DRI performance option to wait for next
+ buffer on swap
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+For simple clients using the swap chain contention back pressure to regulate
+their drawing and that don't query buffer age introduce a new DRI option with
+which set to true (the default is false) we block the client until a new buffer
+is available. This way we stall the client's execution until a new buffer is
+available and the redrawing of the client starts only at this point and not
+before.
+
+The motivation for that is to reduce latency for clients that regulate their
+drawing by swapchain contention back pressure. These clients draw whenever
+possible and their drawing is implicitly stopping whenever we block. When we
+block at the end of the swap and return only when a new buffer is available
+the client can draw and we directly present. Otherwise the client would draw,
+we block on the buffer becoming available, and only then show what the client
+had drawn, usually one frame later.
+
+Co-authored-by: Michel Dänzer <michel@daenzer.net>
+---
+ src/gallium/frontends/dri/dri_util.c |  1 +
+ src/loader/loader_dri3_helper.c      | 35 ++++++++++++++++++++++++++++
+ src/loader/loader_dri3_helper.h      |  2 ++
+ src/util/driconf.h                   |  4 ++++
+ 4 files changed, 42 insertions(+)
+
+diff --git a/src/gallium/frontends/dri/dri_util.c b/src/gallium/frontends/dri/dri_util.c
+index 84a3b13a611f..1def79f2a12e 100644
+--- a/src/gallium/frontends/dri/dri_util.c
++++ b/src/gallium/frontends/dri/dri_util.c
+@@ -58,6 +58,7 @@ driOptionDescription __dri2ConfigOptions[] = {
+ 
+       DRI_CONF_SECTION_PERFORMANCE
+          DRI_CONF_VBLANK_MODE(DRI_CONF_VBLANK_DEF_INTERVAL_1)
++         DRI_CONF_BLOCK_ON_DEPLETED_BUFFERS(false)
+       DRI_CONF_SECTION_END
+ };
+ 
+diff --git a/src/loader/loader_dri3_helper.c b/src/loader/loader_dri3_helper.c
+index 7219c4f01e24..dd1858d90562 100644
+--- a/src/loader/loader_dri3_helper.c
++++ b/src/loader/loader_dri3_helper.c
+@@ -402,12 +402,14 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
+    draw->is_different_gpu = is_different_gpu;
+    draw->multiplanes_available = multiplanes_available;
+    draw->prefer_back_buffer_reuse = prefer_back_buffer_reuse;
++   draw->queries_buffer_age = false;
+ 
+    draw->have_back = 0;
+    draw->have_fake_front = 0;
+    draw->first_init = true;
+    draw->adaptive_sync = false;
+    draw->adaptive_sync_active = false;
++   draw->block_on_depleted_buffers = false;
+ 
+    draw->cur_blit_source = -1;
+    draw->back_format = __DRI_IMAGE_FORMAT_NONE;
+@@ -416,12 +418,19 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
+ 
+    if (draw->ext->config) {
+       unsigned char adaptive_sync = 0;
++      unsigned char block_on_depleted_buffers = 0;
+ 
+       draw->ext->config->configQueryb(draw->dri_screen,
+                                       "adaptive_sync",
+                                       &adaptive_sync);
+ 
+       draw->adaptive_sync = adaptive_sync;
++
++      draw->ext->config->configQueryb(draw->dri_screen,
++                                      "block_on_depleted_buffers",
++                                      &block_on_depleted_buffers);
++
++      draw->block_on_depleted_buffers = block_on_depleted_buffers;
+    }
+ 
+    if (!draw->adaptive_sync)
+@@ -975,6 +984,7 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
+ {
+    struct loader_dri3_buffer *back;
+    int64_t ret = 0;
++   bool wait_for_next_buffer = false;
+ 
+    /* GLX spec:
+     *   void glXSwapBuffers(Display *dpy, GLXDrawable draw);
+@@ -1198,10 +1208,34 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
+    if (draw->stamp)
+       ++(*draw->stamp);
+ 
++   /* Waiting on a buffer is only sensible if all buffers are in use and the
++    * client doesn't use the buffer age extension. In this case a client is
++    * relying on it receiving back control immediately.
++    *
++    * As waiting on a buffer can at worst make us miss a frame the option has
++    * to be enabled explicitly with the block_on_depleted_buffers DRI option.
++    */
++   wait_for_next_buffer = draw->cur_num_back == draw->max_num_back &&
++      !draw->queries_buffer_age && draw->block_on_depleted_buffers;
++
+    mtx_unlock(&draw->mtx);
+ 
+    draw->ext->flush->invalidate(draw->dri_drawable);
+ 
++   /* Clients that use up all available buffers usually regulate their drawing
++    * through swapchain contention backpressure. In such a scenario the client
++    * draws whenever control returns to it. Its event loop is slowed down only
++    * by us waiting on buffers becoming available again.
++    *
++    * By waiting here on a new buffer and only then returning back to the client
++    * we ensure the client begins drawing only when the next buffer is available
++    * and not draw first and then wait a refresh cycle on the next available
++    * buffer to show it. This way we can reduce the latency of what's being
++    * drawn by the client and what's shown on the screen by one frame.
++    */
++   if (wait_for_next_buffer)
++      dri3_find_back(draw, draw->prefer_back_buffer_reuse);
++
+    return ret;
+ }
+ 
+@@ -1212,6 +1246,7 @@ loader_dri3_query_buffer_age(struct loader_dri3_drawable *draw)
+    int ret = 0;
+ 
+    mtx_lock(&draw->mtx);
++   draw->queries_buffer_age = true;
+    if (back && back->last_swap != 0)
+       ret = draw->send_sbc - back->last_swap + 1;
+    mtx_unlock(&draw->mtx);
+diff --git a/src/loader/loader_dri3_helper.h b/src/loader/loader_dri3_helper.h
+index 792f72700988..81f66a0615e6 100644
+--- a/src/loader/loader_dri3_helper.h
++++ b/src/loader/loader_dri3_helper.h
+@@ -173,6 +173,8 @@ struct loader_dri3_drawable {
+    bool first_init;
+    bool adaptive_sync;
+    bool adaptive_sync_active;
++   bool block_on_depleted_buffers;
++   bool queries_buffer_age;
+    int swap_interval;
+ 
+    struct loader_dri3_extensions *ext;
+diff --git a/src/util/driconf.h b/src/util/driconf.h
+index db095fdcd131..7a61a71ca456 100644
+--- a/src/util/driconf.h
++++ b/src/util/driconf.h
+@@ -356,6 +356,10 @@
+    DRI_CONF_OPT_B(adaptive_sync,def, \
+                   "Adapt the monitor sync to the application performance (when possible)")
+ 
++#define DRI_CONF_BLOCK_ON_DEPLETED_BUFFERS(def) \
++   DRI_CONF_OPT_B(block_on_depleted_buffers, def, \
++                  "Block clients using buffer backpressure until new buffer is available to reduce latency")
++
+ #define DRI_CONF_VK_WSI_FORCE_BGRA8_UNORM_FIRST(def) \
+    DRI_CONF_OPT_B(vk_wsi_force_bgra8_unorm_first, def, \
+                   "Force vkGetPhysicalDeviceSurfaceFormatsKHR to return VK_FORMAT_B8G8R8A8_UNORM as the first format")
+-- 
+GitLab
+
