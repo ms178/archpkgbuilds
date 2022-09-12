@@ -89,6 +89,8 @@ kwin-git \
 plasma-workspace-git \
 kde-cli-tools-git \
 systemsettings-git \
+kross-git \
+kdeplasma-addons-git \
 plasma-desktop-git \
 qca-qt5-git \
 plasma-disks-git \
