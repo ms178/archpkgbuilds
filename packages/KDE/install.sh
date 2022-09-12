@@ -85,6 +85,7 @@ networkmanager-qt-git \
 phonon-git \
 plasma-integration-git \
 kpipewire-git \
+kwin-git \
 plasma-workspace-git \
 kde-cli-tools-git \
 systemsettings-git \
