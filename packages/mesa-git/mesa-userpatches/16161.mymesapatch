@@ -1,0 +1,135 @@
+From fe648eccedb8bb9fcaa368d0e6e364a10ed179d7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Tue, 26 Apr 2022 11:09:47 +0200
+Subject: [PATCH] aco: Try to reassign split vector registers post-RA.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Eliminate unnecessary copies when the operand registers of a
+p_split_vector instruction are not clobbered between the p_split_vector
+and the user of its definitions.
+
+This happens when p_split_vector doesn't kill its operand and its
+definitions have a shorter lifespan that the operand. It affects every
+NGG culling shader among other things.
+
+This optimization exists because it's too difficult to solve it
+in RA, and should be removed after we solved this in RA.
+
+Fossil DB stats on Navi 21:
+
+Totals from 58569 (45.52% of 128653) affected shaders:
+CodeSize: 154792268 -> 154384536 (-0.26%)
+Instrs: 29368054 -> 29266170 (-0.35%)
+Latency: 136303418 -> 136300254 (-0.00%); split: -0.00%, +0.00%
+InvThroughput: 21087866 -> 21087732 (-0.00%)
+Copies: 2665691 -> 2563819 (-3.82%)
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+---
+ src/amd/compiler/aco_optimizer_postRA.cpp | 81 +++++++++++++++++++++++
+ 1 file changed, 81 insertions(+)
+
+diff --git a/src/amd/compiler/aco_optimizer_postRA.cpp b/src/amd/compiler/aco_optimizer_postRA.cpp
+index 2c4ab83c0254..93a418c07598 100644
+--- a/src/amd/compiler/aco_optimizer_postRA.cpp
++++ b/src/amd/compiler/aco_optimizer_postRA.cpp
+@@ -492,6 +492,85 @@ try_combine_dpp(pr_opt_ctx& ctx, aco_ptr<Instruction>& instr)
+    }
+ }
+ 
++void
++try_reassign_split_vector(pr_opt_ctx& ctx, aco_ptr<Instruction>& instr)
++{
++   /* We are looking for the following pattern:
++    *
++    * sA, sB = p_split_vector s[X:Y]
++    * ... X and Y not clobbered here ...
++    * use sA or sB <--- current instruction
++    *
++    * If possible, we propagate the registers from the p_split_vector
++    * operand into the current instruction and the above is optimized into:
++    *
++    * use sX or sY
++    *
++    * Thereby, we "break" SSA for the affected operand of the current instruction.
++    * This optimization exists because it's too difficult to solve it
++    * in RA, and should be removed after we solved this in RA.
++    */
++
++   if (!instr->isVALU() && !instr->isSALU())
++      return;
++
++   for (unsigned i = 0; i < instr->operands.size(); i++) {
++      /* Find the instruction that writes the current operand. */
++      const Operand& op = instr->operands[i];
++      Idx op_instr_idx = last_writer_idx(ctx, op);
++      if (!op_instr_idx.found())
++         continue;
++
++      /* Check if the operand is written by p_split_vector. */
++      Instruction* split_vec = ctx.get(op_instr_idx);
++      if (split_vec->opcode != aco_opcode::p_split_vector)
++         continue;
++
++      /* Check if the p_split_vector operand's registers are clobbered. */
++      if (is_clobbered_since(ctx, split_vec->operands[0], op_instr_idx))
++         continue;
++
++      /* Don't do anything if p_split_vector kills its operand and the
++       * definitions already reuse the same registers as the operand.
++       */
++      if (split_vec->operands[0].isKill() &&
++          split_vec->operands[0].physReg() == split_vec->definitions[0].physReg())
++         continue;
++
++      /* Don't propagate VGPR to SALU. */
++      if (instr->isSALU() && split_vec->operands[0].regClass().type() == RegType::vgpr)
++         continue;
++
++      /* Don't propagate misaligned SGPRs to SALU. */
++      if (instr->isSALU() && op.bytes() > 4 &&
++          (split_vec->operands[0].physReg().reg() % (op.bytes() / 4) != 0))
++         continue;
++
++      /* Only propagate SGPR or constant to VALU when it's already SGPR. */
++      if (instr->isVALU() &&
++          (split_vec->operands[0].isConstant() ||
++           split_vec->operands[0].regClass().type() == RegType::sgpr) &&
++          op.regClass().type() != RegType::sgpr)
++         continue;
++
++      int reg_bytes = 0;
++
++      for (unsigned def_idx = 0; def_idx < split_vec->definitions.size(); ++def_idx) {
++         if (split_vec->definitions[def_idx].tempId() == op.tempId())
++            break;
++
++         reg_bytes += split_vec->definitions[def_idx].bytes();
++      }
++
++      /* Use the p_split_vector operand register directly.
++       * Note: unfortunately, this "breaks" SSA to some extent.
++       */
++      ctx.uses[op.tempId()]--;
++      PhysReg reg = split_vec->operands[0].physReg().advance(reg_bytes);
++      instr->operands[i].setFixed(reg);
++   }
++}
++
+ void
+ process_instruction(pr_opt_ctx& ctx, aco_ptr<Instruction>& instr)
+ {
+@@ -508,6 +587,8 @@ process_instruction(pr_opt_ctx& ctx, aco_ptr<Instruction>& instr)
+ 
+    try_combine_dpp(ctx, instr);
+ 
++   try_reassign_split_vector(ctx, instr);
++
+    if (instr)
+       save_reg_writes(ctx, instr);
+ 
+-- 
+GitLab
+
