@@ -1,0 +1,428 @@
+From c25c4186bff75b46bdeee7aa7dd2a873e8698125 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Wed, 17 Aug 2022 08:12:51 +0200
+Subject: [PATCH 1/7] aco/optimizer_postRA: Use unique_ptr + array for
+ instruction indices.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+According to perf, this roughly halves the impact of the post-RA
+optimizer in ACO's compile times.
+
+Measurement was taken using a debug optimized build using
+NIR_DEBUG=novalidate RADV_DEBUG=nocache and replaying the Fossil DB
+from the Doom Eternal shaders.
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+Reviewed-by: Daniel Schürmann <daniel@schuermann.dev>
+---
+ src/amd/compiler/aco_optimizer_postRA.cpp | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/src/amd/compiler/aco_optimizer_postRA.cpp b/src/amd/compiler/aco_optimizer_postRA.cpp
+index 96edae93071b..48587d39f40a 100644
+--- a/src/amd/compiler/aco_optimizer_postRA.cpp
++++ b/src/amd/compiler/aco_optimizer_postRA.cpp
+@@ -63,11 +63,18 @@ Idx const_or_undef{UINT32_MAX, 2};
+ Idx overwritten_untrackable{UINT32_MAX, 3};
+ 
+ struct pr_opt_ctx {
++   using Idx_array = std::array<Idx, max_reg_cnt>;
++
+    Program* program;
+    Block* current_block;
+    uint32_t current_instr_idx;
+    std::vector<uint16_t> uses;
+-   std::vector<std::array<Idx, max_reg_cnt>> instr_idx_by_regs;
++   std::unique_ptr<Idx_array[]> instr_idx_by_regs;
++
++   pr_opt_ctx(Program* p)
++       : program(p), current_block(nullptr), current_instr_idx(0), uses(dead_code_analysis(p)),
++         instr_idx_by_regs(std::unique_ptr<Idx_array[]>{ new Idx_array[p->blocks.size()] })
++   {}
+ 
+    void reset_block(Block* block)
+    {
+@@ -557,10 +564,7 @@ process_instruction(pr_opt_ctx& ctx, aco_ptr<Instruction>& instr)
+ void
+ optimize_postRA(Program* program)
+ {
+-   pr_opt_ctx ctx;
+-   ctx.program = program;
+-   ctx.uses = dead_code_analysis(program);
+-   ctx.instr_idx_by_regs.resize(program->blocks.size());
++   pr_opt_ctx ctx(program);
+ 
+    /* Forward pass
+     * Goes through each instruction exactly once, and can transform
+-- 
+GitLab
+
+
+From 43758d97622a8bb2ddd820895cae0c81ce33fb0f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Wed, 17 Aug 2022 09:05:27 +0200
+Subject: [PATCH 2/7] aco/optimizer_postRA: Speed up reset_block() with
+ predecessors.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Copy the information from the first predecessor then check whether
+it matches other predecessors and modify the data accordingly.
+
+Marked for backporting to stable to make it possible to also
+backport fixes based on this.
+
+Cc: mesa-stable
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+Reviewed-by: Daniel Schürmann <daniel@schuermann.dev>
+---
+ src/amd/compiler/aco_optimizer_postRA.cpp | 56 +++++++++++------------
+ 1 file changed, 27 insertions(+), 29 deletions(-)
+
+diff --git a/src/amd/compiler/aco_optimizer_postRA.cpp b/src/amd/compiler/aco_optimizer_postRA.cpp
+index 48587d39f40a..f09d45bcf4b8 100644
+--- a/src/amd/compiler/aco_optimizer_postRA.cpp
++++ b/src/amd/compiler/aco_optimizer_postRA.cpp
+@@ -76,6 +76,31 @@ struct pr_opt_ctx {
+          instr_idx_by_regs(std::unique_ptr<Idx_array[]>{ new Idx_array[p->blocks.size()] })
+    {}
+ 
++   ALWAYS_INLINE void reset_block_regs(const std::vector<uint32_t>& preds,
++                                       const unsigned block_index, const unsigned min_reg,
++                                       const unsigned num_regs)
++   {
++      const unsigned num_preds = preds.size();
++      const unsigned first_pred = preds[0];
++
++      /* Copy information from the first predecessor. */
++      memcpy(&instr_idx_by_regs[block_index][min_reg], &instr_idx_by_regs[first_pred][min_reg],
++             num_regs * sizeof(Idx));
++
++      /* Mark overwritten if it doesn't match with other predecessors. */
++      const unsigned until_reg = min_reg + num_regs;
++      for (unsigned pred = 1; pred < num_preds; ++pred) {
++         for (unsigned i = min_reg; i < until_reg; ++i) {
++            Idx& idx = instr_idx_by_regs[block_index][i];
++            if (idx == overwritten_untrackable)
++               continue;
++
++            if (idx != instr_idx_by_regs[pred][i])
++               idx = overwritten_untrackable;
++         }
++      }
++   }
++
+    void reset_block(Block* block)
+    {
+       current_block = block;
+@@ -85,40 +110,13 @@ struct pr_opt_ctx {
+          std::fill(instr_idx_by_regs[block->index].begin(), instr_idx_by_regs[block->index].end(),
+                    not_written_yet);
+       } else {
+-         const uint32_t first_linear_pred = block->linear_preds[0];
+-         const std::vector<uint32_t>& linear_preds = block->linear_preds;
+-
+-         for (unsigned i = 0; i < max_sgpr_cnt; i++) {
+-            const bool all_same = std::all_of(
+-               std::next(linear_preds.begin()), linear_preds.end(),
+-               [=](unsigned pred)
+-               { return instr_idx_by_regs[pred][i] == instr_idx_by_regs[first_linear_pred][i]; });
+-
+-            if (all_same)
+-               instr_idx_by_regs[block->index][i] = instr_idx_by_regs[first_linear_pred][i];
+-            else
+-               instr_idx_by_regs[block->index][i] = overwritten_untrackable;
+-         }
++         reset_block_regs(block->linear_preds, block->index, 0, max_sgpr_cnt);
+ 
+          if (!block->logical_preds.empty()) {
+             /* We assume that VGPRs are only read by blocks which have a logical predecessor,
+              * ie. any block that reads any VGPR has at least 1 logical predecessor.
+              */
+-            const unsigned first_logical_pred = block->logical_preds[0];
+-            const std::vector<uint32_t>& logical_preds = block->logical_preds;
+-
+-            for (unsigned i = min_vgpr; i < (min_vgpr + max_vgpr_cnt); i++) {
+-               const bool all_same = std::all_of(
+-                  std::next(logical_preds.begin()), logical_preds.end(),
+-                  [=](unsigned pred) {
+-                     return instr_idx_by_regs[pred][i] == instr_idx_by_regs[first_logical_pred][i];
+-                  });
+-
+-               if (all_same)
+-                  instr_idx_by_regs[block->index][i] = instr_idx_by_regs[first_logical_pred][i];
+-               else
+-                  instr_idx_by_regs[block->index][i] = overwritten_untrackable;
+-            }
++            reset_block_regs(block->logical_preds, block->index, min_vgpr, max_vgpr_cnt);
+          } else {
+             /* If a block has no logical predecessors, it is not part of the
+              * logical CFG and therefore it also won't have any logical successors.
+-- 
+GitLab
+
+
+From 7744ead595a97c81c7cc37516900ab03db9bfdad Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Wed, 5 Oct 2022 19:32:13 -0500
+Subject: [PATCH 3/7] aco/optimizer_postRA: Properly handle vccz/execz/scc in
+ reset_block.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fixes: a8dd07518c59af0087ed311cee232c31c3e8268c
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+Reviewed-by: Daniel Schürmann <daniel@schuermann.dev>
+---
+ src/amd/compiler/aco_optimizer_postRA.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/amd/compiler/aco_optimizer_postRA.cpp b/src/amd/compiler/aco_optimizer_postRA.cpp
+index f09d45bcf4b8..3d4781ad3ec2 100644
+--- a/src/amd/compiler/aco_optimizer_postRA.cpp
++++ b/src/amd/compiler/aco_optimizer_postRA.cpp
+@@ -111,6 +111,7 @@ struct pr_opt_ctx {
+                    not_written_yet);
+       } else {
+          reset_block_regs(block->linear_preds, block->index, 0, max_sgpr_cnt);
++         reset_block_regs(block->linear_preds, block->index, 251, 3);
+ 
+          if (!block->logical_preds.empty()) {
+             /* We assume that VGPRs are only read by blocks which have a logical predecessor,
+-- 
+GitLab
+
+
+From c3d51526c64a6ed52ade95a9b1b5ca22e0913e4f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Thu, 6 Oct 2022 09:54:58 -0500
+Subject: [PATCH 4/7] aco/optimizer_postRA: Use 64-bit comparison in
+ Idx::operator==
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+Reviewed-by: Daniel Schürmann <daniel@schuermann.dev>
+---
+ src/amd/compiler/aco_optimizer_postRA.cpp | 19 ++++++++++++-------
+ 1 file changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/src/amd/compiler/aco_optimizer_postRA.cpp b/src/amd/compiler/aco_optimizer_postRA.cpp
+index 3d4781ad3ec2..52460b3e95e3 100644
+--- a/src/amd/compiler/aco_optimizer_postRA.cpp
++++ b/src/amd/compiler/aco_optimizer_postRA.cpp
+@@ -39,13 +39,18 @@ constexpr const size_t min_vgpr = 256;
+ constexpr const size_t max_vgpr_cnt = 256;
+ 
+ struct Idx {
+-   bool operator==(const Idx& other) const { return block == other.block && instr == other.instr; }
+-   bool operator!=(const Idx& other) const { return !operator==(other); }
+-
+-   bool found() const { return block != UINT32_MAX; }
+-
+-   uint32_t block;
+-   uint32_t instr;
++   inline bool operator==(const Idx& other) const { return data == other.data; }
++   inline bool operator!=(const Idx& other) const { return data != other.data; }
++
++   inline bool found() const { return block != UINT32_MAX; }
++
++   union {
++      struct {
++         uint32_t block;
++         uint32_t instr;
++      };
++      uint64_t data;
++   };
+ };
+ 
+ /** Indicates that a register range was not yet written in the shader. */
+-- 
+GitLab
+
+
+From 464912a7165dce03c4e604d29981f4003bcc3735 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Wed, 17 Aug 2022 10:05:51 +0200
+Subject: [PATCH 5/7] aco/optimizer_postRA: Delete dead instructions more
+ efficiently.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+Reviewed-by: Daniel Schürmann <daniel@schuermann.dev>
+---
+ src/amd/compiler/aco_optimizer_postRA.cpp | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/src/amd/compiler/aco_optimizer_postRA.cpp b/src/amd/compiler/aco_optimizer_postRA.cpp
+index 52460b3e95e3..a861e4d10874 100644
+--- a/src/amd/compiler/aco_optimizer_postRA.cpp
++++ b/src/amd/compiler/aco_optimizer_postRA.cpp
+@@ -586,10 +586,17 @@ optimize_postRA(Program* program)
+     * no longer have any uses.
+     */
+    for (auto& block : program->blocks) {
+-      auto new_end = std::remove_if(block.instructions.begin(), block.instructions.end(),
+-                                    [&ctx](const aco_ptr<Instruction>& instr)
+-                                    { return !instr || is_dead(ctx.uses, instr.get()); });
+-      block.instructions.resize(new_end - block.instructions.begin());
++      std::vector<aco_ptr<Instruction>> instructions;
++      instructions.reserve(block.instructions.size());
++
++      for (aco_ptr<Instruction>& instr : block.instructions) {
++         if (!instr || is_dead(ctx.uses, instr.get()))
++            continue;
++
++         instructions.emplace_back(std::move(instr));
++      }
++
++      block.instructions = std::move(instructions);
+    }
+ }
+ 
+-- 
+GitLab
+
+
+From b4b6388ce10a51270a9a682b9761c11052dff837 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Thu, 6 Oct 2022 10:21:55 -0500
+Subject: [PATCH 6/7] aco: Move is_dead to aco_ir.h to allow it to get inlined.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+Reviewed-by: Daniel Schürmann <daniel@schuermann.dev>
+---
+ src/amd/compiler/aco_dead_code_analysis.cpp | 12 ------------
+ src/amd/compiler/aco_ir.h                   | 14 +++++++++++++-
+ 2 files changed, 13 insertions(+), 13 deletions(-)
+
+diff --git a/src/amd/compiler/aco_dead_code_analysis.cpp b/src/amd/compiler/aco_dead_code_analysis.cpp
+index d558b688030f..4555be589474 100644
+--- a/src/amd/compiler/aco_dead_code_analysis.cpp
++++ b/src/amd/compiler/aco_dead_code_analysis.cpp
+@@ -80,18 +80,6 @@ process_block(dce_ctx& ctx, Block& block)
+ 
+ } /* end namespace */
+ 
+-bool
+-is_dead(const std::vector<uint16_t>& uses, Instruction* instr)
+-{
+-   if (instr->definitions.empty() || instr->isBranch() ||
+-       instr->opcode == aco_opcode::p_init_scratch)
+-      return false;
+-   if (std::any_of(instr->definitions.begin(), instr->definitions.end(),
+-                   [&uses](const Definition& def) { return !def.isTemp() || uses[def.tempId()]; }))
+-      return false;
+-   return !(get_sync_info(instr).semantics & (semantic_volatile | semantic_acqrel));
+-}
+-
+ std::vector<uint16_t>
+ dead_code_analysis(Program* program)
+ {
+diff --git a/src/amd/compiler/aco_ir.h b/src/amd/compiler/aco_ir.h
+index 6483c2d60c12..d0c6a7e87de9 100644
+--- a/src/amd/compiler/aco_ir.h
++++ b/src/amd/compiler/aco_ir.h
+@@ -1849,7 +1849,19 @@ is_phi(aco_ptr<Instruction>& instr)
+ 
+ memory_sync_info get_sync_info(const Instruction* instr);
+ 
+-bool is_dead(const std::vector<uint16_t>& uses, Instruction* instr);
++inline bool
++is_dead(const std::vector<uint16_t>& uses, const Instruction* instr)
++{
++   if (instr->definitions.empty() || instr->isBranch() ||
++       instr->opcode == aco_opcode::p_init_scratch)
++      return false;
++
++   if (std::any_of(instr->definitions.begin(), instr->definitions.end(),
++                   [&uses](const Definition& def) { return !def.isTemp() || uses[def.tempId()]; }))
++      return false;
++
++   return !(get_sync_info(instr).semantics & (semantic_volatile | semantic_acqrel));
++}
+ 
+ bool can_use_opsel(amd_gfx_level gfx_level, aco_opcode op, int idx);
+ bool instr_is_16bit(amd_gfx_level gfx_level, aco_opcode op);
+-- 
+GitLab
+
+
+From d290a65751423870c635e3f296b1d0a4d1bd8668 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Thu, 6 Oct 2022 10:24:14 -0500
+Subject: [PATCH 7/7] aco: Add ACO_DEBUG=novalidateir option.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This disables IR validation in debug/debugoptimized builds.
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+Reviewed-by: Daniel Schürmann <daniel@schuermann.dev>
+---
+ docs/envvars.rst            | 2 ++
+ src/amd/compiler/aco_ir.cpp | 4 ++++
+ src/amd/compiler/aco_ir.h   | 1 +
+ 3 files changed, 7 insertions(+)
+
+diff --git a/docs/envvars.rst b/docs/envvars.rst
+index a8f0f12ccdf7..1336d5998ea1 100644
+--- a/docs/envvars.rst
++++ b/docs/envvars.rst
+@@ -831,6 +831,8 @@ RADV driver environment variables
+    ``validateir``
+       validate the ACO IR at various points of compilation (enabled by
+       default for debug/debugoptimized builds)
++   ``novalidateir``
++      disable ACO IR validation in debug/debugoptimized builds
+    ``validatera``
+       validate register assignment of ACO IR and catches many RA bugs
+    ``perfwarn``
+diff --git a/src/amd/compiler/aco_ir.cpp b/src/amd/compiler/aco_ir.cpp
+index 0b0b92ae5b1c..bf79fc70c9d6 100644
+--- a/src/amd/compiler/aco_ir.cpp
++++ b/src/amd/compiler/aco_ir.cpp
+@@ -38,6 +38,7 @@ uint64_t debug_flags = 0;
+ 
+ static const struct debug_control aco_debug_options[] = {{"validateir", DEBUG_VALIDATE_IR},
+                                                          {"validatera", DEBUG_VALIDATE_RA},
++                                                         {"novalidateir", DEBUG_NO_VALIDATE_IR},
+                                                          {"perfwarn", DEBUG_PERFWARN},
+                                                          {"force-waitcnt", DEBUG_FORCE_WAITCNT},
+                                                          {"novn", DEBUG_NO_VN},
+@@ -58,6 +59,9 @@ init_once()
+    /* enable some flags by default on debug builds */
+    debug_flags |= aco::DEBUG_VALIDATE_IR;
+ #endif
++
++   if (debug_flags & aco::DEBUG_NO_VALIDATE_IR)
++      debug_flags &= ~aco::DEBUG_VALIDATE_IR;
+ }
+ 
+ void
+diff --git a/src/amd/compiler/aco_ir.h b/src/amd/compiler/aco_ir.h
+index d0c6a7e87de9..637554967520 100644
+--- a/src/amd/compiler/aco_ir.h
++++ b/src/amd/compiler/aco_ir.h
+@@ -53,6 +53,7 @@ enum {
+    DEBUG_NO_SCHED = 0x40,
+    DEBUG_PERF_INFO = 0x80,
+    DEBUG_LIVE_INFO = 0x100,
++   DEBUG_NO_VALIDATE_IR = 0x200,
+ };
+ 
+ /**
+-- 
+GitLab
+
