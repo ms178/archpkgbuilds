@@ -266,6 +266,181 @@ index 3c7e5bf60..57df426ac 100644
 -- 
 GitLab
 
+
+From 12589e9c5c3a6eccd7dd0c7b5b99f811fd8fe3dc Mon Sep 17 00:00:00 2001
+From: Erik Kurzinger <ekurzinger@nvidia.com>
+Date: Tue, 16 Aug 2022 11:59:14 -0700
+Subject: [PATCH 2/3] xwayland: implement support for DRI3 syncobjs
+
+Adds an implementation of the import_syncobj DRI3 screen info callback
+for Xwayland along with the various operations defined for dri3_syncobj
+objects. Freeing, checking, and signaling are fairly simple wrappers
+around the associated libdrm functions. Importing or exporting a sync fd
+to or from a particular timeline point requires the use of a temporary
+binary syncobj whose fence is then transfered to the target timeline
+syncobj, since the userspace API does not provide a way to do this
+directly.
+
+Signed-off-by: Erik Kurzinger <ekurzinger@nvidia.com>
+---
+ hw/xwayland/xwayland-glamor-gbm.c | 112 ++++++++++++++++++++++++++++++
+ 1 file changed, 112 insertions(+)
+
+diff --git a/hw/xwayland/xwayland-glamor-gbm.c b/hw/xwayland/xwayland-glamor-gbm.c
+index 60c63ba99..93610d9a8 100644
+--- a/hw/xwayland/xwayland-glamor-gbm.c
++++ b/hw/xwayland/xwayland-glamor-gbm.c
+@@ -52,6 +52,8 @@
+ 
+ #include "linux-dmabuf-unstable-v1-client-protocol.h"
+ 
++static uint32_t scratch_syncobj = 0;
++
+ struct xwl_gbm_private {
+     char *device_name;
+     struct gbm_device *gbm;
+@@ -438,6 +440,9 @@ xwl_glamor_gbm_cleanup(struct xwl_screen *xwl_screen)
+         wl_drm_destroy(xwl_gbm->drm);
+     if (xwl_gbm->gbm)
+         gbm_device_destroy(xwl_gbm->gbm);
++    if (scratch_syncobj)
++        drmSyncobjDestroy(xwl_gbm->drm_fd,
++                          scratch_syncobj);
+ 
+     free(xwl_gbm);
+ }
+@@ -652,6 +657,105 @@ glamor_egl_fd_from_pixmap(ScreenPtr screen, PixmapPtr pixmap,
+     return -1;
+ }
+ 
++struct xwl_syncobj
++{
++    struct dri3_syncobj base;
++    uint32_t handle;
++};
++
++static Bool xwl_dri3_check_syncobj(struct dri3_syncobj *syncobj,
++                                   uint64_t point)
++{
++    struct xwl_syncobj *xwl_syncobj = (struct xwl_syncobj *)syncobj;
++    struct xwl_screen *xwl_screen = xwl_screen_get(syncobj->screen);
++    struct xwl_gbm_private *xwl_gbm = xwl_gbm_get(xwl_screen);
++
++    return !drmSyncobjTimelineWait(xwl_gbm->drm_fd,
++                                   &xwl_syncobj->handle, &point, 1,
++                                   0 /* timeout */, 0 /* flags */,
++                                   NULL /* first_signaled */);
++}
++
++static int xwl_dri3_syncobj_export_fence(struct dri3_syncobj *syncobj,
++                                         uint64_t point)
++{
++    struct xwl_syncobj *xwl_syncobj = (struct xwl_syncobj *)syncobj;
++    struct xwl_screen *xwl_screen = xwl_screen_get(syncobj->screen);
++    struct xwl_gbm_private *xwl_gbm = xwl_gbm_get(xwl_screen);
++    int fd = -1;
++
++    if (!drmSyncobjTransfer(xwl_gbm->drm_fd,
++                            scratch_syncobj, 0,
++                            xwl_syncobj->handle, point,
++                            0 /* flags */))
++        drmSyncobjExportSyncFile(xwl_gbm->drm_fd, scratch_syncobj, &fd);
++
++    return fd;
++}
++
++static void xwl_dri3_syncobj_import_fence(struct dri3_syncobj *syncobj,
++                                          uint64_t point, int fd)
++{
++    struct xwl_syncobj *xwl_syncobj = (struct xwl_syncobj *)syncobj;
++    struct xwl_screen *xwl_screen = xwl_screen_get(syncobj->screen);
++    struct xwl_gbm_private *xwl_gbm = xwl_gbm_get(xwl_screen);
++
++    if (!drmSyncobjImportSyncFile(xwl_gbm->drm_fd, scratch_syncobj, fd))
++        drmSyncobjTransfer(xwl_gbm->drm_fd,
++                           xwl_syncobj->handle, point,
++                           scratch_syncobj, 0,
++                           0 /* flags */);
++    close(fd);
++}
++
++static void xwl_dri3_signal_syncobj(struct dri3_syncobj *syncobj,
++                                    uint64_t point)
++{
++    struct xwl_syncobj *xwl_syncobj = (struct xwl_syncobj *)syncobj;
++    struct xwl_screen *xwl_screen = xwl_screen_get(syncobj->screen);
++    struct xwl_gbm_private *xwl_gbm = xwl_gbm_get(xwl_screen);
++
++    drmSyncobjTimelineSignal(xwl_gbm->drm_fd, &xwl_syncobj->handle, &point, 1);
++}
++
++static void xwl_dri3_free_syncobj(struct dri3_syncobj *syncobj)
++{
++    struct xwl_syncobj *xwl_syncobj = (struct xwl_syncobj *)syncobj;
++    struct xwl_screen *xwl_screen = xwl_screen_get(syncobj->screen);
++    struct xwl_gbm_private *xwl_gbm = xwl_gbm_get(xwl_screen);
++
++    drmSyncobjDestroy(xwl_gbm->drm_fd, xwl_syncobj->handle);
++    free(xwl_syncobj);
++}
++
++static struct dri3_syncobj *xwl_dri3_import_syncobj(ClientPtr client,
++                                                    ScreenPtr screen,
++                                                    XID id, int fd)
++{
++    struct xwl_screen *xwl_screen = xwl_screen_get(screen);
++    struct xwl_gbm_private *xwl_gbm = xwl_gbm_get(xwl_screen);
++    struct xwl_syncobj *syncobj = calloc(1, sizeof (*syncobj));
++
++    if (!syncobj)
++        return NULL;
++
++    if (drmSyncobjFDToHandle(xwl_gbm->drm_fd, fd, &syncobj->handle)) {
++        free(syncobj);
++        return NULL;
++    }
++
++    syncobj->base.id = id;
++    syncobj->base.screen = screen;
++    syncobj->base.refcount = 1;
++
++    syncobj->base.free = xwl_dri3_free_syncobj;
++    syncobj->base.check = xwl_dri3_check_syncobj;
++    syncobj->base.export_fence = xwl_dri3_syncobj_export_fence;
++    syncobj->base.import_fence = xwl_dri3_syncobj_import_fence;
++    syncobj->base.signal = xwl_dri3_signal_syncobj;
++    return &syncobj->base;
++}
++
+ static const dri3_screen_info_rec xwl_dri3_info = {
+     .version = 2,
+     .open = NULL,
+@@ -661,6 +765,7 @@ static const dri3_screen_info_rec xwl_dri3_info = {
+     .get_formats = xwl_glamor_get_formats,
+     .get_modifiers = xwl_glamor_get_modifiers,
+     .get_drawable_modifiers = glamor_get_drawable_modifiers,
++    .import_syncobj = xwl_dri3_import_syncobj,
+ };
+ 
+ static const char *
+@@ -996,6 +1101,13 @@ xwl_glamor_gbm_init_egl(struct xwl_screen *xwl_screen)
+     if (gbm_backend_name && strcmp(gbm_backend_name, "drm") != 0)
+         xwl_screen->glvnd_vendor = gbm_backend_name;
+ 
++    if (drmSyncobjCreate(xwl_gbm->drm_fd, 0 /* flags */,
++                         &scratch_syncobj)) {
++        ErrorF("failed to create DRM syncobj\n");
++        goto error;
++    }
++
++
+     return TRUE;
+ error:
+     if (xwl_screen->egl_display != EGL_NO_DISPLAY) {
+-- 
+GitLab
+
+
 From 4a45433c923e67c30bbb768c0b8ca1d9e257d2d4 Mon Sep 17 00:00:00 2001
 From: Erik Kurzinger <ekurzinger@nvidia.com>
 Date: Tue, 16 Aug 2022 12:03:59 -0700
