@@ -1,0 +1,115 @@
+From 311116c1281bcc7af6ba976dec63af9a0e38b392 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Fri, 21 Oct 2022 20:29:31 -0400
+Subject: [PATCH 1/2] nir: add nir_intrinsic_optimization_barrier_vgpr_amd for
+ LLVM
+
+We need this for the MSAA resolve shader.
+---
+ src/amd/llvm/ac_nir_to_llvm.c              | 4 ++++
+ src/compiler/nir/nir_divergence_analysis.c | 3 +++
+ src/compiler/nir/nir_intrinsics.py         | 7 +++++++
+ 3 files changed, 14 insertions(+)
+
+diff --git a/src/amd/llvm/ac_nir_to_llvm.c b/src/amd/llvm/ac_nir_to_llvm.c
+index cdb758c73690..bc6edeb9d125 100644
+--- a/src/amd/llvm/ac_nir_to_llvm.c
++++ b/src/amd/llvm/ac_nir_to_llvm.c
+@@ -3933,6 +3933,10 @@ static bool visit_intrinsic(struct ac_nir_context *ctx, nir_intrinsic_instr *ins
+ 
+       ac_build_s_barrier(&ctx->ac, ctx->stage);
+       break;
++   case nir_intrinsic_optimization_barrier_vgpr_amd:
++      result = get_src(ctx, instr->src[0]);
++      ac_build_optimization_barrier(&ctx->ac, &result, false);
++      break;
+    case nir_intrinsic_shared_atomic_add:
+    case nir_intrinsic_shared_atomic_imin:
+    case nir_intrinsic_shared_atomic_umin:
+diff --git a/src/compiler/nir/nir_divergence_analysis.c b/src/compiler/nir/nir_divergence_analysis.c
+index 5199f4a63e5a..1d07cf33c543 100644
+--- a/src/compiler/nir/nir_divergence_analysis.c
++++ b/src/compiler/nir/nir_divergence_analysis.c
+@@ -348,6 +348,9 @@ visit_intrinsic(nir_shader *shader, nir_intrinsic_instr *instr)
+                      instr->src[1].ssa->divergent || instr->src[2].ssa->divergent || instr->src[3].ssa->divergent;
+       break;
+ 
++   case nir_intrinsic_optimization_barrier_vgpr_amd:
++      is_divergent = instr->src[0].ssa->divergent;
++      break;
+ 
+    /* Intrinsics with divergence depending on sources */
+    case nir_intrinsic_ballot_bitfield_extract:
+diff --git a/src/compiler/nir/nir_intrinsics.py b/src/compiler/nir/nir_intrinsics.py
+index 23ed8ba81a31..a75063d850ca 100644
+--- a/src/compiler/nir/nir_intrinsics.py
++++ b/src/compiler/nir/nir_intrinsics.py
+@@ -1576,3 +1576,10 @@ system_value("ray_query_global_intel", 1, bit_sizes=[64])
+ # is defined to be whatever thing the hardware can easily give you, so long as
+ # it's in normalized coordinates in the range [0, 1] across the point.
+ intrinsic("load_point_coord_maybe_flipped", dest_comp=2, bit_sizes=[32])
++
++# This barrier is a hint that prevents moving the instruction that computes
++# src after this barrier. It's a constraint for the instruction scheduler.
++# Otherwise it's identical to a move instruction.
++# On AMD, it also forces the src value to be stored in a VGPR.
++intrinsic("optimization_barrier_vgpr_amd", dest_comp=0, src_comp=[0],
++          flags=[CAN_ELIMINATE])
+-- 
+GitLab
+
+
+From db6e9e9e90d250ea73a6f27290a0853fdd13c588 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Fri, 21 Oct 2022 20:30:41 -0400
+Subject: [PATCH 2/2] radeonsi: force the MSAA resolve shader to use 1 clause
+ for MSAA loads
+
+LLVM can't keep consecutive loads in a clause.
+
+Using the optimization barrier for sample indices produces the optimal code.
+Discovered by trial and error.
+---
+ .../drivers/radeonsi/si_shaderlib_nir.c       | 23 ++++++++++++++++---
+ 1 file changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/src/gallium/drivers/radeonsi/si_shaderlib_nir.c b/src/gallium/drivers/radeonsi/si_shaderlib_nir.c
+index 2c426cbf7053..98321e50aee8 100644
+--- a/src/gallium/drivers/radeonsi/si_shaderlib_nir.c
++++ b/src/gallium/drivers/radeonsi/si_shaderlib_nir.c
+@@ -403,12 +403,29 @@ static nir_ssa_def *image_resolve_msaa(nir_builder *b, nir_variable *img, unsign
+       nir_push_else(b, NULL);
+    }
+ 
++   /* We need to hide the constant sample indices behind the optimization barrier, otherwise
++    * LLVM doesn't put loads into the same clause.
++    *
++    * TODO: nir_group_loads could do this.
++    */
++   nir_ssa_def *sample_index[16];
++   for (unsigned i = 0; i < num_samples; i++)
++      sample_index[i] = nir_imm_int(b, i);
++
++   for (unsigned i = 0; i < num_samples; i++)
++      sample_index[i] = nir_optimization_barrier_vgpr_amd(b, 32, sample_index[i]);
++
++   /* Load all samples. */
++   nir_ssa_def *samples[16];
++   for (unsigned i = 0; i < num_samples; i++) {
++      samples[i] = nir_image_deref_load(b, 4, 32, deref_ssa(b, img),
++                                        coord, sample_index[i], zero);
++   }
++
+    /* Average all samples. (the only options on gfx11) */
+    result = NULL;
+    for (unsigned i = 0; i < num_samples; i++) {
+-      nir_ssa_def *sample = nir_image_deref_load(b, 4, 32, deref_ssa(b, img),
+-                                                 coord, nir_imm_int(b, i), zero);
+-      result = result ? nir_fadd(b, result, sample) : sample;
++      result = i ? nir_fadd(b, result, samples[i]) : samples[i];
+    }
+    result = nir_fmul_imm(b, result, 1.0 / num_samples); /* average the sum */
+ 
+-- 
+GitLab
+
