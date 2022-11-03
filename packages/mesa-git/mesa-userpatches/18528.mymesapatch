@@ -1,0 +1,120 @@
+From 5bf5a10064d2101779ae064a9941c399e9048687 Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Sat, 10 Sep 2022 11:35:56 +0200
+Subject: [PATCH] aco: Don't create useless exec movs while creating v_cmpx.
+
+In a lot of situations the previous exec value was already copied from the
+same registers that exec should be saved to. In that case we don't have to
+insert an extra copy to save exec.
+
+This breaks ssa but this pass is are going out of ssa anyway.
+
+Foz-DB Navi21:
+Totals from 16129 (11.96% of 134913) affected shaders:
+CodeSize: 128184044 -> 128054468 (-0.10%)
+Instrs: 23902694 -> 23870325 (-0.14%)
+Latency: 387124324 -> 387095955 (-0.01%); split: -0.01%, +0.00%
+InvThroughput: 79949118 -> 79945859 (-0.00%); split: -0.01%, +0.00%
+Copies: 1620768 -> 1588752 (-1.98%); split: -1.99%, +0.01%
+
+Foz-DB Vega10:
+Totals from 15546 (11.51% of 135041) affected shaders:
+CodeSize: 120322524 -> 120200568 (-0.10%)
+Instrs: 23448344 -> 23417855 (-0.13%)
+Latency: 414018749 -> 413639289 (-0.09%); split: -0.09%, +0.00%
+InvThroughput: 183819363 -> 183726539 (-0.05%); split: -0.05%, +0.00%
+Copies: 2194937 -> 2164448 (-1.39%)
+
+Signed-off-by: Georg Lehmann <dadschoorse@gmail.com>
+---
+ src/amd/compiler/aco_ssa_elimination.cpp | 42 +++++++++++++++++++-----
+ 1 file changed, 33 insertions(+), 9 deletions(-)
+
+diff --git a/src/amd/compiler/aco_ssa_elimination.cpp b/src/amd/compiler/aco_ssa_elimination.cpp
+index b6b51fe4fa99..2224d3add55c 100644
+--- a/src/amd/compiler/aco_ssa_elimination.cpp
++++ b/src/amd/compiler/aco_ssa_elimination.cpp
+@@ -362,14 +362,41 @@ try_optimize_branching_sequence(ssa_elimination_ctx& ctx, Block& block, const in
+    const bool vopc = v_cmpx_op != aco_opcode::num_opcodes;
+ 
+    /* If s_and_saveexec is used, we'll need to insert a new instruction to save the old exec. */
+-   const bool save_original_exec = exec_copy->opcode == and_saveexec;
++   bool save_original_exec = exec_copy->opcode == and_saveexec;
++
++   const Definition exec_wr_def = exec_val->definitions[0];
++   const Definition exec_copy_def = exec_copy->definitions[0];
++
++   const bool vcmpx_exec_only = ctx.program->gfx_level >= GFX10;
++
++   if (save_original_exec) {
++      for (int i = exec_copy_idx - 1; i >= 0; i--) {
++         aco_ptr<Instruction>& instr = block.instructions[i];
++         if (instr->opcode == aco_opcode::p_parallelcopy &&
++             instr->definitions[0].physReg() == exec &&
++             instr->definitions[0].regClass() == ctx.program->lane_mask &&
++             instr->operands[0].physReg() == exec_copy_def.physReg()) {
++            /* The register that we should save exec to already contains the same value as exec. */
++            save_original_exec = false;
++            break;
++         }
++         for (const Definition& def : instr->definitions) {
++            if ((regs_intersect(exec_copy_def, def) && (i != exec_val_idx || !vcmpx_exec_only)) ||
++                regs_intersect(Definition(exec, ctx.program->lane_mask), def)) {
++               /* exec_copy_def is clobbered or exec written before we found a copy. */
++               i = -1; /* break outer loop */
++               break;
++            }
++         }
++      }
++   }
++
+    /* Position where the original exec mask copy should be inserted. */
+    const int save_original_exec_idx = exec_val_idx;
+    /* The copy can be removed when it kills its operand.
+     * v_cmpx also writes the original destination pre GFX10.
+     */
+-   const bool can_remove_copy =
+-      exec_copy->operands[0].isKill() || (vopc && ctx.program->gfx_level < GFX10);
++   const bool can_remove_copy = exec_copy->operands[0].isKill() || (vopc && !vcmpx_exec_only);
+ 
+    /* Always allow reassigning when the value is written by (usable) VOPC.
+     * Note, VOPC implicitly contains "& exec" because it yields zero on inactive lanes.
+@@ -385,9 +412,6 @@ try_optimize_branching_sequence(ssa_elimination_ctx& ctx, Block& block, const in
+    if (!can_reassign || (save_original_exec && !can_remove_copy))
+       return;
+ 
+-   const Definition exec_wr_def = exec_val->definitions[0];
+-   const Definition exec_copy_def = exec_copy->definitions[0];
+-
+    /* When exec_val and exec_copy are non-adjacent, check whether there are any
+     * instructions inbetween (besides p_logical_end) which may inhibit the optimization.
+     */
+@@ -419,14 +443,14 @@ try_optimize_branching_sequence(ssa_elimination_ctx& ctx, Block& block, const in
+          if (regs_intersect(exec_copy_def, op))
+             return;
+       /* We would write over the saved exec value in this case. */
+-      if (((vopc && ctx.program->gfx_level < GFX10) || !can_remove_copy) &&
++      if (((vopc && !vcmpx_exec_only) || !can_remove_copy) &&
+           regs_intersect(exec_copy_def, exec_wr_def))
+          return;
+    }
+ 
+    if (vopc) {
+       /* Add one extra definition for exec and copy the VOP3-specific fields if present. */
+-      if (ctx.program->gfx_level < GFX10) {
++      if (!vcmpx_exec_only) {
+          if (exec_val->isSDWA() || exec_val->isDPP()) {
+             /* This might work but it needs testing and more code to copy the instruction. */
+             return;
+@@ -462,7 +486,7 @@ try_optimize_branching_sequence(ssa_elimination_ctx& ctx, Block& block, const in
+       *exec_val->definitions.rbegin() = Definition(exec, ctx.program->lane_mask);
+ 
+       /* Change instruction from VOP3 to plain VOPC when possible. */
+-      if (ctx.program->gfx_level >= GFX10 && !exec_val->usesModifiers() &&
++      if (vcmpx_exec_only && !exec_val->usesModifiers() &&
+           (exec_val->operands.size() < 2 || exec_val->operands[1].isOfType(RegType::vgpr)))
+          exec_val->format = Format::VOPC;
+    } else {
+-- 
+GitLab
+
