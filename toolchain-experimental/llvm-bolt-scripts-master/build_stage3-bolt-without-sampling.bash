@@ -27,8 +27,9 @@ echo "== Build with stage2-prof-use-lto instrumented clang -- $CPATH"
 
 cmake -G Ninja ../llvm-project/llvm \
     -DCMAKE_BUILD_TYPE=Release \
-    -DLLVM_ENABLE_PROJECTS="clang" \
     -DLLVM_TARGETS_TO_BUILD="X86" \
+    -DLLVM_ENABLE_PROJECTS="polly;lld;clang" \
+    -DLLVM_ENABLE_RUNTIMES="openmp;compiler-rt" \
     -DCMAKE_AR=${CPATH}/llvm-ar \
     -DCMAKE_C_COMPILER=${CPATH}/clang-16 \
     -DCMAKE_CXX_COMPILER=${CPATH}/clang++ \
