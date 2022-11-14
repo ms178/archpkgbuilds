@@ -20458,3 +20458,192 @@ index 69b3d61852ac..7e56a42750ea 100644
  	policy->cpu = cpu;
 --
 2.25.1
+
+Root node is return at the beginning, so we are sure bit 0 is not set.
+
+Signed-off-by: Wei Yang <richard.weiyang@xxxxxxxxx>
+CC: Liam R. Howlett <Liam.Howlett@xxxxxxxxxx>
+---
+ lib/maple_tree.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/maple_tree.c b/lib/maple_tree.c
+index 9aad98c24f3e..f8c4755e7c75 100644
+--- a/lib/maple_tree.c
++++ b/lib/maple_tree.c
+@@ -436,7 +436,7 @@ enum maple_type mte_parent_enum(struct maple_enode *p_enode,
+ 		return 0; /* Validated in the caller. */
+
+ 	p_type &= MAPLE_NODE_MASK;
+-	p_type = p_type & ~(MAPLE_PARENT_ROOT | mte_parent_slot_mask(p_type));
++	p_type = p_type & ~mte_parent_slot_mask(p_type);
+
+ 	switch (p_type) {
+ 	case MAPLE_PARENT_RANGE64: /* or MAPLE_PARENT_ARANGE64 */
+--
+2.33.1
+
+Cpuset v2 has no spread flags to set. So we can skip spread
+flags update if cpuset v2 is being used. Also change the name to
+cpuset_update_task_spread_flags() to indicate that there are multiple
+spread flags.
+
+Signed-off-by: Waiman Long <longman@xxxxxxxxxx>
+---
+ kernel/cgroup/cpuset.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/cgroup/cpuset.c b/kernel/cgroup/cpuset.c
+index b474289c15b8..2525905cdf48 100644
+--- a/kernel/cgroup/cpuset.c
++++ b/kernel/cgroup/cpuset.c
+@@ -550,11 +550,15 @@ static void guarantee_online_mems(struct cpuset *cs, nodemask_t *pmask)
+ /*
+  * update task's spread flag if cpuset's page/slab spread flag is set
+  *
+- * Call with callback_lock or cpuset_rwsem held.
++ * Call with callback_lock or cpuset_rwsem held. The check can be skipped
++ * if on default hierarchy.
+  */
+-static void cpuset_update_task_spread_flag(struct cpuset *cs,
++static void cpuset_update_task_spread_flags(struct cpuset *cs,
+ 					struct task_struct *tsk)
+ {
++	if (cgroup_subsys_on_dfl(cpuset_cgrp_subsys))
++		return;
++
+ 	if (is_spread_page(cs))
+ 		task_set_spread_page(tsk);
+ 	else
+@@ -2153,7 +2157,7 @@ static void update_tasks_flags(struct cpuset *cs)
+
+ 	css_task_iter_start(&cs->css, 0, &it);
+ 	while ((task = css_task_iter_next(&it)))
+-		cpuset_update_task_spread_flag(cs, task);
++		cpuset_update_task_spread_flags(cs, task);
+ 	css_task_iter_end(&it);
+ }
+
+@@ -2530,7 +2534,7 @@ static void cpuset_attach(struct cgroup_taskset *tset)
+ 		WARN_ON_ONCE(set_cpus_allowed_ptr(task, cpus_attach));
+
+ 		cpuset_change_task_nodemask(task, &cpuset_attach_nodemask_to);
+-		cpuset_update_task_spread_flag(cs, task);
++		cpuset_update_task_spread_flags(cs, task);
+ 	}
+
+ 	/*
+--
+2.31.1
+
+It was found that with the default hierarchy, enabling cpuset in the
+child cgroups can trigger a cpuset_attach() call in each of the child
+cgroups that have tasks with no change in effective cpus and mems. If
+there are many processes in those child cgroups, it will burn quite a
+lot of cpu cycles iterating all the tasks without doing useful work.
+
+Optimizing this case by comparing between the old and new cpusets and
+skip useless update if there is no change in effective cpus and mems.
+Also mems_allowed are less likely to be changed than cpus_allowed. So
+skip changing mm if there is no change in effective_mems and
+CS_MEMORY_MIGRATE is not set.
+
+By inserting some instrumentation code and running a simple command in
+a container 200 times in a cgroup v2 system, it was found that all the
+cpuset_attach() calls are skipped (401 times in total) as there was no
+change in effective cpus and mems.
+
+Signed-off-by: Waiman Long <longman@xxxxxxxxxx>
+---
+ kernel/cgroup/cpuset.c | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/cgroup/cpuset.c b/kernel/cgroup/cpuset.c
+index 2525905cdf48..b8361f55ef36 100644
+--- a/kernel/cgroup/cpuset.c
++++ b/kernel/cgroup/cpuset.c
+@@ -2513,12 +2513,28 @@ static void cpuset_attach(struct cgroup_taskset *tset)
+ 	struct cgroup_subsys_state *css;
+ 	struct cpuset *cs;
+ 	struct cpuset *oldcs = cpuset_attach_old_cs;
++	bool cpus_updated, mems_updated;
+
+ 	cgroup_taskset_first(tset, &css);
+ 	cs = css_cs(css);
+
+ 	lockdep_assert_cpus_held();	/* see cgroup_attach_lock() */
+ 	percpu_down_write(&cpuset_rwsem);
++	cpus_updated = !cpumask_equal(cs->effective_cpus,
++				      oldcs->effective_cpus);
++	mems_updated = !nodes_equal(cs->effective_mems, oldcs->effective_mems);
++
++	/*
++	 * In the default hierarchy, enabling cpuset in the child cgroups
++	 * will trigger a number of cpuset_attach() calls with no change
++	 * in effective cpus and mems. In that case, we can optimize out
++	 * by skipping the task iteration and update.
++	 */
++	if (cgroup_subsys_on_dfl(cpuset_cgrp_subsys) &&
++	    !cpus_updated && !mems_updated) {
++		cpuset_attach_nodemask_to = cs->effective_mems;
++		goto out;
++	}
+
+ 	guarantee_online_mems(cs, &cpuset_attach_nodemask_to);
+
+@@ -2539,9 +2555,14 @@ static void cpuset_attach(struct cgroup_taskset *tset)
+
+ 	/*
+ 	 * Change mm for all threadgroup leaders. This is expensive and may
+-	 * sleep and should be moved outside migration path proper.
++	 * sleep and should be moved outside migration path proper. Skip it
++	 * if there is no change in effective_mems and CS_MEMORY_MIGRATE is
++	 * not set.
+ 	 */
+ 	cpuset_attach_nodemask_to = cs->effective_mems;
++	if (!is_memory_migrate(cs) && !mems_updated)
++		goto out;
++
+ 	cgroup_taskset_for_each_leader(leader, css, tset) {
+ 		struct mm_struct *mm = get_task_mm(leader);
+
+@@ -2564,6 +2585,7 @@ static void cpuset_attach(struct cgroup_taskset *tset)
+ 		}
+ 	}
+
++out:
+ 	cs->old_mems_allowed = cpuset_attach_nodemask_to;
+
+ 	cs->attach_in_progress--;
+--
+2.31.1
+
+The function mem_dump_obj() can sometimes provide valuable debugging
+information, but it cannot be called in an interrupt context because
+spinlock vmap_area_lock has not been protected against IRQs. If the
+current task has held the lock before hard/soft interrupt handler calls
+mem_dump_obj(), simply abandoning the dump operation can avoid deadlock.
+That is, no deadlock occurs in extreme cases, and dump succeeds in most
+cases.
+
+Signed-off-by: Zhen Lei <thunder.leizhen@xxxxxxxxxx>
+---
+ mm/vmalloc.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+index ccaa461998f3c37..cdd36c5a1aa16f8 100644
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -4034,6 +4034,9 @@ bool vmalloc_dump_obj(void *object)
+ 	struct vm_struct *vm;
+ 	void *objp = (void *)PAGE_ALIGN((unsigned long)object);
+
++	if (unlikely(spin_is_locked(&vmap_area_lock)))
++		return false;
++
+ 	vm = find_vm_area(objp);
+ 	if (!vm)
+ 		return false;
+--
+2.25.1
