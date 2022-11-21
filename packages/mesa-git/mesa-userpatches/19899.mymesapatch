@@ -1,0 +1,184 @@
+From d36d28c4daaae4e2cb480fddec8366d986542c94 Mon Sep 17 00:00:00 2001
+From: Erik Faye-Lund <erik.faye-lund@collabora.com>
+Date: Mon, 21 Nov 2022 13:53:04 +0100
+Subject: [PATCH 1/2] aux/draw: vectorize aaline computations
+
+This makes it a bit more similar to the TGSI version, which makes
+modifying them easier to review.
+---
+ src/gallium/auxiliary/nir/nir_draw_helpers.c | 8 +++-----
+ 1 file changed, 3 insertions(+), 5 deletions(-)
+
+diff --git a/src/gallium/auxiliary/nir/nir_draw_helpers.c b/src/gallium/auxiliary/nir/nir_draw_helpers.c
+index daa1fcb260bd..098b83b194b5 100644
+--- a/src/gallium/auxiliary/nir/nir_draw_helpers.c
++++ b/src/gallium/auxiliary/nir/nir_draw_helpers.c
+@@ -174,12 +174,10 @@ nir_lower_aaline_block(nir_block *block,
+       nir_ssa_def *out_input = intrin->src[1].ssa;
+       b->cursor = nir_before_instr(instr);
+       nir_ssa_def *lw = nir_load_var(b, state->line_width_input);
+-      nir_ssa_def *tmp = nir_fsat(b, nir_fadd(b, nir_channel(b, lw, 1),
+-                                              nir_fneg(b, nir_fabs(b, nir_channel(b, lw, 0)))));
+-      nir_ssa_def *tmp1 = nir_fsat(b, nir_fadd(b, nir_channel(b, lw, 3),
+-                                               nir_fneg(b, nir_fabs(b, nir_channel(b, lw, 2)))));
++      nir_ssa_def *tmp = nir_fsat(b, nir_fadd(b, nir_channels(b, lw, 0xa),
++                                              nir_fneg(b, nir_fabs(b, nir_channels(b, lw, 0x5)))));
+ 
+-      tmp = nir_fmul(b, tmp, tmp1);
++      tmp = nir_fmul(b, nir_channel(b, tmp, 0), nir_channel(b, tmp, 1));
+       tmp = nir_fmul(b, nir_channel(b, out_input, 3), tmp);
+ 
+       nir_ssa_def *out = nir_vec4(b, nir_channel(b, out_input, 0),
+-- 
+GitLab
+
+
+From b64d19369d5f7fb3e72deb76053a90a1f73213c5 Mon Sep 17 00:00:00 2001
+From: Erik Faye-Lund <erik.faye-lund@collabora.com>
+Date: Mon, 21 Nov 2022 13:28:00 +0100
+Subject: [PATCH 2/2] gallium/draw: properly fix short aalines
+
+The fix we used to have for short smooth lines were incorrect, and
+here's the real fix:
+
+For lines shorter than one pixel, we need to clamp the length-wise
+coverage to the line-length. That produces results that are consistent
+with our approximation for longer lines.
+
+Because we pass (length / 2) + 0.5 to the fragment shader instead of
+the unmodified length, we need to spend a few instructions to
+reconstruct the original width.
+---
+ src/gallium/auxiliary/draw/draw_pipe_aaline.c | 61 ++++++++++++-------
+ src/gallium/auxiliary/nir/nir_draw_helpers.c  |  5 +-
+ 2 files changed, 42 insertions(+), 24 deletions(-)
+
+diff --git a/src/gallium/auxiliary/draw/draw_pipe_aaline.c b/src/gallium/auxiliary/draw/draw_pipe_aaline.c
+index 7dac40785594..edbbc7d54518 100644
+--- a/src/gallium/auxiliary/draw/draw_pipe_aaline.c
++++ b/src/gallium/auxiliary/draw/draw_pipe_aaline.c
+@@ -107,6 +107,7 @@ struct aa_transform_context {
+    uint64_t tempsUsed;  /**< bitmask */
+    int colorOutput; /**< which output is the primary color */
+    int maxInput, maxGeneric;  /**< max input index found */
++   int numImm; /**< number of immediate regsters */
+    int colorTemp, aaTemp;  /**< temp registers */
+ };
+ 
+@@ -147,6 +148,18 @@ aa_transform_decl(struct tgsi_transform_context *ctx,
+    ctx->emit_declaration(ctx, decl);
+ }
+ 
++/**
++ * TGSI immediate declaration transform callback.
++ */
++static void
++aa_immediate(struct tgsi_transform_context *ctx,
++                  struct tgsi_full_immediate *imm)
++{
++   struct aa_transform_context *aactx = (struct aa_transform_context *)ctx;
++
++   ctx->emit_immediate(ctx, imm);
++   aactx->numImm++;
++}
+ 
+ /**
+  * Find the lowest zero bit, or -1 if bitfield is all ones.
+@@ -182,6 +195,9 @@ aa_transform_prolog(struct tgsi_transform_context *ctx)
+    /* declare new temp regs */
+    tgsi_transform_temp_decl(ctx, aactx->aaTemp);
+    tgsi_transform_temp_decl(ctx, aactx->colorTemp);
++
++   /* declare new immediate reg */
++   tgsi_transform_immediate_decl(ctx, 2.0, -1.0, 0.0, 0.25);
+ }
+ 
+ 
+@@ -215,6 +231,26 @@ aa_transform_epilog(struct tgsi_transform_context *ctx)
+       inst.Src[1].Register.Negate = true;
+       ctx->emit_instruction(ctx, &inst);
+ 
++      /* linelength * 2 - 1 */
++      tgsi_transform_op3_swz_inst(ctx, TGSI_OPCODE_MAD,
++                                  TGSI_FILE_TEMPORARY, aactx->aaTemp,
++                                  TGSI_WRITEMASK_Y,
++                                  TGSI_FILE_INPUT, aactx->maxInput + 1,
++                                  TGSI_SWIZZLE_W, false,
++                                  TGSI_FILE_IMMEDIATE, aactx->numImm,
++                                  TGSI_SWIZZLE_X,
++                                  TGSI_FILE_IMMEDIATE, aactx->numImm,
++                                  TGSI_SWIZZLE_Y);
++
++      /* MIN height alpha */
++      tgsi_transform_op2_swz_inst(ctx, TGSI_OPCODE_MIN,
++                                  TGSI_FILE_TEMPORARY, aactx->aaTemp,
++                                  TGSI_WRITEMASK_Z,
++                                  TGSI_FILE_TEMPORARY, aactx->aaTemp,
++                                  TGSI_SWIZZLE_Z,
++                                  TGSI_FILE_TEMPORARY, aactx->aaTemp,
++                                  TGSI_SWIZZLE_Y, false);
++
+       /* MUL width / height alpha */
+       tgsi_transform_op2_swz_inst(ctx, TGSI_OPCODE_MUL,
+                                   TGSI_FILE_TEMPORARY, aactx->aaTemp,
+@@ -292,6 +328,7 @@ generate_aaline_fs(struct aaline_stage *aaline)
+    transform.base.epilog = aa_transform_epilog;
+    transform.base.transform_instruction = aa_transform_inst;
+    transform.base.transform_declaration = aa_transform_decl;
++   transform.base.transform_immediate = aa_immediate;
+ 
+    aaline_fs.tokens = tgsi_transform_shader(orig_fs->tokens, newLen, &transform.base);
+    if (!aaline_fs.tokens)
+@@ -390,29 +427,7 @@ aaline_line(struct draw_stage *stage, struct prim_header *header)
+    uint i;
+ 
+    half_length = 0.5f * sqrtf(dx * dx + dy * dy);
+-
+-   if (half_length < 0.5f) {
+-      /*
+-       * The logic we use for "normal" sized segments is incorrect
+-       * for very short segments (basically because we only have
+-       * one value to interpolate, not a distance to each endpoint).
+-       * Therefore, we calculate half_length differently, so that for
+-       * original line length (near) 0, we get alpha 0 - otherwise
+-       * max alpha would still be 0.5. This also prevents us from
+-       * artifacts due to degenerated lines (the endpoints being
+-       * identical, which would still receive anywhere from alpha
+-       * 0-0.5 otherwise) (at least the pstipple stage may generate
+-       * such lines due to float inaccuracies if line length is very
+-       * close to a integer).
+-       * Might not be fully accurate neither (because the "strength" of
+-       * the line is going to be determined by how close to the pixel
+-       * center those 1 or 2 fragments are) but it's probably the best
+-       * we can do.
+-       */
+-      half_length = 2.0f * half_length;
+-   } else {
+-      half_length = half_length + 0.5f;
+-   }
++   half_length = half_length + 0.5f;
+ 
+    t_w = half_width;
+    t_l = 0.5f;
+diff --git a/src/gallium/auxiliary/nir/nir_draw_helpers.c b/src/gallium/auxiliary/nir/nir_draw_helpers.c
+index 098b83b194b5..4588b56f461f 100644
+--- a/src/gallium/auxiliary/nir/nir_draw_helpers.c
++++ b/src/gallium/auxiliary/nir/nir_draw_helpers.c
+@@ -174,10 +174,13 @@ nir_lower_aaline_block(nir_block *block,
+       nir_ssa_def *out_input = intrin->src[1].ssa;
+       b->cursor = nir_before_instr(instr);
+       nir_ssa_def *lw = nir_load_var(b, state->line_width_input);
++      nir_ssa_def *len = nir_channel(b, lw, 3);
++      len = nir_fadd_imm(b, nir_fmul_imm(b, len, 2.0), -1.0);
+       nir_ssa_def *tmp = nir_fsat(b, nir_fadd(b, nir_channels(b, lw, 0xa),
+                                               nir_fneg(b, nir_fabs(b, nir_channels(b, lw, 0x5)))));
+ 
+-      tmp = nir_fmul(b, nir_channel(b, tmp, 0), nir_channel(b, tmp, 1));
++      tmp = nir_fmul(b, nir_channel(b, tmp, 0),
++                     nir_fmin(b, nir_channel(b, tmp, 1), len));
+       tmp = nir_fmul(b, nir_channel(b, out_input, 3), tmp);
+ 
+       nir_ssa_def *out = nir_vec4(b, nir_channel(b, out_input, 0),
+-- 
+GitLab
+
