@@ -9,9 +9,10 @@ sonnet-git \
 kcodecs-git \
 syndication-git \
 syntax-highlighting-git \
+karchive-git \
+kdoctools-git \
 milou-git \
 prison-git \
-karchive-git \
 kconfig-git \
 kcoreaddons-git \
 kdecoration-git \
@@ -23,7 +24,6 @@ kwindowsystem-git \
 kcrash-git \
 kidletime-git \
 kdbusaddons-git \
-kdoctools-git \
 kglobalaccel-git \
 polkit-qt5-git \
 kauth-git \
