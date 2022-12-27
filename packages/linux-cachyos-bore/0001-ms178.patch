@@ -16901,3 +16901,326 @@ index ebe6b8ec7cb3..14fdd2ee752c 100644
  	/*
 --
 2.36.1
+
+ttwu_runnable() is used as a fast wakeup path when the wakee task
+is running on CPU or runnable on RQ, in both cases we can just
+set its state to TASK_RUNNING to prevent a sleep.
+
+If the wakee task is on_cpu running, we don't need to update_rq_clock()
+or check_preempt_curr().
+
+But if the wakee task is on_rq && !on_cpu (e.g. an IRQ hit before
+the task got to schedule() and the task been preempted), we should
+check_preempt_curr() to see if it can preempt the current running.
+
+This also removes the class->task_woken() callback from ttwu_runnable(),
+which wasn't required per the RT/DL implementations: any required push
+operation would have been queued during class->set_next_task() when p
+got preempted.
+
+ttwu_runnable() also loses the update to rq->idle_stamp, as by definition
+the rq cannot be idle in this scenario.
+
+Signed-off-by: Chengming Zhou <zhouchengming@xxxxxxxxxxxxx>
+Suggested-by: Valentin Schneider <vschneid@xxxxxxxxxx>
+Suggested-by: Peter Zijlstra <peterz@xxxxxxxxxxxxx>
+Reviewed-by: Valentin Schneider <vschneid@xxxxxxxxxx>
+Reviewed-by: Steven Rostedt (Google) <rostedt@xxxxxxxxxxx>
+---
+v6:
+ - Improve the comment in ttwu_runnable() per Steve. Thanks!
+
+v5:
+ - Split the reorganization and optimization into two patches
+   per Chen Yu. Thanks!
+
+v4:
+ - s/This patch reorg/Reorganize/ per Bagas Sanjaya. Thanks!
+
+v3:
+ - Improve the changelog per Valentin Schneider. Thanks!
+
+v2:
+ - keep check_preempt_curr() for on_rq && !on_cpu case in ttwu_runnable(),
+   per Valentin Schneider.
+ - reorg ttwu_do_wakeup() and ttwu_do_activate() code, so ttwu_do_wakeup()
+   can be reused in ttwu_runnable(), per Peter Zijlstra.
+ - reuse ttwu_do_wakeup() in try_to_wake_up() (p == current) fast path too,
+   so ttwu_do_wakeup() become the only place we mark task runnable.
+---
+ kernel/sched/core.c | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 314c2c0219d9..607a5430b192 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3718,9 +3718,16 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
+
+ 	rq = __task_rq_lock(p, &rf);
+ 	if (task_on_rq_queued(p)) {
+-		/* check_preempt_curr() may use rq clock */
+-		update_rq_clock(rq);
+-		ttwu_do_wakeup(rq, p, wake_flags, &rf);
++		if (!task_on_cpu(rq, p)) {
++			/*
++			 * When on_rq && !on_cpu the task is preempted, see if
++			 * it should preempt the task that is current now.
++			 */
++			update_rq_clock(rq);
++			check_preempt_curr(rq, p, wake_flags);
++		}
++		WRITE_ONCE(p->__state, TASK_RUNNING);
++		trace_sched_wakeup(p);
+ 		ret = 1;
+ 	}
+ 	__task_rq_unlock(rq, &rf);
+--
+2.37.2
+
+ttwu_do_activate() is used for a complete wakeup, in which we will
+activate_task() and use ttwu_do_wakeup() to mark the task runnable
+and perform wakeup-preemption, also call class->task_woken() callback
+and update the rq->idle_stamp.
+
+Since ttwu_runnable() is not a complete wakeup, don't need all those
+done in ttwu_do_wakeup(), so we can move those to ttwu_do_activate()
+to simplify ttwu_do_wakeup(), making it only mark the task runnable
+to be reused in ttwu_runnable() and try_to_wake_up().
+
+This patch should not have any functional changes.
+
+Suggested-by: Peter Zijlstra <peterz@xxxxxxxxxxxxx>
+Signed-off-by: Chengming Zhou <zhouchengming@xxxxxxxxxxxxx>
+---
+ kernel/sched/core.c | 64 ++++++++++++++++++++++-----------------------
+ 1 file changed, 31 insertions(+), 33 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 607a5430b192..3936b3328500 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3623,14 +3623,39 @@ ttwu_stat(struct task_struct *p, int cpu, int wake_flags)
+ }
+
+ /*
+- * Mark the task runnable and perform wakeup-preemption.
++ * Mark the task runnable.
+  */
+-static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,
+-			   struct rq_flags *rf)
++static inline void ttwu_do_wakeup(struct task_struct *p)
+ {
+-	check_preempt_curr(rq, p, wake_flags);
+ 	WRITE_ONCE(p->__state, TASK_RUNNING);
+ 	trace_sched_wakeup(p);
++}
++
++static void
++ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
++		 struct rq_flags *rf)
++{
++	int en_flags = ENQUEUE_WAKEUP | ENQUEUE_NOCLOCK;
++
++	lockdep_assert_rq_held(rq);
++
++	if (p->sched_contributes_to_load)
++		rq->nr_uninterruptible--;
++
++#ifdef CONFIG_SMP
++	if (wake_flags & WF_MIGRATED)
++		en_flags |= ENQUEUE_MIGRATED;
++	else
++#endif
++	if (p->in_iowait) {
++		delayacct_blkio_end(p);
++		atomic_dec(&task_rq(p)->nr_iowait);
++	}
++
++	activate_task(rq, p, en_flags);
++	check_preempt_curr(rq, p, wake_flags);
++
++	ttwu_do_wakeup(p);
+
+ #ifdef CONFIG_SMP
+ 	if (p->sched_class->task_woken) {
+@@ -3660,31 +3685,6 @@ static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,
+ #endif
+ }
+
+-static void
+-ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
+-		 struct rq_flags *rf)
+-{
+-	int en_flags = ENQUEUE_WAKEUP | ENQUEUE_NOCLOCK;
+-
+-	lockdep_assert_rq_held(rq);
+-
+-	if (p->sched_contributes_to_load)
+-		rq->nr_uninterruptible--;
+-
+-#ifdef CONFIG_SMP
+-	if (wake_flags & WF_MIGRATED)
+-		en_flags |= ENQUEUE_MIGRATED;
+-	else
+-#endif
+-	if (p->in_iowait) {
+-		delayacct_blkio_end(p);
+-		atomic_dec(&task_rq(p)->nr_iowait);
+-	}
+-
+-	activate_task(rq, p, en_flags);
+-	ttwu_do_wakeup(rq, p, wake_flags, rf);
+-}
+-
+ /*
+  * Consider @p being inside a wait loop:
+  *
+@@ -3726,8 +3726,7 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
+ 			update_rq_clock(rq);
+ 			check_preempt_curr(rq, p, wake_flags);
+ 		}
+-		WRITE_ONCE(p->__state, TASK_RUNNING);
+-		trace_sched_wakeup(p);
++		ttwu_do_wakeup(p);
+ 		ret = 1;
+ 	}
+ 	__task_rq_unlock(rq, &rf);
+@@ -4093,8 +4092,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
+ 			goto out;
+
+ 		trace_sched_waking(p);
+-		WRITE_ONCE(p->__state, TASK_RUNNING);
+-		trace_sched_wakeup(p);
++		ttwu_do_wakeup(p);
+ 		goto out;
+ 	}
+
+--
+2.37.2
+
+In the current algorithm of cputime_adjust(), the accumulated stime and
+utime are used to divide the accumulated rtime. When the value is very
+large, it is easy for the stime or utime not to be updated.
+
+A better and intuitive way is to save the last stime and utime, and
+divide the rtime increment proportionally according to the tick
+increment.
+
+Signed-off-by: Ma Xing <maxing.lan@xxxxxxxxxxxxx>
+---
+ include/linux/sched.h         |  2 ++
+ include/linux/sched/cputime.h |  1 +
+ kernel/sched/cputime.c        | 38 +++++++++++++++++++++++++----------
+ 3 files changed, 30 insertions(+), 11 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 853d08f7562b..41b69ea8b717 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -325,6 +325,8 @@ struct prev_cputime {
+ #ifndef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
+ 	u64				utime;
+ 	u64				stime;
++	u64				utick;
++	u64				stick;
+ 	raw_spinlock_t			lock;
+ #endif
+ };
+diff --git a/include/linux/sched/cputime.h b/include/linux/sched/cputime.h
+index ce3c58286062..db5c32d4a467 100644
+--- a/include/linux/sched/cputime.h
++++ b/include/linux/sched/cputime.h
+@@ -182,6 +182,7 @@ static inline void prev_cputime_init(struct prev_cputime *prev)
+ {
+ #ifndef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
+ 	prev->utime = prev->stime = 0;
++	prev->utick = prev->stick = 0;
+ 	raw_spin_lock_init(&prev->lock);
+ #endif
+ }
+diff --git a/kernel/sched/cputime.c b/kernel/sched/cputime.c
+index 95fc77853743..d94e9a306478 100644
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@ -555,6 +555,7 @@ void cputime_adjust(struct task_cputime *curr, struct prev_cputime *prev,
+ 		    u64 *ut, u64 *st)
+ {
+ 	u64 rtime, stime, utime;
++	s64 delta_rtime, delta_stime, delta_utime;
+ 	unsigned long flags;
+
+ 	/* Serialize concurrent callers such that we can honour our guarantees */
+@@ -575,22 +576,36 @@ void cputime_adjust(struct task_cputime *curr, struct prev_cputime *prev,
+ 	stime = curr->stime;
+ 	utime = curr->utime;
+
++
++	delta_rtime = rtime - prev->stime - prev->utime;
++	delta_stime = stime - prev->stick;
++	delta_utime = utime - prev->utick;
++
++	prev->stick = stime;
++	prev->utick = utime;
++
+ 	/*
+ 	 * If either stime or utime are 0, assume all runtime is userspace.
+ 	 * Once a task gets some ticks, the monotonicity code at 'update:'
+ 	 * will ensure things converge to the observed ratio.
+ 	 */
+ 	if (stime == 0) {
+-		utime = rtime;
++		delta_utime = delta_rtime;
+ 		goto update;
+ 	}
+
+ 	if (utime == 0) {
+-		stime = rtime;
++		delta_stime = delta_rtime;
+ 		goto update;
+ 	}
+
+-	stime = mul_u64_u64_div_u64(stime, rtime, stime + utime);
++	if (delta_stime <= 0)
++		goto update;
++
++	if (delta_utime <= 0)
++		goto update;
++
++	delta_stime = mul_u64_u64_div_u64(delta_stime, delta_rtime, delta_stime + delta_utime);
+
+ update:
+ 	/*
+@@ -602,21 +617,22 @@ void cputime_adjust(struct task_cputime *curr, struct prev_cputime *prev,
+ 	 *            = (rtime_i+1 - rtime_i) + utime_i
+ 	 *            >= utime_i
+ 	 */
+-	if (stime < prev->stime)
+-		stime = prev->stime;
+-	utime = rtime - stime;
++	if (delta_stime <= 0)
++		delta_stime = 0;
++	delta_utime = delta_rtime - delta_stime;
++
+
+ 	/*
+ 	 * Make sure utime doesn't go backwards; this still preserves
+ 	 * monotonicity for stime, analogous argument to above.
+ 	 */
+-	if (utime < prev->utime) {
+-		utime = prev->utime;
+-		stime = rtime - utime;
++	if (delta_utime <= 0) {
++		delta_utime = 0;
++		delta_stime = delta_rtime - delta_utime;
+ 	}
+
+-	prev->stime = stime;
+-	prev->utime = utime;
++	prev->stime += delta_stime;
++	prev->utime += delta_utime;
+ out:
+ 	*ut = prev->utime;
+ 	*st = prev->stime;
+--
+2.20.1
