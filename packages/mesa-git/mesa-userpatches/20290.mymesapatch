@@ -1,0 +1,188 @@
+From 03fb37c4f7b17a487f95ae8af1b5af5be5b79263 Mon Sep 17 00:00:00 2001
+From: Kenneth Graunke <kenneth@whitecape.org>
+Date: Mon, 12 Dec 2022 19:55:10 -0800
+Subject: [PATCH] st/mesa: Enable Alpha writes when writing RGB faked as RGBA
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Some GPUs are able to render more efficiently when all channels of a
+color attachment are written, since whole pixels are being overwritten,
+rather than hitting a read-modify-write cycle where newly written data
+has to be combined with existing unmodified image data.
+
+When faking GL_RGB as RGBA (in case RGB/RGBX isn't color renderable),
+we introduce an extra channel that doesn't exist from the application
+point of view.  With such a format, a color mask of 0x7 (RGB) would mean
+to write all channels.  But because we've added an alpha channel behind
+their back, this becomes a partial write.  We are free to write whatever
+garbage we want to the alpha channel, however.  So we can enable alpha
+writes, making this a more efficient full pixel write again.
+
+This is done unconditionally as it's expected to address a problem
+common to many drivers and isn't expected to be harmful, even on GPUs
+where it may not help much.
+
+Improves WebGL Aquarium performance on Alderlake GT1 by around 2.4x, in
+the Chromium, using Wayland (the --enable-features=UseOzonePlatform and
+--ozone-platform=wayland flags).
+
+v2: Don't require PIPE_CAP_RGB_OVERRIDE_DST_ALPHA_BLEND (Marek)
+v3: Fix independent blending enables (Emma) - now set when needed,
+    skipped when not needed, and PIPE_CAP_INDEP_BLEND_ENABLE is no
+    longer a requirement.  We just optimize where we can.
+
+Closes: https://gitlab.freedesktop.org/mesa/mesa/-/issues/7864
+Reviewed-by: Matt Turner <mattst88@gmail.com> [v1]
+Reviewed-by: Marek Olšák <marek.olsak@amd.com> [v2]
+---
+ src/mesa/main/fbobject.c               |  4 ++
+ src/mesa/main/mtypes.h                 |  1 +
+ src/mesa/state_tracker/st_atom_blend.c | 59 ++++++++++++++++++++++++--
+ src/mesa/state_tracker/st_context.c    |  2 +
+ src/mesa/state_tracker/st_context.h    |  1 +
+ 5 files changed, 63 insertions(+), 4 deletions(-)
+
+diff --git a/src/mesa/main/fbobject.c b/src/mesa/main/fbobject.c
+index 65562e7cd85e..34abce5899a7 100644
+--- a/src/mesa/main/fbobject.c
++++ b/src/mesa/main/fbobject.c
+@@ -1292,6 +1292,7 @@ _mesa_test_framebuffer_completeness(struct gl_context *ctx,
+    fb->_HasAttachments = true;
+    fb->_IntegerBuffers = 0;
+    fb->_BlendForceAlphaToOne = 0;
++   fb->_IsRGB = 0;
+    fb->_FP32Buffers = 0;
+ 
+    /* Start at -2 to more easily loop over all attachment points.
+@@ -1452,6 +1453,9 @@ _mesa_test_framebuffer_completeness(struct gl_context *ctx,
+          if (_mesa_is_format_integer_color(attFormat))
+             fb->_IntegerBuffers |= (1 << i);
+ 
++         if (baseFormat == GL_RGB)
++            fb->_IsRGB |= (1 << i);
++
+          if ((baseFormat == GL_RGB && ctx->st->needs_rgb_dst_alpha_override) ||
+              (baseFormat == GL_LUMINANCE && !util_format_is_luminance(attFormat)) ||
+              (baseFormat == GL_INTENSITY && !util_format_is_intensity(attFormat)))
+diff --git a/src/mesa/main/mtypes.h b/src/mesa/main/mtypes.h
+index da6b80a2a885..bf39a0826d5d 100644
+--- a/src/mesa/main/mtypes.h
++++ b/src/mesa/main/mtypes.h
+@@ -2708,6 +2708,7 @@ struct gl_framebuffer
+ 
+    GLbitfield _IntegerBuffers;  /**< Which color buffers are integer valued */
+    GLbitfield _BlendForceAlphaToOne;  /**< Which color buffers need blend factor adjustment */
++   GLbitfield _IsRGB;  /**< Which color buffers have an RGB base format? */
+    GLbitfield _FP32Buffers; /**< Which color buffers are FP32 */
+ 
+    /* ARB_color_buffer_float */
+diff --git a/src/mesa/state_tracker/st_atom_blend.c b/src/mesa/state_tracker/st_atom_blend.c
+index 68ea850bc4c7..edd6a3c7c5e0 100644
+--- a/src/mesa/state_tracker/st_atom_blend.c
++++ b/src/mesa/state_tracker/st_atom_blend.c
+@@ -123,6 +123,40 @@ colormask_per_rt(const struct gl_context *ctx, unsigned num_cb)
+    return (ctx->Color.ColorMask & full_mask) != repl_mask0;
+ }
+ 
++/**
++ * Decide whether to allow promotion of RGB colormasks (0x7) to RGBA (0xf).
++ */
++static bool
++allow_rgb_colormask_promotion(const struct st_context *st,
++                              unsigned num_cb,
++                              bool *need_independent_blend)
++{
++   const struct gl_context *ctx = st->ctx;
++
++   if (num_cb == 1)
++      return true;
++
++   GLbitfield rgb_mask = _mesa_replicate_colormask(0x7, num_cb);
++   GLbitfield full_mask = _mesa_replicate_colormask(0xf, num_cb);
++
++   /* True if all colormasks should be promoted.  If so, we can do so
++    * without needing independent blending.  (If none should be promoted,
++    * we can just skip this optimization as it doesn't do anything.)
++    */
++   bool same = ctx->DrawBuffer->_IsRGB == u_bit_consecutive(0, num_cb) &&
++               (ctx->Color.ColorMask & full_mask) == rgb_mask;
++
++   /* We can support different per-RT promotion decisions if we driver
++    * supports independent blending (but we must actually enable it).
++    */
++   if (st->has_indep_blend_enable && !same) {
++      *need_independent_blend = true;
++      return true;
++   }
++
++   return same;
++}
++
+ /**
+  * Figure out if blend enables/state are different per rt.
+  */
+@@ -203,14 +237,31 @@ st_update_blend( struct st_context *st )
+ 
+    blend->max_rt = MAX2(1, num_cb) - 1;
+ 
+-   if (num_cb > 1 &&
+-       (blend_per_rt(st, num_cb) || colormask_per_rt(ctx, num_cb))) {
++   bool need_independent_blend = num_cb > 1 &&
++      (blend_per_rt(st, num_cb) || colormask_per_rt(ctx, num_cb));
++
++   bool promote_rgb_colormasks =
++      allow_rgb_colormask_promotion(st, num_cb, &need_independent_blend);
++
++   if (need_independent_blend) {
+       num_state = num_cb;
+       blend->independent_blend_enable = 1;
+    }
+ 
+-   for (i = 0; i < num_state; i++)
+-      blend->rt[i].colormask = GET_COLORMASK(ctx->Color.ColorMask, i);
++   for (i = 0; i < num_state; i++) {
++      unsigned colormask = GET_COLORMASK(ctx->Color.ColorMask, i);
++
++      /* When faking RGB as RGBA and writing every real channel, also enable
++       * writes to the A channel as well.  Some GPUs are able to render more
++       * efficiently if they know whole pixels are being overwritten, whereas
++       * partial writes may require preserving/combining new and old data.
++       */
++      if (promote_rgb_colormasks &&
++          colormask == 0x7 && (ctx->DrawBuffer->_IsRGB & (1 << i)))
++         colormask = 0xf;
++
++      blend->rt[i].colormask = colormask;
++   }
+ 
+    if (ctx->Color.ColorLogicOpEnabled) {
+       /* logicop enabled */
+diff --git a/src/mesa/state_tracker/st_context.c b/src/mesa/state_tracker/st_context.c
+index 80d2e608a992..7722eb6cc818 100644
+--- a/src/mesa/state_tracker/st_context.c
++++ b/src/mesa/state_tracker/st_context.c
+@@ -608,6 +608,8 @@ st_create_context_priv(struct gl_context *ctx, struct pipe_context *pipe,
+       screen->get_param(screen, PIPE_CAP_QUERY_PIPELINE_STATISTICS_SINGLE);
+    st->has_pipeline_stat =
+       screen->get_param(screen, PIPE_CAP_QUERY_PIPELINE_STATISTICS);
++   st->has_indep_blend_enable =
++      screen->get_param(screen, PIPE_CAP_INDEP_BLEND_ENABLE);
+    st->has_indep_blend_func =
+       screen->get_param(screen, PIPE_CAP_INDEP_BLEND_FUNC);
+    st->needs_rgb_dst_alpha_override =
+diff --git a/src/mesa/state_tracker/st_context.h b/src/mesa/state_tracker/st_context.h
+index c3996a25da61..f8c4646eb914 100644
+--- a/src/mesa/state_tracker/st_context.h
++++ b/src/mesa/state_tracker/st_context.h
+@@ -164,6 +164,7 @@ struct st_context
+    boolean has_occlusion_query;
+    boolean has_single_pipe_stat;
+    boolean has_pipeline_stat;
++   boolean has_indep_blend_enable;
+    boolean has_indep_blend_func;
+    boolean needs_rgb_dst_alpha_override;
+    boolean can_dither;
+-- 
+GitLab
+

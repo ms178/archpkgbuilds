@@ -1,0 +1,330 @@
+From ad2106c2f4f9df38a923e59a99302861ef8a2593 Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Thu, 13 Oct 2022 13:56:42 +0200
+Subject: [PATCH 1/2] aco: Merge "break" and "continue" block if "break" falls
+ through to empty "continue".
+
+Removes one branch and one s_mov.
+
+Foz-DB Navi21:
+Totals from 317 (0.23% of 134913) affected shaders:
+CodeSize: 2202372 -> 2196660 (-0.26%)
+Instrs: 406673 -> 405245 (-0.35%)
+Latency: 8290074 -> 8288341 (-0.02%); split: -0.03%, +0.01%
+InvThroughput: 8426508 -> 8428975 (+0.03%); split: -0.00%, +0.03%
+Copies: 38319 -> 37605 (-1.86%)
+Branches: 11439 -> 10725 (-6.24%)
+
+Signed-off-by: Georg Lehmann <dadschoorse@gmail.com>
+---
+ src/amd/compiler/aco_ssa_elimination.cpp | 129 +++++++++++++++++++++++
+ 1 file changed, 129 insertions(+)
+
+diff --git a/src/amd/compiler/aco_ssa_elimination.cpp b/src/amd/compiler/aco_ssa_elimination.cpp
+index 98a00b050c06..83a27bad867b 100644
+--- a/src/amd/compiler/aco_ssa_elimination.cpp
++++ b/src/amd/compiler/aco_ssa_elimination.cpp
+@@ -286,6 +286,12 @@ try_remove_simple_block(ssa_elimination_ctx& ctx, Block* block)
+    block->linear_succs.clear();
+ }
+ 
++bool
++is_simple_copy(Instruction* instr)
++{
++   return instr->opcode == aco_opcode::p_parallelcopy && instr->definitions.size() == 1;
++}
++
+ bool
+ instr_writes_exec(Instruction* instr)
+ {
+@@ -308,6 +314,126 @@ regs_intersect(const T& a, const U& b)
+    return a_hi > b_lo && b_hi > a_lo;
+ }
+ 
++void
++try_merge_break_with_continue(ssa_elimination_ctx& ctx, Block* block)
++{
++   /* Look for this:
++    * BB1:
++    *    ...
++    *    p_branch_z exec BB3, BB2
++    * BB2:
++    *    ...
++    *    s[0:1], scc = s_andn2 s[0:1], exec
++    *    p_branch_z scc BB4, BB3
++    * BB3:
++    *    exec = p_parallelcopy s[0:1]
++    *    p_branch BB1
++    * BB4:
++    *    ...
++    *
++    * And turn it into this:
++    * BB1:
++    *    ...
++    *    p_branch_z exec BB3, BB2
++    * BB2:
++    *    ...
++    *    p_branch BB3
++    * BB3:
++    *    s[0:1], scc, exec = s_andn2_wrexec s[0:1], exec
++    *    p_branch_nz scc BB1, BB4
++    * BB4:
++    *    ...
++    */
++   if (block->linear_succs.size() != 2 || block->instructions.size() < 2)
++      return;
++   if (ctx.program->gfx_level < GFX9)
++      return;
++
++   Pseudo_branch_instruction* branch = &block->instructions.back()->branch();
++   assert(branch->isBranch());
++   if (branch->operands[0].physReg() != scc || branch->opcode != aco_opcode::p_cbranch_z)
++      return;
++
++   Block* merge = &ctx.program->blocks[branch->target[1]];
++   Block* loopexit = &ctx.program->blocks[branch->target[0]];
++
++   /* Just a jump to the loop header. */
++   if (merge->linear_succs.size() != 1)
++      return;
++
++   /* We want to use the loopexit as the fallthrough block from merge,
++    * so there shouldn't be a block inbetween.
++    */
++   for (unsigned i = merge->index + 1; i < loopexit->index; i++) {
++      if (!ctx.program->blocks[i].instructions.empty())
++         return;
++   }
++
++   for (unsigned merge_pred : merge->linear_preds) {
++      Block* pred = &ctx.program->blocks[merge_pred];
++      if (pred == block)
++         continue;
++
++      Pseudo_branch_instruction& pred_branch = pred->instructions.back()->branch();
++      assert(pred_branch.isBranch());
++      /* The branch needs to be exec zero only, otherwise we corrupt exec. */
++      if (pred_branch.opcode != aco_opcode::p_cbranch_z ||
++          pred_branch.operands[0].physReg() != exec)
++         return;
++   }
++
++   /* merge block: copy to exec, logical_start, logical_end, branch */
++   if (merge->instructions.size() != 4 || !ctx.logical_phi_info[merge->index].empty() ||
++       !ctx.linear_phi_info[merge->index].empty())
++      return;
++
++   aco_ptr<Instruction>& execwrite = merge->instructions[0];
++   if (!is_simple_copy(execwrite.get()) || execwrite->definitions[0].physReg() != exec)
++      return;
++
++   const aco_opcode andn2 =
++      ctx.program->lane_mask == s2 ? aco_opcode::s_andn2_b64 : aco_opcode::s_andn2_b32;
++   const aco_opcode andn2_wrexec = ctx.program->lane_mask == s2 ? aco_opcode::s_andn2_wrexec_b64
++                                                                : aco_opcode::s_andn2_wrexec_b32;
++
++   aco_ptr<Instruction>& execsrc = block->instructions[block->instructions.size() - 2];
++   if (execsrc->opcode != andn2 ||
++       execsrc->definitions[0].physReg() != execwrite->operands[0].physReg() ||
++       execsrc->operands[0].physReg() != execwrite->operands[0].physReg() ||
++       execsrc->operands[1].physReg() != exec)
++      return;
++
++   for (const auto& successor_phi_info : ctx.linear_phi_info[block->index]) {
++      if (regs_intersect(successor_phi_info.op, execsrc->definitions[0]) ||
++          regs_intersect(successor_phi_info.def, Definition(exec, ctx.program->lane_mask)))
++         return;
++   }
++
++   execwrite.reset(create_instruction<SOP1_instruction>(andn2_wrexec, Format::SOP1, 2, 3));
++   execwrite->operands[0] = execsrc->operands[0];
++   execwrite->operands[1] = execsrc->operands[1];
++   execwrite->definitions[0] = execsrc->definitions[0];
++   execwrite->definitions[1] = execsrc->definitions[1];
++   execwrite->definitions[2] = Definition(exec, ctx.program->lane_mask);
++
++   branch->target[0] = merge->linear_succs[0];
++   branch->target[1] = loopexit->index;
++   branch->opcode = aco_opcode::p_cbranch_nz;
++
++   merge->instructions.back()->branch().target[0] = merge->index;
++   std::swap(merge->instructions.back(), block->instructions.back());
++   std::swap(merge->instructions.back()->definitions[0],
++             block->instructions.back()->definitions[0]);
++   std::swap(*(block->instructions.rbegin() + 1), block->instructions.back());
++   block->instructions.pop_back();
++
++   block->linear_succs = {merge->index};
++   merge->linear_succs = {loopexit->index, merge->linear_succs[0]};
++
++   std::replace(loopexit->linear_preds.begin(), loopexit->linear_preds.end(), block->index,
++                merge->index);
++}
++
+ void
+ try_optimize_branching_sequence(ssa_elimination_ctx& ctx, Block& block, const int exec_val_idx,
+                                 const int exec_copy_idx)
+@@ -662,6 +788,9 @@ jump_threading(ssa_elimination_ctx& ctx)
+       Block* block = &ctx.program->blocks[i];
+       eliminate_useless_exec_writes_in_block(ctx, *block);
+ 
++      if (block->kind & block_kind_break)
++         try_merge_break_with_continue(ctx, block);
++
+       if (!ctx.empty_blocks[i])
+          continue;
+ 
+-- 
+GitLab
+
+
+From a2d8647617470b645baab7efadbb51178aafb134 Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Fri, 14 Oct 2022 10:36:34 +0200
+Subject: [PATCH 2/2] aco: Move exec copy out of waterfall loops.
+
+Foz-DB Navi21:
+Totals from 73 (0.05% of 134913) affected shaders:
+Latency: 3392154 -> 3392180 (+0.00%); split: -0.00%, +0.01%
+InvThroughput: 7612872 -> 7612670 (-0.00%); split: -0.01%, +0.00%
+
+Signed-off-by: Georg Lehmann <dadschoorse@gmail.com>
+---
+ src/amd/compiler/aco_ssa_elimination.cpp | 114 +++++++++++++++++++++++
+ 1 file changed, 114 insertions(+)
+
+diff --git a/src/amd/compiler/aco_ssa_elimination.cpp b/src/amd/compiler/aco_ssa_elimination.cpp
+index 83a27bad867b..5ad9ea952584 100644
+--- a/src/amd/compiler/aco_ssa_elimination.cpp
++++ b/src/amd/compiler/aco_ssa_elimination.cpp
+@@ -434,6 +434,117 @@ try_merge_break_with_continue(ssa_elimination_ctx& ctx, Block* block)
+                 merge->index);
+ }
+ 
++void
++try_move_saveexec_out_of_loop(ssa_elimination_ctx& ctx, Block* block)
++{
++   /* This pattern can be created by try_optimize_branching_sequence:
++    * BB1: // loop-header
++    *    ... // nothing that clobbers s[0:1] or writes exec
++    *    s[0:1] = p_parallelcopy exec // we will move this
++    *    exec = v_cmpx_...
++    *    p_branch_z exec BB3, BB2
++    * BB2:
++    *    ...
++    *    p_branch BB3
++    * BB3:
++    *    s[0:1], scc, exec = s_andn2_wrexec ... // exec and s[0:1] contain the same mask
++    *    ... // nothing that clobbers s[0:1] or writes exec
++    *    p_branch_nz scc BB1, BB4
++    * BB4:
++    *    ...
++    *
++    * Instead of the s_andn2_wrexec we there can also be p_parallelcopy from s[0:1] to exec.
++    * Either way, we know that that exec copy in the loop header is only need in the first
++    * iteration, so it can be moved to the loop preheader.
++    */
++   if (block->linear_preds.size() != 2)
++      return;
++
++   Block* preheader = &ctx.program->blocks[block->linear_preds[0]];
++   Block* merge = &ctx.program->blocks[block->linear_preds[1]];
++
++   if (!(preheader->kind & block_kind_loop_preheader))
++      std::swap(preheader, merge);
++   assert(preheader->kind & block_kind_loop_preheader);
++
++   const RegClass lm = ctx.program->lane_mask;
++   const aco_opcode andn2_wrexec =
++      lm == s2 ? aco_opcode::s_andn2_wrexec_b64 : aco_opcode::s_andn2_wrexec_b32;
++
++   Operand exec_shadow;
++   for (aco_ptr<Instruction>& instr : merge->instructions) {
++      if (is_simple_copy(instr.get()) && instr->definitions[0].physReg() == exec &&
++          instr->definitions[0].regClass() == lm) {
++         exec_shadow = instr->operands[0];
++         continue;
++      }
++
++      if (instr->opcode == andn2_wrexec) {
++         exec_shadow = Operand(instr->definitions[0].physReg(), lm);
++         continue;
++      }
++
++      if (!exec_shadow.isUndefined()) {
++         for (const Definition& def : instr->definitions)
++            if (regs_intersect(exec_shadow, def))
++               return;
++
++         if (instr_writes_exec(instr.get()))
++            return;
++      }
++   }
++
++   if (exec_shadow.isUndefined())
++      return;
++
++   for (const auto& successor_phi_info : ctx.linear_phi_info[merge->index]) {
++      if (regs_intersect(successor_phi_info.def, exec_shadow) ||
++          regs_intersect(successor_phi_info.def, Definition(exec, lm)))
++         return;
++   }
++
++   for (const auto& successor_phi_info : ctx.linear_phi_info[preheader->index]) {
++      if (regs_intersect(successor_phi_info.def, exec_shadow) ||
++          regs_intersect(successor_phi_info.op, exec_shadow) ||
++          regs_intersect(successor_phi_info.def, Definition(exec, lm)))
++         return;
++   }
++
++   int saveexec_idx = -1;
++   for (unsigned i = 0; i < block->instructions.size(); i++) {
++      Instruction* instr = block->instructions[i].get();
++
++      if (is_simple_copy(instr) && instr->definitions[0].physReg() == exec_shadow.physReg() &&
++          instr->operands[0].physReg() == exec && instr->definitions[0].regClass() == lm) {
++         saveexec_idx = i;
++         break;
++      }
++
++      if (instr->opcode == aco_opcode::p_linear_phi)
++         continue;
++
++      for (const Operand& op : instr->operands)
++         if (regs_intersect(exec_shadow, op))
++            return;
++
++      for (const Definition& def : instr->definitions)
++         if (regs_intersect(exec_shadow, def))
++            return;
++
++      if (instr_writes_exec(instr))
++         return;
++   }
++
++   if (saveexec_idx < 0)
++      return;
++
++   /* Move outside of the loop. */
++   preheader->instructions.insert(
++      preheader->instructions.begin() + (preheader->instructions.size() - 1),
++      std::move(block->instructions[saveexec_idx]));
++   block->instructions.erase(block->instructions.begin() + saveexec_idx);
++}
++
+ void
+ try_optimize_branching_sequence(ssa_elimination_ctx& ctx, Block& block, const int exec_val_idx,
+                                 const int exec_copy_idx)
+@@ -791,6 +902,9 @@ jump_threading(ssa_elimination_ctx& ctx)
+       if (block->kind & block_kind_break)
+          try_merge_break_with_continue(ctx, block);
+ 
++      if (block->kind & block_kind_loop_header)
++         try_move_saveexec_out_of_loop(ctx, block);
++
+       if (!ctx.empty_blocks[i])
+          continue;
+ 
+-- 
+GitLab
+
