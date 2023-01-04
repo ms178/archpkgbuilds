@@ -7,7 +7,7 @@
 STAGE=
 
 ## File or binary you want to instrument and then bolt
-BINARY=libLLVM-14.so
+: ${BINARY:=libLLVM-14.so}
 
 ## PATH to the target
 BINARYPATH=/usr/lib
@@ -38,15 +38,9 @@ create_path() {
     mkdir -p ${BOLTBIN}
 }
 
-check_requirements() {
-    echo "Check if relocations are in the binary"
-    readelf -p .rela.text ${BINARYPATH}/${BINARY}
-    check_reloc=$(readelf -p .rela.text ${BINARYPATH}/${BINARY} | grep ".rela.text")
-}
-
 instrument() {
-    echo "Instrument binary with llvm-bolt"
 
+    echo "Instrument binary with llvm-bolt"
     LD_PRELOAD=/usr/lib/libjemalloc.so ${BOLTPATH}/llvm-bolt \
         --instrument \
         --instrumentation-file-append-pid \
@@ -61,6 +55,7 @@ instrument() {
 }
 
 merge_fdata() {
+
     echo "Merging generated profiles"
     LD_PRELOAD=/usr/lib/libjemalloc.so ${BOLTPATH}/merge-fdata ${FDATA}/${BINARY}*.fdata > ${BOLTBIN}/${BINARY}-combined.fdata || (echo "Could not merge fdate"; exit 1)
     ## Removing not needed bloated fdata
@@ -68,21 +63,24 @@ merge_fdata() {
 }
 
 optimize() {
+
     echo "Optimizing binary with generated profile"
     LD_PRELOAD=/usr/lib/libjemalloc.so ${BOLTPATH}/llvm-bolt ${BOLTBIN}/${BINARY}.org \
         --data ${BOLTBIN}/${BINARY}-combined.fdata \
         -o ${BOLTBIN}/${BINARY}.bolt \
-        -split-functions \
-        -split-all-cold \
-        -split-eh \
-        -dyno-stats \
-        -reorder-functions=hfsort+ \
-        -icp-eliminate-loads \
-        -reorder-blocks=ext-tsp \
-        -icf || (echo "Could not optimize the binary"; exit 1)
+        -reorder-blocks=ext-tsp
+        -reorder-functions=hfsort+
+        -split-functions
+        -split-all-cold
+        -split-eh
+        -dyno-stats
+        -icf=1
+        -use-gnu-stack
+        -plt=hot || (echo "Could not optimize the binary"; exit 1)
 }
 
 move_binary() {
+
     echo "You can find now your optimzed binary at ${BOLTBIN}"
     sudo rm -rf ${FDATA}/${BINARY}.fdata*
     sudo cp ${BOLTBIN}/${BINARY}.bolt ${BINARYPATH}/${BINARY}
@@ -131,22 +129,22 @@ build_llvm_bolt ()  {
 }
 
 ## Stage 1
-if [ ${STAGE} = 1 ]; then
+if [ "${STAGE}" = 1 ]; then
     build_llvm_bolt
 fi
 
 ## Stage 2
-if [ ${STAGE} = 2 ]; then
+if [ "${STAGE}" = 2 ]; then
     create_path
     instrument
 fi
 
 ## Stage 3
-if [ ${STAGE} = 3 ]; then
+if [ "${STAGE}" = 3 ]; then
     merge_fdata
 fi
 ## Stage 4
-if [ ${STAGE} = 4 ]; then
+if [ "${STAGE}" = 4 ]; then
     optimize
     move_binary
 fi
