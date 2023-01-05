@@ -1,0 +1,146 @@
+From 822ca2bccbfdab8c1cc81f29b9d94775b4451b60 Mon Sep 17 00:00:00 2001
+From: Triang3l <triang3l@yandex.ru>
+Date: Sat, 12 Nov 2022 21:31:06 +0300
+Subject: [PATCH] aco,nir: Handle more masked_swizzle_amd special cases
+
+GFX9 adds FFT and rotate swizzle modes, don't handle them like basic modes.
+
+Basic mode with bit 15 set treated as full data sharing within 4 threads.
+
+DPP quad permutation can be used with an AND mask within a quad now.
+
+Also, since SPIR-V SwizzleInvocationsMaskedAMD explicitly accepts 3
+constants containing the bit masks, thus only supporting the masked basic
+mode with 3 masks, don't allow invalid SPIR-V to produce any other modes.
+---
+ .../compiler/aco_instruction_selection.cpp    | 52 +++++++++++--------
+ src/compiler/nir/nir_print.c                  | 16 ++++--
+ src/compiler/spirv/vtn_amd.c                  | 14 ++---
+ 3 files changed, 49 insertions(+), 33 deletions(-)
+
+diff --git a/src/amd/compiler/aco_instruction_selection.cpp b/src/amd/compiler/aco_instruction_selection.cpp
+index 83a853742ef5..0d586f946e5c 100644
+--- a/src/amd/compiler/aco_instruction_selection.cpp
++++ b/src/amd/compiler/aco_instruction_selection.cpp
+@@ -236,31 +236,39 @@ static Temp
+ emit_masked_swizzle(isel_context* ctx, Builder& bld, Temp src, unsigned mask)
+ {
+    if (ctx->options->gfx_level >= GFX8) {
+-      unsigned and_mask = mask & 0x1f;
+-      unsigned or_mask = (mask >> 5) & 0x1f;
+-      unsigned xor_mask = (mask >> 10) & 0x1f;
+-
+       uint16_t dpp_ctrl = 0xffff;
+ 
+-      if (and_mask == 0x1f && or_mask < 4 && xor_mask < 4) {
+-         unsigned res[4] = {0, 1, 2, 3};
+-         for (unsigned i = 0; i < 4; i++)
+-            res[i] = ((res[i] | or_mask) ^ xor_mask) & 0x3;
+-         dpp_ctrl = dpp_quad_perm(res[0], res[1], res[2], res[3]);
+-      } else if (and_mask == 0x1f && !or_mask && xor_mask == 8) {
+-         dpp_ctrl = dpp_row_rr(8);
+-      } else if (and_mask == 0x1f && !or_mask && xor_mask == 0xf) {
+-         dpp_ctrl = dpp_row_mirror;
+-      } else if (and_mask == 0x1f && !or_mask && xor_mask == 0x7) {
+-         dpp_ctrl = dpp_row_half_mirror;
+-      } else if (ctx->options->gfx_level >= GFX10 && (and_mask & 0x18) == 0x18 && or_mask < 8 &&
+-                 xor_mask < 8) {
+-         // DPP8 comes last, as it does not allow several modifiers like `abs` that are available with DPP16
+-         Builder::Result ret = bld.vop1_dpp8(aco_opcode::v_mov_b32, bld.def(v1), src);
+-         for (unsigned i = 0; i < 8; i++) {
+-            ret.instr->dpp8().lane_sel[i] = (((i & and_mask) | or_mask) ^ xor_mask) & 0x7;
++      if (ctx->options->gfx_level < GFX9 || mask < 0xc000) {
++         if (mask & (1 << 15)) {
++            dpp_ctrl = dpp_quad_perm(mask & 3, (mask >> 2) & 3, (mask >> 4) & 3, (mask >> 6) & 3);
++         } else {
++            unsigned and_mask = mask & 0x1f;
++            unsigned or_mask = (mask >> 5) & 0x1f;
++            unsigned xor_mask = (mask >> 10) & 0x1f;
++
++            if ((and_mask & 0x1c) == 0x1c && or_mask < 4 && xor_mask < 4) {
++               unsigned res[4];
++               for (unsigned i = 0; i < 4; i++)
++                  res[i] = ((i & and_mask) | or_mask) ^ xor_mask;
++               dpp_ctrl = dpp_quad_perm(res[0], res[1], res[2], res[3]);
++            } else if (and_mask == 0x1f && !or_mask && xor_mask == 8) {
++               dpp_ctrl = dpp_row_rr(8);
++            } else if (and_mask == 0x1f && !or_mask && xor_mask == 0xf) {
++               dpp_ctrl = dpp_row_mirror;
++            } else if (and_mask == 0x1f && !or_mask && xor_mask == 0x7) {
++               dpp_ctrl = dpp_row_half_mirror;
++            } else if (ctx->options->gfx_level >= GFX10 && (and_mask & 0x18) == 0x18 &&
++                       or_mask < 8 && xor_mask < 8) {
++               /* DPP8 comes last, as it does not allow several modifiers like `abs` that are
++                * available with DPP16
++                */
++               Builder::Result ret = bld.vop1_dpp8(aco_opcode::v_mov_b32, bld.def(v1), src);
++               for (unsigned i = 0; i < 8; i++) {
++                  ret.instr->dpp8().lane_sel[i] = ((i & and_mask) | or_mask) ^ xor_mask;
++               }
++               return ret;
++            }
+          }
+-         return ret;
+       }
+ 
+       if (dpp_ctrl != 0xffff)
+diff --git a/src/compiler/nir/nir_print.c b/src/compiler/nir/nir_print.c
+index ace4467aab13..f1ad6d18899a 100644
+--- a/src/compiler/nir/nir_print.c
++++ b/src/compiler/nir/nir_print.c
+@@ -998,11 +998,19 @@ print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
+             for (unsigned i = 0; i < 4; i++)
+                fprintf(fp, "%d", (mask >> (i * 2) & 3));
+          } else if (instr->intrinsic == nir_intrinsic_masked_swizzle_amd) {
+-            fprintf(fp, "((id & %d) | %d) ^ %d", mask & 0x1F,
+-                                                (mask >> 5) & 0x1F,
+-                                                (mask >> 10) & 0x1F);
++            if (mask < 0xc000) {
++               if (mask & (1 << 15)) {
++                  for (unsigned i = 0; i < 4; i++)
++                     fprintf(fp, "%d", (mask >> (i * 2) & 3));
++               } else {
++                  fprintf(fp, "((id & %d) | %d) ^ %d", mask & 0x1F,
++                                                      (mask >> 5) & 0x1F,
++                                                      (mask >> 10) & 0x1F);
++               }
++            } else {
++               fprintf(fp, "0x%04x", mask);
++            }
+          } else {
+-            fprintf(fp, "%d", mask);
+          }
+          break;
+       }
+diff --git a/src/compiler/spirv/vtn_amd.c b/src/compiler/spirv/vtn_amd.c
+index 85df179d91c8..70ae8217b69e 100644
+--- a/src/compiler/spirv/vtn_amd.c
++++ b/src/compiler/spirv/vtn_amd.c
+@@ -89,17 +89,17 @@ vtn_handle_amd_shader_ballot_instruction(struct vtn_builder *b, SpvOp ext_opcode
+ 
+    if (intrin->intrinsic == nir_intrinsic_quad_swizzle_amd) {
+       struct vtn_value *val = vtn_value(b, w[6], vtn_value_type_constant);
+-      unsigned mask = val->constant->values[0].u32 |
+-                      val->constant->values[1].u32 << 2 |
+-                      val->constant->values[2].u32 << 4 |
+-                      val->constant->values[3].u32 << 6;
++      unsigned mask =  (val->constant->values[0].u32 & 3) |
++                      ((val->constant->values[1].u32 & 3) << 2) |
++                      ((val->constant->values[2].u32 & 3) << 4) |
++                      ((val->constant->values[3].u32 & 3) << 6);
+       nir_intrinsic_set_swizzle_mask(intrin, mask);
+ 
+    } else if (intrin->intrinsic == nir_intrinsic_masked_swizzle_amd) {
+       struct vtn_value *val = vtn_value(b, w[6], vtn_value_type_constant);
+-      unsigned mask = val->constant->values[0].u32 |
+-                      val->constant->values[1].u32 << 5 |
+-                      val->constant->values[2].u32 << 10;
++      unsigned mask =  (val->constant->values[0].u32 & 0x1f) |
++                      ((val->constant->values[1].u32 & 0x1f) << 5) |
++                      ((val->constant->values[2].u32 & 0x1f) << 10);
+       nir_intrinsic_set_swizzle_mask(intrin, mask);
+    } else if (intrin->intrinsic == nir_intrinsic_mbcnt_amd) {
+       /* The v_mbcnt instruction has an additional source that is added to the result.
+-- 
+GitLab
+
