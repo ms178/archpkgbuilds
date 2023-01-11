@@ -1,0 +1,118 @@
+From c3b6075b418c8838b6a630e87693a6bac6d4525b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Mon, 9 Jan 2023 22:50:48 +0100
+Subject: [PATCH 1/2] nir, radv: Add new shader compiler option
+ pack_half_2x16_only_inf_to_inf.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+NIR pack_half_2x16 is the GLSL PackHalf2x16.
+The spec does not specify neither a rounding mode for this opcode,
+nor its behaviour regarding infinity.
+
+When this is true, it indicates that the current backend will only
+return infinity from pack_half_2x16 when the input was infinity.
+
+This knowledge can be used to enable some algebraic optimizations.
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+---
+ src/amd/vulkan/radv_shader.c |  1 +
+ src/compiler/nir/nir.h       | 10 ++++++++++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index 3de836c5f713..923e643aa244 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -118,6 +118,7 @@ get_nir_options_for_stage(struct radv_physical_device *device, gl_shader_stage s
+                              nir_lower_iadd_sat64,
+       .lower_doubles_options = nir_lower_drcp | nir_lower_dsqrt | nir_lower_drsq | nir_lower_ddiv,
+       .divergence_analysis_options = nir_divergence_view_index_uniform,
++      .pack_half_2x16_only_inf_to_inf = true,
+    };
+ }
+ 
+diff --git a/src/compiler/nir/nir.h b/src/compiler/nir/nir.h
+index 736b20c261b3..da52e92e93a7 100644
+--- a/src/compiler/nir/nir.h
++++ b/src/compiler/nir/nir.h
+@@ -3669,6 +3669,16 @@ typedef struct nir_shader_compiler_options {
+    /** Backend supports 32bit ufind_msb_rev and ifind_msb_rev. */
+    bool has_find_msb_rev;
+ 
++   /**
++    * NIR pack_half_2x16 is the GLSL PackHalf2x16.
++    * The spec does not specify neither a rounding mode for this opcode,
++    * nor its behaviour regarding infinity.
++    *
++    * When this is true, it indicates that the current backend will only
++    * return infinity from pack_half_2x16 when the input was infinity.
++    */
++   bool pack_half_2x16_only_inf_to_inf;
++
+    /**
+     * Is this the Intel vec4 backend?
+     *
+-- 
+GitLab
+
+
+From ac2c205db44becd86e5f00fd1220cade834b2d6c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Sat, 9 Apr 2022 22:28:28 +0200
+Subject: [PATCH 2/2] nir: Add algebraic optimization for VKD3D-Proton
+ fp32->fp16 conversion.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This optimization is only valid if we know that the backend makes sure
+that PackHalf2x16 only returns infinity when the input is infinity.
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+---
+ src/compiler/nir/nir_opt_algebraic.py | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/src/compiler/nir/nir_opt_algebraic.py b/src/compiler/nir/nir_opt_algebraic.py
+index 079a522e7681..6c222bf0e33c 100644
+--- a/src/compiler/nir/nir_opt_algebraic.py
++++ b/src/compiler/nir/nir_opt_algebraic.py
+@@ -2475,6 +2475,32 @@ def bitfield_reverse_cp2077(u):
+ optimizations += [(bitfield_reverse_ue4('x@32'), ('bitfield_reverse', 'x'), '!options->lower_bitfield_reverse')]
+ optimizations += [(bitfield_reverse_cp2077('x@32'), ('bitfield_reverse', 'x'), '!options->lower_bitfield_reverse')]
+ 
++# VKD3D-Proton DXBC f32 to f16 conversion implements a float conversion using PackHalf2x16.
++# Because the spec does not specify a rounding mode or behaviour regarding infinity,
++# it emits a sequence to ensure D3D-like behaviour for infinity.
++# When we know the current backend already behaves like we need, we can eliminate the extra sequence.
++#
++# Input is f32, output is u32 that has the f16 packed into its low bits.
++def vkd3d_proton_packed_f2f16_rtz_lo(a):
++    packed_half = ('pack_half_2x16_split', a, 0)
++    packed_half_minus1 = ('iadd', packed_half, 0xffffffff)
++    f32_was_not_inf = ('ine', ('fabs', a), 0x7f800000)
++    f16_is_now_inf = ('ieq', ('iand', packed_half, 0x7fff), 0x7c00)
++    return ('bcsel', ('iand', f32_was_not_inf, f16_is_now_inf), packed_half_minus1, packed_half)
++
++# Same as the above, but with fneg.
++def vkd3d_proton_packed_f2f16_rtz_neg_lo(a):
++    packed_half = ('pack_half_2x16_split', ('fneg', a), 0)
++    packed_half_minus1 = ('iadd', packed_half, 0xffffffff)
++    f32_was_not_inf = ('ine', ('fabs', a), 0x7f800000)
++    f16_is_now_inf = ('ieq', ('iand', packed_half, 0x7fff), 0x7c00)
++    return ('bcsel', ('iand', f32_was_not_inf, f16_is_now_inf), packed_half_minus1, packed_half)
++
++optimizations += [
++   (vkd3d_proton_packed_f2f16_rtz_lo('x@32'), ('pack_half_2x16_split', 'x', 0), 'options->pack_half_2x16_only_inf_to_inf'),
++   (vkd3d_proton_packed_f2f16_rtz_neg_lo('x@32'), ('pack_half_2x16_split', ('fneg', 'x'), 0), 'options->pack_half_2x16_only_inf_to_inf'),
++]
++
+ # "all_equal(eq(a, b), vec(~0))" is the same as "all_equal(a, b)"
+ # "any_nequal(neq(a, b), vec(0))" is the same as "any_nequal(a, b)"
+ for ncomp in [2, 3, 4, 8, 16]:
+-- 
+GitLab
+
