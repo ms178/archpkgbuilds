@@ -2,7 +2,7 @@ This section contains several profiles for LLVM/Clang-15.0.7 which you can use t
 
 To demonstrate their use, I use Mesa in the following as an example and my home directory as the place where the profiles are located, adjust it to your needs. I currently use these flags in my '/etc/makepkg.conf' file and included the command for using the Mesa profile: 
 
-'''
+```
 export CC=clang
 export CXX=clang++
 export CC_LD=mold
@@ -24,11 +24,11 @@ export LDFLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -mllvm -extra-
 CCLDFLAGS="$LDFLAGS"
 CXXLDFLAGS="$LDFLAGS"
 export ASFLAGS="-D__AVX__=1 -D__AVX2__=1 -msse2avx -D__FMA__=1"
-'''
+```
 
 In general, my LLVM-PGO workflow for Mesa looks like this:
 
-1. Compile Mesa with '-fprofile-instr-generate=/home/marcus/Downloads/mesa-%p.profraw'
+1. Compile Mesa with -fprofile-instr-generate=/home/marcus/Downloads/mesa-%p.profraw
 2. Use the instrumented binary on common workloads (e.g. running game benchmarks, video, websurfing etc.) to collect the profile data.
-3. Merge the profraw files with 'llvm-profdata merge -output=mesa.profdata mesa-*.profraw'
-4. Compile the project again with '-fprofile-instr-use=/home/marcus/Downloads/mesa.profdata'
+3. Merge the profraw files with llvm-profdata merge -output=mesa.profdata mesa-*.profraw
+4. Compile the project again with -fprofile-instr-use=/home/marcus/Downloads/mesa.profdata
