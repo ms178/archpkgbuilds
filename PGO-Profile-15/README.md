@@ -1,4 +1,4 @@
-This section contains several profiles for LLVM/Clang-15.0.7 which you can use to squeeze more performance out of your system. Instrumentation was run on my hard- and software, so these might not be perfect for your needs. It is normal that you will get some warnings that a couple of functions do not match and could not be optimized.
+This section contains several profiles for LLVM/Clang-15.0.7 which you can use to squeeze more performance out of your system. Instrumentation was run on my hard- and software, so these might not be perfect for your needs. Especially the Mesa profile is only instrumented for my AMD Vega and might not help you if you are using a different GPU. It is normal that you will get some warnings that a couple of functions do not match and could not be optimized.
 
 To demonstrate their use, I use Mesa in the following as an example and my home directory as the place where the profiles are located, adjust it to your needs. I currently use these flags in my '/etc/makepkg.conf' file and included the command for using the Mesa profile: 
 
