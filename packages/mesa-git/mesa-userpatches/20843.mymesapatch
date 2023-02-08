@@ -1,0 +1,289 @@
+From d5b6a4854d364bc20be716bee320617fb0a78b9a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Sun, 22 Jan 2023 19:50:46 +0100
+Subject: [PATCH 1/2] aco/optimizer: Change v_cmp with subgroup invocation to
+ constant.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When a shader has a comparison with the subgroup invocation id,
+we can use a constant instead, saving a VALU instruction.
+When the constant can't be represented as a 64-bit literal,
+use the s_bfm_b64 instruction to generate it instead.
+
+Fossil DB stats on GFX11:
+Totals from 300 (0.22% of 134913) affected shaders:
+CodeSize: 2223052 -> 2214336 (-0.39%); split: -0.43%, +0.04%
+Instrs: 430216 -> 429882 (-0.08%); split: -0.14%, +0.06%
+Latency: 5881180 -> 5878181 (-0.05%); split: -0.05%, +0.00%
+InvThroughput: 731846 -> 729293 (-0.35%)
+Copies: 31662 -> 31847 (+0.58%); split: -0.03%, +0.61%
+Branches: 8241 -> 8100 (-1.71%)
+PreVGPRs: 15788 -> 15786 (-0.01%)
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+---
+ src/amd/compiler/aco_ir.cpp        |   7 ++
+ src/amd/compiler/aco_ir.h          |   1 +
+ src/amd/compiler/aco_optimizer.cpp | 103 +++++++++++++++++++++++++++++
+ 3 files changed, 111 insertions(+)
+
+diff --git a/src/amd/compiler/aco_ir.cpp b/src/amd/compiler/aco_ir.cpp
+index 34c9ea535c87..bb8a01136958 100644
+--- a/src/amd/compiler/aco_ir.cpp
++++ b/src/amd/compiler/aco_ir.cpp
+@@ -861,6 +861,13 @@ get_inverse(aco_opcode op)
+    return get_cmp_info(op, &info) ? info.inverse : aco_opcode::num_opcodes;
+ }
+ 
++aco_opcode
++get_swapped(aco_opcode op)
++{
++   CmpInfo info;
++   return get_cmp_info(op, &info) ? info.swapped : aco_opcode::num_opcodes;
++}
++
+ aco_opcode
+ get_f32_cmp(aco_opcode op)
+ {
+diff --git a/src/amd/compiler/aco_ir.h b/src/amd/compiler/aco_ir.h
+index baf64b04267c..f37bf04a1b9a 100644
+--- a/src/amd/compiler/aco_ir.h
++++ b/src/amd/compiler/aco_ir.h
+@@ -1883,6 +1883,7 @@ bool needs_exec_mask(const Instruction* instr);
+ aco_opcode get_ordered(aco_opcode op);
+ aco_opcode get_unordered(aco_opcode op);
+ aco_opcode get_inverse(aco_opcode op);
++aco_opcode get_swapped(aco_opcode op);
+ aco_opcode get_f32_cmp(aco_opcode op);
+ aco_opcode get_vcmpx(aco_opcode op);
+ unsigned get_cmp_bitsize(aco_opcode op);
+diff --git a/src/amd/compiler/aco_optimizer.cpp b/src/amd/compiler/aco_optimizer.cpp
+index f5fd82280268..7d710cce5596 100644
+--- a/src/amd/compiler/aco_optimizer.cpp
++++ b/src/amd/compiler/aco_optimizer.cpp
+@@ -123,6 +123,7 @@ enum Label {
+    label_f2f32 = 1ull << 37,
+    label_f2f16 = 1ull << 38,
+    label_split = 1ull << 39,
++   label_subgroup_invocation = 1ull << 40,
+ };
+ 
+ static constexpr uint64_t instr_usedef_labels =
+@@ -494,6 +495,14 @@ struct ssa_info {
+    }
+ 
+    bool is_split() { return label & label_split; }
++
++   void set_subgroup_invocation(Instruction* label_instr)
++   {
++      add_label(label_subgroup_invocation);
++      instr = label_instr;
++   }
++
++   bool is_subgroup_invocation() { return label & label_subgroup_invocation; }
+ };
+ 
+ struct opt_ctx {
+@@ -2108,6 +2117,26 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+       ctx.info[instr->definitions[0].tempId()].set_usedef(instr.get());
+       break;
+    }
++   case aco_opcode::v_mbcnt_lo_u32_b32: {
++      if (instr->operands[0].constantEquals(-1) && instr->operands[1].constantEquals(0)) {
++         if (ctx.program->wave_size == 32)
++            ctx.info[instr->definitions[0].tempId()].set_subgroup_invocation(instr.get());
++         else
++            ctx.info[instr->definitions[0].tempId()].set_usedef(instr.get());
++      }
++      break;
++   }
++   case aco_opcode::v_mbcnt_hi_u32_b32:
++   case aco_opcode::v_mbcnt_hi_u32_b32_e64: {
++      if (instr->operands[0].constantEquals(-1) && instr->operands[1].isTemp() &&
++          ctx.info[instr->operands[1].tempId()].is_usedef()) {
++         Instruction *usedef_instr = ctx.info[instr->operands[1].tempId()].instr;
++         if (usedef_instr->opcode == aco_opcode::v_mbcnt_lo_u32_b32 &&
++             usedef_instr->operands[0].constantEquals(-1) && usedef_instr->operands[1].constantEquals(0))
++            ctx.info[instr->definitions[0].tempId()].set_subgroup_invocation(instr.get());
++      }
++      break;
++   }
+    case aco_opcode::v_cvt_f16_f32: {
+       if (instr->operands[0].isTemp())
+          ctx.info[instr->operands[0].tempId()].set_f2f16(instr.get());
+@@ -2353,6 +2382,75 @@ combine_comparison_ordering(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+    return true;
+ }
+ 
++bool
++optimize_cmp_subgroup_invocation(opt_ctx& ctx, aco_ptr<Instruction>& instr)
++{
++   assert(instr->operands.size() == 2);
++
++   const int const_op_idx = instr->operands[0].isConstant() ? 0 : instr->operands[1].isConstant() ? 1 : -1;
++   if (const_op_idx == -1)
++      return false;
++
++   const int mbcnt_op_idx = 1 - const_op_idx;
++   const Operand mbcnt_op = instr->operands[mbcnt_op_idx];
++   if (!mbcnt_op.isTemp() || !ctx.info[mbcnt_op.tempId()].is_subgroup_invocation())
++      return false;
++
++   const unsigned wave_size = ctx.program->wave_size;
++   const unsigned val = instr->operands[const_op_idx].constantValue();
++   const aco_opcode op = const_op_idx == 0 ? get_swapped(instr->opcode) : instr->opcode;
++   unsigned first_bit = 0, num_bits = 0;
++
++   switch (op) {
++   case aco_opcode::v_cmp_eq_u32:
++   case aco_opcode::v_cmp_eq_i32:
++      first_bit = val;
++      num_bits = 1;
++      break;
++   case aco_opcode::v_cmp_le_u32:
++   case aco_opcode::v_cmp_le_i32:
++      first_bit = 0;
++      num_bits = val + 1;
++      break;
++   case aco_opcode::v_cmp_lt_u32:
++   case aco_opcode::v_cmp_lt_i32:
++      first_bit = 0;
++      num_bits = val;
++      break;
++   case aco_opcode::v_cmp_ge_u32:
++   case aco_opcode::v_cmp_ge_i32:
++      first_bit = val;
++      num_bits = wave_size - val;
++      break;
++   case aco_opcode::v_cmp_gt_u32:
++   case aco_opcode::v_cmp_gt_i32:
++      first_bit = val + 1;
++      num_bits = wave_size - val - 1;
++      break;
++   default:
++      unreachable("Unsupported opcode.");
++   }
++
++   Instruction *cpy = NULL;
++   const uint64_t mask = BITFIELD64_RANGE(first_bit, num_bits);
++   if (wave_size == 64 && mask > 0x7fffffff && mask != -1ull) {
++      /* Mask can't be represented as a 64-bit constant or literal, use s_bfm_b64. */
++      cpy = create_instruction<SOP2_instruction>(aco_opcode::s_bfm_b64, Format::SOP2, 2, 1);
++      cpy->operands[0] = Operand::c32(num_bits);
++      cpy->operands[1] = Operand::c32(first_bit);
++   } else {
++      /* Copy mask as a literal constant. */
++      cpy = create_instruction<Pseudo_instruction>(aco_opcode::p_parallelcopy, Format::PSEUDO, 1, 1);
++      cpy->operands[0] = wave_size == 32 ? Operand::c32((uint32_t)mask) : Operand::c64(mask);
++   }
++
++   ctx.uses[mbcnt_op.tempId()]--;
++   cpy->definitions[0] = instr->definitions[0];
++   instr.reset(cpy);
++
++   return true;
++}
++
+ bool
+ is_operand_constant(opt_ctx& ctx, Operand op, unsigned bit_size, uint64_t* value)
+ {
+@@ -4028,6 +4126,11 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+       apply_ds_extract(ctx, instr);
+    }
+ 
++   if (instr->isVOPC()) {
++      if (optimize_cmp_subgroup_invocation(ctx, instr))
++         return;
++   }
++
+    /* TODO: There are still some peephole optimizations that could be done:
+     * - abs(a - b) -> s_absdiff_i32
+     * - various patterns for s_bitcmp{0,1}_b32 and s_bitset{0,1}_b32
+-- 
+GitLab
+
+
+From 9d1324e44b9fbd29fc424cdad70ef7d2cdbb0db7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Mon, 23 Jan 2023 00:12:28 +0100
+Subject: [PATCH 2/2] aco: Propagate constant exec mask to pseudo branch
+ instructions.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fossil DB stats on GFX11:
+Totals from 59 (0.04% of 134913) affected shaders:
+CodeSize: 474168 -> 473116 (-0.22%); split: -0.22%, +0.00%
+Instrs: 93776 -> 93509 (-0.28%); split: -0.29%, +0.00%
+Latency: 1206267 -> 1206169 (-0.01%); split: -0.01%, +0.00%
+InvThroughput: 182223 -> 182222 (-0.00%); split: -0.00%, +0.00%
+Copies: 4967 -> 4823 (-2.90%)
+Branches: 1551 -> 1396 (-9.99%); split: -10.38%, +0.39%
+PreSGPRs: 2362 -> 2336 (-1.10%)
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+---
+ src/amd/compiler/aco_insert_exec_mask.cpp |  9 ++++++---
+ src/amd/compiler/aco_optimizer.cpp        | 13 +++++++++++++
+ 2 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/src/amd/compiler/aco_insert_exec_mask.cpp b/src/amd/compiler/aco_insert_exec_mask.cpp
+index 63560cb6d301..0e02af51f841 100644
+--- a/src/amd/compiler/aco_insert_exec_mask.cpp
++++ b/src/amd/compiler/aco_insert_exec_mask.cpp
+@@ -803,12 +803,15 @@ add_branch_code(exec_ctx& ctx, Block* block)
+       // orig = s_and_saveexec_b64
+       assert(block->linear_succs.size() == 2);
+       assert(block->instructions.back()->opcode == aco_opcode::p_cbranch_z);
+-      Temp cond = block->instructions.back()->operands[0].getTemp();
+-      nir_selection_control sel_ctrl = block->instructions.back()->branch().selection_control;
++      const Operand cond = block->instructions.back()->operands[0];
++      const nir_selection_control sel_ctrl =
++         (cond.isConstant() && cond.constantValue64() > 0)
++         ? nir_selection_control_divergent_always_taken
++         : block->instructions.back()->branch().selection_control;
+       block->instructions.pop_back();
+ 
+       uint8_t mask_type = ctx.info[idx].exec.back().second & (mask_type_wqm | mask_type_exact);
+-      if (ctx.info[idx].exec.back().first.constantEquals(-1u)) {
++      if (ctx.info[idx].exec.back().first.isConstant()) {
+          bld.copy(Definition(exec, bld.lm), cond);
+       } else {
+          Temp old_exec = bld.sop1(Builder::s_and_saveexec, bld.def(bld.lm), bld.def(s1, scc),
+diff --git a/src/amd/compiler/aco_optimizer.cpp b/src/amd/compiler/aco_optimizer.cpp
+index 7d710cce5596..b41a2c035646 100644
+--- a/src/amd/compiler/aco_optimizer.cpp
++++ b/src/amd/compiler/aco_optimizer.cpp
+@@ -2442,6 +2442,9 @@ optimize_cmp_subgroup_invocation(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+       /* Copy mask as a literal constant. */
+       cpy = create_instruction<Pseudo_instruction>(aco_opcode::p_parallelcopy, Format::PSEUDO, 1, 1);
+       cpy->operands[0] = wave_size == 32 ? Operand::c32((uint32_t)mask) : Operand::c64(mask);
++
++      /* Mark mask as constant so it can be propagated to p_cbranch later. */
++      ctx.info[instr->definitions[0].tempId()].set_constant(ctx.program->gfx_level, mask);
+    }
+ 
+    ctx.uses[mbcnt_op.tempId()]--;
+@@ -4757,6 +4760,16 @@ select_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+       instr->definitions[0].setFixed(scc);
+    }
+ 
++   if (instr->isBranch() && !instr->operands.empty() && instr->operands[0].isTemp() &&
++       (ctx.info[instr->operands[0].tempId()].is_constant_or_literal(32) ||
++        ctx.info[instr->operands[0].tempId()].is_constant_or_literal(ctx.program->wave_size))) {
++      uint32_t val = ctx.info[instr->operands[0].tempId()].val;
++      if (ctx.program->wave_size == 32)
++         instr->operands[0] = Operand::c32(val);
++      else
++         instr->operands[0] = Operand::c64(val);
++   }
++
+    /* check for literals */
+    if (!instr->isSALU() && !instr->isVALU())
+       return;
+-- 
+GitLab
+
