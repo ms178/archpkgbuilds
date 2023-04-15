@@ -1,0 +1,1363 @@
+From d09442ee2a8ecf6f26006ca5c75be3842a50d68f Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Thu, 2 Mar 2023 20:04:52 +0800
+Subject: [PATCH 01/12] nir: add nir_load_barycentric_optimize_amd intrinsic
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/compiler/nir/nir_divergence_analysis.c | 1 +
+ src/compiler/nir/nir_intrinsics.py         | 3 +++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/src/compiler/nir/nir_divergence_analysis.c b/src/compiler/nir/nir_divergence_analysis.c
+index 639432e67712..f40b672ae55a 100644
+--- a/src/compiler/nir/nir_divergence_analysis.c
++++ b/src/compiler/nir/nir_divergence_analysis.c
+@@ -208,6 +208,7 @@ visit_intrinsic(nir_shader *shader, nir_intrinsic_instr *instr)
+    case nir_intrinsic_load_alpha_reference_amd:
+    case nir_intrinsic_load_ssbo_uniform_block_intel:
+    case nir_intrinsic_load_shared_uniform_block_intel:
++   case nir_intrinsic_load_barycentric_optimize_amd:
+       is_divergent = false;
+       break;
+ 
+diff --git a/src/compiler/nir/nir_intrinsics.py b/src/compiler/nir/nir_intrinsics.py
+index 7474afb87a89..597a8032b97c 100644
+--- a/src/compiler/nir/nir_intrinsics.py
++++ b/src/compiler/nir/nir_intrinsics.py
+@@ -1600,6 +1600,9 @@ intrinsic("export_amd", [0], indices=[BASE, WRITE_MASK, FLAGS])
+ # Alpha test reference value
+ system_value("alpha_reference_amd", 1)
+ 
++# Whether to enable barycentric optimization
++system_value("barycentric_optimize_amd", dest_comp=1, bit_sizes=[1])
++
+ # V3D-specific instrinc for tile buffer color reads.
+ #
+ # The hardware requires that we read the samples and components of a pixel
+-- 
+GitLab
+
+
+From 28658e8d6ad9d41490b6411b717bc2074508720a Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Thu, 2 Mar 2023 20:05:40 +0800
+Subject: [PATCH 02/12] radeonsi: implement nir_load_barycentric_optimize_amd
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/gallium/drivers/radeonsi/si_nir_lower_abi.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/gallium/drivers/radeonsi/si_nir_lower_abi.c b/src/gallium/drivers/radeonsi/si_nir_lower_abi.c
+index 35d60c9d882a..095713075f4e 100644
+--- a/src/gallium/drivers/radeonsi/si_nir_lower_abi.c
++++ b/src/gallium/drivers/radeonsi/si_nir_lower_abi.c
+@@ -482,6 +482,12 @@ static bool lower_abi_instr(nir_builder *b, nir_instr *instr, struct lower_abi_s
+    case nir_intrinsic_load_alpha_reference_amd:
+       replacement = ac_nir_load_arg(b, &args->ac, args->alpha_reference);
+       break;
++   case nir_intrinsic_load_barycentric_optimize_amd: {
++      nir_ssa_def *prim_mask = ac_nir_load_arg(b, &args->ac, args->ac.prim_mask);
++      /* enabled when bit 31 is set */
++      replacement = nir_ilt(b, prim_mask, nir_imm_int(b, 0));
++      break;
++   }
+    default:
+       return false;
+    }
+-- 
+GitLab
+
+
+From bf6e4e5faac393efc0a816596117ac4203882347 Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Thu, 2 Mar 2023 20:08:14 +0800
+Subject: [PATCH 03/12] ac/nir/ps: lower barycentric load when bc_optimize
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/amd/common/ac_nir.h          |   3 +
+ src/amd/common/ac_nir_lower_ps.c | 131 ++++++++++++++++++++++++++++---
+ 2 files changed, 124 insertions(+), 10 deletions(-)
+
+diff --git a/src/amd/common/ac_nir.h b/src/amd/common/ac_nir.h
+index 60e42915a382..e6c729356a5a 100644
+--- a/src/amd/common/ac_nir.h
++++ b/src/amd/common/ac_nir.h
+@@ -304,6 +304,9 @@ typedef struct {
+    unsigned color_is_int8;
+    unsigned color_is_int10;
+ 
++   bool bc_optimize_for_persp;
++   bool bc_optimize_for_linear;
++
+    /* OpenGL only */
+    bool clamp_color;
+    bool alpha_to_one;
+diff --git a/src/amd/common/ac_nir_lower_ps.c b/src/amd/common/ac_nir_lower_ps.c
+index 53dbe486b11a..a056313286fb 100644
+--- a/src/amd/common/ac_nir_lower_ps.c
++++ b/src/amd/common/ac_nir_lower_ps.c
+@@ -29,6 +29,10 @@
+ typedef struct {
+    const ac_nir_lower_ps_options *options;
+ 
++   nir_variable *persp_centroid;
++   nir_variable *linear_centroid;
++   bool lower_load_barycentric;
++
+    /* Add one for dual source blend second output. */
+    nir_ssa_def *outputs[FRAG_RESULT_MAX + 1][4];
+    nir_alu_type output_types[FRAG_RESULT_MAX + 1];
+@@ -42,6 +46,100 @@ typedef struct {
+ 
+ #define DUAL_SRC_BLEND_SLOT FRAG_RESULT_MAX
+ 
++static void
++create_interp_param(nir_builder *b, lower_ps_state *s)
++{
++   if (s->options->bc_optimize_for_persp) {
++      s->persp_centroid =
++         nir_local_variable_create(b->impl, glsl_vec_type(2), "persp_centroid");
++   }
++
++   if (s->options->bc_optimize_for_linear) {
++      s->linear_centroid =
++         nir_local_variable_create(b->impl, glsl_vec_type(2), "linear_centroid");
++   }
++
++   s->lower_load_barycentric = s->persp_centroid || s->linear_centroid;
++}
++
++static void
++init_interp_param(nir_builder *b, lower_ps_state *s)
++{
++   b->cursor = nir_before_cf_list(&b->impl->body);
++
++   /* The shader should do: if (PRIM_MASK[31]) CENTROID = CENTER;
++    * The hw doesn't compute CENTROID if the whole wave only
++    * contains fully-covered quads.
++    */
++   if (s->options->bc_optimize_for_persp || s->options->bc_optimize_for_linear) {
++      nir_ssa_def *bc_optimize = nir_load_barycentric_optimize_amd(b);
++
++      if (s->options->bc_optimize_for_persp) {
++         nir_ssa_def *center =
++            nir_load_barycentric_pixel(b, 32, .interp_mode = INTERP_MODE_SMOOTH);
++         nir_ssa_def *centroid =
++            nir_load_barycentric_centroid(b, 32, .interp_mode = INTERP_MODE_SMOOTH);
++
++         nir_ssa_def *value = nir_bcsel(b, bc_optimize, center, centroid);
++         nir_store_var(b, s->persp_centroid, value, 0x3);
++      }
++
++      if (s->options->bc_optimize_for_linear) {
++         nir_ssa_def *center =
++            nir_load_barycentric_pixel(b, 32, .interp_mode = INTERP_MODE_NOPERSPECTIVE);
++         nir_ssa_def *centroid =
++            nir_load_barycentric_centroid(b, 32, .interp_mode = INTERP_MODE_NOPERSPECTIVE);
++
++         nir_ssa_def *value = nir_bcsel(b, bc_optimize, center, centroid);
++         nir_store_var(b, s->linear_centroid, value, 0x3);
++      }
++   }
++}
++
++static bool
++lower_ps_load_barycentric(nir_builder *b, nir_intrinsic_instr *intrin, lower_ps_state *s)
++{
++   enum glsl_interp_mode mode = nir_intrinsic_interp_mode(intrin);
++   nir_variable *var = NULL;
++
++   switch (mode) {
++   case INTERP_MODE_NONE:
++   case INTERP_MODE_SMOOTH:
++      switch (intrin->intrinsic) {
++      case nir_intrinsic_load_barycentric_centroid:
++         var = s->persp_centroid;
++         break;
++      default:
++         break;
++      }
++      break;
++
++   case INTERP_MODE_NOPERSPECTIVE:
++      switch (intrin->intrinsic) {
++      case nir_intrinsic_load_barycentric_centroid:
++         var = s->linear_centroid;
++         break;
++      default:
++         break;
++      }
++      break;
++
++   default:
++      break;
++   }
++
++   if (!var)
++      return false;
++
++   b->cursor = nir_before_instr(&intrin->instr);
++
++   nir_ssa_def *replacement = nir_load_var(b, var);
++   nir_ssa_def_rewrite_uses(&intrin->dest.ssa, replacement);
++
++   nir_instr_remove(&intrin->instr);
++   return true;
++}
++
+ static bool
+ gather_ps_store_output(nir_builder *b, nir_intrinsic_instr *intrin, lower_ps_state *s)
+ {
+@@ -80,8 +178,16 @@ lower_ps_intrinsic(nir_builder *b, nir_instr *instr, void *state)
+ 
+    nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+ 
+-   if (intrin->intrinsic == nir_intrinsic_store_output)
++   switch (intrin->intrinsic) {
++   case nir_intrinsic_store_output:
+       return gather_ps_store_output(b, intrin, s);
++   case nir_intrinsic_load_barycentric_centroid:
++      if (s->lower_load_barycentric)
++         return lower_ps_load_barycentric(b, intrin, s);
++      break;
++   default:
++      break;
++   }
+ 
+    return false;
+ }
+@@ -495,15 +601,9 @@ emit_ps_null_export(nir_builder *b, lower_ps_state *s)
+ }
+ 
+ static void
+-export_ps_outputs(nir_shader *nir, lower_ps_state *s)
++export_ps_outputs(nir_builder *b, lower_ps_state *s)
+ {
+-   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+-
+-   nir_builder builder;
+-   nir_builder *b = &builder;
+-   nir_builder_init(b, impl);
+-
+-   b->cursor = nir_after_cf_list(&impl->body);
++   b->cursor = nir_after_cf_list(&b->impl->body);
+ 
+    emit_ps_color_clamp_and_alpha_test(b, s);
+ 
+@@ -578,13 +678,24 @@ export_ps_outputs(nir_shader *nir, lower_ps_state *s)
+ void
+ ac_nir_lower_ps(nir_shader *nir, const ac_nir_lower_ps_options *options)
+ {
++   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
++
++   nir_builder builder;
++   nir_builder *b = &builder;
++   nir_builder_init(b, impl);
++
+    lower_ps_state state = {
+       .options = options,
+    };
+ 
++   create_interp_param(b, &state);
++
+    nir_shader_instructions_pass(nir, lower_ps_intrinsic,
+                                 nir_metadata_block_index | nir_metadata_dominance,
+                                 &state);
+ 
+-   export_ps_outputs(nir, &state);
++   /* Must be after lower_ps_intrinsic() to prevent it lower added intrinsic here. */
++   init_interp_param(b, &state);
++
++   export_ps_outputs(b, &state);
+ }
+-- 
+GitLab
+
+
+From e5bdfff0616b89ecb5daba5e58a50c6c28cab784 Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Thu, 2 Mar 2023 20:56:48 +0800
+Subject: [PATCH 04/12] ac/nir/ps: add force lower barycentric load options
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/amd/common/ac_nir.h          |  4 ++
+ src/amd/common/ac_nir_lower_ps.c | 78 ++++++++++++++++++++++++++++++--
+ 2 files changed, 79 insertions(+), 3 deletions(-)
+
+diff --git a/src/amd/common/ac_nir.h b/src/amd/common/ac_nir.h
+index e6c729356a5a..b2ec6bb16b1e 100644
+--- a/src/amd/common/ac_nir.h
++++ b/src/amd/common/ac_nir.h
+@@ -306,6 +306,10 @@ typedef struct {
+ 
+    bool bc_optimize_for_persp;
+    bool bc_optimize_for_linear;
++   bool force_persp_sample_interp;
++   bool force_linear_sample_interp;
++   bool force_persp_center_interp;
++   bool force_linear_center_interp;
+ 
+    /* OpenGL only */
+    bool clamp_color;
+diff --git a/src/amd/common/ac_nir_lower_ps.c b/src/amd/common/ac_nir_lower_ps.c
+index a056313286fb..014e0f463cf0 100644
+--- a/src/amd/common/ac_nir_lower_ps.c
++++ b/src/amd/common/ac_nir_lower_ps.c
+@@ -29,8 +29,12 @@
+ typedef struct {
+    const ac_nir_lower_ps_options *options;
+ 
++   nir_variable *persp_center;
+    nir_variable *persp_centroid;
++   nir_variable *persp_sample;
++   nir_variable *linear_center;
+    nir_variable *linear_centroid;
++   nir_variable *linear_sample;
+    bool lower_load_barycentric;
+ 
+    /* Add one for dual source blend second output. */
+@@ -49,17 +53,43 @@ typedef struct {
+ static void
+ create_interp_param(nir_builder *b, lower_ps_state *s)
+ {
+-   if (s->options->bc_optimize_for_persp) {
++   if (s->options->force_persp_sample_interp) {
++      s->persp_center =
++         nir_local_variable_create(b->impl, glsl_vec_type(2), "persp_center");
++   }
++
++   if (s->options->bc_optimize_for_persp ||
++       s->options->force_persp_sample_interp ||
++       s->options->force_persp_center_interp) {
+       s->persp_centroid =
+          nir_local_variable_create(b->impl, glsl_vec_type(2), "persp_centroid");
+    }
+ 
+-   if (s->options->bc_optimize_for_linear) {
++   if (s->options->force_persp_center_interp) {
++      s->persp_sample =
++         nir_local_variable_create(b->impl, glsl_vec_type(2), "persp_sample");
++   }
++
++   if (s->options->force_linear_sample_interp) {
++      s->linear_center =
++         nir_local_variable_create(b->impl, glsl_vec_type(2), "linear_center");
++   }
++
++   if (s->options->bc_optimize_for_linear ||
++       s->options->force_linear_sample_interp ||
++       s->options->force_linear_center_interp) {
+       s->linear_centroid =
+          nir_local_variable_create(b->impl, glsl_vec_type(2), "linear_centroid");
+    }
+ 
+-   s->lower_load_barycentric = s->persp_centroid || s->linear_centroid;
++   if (s->options->force_linear_center_interp) {
++      s->linear_sample =
++         nir_local_variable_create(b->impl, glsl_vec_type(2), "linear_sample");
++   }
++
++   s->lower_load_barycentric =
++      s->persp_center || s->persp_centroid || s->persp_sample ||
++      s->linear_center || s->linear_centroid || s->linear_sample;
+ }
+ 
+ static void
+@@ -94,6 +124,34 @@ init_interp_param(nir_builder *b, lower_ps_state *s)
+          nir_store_var(b, s->linear_centroid, value, 0x3);
+       }
+    }
++
++   if (s->options->force_persp_sample_interp) {
++      nir_ssa_def *sample =
++         nir_load_barycentric_sample(b, 32, .interp_mode = INTERP_MODE_SMOOTH);
++      nir_store_var(b, s->persp_center, sample, 0x3);
++      nir_store_var(b, s->persp_centroid, sample, 0x3);
++   }
++
++   if (s->options->force_linear_sample_interp) {
++      nir_ssa_def *sample =
++         nir_load_barycentric_sample(b, 32, .interp_mode = INTERP_MODE_NOPERSPECTIVE);
++      nir_store_var(b, s->linear_center, sample, 0x3);
++      nir_store_var(b, s->linear_centroid, sample, 0x3);
++   }
++
++   if (s->options->force_persp_center_interp) {
++      nir_ssa_def *center =
++         nir_load_barycentric_pixel(b, 32, .interp_mode = INTERP_MODE_SMOOTH);
++      nir_store_var(b, s->persp_sample, center, 0x3);
++      nir_store_var(b, s->persp_centroid, center, 0x3);
++   }
++
++   if (s->options->force_linear_center_interp) {
++      nir_ssa_def *center =
++         nir_load_barycentric_pixel(b, 32, .interp_mode = INTERP_MODE_NOPERSPECTIVE);
++      nir_store_var(b, s->linear_sample, center, 0x3);
++      nir_store_var(b, s->linear_centroid, center, 0x3);
++   }
+ }
+ 
+ static bool
+@@ -106,9 +164,15 @@ lower_ps_load_barycentric(nir_builder *b, nir_intrinsic_instr *intrin, lower_ps_
+    case INTERP_MODE_NONE:
+    case INTERP_MODE_SMOOTH:
+       switch (intrin->intrinsic) {
++      case nir_intrinsic_load_barycentric_pixel:
++         var = s->persp_center;
++         break;
+       case nir_intrinsic_load_barycentric_centroid:
+          var = s->persp_centroid;
+          break;
++      case nir_intrinsic_load_barycentric_sample:
++         var = s->persp_sample;
++         break;
+       default:
+          break;
+       }
+@@ -116,9 +180,15 @@ lower_ps_load_barycentric(nir_builder *b, nir_intrinsic_instr *intrin, lower_ps_
+ 
+    case INTERP_MODE_NOPERSPECTIVE:
+       switch (intrin->intrinsic) {
++      case nir_intrinsic_load_barycentric_pixel:
++         var = s->linear_center;
++         break;
+       case nir_intrinsic_load_barycentric_centroid:
+          var = s->linear_centroid;
+          break;
++      case nir_intrinsic_load_barycentric_sample:
++         var = s->linear_sample;
++         break;
+       default:
+          break;
+       }
+@@ -181,7 +251,9 @@ lower_ps_intrinsic(nir_builder *b, nir_instr *instr, void *state)
+    switch (intrin->intrinsic) {
+    case nir_intrinsic_store_output:
+       return gather_ps_store_output(b, intrin, s);
++   case nir_intrinsic_load_barycentric_pixel:
+    case nir_intrinsic_load_barycentric_centroid:
++   case nir_intrinsic_load_barycentric_sample:
+       if (s->lower_load_barycentric)
+          return lower_ps_load_barycentric(b, intrin, s);
+       break;
+-- 
+GitLab
+
+
+From fc9fddb0dff8f3325caa25e0edbb8903889a9d21 Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Thu, 2 Mar 2023 21:23:44 +0800
+Subject: [PATCH 05/12] ac/nir/ps: lower sample mask input when needed
+
+Ported from si_llvm_build_ps_prolog().
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/amd/common/ac_nir.h          |  1 +
+ src/amd/common/ac_nir_lower_ps.c | 48 ++++++++++++++++++++++++++++++++
+ 2 files changed, 49 insertions(+)
+
+diff --git a/src/amd/common/ac_nir.h b/src/amd/common/ac_nir.h
+index b2ec6bb16b1e..07eb9f24f890 100644
+--- a/src/amd/common/ac_nir.h
++++ b/src/amd/common/ac_nir.h
+@@ -310,6 +310,7 @@ typedef struct {
+    bool force_linear_sample_interp;
+    bool force_persp_center_interp;
+    bool force_linear_center_interp;
++   unsigned samplemask_log_ps_iter;
+ 
+    /* OpenGL only */
+    bool clamp_color;
+diff --git a/src/amd/common/ac_nir_lower_ps.c b/src/amd/common/ac_nir_lower_ps.c
+index 014e0f463cf0..ab9d07b3a792 100644
+--- a/src/amd/common/ac_nir_lower_ps.c
++++ b/src/amd/common/ac_nir_lower_ps.c
+@@ -238,6 +238,50 @@ gather_ps_store_output(nir_builder *b, nir_intrinsic_instr *intrin, lower_ps_sta
+    return true;
+ }
+ 
++static bool
++lower_ps_load_sample_mask_in(nir_builder *b, nir_intrinsic_instr *intrin, lower_ps_state *s)
++{
++   /* Section 15.2.2 (Shader Inputs) of the OpenGL 4.5 (Core Profile) spec
++    * says:
++    *
++    *    "When per-sample shading is active due to the use of a fragment
++    *     input qualified by sample or due to the use of the gl_SampleID
++    *     or gl_SamplePosition variables, only the bit for the current
++    *     sample is set in gl_SampleMaskIn. When state specifies multiple
++    *     fragment shader invocations for a given fragment, the sample
++    *     mask for any single fragment shader invocation may specify a
++    *     subset of the covered samples for the fragment. In this case,
++    *     the bit corresponding to each covered sample will be set in
++    *     exactly one fragment shader invocation."
++    *
++    * The samplemask loaded by hardware is always the coverage of the
++    * entire pixel/fragment, so mask bits out based on the sample ID.
++    */
++
++   b->cursor = nir_before_instr(&intrin->instr);
++
++   /* The bit pattern matches that used by fixed function fragment
++    * processing.
++    */
++   static const uint16_t ps_iter_masks[] = {
++      0xffff, /* not used */
++      0x5555, 0x1111, 0x0101, 0x0001,
++   };
++   assert(s->options->samplemask_log_ps_iter < ARRAY_SIZE(ps_iter_masks));
++   uint32_t ps_iter_mask = ps_iter_masks[s->options->samplemask_log_ps_iter];
++
++   nir_ssa_def *sampleid = nir_load_sample_id(b);
++   nir_ssa_def *submask = nir_ishl(b, nir_imm_int(b, ps_iter_mask), sampleid);
++
++   nir_ssa_def *sample_mask = nir_load_sample_mask_in(b);
++   nir_ssa_def *replacement = nir_iand(b, sample_mask, submask);
++
++   nir_ssa_def_rewrite_uses(&intrin->dest.ssa, replacement);
++
++   nir_instr_remove(&intrin->instr);
++   return true;
++}
++
+ static bool
+ lower_ps_intrinsic(nir_builder *b, nir_instr *instr, void *state)
+ {
+@@ -257,6 +301,10 @@ lower_ps_intrinsic(nir_builder *b, nir_instr *instr, void *state)
+       if (s->lower_load_barycentric)
+          return lower_ps_load_barycentric(b, intrin, s);
+       break;
++   case nir_intrinsic_load_sample_mask_in:
++      if (s->options->samplemask_log_ps_iter)
++         return lower_ps_load_sample_mask_in(b, intrin, s);
++      break;
+    default:
+       break;
+    }
+-- 
+GitLab
+
+
+From 112eb2c3bb069665f9e05130c90ebc181936b137 Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Thu, 13 Apr 2023 10:43:48 +0800
+Subject: [PATCH 06/12] ac/llvm,radeonsi: lower ps color load in nir
+
+Remove the color0/1 in ac_shader_abi which is used by
+radeonsi only.
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/amd/llvm/ac_nir_to_llvm.c                 |  6 -----
+ src/amd/llvm/ac_shader_abi.h                  |  1 -
+ .../drivers/radeonsi/si_nir_lower_abi.c       | 23 ++++++++++++++++
+ src/gallium/drivers/radeonsi/si_shader.c      |  2 +-
+ .../drivers/radeonsi/si_shader_internal.h     |  1 +
+ src/gallium/drivers/radeonsi/si_shader_llvm.c | 26 -------------------
+ 6 files changed, 25 insertions(+), 34 deletions(-)
+
+diff --git a/src/amd/llvm/ac_nir_to_llvm.c b/src/amd/llvm/ac_nir_to_llvm.c
+index e7db71522ed1..37c4424977fc 100644
+--- a/src/amd/llvm/ac_nir_to_llvm.c
++++ b/src/amd/llvm/ac_nir_to_llvm.c
+@@ -3544,12 +3544,6 @@ static bool visit_intrinsic(struct ac_nir_context *ctx, nir_intrinsic_instr *ins
+    case nir_intrinsic_is_helper_invocation:
+       result = ac_build_is_helper_invocation(&ctx->ac);
+       break;
+-   case nir_intrinsic_load_color0:
+-      result = ctx->abi->color0;
+-      break;
+-   case nir_intrinsic_load_color1:
+-      result = ctx->abi->color1;
+-      break;
+    case nir_intrinsic_load_user_data_amd:
+       assert(LLVMTypeOf(ctx->abi->user_data) == ctx->ac.v4i32);
+       result = ctx->abi->user_data;
+diff --git a/src/amd/llvm/ac_shader_abi.h b/src/amd/llvm/ac_shader_abi.h
+index 5a9494c094c3..b1dd01db51d9 100644
+--- a/src/amd/llvm/ac_shader_abi.h
++++ b/src/amd/llvm/ac_shader_abi.h
+@@ -47,7 +47,6 @@ struct ac_shader_abi {
+    LLVMValueRef vs_rel_patch_id;
+    LLVMValueRef instance_id;
+    LLVMValueRef persp_centroid, linear_centroid;
+-   LLVMValueRef color0, color1;
+    LLVMValueRef user_data;
+ 
+    /* replaced registers when culling enabled */
+diff --git a/src/gallium/drivers/radeonsi/si_nir_lower_abi.c b/src/gallium/drivers/radeonsi/si_nir_lower_abi.c
+index 095713075f4e..473f035dc71f 100644
+--- a/src/gallium/drivers/radeonsi/si_nir_lower_abi.c
++++ b/src/gallium/drivers/radeonsi/si_nir_lower_abi.c
+@@ -488,6 +488,29 @@ static bool lower_abi_instr(nir_builder *b, nir_instr *instr, struct lower_abi_s
+       replacement = nir_ilt(b, prim_mask, nir_imm_int(b, 0));
+       break;
+    }
++   case nir_intrinsic_load_color0:
++   case nir_intrinsic_load_color1: {
++      uint32_t colors_read = sel->info.colors_read;
++
++      int start, offset;
++      if (intrin->intrinsic == nir_intrinsic_load_color0) {
++         start = 0;
++         offset = 0;
++      } else {
++         start = 4;
++         offset = util_bitcount(colors_read & 0xf);
++      }
++
++      nir_ssa_def *color[4];
++      for (int i = 0; i < 4; i++) {
++         color[i] = colors_read & BITFIELD_BIT(start + i) ?
++            ac_nir_load_arg_at_offset(b, &args->ac, args->color_start, offset++) :
++            nir_ssa_undef(b, 1, 32);
++      }
++
++      replacement = nir_vec(b, color, 4);
++      break;
++   }
+    default:
+       return false;
+    }
+diff --git a/src/gallium/drivers/radeonsi/si_shader.c b/src/gallium/drivers/radeonsi/si_shader.c
+index 61de41fb42ca..0b5524600c20 100644
+--- a/src/gallium/drivers/radeonsi/si_shader.c
++++ b/src/gallium/drivers/radeonsi/si_shader.c
+@@ -706,7 +706,7 @@ void si_init_shader_args(struct si_shader *shader, struct si_shader_args *args)
+          unsigned num_color_elements = util_bitcount(shader->selector->info.colors_read);
+ 
+          for (i = 0; i < num_color_elements; i++)
+-            ac_add_arg(&args->ac, AC_ARG_VGPR, 1, AC_ARG_FLOAT, NULL);
++            ac_add_arg(&args->ac, AC_ARG_VGPR, 1, AC_ARG_FLOAT, i ? NULL : &args->color_start);
+ 
+          num_prolog_vgprs += num_color_elements;
+       }
+diff --git a/src/gallium/drivers/radeonsi/si_shader_internal.h b/src/gallium/drivers/radeonsi/si_shader_internal.h
+index de1bc793dc22..a9dd6a3af507 100644
+--- a/src/gallium/drivers/radeonsi/si_shader_internal.h
++++ b/src/gallium/drivers/radeonsi/si_shader_internal.h
+@@ -82,6 +82,7 @@ struct si_shader_args {
+    /* PS */
+    struct ac_arg pos_fixed_pt;
+    struct ac_arg alpha_reference;
++   struct ac_arg color_start;
+    /* CS */
+    struct ac_arg block_size;
+    struct ac_arg cs_user_data;
+diff --git a/src/gallium/drivers/radeonsi/si_shader_llvm.c b/src/gallium/drivers/radeonsi/si_shader_llvm.c
+index 68b3fd09edb1..a9dc7ef5985a 100644
+--- a/src/gallium/drivers/radeonsi/si_shader_llvm.c
++++ b/src/gallium/drivers/radeonsi/si_shader_llvm.c
+@@ -832,32 +832,6 @@ static bool si_llvm_translate_nir(struct si_shader_context *ctx, struct si_shade
+       break;
+ 
+    case MESA_SHADER_FRAGMENT: {
+-      unsigned colors_read = ctx->shader->selector->info.colors_read;
+-      LLVMValueRef main_fn = ctx->main_fn.value;
+-
+-      LLVMValueRef undef = LLVMGetUndef(ctx->ac.f32);
+-
+-      unsigned offset = SI_PARAM_POS_FIXED_PT + 1;
+-
+-      if (colors_read & 0x0f) {
+-         unsigned mask = colors_read & 0x0f;
+-         LLVMValueRef values[4];
+-         values[0] = mask & 0x1 ? LLVMGetParam(main_fn, offset++) : undef;
+-         values[1] = mask & 0x2 ? LLVMGetParam(main_fn, offset++) : undef;
+-         values[2] = mask & 0x4 ? LLVMGetParam(main_fn, offset++) : undef;
+-         values[3] = mask & 0x8 ? LLVMGetParam(main_fn, offset++) : undef;
+-         ctx->abi.color0 = ac_to_integer(&ctx->ac, ac_build_gather_values(&ctx->ac, values, 4));
+-      }
+-      if (colors_read & 0xf0) {
+-         unsigned mask = (colors_read & 0xf0) >> 4;
+-         LLVMValueRef values[4];
+-         values[0] = mask & 0x1 ? LLVMGetParam(main_fn, offset++) : undef;
+-         values[1] = mask & 0x2 ? LLVMGetParam(main_fn, offset++) : undef;
+-         values[2] = mask & 0x4 ? LLVMGetParam(main_fn, offset++) : undef;
+-         values[3] = mask & 0x8 ? LLVMGetParam(main_fn, offset++) : undef;
+-         ctx->abi.color1 = ac_to_integer(&ctx->ac, ac_build_gather_values(&ctx->ac, values, 4));
+-      }
+-
+       ctx->abi.num_interp = si_get_ps_num_interp(shader);
+ 
+       ctx->abi.kill_ps_if_inf_interp =
+-- 
+GitLab
+
+
+From e4e535af9c5dc9058f65b660c17f45bb3b1befb4 Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Fri, 3 Mar 2023 11:16:55 +0800
+Subject: [PATCH 07/12] radeonsi: add si_nir_lower_ps_color_input
+
+For lowering legacy color inputs in PS.
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/gallium/drivers/radeonsi/si_shader.c | 106 +++++++++++++++++++++++
+ 1 file changed, 106 insertions(+)
+
+diff --git a/src/gallium/drivers/radeonsi/si_shader.c b/src/gallium/drivers/radeonsi/si_shader.c
+index 0b5524600c20..d538900eca24 100644
+--- a/src/gallium/drivers/radeonsi/si_shader.c
++++ b/src/gallium/drivers/radeonsi/si_shader.c
+@@ -1837,6 +1837,112 @@ static unsigned si_get_nr_pos_exports(const struct si_shader_selector *sel,
+    return nr_pos_exports;
+ }
+ 
++static bool lower_ps_load_color_intrinsic(nir_builder *b, nir_instr *instr, void *state)
++{
++   nir_ssa_def **colors = (nir_ssa_def **)state;
++
++   if (instr->type != nir_instr_type_intrinsic)
++      return false;
++
++   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
++
++   if (intrin->intrinsic != nir_intrinsic_load_color0 &&
++       intrin->intrinsic != nir_intrinsic_load_color1)
++      return false;
++
++   unsigned index = intrin->intrinsic == nir_intrinsic_load_color0 ? 0 : 1;
++   assert(colors[index]);
++
++   nir_ssa_def_rewrite_uses(&intrin->dest.ssa, colors[index]);
++
++   nir_instr_remove(&intrin->instr);
++   return true;
++}
++
++static void si_nir_lower_ps_color_input(nir_shader *nir, struct si_shader *shader)
++{
++   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
++
++   nir_builder builder;
++   nir_builder *b = &builder;
++   nir_builder_init(b, impl);
++
++   b->cursor = nir_before_cf_list(&impl->body);
++
++   const struct si_shader_selector *sel = shader->selector;
++   const union si_shader_key *key = &shader->key;
++
++   /* Build ready to be used colors at the beginning of the shader. */
++   nir_ssa_def *colors[2] = {0};
++   for (int i = 0; i < 2; i++) {
++      if (!(sel->info.colors_read & (0xf << (i * 4))))
++         continue;
++
++      unsigned color_base = sel->info.color_attr_index[i];
++      /* If BCOLOR0 is used, BCOLOR1 is at offset "num_inputs + 1",
++       * otherwise it's at offset "num_inputs".
++       */
++      unsigned back_color_base = sel->info.num_inputs;
++      if (i == 1 && (sel->info.colors_read & 0xf))
++         back_color_base += 1;
++
++      enum glsl_interp_mode interp_mode = sel->info.color_interpolate[i];
++      if (interp_mode == INTERP_MODE_COLOR) {
++         interp_mode = key->ps.part.prolog.flatshade_colors ?
++            INTERP_MODE_FLAT : INTERP_MODE_SMOOTH;
++      }
++
++      nir_ssa_def *back_color = NULL;
++      if (interp_mode == INTERP_MODE_FLAT) {
++         colors[i] = nir_load_input(b, 4, 32, nir_imm_int(b, 0),
++                                   .base = color_base);
++
++         if (key->ps.part.prolog.color_two_side) {
++            back_color = nir_load_input(b, 4, 32, nir_imm_int(b, 0),
++                                        .base = back_color_base);
++         }
++      } else {
++         nir_intrinsic_op op = 0;
++         switch (sel->info.color_interpolate_loc[i]) {
++         case TGSI_INTERPOLATE_LOC_CENTER:
++            op = nir_intrinsic_load_barycentric_pixel;
++            break;
++         case TGSI_INTERPOLATE_LOC_CENTROID:
++            op = nir_intrinsic_load_barycentric_centroid;
++            break;
++         case TGSI_INTERPOLATE_LOC_SAMPLE:
++            op = nir_intrinsic_load_barycentric_sample;
++            break;
++         default:
++            unreachable("invalid color interpolate location");
++            break;
++         }
++
++         nir_ssa_def *barycentric = nir_load_barycentric(b, op, interp_mode);
++
++         colors[i] =
++            nir_load_interpolated_input(b, 4, 32, barycentric, nir_imm_int(b, 0),
++                                        .base = color_base);
++
++         if (key->ps.part.prolog.color_two_side) {
++            back_color =
++               nir_load_interpolated_input(b, 4, 32, barycentric, nir_imm_int(b, 0),
++                                           .base = back_color_base);
++         }
++      }
++
++      if (back_color) {
++         nir_ssa_def *is_front_face = nir_load_front_face(b, 1);
++         colors[i] = nir_bcsel(b, is_front_face, colors[i], back_color);
++      }
++   }
++
++   /* lower nir_load_color0/1 to use the color value. */
++   nir_shader_instructions_pass(nir, lower_ps_load_color_intrinsic,
++                                nir_metadata_block_index | nir_metadata_dominance,
++                                colors);
++}
++
+ struct nir_shader *si_get_nir_shader(struct si_shader *shader,
+                                      struct si_shader_args *args,
+                                      bool *free_nir,
+-- 
+GitLab
+
+
+From ee605dc84948a63a83387bf9f9c10a1c2a57d812 Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Fri, 3 Mar 2023 12:06:16 +0800
+Subject: [PATCH 08/12] radeonsi: add si_nir_emit_polygon_stipple
+
+Ported from si_llvm_emit_polygon_stipple().
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/gallium/drivers/radeonsi/si_shader.c | 31 ++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/src/gallium/drivers/radeonsi/si_shader.c b/src/gallium/drivers/radeonsi/si_shader.c
+index d538900eca24..67e98f9bfa4b 100644
+--- a/src/gallium/drivers/radeonsi/si_shader.c
++++ b/src/gallium/drivers/radeonsi/si_shader.c
+@@ -1943,6 +1943,37 @@ static void si_nir_lower_ps_color_input(nir_shader *nir, struct si_shader *shade
+                                 colors);
+ }
+ 
++static void si_nir_emit_polygon_stipple(nir_shader *nir, struct si_shader_args *args)
++{
++   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
++
++   nir_builder builder;
++   nir_builder *b = &builder;
++   nir_builder_init(b, impl);
++
++   b->cursor = nir_before_cf_list(&impl->body);
++
++   /* Load the buffer descriptor. */
++   nir_ssa_def *desc =
++      si_nir_load_internal_binding(b, args, SI_PS_CONST_POLY_STIPPLE, 4);
++
++   /* Use the fixed-point gl_FragCoord input.
++    * Since the stipple pattern is 32x32 and it repeats, just get 5 bits
++    * per coordinate to get the repeating effect.
++    */
++   nir_ssa_def *pos_x = ac_nir_unpack_arg(b, &args->ac, args->pos_fixed_pt, 0, 5);
++   nir_ssa_def *pos_y = ac_nir_unpack_arg(b, &args->ac, args->pos_fixed_pt, 16, 5);
++
++   nir_ssa_def *zero = nir_imm_int(b, 0);
++   /* The stipple pattern is 32x32, each row has 32 bits. */
++   nir_ssa_def *offset = nir_ishl_imm(b, pos_y, 2);
++   nir_ssa_def *row = nir_load_buffer_amd(b, 1, 32, desc, offset, zero, zero);
++   nir_ssa_def *bit = nir_ubfe(b, row, pos_x, nir_imm_int(b, 1));
++
++   nir_ssa_def *pass = nir_i2b(b, bit);
++   nir_discard_if(b, nir_inot(b, pass));
++}
++
+ struct nir_shader *si_get_nir_shader(struct si_shader *shader,
+                                      struct si_shader_args *args,
+                                      bool *free_nir,
+-- 
+GitLab
+
+
+From 1a25b361034594394749c3071ae366785e9c0315 Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Fri, 3 Mar 2023 19:33:42 +0800
+Subject: [PATCH 09/12] radeonsi: handle lowered ps in scan_io_usage
+
+si_update_shader_binary_info() will call into this function
+to collect memory usage info after shader has been lowered
+finally. To avoid assertion failure in nir_instr_as_intrinsic()
+we have to check instruction type first.
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/gallium/drivers/radeonsi/si_shader_info.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/src/gallium/drivers/radeonsi/si_shader_info.c b/src/gallium/drivers/radeonsi/si_shader_info.c
+index bf073c363e6a..483777e0f22d 100644
+--- a/src/gallium/drivers/radeonsi/si_shader_info.c
++++ b/src/gallium/drivers/radeonsi/si_shader_info.c
+@@ -226,15 +226,19 @@ static void scan_io_usage(const nir_shader *nir, struct si_shader_info *info,
+    unsigned interp = INTERP_MODE_FLAT; /* load_input uses flat shading */
+ 
+    if (intr->intrinsic == nir_intrinsic_load_interpolated_input) {
+-      nir_intrinsic_instr *baryc = nir_instr_as_intrinsic(intr->src[0].ssa->parent_instr);
+-
+-      if (baryc) {
++      nir_instr *src_instr = intr->src[0].ssa->parent_instr;
++      if (src_instr->type == nir_instr_type_intrinsic) {
++         nir_intrinsic_instr *baryc = nir_instr_as_intrinsic(src_instr);
+          if (nir_intrinsic_infos[baryc->intrinsic].index_map[NIR_INTRINSIC_INTERP_MODE] > 0)
+             interp = nir_intrinsic_interp_mode(baryc);
+          else
+             unreachable("unknown barycentric intrinsic");
+       } else {
+-         unreachable("unknown barycentric expression");
++         /* May get here when si_update_shader_binary_info() after ps lower bc_optimize
++          * which select center and centroid. Set to any value is OK because we don't
++          * care this when si_update_shader_binary_info().
++          */
++         interp = INTERP_MODE_SMOOTH;
+       }
+    }
+ 
+-- 
+GitLab
+
+
+From 66d45ae7822b3f72f5bfa584b3a984879a081af3 Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Fri, 3 Mar 2023 15:09:25 +0800
+Subject: [PATCH 10/12] radeonsi: monolithic ps emit prolog in nir directly
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/gallium/drivers/radeonsi/si_shader.c      | 35 ++++++++++++++-----
+ .../drivers/radeonsi/si_shader_internal.h     |  1 -
+ src/gallium/drivers/radeonsi/si_shader_llvm.c |  2 --
+ .../drivers/radeonsi/si_shader_llvm_ps.c      | 25 -------------
+ 4 files changed, 26 insertions(+), 37 deletions(-)
+
+diff --git a/src/gallium/drivers/radeonsi/si_shader.c b/src/gallium/drivers/radeonsi/si_shader.c
+index 67e98f9bfa4b..c39b4f162371 100644
+--- a/src/gallium/drivers/radeonsi/si_shader.c
++++ b/src/gallium/drivers/radeonsi/si_shader.c
+@@ -701,18 +701,18 @@ void si_init_shader_args(struct si_shader *shader, struct si_shader_args *args)
+       si_add_arg_checked(&args->ac, AC_ARG_VGPR, 1, AC_ARG_INT, &args->pos_fixed_pt,
+                          SI_PARAM_POS_FIXED_PT);
+ 
+-      /* Color inputs from the prolog. */
+-      if (shader->selector->info.colors_read) {
+-         unsigned num_color_elements = util_bitcount(shader->selector->info.colors_read);
++      /* Monolithic PS emit prolog and epilog in NIR directly. */
++      if (!shader->is_monolithic) {
++         /* Color inputs from the prolog. */
++         if (shader->selector->info.colors_read) {
++            unsigned num_color_elements = util_bitcount(shader->selector->info.colors_read);
+ 
+-         for (i = 0; i < num_color_elements; i++)
+-            ac_add_arg(&args->ac, AC_ARG_VGPR, 1, AC_ARG_FLOAT, i ? NULL : &args->color_start);
++            for (i = 0; i < num_color_elements; i++)
++               ac_add_arg(&args->ac, AC_ARG_VGPR, 1, AC_ARG_FLOAT, i ? NULL : &args->color_start);
+ 
+-         num_prolog_vgprs += num_color_elements;
+-      }
++            num_prolog_vgprs += num_color_elements;
++         }
+ 
+-      /* Monolithic PS emit epilog in NIR directly. */
+-      if (!shader->is_monolithic) {
+          /* Outputs for the epilog. */
+          num_return_sgprs = SI_SGPR_ALPHA_REF + 1;
+          num_returns =
+@@ -2148,6 +2148,10 @@ struct nir_shader *si_get_nir_shader(struct si_shader *shader,
+    } else if (is_legacy_gs) {
+       NIR_PASS_V(nir, ac_nir_lower_legacy_gs, false, sel->screen->use_ngg, output_info);
+    } else if (sel->stage == MESA_SHADER_FRAGMENT && shader->is_monolithic) {
++      /* two-side color selection and interpolation */
++      if (sel->info.colors_read)
++         NIR_PASS_V(nir, si_nir_lower_ps_color_input, shader);
++
+       ac_nir_lower_ps_options options = {
+          .gfx_level = sel->screen->info.gfx_level,
+          .family = sel->screen->info.family,
+@@ -2161,9 +2165,22 @@ struct nir_shader *si_get_nir_shader(struct si_shader *shader,
+          .alpha_to_one = key->ps.part.epilog.alpha_to_one,
+          .alpha_func = key->ps.part.epilog.alpha_func,
+          .broadcast_last_cbuf = key->ps.part.epilog.last_cbuf,
++
++         .bc_optimize_for_persp = key->ps.part.prolog.bc_optimize_for_persp,
++         .bc_optimize_for_linear = key->ps.part.prolog.bc_optimize_for_linear,
++         .force_persp_sample_interp = key->ps.part.prolog.force_persp_sample_interp,
++         .force_linear_sample_interp = key->ps.part.prolog.force_linear_sample_interp,
++         .force_persp_center_interp = key->ps.part.prolog.force_persp_center_interp,
++         .force_linear_center_interp = key->ps.part.prolog.force_linear_center_interp,
++         .samplemask_log_ps_iter = key->ps.part.prolog.samplemask_log_ps_iter,
+       };
+ 
+       NIR_PASS_V(nir, ac_nir_lower_ps, &options);
++
++      if (key->ps.part.prolog.poly_stipple)
++         NIR_PASS_V(nir, si_nir_emit_polygon_stipple, args);
++
++      progress2 = true;
+    }
+ 
+    NIR_PASS(progress2, nir, si_nir_lower_abi, shader, args);
+diff --git a/src/gallium/drivers/radeonsi/si_shader_internal.h b/src/gallium/drivers/radeonsi/si_shader_internal.h
+index a9dd6a3af507..858987a2b5be 100644
+--- a/src/gallium/drivers/radeonsi/si_shader_internal.h
++++ b/src/gallium/drivers/radeonsi/si_shader_internal.h
+@@ -235,7 +235,6 @@ void si_llvm_build_ps_prolog(struct si_shader_context *ctx, union si_shader_part
+                              bool separate_prolog);
+ void si_llvm_build_ps_epilog(struct si_shader_context *ctx, union si_shader_part_key *key,
+                              bool separate_epilog);
+-void si_llvm_build_monolithic_ps(struct si_shader_context *ctx, struct si_shader *shader);
+ void si_llvm_ps_build_end(struct si_shader_context *ctx);
+ 
+ /* si_shader_llvm_vs.c */
+diff --git a/src/gallium/drivers/radeonsi/si_shader_llvm.c b/src/gallium/drivers/radeonsi/si_shader_llvm.c
+index a9dc7ef5985a..3228329fd2ff 100644
+--- a/src/gallium/drivers/radeonsi/si_shader_llvm.c
++++ b/src/gallium/drivers/radeonsi/si_shader_llvm.c
+@@ -1177,8 +1177,6 @@ bool si_llvm_compile_shader(struct si_screen *sscreen, struct ac_llvm_compiler *
+       } else {
+          /* Nothing to do for gfx6-8. The shader has only 1 part and it's ctx.main_fn. */
+       }
+-   } else if (shader->is_monolithic && sel->stage == MESA_SHADER_FRAGMENT) {
+-      si_llvm_build_monolithic_ps(&ctx, shader);
+    }
+ 
+    si_llvm_optimize_module(&ctx);
+diff --git a/src/gallium/drivers/radeonsi/si_shader_llvm_ps.c b/src/gallium/drivers/radeonsi/si_shader_llvm_ps.c
+index d6e0c7e3cb1e..665a384be1d9 100644
+--- a/src/gallium/drivers/radeonsi/si_shader_llvm_ps.c
++++ b/src/gallium/drivers/radeonsi/si_shader_llvm_ps.c
+@@ -848,28 +848,3 @@ void si_llvm_build_ps_epilog(struct si_shader_context *ctx, union si_shader_part
+    LLVMBuildRetVoid(ctx->ac.builder);
+ }
+ 
+-void si_llvm_build_monolithic_ps(struct si_shader_context *ctx, struct si_shader *shader)
+-{
+-   union si_shader_part_key prolog_key;
+-   si_get_ps_prolog_key(shader, &prolog_key, false);
+-
+-   /* If no prolog is needed, we only have the main part, no need to build wrapper function. */
+-   if (!si_need_ps_prolog(&prolog_key))
+-      return;
+-
+-   struct ac_llvm_pointer main_fn = ctx->main_fn;
+-
+-   /* Preserve main arguments. */
+-   enum ac_arg_type main_arg_types[AC_MAX_ARGS];
+-   for (int i = 0; i < ctx->args->ac.arg_count; i++)
+-      main_arg_types[i] = ctx->args->ac.args[i].type;
+-
+-   si_llvm_build_ps_prolog(ctx, &prolog_key, false);
+-
+-   struct ac_llvm_pointer parts[2] = {
+-      ctx->main_fn, /* prolog */
+-      main_fn,      /* main */
+-   };
+-
+-   si_build_wrapper_function(ctx, parts, 2, 1, 0, main_arg_types, false);
+-}
+-- 
+GitLab
+
+
+From 0fc84af928c0c3a893bfe93e0730fcb60a18bd09 Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Tue, 11 Apr 2023 18:47:51 +0800
+Subject: [PATCH 11/12] radeonsi: restructure mono merged shader build
+
+No function change, just refine to share more code.
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/gallium/drivers/radeonsi/si_shader_llvm.c | 137 +++++++-----------
+ 1 file changed, 53 insertions(+), 84 deletions(-)
+
+diff --git a/src/gallium/drivers/radeonsi/si_shader_llvm.c b/src/gallium/drivers/radeonsi/si_shader_llvm.c
+index 3228329fd2ff..3f6acf85ba29 100644
+--- a/src/gallium/drivers/radeonsi/si_shader_llvm.c
++++ b/src/gallium/drivers/radeonsi/si_shader_llvm.c
+@@ -1082,101 +1082,70 @@ bool si_llvm_compile_shader(struct si_screen *sscreen, struct ac_llvm_compiler *
+       return false;
+    }
+ 
+-   if (shader->is_monolithic && sel->stage == MESA_SHADER_TESS_CTRL) {
+-      /* Preserve main arguments. */
+-      enum ac_arg_type main_arg_types[AC_MAX_ARGS];
+-
+-      if (sscreen->info.gfx_level >= GFX9) {
++   /* For merged shader stage. */
++   if (shader->is_monolithic && sscreen->info.gfx_level >= GFX9 &&
++       (sel->stage == MESA_SHADER_TESS_CTRL || sel->stage == MESA_SHADER_GEOMETRY)) {
++      /* LS or ES shader. */
++      struct si_shader prev_shader = {};
++      uint64_t tcs_vgpr_only_inputs = 0;
++      bool same_thread_count = false;
++
++      if (sel->stage == MESA_SHADER_TESS_CTRL) {
+          struct si_shader_selector *ls = shader->key.ge.part.tcs.ls;
+-         struct ac_llvm_pointer parts[2];
+-
+-         /* TCS main part */
+-         parts[1] = ctx.main_fn;
+-
+-         struct si_shader shader_ls = {};
+-         shader_ls.selector = ls;
+-         shader_ls.key.ge.part.vs.prolog = shader->key.ge.part.tcs.ls_prolog;
+-         shader_ls.key.ge.as_ls = 1;
+-         shader_ls.key.ge.mono = shader->key.ge.mono;
+-         shader_ls.key.ge.opt = shader->key.ge.opt;
+-         shader_ls.key.ge.opt.inline_uniforms = false; /* only TCS can inline uniforms */
+-         shader_ls.is_monolithic = true;
+-
+-         si_init_shader_args(&shader_ls, ctx.args);
+-
+-         bool free_nir;
+-         nir = si_get_nir_shader(&shader_ls, ctx.args, &free_nir,
+-                                 sel->info.tcs_vgpr_only_inputs, NULL);
+-         si_update_shader_binary_info(shader, nir);
+-
+-         if (!si_llvm_translate_nir(&ctx, &shader_ls, nir, free_nir)) {
+-            si_llvm_dispose(&ctx);
+-            return false;
+-         }
+-         shader->info.uses_instanceid |= ls->info.uses_instanceid;
+-         parts[0] = ctx.main_fn;
+ 
+-         for (int i = 0; i < ctx.args->ac.arg_count; i++)
+-            main_arg_types[i] = ctx.args->ac.args[i].type;
+-         main_arg_types[MIN2(AC_MAX_ARGS - 1, ctx.args->ac.arg_count)] = AC_ARG_INVALID;
++         prev_shader.selector = ls;
++         prev_shader.key.ge.part.vs.prolog = shader->key.ge.part.tcs.ls_prolog;
++         prev_shader.key.ge.as_ls = 1;
+ 
+-         /* Reset the shader context. */
+-         ctx.shader = shader;
+-         ctx.stage = MESA_SHADER_TESS_CTRL;
++         tcs_vgpr_only_inputs = sel->info.tcs_vgpr_only_inputs;
++         same_thread_count = shader->key.ge.opt.same_patch_vertices;
++      } else {
++         struct si_shader_selector *es = shader->key.ge.part.gs.es;
+ 
+-         si_build_wrapper_function(&ctx, parts, 2, 0, 1, main_arg_types,
+-                                   shader->key.ge.opt.same_patch_vertices);
++         prev_shader.selector = es;
++         prev_shader.key.ge.part.vs.prolog = shader->key.ge.part.gs.vs_prolog;
++         prev_shader.key.ge.as_es = 1;
++         prev_shader.key.ge.as_ngg = shader->key.ge.as_ngg;
+       }
+-   } else if (shader->is_monolithic && sel->stage == MESA_SHADER_GEOMETRY) {
+-      if (ctx.screen->info.gfx_level >= GFX9) {
+-         enum ac_arg_type main_arg_types[AC_MAX_ARGS];
+ 
+-         struct si_shader_selector *es = shader->key.ge.part.gs.es;
+-         struct ac_llvm_pointer es_main = {};
+-         struct ac_llvm_pointer gs_main = ctx.main_fn;
+-
+-         /* ES main part */
+-         struct si_shader shader_es = {};
+-         shader_es.selector = es;
+-         shader_es.key.ge.part.vs.prolog = shader->key.ge.part.gs.vs_prolog;
+-         shader_es.key.ge.as_es = 1;
+-         shader_es.key.ge.as_ngg = shader->key.ge.as_ngg;
+-         shader_es.key.ge.mono = shader->key.ge.mono;
+-         shader_es.key.ge.opt = shader->key.ge.opt;
+-         shader_es.key.ge.opt.inline_uniforms = false; /* only GS can inline uniforms */
+-         /* kill_outputs was computed based on GS outputs so we can't use it to kill VS outputs */
+-         shader_es.key.ge.opt.kill_outputs = 0;
+-         shader_es.is_monolithic = true;
+-
+-         si_init_shader_args(&shader_es, ctx.args);
+-
+-         bool free_nir;
+-         nir = si_get_nir_shader(&shader_es, ctx.args, &free_nir, 0, NULL);
+-         si_update_shader_binary_info(shader, nir);
+-
+-         if (!si_llvm_translate_nir(&ctx, &shader_es, nir, free_nir)) {
+-            si_llvm_dispose(&ctx);
+-            return false;
+-         }
+-         shader->info.uses_instanceid |= es->info.uses_instanceid;
+-         es_main = ctx.main_fn;
++      prev_shader.key.ge.mono = shader->key.ge.mono;
++      prev_shader.key.ge.opt = shader->key.ge.opt;
++      prev_shader.key.ge.opt.inline_uniforms = false; /* only TCS/GS can inline uniforms */
++      /* kill_outputs was computed based on second shader's outputs so we can't use it to
++       * kill first shader's outputs.
++       */
++      prev_shader.key.ge.opt.kill_outputs = 0;
++      prev_shader.is_monolithic = true;
+ 
+-         /* Preserve main (= es_main) arguments. */
+-         for (int i = 0; i < ctx.args->ac.arg_count; i++)
+-            main_arg_types[i] = ctx.args->ac.args[i].type;
+-         main_arg_types[MIN2(AC_MAX_ARGS - 1, ctx.args->ac.arg_count)] = AC_ARG_INVALID;
++      si_init_shader_args(&prev_shader, ctx.args);
+ 
+-         /* Reset the shader context. */
+-         ctx.shader = shader;
+-         ctx.stage = MESA_SHADER_GEOMETRY;
++      bool free_nir;
++      nir = si_get_nir_shader(&prev_shader, ctx.args, &free_nir,
++                              tcs_vgpr_only_inputs, NULL);
++      si_update_shader_binary_info(shader, nir);
+ 
+-         /* Prepare the array of shader parts. */
+-         struct ac_llvm_pointer parts[2] = {es_main, gs_main};
++      struct ac_llvm_pointer parts[2];
++      parts[1] = ctx.main_fn;
+ 
+-         si_build_wrapper_function(&ctx, parts, 2, 0, 1, main_arg_types, false);
+-      } else {
+-         /* Nothing to do for gfx6-8. The shader has only 1 part and it's ctx.main_fn. */
++      if (!si_llvm_translate_nir(&ctx, &prev_shader, nir, free_nir)) {
++         si_llvm_dispose(&ctx);
++         return false;
+       }
++      shader->info.uses_instanceid |= prev_shader.selector->info.uses_instanceid;
++      parts[0] = ctx.main_fn;
++
++      /* Preserve main arguments. */
++      enum ac_arg_type main_arg_types[AC_MAX_ARGS];
++      for (int i = 0; i < ctx.args->ac.arg_count; i++)
++         main_arg_types[i] = ctx.args->ac.args[i].type;
++      main_arg_types[MIN2(AC_MAX_ARGS - 1, ctx.args->ac.arg_count)] = AC_ARG_INVALID;
++
++      /* Reset the shader context. */
++      ctx.shader = shader;
++      ctx.stage = sel->stage;
++
++      si_build_wrapper_function(&ctx, parts, 2, 0, 1, main_arg_types,
++                                same_thread_count);
+    }
+ 
+    si_llvm_optimize_module(&ctx);
+-- 
+GitLab
+
+
+From 874b98557b69b13c4d79f058c4aeac143f53d63b Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Tue, 11 Apr 2023 19:39:28 +0800
+Subject: [PATCH 12/12] radeonsi: remove separate_prolog parameter
+
+si_get_ps_prolog_key is only called by part mode shader now.
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/gallium/drivers/radeonsi/si_shader.c      | 38 ++++++-------------
+ .../drivers/radeonsi/si_shader_internal.h     |  3 +-
+ 2 files changed, 13 insertions(+), 28 deletions(-)
+
+diff --git a/src/gallium/drivers/radeonsi/si_shader.c b/src/gallium/drivers/radeonsi/si_shader.c
+index c39b4f162371..f83636e4ced1 100644
+--- a/src/gallium/drivers/radeonsi/si_shader.c
++++ b/src/gallium/drivers/radeonsi/si_shader.c
+@@ -2740,8 +2740,7 @@ static bool si_shader_select_gs_parts(struct si_screen *sscreen, struct ac_llvm_
+  * Compute the PS prolog key, which contains all the information needed to
+  * build the PS prolog function, and set related bits in shader->config.
+  */
+-void si_get_ps_prolog_key(struct si_shader *shader, union si_shader_part_key *key,
+-                          bool separate_prolog)
++void si_get_ps_prolog_key(struct si_shader *shader, union si_shader_part_key *key)
+ {
+    struct si_shader_info *info = &shader->selector->info;
+ 
+@@ -2771,8 +2770,7 @@ void si_get_ps_prolog_key(struct si_shader *shader, union si_shader_part_key *ke
+          /* BCOLORs are stored after the last input. */
+          key->ps_prolog.num_interp_inputs = info->num_inputs;
+          key->ps_prolog.face_vgpr_index = shader->info.face_vgpr_index;
+-         if (separate_prolog)
+-            shader->config.spi_ps_input_ena |= S_0286CC_FRONT_FACE_ENA(1);
++         shader->config.spi_ps_input_ena |= S_0286CC_FRONT_FACE_ENA(1);
+       }
+ 
+       for (unsigned i = 0; i < 2; i++) {
+@@ -2802,21 +2800,15 @@ void si_get_ps_prolog_key(struct si_shader *shader, union si_shader_part_key *ke
+             switch (location) {
+             case TGSI_INTERPOLATE_LOC_SAMPLE:
+                key->ps_prolog.color_interp_vgpr_index[i] = 0;
+-               if (separate_prolog) {
+-                  shader->config.spi_ps_input_ena |= S_0286CC_PERSP_SAMPLE_ENA(1);
+-               }
++               shader->config.spi_ps_input_ena |= S_0286CC_PERSP_SAMPLE_ENA(1);
+                break;
+             case TGSI_INTERPOLATE_LOC_CENTER:
+                key->ps_prolog.color_interp_vgpr_index[i] = 2;
+-               if (separate_prolog) {
+-                  shader->config.spi_ps_input_ena |= S_0286CC_PERSP_CENTER_ENA(1);
+-               }
++               shader->config.spi_ps_input_ena |= S_0286CC_PERSP_CENTER_ENA(1);
+                break;
+             case TGSI_INTERPOLATE_LOC_CENTROID:
+                key->ps_prolog.color_interp_vgpr_index[i] = 4;
+-               if (separate_prolog) {
+-                  shader->config.spi_ps_input_ena |= S_0286CC_PERSP_CENTROID_ENA(1);
+-               }
++               shader->config.spi_ps_input_ena |= S_0286CC_PERSP_CENTROID_ENA(1);
+                break;
+             default:
+                assert(0);
+@@ -2835,22 +2827,16 @@ void si_get_ps_prolog_key(struct si_shader *shader, union si_shader_part_key *ke
+              */
+             switch (location) {
+             case TGSI_INTERPOLATE_LOC_SAMPLE:
+-               key->ps_prolog.color_interp_vgpr_index[i] = separate_prolog ? 6 : 9;
+-               if (separate_prolog) {
+-                  shader->config.spi_ps_input_ena |= S_0286CC_LINEAR_SAMPLE_ENA(1);
+-               }
++               key->ps_prolog.color_interp_vgpr_index[i] = 6;
++               shader->config.spi_ps_input_ena |= S_0286CC_LINEAR_SAMPLE_ENA(1);
+                break;
+             case TGSI_INTERPOLATE_LOC_CENTER:
+-               key->ps_prolog.color_interp_vgpr_index[i] = separate_prolog ? 8 : 11;
+-               if (separate_prolog) {
+-                  shader->config.spi_ps_input_ena |= S_0286CC_LINEAR_CENTER_ENA(1);
+-               }
++               key->ps_prolog.color_interp_vgpr_index[i] = 8;
++               shader->config.spi_ps_input_ena |= S_0286CC_LINEAR_CENTER_ENA(1);
+                break;
+             case TGSI_INTERPOLATE_LOC_CENTROID:
+-               key->ps_prolog.color_interp_vgpr_index[i] = separate_prolog ? 10 : 13;
+-               if (separate_prolog) {
+-                  shader->config.spi_ps_input_ena |= S_0286CC_LINEAR_CENTROID_ENA(1);
+-               }
++               key->ps_prolog.color_interp_vgpr_index[i] = 10;
++               shader->config.spi_ps_input_ena |= S_0286CC_LINEAR_CENTROID_ENA(1);
+                break;
+             default:
+                assert(0);
+@@ -2905,7 +2891,7 @@ static bool si_shader_select_ps_parts(struct si_screen *sscreen, struct ac_llvm_
+    union si_shader_part_key epilog_key;
+ 
+    /* Get the prolog. */
+-   si_get_ps_prolog_key(shader, &prolog_key, true);
++   si_get_ps_prolog_key(shader, &prolog_key);
+ 
+    /* The prolog is a no-op if these aren't set. */
+    if (si_need_ps_prolog(&prolog_key)) {
+diff --git a/src/gallium/drivers/radeonsi/si_shader_internal.h b/src/gallium/drivers/radeonsi/si_shader_internal.h
+index 858987a2b5be..f57cab7a00de 100644
+--- a/src/gallium/drivers/radeonsi/si_shader_internal.h
++++ b/src/gallium/drivers/radeonsi/si_shader_internal.h
+@@ -153,8 +153,7 @@ struct nir_shader *si_get_nir_shader(struct si_shader *shader, struct si_shader_
+                                      ac_nir_gs_output_info *output_info);
+ void si_get_tcs_epilog_key(struct si_shader *shader, union si_shader_part_key *key);
+ bool si_need_ps_prolog(const union si_shader_part_key *key);
+-void si_get_ps_prolog_key(struct si_shader *shader, union si_shader_part_key *key,
+-                          bool separate_prolog);
++void si_get_ps_prolog_key(struct si_shader *shader, union si_shader_part_key *key);
+ void si_get_ps_epilog_key(struct si_shader *shader, union si_shader_part_key *key);
+ 
+ /* gfx10_shader_ngg.c */
+-- 
+GitLab
+
