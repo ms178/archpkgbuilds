@@ -31,7 +31,7 @@ cmake -G Ninja \
     ../llvm-project/llvm || (echo "Could not configure project!"; exit 1)
 
 echo "== Start Training Build"
-perf record -o ${TOPLEV}/perf.data --max-size=30G -F 1500 -e cycles:u -j any,u -- ninja clang || (echo "Could not build project for training!"; exit 1)
+perf record -o ${TOPLEV}/perf.data --max-size=30G -F 1600 -e cycles:u -j any,u -- ninja clang || (echo "Could not build project for training!"; exit 1)
 
 cd ${TOPLEV}
 

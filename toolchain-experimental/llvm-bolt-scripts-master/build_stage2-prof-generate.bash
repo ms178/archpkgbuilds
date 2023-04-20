@@ -56,7 +56,6 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -DLLVM_VP_COUNTERS_PER_SITE=6 \
     -DLLVM_BUILD_INSTRUMENTED=IR \
     -DLLVM_ENABLE_PLUGINS=ON \
-    -DCLANG_DEFAULT_PIE_ON_LINUX=OFF \
     -DLLVM_BUILD_RUNTIME=No || (echo "Could not configure project!"; exit 1)
 
 echo "== Start Build"

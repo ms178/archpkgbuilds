@@ -37,7 +37,6 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -DLLVM_ENABLE_WARNINGS=OFF \
     -DLLVM_INCLUDE_TESTS=OFF \
     -DLLVM_ENABLE_TERMINFO=OFF \
-    -DCLANG_DEFAULT_PIE_ON_LINUX=OFF \
     -DCMAKE_INSTALL_PREFIX=${TOPLEV}/llvm-bolt || (echo "Could not configure project!"; exit 1)
 
 echo "== Start Build"
