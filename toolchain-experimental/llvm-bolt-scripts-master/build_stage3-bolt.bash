@@ -21,7 +21,6 @@ cmake -G Ninja \
     -DCMAKE_CXX_COMPILER=${CPATH}/clang++ \
     -DLLVM_USE_LINKER=${CPATH}/ld.lld \
     -DLLVM_USE_PERF=ON \
-    -DCLANG_DEFAULT_PIE_ON_LINUX=OFF \
     -DLLVM_TARGETS_TO_BUILD="X86" \
     -DLLVM_ENABLE_PROJECTS="polly;lld;clang;openmp;compiler-rt" \
     -D CMAKE_C_FLAGS="-O3 -march=native -mtune=native -maes -mllvm -extra-vectorizer-passes -mllvm -enable-interleaved-mem-accesses -mllvm -enable-masked-interleaved-mem-accesses -mllvm -enable-cond-stores-vec -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -interleave-small-loop-scalar-reduction -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -fno-math-errno -fno-trapping-math -falign-functions=32 -fno-semantic-interposition -fomit-frame-pointer -fcf-protection=none -mharden-sls=none -flto=thin" \
