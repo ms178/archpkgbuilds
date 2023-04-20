@@ -20,6 +20,7 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -DLLVM_ENABLE_OCAMLDOC=OFF \
     -DLLVM_INCLUDE_DOCS=OFF \
     -DLLVM_INCLUDE_EXAMPLES=OFF \
+    -DLLVM_USE_PERF=ON \
     -DCMAKE_C_COMPILER=${CPATH}/clang \
     -DCMAKE_CXX_COMPILER=${CPATH}/clang++ \
     -DLLVM_USE_LINKER=${CPATH}/ld.lld \
@@ -28,9 +29,8 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
         -D CMAKE_EXE_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -Wl,-mllvm,-march=native -mllvm -extra-vectorizer-passes -mllvm -enable-cond-stores-vec -mllvm -enable-interleaved-mem-accesses -mllvm -enable-masked-interleaved-mem-accesses -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -interleave-small-loop-scalar-reduction -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -fuse-ld=lld -maes -flto=thin -Wl,--emit-relocs" \
         -D CMAKE_MODULE_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -Wl,-mllvm,-march=native -mllvm -extra-vectorizer-passes -mllvm -enable-cond-stores-vec -mllvm -enable-interleaved-mem-accesses -mllvm -enable-masked-interleaved-mem-accesses -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -interleave-small-loop-scalar-reduction -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -fuse-ld=lld -maes -flto=thin -Wl,--emit-relocs" \
         -D CMAKE_SHARED_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -Wl,-mllvm,-march=native -mllvm -extra-vectorizer-passes -mllvm -enable-cond-stores-vec -mllvm -enable-interleaved-mem-accesses -mllvm -enable-masked-interleaved-mem-accesses -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -interleave-small-loop-scalar-reduction -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -fuse-ld=lld -maes -flto=thin -Wl,--emit-relocs" \
-        -DLLVM_ENABLE_PROJECTS="polly;lld;clang;bolt" \
+        -DLLVM_ENABLE_PROJECTS="polly;lld;clang;openmp;compiler-rt;bolt" \
         -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86;BPF" \
-        -DLLVM_ENABLE_RUNTIMES="openmp;compiler-rt" \
         -D CLANG_ENABLE_ARCMT:BOOL=OFF \
         -D CLANG_ENABLE_STATIC_ANALYZER:BOOL=OFF \
         -D COMPILER_RT_BUILD_SANITIZERS:BOOL=OFF \
@@ -54,6 +54,7 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -DLLVM_PROFDATA_FILE=${TOPLEV}/stage2-prof-gen/profiles/clang.profdata \
     -DLLVM_ENABLE_LTO=Thin \
     -DLLVM_ENABLE_PLUGINS=ON \
+    -DCLANG_DEFAULT_PIE_ON_LINUX=OFF \
     -DLLVM_ENABLE_TERMINFO=OFF  || (echo "Could not configure project!"; exit 1)
 
 echo "== Start Build"
