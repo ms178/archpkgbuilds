@@ -25,7 +25,7 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -DCMAKE_CXX_COMPILER=clang++ \
     -DLLVM_USE_LINKER=lld \
     -DLLVM_USE_PERF=ON \
-    -DLLVM_ENABLE_PROJECTS="clang;lld;bolt" \
+    -DLLVM_ENABLE_PROJECTS="clang;lld;bolt;compiler-rt" \
     -DLLVM_TARGETS_TO_BUILD="X86" \
     -D CMAKE_C_FLAGS="-O3 -march=native -mtune=native -maes -mllvm -extra-vectorizer-passes -mllvm -enable-interleaved-mem-accesses -mllvm -enable-masked-interleaved-mem-accesses -mllvm -enable-cond-stores-vec -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -interleave-small-loop-scalar-reduction -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -fno-math-errno -fno-trapping-math -falign-functions=32 -fno-semantic-interposition -fomit-frame-pointer -fcf-protection=none -mharden-sls=none -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
     -D CMAKE_CXX_FLAGS="-O3 -march=native -mtune=native -maes -mllvm -extra-vectorizer-passes -mllvm -enable-interleaved-mem-accesses -mllvm -enable-masked-interleaved-mem-accesses -mllvm -enable-cond-stores-vec -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -interleave-small-loop-scalar-reduction -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -fno-math-errno -fno-trapping-math -falign-functions=32 -fno-semantic-interposition -fomit-frame-pointer -fcf-protection=none -mharden-sls=none -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
