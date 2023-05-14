@@ -30,8 +30,6 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -DLLVM_ENABLE_PROJECTS="polly;lld;clang;openmp;compiler-rt" \
         -D CLANG_ENABLE_ARCMT:BOOL=OFF \
         -D CLANG_ENABLE_STATIC_ANALYZER:BOOL=OFF \
-        -D COMPILER_RT_BUILD_SANITIZERS:BOOL=OFF \
-        -D COMPILER_RT_BUILD_XRAY:BOOL=OFF \
         -D LLVM_INCLUDE_BENCHMARKS=OFF \
         -D LLVM_INCLUDE_TESTS=OFF \
         -D LLVM_INCLUDE_EXAMPLES=OFF \
@@ -41,7 +39,6 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
         -D LLVM_ENABLE_SPHINX=OFF \
         -D LLVM_ENABLE_DOXYGEN=OFF \
         -D LLVM_ENABLE_BINDINGS=OFF \
-        -D POLLY_ENABLE_GPGPU_CODEGEN=OFF \
         -D LLVM_ENABLE_Z3_SOLVER=OFF \
         -D LLVM_POLLY_LINK_INTO_TOOLS=ON \
         -D LLVM_ENABLE_ZLIB:BOOL=ON \
