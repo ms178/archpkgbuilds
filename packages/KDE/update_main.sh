@@ -93,7 +93,6 @@ kross-main \
 kdeplasma-addons-main \
 plasma-desktop-main \
 qca-main \
-plasma-disks-main \
 modemmanager-qt-main \
 plasma-nm-main \
 plasma-pa-main \
