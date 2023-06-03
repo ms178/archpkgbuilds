@@ -99,7 +99,7 @@ plasma-pa-main \
 dolphin-main \
 kate-main \
 konsole-main \
-gwenview \
+gwenview-main \
 bluez-qt-main \
 kde-gtk-config-main \
 khotkeys-main \
