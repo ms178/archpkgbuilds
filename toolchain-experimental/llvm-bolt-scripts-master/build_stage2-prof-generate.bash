@@ -28,7 +28,7 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
         -D CMAKE_EXE_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fuse-ld=lld -maes -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
         -D CMAKE_MODULE_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fuse-ld=lld -maes -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
         -D CMAKE_SHARED_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fuse-ld=lld -maes -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
-        -DLLVM_ENABLE_PROJECTS="polly;lld;clang;openmp;compiler-rt" \
+        -DLLVM_ENABLE_PROJECTS="lld;clang;compiler-rt" \
         -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86;BPF" \
         -D CLANG_ENABLE_ARCMT:BOOL=OFF \
         -D CLANG_ENABLE_STATIC_ANALYZER:BOOL=OFF \

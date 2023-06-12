@@ -29,6 +29,11 @@ cmake -G Ninja ../llvm-project/llvm \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLVM_TARGETS_TO_BUILD="X86" \
     -DLLVM_ENABLE_PROJECTS="polly;lld;clang;openmp;compiler-rt" \
+    -D CMAKE_C_FLAGS="-O3 -march=native -mtune=native -maes -mllvm -inline-threshold=500 -mllvm -extra-vectorizer-passes -mllvm -enable-interleaved-mem-accesses -mllvm -enable-masked-interleaved-mem-accesses -mllvm -enable-cond-stores-vec -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -interleave-small-loop-scalar-reduction -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -fno-math-errno -fno-trapping-math -falign-functions=32 -fno-semantic-interposition -fomit-frame-pointer -mllvm -vp-counters-per-site=6 -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -freroll-loops -mllvm -adce-remove-loops -mllvm -enable-ext-tsp-block-placement=1 -mllvm -enable-gvn-hoist" \
+    -D CMAKE_CXX_FLAGS="-O3 -march=native -mtune=native -maes -mllvm -inline-threshold=500 -mllvm -extra-vectorizer-passes -mllvm -enable-interleaved-mem-accesses -mllvm -enable-masked-interleaved-mem-accesses -mllvm -enable-cond-stores-vec -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -interleave-small-loop-scalar-reduction -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -fno-math-errno -fno-trapping-math -falign-functions=32 -fno-semantic-interposition -fomit-frame-pointer -mllvm -vp-counters-per-site=6 -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -freroll-loops -mllvm -adce-remove-loops -mllvm -enable-ext-tsp-block-placement=1 -mllvm -enable-gvn-hoist" \
+    -D CMAKE_EXE_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fuse-ld=lld -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -Wl,--thinlto-jobs=all" \
+    -D CMAKE_MODULE_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fuse-ld=lld -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -Wl,--thinlto-jobs=all" \
+    -D CMAKE_SHARED_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fuse-ld=lld -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -Wl,--thinlto-jobs=all" \
     -DCMAKE_AR=${CPATH}/llvm-ar \
     -DCMAKE_C_COMPILER=${CPATH}/clang-17 \
     -DCMAKE_CXX_COMPILER=${CPATH}/clang++ \
@@ -55,6 +60,11 @@ LD_PRELOAD=/usr/lib/libjemalloc.so ${BOLTPATH}/llvm-bolt ${CPATH}/clang-17.org \
     -dyno-stats \
     -icf=1 \
     -use-gnu-stack \
+    -peepholes=all \
+    -elim-link-veneers \
+    -group-stubs -align-blocks -sctc-mode=heuristic -jump-tables=aggressive -simplify-conditional-tail-calls -simplify-rodata-loads \
+    -align-macro-fusion=all -eliminate-unreachable -tail-duplication=cache -indirect-call-promotion=all -icp-eliminate-loads \
+    -hot-data -x86-strip-redundant-address-size -lite=false -reorder-data-algo=funcs -inline-memcpy -cg-from-perf-data \
     -plt=hot|| (echo "Could not optimize binary for clang"; exit 1)
 
 echo "You can now use the compiler with export PATH=${CPATH}:${PATH}"

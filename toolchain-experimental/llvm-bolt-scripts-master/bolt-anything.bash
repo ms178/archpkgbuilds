@@ -68,14 +68,14 @@ optimize() {
     LD_PRELOAD=/usr/lib/libjemalloc.so ${BOLTPATH}/llvm-bolt ${BOLTBIN}/${BINARY}.org \
         --data ${BOLTBIN}/${BINARY}-combined.fdata \
         -o ${BOLTBIN}/${BINARY}.bolt \
-        -reorder-blocks=ext-tsp
-        -reorder-functions=hfsort+
-        -split-functions
-        -split-all-cold
-        -split-eh
-        -dyno-stats
-        -icf=1
-        -use-gnu-stack
+        -reorder-blocks=ext-tsp \
+        -reorder-functions=hfsort+ \
+        -split-functions \
+        -split-all-cold \
+        -split-eh \
+        -dyno-stats \
+        -icf=1 \
+        -use-gnu-stack \
         -plt=hot || (echo "Could not optimize the binary"; exit 1)
 }
 
