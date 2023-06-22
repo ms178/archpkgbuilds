@@ -1,0 +1,2140 @@
+From 8957a6a42cf345f55d37b33e7b7abdcc22af5f72 Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Sun, 23 Apr 2023 23:12:58 +0300
+Subject: [PATCH 01/23] docs/amd: Document Primitive Ordered Pixel Shading
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ docs/drivers/amd/hw/pops.rst | 473 +++++++++++++++++++++++++++++++++++
+ docs/drivers/radv.rst        |   7 +
+ 2 files changed, 480 insertions(+)
+ create mode 100644 docs/drivers/amd/hw/pops.rst
+
+diff --git a/docs/drivers/amd/hw/pops.rst b/docs/drivers/amd/hw/pops.rst
+new file mode 100644
+index 0000000000000..526d618f0a27e
+--- /dev/null
++++ b/docs/drivers/amd/hw/pops.rst
+@@ -0,0 +1,473 @@
++Primitive Ordered Pixel Shading
++===============================
++
++Primitive Ordered Pixel Shading (POPS) is the feature available starting from
++GFX9 that provides the Fragment Shader Interlock or Fragment Shader Ordering
++functionality.
++
++It allows a part of a fragment shader — an ordered section (or a critical
++section) — to be executed sequentially in rasterization order for different
++invocations covering the same pixel position.
++
++This document describes how POPS is set up in shader code and the registers. The
++information here is currently provided for architecture generations up to GFX11.
++It is based on the shader code output of the Radeon GPU Analyzer for Rasterizer
++Ordered View usage in Direct3D shaders, AMD's Platform Abstraction Library
++(PAL), ISA references, and experimentation with the hardware.
++
++Shader code
++-----------
++
++With POPS, a wave can dynamically execute up to one ordered section. It is fine
++for a wave not to enter an ordered section at all if it doesn't need ordering on
++its execution path, however.
++
++The setup of the ordered section consists of three parts:
++
++1. Entering the ordered section in the current wave — awaiting the completion of
++   ordered sections in overlapped waves.
++2. Resolving overlap within the current wave — intrawave collisions (optional
++   and GFX9–10.3 only).
++3. Exiting the ordered section — resuming overlapping waves trying to enter
++   their ordered sections.
++
++GFX9–10.3: Entering the ordered section in the wave
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++
++Awaiting the completion of ordered sections in overlapped waves is performed by
++setting the POPS packer hardware register, and then polling the volatile
++``pops_exiting_wave_id`` ALU operand source until its value exceeds the newest
++overlapped wave ID for the current wave.
++
++The information needed for the wave to perform the waiting is provided to it via
++the SGPR argument ``COLLISION_WAVEID``. Its loading needs to be enabled in the
++``SPI_SHADER_PGM_RSRC2_PS`` and ``PA_SC_SHADER_CONTROL`` registers (note that
++the POPS arguments specifically need to be enabled not only in ``RSRC`` unlike
++various other arguments, but in ``PA_SC_SHADER_CONTROL`` as well).
++
++The collision wave ID argument contains the following unsigned values:
++
++* [31]: Whether overlap has occurred.
++* [29:28] (GFX10+) / [28] (GFX9): ID of the packer the wave should be associated
++  with.
++* [25:16]: Newest overlapped wave ID.
++* [9:0]: Current wave ID.
++
++The 2020 RDNA and RDNA 2 ISA references contain incorrect offsets and widths of
++the fields, possibly from an early development iteration, but the meanings of
++them are accurate there.
++
++The wait must not be performed if the "did overlap" bit 31 is set to 0,
++otherwise it will result in a hang. Also, the bit being set to 0 indicates that
++there are *both* no wave overlap *and no intrawave collisions* for the current
++wave — so if the bit is 0, it's safe for the wave to skip all of the POPS logic
++completely and execute the contents of the ordered section simply as usual with
++unordered access as a potential additional optimization. The packer hardware
++register, however, may be set even without overlap safely — it's the wait loop
++itself that must not be executed if it was reported that there was no overlap.
++
++The packer ID needs to be passed to the packer hardware register using
++``s_setreg_b32`` so the wave can poll ``pops_exiting_wave_id`` on that packer.
++
++On GFX9, the ``MODE`` (1) hardware register has two bits specifying which packer
++the wave is associated with:
++
++* [25]: The wave is associated with packer 1.
++* [24]: The wave is associated with packer 0.
++
++Initially, both of these bits are set 0, meaning that POPS is disabled for the
++wave. If the wave needs to enter the ordered section, it must set bit 24 to 1 if
++the packer ID in ``COLLISION_WAVEID`` is 0, or set bit 25 to 1 if the packer ID
++is 1.
++
++Starting from GFX10, the ``POPS_PACKER`` (25) hardware register is used instead,
++containing the following fields:
++
++* [2:1]: Packer ID.
++* [0]: POPS enabled for the wave.
++
++Initially, POPS is disabled for a wave. To start entering the ordered section,
++bits 2:1 must be set to the packer ID from ``COLLISION_WAVEID``, and bit 0 needs
++to be set to 1.
++
++The wave IDs, both in ``COLLISION_WAVEID`` and ``pops_exiting_wave_id``, are
++10-bit values wrapping around on overflow — consecutive waves are numbered 1022,
++1023, 0, 1… This wraparound needs to be taken into account when comparing the
++exiting wave ID and the newest overlapped wave ID.
++
++Specifically, until the current wave exits the ordered section, its ID can't be
++smaller than the newest overlapped wave ID or the exiting wave ID. So
++``current_wave_id + 1`` can be subtracted from 10-bit wave IDs to remap them to
++monotonically increasing unsigned values. In this case, the largest value,
++0xFFFFFFFF, will correspond to the current wave, 10-bit values up to the current
++wave ID will be in a range near 0xFFFFFFFF growing towards it, and wave IDs from
++before the last wraparound will be near 0 increasing away from it. Subtracting
++``current_wave_id + 1`` is equivalent to adding ``~current_wave_id``.
++
++GFX9 has an off-by-one error in the newest overlapped wave ID: if the 10-bit
++newest overlapped wave ID is greater than the 10-bit current wave ID (meaning
++that it's behind the last wraparound point), 1 needs to be added to the newest
++overlapped wave ID before using it in the comparison. This was corrected in
++GFX10.
++
++The exiting wave ID (not to be confused with "exited" — the exiting wave ID is
++the wave that will exit the ordered section next) is queried via the
++``pops_exiting_wave_id`` ALU operand source, numbered 239. Normally, it will be
++one of the arguments of ``s_add_i32`` that remaps it from a wrapping 10-bit wave
++ID to monotonically increasing one.
++
++It's a volatile operand, and it needs to be read in a loop until its value
++becomes greater than the newest overlapped wave ID (after remapping both to
++monotonic). However, if it's too early for the current wave to enter the ordered
++section, it needs to yield execution to other waves that may potentially be
++overlapped — via ``s_sleep``. GFX9 requires a finite amount of delay to be
++specified, AMD uses 3. Starting from GFX10, exiting the ordered section wakes up
++the waiting waves, so the maximum delay of 0xFFFF can be used.
++
++In pseudocode, the entering logic would look like this::
++
++   bool did_overlap = collision_wave_id[31];
++   if (did_overlap) {
++      if (gfx_level >= GFX10) {
++         uint packer_id = collision_wave_id[29:28];
++         s_setreg_b32(HW_REG_POPS_PACKER[2:0], 1 | (packer_id << 1));
++      } else {
++         uint packer_id = collision_wave_id[28];
++         s_setreg_b32(HW_REG_MODE[25:24], packer_id ? 0b10 : 0b01);
++      }
++
++      uint current_10bit_wave_id = collision_wave_id[9:0];
++      // Or -(current_10bit_wave_id + 1).
++      uint wave_id_remap_offset = ~current_10bit_wave_id;
++
++      uint newest_overlapped_10bit_wave_id = collision_wave_id[25:16];
++      if (gfx_level < GFX10 &&
++          newest_overlapped_10bit_wave_id > current_10bit_wave_id) {
++         ++newest_overlapped_10bit_wave_id;
++      }
++      uint newest_overlapped_wave_id =
++         newest_overlapped_10bit_wave_id + wave_id_remap_offset;
++
++      while (!(src_pops_exiting_wave_id + wave_id_remap_offset >
++               newest_overlapped_wave_id)) {
++         s_sleep(gfx_level >= GFX10 ? 0xFFFF : 3);
++      }
++   }
++
++The SPIR-V fragment shader interlock specification requires an invocation — an
++individual invocation, not the whole subgroup — to execute
++``OpBeginInvocationInterlockEXT`` exactly once. However, if there are multiple
++begin instructions, or even multiple begin/end pairs, under divergent
++conditions, a wave may end up waiting for the overlapped waves multiple times.
++Thankfully, it's safe to set the POPS packer hardware register to the same
++value, or to run the wait loop, multiple times during the wave's execution, as
++long as the ordered section isn't exited in between by the wave.
++
++GFX11: Entering the ordered section in the wave
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++
++Instead of exposing wave IDs to shaders, GFX11 uses the "export ready" wave
++status flag to report that the wave may enter the ordered section. It's awaited
++by the ``s_wait_event`` instruction, with the bit 0 ("don't wait for
++``export_ready``") of the immediate operand set to 0. On GFX11 specifically, AMD
++passes 0 as the whole immediate operand.
++
++The "export ready" wait can be done multiple times safely.
++
++GFX9–10.3: Resolving intrawave collisions
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++
++On GFX9–10.3, it's possible for overlapping fragment shader invocations to be
++placed not only in different waves, but also in the same wave, with the shader
++code making sure that the ordered section is executed for overlapping
++invocations in order.
++
++This functionality is optional — it can be activated by enabling loading of the
++``INTRAWAVE_COLLISION`` SGPR argument in ``SPI_SHADER_PGM_RSRC2_PS`` and
++``PA_SC_SHADER_CONTROL``.
++
++The lower 8 or 16 (depending on the wave size) bits of ``INTRAWAVE_COLLISION``
++contain the mask of whether each quad in the wave starts a new layer of
++overlapping invocations, and thus the ordered section code for them needs to be
++executed after running it for all lanes with indices preceding that quad index
++multiplied by 4. The rest of the bits in the argument need to be ignored — AMD
++explicitly masks them out in shader code (although this is not necessary if the
++shader uses "find first 1" to obtain the start of the next set of overlapping
++quads or expands this quad mask into a lane mask).
++
++For example, if the intrawave collision mask is 0b0000001110000100, or
++``(1 << 2) | (1 << 7) | (1 << 8) | (1 << 9)``, the code of the ordered section
++needs to be executed first only for quads 1:0 (lanes 7:0), then only for quads
++6:2 (lanes 27:8), then for quad 7 (lanes 31:28), then for quad 8 (lanes 35:32),
++and then for the remaining quads 15:9 (lanes 63:36).
++
++This effectively causes the ordered section to be executed as smaller
++"sub-subgroups" within the original subgroup.
++
++However, this is not always compatible with the execution model of SPIR-V or
++GLSL fragment shaders, so enabling intrawave collisions and wrapping a part of
++the shader in a loop may be unsafe in some cases. One particular example is when
++the shader uses subgroup operations influenced by lanes outside the current
++quad. In this case, the code outside and inside the ordered section may be
++executed with different sets of active invocations, affecting the results of
++subgroup operations. But in SPIR-V and GLSL, fragment shader interlock is not
++supposed to modify the set of active invocations in any way. So the intrawave
++collision loop may break the results of subgroup operations in unpredictable
++ways, even outside the driver's compiler infrastructure. Even if the driver
++splits the subgroup exactly at ``OpBeginInvocationInterlockEXT`` and makes the
++lane subsets rejoin exactly at ``OpEndInvocationInterlockEXT``, the application
++and the compilers that created the source shader are still not aware of that
++happening — the input SPIR-V or GLSL shader might have already gone through
++various optimizations, such as common subexpression elimination which might
++have considered a subgroup operation before ``OpBeginInvocationInterlockEXT``
++and one after it equivalent.
++
++The idea behind reporting intrawave collisions to shaders is to reduce the
++impact on the parallelism of the part of the shader that doesn't depend on the
++ordering, to avoid wasting lanes in the wave and to allow the code outside the
++ordered section in different invocations to run in parallel lanes as usual. This
++may be especially helpful if the ordered section is small compared to the rest
++of the shader — for instance, a custom blending equation in the end of the usual
++fragment shader for a surface in the world.
++
++However, whether handling intrawave collisions is preferred is not a question
++with one universal answer. Intrawave collisions are pretty uncommon without
++multisampling, or when using sample interlock with multisampling, although
++they're highly frequent with pixel interlock with multisampling, when adjacent
++primitives cover the same pixels along the shared edge (though that's an
++extremely expensive situation in general). But resolving intrawave collisions
++adds some overhead costs to the shader. If intrawave overlap is unlikely to
++happen often, or even more importantly, if the majority of the shader is inside
++the ordered section, handling it in the shader may cause more harm than good.
++
++GFX11 removes this concept entirely, instead overlapping invocations are always
++placed in different waves.
++
++GFX9–10.3: Exiting the ordered section in the wave
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++
++To exit the ordered section and let overlapping waves resume execution and enter
++their ordered sections, the wave needs to send the ``ORDERED_PS_DONE`` message
++(7) using ``s_sendmsg``.
++
++If the wave has enabled POPS by setting the packer hardware register, it *must
++not* execute ``s_endpgm`` without having sent ``ORDERED_PS_DONE`` once, so the
++message must be sent on all execution paths after the packer register setup.
++However, if the wave exits before having configured the packer register, sending
++the message is not required, though it's still fine to send it regardless of
++that.
++
++Note that if the shader has multiple ``OpEndInvocationInterlockEXT``
++instructions executed in the same wave (depending on a divergent condition, for
++example), it must still be ensured that ``ORDERED_PS_DONE`` is sent by the wave
++only once, and especially not before any awaiting of overlapped waves.
++
++Before the message is sent, all counters for memory accesses that need to be
++primitive-ordered, both writes and (in case something after the ordered section
++depends on the per-pixel data, for instance, the tail blending fallback in
++order-independent transparency) reads, must be awaited. Those may include
++``vm``, ``vs``, and in some cases ``lgkm`` (though normally primitive-ordered
++memory accesses will be done through VMEM with divergent addresses, not SMEM, as
++there's no synchronization between fragments at different pixel coordinates, but
++it's still technically possible for a shader, even though pointless and
++nonoptimal, to explicitly perform them in a waterfall loop, for instance, and
++that must work correctly too). Without that, a race condition will occur when
++the newly resumed waves start accessing the memory locations to which there
++still are outstanding accesses in the current wave.
++
++Another option for exiting is the ``s_endpgm_ordered_ps_done`` instruction,
++which combines waiting for all the counters, sending the ``ORDERED_PS_DONE``
++message, and ending the program. Generally, however, it's desirable to resume
++overlapping waves as early as possible, including before the export, as it may
++stall the wave for some time too.
++
++GFX11: Exiting the ordered section in the wave
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++
++The overlapping waves are resumed when the wave performs the last export (with
++the ``done`` flag).
++
++The same requirements for awaiting the memory access counters as on GFX9–10.3
++still apply.
++
++Memory access requirements
++^^^^^^^^^^^^^^^^^^^^^^^^^^
++
++The compiler needs to ensure that entering the ordered section implements
++acquire semantics, and exiting it implements release semantics, in the fragment
++interlock memory scope for ``UniformMemory`` and ``ImageMemory`` SPIR-V storage
++classes.
++
++A fragment interlock memory scope instance includes overlapping fragment shader
++invocations executed by commands inside a single subpass. It may be considered a
++subset of a queue family memory scope instance from the perspective of memory
++barriers.
++
++Fragment shader interlock doesn't perform implicit memory availability or
++visibility operations. Shaders must do them by themselves for accesses requiring
++primitive ordering, such as via ``coherent`` (``queuefamilycoherent``) in GLSL
++or ``MakeAvailable`` and ``MakeVisible`` in at least the ``QueueFamily`` scope
++in SPIR-V.
++
++On AMD hardware, this means that the accessed memory locations must be made
++available or visible between waves that may be executed on any compute unit — so
++accesses must go directly to the global L2 cache, bypassing L0$ via the GLC flag
++and L1$ via DLC.
++
++However, it should be noted that memory accesses in the ordered section may be
++expected by the application to be done in primitive order even if they don't
++have the GLC and DLC flags. Coherent access not only bypasses, but also
++invalidates the lower-level caches for the accessed memory locations. Thus,
++considering that normally per-pixel data is accessed exclusively by the
++invocation executing the ordered section, it's not necessary to make all reads
++or writes in the ordered section for one memory location to be GLC/DLC — just
++the first read and the last write: it doesn't matter if per-pixel data is cached
++in L0/L1 in the middle of a dependency chain in the ordered section, as long as
++it's invalidated in them in the beginning and flushed to L2 in the end.
++Therefore, optimizations in the compiler must not simply assume that only
++coherent accesses need primitive ordering — and moreover, the compiler must also
++take into account that the same data may be accessed through different bindings.
++
++Export requirements
++^^^^^^^^^^^^^^^^^^^
++
++With POPS, on all hardware generations, the shader must have at least one
++export, though it can be a null or an ``off, off, off, off`` one.
++
++Also, even if the shader doesn't need to export any real data, the export
++skipping that was added in GFX10 must not be used, and some space must be
++allocated in the export buffer, such as by setting ``SPI_SHADER_COL_FORMAT`` for
++some color output to ``SPI_SHADER_32_R``.
++
++Without this, the shader will be executed without the needed synchronization on
++GFX10, and will hang on GFX11.
++
++Drawing context setup
++---------------------
++
++Configuring POPS
++^^^^^^^^^^^^^^^^
++
++Most of the configuration is performed via the ``DB_SHADER_CONTROL`` register.
++
++To enable POPS for the draw,
++``DB_SHADER_CONTROL.PRIMITIVE_ORDERED_PIXEL_SHADER`` should be set to 1.
++
++On GFX9–10.3, ``DB_SHADER_CONTROL.POPS_OVERLAP_NUM_SAMPLES`` controls which
++fragment shader invocations are considered overlapping:
++
++* For pixel interlock, it must be set to 0 (1 sample).
++* If sample interlock is sufficient (only synchronizing between invocations that
++  have any common sample mask bits), it may be set to
++  ``PA_SC_AA_CONFIG.MSAA_EXPOSED_SAMPLES`` — the number of sample coverage mask
++  bits passed to the shader which is expected to use the sample mask to
++  determine whether it's allowed to access the data for each of the samples. As
++  of April 2023, PAL for some reason doesn't use non-1x
++  ``POPS_OVERLAP_NUM_SAMPLES`` at all, even when using Direct3D Rasterizer
++  Ordered Views or ``GL_INTEL_fragment_shader_ordering`` with sample shading
++  (those APIs tie the interlock granularity to the shading frequency — Vulkan
++  and OpenGL fragment shader interlock, however, allows specifying the interlock
++  granularity independently of it, making it possible both to ask for finer
++  synchronization guarantees and to require stronger ones than Direct3D ROVs can
++  provide). However, with MSAA, on AMD hardware, pixel interlock generally
++  performs *massively*, sometimes prohibitively, slower than sample interlock,
++  because it causes fragment shader invocations along the common edge of
++  adjacent primitives to be ordered as they cover the same pixels (even though
++  they don't cover any common samples). So it's highly desirable for the driver
++  to provide sample interlock, and to set ``POPS_OVERLAP_NUM_SAMPLES``
++  accordingly, if the shader declares that it's enough for it via the execution
++  mode.
++
++On GFX11, when POPS is enabled, ``DB_SHADER_CONTROL.OVERRIDE_INTRINSIC_RATE`` is
++used in place of ``DB_SHADER_CONTROL.POPS_OVERLAP_NUM_SAMPLES`` from the earlier
++architecture generations (and has a different bit offset in the register), and
++``DB_SHADER_CONTROL.OVERRIDE_INTRINSIC_RATE_ENABLE`` must be set to 1. The GFX11
++blending performance workaround overriding the intrinsic rate must not be
++applied if POPS is used in the draw — the intrinsic rate override must be used
++solely to control the interlock granularity in this case.
++
++No explicit flushes/synchronization are needed when changing the pipeline state
++variables that may be involved in POPS, such as the rasterization sample count.
++POPS automatically keeps synchronizing invocations even between draws with
++different sample counts (invocations with common coverage mask bits are
++considered overlapping by the hardware, regardless of what those samples
++actually are — only the indices are important).
++
++Also, on GFX11, POPS uses ``DB_Z_INFO.NUM_SAMPLES`` to determine the coverage
++sample count, and it must be equal to ``PA_SC_AA_CONFIG.MSAA_EXPOSED_SAMPLES``
++even if there's no depth/stencil target.
++
++Hardware bug workarounds
++^^^^^^^^^^^^^^^^^^^^^^^^
++
++Early revisions of GFX9 — ``CHIP_VEGA10`` and ``CHIP_RAVEN`` — contain a
++hardware bug that may result in a hang, and need a workaround to be enabled.
++Specifically, if POPS is used with 8 or more rasterization samples, or with 8 or
++more depth/stencil target samples, ``DB_DFSM_CONTROL.POPS_DRAIN_PS_ON_OVERLAP``
++must be set to 1 for draws that satisfy this condition. In PAL, this is the
++``waMiscPopsMissedOverlap`` workaround. It results in slightly lower performance
++in those cases, increasing the frame time by around 1.5 to 2 times in
++`nvpro-samples/vk_order_independent_transparency <https://github.com/nvpro-samples/vk_order_independent_transparency>`_
++on the RX Vega 10, but it's required in a pretty rare case (8x+ MSAA) and is
++mandatory to ensure stability.
++
++Also, even though ``DB_DFSM_CONTROL.POPS_DRAIN_PS_ON_OVERLAP`` is not required
++on chips other than the ``CHIP_VEGA10`` and ``CHIP_RAVEN`` GFX9 revisions, if
++it's enabled for some reason on GFX10.1 (``CHIP_NAVI10``, ``CHIP_NAVI12``,
++``CHIP_NAVI14``), and the draw uses POPS,
++``DB_RENDER_OVERRIDE2.PARTIAL_SQUAD_LAUNCH_CONTROL`` must be set to
++``PSLC_ON_HANG_ONLY`` to avoid a hang (see ``waStalledPopsMode`` in PAL).
++
++Out-of-order rasterization interaction
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++
++This is a largely unresearched topic currently. However, considering that POPS
++is primarily the functionality of the Depth Block, similarity to the behavior of
++out-of-order rasterization in depth/stencil testing may possibly be expected.
++
++If the shader specifies an ordered interlock execution mode, out-of-order
++rasterization likely must not be enabled implicitly.
++
++As of April 2023, PAL doesn't have any rules specifically for POPS in the logic
++determining whether out-of-order rasterization can be enabled automatically.
++Some of the POPS usage cases may possibly be covered by the rule that always
++disables out-of-order rasterization if the shader writes to Unordered Access
++Views (storage resources), though fragment shader interlock can be used for
++read-only purposes too (for ordering between draws that only read per-pixel data
++and draws that may write it), so that may be an oversight.
++
++Explicitly enabled relaxed rasterization order modifies the concept of
++rasterization order itself in Vulkan, so from the point of view of the
++specification of fragment shader interlock, relaxed rasterization order should
++still be applicable regardless of whether the shader requests ordered interlock.
++PAL also doesn't make any POPS-specific exceptions here as of April 2023.
++
++Variable-rate shading interaction
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++
++On GFX10.3, enabling ``DB_SHADER_CONTROL.PRIMITIVE_ORDERED_PIXEL_SHADER`` forces
++the shading rate to be 1x1, thus the
++``fragmentShadingRateWithFragmentShaderInterlock`` Vulkan device property must
++be false.
++
++On GFX11, by default, POPS itself can work with non-1x1 shading rates, and the
++``fragmentShadingRateWithFragmentShaderInterlock`` property must be true.
++However, if ``PA_SC_VRS_SURFACE_CNTL_1.FORCE_SC_VRS_RATE_FINE_POPS`` is set,
++enabling POPS will force 1x1 shading rate.
++
++The widest interlock granularity available on GFX11 — with the lowest possible
++Depth Block intrinsic rate, 1x — is per-fine-pixel, however. There's no
++synchronization between coarse fragment shader invocations if they don't cover
++common fine pixels, so the ``fragmentShaderShadingRateInterlock`` Vulkan device
++feature is not available.
++
++Additional configuration
++^^^^^^^^^^^^^^^^^^^^^^^^
++
++These are some largely unresearched options found in the register declarations.
++PAL doesn't use them, so it's unknown if they make any significant difference.
++No effect was found in `nvpro-samples/vk_order_independent_transparency <https://github.com/nvpro-samples/vk_order_independent_transparency>`_
++during testing on GFX9 ``CHIP_RAVEN`` and GFX11 ``CHIP_GFX1100``.
++
++* ``DB_SHADER_CONTROL.EXEC_IF_OVERLAPPED`` on GFX9–10.3.
++* ``PA_SC_BINNER_CNTL_0.BIN_MAPPING_MODE = BIN_MAP_MODE_POPS`` on GFX10+.
+diff --git a/docs/drivers/radv.rst b/docs/drivers/radv.rst
+index 5c37b95d59477..5368efb49be01 100644
+--- a/docs/drivers/radv.rst
++++ b/docs/drivers/radv.rst
+@@ -16,6 +16,13 @@ You can find a list of documentation for the various generations of
+ AMD hardware on the `X.Org wiki
+ <https://www.x.org/wiki/RadeonFeature/#documentation>`__.
+ 
++Additional community-written documentation is also available in Mesa:
++
++.. toctree::
++   :glob:
++
++   amd/hw/*
++
+ ACO
+ ---
+ 
+-- 
+GitLab
+
+
+From bfaba950caba2907112e8444bbdd452b4ded4ec5 Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Wed, 26 Apr 2023 21:09:48 +0300
+Subject: [PATCH 02/23] ac/nir: Support Primitive Ordered Pixel Shading in
+ lower_ps
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/common/ac_nir_lower_ps.c | 32 +++++++++++++++++++++++++++++++-
+ 1 file changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/common/ac_nir_lower_ps.c b/src/amd/common/ac_nir_lower_ps.c
+index e9ae9498d5328..84425ec344965 100644
+--- a/src/amd/common/ac_nir_lower_ps.c
++++ b/src/amd/common/ac_nir_lower_ps.c
+@@ -715,12 +715,27 @@ emit_ps_dual_src_blend_swizzle(nir_builder *b, lower_ps_state *s, unsigned first
+ static void
+ emit_ps_null_export(nir_builder *b, lower_ps_state *s)
+ {
++   const bool pops = b->shader->info.fs.sample_interlock_ordered ||
++                     b->shader->info.fs.sample_interlock_unordered ||
++                     b->shader->info.fs.pixel_interlock_ordered ||
++                     b->shader->info.fs.pixel_interlock_unordered;
++
+    /* Gfx10+ doesn't need to export anything if we don't need to export the EXEC mask
+     * for discard.
++    * In Primitive Ordered Pixel Shading, however, GFX11+ explicitly uses the `done` export to exit
++    * the ordered section, and before GFX11, shaders with POPS also need an export.
+     */
+-   if (s->options->gfx_level >= GFX10 && !s->options->uses_discard)
++   if (s->options->gfx_level >= GFX10 && !s->options->uses_discard && !pops)
+       return;
+ 
++   /* The `done` export exits the POPS ordered section on GFX11+, make sure UniformMemory and
++    * ImageMemory (in SPIR-V terms) accesses from the ordered section may not be reordered below it.
++    */
++   if (s->options->gfx_level >= GFX11 && pops)
++      nir_scoped_memory_barrier(b, SCOPE_QUEUE_FAMILY, NIR_MEMORY_RELEASE,
++                                nir_var_image | nir_var_mem_ubo | nir_var_mem_ssbo |
++                                nir_var_mem_global);
++
+    /* Gfx11 doesn't support null exports, and mrt0 should be exported instead. */
+    unsigned target = s->options->gfx_level >= GFX11 ?
+       V_008DFC_SQ_EXP_MRT : V_008DFC_SQ_EXP_NULL;
+@@ -813,6 +828,21 @@ export_ps_outputs(nir_builder *b, lower_ps_state *s)
+       unsigned final_exp_flags = nir_intrinsic_flags(final_exp);
+       final_exp_flags |= AC_EXP_FLAG_DONE | AC_EXP_FLAG_VALID_MASK;
+       nir_intrinsic_set_flags(final_exp, final_exp_flags);
++
++      /* The `done` export exits the POPS ordered section on GFX11+, make sure UniformMemory and
++       * ImageMemory (in SPIR-V terms) accesses from the ordered section may not be reordered below
++       * it.
++       */
++      if (s->options->gfx_level >= GFX11 &&
++          (b->shader->info.fs.sample_interlock_ordered ||
++           b->shader->info.fs.sample_interlock_unordered ||
++           b->shader->info.fs.pixel_interlock_ordered ||
++           b->shader->info.fs.pixel_interlock_unordered)) {
++         b->cursor = nir_before_instr(&final_exp->instr);
++         nir_scoped_memory_barrier(b, SCOPE_QUEUE_FAMILY, NIR_MEMORY_RELEASE,
++                                   nir_var_image | nir_var_mem_ubo | nir_var_mem_ssbo |
++                                   nir_var_mem_global);
++      }
+    } else {
+       emit_ps_null_export(b, s);
+    }
+-- 
+GitLab
+
+
+From bdf2d01425888bca49bc0e07cde6adb7ef13ecb7 Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Mon, 3 Apr 2023 20:50:41 +0300
+Subject: [PATCH 03/23] aco: Support pops_exiting_wave_id PhysReg usage
+
+pops_exiting_wave_id is a volatile ALU source operand containing the ID of
+the latest wave that hasn't exited yet, for comparing with the newest
+overlapped wave ID in overlapping waves.
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/compiler/aco_ir.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/amd/compiler/aco_ir.h b/src/amd/compiler/aco_ir.h
+index 08a9a2a2017e7..545be7337e1e1 100644
+--- a/src/amd/compiler/aco_ir.h
++++ b/src/amd/compiler/aco_ir.h
+@@ -482,6 +482,7 @@ static constexpr PhysReg sgpr_null{125}; /* GFX10+ */
+ static constexpr PhysReg exec{126};
+ static constexpr PhysReg exec_lo{126};
+ static constexpr PhysReg exec_hi{127};
++static constexpr PhysReg pops_exiting_wave_id{239}; /* GFX9-GFX10.3 */
+ static constexpr PhysReg vccz{251};
+ static constexpr PhysReg execz{252};
+ static constexpr PhysReg scc{253};
+-- 
+GitLab
+
+
+From 71dbf1ee231f193437848b1a1c856dd8dccebdc0 Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Mon, 3 Apr 2023 21:08:15 +0300
+Subject: [PATCH 04/23] ac: Define POPS collision wave ID argument SGPR
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/common/ac_shader_args.h |  1 +
+ src/amd/compiler/README-ISA.md  | 14 ++++++++++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/src/amd/common/ac_shader_args.h b/src/amd/common/ac_shader_args.h
+index 6f46fecfae931..1c8c4b93055fc 100644
+--- a/src/amd/common/ac_shader_args.h
++++ b/src/amd/common/ac_shader_args.h
+@@ -117,6 +117,7 @@ struct ac_shader_args {
+    struct ac_arg ancillary;
+    struct ac_arg sample_coverage;
+    struct ac_arg prim_mask;
++   struct ac_arg pops_collision_wave_id;
+    struct ac_arg load_provoking_vtx;
+    struct ac_arg persp_sample;
+    struct ac_arg persp_center;
+diff --git a/src/amd/compiler/README-ISA.md b/src/amd/compiler/README-ISA.md
+index 7e6329dc7fdee..ccc8c60931909 100644
+--- a/src/amd/compiler/README-ISA.md
++++ b/src/amd/compiler/README-ISA.md
+@@ -189,6 +189,20 @@ On GFX9, the A16 field enables both 16 bit addresses and derivatives.
+ Since GFX10+ these are fully independent of each other, A16 controls 16 bit addresses
+ and G16 opcodes 16 bit derivatives. A16 without G16 uses 32 bit derivatives.
+ 
++## POPS collision wave ID argument (GFX9-10.3)
++
++The 2020 RDNA and RDNA 2 ISA references contain incorrect offsets and widths of
++the fields of the "POPS collision wave ID" SGPR argument.
++
++According to the code generated for Rasterizer Ordered View usage in Direct3D,
++the correct layout is:
++
++* [31]: Whether overlap has occurred.
++* [29:28] (GFX10+) / [28] (GFX9): ID of the packer the wave should be associated
++  with.
++* [25:16]: Newest overlapped wave ID.
++* [9:0]: Current wave ID.
++
+ # Hardware Bugs
+ 
+ ## SMEM corrupts VCCZ on SI/CI
+-- 
+GitLab
+
+
+From 2e078b0daaed0e2413e91c4000aa0d883f2223c9 Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Mon, 3 Apr 2023 21:09:34 +0300
+Subject: [PATCH 05/23] aco: Add s_wait_event argument bit definitions
+
+A wait for export_ready (if the corresponding bit is not set in the
+instruction) is done to enter the Primitive Ordered Pixel Shading ordered
+section on GFX11.
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/compiler/aco_ir.h         | 10 ++++++++++
+ src/amd/compiler/aco_print_ir.cpp |  5 +++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/src/amd/compiler/aco_ir.h b/src/amd/compiler/aco_ir.h
+index 545be7337e1e1..579a18c741d67 100644
+--- a/src/amd/compiler/aco_ir.h
++++ b/src/amd/compiler/aco_ir.h
+@@ -284,6 +284,16 @@ struct wait_imm {
+    bool empty() const;
+ };
+ 
++/* s_wait_event immediate bits. */
++enum wait_event_imm : uint16_t {
++   /* If this bit is 0, await that the export buffer space has been allocated.
++    * In Primitive Ordered Pixel Shading, export ready means that the overlapped waves have exited
++    * their ordered sections (by performing the `done` export), and that the current wave may enter
++    * its ordered section.
++    */
++   wait_event_imm_dont_wait_export_ready = 0x1,
++};
++
+ constexpr Format
+ asVOP3(Format format)
+ {
+diff --git a/src/amd/compiler/aco_print_ir.cpp b/src/amd/compiler/aco_print_ir.cpp
+index c7ba8578d1922..b216072a3d4fc 100644
+--- a/src/amd/compiler/aco_print_ir.cpp
++++ b/src/amd/compiler/aco_print_ir.cpp
+@@ -389,6 +389,11 @@ print_instr_format_specific(enum amd_gfx_level gfx_level, const Instruction* ins
+          }
+          break;
+       }
++      case aco_opcode::s_wait_event: {
++         if (!(imm & wait_event_imm_dont_wait_export_ready))
++            fprintf(output, " export_ready");
++         break;
++      }
+       default: {
+          if (imm)
+             fprintf(output, " imm:%u", imm);
+-- 
+GitLab
+
+
+From 0e8f00a0108731818981d6c45c4d58f84a78fa4e Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Mon, 3 Apr 2023 21:22:02 +0300
+Subject: [PATCH 06/23] aco: Add Primitive Ordered Pixel Shading
+ pseudo-instructions
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/compiler/aco_lower_to_hw_instr.cpp   |  5 ++++
+ src/amd/compiler/aco_opcodes.py              | 28 ++++++++++++++++++++
+ src/amd/compiler/aco_opt_value_numbering.cpp |  4 ++-
+ 3 files changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/compiler/aco_lower_to_hw_instr.cpp b/src/amd/compiler/aco_lower_to_hw_instr.cpp
+index f35991e36dadc..4005046f88501 100644
+--- a/src/amd/compiler/aco_lower_to_hw_instr.cpp
++++ b/src/amd/compiler/aco_lower_to_hw_instr.cpp
+@@ -2403,6 +2403,11 @@ lower_to_hw_instr(Program* program)
+                }
+                break;
+             }
++            case aco_opcode::p_pops_gfx9_add_exiting_wave_id: {
++               bld.sop2(aco_opcode::s_add_i32, instr->definitions[0], instr->definitions[1],
++                        Operand(pops_exiting_wave_id, s1), instr->operands[0]);
++               break;
++            }
+             case aco_opcode::p_bpermute_gfx6: {
+                emit_gfx6_bpermute(program, instr, bld);
+                break;
+diff --git a/src/amd/compiler/aco_opcodes.py b/src/amd/compiler/aco_opcodes.py
+index d3bcf078ec6f2..04b2645b61aa4 100644
+--- a/src/amd/compiler/aco_opcodes.py
++++ b/src/amd/compiler/aco_opcodes.py
+@@ -293,6 +293,34 @@ opcode("p_cbranch_nz", format=Format.PSEUDO_BRANCH)
+ 
+ opcode("p_barrier", format=Format.PSEUDO_BARRIER)
+ 
++# Primitive Ordered Pixel Shading pseudo-instructions.
++
++# For querying whether the current wave can enter the ordered section on GFX9-10.3, doing
++# s_add_i32(pops_exiting_wave_id, op0), but in a way that it's different from a usual SALU
++# instruction so that it's easier to maintain the volatility of pops_exiting_wave_id and to handle
++# the polling specially in scheduling.
++# Definitions:
++# - Result SGPR;
++# - Clobbered SCC.
++# Operands:
++# - s1 value to add, usually -(current_wave_ID + 1) (or ~current_wave_ID) to remap the exiting wave
++#   ID from wrapping [0, 0x3FF] to monotonic [0, 0xFFFFFFFF].
++opcode("p_pops_gfx9_add_exiting_wave_id")
++
++# Indicates that the wait for the completion of the ordered section in overlapped waves has been
++# finished on GFX9-10.3. Not lowered to any hardware instructions.
++opcode("p_pops_gfx9_overlapped_wave_wait_done")
++
++# Indicates that a POPS ordered section has ended, hints that overlapping waves can possibly
++# continue execution. The overlapping waves may actually be resumed by this instruction or anywhere
++# later, however, especially taking into account the fact that there can be multiple ordered
++# sections in a wave (for instance, if one is chosen in divergent control flow in the source
++# shader), thus multiple p_pops_gfx9_ordered_section_done instructions. At least one must be present
++# in the program if POPS is used, however, otherwise the location of the end of the ordered section
++# will be undefined. Only needed on GFX9-10.3 (GFX11+ ordered section is until the last export,
++# can't be exited early). Not lowered to any hardware instructions.
++opcode("p_pops_gfx9_ordered_section_done")
++
+ opcode("p_spill")
+ opcode("p_reload")
+ 
+diff --git a/src/amd/compiler/aco_opt_value_numbering.cpp b/src/amd/compiler/aco_opt_value_numbering.cpp
+index ff936f1b833f5..f7619d35a5928 100644
+--- a/src/amd/compiler/aco_opt_value_numbering.cpp
++++ b/src/amd/compiler/aco_opt_value_numbering.cpp
+@@ -357,7 +357,9 @@ can_eliminate(aco_ptr<Instruction>& instr)
+    }
+ 
+    if (instr->definitions.empty() || instr->opcode == aco_opcode::p_phi ||
+-       instr->opcode == aco_opcode::p_linear_phi || instr->definitions[0].isNoCSE())
++       instr->opcode == aco_opcode::p_linear_phi ||
++       instr->opcode == aco_opcode::p_pops_gfx9_add_exiting_wave_id ||
++       instr->definitions[0].isNoCSE())
+       return false;
+ 
+    return true;
+-- 
+GitLab
+
+
+From a92f7488f52ea0a93c5a6d4e816060baece77a60 Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Sat, 15 Apr 2023 21:45:12 +0300
+Subject: [PATCH 07/23] aco: Skip waitcnt insertion in the discard early exit
+ block
+
+Waits are needed for early exits from inside a Primitive Ordered Pixel
+Shading ordered section, but that code doesn't insert them reliably anyway
+because it doesn't obtain the counters for the exact locations of the
+jumps, which may be anywhere inside the predecessor blocks.
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/compiler/aco_insert_waitcnt.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/amd/compiler/aco_insert_waitcnt.cpp b/src/amd/compiler/aco_insert_waitcnt.cpp
+index 985a8e1d944ae..64fdd87653d87 100644
+--- a/src/amd/compiler/aco_insert_waitcnt.cpp
++++ b/src/amd/compiler/aco_insert_waitcnt.cpp
+@@ -1037,6 +1037,15 @@ insert_wait_states(Program* program)
+ 
+    for (unsigned i = 0; i < program->blocks.size();) {
+       Block& current = program->blocks[i++];
++
++      if (current.kind & block_kind_discard_early_exit) {
++         /* Because the jump to the discard early exit block may happen anywhere in a block, it's
++          * not possible to join it with its predecessors this way.
++          * We emit all required waits when emitting the discard block.
++          */
++         continue;
++      }
++
+       wait_ctx ctx = in_ctx[current.index];
+ 
+       if (current.kind & block_kind_loop_header) {
+-- 
+GitLab
+
+
+From f83a98c92ece14ea946240a9afc3da264d5e701b Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Mon, 3 Apr 2023 21:27:47 +0300
+Subject: [PATCH 08/23] aco: Add Primitive Ordered Pixel Shading scheduling
+ rules
+
+Implementing the acquire/release semantics of fragment shader interlock
+ordered section in Vulkan, and preventing reordering of memory accesses
+requiring primitive ordering out of the ordered section.
+
+Also, the ordered section should be as short as possible, so not reordering
+the instructions awaiting overlapped waves upwards, and the exit from the
+ordered section downwards.
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/compiler/aco_ir.cpp        | 14 ++++++++++++++
+ src/amd/compiler/aco_scheduler.cpp | 23 ++++++++++++++++++++++-
+ 2 files changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/compiler/aco_ir.cpp b/src/amd/compiler/aco_ir.cpp
+index ea5e1f229d689..6bed14788b0ec 100644
+--- a/src/amd/compiler/aco_ir.cpp
++++ b/src/amd/compiler/aco_ir.cpp
+@@ -223,6 +223,20 @@ init_program(Program* program, Stage stage, const struct aco_shader_info* info,
+ memory_sync_info
+ get_sync_info(const Instruction* instr)
+ {
++   /* Primitive Ordered Pixel Shading barriers necessary for accesses to memory shared between
++    * different overlapping waves in the queue family - after awaiting the overlapped waves, and
++    * before letting the overlapping waves enter their ordered sections.
++    * `p_pops_gfx9_overlapped_wave_wait_done` on GFX9-10.3, `s_wait_event export_ready` on GFX11+,
++    * indicates the beginning of the ordered section.
++    */
++   if (instr->opcode == aco_opcode::p_pops_gfx9_overlapped_wave_wait_done ||
++       (instr->opcode == aco_opcode::s_wait_event &&
++        !(instr->sopp().imm & wait_event_imm_dont_wait_export_ready))) {
++      return memory_sync_info(storage_buffer | storage_image, semantic_acquire, scope_queuefamily);
++   } else if (instr->opcode == aco_opcode::p_pops_gfx9_ordered_section_done) {
++      return memory_sync_info(storage_buffer | storage_image, semantic_release, scope_queuefamily);
++   }
++
+    switch (instr->format) {
+    case Format::SMEM: return instr->smem().sync;
+    case Format::MUBUF: return instr->mubuf().sync;
+diff --git a/src/amd/compiler/aco_scheduler.cpp b/src/amd/compiler/aco_scheduler.cpp
+index 2e43fa2d62a12..d0cd09db36259 100644
+--- a/src/amd/compiler/aco_scheduler.cpp
++++ b/src/amd/compiler/aco_scheduler.cpp
+@@ -571,6 +571,21 @@ perform_hazard_query(hazard_query* query, Instruction* instr, bool upwards)
+    if (!upwards && instr->opcode == aco_opcode::p_exit_early_if)
+       return hazard_fail_unreorderable;
+ 
++   /* In Primitive Ordered Pixel Shading, await overlapped waves as late as possible, and notify
++    * overlapping waves that they can continue execution as early as possible.
++    */
++   if (upwards) {
++      if (instr->opcode == aco_opcode::p_pops_gfx9_add_exiting_wave_id ||
++          (instr->opcode == aco_opcode::s_wait_event &&
++           !(instr->sopp().imm & wait_event_imm_dont_wait_export_ready))) {
++         return hazard_fail_unreorderable;
++      }
++   } else {
++      if (instr->opcode == aco_opcode::p_pops_gfx9_ordered_section_done) {
++         return hazard_fail_unreorderable;
++      }
++   }
++
+    if (query->uses_exec || query->writes_exec) {
+       for (const Definition& def : instr->definitions) {
+          if (def.isFixed() && def.physReg() == exec)
+@@ -580,7 +595,13 @@ perform_hazard_query(hazard_query* query, Instruction* instr, bool upwards)
+    if (query->writes_exec && needs_exec_mask(instr))
+       return hazard_fail_exec;
+ 
+-   /* don't move exports so that they stay closer together */
++   /* Don't move exports so that they stay closer together.
++    * Also, with Primitive Ordered Pixel Shading on GFX11+, the `done` export must not be moved
++    * above the memory accesses before the queue family scope (more precisely, fragment interlock
++    * scope, but it's not available in ACO) release barrier that is expected to be inserted before
++    * the export, as well as before any `s_wait_event export_ready` which enters the ordered
++    * section, because the `done` export exits the ordered section.
++    */
+    if (instr->isEXP())
+       return hazard_fail_export;
+ 
+-- 
+GitLab
+
+
+From 205c13825db041196ccaf66745785955508342a6 Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Mon, 3 Apr 2023 21:18:21 +0300
+Subject: [PATCH 09/23] aco: Send MSG_ORDERED_PS_DONE where necessary
+
+If the wave has set the Primitive Ordered Pixel Shading packer ID hardware
+register, it must send MSG_ORDERED_PS_DONE once before the program ends.
+It's also safe to send the message if the packer ID register hasn't been
+set yet, therefore the message may be sent conservatively. For simplicity,
+to ensure that it's sent on all execution paths after setting the packer ID
+register, always sending it from a top-level block. This is required for
+GFX9-10.3 POPS.
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/compiler/aco_ir.h                  |   1 +
+ src/amd/compiler/aco_lower_to_hw_instr.cpp | 137 ++++++++++++++++++++-
+ 2 files changed, 136 insertions(+), 2 deletions(-)
+
+diff --git a/src/amd/compiler/aco_ir.h b/src/amd/compiler/aco_ir.h
+index 579a18c741d67..0db65e8979e86 100644
+--- a/src/amd/compiler/aco_ir.h
++++ b/src/amd/compiler/aco_ir.h
+@@ -2134,6 +2134,7 @@ public:
+    Stage stage;
+    bool needs_exact = false; /* there exists an instruction with disable_wqm = true */
+    bool needs_wqm = false;   /* there exists a p_wqm instruction */
++   bool has_pops_overlapped_waves_wait = false;
+    bool has_color_exports = false;
+ 
+    std::vector<uint8_t> constant_data;
+diff --git a/src/amd/compiler/aco_lower_to_hw_instr.cpp b/src/amd/compiler/aco_lower_to_hw_instr.cpp
+index 4005046f88501..db1003be73cfc 100644
+--- a/src/amd/compiler/aco_lower_to_hw_instr.cpp
++++ b/src/amd/compiler/aco_lower_to_hw_instr.cpp
+@@ -38,6 +38,94 @@ struct lower_context {
+    std::vector<aco_ptr<Instruction>> instructions;
+ };
+ 
++/* Class for obtaining where s_sendmsg(MSG_ORDERED_PS_DONE) must be done in a Primitive Ordered
++ * Pixel Shader on GFX9-10.3.
++ *
++ * MSG_ORDERED_PS_DONE must be sent once after the ordered section is done along all execution paths
++ * from the POPS packer ID hardware register setting to s_endpgm. It is, however, also okay to send
++ * it if the packer ID is not going to be set at all by the wave, so some conservativeness is fine.
++ *
++ * For simplicity, sending the message from top-level blocks as dominance and post-dominance
++ * checking for any location in the shader is trivial in them. Also, for simplicity, sending it
++ * regardless of whether the POPS packer ID hardware register has already potentially been set up.
++ *
++ * Note that there can be multiple interlock end instructions in the shader.
++ * SPV_EXT_fragment_shader_interlock requires OpEndInvocationInterlockEXT to be executed exactly
++ * once by the invocation. However, there may be, for instance, multiple ordered sections, and which
++ * one will be executed may depend on divergent control flow (some lanes may execute one ordered
++ * section, other lanes may execute another). MSG_ORDERED_PS_DONE, however, is sent via a scalar
++ * instruction, so it must be ensured that the message is sent after the last ordered section in the
++ * entire wave.
++ */
++class gfx9_pops_done_msg_bounds {
++public:
++   explicit gfx9_pops_done_msg_bounds() = default;
++
++   explicit gfx9_pops_done_msg_bounds(const Program* const program)
++   {
++      /* Find the top-level location after the last ordered section end pseudo-instruction in the
++       * program.
++       * Consider `p_pops_gfx9_overlapped_wave_wait_done` a boundary too - make sure the message
++       * isn't sent if any wait hasn't been fully completed yet (if a begin-end-begin situation
++       * occurs somehow, as the location of `p_pops_gfx9_ordered_section_done` is controlled by the
++       * application) for safety, assuming that waits are the only thing that need the packer
++       * hardware register to be set at some point during or before them, and it won't be set
++       * anymore after the last wait.
++       */
++      int last_top_level_block_idx = -1;
++      for (int block_idx = (int)program->blocks.size() - 1; block_idx >= 0; block_idx--) {
++         const Block& block = program->blocks[block_idx];
++         if (block.kind & block_kind_top_level) {
++            last_top_level_block_idx = block_idx;
++         }
++         for (size_t instr_idx = block.instructions.size() - 1; instr_idx + size_t(1) > 0;
++              instr_idx--) {
++            const aco_opcode opcode = block.instructions[instr_idx]->opcode;
++            if (opcode == aco_opcode::p_pops_gfx9_ordered_section_done ||
++                opcode == aco_opcode::p_pops_gfx9_overlapped_wave_wait_done) {
++               end_block_idx_ = last_top_level_block_idx;
++               /* The same block if it's already a top-level block, or the beginning of the next
++                * top-level block.
++                */
++               instr_after_end_idx_ = block_idx == end_block_idx_ ? instr_idx + 1 : 0;
++               break;
++            }
++         }
++         if (end_block_idx_ != -1) {
++            break;
++         }
++      }
++   }
++
++   /* If this is not -1, during the normal execution flow (not early exiting), MSG_ORDERED_PS_DONE
++    * must be sent in this block.
++    */
++   int end_block_idx() const { return end_block_idx_; }
++
++   /* If end_block_idx() is an existing block, during the normal execution flow (not early exiting),
++    * MSG_ORDERED_PS_DONE must be sent before this instruction in the block end_block_idx().
++    * If this is out of the bounds of the instructions in the end block, it must be sent in the end
++    * of that block.
++    */
++   size_t instr_after_end_idx() const { return instr_after_end_idx_; }
++
++   /* Whether an instruction doing early exit (such as discard) needs to send MSG_ORDERED_PS_DONE
++    * before actually ending the program.
++    */
++   bool early_exit_needs_done_msg(const int block_idx, const size_t instr_idx) const
++   {
++      return block_idx <= end_block_idx_ &&
++             (block_idx != end_block_idx_ || instr_idx < instr_after_end_idx_);
++   }
++
++private:
++   /* Initialize to an empty range for which "is inside" comparisons will be failing for any
++    * block.
++    */
++   int end_block_idx_ = -1;
++   size_t instr_after_end_idx_ = 0;
++};
++
+ /* used by handle_operands() indirectly through Builder::copy */
+ uint8_t int8_mul_table[512] = {
+    0, 20,  1,  1,   1,  2,   1,  3,   1,  4,   1, 5,   1,  6,   1,  7,   1,  8,   1,  9,
+@@ -2202,7 +2290,13 @@ lower_image_sample(lower_context* ctx, aco_ptr<Instruction>& instr)
+ void
+ lower_to_hw_instr(Program* program)
+ {
+-   Block* discard_block = NULL;
++   gfx9_pops_done_msg_bounds pops_done_msg_bounds;
++   if (program->has_pops_overlapped_waves_wait && program->gfx_level < GFX11) {
++      pops_done_msg_bounds = gfx9_pops_done_msg_bounds(program);
++   }
++
++   Block* discard_exit_block = NULL;
++   Block* discard_pops_done_and_exit_block = NULL;
+ 
+    bool should_dealloc_vgprs = dealloc_vgprs(program);
+ 
+@@ -2218,6 +2312,19 @@ lower_to_hw_instr(Program* program)
+ 
+       for (size_t instr_idx = 0; instr_idx < block->instructions.size(); instr_idx++) {
+          aco_ptr<Instruction>& instr = block->instructions[instr_idx];
++
++         /* Send the ordered section done message from the middle of the block if needed (if the
++          * ordered section is ended by an instruction inside this block).
++          * Also make sure the done message is sent if it's needed in case early exit happens for
++          * any reason.
++          */
++         if ((block_idx == pops_done_msg_bounds.end_block_idx() &&
++              instr_idx == pops_done_msg_bounds.instr_after_end_idx()) ||
++             (instr->opcode == aco_opcode::s_endpgm &&
++              pops_done_msg_bounds.early_exit_needs_done_msg(block_idx, instr_idx))) {
++            bld.sopp(aco_opcode::s_sendmsg, -1, sendmsg_ordered_ps_done);
++         }
++
+          aco_ptr<Instruction> mov;
+          if (instr->isPseudo() && instr->opcode != aco_opcode::p_unit_test) {
+             Pseudo_instruction* pi = &instr->pseudo();
+@@ -2336,12 +2443,24 @@ lower_to_hw_instr(Program* program)
+                      break;
+                }
+ 
++               const bool discard_sends_pops_done =
++                  pops_done_msg_bounds.early_exit_needs_done_msg(block_idx, instr_idx);
++
++               Block* discard_block =
++                  discard_sends_pops_done ? discard_pops_done_and_exit_block : discard_exit_block;
+                if (!discard_block) {
+                   discard_block = program->create_and_insert_block();
+                   discard_block->kind = block_kind_discard_early_exit;
++                  if (discard_sends_pops_done) {
++                     discard_pops_done_and_exit_block = discard_block;
++                  } else {
++                     discard_exit_block = discard_block;
++                  }
+                   block = &program->blocks[block_idx];
+ 
+                   bld.reset(discard_block);
++                  if (discard_sends_pops_done)
++                     bld.sopp(aco_opcode::s_sendmsg, -1, sendmsg_ordered_ps_done);
+                   unsigned target = V_008DFC_SQ_EXP_NULL;
+                   if (program->gfx_level >= GFX11)
+                      target =
+@@ -2607,6 +2726,9 @@ lower_to_hw_instr(Program* program)
+                break;
+             }
+             case aco_opcode::p_jump_to_epilog: {
++               if (pops_done_msg_bounds.early_exit_needs_done_msg(block_idx, instr_idx)) {
++                  bld.sopp(aco_opcode::s_sendmsg, -1, sendmsg_ordered_ps_done);
++               }
+                bld.sop1(aco_opcode::s_setpc_b64, instr->operands[0]);
+                break;
+             }
+@@ -2773,7 +2895,8 @@ lower_to_hw_instr(Program* program)
+                      bool is_break_continue =
+                         program->blocks[i].kind & (block_kind_break | block_kind_continue);
+                      bool discard_early_exit =
+-                        discard_block && (unsigned)inst->sopp().block == discard_block->index;
++                        inst->sopp().block != -1 &&
++                        (program->blocks[inst->sopp().block].kind & block_kind_discard_early_exit);
+                      if ((inst->opcode != aco_opcode::s_cbranch_scc0 &&
+                           inst->opcode != aco_opcode::s_cbranch_scc1) ||
+                          (!discard_early_exit && !is_break_continue))
+@@ -2897,6 +3020,16 @@ lower_to_hw_instr(Program* program)
+             ctx.instructions.emplace_back(std::move(instr));
+          }
+       }
++
++      /* Send the ordered section done message from this block if it's needed in this block, but
++       * instr_after_end_idx() points beyond the end of its instructions. This may commonly happen
++       * if the common post-dominator of multiple end locations turns out to be an empty block.
++       */
++      if (block_idx == pops_done_msg_bounds.end_block_idx() &&
++          pops_done_msg_bounds.instr_after_end_idx() >= block->instructions.size()) {
++         bld.sopp(aco_opcode::s_sendmsg, -1, sendmsg_ordered_ps_done);
++      }
++
+       block->instructions = std::move(ctx.instructions);
+    }
+ }
+-- 
+GitLab
+
+
+From f0d2a3645f5a816ce85561dde6b3735309bce5d4 Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Thu, 6 Apr 2023 23:09:35 +0300
+Subject: [PATCH 10/23] aco: Add Primitive Ordered Pixel Shading waitcnt rules
+
+When letting the overlapping waves enter their ordered sections, there must
+be no memory accesses to resources which need primitive-ordered access that
+are still pending, or there would be a race between the current wave and
+the overlapping waves.
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/compiler/aco_insert_waitcnt.cpp       | 32 +++++++++++++++++++
+ .../compiler/aco_instruction_selection.cpp    |  2 ++
+ src/amd/compiler/aco_ir.h                     |  1 +
+ src/amd/compiler/aco_lower_to_hw_instr.cpp    | 21 ++++++++++++
+ 4 files changed, 56 insertions(+)
+
+diff --git a/src/amd/compiler/aco_insert_waitcnt.cpp b/src/amd/compiler/aco_insert_waitcnt.cpp
+index 64fdd87653d87..3566942927cfa 100644
+--- a/src/amd/compiler/aco_insert_waitcnt.cpp
++++ b/src/amd/compiler/aco_insert_waitcnt.cpp
+@@ -505,10 +505,42 @@ kill(wait_imm& imm, alu_delay_info& delay, Instruction* instr, wait_ctx& ctx,
+       /* Force emitting waitcnt states right after the instruction if there is
+        * something to wait for. This is also applied for s_setpc_b64 to ensure
+        * waitcnt states are inserted before jumping to the PS epilog.
++       * Among the reasons, with Primitive Ordered Pixel Shading (both
++       * pre-GFX11 with the ordered_ps_done message, and GFX11+ with the
++       * `done` export), this will await until memory accesses reach the L2
++       * cache (vm and vs 0, and lgkm 0 if SMEM loads are used) before letting
++       * the overlapping waves continue execution by performing the export
++       * from the PS epilog.
+        */
+       force_waitcnt(ctx, imm);
+    }
+ 
++   /* Make sure POPS coherent memory accesses have reached the L2 cache before letting the
++    * overlapping waves proceed into the ordered section.
++    */
++   if (ctx.program->has_pops_overlapped_waves_wait &&
++       (ctx.gfx_level >= GFX11 ? instr->isEXP() && instr->exp().done
++                               : (instr->opcode == aco_opcode::s_sendmsg &&
++                                  instr->sopp().imm == sendmsg_ordered_ps_done))) {
++      if (ctx.vm_cnt)
++         imm.vm = 0;
++      if (ctx.gfx_level >= GFX10 && ctx.vs_cnt)
++         imm.vs = 0;
++      /* Though SMEM loads would be pointless for resources requiring primitive-ordered access, as
++       * the addresses must be unique for each pixel or sample, otherwise access won't be
++       * synchronized, but they still can be generated (for example, if the application has a
++       * waterfall loop for the address, which is not impossible even though that would just result
++       * in serialization of all lanes) and must be handled safely. Note that even though
++       * primitive-ordered accesses are expected to be made coherent explicitly by the shader, it's
++       * not necessary for SMEM loads, or loads in general, to be GLC if they are preceded by other
++       * GLC memory accesses - including VMEM - to the same locations making them visible to the
++       * current invocation, as GLC accesses invalidate the L0 cache for the accessed locations. So
++       * we're awaiting lkgmcnt(0) regardless of whether those SMEM loads are coherent.
++       */
++      if (ctx.program->has_smem_buffer_or_global_loads && ctx.lgkm_cnt)
++         imm.lgkm = 0;
++   }
++
+    check_instr(ctx, imm, delay, instr);
+ 
+    /* It's required to wait for scalar stores before "writing back" data.
+diff --git a/src/amd/compiler/aco_instruction_selection.cpp b/src/amd/compiler/aco_instruction_selection.cpp
+index c3d3a97667f33..1dcd666eea256 100644
+--- a/src/amd/compiler/aco_instruction_selection.cpp
++++ b/src/amd/compiler/aco_instruction_selection.cpp
+@@ -4398,6 +4398,8 @@ smem_load_callback(Builder& bld, const LoadEmitInfo& info, Temp offset, unsigned
+ {
+    assert(align >= 4u);
+ 
++   bld.program->has_smem_buffer_or_global_loads = true;
++
+    bool buffer = info.resource.id() && info.resource.bytes() == 16;
+    Temp addr = info.resource;
+    if (!buffer && !addr.id()) {
+diff --git a/src/amd/compiler/aco_ir.h b/src/amd/compiler/aco_ir.h
+index 0db65e8979e86..48474b461f28e 100644
+--- a/src/amd/compiler/aco_ir.h
++++ b/src/amd/compiler/aco_ir.h
+@@ -2134,6 +2134,7 @@ public:
+    Stage stage;
+    bool needs_exact = false; /* there exists an instruction with disable_wqm = true */
+    bool needs_wqm = false;   /* there exists a p_wqm instruction */
++   bool has_smem_buffer_or_global_loads = false;
+    bool has_pops_overlapped_waves_wait = false;
+    bool has_color_exports = false;
+ 
+diff --git a/src/amd/compiler/aco_lower_to_hw_instr.cpp b/src/amd/compiler/aco_lower_to_hw_instr.cpp
+index db1003be73cfc..c2b37a217fc41 100644
+--- a/src/amd/compiler/aco_lower_to_hw_instr.cpp
++++ b/src/amd/compiler/aco_lower_to_hw_instr.cpp
+@@ -2459,6 +2459,27 @@ lower_to_hw_instr(Program* program)
+                   block = &program->blocks[block_idx];
+ 
+                   bld.reset(discard_block);
++                  if (program->has_pops_overlapped_waves_wait &&
++                      (program->gfx_level >= GFX11 || discard_sends_pops_done)) {
++                     /* Memory accesses in the POPS ordered section must not be pending by the time
++                      * the overlapping waves are resumed, otherwise a race condition may occur
++                      * between the current wave and now-running overlapping waves.
++                      * Normally this is done by the usual waitcnt insertion, but it doesn't work in
++                      * the discard early exit block, so perform the needed waits here.
++                      * Before GFX9, s_sendmsg(MSG_ORDERED_PS_DONE) exits the ordered section.
++                      * Starting with GFX11, the `done` export itself exits it, and we're not
++                      * tracking whether the current location is potentially inside the ordered
++                      * section, so waiting unconditionally.
++                      */
++                     if (program->gfx_level >= GFX10)
++                        bld.sopk(aco_opcode::s_waitcnt_vscnt, Definition(sgpr_null, s1), 0);
++                     wait_imm pops_exit_wait_imm;
++                     pops_exit_wait_imm.vm = 0;
++                     if (program->has_smem_buffer_or_global_loads)
++                        pops_exit_wait_imm.lgkm = 0;
++                     bld.sopp(aco_opcode::s_waitcnt, -1,
++                              pops_exit_wait_imm.pack(program->gfx_level));
++                  }
+                   if (discard_sends_pops_done)
+                      bld.sopp(aco_opcode::s_sendmsg, -1, sendmsg_ordered_ps_done);
+                   unsigned target = V_008DFC_SQ_EXP_NULL;
+-- 
+GitLab
+
+
+From 2e2d8dd3fb06644be1406b3cdf4df66d12db4107 Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Mon, 3 Apr 2023 21:54:38 +0300
+Subject: [PATCH 11/23] aco: Implement fragment shader interlock intrinsics
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ .../compiler/aco_instruction_selection.cpp    | 126 ++++++++++++++++++
+ 1 file changed, 126 insertions(+)
+
+diff --git a/src/amd/compiler/aco_instruction_selection.cpp b/src/amd/compiler/aco_instruction_selection.cpp
+index 1dcd666eea256..fc614da52323c 100644
+--- a/src/amd/compiler/aco_instruction_selection.cpp
++++ b/src/amd/compiler/aco_instruction_selection.cpp
+@@ -8063,6 +8063,7 @@ emit_interp_center(isel_context* ctx, Temp dst, Temp bary, Temp pos1, Temp pos2)
+ 
+ Temp merged_wave_info_to_mask(isel_context* ctx, unsigned i);
+ Temp lanecount_to_mask(isel_context* ctx, Temp count);
++void pops_await_overlapped_waves(isel_context* ctx);
+ 
+ Temp
+ get_interp_param(isel_context* ctx, nir_intrinsic_op intrin, enum glsl_interp_mode interp)
+@@ -9213,6 +9214,15 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
+          as_vgpr(ctx, get_ssa_temp(ctx, instr->src[0].ssa));
+       break;
+    }
++   case nir_intrinsic_begin_invocation_interlock: {
++      pops_await_overlapped_waves(ctx);
++      break;
++   }
++   case nir_intrinsic_end_invocation_interlock: {
++      if (ctx->options->gfx_level < GFX11)
++         bld.pseudo(aco_opcode::p_pops_gfx9_ordered_section_done);
++      break;
++   }
+    default:
+       isel_err(&instr->instr, "Unimplemented intrinsic instr");
+       abort();
+@@ -11237,6 +11247,122 @@ select_program_rt(isel_context& ctx, unsigned shader_count, struct nir_shader* c
+    cleanup_cfg(ctx.program);
+ }
+ 
++void
++pops_await_overlapped_waves(isel_context* ctx)
++{
++   ctx->program->has_pops_overlapped_waves_wait = true;
++
++   Builder bld(ctx->program, ctx->block);
++
++   if (ctx->program->gfx_level >= GFX11) {
++      /* GFX11+ - waiting for the export from the overlapped waves.
++       * Await the export_ready event (bit wait_event_imm_dont_wait_export_ready clear).
++       */
++      bld.sopp(aco_opcode::s_wait_event, -1, 0);
++      return;
++   }
++
++   /* Pre-GFX11 - sleep loop polling the exiting wave ID. */
++
++   const Temp collision = get_arg(ctx, ctx->args->pops_collision_wave_id);
++
++   /* Check if there's an overlap in the current wave - otherwise, the wait may result in a hang. */
++   const Temp did_overlap =
++      bld.sopc(aco_opcode::s_bitcmp1_b32, bld.def(s1, scc), collision, Operand::c32(31));
++   if_context did_overlap_if_context;
++   begin_uniform_if_then(ctx, &did_overlap_if_context, did_overlap);
++   bld.reset(ctx->block);
++
++   /* Set the packer register - after this, pops_exiting_wave_id can be polled. */
++   if (ctx->program->gfx_level >= GFX10) {
++      /* 2 packer ID bits on GFX10-10.3. */
++      const Temp packer_id = bld.sop2(aco_opcode::s_bfe_u32, bld.def(s1), bld.def(s1, scc),
++                                      collision, Operand::c32(0x2001c));
++      /* POPS_PACKER register: bit 0 - POPS enabled for this wave, bits 2:1 - packer ID. */
++      const Temp packer_id_hwreg_bits = bld.sop2(aco_opcode::s_lshl1_add_u32, bld.def(s1),
++                                                 bld.def(s1, scc), packer_id, Operand::c32(1));
++      bld.sopk(aco_opcode::s_setreg_b32, packer_id_hwreg_bits, ((3 - 1) << 11) | 25);
++   } else {
++      /* 1 packer ID bit on GFX9. */
++      const Temp packer_id = bld.sop2(aco_opcode::s_bfe_u32, bld.def(s1), bld.def(s1, scc),
++                                      collision, Operand::c32(0x1001c));
++      /* MODE register: bit 24 - wave is associated with packer 0, bit 25 - with packer 1.
++       * Packer index to packer bits: 0 to 0b01, 1 to 0b10.
++       */
++      const Temp packer_id_hwreg_bits =
++         bld.sop2(aco_opcode::s_add_i32, bld.def(s1), bld.def(s1, scc), packer_id, Operand::c32(1));
++      bld.sopk(aco_opcode::s_setreg_b32, packer_id_hwreg_bits, ((2 - 1) << 11) | (24 << 6) | 1);
++   }
++
++   Temp newest_overlapped_wave_id = bld.sop2(aco_opcode::s_bfe_u32, bld.def(s1), bld.def(s1, scc),
++                                             collision, Operand::c32(0xa0010));
++   if (ctx->program->gfx_level < GFX10) {
++      /* On GFX9, the newest overlapped wave ID value passed to the shader is smaller than the
++       * actual wave ID by 1 in case of wraparound.
++       */
++      const Temp current_wave_id = bld.sop2(aco_opcode::s_and_b32, bld.def(s1), bld.def(s1, scc),
++                                            collision, Operand::c32(0x3ff));
++      const Temp newest_overlapped_wave_id_wrapped = bld.sopc(
++         aco_opcode::s_cmp_gt_u32, bld.def(s1, scc), newest_overlapped_wave_id, current_wave_id);
++      newest_overlapped_wave_id =
++         bld.sop2(aco_opcode::s_add_i32, bld.def(s1), bld.def(s1, scc), newest_overlapped_wave_id,
++                  newest_overlapped_wave_id_wrapped);
++   }
++
++   /* The wave IDs are the low 10 bits of a monotonically increasing wave counter.
++    * The overlapped and the exiting wave IDs can't be larger than the current wave ID, and they are
++    * no more than 1023 values behind the current wave ID.
++    * Remap the overlapped and the exiting wave IDs from wrapping to monotonic so an unsigned
++    * comparison can be used: the wave `current - 1023` becomes 0, it's followed by a piece growing
++    * away from 0, then a piece increasing until UINT32_MAX, and the current wave is UINT32_MAX.
++    * To do that, subtract `current - 1023`, which with wrapping arithmetic is (current + 1), and
++    * `a - (b + 1)` is `a + ~b`.
++    * Note that if the 10-bit current wave ID is 1023 (thus 1024 will be subtracted), the wave
++    * `current - 1023` will become `UINT32_MAX - 1023` rather than 0, but all the possible wave IDs
++    * will still grow monotonically in the 32-bit value, and the unsigned comparison will behave as
++    * expected.
++    */
++   const Temp wave_id_offset = bld.sop2(aco_opcode::s_nand_b32, bld.def(s1), bld.def(s1, scc),
++                                        collision, Operand::c32(0x3ff));
++   newest_overlapped_wave_id = bld.sop2(aco_opcode::s_add_i32, bld.def(s1), bld.def(s1, scc),
++                                        newest_overlapped_wave_id, wave_id_offset);
++
++   /* Await the overlapped waves. */
++
++   loop_context wait_loop_context;
++   begin_loop(ctx, &wait_loop_context);
++   bld.reset(ctx->block);
++
++   const Temp exiting_wave_id = bld.pseudo(aco_opcode::p_pops_gfx9_add_exiting_wave_id, bld.def(s1),
++                                           bld.def(s1, scc), wave_id_offset);
++   /* If the exiting (not exited) wave ID is larger than the newest overlapped wave ID (after
++    * remapping both to monotonically increasing unsigned integers), the newest overlapped wave has
++    * exited the ordered section.
++    */
++   const Temp newest_overlapped_wave_exited = bld.sopc(aco_opcode::s_cmp_lt_u32, bld.def(s1, scc),
++                                                       newest_overlapped_wave_id, exiting_wave_id);
++   if_context newest_overlapped_wave_exited_if_context;
++   begin_uniform_if_then(ctx, &newest_overlapped_wave_exited_if_context,
++                         newest_overlapped_wave_exited);
++   emit_loop_break(ctx);
++   begin_uniform_if_else(ctx, &newest_overlapped_wave_exited_if_context);
++   end_uniform_if(ctx, &newest_overlapped_wave_exited_if_context);
++   bld.reset(ctx->block);
++
++   /* Sleep before rechecking to let overlapped waves run for some time. */
++   bld.sopp(aco_opcode::s_sleep, -1, ctx->program->gfx_level >= GFX10 ? UINT16_MAX : 3);
++
++   end_loop(ctx, &wait_loop_context);
++   bld.reset(ctx->block);
++
++   /* Indicate the wait has been done to subsequent compilation stages. */
++   bld.pseudo(aco_opcode::p_pops_gfx9_overlapped_wave_wait_done);
++
++   begin_uniform_if_else(ctx, &did_overlap_if_context);
++   end_uniform_if(ctx, &did_overlap_if_context);
++   bld.reset(ctx->block);
++}
++
+ } /* end namespace */
+ 
+ void
+-- 
+GitLab
+
+
+From a1417004baa45fc047462d21852a504047aefbcb Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Mon, 3 Apr 2023 22:14:39 +0300
+Subject: [PATCH 12/23] radeonsi: Remove unconditional POPS_DRAIN_PS_ON_OVERLAP
+ setting
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This hardware hang workaround (PAL waMiscPopsMissedOverlap) is needed only
+on some Vega chips, and only for 8 or more samples per pixel. It has a
+significant performance cost (around 1.5x-2x in
+nvpro-samples/vk_order_independent_transparency), so it should be precisely
+configured when setting up Primitive Ordered Pixel Shading.
+
+It was added in 47b780be21d917eaa6a6a6c9e30ba9fba52d9acd, when POPS was not
+used in Mesa, with the change being described as "this may not be needed
+yet, but let's set it now".
+
+Reviewed-by: Marek Olšák <marek.olsak@amd.com>
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/gallium/drivers/radeonsi/si_state.c | 8 ++------
+ 1 file changed, 2 insertions(+), 6 deletions(-)
+
+diff --git a/src/gallium/drivers/radeonsi/si_state.c b/src/gallium/drivers/radeonsi/si_state.c
+index 6ee32a45271ec..81e3bd28c1a1c 100644
+--- a/src/gallium/drivers/radeonsi/si_state.c
++++ b/src/gallium/drivers/radeonsi/si_state.c
+@@ -5751,9 +5751,7 @@ static void gfx6_init_gfx_preamble_state(struct si_context *sctx, bool uses_reg_
+       si_pm4_set_reg(pm4, R_030924_VGT_MIN_VTX_INDX, 0);
+       si_pm4_set_reg(pm4, R_030928_VGT_INDX_OFFSET, 0);
+ 
+-      si_pm4_set_reg(pm4, R_028060_DB_DFSM_CONTROL,
+-                     S_028060_PUNCHOUT_MODE(V_028060_FORCE_OFF) |
+-                     S_028060_POPS_DRAIN_PS_ON_OVERLAP(1));
++      si_pm4_set_reg(pm4, R_028060_DB_DFSM_CONTROL, S_028060_PUNCHOUT_MODE(V_028060_FORCE_OFF));
+ 
+       si_pm4_set_reg_idx3(pm4, R_00B41C_SPI_SHADER_PGM_RSRC3_HS,
+                           ac_apply_cu_en(S_00B41C_CU_EN(0xffff) | S_00B41C_WAVE_LIMIT(0x3F),
+@@ -5954,9 +5952,7 @@ static void gfx10_init_gfx_preamble_state(struct si_context *sctx, bool uses_reg
+ 
+    /* Context registers. */
+    if (sctx->gfx_level < GFX11) {
+-      si_pm4_set_reg(pm4, R_028038_DB_DFSM_CONTROL,
+-                     S_028038_PUNCHOUT_MODE(V_028038_FORCE_OFF) |
+-                     S_028038_POPS_DRAIN_PS_ON_OVERLAP(1));
++      si_pm4_set_reg(pm4, R_028038_DB_DFSM_CONTROL, S_028038_PUNCHOUT_MODE(V_028038_FORCE_OFF));
+    }
+    si_pm4_set_reg(pm4, R_02807C_DB_RMI_L2_CACHE_CONTROL,
+                   S_02807C_Z_WR_POLICY(V_02807C_CACHE_STREAM) |
+-- 
+GitLab
+
+
+From 63f4702f96e0414630a50a7cd56acd6f68088843 Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Mon, 3 Apr 2023 22:15:37 +0300
+Subject: [PATCH 13/23] radv: Remove unconditional POPS_DRAIN_PS_ON_OVERLAP
+ setting
+
+This hardware hang workaround (PAL waMiscPopsMissedOverlap) is needed only
+on some Vega chips, and only for 8 or more samples per pixel. It has a
+significant performance cost (around 1.5x-2x in
+nvpro-samples/vk_order_independent_transparency), so it should be precisely
+configured when setting up Primitive Ordered Pixel Shading.
+
+It was added in 47b780be21d917eaa6a6a6c9e30ba9fba52d9acd, when POPS was not
+used in Mesa, with the change being described as "this may not be needed
+yet, but let's set it now".
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/vulkan/si_cmd_buffer.c | 6 ++----
+ 1 file changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/src/amd/vulkan/si_cmd_buffer.c b/src/amd/vulkan/si_cmd_buffer.c
+index c7b1e0056ca53..acbfe356e9de2 100644
+--- a/src/amd/vulkan/si_cmd_buffer.c
++++ b/src/amd/vulkan/si_cmd_buffer.c
+@@ -287,16 +287,14 @@ si_emit_graphics(struct radv_device *device, struct radeon_cmdbuf *cs)
+       radeon_set_uconfig_reg(cs, R_030988_GE_USER_VGPR_EN, 0);
+ 
+       if (physical_device->rad_info.gfx_level < GFX11) {
+-         radeon_set_context_reg(cs, R_028038_DB_DFSM_CONTROL,
+-                                S_028038_PUNCHOUT_MODE(V_028038_FORCE_OFF) | S_028038_POPS_DRAIN_PS_ON_OVERLAP(1));
++         radeon_set_context_reg(cs, R_028038_DB_DFSM_CONTROL, S_028038_PUNCHOUT_MODE(V_028038_FORCE_OFF));
+       }
+    } else if (physical_device->rad_info.gfx_level == GFX9) {
+       radeon_set_uconfig_reg(cs, R_030920_VGT_MAX_VTX_INDX, ~0);
+       radeon_set_uconfig_reg(cs, R_030924_VGT_MIN_VTX_INDX, 0);
+       radeon_set_uconfig_reg(cs, R_030928_VGT_INDX_OFFSET, 0);
+ 
+-      radeon_set_context_reg(cs, R_028060_DB_DFSM_CONTROL,
+-                             S_028060_PUNCHOUT_MODE(V_028060_FORCE_OFF) | S_028060_POPS_DRAIN_PS_ON_OVERLAP(1));
++      radeon_set_context_reg(cs, R_028060_DB_DFSM_CONTROL, S_028060_PUNCHOUT_MODE(V_028060_FORCE_OFF));
+    } else {
+       /* These registers, when written, also overwrite the
+        * CLEAR_STATE context, so we can't rely on CLEAR_STATE setting
+-- 
+GitLab
+
+
+From f91ae0eee719326210f7834048a605681fdc8d7b Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Sat, 3 Jun 2023 00:26:31 +0300
+Subject: [PATCH 14/23] radv: Detect the use of Primitive Ordered Pixel Shading
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/vulkan/radv_shader.h      | 2 ++
+ src/amd/vulkan/radv_shader_info.c | 6 ++++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_shader.h b/src/amd/vulkan/radv_shader.h
+index 2759fda5ea1ec..0cf51d27ed032 100644
+--- a/src/amd/vulkan/radv_shader.h
++++ b/src/amd/vulkan/radv_shader.h
+@@ -374,6 +374,8 @@ struct radv_shader_info {
+       uint8_t reads_sample_pos_mask;
+       uint8_t depth_layout;
+       bool allow_flat_shading;
++      bool pops; /* Uses Primitive Ordered Pixel Shading (fragment shader interlock) */
++      bool pops_is_per_sample;
+       bool has_epilog;
+       bool mrt0_is_dual_src;
+       unsigned spi_ps_input;
+diff --git a/src/amd/vulkan/radv_shader_info.c b/src/amd/vulkan/radv_shader_info.c
+index eb7607d9a56a7..f8daad6648cd7 100644
+--- a/src/amd/vulkan/radv_shader_info.c
++++ b/src/amd/vulkan/radv_shader_info.c
+@@ -231,6 +231,9 @@ gather_intrinsic_info(const nir_shader *nir, const nir_intrinsic_instr *instr, s
+    case nir_intrinsic_load_poly_line_smooth_enabled:
+       info->ps.needs_poly_line_smooth = true;
+       break;
++   case nir_intrinsic_begin_invocation_interlock:
++      info->ps.pops = true;
++      break;
+    default:
+       break;
+    }
+@@ -587,6 +590,9 @@ gather_shader_info_fs(const struct radv_device *device, const nir_shader *nir,
+         BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_SAMPLE_MASK_IN) ||
+         BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_HELPER_INVOCATION));
+ 
++   info->ps.pops_is_per_sample =
++      info->ps.pops && (nir->info.fs.sample_interlock_ordered || nir->info.fs.sample_interlock_unordered);
++
+    info->ps.spi_ps_input = radv_compute_spi_ps_input(pipeline_key, info);
+ 
+    info->ps.has_epilog = pipeline_key->ps.has_epilog && info->ps.colors_written;
+-- 
+GitLab
+
+
+From 587cd1aeb523c864842c87c13c5b813db7b0d97f Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Sat, 3 Jun 2023 00:29:31 +0300
+Subject: [PATCH 15/23] radv: Force 1x1 shading rate if FS uses an interlock
+ execution mode
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/vulkan/radv_cmd_buffer.c  | 10 ++++------
+ src/amd/vulkan/radv_shader.h      |  1 +
+ src/amd/vulkan/radv_shader_info.c | 19 +++++++++++++++++++
+ 3 files changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index cb578ce724ace..60ac6b10037b4 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -2254,8 +2254,7 @@ radv_should_force_vrs1x1(struct radv_cmd_buffer *cmd_buffer)
+    const struct radv_shader *ps = cmd_buffer->state.shaders[MESA_SHADER_FRAGMENT];
+ 
+    return pdevice->rad_info.gfx_level >= GFX10_3 &&
+-          (cmd_buffer->state.ms.sample_shading_enable ||
+-           (ps && ps->info.ps.reads_sample_mask_in && !ps->info.ps.needs_poly_line_smooth));
++          (cmd_buffer->state.ms.sample_shading_enable || (ps && ps->info.ps.force_sample_iter_shading_rate));
+ }
+ 
+ static void
+@@ -2314,8 +2313,7 @@ radv_emit_fragment_shading_rate(struct radv_cmd_buffer *cmd_buffer)
+    /* Disable VRS and use the rates from PS_ITER_SAMPLES if:
+     *
+     * 1) sample shading is enabled or per-sample interpolation is used by the fragment shader
+-    * 2) the fragment shader reads gl_SampleMaskIn because the 16-bit sample coverage mask isn't
+-    *    enough for MSAA8x and 2x2 coarse shading isn't enough.
++    * 2) the fragment shader requires 1x1 shading rate for some other reason
+     */
+    if (radv_should_force_vrs1x1(cmd_buffer)) {
+       pa_cl_vrs_cntl |= S_028848_SAMPLE_ITER_COMBINER_MODE(V_028848_SC_VRS_COMB_MODE_OVERRIDE);
+@@ -6348,8 +6346,8 @@ radv_bind_fragment_shader(struct radv_cmd_buffer *cmd_buffer, const struct radv_
+    if (!previous_ps || previous_ps->info.ps.reads_fully_covered != ps->info.ps.reads_fully_covered)
+       cmd_buffer->state.dirty |= RADV_CMD_DIRTY_DYNAMIC_CONSERVATIVE_RAST_MODE;
+ 
+-   if (gfx_level >= GFX10_3 &&
+-       (!previous_ps || previous_ps->info.ps.reads_sample_mask_in != ps->info.ps.reads_sample_mask_in))
++   if (gfx_level >= GFX10_3 && (!previous_ps || previous_ps->info.ps.force_sample_iter_shading_rate !=
++                                                   ps->info.ps.force_sample_iter_shading_rate))
+       cmd_buffer->state.dirty |=
+          RADV_CMD_DIRTY_DYNAMIC_RASTERIZATION_SAMPLES | RADV_CMD_DIRTY_DYNAMIC_FRAGMENT_SHADING_RATE;
+ 
+diff --git a/src/amd/vulkan/radv_shader.h b/src/amd/vulkan/radv_shader.h
+index 0cf51d27ed032..a93dc6faa181b 100644
+--- a/src/amd/vulkan/radv_shader.h
++++ b/src/amd/vulkan/radv_shader.h
+@@ -384,6 +384,7 @@ struct radv_shader_info {
+       uint8_t color0_written;
+       bool load_provoking_vtx;
+       bool load_rasterization_prim;
++      bool force_sample_iter_shading_rate;
+       uint32_t db_shader_control; /* DB_SHADER_CONTROL without intrinsic rate overrides */
+    } ps;
+    struct {
+diff --git a/src/amd/vulkan/radv_shader_info.c b/src/amd/vulkan/radv_shader_info.c
+index f8daad6648cd7..0a572cd82f731 100644
+--- a/src/amd/vulkan/radv_shader_info.c
++++ b/src/amd/vulkan/radv_shader_info.c
+@@ -644,6 +644,25 @@ gather_shader_info_fs(const struct radv_device *device, const nir_shader *nir,
+       }
+    }
+ 
++   /* Disable VRS and use the rates from PS_ITER_SAMPLES if:
++    *
++    * - The fragment shader reads gl_SampleMaskIn because the 16-bit sample coverage mask isn't enough for MSAA8x and
++    *   2x2 coarse shading.
++    * - On GFX10.3, if the fragment shader requests a fragment interlock execution mode, even if the resulting ISA
++    *   program ends up not having an ordered section due to it having been optimized out, to fully implement the
++    *   requirements of fragmentShadingRateWithFragmentShaderInterlock = VK_FALSE. Normally, GFX10.3 implicitly forces
++    *   1x1 shading rate if DB_SHADER_CONTROL PRIMITIVE_ORDERED_PIXEL_SHADER is 1, but RADV enables it only if there's a
++    *   real ordered section in the final program so there's no performance impact if one is not truly needed.
++    *   dEQP-VK.fragment_shading_rate.*.interlock.* itself is an example of largely meaningless interlock usage, where
++    *   the interlock is used specifically to check if fragmentShadingRateWithFragmentShaderInterlock is implemented
++    *   correctly, even though there's no per-pixel data that needs interlocked access.
++    */
++   info->ps.force_sample_iter_shading_rate =
++      (info->ps.reads_sample_mask_in && !info->ps.needs_poly_line_smooth) ||
++      (device->physical_device->rad_info.gfx_level == GFX10_3 &&
++       (nir->info.fs.sample_interlock_ordered || nir->info.fs.sample_interlock_unordered ||
++        nir->info.fs.pixel_interlock_ordered || nir->info.fs.pixel_interlock_unordered));
++
+    /* DB_SHADER_CONTROL based on other fragment shader info fields. */
+ 
+    unsigned conservative_z_export = V_02880C_EXPORT_ANY_Z;
+-- 
+GitLab
+
+
+From 32857386f32f87c591b6a66231fe40b513077ca3 Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Fri, 2 Jun 2023 22:55:48 +0300
+Subject: [PATCH 16/23] radv: Declare POPS collision wave ID shader argument
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/vulkan/radv_shader_args.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_shader_args.c b/src/amd/vulkan/radv_shader_args.c
+index 5c9775c96a58c..4abff1865f90e 100644
+--- a/src/amd/vulkan/radv_shader_args.c
++++ b/src/amd/vulkan/radv_shader_args.c
+@@ -668,6 +668,10 @@ declare_shader_args(const struct radv_device *device, const struct radv_pipeline
+ 
+       ac_add_arg(&args->ac, AC_ARG_SGPR, 1, AC_ARG_INT, &args->ac.prim_mask);
+ 
++      if (info->ps.pops && gfx_level < GFX11) {
++         ac_add_arg(&args->ac, AC_ARG_SGPR, 1, AC_ARG_INT, &args->ac.pops_collision_wave_id);
++      }
++
+       if (info->ps.load_provoking_vtx) {
+          ac_add_arg(&args->ac, AC_ARG_SGPR, 1, AC_ARG_INT, &args->ac.load_provoking_vtx);
+       }
+-- 
+GitLab
+
+
+From a1f714f7dad41ae8d63414bd2dcab1dcdce4ff92 Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Fri, 2 Jun 2023 22:58:47 +0300
+Subject: [PATCH 17/23] radv: Enable POPS collision wave ID shader argument
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/vulkan/radv_pipeline_graphics.c | 3 +++
+ src/amd/vulkan/radv_shader.c            | 3 ++-
+ 2 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipeline_graphics.c
+index 09c611aed351d..156b07e63c438 100644
+--- a/src/amd/vulkan/radv_pipeline_graphics.c
++++ b/src/amd/vulkan/radv_pipeline_graphics.c
+@@ -3340,6 +3340,9 @@ radv_emit_fragment_shader(const struct radv_device *device, struct radeon_cmdbuf
+    radeon_set_context_reg(ctx_cs, R_028710_SPI_SHADER_Z_FORMAT,
+                           ac_get_spi_shader_z_format(ps->info.ps.writes_z, ps->info.ps.writes_stencil,
+                                                      ps->info.ps.writes_sample_mask, ps->info.ps.writes_mrt0_alpha));
++
++   if (pdevice->rad_info.gfx_level >= GFX9 && pdevice->rad_info.gfx_level < GFX11)
++      radeon_set_context_reg(ctx_cs, R_028C40_PA_SC_SHADER_CONTROL, S_028C40_LOAD_COLLISION_WAVEID(ps->info.ps.pops));
+ }
+ 
+ static void
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index 44c218f879dcd..921a683e45ec2 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -1499,7 +1499,8 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
+    case MESA_SHADER_FRAGMENT:
+       config->rsrc1 |= S_00B028_MEM_ORDERED(pdevice->rad_info.gfx_level >= GFX10) |
+                        S_00B028_LOAD_PROVOKING_VTX(info->ps.load_provoking_vtx);
+-      config->rsrc2 |= S_00B02C_SHARED_VGPR_CNT(num_shared_vgpr_blocks) | S_00B02C_EXCP_EN(excp_en);
++      config->rsrc2 |= S_00B02C_SHARED_VGPR_CNT(num_shared_vgpr_blocks) | S_00B02C_EXCP_EN(excp_en) |
++                       S_00B02C_LOAD_COLLISION_WAVEID(info->ps.pops && pdevice->rad_info.gfx_level < GFX11);
+       break;
+    case MESA_SHADER_GEOMETRY:
+       config->rsrc1 |= S_00B228_MEM_ORDERED(pdevice->rad_info.gfx_level >= GFX10);
+-- 
+GitLab
+
+
+From 9614d68e5158350e06f8c5ad53dcafb4fa46e685 Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Mon, 3 Apr 2023 22:23:11 +0300
+Subject: [PATCH 18/23] radv: Enable the null export workaround with POPS
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/vulkan/radv_pipeline_graphics.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipeline_graphics.c
+index 156b07e63c438..7c9b8587e9c62 100644
+--- a/src/amd/vulkan/radv_pipeline_graphics.c
++++ b/src/amd/vulkan/radv_pipeline_graphics.c
+@@ -3831,8 +3831,11 @@ radv_needs_null_export_workaround(const struct radv_device *device, const struct
+     * instructions if any are present.
+     *
+     * GFX11 requires one color output, otherwise the DCC decompression does nothing.
++    *
++    * Primitive Ordered Pixel Shading also requires an export, otherwise interlocking doesn't work
++    * correctly before GFX11, and a hang happens on GFX11.
+     */
+-   return (gfx_level <= GFX9 || ps->info.ps.can_discard ||
++   return (gfx_level <= GFX9 || ps->info.ps.can_discard || ps->info.ps.pops ||
+            (custom_blend_mode == V_028808_CB_DCC_DECOMPRESS_GFX11 && gfx_level >= GFX11)) &&
+           !ps->info.ps.writes_z && !ps->info.ps.writes_stencil && !ps->info.ps.writes_sample_mask;
+ }
+-- 
+GitLab
+
+
+From 96b2674f0380b272f525230ef5e5037c9efcf769 Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Sun, 14 May 2023 00:23:16 +0300
+Subject: [PATCH 19/23] radv: Handle Primitive Ordered Pixel Shading in
+ DB_SHADER_CONTROL
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/vulkan/radv_cmd_buffer.c  | 24 ++++++++++++++++++++++--
+ src/amd/vulkan/radv_shader_info.c |  2 +-
+ 2 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index 60ac6b10037b4..74065748cc9d1 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -6364,7 +6364,8 @@ radv_bind_fragment_shader(struct radv_cmd_buffer *cmd_buffer, const struct radv_
+       cmd_buffer->state.dirty |= RADV_CMD_DIRTY_DYNAMIC_RASTERIZATION_SAMPLES;
+    }
+ 
+-   if (!previous_ps || previous_ps->info.ps.db_shader_control != ps->info.ps.db_shader_control)
++   if (!previous_ps || previous_ps->info.ps.db_shader_control != ps->info.ps.db_shader_control ||
++       previous_ps->info.ps.pops_is_per_sample != ps->info.ps.pops_is_per_sample)
+       cmd_buffer->state.dirty |= RADV_CMD_DIRTY_DB_SHADER_CONTROL;
+ 
+    /* Re-emit the PS epilog when a new fragment shader is bound. */
+@@ -8701,6 +8702,7 @@ radv_emit_db_shader_control(struct radv_cmd_buffer *cmd_buffer)
+    const struct radv_dynamic_state *d = &cmd_buffer->state.dynamic;
+    const bool uses_ds_feedback_loop =
+       !!(d->feedback_loop_aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
++   const unsigned rasterization_samples = radv_get_rasterization_samples(cmd_buffer);
+ 
+    uint32_t db_shader_control;
+ 
+@@ -8720,7 +8722,25 @@ radv_emit_db_shader_control(struct radv_cmd_buffer *cmd_buffer)
+        (rad_info->gfx_level == GFX6 && d->vk.rs.line.mode == VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH_EXT))
+       db_shader_control = (db_shader_control & C_02880C_Z_ORDER) | S_02880C_Z_ORDER(V_02880C_LATE_Z);
+ 
+-   if (rad_info->has_export_conflict_bug && radv_get_rasterization_samples(cmd_buffer) == 1) {
++   if (ps->info.ps.pops) {
++      /* If the shader accesses only per-sample data depending on the sample mask input, setting
++       * POPS_OVERLAP_NUM_SAMPLES to the number of exposed samples greatly increases performance with multisampling, as
++       * adjacent primitives (covering the same pixels, but different samples) don't have overlapping fragments.
++       * For the pixel interlock mode, POPS_OVERLAP_NUM_SAMPLES must be 0 (1x) regardless of whether sample shading is
++       * used, as Vulkan explicitly allows pixel interlock with sample shading.
++       * On GFX11, OVERRIDE_INTRINSIC_RATE_ENABLE must always be 1 with POPS. OVERRIDE_INTRINSIC_RATE works like
++       * POPS_OVERLAP_NUM_SAMPLES in this case. The export conflict performance workaround must not be applied with POPS
++       * also.
++       */
++      if (rad_info->gfx_level >= GFX11) {
++         db_shader_control |= S_02880C_OVERRIDE_INTRINSIC_RATE_ENABLE(1);
++         if (ps->info.ps.pops_is_per_sample)
++            db_shader_control |= S_02880C_OVERRIDE_INTRINSIC_RATE(util_logbase2(rasterization_samples));
++      } else {
++         if (ps->info.ps.pops_is_per_sample)
++            db_shader_control |= S_02880C_POPS_OVERLAP_NUM_SAMPLES(util_logbase2(rasterization_samples));
++      }
++   } else if (rad_info->has_export_conflict_bug && rasterization_samples == 1) {
+       for (uint32_t i = 0; i < MAX_RTS; i++) {
+          if (d->vk.cb.attachments[i].write_mask && d->vk.cb.attachments[i].blend_enable) {
+             db_shader_control |= S_02880C_OVERRIDE_INTRINSIC_RATE_ENABLE(1) | S_02880C_OVERRIDE_INTRINSIC_RATE(2);
+diff --git a/src/amd/vulkan/radv_shader_info.c b/src/amd/vulkan/radv_shader_info.c
+index 0a572cd82f731..b8d76275953a4 100644
+--- a/src/amd/vulkan/radv_shader_info.c
++++ b/src/amd/vulkan/radv_shader_info.c
+@@ -689,7 +689,7 @@ gather_shader_info_fs(const struct radv_device *device, const nir_shader *nir,
+       S_02880C_DEPTH_BEFORE_SHADER(info->ps.early_fragment_test) |
+       S_02880C_PRE_SHADER_DEPTH_COVERAGE_ENABLE(info->ps.post_depth_coverage) |
+       S_02880C_EXEC_ON_HIER_FAIL(info->ps.writes_memory) | S_02880C_EXEC_ON_NOOP(info->ps.writes_memory) |
+-      S_02880C_DUAL_QUAD_DISABLE(disable_rbplus);
++      S_02880C_DUAL_QUAD_DISABLE(disable_rbplus) | S_02880C_PRIMITIVE_ORDERED_PIXEL_SHADER(info->ps.pops);
+ }
+ 
+ static void
+-- 
+GitLab
+
+
+From bcea73fc90fbec8bdfded6d5508775f8eda4dab6 Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Mon, 3 Apr 2023 22:40:33 +0300
+Subject: [PATCH 20/23] ac/gpu_info: Check whether the device has the POPS
+ missed overlap bug
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/common/ac_gpu_info.c | 8 ++++++++
+ src/amd/common/ac_gpu_info.h | 1 +
+ 2 files changed, 9 insertions(+)
+
+diff --git a/src/amd/common/ac_gpu_info.c b/src/amd/common/ac_gpu_info.c
+index 1f3a38d4d0830..f4b1b5413a8da 100644
+--- a/src/amd/common/ac_gpu_info.c
++++ b/src/amd/common/ac_gpu_info.c
+@@ -1151,6 +1151,13 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info)
+ 
+    info->has_ls_vgpr_init_bug = info->family == CHIP_VEGA10 || info->family == CHIP_RAVEN;
+ 
++   /* If has_pops_missed_overlap_bug is true, when the pixel shader uses Primitive Ordered Pixel
++    * Shading, if there are 8 or more coverage samples, or 8 or more depth/stencil target samples,
++    * DB_DFSM_CONTROL.POPS_DRAIN_PS_ON_OVERLAP must be set to 1.
++    * waMiscPopsMissedOverlap in PAL.
++    */
++   info->has_pops_missed_overlap_bug = info->family == CHIP_VEGA10 || info->family == CHIP_RAVEN;
++
+    /* Drawing from 0-sized index buffers causes hangs on gfx10. */
+    info->has_zero_index_buffer_bug = info->gfx_level == GFX10;
+ 
+@@ -1665,6 +1672,7 @@ void ac_print_gpu_info(const struct radeon_info *info, FILE *f)
+    fprintf(f, "    has_tc_compat_zrange_bug = %i\n", info->has_tc_compat_zrange_bug);
+    fprintf(f, "    has_small_prim_filter_sample_loc_bug = %i\n", info->has_small_prim_filter_sample_loc_bug);
+    fprintf(f, "    has_ls_vgpr_init_bug = %i\n", info->has_ls_vgpr_init_bug);
++   fprintf(f, "    has_pops_missed_overlap_bug = %i\n", info->has_pops_missed_overlap_bug);
+    fprintf(f, "    has_32bit_predication = %i\n", info->has_32bit_predication);
+    fprintf(f, "    has_3d_cube_border_color_mipmap = %i\n", info->has_3d_cube_border_color_mipmap);
+    fprintf(f, "    has_image_opcodes = %i\n", info->has_image_opcodes);
+diff --git a/src/amd/common/ac_gpu_info.h b/src/amd/common/ac_gpu_info.h
+index 5b4edb2e2b9d8..66390f10faebb 100644
+--- a/src/amd/common/ac_gpu_info.h
++++ b/src/amd/common/ac_gpu_info.h
+@@ -96,6 +96,7 @@ struct radeon_info {
+    bool has_tc_compat_zrange_bug;
+    bool has_small_prim_filter_sample_loc_bug;
+    bool has_ls_vgpr_init_bug;
++   bool has_pops_missed_overlap_bug;
+    bool has_zero_index_buffer_bug;
+    bool has_image_load_dcc_bug;
+    bool has_two_planes_iterate256_bug;
+-- 
+GitLab
+
+
+From 5930c4f06f5936a3680b241a4227fc88360ef535 Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Thu, 27 Apr 2023 14:40:48 +0300
+Subject: [PATCH 21/23] radv: Apply the POPS missed overlap hardware bug
+ workaround
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/vulkan/radv_cmd_buffer.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index 74065748cc9d1..bb5b6d456cafc 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -8739,6 +8739,17 @@ radv_emit_db_shader_control(struct radv_cmd_buffer *cmd_buffer)
+       } else {
+          if (ps->info.ps.pops_is_per_sample)
+             db_shader_control |= S_02880C_POPS_OVERLAP_NUM_SAMPLES(util_logbase2(rasterization_samples));
++
++         if (rad_info->has_pops_missed_overlap_bug) {
++            /* The workaround needs to be enabled for 8+ coverage samples or 8+ depth/stencil samples, but the depth
++             * attachment sample count check is not necessary here, as in Vulkan extended with
++             * VK_AMD_mixed_attachment_samples, if the subpass uses color and/or depth/stencil attachments, the
++             * rasterization sample count must be the maximum of the sample counts of those attachments.
++             */
++            radeon_set_context_reg(cmd_buffer->cs, R_028060_DB_DFSM_CONTROL,
++                                   S_028060_PUNCHOUT_MODE(V_028060_FORCE_OFF) |
++                                      S_028060_POPS_DRAIN_PS_ON_OVERLAP(rasterization_samples >= 8));
++         }
+       }
+    } else if (rad_info->has_export_conflict_bug && rasterization_samples == 1) {
+       for (uint32_t i = 0; i < MAX_RTS; i++) {
+-- 
+GitLab
+
+
+From 9dc4999d4ea15fa3d88d8c4425c7513f362be1e4 Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Fri, 7 Apr 2023 17:31:04 +0300
+Subject: [PATCH 22/23] radv: Disable VRS forcing with Primitive Ordered Pixel
+ Shading
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ src/amd/vulkan/radv_pipeline_graphics.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipeline_graphics.c
+index 7c9b8587e9c62..288b964d70740 100644
+--- a/src/amd/vulkan/radv_pipeline_graphics.c
++++ b/src/amd/vulkan/radv_pipeline_graphics.c
+@@ -2078,9 +2078,14 @@ radv_consider_force_vrs(const struct radv_device *device, const struct radv_grap
+    if (!(pipeline->active_stages & VK_SHADER_STAGE_FRAGMENT_BIT))
+       return false;
+ 
+-   /* Do not enable if the PS uses gl_FragCoord because it breaks postprocessing in some games. */
++   /* Do not enable if the PS uses gl_FragCoord because it breaks postprocessing in some games, or with Primitive
++    * Ordered Pixel Shading (regardless of whether per-pixel data is addressed with gl_FragCoord or a custom
++    * interpolator) as that'd result in races between adjacent primitives with no common fine pixels.
++    */
+    nir_shader *fs_shader = stages[MESA_SHADER_FRAGMENT].nir;
+-   if (fs_shader && BITSET_TEST(fs_shader->info.system_values_read, SYSTEM_VALUE_FRAG_COORD)) {
++   if (fs_shader && (BITSET_TEST(fs_shader->info.system_values_read, SYSTEM_VALUE_FRAG_COORD) ||
++                     fs_shader->info.fs.sample_interlock_ordered || fs_shader->info.fs.sample_interlock_unordered ||
++                     fs_shader->info.fs.pixel_interlock_ordered || fs_shader->info.fs.pixel_interlock_unordered)) {
+       return false;
+    }
+ 
+-- 
+GitLab
+
+
+From 051de67cba9bf4426b791056145560cb0adbd9a2 Mon Sep 17 00:00:00 2001
+From: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+Date: Mon, 3 Apr 2023 22:50:12 +0300
+Subject: [PATCH 23/23] radv: Enable VK_EXT_fragment_shader_interlock
+
+ACO only currently - not available in LLVM.
+
+Signed-off-by: Vitaliy Triang3l Kuzmin <triang3l@yandex.ru>
+---
+ docs/features.txt                     |  2 +-
+ docs/relnotes/new_features.txt        |  1 +
+ src/amd/vulkan/radv_physical_device.c | 12 +++++++++++-
+ src/amd/vulkan/radv_private.h         |  6 ++++++
+ src/amd/vulkan/radv_shader.c          |  3 +++
+ 5 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/docs/features.txt b/docs/features.txt
+index 9be1ba1bd58f2..e3e12eac128b6 100644
+--- a/docs/features.txt
++++ b/docs/features.txt
+@@ -566,7 +566,7 @@ Khronos extensions that are not part of any Vulkan version:
+   VK_EXT_external_memory_dma_buf                        DONE (anv, pvr, radv, tu, v3dv, vn)
+   VK_EXT_external_memory_host                           DONE (anv, lvp, radv)
+   VK_EXT_filter_cubic                                   DONE (tu/a650)
+-  VK_EXT_fragment_shader_interlock                      DONE (anv/gen9+, vn)
++  VK_EXT_fragment_shader_interlock                      DONE (anv/gen9+, radv/gfx9+, vn)
+   VK_EXT_global_priority                                DONE (anv, radv, tu)
+   VK_EXT_global_priority_query                          DONE (anv, radv, tu)
+   VK_EXT_graphics_pipeline_library                      DONE (lvp, radv, tu)
+diff --git a/docs/relnotes/new_features.txt b/docs/relnotes/new_features.txt
+index 009dffa05b8c0..cd73147b1a708 100644
+--- a/docs/relnotes/new_features.txt
++++ b/docs/relnotes/new_features.txt
+@@ -7,3 +7,4 @@ OpenGL ES 3.0 on Asahi
+ VK_KHR_fragment_shader_barycentric on RADV/GFX10.3+
+ VK_KHR_ray_tracing_pipeline on RADV/GFX10.3+
+ VK_EXT_depth_bias_control on RADV
++VK_EXT_fragment_shader_interlock on RADV/GFX9+
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 4e652c2e93b2a..5f80efcc00645 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -494,6 +494,7 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device
+       .EXT_extended_dynamic_state3 = true,
+       .EXT_external_memory_dma_buf = true,
+       .EXT_external_memory_host = device->rad_info.has_userptr,
++      .EXT_fragment_shader_interlock = radv_has_pops(device),
+       .EXT_global_priority = true,
+       .EXT_global_priority_query = true,
+       .EXT_graphics_pipeline_library = !device->use_llvm && !(device->instance->debug_flags & RADV_DEBUG_NO_GPL),
+@@ -594,6 +595,7 @@ radv_physical_device_get_features(const struct radv_physical_device *pdevice, st
+    bool has_perf_query = radv_perf_query_supported(pdevice);
+    bool has_shader_image_float_minmax = pdevice->rad_info.gfx_level != GFX8 && pdevice->rad_info.gfx_level != GFX9 &&
+                                         pdevice->rad_info.gfx_level != GFX11;
++   bool has_fragment_shader_interlock = radv_has_pops(pdevice);
+ 
+    *features = (struct vk_features){
+       /* Vulkan 1.0 */
+@@ -1021,6 +1023,13 @@ radv_physical_device_get_features(const struct radv_physical_device *pdevice, st
+       .leastRepresentableValueForceUnormRepresentation = true,
+       .floatRepresentation = true,
+       .depthBiasExact = true,
++
++      /* VK_EXT_fragment_shader_interlock */
++      .fragmentShaderSampleInterlock = has_fragment_shader_interlock,
++      .fragmentShaderPixelInterlock = has_fragment_shader_interlock,
++      /* Even though GFX11 doesn't force 1x1 shading rate with POPS, overlap is detected at most at fine pixel
++       * granularity (with 1x DB intrinsic rate), thus no fragmentShaderShadingRateInterlock.
++       */
+    };
+ }
+ 
+@@ -1607,7 +1616,8 @@ radv_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, VkPhysicalDev
+          props->fragmentShadingRateWithSampleMask = true;
+          props->fragmentShadingRateWithShaderSampleMask = false;
+          props->fragmentShadingRateWithConservativeRasterization = true;
+-         props->fragmentShadingRateWithFragmentShaderInterlock = false;
++         props->fragmentShadingRateWithFragmentShaderInterlock =
++            pdevice->rad_info.gfx_level >= GFX11 && radv_has_pops(pdevice);
+          props->fragmentShadingRateWithCustomSampleLocations = false;
+          props->fragmentShadingRateStrictMultiplyCombiner = true;
+          break;
+diff --git a/src/amd/vulkan/radv_private.h b/src/amd/vulkan/radv_private.h
+index 1a813a7a0dc8f..d3f34c49dfef9 100644
+--- a/src/amd/vulkan/radv_private.h
++++ b/src/amd/vulkan/radv_private.h
+@@ -3555,6 +3555,12 @@ radv_has_shader_buffer_float_minmax(const struct radv_physical_device *pdevice,
+           pdevice->rad_info.gfx_level == GFX10_3 || (pdevice->rad_info.gfx_level == GFX11 && bitsize == 32);
+ }
+ 
++static inline bool
++radv_has_pops(const struct radv_physical_device *pdevice)
++{
++   return pdevice->rad_info.gfx_level >= GFX9 && !pdevice->use_llvm;
++}
++
+ /* radv_perfcounter.c */
+ void radv_perfcounter_emit_shaders(struct radeon_cmdbuf *cs, unsigned shaders);
+ void radv_perfcounter_emit_spm_reset(struct radeon_cmdbuf *cs);
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index 921a683e45ec2..3da683283658d 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -363,6 +363,7 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_pipeline_
+          .device = device,
+          .object = stage->spirv.object,
+       };
++      const bool has_fragment_shader_interlock = radv_has_pops(device->physical_device);
+       const struct spirv_to_nir_options spirv_options = {
+          .caps =
+             {
+@@ -388,6 +389,8 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_pipeline_
+                .float64_atomic_min_max = true,
+                .fragment_barycentric = true,
+                .fragment_fully_covered = true,
++               .fragment_shader_pixel_interlock = has_fragment_shader_interlock,
++               .fragment_shader_sample_interlock = has_fragment_shader_interlock,
+                .geometry_streams = true,
+                .groups = true,
+                .image_atomic_int64 = true,
+-- 
+GitLab
+
