@@ -1,0 +1,578 @@
+From d8a402f9aa49a52fbf2882502507d4ff4ef479f8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Tue, 4 Jul 2023 14:28:45 +0200
+Subject: [PATCH 01/10] aco: Fix subgroup_id intrinsic on GFX10.3+.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Change this to match how it works in the LLVM backend.
+
+Cc: mesa-stable
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+---
+ src/amd/compiler/aco_instruction_selection.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/amd/compiler/aco_instruction_selection.cpp b/src/amd/compiler/aco_instruction_selection.cpp
+index 84a7ee0a4ad6..4298f87c553c 100644
+--- a/src/amd/compiler/aco_instruction_selection.cpp
++++ b/src/amd/compiler/aco_instruction_selection.cpp
+@@ -8235,9 +8235,10 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
+    }
+    case nir_intrinsic_load_subgroup_id: {
+       if (ctx->stage.hw == AC_HW_COMPUTE_SHADER) {
++         const unsigned bfe_const =
++            ctx->program->gfx_level >= GFX10_3 ? (20 | 0x5u << 16) : (0x6u | (0x6u << 16));
+          bld.sop2(aco_opcode::s_bfe_u32, Definition(get_ssa_temp(ctx, &instr->dest.ssa)),
+-                  bld.def(s1, scc), get_arg(ctx, ctx->args->tg_size),
+-                  Operand::c32(0x6u | (0x6u << 16)));
++                  bld.def(s1, scc), get_arg(ctx, ctx->args->tg_size), Operand::c32(bfe_const));
+       } else if (ctx->stage.hw == AC_HW_NEXT_GEN_GEOMETRY_SHADER) {
+          /* Get the id of the current wave within the threadgroup (workgroup) */
+          bld.sop2(aco_opcode::s_bfe_u32, Definition(get_ssa_temp(ctx, &instr->dest.ssa)),
+-- 
+GitLab
+
+
+From 95414a337aab49f976448086bf2333e7f164bf51 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Mon, 3 Jul 2023 17:06:50 +0200
+Subject: [PATCH 02/10] ac/nir: Simplify arg unpacking when shift is zero.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This is so we can just use the same function when it's zero.
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+---
+ src/amd/common/ac_nir.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/common/ac_nir.c b/src/amd/common/ac_nir.c
+index 118a4ca0e37c..7cf94cd2cb46 100644
+--- a/src/amd/common/ac_nir.c
++++ b/src/amd/common/ac_nir.c
+@@ -40,7 +40,10 @@ ac_nir_unpack_arg(nir_builder *b, const struct ac_shader_args *ac_args, struct a
+                   unsigned rshift, unsigned bitwidth)
+ {
+    nir_ssa_def *value = ac_nir_load_arg(b, ac_args, arg);
+-   return nir_ubfe_imm(b, value, rshift, bitwidth);
++   if (rshift)
++      return nir_ubfe_imm(b, value, rshift, bitwidth);
++   else
++      return nir_iand_imm(b, value, BITFIELD_MASK(bitwidth));
+ }
+ 
+ static bool
+-- 
+GitLab
+
+
+From 376fcc110c1130c697244ea0233796b4f1f09031 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Mon, 3 Jul 2023 17:07:18 +0200
+Subject: [PATCH 03/10] ac/nir: Add new pass to lower intrinsics to shader
+ args.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This is beneficial for intrinsics that do an algebraic
+instruction such as bitfield extract on shader arguments,
+because it allows NIR to be aware of these instructions and
+optimize them together with other algebraic instructions in
+the shader.
+
+Currently, just handle subgroup_id and num_subgroups intrinsics.
+More will be added here in the future.
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+---
+ src/amd/common/ac_nir.c | 70 +++++++++++++++++++++++++++++++++++++++++
+ src/amd/common/ac_nir.h |  3 ++
+ 2 files changed, 73 insertions(+)
+
+diff --git a/src/amd/common/ac_nir.c b/src/amd/common/ac_nir.c
+index 7cf94cd2cb46..8eb2ca03f2c6 100644
+--- a/src/amd/common/ac_nir.c
++++ b/src/amd/common/ac_nir.c
+@@ -67,6 +67,76 @@ ac_nir_lower_sin_cos(nir_shader *shader)
+    return nir_shader_lower_instructions(shader, is_sin_cos, lower_sin_cos, NULL);
+ }
+ 
++typedef struct {
++   const struct ac_shader_args *args;
++   enum amd_gfx_level gfx_level;
++} lower_intrinsics_to_args_state;
++
++static bool
++lower_intrinsic_to_arg(nir_builder *b, nir_instr *instr, void *state)
++{
++   if (instr->type != nir_instr_type_intrinsic)
++      return false;
++
++   lower_intrinsics_to_args_state *s = (lower_intrinsics_to_args_state *)state;
++   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
++   nir_ssa_def *replacement = NULL;
++
++   switch (intrin->intrinsic) {
++   case nir_intrinsic_load_subgroup_id: {
++      b->cursor = nir_after_instr(&intrin->instr);
++
++      if (s->args->tg_size.used) {
++         if (s->gfx_level >= GFX10_3)
++            replacement = ac_nir_unpack_arg(b, s->args, s->args->tg_size, 6, 6);
++         else
++            replacement = ac_nir_unpack_arg(b, s->args, s->args->tg_size, 20, 5);
++      } else if (s->args->tcs_wave_id.used) {
++         replacement = ac_nir_unpack_arg(b, s->args, s->args->tcs_wave_id, 0, 3);
++      } else if (s->args->merged_wave_info.used) {
++         replacement = ac_nir_unpack_arg(b, s->args, s->args->merged_wave_info, 24, 4);
++      } else {
++         replacement = nir_imm_int(b, 0);
++      }
++
++      break;
++   }
++   case nir_intrinsic_load_num_subgroups: {
++      b->cursor = nir_after_instr(&intrin->instr);
++
++      if (s->args->tg_size.used) {
++         replacement = ac_nir_unpack_arg(b, s->args, s->args->tg_size, 0, 6);
++      } else if (s->args->merged_wave_info.used) {
++         replacement = ac_nir_unpack_arg(b, s->args, s->args->merged_wave_info, 28, 4);
++      } else {
++         replacement = nir_imm_int(b, 1);
++      }
++
++      break;
++   }
++   default:
++      return false;
++   }
++
++   assert(replacement);
++   nir_ssa_def_rewrite_uses(&intrin->dest.ssa, replacement);
++   nir_instr_remove(&intrin->instr);
++   return true;
++}
++
++bool
++ac_nir_lower_intrinsics_to_args(nir_shader *shader, const enum amd_gfx_level gfx_level,
++                                const struct ac_shader_args *ac_args)
++{
++   lower_intrinsics_to_args_state state = {
++      .args = ac_args,
++      .gfx_level = gfx_level,
++   };
++
++   return nir_shader_instructions_pass(shader, lower_intrinsic_to_arg,
++                                       nir_metadata_block_index | nir_metadata_dominance, &state);
++}
++
+ void
+ ac_nir_store_var_components(nir_builder *b, nir_variable *var, nir_ssa_def *value,
+                             unsigned component, unsigned writemask)
+diff --git a/src/amd/common/ac_nir.h b/src/amd/common/ac_nir.h
+index 264355c9dfff..9197568277eb 100644
+--- a/src/amd/common/ac_nir.h
++++ b/src/amd/common/ac_nir.h
+@@ -66,6 +66,9 @@ ac_nir_unpack_arg(nir_builder *b, const struct ac_shader_args *ac_args, struct a
+ 
+ bool ac_nir_lower_sin_cos(nir_shader *shader);
+ 
++bool ac_nir_lower_intrinsics_to_args(nir_shader *shader, const enum amd_gfx_level gfx_level,
++                                     const struct ac_shader_args *ac_args);
++
+ void
+ ac_nir_store_var_components(nir_builder *b, nir_variable *var, nir_ssa_def *value,
+                             unsigned component, unsigned writemask);
+-- 
+GitLab
+
+
+From ecdae2cd966ee66da677ce671212e63de064d7ba Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Mon, 3 Jul 2023 17:07:32 +0200
+Subject: [PATCH 04/10] radv: Use ac_nir_lower_intrinsics_to_args.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+---
+ src/amd/vulkan/radv_pipeline.c          | 1 +
+ src/amd/vulkan/radv_pipeline_graphics.c | 2 ++
+ 2 files changed, 3 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_pipeline.c b/src/amd/vulkan/radv_pipeline.c
+index a6ecc48e1722..75a38f9ac791 100644
+--- a/src/amd/vulkan/radv_pipeline.c
++++ b/src/amd/vulkan/radv_pipeline.c
+@@ -689,6 +689,7 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_pipeline_layo
+       NIR_PASS_V(stage->nir, nir_lower_io_to_scalar, nir_var_mem_global);
+ 
+    NIR_PASS(_, stage->nir, ac_nir_lower_global_access);
++   NIR_PASS_V(stage->nir, ac_nir_lower_intrinsics_to_args, gfx_level, &stage->args.ac);
+    NIR_PASS_V(stage->nir, radv_nir_lower_abi, gfx_level, &stage->info, &stage->args, pipeline_key,
+               device->physical_device->rad_info.address32_hi);
+    radv_optimize_nir_algebraic(
+diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipeline_graphics.c
+index 65a313e47162..88e876a62c99 100644
+--- a/src/amd/vulkan/radv_pipeline_graphics.c
++++ b/src/amd/vulkan/radv_pipeline_graphics.c
+@@ -2210,6 +2210,8 @@ radv_pipeline_create_gs_copy_shader(struct radv_device *device, struct radv_pipe
+    gs_copy_stage.info.user_sgprs_locs = gs_copy_stage.args.user_sgprs_locs;
+    gs_copy_stage.info.inline_push_constant_mask = gs_copy_stage.args.ac.inline_push_const_mask;
+ 
++   NIR_PASS_V(nir, ac_nir_lower_intrinsics_to_args, device->physical_device->rad_info.gfx_level,
++              &gs_copy_stage.args.ac);
+    NIR_PASS_V(nir, radv_nir_lower_abi, device->physical_device->rad_info.gfx_level, &gs_copy_stage.info,
+               &gs_copy_stage.args, pipeline_key, device->physical_device->rad_info.address32_hi);
+ 
+-- 
+GitLab
+
+
+From e2cd384acb0102840adb562dd1fbdd911c13a870 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Tue, 4 Jul 2023 14:11:11 +0200
+Subject: [PATCH 05/10] radeonsi: Use ac_nir_lower_intrinsics_to_args.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+---
+ src/gallium/drivers/radeonsi/si_shader.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/gallium/drivers/radeonsi/si_shader.c b/src/gallium/drivers/radeonsi/si_shader.c
+index ad5990ceb63c..13cab211c910 100644
+--- a/src/gallium/drivers/radeonsi/si_shader.c
++++ b/src/gallium/drivers/radeonsi/si_shader.c
+@@ -2274,6 +2274,8 @@ struct nir_shader *si_get_nir_shader(struct si_shader *shader,
+                .allow_fp16 = sel->screen->info.gfx_level >= GFX9,
+             });
+ 
++   NIR_PASS(progress2, nir, ac_nir_lower_intrinsics_to_args, sel->screen->info.gfx_level,
++            &args->ac);
+    NIR_PASS(progress2, nir, si_nir_lower_abi, shader, args);
+ 
+    if (progress2 || opt_offsets)
+@@ -2415,6 +2417,7 @@ si_nir_generate_gs_copy_shader(struct si_screen *sscreen,
+    struct si_shader_args args;
+    si_init_shader_args(shader, &args);
+ 
++   NIR_PASS_V(nir, ac_nir_lower_intrinsics_to_args, sscreen->info.gfx_level, &args.ac);
+    NIR_PASS_V(nir, si_nir_lower_abi, shader, &args);
+ 
+    si_nir_opts(gs_selector->screen, nir, false);
+-- 
+GitLab
+
+
+From 897f69341fa723275afa17cc4783b9f4e30df412 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Tue, 4 Jul 2023 14:29:55 +0200
+Subject: [PATCH 06/10] aco: Remove subgroup_id and num_subgroups intrinsics.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+These are lowered in NIR now.
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+---
+ .../compiler/aco_instruction_selection.cpp    | 28 -------------------
+ 1 file changed, 28 deletions(-)
+
+diff --git a/src/amd/compiler/aco_instruction_selection.cpp b/src/amd/compiler/aco_instruction_selection.cpp
+index 4298f87c553c..22600ac76d89 100644
+--- a/src/amd/compiler/aco_instruction_selection.cpp
++++ b/src/amd/compiler/aco_instruction_selection.cpp
+@@ -8233,38 +8233,10 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
+       }
+       break;
+    }
+-   case nir_intrinsic_load_subgroup_id: {
+-      if (ctx->stage.hw == AC_HW_COMPUTE_SHADER) {
+-         const unsigned bfe_const =
+-            ctx->program->gfx_level >= GFX10_3 ? (20 | 0x5u << 16) : (0x6u | (0x6u << 16));
+-         bld.sop2(aco_opcode::s_bfe_u32, Definition(get_ssa_temp(ctx, &instr->dest.ssa)),
+-                  bld.def(s1, scc), get_arg(ctx, ctx->args->tg_size), Operand::c32(bfe_const));
+-      } else if (ctx->stage.hw == AC_HW_NEXT_GEN_GEOMETRY_SHADER) {
+-         /* Get the id of the current wave within the threadgroup (workgroup) */
+-         bld.sop2(aco_opcode::s_bfe_u32, Definition(get_ssa_temp(ctx, &instr->dest.ssa)),
+-                  bld.def(s1, scc), get_arg(ctx, ctx->args->merged_wave_info),
+-                  Operand::c32(24u | (4u << 16)));
+-      } else {
+-         bld.copy(Definition(get_ssa_temp(ctx, &instr->dest.ssa)), Operand::zero());
+-      }
+-      break;
+-   }
+    case nir_intrinsic_load_subgroup_invocation: {
+       emit_mbcnt(ctx, get_ssa_temp(ctx, &instr->dest.ssa));
+       break;
+    }
+-   case nir_intrinsic_load_num_subgroups: {
+-      if (ctx->stage.hw == AC_HW_COMPUTE_SHADER)
+-         bld.sop2(aco_opcode::s_and_b32, Definition(get_ssa_temp(ctx, &instr->dest.ssa)),
+-                  bld.def(s1, scc), Operand::c32(0x3fu), get_arg(ctx, ctx->args->tg_size));
+-      else if (ctx->stage.hw == AC_HW_NEXT_GEN_GEOMETRY_SHADER)
+-         bld.sop2(aco_opcode::s_bfe_u32, Definition(get_ssa_temp(ctx, &instr->dest.ssa)),
+-                  bld.def(s1, scc), get_arg(ctx, ctx->args->merged_wave_info),
+-                  Operand::c32(28u | (4u << 16)));
+-      else
+-         bld.copy(Definition(get_ssa_temp(ctx, &instr->dest.ssa)), Operand::c32(0x1u));
+-      break;
+-   }
+    case nir_intrinsic_ballot: {
+       Temp src = get_ssa_temp(ctx, instr->src[0].ssa);
+       Temp dst = get_ssa_temp(ctx, &instr->dest.ssa);
+-- 
+GitLab
+
+
+From 714b1c7722969564e294722528cbad0a243ac39d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Wed, 5 Jul 2023 14:40:09 +0200
+Subject: [PATCH 07/10] ac/llvm: Remove subgroup_id and num_subgroups
+ intrinsics.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We expect that these will be lowered in NIR now.
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+---
+ src/amd/llvm/ac_nir_to_llvm.c | 18 ------------------
+ 1 file changed, 18 deletions(-)
+
+diff --git a/src/amd/llvm/ac_nir_to_llvm.c b/src/amd/llvm/ac_nir_to_llvm.c
+index e40bea607705..0f63dc5c1fa3 100644
+--- a/src/amd/llvm/ac_nir_to_llvm.c
++++ b/src/amd/llvm/ac_nir_to_llvm.c
+@@ -2628,18 +2628,6 @@ static LLVMValueRef visit_load_local_invocation_index(struct ac_nir_context *ctx
+                         ac_get_thread_id(&ctx->ac));
+ }
+ 
+-static LLVMValueRef visit_load_num_subgroups(struct ac_nir_context *ctx)
+-{
+-   if (gl_shader_stage_is_compute(ctx->stage)) {
+-      return LLVMBuildAnd(ctx->ac.builder, ac_get_arg(&ctx->ac, ctx->args->tg_size),
+-                          LLVMConstInt(ctx->ac.i32, 0x3f, false), "");
+-   } else if (ctx->args->merged_wave_info.used) {
+-      return ac_unpack_param(&ctx->ac, ac_get_arg(&ctx->ac, ctx->args->merged_wave_info), 28, 4);
+-   } else {
+-      return ctx->ac.i32_1;
+-   }
+-}
+-
+ static LLVMValueRef visit_first_invocation(struct ac_nir_context *ctx)
+ {
+    LLVMValueRef active_set = ac_build_ballot(&ctx->ac, ctx->ac.i32_1);
+@@ -3180,12 +3168,6 @@ static bool visit_intrinsic(struct ac_nir_context *ctx, nir_intrinsic_instr *ins
+    case nir_intrinsic_load_local_invocation_index:
+       result = visit_load_local_invocation_index(ctx);
+       break;
+-   case nir_intrinsic_load_subgroup_id:
+-      result = visit_load_subgroup_id(ctx);
+-      break;
+-   case nir_intrinsic_load_num_subgroups:
+-      result = visit_load_num_subgroups(ctx);
+-      break;
+    case nir_intrinsic_first_invocation:
+       result = visit_first_invocation(ctx);
+       break;
+-- 
+GitLab
+
+
+From 8ac6ae26693464089bb5e43bc5aaaeab43604328 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Mon, 3 Jul 2023 11:36:41 +0200
+Subject: [PATCH 08/10] nir: Add option to lower local invocation id y, z to
+ subgroup id.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+---
+ src/compiler/nir/nir.h                 |  1 +
+ src/compiler/nir/nir_lower_subgroups.c | 27 ++++++++++++++++++++++++--
+ 2 files changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/src/compiler/nir/nir.h b/src/compiler/nir/nir.h
+index 95a74adb9b70..48289bdc0ad4 100644
+--- a/src/compiler/nir/nir.h
++++ b/src/compiler/nir/nir.h
+@@ -5391,6 +5391,7 @@ typedef struct nir_lower_subgroups_options {
+    bool lower_read_invocation_to_cond:1;
+    bool lower_rotate_to_shuffle:1;
+    bool lower_ballot_bit_count_to_mbcnt_amd:1;
++   bool lower_cs_local_id_yz_to_subgroup_id : 1;
+ } nir_lower_subgroups_options;
+ 
+ bool nir_lower_subgroups(nir_shader *shader,
+diff --git a/src/compiler/nir/nir_lower_subgroups.c b/src/compiler/nir/nir_lower_subgroups.c
+index a393a0869e43..d8d60e0ba7b1 100644
+--- a/src/compiler/nir/nir_lower_subgroups.c
++++ b/src/compiler/nir/nir_lower_subgroups.c
+@@ -516,8 +516,8 @@ build_subgroup_mask(nir_builder *b,
+     * in all cases.  The other components will also get the correct value in
+     * case (1) if we just use the rule in case (2), so we'll get the correct
+     * result if we just follow (2) and then replace the first component with
+-    * "result". 
+-    */ 
++    * "result".
++    */
+    nir_const_value min_idx[4];
+    for (unsigned i = 0; i < options->ballot_components; i++)
+       min_idx[i] = nir_const_value_for_int(i * options->ballot_bit_size, 32);
+@@ -865,6 +865,29 @@ lower_subgroups_instr(nir_builder *b, nir_instr *instr, void *_options)
+       }
+       break;
+ 
++   case nir_intrinsic_load_local_invocation_id:
++      if (!b->shader->info.workgroup_size_variable &&
++          options->lower_cs_local_id_yz_to_subgroup_id &&
++          b->shader->info.workgroup_size[0] % options->subgroup_size == 0 &&
++          util_is_power_of_two_nonzero(options->subgroup_size) &&
++          util_is_power_of_two_nonzero(b->shader->info.workgroup_size[0]) &&
++          util_is_power_of_two_nonzero(b->shader->info.workgroup_size[1])) {
++         /* Replace Y and Z components of local invocation ID
++          * by a formula based on the subgroup ID.
++          * This is beneficial for the following reasons:
++          * 1. Allows the use of scalar registers on HW that has them
++          * 2. Removes the need to initialize the Y and Z components
++          */
++         nir_ssa_def *subgroup_id = nir_load_subgroup_id(b);
++         nir_ssa_def *s = nir_udiv_imm(b, subgroup_id,
++                                       b->shader->info.workgroup_size[0] / options->subgroup_size);
++         nir_ssa_def *id_x = nir_channel(b, &intrin->dest.ssa, 0);
++         nir_ssa_def *id_y = nir_umod_imm(b, s, b->shader->info.workgroup_size[1]);
++         nir_ssa_def *id_z = nir_udiv_imm(b, s, b->shader->info.workgroup_size[1]);
++
++         return nir_vec3(b, id_x, id_y, id_z);
++      }
++
+    default:
+       break;
+    }
+-- 
+GitLab
+
+
+From 349ec89c5d1631d44a0fb66e7df6b9b71c0acba2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Mon, 3 Jul 2023 12:39:04 +0200
+Subject: [PATCH 09/10] radv: Use lower_cs_local_id_yz_to_subgroup_id.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+---
+ src/amd/vulkan/radv_shader.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index c441f2ac0015..fe43ea3fc072 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -629,6 +629,7 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_pipeline_
+                .lower_quad_broadcast_dynamic_to_const = gfx7minus,
+                .lower_shuffle_to_swizzle_amd = 1,
+                .lower_ballot_bit_count_to_mbcnt_amd = 1,
++               .lower_cs_local_id_yz_to_subgroup_id = 1,
+             });
+ 
+    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
+-- 
+GitLab
+
+
+From 0d2c5b00c7e081d74b056ae222c7a5b47b0a09cc Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Mon, 3 Jul 2023 17:08:21 +0200
+Subject: [PATCH 10/10] nir/opt_algebraic: Add various bitfield extract
+ patterns.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+---
+ src/compiler/nir/nir_opt_algebraic.py | 21 +++++++++++++++++++++
+ src/compiler/nir/nir_search_helpers.h | 18 ++++++++++++++++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/src/compiler/nir/nir_opt_algebraic.py b/src/compiler/nir/nir_opt_algebraic.py
+index 374ddb681260..12ebce1c1d6e 100644
+--- a/src/compiler/nir/nir_opt_algebraic.py
++++ b/src/compiler/nir/nir_opt_algebraic.py
+@@ -476,6 +476,27 @@ for size, mask in ((8, 0xff), (16, 0xffff), (32, 0xffffffff), (64, 0xfffffffffff
+     ])
+ 
+ optimizations.extend([
++    # Create bitfield extract from right-shift + and pattern,
++    (('iand@32', ('ushr@32', a, b), '#c(is_const_bitmask)'), ('ubfe', a, b, ('bit_count', c)), 'options->lower_bitfield_extract'),
++
++    # Collapse two bitfield extracts with constant operands into a single one.
++    (('ubfe', ('ubfe', a, '#b', '#c'), '#d', '#e'),
++     ('bcsel',
++      ('ior',
++       ('ige', ('iand', d, 0x1f), ('iand', c, 0x1f)),
++       ('ilt', 31, ('iadd', ('iand', b, 0x1f), ('iand', d, 0x1f)))), 0,
++      ('ubfe', a, ('iadd', b, d), ('umin', ('iand', c, 0x1f), ('iand', e, 0x1f)))),
++     'options->lower_bitfield_extract'),
++
++    # Collapse right-shift into bitfield extract.
++    (('ushr@32', ('ubfe', a, '#b', '#c'), '#d'),
++     ('bcsel',
++      ('ior',
++       ('ige', ('iand', d, 0x1f), ('iand', c, 0x1f)),
++       ('ilt', 31, ('iadd', ('iand', b, 0x1f), ('iand', d, 0x1f)))), 0,
++      ('ubfe', a, ('iadd', ('iand', b, 0x1f), ('iand', d, 0x1f)), ('isub', ('iand', c, 0x1f), ('iand', d, 0x1f)))),
++     'options->lower_bitfield_extract'),
++
+     (('iand', ('ishl', 'a@32', '#b(is_first_5_bits_uge_2)'), -4), ('ishl', a, b)),
+     (('iand', ('imul', a, '#b(is_unsigned_multiple_of_4)'), -4), ('imul', a, b)),
+ ])
+diff --git a/src/compiler/nir/nir_search_helpers.h b/src/compiler/nir/nir_search_helpers.h
+index a9d19963a7a1..3e388f3fa065 100644
+--- a/src/compiler/nir/nir_search_helpers.h
++++ b/src/compiler/nir/nir_search_helpers.h
+@@ -574,6 +574,24 @@ is_lower_half_negative_one(UNUSED struct hash_table *ht, const nir_alu_instr *in
+    return true;
+ }
+ 
++static inline bool
++is_const_bitmask(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
++                 unsigned src, unsigned num_components,
++                 const uint8_t *swizzle)
++{
++   if (nir_src_as_const_value(instr->src[src].src) == NULL)
++      return false;
++
++   for (unsigned i = 0; i < num_components; i++) {
++      const uint64_t c = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
++      const unsigned num_bits = util_bitcount64(c);
++      if (c != BITFIELD64_MASK(num_bits))
++         return false;
++   }
++
++   return true;
++}
++
+ static inline bool
+ no_signed_wrap(const nir_alu_instr *instr)
+ {
+-- 
+GitLab
+
