@@ -9,7 +9,7 @@ for dir in */; do
     pkgver=$(grep -oP "(?<=pkgver=)[^']+" PKGBUILD)  # Extract pkgver value
 
     # Check if pkgver ends with "23.04.1"
-    if [[ $pkgver == *23.04.1 ]]; then
+    if [[ $pkgver == *23.04.2 ]]; then
       # Extract the last digit and increment it
       last_digit=${pkgver: -1}
       new_last_digit=$((last_digit + 1))

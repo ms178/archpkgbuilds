@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Set the target version and replacement version
-target_version="5.106.1"
-replacement_version="5.107.0"
+target_version="5.107.0"
+replacement_version="5.108.0"
 
 # Find all PKGBUILD files recursively in the current directory
 pkgbuild_files=$(find . -name PKGBUILD)
