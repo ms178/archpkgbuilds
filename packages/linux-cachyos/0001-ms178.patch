@@ -9295,521 +9295,6 @@ index 78ae7b6f90fd..f84e2640ea2f 100644
 --
 2.41.0
 
-From: Tim C Chen <tim.c.chen@xxxxxxxxxxxxxxx>
-
-On hybrid CPUs with scheduling cluster enabled, we will need to
-consider balancing between SMT CPU cluster, and Atom core cluster.
-
-Below shows such a hybrid x86 CPU with 4 big cores and 8 atom cores.
-Each scheduling cluster span a L2 cache.
-
-          --L2-- --L2-- --L2-- --L2-- ----L2---- -----L2------
-          [0, 1] [2, 3] [4, 5] [5, 6] [7 8 9 10] [11 12 13 14]
-          Big    Big    Big    Big    Atom       Atom
-          core   core   core   core   Module     Module
-
-If the busiest group is a big core with both SMT CPUs busy, we should
-active load balance if destination group has idle CPU cores.  Such
-condition is considered by asym_active_balance() in load balancing but not
-considered when looking for busiest group and computing load imbalance.
-Add this consideration in find_busiest_group() and calculate_imbalance().
-
-In addition, update the logic determining the busier group when one group
-is SMT and the other group is non SMT but both groups are partially busy
-with idle CPU. The busier group should be the group with idle cores rather
-than the group with one busy SMT CPU.  We do not want to make the SMT group
-the busiest one to pull the only task off SMT CPU and causing the whole core to
-go empty.
-
-Otherwise suppose in the search for the busiest group, we first encounter
-an SMT group with 1 task and set it as the busiest.  The destination
-group is an atom cluster with 1 task and we next encounter an atom
-cluster group with 3 tasks, we will not pick this atom cluster over the
-SMT group, even though we should.  As a result, we do not load balance
-the busier Atom cluster (with 3 tasks) towards the local atom cluster
-(with 1 task).  And it doesn't make sense to pick the 1 task SMT group
-as the busier group as we also should not pull task off the SMT towards
-the 1 task atom cluster and make the SMT core completely empty.
-
-Signed-off-by: Tim Chen <tim.c.chen@xxxxxxxxxxxxxxx>
----
- kernel/sched/fair.c | 80 +++++++++++++++++++++++++++++++++++++++++++--
- 1 file changed, 77 insertions(+), 3 deletions(-)
-
-diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 87317634fab2..f636d6c09dc6 100644
---- a/kernel/sched/fair.c
-+++ b/kernel/sched/fair.c
-@@ -8279,6 +8279,11 @@ enum group_type {
- 	 * more powerful CPU.
- 	 */
- 	group_misfit_task,
-+	/*
-+	 * Balance SMT group that's fully busy. Can benefit from migration
-+	 * a task on SMT with busy sibling to another CPU on idle core.
-+	 */
-+	group_smt_balance,
- 	/*
- 	 * SD_ASYM_PACKING only: One local CPU with higher capacity is available,
- 	 * and the task should be migrated to it instead of running on the
-@@ -8987,6 +8992,7 @@ struct sg_lb_stats {
- 	unsigned int group_weight;
- 	enum group_type group_type;
- 	unsigned int group_asym_packing; /* Tasks should be moved to preferred CPU */
-+	unsigned int group_smt_balance;  /* Task on busy SMT be moved */
- 	unsigned long group_misfit_task_load; /* A CPU has a task too big for its capacity */
- #ifdef CONFIG_NUMA_BALANCING
- 	unsigned int nr_numa_running;
-@@ -9260,6 +9266,9 @@ group_type group_classify(unsigned int imbalance_pct,
- 	if (sgs->group_asym_packing)
- 		return group_asym_packing;
-
-+	if (sgs->group_smt_balance)
-+		return group_smt_balance;
-+
- 	if (sgs->group_misfit_task_load)
- 		return group_misfit_task;
-
-@@ -9333,6 +9342,36 @@ sched_asym(struct lb_env *env, struct sd_lb_stats *sds,  struct sg_lb_stats *sgs
- 	return sched_asym_prefer(env->dst_cpu, group->asym_prefer_cpu);
- }
-
-+/* One group has more than one SMT CPU while the other group does not */
-+static inline bool smt_vs_nonsmt_groups(struct sched_group *sg1,
-+				    struct sched_group *sg2)
-+{
-+	if (!sg1 || !sg2)
-+		return false;
-+
-+	return (sg1->flags & SD_SHARE_CPUCAPACITY) !=
-+		(sg2->flags & SD_SHARE_CPUCAPACITY);
-+}
-+
-+static inline bool smt_balance(struct lb_env *env, struct sg_lb_stats *sgs,
-+			       struct sched_group *group)
-+{
-+	if (env->idle == CPU_NOT_IDLE)
-+		return false;
-+
-+	/*
-+	 * For SMT source group, it is better to move a task
-+	 * to a CPU that doesn't have multiple tasks sharing its CPU capacity.
-+	 * Note that if a group has a single SMT, SD_SHARE_CPUCAPACITY
-+	 * will not be on.
-+	 */
-+	if (group->flags & SD_SHARE_CPUCAPACITY &&
-+	    sgs->sum_h_nr_running > 1)
-+		return true;
-+
-+	return false;
-+}
-+
- static inline bool
- sched_reduced_capacity(struct rq *rq, struct sched_domain *sd)
- {
-@@ -9425,6 +9464,10 @@ static inline void update_sg_lb_stats(struct lb_env *env,
- 		sgs->group_asym_packing = 1;
- 	}
-
-+	/* Check for loaded SMT group to be balanced to dst CPU */
-+	if (!local_group && smt_balance(env, sgs, group))
-+		sgs->group_smt_balance = 1;
-+
- 	sgs->group_type = group_classify(env->sd->imbalance_pct, group, sgs);
-
- 	/* Computing avg_load makes sense only when group is overloaded */
-@@ -9509,6 +9552,7 @@ static bool update_sd_pick_busiest(struct lb_env *env,
- 			return false;
- 		break;
-
-+	case group_smt_balance:
- 	case group_fully_busy:
- 		/*
- 		 * Select the fully busy group with highest avg_load. In
-@@ -9537,6 +9581,18 @@ static bool update_sd_pick_busiest(struct lb_env *env,
- 		break;
-
- 	case group_has_spare:
-+		/*
-+		 * Do not pick sg with SMT CPUs over sg with pure CPUs,
-+		 * as we do not want to pull task off SMT core with one task
-+		 * and make the core idle.
-+		 */
-+		if (smt_vs_nonsmt_groups(sds->busiest, sg)) {
-+			if (sg->flags & SD_SHARE_CPUCAPACITY && sgs->sum_h_nr_running <= 1)
-+				return false;
-+			else
-+				return true;
-+		}
-+
- 		/*
- 		 * Select not overloaded group with lowest number of idle cpus
- 		 * and highest number of running tasks. We could also compare
-@@ -9733,6 +9789,7 @@ static bool update_pick_idlest(struct sched_group *idlest,
-
- 	case group_imbalanced:
- 	case group_asym_packing:
-+	case group_smt_balance:
- 		/* Those types are not used in the slow wakeup path */
- 		return false;
-
-@@ -9864,6 +9921,7 @@ find_idlest_group(struct sched_domain *sd, struct task_struct *p, int this_cpu)
-
- 	case group_imbalanced:
- 	case group_asym_packing:
-+	case group_smt_balance:
- 		/* Those type are not used in the slow wakeup path */
- 		return NULL;
-
-@@ -10118,6 +10176,13 @@ static inline void calculate_imbalance(struct lb_env *env, struct sd_lb_stats *s
- 		return;
- 	}
-
-+	if (busiest->group_type == group_smt_balance) {
-+		/* Reduce number of tasks sharing CPU capacity */
-+		env->migration_type = migrate_task;
-+		env->imbalance = 1;
-+		return;
-+	}
-+
- 	if (busiest->group_type == group_imbalanced) {
- 		/*
- 		 * In the group_imb case we cannot rely on group-wide averages
-@@ -10363,16 +10428,23 @@ static struct sched_group *find_busiest_group(struct lb_env *env)
- 		goto force_balance;
-
- 	if (busiest->group_type != group_overloaded) {
--		if (env->idle == CPU_NOT_IDLE)
-+		if (env->idle == CPU_NOT_IDLE) {
- 			/*
- 			 * If the busiest group is not overloaded (and as a
- 			 * result the local one too) but this CPU is already
- 			 * busy, let another idle CPU try to pull task.
- 			 */
- 			goto out_balanced;
-+		}
-+
-+		if (busiest->group_type == group_smt_balance &&
-+		    smt_vs_nonsmt_groups(sds.local, sds.busiest)) {
-+			/* Let non SMT CPU pull from SMT CPU sharing with sibling */
-+			goto force_balance;
-+		}
-
- 		if (busiest->group_weight > 1 &&
--		    local->idle_cpus <= (busiest->idle_cpus + 1))
-+		    local->idle_cpus <= (busiest->idle_cpus + 1)) {
- 			/*
- 			 * If the busiest group is not overloaded
- 			 * and there is no imbalance between this and busiest
-@@ -10383,12 +10455,14 @@ static struct sched_group *find_busiest_group(struct lb_env *env)
- 			 * there is more than 1 CPU per group.
- 			 */
- 			goto out_balanced;
-+		}
-
--		if (busiest->sum_h_nr_running == 1)
-+		if (busiest->sum_h_nr_running == 1) {
- 			/*
- 			 * busiest doesn't have any tasks waiting to run
- 			 */
- 			goto out_balanced;
-+		}
- 	}
-
- force_balance:
---
-2.32.0
-
-From: Tim C Chen <tim.c.chen@xxxxxxxxxxxxxxx>
-
-When balancing sibling domains that have different number of cores,
-tasks in respective sibling domain should be proportional to the number
-of cores in each domain. In preparation of implementing such a policy,
-record the number of tasks in a scheduling group.
-
-Signed-off-by: Tim Chen <tim.c.chen@xxxxxxxxxxxxxxx>
----
- kernel/sched/sched.h    |  1 +
- kernel/sched/topology.c | 10 +++++++++-
- 2 files changed, 10 insertions(+), 1 deletion(-)
-
-diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index 3d0eb36350d2..5f7f36e45b87 100644
---- a/kernel/sched/sched.h
-+++ b/kernel/sched/sched.h
-@@ -1860,6 +1860,7 @@ struct sched_group {
- 	atomic_t		ref;
-
- 	unsigned int		group_weight;
-+	unsigned int		cores;
- 	struct sched_group_capacity *sgc;
- 	int			asym_prefer_cpu;	/* CPU of highest priority in group */
- 	int			flags;
-diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
-index 6d5628fcebcf..6b099dbdfb39 100644
---- a/kernel/sched/topology.c
-+++ b/kernel/sched/topology.c
-@@ -1275,14 +1275,22 @@ build_sched_groups(struct sched_domain *sd, int cpu)
- static void init_sched_groups_capacity(int cpu, struct sched_domain *sd)
- {
- 	struct sched_group *sg = sd->groups;
-+	struct cpumask *mask = sched_domains_tmpmask2;
-
- 	WARN_ON(!sg);
-
- 	do {
--		int cpu, max_cpu = -1;
-+		int cpu, cores = 0, max_cpu = -1;
-
- 		sg->group_weight = cpumask_weight(sched_group_span(sg));
-
-+		cpumask_copy(mask, sched_group_span(sg));
-+		for_each_cpu(cpu, mask) {
-+			cores++;
-+			cpumask_andnot(mask, mask, cpu_smt_mask(cpu));
-+		}
-+		sg->cores = cores;
-+
- 		if (!(sd->flags & SD_ASYM_PACKING))
- 			goto next;
-
---
-2.32.0
-
-From: Tim C Chen <tim.c.chen@xxxxxxxxxxxxxxx>
-
-In the current prefer sibling load balancing code, there is an implicit
-assumption that the busiest sched group and local sched group are
-equivalent, hence the tasks to be moved is simply the difference in
-number of tasks between the two groups (i.e. imbalance) divided by two.
-
-However, we may have different number of cores between the cluster groups,
-say when we take CPU offline or we have hybrid groups.  In that case,
-we should balance between the two groups such that #tasks/#cores ratio
-is the same between the same between both groups.  Hence the imbalance
-computed will need to reflect this.
-
-Adjust the sibling imbalance computation to take into account of the
-above considerations.
-
-Signed-off-by: Tim Chen <tim.c.chen@xxxxxxxxxxxxxxx>
----
- kernel/sched/fair.c | 41 +++++++++++++++++++++++++++++++++++++----
- 1 file changed, 37 insertions(+), 4 deletions(-)
-
-diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index f636d6c09dc6..f491b94908bf 100644
---- a/kernel/sched/fair.c
-+++ b/kernel/sched/fair.c
-@@ -9372,6 +9372,41 @@ static inline bool smt_balance(struct lb_env *env, struct sg_lb_stats *sgs,
- 	return false;
- }
-
-+static inline long sibling_imbalance(struct lb_env *env,
-+				    struct sd_lb_stats *sds,
-+				    struct sg_lb_stats *busiest,
-+				    struct sg_lb_stats *local)
-+{
-+	int ncores_busiest, ncores_local;
-+	long imbalance;
-+
-+	if (env->idle == CPU_NOT_IDLE || !busiest->sum_nr_running)
-+		return 0;
-+
-+	ncores_busiest = sds->busiest->cores;
-+	ncores_local = sds->local->cores;
-+
-+	if (ncores_busiest == ncores_local) {
-+		imbalance = busiest->sum_nr_running;
-+		lsub_positive(&imbalance, local->sum_nr_running);
-+		return imbalance;
-+	}
-+
-+	/* Balance such that nr_running/ncores ratio are same on both groups */
-+	imbalance = ncores_local * busiest->sum_nr_running;
-+	lsub_positive(&imbalance, ncores_busiest * local->sum_nr_running);
-+	/* Normalize imbalance and do rounding on normalization */
-+	imbalance = 2 * imbalance + ncores_local + ncores_busiest;
-+	imbalance /= ncores_local + ncores_busiest;
-+
-+	/* Take advantage of resource in an empty sched group */
-+	if (imbalance == 0 && local->sum_nr_running == 0 &&
-+	    busiest->sum_nr_running > 1)
-+		imbalance = 2;
-+
-+	return imbalance;
-+}
-+
- static inline bool
- sched_reduced_capacity(struct rq *rq, struct sched_domain *sd)
- {
-@@ -10230,14 +10265,12 @@ static inline void calculate_imbalance(struct lb_env *env, struct sd_lb_stats *s
- 		}
-
- 		if (busiest->group_weight == 1 || sds->prefer_sibling) {
--			unsigned int nr_diff = busiest->sum_nr_running;
- 			/*
- 			 * When prefer sibling, evenly spread running tasks on
- 			 * groups.
- 			 */
- 			env->migration_type = migrate_task;
--			lsub_positive(&nr_diff, local->sum_nr_running);
--			env->imbalance = nr_diff;
-+			env->imbalance = sibling_imbalance(env, sds, busiest, local);
- 		} else {
-
- 			/*
-@@ -10424,7 +10457,7 @@ static struct sched_group *find_busiest_group(struct lb_env *env)
- 	 * group's child domain.
- 	 */
- 	if (sds.prefer_sibling && local->group_type == group_has_spare &&
--	    busiest->sum_nr_running > local->sum_nr_running + 1)
-+	    sibling_imbalance(env, &sds, busiest, local) > 1)
- 		goto force_balance;
-
- 	if (busiest->group_type != group_overloaded) {
---
-2.32.0
-
-From: Ricardo Neri <ricardo.neri-calderon@xxxxxxxxxxxxxxx>
-
-should_we_balance() traverses the group_balance_mask (AND'ed with lb_env::
-cpus) starting from lower numbered CPUs looking for the first idle CPU.
-
-In hybrid x86 systems, the siblings of SMT cores get CPU numbers, before
-non-SMT cores:
-
-	[0, 1] [2, 3] [4, 5] 6 7 8 9
-         b  i   b  i   b  i  b i i i
-
-In the figure above, CPUs in brackets are siblings of an SMT core. The
-rest are non-SMT cores. 'b' indicates a busy CPU, 'i' indicates an
-idle CPU.
-
-We should let a CPU on a fully idle core get the first chance to idle
-load balance as it has more CPU capacity than a CPU on an idle SMT
-CPU with busy sibling.  So for the figure above, if we are running
-should_we_balance() to CPU 1, we should return false to let CPU 7 on
-idle core to have a chance first to idle load balance.
-
-A partially busy (i.e., of type group_has_spare) local group with SMT
-cores will often have only one SMT sibling busy. If the destination CPU
-is a non-SMT core, partially busy, lower-numbered, SMT cores should not
-be considered when finding the first idle CPU.
-
-However, in should_we_balance(), when we encounter idle SMT first in partially
-busy core, we prematurely break the search for the first idle CPU.
-
-Higher-numbered, non-SMT cores is not given the chance to have
-idle balance done on their behalf. Those CPUs will only be considered
-for idle balancing by chance via CPU_NEWLY_IDLE.
-
-Instead, consider the idle state of the whole SMT core.
-
-Signed-off-by: Ricardo Neri <ricardo.neri-calderon@xxxxxxxxxxxxxxx>
-Co-developed-by: Tim Chen <tim.c.chen@xxxxxxxxxxxxxxx>
-Signed-off-by: Tim Chen <tim.c.chen@xxxxxxxxxxxxxxx>
----
- kernel/sched/fair.c | 16 +++++++++++++++-
- 1 file changed, 15 insertions(+), 1 deletion(-)
-
-diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index f491b94908bf..294a662c9410 100644
---- a/kernel/sched/fair.c
-+++ b/kernel/sched/fair.c
-@@ -10729,7 +10729,7 @@ static int active_load_balance_cpu_stop(void *data);
- static int should_we_balance(struct lb_env *env)
- {
- 	struct sched_group *sg = env->sd->groups;
--	int cpu;
-+	int cpu, idle_smt = -1;
-
- 	/*
- 	 * Ensure the balancing environment is consistent; can happen
-@@ -10756,10 +10756,24 @@ static int should_we_balance(struct lb_env *env)
- 		if (!idle_cpu(cpu))
- 			continue;
-
-+		/*
-+		 * Don't balance to idle SMT in busy core right away when
-+		 * balancing cores, but remember the first idle SMT CPU for
-+		 * later consideration.  Find CPU on an idle core first.
-+		 */
-+		if (!(env->sd->flags & SD_SHARE_CPUCAPACITY) && !is_core_idle(cpu)) {
-+			if (idle_smt == -1)
-+				idle_smt = cpu;
-+			continue;
-+		}
-+
- 		/* Are we the first idle CPU? */
- 		return cpu == env->dst_cpu;
- 	}
-
-+	if (idle_smt == env->dst_cpu)
-+		return true;
-+
- 	/* Are we the first CPU of this group ? */
- 	return group_balance_cpu(sg) == env->dst_cpu;
- }
---
-2.32.0
-
-From: Tim C Chen <tim.c.chen@xxxxxxxxxxxxxxx>
-
-Cluster topology was not enabled on hybrid x86 CPU as load balance
-was not properly working for cluster domain.  That has been fixed and
-cluster domain can be enabled for hybrid CPU.
-
-Reviewed-by: Ricardo Neri <ricardo.neri-calderon@xxxxxxxxxxxxxxx>
-Signed-off-by: Tim Chen <tim.c.chen@xxxxxxxxxxxxxxx>
----
- arch/x86/kernel/smpboot.c | 3 +++
- 1 file changed, 3 insertions(+)
-
-diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
-index cea297d97034..2489d767c398 100644
---- a/arch/x86/kernel/smpboot.c
-+++ b/arch/x86/kernel/smpboot.c
-@@ -575,6 +575,9 @@ static struct sched_domain_topology_level x86_hybrid_topology[] = {
- #ifdef CONFIG_SCHED_SMT
- 	{ cpu_smt_mask, x86_smt_flags, SD_INIT_NAME(SMT) },
- #endif
-+#ifdef CONFIG_SCHED_CLUSTER
-+	{ cpu_clustergroup_mask, x86_cluster_flags, SD_INIT_NAME(CLS) },
-+#endif
- #ifdef CONFIG_SCHED_MC
- 	{ cpu_coregroup_mask, x86_core_flags, SD_INIT_NAME(MC) },
- #endif
---
-2.32.0
-
-Add dump of domain sched group flags of a CPU to make debug easier
-in the future.
-
-Usage:
-cat /debug/sched/domains/cpu0/domain1/groups_flags
-to dump cpu0 domain1's sched group flags.
-
-Signed-off-by: Tim Chen <tim.c.chen@xxxxxxxxxxxxxxx>
----
- kernel/sched/debug.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
-index 1637b65ba07a..55b50f940feb 100644
---- a/kernel/sched/debug.c
-+++ b/kernel/sched/debug.c
-@@ -389,6 +389,7 @@ static void register_sd(struct sched_domain *sd, struct dentry *parent)
- #undef SDM
-
- 	debugfs_create_file("flags", 0444, parent, &sd->flags, &sd_flags_fops);
-+	debugfs_create_file("groups_flags", 0444, parent, &sd->groups->flags, &sd_flags_fops);
- }
-
- void update_sched_domain_debugfs(void)
---
-2.32.0
-
 In cgroupv2 cfs_b->hierarchical_quota is set to -1 for all task
 groups due to the previous fix simply taking the min.  It should
 reflect a limit imposed at that level or by an ancestor. Even
@@ -10773,3 +10258,185 @@ index 392fb273e7bd..f46fbb03062b 100644
  {
 --
 2.20.1
+
+Suggested-by: Alexander Potapenko <glider@xxxxxxxxxx>
+Signed-off-by: Rob Clark <robdclark@xxxxxxxxxxxx>
+---
+ drivers/gpu/drm/scheduler/sched_fence.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/scheduler/sched_fence.c b/drivers/gpu/drm/scheduler/sched_fence.c
+index ef120475e7c6..b624711c6e03 100644
+--- a/drivers/gpu/drm/scheduler/sched_fence.c
++++ b/drivers/gpu/drm/scheduler/sched_fence.c
+@@ -35,7 +35,7 @@ static int __init drm_sched_fence_slab_init(void)
+ {
+ 	sched_fence_slab = kmem_cache_create(
+ 		"drm_sched_fence", sizeof(struct drm_sched_fence), 0,
+-		SLAB_HWCACHE_ALIGN, NULL);
++		SLAB_HWCACHE_ALIGN | SLAB_TYPESAFE_BY_RCU, NULL);
+ 	if (!sched_fence_slab)
+ 		return -ENOMEM;
+
+--
+2.41.0
+
+select_idle_capacity() not only looks for an idle cpu that fits for the
+waking task but also for cpu with highest bandwidth when no cpu fits.
+Start the loop with target cpu so it will be selected 1st when no cpu fits
+but several cpus shared the same bandwidth. Starting with target cpu
+prevents the task to migrate between cpus with same bandwidth at every
+wakeup when no cpu fits.
+
+Signed-off-by: Vincent Guittot <vincent.guittot@xxxxxxxxxx>
+---
+ kernel/sched/fair.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index a80a73909dc2..0ee116f992f4 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -7065,7 +7065,7 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
+ 	util_min = uclamp_eff_value(p, UCLAMP_MIN);
+ 	util_max = uclamp_eff_value(p, UCLAMP_MAX);
+
+-	for_each_cpu_wrap(cpu, cpus, target + 1) {
++	for_each_cpu_wrap(cpu, cpus, target) {
+ 		unsigned long cpu_cap = capacity_of(cpu);
+
+ 		if (!available_idle_cpu(cpu) && !sched_idle_cpu(cpu))
+--
+2.34.1
+
+apply_vma_lock_flags() calls mlock_fixup(), which could merge the VMA
+after where the vma iterator is located.  Although this is not an issue,
+the next iteration of the loop will check the start of the vma to be
+equal to the locally saved 'tmp' variable and cause an incorrect failure
+scenario.  Fix the error by setting tmp to the end of the vma iterator
+value before restarting the loop.
+
+There is also a potential of the error code being overwritten when the
+loop terminates early.  Fix the return issue by directly returning when
+an error is encountered since there is nothing to undo after the loop.
+
+Reported-by: Ryan Roberts <ryan.roberts@xxxxxxx>
+Link: https://lore.kernel.org/linux-mm/50341ca1-d582-b33a-e3d0-acb08a65166f@xxxxxxx/
+Cc: <stable@xxxxxxxxxxxxxxx>
+Fixes: 37598f5a9d8b ("mlock: convert mlock to vma iterator")
+Signed-off-by: Liam R. Howlett <Liam.Howlett@xxxxxxxxxx>
+---
+ mm/mlock.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/mm/mlock.c b/mm/mlock.c
+index d7db94519884..0a0c996c5c21 100644
+--- a/mm/mlock.c
++++ b/mm/mlock.c
+@@ -477,7 +477,6 @@ static int apply_vma_lock_flags(unsigned long start, size_t len,
+ {
+ 	unsigned long nstart, end, tmp;
+ 	struct vm_area_struct *vma, *prev;
+-	int error;
+ 	VMA_ITERATOR(vmi, current->mm, start);
+
+ 	VM_BUG_ON(offset_in_page(start));
+@@ -498,6 +497,7 @@ static int apply_vma_lock_flags(unsigned long start, size_t len,
+ 	nstart = start;
+ 	tmp = vma->vm_start;
+ 	for_each_vma_range(vmi, vma, end) {
++		int error;
+ 		vm_flags_t newflags;
+
+ 		if (vma->vm_start != tmp)
+@@ -511,14 +511,15 @@ static int apply_vma_lock_flags(unsigned long start, size_t len,
+ 			tmp = end;
+ 		error = mlock_fixup(&vmi, vma, &prev, nstart, tmp, newflags);
+ 		if (error)
+-			break;
++			return error;
++		tmp = vma_iter_end(&vmi);
+ 		nstart = tmp;
+ 	}
+
+-	if (vma_iter_end(&vmi) < end)
++	if (tmp < end)
+ 		return -ENOMEM;
+
+-	return error;
++	return 0;
+ }
+
+ /*
+--
+2.39.2
+
+Calling kthread_stop before executing kthread's threadfn will return
+-EINTR. We can complete the release of memory resources in this state.
+
+Fixes: 6710e1126934 ("bpf: introduce new bpf cpu map type BPF_MAP_TYPE_CPUMAP")
+Signed-off-by: Pu Lehui <pulehui@xxxxxxxxxx>
+---
+ kernel/bpf/cpumap.c | 40 ++++++++++++++++++++++++----------------
+ 1 file changed, 24 insertions(+), 16 deletions(-)
+
+diff --git a/kernel/bpf/cpumap.c b/kernel/bpf/cpumap.c
+index 8a33e8747a0e..6ae02be7a48e 100644
+--- a/kernel/bpf/cpumap.c
++++ b/kernel/bpf/cpumap.c
+@@ -122,22 +122,6 @@ static void get_cpu_map_entry(struct bpf_cpu_map_entry *rcpu)
+ 	atomic_inc(&rcpu->refcnt);
+ }
+
+-/* called from workqueue, to workaround syscall using preempt_disable */
+-static void cpu_map_kthread_stop(struct work_struct *work)
+-{
+-	struct bpf_cpu_map_entry *rcpu;
+-
+-	rcpu = container_of(work, struct bpf_cpu_map_entry, kthread_stop_wq);
+-
+-	/* Wait for flush in __cpu_map_entry_free(), via full RCU barrier,
+-	 * as it waits until all in-flight call_rcu() callbacks complete.
+-	 */
+-	rcu_barrier();
+-
+-	/* kthread_stop will wake_up_process and wait for it to complete */
+-	kthread_stop(rcpu->kthread);
+-}
+-
+ static void __cpu_map_ring_cleanup(struct ptr_ring *ring)
+ {
+ 	/* The tear-down procedure should have made sure that queue is
+@@ -165,6 +149,30 @@ static void put_cpu_map_entry(struct bpf_cpu_map_entry *rcpu)
+ 	}
+ }
+
++/* called from workqueue, to workaround syscall using preempt_disable */
++static void cpu_map_kthread_stop(struct work_struct *work)
++{
++	struct bpf_cpu_map_entry *rcpu;
++	int err;
++
++	rcpu = container_of(work, struct bpf_cpu_map_entry, kthread_stop_wq);
++
++	/* Wait for flush in __cpu_map_entry_free(), via full RCU barrier,
++	 * as it waits until all in-flight call_rcu() callbacks complete.
++	 */
++	rcu_barrier();
++
++	/* kthread_stop will wake_up_process and wait for it to complete */
++	err = kthread_stop(rcpu->kthread);
++	if (err) {
++		/* kthread_stop may be called before cpu_map_kthread_run
++		 * is executed, so we need to release the memory related
++		 * to rcpu.
++		 */
++		put_cpu_map_entry(rcpu);
++	}
++}
++
+ static void cpu_map_bpf_prog_run_skb(struct bpf_cpu_map_entry *rcpu,
+ 				     struct list_head *listp,
+ 				     struct xdp_cpumap_stats *stats)
+--
+2.25.1
