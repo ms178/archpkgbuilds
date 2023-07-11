@@ -23,11 +23,11 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -DCMAKE_C_COMPILER=${CPATH}/clang \
     -DCMAKE_CXX_COMPILER=${CPATH}/clang++ \
     -DLLVM_USE_LINKER=${CPATH}/ld.lld \
-        -D CMAKE_C_FLAGS="-O3 -march=native -mtune=native -maes -falign-functions=32 -fno-semantic-interposition -fno-omit-frame-pointer -fcf-protection=none -mharden-sls=none -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
-        -D CMAKE_CXX_FLAGS="-O3 -march=native -mtune=native -maes -falign-functions=32 -fno-semantic-interposition -fno-omit-frame-pointer -fcf-protection=none -mharden-sls=none -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
-        -D CMAKE_EXE_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fuse-ld=lld -maes -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
-        -D CMAKE_MODULE_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fuse-ld=lld -maes -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
-        -D CMAKE_SHARED_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fuse-ld=lld -maes -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
+        -D CMAKE_C_FLAGS="-O3 -march=native -mtune=native -maes -mbmi2 -mpclmul -falign-functions=32 -fno-semantic-interposition -fno-omit-frame-pointer -fcf-protection=none -mharden-sls=none -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
+        -D CMAKE_CXX_FLAGS="-O3 -march=native -mtune=native -maes -mbmi2 -mpclmul -falign-functions=32 -fno-semantic-interposition -fno-omit-frame-pointer -fcf-protection=none -mharden-sls=none -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
+        -D CMAKE_EXE_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fuse-ld=lld -maes -mbmi2 -mpclmul -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
+        -D CMAKE_MODULE_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fuse-ld=lld -maes -mbmi2 -mpclmul -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
+        -D CMAKE_SHARED_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fuse-ld=lld -maes -mbmi2 -mpclmul -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
         -DLLVM_ENABLE_PROJECTS="lld;clang;compiler-rt" \
         -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86;BPF" \
         -D CLANG_ENABLE_ARCMT:BOOL=OFF \
