@@ -14,13 +14,13 @@ echo "Instrument clang with llvm-bolt"
 ${BOLTPATH}/llvm-bolt \
     --instrument \
     --instrumentation-file-append-pid \
-    --instrumentation-file=${TOPLEV}/stage3-without-sampling/intrumentdata/clang-17.fdata \
-    ${CPATH}/clang-17 \
-    -o ${CPATH}/clang-17.inst
+    --instrumentation-file=${TOPLEV}/stage3-without-sampling/intrumentdata/clang-18.fdata \
+    ${CPATH}/clang-18 \
+    -o ${CPATH}/clang-18.inst
 
 echo "mooving instrumented binary"
-mv ${CPATH}/clang-17 ${CPATH}/clang-17.org
-mv ${CPATH}/clang-17.inst ${CPATH}/clang-17
+mv ${CPATH}/clang-18 ${CPATH}/clang-18.org
+mv ${CPATH}/clang-18.inst ${CPATH}/clang-18
 
 echo "== Configure Build"
 echo "== Build with stage2-prof-use-lto instrumented clang -- $CPATH"
@@ -36,7 +36,7 @@ cmake -G Ninja ../llvm-project/llvm \
     -D CMAKE_MODULE_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -march=native -mtune=native -maes -mbmi2 -mpclmul -fuse-ld=lld -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -Wl,--thinlto-jobs=all" \
     -D CMAKE_SHARED_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -march=native -mtune=native -maes -mbmi2 -mpclmul -fuse-ld=lld -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -Wl,--thinlto-jobs=all" \
     -DCMAKE_AR=${CPATH}/llvm-ar \
-    -DCMAKE_C_COMPILER=${CPATH}/clang-17 \
+    -DCMAKE_C_COMPILER=${CPATH}/clang-18 \
     -DCMAKE_CXX_COMPILER=${CPATH}/clang++ \
     -DLLVM_USE_LINKER=${CPATH}/ld.lld \
     -DCMAKE_RANLIB=${CPATH}/llvm-ranlib \
@@ -50,9 +50,9 @@ cd ${TOPLEV}/stage3-without-sampling/intrumentdata
 LD_PRELOAD=/usr/lib/libjemalloc.so ${BOLTPATH}/merge-fdata *.fdata > combined.fdata
 echo "Optimizing Clang with the generated profile"
 
-LD_PRELOAD=/usr/lib/libjemalloc.so ${BOLTPATH}/llvm-bolt ${CPATH}/clang-17.org \
+LD_PRELOAD=/usr/lib/libjemalloc.so ${BOLTPATH}/llvm-bolt ${CPATH}/clang-18.org \
     --data combined.fdata \
-    -o ${CPATH}/clang-17 \
+    -o ${CPATH}/clang-18 \
     -reorder-blocks=ext-tsp \
     -reorder-functions=hfsort+ \
     -split-functions \
