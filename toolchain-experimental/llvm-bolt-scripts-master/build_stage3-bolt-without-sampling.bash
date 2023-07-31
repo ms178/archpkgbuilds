@@ -54,7 +54,7 @@ LD_PRELOAD=/usr/lib/libjemalloc.so ${BOLTPATH}/llvm-bolt ${CPATH}/clang-18.org \
     --data combined.fdata \
     -o ${CPATH}/clang-18 \
     -reorder-blocks=ext-tsp \
-    -reorder-functions=hfsort+ \
+    -reorder-functions=cds \
     -split-functions \
     -split-all-cold \
     -split-eh \
