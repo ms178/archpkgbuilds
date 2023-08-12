@@ -1,0 +1,256 @@
+From ab8869ff42ed55ca0e20d193cd90d131673afa6a Mon Sep 17 00:00:00 2001
+From: Rhys Perry <pendingchaos02@gmail.com>
+Date: Thu, 13 Jul 2023 22:48:03 +0100
+Subject: [PATCH 1/4] aco: support all scans with a uniform destination
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Some operations weren't handled because we assumed they would always be
+divergent. This should implement all uniform scans.
+
+Signed-off-by: Rhys Perry <pendingchaos02@gmail.com>
+Reviewed-by: Timur Kristóf <timur.kristof@gmail.com>
+---
+ .../compiler/aco_instruction_selection.cpp    | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/src/amd/compiler/aco_instruction_selection.cpp b/src/amd/compiler/aco_instruction_selection.cpp
+index 84a7ee0a4ad6b..7db55054d58ff 100644
+--- a/src/amd/compiler/aco_instruction_selection.cpp
++++ b/src/amd/compiler/aco_instruction_selection.cpp
+@@ -8409,6 +8409,25 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
+       bool create_helpers =
+          instr->intrinsic == nir_intrinsic_reduce && nir_intrinsic_include_helpers(instr);
+ 
++      if (!nir_dest_is_divergent(instr->dest) && instr->intrinsic != nir_intrinsic_reduce &&
++          instr->dest.ssa.bit_size != 1) {
++         /* The lowest invocation must be src0 (inclusive scan) or identity (exclusive scan). Since
++          * the result is uniform, the higher ones much be the same.
++          */
++         ReduceOp reduce_op = get_reduce_op(op, instr->src[0].ssa->bit_size);
++         if (instr->intrinsic == nir_intrinsic_inclusive_scan) {
++            emit_uniform_subgroup(ctx, instr, get_ssa_temp(ctx, instr->src[0].ssa));
++         } else if (dst.bytes() == 8) {
++            uint32_t lo = get_reduction_identity(reduce_op, 0);
++            uint32_t hi = get_reduction_identity(reduce_op, 1);
++            bld.pseudo(aco_opcode::p_create_vector, Definition(dst), Operand::c32(lo),
++                       Operand::c32(hi));
++         } else {
++            bld.copy(Definition(dst), Operand::c32(get_reduction_identity(reduce_op, 0)));
++         }
++         break;
++      }
++
+       if (!nir_src_is_divergent(instr->src[0]) && cluster_size == ctx->program->wave_size &&
+           instr->dest.ssa.bit_size != 1) {
+          /* We use divergence analysis to assign the regclass, so check if it's
+-- 
+GitLab
+
+
+From 8a8708042d38be76d2ad9a91554dfc94c344e9b1 Mon Sep 17 00:00:00 2001
+From: Rhys Perry <pendingchaos02@gmail.com>
+Date: Thu, 13 Jul 2023 22:57:29 +0100
+Subject: [PATCH 2/4] aco: implement uniform clustered reductions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Rhys Perry <pendingchaos02@gmail.com>
+Reviewed-by: Timur Kristóf <timur.kristof@gmail.com>
+---
+ src/amd/compiler/aco_instruction_selection.cpp | 18 +++++++++++++-----
+ 1 file changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/src/amd/compiler/aco_instruction_selection.cpp b/src/amd/compiler/aco_instruction_selection.cpp
+index 7db55054d58ff..0404322029795 100644
+--- a/src/amd/compiler/aco_instruction_selection.cpp
++++ b/src/amd/compiler/aco_instruction_selection.cpp
+@@ -8467,11 +8467,16 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
+          default: assert(false);
+          }
+       } else if (cluster_size == 1) {
+-         bld.copy(Definition(dst), src);
++         if (dst.type() == RegType::sgpr && src.type() == RegType::vgpr)
++            bld.pseudo(aco_opcode::p_as_uniform, Definition(dst), src);
++         else
++            bld.copy(Definition(dst), src);
+       } else {
+          unsigned bit_size = instr->src[0].ssa->bit_size;
+-
+          src = emit_extract_vector(ctx, src, 0, RegClass::get(RegType::vgpr, bit_size / 8));
++         Temp tmp = dst.type() == RegType::sgpr && cluster_size < ctx->program->wave_size
++                       ? bld.tmp(src.regClass())
++                       : dst;
+ 
+          ReduceOp reduce_op = get_reduce_op(op, bit_size);
+ 
+@@ -8483,9 +8488,12 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
+          default: unreachable("unknown reduce intrinsic");
+          }
+ 
+-         Temp tmp_dst = emit_reduction_instr(ctx, aco_op, reduce_op, cluster_size,
+-                                             bld.def(dst.regClass()), src);
+-         emit_wqm(bld, tmp_dst, dst, create_helpers);
++         Temp pre_wqm_dst = emit_reduction_instr(ctx, aco_op, reduce_op, cluster_size,
++                                                 bld.def(tmp.regClass()), src);
++         emit_wqm(bld, pre_wqm_dst, tmp, create_helpers);
++
++         if (tmp != dst)
++            bld.pseudo(aco_opcode::p_as_uniform, Definition(dst), tmp);
+       }
+       break;
+    }
+-- 
+GitLab
+
+
+From e348271dabf7a9123b7f7f1573373caffb92e7b9 Mon Sep 17 00:00:00 2001
+From: Rhys Perry <pendingchaos02@gmail.com>
+Date: Tue, 18 Jul 2023 19:10:41 +0100
+Subject: [PATCH 3/4] ac/nir: adjust mesh shader workgroup size
+
+Signed-off-by: Rhys Perry <pendingchaos02@gmail.com>
+---
+ src/amd/common/ac_nir_lower_ngg.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/amd/common/ac_nir_lower_ngg.c b/src/amd/common/ac_nir_lower_ngg.c
+index d32dae39e900b..ee89cab4fb172 100644
+--- a/src/amd/common/ac_nir_lower_ngg.c
++++ b/src/amd/common/ac_nir_lower_ngg.c
+@@ -4777,6 +4777,13 @@ ac_nir_lower_ngg_ms(nir_shader *shader,
+    emit_ms_finale(b, &state);
+    nir_metadata_preserve(impl, nir_metadata_none);
+ 
++   /* Use the correct workgroup size (aligned to wave_size, since all lanes start active). Local
++    * invocation IDs are lowered earlier.
++    */
++   shader->info.workgroup_size[0] = ALIGN(hw_workgroup_size, wave_size);
++   shader->info.workgroup_size[1] = 1;
++   shader->info.workgroup_size[2] = 1;
++
+    /* Cleanup */
+    nir_lower_vars_to_ssa(shader);
+    nir_remove_dead_variables(shader, nir_var_function_temp, NULL);
+-- 
+GitLab
+
+
+From c7f38660dd9cd0ab218ad8859e86c6be2eca2877 Mon Sep 17 00:00:00 2001
+From: Rhys Perry <pendingchaos02@gmail.com>
+Date: Thu, 13 Jul 2023 22:09:57 +0100
+Subject: [PATCH 4/4] nir/divergence: consider single-invocation shaders
+ uniform
+
+fossil-db (navi21):
+Totals from 3 (0.00% of 133461) affected shaders:
+MaxWaves: 63 -> 69 (+9.52%); split: +17.46%, -7.94%
+Instrs: 2250 -> 2094 (-6.93%)
+CodeSize: 11596 -> 10772 (-7.11%)
+Latency: 1201735 -> 280246 (-76.68%)
+InvThroughput: 3961396 -> 1099904 (-72.23%)
+VClause: 90 -> 69 (-23.33%)
+SClause: 66 -> 95 (+43.94%)
+Copies: 392 -> 222 (-43.37%)
+Branches: 157 -> 197 (+25.48%); split: -1.91%, +27.39%
+PreSGPRs: 128 -> 141 (+10.16%)
+PreVGPRs: 135 -> 122 (-9.63%); split: -10.37%, +0.74%
+
+Signed-off-by: Rhys Perry <pendingchaos02@gmail.com>
+Reviewed-by: Alyssa Rosenzweig <alyssa@rosenzweig.io>
+---
+ src/compiler/nir/nir.c                     |  9 +++++++++
+ src/compiler/nir/nir.h                     |  1 +
+ src/compiler/nir/nir_divergence_analysis.c | 18 ++++++++++++++++++
+ src/compiler/nir/nir_opt_uniform_atomics.c |  5 +----
+ 4 files changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/src/compiler/nir/nir.c b/src/compiler/nir/nir.c
+index a9f642bfd896b..96c0215adbe33 100644
+--- a/src/compiler/nir/nir.c
++++ b/src/compiler/nir/nir.c
+@@ -2453,6 +2453,15 @@ bool nir_shader_supports_implicit_lod(nir_shader *shader)
+             shader->info.cs.derivative_group != DERIVATIVE_GROUP_NONE));
+ }
+ 
++bool nir_shader_is_single_invocation(nir_shader *shader)
++{
++   nir_divergence_options options = shader->options->divergence_analysis_options;
++   return gl_shader_stage_uses_workgroup(shader->info.stage) &&
++          !shader->info.workgroup_size_variable && shader->info.workgroup_size[0] == 1 &&
++          shader->info.workgroup_size[1] == 1 && shader->info.workgroup_size[2] == 1 &&
++          !(options & nir_divergence_multiple_workgroup_per_compute_subgroup);
++}
++
+ nir_intrinsic_op
+ nir_intrinsic_from_system_value(gl_system_value val)
+ {
+diff --git a/src/compiler/nir/nir.h b/src/compiler/nir/nir.h
+index 373222b076f09..d1db36ae0c131 100644
+--- a/src/compiler/nir/nir.h
++++ b/src/compiler/nir/nir.h
+@@ -5975,6 +5975,7 @@ bool nir_lower_fp16_casts(nir_shader *shader, nir_lower_fp16_cast_options option
+ bool nir_normalize_cubemap_coords(nir_shader *shader);
+ 
+ bool nir_shader_supports_implicit_lod(nir_shader *shader);
++bool nir_shader_is_single_invocation(nir_shader *shader);
+ 
+ void nir_live_ssa_defs_impl(nir_function_impl *impl);
+ 
+diff --git a/src/compiler/nir/nir_divergence_analysis.c b/src/compiler/nir/nir_divergence_analysis.c
+index 8cb23456eca0d..c88e91d07dcf5 100644
+--- a/src/compiler/nir/nir_divergence_analysis.c
++++ b/src/compiler/nir/nir_divergence_analysis.c
+@@ -1036,6 +1036,21 @@ nir_divergence_analysis(nir_shader *shader)
+ {
+    shader->info.divergence_analysis_run = true;
+ 
++   if (nir_shader_is_single_invocation(shader)) {
++      /* If the workgroup is only a single invocation, then everything is uniform. */
++      nir_foreach_function_impl(impl, shader) {
++         nir_foreach_block(block, impl) {
++            nir_foreach_instr(instr, block)
++               nir_foreach_ssa_def(instr, set_ssa_def_not_divergent, NULL);
++
++            nir_cf_node *next = nir_cf_node_next(&block->cf_node);
++            if (next && next->type == nir_cf_node_loop)
++               nir_cf_node_as_loop(next)->divergent = false;
++         }
++      }
++      return;
++   }
++
+    struct divergence_state state = {
+       .stage = shader->info.stage,
+       .shader = shader,
+@@ -1052,6 +1067,9 @@ bool nir_update_instr_divergence(nir_shader *shader, nir_instr *instr)
+ {
+    nir_foreach_ssa_def(instr, set_ssa_def_not_divergent, NULL);
+ 
++   if (nir_shader_is_single_invocation(shader))
++      return true;
++
+    if (instr->type == nir_instr_type_phi) {
+       nir_cf_node *prev = nir_cf_node_prev(&instr->block->cf_node);
+       /* can only update gamma/if phis */
+diff --git a/src/compiler/nir/nir_opt_uniform_atomics.c b/src/compiler/nir/nir_opt_uniform_atomics.c
+index 4ec91432fd553..85bf3fa60517f 100644
+--- a/src/compiler/nir/nir_opt_uniform_atomics.c
++++ b/src/compiler/nir/nir_opt_uniform_atomics.c
+@@ -337,10 +337,7 @@ nir_opt_uniform_atomics(nir_shader *shader)
+    /* A 1x1x1 workgroup only ever has one active lane, so there's no point in
+     * optimizing any atomics.
+     */
+-   if (gl_shader_stage_uses_workgroup(shader->info.stage) &&
+-       !shader->info.workgroup_size_variable &&
+-       shader->info.workgroup_size[0] == 1 && shader->info.workgroup_size[1] == 1 &&
+-       shader->info.workgroup_size[2] == 1)
++   if (nir_shader_is_single_invocation(shader))
+       return false;
+ 
+    nir_foreach_function_impl(impl, shader) {
+-- 
+GitLab
+
