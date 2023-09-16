@@ -88,6 +88,7 @@ networkmanager-qt-main \
 phonon-main \
 plasma-integration-main \
 kpipewire-main \
+kscreen-main \
 kwin-main \
 plasma-workspace-main \
 kde-cli-tools-main \
