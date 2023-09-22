@@ -15184,3 +15184,532 @@ index 87a16b6158e5..e548c8cee9ad 100644
  		goto err;
 --
 2.41.0
+
+This is a revert of the commit mentioned below while it is not wrong, as
+in the kernel will explode, having migrate_disable() here it is
+complete waste of resources.
+
+Additionally commit message is plain wrong the review tag does not make
+it any better. The migrate_disable() interface has a fat comment
+describing it and it includes the word "undesired" in the headline which
+should tickle people to read it before using it.
+Initially I assumed it is worded too harsh but now I beg to differ.
+
+The reviewer of the original commit, even not understanding what
+migrate_disable() does should ask the following:
+
+- migrate_disable() is added only to the CONFIG_X86 block and it claims
+  to protect fpu_recursion_depth. Why are the other the architectures
+  excluded?
+
+- migrate_disable() is added after fpu_recursion_depth was modified.
+  Shouldn't it be added before the modification or referencing takes
+  place?
+
+Moving on.
+Disabling preemption DOES prevent CPU migration. A task, that can not be
+pushed away from the CPU by the scheduler (due to disabled preemption)
+can not be pushed or migrated to another CPU.
+
+Disabling migration DOES NOT ensure consistency of per-CPU variables. It
+only ensures that the task acts always on the same per-CPU variable. The
+task remains preemptible meaning multiple tasks can access the same
+per-CPU variable. This in turn leads to inconsistency for the statement
+
+                  *pcpu -= 1;
+
+with two tasks on one CPU and a preemption point during the RMW
+operation:
+
+     Task A                           Task B
+     read pcpu to reg  # 0
+     inc reg           # 0 -> 1
+                                      read pcpu to reg  # 0
+                                      inc reg           # 0 -> 1
+                                      write reg to pcpu # 1
+     write reg to pcpu # 1
+
+At the end pcpu reads 1 but should read 2 instead. Boom.
+
+get_cpu_ptr() already contains a preempt_disable() statement. That means
+that the per-CPU variable can only be referenced by a single task which
+is currently running. The only inconsistency that can occur if the
+variable is additionally accessed from an interrupt.
+
+Remove migrate_disable/enable() from dc_fpu_begin/end().
+
+Cc: Tianci Yin <tianci.yin at amd.com>
+Cc: Aurabindo Pillai <aurabindo.pillai at amd.com>
+Fixes: 0c316556d1249 ("drm/amd/display: Disable migration to ensure consistency of per-CPU variable")
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy at linutronix.de>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c b/drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c
+index 172aa10a8800f..86f4c0e046548 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c
+@@ -91,7 +91,6 @@ void dc_fpu_begin(const char *function_name, const int line)
+
+ 	if (*pcpu == 1) {
+ #if defined(CONFIG_X86) || defined(CONFIG_LOONGARCH)
+-		migrate_disable();
+ 		kernel_fpu_begin();
+ #elif defined(CONFIG_PPC64)
+ 		if (cpu_has_feature(CPU_FTR_VSX_COMP)) {
+@@ -132,7 +131,6 @@ void dc_fpu_end(const char *function_name, const int line)
+ 	if (*pcpu <= 0) {
+ #if defined(CONFIG_X86) || defined(CONFIG_LOONGARCH)
+ 		kernel_fpu_end();
+-		migrate_enable();
+ #elif defined(CONFIG_PPC64)
+ 		if (cpu_has_feature(CPU_FTR_VSX_COMP)) {
+ 			disable_kernel_vsx();
+--
+2.40.1
+
+The fpu_recursion_depth counter is used to ensure that dc_fpu_begin()
+can be invoked multiple times while the FPU-disable function itself is
+only invoked once. Also the counter part (dc_fpu_end()) is ballanced
+properly.
+
+Instead of using the get_cpu_ptr() dance around the inc it is simpler to
+increment the per-CPU variable directly. Also the per-CPU variable has
+to be incremented and decremented on the same CPU. This is ensured by
+the inner-part which disables preemption. This is kind of not obvious,
+works and the preempt-counter is touched a few times for no reason.
+
+Disable preemption before incrementing fpu_recursion_depth for the first
+time. Keep preemption disabled until dc_fpu_end() where the counter is
+decremented making it obvious that the preemption has to stay disabled
+while the counter is non-zero.
+Use simple inc/dec functions.
+Remove the nested preempt_disable/enable functions which are now not
+needed.
+
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy at linutronix.de>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/dc_fpu.c    | 50 ++++++++-----------
+ 1 file changed, 20 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c b/drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c
+index 86f4c0e046548..8bd5926b47e06 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c
+@@ -60,11 +60,9 @@ static DEFINE_PER_CPU(int, fpu_recursion_depth);
+  */
+ inline void dc_assert_fp_enabled(void)
+ {
+-	int *pcpu, depth = 0;
++	int depth;
+
+-	pcpu = get_cpu_ptr(&fpu_recursion_depth);
+-	depth = *pcpu;
+-	put_cpu_ptr(&fpu_recursion_depth);
++	depth = __this_cpu_read(fpu_recursion_depth);
+
+ 	ASSERT(depth >= 1);
+ }
+@@ -84,32 +82,27 @@ inline void dc_assert_fp_enabled(void)
+  */
+ void dc_fpu_begin(const char *function_name, const int line)
+ {
+-	int *pcpu;
++	int depth;
+
+-	pcpu = get_cpu_ptr(&fpu_recursion_depth);
+-	*pcpu += 1;
++	preempt_disable();
++	depth = __this_cpu_inc_return(fpu_recursion_depth);
+
+-	if (*pcpu == 1) {
++	if (depth == 1) {
+ #if defined(CONFIG_X86) || defined(CONFIG_LOONGARCH)
+ 		kernel_fpu_begin();
+ #elif defined(CONFIG_PPC64)
+-		if (cpu_has_feature(CPU_FTR_VSX_COMP)) {
+-			preempt_disable();
++		if (cpu_has_feature(CPU_FTR_VSX_COMP))
+ 			enable_kernel_vsx();
+-		} else if (cpu_has_feature(CPU_FTR_ALTIVEC_COMP)) {
+-			preempt_disable();
++		else if (cpu_has_feature(CPU_FTR_ALTIVEC_COMP))
+ 			enable_kernel_altivec();
+-		} else if (!cpu_has_feature(CPU_FTR_FPU_UNAVAILABLE)) {
+-			preempt_disable();
++		else if (!cpu_has_feature(CPU_FTR_FPU_UNAVAILABLE))
+ 			enable_kernel_fp();
+-		}
+ #elif defined(CONFIG_ARM64)
+ 		kernel_neon_begin();
+ #endif
+ 	}
+
+-	TRACE_DCN_FPU(true, function_name, line, *pcpu);
+-	put_cpu_ptr(&fpu_recursion_depth);
++	TRACE_DCN_FPU(true, function_name, line, depth);
+ }
+
+ /**
+@@ -124,29 +117,26 @@ void dc_fpu_begin(const char *function_name, const int line)
+  */
+ void dc_fpu_end(const char *function_name, const int line)
+ {
+-	int *pcpu;
++	int depth;
+
+-	pcpu = get_cpu_ptr(&fpu_recursion_depth);
+-	*pcpu -= 1;
+-	if (*pcpu <= 0) {
++	depth = __this_cpu_dec_return(fpu_recursion_depth);
++	if (depth == 0) {
+ #if defined(CONFIG_X86) || defined(CONFIG_LOONGARCH)
+ 		kernel_fpu_end();
+ #elif defined(CONFIG_PPC64)
+-		if (cpu_has_feature(CPU_FTR_VSX_COMP)) {
++		if (cpu_has_feature(CPU_FTR_VSX_COMP))
+ 			disable_kernel_vsx();
+-			preempt_enable();
+-		} else if (cpu_has_feature(CPU_FTR_ALTIVEC_COMP)) {
++		else if (cpu_has_feature(CPU_FTR_ALTIVEC_COMP))
+ 			disable_kernel_altivec();
+-			preempt_enable();
+-		} else if (!cpu_has_feature(CPU_FTR_FPU_UNAVAILABLE)) {
++		else if (!cpu_has_feature(CPU_FTR_FPU_UNAVAILABLE))
+ 			disable_kernel_fp();
+-			preempt_enable();
+-		}
+ #elif defined(CONFIG_ARM64)
+ 		kernel_neon_end();
+ #endif
++	} else {
++		WARN_ON_ONCE(depth < 0);
+ 	}
+
+-	TRACE_DCN_FPU(false, function_name, line, *pcpu);
+-	put_cpu_ptr(&fpu_recursion_depth);
++	TRACE_DCN_FPU(false, function_name, line, depth);
++	preempt_enable();
+ }
+--
+2.40.1
+
+Add a warning if the FPU is used from any context other than task
+context. This is only precaution since the code is not able to be used
+from softirq while the API allows it on x86 for instance.
+
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy at linutronix.de>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c b/drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c
+index 8bd5926b47e06..4ae4720535a56 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c
+@@ -84,6 +84,7 @@ void dc_fpu_begin(const char *function_name, const int line)
+ {
+ 	int depth;
+
++	WARN_ON_ONCE(!in_task());
+ 	preempt_disable();
+ 	depth = __this_cpu_inc_return(fpu_recursion_depth);
+
+--
+2.40.1
+
+dcn21_validate_bandwidth_fp() is invoked while FPU access has been
+enabled. FPU access requires disabling preemption even on PREEMPT_RT.
+It is not possible to allocate memory with disabled preemption even with
+GFP_ATOMIC on PREEMPT_RT.
+
+Move the memory allocation before FPU access is enabled.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=217928
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy at linutronix.de>
+---
+ drivers/gpu/drm/amd/display/dc/dcn21/dcn21_resource.c | 10 +++++++++-
+ drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.c  |  7 ++-----
+ drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.h  |  5 ++---
+ 3 files changed, 13 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_resource.c b/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_resource.c
+index d1a25fe6c44fa..5674c3450fc36 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_resource.c
+@@ -953,9 +953,17 @@ static bool dcn21_validate_bandwidth(struct dc *dc, struct dc_state *context,
+ 		bool fast_validate)
+ {
+ 	bool voltage_supported;
++	display_e2e_pipe_params_st *pipes;
++
++	pipes = kcalloc(dc->res_pool->pipe_count, sizeof(display_e2e_pipe_params_st), GFP_KERNEL);
++	if (!pipes)
++		return false;
++
+ 	DC_FP_START();
+-	voltage_supported = dcn21_validate_bandwidth_fp(dc, context, fast_validate);
++	voltage_supported = dcn21_validate_bandwidth_fp(dc, context, fast_validate, pipes);
+ 	DC_FP_END();
++
++	kfree(pipes);
+ 	return voltage_supported;
+ }
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.c b/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.c
+index 5805fb02af14e..8b2038162a7e1 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.c
++++ b/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.c
+@@ -2216,9 +2216,8 @@ static void dcn21_calculate_wm(struct dc *dc, struct dc_state *context,
+ 						&context->bw_ctx.dml, pipes, pipe_cnt);
+ }
+
+-bool dcn21_validate_bandwidth_fp(struct dc *dc,
+-				 struct dc_state *context,
+-				 bool fast_validate)
++bool dcn21_validate_bandwidth_fp(struct dc *dc, struct dc_state *context,
++				 bool fast_validate, display_e2e_pipe_params_st *pipes)
+ {
+ 	bool out = false;
+
+@@ -2227,7 +2226,6 @@ bool dcn21_validate_bandwidth_fp(struct dc *dc,
+ 	int vlevel = 0;
+ 	int pipe_split_from[MAX_PIPES];
+ 	int pipe_cnt = 0;
+-	display_e2e_pipe_params_st *pipes = kzalloc(dc->res_pool->pipe_count * sizeof(display_e2e_pipe_params_st), GFP_ATOMIC);
+ 	DC_LOGGER_INIT(dc->ctx->logger);
+
+ 	BW_VAL_TRACE_COUNT();
+@@ -2267,7 +2265,6 @@ bool dcn21_validate_bandwidth_fp(struct dc *dc,
+ 	out = false;
+
+ validate_out:
+-	kfree(pipes);
+
+ 	BW_VAL_TRACE_FINISH();
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.h b/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.h
+index c51badf7b68a9..a81a0b9e68842 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.h
++++ b/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.h
+@@ -77,9 +77,8 @@ int dcn21_populate_dml_pipes_from_context(struct dc *dc,
+ 					  struct dc_state *context,
+ 					  display_e2e_pipe_params_st *pipes,
+ 					  bool fast_validate);
+-bool dcn21_validate_bandwidth_fp(struct dc *dc,
+-				 struct dc_state *context,
+-				 bool fast_validate);
++bool dcn21_validate_bandwidth_fp(struct dc *dc, struct dc_state *context, bool
++				 fast_validate, display_e2e_pipe_params_st *pipes);
+ void dcn21_update_bw_bounding_box(struct dc *dc, struct clk_bw_params *bw_params);
+
+ void dcn21_clk_mgr_set_bw_params_wm_table(struct clk_bw_params *bw_params);
+--
+2.40.1
+
+dcn20_validate_bandwidth_fp() is invoked while FPU access has been
+enabled. FPU access requires disabling preemption even on PREEMPT_RT.
+It is not possible to allocate memory with disabled preemption even with
+GFP_ATOMIC on PREEMPT_RT.
+
+Move the memory allocation before FPU access is enabled.
+To preserve previous "clean" state of "pipes" add a memset() before the
+second invocation of dcn20_validate_bandwidth_internal() where the
+variable is used.
+
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy at linutronix.de>
+---
+ .../drm/amd/display/dc/dcn20/dcn20_resource.c    | 10 +++++++++-
+ .../gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.c | 16 +++++++---------
+ .../gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.h |  5 ++---
+ 3 files changed, 18 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_resource.c b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_resource.c
+index d587f807dfd7c..5036a3e608324 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_resource.c
+@@ -2141,9 +2141,17 @@ bool dcn20_validate_bandwidth(struct dc *dc, struct dc_state *context,
+ 		bool fast_validate)
+ {
+ 	bool voltage_supported;
++	display_e2e_pipe_params_st *pipes;
++
++	pipes = kcalloc(dc->res_pool->pipe_count, sizeof(display_e2e_pipe_params_st), GFP_KERNEL);
++	if (!pipes)
++		return false;
++
+ 	DC_FP_START();
+-	voltage_supported = dcn20_validate_bandwidth_fp(dc, context, fast_validate);
++	voltage_supported = dcn20_validate_bandwidth_fp(dc, context, fast_validate, pipes);
+ 	DC_FP_END();
++
++	kfree(pipes);
+ 	return voltage_supported;
+ }
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.c b/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.c
+index 8b2038162a7e1..2ad92497b9bf2 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.c
++++ b/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.c
+@@ -1923,7 +1923,7 @@ void dcn20_patch_bounding_box(struct dc *dc, struct _vcs_dpi_soc_bounding_box_st
+ }
+
+ static bool dcn20_validate_bandwidth_internal(struct dc *dc, struct dc_state *context,
+-		bool fast_validate)
++		bool fast_validate, display_e2e_pipe_params_st *pipes)
+ {
+ 	bool out = false;
+
+@@ -1932,7 +1932,6 @@ static bool dcn20_validate_bandwidth_internal(struct dc *dc, struct dc_state *co
+ 	int vlevel = 0;
+ 	int pipe_split_from[MAX_PIPES];
+ 	int pipe_cnt = 0;
+-	display_e2e_pipe_params_st *pipes = kzalloc(dc->res_pool->pipe_count * sizeof(display_e2e_pipe_params_st), GFP_ATOMIC);
+ 	DC_LOGGER_INIT(dc->ctx->logger);
+
+ 	BW_VAL_TRACE_COUNT();
+@@ -1967,16 +1966,14 @@ static bool dcn20_validate_bandwidth_internal(struct dc *dc, struct dc_state *co
+ 	out = false;
+
+ validate_out:
+-	kfree(pipes);
+
+ 	BW_VAL_TRACE_FINISH();
+
+ 	return out;
+ }
+
+-bool dcn20_validate_bandwidth_fp(struct dc *dc,
+-				 struct dc_state *context,
+-				 bool fast_validate)
++bool dcn20_validate_bandwidth_fp(struct dc *dc, struct dc_state *context,
++				 bool fast_validate, display_e2e_pipe_params_st *pipes)
+ {
+ 	bool voltage_supported = false;
+ 	bool full_pstate_supported = false;
+@@ -1995,11 +1992,11 @@ bool dcn20_validate_bandwidth_fp(struct dc *dc,
+ 	ASSERT(context != dc->current_state);
+
+ 	if (fast_validate) {
+-		return dcn20_validate_bandwidth_internal(dc, context, true);
++		return dcn20_validate_bandwidth_internal(dc, context, true, pipes);
+ 	}
+
+ 	// Best case, we support full UCLK switch latency
+-	voltage_supported = dcn20_validate_bandwidth_internal(dc, context, false);
++	voltage_supported = dcn20_validate_bandwidth_internal(dc, context, false, pipes);
+ 	full_pstate_supported = context->bw_ctx.bw.dcn.clk.p_state_change_support;
+
+ 	if (context->bw_ctx.dml.soc.dummy_pstate_latency_us == 0 ||
+@@ -2011,7 +2008,8 @@ bool dcn20_validate_bandwidth_fp(struct dc *dc,
+ 	// Fallback: Try to only support G6 temperature read latency
+ 	context->bw_ctx.dml.soc.dram_clock_change_latency_us = context->bw_ctx.dml.soc.dummy_pstate_latency_us;
+
+-	voltage_supported = dcn20_validate_bandwidth_internal(dc, context, false);
++	memset(pipes, 0, dc->res_pool->pipe_count * sizeof(display_e2e_pipe_params_st));
++	voltage_supported = dcn20_validate_bandwidth_internal(dc, context, false, pipes);
+ 	dummy_pstate_supported = context->bw_ctx.bw.dcn.clk.p_state_change_support;
+
+ 	if (voltage_supported && (dummy_pstate_supported || !(context->stream_count))) {
+diff --git a/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.h b/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.h
+index a81a0b9e68842..b6c34198ddc86 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.h
++++ b/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.h
+@@ -61,9 +61,8 @@ void dcn20_update_bounding_box(struct dc *dc,
+ 			       unsigned int num_states);
+ void dcn20_patch_bounding_box(struct dc *dc,
+ 			      struct _vcs_dpi_soc_bounding_box_st *bb);
+-bool dcn20_validate_bandwidth_fp(struct dc *dc,
+-				 struct dc_state *context,
+-				 bool fast_validate);
++bool dcn20_validate_bandwidth_fp(struct dc *dc, struct dc_state *context,
++				 bool fast_validate, display_e2e_pipe_params_st *pipes);
+ void dcn20_fpu_set_wm_ranges(int i,
+ 			     struct pp_smu_wm_range_sets *ranges,
+ 			     struct _vcs_dpi_soc_bounding_box_st *loaded_bb);
+--
+2.40.1
+
+fix a memory leak that occurs when csum is 0,
+the origin function will return directly and forgets to free 'pia' resource.
+
+Fixes: 0dbf2c562625 ("drm/amdgpu: Interpret IPMI data for product information (v2)")
+
+CC: Luben Tuikov <luben.tuikov at amd.com>
+Signed-off-by: Yang Wang <kevinyang.wang at amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fru_eeprom.c | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fru_eeprom.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fru_eeprom.c
+index 401651f28ba2..50b6eb447726 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fru_eeprom.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fru_eeprom.c
+@@ -111,7 +111,7 @@ int amdgpu_fru_get_product_info(struct amdgpu_device *adev)
+ {
+ 	unsigned char buf[8], *pia;
+ 	u32 addr, fru_addr;
+-	int size, len;
++	int size, len, ret = 0;
+ 	u8 csum;
+
+ 	if (!is_fru_eeprom_supported(adev, &fru_addr))
+@@ -171,16 +171,17 @@ int amdgpu_fru_get_product_info(struct amdgpu_device *adev)
+ 	/* Read the whole PIA. */
+ 	len = amdgpu_eeprom_read(adev->pm.fru_eeprom_i2c_bus, addr, pia, size);
+ 	if (len != size) {
+-		kfree(pia);
+ 		DRM_ERROR("Couldn't read the Product Info Area: %d", len);
+-		return len < 0 ? len : -EIO;
++		ret = len < 0 ? len : -EIO;
++		goto Out;
+ 	}
+
+ 	for (csum = 0; size > 0; size--)
+ 		csum += pia[size - 1];
+ 	if (csum) {
+ 		DRM_ERROR("Bad Product Info Area checksum: 0x%02x", csum);
+-		return -EIO;
++		ret = -EIO;
++		goto Out;
+ 	}
+
+ 	/* Now extract useful information from the PIA.
+@@ -220,7 +221,7 @@ int amdgpu_fru_get_product_info(struct amdgpu_device *adev)
+ 	adev->serial[sizeof(adev->serial) - 1] = '\0';
+ Out:
+ 	kfree(pia);
+-	return 0;
++	return ret;
+ }
+
+ /**
+--
+2.34.1
+
+We can't change the weight of the root cgroup. Let's handle
+root_task_group before doing any real work including acquiring
+the shares_mutex.
+
+Signed-off-by: Haifeng Xu <haifeng.xu@xxxxxxxxxx>
+---
+ kernel/sched/fair.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index a80a73909dc2..1ac2df87e070 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -12594,6 +12594,9 @@ int sched_group_set_shares(struct task_group *tg, unsigned long shares)
+ {
+ 	int ret;
+
++	if (tg == &root_task_group)
++		return -EINVAL;
++
+ 	mutex_lock(&shares_mutex);
+ 	if (tg_is_idle(tg))
+ 		ret = -EINVAL;
+--
+2.25.1
