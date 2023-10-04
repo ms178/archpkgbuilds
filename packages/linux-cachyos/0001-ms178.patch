@@ -15686,3 +15686,594 @@ index 4e787285fc66..3e045f6eb6ee 100644
  }
 
  /*
+
+A call to a synchronize_rcu() can be optimized from time point of
+view. Different workloads can be affected by this especially the
+ones which use this API in its time critical sections.
+
+For example if CONFIG_RCU_NOCB_CPU is set, the wakeme_after_rcu()
+callback can be delayed and such delay depends on where in a nocb
+list it is located.
+
+1. On our Android devices i can easily trigger the scenario when
+it is a last in the list out of ~3600 callbacks:
+
+<snip>
+  <...>-29      [001] d..1. 21950.145313: rcu_batch_start: rcu_preempt CBs=3613 bl=28
+...
+  <...>-29      [001] ..... 21950.152578: rcu_invoke_callback: rcu_preempt rhp=00000000b2d6dee8 func=__free_vm_area_struct.cfi_jt
+  <...>-29      [001] ..... 21950.152579: rcu_invoke_callback: rcu_preempt rhp=00000000a446f607 func=__free_vm_area_struct.cfi_jt
+  <...>-29      [001] ..... 21950.152580: rcu_invoke_callback: rcu_preempt rhp=00000000a5cab03b func=__free_vm_area_struct.cfi_jt
+  <...>-29      [001] ..... 21950.152581: rcu_invoke_callback: rcu_preempt rhp=0000000013b7e5ee func=__free_vm_area_struct.cfi_jt
+  <...>-29      [001] ..... 21950.152582: rcu_invoke_callback: rcu_preempt rhp=000000000a8ca6f9 func=__free_vm_area_struct.cfi_jt
+  <...>-29      [001] ..... 21950.152583: rcu_invoke_callback: rcu_preempt rhp=000000008f162ca8 func=wakeme_after_rcu.cfi_jt
+  <...>-29      [001] d..1. 21950.152625: rcu_batch_end: rcu_preempt CBs-invoked=3612 idle=....
+<snip>
+
+2. On our Android devices we use cpuset/cgroup to classify tasks
+and assign them into different cgroups. For example "backgrond"
+group which binds tasks only to little CPUs or "foreground" that
+binds to all CPUs, i.e. tasks can be migrated between groups.
+
+See below an example of how "surfaceflinger" task is migrated.
+Initially it is located in the "system-background" cgroup which
+allows to run only on little cores. In order to speedup it up
+it can be temporary moved into "foreground" cgroup which allows
+to use big CPUs:
+
+cgroup_attach_task():
+ -> cgroup_migrate_execute()
+   -> cpuset_can_attach()
+     -> percpu_down_write()
+       -> rcu_sync_enter()
+         -> synchronize_rcu()
+   -> now move tasks to the new cgroup.
+ -> cgroup_migrate_finish()
+
+<snip>
+         rcuop/1-29      [000] .....  7030.528570: rcu_invoke_callback: rcu_preempt rhp=00000000461605e0 func=wakeme_after_rcu.cfi_jt
+    PERFD-SERVER-1855    [000] d..1.  7030.530293: cgroup_attach_task: dst_root=3 dst_id=22 dst_level=1 dst_path=/foreground pid=1900 comm=surfaceflinger
+    PERFD-SERVER-1855    [000] d..1.  7030.530383: cgroup_attach_task: dst_root=3 dst_id=22 dst_level=1 dst_path=/foreground pid=1900 comm=surfaceflinger
+   TimerDispatch-2768    [002] d..5.  7030.537542: sched_migrate_task: comm=surfaceflinger pid=1900 prio=98 orig_cpu=0 dest_cpu=4
+<snip>
+
+from this example it is clear that "a moving time" also depends
+on how fast synchronize_rcu() completes.
+
+3. This patch improves the synchronize_rcu() approximately by 30%-50%
+on synthetic tests. Apart of that i have tested app launch of camera
+app where i also see better perf. figures:
+
+542 vs 489 diff: 9%
+540 vs 466 diff: 13%
+518 vs 468 diff: 9%
+531 vs 457 diff: 13%
+548 vs 475 diff: 13%
+509 vs 484 diff: 4%
+
+Signed-off-by: Uladzislau Rezki (Sony) <urezki@xxxxxxxxx>
+---
+ kernel/rcu/tree.c     | 151 +++++++++++++++++++++++++++++++++++++++++-
+ kernel/rcu/tree_exp.h |   2 +-
+ 2 files changed, 151 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/rcu/tree.c b/kernel/rcu/tree.c
+index 78554e7181dd..a347c1f98f11 100644
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@ -1384,6 +1384,122 @@ static void rcu_poll_gp_seq_end_unlocked(unsigned long *snap)
+ 		raw_spin_unlock_irqrestore_rcu_node(rnp, flags);
+ }
+
++/*
++ * There are three lists for handling synchronize_rcu() users.
++ * A first list corresponds to new coming users, second for users
++ * which wait for a grace period and third is for which a grace
++ * period is passed.
++ */
++static struct sr_normal_state {
++	struct llist_head curr;	/* request a GP users. */
++	struct llist_head wait;	/* wait for GP users. */
++	struct llist_head done;	/* ready for GP users. */
++	struct llist_node *curr_tail;
++	struct llist_node *wait_tail;
++	atomic_t active;
++} sr;
++
++/* Enable it by default. */
++static int rcu_normal_wake_from_gp = 1;
++module_param(rcu_normal_wake_from_gp, int, 0644);
++
++static void rcu_sr_normal_complete(struct llist_node *node)
++{
++	struct rcu_synchronize *rs = container_of(
++		(struct rcu_head *) node, struct rcu_synchronize, head);
++	unsigned long oldstate = (unsigned long) rs->head.func;
++
++	if (!poll_state_synchronize_rcu(oldstate))
++		WARN_ONCE(1, "A full grace period is not passed yet: %lu",
++			rcu_seq_diff(get_state_synchronize_rcu(), oldstate));
++
++	/* Finally. */
++	complete(&rs->completion);
++}
++
++static void rcu_sr_normal_gp_cleanup_work(struct work_struct *work)
++{
++	struct llist_node *done, *rcu, *next;
++
++	done = llist_del_all(&sr.done);
++	if (!done)
++		return;
++
++	llist_for_each_safe(rcu, next, done)
++		rcu_sr_normal_complete(rcu);
++}
++static DECLARE_WORK(sr_normal_gp_cleanup, rcu_sr_normal_gp_cleanup_work);
++
++/*
++ * Helper function for rcu_gp_cleanup().
++ */
++static void rcu_sr_normal_gp_cleanup(void)
++{
++	struct llist_node *first, *tail;
++
++	tail = READ_ONCE(sr.wait_tail);
++	first = llist_del_all(&sr.wait);
++	if (!first)
++		return;
++
++	/* Only one user? */
++	if (!first->next) {
++		rcu_sr_normal_complete(first);
++		return;
++	}
++
++	/* Can be not empty. */
++	llist_add_batch(first, tail, &sr.done);
++	queue_work(system_highpri_wq, &sr_normal_gp_cleanup);
++}
++
++/*
++ * Helper function for rcu_gp_init().
++ */
++static void rcu_sr_normal_gp_init(void)
++{
++	struct llist_node *llnode, *rcu;
++	int ret;
++
++	if (llist_empty(&sr.curr))
++		return;
++
++	/*
++	 * A waiting list of GP should be empty on this step,
++	 * since a GP-kthread, rcu_gp_init() -> gp_cleanup(),
++	 * rolls it over. If not, it is a BUG, warn a user.
++	 */
++	WARN_ON_ONCE(!llist_empty(&sr.wait));
++
++	/*
++	 * Obtain a tail of current active users. It is guaranteed
++	 * that if we are only one active user and the list is not
++	 * empty, the tail has already been updated.
++	 */
++	ret = atomic_inc_return(&sr.active);
++	WRITE_ONCE(sr.wait_tail, (ret == 1) ? READ_ONCE(sr.curr_tail):NULL);
++	llnode = llist_del_all(&sr.curr);
++	atomic_dec(&sr.active);
++
++	if (ret != 1) {
++		llist_for_each(rcu, llnode) {
++			if (!rcu->next)
++				WRITE_ONCE(sr.wait_tail, rcu);
++		}
++	}
++
++	llist_add_batch(llnode, READ_ONCE(sr.wait_tail), &sr.wait);
++}
++
++static void rcu_sr_normal_add_req(struct rcu_synchronize *rs)
++{
++	atomic_inc(&sr.active);
++	if (llist_add((struct llist_node *) &rs->head, &sr.curr))
++		/* Set the tail. Only first and one user can do that. */
++		WRITE_ONCE(sr.curr_tail, (struct llist_node *) &rs->head);
++	atomic_dec(&sr.active);
++}
++
+ /*
+  * Initialize a new grace period.  Return false if no grace period required.
+  */
+@@ -1420,6 +1536,7 @@ static noinline_for_stack bool rcu_gp_init(void)
+ 	ASSERT_EXCLUSIVE_WRITER(rcu_state.gp_seq);
+ 	trace_rcu_grace_period(rcu_state.name, rcu_state.gp_seq, TPS("start"));
+ 	rcu_poll_gp_seq_start(&rcu_state.gp_seq_polled_snap);
++	rcu_sr_normal_gp_init();
+ 	raw_spin_unlock_irq_rcu_node(rnp);
+
+ 	/*
+@@ -1787,6 +1904,9 @@ static noinline void rcu_gp_cleanup(void)
+ 	}
+ 	raw_spin_unlock_irq_rcu_node(rnp);
+
++	// Make synchronize_rcu() users aware of the end of old grace period.
++	rcu_sr_normal_gp_cleanup();
++
+ 	// If strict, make all CPUs aware of the end of the old grace period.
+ 	if (IS_ENABLED(CONFIG_RCU_STRICT_GRACE_PERIOD))
+ 		on_each_cpu(rcu_strict_gp_boundary, NULL, 0);
+@@ -3500,6 +3620,35 @@ static int rcu_blocking_is_gp(void)
+ 	return true;
+ }
+
++/*
++ * Helper function for the synchronize_rcu() API.
++ */
++static void synchronize_rcu_normal(void)
++{
++	struct rcu_synchronize rs;
++
++	if (READ_ONCE(rcu_normal_wake_from_gp)) {
++		init_rcu_head_on_stack(&rs.head);
++		init_completion(&rs.completion);
++
++		/*
++		 * This code might be preempted, therefore take a GP
++		 * snapshot before adding a request.
++		 */
++		rs.head.func = (void *) get_state_synchronize_rcu();
++		rcu_sr_normal_add_req(&rs);
++
++		/* Kick a GP and start waiting. */
++		(void) start_poll_synchronize_rcu();
++
++		/* Now we can wait. */
++		wait_for_completion(&rs.completion);
++		destroy_rcu_head_on_stack(&rs.head);
++	} else {
++		wait_rcu_gp(call_rcu_hurry);
++	}
++}
++
+ /**
+  * synchronize_rcu - wait until a grace period has elapsed.
+  *
+@@ -3551,7 +3700,7 @@ void synchronize_rcu(void)
+ 		if (rcu_gp_is_expedited())
+ 			synchronize_rcu_expedited();
+ 		else
+-			wait_rcu_gp(call_rcu_hurry);
++			synchronize_rcu_normal();
+ 		return;
+ 	}
+
+diff --git a/kernel/rcu/tree_exp.h b/kernel/rcu/tree_exp.h
+index 6d7cea5d591f..279a37beb05a 100644
+--- a/kernel/rcu/tree_exp.h
++++ b/kernel/rcu/tree_exp.h
+@@ -987,7 +987,7 @@ void synchronize_rcu_expedited(void)
+
+ 	/* If expedited grace periods are prohibited, fall back to normal. */
+ 	if (rcu_gp_is_normal()) {
+-		wait_rcu_gp(call_rcu_hurry);
++		synchronize_rcu_normal();
+ 		return;
+ 	}
+
+--
+2.30.2
+
+SRCU callbacks acceleration might fail if the preceding callbacks
+advance also fails. This can happen when the following steps are met:
+
+1) The RCU_WAIT_TAIL segment has callbacks (say for gp_num 8) and the
+   RCU_NEXT_READY_TAIL also has callbacks (say for gp_num 12).
+
+2) The grace period for RCU_WAIT_TAIL is observed as started but not yet
+   completed so rcu_seq_current() returns 4 + SRCU_STATE_SCAN1 = 5.
+
+3) This value is passed to rcu_segcblist_advance() which can't move
+   any segment forward and fails.
+
+4) srcu_gp_start_if_needed() still proceeds with callback acceleration.
+   But then the call to rcu_seq_snap() observes the grace period for the
+   RCU_WAIT_TAIL segment (gp_num 8) as completed and the subsequent one
+   for the RCU_NEXT_READY_TAIL segment as started
+   (ie: 8 + SRCU_STATE_SCAN1 = 9) so it returns a snapshot of the
+   next grace period, which is 16.
+
+5) The value of 16 is passed to rcu_segcblist_accelerate() but the
+   freshly enqueued callback in RCU_NEXT_TAIL can't move to
+   RCU_NEXT_READY_TAIL which already has callbacks for a previous grace
+   period (gp_num = 12). So acceleration fails.
+
+6) Note in all these steps, srcu_invoke_callbacks() hadn't had a chance
+   to run srcu_invoke_callbacks().
+
+Then some very bad outcome may happen if the following happens:
+
+7) Some other CPU races and starts the grace period number 16 before the
+   CPU handling previous steps had a chance. Therefore srcu_gp_start()
+   isn't called on the latter sdp to fix the acceleration leak from
+   previous steps with a new pair of call to advance/accelerate.
+
+8) The grace period 16 completes and srcu_invoke_callbacks() is finally
+   called. All the callbacks from previous grace periods (8 and 12) are
+   correctly advanced and executed but callbacks in RCU_NEXT_READY_TAIL
+   still remain. Then rcu_segcblist_accelerate() is called with a
+   snaphot of 20.
+
+9) Since nothing started the grace period number 20, callbacks stay
+   unhandled.
+
+This has been reported in real load:
+
+	[3144162.608392] INFO: task kworker/136:12:252684 blocked for more
+	than 122 seconds.
+	[3144162.615986]       Tainted: G           O  K   5.4.203-1-tlinux4-0011.1 #1
+	[3144162.623053] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs"
+	disables this message.
+	[3144162.631162] kworker/136:12  D    0 252684      2 0x90004000
+	[3144162.631189] Workqueue: kvm-irqfd-cleanup irqfd_shutdown [kvm]
+	[3144162.631192] Call Trace:
+	[3144162.631202]  __schedule+0x2ee/0x660
+	[3144162.631206]  schedule+0x33/0xa0
+	[3144162.631209]  schedule_timeout+0x1c4/0x340
+	[3144162.631214]  ? update_load_avg+0x82/0x660
+	[3144162.631217]  ? raw_spin_rq_lock_nested+0x1f/0x30
+	[3144162.631218]  wait_for_completion+0x119/0x180
+	[3144162.631220]  ? wake_up_q+0x80/0x80
+	[3144162.631224]  __synchronize_srcu.part.19+0x81/0xb0
+	[3144162.631226]  ? __bpf_trace_rcu_utilization+0x10/0x10
+	[3144162.631227]  synchronize_srcu+0x5f/0xc0
+	[3144162.631236]  irqfd_shutdown+0x3c/0xb0 [kvm]
+	[3144162.631239]  ? __schedule+0x2f6/0x660
+	[3144162.631243]  process_one_work+0x19a/0x3a0
+	[3144162.631244]  worker_thread+0x37/0x3a0
+	[3144162.631247]  kthread+0x117/0x140
+	[3144162.631247]  ? process_one_work+0x3a0/0x3a0
+	[3144162.631248]  ? __kthread_cancel_work+0x40/0x40
+	[3144162.631250]  ret_from_fork+0x1f/0x30
+
+Fix this with taking the snapshot for acceleration _before_ the read
+of the current grace period number.
+
+The only side effect of this solution is that callbacks advancing happen
+then _after_ the full barrier in rcu_seq_snap(). This is not a problem
+because that barrier only cares about:
+
+1) Ordering accesses of the update side before call_srcu() so they don't
+   bleed.
+2) See all the accesses prior to the grace period of the current gp_num
+
+The only things callbacks advancing need to be ordered against are
+carried by snp locking.
+
+Reported-by: Yong He <zhuangel570@xxxxxxxxx>
+Co-developed-by: Yong He <zhuangel570@xxxxxxxxx>
+Co-developed-by: Joel Fernandes <joel@xxxxxxxxxxxxxxxxx>
+Co-developed-by: Neeraj upadhyay <neeraj.iitr10@xxxxxxxxx>
+Link: http://lore.kernel.org/CANZk6aR+CqZaqmMWrC2eRRPY12qAZnDZLwLnHZbNi=xXMB401g@xxxxxxxxxxxxxx
+Fixes: da915ad5cf25 ("srcu: Parallelize callback handling")
+Signed-off-by: Frederic Weisbecker <frederic@xxxxxxxxxx>
+---
+ kernel/rcu/srcutree.c | 33 ++++++++++++++++++++++++++++++---
+ 1 file changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/rcu/srcutree.c b/kernel/rcu/srcutree.c
+index 5602042856b1..9fab9ac36996 100644
+--- a/kernel/rcu/srcutree.c
++++ b/kernel/rcu/srcutree.c
+@@ -1244,10 +1244,37 @@ static unsigned long srcu_gp_start_if_needed(struct srcu_struct *ssp,
+ 	spin_lock_irqsave_sdp_contention(sdp, &flags);
+ 	if (rhp)
+ 		rcu_segcblist_enqueue(&sdp->srcu_cblist, rhp);
+-	rcu_segcblist_advance(&sdp->srcu_cblist,
+-			      rcu_seq_current(&ssp->srcu_sup->srcu_gp_seq));
++	/*
++	 * The snapshot for acceleration must be taken _before_ the read of the
++	 * current gp sequence used for advancing, otherwise advancing may fail
++	 * and acceleration may then fail too.
++	 *
++	 * This could happen if:
++	 *
++	 *  1) The RCU_WAIT_TAIL segment has callbacks (gp_num = X + 4) and the
++	 *     RCU_NEXT_READY_TAIL also has callbacks (gp_num = X + 8).
++	 *
++	 *  2) The grace period for RCU_WAIT_TAIL is seen as started but not
++	 *     completed so rcu_seq_current() returns X + SRCU_STATE_SCAN1.
++	 *
++	 *  3) This value is passed to rcu_segcblist_advance() which can't move
++	 *     any segment forward and fails.
++	 *
++	 *  4) srcu_gp_start_if_needed() still proceeds with callback acceleration.
++	 *     But then the call to rcu_seq_snap() observes the grace period for the
++	 *     RCU_WAIT_TAIL segment as completed and the subsequent one for the
++	 *     RCU_NEXT_READY_TAIL segment as started (ie: X + 4 + SRCU_STATE_SCAN1)
++	 *     so it returns a snapshot of the next grace period, which is X + 12.
++	 *
++	 *  5) The value of X + 12 is passed to rcu_segcblist_accelerate() but the
++	 *     freshly enqueued callback in RCU_NEXT_TAIL can't move to
++	 *     RCU_NEXT_READY_TAIL which already has callbacks for a previous grace
++	 *     period (gp_num = X + 8). So acceleration fails.
++	 */
+ 	s = rcu_seq_snap(&ssp->srcu_sup->srcu_gp_seq);
+-	(void)rcu_segcblist_accelerate(&sdp->srcu_cblist, s);
++	rcu_segcblist_advance(&sdp->srcu_cblist,
++			      rcu_seq_current(&ssp->srcu_sup->srcu_gp_seq));
++	WARN_ON_ONCE(!rcu_segcblist_accelerate(&sdp->srcu_cblist, s) && rhp);
+ 	if (ULONG_CMP_LT(sdp->srcu_gp_seq_needed, s)) {
+ 		sdp->srcu_gp_seq_needed = s;
+ 		needgp = true;
+--
+2.41.0
+
+Acceleration in SRCU happens on enqueue time for each new callback. This
+operation is expected not to fail and therefore any similar attempt
+from other places shouldn't find any remaining callbacks to accelerate.
+
+Moreover accelerations performed beyond enqueue time are error prone
+because rcu_seq_snap() then may return the snapshot for a new grace
+period that is not going to be started.
+
+Remove these dangerous and needless accelerations and introduce instead
+assertions reporting leaking unaccelerated callbacks beyond enqueue
+time.
+
+Co-developed-by: Yong He <zhuangel570@xxxxxxxxx>
+Co-developed-by: Joel Fernandes <joel@xxxxxxxxxxxxxxxxx>
+Co-developed-by: Neeraj upadhyay <neeraj.iitr10@xxxxxxxxx>
+Signed-off-by: Frederic Weisbecker <frederic@xxxxxxxxxx>
+---
+ kernel/rcu/srcutree.c | 6 ++----
+ 1 file changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/rcu/srcutree.c b/kernel/rcu/srcutree.c
+index 9fab9ac36996..560e99ec5333 100644
+--- a/kernel/rcu/srcutree.c
++++ b/kernel/rcu/srcutree.c
+@@ -784,8 +784,7 @@ static void srcu_gp_start(struct srcu_struct *ssp)
+ 	spin_lock_rcu_node(sdp);  /* Interrupts already disabled. */
+ 	rcu_segcblist_advance(&sdp->srcu_cblist,
+ 			      rcu_seq_current(&ssp->srcu_sup->srcu_gp_seq));
+-	(void)rcu_segcblist_accelerate(&sdp->srcu_cblist,
+-				       rcu_seq_snap(&ssp->srcu_sup->srcu_gp_seq));
++	WARN_ON_ONCE(!rcu_segcblist_segempty(&sdp->srcu_cblist, RCU_NEXT_TAIL));
+ 	spin_unlock_rcu_node(sdp);  /* Interrupts remain disabled. */
+ 	WRITE_ONCE(ssp->srcu_sup->srcu_gp_start, jiffies);
+ 	WRITE_ONCE(ssp->srcu_sup->srcu_n_exp_nodelay, 0);
+@@ -1721,6 +1720,7 @@ static void srcu_invoke_callbacks(struct work_struct *work)
+ 	ssp = sdp->ssp;
+ 	rcu_cblist_init(&ready_cbs);
+ 	spin_lock_irq_rcu_node(sdp);
++	WARN_ON_ONCE(!rcu_segcblist_segempty(&sdp->srcu_cblist, RCU_NEXT_TAIL));
+ 	rcu_segcblist_advance(&sdp->srcu_cblist,
+ 			      rcu_seq_current(&ssp->srcu_sup->srcu_gp_seq));
+ 	if (sdp->srcu_cblist_invoking ||
+@@ -1750,8 +1750,6 @@ static void srcu_invoke_callbacks(struct work_struct *work)
+ 	 */
+ 	spin_lock_irq_rcu_node(sdp);
+ 	rcu_segcblist_add_len(&sdp->srcu_cblist, -len);
+-	(void)rcu_segcblist_accelerate(&sdp->srcu_cblist,
+-				       rcu_seq_snap(&ssp->srcu_sup->srcu_gp_seq));
+ 	sdp->srcu_cblist_invoking = false;
+ 	more = rcu_segcblist_ready_cbs(&sdp->srcu_cblist);
+ 	spin_unlock_irq_rcu_node(sdp);
+--
+2.41.0
+
+Callbacks advancing on SRCU must be performed on two specific places:
+
+1) On enqueue time in order to make room for the acceleration of the
+   new callback.
+
+2) On invocation time in order to move the callbacks ready to invoke.
+
+Any other callback advancing callsite is needless. Remove the remaining
+one in srcu_gp_start().
+
+Co-developed-by: Yong He <zhuangel570@xxxxxxxxx>
+Co-developed-by: Joel Fernandes <joel@xxxxxxxxxxxxxxxxx>
+Co-developed-by: Neeraj upadhyay <neeraj.iitr10@xxxxxxxxx>
+Signed-off-by: Frederic Weisbecker <frederic@xxxxxxxxxx>
+---
+ kernel/rcu/srcutree.c | 10 ----------
+ 1 file changed, 10 deletions(-)
+
+diff --git a/kernel/rcu/srcutree.c b/kernel/rcu/srcutree.c
+index 560e99ec5333..e9356a103626 100644
+--- a/kernel/rcu/srcutree.c
++++ b/kernel/rcu/srcutree.c
+@@ -772,20 +772,10 @@ EXPORT_SYMBOL_GPL(__srcu_read_unlock_nmisafe);
+  */
+ static void srcu_gp_start(struct srcu_struct *ssp)
+ {
+-	struct srcu_data *sdp;
+ 	int state;
+
+-	if (smp_load_acquire(&ssp->srcu_sup->srcu_size_state) < SRCU_SIZE_WAIT_BARRIER)
+-		sdp = per_cpu_ptr(ssp->sda, get_boot_cpu_id());
+-	else
+-		sdp = this_cpu_ptr(ssp->sda);
+ 	lockdep_assert_held(&ACCESS_PRIVATE(ssp->srcu_sup, lock));
+ 	WARN_ON_ONCE(ULONG_CMP_GE(ssp->srcu_sup->srcu_gp_seq, ssp->srcu_sup->srcu_gp_seq_needed));
+-	spin_lock_rcu_node(sdp);  /* Interrupts already disabled. */
+-	rcu_segcblist_advance(&sdp->srcu_cblist,
+-			      rcu_seq_current(&ssp->srcu_sup->srcu_gp_seq));
+-	WARN_ON_ONCE(!rcu_segcblist_segempty(&sdp->srcu_cblist, RCU_NEXT_TAIL));
+-	spin_unlock_rcu_node(sdp);  /* Interrupts remain disabled. */
+ 	WRITE_ONCE(ssp->srcu_sup->srcu_gp_start, jiffies);
+ 	WRITE_ONCE(ssp->srcu_sup->srcu_n_exp_nodelay, 0);
+ 	smp_mb(); /* Order prior store to ->srcu_gp_seq_needed vs. GP start. */
+--
+2.41.0
+
+While in grace period start, there is nothing to accelerate and
+therefore no need to advance the callbacks either if no callback is
+to be enqueued.
+
+Spare these needless operations in this case.
+
+Signed-off-by: Frederic Weisbecker <frederic@xxxxxxxxxx>
+---
+ kernel/rcu/srcutree.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/rcu/srcutree.c b/kernel/rcu/srcutree.c
+index e9356a103626..2bfc8ed1eed2 100644
+--- a/kernel/rcu/srcutree.c
++++ b/kernel/rcu/srcutree.c
+@@ -1261,9 +1261,11 @@ static unsigned long srcu_gp_start_if_needed(struct srcu_struct *ssp,
+ 	 *     period (gp_num = X + 8). So acceleration fails.
+ 	 */
+ 	s = rcu_seq_snap(&ssp->srcu_sup->srcu_gp_seq);
+-	rcu_segcblist_advance(&sdp->srcu_cblist,
+-			      rcu_seq_current(&ssp->srcu_sup->srcu_gp_seq));
+-	WARN_ON_ONCE(!rcu_segcblist_accelerate(&sdp->srcu_cblist, s) && rhp);
++	if (rhp) {
++		rcu_segcblist_advance(&sdp->srcu_cblist,
++				      rcu_seq_current(&ssp->srcu_sup->srcu_gp_seq));
++		WARN_ON_ONCE(!rcu_segcblist_accelerate(&sdp->srcu_cblist, s));
++	}
+ 	if (ULONG_CMP_LT(sdp->srcu_gp_seq_needed, s)) {
+ 		sdp->srcu_gp_seq_needed = s;
+ 		needgp = true;
+--
+2.41.0
+
+If an SRCU barrier is queued while callbacks are running and a new
+callbacks invocator for the same sdp were to run concurrently, the
+RCU barrier might execute too early. As this requirement is non-obvious,
+make sure to keep a record.
+
+Signed-off-by: Frederic Weisbecker <frederic@xxxxxxxxxx>
+---
+ kernel/rcu/srcutree.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/kernel/rcu/srcutree.c b/kernel/rcu/srcutree.c
+index 2bfc8ed1eed2..0351a4e83529 100644
+--- a/kernel/rcu/srcutree.c
++++ b/kernel/rcu/srcutree.c
+@@ -1715,6 +1715,11 @@ static void srcu_invoke_callbacks(struct work_struct *work)
+ 	WARN_ON_ONCE(!rcu_segcblist_segempty(&sdp->srcu_cblist, RCU_NEXT_TAIL));
+ 	rcu_segcblist_advance(&sdp->srcu_cblist,
+ 			      rcu_seq_current(&ssp->srcu_sup->srcu_gp_seq));
++	/*
++	 * Although this function is theoretically re-entrant, concurrent
++	 * callbacks invocation is disallowed to avoid executing an SRCU barrier
++	 * too early.
++	 */
+ 	if (sdp->srcu_cblist_invoking ||
+ 	    !rcu_segcblist_ready_cbs(&sdp->srcu_cblist)) {
+ 		spin_unlock_irq_rcu_node(sdp);
+@@ -1745,6 +1750,7 @@ static void srcu_invoke_callbacks(struct work_struct *work)
+ 	sdp->srcu_cblist_invoking = false;
+ 	more = rcu_segcblist_ready_cbs(&sdp->srcu_cblist);
+ 	spin_unlock_irq_rcu_node(sdp);
++	/* An SRCU barrier or callbacks from previous nesting work pending */
+ 	if (more)
+ 		srcu_schedule_cbs_sdp(sdp, 0);
+ }
+--
+2.41.0
