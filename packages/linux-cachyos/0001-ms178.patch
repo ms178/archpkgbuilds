@@ -16277,3 +16277,134 @@ index 2bfc8ed1eed2..0351a4e83529 100644
  }
 --
 2.41.0
+
+From: Vineeth Pillai <vineethrp@xxxxxxxxxx>
+
+Whenever a CPU stops its tick, it now requires another idle CPU to handle the
+balancing for it because it can't perform its own periodic load balancing.
+This means it might need to update 'nohz.next_balance' to 'rq->next_balance' if
+the upcoming nohz-idle load balancing is too distant in the future. This update
+process is done by triggering an ILB, as the general ILB handler
+(_nohz_idle_balance) that manages regular nohz balancing also refreshes
+'nohz.next_balance' by looking at the 'rq->next_balance' of all other idle CPUs
+and selecting the smallest value.
+
+Triggering this ILB can be achieved by setting the NOHZ_NEXT_KICK flag. This
+primarily results in the ILB handler updating 'nohz.next_balance' while
+possibly not doing any load balancing at all. However, sending an IPI merely to
+refresh 'nohz.next_balance' seems excessive, and there ought to be a more
+efficient method to update 'nohz.next_balance' from the local CPU.
+
+Fortunately, there already exists a mechanism to directly invoke the ILB
+handler (_nohz_idle_balance) without initiating an IPI. It's accomplished by
+setting the NOHZ_NEWILB_KICK flag. This flag is set during regular "newly idle"
+balancing and solely exists to update a CPU's blocked load if it couldn't pull
+more tasks during regular "newly idle balancing" - and it does so without
+having to send any IPIs. Once the flag is set, the ILB handler is called
+directly from do_idle()-> nohz_run_idle_balance(). While its goal is to update
+the blocked load without an IPI, in our situation, we aim to refresh
+'nohz.next_balance' without an IPI but we can piggy back on this.
+
+So in this patch, we reuse this mechanism by also setting the NOHZ_NEXT_KICK to
+indicate nohz.next_balance needs an update via this direct call shortcut. Note
+that we set this flag without knowledge that the tick is about to be stopped,
+because at the point we do it, we have no way of knowing that. However we do
+know that the CPU is about to enter idle. In our testing, the reduction in IPIs
+is well worth updating nohz.next_balance a few more times.
+
+Also just to note, without this patch we observe the following pattern:
+
+1. A CPU is about to stop its tick.
+2. It sets nohz.needs_update to 1.
+3. It then stops its tick and goes idle.
+4. The scheduler tick on another CPU checks this flag and decides an ILB kick is needed.
+5. The ILB CPU ends up being the one that just stopped its tick!
+6. This results in an IPI to the tick-stopped CPU which ends up waking it up
+   and disturbing it!
+
+Testing shows a considerable reduction in IPIs when doing this:
+
+Running "cyclictest -i 100 -d 100 --latency=1000 -t -m" on a 4vcpu VM
+the IPI call count profiled over 10s period is as follows:
+without fix: ~10500
+with fix: ~1000
+
+Fixes: 7fd7a9e0caba ("sched/fair: Trigger nohz.next_balance updates when a CPU goes NOHZ-idle")
+
+[ Joel: wrote commit messages, collaborated on fix, helped reproduce issue etc. ]
+
+Cc: Suleiman Souhlal <suleiman@xxxxxxxxxx>
+Cc: Steven Rostedt <rostedt@xxxxxxxxxxx>
+Cc: Hsin Yi <hsinyi@xxxxxxxxxx>
+Cc: Frederic Weisbecker <frederic@xxxxxxxxxx>
+Cc: Paul E. McKenney <paulmck@xxxxxxxxxx>
+Signed-off-by: Vineeth Pillai <vineethrp@xxxxxxxxxx>
+Co-developed-by: Joel Fernandes (Google) <joel@xxxxxxxxxxxxxxxxx>
+Signed-off-by: Joel Fernandes (Google) <joel@xxxxxxxxxxxxxxxxx>
+---
+ kernel/sched/fair.c | 21 ++++++++++++++-------
+ 1 file changed, 14 insertions(+), 7 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index cb225921bbca..2ece55f32782 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -11786,13 +11786,12 @@ void nohz_balance_enter_idle(int cpu)
+ 	/*
+ 	 * Ensures that if nohz_idle_balance() fails to observe our
+ 	 * @idle_cpus_mask store, it must observe the @has_blocked
+-	 * and @needs_update stores.
++	 * stores.
+ 	 */
+ 	smp_mb__after_atomic();
+
+ 	set_cpu_sd_state_idle(cpu);
+
+-	WRITE_ONCE(nohz.needs_update, 1);
+ out:
+ 	/*
+ 	 * Each time a cpu enter idle, we assume that it has blocked load and
+@@ -11945,21 +11944,25 @@ static bool nohz_idle_balance(struct rq *this_rq, enum cpu_idle_type idle)
+ }
+
+ /*
+- * Check if we need to run the ILB for updating blocked load before entering
+- * idle state.
++ * Check if we need to run the ILB for updating blocked load and/or updating
++ * nohz.next_balance before entering idle state.
+  */
+ void nohz_run_idle_balance(int cpu)
+ {
+ 	unsigned int flags;
+
+-	flags = atomic_fetch_andnot(NOHZ_NEWILB_KICK, nohz_flags(cpu));
++	flags = atomic_fetch_andnot(NOHZ_NEWILB_KICK | NOHZ_NEXT_KICK, nohz_flags(cpu));
++
++	if (!flags)
++		return;
+
+ 	/*
+ 	 * Update the blocked load only if no SCHED_SOFTIRQ is about to happen
+ 	 * (ie NOHZ_STATS_KICK set) and will do the same.
+ 	 */
+-	if ((flags == NOHZ_NEWILB_KICK) && !need_resched())
+-		_nohz_idle_balance(cpu_rq(cpu), NOHZ_STATS_KICK);
++	if ((flags == (flags & (NOHZ_NEXT_KICK | NOHZ_NEWILB_KICK))) &&
++	    !need_resched())
++		_nohz_idle_balance(cpu_rq(cpu), flags);
+ }
+
+ static void nohz_newidle_balance(struct rq *this_rq)
+@@ -11977,6 +11980,10 @@ static void nohz_newidle_balance(struct rq *this_rq)
+ 	if (this_rq->avg_idle < sysctl_sched_migration_cost)
+ 		return;
+
++	/* If rq->next_balance before nohz.next_balance, trigger ILB */
++	if (time_before(this_rq->next_balance, READ_ONCE(nohz.next_balance)))
++		atomic_or(NOHZ_NEXT_KICK, nohz_flags(this_cpu));
++
+ 	/* Don't need to update blocked load of idle CPUs*/
+ 	if (!READ_ONCE(nohz.has_blocked) ||
+ 	    time_before(jiffies, READ_ONCE(nohz.next_blocked)))
+--
+2.42.0.609.gbb76f46606-goog
