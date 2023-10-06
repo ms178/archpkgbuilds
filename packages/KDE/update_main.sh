@@ -112,6 +112,11 @@ ksystemstats-main \
 kwallet-pam-main \
 powerdevil-main \
 sddm-kcm-main \
+bluedevil-main \
+kio-fuse-main \
+ksysguard-main \
+plasma-systemmonitor-main \
+xdg-desktop-portal-kde-main \
 ; do
   cd $pkg
   rm -f *.zst
