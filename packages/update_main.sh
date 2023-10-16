@@ -117,6 +117,13 @@ kio-fuse-main \
 ksysguard-main \
 plasma-systemmonitor-main \
 xdg-desktop-portal-kde-main \
+ark-main \
+baloo-widgets-main \
+kaccounts-integration-main \
+kio-extras-main \
+kwalletmanager-main \
+signon-kwallet-extension-main \
+spectacle-main
 ; do
   cd $pkg
   rm -f *.zst
