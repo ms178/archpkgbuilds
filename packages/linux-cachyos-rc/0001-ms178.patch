@@ -10624,41 +10624,6 @@ index 0bec1f705f8e..bb41c8460b62 100644
 --
 2.34.1
 
-From: Zi Yan <ziy@xxxxxxxxxx>
-
-nr_failed was missing the rc value from migrate_pages_batch() and can
-cause a mismatch between migrate_pages() return value and the number of
-not migrated pages, i.e., when the return value of migrate_pages() is 0,
-there are still pages left in the from page list. It will happen when a
-non-PMD THP large folio fails to migrate due to -ENOMEM and is split
-successfully but not all the split pages are not migrated,
-migrate_pages_batch() would return non-zero, but astats.nr_thp_split = 0.
-nr_failed would be 0 and returned to the caller of migrate_pages(), but
-the not migrated pages are left in the from page list without being added
-back to LRU lists.
-
-Fixes: 2ef7dbb26990 ("migrate_pages: try migrate in batch asynchronously firstly")
-Signed-off-by: Zi Yan <ziy@xxxxxxxxxx>
----
- mm/migrate.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/mm/migrate.c b/mm/migrate.c
-index c602bf6dec97..5348827bd958 100644
---- a/mm/migrate.c
-+++ b/mm/migrate.c
-@@ -1834,7 +1834,7 @@ static int migrate_pages_sync(struct list_head *from, new_folio_t get_new_folio,
- 		return rc;
- 	}
- 	stats->nr_thp_failed += astats.nr_thp_split;
--	nr_failed += astats.nr_thp_split;
-+	nr_failed += rc + astats.nr_thp_split;
- 	/*
- 	 * Fall back to migrate all failed folios one by one synchronously. All
- 	 * failed folios except split THPs will be retried, so their failure
---
-2.42.0
-
 The nr_deadline_tasks field in cpuset structure was introduced by
 commit 6c24849f5515 ("sched/cpuset: Keep track of SCHED_DEADLINE task
 in cpusets"). Unlike nr_migrate_dl_tasks which is only modified under
@@ -16260,3 +16225,927 @@ index 000000000..169e92248
 +TEST_HARNESS_MAIN
 --
 2.42.0
+
+From: Zi Yan <ziy@xxxxxxxxxx>
+
+nr_failed was missing the large folio splits from migrate_pages_batch()
+and can cause a mismatch between migrate_pages() return value and the
+number of not migrated pages, i.e., when the return value of
+migrate_pages() is 0, there are still pages left in the from page list.
+It will happen when a non-PMD THP large folio fails to migrate due to
+-ENOMEM and is split successfully but not all the split pages are not
+migrated, migrate_pages_batch() would return non-zero, but
+astats.nr_thp_split = 0. nr_failed would be 0 and returned to the caller
+of migrate_pages(), but the not migrated pages are left in the from page
+list without being added back to LRU lists.
+
+Fix it by adding a new nr_split counter for large folio splits and adding
+it to nr_failed in migrate_page_sync() after migrate_pages_batch() is
+done.
+
+Fixes: 2ef7dbb26990 ("migrate_pages: try migrate in batch asynchronously firstly")
+Signed-off-by: Zi Yan <ziy@xxxxxxxxxx>
+---
+ include/trace/events/migrate.h | 24 ++++++++++++++----------
+ mm/migrate.c                   | 15 +++++++++++----
+ 2 files changed, 25 insertions(+), 14 deletions(-)
+
+diff --git a/include/trace/events/migrate.h b/include/trace/events/migrate.h
+index 061b5128f335..0190ef725b43 100644
+--- a/include/trace/events/migrate.h
++++ b/include/trace/events/migrate.h
+@@ -49,10 +49,11 @@ TRACE_EVENT(mm_migrate_pages,
+
+ 	TP_PROTO(unsigned long succeeded, unsigned long failed,
+ 		 unsigned long thp_succeeded, unsigned long thp_failed,
+-		 unsigned long thp_split, enum migrate_mode mode, int reason),
++		 unsigned long thp_split, unsigned long large_folio_split,
++		 enum migrate_mode mode, int reason),
+
+ 	TP_ARGS(succeeded, failed, thp_succeeded, thp_failed,
+-		thp_split, mode, reason),
++		thp_split, large_folio_split, mode, reason),
+
+ 	TP_STRUCT__entry(
+ 		__field(	unsigned long,		succeeded)
+@@ -60,26 +61,29 @@ TRACE_EVENT(mm_migrate_pages,
+ 		__field(	unsigned long,		thp_succeeded)
+ 		__field(	unsigned long,		thp_failed)
+ 		__field(	unsigned long,		thp_split)
++		__field(	unsigned long,		large_folio_split)
+ 		__field(	enum migrate_mode,	mode)
+ 		__field(	int,			reason)
+ 	),
+
+ 	TP_fast_assign(
+-		__entry->succeeded	= succeeded;
+-		__entry->failed		= failed;
+-		__entry->thp_succeeded	= thp_succeeded;
+-		__entry->thp_failed	= thp_failed;
+-		__entry->thp_split	= thp_split;
+-		__entry->mode		= mode;
+-		__entry->reason		= reason;
++		__entry->succeeded			= succeeded;
++		__entry->failed				= failed;
++		__entry->thp_succeeded		= thp_succeeded;
++		__entry->thp_failed			= thp_failed;
++		__entry->thp_split			= thp_split;
++		__entry->large_folio_split	= large_folio_split;
++		__entry->mode				= mode;
++		__entry->reason				= reason;
+ 	),
+
+-	TP_printk("nr_succeeded=%lu nr_failed=%lu nr_thp_succeeded=%lu nr_thp_failed=%lu nr_thp_split=%lu mode=%s reason=%s",
++	TP_printk("nr_succeeded=%lu nr_failed=%lu nr_thp_succeeded=%lu nr_thp_failed=%lu nr_thp_split=%lu nr_split=%lu mode=%s reason=%s",
+ 		__entry->succeeded,
+ 		__entry->failed,
+ 		__entry->thp_succeeded,
+ 		__entry->thp_failed,
+ 		__entry->thp_split,
++		__entry->large_folio_split,
+ 		__print_symbolic(__entry->mode, MIGRATE_MODE),
+ 		__print_symbolic(__entry->reason, MIGRATE_REASON))
+ );
+diff --git a/mm/migrate.c b/mm/migrate.c
+index c602bf6dec97..4caf405b6504 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -1495,6 +1495,7 @@ struct migrate_pages_stats {
+ 	int nr_thp_succeeded;	/* THP migrated successfully */
+ 	int nr_thp_failed;	/* THP failed to be migrated */
+ 	int nr_thp_split;	/* THP split before migrating */
++	int nr_split;	/* Large folio (include THP) split before migrating */
+ };
+
+ /*
+@@ -1614,6 +1615,7 @@ static int migrate_pages_batch(struct list_head *from,
+ 	int nr_retry_pages = 0;
+ 	int pass = 0;
+ 	bool is_thp = false;
++	bool is_large = false;
+ 	struct folio *folio, *folio2, *dst = NULL, *dst2;
+ 	int rc, rc_saved = 0, nr_pages;
+ 	LIST_HEAD(unmap_folios);
+@@ -1629,7 +1631,8 @@ static int migrate_pages_batch(struct list_head *from,
+ 		nr_retry_pages = 0;
+
+ 		list_for_each_entry_safe(folio, folio2, from, lru) {
+-			is_thp = folio_test_large(folio) && folio_test_pmd_mappable(folio);
++			is_large = folio_test_large(folio);
++			is_thp = is_large && folio_test_pmd_mappable(folio);
+ 			nr_pages = folio_nr_pages(folio);
+
+ 			cond_resched();
+@@ -1649,6 +1652,7 @@ static int migrate_pages_batch(struct list_head *from,
+ 				stats->nr_thp_failed++;
+ 				if (!try_split_folio(folio, split_folios)) {
+ 					stats->nr_thp_split++;
++					stats->nr_split++;
+ 					continue;
+ 				}
+ 				stats->nr_failed_pages += nr_pages;
+@@ -1677,11 +1681,12 @@ static int migrate_pages_batch(struct list_head *from,
+ 				nr_failed++;
+ 				stats->nr_thp_failed += is_thp;
+ 				/* Large folio NUMA faulting doesn't split to retry. */
+-				if (folio_test_large(folio) && !nosplit) {
++				if (is_large && !nosplit) {
+ 					int ret = try_split_folio(folio, split_folios);
+
+ 					if (!ret) {
+ 						stats->nr_thp_split += is_thp;
++						stats->nr_split++;
+ 						break;
+ 					} else if (reason == MR_LONGTERM_PIN &&
+ 						   ret == -EAGAIN) {
+@@ -1827,6 +1832,7 @@ static int migrate_pages_sync(struct list_head *from, new_folio_t get_new_folio,
+ 	stats->nr_succeeded += astats.nr_succeeded;
+ 	stats->nr_thp_succeeded += astats.nr_thp_succeeded;
+ 	stats->nr_thp_split += astats.nr_thp_split;
++	stats->nr_split += astats.nr_split;
+ 	if (rc < 0) {
+ 		stats->nr_failed_pages += astats.nr_failed_pages;
+ 		stats->nr_thp_failed += astats.nr_thp_failed;
+@@ -1834,7 +1840,7 @@ static int migrate_pages_sync(struct list_head *from, new_folio_t get_new_folio,
+ 		return rc;
+ 	}
+ 	stats->nr_thp_failed += astats.nr_thp_split;
+-	nr_failed += astats.nr_thp_split;
++	nr_failed += astats.nr_split + astats.nr_thp_split;
+ 	/*
+ 	 * Fall back to migrate all failed folios one by one synchronously. All
+ 	 * failed folios except split THPs will be retried, so their failure
+@@ -1969,7 +1975,8 @@ int migrate_pages(struct list_head *from, new_folio_t get_new_folio,
+ 	count_vm_events(THP_MIGRATION_SPLIT, stats.nr_thp_split);
+ 	trace_mm_migrate_pages(stats.nr_succeeded, stats.nr_failed_pages,
+ 			       stats.nr_thp_succeeded, stats.nr_thp_failed,
+-			       stats.nr_thp_split, mode, reason);
++			       stats.nr_thp_split, stats.nr_split, mode,
++			       reason);
+
+ 	if (ret_succeeded)
+ 		*ret_succeeded = stats.nr_succeeded;
+--
+2.42.0
+
+From 771c3017dee3694902aa9153f9105857e534d24c Mon Sep 17 00:00:00 2001
+From: Jack Brennen <jbrennen@google.com>
+Date: Tue, 26 Sep 2023 08:40:44 -0400
+Subject: [PATCH 18/18] modpost: Optimize symbol search from linear to binary
+ search
+
+Modify modpost to use binary search for converting addresses back
+into symbol references.  Previously it used linear search.
+
+This change saves a few seconds of wall time for defconfig builds,
+but can save several minutes on allyesconfigs.
+
+Before:
+$ make LLVM=1 -j128 allyesconfig vmlinux -s KCFLAGS="-Wno-error"
+$ time scripts/mod/modpost -M -m -a -N -o vmlinux.symvers vmlinux.o
+198.38user 1.27system 3:19.71elapsed
+
+After:
+$ make LLVM=1 -j128 allyesconfig vmlinux -s KCFLAGS="-Wno-error"
+$ time scripts/mod/modpost -M -m -a -N -o vmlinux.symvers vmlinux.o
+11.91user 0.85system 0:12.78elapsed
+
+Signed-off-by: Jack Brennen <jbrennen@google.com>
+Tested-by: Nick Desaulniers <ndesaulniers@google.com>
+Signed-off-by: Masahiro Yamada <masahiroy@kernel.org>
+---
+ scripts/mod/Makefile    |   4 +-
+ scripts/mod/modpost.c   |  70 ++------------
+ scripts/mod/modpost.h   |  25 +++++
+ scripts/mod/symsearch.c | 199 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 232 insertions(+), 66 deletions(-)
+ create mode 100644 scripts/mod/symsearch.c
+
+diff --git a/scripts/mod/Makefile b/scripts/mod/Makefile
+index c9e38ad93..3c54125eb 100644
+--- a/scripts/mod/Makefile
++++ b/scripts/mod/Makefile
+@@ -5,7 +5,7 @@ CFLAGS_REMOVE_empty.o += $(CC_FLAGS_LTO)
+ hostprogs-always-y	+= modpost mk_elfconfig
+ always-y		+= empty.o
+
+-modpost-objs	:= modpost.o file2alias.o sumversion.o
++modpost-objs	:= modpost.o file2alias.o sumversion.o symsearch.o
+
+ devicetable-offsets-file := devicetable-offsets.h
+
+@@ -16,7 +16,7 @@ targets += $(devicetable-offsets-file) devicetable-offsets.s
+
+ # dependencies on generated files need to be listed explicitly
+
+-$(obj)/modpost.o $(obj)/file2alias.o $(obj)/sumversion.o: $(obj)/elfconfig.h
++$(obj)/modpost.o $(obj)/file2alias.o $(obj)/sumversion.o $(obj)/symsearch.o: $(obj)/elfconfig.h
+ $(obj)/file2alias.o: $(obj)/$(devicetable-offsets-file)
+
+ quiet_cmd_elfconfig = MKELF   $@
+diff --git a/scripts/mod/modpost.c b/scripts/mod/modpost.c
+index b3dee8049..2f3b0fe6f 100644
+--- a/scripts/mod/modpost.c
++++ b/scripts/mod/modpost.c
+@@ -22,7 +22,6 @@
+ #include <errno.h>
+ #include "modpost.h"
+ #include "../../include/linux/license.h"
+-#include "../../include/linux/module_symbol.h"
+
+ static bool module_enabled;
+ /* Are we using CONFIG_MODVERSIONS? */
+@@ -577,11 +576,14 @@ static int parse_elf(struct elf_info *info, const char *filename)
+ 			*p = TO_NATIVE(*p);
+ 	}
+
++	symsearch_init(info);
++
+ 	return 1;
+ }
+
+ static void parse_elf_finish(struct elf_info *info)
+ {
++	symsearch_finish(info);
+ 	release_file(info->hdr, info->size);
+ }
+
+@@ -1050,71 +1052,10 @@ static int secref_whitelist(const char *fromsec, const char *fromsym,
+ 	return 1;
+ }
+
+-/*
+- * If there's no name there, ignore it; likewise, ignore it if it's
+- * one of the magic symbols emitted used by current tools.
+- *
+- * Otherwise if find_symbols_between() returns those symbols, they'll
+- * fail the whitelist tests and cause lots of false alarms ... fixable
+- * only by merging __exit and __init sections into __text, bloating
+- * the kernel (which is especially evil on embedded platforms).
+- */
+-static inline int is_valid_name(struct elf_info *elf, Elf_Sym *sym)
+-{
+-	const char *name = elf->strtab + sym->st_name;
+-
+-	if (!name || !strlen(name))
+-		return 0;
+-	return !is_mapping_symbol(name);
+-}
+-
+-/* Look up the nearest symbol based on the section and the address */
+-static Elf_Sym *find_nearest_sym(struct elf_info *elf, Elf_Addr addr,
+-				 unsigned int secndx, bool allow_negative,
+-				 Elf_Addr min_distance)
+-{
+-	Elf_Sym *sym;
+-	Elf_Sym *near = NULL;
+-	Elf_Addr sym_addr, distance;
+-	bool is_arm = (elf->hdr->e_machine == EM_ARM);
+-
+-	for (sym = elf->symtab_start; sym < elf->symtab_stop; sym++) {
+-		if (get_secindex(elf, sym) != secndx)
+-			continue;
+-		if (!is_valid_name(elf, sym))
+-			continue;
+-
+-		sym_addr = sym->st_value;
+-
+-		/*
+-		 * For ARM Thumb instruction, the bit 0 of st_value is set
+-		 * if the symbol is STT_FUNC type. Mask it to get the address.
+-		 */
+-		if (is_arm && ELF_ST_TYPE(sym->st_info) == STT_FUNC)
+-			 sym_addr &= ~1;
+-
+-		if (addr >= sym_addr)
+-			distance = addr - sym_addr;
+-		else if (allow_negative)
+-			distance = sym_addr - addr;
+-		else
+-			continue;
+-
+-		if (distance <= min_distance) {
+-			min_distance = distance;
+-			near = sym;
+-		}
+-
+-		if (min_distance == 0)
+-			break;
+-	}
+-	return near;
+-}
+-
+ static Elf_Sym *find_fromsym(struct elf_info *elf, Elf_Addr addr,
+ 			     unsigned int secndx)
+ {
+-	return find_nearest_sym(elf, addr, secndx, false, ~0);
++	return symsearch_find_nearest(elf, addr, secndx, false, ~0);
+ }
+
+ static Elf_Sym *find_tosym(struct elf_info *elf, Elf_Addr addr, Elf_Sym *sym)
+@@ -1127,7 +1068,8 @@ static Elf_Sym *find_tosym(struct elf_info *elf, Elf_Addr addr, Elf_Sym *sym)
+ 	 * Strive to find a better symbol name, but the resulting name may not
+ 	 * match the symbol referenced in the original code.
+ 	 */
+-	return find_nearest_sym(elf, addr, get_secindex(elf, sym), true, 20);
++	return symsearch_find_nearest(elf, addr, get_secindex(elf, sym),
++				      true, 20);
+ }
+
+ static bool is_executable_section(struct elf_info *elf, unsigned int secndx)
+diff --git a/scripts/mod/modpost.h b/scripts/mod/modpost.h
+index 5f94c2c9f..6413f26fc 100644
+--- a/scripts/mod/modpost.h
++++ b/scripts/mod/modpost.h
+@@ -10,6 +10,7 @@
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <elf.h>
++#include "../../include/linux/module_symbol.h"
+
+ #include "list.h"
+ #include "elfconfig.h"
+@@ -128,6 +129,8 @@ struct elf_info {
+ 	 * take shndx from symtab_shndx_start[N] instead */
+ 	Elf32_Word   *symtab_shndx_start;
+ 	Elf32_Word   *symtab_shndx_stop;
++
++	struct symsearch *symsearch;
+ };
+
+ /* Accessor for sym->st_shndx, hides ugliness of "64k sections" */
+@@ -154,6 +157,28 @@ static inline unsigned int get_secindex(const struct elf_info *info,
+ 	return index;
+ }
+
++/*
++ * If there's no name there, ignore it; likewise, ignore it if it's
++ * one of the magic symbols emitted used by current tools.
++ *
++ * Internal symbols created by tools should be ignored by modpost.
++ */
++static inline int is_valid_name(struct elf_info *elf, Elf_Sym *sym)
++{
++	const char *name = elf->strtab + sym->st_name;
++
++	if (!name || !strlen(name))
++		return 0;
++	return !is_mapping_symbol(name);
++}
++
++/* symsearch.c */
++void symsearch_init(struct elf_info *elf);
++void symsearch_finish(struct elf_info *elf);
++Elf_Sym *symsearch_find_nearest(struct elf_info *elf, Elf_Addr addr,
++				unsigned int secndx, bool allow_negative,
++				Elf_Addr min_distance);
++
+ /* file2alias.c */
+ void handle_moddevtable(struct module *mod, struct elf_info *info,
+ 			Elf_Sym *sym, const char *symname);
+diff --git a/scripts/mod/symsearch.c b/scripts/mod/symsearch.c
+new file mode 100644
+index 000000000..aa4ed51f9
+--- /dev/null
++++ b/scripts/mod/symsearch.c
+@@ -0,0 +1,199 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * Helper functions for finding the symbol in an ELF which is "nearest"
++ * to a given address.
++ */
++
++#include "modpost.h"
++
++struct syminfo {
++	unsigned int symbol_index;
++	unsigned int section_index;
++	Elf_Addr addr;
++};
++
++/*
++ * Container used to hold an entire binary search table.
++ * Entries in table are ascending, sorted first by section_index,
++ * then by addr, and last by symbol_index.  The sorting by
++ * symbol_index is used to ensure predictable behavior when
++ * multiple symbols are present with the same address; all
++ * symbols past the first are effectively ignored, by eliding
++ * them in symsearch_fixup().
++ */
++struct symsearch {
++	unsigned int table_size;
++	struct syminfo table[];
++};
++
++static int syminfo_compare(const void *s1, const void *s2)
++{
++	const struct syminfo *sym1 = s1;
++	const struct syminfo *sym2 = s2;
++
++	if (sym1->section_index > sym2->section_index)
++		return 1;
++	if (sym1->section_index < sym2->section_index)
++		return -1;
++	if (sym1->addr > sym2->addr)
++		return 1;
++	if (sym1->addr < sym2->addr)
++		return -1;
++	if (sym1->symbol_index > sym2->symbol_index)
++		return 1;
++	if (sym1->symbol_index < sym2->symbol_index)
++		return -1;
++	return 0;
++}
++
++static unsigned int symbol_count(struct elf_info *elf)
++{
++	unsigned int result = 0;
++
++	for (Elf_Sym *sym = elf->symtab_start; sym < elf->symtab_stop; sym++) {
++		if (is_valid_name(elf, sym))
++			result++;
++	}
++	return result;
++}
++
++/*
++ * Populate the search array that we just allocated.
++ * Be slightly paranoid here.  The ELF file is mmap'd and could
++ * conceivably change between symbol_count() and symsearch_populate().
++ * If we notice any difference, bail out rather than potentially
++ * propagating errors or crashing.
++ */
++static void symsearch_populate(struct elf_info *elf,
++			       struct syminfo *table,
++			       unsigned int table_size)
++{
++	bool is_arm = (elf->hdr->e_machine == EM_ARM);
++
++	for (Elf_Sym *sym = elf->symtab_start; sym < elf->symtab_stop; sym++) {
++		if (is_valid_name(elf, sym)) {
++			if (table_size-- == 0)
++				fatal("%s: size mismatch\n", __func__);
++			table->symbol_index = sym - elf->symtab_start;
++			table->section_index = get_secindex(elf, sym);
++			table->addr = sym->st_value;
++
++			/*
++			 * For ARM Thumb instruction, the bit 0 of st_value is
++			 * set if the symbol is STT_FUNC type. Mask it to get
++			 * the address.
++			 */
++			if (is_arm && ELF_ST_TYPE(sym->st_info) == STT_FUNC)
++				table->addr &= ~1;
++
++			table++;
++		}
++	}
++
++	if (table_size != 0)
++		fatal("%s: size mismatch\n", __func__);
++}
++
++/*
++ * Do any fixups on the table after sorting.
++ * For now, this just finds adjacent entries which have
++ * the same section_index and addr, and it propagates
++ * the first symbol_index over the subsequent entries,
++ * so that only one symbol_index is seen for any given
++ * section_index and addr.  This ensures that whether
++ * we're looking at an address from "above" or "below"
++ * that we see the same symbol_index.
++ * This does leave some duplicate entries in the table;
++ * in practice, these are a small fraction of the
++ * total number of entries, and they are harmless to
++ * the binary search algorithm other than a few occasional
++ * unnecessary comparisons.
++ */
++static void symsearch_fixup(struct syminfo *table, unsigned int table_size)
++{
++	/* Don't look at index 0, it will never change. */
++	for (unsigned int i = 1; i < table_size; i++) {
++		if (table[i].addr == table[i - 1].addr &&
++		    table[i].section_index == table[i - 1].section_index) {
++			table[i].symbol_index = table[i - 1].symbol_index;
++		}
++	}
++}
++
++void symsearch_init(struct elf_info *elf)
++{
++	unsigned int table_size = symbol_count(elf);
++
++	elf->symsearch = NOFAIL(malloc(sizeof(struct symsearch) +
++				       sizeof(struct syminfo) * table_size));
++	elf->symsearch->table_size = table_size;
++
++	symsearch_populate(elf, elf->symsearch->table, table_size);
++	qsort(elf->symsearch->table, table_size,
++	      sizeof(struct syminfo), syminfo_compare);
++
++	symsearch_fixup(elf->symsearch->table, table_size);
++}
++
++void symsearch_finish(struct elf_info *elf)
++{
++	free(elf->symsearch);
++	elf->symsearch = NULL;
++}
++
++/*
++ * Find the syminfo which is in secndx and "nearest" to addr.
++ * allow_negative: allow returning a symbol whose address is > addr.
++ * min_distance: ignore symbols which are further away than this.
++ *
++ * Returns a pointer into the symbol table for success.
++ * Returns NULL if no legal symbol is found within the requested range.
++ */
++Elf_Sym *symsearch_find_nearest(struct elf_info *elf, Elf_Addr addr,
++				unsigned int secndx, bool allow_negative,
++				Elf_Addr min_distance)
++{
++	unsigned int hi = elf->symsearch->table_size;
++	unsigned int lo = 0;
++	struct syminfo *table = elf->symsearch->table;
++	struct syminfo target;
++
++	target.addr = addr;
++	target.section_index = secndx;
++	target.symbol_index = ~0;  /* compares greater than any actual index */
++	while (hi > lo) {
++		unsigned int mid = lo + (hi - lo) / 2;  /* Avoids overflow */
++
++		if (syminfo_compare(&table[mid], &target) > 0)
++			hi = mid;
++		else
++			lo = mid + 1;
++	}
++
++	/*
++	 * table[hi], if it exists, is the first entry in the array which
++	 * lies beyond target.  table[hi - 1], if it exists, is the last
++	 * entry in the array which comes before target, including the
++	 * case where it perfectly matches the section and the address.
++	 *
++	 * Note -- if the address we're looking up falls perfectly
++	 * in the middle of two symbols, this is written to always
++	 * prefer the symbol with the lower address.
++	 */
++	Elf_Sym *result = NULL;
++
++	if (allow_negative &&
++	    hi < elf->symsearch->table_size &&
++	    table[hi].section_index == secndx &&
++	    table[hi].addr - addr <= min_distance) {
++		min_distance = table[hi].addr - addr;
++		result = &elf->symtab_start[table[hi].symbol_index];
++	}
++	if (hi > 0 &&
++	    table[hi - 1].section_index == secndx &&
++	    addr - table[hi - 1].addr <= min_distance) {
++		result = &elf->symtab_start[table[hi - 1].symbol_index];
++	}
++	return result;
++}
+--
+2.42.0
+
+From: Kairui Song <kasong@xxxxxxxxxxx>
+
+A variable is never used for swapout path (shadowp is NULL) and compiler
+is unable to optimize out the unneeded load since it's a function call.
+
+Signed-off-by: Kairui Song <kasong@xxxxxxxxxxx>
+---
+ mm/swap_state.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index b3b14bd0dd64..ab79ffb71736 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -109,9 +109,9 @@ int add_to_swap_cache(struct folio *folio, swp_entry_t entry,
+ 			goto unlock;
+ 		for (i = 0; i < nr; i++) {
+ 			VM_BUG_ON_FOLIO(xas.xa_index != idx + i, folio);
+-			old = xas_load(&xas);
+-			if (xa_is_value(old)) {
+-				if (shadowp)
++			if (shadowp) {
++				old = xas_load(&xas);
++				if (xa_is_value(old))
+ 					*shadowp = old;
+ 			}
+ 			xas_store(&xas, folio);
+--
+2.42.0
+
+Looks like RADV is actually hitting this.
+
+Signed-off-by: Christian König <christian.koenig at amd.com>
+Fixes: ca6c1e210aa7 ("drm/amdgpu: use the new drm_exec object for CS v3")
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index efdb1c48f431..d93a8961274c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -65,7 +65,8 @@ static int amdgpu_cs_parser_init(struct amdgpu_cs_parser *p,
+ 	}
+
+ 	amdgpu_sync_create(&p->sync);
+-	drm_exec_init(&p->exec, DRM_EXEC_INTERRUPTIBLE_WAIT);
++	drm_exec_init(&p->exec, DRM_EXEC_INTERRUPTIBLE_WAIT |
++		      DRM_EXEC_IGNORE_DUPLICATES);
+ 	return 0;
+ }
+
+--
+2.34.1
+
+The incoming strings might not be terminated by a newline
+or a 0.
+
+(found while testing a program that just wrote the string
+ itself, causing a crash)
+
+Cc: stable at vger.kernel.org
+Fixes: e3933f26b657 ("drm/amd/pp: Add edit/commit/show OD clock/voltage support in sysfs")
+Signed-off-by: Bas Nieuwenhuizen <bas at basnieuwenhuizen.nl>
+---
+ drivers/gpu/drm/amd/pm/amdgpu_pm.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/pm/amdgpu_pm.c b/drivers/gpu/drm/amd/pm/amdgpu_pm.c
+index da0da03569e8..f9c9eba1a815 100644
+--- a/drivers/gpu/drm/amd/pm/amdgpu_pm.c
++++ b/drivers/gpu/drm/amd/pm/amdgpu_pm.c
+@@ -760,7 +760,7 @@ static ssize_t amdgpu_set_pp_od_clk_voltage(struct device *dev,
+ 	if (adev->in_suspend && !adev->in_runpm)
+ 		return -EPERM;
+
+-	if (count > 127)
++	if (count > 127 || count == 0)
+ 		return -EINVAL;
+
+ 	if (*buf == 's')
+@@ -780,7 +780,8 @@ static ssize_t amdgpu_set_pp_od_clk_voltage(struct device *dev,
+ 	else
+ 		return -EINVAL;
+
+-	memcpy(buf_cpy, buf, count+1);
++	memcpy(buf_cpy, buf, count);
++	buf_cpy[count] = 0;
+
+ 	tmp_str = buf_cpy;
+
+@@ -797,6 +798,9 @@ static ssize_t amdgpu_set_pp_od_clk_voltage(struct device *dev,
+ 			return -EINVAL;
+ 		parameter_size++;
+
++		if (!tmp_str)
++			break;
++
+ 		while (isspace(*tmp_str))
+ 			tmp_str++;
+ 	}
+--
+2.42.0
+
+From: Linus Torvalds <torvalds@xxxxxxxxxxxxxxxxxxxx>
+
+It happens to work, but it's very very wrong, because our 'current'
+macro is magic that is supposedly loading a stable value.
+
+It just happens to be not quite stable enough and the compilers
+re-load the value enough for this code to work.  But it's wrong.
+
+The whole
+
+        struct fpu *prev_fpu = &prev->fpu;
+
+thing in __switch_to() is pretty ugly. There's no reason why we
+should look at that 'prev_fpu' pointer there, or pass it down.
+
+And it only generates worse code, in how it loads 'current' when
+__switch_to() has the right task pointers.
+
+The attached patch not only cleans this up, it actually
+generates better code too:
+
+ (a) it removes one push/pop pair at entry/exit because there's one
+less register used (no 'current')
+
+ (b) it removes that pointless load of 'current' because it just uses
+the right argument:
+
+-       movq    %gs:pcpu_hot(%rip), %r12
+-       testq   $16384, (%r12)
++       testq   $16384, (%rdi)
+
+Cc: Thomas Gleixner <tglx@xxxxxxxxxxxxx>
+Cc: Ingo Molnar <mingo@xxxxxxxxxx>
+Cc: Borislav Petkov <bp@xxxxxxxxx>
+Cc: Dave Hansen <dave.hansen@xxxxxxxxxxxxxxx>
+Cc: "H. Peter Anvin" <hpa@xxxxxxxxx>
+Cc: Peter Zijlstra <peterz@xxxxxxxxxxxxx>
+Signed-off-by: Linus Torvalds <torvalds@xxxxxxxxxxxxxxxxxxxx>
+Signed-off-by: Uros Bizjak <ubizjak@xxxxxxxxx>
+---
+ arch/x86/include/asm/fpu/sched.h | 10 ++++++----
+ arch/x86/kernel/process_32.c     |  7 +++----
+ arch/x86/kernel/process_64.c     |  7 +++----
+ 3 files changed, 12 insertions(+), 12 deletions(-)
+
+diff --git a/arch/x86/include/asm/fpu/sched.h b/arch/x86/include/asm/fpu/sched.h
+index ca6e5e5f16b2..c485f1944c5f 100644
+--- a/arch/x86/include/asm/fpu/sched.h
++++ b/arch/x86/include/asm/fpu/sched.h
+@@ -37,10 +37,12 @@ extern void fpu_flush_thread(void);
+  * The FPU context is only stored/restored for a user task and
+  * PF_KTHREAD is used to distinguish between kernel and user threads.
+  */
+-static inline void switch_fpu_prepare(struct fpu *old_fpu, int cpu)
++static inline void switch_fpu_prepare(struct task_struct *old, int cpu)
+ {
+ 	if (cpu_feature_enabled(X86_FEATURE_FPU) &&
+-	    !(current->flags & (PF_KTHREAD | PF_USER_WORKER))) {
++	    !(old->flags & (PF_KTHREAD | PF_USER_WORKER))) {
++		struct fpu *old_fpu = &old->thread.fpu;
++
+ 		save_fpregs_to_fpstate(old_fpu);
+ 		/*
+ 		 * The save operation preserved register state, so the
+@@ -60,10 +62,10 @@ static inline void switch_fpu_prepare(struct fpu *old_fpu, int cpu)
+  * Delay loading of the complete FPU state until the return to userland.
+  * PKRU is handled separately.
+  */
+-static inline void switch_fpu_finish(void)
++static inline void switch_fpu_finish(struct task_struct *new)
+ {
+ 	if (cpu_feature_enabled(X86_FEATURE_FPU))
+-		set_thread_flag(TIF_NEED_FPU_LOAD);
++		set_tsk_thread_flag(new, TIF_NEED_FPU_LOAD);
+ }
+
+ #endif /* _ASM_X86_FPU_SCHED_H */
+diff --git a/arch/x86/kernel/process_32.c b/arch/x86/kernel/process_32.c
+index 708c87b88cc1..0917c7f25720 100644
+--- a/arch/x86/kernel/process_32.c
++++ b/arch/x86/kernel/process_32.c
+@@ -156,13 +156,12 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+ {
+ 	struct thread_struct *prev = &prev_p->thread,
+ 			     *next = &next_p->thread;
+-	struct fpu *prev_fpu = &prev->fpu;
+ 	int cpu = smp_processor_id();
+
+ 	/* never put a printk in __switch_to... printk() calls wake_up*() indirectly */
+
+-	if (!test_thread_flag(TIF_NEED_FPU_LOAD))
+-		switch_fpu_prepare(prev_fpu, cpu);
++	if (!test_tsk_thread_flag(prev_p, TIF_NEED_FPU_LOAD))
++		switch_fpu_prepare(prev_p, cpu);
+
+ 	/*
+ 	 * Save away %gs. No need to save %fs, as it was saved on the
+@@ -209,7 +208,7 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+
+ 	raw_cpu_write(pcpu_hot.current_task, next_p);
+
+-	switch_fpu_finish();
++	switch_fpu_finish(next_p);
+
+ 	/* Load the Intel cache allocation PQR MSR. */
+ 	resctrl_sched_in(next_p);
+diff --git a/arch/x86/kernel/process_64.c b/arch/x86/kernel/process_64.c
+index 33b268747bb7..1553e19904e0 100644
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -562,14 +562,13 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+ {
+ 	struct thread_struct *prev = &prev_p->thread;
+ 	struct thread_struct *next = &next_p->thread;
+-	struct fpu *prev_fpu = &prev->fpu;
+ 	int cpu = smp_processor_id();
+
+ 	WARN_ON_ONCE(IS_ENABLED(CONFIG_DEBUG_ENTRY) &&
+ 		     this_cpu_read(pcpu_hot.hardirq_stack_inuse));
+
+-	if (!test_thread_flag(TIF_NEED_FPU_LOAD))
+-		switch_fpu_prepare(prev_fpu, cpu);
++	if (!test_tsk_thread_flag(prev_p, TIF_NEED_FPU_LOAD))
++		switch_fpu_prepare(prev_p, cpu);
+
+ 	/* We must save %fs and %gs before load_TLS() because
+ 	 * %fs and %gs may be cleared by load_TLS().
+@@ -623,7 +622,7 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+ 	raw_cpu_write(pcpu_hot.current_task, next_p);
+ 	raw_cpu_write(pcpu_hot.top_of_stack, task_top_of_stack(next_p));
+
+-	switch_fpu_finish();
++	switch_fpu_finish(next_p);
+
+ 	/* Reload sp0. */
+ 	update_task_stack(next_p);
+--
+2.41.0
+
+Current scheduler code doesn't handle SD_ASYM_PACKING in the
+find_idlest_cpu path. On few architectures, like Powerpc, cache is at a
+core. Moving threads across cores may end up in cache misses.
+
+While asym_packing can be enabled above SMT level, enabling Asym packing
+across cores could result in poorer performance due to cache misses.
+However if the initial task placement via find_idlest_cpu does take
+Asym_packing into consideration, then scheduler can avoid asym_packing
+migrations. This will result in lesser migrations and better packing and
+better overall performance.
+
+Signed-off-by: Srikar Dronamraju <srikar@xxxxxxxxxxxxxxxxxx>
+---
+ kernel/sched/fair.c | 33 ++++++++++++++++++++++++++++++---
+ 1 file changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index cb225921bbca..7164f79a3d13 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -9931,11 +9931,13 @@ static int idle_cpu_without(int cpu, struct task_struct *p)
+  * @group: sched_group whose statistics are to be updated.
+  * @sgs: variable to hold the statistics for this group.
+  * @p: The task for which we look for the idlest group/CPU.
++ * @this_cpu: current cpu
+  */
+ static inline void update_sg_wakeup_stats(struct sched_domain *sd,
+ 					  struct sched_group *group,
+ 					  struct sg_lb_stats *sgs,
+-					  struct task_struct *p)
++					  struct task_struct *p,
++					  int this_cpu)
+ {
+ 	int i, nr_running;
+
+@@ -9972,6 +9974,11 @@ static inline void update_sg_wakeup_stats(struct sched_domain *sd,
+
+ 	}
+
++	if (sd->flags & SD_ASYM_PACKING && sgs->sum_h_nr_running &&
++			sched_asym_prefer(group->asym_prefer_cpu, this_cpu)) {
++		sgs->group_asym_packing = 1;
++	}
++
+ 	sgs->group_capacity = group->sgc->capacity;
+
+ 	sgs->group_weight = group->group_weight;
+@@ -10012,8 +10019,17 @@ static bool update_pick_idlest(struct sched_group *idlest,
+ 			return false;
+ 		break;
+
+-	case group_imbalanced:
+ 	case group_asym_packing:
++		if (sched_asym_prefer(group->asym_prefer_cpu, idlest->asym_prefer_cpu)) {
++			int busy_cpus = idlest_sgs->group_weight - idlest_sgs->idle_cpus;
++
++			busy_cpus -= (sgs->group_weight - sgs->idle_cpus);
++			if (busy_cpus >= 0)
++				return true;
++		}
++		return false;
++
++	case group_imbalanced:
+ 	case group_smt_balance:
+ 		/* Those types are not used in the slow wakeup path */
+ 		return false;
+@@ -10080,7 +10096,7 @@ find_idlest_group(struct sched_domain *sd, struct task_struct *p, int this_cpu)
+ 			sgs = &tmp_sgs;
+ 		}
+
+-		update_sg_wakeup_stats(sd, group, sgs, p);
++		update_sg_wakeup_stats(sd, group, sgs, p, this_cpu);
+
+ 		if (!local_group && update_pick_idlest(idlest, &idlest_sgs, group, sgs)) {
+ 			idlest = group;
+@@ -10112,6 +10128,17 @@ find_idlest_group(struct sched_domain *sd, struct task_struct *p, int this_cpu)
+ 	if (local_sgs.group_type > idlest_sgs.group_type)
+ 		return idlest;
+
++	if (idlest_sgs.group_type == group_asym_packing) {
++		if (sched_asym_prefer(idlest->asym_prefer_cpu, local->asym_prefer_cpu)) {
++			int busy_cpus = local_sgs.group_weight - local_sgs.idle_cpus;
++
++			busy_cpus -= (idlest_sgs.group_weight - idlest_sgs.idle_cpus);
++			if (busy_cpus >= 0)
++				return idlest;
++		}
++		return NULL;
++	}
++
+ 	switch (local_sgs.group_type) {
+ 	case group_overloaded:
+ 	case group_fully_busy:
+--
+2.31.1
