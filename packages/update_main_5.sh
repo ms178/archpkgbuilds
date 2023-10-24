@@ -125,7 +125,7 @@ kaccounts-integration-main \
 kio-extras-main \
 kwalletmanager-main \
 signon-kwallet-extension-main \
-spectacle-main
+spectacle-main \
 ; do
   cd $pkg
   rm -f *.zst
