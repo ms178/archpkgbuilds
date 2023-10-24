@@ -3,6 +3,7 @@
 # You need to adjust the path in the first line to the folder where you placed all of these packages and make this script executable with "chmod +x". I haven't found a way to say "Yes" automatically to pacman, hence you need to install all of the following packages manually in the correct order when installing them first, but you can use this script for updates. Execute it with "./update.sh". Beware of the dangers, the build order is important and this is now tested to be the correct order. As I personally use Kwinft-main and compile that seperatly, you need that package and its dependancies (wrapland-main, disman-main, kdisplay-main) in addition to this list to be installed. You can integrate these packages above plasma-workspace-main in this script if you like.
 cd /home/marcus/Downloads/KDE
 for pkg in extra-cmake-modules-main \
+oxygen-sounds-main \
 kdnssd5-main \
 ki18n5-main \
 solid5-main \
@@ -54,6 +55,7 @@ frameworkintegration5-main \
 kdeclarative5-main \
 kcmutils5-main \
 breeze-main \
+breeze-gtk-main \
 kactivities5-main \
 kactivities-stats5-main \
 kactivitymanagerd-main \
@@ -117,13 +119,6 @@ kio-fuse-main \
 ksysguard-main \
 plasma-systemmonitor-main \
 xdg-desktop-portal-kde-main \
-ark-main \
-baloo-widgets-main \
-kaccounts-integration-main \
-kio-extras-main \
-kwalletmanager-main \
-signon-kwallet-extension-main \
-spectacle-main
 ; do
   cd $pkg
   rm -f *.zst
