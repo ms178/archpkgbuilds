@@ -46,7 +46,6 @@ kded-main \
 kio-main \
 baloo-main \
 breeze-icons-main \
-breeze-gtk-main \
 kwayland-integration-main \
 plasma-wayland-protocols-main \
 kwayland-main \
@@ -56,6 +55,7 @@ frameworkintegration-main \
 kdeclarative-main \
 kcmutils-main \
 breeze-main \
+breeze-gtk-main \
 kactivities-main \
 kactivities-stats-main \
 kactivitymanagerd-main \
