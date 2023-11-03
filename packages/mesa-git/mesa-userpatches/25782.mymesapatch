@@ -1,0 +1,642 @@
+From 7f4dd24a33edc112e235ab64407513536a2f8f8f Mon Sep 17 00:00:00 2001
+From: Ganesh Belgur Ramachandra <ganesh.belgurramachandra@amd.com>
+Date: Thu, 5 Oct 2023 06:49:58 -0500
+Subject: [PATCH 1/3] radeonsi: "create_dma_compute" shader in nir
+
+---
+ .../drivers/radeonsi/si_compute_blit.c        |   4 +-
+ src/gallium/drivers/radeonsi/si_pipe.h        |   2 +-
+ .../drivers/radeonsi/si_shaderlib_nir.c       |  80 +++++++++++++
+ .../drivers/radeonsi/si_shaderlib_tgsi.c      | 106 ------------------
+ .../drivers/radeonsi/si_test_dma_perf.c       |   2 +-
+ 5 files changed, 84 insertions(+), 110 deletions(-)
+
+diff --git a/src/gallium/drivers/radeonsi/si_compute_blit.c b/src/gallium/drivers/radeonsi/si_compute_blit.c
+index 06e2fc16c463c..1e64290f64a29 100644
+--- a/src/gallium/drivers/radeonsi/si_compute_blit.c
++++ b/src/gallium/drivers/radeonsi/si_compute_blit.c
+@@ -395,7 +395,7 @@ static void si_compute_do_clear_or_copy(struct si_context *sctx, struct pipe_res
+ 
+       if (!sctx->cs_copy_buffer) {
+          sctx->cs_copy_buffer = si_create_dma_compute_shader(
+-            &sctx->b, SI_COMPUTE_COPY_DW_PER_THREAD, shader_dst_stream_policy, true);
++            sctx, SI_COMPUTE_COPY_DW_PER_THREAD, shader_dst_stream_policy, true);
+       }
+ 
+       si_launch_grid_internal_ssbos(sctx, &info, sctx->cs_copy_buffer, flags, coher,
+@@ -409,7 +409,7 @@ static void si_compute_do_clear_or_copy(struct si_context *sctx, struct pipe_res
+ 
+       if (!sctx->cs_clear_buffer) {
+          sctx->cs_clear_buffer = si_create_dma_compute_shader(
+-            &sctx->b, SI_COMPUTE_CLEAR_DW_PER_THREAD, shader_dst_stream_policy, false);
++            sctx, SI_COMPUTE_CLEAR_DW_PER_THREAD, shader_dst_stream_policy, false);
+       }
+ 
+       si_launch_grid_internal_ssbos(sctx, &info, sctx->cs_clear_buffer, flags, coher,
+diff --git a/src/gallium/drivers/radeonsi/si_pipe.h b/src/gallium/drivers/radeonsi/si_pipe.h
+index af042af269ad4..f4b64ee66d745 100644
+--- a/src/gallium/drivers/radeonsi/si_pipe.h
++++ b/src/gallium/drivers/radeonsi/si_pipe.h
+@@ -1638,7 +1638,7 @@ void *si_create_blit_cs(struct si_context *sctx, const union si_compute_blit_sha
+ /* si_shaderlib_tgsi.c */
+ void *si_get_blitter_vs(struct si_context *sctx, enum blitter_attrib_type type,
+                         unsigned num_layers);
+-void *si_create_dma_compute_shader(struct pipe_context *ctx, unsigned num_dwords_per_thread,
++void *si_create_dma_compute_shader(struct si_context *sctx, unsigned num_dwords_per_thread,
+                                    bool dst_stream_cache_policy, bool is_copy);
+ void *si_create_clear_buffer_rmw_cs(struct si_context *sctx);
+ void *si_clear_render_target_shader(struct si_context *sctx, enum pipe_texture_target type);
+diff --git a/src/gallium/drivers/radeonsi/si_shaderlib_nir.c b/src/gallium/drivers/radeonsi/si_shaderlib_nir.c
+index c075e6bfa719b..862f29082c28b 100644
+--- a/src/gallium/drivers/radeonsi/si_shaderlib_nir.c
++++ b/src/gallium/drivers/radeonsi/si_shaderlib_nir.c
+@@ -632,3 +632,83 @@ void *si_clear_12bytes_buffer_shader(struct si_context *sctx)
+ 
+    return create_shader_state(sctx, b.shader);
+ }
++
++/* Create a compute shader implementing clear_buffer or copy_buffer. */
++void *si_create_dma_compute_shader(struct si_context *sctx, unsigned num_dwords_per_thread,
++                                   bool dst_stream_cache_policy, bool is_copy)
++{
++   util_is_power_of_two_nonzero(num_dwords_per_thread);
++
++   const nir_shader_compiler_options *options =
++   sctx->b.screen->get_compiler_options(sctx->b.screen, PIPE_SHADER_IR_NIR, PIPE_SHADER_COMPUTE);
++
++   unsigned store_qualifier = ACCESS_COHERENT | ACCESS_RESTRICT;
++   if (dst_stream_cache_policy)
++      store_qualifier |= ACCESS_NON_TEMPORAL;
++
++   /* Don't cache loads, because there is no reuse. */
++   unsigned load_qualifier = store_qualifier | ACCESS_NON_TEMPORAL;
++
++   nir_builder b =
++   nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, options, "create_dma_compute");
++
++   unsigned default_wave_size = si_determine_wave_size(sctx->screen, NULL);
++
++   b.shader->info.workgroup_size[0] = default_wave_size;
++   b.shader->info.workgroup_size[1] = 1;
++   b.shader->info.workgroup_size[2] = 1;
++   b.shader->info.num_ssbos = 1;
++
++   unsigned num_mem_ops = MAX2(1, num_dwords_per_thread / 4);
++   unsigned *inst_dwords = alloca(num_mem_ops * sizeof(unsigned));
++
++   for (unsigned i = 0; i < num_mem_ops; i++) {
++      if (i * 4 < num_dwords_per_thread)
++         inst_dwords[i] = MIN2(4, num_dwords_per_thread - i * 4);
++   }
++
++   /* If there are multiple stores,
++    * the first store writes into 0*wavesize+tid,
++    * the 2nd store writes into 1*wavesize+tid,
++    * the 3rd store writes into 2*wavesize+tid, etc.
++    */
++   nir_def *store_address = get_global_ids(&b, 1);
++
++   /* Convert from a "store size unit" into bytes. */
++   store_address = nir_imul_imm(&b, store_address, 4 * inst_dwords[0]);
++
++   nir_def *load_address = store_address, *value, *values[num_mem_ops];
++   if (is_copy) {
++      b.shader->info.num_ssbos++;
++   } else {
++      b.shader->info.cs.user_data_components_amd = inst_dwords[0];
++      value = nir_trim_vector(&b, nir_load_user_data_amd(&b), inst_dwords[0]);
++   }
++
++   /* Distance between a load and a store for latency hiding. */
++   unsigned load_store_distance = is_copy ? 8 : 0;
++
++   for (unsigned i = 0; i < num_mem_ops + load_store_distance; i++) {
++      int d = i - load_store_distance;
++
++      if (is_copy && i < num_mem_ops) {
++         if (i) {
++            load_address = nir_iadd(&b, load_address,
++                                    nir_imm_int(&b, 4 * inst_dwords[i] * default_wave_size));
++         }
++         values[i] = nir_load_ssbo(&b, 4, 32, nir_imm_int(&b, 1),load_address,
++                                   .access = load_qualifier);
++      }
++
++      if (d >= 0) {
++         if (d) {
++            store_address = nir_iadd(&b, store_address,
++                                     nir_imm_int(&b, 4 * inst_dwords[d] * default_wave_size));
++         }
++         nir_store_ssbo(&b, is_copy ? values[d] : value, nir_imm_int(&b, 0), store_address,
++                        .access = store_qualifier);
++      }
++   }
++
++   return create_shader_state(sctx, b.shader);
++}
+diff --git a/src/gallium/drivers/radeonsi/si_shaderlib_tgsi.c b/src/gallium/drivers/radeonsi/si_shaderlib_tgsi.c
+index 3b13d4188b801..8d9b4256fb5f2 100644
+--- a/src/gallium/drivers/radeonsi/si_shaderlib_tgsi.c
++++ b/src/gallium/drivers/radeonsi/si_shaderlib_tgsi.c
+@@ -67,112 +67,6 @@ void *si_get_blitter_vs(struct si_context *sctx, enum blitter_attrib_type type,
+    return *vs;
+ }
+ 
+-/* Create a compute shader implementing clear_buffer or copy_buffer. */
+-void *si_create_dma_compute_shader(struct pipe_context *ctx, unsigned num_dwords_per_thread,
+-                                   bool dst_stream_cache_policy, bool is_copy)
+-{
+-   struct si_screen *sscreen = (struct si_screen *)ctx->screen;
+-   assert(util_is_power_of_two_nonzero(num_dwords_per_thread));
+-
+-   unsigned store_qualifier = TGSI_MEMORY_COHERENT | TGSI_MEMORY_RESTRICT;
+-   if (dst_stream_cache_policy)
+-      store_qualifier |= TGSI_MEMORY_STREAM_CACHE_POLICY;
+-
+-   /* Don't cache loads, because there is no reuse. */
+-   unsigned load_qualifier = store_qualifier | TGSI_MEMORY_STREAM_CACHE_POLICY;
+-
+-   unsigned num_mem_ops = MAX2(1, num_dwords_per_thread / 4);
+-   unsigned *inst_dwords = alloca(num_mem_ops * sizeof(unsigned));
+-
+-   for (unsigned i = 0; i < num_mem_ops; i++) {
+-      if (i * 4 < num_dwords_per_thread)
+-         inst_dwords[i] = MIN2(4, num_dwords_per_thread - i * 4);
+-   }
+-
+-   struct ureg_program *ureg = ureg_create(PIPE_SHADER_COMPUTE);
+-   if (!ureg)
+-      return NULL;
+-
+-   unsigned default_wave_size = si_determine_wave_size(sscreen, NULL);
+-
+-   ureg_property(ureg, TGSI_PROPERTY_CS_FIXED_BLOCK_WIDTH, default_wave_size);
+-   ureg_property(ureg, TGSI_PROPERTY_CS_FIXED_BLOCK_HEIGHT, 1);
+-   ureg_property(ureg, TGSI_PROPERTY_CS_FIXED_BLOCK_DEPTH, 1);
+-
+-   struct ureg_src value;
+-   if (!is_copy) {
+-      ureg_property(ureg, TGSI_PROPERTY_CS_USER_DATA_COMPONENTS_AMD, inst_dwords[0]);
+-      value = ureg_DECL_system_value(ureg, TGSI_SEMANTIC_CS_USER_DATA_AMD, 0);
+-   }
+-
+-   struct ureg_src tid = ureg_DECL_system_value(ureg, TGSI_SEMANTIC_THREAD_ID, 0);
+-   struct ureg_src blk = ureg_DECL_system_value(ureg, TGSI_SEMANTIC_BLOCK_ID, 0);
+-   struct ureg_dst store_addr = ureg_writemask(ureg_DECL_temporary(ureg), TGSI_WRITEMASK_X);
+-   struct ureg_dst load_addr = ureg_writemask(ureg_DECL_temporary(ureg), TGSI_WRITEMASK_X);
+-   struct ureg_dst dstbuf = ureg_dst(ureg_DECL_buffer(ureg, 0, false));
+-   struct ureg_src srcbuf;
+-   struct ureg_src *values = NULL;
+-
+-   if (is_copy) {
+-      srcbuf = ureg_DECL_buffer(ureg, 1, false);
+-      values = malloc(num_mem_ops * sizeof(struct ureg_src));
+-   }
+-
+-   /* If there are multiple stores, the first store writes into 0*wavesize+tid,
+-    * the 2nd store writes into 1*wavesize+tid, the 3rd store writes into 2*wavesize+tid, etc.
+-    */
+-   ureg_UMAD(ureg, store_addr, blk, ureg_imm1u(ureg, default_wave_size * num_mem_ops),
+-             tid);
+-   /* Convert from a "store size unit" into bytes. */
+-   ureg_UMUL(ureg, store_addr, ureg_src(store_addr), ureg_imm1u(ureg, 4 * inst_dwords[0]));
+-   ureg_MOV(ureg, load_addr, ureg_src(store_addr));
+-
+-   /* Distance between a load and a store for latency hiding. */
+-   unsigned load_store_distance = is_copy ? 8 : 0;
+-
+-   for (unsigned i = 0; i < num_mem_ops + load_store_distance; i++) {
+-      int d = i - load_store_distance;
+-
+-      if (is_copy && i < num_mem_ops) {
+-         if (i) {
+-            ureg_UADD(ureg, load_addr, ureg_src(load_addr),
+-                      ureg_imm1u(ureg, 4 * inst_dwords[i] * default_wave_size));
+-         }
+-
+-         values[i] = ureg_src(ureg_DECL_temporary(ureg));
+-         struct ureg_dst dst =
+-            ureg_writemask(ureg_dst(values[i]), u_bit_consecutive(0, inst_dwords[i]));
+-         struct ureg_src srcs[] = {srcbuf, ureg_src(load_addr)};
+-         ureg_memory_insn(ureg, TGSI_OPCODE_LOAD, &dst, 1, srcs, 2, load_qualifier,
+-                          TGSI_TEXTURE_BUFFER, 0);
+-      }
+-
+-      if (d >= 0) {
+-         if (d) {
+-            ureg_UADD(ureg, store_addr, ureg_src(store_addr),
+-                      ureg_imm1u(ureg, 4 * inst_dwords[d] * default_wave_size));
+-         }
+-
+-         struct ureg_dst dst = ureg_writemask(dstbuf, u_bit_consecutive(0, inst_dwords[d]));
+-         struct ureg_src srcs[] = {ureg_src(store_addr), is_copy ? values[d] : value};
+-         ureg_memory_insn(ureg, TGSI_OPCODE_STORE, &dst, 1, srcs, 2, store_qualifier,
+-                          TGSI_TEXTURE_BUFFER, 0);
+-      }
+-   }
+-   ureg_END(ureg);
+-
+-   struct pipe_compute_state state = {};
+-   state.ir_type = PIPE_SHADER_IR_TGSI;
+-   state.prog = ureg_get_tokens(ureg, NULL);
+-
+-   void *cs = ctx->create_compute_state(ctx, &state);
+-   ureg_destroy(ureg);
+-   ureg_free_tokens(state.prog);
+-
+-   free(values);
+-   return cs;
+-}
+-
+ /* Create the compute shader that is used to collect the results.
+  *
+  * One compute grid with a single thread is launched for every query result
+diff --git a/src/gallium/drivers/radeonsi/si_test_dma_perf.c b/src/gallium/drivers/radeonsi/si_test_dma_perf.c
+index 0a1d58222cc35..b09d9752f5f9f 100644
+--- a/src/gallium/drivers/radeonsi/si_test_dma_perf.c
++++ b/src/gallium/drivers/radeonsi/si_test_dma_perf.c
+@@ -119,7 +119,7 @@ void si_test_dma_perf(struct si_screen *sscreen)
+ 
+          void *compute_shader = NULL;
+          if (test_cs) {
+-            compute_shader = si_create_dma_compute_shader(ctx, cs_dwords_per_thread,
++            compute_shader = si_create_dma_compute_shader(sctx, cs_dwords_per_thread,
+                                               cache_policy == L2_STREAM, is_copy);
+          }
+ 
+-- 
+GitLab
+
+
+From 3fc39296b81f4bd25696467d7f22c987882a160e Mon Sep 17 00:00:00 2001
+From: Ganesh Belgur Ramachandra <ganesh.belgurramachandra@amd.com>
+Date: Tue, 17 Oct 2023 04:41:14 -0500
+Subject: [PATCH 2/3] radeonsi: "create_fmask_expand_cs" shader in nir
+
+---
+ .../drivers/radeonsi/si_compute_blit.c        |  2 +-
+ src/gallium/drivers/radeonsi/si_pipe.h        |  2 +-
+ .../drivers/radeonsi/si_shaderlib_nir.c       | 60 +++++++++++++++++
+ .../drivers/radeonsi/si_shaderlib_tgsi.c      | 64 -------------------
+ 4 files changed, 62 insertions(+), 66 deletions(-)
+
+diff --git a/src/gallium/drivers/radeonsi/si_compute_blit.c b/src/gallium/drivers/radeonsi/si_compute_blit.c
+index 1e64290f64a29..fdc85cf8d69f3 100644
+--- a/src/gallium/drivers/radeonsi/si_compute_blit.c
++++ b/src/gallium/drivers/radeonsi/si_compute_blit.c
+@@ -911,7 +911,7 @@ void si_compute_expand_fmask(struct pipe_context *ctx, struct pipe_resource *tex
+    /* Bind the shader. */
+    void **shader = &sctx->cs_fmask_expand[log_samples - 1][is_array];
+    if (!*shader)
+-      *shader = si_create_fmask_expand_cs(ctx, tex->nr_samples, is_array);
++      *shader = si_create_fmask_expand_cs(sctx, tex->nr_samples, is_array);
+ 
+    /* Dispatch compute. */
+    struct pipe_grid_info info = {0};
+diff --git a/src/gallium/drivers/radeonsi/si_pipe.h b/src/gallium/drivers/radeonsi/si_pipe.h
+index f4b64ee66d745..2ebbea437b74a 100644
+--- a/src/gallium/drivers/radeonsi/si_pipe.h
++++ b/src/gallium/drivers/radeonsi/si_pipe.h
+@@ -1643,7 +1643,7 @@ void *si_create_dma_compute_shader(struct si_context *sctx, unsigned num_dwords_
+ void *si_create_clear_buffer_rmw_cs(struct si_context *sctx);
+ void *si_clear_render_target_shader(struct si_context *sctx, enum pipe_texture_target type);
+ void *si_clear_12bytes_buffer_shader(struct si_context *sctx);
+-void *si_create_fmask_expand_cs(struct pipe_context *ctx, unsigned num_samples, bool is_array);
++void *si_create_fmask_expand_cs(struct si_context *sctx, unsigned num_samples, bool is_array);
+ void *si_create_query_result_cs(struct si_context *sctx);
+ void *gfx11_create_sh_query_result_cs(struct si_context *sctx);
+ 
+diff --git a/src/gallium/drivers/radeonsi/si_shaderlib_nir.c b/src/gallium/drivers/radeonsi/si_shaderlib_nir.c
+index 862f29082c28b..5eaf8ef6f66da 100644
+--- a/src/gallium/drivers/radeonsi/si_shaderlib_nir.c
++++ b/src/gallium/drivers/radeonsi/si_shaderlib_nir.c
+@@ -712,3 +712,63 @@ void *si_create_dma_compute_shader(struct si_context *sctx, unsigned num_dwords_
+ 
+    return create_shader_state(sctx, b.shader);
+ }
++
++/* Load samples from the image, and copy them to the same image. This looks like
++ * a no-op, but it's not. Loads use FMASK, while stores don't, so samples are
++ * reordered to match expanded FMASK.
++ *
++ * After the shader finishes, FMASK should be cleared to identity.
++ */
++void *si_create_fmask_expand_cs(struct si_context *sctx, unsigned num_samples, bool is_array)
++{
++   const nir_shader_compiler_options *options =
++   sctx->b.screen->get_compiler_options(sctx->b.screen, PIPE_SHADER_IR_NIR, PIPE_SHADER_COMPUTE);
++
++   nir_builder b =
++   nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, options, "create_fmask_expand_cs");
++   b.shader->info.workgroup_size[0] = 8;
++   b.shader->info.workgroup_size[1] = 8;
++   b.shader->info.workgroup_size[2] = 1;
++
++   /* Return an empty compute shader */
++   if (num_samples == 0)
++      return create_shader_state(sctx, b.shader);
++
++   b.shader->info.num_images = 1;
++
++   const struct glsl_type *img_type = glsl_image_type(GLSL_SAMPLER_DIM_MS, is_array, GLSL_TYPE_FLOAT);
++   nir_variable *img = nir_variable_create(b.shader, nir_var_image, img_type, "image");
++   img->data.access = ACCESS_RESTRICT;
++
++   nir_def *z = nir_undef(&b, 1, 32);
++   if (is_array) {
++      z = nir_channel(&b, nir_load_workgroup_id(&b), 2);
++   }
++
++   nir_def *zero = nir_imm_int(&b, 0);
++   nir_def *address = get_global_ids(&b, 2);
++
++   nir_def *sample[8], *addresses[8];
++   assert(num_samples <= ARRAY_SIZE(sample));
++
++   nir_def *img_def = &nir_build_deref_var(&b, img)->def;
++
++   /* Load samples, resolving FMASK. */
++   for (unsigned i = 0; i < num_samples; i++) {
++      nir_def *it = nir_imm_int(&b, i);
++      sample[i] = nir_vec4(&b, nir_channel(&b, address, 0), nir_channel(&b, address, 1), z, it);
++      addresses[i] = nir_image_deref_load(&b, 4, 32, img_def, sample[i], it, zero,
++                                          .access = ACCESS_RESTRICT,
++                                          .image_dim = GLSL_SAMPLER_DIM_2D,
++                                          .image_array = is_array);
++   }
++
++   /* Store samples, ignoring FMASK. */
++   for (unsigned i = 0; i < num_samples; i++) {
++      nir_image_deref_store(&b, img_def, sample[i], nir_imm_int(&b, i), addresses[i], zero,
++                            .access = ACCESS_RESTRICT,
++                            .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = is_array);
++   }
++
++   return create_shader_state(sctx, b.shader);
++}
+diff --git a/src/gallium/drivers/radeonsi/si_shaderlib_tgsi.c b/src/gallium/drivers/radeonsi/si_shaderlib_tgsi.c
+index 8d9b4256fb5f2..7339271587466 100644
+--- a/src/gallium/drivers/radeonsi/si_shaderlib_tgsi.c
++++ b/src/gallium/drivers/radeonsi/si_shaderlib_tgsi.c
+@@ -282,70 +282,6 @@ void *si_create_query_result_cs(struct si_context *sctx)
+    return sctx->b.create_compute_state(&sctx->b, &state);
+ }
+ 
+-/* Load samples from the image, and copy them to the same image. This looks like
+- * a no-op, but it's not. Loads use FMASK, while stores don't, so samples are
+- * reordered to match expanded FMASK.
+- *
+- * After the shader finishes, FMASK should be cleared to identity.
+- */
+-void *si_create_fmask_expand_cs(struct pipe_context *ctx, unsigned num_samples, bool is_array)
+-{
+-   enum tgsi_texture_type target = is_array ? TGSI_TEXTURE_2D_ARRAY_MSAA : TGSI_TEXTURE_2D_MSAA;
+-   struct ureg_program *ureg = ureg_create(PIPE_SHADER_COMPUTE);
+-   if (!ureg)
+-      return NULL;
+-
+-   ureg_property(ureg, TGSI_PROPERTY_CS_FIXED_BLOCK_WIDTH, 8);
+-   ureg_property(ureg, TGSI_PROPERTY_CS_FIXED_BLOCK_HEIGHT, 8);
+-   ureg_property(ureg, TGSI_PROPERTY_CS_FIXED_BLOCK_DEPTH, 1);
+-
+-   /* Compute the image coordinates. */
+-   struct ureg_src image = ureg_DECL_image(ureg, 0, target, 0, true, false);
+-   struct ureg_src tid = ureg_DECL_system_value(ureg, TGSI_SEMANTIC_THREAD_ID, 0);
+-   struct ureg_src blk = ureg_DECL_system_value(ureg, TGSI_SEMANTIC_BLOCK_ID, 0);
+-   struct ureg_dst coord = ureg_writemask(ureg_DECL_temporary(ureg), TGSI_WRITEMASK_XYZW);
+-   ureg_UMAD(ureg, ureg_writemask(coord, TGSI_WRITEMASK_XY), ureg_swizzle(blk, 0, 1, 1, 1),
+-             ureg_imm2u(ureg, 8, 8), ureg_swizzle(tid, 0, 1, 1, 1));
+-   if (is_array) {
+-      ureg_MOV(ureg, ureg_writemask(coord, TGSI_WRITEMASK_Z), ureg_scalar(blk, TGSI_SWIZZLE_Z));
+-   }
+-
+-   /* Load samples, resolving FMASK. */
+-   struct ureg_dst sample[8];
+-   assert(num_samples <= ARRAY_SIZE(sample));
+-
+-   for (unsigned i = 0; i < num_samples; i++) {
+-      sample[i] = ureg_DECL_temporary(ureg);
+-
+-      ureg_MOV(ureg, ureg_writemask(coord, TGSI_WRITEMASK_W), ureg_imm1u(ureg, i));
+-
+-      struct ureg_src srcs[] = {image, ureg_src(coord)};
+-      ureg_memory_insn(ureg, TGSI_OPCODE_LOAD, &sample[i], 1, srcs, 2, TGSI_MEMORY_RESTRICT, target,
+-                       0);
+-   }
+-
+-   /* Store samples, ignoring FMASK. */
+-   for (unsigned i = 0; i < num_samples; i++) {
+-      ureg_MOV(ureg, ureg_writemask(coord, TGSI_WRITEMASK_W), ureg_imm1u(ureg, i));
+-
+-      struct ureg_dst dst_image = ureg_dst(image);
+-      struct ureg_src srcs[] = {ureg_src(coord), ureg_src(sample[i])};
+-      ureg_memory_insn(ureg, TGSI_OPCODE_STORE, &dst_image, 1, srcs, 2, TGSI_MEMORY_RESTRICT,
+-                       target, 0);
+-   }
+-   ureg_END(ureg);
+-
+-   struct pipe_compute_state state = {};
+-   state.ir_type = PIPE_SHADER_IR_TGSI;
+-   state.prog = ureg_get_tokens(ureg, NULL);
+-
+-   void *cs = ctx->create_compute_state(ctx, &state);
+-   ureg_destroy(ureg);
+-   ureg_free_tokens(state.prog);
+-
+-   return cs;
+-}
+-
+ /* Create the compute shader that is used to collect the results of gfx10+
+  * shader queries.
+  *
+-- 
+GitLab
+
+
+From 8cd4b1e75a26e3a936a5d172cdb7c8296c6d4ccc Mon Sep 17 00:00:00 2001
+From: Ganesh Belgur Ramachandra <ganesh.belgurramachandra@amd.com>
+Date: Tue, 17 Oct 2023 12:20:50 -0500
+Subject: [PATCH 3/3] radeonsi: "get_blitter_vs" shader in nir
+
+---
+ src/gallium/drivers/radeonsi/si_pipe.h        |  4 +-
+ .../drivers/radeonsi/si_shaderlib_nir.c       | 73 +++++++++++++++++++
+ .../drivers/radeonsi/si_shaderlib_tgsi.c      | 59 ---------------
+ 3 files changed, 76 insertions(+), 60 deletions(-)
+
+diff --git a/src/gallium/drivers/radeonsi/si_pipe.h b/src/gallium/drivers/radeonsi/si_pipe.h
+index 2ebbea437b74a..87c2ad71062c1 100644
+--- a/src/gallium/drivers/radeonsi/si_pipe.h
++++ b/src/gallium/drivers/radeonsi/si_pipe.h
+@@ -1635,7 +1635,7 @@ union si_compute_blit_shader_key {
+ 
+ void *si_create_blit_cs(struct si_context *sctx, const union si_compute_blit_shader_key *options);
+ 
+-/* si_shaderlib_tgsi.c */
++/* si_shaderlib_nir.c */
+ void *si_get_blitter_vs(struct si_context *sctx, enum blitter_attrib_type type,
+                         unsigned num_layers);
+ void *si_create_dma_compute_shader(struct si_context *sctx, unsigned num_dwords_per_thread,
+@@ -1644,6 +1644,8 @@ void *si_create_clear_buffer_rmw_cs(struct si_context *sctx);
+ void *si_clear_render_target_shader(struct si_context *sctx, enum pipe_texture_target type);
+ void *si_clear_12bytes_buffer_shader(struct si_context *sctx);
+ void *si_create_fmask_expand_cs(struct si_context *sctx, unsigned num_samples, bool is_array);
++
++/* si_shaderlib_tgsi.c */
+ void *si_create_query_result_cs(struct si_context *sctx);
+ void *gfx11_create_sh_query_result_cs(struct si_context *sctx);
+ 
+diff --git a/src/gallium/drivers/radeonsi/si_shaderlib_nir.c b/src/gallium/drivers/radeonsi/si_shaderlib_nir.c
+index 5eaf8ef6f66da..f2c64ab6bef68 100644
+--- a/src/gallium/drivers/radeonsi/si_shaderlib_nir.c
++++ b/src/gallium/drivers/radeonsi/si_shaderlib_nir.c
+@@ -772,3 +772,76 @@ void *si_create_fmask_expand_cs(struct si_context *sctx, unsigned num_samples, b
+ 
+    return create_shader_state(sctx, b.shader);
+ }
++
++/* This is just a pass-through shader with 1-3 MOV instructions. */
++void *si_get_blitter_vs(struct si_context *sctx, enum blitter_attrib_type type, unsigned num_layers)
++{
++   unsigned vs_blit_property;
++   void **vs;
++
++   switch (type) {
++   case UTIL_BLITTER_ATTRIB_NONE:
++      vs = num_layers > 1 ? &sctx->vs_blit_pos_layered : &sctx->vs_blit_pos;
++      vs_blit_property = SI_VS_BLIT_SGPRS_POS;
++      break;
++   case UTIL_BLITTER_ATTRIB_COLOR:
++      vs = num_layers > 1 ? &sctx->vs_blit_color_layered : &sctx->vs_blit_color;
++      vs_blit_property = SI_VS_BLIT_SGPRS_POS_COLOR;
++      break;
++   case UTIL_BLITTER_ATTRIB_TEXCOORD_XY:
++   case UTIL_BLITTER_ATTRIB_TEXCOORD_XYZW:
++      assert(num_layers == 1);
++      vs = &sctx->vs_blit_texcoord;
++      vs_blit_property = SI_VS_BLIT_SGPRS_POS_TEXCOORD;
++      break;
++   default:
++      assert(0);
++      return NULL;
++   }
++
++   if (*vs)
++      return *vs;
++
++   /* Add 1 for the attribute ring address. */
++   if (sctx->gfx_level >= GFX11 && type != UTIL_BLITTER_ATTRIB_NONE)
++      vs_blit_property++;
++
++   const nir_shader_compiler_options *options =
++      sctx->b.screen->get_compiler_options(sctx->b.screen, PIPE_SHADER_IR_NIR, PIPE_SHADER_VERTEX);
++
++   nir_builder b =
++   nir_builder_init_simple_shader(MESA_SHADER_VERTEX, options, "get_blitter_vs");
++
++   /* Tell the shader to load VS inputs from SGPRs: */
++   b.shader->info.vs.blit_sgprs_amd = vs_blit_property;
++   b.shader->info.vs.window_space_position = true;
++
++   const struct glsl_type *vec4 = glsl_vec4_type();
++
++   nir_copy_var(&b,
++                nir_create_variable_with_location(b.shader, nir_var_shader_out,
++                                                  VARYING_SLOT_POS, vec4),
++                nir_create_variable_with_location(b.shader, nir_var_shader_in,
++                                                  VERT_ATTRIB_GENERIC0, vec4));
++
++   if (type != UTIL_BLITTER_ATTRIB_NONE) {
++      nir_copy_var(&b,
++                   nir_create_variable_with_location(b.shader, nir_var_shader_out,
++                                                     VARYING_SLOT_VAR0, vec4),
++                   nir_create_variable_with_location(b.shader, nir_var_shader_in,
++                                                     VERT_ATTRIB_GENERIC1, vec4));
++   }
++
++   if (num_layers > 1) {
++      nir_variable *out_layer =
++      nir_create_variable_with_location(b.shader, nir_var_shader_out, VARYING_SLOT_LAYER, glsl_int_type());
++      out_layer->data.interpolation = INTERP_MODE_NONE;
++
++      nir_copy_var(&b, out_layer,
++                   nir_create_variable_with_location(b.shader, nir_var_system_value,
++                                                     SYSTEM_VALUE_INSTANCE_ID, glsl_int_type()));
++   }
++
++   *vs = create_shader_state(sctx, b.shader);
++   return *vs;
++}
+diff --git a/src/gallium/drivers/radeonsi/si_shaderlib_tgsi.c b/src/gallium/drivers/radeonsi/si_shaderlib_tgsi.c
+index 7339271587466..13acc4eefc7f1 100644
+--- a/src/gallium/drivers/radeonsi/si_shaderlib_tgsi.c
++++ b/src/gallium/drivers/radeonsi/si_shaderlib_tgsi.c
+@@ -8,65 +8,6 @@
+ #include "tgsi/tgsi_text.h"
+ #include "tgsi/tgsi_ureg.h"
+ 
+-void *si_get_blitter_vs(struct si_context *sctx, enum blitter_attrib_type type, unsigned num_layers)
+-{
+-   unsigned vs_blit_property;
+-   void **vs;
+-
+-   switch (type) {
+-   case UTIL_BLITTER_ATTRIB_NONE:
+-      vs = num_layers > 1 ? &sctx->vs_blit_pos_layered : &sctx->vs_blit_pos;
+-      vs_blit_property = SI_VS_BLIT_SGPRS_POS;
+-      break;
+-   case UTIL_BLITTER_ATTRIB_COLOR:
+-      vs = num_layers > 1 ? &sctx->vs_blit_color_layered : &sctx->vs_blit_color;
+-      vs_blit_property = SI_VS_BLIT_SGPRS_POS_COLOR;
+-      break;
+-   case UTIL_BLITTER_ATTRIB_TEXCOORD_XY:
+-   case UTIL_BLITTER_ATTRIB_TEXCOORD_XYZW:
+-      assert(num_layers == 1);
+-      vs = &sctx->vs_blit_texcoord;
+-      vs_blit_property = SI_VS_BLIT_SGPRS_POS_TEXCOORD;
+-      break;
+-   default:
+-      assert(0);
+-      return NULL;
+-   }
+-   if (*vs)
+-      return *vs;
+-
+-   struct ureg_program *ureg = ureg_create(PIPE_SHADER_VERTEX);
+-   if (!ureg)
+-      return NULL;
+-
+-   /* Add 1 for the attribute ring address. */
+-   if (sctx->gfx_level >= GFX11 && type != UTIL_BLITTER_ATTRIB_NONE)
+-      vs_blit_property++;
+-
+-   /* Tell the shader to load VS inputs from SGPRs: */
+-   ureg_property(ureg, TGSI_PROPERTY_VS_BLIT_SGPRS_AMD, vs_blit_property);
+-   ureg_property(ureg, TGSI_PROPERTY_VS_WINDOW_SPACE_POSITION, true);
+-
+-   /* This is just a pass-through shader with 1-3 MOV instructions. */
+-   ureg_MOV(ureg, ureg_DECL_output(ureg, TGSI_SEMANTIC_POSITION, 0), ureg_DECL_vs_input(ureg, 0));
+-
+-   if (type != UTIL_BLITTER_ATTRIB_NONE) {
+-      ureg_MOV(ureg, ureg_DECL_output(ureg, TGSI_SEMANTIC_GENERIC, 0), ureg_DECL_vs_input(ureg, 1));
+-   }
+-
+-   if (num_layers > 1) {
+-      struct ureg_src instance_id = ureg_DECL_system_value(ureg, TGSI_SEMANTIC_INSTANCEID, 0);
+-      struct ureg_dst layer = ureg_DECL_output(ureg, TGSI_SEMANTIC_LAYER, 0);
+-
+-      ureg_MOV(ureg, ureg_writemask(layer, TGSI_WRITEMASK_X),
+-               ureg_scalar(instance_id, TGSI_SWIZZLE_X));
+-   }
+-   ureg_END(ureg);
+-
+-   *vs = ureg_create_shader_and_destroy(ureg, &sctx->b);
+-   return *vs;
+-}
+-
+ /* Create the compute shader that is used to collect the results.
+  *
+  * One compute grid with a single thread is launched for every query result
+-- 
+GitLab
+
