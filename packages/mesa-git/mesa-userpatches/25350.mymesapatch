@@ -1,0 +1,143 @@
+From eccb7dbeae8d8bd524a891bd540225f8aedc1147 Mon Sep 17 00:00:00 2001
+From: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+Date: Wed, 11 Oct 2023 14:41:49 +0200
+Subject: [PATCH 1/2] radv: only initialize DB_{z,stencil}_{read/write}_BASE
+ when needed
+
+Otherwise, the hw seems confused if for example, only the depth aspect
+of a depth/stencil image is copied, although the depth format is
+INVALID. This prevents regressions in the next commit.
+
+This matches PAL.
+
+Signed-off-by: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+---
+ src/amd/vulkan/radv_device.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+index 73783403f5bf..c4814ea1e64b 100644
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -1993,8 +1993,11 @@ radv_initialise_ds_surface(const struct radv_device *device, struct radv_ds_buff
+       }
+    }
+ 
+-   ds->db_z_read_base = ds->db_z_write_base = z_offs >> 8;
+-   ds->db_stencil_read_base = ds->db_stencil_write_base = s_offs >> 8;
++   if (format != V_028040_Z_INVALID)
++      ds->db_z_read_base = ds->db_z_write_base = z_offs >> 8;
++
++   if (stencil_format != V_028044_STENCIL_INVALID)
++      ds->db_stencil_read_base = ds->db_stencil_write_base = s_offs >> 8;
+ }
+ 
+ void
+-- 
+GitLab
+
+
+From 449d99215c9756286a54dbf49a5f6821ccb0dc9f Mon Sep 17 00:00:00 2001
+From: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+Date: Fri, 22 Sep 2023 16:25:26 +0200
+Subject: [PATCH 2/2] radv: fix binding partial depth/stencil views with
+ dynamic rendering
+
+With dynamic rendering, it's allowed to begin rendering with depth or
+stencil only but still with a depth/stencil format. The test below
+checks that unbound part of ds isn't modified, if depth is bound and
+stencil not and vice versa.
+
+This moves the ds surface initialization back to begin rendering
+because otherwise it would be too messy.
+
+This fixes a recent CTS
+dEQP-VK.dynamic_rendering.primary_cmd_buff.basic.partial_binding_depth_stencil,
+except on GFX9 due to the mentioned hw bug which is hard to workaround.
+
+Signed-off-by: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+---
+ src/amd/vulkan/radv_cmd_buffer.c | 20 ++++++++++++++++++--
+ src/amd/vulkan/radv_device.c     | 11 ++++++-----
+ src/amd/vulkan/radv_private.h    |  2 +-
+ 3 files changed, 25 insertions(+), 8 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index bfd4b5c38652..6d9382e0fd07 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -7743,8 +7743,24 @@ radv_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRe
+       }
+ 
+       assert(d_iview == NULL || s_iview == NULL || d_iview == s_iview);
+-      ds_att.iview = d_iview ? d_iview : s_iview, ds_att.format = ds_att.iview->vk.format;
+-      radv_initialise_ds_surface(cmd_buffer->device, &ds_att.ds, ds_att.iview);
++      ds_att.iview = d_iview ? d_iview : s_iview;
++
++      if (d_iview && s_iview) {
++         ds_att.format = ds_att.iview->vk.format;
++      } else if (d_iview) {
++         ds_att.format = vk_format_depth_only(ds_att.iview->vk.format);
++      } else {
++         ds_att.format = vk_format_stencil_only(ds_att.iview->vk.format);
++
++         /* FIXME: GFX9 seems to be affected by a hw bug where compression for a depth/stencil image
++          * should be disabled for a stencil-only view (see waDisableSCompressOnly in PAL).
++          */
++         if (cmd_buffer->device->physical_device->rad_info.gfx_level == GFX9) {
++            ds_att.format = ds_att.iview->vk.format;
++         }
++      }
++
++      radv_initialise_ds_surface(cmd_buffer->device, &ds_att.ds, ds_att.iview, ds_att.format);
+ 
+       assert(d_res_iview == NULL || s_res_iview == NULL || d_res_iview == s_res_iview);
+       ds_att.resolve_iview = d_res_iview ? d_res_iview : s_res_iview;
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+index c4814ea1e64b..313d82e5191f 100644
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -1830,21 +1830,22 @@ radv_initialise_vrs_surface(struct radv_image *image, struct radv_buffer *htile_
+ 
+ void
+ radv_initialise_ds_surface(const struct radv_device *device, struct radv_ds_buffer_info *ds,
+-                           struct radv_image_view *iview)
++                           struct radv_image_view *iview, VkFormat ds_format)
+ {
+    unsigned level = iview->vk.base_mip_level;
+    unsigned format, stencil_format;
+    uint64_t va, s_offs, z_offs;
+-   bool stencil_only = iview->image->vk.format == VK_FORMAT_S8_UINT;
++   bool stencil_only = ds_format == VK_FORMAT_S8_UINT;
+    const struct radv_image_plane *plane = &iview->image->planes[0];
+    const struct radeon_surf *surf = &plane->surface;
+ 
+-   assert(vk_format_get_plane_count(iview->image->vk.format) == 1);
++   assert(vk_format_get_plane_count(ds_format) == 1);
+ 
+    memset(ds, 0, sizeof(*ds));
+ 
+-   format = radv_translate_dbformat(iview->image->vk.format);
+-   stencil_format = surf->has_stencil ? V_028044_STENCIL_8 : V_028044_STENCIL_INVALID;
++   format = radv_translate_dbformat(ds_format);
++   stencil_format =
++      vk_format_has_stencil(ds_format) && surf->has_stencil ? V_028044_STENCIL_8 : V_028044_STENCIL_INVALID;
+ 
+    uint32_t max_slice = radv_surface_max_layer_count(iview) - 1;
+    ds->db_depth_view = S_028008_SLICE_START(iview->vk.base_array_layer) | S_028008_SLICE_MAX(max_slice);
+diff --git a/src/amd/vulkan/radv_private.h b/src/amd/vulkan/radv_private.h
+index c87cd06bebbc..d1335edfc7be 100644
+--- a/src/amd/vulkan/radv_private.h
++++ b/src/amd/vulkan/radv_private.h
+@@ -1522,7 +1522,7 @@ struct radv_ds_buffer_info {
+ void radv_initialise_color_surface(struct radv_device *device, struct radv_color_buffer_info *cb,
+                                    struct radv_image_view *iview);
+ void radv_initialise_ds_surface(const struct radv_device *device, struct radv_ds_buffer_info *ds,
+-                                struct radv_image_view *iview);
++                                struct radv_image_view *iview, VkFormat ds_format);
+ void radv_initialise_vrs_surface(struct radv_image *image, struct radv_buffer *htile_buffer,
+                                  struct radv_ds_buffer_info *ds);
+ 
+-- 
+GitLab
+
