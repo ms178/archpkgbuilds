@@ -123,8 +123,10 @@ xdg-desktop-portal-kde-main \
 ark-main \
 baloo-widgets-main \
 kaccounts-integration-main \
+kdsoap-main \
 kio-extras-main \
 kwalletmanager-main \
+libkdcraw-main \
 signon-kwallet-extension-main \
 spectacle-main \
 ; do
