@@ -9022,151 +9022,6 @@ index 4e787285fc66..3e045f6eb6ee 100644
 
  /*
 
-SRCU callbacks acceleration might fail if the preceding callbacks
-advance also fails. This can happen when the following steps are met:
-
-1) The RCU_WAIT_TAIL segment has callbacks (say for gp_num 8) and the
-   RCU_NEXT_READY_TAIL also has callbacks (say for gp_num 12).
-
-2) The grace period for RCU_WAIT_TAIL is observed as started but not yet
-   completed so rcu_seq_current() returns 4 + SRCU_STATE_SCAN1 = 5.
-
-3) This value is passed to rcu_segcblist_advance() which can't move
-   any segment forward and fails.
-
-4) srcu_gp_start_if_needed() still proceeds with callback acceleration.
-   But then the call to rcu_seq_snap() observes the grace period for the
-   RCU_WAIT_TAIL segment (gp_num 8) as completed and the subsequent one
-   for the RCU_NEXT_READY_TAIL segment as started
-   (ie: 8 + SRCU_STATE_SCAN1 = 9) so it returns a snapshot of the
-   next grace period, which is 16.
-
-5) The value of 16 is passed to rcu_segcblist_accelerate() but the
-   freshly enqueued callback in RCU_NEXT_TAIL can't move to
-   RCU_NEXT_READY_TAIL which already has callbacks for a previous grace
-   period (gp_num = 12). So acceleration fails.
-
-6) Note in all these steps, srcu_invoke_callbacks() hadn't had a chance
-   to run srcu_invoke_callbacks().
-
-Then some very bad outcome may happen if the following happens:
-
-7) Some other CPU races and starts the grace period number 16 before the
-   CPU handling previous steps had a chance. Therefore srcu_gp_start()
-   isn't called on the latter sdp to fix the acceleration leak from
-   previous steps with a new pair of call to advance/accelerate.
-
-8) The grace period 16 completes and srcu_invoke_callbacks() is finally
-   called. All the callbacks from previous grace periods (8 and 12) are
-   correctly advanced and executed but callbacks in RCU_NEXT_READY_TAIL
-   still remain. Then rcu_segcblist_accelerate() is called with a
-   snaphot of 20.
-
-9) Since nothing started the grace period number 20, callbacks stay
-   unhandled.
-
-This has been reported in real load:
-
-	[3144162.608392] INFO: task kworker/136:12:252684 blocked for more
-	than 122 seconds.
-	[3144162.615986]       Tainted: G           O  K   5.4.203-1-tlinux4-0011.1 #1
-	[3144162.623053] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs"
-	disables this message.
-	[3144162.631162] kworker/136:12  D    0 252684      2 0x90004000
-	[3144162.631189] Workqueue: kvm-irqfd-cleanup irqfd_shutdown [kvm]
-	[3144162.631192] Call Trace:
-	[3144162.631202]  __schedule+0x2ee/0x660
-	[3144162.631206]  schedule+0x33/0xa0
-	[3144162.631209]  schedule_timeout+0x1c4/0x340
-	[3144162.631214]  ? update_load_avg+0x82/0x660
-	[3144162.631217]  ? raw_spin_rq_lock_nested+0x1f/0x30
-	[3144162.631218]  wait_for_completion+0x119/0x180
-	[3144162.631220]  ? wake_up_q+0x80/0x80
-	[3144162.631224]  __synchronize_srcu.part.19+0x81/0xb0
-	[3144162.631226]  ? __bpf_trace_rcu_utilization+0x10/0x10
-	[3144162.631227]  synchronize_srcu+0x5f/0xc0
-	[3144162.631236]  irqfd_shutdown+0x3c/0xb0 [kvm]
-	[3144162.631239]  ? __schedule+0x2f6/0x660
-	[3144162.631243]  process_one_work+0x19a/0x3a0
-	[3144162.631244]  worker_thread+0x37/0x3a0
-	[3144162.631247]  kthread+0x117/0x140
-	[3144162.631247]  ? process_one_work+0x3a0/0x3a0
-	[3144162.631248]  ? __kthread_cancel_work+0x40/0x40
-	[3144162.631250]  ret_from_fork+0x1f/0x30
-
-Fix this with taking the snapshot for acceleration _before_ the read
-of the current grace period number.
-
-The only side effect of this solution is that callbacks advancing happen
-then _after_ the full barrier in rcu_seq_snap(). This is not a problem
-because that barrier only cares about:
-
-1) Ordering accesses of the update side before call_srcu() so they don't
-   bleed.
-2) See all the accesses prior to the grace period of the current gp_num
-
-The only things callbacks advancing need to be ordered against are
-carried by snp locking.
-
-Reported-by: Yong He <zhuangel570@xxxxxxxxx>
-Co-developed-by: Yong He <zhuangel570@xxxxxxxxx>
-Co-developed-by: Joel Fernandes <joel@xxxxxxxxxxxxxxxxx>
-Co-developed-by: Neeraj upadhyay <neeraj.iitr10@xxxxxxxxx>
-Link: http://lore.kernel.org/CANZk6aR+CqZaqmMWrC2eRRPY12qAZnDZLwLnHZbNi=xXMB401g@xxxxxxxxxxxxxx
-Fixes: da915ad5cf25 ("srcu: Parallelize callback handling")
-Signed-off-by: Frederic Weisbecker <frederic@xxxxxxxxxx>
----
- kernel/rcu/srcutree.c | 33 ++++++++++++++++++++++++++++++---
- 1 file changed, 30 insertions(+), 3 deletions(-)
-
-diff --git a/kernel/rcu/srcutree.c b/kernel/rcu/srcutree.c
-index 5602042856b1..9fab9ac36996 100644
---- a/kernel/rcu/srcutree.c
-+++ b/kernel/rcu/srcutree.c
-@@ -1244,10 +1244,37 @@ static unsigned long srcu_gp_start_if_needed(struct srcu_struct *ssp,
- 	spin_lock_irqsave_sdp_contention(sdp, &flags);
- 	if (rhp)
- 		rcu_segcblist_enqueue(&sdp->srcu_cblist, rhp);
--	rcu_segcblist_advance(&sdp->srcu_cblist,
--			      rcu_seq_current(&ssp->srcu_sup->srcu_gp_seq));
-+	/*
-+	 * The snapshot for acceleration must be taken _before_ the read of the
-+	 * current gp sequence used for advancing, otherwise advancing may fail
-+	 * and acceleration may then fail too.
-+	 *
-+	 * This could happen if:
-+	 *
-+	 *  1) The RCU_WAIT_TAIL segment has callbacks (gp_num = X + 4) and the
-+	 *     RCU_NEXT_READY_TAIL also has callbacks (gp_num = X + 8).
-+	 *
-+	 *  2) The grace period for RCU_WAIT_TAIL is seen as started but not
-+	 *     completed so rcu_seq_current() returns X + SRCU_STATE_SCAN1.
-+	 *
-+	 *  3) This value is passed to rcu_segcblist_advance() which can't move
-+	 *     any segment forward and fails.
-+	 *
-+	 *  4) srcu_gp_start_if_needed() still proceeds with callback acceleration.
-+	 *     But then the call to rcu_seq_snap() observes the grace period for the
-+	 *     RCU_WAIT_TAIL segment as completed and the subsequent one for the
-+	 *     RCU_NEXT_READY_TAIL segment as started (ie: X + 4 + SRCU_STATE_SCAN1)
-+	 *     so it returns a snapshot of the next grace period, which is X + 12.
-+	 *
-+	 *  5) The value of X + 12 is passed to rcu_segcblist_accelerate() but the
-+	 *     freshly enqueued callback in RCU_NEXT_TAIL can't move to
-+	 *     RCU_NEXT_READY_TAIL which already has callbacks for a previous grace
-+	 *     period (gp_num = X + 8). So acceleration fails.
-+	 */
- 	s = rcu_seq_snap(&ssp->srcu_sup->srcu_gp_seq);
--	(void)rcu_segcblist_accelerate(&sdp->srcu_cblist, s);
-+	rcu_segcblist_advance(&sdp->srcu_cblist,
-+			      rcu_seq_current(&ssp->srcu_sup->srcu_gp_seq));
-+	WARN_ON_ONCE(!rcu_segcblist_accelerate(&sdp->srcu_cblist, s) && rhp);
- 	if (ULONG_CMP_LT(sdp->srcu_gp_seq_needed, s)) {
- 		sdp->srcu_gp_seq_needed = s;
- 		needgp = true;
---
-2.41.0
-
 Acceleration in SRCU happens on enqueue time for each new callback. This
 operation is expected not to fail and therefore any similar attempt
 from other places shouldn't find any remaining callbacks to accelerate.
@@ -21119,51 +20974,6 @@ index bb7368047103..89d3f7a18a73 100644
 --
 2.20.1
 
-Currently, noinc writes are cached as if they were standard incrementing
-writes, overwriting unrelated register values in the cache. Instead, we
-want to cache the last value written to the register, as is done in the
-accelerated noinc handler (regmap_noinc_readwrite).
-
-Fixes: cdf6b11daa77 ("regmap: Add regmap_noinc_write API")
-Signed-off-by: Ben Wolsieffer <ben.wolsieffer@xxxxxxxxxxx>
----
- drivers/base/regmap/regmap.c | 16 +++++++++-------
- 1 file changed, 9 insertions(+), 7 deletions(-)
-
-diff --git a/drivers/base/regmap/regmap.c b/drivers/base/regmap/regmap.c
-index 234a84ecde8b..ea6157747199 100644
---- a/drivers/base/regmap/regmap.c
-+++ b/drivers/base/regmap/regmap.c
-@@ -1620,17 +1620,19 @@ static int _regmap_raw_write_impl(struct regmap *map, unsigned int reg,
- 	}
-
- 	if (!map->cache_bypass && map->format.parse_val) {
--		unsigned int ival;
-+		unsigned int ival, offset;
- 		int val_bytes = map->format.val_bytes;
--		for (i = 0; i < val_len / val_bytes; i++) {
--			ival = map->format.parse_val(val + (i * val_bytes));
--			ret = regcache_write(map,
--					     reg + regmap_get_offset(map, i),
--					     ival);
-+
-+		/* Cache the last written value for noinc writes */
-+		i = noinc ? val_len - val_bytes : 0;
-+		for (; i < val_len; i += val_bytes) {
-+			ival = map->format.parse_val(val + i);
-+			offset = noinc ? 0 : regmap_get_offset(map, i / val_bytes);
-+			ret = regcache_write(map, reg + offset, ival);
- 			if (ret) {
- 				dev_err(map->dev,
- 					"Error in caching of register: %x ret: %d\n",
--					reg + regmap_get_offset(map, i), ret);
-+					reg + offset, ret);
- 				return ret;
- 			}
- 		}
---
-2.42.0
-
 The struct xhci_interval_bw can be reordered to shrink it from 40 to 32
 bytes.
 This makes sense because it is used in struct xhci_interval_bw_table in an
@@ -25442,3 +25252,573 @@ index af7952f12e6c..8e6d9bf351c2 100644
 
 --
 2.39.3
+
+The code in common_interrupt_return() does a bunch of unconditional
+work that is really only needed on PTI kernels. Specifically it
+unconditionally copies the IRET frame back onto the entry stack,
+swizzles onto the entry stack and does IRET from there.
+
+However, without PTI we can simply IRET from whatever stack we're on.
+
+ivb-ep, mitigations=off, gettid-1m:
+
+PRE:
+       140,118,538      cycles:k                                                      ( +-  0.01% )
+       236,692,878      instructions:k            #    1.69  insn per cycle           ( +-  0.00% )
+
+POST:
+       140,026,608      cycles:k                                                      ( +-  0.01% )
+       236,696,176      instructions:k            #    1.69  insn per cycle           ( +-  0.00% )
+
+(this is with --repeat 100 and the run-to-run variance is bigger than
+the difference shown)
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@xxxxxxxxxxxxx>
+---
+ arch/x86/entry/calling.h  |   12 +++++++++---
+ arch/x86/entry/entry_64.S |   17 +++++++++++++++--
+ 2 files changed, 24 insertions(+), 5 deletions(-)
+
+--- a/arch/x86/entry/calling.h
++++ b/arch/x86/entry/calling.h
+@@ -175,8 +175,7 @@ For 32-bit we have the following convent
+ #define THIS_CPU_user_pcid_flush_mask   \
+ 	PER_CPU_VAR(cpu_tlbstate + TLB_STATE_user_pcid_flush_mask)
+
+-.macro SWITCH_TO_USER_CR3_NOSTACK scratch_reg:req scratch_reg2:req
+-	ALTERNATIVE "jmp .Lend_\@", "", X86_FEATURE_PTI
++.macro SWITCH_TO_USER_CR3 scratch_reg:req scratch_reg2:req
+ 	mov	%cr3, \scratch_reg
+
+ 	ALTERNATIVE "jmp .Lwrcr3_\@", "", X86_FEATURE_PCID
+@@ -206,13 +205,20 @@ For 32-bit we have the following convent
+ 	/* Flip the PGD to the user version */
+ 	orq     $(PTI_USER_PGTABLE_MASK), \scratch_reg
+ 	mov	\scratch_reg, %cr3
++.endm
++
++.macro SWITCH_TO_USER_CR3_NOSTACK scratch_reg:req scratch_reg2:req
++	ALTERNATIVE "jmp .Lend_\@", "", X86_FEATURE_PTI
++	SWITCH_TO_USER_CR3 \scratch_reg \scratch_reg2
+ .Lend_\@:
+ .endm
+
+ .macro SWITCH_TO_USER_CR3_STACK	scratch_reg:req
++	ALTERNATIVE "jmp .Lend_\@", "", X86_FEATURE_PTI
+ 	pushq	%rax
+-	SWITCH_TO_USER_CR3_NOSTACK scratch_reg=\scratch_reg scratch_reg2=%rax
++	SWITCH_TO_USER_CR3 scratch_reg=\scratch_reg scratch_reg2=%rax
+ 	popq	%rax
++.Lend_\@:
+ .endm
+
+ .macro SAVE_AND_SWITCH_TO_KERNEL_CR3 scratch_reg:req save_reg:req
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@ -569,7 +569,18 @@ SYM_INNER_LABEL(swapgs_restore_regs_and_
+ #ifdef CONFIG_XEN_PV
+ 	ALTERNATIVE "", "jmp xenpv_restore_regs_and_return_to_usermode", X86_FEATURE_XENPV
+ #endif
++#ifdef CONFIG_PAGE_TABLE_ISOLATION
++	ALTERNATIVE "", "jmp .Lpti_restore_regs_and_return_to_usermode", X86_FEATURE_PTI
++#endif
++
++	STACKLEAK_ERASE
++	POP_REGS
++	add	$8, %rsp	/* orig_ax */
++	swapgs
++	jmp	.Lnative_iret
+
++#ifdef CONFIG_PAGE_TABLE_ISOLATION
++.Lpti_restore_regs_and_return_to_usermode:
+ 	POP_REGS pop_rdi=0
+
+ 	/*
+@@ -596,13 +607,15 @@ SYM_INNER_LABEL(swapgs_restore_regs_and_
+ 	 */
+ 	STACKLEAK_ERASE_NOCLOBBER
+
+-	SWITCH_TO_USER_CR3_STACK scratch_reg=%rdi
++	push	%rax
++	SWITCH_TO_USER_CR3 scratch_reg=%rdi scratch_reg2=%rax
++	pop	%rax
+
+ 	/* Restore RDI. */
+ 	popq	%rdi
+ 	swapgs
+ 	jmp	.Lnative_iret
+-
++#endif
+
+ SYM_INNER_LABEL(restore_regs_and_return_to_kernel, SYM_L_GLOBAL)
+ #ifdef CONFIG_DEBUG_ENTRY
+
+Return AMDGPU_BO_INVALID_OFFSET if the AGP aperture is disabled.
+There is no reason to check further if the aperture is disabled.
+
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+index 5f71414190e9..0f85f906791b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+@@ -181,6 +181,9 @@ uint64_t amdgpu_gmc_agp_addr(struct ttm_buffer_object *bo)
+ {
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->bdev);
+
++	if (!adev->gmc.agp_size)
++		return AMDGPU_BO_INVALID_OFFSET;
++
+ 	if (bo->ttm->num_pages != 1 || bo->ttm->caching == ttm_cached)
+ 		return AMDGPU_BO_INVALID_OFFSET;
+
+--
+2.42.0
+
+This worked by luck if the GART aperture ended up at 0.  When
+we ended up moving GART on some chips, the GART aperture ended
+up offsetting the the AGP address since the resource->start is
+a GART offset, not an MC address.  Fix this by moving the AGP
+address setup into amdgpu_bo_gpu_offset_no_check().
+
+v2: check mem_type before checking agp
+v3: check if the ttm bo has a ttm_tt allocated yet
+
+Fixes: 67318cb84341 ("drm/amdgpu/gmc11: set gart placement GC11")
+Tested-by: Mario Limonciello <mario.limonciello at amd.com>
+Reported-by: Jesse Zhang <Jesse.Zhang at amd.com>
+Reported-by: Yifan Zhang <yifan1.zhang at amd.com>
+Reviewed-by: Christian König <christian.koenig at amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher at amd.com>
+Cc: christian.koenig at amd.com
+Cc: mario.limonciello at amd.com
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c    |  3 +++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c | 10 +++++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c    |  4 +---
+ 3 files changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+index 0f85f906791b..a0dda572e490 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+@@ -184,6 +184,9 @@ uint64_t amdgpu_gmc_agp_addr(struct ttm_buffer_object *bo)
+ 	if (!adev->gmc.agp_size)
+ 		return AMDGPU_BO_INVALID_OFFSET;
+
++	if (!bo->ttm)
++		return AMDGPU_BO_INVALID_OFFSET;
++
+ 	if (bo->ttm->num_pages != 1 || bo->ttm->caching == ttm_cached)
+ 		return AMDGPU_BO_INVALID_OFFSET;
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index c938648de853..c24f7b2c04c1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -1538,10 +1538,14 @@ u64 amdgpu_bo_gpu_offset(struct amdgpu_bo *bo)
+ u64 amdgpu_bo_gpu_offset_no_check(struct amdgpu_bo *bo)
+ {
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
+-	uint64_t offset;
++	uint64_t offset = AMDGPU_BO_INVALID_OFFSET;
+
+-	offset = (bo->tbo.resource->start << PAGE_SHIFT) +
+-		 amdgpu_ttm_domain_start(adev, bo->tbo.resource->mem_type);
++	if (bo->tbo.resource->mem_type == TTM_PL_TT)
++		offset = amdgpu_gmc_agp_addr(&bo->tbo);
++
++	if (offset == AMDGPU_BO_INVALID_OFFSET)
++		offset = (bo->tbo.resource->start << PAGE_SHIFT) +
++			amdgpu_ttm_domain_start(adev, bo->tbo.resource->mem_type);
+
+ 	return amdgpu_gmc_sign_extend(offset);
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 05991c5c8ddb..ab4a762aed5b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -959,10 +959,8 @@ int amdgpu_ttm_alloc_gart(struct ttm_buffer_object *bo)
+ 		return 0;
+
+ 	addr = amdgpu_gmc_agp_addr(bo);
+-	if (addr != AMDGPU_BO_INVALID_OFFSET) {
+-		bo->resource->start = addr >> PAGE_SHIFT;
++	if (addr != AMDGPU_BO_INVALID_OFFSET)
+ 		return 0;
+-	}
+
+ 	/* allocate GART space */
+ 	placement.num_placement = 1;
+--
+2.42.0
+
+The cache hot duration is calculated by the average sleeping
+time of a task, which is the time delta between the task
+being dequeued and enqueued.
+
+The cache hot duration of a task is introduced to describe
+how soon this dequeue task could be woken up. During this
+cache hot period, the task's previous CPU is regarded as
+still cache-hot for the task. This information will be used
+by SIS_CACHE to improve cache locality for short-sleeping tasks.
+
+Suggested-by: Mathieu Desnoyers <mathieu.desnoyers@xxxxxxxxxxxx>
+Suggested-by: Aaron Lu <aaron.lu@xxxxxxxxx>
+Reviewed-by: Mathieu Desnoyers <mathieu.desnoyers@xxxxxxxxxxxx>
+Signed-off-by: Chen Yu <yu.c.chen@xxxxxxxxx>
+---
+ include/linux/sched.h |  4 ++++
+ kernel/sched/fair.c   | 39 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 43 insertions(+)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 8d258162deb0..7d0fafd29345 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1347,6 +1347,10 @@ struct task_struct {
+ 	struct callback_head		cid_work;
+ #endif
+
++	u64				last_dequeue_time;
++	u64				avg_hot_dur;	/* Average cache hot duration */
++	int				last_dequeue_cpu;
++
+ 	struct tlbflush_unmap_batch	tlb_ubc;
+
+ 	/* Cache last used pipe for splice(): */
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 53e7bf2ccc44..672616503e35 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -6667,6 +6667,36 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 	struct sched_entity *se = &p->se;
+ 	int idle_h_nr_running = task_has_idle_policy(p);
+ 	int task_new = !(flags & ENQUEUE_WAKEUP);
++	u64 last_dequeue = p->last_dequeue_time;
++
++	if ((flags & ENQUEUE_WAKEUP) && last_dequeue &&
++	    cpu_online(p->last_dequeue_cpu)) {
++		/*
++		 * The enqueue task_cpu(p) has already been assigned
++		 * with a new one. Need to calculate the task's sleeping
++		 * time based on its previous running CPU.
++		 */
++		u64 now = sched_clock_cpu(p->last_dequeue_cpu);
++
++		/*
++		 * Record the task's short sleep time. This sleep time
++		 * indicates how soon this task might be woken up again.
++		 * The task's previous running CPU is regarded as cache-hot
++		 * in the sleep time. So, define the average sleep time of
++		 * the task as its cache-hot duration. The SIS could leverage
++		 * the cache-hot duration for better idle CPU selection.
++		 * This improves cache locality for short-sleeping tasks.
++		 *
++		 * If the sleep time is longer than sysctl_sched_migration_cost,
++		 * give the cache hot duration a penalty by cutting it to half.
++		 */
++		if (now > last_dequeue) {
++			if (now - last_dequeue < sysctl_sched_migration_cost)
++				update_avg(&p->avg_hot_dur, now - last_dequeue);
++			else
++				p->avg_hot_dur >>= 1;
++		}
++	}
+
+ 	/*
+ 	 * The code below (indirectly) updates schedutil which looks at
+@@ -6821,6 +6851,15 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+
+ dequeue_throttle:
+ 	util_est_update(&rq->cfs, p, task_sleep);
++
++	if (task_sleep) {
++		p->last_dequeue_time = sched_clock_cpu(cpu_of(rq));
++		p->last_dequeue_cpu = cpu_of(rq);
++	} else {
++		/* 0 indicates the dequeue is not caused by sleep */
++		p->last_dequeue_time = 0;
++	}
++
+ 	hrtick_update(rq);
+ }
+
+--
+2.25.1
+
+When a CPU is about to become idle due to task dequeue, uses
+the dequeued task's average sleep time to set the cache
+hot timeout of this idle CPU. This information can facilitate
+SIS to skip the cache-hot idle CPU and scan for the next
+cache-cold one. When that task is woken up again, it can choose
+its previous CPU and reuses its hot-cache.
+
+This is a preparation for the next patch to introduce SIS_CACHE
+based task wakeup.
+
+Signed-off-by: Chen Yu <yu.c.chen@xxxxxxxxx>
+---
+ kernel/sched/fair.c     | 30 +++++++++++++++++++++++++++++-
+ kernel/sched/features.h |  1 +
+ kernel/sched/sched.h    |  1 +
+ 3 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 672616503e35..c309b3d203c0 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -6853,8 +6853,17 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 	util_est_update(&rq->cfs, p, task_sleep);
+
+ 	if (task_sleep) {
+-		p->last_dequeue_time = sched_clock_cpu(cpu_of(rq));
++		u64 now = sched_clock_cpu(cpu_of(rq));
++
++		p->last_dequeue_time = now;
+ 		p->last_dequeue_cpu = cpu_of(rq);
++
++#ifdef CONFIG_SMP
++		/* this rq becomes idle, update its cache hot timeout */
++		if (sched_feat(SIS_CACHE) && !rq->nr_running &&
++		    p->avg_hot_dur)
++			rq->cache_hot_timeout = max(rq->cache_hot_timeout, now + p->avg_hot_dur);
++#endif
+ 	} else {
+ 		/* 0 indicates the dequeue is not caused by sleep */
+ 		p->last_dequeue_time = 0;
+@@ -7347,6 +7356,25 @@ static inline int select_idle_smt(struct task_struct *p, int target)
+
+ #endif /* CONFIG_SCHED_SMT */
+
++/*
++ * Return true if the idle CPU is cache-hot for someone,
++ * return false otherwise.
++ */
++static __maybe_unused bool cache_hot_cpu(int cpu, int *hot_cpu)
++{
++	if (!sched_feat(SIS_CACHE))
++		return false;
++
++	if (sched_clock_cpu(cpu) >= cpu_rq(cpu)->cache_hot_timeout)
++		return false;
++
++	/* record the first cache hot idle cpu as the backup */
++	if (*hot_cpu == -1)
++		*hot_cpu = cpu;
++
++	return true;
++}
++
+ /*
+  * Scan the LLC domain for idle CPUs; this is dynamically regulated by
+  * comparing the average scan cost (tracked in sd->avg_scan_cost) against the
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index a3ddf84de430..0af282712cd1 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -50,6 +50,7 @@ SCHED_FEAT(TTWU_QUEUE, true)
+  * When doing wakeups, attempt to limit superfluous scans of the LLC domain.
+  */
+ SCHED_FEAT(SIS_UTIL, true)
++SCHED_FEAT(SIS_CACHE, true)
+
+ /*
+  * Issue a WARN when we do multiple update_rq_clock() calls
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index e58a54bda77d..191ed62ef06d 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1083,6 +1083,7 @@ struct rq {
+ #endif
+ 	u64			idle_stamp;
+ 	u64			avg_idle;
++	u64			cache_hot_timeout;
+
+ 	/* This is used to determine avg_idle's max value */
+ 	u64			max_idle_balance_cost;
+--
+2.25.1
+
+Problem statement:
+When task p is woken up, the scheduler leverages select_idle_sibling()
+to find an idle CPU for it. p's previous CPU is usually a preference
+because it can improve cache locality. However in many cases, the
+previous CPU has already been taken by other wakees, thus p has to
+find another idle CPU.
+
+Proposal:
+Introduce the SIS_CACHE. It considers the sleep time of the task for
+better task placement. Based on the task's short sleeping history,
+tag p's previous CPU as cache-hot. Later when p is woken up, it can
+choose its previous CPU in select_idle_sibling(). When other task is
+woken up, skip this cache-hot idle CPU when possible.
+
+SIS_CACHE still prefers to choose an idle CPU during task wakeup,
+the idea is to optimize the idle CPU scan sequence.
+
+As pointed out by Prateek, this has the potential that all idle CPUs
+are cache-hot and skipped. Mitigate this by returning the first
+cache-hot idle CPU. Meanwhile, to reduce the time spend on scanning,
+limit the max number of cache-hot CPU search depth to half of the number
+suggested by SIS_UTIL.
+
+Tested on Xeon 2 x 60C/120T platforms:
+
+netperf
+=======
+case            	load    	baseline(std%)	compare%( std%)
+TCP_RR          	60-threads	 1.00 (  1.37)	 +0.04 (  1.47)
+TCP_RR          	120-threads	 1.00 (  1.77)	 -1.03 (  1.31)
+TCP_RR          	180-threads	 1.00 (  2.03)	 +1.25 (  1.66)
+TCP_RR          	240-threads	 1.00 ( 41.31)	+73.71 ( 22.02)
+TCP_RR          	300-threads	 1.00 ( 12.79)	 -0.11 ( 15.84)
+
+tbench
+======
+case            	load    	baseline(std%)	compare%( std%)
+loopback        	60-threads	 1.00 (  0.35)	 +0.40 (  0.31)
+loopback        	120-threads	 1.00 (  1.94)	 -1.89 (  1.17)
+loopback        	180-threads	 1.00 ( 13.59)	 +9.97 (  0.93)
+loopback        	240-threads	 1.00 ( 11.68)	+42.85 (  7.28)
+loopback        	300-threads	 1.00 (  4.47)	+15.12 (  1.40)
+
+hackbench
+=========
+case            	load    	baseline(std%)	compare%( std%)
+process-pipe    	1-groups	 1.00 (  9.21)	 -7.88 (  2.03)
+process-pipe    	2-groups	 1.00 (  7.09)	 +5.47 (  9.02)
+process-pipe    	4-groups	 1.00 (  1.60)	 +1.53 (  1.70)
+
+schbench
+========
+case            	load    	baseline(std%)	compare%( std%)
+normal          	1-mthreads	 1.00 (  0.98)	 +0.26 (  0.37)
+normal          	2-mthreads	 1.00 (  3.99)	 -7.97 (  7.33)
+normal          	4-mthreads	 1.00 (  3.07)	 -1.55 (  3.27)
+
+Also did some experiments on the OLTP workload on a 112 core 2 socket
+SPR machine. The OLTP workload have a mixture of threads handling
+database updates on disks and handling transaction queries over network.
+Around 0.7% improvement is observed with less than 0.2% run-to-run
+variation.
+
+Thanks Madadi for testing the SIS_CACHE on a power system with 96 CPUs.
+The results showed a max of 29% improvements in hackbench, 13% improvements
+in producer_consumer workload, and 2% improvements in real life workload
+named Daytrader.
+
+Thanks Prateek for running microbenchmarks on top of the latest patch on
+a 3rd Generation EPYC System:
+- 2 sockets each with 64C/128T
+- NPS1 (Each socket is a NUMA node)
+- C2 Disabled (POLL and C1(MWAIT) remained enabled)
+No consistent regression was observed in v2 version.
+
+Analysis:
+The reason why waking up the task on its previous CPU brings benefits
+is due to less task migration and higher local resource locality.
+
+Take netperf 240 case as an example, run the following script
+to track the migration number within 10 seconds. Use perf topdown
+to track the PMU events. The task migration and stall cycles
+have been reduced a lot with SIS_CACHE:
+
+kretfunc:select_task_rq_fair
+{
+        $p = (struct task_struct *)args->p;
+        if ($p->comm == "netperf") {
+                if ($p->thread_info.cpu != retval) {
+                        @wakeup_migrate_netperf = count();
+                } else {
+                        @wakeup_prev_netperf = count();
+                }
+        }
+}
+
+NO_SIS_CACHE:
+@wakeup_migrate_netperf: 57473509
+@wakeup_prev_netperf: 14935964
+RESOURCE_STALLS: 19.1% * 7.1% * 35.0%
+
+SIS_CACHE:
+@wakeup_migrate_netperf: 799
+@wakeup_prev_netperf: 132937436
+RESOURCE_STALLS: 5.4% * 7.5% * 39.8%
+
+Suggested-by: Tim Chen <tim.c.chen@xxxxxxxxx>
+Signed-off-by: Chen Yu <yu.c.chen@xxxxxxxxx>
+---
+ kernel/sched/fair.c | 23 +++++++++++++++++++----
+ 1 file changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index c309b3d203c0..d149eca74fca 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -7360,7 +7360,7 @@ static inline int select_idle_smt(struct task_struct *p, int target)
+  * Return true if the idle CPU is cache-hot for someone,
+  * return false otherwise.
+  */
+-static __maybe_unused bool cache_hot_cpu(int cpu, int *hot_cpu)
++static bool cache_hot_cpu(int cpu, int *hot_cpu)
+ {
+ 	if (!sched_feat(SIS_CACHE))
+ 		return false;
+@@ -7383,7 +7383,7 @@ static __maybe_unused bool cache_hot_cpu(int cpu, int *hot_cpu)
+ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool has_idle_core, int target)
+ {
+ 	struct cpumask *cpus = this_cpu_cpumask_var_ptr(select_rq_mask);
+-	int i, cpu, idle_cpu = -1, nr = INT_MAX;
++	int i, cpu, idle_cpu = -1, nr = INT_MAX, nr_hot = 0, hot_cpu = -1;
+ 	struct sched_domain_shared *sd_share;
+
+ 	cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
+@@ -7396,6 +7396,9 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
+ 			/* overloaded LLC is unlikely to have idle cpu/core */
+ 			if (nr == 1)
+ 				return -1;
++
++			/* max number of cache-hot idle cpu check */
++			nr_hot = nr >> 1;
+ 		}
+ 	}
+
+@@ -7426,18 +7429,30 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
+ 	for_each_cpu_wrap(cpu, cpus, target + 1) {
+ 		if (has_idle_core) {
+ 			i = select_idle_core(p, cpu, cpus, &idle_cpu);
+-			if ((unsigned int)i < nr_cpumask_bits)
++			if ((unsigned int)i < nr_cpumask_bits) {
++				if (--nr_hot >= 0 && cache_hot_cpu(i, &hot_cpu))
++					continue;
++
+ 				return i;
++			}
+
+ 		} else {
+ 			if (--nr <= 0)
+ 				return -1;
+ 			idle_cpu = __select_idle_cpu(cpu, p);
+-			if ((unsigned int)idle_cpu < nr_cpumask_bits)
++			if ((unsigned int)idle_cpu < nr_cpumask_bits) {
++				if (--nr_hot >= 0 && cache_hot_cpu(idle_cpu, &hot_cpu))
++					continue;
++
+ 				break;
++			}
+ 		}
+ 	}
+
++	/* pick the first cache-hot CPU as the last resort */
++	if (idle_cpu == -1 && hot_cpu != -1)
++		idle_cpu = hot_cpu;
++
+ 	if (has_idle_core)
+ 		set_idle_cores(target, false);
+
+--
+2.25.1
