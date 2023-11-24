@@ -1,0 +1,458 @@
+From 9e0f35509b18f20da50e354f29aab16cf909103c Mon Sep 17 00:00:00 2001
+From: Rhys Perry <pendingchaos02@gmail.com>
+Date: Fri, 17 Nov 2023 11:21:19 +0000
+Subject: [PATCH 1/6] nir: add msad_u8x4
+
+Signed-off-by: Rhys Perry <pendingchaos02@gmail.com>
+---
+ src/compiler/nir/nir.h                |  3 +++
+ src/compiler/nir/nir_opcodes.py       | 29 ++++++++++++++++++++++-----
+ src/compiler/nir/nir_range_analysis.c |  3 ++-
+ 3 files changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/src/compiler/nir/nir.h b/src/compiler/nir/nir.h
+index e1c7ca8ec170c..3deaa4fcb066e 100644
+--- a/src/compiler/nir/nir.h
++++ b/src/compiler/nir/nir.h
+@@ -3908,6 +3908,9 @@ typedef struct nir_shader_compiler_options {
+    /** Backend supports uclz. */
+    bool has_uclz;
+ 
++   /** Backend support msad_u4x8. */
++   bool has_msad;
++
+    /**
+     * Is this the Intel vec4 backend?
+     *
+diff --git a/src/compiler/nir/nir_opcodes.py b/src/compiler/nir/nir_opcodes.py
+index 0f81328f44174..6a852812b2869 100644
+--- a/src/compiler/nir/nir_opcodes.py
++++ b/src/compiler/nir/nir_opcodes.py
+@@ -1126,11 +1126,6 @@ if (bits == 0) {
+ }
+ """)
+ 
+-# Sum of absolute differences with accumulation.
+-# (Equivalent to AMD's v_sad_u8 instruction.)
+-# The first two sources contain packed 8-bit unsigned integers, the instruction
+-# will calculate the absolute difference of these, and then add them together.
+-# There is also a third source which is a 32-bit unsigned integer and added to the result.
+ triop_horiz("sad_u8x4", 1, 1, 1, 1, """
+ uint8_t s0_b0 = (src0.x & 0x000000ff) >> 0;
+ uint8_t s0_b1 = (src0.x & 0x0000ff00) >> 8;
+@@ -1147,6 +1142,30 @@ dst.x = src2.x +
+         (s0_b1 > s1_b1 ? (s0_b1 - s1_b1) : (s1_b1 - s0_b1)) +
+         (s0_b2 > s1_b2 ? (s0_b2 - s1_b2) : (s1_b2 - s0_b2)) +
+         (s0_b3 > s1_b3 ? (s0_b3 - s1_b3) : (s1_b3 - s0_b3));
++""", description = """
++Sum of absolute differences with accumulation. Equivalent to AMD's v_sad_u8 instruction.
++
++The first two sources contain packed 8-bit unsigned integers, the instruction will
++calculate the absolute difference of these, and then add them together. There is also a
++third source which is a 32-bit unsigned integer and added to the result.
++""")
++
++triop("msad_u8x4", tuint32, "", """
++dst = src2;
++for (unsigned i = 0; i < 4; i++) {
++   const uint8_t ref = src0 >> (i * 8);
++   const uint8_t src = src1 >> (i * 8);
++   if (ref != 0)
++      dst += MAX2(ref, src) - MIN2(ref, src);
++}
++""", description = """
++Masked sum of absolute differences with accumulation. Equivalent to AMD's v_msad_u8
++instruction and DXIL's MSAD.
++
++The first two sources contain packed 8-bit unsigned integers, the instruction
++will calculate the absolute difference of integers when src0's is non-zero, and
++then add them together. There is also a third source which is a 32-bit unsigned
++integer and added to the result.
+ """)
+ 
+ # Combines the first component of each input to make a 3-component vector.
+diff --git a/src/compiler/nir/nir_range_analysis.c b/src/compiler/nir/nir_range_analysis.c
+index d982c9e602c8d..6cb7f5a16e32b 100644
+--- a/src/compiler/nir/nir_range_analysis.c
++++ b/src/compiler/nir/nir_range_analysis.c
+@@ -1865,7 +1865,8 @@ get_alu_uub(struct analysis_state *state, struct uub_query q, uint32_t *result,
+       *result = 1;
+       break;
+    case nir_op_sad_u8x4:
+-      *result = src[2] + 4 * 255;
++   case nir_op_msad_u8x4:
++      *result = MIN2((uint64_t)src[2] + 4 * 255, UINT32_MAX);
+       break;
+    case nir_op_extract_u8:
+       *result = MIN2(src[0], UINT8_MAX);
+-- 
+GitLab
+
+
+From 1c8e3b6cbb0a758c6da715704957a097bf85b2a4 Mon Sep 17 00:00:00 2001
+From: Rhys Perry <pendingchaos02@gmail.com>
+Date: Fri, 17 Nov 2023 12:24:14 +0000
+Subject: [PATCH 2/6] nir/algebraic: optimize vkd3d-proton's MSAD
+
+Signed-off-by: Rhys Perry <pendingchaos02@gmail.com>
+---
+ src/compiler/nir/nir_opt_algebraic.py      | 19 ++++++++++
+ src/compiler/nir/tests/algebraic_tests.cpp | 40 ++++++++++++++++++++++
+ src/compiler/nir/tests/nir_test.h          |  2 +-
+ 3 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/src/compiler/nir/nir_opt_algebraic.py b/src/compiler/nir/nir_opt_algebraic.py
+index 8a7cb3617fa2b..a16c4e30c5d56 100644
+--- a/src/compiler/nir/nir_opt_algebraic.py
++++ b/src/compiler/nir/nir_opt_algebraic.py
+@@ -2613,6 +2613,25 @@ optimizations += [
+    (vkd3d_proton_packed_f2f16_rtz_lo(('fneg', 'x'), ('fabs', 'x')), ('pack_half_2x16_rtz_split', ('fneg', 'x'), 0)),
+ ]
+ 
++def vkd3d_proton_msad():
++   pattern = None
++   for i in range(4):
++      ref = ('extract_u8', 'a@32', i)
++      src = ('extract_u8', 'b@32', i)
++      sad = ('iabs', ('iadd', ref, ('ineg', src)))
++      msad = ('bcsel', ('ieq', ref, 0), 0, sad)
++      if pattern == None:
++         pattern = msad
++      else:
++         pattern = ('iadd', pattern, msad)
++   pattern = (pattern[0] + '(many-comm-expr)', *pattern[1:])
++   return pattern
++
++optimizations += [
++   (vkd3d_proton_msad(), ('msad_u8x4', a, b, 0), 'options->has_msad'),
++   (('iadd', ('msad_u8x4', a, b, 0), c), ('msad_u8x4', a, b, c)),
++]
++
+ 
+ # "all_equal(eq(a, b), vec(~0))" is the same as "all_equal(a, b)"
+ # "any_nequal(neq(a, b), vec(0))" is the same as "any_nequal(a, b)"
+diff --git a/src/compiler/nir/tests/algebraic_tests.cpp b/src/compiler/nir/tests/algebraic_tests.cpp
+index 65e15a57da4ba..fe107c77b3c8c 100644
+--- a/src/compiler/nir/tests/algebraic_tests.cpp
++++ b/src/compiler/nir/tests/algebraic_tests.cpp
+@@ -132,6 +132,46 @@ TEST_F(nir_opt_algebraic_test, irem_pow2_src2)
+    test_2src_op(nir_op_irem, INT32_MIN, -4);
+ }
+ 
++TEST_F(nir_opt_algebraic_test, msad)
++{
++   options.lower_bitfield_extract = true;
++   options.has_bfe = true;
++   options.has_msad = true;
++
++   nir_def *src0 = nir_load_var(b, nir_local_variable_create(b->impl, glsl_int_type(), "src0"));
++   nir_def *src1 = nir_load_var(b, nir_local_variable_create(b->impl, glsl_int_type(), "src1"));
++
++   /* This mimics the sequence created by vkd3d-proton. */
++   nir_def *res = NULL;
++   for (unsigned i = 0; i < 4; i++) {
++      nir_def *ref = nir_ubitfield_extract(b, src0, nir_imm_int(b, i * 8), nir_imm_int(b, 8));
++      nir_def *src = nir_ubitfield_extract(b, src1, nir_imm_int(b, i * 8), nir_imm_int(b, 8));
++      nir_def *is_ref_zero = nir_ieq_imm(b, ref, 0);
++      nir_def *abs_diff = nir_iabs(b, nir_isub(b, ref, src));
++      nir_def *masked_diff = nir_bcsel(b, is_ref_zero, nir_imm_int(b, 0), abs_diff);
++      if (res)
++         res = nir_iadd(b, res, masked_diff);
++      else
++         res = masked_diff;
++   }
++
++   nir_store_var(b, res_var, res, 0x1);
++
++   while (nir_opt_algebraic(b->shader)) {
++      nir_opt_constant_folding(b->shader);
++      nir_opt_dce(b->shader);
++   }
++
++   unsigned count = 0;
++   nir_foreach_instr(instr, nir_start_block(b->impl)) {
++      if (instr->type == nir_instr_type_alu) {
++         ASSERT_TRUE(nir_instr_as_alu(instr)->op == nir_op_msad_u8x4);
++         ASSERT_EQ(count, 0);
++         count++;
++      }
++   }
++}
++
+ TEST_F(nir_opt_idiv_const_test, umod)
+ {
+    for (uint32_t d : {16u, 17u, 0u, UINT32_MAX}) {
+diff --git a/src/compiler/nir/tests/nir_test.h b/src/compiler/nir/tests/nir_test.h
+index c94fce2390217..151071424e69e 100644
+--- a/src/compiler/nir/tests/nir_test.h
++++ b/src/compiler/nir/tests/nir_test.h
+@@ -17,7 +17,6 @@ class nir_test : public ::testing::Test {
+    {
+       glsl_type_singleton_init_or_ref();
+ 
+-      static const nir_shader_compiler_options options = {};
+       _b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &options, "%s", name);
+       b = &_b;
+    }
+@@ -34,6 +33,7 @@ class nir_test : public ::testing::Test {
+       glsl_type_singleton_decref();
+    }
+ 
++   nir_shader_compiler_options options = {};
+    nir_builder _b;
+    nir_builder *b;
+ };
+-- 
+GitLab
+
+
+From c433abf9a4740212ef6bac9e8fade003d9128472 Mon Sep 17 00:00:00 2001
+From: Rhys Perry <pendingchaos02@gmail.com>
+Date: Fri, 17 Nov 2023 11:21:51 +0000
+Subject: [PATCH 3/6] aco: implement msad_u8x4
+
+Signed-off-by: Rhys Perry <pendingchaos02@gmail.com>
+---
+ src/amd/compiler/aco_instruction_selection.cpp       | 7 ++++++-
+ src/amd/compiler/aco_instruction_selection_setup.cpp | 1 +
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/compiler/aco_instruction_selection.cpp b/src/amd/compiler/aco_instruction_selection.cpp
+index c40f05ceb9608..24d2ec19d6232 100644
+--- a/src/amd/compiler/aco_instruction_selection.cpp
++++ b/src/amd/compiler/aco_instruction_selection.cpp
+@@ -922,7 +922,7 @@ emit_vop3a_instruction(isel_context* ctx, nir_alu_instr* instr, aco_opcode op, T
+    Temp src[3] = {Temp(0, v1), Temp(0, v1), Temp(0, v1)};
+    bool has_sgpr = false;
+    for (unsigned i = 0; i < num_sources; i++) {
+-      src[i] = get_alu_src(ctx, instr->src[swap_srcs ? 1 - i : i]);
++      src[i] = get_alu_src(ctx, instr->src[(swap_srcs && i < 2) ? 1 - i : i]);
+       if (has_sgpr)
+          src[i] = as_vgpr(ctx, src[i]);
+       else
+@@ -3413,6 +3413,11 @@ visit_alu_instr(isel_context* ctx, nir_alu_instr* instr)
+       emit_vop3a_instruction(ctx, instr, aco_opcode::v_sad_u8, dst, false, 3u, false);
+       break;
+    }
++   case nir_op_msad_u8x4: {
++      assert(dst.regClass() == v1);
++      emit_vop3a_instruction(ctx, instr, aco_opcode::v_msad_u8, dst, false, 3u, true);
++      break;
++   }
+    case nir_op_fquantize2f16: {
+       Temp src = get_alu_src(ctx, instr->src[0]);
+       Temp f16;
+diff --git a/src/amd/compiler/aco_instruction_selection_setup.cpp b/src/amd/compiler/aco_instruction_selection_setup.cpp
+index eac1c6c5f06f0..fef7b6d02f782 100644
+--- a/src/amd/compiler/aco_instruction_selection_setup.cpp
++++ b/src/amd/compiler/aco_instruction_selection_setup.cpp
+@@ -397,6 +397,7 @@ init_context(isel_context* ctx, nir_shader* shader)
+                case nir_op_frexp_exp:
+                case nir_op_cube_amd:
+                case nir_op_sad_u8x4:
++               case nir_op_msad_u8x4:
+                case nir_op_udot_4x8_uadd:
+                case nir_op_sdot_4x8_iadd:
+                case nir_op_sudot_4x8_iadd:
+-- 
+GitLab
+
+
+From 547276910109a9aaa375ab3dc3c47170ecada1ee Mon Sep 17 00:00:00 2001
+From: Rhys Perry <pendingchaos02@gmail.com>
+Date: Fri, 17 Nov 2023 11:21:58 +0000
+Subject: [PATCH 4/6] ac/llvm: implement msad_u8x4
+
+Signed-off-by: Rhys Perry <pendingchaos02@gmail.com>
+---
+ src/amd/llvm/ac_nir_to_llvm.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/amd/llvm/ac_nir_to_llvm.c b/src/amd/llvm/ac_nir_to_llvm.c
+index 28cd089b51554..2e9b22b4e02bf 100644
+--- a/src/amd/llvm/ac_nir_to_llvm.c
++++ b/src/amd/llvm/ac_nir_to_llvm.c
+@@ -1278,6 +1278,11 @@ static bool visit_alu(struct ac_nir_context *ctx, const nir_alu_instr *instr)
+                                   (LLVMValueRef[]){src[0], src[1], src[2]}, 3, 0);
+       break;
+ 
++   case nir_op_msad_u8x4:
++      result = ac_build_intrinsic(&ctx->ac, "llvm.amdgcn.msad.u8", ctx->ac.i32,
++                                  (LLVMValueRef[]){src[1], src[0], src[2]}, 3, 0);
++      break;
++
+    default:
+       fprintf(stderr, "Unknown NIR alu instr: ");
+       nir_print_instr(&instr->instr, stderr);
+-- 
+GitLab
+
+
+From 3b5ff48a9537bc4249f2df492c62784d3d9165c7 Mon Sep 17 00:00:00 2001
+From: Rhys Perry <pendingchaos02@gmail.com>
+Date: Fri, 17 Nov 2023 11:22:05 +0000
+Subject: [PATCH 5/6] radv: enable msad_u8x4
+
+Signed-off-by: Rhys Perry <pendingchaos02@gmail.com>
+---
+ src/amd/vulkan/radv_shader.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index 393cd44d82047..df68351145886 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -110,6 +110,7 @@ get_nir_options_for_stage(struct radv_physical_device *device, gl_shader_stage s
+       .has_pack_half_2x16_rtz = true,
+       .has_bit_test = !device->use_llvm,
+       .has_fmulz = true,
++      .has_msad = true,
+       .max_unroll_iterations = 32,
+       .max_unroll_iterations_aggressive = 128,
+       .use_interpolated_input_intrinsics = true,
+-- 
+GitLab
+
+
+From 0f065e2915e5c657477848b9381c4b48d60feae9 Mon Sep 17 00:00:00 2001
+From: Rhys Perry <pendingchaos02@gmail.com>
+Date: Mon, 20 Nov 2023 15:53:39 +0000
+Subject: [PATCH 6/6] nir: remove sad_u8x4
+
+Signed-off-by: Rhys Perry <pendingchaos02@gmail.com>
+---
+ src/amd/common/ac_nir_lower_ngg.c             |  8 +++----
+ .../compiler/aco_instruction_selection.cpp    |  5 ----
+ .../aco_instruction_selection_setup.cpp       |  1 -
+ src/amd/llvm/ac_nir_to_llvm.c                 |  5 ----
+ src/compiler/nir/nir_opcodes.py               | 24 -------------------
+ src/compiler/nir/nir_range_analysis.c         |  1 -
+ 6 files changed, 4 insertions(+), 40 deletions(-)
+
+diff --git a/src/amd/common/ac_nir_lower_ngg.c b/src/amd/common/ac_nir_lower_ngg.c
+index e5729d89e0d72..3f4be19173b37 100644
+--- a/src/amd/common/ac_nir_lower_ngg.c
++++ b/src/amd/common/ac_nir_lower_ngg.c
+@@ -284,7 +284,7 @@ summarize_repack(nir_builder *b, nir_def *packed_counts, unsigned num_lds_dwords
+     *
+     * If the v_dot instruction can't be used, we left-shift the packed bytes.
+     * This will shift out the unneeded bytes and shift in zeroes instead,
+-    * then we sum them using v_sad_u8.
++    * then we sum them using v_msad_u8.
+     */
+ 
+    nir_def *lane_id = nir_load_subgroup_invocation(b);
+@@ -302,7 +302,7 @@ summarize_repack(nir_builder *b, nir_def *packed_counts, unsigned num_lds_dwords
+          return nir_udot_4x8_uadd(b, packed, dot_op, nir_imm_int(b, 0));
+       } else {
+          nir_def *sad_op = nir_ishl(b, nir_ishl(b, packed, shift), shift);
+-         return nir_sad_u8x4(b, sad_op, nir_imm_int(b, 0), nir_imm_int(b, 0));
++         return nir_msad_u8x4(b, sad_op, nir_imm_int(b, 0), nir_imm_int(b, 0));
+       }
+    } else if (num_lds_dwords == 2) {
+       nir_def *dot_op = !use_dot ? NULL : nir_ushr(b, nir_ushr(b, nir_imm_int64(b, 0x0101010101010101), shift), shift);
+@@ -317,8 +317,8 @@ summarize_repack(nir_builder *b, nir_def *packed_counts, unsigned num_lds_dwords
+          return nir_udot_4x8_uadd(b, packed_dw1, nir_unpack_64_2x32_split_y(b, dot_op), sum);
+       } else {
+          nir_def *sad_op = nir_ishl(b, nir_ishl(b, nir_pack_64_2x32_split(b, packed_dw0, packed_dw1), shift), shift);
+-         nir_def *sum = nir_sad_u8x4(b, nir_unpack_64_2x32_split_x(b, sad_op), nir_imm_int(b, 0), nir_imm_int(b, 0));
+-         return nir_sad_u8x4(b, nir_unpack_64_2x32_split_y(b, sad_op), nir_imm_int(b, 0), sum);
++         nir_def *sum = nir_msad_u8x4(b, nir_unpack_64_2x32_split_x(b, sad_op), nir_imm_int(b, 0), nir_imm_int(b, 0));
++         return nir_msad_u8x4(b, nir_unpack_64_2x32_split_y(b, sad_op), nir_imm_int(b, 0), sum);
+       }
+    } else {
+       unreachable("Unimplemented NGG wave count");
+diff --git a/src/amd/compiler/aco_instruction_selection.cpp b/src/amd/compiler/aco_instruction_selection.cpp
+index 24d2ec19d6232..7a49f5eab4989 100644
+--- a/src/amd/compiler/aco_instruction_selection.cpp
++++ b/src/amd/compiler/aco_instruction_selection.cpp
+@@ -3408,11 +3408,6 @@ visit_alu_instr(isel_context* ctx, nir_alu_instr* instr)
+       }
+       break;
+    }
+-   case nir_op_sad_u8x4: {
+-      assert(dst.regClass() == v1);
+-      emit_vop3a_instruction(ctx, instr, aco_opcode::v_sad_u8, dst, false, 3u, false);
+-      break;
+-   }
+    case nir_op_msad_u8x4: {
+       assert(dst.regClass() == v1);
+       emit_vop3a_instruction(ctx, instr, aco_opcode::v_msad_u8, dst, false, 3u, true);
+diff --git a/src/amd/compiler/aco_instruction_selection_setup.cpp b/src/amd/compiler/aco_instruction_selection_setup.cpp
+index fef7b6d02f782..0075a2f04b7c9 100644
+--- a/src/amd/compiler/aco_instruction_selection_setup.cpp
++++ b/src/amd/compiler/aco_instruction_selection_setup.cpp
+@@ -396,7 +396,6 @@ init_context(isel_context* ctx, nir_shader* shader)
+                case nir_op_frexp_sig:
+                case nir_op_frexp_exp:
+                case nir_op_cube_amd:
+-               case nir_op_sad_u8x4:
+                case nir_op_msad_u8x4:
+                case nir_op_udot_4x8_uadd:
+                case nir_op_sdot_4x8_iadd:
+diff --git a/src/amd/llvm/ac_nir_to_llvm.c b/src/amd/llvm/ac_nir_to_llvm.c
+index 2e9b22b4e02bf..703f73106646d 100644
+--- a/src/amd/llvm/ac_nir_to_llvm.c
++++ b/src/amd/llvm/ac_nir_to_llvm.c
+@@ -1273,11 +1273,6 @@ static bool visit_alu(struct ac_nir_context *ctx, const nir_alu_instr *instr)
+       break;
+    }
+ 
+-   case nir_op_sad_u8x4:
+-      result = ac_build_intrinsic(&ctx->ac, "llvm.amdgcn.sad.u8", ctx->ac.i32,
+-                                  (LLVMValueRef[]){src[0], src[1], src[2]}, 3, 0);
+-      break;
+-
+    case nir_op_msad_u8x4:
+       result = ac_build_intrinsic(&ctx->ac, "llvm.amdgcn.msad.u8", ctx->ac.i32,
+                                   (LLVMValueRef[]){src[1], src[0], src[2]}, 3, 0);
+diff --git a/src/compiler/nir/nir_opcodes.py b/src/compiler/nir/nir_opcodes.py
+index 6a852812b2869..bc7338766be17 100644
+--- a/src/compiler/nir/nir_opcodes.py
++++ b/src/compiler/nir/nir_opcodes.py
+@@ -1126,30 +1126,6 @@ if (bits == 0) {
+ }
+ """)
+ 
+-triop_horiz("sad_u8x4", 1, 1, 1, 1, """
+-uint8_t s0_b0 = (src0.x & 0x000000ff) >> 0;
+-uint8_t s0_b1 = (src0.x & 0x0000ff00) >> 8;
+-uint8_t s0_b2 = (src0.x & 0x00ff0000) >> 16;
+-uint8_t s0_b3 = (src0.x & 0xff000000) >> 24;
+-
+-uint8_t s1_b0 = (src1.x & 0x000000ff) >> 0;
+-uint8_t s1_b1 = (src1.x & 0x0000ff00) >> 8;
+-uint8_t s1_b2 = (src1.x & 0x00ff0000) >> 16;
+-uint8_t s1_b3 = (src1.x & 0xff000000) >> 24;
+-
+-dst.x = src2.x +
+-        (s0_b0 > s1_b0 ? (s0_b0 - s1_b0) : (s1_b0 - s0_b0)) +
+-        (s0_b1 > s1_b1 ? (s0_b1 - s1_b1) : (s1_b1 - s0_b1)) +
+-        (s0_b2 > s1_b2 ? (s0_b2 - s1_b2) : (s1_b2 - s0_b2)) +
+-        (s0_b3 > s1_b3 ? (s0_b3 - s1_b3) : (s1_b3 - s0_b3));
+-""", description = """
+-Sum of absolute differences with accumulation. Equivalent to AMD's v_sad_u8 instruction.
+-
+-The first two sources contain packed 8-bit unsigned integers, the instruction will
+-calculate the absolute difference of these, and then add them together. There is also a
+-third source which is a 32-bit unsigned integer and added to the result.
+-""")
+-
+ triop("msad_u8x4", tuint32, "", """
+ dst = src2;
+ for (unsigned i = 0; i < 4; i++) {
+diff --git a/src/compiler/nir/nir_range_analysis.c b/src/compiler/nir/nir_range_analysis.c
+index 6cb7f5a16e32b..556b64d12d196 100644
+--- a/src/compiler/nir/nir_range_analysis.c
++++ b/src/compiler/nir/nir_range_analysis.c
+@@ -1864,7 +1864,6 @@ get_alu_uub(struct analysis_state *state, struct uub_query q, uint32_t *result,
+    case nir_op_b2i32:
+       *result = 1;
+       break;
+-   case nir_op_sad_u8x4:
+    case nir_op_msad_u8x4:
+       *result = MIN2((uint64_t)src[2] + 4 * 255, UINT32_MAX);
+       break;
+-- 
+GitLab
+
