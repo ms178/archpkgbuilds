@@ -23,13 +23,13 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -DCMAKE_C_COMPILER=${CPATH}/clang \
     -DCMAKE_CXX_COMPILER=${CPATH}/clang++ \
     -DLLVM_USE_LINKER=${CPATH}/ld.lld \
-        -D CMAKE_C_FLAGS="-O3 -march=native -mtune=native -maes -mbmi2 -mpclmul -falign-functions=32 -fno-semantic-interposition -fno-omit-frame-pointer -fcf-protection=none -mharden-sls=none -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
-        -D CMAKE_CXX_FLAGS="-O3 -march=native -mtune=native -maes -mbmi2 -mpclmul -falign-functions=32 -fno-semantic-interposition -fno-omit-frame-pointer -fcf-protection=none -mharden-sls=none -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
-        -D CMAKE_EXE_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fuse-ld=lld -maes -mbmi2 -mpclmul -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
-        -D CMAKE_MODULE_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fuse-ld=lld -maes -mbmi2 -mpclmul -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
-        -D CMAKE_SHARED_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fuse-ld=lld -maes -mbmi2 -mpclmul -flto=thin -fprofile-instr-use=/home/marcus/Downloads/llvm17.profdata" \
-        -DLLVM_ENABLE_PROJECTS="lld;clang;compiler-rt" \
-        -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86;BPF" \
+        -D CMAKE_C_FLAGS="-O3 -march=native -mtune=native -maes -mbmi2 -mpclmul -falign-functions=32 -fno-semantic-interposition -fno-omit-frame-pointer -fcf-protection=none -mharden-sls=none -flto=thin" \
+        -D CMAKE_CXX_FLAGS="-O3 -march=native -mtune=native -maes -mbmi2 -mpclmul -falign-functions=32 -fno-semantic-interposition -fno-omit-frame-pointer -fcf-protection=none -mharden-sls=none -flto=thin" \
+        -D CMAKE_EXE_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fuse-ld=lld -maes -mbmi2 -mpclmul -flto=thin" \
+        -D CMAKE_MODULE_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fuse-ld=lld -maes -mbmi2 -mpclmul -flto=thin" \
+        -D CMAKE_SHARED_LINKER_FLAGS="-Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fuse-ld=lld -maes -mbmi2 -mpclmul -flto=thin" \
+        -DLLVM_ENABLE_PROJECTS="lld;clang" \
+        -DLLVM_TARGETS_TO_BUILD="X86" \
         -D CLANG_ENABLE_ARCMT:BOOL=OFF \
         -D CLANG_ENABLE_STATIC_ANALYZER:BOOL=OFF \
         -D LLVM_INCLUDE_BENCHMARKS=OFF \
@@ -43,15 +43,14 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
         -D LLVM_ENABLE_BINDINGS=OFF \
         -D LLVM_ENABLE_Z3_SOLVER=OFF \
         -D LLVM_POLLY_LINK_INTO_TOOLS=ON \
-        -D LLVM_ENABLE_ZLIB:BOOL=ON \
+        -D LLVM_ENABLE_ZLIB=ON \
+        -D LLVM_ENABLE_ZSTD=ON \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLVM_ENABLE_WARNINGS=OFF \
     -DCMAKE_INSTALL_PREFIX=${TOPLEV}/stage2-prof-gen/install \
     -DLLVM_BUILD_INSTRUMENTED=IR \
-    -DLLVM_BUILD_RUNTIME=OFF \
-    -DLLVM_LINK_LLVM_DYLIB=ON \
     -DLLVM_VP_COUNTERS_PER_SITE=6 \
-    -DLLVM_BUILD_INSTRUMENTED=IR \
+    -DLLVM_LINK_LLVM_DYLIB=ON \
     -DLLVM_ENABLE_PLUGINS=ON \
     -DLLVM_BUILD_RUNTIME=No || (echo "Could not configure project!"; exit 1)
 
