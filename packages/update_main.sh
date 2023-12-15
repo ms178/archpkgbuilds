@@ -91,8 +91,10 @@ networkmanager-qt-main \
 phonon-main \
 plasma-integration-main \
 kpipewire-main \
+wrapland-kwinft \
+disman-kwinft \
 kdisplay-kwinft \
-kwinft \
+kwin-main \
 plasma-workspace-main \
 kde-cli-tools-main \
 systemsettings-main \
