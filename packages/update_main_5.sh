@@ -17,7 +17,7 @@ milou-main \
 prison5-main \
 kconfig5-main \
 kcoreaddons5-main \
-kdecoration5-main \
+kdecoration-main \
 kguiaddons5-main \
 kquickcharts5-main \
 attica5-main \
@@ -28,7 +28,7 @@ kcrash5-main \
 kidletime5-main \
 kdbusaddons5-main \
 kglobalaccel5-main \
-polkit-qt5-main \
+polkit-qt-main \
 kauth5-main \
 kwidgetsaddons5-main \
 kconfigwidgets5-main \
@@ -86,7 +86,7 @@ libksysguard-main \
 polkit-kde-agent-main \
 qqc2-desktop-style5-main \
 libqaccessibilityclient-main \
-networkmanager-qt-main \
+networkmanager-qt5-main \
 phonon-main \
 plasma-integration-main \
 kpipewire-main \
@@ -99,7 +99,7 @@ kross-main \
 kdeplasma-addons-main \
 plasma-desktop-main \
 qca-main \
-modemmanager-qt-main \
+modemmanager-qt5-main \
 plasma-nm-main \
 plasma-pa-main \
 dolphin-main \
@@ -122,8 +122,10 @@ xdg-desktop-portal-kde-main \
 ark-main \
 baloo-widgets-main \
 kaccounts-integration-main \
+kdsoap-main \
 kio-extras-main \
 kwalletmanager-main \
+libkdcraw-main \
 signon-kwallet-extension-main \
 spectacle-main \
 ; do
