@@ -1,0 +1,1289 @@
+From 1ec88f84901ace03cda1c2ad4fc52a4e4ba429e8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Thu, 7 Dec 2023 16:48:29 -0500
+Subject: [PATCH 1/7] gallium/u_threaded_context: use function table to jump to
+ different draw impls
+
+Instead of a series of if-else statements, use a function table containing
+all the draw variants, which is indexed by:
+    [is_indirect * 8 + index_size_and_has_user_indices * 4 +
+     is_multi_draw * 2 + non_zero_draw_id]
+
+This decreases the overhead of tc_draw_vbo by 0.7% (from 4% to 3.3%)
+for the GL frontend thread in VP2020/Catia1, which has CPU usage of 26%,
+so it decreases the overhead for that thread by 2.7%. (0.7 / 26)
+---
+ .../auxiliary/util/u_threaded_context.c       | 520 +++++++++++-------
+ 1 file changed, 324 insertions(+), 196 deletions(-)
+
+diff --git a/src/gallium/auxiliary/util/u_threaded_context.c b/src/gallium/auxiliary/util/u_threaded_context.c
+index 5e9ffd684f954..7e1959b932d24 100644
+--- a/src/gallium/auxiliary/util/u_threaded_context.c
++++ b/src/gallium/auxiliary/util/u_threaded_context.c
+@@ -3889,239 +3889,367 @@ tc_call_draw_multi(struct pipe_context *pipe, void *call, uint64_t *last)
+ #define DRAW_INFO_SIZE_WITHOUT_INDEXBUF_AND_MIN_MAX_INDEX \
+    offsetof(struct pipe_draw_info, index)
+ 
+-void
+-tc_draw_vbo(struct pipe_context *_pipe, const struct pipe_draw_info *info,
+-            unsigned drawid_offset,
+-            const struct pipe_draw_indirect_info *indirect,
+-            const struct pipe_draw_start_count_bias *draws,
+-            unsigned num_draws)
++/* Single draw with drawid_offset == 0. */
++static void
++tc_draw_single(struct pipe_context *_pipe, const struct pipe_draw_info *info,
++               unsigned drawid_offset,
++               const struct pipe_draw_indirect_info *indirect,
++               const struct pipe_draw_start_count_bias *draws,
++               unsigned num_draws)
+ {
+-   STATIC_ASSERT(DRAW_INFO_SIZE_WITHOUT_INDEXBUF_AND_MIN_MAX_INDEX +
+-                 sizeof(intptr_t) == offsetof(struct pipe_draw_info, min_index));
+-
+    struct threaded_context *tc = threaded_context(_pipe);
+-   unsigned index_size = info->index_size;
+-   bool has_user_indices = info->has_user_indices;
+-   if (tc->options.parse_renderpass_info)
+-      tc_parse_draw(tc);
++   struct tc_draw_single *p =
++      tc_add_call(tc, TC_CALL_draw_single, tc_draw_single);
+ 
+-   if (unlikely(indirect)) {
+-      assert(!has_user_indices);
+-      assert(num_draws == 1);
++   if (info->index_size) {
++      if (!info->take_index_buffer_ownership) {
++         tc_set_resource_reference(&p->info.index.resource,
++                                   info->index.resource);
++      }
++      tc_add_to_buffer_list(tc, &tc->buffer_lists[tc->next_buf_list], info->index.resource);
++   }
++   memcpy(&p->info, info, DRAW_INFO_SIZE_WITHOUT_MIN_MAX_INDEX);
++   /* u_threaded_context stores start/count in min/max_index for single draws. */
++   p->info.min_index = draws[0].start;
++   p->info.max_index = draws[0].count;
++   p->index_bias = draws[0].index_bias;
++   simplify_draw_info(&p->info);
++}
+ 
+-      struct tc_draw_indirect *p =
+-         tc_add_call(tc, TC_CALL_draw_indirect, tc_draw_indirect);
+-      struct tc_buffer_list *next = &tc->buffer_lists[tc->next_buf_list];
++/* Single draw with drawid_offset > 0. */
++static void
++tc_draw_single_draw_id(struct pipe_context *_pipe,
++                       const struct pipe_draw_info *info,
++                       unsigned drawid_offset,
++                       const struct pipe_draw_indirect_info *indirect,
++                       const struct pipe_draw_start_count_bias *draws,
++                       unsigned num_draws)
++{
++   struct threaded_context *tc = threaded_context(_pipe);
++   struct tc_draw_single *p =
++      &tc_add_call(tc, TC_CALL_draw_single_drawid, tc_draw_single_drawid)->base;
+ 
+-      if (index_size) {
+-         if (!info->take_index_buffer_ownership) {
+-            tc_set_resource_reference(&p->info.index.resource,
+-                                      info->index.resource);
+-         }
+-         tc_add_to_buffer_list(tc, next, info->index.resource);
++   if (info->index_size) {
++      if (!info->take_index_buffer_ownership) {
++         tc_set_resource_reference(&p->info.index.resource,
++                                   info->index.resource);
+       }
+-      memcpy(&p->info, info, DRAW_INFO_SIZE_WITHOUT_MIN_MAX_INDEX);
++      tc_add_to_buffer_list(tc, &tc->buffer_lists[tc->next_buf_list], info->index.resource);
++   }
++   ((struct tc_draw_single_drawid*)p)->drawid_offset = drawid_offset;
++   memcpy(&p->info, info, DRAW_INFO_SIZE_WITHOUT_MIN_MAX_INDEX);
++   /* u_threaded_context stores start/count in min/max_index for single draws. */
++   p->info.min_index = draws[0].start;
++   p->info.max_index = draws[0].count;
++   p->index_bias = draws[0].index_bias;
++   simplify_draw_info(&p->info);
++}
+ 
+-      tc_set_resource_reference(&p->indirect.buffer, indirect->buffer);
+-      tc_set_resource_reference(&p->indirect.indirect_draw_count,
+-                                indirect->indirect_draw_count);
+-      p->indirect.count_from_stream_output = NULL;
+-      pipe_so_target_reference(&p->indirect.count_from_stream_output,
+-                               indirect->count_from_stream_output);
++/* Single draw with user indices and drawid_offset == 0. */
++static void
++tc_draw_user_indices_single(struct pipe_context *_pipe,
++                            const struct pipe_draw_info *info,
++                            unsigned drawid_offset,
++                            const struct pipe_draw_indirect_info *indirect,
++                            const struct pipe_draw_start_count_bias *draws,
++                            unsigned num_draws)
++{
++   struct threaded_context *tc = threaded_context(_pipe);
++   unsigned index_size = info->index_size;
++   unsigned size = draws[0].count * index_size;
++   struct pipe_resource *buffer = NULL;
++   unsigned offset;
+ 
+-      if (indirect->buffer)
+-         tc_add_to_buffer_list(tc, next, indirect->buffer);
+-      if (indirect->indirect_draw_count)
+-         tc_add_to_buffer_list(tc, next, indirect->indirect_draw_count);
+-      if (indirect->count_from_stream_output)
+-         tc_add_to_buffer_list(tc, next, indirect->count_from_stream_output->buffer);
++   if (!size)
++      return;
+ 
+-      memcpy(&p->indirect, indirect, sizeof(*indirect));
+-      p->draw.start = draws[0].start;
++   /* This must be done before adding draw_vbo, because it could generate
++    * e.g. transfer_unmap and flush partially-uninitialized draw_vbo
++    * to the driver if it was done afterwards.
++    */
++   u_upload_data(tc->base.stream_uploader, 0, size, 4,
++                 (uint8_t*)info->index.user + draws[0].start * index_size,
++                 &offset, &buffer);
++   if (unlikely(!buffer))
++      return;
+ 
+-      /* This must be after tc_add_call, which can flush the batch. */
+-      if (unlikely(tc->add_all_gfx_bindings_to_buffer_list))
+-         tc_add_all_gfx_bindings_to_buffer_list(tc);
++   struct tc_draw_single *p =
++      tc_add_call(tc, TC_CALL_draw_single, tc_draw_single);
++   memcpy(&p->info, info, DRAW_INFO_SIZE_WITHOUT_INDEXBUF_AND_MIN_MAX_INDEX);
++   p->info.index.resource = buffer;
++   /* u_threaded_context stores start/count in min/max_index for single draws. */
++   p->info.min_index = offset >> util_logbase2(index_size);
++   p->info.max_index = draws[0].count;
++   p->index_bias = draws[0].index_bias;
++   simplify_draw_info(&p->info);
++}
++
++/* Single draw with user indices and drawid_offset > 0. */
++static void
++tc_draw_user_indices_single_draw_id(struct pipe_context *_pipe,
++                                    const struct pipe_draw_info *info,
++                                    unsigned drawid_offset,
++                                    const struct pipe_draw_indirect_info *indirect,
++                                    const struct pipe_draw_start_count_bias *draws,
++                                    unsigned num_draws)
++{
++   struct threaded_context *tc = threaded_context(_pipe);
++   unsigned index_size = info->index_size;
++   unsigned size = draws[0].count * index_size;
++   struct pipe_resource *buffer = NULL;
++   unsigned offset;
++
++   if (!size)
+       return;
+-   }
+ 
+-   if (num_draws == 1) {
+-      /* Single draw. */
+-      if (index_size && has_user_indices) {
+-         unsigned size = draws[0].count * index_size;
+-         struct pipe_resource *buffer = NULL;
+-         unsigned offset;
++   /* This must be done before adding draw_vbo, because it could generate
++    * e.g. transfer_unmap and flush partially-uninitialized draw_vbo
++    * to the driver if it was done afterwards.
++    */
++   u_upload_data(tc->base.stream_uploader, 0, size, 4,
++                 (uint8_t*)info->index.user + draws[0].start * index_size,
++                 &offset, &buffer);
++   if (unlikely(!buffer))
++      return;
+ 
+-         if (!size)
+-            return;
++   struct tc_draw_single *p =
++      &tc_add_call(tc, TC_CALL_draw_single_drawid, tc_draw_single_drawid)->base;
++   memcpy(&p->info, info, DRAW_INFO_SIZE_WITHOUT_INDEXBUF_AND_MIN_MAX_INDEX);
++   p->info.index.resource = buffer;
++   ((struct tc_draw_single_drawid*)p)->drawid_offset = drawid_offset;
++   /* u_threaded_context stores start/count in min/max_index for single draws. */
++   p->info.min_index = offset >> util_logbase2(index_size);
++   p->info.max_index = draws[0].count;
++   p->index_bias = draws[0].index_bias;
++   simplify_draw_info(&p->info);
++}
+ 
+-         /* This must be done before adding draw_vbo, because it could generate
+-          * e.g. transfer_unmap and flush partially-uninitialized draw_vbo
+-          * to the driver if it was done afterwards.
+-          */
+-         u_upload_data(tc->base.stream_uploader, 0, size, 4,
+-                       (uint8_t*)info->index.user + draws[0].start * index_size,
+-                       &offset, &buffer);
+-         if (unlikely(!buffer))
+-            return;
+-
+-         struct tc_draw_single *p = drawid_offset > 0 ?
+-            &tc_add_call(tc, TC_CALL_draw_single_drawid, tc_draw_single_drawid)->base :
+-            tc_add_call(tc, TC_CALL_draw_single, tc_draw_single);
+-         memcpy(&p->info, info, DRAW_INFO_SIZE_WITHOUT_INDEXBUF_AND_MIN_MAX_INDEX);
+-         p->info.index.resource = buffer;
+-         if (drawid_offset > 0)
+-            ((struct tc_draw_single_drawid*)p)->drawid_offset = drawid_offset;
+-         /* u_threaded_context stores start/count in min/max_index for single draws. */
+-         p->info.min_index = offset >> util_logbase2(index_size);
+-         p->info.max_index = draws[0].count;
+-         p->index_bias = draws[0].index_bias;
+-         simplify_draw_info(&p->info);
+-      } else {
+-         /* Non-indexed call or indexed with a real index buffer. */
+-         struct tc_draw_single *p = drawid_offset > 0 ?
+-            &tc_add_call(tc, TC_CALL_draw_single_drawid, tc_draw_single_drawid)->base :
+-            tc_add_call(tc, TC_CALL_draw_single, tc_draw_single);
+-         if (index_size) {
+-            if (!info->take_index_buffer_ownership) {
+-               tc_set_resource_reference(&p->info.index.resource,
+-                                         info->index.resource);
+-            }
+-            tc_add_to_buffer_list(tc, &tc->buffer_lists[tc->next_buf_list], info->index.resource);
++#define DRAW_OVERHEAD_BYTES sizeof(struct tc_draw_multi)
++#define ONE_DRAW_SLOT_BYTES sizeof(((struct tc_draw_multi*)NULL)->slot[0])
++
++#define SLOTS_FOR_ONE_DRAW \
++   DIV_ROUND_UP(DRAW_OVERHEAD_BYTES + ONE_DRAW_SLOT_BYTES, \
++                sizeof(struct tc_call_base))
++
++static void
++tc_draw_multi(struct pipe_context *_pipe, const struct pipe_draw_info *info,
++              unsigned drawid_offset,
++              const struct pipe_draw_indirect_info *indirect,
++              const struct pipe_draw_start_count_bias *draws,
++              unsigned num_draws)
++{
++   struct threaded_context *tc = threaded_context(_pipe);
++   int total_offset = 0;
++   bool take_index_buffer_ownership = info->take_index_buffer_ownership;
++
++   while (num_draws) {
++      struct tc_batch *next = &tc->batch_slots[tc->next];
++
++      int nb_slots_left = TC_SLOTS_PER_BATCH - next->num_total_slots;
++      /* If there isn't enough place for one draw, try to fill the next one */
++      if (nb_slots_left < SLOTS_FOR_ONE_DRAW)
++         nb_slots_left = TC_SLOTS_PER_BATCH;
++      const int size_left_bytes = nb_slots_left * sizeof(struct tc_call_base);
++
++      /* How many draws can we fit in the current batch */
++      const int dr = MIN2(num_draws, (size_left_bytes - DRAW_OVERHEAD_BYTES) /
++                          ONE_DRAW_SLOT_BYTES);
++
++      /* Non-indexed call or indexed with a real index buffer. */
++      struct tc_draw_multi *p =
++         tc_add_slot_based_call(tc, TC_CALL_draw_multi, tc_draw_multi,
++                                dr);
++      if (info->index_size) {
++         if (!take_index_buffer_ownership) {
++            tc_set_resource_reference(&p->info.index.resource,
++                                      info->index.resource);
+          }
+-         if (drawid_offset > 0)
+-            ((struct tc_draw_single_drawid*)p)->drawid_offset = drawid_offset;
+-         memcpy(&p->info, info, DRAW_INFO_SIZE_WITHOUT_MIN_MAX_INDEX);
+-         /* u_threaded_context stores start/count in min/max_index for single draws. */
+-         p->info.min_index = draws[0].start;
+-         p->info.max_index = draws[0].count;
+-         p->index_bias = draws[0].index_bias;
+-         simplify_draw_info(&p->info);
++         tc_add_to_buffer_list(tc, &tc->buffer_lists[tc->next_buf_list], info->index.resource);
+       }
++      take_index_buffer_ownership = false;
++      memcpy(&p->info, info, DRAW_INFO_SIZE_WITHOUT_MIN_MAX_INDEX);
++      p->num_draws = dr;
++      memcpy(p->slot, &draws[total_offset], sizeof(draws[0]) * dr);
++      num_draws -= dr;
+ 
+-      /* This must be after tc_add_call, which can flush the batch. */
+-      if (unlikely(tc->add_all_gfx_bindings_to_buffer_list))
+-         tc_add_all_gfx_bindings_to_buffer_list(tc);
+-      return;
++      total_offset += dr;
+    }
++}
+ 
+-   const int draw_overhead_bytes = sizeof(struct tc_draw_multi);
+-   const int one_draw_slot_bytes = sizeof(((struct tc_draw_multi*)NULL)->slot[0]);
+-   const int slots_for_one_draw = DIV_ROUND_UP(draw_overhead_bytes + one_draw_slot_bytes,
+-                                               sizeof(struct tc_call_base));
+-   /* Multi draw. */
+-   if (index_size && has_user_indices) {
+-      struct pipe_resource *buffer = NULL;
+-      unsigned buffer_offset, total_count = 0;
+-      unsigned index_size_shift = util_logbase2(index_size);
+-      uint8_t *ptr = NULL;
+-
+-      /* Get the total count. */
+-      for (unsigned i = 0; i < num_draws; i++)
+-         total_count += draws[i].count;
++static void
++tc_draw_user_indices_multi(struct pipe_context *_pipe,
++                           const struct pipe_draw_info *info,
++                           unsigned drawid_offset,
++                           const struct pipe_draw_indirect_info *indirect,
++                           const struct pipe_draw_start_count_bias *draws,
++                           unsigned num_draws)
++{
++   struct threaded_context *tc = threaded_context(_pipe);
++   struct pipe_resource *buffer = NULL;
++   unsigned buffer_offset, total_count = 0;
++   unsigned index_size_shift = util_logbase2(info->index_size);
++   uint8_t *ptr = NULL;
+ 
+-      if (!total_count)
+-         return;
++   /* Get the total count. */
++   for (unsigned i = 0; i < num_draws; i++)
++      total_count += draws[i].count;
+ 
+-      /* Allocate space for all index buffers.
+-       *
+-       * This must be done before adding draw_vbo, because it could generate
+-       * e.g. transfer_unmap and flush partially-uninitialized draw_vbo
+-       * to the driver if it was done afterwards.
+-       */
+-      u_upload_alloc(tc->base.stream_uploader, 0,
+-                     total_count << index_size_shift, 4,
+-                     &buffer_offset, &buffer, (void**)&ptr);
+-      if (unlikely(!buffer))
+-         return;
++   if (!total_count)
++      return;
+ 
+-      int total_offset = 0;
+-      unsigned offset = 0;
+-      while (num_draws) {
+-         struct tc_batch *next = &tc->batch_slots[tc->next];
++   /* Allocate space for all index buffers.
++    *
++    * This must be done before adding draw_vbo, because it could generate
++    * e.g. transfer_unmap and flush partially-uninitialized draw_vbo
++    * to the driver if it was done afterwards.
++    */
++   u_upload_alloc(tc->base.stream_uploader, 0,
++                  total_count << index_size_shift, 4,
++                  &buffer_offset, &buffer, (void**)&ptr);
++   if (unlikely(!buffer))
++      return;
+ 
+-         int nb_slots_left = TC_SLOTS_PER_BATCH - next->num_total_slots;
+-         /* If there isn't enough place for one draw, try to fill the next one */
+-         if (nb_slots_left < slots_for_one_draw)
+-            nb_slots_left = TC_SLOTS_PER_BATCH;
+-         const int size_left_bytes = nb_slots_left * sizeof(struct tc_call_base);
++   int total_offset = 0;
++   unsigned offset = 0;
++   while (num_draws) {
++      struct tc_batch *next = &tc->batch_slots[tc->next];
+ 
+-         /* How many draws can we fit in the current batch */
+-         const int dr = MIN2(num_draws, (size_left_bytes - draw_overhead_bytes) / one_draw_slot_bytes);
++      int nb_slots_left = TC_SLOTS_PER_BATCH - next->num_total_slots;
++      /* If there isn't enough place for one draw, try to fill the next one */
++      if (nb_slots_left < SLOTS_FOR_ONE_DRAW)
++         nb_slots_left = TC_SLOTS_PER_BATCH;
++      const int size_left_bytes = nb_slots_left * sizeof(struct tc_call_base);
+ 
+-         struct tc_draw_multi *p =
+-            tc_add_slot_based_call(tc, TC_CALL_draw_multi, tc_draw_multi,
+-                                   dr);
+-         memcpy(&p->info, info, DRAW_INFO_SIZE_WITHOUT_INDEXBUF_AND_MIN_MAX_INDEX);
++      /* How many draws can we fit in the current batch */
++      const int dr = MIN2(num_draws, (size_left_bytes - DRAW_OVERHEAD_BYTES) /
++                          ONE_DRAW_SLOT_BYTES);
+ 
+-         if (total_offset == 0)
+-            /* the first slot inherits the reference from u_upload_alloc() */
+-            p->info.index.resource = buffer;
+-         else
+-            /* all following slots need a new reference */
+-            tc_set_resource_reference(&p->info.index.resource, buffer);
++      struct tc_draw_multi *p =
++         tc_add_slot_based_call(tc, TC_CALL_draw_multi, tc_draw_multi,
++                                dr);
++      memcpy(&p->info, info, DRAW_INFO_SIZE_WITHOUT_INDEXBUF_AND_MIN_MAX_INDEX);
+ 
+-         p->num_draws = dr;
++      if (total_offset == 0)
++         /* the first slot inherits the reference from u_upload_alloc() */
++         p->info.index.resource = buffer;
++      else
++         /* all following slots need a new reference */
++         tc_set_resource_reference(&p->info.index.resource, buffer);
+ 
+-         /* Upload index buffers. */
+-         for (unsigned i = 0; i < dr; i++) {
+-            unsigned count = draws[i + total_offset].count;
++      p->num_draws = dr;
+ 
+-            if (!count) {
+-               p->slot[i].start = 0;
+-               p->slot[i].count = 0;
+-               p->slot[i].index_bias = 0;
+-               continue;
+-            }
++      /* Upload index buffers. */
++      for (unsigned i = 0; i < dr; i++) {
++         unsigned count = draws[i + total_offset].count;
+ 
+-            unsigned size = count << index_size_shift;
+-            memcpy(ptr + offset,
+-                   (uint8_t*)info->index.user +
+-                   (draws[i + total_offset].start << index_size_shift), size);
+-            p->slot[i].start = (buffer_offset + offset) >> index_size_shift;
+-            p->slot[i].count = count;
+-            p->slot[i].index_bias = draws[i + total_offset].index_bias;
+-            offset += size;
++         if (!count) {
++            p->slot[i].start = 0;
++            p->slot[i].count = 0;
++            p->slot[i].index_bias = 0;
++            continue;
+          }
+ 
+-         total_offset += dr;
+-         num_draws -= dr;
++         unsigned size = count << index_size_shift;
++         memcpy(ptr + offset,
++                (uint8_t*)info->index.user +
++                (draws[i + total_offset].start << index_size_shift), size);
++         p->slot[i].start = (buffer_offset + offset) >> index_size_shift;
++         p->slot[i].count = count;
++         p->slot[i].index_bias = draws[i + total_offset].index_bias;
++         offset += size;
+       }
+-   } else {
+-      int total_offset = 0;
+-      bool take_index_buffer_ownership = info->take_index_buffer_ownership;
+-      while (num_draws) {
+-         struct tc_batch *next = &tc->batch_slots[tc->next];
+ 
+-         int nb_slots_left = TC_SLOTS_PER_BATCH - next->num_total_slots;
+-         /* If there isn't enough place for one draw, try to fill the next one */
+-         if (nb_slots_left < slots_for_one_draw)
+-            nb_slots_left = TC_SLOTS_PER_BATCH;
+-         const int size_left_bytes = nb_slots_left * sizeof(struct tc_call_base);
+-
+-         /* How many draws can we fit in the current batch */
+-         const int dr = MIN2(num_draws, (size_left_bytes - draw_overhead_bytes) / one_draw_slot_bytes);
+-
+-         /* Non-indexed call or indexed with a real index buffer. */
+-         struct tc_draw_multi *p =
+-            tc_add_slot_based_call(tc, TC_CALL_draw_multi, tc_draw_multi,
+-                                   dr);
+-         if (index_size) {
+-            if (!take_index_buffer_ownership) {
+-               tc_set_resource_reference(&p->info.index.resource,
+-                                         info->index.resource);
+-            }
+-            tc_add_to_buffer_list(tc, &tc->buffer_lists[tc->next_buf_list], info->index.resource);
+-         }
+-         take_index_buffer_ownership = false;
+-         memcpy(&p->info, info, DRAW_INFO_SIZE_WITHOUT_MIN_MAX_INDEX);
+-         p->num_draws = dr;
+-         memcpy(p->slot, &draws[total_offset], sizeof(draws[0]) * dr);
+-         num_draws -= dr;
++      total_offset += dr;
++      num_draws -= dr;
++   }
++}
+ 
+-         total_offset += dr;
++static void
++tc_draw_indirect(struct pipe_context *_pipe, const struct pipe_draw_info *info,
++                 unsigned drawid_offset,
++                 const struct pipe_draw_indirect_info *indirect,
++                 const struct pipe_draw_start_count_bias *draws,
++                 unsigned num_draws)
++{
++   struct threaded_context *tc = threaded_context(_pipe);
++   assert(!info->has_user_indices);
++   assert(num_draws == 1);
++
++   struct tc_draw_indirect *p =
++      tc_add_call(tc, TC_CALL_draw_indirect, tc_draw_indirect);
++   struct tc_buffer_list *next = &tc->buffer_lists[tc->next_buf_list];
++
++   if (info->index_size) {
++      if (!info->take_index_buffer_ownership) {
++         tc_set_resource_reference(&p->info.index.resource,
++                                   info->index.resource);
+       }
++      tc_add_to_buffer_list(tc, next, info->index.resource);
+    }
++   memcpy(&p->info, info, DRAW_INFO_SIZE_WITHOUT_MIN_MAX_INDEX);
++
++   tc_set_resource_reference(&p->indirect.buffer, indirect->buffer);
++   tc_set_resource_reference(&p->indirect.indirect_draw_count,
++                             indirect->indirect_draw_count);
++   p->indirect.count_from_stream_output = NULL;
++   pipe_so_target_reference(&p->indirect.count_from_stream_output,
++                            indirect->count_from_stream_output);
++
++   if (indirect->buffer)
++      tc_add_to_buffer_list(tc, next, indirect->buffer);
++   if (indirect->indirect_draw_count)
++      tc_add_to_buffer_list(tc, next, indirect->indirect_draw_count);
++   if (indirect->count_from_stream_output)
++      tc_add_to_buffer_list(tc, next, indirect->count_from_stream_output->buffer);
++
++   memcpy(&p->indirect, indirect, sizeof(*indirect));
++   p->draw.start = draws[0].start;
++}
++
++/* Dispatch table for tc_draw_vbo:
++ *
++ * Indexed by:
++ *    [is_indirect * 8 + index_size_and_has_user_indices * 4 +
++ *     is_multi_draw * 2 + non_zero_draw_id]
++ */
++static pipe_draw_func draw_funcs[16] = {
++   tc_draw_single,
++   tc_draw_single_draw_id,
++   tc_draw_multi,
++   tc_draw_multi,
++   tc_draw_user_indices_single,
++   tc_draw_user_indices_single_draw_id,
++   tc_draw_user_indices_multi,
++   tc_draw_user_indices_multi,
++   tc_draw_indirect,
++   tc_draw_indirect,
++   tc_draw_indirect,
++   tc_draw_indirect,
++   tc_draw_indirect,
++   tc_draw_indirect,
++   tc_draw_indirect,
++   tc_draw_indirect,
++};
++
++void
++tc_draw_vbo(struct pipe_context *_pipe, const struct pipe_draw_info *info,
++            unsigned drawid_offset,
++            const struct pipe_draw_indirect_info *indirect,
++            const struct pipe_draw_start_count_bias *draws,
++            unsigned num_draws)
++{
++   STATIC_ASSERT(DRAW_INFO_SIZE_WITHOUT_INDEXBUF_AND_MIN_MAX_INDEX +
++                 sizeof(intptr_t) == offsetof(struct pipe_draw_info, min_index));
++
++   struct threaded_context *tc = threaded_context(_pipe);
++   if (tc->options.parse_renderpass_info)
++      tc_parse_draw(tc);
++
++   /* Use a function table to call the desired variant of draw_vbo. */
++   unsigned index = (indirect != NULL) * 8 +
++                    (info->index_size && info->has_user_indices) * 4 +
++                    (num_draws > 1) * 2 + (drawid_offset != 0);
++   draw_funcs[index](_pipe, info, drawid_offset, indirect, draws, num_draws);
+ 
+    /* This must be after tc_add_*call, which can flush the batch. */
+    if (unlikely(tc->add_all_gfx_bindings_to_buffer_list))
+-- 
+GitLab
+
+
+From e0bcc4c9bd91cd755d3cd96babacbf30a0c68b54 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Thu, 7 Dec 2023 15:50:07 -0500
+Subject: [PATCH 2/7] mesa,u_threaded_context: add a fast path for
+ glDrawElements calling TC directly
+
+mesa/main/draw.c calls threaded_context to add a draw call, but the caller
+fills it manually.
+
+This way we don't have to fill pipe_draw_info in a local variable and later
+copy it to tc_batch. We will it inside tc_batch directly.
+
+It also eliminates a few conditional jumps thanks to assumptions we can make
+in DrawElements but not tc_draw_vbo.
+
+This decreases the overhead of the GL frontend thread by 1.1%, which has
+CPU usage of 26%, so it decreases the overhead for that thread by 4.2%.
+(1.1 / 26)
+---
+ .../auxiliary/util/u_threaded_context.c       | 28 +++++++--
+ .../auxiliary/util/u_threaded_context.h       | 10 ++++
+ src/mesa/main/draw.c                          | 58 ++++++++++++++++++-
+ src/mesa/state_tracker/st_draw.c              |  2 +-
+ src/mesa/state_tracker/st_draw.h              |  7 +++
+ 5 files changed, 95 insertions(+), 10 deletions(-)
+
+diff --git a/src/gallium/auxiliary/util/u_threaded_context.c b/src/gallium/auxiliary/util/u_threaded_context.c
+index 7e1959b932d24..17e27bee9ed16 100644
+--- a/src/gallium/auxiliary/util/u_threaded_context.c
++++ b/src/gallium/auxiliary/util/u_threaded_context.c
+@@ -3693,12 +3693,6 @@ out_of_memory:
+    tc->flushing = false;
+ }
+ 
+-struct tc_draw_single {
+-   struct tc_call_base base;
+-   unsigned index_bias;
+-   struct pipe_draw_info info;
+-};
+-
+ struct tc_draw_single_drawid {
+    struct tc_draw_single base;
+    unsigned drawid_offset;
+@@ -4256,6 +4250,28 @@ tc_draw_vbo(struct pipe_context *_pipe, const struct pipe_draw_info *info,
+       tc_add_all_gfx_bindings_to_buffer_list(tc);
+ }
+ 
++struct tc_draw_single *
++tc_add_draw_single_call(struct pipe_context *_pipe,
++                        struct pipe_resource *index_bo)
++{
++   struct threaded_context *tc = threaded_context(_pipe);
++
++   if (tc->options.parse_renderpass_info)
++      tc_parse_draw(tc);
++
++   struct tc_draw_single *p =
++      tc_add_call(tc, TC_CALL_draw_single, tc_draw_single);
++
++   if (index_bo)
++      tc_add_to_buffer_list(tc, &tc->buffer_lists[tc->next_buf_list], index_bo);
++
++   /* This must be after tc_add_*call, which can flush the batch. */
++   if (unlikely(tc->add_all_gfx_bindings_to_buffer_list))
++      tc_add_all_gfx_bindings_to_buffer_list(tc);
++
++   return p;
++}
++
+ struct tc_draw_vstate_single {
+    struct tc_call_base base;
+    struct pipe_draw_start_count_bias draw;
+diff --git a/src/gallium/auxiliary/util/u_threaded_context.h b/src/gallium/auxiliary/util/u_threaded_context.h
+index 64dfeed543b75..0ceb9bba75bba 100644
+--- a/src/gallium/auxiliary/util/u_threaded_context.h
++++ b/src/gallium/auxiliary/util/u_threaded_context.h
+@@ -404,6 +404,12 @@ struct tc_call_base {
+    uint16_t call_id;
+ };
+ 
++struct tc_draw_single {
++   struct tc_call_base base;
++   unsigned index_bias;
++   struct pipe_draw_info info;
++};
++
+ /**
+  * A token representing an unflushed batch.
+  *
+@@ -683,6 +689,10 @@ threaded_context_flush(struct pipe_context *_pipe,
+                        struct tc_unflushed_batch_token *token,
+                        bool prefer_async);
+ 
++struct tc_draw_single *
++tc_add_draw_single_call(struct pipe_context *_pipe,
++                        struct pipe_resource *index_bo);
++
+ void
+ tc_draw_vbo(struct pipe_context *_pipe, const struct pipe_draw_info *info,
+             unsigned drawid_offset,
+diff --git a/src/mesa/main/draw.c b/src/mesa/main/draw.c
+index d1c902e164f82..fa47d3c7470b9 100644
+--- a/src/mesa/main/draw.c
++++ b/src/mesa/main/draw.c
+@@ -44,6 +44,7 @@
+ #include "api_exec_decl.h"
+ #include "glthread_marshal.h"
+ 
++#include "cso_cache/cso_context.h"
+ #include "state_tracker/st_context.h"
+ #include "state_tracker/st_draw.h"
+ #include "util/u_draw.h"
+@@ -1619,8 +1620,6 @@ _mesa_validated_drawrangeelements(struct gl_context *ctx,
+       assert(end == ~0u);
+    }
+ 
+-   struct pipe_draw_info info;
+-   struct pipe_draw_start_count_bias draw;
+    unsigned index_size_shift = get_index_size_shift(type);
+ 
+    if (index_bo) {
+@@ -1639,6 +1638,60 @@ _mesa_validated_drawrangeelements(struct gl_context *ctx,
+       }
+    }
+ 
++   st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
++
++   /* Fast path for a very common DrawElements case:
++    * - there are no user indices here (always true with glthread)
++    * - DrawGallium is st_draw_gallium (regular render mode, almost always
++    *   true), which only calls cso_context::draw_vbo
++    * - the threaded context is enabled while u_vbuf is bypassed (cso_context
++    *   always calls tc_draw_vbo, which is always true with glthread if all
++    *   vertex formats are also supported by the driver)
++    * - DrawID is 0 (true if glthread isn't unrolling an indirect multi draw,
++    *   which is almost always true)
++    */
++   struct st_context *st = st_context(ctx);
++   if (index_bo && ctx->Driver.DrawGallium == st_draw_gallium &&
++       st->cso_context->draw_vbo == tc_draw_vbo && ctx->DrawID == 0) {
++      assert(!st->draw_needs_minmax_index);
++      struct pipe_resource *index_buffer =
++         _mesa_get_bufferobj_reference(ctx, index_bo);
++      struct tc_draw_single *draw =
++         tc_add_draw_single_call(st->pipe, index_buffer);
++      bool primitive_restart = ctx->Array._PrimitiveRestart[index_size_shift];
++
++      /* This must be set exactly like u_threaded_context sets it, not like
++       * it would be set for draw_vbo.
++       */
++      draw->info.mode = mode;
++      draw->info.index_size = 1 << index_size_shift;
++      draw->info.view_mask = 0;
++      /* Packed section begin. */
++      draw->info.primitive_restart = primitive_restart;
++      draw->info.has_user_indices = false;
++      draw->info.index_bounds_valid = false;
++      draw->info.increment_draw_id = false;
++      draw->info.take_index_buffer_ownership = false;
++      draw->info.index_bias_varies = false;
++      draw->info.was_line_loop = false;
++      draw->info._pad = 0;
++      /* Packed section end. */
++      draw->info.start_instance = baseInstance;
++      draw->info.instance_count = numInstances;
++      draw->info.restart_index =
++         primitive_restart ? ctx->Array._RestartIndex[index_size_shift] : 0;
++      draw->info.index.resource = index_buffer;
++
++      /* u_threaded_context stores start/count in min/max_index for single draws. */
++      draw->info.min_index = (uintptr_t)indices >> index_size_shift;
++      draw->info.max_index = count;
++      draw->index_bias = basevertex;
++      return;
++   }
++
++   struct pipe_draw_info info;
++   struct pipe_draw_start_count_bias draw;
++
+    info.mode = mode;
+    info.index_size = 1 << index_size_shift;
+    /* Packed section begin. */
+@@ -1675,7 +1728,6 @@ _mesa_validated_drawrangeelements(struct gl_context *ctx,
+    info.max_index = end;
+    draw.count = count;
+ 
+-   st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
+    if (!validate_index_bounds(ctx, &info, &draw, 1))
+       return;
+ 
+diff --git a/src/mesa/state_tracker/st_draw.c b/src/mesa/state_tracker/st_draw.c
+index a2d0b85d0fd52..d1f54f6b18922 100644
+--- a/src/mesa/state_tracker/st_draw.c
++++ b/src/mesa/state_tracker/st_draw.c
+@@ -111,7 +111,7 @@ st_prepare_draw(struct gl_context *ctx, uint64_t state_mask)
+    }
+ }
+ 
+-static void
++void
+ st_draw_gallium(struct gl_context *ctx,
+                 struct pipe_draw_info *info,
+                 unsigned drawid_offset,
+diff --git a/src/mesa/state_tracker/st_draw.h b/src/mesa/state_tracker/st_draw.h
+index a52182e045109..76d473b2d2438 100644
+--- a/src/mesa/state_tracker/st_draw.h
++++ b/src/mesa/state_tracker/st_draw.h
+@@ -76,6 +76,13 @@ pointer_to_offset(const void *ptr)
+ void
+ st_prepare_draw(struct gl_context *ctx, uint64_t state_mask);
+ 
++void
++st_draw_gallium(struct gl_context *ctx,
++                struct pipe_draw_info *info,
++                unsigned drawid_offset,
++                const struct pipe_draw_start_count_bias *draws,
++                unsigned num_draws);
++
+ bool
+ st_draw_quad(struct st_context *st,
+              float x0, float y0, float x1, float y1, float z,
+-- 
+GitLab
+
+
+From 88f252000f0d2973b5dcc5c2d6f5f8bdb5efad3d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Sun, 10 Dec 2023 16:14:06 -0500
+Subject: [PATCH 3/7] mesa: micro-improvements in draw.c
+
+- use ctx->pipe instead of ctx->st->pipe
+- call st_prepare_draw outside the loop
+- don't call DrawGallium is draw.count == 0
+---
+ src/mesa/main/draw.c | 21 +++++++++++++--------
+ 1 file changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/src/mesa/main/draw.c b/src/mesa/main/draw.c
+index fa47d3c7470b9..e76ed13eb1f50 100644
+--- a/src/mesa/main/draw.c
++++ b/src/mesa/main/draw.c
+@@ -1714,7 +1714,7 @@ _mesa_validated_drawrangeelements(struct gl_context *ctx,
+    } else {
+       draw.start = (uintptr_t)indices >> index_size_shift;
+ 
+-      if (ctx->st->pipe->draw_vbo == tc_draw_vbo) {
++      if (ctx->pipe->draw_vbo == tc_draw_vbo) {
+          /* Fast path for u_threaded_context to eliminate atomics. */
+          info.index.resource = _mesa_get_bufferobj_reference(ctx, index_bo);
+          info.take_index_buffer_ownership = true;
+@@ -2068,7 +2068,7 @@ _mesa_validated_multidrawelements(struct gl_context *ctx,
+    if (info.has_user_indices) {
+       info.index.user = (void*)min_index_ptr;
+    } else {
+-      if (ctx->st->pipe->draw_vbo == tc_draw_vbo) {
++      if (ctx->pipe->draw_vbo == tc_draw_vbo) {
+          /* Fast path for u_threaded_context to eliminate atomics. */
+          info.index.resource = _mesa_get_bufferobj_reference(ctx, index_bo);
+          info.take_index_buffer_ownership = true;
+@@ -2121,6 +2121,8 @@ _mesa_validated_multidrawelements(struct gl_context *ctx,
+       assert(info.has_user_indices);
+       info.increment_draw_id = false;
+ 
++      st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
++
+       for (int i = 0; i < primcount; i++) {
+          struct pipe_draw_start_count_bias draw;
+ 
+@@ -2134,8 +2136,7 @@ _mesa_validated_multidrawelements(struct gl_context *ctx,
+          draw.index_bias = basevertex ? basevertex[i] : 0;
+          draw.count = count[i];
+ 
+-         st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
+-         if (!validate_index_bounds(ctx, &info, &draw, 1))
++         if (!draw.count || !validate_index_bounds(ctx, &info, &draw, 1))
+             continue;
+ 
+          ctx->Driver.DrawGallium(ctx, &info, i, &draw, 1);
+@@ -2451,6 +2452,8 @@ _mesa_MultiDrawArraysIndirect(GLenum mode, const GLvoid *indirect,
+       info.index_bias_varies = false;
+       /* Packed section end. */
+ 
++      st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
++
+       const uint8_t *ptr = (const uint8_t *) indirect;
+       for (unsigned i = 0; i < primcount; i++) {
+          DrawArraysIndirectCommand *cmd = (DrawArraysIndirectCommand *) ptr;
+@@ -2462,7 +2465,8 @@ _mesa_MultiDrawArraysIndirect(GLenum mode, const GLvoid *indirect,
+          draw.start = cmd->first;
+          draw.count = cmd->count;
+ 
+-         st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
++         if (!draw.count)
++            continue;
+ 
+          ctx->Driver.DrawGallium(ctx, &info, i, &draw, 1);
+          ptr += stride;
+@@ -2546,7 +2550,7 @@ _mesa_MultiDrawElementsIndirect(GLenum mode, GLenum type,
+ 
+       struct gl_buffer_object *index_bo = ctx->Array.VAO->IndexBufferObj;
+ 
+-      if (ctx->st->pipe->draw_vbo == tc_draw_vbo) {
++      if (ctx->pipe->draw_vbo == tc_draw_vbo) {
+          /* Fast path for u_threaded_context to eliminate atomics. */
+          info.index.resource = _mesa_get_bufferobj_reference(ctx, index_bo);
+          info.take_index_buffer_ownership = true;
+@@ -2563,6 +2567,8 @@ _mesa_MultiDrawElementsIndirect(GLenum mode, GLenum type,
+       if (!info.index.resource)
+          return;
+ 
++      st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
++
+       const uint8_t *ptr = (const uint8_t *) indirect;
+       for (unsigned i = 0; i < primcount; i++) {
+          DrawElementsIndirectCommand *cmd = (DrawElementsIndirectCommand*)ptr;
+@@ -2575,8 +2581,7 @@ _mesa_MultiDrawElementsIndirect(GLenum mode, GLenum type,
+          draw.count = cmd->count;
+          draw.index_bias = cmd->baseVertex;
+ 
+-         st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
+-         if (!validate_index_bounds(ctx, &info, &draw, 1))
++         if (!draw.count || !validate_index_bounds(ctx, &info, &draw, 1))
+             continue;
+ 
+          ctx->Driver.DrawGallium(ctx, &info, i, &draw, 1);
+-- 
+GitLab
+
+
+From 858c3abd90c782520160df2c87ff3acff3502d0e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Sat, 31 Dec 2022 12:25:32 -0500
+Subject: [PATCH 4/7] st/mesa: restore pipe_draw_info::mode at the end of
+ st_hw_select_draw_gallium
+
+This fixes possible incorrect rendering with lowered multi draws because
+the first draw would override the prim type and the next draws would use
+the overriden (incorrect) prim type.
+---
+ src/mesa/state_tracker/st_draw.c | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/src/mesa/state_tracker/st_draw.c b/src/mesa/state_tracker/st_draw.c
+index d1f54f6b18922..7090bbfcc0bec 100644
+--- a/src/mesa/state_tracker/st_draw.c
++++ b/src/mesa/state_tracker/st_draw.c
+@@ -443,12 +443,15 @@ st_hw_select_draw_gallium(struct gl_context *ctx,
+                           unsigned num_draws)
+ {
+    struct st_context *st = st_context(ctx);
++   enum mesa_prim old_mode = info->mode;
+ 
+-   if (!st_draw_hw_select_prepare_common(ctx) ||
+-       !st_draw_hw_select_prepare_mode(ctx, info))
+-      return;
++   if (st_draw_hw_select_prepare_common(ctx) &&
++       st_draw_hw_select_prepare_mode(ctx, info)) {
++      cso_draw_vbo(st->cso_context, info, drawid_offset, NULL, draws,
++                   num_draws);
++   }
+ 
+-   cso_draw_vbo(st->cso_context, info, drawid_offset, NULL, draws, num_draws);
++   info->mode = old_mode;
+ }
+ 
+ static void
+-- 
+GitLab
+
+
+From a7b7523165b71e4047d756cf09a26d9112cf86a1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Sat, 31 Dec 2022 13:41:49 -0500
+Subject: [PATCH 5/7] mesa: add a pipe_draw_indirect_info* parameter into the
+ DrawGallium callback
+
+We need this to enable GL_SELECT and GL_FEEDBACK modes for indirect draws.
+---
+ src/mesa/main/dd.h                        |  5 +++--
+ src/mesa/main/draw.c                      | 14 +++++++-------
+ src/mesa/state_tracker/st_cb_rasterpos.c  |  2 +-
+ src/mesa/state_tracker/st_draw.c          |  6 ++++--
+ src/mesa/state_tracker/st_draw.h          |  2 ++
+ src/mesa/state_tracker/st_draw_feedback.c |  6 +++---
+ src/mesa/vbo/vbo_save_draw.c              |  4 ++--
+ 7 files changed, 22 insertions(+), 17 deletions(-)
+
+diff --git a/src/mesa/main/dd.h b/src/mesa/main/dd.h
+index 972f515dba91a..fea734db1e7c5 100644
+--- a/src/mesa/main/dd.h
++++ b/src/mesa/main/dd.h
+@@ -62,6 +62,7 @@ struct gl_vertex_array_object;
+ struct ati_fragment_shader;
+ struct util_queue_monitoring;
+ struct pipe_draw_info;
++struct pipe_draw_indirect_info;
+ struct pipe_draw_start_count_bias;
+ struct pipe_vertex_state;
+ struct pipe_draw_vertex_state_info;
+@@ -145,8 +146,7 @@ struct dd_function_table {
+     * Optimal Gallium version of Draw() that doesn't require translation
+     * of draw info in the state tracker.
+     *
+-    * The interface is identical to pipe_context::draw_vbo
+-    * with indirect == NULL.
++    * The interface is identical to pipe_context::draw_vbo.
+     *
+     * "info" is not const and the following fields can be changed by
+     * the callee, so callers should be aware:
+@@ -158,6 +158,7 @@ struct dd_function_table {
+    void (*DrawGallium)(struct gl_context *ctx,
+                        struct pipe_draw_info *info,
+                        unsigned drawid_offset,
++                       const struct pipe_draw_indirect_info *indirect,
+                        const struct pipe_draw_start_count_bias *draws,
+                        unsigned num_draws);
+ 
+diff --git a/src/mesa/main/draw.c b/src/mesa/main/draw.c
+index e76ed13eb1f50..95ea070998048 100644
+--- a/src/mesa/main/draw.c
++++ b/src/mesa/main/draw.c
+@@ -1201,7 +1201,7 @@ _mesa_draw_arrays(struct gl_context *ctx, GLenum mode, GLint start,
+ 
+    st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
+ 
+-   ctx->Driver.DrawGallium(ctx, &info, ctx->DrawID, &draw, 1);
++   ctx->Driver.DrawGallium(ctx, &info, ctx->DrawID, NULL, &draw, 1);
+ 
+    if (MESA_DEBUG_FLAGS & DEBUG_ALWAYS_FLUSH) {
+       _mesa_flush(ctx);
+@@ -1508,7 +1508,7 @@ _mesa_MultiDrawArrays(GLenum mode, const GLint *first,
+ 
+    st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
+ 
+-   ctx->Driver.DrawGallium(ctx, &info, 0, draw, primcount);
++   ctx->Driver.DrawGallium(ctx, &info, 0, NULL, draw, primcount);
+ 
+    if (MESA_DEBUG_FLAGS & DEBUG_ALWAYS_FLUSH)
+       _mesa_flush(ctx);
+@@ -1731,7 +1731,7 @@ _mesa_validated_drawrangeelements(struct gl_context *ctx,
+    if (!validate_index_bounds(ctx, &info, &draw, 1))
+       return;
+ 
+-   ctx->Driver.DrawGallium(ctx, &info, ctx->DrawID, &draw, 1);
++   ctx->Driver.DrawGallium(ctx, &info, ctx->DrawID, NULL, &draw, 1);
+ 
+    if (MESA_DEBUG_FLAGS & DEBUG_ALWAYS_FLUSH) {
+       _mesa_flush(ctx);
+@@ -2115,7 +2115,7 @@ _mesa_validated_multidrawelements(struct gl_context *ctx,
+       if (!validate_index_bounds(ctx, &info, draw, primcount))
+          return;
+ 
+-      ctx->Driver.DrawGallium(ctx, &info, 0, draw, primcount);
++      ctx->Driver.DrawGallium(ctx, &info, 0, NULL, draw, primcount);
+    } else {
+       /* draw[i].start would overflow. Draw one at a time. */
+       assert(info.has_user_indices);
+@@ -2139,7 +2139,7 @@ _mesa_validated_multidrawelements(struct gl_context *ctx,
+          if (!draw.count || !validate_index_bounds(ctx, &info, &draw, 1))
+             continue;
+ 
+-         ctx->Driver.DrawGallium(ctx, &info, i, &draw, 1);
++         ctx->Driver.DrawGallium(ctx, &info, i, NULL, &draw, 1);
+       }
+    }
+ 
+@@ -2468,7 +2468,7 @@ _mesa_MultiDrawArraysIndirect(GLenum mode, const GLvoid *indirect,
+          if (!draw.count)
+             continue;
+ 
+-         ctx->Driver.DrawGallium(ctx, &info, i, &draw, 1);
++         ctx->Driver.DrawGallium(ctx, &info, i, NULL, &draw, 1);
+          ptr += stride;
+       }
+ 
+@@ -2584,7 +2584,7 @@ _mesa_MultiDrawElementsIndirect(GLenum mode, GLenum type,
+          if (!draw.count || !validate_index_bounds(ctx, &info, &draw, 1))
+             continue;
+ 
+-         ctx->Driver.DrawGallium(ctx, &info, i, &draw, 1);
++         ctx->Driver.DrawGallium(ctx, &info, i, NULL, &draw, 1);
+          ptr += stride;
+       }
+ 
+diff --git a/src/mesa/state_tracker/st_cb_rasterpos.c b/src/mesa/state_tracker/st_cb_rasterpos.c
+index c728ff92868dc..fe8ec093f8c7f 100644
+--- a/src/mesa/state_tracker/st_cb_rasterpos.c
++++ b/src/mesa/state_tracker/st_cb_rasterpos.c
+@@ -278,7 +278,7 @@ st_RasterPos(struct gl_context *ctx, const GLfloat v[4])
+                                ctx->Array._DrawVAO->_EnabledWithMapMode);
+ 
+    st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
+-   st_feedback_draw_vbo(ctx, &rs->info, 0, &rs->draw, 1);
++   st_feedback_draw_vbo(ctx, &rs->info, 0, NULL, &rs->draw, 1);
+ 
+    _mesa_restore_draw_vao(ctx, old_vao, old_vp_input_filter);
+ 
+diff --git a/src/mesa/state_tracker/st_draw.c b/src/mesa/state_tracker/st_draw.c
+index 7090bbfcc0bec..cd5ea789a5860 100644
+--- a/src/mesa/state_tracker/st_draw.c
++++ b/src/mesa/state_tracker/st_draw.c
+@@ -115,12 +115,13 @@ void
+ st_draw_gallium(struct gl_context *ctx,
+                 struct pipe_draw_info *info,
+                 unsigned drawid_offset,
++                const struct pipe_draw_indirect_info *indirect,
+                 const struct pipe_draw_start_count_bias *draws,
+                 unsigned num_draws)
+ {
+    struct st_context *st = st_context(ctx);
+ 
+-   cso_draw_vbo(st->cso_context, info, drawid_offset, NULL, draws, num_draws);
++   cso_draw_vbo(st->cso_context, info, drawid_offset, indirect, draws, num_draws);
+ }
+ 
+ static void
+@@ -439,6 +440,7 @@ static void
+ st_hw_select_draw_gallium(struct gl_context *ctx,
+                           struct pipe_draw_info *info,
+                           unsigned drawid_offset,
++                          const struct pipe_draw_indirect_info *indirect,
+                           const struct pipe_draw_start_count_bias *draws,
+                           unsigned num_draws)
+ {
+@@ -447,7 +449,7 @@ st_hw_select_draw_gallium(struct gl_context *ctx,
+ 
+    if (st_draw_hw_select_prepare_common(ctx) &&
+        st_draw_hw_select_prepare_mode(ctx, info)) {
+-      cso_draw_vbo(st->cso_context, info, drawid_offset, NULL, draws,
++      cso_draw_vbo(st->cso_context, info, drawid_offset, indirect, draws,
+                    num_draws);
+    }
+ 
+diff --git a/src/mesa/state_tracker/st_draw.h b/src/mesa/state_tracker/st_draw.h
+index 76d473b2d2438..fb847a86b5791 100644
+--- a/src/mesa/state_tracker/st_draw.h
++++ b/src/mesa/state_tracker/st_draw.h
+@@ -50,6 +50,7 @@ void
+ st_feedback_draw_vbo(struct gl_context *ctx,
+                      struct pipe_draw_info *info,
+                      unsigned drawid_offset,
++                     const struct pipe_draw_indirect_info *indirect,
+                      const struct pipe_draw_start_count_bias *draws,
+                      unsigned num_draws);
+ 
+@@ -80,6 +81,7 @@ void
+ st_draw_gallium(struct gl_context *ctx,
+                 struct pipe_draw_info *info,
+                 unsigned drawid_offset,
++                const struct pipe_draw_indirect_info *indirect,
+                 const struct pipe_draw_start_count_bias *draws,
+                 unsigned num_draws);
+ 
+diff --git a/src/mesa/state_tracker/st_draw_feedback.c b/src/mesa/state_tracker/st_draw_feedback.c
+index 4da566849c44b..e667759b850bf 100644
+--- a/src/mesa/state_tracker/st_draw_feedback.c
++++ b/src/mesa/state_tracker/st_draw_feedback.c
+@@ -95,6 +95,7 @@ void
+ st_feedback_draw_vbo(struct gl_context *ctx,
+                      struct pipe_draw_info *info,
+                      unsigned drawid_offset,
++                     const struct pipe_draw_indirect_info *indirect,
+                      const struct pipe_draw_start_count_bias *draws,
+                      unsigned num_draws)
+ {
+@@ -386,8 +387,7 @@ st_feedback_draw_vbo(struct gl_context *ctx,
+ 
+    /* draw here */
+    for (i = 0; i < num_draws; i++) {
+-      /* TODO: indirect draws */
+-      draw_vbo(draw, info, info->increment_draw_id ? i : 0, NULL,
++      draw_vbo(draw, info, info->increment_draw_id ? i : 0, indirect,
+                &draws[i], 1, ctx->TessCtrlProgram.patch_vertices);
+    }
+ 
+@@ -469,6 +469,6 @@ st_feedback_draw_vbo_multi_mode(struct gl_context *ctx,
+ {
+    for (unsigned i = 0; i < num_draws; i++) {
+       info->mode = mode[i];
+-      st_feedback_draw_vbo(ctx, info, 0, &draws[i], 1);
++      st_feedback_draw_vbo(ctx, info, 0, NULL, &draws[i], 1);
+    }
+ }
+diff --git a/src/mesa/vbo/vbo_save_draw.c b/src/mesa/vbo/vbo_save_draw.c
+index 7d46341ebfe1a..0923db73514d9 100644
+--- a/src/mesa/vbo/vbo_save_draw.c
++++ b/src/mesa/vbo/vbo_save_draw.c
+@@ -359,9 +359,9 @@ vbo_save_playback_vertex_list(struct gl_context *ctx, void *data, bool copy_to_c
+                                        node->modes,
+                                        node->num_draws);
+    } else if (node->num_draws == 1) {
+-      ctx->Driver.DrawGallium(ctx, info, 0, &node->start_count, 1);
++      ctx->Driver.DrawGallium(ctx, info, 0, NULL, &node->start_count, 1);
+    } else if (node->num_draws) {
+-      ctx->Driver.DrawGallium(ctx, info, 0, node->start_counts,
++      ctx->Driver.DrawGallium(ctx, info, 0, NULL, node->start_counts,
+                               node->num_draws);
+    }
+ 
+-- 
+GitLab
+
+
+From 70fa44c3105551943c9711b212094100b2e375ea Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Sat, 31 Dec 2022 22:39:55 -0500
+Subject: [PATCH 6/7] mesa: enable GL_SELECT and GL_FEEDBACK modes for indirect
+ draws
+
+This enables the correct GL_SELECT/GL_FEEDBACK codepaths for indirect
+draws.
+---
+ src/mesa/main/draw.c             | 2 +-
+ src/mesa/state_tracker/st_draw.c | 6 +++---
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/mesa/main/draw.c b/src/mesa/main/draw.c
+index 95ea070998048..f97f70e801df4 100644
+--- a/src/mesa/main/draw.c
++++ b/src/mesa/main/draw.c
+@@ -2299,7 +2299,7 @@ _mesa_DrawTransformFeedbackStreamInstanced(GLenum mode, GLuint name,
+    info.mode = mode;
+    info.instance_count = primcount;
+ 
+-   cso_draw_vbo(st_context(ctx)->cso_context, &info, 0, &indirect, &draw, 1);
++   ctx->Driver.DrawGallium(ctx, &info, 0, &indirect, &draw, 1);
+ 
+    if (MESA_DEBUG_FLAGS & DEBUG_ALWAYS_FLUSH) {
+       _mesa_flush(ctx);
+diff --git a/src/mesa/state_tracker/st_draw.c b/src/mesa/state_tracker/st_draw.c
+index cd5ea789a5860..0a8ccf0fa62e5 100644
+--- a/src/mesa/state_tracker/st_draw.c
++++ b/src/mesa/state_tracker/st_draw.c
+@@ -162,7 +162,7 @@ rewrite_partial_stride_indirect(struct st_context *st,
+    if (!new_draws)
+       return;
+    for (unsigned i = 0; i < draw_count; i++)
+-      cso_draw_vbo(st->cso_context, &new_draws[i].info, i, NULL, &new_draws[i].draw, 1);
++      st->ctx->Driver.DrawGallium(st->ctx, &new_draws[i].info, i, NULL, &new_draws[i].draw, 1);
+    free(new_draws);
+ }
+ 
+@@ -244,7 +244,7 @@ st_indirect_draw_vbo(struct gl_context *ctx,
+ 
+       indirect.draw_count = 1;
+       for (i = 0; i < draw_count; i++) {
+-         cso_draw_vbo(st->cso_context, &info, i, &indirect, &draw, 1);
++         ctx->Driver.DrawGallium(ctx, &info, i, &indirect, &draw, 1);
+          indirect.offset += stride;
+       }
+    } else {
+@@ -264,7 +264,7 @@ st_indirect_draw_vbo(struct gl_context *ctx,
+             indirect_draw_count->buffer;
+          indirect.indirect_draw_count_offset = indirect_draw_count_offset;
+       }
+-      cso_draw_vbo(st->cso_context, &info, 0, &indirect, &draw, 1);
++      ctx->Driver.DrawGallium(ctx, &info, 0, &indirect, &draw, 1);
+    }
+ 
+    if (MESA_DEBUG_FLAGS & DEBUG_ALWAYS_FLUSH)
+-- 
+GitLab
+
+
+From c8bd26fd8aee5f191642fe0646e4efa55b5a94a7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Fri, 8 Dec 2023 21:38:30 -0500
+Subject: [PATCH 7/7] glthread: add a missing end-of-batch marker
+
+Unmarshal calls that "look ahead" in the batch use it. They expect
+the next call ID to be equal to a specific GL call. NUM_DISPATCH_CMD
+is not equal to any GL call (it's last_call_id + 1).
+
+This was missed in the referenced commit, causing assertion failures.
+
+Fixes: c3b95d1507d809ff9c - glthread: add a marker at the end of batches indicating the end
+---
+ src/mesa/main/glthread.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/mesa/main/glthread.c b/src/mesa/main/glthread.c
+index a6e62516d021b..f16326a7a71f3 100644
+--- a/src/mesa/main/glthread.c
++++ b/src/mesa/main/glthread.c
+@@ -390,6 +390,11 @@ _mesa_glthread_finish(struct gl_context *ctx)
+    }
+ 
+    if (glthread->used) {
++      /* Mark the end of the batch, but don't increment "used". */
++      struct marshal_cmd_base *last =
++         (struct marshal_cmd_base *)&next->buffer[glthread->used];
++      last->cmd_id = NUM_DISPATCH_CMD;
++
+       p_atomic_add(&glthread->stats.num_direct_items, glthread->used);
+       next->used = glthread->used;
+       glthread->used = 0;
+-- 
+GitLab
+
