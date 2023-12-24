@@ -56,7 +56,7 @@ cmake -G Ninja ../llvm-project/llvm \
     -DCMAKE_INSTALL_PREFIX=${TOPLEV}/stage3-without-sampling/install
 
 echo "== Start Training Build"
-ninja & read -t 800 || kill $!
+ninja & read -t 500 || kill $!
 
 echo "Merging generated profiles"
 cd ${TOPLEV}/stage3-without-sampling/instrumentdata
