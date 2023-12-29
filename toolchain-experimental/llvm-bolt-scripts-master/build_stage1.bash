@@ -28,11 +28,11 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -DLLVM_USE_PERF=OFF \
     -DLLVM_ENABLE_PROJECTS="clang;lld;bolt;compiler-rt" \
     -DLLVM_TARGETS_TO_BUILD="X86" \
-    -D CMAKE_C_FLAGS="-O3 -march=native -mtune=native -maes -mbmi2 -mpclmul -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -fprofile-use=/home/marcus/Downloads/llvm17.profdata" \
-    -D CMAKE_CXX_FLAGS="-O3 -march=native -mtune=native -maes -mbmi2 -mpclmul -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -fprofile-use=/home/marcus/Downloads/llvm17.profdata" \
-    -D CMAKE_EXE_LINKER_FLAGS="-Wl,--thinlto-jobs=8 -Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -flto=thin -fwhole-program-vtables -fuse-ld=lld -Wl,-zmax-page-size=0x200000 -fprofile-use=/home/marcus/Downloads/llvm17.profdata -Wl,--push-state -Wl,-whole-archive -ljemalloc_pic -Wl,--pop-state -lpthread -lstdc++ -lm -ldl" \
-    -D CMAKE_MODULE_LINKER_FLAGS="-Wl,--thinlto-jobs=8 -Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -flto=thin -fwhole-program-vtables -fuse-ld=lld -Wl,-zmax-page-size=0x200000 -fprofile-use=/home/marcus/Downloads/llvm17.profdata -Wl,--push-state -Wl,-whole-archive -ljemalloc_pic -Wl,--pop-state -lpthread -lstdc++ -lm -ldl" \
-    -D CMAKE_SHARED_LINKER_FLAGS="-Wl,--thinlto-jobs=8 -Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -flto=thin -fwhole-program-vtables -fuse-ld=lld -Wl,-zmax-page-size=0x200000 -fprofile-use=/home/marcus/Downloads/llvm17.profdata -Wl,--push-state -Wl,-whole-archive -ljemalloc_pic -Wl,--pop-state -lpthread -lstdc++ -lm -ldl" \
+    -D CMAKE_C_FLAGS="-O3 -march=native -mtune=native -maes -mbmi2 -mpclmul -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -fprofile-use=/home/marcus/Downloads/llvm18.profdata" \
+    -D CMAKE_CXX_FLAGS="-O3 -march=native -mtune=native -maes -mbmi2 -mpclmul -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -fprofile-use=/home/marcus/Downloads/llvm18.profdata" \
+    -D CMAKE_EXE_LINKER_FLAGS="-Wl,--thinlto-jobs=8 -Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -flto=thin -fwhole-program-vtables -fuse-ld=lld -Wl,-zmax-page-size=0x200000 -fprofile-use=/home/marcus/Downloads/llvm18.profdata -Wl,--push-state -Wl,-whole-archive -ljemalloc_pic -Wl,--pop-state -lpthread -lstdc++ -lm -ldl" \
+    -D CMAKE_MODULE_LINKER_FLAGS="-Wl,--thinlto-jobs=8 -Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -flto=thin -fwhole-program-vtables -fuse-ld=lld -Wl,-zmax-page-size=0x200000 -fprofile-use=/home/marcus/Downloads/llvm18.profdata -Wl,--push-state -Wl,-whole-archive -ljemalloc_pic -Wl,--pop-state -lpthread -lstdc++ -lm -ldl" \
+    -D CMAKE_SHARED_LINKER_FLAGS="-Wl,--thinlto-jobs=8 -Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -flto=thin -fwhole-program-vtables -fuse-ld=lld -Wl,-zmax-page-size=0x200000 -fprofile-use=/home/marcus/Downloads/llvm18.profdata -Wl,--push-state -Wl,-whole-archive -ljemalloc_pic -Wl,--pop-state -lpthread -lstdc++ -lm -ldl" \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLVM_BUILD_UTILS=OFF \
     -DLLVM_ENABLE_BACKTRACES=OFF \
