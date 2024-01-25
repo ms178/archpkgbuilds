@@ -1,0 +1,887 @@
+From 2d5b49aa7ee4bdc02e28b4e0c82ef77b1ab4fc69 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Wed, 17 Jan 2024 08:18:40 -0500
+Subject: [PATCH 1/7] mesa,gallium: move the thread scheduler to src/util
+
+The only change in behavior is that setting the affinity mask is skipped
+when it has no effect, which happens when the app thread hasn't been moved
+under a different L3 cache by the kernel (the sched_state variable tracks
+that). This improves performance because setting the affinity mask incurs
+measurable CPU overhead even if it has no effect.
+---
+ .../auxiliary/util/u_threaded_context.c       |  8 +--
+ src/gallium/drivers/zink/zink_context.c       |  6 +-
+ src/gallium/include/winsys/radeon_winsys.h    |  2 +-
+ src/gallium/winsys/amdgpu/drm/amdgpu_winsys.c |  8 +--
+ .../winsys/radeon/drm/radeon_drm_winsys.c     |  8 +--
+ src/mesa/main/glthread.c                      | 31 ++++-----
+ src/mesa/main/glthread.h                      |  2 +
+ src/mesa/state_tracker/st_context.c           |  4 +-
+ src/mesa/state_tracker/st_draw.c              |  6 +-
+ src/util/meson.build                          |  2 +
+ src/util/thread_sched.c                       | 66 +++++++++++++++++++
+ src/util/thread_sched.h                       | 30 +++++++++
+ 12 files changed, 137 insertions(+), 36 deletions(-)
+ create mode 100644 src/util/thread_sched.c
+ create mode 100644 src/util/thread_sched.h
+
+diff --git a/src/gallium/auxiliary/util/u_threaded_context.c b/src/gallium/auxiliary/util/u_threaded_context.c
+index 8da515805b0f9..19bcded5b135f 100644
+--- a/src/gallium/auxiliary/util/u_threaded_context.c
++++ b/src/gallium/auxiliary/util/u_threaded_context.c
+@@ -33,6 +33,7 @@
+ #include "driver_trace/tr_context.h"
+ #include "util/log.h"
+ #include "util/perf/cpu_trace.h"
++#include "util/thread_sched.h"
+ #include "compiler/shader_info.h"
+ 
+ #if TC_DEBUG >= 1
+@@ -3552,10 +3553,9 @@ tc_set_context_param(struct pipe_context *_pipe,
+    struct threaded_context *tc = threaded_context(_pipe);
+ 
+    if (param == PIPE_CONTEXT_PARAM_PIN_THREADS_TO_L3_CACHE) {
+-      /* Pin the gallium thread as requested. */
+-      util_set_thread_affinity(tc->queue.threads[0],
+-                               util_get_cpu_caps()->L3_affinity_mask[value],
+-                               NULL, util_get_cpu_caps()->num_cpu_mask_bits);
++      util_thread_sched_apply_policy(tc->queue.threads[0],
++                                     UTIL_THREAD_THREADED_CONTEXT, value,
++                                     NULL);
+ 
+       /* Execute this immediately (without enqueuing).
+        * It's required to be thread-safe.
+diff --git a/src/gallium/drivers/zink/zink_context.c b/src/gallium/drivers/zink/zink_context.c
+index 2c4f8167f9d0f..cd30c4d3f9e81 100644
+--- a/src/gallium/drivers/zink/zink_context.c
++++ b/src/gallium/drivers/zink/zink_context.c
+@@ -52,6 +52,7 @@
+ #include "util/u_thread.h"
+ #include "util/perf/u_trace.h"
+ #include "util/u_cpu_detect.h"
++#include "util/thread_sched.h"
+ #include "util/strndup.h"
+ #include "nir.h"
+ #include "nir_builder.h"
+@@ -330,9 +331,8 @@ zink_set_context_param(struct pipe_context *pctx, enum pipe_context_param param,
+    switch (param) {
+    case PIPE_CONTEXT_PARAM_PIN_THREADS_TO_L3_CACHE:
+       if (screen->threaded_submit)
+-         util_set_thread_affinity(screen->flush_queue.threads[0],
+-                                 util_get_cpu_caps()->L3_affinity_mask[value],
+-                                 NULL, util_get_cpu_caps()->num_cpu_mask_bits);
++         util_thread_sched_apply_policy(screen->flush_queue.threads[0],
++                                        UTIL_THREAD_DRIVER_SUBMIT, value, NULL);
+       break;
+    default:
+       break;
+diff --git a/src/gallium/include/winsys/radeon_winsys.h b/src/gallium/include/winsys/radeon_winsys.h
+index 02f7ee48d6df5..30554e1ebcb72 100644
+--- a/src/gallium/include/winsys/radeon_winsys.h
++++ b/src/gallium/include/winsys/radeon_winsys.h
+@@ -314,7 +314,7 @@ struct radeon_winsys {
+     * L3 caches. This is needed for good multithreading performance on
+     * AMD Zen CPUs.
+     */
+-   void (*pin_threads_to_L3_cache)(struct radeon_winsys *ws, unsigned cache);
++   void (*pin_threads_to_L3_cache)(struct radeon_winsys *ws, unsigned cpu);
+ 
+    /**************************************************************************
+     * Buffer management. Buffer attributes are mostly fixed over its lifetime.
+diff --git a/src/gallium/winsys/amdgpu/drm/amdgpu_winsys.c b/src/gallium/winsys/amdgpu/drm/amdgpu_winsys.c
+index 5673ecf228b33..14e29cb1cdd44 100644
+--- a/src/gallium/winsys/amdgpu/drm/amdgpu_winsys.c
++++ b/src/gallium/winsys/amdgpu/drm/amdgpu_winsys.c
+@@ -14,6 +14,7 @@
+ #include "util/u_cpu_detect.h"
+ #include "util/u_hash_table.h"
+ #include "util/hash_table.h"
++#include "util/thread_sched.h"
+ #include "util/xmlconfig.h"
+ #include "drm-uapi/amdgpu_drm.h"
+ #include <xf86drm.h>
+@@ -270,13 +271,12 @@ static bool amdgpu_winsys_unref(struct radeon_winsys *rws)
+ }
+ 
+ static void amdgpu_pin_threads_to_L3_cache(struct radeon_winsys *rws,
+-                                           unsigned cache)
++                                           unsigned cpu)
+ {
+    struct amdgpu_winsys *ws = amdgpu_winsys(rws);
+ 
+-   util_set_thread_affinity(ws->cs_queue.threads[0],
+-                            util_get_cpu_caps()->L3_affinity_mask[cache],
+-                            NULL, util_get_cpu_caps()->num_cpu_mask_bits);
++   util_thread_sched_apply_policy(ws->cs_queue.threads[0],
++                                  UTIL_THREAD_DRIVER_SUBMIT, cpu, NULL);
+ }
+ 
+ static uint32_t kms_handle_hash(const void *key)
+diff --git a/src/gallium/winsys/radeon/drm/radeon_drm_winsys.c b/src/gallium/winsys/radeon/drm/radeon_drm_winsys.c
+index 864434944005e..87fc49983a9a3 100644
+--- a/src/gallium/winsys/radeon/drm/radeon_drm_winsys.c
++++ b/src/gallium/winsys/radeon/drm/radeon_drm_winsys.c
+@@ -10,6 +10,7 @@
+ 
+ #include "util/os_file.h"
+ #include "util/simple_mtx.h"
++#include "util/thread_sched.h"
+ #include "util/u_cpu_detect.h"
+ #include "util/u_memory.h"
+ #include "util/u_hash_table.h"
+@@ -825,14 +826,13 @@ static bool radeon_winsys_unref(struct radeon_winsys *ws)
+ }
+ 
+ static void radeon_pin_threads_to_L3_cache(struct radeon_winsys *ws,
+-                                           unsigned cache)
++                                           unsigned cpu)
+ {
+    struct radeon_drm_winsys *rws = (struct radeon_drm_winsys*)ws;
+ 
+    if (util_queue_is_initialized(&rws->cs_queue)) {
+-      util_set_thread_affinity(rws->cs_queue.threads[0],
+-                               util_get_cpu_caps()->L3_affinity_mask[cache],
+-                               NULL, util_get_cpu_caps()->num_cpu_mask_bits);
++      util_thread_sched_apply_policy(rws->cs_queue.threads[0],
++                                     UTIL_THREAD_DRIVER_SUBMIT, cpu, NULL);
+    }
+ }
+ 
+diff --git a/src/mesa/main/glthread.c b/src/mesa/main/glthread.c
+index f2c24e3b5b146..8f3c15e1f22d9 100644
+--- a/src/mesa/main/glthread.c
++++ b/src/mesa/main/glthread.c
+@@ -39,6 +39,7 @@
+ #include "util/u_atomic.h"
+ #include "util/u_thread.h"
+ #include "util/u_cpu_detect.h"
++#include "util/thread_sched.h"
+ 
+ #include "state_tracker/st_context.h"
+ 
+@@ -236,6 +237,10 @@ _mesa_glthread_init(struct gl_context *ctx)
+                       glthread_thread_initialization, NULL, 0);
+    util_queue_fence_wait(&fence);
+    util_queue_fence_destroy(&fence);
++
++   glthread->thread_sched_enabled = ctx->pipe->set_context_param &&
++                                    util_thread_scheduler_enabled();
++   util_thread_scheduler_init_state(&glthread->thread_sched_state);
+ }
+ 
+ static void
+@@ -316,25 +321,21 @@ _mesa_glthread_flush_batch(struct gl_context *ctx)
+    if (!glthread->used)
+       return; /* the batch is empty */
+ 
+-   /* Pin threads regularly to the same Zen CCX that the main thread is
+-    * running on. The main thread can move between CCXs.
++   /* Apply our thread scheduling policy for better multithreading
++    * performance.
+     */
+-   if (util_get_cpu_caps()->num_L3_caches > 1 &&
+-       /* driver support */
+-       ctx->pipe->set_context_param &&
++   if (glthread->thread_sched_enabled &&
+        ++glthread->pin_thread_counter % 128 == 0) {
+       int cpu = util_get_current_cpu();
+ 
+-      if (cpu >= 0) {
+-         uint16_t L3_cache = util_get_cpu_caps()->cpu_to_L3[cpu];
+-         if (L3_cache != U_CPU_INVALID_L3) {
+-            util_set_thread_affinity(glthread->queue.threads[0],
+-                                     util_get_cpu_caps()->L3_affinity_mask[L3_cache],
+-                                     NULL, util_get_cpu_caps()->num_cpu_mask_bits);
+-            ctx->pipe->set_context_param(ctx->pipe,
+-                                         PIPE_CONTEXT_PARAM_PIN_THREADS_TO_L3_CACHE,
+-                                         L3_cache);
+-         }
++      if (cpu >= 0 &&
++          util_thread_sched_apply_policy(glthread->queue.threads[0],
++                                         UTIL_THREAD_GLTHREAD, cpu,
++                                         &glthread->thread_sched_state)) {
++         /* If it's successful, apply the policy to the driver threads too. */
++         ctx->pipe->set_context_param(ctx->pipe,
++                                      PIPE_CONTEXT_PARAM_PIN_THREADS_TO_L3_CACHE,
++                                      cpu);
+       }
+    }
+ 
+diff --git a/src/mesa/main/glthread.h b/src/mesa/main/glthread.h
+index 1a5399e33dfad..bc47403364812 100644
+--- a/src/mesa/main/glthread.h
++++ b/src/mesa/main/glthread.h
+@@ -190,6 +190,7 @@ struct glthread_state
+    /** Whether GLThread is enabled. */
+    bool enabled;
+    bool inside_begin_end;
++   bool thread_sched_enabled;
+ 
+    /** Display lists. */
+    GLenum16 ListMode; /**< Zero if not inside display list, else list mode. */
+@@ -198,6 +199,7 @@ struct glthread_state
+ 
+    /** For L3 cache pinning. */
+    unsigned pin_thread_counter;
++   unsigned thread_sched_state;
+ 
+    /** The ring of batches in memory. */
+    struct glthread_batch batches[MARSHAL_MAX_BATCHES];
+diff --git a/src/mesa/state_tracker/st_context.c b/src/mesa/state_tracker/st_context.c
+index ad0608c2d6f4c..b50ca283872fa 100644
+--- a/src/mesa/state_tracker/st_context.c
++++ b/src/mesa/state_tracker/st_context.c
+@@ -66,6 +66,7 @@
+ #include "util/u_vbuf.h"
+ #include "util/u_memory.h"
+ #include "util/hash_table.h"
++#include "util/thread_sched.h"
+ #include "cso_cache/cso_context.h"
+ #include "compiler/glsl/glsl_parser_extras.h"
+ 
+@@ -730,8 +731,7 @@ st_create_context_priv(struct gl_context *ctx, struct pipe_context *pipe,
+          !st->lower_ucp;
+    st->shader_has_one_variant[MESA_SHADER_COMPUTE] = st->has_shareable_shaders;
+ 
+-   if (util_get_cpu_caps()->num_L3_caches == 1 ||
+-       !st->pipe->set_context_param)
++   if (!st->pipe->set_context_param || !util_thread_scheduler_enabled())
+       st->pin_thread_counter = ST_L3_PINNING_DISABLED;
+ 
+    st->bitmap.cache.empty = true;
+diff --git a/src/mesa/state_tracker/st_draw.c b/src/mesa/state_tracker/st_draw.c
+index f310efe781026..13672a8e93468 100644
+--- a/src/mesa/state_tracker/st_draw.c
++++ b/src/mesa/state_tracker/st_draw.c
+@@ -89,8 +89,8 @@ st_prepare_draw(struct gl_context *ctx, uint64_t state_mask)
+    /* Validate state. */
+    st_validate_state(st, state_mask);
+ 
+-   /* Pin threads regularly to the same Zen CCX that the main thread is
+-    * running on. The main thread can move between CCXs.
++   /* Apply our thread scheduling policy for better multithreading
++    * performance.
+     */
+    if (unlikely(st->pin_thread_counter != ST_L3_PINNING_DISABLED &&
+                 /* do it occasionally */
+@@ -105,7 +105,7 @@ st_prepare_draw(struct gl_context *ctx, uint64_t state_mask)
+          if (L3_cache != U_CPU_INVALID_L3) {
+             pipe->set_context_param(pipe,
+                                     PIPE_CONTEXT_PARAM_PIN_THREADS_TO_L3_CACHE,
+-                                    L3_cache);
++                                    cpu);
+          }
+       }
+    }
+diff --git a/src/util/meson.build b/src/util/meson.build
+index eb88f235c470e..d5ab3d40b558a 100644
+--- a/src/util/meson.build
++++ b/src/util/meson.build
+@@ -45,6 +45,8 @@ files_mesa_util = files(
+   'compiler.h',
+   'compress.c',
+   'compress.h',
++  'thread_sched.c',
++  'thread_sched.h',
+   'crc32.c',
+   'crc32.h',
+   'dag.c',
+diff --git a/src/util/thread_sched.c b/src/util/thread_sched.c
+new file mode 100644
+index 0000000000000..7d27bebd291de
+--- /dev/null
++++ b/src/util/thread_sched.c
+@@ -0,0 +1,66 @@
++/*
++ * Copyright 2023 Advanced Micro Devices, Inc.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "thread_sched.h"
++#include "u_cpu_detect.h"
++
++bool
++util_thread_scheduler_enabled(void)
++{
++#if DETECT_ARCH_X86 || DETECT_ARCH_X86_64
++   return util_get_cpu_caps()->num_L3_caches > 1;
++#else
++   return false;
++#endif
++}
++
++void
++util_thread_scheduler_init_state(unsigned *state)
++{
++   *state = UINT32_MAX;
++}
++
++/**
++ * Apply the optimal thread scheduling policy for the given thread.
++ *
++ * "name" determines which thread the policy is being applied to.
++ *
++ * "app_thread_cpu" is the CPU where the application thread currently
++ * resides.
++ *
++ * "sched_state" is a per-gl_context state that this function uses to track
++ * what happened in previous invocations.
++ */
++bool
++util_thread_sched_apply_policy(thrd_t thread, enum util_thread_name name,
++                               unsigned app_thread_cpu, unsigned *sched_state)
++{
++#if DETECT_ARCH_X86 || DETECT_ARCH_X86_64
++   /* Move Mesa threads to the L3 core complex where the app thread
++    * resides. We call this "L3 chasing".
++    *
++    * This improves multithreading performance by up to 33% on Ryzen 3900X.
++    */
++   const struct util_cpu_caps_t *caps = util_get_cpu_caps();
++   int L3_cache = caps->cpu_to_L3[app_thread_cpu];
++
++   /* Don't do anything if the app thread hasn't moved to a different
++    * core complex. (*sched_state contains the last set L3 index)
++    */
++   if (L3_cache == U_CPU_INVALID_L3 ||
++       (sched_state && L3_cache == *sched_state))
++      return false;
++
++   /* Apply the policy. */
++   if (sched_state)
++      *sched_state = L3_cache;
++
++   return util_set_thread_affinity(thread, caps->L3_affinity_mask[L3_cache],
++                                   NULL, caps->num_cpu_mask_bits);
++#else
++   return false;
++#endif
++}
+diff --git a/src/util/thread_sched.h b/src/util/thread_sched.h
+new file mode 100644
+index 0000000000000..01cbae6df4413
+--- /dev/null
++++ b/src/util/thread_sched.h
+@@ -0,0 +1,30 @@
++/*
++ * Copyright 2023 Advanced Micro Devices, Inc.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef CPU_SCHED_H
++#define CPU_SCHED_H
++
++#include "compiler.h"
++#include "u_thread.h"
++
++enum util_thread_name
++{
++   UTIL_THREAD_GLTHREAD,
++   UTIL_THREAD_THREADED_CONTEXT,
++   UTIL_THREAD_DRIVER_SUBMIT,
++};
++
++bool
++util_thread_scheduler_enabled(void);
++
++void
++util_thread_scheduler_init_state(unsigned *state);
++
++bool
++util_thread_sched_apply_policy(thrd_t thread, enum util_thread_name name,
++                               unsigned app_thread_cpu, unsigned *sched_state);
++
++#endif
+-- 
+GitLab
+
+
+From e050ebd42f4f37c62bf97aa6cbf840395d9c9709 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Wed, 17 Jan 2024 08:25:04 -0500
+Subject: [PATCH 2/7] gallium: rename PIPE_.._PIN_THREADS_TO_L3_CACHE ->
+ .._UPDATE_THREAD_SCHEDULING
+
+---
+ src/gallium/auxiliary/util/u_threaded_context.c | 2 +-
+ src/gallium/drivers/radeonsi/si_pipe.c          | 2 +-
+ src/gallium/drivers/zink/zink_context.c         | 2 +-
+ src/gallium/include/pipe/p_defines.h            | 9 +++------
+ src/mesa/main/glthread.c                        | 2 +-
+ src/mesa/state_tracker/st_draw.c                | 2 +-
+ 6 files changed, 8 insertions(+), 11 deletions(-)
+
+diff --git a/src/gallium/auxiliary/util/u_threaded_context.c b/src/gallium/auxiliary/util/u_threaded_context.c
+index 19bcded5b135f..b4e85d6effc44 100644
+--- a/src/gallium/auxiliary/util/u_threaded_context.c
++++ b/src/gallium/auxiliary/util/u_threaded_context.c
+@@ -3552,7 +3552,7 @@ tc_set_context_param(struct pipe_context *_pipe,
+ {
+    struct threaded_context *tc = threaded_context(_pipe);
+ 
+-   if (param == PIPE_CONTEXT_PARAM_PIN_THREADS_TO_L3_CACHE) {
++   if (param == PIPE_CONTEXT_PARAM_UPDATE_THREAD_SCHEDULING) {
+       util_thread_sched_apply_policy(tc->queue.threads[0],
+                                      UTIL_THREAD_THREADED_CONTEXT, value,
+                                      NULL);
+diff --git a/src/gallium/drivers/radeonsi/si_pipe.c b/src/gallium/drivers/radeonsi/si_pipe.c
+index a2712aadd3af0..5a3ab0349d51f 100644
+--- a/src/gallium/drivers/radeonsi/si_pipe.c
++++ b/src/gallium/drivers/radeonsi/si_pipe.c
+@@ -470,7 +470,7 @@ static void si_set_context_param(struct pipe_context *ctx, enum pipe_context_par
+    struct radeon_winsys *ws = ((struct si_context *)ctx)->ws;
+ 
+    switch (param) {
+-   case PIPE_CONTEXT_PARAM_PIN_THREADS_TO_L3_CACHE:
++   case PIPE_CONTEXT_PARAM_UPDATE_THREAD_SCHEDULING:
+       ws->pin_threads_to_L3_cache(ws, value);
+       break;
+    default:;
+diff --git a/src/gallium/drivers/zink/zink_context.c b/src/gallium/drivers/zink/zink_context.c
+index cd30c4d3f9e81..b5775216e69d5 100644
+--- a/src/gallium/drivers/zink/zink_context.c
++++ b/src/gallium/drivers/zink/zink_context.c
+@@ -329,7 +329,7 @@ zink_set_context_param(struct pipe_context *pctx, enum pipe_context_param param,
+    struct zink_screen *screen = zink_screen(ctx->base.screen);
+ 
+    switch (param) {
+-   case PIPE_CONTEXT_PARAM_PIN_THREADS_TO_L3_CACHE:
++   case PIPE_CONTEXT_PARAM_UPDATE_THREAD_SCHEDULING:
+       if (screen->threaded_submit)
+          util_thread_sched_apply_policy(screen->flush_queue.threads[0],
+                                         UTIL_THREAD_DRIVER_SUBMIT, value, NULL);
+diff --git a/src/gallium/include/pipe/p_defines.h b/src/gallium/include/pipe/p_defines.h
+index 11328563a542a..1dea74ea2e093 100644
+--- a/src/gallium/include/pipe/p_defines.h
++++ b/src/gallium/include/pipe/p_defines.h
+@@ -1101,13 +1101,10 @@ enum pipe_resource_param
+  */
+ enum pipe_context_param
+ {
+-   /* A hint for the driver that it should pin its execution threads to
+-    * a group of cores sharing a specific L3 cache if the CPU has multiple
+-    * L3 caches. This is needed for good multithreading performance on
+-    * AMD Zen CPUs. "value" is the L3 cache index. Drivers that don't have
+-    * any internal threads or don't run on affected CPUs can ignore this.
++   /* Call util_thread_sched_apply_policy() for each driver thread that
++    * benefits from it.
+     */
+-   PIPE_CONTEXT_PARAM_PIN_THREADS_TO_L3_CACHE,
++   PIPE_CONTEXT_PARAM_UPDATE_THREAD_SCHEDULING,
+ };
+ 
+ /**
+diff --git a/src/mesa/main/glthread.c b/src/mesa/main/glthread.c
+index 8f3c15e1f22d9..76033e85b2aeb 100644
+--- a/src/mesa/main/glthread.c
++++ b/src/mesa/main/glthread.c
+@@ -334,7 +334,7 @@ _mesa_glthread_flush_batch(struct gl_context *ctx)
+                                          &glthread->thread_sched_state)) {
+          /* If it's successful, apply the policy to the driver threads too. */
+          ctx->pipe->set_context_param(ctx->pipe,
+-                                      PIPE_CONTEXT_PARAM_PIN_THREADS_TO_L3_CACHE,
++                                      PIPE_CONTEXT_PARAM_UPDATE_THREAD_SCHEDULING,
+                                       cpu);
+       }
+    }
+diff --git a/src/mesa/state_tracker/st_draw.c b/src/mesa/state_tracker/st_draw.c
+index 13672a8e93468..f881153c3d901 100644
+--- a/src/mesa/state_tracker/st_draw.c
++++ b/src/mesa/state_tracker/st_draw.c
+@@ -104,7 +104,7 @@ st_prepare_draw(struct gl_context *ctx, uint64_t state_mask)
+ 
+          if (L3_cache != U_CPU_INVALID_L3) {
+             pipe->set_context_param(pipe,
+-                                    PIPE_CONTEXT_PARAM_PIN_THREADS_TO_L3_CACHE,
++                                    PIPE_CONTEXT_PARAM_UPDATE_THREAD_SCHEDULING,
+                                     cpu);
+          }
+       }
+-- 
+GitLab
+
+
+From a1a6bf4f54a572c2460087ad7bc2c65512c71b94 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Wed, 17 Jan 2024 08:19:39 -0500
+Subject: [PATCH 3/7] st/mesa: rename ST_L3_PINNING_DISABLED ->
+ ST_THREAD_SCHEDULER_DISABLED
+
+---
+ src/mesa/main/glthread.c            | 2 +-
+ src/mesa/state_tracker/st_context.c | 2 +-
+ src/mesa/state_tracker/st_context.h | 2 +-
+ src/mesa/state_tracker/st_draw.c    | 2 +-
+ 4 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/mesa/main/glthread.c b/src/mesa/main/glthread.c
+index 76033e85b2aeb..3d761cc5c747d 100644
+--- a/src/mesa/main/glthread.c
++++ b/src/mesa/main/glthread.c
+@@ -226,7 +226,7 @@ _mesa_glthread_init(struct gl_context *ctx)
+    _mesa_glthread_init_call_fence(&glthread->LastDListChangeBatchIndex);
+ 
+    /* glthread takes over all L3 pinning */
+-   ctx->st->pin_thread_counter = ST_L3_PINNING_DISABLED;
++   ctx->st->pin_thread_counter = ST_THREAD_SCHEDULER_DISABLED;
+ 
+    _mesa_glthread_enable(ctx);
+ 
+diff --git a/src/mesa/state_tracker/st_context.c b/src/mesa/state_tracker/st_context.c
+index b50ca283872fa..7e08c83760193 100644
+--- a/src/mesa/state_tracker/st_context.c
++++ b/src/mesa/state_tracker/st_context.c
+@@ -732,7 +732,7 @@ st_create_context_priv(struct gl_context *ctx, struct pipe_context *pipe,
+    st->shader_has_one_variant[MESA_SHADER_COMPUTE] = st->has_shareable_shaders;
+ 
+    if (!st->pipe->set_context_param || !util_thread_scheduler_enabled())
+-      st->pin_thread_counter = ST_L3_PINNING_DISABLED;
++      st->pin_thread_counter = ST_THREAD_SCHEDULER_DISABLED;
+ 
+    st->bitmap.cache.empty = true;
+ 
+diff --git a/src/mesa/state_tracker/st_context.h b/src/mesa/state_tracker/st_context.h
+index 45a71b77d0c4a..021ae896fa141 100644
+--- a/src/mesa/state_tracker/st_context.h
++++ b/src/mesa/state_tracker/st_context.h
+@@ -53,7 +53,7 @@ struct st_context;
+ struct st_program;
+ struct u_upload_mgr;
+ 
+-#define ST_L3_PINNING_DISABLED 0xffffffff
++#define ST_THREAD_SCHEDULER_DISABLED 0xffffffff
+ 
+ struct st_bitmap_cache
+ {
+diff --git a/src/mesa/state_tracker/st_draw.c b/src/mesa/state_tracker/st_draw.c
+index f881153c3d901..297149f5d5166 100644
+--- a/src/mesa/state_tracker/st_draw.c
++++ b/src/mesa/state_tracker/st_draw.c
+@@ -92,7 +92,7 @@ st_prepare_draw(struct gl_context *ctx, uint64_t state_mask)
+    /* Apply our thread scheduling policy for better multithreading
+     * performance.
+     */
+-   if (unlikely(st->pin_thread_counter != ST_L3_PINNING_DISABLED &&
++   if (unlikely(st->pin_thread_counter != ST_THREAD_SCHEDULER_DISABLED &&
+                 /* do it occasionally */
+                 ++st->pin_thread_counter % 512 == 0)) {
+       st->pin_thread_counter = 0;
+-- 
+GitLab
+
+
+From 7dba5f2fbc7c19f7e92fc6432f203201001ff550 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Wed, 24 Jan 2024 13:50:57 -0500
+Subject: [PATCH 4/7] util: add mesa_pin_threads environment variable that sets
+ a static affinity mask
+
+This is required for deterministic benchmark results.
+---
+ src/util/thread_sched.c | 27 ++++++++++++++++++++++++++-
+ src/util/thread_sched.h |  1 +
+ 2 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/src/util/thread_sched.c b/src/util/thread_sched.c
+index 7d27bebd291de..9aa871364a83f 100644
+--- a/src/util/thread_sched.c
++++ b/src/util/thread_sched.c
+@@ -6,12 +6,16 @@
+ 
+ #include "thread_sched.h"
+ #include "u_cpu_detect.h"
++#include "u_debug.h"
++
++DEBUG_GET_ONCE_BOOL_OPTION(pin_threads, "mesa_pin_threads", false)
+ 
+ bool
+ util_thread_scheduler_enabled(void)
+ {
+ #if DETECT_ARCH_X86 || DETECT_ARCH_X86_64
+-   return util_get_cpu_caps()->num_L3_caches > 1;
++   return util_get_cpu_caps()->num_L3_caches > 1 ||
++          debug_get_option_pin_threads();
+ #else
+    return false;
+ #endif
+@@ -21,6 +25,9 @@ void
+ util_thread_scheduler_init_state(unsigned *state)
+ {
+    *state = UINT32_MAX;
++
++   util_thread_sched_apply_policy(thrd_current(), UTIL_THREAD_APP_CALLER, 0,
++                                  NULL); /* keep as NULL */
+ }
+ 
+ /**
+@@ -39,6 +46,24 @@ util_thread_sched_apply_policy(thrd_t thread, enum util_thread_name name,
+                                unsigned app_thread_cpu, unsigned *sched_state)
+ {
+ #if DETECT_ARCH_X86 || DETECT_ARCH_X86_64
++   if (debug_get_option_pin_threads()) {
++      /* Pin threads to a specific CPU. This is done only once. *sched_state
++       * is true if this is the first time we are doing it.
++       */
++      if (sched_state && !*sched_state)
++         return false;
++
++      /* Each thread is assigned to a different CPU. */
++      unsigned mask = BITFIELD_BIT(name);
++      if (sched_state)
++         *sched_state = 0;
++      return util_set_thread_affinity(thread, &mask, NULL, 32);
++   }
++
++   /* Don't do anything for the app thread with the L3 chasing policy. */
++   if (name == UTIL_THREAD_APP_CALLER)
++      return false;
++
+    /* Move Mesa threads to the L3 core complex where the app thread
+     * resides. We call this "L3 chasing".
+     *
+diff --git a/src/util/thread_sched.h b/src/util/thread_sched.h
+index 01cbae6df4413..9d7f7d851bdbf 100644
+--- a/src/util/thread_sched.h
++++ b/src/util/thread_sched.h
+@@ -12,6 +12,7 @@
+ 
+ enum util_thread_name
+ {
++   UTIL_THREAD_APP_CALLER,
+    UTIL_THREAD_GLTHREAD,
+    UTIL_THREAD_THREADED_CONTEXT,
+    UTIL_THREAD_DRIVER_SUBMIT,
+-- 
+GitLab
+
+
+From be1ebec0f5a8032be199e0748c23906eef7ef0e6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Wed, 24 Jan 2024 16:13:34 -0500
+Subject: [PATCH 5/7] glthread: apply the thread scheduling policy when the
+ context is created
+
+instead of after 128 batches
+---
+ src/mesa/main/glthread.c | 45 +++++++++++++++++++++++++---------------
+ 1 file changed, 28 insertions(+), 17 deletions(-)
+
+diff --git a/src/mesa/main/glthread.c b/src/mesa/main/glthread.c
+index 3d761cc5c747d..26bc18b8a6f3d 100644
+--- a/src/mesa/main/glthread.c
++++ b/src/mesa/main/glthread.c
+@@ -157,6 +157,32 @@ glthread_unmarshal_batch(void *job, void *gdata, int thread_index)
+    p_atomic_inc(&ctx->GLThread.stats.num_batches);
+ }
+ 
++static void
++glthread_apply_thread_sched_policy(struct gl_context *ctx, bool initialization)
++{
++   struct glthread_state *glthread = &ctx->GLThread;
++
++   if (!glthread->thread_sched_enabled)
++      return;
++
++   /* Apply our thread scheduling policy for better multithreading
++    * performance.
++    */
++   if (initialization || ++glthread->pin_thread_counter % 128 == 0) {
++      int cpu = util_get_current_cpu();
++
++      if (cpu >= 0 &&
++          util_thread_sched_apply_policy(glthread->queue.threads[0],
++                                         UTIL_THREAD_GLTHREAD, cpu,
++                                         &glthread->thread_sched_state)) {
++         /* If it's successful, apply the policy to the driver threads too. */
++         ctx->pipe->set_context_param(ctx->pipe,
++                                      PIPE_CONTEXT_PARAM_UPDATE_THREAD_SCHEDULING,
++                                      cpu);
++      }
++   }
++}
++
+ static void
+ glthread_thread_initialization(void *job, void *gdata, int thread_index)
+ {
+@@ -241,6 +267,7 @@ _mesa_glthread_init(struct gl_context *ctx)
+    glthread->thread_sched_enabled = ctx->pipe->set_context_param &&
+                                     util_thread_scheduler_enabled();
+    util_thread_scheduler_init_state(&glthread->thread_sched_state);
++   glthread_apply_thread_sched_policy(ctx, true);
+ }
+ 
+ static void
+@@ -321,23 +348,7 @@ _mesa_glthread_flush_batch(struct gl_context *ctx)
+    if (!glthread->used)
+       return; /* the batch is empty */
+ 
+-   /* Apply our thread scheduling policy for better multithreading
+-    * performance.
+-    */
+-   if (glthread->thread_sched_enabled &&
+-       ++glthread->pin_thread_counter % 128 == 0) {
+-      int cpu = util_get_current_cpu();
+-
+-      if (cpu >= 0 &&
+-          util_thread_sched_apply_policy(glthread->queue.threads[0],
+-                                         UTIL_THREAD_GLTHREAD, cpu,
+-                                         &glthread->thread_sched_state)) {
+-         /* If it's successful, apply the policy to the driver threads too. */
+-         ctx->pipe->set_context_param(ctx->pipe,
+-                                      PIPE_CONTEXT_PARAM_UPDATE_THREAD_SCHEDULING,
+-                                      cpu);
+-      }
+-   }
++   glthread_apply_thread_sched_policy(ctx, false);
+ 
+    struct glthread_batch *next = glthread->next_batch;
+ 
+-- 
+GitLab
+
+
+From 03fa680b01fd948b6ceeaf977934e432f61059ce Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Wed, 24 Jan 2024 16:46:58 -0500
+Subject: [PATCH 6/7] glthread: apply the thread scheduling policy when a batch
+ executes synchronously
+
+before this, when no batch was executed asynchronously, the policy wasn't
+applied
+---
+ src/mesa/main/glthread.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/mesa/main/glthread.c b/src/mesa/main/glthread.c
+index 26bc18b8a6f3d..163bf3164166e 100644
+--- a/src/mesa/main/glthread.c
++++ b/src/mesa/main/glthread.c
+@@ -401,6 +401,8 @@ _mesa_glthread_finish(struct gl_context *ctx)
+       synced = true;
+    }
+ 
++   glthread_apply_thread_sched_policy(ctx, false);
++
+    if (glthread->used) {
+       /* Mark the end of the batch, but don't increment "used". */
+       struct marshal_cmd_base *last =
+-- 
+GitLab
+
+
+From be779c01057ca4741c31e3319e07cb5a3244fd4a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Tue, 23 Jan 2024 16:15:04 -0500
+Subject: [PATCH 7/7] gallium/hud: add "csv" option to print values to stdout
+ as CSV
+
+---
+ src/gallium/auxiliary/hud/hud_context.c | 28 ++++++++++++++++++++-----
+ src/gallium/auxiliary/hud/hud_private.h |  1 +
+ 2 files changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/src/gallium/auxiliary/hud/hud_context.c b/src/gallium/auxiliary/hud/hud_context.c
+index ead8b38a86514..e3b4477b98432 100644
+--- a/src/gallium/auxiliary/hud/hud_context.c
++++ b/src/gallium/auxiliary/hud/hud_context.c
+@@ -998,16 +998,16 @@ hud_graph_add_value(struct hud_graph *gr, double value)
+    value = value > gr->pane->ceiling ? gr->pane->ceiling : value;
+ 
+    if (gr->fd) {
+-      if (gr->fd == stdout) {
++      if (gr->fd == stdout && !gr->separator) {
+          fprintf(gr->fd, "%s: ", gr->name);
+       }
+       if (fabs(value - lround(value)) > FLT_EPSILON) {
+          fprintf(gr->fd, get_float_modifier(value), value);
+-         fprintf(gr->fd, "\n");
+       }
+       else {
+-         fprintf(gr->fd, "%" PRIu64 "\n", (uint64_t) lround(value));
++         fprintf(gr->fd, "%" PRIu64, (uint64_t) lround(value));
+       }
++      fprintf(gr->fd, "%s", gr->separator ? gr->separator : "\n");
+    }
+ 
+    if (gr->index == gr->pane->max_num_vertices) {
+@@ -1073,7 +1073,8 @@ static void strcat_without_spaces(char *dst, const char *src)
+  * is a HUD variable such as "fps", or "cpu"
+  */
+ static void
+-hud_graph_set_dump_file(struct hud_graph *gr, const char *hud_dump_dir, bool to_stdout)
++hud_graph_set_dump_file(struct hud_graph *gr, const char *hud_dump_dir,
++                        bool to_stdout, const char *separator)
+ {
+    if (hud_dump_dir) {
+       char *dump_file = malloc(strlen(hud_dump_dir) + sizeof(PATH_SEP)
+@@ -1093,6 +1094,8 @@ hud_graph_set_dump_file(struct hud_graph *gr, const char *hud_dump_dir, bool to_
+       /* flush output after each line is written */
+       setvbuf(gr->fd, NULL, _IOLBF, 0);
+    }
++
++   gr->separator = separator;
+ }
+ 
+ /**
+@@ -1231,6 +1234,7 @@ hud_parse_env_var(struct hud_context *hud, struct pipe_screen *screen,
+    bool dyn_ceiling = false;
+    bool reset_colors = false;
+    bool sort_items = false;
++   bool is_csv = false;
+    bool to_stdout = false;
+    const char *period_env;
+ 
+@@ -1395,6 +1399,10 @@ hud_parse_env_var(struct hud_context *hud, struct pipe_screen *screen,
+       else if (strcmp(name, "stdout") == 0) {
+          to_stdout = true;
+       }
++      else if (strcmp(name, "csv") == 0) {
++         to_stdout = true;
++         is_csv = true;
++      }
+       else {
+          bool processed = false;
+ 
+@@ -1551,7 +1559,16 @@ hud_parse_env_var(struct hud_context *hud, struct pipe_screen *screen,
+          struct hud_graph *gr;
+ 
+          LIST_FOR_EACH_ENTRY(gr, &pane->graph_list, head) {
+-            hud_graph_set_dump_file(gr, hud_dump_dir, to_stdout);
++            char *separator = NULL;
++
++            if (is_csv) {
++               if (gr ==
++                   list_last_entry(&pane->graph_list, struct hud_graph, head))
++                  separator = "\n";
++               else
++                  separator = ", ";
++            }
++            hud_graph_set_dump_file(gr, hud_dump_dir, to_stdout, separator);
+          }
+       }
+    }
+@@ -1610,6 +1627,7 @@ print_help(struct pipe_screen *screen)
+    puts("");
+    puts("  Available names:");
+    puts("    stdout (prints the counters value to stdout)");
++   puts("    csv (prints the counter values to stdout as CSV, use + to separate names)");
+    puts("    fps");
+    puts("    frametime");
+    puts("    cpu");
+diff --git a/src/gallium/auxiliary/hud/hud_private.h b/src/gallium/auxiliary/hud/hud_private.h
+index 28bef37b476e0..9ab690056d24b 100644
+--- a/src/gallium/auxiliary/hud/hud_private.h
++++ b/src/gallium/auxiliary/hud/hud_private.h
+@@ -123,6 +123,7 @@ struct hud_graph {
+    unsigned index; /* vertex index being updated */
+    double current_value;
+    FILE *fd;
++   const char *separator;
+ };
+ 
+ struct hud_pane {
+-- 
+GitLab
+
