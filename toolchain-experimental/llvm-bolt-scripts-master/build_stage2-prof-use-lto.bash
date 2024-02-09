@@ -32,18 +32,18 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -D CMAKE_SHARED_LINKER_FLAGS="-Wl,--thinlto-jobs=2 -Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -fcf-protection=none -mharden-sls=none -Wl,-mllvm -Wl,-extra-vectorizer-passes -Wl,-mllvm -Wl,-enable-cond-stores-vec -Wl,-mllvm -Wl,-slp-vectorize-hor-store -Wl,-mllvm -Wl,-enable-loopinterchange -Wl,-mllvm -Wl,-enable-loop-distribute -Wl,-mllvm -Wl,-enable-unroll-and-jam -Wl,-mllvm -Wl,-enable-loop-flatten -Wl,-mllvm -Wl,-interleave-small-loop-scalar-reduction -Wl,-mllvm -Wl,-unroll-runtime-multi-exit -Wl,-mllvm -Wl,-aggressive-ext-opt -Wl,-mllvm -Wl,-enable-interleaved-mem-accesses -Wl,-mllvm -Wl,-enable-masked-interleaved-mem-accesses -march=native -maes -mbmi2 -mpclmul -flto=thin -fwhole-program-vtables -fuse-ld=lld -Wl,-zmax-page-size=0x200000 -Wl,-mllvm -Wl,-adce-remove-loops -Wl,-mllvm -Wl,-enable-ext-tsp-block-placement -Wl,-mllvm -Wl,-enable-gvn-hoist -Wl,-mllvm -Wl,-enable-dfa-jump-thread -Wl,--push-state -Wl,-whole-archive -ljemalloc_pic -Wl,--pop-state -lpthread -lstdc++ -lm -ldl -Wl,-znow -Wl,--emit-relocs" \
         -DLLVM_ENABLE_PROJECTS="polly;lld;clang;openmp;compiler-rt;bolt" \
         -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86;BPF" \
-        -D COMPILER_RT_BUILD_SANITIZERS=OFF \
-        -D COMPILER_RT_BUILD_XRAY=OFF \
+        -DLIBOMP_ARCH="i386;x86_64" \
+        -DLIBOMP_USE_DEBUGGER=OFF \
         -D LLVM_INCLUDE_BENCHMARKS=OFF \
         -D LLVM_INCLUDE_TESTS=OFF \
         -D LLVM_ENABLE_DIA_SDK=OFF \
         -D LLVM_BUILD_DOCS=OFF \
         -D LLVM_ENABLE_SPHINX=OFF \
         -D LLVM_ENABLE_DOXYGEN=OFF \
-        -D LLVM_ENABLE_Z3_SOLVER=OFF \
+        -D LLVM_ENABLE_Z3_SOLVER=ON \
         -D LLVM_POLLY_LINK_INTO_TOOLS=ON \
         -D LLVM_ENABLE_ZLIB=ON \
-        -D LLVM_ENABLE_ZSTD=OFF \
+        -D LLVM_ENABLE_ZSTD=ON \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=${TOPLEV}/stage2-prof-use-lto/install \
     -DLLVM_PROFDATA_FILE=${TOPLEV}/stage2-prof-gen/profiles/clang.profdata \
