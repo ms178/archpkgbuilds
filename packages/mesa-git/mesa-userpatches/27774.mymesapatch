@@ -1,0 +1,978 @@
+From c8e1dd06f339a6968b70b5eb6f758a798125a03d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Sch=C3=BCrmann?= <daniel@schuermann.dev>
+Date: Thu, 4 Jan 2024 15:50:10 +0100
+Subject: [PATCH 01/10] aco: rematerialize constants in every basic block
+ during optimizer
+
+Totals from 16837 (21.25% of 79242) affected shaders: (GFX11)
+MaxWaves: 441634 -> 444546 (+0.66%); split: +0.66%, -0.00%
+Instrs: 25908303 -> 25838469 (-0.27%); split: -0.36%, +0.09%
+CodeSize: 133943168 -> 135446948 (+1.12%); split: -0.04%, +1.16%
+VGPRs: 985332 -> 977440 (-0.80%); split: -0.83%, +0.03%
+SpillSGPRs: 9133 -> 7535 (-17.50%); split: -17.74%, +0.24%
+SpillVGPRs: 1418 -> 1359 (-4.16%); split: -4.58%, +0.42%
+Scratch: 5047552 -> 5040640 (-0.14%)
+Latency: 204330340 -> 204179212 (-0.07%); split: -0.32%, +0.25%
+InvThroughput: 36584220 -> 36508856 (-0.21%); split: -0.40%, +0.19%
+VClause: 437847 -> 437344 (-0.11%); split: -0.34%, +0.22%
+SClause: 771311 -> 771013 (-0.04%); split: -0.42%, +0.38%
+Copies: 1774950 -> 1712070 (-3.54%); split: -4.46%, +0.91%
+Branches: 580595 -> 580478 (-0.02%); split: -0.03%, +0.01%
+PreSGPRs: 877017 -> 817549 (-6.78%)
+PreVGPRs: 852747 -> 846966 (-0.68%); split: -0.68%, +0.00%
+---
+ src/amd/compiler/aco_optimizer.cpp | 100 +++++++++++++++++++++++++++--
+ 1 file changed, 94 insertions(+), 6 deletions(-)
+
+diff --git a/src/amd/compiler/aco_optimizer.cpp b/src/amd/compiler/aco_optimizer.cpp
+index 73530876c4be3..1f39c27e8e96c 100644
+--- a/src/amd/compiler/aco_optimizer.cpp
++++ b/src/amd/compiler/aco_optimizer.cpp
+@@ -521,7 +521,7 @@ struct opt_ctx {
+    Program* program;
+    float_mode fp_mode;
+    std::vector<aco_ptr<Instruction>> instructions;
+-   ssa_info* info;
++   std::vector<ssa_info> info;
+    std::pair<uint32_t, Temp> last_literal;
+    std::vector<mad_info> mad_infos;
+    std::vector<uint16_t> uses;
+@@ -3115,6 +3115,7 @@ combine_add_sub_b2i(opt_ctx& ctx, aco_ptr<Instruction>& instr, aco_opcode new_op
+              * uses properly initialized to 0.
+              */
+             ctx.uses.push_back(0);
++            ctx.info.push_back(ssa_info{});
+          }
+          new_instr->operands[0] = Operand::zero();
+          new_instr->operands[1] = instr->operands[!i];
+@@ -4615,6 +4616,91 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+    }
+ }
+ 
++struct remat_entry {
++   Instruction* instr;
++   uint32_t block;
++};
++
++inline bool
++is_constant(Instruction* instr)
++{
++   if (instr->opcode != aco_opcode::p_parallelcopy || instr->operands.size() != 1)
++      return false;
++
++   return instr->operands[0].isConstant() && instr->definitions[0].isTemp();
++}
++
++void
++remat_constants_instr(opt_ctx& ctx, aco::map<Temp, remat_entry>& constants, Instruction* instr,
++                      uint32_t block_idx)
++{
++   for (Operand& op : instr->operands) {
++      if (!op.isTemp())
++         continue;
++
++      auto it = constants.find(op.getTemp());
++      if (it == constants.end())
++         continue;
++
++      /* Check if we already emitted the same constant in this block. */
++      if (it->second.block != block_idx) {
++         /* Rematerialize the constant. */
++         Builder bld(ctx.program, &ctx.instructions);
++         Operand const_op = it->second.instr->operands[0];
++         it->second.instr = bld.copy(bld.def(op.regClass()), const_op);
++         it->second.block = block_idx;
++         ctx.uses.push_back(0);
++         ctx.info.push_back(ctx.info[op.tempId()]);
++      }
++
++      /* Use the rematerialized constant and update information about latest use. */
++      if (op.getTemp() != it->second.instr->definitions[0].getTemp()) {
++         ctx.uses[op.tempId()]--;
++         op.setTemp(it->second.instr->definitions[0].getTemp());
++         ctx.uses[op.tempId()]++;
++      }
++   }
++}
++
++/**
++ * This pass implements a simple constant rematerialization.
++ * As common subexpression elimination (CSE) might increase the live-ranges
++ * of loaded constants over large distances, this pass splits the live-ranges
++ * again by re-emitting constants in every basic block.
++ */
++void
++rematerialize_constants(opt_ctx& ctx)
++{
++   aco::monotonic_buffer_resource memory(1024);
++   aco::map<Temp, remat_entry> constants(memory);
++
++   for (Block& block : ctx.program->blocks) {
++      if (block.logical_idom == -1)
++         continue;
++
++      if (block.logical_idom == (int)block.index)
++         constants.clear();
++
++      ctx.instructions.reserve(block.instructions.size());
++
++      for (aco_ptr<Instruction>& instr : block.instructions) {
++         if (is_dead(ctx.uses, instr.get()))
++            continue;
++
++         if (is_constant(instr.get())) {
++            Temp tmp = instr->definitions[0].getTemp();
++            constants[tmp] = {instr.get(), block.index};
++         } else if (!is_phi(instr)) {
++            remat_constants_instr(ctx, constants, instr.get(), block.index);
++         }
++
++         ctx.instructions.emplace_back(instr.release());
++      }
++
++      block.instructions = std::move(ctx.instructions);
++   }
++}
++
+ bool
+ to_uniform_bool_instr(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+ {
+@@ -5300,8 +5386,7 @@ optimize(Program* program)
+ {
+    opt_ctx ctx;
+    ctx.program = program;
+-   std::vector<ssa_info> info(program->peekAllocationId());
+-   ctx.info = info.data();
++   ctx.info = std::vector<ssa_info>(program->peekAllocationId());
+ 
+    /* 1. Bottom-Up DAG pass (forward) to label all ssa-defs */
+    for (Block& block : program->blocks) {
+@@ -5312,14 +5397,17 @@ optimize(Program* program)
+ 
+    ctx.uses = dead_code_analysis(program);
+ 
+-   /* 2. Combine v_mad, omod, clamp and propagate sgpr on VALU instructions */
++   /* 2. Rematerialize constants in every block. */
++   rematerialize_constants(ctx);
++
++   /* 3. Combine v_mad, omod, clamp and propagate sgpr on VALU instructions */
+    for (Block& block : program->blocks) {
+       ctx.fp_mode = block.fp_mode;
+       for (aco_ptr<Instruction>& instr : block.instructions)
+          combine_instruction(ctx, instr);
+    }
+ 
+-   /* 3. Top-Down DAG pass (backward) to select instructions (includes DCE) */
++   /* 4. Top-Down DAG pass (backward) to select instructions (includes DCE) */
+    for (auto block_rit = program->blocks.rbegin(); block_rit != program->blocks.rend();
+         ++block_rit) {
+       Block* block = &(*block_rit);
+@@ -5329,7 +5417,7 @@ optimize(Program* program)
+          select_instruction(ctx, *instr_rit);
+    }
+ 
+-   /* 4. Add literals to instructions */
++   /* 5. Add literals to instructions */
+    for (Block& block : program->blocks) {
+       ctx.instructions.reserve(block.instructions.size());
+       ctx.fp_mode = block.fp_mode;
+-- 
+GitLab
+
+
+From 59c3a6c92447e63d682e97587e4f984632932a89 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Sch=C3=BCrmann?= <daniel@schuermann.dev>
+Date: Tue, 20 Feb 2024 12:45:56 +0100
+Subject: [PATCH 02/10] aco/spill: refactor SSA repairing
+
+---
+ src/amd/compiler/aco_spill.cpp | 73 +++++++++++-----------------------
+ 1 file changed, 24 insertions(+), 49 deletions(-)
+
+diff --git a/src/amd/compiler/aco_spill.cpp b/src/amd/compiler/aco_spill.cpp
+index 8da3d49202bfc..e06223c3983ed 100644
+--- a/src/amd/compiler/aco_spill.cpp
++++ b/src/amd/compiler/aco_spill.cpp
+@@ -1350,64 +1350,39 @@ spill_block(spill_ctx& ctx, unsigned block_idx)
+ 
+    /* add coupling code to all loop header predecessors */
+    add_coupling_code(ctx, loop_header, loop_header->index);
+-
+-   /* propagate new renames through loop: i.e. repair the SSA */
+    renames.swap(ctx.renames[loop_header->index]);
+-   for (std::pair<Temp, Temp> rename : renames) {
+-      for (unsigned idx = loop_header->index; idx <= block_idx; idx++) {
+-         Block& current = ctx.program->blocks[idx];
+-         std::vector<aco_ptr<Instruction>>::iterator instr_it = current.instructions.begin();
+-
+-         /* first rename phis */
+-         while (instr_it != current.instructions.end()) {
+-            aco_ptr<Instruction>& phi = *instr_it;
+-            if (phi->opcode != aco_opcode::p_phi && phi->opcode != aco_opcode::p_linear_phi)
+-               break;
+-            /* no need to rename the loop header phis once again. this happened in
+-             * add_coupling_code() */
+-            if (idx == loop_header->index) {
+-               instr_it++;
+-               continue;
+-            }
+ 
+-            for (Operand& op : phi->operands) {
+-               if (!op.isTemp())
+-                  continue;
+-               if (op.getTemp() == rename.first)
+-                  op.setTemp(rename.second);
+-            }
+-            instr_it++;
+-         }
++   /* remove loop header info from stack */
++   ctx.loop_header.pop();
++   if (renames.empty())
++      return;
+ 
+-         /* variable is not live at beginning of this block */
+-         if (ctx.next_use_distances_start[idx].count(rename.first) == 0)
++   /* Add the new renames to each block */
++   for (std::pair<Temp, Temp> rename : renames) {
++      /* If there is already a rename, don't overwrite it. */
++      for (unsigned idx = loop_header->index; idx <= block_idx; idx++)
++         ctx.renames[idx].insert(rename);
++   }
++
++   /* propagate new renames through loop: i.e. repair the SSA */
++   for (unsigned idx = loop_header->index; idx <= block_idx; idx++) {
++      Block& current = ctx.program->blocks[idx];
++      /* rename all uses in this block */
++      for (aco_ptr<Instruction>& instr : current.instructions) {
++         /* no need to rename the loop header phis once again. */
++         if (idx == loop_header->index && is_phi(instr))
+             continue;
+ 
+-         /* if the variable is live at the block's exit, add rename */
+-         if (ctx.next_use_distances_end[idx].count(rename.first) != 0)
+-            ctx.renames[idx].insert(rename);
++         for (Operand& op : instr->operands) {
++            if (!op.isTemp())
++               continue;
+ 
+-         /* rename all uses in this block */
+-         bool renamed = false;
+-         while (!renamed && instr_it != current.instructions.end()) {
+-            aco_ptr<Instruction>& instr = *instr_it;
+-            for (Operand& op : instr->operands) {
+-               if (!op.isTemp())
+-                  continue;
+-               if (op.getTemp() == rename.first) {
+-                  op.setTemp(rename.second);
+-                  /* we can stop with this block as soon as the variable is spilled */
+-                  if (instr->opcode == aco_opcode::p_spill)
+-                     renamed = true;
+-               }
+-            }
+-            instr_it++;
++            auto rename = renames.find(op.getTemp());
++            if (rename != renames.end())
++               op.setTemp(rename->second);
+          }
+       }
+    }
+-
+-   /* remove loop header info from stack */
+-   ctx.loop_header.pop();
+ }
+ 
+ Temp
+-- 
+GitLab
+
+
+From a74753d47bc5dbc725b30fa3bd3d75dd675d1a58 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Sch=C3=BCrmann?= <daniel@schuermann.dev>
+Date: Fri, 23 Feb 2024 11:31:40 +0100
+Subject: [PATCH 03/10] aco/spill: refactor Operand reloading
+
+This simplifies the code to avoid spilling Operands.
+---
+ src/amd/compiler/aco_spill.cpp | 16 ++++++++--------
+ 1 file changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/src/amd/compiler/aco_spill.cpp b/src/amd/compiler/aco_spill.cpp
+index e06223c3983ed..9a26cbda94bbf 100644
+--- a/src/amd/compiler/aco_spill.cpp
++++ b/src/amd/compiler/aco_spill.cpp
+@@ -1206,7 +1206,7 @@ process_block(spill_ctx& ctx, unsigned block_idx, Block* block, RegisterDemand s
+       for (Operand& op : instr->operands) {
+          if (!op.isTemp())
+             continue;
+-         if (!current_spills.count(op.getTemp())) {
++         if (!current_spills.count(op.getTemp()) || reloads.count(op.getTemp())) {
+             /* the Operand is in register: check if it was renamed */
+             auto rename_it = ctx.renames[block_idx].find(op.getTemp());
+             if (rename_it != ctx.renames[block_idx].end()) {
+@@ -1223,8 +1223,7 @@ process_block(spill_ctx& ctx, unsigned block_idx, Block* block, RegisterDemand s
+          /* the Operand is spilled: add it to reloads */
+          Temp new_tmp = ctx.program->allocateTmp(op.regClass());
+          ctx.renames[block_idx][op.getTemp()] = new_tmp;
+-         reloads[new_tmp] = std::make_pair(op.getTemp(), current_spills[op.getTemp()]);
+-         current_spills.erase(op.getTemp());
++         reloads[op.getTemp()] = std::make_pair(new_tmp, current_spills[op.getTemp()]);
+          op.setTemp(new_tmp);
+          spilled_registers -= new_tmp;
+       }
+@@ -1247,12 +1246,12 @@ process_block(spill_ctx& ctx, unsigned block_idx, Block* block, RegisterDemand s
+                type = RegType::vgpr;
+ 
+             for (std::pair<Temp, uint32_t> pair : ctx.local_next_use_distance[idx]) {
+-               if (pair.first.type() != type)
++               if (pair.first.type() != type || current_spills.count(pair.first))
+                   continue;
++
+                bool can_rematerialize = ctx.remat.count(pair.first);
+-               if (((pair.second > distance && can_rematerialize == do_rematerialize) ||
+-                    (can_rematerialize && !do_rematerialize && pair.second > idx)) &&
+-                   !current_spills.count(pair.first)) {
++               if ((pair.second > distance && can_rematerialize == do_rematerialize) ||
++                   (can_rematerialize && !do_rematerialize)) {
+                   to_spill = pair.first;
+                   distance = pair.second;
+                   do_rematerialize = can_rematerialize;
+@@ -1288,8 +1287,9 @@ process_block(spill_ctx& ctx, unsigned block_idx, Block* block, RegisterDemand s
+       /* add reloads and instruction to new instructions */
+       for (std::pair<const Temp, std::pair<Temp, uint32_t>>& pair : reloads) {
+          aco_ptr<Instruction> reload =
+-            do_reload(ctx, pair.second.first, pair.first, pair.second.second);
++            do_reload(ctx, pair.first, pair.second.first, pair.second.second);
+          instructions.emplace_back(std::move(reload));
++         current_spills.erase(pair.first);
+       }
+       instructions.emplace_back(std::move(instr));
+       idx++;
+-- 
+GitLab
+
+
+From 491308b7c3e6326e6ccbc6f0e6f3fe855d8e4310 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Sch=C3=BCrmann?= <daniel@schuermann.dev>
+Date: Tue, 20 Feb 2024 10:19:33 +0100
+Subject: [PATCH 04/10] aco/spill: keep live-out variables spilled at branch
+ blocks
+
+There is no reason to reload early. Leave scheduling to the scheduler.
+
+Totals from 98 (0.12% of 79242) affected shaders: (GFX11)
+Instrs: 841944 -> 841995 (+0.01%); split: -0.02%, +0.03%
+CodeSize: 4354332 -> 4354544 (+0.00%); split: -0.02%, +0.02%
+SpillSGPRs: 2557 -> 2554 (-0.12%)
+Latency: 5772080 -> 5772209 (+0.00%); split: -0.00%, +0.01%
+InvThroughput: 1694834 -> 1694873 (+0.00%); split: -0.00%, +0.00%
+SClause: 16036 -> 16042 (+0.04%); split: -0.07%, +0.11%
+Copies: 85117 -> 85125 (+0.01%); split: -0.18%, +0.19%
+Branches: 25222 -> 25219 (-0.01%); split: -0.02%, +0.00%
+---
+ src/amd/compiler/aco_spill.cpp | 148 ++++++---------------------------
+ 1 file changed, 26 insertions(+), 122 deletions(-)
+
+diff --git a/src/amd/compiler/aco_spill.cpp b/src/amd/compiler/aco_spill.cpp
+index 9a26cbda94bbf..5c2dd3e46a766 100644
+--- a/src/amd/compiler/aco_spill.cpp
++++ b/src/amd/compiler/aco_spill.cpp
+@@ -606,53 +606,29 @@ init_live_in_vars(spill_ctx& ctx, Block* block, unsigned block_idx)
+ 
+    /* branch block */
+    if (block->linear_preds.size() == 1 && !(block->kind & block_kind_loop_exit)) {
+-      /* keep variables spilled if they are alive and not used in the current block */
++      /* keep variables spilled */
+       unsigned pred_idx = block->linear_preds[0];
+       for (std::pair<Temp, uint32_t> pair : ctx.spills_exit[pred_idx]) {
+-         if (pair.first.type() != RegType::sgpr) {
++         if (pair.first.type() != RegType::sgpr)
+             continue;
+-         }
+-         auto next_use_distance_it = next_use_distances.find(pair.first);
+-         if (next_use_distance_it != next_use_distances.end() &&
+-             next_use_distance_it->second.first != block_idx) {
+-            ctx.spills_entry[block_idx].insert(pair);
+-            spilled_registers.sgpr += pair.first.size();
+-         }
+-      }
+-      if (block->logical_preds.size() == 1) {
+-         pred_idx = block->logical_preds[0];
+-         for (std::pair<Temp, uint32_t> pair : ctx.spills_exit[pred_idx]) {
+-            if (pair.first.type() != RegType::vgpr) {
+-               continue;
+-            }
+-            auto next_use_distance_it = next_use_distances.find(pair.first);
+-            if (next_use_distance_it != next_use_distances.end() &&
+-                next_use_distance_it->second.first != block_idx) {
+-               ctx.spills_entry[block_idx].insert(pair);
+-               spilled_registers.vgpr += pair.first.size();
+-            }
+-         }
+-      }
+ 
+-      /* if register demand is still too high, we just keep all spilled live vars
+-       * and process the block */
+-      if (block->register_demand.sgpr - spilled_registers.sgpr > ctx.target_pressure.sgpr) {
+-         pred_idx = block->linear_preds[0];
+-         for (std::pair<Temp, uint32_t> pair : ctx.spills_exit[pred_idx]) {
+-            if (pair.first.type() == RegType::sgpr && next_use_distances.count(pair.first) &&
+-                ctx.spills_entry[block_idx].insert(pair).second) {
+-               spilled_registers.sgpr += pair.first.size();
+-            }
++         if (next_use_distances.count(pair.first)) {
++            spilled_registers += pair.first;
++            ctx.spills_entry[block_idx].emplace(pair);
+          }
+       }
+-      if (block->register_demand.vgpr - spilled_registers.vgpr > ctx.target_pressure.vgpr &&
+-          block->logical_preds.size() == 1) {
+-         pred_idx = block->logical_preds[0];
+-         for (std::pair<Temp, uint32_t> pair : ctx.spills_exit[pred_idx]) {
+-            if (pair.first.type() == RegType::vgpr && next_use_distances.count(pair.first) &&
+-                ctx.spills_entry[block_idx].insert(pair).second) {
+-               spilled_registers.vgpr += pair.first.size();
+-            }
++
++      if (block->logical_preds.empty())
++         return spilled_registers;
++
++      pred_idx = block->logical_preds[0];
++      for (std::pair<Temp, uint32_t> pair : ctx.spills_exit[pred_idx]) {
++         if (pair.first.type() != RegType::vgpr)
++            continue;
++
++         if (next_use_distances.count(pair.first)) {
++            spilled_registers += pair.first;
++            ctx.spills_entry[block_idx].emplace(pair);
+          }
+       }
+ 
+@@ -767,100 +743,28 @@ init_live_in_vars(spill_ctx& ctx, Block* block, unsigned block_idx)
+ void
+ add_coupling_code(spill_ctx& ctx, Block* block, unsigned block_idx)
+ {
+-   /* no coupling code necessary */
++   /* No coupling code necessary */
+    if (block->linear_preds.size() == 0)
+       return;
+ 
+-   std::vector<aco_ptr<Instruction>> instructions;
+-   /* branch block: TODO take other branch into consideration */
++   /* Branch block: update renames */
+    if (block->linear_preds.size() == 1 &&
+        !(block->kind & (block_kind_loop_exit | block_kind_loop_header))) {
+       assert(ctx.processed[block->linear_preds[0]]);
+       assert(ctx.register_demand[block_idx].size() == block->instructions.size());
+-      std::vector<RegisterDemand> reg_demand;
+-      unsigned insert_idx = 0;
+-      RegisterDemand demand_before = get_demand_before(ctx, block_idx, 0);
+-
+-      for (std::pair<const Temp, std::pair<uint32_t, uint32_t>>& live :
+-           ctx.next_use_distances_start[block_idx]) {
+-         const unsigned pred_idx = block->linear_preds[0];
+-
+-         if (!live.first.is_linear())
+-            continue;
+-         /* still spilled */
+-         if (ctx.spills_entry[block_idx].count(live.first))
+-            continue;
+ 
+-         /* in register at end of predecessor */
+-         auto spills_exit_it = ctx.spills_exit[pred_idx].find(live.first);
+-         if (spills_exit_it == ctx.spills_exit[pred_idx].end()) {
+-            std::map<Temp, Temp>::iterator it = ctx.renames[pred_idx].find(live.first);
+-            if (it != ctx.renames[pred_idx].end())
+-               ctx.renames[block_idx].insert(*it);
+-            continue;
++      ctx.renames[block_idx] = ctx.renames[block->linear_preds[0]];
++      if (!block->logical_preds.empty() && block->logical_preds[0] != block->linear_preds[0]) {
++         for (auto it : ctx.renames[block->logical_preds[0]]) {
++            if (it.first.type() == RegType::vgpr)
++               ctx.renames[block_idx].insert_or_assign(it.first, it.second);
+          }
+-
+-         /* variable is spilled at predecessor and live at current block: create reload instruction */
+-         Temp new_name = ctx.program->allocateTmp(live.first.regClass());
+-         aco_ptr<Instruction> reload = do_reload(ctx, live.first, new_name, spills_exit_it->second);
+-         instructions.emplace_back(std::move(reload));
+-         reg_demand.push_back(demand_before);
+-         ctx.renames[block_idx][live.first] = new_name;
+-      }
+-
+-      if (block->logical_preds.size() == 1) {
+-         do {
+-            assert(insert_idx < block->instructions.size());
+-            instructions.emplace_back(std::move(block->instructions[insert_idx]));
+-            reg_demand.push_back(ctx.register_demand[block_idx][insert_idx]);
+-            insert_idx++;
+-         } while (instructions.back()->opcode != aco_opcode::p_logical_start);
+-
+-         unsigned pred_idx = block->logical_preds[0];
+-         for (std::pair<const Temp, std::pair<uint32_t, uint32_t>>& live :
+-              ctx.next_use_distances_start[block_idx]) {
+-            if (live.first.is_linear())
+-               continue;
+-            /* still spilled */
+-            if (ctx.spills_entry[block_idx].count(live.first))
+-               continue;
+-
+-            /* in register at end of predecessor */
+-            auto spills_exit_it = ctx.spills_exit[pred_idx].find(live.first);
+-            if (spills_exit_it == ctx.spills_exit[pred_idx].end()) {
+-               std::map<Temp, Temp>::iterator it = ctx.renames[pred_idx].find(live.first);
+-               if (it != ctx.renames[pred_idx].end())
+-                  ctx.renames[block_idx].insert(*it);
+-               continue;
+-            }
+-
+-            /* variable is spilled at predecessor and live at current block:
+-             * create reload instruction */
+-            Temp new_name = ctx.program->allocateTmp(live.first.regClass());
+-            aco_ptr<Instruction> reload =
+-               do_reload(ctx, live.first, new_name, spills_exit_it->second);
+-            instructions.emplace_back(std::move(reload));
+-            reg_demand.emplace_back(reg_demand.back());
+-            ctx.renames[block_idx][live.first] = new_name;
+-         }
+-      }
+-
+-      /* combine new reload instructions with original block */
+-      if (!instructions.empty()) {
+-         reg_demand.insert(reg_demand.end(),
+-                           std::next(ctx.register_demand[block->index].begin(), insert_idx),
+-                           ctx.register_demand[block->index].end());
+-         ctx.register_demand[block_idx] = std::move(reg_demand);
+-         instructions.insert(instructions.end(),
+-                             std::move_iterator<std::vector<aco_ptr<Instruction>>::iterator>(
+-                                std::next(block->instructions.begin(), insert_idx)),
+-                             std::move_iterator<std::vector<aco_ptr<Instruction>>::iterator>(
+-                                block->instructions.end()));
+-         block->instructions = std::move(instructions);
+       }
+       return;
+    }
+ 
++   std::vector<aco_ptr<Instruction>> instructions;
++
+    /* loop header and merge blocks: check if all (linear) predecessors have been processed */
+    for (ASSERTED unsigned pred : block->linear_preds)
+       assert(ctx.processed[pred]);
+-- 
+GitLab
+
+
+From a69aec3d7115363ac776d060b808cd83b64e2e43 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Sch=C3=BCrmann?= <daniel@schuermann.dev>
+Date: Mon, 19 Feb 2024 14:19:52 +0100
+Subject: [PATCH 05/10] aco/spill: don't prefer to spill phis at merge blocks
+
+Totals from 44 (0.06% of 79242) affected shaders: (GFX11)
+Instrs: 165578 -> 165545 (-0.02%); split: -0.08%, +0.06%
+CodeSize: 833528 -> 832988 (-0.06%); split: -0.11%, +0.04%
+SpillSGPRs: 346 -> 329 (-4.91%)
+Latency: 1176341 -> 1176231 (-0.01%); split: -0.02%, +0.01%
+InvThroughput: 235771 -> 235761 (-0.00%); split: -0.01%, +0.01%
+SClause: 3287 -> 3289 (+0.06%); split: -0.21%, +0.27%
+Copies: 16290 -> 16299 (+0.06%); split: -0.62%, +0.68%
+Branches: 3633 -> 3641 (+0.22%)
+---
+ src/amd/compiler/aco_spill.cpp | 17 ++++++++++-------
+ 1 file changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/src/amd/compiler/aco_spill.cpp b/src/amd/compiler/aco_spill.cpp
+index 5c2dd3e46a766..c6df2ba5190cb 100644
+--- a/src/amd/compiler/aco_spill.cpp
++++ b/src/amd/compiler/aco_spill.cpp
+@@ -687,11 +687,14 @@ init_live_in_vars(spill_ctx& ctx, Block* block, unsigned block_idx)
+       std::vector<unsigned>& preds =
+          phi->opcode == aco_opcode::p_phi ? block->logical_preds : block->linear_preds;
+       bool is_all_spilled = true;
++      bool is_partial_spill = false;
+       for (unsigned i = 0; i < phi->operands.size(); i++) {
+          if (phi->operands[i].isUndefined())
+             continue;
+-         is_all_spilled &= phi->operands[i].isTemp() &&
+-                           ctx.spills_exit[preds[i]].count(phi->operands[i].getTemp());
++         bool spilled = phi->operands[i].isTemp() &&
++                        ctx.spills_exit[preds[i]].count(phi->operands[i].getTemp());
++         is_all_spilled &= spilled;
++         is_partial_spill |= spilled;
+       }
+ 
+       if (is_all_spilled) {
+@@ -701,7 +704,7 @@ init_live_in_vars(spill_ctx& ctx, Block* block, unsigned block_idx)
+          spilled_registers += phi->definitions[0].getTemp();
+       } else {
+          /* Phis might increase the register pressure. */
+-         partial_spills[phi->definitions[0].getTemp()] = true;
++         partial_spills[phi->definitions[0].getTemp()] = is_partial_spill;
+       }
+    }
+ 
+@@ -713,19 +716,19 @@ init_live_in_vars(spill_ctx& ctx, Block* block, unsigned block_idx)
+       assert(!partial_spills.empty());
+       std::map<Temp, bool>::iterator it = partial_spills.begin();
+       Temp to_spill = Temp();
+-      bool is_spilled_or_phi = false;
++      bool is_partial_spill = false;
+       unsigned distance = 0;
+       RegType type = reg_pressure.vgpr > ctx.target_pressure.vgpr ? RegType::vgpr : RegType::sgpr;
+ 
+       while (it != partial_spills.end()) {
+          assert(!ctx.spills_entry[block_idx].count(it->first));
+ 
+-         if (it->first.type() == type && ((it->second && !is_spilled_or_phi) ||
+-                                          (it->second == is_spilled_or_phi &&
++         if (it->first.type() == type && ((it->second && !is_partial_spill) ||
++                                          (it->second == is_partial_spill &&
+                                            next_use_distances.at(it->first).second > distance))) {
+             distance = next_use_distances.at(it->first).second;
+             to_spill = it->first;
+-            is_spilled_or_phi = it->second;
++            is_partial_spill = it->second;
+          }
+          ++it;
+       }
+-- 
+GitLab
+
+
+From 933501c19ff4b5bdc4c95a67515dca81f3a3f265 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Sch=C3=BCrmann?= <daniel@schuermann.dev>
+Date: Wed, 21 Feb 2024 16:48:18 +0100
+Subject: [PATCH 06/10] aco/spill: avoid re-spilling loop-carried variables in
+ process_block()
+
+If a variable is spilled at the loop-header of the current loop,
+there is no need to spill it redundantly. Instead, re-use the
+spill-slot from the loop-header.
+---
+ src/amd/compiler/aco_spill.cpp | 27 ++++++++++++++++++++++-----
+ 1 file changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/src/amd/compiler/aco_spill.cpp b/src/amd/compiler/aco_spill.cpp
+index c6df2ba5190cb..5e05d91f8653b 100644
+--- a/src/amd/compiler/aco_spill.cpp
++++ b/src/amd/compiler/aco_spill.cpp
+@@ -1147,7 +1147,8 @@ process_block(spill_ctx& ctx, unsigned block_idx, Block* block, RegisterDemand s
+          while ((new_demand - spilled_registers).exceeds(ctx.target_pressure)) {
+             unsigned distance = 0;
+             Temp to_spill;
+-            bool do_rematerialize = false;
++            unsigned do_rematerialize = 0;
++            unsigned avoid_respill = 0;
+             RegType type = RegType::sgpr;
+             if (new_demand.vgpr - spilled_registers.vgpr > ctx.target_pressure.vgpr)
+                type = RegType::vgpr;
+@@ -1156,16 +1157,32 @@ process_block(spill_ctx& ctx, unsigned block_idx, Block* block, RegisterDemand s
+                if (pair.first.type() != type || current_spills.count(pair.first))
+                   continue;
+ 
+-               bool can_rematerialize = ctx.remat.count(pair.first);
+-               if ((pair.second > distance && can_rematerialize == do_rematerialize) ||
+-                   (can_rematerialize && !do_rematerialize)) {
++               unsigned can_rematerialize = ctx.remat.count(pair.first);
++               unsigned loop_variable =
++                  block->loop_nest_depth &&
++                  ctx.spills_entry[ctx.loop_header.top()->index].count(pair.first);
++               if ((avoid_respill && !loop_variable) || (do_rematerialize && !can_rematerialize))
++                  continue;
++
++               if (can_rematerialize > do_rematerialize || loop_variable > avoid_respill ||
++                   pair.second > distance) {
+                   to_spill = pair.first;
+                   distance = pair.second;
+                   do_rematerialize = can_rematerialize;
++                  avoid_respill = loop_variable;
+                }
+             }
+-
+             assert(distance != 0 && distance > idx);
++
++            if (avoid_respill) {
++               /* This variable is spilled at the loop-header of the current loop.
++                * Re-use the spill-slot in order to avoid an extra store.
++                */
++               current_spills[to_spill] = ctx.spills_entry[ctx.loop_header.top()->index][to_spill];
++               spilled_registers += to_spill;
++               continue;
++            }
++
+             uint32_t spill_id = ctx.allocate_spill_id(to_spill.regClass());
+ 
+             /* add interferences with currently spilled variables */
+-- 
+GitLab
+
+
+From a3e9ffd9507918b7aa163ad19cb9233c51656ceb Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Sch=C3=BCrmann?= <daniel@schuermann.dev>
+Date: Wed, 21 Feb 2024 17:01:17 +0100
+Subject: [PATCH 07/10] aco/spill: avoid re-spilling loop-carried variables in
+ add_coupling_code()
+
+These variables only need to be spilled once at the loop-preheader.
+---
+ src/amd/compiler/aco_spill.cpp | 18 ++++++++++++++----
+ 1 file changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/src/amd/compiler/aco_spill.cpp b/src/amd/compiler/aco_spill.cpp
+index 5e05d91f8653b..252435e048e75 100644
+--- a/src/amd/compiler/aco_spill.cpp
++++ b/src/amd/compiler/aco_spill.cpp
+@@ -856,6 +856,20 @@ add_coupling_code(spill_ctx& ctx, Block* block, unsigned block_idx)
+          pair.first.is_linear() ? block->linear_preds : block->logical_preds;
+ 
+       for (unsigned pred_idx : preds) {
++         /* variable is dead at predecessor, it must be from a phi: this works because of CSSA form */
++         if (!ctx.next_use_distances_end[pred_idx].count(pair.first))
++            continue;
++
++         /* If this variable is spilled through the entire loop, no need to re-spill.
++          * It can be reloaded from the same spill-slot it got at the loop-preheader.
++          */
++         if (block->loop_nest_depth &&
++             ctx.program->blocks[pred_idx].loop_nest_depth >= block->loop_nest_depth &&
++             ctx.spills_entry[ctx.loop_header.top()->index].count(pair.first)) {
++            ctx.spills_exit[pred_idx].insert(pair);
++            continue;
++         }
++
+          /* variable is already spilled at predecessor */
+          auto spilled = ctx.spills_exit[pred_idx].find(pair.first);
+          if (spilled != ctx.spills_exit[pred_idx].end()) {
+@@ -864,10 +878,6 @@ add_coupling_code(spill_ctx& ctx, Block* block, unsigned block_idx)
+             continue;
+          }
+ 
+-         /* variable is dead at predecessor, it must be from a phi: this works because of CSSA form */
+-         if (!ctx.next_use_distances_end[pred_idx].count(pair.first))
+-            continue;
+-
+          /* add interferences between spilled variable and predecessors exit spills */
+          for (std::pair<Temp, uint32_t> exit_spill : ctx.spills_exit[pred_idx]) {
+             if (exit_spill.first == pair.first)
+-- 
+GitLab
+
+
+From 386a596995e24e48f5984a6467e2c97f54e2b8a2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Sch=C3=BCrmann?= <daniel@schuermann.dev>
+Date: Thu, 22 Feb 2024 17:12:17 +0100
+Subject: [PATCH 08/10] aco/spill: keep loop-carried variables spilled at loop
+ headers
+
+Now, that we avoid re-spilling loop-carried variables, we can
+keep them spilled at loop-headers.
+
+Totals from 57 (0.07% of 79242) affected shaders: (GFX11)
+Instrs: 779128 -> 777525 (-0.21%); split: -0.28%, +0.07%
+CodeSize: 3971864 -> 3961320 (-0.27%); split: -0.32%, +0.06%
+SpillSGPRs: 1553 -> 1151 (-25.89%)
+SpillVGPRs: 292 -> 274 (-6.16%)
+Scratch: 26880 -> 24320 (-9.52%)
+Latency: 4463433 -> 4464512 (+0.02%); split: -0.03%, +0.05%
+InvThroughput: 1076521 -> 1077133 (+0.06%); split: -0.03%, +0.09%
+VClause: 16267 -> 16306 (+0.24%)
+SClause: 15673 -> 15670 (-0.02%); split: -0.10%, +0.08%
+Copies: 67673 -> 67119 (-0.82%); split: -1.29%, +0.47%
+Branches: 23616 -> 23620 (+0.02%); split: -0.07%, +0.08%
+---
+ src/amd/compiler/aco_spill.cpp | 12 +++++-------
+ 1 file changed, 5 insertions(+), 7 deletions(-)
+
+diff --git a/src/amd/compiler/aco_spill.cpp b/src/amd/compiler/aco_spill.cpp
+index 252435e048e75..1ee2f6a6c0c7c 100644
+--- a/src/amd/compiler/aco_spill.cpp
++++ b/src/amd/compiler/aco_spill.cpp
+@@ -524,15 +524,13 @@ init_live_in_vars(spill_ctx& ctx, Block* block, unsigned block_idx)
+          if (it == next_use_distances.end())
+             continue;
+ 
+-         /* keep constants and live-through variables spilled */
+-         if (it->second.first >= loop_end || ctx.remat.count(spilled.first)) {
+-            ctx.spills_entry[block_idx][spilled.first] = spilled.second;
+-            spilled_registers += spilled.first;
+-            loop_demand -= spilled.first;
+-         }
++         /* keep live-through variables spilled */
++         ctx.spills_entry[block_idx][spilled.first] = spilled.second;
++         spilled_registers += spilled.first;
++         loop_demand -= spilled.first;
+       }
+ 
+-      /* select live-through variables and constants */
++      /* select more live-through variables and constants */
+       RegType type = RegType::vgpr;
+       while (loop_demand.exceeds(ctx.target_pressure)) {
+          /* if VGPR demand is low enough, select SGPRs */
+-- 
+GitLab
+
+
+From cd1f37ce708e4d4b00331e7a2b72c1b3c31382da Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Sch=C3=BCrmann?= <daniel@schuermann.dev>
+Date: Thu, 22 Feb 2024 17:21:05 +0100
+Subject: [PATCH 09/10] aco/spill: keep loop-carried variables spilled at merge
+ blocks
+
+If loop-carried variables are partially spilled at some predecessor,
+keep them spilled without extra instruction.
+
+Also slightly refactors the code for better readability.
+
+Totals from 55 (0.07% of 79242) affected shaders: (GFX11)
+Instrs: 179743 -> 179317 (-0.24%); split: -0.28%, +0.05%
+CodeSize: 914060 -> 912212 (-0.20%); split: -0.24%, +0.04%
+SpillVGPRs: 274 -> 256 (-6.57%)
+Scratch: 24320 -> 24832 (+2.11%)
+Latency: 1518480 -> 1517317 (-0.08%); split: -0.09%, +0.01%
+InvThroughput: 334298 -> 333810 (-0.15%); split: -0.15%, +0.01%
+VClause: 2375 -> 2350 (-1.05%)
+SClause: 3327 -> 3332 (+0.15%); split: -0.33%, +0.48%
+Copies: 17100 -> 16883 (-1.27%); split: -1.84%, +0.57%
+Branches: 3614 -> 3604 (-0.28%)
+---
+ src/amd/compiler/aco_spill.cpp | 25 +++++++++++++++----------
+ 1 file changed, 15 insertions(+), 10 deletions(-)
+
+diff --git a/src/amd/compiler/aco_spill.cpp b/src/amd/compiler/aco_spill.cpp
+index 1ee2f6a6c0c7c..687ed7ae273a0 100644
+--- a/src/amd/compiler/aco_spill.cpp
++++ b/src/amd/compiler/aco_spill.cpp
+@@ -644,10 +644,14 @@ init_live_in_vars(spill_ctx& ctx, Block* block, unsigned block_idx)
+        * it. Otherwise, if any predecessor reloads it, ensure it's reloaded on all other
+        * predecessors. The idea is that it's better in practice to rematerialize redundantly than to
+        * create lots of phis. */
+-      /* TODO: test this idea with more than Dawn of War III shaders (the current pipeline-db
+-       * doesn't seem to exercise this path much) */
+-      bool remat = ctx.remat.count(pair.first);
+-      bool spill = !remat;
++      const bool remat = ctx.remat.count(pair.first);
++      /* If the variable is spilled at the current loop-header, spilling is essentially for free
++       * while reloading is not. Thus, keep them spilled if they are at least partially spilled.
++       */
++      const bool avoid_respill =
++         block->loop_nest_depth && ctx.spills_entry[ctx.loop_header.top()->index].count(pair.first);
++      bool spill = true;
++      bool partial_spill = false;
+       uint32_t spill_id = 0;
+       for (unsigned pred_idx : preds) {
+          /* variable is not even live at the predecessor: probably from a phi */
+@@ -656,22 +660,22 @@ init_live_in_vars(spill_ctx& ctx, Block* block, unsigned block_idx)
+             break;
+          }
+          if (!ctx.spills_exit[pred_idx].count(pair.first)) {
+-            partial_spills.emplace(pair.first, false);
+-            if (!remat)
+-               spill = false;
++            spill = false;
+          } else {
+-            partial_spills[pair.first] = true;
++            partial_spill = true;
+             /* it might be that on one incoming path, the variable has a different spill_id, but
+              * add_couple_code() will take care of that. */
+             spill_id = ctx.spills_exit[pred_idx][pair.first];
+-            if (remat)
+-               spill = true;
+          }
+       }
++      spill |= (remat && partial_spill);
++      spill |= (avoid_respill && partial_spill);
+       if (spill) {
+          ctx.spills_entry[block_idx][pair.first] = spill_id;
+          partial_spills.erase(pair.first);
+          spilled_registers += pair.first;
++      } else {
++         partial_spills[pair.first] = partial_spill;
+       }
+    }
+ 
+@@ -700,6 +704,7 @@ init_live_in_vars(spill_ctx& ctx, Block* block, unsigned block_idx)
+          ctx.spills_entry[block_idx][phi->definitions[0].getTemp()] =
+             ctx.allocate_spill_id(phi->definitions[0].regClass());
+          spilled_registers += phi->definitions[0].getTemp();
++         partial_spills.erase(phi->definitions[0].getTemp());
+       } else {
+          /* Phis might increase the register pressure. */
+          partial_spills[phi->definitions[0].getTemp()] = is_partial_spill;
+-- 
+GitLab
+
+
+From a41ecc85c84451db8d117c105bb8d6b256dd1570 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Sch=C3=BCrmann?= <daniel@schuermann.dev>
+Date: Wed, 21 Feb 2024 14:57:36 +0100
+Subject: [PATCH 10/10] aco/spill: select more loop-carried variables to be
+ spilled
+
+This changes the heuristic to also spill live-through variables
+if they are used within the loop if the register pressure is too high.
+
+Totals from 83 (0.10% of 79242) affected shaders: (GFX11)
+Instrs: 1944025 -> 1941665 (-0.12%); split: -0.20%, +0.08%
+CodeSize: 9964568 -> 9954652 (-0.10%); split: -0.21%, +0.12%
+SpillSGPRs: 3801 -> 3071 (-19.21%); split: -19.52%, +0.32%
+SpillVGPRs: 1184 -> 1037 (-12.42%); split: -13.43%, +1.01%
+Scratch: 89856 -> 88320 (-1.71%); split: -1.99%, +0.28%
+Latency: 14235013 -> 14499869 (+1.86%); split: -0.05%, +1.91%
+InvThroughput: 4268657 -> 4399911 (+3.07%); split: -0.02%, +3.09%
+VClause: 45818 -> 45857 (+0.09%); split: -0.05%, +0.14%
+SClause: 37674 -> 37604 (-0.19%); split: -0.27%, +0.08%
+Copies: 184824 -> 181998 (-1.53%); split: -1.71%, +0.18%
+Branches: 60457 -> 60447 (-0.02%); split: -0.13%, +0.11%
+---
+ src/amd/compiler/aco_spill.cpp | 17 ++++++++---------
+ 1 file changed, 8 insertions(+), 9 deletions(-)
+
+diff --git a/src/amd/compiler/aco_spill.cpp b/src/amd/compiler/aco_spill.cpp
+index 687ed7ae273a0..10675e5d62cdf 100644
+--- a/src/amd/compiler/aco_spill.cpp
++++ b/src/amd/compiler/aco_spill.cpp
+@@ -500,7 +500,7 @@ init_live_in_vars(spill_ctx& ctx, Block* block, unsigned block_idx)
+    const auto& next_use_distances = ctx.next_use_distances_start[block_idx];
+ 
+    /* loop header block */
+-   if (block->loop_nest_depth > ctx.program->blocks[block_idx - 1].loop_nest_depth) {
++   if (block->kind & block_kind_loop_header) {
+       assert(block->linear_preds[0] == block_idx - 1);
+       assert(block->logical_preds[0] == block_idx - 1);
+ 
+@@ -511,11 +511,8 @@ init_live_in_vars(spill_ctx& ctx, Block* block, unsigned block_idx)
+       RegisterDemand reg_pressure = get_live_in_demand(ctx, block_idx);
+       RegisterDemand loop_demand = reg_pressure;
+       unsigned i = block_idx;
+-      while (ctx.program->blocks[i].loop_nest_depth >= block->loop_nest_depth) {
+-         assert(ctx.program->blocks.size() > i);
++      while (ctx.program->blocks[i].loop_nest_depth >= block->loop_nest_depth)
+          loop_demand.update(ctx.program->blocks[i++].register_demand);
+-      }
+-      unsigned loop_end = i;
+ 
+       for (auto spilled : ctx.spills_exit[block_idx - 1]) {
+          auto it = next_use_distances.find(spilled.first);
+@@ -541,15 +538,17 @@ init_live_in_vars(spill_ctx& ctx, Block* block, unsigned block_idx)
+             break;
+ 
+          unsigned distance = 0;
++         unsigned remat = 0;
+          Temp to_spill;
+          for (const std::pair<const Temp, std::pair<uint32_t, uint32_t>>& pair :
+               next_use_distances) {
+-            if (pair.first.type() == type &&
+-                (pair.second.first >= loop_end ||
+-                 (ctx.remat.count(pair.first) && type == RegType::sgpr)) &&
+-                pair.second.second > distance && !ctx.spills_entry[block_idx].count(pair.first)) {
++            unsigned can_remat = ctx.remat.count(pair.first);
++            if (pair.first.type() == type && !ctx.spills_entry[block_idx].count(pair.first) &&
++                ctx.next_use_distances_end[block_idx - 1].count(pair.first) &&
++                (can_remat > remat || (can_remat == remat && pair.second.second > distance))) {
+                to_spill = pair.first;
+                distance = pair.second.second;
++               remat = can_remat;
+             }
+          }
+ 
+-- 
+GitLab
+
