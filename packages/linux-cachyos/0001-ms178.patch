@@ -8514,1043 +8514,6 @@ index 75c9fd2c6c2a..b0ed10f4de60 100644
 --
 2.35.1
 
-- Add tracking clear page feature.
-
-- Driver should enable the DRM_BUDDY_CLEARED flag if it
-  successfully clears the blocks in the free path. On the otherhand,
-  DRM buddy marks each block as cleared.
-
-- Track the available cleared pages size
-
-- If driver requests cleared memory we prefer cleared memory
-  but fallback to uncleared if we can't find the cleared blocks.
-  when driver requests uncleared memory we try to use uncleared but
-  fallback to cleared memory if necessary.
-
-- When a block gets freed we clear it and mark the freed block as cleared,
-  when there are buddies which are cleared as well we can merge them.
-  Otherwise, we prefer to keep the blocks as separated.
-
-- Add a function to support defragmentation.
-
-v1:
-  - Depends on the flag check DRM_BUDDY_CLEARED, enable the block as
-    cleared. Else, reset the clear flag for each block in the list(Christian)
-  - For merging the 2 cleared blocks compare as below,
-    drm_buddy_is_clear(block) != drm_buddy_is_clear(buddy)(Christian)
-  - Defragment the memory beginning from min_order
-    till the required memory space is available.
-
-v2: (Matthew)
-  - Add a wrapper drm_buddy_free_list_internal for the freeing of blocks
-    operation within drm buddy.
-  - Write a macro block_incompatible() to allocate the required blocks.
-  - Update the xe driver for the drm_buddy_free_list change in arguments.
-  - add a warning if the two blocks are incompatible on
-    defragmentation
-  - call full defragmentation in the fini() function
-  - place a condition to test if min_order is equal to 0
-  - replace the list with safe_reverse() variant as we might
-    remove the block from the list.
-
-v3:
-  - fix Gitlab user reported lockup issue.
-  - Keep DRM_BUDDY_HEADER_CLEAR define sorted(Matthew)
-  - modify to pass the root order instead max_order in fini()
-    function(Matthew)
-  - change bool 1 to true(Matthew)
-  - add check if min_block_size is power of 2(Matthew)
-  - modify the min_block_size datatype to u64(Matthew)
-
-Signed-off-by: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam at amd.com>
-Signed-off-by: Matthew Auld <matthew.auld at intel.com>
-Suggested-by: Christian König <christian.koenig at amd.com>
-Suggested-by: Matthew Auld <matthew.auld at intel.com>
----
- drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c  |   6 +-
- drivers/gpu/drm/drm_buddy.c                   | 294 +++++++++++++++---
- drivers/gpu/drm/i915/i915_ttm_buddy_manager.c |   6 +-
- drivers/gpu/drm/tests/drm_buddy_test.c        |  18 +-
- drivers/gpu/drm/xe/xe_ttm_vram_mgr.c          |   4 +-
- include/drm/drm_buddy.h                       |  22 +-
- 6 files changed, 290 insertions(+), 60 deletions(-)
-
-diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
-index 8db880244324..c0c851409241 100644
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
-@@ -571,7 +571,7 @@ static int amdgpu_vram_mgr_new(struct ttm_resource_manager *man,
- 	return 0;
-
- error_free_blocks:
--	drm_buddy_free_list(mm, &vres->blocks);
-+	drm_buddy_free_list(mm, &vres->blocks, 0);
- 	mutex_unlock(&mgr->lock);
- error_fini:
- 	ttm_resource_fini(man, &vres->base);
-@@ -604,7 +604,7 @@ static void amdgpu_vram_mgr_del(struct ttm_resource_manager *man,
-
- 	amdgpu_vram_mgr_do_reserve(man);
-
--	drm_buddy_free_list(mm, &vres->blocks);
-+	drm_buddy_free_list(mm, &vres->blocks, 0);
- 	mutex_unlock(&mgr->lock);
-
- 	atomic64_sub(vis_usage, &mgr->vis_usage);
-@@ -912,7 +912,7 @@ void amdgpu_vram_mgr_fini(struct amdgpu_device *adev)
- 		kfree(rsv);
-
- 	list_for_each_entry_safe(rsv, temp, &mgr->reserved_pages, blocks) {
--		drm_buddy_free_list(&mgr->mm, &rsv->allocated);
-+		drm_buddy_free_list(&mgr->mm, &rsv->allocated, 0);
- 		kfree(rsv);
- 	}
- 	if (!adev->gmc.is_app_apu)
-diff --git a/drivers/gpu/drm/drm_buddy.c b/drivers/gpu/drm/drm_buddy.c
-index c4222b886db7..40131ed9b0cd 100644
---- a/drivers/gpu/drm/drm_buddy.c
-+++ b/drivers/gpu/drm/drm_buddy.c
-@@ -57,6 +57,16 @@ static void list_insert_sorted(struct drm_buddy *mm,
- 	__list_add(&block->link, node->link.prev, &node->link);
- }
-
-+static void clear_reset(struct drm_buddy_block *block)
-+{
-+	block->header &= ~DRM_BUDDY_HEADER_CLEAR;
-+}
-+
-+static void mark_cleared(struct drm_buddy_block *block)
-+{
-+	block->header |= DRM_BUDDY_HEADER_CLEAR;
-+}
-+
- static void mark_allocated(struct drm_buddy_block *block)
- {
- 	block->header &= ~DRM_BUDDY_HEADER_STATE;
-@@ -186,11 +196,21 @@ EXPORT_SYMBOL(drm_buddy_init);
-  */
- void drm_buddy_fini(struct drm_buddy *mm)
- {
-+	u64 root_size, size;
-+	unsigned int order;
- 	int i;
-
-+	size = mm->size;
-+
- 	for (i = 0; i < mm->n_roots; ++i) {
-+		order = ilog2(size) - ilog2(mm->chunk_size);
-+		root_size = mm->chunk_size << order;
-+		drm_buddy_defrag(mm, root_size);
-+
- 		WARN_ON(!drm_buddy_block_is_free(mm->roots[i]));
- 		drm_block_free(mm, mm->roots[i]);
-+
-+		size -= root_size;
- 	}
-
- 	WARN_ON(mm->avail != mm->size);
-@@ -223,6 +243,12 @@ static int split_block(struct drm_buddy *mm,
- 	mark_free(mm, block->left);
- 	mark_free(mm, block->right);
-
-+	if (drm_buddy_block_is_clear(block)) {
-+		mark_cleared(block->left);
-+		mark_cleared(block->right);
-+		clear_reset(block);
-+	}
-+
- 	mark_split(block);
-
- 	return 0;
-@@ -260,10 +286,12 @@ drm_get_buddy(struct drm_buddy_block *block)
- }
- EXPORT_SYMBOL(drm_get_buddy);
-
--static void __drm_buddy_free(struct drm_buddy *mm,
--			     struct drm_buddy_block *block)
-+static unsigned int __drm_buddy_free(struct drm_buddy *mm,
-+				     struct drm_buddy_block *block,
-+				     bool defrag)
- {
- 	struct drm_buddy_block *parent;
-+	unsigned int order;
-
- 	while ((parent = block->parent)) {
- 		struct drm_buddy_block *buddy;
-@@ -273,6 +301,23 @@ static void __drm_buddy_free(struct drm_buddy *mm,
- 		if (!drm_buddy_block_is_free(buddy))
- 			break;
-
-+		if (!defrag) {
-+			/*
-+			 * Check the block and its buddy clear state and exit
-+			 * the loop if they both have the dissimilar state.
-+			 */
-+			if (drm_buddy_block_is_clear(block) !=
-+			    drm_buddy_block_is_clear(buddy))
-+				break;
-+
-+			if (drm_buddy_block_is_clear(block))
-+				mark_cleared(parent);
-+		}
-+
-+		WARN_ON(defrag &&
-+			(drm_buddy_block_is_clear(block) ==
-+			 drm_buddy_block_is_clear(buddy)));
-+
- 		list_del(&buddy->link);
-
- 		drm_block_free(mm, block);
-@@ -281,7 +326,75 @@ static void __drm_buddy_free(struct drm_buddy *mm,
- 		block = parent;
- 	}
-
-+	order = drm_buddy_block_order(block);
- 	mark_free(mm, block);
-+
-+	return order;
-+}
-+
-+/**
-+ * drm_buddy_defrag - Defragmentation routine
-+ *
-+ * @mm: DRM buddy manager
-+ * @min_block_size: minimum size in bytes to begin
-+ * the defragmentation process
-+ *
-+ * Driver calls the defragmentation function when the
-+ * requested memory allocation returns -ENOSPC.
-+ */
-+void drm_buddy_defrag(struct drm_buddy *mm,
-+		      u64 min_block_size)
-+{
-+	struct drm_buddy_block *block;
-+	unsigned int order, min_order;
-+	struct list_head *list;
-+	unsigned long pages;
-+	int i;
-+
-+	if (min_block_size <= mm->chunk_size)
-+		return;
-+
-+	if (!is_power_of_2(min_block_size))
-+		return;
-+
-+	pages = min_block_size >> ilog2(mm->chunk_size);
-+	min_order = fls(pages) - 1;
-+
-+	if (min_order > mm->max_order)
-+		return;
-+
-+	for (i = min_order - 1; i >= 0; i--) {
-+		struct drm_buddy_block *prev;
-+
-+		list = &mm->free_list[i];
-+		if (list_empty(list))
-+			continue;
-+
-+		list_for_each_entry_safe_reverse(block, prev, list, link) {
-+			struct drm_buddy_block *buddy;
-+
-+			if (!block->parent)
-+				continue;
-+
-+			buddy = __get_buddy(block);
-+			if (!drm_buddy_block_is_free(buddy))
-+				continue;
-+
-+			/*
-+			 * If the prev block is same as buddy, don't access the
-+			 * block in the next iteration as we would free the
-+			 * buddy block as part of the free function.
-+			 */
-+			if (prev == buddy)
-+				prev = list_prev_entry(prev, link);
-+
-+			list_del(&block->link);
-+
-+			order = __drm_buddy_free(mm, block, true);
-+			if (order >= min_order)
-+				return;
-+		}
-+	}
- }
-
- /**
-@@ -295,26 +408,59 @@ void drm_buddy_free_block(struct drm_buddy *mm,
- {
- 	BUG_ON(!drm_buddy_block_is_allocated(block));
- 	mm->avail += drm_buddy_block_size(mm, block);
--	__drm_buddy_free(mm, block);
-+	if (drm_buddy_block_is_clear(block))
-+		mm->clear_avail += drm_buddy_block_size(mm, block);
-+
-+	__drm_buddy_free(mm, block, false);
- }
- EXPORT_SYMBOL(drm_buddy_free_block);
-
--/**
-- * drm_buddy_free_list - free blocks
-- *
-- * @mm: DRM buddy manager
-- * @objects: input list head to free blocks
-- */
--void drm_buddy_free_list(struct drm_buddy *mm, struct list_head *objects)
-+static void __drm_buddy_free_list(struct drm_buddy *mm,
-+				  struct list_head *objects,
-+				  bool mark_clear,
-+				  bool mark_dirty)
- {
- 	struct drm_buddy_block *block, *on;
-
-+	WARN_ON(mark_dirty && mark_clear);
-+
- 	list_for_each_entry_safe(block, on, objects, link) {
-+		if (mark_clear)
-+			mark_cleared(block);
-+		else if (mark_dirty)
-+			clear_reset(block);
- 		drm_buddy_free_block(mm, block);
- 		cond_resched();
- 	}
- 	INIT_LIST_HEAD(objects);
- }
-+
-+static void drm_buddy_free_list_internal(struct drm_buddy *mm,
-+					 struct list_head *objects)
-+{
-+	/*
-+	 * Don't touch the clear/dirty bit, since allocation is still internal
-+	 * at this point. For example we might have just failed part of the
-+	 * allocation.
-+	 */
-+	__drm_buddy_free_list(mm, objects, false, false);
-+}
-+
-+/**
-+ * drm_buddy_free_list - free blocks
-+ *
-+ * @mm: DRM buddy manager
-+ * @objects: input list head to free blocks
-+ * @flags: optional flags like DRM_BUDDY_CLEARED
-+ */
-+void drm_buddy_free_list(struct drm_buddy *mm,
-+			 struct list_head *objects,
-+			 unsigned int flags)
-+{
-+	bool mark_clear = flags & DRM_BUDDY_CLEARED;
-+
-+	__drm_buddy_free_list(mm, objects, mark_clear, !mark_clear);
-+}
- EXPORT_SYMBOL(drm_buddy_free_list);
-
- static inline bool overlaps(u64 s1, u64 e1, u64 s2, u64 e2)
-@@ -327,10 +473,19 @@ static inline bool contains(u64 s1, u64 e1, u64 s2, u64 e2)
- 	return s1 <= s2 && e1 >= e2;
- }
-
-+static bool block_incompatible(struct drm_buddy_block *block, unsigned int flags)
-+{
-+	bool needs_clear = flags & DRM_BUDDY_CLEAR_ALLOCATION;
-+
-+	return needs_clear != drm_buddy_block_is_clear(block);
-+}
-+
- static struct drm_buddy_block *
--alloc_range_bias(struct drm_buddy *mm,
--		 u64 start, u64 end,
--		 unsigned int order)
-+__alloc_range_bias(struct drm_buddy *mm,
-+		   u64 start, u64 end,
-+		   unsigned int order,
-+		   unsigned long flags,
-+		   bool fallback)
- {
- 	struct drm_buddy_block *block;
- 	struct drm_buddy_block *buddy;
-@@ -369,6 +524,9 @@ alloc_range_bias(struct drm_buddy *mm,
-
- 		if (contains(start, end, block_start, block_end) &&
- 		    order == drm_buddy_block_order(block)) {
-+			if (!fallback && block_incompatible(block, flags))
-+				continue;
-+
- 			/*
- 			 * Find the free block within the range.
- 			 */
-@@ -400,30 +558,57 @@ alloc_range_bias(struct drm_buddy *mm,
- 	if (buddy &&
- 	    (drm_buddy_block_is_free(block) &&
- 	     drm_buddy_block_is_free(buddy)))
--		__drm_buddy_free(mm, block);
-+		__drm_buddy_free(mm, block, false);
- 	return ERR_PTR(err);
- }
-
- static struct drm_buddy_block *
--get_maxblock(struct drm_buddy *mm, unsigned int order)
-+__drm_buddy_alloc_range_bias(struct drm_buddy *mm,
-+			     u64 start, u64 end,
-+			     unsigned int order,
-+			     unsigned long flags)
-+{
-+	struct drm_buddy_block *block;
-+	bool fallback = 0;
-+
-+	block = __alloc_range_bias(mm, start, end, order,
-+				   flags, fallback);
-+	if (IS_ERR(block))
-+		return __alloc_range_bias(mm, start, end, order,
-+					  flags, !fallback);
-+
-+	return block;
-+}
-+
-+static struct drm_buddy_block *
-+get_maxblock(struct drm_buddy *mm, unsigned int order,
-+	     unsigned long flags)
- {
--	struct drm_buddy_block *max_block = NULL, *node;
-+	struct drm_buddy_block *max_block = NULL, *block = NULL;
- 	unsigned int i;
-
- 	for (i = order; i <= mm->max_order; ++i) {
--		if (!list_empty(&mm->free_list[i])) {
--			node = list_last_entry(&mm->free_list[i],
--					       struct drm_buddy_block,
--					       link);
--			if (!max_block) {
--				max_block = node;
-+		struct drm_buddy_block *tmp_block;
-+
-+		list_for_each_entry_reverse(tmp_block, &mm->free_list[i], link) {
-+			if (block_incompatible(tmp_block, flags))
- 				continue;
--			}
-
--			if (drm_buddy_block_offset(node) >
--			    drm_buddy_block_offset(max_block)) {
--				max_block = node;
--			}
-+			block = tmp_block;
-+			break;
-+		}
-+
-+		if (!block)
-+			continue;
-+
-+		if (!max_block) {
-+			max_block = block;
-+			continue;
-+		}
-+
-+		if (drm_buddy_block_offset(block) >
-+		    drm_buddy_block_offset(max_block)) {
-+			max_block = block;
- 		}
- 	}
-
-@@ -440,11 +625,29 @@ alloc_from_freelist(struct drm_buddy *mm,
- 	int err;
-
- 	if (flags & DRM_BUDDY_TOPDOWN_ALLOCATION) {
--		block = get_maxblock(mm, order);
-+		block = get_maxblock(mm, order, flags);
- 		if (block)
- 			/* Store the obtained block order */
- 			tmp = drm_buddy_block_order(block);
- 	} else {
-+		for (tmp = order; tmp <= mm->max_order; ++tmp) {
-+			struct drm_buddy_block *tmp_block;
-+
-+			list_for_each_entry_reverse(tmp_block, &mm->free_list[tmp], link) {
-+				if (block_incompatible(tmp_block, flags))
-+					continue;
-+
-+				block = tmp_block;
-+				break;
-+			}
-+
-+			if (block)
-+				break;
-+		}
-+	}
-+
-+	if (!block) {
-+		/* Fallback method */
- 		for (tmp = order; tmp <= mm->max_order; ++tmp) {
- 			if (!list_empty(&mm->free_list[tmp])) {
- 				block = list_last_entry(&mm->free_list[tmp],
-@@ -454,10 +657,10 @@ alloc_from_freelist(struct drm_buddy *mm,
- 					break;
- 			}
- 		}
--	}
-
--	if (!block)
--		return ERR_PTR(-ENOSPC);
-+		if (!block)
-+			return ERR_PTR(-ENOSPC);
-+	}
-
- 	BUG_ON(!drm_buddy_block_is_free(block));
-
-@@ -473,7 +676,7 @@ alloc_from_freelist(struct drm_buddy *mm,
-
- err_undo:
- 	if (tmp != order)
--		__drm_buddy_free(mm, block);
-+		__drm_buddy_free(mm, block, false);
- 	return ERR_PTR(err);
- }
-
-@@ -524,6 +727,8 @@ static int __alloc_range(struct drm_buddy *mm,
- 			mark_allocated(block);
- 			total_allocated += drm_buddy_block_size(mm, block);
- 			mm->avail -= drm_buddy_block_size(mm, block);
-+			if (drm_buddy_block_is_clear(block))
-+				mm->clear_avail -= drm_buddy_block_size(mm, block);
- 			list_add_tail(&block->link, &allocated);
- 			continue;
- 		}
-@@ -557,14 +762,14 @@ static int __alloc_range(struct drm_buddy *mm,
- 	if (buddy &&
- 	    (drm_buddy_block_is_free(block) &&
- 	     drm_buddy_block_is_free(buddy)))
--		__drm_buddy_free(mm, block);
-+		__drm_buddy_free(mm, block, false);
-
- err_free:
- 	if (err == -ENOSPC && total_allocated_on_err) {
- 		list_splice_tail(&allocated, blocks);
- 		*total_allocated_on_err = total_allocated;
- 	} else {
--		drm_buddy_free_list(mm, &allocated);
-+		drm_buddy_free_list_internal(mm, &allocated);
- 	}
-
- 	return err;
-@@ -630,11 +835,11 @@ static int __alloc_contig_try_harder(struct drm_buddy *mm,
- 			list_splice(&blocks_lhs, blocks);
- 			return 0;
- 		} else if (err != -ENOSPC) {
--			drm_buddy_free_list(mm, blocks);
-+			drm_buddy_free_list_internal(mm, blocks);
- 			return err;
- 		}
- 		/* Free blocks for the next iteration */
--		drm_buddy_free_list(mm, blocks);
-+		drm_buddy_free_list_internal(mm, blocks);
- 	}
-
- 	return -ENOSPC;
-@@ -690,6 +895,8 @@ int drm_buddy_block_trim(struct drm_buddy *mm,
- 	list_del(&block->link);
- 	mark_free(mm, block);
- 	mm->avail += drm_buddy_block_size(mm, block);
-+	if (drm_buddy_block_is_clear(block))
-+		mm->clear_avail += drm_buddy_block_size(mm, block);
-
- 	/* Prevent recursively freeing this node */
- 	parent = block->parent;
-@@ -701,6 +908,8 @@ int drm_buddy_block_trim(struct drm_buddy *mm,
- 	if (err) {
- 		mark_allocated(block);
- 		mm->avail -= drm_buddy_block_size(mm, block);
-+		if (drm_buddy_block_is_clear(block))
-+			mm->clear_avail -= drm_buddy_block_size(mm, block);
- 		list_add(&block->link, blocks);
- 	}
-
-@@ -715,7 +924,7 @@ EXPORT_SYMBOL(drm_buddy_block_trim);
-  * @mm: DRM buddy manager to allocate from
-  * @start: start of the allowed range for this block
-  * @end: end of the allowed range for this block
-- * @size: size of the allocation
-+ * @size: size of the allocation in bytes
-  * @min_block_size: alignment of the allocation
-  * @blocks: output list head to add allocated blocks
-  * @flags: DRM_BUDDY_*_ALLOCATION flags
-@@ -788,7 +997,8 @@ int drm_buddy_alloc_blocks(struct drm_buddy *mm,
- 		do {
- 			if (flags & DRM_BUDDY_RANGE_ALLOCATION)
- 				/* Allocate traversing within the range */
--				block = alloc_range_bias(mm, start, end, order);
-+				block = __drm_buddy_alloc_range_bias(mm, start, end,
-+								     order, flags);
- 			else
- 				/* Allocate from freelist */
- 				block = alloc_from_freelist(mm, order, flags);
-@@ -814,6 +1024,8 @@ int drm_buddy_alloc_blocks(struct drm_buddy *mm,
-
- 		mark_allocated(block);
- 		mm->avail -= drm_buddy_block_size(mm, block);
-+		if (drm_buddy_block_is_clear(block))
-+			mm->clear_avail -= drm_buddy_block_size(mm, block);
- 		kmemleak_update_trace(block);
- 		list_add_tail(&block->link, &allocated);
-
-@@ -852,7 +1064,7 @@ int drm_buddy_alloc_blocks(struct drm_buddy *mm,
- 	return 0;
-
- err_free:
--	drm_buddy_free_list(mm, &allocated);
-+	drm_buddy_free_list_internal(mm, &allocated);
- 	return err;
- }
- EXPORT_SYMBOL(drm_buddy_alloc_blocks);
-@@ -885,8 +1097,8 @@ void drm_buddy_print(struct drm_buddy *mm, struct drm_printer *p)
- {
- 	int order;
-
--	drm_printf(p, "chunk_size: %lluKiB, total: %lluMiB, free: %lluMiB\n",
--		   mm->chunk_size >> 10, mm->size >> 20, mm->avail >> 20);
-+	drm_printf(p, "chunk_size: %lluKiB, total: %lluMiB, free: %lluMiB, clear_free: %lluMiB\n",
-+		   mm->chunk_size >> 10, mm->size >> 20, mm->avail >> 20, mm->clear_avail >> 20);
-
- 	for (order = mm->max_order; order >= 0; order--) {
- 		struct drm_buddy_block *block;
-diff --git a/drivers/gpu/drm/i915/i915_ttm_buddy_manager.c b/drivers/gpu/drm/i915/i915_ttm_buddy_manager.c
-index 0d735d5c2b35..942345548bc3 100644
---- a/drivers/gpu/drm/i915/i915_ttm_buddy_manager.c
-+++ b/drivers/gpu/drm/i915/i915_ttm_buddy_manager.c
-@@ -126,7 +126,7 @@ static int i915_ttm_buddy_man_alloc(struct ttm_resource_manager *man,
- 	return 0;
-
- err_free_blocks:
--	drm_buddy_free_list(mm, &bman_res->blocks);
-+	drm_buddy_free_list(mm, &bman_res->blocks, 0);
- 	mutex_unlock(&bman->lock);
- err_free_res:
- 	ttm_resource_fini(man, &bman_res->base);
-@@ -141,7 +141,7 @@ static void i915_ttm_buddy_man_free(struct ttm_resource_manager *man,
- 	struct i915_ttm_buddy_manager *bman = to_buddy_manager(man);
-
- 	mutex_lock(&bman->lock);
--	drm_buddy_free_list(&bman->mm, &bman_res->blocks);
-+	drm_buddy_free_list(&bman->mm, &bman_res->blocks, 0);
- 	bman->visible_avail += bman_res->used_visible_size;
- 	mutex_unlock(&bman->lock);
-
-@@ -345,7 +345,7 @@ int i915_ttm_buddy_man_fini(struct ttm_device *bdev, unsigned int type)
- 	ttm_set_driver_manager(bdev, type, NULL);
-
- 	mutex_lock(&bman->lock);
--	drm_buddy_free_list(mm, &bman->reserved);
-+	drm_buddy_free_list(mm, &bman->reserved, 0);
- 	drm_buddy_fini(mm);
- 	bman->visible_avail += bman->visible_reserved;
- 	WARN_ON_ONCE(bman->visible_avail != bman->visible_size);
-diff --git a/include/drm/drm_buddy.h b/include/drm/drm_buddy.h
-index a5b39fc01003..7393e6ca0fd6 100644
---- a/include/drm/drm_buddy.h
-+++ b/include/drm/drm_buddy.h
-@@ -6,6 +6,7 @@
- #ifndef __DRM_BUDDY_H__
- #define __DRM_BUDDY_H__
-
-+#include <linux/bitfield.h>
- #include <linux/bitops.h>
- #include <linux/list.h>
- #include <linux/slab.h>
-@@ -25,15 +26,20 @@
- #define DRM_BUDDY_RANGE_ALLOCATION		BIT(0)
- #define DRM_BUDDY_TOPDOWN_ALLOCATION		BIT(1)
- #define DRM_BUDDY_CONTIGUOUS_ALLOCATION		BIT(2)
-+#define DRM_BUDDY_CLEAR_ALLOCATION		BIT(3)
-+#define DRM_BUDDY_CLEARED			BIT(4)
-
- struct drm_buddy_block {
- #define DRM_BUDDY_HEADER_OFFSET GENMASK_ULL(63, 12)
- #define DRM_BUDDY_HEADER_STATE  GENMASK_ULL(11, 10)
-+
- #define   DRM_BUDDY_ALLOCATED	   (1 << 10)
- #define   DRM_BUDDY_FREE	   (2 << 10)
- #define   DRM_BUDDY_SPLIT	   (3 << 10)
-+
-+#define DRM_BUDDY_HEADER_CLEAR  GENMASK_ULL(9, 9)
- /* Free to be used, if needed in the future */
--#define DRM_BUDDY_HEADER_UNUSED GENMASK_ULL(9, 6)
-+#define DRM_BUDDY_HEADER_UNUSED GENMASK_ULL(8, 6)
- #define DRM_BUDDY_HEADER_ORDER  GENMASK_ULL(5, 0)
- 	u64 header;
-
-@@ -86,6 +92,7 @@ struct drm_buddy {
- 	u64 chunk_size;
- 	u64 size;
- 	u64 avail;
-+	u64 clear_avail;
- };
-
- static inline u64
-@@ -112,6 +119,12 @@ drm_buddy_block_is_allocated(struct drm_buddy_block *block)
- 	return drm_buddy_block_state(block) == DRM_BUDDY_ALLOCATED;
- }
-
-+static inline bool
-+drm_buddy_block_is_clear(struct drm_buddy_block *block)
-+{
-+	return block->header & DRM_BUDDY_HEADER_CLEAR;
-+}
-+
- static inline bool
- drm_buddy_block_is_free(struct drm_buddy_block *block)
- {
-@@ -150,7 +163,12 @@ int drm_buddy_block_trim(struct drm_buddy *mm,
-
- void drm_buddy_free_block(struct drm_buddy *mm, struct drm_buddy_block *block);
-
--void drm_buddy_free_list(struct drm_buddy *mm, struct list_head *objects);
-+void drm_buddy_free_list(struct drm_buddy *mm,
-+			 struct list_head *objects,
-+			 unsigned int flags);
-+
-+void drm_buddy_defrag(struct drm_buddy *mm,
-+		      u64 min_order);
-
- void drm_buddy_print(struct drm_buddy *mm, struct drm_printer *p);
- void drm_buddy_block_print(struct drm_buddy *mm,
-
-base-commit: 216c1282dde38ca87ebdf1ccacee5a0682901574
---
-2.25.1
-
-Add clear page support in vram memory region.
-
-v1(Christian):
-  - Dont handle clear page as TTM flag since when moving the BO back
-    in from GTT again we don't need that.
-  - Make a specialized version of amdgpu_fill_buffer() which only
-    clears the VRAM areas which are not already cleared
-  - Drop the TTM_PL_FLAG_WIPE_ON_RELEASE check in
-    amdgpu_object.c
-
-v2:
-  - Modify the function name amdgpu_ttm_* (Alex)
-  - Drop the delayed parameter (Christian)
-  - handle amdgpu_res_cleared(&cursor) just above the size
-    calculation (Christian)
-  - Use AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE for clearing the buffers
-    in the free path to properly wait for fences etc.. (Christian)
-
-v3(Christian):
-  - Remove buffer clear code in VRAM manager instead change the
-    AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE handling to set
-    the DRM_BUDDY_CLEARED flag.
-  - Remove ! from amdgpu_res_cleared(&cursor) check.
-
-Signed-off-by: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam at amd.com>
-Suggested-by: Christian König <christian.koenig at amd.com>
-Acked-by: Felix Kuehling <felix.kuehling at amd.com>
----
- drivers/gpu/drm/amd/amdgpu/amdgpu_object.c    | 22 ++++---
- .../gpu/drm/amd/amdgpu/amdgpu_res_cursor.h    | 25 ++++++++
- drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c       | 61 ++++++++++++++++++-
- drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h       |  5 +-
- drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c  |  6 +-
- drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.h  |  5 ++
- 6 files changed, 111 insertions(+), 13 deletions(-)
-
-diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
-index 8bc79924d171..c92d92b28a57 100644
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
-@@ -39,6 +39,7 @@
- #include "amdgpu.h"
- #include "amdgpu_trace.h"
- #include "amdgpu_amdkfd.h"
-+#include "amdgpu_vram_mgr.h"
-
- /**
-  * DOC: amdgpu_object
-@@ -601,8 +602,7 @@ int amdgpu_bo_create(struct amdgpu_device *adev,
- 	if (!amdgpu_bo_support_uswc(bo->flags))
- 		bo->flags &= ~AMDGPU_GEM_CREATE_CPU_GTT_USWC;
-
--	if (adev->ras_enabled)
--		bo->flags |= AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE;
-+	bo->flags |= AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE;
-
- 	bo->tbo.bdev = &adev->mman.bdev;
- 	if (bp->domain & (AMDGPU_GEM_DOMAIN_GWS | AMDGPU_GEM_DOMAIN_OA |
-@@ -632,15 +632,17 @@ int amdgpu_bo_create(struct amdgpu_device *adev,
-
- 	if (bp->flags & AMDGPU_GEM_CREATE_VRAM_CLEARED &&
- 	    bo->tbo.resource->mem_type == TTM_PL_VRAM) {
--		struct dma_fence *fence;
-+		struct dma_fence *fence = NULL;
-
--		r = amdgpu_fill_buffer(bo, 0, bo->tbo.base.resv, &fence, true);
-+		r = amdgpu_ttm_clear_buffer(bo, bo->tbo.base.resv, &fence);
- 		if (unlikely(r))
- 			goto fail_unreserve;
-
--		dma_resv_add_fence(bo->tbo.base.resv, fence,
--				   DMA_RESV_USAGE_KERNEL);
--		dma_fence_put(fence);
-+		if (fence) {
-+			dma_resv_add_fence(bo->tbo.base.resv, fence,
-+					   DMA_RESV_USAGE_KERNEL);
-+			dma_fence_put(fence);
-+		}
- 	}
- 	if (!bp->resv)
- 		amdgpu_bo_unreserve(bo);
-@@ -1365,8 +1367,12 @@ void amdgpu_bo_release_notify(struct ttm_buffer_object *bo)
- 	if (WARN_ON_ONCE(!dma_resv_trylock(bo->base.resv)))
- 		return;
-
--	r = amdgpu_fill_buffer(abo, AMDGPU_POISON, bo->base.resv, &fence, true);
-+	r = amdgpu_fill_buffer(abo, 0, bo->base.resv, &fence, true);
- 	if (!WARN_ON(r)) {
-+		struct amdgpu_vram_mgr_resource *vres;
-+
-+		vres = to_amdgpu_vram_mgr_resource(bo->resource);
-+		vres->flags |= DRM_BUDDY_CLEARED;
- 		amdgpu_bo_fence(abo, fence, false);
- 		dma_fence_put(fence);
- 	}
-diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_res_cursor.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_res_cursor.h
-index 381101d2bf05..50fcd86e1033 100644
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_res_cursor.h
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_res_cursor.h
-@@ -164,4 +164,29 @@ static inline void amdgpu_res_next(struct amdgpu_res_cursor *cur, uint64_t size)
- 	}
- }
-
-+/**
-+ * amdgpu_res_cleared - check if blocks are cleared
-+ *
-+ * @cur: the cursor to extract the block
-+ *
-+ * Check if the @cur block is cleared
-+ */
-+static inline bool amdgpu_res_cleared(struct amdgpu_res_cursor *cur)
-+{
-+	struct drm_buddy_block *block;
-+
-+	switch (cur->mem_type) {
-+	case TTM_PL_VRAM:
-+		block = cur->node;
-+
-+		if (!amdgpu_vram_mgr_is_cleared(block))
-+			return false;
-+		break;
-+	default:
-+		return false;
-+	}
-+
-+	return true;
-+}
-+
- #endif
-diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
-index 8722beba494e..bcbffe909b47 100644
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
-@@ -378,11 +378,15 @@ static int amdgpu_move_blit(struct ttm_buffer_object *bo,
- 	    (abo->flags & AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE)) {
- 		struct dma_fence *wipe_fence = NULL;
-
--		r = amdgpu_fill_buffer(abo, AMDGPU_POISON, NULL, &wipe_fence,
--					false);
-+		r = amdgpu_fill_buffer(abo, 0, NULL, &wipe_fence,
-+				       false);
- 		if (r) {
- 			goto error;
- 		} else if (wipe_fence) {
-+			struct amdgpu_vram_mgr_resource *vres;
-+
-+			vres = to_amdgpu_vram_mgr_resource(bo->resource);
-+			vres->flags |= DRM_BUDDY_CLEARED;
- 			dma_fence_put(fence);
- 			fence = wipe_fence;
- 		}
-@@ -2214,6 +2218,59 @@ static int amdgpu_ttm_fill_mem(struct amdgpu_ring *ring, uint32_t src_data,
- 	return 0;
- }
-
-+int amdgpu_ttm_clear_buffer(struct amdgpu_bo *bo,
-+			    struct dma_resv *resv,
-+			    struct dma_fence **fence)
-+{
-+	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
-+	struct amdgpu_ring *ring = adev->mman.buffer_funcs_ring;
-+	struct amdgpu_res_cursor cursor;
-+	struct dma_fence *f = NULL;
-+	u64 addr;
-+	int r;
-+
-+	if (!adev->mman.buffer_funcs_enabled)
-+		return -EINVAL;
-+
-+	amdgpu_res_first(bo->tbo.resource, 0, amdgpu_bo_size(bo), &cursor);
-+
-+	mutex_lock(&adev->mman.gtt_window_lock);
-+	while (cursor.remaining) {
-+		struct dma_fence *next = NULL;
-+		u64 size;
-+
-+		if (amdgpu_res_cleared(&cursor)) {
-+			amdgpu_res_next(&cursor, cursor.size);
-+			continue;
-+		}
-+
-+		/* Never clear more than 256MiB at once to avoid timeouts */
-+		size = min(cursor.size, 256ULL << 20);
-+
-+		r = amdgpu_ttm_map_buffer(&bo->tbo, bo->tbo.resource, &cursor,
-+					  1, ring, false, &size, &addr);
-+		if (r)
-+			goto err;
-+
-+		r = amdgpu_ttm_fill_mem(ring, 0, addr, size, resv,
-+					&next, true, true);
-+		if (r)
-+			goto err;
-+
-+		dma_fence_put(f);
-+		f = next;
-+
-+		amdgpu_res_next(&cursor, size);
-+	}
-+err:
-+	mutex_unlock(&adev->mman.gtt_window_lock);
-+	if (fence)
-+		*fence = dma_fence_get(f);
-+	dma_fence_put(f);
-+
-+	return r;
-+}
-+
- int amdgpu_fill_buffer(struct amdgpu_bo *bo,
- 			uint32_t src_data,
- 			struct dma_resv *resv,
-diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
-index 65ec82141a8e..b404d89d52e5 100644
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
-@@ -38,8 +38,6 @@
- #define AMDGPU_GTT_MAX_TRANSFER_SIZE	512
- #define AMDGPU_GTT_NUM_TRANSFER_WINDOWS	2
-
--#define AMDGPU_POISON	0xd0bed0be
--
- extern const struct attribute_group amdgpu_vram_mgr_attr_group;
- extern const struct attribute_group amdgpu_gtt_mgr_attr_group;
-
-@@ -155,6 +153,9 @@ int amdgpu_ttm_copy_mem_to_mem(struct amdgpu_device *adev,
- 			       uint64_t size, bool tmz,
- 			       struct dma_resv *resv,
- 			       struct dma_fence **f);
-+int amdgpu_ttm_clear_buffer(struct amdgpu_bo *bo,
-+			    struct dma_resv *resv,
-+			    struct dma_fence **fence);
- int amdgpu_fill_buffer(struct amdgpu_bo *bo,
- 			uint32_t src_data,
- 			struct dma_resv *resv,
-diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
-index c0c851409241..e494f5bf136a 100644
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
-@@ -450,6 +450,7 @@ static int amdgpu_vram_mgr_new(struct ttm_resource_manager *man,
- {
- 	struct amdgpu_vram_mgr *mgr = to_vram_mgr(man);
- 	struct amdgpu_device *adev = to_amdgpu_device(mgr);
-+	struct amdgpu_bo *bo = ttm_to_amdgpu_bo(tbo);
- 	u64 vis_usage = 0, max_bytes, min_block_size;
- 	struct amdgpu_vram_mgr_resource *vres;
- 	u64 size, remaining_size, lpfn, fpfn;
-@@ -501,6 +502,9 @@ static int amdgpu_vram_mgr_new(struct ttm_resource_manager *man,
- 	if (place->flags & TTM_PL_FLAG_CONTIGUOUS)
- 		vres->flags |= DRM_BUDDY_CONTIGUOUS_ALLOCATION;
-
-+	if (bo->flags & AMDGPU_GEM_CREATE_VRAM_CLEARED)
-+		vres->flags |= DRM_BUDDY_CLEAR_ALLOCATION;
-+
- 	if (fpfn || lpfn != mgr->mm.size)
- 		/* Allocate blocks in desired range */
- 		vres->flags |= DRM_BUDDY_RANGE_ALLOCATION;
-@@ -604,7 +608,7 @@ static void amdgpu_vram_mgr_del(struct ttm_resource_manager *man,
-
- 	amdgpu_vram_mgr_do_reserve(man);
-
--	drm_buddy_free_list(mm, &vres->blocks, 0);
-+	drm_buddy_free_list(mm, &vres->blocks, vres->flags);
- 	mutex_unlock(&mgr->lock);
-
- 	atomic64_sub(vis_usage, &mgr->vis_usage);
-diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.h
-index 0e04e42cf809..8478522d7366 100644
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.h
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.h
-@@ -53,6 +53,11 @@ static inline u64 amdgpu_vram_mgr_block_size(struct drm_buddy_block *block)
- 	return (u64)PAGE_SIZE << drm_buddy_block_order(block);
- }
-
-+static inline bool amdgpu_vram_mgr_is_cleared(struct drm_buddy_block *block)
-+{
-+	return drm_buddy_block_is_clear(block);
-+}
-+
- static inline struct amdgpu_vram_mgr_resource *
- to_amdgpu_vram_mgr_resource(struct ttm_resource *res)
- {
---
-2.25.1
-
-Add amdgpu driver as user for the drm buddy
-defragmentation.
-
-Signed-off-by: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam at amd.com>
----
- drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c | 17 +++++++++++++++--
- drivers/gpu/drm/drm_buddy.c                  |  1 +
- 2 files changed, 16 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
-index e494f5bf136a..cff8a526c622 100644
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
-@@ -533,8 +533,21 @@ static int amdgpu_vram_mgr_new(struct ttm_resource_manager *man,
- 					   min_block_size,
- 					   &vres->blocks,
- 					   vres->flags);
--		if (unlikely(r))
--			goto error_free_blocks;
-+		if (unlikely(r)) {
-+			if (r == -ENOSPC) {
-+				drm_buddy_defrag(mm, min_block_size);
-+				r = drm_buddy_alloc_blocks(mm, fpfn,
-+							   lpfn,
-+							   size,
-+							   min_block_size,
-+							   &vres->blocks,
-+							   vres->flags);
-+				if (unlikely(r))
-+					goto error_free_blocks;
-+			} else {
-+				goto error_free_blocks;
-+			}
-+		}
-
- 		if (size > remaining_size)
- 			remaining_size = 0;
-diff --git a/drivers/gpu/drm/drm_buddy.c b/drivers/gpu/drm/drm_buddy.c
-index 40131ed9b0cd..19440f8caec0 100644
---- a/drivers/gpu/drm/drm_buddy.c
-+++ b/drivers/gpu/drm/drm_buddy.c
-@@ -396,6 +396,7 @@ void drm_buddy_defrag(struct drm_buddy *mm,
- 		}
- 	}
- }
-+EXPORT_SYMBOL(drm_buddy_defrag);
-
- /**
-  * drm_buddy_free_block - free a block
---
-2.25.1
-
 From 26ccbbc27e7859aedf4e6949026624a18e0dce64 Mon Sep 17 00:00:00 2001
 From: Piotr Gorski <lucjan.lucjanov@gmail.com>
 Date: Wed, 31 Jan 2024 00:03:23 +0100
@@ -14146,41 +13109,383 @@ index a19ea290b790..e1869cf454ea 100644
 --
 2.40.1
 
-From 2e875cb59631248ba5ff8c4439d4644e9cbaca75 Mon Sep 17 00:00:00 2001
+Cc: Mike Rapoport (IBM) <rppt@xxxxxxxxxx>
+Cc: Ingo Molnar <mingo@xxxxxxxxxx>
+Cc: Dave Hansen <dave.hansen@xxxxxxxxxxxxxxx>
+Cc: Andy Lutomirski <luto@xxxxxxxxxx>
+Cc: H. Peter Anvin <hpa@xxxxxxxxx>
+---
+ arch/x86/include/asm/special_insns.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/include/asm/special_insns.h b/arch/x86/include/asm/special_insns.h
+index 0ee2ba589492..aec6e2d3aa1d 100644
+--- a/arch/x86/include/asm/special_insns.h
++++ b/arch/x86/include/asm/special_insns.h
+@@ -205,9 +205,9 @@ static inline void clwb(volatile void *__p)
+ #ifdef CONFIG_X86_USER_SHADOW_STACK
+ static inline int write_user_shstk_64(u64 __user *addr, u64 val)
+ {
+-	asm goto("1: wrussq %[val], (%[addr])\n"
++	asm goto("1: wrussq %[val], %[addr]\n"
+ 			  _ASM_EXTABLE(1b, %l[fail])
+-			  :: [addr] "r" (addr), [val] "r" (val)
++			  :: [addr] "m" (*addr), [val] "r" (val)
+ 			  :: fail);
+ 	return 0;
+ fail:
+--
+2.42.0
+
+The following commit has been merged into the x86/asm branch of tip:
+
+Commit-ID:     a3ff53167cef2b5c6c8948246172d6f9279f037f
+Gitweb:        https://git.kernel.org/tip/a3ff53167cef2b5c6c8948246172d6f9279f037f
+Author:        Uros Bizjak <ubizjak@xxxxxxxxx>
+AuthorDate:    Tue, 19 Mar 2024 11:40:12 +01:00
+Committer:     Ingo Molnar <mingo@xxxxxxxxxx>
+CommitterDate: Tue, 19 Mar 2024 13:15:34 +01:00
+
+x86/asm: Remove %P operand modifier from altinstr asm templates
+
+The "P" asm operand modifier is a x86 target-specific modifier.
+
+For x86_64, when used with a symbol reference, the "%P" modifier
+emits "sym" instead of "sym(%rip)". This property is currently
+used to prevent %RIP-relative addressing in .altinstr sections.
+
+%RIP-relative addresses are nowadays correctly handled in .altinstr
+sections, so remove %P operand modifier from altinstr asm templates.
+
+Also note that unlike GCC, clang emits %rip-relative symbol
+reference with "P" asm operand modifier, so the patch also unifies
+symbol handling with both compilers.
+
+No functional changes intended.
+
+Signed-off-by: Uros Bizjak <ubizjak@xxxxxxxxx>
+Signed-off-by: Ingo Molnar <mingo@xxxxxxxxxx>
+Cc: Linus Torvalds <torvalds@xxxxxxxxxxxxxxxxxxxx>
+Cc: Josh Poimboeuf <jpoimboe@xxxxxxxxxx>
+Cc: Ard Biesheuvel <ardb@xxxxxxxxxx>
+Cc: "H. Peter Anvin" <hpa@xxxxxxxxx>
+Link: https://lore.kernel.org/r/20240319104418.284519-2-ubizjak@xxxxxxxxx
+---
+ arch/x86/include/asm/apic.h          | 2 +-
+ arch/x86/include/asm/processor.h     | 6 +++---
+ arch/x86/include/asm/special_insns.h | 4 ++--
+ 3 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/arch/x86/include/asm/apic.h b/arch/x86/include/asm/apic.h
+index 94ce0f7..fa2e424 100644
+--- a/arch/x86/include/asm/apic.h
++++ b/arch/x86/include/asm/apic.h
+@@ -91,7 +91,7 @@ static inline void native_apic_mem_write(u32 reg, u32 v)
+ {
+ 	volatile u32 *addr = (volatile u32 *)(APIC_BASE + reg);
+
+-	alternative_io("movl %0, %P1", "xchgl %0, %P1", X86_BUG_11AP,
++	alternative_io("movl %0, %1", "xchgl %0, %1", X86_BUG_11AP,
+ 		       ASM_OUTPUT2("=r" (v), "=m" (*addr)),
+ 		       ASM_OUTPUT2("0" (v), "m" (*addr)));
+ }
+diff --git a/arch/x86/include/asm/processor.h b/arch/x86/include/asm/processor.h
+index 811548f..438c0c8 100644
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -587,7 +587,7 @@ extern char			ignore_fpu_irq;
+ # define BASE_PREFETCH		""
+ # define ARCH_HAS_PREFETCH
+ #else
+-# define BASE_PREFETCH		"prefetcht0 %P1"
++# define BASE_PREFETCH		"prefetcht0 %1"
+ #endif
+
+ /*
+@@ -598,7 +598,7 @@ extern char			ignore_fpu_irq;
+  */
+ static inline void prefetch(const void *x)
+ {
+-	alternative_input(BASE_PREFETCH, "prefetchnta %P1",
++	alternative_input(BASE_PREFETCH, "prefetchnta %1",
+ 			  X86_FEATURE_XMM,
+ 			  "m" (*(const char *)x));
+ }
+@@ -610,7 +610,7 @@ static inline void prefetch(const void *x)
+  */
+ static __always_inline void prefetchw(const void *x)
+ {
+-	alternative_input(BASE_PREFETCH, "prefetchw %P1",
++	alternative_input(BASE_PREFETCH, "prefetchw %1",
+ 			  X86_FEATURE_3DNOWPREFETCH,
+ 			  "m" (*(const char *)x));
+ }
+diff --git a/arch/x86/include/asm/special_insns.h b/arch/x86/include/asm/special_insns.h
+index 2e9fc5c..0ee2ba5 100644
+--- a/arch/x86/include/asm/special_insns.h
++++ b/arch/x86/include/asm/special_insns.h
+@@ -182,8 +182,8 @@ static __always_inline void clflush(volatile void *__p)
+
+ static inline void clflushopt(volatile void *__p)
+ {
+-	alternative_io(".byte 0x3e; clflush %P0",
+-		       ".byte 0x66; clflush %P0",
++	alternative_io(".byte 0x3e; clflush %0",
++		       ".byte 0x66; clflush %0",
+ 		       X86_FEATURE_CLFLUSHOPT,
+ 		       "+m" (*(volatile char __force *)__p));
+ }
+
+The following commit has been merged into the x86/asm branch of tip:
+
+Commit-ID:     41cd2e1ee96e56401a18dbce6f42f0bdaebcbf3b
+Gitweb:        https://git.kernel.org/tip/41cd2e1ee96e56401a18dbce6f42f0bdaebcbf3b
+Author:        Uros Bizjak <ubizjak@xxxxxxxxx>
+AuthorDate:    Tue, 19 Mar 2024 11:40:13 +01:00
+Committer:     Ingo Molnar <mingo@xxxxxxxxxx>
+CommitterDate: Tue, 19 Mar 2024 13:15:35 +01:00
+
+x86/asm: Use %c/%n instead of %P operand modifier in asm templates
+
+The "P" asm operand modifier is a x86 target-specific modifier.
+
+When used with a constant, the "P" modifier emits "cst" instead of
+"$cst". This property is currently used to emit the bare constant
+without all syntax-specific prefixes.
+
+The generic "c" resp. "n" operand modifier should be used instead.
+
+No functional changes intended.
+
+Signed-off-by: Uros Bizjak <ubizjak@xxxxxxxxx>
+Signed-off-by: Ingo Molnar <mingo@xxxxxxxxxx>
+Cc: Linus Torvalds <torvalds@xxxxxxxxxxxxxxxxxxxx>
+Cc: Josh Poimboeuf <jpoimboe@xxxxxxxxxx>
+Cc: Ard Biesheuvel <ardb@xxxxxxxxxx>
+Cc: "H. Peter Anvin" <hpa@xxxxxxxxx>
+Link: https://lore.kernel.org/r/20240319104418.284519-3-ubizjak@xxxxxxxxx
+---
+ arch/x86/boot/main.c               |  4 ++--
+ arch/x86/include/asm/alternative.h | 22 +++++++++++-----------
+ arch/x86/include/asm/atomic64_32.h |  2 +-
+ arch/x86/include/asm/cpufeature.h  |  2 +-
+ arch/x86/include/asm/irq_stack.h   |  2 +-
+ arch/x86/include/asm/uaccess.h     |  4 ++--
+ 6 files changed, 18 insertions(+), 18 deletions(-)
+
+diff --git a/arch/x86/boot/main.c b/arch/x86/boot/main.c
+index c4ea525..9049f39 100644
+--- a/arch/x86/boot/main.c
++++ b/arch/x86/boot/main.c
+@@ -119,8 +119,8 @@ static void init_heap(void)
+ 	char *stack_end;
+
+ 	if (boot_params.hdr.loadflags & CAN_USE_HEAP) {
+-		asm("leal %P1(%%esp),%0"
+-		    : "=r" (stack_end) : "i" (-STACK_SIZE));
++		asm("leal %n1(%%esp),%0"
++		    : "=r" (stack_end) : "i" (STACK_SIZE));
+
+ 		heap_end = (char *)
+ 			((size_t)boot_params.hdr.heap_end_ptr + 0x200);
+diff --git a/arch/x86/include/asm/alternative.h b/arch/x86/include/asm/alternative.h
+index fcd20c6..9943269 100644
+--- a/arch/x86/include/asm/alternative.h
++++ b/arch/x86/include/asm/alternative.h
+@@ -294,10 +294,10 @@ static inline int alternatives_text_reserved(void *start, void *end)
+  * Otherwise, if CPU has feature1, newinstr1 is used.
+  * Otherwise, oldinstr is used.
+  */
+-#define alternative_input_2(oldinstr, newinstr1, ft_flags1, newinstr2,	     \
+-			   ft_flags2, input...)				     \
+-	asm_inline volatile(ALTERNATIVE_2(oldinstr, newinstr1, ft_flags1,     \
+-		newinstr2, ft_flags2)					     \
++#define alternative_input_2(oldinstr, newinstr1, ft_flags1, newinstr2,	\
++			   ft_flags2, input...)				\
++	asm_inline volatile(ALTERNATIVE_2(oldinstr, newinstr1, ft_flags1, \
++		newinstr2, ft_flags2)					\
+ 		: : "i" (0), ## input)
+
+ /* Like alternative_input, but with a single output argument */
+@@ -307,7 +307,7 @@ static inline int alternatives_text_reserved(void *start, void *end)
+
+ /* Like alternative_io, but for replacing a direct call with another one. */
+ #define alternative_call(oldfunc, newfunc, ft_flags, output, input...)	\
+-	asm_inline volatile (ALTERNATIVE("call %P[old]", "call %P[new]", ft_flags) \
++	asm_inline volatile (ALTERNATIVE("call %c[old]", "call %c[new]", ft_flags) \
+ 		: output : [old] "i" (oldfunc), [new] "i" (newfunc), ## input)
+
+ /*
+@@ -316,12 +316,12 @@ static inline int alternatives_text_reserved(void *start, void *end)
+  * Otherwise, if CPU has feature1, function1 is used.
+  * Otherwise, old function is used.
+  */
+-#define alternative_call_2(oldfunc, newfunc1, ft_flags1, newfunc2, ft_flags2,   \
+-			   output, input...)				      \
+-	asm_inline volatile (ALTERNATIVE_2("call %P[old]", "call %P[new1]", ft_flags1,\
+-		"call %P[new2]", ft_flags2)				      \
+-		: output, ASM_CALL_CONSTRAINT				      \
+-		: [old] "i" (oldfunc), [new1] "i" (newfunc1),		      \
++#define alternative_call_2(oldfunc, newfunc1, ft_flags1, newfunc2, ft_flags2, \
++			   output, input...)				\
++	asm_inline volatile (ALTERNATIVE_2("call %c[old]", "call %c[new1]", ft_flags1, \
++		"call %c[new2]", ft_flags2)				\
++		: output, ASM_CALL_CONSTRAINT				\
++		: [old] "i" (oldfunc), [new1] "i" (newfunc1),		\
+ 		  [new2] "i" (newfunc2), ## input)
+
+ /*
+diff --git a/arch/x86/include/asm/atomic64_32.h b/arch/x86/include/asm/atomic64_32.h
+index 3486d91..d510405 100644
+--- a/arch/x86/include/asm/atomic64_32.h
++++ b/arch/x86/include/asm/atomic64_32.h
+@@ -24,7 +24,7 @@ typedef struct {
+
+ #ifdef CONFIG_X86_CMPXCHG64
+ #define __alternative_atomic64(f, g, out, in...) \
+-	asm volatile("call %P[func]" \
++	asm volatile("call %c[func]" \
+ 		     : out : [func] "i" (atomic64_##g##_cx8), ## in)
+
+ #define ATOMIC64_DECL(sym) ATOMIC64_DECL_ONE(sym##_cx8)
+diff --git a/arch/x86/include/asm/cpufeature.h b/arch/x86/include/asm/cpufeature.h
+index a127369..fa938ed 100644
+--- a/arch/x86/include/asm/cpufeature.h
++++ b/arch/x86/include/asm/cpufeature.h
+@@ -169,7 +169,7 @@ extern void clear_cpu_cap(struct cpuinfo_x86 *c, unsigned int bit);
+ static __always_inline bool _static_cpu_has(u16 bit)
+ {
+ 	asm goto(
+-		ALTERNATIVE_TERNARY("jmp 6f", %P[feature], "", "jmp %l[t_no]")
++		ALTERNATIVE_TERNARY("jmp 6f", %c[feature], "", "jmp %l[t_no]")
+ 		".pushsection .altinstr_aux,\"ax\"\n"
+ 		"6:\n"
+ 		" testb %[bitnum]," _ASM_RIP(%P[cap_byte]) "\n"
+diff --git a/arch/x86/include/asm/irq_stack.h b/arch/x86/include/asm/irq_stack.h
+index 7981838..b71ad17 100644
+--- a/arch/x86/include/asm/irq_stack.h
++++ b/arch/x86/include/asm/irq_stack.h
+@@ -100,7 +100,7 @@
+ }
+
+ #define ASM_CALL_ARG0							\
+-	"call %P[__func]				\n"		\
++	"call %c[__func]				\n"		\
+ 	ASM_REACHABLE
+
+ #define ASM_CALL_ARG1							\
+diff --git a/arch/x86/include/asm/uaccess.h b/arch/x86/include/asm/uaccess.h
+index 237dc8c..0f9bab9 100644
+--- a/arch/x86/include/asm/uaccess.h
++++ b/arch/x86/include/asm/uaccess.h
+@@ -78,7 +78,7 @@ extern int __get_user_bad(void);
+ 	int __ret_gu;							\
+ 	register __inttype(*(ptr)) __val_gu asm("%"_ASM_DX);		\
+ 	__chk_user_ptr(ptr);						\
+-	asm volatile("call __" #fn "_%P4"				\
++	asm volatile("call __" #fn "_%c4"				\
+ 		     : "=a" (__ret_gu), "=r" (__val_gu),		\
+ 			ASM_CALL_CONSTRAINT				\
+ 		     : "0" (ptr), "i" (sizeof(*(ptr))));		\
+@@ -177,7 +177,7 @@ extern void __put_user_nocheck_8(void);
+ 	__chk_user_ptr(__ptr);						\
+ 	__ptr_pu = __ptr;						\
+ 	__val_pu = __x;							\
+-	asm volatile("call __" #fn "_%P[size]"				\
++	asm volatile("call __" #fn "_%c[size]"				\
+ 		     : "=c" (__ret_pu),					\
+ 			ASM_CALL_CONSTRAINT				\
+ 		     : "0" (__ptr_pu),					\
+
+The following commit has been merged into the x86/asm branch of tip:
+
+Commit-ID:     d689863c1a60b9936b47a34fa5c3330de374f4fc
+Gitweb:        https://git.kernel.org/tip/d689863c1a60b9936b47a34fa5c3330de374f4fc
+Author:        Uros Bizjak <ubizjak@xxxxxxxxx>
+AuthorDate:    Tue, 19 Mar 2024 11:40:14 +01:00
+Committer:     Ingo Molnar <mingo@xxxxxxxxxx>
+CommitterDate: Tue, 19 Mar 2024 13:15:35 +01:00
+
+x86/asm: Use %a instead of %P operand modifier in asm templates
+
+The "P" asm operand modifier is a x86 target-specific modifier.
+
+For x86_64, when used with a symbol reference, the "%P" modifier
+emits "sym" instead of "sym(%rip)". This property is currently
+used to issue bare symbol reference.
+
+The generic "a" operand modifier should be used instead. The "a"
+asm operand modifier substitutes a memory reference, with the
+actual operand treated as address.  For x86_64, when a symbol is
+provided, the "a" modifier emits "sym(%rip)" instead of "sym",
+enabling shorter %rip-relative addressing.
+
+Also note that unlike GCC, clang emits %rip-relative symbol
+reference with "P" asm operand modifier, so the patch also unifies
+symbol handling with both compilers.
+
+No functional changes intended.
+
+Signed-off-by: Uros Bizjak <ubizjak@xxxxxxxxx>
+Signed-off-by: Ingo Molnar <mingo@xxxxxxxxxx>
+Cc: Linus Torvalds <torvalds@xxxxxxxxxxxxxxxxxxxx>
+Cc: Josh Poimboeuf <jpoimboe@xxxxxxxxxx>
+Cc: Ard Biesheuvel <ardb@xxxxxxxxxx>
+Cc: "H. Peter Anvin" <hpa@xxxxxxxxx>
+Link: https://lore.kernel.org/r/20240319104418.284519-4-ubizjak@xxxxxxxxx
+---
+ arch/x86/include/asm/cpufeature.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/x86/include/asm/cpufeature.h b/arch/x86/include/asm/cpufeature.h
+index fa938ed..daae5c6 100644
+--- a/arch/x86/include/asm/cpufeature.h
++++ b/arch/x86/include/asm/cpufeature.h
+@@ -172,7 +172,7 @@ static __always_inline bool _static_cpu_has(u16 bit)
+ 		ALTERNATIVE_TERNARY("jmp 6f", %c[feature], "", "jmp %l[t_no]")
+ 		".pushsection .altinstr_aux,\"ax\"\n"
+ 		"6:\n"
+-		" testb %[bitnum]," _ASM_RIP(%P[cap_byte]) "\n"
++		" testb %[bitnum], %a[cap_byte]\n"
+ 		" jnz %l[t_yes]\n"
+ 		" jmp %l[t_no]\n"
+ 		".popsection\n"
+
+From 908c46a1c29ddee39c73a72ac9b719964269dbbc Mon Sep 17 00:00:00 2001
 From: Piotr Gorski <lucjan.lucjanov@gmail.com>
-Date: Tue, 12 Mar 2024 10:58:23 +0100
-Subject: [PATCH] prjc-cachy
+Date: Fri, 22 Mar 2024 16:15:20 +0100
+Subject: [PATCH] PRJC for 6.8
 
 Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
 ---
- Documentation/admin-guide/sysctl/kernel.rst |   10 +
+ Documentation/admin-guide/sysctl/kernel.rst |    9 +
  Documentation/scheduler/sched-BMQ.txt       |  110 +
  fs/proc/base.c                              |    2 +-
  include/asm-generic/resource.h              |    2 +-
- include/linux/sched.h                       |   33 +-
+ include/linux/sched.h                       |   32 +-
  include/linux/sched/deadline.h              |   20 +
  include/linux/sched/prio.h                  |   26 +
  include/linux/sched/rt.h                    |    2 +
  include/linux/sched/topology.h              |    3 +-
  init/Kconfig                                |   35 +
- init/init_task.c                            |   18 +
+ init/init_task.c                            |   17 +
  kernel/Kconfig.preempt                      |    2 +-
  kernel/cgroup/cpuset.c                      |   10 +-
  kernel/delayacct.c                          |    2 +-
  kernel/exit.c                               |    4 +-
  kernel/locking/rtmutex.c                    |   16 +-
  kernel/sched/Makefile                       |    5 +
- kernel/sched/alt_core.c                     | 8960 +++++++++++++++++++
+ kernel/sched/alt_core.c                     | 8944 +++++++++++++++++++
  kernel/sched/alt_debug.c                    |   32 +
- kernel/sched/alt_sched.h                    |  954 ++
- kernel/sched/bmq.h                          |   99 +
+ kernel/sched/alt_sched.h                    |  975 ++
+ kernel/sched/bmq.h                          |  102 +
  kernel/sched/build_policy.c                 |    8 +-
  kernel/sched/build_utility.c                |    2 +
  kernel/sched/cpufreq_schedutil.c            |    8 +
  kernel/sched/cputime.c                      |   10 +-
  kernel/sched/debug.c                        |   10 +
  kernel/sched/idle.c                         |    2 +
- kernel/sched/pds.h                          |  141 +
+ kernel/sched/pds.h                          |  134 +
  kernel/sched/pelt.c                         |    4 +-
  kernel/sched/pelt.h                         |    8 +-
  kernel/sched/sched.h                        |    9 +
@@ -14192,7 +13497,7 @@ Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
  kernel/time/posix-cpu-timers.c              |   10 +-
  kernel/trace/trace_selftest.c               |    5 +
  kernel/workqueue.c                          |   15 +
- 39 files changed, 10607 insertions(+), 23 deletions(-)
+ 39 files changed, 10605 insertions(+), 23 deletions(-)
  create mode 100644 Documentation/scheduler/sched-BMQ.txt
  create mode 100644 kernel/sched/alt_core.c
  create mode 100644 kernel/sched/alt_debug.c
@@ -14201,10 +13506,10 @@ Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
  create mode 100644 kernel/sched/pds.h
 
 diff --git a/Documentation/admin-guide/sysctl/kernel.rst b/Documentation/admin-guide/sysctl/kernel.rst
-index 6584a1f9b..226c79dd3 100644
+index 6584a1f9b..1ac9e0850 100644
 --- a/Documentation/admin-guide/sysctl/kernel.rst
 +++ b/Documentation/admin-guide/sysctl/kernel.rst
-@@ -1646,3 +1646,13 @@ is 10 seconds.
+@@ -1646,3 +1646,12 @@ is 10 seconds.
 
  The softlockup threshold is (``2 * watchdog_thresh``). Setting this
  tunable to zero will disable lockup detection altogether.
@@ -14217,7 +13522,6 @@ index 6584a1f9b..226c79dd3 100644
 +
 +  0 - No yield.
 +  1 - Requeue task. (default)
-+  2 - Set run queue skip task. Same as CFS.
 diff --git a/Documentation/scheduler/sched-BMQ.txt b/Documentation/scheduler/sched-BMQ.txt
 new file mode 100644
 index 000000000..05c84eec0
@@ -14361,7 +13665,7 @@ index 8874f681b..59eb72bf7 100644
  	[RLIMIT_RTTIME]		= {  RLIM_INFINITY,  RLIM_INFINITY },	\
  }
 diff --git a/include/linux/sched.h b/include/linux/sched.h
-index ffe8f618a..3c17bfa14 100644
+index ffe8f618a..18058ad9d 100644
 --- a/include/linux/sched.h
 +++ b/include/linux/sched.h
 @@ -771,8 +771,14 @@ struct task_struct {
@@ -14388,14 +13692,13 @@ index ffe8f618a..3c17bfa14 100644
  #endif
  	int				on_rq;
 
-@@ -794,6 +801,20 @@ struct task_struct {
+@@ -794,6 +801,19 @@ struct task_struct {
  	int				normal_prio;
  	unsigned int			rt_priority;
 
 +#ifdef CONFIG_SCHED_ALT
 +	u64				last_ran;
 +	s64				time_slice;
-+	int				sq_idx;
 +	struct list_head		sq_node;
 +#ifdef CONFIG_SCHED_BMQ
 +	int				boost_prio;
@@ -14409,7 +13712,7 @@ index ffe8f618a..3c17bfa14 100644
  	struct sched_entity		se;
  	struct sched_rt_entity		rt;
  	struct sched_dl_entity		dl;
-@@ -805,6 +826,7 @@ struct task_struct {
+@@ -805,6 +825,7 @@ struct task_struct {
  	unsigned long			core_cookie;
  	unsigned int			core_occupation;
  #endif
@@ -14417,7 +13720,7 @@ index ffe8f618a..3c17bfa14 100644
 
  #ifdef CONFIG_CGROUP_SCHED
  	struct task_group		*sched_task_group;
-@@ -1564,6 +1586,15 @@ struct task_struct {
+@@ -1564,6 +1585,15 @@ struct task_struct {
  	 */
  };
 
@@ -14538,10 +13841,10 @@ index a6e04b4a2..66f517003 100644
  #else
  static inline void rebuild_sched_domains_energy(void)
 diff --git a/init/Kconfig b/init/Kconfig
-index 9ea39297f..ac5a9e545 100644
+index bee58f746..81f568107 100644
 --- a/init/Kconfig
 +++ b/init/Kconfig
-@@ -642,6 +642,7 @@ config TASK_IO_ACCOUNTING
+@@ -638,6 +638,7 @@ config TASK_IO_ACCOUNTING
 
  config PSI
  	bool "Pressure stall information tracking"
@@ -14549,7 +13852,7 @@ index 9ea39297f..ac5a9e545 100644
  	select KERNFS
  	help
  	  Collect metrics that indicate how overcommitted the CPU, memory,
-@@ -807,6 +808,7 @@ menu "Scheduler features"
+@@ -803,6 +804,7 @@ menu "Scheduler features"
  config UCLAMP_TASK
  	bool "Enable utilization clamping for RT/FAIR tasks"
  	depends on CPU_FREQ_GOV_SCHEDUTIL
@@ -14557,7 +13860,7 @@ index 9ea39297f..ac5a9e545 100644
  	help
  	  This feature enables the scheduler to track the clamped utilization
  	  of each CPU based on RUNNABLE tasks scheduled on that CPU.
-@@ -853,6 +855,35 @@ config UCLAMP_BUCKETS_COUNT
+@@ -849,6 +851,35 @@ config UCLAMP_BUCKETS_COUNT
 
  	  If in doubt, use the default value.
 
@@ -14593,7 +13896,7 @@ index 9ea39297f..ac5a9e545 100644
  endmenu
 
  #
-@@ -918,6 +949,7 @@ config NUMA_BALANCING
+@@ -914,6 +945,7 @@ config NUMA_BALANCING
  	depends on ARCH_SUPPORTS_NUMA_BALANCING
  	depends on !ARCH_WANT_NUMA_VARIABLE_LOCALITY
  	depends on SMP && NUMA && MIGRATION && !PREEMPT_RT
@@ -14601,7 +13904,7 @@ index 9ea39297f..ac5a9e545 100644
  	help
  	  This option adds support for automatic NUMA aware memory/task placement.
  	  The mechanism is quite primitive and is based on migrating memory when
-@@ -1015,6 +1047,7 @@ config FAIR_GROUP_SCHED
+@@ -1011,6 +1043,7 @@ config FAIR_GROUP_SCHED
  	depends on CGROUP_SCHED
  	default CGROUP_SCHED
 
@@ -14609,7 +13912,7 @@ index 9ea39297f..ac5a9e545 100644
  config CFS_BANDWIDTH
  	bool "CPU bandwidth provisioning for FAIR_GROUP_SCHED"
  	depends on FAIR_GROUP_SCHED
-@@ -1037,6 +1070,7 @@ config RT_GROUP_SCHED
+@@ -1033,6 +1066,7 @@ config RT_GROUP_SCHED
  	  realtime bandwidth for them.
  	  See Documentation/scheduler/sched-rt-group.rst for more information.
 
@@ -14617,7 +13920,7 @@ index 9ea39297f..ac5a9e545 100644
  endif #CGROUP_SCHED
 
  config SCHED_MM_CID
-@@ -1301,6 +1335,7 @@ config CHECKPOINT_RESTORE
+@@ -1281,6 +1315,7 @@ config CHECKPOINT_RESTORE
 
  config SCHED_AUTOGROUP
  	bool "Automatic process group scheduling"
@@ -14626,7 +13929,7 @@ index 9ea39297f..ac5a9e545 100644
  	select CGROUP_SCHED
  	select FAIR_GROUP_SCHED
 diff --git a/init/init_task.c b/init/init_task.c
-index 7ecb458eb..9530a7173 100644
+index 7ecb458eb..40d2e86da 100644
 --- a/init/init_task.c
 +++ b/init/init_task.c
 @@ -70,9 +70,15 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
@@ -14645,7 +13948,7 @@ index 7ecb458eb..9530a7173 100644
  	.policy		= SCHED_NORMAL,
  	.cpus_ptr	= &init_task.cpus_mask,
  	.user_cpus_ptr	= NULL,
-@@ -84,6 +90,17 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
+@@ -84,6 +90,16 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
  	.restart_block	= {
  		.fn = do_no_restart_syscall,
  	},
@@ -14653,7 +13956,6 @@ index 7ecb458eb..9530a7173 100644
 +	.sq_node	= LIST_HEAD_INIT(init_task.sq_node),
 +#ifdef CONFIG_SCHED_BMQ
 +	.boost_prio	= 0,
-+	.sq_idx		= 15,
 +#endif
 +#ifdef CONFIG_SCHED_PDS
 +	.deadline	= 0,
@@ -14663,7 +13965,7 @@ index 7ecb458eb..9530a7173 100644
  	.se		= {
  		.group_node 	= LIST_HEAD_INIT(init_task.se.group_node),
  	},
-@@ -91,6 +108,7 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
+@@ -91,6 +107,7 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
  		.run_list	= LIST_HEAD_INIT(init_task.rt.run_list),
  		.time_slice	= RR_TIMESLICE,
  	},
@@ -14868,10 +14170,10 @@ index 976092b7b..31d587c16 100644
  obj-y += build_utility.o
 diff --git a/kernel/sched/alt_core.c b/kernel/sched/alt_core.c
 new file mode 100644
-index 000000000..2745abb36
+index 000000000..31fadbf46
 --- /dev/null
 +++ b/kernel/sched/alt_core.c
-@@ -0,0 +1,8960 @@
+@@ -0,0 +1,8944 @@
 +/*
 + *  kernel/sched/alt_core.c
 + *
@@ -14950,7 +14252,7 @@ index 000000000..2745abb36
 +#define sched_feat(x)	(0)
 +#endif /* CONFIG_SCHED_DEBUG */
 +
-+#define ALT_SCHED_VERSION "v6.8-r0"
++#define ALT_SCHED_VERSION "v6.8-r2"
 +
 +/*
 + * Compile time debug macro
@@ -14969,8 +14271,6 @@ index 000000000..2745abb36
 + * (default: 4 msec, units: nanoseconds)
 + */
 +unsigned int sysctl_sched_base_slice __read_mostly	= (4 << 20);
-+
-+static inline void requeue_task(struct task_struct *p, struct rq *rq, int idx);
 +
 +#ifdef CONFIG_SCHED_BMQ
 +#include "bmq.h"
@@ -14992,7 +14292,6 @@ index 000000000..2745abb36
 + * sched_yield_type - Type of sched_yield() will be performed.
 + * 0: No yield.
 + * 1: Requeue task. (default)
-+ * 2: Set rq skip task. (Same as mainline)
 + */
 +int sched_yield_type __read_mostly = 1;
 +
@@ -15027,11 +14326,12 @@ index 000000000..2745abb36
 +# define finish_arch_post_lock_switch()	do { } while (0)
 +#endif
 +
++static cpumask_t sched_preempt_mask[SCHED_QUEUE_BITS + 1] ____cacheline_aligned_in_smp;
++
++static cpumask_t *const sched_idle_mask = &sched_preempt_mask[SCHED_QUEUE_BITS - 1];
 +#ifdef CONFIG_SCHED_SMT
-+static cpumask_t sched_sg_idle_mask ____cacheline_aligned_in_smp;
++static cpumask_t *const sched_sg_idle_mask = &sched_preempt_mask[SCHED_QUEUE_BITS];
 +#endif
-+static cpumask_t sched_preempt_mask[SCHED_QUEUE_BITS] ____cacheline_aligned_in_smp;
-+static cpumask_t *const sched_idle_mask = &sched_preempt_mask[0];
 +
 +/* task function */
 +static inline const struct cpumask *task_user_cpus(struct task_struct *p)
@@ -15058,23 +14358,23 @@ index 000000000..2745abb36
 +static inline void sched_queue_init_idle(struct sched_queue *q,
 +					 struct task_struct *idle)
 +{
-+	idle->sq_idx = IDLE_TASK_SCHED_PRIO;
-+	INIT_LIST_HEAD(&q->heads[idle->sq_idx]);
-+	list_add(&idle->sq_node, &q->heads[idle->sq_idx]);
++	INIT_LIST_HEAD(&q->heads[IDLE_TASK_SCHED_PRIO]);
++	list_add_tail(&idle->sq_node, &q->heads[IDLE_TASK_SCHED_PRIO]);
++	idle->on_rq = TASK_ON_RQ_QUEUED;
 +}
 +
 +static inline void
 +clear_recorded_preempt_mask(int pr, int low, int high, int cpu)
 +{
 +	if (low < pr && pr <= high)
-+		cpumask_clear_cpu(cpu, sched_preempt_mask + SCHED_QUEUE_BITS - pr);
++		cpumask_clear_cpu(cpu, sched_preempt_mask + pr);
 +}
 +
 +static inline void
 +set_recorded_preempt_mask(int pr, int low, int high, int cpu)
 +{
 +	if (low < pr && pr <= high)
-+		cpumask_set_cpu(cpu, sched_preempt_mask + SCHED_QUEUE_BITS - pr);
++		cpumask_set_cpu(cpu, sched_preempt_mask + pr);
 +}
 +
 +static atomic_t sched_prio_record = ATOMIC_INIT(0);
@@ -15090,6 +14390,9 @@ index 000000000..2745abb36
 +		return;
 +
 +	rq->prio = prio;
++#ifdef CONFIG_SCHED_PDS
++	rq->prio_idx = sched_prio2idx(rq->prio, rq);
++#endif
 +	cpu = cpu_of(rq);
 +	pr = atomic_read(&sched_prio_record);
 +
@@ -15097,8 +14400,8 @@ index 000000000..2745abb36
 +		if (IDLE_TASK_SCHED_PRIO == last_prio) {
 +#ifdef CONFIG_SCHED_SMT
 +			if (static_branch_likely(&sched_smt_present))
-+				cpumask_andnot(&sched_sg_idle_mask,
-+					       &sched_sg_idle_mask, cpu_smt_mask(cpu));
++				cpumask_andnot(sched_sg_idle_mask,
++					       sched_sg_idle_mask, cpu_smt_mask(cpu));
 +#endif
 +			cpumask_clear_cpu(cpu, sched_idle_mask);
 +			last_prio -= 2;
@@ -15112,8 +14415,8 @@ index 000000000..2745abb36
 +#ifdef CONFIG_SCHED_SMT
 +		if (static_branch_likely(&sched_smt_present) &&
 +		    cpumask_intersects(cpu_smt_mask(cpu), sched_idle_mask))
-+			cpumask_or(&sched_sg_idle_mask,
-+				   &sched_sg_idle_mask, cpu_smt_mask(cpu));
++			cpumask_or(sched_sg_idle_mask,
++				   sched_sg_idle_mask, cpu_smt_mask(cpu));
 +#endif
 +		cpumask_set_cpu(cpu, sched_idle_mask);
 +		prio -= 2;
@@ -15126,7 +14429,7 @@ index 000000000..2745abb36
 + */
 +static inline struct task_struct *sched_rq_first_task(struct rq *rq)
 +{
-+	const struct list_head *head = &rq->queue.heads[sched_prio2idx(rq->prio, rq)];
++	const struct list_head *head = &rq->queue.heads[sched_rq_prio_idx(rq)];
 +
 +	return list_first_entry(head, struct task_struct, sq_node);
 +}
@@ -15134,28 +14437,19 @@ index 000000000..2745abb36
 +static inline struct task_struct *
 +sched_rq_next_task(struct task_struct *p, struct rq *rq)
 +{
-+	unsigned long idx = p->sq_idx;
-+	struct list_head *head = &rq->queue.heads[idx];
++	struct list_head *next = p->sq_node.next;
 +
-+	if (list_is_last(&p->sq_node, head)) {
-+		idx = find_next_bit(rq->queue.bitmap, SCHED_QUEUE_BITS,
-+				    sched_idx2prio(idx, rq) + 1);
++	if (&rq->queue.heads[0] <= next && next < &rq->queue.heads[SCHED_LEVELS]) {
++		struct list_head *head;
++		unsigned long idx = next - &rq->queue.heads[0];
++
++		idx = find_next_bit(rq->queue.bitmap, SCHED_QUEUE_BITS, sched_idx2prio(idx, rq) + 1);
 +		head = &rq->queue.heads[sched_prio2idx(idx, rq)];
 +
 +		return list_first_entry(head, struct task_struct, sq_node);
 +	}
 +
 +	return list_next_entry(p, sq_node);
-+}
-+
-+static inline struct task_struct *rq_runnable_task(struct rq *rq)
-+{
-+	struct task_struct *next = sched_rq_first_task(rq);
-+
-+	if (unlikely(next == rq->skip))
-+		next = sched_rq_next_task(next, rq);
-+
-+	return next;
 +}
 +
 +/*
@@ -15643,21 +14937,27 @@ index 000000000..2745abb36
 + * Add/Remove/Requeue task to/from the runqueue routines
 + * Context: rq->lock
 + */
-+#define __SCHED_DEQUEUE_TASK(p, rq, flags, func)				\
-+	sched_info_dequeue(rq, p);						\
-+										\
-+	list_del(&p->sq_node);							\
-+	if (list_empty(&rq->queue.heads[p->sq_idx])) { 				\
-+		clear_bit(sched_idx2prio(p->sq_idx, rq), rq->queue.bitmap);	\
-+		func;								\
++#define __SCHED_DEQUEUE_TASK(p, rq, flags, func)					\
++	sched_info_dequeue(rq, p);							\
++											\
++	__list_del_entry(&p->sq_node);							\
++	if (p->sq_node.prev == p->sq_node.next) {					\
++		clear_bit(sched_idx2prio(p->sq_node.next - &rq->queue.heads[0], rq),	\
++			  rq->queue.bitmap);						\
++		func;									\
 +	}
 +
-+#define __SCHED_ENQUEUE_TASK(p, rq, flags)				\
-+	sched_info_enqueue(rq, p);					\
-+									\
-+	p->sq_idx = task_sched_prio_idx(p, rq);				\
-+	list_add_tail(&p->sq_node, &rq->queue.heads[p->sq_idx]);	\
-+	set_bit(sched_idx2prio(p->sq_idx, rq), rq->queue.bitmap);
++#define __SCHED_ENQUEUE_TASK(p, rq, flags, func)					\
++	sched_info_enqueue(rq, p);							\
++	{										\
++	int idx, prio;									\
++	TASK_SCHED_PRIO_IDX(p, rq, idx, prio);						\
++	list_add_tail(&p->sq_node, &rq->queue.heads[idx]);				\
++	if (list_is_first(&p->sq_node, &rq->queue.heads[idx])) {			\
++		set_bit(prio, rq->queue.bitmap);					\
++		func;									\
++	}										\
++	}
 +
 +static inline void dequeue_task(struct task_struct *p, struct rq *rq, int flags)
 +{
@@ -15689,8 +14989,7 @@ index 000000000..2745abb36
 +		  task_cpu(p), cpu_of(rq));
 +#endif
 +
-+	__SCHED_ENQUEUE_TASK(p, rq, flags);
-+	update_sched_preempt_mask(rq);
++	__SCHED_ENQUEUE_TASK(p, rq, flags, update_sched_preempt_mask(rq));
 +	++rq->nr_running;
 +#ifdef CONFIG_SMP
 +	if (2 == rq->nr_running)
@@ -15700,24 +14999,29 @@ index 000000000..2745abb36
 +	sched_update_tick_dependency(rq);
 +}
 +
-+static inline void requeue_task(struct task_struct *p, struct rq *rq, int idx)
++static inline void requeue_task(struct task_struct *p, struct rq *rq)
 +{
++	struct list_head *node = &p->sq_node;
++	int deq_idx, idx, prio;
++
++	TASK_SCHED_PRIO_IDX(p, rq, idx, prio);
 +#ifdef ALT_SCHED_DEBUG
 +	lockdep_assert_held(&rq->lock);
 +	/*printk(KERN_INFO "sched: requeue(%d) %px %016llx\n", cpu_of(rq), p, p->deadline);*/
 +	WARN_ONCE(task_rq(p) != rq, "sched: cpu[%d] requeue task reside on cpu%d\n",
 +		  cpu_of(rq), task_cpu(p));
 +#endif
++	if (list_is_last(node, &rq->queue.heads[idx]))
++		return;
 +
-+	list_del(&p->sq_node);
-+	list_add_tail(&p->sq_node, &rq->queue.heads[idx]);
-+	if (idx != p->sq_idx) {
-+		if (list_empty(&rq->queue.heads[p->sq_idx]))
-+			clear_bit(sched_idx2prio(p->sq_idx, rq), rq->queue.bitmap);
-+		p->sq_idx = idx;
-+		set_bit(sched_idx2prio(p->sq_idx, rq), rq->queue.bitmap);
-+		update_sched_preempt_mask(rq);
-+	}
++	__list_del_entry(node);
++	if (node->prev == node->next && (deq_idx = node->next - &rq->queue.heads[0]) != idx)
++		clear_bit(sched_idx2prio(deq_idx, rq), rq->queue.bitmap);
++
++	list_add_tail(node, &rq->queue.heads[idx]);
++	if (list_is_first(node, &rq->queue.heads[idx]))
++		set_bit(prio, rq->queue.bitmap);
++	update_sched_preempt_mask(rq);
 +}
 +
 +/*
@@ -15939,7 +15243,7 @@ index 000000000..2745abb36
 +
 +	hk_mask = housekeeping_cpumask(HK_TYPE_TIMER);
 +
-+	for (mask = per_cpu(sched_cpu_topo_masks, cpu) + 1;
++	for (mask = per_cpu(sched_cpu_topo_masks, cpu);
 +	     mask < per_cpu(sched_cpu_topo_end_mask, cpu); mask++)
 +		for_each_cpu_and(i, mask, hk_mask)
 +			if (!idle_cpu(i))
@@ -16933,28 +16237,33 @@ index 000000000..2745abb36
 +}
 +
 +static inline void
-+sched_preempt_mask_flush(cpumask_t *mask, int prio)
++sched_preempt_mask_flush(cpumask_t *mask, int prio, int ref)
 +{
 +	int cpu;
 +
-+	cpumask_copy(mask, sched_idle_mask);
-+
-+	for_each_clear_bit(cpu, cpumask_bits(mask), nr_cpumask_bits) {
-+		if (prio < cpu_rq(cpu)->prio)
-+			cpumask_set_cpu(cpu, mask);
++	cpumask_copy(mask, sched_preempt_mask + ref);
++	if (prio < ref) {
++		for_each_clear_bit(cpu, cpumask_bits(mask), nr_cpumask_bits) {
++			if (prio < cpu_rq(cpu)->prio)
++				cpumask_set_cpu(cpu, mask);
++		}
++	} else {
++		for_each_cpu_andnot(cpu, mask, sched_idle_mask) {
++			if (prio >= cpu_rq(cpu)->prio)
++				cpumask_clear_cpu(cpu, mask);
++		}
 +	}
 +}
 +
 +static inline int
-+preempt_mask_check(struct task_struct *p, cpumask_t *allow_mask, cpumask_t *preempt_mask)
++preempt_mask_check(cpumask_t *preempt_mask, cpumask_t *allow_mask, int prio)
 +{
-+	int task_prio = task_sched_prio(p);
-+	cpumask_t *mask = sched_preempt_mask + SCHED_QUEUE_BITS - 1 - task_prio;
++	cpumask_t *mask = sched_preempt_mask + prio;
 +	int pr = atomic_read(&sched_prio_record);
 +
-+	if (pr != task_prio) {
-+		sched_preempt_mask_flush(mask, task_prio);
-+		atomic_set(&sched_prio_record, task_prio);
++	if (pr != prio && SCHED_QUEUE_BITS - 1 != prio) {
++		sched_preempt_mask_flush(mask, prio, pr);
++		atomic_set(&sched_prio_record, prio);
 +	}
 +
 +	return cpumask_and(preempt_mask, allow_mask, mask);
@@ -16969,10 +16278,10 @@ index 000000000..2745abb36
 +
 +	if (
 +#ifdef CONFIG_SCHED_SMT
-+	    cpumask_and(&mask, &allow_mask, &sched_sg_idle_mask) ||
++	    cpumask_and(&mask, &allow_mask, sched_sg_idle_mask) ||
 +#endif
 +	    cpumask_and(&mask, &allow_mask, sched_idle_mask) ||
-+	    preempt_mask_check(p, &allow_mask, &mask))
++	    preempt_mask_check(&mask, &allow_mask, task_sched_prio(p)))
 +		return best_mask_cpu(task_cpu(p), &mask);
 +
 +	return best_mask_cpu(task_cpu(p), &allow_mask);
@@ -19076,7 +18385,7 @@ index 000000000..2745abb36
 +	rq->active_balance = 0;
 +	/* _something_ may have changed the task, double check again */
 +	if (task_on_rq_queued(p) && task_rq(p) == rq &&
-+	    cpumask_and(&tmp, p->cpus_ptr, &sched_sg_idle_mask) &&
++	    cpumask_and(&tmp, p->cpus_ptr, sched_sg_idle_mask) &&
 +	    !is_migration_disabled(p)) {
 +		int cpu = cpu_of(rq);
 +		int dcpu = __best_mask_cpu(&tmp, per_cpu(sched_cpu_llc_mask, cpu));
@@ -19092,58 +18401,61 @@ index 000000000..2745abb36
 +}
 +
 +/* sg_balance_trigger - trigger slibing group balance for @cpu */
-+static inline int sg_balance_trigger(const int cpu)
++static inline int sg_balance_trigger(struct rq *src_rq, const int cpu)
 +{
 +	struct rq *rq= cpu_rq(cpu);
 +	unsigned long flags;
-+	struct task_struct *curr;
++	struct task_struct *p;
 +	int res;
 +
 +	if (!raw_spin_trylock_irqsave(&rq->lock, flags))
 +		return 0;
-+	curr = rq->curr;
-+	res = (!is_idle_task(curr)) && (1 == rq->nr_running) &&\
-+	      cpumask_intersects(curr->cpus_ptr, &sched_sg_idle_mask) &&\
-+	      !is_migration_disabled(curr) && (!rq->active_balance);
 +
++	res = (1 == rq->nr_running) &&					\
++	      !is_migration_disabled((p = sched_rq_first_task(rq))) &&	\
++	      cpumask_intersects(p->cpus_ptr, sched_sg_idle_mask) &&	\
++	      !rq->active_balance;
 +	if (res)
 +		rq->active_balance = 1;
 +
 +	raw_spin_unlock_irqrestore(&rq->lock, flags);
 +
-+	if (res)
-+		stop_one_cpu_nowait(cpu, sg_balance_cpu_stop, curr,
++	if (res) {
++		preempt_disable();
++		raw_spin_unlock(&src_rq->lock);
++
++		stop_one_cpu_nowait(cpu, sg_balance_cpu_stop, p,
 +				    &rq->active_balance_work);
++
++		raw_spin_lock(&src_rq->lock);
++		preempt_enable();
++	}
++
 +	return res;
 +}
 +
 +/*
 + * sg_balance - slibing group balance check for run queue @rq
 + */
-+static inline void sg_balance(struct rq *rq, int cpu)
++static inline void sg_balance(struct rq *rq)
 +{
 +	cpumask_t chk;
 +
-+	/* exit when cpu is offline */
-+	if (unlikely(!rq->online))
-+		return;
-+
-+	/*
-+	 * Only cpu in slibing idle group will do the checking and then
-+	 * find potential cpus which can migrate the current running task
-+	 */
-+	if (cpumask_test_cpu(cpu, &sched_sg_idle_mask) &&
-+	    cpumask_andnot(&chk, cpu_online_mask, sched_idle_mask) &&
++	if (cpumask_andnot(&chk, cpu_active_mask, sched_idle_mask) &&
 +	    cpumask_andnot(&chk, &chk, &sched_rq_pending_mask)) {
-+		int i;
++		int i, cpu = cpu_of(rq);
 +
 +		for_each_cpu_wrap(i, &chk, cpu) {
-+			if (!cpumask_intersects(cpu_smt_mask(i), sched_idle_mask) &&\
-+			    sg_balance_trigger(i))
++			if (cpumask_subset(cpu_smt_mask(i), &chk) &&\
++			    sg_balance_trigger(rq, i))
 +				return;
 +		}
 +	}
 +}
++
++static DEFINE_PER_CPU(struct balance_callback, sg_balance_head) = {
++	.func = sg_balance,
++};
 +#endif /* CONFIG_SCHED_SMT */
 +
 +#ifdef CONFIG_NO_HZ_FULL
@@ -19473,7 +18785,7 @@ index 000000000..2745abb36
 +			set_task_cpu(p, dest_cpu);
 +			sched_task_sanity_check(p, dest_rq);
 +			sched_mm_cid_migrate_to(dest_rq, p, cpu_of(rq));
-+			__SCHED_ENQUEUE_TASK(p, dest_rq, 0);
++			__SCHED_ENQUEUE_TASK(p, dest_rq, 0, );
 +			nr_migrated++;
 +		}
 +		nr_tries--;
@@ -19484,7 +18796,7 @@ index 000000000..2745abb36
 +
 +static inline int take_other_rq_tasks(struct rq *rq, int cpu)
 +{
-+	struct cpumask *topo_mask, *end_mask;
++	cpumask_t *topo_mask, *end_mask, chk;
 +
 +	if (unlikely(!rq->online))
 +		return 0;
@@ -19492,11 +18804,15 @@ index 000000000..2745abb36
 +	if (cpumask_empty(&sched_rq_pending_mask))
 +		return 0;
 +
-+	topo_mask = per_cpu(sched_cpu_topo_masks, cpu) + 1;
++	topo_mask = per_cpu(sched_cpu_topo_masks, cpu);
 +	end_mask = per_cpu(sched_cpu_topo_end_mask, cpu);
 +	do {
 +		int i;
-+		for_each_cpu_and(i, &sched_rq_pending_mask, topo_mask) {
++
++		if (!cpumask_and(&chk, &sched_rq_pending_mask, topo_mask))
++			continue;
++
++		for_each_cpu_wrap(i, &chk, cpu) {
 +			int nr_migrated;
 +			struct rq *src_rq;
 +
@@ -19540,7 +18856,7 @@ index 000000000..2745abb36
 +	sched_task_renew(p, rq);
 +
 +	if (SCHED_FIFO != p->policy && task_on_rq_queued(p))
-+		requeue_task(p, rq, task_sched_prio_idx(p, rq));
++		requeue_task(p, rq);
 +}
 +
 +/*
@@ -19561,33 +18877,17 @@ index 000000000..2745abb36
 +static inline struct task_struct *
 +choose_next_task(struct rq *rq, int cpu)
 +{
-+	struct task_struct *next;
++	struct task_struct *next = sched_rq_first_task(rq);
 +
-+	if (unlikely(rq->skip)) {
-+		next = rq_runnable_task(rq);
-+		if (next == rq->idle) {
-+#ifdef	CONFIG_SMP
-+			if (!take_other_rq_tasks(rq, cpu)) {
-+#endif
-+				rq->skip = NULL;
-+				schedstat_inc(rq->sched_goidle);
-+				return next;
-+#ifdef	CONFIG_SMP
-+			}
-+			next = rq_runnable_task(rq);
-+#endif
-+		}
-+		rq->skip = NULL;
-+#ifdef CONFIG_HIGH_RES_TIMERS
-+		hrtick_start(rq, next->time_slice);
-+#endif
-+		return next;
-+	}
-+
-+	next = sched_rq_first_task(rq);
 +	if (next == rq->idle) {
 +#ifdef	CONFIG_SMP
 +		if (!take_other_rq_tasks(rq, cpu)) {
++#endif
++
++#ifdef CONFIG_SCHED_SMT
++			if (likely(rq->online) &&
++			    cpumask_test_cpu(cpu, sched_sg_idle_mask))
++				__queue_balance_callback(rq, &per_cpu(sg_balance_head, cpu));
 +#endif
 +			schedstat_inc(rq->sched_goidle);
 +			/*printk(KERN_INFO "sched: choose_next_task(%d) idle %px\n", cpu, next);*/
@@ -19789,10 +19089,6 @@ index 000000000..2745abb36
 +		__balance_callbacks(rq);
 +		raw_spin_unlock_irq(&rq->lock);
 +	}
-+
-+#ifdef CONFIG_SCHED_SMT
-+	sg_balance(rq, cpu);
-+#endif
 +}
 +
 +void __noreturn do_task_dead(void)
@@ -20128,14 +19424,9 @@ index 000000000..2745abb36
 +{
 +	/* Trigger resched if task sched_prio has been modified. */
 +	if (task_on_rq_queued(p)) {
-+		int idx;
-+
 +		update_rq_clock(rq);
-+		idx = task_sched_prio_idx(p, rq);
-+		if (idx != p->sq_idx) {
-+			requeue_task(p, rq, idx);
-+			wakeup_preempt(rq);
-+		}
++		requeue_task(p, rq);
++		wakeup_preempt(rq);
 +	}
 +}
 +
@@ -21290,15 +20581,11 @@ index 000000000..2745abb36
 +	p = current;
 +	if (rt_task(p)) {
 +		if (task_on_rq_queued(p))
-+			requeue_task(p, rq, task_sched_prio_idx(p, rq));
++			requeue_task(p, rq);
 +	} else if (rq->nr_running > 1) {
-+		if (1 == sched_yield_type) {
-+			do_sched_yield_type_1(p, rq);
-+			if (task_on_rq_queued(p))
-+				requeue_task(p, rq, task_sched_prio_idx(p, rq));
-+		} else if (2 == sched_yield_type) {
-+			rq->skip = p;
-+		}
++		do_sched_yield_type_1(p, rq);
++		if (task_on_rq_queued(p))
++			requeue_task(p, rq);
 +	}
 +
 +	preempt_disable();
@@ -22358,7 +21645,7 @@ index 000000000..2745abb36
 +	if (cpumask_weight(cpu_smt_mask(cpu)) == 2) {
 +		static_branch_dec_cpuslocked(&sched_smt_present);
 +		if (!static_branch_likely(&sched_smt_present))
-+			cpumask_clear(&sched_sg_idle_mask);
++			cpumask_clear(sched_sg_idle_mask);
 +	}
 +#endif
 +
@@ -22475,12 +21762,9 @@ index 000000000..2745abb36
 +		/* init topo masks */
 +		tmp = per_cpu(sched_cpu_topo_masks, cpu);
 +
-+		cpumask_copy(tmp, cpumask_of(cpu));
-+		tmp++;
 +		cpumask_copy(tmp, cpu_possible_mask);
 +		per_cpu(sched_cpu_llc_mask, cpu) = tmp;
 +		per_cpu(sched_cpu_topo_end_mask, cpu) = ++tmp;
-+		/*per_cpu(sd_llc_id, cpu) = cpu;*/
 +	}
 +}
 +
@@ -22503,7 +21787,7 @@ index 000000000..2745abb36
 +		/* take chance to reset time slice for idle tasks */
 +		cpu_rq(cpu)->idle->time_slice = sysctl_sched_base_slice;
 +
-+		topo = per_cpu(sched_cpu_topo_masks, cpu) + 1;
++		topo = per_cpu(sched_cpu_topo_masks, cpu);
 +
 +		bitmap_complement(cpumask_bits(topo), cpumask_bits(cpumask_of(cpu)),
 +				  nr_cpumask_bits);
@@ -22599,7 +21883,9 @@ index 000000000..2745abb36
 +
 +		sched_queue_init(&rq->queue);
 +		rq->prio = IDLE_TASK_SCHED_PRIO;
-+		rq->skip = NULL;
++#ifdef CONFIG_SCHED_PDS
++		rq->prio_idx = rq->prio;
++#endif
 +
 +		raw_spin_lock_init(&rq->lock);
 +		rq->nr_running = rq->nr_uninterruptible = 0;
@@ -23001,7 +22287,7 @@ index 000000000..2745abb36
 +#ifdef CONFIG_FAIR_GROUP_SCHED
 +static DEFINE_MUTEX(shares_mutex);
 +
-+int sched_group_set_shares(struct task_group *tg, unsigned long shares)
++static int sched_group_set_shares(struct task_group *tg, unsigned long shares)
 +{
 +	/*
 +	 * We can't change the weight of the root cgroup.
@@ -23872,10 +23158,10 @@ index 000000000..1dbd7eb6a
 +{}
 diff --git a/kernel/sched/alt_sched.h b/kernel/sched/alt_sched.h
 new file mode 100644
-index 000000000..e9bfc67e8
+index 000000000..ba1b7b805
 --- /dev/null
 +++ b/kernel/sched/alt_sched.h
-@@ -0,0 +1,954 @@
+@@ -0,0 +1,975 @@
 +#ifndef ALT_SCHED_H
 +#define ALT_SCHED_H
 +
@@ -24045,14 +23331,14 @@ index 000000000..e9bfc67e8
 +	struct task_struct __rcu	*curr;
 +	struct task_struct		*idle;
 +	struct task_struct		*stop;
-+	struct task_struct		*skip;
 +	struct mm_struct		*prev_mm;
 +
-+	struct sched_queue	queue;
++	struct sched_queue		queue		____cacheline_aligned;
 +#ifdef CONFIG_SCHED_PDS
 +	u64			time_edge;
++	unsigned long			prio_idx;
 +#endif
-+	unsigned long		prio;
++	unsigned long			prio;
 +
 +	/* switch count */
 +	u64 nr_switches;
@@ -24197,7 +23483,6 @@ index 000000000..e9bfc67e8
 +extern bool sched_smp_initialized;
 +
 +enum {
-+	ITSELF_LEVEL_SPACE_HOLDER,
 +#ifdef CONFIG_SCHED_SMT
 +	SMT_LEVEL_SPACE_HOLDER,
 +#endif
@@ -24829,20 +24114,42 @@ index 000000000..e9bfc67e8
 +static inline void init_sched_mm_cid(struct task_struct *t) { }
 +#endif
 +
++#ifdef CONFIG_SMP
++extern struct balance_callback balance_push_callback;
++
++static inline void
++__queue_balance_callback(struct rq *rq,
++			 struct balance_callback *head)
++{
++	lockdep_assert_rq_held(rq);
++
++	/*
++	 * Don't (re)queue an already queued item; nor queue anything when
++	 * balance_push() is active, see the comment with
++	 * balance_push_callback.
++	 */
++	if (unlikely(head->next || rq->balance_callback == &balance_push_callback))
++		return;
++
++	head->next = rq->balance_callback;
++	rq->balance_callback = head;
++}
++#endif /* CONFIG_SMP */
++
 +#endif /* ALT_SCHED_H */
 diff --git a/kernel/sched/bmq.h b/kernel/sched/bmq.h
 new file mode 100644
-index 000000000..840009dc1
+index 000000000..f270fd1b9
 --- /dev/null
 +++ b/kernel/sched/bmq.h
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,102 @@
 +#define ALT_SCHED_NAME "BMQ"
 +
 +/*
 + * BMQ only routines
 + */
 +#define rq_switch_time(rq)	((rq)->clock - (rq)->last_ts_switch)
-+#define boost_threshold(p)	(sysctl_sched_base_slice >> ((14 - (p)->boost_prio) / 2))
++#define boost_threshold(p)	(sysctl_sched_base_slice >> ((20 - (p)->boost_prio) / 2))
 +
 +static inline void boost_task(struct task_struct *p)
 +{
@@ -24853,7 +24160,6 @@ index 000000000..840009dc1
 +		limit = -MAX_PRIORITY_ADJ;
 +		break;
 +	case SCHED_BATCH:
-+	case SCHED_IDLE:
 +		limit = 0;
 +		break;
 +	default:
@@ -24875,6 +24181,7 @@ index 000000000..840009dc1
 + */
 +static inline void sched_timeslice_imp(const int timeslice_ms) {}
 +
++/* This API is used in task_prio(), return value readed by human users */
 +static inline int
 +task_sched_prio_normal(const struct task_struct *p, const struct rq *rq)
 +{
@@ -24887,11 +24194,9 @@ index 000000000..840009dc1
 +		MIN_SCHED_NORMAL_PRIO + (p->prio + p->boost_prio - MAX_RT_PRIO) / 2;
 +}
 +
-+static inline int
-+task_sched_prio_idx(const struct task_struct *p, const struct rq *rq)
-+{
-+	return task_sched_prio(p);
-+}
++#define TASK_SCHED_PRIO_IDX(p, rq, idx, prio)	\
++	prio = task_sched_prio(p);		\
++	idx = prio;
 +
 +static inline int sched_prio2idx(int prio, struct rq *rq)
 +{
@@ -24901,6 +24206,11 @@ index 000000000..840009dc1
 +static inline int sched_idx2prio(int idx, struct rq *rq)
 +{
 +	return idx;
++}
++
++static inline int sched_rq_prio_idx(struct rq *rq)
++{
++	return rq->prio;
 +}
 +
 +inline int task_running_nice(struct task_struct *p)
@@ -25159,10 +24469,10 @@ index 31231925f..c08731103 100644
 +#endif
 diff --git a/kernel/sched/pds.h b/kernel/sched/pds.h
 new file mode 100644
-index 000000000..c35dfb909
+index 000000000..f9de95e0e
 --- /dev/null
 +++ b/kernel/sched/pds.h
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,134 @@
 +#define ALT_SCHED_NAME "PDS"
 +
 +static const u64 RT_MASK = ((1ULL << MIN_SCHED_NORMAL_PRIO) - 1);
@@ -25170,7 +24480,7 @@ index 000000000..c35dfb909
 +#define SCHED_NORMAL_PRIO_NUM	(32)
 +#define SCHED_EDGE_DELTA	(SCHED_NORMAL_PRIO_NUM - NICE_WIDTH / 2)
 +
-+/* PDS assume NORMAL_PRIO_NUM is power of 2 */
++/* PDS assume SCHED_NORMAL_PRIO_NUM is power of 2 */
 +#define SCHED_NORMAL_PRIO_MOD(x)	((x) & (SCHED_NORMAL_PRIO_NUM - 1))
 +
 +/* default time slice 4ms -> shift 22, 2 time slice slots -> shift 23 */
@@ -25179,24 +24489,18 @@ index 000000000..c35dfb909
 +/*
 + * Common interfaces
 + */
-+static inline void sched_timeslice_imp(const int timeslice_ms)
-+{
-+	if (2 == timeslice_ms)
-+		sched_timeslice_shift = 22;
-+}
-+
 +static inline int
 +task_sched_prio_normal(const struct task_struct *p, const struct rq *rq)
 +{
-+	s64 delta = p->deadline - rq->time_edge + SCHED_EDGE_DELTA;
++	u64 sched_dl = max(p->deadline, rq->time_edge);
 +
 +#ifdef ALT_SCHED_DEBUG
-+	if (WARN_ONCE(delta > NORMAL_PRIO_NUM - 1,
-+		      "pds: task_sched_prio_normal() delta %lld\n", delta))
++	if (WARN_ONCE(sched_dl - rq->time_edge > NORMAL_PRIO_NUM - 1,
++		      "pds: task_sched_prio_normal() delta %lld\n", sched_dl - rq->time_edge))
 +		return SCHED_NORMAL_PRIO_NUM - 1;
 +#endif
 +
-+	return max(0LL, delta);
++	return sched_dl - rq->time_edge;
 +}
 +
 +static inline int task_sched_prio(const struct task_struct *p)
@@ -25205,18 +24509,15 @@ index 000000000..c35dfb909
 +		MIN_SCHED_NORMAL_PRIO + task_sched_prio_normal(p, task_rq(p));
 +}
 +
-+static inline int
-+task_sched_prio_idx(const struct task_struct *p, const struct rq *rq)
-+{
-+	u64 idx;
-+
-+	if (p->prio < MIN_NORMAL_PRIO)
-+		return p->prio >> 2;
-+
-+	idx = max(p->deadline + SCHED_EDGE_DELTA, rq->time_edge);
-+	/*printk(KERN_INFO "sched: task_sched_prio_idx edge:%llu, deadline=%llu idx=%llu\n", rq->time_edge, p->deadline, idx);*/
-+	return MIN_SCHED_NORMAL_PRIO + SCHED_NORMAL_PRIO_MOD(idx);
-+}
++#define TASK_SCHED_PRIO_IDX(p, rq, idx, prio)							\
++	if (p->prio < MIN_NORMAL_PRIO) {							\
++		prio = p->prio >> 2;								\
++		idx = prio;									\
++	} else {										\
++		u64 sched_dl = max(p->deadline, rq->time_edge);					\
++		prio = MIN_SCHED_NORMAL_PRIO + sched_dl - rq->time_edge;			\
++		idx = MIN_SCHED_NORMAL_PRIO + SCHED_NORMAL_PRIO_MOD(sched_dl);			\
++	}
 +
 +static inline int sched_prio2idx(int sched_prio, struct rq *rq)
 +{
@@ -25230,6 +24531,11 @@ index 000000000..c35dfb909
 +	return (sched_idx < MIN_SCHED_NORMAL_PRIO) ?
 +		sched_idx :
 +		MIN_SCHED_NORMAL_PRIO + SCHED_NORMAL_PRIO_MOD(sched_idx - rq->time_edge);
++}
++
++static inline int sched_rq_prio_idx(struct rq *rq)
++{
++	return rq->prio_idx;
 +}
 +
 +int task_running_nice(struct task_struct *p)
@@ -25259,13 +24565,9 @@ index 000000000..c35dfb909
 +
 +	bitmap_shift_right(normal, rq->queue.bitmap, delta, SCHED_QUEUE_BITS);
 +	if (!list_empty(&head)) {
-+		struct task_struct *p;
 +		u64 idx = MIN_SCHED_NORMAL_PRIO + SCHED_NORMAL_PRIO_MOD(now);
 +
-+		list_for_each_entry(p, &head, sq_node)
-+			p->sq_idx = idx;
-+
-+		list_splice(&head, rq->queue.heads + idx);
++		__list_splice(&head, rq->queue.heads + idx, rq->queue.heads[idx].next);
 +		set_bit(MIN_SCHED_NORMAL_PRIO, normal);
 +	}
 +	bitmap_replace(rq->queue.bitmap, normal, rq->queue.bitmap,
@@ -25274,19 +24576,20 @@ index 000000000..c35dfb909
 +	if (rq->prio < MIN_SCHED_NORMAL_PRIO || IDLE_TASK_SCHED_PRIO == rq->prio)
 +		return;
 +
-+	rq->prio = (rq->prio < MIN_SCHED_NORMAL_PRIO + delta) ?
-+		MIN_SCHED_NORMAL_PRIO : rq->prio - delta;
++	rq->prio = max_t(u64, MIN_SCHED_NORMAL_PRIO, rq->prio - delta);
++	rq->prio_idx = sched_prio2idx(rq->prio, rq);
 +}
 +
 +static inline void sched_task_renew(struct task_struct *p, const struct rq *rq)
 +{
 +	if (p->prio >= MIN_NORMAL_PRIO)
-+		p->deadline = rq->time_edge + (p->static_prio - (MAX_PRIO - NICE_WIDTH)) / 2;
++		p->deadline = rq->time_edge + SCHED_EDGE_DELTA +
++			      (p->static_prio - (MAX_PRIO - NICE_WIDTH)) / 2;
 +}
 +
 +static inline void sched_task_sanity_check(struct task_struct *p, struct rq *rq)
 +{
-+	u64 max_dl = rq->time_edge + NICE_WIDTH / 2 - 1;
++	u64 max_dl = rq->time_edge + SCHED_EDGE_DELTA + NICE_WIDTH / 2 - 1;
 +	if (unlikely(p->deadline > max_dl))
 +		p->deadline = max_dl;
 +}
@@ -25377,7 +24680,7 @@ index 9e1083465..d35f050e8 100644
  static inline int
  update_thermal_load_avg(u64 now, struct rq *rq, u64 capacity)
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index ed5c758c7..dbbba2c69 100644
+index 001fe047b..a2fafb8f3 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
 @@ -5,6 +5,10 @@
@@ -25519,7 +24822,7 @@ index 10d1391e7..dc7176833 100644
 +#endif /* CONFIG_NUMA */
 +#endif
 diff --git a/kernel/sysctl.c b/kernel/sysctl.c
-index c92d8a4b2..482857073 100644
+index 157f7ce29..63083a9a2 100644
 --- a/kernel/sysctl.c
 +++ b/kernel/sysctl.c
 @@ -92,6 +92,10 @@ EXPORT_SYMBOL_GPL(sysctl_long_vals);
@@ -25533,7 +24836,7 @@ index c92d8a4b2..482857073 100644
  #ifdef CONFIG_PERF_EVENTS
  static const int six_hundred_forty_kb = 640 * 1024;
  #endif
-@@ -1924,6 +1928,17 @@ static struct ctl_table kern_table[] = {
+@@ -1912,6 +1916,17 @@ static struct ctl_table kern_table[] = {
  		.proc_handler	= proc_dointvec,
  	},
  #endif
