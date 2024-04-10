@@ -42,8 +42,7 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
         -D LLVM_ENABLE_DOXYGEN=OFF \
         -D LLVM_ENABLE_Z3_SOLVER=OFF \
         -D LLVM_POLLY_LINK_INTO_TOOLS=ON \
-        -D LLVM_ENABLE_ZLIB=ON \
-        -D LLVM_ENABLE_ZSTD=OFF \
+        -D LLVM_ENABLE_ZSTD=ON \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=${TOPLEV}/stage2-prof-use-lto/install \
     -DLLVM_PROFDATA_FILE=${TOPLEV}/stage2-prof-gen/profiles/clang.profdata \
