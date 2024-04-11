@@ -1,0 +1,531 @@
+From f2fc9abf8dae0a4c796f10425d85677963cb7b8f Mon Sep 17 00:00:00 2001
+From: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+Date: Wed, 6 Mar 2024 14:17:55 +0100
+Subject: [PATCH 1/3] ac,radeonsi: add helpers to compute the number of tess
+ patches/lds size
+
+Signed-off-by: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+---
+ src/amd/common/ac_shader_util.c               | 93 +++++++++++++++++++
+ src/amd/common/ac_shader_util.h               |  8 ++
+ .../drivers/radeonsi/si_state_shaders.cpp     | 81 ++--------------
+ 3 files changed, 107 insertions(+), 75 deletions(-)
+
+diff --git a/src/amd/common/ac_shader_util.c b/src/amd/common/ac_shader_util.c
+index 6837083a51b50..9f27fbb9bc4b9 100644
+--- a/src/amd/common/ac_shader_util.c
++++ b/src/amd/common/ac_shader_util.c
+@@ -1031,6 +1031,99 @@ unsigned ac_compute_ngg_workgroup_size(unsigned es_verts, unsigned gs_inst_prims
+    return CLAMP(workgroup_size, 1, 256);
+ }
+ 
++uint32_t ac_compute_num_tess_patches(const struct radeon_info *info, uint32_t num_tcs_input_cp,
++                                     uint32_t num_tcs_output_cp, uint32_t num_tcs_patch_outputs,
++                                     uint32_t output_vertex_size, uint32_t lds_per_patch,
++                                     uint32_t wave_size, bool tess_uses_primid)
++{
++   /* The VGT HS block increments the patch ID unconditionally
++    * within a single threadgroup. This results in incorrect
++    * patch IDs when instanced draws are used.
++    *
++    * The intended solution is to restrict threadgroups to
++    * a single instance by setting SWITCH_ON_EOI, which
++    * should cause IA to split instances up. However, this
++    * doesn't work correctly on GFX6 when there is no other
++    * SE to switch to.
++    */
++   const bool has_primid_instancing_bug = info->gfx_level == GFX6 && info->max_se == 1;
++   if (has_primid_instancing_bug && tess_uses_primid)
++      return 1;
++
++   const unsigned pervertex_output_patch_size = num_tcs_output_cp * output_vertex_size;
++   const unsigned output_patch_size = pervertex_output_patch_size + num_tcs_patch_outputs * 16;
++
++   /* Ensure that we only need 4 waves per CU, so that we don't need to check
++    * resource usage (such as whether we have enough VGPRs to fit the whole
++    * threadgroup into the CU). It also ensures that the number of tcs in and out
++    * vertices per threadgroup are at most 256, which is the hw limit.
++    */
++   const unsigned max_verts_per_patch = MAX2(num_tcs_input_cp, num_tcs_output_cp);
++   unsigned num_patches = 256 / max_verts_per_patch;
++
++   /* Not necessary for correctness, but higher numbers are slower.
++    * The hardware can do more, but we prefer fully occupied waves.
++    * eg. 64 triangle patches means 3 fully occupied Wave64 waves.
++    */
++   num_patches = MIN2(num_patches, 64);
++
++   /* When distributed tessellation is unsupported, switch between SEs
++    * at a higher frequency to manually balance the workload between SEs.
++    */
++   if (!info->has_distributed_tess && info->max_se > 1)
++      num_patches = MIN2(num_patches, 16); /* recommended */
++
++   /* Make sure the output data fits in the offchip buffer */
++   if (output_patch_size) {
++      const uint32_t tess_offchip_block_dw_size = info->family == CHIP_HAWAII ? 4096 : 8192;
++      num_patches =
++         MIN2(num_patches, (tess_offchip_block_dw_size * 4) / output_patch_size);
++   }
++
++   /* Make sure that the data fits in LDS. This assumes the shaders only
++    * use LDS for the inputs and outputs.
++    *
++    * The maximum allowed LDS size is 32K. Higher numbers can hang.
++    * Use 16K as the maximum, so that we can fit 2 workgroups on the same CU.
++    */
++   if (lds_per_patch) {
++      ASSERTED const unsigned max_lds_size = 32 * 1024; /* hw limit */
++      const unsigned target_lds_size = 16 * 1024; /* target at least 2 workgroups per CU, 16K each */
++      num_patches = MIN2(num_patches, target_lds_size / lds_per_patch);
++      assert(num_patches * lds_per_patch <= max_lds_size);
++   }
++   num_patches = MAX2(num_patches, 1);
++
++   /* Make sure that vector lanes are fully occupied by cutting off the last wave
++    * if it's only partially filled.
++    */
++   const unsigned temp_verts_per_tg = num_patches * max_verts_per_patch;
++
++   if (temp_verts_per_tg > wave_size &&
++       (wave_size - temp_verts_per_tg % wave_size >= MAX2(max_verts_per_patch, 8)))
++      num_patches = (temp_verts_per_tg & ~(wave_size - 1)) / max_verts_per_patch;
++
++   if (info->gfx_level == GFX6) {
++      /* GFX6 bug workaround, related to power management. Limit LS-HS
++       * threadgroups to only one wave.
++       */
++      const unsigned one_wave = wave_size / max_verts_per_patch;
++      num_patches = MIN2(num_patches, one_wave);
++   }
++
++   return num_patches;
++}
++
++uint32_t
++ac_compute_tess_lds_size(const struct radeon_info *info, uint32_t lds_per_patch, uint32_t num_patches)
++{
++   const unsigned lds_size = lds_per_patch * num_patches;
++
++   assert(lds_size <= (info->gfx_level >= GFX7 ? 65536 : 32768));
++
++   return align(lds_size, info->lds_encode_granularity) / info->lds_encode_granularity;
++}
++
+ uint32_t ac_apply_cu_en(uint32_t value, uint32_t clear_mask, unsigned value_shift,
+                         const struct radeon_info *info)
+ {
+diff --git a/src/amd/common/ac_shader_util.h b/src/amd/common/ac_shader_util.h
+index f36bffdfb77e7..6245116bd9e1c 100644
+--- a/src/amd/common/ac_shader_util.h
++++ b/src/amd/common/ac_shader_util.h
+@@ -197,6 +197,14 @@ unsigned ac_compute_esgs_workgroup_size(enum amd_gfx_level gfx_level, unsigned w
+ unsigned ac_compute_ngg_workgroup_size(unsigned es_verts, unsigned gs_inst_prims,
+                                        unsigned max_vtx_out, unsigned prim_amp_factor);
+ 
++uint32_t ac_compute_num_tess_patches(const struct radeon_info *info, uint32_t num_tcs_input_cp,
++                                     uint32_t num_tcs_output_cp, uint32_t num_tcs_patch_outputs,
++                                     uint32_t output_vertex_size, uint32_t lds_per_patch,
++                                     uint32_t wave_size, bool tess_uses_primid);
++
++uint32_t ac_compute_tess_lds_size(const struct radeon_info *info,
++                                  uint32_t lds_per_patch, uint32_t num_patches);
++
+ uint32_t ac_apply_cu_en(uint32_t value, uint32_t clear_mask, unsigned value_shift,
+                         const struct radeon_info *info);
+ 
+diff --git a/src/gallium/drivers/radeonsi/si_state_shaders.cpp b/src/gallium/drivers/radeonsi/si_state_shaders.cpp
+index 38bc0b3f44447..bd859e7c01466 100644
+--- a/src/gallium/drivers/radeonsi/si_state_shaders.cpp
++++ b/src/gallium/drivers/radeonsi/si_state_shaders.cpp
+@@ -4515,72 +4515,11 @@ void si_update_tess_io_layout_state(struct si_context *sctx)
+       lds_per_patch = MAX2(input_patch_size, output_patch_size);
+    }
+ 
+-   /* Ensure that we only need 4 waves per CU, so that we don't need to check
+-    * resource usage (such as whether we have enough VGPRs to fit the whole
+-    * threadgroup into the CU). It also ensures that the number of tcs in and out
+-    * vertices per threadgroup are at most 256, which is the hw limit.
+-    */
+-   unsigned max_verts_per_patch = MAX2(num_tcs_input_cp, num_tcs_output_cp);
+-   unsigned num_patches = 256 / max_verts_per_patch;
+-
+-   /* Not necessary for correctness, but higher numbers are slower.
+-    * The hardware can do more, but the radeonsi shader constant is
+-    * limited to 6 bits.
+-    */
+-   num_patches = MIN2(num_patches, 64); /* e.g. 64 triangles in exactly 3 waves */
+-
+-   /* When distributed tessellation is unsupported, switch between SEs
+-    * at a higher frequency to manually balance the workload between SEs.
+-    */
+-   if (!sctx->screen->info.has_distributed_tess && sctx->screen->info.max_se > 1)
+-      num_patches = MIN2(num_patches, 16); /* recommended */
+-
+-   /* Make sure the output data fits in the offchip buffer */
+-   num_patches =
+-      MIN2(num_patches, (sctx->screen->hs.tess_offchip_block_dw_size * 4) / output_patch_size);
+-
+-   /* Make sure that the data fits in LDS. This assumes the shaders only
+-    * use LDS for the inputs and outputs.
+-    *
+-    * The maximum allowed LDS size is 32K. Higher numbers can hang.
+-    * Use 16K as the maximum, so that we can fit 2 workgroups on the same CU.
+-    */
+-   ASSERTED unsigned max_lds_size = 32 * 1024; /* hw limit */
+-   unsigned target_lds_size = 16 * 1024; /* target at least 2 workgroups per CU, 16K each */
+-   num_patches = MIN2(num_patches, target_lds_size / lds_per_patch);
+-   num_patches = MAX2(num_patches, 1);
+-   assert(num_patches * lds_per_patch <= max_lds_size);
+-
+-   /* Make sure that vector lanes are fully occupied by cutting off the last wave
+-    * if it's only partially filled.
+-    */
+-   unsigned temp_verts_per_tg = num_patches * max_verts_per_patch;
+-   unsigned wave_size = ls_current->wave_size;
+-
+-   if (temp_verts_per_tg > wave_size &&
+-       (wave_size - temp_verts_per_tg % wave_size >= MAX2(max_verts_per_patch, 8)))
+-      num_patches = (temp_verts_per_tg & ~(wave_size - 1)) / max_verts_per_patch;
+-
+-   if (sctx->gfx_level == GFX6) {
+-      /* GFX6 bug workaround, related to power management. Limit LS-HS
+-       * threadgroups to only one wave.
+-       */
+-      unsigned one_wave = wave_size / max_verts_per_patch;
+-      num_patches = MIN2(num_patches, one_wave);
+-   }
+-
+-   /* The VGT HS block increments the patch ID unconditionally
+-    * within a single threadgroup. This results in incorrect
+-    * patch IDs when instanced draws are used.
+-    *
+-    * The intended solution is to restrict threadgroups to
+-    * a single instance by setting SWITCH_ON_EOI, which
+-    * should cause IA to split instances up. However, this
+-    * doesn't work correctly on GFX6 when there is no other
+-    * SE to switch to.
+-    */
+-   if (has_primid_instancing_bug && tess_uses_primid)
+-      num_patches = 1;
++   unsigned num_patches =
++      ac_compute_num_tess_patches(&sctx->screen->info, num_tcs_input_cp,
++                                  num_tcs_output_cp, num_tcs_patch_outputs,
++                                  output_vertex_size, lds_per_patch,
++                                  ls_current->wave_size, tess_uses_primid);
+ 
+    if (sctx->num_patches_per_workgroup != num_patches) {
+       sctx->num_patches_per_workgroup = num_patches;
+@@ -4607,15 +4546,7 @@ void si_update_tess_io_layout_state(struct si_context *sctx)
+       (num_vs_outputs << 17) | (num_tcs_outputs << 23);
+ 
+    /* Compute the LDS size. */
+-   unsigned lds_size = lds_per_patch * num_patches;
+-
+-   if (sctx->gfx_level >= GFX7) {
+-      assert(lds_size <= 65536);
+-      lds_size = align(lds_size, 512) / 512;
+-   } else {
+-      assert(lds_size <= 32768);
+-      lds_size = align(lds_size, 256) / 256;
+-   }
++   unsigned lds_size = ac_compute_tess_lds_size(&sctx->screen->info, lds_per_patch, num_patches);
+ 
+    /* We should be able to support in-shader LDS use with LLVM >= 9
+     * by just adding the lds_sizes together, but it has never
+-- 
+GitLab
+
+
+From 93c7c7ef82f7cfa8d8db426f769c29c0346a25e4 Mon Sep 17 00:00:00 2001
+From: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+Date: Wed, 6 Mar 2024 14:38:35 +0100
+Subject: [PATCH 2/3] radv: rework the number of tess patches computation
+
+This uses the same helper as RadeonSI which seems more robust and more
+optimal (eg. it reduces the number of patches to increase occupancy).
+
+fossils-db (NAVI21):
+Totals from 638 (0.80% of 79395) affected shaders:
+MaxWaves: 13182 -> 13142 (-0.30%)
+Instrs: 419447 -> 419323 (-0.03%); split: -0.08%, +0.05%
+CodeSize: 2261412 -> 2261364 (-0.00%); split: -0.06%, +0.05%
+VGPRs: 32560 -> 32600 (+0.12%)
+LDS: 4648960 -> 5425152 (+16.70%); split: -1.67%, +18.37%
+Latency: 4812114 -> 4811040 (-0.02%); split: -0.04%, +0.02%
+InvThroughput: 1159924 -> 1153877 (-0.52%); split: -0.61%, +0.09%
+VClause: 7837 -> 7891 (+0.69%); split: -0.36%, +1.05%
+SClause: 9378 -> 9401 (+0.25%)
+Copies: 28451 -> 28271 (-0.63%); split: -0.76%, +0.13%
+PreVGPRs: 25404 -> 25411 (+0.03%); split: -0.06%, +0.09%
+VALU: 278086 -> 278035 (-0.02%); split: -0.09%, +0.07%
+SALU: 43657 -> 43617 (-0.09%)
+
+Signed-off-by: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+---
+ src/amd/vulkan/radv_cmd_buffer.c  | 13 +++--
+ src/amd/vulkan/radv_shader.c      | 38 +++++++++++++++
+ src/amd/vulkan/radv_shader.h      | 79 +++----------------------------
+ src/amd/vulkan/radv_shader_info.c | 14 +++---
+ 4 files changed, 56 insertions(+), 88 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index a183153573ddd..bb66eee40623e 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -2646,16 +2646,15 @@ radv_emit_patch_control_points(struct radv_cmd_buffer *cmd_buffer)
+     */
+    if (cmd_buffer->state.uses_dynamic_patch_control_points) {
+       /* Compute the number of patches. */
+-      cmd_buffer->state.tess_num_patches = get_tcs_num_patches(
+-         d->vk.ts.patch_control_points, tcs->info.tcs.tcs_vertices_out, vs->info.vs.num_linked_outputs,
+-         tcs->info.tcs.num_lds_per_vertex_outputs, tcs->info.tcs.num_lds_per_patch_outputs,
+-         pdev->hs.tess_offchip_block_dw_size, pdev->info.gfx_level, pdev->info.family);
++      cmd_buffer->state.tess_num_patches = radv_get_tcs_num_patches(
++         pdev, d->vk.ts.patch_control_points, tcs->info.tcs.tcs_vertices_out, vs->info.vs.num_linked_outputs,
++         tcs->info.tcs.num_lds_per_vertex_outputs, tcs->info.tcs.num_lds_per_patch_outputs);
+ 
+       /* Compute the LDS size. */
+       cmd_buffer->state.tess_lds_size =
+-         calculate_tess_lds_size(pdev->info.gfx_level, d->vk.ts.patch_control_points, tcs->info.tcs.tcs_vertices_out,
+-                                 vs->info.vs.num_linked_outputs, cmd_buffer->state.tess_num_patches,
+-                                 tcs->info.tcs.num_lds_per_vertex_outputs, tcs->info.tcs.num_lds_per_patch_outputs);
++         radv_get_tess_lds_size(pdev, d->vk.ts.patch_control_points, tcs->info.tcs.tcs_vertices_out,
++                                vs->info.vs.num_linked_outputs, cmd_buffer->state.tess_num_patches,
++                                tcs->info.tcs.num_lds_per_vertex_outputs, tcs->info.tcs.num_lds_per_patch_outputs);
+    }
+ 
+    ls_hs_config = S_028B58_NUM_PATCHES(cmd_buffer->state.tess_num_patches) |
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index 048383a2e773e..888c0ce8b227b 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -2954,6 +2954,44 @@ radv_get_user_sgpr(const struct radv_shader *shader, int idx)
+    return &shader->info.user_sgprs_locs.shader_data[idx];
+ }
+ 
++static uint32_t
++radv_get_tess_lds_per_patch(uint32_t tcs_num_input_vertices, uint32_t tcs_num_output_vertices, uint32_t tcs_num_inputs,
++                            uint32_t tcs_num_outputs, uint32_t tcs_num_patch_outputs)
++{
++   const uint32_t input_vertex_size = get_tcs_input_vertex_stride(tcs_num_inputs);
++   const uint32_t output_vertex_size = tcs_num_outputs * 16;
++   const uint32_t input_patch_size = tcs_num_input_vertices * input_vertex_size;
++   const uint32_t pervertex_output_patch_size = tcs_num_output_vertices * output_vertex_size;
++   const uint32_t output_patch_size = pervertex_output_patch_size + tcs_num_patch_outputs * 16;
++
++   return input_patch_size + output_patch_size;
++}
++
++uint32_t
++radv_get_tcs_num_patches(const struct radv_physical_device *pdev, uint32_t tcs_num_input_vertices,
++                         uint32_t tcs_num_output_vertices, uint32_t tcs_num_inputs, uint32_t tcs_num_outputs,
++                         uint32_t tcs_num_patch_outputs)
++{
++   const uint32_t lds_per_patch = radv_get_tess_lds_per_patch(tcs_num_input_vertices, tcs_num_output_vertices,
++                                                              tcs_num_inputs, tcs_num_outputs, tcs_num_patch_outputs);
++   const uint32_t output_vertex_size = tcs_num_outputs * 16;
++
++   return ac_compute_num_tess_patches(&pdev->info, tcs_num_input_vertices, tcs_num_output_vertices,
++                                      tcs_num_patch_outputs, output_vertex_size, lds_per_patch, pdev->ge_wave_size,
++                                      false);
++}
++
++uint32_t
++radv_get_tess_lds_size(const struct radv_physical_device *pdev, uint32_t tcs_num_input_vertices,
++                       uint32_t tcs_num_output_vertices, uint32_t tcs_num_inputs, uint32_t tcs_num_patches,
++                       uint32_t tcs_num_outputs, uint32_t tcs_num_patch_outputs)
++{
++   const uint32_t lds_per_patch = radv_get_tess_lds_per_patch(tcs_num_input_vertices, tcs_num_output_vertices,
++                                                              tcs_num_inputs, tcs_num_outputs, tcs_num_patch_outputs);
++
++   return ac_compute_tess_lds_size(&pdev->info, lds_per_patch, tcs_num_patches);
++}
++
+ VkResult
+ radv_dump_shader_stats(struct radv_device *device, struct radv_pipeline *pipeline, struct radv_shader *shader,
+                        gl_shader_stage stage, FILE *output)
+diff --git a/src/amd/vulkan/radv_shader.h b/src/amd/vulkan/radv_shader.h
+index 65028b1389a46..287dbd9f21cff 100644
+--- a/src/amd/vulkan/radv_shader.h
++++ b/src/amd/vulkan/radv_shader.h
+@@ -642,80 +642,13 @@ get_tcs_input_vertex_stride(unsigned tcs_num_inputs)
+    return stride;
+ }
+ 
+-static inline unsigned
+-calculate_tess_lds_size(enum amd_gfx_level gfx_level, unsigned tcs_num_input_vertices, unsigned tcs_num_output_vertices,
+-                        unsigned tcs_num_inputs, unsigned tcs_num_patches, unsigned tcs_num_outputs,
+-                        unsigned tcs_num_patch_outputs)
+-{
+-   unsigned input_vertex_size = get_tcs_input_vertex_stride(tcs_num_inputs);
+-   unsigned output_vertex_size = tcs_num_outputs * 16;
+-
+-   unsigned input_patch_size = tcs_num_input_vertices * input_vertex_size;
+-
+-   unsigned pervertex_output_patch_size = tcs_num_output_vertices * output_vertex_size;
+-   unsigned output_patch_size = pervertex_output_patch_size + tcs_num_patch_outputs * 16;
+-
+-   unsigned output_patch0_offset = input_patch_size * tcs_num_patches;
+-
+-   unsigned lds_size = output_patch0_offset + output_patch_size * tcs_num_patches;
+-
+-   if (gfx_level >= GFX7) {
+-      assert(lds_size <= 65536);
+-      lds_size = align(lds_size, 512) / 512;
+-   } else {
+-      assert(lds_size <= 32768);
+-      lds_size = align(lds_size, 256) / 256;
+-   }
+-
+-   return lds_size;
+-}
++uint32_t radv_get_tcs_num_patches(const struct radv_physical_device *pdev, uint32_t tcs_num_input_vertices,
++                                  uint32_t tcs_num_output_vertices, uint32_t tcs_num_inputs, uint32_t tcs_num_outputs,
++                                  uint32_t tcs_num_patch_outputs);
+ 
+-static inline unsigned
+-get_tcs_num_patches(unsigned tcs_num_input_vertices, unsigned tcs_num_output_vertices, unsigned tcs_num_inputs,
+-                    unsigned tcs_num_outputs, unsigned tcs_num_patch_outputs, unsigned tess_offchip_block_dw_size,
+-                    enum amd_gfx_level gfx_level, enum radeon_family family)
+-{
+-   uint32_t input_vertex_size = get_tcs_input_vertex_stride(tcs_num_inputs);
+-   uint32_t input_patch_size = tcs_num_input_vertices * input_vertex_size;
+-   uint32_t output_vertex_size = tcs_num_outputs * 16;
+-   uint32_t pervertex_output_patch_size = tcs_num_output_vertices * output_vertex_size;
+-   uint32_t output_patch_size = pervertex_output_patch_size + tcs_num_patch_outputs * 16;
+-
+-   /* Ensure that we only need one wave per SIMD so we don't need to check
+-    * resource usage. Also ensures that the number of tcs in and out
+-    * vertices per threadgroup are at most 256.
+-    */
+-   unsigned num_patches = 64 / MAX2(tcs_num_input_vertices, tcs_num_output_vertices) * 4;
+-   /* Make sure that the data fits in LDS. This assumes the shaders only
+-    * use LDS for the inputs and outputs.
+-    */
+-   unsigned hardware_lds_size = 32768;
+-
+-   /* Looks like STONEY hangs if we use more than 32 KiB LDS in a single
+-    * threadgroup, even though there is more than 32 KiB LDS.
+-    *
+-    * Test: dEQP-VK.tessellation.shader_input_output.barrier
+-    */
+-   if (gfx_level >= GFX7 && family != CHIP_STONEY)
+-      hardware_lds_size = 65536;
+-
+-   if (input_patch_size + output_patch_size)
+-      num_patches = MIN2(num_patches, hardware_lds_size / (input_patch_size + output_patch_size));
+-   /* Make sure the output data fits in the offchip buffer */
+-   if (output_patch_size)
+-      num_patches = MIN2(num_patches, (tess_offchip_block_dw_size * 4) / output_patch_size);
+-   /* Not necessary for correctness, but improves performance. The
+-    * specific value is taken from the proprietary driver.
+-    */
+-   num_patches = MIN2(num_patches, 40);
+-
+-   /* GFX6 bug workaround - limit LS-HS threadgroups to only one wave. */
+-   if (gfx_level == GFX6) {
+-      unsigned one_wave = 64 / MAX2(tcs_num_input_vertices, tcs_num_output_vertices);
+-      num_patches = MIN2(num_patches, one_wave);
+-   }
+-   return num_patches;
+-}
++uint32_t radv_get_tess_lds_size(const struct radv_physical_device *pdev, uint32_t tcs_num_input_vertices,
++                                uint32_t tcs_num_output_vertices, uint32_t tcs_num_inputs, uint32_t tcs_num_patches,
++                                uint32_t tcs_num_outputs, uint32_t tcs_num_patch_outputs);
+ 
+ void radv_lower_ngg(struct radv_device *device, struct radv_shader_stage *ngg_stage,
+                     const struct radv_graphics_state_key *gfx_state);
+diff --git a/src/amd/vulkan/radv_shader_info.c b/src/amd/vulkan/radv_shader_info.c
+index 26a48ad90c914..723c2a79a73bb 100644
+--- a/src/amd/vulkan/radv_shader_info.c
++++ b/src/amd/vulkan/radv_shader_info.c
+@@ -543,16 +543,14 @@ gather_shader_info_tcs(struct radv_device *device, const nir_shader *nir,
+ 
+    if (gfx_state->ts.patch_control_points) {
+       /* Number of tessellation patches per workgroup processed by the current pipeline. */
+-      info->num_tess_patches = get_tcs_num_patches(
+-         gfx_state->ts.patch_control_points, nir->info.tess.tcs_vertices_out, info->tcs.num_linked_inputs,
+-         info->tcs.num_lds_per_vertex_outputs, info->tcs.num_lds_per_patch_outputs, pdev->hs.tess_offchip_block_dw_size,
+-         pdev->info.gfx_level, pdev->info.family);
++      info->num_tess_patches = radv_get_tcs_num_patches(
++         pdev, gfx_state->ts.patch_control_points, nir->info.tess.tcs_vertices_out, info->tcs.num_linked_inputs,
++         info->tcs.num_lds_per_vertex_outputs, info->tcs.num_lds_per_patch_outputs);
+ 
+       /* LDS size used by VS+TCS for storing TCS inputs and outputs. */
+-      info->tcs.num_lds_blocks =
+-         calculate_tess_lds_size(pdev->info.gfx_level, gfx_state->ts.patch_control_points,
+-                                 nir->info.tess.tcs_vertices_out, info->tcs.num_linked_inputs, info->num_tess_patches,
+-                                 info->tcs.num_lds_per_vertex_outputs, info->tcs.num_lds_per_patch_outputs);
++      info->tcs.num_lds_blocks = radv_get_tess_lds_size(
++         pdev, gfx_state->ts.patch_control_points, nir->info.tess.tcs_vertices_out, info->tcs.num_linked_inputs,
++         info->num_tess_patches, info->tcs.num_lds_per_vertex_outputs, info->tcs.num_lds_per_patch_outputs);
+    }
+ }
+ 
+-- 
+GitLab
+
+
+From 91abe32b33c6c59435a734b4bba6c26942d291fb Mon Sep 17 00:00:00 2001
+From: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+Date: Mon, 8 Apr 2024 08:49:33 +0200
+Subject: [PATCH 3/3] ac: allow to use 64K of LDS for tessellation on GFX9+
+
+This is the hardware limit and it's supposed to be working. GFX7-8 also
+support 64KiB but Stoney used to hang in the past and using 32KiB was
+the only known solution.
+
+fossils-db (NAVI21):
+Totals from 336 (0.42% of 79395) affected shaders:
+MaxWaves: 6536 -> 6554 (+0.28%); split: +0.37%, -0.09%
+Instrs: 238382 -> 238636 (+0.11%); split: -0.05%, +0.15%
+CodeSize: 1287376 -> 1289240 (+0.14%); split: -0.04%, +0.18%
+VGPRs: 18096 -> 17944 (-0.84%); split: -0.97%, +0.13%
+LDS: 2912768 -> 4075008 (+39.90%)
+Latency: 2956640 -> 2953366 (-0.11%); split: -0.31%, +0.20%
+InvThroughput: 708979 -> 705851 (-0.44%); split: -0.47%, +0.03%
+VClause: 4491 -> 4541 (+1.11%); split: -0.24%, +1.36%
+SClause: 5406 -> 5412 (+0.11%); split: -0.31%, +0.43%
+Copies: 15217 -> 15237 (+0.13%); split: -0.47%, +0.60%
+PreVGPRs: 13739 -> 13742 (+0.02%); split: -0.03%, +0.05%
+VALU: 160384 -> 160643 (+0.16%); split: -0.04%, +0.20%
+SALU: 22330 -> 22319 (-0.05%)
+
+Signed-off-by: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+---
+ src/amd/common/ac_shader_util.c | 9 +++------
+ 1 file changed, 3 insertions(+), 6 deletions(-)
+
+diff --git a/src/amd/common/ac_shader_util.c b/src/amd/common/ac_shader_util.c
+index 9f27fbb9bc4b9..6f8a4ccae4fe2 100644
+--- a/src/amd/common/ac_shader_util.c
++++ b/src/amd/common/ac_shader_util.c
+@@ -1082,13 +1082,10 @@ uint32_t ac_compute_num_tess_patches(const struct radeon_info *info, uint32_t nu
+ 
+    /* Make sure that the data fits in LDS. This assumes the shaders only
+     * use LDS for the inputs and outputs.
+-    *
+-    * The maximum allowed LDS size is 32K. Higher numbers can hang.
+-    * Use 16K as the maximum, so that we can fit 2 workgroups on the same CU.
+     */
+    if (lds_per_patch) {
+-      ASSERTED const unsigned max_lds_size = 32 * 1024; /* hw limit */
+-      const unsigned target_lds_size = 16 * 1024; /* target at least 2 workgroups per CU, 16K each */
++      ASSERTED const unsigned max_lds_size = info->gfx_level >= GFX9 ? 64 * 1024 : 32 * 1024; /* hw limit */
++      const unsigned target_lds_size = max_lds_size / 2; /* target at least 2 workgroups per CU */
+       num_patches = MIN2(num_patches, target_lds_size / lds_per_patch);
+       assert(num_patches * lds_per_patch <= max_lds_size);
+    }
+@@ -1119,7 +1116,7 @@ ac_compute_tess_lds_size(const struct radeon_info *info, uint32_t lds_per_patch,
+ {
+    const unsigned lds_size = lds_per_patch * num_patches;
+ 
+-   assert(lds_size <= (info->gfx_level >= GFX7 ? 65536 : 32768));
++   assert(lds_size <= (info->gfx_level >= GFX9 ? 65536 : 32768));
+ 
+    return align(lds_size, info->lds_encode_granularity) / info->lds_encode_granularity;
+ }
+-- 
+GitLab
+
