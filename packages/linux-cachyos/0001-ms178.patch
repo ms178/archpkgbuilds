@@ -1,3 +1,1494 @@
+We observed that the overhead on trigger_load_balance(), now renamed
+sched_balance_trigger(), has risen with a system's core counts.
+
+For an OLTP workload running 6.8 kernel on a 2 socket x86 systems
+having 96 cores/socket, we saw that 0.7% cpu cycles are spent in
+trigger_load_balance(). On older systems with fewer cores/socket, this
+function's overhead was less than 0.1%.
+
+The cause of this overhead was that there are multiple cpus calling
+kick_ilb(flags), updating the balancing work needed to a common idle
+load balancer cpu. The ilb_cpu's flags field got updated unconditionally
+with atomic_fetch_or().  The atomic read and writes to ilb_cpu's flags
+causes much cache bouncing and cpu cycles overhead. This is seen in the
+annotated profile below.
+
+             kick_ilb():
+             if (ilb_cpu < 0)
+               test   %r14d,%r14d
+             ↑ js     6c
+             flags = atomic_fetch_or(flags, nohz_flags(ilb_cpu));
+               mov    $0x2d600,%rdi
+               movslq %r14d,%r8
+               mov    %rdi,%rdx
+               add    -0x7dd0c3e0(,%r8,8),%rdx
+             arch_atomic_read():
+  0.01         mov    0x64(%rdx),%esi
+ 35.58         add    $0x64,%rdx
+             arch_atomic_fetch_or():
+
+             static __always_inline int arch_atomic_fetch_or(int i, atomic_t *v)
+             {
+             int val = arch_atomic_read(v);
+
+             do { } while (!arch_atomic_try_cmpxchg(v, &val, val | i));
+  0.03  157:   mov    %r12d,%ecx
+             arch_atomic_try_cmpxchg():
+             return arch_try_cmpxchg(&v->counter, old, new);
+  0.00         mov    %esi,%eax
+             arch_atomic_fetch_or():
+             do { } while (!arch_atomic_try_cmpxchg(v, &val, val | i));
+               or     %esi,%ecx
+             arch_atomic_try_cmpxchg():
+             return arch_try_cmpxchg(&v->counter, old, new);
+  0.01         lock   cmpxchg %ecx,(%rdx)
+ 42.96       ↓ jne    2d2
+             kick_ilb():
+
+With instrumentation, we found that 81% of the updates do not result in
+any change in the ilb_cpu's flags.  That is, multiple cpus are asking
+the ilb_cpu to do the same things over and over again, before the ilb_cpu
+has a chance to run NOHZ load balance.
+
+Skip updates to ilb_cpu's flags if no new work needs to be done.
+Such updates do not change ilb_cpu's NOHZ flags.  This requires an extra
+atomic read but it is less expensive than frequent unnecessary atomic
+updates that generate cache bounces.
+
+We saw that on the OLTP workload, cpu cycles from trigger_load_balance()
+(or sched_balance_trigger()) got reduced from 0.7% to 0.2%.
+
+Signed-off-by: Tim Chen <tim.c.chen@xxxxxxxxxxxxxxx>
+---
+ kernel/sched/fair.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 8a5b1ae0aa55..9ab6dff6d8ac 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -11891,6 +11891,13 @@ static void kick_ilb(unsigned int flags)
+ 	if (ilb_cpu < 0)
+ 		return;
+
++	/*
++	 * Don't bother if no new NOHZ balance work items for ilb_cpu,
++	 * i.e. all bits in flags are already set in ilb_cpu.
++	 */
++	if ((atomic_read(nohz_flags(ilb_cpu)) & flags) == flags)
++		return;
++
+ 	/*
+ 	 * Access to rq::nohz_csd is serialized by NOHZ_KICK_MASK; he who sets
+ 	 * the first flag owns it; cleared by nohz_csd_func().
+--
+2.32.0
+
+We can skip children resources when the parent resource does not cover
+the range.
+
+This should help vmf_insert_* users on x86, such as several DRM drivers.
+On my AMD Ryzen 5 7520C, when streaming data from cpu memory into amdgpu
+bo, the throughput goes from 5.1GB/s to 6.6GB/s.  perf report says
+
+  34.69%--__do_fault
+  34.60%--amdgpu_gem_fault
+  34.00%--ttm_bo_vm_fault_reserved
+  32.95%--vmf_insert_pfn_prot
+  25.89%--track_pfn_insert
+  24.35%--lookup_memtype
+  21.77%--pat_pagerange_is_ram
+  20.80%--walk_system_ram_range
+  17.42%--find_next_iomem_res
+
+before this change, and
+
+  26.67%--__do_fault
+  26.57%--amdgpu_gem_fault
+  25.83%--ttm_bo_vm_fault_reserved
+  24.40%--vmf_insert_pfn_prot
+  14.30%--track_pfn_insert
+  12.20%--lookup_memtype
+  9.34%--pat_pagerange_is_ram
+  8.22%--walk_system_ram_range
+  5.09%--find_next_iomem_res
+
+after.
+
+Signed-off-by: Chia-I Wu <olvaffe at gmail.com>
+---
+ kernel/resource.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/resource.c b/kernel/resource.c
+index fcbca39dbc450..19b84b4f9a577 100644
+--- a/kernel/resource.c
++++ b/kernel/resource.c
+@@ -326,6 +326,7 @@ static int find_next_iomem_res(resource_size_t start, resource_size_t end,
+ 			       unsigned long flags, unsigned long desc,
+ 			       struct resource *res)
+ {
++	bool skip_children = false;
+ 	struct resource *p;
+
+ 	if (!res)
+@@ -336,7 +337,7 @@ static int find_next_iomem_res(resource_size_t start, resource_size_t end,
+
+ 	read_lock(&resource_lock);
+
+-	for_each_resource(&iomem_resource, p, false) {
++	for_each_resource(&iomem_resource, p, skip_children) {
+ 		/* If we passed the resource we are looking for, stop */
+ 		if (p->start > end) {
+ 			p = NULL;
+@@ -344,8 +345,11 @@ static int find_next_iomem_res(resource_size_t start, resource_size_t end,
+ 		}
+
+ 		/* Skip until we find a range that matches what we look for */
+-		if (p->end < start)
++		if (p->end < start) {
++			skip_children = true;
+ 			continue;
++		}
++		skip_children = false;
+
+ 		if ((p->flags & flags) != flags)
+ 			continue;
+--
+2.45.1.288.g0e0cd299f1-goog
+
+This patch implements the framework for PCIe TPH support. It introduces
+tph.c source file, along with CONFIG_PCIE_TPH, to Linux PCIe subsystem.
+A new member, named tph_cap, is also introduced in pci_dev to cache TPH
+capability offset.
+
+Co-developed-by: Eric Van Tassell <Eric.VanTassell@xxxxxxx>
+Signed-off-by: Eric Van Tassell <Eric.VanTassell@xxxxxxx>
+Signed-off-by: Wei Huang <wei.huang2@xxxxxxx>
+Reviewed-by: Ajit Khaparde <ajit.khaparde@xxxxxxxxxxxx>
+Reviewed-by: Somnath Kotur <somnath.kotur@xxxxxxxxxxxx>
+Reviewed-by: Andy Gospodarek <andrew.gospodarek@xxxxxxxxxxxx>
+---
+ drivers/pci/pci.h         |  6 ++++++
+ drivers/pci/pcie/Kconfig  | 10 ++++++++++
+ drivers/pci/pcie/Makefile |  1 +
+ drivers/pci/pcie/tph.c    | 28 ++++++++++++++++++++++++++++
+ drivers/pci/probe.c       |  1 +
+ include/linux/pci.h       |  4 ++++
+ 6 files changed, 50 insertions(+)
+ create mode 100644 drivers/pci/pcie/tph.c
+
+diff --git a/drivers/pci/pci.h b/drivers/pci/pci.h
+index fd44565c4756..b371b5b45f86 100644
+--- a/drivers/pci/pci.h
++++ b/drivers/pci/pci.h
+@@ -506,6 +506,12 @@ static inline int pci_iov_bus_range(struct pci_bus *bus)
+
+ #endif /* CONFIG_PCI_IOV */
+
++#ifdef CONFIG_PCIE_TPH
++void pcie_tph_init(struct pci_dev *dev);
++#else
++static inline void pcie_tph_init(struct pci_dev *dev) {}
++#endif
++
+ #ifdef CONFIG_PCIE_PTM
+ void pci_ptm_init(struct pci_dev *dev);
+ void pci_save_ptm_state(struct pci_dev *dev);
+diff --git a/drivers/pci/pcie/Kconfig b/drivers/pci/pcie/Kconfig
+index 17919b99fa66..d22857325b3e 100644
+--- a/drivers/pci/pcie/Kconfig
++++ b/drivers/pci/pcie/Kconfig
+@@ -155,3 +155,13 @@ config PCIE_EDR
+ 	  the PCI Firmware Specification r3.2.  Enable this if you want to
+ 	  support hybrid DPC model which uses both firmware and OS to
+ 	  implement DPC.
++
++config PCIE_TPH
++	bool "TLP Processing Hints"
++	default n
++	help
++	  This option adds support for PCIE TLP Processing Hints (TPH).
++	  TPH allows endpoint devices to provide optimization hints, such as
++	  desired caching behavior, for requests that target memory space.
++	  These hints, called steering tags, can empower the system hardware
++	  to optimize the utilization of platform resources.
+diff --git a/drivers/pci/pcie/Makefile b/drivers/pci/pcie/Makefile
+index 6461aa93fe76..3542b42ea0b9 100644
+--- a/drivers/pci/pcie/Makefile
++++ b/drivers/pci/pcie/Makefile
+@@ -13,3 +13,4 @@ obj-$(CONFIG_PCIE_PME)		+= pme.o
+ obj-$(CONFIG_PCIE_DPC)		+= dpc.o
+ obj-$(CONFIG_PCIE_PTM)		+= ptm.o
+ obj-$(CONFIG_PCIE_EDR)		+= edr.o
++obj-$(CONFIG_PCIE_TPH)		+= tph.o
+diff --git a/drivers/pci/pcie/tph.c b/drivers/pci/pcie/tph.c
+new file mode 100644
+index 000000000000..5f0cc06b74bb
+--- /dev/null
++++ b/drivers/pci/pcie/tph.c
+@@ -0,0 +1,28 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * TPH (TLP Processing Hints) support
++ *
++ * Copyright (C) 2024 Advanced Micro Devices, Inc.
++ *     Eric Van Tassell <Eric.VanTassell@xxxxxxx>
++ *     Wei Huang <wei.huang2@xxxxxxx>
++ */
++
++#define pr_fmt(fmt) "TPH: " fmt
++#define dev_fmt pr_fmt
++
++#include <linux/acpi.h>
++#include <uapi/linux/pci_regs.h>
++#include <linux/kernel.h>
++#include <linux/errno.h>
++#include <linux/msi.h>
++#include <linux/pci.h>
++#include <linux/msi.h>
++#include <linux/pci-acpi.h>
++
++#include "../pci.h"
++
++void pcie_tph_init(struct pci_dev *dev)
++{
++	dev->tph_cap = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_TPH);
++}
++
+diff --git a/drivers/pci/probe.c b/drivers/pci/probe.c
+index 15168881ec94..1f1ae55a5f83 100644
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@ -2484,6 +2484,7 @@ static void pci_init_capabilities(struct pci_dev *dev)
+ 	pci_dpc_init(dev);		/* Downstream Port Containment */
+ 	pci_rcec_init(dev);		/* Root Complex Event Collector */
+ 	pci_doe_init(dev);		/* Data Object Exchange */
++	pcie_tph_init(dev);             /* TLP Processing Hints */
+
+ 	pcie_report_downtraining(dev);
+ 	pci_init_reset_methods(dev);
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+index 5bece7fd11f8..d75a88ec5136 100644
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -530,6 +530,10 @@ struct pci_dev {
+
+ 	/* These methods index pci_reset_fn_methods[] */
+ 	u8 reset_methods[PCI_NUM_RESET_METHODS]; /* In priority order */
++
++#ifdef CONFIG_PCIE_TPH
++	u16 tph_cap; /* TPH capability offset */
++#endif
+ };
+
+ static inline struct pci_dev *pci_physfn(struct pci_dev *dev)
+--
+2.44.0
+
+Linux has some basic, but incomplete, definition for the TPH Requester
+capability registers. Also the control registers of TPH Requester and
+the TPH Completer are missing. This patch adds all required definitions
+to support TPH enablement.
+
+Co-developed-by: Eric Van Tassell <Eric.VanTassell@xxxxxxx>
+Signed-off-by: Eric Van Tassell <Eric.VanTassell@xxxxxxx>
+Signed-off-by: Wei Huang <wei.huang2@xxxxxxx>
+Reviewed-by: Ajit Khaparde <ajit.khaparde@xxxxxxxxxxxx>
+Reviewed-by: Somnath Kotur <somnath.kotur@xxxxxxxxxxxx>
+Reviewed-by: Andy Gospodarek <andrew.gospodarek@xxxxxxxxxxxx>
+---
+ drivers/vfio/pci/vfio_pci_config.c |  7 +++---
+ include/uapi/linux/pci_regs.h      | 35 ++++++++++++++++++++++++++----
+ 2 files changed, 35 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/vfio/pci/vfio_pci_config.c b/drivers/vfio/pci/vfio_pci_config.c
+index 97422aafaa7b..de622cdfc2a4 100644
+--- a/drivers/vfio/pci/vfio_pci_config.c
++++ b/drivers/vfio/pci/vfio_pci_config.c
+@@ -1434,14 +1434,15 @@ static int vfio_ext_cap_len(struct vfio_pci_core_device *vdev, u16 ecap, u16 epo
+ 		if (ret)
+ 			return pcibios_err_to_errno(ret);
+
+-		if ((dword & PCI_TPH_CAP_LOC_MASK) == PCI_TPH_LOC_CAP) {
++		if (((dword & PCI_TPH_CAP_LOC_MASK) >> PCI_TPH_CAP_LOC_SHIFT)
++			== PCI_TPH_LOC_CAP) {
+ 			int sts;
+
+ 			sts = dword & PCI_TPH_CAP_ST_MASK;
+ 			sts >>= PCI_TPH_CAP_ST_SHIFT;
+-			return PCI_TPH_BASE_SIZEOF + (sts * 2) + 2;
++			return PCI_TPH_ST_TABLE + (sts * 2) + 2;
+ 		}
+-		return PCI_TPH_BASE_SIZEOF;
++		return PCI_TPH_ST_TABLE;
+ 	case PCI_EXT_CAP_ID_DVSEC:
+ 		ret = pci_read_config_dword(pdev, epos + PCI_DVSEC_HEADER1, &dword);
+ 		if (ret)
+diff --git a/include/uapi/linux/pci_regs.h b/include/uapi/linux/pci_regs.h
+index 94c00996e633..ae1cf048b04a 100644
+--- a/include/uapi/linux/pci_regs.h
++++ b/include/uapi/linux/pci_regs.h
+@@ -657,6 +657,7 @@
+ #define  PCI_EXP_DEVCAP2_ATOMIC_COMP64	0x00000100 /* 64b AtomicOp completion */
+ #define  PCI_EXP_DEVCAP2_ATOMIC_COMP128	0x00000200 /* 128b AtomicOp completion */
+ #define  PCI_EXP_DEVCAP2_LTR		0x00000800 /* Latency tolerance reporting */
++#define  PCI_EXP_DEVCAP2_TPH_COMP	0x00003000 /* TPH completer support */
+ #define  PCI_EXP_DEVCAP2_OBFF_MASK	0x000c0000 /* OBFF support mechanism */
+ #define  PCI_EXP_DEVCAP2_OBFF_MSG	0x00040000 /* New message signaling */
+ #define  PCI_EXP_DEVCAP2_OBFF_WAKE	0x00080000 /* Re-use WAKE# for OBFF */
+@@ -1020,15 +1021,41 @@
+ #define  PCI_DPA_CAP_SUBSTATE_MASK	0x1F	/* # substates - 1 */
+ #define PCI_DPA_BASE_SIZEOF	16	/* size with 0 substates */
+
++/* TPH Completer Support */
++#define PCI_EXP_DEVCAP2_TPH_COMP_SHIFT		12
++#define PCI_EXP_DEVCAP2_TPH_COMP_NONE		0x0 /* None */
++#define PCI_EXP_DEVCAP2_TPH_COMP_TPH_ONLY	0x1 /* TPH only */
++#define PCI_EXP_DEVCAP2_TPH_COMP_TPH_AND_EXT	0x3 /* TPH and Extended TPH */
++
+ /* TPH Requester */
+ #define PCI_TPH_CAP		4	/* capability register */
++#define  PCI_TPH_CAP_NO_ST	0x1	/* no ST mode supported */
++#define  PCI_TPH_CAP_NO_ST_SHIFT	0x0	/* no ST mode supported shift */
++#define  PCI_TPH_CAP_INT_VEC	0x2	/* interrupt vector mode supported */
++#define  PCI_TPH_CAP_INT_VEC_SHIFT	0x1	/* interrupt vector mode supported shift */
++#define  PCI_TPH_CAP_DS		0x4	/* device specific mode supported */
++#define  PCI_TPH_CAP_DS_SHIFT	0x4	/* device specific mode supported shift */
+ #define  PCI_TPH_CAP_LOC_MASK	0x600	/* location mask */
+-#define   PCI_TPH_LOC_NONE	0x000	/* no location */
+-#define   PCI_TPH_LOC_CAP	0x200	/* in capability */
+-#define   PCI_TPH_LOC_MSIX	0x400	/* in MSI-X */
++#define  PCI_TPH_CAP_LOC_SHIFT	9	/* location shift */
++#define   PCI_TPH_LOC_NONE	0x0	/*  no ST Table */
++#define   PCI_TPH_LOC_CAP	0x1	/*  ST Table in extended capability */
++#define   PCI_TPH_LOC_MSIX	0x2	/*  ST table in MSI-X table */
+ #define PCI_TPH_CAP_ST_MASK	0x07FF0000	/* ST table mask */
+ #define PCI_TPH_CAP_ST_SHIFT	16	/* ST table shift */
+-#define PCI_TPH_BASE_SIZEOF	0xc	/* size with no ST table */
++
++#define PCI_TPH_CTRL		0x8	/* control register */
++#define  PCI_TPH_CTRL_MODE_SEL_MASK	0x7	/* ST Model Select mask */
++#define  PCI_TPH_CTRL_MODE_SEL_SHIFT	0x0	/* ST Model Select shift */
++#define   PCI_TPH_NO_ST_MODE		0x0	/*  No ST Mode */
++#define   PCI_TPH_INT_VEC_MODE		0x1	/*  Interrupt Vector Mode */
++#define   PCI_TPH_DEV_SPEC_MODE		0x2	/*  Device Specific Mode */
++#define  PCI_TPH_CTRL_REQ_EN_MASK	0x300	/* TPH Requester mask */
++#define  PCI_TPH_CTRL_REQ_EN_SHIFT	8	/* TPH Requester shift */
++#define   PCI_TPH_REQ_DISABLE		0x0	/*  No TPH request allowed */
++#define   PCI_TPH_REQ_TPH_ONLY		0x1	/*  8-bit TPH tags allowed */
++#define   PCI_TPH_REQ_EXT_TPH		0x3	/*  16-bit TPH tags allowed */
++
++#define PCI_TPH_ST_TABLE	0xc	/* base of ST table */
+
+ /* Downstream Port Containment */
+ #define PCI_EXP_DPC_CAP			0x04	/* DPC Capability */
+--
+2.44.0
+
+Provide a kernel option, with related helper functions, to completely
+disable TPH so that no TPH headers are generated.
+
+Co-developed-by: Eric Van Tassell <Eric.VanTassell@xxxxxxx>
+Signed-off-by: Eric Van Tassell <Eric.VanTassell@xxxxxxx>
+Signed-off-by: Wei Huang <wei.huang2@xxxxxxx>
+Reviewed-by: Ajit Khaparde <ajit.khaparde@xxxxxxxxxxxx>
+Reviewed-by: Somnath Kotur <somnath.kotur@xxxxxxxxxxxx>
+Reviewed-by: Andy Gospodarek <andrew.gospodarek@xxxxxxxxxxxx>
+---
+ .../admin-guide/kernel-parameters.txt         |  1 +
+ drivers/pci/pci-driver.c                      |  7 ++++-
+ drivers/pci/pci.c                             | 12 ++++++++
+ drivers/pci/pcie/tph.c                        | 30 +++++++++++++++++++
+ include/linux/pci-tph.h                       | 19 ++++++++++++
+ include/linux/pci.h                           |  1 +
+ 6 files changed, 69 insertions(+), 1 deletion(-)
+ create mode 100644 include/linux/pci-tph.h
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 500cfa776225..fedcc69e35c1 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -4623,6 +4623,7 @@
+ 		nomio		[S390] Do not use MIO instructions.
+ 		norid		[S390] ignore the RID field and force use of
+ 				one PCI domain per PCI function
++		notph		[PCIE] Do not use PCIe TPH
+
+ 	pcie_aspm=	[PCIE] Forcibly enable or ignore PCIe Active State Power
+ 			Management.
+diff --git a/drivers/pci/pci-driver.c b/drivers/pci/pci-driver.c
+index af2996d0d17f..9722d070c0ca 100644
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -21,6 +21,7 @@
+ #include <linux/acpi.h>
+ #include <linux/dma-map-ops.h>
+ #include <linux/iommu.h>
++#include <linux/pci-tph.h>
+ #include "pci.h"
+ #include "pcie/portdrv.h"
+
+@@ -322,8 +323,12 @@ static long local_pci_probe(void *_ddi)
+ 	pm_runtime_get_sync(dev);
+ 	pci_dev->driver = pci_drv;
+ 	rc = pci_drv->probe(pci_dev, ddi->id);
+-	if (!rc)
++	if (!rc) {
++		if (pci_tph_disabled())
++			pcie_tph_disable(pci_dev);
++
+ 		return rc;
++	}
+ 	if (rc < 0) {
+ 		pci_dev->driver = NULL;
+ 		pm_runtime_put_sync(dev);
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+index 59e0949fb079..31c443504ce9 100644
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -157,6 +157,9 @@ static bool pcie_ari_disabled;
+ /* If set, the PCIe ATS capability will not be used. */
+ static bool pcie_ats_disabled;
+
++/* If set, the PCIe TPH capability will not be used. */
++static bool pcie_tph_disabled;
++
+ /* If set, the PCI config space of each device is printed during boot. */
+ bool pci_early_dump;
+
+@@ -166,6 +169,12 @@ bool pci_ats_disabled(void)
+ }
+ EXPORT_SYMBOL_GPL(pci_ats_disabled);
+
++bool pci_tph_disabled(void)
++{
++	return pcie_tph_disabled;
++}
++EXPORT_SYMBOL_GPL(pci_tph_disabled);
++
+ /* Disable bridge_d3 for all PCIe ports */
+ static bool pci_bridge_d3_disable;
+ /* Force bridge_d3 for all PCIe ports */
+@@ -6806,6 +6815,9 @@ static int __init pci_setup(char *str)
+ 				pci_no_domains();
+ 			} else if (!strncmp(str, "noari", 5)) {
+ 				pcie_ari_disabled = true;
++			} else if (!strcmp(str, "notph")) {
++				pr_info("PCIe: TPH is disabled\n");
++				pcie_tph_disabled = true;
+ 			} else if (!strncmp(str, "cbiosize=", 9)) {
+ 				pci_cardbus_io_size = memparse(str + 9, &str);
+ 			} else if (!strncmp(str, "cbmemsize=", 10)) {
+diff --git a/drivers/pci/pcie/tph.c b/drivers/pci/pcie/tph.c
+index 5f0cc06b74bb..5dc533b89a33 100644
+--- a/drivers/pci/pcie/tph.c
++++ b/drivers/pci/pcie/tph.c
+@@ -16,11 +16,41 @@
+ #include <linux/errno.h>
+ #include <linux/msi.h>
+ #include <linux/pci.h>
++#include <linux/pci-tph.h>
+ #include <linux/msi.h>
+ #include <linux/pci-acpi.h>
+
+ #include "../pci.h"
+
++static int tph_set_reg_field_u32(struct pci_dev *dev, u8 offset, u32 mask,
++				 u8 shift, u32 field)
++{
++	u32 reg_val;
++	int ret;
++
++	if (!dev->tph_cap)
++		return -EINVAL;
++
++	ret = pci_read_config_dword(dev, dev->tph_cap + offset, &reg_val);
++	if (ret)
++		return ret;
++
++	reg_val &= ~mask;
++	reg_val |= (field << shift) & mask;
++
++	ret = pci_write_config_dword(dev, dev->tph_cap + offset, reg_val);
++
++	return ret;
++}
++
++int pcie_tph_disable(struct pci_dev *dev)
++{
++	return  tph_set_reg_field_u32(dev, PCI_TPH_CTRL,
++				      PCI_TPH_CTRL_REQ_EN_MASK,
++				      PCI_TPH_CTRL_REQ_EN_SHIFT,
++				      PCI_TPH_REQ_DISABLE);
++}
++
+ void pcie_tph_init(struct pci_dev *dev)
+ {
+ 	dev->tph_cap = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_TPH);
+diff --git a/include/linux/pci-tph.h b/include/linux/pci-tph.h
+new file mode 100644
+index 000000000000..e187d7e89e8c
+--- /dev/null
++++ b/include/linux/pci-tph.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * TPH (TLP Processing Hints)
++ *
++ * Copyright (C) 2024 Advanced Micro Devices, Inc.
++ *     Eric Van Tassell <Eric.VanTassell@xxxxxxx>
++ *     Wei Huang <wei.huang2@xxxxxxx>
++ */
++#ifndef LINUX_PCI_TPH_H
++#define LINUX_PCI_TPH_H
++
++#ifdef CONFIG_PCIE_TPH
++int pcie_tph_disable(struct pci_dev *dev);
++#else
++static inline int pcie_tph_disable(struct pci_dev *dev)
++{ return -EOPNOTSUPP; }
++#endif
++
++#endif /* LINUX_PCI_TPH_H */
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+index d75a88ec5136..d88ebe87815a 100644
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -1841,6 +1841,7 @@ static inline bool pci_aer_available(void) { return false; }
+ #endif
+
+ bool pci_ats_disabled(void);
++bool pci_tph_disabled(void);
+
+ #ifdef CONFIG_PCIE_PTM
+ int pci_enable_ptm(struct pci_dev *dev, u8 *granularity);
+--
+2.44.0
+
+When "No ST mode" is enabled, end-point devices can generate TPH headers
+but with all steering tags treated as zero. A steering tag of zero is
+interpreted as "using the default policy" by the root complex. This is
+essential to quantify the benefit of steering tags for some given
+workloads.
+
+Co-developed-by: Eric Van Tassell <Eric.VanTassell@xxxxxxx>
+Signed-off-by: Eric Van Tassell <Eric.VanTassell@xxxxxxx>
+Signed-off-by: Wei Huang <wei.huang2@xxxxxxx>
+Reviewed-by: Ajit Khaparde <ajit.khaparde@xxxxxxxxxxxx>
+Reviewed-by: Somnath Kotur <somnath.kotur@xxxxxxxxxxxx>
+Reviewed-by: Andy Gospodarek <andrew.gospodarek@xxxxxxxxxxxx>
+---
+ .../admin-guide/kernel-parameters.txt         |  1 +
+ drivers/pci/pci-driver.c                      |  7 ++++++-
+ drivers/pci/pci.c                             | 12 +++++++++++
+ drivers/pci/pcie/tph.c                        | 21 +++++++++++++++++++
+ include/linux/pci-tph.h                       |  3 +++
+ include/linux/pci.h                           |  1 +
+ 6 files changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index fedcc69e35c1..e97a4a239563 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -4624,6 +4624,7 @@
+ 		norid		[S390] ignore the RID field and force use of
+ 				one PCI domain per PCI function
+ 		notph		[PCIE] Do not use PCIe TPH
++		nostmode	[PCIE] Force TPH to use No ST Mode
+
+ 	pcie_aspm=	[PCIE] Forcibly enable or ignore PCIe Active State Power
+ 			Management.
+diff --git a/drivers/pci/pci-driver.c b/drivers/pci/pci-driver.c
+index 9722d070c0ca..aa98843d9884 100644
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -324,8 +324,13 @@ static long local_pci_probe(void *_ddi)
+ 	pci_dev->driver = pci_drv;
+ 	rc = pci_drv->probe(pci_dev, ddi->id);
+ 	if (!rc) {
+-		if (pci_tph_disabled())
++		if (pci_tph_disabled()) {
+ 			pcie_tph_disable(pci_dev);
++			return rc;
++		}
++
++		if (pci_tph_nostmode())
++			tph_set_dev_nostmode(pci_dev);
+
+ 		return rc;
+ 	}
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+index 31c443504ce9..f3558a551bf2 100644
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -160,6 +160,9 @@ static bool pcie_ats_disabled;
+ /* If set, the PCIe TPH capability will not be used. */
+ static bool pcie_tph_disabled;
+
++/* If TPH is enabled, "No ST Mode" will be enforced. */
++static bool pcie_tph_nostmode;
++
+ /* If set, the PCI config space of each device is printed during boot. */
+ bool pci_early_dump;
+
+@@ -175,6 +178,12 @@ bool pci_tph_disabled(void)
+ }
+ EXPORT_SYMBOL_GPL(pci_tph_disabled);
+
++bool pci_tph_nostmode(void)
++{
++	return pcie_tph_nostmode;
++}
++EXPORT_SYMBOL_GPL(pci_tph_nostmode);
++
+ /* Disable bridge_d3 for all PCIe ports */
+ static bool pci_bridge_d3_disable;
+ /* Force bridge_d3 for all PCIe ports */
+@@ -6818,6 +6827,9 @@ static int __init pci_setup(char *str)
+ 			} else if (!strcmp(str, "notph")) {
+ 				pr_info("PCIe: TPH is disabled\n");
+ 				pcie_tph_disabled = true;
++			} else if (!strcmp(str, "nostmode")) {
++				pr_info("PCIe: TPH No ST Mode is enabled\n");
++				pcie_tph_nostmode = true;
+ 			} else if (!strncmp(str, "cbiosize=", 9)) {
+ 				pci_cardbus_io_size = memparse(str + 9, &str);
+ 			} else if (!strncmp(str, "cbmemsize=", 10)) {
+diff --git a/drivers/pci/pcie/tph.c b/drivers/pci/pcie/tph.c
+index 5dc533b89a33..d5f7309fdf52 100644
+--- a/drivers/pci/pcie/tph.c
++++ b/drivers/pci/pcie/tph.c
+@@ -43,6 +43,27 @@ static int tph_set_reg_field_u32(struct pci_dev *dev, u8 offset, u32 mask,
+ 	return ret;
+ }
+
++int tph_set_dev_nostmode(struct pci_dev *dev)
++{
++	int ret;
++
++	/* set ST Mode Select to "No ST Mode" */
++	ret = tph_set_reg_field_u32(dev, PCI_TPH_CTRL,
++				    PCI_TPH_CTRL_MODE_SEL_MASK,
++				    PCI_TPH_CTRL_MODE_SEL_SHIFT,
++				    PCI_TPH_NO_ST_MODE);
++	if (ret)
++		return ret;
++
++	/* set "TPH Requester Enable" to "TPH only" */
++	ret = tph_set_reg_field_u32(dev, PCI_TPH_CTRL,
++				    PCI_TPH_CTRL_REQ_EN_MASK,
++				    PCI_TPH_CTRL_REQ_EN_SHIFT,
++				    PCI_TPH_REQ_TPH_ONLY);
++
++	return ret;
++}
++
+ int pcie_tph_disable(struct pci_dev *dev)
+ {
+ 	return  tph_set_reg_field_u32(dev, PCI_TPH_CTRL,
+diff --git a/include/linux/pci-tph.h b/include/linux/pci-tph.h
+index e187d7e89e8c..95269afc8b7d 100644
+--- a/include/linux/pci-tph.h
++++ b/include/linux/pci-tph.h
+@@ -11,9 +11,12 @@
+
+ #ifdef CONFIG_PCIE_TPH
+ int pcie_tph_disable(struct pci_dev *dev);
++int tph_set_dev_nostmode(struct pci_dev *dev);
+ #else
+ static inline int pcie_tph_disable(struct pci_dev *dev)
+ { return -EOPNOTSUPP; }
++static inline int tph_set_dev_nostmode(struct pci_dev *dev)
++{ return -EOPNOTSUPP; }
+ #endif
+
+ #endif /* LINUX_PCI_TPH_H */
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+index d88ebe87815a..5f520624d133 100644
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -1842,6 +1842,7 @@ static inline bool pci_aer_available(void) { return false; }
+
+ bool pci_ats_disabled(void);
+ bool pci_tph_disabled(void);
++bool pci_tph_nostmode(void);
+
+ #ifdef CONFIG_PCIE_PTM
+ int pci_enable_ptm(struct pci_dev *dev, u8 *granularity);
+--
+2.44.0
+
+This patch introduces three API functions, pcie_tph_intr_vec_supported(),
+pcie_tph_get_st() and pcie_tph_set_st(), for a driver to query, retrieve
+or configure device's steering tags. There are two possible locations for
+steering tag table and the code automatically figure out the right
+location to set the tags if pcie_tph_set_st() is called. Note the tag
+value is always zero currently and will be extended in the follow-up
+patches.
+
+Co-developed-by: Eric Van Tassell <Eric.VanTassell@xxxxxxx>
+Signed-off-by: Eric Van Tassell <Eric.VanTassell@xxxxxxx>
+Signed-off-by: Wei Huang <wei.huang2@xxxxxxx>
+Reviewed-by: Ajit Khaparde <ajit.khaparde@xxxxxxxxxxxx>
+Reviewed-by: Somnath Kotur <somnath.kotur@xxxxxxxxxxxx>
+Reviewed-by: Andy Gospodarek <andrew.gospodarek@xxxxxxxxxxxx>
+---
+ drivers/pci/pcie/tph.c  | 402 ++++++++++++++++++++++++++++++++++++++++
+ include/linux/pci-tph.h |  22 +++
+ 2 files changed, 424 insertions(+)
+
+diff --git a/drivers/pci/pcie/tph.c b/drivers/pci/pcie/tph.c
+index d5f7309fdf52..320b99c60365 100644
+--- a/drivers/pci/pcie/tph.c
++++ b/drivers/pci/pcie/tph.c
+@@ -43,6 +43,336 @@ static int tph_set_reg_field_u32(struct pci_dev *dev, u8 offset, u32 mask,
+ 	return ret;
+ }
+
++static int tph_get_reg_field_u32(struct pci_dev *dev, u8 offset, u32 mask,
++				 u8 shift, u32 *field)
++{
++	u32 reg_val;
++	int ret;
++
++	if (!dev->tph_cap)
++		return -EINVAL;
++
++	ret = pci_read_config_dword(dev, dev->tph_cap + offset, &reg_val);
++	if (ret)
++		return ret;
++
++	*field = (reg_val & mask) >> shift;
++
++	return 0;
++}
++
++static int tph_get_table_size(struct pci_dev *dev, u16 *size_out)
++{
++	int ret;
++	u32 tmp;
++
++	ret = tph_get_reg_field_u32(dev, PCI_TPH_CAP,
++				    PCI_TPH_CAP_ST_MASK,
++				    PCI_TPH_CAP_ST_SHIFT, &tmp);
++
++	if (ret)
++		return ret;
++
++	*size_out = (u16)tmp;
++
++	return 0;
++}
++
++/*
++ * For a given device, return a pointer to the MSI table entry at msi_index.
++ */
++static void __iomem *tph_msix_table_entry(struct pci_dev *dev,
++					  u16 msi_index)
++{
++	void __iomem *entry;
++	u16 tbl_sz;
++	int ret;
++
++	ret = tph_get_table_size(dev, &tbl_sz);
++	if (ret || msi_index > tbl_sz)
++		return NULL;
++
++	entry = dev->msix_base + msi_index * PCI_MSIX_ENTRY_SIZE;
++
++	return entry;
++}
++
++/*
++ * For a given device, return a pointer to the vector control register at
++ * offset 0xc of MSI table entry at msi_index.
++ */
++static void __iomem *tph_msix_vector_control(struct pci_dev *dev,
++					     u16 msi_index)
++{
++	void __iomem *vec_ctrl_addr = tph_msix_table_entry(dev, msi_index);
++
++	if (vec_ctrl_addr)
++		vec_ctrl_addr += PCI_MSIX_ENTRY_VECTOR_CTRL;
++
++	return vec_ctrl_addr;
++}
++
++/*
++ * Translate from MSI-X interrupt index to struct msi_desc *
++ */
++static struct msi_desc *tph_msix_index_to_desc(struct pci_dev *dev, int index)
++{
++	struct msi_desc *entry;
++
++	msi_lock_descs(&dev->dev);
++	msi_for_each_desc(entry, &dev->dev, MSI_DESC_ASSOCIATED) {
++		if (entry->msi_index == index)
++			return entry;
++	}
++	msi_unlock_descs(&dev->dev);
++
++	return NULL;
++}
++
++static bool tph_int_vec_mode_supported(struct pci_dev *dev)
++{
++	u32 mode = 0;
++	int ret;
++
++	ret = tph_get_reg_field_u32(dev, PCI_TPH_CAP,
++				    PCI_TPH_CAP_INT_VEC,
++				    PCI_TPH_CAP_INT_VEC_SHIFT, &mode);
++	if (ret)
++		return false;
++
++	return !!mode;
++}
++
++static int tph_get_table_location(struct pci_dev *dev, u8 *loc_out)
++{
++	u32 loc;
++	int ret;
++
++	ret = tph_get_reg_field_u32(dev, PCI_TPH_CAP, PCI_TPH_CAP_LOC_MASK,
++				    PCI_TPH_CAP_LOC_SHIFT, &loc);
++	if (ret)
++		return ret;
++
++	*loc_out = (u8)loc;
++
++	return 0;
++}
++
++static bool msix_nr_in_bounds(struct pci_dev *dev, int msix_nr)
++{
++	u16 tbl_sz;
++
++	if (tph_get_table_size(dev, &tbl_sz))
++		return false;
++
++	return msix_nr <= tbl_sz;
++}
++
++/* Return root port capability - 0 means none */
++static int get_root_port_completer_cap(struct pci_dev *dev)
++{
++	struct pci_dev *rp;
++	int ret;
++	int val;
++
++	rp = pcie_find_root_port(dev);
++	if (!rp) {
++		pr_err("cannot find root port of %s\n", dev_name(&dev->dev));
++		return 0;
++	}
++
++	ret = pcie_capability_read_dword(rp, PCI_EXP_DEVCAP2, &val);
++	if (ret) {
++		pr_err("cannot read device capabilities 2 of %s\n",
++		       dev_name(&dev->dev));
++		return 0;
++	}
++
++	val &= PCI_EXP_DEVCAP2_TPH_COMP;
++
++	return val >> PCI_EXP_DEVCAP2_TPH_COMP_SHIFT;
++}
++
++/*
++ * TPH device needs to be below a rootport with the TPH Completer and
++ * the completer must offer a compatible level of completer support to that
++ * requested by the device driver.
++ */
++static bool completer_support_ok(struct pci_dev *dev, u8 req)
++{
++	int rp_cap;
++
++	rp_cap = get_root_port_completer_cap(dev);
++
++	if (req > rp_cap) {
++		pr_err("root port lacks proper TPH completer capability\n");
++		return false;
++	}
++
++	return true;
++}
++
++/*
++ * The PCI Specification version 5.0 requires the "No ST Mode" mode
++ * be supported by any compatible device.
++ */
++static bool no_st_mode_supported(struct pci_dev *dev)
++{
++	bool no_st;
++	int ret;
++	u32 tmp;
++
++	ret = tph_get_reg_field_u32(dev, PCI_TPH_CAP, PCI_TPH_CAP_NO_ST,
++				    PCI_TPH_CAP_NO_ST_SHIFT, &tmp);
++	if (ret)
++		return false;
++
++	no_st = !!tmp;
++
++	if (!no_st) {
++		pr_err("TPH devices must support no ST mode\n");
++		return false;
++	}
++
++	return true;
++}
++
++static int tph_write_ctrl_reg(struct pci_dev *dev, u32 value)
++{
++	int ret;
++
++	ret = tph_set_reg_field_u32(dev, PCI_TPH_CTRL, ~0L, 0, value);
++
++	if (ret)
++		goto err_out;
++
++	return 0;
++
++err_out:
++	/* minimizing possible harm by disabling TPH */
++	pcie_tph_disable(dev);
++	return ret;
++}
++
++/* Update the ST Mode Select field of the TPH Control Register */
++static int tph_set_ctrl_reg_mode_sel(struct pci_dev *dev, u8 st_mode)
++{
++	int ret;
++	u32 ctrl_reg;
++
++	ret = tph_get_reg_field_u32(dev, PCI_TPH_CTRL, ~0L, 0, &ctrl_reg);
++	if (ret)
++		return ret;
++
++	/* clear the mode select and enable fields */
++	ctrl_reg &= ~(PCI_TPH_CTRL_MODE_SEL_MASK);
++	ctrl_reg |= ((u32)(st_mode << PCI_TPH_CTRL_MODE_SEL_SHIFT) &
++		     PCI_TPH_CTRL_MODE_SEL_MASK);
++
++	ret = tph_write_ctrl_reg(dev, ctrl_reg);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++/* Write the steering tag to MSI-X vector control register */
++static void tph_write_tag_to_msix(struct pci_dev *dev, int msix_nr, u16 tag)
++{
++	u32 val;
++	void __iomem *vec_ctrl;
++	struct msi_desc *msi_desc;
++
++	msi_desc = tph_msix_index_to_desc(dev, msix_nr);
++	if (!msi_desc) {
++		pr_err("MSI-X descriptor for #%d not found\n", msix_nr);
++		return;
++	}
++
++	vec_ctrl = tph_msix_vector_control(dev, msi_desc->msi_index);
++
++	val = readl(vec_ctrl);
++	val &= 0xffff;
++	val |= (tag << 16);
++	writel(val, vec_ctrl);
++
++	/* read back to flush the update */
++	val = readl(vec_ctrl);
++	msi_unlock_descs(&dev->dev);
++}
++
++/* Update the TPH Requester Enable field of the TPH Control Register */
++static int tph_set_ctrl_reg_en(struct pci_dev *dev, u8 req_type)
++{
++	int ret;
++	u32 ctrl_reg;
++
++	ret = tph_get_reg_field_u32(dev, PCI_TPH_CTRL, ~0L, 0,
++				    &ctrl_reg);
++	if (ret)
++		return ret;
++
++	/* clear the mode select and enable fields and set new values*/
++	ctrl_reg &= ~(PCI_TPH_CTRL_REQ_EN_MASK);
++	ctrl_reg |= (((u32)req_type << PCI_TPH_CTRL_REQ_EN_SHIFT) &
++			PCI_TPH_CTRL_REQ_EN_MASK);
++
++	ret = tph_write_ctrl_reg(dev, ctrl_reg);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static bool pcie_tph_write_st(struct pci_dev *dev, unsigned int msix_nr,
++			      u8 req_type, u16 tag)
++{
++	int offset;
++	u8  loc;
++	int ret;
++
++	/* setting ST isn't needed - not an error, just return true */
++	if (!dev->tph_cap || pci_tph_disabled() || pci_tph_nostmode() ||
++	    !dev->msix_enabled || !tph_int_vec_mode_supported(dev))
++		return true;
++
++	/* setting ST is incorrect in the following cases - return error */
++	if (!no_st_mode_supported(dev) || !msix_nr_in_bounds(dev, msix_nr) ||
++	    !completer_support_ok(dev, req_type))
++		return false;
++
++	/*
++	 * disable TPH before updating the tag to avoid potential instability
++	 * as cautioned about in the "ST Table Programming" of PCI-E spec
++	 */
++	pcie_tph_disable(dev);
++
++	ret = tph_get_table_location(dev, &loc);
++	if (ret)
++		return false;
++
++	switch (loc) {
++	case PCI_TPH_LOC_MSIX:
++		tph_write_tag_to_msix(dev, msix_nr, tag);
++		break;
++	case PCI_TPH_LOC_CAP:
++		offset = dev->tph_cap + PCI_TPH_ST_TABLE
++			  + msix_nr * sizeof(u16);
++		pci_write_config_word(dev, offset, tag);
++		break;
++	default:
++		pr_err("unable to write steering tag for device %s\n",
++		       dev_name(&dev->dev));
++		return false;
++	}
++
++	/* select interrupt vector mode */
++	tph_set_ctrl_reg_mode_sel(dev, PCI_TPH_INT_VEC_MODE);
++	tph_set_ctrl_reg_en(dev, req_type);
++
++	return true;
++}
++
+ int tph_set_dev_nostmode(struct pci_dev *dev)
+ {
+ 	int ret;
+@@ -77,3 +407,75 @@ void pcie_tph_init(struct pci_dev *dev)
+ 	dev->tph_cap = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_TPH);
+ }
+
++/**
++ * pcie_tph_intr_vec_supported() - Check if interrupt vector mode supported for dev
++ * @dev: pci device
++ *
++ * Return:
++ *        true : intr vector mode supported
++ *        false: intr vector mode not supported
++ */
++bool pcie_tph_intr_vec_supported(struct pci_dev *dev)
++{
++	if (!dev->tph_cap || pci_tph_disabled() || !dev->msix_enabled ||
++	    !tph_int_vec_mode_supported(dev))
++		return false;
++
++	return true;
++}
++EXPORT_SYMBOL(pcie_tph_intr_vec_supported);
++
++/**
++ * pcie_tph_get_st() - Retrieve steering tag for a specific CPU
++ * @dev: pci device
++ * @cpu: the acpi cpu_uid.
++ * @mem_type: memory type (vram, nvram)
++ * @req_type: request type (disable, tph, extended tph)
++ * @tag: steering tag return value
++ *
++ * Return:
++ *        true : success
++ *        false: failed
++ */
++bool pcie_tph_get_st(struct pci_dev *dev, unsigned int cpu,
++		    enum tph_mem_type mem_type, u8 req_type,
++		    u16 *tag)
++{
++	*tag = 0;
++
++	return true;
++}
++EXPORT_SYMBOL(pcie_tph_get_st);
++
++/**
++ * pcie_tph_set_st() - Set steering tag in ST table entry
++ * @dev: pci device
++ * @msix_nr: ordinal number of msix interrupt.
++ * @cpu: the acpi cpu_uid.
++ * @mem_type: memory type (vram, nvram)
++ * @req_type: request type (disable, tph, extended tph)
++ *
++ * Return:
++ *        true : success
++ *        false: failed
++ */
++bool pcie_tph_set_st(struct pci_dev *dev, unsigned int msix_nr,
++		     unsigned int cpu, enum tph_mem_type mem_type,
++		     u8 req_type)
++{
++	u16 tag;
++	bool ret = true;
++
++	ret = pcie_tph_get_st(dev, cpu, mem_type, req_type, &tag);
++
++	if (!ret)
++		return false;
++
++	pr_debug("%s: writing tag %d for msi-x intr %d (cpu: %d)\n",
++		 __func__, tag, msix_nr, cpu);
++
++	ret = pcie_tph_write_st(dev, msix_nr, req_type, tag);
++
++	return ret;
++}
++EXPORT_SYMBOL(pcie_tph_set_st);
+diff --git a/include/linux/pci-tph.h b/include/linux/pci-tph.h
+index 95269afc8b7d..4fbd1e2fd98c 100644
+--- a/include/linux/pci-tph.h
++++ b/include/linux/pci-tph.h
+@@ -9,14 +9,36 @@
+ #ifndef LINUX_PCI_TPH_H
+ #define LINUX_PCI_TPH_H
+
++enum tph_mem_type {
++	TPH_MEM_TYPE_VM,	/* volatile memory type */
++	TPH_MEM_TYPE_PM		/* persistent memory type */
++};
++
+ #ifdef CONFIG_PCIE_TPH
+ int pcie_tph_disable(struct pci_dev *dev);
+ int tph_set_dev_nostmode(struct pci_dev *dev);
++bool pcie_tph_intr_vec_supported(struct pci_dev *dev);
++bool pcie_tph_get_st(struct pci_dev *dev, unsigned int cpu,
++		     enum tph_mem_type tag_type, u8 req_enable,
++		     u16 *tag);
++bool pcie_tph_set_st(struct pci_dev *dev, unsigned int msix_nr,
++		     unsigned int cpu, enum tph_mem_type tag_type,
++		     u8 req_enable);
+ #else
+ static inline int pcie_tph_disable(struct pci_dev *dev)
+ { return -EOPNOTSUPP; }
+ static inline int tph_set_dev_nostmode(struct pci_dev *dev)
+ { return -EOPNOTSUPP; }
++static inline bool pcie_tph_intr_vec_supported(struct pci_dev *dev)
++{ return false; }
++static inline bool pcie_tph_get_st(struct pci_dev *dev, unsigned int cpu,
++				   enum tph_mem_type tag_type, u8 req_enable,
++				   u16 *tag)
++{ return false; }
++static inline bool pcie_tph_set_st(struct pci_dev *dev, unsigned int msix_nr,
++				   unsigned int cpu, enum tph_mem_type tag_type,
++				   u8 req_enable)
++{ return true; }
+ #endif
+
+ #endif /* LINUX_PCI_TPH_H */
+--
+2.44.0
+
+According to PCI SIG ECN, calling the _DSM firmware method for a given
+CPU_UID returns the steering tags for different types of memory
+(volatile, non-volatile). These tags are supposed to be used in ST
+table entry for optimal results.
+
+Co-developed-by: Eric Van Tassell <Eric.VanTassell@xxxxxxx>
+Signed-off-by: Eric Van Tassell <Eric.VanTassell@xxxxxxx>
+Signed-off-by: Wei Huang <wei.huang2@xxxxxxx>
+Reviewed-by: Ajit Khaparde <ajit.khaparde@xxxxxxxxxxxx>
+Reviewed-by: Somnath Kotur <somnath.kotur@xxxxxxxxxxxx>
+Reviewed-by: Andy Gospodarek <andrew.gospodarek@xxxxxxxxxxxx>
+---
+ drivers/pci/pcie/tph.c  | 103 +++++++++++++++++++++++++++++++++++++++-
+ include/linux/pci-tph.h |  34 +++++++++++++
+ 2 files changed, 136 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/pci/pcie/tph.c b/drivers/pci/pcie/tph.c
+index 320b99c60365..425935a14b62 100644
+--- a/drivers/pci/pcie/tph.c
++++ b/drivers/pci/pcie/tph.c
+@@ -158,6 +158,98 @@ static int tph_get_table_location(struct pci_dev *dev, u8 *loc_out)
+ 	return 0;
+ }
+
++static u16 tph_extract_tag(enum tph_mem_type mem_type, u8 req_type,
++			   union st_info *st_tag)
++{
++	switch (req_type) {
++	case PCI_TPH_REQ_TPH_ONLY: /* 8 bit tags */
++		switch (mem_type) {
++		case TPH_MEM_TYPE_VM:
++			if (st_tag->vm_st_valid)
++				return st_tag->vm_st;
++			break;
++		case TPH_MEM_TYPE_PM:
++			if (st_tag->pm_st_valid)
++				return st_tag->pm_st;
++			break;
++		}
++		break;
++	case PCI_TPH_REQ_EXT_TPH: /* 16 bit tags */
++		switch (mem_type) {
++		case TPH_MEM_TYPE_VM:
++			if (st_tag->vm_xst_valid)
++				return st_tag->vm_xst;
++			break;
++		case TPH_MEM_TYPE_PM:
++			if (st_tag->pm_xst_valid)
++				return st_tag->pm_xst;
++			break;
++		}
++		break;
++	default:
++		pr_err("invalid steering tag in ACPI _DSM\n");
++		return 0;
++	}
++
++	return 0;
++}
++
++#define MIN_ST_DSM_REV		7
++#define ST_DSM_FUNC_INDEX	0xf
++static bool invoke_dsm(acpi_handle handle, u32 cpu_uid, u8 ph,
++		       u8 target_type, bool cache_ref_valid,
++		       u64 cache_ref, union st_info *st_out)
++{
++	union acpi_object in_obj, in_buf[3], *out_obj;
++
++	in_buf[0].integer.type = ACPI_TYPE_INTEGER;
++	in_buf[0].integer.value = 0; /* 0 => processor cache steering tags */
++
++	in_buf[1].integer.type = ACPI_TYPE_INTEGER;
++	in_buf[1].integer.value = cpu_uid;
++
++	in_buf[2].integer.type = ACPI_TYPE_INTEGER;
++	in_buf[2].integer.value = ph & 3;
++	in_buf[2].integer.value |= (target_type & 1) << 2;
++	in_buf[2].integer.value |= (cache_ref_valid & 1) << 3;
++	in_buf[2].integer.value |= (cache_ref << 32);
++
++	in_obj.type = ACPI_TYPE_PACKAGE;
++	in_obj.package.count = ARRAY_SIZE(in_buf);
++	in_obj.package.elements = in_buf;
++
++	out_obj = acpi_evaluate_dsm(handle, &pci_acpi_dsm_guid, MIN_ST_DSM_REV,
++				    ST_DSM_FUNC_INDEX, &in_obj);
++
++	if (!out_obj)
++		return false;
++
++	if (out_obj->type != ACPI_TYPE_BUFFER) {
++		pr_err("invalid return type %d from TPH _DSM\n",
++		       out_obj->type);
++		ACPI_FREE(out_obj);
++		return false;
++	}
++
++	st_out->value = *((u64 *)(out_obj->buffer.pointer));
++
++	ACPI_FREE(out_obj);
++
++	return true;
++}
++
++static acpi_handle root_complex_acpi_handle(struct pci_dev *dev)
++{
++	struct pci_dev *root_port;
++
++	root_port = pcie_find_root_port(dev);
++
++	if (!root_port || !root_port->bus || !root_port->bus->bridge)
++		return NULL;
++
++	return ACPI_HANDLE(root_port->bus->bridge);
++}
++
+ static bool msix_nr_in_bounds(struct pci_dev *dev, int msix_nr)
+ {
+ 	u16 tbl_sz;
+@@ -441,7 +533,16 @@ bool pcie_tph_get_st(struct pci_dev *dev, unsigned int cpu,
+ 		    enum tph_mem_type mem_type, u8 req_type,
+ 		    u16 *tag)
+ {
+-	*tag = 0;
++	union st_info info;
++
++	if (!invoke_dsm(root_complex_acpi_handle(dev), cpu, 0, 0, false, 0,
++			&info)) {
++		*tag = 0;
++		return false;
++	}
++
++	*tag = tph_extract_tag(mem_type, req_type, &info);
++	pr_debug("%s: cpu=%d tag=%d\n", __func__, cpu, *tag);
+
+ 	return true;
+ }
+diff --git a/include/linux/pci-tph.h b/include/linux/pci-tph.h
+index 4fbd1e2fd98c..79533c6254c2 100644
+--- a/include/linux/pci-tph.h
++++ b/include/linux/pci-tph.h
+@@ -14,6 +14,40 @@ enum tph_mem_type {
+ 	TPH_MEM_TYPE_PM		/* persistent memory type */
+ };
+
++/*
++ * The st_info struct defines the steering tag returned by the firmware _DSM
++ * method defined in PCI SIG ECN. The specification is available at:
++ * https://members.pcisig.com/wg/PCI-SIG/document/15470.
++
++ * @vm_st_valid:  8 bit tag for volatile memory is valid
++ * @vm_xst_valid: 16 bit tag for volatile memory is valid
++ * @vm_ignore:    1 => was and will be ignored, 0 => ph should be supplied
++ * @vm_st:        8 bit steering tag for volatile mem
++ * @vm_xst:       16 bit steering tag for volatile mem
++ * @pm_st_valid:  8 bit tag for persistent memory is valid
++ * @pm_xst_valid: 16 bit tag for persistent memory is valid
++ * @pm_ignore:    1 => was and will be ignore, 0 => ph should be supplied
++ * @pm_st:        8 bit steering tag for persistent mem
++ * @pm_xst:       16 bit steering tag for persistent mem
++ */
++union st_info {
++	struct {
++		u64 vm_st_valid:1,
++		vm_xst_valid:1,
++		vm_ph_ignore:1,
++		rsvd1:5,
++		vm_st:8,
++		vm_xst:16,
++		pm_st_valid:1,
++		pm_xst_valid:1,
++		pm_ph_ignore:1,
++		rsvd2:5,
++		pm_st:8,
++		pm_xst:16;
++	};
++	u64 value;
++};
++
+ #ifdef CONFIG_PCIE_TPH
+ int pcie_tph_disable(struct pci_dev *dev);
+ int tph_set_dev_nostmode(struct pci_dev *dev);
+--
+2.44.0
+
+Provide a document for TPH feature, including the description of
+kernel options and driver API interface.
+
+Co-developed-by: Eric Van Tassell <Eric.VanTassell@xxxxxxx>
+Signed-off-by: Eric Van Tassell <Eric.VanTassell@xxxxxxx>
+Signed-off-by: Wei Huang <wei.huang2@xxxxxxx>
+Reviewed-by: Ajit Khaparde <ajit.khaparde@xxxxxxxxxxxx>
+Reviewed-by: Somnath Kotur <somnath.kotur@xxxxxxxxxxxx>
+Reviewed-by: Andy Gospodarek <andrew.gospodarek@xxxxxxxxxxxx>
+---
+ Documentation/PCI/index.rst          |  1 +
+ Documentation/PCI/tph.rst            | 57 ++++++++++++++++++++++++++++
+ Documentation/driver-api/pci/pci.rst |  3 ++
+ 3 files changed, 61 insertions(+)
+ create mode 100644 Documentation/PCI/tph.rst
+
+diff --git a/Documentation/PCI/index.rst b/Documentation/PCI/index.rst
+index e73f84aebde3..5e7c4e6e726b 100644
+--- a/Documentation/PCI/index.rst
++++ b/Documentation/PCI/index.rst
+@@ -18,3 +18,4 @@ PCI Bus Subsystem
+    pcieaer-howto
+    endpoint/index
+    boot-interrupts
++   tph
+diff --git a/Documentation/PCI/tph.rst b/Documentation/PCI/tph.rst
+new file mode 100644
+index 000000000000..ea9c8313f3e4
+--- /dev/null
++++ b/Documentation/PCI/tph.rst
+@@ -0,0 +1,57 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++===========
++TPH Support
++===========
++
++
++:Copyright: 2024 Advanced Micro Devices, Inc.
++:Authors: - Eric van Tassell <eric.vantassell@xxxxxxx>
++          - Wei Huang <wei.huang2@xxxxxxx>
++
++Overview
++========
++TPH (TLP Processing Hints) is a PCIe feature that allows endpoint devices
++to provide optimization hints, such as desired caching behavior, for
++requests that target memory space. These hints, in a format called steering
++tags, are provided in the requester's TLP headers and can empower the system
++hardware, including the Root Complex, to optimize the utilization of platform
++resources for the requests.
++
++User Guide
++==========
++
++Kernel Options
++--------------
++There are two kernel command line options available to control TPH feature
++
++   * "notph": TPH will be disabled for all endpoint devices.
++   * "nostmode": TPH will be enabled but the ST Mode will be forced to "No ST Mode".
++
++Device Driver API
++-----------------
++In brief, an endpoint device driver using the TPH interface to configure
++Interrupt Vector Mode will call pcie_tph_set_st() when setting up MSI-X
++interrupts as shown below:
++
++.. code-block:: c
++
++    for (i = 0, j = 0; i < nr_rings; i++) {
++        ...
++        rc = request_irq(irq->vector, irq->handler, flags, irq->name, NULL);
++        ...
++        if (!pcie_tph_set_st(pdev, i, cpumask_first(irq->cpu_mask),
++                             TPH_MEM_TYPE_VM, PCI_TPH_REQ_TPH_ONLY))
++               pr_err("Error in configuring steering tag\n");
++        ...
++    }
++
++If a device only supports TPH vendor specific mode, its driver can call
++pcie_tph_get_st() to retrieve the steering tag for a specific CPU and uses
++the tag to control TPH behavior.
++
++.. kernel-doc:: drivers/pci/pcie/tph.c
++   :export:
++
++.. kernel-doc:: drivers/pci/pcie/tph.c
++   :identifiers: pcie_tph_set_st
+diff --git a/Documentation/driver-api/pci/pci.rst b/Documentation/driver-api/pci/pci.rst
+index aa40b1cc243b..3d896b2cf16e 100644
+--- a/Documentation/driver-api/pci/pci.rst
++++ b/Documentation/driver-api/pci/pci.rst
+@@ -46,6 +46,9 @@ PCI Support Library
+ .. kernel-doc:: drivers/pci/pci-sysfs.c
+    :internal:
+
++.. kernel-doc:: drivers/pci/pcie/tph.c
++   :export:
++
+ PCI Hotplug Support Library
+ ---------------------------
+
+--
+2.44.0
+
 From: Piotr Gorski <lucjan.lucjanov@gmail.com>
 Date: Thu, 11 Apr 2024 19:06:47 +0200
 Subject: [PATCH] mm-6.9: add le9uo
@@ -2166,118 +3657,6 @@ index 4621a860cb05..e3b50e240d36 100644
  };
 --
 2.25.1
-
-From: Ard Biesheuvel <ardb@xxxxxxxxxx>
-
-On x86, the ordinary, position dependent 'small' and 'kernel' code models only
-support placement of the executable in 32-bit addressable memory, due to
-the use of 32-bit signed immediates to generate references to global
-variables. For the kernel, this implies that all global variables must
-reside in the top 2 GiB of the kernel virtual address space, where the
-implicit address bits 63:32 are equal to sign bit 31.
-
-This means the kernel code model is not suitable for other bare metal
-executables such as the kexec purgatory, which can be placed arbitrarily
-in the physical address space, where its address may no longer be
-representable as a sign extended 32-bit quantity. For this reason,
-commit
-
-  e16c2983fba0 ("x86/purgatory: Change compiler flags from -mcmodel=kernel to -mcmodel=large to fix kexec relocation errors")
-
-switched to the 'large' code model, which uses 64-bit immediates for all
-symbol references, including function calls, in order to avoid relying
-on any assumptions regarding proximity of symbols in the final
-executable.
-
-The large code model is rarely used, clunky and the least likely to
-operate in a similar fashion when comparing GCC and Clang, so it is best
-avoided. This is especially true now that Clang 18 has started to emit
-executable code in two separate sections (.text and .ltext), which
-triggers an issue in the kexec loading code at runtime.
-
-Instead, use the position independent small code model, which makes no
-assumptions about placement but only about proximity, where all
-referenced symbols must be within -/+ 2 GiB, i.e., in range for a
-RIP-relative reference. Use hidden visibility to suppress the use of a
-GOT, which carries absolute addresses that are not covered by static ELF
-relocations, and is therefore incompatible with the kexec loader's
-relocation logic.
-
-Cc: Nathan Chancellor <nathan@xxxxxxxxxx>
-Cc: Nick Desaulniers <ndesaulniers@xxxxxxxxxx>
-Cc: Bill Wendling <morbo@xxxxxxxxxx>
-Cc: Justin Stitt <justinstitt@xxxxxxxxxx>
-Cc: Song Liu <song@xxxxxxxxxx>
-Cc: Ricardo Ribalda <ribalda@xxxxxxxxxx>
-Cc: Fangrui Song <maskray@xxxxxxxxxx>
-Cc: Arthur Eubanks <aeubanks@xxxxxxxxxx>
-Link: https://lore.kernel.org/all/20240417-x86-fix-kexec-with-llvm-18-v1-0-5383121e8fb7@xxxxxxxxxx/
-Cc: <stable@xxxxxxxxxxxxxxx>
-Signed-off-by: Ard Biesheuvel <ardb@xxxxxxxxxx>
----
- arch/x86/purgatory/Makefile | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
-
-diff --git a/arch/x86/purgatory/Makefile b/arch/x86/purgatory/Makefile
-index bc31863c5ee6..a18591f6e6d9 100644
---- a/arch/x86/purgatory/Makefile
-+++ b/arch/x86/purgatory/Makefile
-@@ -42,7 +42,8 @@ KCOV_INSTRUMENT := n
- # make up the standalone purgatory.ro
-
- PURGATORY_CFLAGS_REMOVE := -mcmodel=kernel
--PURGATORY_CFLAGS := -mcmodel=large -ffreestanding -fno-zero-initialized-in-bss -g0
-+PURGATORY_CFLAGS := -mcmodel=small -ffreestanding -fno-zero-initialized-in-bss -g0
-+PURGATORY_CFLAGS += -fpic -fvisibility=hidden
- PURGATORY_CFLAGS += $(DISABLE_STACKLEAK_PLUGIN) -DDISABLE_BRANCH_PROFILING
- PURGATORY_CFLAGS += -fno-stack-protector
-
---
-2.44.0.769.g3c40516874-goog
-
-The exit() callback is optional and shouldn't be called without checking
-a valid pointer first.
-
-Also, we must clear freq_table pointer even if the exit() callback isn't
-present.
-
-Signed-off-by: Viresh Kumar <viresh.kumar@xxxxxxxxxx>
----
- drivers/cpufreq/cpufreq.c | 11 +++++++----
- 1 file changed, 7 insertions(+), 4 deletions(-)
-
-diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
-index 66e10a19d76a..fd9c3ed21f49 100644
---- a/drivers/cpufreq/cpufreq.c
-+++ b/drivers/cpufreq/cpufreq.c
-@@ -1679,10 +1679,13 @@ static void __cpufreq_offline(unsigned int cpu, struct cpufreq_policy *policy)
- 	 */
- 	if (cpufreq_driver->offline) {
- 		cpufreq_driver->offline(policy);
--	} else if (cpufreq_driver->exit) {
--		cpufreq_driver->exit(policy);
--		policy->freq_table = NULL;
-+		return;
- 	}
-+
-+	if (cpufreq_driver->exit)
-+		cpufreq_driver->exit(policy);
-+
-+	policy->freq_table = NULL;
- }
-
- static int cpufreq_offline(unsigned int cpu)
-@@ -1740,7 +1743,7 @@ static void cpufreq_remove_dev(struct device *dev, struct subsys_interface *sif)
- 	}
-
- 	/* We did light-weight exit earlier, do full tear down now */
--	if (cpufreq_driver->offline)
-+	if (cpufreq_driver->offline && cpufreq_driver->exit)
- 		cpufreq_driver->exit(policy);
-
- 	up_write(&policy->rwsem);
---
-2.31.1.272.g89b43f80a514
 
 Signed-off-by: Kyle Meyer <kyle.meyer@xxxxxxx>
 Acked-by: Yury Norov <yury.norov@xxxxxxxxx>
@@ -6554,184 +7933,6 @@ index fa8c42c83d5d..240fa6751260 100644
  void amdgpu_vmid_free_reserved(struct amdgpu_device *adev,
 --
 2.34.1
-
-Overutilized field of root domain is only used for EAS(energy aware scheduler)
-to decide whether to do regular load balance or EAS aware load balance. It
-is not used if EAS not possible.
-
-Currently enqueue_task_fair and task_tick_fair accesses, sometime updates
-this field. In update_sd_lb_stats it is updated often.
-Which causes cache contention due to load/store tearing and burns
-a lot of cycles. Hence add EAS check before updating this field.
-EAS check is optimized at compile time or it is static branch.
-Hence it shouldn't cost much.
-
-With the patch, both enqueue_task_fair and newidle_balance don't show
-up as hot routines in perf profile.
-
-6.8-rc4:
-7.18%  swapper          [kernel.vmlinux]              [k] enqueue_task_fair
-6.78%  s                [kernel.vmlinux]              [k] newidle_balance
-+patch:
-0.14%  swapper          [kernel.vmlinux]              [k] enqueue_task_fair
-0.00%  swapper          [kernel.vmlinux]              [k] newidle_balance
-
-While here, Fix updating overutilized as either SG_OVERUTILIZED or 0
-instead. Current code can make it 0, 1 or 2. This shouldn't alter the
-functionality.
-
-Fixes: 2802bf3cd936 ("sched/fair: Add over-utilization/tipping point indicator")
-Signed-off-by: Shrikanth Hegde <sshegde@xxxxxxxxxxxxx>
----
- kernel/sched/fair.c | 36 +++++++++++++++++++++++++-----------
- 1 file changed, 25 insertions(+), 11 deletions(-)
-
-diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 8e30e2bb77a0..9529d9ef2c5b 100644
---- a/kernel/sched/fair.c
-+++ b/kernel/sched/fair.c
-@@ -6670,15 +6670,30 @@ static inline bool cpu_overutilized(int cpu)
- 	return !util_fits_cpu(cpu_util_cfs(cpu), rq_util_min, rq_util_max, cpu);
- }
-
--static inline void update_overutilized_status(struct rq *rq)
-+static inline void update_rd_overutilized_status(struct root_domain *rd,
-+						 int status)
- {
--	if (!READ_ONCE(rq->rd->overutilized) && cpu_overutilized(rq->cpu)) {
--		WRITE_ONCE(rq->rd->overutilized, SG_OVERUTILIZED);
--		trace_sched_overutilized_tp(rq->rd, SG_OVERUTILIZED);
-+	if (sched_energy_enabled()) {
-+		WRITE_ONCE(rd->overutilized, status);
-+		trace_sched_overutilized_tp(rd, !!status);
-+	}
-+}
-+
-+static inline void check_update_overutilized_status(struct rq *rq)
-+{
-+	/*
-+	 * overutilized field is used for load balancing decisions only
-+	 * if energy aware scheduler is being used
-+	 */
-+	if (sched_energy_enabled()) {
-+		if (!READ_ONCE(rq->rd->overutilized) && cpu_overutilized(rq->cpu))
-+			update_rd_overutilized_status(rq->rd, SG_OVERUTILIZED);
- 	}
- }
- #else
--static inline void update_overutilized_status(struct rq *rq) { }
-+static inline void check_update_overutilized_status(struct rq *rq) { }
-+static inline void update_rd_overutilized_status(struct root_domain *rd,
-+						 bool status) { }
- #endif
-
- /* Runqueue only has SCHED_IDLE tasks enqueued */
-@@ -6779,7 +6794,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
- 	 * and the following generally works well enough in practice.
- 	 */
- 	if (!task_new)
--		update_overutilized_status(rq);
-+		check_update_overutilized_status(rq);
-
- enqueue_throttle:
- 	assert_list_leaf_cfs_rq(rq);
-@@ -10613,13 +10628,12 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
- 		WRITE_ONCE(rd->overload, sg_status & SG_OVERLOAD);
-
- 		/* Update over-utilization (tipping point, U >= 0) indicator */
--		WRITE_ONCE(rd->overutilized, sg_status & SG_OVERUTILIZED);
--		trace_sched_overutilized_tp(rd, sg_status & SG_OVERUTILIZED);
-+		update_rd_overutilized_status(rd,
-+				(sg_status & SG_OVERUTILIZED) ? SG_OVERUTILIZED : 0);
- 	} else if (sg_status & SG_OVERUTILIZED) {
- 		struct root_domain *rd = env->dst_rq->rd;
-
--		WRITE_ONCE(rd->overutilized, SG_OVERUTILIZED);
--		trace_sched_overutilized_tp(rd, SG_OVERUTILIZED);
-+		update_rd_overutilized_status(rd, SG_OVERUTILIZED);
- 	}
-
- 	update_idle_cpu_scan(env, sum_util);
-@@ -12625,7 +12639,7 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
- 		task_tick_numa(rq, curr);
-
- 	update_misfit_status(curr, rq);
--	update_overutilized_status(task_rq(curr));
-+	check_update_overutilized_status(task_rq(curr));
-
- 	task_tick_core(rq, curr);
- }
---
-2.39.3
-
-Overutilized field is accessed directly in multiple places.
-So it could use a helper function. That way one might be more
-informed that it needs to be used only in case of EAS.
-
-No change in functionality intended.
-
-Signed-off-by: Shrikanth Hegde <sshegde@xxxxxxxxxxxxx>
----
- kernel/sched/fair.c | 16 +++++++++++++---
- 1 file changed, 13 insertions(+), 3 deletions(-)
-
-diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 9529d9ef2c5b..29a3481c55c9 100644
---- a/kernel/sched/fair.c
-+++ b/kernel/sched/fair.c
-@@ -6670,6 +6670,15 @@ static inline bool cpu_overutilized(int cpu)
- 	return !util_fits_cpu(cpu_util_cfs(cpu), rq_util_min, rq_util_max, cpu);
- }
-
-+/*
-+ * Ensure that caller can do EAS. overutilized value
-+ * make sense only if EAS is enabled
-+ */
-+static inline int is_rd_overutilized(struct root_domain *rd)
-+{
-+	return READ_ONCE(rd->overutilized);
-+}
-+
- static inline void update_rd_overutilized_status(struct root_domain *rd,
- 						 int status)
- {
-@@ -6686,7 +6695,7 @@ static inline void check_update_overutilized_status(struct rq *rq)
- 	 * if energy aware scheduler is being used
- 	 */
- 	if (sched_energy_enabled()) {
--		if (!READ_ONCE(rq->rd->overutilized) && cpu_overutilized(rq->cpu))
-+		if (!is_rd_overutilized(rq->rd) && cpu_overutilized(rq->cpu))
- 			update_rd_overutilized_status(rq->rd, SG_OVERUTILIZED);
- 	}
- }
-@@ -6694,6 +6703,7 @@ static inline void check_update_overutilized_status(struct rq *rq)
- static inline void check_update_overutilized_status(struct rq *rq) { }
- static inline void update_rd_overutilized_status(struct root_domain *rd,
- 						 bool status) { }
-+static inline int is_rd_overutilized(struct root_domain *rd) { }
- #endif
-
- /* Runqueue only has SCHED_IDLE tasks enqueued */
-@@ -7969,7 +7979,7 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
-
- 	rcu_read_lock();
- 	pd = rcu_dereference(rd->pd);
--	if (!pd || READ_ONCE(rd->overutilized))
-+	if (!pd || is_rd_overutilized(rd))
- 		goto unlock;
-
- 	/*
-@@ -10873,7 +10883,7 @@ static struct sched_group *find_busiest_group(struct lb_env *env)
- 	if (sched_energy_enabled()) {
- 		struct root_domain *rd = env->dst_rq->rd;
-
--		if (rcu_dereference(rd->pd) && !READ_ONCE(rd->overutilized))
-+		if (rcu_dereference(rd->pd) && !is_rd_overutilized(rd))
- 			goto out_balanced;
- 	}
-
---
-2.39.3
 
 Only return successful completion status from `pcie_failed_link_retrain'
 if retraining has actually been done, preventing excessive delays from
