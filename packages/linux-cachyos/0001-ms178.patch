@@ -1,3 +1,799 @@
+Both __d_lookup_rcu() and __d_lookup_rcu_op_compare() have the full
+'name_hash' value of the qstr that they want to look up, and mask it off
+to just the low 32-bit hash before calling down to d_hash().
+
+Other callers just load the 32-bit hash and pass it as the argument.
+
+If we move the masking into d_hash() itself, it simplifies the two
+callers that currently do the masking, and is a no-op for the other
+cases.  It doesn't actually change the generated code since the compiler
+will inline d_hash() and see that the end result is the same.
+
+[ Technically, since the parse tree changes, the code generation may not
+  be 100% the same, and for me on x86-64, this does result in gcc
+  switching the operands around for one 'cmpl' instruction. So not
+  necessarily the exact same code generation, but equivalent ]
+
+However, this does encapsulate the 'd_hash()' operation more, and makes
+the shift operation in particular be a "shift 32 bits right, return full
+word".  Which matches the instruction semantics on both x86-64 and arm64
+better, since a 32-bit shift will clear the upper bits.
+
+That makes the next step of introducing a "shift by runtime constant"
+more obvious and generates the shift with no extraneous type masking.
+
+Signed-off-by: Linus Torvalds <torvalds@xxxxxxxxxxxxxxxxxxxx>
+---
+ fs/dcache.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/fs/dcache.c b/fs/dcache.c
+index 407095188f83..8b4382f5c99d 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -100,9 +100,9 @@ static unsigned int d_hash_shift __ro_after_init;
+ 
+ static struct hlist_bl_head *dentry_hashtable __ro_after_init;
+ 
+-static inline struct hlist_bl_head *d_hash(unsigned int hash)
++static inline struct hlist_bl_head *d_hash(unsigned long hashlen)
+ {
+-	return dentry_hashtable + (hash >> d_hash_shift);
++	return dentry_hashtable + ((u32)hashlen >> d_hash_shift);
+ }
+ 
+ #define IN_LOOKUP_SHIFT 10
+@@ -2104,7 +2104,7 @@ static noinline struct dentry *__d_lookup_rcu_op_compare(
+ 	unsigned *seqp)
+ {
+ 	u64 hashlen = name->hash_len;
+-	struct hlist_bl_head *b = d_hash(hashlen_hash(hashlen));
++	struct hlist_bl_head *b = d_hash(hashlen);
+ 	struct hlist_bl_node *node;
+ 	struct dentry *dentry;
+ 
+@@ -2171,7 +2171,7 @@ struct dentry *__d_lookup_rcu(const struct dentry *parent,
+ {
+ 	u64 hashlen = name->hash_len;
+ 	const unsigned char *str = name->name;
+-	struct hlist_bl_head *b = d_hash(hashlen_hash(hashlen));
++	struct hlist_bl_head *b = d_hash(hashlen);
+ 	struct hlist_bl_node *node;
+ 	struct dentry *dentry;
+ 
+-- 
+2.45.1.209.gc6f12300df
+
+This adds the initial dummy support for 'runtime constants' for when
+an architecture doesn't actually support an implementation of fixing up
+said runtime constants.
+
+This ends up being the fallback to just using the variables as regular
+__ro_after_init variables, and changes the dcache d_hash() function to
+use this model.
+
+Signed-off-by: Linus Torvalds <torvalds@xxxxxxxxxxxxxxxxxxxx>
+---
+ fs/dcache.c                         | 11 ++++++++++-
+ include/asm-generic/Kbuild          |  1 +
+ include/asm-generic/runtime-const.h | 15 +++++++++++++++
+ include/asm-generic/vmlinux.lds.h   |  8 ++++++++
+ 4 files changed, 34 insertions(+), 1 deletion(-)
+ create mode 100644 include/asm-generic/runtime-const.h
+
+diff --git a/fs/dcache.c b/fs/dcache.c
+index 8b4382f5c99d..5d3a5b315692 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -35,6 +35,8 @@
+ #include "internal.h"
+ #include "mount.h"
+ 
++#include <asm/runtime-const.h>
++
+ /*
+  * Usage:
+  * dcache->d_inode->i_lock protects:
+@@ -102,7 +104,8 @@ static struct hlist_bl_head *dentry_hashtable __ro_after_init;
+ 
+ static inline struct hlist_bl_head *d_hash(unsigned long hashlen)
+ {
+-	return dentry_hashtable + ((u32)hashlen >> d_hash_shift);
++	return runtime_const_ptr(dentry_hashtable) +
++		runtime_const_shift_right_32(hashlen, d_hash_shift);
+ }
+ 
+ #define IN_LOOKUP_SHIFT 10
+@@ -3129,6 +3132,9 @@ static void __init dcache_init_early(void)
+ 					0,
+ 					0);
+ 	d_hash_shift = 32 - d_hash_shift;
++
++	runtime_const_init(shift, d_hash_shift);
++	runtime_const_init(ptr, dentry_hashtable);
+ }
+ 
+ static void __init dcache_init(void)
+@@ -3157,6 +3163,9 @@ static void __init dcache_init(void)
+ 					0,
+ 					0);
+ 	d_hash_shift = 32 - d_hash_shift;
++
++	runtime_const_init(shift, d_hash_shift);
++	runtime_const_init(ptr, dentry_hashtable);
+ }
+ 
+ /* SLAB cache for __getname() consumers */
+diff --git a/include/asm-generic/Kbuild b/include/asm-generic/Kbuild
+index b20fa25a7e8d..052e5c98c105 100644
+--- a/include/asm-generic/Kbuild
++++ b/include/asm-generic/Kbuild
+@@ -46,6 +46,7 @@ mandatory-y += pci.h
+ mandatory-y += percpu.h
+ mandatory-y += pgalloc.h
+ mandatory-y += preempt.h
++mandatory-y += runtime-const.h
+ mandatory-y += rwonce.h
+ mandatory-y += sections.h
+ mandatory-y += serial.h
+diff --git a/include/asm-generic/runtime-const.h b/include/asm-generic/runtime-const.h
+new file mode 100644
+index 000000000000..670499459514
+--- /dev/null
++++ b/include/asm-generic/runtime-const.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_RUNTIME_CONST_H
++#define _ASM_RUNTIME_CONST_H
++
++/*
++ * This is the fallback for when the architecture doesn't
++ * support the runtime const operations.
++ *
++ * We just use the actual symbols as-is.
++ */
++#define runtime_const_ptr(sym) (sym)
++#define runtime_const_shift_right_32(val, sym) ((u32)(val)>>(sym))
++#define runtime_const_init(type,sym) do { } while (0)
++
++#endif
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index 5703526d6ebf..389a78415b9b 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -944,6 +944,14 @@
+ #define CON_INITCALL							\
+ 	BOUNDED_SECTION_POST_LABEL(.con_initcall.init, __con_initcall, _start, _end)
+ 
++#define RUNTIME_NAME(t,x) runtime_##t##_##x
++
++#define RUNTIME_CONST(t,x)						\
++	. = ALIGN(8);							\
++	RUNTIME_NAME(t,x) : AT(ADDR(RUNTIME_NAME(t,x)) - LOAD_OFFSET) {	\
++		*(RUNTIME_NAME(t,x));					\
++	}
++
+ /* Alignment must be consistent with (kunit_suite *) in include/kunit/test.h */
+ #define KUNIT_TABLE()							\
+ 		. = ALIGN(8);						\
+-- 
+2.45.1.209.gc6f12300df
+
+This implements the runtime constant infrastructure for x86, allowing
+the dcache d_hash() function to be generated using as a constant for
+hash table address followed by shift by a constant of the hash index.
+
+Signed-off-by: Linus Torvalds <torvalds@xxxxxxxxxxxxxxxxxxxx>
+---
+ arch/x86/include/asm/runtime-const.h | 61 ++++++++++++++++++++++++++++
+ arch/x86/kernel/vmlinux.lds.S        |  3 ++
+ 2 files changed, 64 insertions(+)
+ create mode 100644 arch/x86/include/asm/runtime-const.h
+
+diff --git a/arch/x86/include/asm/runtime-const.h b/arch/x86/include/asm/runtime-const.h
+new file mode 100644
+index 000000000000..24e3a53ca255
+--- /dev/null
++++ b/arch/x86/include/asm/runtime-const.h
+@@ -0,0 +1,61 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_RUNTIME_CONST_H
++#define _ASM_RUNTIME_CONST_H
++
++#define runtime_const_ptr(sym) ({				\
++	typeof(sym) __ret;					\
++	asm_inline("mov %1,%0\n1:\n"				\
++		".pushsection runtime_ptr_" #sym ",\"a\"\n\t"	\
++		".long 1b - %c2 - .\n\t"			\
++		".popsection"					\
++		:"=r" (__ret)					\
++		:"i" ((unsigned long)0x0123456789abcdefull),	\
++		 "i" (sizeof(long)));				\
++	__ret; })
++
++// The 'typeof' will create at _least_ a 32-bit type, but
++// will happily also take a bigger type and the 'shrl' will
++// clear the upper bits
++#define runtime_const_shift_right_32(val, sym) ({		\
++	typeof(0u+(val)) __ret = (val);				\
++	asm_inline("shrl $12,%k0\n1:\n"				\
++		".pushsection runtime_shift_" #sym ",\"a\"\n\t"	\
++		".long 1b - 1 - .\n\t"				\
++		".popsection"					\
++		:"+r" (__ret));					\
++	__ret; })
++
++#define runtime_const_init(type, sym) do {		\
++	extern s32 __start_runtime_##type##_##sym[];	\
++	extern s32 __stop_runtime_##type##_##sym[];	\
++	runtime_const_fixup(__runtime_fixup_##type,	\
++		(unsigned long)(sym), 			\
++		__start_runtime_##type##_##sym,		\
++		__stop_runtime_##type##_##sym);		\
++} while (0)
++
++/*
++ * The text patching is trivial - you can only do this at init time,
++ * when the text section hasn't been marked RO, and before the text
++ * has ever been executed.
++ */
++static inline void __runtime_fixup_ptr(void *where, unsigned long val)
++{
++	*(unsigned long *)where = val;
++}
++
++static inline void __runtime_fixup_shift(void *where, unsigned long val)
++{
++	*(unsigned char *)where = val;
++}
++
++static inline void runtime_const_fixup(void (*fn)(void *, unsigned long),
++	unsigned long val, s32 *start, s32 *end)
++{
++	while (start < end) {
++		fn(*start + (void *)start, val);
++		start++;
++	}
++}
++
++#endif
+diff --git a/arch/x86/kernel/vmlinux.lds.S b/arch/x86/kernel/vmlinux.lds.S
+index 3509afc6a672..6e73403e874f 100644
+--- a/arch/x86/kernel/vmlinux.lds.S
++++ b/arch/x86/kernel/vmlinux.lds.S
+@@ -357,6 +357,9 @@ SECTIONS
+ 	PERCPU_SECTION(INTERNODE_CACHE_BYTES)
+ #endif
+ 
++	RUNTIME_CONST(shift, d_hash_shift)
++	RUNTIME_CONST(ptr, dentry_hashtable)
++
+ 	. = ALIGN(PAGE_SIZE);
+ 
+ 	/* freed after init ends here */
+-- 
+2.45.1.209.gc6f12300df
+
+[now without a descriptor leak; it really needs testing, though]
+
+Using drm_gem_prime_handle_to_fd() to set dmabuf up and insert it into
+descriptor table, only to have it looked up by file descriptor and
+remove it from descriptor table is not just too convoluted - it's
+racy; another thread might have modified the descriptor table while
+we'd been going through that song and dance.
+
+It's not hard to fix - turn drm_gem_prime_handle_to_fd()
+into a wrapper for a new helper that would simply return the
+dmabuf, without messing with descriptor table.
+
+Then kfd_mem_export_dmabuf() would simply use that new helper
+and leave the descriptor table alone.
+
+Signed-off-by: Al Viro <viro at zeniv.linux.org.uk>
+---
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index 8975cf41a91a..793780bb819c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -25,7 +25,6 @@
+ #include <linux/pagemap.h>
+ #include <linux/sched/mm.h>
+ #include <linux/sched/task.h>
+-#include <linux/fdtable.h>
+ #include <drm/ttm/ttm_tt.h>
+
+ #include <drm/drm_exec.h>
+@@ -812,18 +811,13 @@ static int kfd_mem_export_dmabuf(struct kgd_mem *mem)
+ 	if (!mem->dmabuf) {
+ 		struct amdgpu_device *bo_adev;
+ 		struct dma_buf *dmabuf;
+-		int r, fd;
+
+ 		bo_adev = amdgpu_ttm_adev(mem->bo->tbo.bdev);
+-		r = drm_gem_prime_handle_to_fd(&bo_adev->ddev, bo_adev->kfd.client.file,
++		dmabuf = drm_gem_prime_handle_to_dmabuf(&bo_adev->ddev, bo_adev->kfd.client.file,
+ 					       mem->gem_handle,
+ 			mem->alloc_flags & KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE ?
+-					       DRM_RDWR : 0, &fd);
+-		if (r)
+-			return r;
+-		dmabuf = dma_buf_get(fd);
+-		close_fd(fd);
+-		if (WARN_ON_ONCE(IS_ERR(dmabuf)))
++					       DRM_RDWR : 0);
++		if (IS_ERR(dmabuf))
+ 			return PTR_ERR(dmabuf);
+ 		mem->dmabuf = dmabuf;
+ 	}
+diff --git a/drivers/gpu/drm/drm_prime.c b/drivers/gpu/drm/drm_prime.c
+index 03bd3c7bd0dc..467c7a278ad3 100644
+--- a/drivers/gpu/drm/drm_prime.c
++++ b/drivers/gpu/drm/drm_prime.c
+@@ -409,23 +409,9 @@ static struct dma_buf *export_and_register_object(struct drm_device *dev,
+ 	return dmabuf;
+ }
+
+-/**
+- * drm_gem_prime_handle_to_fd - PRIME export function for GEM drivers
+- * @dev: dev to export the buffer from
+- * @file_priv: drm file-private structure
+- * @handle: buffer handle to export
+- * @flags: flags like DRM_CLOEXEC
+- * @prime_fd: pointer to storage for the fd id of the create dma-buf
+- *
+- * This is the PRIME export function which must be used mandatorily by GEM
+- * drivers to ensure correct lifetime management of the underlying GEM object.
+- * The actual exporting from GEM object to a dma-buf is done through the
+- * &drm_gem_object_funcs.export callback.
+- */
+-int drm_gem_prime_handle_to_fd(struct drm_device *dev,
++struct dma_buf *drm_gem_prime_handle_to_dmabuf(struct drm_device *dev,
+ 			       struct drm_file *file_priv, uint32_t handle,
+-			       uint32_t flags,
+-			       int *prime_fd)
++			       uint32_t flags)
+ {
+ 	struct drm_gem_object *obj;
+ 	int ret = 0;
+@@ -434,14 +420,14 @@ int drm_gem_prime_handle_to_fd(struct drm_device *dev,
+ 	mutex_lock(&file_priv->prime.lock);
+ 	obj = drm_gem_object_lookup(file_priv, handle);
+ 	if (!obj)  {
+-		ret = -ENOENT;
++		dmabuf = ERR_PTR(-ENOENT);
+ 		goto out_unlock;
+ 	}
+
+ 	dmabuf = drm_prime_lookup_buf_by_handle(&file_priv->prime, handle);
+ 	if (dmabuf) {
+ 		get_dma_buf(dmabuf);
+-		goto out_have_handle;
++		goto out;
+ 	}
+
+ 	mutex_lock(&dev->object_name_lock);
+@@ -463,7 +449,6 @@ int drm_gem_prime_handle_to_fd(struct drm_device *dev,
+ 		/* normally the created dma-buf takes ownership of the ref,
+ 		 * but if that fails then drop the ref
+ 		 */
+-		ret = PTR_ERR(dmabuf);
+ 		mutex_unlock(&dev->object_name_lock);
+ 		goto out;
+ 	}
+@@ -478,34 +463,51 @@ int drm_gem_prime_handle_to_fd(struct drm_device *dev,
+ 	ret = drm_prime_add_buf_handle(&file_priv->prime,
+ 				       dmabuf, handle);
+ 	mutex_unlock(&dev->object_name_lock);
+-	if (ret)
+-		goto fail_put_dmabuf;
+-
+-out_have_handle:
+-	ret = dma_buf_fd(dmabuf, flags);
+-	/*
+-	 * We must _not_ remove the buffer from the handle cache since the newly
+-	 * created dma buf is already linked in the global obj->dma_buf pointer,
+-	 * and that is invariant as long as a userspace gem handle exists.
+-	 * Closing the handle will clean out the cache anyway, so we don't leak.
+-	 */
+-	if (ret < 0) {
+-		goto fail_put_dmabuf;
+-	} else {
+-		*prime_fd = ret;
+-		ret = 0;
++	if (ret) {
++		dma_buf_put(dmabuf);
++		dmabuf = ERR_PTR(ret);
+ 	}
+-
+-	goto out;
+-
+-fail_put_dmabuf:
+-	dma_buf_put(dmabuf);
+ out:
+ 	drm_gem_object_put(obj);
+ out_unlock:
+ 	mutex_unlock(&file_priv->prime.lock);
++	return dmabuf;
++}
++EXPORT_SYMBOL(drm_gem_prime_handle_to_dmabuf);
+
+-	return ret;
++/**
++ * drm_gem_prime_handle_to_fd - PRIME export function for GEM drivers
++ * @dev: dev to export the buffer from
++ * @file_priv: drm file-private structure
++ * @handle: buffer handle to export
++ * @flags: flags like DRM_CLOEXEC
++ * @prime_fd: pointer to storage for the fd id of the create dma-buf
++ *
++ * This is the PRIME export function which must be used mandatorily by GEM
++ * drivers to ensure correct lifetime management of the underlying GEM object.
++ * The actual exporting from GEM object to a dma-buf is done through the
++ * &drm_gem_object_funcs.export callback.
++ */
++int drm_gem_prime_handle_to_fd(struct drm_device *dev,
++			       struct drm_file *file_priv, uint32_t handle,
++			       uint32_t flags,
++			       int *prime_fd)
++{
++	struct dma_buf *dmabuf;
++	int fd = get_unused_fd_flags(flags);
++
++	if (fd < 0)
++		return fd;
++
++	dmabuf = drm_gem_prime_handle_to_dmabuf(dev, file_priv, handle, flags);
++	if (IS_ERR(dmabuf)) {
++		put_unused_fd(fd);
++		return PTR_ERR(dmabuf);
++	}
++
++	fd_install(fd, dmabuf->file);
++	*prime_fd = fd;
++	return 0;
+ }
+ EXPORT_SYMBOL(drm_gem_prime_handle_to_fd);
+
+diff --git a/include/drm/drm_prime.h b/include/drm/drm_prime.h
+index 2a1d01e5b56b..fa085c44d4ca 100644
+--- a/include/drm/drm_prime.h
++++ b/include/drm/drm_prime.h
+@@ -69,6 +69,9 @@ void drm_gem_dmabuf_release(struct dma_buf *dma_buf);
+
+ int drm_gem_prime_fd_to_handle(struct drm_device *dev,
+ 			       struct drm_file *file_priv, int prime_fd, uint32_t *handle);
++struct dma_buf *drm_gem_prime_handle_to_dmabuf(struct drm_device *dev,
++			       struct drm_file *file_priv, uint32_t handle,
++			       uint32_t flags);
+ int drm_gem_prime_handle_to_fd(struct drm_device *dev,
+ 			       struct drm_file *file_priv, uint32_t handle, uint32_t flags,
+ 			       int *prime_fd);
+
+Instead of trying to use close_fd() on failure exits, just have
+criu_get_prime_handle() store the file reference without inserting
+it into descriptor table.
+
+Then, once the callers are past the last failure exit, they can go
+and either insert all those file references into the corresponding
+slots of descriptor table, or drop all those file references and
+free the unused descriptors.
+
+Signed-off-by: Al Viro <viro at zeniv.linux.org.uk>
+---
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index fdf171ad4a3c..3f129e1c0daa 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -36,7 +36,6 @@
+ #include <linux/mman.h>
+ #include <linux/ptrace.h>
+ #include <linux/dma-buf.h>
+-#include <linux/fdtable.h>
+ #include <linux/processor.h>
+ #include "kfd_priv.h"
+ #include "kfd_device_queue_manager.h"
+@@ -1857,7 +1856,8 @@ static uint32_t get_process_num_bos(struct kfd_process *p)
+ }
+
+ static int criu_get_prime_handle(struct kgd_mem *mem,
+-				 int flags, u32 *shared_fd)
++				 int flags, u32 *shared_fd,
++				 struct file **file)
+ {
+ 	struct dma_buf *dmabuf;
+ 	int ret;
+@@ -1868,13 +1868,14 @@ static int criu_get_prime_handle(struct kgd_mem *mem,
+ 		return ret;
+ 	}
+
+-	ret = dma_buf_fd(dmabuf, flags);
++	ret = get_unused_fd_flags(flags);
+ 	if (ret < 0) {
+ 		pr_err("dmabuf create fd failed, ret:%d\n", ret);
+ 		goto out_free_dmabuf;
+ 	}
+
+ 	*shared_fd = ret;
++	*file = dmabuf->file;
+ 	return 0;
+
+ out_free_dmabuf:
+@@ -1882,6 +1883,24 @@ static int criu_get_prime_handle(struct kgd_mem *mem,
+ 	return ret;
+ }
+
++static void commit_files(struct file **files,
++			 struct kfd_criu_bo_bucket *bo_buckets,
++			 unsigned int count,
++			 int err)
++{
++	while (count--) {
++		struct file *file = files[count];
++		if (!file)
++			continue;
++		if (err) {
++			fput(file);
++			put_unused_fd(bo_buckets[count].dmabuf_fd);
++		} else {
++			fd_install(bo_buckets[count].dmabuf_fd, file);
++		}
++	}
++}
++
+ static int criu_checkpoint_bos(struct kfd_process *p,
+ 			       uint32_t num_bos,
+ 			       uint8_t __user *user_bos,
+@@ -1890,6 +1909,7 @@ static int criu_checkpoint_bos(struct kfd_process *p,
+ {
+ 	struct kfd_criu_bo_bucket *bo_buckets;
+ 	struct kfd_criu_bo_priv_data *bo_privs;
++	struct file **files = NULL;
+ 	int ret = 0, pdd_index, bo_index = 0, id;
+ 	void *mem;
+
+@@ -1903,6 +1923,12 @@ static int criu_checkpoint_bos(struct kfd_process *p,
+ 		goto exit;
+ 	}
+
++	files = kvzalloc(num_bos * sizeof(struct file *), GFP_KERNEL);
++	if (!files) {
++		ret = -ENOMEM;
++		goto exit;
++	}
++
+ 	for (pdd_index = 0; pdd_index < p->n_pdds; pdd_index++) {
+ 		struct kfd_process_device *pdd = p->pdds[pdd_index];
+ 		struct amdgpu_bo *dumper_bo;
+@@ -1950,7 +1976,7 @@ static int criu_checkpoint_bos(struct kfd_process *p,
+ 				ret = criu_get_prime_handle(kgd_mem,
+ 						bo_bucket->alloc_flags &
+ 						KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE ? DRM_RDWR : 0,
+-						&bo_bucket->dmabuf_fd);
++						&bo_bucket->dmabuf_fd, &files[bo_index]);
+ 				if (ret)
+ 					goto exit;
+ 			} else {
+@@ -2001,12 +2027,8 @@ static int criu_checkpoint_bos(struct kfd_process *p,
+ 	*priv_offset += num_bos * sizeof(*bo_privs);
+
+ exit:
+-	while (ret && bo_index--) {
+-		if (bo_buckets[bo_index].alloc_flags
+-		    & (KFD_IOC_ALLOC_MEM_FLAGS_VRAM | KFD_IOC_ALLOC_MEM_FLAGS_GTT))
+-			close_fd(bo_buckets[bo_index].dmabuf_fd);
+-	}
+-
++	commit_files(files, bo_buckets, bo_index, ret);
++	kvfree(files);
+ 	kvfree(bo_buckets);
+ 	kvfree(bo_privs);
+ 	return ret;
+@@ -2358,7 +2380,8 @@ static int criu_restore_memory_of_gpu(struct kfd_process_device *pdd,
+
+ static int criu_restore_bo(struct kfd_process *p,
+ 			   struct kfd_criu_bo_bucket *bo_bucket,
+-			   struct kfd_criu_bo_priv_data *bo_priv)
++			   struct kfd_criu_bo_priv_data *bo_priv,
++			   struct file **file)
+ {
+ 	struct kfd_process_device *pdd;
+ 	struct kgd_mem *kgd_mem;
+@@ -2410,7 +2433,7 @@ static int criu_restore_bo(struct kfd_process *p,
+ 	if (bo_bucket->alloc_flags
+ 	    & (KFD_IOC_ALLOC_MEM_FLAGS_VRAM | KFD_IOC_ALLOC_MEM_FLAGS_GTT)) {
+ 		ret = criu_get_prime_handle(kgd_mem, DRM_RDWR,
+-					    &bo_bucket->dmabuf_fd);
++					    &bo_bucket->dmabuf_fd, file);
+ 		if (ret)
+ 			return ret;
+ 	} else {
+@@ -2427,6 +2450,7 @@ static int criu_restore_bos(struct kfd_process *p,
+ {
+ 	struct kfd_criu_bo_bucket *bo_buckets = NULL;
+ 	struct kfd_criu_bo_priv_data *bo_privs = NULL;
++	struct file **files = NULL;
+ 	int ret = 0;
+ 	uint32_t i = 0;
+
+@@ -2440,6 +2464,12 @@ static int criu_restore_bos(struct kfd_process *p,
+ 	if (!bo_buckets)
+ 		return -ENOMEM;
+
++	files = kvzalloc(args->num_bos * sizeof(struct file *), GFP_KERNEL);
++	if (!files) {
++		ret = -ENOMEM;
++		goto exit;
++	}
++
+ 	ret = copy_from_user(bo_buckets, (void __user *)args->bos,
+ 			     args->num_bos * sizeof(*bo_buckets));
+ 	if (ret) {
+@@ -2465,7 +2495,7 @@ static int criu_restore_bos(struct kfd_process *p,
+
+ 	/* Create and map new BOs */
+ 	for (; i < args->num_bos; i++) {
+-		ret = criu_restore_bo(p, &bo_buckets[i], &bo_privs[i]);
++		ret = criu_restore_bo(p, &bo_buckets[i], &bo_privs[i], &files[i]);
+ 		if (ret) {
+ 			pr_debug("Failed to restore BO[%d] ret%d\n", i, ret);
+ 			goto exit;
+@@ -2480,11 +2510,8 @@ static int criu_restore_bos(struct kfd_process *p,
+ 		ret = -EFAULT;
+
+ exit:
+-	while (ret && i--) {
+-		if (bo_buckets[i].alloc_flags
+-		   & (KFD_IOC_ALLOC_MEM_FLAGS_VRAM | KFD_IOC_ALLOC_MEM_FLAGS_GTT))
+-			close_fd(bo_buckets[i].dmabuf_fd);
+-	}
++	commit_files(files, bo_buckets, i, ret);
++	kvfree(files);
+ 	kvfree(bo_buckets);
+ 	kvfree(bo_privs);
+ 	return ret;
+
+This reverts commit b8c415e3bf989be1b749409951debe6b36f5c78c and
+commit 425285d39afddaf4a9dab36045b816af0cc3e400.
+
+Taking a runtime pm reference for DMA-buf is actually completely
+unnecessary and even dangerous.
+
+The problem is that calling pm_runtime_get_sync() from the DMA-buf
+callbacks is illegal because we have the reservation locked here
+which is also taken during resume. So this would deadlock.
+
+When the buffer is in GTT it is still accessible even when the GPU
+is powered down and when it is in VRAM the buffer gets migrated to
+GTT before powering down.
+
+The only use case which would make it mandatory to keep the runtime
+pm reference would be if we pin the buffer into VRAM, and that's not
+something we currently do.
+
+v2: improve the commit message
+
+Signed-off-by: Christian König <christian.koenig at amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher at amd.com>
+CC: stable at vger.kernel.org
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c | 34 ---------------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c   |  2 --
+ drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h   | 15 ---------
+ 3 files changed, 51 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
+index 0b3b10d21952..8e81a83d37d8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
+@@ -41,8 +41,6 @@
+ #include <linux/dma-buf.h>
+ #include <linux/dma-fence-array.h>
+ #include <linux/pci-p2pdma.h>
+-#include <linux/pm_runtime.h>
+-#include "amdgpu_trace.h"
+
+ /**
+  * amdgpu_dma_buf_attach - &dma_buf_ops.attach implementation
+@@ -58,42 +56,11 @@ static int amdgpu_dma_buf_attach(struct dma_buf *dmabuf,
+ 	struct drm_gem_object *obj = dmabuf->priv;
+ 	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
+-	int r;
+
+ 	if (pci_p2pdma_distance(adev->pdev, attach->dev, false) < 0)
+ 		attach->peer2peer = false;
+
+-	r = pm_runtime_get_sync(adev_to_drm(adev)->dev);
+-	trace_amdgpu_runpm_reference_dumps(1, __func__);
+-	if (r < 0)
+-		goto out;
+-
+ 	return 0;
+-
+-out:
+-	pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
+-	trace_amdgpu_runpm_reference_dumps(0, __func__);
+-	return r;
+-}
+-
+-/**
+- * amdgpu_dma_buf_detach - &dma_buf_ops.detach implementation
+- *
+- * @dmabuf: DMA-buf where we remove the attachment from
+- * @attach: the attachment to remove
+- *
+- * Called when an attachment is removed from the DMA-buf.
+- */
+-static void amdgpu_dma_buf_detach(struct dma_buf *dmabuf,
+-				  struct dma_buf_attachment *attach)
+-{
+-	struct drm_gem_object *obj = dmabuf->priv;
+-	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
+-	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
+-
+-	pm_runtime_mark_last_busy(adev_to_drm(adev)->dev);
+-	pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
+-	trace_amdgpu_runpm_reference_dumps(0, __func__);
+ }
+
+ /**
+@@ -266,7 +233,6 @@ static int amdgpu_dma_buf_begin_cpu_access(struct dma_buf *dma_buf,
+
+ const struct dma_buf_ops amdgpu_dmabuf_ops = {
+ 	.attach = amdgpu_dma_buf_attach,
+-	.detach = amdgpu_dma_buf_detach,
+ 	.pin = amdgpu_dma_buf_pin,
+ 	.unpin = amdgpu_dma_buf_unpin,
+ 	.map_dma_buf = amdgpu_dma_buf_map,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+index 10832b470448..bc3ac73b6b8d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -181,7 +181,6 @@ int amdgpu_fence_emit(struct amdgpu_ring *ring, struct dma_fence **f, struct amd
+ 	amdgpu_ring_emit_fence(ring, ring->fence_drv.gpu_addr,
+ 			       seq, flags | AMDGPU_FENCE_FLAG_INT);
+ 	pm_runtime_get_noresume(adev_to_drm(adev)->dev);
+-	trace_amdgpu_runpm_reference_dumps(1, __func__);
+ 	ptr = &ring->fence_drv.fences[seq & ring->fence_drv.num_fences_mask];
+ 	if (unlikely(rcu_dereference_protected(*ptr, 1))) {
+ 		struct dma_fence *old;
+@@ -309,7 +308,6 @@ bool amdgpu_fence_process(struct amdgpu_ring *ring)
+ 		dma_fence_put(fence);
+ 		pm_runtime_mark_last_busy(adev_to_drm(adev)->dev);
+ 		pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
+-		trace_amdgpu_runpm_reference_dumps(0, __func__);
+ 	} while (last_seq != seq);
+
+ 	return true;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h
+index f539b1d00234..2fd1bfb35916 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h
+@@ -554,21 +554,6 @@ TRACE_EVENT(amdgpu_reset_reg_dumps,
+ 		      __entry->value)
+ );
+
+-TRACE_EVENT(amdgpu_runpm_reference_dumps,
+-	    TP_PROTO(uint32_t index, const char *func),
+-	    TP_ARGS(index, func),
+-	    TP_STRUCT__entry(
+-			     __field(uint32_t, index)
+-			     __string(func, func)
+-			     ),
+-	    TP_fast_assign(
+-			   __entry->index = index;
+-			   __assign_str(func, func);
+-			   ),
+-	    TP_printk("amdgpu runpm reference dump 0x%x: 0x%s\n",
+-		      __entry->index,
+-		      __get_str(func))
+-);
+ #undef AMDGPU_JOB_GET_TIMELINE_NAME
+ #endif
+
+--
+2.34.1
+
 We observed that the overhead on trigger_load_balance(), now renamed
 sched_balance_trigger(), has risen with a system's core counts.
 
@@ -3655,6 +4451,43 @@ index 4621a860cb05..e3b50e240d36 100644
  	KUNIT_CASE(drm_test_buddy_alloc_range_bias),
  	{}
  };
+--
+2.25.1
+
+Cc: <stable@vger.kernel.org> # 6.10+
+Fixes: a68c7eaa7a8f ("drm/amdgpu: Enable clear page functionality")
+Signed-off-by: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Suggested-by: Christian König <christian.koenig@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c    | 1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c | 2 --
+ 2 files changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index 67c234bcf89f..3adaa4670103 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -108,6 +108,7 @@ int amdgpu_gem_object_create(struct amdgpu_device *adev, unsigned long size,
+
+ 	memset(&bp, 0, sizeof(bp));
+ 	*obj = NULL;
++	flags |= AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE;
+
+ 	bp.size = size;
+ 	bp.byte_align = alignment;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index 8d8c39be6129..c556c8b653fa 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -604,8 +604,6 @@ int amdgpu_bo_create(struct amdgpu_device *adev,
+ 	if (!amdgpu_bo_support_uswc(bo->flags))
+ 		bo->flags &= ~AMDGPU_GEM_CREATE_CPU_GTT_USWC;
+
+-	bo->flags |= AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE;
+-
+ 	bo->tbo.bdev = &adev->mman.bdev;
+ 	if (bp->domain & (AMDGPU_GEM_DOMAIN_GWS | AMDGPU_GEM_DOMAIN_OA |
+ 			  AMDGPU_GEM_DOMAIN_GDS))
 --
 2.25.1
 
