@@ -1,0 +1,236 @@
+From ba3da34bffc47b428b9e82e79d33c2a4cfe67e97 Mon Sep 17 00:00:00 2001
+From: Friedrich Vock <friedrich.vock@gmx.de>
+Date: Mon, 13 May 2024 06:12:33 +0200
+Subject: [PATCH 1/3] aco/live_var_analysis: Add temp registers for the same
+ operand fixed to different registers
+
+We're going to need one copy of the temp for each register.
+
+Cc: mesa-stable
+---
+ src/amd/compiler/aco_live_var_analysis.cpp | 32 ++++++++++++++++++----
+ 1 file changed, 27 insertions(+), 5 deletions(-)
+
+diff --git a/src/amd/compiler/aco_live_var_analysis.cpp b/src/amd/compiler/aco_live_var_analysis.cpp
+index 9160cb5558353..c610d57d2f7fb 100644
+--- a/src/amd/compiler/aco_live_var_analysis.cpp
++++ b/src/amd/compiler/aco_live_var_analysis.cpp
+@@ -58,18 +58,40 @@ get_temp_registers(aco_ptr<Instruction>& instr)
+          temp_registers += def.getTemp();
+    }
+ 
++   /* Usually the register demand before an instruction would be considered part of the previous
++    * instruction, since it's not greater than the register demand for that previous instruction.
++    * Except, it can be greater in case we need to copy operands around: the RA needs to reserve
++    * space between the two instructions for the copies.
++    */
++   RegisterDemand demand_between;
++
+    for (Operand op : instr->operands) {
+       if (op.isTemp() && op.isLateKill() && op.isFirstKill())
+          temp_registers += op.getTemp();
++      if (op.isTemp() && op.isFixed() && !op.isFirstKill()) {
++         for (Operand op2 : instr->operands) {
++            if (!op2.isTemp())
++               continue;
++            if (op2 == op)
++               break;
++
++            if (op2.tempId() == op.tempId() && op2.isFixed() && op2.physReg() != op.physReg()) {
++               if (op.isLateKill())
++                  temp_registers += op.getTemp();
++               else
++                  demand_between += op.getTemp();
++               break;
++            }
++         }
++      }
+    }
+ 
+    int op_idx = get_op_fixed_to_def(instr.get());
+-   if (op_idx != -1 && !instr->operands[op_idx].isKill()) {
+-      RegisterDemand before_instr;
+-      before_instr -= get_live_changes(instr);
+-      handle_def_fixed_to_op(&temp_registers, before_instr, instr.get(), op_idx);
+-   }
++   if (op_idx != -1 && !instr->operands[op_idx].isKill())
++      demand_between += instr->definitions[0].getTemp();
+ 
++   if (demand_between.sgpr || demand_between.vgpr)
++      temp_registers.update(demand_between - get_live_changes(instr));
+    return temp_registers;
+ }
+ 
+-- 
+GitLab
+
+
+From 43853acccd48eec2f1c344fc260883f382e17248 Mon Sep 17 00:00:00 2001
+From: Friedrich Vock <friedrich.vock@gmx.de>
+Date: Thu, 6 Jun 2024 18:01:37 +0200
+Subject: [PATCH 2/3] aco/live_var_analysis: Don't duplicate temp register
+ estimation
+
+---
+ src/amd/compiler/aco_live_var_analysis.cpp | 23 +---------------------
+ 1 file changed, 1 insertion(+), 22 deletions(-)
+
+diff --git a/src/amd/compiler/aco_live_var_analysis.cpp b/src/amd/compiler/aco_live_var_analysis.cpp
+index c610d57d2f7fb..07dd3c34a80bd 100644
+--- a/src/amd/compiler/aco_live_var_analysis.cpp
++++ b/src/amd/compiler/aco_live_var_analysis.cpp
+@@ -32,20 +32,6 @@ get_live_changes(aco_ptr<Instruction>& instr)
+    return changes;
+ }
+ 
+-void
+-handle_def_fixed_to_op(RegisterDemand* demand, RegisterDemand demand_before, Instruction* instr,
+-                       int op_idx)
+-{
+-   /* Usually the register demand before an instruction would be considered part of the previous
+-    * instruction, since it's not greater than the register demand for that previous instruction.
+-    * Except, it can be greater in the case of an definition fixed to a non-killed operand: the RA
+-    * needs to reserve space between the two instructions for the definition (containing a copy of
+-    * the operand).
+-    */
+-   demand_before += instr->definitions[0].getTemp();
+-   demand->update(demand_before);
+-}
+-
+ RegisterDemand
+ get_temp_registers(aco_ptr<Instruction>& instr)
+ {
+@@ -168,7 +154,6 @@ process_live_temps_per_block(Program* program, Block* block, unsigned& worklist,
+             new_demand -= temp;
+             definition.setKill(false);
+          } else {
+-            register_demand[idx] += temp;
+             definition.setKill(true);
+          }
+       }
+@@ -200,18 +185,12 @@ process_live_temps_per_block(Program* program, Block* block, unsigned& worklist,
+                      insn->operands[j].setKill(true);
+                   }
+                }
+-               if (operand.isLateKill())
+-                  register_demand[idx] += temp;
+                new_demand += temp;
+             }
+          }
+       }
+ 
+-      int op_idx = get_op_fixed_to_def(insn);
+-      if (op_idx != -1 && !insn->operands[op_idx].isKill()) {
+-         RegisterDemand before_instr = new_demand;
+-         handle_def_fixed_to_op(&register_demand[idx], before_instr, insn, op_idx);
+-      }
++      register_demand[idx] += get_temp_registers(block->instructions[idx]);
+    }
+ 
+    /* handle phi definitions */
+-- 
+GitLab
+
+
+From 5755ba8b3b32a1cf0906ca1c86ec6e31e14c1f67 Mon Sep 17 00:00:00 2001
+From: Friedrich Vock <friedrich.vock@gmx.de>
+Date: Fri, 7 Jun 2024 19:48:35 +0200
+Subject: [PATCH 3/3] aco/live_var_analysis: Fix fixed VGPRs intersecting
+ linear VGPR bounds
+
+If there is a fixed VGPR in a high register with low register demand
+(for example a definition fixed to v31 with demand = 32), then a linear
+VGPR might already be in that register. We can't move/split live ranges
+of linear VGPRs, so take the maximum fixed VGPR into account when
+determining where to allocate linear VGPRs.
+---
+ src/amd/compiler/aco_live_var_analysis.cpp | 23 ++++++++++++++++++----
+ 1 file changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/src/amd/compiler/aco_live_var_analysis.cpp b/src/amd/compiler/aco_live_var_analysis.cpp
+index 07dd3c34a80bd..cdd6c371df5f7 100644
+--- a/src/amd/compiler/aco_live_var_analysis.cpp
++++ b/src/amd/compiler/aco_live_var_analysis.cpp
+@@ -120,13 +120,17 @@ process_live_temps_per_block(Program* program, Block* block, unsigned& worklist,
+ {
+    std::vector<RegisterDemand>& register_demand = program->live.register_demand[block->index];
+    RegisterDemand new_demand;
++   unsigned linear_vgpr_demand = 0;
+ 
+    register_demand.resize(block->instructions.size());
+    IDSet live = program->live.live_out[block->index];
+ 
+    /* initialize register demand */
+-   for (unsigned t : live)
++   for (unsigned t : live) {
+       new_demand += Temp(t, program->temp_rc[t]);
++      if (program->temp_rc[t].is_linear_vgpr())
++         linear_vgpr_demand += program->temp_rc[t].size();
++   }
+    new_demand.sgpr -= phi_info[block->index].logical_phi_sgpr_ops;
+ 
+    /* traverse the instructions backwards */
+@@ -146,6 +150,9 @@ process_live_temps_per_block(Program* program, Block* block, unsigned& worklist,
+          }
+          if (definition.isFixed() && definition.physReg() == vcc)
+             program->needs_vcc = true;
++         if (definition.isFixed() && definition.regClass().type() == RegType::vgpr)
++            block->register_demand.update(
++               RegisterDemand((int16_t)(definition.physReg().reg() - 256 + linear_vgpr_demand), 0));
+ 
+          const Temp temp = definition.getTemp();
+          const size_t n = live.erase(temp.id());
+@@ -153,6 +160,8 @@ process_live_temps_per_block(Program* program, Block* block, unsigned& worklist,
+          if (n) {
+             new_demand -= temp;
+             definition.setKill(false);
++            if (temp.regClass().is_linear_vgpr())
++               linear_vgpr_demand -= temp.size();
+          } else {
+             definition.setKill(true);
+          }
+@@ -174,6 +183,9 @@ process_live_temps_per_block(Program* program, Block* block, unsigned& worklist,
+                continue;
+             if (operand.isFixed() && operand.physReg() == vcc)
+                program->needs_vcc = true;
++            if (operand.isFixed() && operand.regClass().type() == RegType::vgpr)
++               block->register_demand.update(
++                  RegisterDemand((int16_t)(operand.physReg().reg() - 256 + linear_vgpr_demand), 0));
+             const Temp temp = operand.getTemp();
+             const bool inserted = live.insert(temp.id()).second;
+             if (inserted) {
+@@ -186,6 +198,8 @@ process_live_temps_per_block(Program* program, Block* block, unsigned& worklist,
+                   }
+                }
+                new_demand += temp;
++               if (operand.regClass().is_linear_vgpr())
++                  linear_vgpr_demand += temp.size();
+             }
+          }
+       }
+@@ -469,6 +483,9 @@ live_var_analysis(Program* program)
+ 
+    program->needs_vcc = program->gfx_level >= GFX10;
+ 
++   for (auto& block : program->blocks)
++      block.register_demand = RegisterDemand();
++
+    /* this implementation assumes that the block idx corresponds to the block's position in
+     * program->blocks vector */
+    while (worklist) {
+@@ -484,11 +501,9 @@ live_var_analysis(Program* program)
+          phi_info[block.index].linear_phi_ops;
+ 
+       /* update block's register demand */
+-      if (program->progress < CompilationProgress::after_ra) {
+-         block.register_demand = RegisterDemand();
++      if (program->progress < CompilationProgress::after_ra)
+          for (RegisterDemand& demand : program->live.register_demand[block.index])
+             block.register_demand.update(demand);
+-      }
+ 
+       new_demand.update(block.register_demand);
+    }
+-- 
+GitLab
+
