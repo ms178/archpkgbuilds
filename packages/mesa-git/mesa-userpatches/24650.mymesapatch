@@ -1,0 +1,843 @@
+From c8eaa40c6aa8cc28bc174f31f1720fc97d3993ee Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Sat, 12 Aug 2023 16:49:00 +0200
+Subject: [PATCH 1/4] aco,nir: add dpp16_shift_amd intrinsic
+
+---
+ src/amd/compiler/aco_instruction_selection.cpp     | 14 ++++++++++++++
+ .../compiler/aco_instruction_selection_setup.cpp   |  1 +
+ src/compiler/nir/nir_divergence_analysis.c         |  1 +
+ src/compiler/nir/nir_intrinsics.py                 |  5 +++++
+ 4 files changed, 21 insertions(+)
+
+diff --git a/src/amd/compiler/aco_instruction_selection.cpp b/src/amd/compiler/aco_instruction_selection.cpp
+index d74f928e1a15f..205f8fe8e506b 100644
+--- a/src/amd/compiler/aco_instruction_selection.cpp
++++ b/src/amd/compiler/aco_instruction_selection.cpp
+@@ -8582,6 +8582,20 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
+       set_wqm(ctx);
+       break;
+    }
++   case nir_intrinsic_dpp16_shift_amd: {
++      Temp src = as_vgpr(ctx, get_ssa_temp(ctx, instr->src[0].ssa));
++      Temp dst = get_ssa_temp(ctx, &instr->def);
++      int delta = nir_intrinsic_base(instr);
++      assert(delta >= -15 && delta <= 15 && delta != 0);
++      assert(instr->def.bit_size != 1 && instr->def.bit_size < 64);
++      assert(ctx->options->gfx_level >= GFX8);
++
++      uint16_t dpp_ctrl = delta < 0 ? dpp_row_sr(-delta) : dpp_row_sl(delta);
++      bld.vop1_dpp(aco_opcode::v_mov_b32, Definition(dst), src, dpp_ctrl);
++
++      set_wqm(ctx);
++      break;
++   }
+    case nir_intrinsic_quad_broadcast:
+    case nir_intrinsic_quad_swap_horizontal:
+    case nir_intrinsic_quad_swap_vertical:
+diff --git a/src/amd/compiler/aco_instruction_selection_setup.cpp b/src/amd/compiler/aco_instruction_selection_setup.cpp
+index 5fe46c2e93cc0..239e72f128387 100644
+--- a/src/amd/compiler/aco_instruction_selection_setup.cpp
++++ b/src/amd/compiler/aco_instruction_selection_setup.cpp
+@@ -484,6 +484,7 @@ init_context(isel_context* ctx, nir_shader* shader)
+                case nir_intrinsic_write_invocation_amd:
+                case nir_intrinsic_mbcnt_amd:
+                case nir_intrinsic_lane_permute_16_amd:
++               case nir_intrinsic_dpp16_shift_amd:
+                case nir_intrinsic_load_instance_id:
+                case nir_intrinsic_ssbo_atomic:
+                case nir_intrinsic_ssbo_atomic_swap:
+diff --git a/src/compiler/nir/nir_divergence_analysis.c b/src/compiler/nir/nir_divergence_analysis.c
+index a5b770d4737e6..c645e42f375d6 100644
+--- a/src/compiler/nir/nir_divergence_analysis.c
++++ b/src/compiler/nir/nir_divergence_analysis.c
+@@ -705,6 +705,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
+    case nir_intrinsic_write_invocation_amd:
+    case nir_intrinsic_mbcnt_amd:
+    case nir_intrinsic_lane_permute_16_amd:
++   case nir_intrinsic_dpp16_shift_amd:
+    case nir_intrinsic_elect:
+    case nir_intrinsic_load_tlb_color_brcm:
+    case nir_intrinsic_load_tess_rel_patch_id_amd:
+diff --git a/src/compiler/nir/nir_intrinsics.py b/src/compiler/nir/nir_intrinsics.py
+index 2f9f13dbb587d..1de01eb58d355 100644
+--- a/src/compiler/nir/nir_intrinsics.py
++++ b/src/compiler/nir/nir_intrinsics.py
+@@ -545,6 +545,11 @@ intrinsic("write_invocation_amd", src_comp=[0, 0, 1], dest_comp=0, bit_sizes=src
+ intrinsic("mbcnt_amd", src_comp=[1, 1], dest_comp=1, bit_sizes=[32], flags=[CAN_ELIMINATE])
+ # Compiled to v_permlane16_b32. src = [ value, lanesel_lo, lanesel_hi ]
+ intrinsic("lane_permute_16_amd", src_comp=[1, 1, 1], dest_comp=1, bit_sizes=[32], flags=[CAN_ELIMINATE])
++# subgroup shuffle up/down with cluster size 16.
++# base in [-15, -1]: DPP_ROW_SR
++# base in [  1, 15]: DPP_ROW_SL, otherwise invalid.
++# Returns zero for invocations that try to read out of bounds
++intrinsic("dpp16_shift_amd", src_comp=[0], dest_comp=0, bit_sizes=src0, indices=[BASE], flags=[CAN_ELIMINATE])
+ 
+ # Basic Geometry Shader intrinsics.
+ #
+-- 
+GitLab
+
+
+From 7623b8e4ef99e7d7345ec82e4b45be0efbbe2be1 Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Mon, 20 Feb 2023 16:31:06 +0100
+Subject: [PATCH 2/4] nir: add a pass to optimize shuffle/booleans dependent
+ only on tid/consts
+
+This pass uses constant folding to determine which invocation is read by shuffle
+for each invocation. Then, it detects patterns in the result and uses more
+a specialized intrinsic if possible.
+
+For booleans it creates inverse_ballot.
+---
+ src/compiler/nir/meson.build            |   1 +
+ src/compiler/nir/nir.h                  |  17 +
+ src/compiler/nir/nir_opt_tid_function.c | 586 ++++++++++++++++++++++++
+ 3 files changed, 604 insertions(+)
+ create mode 100644 src/compiler/nir/nir_opt_tid_function.c
+
+diff --git a/src/compiler/nir/meson.build b/src/compiler/nir/meson.build
+index 836458bfbc4a0..f20f3946efafd 100644
+--- a/src/compiler/nir/meson.build
++++ b/src/compiler/nir/meson.build
+@@ -272,6 +272,7 @@ files_libnir = files(
+   'nir_opt_shrink_stores.c',
+   'nir_opt_shrink_vectors.c',
+   'nir_opt_sink.c',
++  'nir_opt_tid_function.c',
+   'nir_opt_undef.c',
+   'nir_opt_uniform_atomics.c',
+   'nir_opt_uniform_subgroup.c',
+diff --git a/src/compiler/nir/nir.h b/src/compiler/nir/nir.h
+index ed070eb14e015..694675dc7c5e9 100644
+--- a/src/compiler/nir/nir.h
++++ b/src/compiler/nir/nir.h
+@@ -6516,6 +6516,23 @@ bool nir_opt_algebraic_late(nir_shader *shader);
+ bool nir_opt_algebraic_distribute_src_mods(nir_shader *shader);
+ bool nir_opt_constant_folding(nir_shader *shader);
+ 
++typedef struct nir_opt_tid_function_options {
++   bool use_masked_swizzle_amd : 1;
++   bool use_dpp16_shift_amd : 1;
++   bool use_shuffle_xor : 1;
++   uint8_t rotate_cluster_sizes;
++   /* The can be smaller than the api subgroup/ballot size
++    * if some invocations are always inactive.
++    */
++   uint8_t hw_subgroup_size;
++   uint8_t hw_ballot_bit_size;
++   uint8_t hw_ballot_num_comp;
++} nir_opt_tid_function_options;
++
++bool
++nir_opt_tid_function(nir_shader *shader,
++                     const nir_opt_tid_function_options *options);
++
+ /* Try to combine a and b into a.  Return true if combination was possible,
+  * which will result in b being removed by the pass.  Return false if
+  * combination wasn't possible.
+diff --git a/src/compiler/nir/nir_opt_tid_function.c b/src/compiler/nir/nir_opt_tid_function.c
+new file mode 100644
+index 0000000000000..7ea45727654e8
+--- /dev/null
++++ b/src/compiler/nir/nir_opt_tid_function.c
+@@ -0,0 +1,586 @@
++/*
++ * Copyright 2023 Valve Corporation
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nir.h"
++#include "nir_builder.h"
++#include "nir_constant_expressions.h"
++
++/* This pass optimizes shuffles and boolean alu where the source can be
++ * expressed as a function of tid (only subgroup_id,
++ * invocation_id or constant as inputs).
++ * Shuffles are replaced by specialized intrinsics, boolean alu by inverse_ballot.
++ * The pass first computes the function of tid (fotid) mask, and then uses constant
++ * folding to compute the source for each invocation.
++ */
++
++#define NIR_MAX_SUBGROUP_SIZE     128
++#define FOTID_MAX_RECURSION_DEPTH 16 /* totally arbitrary */
++
++static inline unsigned
++src_get_fotid_mask(nir_src src)
++{
++   return src.ssa->parent_instr->pass_flags;
++}
++
++static inline unsigned
++alu_src_get_fotid_mask(nir_alu_instr *instr, unsigned idx)
++{
++   unsigned unswizzled = src_get_fotid_mask(instr->src[idx].src);
++   unsigned result = 0;
++   for (unsigned i = 0; i < nir_ssa_alu_instr_src_components(instr, idx); i++) {
++      bool is_fotid = unswizzled & (1u << instr->src[idx].swizzle[i]);
++      result |= is_fotid << i;
++   }
++   return result;
++}
++
++static void
++update_fotid_alu(nir_builder *b, nir_alu_instr *instr,
++                 const nir_opt_tid_function_options *options)
++{
++   /* For legacy reasons these are ALU instructions
++    * when they should be intrinsics.
++    */
++   if (nir_op_is_derivative(instr->op))
++      return;
++
++   const nir_op_info *info = &nir_op_infos[instr->op];
++
++   unsigned res = BITFIELD_MASK(instr->def.num_components);
++   for (unsigned i = 0; i < info->num_inputs; i++) {
++      unsigned src_mask = alu_src_get_fotid_mask(instr, i);
++      if (info->input_sizes[i] == 0)
++         res &= src_mask;
++      else if (src_mask != BITFIELD_MASK(info->input_sizes[i]))
++         res = 0;
++   }
++
++   instr->instr.pass_flags = res;
++}
++
++static void
++update_fotid_intrinsic(nir_builder *b, nir_intrinsic_instr *instr,
++                       const nir_opt_tid_function_options *options)
++{
++   switch (instr->intrinsic) {
++   case nir_intrinsic_load_subgroup_invocation: {
++      instr->instr.pass_flags = 1;
++      break;
++   }
++   case nir_intrinsic_load_local_invocation_id: {
++      /* TODO: is this always correct or do we need a callback? */
++      unsigned partial_size = 1;
++      for (unsigned i = 0; i < 3; i++) {
++         partial_size *= b->shader->info.workgroup_size[i];
++         if (partial_size == options->hw_subgroup_size)
++            instr->instr.pass_flags = BITFIELD_MASK(i + 1);
++      }
++      if (partial_size <= options->hw_subgroup_size)
++         instr->instr.pass_flags = 0x7;
++      break;
++   }
++   case nir_intrinsic_load_local_invocation_index: {
++      unsigned workgroup_size = b->shader->info.workgroup_size[0] *
++                                b->shader->info.workgroup_size[1] *
++                                b->shader->info.workgroup_size[2];
++      if (workgroup_size <= options->hw_subgroup_size)
++         instr->instr.pass_flags = 0x1;
++      break;
++   }
++   case nir_intrinsic_inverse_ballot: {
++      if (src_get_fotid_mask(instr->src[0]) ==
++          BITFIELD_MASK(instr->src[0].ssa->num_components)) {
++         instr->instr.pass_flags = 0x1;
++      }
++      break;
++   }
++   default: {
++      break;
++   }
++   }
++}
++
++static void
++update_fotid_load_const(nir_load_const_instr *instr)
++{
++   instr->instr.pass_flags = BITFIELD_MASK(instr->def.num_components);
++}
++
++static bool
++update_fotid_instr(nir_builder *b, nir_instr *instr,
++                   const nir_opt_tid_function_options *options)
++{
++   /* Gather a mask of components that are functions of tid. */
++   instr->pass_flags = 0;
++
++   switch (instr->type) {
++   case nir_instr_type_alu:
++      update_fotid_alu(b, nir_instr_as_alu(instr), options);
++      break;
++   case nir_instr_type_intrinsic:
++      update_fotid_intrinsic(b, nir_instr_as_intrinsic(instr), options);
++      break;
++   case nir_instr_type_load_const:
++      update_fotid_load_const(nir_instr_as_load_const(instr));
++      break;
++   default:
++      break;
++   }
++
++   return false;
++}
++
++static bool
++constant_fold_scalar(nir_scalar s, unsigned invocation_id,
++                     nir_shader *shader, nir_const_value *dest,
++                     unsigned depth)
++{
++   if (depth > FOTID_MAX_RECURSION_DEPTH)
++      return false;
++
++   memset(dest, 0, sizeof(*dest));
++
++   if (nir_scalar_is_alu(s)) {
++      nir_alu_instr *alu = nir_instr_as_alu(s.def->parent_instr);
++      nir_const_value sources[NIR_MAX_VEC_COMPONENTS][NIR_MAX_VEC_COMPONENTS];
++      const nir_op_info *op_info = &nir_op_infos[alu->op];
++
++      unsigned bit_size = 0;
++      if (!nir_alu_type_get_type_size(op_info->output_type))
++         bit_size = alu->def.bit_size;
++
++      for (unsigned i = 0; i < op_info->num_inputs; i++) {
++         if (!bit_size && !nir_alu_type_get_type_size(op_info->input_types[i]))
++            bit_size = alu->src[i].src.ssa->bit_size;
++
++         unsigned offset = 0;
++         unsigned num_comp = op_info->input_sizes[i];
++         if (num_comp == 0) {
++            num_comp = 1;
++            offset = s.comp;
++         }
++
++         for (unsigned j = 0; j < num_comp; j++) {
++            nir_scalar ss = nir_get_scalar(alu->src[i].src.ssa,
++                                           alu->src[i].swizzle[offset + j]);
++            if (!constant_fold_scalar(ss, invocation_id, shader,
++                                      &sources[i][j], depth + 1))
++               return false;
++         }
++      }
++
++      if (!bit_size)
++         bit_size = 32;
++
++      unsigned exec_mode = shader->info.float_controls_execution_mode;
++
++      nir_const_value *srcs[NIR_MAX_VEC_COMPONENTS];
++      for (unsigned i = 0; i < op_info->num_inputs; ++i)
++         srcs[i] = sources[i];
++      nir_const_value dests[NIR_MAX_VEC_COMPONENTS];
++      if (op_info->output_size == 0) {
++         nir_eval_const_opcode(alu->op, dests, 1, bit_size, srcs, exec_mode);
++         *dest = dests[0];
++      } else {
++         nir_eval_const_opcode(alu->op, dests, s.def->num_components, bit_size, srcs, exec_mode);
++         *dest = dests[s.comp];
++      }
++      return true;
++   } else if (nir_scalar_is_intrinsic(s)) {
++      switch (nir_scalar_intrinsic_op(s)) {
++      case nir_intrinsic_load_subgroup_invocation:
++      case nir_intrinsic_load_local_invocation_index: {
++         *dest = nir_const_value_for_uint(invocation_id, s.def->bit_size);
++         return true;
++      }
++      case nir_intrinsic_load_local_invocation_id: {
++         unsigned local_ids[3];
++         local_ids[2] = invocation_id / (shader->info.workgroup_size[0] * shader->info.workgroup_size[1]);
++         unsigned xy = invocation_id % (shader->info.workgroup_size[0] * shader->info.workgroup_size[1]);
++         local_ids[1] = xy / shader->info.workgroup_size[0];
++         local_ids[0] = xy % shader->info.workgroup_size[0];
++         *dest = nir_const_value_for_uint(local_ids[s.comp], s.def->bit_size);
++         return true;
++      }
++      case nir_intrinsic_inverse_ballot: {
++         nir_def *src = nir_instr_as_intrinsic(s.def->parent_instr)->src[0].ssa;
++         unsigned comp = invocation_id / src->bit_size;
++         unsigned bit = invocation_id % src->bit_size;
++         if (!constant_fold_scalar(nir_get_scalar(src, comp), invocation_id,
++                                   shader, dest, depth + 1))
++            return false;
++         uint64_t ballot = nir_const_value_as_uint(*dest, src->bit_size);
++         *dest = nir_const_value_for_bool(ballot & (1ull << bit), 1);
++         return true;
++      }
++      default:
++         break;
++      }
++   } else if (nir_scalar_is_const(s)) {
++      *dest = nir_scalar_as_const_value(s);
++      return true;
++   }
++
++   unreachable("unhandled scalar type");
++   return false;
++}
++
++struct fotid_context {
++   const nir_opt_tid_function_options *options;
++   uint8_t src_invoc[NIR_MAX_SUBGROUP_SIZE];
++   bool reads_zero[NIR_MAX_SUBGROUP_SIZE];
++   nir_shader *shader;
++};
++
++static bool
++gather_read_invocation_shuffle(nir_def *src, struct fotid_context *ctx)
++{
++   nir_scalar s = { src, 0 };
++
++   /* Recursive constant folding for each invocation */
++   for (unsigned i = 0; i < ctx->options->hw_subgroup_size; i++) {
++      nir_const_value value;
++      if (!constant_fold_scalar(s, i, ctx->shader, &value, 0))
++         return false;
++      ctx->src_invoc[i] =
++         MIN2(nir_const_value_as_uint(value, src->bit_size), UINT8_MAX);
++   }
++
++   return true;
++}
++
++static nir_alu_instr *
++get_singluar_user_bcsel(nir_def *def, unsigned *src_idx)
++{
++   if (def->num_components != 1 || !list_is_singular(&def->uses))
++      return NULL;
++
++   nir_alu_instr *bcsel = NULL;
++   nir_foreach_use_including_if_safe(src, def) {
++      if (nir_src_is_if(src) || nir_src_parent_instr(src)->type != nir_instr_type_alu)
++         return NULL;
++      bcsel = nir_instr_as_alu(nir_src_parent_instr(src));
++      if (bcsel->op != nir_op_bcsel || bcsel->def.num_components != 1)
++         return NULL;
++      *src_idx = list_entry(src, nir_alu_src, src) - bcsel->src;
++      break;
++   }
++   assert(*src_idx < 3);
++
++   if (*src_idx == 0)
++      return NULL;
++   return bcsel;
++}
++
++static bool
++gather_invocation_uses(nir_alu_instr *bcsel, unsigned shuffle_idx, struct fotid_context *ctx)
++{
++   if (!alu_src_get_fotid_mask(bcsel, 0))
++      return false;
++
++   nir_scalar s = { bcsel->src[0].src.ssa, bcsel->src[0].swizzle[0] };
++
++   bool can_remove_bcsel = nir_src_is_const(bcsel->src[3 - shuffle_idx].src) &&
++                           nir_src_as_uint(bcsel->src[3 - shuffle_idx].src) == 0;
++
++   /* Recursive constant folding for each invocation */
++   for (unsigned i = 0; i < ctx->options->hw_subgroup_size; i++) {
++      nir_const_value value;
++      if (!constant_fold_scalar(s, i, ctx->shader, &value, 0)) {
++         can_remove_bcsel = false;
++         continue;
++      }
++
++      /* If this invocation selects the other source,
++       * so we can read an undefined result. */
++      if (nir_const_value_as_bool(value, 1) == (shuffle_idx != 1)) {
++         ctx->src_invoc[i] = UINT8_MAX;
++         ctx->reads_zero[i] = can_remove_bcsel;
++      }
++   }
++
++   if (can_remove_bcsel) {
++      return true;
++   } else {
++      memset(ctx->reads_zero, 0, sizeof(ctx->reads_zero));
++      return false;
++   }
++}
++
++static nir_def *
++try_opt_bitwise_mask(nir_builder *b, nir_def *def, struct fotid_context *ctx)
++{
++   unsigned one = NIR_MAX_SUBGROUP_SIZE - 1;
++   unsigned zero = NIR_MAX_SUBGROUP_SIZE - 1;
++   unsigned copy = NIR_MAX_SUBGROUP_SIZE - 1;
++   unsigned invert = NIR_MAX_SUBGROUP_SIZE - 1;
++
++   for (unsigned i = 0; i < ctx->options->hw_subgroup_size; i++) {
++      unsigned read = ctx->src_invoc[i];
++      if (read >= ctx->options->hw_subgroup_size)
++         continue; /* undefined result */
++
++      copy &= ~(read ^ i);
++      invert &= read ^ i;
++      one &= read;
++      zero &= ~read;
++   }
++
++   /* We didn't find valid masks for at least one bit. */
++   if ((copy | zero | one | invert) != NIR_MAX_SUBGROUP_SIZE - 1)
++      return NULL;
++
++   unsigned and_mask = copy | invert;
++   unsigned xor_mask = (one | invert) & ~copy;
++
++
++#if 0
++   fprintf(stderr, "and %x, xor %x \n", and_mask, xor_mask);
++
++   assert(false);
++#endif
++
++   if ((and_mask & (ctx->options->hw_subgroup_size - 1)) == 0) {
++      return nir_read_invocation(b, def, nir_imm_int(b, xor_mask));
++   } else if (and_mask == 0x7f && xor_mask == 0) {
++      return def;
++   } else if (ctx->options->use_shuffle_xor && and_mask == 0x7f) {
++      return nir_shuffle_xor(b, def, nir_imm_int(b, xor_mask));
++   } else if (ctx->options->use_masked_swizzle_amd &&
++              (and_mask & 0x60) == 0x60 && xor_mask <= 0x1f) {
++      return nir_masked_swizzle_amd(b, def,
++                                    (xor_mask << 10) | (and_mask & 0x1f),
++                                    .fetch_inactive = true);
++   }
++
++   return NULL;
++}
++
++static nir_def *
++try_opt_rotate(nir_builder *b, nir_def *def, struct fotid_context *ctx)
++{
++   u_foreach_bit(i, ctx->options->rotate_cluster_sizes) {
++      unsigned csize = 1u << i;
++      unsigned cmask = csize - 1;
++
++      unsigned delta = UINT_MAX;
++      for (unsigned i = 0; i < ctx->options->hw_subgroup_size; i++) {
++         if (ctx->src_invoc[i] >= ctx->options->hw_subgroup_size)
++            continue;
++
++         if (ctx->src_invoc[i] >= i)
++            delta = ctx->src_invoc[i] - i;
++         else
++            delta = csize - i + ctx->src_invoc[i];
++         break;
++      }
++
++      if (delta >= csize || delta == 0)
++         continue;
++
++      bool use_rotate = true;
++      for (unsigned i = 0; i < ctx->options->hw_subgroup_size; i++) {
++         if (ctx->src_invoc[i] >= ctx->options->hw_subgroup_size)
++            continue;
++         use_rotate &= (((i + delta) & cmask) + (i & ~cmask)) == ctx->src_invoc[i];
++      }
++
++      if (use_rotate)
++         return nir_rotate(b, def, nir_imm_int(b, delta), .cluster_size = csize);
++   }
++
++   return NULL;
++}
++
++static nir_def *
++try_opt_dpp16_shift(nir_builder *b, nir_def *def, struct fotid_context *ctx)
++{
++   int delta = INT_MAX;
++   for (unsigned i = 0; i < ctx->options->hw_subgroup_size; i++) {
++      if (ctx->src_invoc[i] >= ctx->options->hw_subgroup_size)
++         continue;
++      delta = ctx->src_invoc[i] - i;
++      break;
++   }
++
++   if (delta < -15 && delta > 15 && delta == 0)
++      return NULL;
++
++   for (unsigned i = 0; i < ctx->options->hw_subgroup_size; i++) {
++      int read = i + delta;
++      bool out_of_bounds = (read & ~0xf) != (i & ~0xf);
++      if (ctx->reads_zero[i] && !out_of_bounds)
++         return NULL;
++      if (ctx->src_invoc[i] >= ctx->options->hw_subgroup_size)
++         continue;
++      if (read != ctx->src_invoc[i] || out_of_bounds)
++         return NULL;
++   }
++
++   return nir_dpp16_shift_amd(b, def, .base = delta);
++}
++
++enum opt_shuffle_progress {
++   OPT_SHUFFLE_NO_PROGRESS = 0,
++   OPT_SHUFFLE_PROGRESS,
++   OPT_SHUFFLE_PROGRESS_BCSEL,
++};
++
++static enum opt_shuffle_progress
++opt_fotid_shuffle(nir_builder *b, nir_intrinsic_instr *instr,
++                  const nir_opt_tid_function_options *options,
++                  bool revist_bcsel)
++{
++   if (instr->intrinsic != nir_intrinsic_shuffle)
++      return OPT_SHUFFLE_NO_PROGRESS;
++   if (!instr->src[1].ssa->parent_instr->pass_flags)
++      return OPT_SHUFFLE_NO_PROGRESS;
++
++   unsigned src_idx = 0;
++   nir_alu_instr *bcsel = get_singluar_user_bcsel(&instr->def, &src_idx);
++   /* Skip this shuffle, it will be revisited later when
++    * the function of tid mask is set on the bcsel.
++    */
++   if (bcsel && !revist_bcsel)
++      return OPT_SHUFFLE_NO_PROGRESS;
++
++   /* We already tried (and failed) to optimize this shuffle. */
++   if (!bcsel && revist_bcsel)
++      return OPT_SHUFFLE_NO_PROGRESS;
++
++   struct fotid_context ctx = {
++      .options = options,
++      .reads_zero = {},
++      .shader = b->shader,
++   };
++
++   memset(ctx.src_invoc, 0xff, sizeof(ctx.src_invoc));
++
++   if (!gather_read_invocation_shuffle(instr->src[1].ssa, &ctx))
++      return OPT_SHUFFLE_NO_PROGRESS;
++
++   /* Generalize src_invoc by taking into account which invocations
++    * do not use the shuffle result because of bcsel.
++    */
++   bool can_remove_bcsel = false;
++   if (bcsel)
++      can_remove_bcsel = gather_invocation_uses(bcsel, src_idx, &ctx);
++
++#if 0
++   for (int i = 0; i < options->hw_subgroup_size; i++) {
++      fprintf(stderr, "invocation %d reads %d\n", i, ctx.src_invoc[i]);
++   }
++
++   for (int i = 0; i < options->hw_subgroup_size; i++) {
++      fprintf(stderr, "invocation %d zero %d\n", i, ctx.reads_zero[i]);
++   }
++#endif
++
++   b->cursor = nir_after_instr(&instr->instr);
++
++   nir_def *res = NULL;
++
++   if (can_remove_bcsel && options->use_dpp16_shift_amd) {
++      res = try_opt_dpp16_shift(b, instr->src[0].ssa, &ctx);
++      if (res) {
++         nir_def_replace(&bcsel->def, res);
++         nir_instr_remove(&instr->instr);
++         return OPT_SHUFFLE_PROGRESS_BCSEL;
++      }
++   }
++
++   if (!res)
++      res = try_opt_bitwise_mask(b, instr->src[0].ssa, &ctx);
++   if (!res)
++      res = try_opt_rotate(b, instr->src[0].ssa, &ctx);
++
++   if (res) {
++      nir_def_replace(&instr->def, res);
++      return OPT_SHUFFLE_PROGRESS;
++   } else {
++      return OPT_SHUFFLE_NO_PROGRESS;
++   }
++}
++
++static bool
++opt_fotid_bool(nir_builder *b, nir_alu_instr *instr,
++               const nir_opt_tid_function_options *options)
++{
++   nir_scalar s = { &instr->def, 0 };
++
++   b->cursor = nir_after_instr(&instr->instr);
++
++   nir_def *ballot_comp[NIR_MAX_VEC_COMPONENTS];
++
++   for (unsigned comp = 0; comp < options->hw_ballot_num_comp; comp++) {
++      uint64_t cballot = 0;
++      for (unsigned i = 0; i < options->hw_ballot_bit_size; i++) {
++         unsigned invocation_id = comp * options->hw_ballot_bit_size + i;
++         if (invocation_id >= options->hw_subgroup_size)
++            break;
++         nir_const_value value;
++         if (!constant_fold_scalar(s, invocation_id, b->shader, &value, 0))
++            return false;
++         cballot |= nir_const_value_as_uint(value, 1) << i;
++      }
++      ballot_comp[comp] = nir_imm_intN_t(b, cballot, options->hw_ballot_bit_size);
++   }
++
++   nir_def *ballot = nir_vec(b, ballot_comp, options->hw_ballot_num_comp);
++   nir_def *res = nir_inverse_ballot(b, 1, ballot);
++   res->parent_instr->pass_flags = 1;
++
++   nir_def_replace(&instr->def, res);
++   return true;
++}
++
++static bool
++visit_instr(nir_builder *b, nir_instr *instr, void *params)
++{
++   const nir_opt_tid_function_options *options = params;
++   update_fotid_instr(b, instr, options);
++
++   switch (instr->type) {
++   case nir_instr_type_alu: {
++      nir_alu_instr *alu = nir_instr_as_alu(instr);
++
++      if (alu->op == nir_op_bcsel && alu->def.bit_size != 1) {
++         /* revist shuffles that we skipped previously */
++         bool progress = false;
++         for (unsigned i = 1; i < 3; i++) {
++            nir_instr *src_instr = alu->src[i].src.ssa->parent_instr;
++            if (src_instr->type == nir_instr_type_intrinsic) {
++               nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(src_instr);
++               enum opt_shuffle_progress res = opt_fotid_shuffle(b, intrin, options, true);
++               progress |= res != OPT_SHUFFLE_NO_PROGRESS;
++               if (res == OPT_SHUFFLE_PROGRESS_BCSEL)
++                  break;
++            }
++         }
++         return progress;
++      }
++
++      if (!options->hw_ballot_bit_size || !options->hw_ballot_num_comp)
++         return false;
++      if (alu->def.bit_size != 1 || alu->def.num_components > 1 || !instr->pass_flags)
++         return false;
++      return opt_fotid_bool(b, alu, options);
++   }
++   case nir_instr_type_intrinsic: {
++      nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
++      return opt_fotid_shuffle(b, intrin, options, false) != OPT_SHUFFLE_NO_PROGRESS;
++   }
++   default:
++      return false;
++   }
++}
++
++bool
++nir_opt_tid_function(nir_shader *shader,
++                     const nir_opt_tid_function_options *options)
++{
++   return nir_shader_instructions_pass(
++      shader, visit_instr, nir_metadata_control_flow, (void *)options);
++}
+-- 
+GitLab
+
+
+From 85af2407b7a57c8f8c4d5e09c5bd9c9249b00da2 Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Sat, 12 Aug 2023 16:51:21 +0200
+Subject: [PATCH 3/4] radv: use nir_opt_tid_function for shuffles
+
+The main motivation were open coded clustered inclusive scans
+and clustered broadcasts in the gdeflate decompression shader used by
+DirectStorage.
+
+Foz-DB Navi21 (only the_last_of_us_part1 is affected):
+Totals from 8 (0.01% of 79395) affected shaders:
+Instrs: 6230 -> 5438 (-12.71%)
+CodeSize: 33376 -> 29148 (-12.67%)
+Latency: 77017 -> 72917 (-5.32%)
+InvThroughput: 10190 -> 9280 (-8.93%)
+Copies: 566 -> 569 (+0.53%)
+PreSGPRs: 528 -> 524 (-0.76%)
+PreVGPRs: 232 -> 230 (-0.86%)
+VALU: 2889 -> 2616 (-9.45%)
+SALU: 1748 -> 1491 (-14.70%); split: -14.82%, +0.11%
+---
+ src/amd/vulkan/radv_pipeline.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_pipeline.c b/src/amd/vulkan/radv_pipeline.c
+index 94267eefffa5c..d6e7517ff758e 100644
+--- a/src/amd/vulkan/radv_pipeline.c
++++ b/src/amd/vulkan/radv_pipeline.c
+@@ -384,6 +384,16 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
+       NIR_PASS(_, stage->nir, radv_nir_lower_fs_intrinsics, stage, gfx_state);
+    }
+ 
++   /* LLVM could support more of these in theory. */
++   bool use_llvm = radv_use_llvm_for_stage(pdev, stage->stage);
++   nir_opt_tid_function_options tid_options = {
++      .use_masked_swizzle_amd = true,
++      .use_dpp16_shift_amd = !use_llvm && gfx_level >= GFX8,
++      .rotate_cluster_sizes = use_llvm ? 0 : 64 | 32 | 16 | 8 | 4,
++      .hw_subgroup_size = stage->info.wave_size,
++   };
++   NIR_PASS(_, stage->nir, nir_opt_tid_function, &tid_options);
++
+    enum nir_lower_non_uniform_access_type lower_non_uniform_access_types =
+       nir_lower_non_uniform_ubo_access | nir_lower_non_uniform_ssbo_access | nir_lower_non_uniform_texture_access |
+       nir_lower_non_uniform_image_access;
+-- 
+GitLab
+
+
+From 141f3a874bdd9caa83d55d8a7a3d968954f78630 Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Wed, 13 Sep 2023 14:14:05 +0200
+Subject: [PATCH 4/4] radv: use nir_opt_tid_function to create inverse_ballot
+
+Foz-DB Navi21:
+Totals from 542 (0.68% of 79395) affected shaders:
+Instrs: 617316 -> 616259 (-0.17%); split: -0.19%, +0.02%
+CodeSize: 3347852 -> 3320040 (-0.83%); split: -0.85%, +0.02%
+VGPRs: 21864 -> 21824 (-0.18%); split: -0.29%, +0.11%
+SpillSGPRs: 207 -> 199 (-3.86%)
+Latency: 4900847 -> 4895665 (-0.11%); split: -0.11%, +0.01%
+InvThroughput: 860278 -> 857272 (-0.35%); split: -0.35%, +0.00%
+SClause: 21251 -> 21169 (-0.39%); split: -0.40%, +0.01%
+Copies: 57759 -> 58881 (+1.94%); split: -0.06%, +2.00%
+Branches: 20854 -> 20365 (-2.34%); split: -2.36%, +0.01%
+PreSGPRs: 20785 -> 20774 (-0.05%)
+PreVGPRs: 17309 -> 17212 (-0.56%)
+VALU: 379885 -> 378180 (-0.45%); split: -0.45%, +0.00%
+SALU: 87522 -> 88664 (+1.30%); split: -0.02%, +1.32%
+---
+ src/amd/vulkan/radv_pipeline.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_pipeline.c b/src/amd/vulkan/radv_pipeline.c
+index d6e7517ff758e..00e8f67467137 100644
+--- a/src/amd/vulkan/radv_pipeline.c
++++ b/src/amd/vulkan/radv_pipeline.c
+@@ -37,6 +37,9 @@
+ #include "vk_format.h"
+ #include "vk_nir_convert_ycbcr.h"
+ #include "vk_ycbcr_conversion.h"
++#if AMD_LLVM_AVAILABLE
++#include "ac_llvm_util.h"
++#endif
+ 
+ bool
+ radv_shader_need_indirect_descriptor_sets(const struct radv_shader *shader)
+@@ -386,11 +389,17 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
+ 
+    /* LLVM could support more of these in theory. */
+    bool use_llvm = radv_use_llvm_for_stage(pdev, stage->stage);
++   bool has_inverse_ballot = true;
++#if AMD_LLVM_AVAILABLE
++   has_inverse_ballot = !use_llvm || LLVM_VERSION_MAJOR >= 17;
++#endif
+    nir_opt_tid_function_options tid_options = {
+       .use_masked_swizzle_amd = true,
+       .use_dpp16_shift_amd = !use_llvm && gfx_level >= GFX8,
+       .rotate_cluster_sizes = use_llvm ? 0 : 64 | 32 | 16 | 8 | 4,
+       .hw_subgroup_size = stage->info.wave_size,
++      .hw_ballot_bit_size = has_inverse_ballot ? stage->info.wave_size : 0,
++      .hw_ballot_num_comp = has_inverse_ballot ? 1 : 0,
+    };
+    NIR_PASS(_, stage->nir, nir_opt_tid_function, &tid_options);
+ 
+-- 
+GitLab
+
