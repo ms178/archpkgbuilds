@@ -13,20 +13,20 @@ ${BOLTPATH}/llvm-bolt \
     --lite=false \
     --instrument \
     --instrumentation-file-append-pid \
-    --instrumentation-file=${TOPLEV}/stage3-without-sampling/instrumentdata/clang-19.fdata \
-    ${CPATH}/clang-19 \
-    -o ${CPATH}/clang-19.inst
+    --instrumentation-file=${TOPLEV}/stage3-without-sampling/instrumentdata/clang-20.fdata \
+    ${CPATH}/clang-20 \
+    -o ${CPATH}/clang-20.inst
 
 echo "Moving instrumented Clang binary"
-mv ${CPATH}/clang-19 ${CPATH}/clang-19.org
-mv ${CPATH}/clang-19.inst ${CPATH}/clang-19
+mv ${CPATH}/clang-20 ${CPATH}/clang-20.org
+mv ${CPATH}/clang-20.inst ${CPATH}/clang-20
 
 echo "Instrument LLD with llvm-bolt"
 ${BOLTPATH}/llvm-bolt \
     --lite=false \
     --instrument \
     --instrumentation-file-append-pid \
-    --instrumentation-file=${TOPLEV}/stage3-without-sampling/instrumentdata/lld-19.fdata \
+    --instrumentation-file=${TOPLEV}/stage3-without-sampling/instrumentdata/lld-20.fdata \
     ${CPATH}/lld \
     -o ${CPATH}/lld.inst
 
@@ -49,7 +49,7 @@ cmake -G Ninja ../llvm-project/llvm \
     -D CMAKE_SHARED_LINKER_FLAGS="-Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -march=native -mtune=native -maes -mbmi2 -mpclmul -fuse-ld=lld -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables" \
     -DLLVM_VP_COUNTERS_PER_SITE=6 \
     -DCMAKE_AR=${CPATH}/llvm-ar \
-    -DCMAKE_C_COMPILER=${CPATH}/clang-19 \
+    -DCMAKE_C_COMPILER=${CPATH}/clang-20 \
     -DCMAKE_CXX_COMPILER=${CPATH}/clang++ \
     -DLLVM_USE_LINKER=${CPATH}/ld.lld \
     -DCMAKE_RANLIB=${CPATH}/llvm-ranlib \
@@ -63,9 +63,9 @@ cd ${TOPLEV}/stage3-without-sampling/instrumentdata
 LD_PRELOAD=/usr/lib/libjemalloc.so ${BOLTPATH}/merge-fdata *.fdata > combined.fdata
 echo "Optimizing Clang and LLD with the generated profile"
 
-LD_PRELOAD=/usr/lib/libjemalloc.so ${BOLTPATH}/llvm-bolt ${CPATH}/clang-19.org \
+LD_PRELOAD=/usr/lib/libjemalloc.so ${BOLTPATH}/llvm-bolt ${CPATH}/clang-20.org \
     --data combined.fdata \
-    -o ${CPATH}/clang-19 \
+    -o ${CPATH}/clang-20 \
     -reorder-blocks=ext-tsp \
     -reorder-functions=cdsort \
     -split-functions \

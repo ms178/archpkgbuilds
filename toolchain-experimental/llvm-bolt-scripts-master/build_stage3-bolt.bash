@@ -37,15 +37,15 @@ cd ${TOPLEV}
 
 echo "Converting profile to a more aggreated form suitable to be consumed by BOLT"
 
-LD_PRELOAD=/usr/lib/libjemalloc.so ${BOLTPATH}/perf2bolt ${CPATH}/clang-19 \
+LD_PRELOAD=/usr/lib/libjemalloc.so ${BOLTPATH}/perf2bolt ${CPATH}/clang-20 \
     -p ${TOPLEV}/perf.data \
-    -o ${TOPLEV}/clang-19.fdata || (echo "Could not convert perf-data to bolt for clang-19"; exit 1)
+    -o ${TOPLEV}/clang-20.fdata || (echo "Could not convert perf-data to bolt for clang-20"; exit 1)
 
 echo "Optimizing Clang with the generated profile"
 
-LD_PRELOAD=/usr/lib/libjemalloc.so ${BOLTPATH}/llvm-bolt ${CPATH}/clang-19 \
-    -o ${CPATH}/clang-19.bolt \
-    --data ${TOPLEV}/clang-19.fdata \
+LD_PRELOAD=/usr/lib/libjemalloc.so ${BOLTPATH}/llvm-bolt ${CPATH}/clang-20 \
+    -o ${CPATH}/clang-20.bolt \
+    --data ${TOPLEV}/clang-20.fdata \
     -reorder-blocks=ext-tsp \
     -reorder-functions=cds \
     -split-functions \
@@ -61,8 +61,8 @@ LD_PRELOAD=/usr/lib/libjemalloc.so ${BOLTPATH}/llvm-bolt ${CPATH}/clang-19 \
     -hot-data -x86-strip-redundant-address-size -lite=false -reorder-data-algo=funcs -inline-memcpy -cg-from-perf-data \
     -plt=hot || (echo "Could not optimize binary for clang"; exit 1)
 
-echo "move bolted binary to clang-19"
-mv ${CPATH}/clang-19 ${CPATH}/clang-19.org
-mv ${CPATH}/clang-19.bolt ${CPATH}/clang-19
+echo "move bolted binary to clang-20"
+mv ${CPATH}/clang-20 ${CPATH}/clang-20.org
+mv ${CPATH}/clang-20.bolt ${CPATH}/clang-20
 
 echo "You can now use the compiler with export PATH=${CPATH}"
