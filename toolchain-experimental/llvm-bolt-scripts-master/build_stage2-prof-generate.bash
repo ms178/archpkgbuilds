@@ -16,11 +16,11 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -DCMAKE_C_COMPILER=${CPATH}/clang \
     -DCMAKE_CXX_COMPILER=${CPATH}/clang++ \
     -DLLVM_USE_LINKER=${CPATH}/ld.lld \
-        -D CMAKE_C_FLAGS="-O2 -g3 -march=native -mtune=native -maes -mbmi2 -mpclmul -falign-functions=32 -fno-semantic-interposition -fno-omit-frame-pointer -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables" \
-        -D CMAKE_CXX_FLAGS="-O2 -g3 -march=native -mtune=native -maes -mbmi2 -mpclmul -falign-functions=32 -fno-semantic-interposition -fno-omit-frame-pointer -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables" \
-        -D CMAKE_EXE_LINKER_FLAGS="-Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O2,-O2,-Bsymbolic-functions,--as-needed -fuse-ld=lld -maes -mbmi2 -mpclmul -flto=thin -fwhole-program-vtables" \
-        -D CMAKE_MODULE_LINKER_FLAGS="-Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O2,-O2,-Bsymbolic-functions,--as-needed -fuse-ld=lld -maes -mbmi2 -mpclmul -flto=thin -fwhole-program-vtables" \
-        -D CMAKE_SHARED_LINKER_FLAGS="-Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O2,-O2,-Bsymbolic-functions,--as-needed -fuse-ld=lld -maes -mbmi2 -mpclmul -flto=thin -fwhole-program-vtables" \
+        -D CMAKE_C_FLAGS="-O2 -g3 -march=native -mtune=native -falign-functions=32 -fno-semantic-interposition -fno-omit-frame-pointer -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables" \
+        -D CMAKE_CXX_FLAGS="-O2 -g3 -march=native -mtune=native -falign-functions=32 -fno-semantic-interposition -fno-omit-frame-pointer -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables" \
+        -D CMAKE_EXE_LINKER_FLAGS="-Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O2,-O2,-Bsymbolic-functions,--as-needed -fuse-ld=lld -flto=thin -fwhole-program-vtables -Wl,--push-state -Wl,-whole-archive -lmimalloc -Wl,--pop-state -lpthread -lstdc++ -lm -ldl" \
+        -D CMAKE_MODULE_LINKER_FLAGS="-Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O2,-O2,-Bsymbolic-functions,--as-needed -fuse-ld=lld -flto=thin -fwhole-program-vtables -Wl,--push-state -Wl,-whole-archive -lmimalloc -Wl,--pop-state -lpthread -lstdc++ -lm -ldl" \
+        -D CMAKE_SHARED_LINKER_FLAGS="-Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O2,-O2,-Bsymbolic-functions,--as-needed -fuse-ld=lld -flto=thin -fwhole-program-vtables -Wl,--push-state -Wl,-whole-archive -lmimalloc -Wl,--pop-state -lpthread -lstdc++ -lm -ldl" \
         -DLLVM_ENABLE_PROJECTS="lld;clang" \
         -DLLVM_TARGETS_TO_BUILD="X86" \
         -D CLANG_ENABLE_ARCMT=OFF \
