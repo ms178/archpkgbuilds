@@ -1,3 +1,785 @@
+https://github.com/GloriousEggroll/Linux-Pollrate-Patch
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index a1068742a6df..99bd3b31ea63 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -5472,6 +5472,14 @@
+ 					delay after resetting its port);
+ 			Example: quirks=0781:5580:bk,0a5c:5834:gij
+ 
++	usbcore.interrupt_interval_override=
++			[USB] A list of USB devices for which a different polling
++			interval than the default shall be used on all interrupt-type
++			endpoints. The format is VendorID:ProductID:interval, with
++			the vendor and product ids specified hexadecimally, and the
++			interval decimally in milliseconds.
++			Example: interrupt_interval_override=045e:00db:16,1bcf:0005:2
++
+ 	usbhid.mousepoll=
+ 			[USBHID] The interval which mice are to be polled at.
+ 
+diff --git a/drivers/usb/core/config.c b/drivers/usb/core/config.c
+index 562a730befda..b6e51182ca5b 100644
+--- a/drivers/usb/core/config.c
++++ b/drivers/usb/core/config.c
+@@ -19,6 +19,149 @@
+ #define USB_MAXCONFIG			8	/* Arbitrary limit */
+ 
+ 
++/* A struct associated with the interrupt_interval_override module parameter, representing
++   an user's choice to force a specific interrupt interval upon all interrupt endpoints of
++   a certain device. */
++struct interrupt_interval_override {
++	/* The vendor ID of the device of which the interrupt interval shall be overridden */
++	u16 vendor;
++	/* The product ID of the device of which the interrupt interval shall be overridden */
++	u16 product;
++	/* The new interval measured in milliseconds that shall be given to all endpoints of type interrupt on said device */
++	unsigned int interval;
++};
++
++static DEFINE_MUTEX(interrupt_interval_override_mutex);
++static char interrupt_interval_override_param[128];
++static struct interrupt_interval_override *interrupt_interval_override_list = NULL;
++static size_t interrupt_interval_override_count = 0;
++
++static int interrupt_interval_override_param_set(const char *value, const struct kernel_param *kp)
++{
++	const char *p;
++	unsigned short vendor, product;
++	unsigned int interval;
++	struct interrupt_interval_override* list;
++	struct interrupt_interval_override param;
++	size_t count, max_count, i, len;
++	int err, res;
++
++	mutex_lock(&interrupt_interval_override_mutex);
++
++	if (!value || !*value) {
++		/* Unset the current variable. */
++		kfree(interrupt_interval_override_list);
++		interrupt_interval_override_list = NULL;
++		interrupt_interval_override_count = 0;
++		param_set_copystring(value, kp);  /* Does not fail: the empty string is short enough to fit. */
++		mutex_unlock(&interrupt_interval_override_mutex);
++		return 0;
++	}
++
++	/* Compute an upper bound on the amount of entries we need. */
++	for (max_count = 1, i = 0; value[i]; i++) {
++		if (value[i] == ',')
++			max_count++;
++	}
++
++	/* Ensure we can allocate enough memory before overwriting the global variables. */
++	list = kcalloc(max_count,
++		sizeof(struct interrupt_interval_override),
++		GFP_KERNEL);
++
++	if (!list) {
++		mutex_unlock(&interrupt_interval_override_mutex);
++		return -ENOMEM;
++	}
++
++	err = param_set_copystring(value, kp);
++	if (err) {
++		kfree(list);
++		mutex_unlock(&interrupt_interval_override_mutex);
++		return err;
++	}
++
++	/* Parse the parameter. Example of a valid parameter: 045e:00db:16,1bcf:0005:2 */
++	for (count = 0, p = (const char*)value; p && *p;) {
++		res = sscanf(p, "%hx:%hx:%d%zn", &vendor, &product, &interval, &len);
++
++		/* Check whether all variables (vendor, product, interval, len) were assigned.
++		   %zn does not increase the assignment count, so we need to check for value 3 instead of 4.
++		   %zn does not consume input either, so setting len shouldn't fail if interval has been properly set. */
++		if (res != 3) {
++			pr_warn("Error while parsing USB interrupt interval override parameter %s.\n", value);
++			break;
++		}
++
++		param.vendor = (u16)vendor;
++		param.product = (u16)product;
++		param.interval = interval;
++		list[count++] = param;
++
++		p += len;
++		if (*p == ',' && *(p+1) != '\0') {
++			p++;
++			continue;
++		} else if(*p == '\0' || (*p == '\n' && *(p+1) == '\0')) {
++			break;
++		} else {
++			pr_warn("Error while parsing USB interrupt interval override parameter %s.\n", value);
++			break;
++		}
++	}
++
++	/* Overwrite the global variables with the local ones. */
++	kfree(interrupt_interval_override_list);
++	interrupt_interval_override_list = list;
++	interrupt_interval_override_count = count;
++	mutex_unlock(&interrupt_interval_override_mutex);
++	return 0;
++}
++
++static const struct kernel_param_ops interrupt_interval_override_param_ops = {
++	.set = interrupt_interval_override_param_set,
++	.get = param_get_string,
++};
++
++static struct kparam_string interrupt_interval_override_param_string = {
++	.maxlen = sizeof(interrupt_interval_override_param),
++	.string = interrupt_interval_override_param,
++};
++
++device_param_cb(interrupt_interval_override,
++	&interrupt_interval_override_param_ops,
++	&interrupt_interval_override_param_string,
++	0644);
++MODULE_PARM_DESC(interrupt_interval_override,
++	"Override the polling interval of all interrupt-type endpoints of a specific USB"
++	" device by specifying interrupt_interval_override=vendorID:productID:interval.");
++
++/* Given an USB device, this checks whether the user has specified they want to override the interrupt
++   polling interval on all interrupt-type endpoints of said device.
++
++   This function returns the user-desired amount of milliseconds between interrupts on said endpoint.
++   If this function returns zero, the device-requested interrupt interval should be used. */
++static unsigned int usb_check_interrupt_interval_override(struct usb_device* udev)
++{
++	size_t i;
++	unsigned int res;
++	u16 vendor = le16_to_cpu(udev->descriptor.idVendor);
++	u16 product = le16_to_cpu(udev->descriptor.idProduct);
++
++	mutex_lock(&interrupt_interval_override_mutex);
++	for (i = 0; i < interrupt_interval_override_count; i++) {
++		if (interrupt_interval_override_list[i].vendor == vendor
++				&& interrupt_interval_override_list[i].product == product) {
++
++			res = interrupt_interval_override_list[i].interval;
++			mutex_unlock(&interrupt_interval_override_mutex);
++			return res;
++		}
++	}
++	mutex_unlock(&interrupt_interval_override_mutex);
++	return 0;
++}
++
+ static inline const char *plural(int n)
+ {
+ 	return (n == 1 ? "" : "s");
+@@ -261,7 +404,7 @@ static int usb_parse_endpoint(struct device *ddev, int cfgno,
+ 	struct usb_endpoint_descriptor *d;
+ 	struct usb_host_endpoint *endpoint;
+ 	int n, i, j, retval;
+-	unsigned int maxp;
++	unsigned int maxp, ival;
+ 	const unsigned short *maxpacket_maxes;
+ 
+ 	d = (struct usb_endpoint_descriptor *) buffer;
+@@ -386,6 +529,23 @@ static int usb_parse_endpoint(struct device *ddev, int cfgno,
+ 		endpoint->desc.bInterval = n;
+ 	}
+ 
++	/* Override the interrupt polling interval if a module parameter tells us to do so. */
++	if (usb_endpoint_xfer_int(d)) {
++		ival = usb_check_interrupt_interval_override(udev);
++		if (ival > 0) {
++			switch (udev->speed) {
++			case USB_SPEED_SUPER_PLUS:
++			case USB_SPEED_SUPER:
++			case USB_SPEED_HIGH:
++				endpoint->desc.bInterval = fls(ival) + 3;
++				break;
++			default:  /* USB_SPEED_FULL or _LOW */
++				endpoint->desc.bInterval = ival;
++				break;
++			}
++		}
++	}
++
+ 	/* Some buggy low-speed devices have Bulk endpoints, which is
+ 	 * explicitly forbidden by the USB spec.  In an attempt to make
+ 	 * them usable, we will try treating them as Interrupt endpoints.
+@@ -1091,3 +1251,11 @@ int usb_get_bos_descriptor(struct usb_device *dev)
+ 	usb_release_bos_descriptor(dev);
+ 	return ret;
+ }
++
++void usb_release_interrupt_interval_override_list(void)
++{
++	mutex_lock(&interrupt_interval_override_mutex);
++	kfree(interrupt_interval_override_list);
++	interrupt_interval_override_list = NULL;
++	mutex_unlock(&interrupt_interval_override_mutex);
++}
+diff --git a/drivers/usb/core/usb.c b/drivers/usb/core/usb.c
+index bafc113f2b3e..d766c18747a3 100644
+--- a/drivers/usb/core/usb.c
++++ b/drivers/usb/core/usb.c
+@@ -1040,6 +1040,7 @@ static void __exit usb_exit(void)
+ 		return;
+ 
+ 	usb_release_quirk_list();
++	usb_release_interrupt_interval_override_list();
+ 	usb_deregister_device_driver(&usb_generic_driver);
+ 	usb_major_cleanup();
+ 	usb_deregister(&usbfs_driver);
+diff --git a/drivers/usb/core/usb.h b/drivers/usb/core/usb.h
+index 98e7d1ee63dc..76cf312baafd 100644
+--- a/drivers/usb/core/usb.h
++++ b/drivers/usb/core/usb.h
+@@ -37,6 +37,7 @@ extern void usb_authorize_interface(struct usb_interface *);
+ extern void usb_detect_quirks(struct usb_device *udev);
+ extern void usb_detect_interface_quirks(struct usb_device *udev);
+ extern void usb_release_quirk_list(void);
++extern void usb_release_interrupt_interval_override_list(void);
+ extern bool usb_endpoint_is_ignored(struct usb_device *udev,
+ 		struct usb_host_interface *intf,
+ 		struct usb_endpoint_descriptor *epd);
+
+From: Tvrtko Ursulin <tvrtko.ursulin at igalia.com>
+
+After commit
+746ae46c1113 ("drm/sched: Mark scheduler work queues with WQ_MEM_RECLAIM")
+amdgpu started seeing the following warning:
+
+ [ ] workqueue: WQ_MEM_RECLAIM sdma0:drm_sched_run_job_work [gpu_sched] is flushing !WQ_MEM_RECLAIM events:amdgpu_device_delay_enable_gfx_off [amdgpu]
+...
+ [ ] Workqueue: sdma0 drm_sched_run_job_work [gpu_sched]
+...
+ [ ] Call Trace:
+ [ ]  <TASK>
+...
+ [ ]  ? check_flush_dependency+0xf5/0x110
+...
+ [ ]  cancel_delayed_work_sync+0x6e/0x80
+ [ ]  amdgpu_gfx_off_ctrl+0xab/0x140 [amdgpu]
+ [ ]  amdgpu_ring_alloc+0x40/0x50 [amdgpu]
+ [ ]  amdgpu_ib_schedule+0xf4/0x810 [amdgpu]
+ [ ]  ? drm_sched_run_job_work+0x22c/0x430 [gpu_sched]
+ [ ]  amdgpu_job_run+0xaa/0x1f0 [amdgpu]
+ [ ]  drm_sched_run_job_work+0x257/0x430 [gpu_sched]
+ [ ]  process_one_work+0x217/0x720
+...
+ [ ]  </TASK>
+
+The intent of the verifcation done in check_flush_depedency is to ensure
+forward progress during memory reclaim, by flagging cases when either a
+memory reclaim process, or a memory reclaim work item is flushed from a
+context not marked as memory reclaim safe.
+
+This is correct when flushing, but when called from the
+cancel(_delayed)_work_sync() paths it is a false positive because work is
+either already running, or will not be running at all. Therefore
+cancelling it is safe and we can relax the warning criteria by letting the
+helper know of the calling context.
+
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin at igalia.com>
+Fixes: fca839c00a12 ("workqueue: warn if memory reclaim tries to flush !WQ_MEM_RECLAIM workqueue")
+References: 746ae46c1113 ("drm/sched: Mark scheduler work queues with WQ_MEM_RECLAIM")
+Cc: Tejun Heo <tj at kernel.org>
+Cc: Peter Zijlstra <peterz at infradead.org>
+Cc: Lai Jiangshan <jiangshanlai at gmail.com>
+Cc: Alex Deucher <alexander.deucher at amd.com>
+Cc: Christian König <christian.koenig at amd.com
+Cc: Matthew Brost <matthew.brost at intel.com>
+Cc: <stable at vger.kernel.org> # v4.5+
+---
+ kernel/workqueue.c | 22 +++++++++++++---------
+ 1 file changed, 13 insertions(+), 9 deletions(-)
+
+diff --git a/kernel/workqueue.c b/kernel/workqueue.c
+index 9949ffad8df0..7abba81296cd 100644
+--- a/kernel/workqueue.c
++++ b/kernel/workqueue.c
+@@ -3680,23 +3680,27 @@ void workqueue_softirq_dead(unsigned int cpu)
+  * check_flush_dependency - check for flush dependency sanity
+  * @target_wq: workqueue being flushed
+  * @target_work: work item being flushed (NULL for workqueue flushes)
++ * @from_cancel: are we called from the work cancel path
+  *
+  * %current is trying to flush the whole @target_wq or @target_work on it.
+- * If @target_wq doesn't have %WQ_MEM_RECLAIM, verify that %current is not
+- * reclaiming memory or running on a workqueue which doesn't have
+- * %WQ_MEM_RECLAIM as that can break forward-progress guarantee leading to
+- * a deadlock.
++ * If this is not the cancel path (which implies work being flushed is either
++ * already running, or will not be at all), check if @target_wq doesn't have
++ * %WQ_MEM_RECLAIM and verify that %current is not reclaiming memory or running
++ * on a workqueue which doesn't have %WQ_MEM_RECLAIM as that can break forward-
++ * progress guarantee leading to a deadlock.
+  */
+ static void check_flush_dependency(struct workqueue_struct *target_wq,
+-				   struct work_struct *target_work)
++				   struct work_struct *target_work,
++				   bool from_cancel)
+ {
+-	work_func_t target_func = target_work ? target_work->func : NULL;
++	work_func_t target_func;
+ 	struct worker *worker;
+ 
+-	if (target_wq->flags & WQ_MEM_RECLAIM)
++	if (from_cancel || target_wq->flags & WQ_MEM_RECLAIM)
+ 		return;
+ 
+ 	worker = current_wq_worker();
++	target_func = target_work ? target_work->func : NULL;
+ 
+ 	WARN_ONCE(current->flags & PF_MEMALLOC,
+ 		  "workqueue: PF_MEMALLOC task %d(%s) is flushing !WQ_MEM_RECLAIM %s:%ps",
+@@ -3966,7 +3970,7 @@ void __flush_workqueue(struct workqueue_struct *wq)
+ 		list_add_tail(&this_flusher.list, &wq->flusher_overflow);
+ 	}
+ 
+-	check_flush_dependency(wq, NULL);
++	check_flush_dependency(wq, NULL, false);
+ 
+ 	mutex_unlock(&wq->mutex);
+ 
+@@ -4141,7 +4145,7 @@ static bool start_flush_work(struct work_struct *work, struct wq_barrier *barr,
+ 	}
+ 
+ 	wq = pwq->wq;
+-	check_flush_dependency(wq, work);
++	check_flush_dependency(wq, work, from_cancel);
+ 
+ 	insert_wq_barrier(pwq, barr, work, worker);
+ 	raw_spin_unlock_irq(&pool->lock);
+-- 
+2.47.1
+
+hrtimers are migrated away from the dying CPU to any online target at
+the CPUHP_AP_HRTIMERS_DYING stage in order not to delay bandwidth timers
+handling tasks involved in the CPU hotplug forward progress.
+
+However wake ups can still be performed by the outgoing CPU after
+CPUHP_AP_HRTIMERS_DYING. Those can result again in bandwidth timers
+being armed. Depending on several considerations (crystal ball
+power management based election, earliest timer already enqueued, timer
+migration enabled or not), the target may eventually be the current
+CPU even if offline. If that happens, the timer is eventually ignored.
+
+The most notable example is RCU which had to deal with each an every of
+those wake-ups by deferring them to an online CPU, along with related
+workarounds:
+
+_ e787644caf76 (rcu: Defer RCU kthreads wakeup when CPU is dying)
+_ 9139f93209d1 (rcu/nocb: Fix RT throttling hrtimer armed from offline CPU)
+_ f7345ccc62a4 (rcu/nocb: Fix rcuog wake-up from offline softirq)
+
+The problem isn't confined to RCU though as the stop machine kthread
+(which runs CPUHP_AP_HRTIMERS_DYING) reports its completion at the end
+and performs a wake up that eventually arms the deadline server timer:
+
+           WARNING: CPU: 94 PID: 588 at kernel/time/hrtimer.c:1086 hrtimer_start_range_ns+0x289/0x2d0
+           Modules linked in:
+           CPU: 94 UID: 0 PID: 588 Comm: migration/94 Not tainted
+           Stopper: multi_cpu_stop+0x0/0x120 <- stop_machine_cpuslocked+0x66/0xc0
+           RIP: 0010:hrtimer_start_range_ns+0x289/0x2d0
+           Code: 41 5c 41 5d 41 5e 41 5f 5d e9 63 94 ea 00 0f 0b 48 83 c4 10 5b 41 5c 41 5d 41 5e 41 5f 5d e9 39 fc 15 01 0f 0b e9 c1 fd ff ff <0f> 0b 48 8b
++45 00 e9 59 ff ff ff f3 0f 1e fa 65 8b 05 1d ec e8 7e
+           RSP: 0018:ffffc900019cbcc8 EFLAGS: 00010046
+           RAX: ffff88bf449a4c40 RBX: 0000000000000082 RCX: 0000000000000001
+           RDX: 0000000000000001 RSI: ffff88bf43224c80 RDI: ffff88bf449a4c40
+           RBP: ffff88bf449a4c80 R08: ffff888280970090 R09: 0000000000000000
+           R10: ffff88bf432252e0 R11: ffffffff811abf70 R12: ffff88bf449a4c40
+           R13: ffff88bf43234b28 R14: ffff88bf43224c80 R15: 0000000000000000
+           FS:  0000000000000000(0000) GS:ffff88bf44980000(0000) knlGS:0000000000000000
+           CR2: 0000000000000000 CR3: 000000404b230001 CR4: 0000000000770ef0
+           PKRU: 55555554
+           Call Trace:
+            <TASK>
+            ? __warn+0xcf/0x1b0
+            ? hrtimer_start_range_ns+0x289/0x2d0
+            ? report_bug+0x120/0x1a0
+            ? handle_bug+0x60/0x90
+            ? exc_invalid_op+0x1a/0x50
+            ? asm_exc_invalid_op+0x1a/0x20
+            ? register_refined_jiffies+0xb0/0xb0
+            ? hrtimer_start_range_ns+0x289/0x2d0
+            ? hrtimer_start_range_ns+0x186/0x2d0
+            start_dl_timer+0xfc/0x150
+            enqueue_dl_entity+0x367/0x640
+            dl_server_start+0x53/0xa0
+            enqueue_task_fair+0x363/0x460
+            enqueue_task+0x3c/0x200
+            ttwu_do_activate+0x94/0x240
+            try_to_wake_up+0x315/0x600
+            complete+0x4b/0x80
+
+Instead of providing yet another bandaid to work around the situation,
+fix it from hrtimers infrastructure instead: always migrate away a
+timer to an online target whenever it is enqueued from an offline CPU.
+
+This will also allow to revert all the above RCU disgraceful hacks.
+
+Reported-by: Vlad Poenaru <vlad.wing@xxxxxxxxx>
+Reported-by: Usama Arif <usamaarif642@xxxxxxxxx>
+Fixes: 5c0930ccaad5 ("hrtimers: Push pending hrtimers away from outgoing CPU earlier")
+Closes: 20241213203739.1519801-1-usamaarif642@xxxxxxxxx
+Signed-off-by: Frederic Weisbecker <frederic@xxxxxxxxxx>
+Signed-off-by: Paul E. McKenney <paulmck@xxxxxxxxxx>
+---
+ include/linux/hrtimer_defs.h |  1 +
+ kernel/time/hrtimer.c        | 53 +++++++++++++++++++++++++++++++++---
+ 2 files changed, 50 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/hrtimer_defs.h b/include/linux/hrtimer_defs.h
+index c3b4b7ed7c16..84a5045f80f3 100644
+--- a/include/linux/hrtimer_defs.h
++++ b/include/linux/hrtimer_defs.h
+@@ -125,6 +125,7 @@ struct hrtimer_cpu_base {
+ 	ktime_t				softirq_expires_next;
+ 	struct hrtimer			*softirq_next_timer;
+ 	struct hrtimer_clock_base	clock_base[HRTIMER_MAX_CLOCK_BASES];
++	call_single_data_t		csd;
+ } ____cacheline_aligned;
+ 
+ 
+diff --git a/kernel/time/hrtimer.c b/kernel/time/hrtimer.c
+index 80fe3749d2db..1ea9ef57d710 100644
+--- a/kernel/time/hrtimer.c
++++ b/kernel/time/hrtimer.c
+@@ -58,6 +58,8 @@
+ #define HRTIMER_ACTIVE_SOFT	(HRTIMER_ACTIVE_HARD << MASK_SHIFT)
+ #define HRTIMER_ACTIVE_ALL	(HRTIMER_ACTIVE_SOFT | HRTIMER_ACTIVE_HARD)
+ 
++static void retrigger_next_event(void *arg);
++
+ /*
+  * The timer bases:
+  *
+@@ -111,7 +113,8 @@ DEFINE_PER_CPU(struct hrtimer_cpu_base, hrtimer_bases) =
+ 			.clockid = CLOCK_TAI,
+ 			.get_time = &ktime_get_clocktai,
+ 		},
+-	}
++	},
++	.csd = CSD_INIT(retrigger_next_event, NULL)
+ };
+ 
+ static const int hrtimer_clock_to_base_table[MAX_CLOCKS] = {
+@@ -716,8 +719,6 @@ static inline int hrtimer_is_hres_enabled(void)
+ 	return hrtimer_hres_enabled;
+ }
+ 
+-static void retrigger_next_event(void *arg);
+-
+ /*
+  * Switch to high resolution mode
+  */
+@@ -1202,10 +1203,49 @@ hrtimer_update_softirq_timer(struct hrtimer_cpu_base *cpu_base, bool reprogram)
+ 	hrtimer_reprogram(cpu_base->softirq_next_timer, reprogram);
+ }
+ 
++/*
++ * If the current CPU is offline and timers have been already
++ * migrated away, make sure not to enqueue locally and perform
++ * a remote retrigger as a last resort.
++ */
++static void enqueue_hrtimer_offline(struct hrtimer *timer,
++				    struct hrtimer_clock_base *base,
++				    const enum hrtimer_mode mode)
++{
++#ifdef CONFIG_HOTPLUG_CPU
++	struct hrtimer_cpu_base *new_cpu_base, *old_cpu_base, *this_cpu_base;
++	struct hrtimer_clock_base *new_base;
++	int cpu;
++
++	old_cpu_base = base->cpu_base;
++	this_cpu_base = this_cpu_ptr(&hrtimer_bases);
++
++	if (old_cpu_base == this_cpu_base || !old_cpu_base->online) {
++		WARN_ON_ONCE(hrtimer_callback_running(timer));
++		cpu = cpumask_any_and(cpu_online_mask,
++				      housekeeping_cpumask(HK_TYPE_TIMER));
++		new_cpu_base = &per_cpu(hrtimer_bases, cpu);
++		new_base = &new_cpu_base->clock_base[base->index];
++		WRITE_ONCE(timer->base, &migration_base);
++		raw_spin_unlock(&old_cpu_base->lock);
++		raw_spin_lock(&new_cpu_base->lock);
++		WRITE_ONCE(timer->base, new_base);
++	} else {
++		new_base = base;
++		new_cpu_base = new_base->cpu_base;
++		cpu = new_cpu_base->cpu;
++	}
++
++	if (enqueue_hrtimer(timer, new_base, mode))
++		smp_call_function_single_async(cpu, &new_cpu_base->csd);
++#endif
++}
++
+ static int __hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,
+ 				    u64 delta_ns, const enum hrtimer_mode mode,
+ 				    struct hrtimer_clock_base *base)
+ {
++	struct hrtimer_cpu_base *this_cpu_base = this_cpu_ptr(&hrtimer_bases);
+ 	struct hrtimer_clock_base *new_base;
+ 	bool force_local, first;
+ 
+@@ -1217,7 +1257,7 @@ static int __hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,
+ 	 * and enforce reprogramming after it is queued no matter whether
+ 	 * it is the new first expiring timer again or not.
+ 	 */
+-	force_local = base->cpu_base == this_cpu_ptr(&hrtimer_bases);
++	force_local = base->cpu_base == this_cpu_base;
+ 	force_local &= base->cpu_base->next_timer == timer;
+ 
+ 	/*
+@@ -1240,6 +1280,11 @@ static int __hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,
+ 
+ 	hrtimer_set_expires_range_ns(timer, tim, delta_ns);
+ 
++	if (unlikely(!this_cpu_base->online)) {
++		enqueue_hrtimer_offline(timer, base, mode);
++		return 0;
++	}
++
+ 	/* Switch the timer base, if necessary: */
+ 	if (!force_local) {
+ 		new_base = switch_hrtimer_base(timer, base,
+-- 
+2.46.0
+
+It's now ok to perform a wake-up from an offline CPU because the
+resulting armed scheduler bandwidth hrtimers are now correctly targeted
+by hrtimer infrastructure.
+
+Remove the obsolete hackerry.
+
+Reviewed-by: Usama Arif <usamaarif642@xxxxxxxxx>
+Signed-off-by: Frederic Weisbecker <frederic@xxxxxxxxxx>
+---
+ kernel/rcu/tree.c      | 34 +---------------------------------
+ kernel/rcu/tree_exp.h  |  2 +-
+ kernel/rcu/tree_nocb.h |  2 +-
+ 3 files changed, 3 insertions(+), 35 deletions(-)
+
+diff --git a/kernel/rcu/tree.c b/kernel/rcu/tree.c
+index ff98233d4aa5..7c433c6b35ea 100644
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@ -1061,38 +1061,6 @@ static bool rcu_future_gp_cleanup(struct rcu_node *rnp)
+ 	return needmore;
+ }
+ 
+-static void swake_up_one_online_ipi(void *arg)
+-{
+-	struct swait_queue_head *wqh = arg;
+-
+-	swake_up_one(wqh);
+-}
+-
+-static void swake_up_one_online(struct swait_queue_head *wqh)
+-{
+-	int cpu = get_cpu();
+-
+-	/*
+-	 * If called from rcutree_report_cpu_starting(), wake up
+-	 * is dangerous that late in the CPU-down hotplug process. The
+-	 * scheduler might queue an ignored hrtimer. Defer the wake up
+-	 * to an online CPU instead.
+-	 */
+-	if (unlikely(cpu_is_offline(cpu))) {
+-		int target;
+-
+-		target = cpumask_any_and(housekeeping_cpumask(HK_TYPE_RCU),
+-					 cpu_online_mask);
+-
+-		smp_call_function_single(target, swake_up_one_online_ipi,
+-					 wqh, 0);
+-		put_cpu();
+-	} else {
+-		put_cpu();
+-		swake_up_one(wqh);
+-	}
+-}
+-
+ /*
+  * Awaken the grace-period kthread.  Don't do a self-awaken (unless in an
+  * interrupt or softirq handler, in which case we just might immediately
+@@ -1117,7 +1085,7 @@ static void rcu_gp_kthread_wake(void)
+ 		return;
+ 	WRITE_ONCE(rcu_state.gp_wake_time, jiffies);
+ 	WRITE_ONCE(rcu_state.gp_wake_seq, READ_ONCE(rcu_state.gp_seq));
+-	swake_up_one_online(&rcu_state.gp_wq);
++	swake_up_one(&rcu_state.gp_wq);
+ }
+ 
+ /*
+diff --git a/kernel/rcu/tree_exp.h b/kernel/rcu/tree_exp.h
+index fb664d3a01c9..17b1a5e3590c 100644
+--- a/kernel/rcu/tree_exp.h
++++ b/kernel/rcu/tree_exp.h
+@@ -200,7 +200,7 @@ static void __rcu_report_exp_rnp(struct rcu_node *rnp,
+ 		if (rnp->parent == NULL) {
+ 			raw_spin_unlock_irqrestore_rcu_node(rnp, flags);
+ 			if (wake)
+-				swake_up_one_online(&rcu_state.expedited_wq);
++				swake_up_one(&rcu_state.expedited_wq);
+ 
+ 			break;
+ 		}
+diff --git a/kernel/rcu/tree_nocb.h b/kernel/rcu/tree_nocb.h
+index 2605dd234a13..a43141a1b3a5 100644
+--- a/kernel/rcu/tree_nocb.h
++++ b/kernel/rcu/tree_nocb.h
+@@ -216,7 +216,7 @@ static bool __wake_nocb_gp(struct rcu_data *rdp_gp,
+ 	raw_spin_unlock_irqrestore(&rdp_gp->nocb_gp_lock, flags);
+ 	if (needwake) {
+ 		trace_rcu_nocb_wake(rcu_state.name, rdp->cpu, TPS("DoWake"));
+-		swake_up_one_online(&rdp_gp->nocb_gp_wq);
++		swake_up_one(&rdp_gp->nocb_gp_wq);
+ 	}
+ 
+ 	return needwake;
+-- 
+2.46.0
+
+This reverts commit f7345ccc62a4b880cf76458db5f320725f28e400.
+
+swake_up_one_online() has been removed because hrtimers can now assign
+a proper online target to hrtimers queued from offline CPUs. Therefore
+remove the related hackery.
+
+Reviewed-by: Usama Arif <usamaarif642@xxxxxxxxx>
+Signed-off-by: Frederic Weisbecker <frederic@xxxxxxxxxx>
+---
+ kernel/rcu/tree_nocb.h | 8 +-------
+ 1 file changed, 1 insertion(+), 7 deletions(-)
+
+diff --git a/kernel/rcu/tree_nocb.h b/kernel/rcu/tree_nocb.h
+index a43141a1b3a5..a03fc19abde7 100644
+--- a/kernel/rcu/tree_nocb.h
++++ b/kernel/rcu/tree_nocb.h
+@@ -554,19 +554,13 @@ static void __call_rcu_nocb_wake(struct rcu_data *rdp, bool was_alldone,
+ 			rcu_nocb_unlock(rdp);
+ 			wake_nocb_gp_defer(rdp, RCU_NOCB_WAKE_LAZY,
+ 					   TPS("WakeLazy"));
+-		} else if (!irqs_disabled_flags(flags) && cpu_online(rdp->cpu)) {
++		} else if (!irqs_disabled_flags(flags)) {
+ 			/* ... if queue was empty ... */
+ 			rcu_nocb_unlock(rdp);
+ 			wake_nocb_gp(rdp, false);
+ 			trace_rcu_nocb_wake(rcu_state.name, rdp->cpu,
+ 					    TPS("WakeEmpty"));
+ 		} else {
+-			/*
+-			 * Don't do the wake-up upfront on fragile paths.
+-			 * Also offline CPUs can't call swake_up_one_online() from
+-			 * (soft-)IRQs. Rely on the final deferred wake-up from
+-			 * rcutree_report_cpu_dead()
+-			 */
+ 			rcu_nocb_unlock(rdp);
+ 			wake_nocb_gp_defer(rdp, RCU_NOCB_WAKE,
+ 					   TPS("WakeEmptyIsDeferred"));
+-- 
+2.46.0
+
+If the timer is deferrable and NO_HZ_COMMON is enabled, the function
+get_timer_cpu_base() will call per_cpu_ptr() twice. Optimize the function
+to avoid potentially redundant per_cpu_ptr() calls.
+
+One of the call paths of the get_timer_cpu_base() function is through the
+lock_timer_base() function, which contains a loop. Within this loop, the
+get_timer_base() func is called, and in turn, it calls the
+get_timer_cpu_base() function. And in such a path, get_timer_cpu_base is
+a hotspot function. It is called approximately 13,000 times in 12 seconds
+on test x86 KVM machines.
+
+lock_timer_base(){
+    for(;;) {
+    ...
+    --> get_timer_base() [inline]
+        --> get_timer_cpu_base() [inline]
+    ...
+    }
+}
+
+With the patch, assembly code(on x86 and ARM64) to be executed in loop is
+reduced. And conducting comparative tests on x86 KVM virtual machines,
+comparison of runtime before and after optimization (in nanoseconds), we
+can see that the distribution of runtime tends to favor smaller time
+intervals.
+
+      Before                  After
+[0-19]:      0    	[0-19]:      0
+[20-39]:     6    	[20-39]:     1014
+[40-59]:     41   	[40-59]:     2198
+[60-79]:     93   	[60-79]:     2073
+[80-99]:     814  	[80-99]:     3081
+[100-119]:   5262 	[100-119]:   3268
+[120-139]:   4510 	[120-139]:   671
+[140-159]:   2202 	[140-159]:   468
+[160-179]:   81   	[160-179]:   158
+[180-199]:   15   	[180-199]:   160
+[200-219]:   3    	[200-219]:   54
+[220-239]:   2    	[220-239]:   7
+[240-259]:   2    	[240-259]:   3
+[260-279]:   0    	[260-279]:   0
+[280-299]:   0    	[280-299]:   1
+[300-319]:   0    	[300-319]:   0
+total:       13031      total:       13156
+
+Signed-off-by: Zhongqiu Han <quic_zhonhan@xxxxxxxxxxx>
+---
+ kernel/time/timer.c | 16 ++++++----------
+ 1 file changed, 6 insertions(+), 10 deletions(-)
+
+diff --git a/kernel/time/timer.c b/kernel/time/timer.c
+index a5860bf6d16f..40706cb36920 100644
+--- a/kernel/time/timer.c
++++ b/kernel/time/timer.c
+@@ -956,33 +956,29 @@ static int detach_if_pending(struct timer_list *timer, struct timer_base *base,
+ static inline struct timer_base *get_timer_cpu_base(u32 tflags, u32 cpu)
+ {
+ 	int index = tflags & TIMER_PINNED ? BASE_LOCAL : BASE_GLOBAL;
+-	struct timer_base *base;
+-
+-	base = per_cpu_ptr(&timer_bases[index], cpu);
+ 
+ 	/*
+ 	 * If the timer is deferrable and NO_HZ_COMMON is set then we need
+ 	 * to use the deferrable base.
+ 	 */
+ 	if (IS_ENABLED(CONFIG_NO_HZ_COMMON) && (tflags & TIMER_DEFERRABLE))
+-		base = per_cpu_ptr(&timer_bases[BASE_DEF], cpu);
+-	return base;
++		index = BASE_DEF;
++
++	return per_cpu_ptr(&timer_bases[index], cpu);
+ }
+ 
+ static inline struct timer_base *get_timer_this_cpu_base(u32 tflags)
+ {
+ 	int index = tflags & TIMER_PINNED ? BASE_LOCAL : BASE_GLOBAL;
+-	struct timer_base *base;
+-
+-	base = this_cpu_ptr(&timer_bases[index]);
+ 
+ 	/*
+ 	 * If the timer is deferrable and NO_HZ_COMMON is set then we need
+ 	 * to use the deferrable base.
+ 	 */
+ 	if (IS_ENABLED(CONFIG_NO_HZ_COMMON) && (tflags & TIMER_DEFERRABLE))
+-		base = this_cpu_ptr(&timer_bases[BASE_DEF]);
+-	return base;
++		index = BASE_DEF;
++
++	return this_cpu_ptr(&timer_bases[index]);
+ }
+ 
+ static inline struct timer_base *get_timer_base(u32 tflags)
+-- 
+2.25.1
+
 Subject: [PATCH 1/3] drm/amd/display: fix page fault due to max surface definition mismatch
 Date: Tue, 17 Dec 2024 17:45:03 -0300	[thread overview]
 Message-ID: <20241217205029.39850-2-mwen@igalia.com> (raw)
@@ -4224,6 +5006,82 @@ index 93e928e76959..d38fec26fd3d 100644
 --
 2.25.1
 
+
+From: Tim Chen <tim.c.chen@linux.intel.com>
+Date: Fri, 6 Oct 2023 15:58:56 -0700
+Subject: [PATCH] sched/fair: Don't force smt balancing when CPU has spare
+ capacity
+
+Currently group_smt_balance is picked whenever there are more
+than two tasks on a core with two SMT.  However, the utilization
+of those tasks may be low and do not warrant a task
+migration to a CPU of lower priority.
+
+Adjust sched group clssification and sibling_imbalance()
+to reflect this consideration.  Use sibling_imbalance() to
+compute imbalance in calculate_imbalance() for the group_smt_balance
+case.
+
+Signed-off-by: Tim Chen <tim.c.chen@linux.intel.com>
+
+---
+ kernel/sched/fair.c | 23 +++++++++++------------
+ 1 file changed, 11 insertions(+), 12 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index ef7490c4b8b4..7dd7c2d2367a 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -9460,14 +9460,15 @@ group_type group_classify(unsigned int imbalance_pct,
+ 	if (sgs->group_asym_packing)
+ 		return group_asym_packing;
+
+-	if (sgs->group_smt_balance)
+-		return group_smt_balance;
+-
+ 	if (sgs->group_misfit_task_load)
+ 		return group_misfit_task;
+
+-	if (!group_has_capacity(imbalance_pct, sgs))
+-		return group_fully_busy;
++	if (!group_has_capacity(imbalance_pct, sgs)) {
++		if (sgs->group_smt_balance)
++			return group_smt_balance;
++		else
++			return group_fully_busy;
++	}
+
+ 	return group_has_spare;
+ }
+@@ -9573,6 +9574,11 @@ static inline long sibling_imbalance(struct lb_env *env,
+ 	if (env->idle == CPU_NOT_IDLE || !busiest->sum_nr_running)
+ 		return 0;
+
++	/* Do not pull tasks off preferred group with spare capacity */
++	if (busiest->group_type == group_has_spare &&
++	    sched_asym_prefer(sds->busiest->asym_prefer_cpu, env->dst_cpu))
++		return 0;
++
+ 	ncores_busiest = sds->busiest->cores;
+ 	ncores_local = sds->local->cores;
+
+@@ -10411,13 +10417,6 @@ static inline void calculate_imbalance(struct lb_env *env, struct sd_lb_stats *s
+ 		return;
+ 	}
+
+-	if (busiest->group_type == group_smt_balance) {
+-		/* Reduce number of tasks sharing CPU capacity */
+-		env->migration_type = migrate_task;
+-		env->imbalance = 1;
+-		return;
+-	}
+-
+ 	if (busiest->group_type == group_imbalanced) {
+ 		/*
+ 		 * In the group_imb case we cannot rely on group-wide averages
+--
+2.32.0
+
 This diff uses an open source tool include-what-you-use (IWYU) to modify
 the include list, changing indirect includes to direct includes. IWYU is
 implemented using the IWYUScripts github repository which is a tool that
@@ -4416,81 +5274,6 @@ index e9b448d1b1b70..fdc00516c0b54 100644
  #ifdef CONFIG_PCI_BIOS
 --
 2.34.1
-
-From: Tim Chen <tim.c.chen@linux.intel.com>
-Date: Fri, 6 Oct 2023 15:58:56 -0700
-Subject: [PATCH] sched/fair: Don't force smt balancing when CPU has spare
- capacity
-
-Currently group_smt_balance is picked whenever there are more
-than two tasks on a core with two SMT.  However, the utilization
-of those tasks may be low and do not warrant a task
-migration to a CPU of lower priority.
-
-Adjust sched group clssification and sibling_imbalance()
-to reflect this consideration.  Use sibling_imbalance() to
-compute imbalance in calculate_imbalance() for the group_smt_balance
-case.
-
-Signed-off-by: Tim Chen <tim.c.chen@linux.intel.com>
-
----
- kernel/sched/fair.c | 23 +++++++++++------------
- 1 file changed, 11 insertions(+), 12 deletions(-)
-
-diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index ef7490c4b8b4..7dd7c2d2367a 100644
---- a/kernel/sched/fair.c
-+++ b/kernel/sched/fair.c
-@@ -9460,14 +9460,15 @@ group_type group_classify(unsigned int imbalance_pct,
- 	if (sgs->group_asym_packing)
- 		return group_asym_packing;
-
--	if (sgs->group_smt_balance)
--		return group_smt_balance;
--
- 	if (sgs->group_misfit_task_load)
- 		return group_misfit_task;
-
--	if (!group_has_capacity(imbalance_pct, sgs))
--		return group_fully_busy;
-+	if (!group_has_capacity(imbalance_pct, sgs)) {
-+		if (sgs->group_smt_balance)
-+			return group_smt_balance;
-+		else
-+			return group_fully_busy;
-+	}
-
- 	return group_has_spare;
- }
-@@ -9573,6 +9574,11 @@ static inline long sibling_imbalance(struct lb_env *env,
- 	if (env->idle == CPU_NOT_IDLE || !busiest->sum_nr_running)
- 		return 0;
-
-+	/* Do not pull tasks off preferred group with spare capacity */
-+	if (busiest->group_type == group_has_spare &&
-+	    sched_asym_prefer(sds->busiest->asym_prefer_cpu, env->dst_cpu))
-+		return 0;
-+
- 	ncores_busiest = sds->busiest->cores;
- 	ncores_local = sds->local->cores;
-
-@@ -10411,13 +10417,6 @@ static inline void calculate_imbalance(struct lb_env *env, struct sd_lb_stats *s
- 		return;
- 	}
-
--	if (busiest->group_type == group_smt_balance) {
--		/* Reduce number of tasks sharing CPU capacity */
--		env->migration_type = migrate_task;
--		env->imbalance = 1;
--		return;
--	}
--
- 	if (busiest->group_type == group_imbalanced) {
- 		/*
- 		 * In the group_imb case we cannot rely on group-wide averages
---
-2.32.0
 
 From a05ea893677dd4b3134ed2464bce3d4de513102c Mon Sep 17 00:00:00 2001
 From: Alexandre Frade <kernel@xanmod.org>
