@@ -1,0 +1,459 @@
+From 4f6aefa03bdb7a424610b6e2dd3a299516fdb4a1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Fri, 24 May 2024 20:06:23 -0400
+Subject: [PATCH 1/3] ac,radeonsi: scalarize overfetching loads
+
+There is nothing preventing ACO from generating loads with unused
+components. This happens often with GLSL uniforms. Some of those loads
+are partially re-vectorized after this.
+
+radeonsi+ACO:
+
+TOTALS FROM AFFECTED SHADERS (19564/58918)
+  VGPRs: 732900 -> 728448 (-0.61 %)
+  Spilled SGPRs: 429 -> 433 (0.93 %)
+  Code Size: 38446004 -> 38485612 (0.10 %) bytes
+  Max Waves: 305440 -> 305549 (0.04 %)
+
+Acked-by: Pierre-Eric Pelloux-Prayer <pierre-eric.pelloux-prayer@amd.com>
+---
+ src/amd/common/ac_shader_util.c          | 54 ++++++++++++++++++++++++
+ src/amd/common/ac_shader_util.h          |  2 +
+ src/gallium/drivers/radeonsi/si_shader.c |  7 +++
+ 3 files changed, 63 insertions(+)
+
+diff --git a/src/amd/common/ac_shader_util.c b/src/amd/common/ac_shader_util.c
+index bdfa23fc1c39c..4fc42632be486 100644
+--- a/src/amd/common/ac_shader_util.c
++++ b/src/amd/common/ac_shader_util.c
+@@ -114,6 +114,28 @@ void ac_set_nir_options(struct radeon_info *info, bool use_llvm,
+       BITFIELD_BIT(nir_lower_packing_op_unpack_32_4x8);
+ }
+ 
++static unsigned
++align_load_store_size(enum amd_gfx_level gfx_level, unsigned size, bool uses_smem, bool is_shared)
++{
++   /* LDS can't overfetch because accesses that are partially out of range would be dropped
++    * entirely, so all unaligned LDS accesses are always split.
++    */
++   if (is_shared)
++      return size;
++
++   /* Align the size to what the hw supports. Out of range access due to alignment is OK because
++    * range checking is per dword for untyped instructions. This assumes that the compiler backend
++    * overfetches due to load size alignment instead of splitting the load.
++    *
++    * GFX6-11 don't have 96-bit SMEM loads.
++    * GFX6 doesn't have 96-bit untyped VMEM loads.
++    */
++   if (gfx_level >= (uses_smem ? GFX12 : GFX7) && size == 96)
++      return size;
++   else
++      return util_next_power_of_two(size);
++}
++
+ bool
+ ac_nir_mem_vectorize_callback(unsigned align_mul, unsigned align_offset, unsigned bit_size,
+                               unsigned num_components, int64_t hole_size, nir_intrinsic_instr *low,
+@@ -195,6 +217,38 @@ ac_nir_mem_vectorize_callback(unsigned align_mul, unsigned align_offset, unsigne
+    return false;
+ }
+ 
++bool ac_nir_scalarize_overfetching_loads_callback(const nir_instr *instr, const void *data)
++{
++   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++
++   /* Reject opcodes we don't scalarize. */
++   switch (intr->intrinsic) {
++   case nir_intrinsic_load_ubo:
++   case nir_intrinsic_load_ssbo:
++   case nir_intrinsic_load_global:
++   case nir_intrinsic_load_global_constant:
++   case nir_intrinsic_load_shared:
++      break;
++   default:
++      return false;
++   }
++
++   bool uses_smem = nir_intrinsic_has_access(intr) &&
++                    nir_intrinsic_access(intr) & ACCESS_SMEM_AMD;
++   bool is_shared = intr->intrinsic == nir_intrinsic_load_shared;
++
++   enum amd_gfx_level gfx_level = *(enum amd_gfx_level *)data;
++   unsigned comp_size = intr->def.bit_size / 8;
++   unsigned load_size = intr->def.num_components * comp_size;
++   unsigned used_load_size = util_bitcount(nir_def_components_read(&intr->def)) * comp_size;
++
++   /* Scalarize if the load overfetches. That includes loads that overfetch due to load size
++    * alignment, e.g. when only a power-of-two load is available. The scalarized loads are expected
++    * to be later vectorized to optimal sizes.
++    */
++   return used_load_size < align_load_store_size(gfx_level, load_size, uses_smem, is_shared);
++}
++
+ unsigned ac_get_spi_shader_z_format(bool writes_z, bool writes_stencil, bool writes_samplemask,
+                                     bool writes_mrt0_alpha)
+ {
+diff --git a/src/amd/common/ac_shader_util.h b/src/amd/common/ac_shader_util.h
+index b6ce1c1fcce1a..c8be21d099345 100644
+--- a/src/amd/common/ac_shader_util.h
++++ b/src/amd/common/ac_shader_util.h
+@@ -248,6 +248,8 @@ bool ac_nir_mem_vectorize_callback(unsigned align_mul, unsigned align_offset, un
+                                    unsigned num_components, int64_t hole_size,
+                                    nir_intrinsic_instr *low, nir_intrinsic_instr *high, void *data);
+ 
++bool ac_nir_scalarize_overfetching_loads_callback(const nir_instr *instr, const void *data);
++
+ unsigned ac_get_spi_shader_z_format(bool writes_z, bool writes_stencil, bool writes_samplemask,
+                                     bool writes_mrt0_alpha);
+ 
+diff --git a/src/gallium/drivers/radeonsi/si_shader.c b/src/gallium/drivers/radeonsi/si_shader.c
+index 1dae1bdcab67f..7584d72817cb5 100644
+--- a/src/gallium/drivers/radeonsi/si_shader.c
++++ b/src/gallium/drivers/radeonsi/si_shader.c
+@@ -2594,6 +2594,13 @@ static struct nir_shader *si_get_nir_shader(struct si_shader *shader, struct si_
+       NIR_PASS_V(nir, nir_clear_shared_memory, shared_size, chunk_size);
+    }
+ 
++   NIR_PASS_V(nir, nir_divergence_analysis); /* required by ac_nir_flag_smem_for_loads */
++   NIR_PASS(progress, nir, ac_nir_flag_smem_for_loads, sel->screen->info.gfx_level,
++            !sel->info.base.use_aco_amd, true);
++   NIR_PASS(progress, nir, nir_lower_io_to_scalar,
++            nir_var_mem_ubo | nir_var_mem_ssbo | nir_var_mem_shared | nir_var_mem_global,
++            ac_nir_scalarize_overfetching_loads_callback, &sel->screen->info.gfx_level);
++
+    if (progress) {
+       si_nir_opts(sel->screen, nir, false);
+       progress = false;
+-- 
+GitLab
+
+
+From 539c42e6b6a113be1bd2fefeee6d1f8dc797af4d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Fri, 24 May 2024 23:17:22 -0400
+Subject: [PATCH 2/3] radeonsi: lower descriptors sooner to allow vectorizing
+ descriptor loads
+
+The comment was wrong.
+
+Acked-by: Pierre-Eric Pelloux-Prayer <pierre-eric.pelloux-prayer@amd.com>
+---
+ src/gallium/drivers/radeonsi/si_shader.c | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/src/gallium/drivers/radeonsi/si_shader.c b/src/gallium/drivers/radeonsi/si_shader.c
+index 7584d72817cb5..7ef4b21e59955 100644
+--- a/src/gallium/drivers/radeonsi/si_shader.c
++++ b/src/gallium/drivers/radeonsi/si_shader.c
+@@ -2600,6 +2600,7 @@ static struct nir_shader *si_get_nir_shader(struct si_shader *shader, struct si_
+    NIR_PASS(progress, nir, nir_lower_io_to_scalar,
+             nir_var_mem_ubo | nir_var_mem_ssbo | nir_var_mem_shared | nir_var_mem_global,
+             ac_nir_scalarize_overfetching_loads_callback, &sel->screen->info.gfx_level);
++   NIR_PASS(progress, nir, si_nir_lower_resource, shader, args);
+ 
+    if (progress) {
+       si_nir_opts(sel->screen, nir, false);
+@@ -2638,9 +2639,6 @@ static struct nir_shader *si_get_nir_shader(struct si_shader *shader, struct si_
+       }
+    }
+ 
+-   /* This must be after vectorization because it causes bindings_different_restrict() to fail. */
+-   NIR_PASS(progress, nir, si_nir_lower_resource, shader, args);
+-
+    /* This must be after lowering resources to descriptor loads and before lowering intrinsics
+     * to args and lowering int64.
+     */
+-- 
+GitLab
+
+
+From bd5d4c0a0511433daa2ee88fe8d6f66ce1bddb9c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <marek.olsak@amd.com>
+Date: Fri, 24 May 2024 18:15:06 -0400
+Subject: [PATCH 3/3] amd: vectorize SMEM loads aggressively, allow
+ overfetching for ACO
+
+If there is a 4-byte hole between 2 loads, they are vectorized. Example:
+    load 4 + hole 4 + load 8 -> load 16
+This helps GLSL uniform loads, which are often sparse. See the code for more
+info.
+
+RADV could get better code by vectorizing later.
+
+radeonsi+ACO - TOTALS FROM AFFECTED SHADERS (45482/58355)
+  Spilled SGPRs: 841 -> 747 (-11.18 %)
+  Code Size: 67552396 -> 65291092 (-3.35 %) bytes
+  Max Waves: 714439 -> 714520 (0.01 %)
+
+This should have no effect on LLVM because ac_build_buffer_load scalarizes
+SMEM, but it's improved for some reason:
+
+radeonsi+LLVM - TOTALS FROM AFFECTED SHADERS (4673/58355)
+  Spilled SGPRs: 1450 -> 1282 (-11.59 %)
+  Spilled VGPRs: 106 -> 107 (0.94 %)
+  Scratch size: 101 -> 102 (0.99 %) dwords per thread
+  Code Size: 14994624 -> 14956316 (-0.26 %) bytes
+  Max Waves: 66679 -> 66735 (0.08 %)
+---
+ src/amd/common/ac_shader_util.c          | 146 ++++++++++++++++++-----
+ src/amd/common/ac_shader_util.h          |   5 +
+ src/amd/vulkan/radv_pipeline.c           |   3 +-
+ src/amd/vulkan/radv_pipeline_rt.c        |   2 +-
+ src/gallium/drivers/radeonsi/si_shader.c |   2 +-
+ 5 files changed, 125 insertions(+), 33 deletions(-)
+
+diff --git a/src/amd/common/ac_shader_util.c b/src/amd/common/ac_shader_util.c
+index 4fc42632be486..0154027f13832 100644
+--- a/src/amd/common/ac_shader_util.c
++++ b/src/amd/common/ac_shader_util.c
+@@ -141,25 +141,129 @@ ac_nir_mem_vectorize_callback(unsigned align_mul, unsigned align_offset, unsigne
+                               unsigned num_components, int64_t hole_size, nir_intrinsic_instr *low,
+                               nir_intrinsic_instr *high, void *data)
+ {
+-   if (num_components > 4 || hole_size > 0)
++   struct ac_nir_config *config = (struct ac_nir_config *)data;
++   bool uses_smem = (nir_intrinsic_has_access(low) &&
++                     nir_intrinsic_access(low) & ACCESS_SMEM_AMD) ||
++                    /* These don't have the "access" field. */
++                    low->intrinsic == nir_intrinsic_load_smem_amd ||
++                    low->intrinsic == nir_intrinsic_load_push_constant;
++   bool uses_s_buffer_load = uses_smem &&
++                             (low->intrinsic == nir_intrinsic_load_ubo ||
++                              low->intrinsic == nir_intrinsic_load_ssbo);
++   bool is_store = !nir_intrinsic_infos[low->intrinsic].has_dest;
++   bool is_scratch = low->intrinsic == nir_intrinsic_load_stack ||
++                     low->intrinsic == nir_intrinsic_store_stack ||
++                     low->intrinsic == nir_intrinsic_load_scratch ||
++                     low->intrinsic == nir_intrinsic_store_scratch;
++   bool is_shared = low->intrinsic == nir_intrinsic_load_shared ||
++                    low->intrinsic == nir_intrinsic_store_shared ||
++                    low->intrinsic == nir_intrinsic_load_deref ||
++                    low->intrinsic == nir_intrinsic_store_deref;
++
++   assert(!is_store || hole_size == 0);
++
++   /* If we get derefs here, only shared memory derefs are expected. */
++   assert((low->intrinsic != nir_intrinsic_load_deref &&
++           low->intrinsic != nir_intrinsic_store_deref) ||
++          nir_deref_mode_is(nir_src_as_deref(low->src[0]), nir_var_mem_shared));
++
++   /* Don't vectorize descriptor loads for LLVM due to excessive SGPR and VGPR spilling. */
++   if (!config->uses_aco && low->intrinsic == nir_intrinsic_load_smem_amd)
+       return false;
+ 
+-   bool is_scratch = false;
++   /* Reject opcodes we don't vectorize. */
+    switch (low->intrinsic) {
++   case nir_intrinsic_load_smem_amd:
++   case nir_intrinsic_load_push_constant:
++   case nir_intrinsic_load_ubo:
+    case nir_intrinsic_load_stack:
+-   case nir_intrinsic_load_scratch:
+    case nir_intrinsic_store_stack:
++   case nir_intrinsic_load_scratch:
+    case nir_intrinsic_store_scratch:
+-      is_scratch = true;
++   case nir_intrinsic_load_global_constant:
++   case nir_intrinsic_load_global:
++   case nir_intrinsic_store_global:
++   case nir_intrinsic_load_ssbo:
++   case nir_intrinsic_store_ssbo:
++   case nir_intrinsic_load_deref:
++   case nir_intrinsic_store_deref:
++   case nir_intrinsic_load_shared:
++   case nir_intrinsic_store_shared:
+       break;
+    default:
+-      break;
++      return false;
+    }
+ 
+-   /* >128 bit loads are split except with SMEM. On GFX6-8, >32 bit scratch loads are split. */
+-   enum amd_gfx_level gfx_level = *(enum amd_gfx_level *)data;
+-   if (bit_size * num_components > (is_scratch && gfx_level <= GFX8 ? 32 : 128))
+-      return false;
++   /* Align the size to what the hw supports. */
++   unsigned unaligned_new_size = num_components * bit_size;
++   unsigned aligned_new_size = align_load_store_size(config->gfx_level, unaligned_new_size,
++                                                     uses_smem, is_shared);
++
++   if (uses_smem) {
++      /* Maximize SMEM vectorization except for LLVM, which suffers from SGPR and VGPR spilling.
++       * GFX6-7 have fewer hw SGPRs, so merge only up to 128 bits to limit SGPR usage.
++       */
++      if (aligned_new_size > (config->gfx_level >= GFX8 ? (config->uses_aco ? 512 : 256) : 128))
++         return false;
++   } else {
++      if (aligned_new_size > 128)
++         return false;
++
++      /* GFX6-8 only support 32-bit scratch loads/stores. */
++      if (config->gfx_level <= GFX8 && is_scratch && aligned_new_size > 32)
++         return false;
++   }
++
++   if (!is_store) {
++      /* Only allow SMEM loads to overfetch by 32 bits:
++       *
++       * Examples (the hole is indicated by parentheses, the numbers are  in bytes, the maximum
++       * overfetch size is 4):
++       *    4  | (4) | 4   ->  hw loads 12  : ALLOWED    (4 over)
++       *    4  | (4) | 4   ->  hw loads 16  : DISALLOWED (8 over)
++       *    4  |  4  | 4   ->  hw loads 16  : ALLOWED    (4 over)
++       *    4  | (4) | 8   ->  hw loads 16  : ALLOWED    (4 over)
++       *    16 |  4        ->  hw loads 32  : DISALLOWED (12 over)
++       *    16 |  8        ->  hw loads 32  : DISALLOWED (8 over)
++       *    16 | 12        ->  hw loads 32  : ALLOWED    (4 over)
++       *    16 | (4) | 12  ->  hw loads 32  : ALLOWED    (4 over)
++       *    32 | 16        ->  hw loads 64  : DISALLOWED (16 over)
++       *    32 | 28        ->  hw loads 64  : ALLOWED    (4 over)
++       *    32 | (4) | 28  ->  hw loads 64  : ALLOWED    (4 over)
++       *
++       * Note that we can overfetch by more than 4 bytes if we merge more than 2 loads, e.g.:
++       *    4  | (4) | 8 | (4) | 12  ->  hw loads 32  : ALLOWED (4 + 4 over)
++       *
++       * That's because this callback is called twice in that case, each time allowing only 4 over.
++       *
++       * This is only enabled for ACO. LLVM spills SGPRs and VGPRs too much.
++       */
++      unsigned overfetch_size = 0;
++
++      if (config->uses_aco && uses_smem && aligned_new_size >= 128) {
++         if (uses_s_buffer_load) {
++            overfetch_size = 32;
++         } else {
++            /* Only increase the size of loads if doing so doesn't extend into a new page. */
++            uint32_t resource_align = low->intrinsic == nir_intrinsic_load_global_constant ||
++                                      low->intrinsic == nir_intrinsic_load_global ? NIR_ALIGN_MUL_MAX : 4;
++            uint32_t page_size = 4096;
++            uint32_t mul = MIN3(align_mul, page_size, resource_align);
++            unsigned end = (align_offset + unaligned_new_size / 8u) & (mul - 1);
++            if ((aligned_new_size - unaligned_new_size) / 8u > (mul - end))
++               overfetch_size = 32;
++         }
++      }
++
++      int64_t aligned_unvectorized_size =
++         align_load_store_size(config->gfx_level, low->num_components * low->def.bit_size,
++                               uses_smem, is_shared) +
++         align_load_store_size(config->gfx_level, high->num_components * high->def.bit_size,
++                               uses_smem, is_shared);
++
++      if (aligned_new_size > aligned_unvectorized_size + overfetch_size)
++         return false;
++   }
+ 
+    uint32_t align;
+    if (align_offset)
+@@ -167,18 +271,8 @@ ac_nir_mem_vectorize_callback(unsigned align_mul, unsigned align_offset, unsigne
+    else
+       align = align_mul;
+ 
+-   switch (low->intrinsic) {
+-   case nir_intrinsic_load_global:
+-   case nir_intrinsic_load_global_constant:
+-   case nir_intrinsic_store_global:
+-   case nir_intrinsic_store_ssbo:
+-   case nir_intrinsic_load_ssbo:
+-   case nir_intrinsic_load_ubo:
+-   case nir_intrinsic_load_push_constant:
+-   case nir_intrinsic_load_stack:
+-   case nir_intrinsic_load_scratch:
+-   case nir_intrinsic_store_stack:
+-   case nir_intrinsic_store_scratch: {
++   /* Validate the alignment and number of components. */
++   if (!is_shared) {
+       unsigned max_components;
+       if (align % 4 == 0)
+          max_components = NIR_MAX_VEC_COMPONENTS;
+@@ -187,13 +281,7 @@ ac_nir_mem_vectorize_callback(unsigned align_mul, unsigned align_offset, unsigne
+       else
+          max_components = 8u / bit_size;
+       return (align % (bit_size / 8u)) == 0 && num_components <= max_components;
+-   }
+-   case nir_intrinsic_load_deref:
+-   case nir_intrinsic_store_deref:
+-      assert(nir_deref_mode_is(nir_src_as_deref(low->src[0]), nir_var_mem_shared));
+-      FALLTHROUGH;
+-   case nir_intrinsic_load_shared:
+-   case nir_intrinsic_store_shared:
++   } else {
+       if (bit_size * num_components == 96) { /* 96 bit loads require 128 bit alignment and are split otherwise */
+          return align % 16 == 0;
+       } else if (bit_size == 16 && (align % 4)) {
+@@ -211,8 +299,6 @@ ac_nir_mem_vectorize_callback(unsigned align_mul, unsigned align_offset, unsigne
+             req /= 2u;
+          return align % (req / 8u) == 0;
+       }
+-   default:
+-      return false;
+    }
+    return false;
+ }
+diff --git a/src/amd/common/ac_shader_util.h b/src/amd/common/ac_shader_util.h
+index c8be21d099345..d1c985ba150da 100644
+--- a/src/amd/common/ac_shader_util.h
++++ b/src/amd/common/ac_shader_util.h
+@@ -241,6 +241,11 @@ enum ac_descriptor_type
+    AC_DESC_PLANE_2,
+ };
+ 
++struct ac_nir_config {
++   enum amd_gfx_level gfx_level;
++   bool uses_aco;
++};
++
+ void ac_set_nir_options(struct radeon_info *info, bool use_llvm,
+                         nir_shader_compiler_options *options);
+ 
+diff --git a/src/amd/vulkan/radv_pipeline.c b/src/amd/vulkan/radv_pipeline.c
+index 3c97b653687ab..a0921695ef886 100644
+--- a/src/amd/vulkan/radv_pipeline.c
++++ b/src/amd/vulkan/radv_pipeline.c
+@@ -329,7 +329,7 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
+       .modes = nir_var_mem_ssbo | nir_var_mem_ubo | nir_var_mem_push_const | nir_var_mem_shared | nir_var_mem_global |
+                nir_var_shader_temp,
+       .callback = ac_nir_mem_vectorize_callback,
+-      .cb_data = &gfx_level,
++      .cb_data = &(struct ac_nir_config){gfx_level, !use_llvm},
+       .robust_modes = 0,
+       /* On GFX6, read2/write2 is out-of-bounds if the offset register is negative, even if
+        * the final offset is not.
+@@ -413,6 +413,7 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
+    if (constant_fold_for_push_const && stage->args.ac.inline_push_const_mask)
+       NIR_PASS(_, stage->nir, nir_opt_constant_folding);
+ 
++   /* TODO: vectorize loads after this to vectorize loading adjacent descriptors */
+    NIR_PASS_V(stage->nir, radv_nir_apply_pipeline_layout, device, stage);
+ 
+    if (!stage->key.optimisations_disabled) {
+diff --git a/src/amd/vulkan/radv_pipeline_rt.c b/src/amd/vulkan/radv_pipeline_rt.c
+index db41d16f4cc5a..07925c5893263 100644
+--- a/src/amd/vulkan/radv_pipeline_rt.c
++++ b/src/amd/vulkan/radv_pipeline_rt.c
+@@ -400,7 +400,7 @@ radv_rt_nir_to_asm(struct radv_device *device, struct vk_pipeline_cache *cache,
+          .stack_alignment = 16,
+          .localized_loads = true,
+          .vectorizer_callback = ac_nir_mem_vectorize_callback,
+-         .vectorizer_data = &pdev->info.gfx_level,
++         .vectorizer_data = &(struct ac_nir_config){pdev->info.gfx_level, !radv_use_llvm_for_stage(pdev, stage->stage)},
+       };
+       nir_lower_shader_calls(stage->nir, &opts, &resume_shaders, &num_resume_shaders, stage->nir);
+    }
+diff --git a/src/gallium/drivers/radeonsi/si_shader.c b/src/gallium/drivers/radeonsi/si_shader.c
+index 7ef4b21e59955..3d0f14fd144d8 100644
+--- a/src/gallium/drivers/radeonsi/si_shader.c
++++ b/src/gallium/drivers/radeonsi/si_shader.c
+@@ -2613,7 +2613,7 @@ static struct nir_shader *si_get_nir_shader(struct si_shader *shader, struct si_
+                .modes = nir_var_mem_ssbo | nir_var_mem_ubo | nir_var_mem_shared | nir_var_mem_global |
+                         nir_var_shader_temp,
+                .callback = ac_nir_mem_vectorize_callback,
+-               .cb_data = &sel->screen->info.gfx_level,
++               .cb_data = &(struct ac_nir_config){sel->screen->info.gfx_level, sel->info.base.use_aco_amd},
+                /* On GFX6, read2/write2 is out-of-bounds if the offset register is negative, even if
+                 * the final offset is not.
+                 */
+-- 
+GitLab
+
