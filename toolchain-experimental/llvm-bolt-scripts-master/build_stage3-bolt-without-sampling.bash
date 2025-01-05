@@ -79,6 +79,9 @@ optimize_binary() {
         --hot-text \
         --frame-opt-rm-stores \
         --peepholes=all \
+        --infer-stale-profile=1 \
+        --x86-strip-redundant-address-size \
+        --indirect-call-promotion=all \
         --reg-reassign \
         --use-aggr-reg-reassign \
         --reorder-blocks=ext-tsp \
