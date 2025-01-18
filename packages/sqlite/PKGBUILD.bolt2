@@ -1,0 +1,304 @@
+# PGO Version: Laio Seman <laio [at] ieee.org>
+
+pkgbase="sqlite"
+pkgname=('sqlite')
+_srcver=3480000
+pkgver=3.48.0
+pkgrel=4.2
+pkgdesc="A C library that implements an SQL database engine"
+arch=('x86_64')
+license=('LicenseRef-Sqlite')
+url="https://www.sqlite.org/"
+makedepends=('tcl' 'readline' 'zlib' 'clang' 'llvm' 'llvm-libs' 'lld' 'pigz' 'curl')
+options=('!emptydirs' '!strip' '!lto')
+source=(https://www.sqlite.org/2024/sqlite-src-${_srcver}.zip
+        sqlite-lemon-system-template.patch
+        license.txt
+        git+https://github.com/ClickHouse/ClickBench.git)
+sha256sums=('2d7b032b6fdfe8c442aa809f850687a81d06381deecd7be3312601d28612e640'
+            '3dc137fcd7c6acb326af60a61b9844dd15d3773cb05e7a9ce276c41f713d765a'
+            '4e57d9ac979f1c9872e69799c2597eeef4c6ce7224f3ede0bf9dc8d217b1e65d'
+            'SKIP')
+
+prepare() {
+  # Use a cache directory in the user's home directory
+  local cache_dir="$HOME/Downloads/sqlite/sqlite-dataset"
+  mkdir -p "$cache_dir"
+
+  # Define the path to the cached compressed file
+  local cached_gz_file="$cache_dir/hits.csv.gz"
+
+  # Download the compressed file only if it doesn't exist in the cache
+  if [[ ! -f "$cached_gz_file" ]]; then
+    echo "Downloading hits.csv.gz..."
+    curl -L -o "$cached_gz_file" "https://datasets.clickhouse.com/hits_compatible/hits.csv.gz" || return 1
+  fi
+
+  # Create a directory for the dataset inside the srcdir
+  local dataset_dir="$srcdir/dataset"
+  mkdir -p "$dataset_dir"
+
+  # Decompress into the dataset directory only if the decompressed file doesn't exist
+  if [[ ! -f "$dataset_dir/hits.csv" ]]; then
+    echo "Decompressing hits.csv.gz with pigz..."
+    # Use all available processors for pigz
+    pigz -d -k -f -p "$(nproc)" "$cached_gz_file" -c > "$dataset_dir/hits.csv" || return 1
+  fi
+
+  # Verify the dataset exists
+  if [[ ! -f "$dataset_dir/hits.csv" ]]; then
+    echo "Dataset file not found after preparation"
+    return 1
+  fi
+
+  cd sqlite-src-$_srcver || return 1
+
+  # patch taken from Fedora
+  patch -Np1 -i ../sqlite-lemon-system-template.patch
+}
+
+pgo_profiler() {
+  # preparing PGO data
+  # using ClickHouse ClickBench scripts
+
+  # Use the dataset from the separate directory
+  local dataset_dir="$srcdir/dataset"
+
+  cd $ROOT_DIR || return 1
+  # Copy instead of move, so we can use it multiple times
+  cp "$dataset_dir/hits.csv" ClickBench/sqlite/hits.csv || {
+    echo "Failed to copy hits.csv dataset"
+    return 1
+  }
+
+  cd ClickBench/sqlite || {
+    echo "Failed to change to ClickBench/sqlite directory"
+    return 1
+  }
+
+  rm -rf mydb
+  sed -i '/REGEXP_REPLACE/d' queries.sql
+  LLVM_PROFILE_FILE=${PGO_PROFILE_DIR}/_%m_%p.profraw $SQLITE_DIR/sqlite3 mydb <create.sql
+  head -n 5000000 hits.csv >sample.csv
+  LLVM_PROFILE_FILE=${PGO_PROFILE_DIR}/_%m_%p.profraw $SQLITE_DIR/sqlite3 mydb '.import --csv sample.csv hits'
+  wc -c mydb
+
+  TRIES=3
+
+  cat queries.sql | while read query; do
+      sync
+      echo "$query"
+      for i in $(seq 1 $TRIES); do
+          LLVM_PROFILE_FILE=${PGO_PROFILE_DIR}/_%m_%p.profraw $SQLITE_DIR/sqlite3 mydb <<<"${query}"
+      done
+  done
+
+  # Cleanup after profiling
+  rm -f hits.csv sample.csv
+}
+
+build() {
+  # this uses malloc_usable_size, which is incompatible with fortification level 3
+  export CFLAGS="${CFLAGS/_FORTIFY_SOURCE=3/_FORTIFY_SOURCE=0}"
+  export CXXFLAGS="${CXXFLAGS/_FORTIFY_SOURCE=3/_FORTIFY_SOURCE=0}"
+
+  export CPPFLAGS="$CPPFLAGS \
+        -DSQLITE_ENABLE_COLUMN_METADATA=1 \
+        -DSQLITE_ENABLE_UNLOCK_NOTIFY \
+        -DSQLITE_ENABLE_DBSTAT_VTAB=1 \
+        -DSQLITE_ENABLE_FTS3_TOKENIZER=1 \
+        -DSQLITE_ENABLE_FTS3_PARENTHESIS \
+        -DSQLITE_SECURE_DELETE \
+        -DSQLITE_ENABLE_STMTVTAB \
+        -DSQLITE_ENABLE_STAT4 \
+        -DSQLITE_MAX_VARIABLE_NUMBER=250000 \
+        -DSQLITE_MAX_EXPR_DEPTH=10000 \
+        -DSQLITE_ENABLE_MATH_FUNCTIONS"
+
+  # define PGO_PROFILE_DIR
+  export PGO_PROFILE_DIR="$PWD/pgo-data"
+  mkdir -p "${PGO_PROFILE_DIR}"
+
+  export AR=llvm-ar
+  export CC=clang
+  export CXX=clang++
+  export NM=llvm-nm
+  export RANLIB=llvm-ranlib
+
+  export ORIG_CFLAGS="${CFLAGS}"
+  export ORIG_CXXFLAGS="${CXXFLAGS}"
+  export ORIG_LDFLAGS="${LDFLAGS}"
+
+  # 1. Initial build (for PGO generation)
+  export CFLAGS+=" -fprofile-generate -g3 -fno-omit-frame-pointer"
+  export CXXFLAGS+=" -fprofile-generate -g3 -fno-omit-frame-pointer"
+  export LDFLAGS+=" -fprofile-generate -g3 -fno-omit-frame-pointer"
+
+  cd sqlite-src-$_srcver
+  ./configure --prefix=/usr \
+    --disable-static \
+    --fts4 \
+    --fts5 \
+    --rtree \
+    --soname=legacy
+  sed -i -e 's/$(LDFLAGS.libsqlite3)/ -Wl,-O1,--as-needed \0/g' main.mk
+  make -j$(nproc)
+
+  # 2. First PGO profiling run
+  export SQLITE_DIR="$PWD"
+  cd ..
+  export ROOT_DIR="$PWD"
+  pgo_profiler || return 1
+
+  # 3. Rebuild with PGO profile data
+  cd "$SQLITE_DIR"
+  llvm-profdata merge -o merged.profdata "${PGO_PROFILE_DIR}"/*.profraw
+
+  export CFLAGS="${ORIG_CFLAGS} -fprofile-use=merged.profdata -flto=thin"
+  export CXXFLAGS="${ORIG_CXXFLAGS} -fprofile-use=merged.profdata -flto=thin"
+  export LDFLAGS="${ORIG_LDFLAGS} -fprofile-use=merged.profdata -flto=thin -Wl,--emit-relocs"
+
+  make clean
+  ./configure --prefix=/usr \
+    --disable-static \
+    --fts4 \
+    --fts5 \
+    --rtree \
+    --soname=legacy
+  sed -i -e 's/$(LDFLAGS.libsqlite3)/ -Wl,-O1,--as-needed \0/g' main.mk
+  make -j$(nproc)
+
+  # 4. BOLT instrumentation and profiling
+  echo "BOLT instrumenting..."
+  export BOLT_INSTRUMENT_DIR="$PWD/bolt-instr"
+  mkdir -p "${BOLT_INSTRUMENT_DIR}"
+
+  # Save the original binaries
+  cp sqlite3 sqlite3.orig
+  cp libsqlite3.so libsqlite3.so.orig
+
+  # Instrument both binaries
+  llvm-bolt sqlite3 -o sqlite3.instrumented \
+    -instrument \
+    -instrumentation-file="${BOLT_INSTRUMENT_DIR}/bolt.sqlite3.fdata"
+
+  llvm-bolt libsqlite3.so -o libsqlite3.so.instrumented \
+    -instrument \
+    -instrumentation-file="${BOLT_INSTRUMENT_DIR}/bolt.libsqlite3.fdata"
+
+  # Replace the original binaries with instrumented ones for profiling
+  mv sqlite3.instrumented sqlite3
+  mv libsqlite3.so.instrumented libsqlite3.so
+
+  # Make sure the instrumented library is found
+  export LD_LIBRARY_PATH="$PWD:$LD_LIBRARY_PATH"
+
+  # Run the same workload as PGO
+  cd ..
+  export ROOT_DIR="$PWD"
+  pgo_profiler || return 1
+
+  # Restore original binaries
+  cd "$SQLITE_DIR"
+  mv sqlite3.orig sqlite3
+  mv libsqlite3.so.orig libsqlite3.so
+
+  # 5. BOLT optimization
+  echo "BOLT optimizing sqlite3..."
+  llvm-bolt sqlite3 -o sqlite3.bolt \
+    -data="${BOLT_INSTRUMENT_DIR}/bolt.sqlite3.fdata" \
+    --dyno-stats \
+    --cu-processing-batch-size=64 \
+    --eliminate-unreachable \
+    --frame-opt=all \
+    --icf=all \
+    --jump-tables=aggressive \
+    --min-branch-clusters \
+    --stoke \
+    --sctc-mode=always \
+    --plt=all \
+    --hot-data \
+    --hot-text \
+    --frame-opt-rm-stores \
+    --peepholes=all \
+    --infer-stale-profile=1 \
+    --x86-strip-redundant-address-size \
+    --indirect-call-promotion=all \
+    --reg-reassign \
+    --use-aggr-reg-reassign \
+    --reorder-blocks=ext-tsp \
+    --reorder-functions=cdsort \
+    --split-all-cold \
+    --split-eh \
+    --split-functions \
+    --split-strategy=cdsplit
+
+  echo "BOLT optimizing libsqlite3.so..."
+  llvm-bolt libsqlite3.so -o libsqlite3.so.bolt \
+    -data="${BOLT_INSTRUMENT_DIR}/bolt.sqlite3.fdata" \
+    --dyno-stats \
+    --cu-processing-batch-size=64 \
+    --eliminate-unreachable \
+    --frame-opt=all \
+    --icf=all \
+    --jump-tables=aggressive \
+    --min-branch-clusters \
+    --stoke \
+    --sctc-mode=always \
+    --plt=all \
+    --hot-data \
+    --hot-text \
+    --frame-opt-rm-stores \
+    --peepholes=all \
+    --infer-stale-profile=1 \
+    --x86-strip-redundant-address-size \
+    --indirect-call-promotion=all \
+    --reg-reassign \
+    --use-aggr-reg-reassign \
+    --reorder-blocks=ext-tsp \
+    --reorder-functions=cdsort \
+    --split-all-cold \
+    --split-eh \
+    --split-functions \
+    --split-strategy=cdsplit
+
+  if [ ! -f "sqlite3.bolt" ] || [ ! -f "libsqlite3.so.bolt" ]; then
+    echo "BOLT optimization failed"
+    return 1
+  fi
+
+  # Replace with optimized binaries
+  mv sqlite3.bolt sqlite3
+  mv libsqlite3.so.bolt libsqlite3.so
+
+  # Cleanup
+  rm -rf "${PGO_PROFILE_DIR}"
+  rm -rf "${BOLT_INSTRUMENT_DIR}"
+
+}
+
+package_sqlite() {
+  pkgdesc="A C library that implements an SQL database engine"
+  depends=('readline' 'zlib' 'glibc')
+  provides=("sqlite3=$pkgver" 'libsqlite3.so')
+  replaces=("sqlite3")
+
+  cd sqlite-src-$_srcver
+  make DESTDIR="${pkgdir}" install
+
+  # install manpage
+  install -m755 -d "${pkgdir}"/usr/share/man/man1
+  install -m644 sqlite3.1 "${pkgdir}"/usr/share/man/man1/
+
+  # Use llvm-strip only on recognized file formats
+  find "$pkgdir" -type f \( -name '*.so*' -o -name '*.a' -o -executable \) -print0 | while IFS= read -r -d '' file; do
+    if llvm-strip --strip-unneeded "$file" 2>/dev/null || llvm-strip --strip-all "$file" 2>/dev/null; then
+      echo "Stripped: $file"
+    else
+      echo "Skipping: $file (not a valid object file)" >&2
+    fi
+  done
+
+  # license
+  install -D -m644 "${srcdir}"/license.txt "${pkgdir}"/usr/share/licenses/${pkgname}/license.txt
+}
