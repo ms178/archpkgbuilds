@@ -1,9 +1,6 @@
-# Maintainer: Jan Alexander Steffens (heftig) <heftig@archlinux.org>
-# Contributor: Jan de Groot <jgc@archlinux.org>
-
 pkgname=fontconfig
-pkgver=2.15.0
-pkgrel=3.1
+pkgver=2.16.0
+pkgrel=2.1
 epoch=2
 pkgdesc="Library for configuring and customizing font access"
 url=https://www.freedesktop.org/wiki/Software/fontconfig/
@@ -20,15 +17,17 @@ makedepends=(
   gperf
   meson
   perl-sgmls
+  llvm
 )
-provides=(fontconfig-docs)
+provides=(fontconfig-docs libfontconfig.so)
 conflicts=(fontconfig-docs)
 replaces=('fontconfig-docs<2:2.13.93-1')
 backup=(etc/fonts/fonts.conf)
 install=fontconfig.install
+options=(!strip)
 _commit=72b9a48f57de6204d99ce1c217b5609ee92ece9b  # tags/2.15.0^0
 source=(
-  "git+https://gitlab.freedesktop.org/fontconfig/fontconfig.git#commit=$_commit"
+  "git+https://gitlab.freedesktop.org/fontconfig/fontconfig.git#tag=$pkgver"
   40-fontconfig-config.script
   40-fontconfig-config.hook
   fontconfig.hook
@@ -51,21 +50,156 @@ build() {
   local meson_options=(
     -D default-hinting=slight
     -D default-sub-pixel-rendering=rgb
-    -D doc-html=enabled
+    -D doc-html=disabled
     -D doc-pdf=disabled
     -D doc-txt=disabled
+    -D xml-backend=libxml2
   )
+
+  # Stage 1: Instrumented build for PGO
+  export LLVM_PROFILE_FILE="$srcdir/%p.profraw"
+  CFLAGS_ORIG="$CFLAGS"
+  CXXFLAGS_ORIG="$CXXFLAGS"
+  LDFLAGS_ORIG="$LDFLAGS"
+
+  CFLAGS+=" -fprofile-generate -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10"
+  CXXFLAGS+=" -g3 -fno-omit-frame-pointer -fprofile-generate -mllvm -vp-counters-per-site=10"
+  LDFLAGS+=" -g3 -fno-omit-frame-pointer -fprofile-generate -mllvm -vp-counters-per-site=10"
+
+  arch-meson fontconfig build-stage1 "${meson_options[@]}" \
+    -D b_ndebug=false \
+    -D b_pie=false \
+    -D c_std=gnu2x \
+    -D cpp_std=gnu++2a \
+    --buildtype=debug \
+    -D b_lto=true
+
+  meson compile -C build-stage1
+
+  # Run tests to generate profile data
+  meson test -C build-stage1
+
+  # Merge profraw files
+  llvm-profdata merge -output="$srcdir/default.profdata" "$srcdir"/*.profraw
+
+  # Clean up profraw files
+  rm -f "$srcdir"/*.profraw
+
+  # Stage 2: Build with PGO data and prepare for BOLT
+  CFLAGS="$CFLAGS_ORIG -fprofile-use=$srcdir/default.profdata"
+  CXXFLAGS="$CXXFLAGS_ORIG -fprofile-use=$srcdir/default.profdata"
+  LDFLAGS="$LDFLAGS_ORIG -fprofile-use=$srcdir/default.profdata -Wl,--emit-relocs"
+
   arch-meson fontconfig build "${meson_options[@]}" \
     -D b_ndebug=true \
     -D b_pie=false \
     -D c_std=gnu2x \
     -D cpp_std=gnu++2a \
-    --buildtype=release
+    --buildtype=release \
+    -D b_lto=true
+
   meson compile -C build
+
+  # Create directory for profile data
+  mkdir -p "$srcdir/bolt_profile"
 }
 
 check() {
-  meson test -C build --print-errorlogs
+  cd "$srcdir"
+
+  # Use the correct path to the library
+  FONTCONFIG_LIB="build/src/libfontconfig.so.1.15.0"
+
+  if [ ! -f "$FONTCONFIG_LIB" ]; then
+    echo "Error: Could not find libfontconfig.so.1.15.0"
+    return 1
+  fi
+
+  echo "Using library: $FONTCONFIG_LIB"
+
+  # Create a copy of the original library for instrumentation
+  cp "$FONTCONFIG_LIB" "${FONTCONFIG_LIB}.orig"
+
+  # Create directory for BOLT data
+  mkdir -p "$srcdir/bolt_profile"
+
+  # Instrument the library copy
+  if ! llvm-bolt "${FONTCONFIG_LIB}.orig" \
+    --instrument \
+    --instrumentation-file-append-pid \
+    --lite=false \
+    --instrumentation-file="$srcdir/bolt_profile/prof.fdata" \
+    -o "${FONTCONFIG_LIB}.inst"; then
+    echo "Error: BOLT instrumentation failed"
+    return 1
+  fi
+
+  # Replace the original library with the instrumented version
+  mv "${FONTCONFIG_LIB}.inst" "$FONTCONFIG_LIB"
+
+  # Run tests to generate profile data
+  if ! meson test -C build --print-errorlogs; then
+    echo "Error: Tests failed during instrumentation run"
+    return 1
+  fi
+
+  # Restore the original library
+  mv "${FONTCONFIG_LIB}.orig" "$FONTCONFIG_LIB"
+
+  # Debug: List contents of bolt_profile directory
+  echo "Contents of $srcdir/bolt_profile:"
+  ls -l "$srcdir/bolt_profile"
+
+  # Merge profile data files
+  echo "Merging profile data files..."
+  if command -v merge-fdata &> /dev/null; then
+    merge-fdata "$srcdir/bolt_profile/prof.fdata."* > "$srcdir/bolt_profile/merged_prof.fdata"
+  else
+    # Fallback to simple concatenation if merge-fdata is not available
+    cat "$srcdir/bolt_profile/prof.fdata."* > "$srcdir/bolt_profile/merged_prof.fdata"
+  fi
+
+  if [ ! -f "$srcdir/bolt_profile/merged_prof.fdata" ]; then
+    echo "Error: Failed to merge profile data files"
+    return 1
+  fi
+
+  # Create optimized binary directory
+  mkdir -p "$srcdir/build/bolt"
+
+  # Optimize using BOLT with the merged profile data
+  if ! llvm-bolt "$FONTCONFIG_LIB" \
+    --data "$srcdir/bolt_profile/merged_prof.fdata" \
+    --dyno-stats \
+    --lite=false \
+    --cu-processing-batch-size=64 \
+    --eliminate-unreachable \
+    --frame-opt=all \
+    --icf=all \
+    --jump-tables=aggressive \
+    --min-branch-clusters \
+    --stoke \
+    --sctc-mode=always \
+    --plt=all \
+    --hot-data \
+    --hot-text \
+    --frame-opt-rm-stores \
+    --peepholes=all \
+    --infer-stale-profile=1 \
+    --x86-strip-redundant-address-size \
+    --indirect-call-promotion=all \
+    --reg-reassign \
+    --use-aggr-reg-reassign \
+    --reorder-blocks=ext-tsp \
+    --reorder-functions=cdsort \
+    --split-all-cold \
+    --split-eh \
+    --split-functions \
+    --split-strategy=cdsplit \
+    -o "$srcdir/build/bolt/libfontconfig.so.1.15.0.bolt" 2>&1 | tee llvm-bolt.log; then
+    echo "Error: BOLT optimization failed. See llvm-bolt.log for details."
+    return 1
+  fi
 }
 
 package() {
@@ -73,9 +207,25 @@ package() {
     libexpat.so
     libfreetype.so
   )
-  provides+=(libfontconfig.so)
 
+  # First, install everything normally
   meson install -C build --destdir "$pkgdir"
+
+  # Now, replace the library with the BOLT-optimized version if it exists
+  BOLT_LIB="$srcdir/build/bolt/libfontconfig.so.1.15.0.bolt"
+  if [ -f "$BOLT_LIB" ]; then
+    echo "Installing BOLT-optimized library..."
+    install -Dm755 "$BOLT_LIB" "$pkgdir/usr/lib/libfontconfig.so.1.15.0"
+
+    # Strip the optimized library
+    llvm-strip --strip-all --remove-section=.comment --remove-section=.note "$pkgdir/usr/lib/libfontconfig.so.1.15.0"
+
+    # Update symlinks
+    ln -sf libfontconfig.so.1.15.0 "$pkgdir/usr/lib/libfontconfig.so.1"
+    ln -sf libfontconfig.so.1.15.0 "$pkgdir/usr/lib/libfontconfig.so"
+  else
+    echo "BOLT-optimized library not found. Using original library."
+  fi
 
   # Handle conf.d using the hook to avoid overwriting the symlinks on upgrade
   mkdir -p "$pkgdir/usr/share/fontconfig/conf.default"
@@ -88,6 +238,15 @@ package() {
   install -D 40-fontconfig-config.script \
     "$pkgdir/usr/share/libalpm/scripts/40-fontconfig-config"
   install -Dm644 fontconfig/COPYING -t "$pkgdir/usr/share/licenses/$pkgname"
+
+  # Size comparison
+  echo "Size comparison:"
+  ls -lh "$srcdir/build/src/libfontconfig.so.1.15.0"
+  ls -lh "$BOLT_LIB"
+  ls -lh "$pkgdir/usr/lib/libfontconfig.so.1.15.0"
+
+  # Update the provides array with the correct SO name
+  provides=(fontconfig-docs "libfontconfig.so=${pkgver}")
 }
 
 # vim:set sw=2 sts=-1 et:
