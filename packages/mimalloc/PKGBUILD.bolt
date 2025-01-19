@@ -1,6 +1,6 @@
 pkgname=mimalloc
 pkgver=2.1.9
-pkgrel=3.2
+pkgrel=4.1
 pkgdesc='General-purpose allocator with excellent performance characteristics'
 arch=('x86_64')
 url='https://github.com/microsoft/mimalloc'
@@ -19,6 +19,9 @@ pkgver() {
 build() {
   cd "$pkgname"
 
+  # Setup cleanup trap
+  trap 'rm -rf "$srcdir/pgo" "$srcdir/bolt_profile"' EXIT
+
   # Create directory for PGO profiles
   mkdir -p "$srcdir/pgo"
 
@@ -35,9 +38,10 @@ build() {
   )
 
   # --- Stage 1: Build with PGO instrumentation ---
-  CFLAGS+=" -fprofile-generate=$srcdir/pgo -mllvm -vp-counters-per-site=10 -g3 -fno-omit-frame-pointer"
-  CXXFLAGS+=" -fprofile-generate=$srcdir/pgo -mllvm -vp-counters-per-site=10 -g3 -fno-omit-frame-pointer"
-  LDFLAGS+=" -fprofile-generate=$srcdir/pgo -mllvm -vp-counters-per-site=10 -g3 -fno-omit-frame-pointer"
+  local _pgo_instrument_flags=" -fprofile-generate=$srcdir/pgo -mllvm -vp-counters-per-site=10 -g3 -fno-omit-frame-pointer"
+  CFLAGS+="$_pgo_instrument_flags"
+  CXXFLAGS+="$_pgo_instrument_flags"
+  LDFLAGS+="$_pgo_instrument_flags"
 
   cmake \
     -B build-stage1 \
@@ -50,7 +54,7 @@ build() {
   echo "Running tests to generate PGO profile data..."
   cd build-stage1
   export LD_LIBRARY_PATH="$PWD:$LD_LIBRARY_PATH"
-  ctest --output-on-failure
+  ctest --output-on-failure -j$(nproc)
   cd ..
 
   # Merge PGO profiles
@@ -58,9 +62,10 @@ build() {
   llvm-profdata merge -output="$srcdir/pgo/default.profdata" "$srcdir"/pgo/*.profraw
 
   # --- Stage 2: Build with PGO data ---
-  CFLAGS="${CFLAGS%% -fprofile-generate*} -fprofile-use=$srcdir/pgo/default.profdata"
-  CXXFLAGS="${CXXFLAGS%% -fprofile-generate*} -fprofile-use=$srcdir/pgo/default.profdata"
-  LDFLAGS="${LDFLAGS%% -fprofile-generate*} -fprofile-use=$srcdir/pgo/default.profdata -Wl,--emit-relocs"
+  # Remove instrumentation flags and only add profile use
+  CFLAGS="${CFLAGS%"$_pgo_instrument_flags"} -fprofile-use=$srcdir/pgo/default.profdata"
+  CXXFLAGS="${CXXFLAGS%"$_pgo_instrument_flags"} -fprofile-use=$srcdir/pgo/default.profdata"
+  LDFLAGS="${LDFLAGS%"$_pgo_instrument_flags"} -fprofile-use=$srcdir/pgo/default.profdata -Wl,--emit-relocs"
 
   cmake \
     -B build-pgo \
@@ -75,6 +80,8 @@ build() {
   # Array of shared libraries to instrument
   local shared_libs=(
     "build-pgo/libmimalloc.so"
+    "build-pgo/libmimalloc.so.2"
+    "build-pgo/libmimalloc.so.2.1"
   )
 
   # Instrument shared libraries
@@ -86,8 +93,6 @@ build() {
         --lite=false \
         --instrumentation-file-append-pid \
         --instrumentation-file="$srcdir/bolt_profile/prof.fdata" \
-        --instrument-hot-only=false \
-        --instrument-calls \
         -o "$lib.inst"
       mv "$lib.inst" "$lib"
     fi
@@ -99,7 +104,7 @@ build() {
   export BOLT_INSTRUMENT_FILE="$srcdir/bolt_profile/prof.fdata"
 
   cd build-pgo
-  LD_PRELOAD="./libmimalloc.so" ctest --output-on-failure
+  LD_PRELOAD="./libmimalloc.so" ctest --output-on-failure -j$(nproc)
   cd ..
 
   # --- Debug output and checks for BOLT ---
@@ -121,12 +126,18 @@ build() {
     return 1
   fi
 
+  # Validate BOLT profile quality
+  if ! llvm-bolt-heatmap "$srcdir/bolt_profile/merged.fdata" ; then
+    echo "Warning: BOLT profile may have quality issues"
+  fi
+
   # --- Stage 4: Optimize with BOLT ---
   echo "Optimizing with BOLT..."
 
   local bolt_options=(
     --data "$srcdir/bolt_profile/merged.fdata"
     --dyno-stats
+    --lite=false
     --cu-processing-batch-size=64
     --eliminate-unreachable
     --frame-opt=all
@@ -153,30 +164,42 @@ build() {
     --split-strategy=cdsplit
   )
 
-  # Optimize shared libraries
+  # Optimize shared libraries with fallback
   for lib in "${shared_libs[@]}"; do
     if [ -f "${lib}.orig" ]; then
-      llvm-bolt "${lib}.orig" \
-        "${bolt_options[@]}" \
-        -o "${lib}.bolt" || \
-        echo "Warning: BOLT optimization failed for ${lib}"
+      if ! llvm-bolt "${lib}.orig" "${bolt_options[@]}" -o "${lib}.bolt" ; then
+        echo "Warning: BOLT optimization failed for ${lib}, using PGO-only version"
+        cp "${lib}.orig" "${lib}.bolt"
+      fi
+    fi
+  done
+
+  # Validate optimized binaries
+  for lib in "${shared_libs[@]}"; do
+    if [ -f "${lib}.bolt" ]; then
+      if ! ldd "${lib}.bolt" >/dev/null 2>&1; then
+        echo "Error: Optimized library ${lib}.bolt has missing dependencies"
+        return 1
+      fi
     fi
   done
 }
 
 check() {
   cd "$pkgname/build-pgo"
-  ctest --output-on-failure
+  ctest --output-on-failure -j$(nproc)
 }
 
 package() {
   cd "$pkgname"
   DESTDIR="$pkgdir" cmake --install build-pgo
 
-  # Replace the original library with the BOLT-optimized version if it exists
-  if [ -f "build-pgo/libmimalloc.so.bolt" ]; then
-    install -Dm755 build-pgo/libmimalloc.so.bolt "$pkgdir/usr/lib/libmimalloc.so"
-  fi
+  # Replace the original libraries with BOLT-optimized versions if they exist
+  for lib in "libmimalloc.so" "libmimalloc.so.2" "libmimalloc.so.2.1"; do
+    if [ -f "build-pgo/${lib}.bolt" ]; then
+      install -Dm755 "build-pgo/${lib}.bolt" "$pkgdir/usr/lib/${lib}"
+    fi
+  done
 
   # Use llvm-strip only on recognized file formats
   find "$pkgdir" -type f \( -name '*.so*' -o -name '*.a' -o -executable \) -print0 | while IFS= read -r -d '' file; do
