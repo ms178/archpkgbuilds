@@ -1,6 +1,6 @@
 pkgname=mimalloc
 pkgver=2.1.9
-pkgrel=4.1
+pkgrel=5.1
 pkgdesc='General-purpose allocator with excellent performance characteristics'
 arch=('x86_64')
 url='https://github.com/microsoft/mimalloc'
@@ -30,7 +30,6 @@ build() {
 
   local _common_cmake_options=(
     -D CMAKE_INSTALL_PREFIX=/usr
-    -D CMAKE_BUILD_TYPE=Release
     -D CMAKE_UNITY_BUILD=ON
     -D MI_BUILD_STATIC=OFF
     -D MI_BUILD_OBJECT=OFF
@@ -39,13 +38,21 @@ build() {
 
   # --- Stage 1: Build with PGO instrumentation ---
   local _pgo_instrument_flags=" -fprofile-generate=$srcdir/pgo -mllvm -vp-counters-per-site=10 -g3 -fno-omit-frame-pointer"
-  CFLAGS+="$_pgo_instrument_flags"
-  CXXFLAGS+="$_pgo_instrument_flags"
-  LDFLAGS+="$_pgo_instrument_flags"
+  local _original_cflags="$CFLAGS"
+  local _original_cxxflags="$CXXFLAGS"
+  local _original_ldflags="$LDFLAGS"
+  CFLAGS+=" $_pgo_instrument_flags"
+  CXXFLAGS+=" $_pgo_instrument_flags"
+  LDFLAGS+=" $_pgo_instrument_flags"
+
+  echo "CFLAGS for PGO instrumentation: $CFLAGS"
+  echo "CXXFLAGS for PGO instrumentation: $CXXFLAGS"
+  echo "LDFLAGS for PGO instrumentation: $LDFLAGS"
 
   cmake \
     -B build-stage1 \
     -G Ninja \
+    -D CMAKE_BUILD_TYPE=None \
     "${_common_cmake_options[@]}"
 
   ninja -C build-stage1
@@ -62,32 +69,36 @@ build() {
   llvm-profdata merge -output="$srcdir/pgo/default.profdata" "$srcdir"/pgo/*.profraw
 
   # --- Stage 2: Build with PGO data ---
-  # Remove instrumentation flags and only add profile use
-  CFLAGS="${CFLAGS%"$_pgo_instrument_flags"} -fprofile-use=$srcdir/pgo/default.profdata"
-  CXXFLAGS="${CXXFLAGS%"$_pgo_instrument_flags"} -fprofile-use=$srcdir/pgo/default.profdata"
-  LDFLAGS="${LDFLAGS%"$_pgo_instrument_flags"} -fprofile-use=$srcdir/pgo/default.profdata -Wl,--emit-relocs"
+  CFLAGS="$_original_cflags -fprofile-use=$srcdir/pgo/default.profdata"
+  CXXFLAGS="$_original_cxxflags -fprofile-use=$srcdir/pgo/default.profdata"
+  LDFLAGS="$_original_ldflags -fprofile-use=$srcdir/pgo/default.profdata -Wl,--emit-relocs"
+
+  echo "CFLAGS for PGO optimization: $CFLAGS"
+  echo "CXXFLAGS for PGO optimization: $CXXFLAGS"
+  echo "LDFLAGS for PGO optimization: $LDFLAGS"
 
   cmake \
     -B build-pgo \
     -G Ninja \
+    -D CMAKE_BUILD_TYPE=Release \
     "${_common_cmake_options[@]}"
 
   ninja -C build-pgo
 
-  # --- Stage 3: Instrument for BOLT ---
-  echo "Creating instrumented binaries for BOLT..."
+  # --- Stage 3 & 4: BOLT Instrumentation and Optimization ---
+  echo "Starting BOLT instrumentation and optimization..."
 
-  # Array of shared libraries to instrument
   local shared_libs=(
-    "build-pgo/libmimalloc.so"
-    "build-pgo/libmimalloc.so.2"
     "build-pgo/libmimalloc.so.2.1"
   )
 
-  # Instrument shared libraries
   for lib in "${shared_libs[@]}"; do
     if [ -f "$lib" ]; then
-      cp "$lib" "$lib.orig"
+      # Backup original PGO-optimized library
+      cp "$lib" "$lib.pgo"
+
+      # --- Instrument for BOLT ---
+      echo "Instrumenting $lib for BOLT..."
       llvm-bolt "$lib" \
         --instrument \
         --lite=false \
@@ -95,46 +106,22 @@ build() {
         --instrumentation-file="$srcdir/bolt_profile/prof.fdata" \
         -o "$lib.inst"
       mv "$lib.inst" "$lib"
-    fi
-  done
 
-  # Run tests with instrumented binaries to generate BOLT profile data
-  echo "Running tests with instrumented binaries for BOLT..."
-  export BOLT_USE_INSTRUMENTATION=1
-  export BOLT_INSTRUMENT_FILE="$srcdir/bolt_profile/prof.fdata"
+      # --- Run tests with instrumented binary ---
+      echo "Running tests with BOLT instrumentation..."
+      export BOLT_USE_INSTRUMENTATION=1
+      export BOLT_INSTRUMENT_FILE="$srcdir/bolt_profile/prof.fdata"
+      cd build-pgo
+      LD_PRELOAD="../$lib" ctest --output-on-failure -j$(nproc) # Use relative path for LD_PRELOAD
+      cd ..
 
-  cd build-pgo
-  LD_PRELOAD="./libmimalloc.so" ctest --output-on-failure -j$(nproc)
-  cd ..
+      # --- Merge BOLT profile data ---
+      echo "Merging BOLT profile data..."
+      merge-fdata "$srcdir/bolt_profile/prof.fdata"* > "$srcdir/bolt_profile/merged.fdata"
 
-  # --- Debug output and checks for BOLT ---
-  echo "Looking for BOLT profile data files..."
-  ls -la "$srcdir/bolt_profile/"
-
-  # Check if BOLT profile data files exist
-  if ! ls "$srcdir/bolt_profile/prof.fdata"* >/dev/null 2>&1; then
-    echo "Error: No BOLT profile data files found!"
-    return 1
-  fi
-
-  echo "Merging BOLT profile data files..."
-  merge-fdata "$srcdir/bolt_profile/prof.fdata"* > "$srcdir/bolt_profile/merged.fdata"
-
-  # Verify merged BOLT profile data file size
-  if [ ! -s "$srcdir/bolt_profile/merged.fdata" ]; then
-    echo "Error: Merged BOLT profile data file is empty!"
-    return 1
-  fi
-
-  # Validate BOLT profile quality
-  if ! llvm-bolt-heatmap "$srcdir/bolt_profile/merged.fdata" ; then
-    echo "Warning: BOLT profile may have quality issues"
-  fi
-
-  # --- Stage 4: Optimize with BOLT ---
-  echo "Optimizing with BOLT..."
-
-  local bolt_options=(
+      # --- Optimize with BOLT ---
+      echo "Optimizing $lib with BOLT..."
+      local bolt_options=(
     --data "$srcdir/bolt_profile/merged.fdata"
     --dyno-stats
     --lite=false
@@ -148,7 +135,7 @@ build() {
     --sctc-mode=always
     --plt=all
     --hot-data
-    --hot-text
+    --hugify
     --frame-opt-rm-stores
     --peepholes=all
     --infer-stale-profile=1
@@ -164,42 +151,53 @@ build() {
     --split-strategy=cdsplit
   )
 
-  # Optimize shared libraries with fallback
-  for lib in "${shared_libs[@]}"; do
-    if [ -f "${lib}.orig" ]; then
-      if ! llvm-bolt "${lib}.orig" "${bolt_options[@]}" -o "${lib}.bolt" ; then
-        echo "Warning: BOLT optimization failed for ${lib}, using PGO-only version"
-        cp "${lib}.orig" "${lib}.bolt"
+      if ! llvm-bolt "$lib.pgo" "${bolt_options[@]}" -o "$lib.bolt"; then
+        echo "Warning: BOLT optimization failed for $lib, using PGO-only version"
+        cp "$lib.pgo" "$lib.bolt"
       fi
+
+      # --- Replace original with optimized library ---
+      mv "$lib.bolt" "$lib"
+
+      # --- Validate optimized library ---
+      if ! ldd "$lib" >/dev/null 2>&1; then
+        echo "Error: Optimized library $lib has missing dependencies"
+        return 1
+      fi
+
+      # --- Clean up instrumentation files ---
+      rm -f "$srcdir/bolt_profile/prof.fdata"*
     fi
   done
 
-  # Validate optimized binaries
-  for lib in "${shared_libs[@]}"; do
-    if [ -f "${lib}.bolt" ]; then
-      if ! ldd "${lib}.bolt" >/dev/null 2>&1; then
-        echo "Error: Optimized library ${lib}.bolt has missing dependencies"
-        return 1
-      fi
-    fi
-  done
+  # --- Add RPATH to link the correct library ---
+  local _rpath_flags="-Wl,-rpath,\$ORIGIN/../.."
+  LDFLAGS+=" $_rpath_flags"
+
+  # --- Run check() AFTER BOLT optimization and installation ---
+  echo "Running final check on BOLT-optimized binary..."
+  check
+
 }
 
 check() {
-  cd "$pkgname/build-pgo"
-  ctest --output-on-failure -j$(nproc)
+  # Run tests against the optimized library in the build-pgo directory, using LD_LIBRARY_PATH
+  cd "$srcdir/$pkgname/build-pgo"
+  export LD_LIBRARY_PATH="$srcdir/$pkgname/build-pgo:$LD_LIBRARY_PATH" # Set LD_LIBRARY_PATH
+  ctest -C Release -j$(nproc) # Specify Release configuration
+  unset LD_LIBRARY_PATH # Clean up after tests
 }
 
 package() {
   cd "$pkgname"
   DESTDIR="$pkgdir" cmake --install build-pgo
 
-  # Replace the original libraries with BOLT-optimized versions if they exist
-  for lib in "libmimalloc.so" "libmimalloc.so.2" "libmimalloc.so.2.1"; do
-    if [ -f "build-pgo/${lib}.bolt" ]; then
-      install -Dm755 "build-pgo/${lib}.bolt" "$pkgdir/usr/lib/${lib}"
-    fi
-  done
+  # Replace only the actual library with BOLT-optimized version and recreate symlinks
+  if [ -f "build-pgo/libmimalloc.so.2.1.bolt" ]; then
+    install -Dm755 "build-pgo/libmimalloc.so.2.1.bolt" "$pkgdir/usr/lib/libmimalloc.so.2.1"
+    ln -sf libmimalloc.so.2.1 "$pkgdir/usr/lib/libmimalloc.so.2"
+    ln -sf libmimalloc.so.2 "$pkgdir/usr/lib/libmimalloc.so"
+  fi
 
   # Use llvm-strip only on recognized file formats
   find "$pkgdir" -type f \( -name '*.so*' -o -name '*.a' -o -executable \) -print0 | while IFS= read -r -d '' file; do
