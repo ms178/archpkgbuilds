@@ -70,7 +70,7 @@ if [[ "$_additional_meson_flags" =~ "--buildtype debug" ]]; then
   _makepkg_options+=('debug !strip')
 fi
 
-options=(${_makepkg_options[@]})
+options=(${_makepkg_options[@]} !strip)
 
 url="https://www.mesa3d.org"
 license=('custom')
@@ -491,18 +491,14 @@ build() {
 }
 
 run_with_perf() {
-    local cmd="vkcube"
-    local driver="libvulkan_radeon.so"
     local bolt_profile_dir="${srcdir}/bolt_profile"
-    local perf_data_file="${srcdir}/bolt_profile/vkcube.perf.data"
+    mkdir -p "${bolt_profile_dir}"
 
-    # Ensure the bolt_profile directory exists
-    mkdir -p "${srcdir}/bolt_profile" || {
-        echo "Error: Failed to create bolt_profile directory at ${srcdir}/bolt_profile." >&2
-        return 1
-    }
+    # Profile RADV first
+    local cmd="vkcube"
+    local perf_data_file="${bolt_profile_dir}/vkcube.perf.data"
 
-    # Set Vulkan environment variables to use the just-built RADV driver
+    # Set Vulkan environment variables
     export LD_PRELOAD="${srcdir}/_build64/src/amd/vulkan/libvulkan_radeon.so"
     export LD_LIBRARY_PATH="${srcdir}/_build64/src/amd/vulkan/:$LD_LIBRARY_PATH"
     export VK_ICD_FILENAMES="${srcdir}/_build64/src/amd/vulkan/radeon_icd.x86_64.json"
@@ -513,92 +509,131 @@ run_with_perf() {
     export VK_IMPLICIT_LAYER_PATH="${srcdir}/_build64/src/amd/vulkan/"
     export VK_LOADER_DEBUG="all"
 
-    # Run vkcube with perf record in the background
-    echo "Profiling $cmd with the just-built RADV driver..."
+    # Profile vkcube
+    echo "Profiling vkcube with RADV driver..."
     perf record --max-size=6G -F 50000 -e branch-instructions:u,cycles:u,cache-misses:u,branch-misses:u,branches:u,branch-loads:u,branch-load-misses:u,iTLB-load-misses:u,dTLB-store-misses:u,dTLB-load-misses:u,L1-icache-load-misses:u,LLC-load-misses:u -b --strict-freq -- "$cmd" &
     local pid=$!
-
-    # Allow vkcube to run for a sufficient amount of time
     sleep 240
-
-    # Gracefully terminate the profiled process
-    if kill "$pid" 2>/dev/null; then
-        echo "Profiling completed for $cmd."
-    else
-        echo "Warning: $cmd exited prematurely, perf data may be incomplete." >&2
-    fi
-
-    # Wait for the process to finish, suppressing errors
+    kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null || true
+    mv perf.data "$perf_data_file"
 
-    # Move the perf.data file to the bolt_profile directory with the correct name
-    if [[ -f perf.data ]]; then
-        mv perf.data "$perf_data_file"
-        echo "Perf data saved to $perf_data_file"
-    else
-        echo "Warning: perf.data file not generated for $cmd." >&2
-        return 1
-    fi
+    # Now profile glxgears for radeonsi
+    local glx_perf_data_file="${bolt_profile_dir}/glxgears.perf.data"
+
+    # Set OpenGL environment variables
+    export LIBGL_DRIVERS_PATH="${srcdir}/_build64/src/gallium/targets/dri/"
+    export LD_LIBRARY_PATH="${srcdir}/_build64/src/gallium/targets/dri/:$LD_LIBRARY_PATH"
+
+    echo "Profiling glxgears with radeonsi driver..."
+    perf record --max-size=6G -F 50000 -e branch-instructions:u,cycles:u,cache-misses:u,branch-misses:u,branches:u,branch-loads:u,branch-load-misses:u,iTLB-load-misses:u,dTLB-store-misses:u,dTLB-load-misses:u,L1-icache-load-misses:u,LLC-load-misses:u -b --strict-freq -- glxgears &
+    pid=$!
+    sleep 240
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null || true
+    mv perf.data "$glx_perf_data_file"
 }
-
 
 build_bolt() {
     cd "${srcdir}/${_mesa_srcdir}"
     mkdir -p _build64/bolt
 
-    # Check if BOLT is available
     if ! command -v llvm-bolt >/dev/null 2>&1; then
         echo "Warning: llvm-bolt not found, skipping BOLT optimization" >&2
         return 0
     fi
 
-    # Optimize RADV driver using BOLT
-    driver="libvulkan_radeon.so"
-    file=$(find "$srcdir/_build64/src/amd/vulkan" -name "$driver" -print -quit)
+    # Optimize RADV
+    local driver="libvulkan_radeon.so"
+    local path="src/amd/vulkan"
+    local perf_file="vkcube.perf.data"
 
-    # Check if the driver file exists
+    local file=$(find "$srcdir/_build64/$path" -name "$driver" -print -quit)
+
     if [[ -z "$file" ]]; then
-        echo "Warning: $driver driver not found, skipping BOLT optimization" >&2
-        return 1
+        echo "Warning: $driver not found, skipping BOLT optimization" >&2
+    else
+        echo "Optimizing $file with BOLT..."
+        if ! llvm-bolt "$file" \
+        --data "${srcdir}/bolt_profile/$perf_file" \
+        --dyno-stats \
+        --lite=false \
+        --cu-processing-batch-size=64 \
+        --eliminate-unreachable \
+        --frame-opt=all \
+        --icf=all \
+        --jump-tables=aggressive \
+        --min-branch-clusters \
+        --stoke \
+        --sctc-mode=always \
+        --plt=all \
+        --hot-data \
+        --hot-text \
+        --frame-opt-rm-stores \
+        --peepholes=all \
+        --infer-stale-profile=1 \
+        --x86-strip-redundant-address-size \
+        --indirect-call-promotion=all \
+        --reg-reassign \
+        --reorder-blocks=ext-tsp \
+        --reorder-functions=cdsort \
+        --split-all-cold \
+        --split-eh \
+        --split-functions \
+        --split-strategy=cdsplit \
+        --skip-funcs=.text/1 \
+            -o "_build64/bolt/$(basename "$file")"; then
+                echo "Warning: BOLT optimization failed for $file, continuing with unoptimized version..." >&2
+                cp "$file" "_build64/bolt/$(basename "$file")"
+        else
+            echo "BOLT optimization successful for $file"
+        fi
     fi
 
-    # don't use --use-aggr-reg-reassign (see: https://github.com/llvm/llvm-project/issues/123487), also don't use mold as linker or experiment with --plt=needed; you can profile with a more diverse workload than vkcube in the background with LD_PRELOADing the freshly built libvulkan_radeon.so from the src directory.
+    # Optimize radeonsi (without --reg-reassign)
+    driver="libgallium-25.0.0-devel.so"
+    path="src/gallium/targets/dri"
+    perf_file="glxgears.perf.data"
 
-    # Attempt BOLT optimization with error handling
-    echo "Optimizing $file with BOLT..."
-    if ! llvm-bolt "$file" \
-    --data "${srcdir}/bolt_profile/vkcube.perf.data" \
-    --dyno-stats \
-    --lite=false \
-    --cu-processing-batch-size=64 \
-    --eliminate-unreachable \
-    --frame-opt=all \
-    --icf=all \
-    --jump-tables=aggressive \
-    --min-branch-clusters \
-    --stoke \
-    --sctc-mode=always \
-    --plt=all \
-    --hot-data \
-    --hot-text \
-    --frame-opt-rm-stores \
-    --peepholes=all \
-    --infer-stale-profile=1 \
-    --x86-strip-redundant-address-size \
-    --indirect-call-promotion=all \
-    --reg-reassign \
-    --reorder-blocks=ext-tsp \
-    --reorder-functions=cdsort \
-    --split-all-cold \
-    --split-eh \
-    --split-functions \
-    --split-strategy=cdsplit \
-    --skip-funcs=.text/1 \
-        -o "_build64/bolt/$(basename "$file")"; then
-            echo "Warning: BOLT optimization failed for $file, continuing with unoptimized version..." >&2
-            cp "$file" "_build64/bolt/$(basename "$file")"
+    file=$(find "$srcdir/_build64/$path" -name "$driver" -print -quit)
+
+    if [[ -z "$file" ]]; then
+        echo "Warning: $driver not found, skipping BOLT optimization" >&2
     else
-        echo "BOLT optimization successful for $file"
+        echo "Optimizing $file with BOLT..."
+        if ! llvm-bolt "$file" \
+        --data "${srcdir}/bolt_profile/$perf_file" \
+        --dyno-stats \
+        --lite=false \
+        --cu-processing-batch-size=64 \
+        --eliminate-unreachable \
+        --frame-opt=all \
+        --icf=all \
+        --jump-tables=aggressive \
+        --min-branch-clusters \
+        --stoke \
+        --sctc-mode=always \
+        --plt=all \
+        --hot-data \
+        --hot-text \
+        --frame-opt-rm-stores \
+        --peepholes=all \
+        --infer-stale-profile=1 \
+        --x86-strip-redundant-address-size \
+        --indirect-call-promotion=all \
+        --reorder-blocks=ext-tsp \
+        --reorder-functions=cdsort \
+        --split-all-cold \
+        --split-eh \
+        --split-functions \
+        --split-strategy=cdsplit \
+        --skip-funcs=.text/1 \
+            -o "_build64/bolt/$(basename "$file")"; then
+                echo "Warning: BOLT optimization failed for $file, continuing with unoptimized version..." >&2
+                cp "$file" "_build64/bolt/$(basename "$file")"
+        else
+            echo "BOLT optimization successful for $file"
+        fi
     fi
 
     return 0
@@ -610,6 +645,9 @@ package_mesa-tkg-git() {
              'expat' 'libclc' 'libx11' "$_llvm")
     provides=(mesa=$pkgver-$pkgrel vulkan-intel=$pkgver-$pkgrel vulkan-radeon=$pkgver-$pkgrel vulkan-mesa-layers=$pkgver-$pkgrel mesa-vulkan-layers=$pkgver-$pkgrel libva-mesa-driver=$pkgver-$pkgrel mesa-vdpau=$pkgver-$pkgrel vulkan-driver opencl-mesa=$pkgver-$pkgrel opengl-driver opencl-driver ati-dri intel-dri nouveau-dri svga-dri mesa-dri mesa-libgl vulkan-swrast)
     conflicts=('mesa' 'opencl-mesa' 'vulkan-intel' 'vulkan-radeon' 'vulkan-mesa-layers' 'mesa-vulkan-layers' 'libva-mesa-driver' 'mesa-vdpau' 'vulkan-swrast')
+
+    # Create the /usr/lib directory in pkgdir
+    install -Dm755 /dev/null "${pkgdir}/usr/lib/.keep"
 
     # Install BOLT-optimized RADV driver (if it exists)
     if [[ -f "${srcdir}/${_mesa_srcdir}/_build64/bolt/libvulkan_radeon.so" ]]; then
@@ -628,12 +666,29 @@ package_mesa-tkg-git() {
     # Install the rest of the Mesa package
     DESTDIR="$pkgdir" ninja $NINJAFLAGS -C _build64 install
 
-    # Use llvm-strip only on recognized file formats
+    # Strip the unoptimized libgallium before copying it for potential BOLT optimization
+    if [[ -f "${pkgdir}/usr/lib/libgallium-25.0.0-devel.so" ]]; then
+        if ! llvm-strip --strip-unneeded "${pkgdir}/usr/lib/libgallium-25.0.0-devel.so"; then
+            echo "Error: llvm-strip failed on ${pkgdir}/usr/lib/libgallium-25.0.0-devel.so" >&2
+            return 1
+        fi
+        echo "Stripped: ${pkgdir}/usr/lib/libgallium-25.0.0-devel.so"
+    fi
+
+    # Overwrite unoptimized libgallium with BOLT-optimized version (if it exists)
+    if [[ -f "${srcdir}/${_mesa_srcdir}/_build64/bolt/libgallium-25.0.0-devel.so" ]]; then
+        install -Dm755 "${srcdir}/${_mesa_srcdir}/_build64/bolt/libgallium-25.0.0-devel.so" "${pkgdir}/usr/lib/libgallium-25.0.0-devel.so"
+        echo "Installed BOLT-optimized libgallium-25.0.0-devel.so"
+    fi
+
+    # Use llvm-strip on other recognized file formats
     find "$pkgdir" -type f \( -name '*.so*' -o -name '*.a' -o -executable \) -print0 | while IFS= read -r -d '' file; do
-        if llvm-strip --strip-unneeded "$file" 2>/dev/null || llvm-strip --strip-all "$file" 2>/dev/null; then
-            echo "Stripped: $file"
-        else
-            echo "Skipping: $file (not a valid object file)" >&2
+        if [[ "$file" != *"/usr/lib/libgallium-25.0.0-devel.so" ]]; then
+            if llvm-strip --strip-unneeded "$file" 2>/dev/null || llvm-strip --strip-all "$file" 2>/dev/null; then
+                echo "Stripped: $file"
+            else
+                echo "Skipping: $file (not a valid object file)" >&2
+            fi
         fi
     done
 
