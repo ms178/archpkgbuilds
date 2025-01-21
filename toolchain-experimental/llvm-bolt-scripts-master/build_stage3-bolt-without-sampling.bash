@@ -18,6 +18,7 @@ instrument_binary() {
     echo "Instrumenting ${binary}"
     "${BOLTPATH}/llvm-bolt" \
         --instrument \
+        --lite=false \
         --instrumentation-file-append-pid \
         --instrumentation-file="${profile}" \
         "${binary}" \
@@ -42,7 +43,7 @@ cmake -G Ninja ../llvm-project/llvm \
     -D CMAKE_EXE_LINKER_FLAGS="-Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -march=native -mtune=native -fuse-ld=lld -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -Wl,--push-state -Wl,-whole-archive -lmimalloc -Wl,--pop-state -lpthread -lstdc++ -lm -ldl" \
     -D CMAKE_MODULE_LINKER_FLAGS="-Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -march=native -mtune=native -fuse-ld=lld -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -Wl,--push-state -Wl,-whole-archive -lmimalloc -Wl,--pop-state -lpthread -lstdc++ -lm -ldl" \
     -D CMAKE_SHARED_LINKER_FLAGS="-Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -march=native -mtune=native -fuse-ld=lld -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -Wl,--push-state -Wl,-whole-archive -lmimalloc -Wl,--pop-state -lpthread -lstdc++ -lm -ldl" \
-    -DLLVM_VP_COUNTERS_PER_SITE=6 \
+    -DLLVM_VP_COUNTERS_PER_SITE=10 \
     -DCMAKE_AR="${CPATH}/llvm-ar" \
     -DCMAKE_C_COMPILER="${CPATH}/clang-20" \
     -DCMAKE_CXX_COMPILER="${CPATH}/clang++" \
@@ -66,6 +67,7 @@ optimize_binary() {
         --data "${profile}" \
         -o "${binary}" \
         --dyno-stats \
+        --lite=false \
         --cu-processing-batch-size=64 \
         --eliminate-unreachable\
         --frame-opt=all \
@@ -76,7 +78,7 @@ optimize_binary() {
         --sctc-mode=always \
         --plt=all \
         --hot-data \
-        --hot-text \
+        --hugify \
         --frame-opt-rm-stores \
         --peepholes=all \
         --infer-stale-profile=1 \
@@ -90,7 +92,7 @@ optimize_binary() {
         --split-eh \
         --split-functions \
         --split-strategy=cdsplit \
-        --time-opts || return 1
+        --redirect-never-taken-jumps || return 1
 }
 
 # Optimize binaries
