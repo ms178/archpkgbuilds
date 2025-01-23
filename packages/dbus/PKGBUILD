@@ -1,8 +1,3 @@
-# Maintainer: Jan Alexander Steffens (heftig) <heftig@archlinux.org>
-# Contributor: Jan de Groot <jgc@archlinux.org>
-# Contributor: Tom Gundersen <teg@jklm.no>
-# Contributor: Link Dupont <link@subpop.net>
-
 pkgbase=dbus
 pkgname=(
   dbus
@@ -14,6 +9,7 @@ pkgdesc="Freedesktop.org message bus system"
 url="https://www.freedesktop.org/wiki/Software/dbus/"
 arch=(x86_64)
 license=("AFL-2.1 OR GPL-2.0-or-later")
+options=(!strip)
 depends=(
   audit
   expat
@@ -31,6 +27,8 @@ makedepends=(
   qt5-tools
   systemd
   xmlto
+  llvm              # Required for BOLT
+  perf              # Required for profile data collection
   yelp-tools
 )
 source=(
@@ -52,6 +50,15 @@ prepare() {
 }
 
 build() {
+  # Stage 1: Instrumented build and test for PGO
+  export LLVM_PROFILE_FILE="$srcdir/%p.profraw"
+  CFLAGS_ORIG="$CFLAGS"
+  CXXFLAGS_ORIG="$CXXFLAGS"
+  LDFLAGS_ORIG="$LDFLAGS"
+
+  CFLAGS+=" -fprofile-generate -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10"
+  CXXFLAGS+=" -g3 -fno-omit-frame-pointer -fprofile-generate -mllvm -vp-counters-per-site=10"
+  LDFLAGS+=" -g3 -fno-omit-frame-pointer -fprofile-generate -mllvm -vp-counters-per-site=10"
   local meson_options=(
     -D apparmor=disabled
     -D dbus_user=dbus
@@ -60,22 +67,99 @@ build() {
     -D relocation=disabled
     -D selinux=disabled
     -D x11_autolaunch=disabled
+    -D doxygen_docs=disabled
   )
 
+  arch-meson dbus-$pkgver build-stage1 "${meson_options[@]}" \
+        -D python.bytecompile=2 \
+        -D b_ndebug=false \
+        -D b_pie=false \
+        -D c_std=gnu18 \
+        -D cpp_std=gnu++2a \
+        -D b_lto=false \
+        --buildtype=debug \
+        --wrap-mode=nofallback
+  meson compile -C build-stage1
+
+  # Run tests to generate PGO data
+  meson test -C build-stage1
+
+  # Merge profraw files
+  llvm-profdata merge -output="$srcdir/default.profdata" "$srcdir"/*.profraw
+
+  # Clean up profraw files
+  rm -f "$srcdir"/*.profraw
+
+  # Stage 2: Build with PGO data and prepare for BOLT
+  CFLAGS="$CFLAGS_ORIG -fprofile-use=$srcdir/default.profdata"
+  CXXFLAGS="$CXXFLAGS_ORIG -fprofile-use=$srcdir/default.profdata"
+  LDFLAGS="$LDFLAGS_ORIG -fprofile-use=$srcdir/default.profdata -Wl,--emit-relocs"
+
   arch-meson dbus-$pkgver build "${meson_options[@]}" \
-  		-D python.bytecompile=2 \
-    	-D b_ndebug=true \
-    	-D b_pie=false \
-    	-D c_std=gnu18 \
-    	-D cpp_std=gnu++2a \
-    	-D b_lto=true \
-      	--buildtype=release \
-      	--wrap-mode=nofallback
+      -D python.bytecompile=2 \
+      -D b_ndebug=true \
+      -D b_pie=false \
+      -D c_std=gnu18 \
+      -D cpp_std=gnu++2a \
+      -D b_lto=true \
+      --buildtype=release \
+      --wrap-mode=nofallback
   meson compile -C build
+
+  # Create directory for profile data
+  mkdir -p "$srcdir/bolt_profile"
 }
 
 check() {
-  meson test -C build --print-errorlogs
+  cd "$srcdir"
+  # Ensure the binaries are built before running perf record
+  meson compile -C build
+
+  # Debugging: List contents of the build directory
+  echo "Listing contents of $srcdir/build:"
+  ls -l "$srcdir/build"
+  echo "Listing contents of $srcdir/build recursively:"
+  ls -lR "$srcdir/build"
+
+  # Run tests with perf recording for BOLT profile data
+  perf record --max-size=6G -F 20000 -e branch-instructions:u,cycles:u,cache-misses:u,branch-misses:u,branches:u,branch-loads:u,branch-load-misses:u,iTLB-load-misses:u,dTLB-store-misses:u,dTLB-load-misses:u,L1-icache-load-misses:u,LLC-load-misses:u -b -- meson test -C build --print-errorlogs
+
+  # Convert perf data to BOLT profile format
+  # Use find to locate the binaries
+  DBUS_DAEMON_PATH=$(find "$srcdir/build" -name dbus-daemon -type f | head -n 1)
+
+  # Find potential libdbus candidates:
+  echo "Finding potential libdbus candidates:"
+  find "$srcdir/build" -name 'libdbus-1.so*' -print
+
+  # Find the actual shared library, excluding .symbols and prioritizing versioned files:
+  LIBDBUS_PATH=$(find "$srcdir/build" -name 'libdbus-1.so.*' -type f ! -name '*.symbols' -print | sort -V | tail -n 1)
+
+  # Debugging: Print the paths
+  echo "DBUS_DAEMON_PATH: $DBUS_DAEMON_PATH"
+  echo "LIBDBUS_PATH: $LIBDBUS_PATH"
+
+  # Check if LIBDBUS_PATH is empty and print an error if it is
+  if [ -z "$LIBDBUS_PATH" ]; then
+    echo "ERROR: Could not find libdbus-1.so library."
+    exit 1
+  fi
+
+  # Check if LIBDBUS_PATH is a regular file
+  if [ ! -f "$LIBDBUS_PATH" ]; then
+      echo "ERROR: LIBDBUS_PATH is not a regular file: $LIBDBUS_PATH"
+      exit 1
+  fi
+
+  # Check if LIBDBUS_PATH is executable or a shared library
+  if ! (file "$LIBDBUS_PATH" | grep -q "executable\|shared object"); then
+      echo "ERROR: LIBDBUS_PATH is not an executable or shared object: $LIBDBUS_PATH"
+      exit 1
+  fi
+
+  perf2bolt "$DBUS_DAEMON_PATH" -p perf.data -o "$srcdir/bolt_profile/perf.fdata"
+  perf2bolt "$LIBDBUS_PATH" -p perf.data -o "$srcdir/bolt_profile/libdbus-1.so.3.38.3.fdata"
+
 }
 
 _pick() {
@@ -102,15 +186,58 @@ package_dbus() {
   conflicts=(libdbus)
   replaces=(libdbus)
 
+  DBUS_DAEMON_PATH="$srcdir/build/bus/dbus-daemon"
+  LIBDBUS_PATH="$srcdir/build/dbus/libdbus-1.so.3.38.3"
+
+ # BOLT Optimization (moved to package function)
+  if [ -f "$srcdir/bolt_profile/perf.fdata" ]; then
+    mkdir -p "$pkgdir/usr/bin/" # Ensure directory exists
+    llvm-bolt "$DBUS_DAEMON_PATH" \
+      --data "$srcdir/bolt_profile/perf.fdata" \
+      --dyno-stats --lite=false --frame-opt=all --icf=all \
+      --jump-tables=aggressive --min-branch-clusters --stoke \
+      --sctc-mode=always --plt=all --hot-data --hugify \
+      --frame-opt-rm-stores --peepholes=all --x86-strip-redundant-address-size \
+      --indirect-call-promotion=all --reorder-blocks=ext-tsp --reorder-functions=cdsort \
+      --split-all-cold --split-eh --split-functions \
+      --redirect-never-taken-jumps \
+      -o "$pkgdir/usr/bin/dbus-daemon" # Install directly to $pkgdir
+
+  fi
+
+
+  if [ -f "$srcdir/bolt_profile/libdbus-1.so.3.38.3.fdata" ]; then
+    mkdir -p "$pkgdir/usr/lib/" # Ensure directory exists
+    llvm-bolt "$LIBDBUS_PATH" \
+      --data "$srcdir/bolt_profile/libdbus-1.so.3.38.3.fdata" \
+      --dyno-stats --lite=false --frame-opt=all --icf=all \
+      --jump-tables=aggressive --min-branch-clusters --stoke \
+      --sctc-mode=always --plt=all --hot-data --hugify \
+      --frame-opt-rm-stores --peepholes=all --x86-strip-redundant-address-size \
+      --indirect-call-promotion=all --reorder-blocks=ext-tsp --reorder-functions=cdsort \
+      --split-all-cold --split-eh --split-functions \
+      --redirect-never-taken-jumps \
+      -o "$pkgdir/usr/lib/libdbus-1.so.3.38.3" # Install directly to $pkgdir
+  fi
+
+  # Use llvm-strip only on recognized file formats
+  find "$pkgdir" -type f \( -name '*.so*' -o -name '*.a' -o -executable \) -print0 | while IFS= read -r -d '' file; do
+    if llvm-strip --strip-unneeded "$file" 2>/dev/null || llvm-strip --strip-all "$file" 2>/dev/null; then
+      echo "Stripped: $file"
+    else
+      echo "Skipping: $file (not a valid object file)" >&2
+    fi
+  done
+
   meson install -C build --destdir "$pkgdir"
 
   _pick unit "$pkgdir"/usr/lib/systemd/{system,user}/dbus.service
-  #_pick docs "$pkgdir"/usr/share/doc
 
   install -Dt "$pkgdir/usr/share/libalpm/hooks" -m644 *.hook
 
   install -Dt "$pkgdir/usr/share/licenses/$pkgname" -m644 \
     dbus-$pkgver/COPYING dbus-$pkgver/LICENSES/AFL-2.1.txt
+
 }
 
 package_dbus-daemon-units() {
@@ -124,5 +251,3 @@ package_dbus-daemon-units() {
   mkdir -p "$pkgdir/usr/share/licenses"
   ln -s dbus "$pkgdir/usr/share/licenses/$pkgname"
 }
-
-# vim:set sw=2 sts=-1 et:
