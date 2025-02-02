@@ -3,32 +3,42 @@ pkgname=(
   zlib-ng-compat
 )
 pkgver=2.2.3
-pkgrel=13.2
-_zlibver=1.3.1
-pkgdesc='zlib replacement with optimizations for next generation systems'
+pkgrel=14.1
+_zlibver=1.3.1  # Muss konsistent zur ersetzten zlib-Version bleiben
+pkgdesc='zlib-Ersatz mit Optimierungen für Systeme der nächsten Generation'
 url='https://github.com/zlib-ng/zlib-ng'
 arch=('x86_64')
 license=('custom:zlib')
-depends=(
-  glibc
-)
+depends=('glibc')
 makedepends=(
   cmake
   ninja
   git
-  llvm            # Required for BOLT
-  perf            # Required for profile data collection
+  llvm              # Für clang, llvm-profdata, llvm-bolt, merge-fdata
 )
 source=(git+https://github.com/zlib-ng/zlib-ng#tag=${pkgver})
-sha256sums=('6867f8f1e57d3e8e4158292a839fa29967c58849aabeba2199e3d95b346d675f')
+sha256sums=('SKIP')
 
 build() {
   cd "zlib-ng"
 
-  export CFLAGS+=" -Wl,--build-id=sha1 -mllvm -vp-counters-per-site=10"
-  export CXXFLAGS+=" -Wl,--build-id=sha1 -mllvm -vp-counters-per-site=10"
-  export LDFLAGS+=" -Wl,--build-id=sha1 -Wl,--emit-relocs"
+  # Speichere ursprüngliche Flags
+  orig_cflags="${CFLAGS}"
+  orig_cxxflags="${CXXFLAGS}"
+  orig_ldflags="${LDFLAGS}"
+  extra_flags=" "
 
+  # Erstelle Profilverzeichnis
+  mkdir -p "$srcdir/bolt_profile"
+  chmod -R u+rw "$srcdir/bolt_profile"
+
+  ###########################################################################
+  # Phase 1: PGO-Instrumentierungs-Build (PGO raw profile generation)
+  ###########################################################################
+  msg2 "== Aufbau des PGO-instrumentierten Builds (zlib-ng)"
+  export CFLAGS="${orig_cflags}${extra_flags} -fprofile-generate -Wl,--build-id=sha1 -fdebug-info-for-profiling -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10"
+  export CXXFLAGS="${orig_cxxflags}${extra_flags} -fprofile-generate -Wl,--build-id=sha1 -fdebug-info-for-profiling -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10"
+  export LDFLAGS="${orig_ldflags}${extra_flags}"
   local _options=(
     -G Ninja
     -DCMAKE_BUILD_TYPE=Release
@@ -39,118 +49,168 @@ build() {
     -Wno-dev
     -DWITH_GTEST=OFF
   )
+  # Für zlib-ng
+  cmake -B build_pgo "${_options[@]}"
+  cmake --build build_pgo
+  # Für zlib-ng-compat
+  cmake -B build_pgo_compat "${_options[@]}" -DZLIB_COMPAT=ON
+  cmake --build build_pgo_compat
 
-  # Build the binaries first
-  cmake -B build "${_options[@]}"
-  cmake --build build
+  ###########################################################################
+  # Phase 2: Testlauf zum Erzeugen der PGO-Rohprofile
+  ###########################################################################
+  msg2 "== Ausführen der Tests zur Erzeugung der PGO-Profil-Daten (instrumentierter Build)"
+  export LLVM_PROFILE_FILE="$srcdir/bolt_profile/%p.profraw"
+  ctest --test-dir build_pgo --output-on-failure
+  ctest --test-dir build_pgo_compat --output-on-failure
 
-  cmake -B build-compat "${_options[@]}" \
-    -DZLIB_COMPAT=ON
-  cmake --build build-compat
+  ###########################################################################
+  # Phase 3: Zusammenführen der PGO-Rohprofile
+  ###########################################################################
+  msg2 "== Zusammenführen der PGO-Profil-Daten"
+  shopt -s nullglob
+  profraw_files=("$srcdir/bolt_profile/"*.profraw)
+  if [ ${#profraw_files[@]} -eq 0 ]; then
+      msg2 "Es wurden keine .profraw-Dateien erzeugt. Bitte stellen Sie sicher, dass Ihre Tests genügend Codepfade abdecken."
+      exit 1
+  fi
+  llvm-profdata merge "${profraw_files[@]}" -o "$srcdir/bolt_profile/profile.profdata"
+  shopt -u nullglob
 
-  # Ensure bolt_profile directory exists and is writable
-  mkdir -p "$srcdir/bolt_profile"
-  chmod -R u+rw "$srcdir/bolt_profile" # Ensure write permissions
+  ###########################################################################
+  # Phase 4: Rebuild mit PGO-Optimierung
+  ###########################################################################
+  msg2 "== Aufbau des PGO-optimierten Builds (zlib-ng)"
+  export CFLAGS="${orig_cflags}${extra_flags} -fprofile-use=$srcdir/bolt_profile/profile.profdata"
+  export CXXFLAGS="${orig_cxxflags}${extra_flags} -fprofile-use=$srcdir/bolt_profile/profile.profdata"
+  export LDFLAGS="${orig_ldflags}${extra_flags} -Wl,--emit-relocs"
+  cmake -B build_opt "${_options[@]}"
+  cmake --build build_opt
+  msg2 "== Aufbau des PGO-optimierten Builds (zlib-ng-compat)"
+  cmake -B build_opt_compat "${_options[@]}" -DZLIB_COMPAT=ON
+  cmake --build build_opt_compat
 
-  # Remove existing .fdata files
-  rm -f "$srcdir/bolt_profile/perf.ng.fdata"
-  rm -f "$srcdir/bolt_profile/perf.compat.fdata"
+  ###########################################################################
+  # Phase 5: BOLT-Instrumentierung (Erzeuge rohes BOLT-Profil in fdata-Form)
+  ###########################################################################
+  msg2 "== BOLT-Instrumentierung (zlib-ng)"
+  llvm-bolt "$srcdir/zlib-ng/build_opt/libz-ng.so.${pkgver}" \
+      --instrument \
+      --lite=false \
+      --instrumentation-file-append-pid \
+      --instrumentation-file="$srcdir/bolt_profile/bolt.fdata" \
+      -o "$srcdir/zlib-ng/build_opt/libz-ng.so.${pkgver}.inst"
+  # Ersetze das Original: sichere es unter .org und setze das instrumentierte Binary ein
+  mv "$srcdir/zlib-ng/build_opt/libz-ng.so.${pkgver}" "$srcdir/zlib-ng/build_opt/libz-ng.so.${pkgver}.org"
+  mv "$srcdir/zlib-ng/build_opt/libz-ng.so.${pkgver}.inst" "$srcdir/zlib-ng/build_opt/libz-ng.so.${pkgver}"
 
-  # Now run tests with perf record, without rebuilding
-  msg2 "== Start Training Build (zlib-ng)"
-  perf record --max-size=6G -F 500000 -e branch-instructions:u,cycles:u,cache-misses:u,branch-misses:u,branches:u,branch-loads:u,branch-load-misses:u,iTLB-load-misses:u,dTLB-store-misses:u,dTLB-load-misses:u,L1-icache-load-misses:u,LLC-load-misses:u -b -- ctest --test-dir build --output-on-failure
+  msg2 "== BOLT-Instrumentierung (zlib-ng-compat)"
+  llvm-bolt "$srcdir/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng" \
+      --instrument \
+      --lite=false \
+      --instrumentation-file-append-pid \
+      --instrumentation-file="$srcdir/bolt_profile/bolt_compat.fdata" \
+      -o "$srcdir/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng.inst"
+  mv "$srcdir/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng" "$srcdir/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng.org"
+  mv "$srcdir/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng.inst" "$srcdir/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng"
 
-  # Create a separate perf.data file for the compat tests
-  msg2 "== Start Training Build (zlib-ng-compat)"
-  perf record --max-size=6G -F 500000 -e branch-instructions:u,cycles:u,cache-misses:u,branch-misses:u,branches:u,branch-loads:u,branch-load-misses:u,iTLB-load-misses:u,dTLB-store-misses:u,dTLB-load-misses:u,L1-icache-load-misses:u,LLC-load-misses:u -b -o perf.data.compat -- ctest --test-dir build-compat --output-on-failure
+  ###########################################################################
+  # Phase 6: Ausführen der Tests mit den BOLT-instrumentierten Binaries
+  ###########################################################################
+  msg2 "== Ausführen der Tests mit den BOLT-instrumentierten Binaries (zlib-ng)"
+  export BOLT_PROFILE_FILE="$srcdir/bolt_profile/bolt.fdata"
+  ctest --test-dir build_opt --output-on-failure
 
-  # Convert perf data to BOLT format (using correct sonames and absolute paths)
-  msg2 "Converting profile to BOLT format (zlib-ng)"
-  perf2bolt "$srcdir/zlib-ng/build/libz-ng.so.2.2.3" -p perf.data -o "$srcdir/bolt_profile/perf.ng.fdata"
+  msg2 "== Ausführen der Tests mit den BOLT-instrumentierten Binaries (zlib-ng-compat)"
+  export BOLT_PROFILE_FILE="$srcdir/bolt_profile/bolt_compat.fdata"
+  ctest --test-dir build_opt_compat --output-on-failure
 
-  msg2 "Converting profile to BOLT format (zlib-ng-compat)"
-  perf2bolt "$srcdir/zlib-ng/build-compat/libz.so.1.3.1.zlib-ng" -p perf.data.compat -o "$srcdir/bolt_profile/perf.compat.fdata"
+  ###########################################################################
+  # Phase 7: Zusammenführen der BOLT fdata-Profile
+  ###########################################################################
+  msg2 "== Zusammenführen der BOLT fdata-Profile"
+  # Hier wird merge-fdata verwendet – LD_PRELOAD wird gesetzt wie im Vorbild
+  LD_PRELOAD=/usr/lib/libmimalloc.so merge-fdata "$srcdir/bolt_profile/"*.fdata > "$srcdir/bolt_profile/combined.fdata"
 
-  # Optimize with BOLT (using correct sonames, absolute paths, and your specified BOLT flags)
-  msg2 "Optimizing zlib-ng with BOLT"
-  llvm-bolt "$srcdir/zlib-ng/build/libz-ng.so.2.2.3" -o "$srcdir/zlib-ng/build/libz-ng.so.2.2.3.bolt" \
-    --data "$srcdir/bolt_profile/perf.ng.fdata" \
-    --dyno-stats --lite=false --cu-processing-batch-size=64 --eliminate-unreachable --frame-opt=all \
-    --icf=all --jump-tables=aggressive --min-branch-clusters --stoke --sctc-mode=always \
-    --plt=all --hot-data --hot-text --frame-opt-rm-stores --peepholes=all \
-    --infer-stale-profile=1 --x86-strip-redundant-address-size --indirect-call-promotion=all \
-    --reg-reassign --use-aggr-reg-reassign --reorder-blocks=ext-tsp --reorder-functions=cdsort \
-    --split-all-cold --split-eh --split-functions --split-strategy=cdsplit --skip-funcs=.text/1
+  ###########################################################################
+  # Phase 8: BOLT-Optimierung mithilfe der kombinierten fdata
+  ###########################################################################
+  msg2 "== BOLT-Optimierung (zlib-ng)"
+  LD_PRELOAD=/usr/lib/libmimalloc.so llvm-bolt "$srcdir/zlib-ng/build_opt/libz-ng.so.${pkgver}.org" \
+      --data "$srcdir/bolt_profile/combined.fdata" \
+      -o "$srcdir/zlib-ng/build_opt/libz-ng.so.${pkgver}.bolt" \
+      --dyno-stats --icf=safe --plt=all --hugify --peepholes=all \
+      --x86-strip-redundant-address-size --indirect-call-promotion=all \
+      --reorder-blocks=ext-tsp --reorder-functions=cdsort \
+      --split-all-cold --split-eh --split-functions --split-strategy=cdsplit \
+      --redirect-never-taken-jumps || exit 1
 
-  msg2 "Optimizing zlib-ng-compat with BOLT"
-  llvm-bolt "$srcdir/zlib-ng/build-compat/libz.so.1.3.1.zlib-ng" -o "$srcdir/zlib-ng/build-compat/libz.so.1.3.1.zlib-ng.bolt" \
-    --data "$srcdir/bolt_profile/perf.compat.fdata" \
-    --dyno-stats --lite=false --cu-processing-batch-size=64 --eliminate-unreachable --frame-opt=all \
-    --icf=all --jump-tables=aggressive --min-branch-clusters --stoke --sctc-mode=always \
-    --plt=all --hot-data --hot-text --frame-opt-rm-stores --peepholes=all \
-    --infer-stale-profile=1 --x86-strip-redundant-address-size --indirect-call-promotion=all \
-    --reg-reassign --use-aggr-reg-reassign --reorder-blocks=ext-tsp --reorder-functions=cdsort \
-    --split-all-cold --split-eh --split-functions --split-strategy=cdsplit --skip-funcs=.text/1
+  msg2 "== BOLT-Optimierung (zlib-ng-compat)"
+  LD_PRELOAD=/usr/lib/libmimalloc.so llvm-bolt "$srcdir/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng.org" \
+      --data "$srcdir/bolt_profile/combined.fdata" \
+      -o "$srcdir/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng.bolt" \
+      --dyno-stats --icf=safe --plt=all --hugify --peepholes=all \
+      --x86-strip-redundant-address-size --indirect-call-promotion=all \
+      --reorder-blocks=ext-tsp --reorder-functions=cdsort \
+      --split-all-cold --split-eh --split-functions --split-strategy=cdsplit \
+      --redirect-never-taken-jumps || exit 1
 }
 
 check() {
   cd "zlib-ng"
-  msg "Checking zlib-ng"
-  ctest --output-on-failure --test-dir build
-  msg "Checking zlib-ng-compat"
-  ctest --test-dir build-compat --output-on-failure
+  msg "Prüfe zlib-ng (PGO-optimierter Build)"
+  ctest --test-dir build_opt --output-on-failure
+  msg "Prüfe zlib-ng-compat (PGO-optimierter Build)"
+  ctest --test-dir build_opt_compat --output-on-failure
 }
 
 package_zlib-ng() {
-  pkgdesc='zlib replacement with optimizations for next generation systems'
+  pkgdesc='zlib-Ersatz mit Optimierungen für Systeme der nächsten Generation'
   provides=("libz-ng.so")
-
+  options=(!strip)
   cd "zlib-ng"
-  DESTDIR="${pkgdir}" cmake --install build
+  DESTDIR="${pkgdir}" cmake --install build_opt
 
-  # Use llvm-strip only on recognized file formats
-  find "$pkgdir" -type f \( -name '*.so*' -o -name '*.a' -o -executable \) -print0 | while IFS= read -r -d '' file; do
-  if llvm-strip --strip-unneeded "$file" 2>/dev/null || llvm-strip --strip-all "$file" 2>/dev/null; then
-    echo "Stripped: $file"
-  else
-    echo "Skipping: $file (not a valid object file)" >&2
+  find "$pkgdir" -type f \( -name '*.so*' -o -name '*.a' -o -executable \) -print0 | \
+    while IFS= read -r -d '' file; do
+      if llvm-strip --strip-unneeded "$file" 2>/dev/null || llvm-strip --strip-all "$file" 2>/dev/null; then
+        echo "Stripped: $file"
+      else
+        echo "Skipping: $file (kein gültiges Objekt)" >&2
+      fi
+    done
+
+  if [ -f "$srcdir/zlib-ng/build_opt/libz-ng.so.${pkgver}.bolt" ]; then
+    install -Dm755 "$srcdir/zlib-ng/build_opt/libz-ng.so.${pkgver}.bolt" "$pkgdir/usr/lib/libz-ng.so.${pkgver}"
   fi
-done
 
-  # Replace the binary with BOLT-optimized version if it exists
-  if [ -f "$srcdir/build/bolt/libz-ng.bolt" ]; then
-    install -Dm755 "$srcdir/build/bolt/libz-ng.bolt" "$pkgdir"/usr/lib/libz-ng.so.2.2.3
-  fi
-
-  install -Dm 644 LICENSE.md -t "${pkgdir}/usr/share/licenses/${pkgname[0]}"
-  install -Dm 644 README.md -t "${pkgdir}/usr/share/doc/${pkgname[0]}"
+  install -Dm644 LICENSE.md -t "${pkgdir}/usr/share/licenses/${pkgname[0]}"
+  install -Dm644 README.md -t "${pkgdir}/usr/share/doc/${pkgname[0]}"
 }
 
 package_zlib-ng-compat() {
-  pkgdesc='zlib replacement with optimizations for next generation systems (zlib compat)'
+  pkgdesc='zlib-Ersatz mit Optimierungen für Systeme der nächsten Generation (zlib compat)'
   provides=("zlib=1:${_zlibver}" "libz.so")
   depends=('zlib-ng')
   conflicts=('zlib')
   replaces=('zlib')
-  options=('staticlibs')
-
+  options=('staticlibs' !strip)
   cd "zlib-ng"
-  DESTDIR="${pkgdir}" cmake --install build-compat
+  DESTDIR="${pkgdir}" cmake --install build_opt_compat
 
-  # Use llvm-strip only on recognized file formats
-  find "$pkgdir" -type f \( -name '*.so*' -o -name '*.a' -o -executable \) -print0 | while IFS= read -r -d '' file; do
-  if llvm-strip --strip-unneeded "$file" 2>/dev/null || llvm-strip --strip-all "$file" 2>/dev/null; then
-    echo "Stripped: $file"
-  else
-    echo "Skipping: $file (not a valid object file)" >&2
+  find "$pkgdir" -type f \( -name '*.so*' -o -name '*.a' -o -executable \) -print0 | \
+    while IFS= read -r -d '' file; do
+      if llvm-strip --strip-unneeded "$file" 2>/dev/null || llvm-strip --strip-all "$file" 2>/dev/null; then
+        echo "Stripped: $file"
+      else
+        echo "Skipping: $file (kein gültiges Objekt)" >&2
+      fi
+    done
+
+  if [ -f "$srcdir/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng.bolt" ]; then
+    install -Dm755 "$srcdir/zlib-ng/build_opt_compat/libz.so.${_zlibver}.zlib-ng.bolt" "$pkgdir/usr/lib/libz.so.${_zlibver}.zlib-ng"
   fi
-done
 
-  # Replace the binary with BOLT-optimized version if it exists
-  if [ -f "$srcdir/build/bolt/libz-compat.bolt" ]; then
-    install -Dm755 "$srcdir/build/bolt/libz-compat.bolt" "$pkgdir"/usr/lib/libz.so.1.3.1.zlib-ng
-  fi
-
-  install -Dm 644 LICENSE.md -t "${pkgdir}/usr/share/licenses/${pkgname[0]}"
-  install -Dm 644 README.md -t "${pkgdir}/usr/share/doc/${pkgname[0]}"
+  install -Dm644 LICENSE.md -t "${pkgdir}/usr/share/licenses/${pkgname[0]}"
+  install -Dm644 README.md -t "${pkgdir}/usr/share/doc/${pkgname[0]}"
 }
