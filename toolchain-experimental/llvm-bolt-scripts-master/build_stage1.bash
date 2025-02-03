@@ -30,7 +30,8 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -DLLVM_DEFAULT_TARGET_TRIPLE="x86_64-pc-linux-gnu" \
     -DLLVM_USE_LINKER=lld \
     -DLLVM_USE_PERF=OFF \
-    -DLLVM_ENABLE_PROJECTS="clang;lld;bolt;compiler-rt" \
+    -DLLVM_ENABLE_PROJECTS="clang;lld;bolt" \
+    -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
     -DLLVM_TARGETS_TO_BUILD="X86" \
     -D CMAKE_C_FLAGS="-O3 -march=native -mtune=native -fprofile-use=/home/marcus/Downloads/clang.profdata -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables" \
     -D CMAKE_CXX_FLAGS="-O3 -march=native -mtune=native -fprofile-use=/home/marcus/Downloads/clang.profdata -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables" \
@@ -45,8 +46,7 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
         -DCLANG_BUILD_TOOLS=ON \
         -DCLANG_TOOL_AMDGPU_ARCH_BUILD=OFF \
         -DCLANG_TOOL_APINOTES_TEST_BUILD=OFF \
-        -DCLANG_TOOL_ARCMT_TEST_BUILD=OFF \
-        -DCLANG_TOOL_C_ARCMT_TEST_BUILD=OFF \
+        -DCLANG_ENABLE_OBJC_REWRITER=OFF \
         -DCLANG_TOOL_C_INDEX_TEST_BUILD=OFF \
         -DCLANG_TOOL_CLANG_CHECK_BUILD=OFF \
         -DCLANG_TOOL_CLANG_DIFF_BUILD=OFF \
@@ -112,7 +112,7 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
         -DLLVM_ENABLE_ZSTD=ON \
         -DLLVM_ENABLE_LIBXML2=ON \
         "-DLLVM_THINLTO_CACHE_PATH='${CMAKE_INSTALL_PREFIX}/llvm-thinlto'" \
-    -DCMAKE_INSTALL_PREFIX=${TOPLEV}/llvm-bolt || (echo "Could not configure project!"; exit 1)
+    -DCMAKE_INSTALL_PREFIX=${TOPLEV}/llvm-bolt > cmake_log.txt 2>&1 || (echo "Could not configure project!"; exit 1)
 
 echo "== Start Build"
 ninja install || (echo "Could not build project!"; exit 1)

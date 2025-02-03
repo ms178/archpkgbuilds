@@ -29,7 +29,7 @@ instrument_binary() {
 }
 
 # Instrument binaries
-instrument_binary "${CPATH}/clang-20"
+instrument_binary "${CPATH}/clang-21"
 instrument_binary "${CPATH}/lld"
 
 # Configure build
@@ -37,7 +37,8 @@ cmake -G Ninja ../llvm-project/llvm \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLVM_DEFAULT_TARGET_TRIPLE="x86_64-pc-linux-gnu" \
     -DLLVM_TARGETS_TO_BUILD="X86" \
-    -DLLVM_ENABLE_PROJECTS="polly;lld;clang;compiler-rt" \
+    -DLLVM_ENABLE_PROJECTS="polly;lld;clang" \
+    -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
     -D CMAKE_C_FLAGS="-O3 -march=native -mtune=native -mllvm -inline-threshold=500 -mllvm -polly -mllvm -polly-position=early -mllvm -polly-dependences-computeout=60000000 -mllvm -polly-detect-profitability-min-per-loop-insts=40 -mllvm -polly-tiling=true -mllvm -polly-prevect-width=256 -mllvm -polly-vectorizer=stripmine -mllvm -polly-invariant-load-hoisting -mllvm -polly-loopfusion-greedy -mllvm -polly-run-inliner -mllvm -polly-run-dce -mllvm -polly-enable-delicm=true -mllvm -polly -fmerge-all-constants -mllvm -extra-vectorizer-passes -mllvm -enable-interleaved-mem-accesses -mllvm -enable-masked-interleaved-mem-accesses -mllvm -enable-cond-stores-vec -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -fno-math-errno -fno-trapping-math -falign-functions=32 -fno-semantic-interposition -fomit-frame-pointer -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -mllvm -adce-remove-loops -mllvm -enable-ext-tsp-block-placement=1 -mllvm -enable-gvn-hoist=1 -mllvm -enable-dfa-jump-thread=1" \
     -D CMAKE_CXX_FLAGS="-O3 -march=native -mtune=native -mllvm -inline-threshold=500 -mllvm -polly -mllvm -polly-position=early -mllvm -polly-dependences-computeout=60000000 -mllvm -polly-detect-profitability-min-per-loop-insts=40 -mllvm -polly-tiling=true -mllvm -polly-prevect-width=256 -mllvm -polly-vectorizer=stripmine -mllvm -polly-invariant-load-hoisting -mllvm -polly-loopfusion-greedy -mllvm -polly-run-inliner -mllvm -polly-run-dce -mllvm -polly-enable-delicm=true -mllvm -polly -fmerge-all-constants -mllvm -extra-vectorizer-passes -mllvm -enable-interleaved-mem-accesses -mllvm -enable-masked-interleaved-mem-accesses -mllvm -enable-cond-stores-vec -mllvm -slp-vectorize-hor-store -mllvm -enable-loopinterchange -mllvm -enable-loop-distribute -mllvm -enable-unroll-and-jam -mllvm -enable-loop-flatten -mllvm -unroll-runtime-multi-exit -mllvm -aggressive-ext-opt -fno-math-errno -fno-trapping-math -falign-functions=32 -fno-semantic-interposition -fomit-frame-pointer -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -mllvm -adce-remove-loops -mllvm -enable-ext-tsp-block-placement=1 -mllvm -enable-gvn-hoist=1 -mllvm -enable-dfa-jump-thread=1" \
     -D CMAKE_EXE_LINKER_FLAGS="-Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -march=native -mtune=native -fuse-ld=lld -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -Wl,--push-state -Wl,-whole-archive -lmimalloc -Wl,--pop-state -lpthread -lstdc++ -lm -ldl" \
@@ -45,7 +46,7 @@ cmake -G Ninja ../llvm-project/llvm \
     -D CMAKE_SHARED_LINKER_FLAGS="-Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -march=native -mtune=native -fuse-ld=lld -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -Wl,--push-state -Wl,-whole-archive -lmimalloc -Wl,--pop-state -lpthread -lstdc++ -lm -ldl" \
     -DLLVM_VP_COUNTERS_PER_SITE=10 \
     -DCMAKE_AR="${CPATH}/llvm-ar" \
-    -DCMAKE_C_COMPILER="${CPATH}/clang-20" \
+    -DCMAKE_C_COMPILER="${CPATH}/clang-21" \
     -DCMAKE_CXX_COMPILER="${CPATH}/clang++" \
     -DLLVM_USE_LINKER="${CPATH}/ld.lld" \
     -DCMAKE_RANLIB="${CPATH}/llvm-ranlib" \
@@ -68,20 +69,12 @@ optimize_binary() {
         -o "${binary}" \
         --dyno-stats \
         --lite=false \
-        --frame-opt=all \
         --icf=all \
-        --jump-tables=aggressive \
-        --min-branch-clusters \
-        --stoke \
         --plt=all \
-        --hot-data \
         --hugify \
-        --frame-opt-rm-stores \
         --peepholes=all \
-        --infer-stale-profile=1 \
         --x86-strip-redundant-address-size \
         --indirect-call-promotion=all \
-        --reg-reassign \
         --reorder-blocks=ext-tsp \
         --reorder-functions=cdsort \
         --split-all-cold \
@@ -92,7 +85,7 @@ optimize_binary() {
 }
 
 # Optimize binaries
-optimize_binary "${CPATH}/clang-20"
+optimize_binary "${CPATH}/clang-21"
 optimize_binary "${CPATH}/lld"
 
 echo "Optimized binaries are ready at ${CPATH}"
