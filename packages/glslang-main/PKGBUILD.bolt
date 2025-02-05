@@ -1,0 +1,263 @@
+pkgname=glslang
+pkgver=15.1.0
+pkgrel=7.1
+pkgdesc="OpenGL and OpenGL ES shader front end and validator"
+arch=('x86_64')
+url='https://github.com/KhronosGroup/glslang'
+license=('BSD')
+depends=('gcc-libs' 'spirv-tools')
+makedepends=('cmake' 'ninja' 'spirv-headers' 'python' 'llvm')
+options=('staticlibs' '!strip')
+source=(${pkgname}-${pkgver}.tar.gz::https://github.com/KhronosGroup/glslang/archive/${pkgver}.tar.gz
+        run-instrumented-tests.sh)
+sha256sums=('1c4d0a5a38c8aaf89a2d7e6093be734320599f5a6775b2726beeb05b0c054e66'
+            'SKIP')
+
+prepare() {
+  cd ${pkgname}-${pkgver}
+}
+
+build() {
+  cd ${pkgname}-${pkgver}
+
+  # Create directory for PGO profiles
+  mkdir -p "$srcdir/pgo"
+  chmod u+w "$srcdir/pgo"
+
+  # Create directory for BOLT profile data
+  mkdir -p "$srcdir/bolt_profile"
+
+  local _common_cmake_options=(
+    -DCMAKE_INSTALL_PREFIX=/usr
+    -DCMAKE_C_STANDARD=23
+    -DCMAKE_CXX_STANDARD=23
+    -DALLOW_EXTERNAL_SPIRV_TOOLS=ON
+    -DGLSLANG_TESTS=ON
+  )
+
+  # --- Stage 1: Build with PGO instrumentation ---
+  CFLAGS+=" -fprofile-generate=$srcdir/pgo -mllvm -vp-counters-per-site=10 -g3 -fno-omit-frame-pointer"
+  CXXFLAGS+=" -fprofile-generate=$srcdir/pgo -mllvm -vp-counters-per-site=10 -g3 -fno-omit-frame-pointer"
+  LDFLAGS+=" -fprofile-generate=$srcdir/pgo -mllvm -vp-counters-per-site=10 -g3 -fno-omit-frame-pointer"
+
+  cmake \
+    -Bbuild-stage1 \
+    -GNinja \
+    -DCMAKE_BUILD_TYPE=Debug \
+    "${_common_cmake_options[@]}" \
+    -DBUILD_SHARED_LIBS=ON \
+    -DCMAKE_C_FLAGS="$CFLAGS" \
+    -DCMAKE_CXX_FLAGS="$CXXFLAGS" \
+    -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS"
+
+  ninja -Cbuild-stage1
+
+  # Run tests to generate PGO profile data
+  echo "Running tests to generate PGO profile data..."
+  cd build-stage1
+  export LD_LIBRARY_PATH="$srcdir/${pkgname}-${pkgver}/build-stage1/glslang:$srcdir/${pkgname}-${pkgver}/build-stage1/SPIRV:$LD_LIBRARY_PATH"
+  ctest -C Release -VV -R ".*" -j$(nproc) --output-on-failure
+  cd ..
+
+  # Merge PGO profiles
+  echo "Merging PGO profiles..."
+  llvm-profdata merge -output="$srcdir/pgo/default.profdata" "$srcdir/pgo/"*.profraw || {
+    echo "Error: Failed to merge .profraw files!"
+    return 1
+  }
+
+  # Verify merged .profdata file
+  if [ ! -s "$srcdir/pgo/default.profdata" ]; then
+    echo "Error: Merged .profdata file is empty!"
+    return 1
+  fi
+
+  # --- Stage 2: Build with PGO data ---
+  CFLAGS="${CFLAGS%% -fprofile-generate*} -fprofile-use=$srcdir/pgo/default.profdata"
+  CXXFLAGS="${CXXFLAGS%% -fprofile-generate*} -fprofile-use=$srcdir/pgo/default.profdata"
+  LDFLAGS="${LDFLAGS%% -fprofile-generate*} -fprofile-use=$srcdir/pgo/default.profdata -Wl,--emit-relocs"
+
+  cmake \
+    -Bbuild-pgo \
+    -GNinja \
+    -DCMAKE_BUILD_TYPE=Release \
+    "${_common_cmake_options[@]}" \
+    -DBUILD_SHARED_LIBS=ON \
+    -DCMAKE_C_FLAGS="$CFLAGS" \
+    -DCMAKE_CXX_FLAGS="$CXXFLAGS" \
+    -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS"
+
+  ninja -Cbuild-pgo
+
+  # --- Stage 3: Instrument for BOLT ---
+  echo "Creating instrumented binaries for BOLT..."
+
+  # Array of binaries to instrument - use readlink -f to resolve symlinks
+  local binaries=(
+    "$(readlink -f "$srcdir/${pkgname}-${pkgver}/build-pgo/StandAlone/glslang")"
+    "$srcdir/${pkgname}-${pkgver}/build-pgo/StandAlone/spirv-remap"
+  )
+
+  # Clean up build directory
+  echo "Cleaning up build directory..."
+  rm -f "$srcdir/${pkgname}-${pkgver}/build-pgo/StandAlone/"*.orig
+  rm -f "$srcdir/${pkgname}-${pkgver}/build-pgo/StandAlone/"*.inst
+  rm -f "$srcdir/${pkgname}-${pkgver}/build-pgo/StandAlone/"*.bolt
+
+  # Ensure binaries exist and are executable
+  for binary in "${binaries[@]}"; do
+    # Skip if binary is a symlink
+    if [ -L "$binary" ]; then
+      echo "Skipping symlink: $binary"
+      continue
+    fi  # Fixed the syntax error here - changed } to fi
+
+    if [ ! -x "$binary" ]; then
+      echo "Warning: Skipping missing or non-executable binary: $binary"
+      continue
+    fi
+
+    # Debug binary information
+    echo "Processing binary: $binary"
+    echo "Binary type: $(file "$binary")"
+
+    # Check if binary has already been processed by BOLT
+    if readelf -S "$binary" 2>/dev/null | grep -q "__bolt_runtime_start" || file "$binary" | grep -q "BOLT"; then
+      echo "Warning: Skipping already processed binary: $binary"
+      continue
+    fi
+
+    # Backup original binary if not already backed up
+    if [ ! -f "$binary.orig" ]; then
+      cp "$binary" "$binary.orig"
+    else
+      cp "$binary.orig" "$binary"
+    fi
+
+    # Instrument binary
+    echo "Instrumenting binary: $binary"
+    llvm-bolt "$binary" \
+      --instrument \
+      --instrumentation-file-append-pid \
+      --instrumentation-file="$srcdir/bolt_profile/prof.fdata" \
+      -o "$binary.inst"
+    mv "$binary.inst" "$binary"
+  done
+
+  # Run tests with instrumented binaries to generate BOLT profile data
+  echo "Running tests with instrumented binaries for BOLT..."
+  export LD_LIBRARY_PATH="$srcdir/${pkgname}-${pkgver}/build-pgo/glslang:$srcdir/${pkgname}-${pkgver}/build-pgo/SPIRV:$LD_LIBRARY_PATH"
+  echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
+  chmod +x "$srcdir/run-instrumented-tests.sh"
+  cd build-pgo
+  ctest -C Release -VV -j$(nproc) --output-on-failure \
+      -D "TEST_COMMAND=$srcdir/run-instrumented-tests.sh"
+  cd ..
+
+  # Verify BOLT profile data files
+  echo "Looking for BOLT profile data files..."
+  ls -la "$srcdir/bolt_profile/"
+
+  if ! ls "$srcdir/bolt_profile/prof.fdata"* >/dev/null 2>&1; then
+    echo "Warning: No BOLT profile data files found. Skipping BOLT optimization."
+    return 0
+  fi
+
+  echo "Merging BOLT profile data files..."
+  merge-fdata "$srcdir/bolt_profile/prof.fdata"* > "$srcdir/bolt_profile/merged.fdata"
+
+  # Verify merged BOLT profile data file size
+  if [ ! -s "$srcdir/bolt_profile/merged.fdata" ]; then
+    echo "Error: Merged BOLT profile data file is empty!"
+    return 1
+  fi
+
+  # --- Stage 4: Optimize with BOLT ---
+  echo "Optimizing with BOLT..."
+
+  local bolt_options=(
+    --data "$srcdir/bolt_profile/merged.fdata"
+    --dyno-stats
+    --lite=false
+    --eliminate-unreachable
+    --frame-opt=all
+    --icf=all
+    --jump-tables=aggressive
+    --min-branch-clusters
+    --stoke
+    --sctc-mode=always
+    --plt=all
+    --hot-data
+    --hugify
+    --frame-opt-rm-stores
+    --peepholes=all
+    --infer-stale-profile=1
+    --x86-strip-redundant-address-size
+    --indirect-call-promotion=all
+    --reorder-blocks=ext-tsp
+    --reorder-functions=cdsort
+    --split-all-cold
+    --split-eh
+    --split-functions
+    --split-strategy=cdsplit
+    --redirect-never-taken-jumps
+  )
+
+  # Optimize binaries
+  for binary in "${binaries[@]}"; do
+    if [ -L "$binary" ]; then
+      echo "Skipping symlink: $binary"
+      continue
+    fi
+
+    if [ -f "${binary}.orig" ]; then
+      llvm-bolt "${binary}.orig" \
+        "${bolt_options[@]}" \
+        -o "${binary}.bolt" || \
+        echo "Warning: BOLT optimization failed for ${binary}"
+    else
+      echo "Warning: Original binary not found for ${binary}"
+    fi
+  done
+}
+
+package() {
+  cd ${pkgname}-${pkgver}
+
+  # Install PGO-optimized files first
+  DESTDIR="${pkgdir}" cmake --install build-pgo
+
+  # Install BOLT-optimized binaries if they exist
+  if [ -f "build-pgo/StandAlone/glslang.bolt" ]; then
+    install -Dm755 "build-pgo/StandAlone/glslang.bolt" "${pkgdir}/usr/bin/glslang"
+  fi
+  if [ -f "build-pgo/StandAlone/spirv-remap.bolt" ]; then
+    install -Dm755 "build-pgo/StandAlone/spirv-remap.bolt" "${pkgdir}/usr/bin/spirv-remap"
+  fi
+
+  # Install license
+  install -Dm644 LICENSE.txt "${pkgdir}"/usr/share/licenses/${pkgname}/LICENSE
+
+  # Create symlinks for shared libraries
+  cd "${pkgdir}"/usr/lib
+  for lib in *.so.*; do
+    ln -sf "${lib}" "${lib%.*}"
+    ln -sf "${lib}" "${lib%.*.*}"
+  done
+
+  # Create symlink for glslangValidator
+  cd "${pkgdir}"/usr/bin
+  ln -sf glslang glslangValidator
+
+  # Use llvm-strip only on recognized file formats
+  find "$pkgdir" -type f \( -name '*.so*' -o -name '*.a' -o -executable \) -print0 | while IFS= read -r -d '' file; do
+    if [ -L "$file" ]; then
+      continue  # Skip symlinks
+    fi
+    if llvm-strip --strip-unneeded "$file" 2>/dev/null || llvm-strip --strip-all "$file" 2>/dev/null; then
+      echo "Stripped: $file"
+    else
+      echo "Skipping: $file (not a valid object file)" >&2
+    fi
+  done
+}
