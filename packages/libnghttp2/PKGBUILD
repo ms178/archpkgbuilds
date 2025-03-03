@@ -1,8 +1,5 @@
-# Maintainer: Anatol Pomozov
-# Contributor: Zhuoyun Wei <wzyboy@wzyboy.org>
-
 pkgname=libnghttp2
-pkgver=1.64.0
+pkgver=1.65.0
 pkgrel=3.1
 pkgdesc='Framing layer of HTTP/2 is implemented as a reusable C library'
 arch=('x86_64')
@@ -10,7 +7,7 @@ url='https://nghttp2.org/'
 license=('MIT')
 depends=('glibc')
 provides=('libnghttp2.so')
-makedepends=('git')
+makedepends=('git' 'llvm' 'clang' 'openssl' 'libev' 'c-ares' 'jansson')
 conflicts=('nghttp2<1.20.0-2')
 validpgpkeys=('F4F3B91474D1EB29889BD0EF7E8403D5D673C366') # Tatsuhiro Tsujikawa <tatsuhiro.t@gmail.com>
 source=("git+https://github.com/nghttp2/nghttp2.git#tag=v${pkgver}?signed"
@@ -33,16 +30,209 @@ prepare() {
   git -c protocol.file.allow=always submodule update
 
   autoreconf -vfi
+
+  # Create PGO workload script
+  cat > "$srcdir/pgo-workload.sh" << 'EOF'
+#!/bin/bash
+set -e
+
+WORKDIR="$1"
+BINDIR="$2"
+cd "$WORKDIR"
+
+echo "Setting up HTTP/2 test environment..."
+
+# Generate test files of different sizes
+dd if=/dev/urandom of=small.bin bs=1K count=10 status=none
+dd if=/dev/urandom of=medium.bin bs=1K count=100 status=none
+dd if=/dev/urandom of=large.bin bs=1M count=5 status=none
+
+# Create a simple HTML file
+cat > index.html << 'HTML'
+<!DOCTYPE html>
+<html>
+<head>
+    <title>nghttp2 PGO Test</title>
+</head>
+<body>
+    <h1>HTTP/2 Test Page</h1>
+    <p>This is a test page for nghttp2 PGO profiling.</p>
+</body>
+</html>
+HTML
+
+# Start an HTTP/2 server in the background
+echo "Starting HTTP/2 server..."
+"$BINDIR/nghttpd" -v -d "$WORKDIR" 8080 server.key server.crt &
+SERVER_PID=$!
+
+# Give the server a moment to start
+sleep 2
+
+# Function to stop server on exit
+cleanup() {
+    echo "Stopping HTTP/2 server..."
+    kill $SERVER_PID
+    wait $SERVER_PID 2>/dev/null || true
+    echo "Cleanup complete"
+}
+trap cleanup EXIT
+
+echo "Running HTTP/2 client tests..."
+
+# Simple GET requests
+"$BINDIR/nghttp" -nva 'https://localhost:8080/index.html'
+"$BINDIR/nghttp" -nva 'https://localhost:8080/index.html' 'https://localhost:8080/small.bin'
+
+# Multiple concurrent requests
+"$BINDIR/nghttp" -nva -c 2 'https://localhost:8080/index.html' 'https://localhost:8080/medium.bin' 'https://localhost:8080/large.bin'
+
+# Test with different window bits
+"$BINDIR/nghttp" -nva --window-bits=16 'https://localhost:8080/medium.bin'
+"$BINDIR/nghttp" -nva --window-bits=28 'https://localhost:8080/large.bin'
+
+# Test with different header table sizes
+"$BINDIR/nghttp" -nva --header-table-size=1024 'https://localhost:8080/index.html'
+"$BINDIR/nghttp" -nva --header-table-size=8192 'https://localhost:8080/medium.bin'
+
+# Test with different connection window bits
+"$BINDIR/nghttp" -nva --connection-window-bits=20 'https://localhost:8080/large.bin'
+
+# Exercise different aspects of HTTP/2 protocol
+"$BINDIR/nghttp" -nva --no-dep 'https://localhost:8080/index.html'
+"$BINDIR/nghttp" -nva --padding=64 'https://localhost:8080/medium.bin'
+"$BINDIR/nghttp" -nva --weight=32 'https://localhost:8080/large.bin'
+
+# Make multiple requests with different parameters and statistics output
+for i in {1..3}; do
+    "$BINDIR/nghttp" -nva --stat 'https://localhost:8080/index.html'
+    "$BINDIR/nghttp" -nva --har 'https://localhost:8080/small.bin'  # Fixed: --harq to --har
+    "$BINDIR/nghttp" -nva 'https://localhost:8080/medium.bin'
+done
+
+echo "HTTP/2 client tests completed"
+EOF
+
+  chmod +x "$srcdir/pgo-workload.sh"
+
+  # Generate self-signed certificates for HTTPS testing
+  cd "$srcdir"
+  openssl req -new -x509 -days 365 -nodes \
+    -out server.crt -keyout server.key \
+    -subj "/CN=localhost" \
+    -addext "subjectAltName = DNS:localhost"
 }
 
 build() {
   cd nghttp2
 
+  # Create PGO directories
+  pgo_dir="$srcdir/pgo-data"
+  mkdir -p "${pgo_dir}/standard"
+  mkdir -p "${pgo_dir}/cs"
+
+  # Store original flags
+  orig_cflags="$CFLAGS"
+  orig_cxxflags="$CXXFLAGS"
+  orig_ldflags="$LDFLAGS"
+
+  # Use clang for compilation
+  export CC=clang
+  export CXX=clang++
+
+  ###########################################################################
+  # Phase 1: Standard PGO Instrumentation
+  ###########################################################################
+  msg2 "== Building with standard PGO instrumentation"
+
+  # Standard PGO instrumentation flags
+  export CFLAGS="${orig_cflags} -fprofile-generate=${pgo_dir}/standard -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+  export CXXFLAGS="${orig_cxxflags} -fprofile-generate=${pgo_dir}/standard -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+  export LDFLAGS="${orig_ldflags} -fprofile-generate=${pgo_dir}/standard -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+
+  # Configure with --enable-app to build the tools
+  ./configure \
+    --prefix=/usr \
+    --disable-python-bindings \
+    --disable-static \
+    --enable-app
+
+  make clean
+  make
+
+  # Run the built-in tests properly using make check
+  msg2 "Running built-in tests for PGO profiling"
+  make check || true  # Continue even if tests fail
+
+  # Setup a testing environment for custom workload
+  msg2 "Running custom HTTP/2 workload for PGO profiling"
+  mkdir -p "$srcdir/http2-test"
+
+  # Copy the generated certificates to the test directory
+  cp "$srcdir/server.crt" "$srcdir/server.key" "$srcdir/http2-test/"
+
+  # Run the PGO workload script with the correct binary path
+  "$srcdir/pgo-workload.sh" "$srcdir/http2-test" "$(pwd)/src" || true  # Continue even if workload fails
+
+  # Merge profile data from first run
+  llvm-profdata merge -output="${pgo_dir}/standard.profdata" "${pgo_dir}/standard/"
+
+  ###########################################################################
+  # Phase 2: Context-Sensitive PGO Instrumentation
+  ###########################################################################
+  msg2 "== Building with context-sensitive PGO instrumentation"
+
+  # CS-PGO instrumentation flags (using standard profile data)
+  export CFLAGS="${orig_cflags} -fprofile-use=${pgo_dir}/standard.profdata -fcs-profile-generate=${pgo_dir}/cs -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+  export CXXFLAGS="${orig_cxxflags} -fprofile-use=${pgo_dir}/standard.profdata -fcs-profile-generate=${pgo_dir}/cs -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+  export LDFLAGS="${orig_ldflags} -fprofile-use=${pgo_dir}/standard.profdata -fcs-profile-generate=${pgo_dir}/cs -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+
+  # Configure with --enable-app again
+  ./configure \
+    --prefix=/usr \
+    --disable-python-bindings \
+    --disable-static \
+    --enable-app
+
+  make clean
+  make
+
+  # Run the built-in tests properly using make check
+  msg2 "Running built-in tests for CS-PGO profiling"
+  make check || true  # Continue even if tests fail
+
+  # Setup and run the custom workload again
+  msg2 "Running custom HTTP/2 workload for CS-PGO profiling"
+  rm -rf "$srcdir/http2-test"
+  mkdir -p "$srcdir/http2-test"
+
+  # Copy the generated certificates to the test directory
+  cp "$srcdir/server.crt" "$srcdir/server.key" "$srcdir/http2-test/"
+
+  # Run the workload script with the path to the binaries
+  "$srcdir/pgo-workload.sh" "$srcdir/http2-test" "$(pwd)/src" || true  # Continue even if workload fails
+
+  # Merge both profile datasets
+  llvm-profdata merge -output="${pgo_dir}/merged.profdata" "${pgo_dir}/cs/" "${pgo_dir}/standard.profdata"
+
+  ###########################################################################
+  # Phase 3: Final Build with PGO-optimized flags
+  ###########################################################################
+  msg2 "== Building final optimized version with PGO data"
+
+  # Final build using merged profile data
+  export CFLAGS="${orig_cflags} -fprofile-use=${pgo_dir}/merged.profdata"
+  export CXXFLAGS="${orig_cxxflags} -fprofile-use=${pgo_dir}/merged.profdata"
+  export LDFLAGS="${orig_ldflags} -fprofile-use=${pgo_dir}/merged.profdata"
+
+  # Now build with lib-only for the final package
   ./configure \
     --prefix=/usr \
     --disable-examples \
     --disable-python-bindings \
     --enable-lib-only
+
+  make clean
   make
 }
 
