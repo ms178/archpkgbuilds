@@ -55,6 +55,9 @@ pkgver() {
 
 prepare() {
   cd "$pkgbase"
+  # Freeze the source code by checking out the current commit to ensure consistency
+  git checkout "$(git rev-parse HEAD)"
+
   local sp
   for sp in {dvar-1,ini-1,list-3,rbtree-3,shquote-1,stdaux-1,utf8-1}; do
     ln -fs "$(realpath --relative-to "subprojects" "$srcdir/c-$sp")" "subprojects/libc$sp"
@@ -84,28 +87,37 @@ build() {
     -D system-console-users=gdm,sddm,lightdm,lxdm
   )
 
+  # Ensure a clean build environment by removing existing build directories
+  rm -rf "$srcdir/build" "$srcdir/build-pgo1" "$srcdir/build-pgo2"
+
   # Create directories for PGO and BOLT profiles
-  mkdir -p "$srcdir/pgo_standard"
+  mkdir -p "$srcdir/pgo_raw"
   mkdir -p "$srcdir/pgo_cs"
   mkdir -p "$srcdir/bolt_profile"
+  chmod -R u+w "$srcdir/pgo_raw" "$srcdir/pgo_cs" "$srcdir/bolt_profile"
 
   # Store original flags
   CFLAGS_ORIG="$CFLAGS"
   CXXFLAGS_ORIG="$CXXFLAGS"
   LDFLAGS_ORIG="$LDFLAGS"
 
+  # Common optimization flags for all stages to ensure consistency
+  local common_cflags+=" -fno-common -ffunction-sections -fdata-sections"
+  local common_cxxflags+=" -fno-common -ffunction-sections -fdata-sections"
+  local common_ldflags+=" -fuse-ld=lld -Wl,--lto-O3 -Wl,--gc-sections"
+
   # --- Stage 1: Standard PGO - First round with standard instrumentation ---
   echo "Stage 1: Building with standard PGO instrumentation..."
 
-  # Add standard PGO instrumentation flags with full LTO
-  CFLAGS+=" -fprofile-generate=$srcdir/pgo_standard -flto"
-  CXXFLAGS+=" -fprofile-generate=$srcdir/pgo_standard -flto"
-  LDFLAGS+=" -fprofile-generate=$srcdir/pgo_standard -flto"
+  # Reset flags to avoid contamination
+  CFLAGS="$CFLAGS_ORIG"
+  CXXFLAGS="$CXXFLAGS_ORIG"
+  LDFLAGS="$LDFLAGS_ORIG"
 
-  # Add additional LTO optimization flags for compiler and linker
-  CFLAGS+=" -fuse-ld=lld -Wl,--lto-O3"
-  CXXFLAGS+=" -fuse-ld=lld -Wl,--lto-O3"
-  LDFLAGS+=" -fuse-ld=lld -Wl,--lto-O3"
+  # Add standard PGO instrumentation flags with full LTO
+  CFLAGS+=" $common_cflags -fprofile-generate=$srcdir/pgo_raw -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+  CXXFLAGS+=" $common_cxxflags -fprofile-generate=$srcdir/pgo_raw -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+  LDFLAGS+=" $common_ldflags -fprofile-generate=$srcdir/pgo_raw -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
 
   # Configure and build with standard instrumentation
   arch-meson "$pkgbase" build-pgo1 "${meson_options[@]}" \
@@ -115,37 +127,57 @@ build() {
     -D b_pie=false \
     -D c_std=gnu18 \
     -D cpp_std=gnu++2a \
-    --buildtype=debug \
-    -D b_lto=false  # We're controlling LTO manually
+    --buildtype=plain  # Use plain to manually control optimization flags
 
   meson compile -C build-pgo1
 
   # Run tests to generate profile data
   echo "Running tests to generate standard PGO profile data..."
-  meson test -C build-pgo1 || echo "Some tests failed, but continuing anyway"
+  if ! meson test -C build-pgo1; then
+    echo "Warning: Some tests failed during standard PGO profile generation. Profile data may be incomplete."
+  fi
 
-  # Run additional workloads if possible for better coverage
+  # Run additional workloads for better coverage
   if [ -x "$srcdir/build-pgo1/src/dbus-broker" ]; then
-    "$srcdir/build-pgo1/src/dbus-broker" --help || true
-    "$srcdir/build-pgo1/src/dbus-broker" --version || true
+    echo "Running additional workloads for better PGO coverage..."
+    # Start dbus-broker in the background with a realistic configuration
+    "$srcdir/build-pgo1/src/dbus-broker" --scope system --log 4 --verbose > "$srcdir/pgo1.log" 2>&1 &
+    broker_pid=$!
+    sleep 1  # Give it time to start
+    # Simulate some D-Bus activity (e.g., using dbus-send or similar tools)
+    if command -v dbus-send >/dev/null 2>&1; then
+      dbus-send --system --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ListNames || true
+    fi
+    # Stop the broker
+    kill $broker_pid || true
+    wait $broker_pid 2>/dev/null || true
+  fi
+
+  # Check if profile data exists
+  if ! ls "$srcdir/pgo_raw"/*.profraw >/dev/null 2>&1; then
+    echo "Error: No standard PGO profile data generated. Aborting."
+    exit 1
   fi
 
   # Merge standard profile data
   echo "Merging standard PGO profile data..."
-  llvm-profdata merge -output="$srcdir/standard.profdata" "$srcdir/pgo_standard"
+  if ! llvm-profdata merge -output="$srcdir/standard.profdata" "$srcdir/pgo_raw"/*.profraw; then
+    echo "Error: Failed to merge standard PGO profile data."
+    exit 1
+  fi
 
   # --- Stage 2: Context-Sensitive PGO - Second round using first profile ---
   echo "Stage 2: Building with context-sensitive PGO instrumentation..."
 
-  # Update flags for CS-PGO instrumentation, using standard profile data
-  CFLAGS="${CFLAGS_ORIG} -fprofile-use=$srcdir/standard.profdata -fcs-profile-generate=$srcdir/pgo_cs -flto"
-  CXXFLAGS="${CXXFLAGS_ORIG} -fprofile-use=$srcdir/standard.profdata -fcs-profile-generate=$srcdir/pgo_cs -flto"
-  LDFLAGS="${LDFLAGS_ORIG} -fprofile-use=$srcdir/standard.profdata -fcs-profile-generate=$srcdir/pgo_cs -flto"
+  # Reset flags to avoid contamination
+  CFLAGS="$CFLAGS_ORIG"
+  CXXFLAGS="$CXXFLAGS_ORIG"
+  LDFLAGS="$LDFLAGS_ORIG"
 
-  # Add LTO flags
-  CFLAGS+=" -fuse-ld=lld -Wl,--lto-O3"
-  CXXFLAGS+=" -fuse-ld=lld -Wl,--lto-O3"
-  LDFLAGS+=" -fuse-ld=lld -Wl,--lto-O3"
+  # Update flags for CS-PGO instrumentation, using standard profile data
+  CFLAGS+=" $common_cflags -fprofile-use=$srcdir/standard.profdata -fcs-profile-generate=$srcdir/pgo_cs -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+  CXXFLAGS+=" $common_cxxflags -fprofile-use=$srcdir/standard.profdata -fcs-profile-generate=$srcdir/pgo_cs -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+  LDFLAGS+=" $common_ldflags -fprofile-use=$srcdir/standard.profdata -fcs-profile-generate=$srcdir/pgo_cs -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
 
   # Configure and build with CS-PGO instrumentation
   arch-meson "$pkgbase" build-pgo2 "${meson_options[@]}" \
@@ -155,41 +187,57 @@ build() {
     -D b_pie=false \
     -D c_std=gnu18 \
     -D cpp_std=gnu++2a \
-    --buildtype=debug \
-    -D b_lto=false  # We're controlling LTO manually
+    --buildtype=plain
 
   meson compile -C build-pgo2
 
   # Run tests to generate context-sensitive profile data
   echo "Running tests to generate context-sensitive PGO profile data..."
-  meson test -C build-pgo2 || echo "Some tests failed, but continuing anyway"
+  if ! meson test -C build-pgo2; then
+    echo "Warning: Some tests failed during context-sensitive PGO profile generation. Profile data may be incomplete."
+  fi
 
-  # Run the same additional workloads as before
+  # Run the same additional workloads for better coverage
   if [ -x "$srcdir/build-pgo2/src/dbus-broker" ]; then
-    "$srcdir/build-pgo2/src/dbus-broker" --help || true
-    "$srcdir/build-pgo2/src/dbus-broker" --version || true
+    echo "Running additional workloads for better PGO coverage..."
+    # Start dbus-broker in the background with a realistic configuration
+    "$srcdir/build-pgo2/src/dbus-broker" --scope system --log 4 --verbose > "$srcdir/pgo2.log" 2>&1 &
+    broker_pid=$!
+    sleep 1  # Give it time to start
+    # Simulate some D-Bus activity
+    if command -v dbus-send >/dev/null 2>&1; then
+      dbus-send --system --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ListNames || true
+    fi
+    # Stop the broker
+    kill $broker_pid || true
+    wait $broker_pid 2>/dev/null || true
+  fi
+
+  # Check if profile data exists
+  if ! ls "$srcdir/pgo_cs"/*.profraw >/dev/null 2>&1; then
+    echo "Error: No context-sensitive PGO profile data generated. Aborting."
+    exit 1
   fi
 
   # Merge context-sensitive profile with standard profile
   echo "Merging context-sensitive profile with standard profile..."
-  llvm-profdata merge -output="$srcdir/merged.profdata" "$srcdir/pgo_cs" "$srcdir/standard.profdata"
+  if ! llvm-profdata merge -output="$srcdir/merged.profdata" "$srcdir/pgo_cs"/*.profraw "$srcdir/standard.profdata"; then
+    echo "Error: Failed to merge context-sensitive PGO profile data."
+    exit 1
+  fi
 
   # --- Stage 3: Final build with merged profile data ---
   echo "Stage 3: Building final version with merged profile data..."
 
+  # Reset flags to avoid contamination
+  CFLAGS="$CFLAGS_ORIG"
+  CXXFLAGS="$CXXFLAGS_ORIG"
+  LDFLAGS="$LDFLAGS_ORIG"
+
   # Update flags for the final optimized build
-  CFLAGS="${CFLAGS_ORIG} -fprofile-use=$srcdir/merged.profdata -flto"
-  CXXFLAGS="${CXXFLAGS_ORIG} -fprofile-use=$srcdir/merged.profdata -flto"
-  LDFLAGS="${LDFLAGS_ORIG} -fprofile-use=$srcdir/merged.profdata -flto -Wl,--emit-relocs"
-
-  # Add advanced optimization flags
-  CFLAGS+=" -fno-common -ffunction-sections -fdata-sections"
-  CXXFLAGS+=" -fno-common -ffunction-sections -fdata-sections"
-
-  # Add LTO flags
-  CFLAGS+=" -fuse-ld=lld -Wl,--lto-O3 -Wl,--gc-sections"
-  CXXFLAGS+=" -fuse-ld=lld -Wl,--lto-O3 -Wl,--gc-sections"
-  LDFLAGS+=" -fuse-ld=lld -Wl,--lto-O3 -Wl,--gc-sections"
+  CFLAGS+=" $common_cflags -fprofile-use=$srcdir/merged.profdata"
+  CXXFLAGS+=" $common_cxxflags -fprofile-use=$srcdir/merged.profdata"
+  LDFLAGS+=" $common_ldflags -fprofile-use=$srcdir/merged.profdata -Wl,--emit-relocs"
 
   # Configure and build with final optimizations
   arch-meson "$pkgbase" build "${meson_options[@]}" \
@@ -199,8 +247,7 @@ build() {
     -D b_pie=false \
     -D c_std=gnu18 \
     -D cpp_std=gnu++2a \
-    --buildtype=release \
-    -D b_lto=false  # We're controlling LTO manually
+    --buildtype=plain
 
   meson compile -C build
 
@@ -218,6 +265,12 @@ build() {
   rm -f "$srcdir/build/src/"*.orig
   rm -f "$srcdir/build/src/"*.inst
   rm -f "$srcdir/build/src/"*.bolt
+
+  # Ensure bolt_profile directory exists and is writable
+  if [ ! -d "$srcdir/bolt_profile" ]; then
+    mkdir -p "$srcdir/bolt_profile"
+  fi
+  chmod -R u+w "$srcdir/bolt_profile"
 
   # Ensure binaries exist and are executable
   for binary in "${binaries[@]}"; do
@@ -245,29 +298,58 @@ build() {
     # Backup original binary if not already backed up
     if [ ! -f "$binary.orig" ]; then
       cp "$binary" "$binary.orig"
-    else
-      cp "$binary.orig" "$binary"
     fi
 
-    # Instrument binary
+    # Instrument binary, keeping it separate from the original
     echo "Instrumenting binary: $binary"
-    llvm-bolt "$binary" \
+    if ! llvm-bolt "$binary" \
       --instrument \
+      --lite=false \
       --instrumentation-file-append-pid \
       --instrumentation-file="$srcdir/bolt_profile/prof.fdata" \
-      -o "$binary.inst"
-    mv "$binary.inst" "$binary"
+      -o "$binary.inst"; then
+      echo "Error: Failed to instrument binary: $binary"
+      echo "Check if $srcdir/bolt_profile is writable and accessible."
+      exit 1
+    fi
   done
 
   # Run tests with instrumented binaries to generate BOLT profile data
   echo "Running tests with instrumented binaries for BOLT..."
-  meson test -C build || echo "Some tests failed, but continuing anyway"
+  # Temporarily replace original binaries with instrumented ones for testing
+  for binary in "${binaries[@]}"; do
+    if [ -f "$binary.inst" ]; then
+      mv "$binary" "$binary.bak"
+      mv "$binary.inst" "$binary"
+    fi
+  done
 
-  # Run the same additional workloads for consistency
-  if [ -x "$srcdir/build/src/dbus-broker" ]; then
-    "$srcdir/build/src/dbus-broker" --help || true
-    "$srcdir/build/src/dbus-broker" --version || true
+  if ! meson test -C build; then
+    echo "Warning: Some tests failed during BOLT profile generation. Profile data may be incomplete."
   fi
+
+  # Run additional workloads for better coverage
+  if [ -x "$srcdir/build/src/dbus-broker" ]; then
+    echo "Running additional workloads for better BOLT coverage..."
+    # Start dbus-broker in the background with a realistic configuration
+    "$srcdir/build/src/dbus-broker" --scope system --log 4 --verbose > "$srcdir/bolt.log" 2>&1 &
+    broker_pid=$!
+    sleep 1  # Give it time to start
+    # Simulate some D-Bus activity
+    if command -v dbus-send >/dev/null 2>&1; then
+    dbus-send --system --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ListNames || true
+    fi
+    # Stop the broker
+    kill $broker_pid || true
+    wait $broker_pid 2>/dev/null || true
+  fi
+
+  # Restore original binaries after testing
+  for binary in "${binaries[@]}"; do
+    if [ -f "$binary.bak" ]; then
+      mv "$binary.bak" "$binary"
+    fi
+  done
 
   # Verify BOLT profile data files
   echo "Looking for BOLT profile data files..."
@@ -279,12 +361,15 @@ build() {
   fi
 
   echo "Merging BOLT profile data files..."
-  merge-fdata "$srcdir/bolt_profile/prof.fdata"* > "$srcdir/bolt_profile/merged.fdata"
+  if ! merge-fdata "$srcdir/bolt_profile/prof.fdata"* > "$srcdir/bolt_profile/merged.fdata"; then
+    echo "Error: Failed to merge BOLT profile data files."
+    exit 1
+  fi
 
   # Verify merged BOLT profile data file size
   if [ ! -s "$srcdir/bolt_profile/merged.fdata" ]; then
     echo "Error: Merged BOLT profile data file is empty!"
-    return 1
+    exit 1
   fi
 
   # --- Stage 5: Optimize with BOLT ---
@@ -330,13 +415,16 @@ build() {
     fi
 
     binary_name=$(basename "$binary")
-    if [ -f "${binary}.orig" ]; then
-      llvm-bolt "${binary}.orig" \
-        "${bolt_options[@]}" \
-        -o "$srcdir/build/bolt/${binary_name}.bolt" || \
-        echo "Warning: BOLT optimization failed for ${binary}"
-    else
-      echo "Warning: Original binary not found for ${binary}"
+    if [ ! -f "${binary}.orig" ]; then
+      echo "Error: Original binary not found for ${binary}. Aborting."
+      exit 1
+    fi
+
+    echo "Optimizing binary: $binary"
+    if ! llvm-bolt "${binary}.orig" \
+      "${bolt_options[@]}" \
+      -o "$srcdir/build/bolt/${binary_name}.bolt"; then
+      echo "Warning: BOLT optimization failed for ${binary}. Falling back to original binary."
     fi
   done
 }
@@ -361,17 +449,37 @@ package_dbus-broker-git() {
   provides=("dbus-broker")
   conflicts=("dbus-broker")
 
-  # Install all files normally
+  # Restore original binaries to the build directory before installation
+  local binaries=(
+    "$srcdir/build/src/dbus-broker"
+    "$srcdir/build/src/dbus-broker-launch"
+  )
+
+  for binary in "${binaries[@]}"; do
+    if [ -f "$binary.orig" ]; then
+      cp "$binary.orig" "$binary"
+    fi
+  done
+
+  # Install all files normally (using original binaries)
   meson install -C build --destdir "$pkgdir"
 
-  # Then replace the binary with BOLT-optimized version if it exists
+  # Replace dbus-broker with BOLT-optimized version if it exists, otherwise use original
   if [ -f "$srcdir/build/bolt/dbus-broker.bolt" ]; then
-    install -Dm755 "$srcdir/build/bolt/dbus-broker.bolt" "$pkgdir"/usr/bin/dbus-broker
+    install -Dm755 "$srcdir/build/bolt/dbus-broker.bolt" "$pkgdir/usr/bin/dbus-broker"
+    echo "Installed BOLT-optimized dbus-broker"
+  else
+    echo "Warning: BOLT-optimized dbus-broker not found. Using original binary."
+    install -Dm755 "$srcdir/build/src/dbus-broker" "$pkgdir/usr/bin/dbus-broker"
   fi
 
-  # Then replace the binary with BOLT-optimized version if it exists
+  # Replace dbus-broker-launch with BOLT-optimized version if it exists, otherwise use original
   if [ -f "$srcdir/build/bolt/dbus-broker-launch.bolt" ]; then
-    install -Dm755 "$srcdir/build/bolt/dbus-broker-launch.bolt" "$pkgdir"/usr/bin/dbus-broker-launch
+    install -Dm755 "$srcdir/build/bolt/dbus-broker-launch.bolt" "$pkgdir/usr/bin/dbus-broker-launch"
+    echo "Installed BOLT-optimized dbus-broker-launch"
+  else
+    echo "Warning: BOLT-optimized dbus-broker-launch not found. Using original binary."
+    install -Dm755 "$srcdir/build/src/dbus-broker-launch" "$pkgdir/usr/bin/dbus-broker-launch"
   fi
 
   # Use LLVM strip
@@ -388,7 +496,7 @@ package_dbus-broker-git() {
 
 package_dbus-broker-units-git() {
   pkgdesc+=" - Service units"
-  depends=("dbus-broker")
+  depends=("dbus-broker-git")
   provides=(
     "dbus-broker-units"
     "dbus-units"
