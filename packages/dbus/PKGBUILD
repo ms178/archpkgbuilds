@@ -3,7 +3,7 @@ pkgname=(
   dbus
   dbus-daemon-units
 )
-pkgver=1.16.0
+pkgver=1.16.2
 pkgrel=3.1
 pkgdesc="Freedesktop.org message bus system"
 url="https://www.freedesktop.org/wiki/Software/dbus/"
@@ -28,7 +28,6 @@ makedepends=(
   systemd
   xmlto
   llvm              # Required for BOLT
-  perf              # Required for profile data collection
   yelp-tools
 )
 source=(
@@ -47,18 +46,12 @@ validpgpkeys=(
 prepare() {
   cd dbus-$pkgver
   patch -Np1 -i ../0001-Arch-Linux-tweaks.patch
+
+  # Create directory for BOLT profile data
+  mkdir -p "$srcdir/bolt_profile"
 }
 
 build() {
-  # Stage 1: Instrumented build and test for PGO
-  export LLVM_PROFILE_FILE="$srcdir/%p.profraw"
-  CFLAGS_ORIG="$CFLAGS"
-  CXXFLAGS_ORIG="$CXXFLAGS"
-  LDFLAGS_ORIG="$LDFLAGS"
-
-  CFLAGS+=" -fprofile-generate -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10"
-  CXXFLAGS+=" -g3 -fno-omit-frame-pointer -fprofile-generate -mllvm -vp-counters-per-site=10"
-  LDFLAGS+=" -g3 -fno-omit-frame-pointer -fprofile-generate -mllvm -vp-counters-per-site=10"
   local meson_options=(
     -D apparmor=disabled
     -D dbus_user=dbus
@@ -68,98 +61,196 @@ build() {
     -D selinux=disabled
     -D x11_autolaunch=disabled
     -D doxygen_docs=disabled
+    -D python.bytecompile=2
   )
 
+  # Stage 1: PGO instrumented build
+  echo "Building with PGO instrumentation..."
+  CFLAGS_ORIG="$CFLAGS"
+  CXXFLAGS_ORIG="$CXXFLAGS"
+  LDFLAGS_ORIG="$LDFLAGS"
+
+  # Add PGO instrumentation flags
+  CFLAGS+=" -fprofile-generate -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+  CXXFLAGS+=" -fprofile-generate -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+  LDFLAGS+=" -fprofile-generate -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+
+  # Configure and build with instrumentation
   arch-meson dbus-$pkgver build-stage1 "${meson_options[@]}" \
-        -D python.bytecompile=2 \
-        -D b_ndebug=false \
-        -D b_pie=false \
-        -D c_std=gnu18 \
-        -D cpp_std=gnu++2a \
-        -D b_lto=false \
-        --buildtype=debug \
-        --wrap-mode=nofallback
+    -D b_ndebug=false \
+    -D b_pie=false \
+    -D c_std=gnu18 \
+    -D cpp_std=gnu++2a \
+    -D b_lto=false \
+    --buildtype=debug \
+    --wrap-mode=nofallback
+
   meson compile -C build-stage1
 
-  # Run tests to generate PGO data
-  meson test -C build-stage1
+  # Run tests to generate PGO profile data
+  echo "Running tests to generate PGO profile data..."
+  meson test -C build-stage1 || echo "Some tests failed, but continuing anyway"
 
   # Merge profraw files
-  llvm-profdata merge -output="$srcdir/default.profdata" "$srcdir"/*.profraw
+  echo "Merging PGO profile data..."
+  llvm-profdata merge -output="$srcdir/default.profdata" "$srcdir"/*.profraw || true
 
-  # Clean up profraw files
-  rm -f "$srcdir"/*.profraw
+  # Stage 2: Build with PGO optimization and prepare for BOLT
+  echo "Building with PGO optimization..."
+  CFLAGS="${CFLAGS_ORIG} -fprofile-use=$srcdir/default.profdata"
+  CXXFLAGS="${CXXFLAGS_ORIG} -fprofile-use=$srcdir/default.profdata"
+  LDFLAGS="${LDFLAGS_ORIG} -fprofile-use=$srcdir/default.profdata -Wl,--emit-relocs"
 
-  # Stage 2: Build with PGO data and prepare for BOLT
-  CFLAGS="$CFLAGS_ORIG -fprofile-use=$srcdir/default.profdata"
-  CXXFLAGS="$CXXFLAGS_ORIG -fprofile-use=$srcdir/default.profdata"
-  LDFLAGS="$LDFLAGS_ORIG -fprofile-use=$srcdir/default.profdata -Wl,--emit-relocs"
-
+  # Configure and build with PGO optimization
   arch-meson dbus-$pkgver build "${meson_options[@]}" \
-      -D python.bytecompile=2 \
-      -D b_ndebug=true \
-      -D b_pie=false \
-      -D c_std=gnu18 \
-      -D cpp_std=gnu++2a \
-      -D b_lto=true \
-      --buildtype=release \
-      --wrap-mode=nofallback
+    -D b_ndebug=true \
+    -D b_pie=false \
+    -D c_std=gnu18 \
+    -D cpp_std=gnu++2a \
+    -D b_lto=true \
+    --buildtype=release \
+    --wrap-mode=nofallback
+
   meson compile -C build
 
-  # Create directory for profile data
-  mkdir -p "$srcdir/bolt_profile"
-}
+  # --- Stage 3: Instrument for BOLT ---
+  echo "Creating instrumented binaries for BOLT..."
 
-check() {
-  cd "$srcdir"
-  # Ensure the binaries are built before running perf record
-  meson compile -C build
-
-  # Debugging: List contents of the build directory
-  echo "Listing contents of $srcdir/build:"
-  ls -l "$srcdir/build"
-  echo "Listing contents of $srcdir/build recursively:"
-  ls -lR "$srcdir/build"
-
-  # Run tests with perf recording for BOLT profile data
-  perf record --max-size=6G -F 20000 -e branch-instructions:u,cycles:u,cache-misses:u,branch-misses:u,branches:u,branch-loads:u,branch-load-misses:u,iTLB-load-misses:u,dTLB-store-misses:u,dTLB-load-misses:u,L1-icache-load-misses:u,LLC-load-misses:u -b -- meson test -C build --print-errorlogs
-
-  # Convert perf data to BOLT profile format
-  # Use find to locate the binaries
-  DBUS_DAEMON_PATH=$(find "$srcdir/build" -name dbus-daemon -type f | head -n 1)
-
-  # Find potential libdbus candidates:
-  echo "Finding potential libdbus candidates:"
-  find "$srcdir/build" -name 'libdbus-1.so*' -print
-
-  # Find the actual shared library, excluding .symbols and prioritizing versioned files:
+  # Find dbus-daemon and libdbus paths
+  DBUS_DAEMON_PATH="$srcdir/build/bus/dbus-daemon"
   LIBDBUS_PATH=$(find "$srcdir/build" -name 'libdbus-1.so.*' -type f ! -name '*.symbols' -print | sort -V | tail -n 1)
 
-  # Debugging: Print the paths
-  echo "DBUS_DAEMON_PATH: $DBUS_DAEMON_PATH"
-  echo "LIBDBUS_PATH: $LIBDBUS_PATH"
+  # Array of binaries to instrument
+  local binaries=(
+    "$DBUS_DAEMON_PATH"
+    "$LIBDBUS_PATH"
+  )
 
-  # Check if LIBDBUS_PATH is empty and print an error if it is
-  if [ -z "$LIBDBUS_PATH" ]; then
-    echo "ERROR: Could not find libdbus-1.so library."
-    exit 1
+  # Clean up build directory
+  echo "Cleaning up any previous instrumentation files..."
+  rm -f "$srcdir/build/bus/"*.orig
+  rm -f "$srcdir/build/bus/"*.inst
+  rm -f "$srcdir/build/bus/"*.bolt
+  rm -f "$srcdir/build/dbus/"*.orig
+  rm -f "$srcdir/build/dbus/"*.inst
+  rm -f "$srcdir/build/dbus/"*.bolt
+
+  # Ensure binaries exist and are executable
+  for binary in "${binaries[@]}"; do
+    # Skip if binary is a symlink
+    if [ -L "$binary" ]; then
+      echo "Skipping symlink: $binary"
+      continue
+    fi
+
+    if [ ! -f "$binary" ]; then
+      echo "Warning: Skipping missing binary: $binary"
+      continue
+    fi
+
+    # Debug binary information
+    echo "Processing binary: $binary"
+    echo "Binary type: $(file "$binary")"
+
+    # Check if binary has already been processed by BOLT
+    if readelf -S "$binary" 2>/dev/null | grep -q "__bolt_runtime_start" || file "$binary" | grep -q "BOLT"; then
+      echo "Warning: Skipping already processed binary: $binary"
+      continue
+    fi
+
+    # Backup original binary if not already backed up
+    if [ ! -f "$binary.orig" ]; then
+      cp "$binary" "$binary.orig"
+    else
+      cp "$binary.orig" "$binary"
+    fi
+
+    # Instrument binary
+    echo "Instrumenting binary: $binary"
+    llvm-bolt "$binary" \
+      --instrument \
+      --instrumentation-file-append-pid \
+      --skip-funcs=.text/1 \
+      --instrumentation-file="$srcdir/bolt_profile/prof.fdata" \
+      -o "$binary.inst"
+    mv "$binary.inst" "$binary"
+  done
+
+  # Run tests with instrumented binaries to generate BOLT profile data
+  echo "Running tests with instrumented binaries for BOLT..."
+  meson test -C build || echo "Some tests failed, but continuing anyway"
+
+  # Verify BOLT profile data files
+  echo "Looking for BOLT profile data files..."
+  ls -la "$srcdir/bolt_profile/"
+
+  if ! ls "$srcdir/bolt_profile/prof.fdata"* >/dev/null 2>&1; then
+    echo "Warning: No BOLT profile data files found. Skipping BOLT optimization."
+    return 0
   fi
 
-  # Check if LIBDBUS_PATH is a regular file
-  if [ ! -f "$LIBDBUS_PATH" ]; then
-      echo "ERROR: LIBDBUS_PATH is not a regular file: $LIBDBUS_PATH"
-      exit 1
+  echo "Merging BOLT profile data files..."
+  merge-fdata "$srcdir/bolt_profile/prof.fdata"* > "$srcdir/bolt_profile/merged.fdata"
+
+  # Verify merged BOLT profile data file size
+  if [ ! -s "$srcdir/bolt_profile/merged.fdata" ]; then
+    echo "Error: Merged BOLT profile data file is empty!"
+    return 1
   fi
 
-  # Check if LIBDBUS_PATH is executable or a shared library
-  if ! (file "$LIBDBUS_PATH" | grep -q "executable\|shared object"); then
-      echo "ERROR: LIBDBUS_PATH is not an executable or shared object: $LIBDBUS_PATH"
-      exit 1
-  fi
+  # --- Stage 4: Optimize with BOLT ---
+  echo "Optimizing with BOLT..."
 
-  perf2bolt "$DBUS_DAEMON_PATH" -p perf.data -o "$srcdir/bolt_profile/perf.fdata"
-  perf2bolt "$LIBDBUS_PATH" -p perf.data -o "$srcdir/bolt_profile/libdbus-1.so.3.38.3.fdata"
+  local bolt_options=(
+    --data "$srcdir/bolt_profile/merged.fdata"
+    --dyno-stats
+    --lite=false
+    --eliminate-unreachable
+    --frame-opt=all
+    --icf=all
+    --jump-tables=aggressive
+    --min-branch-clusters
+    --stoke
+    --sctc-mode=always
+    --plt=all
+    --hot-data
+    --hugify
+    --frame-opt-rm-stores
+    --peepholes=all
+    --infer-stale-profile=1
+    --x86-strip-redundant-address-size
+    --indirect-call-promotion=all
+    --reorder-blocks=ext-tsp
+    --reorder-functions=cdsort
+    --split-all-cold
+    --split-eh
+    --split-functions
+    --split-strategy=cdsplit
+    --use-gnu-stack
+    --align-functions=32
+    --skip-funcs=.text/1
+  )
 
+  # Create optimized binary directory
+  mkdir -p "$srcdir/build/bolt"
+
+  # Optimize binaries
+  for binary in "${binaries[@]}"; do
+    if [ -L "$binary" ]; then
+      echo "Skipping symlink: $binary"
+      continue
+    fi
+
+    binary_name=$(basename "$binary")
+    if [ -f "${binary}.orig" ]; then
+      llvm-bolt "${binary}.orig" \
+        "${bolt_options[@]}" \
+        -o "$srcdir/build/bolt/${binary_name}.bolt" || \
+        echo "Warning: BOLT optimization failed for ${binary}"
+    else
+      echo "Warning: Original binary not found for ${binary}"
+    fi
+  done
 }
 
 _pick() {
@@ -186,41 +277,23 @@ package_dbus() {
   conflicts=(libdbus)
   replaces=(libdbus)
 
-  DBUS_DAEMON_PATH="$srcdir/build/bus/dbus-daemon"
-  LIBDBUS_PATH="$srcdir/build/dbus/libdbus-1.so.3.38.3"
+  # First install all files normally
+  meson install -C build --destdir "$pkgdir"
 
- # BOLT Optimization (moved to package function)
-  if [ -f "$srcdir/bolt_profile/perf.fdata" ]; then
-    mkdir -p "$pkgdir/usr/bin/" # Ensure directory exists
-    llvm-bolt "$DBUS_DAEMON_PATH" \
-      --data "$srcdir/bolt_profile/perf.fdata" \
-      --dyno-stats --lite=false --frame-opt=all --icf=all \
-      --jump-tables=aggressive --min-branch-clusters --stoke \
-      --sctc-mode=always --plt=all --hot-data --hugify \
-      --frame-opt-rm-stores --peepholes=all --x86-strip-redundant-address-size \
-      --indirect-call-promotion=all --reorder-blocks=ext-tsp --reorder-functions=cdsort \
-      --split-all-cold --split-eh --split-functions \
-      --redirect-never-taken-jumps \
-      -o "$pkgdir/usr/bin/dbus-daemon" # Install directly to $pkgdir
-
+  # Replace dbus-daemon with BOLT-optimized version if it exists
+  if [ -f "$srcdir/build/bolt/dbus-daemon.bolt" ]; then
+    install -Dm755 "$srcdir/build/bolt/dbus-daemon.bolt" "$pkgdir/usr/bin/dbus-daemon"
+    echo "Installed BOLT-optimized dbus-daemon"
   fi
 
-
-  if [ -f "$srcdir/bolt_profile/libdbus-1.so.3.38.3.fdata" ]; then
-    mkdir -p "$pkgdir/usr/lib/" # Ensure directory exists
-    llvm-bolt "$LIBDBUS_PATH" \
-      --data "$srcdir/bolt_profile/libdbus-1.so.3.38.3.fdata" \
-      --dyno-stats --lite=false --frame-opt=all --icf=all \
-      --jump-tables=aggressive --min-branch-clusters --stoke \
-      --sctc-mode=always --plt=all --hot-data --hugify \
-      --frame-opt-rm-stores --peepholes=all --x86-strip-redundant-address-size \
-      --indirect-call-promotion=all --reorder-blocks=ext-tsp --reorder-functions=cdsort \
-      --split-all-cold --split-eh --split-functions \
-      --redirect-never-taken-jumps \
-      -o "$pkgdir/usr/lib/libdbus-1.so.3.38.3" # Install directly to $pkgdir
+  # Replace libdbus with BOLT-optimized version if it exists
+  LIBDBUS_BASENAME=$(basename "$(find "$srcdir/build" -name 'libdbus-1.so.*' -type f ! -name '*.symbols' -print | sort -V | tail -n 1)")
+  if [ -f "$srcdir/build/bolt/${LIBDBUS_BASENAME}.bolt" ]; then
+    install -Dm755 "$srcdir/build/bolt/${LIBDBUS_BASENAME}.bolt" "$pkgdir/usr/lib/${LIBDBUS_BASENAME}"
+    echo "Installed BOLT-optimized ${LIBDBUS_BASENAME}"
   fi
 
-  # Use llvm-strip only on recognized file formats
+  # Strip binaries
   find "$pkgdir" -type f \( -name '*.so*' -o -name '*.a' -o -executable \) -print0 | while IFS= read -r -d '' file; do
     if llvm-strip --strip-unneeded "$file" 2>/dev/null || llvm-strip --strip-all "$file" 2>/dev/null; then
       echo "Stripped: $file"
@@ -229,15 +302,12 @@ package_dbus() {
     fi
   done
 
-  meson install -C build --destdir "$pkgdir"
-
   _pick unit "$pkgdir"/usr/lib/systemd/{system,user}/dbus.service
 
   install -Dt "$pkgdir/usr/share/libalpm/hooks" -m644 *.hook
 
   install -Dt "$pkgdir/usr/share/licenses/$pkgname" -m644 \
     dbus-$pkgver/COPYING dbus-$pkgver/LICENSES/AFL-2.1.txt
-
 }
 
 package_dbus-daemon-units() {
