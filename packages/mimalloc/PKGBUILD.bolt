@@ -1,6 +1,6 @@
 pkgname=mimalloc
 pkgver=2.1.9
-pkgrel=5.1
+pkgrel=6.1
 pkgdesc='General-purpose allocator with excellent performance characteristics'
 arch=('x86_64')
 url='https://github.com/microsoft/mimalloc'
@@ -19,11 +19,14 @@ pkgver() {
 build() {
   cd "$pkgname"
 
-  # Setup cleanup trap
+  # Setup cleanup trap (exclude $srcdir/cspgo to preserve cs.profdata)
   trap 'rm -rf "$srcdir/pgo" "$srcdir/bolt_profile"' EXIT
 
   # Create directory for PGO profiles
   mkdir -p "$srcdir/pgo"
+
+  # Create directory for CS-PGO profiles
+  mkdir -p "$srcdir/cspgo"
 
   # Create directory for BOLT profile data
   mkdir -p "$srcdir/bolt_profile"
@@ -37,7 +40,7 @@ build() {
   )
 
   # --- Stage 1: Build with PGO instrumentation ---
-  local _pgo_instrument_flags=" -fprofile-generate=$srcdir/pgo -mllvm -vp-counters-per-site=10 -g3 -fno-omit-frame-pointer"
+  local _pgo_instrument_flags=" -fprofile-generate=$srcdir/pgo -mllvm -vp-counters-per-site=10 -g3 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling -fno-omit-frame-pointer"
   local _original_cflags="$CFLAGS"
   local _original_cxxflags="$CXXFLAGS"
   local _original_ldflags="$LDFLAGS"
@@ -68,14 +71,43 @@ build() {
   echo "Merging PGO profiles..."
   llvm-profdata merge -output="$srcdir/pgo/default.profdata" "$srcdir"/pgo/*.profraw
 
-  # --- Stage 2: Build with PGO data ---
-  CFLAGS="$_original_cflags -fprofile-use=$srcdir/pgo/default.profdata"
-  CXXFLAGS="$_original_cxxflags -fprofile-use=$srcdir/pgo/default.profdata"
-  LDFLAGS="$_original_ldflags -fprofile-use=$srcdir/pgo/default.profdata -Wl,--emit-relocs"
+  # --- Stage 2: Build with CS-PGO instrumentation ---
+  local _cspgo_instrument_flags=" -fprofile-use=$srcdir/pgo/default.profdata -fcs-profile-generate=$srcdir/cspgo -mllvm -vp-counters-per-site=10 -g3 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling -fno-omit-frame-pointer"
+  CFLAGS="$_original_cflags $_cspgo_instrument_flags"
+  CXXFLAGS="$_original_cxxflags $_cspgo_instrument_flags"
+  LDFLAGS="$_original_ldflags $_cspgo_instrument_flags"
 
-  echo "CFLAGS for PGO optimization: $CFLAGS"
-  echo "CXXFLAGS for PGO optimization: $CXXFLAGS"
-  echo "LDFLAGS for PGO optimization: $LDFLAGS"
+  echo "CFLAGS for CS-PGO instrumentation: $CFLAGS"
+  echo "CXXFLAGS for CS-PGO instrumentation: $CXXFLAGS"
+  echo "LDFLAGS for CS-PGO instrumentation: $LDFLAGS"
+
+  cmake \
+    -B build-stage2 \
+    -G Ninja \
+    -D CMAKE_BUILD_TYPE=None \
+    "${_common_cmake_options[@]}"
+
+  ninja -C build-stage2
+
+  # Run tests to generate CS-PGO profile data
+  echo "Running tests to generate CS-PGO profile data..."
+  cd build-stage2
+  export LD_LIBRARY_PATH="$PWD:$LD_LIBRARY_PATH"
+  ctest --output-on-failure -j$(nproc)
+  cd ..
+
+  # Merge CS-PGO profiles with PGO profiles
+  echo "Merging CS-PGO profiles with PGO profiles..."
+  llvm-profdata merge -output="$srcdir/cspgo/cs.profdata" "$srcdir/cspgo"/*.profraw "$srcdir/pgo/default.profdata"
+
+  # --- Stage 3: Build with merged CS-PGO data ---
+  CFLAGS="$_original_cflags -fprofile-use=$srcdir/cspgo/cs.profdata"
+  CXXFLAGS="$_original_cxxflags -fprofile-use=$srcdir/cspgo/cs.profdata"
+  LDFLAGS="$_original_ldflags -fprofile-use=$srcdir/cspgo/cs.profdata -Wl,--emit-relocs"
+
+  echo "CFLAGS for CS-PGO optimization: $CFLAGS"
+  echo "CXXFLAGS for CS-PGO optimization: $CXXFLAGS"
+  echo "LDFLAGS for CS-PGO optimization: $LDFLAGS"
 
   cmake \
     -B build-pgo \
@@ -85,7 +117,7 @@ build() {
 
   ninja -C build-pgo
 
-  # --- Stage 3 & 4: BOLT Instrumentation and Optimization ---
+  # --- Stage 4 & 5: BOLT Instrumentation and Optimization ---
   echo "Starting BOLT instrumentation and optimization..."
 
   local shared_libs=(
@@ -94,8 +126,8 @@ build() {
 
   for lib in "${shared_libs[@]}"; do
     if [ -f "$lib" ]; then
-      # Backup original PGO-optimized library
-      cp "$lib" "$lib.pgo"
+      # Backup original CS-PGO-optimized library
+      cp "$lib" "$lib.cspgo"
 
       # --- Instrument for BOLT ---
       echo "Instrumenting $lib for BOLT..."
@@ -122,38 +154,35 @@ build() {
       # --- Optimize with BOLT ---
       echo "Optimizing $lib with BOLT..."
       local bolt_options=(
-    --data "$srcdir/bolt_profile/merged.fdata"
-    --dyno-stats
-    --lite=false
-    --cu-processing-batch-size=64
-    --eliminate-unreachable
-    --frame-opt=all
-    --icf=all
-    --jump-tables=aggressive
-    --min-branch-clusters
-    --stoke
-    --sctc-mode=always
-    --plt=all
-    --hot-data
-    --hugify
-    --frame-opt-rm-stores
-    --peepholes=all
-    --infer-stale-profile=1
-    --x86-strip-redundant-address-size
-    --indirect-call-promotion=all
-    --reg-reassign
-    --use-aggr-reg-reassign
-    --reorder-blocks=ext-tsp
-    --reorder-functions=cdsort
-    --split-all-cold
-    --split-eh
-    --split-functions
-    --split-strategy=cdsplit
-  )
+        --data "$srcdir/bolt_profile/merged.fdata"
+        --dyno-stats
+        --lite=false
+        --frame-opt=all
+        --icf=all
+        --jump-tables=aggressive
+        --min-branch-clusters
+        --stoke
+        --sctc-mode=always
+        --plt=all
+        --hot-data
+        --hugify
+        --frame-opt-rm-stores
+        --peepholes=all
+        --infer-stale-profile=1
+        --x86-strip-redundant-address-size
+        --indirect-call-promotion=all
+        --reg-reassign
+        --use-aggr-reg-reassign
+        --reorder-blocks=ext-tsp
+        --reorder-functions=cdsort
+        --split-all-cold
+        --split-eh
+        --split-functions
+      )
 
-      if ! llvm-bolt "$lib.pgo" "${bolt_options[@]}" -o "$lib.bolt"; then
-        echo "Warning: BOLT optimization failed for $lib, using PGO-only version"
-        cp "$lib.pgo" "$lib.bolt"
+      if ! llvm-bolt "$lib.cspgo" "${bolt_options[@]}" -o "$lib.bolt"; then
+        echo "Warning: BOLT optimization failed for $lib, using CS-PGO-only version"
+        cp "$lib.cspgo" "$lib.bolt"
       fi
 
       # --- Replace original with optimized library ---
