@@ -1,9 +1,5 @@
-# Maintainer: Xuanrui Qi <me@xuanruiqi.com>
-# Contributor: Antonin Décimo <antonin dot decimo at gmail dot com>
-# Contributor: AndyRTR <andyrtr@archlinux.org>
-
 pkgname=xorg-xwayland-git
-pkgver=24.1.0.r137.gaf6180b2c
+pkgver=24.1.6.r846.g68054d0fe
 pkgrel=1
 arch=('x86_64')
 license=(
@@ -31,11 +27,9 @@ depends=('nettle' 'libepoxy' 'systemd-libs' 'libxfont2'
          'libei' 'libxshmfence' 'glibc')
 makedepends=('meson' 'xorgproto' 'xtrans' 'libxkbfile' 'dbus'
              'xorg-font-util' 'wayland-protocols' 'mesa-libgl'
-             'systemd' 'git')
+             'systemd' 'git' 'clang' 'llvm' 'weston' 'glxgears' 'mesa-demos')
 source=("xserver::git+https://gitlab.freedesktop.org/xorg/xserver.git"
-
 1567.patch
-
 )
 sha256sums=('SKIP')
 
@@ -53,7 +47,6 @@ pkgver() {
 }
 
 prepare() {
-
     local src
     for src in "${source[@]}"; do
         src="${src%%::*}"
@@ -65,6 +58,346 @@ prepare() {
 }
 
 build() {
+  # PGO instrumentation flags
+  local _common_instrument_flags=" -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+
+  # Create directories for profiles
+  mkdir -p "${srcdir}/pgo_profiles" "${srcdir}/cs_pgo_profiles"
+
+  ##################################################
+  # STEP 1: Build with standard PGO instrumentation
+  ##################################################
+  echo "Building xorg-xwayland with standard PGO instrumentation..."
+
+  export CC="clang"
+  export CXX="clang++"
+  export CFLAGS="${CFLAGS} -fprofile-generate=${srcdir}/pgo_profiles ${_common_instrument_flags}"
+  export CXXFLAGS="${CXXFLAGS} -fprofile-generate=${srcdir}/pgo_profiles ${_common_instrument_flags}"
+  export LDFLAGS="${LDFLAGS} -fprofile-generate=${srcdir}/pgo_profiles"
+
+  # Configure with Meson
+  arch-meson xserver build-pgo \
+      -D b_ndebug=true \
+      -D b_pie=false \
+      -D c_std=gnu2x \
+      -D cpp_std=gnu++2a \
+      -D b_lto=false \
+      --buildtype=debug \
+      --wrap-mode=nofallback \
+    -D ipv6=true \
+    -D xvfb=false \
+    -D xnest=false \
+    -D xdmcp=false \
+    -D xcsecurity=true \
+    -D xorg=false \
+    -D xephyr=false \
+    -D xwayland=true \
+    -D xwin=false \
+    -D xquartz=false \
+    -D dri3=true \
+    -D glamor=true \
+    -D xkb_dir=/usr/share/X11/xkb \
+    -D xkb_output_dir=/var/lib/xkb
+
+  # Build instrumented binary
+  ninja -C build-pgo
+
+  # Install to temporary location
+  DESTDIR="${srcdir}/temp_install" ninja -C build-pgo install
+
+  ##################################################
+  # STEP 2: Create script to run workload
+  ##################################################
+  echo "Creating script to run workload for profiling..."
+
+cat > "${srcdir}/run_workload.sh" << 'EOF'
+#!/bin/bash
+set -e
+
+# Get directory and binary path
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+XWAYLAND_BIN="${SCRIPT_DIR}/temp_install/usr/bin/Xwayland"
+
+# Verify binary exists
+if [ ! -f "$XWAYLAND_BIN" ]; then
+  echo "Error: Xwayland binary not found!"
+  exit 1
+fi
+
+# Setup runtime directory
+export XDG_RUNTIME_DIR="$(mktemp -d -p /tmp xwayland-pgo-XXXXXX)"
+chmod 700 "$XDG_RUNTIME_DIR"
+
+echo "=== DIRECT BINARY EXERCISING ==="
+echo "Exercising Xwayland binary with various options to generate profile data..."
+
+# Run with more options to exercise more code paths
+"$XWAYLAND_BIN" -help > /dev/null
+"$XWAYLAND_BIN" -version > /dev/null
+"$XWAYLAND_BIN" -glamor gl -showoptions 2>/dev/null || true
+"$XWAYLAND_BIN" -glamor es -showoptions 2>/dev/null || true
+"$XWAYLAND_BIN" -glamor off -showoptions 2>/dev/null || true
+
+# Test all extensions
+for ext in SHAPE MIT-SHM XTEST SECURITY XINERAMA XFIXES RENDER RANDR COMPOSITE DAMAGE "MIT-SCREEN-SAVER" "DOUBLE-BUFFER" RECORD DPMS "X-Resource" XVideo "XVideo-MotionCompensation" GLX; do
+  "$XWAYLAND_BIN" +extension $ext -showoptions 2>/dev/null || true
+  "$XWAYLAND_BIN" -extension $ext -showoptions 2>/dev/null || true
+done
+
+# More combinations
+"$XWAYLAND_BIN" -ac -noreset -retro -verbose 5 -listen tcp -nolock -showoptions 2>/dev/null || true
+
+echo "=== XVFB TESTING ==="
+# Find an available display
+DISPLAY_NUM=1
+while [ -e "/tmp/.X${DISPLAY_NUM}-lock" ]; do
+  DISPLAY_NUM=$((DISPLAY_NUM + 1))
+done
+
+echo "Starting Xvfb on display :${DISPLAY_NUM}..."
+Xvfb :${DISPLAY_NUM} -screen 0 1280x720x24 -ac +extension GLX +render &
+XVFB_PID=$!
+sleep 3
+
+# Verify server is running
+if ! ps -p $XVFB_PID > /dev/null; then
+  echo "Warning: Xvfb failed to start, trying alternative configuration..."
+  Xvfb :${DISPLAY_NUM} -screen 0 1280x720x24 -ac &
+  XVFB_PID=$!
+  sleep 3
+
+  if ! ps -p $XVFB_PID > /dev/null; then
+    echo "Error: Could not start any X server for testing."
+    rm -rf "$XDG_RUNTIME_DIR"
+    exit 1
+  fi
+fi
+
+# Run extensive X11 tests
+export DISPLAY=:${DISPLAY_NUM}
+export vblank_mode=0
+export __GL_SYNC_TO_VBLANK=0
+
+# Run more intensive GL tests
+if command -v glxgears > /dev/null; then
+  echo "Running glxgears for 30 seconds..."
+  timeout 30 glxgears || true
+  timeout 10 glxgears -info || true
+fi
+
+# Run extensive glxinfo testing
+if command -v glxinfo > /dev/null; then
+  echo "Running comprehensive glxinfo tests..."
+  # Run full glxinfo to exercise all extensions
+  glxinfo -l > /dev/null || true
+  glxinfo -s > /dev/null || true
+  glxinfo -v > /dev/null || true
+  glxinfo -display :${DISPLAY_NUM} -t > /dev/null || true
+  # Query each extension/capability
+  glxinfo -q renderer > /dev/null || true
+  glxinfo -q vendor > /dev/null || true
+  glxinfo -q version > /dev/null || true
+  glxinfo -q extensions > /dev/null || true
+  glxinfo -q limits > /dev/null || true
+  # Test specific visuals
+  for visual in 0x21 0x22 0x23 0x24 0x25 0x26 0x27 0x28; do
+    glxinfo -v -i $visual > /dev/null 2>&1 || true
+  done
+fi
+
+# Run x11perf with more specific tests
+if command -v x11perf > /dev/null; then
+  echo "Running intensive x11perf tests..."
+  # Focus on drawing operations that exercise server-side code
+  x11perf -repeat 5 -times 100 -rect1 > /dev/null 2>&1 || true
+  x11perf -repeat 5 -times 100 -rect10 > /dev/null 2>&1 || true
+  x11perf -repeat 5 -times 100 -rect100 > /dev/null 2>&1 || true
+  x11perf -repeat 5 -times 100 -fillrect1 > /dev/null 2>&1 || true
+  x11perf -repeat 5 -times 100 -fillrect10 > /dev/null 2>&1 || true
+  x11perf -repeat 5 -times 100 -fillrect100 > /dev/null 2>&1 || true
+  x11perf -repeat 5 -times 100 -circle1 > /dev/null 2>&1 || true
+  x11perf -repeat 5 -times 100 -circle10 > /dev/null 2>&1 || true
+  x11perf -repeat 5 -times 100 -circle100 > /dev/null 2>&1 || true
+  x11perf -repeat 5 -times 100 -line1 > /dev/null 2>&1 || true
+  x11perf -repeat 5 -times 100 -line10 > /dev/null 2>&1 || true
+  x11perf -repeat 5 -times 100 -line100 > /dev/null 2>&1 || true
+  # Test text rendering
+  x11perf -repeat 5 -times 20 -text > /dev/null 2>&1 || true
+  x11perf -repeat 5 -times 20 -polytext > /dev/null 2>&1 || true
+  # Test images
+  x11perf -repeat 5 -times 20 -putimage10 > /dev/null 2>&1 || true
+  x11perf -repeat 5 -times 20 -putimage100 > /dev/null 2>&1 || true
+  # Test Copy operations
+  x11perf -repeat 5 -times 20 -copyarea10 > /dev/null 2>&1 || true
+  x11perf -repeat 5 -times 20 -copyarea100 > /dev/null 2>&1 || true
+  # Test window operations
+  x11perf -repeat 5 -times 20 -scroll10 > /dev/null 2>&1 || true
+  x11perf -repeat 5 -times 20 -scroll100 > /dev/null 2>&1 || true
+fi
+
+# Run more X clients
+for app in xeyes xclock xlogo xwininfo xdpyinfo xprop xrandr; do
+  if command -v $app > /dev/null; then
+    echo "Running $app..."
+    ( $app ) > /dev/null 2>&1 &
+    APP_PID=$!
+    sleep 5
+    kill $APP_PID 2>/dev/null || true
+    wait $APP_PID 2>/dev/null || true
+  fi
+done
+
+# Test window creation extensively
+if command -v xterm > /dev/null; then
+  echo "Testing intensive window creation..."
+  for i in {1..10}; do
+    # Different sizes to exercise window management code
+    xterm -geometry 80x24 -e "exit" > /dev/null 2>&1 &
+    XTERM_PID=$!
+    sleep 1
+    kill $XTERM_PID 2>/dev/null || true
+
+    xterm -geometry 100x30+100+100 -e "exit" > /dev/null 2>&1 &
+    XTERM_PID=$!
+    sleep 1
+    kill $XTERM_PID 2>/dev/null || true
+  done
+fi
+
+# Clean up Xvfb
+echo "Cleaning up..."
+kill $XVFB_PID 2>/dev/null || true
+sleep 2
+kill -9 $XVFB_PID 2>/dev/null || true
+
+echo "Workload completed successfully"
+rm -rf "$XDG_RUNTIME_DIR"
+EOF
+
+chmod +x "${srcdir}/run_workload.sh"
+
+  ##################################################
+  # STEP 3: Run workload to generate profile data
+  ##################################################
+  echo "Running workload to generate PGO profiles..."
+
+  # Set profile output location
+  export LLVM_PROFILE_FILE="${srcdir}/pgo_profiles/xwayland-%m.profraw"
+
+  # Run the benchmark
+  "${srcdir}/run_workload.sh"
+
+  # Check if profiles were generated
+  echo "Checking for standard PGO profiles:"
+  find "${srcdir}/pgo_profiles" -type f -name "*.profraw" | xargs ls -lh || echo "No profiles found"
+
+  # Merge the profiles
+  echo "Merging standard PGO profiles..."
+  llvm-profdata merge -output="${srcdir}/xwayland.profdata" "${srcdir}/pgo_profiles"/*.profraw
+
+  ##################################################
+  # STEP 4: Build with context-sensitive PGO
+  ##################################################
+  echo "Building xorg-xwayland with context-sensitive PGO..."
+
+  # Update compiler flags
+  export CFLAGS="${CFLAGS/-fprofile-generate=*/} -fprofile-use=${srcdir}/xwayland.profdata -fcs-profile-generate=${srcdir}/cs_pgo_profiles ${_common_instrument_flags}"
+  export CXXFLAGS="${CXXFLAGS/-fprofile-generate=*/} -fprofile-use=${srcdir}/xwayland.profdata -fcs-profile-generate=${srcdir}/cs_pgo_profiles ${_common_instrument_flags}"
+  export LDFLAGS="${LDFLAGS/-fprofile-generate=*/} -fprofile-use=${srcdir}/xwayland.profdata -fcs-profile-generate=${srcdir}/cs_pgo_profiles ${_common_instrument_flags}"
+
+  # Configure with Meson
+  arch-meson xserver build-cs-pgo \
+      -D b_ndebug=true \
+      -D b_pie=false \
+      -D c_std=gnu2x \
+      -D cpp_std=gnu++2a \
+      -D b_lto=false \
+      --buildtype=debug \
+      --wrap-mode=nofallback \
+    -D ipv6=true \
+    -D xvfb=false \
+    -D xnest=false \
+    -D xdmcp=false \
+    -D xcsecurity=true \
+    -D xorg=false \
+    -D xephyr=false \
+    -D xwayland=true \
+    -D xwin=false \
+    -D xquartz=false \
+    -D dri3=true \
+    -D glamor=true \
+    -D xkb_dir=/usr/share/X11/xkb \
+    -D xkb_output_dir=/var/lib/xkb
+
+  # Build CS instrumented binary
+  ninja -C build-cs-pgo
+
+  # Update the temporary installation
+  rm -rf "${srcdir}/temp_install"
+  DESTDIR="${srcdir}/temp_install" ninja -C build-cs-pgo install
+
+  ##################################################
+  # STEP 5: Run workload again for CS-PGO profiles
+  ##################################################
+  echo "Running workload to generate CS-PGO profiles..."
+
+  # Update profile output location
+  export LLVM_PROFILE_FILE="${srcdir}/cs_pgo_profiles/xwayland-cs-%m.profraw"
+
+  # Run the benchmark
+  "${srcdir}/run_workload.sh"
+
+  # Check if CS profiles were generated
+  echo "Checking for context-sensitive PGO profiles:"
+  find "${srcdir}/cs_pgo_profiles" -type f -name "*.profraw" | xargs ls -lh || echo "No CS profiles found"
+
+  # Merge CS profiles with standard profiles
+  echo "Merging standard and context-sensitive profiles..."
+  llvm-profdata merge -output="${srcdir}/cs_xwayland.profdata" \
+    "${srcdir}/cs_pgo_profiles"/*.profraw "${srcdir}/xwayland.profdata"
+
+  ##################################################
+  # STEP 6: Build final optimized version
+  ##################################################
+  echo "Building final optimized xorg-xwayland..."
+
+  # Back up original flags
+  ORIG_CFLAGS="$CFLAGS"
+  ORIG_CXXFLAGS="$CXXFLAGS"
+  ORIG_LDFLAGS="$LDFLAGS"
+
+  # Clean up instrumentation flags that could interfere with the build
+  export CFLAGS=$(echo "$ORIG_CFLAGS" | sed -E 's/-fprofile-(generate|use)=[^ ]*//g; s/-fcs-profile-generate=[^ ]*//g; s/-mllvm[[:space:]]+-[^[:space:]]+//g; s/-g3//g; s/-fno-omit-frame-pointer//g')
+  export CXXFLAGS=$(echo "$ORIG_CXXFLAGS" | sed -E 's/-fprofile-(generate|use)=[^ ]*//g; s/-fcs-profile-generate=[^ ]*//g; s/-mllvm[[:space:]]+-[^[:space:]]+//g; s/-g3//g; s/-fno-omit-frame-pointer//g')
+  export LDFLAGS=$(echo "$ORIG_LDFLAGS" | sed -E 's/-fprofile-(generate|use)=[^ ]*//g; s/-fcs-profile-generate=[^ ]*//g; s/-mllvm[[:space:]]+-[^[:space:]]+//g')
+
+  # Add back the profile use flag
+  export CFLAGS="$CFLAGS -fprofile-use=${srcdir}/cs_xwayland.profdata"
+  export CXXFLAGS="$CXXFLAGS -fprofile-use=${srcdir}/cs_xwayland.profdata"
+  export LDFLAGS="$LDFLAGS -fprofile-use=${srcdir}/cs_xwayland.profdata"
+
+  # Check if we have profile data
+  if [ ! -f "${srcdir}/cs_xwayland.profdata" ]; then
+    echo "WARNING: No profile data found at ${srcdir}/cs_xwayland.profdata"
+    echo "Falling back to standard data if available..."
+
+    if [ -f "${srcdir}/xwayland.profdata" ]; then
+      echo "Using standard profile data instead"
+      export CFLAGS="$CFLAGS -fprofile-use=${srcdir}/xwayland.profdata"
+      export CXXFLAGS="$CXXFLAGS -fprofile-use=${srcdir}/xwayland.profdata"
+      export LDFLAGS="$LDFLAGS -fprofile-use=${srcdir}/xwayland.profdata"
+    else
+      echo "WARNING: No profile data available. Building without PGO."
+      export CFLAGS=$(echo "$CFLAGS" | sed -E 's/-fprofile-use=[^ ]*//g')
+      export CXXFLAGS=$(echo "$CXXFLAGS" | sed -E 's/-fprofile-use=[^ ]*//g')
+      export LDFLAGS=$(echo "$LDFLAGS" | sed -E 's/-fprofile-use=[^ ]*//g')
+    fi
+  fi
+
+  # Configure with Meson
+  echo "CFLAGS: $CFLAGS"
+  echo "CXXFLAGS: $CXXFLAGS"
+  echo "LDFLAGS: $LDFLAGS"
 
   arch-meson xserver build \
       -D b_ndebug=true \
@@ -89,6 +422,7 @@ build() {
     -D xkb_dir=/usr/share/X11/xkb \
     -D xkb_output_dir=/var/lib/xkb
 
+  # Build final optimized binary
   ninja -C build
 }
 
