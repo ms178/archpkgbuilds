@@ -1,13 +1,11 @@
-# Maintainer:  Adrian Bacircea <adrian.bacircea@gmail.com>
-
 pkgname=libbpf-git
-pkgver=1.4.0.r113.caa17bd
+pkgver=1.5.0.r61.4c893341
 pkgrel=1
 pkgdesc='BPF library'
 depends=('libelf' 'linux-api-headers>=6.2')
 url='https://github.com/libbpf/libbpf'
 license=('custom')
-makedepends=('rsync')
+makedepends=('rsync' 'clang' 'llvm' 'stress-ng')
 arch=('x86_64')
 provides=('libbpf' libbpf.so=1-64)
 conflicts=('libbpf')
@@ -21,6 +19,366 @@ pkgver() {
 
 build() {
   cd "${srcdir}/${pkgname%-git}/src"
+
+  # Instrumentation flags
+  local _common_instrument_flags=" -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+
+  ############################################################
+  # Build with PGO using a comprehensive benchmark
+  ############################################################
+
+  # First, make a clean build
+  make clean
+  make
+
+  # Copy the library to a location that will be preserved with sudo
+  cp libbpf.so "${srcdir}/libbpf.so"
+
+  # Create a more robust benchmark
+  cat > "${srcdir}/libbpf_benchmark.c" << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <time.h>
+#include <pthread.h>
+#include <errno.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
+#include <linux/bpf.h>
+
+// Parameters for benchmark workload
+#define NUM_MAPS 5  // Reduced for stability
+#define NUM_ELEMENTS 50
+#define NUM_THREADS 4
+#define RUN_TIME_SECONDS 60
+
+// BPF map types to test - using only the most reliable types
+int map_types[] = {
+    BPF_MAP_TYPE_HASH,
+    BPF_MAP_TYPE_ARRAY
+};
+int num_map_types = sizeof(map_types) / sizeof(map_types[0]);
+
+// Array to store created map fds
+int map_fds[NUM_MAPS];
+pthread_mutex_t map_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Time utilities
+time_t end_time;
+volatile int keep_running = 1;
+
+// Signal handler for clean shutdown
+void handle_signal(int sig) {
+    printf("Received signal %d, shutting down...\n", sig);
+    keep_running = 0;
+}
+
+// Function to exercise basic libbpf functionality
+void exercise_libbpf_basic() {
+    int i;
+
+    // Call version functions
+    for (i = 0; i < 1000; i++) {
+        libbpf_major_version();
+        libbpf_minor_version();
+    }
+
+    // Exercise logging functionality
+    libbpf_set_print(NULL);
+    printf("Basic libbpf functions tested\n");
+}
+
+// Function to create different types of maps
+void create_maps() {
+    int i;
+    char map_name[64];
+
+    for (i = 0; i < NUM_MAPS; i++) {
+        int map_type = map_types[i % num_map_types];
+        int key_size = 4; // int key
+        int value_size = 8; // long value
+
+        snprintf(map_name, sizeof(map_name), "benchmark_map_%d", i);
+
+        pthread_mutex_lock(&map_mutex);
+        map_fds[i] = bpf_map_create(map_type, map_name, key_size, value_size, NUM_ELEMENTS, NULL);
+        pthread_mutex_unlock(&map_mutex);
+
+        if (map_fds[i] < 0) {
+            printf("Failed to create map %s (type %d): %s\n",
+                   map_name, map_type, strerror(errno));
+        } else {
+            printf("Created map %s (fd: %d)\n", map_name, map_fds[i]);
+        }
+    }
+}
+
+// Thread-safe map operations
+void exercise_map_operations(int thread_id) {
+    int i, key;
+    int64_t value;
+
+    // Continue until global end time
+    while (time(NULL) < end_time && keep_running) {
+        // Pick a map
+        int map_idx = thread_id % NUM_MAPS; // Assign each thread to a specific map to reduce contention
+        int map_fd;
+
+        pthread_mutex_lock(&map_mutex);
+        map_fd = map_fds[map_idx];
+        pthread_mutex_unlock(&map_mutex);
+
+        if (map_fd < 0) {
+            continue;
+        }
+
+        // Do operations on this map
+        for (i = 0; i < 50 && time(NULL) < end_time && keep_running; i++) {
+            key = (thread_id * 100) + i;
+            value = (thread_id * 1000) + i;
+
+            // Update
+            if (bpf_map_update_elem(map_fd, &key, &value, BPF_ANY) == 0) {
+                // Lookup
+                int64_t result = 0;
+                if (bpf_map_lookup_elem(map_fd, &key, &result) == 0) {
+                    // Verify
+                    if (result != value) {
+                        printf("Thread %d: Value mismatch for key %d: expected %ld, got %ld\n",
+                               thread_id, key, value, result);
+                    }
+
+                    // Delete some entries
+                    if (i % 3 == 0) {
+                        bpf_map_delete_elem(map_fd, &key);
+                    }
+                }
+            }
+        }
+
+        // Brief pause to avoid spinning too hard
+        usleep(1000);
+    }
+}
+
+// Thread function
+void* worker_thread(void* arg) {
+    long thread_id = (long)arg;
+
+    printf("Thread %ld starting\n", thread_id);
+
+    // Each thread exercises map operations
+    exercise_map_operations(thread_id);
+
+    printf("Thread %ld completed\n", thread_id);
+    return NULL;
+}
+
+// Main benchmark function
+int main() {
+    // Set up signal handlers for graceful shutdown
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+
+    // Seed random number generator
+    srand(time(NULL));
+
+    printf("Starting libbpf benchmark\n");
+    printf("libbpf version: %d.%d\n", libbpf_major_version(), libbpf_minor_version());
+
+    // Set end time
+    end_time = time(NULL) + RUN_TIME_SECONDS;
+
+    // Initialize maps
+    memset(map_fds, -1, sizeof(map_fds));
+    create_maps();
+
+    // Check if maps were created
+    int maps_created = 0;
+    for (int i = 0; i < NUM_MAPS; i++) {
+        if (map_fds[i] >= 0) {
+            maps_created++;
+        }
+    }
+
+    if (maps_created == 0) {
+        printf("All maps failed to create. This benchmark requires root privileges.\n");
+        return 1;
+    }
+
+    printf("Successfully created %d out of %d maps\n", maps_created, NUM_MAPS);
+
+    // Exercise basic libbpf functionality
+    exercise_libbpf_basic();
+
+    // Create worker threads
+    pthread_t threads[NUM_THREADS];
+
+    for (long i = 0; i < NUM_THREADS; i++) {
+        int ret = pthread_create(&threads[i], NULL, worker_thread, (void*)i);
+        if (ret != 0) {
+            printf("Failed to create thread %ld: %s\n", i, strerror(ret));
+        } else {
+            printf("Started worker thread %ld\n", i);
+        }
+    }
+
+    // Run stress-ng in a safer way
+    printf("Starting stress-ng for system load...\n");
+    pid_t stress_pid = fork();
+    if (stress_pid == 0) {
+        // Child process - run stress-ng with limited operations
+        execlp("stress-ng", "stress-ng", "--cpu", "2", "--timeout", "60s", NULL);
+        // If exec fails
+        fprintf(stderr, "Failed to start stress-ng: %s\n", strerror(errno));
+        exit(1);
+    }
+
+    // Wait for threads to complete
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    // Clean up - close map file descriptors
+    for (int i = 0; i < NUM_MAPS; i++) {
+        if (map_fds[i] >= 0) {
+            close(map_fds[i]);
+        }
+    }
+
+    printf("Benchmark completed\n");
+    return 0;
+}
+EOF
+
+  # Create a more robust wrapper script
+  cat > "${srcdir}/run_benchmark.sh" << 'EOF'
+#!/bin/bash
+set -e
+
+# Get the directory of this script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+  echo "This benchmark requires root privileges to create BPF maps."
+  echo "Enter your password to continue with sudo:"
+  # Use sudo with preserved environment and pass along the LLVM_PROFILE_FILE
+  exec sudo -E bash -c "cd \"$SCRIPT_DIR\" && LLVM_PROFILE_FILE=\"$LLVM_PROFILE_FILE\" LD_LIBRARY_PATH=\"$SCRIPT_DIR\" \"$SCRIPT_DIR/libbpf_benchmark\""
+  exit $?
+fi
+
+# If we get here, we're running as root
+echo "Running benchmark with root privileges..."
+
+# Make sure LD_LIBRARY_PATH is set to the current directory
+export LD_LIBRARY_PATH="$SCRIPT_DIR"
+
+# Verify the library exists
+if [ ! -f "$SCRIPT_DIR/libbpf.so" ]; then
+  echo "Error: $SCRIPT_DIR/libbpf.so not found!"
+  ls -la "$SCRIPT_DIR"
+  exit 1
+fi
+
+# Verify the benchmark executable exists
+if [ ! -f "$SCRIPT_DIR/libbpf_benchmark" ]; then
+  echo "Error: $SCRIPT_DIR/libbpf_benchmark not found!"
+  ls -la "$SCRIPT_DIR"
+  exit 1
+fi
+
+# Run the benchmark with proper environment
+cd "$SCRIPT_DIR"
+"$SCRIPT_DIR/libbpf_benchmark"
+
+exit $?
+EOF
+
+  # Make the wrapper script executable
+  chmod +x "${srcdir}/run_benchmark.sh"
+
+  # Set up directories for profiles
+  mkdir -p "${srcdir}/pgo_profiles" "${srcdir}/cs_pgo_profiles"
+
+  # Build standard PGO instrumented benchmark
+  echo "Compiling benchmark for standard PGO..."
+  cd "${srcdir}"
+  export LLVM_PROFILE_FILE="${srcdir}/pgo_profiles/libbpf-%m.profraw"
+
+  clang -g -o libbpf_benchmark libbpf_benchmark.c \
+    -I"${srcdir}/${pkgname%-git}/src" \
+    -I"${srcdir}/${pkgname%-git}/include" \
+    -L"${srcdir}" \
+    -lbpf -lelf -lz -lpthread \
+    -fprofile-generate="${srcdir}/pgo_profiles" \
+    ${_common_instrument_flags}
+
+  # Run benchmark with sudo
+  echo "Running benchmark for standard PGO (will ask for sudo password)..."
+  echo "Please enter your password when prompted to enable BPF operations."
+  "${srcdir}/run_benchmark.sh"
+
+  # Check for generated profiles
+  echo "Checking for standard profiles:"
+  find "${srcdir}/pgo_profiles" -type f | xargs ls -lh 2>/dev/null || echo "No profiles found"
+
+  # Merge profiles
+  echo "Merging standard profiles..."
+  llvm-profdata merge -output="${srcdir}/libbpf.profdata" "${srcdir}/pgo_profiles"/*.profraw
+
+  # Build with standard PGO
+  echo "Building libbpf with standard PGO..."
+  cd "${srcdir}/${pkgname%-git}/src"
+  make clean
+  CC=clang \
+  CFLAGS="$CFLAGS -fprofile-use=${srcdir}/libbpf.profdata" \
+  LDFLAGS="$LDFLAGS -fprofile-use=${srcdir}/libbpf.profdata" \
+  make
+
+  # Copy the library again for CS-PGO
+  cp libbpf.so "${srcdir}/libbpf.so"
+
+  # Build context-sensitive PGO instrumented benchmark
+  echo "Compiling benchmark for context-sensitive PGO..."
+  cd "${srcdir}"
+  export LLVM_PROFILE_FILE="${srcdir}/cs_pgo_profiles/libbpf-cs-%m.profraw"
+
+  clang -g -o libbpf_benchmark libbpf_benchmark.c \
+    -I"${srcdir}/${pkgname%-git}/src" \
+    -I"${srcdir}/${pkgname%-git}/include" \
+    -L"${srcdir}" \
+    -lbpf -lelf -lz -lpthread \
+    -fprofile-use="${srcdir}/libbpf.profdata" \
+    -fcs-profile-generate="${srcdir}/cs_pgo_profiles" \
+    ${_common_instrument_flags}
+
+  # Run benchmark with sudo for CS PGO
+  echo "Running benchmark for context-sensitive PGO (will ask for sudo password)..."
+  echo "Please enter your password when prompted to enable BPF operations."
+  "${srcdir}/run_benchmark.sh"
+
+  # Check for CS profiles
+  echo "Checking for context-sensitive profiles:"
+  find "${srcdir}/cs_pgo_profiles" -type f | xargs ls -lh 2>/dev/null || echo "No CS profiles found"
+
+  # Merge CS profiles with standard profiles
+  echo "Merging standard and context-sensitive profiles..."
+  llvm-profdata merge -output="${srcdir}/cs_libbpf.profdata" \
+    "${srcdir}/cs_pgo_profiles"/*.profraw "${srcdir}/libbpf.profdata"
+
+  # Final build with combined profiles
+  echo "Building final optimized libbpf..."
+  cd "${srcdir}/${pkgname%-git}/src"
+  make clean
+  CC=clang \
+  CFLAGS="$CFLAGS -fprofile-use=${srcdir}/cs_libbpf.profdata" \
+  LDFLAGS="$LDFLAGS -fprofile-use=${srcdir}/cs_libbpf.profdata" \
   make
 }
 
