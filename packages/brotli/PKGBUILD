@@ -1,14 +1,8 @@
-# Maintainer: Felix Yan <felixonmars@archlinux.org>
-# Maintainer: Levente Polyak <anthraxx[at]archlinux[dot]org>
-# Contributor: Lex Black <autumn-wind at web dot de>
-# Contributor: TingPing <tingping@tingping.se>
-# Contributor: Guillaume Horel <guillaume.horel@gmail.com>
-
 pkgbase=brotli
 pkgname=('brotli' 'python-brotli')
 _gitcommit=ed738e842d2fbdf2d6459e39267a633c4a9b2f5d
 pkgver=1.1.0
-pkgrel=2.1
+pkgrel=4.3
 pkgdesc='Generic-purpose lossless compression algorithm'
 url='https://github.com/google/brotli'
 arch=('x86_64')
@@ -20,35 +14,293 @@ makedepends=(
   python-build
   python-installer
   python-wheel
+  clang
+  llvm
+  llvm-libs
 )
 source=(${pkgname}::"git+${url}#commit=${_gitcommit}")
-sha512sums=('SKIP')
+sha512sums=('SKIP') # Please generate and add SHA512 checksums here
+
+_common_instrument_flags="-mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
 
 pkgver() {
   cd ${pkgbase}
   git describe --tags --match 'v*' | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
 }
 
-build() {
-  cd ${pkgbase}
-  python -m build --wheel --no-isolation
-  cmake -S . -B build \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_STANDARD=23 \
-    -DCMAKE_CXX_STANDARD=23 \
-    -DBUILD_TESTING=OFF \
-    -DCMAKE_INSTALL_PREFIX=/usr \
-    -DBUILD_SHARED_LIBS=True
-  cmake --build build -v
+prepare() {
+  mkdir -p "$srcdir/pgo-profiles/standard" "$srcdir/pgo-profiles/context-sensitive"
+
+  # Create a comprehensive training workload for PGO
+  cat > "$srcdir/training_workload.cpp" << 'EOF'
+#include <brotli/decode.h>
+#include <brotli/encode.h>
+#include <vector>
+#include <string>
+#include <iostream>
+#include <cstring>
+#include <random>
+#include <chrono>
+#include <cassert>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+
+// Generate random data with different patterns
+std::vector<uint8_t> generate_random_data(size_t size, int pattern_type = 0) {
+  std::vector<uint8_t> data(size);
+  std::random_device rd;
+  std::mt19937 gen(rd());
+
+  // Different pattern types to better represent real-world data
+  switch (pattern_type) {
+    case 0: { // Fully random
+      std::uniform_int_distribution<> dis(0, 255);
+      for (size_t i = 0; i < size; ++i) {
+        data[i] = static_cast<uint8_t>(dis(gen));
+      }
+      break;
+    }
+    case 1: { // Text-like with repeating words
+      std::string words[] = {"the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog", " ", ".", ",", "\n"};
+      std::uniform_int_distribution<> dis(0, 11);
+      size_t pos = 0;
+      while (pos < size) {
+        std::string word = words[dis(gen)];
+        for (size_t i = 0; i < word.length() && pos < size; ++i) {
+          data[pos++] = word[i];
+        }
+      }
+      break;
+    }
+    case 2: { // Binary-like with long repeated sequences
+      std::uniform_int_distribution<> dis(0, 255);
+      std::uniform_int_distribution<> seq_len(1, 100);
+      size_t pos = 0;
+      while (pos < size) {
+        uint8_t value = dis(gen);
+        size_t length = std::min(static_cast<size_t>(seq_len(gen)), size - pos);
+        std::fill_n(data.begin() + pos, length, value);
+        pos += length;
+      }
+      break;
+    }
+  }
+  return data;
 }
 
-#check() {
-#  cd ${pkgbase}
-#  local python_version=$(python -c 'import sys; print("".join(map(str, sys.version_info[:2])))')
-#  PYTHONPATH="$PWD/bin/lib.linux-$CARCH-cpython-${python_version}" python -m unittest discover python "*_test.py"
-#  cd build
-#  ctest --output-on-failure --stop-on-failure -j$(nproc)
-#}
+// Helper for compression
+bool compress_data(const std::vector<uint8_t>& input, std::vector<uint8_t>& output, int quality, int mode) {
+  BrotliEncoderState* state = BrotliEncoderCreateInstance(nullptr, nullptr, nullptr);
+  if (!state) return false;
+
+  BrotliEncoderSetParameter(state, BROTLI_PARAM_QUALITY, quality);
+  BrotliEncoderSetParameter(state, BROTLI_PARAM_MODE, mode);
+
+  size_t available_in = input.size();
+  const uint8_t* next_in = input.data();
+
+  output.resize(BrotliEncoderMaxCompressedSize(input.size()));
+  size_t available_out = output.size();
+  uint8_t* next_out = output.data();
+
+  BROTLI_BOOL result = BrotliEncoderCompressStream(state, BROTLI_OPERATION_FINISH,
+                                          &available_in, &next_in,
+                                          &available_out, &next_out, nullptr);
+
+  BrotliEncoderDestroyInstance(state);
+
+  if (!result) return false;
+
+  output.resize(output.size() - available_out);
+  return true;
+}
+
+// Helper for decompression
+bool decompress_data(const std::vector<uint8_t>& input, std::vector<uint8_t>& output, size_t expected_size) {
+  BrotliDecoderState* state = BrotliDecoderCreateInstance(nullptr, nullptr, nullptr);
+  if (!state) return false;
+
+  output.resize(expected_size);
+
+  size_t available_in = input.size();
+  const uint8_t* next_in = input.data();
+  size_t available_out = output.size();
+  uint8_t* next_out = output.data();
+
+  BrotliDecoderResult result = BrotliDecoderDecompressStream(state, &available_in, &next_in,
+                                                           &available_out, &next_out, nullptr);
+
+  BrotliDecoderDestroyInstance(state);
+
+  return result == BROTLI_DECODER_RESULT_SUCCESS;
+}
+
+int main() {
+  std::cout << "Starting Brotli training workload..." << std::endl;
+
+  // Reduced sizes and iterations
+  const std::vector<size_t> sizes = {
+    512,       // 512B
+    8 * 1024,  // 8KB
+    64 * 1024  // 64KB
+  };
+
+  // Reduced number of patterns
+  const int num_patterns = 2;  // Just random and text-like
+
+  // Just enough to generate profiles without hanging
+  const int iterations_small = 20;
+  const int iterations_medium = 10;
+  const int iterations_large = 5;
+
+  // Limited quality and mode combinations
+  const std::vector<int> qualities = {1, 5, 11};  // Low, medium, high
+  const std::vector<int> modes = {BROTLI_MODE_GENERIC, BROTLI_MODE_TEXT};
+
+  // Test different data patterns
+  for (int pattern = 0; pattern < num_patterns; ++pattern) {
+    std::cout << "Testing pattern " << pattern << std::endl;
+
+    for (auto& size : sizes) {
+      std::cout << "  Size: " << size << " bytes" << std::endl;
+      std::vector<uint8_t> input_data = generate_random_data(size, pattern);
+
+      // Adjust iterations based on size
+      int iterations = (size <= 1024) ? iterations_small :
+                      (size <= 32 * 1024) ? iterations_medium : iterations_large;
+
+      // Test quality and mode combinations
+      for (int quality : qualities) {
+        for (int mode : modes) {
+          std::cout << "    Testing Q" << quality << " M" << mode << " (" << iterations << " iterations)" << std::endl;
+
+          for (int i = 0; i < iterations; ++i) {
+            std::vector<uint8_t> compressed;
+            bool success = compress_data(input_data, compressed, quality, mode);
+            assert(success);
+
+            std::vector<uint8_t> decompressed;
+            success = decompress_data(compressed, decompressed, input_data.size());
+            assert(success);
+
+            if (i == 0) {
+              std::cout << "      Compressed size: " << compressed.size() << " bytes" << std::endl;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Add some simple tests for edge cases
+  std::cout << "Testing edge cases..." << std::endl;
+
+  // Empty input
+  {
+    std::vector<uint8_t> empty;
+    std::vector<uint8_t> compressed;
+    bool success = compress_data(empty, compressed, 5, BROTLI_MODE_GENERIC);
+    assert(success);
+    std::cout << "  Empty input compressed size: " << compressed.size() << " bytes" << std::endl;
+  }
+
+  // 1-byte input
+  {
+    std::vector<uint8_t> one_byte = {42};
+    std::vector<uint8_t> compressed;
+    bool success = compress_data(one_byte, compressed, 5, BROTLI_MODE_GENERIC);
+    assert(success);
+    std::cout << "  1-byte input compressed size: " << compressed.size() << " bytes" << std::endl;
+  }
+
+  std::cout << "Training workload completed successfully." << std::endl;
+  return 0;
+}
+EOF
+}
+
+build() {
+  cd ${pkgbase}
+
+  # Step 1: Standard PGO Instrumentation Build
+  cmake -S . -B build-pgo-standard -G Ninja \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DBUILD_SHARED_LIBS=ON \
+    -DCMAKE_C_COMPILER=clang \
+    -DCMAKE_CXX_COMPILER=clang++ \
+    -DCMAKE_C_FLAGS_INIT="-g3 ${CFLAGS//-fomit-frame-pointer/} ${_common_instrument_flags} -fprofile-generate=$srcdir/pgo-profiles/standard" \
+    -DCMAKE_CXX_FLAGS_INIT="-g3 ${CXXFLAGS//-fomit-frame-pointer/} ${_common_instrument_flags} -fprofile-generate=$srcdir/pgo-profiles/standard" \
+    -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS}" \
+    -Wno-dev \
+    -DCMAKE_BUILD_TYPE=Debug
+  cmake --build build-pgo-standard
+
+  # Step 2: Compile and run training workload for standard PGO
+  mkdir -p "$srcdir/pgo-profiles/standard"  # Ensure directory exists
+  clang++ -std=c++20 -I"$srcdir/brotli/c/include" -L"$srcdir/brotli/build-pgo-standard" -lbrotlienc -lbrotlidec -lbrotlicommon \
+    "${CXXFLAGS//-fomit-frame-pointer/} ${_common_instrument_flags} -fprofile-generate=$srcdir/pgo-profiles/standard" \
+    "$srcdir/training_workload.cpp" -o "$srcdir/training_workload_standard" -O3 -march=native -mtune=native
+
+  # Set the environment variable to specify where profiles should be written
+  export LLVM_PROFILE_FILE="$srcdir/pgo-profiles/standard/profile_%m.profraw"
+  LD_LIBRARY_PATH="$srcdir/brotli/build-pgo-standard" "$srcdir/training_workload_standard"
+  unset LLVM_PROFILE_FILE
+
+  # Step 3: Merge standard PGO profiles
+  llvm-profdata merge -output="$srcdir/pgo-profiles/standard.profdata" "$srcdir/pgo-profiles/standard"/*.profraw
+
+  # Step 4: Context-Sensitive PGO Instrumentation Build
+  cmake -S . -B build-pgo-cs -G Ninja \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DBUILD_SHARED_LIBS=ON \
+    -DCMAKE_C_COMPILER=clang \
+    -DCMAKE_CXX_COMPILER=clang++ \
+    -DCMAKE_C_FLAGS_INIT="-g3 ${CFLAGS//-fomit-frame-pointer/} ${_common_instrument_flags} -fprofile-use=$srcdir/pgo-profiles/standard.profdata -fcs-profile-generate=$srcdir/pgo-profiles/context-sensitive" \
+    -DCMAKE_CXX_FLAGS_INIT="-g3 ${CXXFLAGS//-fomit-frame-pointer/} ${_common_instrument_flags} -fprofile-use=$srcdir/pgo-profiles/standard.profdata -fcs-profile-generate=$srcdir/pgo-profiles/context-sensitive" \
+    -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS}" \
+    -Wno-dev \
+    -DCMAKE_BUILD_TYPE=Debug
+  cmake --build build-pgo-cs
+
+  # Step 5: Compile and run training workload for context-sensitive PGO
+  mkdir -p "$srcdir/pgo-profiles/context-sensitive"  # Ensure directory exists
+  clang++ -std=c++20 -I"$srcdir/brotli/c/include" -L"$srcdir/brotli/build-pgo-cs" -lbrotlienc -lbrotlidec -lbrotlicommon \
+    "${CXXFLAGS//-fomit-frame-pointer/} ${_common_instrument_flags} -fcs-profile-generate=$srcdir/pgo-profiles/context-sensitive -fprofile-use=$srcdir/pgo-profiles/standard.profdata" \
+    "$srcdir/training_workload.cpp" -o "$srcdir/training_workload_cs" -O3 -march=native -mtune=native
+
+  # Set the environment variable for context-sensitive profiles
+  export LLVM_PROFILE_FILE="$srcdir/pgo-profiles/context-sensitive/profile_%m.profraw"
+  LD_LIBRARY_PATH="$srcdir/brotli/build-pgo-cs" "$srcdir/training_workload_cs"
+  unset LLVM_PROFILE_FILE
+
+  # Step 6: Merge context-sensitive PGO profiles with standard profiles
+  llvm-profdata merge -output="$srcdir/pgo-profiles/combined.profdata" "$srcdir/pgo-profiles/standard.profdata" "$srcdir/pgo-profiles/context-sensitive"/*.profraw
+
+  # Step 7: Final Optimized Build
+  cmake -S . -B build -G Ninja \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DBUILD_SHARED_LIBS=ON \
+    -DCMAKE_C_COMPILER=clang \
+    -DCMAKE_CXX_COMPILER=clang++ \
+    -DCMAKE_C_FLAGS_INIT="${CFLAGS} -fprofile-use=$srcdir/pgo-profiles/combined.profdata" \
+    -DCMAKE_CXX_FLAGS_INIT="${CXXFLAGS} -fprofile-use=$srcdir/pgo-profiles/combined.profdata" \
+    -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS}" \
+    -Wno-dev \
+    -DCMAKE_BUILD_TYPE=Release
+  cmake --build build -v
+
+  # Build Python wheel
+  python -m build --wheel --no-isolation
+}
+
+check() {
+  cd ${pkgbase}
+  local python_version=$(python -c 'import sys; print("".join(map(str, sys.version_info[:2])))')
+  PYTHONPATH="$PWD/bin/lib.linux-$CARCH-cpython-${python_version}" python -m unittest discover python "*_test.py"
+  cd build
+  ctest --output-on-failure --stop-on-failure -j$(nproc)
+}
 
 package_brotli() {
   depends=('glibc')
@@ -61,6 +313,8 @@ package_brotli() {
     install -Dm 644 "$man" "$pkgdir/usr/share/man/man${man##*.}/${man##*/}"
   done
   install -Dm 644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname"
+
+  rm -rf "$srcdir/pgo-profiles"
 }
 
 package_python-brotli() {
@@ -71,5 +325,3 @@ package_python-brotli() {
   python -m installer --destdir="$pkgdir" dist/*.whl
   install -Dm 644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname"
 }
-
-# vim:set ts=2 sw=2 et:
