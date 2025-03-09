@@ -1,7 +1,5 @@
-# Maintainer: Chocobo1 <chocobo1 AT archlinux DOT net>
-
 pkgname=jemalloc-git
-pkgver=5.3.0.r159.g373884ab
+pkgver=5.3.0.r265.g22440a02
 pkgrel=1
 pkgdesc="General purpose malloc implementation"
 arch=('i686' 'x86_64')
@@ -25,8 +23,463 @@ pkgver() {
 build() {
   cd "jemalloc"
 
+  # Store original flags
+  CFLAGS_ORIG="$CFLAGS"
+  CXXFLAGS_ORIG="$CXXFLAGS"
+  LDFLAGS_ORIG="$LDFLAGS"
+
   _xslroot="/usr/share/xml/docbook/xsl-stylesheets-$(pacman -Q docbook-xsl | cut -d ' ' -f 2 | cut -d '-' -f 1)"
-  autoreconf -vfi
+
+  # Stage 1: Instrumented build for PGO
+  export LLVM_PROFILE_FILE="$srcdir/jemalloc-%p.profraw"
+  CFLAGS+=" -fprofile-generate -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+  CXXFLAGS+=" -fprofile-generate -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+  LDFLAGS+=" -fprofile-generate -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+
+  echo "Building with PGO instrumentation..."
+  ./autogen.sh
+  ./configure \
+    --prefix="/usr" \
+    --enable-debug \
+    --disable-log \
+    --enable-prof \
+    --disable-doc \
+    --with-xslroot="$_xslroot"
+  make
+
+  # Run comprehensive training workload
+  echo "Running training workload for PGO data collection..."
+
+  # Run jemalloc tests
+  make check || echo "Tests completed with some failures, continuing PGO process"
+
+  # Create a comprehensive training program
+  cat > "$srcdir/jemalloc_training.c" << 'EOF'
+  #include <stdlib.h>
+  #include <stdio.h>
+  #include <string.h>
+  #include <pthread.h>
+  #include <unistd.h>
+  #include <sys/time.h>
+  #include <errno.h>
+
+  // Always include jemalloc headers to use jemalloc-specific functions
+  #include <jemalloc/jemalloc.h>
+
+  #define NUM_THREADS 8
+  #define ITERATIONS 1000
+  #define MAX_ALLOCS 10000
+  #define MAX_HUGE_ALLOC_MB 5  // Limit huge allocations to 5MB to avoid OOM
+
+  typedef struct {
+    void* ptrs[MAX_ALLOCS];
+    size_t sizes[MAX_ALLOCS];
+    int count;
+    int id;
+    pthread_mutex_t mutex;  // For thread safety
+  } thread_data_t;
+
+  // Different allocation patterns
+  void small_allocs(thread_data_t* data) {
+    for (int i = 0; i < ITERATIONS; i++) {
+      // Thread-safe increment of count
+      pthread_mutex_lock(&data->mutex);
+      int idx = (data->count++) % MAX_ALLOCS;
+      pthread_mutex_unlock(&data->mutex);
+
+      if (data->ptrs[idx] != NULL) {
+        free(data->ptrs[idx]);
+        data->ptrs[idx] = NULL;
+      }
+      size_t size = rand() % 256 + 1;
+      data->ptrs[idx] = malloc(size);
+      if (data->ptrs[idx] == NULL) {
+        printf("Thread %d: malloc failed for size %zu\n", data->id, size);
+        continue;
+      }
+      data->sizes[idx] = size;
+
+      // Touch memory to ensure it's used
+      memset(data->ptrs[idx], 1, size);
+    }
+  }
+
+  void medium_allocs(thread_data_t* data) {
+    for (int i = 0; i < ITERATIONS / 2; i++) {
+      pthread_mutex_lock(&data->mutex);
+      int idx = (data->count++) % MAX_ALLOCS;
+      pthread_mutex_unlock(&data->mutex);
+
+      if (data->ptrs[idx] != NULL) {
+        free(data->ptrs[idx]);
+        data->ptrs[idx] = NULL;
+      }
+      size_t size = 256 + rand() % 3840;
+      data->ptrs[idx] = malloc(size);
+      if (data->ptrs[idx] == NULL) {
+        printf("Thread %d: malloc failed for size %zu\n", data->id, size);
+        continue;
+      }
+      data->sizes[idx] = size;
+
+      memset(data->ptrs[idx], 2, size);
+    }
+  }
+
+  void large_allocs(thread_data_t* data) {
+    for (int i = 0; i < ITERATIONS / 10; i++) {
+      pthread_mutex_lock(&data->mutex);
+      int idx = (data->count++) % MAX_ALLOCS;
+      pthread_mutex_unlock(&data->mutex);
+
+      if (data->ptrs[idx] != NULL) {
+        free(data->ptrs[idx]);
+        data->ptrs[idx] = NULL;
+      }
+      size_t size = 4096 + rand() % (1024*1024-4096);
+      data->ptrs[idx] = malloc(size);
+      if (data->ptrs[idx] == NULL) {
+        printf("Thread %d: malloc failed for size %zu\n", data->id, size);
+        continue;
+      }
+      data->sizes[idx] = size;
+
+      memset(data->ptrs[idx], 3, size < 10240 ? size : 10240);
+    }
+  }
+
+  void huge_allocs(thread_data_t* data) {
+    for (int i = 0; i < ITERATIONS / 100; i++) {
+      pthread_mutex_lock(&data->mutex);
+      int idx = (data->count++) % MAX_ALLOCS;
+      pthread_mutex_unlock(&data->mutex);
+
+      if (data->ptrs[idx] != NULL) {
+        free(data->ptrs[idx]);
+        data->ptrs[idx] = NULL;
+      }
+      // Limit to MAX_HUGE_ALLOC_MB to avoid OOM
+      size_t size = 1024*1024 + rand() % (MAX_HUGE_ALLOC_MB*1024*1024);
+      data->ptrs[idx] = malloc(size);
+      if (data->ptrs[idx] == NULL) {
+        printf("Thread %d: malloc failed for huge size %zu\n", data->id, size);
+        continue;
+      }
+      data->sizes[idx] = size;
+
+      memset(data->ptrs[idx], 4, size < 10240 ? size : 10240);
+    }
+  }
+
+  void realloc_exercise(thread_data_t* data) {
+      for (int i = 0; i < ITERATIONS / 2; i++) {
+          pthread_mutex_lock(&data->mutex);
+          int count = data->count;
+          pthread_mutex_unlock(&data->mutex);
+
+          // Prevent division by zero
+          if (count == 0) continue;
+
+          int idx = rand() % count;
+          if (idx >= MAX_ALLOCS) idx = MAX_ALLOCS - 1;
+
+          if (data->ptrs[idx] != NULL) {
+              size_t current_size = data->sizes[idx];
+              // Use signed integer arithmetic for the calculation
+              int size_delta = rand() % 1024 - 512;
+              size_t new_size;
+
+              // Safe addition/subtraction that prevents underflow
+              if (size_delta < 0 && (size_t)(-size_delta) > current_size) {
+                  // Would underflow, set to minimum size
+                  new_size = 1;
+              } else {
+                  new_size = current_size + size_delta;
+                  if (new_size < 1) new_size = 1;  // Safety check
+              }
+
+              void* new_ptr = realloc(data->ptrs[idx], new_size);
+              if (new_ptr == NULL) {
+                  printf("Thread %d: realloc failed for size %zu\n", data->id, new_size);
+                  continue;
+              }
+              data->ptrs[idx] = new_ptr;
+              data->sizes[idx] = new_size;
+
+              memset(data->ptrs[idx], 5, new_size < 10240 ? new_size : 10240);
+          }
+      }
+  }
+
+  void calloc_exercise(thread_data_t* data) {
+    for (int i = 0; i < ITERATIONS / 2; i++) {
+      pthread_mutex_lock(&data->mutex);
+      int idx = (data->count++) % MAX_ALLOCS;
+      pthread_mutex_unlock(&data->mutex);
+
+      if (data->ptrs[idx] != NULL) {
+        free(data->ptrs[idx]);
+        data->ptrs[idx] = NULL;
+      }
+      size_t nmemb = rand() % 100 + 1;
+      size_t size = rand() % 100 + 1;
+      data->ptrs[idx] = calloc(nmemb, size);
+      if (data->ptrs[idx] == NULL) {
+        printf("Thread %d: calloc failed for size %zu\n", data->id, nmemb * size);
+        continue;
+      }
+      data->sizes[idx] = nmemb * size;
+    }
+  }
+
+  void aligned_allocs(thread_data_t* data) {
+    for (int i = 0; i < ITERATIONS / 4; i++) {
+      pthread_mutex_lock(&data->mutex);
+      int idx = (data->count++) % MAX_ALLOCS;
+      pthread_mutex_unlock(&data->mutex);
+
+      if (data->ptrs[idx] != NULL) {
+        free(data->ptrs[idx]);
+        data->ptrs[idx] = NULL;
+      }
+      size_t alignment = 1 << (rand() % 8 + 3); // 8 to 1024
+      size_t size = alignment * (rand() % 100 + 1);
+      data->ptrs[idx] = aligned_alloc(alignment, size);
+      if (data->ptrs[idx] == NULL) {
+        printf("Thread %d: aligned_alloc failed for size %zu, alignment %zu\n",
+               data->id, size, alignment);
+        continue;
+      }
+      data->sizes[idx] = size;
+
+      memset(data->ptrs[idx], 6, size);
+    }
+  }
+
+  // Add jemalloc-specific allocation exercises
+  void jemalloc_specific(thread_data_t* data) {
+    for (int i = 0; i < ITERATIONS / 4; i++) {
+      pthread_mutex_lock(&data->mutex);
+      int idx = (data->count++) % MAX_ALLOCS;
+      pthread_mutex_unlock(&data->mutex);
+
+      if (data->ptrs[idx] != NULL) {
+        free(data->ptrs[idx]);
+        data->ptrs[idx] = NULL;
+      }
+
+      // Use jemalloc-specific API
+      size_t size = 256 + rand() % 1024;
+
+      // Test mallocx with different flags
+      unsigned flags = 0;
+
+      // Occasionally use MALLOCX_ZERO
+      if (rand() % 4 == 0) {
+        flags |= MALLOCX_ZERO;
+      }
+
+      // Occasionally use MALLOCX_ALIGN
+      if (rand() % 4 == 0) {
+        size_t alignment = 1 << (rand() % 8 + 3); // 8 to 1024
+        flags |= MALLOCX_ALIGN(alignment);
+      }
+
+      data->ptrs[idx] = mallocx(size, flags);
+      if (data->ptrs[idx] == NULL) {
+        printf("Thread %d: mallocx failed for size %zu, flags %u\n",
+               data->id, size, flags);
+        continue;
+      }
+      data->sizes[idx] = size;
+
+      // If not zeroed, touch memory
+      if (!(flags & MALLOCX_ZERO)) {
+        memset(data->ptrs[idx], 7, size);
+      }
+
+      // Occasionally resize using rallocx
+      if (rand() % 4 == 0) {
+        size_t new_size = size + rand() % 512;
+        void* new_ptr = rallocx(data->ptrs[idx], new_size, flags);
+        if (new_ptr == NULL) {
+          printf("Thread %d: rallocx failed for size %zu\n", data->id, new_size);
+        } else {
+          data->ptrs[idx] = new_ptr;
+          data->sizes[idx] = new_size;
+          if (!(flags & MALLOCX_ZERO)) {
+            memset(data->ptrs[idx], 8, new_size);
+          }
+        }
+      }
+
+      // Occasionally get size using sallocx
+      if (rand() % 4 == 0) {
+        size_t real_size = sallocx(data->ptrs[idx], 0);
+        if (real_size < data->sizes[idx]) {
+          printf("Thread %d: sallocx returned unexpected size %zu (expected >= %zu)\n",
+                 data->id, real_size, data->sizes[idx]);
+        }
+      }
+    }
+  }
+
+  void mixed_pattern(thread_data_t* data) {
+    switch (rand() % 7) { // Updated to include jemalloc_specific
+      case 0: small_allocs(data); break;
+      case 1: medium_allocs(data); break;
+      case 2: large_allocs(data); break;
+      case 3: huge_allocs(data); break;
+      case 4: realloc_exercise(data); break;
+      case 5: calloc_exercise(data); break;
+      case 6: jemalloc_specific(data); break;
+    }
+  }
+
+  void cleanup(thread_data_t* data) {
+    for (int i = 0; i < MAX_ALLOCS; i++) {
+      if (data->ptrs[i] != NULL) {
+        free(data->ptrs[i]);
+        data->ptrs[i] = NULL;
+      }
+    }
+  }
+
+  void* thread_work(void* arg) {
+    thread_data_t* data = (thread_data_t*)arg;
+
+    // Initialize with random allocation pattern
+    for (int i = 0; i < MAX_ALLOCS / 10; i++) {
+      mixed_pattern(data);
+    }
+
+    // Exercise different allocation sizes
+    small_allocs(data);
+    medium_allocs(data);
+    large_allocs(data);
+    huge_allocs(data);
+
+    // Exercise realloc and calloc
+    realloc_exercise(data);
+    calloc_exercise(data);
+    aligned_allocs(data);
+    jemalloc_specific(data);
+
+    // Mix of patterns
+    for (int i = 0; i < 20; i++) {
+      mixed_pattern(data);
+    }
+
+    cleanup(data);
+
+    printf("Thread %d completed work with %d allocations\n", data->id, data->count);
+    return NULL;
+  }
+
+  void run_memory_stress() {
+    pthread_t threads[NUM_THREADS];
+    thread_data_t thread_data[NUM_THREADS];
+
+    // Initialize thread data
+    for (int i = 0; i < NUM_THREADS; i++) {
+      memset(&thread_data[i], 0, sizeof(thread_data_t));
+      thread_data[i].id = i;
+      pthread_mutex_init(&thread_data[i].mutex, NULL);
+    }
+
+    // Create threads
+    for (int i = 0; i < NUM_THREADS; i++) {
+      if (pthread_create(&threads[i], NULL, thread_work, &thread_data[i]) != 0) {
+        printf("Failed to create thread %d: %s\n", i, strerror(errno));
+      }
+    }
+
+    // Wait for threads to finish
+    for (int i = 0; i < NUM_THREADS; i++) {
+      pthread_join(threads[i], NULL);
+      pthread_mutex_destroy(&thread_data[i].mutex);
+    }
+
+    printf("Memory stress test completed\n");
+  }
+
+  int main() {
+    // Seed random number generator
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    srand(tv.tv_sec ^ tv.tv_usec);
+
+    printf("Starting jemalloc training...\n");
+
+    // Run memory stress workload multiple times
+    for (int i = 0; i < 3; i++) {
+      printf("Run %d of memory stress\n", i+1);
+      run_memory_stress();
+    }
+
+    printf("Jemalloc training completed\n");
+    return 0;
+  }
+EOF
+
+  # Compile and run training program - FIX: Use consistent compiler (clang) and correct path
+  clang -DJEMALLOC -I./include -o "$srcdir/jemalloc_training" "$srcdir/jemalloc_training.c" -L./lib -ljemalloc -lpthread || { echo "Error compiling training program"; exit 1; }
+
+  # Set environment variables to control jemalloc behavior
+  export MALLOC_CONF="background_thread:true,narenas:8,tcache:true,prof:true"
+  LD_LIBRARY_PATH=./lib "$srcdir/jemalloc_training" || echo "Training program completed with some failures"
+
+  # Merge profile data
+  echo "Merging profile data..."
+  llvm-profdata merge -output="$srcdir/default.profdata" "$srcdir"/jemalloc-*.profraw || { echo "Error merging profile data"; exit 1; }
+  rm -f "$srcdir"/jemalloc-*.profraw
+
+  # Clean build directory
+  make clean
+
+  # Stage 2: CS-PGO instrumentation build using first profile data
+  echo "Building with context-sensitive PGO instrumentation..."
+  export LLVM_PROFILE_FILE="$srcdir/cs-jemalloc-%p.profraw"
+  CFLAGS="$CFLAGS_ORIG -fprofile-use=$srcdir/default.profdata -fcs-profile-generate -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+  CXXFLAGS="$CXXFLAGS_ORIG -fprofile-use=$srcdir/default.profdata -fcs-profile-generate -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+  LDFLAGS="$LDFLAGS_ORIG -fprofile-use=$srcdir/default.profdata -fcs-profile-generate -g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+
+  ./autogen.sh
+  ./configure \
+    --prefix="/usr" \
+    --enable-debug \
+    --disable-log \
+    --enable-prof \
+    --disable-doc \
+    --with-xslroot="$_xslroot"
+  make
+
+  # Run the same training workload for CS-PGO
+  echo "Running training workload for CS-PGO data collection..."
+
+  # Run tests again
+  make check || echo "Tests completed with some failures during CS-PGO, continuing"
+
+  # Run training program again - FIX: Use clang consistently
+  export MALLOC_CONF="background_thread:true,narenas:8,tcache:true,prof:true"
+  clang -DJEMALLOC -I./include -o "$srcdir/jemalloc_training" "$srcdir/jemalloc_training.c" -L./lib -ljemalloc -lpthread || { echo "Error compiling training program for CS-PGO"; exit 1; }
+  LD_LIBRARY_PATH=./lib "$srcdir/jemalloc_training" || echo "Training program completed with some failures during CS-PGO"
+
+  # Merge CS-PGO profile data with previous profile data
+  echo "Merging CS-PGO profile data..."
+  llvm-profdata merge -output="$srcdir/cs.profdata" "$srcdir"/cs-jemalloc-*.profraw "$srcdir/default.profdata" || { echo "Error merging CS-PGO profile data"; exit 1; }
+  rm -f "$srcdir"/cs-jemalloc-*.profraw
+
+  # Clean build directory
+  make clean
+
+  # Stage 3: Final build with merged CS-PGO profile data
+  echo "Building with merged CS-PGO data..."
+  CFLAGS="$CFLAGS_ORIG -fprofile-use=$srcdir/cs.profdata"
+  CXXFLAGS="$CXXFLAGS_ORIG -fprofile-use=$srcdir/cs.profdata"
+  LDFLAGS="$LDFLAGS_ORIG -fprofile-use=$srcdir/cs.profdata"
+
+  ./autogen.sh
   ./configure \
     --prefix="/usr" \
     --disable-debug \
