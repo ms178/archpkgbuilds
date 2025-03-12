@@ -1,7 +1,7 @@
 pkgbase=ollama
 pkgname=(ollama ollama-rocm)
 pkgver=0.6.0
-pkgrel=2.1
+pkgrel=3.1
 pkgdesc='Create, run and share large language models (LLMs)'
 arch=(x86_64)
 url='https://github.com/ollama/ollama'
@@ -31,441 +31,475 @@ prepare() {
 build() {
   # Create build directory
   cd ollama
-  BUILD_DIR=$(pwd)
+  BUILD_DIR="$(pwd)"
 
-  echo "PGO: Stage 1 - Build with instrumentation"
+  # Set up directories for build
+  PGO_DATA_DIR_GCC="${BUILD_DIR}/pgo_profiles_gcc"
+  PGO_DATA_DIR_CLANG="${BUILD_DIR}/pgo_profiles_clang"
+  mkdir -p "$PGO_DATA_DIR_GCC"
+  mkdir -p "$PGO_DATA_DIR_CLANG"
 
-  # Set flags for profile generation
+  # Clean any existing profile data
+  find "$BUILD_DIR" -name "*.gcda" -delete
+  find "$BUILD_DIR" -name "*.profraw" -delete
+  find "$BUILD_DIR" -name "*.profdata" -delete
+
+  ##################################################
+  echo "=== PHASE 1: PGO INSTRUMENTED BUILD ==="
+  ##################################################
+
+  # --- GCC (CPU) Flags ---
+  ORIGINAL_CFLAGS_GCC="$CFLAGS"
+  ORIGINAL_CXXFLAGS_GCC="$CXXFLAGS"
+  ORIGINAL_LDFLAGS_GCC="$LDFLAGS"
+
+  export CFLAGS_GCC="${ORIGINAL_CFLAGS_GCC} -fprofile-generate=${PGO_DATA_DIR_GCC}"
+  export CXXFLAGS_GCC="${ORIGINAL_CXXFLAGS_GCC} -fprofile-generate=${PGO_DATA_DIR_GCC}"
+  export LDFLAGS_GCC="${ORIGINAL_LDFLAGS_GCC} -fprofile-generate=${PGO_DATA_DIR_GCC}"
+
+  # --- Clang (HIP) Flags ---
+  #   Use -fprofile-instr-generate with environment variable for unique profile files
+  ORIGINAL_CFLAGS_CLANG="$CFLAGS"
+  ORIGINAL_CXXFLAGS_CLANG="$CXXFLAGS"
+  ORIGINAL_LDFLAGS_CLANG="$LDFLAGS"
+
+  export CFLAGS_CLANG="${ORIGINAL_CFLAGS_CLANG} -fprofile-instr-generate"
+  export CXXFLAGS_CLANG="${ORIGINAL_CXXFLAGS_CLANG} -fprofile-instr-generate"
+  export LDFLAGS_CLANG="${ORIGINAL_LDFLAGS_CLANG} -fprofile-instr-generate"
+  export LLVM_PROFILE_FILE="${PGO_DATA_DIR_CLANG}/ollama-%p.profraw"
+
+  # Set CGO flags (primarily for Go, which uses GCC)
   export CGO_CPPFLAGS="${CPPFLAGS}"
-  export CGO_CFLAGS="${CFLAGS} -march=native -mtune=native -fprofile-generate=${BUILD_DIR}/pgo_data"
-  export CGO_CXXFLAGS="${CXXFLAGS} -march=native -mtune=native -fprofile-generate=${BUILD_DIR}/pgo_data"
-  export CGO_LDFLAGS="${LDFLAGS} -march=native -mtune=native -fprofile-generate=${BUILD_DIR}/pgo_data"
-  export GOPATH="${srcdir}"
-  export GOFLAGS="-buildmode=pie -mod=readonly -modcacherw '-ldflags=-linkmode=external -compressdwarf=false -X=github.com/ollama/ollama/version.Version=$pkgver -X=github.com/ollama/ollama/server.mode=release' -gcflags=all=-B -trimpath -buildvcs=false"
+  export CGO_CFLAGS="${CFLAGS_GCC}"
+  export CGO_CXXFLAGS="${CXXFLAGS_GCC}"
+  export CGO_LDFLAGS="${LDFLAGS_GCC}"
 
-  # Stage 1a: Build CMake components with instrumentation
-  echo "PGO: Building C/C++ components with instrumentation"
+  # Standard Go flags
+  export GOPATH="${srcdir}"
+  export GOFLAGS="-buildmode=pie -mod=readonly -modcacherw '-ldflags=-linkmode=external -compressdwarf=false -X=github.com/ollama/ollama/version.Version=$pkgver -X=github.com/ollama/ollama/server.mode=release' '-gcflags=all=-N -l' -trimpath -buildvcs=false"
+
+  echo "Building C/C++ components with PGO instrumentation (GCC and Clang)..."
+  rm -rf build
   cmake -B build -G Ninja \
     -DAMDGPU_TARGETS="gfx900" \
-    -DGGML_CUDA=OFF \
+    -DCMAKE_C_COMPILER=gcc \
+    -DCMAKE_CXX_COMPILER=g++ \
+    -DCMAKE_C_FLAGS="${CFLAGS_GCC}" \
+    -DCMAKE_CXX_FLAGS="${CXXFLAGS_GCC}" \
+    -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS_GCC}" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${LDFLAGS_GCC}" \
+    -DCMAKE_HIP_ARCHITECTURES="gfx900" \
+    -DCMAKE_HIP_COMPILER=clang \
+    -DCMAKE_HIP_FLAGS="${CFLAGS_CLANG}" \
+    -DCMAKE_HIP_LINK_FLAGS="${LDFLAGS_CLANG}" \
     -DCMAKE_INSTALL_PREFIX=/usr
   cmake --build build
 
-  # Stage 1b: Build Go components with instrumentation
-  echo "PGO: Building Go components with instrumentation"
-  go build -o ollama-instrumented .
+  echo "Building Go components with instrumentation..."
+  go build -o ollama-pgo .
 
-  # Create directory for PGO data
-  mkdir -p "${BUILD_DIR}/pgo_data"
-  echo "PGO: Profile data will be stored in ${BUILD_DIR}/pgo_data"
+  echo "Instrumented build completed: $(ls -lh ollama-pgo)"
 
-  # Function to check if a port is in use
-  is_port_in_use() {
-    local port="$1"
-    if nc -z 127.0.0.1 "$port" >/dev/null 2>&1; then
-      return 0  # Port is in use
-    fi
-    if command -v ss >/dev/null 2>&1; then
-      if ss -tln | grep -q ":$port "; then
-        return 0  # Port is in use
-      fi
-    elif command -v netstat >/dev/null 2>&1; then
-      if netstat -tln | grep -q ":$port "; then
-        return 0  # Port is in use
-      fi
-    fi
-    return 1  # Port is not in use
-  }
+  ##################################################
+  echo "=== PHASE 2: VERIFY SERVER & MODEL ==="
+  ##################################################
 
-  # Function to find an available port
+  # (Rest of the server start and model selection code is the same as before,
+  #  using the `ollama-pgo` binary and the selected model.  No changes needed here.)
+
+  # Find an available port for our server
   find_available_port() {
     local port=12000
     local max_port=13000
     while [ $port -le $max_port ]; do
-      if ! is_port_in_use "$port"; then
+      if ! nc -z 127.0.0.1 "$port" >/dev/null 2>&1; then
         echo $port
         return 0
       fi
       port=$((port + 1))
     done
-    echo "Error: No available ports found in range $port-$max_port"
+    echo "Error: No available ports found"
     return 1
   }
 
-  # Function to run a generation with token tracking
-  generate_with_token_tracking() {
-    local prompt="$1"
-    local max_tokens="$2"
-    local total_tokens=0
-
-    # Create a unique file for this generation
-    local tmp_file=$(mktemp)
-
-    # Start curl in the background to capture all tokens
-    curl -s --max-time 120 -X POST "http://$ollama_host/api/generate" \
-         -H "Content-Type: application/json" \
-         -d "{\"model\":\"dolphin3-r1\",\"prompt\":\"$prompt\",\"stream\":true,\"options\":{\"num_predict\":$max_tokens}}" > "$tmp_file" &
-    local curl_pid=$!
-
-    # Track progress
-    local token_pattern='"response":'
-    local done_pattern='"done":true'
-    local progress_shown=0
-    local max_progress=20  # Show up to 20 progress markers
-
-    echo -n "  Generating ["
-
-    # Monitor the output file for new tokens
-    while ps -p $curl_pid > /dev/null 2>&1; do
-      # Count new tokens that have arrived
-      new_total=$(grep -o "$token_pattern" "$tmp_file" | wc -l)
-
-      # Update progress bar if we have new tokens
-      if [ "$new_total" -gt "$total_tokens" ]; then
-        # Calculate how many new markers to show
-        local new_progress=$(($new_total * $max_progress / $max_tokens))
-        if [ "$new_progress" -gt "$progress_shown" ]; then
-          # Show new markers
-          for ((i=progress_shown; i<new_progress && i<max_progress; i++)); do
-            echo -n "#"
-          done
-          progress_shown=$new_progress
-        fi
-        total_tokens=$new_total
-      fi
-
-      # Check if generation is done
-      if grep -q "$done_pattern" "$tmp_file"; then
-        break
-      fi
-
-      # Brief pause
-      sleep 0.2
-    done
-
-    # Fill in the rest of the progress bar if needed
-    while [ "$progress_shown" -lt "$max_progress" ]; do
-      echo -n "#"
-      progress_shown=$((progress_shown + 1))
-    done
-    echo "] Done."
-
-    # Get final token count
-    final_tokens=$(grep -o "$token_pattern" "$tmp_file" | wc -l)
-    echo "  Generated $final_tokens tokens"
-
-    # Clean up
-    rm -f "$tmp_file"
-
-    # If curl is still running, kill it
-    if ps -p $curl_pid > /dev/null 2>&1; then
-      kill $curl_pid
-    fi
-  }
-
-  # Check for existing Ollama server on default port
-  echo "PGO: Checking for existing Ollama server..."
-  if is_port_in_use 11434; then
-    echo "PGO: Found existing Ollama server on port 11434"
-    if curl -s http://127.0.0.1:11434/api/tags | grep -q "dolphin3-r1"; then
-      echo "PGO: Using existing Ollama server with dolphin3-r1 model"
-      ollama_host="127.0.0.1:11434"
-      using_existing_server=true
-    else
-      echo "PGO: Existing server doesn't have the required model. Will start our own server."
-      using_existing_server=false
-    fi
-  else
-    echo "PGO: No existing Ollama server detected on port 11434"
-    using_existing_server=false
+  ollama_port=$(find_available_port)
+  if [ $? -ne 0 ]; then
+    echo "Error: Unable to find an available port"
+    exit 1
   fi
 
-  # Start our own server only if needed
-  if [ "$using_existing_server" = false ]; then
-    # Find an available port for our server
-    ollama_port=$(find_available_port)
-    if [ $? -ne 0 ]; then
-      echo "Error: Unable to find an available port"
+  # Server settings
+  ollama_host="127.0.0.1:$ollama_port"
+  SERVER_LOG="${PGO_DATA_DIR_GCC}/server.log" # Log in GCC dir
+
+  # Get the directory with models
+  USER_HOME="$HOME"
+  SYSTEM_MODELS_DIR="$USER_HOME/.ollama/models"
+
+  # Start the server with the instrumented binary - using env var, not command line flag
+  echo "Starting instrumented server on port $ollama_port..."
+  OLLAMA_HOST="$ollama_host" OLLAMA_MODELS="$SYSTEM_MODELS_DIR" OLLAMA_DEBUG=1 LLVM_PROFILE_FILE="${PGO_DATA_DIR_CLANG}/ollama-%p.profraw" ./ollama-pgo serve > "$SERVER_LOG" 2>&1 &
+  ollama_pid=$!
+
+  # Wait for server to start (with proper error handling)
+  echo "Waiting for server to start..."
+  server_ready=false
+  for i in {1..30}; do
+    if ! ps -p $ollama_pid > /dev/null 2>&1; then
+      echo "ERROR: Server process terminated during startup"
+      cat "$SERVER_LOG"
       exit 1
     fi
 
-    echo "PGO: Using port $ollama_port for Ollama server"
-    ollama_host="127.0.0.1:$ollama_port"
-
-    # Get user's home directory to locate their model directory
-    USER_HOME="$HOME"
-    if [ -z "$USER_HOME" ]; then
-      USER_HOME="$(getent passwd $(whoami) | cut -d: -f6)"
+    if curl -s "http://$ollama_host/api/version" > /dev/null 2>&1; then
+      echo "Server started successfully"
+      server_ready=true
+      break
     fi
 
-    # Use system models directory
-    SYSTEM_MODELS_DIR="$USER_HOME/.ollama/models"
-    echo "PGO: Using system models directory: $SYSTEM_MODELS_DIR"
+    echo "Waiting... ($i/30)"
+    sleep 2
+  done
 
-    # Create log directory
-    LOG_DIR="${BUILD_DIR}/pgo_data/logs"
-    mkdir -p "$LOG_DIR"
-    SERVER_LOG="$LOG_DIR/server.log"
+  if [ "$server_ready" = false ]; then
+    echo "ERROR: Server failed to start within timeout"
+    cat "$SERVER_LOG"
+    if ps -p $ollama_pid > /dev/null 2>&1; then
+      kill $ollama_pid
+    fi
+    exit 1
+  fi
 
-    # Start the Ollama server in the background
-    echo "PGO: Starting Ollama server for PGO workload..."
-    OLLAMA_KEEP_ALIVE=1 OLLAMA_HOST="$ollama_host" OLLAMA_MODELS="$SYSTEM_MODELS_DIR" \
-    ./ollama-instrumented serve > "$SERVER_LOG" 2>&1 &
-    ollama_pid=$!
-    echo "PGO: Server started with PID: $ollama_pid"
+  # Check model availability - verify dolphin3-r1
+  MODEL_NAME="dolphin3-r1:latest"
+  echo "Checking for model $MODEL_NAME..."
 
-    # Verify server startup with retries
-    echo "PGO: Waiting for server to start..."
-    server_ready=false
-    for i in {1..30}; do
-      # Check process is still running
-      if ! ps -p $ollama_pid > /dev/null 2>&1; then
-        echo "Error: Server process terminated during startup"
-        echo "Server log:"
-        cat "$SERVER_LOG"
-        exit 1
+  model_available=false
+  if curl -s "http://$ollama_host/api/tags" | jq -e ".models[] | select(.name == \"$MODEL_NAME\")" > /dev/null 2>&1; then
+      echo "✓ Model $MODEL_NAME is available"
+      model_available=true
+  else
+    echo "⚠ Model $MODEL_NAME not found. Available models:"
+    curl -s "http://$ollama_host/api/tags" | jq -r '.models[].name'
+    echo "Using first available model instead"
+
+    # Find a model to use instead
+    AVAILABLE_MODELS=$(curl -s "http://$ollama_host/api/tags" | jq -r '.models[].name')
+    if [ -n "$AVAILABLE_MODELS" ]; then
+      # Try to find a small model first
+        for model in llama2:7b tiny phi:latest gemma:2b cerebras:2b; do
+            if echo "$AVAILABLE_MODELS" | grep -q "^$model$"; then
+                echo "Selected small model: $model"
+                MODEL_NAME="$model"
+                model_available=true
+                break
+            fi
+        done
+
+      # If no small model found, use the first available
+      if [ "$model_available" = false ]; then
+        ALTERNATIVE_MODEL=$(echo "$AVAILABLE_MODELS" | head -n1)
+        echo "Selected first available model: $ALTERNATIVE_MODEL"
+        MODEL_NAME="$ALTERNATIVE_MODEL"
+        model_available=true
       fi
-
-      # Check if server is responding
-      if curl -s "http://$ollama_host/api/version" > /dev/null 2>&1; then
-        echo "PGO: Server started successfully on port $ollama_port"
-        server_ready=true
-        break
-      fi
-
-      echo "PGO: Waiting for server to start... ($i/30)"
-      sleep 2
-    done
-
-    if [ "$server_ready" = false ]; then
-      echo "Error: Server failed to start within the timeout period"
-      echo "Server log:"
-      cat "$SERVER_LOG"
+    else
+      echo "ERROR: No models available"
       if ps -p $ollama_pid > /dev/null 2>&1; then
         kill $ollama_pid
       fi
       exit 1
     fi
-
-    # Check if the model is available on our server
-    if ! curl -s "http://$ollama_host/api/tags" | grep -q "dolphin3-r1"; then
-      echo "Warning: The required model 'dolphin3-r1' is not available on the server"
-      echo "PGO will continue with a text-only approach"
-      use_text_only=true
-    else
-      echo "PGO: Found model 'dolphin3-r1' on the server"
-      use_text_only=false
-    fi
-  else
-    # Using existing server
-    ollama_pid=""
-    use_text_only=false
   fi
 
-  # Function to check server health
-  check_server_health() {
-    # Only check process health if we started our own server
-    if [ -n "$ollama_pid" ]; then
-      if ! ps -p $ollama_pid > /dev/null 2>&1; then
-        echo "Error: Server process (PID $ollama_pid) terminated unexpectedly"
-        return 1
-      fi
-    fi
+  ##################################################
+  echo "=== PHASE 3: PROFILE GENERATION ==="
+  ##################################################
 
-    # Always check server API responsiveness
-    if ! curl -s --max-time 3 "http://$ollama_host/api/version" > /dev/null 2>&1; then
-      echo "Error: Server not responding to health check on $ollama_host"
-      return 1
-    fi
+# Function to run a simple generation and verify it works
+test_generation() {
+  local prompt="$1"
+  local output_file="${PGO_DATA_DIR_GCC}/test_generation.json"
 
-    return 0
-  }
+  echo "Testing generation with prompt: $prompt"
 
-  # Run the representative workload to generate profiling data
-  echo "PGO: Stage 2 - Running workload for profile data collection"
+  curl -s -X POST "http://$ollama_host/api/generate" \
+       -H "Content-Type: application/json" \
+       -d "{\"model\":\"$MODEL_NAME\",\"prompt\":\"$prompt\",\"options\":{\"num_predict\":50}, \"stream\": false}" > "$output_file"
+  curl_exit_code=$?
 
-  # Set a time limit for the PGO phase (20 minutes)
-  PGO_TIME_LIMIT=1200
+  if [ $curl_exit_code -ne 0 ]; then
+    echo "✗ CURL request failed with exit code $curl_exit_code"
+    cat "$output_file"
+    return 1
+  fi
+
+  # Check if the response is valid JSON
+  if ! jq -e '.' < "$output_file" > /dev/null 2>&1; then
+    echo "✗ Server returned invalid JSON"
+    cat "$output_file"
+    return 1
+  fi
+
+  # Check for error field in the response
+  if jq -e '.error' < "$output_file" > /dev/null 2>&1; then
+    echo "✗ Server returned an error: $(jq -r '.error' < "$output_file")"
+    return 1
+  fi
+
+  # Check if we got a non-empty response
+  response=$(jq -r '.response' < "$output_file" 2>/dev/null)
+  if [ $? -ne 0 ] || [ -z "$response" ]; then
+    echo "✗ Test generation produced no output (empty response)"
+    cat "$output_file"
+    return 1
+  fi
+
+  echo "✓ Generation successful (response length: ${#response} characters)"
+  return 0
+}
+
+# Function to generate with detailed output
+run_generation() {
+  local prompt="$1"
+  local length="$2"
+  local tag="$3"
+  local output_file="${PGO_DATA_DIR_GCC}/generation_${tag}.json"
+
+  echo "Generating response for: ${prompt:0:50}..."
+
+  # Run generation and show progress
   start_time=$(date +%s)
+  curl -s -X POST "http://$ollama_host/api/generate" \
+       -H "Content-Type: application/json" \
+       -d "{\"model\":\"$MODEL_NAME\",\"prompt\":$prompt,\"options\":{\"num_predict\":$length}, \"stream\": false}" > "$output_file"
+  curl_exit_code=$?
+  end_time=$(date +%s)
 
-  workload_success=true
+  if [ $curl_exit_code -ne 0 ]; then
+    echo "✗ CURL request failed with exit code $curl_exit_code"
+    cat "$output_file"
+    return 1
+  fi
+
+  # Check if the response is valid JSON and contains a response field
+  if ! jq -e '.' < "$output_file" > /dev/null 2>&1; then
+    echo "✗ Server returned invalid JSON"
+    cat "$output_file"
+    return 1
+  fi
+
+  # Check for error field in the response
+  if jq -e '.error' < "$output_file" > /dev/null 2>&1; then
+    echo "✗ Server returned an error: $(jq -r '.error' < "$output_file")"
+    return 1
+  fi
+
+  # Extract and verify the response field
+  response=$(jq -r '.response' < "$output_file" 2>/dev/null)
+  if [ $? -ne 0 ] || [ -z "$response" ]; then
+    echo "✗ Generation produced no output (empty response)"
+    cat "$output_file"
+    return 1
+  fi
+
+  # Count tokens and show stats
+  token_count=$(printf '%s' "$response" | wc -c)  # Use character count as a proxy for tokens
+  duration=$((end_time - start_time))
+
+  echo "✓ Generated response of length ${#response} characters (${token_count} estimated tokens) in $duration seconds"
+  return 0
+}
+
+  # Run workload using prompts from workload.txt file
+  echo "Running PGO workload from workload.txt..."
+
+  # Set parameters for PGO workload
+  max_prompts=12  # Number of prompts to process
   prompt_count=0
-
-  # We'll do fewer prompts but generate more tokens for each
-  max_prompts=15
-
-  # Track sections to ensure coverage from all types
-  declare -A processed_sections
-  max_per_section=1  # Just one prompt per section, but generate more tokens
   current_section=""
 
-  # First confirm server is healthy before starting workload
-  if ! check_server_health; then
-    echo "Error: Server is not healthy before starting workload"
-    workload_success=false
-  else
-    # Process the workload file
-    while IFS= read -r line; do
-      # Check time limit
-      current_time=$(date +%s)
-      elapsed_time=$((current_time - start_time))
-      if [ $elapsed_time -ge $PGO_TIME_LIMIT ]; then
-        echo "PGO: Time limit reached after $elapsed_time seconds and $prompt_count prompts."
-        break
-      fi
+  # Process workload.txt file
+  while IFS= read -r line; do
+    # Skip empty lines
+    if [[ -z "$line" ]]; then
+      continue
+    fi
 
-      # Process section headers
-      if [[ "$line" =~ ^#\ Section ]]; then
-        current_section="$line"
-        processed_sections["$current_section"]=0
-        echo "PGO: Processing $current_section"
-        continue
-      fi
+    # Track section headers
+    if [[ "$line" =~ ^#\ Section ]]; then
+      current_section="$line"
+      echo "Processing section: ${current_section#\# }"
+      continue
+    fi
 
-      # Skip comments and empty lines
-      if [[ -z "$line" || "$line" =~ ^# ]]; then
-        continue
-      fi
+    # Skip comment lines
+    if [[ "$line" =~ ^# ]]; then
+      continue
+    fi
 
-      # Limit prompts per section for balanced coverage
-      if [[ -n "$current_section" && ${processed_sections["$current_section"]} -ge $max_per_section ]]; then
-        continue
-      fi
+    # Extract prompt from quotes if present
+    if [[ "$line" =~ ^\"(.*)\"$ ]]; then
+      prompt="${BASH_REMATCH[1]}"
+    else
+      prompt="$line"
+    fi
 
-      # Limit total prompts
-      if [ $prompt_count -ge $max_prompts ]; then
-        echo "PGO: Maximum prompt limit reached ($max_prompts)."
-        break
-      fi
+    # Only process if we haven't reached max_prompts
+    if [ $prompt_count -ge $max_prompts ]; then
+      echo "Maximum number of prompts ($max_prompts) processed."
+      break
+    fi
 
-      prompt_count=$((prompt_count + 1))
-      if [[ -n "$current_section" ]]; then
-        processed_sections["$current_section"]=$((processed_sections["$current_section"] + 1))
-      fi
+    # Determine token count based on section
+    token_count=200  # Default
+    if [[ "$current_section" == *"Long-Form Text Generation"* ]]; then
+      token_count=300
+    elif [[ "$current_section" == *"Short-Form Text Generation"* ]]; then
+      token_count=100
+    elif [[ "$current_section" == *"Code Generation"* ]]; then
+      token_count=250
+    elif [[ "$current_section" == *"Translation"* ]]; then
+      token_count=250
+    elif [[ "$current_section" == *"Summarization"* ]]; then
+      token_count=150
+    elif [[ "$current_section" == *"GPU-Stressing"* ]]; then
+      token_count=400
+    fi
 
-      # Extract the actual prompt from within quotes if present
-      if [[ "$line" =~ ^\"(.*)\"$ ]]; then
-        prompt="${BASH_REMATCH[1]}"
-      else
-        prompt="$line"
-      fi
+    # Increment prompt counter
+    prompt_count=$((prompt_count + 1))
 
-      echo "PGO: Processing prompt $prompt_count: ${prompt:0:50}..."
+    # Properly escape the prompt for JSON
+    escaped_prompt=$(printf '%s' "$prompt" | jq -sRr @json)
 
-      # Check server health before each prompt
-      if ! check_server_health; then
-        echo "Error: Server health check failed before prompt $prompt_count"
-        workload_success=false
-        break
-      fi
+    # Run generation
+    section_name=$(echo "$current_section" | sed 's/# Section [0-9]*: //;s/ /_/g')
+    run_generation "$escaped_prompt" $token_count "${section_name}_${prompt_count}"
 
-      # If using text-only approach, just hit the API without model generation
-      if [ "$use_text_only" = true ]; then
-        # Simulated API call to exercise the same code paths without needing model
-        echo "  Using text-only simulation mode (no model available)"
-        for i in {1..5}; do
-          curl -s --max-time 5 "http://$ollama_host/api/version" > /dev/null
-          sleep 1
-          echo -n "."
-        done
-        echo " Done."
-      else
-        # Determine token count based on section type
-        token_count=100  # Default
+    # Brief pause between generations
+    sleep 1
+  done < ../workload.txt
 
-        # Adjust token counts based on section type for more realistic PGO
-        if [[ "$current_section" == *"Long-Form Text Generation"* ]]; then
-          token_count=300  # More tokens for long-form generation
-        elif [[ "$current_section" == *"Short-Form Text Generation"* ]]; then
-          token_count=50   # Fewer tokens for short-form
-        elif [[ "$current_section" == *"Code Generation"* ]]; then
-          token_count=200  # Medium for code
-        elif [[ "$current_section" == *"Translation"* ]]; then
-          token_count=150  # Medium for translation
-        elif [[ "$current_section" == *"GPU-Stressing"* ]]; then
-          token_count=400  # More for GPU stress testing
-        fi
+  echo "Completed PGO workload with $prompt_count prompts."
 
-        # Properly escape the prompt for JSON
-        escaped_prompt=$(echo "$prompt" | sed 's/"/\\"/g')
-
-        # Generate with token tracking to see progress
-        generate_with_token_tracking "$escaped_prompt" "$token_count"
-      fi
-
-      # Give server a short break between generations
-      sleep 2
-    done < ../workload.txt
+  # Stop the server
+  echo "Stopping Ollama server..."
+  if ps -p $ollama_pid > /dev/null 2>&1; then
+    kill $ollama_pid
+    sleep 3
+    if ps -p $ollama_pid > /dev/null 2>&1; then
+      kill -9 $ollama_pid
+    fi
   fi
 
-  echo "PGO: Completed workload with $prompt_count prompts."
+  ##################################################
+  echo "=== PHASE 4: VERIFY PROFILE DATA ==="
+  ##################################################
 
-  # Only stop the server if we started it
-  if [ -n "$ollama_pid" ]; then
-    echo "PGO: Stopping Ollama server (PID $ollama_pid)..."
-    if ps -p $ollama_pid > /dev/null 2>&1; then
-      kill $ollama_pid
-      # Wait for process to terminate
-      for i in {1..10}; do
-        if ! ps -p $ollama_pid > /dev/null 2>&1; then
-          echo "PGO: Server process terminated successfully."
-          break
-        fi
-        sleep 1
-      done
-      # Force kill if still running
-      if ps -p $ollama_pid > /dev/null 2>&1; then
-        echo "PGO: Server still running, force killing..."
-        kill -9 $ollama_pid
-        sleep 1
-      fi
+  # --- Check GCC Profile Data ---
+  echo "Searching for GCC profile data files..."
+  find "$BUILD_DIR" -name "*.gcda" > "${PGO_DATA_DIR_GCC}/gcda_files.txt"
+  GCDA_COUNT=$(wc -l < "${PGO_DATA_DIR_GCC}/gcda_files.txt")
+
+  if [ "$GCDA_COUNT" -gt 0 ]; then
+    echo "✓ Found $GCDA_COUNT GCC profile data files"
+    PGO_SUCCESS_GCC=true
+  else
+    echo "⚠ No GCC profile data files found."
+    PGO_SUCCESS_GCC=false
+  fi
+
+  # --- Check and Merge Clang Profile Data ---
+  echo "Searching for Clang profile data files..."
+  find "$BUILD_DIR" -name "*.profraw" > "${PGO_DATA_DIR_CLANG}/profraw_files.txt"
+  PROFRAW_COUNT=$(wc -l < "${PGO_DATA_DIR_CLANG}/profraw_files.txt")
+
+  if [ "$PROFRAW_COUNT" -gt 0 ]; then
+    echo "✓ Found $PROFRAW_COUNT Clang profile data files"
+    echo "Merging Clang profile data..."
+    llvm-profdata merge -output="${PGO_DATA_DIR_CLANG}/ollama.profdata" $(cat "${PGO_DATA_DIR_CLANG}/profraw_files.txt")
+    if [ $? -eq 0 ] && [ -f "${PGO_DATA_DIR_CLANG}/ollama.profdata" ]; then
+      echo "✓ Successfully merged Clang profile data into ollama.profdata"
+      PGO_SUCCESS_CLANG=true
     else
-      echo "PGO: Server process already terminated."
+      echo "⚠ Failed to merge Clang profile data"
+      PGO_SUCCESS_CLANG=false
     fi
   else
-    echo "PGO: Using existing Ollama server, not stopping it."
+    echo "⚠ No Clang profile data files found."
+    PGO_SUCCESS_CLANG=false
   fi
 
-  # Check for profile data and report results
-  echo "PGO: Checking for profile data collection..."
-
-  # Find any .gcda files in the build directory or PGO data directory
-  PGO_FILES=$(find "${BUILD_DIR}" -name "*.gcda" 2>/dev/null | wc -l)
-  if [ "$PGO_FILES" -gt 0 ]; then
-    echo "PGO: ✓ Found $PGO_FILES profile data files (*.gcda)"
+  # --- Overall PGO Success ---
+  #   Consider PGO successful if *either* GCC or Clang PGO succeeded.
+  #   You might want to adjust this logic based on your priorities.
+  if [ "$PGO_SUCCESS_GCC" = true ] || [ "$PGO_SUCCESS_CLANG" = true ]; then
     PGO_SUCCESS=true
-
-    # List some of the profile data files for verification
-    echo "PGO: Sample profile data files:"
-    find "${BUILD_DIR}" -name "*.gcda" | head -n 5
   else
-    echo "PGO: ✗ No profile data files found"
-    echo "PGO: Will continue without PGO, performance may not be optimal"
     PGO_SUCCESS=false
   fi
 
-  # Stage 3: Rebuild with PGO data
-  echo "PGO: Stage 3 - Rebuilding with PGO optimizations"
+  ##################################################
+  echo "=== PHASE 5: OPTIMIZED REBUILD ==="
+  ##################################################
 
   if [ "$PGO_SUCCESS" = true ]; then
-    # Set flags for profile use
-    export CGO_CFLAGS="${CFLAGS} -march=native -mtune=native -fprofile-use=${BUILD_DIR}/pgo_data -fprofile-correction -Wno-error -Wno-missing-profile"
-    export CGO_CXXFLAGS="${CXXFLAGS} -march=native -mtune=native -fprofile-use=${BUILD_DIR}/pgo_data -fprofile-correction -Wno-error -Wno-missing-profile"
-    export CGO_LDFLAGS="${LDFLAGS} -march=native -mtune=native -fprofile-use=${BUILD_DIR}/pgo_data -fprofile-correction -Wno-error -Wno-missing-profile"
+    echo "Rebuilding with profile data..."
+
+    # --- GCC (CPU) Optimized Flags ---
+    if [ "$PGO_SUCCESS_GCC" = true ]; then
+      export CFLAGS_GCC="${ORIGINAL_CFLAGS_GCC} -fprofile-use=${PGO_DATA_DIR_GCC} -fprofile-correction -Wno-error -Wno-missing-profile"
+      export CXXFLAGS_GCC="${ORIGINAL_CXXFLAGS_GCC} -fprofile-use=${PGO_DATA_DIR_GCC} -fprofile-correction -Wno-error -Wno-missing-profile"
+      export LDFLAGS_GCC="${ORIGINAL_LDFLAGS_GCC} -fprofile-use=${PGO_DATA_DIR_GCC} -fprofile-correction -Wno-error -Wno-missing-profile"
+    else
+      export CFLAGS_GCC="${ORIGINAL_CFLAGS_GCC} -Wno-error -Wno-missing-profile"
+      export CXXFLAGS_GCC="${ORIGINAL_CXXFLAGS_GCC} -Wno-error -Wno-missing-profile"
+      export LDFLAGS_GCC="${ORIGINAL_LDFLAGS_GCC} -Wno-error -Wno-missing-profile"
+    fi
+
+    # --- Clang (HIP) Optimized Flags ---
+    if [ "$PGO_SUCCESS_CLANG" = true ]; then
+      export CFLAGS_CLANG="${ORIGINAL_CFLAGS_CLANG} -fprofile-instr-use=${PGO_DATA_DIR_CLANG}/ollama.profdata -Wno-error -Wno-missing-profile"
+      export CXXFLAGS_CLANG="${ORIGINAL_CXXFLAGS_CLANG} -fprofile-instr-use=${PGO_DATA_DIR_CLANG}/ollama.profdata -Wno-error -Wno-missing-profile"
+      export LDFLAGS_CLANG="${ORIGINAL_LDFLAGS_CLANG} -fprofile-instr-use=${PGO_DATA_DIR_CLANG}/ollama.profdata -Wno-error -Wno-missing-profile"
+    else
+      export CFLAGS_CLANG="${ORIGINAL_CFLAGS_CLANG} -Wno-error -Wno-missing-profile"
+      export CXXFLAGS_CLANG="${ORIGINAL_CXXFLAGS_CLANG} -Wno-error -Wno-missing-profile"
+      export LDFLAGS_CLANG="${ORIGINAL_LDFLAGS_CLANG} -Wno-error -Wno-missing-profile"
+    fi
+
+    # Update CGO flags (still using GCC flags)
+    export CGO_CFLAGS="${CFLAGS_GCC}"
+    export CGO_CXXFLAGS="${CXXFLAGS_GCC}"
+    export CGO_LDFLAGS="${LDFLAGS_GCC}"
+
   else
-    # Fall back to regular optimization flags without PGO
-    export CGO_CFLAGS="${CFLAGS} -march=native -mtune=native"
-    export CGO_CXXFLAGS="${CXXFLAGS} -march=native -mtune=native"
-    export CGO_LDFLAGS="${LDFLAGS} -march=native -mtune=native"
+    echo "Rebuilding with standard optimizations (no PGO)..."
+    # Use standard optimization flags
+    export CFLAGS_GCC="${ORIGINAL_CFLAGS_GCC} -Wno-error -Wno-missing-profile"
+    export CXXFLAGS_GCC="${ORIGINAL_CXXFLAGS_GCC} -Wno-error -Wno-missing-profile"
+    export LDFLAGS_GCC="${ORIGINAL_LDFLAGS_GCC} -Wno-error -Wno-missing-profile"
+
+    export CFLAGS_CLANG="${ORIGINAL_CFLAGS_CLANG} -Wno-error -Wno-missing-profile"
+    export CXXFLAGS_CLANG="${ORIGINAL_CXXFLAGS_CLANG} -Wno-error -Wno-missing-profile"
+    export LDFLAGS_CLANG="${ORIGINAL_LDFLAGS_CLANG} -Wno-error -Wno-missing-profile"
+
+    # Update CGO flags
+    export CGO_CFLAGS="${CFLAGS_GCC}"
+    export CGO_CXXFLAGS="${CXXFLAGS_GCC}"
+    export CGO_LDFLAGS="${LDFLAGS_GCC}"
   fi
 
   # Rebuild C/C++ components
+  echo "Rebuilding C/C++ components..."
   cmake --build build --clean-first
 
-  # Rebuild Go components
+  # Rebuild Go components (final binary)
+  echo "Rebuilding Go components..."
   go build -o ollama .
 
-  echo "PGO: Build completed"
+  echo "✓ Build complete."
 }
 
 check() {
