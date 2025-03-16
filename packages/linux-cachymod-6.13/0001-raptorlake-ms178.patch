@@ -2112,8 +2112,8 @@
 +        pushq %r14
 +        pushq %r15
 +
-+        /* Only set direction flag at the main entry point */
-+        cld
++        /* Do not set direction flag at the main entry point due to objtool warnings */
++        /* cld */
 +
 +        /* Optimize branch prediction by checking zero length first */
 +        testq %rcx, %rcx
@@ -2885,7 +2885,7 @@
  
  #include <linux/export.h>
  #include <linux/linkage.h>
-@@ -9,109 +10,367 @@
+@@ -9,109 +10,342 @@
  .section .noinstr.text, "ax"
  
  /*
@@ -2893,7 +2893,10 @@
 - * string to get better performance than the original function. The code is
 - * simpler and shorter than the original function as well.
 + * ISO C memset - set a memory block to a byte value.
-+ * Optimized for Intel Raptor Lake architecture.
++ * Optimized for Intel Raptor Lake architecture with P/E-core awareness.
++ *
++ * P-cores: >2KB threshold for ERMSB, 64B-2KB use AVX2 when available
++ * E-cores: >1KB threshold for ERMSB, 64B-1KB use AVX2 when available
   *
   * rdi   destination
   * rsi   value (char)
@@ -2917,19 +2920,13 @@
 +
 +        /* Ensure proper direction flag - keep this as the main entry point */
 +        cld
- 
--	movq %rdi,%r9
--	movb %sil,%al
--	movq %rdx,%rcx
--	rep stosb
--	movq %r9,%rax
--	RET
++
 +        /* Check for zero-length case first */
 +        testq %rdx, %rdx
 +        jz .L_zero_length
 +
-+        /* Fast path with FSRS - use rep stosb for all sizes */
-+        ALTERNATIVE "jmp memset_orig", "", X86_FEATURE_FSRS
++        /* Fast path with FSRS for large buffers */
++        ALTERNATIVE "jmp .L_hybrid_path", "", X86_FEATURE_FSRS
 +
 +        /* Expand byte value to fill %al */
 +        movb %sil, %al
@@ -2938,7 +2935,13 @@
 +.L_zero_length:
 +        movq %r9, %rax
 +        RET
-+
+ 
+-	movq %rdi,%r9
+-	movb %sil,%al
+-	movq %rdx,%rcx
+-	rep stosb
+-	movq %r9,%rax
+-	RET
 +        /* Exception table for FSRS path */
 +        _ASM_EXTABLE(1b, .Lfsrs_fault_handler)
  SYM_FUNC_END(__memset)
@@ -2947,237 +2950,200 @@
  SYM_FUNC_ALIAS_MEMFUNC(memset, __memset)
  EXPORT_SYMBOL(memset)
  
-+/* Fault handler for FSRS path */
-+.Lfsrs_fault_handler:
-+        /* cld not required */
-+        movq %r9, %rax     /* Restore original destination */
-+        RET                /* Return directly for consistency */
-+
-+/* Optimized path for large sets using AVX2 */
-+SYM_FUNC_START_LOCAL(memset_pcore_path)
-+        /* Save return value */
++/* P/E-core hybrid aware path */
++SYM_FUNC_START_LOCAL(.L_hybrid_path)
++        /* Store original destination for return value */
 +        movq %rdi, %r10
 +
-+        /* Handle zero-length case */
-+        testq %rdx, %rdx
-+        jz .Lexit_pcore
++        /* For small blocks (<64 bytes), use scalar path directly */
++        cmpq $64, %rdx
++        jb .L_small_path
 +
-+        /* Expand byte value */
++        /* For large blocks, use different thresholds for P-cores vs E-cores */
++        /* Check CPU type if available (Intel Hybrid bit) */
++        ALTERNATIVE "jmp .L_pcore_path", "", X86_FEATURE_HYBRID_CPU
++
++        /* E-core path: Use ERMSB for >1KB, otherwise scalar/AVX path */
++        cmpq $1024, %rdx
++        ja .L_use_ermsb
++
++        /* Use AVX2 for medium blocks if available */
++        ALTERNATIVE "jmp .L_use_scalar", "", X86_FEATURE_AVX2
++
++        jmp .L_use_avx2
++
++.L_pcore_path:
++        /* P-core path: Use ERMSB for >2KB, otherwise scalar/AVX path */
++        cmpq $2048, %rdx
++        ja .L_use_ermsb
++
++        /* Use AVX2 for medium blocks if available */
++        ALTERNATIVE "jmp .L_use_scalar", "", X86_FEATURE_AVX2
++
++        jmp .L_use_avx2
++
++.L_use_ermsb:
++        /* Enhanced REP STOSB path - optimized for both P and E cores */
++        movb %sil, %al
++        movq %rdx, %rcx
++2:      rep stosb
++        movq %r10, %rax
++        RET
++
++.L_use_avx2:
++        /* AVX2 path for medium blocks */
++        /* Broadcast byte value to YMM register */
++        movzbl %sil, %eax
++        vmovd %eax, %xmm0
++        vpbroadcastb %xmm0, %ymm0
++
++        /* Align destination to 32-byte boundary */
++        movl %edi, %ecx
++        andl $31, %ecx
++        jz .L_avx2_aligned
++
++        /* Calculate bytes to align */
++        movl $32, %r8d
++        subl %ecx, %r8d
++
++        /* Ensure alignment doesn't exceed total size */
++        movq %r8, %rcx
++        cmpq %rdx, %rcx
++        jbe 3f
++        movq %rdx, %rcx
++
++3:      /* Align with rep stosb */
++        movb %sil, %al
++        subq %rcx, %rdx
++        rep stosb
++
++.L_avx2_aligned:
++        /* Process 64-byte chunks */
++        movq %rdx, %rcx
++        shrq $6, %rcx
++        jz .L_avx2_remainder
++
++.L_avx2_loop:
++4:      vmovdqa %ymm0, (%rdi)
++5:      vmovdqa %ymm0, 32(%rdi)
++        addq $64, %rdi
++        decq %rcx
++        jnz .L_avx2_loop
++
++        /* Process remainder bytes */
++        andq $63, %rdx
++
++.L_avx2_remainder:
++        testq %rdx, %rdx
++        jz .L_avx2_done
++
++        /* Process 32-byte chunk if applicable */
++        cmpq $32, %rdx
++        jb .L_avx2_small_remainder
++
++6:      vmovdqa %ymm0, (%rdi)
++        addq $32, %rdi
++        subq $32, %rdx
++
++.L_avx2_small_remainder:
++        /* Process remaining bytes with scalar */
++        testq %rdx, %rdx
++        jz .L_avx2_done
++
++        /* Use rep stosb for tail */
++        movq %rdx, %rcx
++        movb %sil, %al
++        rep stosb
++
++.L_avx2_done:
++        vzeroupper
++        movq %r10, %rax
++        RET
++
++.L_use_scalar:
++.L_small_path:
++        /* Scalar path for small blocks */
 +        movzbl %sil, %ecx
 +        movabs $0x0101010101010101, %rax
 +        imulq %rcx, %rax
 +
-+        /* Save callee-saved registers we'll use */
-+        pushq %rbx
-+        pushq %r12
-+        pushq %r13
-+        pushq %r14
-+        pushq %r15
++        /* Handle small sizes (<64 bytes) with optimized code */
++        cmpq $8, %rdx
++        jb .L_small_lt8
 +
-+        /* Check for AVX2 support for large blocks - increased for Raptor Lake's improved FSRS */
-+        cmpq $65536, %rdx  /* 64KB threshold to leverage Raptor Lake's FSRS */
-+        jb .Lno_avx_path
-+
-+        /* Use AVX path for large blocks if supported */
-+        ALTERNATIVE "jmp .Lno_avx_path", "", X86_FEATURE_AVX2
-+
-+        /* Check if kernel allows AVX usage */
-+        ALTERNATIVE "jmp .Lno_avx_path", "", X86_FEATURE_OSXSAVE
-+
-+        /* For very large sets, use non-temporal stores */
-+        cmpq $1048576, %rdx    /* 1MB threshold */
-+        jae .Lavx_nt_path
-+
-+        /* AVX2 path for large blocks */
-+        /* Broadcast byte to YMM register */
-+        vmovd %ecx, %xmm0
-+        vpbroadcastb %xmm0, %ymm0
-+
-+        /* Align destination to 64-byte boundary for Raptor Lake */
-+        movl %edi, %ecx
-+        andl $63, %ecx        /* Check 64-byte alignment */
-+        jz .Lavx_aligned
-+
-+        /* Calculate bytes to align */
-+        movl $64, %r8d
-+        subl %ecx, %r8d
-+
-+        /* Ensure alignment doesn't exceed total size */
-+        movq %r8, %rcx
-+        cmpq %rdx, %rcx
-+        jbe 2f
++        /* Handle 8+ bytes - start with 8-byte chunks */
 +        movq %rdx, %rcx
++        shrq $3, %rcx
++        jz .L_small_remainder
 +
-+2:      /* Align with rep stosb */
-+        subq %rcx, %rdx
-+        rep stosb
-+
-+        /* Skip AVX if no bytes remain */
-+        testq %rdx, %rdx
-+        jz .Lexit_pcore
-+
-+.Lavx_aligned:
-+        /* Set up for 128-byte chunk copies */
-+        movq %rdx, %rcx
-+        shrq $7, %rcx     /* Divide by 128 */
-+        jz .Lavx_remainder
-+
-+        /* Add prefetching for large copies (>1KB) */
-+        cmpq $1024, %rdx
-+        jl .Lavx_loop
-+
-+        /* Prefetch ahead with optimized distances for Raptor Lake */
-+3:      prefetcht0 384(%rdi)  /* L1 cache */
-+4:      prefetcht1 512(%rdi)  /* L2 cache */
-+
-+        .p2align 4
-+.Lavx_loop:
-+        /* Store 128 bytes (4x 32-byte AVX stores) */
-+5:      vmovdqa %ymm0, 0*32(%rdi)
-+6:      vmovdqa %ymm0, 1*32(%rdi)
-+7:      vmovdqa %ymm0, 2*32(%rdi)
-+8:      vmovdqa %ymm0, 3*32(%rdi)
-+
-+        /* Periodic prefetch for large transfers optimized for Raptor Lake client */
-+        testq $0xF, %rcx    /* Changed from $0x7 to $0xF to optimize frequency */
-+        jnz 9f
-+        cmpq $32, %rcx      /* Changed from $16 to $32 to focus on larger transfers */
-+        jl 9f
-+10:     prefetcht0 384(%rdi)
-+
-+9:      addq $128, %rdi
++.L_small_loop:
++7:      movq %rax, (%rdi)
++        addq $8, %rdi
 +        decq %rcx
-+        jnz .Lavx_loop
++        jnz .L_small_loop
 +
-+        /* Calculate remaining bytes */
-+        andq $127, %rdx
-+        jmp .Lavx_remainder
++.L_small_remainder:
++        /* Handle 0-7 remaining bytes */
++        andq $7, %rdx
++        jz .L_small_done
 +
-+.Lavx_nt_path:
-+        /* Non-temporal stores for very large sets */
-+        /* Broadcast byte to YMM register */
-+        vmovd %ecx, %xmm0
-+        vpbroadcastb %xmm0, %ymm0
++.L_small_lt8:
++        /* Handle 4-byte chunk if applicable */
++        cmpq $4, %rdx
++        jb .L_small_lt4
 +
-+        /* Align destination to 64-byte boundary for Raptor Lake */
-+        movl %edi, %ecx
-+        andl $63, %ecx
-+        jz .Lavx_nt_aligned
++8:      movl %eax, (%rdi)
++        addq $4, %rdi
++        subq $4, %rdx
 +
-+        /* Calculate bytes to align */
-+        movl $64, %r8d
-+        subl %ecx, %r8d
++.L_small_lt4:
++        /* Handle 2-byte chunk if applicable */
++        cmpq $2, %rdx
++        jb .L_small_lt2
 +
-+        /* Ensure alignment doesn't exceed total size */
-+        movq %r8, %rcx
-+        cmpq %rdx, %rcx
-+        jbe 11f
-+        movq %rdx, %rcx
++9:      movw %ax, (%rdi)
++        addq $2, %rdi
++        subq $2, %rdx
 +
-+11:     /* Align with rep stosb */
-+        subq %rcx, %rdx
-+        rep stosb
-+
-+        /* Skip AVX if no bytes remain */
++.L_small_lt2:
++        /* Handle last byte if applicable */
 +        testq %rdx, %rdx
-+        jz .Lexit_pcore
++        jz .L_small_done
 +
-+.Lavx_nt_aligned:
-+        /* Set up for 128-byte chunk copies */
-+        movq %rdx, %rcx
-+        shrq $7, %rcx     /* Divide by 128 */
-+        andq $127, %rdx   /* Save remainder */
++10:     movb %al, (%rdi)
 +
-+        .p2align 4
-+.Lavx_nt_loop:
-+        /* Store 128 bytes with non-temporal stores */
-+12:     vmovntdq %ymm0, 0*32(%rdi)
-+13:     vmovntdq %ymm0, 1*32(%rdi)
-+14:     vmovntdq %ymm0, 2*32(%rdi)
-+15:     vmovntdq %ymm0, 3*32(%rdi)
-+
-+        addq $128, %rdi
-+        decq %rcx
-+        jnz .Lavx_nt_loop
-+
-+        /* Ensure non-temporal stores are visible */
-+        sfence
-+
-+.Lavx_remainder:
-+        /* Clear AVX state to avoid penalties */
-+        vzeroupper
-+
-+        /* Handle remaining bytes (<128) */
-+        testq %rdx, %rdx
-+        jz .Lexit_pcore
-+
-+        /* Use rep stosb for tail */
-+        movq %rdx, %rcx
-+        rep stosb
-+
-+.Lexit_pcore:
-+        /* Restore saved registers and return */
-+        movq %r10, %rax  /* Return original pointer */
-+        popq %r15
-+        popq %r14
-+        popq %r13
-+        popq %r12
-+        popq %rbx
++.L_small_done:
++        movq %r10, %rax
 +        RET
 +
-+.Lno_avx_path:
-+        /* Restore registers before jumping to regular path */
-+        movq %r10, %rax  /* Restore original pointer */
-+        popq %r15
-+        popq %r14
-+        popq %r13
-+        popq %r12
-+        popq %rbx
-+        jmp memset_orig
-+
-+/* AVX fault handler - properly clean up and return */
-+.Lavx_fault_handler:
-+        /* Clean up AVX state, clear direction flag, and return original destination */
-+        vzeroupper
-+        cld                 /* Ensure direction flag is cleared */
-+        movq %r10, %rax     /* Restore original destination */
-+        popq %r15
-+        popq %r14
-+        popq %r13
-+        popq %r12
-+        popq %rbx
++/* Fault handlers */
++.Lfsrs_fault_handler:
++        cld
++        movq %r9, %rax
 +        RET
 +
-+/* Exception tables for AVX path */
-+        _ASM_EXTABLE(2b, .Lavx_fault_handler)
-+        _ASM_EXTABLE(3b, .Lavx_fault_handler)  /* Prefetch */
-+        _ASM_EXTABLE(4b, .Lavx_fault_handler)  /* Prefetch */
-+        _ASM_EXTABLE(5b, .Lavx_fault_handler)
-+        _ASM_EXTABLE(6b, .Lavx_fault_handler)
-+        _ASM_EXTABLE(7b, .Lavx_fault_handler)
-+        _ASM_EXTABLE(8b, .Lavx_fault_handler)
-+        _ASM_EXTABLE(9b, .Lavx_fault_handler)
-+        _ASM_EXTABLE(10b, .Lavx_fault_handler) /* Prefetch */
-+        _ASM_EXTABLE(11b, .Lavx_fault_handler)
-+        _ASM_EXTABLE(12b, .Lavx_fault_handler)
-+        _ASM_EXTABLE(13b, .Lavx_fault_handler)
-+        _ASM_EXTABLE(14b, .Lavx_fault_handler)
-+        _ASM_EXTABLE(15b, .Lavx_fault_handler)
-+SYM_FUNC_END(memset_pcore_path)
++.L_hybrid_fault_handler:
++        /* Clean up AVX state if needed */
++        ALTERNATIVE "nop", "vzeroupper", X86_FEATURE_AVX2
++        cld
++        movq %r10, %rax
++        RET
++
++        /* Exception tables for hybrid path */
++        _ASM_EXTABLE(2b, .L_hybrid_fault_handler)
++        _ASM_EXTABLE(3b, .L_hybrid_fault_handler)
++        _ASM_EXTABLE(4b, .L_hybrid_fault_handler)
++        _ASM_EXTABLE(5b, .L_hybrid_fault_handler)
++        _ASM_EXTABLE(6b, .L_hybrid_fault_handler)
++        _ASM_EXTABLE(7b, .L_hybrid_fault_handler)
++        _ASM_EXTABLE(8b, .L_hybrid_fault_handler)
++        _ASM_EXTABLE(9b, .L_hybrid_fault_handler)
++        _ASM_EXTABLE(10b, .L_hybrid_fault_handler)
++SYM_FUNC_END(.L_hybrid_path)
 +
 +/* Original memset implementation (non-optimized fallback) */
  SYM_FUNC_START_LOCAL(memset_orig)
 -	movq %rdi,%r10
- 
--	/* expand byte value  */
--	movzbl %sil,%ecx
--	movabs $0x0101010101010101,%rax
--	imulq  %rcx,%rax
--
--	/* align dst */
--	movl  %edi,%r9d
--	andl  $7,%r9d
--	jnz  .Lbad_alignment
 +        /* Store original destination for return value */
 +        movq %rdi, %r9
 +
@@ -3216,7 +3182,16 @@
 +        /* Check if we have bytes left to set */
 +        testq %rdx, %rdx
 +        jz .Lende
-+
+ 
+-	/* expand byte value  */
+-	movzbl %sil,%ecx
+-	movabs $0x0101010101010101,%rax
+-	imulq  %rcx,%rax
+-
+-	/* align dst */
+-	movl  %edi,%r9d
+-	andl  $7,%r9d
+-	jnz  .Lbad_alignment
  .Lafter_bad_alignment:
 +        /* Check if we have enough memory for prefetching */
 +        cmpq $256, %rdx
