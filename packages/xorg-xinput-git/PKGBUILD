@@ -1,15 +1,12 @@
-# Maintainer:  Vincent Grande <shoober420@gmail.com>
-# Contributor: Jan de Groot <jgc@archlinux.org>
-
 pkgname=xorg-xinput-git
-pkgver=xinput.1.6.3.r7.g8cebd89
+pkgver=xinput.1.6.4.r5.g39d47a8
 pkgrel=1
 pkgdesc="Small commandline tool to configure devices"
 arch=(x86_64)
 url="https://xorg.freedesktop.org/"
 license=('custom')
 depends=('libx11' 'xorg-xrandr' 'libxinerama')
-makedepends=('xorg-util-macros' 'xorgproto' 'libxfixes')
+makedepends=('xorg-util-macros' 'xorgproto' 'libxfixes' 'clang' 'llvm')
 provides=(xorg-xinput)
 conflicts=(xorg-xinput)
 groups=('xorg-apps' 'xorg')
@@ -23,10 +20,294 @@ pkgver() {
 }
 
 build() {
-  cd xinput
+  cd "${srcdir}/xinput"
+
+  # PGO instrumentation flags - using your exact values
+  local _common_instrument_flags=" -g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=50 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
+
+  # Create directories for profiles and temporary installations
+  mkdir -p "${srcdir}/pgo_profiles" "${srcdir}/cs_pgo_profiles" "${srcdir}/bolt_profile"
+  mkdir -p "${srcdir}/temp_install_pgo" "${srcdir}/temp_install_cs_pgo" "${srcdir}/bolt_instrumented" "${srcdir}/bolt_opt"
+
+  ##################################################
+  # Create comprehensive training workload
+  ##################################################
+  echo "Creating comprehensive training workload script..."
+
+  cat > "${srcdir}/training_workload.sh" << 'EOF'
+#!/bin/bash
+
+# The program to test (passed as arg) or use default
+PROGRAM="${1:-xinput}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROGRAM_PATH="${2:-$SCRIPT_DIR/temp_install/usr/bin/$PROGRAM}"
+PROFILE_DIR="${3:-$SCRIPT_DIR/pgo_profiles}"
+
+# Check if the binary exists
+if [ ! -f "$PROGRAM_PATH" ]; then
+  echo "Error: Program binary not found at $PROGRAM_PATH"
+  exit 1
+fi
+
+# Verify we're running inside a graphical environment
+if [ -z "$DISPLAY" ]; then
+  echo "Warning: DISPLAY environment variable not set. Using limited testing mode."
+  export DISPLAY=:0  # Try with :0 as fallback
+fi
+
+echo "Starting xinput training workload..."
+
+# Function to run command and ignore errors
+run_cmd() {
+  echo "Running: $*"
+  "$@" 2>/dev/null || true
+}
+
+# Basic commands
+run_cmd "$PROGRAM_PATH" version
+run_cmd "$PROGRAM_PATH" --version
+run_cmd "$PROGRAM_PATH" --help
+
+# List devices in various formats
+run_cmd "$PROGRAM_PATH" list
+run_cmd "$PROGRAM_PATH" list --short
+run_cmd "$PROGRAM_PATH" list --long
+run_cmd "$PROGRAM_PATH" list --name-only
+run_cmd "$PROGRAM_PATH" list --id-only
+
+# If we have a valid DISPLAY, try more extensive tests
+if xdpyinfo >/dev/null 2>&1; then
+  echo "Valid X display found, running device-specific tests"
+
+  # Get list of device IDs
+  DEVICE_IDS=$(run_cmd "$PROGRAM_PATH" list --id-only | grep -v "unable to find device")
+
+  if [ -n "$DEVICE_IDS" ]; then
+    # Process each device
+    for DEVICE_ID in $DEVICE_IDS; do
+      echo "Testing device ID: $DEVICE_ID"
+
+      # Basic device info
+      run_cmd "$PROGRAM_PATH" list $DEVICE_ID
+
+      # Properties
+      run_cmd "$PROGRAM_PATH" list-props $DEVICE_ID
+      run_cmd "$PROGRAM_PATH" list-props $DEVICE_ID --short
+      run_cmd "$PROGRAM_PATH" list-props $DEVICE_ID --long
+
+      # Try other commands that work with most devices
+      run_cmd "$PROGRAM_PATH" query-state $DEVICE_ID
+      run_cmd "$PROGRAM_PATH" get-button-map $DEVICE_ID
+      run_cmd "$PROGRAM_PATH" get-feedbacks $DEVICE_ID
+    done
+
+    # For more intensive testing, choose one device for property experiments
+    FIRST_DEVICE=$(echo "$DEVICE_IDS" | head -1)
+    if [ -n "$FIRST_DEVICE" ]; then
+      # Get property IDs
+      PROP_LIST=$(run_cmd "$PROGRAM_PATH" list-props $FIRST_DEVICE | grep -oE '^\s+\([0-9]+\)' | grep -oE '[0-9]+')
+
+      # Try to query each property
+      for PROP_ID in $PROP_LIST; do
+        run_cmd "$PROGRAM_PATH" get-prop $FIRST_DEVICE $PROP_ID
+      done
+    fi
+  fi
+
+  # Run repeated tests to ensure good profiling data
+  for i in {1..5}; do
+    echo "Running iteration $i of basic tests"
+    run_cmd "$PROGRAM_PATH" list
+    run_cmd "$PROGRAM_PATH" list --short
+    run_cmd "$PROGRAM_PATH" list --name-only
+
+    # Test with one device if available
+    if [ -n "$FIRST_DEVICE" ]; then
+      run_cmd "$PROGRAM_PATH" list-props $FIRST_DEVICE
+      run_cmd "$PROGRAM_PATH" query-state $FIRST_DEVICE
+    fi
+  done
+fi
+
+echo "Training workload completed"
+EOF
+
+  chmod +x "${srcdir}/training_workload.sh"
+
+  ##################################################
+  # Phase 1: Standard PGO - Instrumentation
+  ##################################################
+  echo "Building with standard PGO instrumentation..."
+
+  # Clean first
+  autoreconf -vfi
+
+  # Configure with PGO instrumentation
+  export CFLAGS="${CFLAGS} ${_common_instrument_flags} -fprofile-generate=${srcdir}/pgo_profiles"
+  export CXXFLAGS="${CXXFLAGS} ${_common_instrument_flags} -fprofile-generate=${srcdir}/pgo_profiles"
+  export LDFLAGS="${LDFLAGS} ${_common_instrument_flags} -fprofile-generate=${srcdir}/pgo_profiles"
+
+  ./configure --prefix=/usr
+  make clean
+  make
+
+  # Install to temporary location
+  make DESTDIR="${srcdir}/temp_install_pgo" install
+
+  ##################################################
+  # Phase 2: Standard PGO - Training
+  ##################################################
+  echo "Running standard PGO training workload..."
+
+  # Run the training workload with the instrumented binary
+  "${srcdir}/training_workload.sh" xinput "${srcdir}/temp_install_pgo/usr/bin/xinput" "${srcdir}/pgo_profiles"
+
+  # Run additional iterations
+  for i in {1..3}; do
+    echo "Running additional training iteration $i"
+    "${srcdir}/training_workload.sh" xinput "${srcdir}/temp_install_pgo/usr/bin/xinput" "${srcdir}/pgo_profiles" >/dev/null 2>&1 || true
+  done
+
+  # Merge profiles
+  echo "Merging standard PGO profiles..."
+  llvm-profdata merge -output="${srcdir}/merged_pgo.profdata" "${srcdir}/pgo_profiles"
+
+  ##################################################
+  # Phase 3: Context-sensitive PGO - Instrumentation
+  ##################################################
+  echo "Building with context-sensitive PGO instrumentation..."
+
+  # Configure with CS PGO instrumentation using standard PGO data
+  export CFLAGS="${CFLAGS/-fprofile-generate=*/} ${_common_instrument_flags} -fprofile-use=${srcdir}/merged_pgo.profdata -fcs-profile-generate=${srcdir}/cs_pgo_profiles"
+  export CXXFLAGS="${CXXFLAGS/-fprofile-generate=*/} ${_common_instrument_flags} -fprofile-use=${srcdir}/merged_pgo.profdata -fcs-profile-generate=${srcdir}/cs_pgo_profiles"
+  export LDFLAGS="${LDFLAGS/-fprofile-generate=*/} ${_common_instrument_flags} -fprofile-use=${srcdir}/merged_pgo.profdata -fcs-profile-generate=${srcdir}/cs_pgo_profiles"
+
   autoreconf -vfi
   ./configure --prefix=/usr
+  make clean
   make
+
+  # Install to temporary location
+  make DESTDIR="${srcdir}/temp_install_cs_pgo" install
+
+  ##################################################
+  # Phase 4: Context-sensitive PGO - Training
+  ##################################################
+  echo "Running context-sensitive PGO training workload..."
+
+  # Run the training workload with the CS instrumented binary
+  "${srcdir}/training_workload.sh" xinput "${srcdir}/temp_install_cs_pgo/usr/bin/xinput" "${srcdir}/cs_pgo_profiles"
+
+  # Run additional iterations
+  for i in {1..3}; do
+    echo "Running additional CS training iteration $i"
+    "${srcdir}/training_workload.sh" xinput "${srcdir}/temp_install_cs_pgo/usr/bin/xinput" "${srcdir}/cs_pgo_profiles" >/dev/null 2>&1 || true
+  done
+
+  # Merge CS profiles
+  echo "Merging context-sensitive PGO profiles..."
+  llvm-profdata merge -output="${srcdir}/merged_cs_pgo.profdata" "${srcdir}/cs_pgo_profiles"
+
+  # Merge both standard and CS profiles
+  echo "Merging all PGO profiles..."
+  llvm-profdata merge -output="${srcdir}/final_pgo.profdata" "${srcdir}/merged_pgo.profdata" "${srcdir}/merged_cs_pgo.profdata"
+
+  ##################################################
+  # Phase 5: Final PGO-optimized build
+  ##################################################
+  echo "Building with final PGO-optimized flags..."
+
+  # Build with PGO optimization and add --emit-relocs for BOLT
+  export CFLAGS="${CFLAGS/-fcs-profile-generate=*/} -fprofile-use=${srcdir}/final_pgo.profdata"
+  export CXXFLAGS="${CXXFLAGS/-fcs-profile-generate=*/} -fprofile-use=${srcdir}/final_pgo.profdata"
+  export LDFLAGS="${LDFLAGS/-fcs-profile-generate=*/} -fprofile-use=${srcdir}/final_pgo.profdata -Wl,--emit-relocs"
+
+  autoreconf -vfi
+  ./configure --prefix=/usr
+  make clean
+  make
+
+  # Save the optimized binary for BOLT
+  mkdir -p "${srcdir}/bolt_opt"
+  # Find the actual binary location
+  XINPUT_BIN=$(find . -name xinput -type f -executable | head -1)
+  if [ -n "$XINPUT_BIN" ]; then
+    cp "$XINPUT_BIN" "${srcdir}/bolt_opt/xinput.orig"
+  else
+    echo "Error: Could not find xinput binary"
+    exit 1
+  fi
+
+  ##################################################
+  # Phase 6: BOLT Instrumentation
+  ##################################################
+  echo "Applying BOLT instrumentation..."
+
+  mkdir -p "${srcdir}/bolt_profile"
+
+  # Instrument with BOLT
+  llvm-bolt "${srcdir}/bolt_opt/xinput.orig" \
+    --instrument \
+    --instrumentation-file="${srcdir}/bolt_profile/xinput.fdata" \
+    -o "${srcdir}/bolt_instrumented/xinput.inst"
+
+  ##################################################
+  # Phase 7: BOLT Training
+  ##################################################
+  echo "Running BOLT training workload..."
+
+  # Set BOLT environment variables
+  export BOLT_USE_INSTRUMENT=1
+
+  # Run training workload with BOLT instrumented binary
+  "${srcdir}/training_workload.sh" xinput "${srcdir}/bolt_instrumented/xinput.inst" "${srcdir}/bolt_profile"
+
+  # Run additional iterations
+  for i in {1..3}; do
+    echo "Running additional BOLT training iteration $i"
+    "${srcdir}/training_workload.sh" xinput "${srcdir}/bolt_instrumented/xinput.inst" "${srcdir}/bolt_profile" >/dev/null 2>&1 || true
+  done
+
+  ##################################################
+  # Phase 8: BOLT Optimization
+  ##################################################
+  echo "Applying BOLT optimizations..."
+
+  # Merge BOLT profiles
+  if [ -f "${srcdir}/bolt_profile/xinput.fdata" ]; then
+    # Apply BOLT optimizations - using your exact options
+    llvm-bolt "${srcdir}/bolt_opt/xinput.orig" \
+      --data="${srcdir}/bolt_profile/xinput.fdata" \
+      --dyno-stats \
+      --frame-opt=all \
+      --lite=false \
+      --infer-stale-profile=1 \
+      --icf=all \
+      --plt=all \
+      --hugify \
+      --peepholes=all \
+      --x86-strip-redundant-address-size \
+      --indirect-call-promotion=all \
+      --reorder-blocks=ext-tsp \
+      --reorder-functions=cdsort \
+      --split-all-cold \
+      --split-eh \
+      --split-functions \
+      --split-strategy=cdsplit \
+      --align-functions=32 \
+      --frame-opt-rm-stores \
+      --jump-tables=aggressive \
+      --stoke \
+      -o xinput.bolt
+
+    # If successful, use the optimized binary
+    if [ -f "xinput.bolt" ]; then
+      echo "BOLT optimization succeeded, using optimized binary"
+      cp xinput.bolt xinput
+    fi
+  else
+    echo "No BOLT profile data found, skipping BOLT optimization"
+  fi
 }
 
 package() {
