@@ -1,3 +1,374 @@
+--- a/arch/x86/kernel/cpu/topology.c	2025-03-13 13:08:08.000000000 +0100
++++ b/arch/x86/kernel/cpu/topology.c	2025-03-18 18:59:24.095000486 +0100
+@@ -31,6 +31,11 @@
+ #include <asm/io_apic.h>
+ #include <asm/mpspec.h>
+ #include <asm/smp.h>
++#include <asm/cpufeature.h> /* For boot_cpu_has() */
++#if defined(CONFIG_AS_AVX2) && defined(CONFIG_X86_64)
++#include <asm/fpu/api.h>    /* For FPU state management */
++#include <asm/immintrin.h>  /* For AVX2 intrinsics */
++#endif
+ 
+ #include "cpu.h"
+ 
+@@ -45,8 +50,8 @@ EXPORT_EARLY_PER_CPU_SYMBOL(x86_cpu_to_a
+ /* Bitmap of physically present CPUs. */
+ DECLARE_BITMAP(phys_cpu_present_map, MAX_LOCAL_APIC) __read_mostly;
+ 
+-/* Used for CPU number allocation and parallel CPU bringup */
+-u32 cpuid_to_apicid[] __ro_after_init = { [0 ... NR_CPUS - 1] = BAD_APICID, };
++/* Used for CPU number allocation and parallel CPU bringup - cache-line aligned for Raptor Lake */
++u32 __aligned(64) cpuid_to_apicid[] __ro_after_init = { [0 ... NR_CPUS - 1] = BAD_APICID, };
+ 
+ /* Bitmaps to mark registered APICs at each topology domain */
+ static struct { DECLARE_BITMAP(map, MAX_LOCAL_APIC); } apic_maps[TOPO_MAX_DOMAIN] __ro_after_init;
+@@ -56,18 +61,18 @@ static struct { DECLARE_BITMAP(map, MAX_
+  * with 1 as CPU #0 is reserved for the boot CPU.
+  */
+ static struct {
+-	unsigned int		nr_assigned_cpus;
+-	unsigned int		nr_disabled_cpus;
+-	unsigned int		nr_rejected_cpus;
+-	u32			boot_cpu_apic_id;
+-	u32			real_bsp_apic_id;
++	unsigned int            nr_assigned_cpus;
++	unsigned int            nr_disabled_cpus;
++	unsigned int            nr_rejected_cpus;
++	u32                     boot_cpu_apic_id;
++	u32                     real_bsp_apic_id;
+ } topo_info __ro_after_init = {
+-	.nr_assigned_cpus	= 1,
+-	.boot_cpu_apic_id	= BAD_APICID,
+-	.real_bsp_apic_id	= BAD_APICID,
++	.nr_assigned_cpus       = 1,
++	.boot_cpu_apic_id       = BAD_APICID,
++	.real_bsp_apic_id       = BAD_APICID,
+ };
+ 
+-#define domain_weight(_dom)	bitmap_weight(apic_maps[_dom].map, MAX_LOCAL_APIC)
++#define domain_weight(_dom)     bitmap_weight(apic_maps[_dom].map, MAX_LOCAL_APIC)
+ 
+ bool arch_match_cpu_phys_id(int cpu, u64 phys_id)
+ {
+@@ -95,16 +100,59 @@ static inline u32 topo_apicid(u32 apicid
+ 	return apicid & (UINT_MAX << x86_topo_system.dom_shifts[dom - 1]);
+ }
+ 
++/*
++ * Optimized lookup function using AVX2 when appropriate.
++ * - Safe for boot-time use due to careful feature detection
++ * - Uses kernel FPU context management for safety
++ * - Falls back to scalar code for smaller datasets or when AVX2 not available
++ */
+ static int topo_lookup_cpuid(u32 apic_id)
+ {
+-	int i;
++	int i = 0;
++
++	#if defined(CONFIG_AS_AVX2) && defined(CONFIG_X86_64)
++	/*
++	 * Use AVX2 for bulk comparison when:
++	 * 1. We have enough elements to justify vector ops (≥16)
++	 * 2. CPU supports AVX2
++	 * 3. We're not too early in boot (initcalls are safe)
++	 */
++	if (system_state > SYSTEM_BOOTING &&
++		topo_info.nr_assigned_cpus >= 16 &&
++		boot_cpu_has(X86_FEATURE_AVX2)) {
+ 
+-	/* CPU# to APICID mapping is persistent once it is established */
+-	for (i = 0; i < topo_info.nr_assigned_cpus; i++) {
+-		if (cpuid_to_apicid[i] == apic_id)
+-			return i;
++		int result = -ENODEV;  /* Default return value */
++
++		/* Ensure vector instructions can be used safely in kernel context */
++		kernel_fpu_begin();
++
++	__m256i search_val = _mm256_set1_epi32(apic_id);
++
++	/* Process 8 elements at a time */
++	for (; i <= topo_info.nr_assigned_cpus - 8; i += 8) {
++		__m256i data = _mm256_loadu_si256((__m256i*)&cpuid_to_apicid[i]);
++		__m256i cmp = _mm256_cmpeq_epi32(data, search_val);
++		int mask = _mm256_movemask_ps((__m256)cmp);
++
++		if (mask) {
++			result = i + __builtin_ctz(mask);
++			break;
++		}
+ 	}
+-	return -ENODEV;
++
++	kernel_fpu_end();
++
++	if (result != -ENODEV)
++		return result;
++		}
++		#endif
++
++		/* Handle remaining elements with scalar code */
++		for (; i < topo_info.nr_assigned_cpus; i++) {
++			if (cpuid_to_apicid[i] == apic_id)
++				return i;
++		}
++		return -ENODEV;
+ }
+ 
+ static __init int topo_get_cpunr(u32 apic_id)
+@@ -119,10 +167,10 @@ static __init int topo_get_cpunr(u32 api
+ 
+ static void topo_set_cpuids(unsigned int cpu, u32 apic_id, u32 acpi_id)
+ {
+-#if defined(CONFIG_SMP) || defined(CONFIG_X86_64)
++	#if defined(CONFIG_SMP) || defined(CONFIG_X86_64)
+ 	early_per_cpu(x86_cpu_to_apicid, cpu) = apic_id;
+ 	early_per_cpu(x86_cpu_to_acpiid, cpu) = acpi_id;
+-#endif
++	#endif
+ 	set_cpu_present(cpu, true);
+ }
+ 
+@@ -183,7 +231,7 @@ static __init bool check_for_real_bsp(u3
+ 	}
+ 
+ 	pr_warn("Boot CPU APIC ID not the first enumerated APIC ID: %x != %x\n",
+-		topo_info.boot_cpu_apic_id, apic_id);
++			topo_info.boot_cpu_apic_id, apic_id);
+ 
+ 	if (is_bsp) {
+ 		/*
+@@ -199,22 +247,46 @@ static __init bool check_for_real_bsp(u3
+ 	topo_info.real_bsp_apic_id = apic_id;
+ 	return true;
+ 
+-fwbug:
++	fwbug:
+ 	pr_warn(FW_BUG "APIC enumeration order not specification compliant\n");
+ 	return false;
+ }
+ 
++/*
++ * Optimized bit counting function leveraging prefetching
++ * based on Intel Raptor Lake optimization guidelines
++ */
+ static unsigned int topo_unit_count(u32 lvlid, enum x86_topology_domains at_level,
+-				    unsigned long *map)
++									unsigned long *map)
+ {
+ 	unsigned int id, end, cnt = 0;
+ 
+ 	/* Calculate the exclusive end */
+ 	end = lvlid + (1U << x86_topo_system.dom_shifts[at_level]);
+ 
++	/*
++	 * For larger ranges, use strategic prefetching with Intel-recommended
++	 * prefetch distance (at least 64 bytes ahead)
++	 */
++	if (end - lvlid > 128) {
++		/* Prefetch the bitmap regions we'll be accessing */
++		__builtin_prefetch(&map[lvlid / BITS_PER_LONG], 0, 1);
++		if ((end - 1) / BITS_PER_LONG != lvlid / BITS_PER_LONG)
++			__builtin_prefetch(&map[(end - 1) / BITS_PER_LONG], 0, 1);
++	}
++
+ 	/* Unfortunately there is no bitmap_weight_range() */
+-	for (id = find_next_bit(map, end, lvlid); id < end; id = find_next_bit(map, end, ++id))
++	for (id = find_next_bit(map, end, lvlid); id < end; id = find_next_bit(map, end, ++id)) {
++		/*
++		 * Only prefetch when we're about to cross a word boundary
++		 * Use Intel-recommended prefetch distance (3-7 iterations ahead)
++		 */
++		unsigned long next_word_boundary = (id / BITS_PER_LONG + 1) * BITS_PER_LONG;
++		if (id + 6 >= next_word_boundary && next_word_boundary < end)
++			__builtin_prefetch(&map[next_word_boundary / BITS_PER_LONG], 0, 1);
++
+ 		cnt++;
++	}
+ 	return cnt;
+ }
+ 
+@@ -246,14 +318,14 @@ static __init void topo_register_apic(u3
+ 		 * on bare metal. Allow the bogosity in a guest.
+ 		 */
+ 		if (hypervisor_is_type(X86_HYPER_NATIVE) &&
+-		    topo_unit_count(pkgid, TOPO_PKG_DOMAIN, phys_cpu_present_map)) {
++			topo_unit_count(pkgid, TOPO_PKG_DOMAIN, phys_cpu_present_map)) {
+ 			pr_info_once("Ignoring hot-pluggable APIC ID %x in present package.\n",
+-				     apic_id);
++						 apic_id);
+ 			topo_info.nr_rejected_cpus++;
+-			return;
+-		}
++		return;
++			}
+ 
+-		topo_info.nr_disabled_cpus++;
++			topo_info.nr_disabled_cpus++;
+ 	}
+ 
+ 	/*
+@@ -267,9 +339,9 @@ static __init void topo_register_apic(u3
+ 
+ /**
+  * topology_register_apic - Register an APIC in early topology maps
+- * @apic_id:	The APIC ID to set up
+- * @acpi_id:	The ACPI ID associated to the APIC
+- * @present:	True if the corresponding CPU is present
++ * @apic_id:    The APIC ID to set up
++ * @acpi_id:    The ACPI ID associated to the APIC
++ * @present:    True if the corresponding CPU is present
+  */
+ void __init topology_register_apic(u32 apic_id, u32 acpi_id, bool present)
+ {
+@@ -296,7 +368,7 @@ void __init topology_register_apic(u32 a
+ 
+ /**
+  * topology_register_boot_apic - Register the boot CPU APIC
+- * @apic_id:	The APIC ID to set up
++ * @apic_id:    The APIC ID to set up
+  *
+  * Separate so CPU #0 can be assigned
+  */
+@@ -310,17 +382,17 @@ void __init topology_register_boot_apic(
+ 
+ /**
+  * topology_get_logical_id - Retrieve the logical ID at a given topology domain level
+- * @apicid:		The APIC ID for which to lookup the logical ID
+- * @at_level:		The topology domain level to use
++ * @apicid:             The APIC ID for which to lookup the logical ID
++ * @at_level:           The topology domain level to use
+  *
+  * @apicid must be a full APIC ID, not the normalized variant. It's valid to have
+  * all bits below the domain level specified by @at_level to be clear. So both
+  * real APIC IDs and backshifted normalized APIC IDs work correctly.
+  *
+  * Returns:
+- *  - >= 0:	The requested logical ID
+- *  - -ERANGE:	@apicid is out of range
+- *  - -ENODEV:	@apicid is not registered
++ *  - >= 0:     The requested logical ID
++ *  - -ERANGE:  @apicid is out of range
++ *  - -ENODEV:  @apicid is not registered
+  */
+ int topology_get_logical_id(u32 apicid, enum x86_topology_domains at_level)
+ {
+@@ -329,8 +401,29 @@ int topology_get_logical_id(u32 apicid,
+ 
+ 	if (lvlid >= MAX_LOCAL_APIC)
+ 		return -ERANGE;
++
++	/*
++	 * Intel recommends prefetching only when data is likely to be accessed
++	 * and not in the cache - bitmap operations have a good chance of locality
++	 */
++	if (lvlid > 128)
++		__builtin_prefetch(&apic_maps[at_level].map[lvlid / BITS_PER_LONG], 0, 1);
++
+ 	if (!test_bit(lvlid, apic_maps[at_level].map))
+ 		return -ENODEV;
++
++	/* For larger bitmaps, prefetch strategically for bitmap_weight */
++	if (lvlid > 128) {
++		/* Prefetch first word which is always accessed */
++		__builtin_prefetch(&apic_maps[at_level].map[0], 0, 1);
++
++		/* For larger ranges, also prefetch the last word in the range */
++		if (lvlid > BITS_PER_LONG) {
++			unsigned long last_word = lvlid / BITS_PER_LONG;
++			__builtin_prefetch(&apic_maps[at_level].map[last_word], 0, 1);
++		}
++	}
++
+ 	/* Get the number of set bits before @lvlid. */
+ 	return bitmap_weight(apic_maps[at_level].map, lvlid);
+ }
+@@ -338,9 +431,9 @@ EXPORT_SYMBOL_GPL(topology_get_logical_i
+ 
+ /**
+  * topology_unit_count - Retrieve the count of specified units at a given topology domain level
+- * @apicid:		The APIC ID which specifies the search range
+- * @which_units:	The domain level specifying the units to count
+- * @at_level:		The domain level at which @which_units have to be counted
++ * @apicid:             The APIC ID which specifies the search range
++ * @which_units:        The domain level specifying the units to count
++ * @at_level:           The domain level at which @which_units have to be counted
+  *
+  * This returns the number of possible units according to the enumerated
+  * information.
+@@ -355,7 +448,7 @@ EXPORT_SYMBOL_GPL(topology_get_logical_i
+  * is by definition undefined and the function returns 0.
+  */
+ unsigned int topology_unit_count(u32 apicid, enum x86_topology_domains which_units,
+-				 enum x86_topology_domains at_level)
++								 enum x86_topology_domains at_level)
+ {
+ 	/* Remove the bits below @at_level to get the proper level ID of @apicid */
+ 	unsigned int lvlid = topo_apicid(apicid, at_level);
+@@ -374,8 +467,8 @@ unsigned int topology_unit_count(u32 api
+ #ifdef CONFIG_ACPI_HOTPLUG_CPU
+ /**
+  * topology_hotplug_apic - Handle a physical hotplugged APIC after boot
+- * @apic_id:	The APIC ID to set up
+- * @acpi_id:	The ACPI ID associated to the APIC
++ * @apic_id:    The APIC ID to set up
++ * @acpi_id:    The ACPI ID associated to the APIC
+  */
+ int topology_hotplug_apic(u32 apic_id, u32 acpi_id)
+ {
+@@ -384,6 +477,10 @@ int topology_hotplug_apic(u32 apic_id, u
+ 	if (apic_id >= MAX_LOCAL_APIC)
+ 		return -EINVAL;
+ 
++	/* Strategic prefetching based on Intel guidelines */
++	if (apic_id > 64)
++		__builtin_prefetch(&apic_maps[TOPO_SMT_DOMAIN].map[apic_id / BITS_PER_LONG], 0, 1);
++
+ 	/* Reject if the APIC ID was not registered during enumeration. */
+ 	if (!test_bit(apic_id, apic_maps[TOPO_SMT_DOMAIN].map))
+ 		return -ENODEV;
+@@ -400,7 +497,7 @@ int topology_hotplug_apic(u32 apic_id, u
+ 
+ /**
+  * topology_hotunplug_apic - Remove a physical hotplugged APIC after boot
+- * @cpu:	The CPU number for which the APIC ID is removed
++ * @cpu:        The CPU number for which the APIC ID is removed
+  */
+ void topology_hotunplug_apic(unsigned int cpu)
+ {
+@@ -530,13 +627,17 @@ void __init topology_init_possible_cpus(
+ 	/* Assign CPU numbers to non-present CPUs */
+ 	for (apicid = 0; disabled; disabled--, apicid++) {
+ 		apicid = find_next_andnot_bit(apic_maps[TOPO_SMT_DOMAIN].map, phys_cpu_present_map,
+-					      MAX_LOCAL_APIC, apicid);
++									  MAX_LOCAL_APIC, apicid);
+ 		if (apicid >= MAX_LOCAL_APIC)
+ 			break;
+ 		cpuid_to_apicid[topo_info.nr_assigned_cpus++] = apicid;
+ 	}
+ 
+ 	for (cpu = 0; cpu < allowed; cpu++) {
++		/* Prefetch data several iterations ahead for systems with many CPUs */
++		if (allowed > 32 && cpu + 8 < allowed)
++			__builtin_prefetch(&cpuid_to_apicid[cpu + 8], 0, 1);
++
+ 		apicid = cpuid_to_apicid[cpu];
+ 
+ 		set_cpu_possible(cpu, true);
+@@ -544,6 +645,10 @@ void __init topology_init_possible_cpus(
+ 		if (apicid == BAD_APICID)
+ 			continue;
+ 
++		/* Prefetch bitmap data for upcoming test_bit operation when APIC IDs are larger */
++		if (apicid > 128)
++			__builtin_prefetch(&phys_cpu_present_map[apicid / BITS_PER_LONG], 0, 1);
++
+ 		cpu_mark_primary_thread(cpu, apicid);
+ 		set_cpu_present(cpu, test_bit(apicid, phys_cpu_present_map));
+ 	}
+
+
 --- a/arch/x86/lib/getuser.S	2025-03-18 16:04:33.928339120 +0100
 +++ b/arch/x86/lib/getuser.S	2025-03-18 16:04:43.179011750 +0100
 @@ -15,11 +15,11 @@
