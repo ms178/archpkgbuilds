@@ -17,17 +17,6 @@ scripts/config -d MEMORY_HOTPLUG
 ### 1000Hz = 2.0ms, 800Hz = 2.5ms, 600Hz = 1.6(6)ms, 500Hz = 2.0ms.
 scripts/config --set-val MIN_BASE_SLICE_NS 1600000
 
-### Cluster scheduler support improves the CPU scheduler's decision
-### making when dealing with machines that have clusters of CPUs.
-### Cluster usually means a couple of CPUs which are placed closely
-### by sharing mid-level caches, last-level cache tags or internal
-### busses.
-
-if [[ $(uname -m) = *"x86"* ]]; then
-    # Disable on X86 platform; prefer scheduling to idled CPUs.
-    scripts/config -d SCHED_CLUSTER
-fi
-
 ### Enable ACPI options. (default -m)
 scripts/config -e ACPI_TAD -e ACPI_VIDEO -e ACPI_WMI -e INPUT_SPARSEKMAP
 
@@ -49,7 +38,7 @@ scripts/config -e USB_STORAGE -e USB_STORAGE_REALTEK -e USB_UAS
 ### Enable file systems. (default -m)
 scripts/config -d MSDOS_FS -e FAT_FS -e VFAT_FS
 scripts/config -e EXT4_FS -e FS_MBCACHE -e JBD2
-scripts/config -e BTRFS_FS -e F2FS_FS -e XFS_FS
+scripts/config -e F2FS_FS
 
 ### Default HugeTLB Vmemmap Optimization (HVO) to on. It can be disabled via
 ### hugetlb_free_vmemmap=off (cmdline) or vm.hugetlb_optimize_vmemmap (sysctl).
@@ -61,6 +50,21 @@ scripts/config -d IXGBE_HWMON
 scripts/config -d TIGON3_HWMON
 scripts/config -d SCSI_UFS_HWMON
 scripts/config -d SENSORS_IIO_HWMON
+
+### Disable more drivers.
+scripts/config -d AGP
+scripts/config -d ATA_SFF
+scripts/config -d ISDN
+scripts/config -d NET_FC
+scripts/config -d RD_BZIP2
+scripts/config -d RD_LZMA
+scripts/config -d RD_LZO
+scripts/config -d RD_LZ4
+scripts/config -d FUSION
+scripts/config -d MACINTOSH_DRIVERS
+scripts/config -d SCSI_PROC_FS
+scripts/config -d SCSI_CONSTANTS
+scripts/config -d SCSI_LOWLEVEL
 
 ### Disable tracers.
 scripts/config -d ATH5K_TRACER
@@ -223,6 +227,9 @@ if [[ $(uname -m) = *"x86"* ]]; then
     ### Disable paravirtual steal time accounting.
     scripts/config -d PARAVIRT_TIME_ACCOUNTING
 
+    ### Disable pvpanic device support.
+    scripts/config -d PVPANIC
+
     ### Require boot param to enable pressure stall information tracking.
     scripts/config -e PSI_DEFAULT_DISABLED
 
@@ -312,9 +319,9 @@ if [[ $(uname -m) = *"x86"* ]]; then
     ### Apply Clear defaults for NR_CPUS and NODES_SHIFT.
     scripts/config -d CPUMASK_OFFSTACK -d MAXSMP
     scripts/config --set-val NR_CPUS_RANGE_BEGIN 2
-    scripts/config --set-val NR_CPUS_RANGE_END 512
-    scripts/config --set-val NR_CPUS_DEFAULT 64
-    scripts/config --set-val NR_CPUS 512
+    scripts/config --set-val NR_CPUS_RANGE_END 32
+    scripts/config --set-val NR_CPUS_DEFAULT 32
+    scripts/config --set-val NR_CPUS 32
     scripts/config --set-val NODES_SHIFT 10
 
     ### Default to the 2:1 compression allocator (zbud) as the default allocator.
