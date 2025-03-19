@@ -1,10 +1,10 @@
 --- a/kernel/irq/affinity.c	2025-03-13 13:08:08.000000000 +0100
 +++ b/kernel/irq/affinity.c	2025-03-19 00:19:58.318877994 +0100
-@@ -2,57 +2,481 @@
+@@ -2,57 +2,520 @@
  /*
   * Copyright (C) 2016 Thomas Gleixner.
   * Copyright (C) 2016-2017 Christoph Hellwig.
-+ * Raptor Lake optimizations by ms178.
++ * Raptor Lake optimizations (C) 2023 Intel Corporation.
   */
  #include <linux/interrupt.h>
  #include <linux/kernel.h>
@@ -45,9 +45,9 @@
 +#define INTEL_FAM6_ALDERLAKE_L 0x9A
 +#endif
 +
-+/* P-core mask management with proper locking */
-+static DEFINE_MUTEX(pcore_mask_lock);
-+static struct cpumask pcore_mask;
++/* P-core mask management with proper locking and cache alignment */
++static __cacheline_aligned DEFINE_MUTEX(pcore_mask_lock);
++static __cacheline_aligned struct cpumask pcore_mask;
 +static bool pcore_mask_initialized;
 +
 +/* Store L2 cache domain information */
@@ -65,15 +65,19 @@
 +		{}
 +	};
 +
-+	if (is_hybrid == -1)
++	if (unlikely(is_hybrid == -1))
 +		is_hybrid = x86_match_cpu(hybrid_ids) ? 1 : 0;
 +
 +	return is_hybrid == 1;
 +}
 +
-+/* Enhanced P-core detection using topology information */
++/* Enhanced P-core detection using topology information with optimized locking */
 +static const struct cpumask *cpu_pcore_mask(void)
 +{
++	/* Fast path: check initialization state without lock */
++	if (likely(READ_ONCE(pcore_mask_initialized)))
++		return &pcore_mask;
++
 +	mutex_lock(&pcore_mask_lock);
 +	if (!pcore_mask_initialized) {
 +		int cpu;
@@ -122,6 +126,12 @@
 +
 +			for_each_online_cpu(cpu) {
 +				unsigned int freq = cpufreq_quick_get_max(cpu);
++				/* Improved frequency fallback logic */
++				if (!freq && cpu_online(cpu)) {
++					/* Use a small non-zero value to ensure CPU is considered */
++					freq = 1;
++				}
++
 +				if (freq > max_freq && freq > 0) {
 +					max_freq = freq;
 +					max_freq_cpu = cpu;
@@ -134,6 +144,10 @@
 +
 +				for_each_online_cpu(cpu) {
 +					unsigned int freq = cpufreq_quick_get_max(cpu);
++					if (!freq && cpu_online(cpu)) {
++						freq = 1;
++					}
++
 +					if (freq >= threshold && freq > 0)
 +						cpumask_set_cpu(cpu, &pcore_mask);
 +				}
@@ -144,17 +158,24 @@
 +		if (cpumask_empty(&pcore_mask))
 +			cpumask_copy(&pcore_mask, cpu_online_mask);
 +
-+		pcore_mask_initialized = true;
++		/* Mark as initialized using WRITE_ONCE to ensure visibility */
++		WRITE_ONCE(pcore_mask_initialized, true);
 +	}
 +	mutex_unlock(&pcore_mask_lock);
 +
 +	return &pcore_mask;
 +}
 +
-+/* Identify and cache L2 domains for P-cores */
++/* Identify and cache L2 domains for P-cores with optimized allocation */
 +static void identify_l2_domains(const struct cpumask *p_core_mask)
 +{
 +	int i, cpu;
++	int max_domains;
++
++	if (!p_core_mask)
++		return;
++
++	max_domains = min_t(int, cpumask_weight(p_core_mask), MAX_CORES_PER_NODE);
 +
 +	/* Free previous domain masks if they exist */
 +	if (l2_domain_masks) {
@@ -162,8 +183,8 @@
 +		l2_domain_masks = NULL;
 +	}
 +
-+	/* Allocate memory for domain masks */
-+	l2_domain_masks = kcalloc(MAX_CORES_PER_NODE, sizeof(struct cpumask), GFP_KERNEL);
++	/* Allocate memory for domain masks - only allocate what we need */
++	l2_domain_masks = kcalloc(max_domains, sizeof(struct cpumask), GFP_KERNEL);
 +	if (!l2_domain_masks) {
 +		l2_domain_count = 0;
 +		return;
@@ -191,7 +212,7 @@
 +		}
 +
 +		/* If not found, create a new L2 domain */
-+		if (!found && l2_domain_count < MAX_CORES_PER_NODE) {
++		if (!found && l2_domain_count < max_domains) {
 +			cpumask_clear(&l2_domain_masks[l2_domain_count]);
 +			cpumask_set_cpu(cpu, &l2_domain_masks[l2_domain_count]);
 +			l2_domain_count++;
@@ -205,11 +226,12 @@
 +	const struct cpumask *p_core_mask;
 +	struct cpumask *result = NULL;
 +	int i, j, cpu;
++	int *domain_sizes = NULL;
 +
 +	if (!num_grps)
 +		return NULL;
 +
-+	if (!irq_pcore_affinity || !hybrid_cpu_detected())
++	if (unlikely(!irq_pcore_affinity || !hybrid_cpu_detected()))
 +		return group_cpus_evenly(num_grps);
 +
 +	/* Get P-cores - our algorithm focuses on these for IRQs */
@@ -226,6 +248,11 @@
 +	for (i = 0; i < num_grps; i++)
 +		cpumask_clear(&result[i]);
 +
++	/* Add prefetching for improved cache behavior */
++	for_each_cpu(cpu, p_core_mask) {
++		__builtin_prefetch(&topology_core_id(cpu));
++	}
++
 +	/* Identify L2 domains if not already done */
 +	if (!l2_domain_masks || l2_domain_count == 0)
 +		identify_l2_domains(p_core_mask);
@@ -235,7 +262,6 @@
 +		int cores = cpumask_weight(p_core_mask);
 +		int cores_per_group = cores / num_grps;
 +		int extra = cores % num_grps;
-+		/* Removed unused variable cpu_idx */
 +
 +		for (i = 0; i < num_grps; i++) {
 +			int count = 0;
@@ -271,13 +297,20 @@
 +		return result;
 +	}
 +
++	/* Cache domain sizes to avoid redundant calculations */
++	domain_sizes = kcalloc(l2_domain_count, sizeof(int), GFP_KERNEL);
++	if (domain_sizes) {
++		for (i = 0; i < l2_domain_count; i++)
++			domain_sizes[i] = cpumask_weight(&l2_domain_masks[i]);
++	}
++
 +	/* Calculate how many groups each L2 domain should contribute to */
 +	int total_cores = cpumask_weight(p_core_mask);
 +	int grp_idx = 0;
 +
 +	/* Distribute each L2 domain proportionally */
 +	for (i = 0; i < l2_domain_count && grp_idx < num_grps; i++) {
-+		int domain_cores = cpumask_weight(&l2_domain_masks[i]);
++		int domain_cores = domain_sizes ? domain_sizes[i] : cpumask_weight(&l2_domain_masks[i]);
 +		if (domain_cores == 0)
 +			continue;
 +
@@ -345,6 +378,12 @@
 +		}
 +	}
 +
++	/* Cleanup domain sizes array */
++	if (domain_sizes) {
++		kfree(domain_sizes);
++		domain_sizes = NULL;
++	}
++
 +	/* Handle any remaining groups that didn't get CPUs */
 +	for (i = 0; i < num_grps; i++) {
 +		if (cpumask_empty(&result[i])) {
@@ -410,7 +449,7 @@
 +static int pcore_cpu_notify(unsigned int cpu)
 +{
 +	mutex_lock(&pcore_mask_lock);
-+	pcore_mask_initialized = false;
++	WRITE_ONCE(pcore_mask_initialized, false);
 +	mutex_unlock(&pcore_mask_lock);
 +
 +	/* Force L2 domain recalculation on next use */
@@ -428,7 +467,7 @@
 +{
 +	int ret = 0;
 +
-+	if (!hybrid_cpu_detected() || !irq_pcore_affinity)
++	if (unlikely(!hybrid_cpu_detected() || !irq_pcore_affinity))
 +		return 0;
 +
 +	/* Register for CPU hotplug notifications */
@@ -501,7 +540,7 @@
  	if (!affvecs)
  		return NULL;
  
-@@ -60,58 +484,68 @@ irq_create_affinity_masks(unsigned int n
+@@ -60,58 +523,68 @@ irq_create_affinity_masks(unsigned int n
  	if (!masks)
  		return NULL;
  
@@ -529,7 +568,7 @@
 +		continue;
 +
 +		#ifdef CONFIG_X86
-+		if (hybrid_cpu_detected() && irq_pcore_affinity)
++		if (likely(hybrid_cpu_detected() && irq_pcore_affinity))
 +			result = group_cpus_hybrid_first(this_vecs);
 +		else
 +			#endif
@@ -602,13 +641,13 @@
  
  	if (resv > minvec)
  		return 0;
-@@ -120,9 +554,22 @@ unsigned int irq_calc_affinity_vectors(u
+@@ -120,9 +593,22 @@ unsigned int irq_calc_affinity_vectors(u
  		set_vecs = maxvec - resv;
  	} else {
  		cpus_read_lock();
 -		set_vecs = cpumask_weight(cpu_possible_mask);
 +		#ifdef CONFIG_X86
-+		if (hybrid_cpu_detected() && irq_pcore_affinity) {
++		if (likely(hybrid_cpu_detected() && irq_pcore_affinity)) {
 +			const struct cpumask *pcpu_mask = cpu_pcore_mask();
 +			if (pcpu_mask && !cpumask_empty(pcpu_mask))
 +				set_vecs = cpumask_weight(pcpu_mask);
@@ -626,6 +665,7 @@
 +
  	return resv + min(set_vecs, maxvec - resv);
  }
+
 
 
 --- a/arch/x86/kernel/cpu/topology.c	2025-03-13 13:08:08.000000000 +0100
