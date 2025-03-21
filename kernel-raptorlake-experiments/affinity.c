@@ -33,15 +33,15 @@ MODULE_PARM_DESC(pcore_affinity, "Enable P-core IRQ affinity (default: 1)");
 
 /* Define CPU IDs if not already defined */
 #ifndef INTEL_FAM6_RAPTORLAKE
-#define INTEL_FAM6_RAPTORLAKE 0x7E
+#define INTEL_FAM6_RAPTORLAKE 0xB7
 #endif
 
 #ifndef INTEL_FAM6_ALDERLAKE
-#define INTEL_FAM6_ALDERLAKE 0x7A
+#define INTEL_FAM6_ALDERLAKE 0x97
 #endif
 
 #ifndef INTEL_FAM6_ALDERLAKE_L
-#define INTEL_FAM6_ALDERLAKE_L 0x7A
+#define INTEL_FAM6_ALDERLAKE_L 0x9A
 #endif
 
 /* Core type definition if not available */
