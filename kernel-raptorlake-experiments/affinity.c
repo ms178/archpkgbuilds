@@ -2,7 +2,7 @@
 /*
  * Copyright (C) 2016 Thomas Gleixner.
  * Copyright (C) 2016-2017 Christoph Hellwig.
- * Raptor Lake optimizations (C) 2023 Intel Corporation.
+ * Raptor Lake optimizations (C) 2025 ms178.
  */
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
@@ -19,7 +19,6 @@
 #include <asm/topology.h>
 #include <asm/cpu.h>
 #include <asm/smp.h>
-#include <linux/cpuhotplug.h>
 #endif
 
 #ifdef CONFIG_X86
@@ -49,6 +48,10 @@ MODULE_PARM_DESC(pcore_affinity, "Enable P-core IRQ affinity (default: 1)");
 #define X86_CORE_TYPE_INTEL_CORE 1
 #endif
 
+#ifndef X86_CORE_TYPE_INTEL_ATOM
+#define X86_CORE_TYPE_INTEL_ATOM 0
+#endif
+
 /* P-core mask management with proper locking */
 static DEFINE_MUTEX(pcore_mask_lock);
 static struct cpumask pcore_mask;
@@ -59,7 +62,14 @@ static int numa_node_for_cpu[NR_CPUS];
 static struct cpumask *l2_domain_masks;
 static int l2_domain_count;
 
-/* Optimized detection with proper caching */
+/**
+ * hybrid_cpu_detected - Check if system has hybrid CPU architecture
+ *
+ * Detects Intel hybrid architectures like Raptor Lake and Alder Lake.
+ * Result is safely cached for performance.
+ *
+ * Return: true if hybrid CPU detected, false otherwise
+ */
 static bool hybrid_cpu_detected(void)
 {
 	static int is_hybrid = -1;
@@ -76,7 +86,16 @@ static bool hybrid_cpu_detected(void)
 	return is_hybrid == 1;
 }
 
-/* Direct core type detection when available */
+/**
+ * get_core_type - Determine CPU core type
+ * @cpu: CPU number to check
+ *
+ * Identifies whether a CPU is a performance core (P-core) or efficiency
+ * core (E-core) on hybrid Intel architectures. Uses multiple detection
+ * methods with appropriate fallbacks.
+ *
+ * Return: 1 for P-core, 0 for E-core, -1 if unknown/not hybrid
+ */
 static int get_core_type(int cpu)
 {
 	if (!hybrid_cpu_detected())
@@ -86,15 +105,52 @@ static int get_core_type(int cpu)
 		return -1;
 
 	#ifdef CONFIG_INTEL_HYBRID_CPU
-	/* If hybrid detection is supported, check the official field */
-	return cpu_data(cpu).x86_core_type == X86_CORE_TYPE_INTEL_CORE ? 1 : 0;
-	#else
-	/* If not available, use other methods to identify core type */
-	return -1;
-	#endif
+	/* Method 1: Use official core type if available */
+	if (cpu_data(cpu).x86_core_type == X86_CORE_TYPE_INTEL_CORE)
+		return 1;  /* P-core */
+		else if (cpu_data(cpu).x86_core_type == X86_CORE_TYPE_INTEL_ATOM)
+			return 0;  /* E-core */
+			#endif
+
+			/* Method 2: Topology-based detection */
+			const struct cpumask *thread_siblings = topology_sibling_cpumask(cpu);
+		if (thread_siblings && cpumask_weight(thread_siblings) > 1) {
+			return 1;  /* Multiple threads per core = P-core on Raptor Lake */
+		}
+
+		/* Method 3: Frequency-based heuristic */
+		unsigned int cpu_freq = cpufreq_quick_get_max(cpu);
+		unsigned int max_freq = 0;
+		int max_freq_cpu = -1;
+		int c;
+
+		/* Find highest frequency CPU */
+		for_each_online_cpu(c) {
+			unsigned int freq = cpufreq_quick_get_max(c);
+			if (freq > max_freq) {
+				max_freq = freq;
+				max_freq_cpu = c;
+			}
+		}
+
+		if (max_freq > 0 && cpu_freq >= max_freq * 95 / 100) {
+			return 1;  /* Within 5% of max frequency = likely P-core */
+		} else if (max_freq > 0 && cpu_freq <= max_freq * 70 / 100) {
+			return 0;  /* Below 70% of max frequency = likely E-core */
+		}
+
+		/* Cannot determine reliably */
+		return -1;
 }
 
-/* Cache-aware mask retrieval */
+/**
+ * get_cache_shared_mask - Get cache sharing mask for CPU
+ * @cpu: CPU number
+ *
+ * Returns the appropriate cache sharing mask based on core type
+ *
+ * Return: Pointer to cpumask
+ */
 static const struct cpumask *get_cache_shared_mask(int cpu)
 {
 	int core_type = get_core_type(cpu);
@@ -107,10 +163,36 @@ static const struct cpumask *get_cache_shared_mask(int cpu)
 		return cpu_llc_shared_mask(cpu); /* Default to LLC */
 }
 
-/* Enhanced P-core detection using multiple methods */
-static const struct cpumask *cpu_pcore_mask(void)
+/**
+ * free_l2_domain_masks - Free L2 domain mask resources
+ *
+ * Helper function to safely clean up L2 domain resources.
+ * Can be called from any context including error paths.
+ */
+static void free_l2_domain_masks(void)
 {
-	struct cpumask *mask_copy = NULL;
+	mutex_lock(&pcore_mask_lock);
+	if (l2_domain_masks) {
+		kfree(l2_domain_masks);
+		l2_domain_masks = NULL;
+		l2_domain_count = 0;
+	}
+	mutex_unlock(&pcore_mask_lock);
+}
+
+/**
+ * get_pcore_mask - Fill provided mask with performance cores
+ * @dst: Destination cpumask to fill with P-cores
+ *
+ * Thread-safe function to identify performance cores on hybrid CPUs.
+ * Caller must provide the destination buffer.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int get_pcore_mask(struct cpumask *dst)
+{
+	if (!dst)
+		return -EINVAL;
 
 	if (atomic_read_acquire(&pcore_mask_initialized) == 0) {
 		mutex_lock(&pcore_mask_lock);
@@ -133,7 +215,8 @@ static const struct cpumask *cpu_pcore_mask(void)
 					direct_detection = true;
 				}
 				/* Store NUMA node information for each CPU */
-				numa_node_for_cpu[cpu] = cpu_to_node(cpu);
+				if (cpu < NR_CPUS)
+					numa_node_for_cpu[cpu] = cpu_to_node(cpu);
 			}
 
 			/* If direct detection didn't work, use heuristics */
@@ -199,79 +282,109 @@ static const struct cpumask *cpu_pcore_mask(void)
 			if (cpumask_empty(&pcore_mask))
 				cpumask_copy(&pcore_mask, cpu_online_mask);
 
-			atomic_set_release(&pcore_mask_initialized, 1);
+			/* Memory barrier before setting initialized flag */
+			smp_wmb();
+			atomic_set(&pcore_mask_initialized, 1);
 		}
 		mutex_unlock(&pcore_mask_lock);
 	}
 
-	/* Return a copy to avoid race conditions */
-	mask_copy = kmalloc(sizeof(struct cpumask), GFP_KERNEL);
-	if (mask_copy) {
-		mutex_lock(&pcore_mask_lock);
-		cpumask_copy(mask_copy, &pcore_mask);
-		mutex_unlock(&pcore_mask_lock);
-	} else {
-		/* If allocation fails, return the static mask directly - not ideal but better than NULL */
-		return &pcore_mask;
-	}
+	mutex_lock(&pcore_mask_lock);
+	cpumask_copy(dst, &pcore_mask);
+	mutex_unlock(&pcore_mask_lock);
 
-	return mask_copy;
+	return 0;
 }
 
-/* Improved L2 domain identification with cache awareness */
-static void identify_l2_domains(const struct cpumask *p_core_mask)
+/**
+ * identify_l2_domains - Identify L2 cache domains among P-cores
+ * @p_core_mask: Mask of P-cores to analyze
+ *
+ * Maps L2 cache sharing domains on Raptor Lake and similar processors.
+ * Uses hardware topology information with fallbacks for robustness.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int identify_l2_domains(struct cpumask *p_core_mask)
 {
 	int i, cpu;
+	bool using_fallback = false;
+	int total_cpus;
 
-	/* Free previous domain masks if they exist */
+	/* Validate input */
+	if (!p_core_mask || cpumask_empty(p_core_mask)) {
+		pr_warn("Empty P-core mask provided\n");
+		return -EINVAL;
+	}
+
+	mutex_lock(&pcore_mask_lock);
+
+	/* Clean up existing resources */
 	if (l2_domain_masks) {
 		kfree(l2_domain_masks);
 		l2_domain_masks = NULL;
+		l2_domain_count = 0;
 	}
 
-	/* Allocate memory for domain masks */
+	/* Allocate memory with bounds check */
+	if (MAX_CORES_PER_NODE == 0) {
+		mutex_unlock(&pcore_mask_lock);
+		pr_err("Invalid MAX_CORES_PER_NODE value\n");
+		return -EINVAL;
+	}
+
 	l2_domain_masks = kcalloc(MAX_CORES_PER_NODE, sizeof(struct cpumask), GFP_KERNEL);
 	if (!l2_domain_masks) {
-		l2_domain_count = 0;
-		return;
+		mutex_unlock(&pcore_mask_lock);
+		pr_warn("Failed to allocate L2 domain masks\n");
+		return -ENOMEM;
 	}
 
 	l2_domain_count = 0;
 
-	/* Group P-cores by their cache domains using direct cache info */
+	/* Primary detection: use cache topology */
 	for_each_cpu(cpu, p_core_mask) {
 		const struct cpumask *shared_mask = get_cache_shared_mask(cpu);
 		bool found = false;
 
-		if (cpumask_empty(shared_mask))
-			continue;
-
-		/* Check if we already have this cache domain */
-		for (i = 0; i < l2_domain_count; i++) {
-			if (cpumask_equal(&l2_domain_masks[i], shared_mask)) {
-				found = true;
-				break;
+		/* Validate mask */
+		if (!shared_mask || cpumask_empty(shared_mask) ||
+			cpumask_weight(shared_mask) > MAX_CORES_PER_NODE/2) {
+			using_fallback = true;
+		continue;
 			}
-		}
 
-		/* If not found, create a new domain */
-		if (!found && l2_domain_count < MAX_CORES_PER_NODE) {
-			cpumask_copy(&l2_domain_masks[l2_domain_count], shared_mask);
-			l2_domain_count++;
-		}
+			/* Check if domain already exists */
+			for (i = 0; i < l2_domain_count; i++) {
+				if (cpumask_equal(&l2_domain_masks[i], shared_mask)) {
+					found = true;
+					break;
+				}
+			}
+
+			/* Add new domain if needed */
+			if (!found && l2_domain_count < MAX_CORES_PER_NODE) {
+				cpumask_copy(&l2_domain_masks[l2_domain_count], shared_mask);
+				l2_domain_count++;
+			}
 	}
 
-	/* If no domains found using cache info, fall back to core ID */
-	if (l2_domain_count == 0) {
+	/* Fallback: use core ID if cache detection failed */
+	if (l2_domain_count == 0 || using_fallback) {
+		pr_info("Using fallback L2 domain detection\n");
+		l2_domain_count = 0;
+
 		for_each_cpu(cpu, p_core_mask) {
-			int l2_id = topology_core_id(cpu);
+			int l2_id = topology_physical_package_id(cpu) * 100 + topology_core_id(cpu);
 			bool found = false;
 
-			/* Check if we already have this L2 domain */
+			/* Check existing domains */
 			for (i = 0; i < l2_domain_count; i++) {
 				int check_cpu;
 				for_each_cpu(check_cpu, &l2_domain_masks[i]) {
-					if (topology_core_id(check_cpu) == l2_id) {
+					int check_l2_id = topology_physical_package_id(check_cpu) * 100 +
+					topology_core_id(check_cpu);
+					if (check_l2_id == l2_id) {
 						found = true;
 						cpumask_set_cpu(cpu, &l2_domain_masks[i]);
 						break;
@@ -281,7 +394,7 @@ static void identify_l2_domains(const struct cpumask *p_core_mask)
 					break;
 			}
 
-			/* If not found, create a new L2 domain */
+			/* Create new domain if needed */
 			if (!found && l2_domain_count < MAX_CORES_PER_NODE) {
 				cpumask_clear(&l2_domain_masks[l2_domain_count]);
 				cpumask_set_cpu(cpu, &l2_domain_masks[l2_domain_count]);
@@ -289,16 +402,38 @@ static void identify_l2_domains(const struct cpumask *p_core_mask)
 			}
 		}
 	}
+
+	/* Verify all CPUs were assigned */
+	total_cpus = 0;
+	for (i = 0; i < l2_domain_count; i++)
+		total_cpus += cpumask_weight(&l2_domain_masks[i]);
+
+	if (total_cpus < cpumask_weight(p_core_mask)) {
+		pr_warn("L2 domain detection incomplete: %d/%d CPUs\n",
+				total_cpus, cpumask_weight(p_core_mask));
+	}
+
+	mutex_unlock(&pcore_mask_lock);
+	return l2_domain_count > 0 ? 0 : -ENODATA;
 }
 
-/* Improved cache-aware IRQ distribution algorithm */
+/**
+ * group_cpus_hybrid_first - Distribute IRQs with hybrid CPU awareness
+ * @num_grps: Number of groups to create
+ *
+ * Creates CPU groups optimized for IRQ distribution on hybrid CPUs.
+ * Prioritizes P-cores and considers cache topology for performance.
+ *
+ * Return: Array of CPU masks or NULL on failure
+ */
 static struct cpumask *group_cpus_hybrid_first(unsigned int num_grps)
 {
-	const struct cpumask *p_core_mask;
+	struct cpumask p_core_copy;
 	struct cpumask *result = NULL;
 	struct cpumask e_cores_mask;
 	DECLARE_BITMAP(assigned, NR_CPUS);
 	int i, j, cpu, grp_idx = 0;
+	int ret;
 
 	if (!num_grps)
 		return NULL;
@@ -306,33 +441,30 @@ static struct cpumask *group_cpus_hybrid_first(unsigned int num_grps)
 	if (!irq_pcore_affinity || !hybrid_cpu_detected())
 		return group_cpus_evenly(num_grps);
 
-	/* Get P-cores - our algorithm focuses on these for IRQs */
-	p_core_mask = cpu_pcore_mask();
-	if (!p_core_mask || cpumask_empty(p_core_mask))
+	/* Get P-cores using our improved function */
+	cpumask_clear(&p_core_copy);
+	ret = get_pcore_mask(&p_core_copy);
+	if (ret || cpumask_empty(&p_core_copy))
 		return group_cpus_evenly(num_grps);
 
 	/* Create result masks */
 	result = kcalloc(num_grps, sizeof(struct cpumask), GFP_KERNEL);
-	if (!result) {
-		if (p_core_mask != &pcore_mask)
-			kfree((void *)p_core_mask);
+	if (!result)
 		return group_cpus_evenly(num_grps);
-	}
 
 	/* Clear all result masks */
 	for (i = 0; i < num_grps; i++)
 		cpumask_clear(&result[i]);
 
-	/* Identify E-cores for later use */
+	/* Identify E-cores */
 	bitmap_zero(assigned, NR_CPUS);
-	cpumask_andnot(&e_cores_mask, cpu_online_mask, p_core_mask);
+	cpumask_andnot(&e_cores_mask, cpu_online_mask, &p_core_copy);
 
-	/* Identify L2 domains if not already done */
-	identify_l2_domains(p_core_mask);
-
-	/* If L2 domain identification failed, fall back to simple distribution */
-	if (!l2_domain_masks || l2_domain_count == 0) {
-		int cores = cpumask_weight(p_core_mask);
+	/* Identify L2 domains */
+	ret = identify_l2_domains(&p_core_copy);
+	if (ret) {
+		/* Fall back to simple distribution on error */
+		int cores = cpumask_weight(&p_core_copy);
 		int cores_per_group = cores / num_grps;
 		int extra = cores % num_grps;
 
@@ -340,7 +472,7 @@ static struct cpumask *group_cpus_hybrid_first(unsigned int num_grps)
 			int count = 0;
 			int cores_this_group = cores_per_group + (i < extra ? 1 : 0);
 
-			for_each_cpu(cpu, p_core_mask) {
+			for_each_cpu(cpu, &p_core_copy) {
 				if (!test_bit(cpu, assigned) && count < cores_this_group) {
 					cpumask_set_cpu(cpu, &result[i]);
 					set_bit(cpu, assigned);
@@ -349,34 +481,30 @@ static struct cpumask *group_cpus_hybrid_first(unsigned int num_grps)
 			}
 		}
 	} else {
-		/* Distribute cores with cache awareness using proportional allocation */
+		/* Cache-aware distribution */
 		int total_cores = 0;
 		for (i = 0; i < l2_domain_count; i++)
 			total_cores += cpumask_weight(&l2_domain_masks[i]);
 
-		/* Distribute each L2 domain proportionally */
+		/* Distribute domains proportionally */
 		for (i = 0; i < l2_domain_count && grp_idx < num_grps; i++) {
 			int domain_cores = cpumask_weight(&l2_domain_masks[i]);
 			if (domain_cores == 0)
 				continue;
 
-			/* Calculate groups for this domain proportional to its size */
-			int grps_for_domain;
-
+			/* Calculate groups for this domain */
+			int grps_for_domain = 1;
 			if (total_cores > 0) {
 				grps_for_domain = (num_grps * domain_cores + total_cores - 1) / total_cores;
 				grps_for_domain = min_t(int, grps_for_domain, num_grps - grp_idx);
-			} else {
-				grps_for_domain = 1;
 			}
-
 			grps_for_domain = max(1, grps_for_domain);
 
 			/* Calculate cores per group */
 			int cores_per_domain_group = domain_cores / grps_for_domain;
 			int domain_extra = domain_cores % grps_for_domain;
 
-			/* Distribute cores from this domain to groups */
+			/* Distribute cores */
 			for (j = 0; j < grps_for_domain && grp_idx < num_grps; j++, grp_idx++) {
 				int cores_this_group = cores_per_domain_group + (j < domain_extra ? 1 : 0);
 				int count = 0;
@@ -394,7 +522,7 @@ static struct cpumask *group_cpus_hybrid_first(unsigned int num_grps)
 		}
 	}
 
-	/* Handle remaining groups with E-cores */
+	/* Handle E-cores for remaining groups */
 	if (grp_idx < num_grps && !cpumask_empty(&e_cores_mask)) {
 		int e_cores = cpumask_weight(&e_cores_mask);
 		int cores_per_group = e_cores / (num_grps - grp_idx);
@@ -416,95 +544,170 @@ static struct cpumask *group_cpus_hybrid_first(unsigned int num_grps)
 		}
 	}
 
-	/* Final validation and rebalancing */
+	/* Intelligent rebalancing for empty groups */
 	for (i = 0; i < num_grps; i++) {
 		if (cpumask_empty(&result[i])) {
-			/* Find a CPU from a group with more than one CPU */
+			/* Find best donor CPU from a group with multiple CPUs */
 			int donor_cpu = -1;
 			int donor_group = -1;
+			int best_score = -1;
 
+			/* Find groups with multiple CPUs */
 			for (j = 0; j < num_grps; j++) {
 				if (cpumask_weight(&result[j]) > 1) {
-					donor_group = j;
-					break;
+					/* Find best CPU to donate based on cache sharing */
+					for_each_cpu(cpu, &result[j]) {
+						int score = 0;
+						int core_type = get_core_type(cpu);
+						const struct cpumask *cache_mask;
+						int cache_siblings = 0;
+						int sibling;
+
+						/* Prefer E-cores for donation */
+						if (core_type == 0) /* E-core */
+							score += 100;
+
+						/* Count siblings in same cache domain */
+						cache_mask = get_cache_shared_mask(cpu);
+						for_each_cpu(sibling, &result[j]) {
+							if (sibling != cpu && cpumask_test_cpu(sibling, cache_mask))
+								cache_siblings++;
+						}
+
+						/* Prefer CPUs with fewer cache siblings in group */
+						score += (10 - cache_siblings) * 10;
+
+						/* Consider NUMA node if target has a CPU */
+						if (cpumask_weight(&result[i]) > 0) {
+							int target_cpu = cpumask_first(&result[i]);
+							if (target_cpu < NR_CPUS && cpu < NR_CPUS &&
+								numa_node_for_cpu[cpu] == numa_node_for_cpu[target_cpu])
+								score += 50;
+						}
+
+						if (score > best_score) {
+							best_score = score;
+							donor_cpu = cpu;
+							donor_group = j;
+						}
+					}
 				}
 			}
 
-			if (donor_group >= 0) {
-				/* Take the first CPU from the donor group */
-				for_each_cpu(cpu, &result[donor_group]) {
-					donor_cpu = cpu;
-					break;
-				}
-
-				if (donor_cpu >= 0) {
-					cpumask_clear_cpu(donor_cpu, &result[donor_group]);
-					cpumask_set_cpu(donor_cpu, &result[i]);
-				}
+			if (donor_group >= 0 && donor_cpu >= 0) {
+				cpumask_clear_cpu(donor_cpu, &result[donor_group]);
+				cpumask_set_cpu(donor_cpu, &result[i]);
 			} else {
-				/* If no group has multiple CPUs, fall back to standard distribution */
-				if (p_core_mask != &pcore_mask)
-					kfree((void *)p_core_mask);
+				/* Last resort: fall back to standard distribution */
 				kfree(result);
 				return group_cpus_evenly(num_grps);
 			}
 		}
 	}
 
-	/* Clean up */
-	if (p_core_mask != &pcore_mask)
-		kfree((void *)p_core_mask);
-
 	return result;
 }
 
-/* CPU hotplug notification handler */
+/**
+ * pcore_cpu_notify - CPU hotplug notification handler
+ * @cpu: CPU number that changed state
+ *
+ * Handles topology changes on CPU hotplug events.
+ * Safely resets cached information to force recalculation.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
 static int pcore_cpu_notify(unsigned int cpu)
 {
-	atomic_set_release(&pcore_mask_initialized, 0);
+	if (cpu >= NR_CPUS) {
+		pr_warn("pcore_cpu_notify: cpu %u out of range\n", cpu);
+		return -EINVAL;
+	}
+
+	mutex_lock(&pcore_mask_lock);
+
+	/* Reset initialized flag to force recalculation */
+	atomic_set(&pcore_mask_initialized, 0);
+
+	/* Update NUMA node info */
 	numa_node_for_cpu[cpu] = cpu_to_node(cpu);
 
-	/* Force L2 domain recalculation on next use */
+	/* Clean up L2 domain information */
 	if (l2_domain_masks) {
 		kfree(l2_domain_masks);
 		l2_domain_masks = NULL;
 		l2_domain_count = 0;
 	}
 
+	mutex_unlock(&pcore_mask_lock);
+
 	return 0;
 }
 
-/* Improved initialization with proper hotplug registration */
+/**
+ * hybrid_irq_tuning_exit - Module exit function
+ *
+ * Cleans up all resources and restores system state when module is unloaded.
+ */
+static void __exit hybrid_irq_tuning_exit(void)
+{
+	if (!hybrid_cpu_detected() || !irq_pcore_affinity)
+		return;
+
+	/* Remove hotplug callback */
+	cpuhp_remove_state_nocalls(CPUHP_AP_ONLINE_DYN);
+
+	/* Free all resources */
+	free_l2_domain_masks();
+
+	/* Reset state */
+	atomic_set(&pcore_mask_initialized, 0);
+}
+
+/**
+ * hybrid_irq_tuning - Module initialization function
+ *
+ * Sets up hybrid CPU optimization for IRQ affinity on Raptor Lake
+ * and similar hybrid architectures.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
 static int __init hybrid_irq_tuning(void)
 {
-	int ret = 0;
+	int ret = 0, cpu;
+	struct cpumask pcore_copy;
 
 	if (!hybrid_cpu_detected() || !irq_pcore_affinity)
 		return 0;
 
-	/* Initialize NUMA node mapping */
-	int cpu;
+	/* Initialize NUMA node mapping with bounds checking */
 	for_each_possible_cpu(cpu) {
-		numa_node_for_cpu[cpu] = cpu_to_node(cpu);
+		if (cpu < NR_CPUS)
+			numa_node_for_cpu[cpu] = cpu_to_node(cpu);
 	}
 
-	/* Register for CPU hotplug notifications */
+	/* Register CPU hotplug callback */
 	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "irq/pcore_affinity:online",
 							pcore_cpu_notify, pcore_cpu_notify);
-	if (ret < 0)
+	if (ret < 0) {
+		pr_err("Failed to register CPU hotplug callback: %d\n", ret);
 		return ret;
+	}
 
-	/* Apply P-core affinity if enabled */
-	const struct cpumask *pcpu_mask = cpu_pcore_mask();
-	if (pcpu_mask && !cpumask_empty(pcpu_mask))
-		cpumask_copy(irq_default_affinity, pcpu_mask);
-
-	if (pcpu_mask != &pcore_mask)
-		kfree((void *)pcpu_mask);
+	/* Get P-core mask and apply to default affinity */
+	cpumask_clear(&pcore_copy);
+	ret = get_pcore_mask(&pcore_copy);
+	if (ret < 0) {
+		pr_warn("Failed to get P-core mask: %d\n", ret);
+		/* Continue anyway - will use default affinity */
+	} else if (!cpumask_empty(&pcore_copy)) {
+		cpumask_copy(irq_default_affinity, &pcore_copy);
+	}
 
 	return 0;
 }
 core_initcall(hybrid_irq_tuning);
+module_exit(hybrid_irq_tuning_exit);
 #endif /* CONFIG_X86 */
 
 /* Preserve original algorithm with safety checks */
@@ -517,6 +720,16 @@ static void default_calc_sets(struct irq_affinity *affd, unsigned int affvecs)
 	affd->set_size[0] = affvecs;
 }
 
+/**
+ * irq_create_affinity_masks - Create CPU affinity masks for IRQ distribution
+ * @nvecs: Number of vectors to create masks for
+ * @affd: IRQ affinity descriptor
+ *
+ * Creates affinity masks for IRQ vectors, optimized for hybrid CPU architectures
+ * when available. Includes proper bounds checking and error handling.
+ *
+ * Return: Array of affinity descriptors or NULL on failure
+ */
 struct irq_affinity_desc *
 irq_create_affinity_masks(unsigned int nvecs, struct irq_affinity *affd)
 {
@@ -599,6 +812,17 @@ irq_create_affinity_masks(unsigned int nvecs, struct irq_affinity *affd)
 	return masks;
 }
 
+/**
+ * irq_calc_affinity_vectors - Calculate optimal number of vectors for IRQ affinity
+ * @minvec: Minimum number of vectors
+ * @maxvec: Maximum number of vectors
+ * @affd: IRQ affinity descriptor
+ *
+ * Determines the optimal number of interrupt vectors for the system
+ * based on CPU topology.
+ *
+ * Return: Optimal number of vectors or 0 on failure
+ */
 unsigned int irq_calc_affinity_vectors(unsigned int minvec, unsigned int maxvec,
 									   const struct irq_affinity *affd)
 {
@@ -623,15 +847,12 @@ unsigned int irq_calc_affinity_vectors(unsigned int minvec, unsigned int maxvec,
 		cpus_read_lock();
 		#ifdef CONFIG_X86
 		if (hybrid_cpu_detected() && irq_pcore_affinity) {
-			const struct cpumask *pcpu_mask = cpu_pcore_mask();
-			if (pcpu_mask && !cpumask_empty(pcpu_mask)) {
-				set_vecs = cpumask_weight(pcpu_mask);
-				if (pcpu_mask != &pcore_mask)
-					kfree((void *)pcpu_mask);
+			struct cpumask pcpu_mask;
+			cpumask_clear(&pcpu_mask);
+			if (get_pcore_mask(&pcpu_mask) == 0 && !cpumask_empty(&pcpu_mask)) {
+				set_vecs = cpumask_weight(&pcpu_mask);
 			} else {
 				set_vecs = cpumask_weight(cpu_online_mask);
-				if (pcpu_mask != &pcore_mask)
-					kfree((void *)pcpu_mask);
 			}
 		} else
 			#endif
@@ -645,3 +866,8 @@ unsigned int irq_calc_affinity_vectors(unsigned int minvec, unsigned int maxvec,
 
 	return resv + min(set_vecs, diff);
 }
+
+/* Module metadata */
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Intel Corporation");
+MODULE_DESCRIPTION("Raptor Lake IRQ Affinity Optimizations");
