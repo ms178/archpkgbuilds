@@ -1,47 +1,242 @@
-# Maintainer: George Rawlinson <grawlinson@archlinux.org>
-# Contributor: René Wagner < rwagner at rw-net dot de >
-# Contributor: Diab Neiroukh <lazerl0rd@thezest.dev>
-
 pkgname=mimalloc
-pkgver=2.1.9
-pkgrel=3.1
+pkgver=2.2.2
+pkgrel=4.1
 pkgdesc='General-purpose allocator with excellent performance characteristics'
 arch=('x86_64')
 url='https://github.com/microsoft/mimalloc'
 license=('MIT')
 depends=('glibc')
-makedepends=('git' 'cmake')
+makedepends=('git' 'cmake' 'ninja' 'clang' 'llvm')
+options=(!strip)
 source=("$pkgname::git+$url#tag=v${pkgver}")
 b2sums=('SKIP')
 
 pkgver() {
   cd "$pkgname"
-
   git describe --tags | sed 's/^v//'
 }
 
 build() {
-  cmake \
-    -B build \
-    -S "$pkgname" \
-    -D CMAKE_INSTALL_PREFIX=/usr \
-    -DCMAKE_BUILD_TYPE=Release  \
-    -DCMAKE_UNITY_BUILD=ON \
-    -D MI_BUILD_STATIC=OFF \
-    -D MI_BUILD_OBJECT=OFF \
-    -D MI_INSTALL_TOPLEVEL=ON
+  cd "$pkgname"
 
-  cmake --build build
+  # Setup cleanup trap (exclude $srcdir/cspgo to preserve cs.profdata)
+  trap 'rm -rf "$srcdir/pgo" "$srcdir/bolt_profile"' EXIT
+
+  # Create directory for PGO profiles
+  mkdir -p "$srcdir/pgo"
+
+  # Create directory for CS-PGO profiles
+  mkdir -p "$srcdir/cspgo"
+
+  # Create directory for BOLT profile data
+  mkdir -p "$srcdir/bolt_profile"
+
+  local _common_cmake_options=(
+    -D CMAKE_INSTALL_PREFIX=/usr
+    -D CMAKE_UNITY_BUILD=ON
+    -D MI_BUILD_STATIC=ON
+    -D MI_BUILD_SHARED=ON
+    -D MI_BUILD_OBJECT=OFF
+    -D MI_INSTALL_TOPLEVEL=ON
+  )
+
+  # --- Stage 1: Build with PGO instrumentation ---
+  local _pgo_instrument_flags=" -fprofile-generate=$srcdir/pgo -Xclang -mllvm -Xclang -vp-counters-per-site=150 -g3 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling -fno-omit-frame-pointer"
+  local _original_cflags="$CFLAGS"
+  local _original_cxxflags="$CXXFLAGS"
+  local _original_ldflags="$LDFLAGS"
+  CFLAGS+=" $_pgo_instrument_flags"
+  CXXFLAGS+=" $_pgo_instrument_flags"
+  LDFLAGS+=" $_pgo_instrument_flags"
+
+  echo "CFLAGS for PGO instrumentation: $CFLAGS"
+  echo "CXXFLAGS for PGO instrumentation: $CXXFLAGS"
+  echo "LDFLAGS for PGO instrumentation: $LDFLAGS"
+
+  cmake \
+    -B build-stage1 \
+    -G Ninja \
+    -D CMAKE_BUILD_TYPE=None \
+    "${_common_cmake_options[@]}"
+
+  ninja -C build-stage1
+
+  # Run tests to generate PGO profile data
+  echo "Running tests to generate PGO profile data..."
+  cd build-stage1
+  export LD_LIBRARY_PATH="$PWD:$LD_LIBRARY_PATH"
+  ctest --output-on-failure -j$(nproc)
+  cd ..
+
+  # Merge PGO profiles
+  echo "Merging PGO profiles..."
+  llvm-profdata merge -output="$srcdir/pgo/default.profdata" "$srcdir"/pgo/*.profraw
+
+  # --- Stage 2: Build with CS-PGO instrumentation ---
+  local _cspgo_instrument_flags=" -fprofile-use=$srcdir/pgo/default.profdata -fcs-profile-generate=$srcdir/cspgo -Xclang -mllvm -Xclang -vp-counters-per-site=150 -g3 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling -fno-omit-frame-pointer"
+  CFLAGS="$_original_cflags $_cspgo_instrument_flags"
+  CXXFLAGS="$_original_cxxflags $_cspgo_instrument_flags"
+  LDFLAGS="$_original_ldflags $_cspgo_instrument_flags"
+
+  echo "CFLAGS for CS-PGO instrumentation: $CFLAGS"
+  echo "CXXFLAGS for CS-PGO instrumentation: $CXXFLAGS"
+  echo "LDFLAGS for CS-PGO instrumentation: $LDFLAGS"
+
+  cmake \
+    -B build-stage2 \
+    -G Ninja \
+    -D CMAKE_BUILD_TYPE=None \
+    "${_common_cmake_options[@]}"
+
+  ninja -C build-stage2
+
+  # Run tests to generate CS-PGO profile data
+  echo "Running tests to generate CS-PGO profile data..."
+  cd build-stage2
+  export LD_LIBRARY_PATH="$PWD:$LD_LIBRARY_PATH"
+  ctest --output-on-failure -j$(nproc)
+  cd ..
+
+  # Merge CS-PGO profiles with PGO profiles
+  echo "Merging CS-PGO profiles with PGO profiles..."
+  llvm-profdata merge -output="$srcdir/cspgo/cs.profdata" "$srcdir/cspgo"/*.profraw "$srcdir/pgo/default.profdata"
+
+  # --- Stage 3: Build with merged CS-PGO data ---
+  CFLAGS="$_original_cflags -fprofile-use=$srcdir/cspgo/cs.profdata"
+  CXXFLAGS="$_original_cxxflags -fprofile-use=$srcdir/cspgo/cs.profdata"
+  LDFLAGS="$_original_ldflags -fprofile-use=$srcdir/cspgo/cs.profdata -Wl,--emit-relocs"
+
+  echo "CFLAGS for CS-PGO optimization: $CFLAGS"
+  echo "CXXFLAGS for CS-PGO optimization: $CXXFLAGS"
+  echo "LDFLAGS for CS-PGO optimization: $LDFLAGS"
+
+  cmake \
+    -B build-pgo \
+    -G Ninja \
+    -D CMAKE_BUILD_TYPE=Release \
+    "${_common_cmake_options[@]}"
+
+  ninja -C build-pgo
+
+  # --- Stage 4 & 5: BOLT Instrumentation and Optimization ---
+  echo "Starting BOLT instrumentation and optimization..."
+
+  local shared_libs=(
+    "build-pgo/libmimalloc.so.2.2"
+  )
+
+  for lib in "${shared_libs[@]}"; do
+    if [ -f "$lib" ]; then
+      # Backup original CS-PGO-optimized library
+      cp "$lib" "$lib.cspgo"
+
+      # --- Instrument for BOLT ---
+      echo "Instrumenting $lib for BOLT..."
+      llvm-bolt "$lib" \
+        --instrument \
+        --lite=false \
+        --instrumentation-file-append-pid \
+        --instrumentation-file="$srcdir/bolt_profile/prof.fdata" \
+        -o "$lib.inst"
+      mv "$lib.inst" "$lib"
+
+      # --- Run tests with instrumented binary ---
+      echo "Running tests with BOLT instrumentation..."
+      export BOLT_USE_INSTRUMENTATION=1
+      export BOLT_INSTRUMENT_FILE="$srcdir/bolt_profile/prof.fdata"
+      cd build-pgo
+      LD_PRELOAD="../$lib" ctest --output-on-failure -j$(nproc) # Use relative path for LD_PRELOAD
+      cd ..
+
+      # --- Merge BOLT profile data ---
+      echo "Merging BOLT profile data..."
+      merge-fdata "$srcdir/bolt_profile/prof.fdata"* > "$srcdir/bolt_profile/merged.fdata"
+
+      # --- Optimize with BOLT ---
+      echo "Optimizing $lib with BOLT..."
+      local bolt_options=(
+        --data "$srcdir/bolt_profile/merged.fdata"
+        --dyno-stats
+        --lite=false
+        --frame-opt=all
+        --icf=all
+        --jump-tables=aggressive
+        --min-branch-clusters
+        --stoke
+        --sctc-mode=always
+        --plt=all
+        --hot-data
+        --hugify
+        --frame-opt-rm-stores
+        --peepholes=all
+        --infer-stale-profile=1
+        --x86-strip-redundant-address-size
+        --indirect-call-promotion=all
+        --reg-reassign
+        --use-aggr-reg-reassign
+        --reorder-blocks=ext-tsp
+        --reorder-functions=cdsort
+        --split-all-cold
+        --split-eh
+        --split-functions
+      )
+
+      if ! llvm-bolt "$lib.cspgo" "${bolt_options[@]}" -o "$lib.bolt"; then
+        echo "Warning: BOLT optimization failed for $lib, using CS-PGO-only version"
+        cp "$lib.cspgo" "$lib.bolt"
+      fi
+
+      # --- Replace original with optimized library ---
+      mv "$lib.bolt" "$lib"
+
+      # --- Validate optimized library ---
+      if ! ldd "$lib" >/dev/null 2>&1; then
+        echo "Error: Optimized library $lib has missing dependencies"
+        return 1
+      fi
+
+      # --- Clean up instrumentation files ---
+      rm -f "$srcdir/bolt_profile/prof.fdata"*
+    fi
+  done
+
+  # --- Add RPATH to link the correct library ---
+  local _rpath_flags="-Wl,-rpath,\$ORIGIN/../.."
+  LDFLAGS+=" $_rpath_flags"
+
+  # --- Run check() AFTER BOLT optimization and installation ---
+  echo "Running final check on BOLT-optimized binary..."
+  check
+
 }
 
 check() {
-  cd build
-
-  ctest --output-on-failure
+  # Run tests against the optimized library in the build-pgo directory, using LD_LIBRARY_PATH
+  cd "$srcdir/$pkgname/build-pgo"
+  export LD_LIBRARY_PATH="$srcdir/$pkgname/build-pgo:$LD_LIBRARY_PATH" # Set LD_LIBRARY_PATH
+  ctest -C Release -j$(nproc) # Specify Release configuration
+  unset LD_LIBRARY_PATH # Clean up after tests
 }
 
 package() {
-  DESTDIR="$pkgdir" cmake --install build
+  cd "$pkgname"
+  DESTDIR="$pkgdir" cmake --install build-pgo
 
-  install -vDm644 -t "$pkgdir/usr/share/licenses/$pkgname" "$pkgname/LICENSE"
+  # Replace only the actual library with BOLT-optimized version and recreate symlinks
+  if [ -f "build-pgo/libmimalloc.so.2.2.bolt" ]; then
+    install -Dm755 "build-pgo/libmimalloc.so.2.2.bolt" "$pkgdir/usr/lib/libmimalloc.so.2.2"
+    ln -sf libmimalloc.so.2.2 "$pkgdir/usr/lib/libmimalloc.so.2"
+    ln -sf libmimalloc.so.2 "$pkgdir/usr/lib/libmimalloc.so"
+  fi
+
+  # Use llvm-strip only on recognized file formats
+  find "$pkgdir" -type f \( -name '*.so*' -o -name '*.a' -o -executable \) -print0 | while IFS= read -r -d '' file; do
+    if llvm-strip --strip-unneeded "$file" 2>/dev/null || llvm-strip --strip-all "$file" 2>/dev/null; then
+      echo "Stripped: $file"
+    else
+      echo "Skipping: $file (not a valid object file)" >&2
+    fi
+  done
+
+  install -vDm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE
 }
