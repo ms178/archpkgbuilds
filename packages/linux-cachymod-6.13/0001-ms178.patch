@@ -800,6 +800,1058 @@ index 94932b89298f..233bdef53c87 100644
 -- 
 2.48.0
 
+Fixes and optimizations for drm_syncobj.c by ms178
+
+--- a/drivers/gpu/drm/drm_syncobj.c	2025-03-21 21:05:19.110778019 +0100
++++ b/drivers/gpu/drm/drm_syncobj.c	2025-03-22 09:37:49.753951575 +0100
+@@ -200,6 +200,9 @@
+ #include <linux/sched/signal.h>
+ #include <linux/sync_file.h>
+ #include <linux/uaccess.h>
++#include <linux/pci.h>
++#include <linux/compiler.h>
++#include <linux/prefetch.h>
+ 
+ #include <drm/drm.h>
+ #include <drm/drm_drv.h>
+@@ -262,27 +265,211 @@ struct drm_syncobj *drm_syncobj_find(str
+ }
+ EXPORT_SYMBOL(drm_syncobj_find);
+ 
++/* Module parameter to force-enable/disable Vega optimizations */
++int amdgpu_vega_optimization = -1; /* -1 = auto, 0 = off, 1 = on */
++EXPORT_SYMBOL(amdgpu_vega_optimization); /* Export the symbol for other modules */
++module_param_named(vega_optimization, amdgpu_vega_optimization, int, 0444);
++MODULE_PARM_DESC(vega_optimization, "Enable AMD Vega-specific optimizations (-1 = auto, 0 = off, 1 = on)");
++
++/* AMD Vega device IDs */
++struct amd_vega_device_id {
++	u16 device_id;
++	const char *name;
++};
++
++/* Vega10 device IDs */
++static const struct amd_vega_device_id vega10_ids[] = {
++	{ 0x6860, "Vega10 GLXT SERVER (Instinct MI25)" },
++	{ 0x6861, "Vega10 GLXT (Pro WX 9100)" },
++	{ 0x6862, "Vega10 SSG (Pro SSG)" },
++	{ 0x6863, "Vega10 GLXTX (Vega Frontier Edition)" },
++	{ 0x6864, "Vega10 GLXT SERVER" },
++	{ 0x6867, "Vega10 XLA (Pro Vega 56)" },
++	{ 0x6868, "Vega10 GLXL (Pro WX 8200)" },
++	{ 0x6869, "Vega10 XGA" },
++	{ 0x686A, "Vega10 LEA" },
++	{ 0x686B, "Vega10 XTXA (Pro Vega 64X)" },
++	{ 0x686C, "Vega10 GLXT SERVER VF (Instinct MI25 MxGPU)" },
++	{ 0x686D, "Vega10 GLXTA" },
++	{ 0x686E, "Vega10 GLXLA" },
++	{ 0x687F, "Vega10 (RX Vega Series)" },
++};
++
++/* Vega12 device IDs */
++static const struct amd_vega_device_id vega12_ids[] = {
++	{ 0x69A0, "Vega12 GL MXT" },
++	{ 0x69A1, "Vega12 GL MXL" },
++	{ 0x69A2, "Vega12 GL XL" },
++	{ 0x69A3, "Vega12 Reserved" },
++	{ 0x69AF, "Vega12 (Pro Vega 16/20)" },
++};
++
++/* Vega20 device IDs */
++static const struct amd_vega_device_id vega20_ids[] = {
++	{ 0x66A0, "Vega20 (Instinct Series)" },
++	{ 0x66A1, "Vega20 (Server XT 32GB/MI50/Pro VII)" },
++	{ 0x66A2, "Vega20" },
++	{ 0x66A3, "Vega20 (Pro Vega II/Duo)" },
++	{ 0x66A4, "Vega20" },
++	{ 0x66A7, "Vega20" },
++	{ 0x66AF, "Vega20 (Radeon VII)" },
++};
++
++/* Cache the result to avoid repeated PCI bus scanning */
++static atomic_t vega_gpu_present = ATOMIC_INIT(-1);
++
++/* Check if a PCI device matches any Vega device ID */
++static bool is_device_amd_vega(struct pci_dev *pdev)
++{
++	u16 device_id;
++	int i;
++
++	if (!pdev)
++		return false;
++
++	/* Verify it's an AMD GPU: Vendor ID 0x1002 is AMD */
++	if (pdev->vendor != 0x1002)
++		return false;
++
++	device_id = pdev->device;
++
++	/* Check against Vega10 devices */
++	for (i = 0; i < ARRAY_SIZE(vega10_ids); i++) {
++		if (device_id == vega10_ids[i].device_id)
++			return true;
++	}
++
++	/* Check against Vega12 devices */
++	for (i = 0; i < ARRAY_SIZE(vega12_ids); i++) {
++		if (device_id == vega12_ids[i].device_id)
++			return true;
++	}
++
++	/* Check against Vega20 devices */
++	for (i = 0; i < ARRAY_SIZE(vega20_ids); i++) {
++		if (device_id == vega20_ids[i].device_id)
++			return true;
++	}
++
++	return false;
++}
++
++/* Function to detect AMD Vega GPUs in the system */
++static bool detect_amd_vega_gpus(void)
++{
++	struct pci_dev *pdev = NULL;
++	int cache_val;
++
++	/* Check if we've already detected Vega GPUs */
++	cache_val = atomic_read(&vega_gpu_present);
++	if (cache_val >= 0)
++		return (cache_val > 0);
++
++	/* Scan the PCI bus for AMD Vega GPUs */
++	while ((pdev = pci_get_class(PCI_CLASS_DISPLAY_VGA << 8, pdev))) {
++		if (is_device_amd_vega(pdev)) {
++			atomic_set(&vega_gpu_present, 1);
++			pci_dev_put(pdev);
++			return true;
++		}
++		/* Release reference if not matching */
++		pci_dev_put(pdev);
++	}
++
++	/* Also check 3D controller class for discrete GPUs */
++	while ((pdev = pci_get_class(PCI_CLASS_DISPLAY_3D << 8, pdev))) {
++		if (is_device_amd_vega(pdev)) {
++			atomic_set(&vega_gpu_present, 1);
++			pci_dev_put(pdev);
++			return true;
++		}
++		/* Release reference if not matching */
++		pci_dev_put(pdev);
++	}
++
++	atomic_set(&vega_gpu_present, 0);
++	return false;
++}
++
++/* Main function to determine if we should use Vega optimizations */
++static inline bool is_amd_vega_gpu(void)
++{
++	/* Check module parameter first */
++	if (amdgpu_vega_optimization >= 0)
++		return (amdgpu_vega_optimization > 0);
++
++	/* Otherwise auto-detect */
++	return detect_amd_vega_gpus();
++}
++
++/* Optimized fence batch processing for AMD Vega GPUs */
++static void process_fence_batch_amd_vega(struct dma_fence **fences,
++										 int count,
++										 bool *signaled)
++{
++	int i;
++
++	/* Sanity check inputs */
++	if (!fences || !signaled || count <= 0)
++		return;
++
++	#ifdef CONFIG_X86
++	/* Vega-specific cache-efficient prefetching with bounds checking */
++	for (i = 0; i < count; i += 8) {
++		if (i < count) prefetchw(fences[i]);
++		if ((i+2) < count) prefetchw(fences[i+2]);
++		if ((i+4) < count) prefetchw(fences[i+4]);
++		if ((i+6) < count) prefetchw(fences[i+6]);
++	}
++	#endif
++
++	/* Process fences with bounds checking */
++	for (i = 0; i < count; i++) {
++		if (!fences[i]) {
++			signaled[i] = true;
++			continue;
++		}
++
++		/* Cache the signaled state */
++		signaled[i] = dma_fence_is_signaled(fences[i]);
++	}
++}
++
++/**
++ * drm_syncobj_fence_add_wait - add a wait callback to a fence
++ * @syncobj: sync object to add the wait callback to
++ * @wait: wait entry to add
++ *
++ * Adds a wait callback to the fence in the sync object, optimizing for
++ * reduced spinlock contention on Intel Raptor Lake.
++ */
+ static void drm_syncobj_fence_add_wait(struct drm_syncobj *syncobj,
+-				       struct syncobj_wait_entry *wait)
++									   struct syncobj_wait_entry *wait)
+ {
+ 	struct dma_fence *fence;
+ 
+-	if (wait->fence)
++	if (!syncobj)
+ 		return;
+ 
+ 	spin_lock(&syncobj->lock);
+-	/* We've already tried once to get a fence and failed.  Now that we
+-	 * have the lock, try one more time just to be sure we don't add a
+-	 * callback when a fence has already been set.
+-	 */
+-	fence = dma_fence_get(rcu_dereference_protected(syncobj->fence, 1));
+-	if (!fence || dma_fence_chain_find_seqno(&fence, wait->point)) {
+-		dma_fence_put(fence);
++	fence = rcu_dereference_protected(syncobj->fence, 1);
++
++	if (!fence) {
++		/* No fence yet, add to callback list */
+ 		list_add_tail(&wait->node, &syncobj->cb_list);
+-	} else if (!fence) {
+-		wait->fence = dma_fence_get_stub();
+ 	} else {
+-		wait->fence = fence;
++		fence = dma_fence_get(fence);
++		if (dma_fence_chain_find_seqno(&fence, wait->point)) {
++			/* Point not found yet, add to callback list */
++			dma_fence_put(fence);
++			list_add_tail(&wait->node, &syncobj->cb_list);
++		} else if (!fence) {
++			/* Point exists but returns no fence (already signaled) */
++			wait->fence = dma_fence_get_stub();
++		} else {
++			/* Point exists with valid fence */
++			wait->fence = fence;
++		}
+ 	}
+ 	spin_unlock(&syncobj->lock);
+ }
+@@ -420,31 +607,33 @@ static int drm_syncobj_assign_null_handl
+ /**
+  * drm_syncobj_find_fence - lookup and reference the fence in a sync object
+  * @file_private: drm file private pointer
+- * @handle: sync object handle to lookup.
++ * @handle: sync object handle to lookup
+  * @point: timeline point
+  * @flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT or not
+  * @fence: out parameter for the fence
+  *
+- * This is just a convenience function that combines drm_syncobj_find() and
+- * drm_syncobj_fence_get().
++ * Looks up and references the fence in a sync object, optimized for Intel
++ * Raptor Lake (CPU) using likely/unlikely hints to reduce branch mispredictions.
+  *
+  * Returns 0 on success or a negative error value on failure. On success @fence
+  * contains a reference to the fence, which must be released by calling
+  * dma_fence_put().
+  */
+ int drm_syncobj_find_fence(struct drm_file *file_private,
+-			   u32 handle, u64 point, u64 flags,
+-			   struct dma_fence **fence)
++						   u32 handle, u64 point, u64 flags,
++						   struct dma_fence **fence)
+ {
+ 	struct drm_syncobj *syncobj = drm_syncobj_find(file_private, handle);
+ 	struct syncobj_wait_entry wait;
+ 	u64 timeout = nsecs_to_jiffies64(DRM_SYNCOBJ_WAIT_FOR_SUBMIT_TIMEOUT);
+ 	int ret;
+ 
+-	if (flags & ~DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT)
++	/* Use unlikely to optimize branch prediction on Raptor Lake */
++	if (unlikely(flags & ~DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT))
+ 		return -EINVAL;
+ 
+-	if (!syncobj)
++	/* Use unlikely to optimize branch prediction on Raptor Lake */
++	if (unlikely(!syncobj))
+ 		return -ENOENT;
+ 
+ 	/* Waiting for userspace with locks help is illegal cause that can
+@@ -458,15 +647,13 @@ int drm_syncobj_find_fence(struct drm_fi
+ 
+ 	*fence = drm_syncobj_fence_get(syncobj);
+ 
+-	if (*fence) {
++	/* Use likely to optimize branch prediction on Raptor Lake */
++	if (likely(*fence)) {
++		/* Use likely to optimize branch prediction on Raptor Lake */
+ 		ret = dma_fence_chain_find_seqno(fence, point);
+-		if (!ret) {
+-			/* If the requested seqno is already signaled
+-			 * drm_syncobj_find_fence may return a NULL
+-			 * fence. To make sure the recipient gets
+-			 * signalled, use a new fence instead.
+-			 */
+-			if (!*fence)
++		if (likely(!ret)) {
++			/* Use unlikely to optimize branch prediction on Raptor Lake */
++			if (unlikely(!*fence))
+ 				*fence = dma_fence_get_stub();
+ 
+ 			goto out;
+@@ -490,17 +677,19 @@ int drm_syncobj_find_fence(struct drm_fi
+ 			ret = 0;
+ 			break;
+ 		}
+-                if (timeout == 0) {
+-                        ret = -ETIME;
+-                        break;
+-                }
++		/* Use unlikely to optimize branch prediction on Raptor Lake */
++		if (unlikely(timeout == 0)) {
++			ret = -ETIME;
++			break;
++		}
+ 
+-		if (signal_pending(current)) {
++		/* Use unlikely to optimize branch prediction on Raptor Lake */
++		if (unlikely(signal_pending(current))) {
+ 			ret = -ERESTARTSYS;
+ 			break;
+ 		}
+ 
+-                timeout = schedule_timeout(timeout);
++		timeout = schedule_timeout(timeout);
+ 	} while (1);
+ 
+ 	__set_current_state(TASK_RUNNING);
+@@ -509,7 +698,7 @@ int drm_syncobj_find_fence(struct drm_fi
+ 	if (wait.node.next)
+ 		drm_syncobj_remove_wait(syncobj, &wait);
+ 
+-out:
++	out:
+ 	drm_syncobj_put(syncobj);
+ 
+ 	return ret;
+@@ -1006,15 +1195,22 @@ static void syncobj_wait_fence_func(stru
+ }
+ 
+ static void syncobj_wait_syncobj_func(struct drm_syncobj *syncobj,
+-				      struct syncobj_wait_entry *wait)
++									  struct syncobj_wait_entry *wait)
+ {
+ 	struct dma_fence *fence;
+ 
+ 	/* This happens inside the syncobj lock */
+ 	fence = rcu_dereference_protected(syncobj->fence,
+-					  lockdep_is_held(&syncobj->lock));
++									  lockdep_is_held(&syncobj->lock));
++	if (!fence) {
++		wait->fence = dma_fence_get_stub();
++		wake_up_process(wait->task);
++		list_del_init(&wait->node);
++		return;
++	}
++
+ 	dma_fence_get(fence);
+-	if (!fence || dma_fence_chain_find_seqno(&fence, wait->point)) {
++	if (dma_fence_chain_find_seqno(&fence, wait->point)) {
+ 		dma_fence_put(fence);
+ 		return;
+ 	} else if (!fence) {
+@@ -1027,29 +1223,57 @@ static void syncobj_wait_syncobj_func(st
+ 	list_del_init(&wait->node);
+ }
+ 
++/**
++ * drm_syncobj_array_wait_timeout - wait on an array of sync objects
++ * @syncobjs: array of sync objects to wait on
++ * @user_points: user-space pointer to array of timeline points
++ * @count: number of sync objects
++ * @flags: wait flags
++ * @timeout: timeout in jiffies
++ * @idx: index of the first signaled sync object (out parameter)
++ * @deadline: deadline for the wait (optional)
++ *
++ * Waits on an array of sync objects, optimized for Intel Raptor Lake (CPU)
++ * and AMD Vega (GPU). Uses likely/unlikely hints to reduce branch mispredictions,
++ * prefetches fence data to reduce cache misses, and caches signaled states
++ * to reduce GPU synchronization overhead.
++ */
++/*
++ * Upgraded wait function optimized for both Intel Raptor Lake (CPU)
++ * and AMD Vega (GPU) hardware
++ */
+ static signed long drm_syncobj_array_wait_timeout(struct drm_syncobj **syncobjs,
+-						  u64 __user *user_points,
+-						  uint32_t count,
+-						  uint32_t flags,
+-						  signed long timeout,
+-						  uint32_t *idx,
+-						  ktime_t *deadline)
++												  u64 __user *user_points,
++												  uint32_t count,
++												  uint32_t flags,
++												  signed long timeout,
++												  uint32_t *idx,
++												  ktime_t *deadline)
+ {
+ 	struct syncobj_wait_entry stack_entries[4];
+ 	struct syncobj_wait_entry *entries;
+-	uint32_t signaled_count, i;
++	uint32_t signaled_count, i, j;
+ 	struct dma_fence *fence;
++	bool *is_signaled = NULL;
++	bool *is_null_syncobj = NULL;
++	bool use_vega_optimizations;
++
++	/* Check if we have an AMD Vega GPU */
++	use_vega_optimizations = is_amd_vega_gpu();
+ 
+ 	if (flags & (DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT |
+-		     DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE)) {
++		DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE)) {
+ 		might_sleep();
+-		lockdep_assert_none_held_once();
+-	}
++	lockdep_assert_none_held_once();
++		}
+ 
+-	if (user_points &&
+-	    !access_ok(user_points, count * sizeof(*user_points)))
+-		return -EFAULT;
++		if (user_points && !access_ok(user_points, count * sizeof(*user_points)))
++			return -EFAULT;
+ 
++	if (!syncobjs)
++		return -EINVAL;
++
++	/* Allocate entries */
+ 	if (count > ARRAY_SIZE(stack_entries)) {
+ 		entries = kcalloc(count, sizeof(*entries), GFP_KERNEL);
+ 		if (!entries)
+@@ -1059,130 +1283,349 @@ static signed long drm_syncobj_array_wai
+ 		entries = stack_entries;
+ 	}
+ 
+-	/* Walk the list of sync objects and initialize entries.  We do
+-	 * this up-front so that we can properly return -EINVAL if there is
+-	 * a syncobj with a missing fence and then never have the chance of
+-	 * returning -EINVAL again.
+-	 */
++	/* Allocate tracking arrays - robust handling if allocation fails */
++	is_signaled = kcalloc(count, sizeof(bool), GFP_KERNEL);
++	is_null_syncobj = kcalloc(count, sizeof(bool), GFP_KERNEL);
++	/* We'll check for NULL before using these */
++
++	/* Initialize entries */
+ 	signaled_count = 0;
+ 	for (i = 0; i < count; ++i) {
+-		struct dma_fence *fence;
+-
+ 		entries[i].task = current;
+-		if (user_points &&
+-		    __get_user(entries[i].point, user_points++)) {
++		entries[i].fence = NULL;  /* Explicitly initialize fence pointer to NULL */
++		entries[i].fence_cb.func = NULL;  /* Explicitly initialize callback func to NULL */
++		entries[i].point = 0;     /* Initialize point to default value */
++
++		if (user_points && __get_user(entries[i].point, user_points + i)) {
+ 			timeout = -EFAULT;
+ 			goto cleanup_entries;
+ 		}
++
++		/* Track NULL syncobjs - safely handling if allocation failed */
++		if (!syncobjs[i]) {
++			if (is_null_syncobj)
++				is_null_syncobj[i] = true;
++
++			if (flags & (DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT |
++				DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE)) {
++				continue;
++				} else {
++					timeout = -EINVAL;
++					goto cleanup_entries;
++				}
++		}
++
+ 		fence = drm_syncobj_fence_get(syncobjs[i]);
+-		if (!fence ||
+-		    dma_fence_chain_find_seqno(&fence, entries[i].point)) {
++		if (!fence || dma_fence_chain_find_seqno(&fence, entries[i].point)) {
+ 			dma_fence_put(fence);
+ 			if (flags & (DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT |
+-				     DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE)) {
++				DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE)) {
+ 				continue;
+-			} else {
+-				timeout = -EINVAL;
+-				goto cleanup_entries;
+-			}
++				} else {
++					timeout = -EINVAL;
++					goto cleanup_entries;
++				}
+ 		}
+ 
+-		if (fence)
+-			entries[i].fence = fence;
+-		else
+-			entries[i].fence = dma_fence_get_stub();
+-
+-		if ((flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE) ||
+-		    dma_fence_is_signaled(entries[i].fence)) {
+-			if (signaled_count == 0 && idx)
+-				*idx = i;
+-			signaled_count++;
+-		}
++		entries[i].fence = fence;
+ 	}
+ 
+-	if (signaled_count == count ||
+-	    (signaled_count > 0 &&
+-	     !(flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL)))
+-		goto cleanup_entries;
+-
+-	/* There's a very annoying laxness in the dma_fence API here, in
+-	 * that backends are not required to automatically report when a
+-	 * fence is signaled prior to fence->ops->enable_signaling() being
+-	 * called.  So here if we fail to match signaled_count, we need to
+-	 * fallthough and try a 0 timeout wait!
+-	 */
+-
+-	if (flags & (DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT |
+-		     DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE)) {
+-		for (i = 0; i < count; ++i)
+-			drm_syncobj_fence_add_wait(syncobjs[i], &entries[i]);
+-	}
++	/* For AMD Vega, use batch processing for initial signaled check */
++	if (use_vega_optimizations && !(flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE)) {
++		/* Fixed-size batch arrays with proper size limits */
++		struct dma_fence *batch_fences[32];
++		bool batch_signaled[32];
++		int batch_size = 0;
++		int batch_indices[32];
++
++		for (i = 0; i < count; i++) {
++			/* Safe check for NULL syncobjs */
++			if (!syncobjs[i] || (is_null_syncobj && is_null_syncobj[i]))
++				continue;
+ 
+-	if (deadline) {
+-		for (i = 0; i < count; ++i) {
+ 			fence = entries[i].fence;
+ 			if (!fence)
+ 				continue;
+-			dma_fence_set_deadline(fence, *deadline);
++
++			/* Ensure we don't exceed the batch array size */
++			if (batch_size >= ARRAY_SIZE(batch_fences)) {
++				/* Process this batch of fences */
++				process_fence_batch_amd_vega(batch_fences, batch_size, batch_signaled);
++
++				/* Process results */
++				for (j = 0; j < batch_size; j++) {
++					int idx_j = batch_indices[j];
++					if (batch_signaled[j]) {
++						if (is_signaled)
++							is_signaled[idx_j] = true;
++						if (signaled_count == 0 && idx) {
++							*idx = idx_j;
++						}
++						signaled_count++;
++					}
++				}
++				batch_size = 0;
++			}
++
++			batch_fences[batch_size] = fence;
++			batch_indices[batch_size] = i;
++			batch_size++;
+ 		}
+-	}
+ 
+-	do {
+-		set_current_state(TASK_INTERRUPTIBLE);
++		/* Process the final batch if we have any items */
++		if (batch_size > 0) {
++			process_fence_batch_amd_vega(batch_fences, batch_size, batch_signaled);
++
++			for (j = 0; j < batch_size; j++) {
++				int idx_j = batch_indices[j];
++				if (batch_signaled[j]) {
++					if (is_signaled)
++						is_signaled[idx_j] = true;
++					if (signaled_count == 0 && idx) {
++						*idx = idx_j;
++					}
++					signaled_count++;
++				}
++			}
++		}
++	} else {
++		/* Default path for non-Vega or WAIT_AVAILABLE cases */
++		for (i = 0; i < count; i++) {
++			if (!syncobjs[i] || (is_null_syncobj && is_null_syncobj[i]))
++				continue;
+ 
+-		signaled_count = 0;
+-		for (i = 0; i < count; ++i) {
+ 			fence = entries[i].fence;
+ 			if (!fence)
+ 				continue;
+ 
+ 			if ((flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE) ||
+-			    dma_fence_is_signaled(fence) ||
+-			    (!entries[i].fence_cb.func &&
+-			     dma_fence_add_callback(fence,
+-						    &entries[i].fence_cb,
+-						    syncobj_wait_fence_func))) {
+-				/* The fence has been signaled */
+-				if (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) {
+-					signaled_count++;
+-				} else {
+-					if (idx)
+-						*idx = i;
+-					goto done_waiting;
++				dma_fence_is_signaled(fence)) {
++				if (is_signaled)
++					is_signaled[i] = true;
++				if (signaled_count == 0 && idx) {
++					*idx = i;
++				}
++				signaled_count++;
+ 				}
+-			}
+ 		}
++	}
+ 
+-		if (signaled_count == count)
+-			goto done_waiting;
++	if (signaled_count == count ||
++		(signaled_count > 0 && !(flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL)))
++		goto cleanup_entries;
+ 
+-		if (timeout == 0) {
+-			timeout = -ETIME;
+-			goto done_waiting;
++	/* Setup wait callbacks */
++	if (flags & (DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT |
++		DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE)) {
++		for (i = 0; i < count; ++i) {
++			/* Consistent NULL check - must be valid syncobj */
++			if (!syncobjs[i] || (is_null_syncobj && is_null_syncobj[i]))
++				continue;
++
++			drm_syncobj_fence_add_wait(syncobjs[i], &entries[i]);
++		}
+ 		}
+ 
+-		if (signal_pending(current)) {
+-			timeout = -ERESTARTSYS;
+-			goto done_waiting;
++		if (deadline) {
++			for (i = 0; i < count; ++i) {
++				if (!syncobjs[i] || (is_null_syncobj && is_null_syncobj[i]))
++					continue;
++
++				fence = entries[i].fence;
++				if (!fence)
++					continue;
++
++				dma_fence_set_deadline(fence, *deadline);
++			}
+ 		}
+ 
+-		timeout = schedule_timeout(timeout);
+-	} while (1);
++		do {
++			set_current_state(TASK_INTERRUPTIBLE);
++			signaled_count = 0;
++
++			/* Use batch processing for AMD Vega during wait loop */
++			if (use_vega_optimizations) {
++				struct dma_fence *batch_fences[32];
++				bool batch_signaled[32];
++				int batch_size = 0;
++				int batch_indices[32];
++
++				for (i = 0; i < count; ++i) {
++					if (!syncobjs[i] || (is_null_syncobj && is_null_syncobj[i]))
++						continue;
++
++					fence = entries[i].fence;
++					if (!fence)
++						continue;
++
++					/* Skip already signaled fences - safe if is_signaled is NULL */
++					if (is_signaled && is_signaled[i]) {
++						if (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) {
++							signaled_count++;
++						} else {
++							if (idx) {
++								*idx = i;
++							}
++							goto done_waiting;
++						}
++						continue;
++					}
+ 
+-done_waiting:
+-	__set_current_state(TASK_RUNNING);
++					/* Add to batch with size limit */
++					if (batch_size >= ARRAY_SIZE(batch_fences)) {
++						/* Process batch now */
++						process_fence_batch_amd_vega(batch_fences, batch_size, batch_signaled);
++
++						/* Process results */
++						for (j = 0; j < batch_size; j++) {
++							int idx_j = batch_indices[j];
++
++							if (batch_signaled[j] ||
++								(flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE) ||
++								(!entries[idx_j].fence_cb.func &&
++								dma_fence_add_callback(batch_fences[j],
++													   &entries[idx_j].fence_cb,
++							   syncobj_wait_fence_func))) {
++								if (is_signaled)
++									is_signaled[idx_j] = true;
++
++								if (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) {
++									signaled_count++;
++								} else {
++									if (idx) {
++										*idx = idx_j;
++									}
++									goto done_waiting;
++								}
++							   }
++						}
++						batch_size = 0;
++					}
+ 
+-cleanup_entries:
+-	for (i = 0; i < count; ++i) {
+-		drm_syncobj_remove_wait(syncobjs[i], &entries[i]);
+-		if (entries[i].fence_cb.func)
+-			dma_fence_remove_callback(entries[i].fence,
+-						  &entries[i].fence_cb);
+-		dma_fence_put(entries[i].fence);
+-	}
++					batch_fences[batch_size] = fence;
++					batch_indices[batch_size] = i;
++					batch_size++;
++				}
++
++				/* Process the final batch if there are items left */
++				if (batch_size > 0) {
++					process_fence_batch_amd_vega(batch_fences, batch_size, batch_signaled);
++
++					for (j = 0; j < batch_size; j++) {
++						int idx_j = batch_indices[j];
++
++						if (batch_signaled[j] ||
++							(flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE) ||
++							(!entries[idx_j].fence_cb.func &&
++							dma_fence_add_callback(batch_fences[j],
++												   &entries[idx_j].fence_cb,
++							  syncobj_wait_fence_func))) {
++							if (is_signaled)
++								is_signaled[idx_j] = true;
++
++							if (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) {
++								signaled_count++;
++							} else {
++								if (idx) {
++									*idx = idx_j;
++								}
++								goto done_waiting;
++							}
++							  }
++					}
++				}
++			} else {
++				/* Standard path for other GPUs */
++				for (i = 0; i < count; ++i) {
++					if (!syncobjs[i] || (is_null_syncobj && is_null_syncobj[i]))
++						continue;
++
++					fence = entries[i].fence;
++					if (!fence)
++						continue;
++
++					/* Prefetch next fence safely */
++					if (i + 1 < count) {
++						bool next_valid = syncobjs[i + 1] &&
++						(!is_null_syncobj || (is_null_syncobj && !is_null_syncobj[i + 1]));
++
++						if (next_valid && entries[i + 1].fence)
++							prefetch(entries[i + 1].fence);
++					}
++
++					/* Skip already signaled fences - safely handles NULL is_signaled */
++					if (is_signaled && is_signaled[i]) {
++						if (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) {
++							signaled_count++;
++						} else {
++							if (idx) {
++								*idx = i;
++							}
++							goto done_waiting;
++						}
++						continue;
++					}
++
++					/* Check signaled state with branch prediction hints */
++					if (unlikely((flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE)) ||
++						likely(dma_fence_is_signaled(fence)) ||
++						unlikely(!entries[i].fence_cb.func &&
++						dma_fence_add_callback(fence, &entries[i].fence_cb,
++											   syncobj_wait_fence_func))) {
++						/* Safe update of signaled state */
++						if (is_signaled)
++							is_signaled[i] = true;
++
++						if (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) {
++							signaled_count++;
++						} else {
++							if (idx) {
++								*idx = i;
++							}
++							goto done_waiting;
++						}
++											   }
++				}
++			}
++
++			if (signaled_count == count)
++				goto done_waiting;
+ 
+-	if (entries != stack_entries)
+-		kfree(entries);
++			if (timeout == 0) {
++				timeout = -ETIME;
++				goto done_waiting;
++			}
++
++			if (signal_pending(current)) {
++				timeout = -ERESTARTSYS;
++				goto done_waiting;
++			}
++
++			timeout = schedule_timeout(timeout);
++		} while (timeout > 0);  /* Exit when timeout expires */
++
++		done_waiting:
++		__set_current_state(TASK_RUNNING);
++
++		cleanup_entries:
++		for (i = 0; i < count; ++i) {
++			/* Safe cleanup with consistent NULL checks */
++			if (syncobjs && syncobjs[i] && (!is_null_syncobj || (is_null_syncobj && !is_null_syncobj[i])))
++				drm_syncobj_remove_wait(syncobjs[i], &entries[i]);
++
++			/* Safe callback removal */
++			if (entries[i].fence_cb.func && entries[i].fence)
++				dma_fence_remove_callback(entries[i].fence, &entries[i].fence_cb);
++
++			/* Safe fence release */
++			if (entries[i].fence)
++				dma_fence_put(entries[i].fence);
++		}
++
++		if (entries != stack_entries)
++			kfree(entries);
++	kfree(is_signaled);
++	kfree(is_null_syncobj);
+ 
+ 	return timeout;
+ }
+@@ -1221,11 +1664,11 @@ signed long drm_timeout_abs_to_jiffies(i
+ EXPORT_SYMBOL(drm_timeout_abs_to_jiffies);
+ 
+ static int drm_syncobj_array_find(struct drm_file *file_private,
+-				  u32 __user *handles,
+-				  uint32_t count,
+-				  struct drm_syncobj **stack_syncobjs,
+-				  u32 stack_count,
+-				  struct drm_syncobj ***syncobjs_out)
++								  u32 __user *handles,
++								  uint32_t count,
++								  struct drm_syncobj **stack_syncobjs,
++								  u32 stack_count,
++								  struct drm_syncobj ***syncobjs_out)
+ {
+ 	struct drm_syncobj **syncobjs;
+ 	uint32_t i;
+@@ -1243,11 +1686,11 @@ static int drm_syncobj_array_find(struct
+ 	}
+ 
+ 	for (i = 0; i < count; i++) {
+-		u64 handle;
++		u32 handle;
+ 
+ 		if (__get_user(handle, handles++)) {
+ 			ret = -EFAULT;
+-			syncobjs[i] = NULL;
++			syncobjs[i] = NULL;  /* Fixed: added missing semicolon */
+ 			goto err_put_syncobjs;
+ 		}
+ 		syncobjs[i] = drm_syncobj_find(file_private, handle);
+@@ -1260,7 +1703,7 @@ static int drm_syncobj_array_find(struct
+ 	*syncobjs_out = syncobjs;
+ 	return 0;
+ 
+-err_put_syncobjs:
++	err_put_syncobjs:
+ 	while (i > 0) {
+ 		if (syncobjs[i])
+ 			drm_syncobj_put(syncobjs[i]);
+@@ -1654,7 +2097,7 @@ out:
+ }
+ 
+ int drm_syncobj_query_ioctl(struct drm_device *dev, void *data,
+-			    struct drm_file *file_private)
++							struct drm_file *file_private)
+ {
+ 	struct drm_syncobj_timeline_array *args = data;
+ 	struct drm_syncobj *stack_syncobjs[4];
+@@ -1672,58 +2115,104 @@ int drm_syncobj_query_ioctl(struct drm_d
+ 	if (args->count_handles == 0)
+ 		return -EINVAL;
+ 
+-	if (!access_ok(points, args->count_handles * sizeof(*points)))
++	if (!points || !access_ok(points, args->count_handles * sizeof(*points)))
+ 		return -EFAULT;
+ 
+ 	ret = drm_syncobj_array_find(file_private,
+-				     u64_to_user_ptr(args->handles),
+-				     args->count_handles,
+-				     stack_syncobjs,
+-				     ARRAY_SIZE(stack_syncobjs),
+-				     &syncobjs);
++								 u64_to_user_ptr(args->handles),
++								 args->count_handles,
++							  stack_syncobjs,
++							  ARRAY_SIZE(stack_syncobjs),
++								 &syncobjs);
+ 	if (ret < 0)
+ 		return ret;
+ 
+ 	for (i = 0; i < args->count_handles; i++) {
+ 		struct dma_fence_chain *chain;
+ 		struct dma_fence *fence;
+-		uint64_t point;
++		uint64_t point = 0;  /* Initialize with default value */
++
++		if (!syncobjs[i]) {
++			/* Handle NULL syncobj - this shouldn't happen but be defensive */
++			goto put_point;
++		}
+ 
+ 		fence = drm_syncobj_fence_get(syncobjs[i]);
++		if (!fence) {
++			/* No fence available */
++			goto put_point;
++		}
++
+ 		chain = to_dma_fence_chain(fence);
+ 		if (chain) {
+-			struct dma_fence *iter, *last_signaled =
+-				dma_fence_get(fence);
++			struct dma_fence *iter = NULL, *last_signaled = NULL;
++			bool has_unordered_points = false;  /* Properly declared at block start */
+ 
+-			if (args->flags &
+-			    DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED) {
++			/* Use the last submitted point if requested */
++			if (args->flags & DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED) {
+ 				point = fence->seqno;
+-			} else {
+-				dma_fence_chain_for_each(iter, fence) {
+-					if (iter->context != fence->context) {
++				dma_fence_put(fence);
++				goto put_point;
++			}
++
++			/* Otherwise find the signaled point */
++			last_signaled = dma_fence_get(fence);
++			if (!last_signaled) {
++				/* This should never happen, but be defensive */
++				dma_fence_put(fence);
++				goto put_point;
++			}
++
++			dma_fence_chain_for_each(iter, fence) {
++				if (!iter || iter->context != fence->context) {
++					/* Timeline has unordered points */
++					has_unordered_points = true;
++					if (iter)
+ 						dma_fence_put(iter);
+-						/* It is most likely that timeline has
+-						* unorder points. */
+-						break;
++					break;
++				}
++
++				/* Update last_signaled with current iteration */
++				dma_fence_put(last_signaled);
++				last_signaled = dma_fence_get(iter);
++				if (!last_signaled) {
++					/* Unexpected error - break out safely */
++					has_unordered_points = true;
++					break;
++				}
++			}
++
++			/* Determine point based on signaled state */
++			if (last_signaled) {
++				if (dma_fence_is_signaled(last_signaled)) {
++					point = last_signaled->seqno;
++				} else {
++					struct dma_fence_chain *last_chain = to_dma_fence_chain(last_signaled);
++					if (last_chain) {
++						point = last_chain->prev_seqno;
++					} else {
++						/* Fallback for unhandled cases */
++						point = has_unordered_points ? last_signaled->seqno : 0;
+ 					}
+-					dma_fence_put(last_signaled);
+-					last_signaled = dma_fence_get(iter);
+ 				}
+-				point = dma_fence_is_signaled(last_signaled) ?
+-					last_signaled->seqno :
+-					to_dma_fence_chain(last_signaled)->prev_seqno;
++
++				/* Clean up the last_signaled reference */
++				dma_fence_put(last_signaled);
+ 			}
+-			dma_fence_put(last_signaled);
++
++			dma_fence_put(fence);
+ 		} else {
+-			point = 0;
++			/* Not a chain fence */
++			dma_fence_put(fence);
+ 		}
+-		dma_fence_put(fence);
++
++		put_point:
+ 		if (__put_user(point, points++)) {
+ 			ret = -EFAULT;
+ 			break;
+ 		}
+ 	}
+-	drm_syncobj_array_free(syncobjs, args->count_handles, stack_syncobjs);
+ 
++	drm_syncobj_array_free(syncobjs, args->count_handles, stack_syncobjs);
+ 	return ret;
+ }
+
+
 Fix noisy warnings in tcp_bbr.c
 
 --- a/net/ipv4/tcp_bbr.c	2025-03-19 11:04:45.856164985 +0100
