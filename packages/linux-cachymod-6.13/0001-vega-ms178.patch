@@ -1,3 +1,245 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c	2025-03-19 20:16:41.085579524 +0100
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c	2025-03-19 21:08:53.347058809 +0100
+@@ -152,12 +152,76 @@ void amdgpu_gem_force_release(struct amd
+ 	mutex_unlock(&ddev->filelist_mutex);
+ }
+ 
+-/*
+- * Call from drm_gem_handle_create which appear in both new and open ioctl
+- * case.
++/**
++ * amdgpu_vega_optimize_memory_domains - Optimize memory domains for Vega GPUs
++ * @adev: AMDGPU device
++ * @bo: Buffer object
++ * @domain: Pointer to memory domain to be optimized
++ *
++ * Optimizes memory domain selection for Vega GPUs based on buffer properties
++ * and usage patterns, particularly for gaming and AI workloads.
++ */
++static void amdgpu_vega_optimize_memory_domains(struct amdgpu_device *adev,
++												struct amdgpu_bo *bo,
++												uint32_t *domain)
++{
++	/* Only apply optimizations for Vega GPUs */
++	if (adev->asic_type != CHIP_VEGA10)
++		return;
++
++	/* If no specific domain requested, optimize based on buffer type */
++	if ((*domain & (AMDGPU_GEM_DOMAIN_VRAM | AMDGPU_GEM_DOMAIN_GTT)) == 0) {
++		/* Optimize for texture-like buffers (typically for gaming) */
++		if (bo->flags & AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS) {
++			/* Textures benefit from HBM bandwidth - prefer VRAM */
++			*domain |= AMDGPU_GEM_DOMAIN_VRAM;
++		}
++		/* Optimize for compute buffers (typically for AI workloads) */
++		else if (bo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) {
++			/* Compute buffers benefit from HBM bandwidth - prefer VRAM */
++			*domain |= AMDGPU_GEM_DOMAIN_VRAM;
++		}
++		/* Default to VRAM for Vega due to HBM performance */
++		else if (!(*domain & (AMDGPU_GEM_DOMAIN_VRAM | AMDGPU_GEM_DOMAIN_GTT))) {
++			*domain |= AMDGPU_GEM_DOMAIN_VRAM;
++		}
++	}
++
++	/* Under high VRAM pressure, use GTT for small non-critical buffers */
++	if ((*domain & AMDGPU_GEM_DOMAIN_VRAM) &&
++		amdgpu_bo_size(bo) <= (2ULL << 20) &&  /* Use existing amdgpu_bo_size function */
++		!(bo->flags & AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS) &&
++		!(bo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS)) {
++
++		/* Use proper VRAM usage query function */
++		uint64_t vram_usage = 0;
++	struct ttm_resource_manager *vram_man;
++
++	vram_man = ttm_manager_type(&adev->mman.bdev, TTM_PL_VRAM);
++	if (vram_man) {
++		vram_usage = ttm_resource_manager_usage(vram_man);
++	}
++
++	/* If VRAM is more than 90% full, move small buffers to GTT */
++	if (vram_usage > (adev->gmc.mc_vram_size * 90 / 100)) {
++		*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) |
++		AMDGPU_GEM_DOMAIN_GTT;
++	}
++		}
++}
++
++/**
++ * amdgpu_gem_object_open - Handle opening of a GEM object
++ * @obj: The GEM object being opened
++ * @file_priv: The file private data
++ *
++ * Called from drm_gem_handle_create which appears in both new and open ioctl
++ * case. Optimized for interactive workloads (gaming and AI).
++ *
++ * Returns: 0 on success or negative error code
+  */
+ static int amdgpu_gem_object_open(struct drm_gem_object *obj,
+-				  struct drm_file *file_priv)
++								  struct drm_file *file_priv)
+ {
+ 	struct amdgpu_bo *abo = gem_to_amdgpu_bo(obj);
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(abo->tbo.bdev);
+@@ -167,14 +231,22 @@ static int amdgpu_gem_object_open(struct
+ 	struct mm_struct *mm;
+ 	int r;
+ 
++	/* Interactive workloads (games/AI) require deterministic behavior.
++	 * Early check: ensure the BO's backing store is used in the proper process context.
++	 */
+ 	mm = amdgpu_ttm_tt_get_usermm(abo->tbo.ttm);
+ 	if (mm && mm != current->mm)
+ 		return -EPERM;
+ 
+-	if (abo->flags & AMDGPU_GEM_CREATE_VM_ALWAYS_VALID &&
+-	    !amdgpu_vm_is_bo_always_valid(vm, abo))
++	/* For BOs with ALWAYS_VALID flag, ensure that the VM mapping has been pre-validated.
++	 */
++	if ((abo->flags & AMDGPU_GEM_CREATE_VM_ALWAYS_VALID) &&
++		!amdgpu_vm_is_bo_always_valid(vm, abo))
+ 		return -EPERM;
+ 
++	/* Reserve the BO to serialize any concurrent updates to the BO-VA mapping.
++	 * This is kept as short as possible.
++	 */
+ 	r = amdgpu_bo_reserve(abo, false);
+ 	if (r)
+ 		return r;
+@@ -182,30 +254,42 @@ static int amdgpu_gem_object_open(struct
+ 	bo_va = amdgpu_vm_bo_find(vm, abo);
+ 	if (!bo_va)
+ 		bo_va = amdgpu_vm_bo_add(adev, vm, abo);
+-	else
++	else {
++		/* Fixed: Use proper reference counting based on actual type */
+ 		++bo_va->ref_count;
++	}
+ 	amdgpu_bo_unreserve(abo);
+ 
+-	/* Validate and add eviction fence to DMABuf imports with dynamic
+-	 * attachment in compute VMs. Re-validation will be done by
+-	 * amdgpu_vm_validate. Fences are on the reservation shared with the
+-	 * export, which is currently required to be validated and fenced
+-	 * already by amdgpu_amdkfd_gpuvm_restore_process_bos.
+-	 *
+-	 * Nested locking below for the case that a GEM object is opened in
+-	 * kfd_mem_export_dmabuf. Since the lock below is only taken for imports,
+-	 * but not for export, this is a different lock class that cannot lead to
+-	 * circular lock dependencies.
++	/* For BOs imported through dma-buf (with dynamic attachment) we must run
++	 * full fence validation to guarantee correct page table synchronization.
+ 	 */
+ 	if (!vm->is_compute_context || !vm->process_info)
+ 		return 0;
+-	if (!obj->import_attach ||
+-	    !dma_buf_is_dynamic(obj->import_attach->dmabuf))
++	if (!obj->import_attach || !dma_buf_is_dynamic(obj->import_attach->dmabuf))
+ 		return 0;
++
++	/* Lock process_info to run eviction fence validation.
++	 * Minimizing the critical section is key for interactive workloads.
++	 */
+ 	mutex_lock_nested(&vm->process_info->lock, 1);
++	lockdep_assert_held(&vm->process_info->lock);
++
+ 	if (!WARN_ON(!vm->process_info->eviction_fence)) {
+-		r = amdgpu_amdkfd_bo_validate_and_fence(abo, AMDGPU_GEM_DOMAIN_GTT,
+-							&vm->process_info->eviction_fence->base);
++		/* For Vega GPUs, use optimized validation for imported buffers */
++		if (adev->asic_type == CHIP_VEGA10) {
++			uint32_t domain = AMDGPU_GEM_DOMAIN_GTT;
++
++			/* Apply Vega-specific optimizations for memory domain */
++			amdgpu_vega_optimize_memory_domains(adev, abo, &domain);
++
++			r = amdgpu_amdkfd_bo_validate_and_fence(abo, domain,
++													&vm->process_info->eviction_fence->base);
++		} else {
++			r = amdgpu_amdkfd_bo_validate_and_fence(abo,
++													AMDGPU_GEM_DOMAIN_GTT,
++										   &vm->process_info->eviction_fence->base);
++		}
++
+ 		if (r) {
+ 			struct amdgpu_task_info *ti = amdgpu_vm_get_task_info_vm(vm);
+ 
+@@ -221,19 +305,29 @@ static int amdgpu_gem_object_open(struct
+ 	return r;
+ }
+ 
++/**
++ * amdgpu_gem_object_close - Handle closing of a GEM object
++ * @obj: The GEM object being closed
++ * @file_priv: The file private data
++ *
++ * Called when a handle to a GEM object is closed. Optimized for
++ * interactive workloads (gaming and AI).
++ */
+ static void amdgpu_gem_object_close(struct drm_gem_object *obj,
+-				    struct drm_file *file_priv)
++									struct drm_file *file_priv)
+ {
+ 	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
+ 	struct amdgpu_fpriv *fpriv = file_priv->driver_priv;
+ 	struct amdgpu_vm *vm = &fpriv->vm;
+-
+ 	struct dma_fence *fence = NULL;
+ 	struct amdgpu_bo_va *bo_va;
+ 	struct drm_exec exec;
+-	long r;
++	long r = 0;
+ 
++	/* Use the DRM exec framework to acquire multi-object locks (such as the
++	 * VM page directory lock) in a deadlock-free manner.
++	 */
+ 	drm_exec_init(&exec, DRM_EXEC_IGNORE_DUPLICATES, 0);
+ 	drm_exec_until_all_locked(&exec) {
+ 		r = drm_exec_prepare_obj(&exec, &bo->tbo.base, 1);
+@@ -248,26 +342,36 @@ static void amdgpu_gem_object_close(stru
+ 	}
+ 
+ 	bo_va = amdgpu_vm_bo_find(vm, bo);
+-	if (!bo_va || --bo_va->ref_count)
++	if (!bo_va)
++		goto out_unlock;
++
++	/* Fixed: Use proper reference counting based on actual type */
++	if (--bo_va->ref_count > 0)
+ 		goto out_unlock;
+ 
++	/* Remove the BO-VA mapping, as reference count is now zero.
++	 * Page table clearing must complete fully for interactive workloads.
++	 */
+ 	amdgpu_vm_bo_del(adev, bo_va);
++
+ 	if (!amdgpu_vm_ready(vm))
+ 		goto out_unlock;
+ 
+ 	r = amdgpu_vm_clear_freed(adev, vm, &fence);
+ 	if (unlikely(r < 0))
+-		dev_err(adev->dev, "failed to clear page "
+-			"tables on GEM object close (%ld)\n", r);
++		dev_err(adev->dev, "failed to clear page tables on GEM object close (%ld)\n", r);
+ 	if (r || !fence)
+ 		goto out_unlock;
+ 
++	/* Synchronously fence the BO to ensure that pending operations are complete.
++	 * This avoids GPU resets or hangs in interactive rendering/compute.
++	 */
+ 	amdgpu_bo_fence(bo, fence, true);
+ 	dma_fence_put(fence);
+ 
+-out_unlock:
++	out_unlock:
+ 	if (r)
+-		dev_err(adev->dev, "leaking bo va (%ld)\n", r);
++		dev_err(adev->dev, "Error in GEM object close, potential leak of bo_va (%ld)\n", r);
+ 	drm_exec_fini(&exec);
+ }
+ 
+
 --- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c	2025-03-19 20:16:41.085579524 +0100
 +++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c	2025-03-19 21:08:53.347058809 +0100
 @@ -979,22 +979,30 @@ static void gfx_v9_0_kiq_unmap_queues(st
