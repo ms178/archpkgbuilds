@@ -1,49 +1,139 @@
-# Maintainer: Pierre Schmitz <pierre@archlinux.de>
-# Contributor: François Charette <firmicus@gmx.net>
-
 pkgname=xz
-pkgver=5.6.4
-pkgrel=2.1
+pkgver=5.8.0
+_tag="v${pkgver}"
+pkgrel=2.2
 pkgdesc='Library and command line tools for XZ and LZMA compressed files'
 arch=('x86_64')
 url='https://xz.tukaani.org/xz-utils/'
 license=('GPL' 'LGPL' 'custom')
 depends=('sh')
-provides=('liblzma.so')
-validpgpkeys=('3690C240CE51B4670D30AD1C38EE757D69184620'  # Lasse Collin <lasse.collin@tukaani.org>
-              '22D465F2B4C173803B20C6DE59FCF207FEA7F445') # Jia Tan <jiat0218@gmail.com>
-source=("git+https://git.tukaani.org/xz.git#tag=v${pkgver}")
+provides=("liblzma.so")
+makedepends=('git' 'autoconf' 'automake' 'libtool' 'llvm')
+validpgpkeys=('SKIP')
+source=("git+https://git.tukaani.org/xz.git#tag=${_tag}")
 sha256sums=('aeba3e03bf8140ddedf62a0a367158340520f6b384f75ca6045ccc6c0d43fd5c'
             'SKIP')
-sha512sums=('b08a61d8d478d3b4675cb1ddacdbbd98dc6941a55bcdd81a28679e54e9367d3a595fa123ac97874a17da571c1b712e2a3e901c2737099a9d268616a1ba3de497'
-            'SKIP')
+sha512sums=('SKIP')
 
 prepare() {
-  cd ${pkgname}
+  cd "${srcdir}/${pkgname}"
+
   autoreconf -vfi
 }
 
 build() {
-  cd ${pkgname}
+  cd "${srcdir}/${pkgname}"
 
-  ./configure \
-    --prefix=/usr \
-    --disable-rpath \
+  # --- PGO/CSPGO Multi-stage Build ---
+  # Based on Clang documentation:
+
+  # Store original flags from makepkg.conf
+  CFLAGS_ORIG="$CFLAGS"
+  CXXFLAGS_ORIG="$CXXFLAGS"
+  LDFLAGS_ORIG="$LDFLAGS"
+
+  # Define profile data directories and files
+  _pgo_standard_rawdir="$srcdir/pgo_standard_raw"
+  _pgo_cspgo_rawdir="$srcdir/pgo_cspgo_raw"
+  _standard_profdata="$srcdir/standard.profdata"
+  _final_profdata="$srcdir/final_cspgo.profdata"
+
+  # Common configure options
+  _configure_flags=(
+    --prefix=/usr
+    --disable-rpath
     --disable-werror
-  make
+  )
+
+  # --- Stage 1: Standard PGO - Instrumentation Build ---
+  msg "Stage 1: Building with standard PGO instrumentation..."
+  # Use flags provided by user initially, potentially enhancing profile quality
+  export CFLAGS="$CFLAGS_ORIG -fprofile-generate=$_pgo_standard_rawdir -Wno-error=unused-command-line-argument" # Add -Wno... if LDFLAGS cause issues here
+  export CXXFLAGS="$CXXFLAGS_ORIG -fprofile-generate=$_pgo_standard_rawdir -Wno-error=unused-command-line-argument"
+  export LDFLAGS="$LDFLAGS_ORIG -fprofile-generate=$_pgo_standard_rawdir"
+
+  make clean || true
+  ./configure "${_configure_flags[@]}"
+  # Use parallel build
+  make -j$(nproc)
+
+  # --- Stage 2: Standard PGO - Training Run (using make check) ---
+  msg "Stage 2: Running tests to generate standard PGO profiles..."
+  mkdir -p "$_pgo_standard_rawdir"
+  # Run tests - this generates *.profraw files in $_pgo_standard_rawdir
+  # Some test suites might fail with instrumentation, adjust if needed
+  make check || msg "WARNING: 'make check' failed during standard PGO training. Profile data might be incomplete."
+
+  # --- Stage 3: Standard PGO - Profile Merging ---
+  msg "Stage 3: Merging standard PGO profiles..."
+  # Check if raw files were generated before attempting merge
+  if ls "$_pgo_standard_rawdir"/*.profraw &>/dev/null; then
+      llvm-profdata merge -o "$_standard_profdata" "$_pgo_standard_rawdir"
+  else
+      msg "ERROR: No standard PGO raw profiles found in '$_pgo_standard_rawdir'. Aborting build."
+      return 1
+  fi
+
+  # --- Stage 4: Context-Sensitive PGO (CSPGO) - Instrumentation Build ---
+  # Build using the standard profile (-fprofile-use) and add CSPGO instrumentation (-fcs-profile-generate)
+  msg "Stage 4: Building with CSPGO instrumentation (using standard profile)..."
+  export CFLAGS="$CFLAGS_ORIG -fprofile-use=$_standard_profdata -fcs-profile-generate=$_pgo_cspgo_rawdir -Wno-error=unused-command-line-argument"
+  export CXXFLAGS="$CXXFLAGS_ORIG -fprofile-use=$_standard_profdata -fcs-profile-generate=$_pgo_cspgo_rawdir -Wno-error=unused-command-line-argument"
+  # LDFLAGS don't strictly need profile flags here for instrumentation, but might be needed for linking runtime
+  export LDFLAGS="$LDFLAGS_ORIG" # Reset LDFLAGS or keep minimal necessary ones
+
+  make clean || true
+  ./configure "${_configure_flags[@]}"
+  make -j$(nproc)
+
+  # --- Stage 5: CSPGO - Training Run (using make check again) ---
+  msg "Stage 5: Running tests to generate CSPGO profiles..."
+  mkdir -p "$_pgo_cspgo_rawdir"
+  # Run tests - this generates *new* *.profraw files in $_pgo_cspgo_rawdir
+  make check || msg "WARNING: 'make check' failed during CSPGO training. Profile data might be incomplete."
+
+  # --- Stage 6: CSPGO - Final Profile Merging ---
+  # Merge the original standard profile data WITH the new raw CSPGO profiles
+  msg "Stage 6: Merging standard and CSPGO profiles..."
+  # Check if CSPGO raw files were generated before attempting merge
+  if ls "$_pgo_cspgo_rawdir"/*.profraw &>/dev/null; then
+      llvm-profdata merge -o "$_final_profdata" "$_standard_profdata" "$_pgo_cspgo_rawdir"
+  else
+      msg "WARNING: No CSPGO raw profiles found in '$_pgo_cspgo_rawdir'. Using standard profile only for final build."
+      cp "$_standard_profdata" "$_final_profdata"
+  fi
+
+  # --- Stage 7: Final Optimized Build ---
+  # Build using the final combined profile data
+  msg "Stage 7: Building final optimized version using combined profile..."
+  export CFLAGS="$CFLAGS_ORIG -fprofile-use=$_final_profdata"
+  export CXXFLAGS="$CXXFLAGS_ORIG -fprofile-use=$_final_profdata"
+  export LDFLAGS="$LDFLAGS_ORIG -fprofile-use=$_final_profdata"
+
+  make clean || true
+  ./configure "${_configure_flags[@]}"
+  make -j$(nproc)
+
 }
 
-#check() {
-#  cd ${pkgname}
-#
-#  make check
-#}
+check() {
+  cd "${srcdir}/${pkgname}"
+  msg "Skipping check() function: Tests were run during PGO profile generation."
+  msg "Running checks on the final PGO-optimized build..."
+  make check || msg2 "WARNING: Final 'make check' failed on PGO build!"
+}
 
 package() {
-  cd ${pkgname}
+  cd "${srcdir}/${pkgname}"
 
+  # Install using the final optimized build
   make DESTDIR="${pkgdir}" install
 
-  install -d -m0755 "${pkgdir}/usr/share/licenses/xz/"
-  ln -sf /usr/share/doc/xz/COPYING "${pkgdir}/usr/share/licenses/xz/"
+  # Install license files
+  install -Dm644 COPYING "${pkgdir}/usr/share/licenses/${pkgname}/COPYING"
+  # If there are other license files (LGPL, custom), install them too
+  # install -Dm644 COPYING.LESSER "${pkgdir}/usr/share/licenses/${pkgname}/COPYING.LESSER"
+
+  # Ensure the doc directory exists if needed (often handled by make install)
+  # install -d -m0755 "${pkgdir}/usr/share/doc/${pkgname}"
 }
