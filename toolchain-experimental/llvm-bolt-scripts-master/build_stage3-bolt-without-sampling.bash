@@ -53,7 +53,7 @@ cmake -G Ninja ../llvm-project/llvm \
     -DCMAKE_INSTALL_PREFIX="${STAGE3_DIR}/install"
 
 # Build with timeout
-timeout 120s ninja || true
+timeout 180s ninja || true
 
 echo "Merging generated profiles"
 cd ${TOPLEV}/stage3-without-sampling/instrumentdata
@@ -80,8 +80,7 @@ optimize_binary() {
         --split-all-cold \
         --split-eh \
         --split-functions \
-        --split-strategy=cdsplit \
-        --redirect-never-taken-jumps || return 1
+        --split-strategy=cdsplit || return 1
 }
 
 # Optimize binaries
