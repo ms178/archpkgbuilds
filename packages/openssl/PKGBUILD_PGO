@@ -1,33 +1,160 @@
-pkgname=openssl-pgo-bolt
-pkgver=3.0.9
-pkgrel=6.1
-pkgdesc="OpenSSL with Clang PGO and BOLT optimizations and algorithm profiles"
+pkgname=openssl
+pkgver=3.4.1
+pkgrel=2.1 # Increment pkgrel if PGO changes warrant it
+pkgdesc='The Open Source toolkit for Secure Sockets Layer and Transport Layer Security'
 arch=('x86_64')
-url="https://www.openssl.org/"
-license=('OpenSSL')
-depends=('zlib' 'perl' 'clang')
-source=("https://www.openssl.org/source/openssl-${pkgver}.tar.gz" ca-dir.patch)
-sha256sums=('SKIP')
+url='https://www.openssl.org'
+license=('Apache')
+depends=('glibc')
+# Added clang, llvm, lld for PGO/CS-PGO
+makedepends=('perl' 'clang' 'llvm' 'lld')
+optdepends=('ca-certificates' 'perl')
+replaces=('openssl-perl' 'openssl-doc')
+provides=('libcrypto.so' 'libssl.so')
+backup=('etc/ssl/openssl.cnf')
+source=("https://github.com/${pkgname}/${pkgname}/releases/download/${pkgname}-${pkgver}/${pkgname}-${pkgver}.tar.gz"{,.asc}
+        'ca-dir.patch')
+sha256sums=('83049d042a260e696f62406ac5c08bf706fd84383f945cf21bd61e9ed95c396e'
+            'SKIP'
+            '0a32d9ca68e8d985ce0bfef6a4c20b46675e06178cc2d0bf6d91bd6865d648b7')
+validpgpkeys=('8657ABB260F056B1E5190839D9C4D26D0E604491'
+              '7953AC1FBC3DC8B3B292393ED5E9E43F7DF9EE8C'
+              'A21FAB74B0088AA361152586B8EF1A6BA9DA2D5C')
+# options=(strip) # Add strip if desired, was present in GMP example
 
 prepare() {
-  cd "${srcdir}/openssl-${pkgver}"
-    # set ca dir to /etc/ssl by default
+	cd "$srcdir/$pkgname-$pkgver"
+
+	# set ca dir to /etc/ssl by default
 	patch -Np1 -i "$srcdir/ca-dir.patch"
-  ./Configure --prefix=/usr --openssldir=/etc/ssl --libdir=lib linux-x86_64 -Wl,-z,relro,-z,now shared enable-ktls no-ssl zlib-dynamic no-ssl3 enable-ec_nistp_64_gcc_128 -fprofile-instr-generate -fcoverage-mapping
+
+	# --- PGO/CS-PGO Toolchain Setup ---
+	# Ensure we use clang for compilation, matching the GMP example
+	export CC=clang
+	export CXX=clang++
+	export CC_LD=lld
+	export CXX_LD=lld
+	export LDFLAGS+=" -fuse-ld=lld" # Append, don't overwrite potential user LDFLAGS
+	export AR=llvm-ar
+	export NM=llvm-nm
+	export STRIP=llvm-strip
+	export OBJCOPY=llvm-objcopy
+	export OBJDUMP=llvm-objdump
+	export READELF=llvm-readelf
+	export RANLIB=llvm-ranlib
+	# OpenSSL Configure might respect CC but let's be explicit
+	# No HOST settings needed unless cross-compiling intensely
 }
 
 build() {
-  cd "${srcdir}/openssl-${pkgver}"
-  make depend
-  make -j$(nproc)
+	cd "$srcdir/$pkgname-$pkgver"
+
+	# Setup cleanup trap (exclude $srcdir/cspgo to preserve final cs.profdata)
+	trap 'rm -rf "$srcdir/pgo"' EXIT
+
+	# Create directory for PGO profiles
+	mkdir -p "$srcdir/pgo"
+
+	# Create directory for CS-PGO profiles
+	mkdir -p "$srcdir/cspgo"
+
+	# Common additional flags for both instrumentation phases (compiler flags only)
+	# -g3: Rich debug info often helps PGO/CS-PGO accuracy
+	# -fno-omit-frame-pointer: May be needed for accurate profiling/debugging
+	# Value Profiling flags from GMP example:
+	local _common_instrument_flags=" -g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=50 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling"
+
+	# Base configure options
+	local _configure_options=(
+		--prefix=/usr
+		--openssldir=/etc/ssl
+		--libdir=lib
+		shared
+		enable-ktls
+		no-ssl # This seems odd, double-check if no-ssl3 or no-ssl2 was intended? Keeping as per original.
+		zlib-dynamic
+		no-ssl3 # Added based on comment above, original had 'no-ssl' AND 'no-ssl3'
+		enable-ec_nistp_64_gcc_128
+		linux-x86_64
+		# The final argument will contain compiler/linker flags
+	)
+
+	# --- Stage 1: Build with PGO instrumentation ---
+	msg "Starting PGO Instrumentation Build..."
+	local _pgo_instrument_flags="-fprofile-generate=$srcdir/pgo $_common_instrument_flags"
+	local _original_cflags="$CFLAGS"
+	local _original_ldflags="$LDFLAGS"
+
+	# Append PGO flags to CFLAGS for the Configure script
+	local _stage1_build_flags="${CPPFLAGS} ${CFLAGS} ${_pgo_instrument_flags} ${LDFLAGS}"
+
+	./Configure "${_configure_options[@]}" "-Wa,--noexecstack ${_stage1_build_flags}"
+
+	make depend
+	make -j$(nproc) # Use multiple cores for faster builds
+
+	# Run tests to generate PGO profile data
+	msg "Running tests to generate PGO profile data..."
+	# Some tests might fail under instrumentation, often okay. Check logs if concerned.
+	make test || echo "WARNING: 'make test' failed during PGO data generation. Profile data might be incomplete."
+
+	# Merge PGO profiles
+	msg "Merging PGO profiles..."
+	llvm-profdata merge -output="$srcdir/pgo/default.profdata" "$srcdir"/pgo/*.profraw
+
+	# Clean up build directory for the next stage (make clean is usually sufficient)
+	make clean
+
+	# --- Stage 2: Build with CS-PGO instrumentation ---
+	msg "Starting CS-PGO Instrumentation Build..."
+	local _cspgo_instrument_flags="-fprofile-use=$srcdir/pgo/default.profdata -fcs-profile-generate=$srcdir/cspgo $_common_instrument_flags"
+
+	# Restore original flags and append CS-PGO flags
+	CFLAGS="$_original_cflags"
+	LDFLAGS="$_original_ldflags"
+	local _stage2_build_flags="${CPPFLAGS} ${CFLAGS} ${_cspgo_instrument_flags} ${LDFLAGS}"
+
+	./Configure "${_configure_options[@]}" "-Wa,--noexecstack ${_stage2_build_flags}"
+
+	make depend
+	make -j$(nproc)
+
+	# Run tests to generate CS-PGO profile data
+	msg "Running tests to generate CS-PGO profile data..."
+	make test || echo "WARNING: 'make test' failed during CS-PGO data generation. Profile data might be incomplete."
+
+	# Merge CS-PGO profiles with PGO profiles
+	msg "Merging CS-PGO profiles with PGO profiles..."
+	llvm-profdata merge -output="$srcdir/cspgo/cs.profdata" "$srcdir/cspgo"/*.profraw "$srcdir/pgo/default.profdata"
+
+	# Clean up build directory for the final stage
+	make clean
+
+	# --- Stage 3: Build with merged CS-PGO data ---
+	msg "Starting Final Optimized Build..."
+	# Restore original flags and append final optimization flags
+	CFLAGS="$_original_cflags"
+	LDFLAGS="$_original_ldflags"
+	local _stage3_build_flags="${CPPFLAGS} ${CFLAGS} -fprofile-use=$srcdir/cspgo/cs.profdata ${LDFLAGS}"
+
+	./Configure "${_configure_options[@]}" "-Wa,--noexecstack ${_stage3_build_flags}"
+
+	make depend
+	make -j$(nproc)
+
+	msg "PGO/CS-PGO Build Process Complete."
 }
 
-#check() {
-#  cd "${srcdir}/openssl-${pkgver}"
-#  make test
-#}
+check() {
+  cd "$srcdir/$pkgname-$pkgver"
+  msg "Running tests on the final optimized build..."
+  make test
+}
 
 package() {
-  cd "${srcdir}/openssl-${pkgver}"
-  make install_sw install_ssldirs DESTDIR="${pkgdir}"
+	cd "$srcdir/$pkgname-$pkgver"
+
+	make DESTDIR="$pkgdir" MANDIR=/usr/share/man MANSUFFIX=ssl install_sw install_ssldirs
+
+	install -D -m644 LICENSE.txt "$pkgdir/usr/share/licenses/$pkgname/LICENSE.txt"
 }
