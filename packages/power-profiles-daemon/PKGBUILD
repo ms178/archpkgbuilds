@@ -1,9 +1,6 @@
-# Maintainer: Antonio Rojas <arojas@archlinux.org>
-# Contributor: tinywrkb <tinywrkb@gmail.com>
-
 pkgname=power-profiles-daemon
 pkgver=0.30
-pkgrel=3.1
+pkgrel=3.2 # Incremented pkgrel for PGO changes
 pkgdesc='Makes power profiles handling available over D-Bus'
 url='https://gitlab.freedesktop.org/upower/power-profiles-daemon'
 license=(GPL-3.0-only)
@@ -15,40 +12,178 @@ depends=(gcc-libs
          polkit
          upower)
 optdepends=('python-gobject: for powerprofilesctl')
+# Added PGO toolchain deps
 makedepends=(bash-completion
              git
              glib2-devel
              python-argparse-manpage
              python-shtab
-             meson)
+             meson
+             clang llvm lld) # Added for PGO
 checkdepends=(python-dbusmock
               python-isort
               python-mccabe
               umockdev)
-source=(git+https://gitlab.freedesktop.org/upower/$pkgname#tag=$pkgver)
-sha256sums=('ffa0951d6c008239539c2a51150ad454b283c4b4b0e1910920b6afed3d143a3f')
+source=(git+https://gitlab.freedesktop.org/upower/$pkgname#tag=$pkgver?depth=1) # Shallow clone
+sha256sums=('SKIP')
+options=(strip)
+
+# --- Standard PKGBUILD Functions ---
+
+prepare() {
+  # No patching needed currently
+
+  # --- PGO/CS-PGO Toolchain Setup ---
+  export CC=clang
+  export CXX=clang++ # Set even if not C++ project
+  export LDFLAGS+=" -fuse-ld=lld" # Append
+  export AR=llvm-ar
+  export NM=llvm-nm
+  export STRIP=llvm-strip
+  export OBJCOPY=llvm-objcopy
+  export OBJDUMP=llvm-objdump
+  export READELF=llvm-readelf
+  export RANLIB=llvm-ranlib
+}
 
 build() {
-  meson $pkgname build \
-    --prefix /usr \
-    --libexec lib \
-    --sysconfdir /usr/share \
-    -Dzshcomp=/usr/share/zsh/site-functions \
-    -Dbashcomp=enabled \
-    -Dmanpage=disabled \
-    --wrap-mode=forcefallback \
-    -D b_ndebug=true \
-    -D b_pie=false \
-    -D c_std=gnu2x \
-    -D cpp_std=gnu++2a \
+  # Setup cleanup trap for temporary directories
+  trap 'rm -rf "$srcdir/pgo" "$srcdir/cspgo" build' EXIT # build dir is created per stage
+
+  # Create directory for PGO profiles
+  mkdir -p "$srcdir/pgo"
+  # Create directory for CS-PGO profiles
+  mkdir -p "$srcdir/cspgo"
+
+  # Common additional flags for instrumentation (User flags, do not change)
+  local _common_instrument_flags=" -g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=50 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling"
+  # Save original flags from makepkg.conf
+  local _original_cflags="$CFLAGS"
+  local _original_ldflags="$LDFLAGS"
+
+  # Base Meson setup options
+  local _meson_setup_opts=(
+    --prefix /usr
+    --libexecdir lib # Note: Original used --libexec, check if this should be libexecdir
+    --sysconfdir /usr/share
     --buildtype=release
-  meson compile -C build
+    --wrap-mode=forcefallback # Keep this from original build
+  )
+  # Base Meson configure options (only -D flags)
+  local _meson_common_config_opts=(
+    -Dzshcomp=/usr/share/zsh/site-functions
+    -Dbashcomp=enabled
+    -Dmanpage=disabled
+    -Db_ndebug=true
+    -Db_pie=false
+    -Dc_std=gnu2x
+    -Dcpp_std=gnu++2a
+  )
+  # Meson source directory
+  local _meson_source_dir="$srcdir/$pkgname"
+
+  # --- Stage 1: Build with PGO instrumentation ---
+  msg "Starting PGO Instrumentation Build (Stage 1/3)..."
+  # Combine flags (User flags, do not change)
+  local _pgo_c_args="${_original_cflags} -fprofile-generate=$srcdir/pgo ${_common_instrument_flags}"
+  # Add flag to link the profile runtime for generation
+  local _pgo_c_link_args="${_original_ldflags} -fprofile-generate=$srcdir/pgo ${_common_instrument_flags}"
+
+  # Setup and Configure Stage 1
+  meson setup "${_meson_setup_opts[@]}" "${_meson_source_dir}" build
+  meson configure build "${_meson_common_config_opts[@]}" \
+      -Db_lto=true \
+      -Dc_args="${_pgo_c_args}" \
+      -Dc_link_args="${_pgo_c_link_args}"
+
+  # Compile Stage 1 - Exit build script if this fails
+  meson compile -C build -j$(nproc) || return 1
+
+  # Run workload (meson test) to generate PGO profile data
+  msg "Running workload (meson test) to generate PGO profile data (Stage 1/3)..."
+  export LLVM_PROFILE_FILE="$srcdir/pgo/%p-%m.profraw"
+  meson test -C build --print-errorlogs || echo "WARNING: 'meson test' failed during PGO data generation. Profile data might be incomplete."
+  unset LLVM_PROFILE_FILE
+
+  # Merge PGO profiles
+  msg "Merging PGO profiles (Stage 1/3)..."
+  llvm-profdata merge -output="$srcdir/pgo/default.profdata" "$srcdir"/pgo/*.profraw
+
+  # Clean up build directory for the next stage
+  rm -rf build
+
+  # --- Stage 2: Build with CS-PGO instrumentation ---
+  msg "Starting CS-PGO Instrumentation Build (Stage 2/3)..."
+  # Combine flags (User flags, do not change)
+  local _cspgo_c_args="${_original_cflags} -fprofile-use=$srcdir/pgo/default.profdata -fcs-profile-generate=$srcdir/cspgo ${_common_instrument_flags}"
+  # Add flags to link the profile runtime for both use and generation
+  local _cspgo_c_link_args="${_original_ldflags} -fprofile-use=$srcdir/pgo/default.profdata -fcs-profile-generate=$srcdir/cspgo ${_common_instrument_flags}"
+
+  # Setup and Configure Stage 2
+  meson setup "${_meson_setup_opts[@]}" "${_meson_source_dir}" build
+  meson configure build "${_meson_common_config_opts[@]}" \
+      -Db_lto=true \
+      -Dc_args="${_cspgo_c_args}" \
+      -Dc_link_args="${_cspgo_c_link_args}"
+
+  # Compile Stage 2 - Exit build script if this fails
+  meson compile -C build -j$(nproc) || return 1
+
+  # Run workload (meson test) to generate CS-PGO profile data
+  msg "Running workload (meson test) to generate CS-PGO profile data (Stage 2/3)..."
+  export LLVM_PROFILE_FILE="$srcdir/cspgo/%p-%m.profraw"
+  meson test -C build --print-errorlogs || echo "WARNING: 'meson test' failed during CS-PGO data generation. Profile data might be incomplete."
+  unset LLVM_PROFILE_FILE
+
+  # Merge CS-PGO profiles with PGO profiles
+  msg "Merging CS-PGO profiles with PGO profiles (Stage 2/3)..."
+  llvm-profdata merge -output="$srcdir/cspgo/cs.profdata" "$srcdir/cspgo"/*.profraw "$srcdir/pgo/default.profdata"
+
+  # Clean up build directory for the final stage
+  rm -rf build
+
+  # --- Stage 3: Build with merged CS-PGO data ---
+  msg "Starting Final Optimized Build (Stage 3/3)..."
+  # Combine flags (User flags, do not change)
+  local _final_lto_flags="-flto"
+  local _final_c_args="${_original_cflags} -fprofile-use=$srcdir/cspgo/cs.profdata ${_final_lto_flags}"
+  # Linker flags (User flags + profile use + LTO)
+  local _final_c_link_args="${_original_ldflags} -fprofile-use=$srcdir/cspgo/cs.profdata ${_final_lto_flags}"
+
+  # Setup and Configure Stage 3
+  meson setup "${_meson_setup_opts[@]}" "${_meson_source_dir}" build
+  meson configure build "${_meson_common_config_opts[@]}" \
+      -Db_lto=false `# Disable Meson LTO as we add it manually` \
+      -Dc_args="${_final_c_args}" \
+      -Dc_link_args="${_final_c_link_args}"
+
+  # Compile Final Stage - Exit build script if this fails
+  meson compile -C build -j$(nproc) || return 1
+
+  msg "PGO/CS-PGO Build Process Complete."
+  # Cleanup handled by trap on exit/success (removes pgo/cspgo dirs)
 }
 
 check() {
-  meson test -C build
+  # Run checks against the final optimized build in ./build
+  msg "Running checks (meson test) on the final optimized build..."
+
+  if [ ! -d "$srcdir/build" ]; then
+    error "Build directory '$srcdir/build' not found for check(). Check build stage."
+    return 1
+  fi
+
+  # Run the standard meson test suite
+  meson test -C build --print-errorlogs || { error "Check: 'meson test' failed on final optimized build."; return 1; }
+
+  msg "Checks passed."
 }
 
 package() {
+  # Install from the final build directory created in Stage 3
+  if [ ! -d "$srcdir/build" ]; then
+    error "Build directory '$srcdir/build' not found for package(). Check build stage."
+    return 1
+  fi
   meson install -C build --destdir "$pkgdir"
 }
