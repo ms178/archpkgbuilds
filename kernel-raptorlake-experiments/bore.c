@@ -6,6 +6,8 @@
  * and experimental core-aware runtime adaptations.
  * Relies on kernel topology information (get_topology_cpu_type) and defers
  * core-aware tuning application to late_init if needed.
+ * Core-aware features enabled by default if P/E info found.
+ * Uses ecore_scale_pct to implicitly adjust E-core penalty offset.
  *
  * CRITICAL: Requires corresponding BORE hooks/modifications in core kernel
  * scheduler files (fair.c, core.c, etc.) from the BORE patchset for ~6.13.
@@ -46,6 +48,10 @@
 #ifdef CONFIG_SCHED_BORE
 
 #define MAX_BURST_PENALTY (156U)
+#define ECORE_OFFSET_ADJUST_DIVISOR 20 // Divisor for ecore_scale_pct -> offset adjustment
+#define MIN_ECORE_OFFSET_ADJUST 0     // Minimum resulting adjustment value
+#define MAX_ECORE_OFFSET_ADJUST 10    // Max offset reduction derived from scale_pct
+#define MIN_EFFECTIVE_OFFSET    4     // Minimum allowed effective offset
 
 // --- Global Variables (Sysctl Tunables) ---
 u8   sched_bore;
@@ -55,15 +61,15 @@ u8   sched_burst_parity_threshold;
 uint sched_burst_cache_stop_count;
 uint sched_burst_cache_lifetime;
 uint sched_deadline_boost_mask;
-u8   sched_burst_penalty_offset;
-uint sched_burst_penalty_scale;
+u8   sched_burst_penalty_offset; // Base offset (used for P-cores)
+uint sched_burst_penalty_scale; // Base scale, potentially reduced if core-aware
 u8   sched_burst_smoothness_long;
 u8   sched_burst_smoothness_short;
-// Core-aware tunables (only used if core type info is available)
+// Core-aware tunables (enabled by default if P/E info found)
 u8   sched_burst_core_aware_penalty;
 u8   sched_burst_core_aware_smoothing;
-uint sched_burst_penalty_pcore_scale_pct;
-uint sched_burst_penalty_ecore_scale_pct;
+uint sched_burst_penalty_pcore_scale_pct; // P-core scale multiplier %
+uint sched_burst_penalty_ecore_scale_pct; // E-core scale multiplier % AND offset basis
 u8   sched_burst_smoothness_long_p;
 u8   sched_burst_smoothness_short_p;
 u8   sched_burst_smoothness_long_e;
@@ -76,15 +82,17 @@ u8   sched_burst_smoothness_short_e;
 #define BORE_ORIG_BURST_SMOOTHNESS_SHORT 0
 #define BORE_ORIG_BURST_FORK_ATAVISTIC   2 // Default conservative for hybrid
 #define BORE_ORIG_BURST_PARITY_THRESHOLD 2
-#define BORE_ORIG_BURST_PENALTY_OFFSET   24
-#define BORE_ORIG_BURST_PENALTY_SCALE    1280
+#define BORE_ORIG_BURST_PENALTY_OFFSET   24 // Original base offset
+#define BORE_ORIG_BURST_PENALTY_SCALE    1280 // The absolute base value
 #define BORE_ORIG_BURST_CACHE_STOP_COUNT 64
 #define BORE_ORIG_BURST_CACHE_LIFETIME   75000000 // 75ms
 #define BORE_ORIG_DEADLINE_BOOST_MASK    (ENQUEUE_INITIAL | ENQUEUE_WAKEUP)
-#define BORE_ORIG_CORE_AWARE_PENALTY    0 // Disabled by default
-#define BORE_ORIG_CORE_AWARE_SMOOTHING  0 // Disabled by default
+// Initial defaults are OFF, but they get turned ON if P/E detected
+#define BORE_ORIG_CORE_AWARE_PENALTY    0
+#define BORE_ORIG_CORE_AWARE_SMOOTHING  0
+// Percentages applied relative to sched_burst_penalty_scale
 #define BORE_ORIG_PENALTY_PCORE_SCALE_PCT 100
-#define BORE_ORIG_PENALTY_ECORE_SCALE_PCT 100
+#define BORE_ORIG_PENALTY_ECORE_SCALE_PCT 100 // Also used for offset adjustment base
 #define BORE_ORIG_SMOOTHNESS_LONG_P      BORE_ORIG_BURST_SMOOTHNESS_LONG
 #define BORE_ORIG_SMOOTHNESS_SHORT_P     BORE_ORIG_BURST_SMOOTHNESS_SHORT
 #define BORE_ORIG_SMOOTHNESS_LONG_E      BORE_ORIG_BURST_SMOOTHNESS_LONG
@@ -99,10 +107,10 @@ static bool bore_has_core_type_info = false;
 // Flag indicating core-aware tuning needs to be applied later
 static bool bore_apply_core_aware_tuning_late __initdata = false;
 
-// Static key to enable core-aware features (enabled early or late)
+// Static key to enable core-aware features (enabled early or late if P/E info found)
 static struct static_key_false bore_core_aware_key = STATIC_KEY_FALSE_INIT;
 
-// FIX: Define is_intel_raptor_lake *before* is_intel_hybrid
+// Define is_intel_raptor_lake *before* is_intel_hybrid
 static bool __init is_intel_raptor_lake(void) {
 	if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL || boot_cpu_data.x86 != 6) return false;
 	switch (boot_cpu_data.x86_model) {
@@ -112,17 +120,18 @@ static bool __init is_intel_raptor_lake(void) {
 		case 0xBF: // Raptor Lake-S (Refresh / 14th Gen Desktop) - Covers 14700KF
 		case 0xAD: // Alder Lake-M/N (?) E-cores only
 		case 0xAC: // Alder Lake-S (?) E-cores only
-			// Consider adding Alder Lake Models if needed (e.g., 0x97, 0x9A)
+			// Alder Lake Models
 		case 0x97: // Alder Lake-S
 		case 0x9A: // Alder Lake-P
-			return true; // Treat ADL also as needing potential late check
+			return true; // Treat ADL/RPL as needing potential late check
 		default:
 			return false;
 	}
 }
 
 static bool __init is_intel_hybrid(void) {
-	return boot_cpu_has(X86_FEATURE_HYBRID_CPU) || is_intel_raptor_lake(); // Combine checks
+	// Check CPUID feature bit OR specific known hybrid model families
+	return boot_cpu_has(X86_FEATURE_HYBRID_CPU) || is_intel_raptor_lake();
 }
 
 
@@ -183,32 +192,40 @@ static void __init detect_all_cpu_types_early(void)
 
 /*
  * Apply core-aware tuning settings. Should only be called if bore_has_core_type_info is true.
+ * Enables core-aware features, reduces base penalty scale, and sets P/E params by default.
  */
 static void __init bore_apply_core_aware_settings(void)
 {
 	// This function is only called if bore_has_core_type_info is true.
 
-	pr_info("BORE: Enabling core-aware penalty and smoothing defaults because P/E info is available.\n");
-	// Enable core-aware features now that we have confirmed P/E info
+	pr_info("BORE: Enabling core-aware penalty/smoothing defaults and adjusting base parameters (P/E info available).\n");
+
+	// Reduce base penalty scale for hybrid systems
+	sched_burst_penalty_scale = max(1U, BORE_ORIG_BURST_PENALTY_SCALE / 2U);
+	// Reduce base offset slightly for hybrid P-cores vs original monolithic default
+	sched_burst_penalty_offset = max((u8)4, (u8)(BORE_ORIG_BURST_PENALTY_OFFSET * 7 / 8)); // ~87.5% of original, min 4
+	pr_info("BORE: Adjusted base penalty scale=%u, base offset=%u for hybrid.\n",
+			sched_burst_penalty_scale, sched_burst_penalty_offset);
+
+	// Enable core-aware features now
 	sched_burst_core_aware_penalty = 1;
 	sched_burst_core_aware_smoothing = 1;
 
 	// Set the specific P/E tuning parameters
 	if (is_intel_raptor_lake()) {
-		pr_info("BORE: Applying Raptor Lake core-aware parameters.\n");
+		pr_info("BORE: Applying Raptor Lake P/E scaling percentages and smoothing.\n");
 		// Use the specific RL values
-		sched_burst_penalty_pcore_scale_pct = 100;
-		sched_burst_penalty_ecore_scale_pct = 110;
+		sched_burst_penalty_pcore_scale_pct = 100; // 100% of reduced base scale
+		sched_burst_penalty_ecore_scale_pct = 120; // 120% of reduced base scale (also used for offset)
 		sched_burst_smoothness_long_p = 1;
 		sched_burst_smoothness_short_p = 0;
 		sched_burst_smoothness_long_e = 2;
 		sched_burst_smoothness_short_e = 1;
 	} else {
-		// Apply potentially different defaults for other hybrid (e.g., Alder Lake)
-		// Using the original defaults here for non-RL hybrid
-		pr_info("BORE: Applying default core-aware parameters for non-Raptor Lake hybrid.\n");
-		sched_burst_penalty_pcore_scale_pct = BORE_ORIG_PENALTY_PCORE_SCALE_PCT; // 100
-		sched_burst_penalty_ecore_scale_pct = BORE_ORIG_PENALTY_ECORE_SCALE_PCT; // 100
+		// Use original defaults for other hybrid (e.g., Alder Lake) percentages
+		pr_info("BORE: Applying default P/E scaling percentages and smoothing for non-Raptor Lake hybrid.\n");
+		sched_burst_penalty_pcore_scale_pct = BORE_ORIG_PENALTY_PCORE_SCALE_PCT; // 100% of reduced base scale
+		sched_burst_penalty_ecore_scale_pct = BORE_ORIG_PENALTY_ECORE_SCALE_PCT; // 100% of reduced base scale
 		sched_burst_smoothness_long_p = BORE_ORIG_SMOOTHNESS_LONG_P; // 1
 		sched_burst_smoothness_short_p = BORE_ORIG_SMOOTHNESS_SHORT_P; // 0
 		sched_burst_smoothness_long_e = BORE_ORIG_SMOOTHNESS_LONG_E; // 1
@@ -228,6 +245,8 @@ static void __init bore_recalculate_pcore_mask(void)
 	unsigned int cpu, calculated_mask = 0;
 	bool pcore_found = false;
 
+	if (!bore_has_core_type_info) return; // Should not happen if called correctly, but safety check
+
 	if (!zalloc_cpumask_var(&pcore_mask, GFP_KERNEL)) {
 		pr_err("BORE: Failed P-core mask alloc during late init! Using previous boost mask (0x%x).\n", sched_deadline_boost_mask);
 		return;
@@ -235,7 +254,6 @@ static void __init bore_recalculate_pcore_mask(void)
 
 	for_each_possible_cpu(cpu) {
 		if (!cpu_online(cpu)) continue;
-		// Use the now confirmed (hopefully) core type
 		if (per_cpu(bore_cpu_type, cpu) == TOPO_CPU_TYPE_PERFORMANCE) {
 			cpumask_set_cpu(cpu, pcore_mask);
 			pcore_found = true;
@@ -293,7 +311,7 @@ static int __init bore_late_topology_check_and_apply(void)
 		bore_has_core_type_info = true; // Update global flag
 		pr_info("BORE: Late check: Kernel provided valid P/E core topology information.\n");
 
-		// Apply the core-aware settings and P-core mask now
+		// Apply the core-aware settings (incl. base scale/offset reduction) and P-core mask now
 		bore_apply_core_aware_settings();
 		bore_recalculate_pcore_mask();
 
@@ -315,29 +333,26 @@ late_initcall_sync(bore_late_topology_check_and_apply);
 static void __init bore_detect_intel_hybrid_early(void)
 {
 	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL && is_intel_hybrid()) {
-		// Run the early detection attempt
-		detect_all_cpu_types_early(); // Sets bore_has_core_type_info & bore_apply_core_aware_tuning_late
+		detect_all_cpu_types_early(); // Sets flags
 
-		// Apply non-core-aware hybrid defaults immediately if hybrid detected,
-		// regardless of whether core types were known *yet*.
+		// Apply non-core-aware hybrid defaults immediately
 		pr_info("BORE: Intel Hybrid CPU detected. Applying initial non-core-aware defaults.\n");
 		sched_burst_parity_threshold = BORE_ORIG_BURST_PARITY_THRESHOLD + 2;
-		sched_burst_penalty_scale    = max(1U, BORE_ORIG_BURST_PENALTY_SCALE / 2U);
-		sched_burst_penalty_offset   = max((u8)1, (u8)(BORE_ORIG_BURST_PENALTY_OFFSET / 2U));
+		// Base scale/offset are NOT adjusted here anymore
 		sched_burst_smoothness_short = max((u8)1, (u8)(BORE_ORIG_BURST_SMOOTHNESS_SHORT + 1));
 		sched_burst_fork_atavistic   = 0;
 		sched_burst_exclude_kthreads = 1;
 
-		// If core types *were* successfully found early, enable core-aware key and apply settings now
+		// If core types *were* successfully found early, apply core-aware settings now
 		if (bore_has_core_type_info) {
-			bore_apply_core_aware_settings();
-			bore_recalculate_pcore_mask(); // Apply P-core mask early if possible
+			bore_apply_core_aware_settings(); // This now reduces base scale/offset and sets P/E specifics
+			bore_recalculate_pcore_mask();
 		}
 	}
 }
 
 /*
- * Apply Raptor Lake specific NON-core-aware tunings. Core-aware parts are handled later.
+ * Apply Raptor Lake specific NON-core-aware tunings. Core-aware parts handled separately.
  */
 static void __init bore_apply_raptor_lake_tuning_early(void)
 {
@@ -346,10 +361,11 @@ static void __init bore_apply_raptor_lake_tuning_early(void)
 
 	// Apply minor general RL adjustments (always safe)
 	sched_burst_parity_threshold++; // Apply cumulative adjustment if hybrid already did
-	// Set scale based on halved original, adjusted for RL
-	sched_burst_penalty_scale = max(1U, (BORE_ORIG_BURST_PENALTY_SCALE / 2U * 9) / 10);
 
-	// Core-aware parts are handled by bore_apply_core_aware_settings() called early or late
+	// Base penalty scale/offset are handled later in bore_apply_core_aware_settings if P/E detected
+	// No adjustments here.
+
+	// Core-aware values are set by bore_apply_core_aware_settings() called early or late
 }
 
 /* --- BORE Helper Functions --- */
@@ -369,14 +385,61 @@ static inline u32 log2plus1_u64_u32f8(u64 v) {
 	return (integral << 8) | fractional;
 }
 
+// Godlike calculation: incorporates implicit E-core offset adjustment
 static inline u32 calc_burst_penalty(u64 burst_time) {
 	u32 greed, tolerance, penalty, scaled_penalty;
+	u8 core_offset = sched_burst_penalty_offset; // Start with base (P-core) offset
+
+	// If core-aware features active, potentially adjust offset for E-cores
+	if (static_key_enabled(&bore_core_aware_key.key)) {
+		// Lightweight check within the function (task_cpu is usually fast)
+		// Avoid calling bore_get_task_cpu_type repeatedly if possible
+		int cpu = raw_smp_processor_id(); // Get current CPU - assumes task runs here
+		// Alternative: int cpu = task_cpu(current); if needed, but adds overhead
+		if (likely(cpu >= 0 && cpu < nr_cpu_ids)) {
+			if (per_cpu(bore_cpu_type, cpu) == TOPO_CPU_TYPE_EFFICIENCY) {
+				// Calculate E-core offset adjustment based on ecore scale percentage
+				// Only adjust if ecore scale > 100
+				if (sched_burst_penalty_ecore_scale_pct > 100) {
+					u8 adj = (u8)min_t(uint, MAX_ECORE_OFFSET_ADJUST,
+									   (sched_burst_penalty_ecore_scale_pct - 100) / ECORE_OFFSET_ADJUST_DIVISOR);
+					adj = max((u8)MIN_ECORE_OFFSET_ADJUST, adj);
+					// Apply adjustment, ensuring it doesn't go below minimum
+					core_offset = max((u8)MIN_EFFECTIVE_OFFSET, (u8)max(0, (int)core_offset - adj));
+				}
+				// If ecore scale <= 100, E-core uses same offset as P-core (no adjustment)
+			}
+			// If P-core, core_offset remains sched_burst_penalty_offset
+		}
+		// If cpu invalid or type unknown (shouldn't happen if key enabled), use base offset
+	}
+
 	greed = log2plus1_u64_u32f8(burst_time);
-	tolerance = (u32)sched_burst_penalty_offset << 8;
+	tolerance = (u32)core_offset << 8; // Use potentially adjusted offset
 	penalty = max(0, (s32)(greed - tolerance));
-	scaled_penalty = mul_u32_u32(penalty, sched_burst_penalty_scale) >> 16;
+
+	// Apply scaling (base scale * percentage)
+	uint scale = sched_burst_penalty_scale; // Base scale (original or reduced)
+	if (static_key_enabled(&bore_core_aware_key.key)) {
+		int cpu = raw_smp_processor_id();
+		if (likely(cpu >= 0 && cpu < nr_cpu_ids)) {
+			uint scale_pct = 100; // Default multiplier
+			if (per_cpu(bore_cpu_type, cpu) == TOPO_CPU_TYPE_EFFICIENCY) {
+				scale_pct = sched_burst_penalty_ecore_scale_pct;
+			} else if (per_cpu(bore_cpu_type, cpu) == TOPO_CPU_TYPE_PERFORMANCE) {
+				scale_pct = sched_burst_penalty_pcore_scale_pct;
+			}
+			if (scale_pct != 100) {
+				// Apply percentage multiplier to the base scale
+				scale = (u32)div_u64((u64)scale * scale_pct, 100);
+			}
+		}
+	}
+
+	scaled_penalty = mul_u32_u32(penalty, scale) >> 16;
 	return min(MAX_BURST_PENALTY, scaled_penalty);
 }
+
 
 static inline u64 __scale_slice(u64 delta, u8 score) {
 	score = min((u8)(NICE_WIDTH - 1), score);
@@ -432,9 +495,12 @@ static inline u32 binary_smooth(u32 new, u32 old, enum x86_topology_cpu_type cpu
 
 static void revolve_burst_penalty(struct sched_entity *se) {
 	enum x86_topology_cpu_type cpu_type = TOPO_CPU_TYPE_UNKNOWN;
-	if (entity_is_task(se)) {
-		cpu_type = bore_get_task_cpu_type(task_of(se)); // Gets stored type
-	}
+	// Get current CPU type *without* locking task rq, faster but assumes task is running here
+	// This is generally safe within scheduler context where revolve is called
+	int cpu = raw_smp_processor_id();
+	if (likely(cpu >= 0 && cpu < nr_cpu_ids))
+		cpu_type = per_cpu(bore_cpu_type, cpu);
+
 	se->prev_burst_penalty = binary_smooth(se->curr_burst_penalty, se->prev_burst_penalty, cpu_type);
 	se->burst_time = 0;
 	se->curr_burst_penalty = 0;
@@ -554,28 +620,9 @@ static inline u8 inherit_burst_tg(struct task_struct *parent_task, u64 now) {
 // Assumes rq lock held
 void update_burst_penalty(struct sched_entity *se) {
 	u32 raw_penalty;
-	enum x86_topology_cpu_type cpu_type;
-	uint scale_pct = 100;
 
+	// Calculation now happens entirely within calc_burst_penalty
 	raw_penalty = calc_burst_penalty(se->burst_time);
-
-	// Apply core-aware scaling only if the core-aware key is enabled
-	if (sched_burst_core_aware_penalty && static_key_enabled(&bore_core_aware_key.key)) {
-		if (entity_is_task(se)) {
-			cpu_type = bore_get_task_cpu_type(task_of(se)); // Gets stored type
-			// Only apply if type is known (it should be if key is enabled)
-			if (cpu_type == TOPO_CPU_TYPE_EFFICIENCY) {
-				scale_pct = sched_burst_penalty_ecore_scale_pct;
-			} else if (cpu_type == TOPO_CPU_TYPE_PERFORMANCE) {
-				scale_pct = sched_burst_penalty_pcore_scale_pct;
-			}
-			// Apply scaling if needed and type was known
-			if (scale_pct != 100 && cpu_type != TOPO_CPU_TYPE_UNKNOWN) {
-				raw_penalty = (u32)div_u64((u64)raw_penalty * scale_pct, 100);
-				raw_penalty = min(MAX_BURST_PENALTY, raw_penalty);
-			}
-		}
-	}
 
 	se->curr_burst_penalty = raw_penalty;
 	se->burst_penalty = max(se->prev_burst_penalty, se->curr_burst_penalty);
@@ -709,15 +756,15 @@ int sched_bore_update_handler(const struct ctl_table *table, int write,
 								  sched_burst_smoothness_short = BORE_ORIG_BURST_SMOOTHNESS_SHORT;
 								  sched_burst_fork_atavistic   = BORE_ORIG_BURST_FORK_ATAVISTIC;
 								  sched_burst_parity_threshold = BORE_ORIG_BURST_PARITY_THRESHOLD;
-								  sched_burst_penalty_offset   = BORE_ORIG_BURST_PENALTY_OFFSET;
-								  sched_burst_penalty_scale    = BORE_ORIG_BURST_PENALTY_SCALE;
+								  sched_burst_penalty_offset   = BORE_ORIG_BURST_PENALTY_OFFSET; // Original base offset
+								  sched_burst_penalty_scale    = BORE_ORIG_BURST_PENALTY_SCALE;   // Original base scale
 								  sched_burst_cache_stop_count = BORE_ORIG_BURST_CACHE_STOP_COUNT;
 								  sched_burst_cache_lifetime   = BORE_ORIG_BURST_CACHE_LIFETIME;
 								  sched_deadline_boost_mask    = BORE_ORIG_DEADLINE_BOOST_MASK;
-								  // Initialize core-aware toggles from defaults (likely 0)
+								  // Initialize core-aware toggles from defaults (0 = disabled)
 								  sched_burst_core_aware_penalty = BORE_ORIG_CORE_AWARE_PENALTY;
 								  sched_burst_core_aware_smoothing = BORE_ORIG_CORE_AWARE_SMOOTHING;
-								  // Initialize core-specific values from defaults (likely neutral)
+								  // Initialize core-specific values from defaults (will be overridden if core-aware activated)
 								  sched_burst_penalty_pcore_scale_pct = BORE_ORIG_PENALTY_PCORE_SCALE_PCT;
 								  sched_burst_penalty_ecore_scale_pct = BORE_ORIG_PENALTY_ECORE_SCALE_PCT;
 								  sched_burst_smoothness_long_p = BORE_ORIG_SMOOTHNESS_LONG_P;
@@ -725,14 +772,14 @@ int sched_bore_update_handler(const struct ctl_table *table, int write,
 								  sched_burst_smoothness_long_e = BORE_ORIG_SMOOTHNESS_LONG_E;
 								  sched_burst_smoothness_short_e = BORE_ORIG_SMOOTHNESS_SHORT_E;
 
-								  // Run early detection and apply non-core-aware hybrid defaults
+								  // Run early detection and apply *only* non-scale/offset hybrid defaults
 								  bore_detect_intel_hybrid_early();
 
-								  // Apply non-core-aware Raptor Lake tunings if applicable
+								  // Apply non-scale/offset Raptor Lake tunings if applicable
 								  bore_apply_raptor_lake_tuning_early();
 
-								  // Core-aware settings and P-core mask are applied either now (if detected early)
-								  // or later via bore_late_topology_check_and_apply().
+								  // Core-aware settings (incl. base scale/offset reduction) and P-core mask are applied
+								  // either now (if detected early) or later via bore_late_topology_check_and_apply().
 
 								  // Initialize BORE state for the init task
 								  reset_task_bore(&init_task);
