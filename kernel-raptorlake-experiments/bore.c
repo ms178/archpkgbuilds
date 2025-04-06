@@ -4,9 +4,11 @@
  * Copyright (C) 2021-2024 Masahito Suzuki <firelzrd@gmail.com>
  * Integration of Intel Hybrid CPU default tuning with Raptor Lake optimizations
  * and experimental core-aware runtime adaptations.
+ * Relies on kernel topology information (get_topology_cpu_type) and defers
+ * core-aware tuning application to late_init if needed.
  *
  * CRITICAL: Requires corresponding BORE hooks/modifications in core kernel
- * scheduler files (fair.c, core.c, etc.) from the BORE patchset for 6.13.8.
+ * scheduler files (fair.c, core.c, etc.) from the BORE patchset for ~6.13.
  */
 
 #include <linux/sched.h>
@@ -31,8 +33,9 @@
 // #include <linux/once.h> // Removed for workaround
 
 #include <asm/cpufeatures.h>
-#include <asm/processor.h>
-#include <asm/topology.h>
+#include <asm/processor.h>  // Provides struct cpuinfo_x86
+#include <asm/topology.h>   // Provides get_topology_cpu_type()
+#include <asm/cpufeature.h> // For boot_cpu_has
 
 #include <linux/sched/bore.h>
 #include "sched.h"
@@ -44,6 +47,7 @@
 
 #define MAX_BURST_PENALTY (156U)
 
+// --- Global Variables (Sysctl Tunables) ---
 u8   sched_bore;
 u8   sched_burst_exclude_kthreads;
 u8   sched_burst_fork_atavistic;
@@ -55,6 +59,7 @@ u8   sched_burst_penalty_offset;
 uint sched_burst_penalty_scale;
 u8   sched_burst_smoothness_long;
 u8   sched_burst_smoothness_short;
+// Core-aware tunables (only used if core type info is available)
 u8   sched_burst_core_aware_penalty;
 u8   sched_burst_core_aware_smoothing;
 uint sched_burst_penalty_pcore_scale_pct;
@@ -64,19 +69,20 @@ u8   sched_burst_smoothness_short_p;
 u8   sched_burst_smoothness_long_e;
 u8   sched_burst_smoothness_short_e;
 
+// --- Original BORE Defaults ---
 #define BORE_ORIG_SCHED_BORE                   1
 #define BORE_ORIG_BURST_EXCLUDE_KTHREADS 1
 #define BORE_ORIG_BURST_SMOOTHNESS_LONG  1
 #define BORE_ORIG_BURST_SMOOTHNESS_SHORT 0
-#define BORE_ORIG_BURST_FORK_ATAVISTIC   2
+#define BORE_ORIG_BURST_FORK_ATAVISTIC   2 // Default conservative for hybrid
 #define BORE_ORIG_BURST_PARITY_THRESHOLD 2
 #define BORE_ORIG_BURST_PENALTY_OFFSET   24
 #define BORE_ORIG_BURST_PENALTY_SCALE    1280
 #define BORE_ORIG_BURST_CACHE_STOP_COUNT 64
 #define BORE_ORIG_BURST_CACHE_LIFETIME   75000000 // 75ms
 #define BORE_ORIG_DEADLINE_BOOST_MASK    (ENQUEUE_INITIAL | ENQUEUE_WAKEUP)
-#define BORE_ORIG_CORE_AWARE_PENALTY    0
-#define BORE_ORIG_CORE_AWARE_SMOOTHING  0
+#define BORE_ORIG_CORE_AWARE_PENALTY    0 // Disabled by default
+#define BORE_ORIG_CORE_AWARE_SMOOTHING  0 // Disabled by default
 #define BORE_ORIG_PENALTY_PCORE_SCALE_PCT 100
 #define BORE_ORIG_PENALTY_ECORE_SCALE_PCT 100
 #define BORE_ORIG_SMOOTHNESS_LONG_P      BORE_ORIG_BURST_SMOOTHNESS_LONG
@@ -84,196 +90,155 @@ u8   sched_burst_smoothness_short_e;
 #define BORE_ORIG_SMOOTHNESS_LONG_E      BORE_ORIG_BURST_SMOOTHNESS_LONG
 #define BORE_ORIG_SMOOTHNESS_SHORT_E     BORE_ORIG_BURST_SMOOTHNESS_SHORT
 
+// --- CPU Type Detection ---
 static DEFINE_PER_CPU(enum x86_topology_cpu_type, bore_cpu_type) = TOPO_CPU_TYPE_UNKNOWN;
 // Workaround: Use static flag instead of DEFINE_ONCE/do_once
-static bool bore_core_detection_has_run __initdata = false;
-static bool bore_using_custom_topology = false;
+static bool bore_early_detection_has_run __initdata = false;
+// Flag indicating if the kernel provided valid P/E core type info (set early or late)
+static bool bore_has_core_type_info = false;
+// Flag indicating core-aware tuning needs to be applied later
+static bool bore_apply_core_aware_tuning_late __initdata = false;
 
-#define BORE_DETECT_CACHE_SIZE      0x01
-#define BORE_DETECT_CORE_ID         0x02
-#define BORE_DETECT_FREQ            0x04
-#define BORE_DETECT_ALL             0x07
+// Static key to enable core-aware features (enabled early or late)
+static struct static_key_false bore_core_aware_key = STATIC_KEY_FALSE_INIT;
 
-static struct static_key_false bore_intel_hybrid_defaults_key = STATIC_KEY_FALSE_INIT;
-
+// FIX: Define is_intel_raptor_lake *before* is_intel_hybrid
 static bool __init is_intel_raptor_lake(void) {
 	if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL || boot_cpu_data.x86 != 6) return false;
 	switch (boot_cpu_data.x86_model) {
-		case 0xB7: case 0xBA: case 0xBF: return true; default: return false;
+		case 0xB7: // Raptor Lake-S (Desktop) / Alder Lake-N
+		case 0xBA: // Raptor Lake-P (Mobile)
+		case 0xBE: // Raptor Lake-H/S (?)
+		case 0xBF: // Raptor Lake-S (Refresh / 14th Gen Desktop) - Covers 14700KF
+		case 0xAD: // Alder Lake-M/N (?) E-cores only
+		case 0xAC: // Alder Lake-S (?) E-cores only
+			// Consider adding Alder Lake Models if needed (e.g., 0x97, 0x9A)
+		case 0x97: // Alder Lake-S
+		case 0x9A: // Alder Lake-P
+			return true; // Treat ADL also as needing potential late check
+		default:
+			return false;
 	}
 }
 
-static enum x86_topology_cpu_type detect_raptor_lake_core_type(int cpu, unsigned int methods)
-{
-	enum x86_topology_cpu_type kernel_type = get_topology_cpu_type(&per_cpu(cpu_info, cpu));
-	if (kernel_type != TOPO_CPU_TYPE_UNKNOWN)
-		return kernel_type;
-
-	int is_pcore = 0;
-	int evidence_count = 0;
-
-	if (methods & BORE_DETECT_CACHE_SIZE) {
-		unsigned int cache_size = per_cpu(cpu_info, cpu).x86_cache_size;
-		if (cache_size >= 2048) {
-			is_pcore++;
-		} else if (cache_size <= 1280) {
-			is_pcore--;
-		}
-		evidence_count++;
-	}
-
-	if (methods & BORE_DETECT_CORE_ID) {
-		int core_id = topology_core_id(cpu);
-		if (core_id < 8) {
-			is_pcore++;
-		} else if (core_id >= 16) {
-			is_pcore--;
-		}
-		evidence_count++;
-	}
-
-	if (methods & BORE_DETECT_FREQ) {
-		u64 freq;
-		u32 eax, ebx, ecx, edx;
-		if (per_cpu(cpu_info, cpu).cpuid_level >= 0x16) {
-			cpuid(0x16, &eax, &ebx, &ecx, &edx);
-			freq = (u64)eax * 1000000;
-			if (freq >= 3000000000ULL) {
-				is_pcore++;
-			} else if (freq <= 2400000000ULL) {
-				is_pcore--;
-			}
-			evidence_count++;
-		}
-	}
-
-	enum x86_topology_cpu_type result;
-	if (evidence_count == 0) {
-		result = TOPO_CPU_TYPE_UNKNOWN;
-	} else if (is_pcore > 0) {
-		result = TOPO_CPU_TYPE_PERFORMANCE;
-	} else if (is_pcore < 0) {
-		result = TOPO_CPU_TYPE_EFFICIENCY;
-	} else {
-		result = (topology_core_id(cpu) % 16) < 8 ?
-		TOPO_CPU_TYPE_PERFORMANCE : TOPO_CPU_TYPE_EFFICIENCY;
-	}
-	return result;
+static bool __init is_intel_hybrid(void) {
+	return boot_cpu_has(X86_FEATURE_HYBRID_CPU) || is_intel_raptor_lake(); // Combine checks
 }
+
 
 /*
- * Detect core types for all CPUs using a static flag for run-once logic.
+ * Initial attempt to detect core types using get_topology_cpu_type().
+ * Stores results and sets flags for potential later re-check.
  */
-static void __init detect_all_cpu_types(void)
+static void __init detect_all_cpu_types_early(void)
 {
 	unsigned int cpu;
 	enum x86_topology_cpu_type type;
 	int p_cores = 0, e_cores = 0, unknown_cores = 0;
+	bool p_or_e_found_early = false;
 
-	/* Ensure this runs only once using a simple static flag */
-	if (bore_core_detection_has_run)
+	/* Ensure this runs only once */
+	if (bore_early_detection_has_run)
 		return;
-	bore_core_detection_has_run = true;
+	bore_early_detection_has_run = true;
 
-	pr_info("BORE: Performing enhanced CPU core type detection...\n");
-	bool is_raptor = is_intel_raptor_lake();
+	pr_info("BORE: Performing initial CPU core type detection using get_topology_cpu_type()...\n");
 
 	for_each_possible_cpu(cpu) {
-		if (is_raptor) {
-			type = detect_raptor_lake_core_type(cpu, BORE_DETECT_ALL);
-		} else {
-			// Fallback for non-Raptor Lake or if custom detection isn't needed
-			type = get_topology_cpu_type(&per_cpu(cpu_info, cpu));
-		}
+		struct cpuinfo_x86 *c = &per_cpu(cpu_info, cpu);
+		type = get_topology_cpu_type(c);
+
 		per_cpu(bore_cpu_type, cpu) = type;
 		switch (type) {
-			case TOPO_CPU_TYPE_PERFORMANCE: p_cores++; break;
-			case TOPO_CPU_TYPE_EFFICIENCY: e_cores++; break;
-			default: unknown_cores++; break;
+			case TOPO_CPU_TYPE_PERFORMANCE:
+				p_cores++;
+				p_or_e_found_early = true;
+				break;
+			case TOPO_CPU_TYPE_EFFICIENCY:
+				e_cores++;
+				p_or_e_found_early = true;
+				break;
+			default:
+				unknown_cores++;
+				break;
 		}
 	}
 
-	pr_info("BORE: Core detection results: %d P-cores, %d E-cores, %d unknown\n",
+	pr_info("BORE: Early core detection results: %d P-cores (logical), %d E-cores (logical), %d unknown\n",
 			p_cores, e_cores, unknown_cores);
 
-	// Determine if our custom detection was successful and useful
-	if (p_cores > 0 || e_cores > 0) {
-		bore_using_custom_topology = true;
-		pr_info("BORE: Using enhanced core type detection results.\n");
+	if (p_or_e_found_early) {
+		bore_has_core_type_info = true;
+		pr_info("BORE: Early check: Kernel provided valid P/E core topology information.\n");
 	} else {
-		bore_using_custom_topology = false;
-		pr_info("BORE: Enhanced detection found no P/E cores, relying on standard kernel info if available.\n");
+		bore_has_core_type_info = false;
+		pr_info("BORE: Early check: Kernel did not provide P/E core topology information.\n");
+		// If it's a known hybrid platform, flag for later check
+		if (is_intel_hybrid()) {
+			bore_apply_core_aware_tuning_late = true;
+			pr_info("BORE: Flagging hybrid system for late topology re-check.\n");
+		}
 	}
 }
 
 /*
- * Detect Intel Hybrid CPUs and enable specific tunings.
- * Prioritizes custom detection results if successful.
+ * Apply core-aware tuning settings. Should only be called if bore_has_core_type_info is true.
  */
-static void __init bore_detect_intel_hybrid(void)
+static void __init bore_apply_core_aware_settings(void)
 {
-	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL &&
-		(boot_cpu_has(X86_FEATURE_HYBRID_CPU) || is_intel_raptor_lake())) {
+	// This function is only called if bore_has_core_type_info is true.
 
-		// Run our custom detection logic first
-		detect_all_cpu_types();
+	pr_info("BORE: Enabling core-aware penalty and smoothing defaults because P/E info is available.\n");
+	// Enable core-aware features now that we have confirmed P/E info
+	sched_burst_core_aware_penalty = 1;
+	sched_burst_core_aware_smoothing = 1;
 
-	// Check if our custom detection succeeded
-	if (bore_using_custom_topology) {
-		pr_info("BORE: Intel Hybrid CPU detected. Applying tuned defaults based on enhanced topology detection.\n");
-		static_key_enable(&bore_intel_hybrid_defaults_key.key);
+	// Set the specific P/E tuning parameters
+	if (is_intel_raptor_lake()) {
+		pr_info("BORE: Applying Raptor Lake core-aware parameters.\n");
+		// Use the specific RL values
+		sched_burst_penalty_pcore_scale_pct = 100;
+		sched_burst_penalty_ecore_scale_pct = 110;
+		sched_burst_smoothness_long_p = 1;
+		sched_burst_smoothness_short_p = 0;
+		sched_burst_smoothness_long_e = 2;
+		sched_burst_smoothness_short_e = 1;
+	} else {
+		// Apply potentially different defaults for other hybrid (e.g., Alder Lake)
+		// Using the original defaults here for non-RL hybrid
+		pr_info("BORE: Applying default core-aware parameters for non-Raptor Lake hybrid.\n");
+		sched_burst_penalty_pcore_scale_pct = BORE_ORIG_PENALTY_PCORE_SCALE_PCT; // 100
+		sched_burst_penalty_ecore_scale_pct = BORE_ORIG_PENALTY_ECORE_SCALE_PCT; // 100
+		sched_burst_smoothness_long_p = BORE_ORIG_SMOOTHNESS_LONG_P; // 1
+		sched_burst_smoothness_short_p = BORE_ORIG_SMOOTHNESS_SHORT_P; // 0
+		sched_burst_smoothness_long_e = BORE_ORIG_SMOOTHNESS_LONG_E; // 1
+		sched_burst_smoothness_short_e = BORE_ORIG_SMOOTHNESS_SHORT_E; // 0
 	}
-	// Fallback: Check if the kernel has topology info for the boot CPU (even if our detection failed)
-	else if (get_topology_cpu_type(&per_cpu(cpu_info, raw_smp_processor_id())) != TOPO_CPU_TYPE_UNKNOWN) {
-		pr_info("BORE: Intel Hybrid CPU detected. Applying tuned defaults based on kernel topology info.\n");
-		static_key_enable(&bore_intel_hybrid_defaults_key.key);
-	}
-	// If neither our detection nor kernel info is available/useful
-	else {
-		pr_warn("BORE: Intel Hybrid CPU detected, but kernel lacks CPU type info and enhanced detection failed. Using standard defaults.\n");
-	}
-		}
+	// Enable the static key now that settings are applied
+	static_key_enable(&bore_core_aware_key.key);
+	pr_info("BORE: Core-aware tuning key enabled.\n");
 }
 
-
-static void __init bore_apply_hybrid_defaults(void) {
+/*
+ * Recalculate and apply P-core mask. Should only be called if bore_has_core_type_info is true.
+ */
+static void __init bore_recalculate_pcore_mask(void)
+{
 	cpumask_var_t pcore_mask;
 	unsigned int cpu, calculated_mask = 0;
 	bool pcore_found = false;
 
-	if (!static_key_enabled(&bore_intel_hybrid_defaults_key.key)) return;
-	pr_info("BORE: Applying Intel Hybrid specific default tunings...\n");
-
-	sched_burst_parity_threshold = BORE_ORIG_BURST_PARITY_THRESHOLD + 2;
-	sched_burst_penalty_scale    = max(1U, BORE_ORIG_BURST_PENALTY_SCALE / 2U);
-	sched_burst_penalty_offset   = max((u8)1, (u8)(BORE_ORIG_BURST_PENALTY_OFFSET / 2U));
-	sched_burst_smoothness_short = max((u8)1, (u8)(BORE_ORIG_BURST_SMOOTHNESS_SHORT + 1));
-	sched_burst_fork_atavistic   = 0;
-	sched_burst_exclude_kthreads = 1;
-
 	if (!zalloc_cpumask_var(&pcore_mask, GFP_KERNEL)) {
-		pr_err("BORE: Failed P-core mask alloc! Using default boost mask (0x%x).\n", sched_deadline_boost_mask);
-		goto mask_done;
+		pr_err("BORE: Failed P-core mask alloc during late init! Using previous boost mask (0x%x).\n", sched_deadline_boost_mask);
+		return;
 	}
 
-	// Use our enhanced detection results if they were successful
-	if (bore_using_custom_topology) {
-		for_each_possible_cpu(cpu) {
-			if (!cpu_online(cpu)) continue;
-			if (per_cpu(bore_cpu_type, cpu) == TOPO_CPU_TYPE_PERFORMANCE) {
-				cpumask_set_cpu(cpu, pcore_mask);
-				pcore_found = true;
-			}
-		}
-	}
-	// Fallback to kernel topology if our detection wasn't used/successful
-	else {
-		for_each_possible_cpu(cpu) {
-			if (!cpu_online(cpu)) continue;
-			if (get_topology_cpu_type(&per_cpu(cpu_info, cpu)) == TOPO_CPU_TYPE_PERFORMANCE) {
-				cpumask_set_cpu(cpu, pcore_mask);
-				pcore_found = true;
-			}
+	for_each_possible_cpu(cpu) {
+		if (!cpu_online(cpu)) continue;
+		// Use the now confirmed (hopefully) core type
+		if (per_cpu(bore_cpu_type, cpu) == TOPO_CPU_TYPE_PERFORMANCE) {
+			cpumask_set_cpu(cpu, pcore_mask);
+			pcore_found = true;
 		}
 	}
 
@@ -282,52 +247,118 @@ static void __init bore_apply_hybrid_defaults(void) {
 			if (cpu < (sizeof(sched_deadline_boost_mask) * BITS_PER_BYTE)) {
 				calculated_mask |= (1U << cpu);
 			} else {
-				pr_warn_once("BORE: Online P-core CPU %u exceeds uint boost_mask range.\n", cpu);
+				pr_warn_once("BORE: (Late) Online P-core CPU %u exceeds uint boost_mask range.\n", cpu);
 			}
 		}
 		if (calculated_mask != 0) {
 			sched_deadline_boost_mask = calculated_mask;
-			pr_info("BORE: Applied P-core specific deadline boost mask (0x%x).\n", sched_deadline_boost_mask);
+			pr_info("BORE: (Late) Applied P-core specific deadline boost mask (0x%x).\n", sched_deadline_boost_mask);
 		} else {
-			pr_warn("BORE: Calculated P-core mask empty (range limit?). Using default boost mask (0x%x).\n", sched_deadline_boost_mask);
+			pr_warn("BORE: (Late) Calculated P-core mask empty? Using default boost mask (0x%x).\n", BORE_ORIG_DEADLINE_BOOST_MASK);
+			sched_deadline_boost_mask = BORE_ORIG_DEADLINE_BOOST_MASK;
 		}
 	} else {
-		pr_warn("BORE: No online P-cores detected for boost mask. Using default boost mask (0x%x).\n", sched_deadline_boost_mask);
+		pr_warn("BORE: (Late) No online P-cores detected for boost mask? Using default boost mask (0x%x).\n", BORE_ORIG_DEADLINE_BOOST_MASK);
+		sched_deadline_boost_mask = BORE_ORIG_DEADLINE_BOOST_MASK;
 	}
 	free_cpumask_var(pcore_mask);
-	mask_done:;
 }
 
-static void __init bore_apply_raptor_lake_tuning(void) {
-	if (!is_intel_raptor_lake()) return;
-	pr_info("BORE: Raptor Lake CPU detected, applying specific conservative optimizations\n");
-	sched_burst_parity_threshold++;
-	sched_burst_penalty_scale = max(1U, (sched_burst_penalty_scale * 9) / 10);
+/*
+ * Late initcall to recheck topology and apply core-aware settings if needed.
+ */
+static int __init bore_late_topology_check_and_apply(void)
+{
+	// Only proceed if the early check failed on a hybrid system
+	if (!bore_apply_core_aware_tuning_late)
+		return 0;
 
-	// Only apply core-aware tuning if our custom detection actually worked
-	if (bore_using_custom_topology) {
-		sched_burst_core_aware_penalty = 1;
-		sched_burst_core_aware_smoothing = 1;
-		sched_burst_penalty_pcore_scale_pct = 95;
-		sched_burst_penalty_ecore_scale_pct = 120;
-		sched_burst_smoothness_long_p = 1;
-		sched_burst_smoothness_short_p = 0;
-		sched_burst_smoothness_long_e = 2;
-		sched_burst_smoothness_short_e = 1;
-		pr_info("BORE: Applied Raptor Lake core-aware optimizations\n");
+	pr_info("BORE: Performing late topology re-check...\n");
+
+	unsigned int cpu;
+	enum x86_topology_cpu_type type;
+	bool p_or_e_found_late = false;
+
+	// Re-populate per-cpu data using the (now hopefully initialized) kernel function
+	for_each_possible_cpu(cpu) {
+		struct cpuinfo_x86 *c = &per_cpu(cpu_info, cpu);
+		type = get_topology_cpu_type(c);
+		per_cpu(bore_cpu_type, cpu) = type; // Update stored type
+		if (type == TOPO_CPU_TYPE_PERFORMANCE || type == TOPO_CPU_TYPE_EFFICIENCY) {
+			p_or_e_found_late = true;
+		}
+	}
+
+	if (p_or_e_found_late) {
+		bore_has_core_type_info = true; // Update global flag
+		pr_info("BORE: Late check: Kernel provided valid P/E core topology information.\n");
+
+		// Apply the core-aware settings and P-core mask now
+		bore_apply_core_aware_settings();
+		bore_recalculate_pcore_mask();
+
 	} else {
-		pr_info("BORE: Skipping Raptor Lake core-aware optimizations as enhanced detection was not used/successful.\n");
+		// Still no info even at late_initcall? Unlikely but possible.
+		bore_has_core_type_info = false;
+		pr_warn("BORE: Late check: Kernel still did not provide P/E core topology info. Core-aware tuning remains disabled.\n");
+	}
+
+	return 0;
+}
+// Run after standard topology/SMP setup, but before scheduler really gets going
+late_initcall_sync(bore_late_topology_check_and_apply);
+
+
+/*
+ * Initial check for Hybrid CPU and application of NON-core-aware defaults.
+ */
+static void __init bore_detect_intel_hybrid_early(void)
+{
+	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL && is_intel_hybrid()) {
+		// Run the early detection attempt
+		detect_all_cpu_types_early(); // Sets bore_has_core_type_info & bore_apply_core_aware_tuning_late
+
+		// Apply non-core-aware hybrid defaults immediately if hybrid detected,
+		// regardless of whether core types were known *yet*.
+		pr_info("BORE: Intel Hybrid CPU detected. Applying initial non-core-aware defaults.\n");
+		sched_burst_parity_threshold = BORE_ORIG_BURST_PARITY_THRESHOLD + 2;
+		sched_burst_penalty_scale    = max(1U, BORE_ORIG_BURST_PENALTY_SCALE / 2U);
+		sched_burst_penalty_offset   = max((u8)1, (u8)(BORE_ORIG_BURST_PENALTY_OFFSET / 2U));
+		sched_burst_smoothness_short = max((u8)1, (u8)(BORE_ORIG_BURST_SMOOTHNESS_SHORT + 1));
+		sched_burst_fork_atavistic   = 0;
+		sched_burst_exclude_kthreads = 1;
+
+		// If core types *were* successfully found early, enable core-aware key and apply settings now
+		if (bore_has_core_type_info) {
+			bore_apply_core_aware_settings();
+			bore_recalculate_pcore_mask(); // Apply P-core mask early if possible
+		}
 	}
 }
 
+/*
+ * Apply Raptor Lake specific NON-core-aware tunings. Core-aware parts are handled later.
+ */
+static void __init bore_apply_raptor_lake_tuning_early(void)
+{
+	if (!is_intel_raptor_lake()) return;
+	pr_info("BORE: Raptor Lake CPU detected, applying initial non-core-aware optimizations\n");
+
+	// Apply minor general RL adjustments (always safe)
+	sched_burst_parity_threshold++; // Apply cumulative adjustment if hybrid already did
+	// Set scale based on halved original, adjusted for RL
+	sched_burst_penalty_scale = max(1U, (BORE_ORIG_BURST_PENALTY_SCALE / 2U * 9) / 10);
+
+	// Core-aware parts are handled by bore_apply_core_aware_settings() called early or late
+}
+
+/* --- BORE Helper Functions --- */
+
+// Returns the CPU type stored (potentially updated by late init)
 static inline enum x86_topology_cpu_type bore_get_task_cpu_type(struct task_struct *p) {
 	int cpu = task_cpu(p);
 	if (cpu >= nr_cpu_ids || cpu < 0) return TOPO_CPU_TYPE_UNKNOWN;
-	// Prioritize our detected type if available
-	if (bore_using_custom_topology)
-		return per_cpu(bore_cpu_type, cpu);
-	// Fallback to kernel's topology info
-	return get_topology_cpu_type(&per_cpu(cpu_info, cpu));
+	return per_cpu(bore_cpu_type, cpu);
 }
 
 static inline u32 log2plus1_u64_u32f8(u64 v) {
@@ -372,12 +403,15 @@ static inline u8 effective_prio(struct task_struct *p) {
 	return (u8)min_t(int, NICE_WIDTH - 1, prio);
 }
 
+// Apply core-aware smoothing only if the core-aware key is enabled
 static inline u32 binary_smooth(u32 new, u32 old, enum x86_topology_cpu_type cpu_type) {
 	int increment = (int)new - (int)old;
 	u8 shift_long = sched_burst_smoothness_long;
 	u8 shift_short = sched_burst_smoothness_short;
 
-	if (sched_burst_core_aware_smoothing && static_key_enabled(&bore_intel_hybrid_defaults_key.key) && bore_using_custom_topology) {
+	// Apply core-aware smoothing only if the core-aware key is enabled
+	if (sched_burst_core_aware_smoothing && static_key_enabled(&bore_core_aware_key.key)) {
+		// We can trust cpu_type IF the key is enabled (means bore_has_core_type_info was true)
 		if (cpu_type == TOPO_CPU_TYPE_PERFORMANCE) {
 			shift_long = sched_burst_smoothness_long_p;
 			shift_short = sched_burst_smoothness_short_p;
@@ -385,7 +419,7 @@ static inline u32 binary_smooth(u32 new, u32 old, enum x86_topology_cpu_type cpu
 			shift_long = sched_burst_smoothness_long_e;
 			shift_short = sched_burst_smoothness_short_e;
 		}
-	}
+	} // else use the global defaults
 
 	if (increment >= 0) {
 		shift_long = min((u8)31, shift_long);
@@ -399,7 +433,7 @@ static inline u32 binary_smooth(u32 new, u32 old, enum x86_topology_cpu_type cpu
 static void revolve_burst_penalty(struct sched_entity *se) {
 	enum x86_topology_cpu_type cpu_type = TOPO_CPU_TYPE_UNKNOWN;
 	if (entity_is_task(se)) {
-		cpu_type = bore_get_task_cpu_type(task_of(se)); // Uses helper which respects custom topology
+		cpu_type = bore_get_task_cpu_type(task_of(se)); // Gets stored type
 	}
 	se->prev_burst_penalty = binary_smooth(se->curr_burst_penalty, se->prev_burst_penalty, cpu_type);
 	se->burst_time = 0;
@@ -410,7 +444,8 @@ static inline bool task_is_bore_eligible(struct task_struct *p) {
 	return p && p->sched_class == &fair_sched_class && !p->exit_state;
 }
 
-#define for_each_child(p, t) list_for_each_entry(t, &(p)->children, sibling)
+/* --- Burst Cache & Inheritance Helpers --- */
+#define for_each_child(p, t) list_for_each_entry_rcu(t, &(p)->children, sibling)
 static u32 count_entries_upto2(struct list_head *head) {
 	struct list_head *next = head->next; return (next != head) + (next->next != head);
 }
@@ -421,14 +456,16 @@ static inline bool burst_cache_expired(struct sched_burst_cache *bc, u64 now) {
 	return (s64)(bc->timestamp + sched_burst_cache_lifetime - now) < 0;
 }
 
+// Assumes bc->lock held
 static void update_burst_cache(struct sched_burst_cache *bc, struct task_struct *p, u32 cnt, u32 sum, u64 now) {
 	u8 avg = cnt ? (u8)(sum / cnt) : 0;
 	bc->score = max(avg, p->se.burst_penalty); bc->count = cnt; bc->timestamp = now;
 }
 
+// Assumes p->se.child_burst.lock held
 static void update_child_burst_direct(struct task_struct *p, u64 now) {
 	u32 cnt = 0, sum = 0; struct task_struct *child;
-	rcu_read_lock(); // Needed for task iteration
+	rcu_read_lock();
 	for_each_child(p, child) {
 		if (task_is_bore_eligible(child)) { cnt++; sum += child->se.burst_penalty; }
 	}
@@ -436,89 +473,71 @@ static void update_child_burst_direct(struct task_struct *p, u64 now) {
 	update_burst_cache(&p->se.child_burst, p, cnt, sum, now);
 }
 
+// Simplified topological update
+// Assumes p->se.child_burst.lock held
 static void update_child_burst_topological(struct task_struct *p, u64 now, u32 depth, u32 *acnt, u32 *asum) {
-	u32 cnt = 0, sum = 0; struct task_struct *child, *desc; u32 dcnt; unsigned long flags;
-	rcu_read_lock(); // Needed for task iteration
+	u32 cnt = 0, sum = 0; struct task_struct *child;
+	rcu_read_lock();
 	for_each_child(p, child) {
-		desc = child;
-		while ((dcnt = count_entries_upto2(&desc->children)) == 1) {
-			struct task_struct *next_desc = list_first_entry_or_null(&desc->children, struct task_struct, sibling);
-			if (!next_desc || next_desc == desc) break; desc = next_desc;
-		}
-		if (!dcnt || !depth) {
-			if (task_is_bore_eligible(desc)) { cnt++; sum += desc->se.burst_penalty; }
-			if (sched_burst_cache_stop_count <= (*acnt + cnt)) goto exit_loop; continue;
-		}
-		spin_lock_irqsave(&desc->se.child_burst.lock, flags);
-		if (!burst_cache_expired(&desc->se.child_burst, now)) {
-			cnt += desc->se.child_burst.count; sum += (u32)desc->se.child_burst.score * desc->se.child_burst.count;
-			spin_unlock_irqrestore(&desc->se.child_burst.lock, flags);
-			if (sched_burst_cache_stop_count <= (*acnt + cnt)) goto exit_loop; continue;
-		}
-		// Unlock before recursion, lock will be taken inside
-		spin_unlock_irqrestore(&desc->se.child_burst.lock, flags);
-		update_child_burst_topological(desc, now, depth - 1, &cnt, &sum);
-		// Lock again to update this level's cache (though update_burst_cache does it)
-		spin_lock_irqsave(&desc->se.child_burst.lock, flags);
-		update_burst_cache(&desc->se.child_burst, desc, cnt, sum, now); // Update cache of intermediate node
-		spin_unlock_irqrestore(&desc->se.child_burst.lock, flags);
-		if (sched_burst_cache_stop_count <= (*acnt + cnt)) goto exit_loop;
+		if (task_is_bore_eligible(child)) { cnt++; sum += child->se.burst_penalty; }
 	}
-	exit_loop:
 	rcu_read_unlock();
-	// Update current node's cache outside the loop
 	update_burst_cache(&p->se.child_burst, p, cnt, sum, now);
-	*acnt += cnt; *asum += sum; // Update accumulated counts passed up
+	*acnt += cnt; *asum += sum;
 }
 
-static inline u8 inherit_burst_direct(struct task_struct *p, u64 now, u64 clone_flags) {
-	struct task_struct *parent = p; unsigned long flags; u8 score = 0;
-	rcu_read_lock(); // Needed for parent access
-	if (clone_flags & CLONE_PARENT) parent = parent->real_parent;
-	if (unlikely(!parent)) { rcu_read_unlock(); return 0; }
-	spin_lock_irqsave(&parent->se.child_burst.lock, flags);
-	rcu_read_unlock(); // Safe to unlock after lock acquired
-	if (burst_cache_expired(&parent->se.child_burst, now)) {
-		update_child_burst_direct(parent, now); // Lock already held
-		score = parent->se.child_burst.score;
+// Assumes caller holds RCU read lock
+static inline u8 inherit_burst_direct(struct task_struct *parent_task, u64 now, u64 clone_flags) {
+	struct task_struct *target_parent = parent_task; unsigned long flags; u8 score = 0;
+	if (clone_flags & CLONE_PARENT) target_parent = target_parent->real_parent;
+	if (unlikely(!target_parent)) return 0;
+
+	spin_lock_irqsave(&target_parent->se.child_burst.lock, flags);
+	if (burst_cache_expired(&target_parent->se.child_burst, now)) {
+		update_child_burst_direct(target_parent, now); // Lock held
 	}
-	spin_unlock_irqrestore(&parent->se.child_burst.lock, flags);
+	score = target_parent->se.child_burst.score;
+	spin_unlock_irqrestore(&target_parent->se.child_burst.lock, flags);
 	return score;
 }
 
-static inline u8 inherit_burst_topological(struct task_struct *p, u64 now, u64 clone_flags) {
-	struct task_struct *anc = p; u32 cnt = 0, sum = 0, depth = 0; u32 base_thresh = 0; unsigned long flags; u8 score = 0;
-	rcu_read_lock(); // Needed for ancestry traversal
+// Assumes caller holds RCU read lock
+static inline u8 inherit_burst_topological(struct task_struct *parent_task, u64 now, u64 clone_flags) {
+	struct task_struct *anc = parent_task; u32 cnt = 0, sum = 0; u32 base_thresh = 0; unsigned long flags; u8 score = 0;
 	if (clone_flags & CLONE_PARENT) { anc = anc->real_parent; base_thresh = 1; }
+
 	while (anc && anc != anc->real_parent && count_entries_upto2(&anc->children) <= base_thresh) {
 		anc = anc->real_parent; base_thresh = 1;
 	}
-	if (unlikely(!anc)) { rcu_read_unlock(); return 0; }
+	if (unlikely(!anc)) return 0;
+
 	spin_lock_irqsave(&anc->se.child_burst.lock, flags);
-	rcu_read_unlock(); // Safe to unlock after lock acquired
 	if (burst_cache_expired(&anc->se.child_burst, now)) {
-		depth = (sched_burst_fork_atavistic > 1) ? (sched_burst_fork_atavistic - 1) : 0;
-		update_child_burst_topological(anc, now, depth, &cnt, &sum); // Lock already held
+		update_child_burst_topological(anc, now, 0, &cnt, &sum); // Lock held, pass 0 for depth
 	}
 	score = anc->se.child_burst.score;
 	spin_unlock_irqrestore(&anc->se.child_burst.lock, flags);
 	return score;
 }
 
+// Assumes caller holds group_leader->se.group_burst.lock AND RCU read lock
 static void update_tg_burst(struct task_struct *group_leader, u64 now) {
 	struct task_struct *task; u32 cnt = 0, sum = 0;
-	// RCU lock should be held by caller (inherit_burst_tg)
 	for_each_thread(group_leader, task) {
 		if (task_is_bore_eligible(task)) { cnt++; sum += task->se.burst_penalty; }
 	}
 	update_burst_cache(&group_leader->se.group_burst, group_leader, cnt, sum, now);
 }
 
-static inline u8 inherit_burst_tg(struct task_struct *p, u64 now) {
+// Assumes caller holds NO locks initially
+static inline u8 inherit_burst_tg(struct task_struct *parent_task, u64 now) {
 	struct task_struct *leader; unsigned long flags; u8 score = 0;
-	rcu_read_lock(); // Needed for group_leader access and update_tg_burst
-	leader = READ_ONCE(p->group_leader);
-	if (unlikely(!leader)) { rcu_read_unlock(); return 0; }
+	rcu_read_lock();
+	leader = READ_ONCE(parent_task->group_leader);
+	if (unlikely(!leader)) {
+		rcu_read_unlock();
+		return 0;
+	}
 	spin_lock_irqsave(&leader->se.group_burst.lock, flags);
 	if (burst_cache_expired(&leader->se.group_burst, now)) {
 		update_tg_burst(leader, now); // RCU lock is held
@@ -530,6 +549,9 @@ static inline u8 inherit_burst_tg(struct task_struct *p, u64 now) {
 }
 
 
+/* --- BORE Public Functions --- */
+
+// Assumes rq lock held
 void update_burst_penalty(struct sched_entity *se) {
 	u32 raw_penalty;
 	enum x86_topology_cpu_type cpu_type;
@@ -537,16 +559,18 @@ void update_burst_penalty(struct sched_entity *se) {
 
 	raw_penalty = calc_burst_penalty(se->burst_time);
 
-	// Only apply core-aware scaling if hybrid defaults are active AND custom topo was successful
-	if (sched_burst_core_aware_penalty && static_key_enabled(&bore_intel_hybrid_defaults_key.key) && bore_using_custom_topology) {
+	// Apply core-aware scaling only if the core-aware key is enabled
+	if (sched_burst_core_aware_penalty && static_key_enabled(&bore_core_aware_key.key)) {
 		if (entity_is_task(se)) {
-			cpu_type = bore_get_task_cpu_type(task_of(se)); // Uses helper which respects custom topology
+			cpu_type = bore_get_task_cpu_type(task_of(se)); // Gets stored type
+			// Only apply if type is known (it should be if key is enabled)
 			if (cpu_type == TOPO_CPU_TYPE_EFFICIENCY) {
 				scale_pct = sched_burst_penalty_ecore_scale_pct;
 			} else if (cpu_type == TOPO_CPU_TYPE_PERFORMANCE) {
 				scale_pct = sched_burst_penalty_pcore_scale_pct;
 			}
-			if (scale_pct != 100) {
+			// Apply scaling if needed and type was known
+			if (scale_pct != 100 && cpu_type != TOPO_CPU_TYPE_UNKNOWN) {
 				raw_penalty = (u32)div_u64((u64)raw_penalty * scale_pct, 100);
 				raw_penalty = min(MAX_BURST_PENALTY, raw_penalty);
 			}
@@ -559,7 +583,7 @@ void update_burst_penalty(struct sched_entity *se) {
 }
 EXPORT_SYMBOL_GPL(update_burst_penalty);
 
-
+// Assumes rq lock held
 void update_burst_score(struct sched_entity *se) {
 	struct task_struct *p; u8 prev_prio, new_prio, burst_score = 0;
 	if (!entity_is_task(se)) return;
@@ -574,7 +598,7 @@ void update_burst_score(struct sched_entity *se) {
 }
 EXPORT_SYMBOL_GPL(update_burst_score);
 
-
+// Assumes rq lock held
 inline void restart_burst(struct sched_entity *se) {
 	revolve_burst_penalty(se);
 	se->burst_penalty = se->prev_burst_penalty;
@@ -582,7 +606,7 @@ inline void restart_burst(struct sched_entity *se) {
 }
 EXPORT_SYMBOL_GPL(restart_burst);
 
-
+// Assumes rq lock held
 void restart_burst_rescale_deadline(struct sched_entity *se) {
 	s64 vscaled, wremain, vremain; struct task_struct *p; u8 prev_prio, new_prio;
 	if (unlikely(!entity_is_task(se))) return;
@@ -600,10 +624,11 @@ void restart_burst_rescale_deadline(struct sched_entity *se) {
 }
 EXPORT_SYMBOL_GPL(restart_burst_rescale_deadline);
 
-
-void sched_clone_bore(struct task_struct *p, struct task_struct *parent, u64 clone_flags, u64 now) {
+// Called during fork.
+void sched_clone_bore(struct task_struct *p, struct task_struct *parent_task, u64 clone_flags, u64 now) {
 	struct sched_entity *se = &p->se; u8 inherited_penalty = 0;
-	if (unlikely(!p || !parent)) return;
+	if (unlikely(!p || !parent_task)) return;
+
 	init_task_burst_cache_lock(p);
 	se->child_burst.timestamp = 0; se->group_burst.timestamp = 0;
 	se->child_burst.score = 0; se->group_burst.score = 0;
@@ -611,16 +636,18 @@ void sched_clone_bore(struct task_struct *p, struct task_struct *parent, u64 clo
 	se->burst_time = 0; se->curr_burst_penalty = 0; se->burst_score = 0;
 
 	if (task_is_bore_eligible(p)) {
-		if (clone_flags & CLONE_THREAD) { inherited_penalty = inherit_burst_tg(p, now); } // Pass child 'p'
-		else {
+		if (clone_flags & CLONE_THREAD) {
+			inherited_penalty = inherit_burst_tg(parent_task, now);
+		} else {
+			rcu_read_lock(); // Acquire RCU lock for direct/topological parent access
 			if (sched_burst_fork_atavistic == 0) inherited_penalty = 0;
-			else if (sched_burst_fork_atavistic == 1) inherited_penalty = inherit_burst_direct(p, now, clone_flags); // Pass child 'p'
-			else inherited_penalty = inherit_burst_topological(p, now, clone_flags); // Pass child 'p'
+			else if (sched_burst_fork_atavistic == 1) inherited_penalty = inherit_burst_direct(parent_task, now, clone_flags);
+			else inherited_penalty = inherit_burst_topological(parent_task, now, clone_flags);
+			rcu_read_unlock();
 		}
 	}
 	se->prev_burst_penalty = inherited_penalty;
 	se->burst_penalty = inherited_penalty;
-	update_burst_score(se);
 }
 EXPORT_SYMBOL_GPL(sched_clone_bore);
 
@@ -635,6 +662,7 @@ void reset_task_bore(struct task_struct *p) {
 }
 EXPORT_SYMBOL_GPL(reset_task_bore);
 
+/* --- Sysctl Handler for Global Toggle --- */
 static void reset_task_weights_bore(void) {
 	struct task_struct *g, *p; struct rq *rq; struct rq_flags rf;
 	read_lock(&tasklist_lock);
@@ -642,8 +670,12 @@ static void reset_task_weights_bore(void) {
 		for_each_thread(g, p) {
 			if (!task_is_bore_eligible(p)) continue;
 			rq = task_rq(p);
-			if (unlikely(!rq)) continue;
+			if (unlikely(!rq || !p->on_rq)) continue; // Check rq and on_rq status
 			rq_pin_lock(rq, &rf);
+			if (task_rq(p) != rq || !p->on_rq) { // Recheck after pinning
+				rq_unpin_lock(rq, &rf);
+				continue;
+			}
 			update_rq_clock(rq);
 			reweight_task_by_prio(p, effective_prio(p));
 			rq_unpin_lock(rq, &rf);
@@ -665,9 +697,12 @@ int sched_bore_update_handler(const struct ctl_table *table, int write,
 	return 0;
 							  }
 
+
+							  /* --- Initialization --- */
 							  void __init sched_bore_init(void) {
 								  pr_info("BORE (Burst-Oriented Response Enhancer) CPU Scheduler modification %s by Masahito Suzuki\n", SCHED_BORE_VERSION);
 
+								  // Set initial default values FIRST
 								  sched_bore                   = BORE_ORIG_SCHED_BORE;
 								  sched_burst_exclude_kthreads = BORE_ORIG_BURST_EXCLUDE_KTHREADS;
 								  sched_burst_smoothness_long  = BORE_ORIG_BURST_SMOOTHNESS_LONG;
@@ -679,8 +714,10 @@ int sched_bore_update_handler(const struct ctl_table *table, int write,
 								  sched_burst_cache_stop_count = BORE_ORIG_BURST_CACHE_STOP_COUNT;
 								  sched_burst_cache_lifetime   = BORE_ORIG_BURST_CACHE_LIFETIME;
 								  sched_deadline_boost_mask    = BORE_ORIG_DEADLINE_BOOST_MASK;
+								  // Initialize core-aware toggles from defaults (likely 0)
 								  sched_burst_core_aware_penalty = BORE_ORIG_CORE_AWARE_PENALTY;
 								  sched_burst_core_aware_smoothing = BORE_ORIG_CORE_AWARE_SMOOTHING;
+								  // Initialize core-specific values from defaults (likely neutral)
 								  sched_burst_penalty_pcore_scale_pct = BORE_ORIG_PENALTY_PCORE_SCALE_PCT;
 								  sched_burst_penalty_ecore_scale_pct = BORE_ORIG_PENALTY_ECORE_SCALE_PCT;
 								  sched_burst_smoothness_long_p = BORE_ORIG_SMOOTHNESS_LONG_P;
@@ -688,19 +725,23 @@ int sched_bore_update_handler(const struct ctl_table *table, int write,
 								  sched_burst_smoothness_long_e = BORE_ORIG_SMOOTHNESS_LONG_E;
 								  sched_burst_smoothness_short_e = BORE_ORIG_SMOOTHNESS_SHORT_E;
 
-								  // Run detection logic which sets bore_using_custom_topology and enables the key if successful
-								  bore_detect_intel_hybrid();
-								  // Apply hybrid defaults if the key was enabled (either by custom detection or kernel fallback)
-								  bore_apply_hybrid_defaults();
-								  // Apply Raptor Lake tuning if applicable (will check bore_using_custom_topology internally)
-								  bore_apply_raptor_lake_tuning();
+								  // Run early detection and apply non-core-aware hybrid defaults
+								  bore_detect_intel_hybrid_early();
 
+								  // Apply non-core-aware Raptor Lake tunings if applicable
+								  bore_apply_raptor_lake_tuning_early();
+
+								  // Core-aware settings and P-core mask are applied either now (if detected early)
+								  // or later via bore_late_topology_check_and_apply().
+
+								  // Initialize BORE state for the init task
 								  reset_task_bore(&init_task);
 								  init_task_burst_cache_lock(&init_task);
 
-								  pr_info("BORE: Initialization complete. Active status: %u\n", sched_bore);
+								  pr_info("BORE: Initial setup complete. Active status: %u. Core-aware status pending late init.\n", sched_bore);
 							  }
 
+							  /* --- Sysctl Setup --- */
 							  #ifdef CONFIG_SYSCTL
 							  static const int const_int_zero = 0;
 							  static const int const_int_one = 1;
@@ -773,7 +814,7 @@ int sched_bore_update_handler(const struct ctl_table *table, int write,
 
 							  #else /* CONFIG_SCHED_BORE */
 
-							  /* Stubs when BORE is disabled */
+							  /* --- Stubs when BORE is disabled --- */
 							  void __init sched_bore_init(void) { }
 							  #ifndef _LINUX_SCHED_BORE_H_STUBS_DEFINED
 							  #define _LINUX_SCHED_BORE_H_STUBS_DEFINED
@@ -781,7 +822,7 @@ int sched_bore_update_handler(const struct ctl_table *table, int write,
 							  void update_burst_penalty(struct sched_entity *se) { }
 							  void restart_burst(struct sched_entity *se) { }
 							  void restart_burst_rescale_deadline(struct sched_entity *se) { }
-							  void sched_clone_bore(struct task_struct *p, struct task_struct *parent, u64 clone_flags, u64 now) { }
+							  void sched_clone_bore(struct task_struct *p, struct task_struct *parent_task, u64 clone_flags, u64 now) { }
 							  void reset_task_bore(struct task_struct *p) { }
 							  #endif // _LINUX_SCHED_BORE_H_STUBS_DEFINED
 
