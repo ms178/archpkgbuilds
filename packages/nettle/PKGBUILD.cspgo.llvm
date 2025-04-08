@@ -1,0 +1,238 @@
+pkgname=nettle
+_pkgver=3.10.1
+pkgver=$_pkgver
+# Increment pkgrel for build process change
+pkgrel=4.2
+pkgdesc="A low-level cryptographic library (PGO+CS-PGO optimized)" # Updated description
+arch=('x86_64')
+url="https://www.lysator.liu.se/~nisse/nettle"
+license=('GPL2')
+depends=('glibc' 'gmp')
+# Ensure needed tools are present
+makedepends=('clang' 'llvm' 'autoconf' 'automake') # Added autoconf/automake for autoreconf
+provides=('nettle' 'libhogweed.so' 'libnettle.so')
+conflicts=('nettle')
+checkdepends=('valgrind')
+options=(!strip) # Keep !strip for PGO/debugging symbols
+source=(https://ftp.gnu.org/gnu/$pkgname/$pkgname-$_pkgver.tar.gz{,.sig})
+sha256sums=('ccfeff981b0ca71bbd6fbcb054f407c60ffb644389a5be80d6716d5b550c6ce3'
+            'SKIP')
+validpgpkeys=('343C2FF0FBEE5EC2EDBEF399F3599FF828C67298') # Niels Möller
+
+prepare() {
+  cd $pkgname-$_pkgver
+  # Run autoreconf to ensure configure script is up-to-date
+  autoreconf -vfi
+}
+
+build() {
+  cd $pkgname-$_pkgver
+
+  # --- Setup ---
+  # Use system clang/llvm toolchain
+  export CC="clang"
+  export CXX="clang++"
+  export LD="lld"
+
+  # Save original flags from makepkg.conf
+  local _original_cflags="$CFLAGS"
+  local _original_cxxflags="$CXXFLAGS"
+  local _original_ldflags="$LDFLAGS"
+
+  # Define profile directories
+  local PGO_DATA_DIR="${srcdir}/pgo_data"
+  local CS_PGO_DATA_DIR="${srcdir}/cspgo_data"
+  mkdir -p "$PGO_DATA_DIR" "$CS_PGO_DATA_DIR"
+
+  # Ensure cleanup on exit
+  trap 'rm -rf "$PGO_DATA_DIR" "$CS_PGO_DATA_DIR"' EXIT
+
+  # Common configure options for nettle
+  local _configure_opts=(
+    --prefix="/usr"
+    --disable-documentation
+    --enable-x86-aesni
+    --enable-x86-sha-ni
+    --enable-x86-pclmul
+  )
+  # Flag to track if any PGO stage fails, to skip subsequent ones
+  local pgo_failed=false
+  # --- End Setup ---
+
+  # --- Stage 1: PGO Instrumentation Build ---
+  msg "Stage 1: Building PGO instrumented build..."
+  export CFLAGS="$_original_cflags"
+  export CXXFLAGS="$_original_cxxflags"
+  export LDFLAGS="$_original_ldflags"
+  # Add flags for PGO instrumentation and debug info helpful for profiling
+  # Keep -g3 and -fno-omit-frame-pointer for potentially better profiling data
+  local _pgo_instr_flags="-fprofile-generate=$PGO_DATA_DIR -g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=150 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling"
+  export CFLAGS+=" $_pgo_instr_flags"
+  export CXXFLAGS+=" $_pgo_instr_flags" # Apply to CXX just in case
+  export LDFLAGS+=" $_pgo_instr_flags"
+
+  # Ensure a clean state before configuring
+  # 'make distclean' might remove configure, so run it carefully or just 'make clean'
+  # Since autoreconf is in prepare(), running it again here isn't ideal.
+  # Let's try without clean first, configure might handle it. If issues arise, add 'make clean'.
+  # make clean # Optional: Uncomment if needed
+
+  ./configure "${_configure_opts[@]}" || { error "Configure failed (Stage 1)"; return 1; }
+  make -j$(nproc) || { error "Make failed (Stage 1)"; return 1; }
+
+  # --- Stage 1: PGO Training Run ---
+  msg "Stage 1: Running PGO training..."
+  # Set where the profile data should be written
+  export LLVM_PROFILE_FILE="${PGO_DATA_DIR}/nettle-%p_%m.profraw"
+  # Run the test suite multiple times to get better coverage
+  local training_success=true
+  for i in {1..3}; do
+    msg2 "Training run $i..."
+    # Use -k to continue after errors, but capture overall success/failure
+    if ! make -k check; then
+      warning "Note: Some tests failed during PGO training (run $i)"
+      training_success=false # Mark if any run had failures, though we still proceed
+    fi
+  done
+  # Unset profile file variable after use
+  unset LLVM_PROFILE_FILE
+
+  # --- Stage 1: Merge PGO Profiles ---
+  msg "Stage 1: Merging PGO profiles..."
+  # Check if any raw files were actually created
+  find "$PGO_DATA_DIR" -name '*.profraw' -print -quit | grep -q .
+  if [ $? -ne 0 ]; then
+      error "No raw PGO profile data (*.profraw) generated. Aborting."
+      return 1
+  fi
+  # Merge profiles
+  if ! llvm-profdata merge -output="${PGO_DATA_DIR}/default.profdata" "${PGO_DATA_DIR}"/*.profraw; then
+       error "llvm-profdata merge failed (Stage 1). Aborting."
+       return 1
+  fi
+  # Verify merged profile exists and has size
+  if [ ! -s "${PGO_DATA_DIR}/default.profdata" ]; then
+       error "Merged PGO profile data is empty or missing (Stage 1). Aborting."
+       return 1
+  fi
+  # Clean up raw files
+  rm -f "${PGO_DATA_DIR}"/*.profraw
+  # --- End Stage 1 ---
+
+
+  # --- Stage 2: CS-PGO Instrumentation Build ---
+  msg "Stage 2: Building CS-PGO instrumented build..."
+  # Clean previous build artifacts thoroughly before reconfiguring
+  make distclean || { warning "make distclean failed, attempting configure anyway..."; }
+  # Rerun autoreconf if distclean removed configure
+  # autoreconf -vfi # Usually needed after distclean
+
+  export CFLAGS="$_original_cflags"
+  export CXXFLAGS="$_original_cxxflags"
+  export LDFLAGS="$_original_ldflags"
+  # Use PGO data from Stage 1, enable CS profile generation
+  local _cspgo_instr_flags="-fprofile-use=${PGO_DATA_DIR}/default.profdata -fcs-profile-generate=$CS_PGO_DATA_DIR -g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=150 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling"
+  export CFLAGS+=" $_cspgo_instr_flags"
+  export CXXFLAGS+=" $_cspgo_instr_flags"
+  export LDFLAGS+=" $_cspgo_instr_flags"
+
+  # Configure and build again
+  ./configure "${_configure_opts[@]}" || { error "Configure failed (Stage 2)"; return 1; }
+  make -j$(nproc) || { error "Make failed (Stage 2)"; return 1; }
+
+  # --- Stage 2: CS-PGO Training Run ---
+  msg "Stage 2: Running CS-PGO training..."
+  # Set where the new context-sensitive profile data should be written
+  export LLVM_PROFILE_FILE="${CS_PGO_DATA_DIR}/nettle-cs-%p_%m.profraw"
+  training_success=true # Reset success tracker for this stage
+  for i in {1..3}; do
+    msg2 "CS Training run $i..."
+    if ! make -k check; then
+      warning "Note: Some tests failed during CS-PGO training (run $i)"
+      training_success=false
+    fi
+  done
+  unset LLVM_PROFILE_FILE
+
+  # --- Stage 2: Merge CS-PGO Profiles ---
+  msg "Stage 2: Merging CS-PGO profiles..."
+  # Check if any CS raw files were created
+  find "$CS_PGO_DATA_DIR" -name '*.profraw' -print -quit | grep -q .
+  if [ $? -ne 0 ]; then
+      warning "No raw CS-PGO profile data (*.profraw) generated. Final build will use only Stage 1 PGO data."
+      # Copy Stage 1 data as the final profile in this case
+      cp "${PGO_DATA_DIR}/default.profdata" "${CS_PGO_DATA_DIR}/cs.profdata" || { error "Failed to copy fallback profile data."; return 1; }
+  else
+    # Merge CS raw files *and* the default profile from stage 1
+    if ! llvm-profdata merge -output="${CS_PGO_DATA_DIR}/cs.profdata" "${CS_PGO_DATA_DIR}"/*.profraw "${PGO_DATA_DIR}/default.profdata"; then
+        error "llvm-profdata merge failed (Stage 2). Aborting."
+        return 1
+    fi
+    # Clean up CS raw files
+    rm -f "${CS_PGO_DATA_DIR}"/*.profraw
+  fi
+  # Verify final merged profile exists and has size
+  if [ ! -s "${CS_PGO_DATA_DIR}/cs.profdata" ]; then
+      error "Final merged CS-PGO profile data is empty or missing (Stage 2). Aborting."
+      return 1
+  fi
+  # --- End Stage 2 ---
+
+
+  # --- Stage 3: Final Optimized Build ---
+  msg "Stage 3: Building final CS-PGO optimized build..."
+  # Clean previous build artifacts thoroughly
+  make distclean || { warning "make distclean failed, attempting configure anyway..."; }
+  # Rerun autoreconf if distclean removed configure
+  # autoreconf -vfi
+
+  export CFLAGS="$_original_cflags"
+  export CXXFLAGS="$_original_cxxflags"
+  export LDFLAGS="$_original_ldflags"
+  # Use the final merged CS-PGO profile data
+  # DO NOT include -fcs-profile-generate here
+  local _final_opt_flags="-fprofile-use=${CS_PGO_DATA_DIR}/cs.profdata"
+  export CFLAGS+=" $_final_opt_flags"
+  export CXXFLAGS+=" $_final_opt_flags"
+  # Keep --emit-relocs potentially for debug/future use, PGO flags for LDFLAGS
+  export LDFLAGS+=" $_final_opt_flags"
+
+  # Configure and build the final optimized version
+  ./configure "${_configure_opts[@]}" || { error "Configure failed (Stage 3)"; return 1; }
+  make -j$(nproc) || { error "Make failed (Stage 3)"; return 1; }
+  # --- End Stage 3 ---
+
+  msg "CS-PGO build process completed successfully."
+}
+
+check() {
+  cd "$pkgname-$_pkgver"
+  msg "Running final checks on optimized build..."
+  # Run 'make check' against the final optimized build artifact
+  # Use -k to see all failures if any occur
+  make -k check || error "Final 'make check' failed. Review test output."
+}
+
+package() {
+  cd "$pkgname-$_pkgver"
+  msg "Installing package..."
+  # Install from the final build state
+  make DESTDIR="$pkgdir/" install || error "make install failed"
+
+  # Use llvm-strip with error handling, respecting !strip
+  if [[ ! " ${options[@]} " =~ " !strip " ]]; then
+    msg "Stripping binaries..."
+    find "$pkgdir" -type f -print0 | while IFS= read -r -d '' file; do
+        # Check if file is ELF executable or shared object using 'file' command
+        if file -b --mime-type "$file" | grep -qE 'application/(x-executable|x-sharedlib)'; then
+            msg2 "Stripping: $file"
+            # Use --strip-unneeded which is generally safer than --strip-all for libraries
+            if ! llvm-strip --strip-unneeded "$file" 2>/dev/null; then
+                 warning "llvm-strip --strip-unneeded failed on $file"
+            fi
+        fi
+    done
+  else
+      msg "Skipping stripping due to !strip option."
+  fi
+}
