@@ -7449,726 +7449,6 @@
 +        RET
  SYM_CODE_END(__get_user_handle_exception)
 
-
---- a/arch/x86/include/asm/uaccess_64.h	2025-03-18 00:20:02.510926979 +0100
-+++ b/arch/x86/include/asm/uaccess_64.h	2025-03-26 20:59:09.466972579 +0100
-@@ -4,15 +4,18 @@
- 
- /*
-  * User space memory access functions
-+ * Optimized for Intel Raptor Lake (AVX2)
-  */
- #include <linux/compiler.h>
- #include <linux/lockdep.h>
- #include <linux/kasan-checks.h>
-+#include <linux/jump_label.h>
- #include <asm/alternative.h>
- #include <asm/cpufeatures.h>
- #include <asm/page.h>
- #include <asm/percpu.h>
- #include <asm/runtime-const.h>
-+#include <linux/prefetch.h>
- 
- /*
-  * Virtual variable: there's no actual backing store for this,
-@@ -20,151 +23,499 @@
-  */
- extern unsigned long USER_PTR_MAX;
- 
-+/* Set all feature flags to FALSE by default */
-+static DEFINE_STATIC_KEY_FALSE(fsrm_enabled_key);
-+static DEFINE_STATIC_KEY_FALSE(fsrs_enabled_key);
-+static DEFINE_STATIC_KEY_FALSE(avx2_enabled_key);
-+static DEFINE_STATIC_KEY_TRUE(user_ptr_max_fixed_key);
-+static DEFINE_STATIC_KEY_FALSE(lam_enabled_key);
-+static DEFINE_STATIC_KEY_FALSE(features_initialized_key);
-+
-+static inline void init_lam_feature(void)
-+{
-+	if (cpu_feature_enabled(X86_FEATURE_LAM))
-+		static_branch_enable(&lam_enabled_key);
-+}
-+
-+static inline void init_fsrm_feature(void)
-+{
-+	if (cpu_feature_enabled(X86_FEATURE_FSRM))
-+		static_branch_enable(&fsrm_enabled_key);
-+}
-+
-+static inline void init_fsrs_feature(void)
-+{
-+	if (cpu_feature_enabled(X86_FEATURE_FSRS))
-+		static_branch_enable(&fsrs_enabled_key);
-+}
-+
-+static inline void init_avx2_feature(void)
-+{
-+	if (cpu_feature_enabled(X86_FEATURE_AVX2))
-+		static_branch_enable(&avx2_enabled_key);
-+}
-+
-+static inline void init_user_ptr_max(void)
-+{
-+	if (runtime_const_ptr(USER_PTR_MAX) != 0x00007fffffffffffUL)
-+		static_branch_disable(&user_ptr_max_fixed_key);
-+}
-+
-+static inline void mark_uaccess_features_initialized(void)
-+{
-+	/* Ensure full memory barrier before enabling features */
-+	smp_mb();
-+	static_branch_enable(&features_initialized_key);
-+}
-+
-+/* Read features with memory barrier for consistency */
-+static inline bool are_uaccess_features_initialized(void)
-+{
-+	bool initialized = static_branch_likely(&features_initialized_key);
-+	/* Ensure memory barrier when checking feature initialization */
-+	if (initialized)
-+		smp_rmb();
-+	return initialized;
-+}
-+
- #ifdef CONFIG_ADDRESS_MASKING
- /*
-  * Mask out tag bits from the address.
-  */
- static inline unsigned long __untagged_addr(unsigned long addr)
- {
--	asm_inline (ALTERNATIVE("", "and " __percpu_arg([mask]) ", %[addr]",
--				X86_FEATURE_LAM)
--	     : [addr] "+r" (addr)
--	     : [mask] "m" (__my_cpu_var(tlbstate_untag_mask)));
--
--	return addr;
-+	unsigned long mask;
-+	/* Only use LAM if features are initialized */
-+	if (are_uaccess_features_initialized() &&
-+		static_branch_likely(&lam_enabled_key)) {
-+		asm_inline (
-+			"movq " __percpu_arg([mask]) ", %[mask]\n\t"
-+			"and %[mask], %[addr]"
-+			: [addr] "+r" (addr), [mask] "=r" (mask)
-+			: [mask] "m" (__my_cpu_var(tlbstate_untag_mask)));
-+		}
-+		return addr;
- }
- 
--#define untagged_addr(addr)	({					\
--	unsigned long __addr = (__force unsigned long)(addr);		\
--	(__force __typeof__(addr))__untagged_addr(__addr);		\
-+#define untagged_addr(addr)     ({                                      \
-+unsigned long __addr = (__force unsigned long)(addr);           \
-+(__force __typeof__(addr))__untagged_addr(__addr);              \
- })
- 
- static inline unsigned long __untagged_addr_remote(struct mm_struct *mm,
--						   unsigned long addr)
-+												   unsigned long addr)
- {
- 	mmap_assert_locked(mm);
- 	return addr & (mm)->context.untag_mask;
- }
- 
--#define untagged_addr_remote(mm, addr)	({				\
--	unsigned long __addr = (__force unsigned long)(addr);		\
--	(__force __typeof__(addr))__untagged_addr_remote(mm, __addr);	\
-+#define untagged_addr_remote(mm, addr)  ({                              \
-+unsigned long __addr = (__force unsigned long)(addr);           \
-+(__force __typeof__(addr))__untagged_addr_remote(mm, __addr);   \
- })
- 
- #endif
- 
--#define valid_user_address(x) \
--	((__force unsigned long)(x) <= runtime_const_ptr(USER_PTR_MAX))
--
--/*
-- * Masking the user address is an alternative to a conditional
-- * user_access_begin that can avoid the fencing. This only works
-- * for dense accesses starting at the address.
-- */
--static inline void __user *mask_user_address(const void __user *ptr)
--{
--	unsigned long mask;
--	asm("cmp %1,%0\n\t"
--	    "sbb %0,%0"
--		:"=r" (mask)
--		:"r" (ptr),
--		 "0" (runtime_const_ptr(USER_PTR_MAX)));
--	return (__force void __user *)(mask | (__force unsigned long)ptr);
--}
--#define masked_user_access_begin(x) ({				\
--	__auto_type __masked_ptr = (x);				\
--	__masked_ptr = mask_user_address(__masked_ptr);		\
--	__uaccess_begin(); __masked_ptr; })
-+#define valid_user_address(x) ({                                \
-+unsigned long __addr = (__force unsigned long)(x);          \
-+unsigned long __max;                                        \
-+unsigned long __valid;                                      \
-+if (static_branch_likely(&user_ptr_max_fixed_key)) {        \
-+	__max = 0x00007fffffffffffUL;                           \
-+} else {                                                    \
-+	__max = runtime_const_ptr(USER_PTR_MAX);                \
-+}                                                           \
-+asm_inline ("cmpq %1, %2\n\t"                               \
-+"setbe %b0"                                     \
-+: "=q" (__valid)                                \
-+: "r" (__max), "r" (__addr));                   \
-+__valid;                                                    \
-+})
- 
- /*
-- * User pointers can have tag bits on x86-64.  This scheme tolerates
-+ * User pointers can have tag bits on x86-64. This scheme tolerates
-  * arbitrary values in those bits rather then masking them off.
-  *
-  * Enforce two rules:
-  * 1. 'ptr' must be in the user part of the address space
-  * 2. 'ptr+size' must not overflow into kernel addresses
-- *
-- * Note that we always have at least one guard page between the
-- * max user address and the non-canonical gap, allowing us to
-- * ignore small sizes entirely.
-- *
-- * In fact, we could probably remove the size check entirely, since
-- * any kernel accesses will be in increasing address order starting
-- * at 'ptr'.
-- *
-- * That's a separate optimization, for now just handle the small
-- * constant case.
-  */
- static inline bool __access_ok(const void __user *ptr, unsigned long size)
- {
-+	if (unlikely(size == 0))
-+		return true;
-+
- 	if (__builtin_constant_p(size <= PAGE_SIZE) && size <= PAGE_SIZE) {
- 		return valid_user_address(ptr);
- 	} else {
--		unsigned long sum = size + (__force unsigned long)ptr;
--
--		return valid_user_address(sum) && sum >= (__force unsigned long)ptr;
-+		unsigned long addr = (__force unsigned long)ptr;
-+		unsigned long sum = addr + size;
-+		unsigned long max = runtime_const_ptr(USER_PTR_MAX);
-+		bool valid;
-+		asm_inline (
-+			"cmpq %2, %1\n\t" /* Compare sum with max */
-+			"setbe %b0\n\t"   /* Set valid if sum <= max */
-+			"cmpq %1, %3\n\t" /* Compare sum with addr */
-+			"andb $1, %b0"    /* AND with valid if sum >= addr */
-+			: "=q" (valid)
-+			: "r" (sum), "r" (max), "r" (addr));
-+		return valid;
- 	}
- }
- #define __access_ok __access_ok
- 
--/*
-- * Copy To/From Userspace
-- */
-+static inline void __user *mask_user_address(const void __user *ptr)
-+{
-+	void __user *ret;
-+	asm("cmp %1,%0\n\t"
-+	"cmova %1,%0"
-+	:"=r" (ret)
-+	:"r" (runtime_const_ptr(USER_PTR_MAX)),
-+		"0" (ptr));
-+	return ret;
-+}
-+#define masked_user_access_begin(x) ({                          \
-+__auto_type __masked_ptr = (x);                         \
-+__masked_ptr = mask_user_address(__masked_ptr);         \
-+__uaccess_begin(); __masked_ptr; })
- 
--/* Handles exceptions in both to and from, but doesn't do access_ok */
--__must_check unsigned long
--rep_movs_alternative(void *to, const void *from, unsigned len);
-+/* Helper function for small, constant-size transfers */
-+static __always_inline __must_check unsigned long
-+__copy_user_inline(void *to, const void *from, unsigned long len)
-+{
-+	/* Small, constant-size transfer: use inline moves */
-+	kasan_check_write(to, len);
-+	kasan_check_read(from, len);
-+
-+	switch (len) {
-+		case 0: return 0;
-+		case 1: *(char *)to = *(char *)from; return 0;
-+		case 2: *(short *)to = *(short *)from; return 0;
-+		case 4: *(int *)to = *(int *)from; return 0;
-+		case 8: *(long *)to = *(long *)from; return 0;
-+		case 16: {
-+			/* Optimized 16-byte copy using XMM register */
-+			asm volatile(
-+				"movups (%1), %%xmm0\n\t"
-+				"movups %%xmm0, (%0)\n\t"
-+				:
-+				: "r" (to), "r" (from)
-+				: "memory", "xmm0");
-+			return 0;
-+		}
-+		default:
-+			return len; /* Fall back to caller for non-constant size */
-+	}
-+}
- 
-+/* Adaptive prefetch for user-to-kernel copies based on transfer size */
-+static inline void user_access_prefetch(const void *addr, unsigned long len)
-+{
-+	/* Only prefetch if we have a significant amount of data */
-+	if (len < 256)
-+		return;
-+
-+	unsigned long prefetch_distance;
-+	unsigned long prefetch_step;
-+
-+	if (len >= 8192) {
-+		/* For very large transfers, use aggressive prefetching */
-+		prefetch_distance = 512;
-+		prefetch_step = 128;
-+	} else if (len >= 1024) {
-+		/* For medium transfers */
-+		prefetch_distance = 256;
-+		prefetch_step = 64;
-+	} else {
-+		/* For smaller transfers */
-+		prefetch_distance = 128;
-+		prefetch_step = 64;
-+	}
-+
-+	/* Prefetch with temporal locality for normal copies */
-+	unsigned long i;
-+	for (i = 0; i < len && i < prefetch_distance; i += prefetch_step) {
-+		asm volatile("prefetcht0 %0" : : "m" (*(const char *)(addr + i)));
-+	}
-+}
-+
-+/* Handle early returns for zero-length operations */
- static __always_inline __must_check unsigned long
- copy_user_generic(void *to, const void *from, unsigned long len)
- {
-+	/* Early return for zero-length copy */
-+	if (unlikely(len == 0))
-+		return 0;
-+
-+	unsigned long orig_len = len;
-+	unsigned long bytes_copied = 0;
-+	char *current_dst = to;
-+	const char *current_src = from;
-+
-+	/* Validate with KASAN for kernel side */
-+	kasan_check_write(to, len);
-+	kasan_check_read(from, len);
-+
-+	/* For constant small sizes, try to handle without UACCESS state changes */
-+	if (__builtin_constant_p(len) && len <= 16) {
-+		unsigned long inline_ret = __copy_user_inline(to, from, len);
-+		if (inline_ret == 0)
-+			return 0;
-+	}
-+
- 	stac();
--	/*
--	 * If CPU has FSRM feature, use 'rep movs'.
--	 * Otherwise, use rep_movs_alternative.
--	 */
--	asm volatile(
--		"1:\n\t"
--		ALTERNATIVE("rep movsb",
--			    "call rep_movs_alternative", ALT_NOT(X86_FEATURE_FSRM))
--		"2:\n"
--		_ASM_EXTABLE_UA(1b, 2b)
--		:"+c" (len), "+D" (to), "+S" (from), ASM_CALL_CONSTRAINT
--		: : "memory", "rax");
--	clac();
--	return len;
-+
-+	/* Only use optimized path if features are initialized */
-+	if (are_uaccess_features_initialized() &&
-+		static_branch_likely(&fsrm_enabled_key)) {
-+
-+		if (__builtin_constant_p(len) && len <= 16) {
-+			/* Already tried inline above, use rep movsb with exception handling */
-+			unsigned long rem = len;
-+			asm volatile(
-+				"1:\n\t"
-+				"rep movsb\n\t"
-+				"2:\n\t"
-+				_ASM_EXTABLE_UA(1b, 2b)
-+				: "+c" (rem), "+D" (current_dst), "+S" (current_src)
-+				: : "memory");
-+			bytes_copied = len - rem;
-+		} else if (len <= 16) {
-+			/* Small transfer with exception handling */
-+			unsigned long rem = len;
-+			asm volatile(
-+				"1:\n\t"
-+				"rep movsb\n\t"
-+				"2:\n\t"
-+				_ASM_EXTABLE_UA(1b, 2b)
-+				: "+c" (rem), "+D" (current_dst), "+S" (current_src)
-+				: : "memory");
-+			bytes_copied = len - rem;
-+		} else if (len >= 4096) {
-+			/* Large transfer with prefetching and exception handling */
-+			user_access_prefetch(current_src, len);
-+
-+			if (len >= 64 && !((unsigned long)current_dst & 7) && !((unsigned long)current_src & 7)) {
-+				/* Aligned large transfer: use rep movsq + remainder */
-+				unsigned long qwords = len >> 3;
-+				unsigned long remainder = len & 7;
-+				unsigned long orig_qwords = qwords;
-+
-+				asm volatile(
-+					"1:\n\t"
-+					"rep movsq\n\t"
-+					"2:\n\t"
-+					_ASM_EXTABLE_UA(1b, 2b)
-+					: "+c" (qwords), "+D" (current_dst), "+S" (current_src)
-+					: : "memory");
-+
-+				/* Calculate bytes moved */
-+				unsigned long qword_bytes = (orig_qwords - qwords) << 3;
-+				bytes_copied = qword_bytes;
-+
-+				/* Only process remainder if all qwords were copied */
-+				if (likely(qwords == 0) && remainder > 0) {
-+					/* Handle remainder bytes with exception handling */
-+					unsigned long rem = remainder;
-+					asm volatile(
-+						"1:\n\t"
-+						"rep movsb\n\t"
-+						"2:\n\t"
-+						_ASM_EXTABLE_UA(1b, 2b)
-+						: "+c" (rem), "+D" (current_dst), "+S" (current_src)
-+						: : "memory");
-+					bytes_copied += (remainder - rem);
-+				}
-+			} else {
-+				/* Unaligned large transfer: use rep movsb with exception handling */
-+				unsigned long rem = len;
-+				asm volatile(
-+					"1:\n\t"
-+					"rep movsb\n\t"
-+					"2:\n\t"
-+					_ASM_EXTABLE_UA(1b, 2b)
-+					: "+c" (rem), "+D" (current_dst), "+S" (current_src)
-+					: : "memory");
-+				bytes_copied = len - rem;
-+			}
-+		} else if (len >= 64 && !((unsigned long)current_dst & 7) && !((unsigned long)current_src & 7)) {
-+			/* Aligned medium transfer: use rep movsq with exception handling */
-+			unsigned long qwords = len >> 3;
-+			unsigned long remainder = len & 7;
-+			unsigned long orig_qwords = qwords;
-+
-+			asm volatile(
-+				"1:\n\t"
-+				"rep movsq\n\t"
-+				"2:\n\t"
-+				_ASM_EXTABLE_UA(1b, 2b)
-+				: "+c" (qwords), "+D" (current_dst), "+S" (current_src)
-+				: : "memory");
-+
-+			/* Calculate bytes moved */
-+			unsigned long qword_bytes = (orig_qwords - qwords) << 3;
-+			bytes_copied = qword_bytes;
-+
-+			/* Only process remainder if all qwords were copied */
-+			if (likely(qwords == 0) && remainder > 0) {
-+				/* Handle remainder with exception handling */
-+				unsigned long rem = remainder;
-+				asm volatile(
-+					"1:\n\t"
-+					"rep movsb\n\t"
-+					"2:\n\t"
-+					_ASM_EXTABLE_UA(1b, 2b)
-+					: "+c" (rem), "+D" (current_dst), "+S" (current_src)
-+					: : "memory");
-+				bytes_copied += (remainder - rem);
-+			}
-+		} else {
-+			/* Unaligned medium transfer: use rep movsb with exception handling */
-+			unsigned long rem = len;
-+			asm volatile(
-+				"1:\n\t"
-+				"rep movsb\n\t"
-+				"2:\n\t"
-+				_ASM_EXTABLE_UA(1b, 2b)
-+				: "+c" (rem), "+D" (current_dst), "+S" (current_src)
-+				: : "memory");
-+			bytes_copied = len - rem;
-+		}
-+		} else {
-+			/* Non-FSRM fallback */
-+			unsigned long ret = len;
-+			asm volatile(
-+				"1:\n\t"
-+				"call rep_movs_alternative\n\t"
-+				"2:\n"
-+				_ASM_EXTABLE_UA(1b, 2b)
-+				: "+c" (ret), "+D" (current_dst), "+S" (current_src), ASM_CALL_CONSTRAINT
-+				: : "memory", "rax", "rdx", "r8");
-+			bytes_copied = orig_len - ret;
-+		}
-+
-+		clac();
-+		return orig_len - bytes_copied; /* Return bytes not copied */
- }
- 
- static __always_inline __must_check unsigned long
- raw_copy_from_user(void *dst, const void __user *src, unsigned long size)
- {
-+	if (unlikely(!__access_ok(src, size)))
-+		return size;
- 	return copy_user_generic(dst, (__force void *)src, size);
- }
- 
- static __always_inline __must_check unsigned long
- raw_copy_to_user(void __user *dst, const void *src, unsigned long size)
- {
-+	if (unlikely(!__access_ok(dst, size)))
-+		return size;
- 	return copy_user_generic((__force void *)dst, src, size);
- }
- 
- extern long __copy_user_nocache(void *dst, const void __user *src, unsigned size);
- extern long __copy_user_flushcache(void *dst, const void __user *src, unsigned size);
- 
-+/* Optimized non-temporal copy with AVX2 */
- static inline int
- __copy_from_user_inatomic_nocache(void *dst, const void __user *src,
--				  unsigned size)
-+								  unsigned size)
- {
--	long ret;
-+	/* Early return for zero-length copy */
-+	if (unlikely(size == 0))
-+		return 0;
-+
-+	/* Validate the user pointer */
-+	if (unlikely(!__access_ok(src, size)))
-+		return size;
-+
-+	unsigned long bytes_copied = 0;
- 	kasan_check_write(dst, size);
-+
-+	/* Only use AVX2 if features are initialized and conditions are right */
-+	if (are_uaccess_features_initialized() &&
-+		static_branch_likely(&avx2_enabled_key) &&
-+		size >= 32 &&
-+		!((unsigned long)src & 31) &&
-+		!((unsigned long)dst & 31)) {
-+
-+		/* Aligned, large transfer: use AVX2 */
-+		unsigned long vector_chunks = size >> 5; /* 32-byte chunks */
-+		unsigned long remainder = size & 31;
-+
- 	stac();
--	ret = __copy_user_nocache(dst, src, size);
-+
-+	if (vector_chunks) {
-+		/* Use AVX2 for 32-byte chunks */
-+		unsigned long avx_chunks_left = vector_chunks;
-+		char *avx_dst = (char *)dst;
-+		const char __user *avx_src = src;
-+
-+		asm volatile(
-+			"1:\n\t"
-+			"vmovdqa (%1), %%ymm0\n\t"      /* Load 32 bytes from src */
-+			"vmovntdq %%ymm0, (%0)\n\t"     /* Non-temporal store to dst */
-+			"add $32, %0\n\t"
-+			"add $32, %1\n\t"
-+			"dec %2\n\t"
-+			"jnz 1b\n\t"
-+			"2:\n\t"
-+			_ASM_EXTABLE_UA(1b, 2b)
-+			: "+r" (avx_dst), "+r" (avx_src), "+r" (avx_chunks_left)
-+			: : "memory", "ymm0");
-+
-+		/* Clean up AVX state */
-+		asm volatile("vzeroupper" ::: "memory");
-+
-+		/* Calculate bytes copied with AVX2 */
-+		bytes_copied = (vector_chunks - avx_chunks_left) << 5;
-+
-+		/* If all chunks were processed and we have remainder */
-+		if (likely(avx_chunks_left == 0) && remainder > 0) {
-+			/* Recalculate correct pointers for remainder handling */
-+			void *rem_dst = (char *)dst + bytes_copied;
-+			const void __user *rem_src = (const char __user *)src + bytes_copied;
-+
-+			/* Handle remainder */
-+			clac();  /* Disable user access before calling function */
-+			long ret = __copy_user_nocache(rem_dst, rem_src, remainder);
-+
-+			if (ret == 0) {
-+				/* All remainder bytes copied */
-+				bytes_copied += remainder;
-+			} else {
-+				/* Some remainder bytes not copied */
-+				bytes_copied += remainder - ret;
-+			}
-+			return size - bytes_copied;
-+		}
-+	} else if (remainder) {
-+		/* No full 32-byte chunks, just handle remainder */
-+		clac();
-+		long ret = __copy_user_nocache(dst, src, remainder);
-+
-+		if (ret == 0) {
-+			bytes_copied = remainder;
-+		} else {
-+			bytes_copied = remainder - ret;
-+		}
-+		return size - bytes_copied;
-+	}
-+
- 	clac();
--	return ret;
-+	return size - bytes_copied;
-+		} else {
-+			/* Non-AVX2 path - straight to __copy_user_nocache */
-+			return __copy_user_nocache(dst, src, size);
-+		}
- }
- 
- static inline int
- __copy_from_user_flushcache(void *dst, const void __user *src, unsigned size)
- {
-+	if (unlikely(!__access_ok(src, size)))
-+		return size;
- 	kasan_check_write(dst, size);
- 	return __copy_user_flushcache(dst, src, size);
- }
-@@ -176,33 +527,103 @@ __copy_from_user_flushcache(void *dst, c
- __must_check unsigned long
- rep_stos_alternative(void __user *addr, unsigned long len);
- 
--static __always_inline __must_check unsigned long __clear_user(void __user *addr, unsigned long size)
-+/* Fixed __clear_user function */
-+static __always_inline __must_check unsigned long
-+__clear_user(void __user *addr, unsigned long size)
- {
-+	/* Early return for zero-length clear */
-+	if (unlikely(size == 0))
-+		return 0;
-+
-+	unsigned long orig_size = size;
-+	unsigned long bytes_cleared = 0;
-+	void __user *current_addr = addr;
-+
- 	might_fault();
- 	stac();
- 
--	/*
--	 * No memory constraint because it doesn't change any memory gcc
--	 * knows about.
--	 */
--	asm volatile(
--		"1:\n\t"
--		ALTERNATIVE("rep stosb",
--			    "call rep_stos_alternative", ALT_NOT(X86_FEATURE_FSRS))
--		"2:\n"
--	       _ASM_EXTABLE_UA(1b, 2b)
--	       : "+c" (size), "+D" (addr), ASM_CALL_CONSTRAINT
--	       : "a" (0));
-+	/* Only use optimized path if features are initialized */
-+	if (are_uaccess_features_initialized() &&
-+		static_branch_likely(&fsrs_enabled_key) &&
-+		size >= 64 &&
-+		!((unsigned long)addr & 7)) {
-+
-+		/* Aligned, large clear: use rep stosq */
-+		unsigned long qwords = size >> 3;
-+	unsigned long remainder = size & 7;
-+
-+	if (likely(qwords > 0)) {
-+		/* Clear qwords first */
-+		unsigned long qwords_left = qwords;
-+
-+		asm volatile(
-+			"1:\n\t"
-+			"rep stosq\n\t"
-+			"2:\n\t"
-+			_ASM_EXTABLE_UA(1b, 2b)
-+			: "+c" (qwords_left), "+D" (current_addr)
-+			: "a" (0)
-+			: "memory");
-+
-+		/* Calculate bytes cleared */
-+		unsigned long qword_bytes = (qwords - qwords_left) << 3;
-+		bytes_cleared = qword_bytes;
-+
-+		/* Only process remainder if all qwords were cleared */
-+		if (likely(qwords_left == 0) && remainder > 0) {
-+			/* Clear remainder bytes */
-+			unsigned long rem = remainder;
-+			asm volatile(
-+				"1:\n\t"
-+				"rep stosb\n\t"
-+				"2:\n\t"
-+				_ASM_EXTABLE_UA(1b, 2b)
-+				: "+c" (rem), "+D" (current_addr)
-+				: "a" (0)
-+				: "memory");
- 
--	clac();
-+			bytes_cleared += (remainder - rem);
-+		}
-+	} else {
-+		/* No qwords, just clear bytes */
-+		unsigned long rem = size;
-+		asm volatile(
-+			"1:\n\t"
-+			"rep stosb\n\t"
-+			"2:\n\t"
-+			_ASM_EXTABLE_UA(1b, 2b)
-+			: "+c" (rem), "+D" (current_addr)
-+			: "a" (0)
-+			: "memory");
-+
-+		bytes_cleared = size - rem;
-+	}
-+		} else {
-+			/* Unaligned or small clear: use rep_stos_alternative */
-+			unsigned long rem = size;
-+
-+			asm volatile(
-+				"1:\n\t"
-+				"call rep_stos_alternative\n\t"
-+				"2:\n"
-+				_ASM_EXTABLE_UA(1b, 2b)
-+				: "+c" (rem), "+D" (current_addr), ASM_CALL_CONSTRAINT
-+				: "a" (0)
-+				: "memory");
-+
-+			bytes_cleared = size - rem;
-+		}
-+
-+		clac();
- 
--	return size;
-+		/* Return number of bytes not cleared */
-+		return orig_size - bytes_cleared;
- }
- 
- static __always_inline unsigned long clear_user(void __user *to, unsigned long n)
- {
--	if (__access_ok(to, n))
--		return __clear_user(to, n);
--	return n;
-+	if (unlikely(!__access_ok(to, n)))
-+		return n;
-+	return __clear_user(to, n);
- }
- #endif /* _ASM_X86_UACCESS_64_H */
-
-
 --- a/arch/x86/include/asm/atomic.h	2025-03-17 23:15:50.374342755 +0100
 +++ b/arch/x86/include/asm/atomic.h	2025-03-17 23:33:21.311978298 +0100
 @@ -4,6 +4,7 @@
@@ -10839,32 +10119,23 @@
 
 --- a/arch/x86/lib/copy_user_64.S	2025-03-14 20:54:19.889090942 +0100
 +++ b/arch/x86/lib/copy_user_64.S	2025-03-14 20:54:43.574754215 +0100
-@@ -1,20 +1,16 @@
- /* SPDX-License-Identifier: GPL-2.0-only */
--/*
-- * Copyright 2008 Vitaly Mayatskikh <vmayatsk@redhat.com>
-- * Copyright 2002 Andi Kleen, SuSE Labs.
-- *
-- * Functions to copy from and to user space.
-- */
-+/* Copyright(c) 2016-2020 Intel Corporation. All rights reserved. */
-+/* Optimized for Intel Raptor Lake by [Your Name], 2025 */
- 
--#include <linux/export.h>
- #include <linux/linkage.h>
-+#include <asm/asm.h>
- #include <asm/cpufeatures.h>
- #include <asm/alternative.h>
--#include <asm/asm.h>
- 
+@@ -2,6 +2,7 @@
+ /*
+  * Copyright 2008 Vitaly Mayatskikh <vmayatsk@redhat.com>
+  * Copyright 2002 Andi Kleen, SuSE Labs.
++ * Optimized for Intel Raptor Lake by Claude, 2025
+  *
+  * Functions to copy from and to user space.
+  */
+@@ -15,6 +16,7 @@
  /*
   * rep_movs_alternative - memory copy with exception handling.
   * This version is for CPUs that don't have FSRM (Fast Short Rep Movs)
-+ * With optimizations for Intel Raptor Lake architecture.
++ * Optimized for Intel Raptor Lake CPUs.
   *
   * Input:
   * rdi destination
-@@ -23,69 +19,721 @@
+@@ -23,87 +25,167 @@
   *
   * Output:
   * rcx uncopied bytes or 0 if successful.
@@ -10877,228 +10148,49 @@
  SYM_FUNC_START(rep_movs_alternative)
 -	cmpq $64,%rcx
 -	jae .Llarge
-+        /* Save callee-saved registers we'll use */
-+        pushq %r12
-+        pushq %r13
-+        pushq %r14
-+        pushq %r15
-+
-+        /* Do not set direction flag at the main entry point due to objtool warnings */
-+        /* cld */
-+
-+        /* Optimize branch prediction by checking zero length first */
-+        testq %rcx, %rcx
-+        jz .Lexit_success
-+
-+        /* Use ERMS (rep movsb) for all sizes if available, otherwise proceed with manual copy */
-+1:      ALTERNATIVE "jmp .Lmanual_copy", "rep movsb", X86_FEATURE_ERMS
-+
-+        /* Successful completion with ERMS */
-+        xorq %rcx, %rcx
-+        jmp .Lexit_success
-+
-+.Lmanual_copy:
-+        /* Check destination alignment to 8 bytes for small to medium copies */
-+        movl %edi, %eax
-+        andl $7, %eax
-+        je .Laligned
-+
-+        /* Calculate bytes to 8-byte alignment */
-+        movl $8, %edx
-+        subl %eax, %edx
-+        movq %rdx, %r8
-+
-+        /* Ensure alignment doesn't exceed total bytes */
-+        cmpq %rcx, %r8
-+        jbe 2f
-+        movq %rcx, %r8
-+2:
-+        /* Save original count for later */
-+        movq %rcx, %r9
-+        movq %r8, %rcx
-+
-+        /* Use rep movsb for alignment if ERMS is available, otherwise byte-by-byte */
-+3:      ALTERNATIVE "jmp .Lalign_bytes", "rep movsb", X86_FEATURE_ERMS
-+
-+        /* Update remaining bytes after alignment with ERMS */
-+        movq %r9, %rcx
-+        subq %r8, %rcx
-+        jz .Lexit_success
-+        jmp .Laligned
-+
-+.Lalign_bytes:
-+        /* Use byte-by-byte copy for alignment - safest approach */
-+        testq %rcx, %rcx
-+        jz 4f
-+
-+.Lalign_bytes_loop:
-+5:      movb (%rsi), %al
-+6:      movb %al, (%rdi)
-+        addq $1, %rdi
-+        addq $1, %rsi
-+        subq $1, %rcx
-+        jnz .Lalign_bytes_loop
-+
-+4:      /* Update remaining bytes after alignment */
-+        movq %r9, %rcx
-+        subq %r8, %rcx
-+        jz .Lexit_success
-+
-+.Laligned:
-+        /* Check size for large copy optimization */
-+        cmpq $4096, %rcx
-+        jae .Llarge_vectorized
-+
-+        /* Check alignment to cache line (64 bytes) for medium to large copies */
-+        cmpq $128, %rcx
-+        jb .Lcheck_medium  /* Skip check for smaller copies */
-+
-+        movl %edi, %eax
-+        andl $63, %eax
-+        jz .Lcheck_large   /* Already cache line aligned */
-+
-+        /* Calculate bytes to next cache line */
-+        movl $64, %edx
-+        subl %eax, %edx
-+        movq %rdx, %r8
-+
-+        /* Ensure alignment doesn't exceed total bytes */
-+        cmpq %rcx, %r8
-+        jbe 7f
-+        movq %rcx, %r8
-+7:
-+        /* Save original count */
-+        movq %rcx, %r9
-+        movq %r8, %rcx
-+
-+        /* Use rep movsb for alignment if ERMS is available, otherwise manual copy */
-+8:      ALTERNATIVE "jmp .Lalign_cacheline_bytes", "rep movsb", X86_FEATURE_ERMS
-+
-+        /* Update remaining bytes after alignment with ERMS */
-+        movq %r9, %rcx
-+        subq %r8, %rcx
-+        jmp .Lcheck_large
-+
-+.Lalign_cacheline_bytes:
-+        /* Copy to align to cache line boundary with 8-byte chunks when possible */
-+        cmpq $8, %rcx
-+        jb .Lalign_cacheline_bytes_loop
-+
-+.Lalign_cacheline_loop:
-+9:      movq (%rsi), %rax
-+10:     movq %rax, (%rdi)
-+        addq $8, %rsi
-+        addq $8, %rdi
-+        subq $8, %rcx
-+        cmpq $8, %rcx
-+        jae .Lalign_cacheline_loop
-+
-+.Lalign_cacheline_bytes_loop:
-+        /* Handle remaining alignment bytes */
-+        testq %rcx, %rcx
-+        jz 11f
-+
-+12:     movb (%rsi), %al
-+13:     movb %al, (%rdi)
-+        addq $1, %rdi
-+        addq $1, %rsi
-+        subq $1, %rcx
-+        jnz .Lalign_cacheline_bytes_loop
-+
-+11:     /* Restore count and continue with aligned copy */
-+        movq %r9, %rcx
-+        subq %r8, %rcx
-+
-+.Lcheck_large:
-+        /* Use higher threshold (64KB) for vectorized copy on Raptor Lake client */
-+        cmpq $65536, %rcx
-+        jae .Llarge_vectorized
-+
-+.Lcheck_medium:
-+        /* Medium copy optimization path (32-4096 bytes) */
-+        cmpq $32, %rcx
-+        jae .Lmedium_copy
-+
-+        /* Small copy (8-32 bytes) */
-+        cmpq $8, %rcx
-+        jae .Lword
-+
-+        /* Less than 8 bytes - use rep movsb if ERMS, otherwise byte copy */
-+        testq %rcx, %rcx
-+        jz .Lexit_success
-+14:     ALTERNATIVE "jmp .Lcopy_trailing_bytes", "rep movsb", X86_FEATURE_ERMS
-+        xorq %rcx, %rcx       /* Mark successful completion */
-+        jmp .Lexit_success
-+
-+.Lcopy_trailing_bytes:
-+        /* Dedicated trailing bytes handler */
-+        testq %rcx, %rcx      /* Make sure we have bytes to copy */
-+        jz .Lexit_success
-+
-+        movq %rcx, %r8
-+15:     movb (%rsi), %al
-+16:     movb %al, (%rdi)
-+        addq $1, %rdi
-+        addq $1, %rsi
-+        subq $1, %r8
-+        jnz 15b
-+        xorq %rcx, %rcx       /* Mark successful completion */
-+        jmp .Lexit_success
-+
-+.Lexit_success:
-+        /* Return successfully with rcx=0 */
-+        xorq %rcx, %rcx
-+        popq %r15
-+        popq %r14
-+        popq %r13
-+        popq %r12
-+        RET
-+
-+.Lexit_fault:
-+        /* Fault handler - restore registers, clear direction flag, and return uncopied bytes */
-+        cld
-+        popq %r15
-+        popq %r14
-+        popq %r13
-+        popq %r12
-+        RET
-+
-+        /* Exception table for initial ERMS path */
-+        _ASM_EXTABLE_UA(1b, .Lexit_fault)
-+
-+/* Exception table for alignment paths */
-+        _ASM_EXTABLE_UA(3b, .Lexit_fault)  /* ERMS alignment */
-+        _ASM_EXTABLE_UA(5b, .Lexit_fault)  /* Byte-by-byte alignment read */
-+        _ASM_EXTABLE_UA(6b, .Lexit_fault)  /* Byte-by-byte alignment write */
-+        _ASM_EXTABLE_UA(8b, .Lexit_fault)  /* ERMS cache line alignment */
-+        _ASM_EXTABLE_UA(9b, .Lexit_fault)  /* Cache line alignment read */
-+        _ASM_EXTABLE_UA(10b, .Lexit_fault) /* Cache line alignment write */
-+        _ASM_EXTABLE_UA(12b, .Lexit_fault) /* Cache line alignment byte read */
-+        _ASM_EXTABLE_UA(13b, .Lexit_fault) /* Cache line alignment byte write */
-+        _ASM_EXTABLE_UA(14b, .Lexit_fault) /* ERMS trailing bytes */
-+        _ASM_EXTABLE_UA(15b, .Lexit_fault) /* Trailing bytes read */
-+        _ASM_EXTABLE_UA(16b, .Lexit_fault) /* Trailing bytes write */
- 
+-
 -	cmp $8,%ecx
 -	jae .Lword
 -
 -	testl %ecx,%ecx
 -	je .Lexit
--
--.Lcopy_user_tail:
++        /* Check for zero length */
++        testq %rcx,%rcx
++        jz .Lexit
++
++        /* Classify transfer size */
++        cmpq $128,%rcx
++        jae .Llarge
++        cmpq $32,%rcx
++        jae .Lmedium
++        cmpq $8,%rcx
++        jae .Lword
+ 
++        /* 1-7 bytes: byte-by-byte copy */
+ .Lcopy_user_tail:
 -0:	movb (%rsi),%al
 -1:	movb %al,(%rdi)
 -	inc %rdi
 -	inc %rsi
 -	dec %rcx
 -	jne .Lcopy_user_tail
--.Lexit:
++0:      movb (%rsi),%al
++1:      movb %al,(%rdi)
++        inc %rdi
++        inc %rsi
++        dec %rcx
++        jnz .Lcopy_user_tail
+ .Lexit:
 -	RET
--
++        RET
+ 
 -	_ASM_EXTABLE_UA( 0b, .Lexit)
 -	_ASM_EXTABLE_UA( 1b, .Lexit)
--
++        _ASM_EXTABLE_UA( 0b, .Lexit)
++        _ASM_EXTABLE_UA( 1b, .Lexit)
+ 
 -	.p2align 4
++        /* 8-31 bytes: word-sized copy */
 +        .p2align 4
  .Lword:
 -2:	movq (%rsi),%rax
@@ -11113,14 +10205,90 @@
 -
 -	_ASM_EXTABLE_UA( 2b, .Lcopy_user_tail)
 -	_ASM_EXTABLE_UA( 3b, .Lcopy_user_tail)
--
--.Llarge:
++2:      movq (%rsi),%rax
++3:      movq %rax,(%rdi)
++        addq $8,%rsi
++        addq $8,%rdi
++        subq $8,%rcx
++        jz .Lexit            /* Exactly 8 bytes copied */
++        cmpq $8,%rcx         /* 8 or more bytes left? */
++        jae .Lword           /* Yes, continue with words */
++        jmp .Lcopy_user_tail /* Handle 1-7 remaining bytes */
++
++        _ASM_EXTABLE_UA( 2b, .Lcopy_user_tail)
++        _ASM_EXTABLE_UA( 3b, .Lcopy_user_tail)
++
++        /* 32-127 bytes: simpler two-phase approach for medium transfers */
++        .p2align 4
++.Lmedium:
++        /* Handle first 32 bytes in a single go */
++4:      movq 0*8(%rsi),%rax
++5:      movq 1*8(%rsi),%rdx
++6:      movq 2*8(%rsi),%r8
++7:      movq 3*8(%rsi),%r9
++
++8:      movq %rax,0*8(%rdi)
++9:      movq %rdx,1*8(%rdi)
++10:     movq %r8,2*8(%rdi)
++11:     movq %r9,3*8(%rdi)
++
++        /* Update pointers and count */
++        addq $32,%rsi
++        addq $32,%rdi
++        subq $32,%rcx        /* Adjust for first 32 bytes */
++
++        /* Handle remaining bytes */
++        cmpq $32,%rcx        /* 32 or more bytes left? */
++        jae .Lmedium         /* Yes, process another 32-byte chunk */
++        cmpq $8,%rcx         /* 8 or more bytes left? */
++        jae .Lword           /* Yes, switch to word-based copy */
++        testq %rcx,%rcx      /* Any bytes left? */
++        jnz .Lcopy_user_tail /* Yes, handle remaining 1-7 bytes */
++        RET                  /* No, we're done */
++
++        /* Exception table for medium path */
++        _ASM_EXTABLE_UA( 4b, .Lmedium_fault)
++        _ASM_EXTABLE_UA( 5b, .Lmedium_fault)
++        _ASM_EXTABLE_UA( 6b, .Lmedium_fault)
++        _ASM_EXTABLE_UA( 7b, .Lmedium_fault)
++        _ASM_EXTABLE_UA( 8b, .Lmedium_fault)
++        _ASM_EXTABLE_UA( 9b, .Lmedium_fault)
++        _ASM_EXTABLE_UA(10b, .Lmedium_fault)
++        _ASM_EXTABLE_UA(11b, .Lmedium_fault)
++
++.Lmedium_fault:
++        /* Simply return current rcx value (remaining bytes) */
++        RET
+ 
++        /* 128+ bytes: large transfers with alignment and/or rep movsb */
+ .Llarge:
 -0:	ALTERNATIVE "jmp .Llarge_movsq", "rep movsb", X86_FEATURE_ERMS
 -1:	RET
--
++0:      ALTERNATIVE "jmp .Llarge_movsq", "rep movsb", X86_FEATURE_ERMS
++1:      RET
+ 
 -	_ASM_EXTABLE_UA( 0b, 1b)
++        _ASM_EXTABLE_UA( 0b, 1b)
+ 
+ .Llarge_movsq:
+-	/* Do the first possibly unaligned word */
+-0:	movq (%rsi),%rax
+-1:	movq %rax,(%rdi)
 -
--.Llarge_movsq:
+-	_ASM_EXTABLE_UA( 0b, .Lcopy_user_tail)
+-	_ASM_EXTABLE_UA( 1b, .Lcopy_user_tail)
+-
+-	/* What would be the offset to the aligned destination? */
+-	leaq 8(%rdi),%rax
+-	andq $-8,%rax
+-	subq %rdi,%rax
+-
+-	/* .. and update pointers and count to match */
+-	addq %rax,%rdi
+-	addq %rax,%rsi
+-	subq %rax,%rcx
+-
+-	/* make %rcx contain the number of words, %rax the remainder */
 -	movq %rcx,%rax
 -	shrq $3,%rcx
 -	andl $7,%eax
@@ -11129,518 +10297,75 @@
 -	testl %ecx,%ecx
 -	jne .Lcopy_user_tail
 -	RET
--
++        /* Save original count */
++        movq %rcx,%r10
+ 
 -1:	leaq (%rax,%rcx,8),%rcx
 -	jmp .Lcopy_user_tail
-+        /* Optimized word-sized copy (8-32 bytes) */
-+17:     movq (%rsi), %rax
-+18:     movq %rax, (%rdi)
-+        addq $8, %rsi
-+        addq $8, %rdi
-+        subq $8, %rcx
-+        je .Lexit_success
-+        cmpq $8, %rcx
-+        jae .Lword
-+        testq %rcx, %rcx
-+        jz .Lexit_success
-+19:     ALTERNATIVE "jmp .Lcopy_trailing_bytes", "rep movsb", X86_FEATURE_ERMS
-+        xorq %rcx, %rcx       /* Mark successful completion */
-+        jmp .Lexit_success
++        /* Optional alignment to 64-byte boundary (cache line) */
++        movq %rdi,%rax
++        andl $7,%eax         /* Check 8-byte alignment first */
++        jz .Lmovsq_aligned
 +
-+        /* Exception table for word-sized copy */
-+        _ASM_EXTABLE_UA(17b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(18b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(19b, .Lexit_fault)
++        /* Handle up to 7 bytes for quadword alignment */
++        movl $8,%r8d
++        subl %eax,%r8d       /* r8d = bytes to 8-byte alignment */
++        movq %r8,%rcx
 +
-+        .p2align 4
-+.Lmedium_copy:
-+        /* Medium copy (32-4096 bytes) - use rep movsb if ERMS, otherwise manual copy */
-+20:     ALTERNATIVE "jmp .Lmedium_manual_copy", "rep movsb", X86_FEATURE_ERMS
-+        xorq %rcx, %rcx       /* Mark successful completion */
-+        jmp .Lexit_success
++12:     rep movsb
 +
-+        /* Exception table for medium copy with ERMS */
-+        _ASM_EXTABLE_UA(20b, .Lexit_fault)
++        /* Update remaining bytes */
++        subq %r8,%r10
++        movq %r10,%rcx
++        testq %rcx,%rcx
++        jz .Lexit
 +
-+.Lmedium_manual_copy:
-+        /* Manual copy for medium sizes without ERMS */
-+        cmpq $64, %rcx
-+        jb .Lmedium_lt_64
++.Lmovsq_aligned:
++        /* Prefetch for large transfers (128+ bytes away) */
++13:     prefetcht0 128(%rsi)
 +
-+        /* 64-4096 byte copy - unrolled copy of first 64 bytes */
-+21:     movq (%rsi), %rax
-+22:     movq %rax, (%rdi)
-+23:     movq 8(%rsi), %rax
-+24:     movq %rax, 8(%rdi)
-+25:     movq 16(%rsi), %rax
-+26:     movq %rax, 16(%rdi)
-+27:     movq 24(%rsi), %rax
-+28:     movq %rax, 24(%rdi)
-+29:     movq 32(%rsi), %rax
-+30:     movq %rax, 32(%rdi)
-+31:     movq 40(%rsi), %rax
-+32:     movq %rax, 40(%rdi)
-+33:     movq 48(%rsi), %rax
-+34:     movq %rax, 48(%rdi)
-+35:     movq 56(%rsi), %rax
-+36:     movq %rax, 56(%rdi)
++        /* Calculate number of 8-byte chunks and remainder */
++        movq %rcx,%rax       /* Save original count */
++        shrq $3,%rcx         /* rcx = number of 8-byte chunks */
++        andl $7,%eax         /* eax = remainder bytes */
 +
-+        addq $64, %rsi
-+        addq $64, %rdi
-+        subq $64, %rcx
-+        je .Lexit_success
++        testq %rcx,%rcx
++        jz .Lmovsq_tail
 +
-+        cmpq $4096, %rcx
-+        jae .Llarge_vectorized
-+        cmpq $32, %rcx
-+        jae .Lmedium_manual_copy
-+        cmpq $8, %rcx
-+        jae .Lword
-+        testq %rcx, %rcx
-+        jz .Lexit_success
-+37:     ALTERNATIVE "jmp .Lcopy_trailing_bytes", "rep movsb", X86_FEATURE_ERMS
-+        xorq %rcx, %rcx       /* Mark successful completion */
-+        jmp .Lexit_success
++        /* Copy 8-byte aligned chunks */
++14:     rep movsq
 +
-+.Lmedium_lt_64:
-+        /* 32-64 byte copy with unrolled operations */
-+38:     movq (%rsi), %rax
-+39:     movq %rax, (%rdi)
-+40:     movq 8(%rsi), %rax
-+41:     movq %rax, 8(%rdi)
-+42:     movq 16(%rsi), %rax
-+43:     movq %rax, 16(%rdi)
-+44:     movq 24(%rsi), %rax
-+45:     movq %rax, 24(%rdi)
++.Lmovsq_tail:
++        /* Handle remainder bytes (0-7) */
++        movl %eax,%ecx
++        testl %ecx,%ecx
++        jz .Lexit
 +
-+        addq $32, %rsi
-+        addq $32, %rdi
-+        subq $32, %rcx
-+        je .Lexit_success
-+
-+        cmpq $4096, %rcx
-+        jae .Llarge_vectorized
-+        cmpq $32, %rcx
-+        jae .Lmedium_manual_copy
-+        cmpq $8, %rcx
-+        jae .Lword
-+        testq %rcx, %rcx
-+        jz .Lexit_success
-+46:     ALTERNATIVE "jmp .Lcopy_trailing_bytes", "rep movsb", X86_FEATURE_ERMS
-+        xorq %rcx, %rcx       /* Mark successful completion */
-+        jmp .Lexit_success
-+
-+        /* Exception table for medium manual copy */
-+        _ASM_EXTABLE_UA(21b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(22b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(23b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(24b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(25b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(26b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(27b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(28b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(29b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(30b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(31b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(32b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(33b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(34b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(35b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(36b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(37b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(38b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(39b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(40b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(41b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(42b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(43b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(44b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(45b, .Lexit_fault)
-+        _ASM_EXTABLE_UA(46b, .Lexit_fault)
-+
-+        .p2align 4
-+.Llarge_vectorized:
-+        /* Check for AVX2 support for very large copies */
-+47:     ALTERNATIVE "jmp .Llarge_manual_copy", "", X86_FEATURE_AVX2
-+
-+        /* Check if kernel allows AVX usage */
-+48:     ALTERNATIVE "jmp .Llarge_manual_copy", "", X86_FEATURE_OSXSAVE
-+
-+        /* AVX2 path for very large copies (>64KB bytes) */
-+        /* For very large transfers (>1MB), use non-temporal stores */
-+        cmpq $1048576, %rcx
-+        jae .Lavx_nt_copy
-+
-+        /* Align destination to 64-byte boundary for Raptor Lake */
-+        movl %edi, %eax
-+        andl $63, %eax
-+        jz .Lavx_aligned
-+
-+        /* Calculate bytes to 64-byte alignment */
-+        movl $64, %edx
-+        subl %eax, %edx
-+        movq %rdx, %r8
-+
-+        /* Ensure alignment doesn't exceed total bytes */
-+        cmpq %rcx, %r8
-+        jbe 49f
-+        movq %rcx, %r8
-+49:
-+        /* Save original count */
-+        movq %rcx, %r9
-+        movq %r8, %rcx
-+
-+        /* Use rep movsb for alignment if ERMS, otherwise manual copy */
-+50:     ALTERNATIVE "jmp .Lavx_align_bytes", "rep movsb", X86_FEATURE_ERMS
-+
-+        /* Update remaining bytes after alignment with ERMS */
-+        movq %r9, %rcx
-+        subq %r8, %rcx
-+        jmp .Lavx_aligned
-+
-+.Lavx_align_bytes:
-+        /* Copy to align to 64-byte boundary with 8-byte chunks when possible */
-+        cmpq $8, %rcx
-+        jb .Lavx_align_bytes_loop
-+
-+.Lavx_align_loop:
-+51:     movq (%rsi), %rax
-+52:     movq %rax, (%rdi)
-+        addq $8, %rsi
-+        addq $8, %rdi
-+        subq $8, %rcx
-+        cmpq $8, %rcx
-+        jae .Lavx_align_loop
-+
-+.Lavx_align_bytes_loop:
-+        /* Handle remaining alignment bytes */
-+        testq %rcx, %rcx
-+        jz 53f
-+
-+54:     movb (%rsi), %al
-+55:     movb %al, (%rdi)
-+        addq $1, %rdi
-+        addq $1, %rsi
-+        subq $1, %rcx
-+        jnz .Lavx_align_bytes_loop
-+
-+53:     /* Restore count and continue with aligned copy */
-+        movq %r9, %rcx
-+        subq %r8, %rcx
-+
-+.Lavx_aligned:
-+        /* Set up for 128-byte chunk copies */
-+        movq %rcx, %rax
-+        shrq $7, %rcx     /* Divide by 128 */
-+        andl $127, %eax   /* Save remainder */
-+        movq %rax, %r9    /* Save remainder for fault handling */
-+        testq %rcx, %rcx
-+        jz .Lavx_remainder
-+
-+        /* Add prefetching for large copies (>1KB) */
-+        cmpq $1024, %rcx
-+        jl .Lavx_loop
-+
-+        /* Prefetch ahead with optimized distances for Raptor Lake */
-+56:     prefetcht0 384(%rsi)  /* L1 cache */
-+57:     prefetcht1 512(%rsi)  /* L2 cache */
-+
-+        .p2align 4
-+.Lavx_loop:
-+        /* Read 128 bytes (4x 32-byte AVX loads) */
-+58:     vmovdqu 0*32(%rsi), %ymm0
-+59:     vmovdqu 1*32(%rsi), %ymm1
-+60:     vmovdqu 2*32(%rsi), %ymm2
-+61:     vmovdqu 3*32(%rsi), %ymm3
-+
-+        /* Periodic prefetch for very large transfers optimized for Raptor Lake client */
-+        testq $0xF, %rcx    /* Changed from $0x7 to $0xF to optimize frequency */
-+        jnz 62f
-+        cmpq $32, %rcx      /* Changed from $16 to $32 to focus on larger transfers */
-+        jl 62f
-+63:     prefetcht0 384(%rsi)  /* L1 cache */
-+
-+62:     /* Write 128 bytes (4x 32-byte AVX stores) */
-+64:     vmovdqa %ymm0, 0*32(%rdi)
-+65:     vmovdqa %ymm1, 1*32(%rdi)
-+66:     vmovdqa %ymm2, 2*32(%rdi)
-+67:     vmovdqa %ymm3, 3*32(%rdi)
-+
-+        addq $128, %rsi
-+        addq $128, %rdi
-+        subq $1, %rcx
-+        jnz .Lavx_loop
-+        jmp .Lavx_remainder
-+
-+.Lavx_nt_copy:
-+        /* Non-temporal stores for very large copies (>1MB) */
-+        /* Align destination to 64-byte boundary for Raptor Lake */
-+        movl %edi, %eax
-+        andl $63, %eax
-+        jz .Lavx_nt_aligned
-+
-+        /* Calculate bytes to 64-byte alignment */
-+        movl $64, %edx
-+        subl %eax, %edx
-+        movq %rdx, %r8
-+
-+        /* Ensure alignment doesn't exceed total bytes */
-+        cmpq %rcx, %r8
-+        jbe 68f
-+        movq %rcx, %r8
-+68:
-+        /* Save original count */
-+        movq %rcx, %r9
-+        movq %r8, %rcx
-+
-+        /* Use rep movsb for alignment if ERMS, otherwise manual copy */
-+69:     ALTERNATIVE "jmp .Lavx_nt_align_bytes", "rep movsb", X86_FEATURE_ERMS
-+
-+        /* Update remaining bytes after alignment with ERMS */
-+        movq %r9, %rcx
-+        subq %r8, %rcx
-+        jmp .Lavx_nt_aligned
-+
-+.Lavx_nt_align_bytes:
-+        /* Copy to align to 64-byte boundary with 8-byte chunks when possible */
-+        cmpq $8, %rcx
-+        jb .Lavx_nt_align_bytes_loop
-+
-+.Lavx_nt_align_loop:
-+70:     movq (%rsi), %rax
-+71:     movq %rax, (%rdi)
-+        addq $8, %rsi
-+        addq $8, %rdi
-+        subq $8, %rcx
-+        cmpq $8, %rcx
-+        jae .Lavx_nt_align_loop
-+
-+.Lavx_nt_align_bytes_loop:
-+        /* Handle remaining alignment bytes */
-+        testq %rcx, %rcx
-+        jz 72f
-+
-+73:     movb (%rsi), %al
-+74:     movb %al, (%rdi)
-+        addq $1, %rdi
-+        addq $1, %rsi
-+        subq $1, %rcx
-+        jnz .Lavx_nt_align_bytes_loop
-+
-+72:     /* Restore count and continue with aligned copy */
-+        movq %r9, %rcx
-+        subq %r8, %rcx
-+
-+.Lavx_nt_aligned:
-+        /* Set up for 128-byte chunk copies */
-+        movq %rcx, %rax
-+        shrq $7, %rcx     /* Divide by 128 */
-+        andl $127, %eax   /* Save remainder */
-+        movq %rax, %r9    /* Save remainder for fault handling */
-+        testq %rcx, %rcx
-+        jz .Lavx_remainder
-+
-+.Lavx_nt_loop:
-+        /* Read 128 bytes (4x 32-byte AVX loads) */
-+75:     vmovdqu 0*32(%rsi), %ymm0
-+76:     vmovdqu 1*32(%rsi), %ymm1
-+77:     vmovdqu 2*32(%rsi), %ymm2
-+78:     vmovdqu 3*32(%rsi), %ymm3
-+
-+        /* Write 128 bytes with non-temporal stores */
-+79:     vmovntdq %ymm0, 0*32(%rdi)
-+80:     vmovntdq %ymm1, 1*32(%rdi)
-+81:     vmovntdq %ymm2, 2*32(%rdi)
-+82:     vmovntdq %ymm3, 3*32(%rdi)
-+
-+        addq $128, %rsi
-+        addq $128, %rdi
-+        subq $1, %rcx
-+        jnz .Lavx_nt_loop
-+
-+        /* Ensure non-temporal stores are visible */
-+        sfence
-+
-+.Lavx_remainder:
-+        /* Clear AVX state to avoid penalties */
-+        vzeroupper
-+
-+        /* Handle remaining bytes (<128) */
-+        movq %r9, %rcx    /* Restore remainder */
-+        testq %rcx, %rcx
-+        jz .Lexit_success
-+
-+        /* Use rep movsb for remainder if ERMS, otherwise manual copy */
-+83:     ALTERNATIVE "jmp .Lcopy_trailing_bytes", "rep movsb", X86_FEATURE_ERMS
-+        xorq %rcx, %rcx       /* Mark successful completion */
-+        jmp .Lexit_success
-+
-+        .p2align 4
-+.Llarge_manual_copy:
-+        /* Manual copy for large sizes without ERMS or AVX2 */
-+        /* Add prefetching for large copies (>1KB) */
-+        cmpq $1024, %rcx
-+        jl .Llarge_no_prefetch
-+
-+        /* Prefetch ahead with optimized distances for Raptor Lake */
-+84:     prefetcht0 384(%rsi)  /* L1 cache */
-+85:     prefetcht1 512(%rsi)  /* L2 cache */
-+
-+.Llarge_no_prefetch:
-+        /* Use 64-byte chunks for Raptor Lake's cache line size */
-+        movq %rcx, %rax
-+        shrq $6, %rcx     /* Divide by 64 */
-+        andl $63, %eax    /* Save remainder */
-+        movq %rax, %r9    /* Save remainder for fault handling */
-+        testq %rcx, %rcx
-+        jz .Llarge_remainder
-+
-+        .p2align 4
-+.Llarge_loop:
-+        /* Read 64 bytes */
-+86:     movq 0*8(%rsi), %r8
-+87:     movq 1*8(%rsi), %r9
-+88:     movq 2*8(%rsi), %r10
-+89:     movq 3*8(%rsi), %r11
-+90:     movq 4*8(%rsi), %r12
-+91:     movq 5*8(%rsi), %r13
-+92:     movq 6*8(%rsi), %r14
-+93:     movq 7*8(%rsi), %r15
-+
-+        /* Periodic prefetch for very large transfers optimized for Raptor Lake client */
-+        testq $0xF, %rcx    /* Changed from $0x7 to $0xF to optimize frequency */
-+        jnz 94f
-+        cmpq $32, %rcx      /* Changed from $16 to $32 to focus on larger transfers */
-+        jl 94f
-+95:     prefetcht0 384(%rsi)  /* L1 cache */
-+
-+94:     /* Write 64 bytes */
-+96:     movq %r8, 0*8(%rdi)
-+97:     movq %r9, 1*8(%rdi)
-+98:     movq %r10, 2*8(%rdi)
-+99:     movq %r11, 3*8(%rdi)
-+100:    movq %r12, 4*8(%rdi)
-+101:    movq %r13, 5*8(%rdi)
-+102:    movq %r14, 6*8(%rdi)
-+103:    movq %r15, 7*8(%rdi)
-+
-+        addq $64, %rsi
-+        addq $64, %rdi
-+        subq $1, %rcx
-+        jnz .Llarge_loop
-+
-+.Llarge_remainder:
-+        /* Handle remaining bytes (<64) */
-+        movq %r9, %rcx    /* Restore remainder */
-+        testq %rcx, %rcx
-+        jz .Lexit_success
-+
-+        /* Use rep movsb for remainder if ERMS, otherwise manual copy */
-+104:    ALTERNATIVE "jmp .Lcopy_trailing_bytes", "rep movsb", X86_FEATURE_ERMS
-+        xorq %rcx, %rcx       /* Mark successful completion */
-+        jmp .Lexit_success
-+
-+.Llarge_read_fault:
-+        /* Calculate remaining bytes for read fault */
-+        shlq $6, %rcx     /* Convert back to bytes */
-+        addq %r9, %rcx    /* Add remainder bytes */
-+        cld               /* Ensure direction flag is cleared */
-+        popq %r15
-+        popq %r14
-+        popq %r13
-+        popq %r12
++15:     rep movsb
++        xorl %ecx,%ecx       /* Set rcx to 0 (success) */
 +        RET
 +
-+.Llarge_write_fault:
-+        /* Calculate remaining bytes for write fault */
-+        shlq $6, %rcx     /* Convert back to bytes */
-+        addq %r9, %rcx    /* Add remainder bytes */
-+        cld               /* Ensure direction flag is cleared */
-+        popq %r15
-+        popq %r14
-+        popq %r13
-+        popq %r12
++        /* Exception handling for large transfers */
++16:     /* Calculate remaining bytes for movsq fault */
++        leaq (%rax,%rcx,8),%rcx
++        jmp .Lcopy_user_tail
++
++        _ASM_EXTABLE_UA(12b, .Llarge_fault_align)
++        _ASM_EXTABLE_UA(13b, .Lmovsq_fault_prefetch)
++        _ASM_EXTABLE_UA(14b, 16b)
++        _ASM_EXTABLE_UA(15b, .Lexit)
++
++.Llarge_fault_align:
++        /* On fault during alignment - return remaining */
++        movq %r10,%rcx
++        addq %r8,%rcx        /* Add alignment bytes */
++        subq %rax,%rcx       /* Subtract processed bytes */
 +        RET
 +
-+.Lavx_read_fault:
-+        /* Calculate remaining bytes for AVX read fault */
-+        shlq $7, %rcx     /* Convert back to bytes */
-+        addq %r9, %rcx    /* Add remainder bytes */
-+        vzeroupper        /* Clear AVX state */
-+        cld               /* Ensure direction flag is cleared */
-+        popq %r15
-+        popq %r14
-+        popq %r13
-+        popq %r12
++.Lmovsq_fault_prefetch:
++        /* On fault during prefetch - whole count remains */
++        movq %r10,%rcx
 +        RET
-+
-+.Lavx_write_fault:
-+        /* Calculate remaining bytes for AVX write fault */
-+        shlq $7, %rcx     /* Convert back to bytes */
-+        addq %r9, %rcx    /* Add remainder bytes */
-+        vzeroupper        /* Clear AVX state */
-+        cld               /* Ensure direction flag is cleared */
-+        popq %r15
-+        popq %r14
-+        popq %r13
-+        popq %r12
-+        RET
-+
-+        /* Exception table for AVX2 path */
-+        _ASM_EXTABLE_UA(47b, .Lexit_fault) /* AVX2 check */
-+        _ASM_EXTABLE_UA(48b, .Lexit_fault) /* OSXSAVE check */
-+        _ASM_EXTABLE_UA(50b, .Lexit_fault) /* ERMS alignment */
-+        _ASM_EXTABLE_UA(51b, .Lexit_fault) /* AVX alignment read */
-+        _ASM_EXTABLE_UA(52b, .Lexit_fault) /* AVX alignment write */
-+        _ASM_EXTABLE_UA(54b, .Lexit_fault) /* AVX alignment byte read */
-+        _ASM_EXTABLE_UA(55b, .Lexit_fault) /* AVX alignment byte write */
-+        _ASM_EXTABLE_UA(56b, .Lavx_read_fault) /* AVX prefetch */
-+        _ASM_EXTABLE_UA(57b, .Lavx_read_fault) /* AVX prefetch */
-+        _ASM_EXTABLE_UA(58b, .Lavx_read_fault) /* AVX read */
-+        _ASM_EXTABLE_UA(59b, .Lavx_read_fault) /* AVX read */
-+        _ASM_EXTABLE_UA(60b, .Lavx_read_fault) /* AVX read */
-+        _ASM_EXTABLE_UA(61b, .Lavx_read_fault) /* AVX read */
-+        _ASM_EXTABLE_UA(63b, .Lavx_read_fault) /* AVX prefetch */
-+        _ASM_EXTABLE_UA(64b, .Lavx_write_fault) /* AVX write */
-+        _ASM_EXTABLE_UA(65b, .Lavx_write_fault) /* AVX write */
-+        _ASM_EXTABLE_UA(66b, .Lavx_write_fault) /* AVX write */
-+        _ASM_EXTABLE_UA(67b, .Lavx_write_fault) /* AVX write */
-+        _ASM_EXTABLE_UA(69b, .Lexit_fault) /* ERMS alignment */
-+        _ASM_EXTABLE_UA(70b, .Lexit_fault) /* AVX NT alignment read */
-+        _ASM_EXTABLE_UA(71b, .Lexit_fault) /* AVX NT alignment write */
-+        _ASM_EXTABLE_UA(73b, .Lexit_fault) /* AVX NT alignment byte read */
-+        _ASM_EXTABLE_UA(74b, .Lexit_fault) /* AVX NT alignment byte write */
-+        _ASM_EXTABLE_UA(75b, .Lavx_read_fault) /* AVX NT read */
-+        _ASM_EXTABLE_UA(76b, .Lavx_read_fault) /* AVX NT read */
-+        _ASM_EXTABLE_UA(77b, .Lavx_read_fault) /* AVX NT read */
-+        _ASM_EXTABLE_UA(78b, .Lavx_read_fault) /* AVX NT read */
-+        _ASM_EXTABLE_UA(79b, .Lavx_write_fault) /* AVX NT write */
-+        _ASM_EXTABLE_UA(80b, .Lavx_write_fault) /* AVX NT write */
-+        _ASM_EXTABLE_UA(81b, .Lavx_write_fault) /* AVX NT write */
-+        _ASM_EXTABLE_UA(82b, .Lavx_write_fault) /* AVX NT write */
-+        _ASM_EXTABLE_UA(83b, .Lexit_fault) /* ERMS remainder */
-+
-+        /* Exception table for large manual copy */
-+        _ASM_EXTABLE_UA(84b, .Llarge_read_fault) /* Prefetch */
-+        _ASM_EXTABLE_UA(85b, .Llarge_read_fault) /* Prefetch */
-+        _ASM_EXTABLE_UA(86b, .Llarge_read_fault) /* Read */
-+        _ASM_EXTABLE_UA(87b, .Llarge_read_fault) /* Read */
-+        _ASM_EXTABLE_UA(88b, .Llarge_read_fault) /* Read */
-+        _ASM_EXTABLE_UA(89b, .Llarge_read_fault) /* Read */
-+        _ASM_EXTABLE_UA(90b, .Llarge_read_fault) /* Read */
-+        _ASM_EXTABLE_UA(91b, .Llarge_read_fault) /* Read */
-+        _ASM_EXTABLE_UA(92b, .Llarge_read_fault) /* Read */
-+        _ASM_EXTABLE_UA(93b, .Llarge_read_fault) /* Read */
-+        _ASM_EXTABLE_UA(95b, .Llarge_read_fault) /* Prefetch */
-+        _ASM_EXTABLE_UA(96b, .Llarge_write_fault) /* Write */
-+        _ASM_EXTABLE_UA(97b, .Llarge_write_fault) /* Write */
-+        _ASM_EXTABLE_UA(98b, .Llarge_write_fault) /* Write */
-+        _ASM_EXTABLE_UA(99b, .Llarge_write_fault) /* Write */
-+        _ASM_EXTABLE_UA(100b, .Llarge_write_fault) /* Write */
-+        _ASM_EXTABLE_UA(101b, .Llarge_write_fault) /* Write */
-+        _ASM_EXTABLE_UA(102b, .Llarge_write_fault) /* Write */
-+        _ASM_EXTABLE_UA(103b, .Llarge_write_fault) /* Write */
-+        _ASM_EXTABLE_UA(104b, .Lexit_fault) /* ERMS remainder */
  
 -	_ASM_EXTABLE_UA( 0b, 1b)
  SYM_FUNC_END(rep_movs_alternative)
