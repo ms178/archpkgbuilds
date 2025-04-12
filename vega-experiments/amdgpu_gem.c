@@ -42,6 +42,7 @@
 #include "amdgpu_dma_buf.h"
 #include "amdgpu_hmm.h"
 #include "amdgpu_xgmi.h"
+#include "amdgpu_vm.h" // Included in orig, needed for some Vega functions
 
 /* Define constants for Vega memory management */
 #define AMDGPU_VEGA_HBM2_BANK_SIZE (1ULL * 1024 * 1024) /* 1MB HBM2 bank size */
@@ -538,94 +539,6 @@ static void amdgpu_vega_set_buffer_domains(struct amdgpu_device *adev,
 	}
 }
 
-/**
- * amdgpu_gem_fault - Handle page fault for GEM object
- * @vmf: VM fault structure
- *
- * This function is called when a page fault occurs on a GEM object.
- * It handles the page fault by validating BO and applying HBM2-aware
- * prefetch optimization.
- */
-static vm_fault_t amdgpu_gem_fault(struct vm_fault *vmf)
-{
-	struct ttm_buffer_object *bo;
-	struct drm_device *ddev;
-	vm_fault_t ret;
-	int idx;
-
-	if (!vmf || !vmf->vma)
-		return VM_FAULT_SIGBUS;
-
-	bo = vmf->vma->vm_private_data;
-	if (!bo)
-		return VM_FAULT_SIGBUS;
-
-	ddev = bo->base.dev;
-	if (!ddev)
-		return VM_FAULT_SIGBUS;
-
-	ret = ttm_bo_vm_reserve(bo, vmf);
-	if (ret)
-		return ret;
-
-	if (drm_dev_enter(ddev, &idx)) {
-		struct amdgpu_device *adev = drm_to_adev(ddev);
-
-		ret = amdgpu_bo_fault_reserve_notify(bo);
-		if (ret) {
-			drm_dev_exit(idx);
-			goto unlock;
-		}
-
-		/* Vega-specific prefetch optimizations for HBM2 memory */
-		if (adev && adev->asic_type == CHIP_VEGA10) {
-			struct amdgpu_bo *abo = ttm_to_amdgpu_bo(bo);
-			unsigned int prefetch_pages = TTM_BO_VM_NUM_PREFAULT;
-
-			if (abo) {
-				/* Get current VRAM usage for context-aware prefetch */
-				uint32_t vram_usage = amdgpu_vega_get_effective_vram_usage(adev);
-
-				/* Calculate optimal prefetch size based on buffer characteristics */
-				prefetch_pages = amdgpu_vega_determine_optimal_prefetch(
-					adev, abo, TTM_BO_VM_NUM_PREFAULT, vram_usage);
-			}
-
-			ret = ttm_bo_vm_fault_reserved(vmf, vmf->vma->vm_page_prot, prefetch_pages);
-		} else {
-			/* Standard fault handling for other GPUs */
-			ret = ttm_bo_vm_fault_reserved(vmf, vmf->vma->vm_page_prot,
-										   TTM_BO_VM_NUM_PREFAULT);
-		}
-
-		drm_dev_exit(idx);
-	} else {
-		ret = ttm_bo_vm_dummy_page(vmf, vmf->vma->vm_page_prot);
-	}
-	if (ret == VM_FAULT_RETRY && !(vmf->flags & FAULT_FLAG_RETRY_NOWAIT))
-		return ret;
-
-	unlock:
-	dma_resv_unlock(bo->base.resv);
-	return ret;
-}
-
-static const struct vm_operations_struct amdgpu_gem_vm_ops = {
-	.fault = amdgpu_gem_fault,
-	.open = ttm_bo_vm_open,
-	.close = ttm_bo_vm_close,
-	.access = ttm_bo_vm_access
-};
-
-static void amdgpu_gem_object_free(struct drm_gem_object *gobj)
-{
-	struct amdgpu_bo *aobj = gem_to_amdgpu_bo(gobj);
-
-	if (aobj) {
-		amdgpu_hmm_unregister(aobj);
-		ttm_bo_put(&aobj->tbo);
-	}
-}
 
 /**
  * amdgpu_vega_optimize_for_workload - Apply workload-specific optimizations
@@ -694,6 +607,88 @@ static bool amdgpu_vega_optimize_for_workload(struct amdgpu_device *adev,
 				return false;
 }
 
+static vm_fault_t amdgpu_gem_fault(struct vm_fault *vmf)
+{
+	struct ttm_buffer_object *bo;
+	struct drm_device *ddev;
+	vm_fault_t ret;
+	int idx;
+
+	// Start of original code section
+	bo = vmf->vma->vm_private_data;
+	if (!bo) // Added safety check from source
+		return VM_FAULT_SIGBUS;
+
+	ddev = bo->base.dev;
+	if (!ddev) // Added safety check from source
+		return VM_FAULT_SIGBUS;
+	// End of original code section (with safety checks added)
+
+	ret = ttm_bo_vm_reserve(bo, vmf);
+	if (ret)
+		return ret;
+
+	if (drm_dev_enter(ddev, &idx)) {
+		// Start of original code section
+		struct amdgpu_device *adev = drm_to_adev(ddev); // Moved up for Vega check
+		// End of original code section
+
+		ret = amdgpu_bo_fault_reserve_notify(bo);
+		if (ret) {
+			drm_dev_exit(idx);
+			goto unlock;
+		}
+
+		/* Vega-specific prefetch optimizations for HBM2 memory */
+		if (adev && adev->asic_type == CHIP_VEGA10) {
+			struct amdgpu_bo *abo = ttm_to_amdgpu_bo(bo);
+			unsigned int prefetch_pages = TTM_BO_VM_NUM_PREFAULT;
+
+			if (abo) {
+				/* Get current VRAM usage for context-aware prefetch */
+				uint32_t vram_usage = amdgpu_vega_get_effective_vram_usage(adev);
+
+				/* Calculate optimal prefetch size based on buffer characteristics */
+				prefetch_pages = amdgpu_vega_determine_optimal_prefetch(
+					adev, abo, TTM_BO_VM_NUM_PREFAULT, vram_usage);
+			}
+
+			ret = ttm_bo_vm_fault_reserved(vmf, vmf->vma->vm_page_prot, prefetch_pages);
+		} else {
+			/* Standard fault handling for other GPUs */
+			ret = ttm_bo_vm_fault_reserved(vmf, vmf->vma->vm_page_prot,
+										   TTM_BO_VM_NUM_PREFAULT);
+		}
+
+		drm_dev_exit(idx);
+	} else {
+		ret = ttm_bo_vm_dummy_page(vmf, vmf->vma->vm_page_prot);
+	}
+	if (ret == VM_FAULT_RETRY && !(vmf->flags & FAULT_FLAG_RETRY_NOWAIT))
+		return ret;
+
+	unlock:
+	dma_resv_unlock(bo->base.resv);
+	return ret;
+}
+
+static const struct vm_operations_struct amdgpu_gem_vm_ops = {
+	.fault = amdgpu_gem_fault,
+	.open = ttm_bo_vm_open,
+	.close = ttm_bo_vm_close,
+	.access = ttm_bo_vm_access
+};
+
+static void amdgpu_gem_object_free(struct drm_gem_object *gobj)
+{
+	struct amdgpu_bo *aobj = gem_to_amdgpu_bo(gobj);
+
+	if (aobj) { // Added check from source
+		amdgpu_hmm_unregister(aobj);
+		ttm_bo_put(&aobj->tbo);
+	}
+}
+
 int amdgpu_gem_object_create(struct amdgpu_device *adev, unsigned long size,
 							 int alignment, u32 initial_domain,
 							 u64 flags, enum ttm_bo_type type,
@@ -705,7 +700,7 @@ int amdgpu_gem_object_create(struct amdgpu_device *adev, unsigned long size,
 	struct amdgpu_bo_param bp;
 	int r;
 
-	if (!adev || !obj)
+	if (!adev || !obj) // Added check from source
 		return -EINVAL;
 
 	memset(&bp, 0, sizeof(bp));
@@ -741,6 +736,7 @@ int amdgpu_gem_object_create(struct amdgpu_device *adev, unsigned long size,
 		}
 	}
 
+
 	bp.type = type;
 	bp.resv = resv;
 	bp.preferred_domain = initial_domain;
@@ -760,13 +756,14 @@ int amdgpu_gem_object_create(struct amdgpu_device *adev, unsigned long size,
 		/* For compute buffers, apply specialized optimization */
 		if (bo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) {
 			/* amdgpu_vega_set_compute_placement expects uint64_t size */
+			/* BO needs reservation lock here, which is held during creation */
 			amdgpu_vega_set_compute_placement(adev, bo, (uint64_t)size, &bo->preferred_domains);
 		}
 
 		/* Apply workload-specific optimizations - bo is already reserved during creation */
 		amdgpu_vega_optimize_for_workload(adev, bo, flags);
 
-		/* Apply general domain optimizations */
+		/* Apply general domain optimizations - needs lock */
 		amdgpu_vega_set_buffer_domains(adev, bo);
 	}
 
@@ -799,15 +796,9 @@ void amdgpu_gem_force_release(struct amdgpu_device *adev)
 	mutex_unlock(&ddev->filelist_mutex);
 }
 
-/**
- * amdgpu_gem_object_open - Handle opening of a GEM object
- * @obj: The GEM object being opened
- * @file_priv: The file private data
- *
- * Called from drm_gem_handle_create which appears in both new and open ioctl
- * case. Optimized for all workloads including API translation layers.
- *
- * Returns: 0 on success or negative error code
+/*
+ * Call from drm_gem_handle_create which appear in both new and open ioctl
+ * case.
  */
 static int amdgpu_gem_object_open(struct drm_gem_object *obj,
 								  struct drm_file *file_priv)
@@ -820,57 +811,70 @@ static int amdgpu_gem_object_open(struct drm_gem_object *obj,
 	struct mm_struct *mm;
 	int r;
 
-	if (!obj || !file_priv)
+	// Start of original code section (with source checks added)
+	if (!obj || !file_priv) // Added check from source
 		return -EINVAL;
 
 	abo = gem_to_amdgpu_bo(obj);
-	if (!abo)
+	if (!abo) // Added check from source
 		return -EINVAL;
 
 	adev = amdgpu_ttm_adev(abo->tbo.bdev);
-	if (!adev)
+	if (!adev) // Added check from source
 		return -EINVAL;
 
 	fpriv = file_priv->driver_priv;
-	if (!fpriv)
+	if (!fpriv) // Added check from source
 		return -EINVAL;
 
 	vm = &fpriv->vm;
+	// End of original code section (with source checks added)
 
-	/* Early check: ensure the BO's backing store is used in the proper process context */
 	mm = amdgpu_ttm_tt_get_usermm(abo->tbo.ttm);
 	if (mm && mm != current->mm)
 		return -EPERM;
 
 	/* For BOs with ALWAYS_VALID flag, ensure that the VM mapping has been pre-validated */
+	// Merged check from source
 	if ((abo->flags & AMDGPU_GEM_CREATE_VM_ALWAYS_VALID) &&
 		!amdgpu_vm_is_bo_always_valid(vm, abo))
 		return -EPERM;
 
-	/* Reserve the BO to serialize any concurrent updates to the BO-VA mapping */
 	r = amdgpu_bo_reserve(abo, false);
 	if (r)
 		return r;
 
+	// Merged amdgpu_vm_bo_update_shared call from orig into find/add logic
 	bo_va = amdgpu_vm_bo_find(vm, abo);
-	if (!bo_va)
+	if (!bo_va) {
+		amdgpu_vm_bo_update_shared(abo); // From orig, call before add
 		bo_va = amdgpu_vm_bo_add(adev, vm, abo);
-	else
+	} else {
+		amdgpu_vm_bo_update_shared(abo); // From orig, call before increment
 		++bo_va->ref_count;
-
+	}
 	amdgpu_bo_unreserve(abo);
 
-	/* For BOs imported through dma-buf (with dynamic attachment) we must run
-	 * full fence validation to guarantee correct page table synchronization
+	/* Validate and add eviction fence to DMABuf imports with dynamic
+	 * attachment in compute VMs. Re-validation will be done by
+	 * amdgpu_vm_validate. Fences are on the reservation shared with the
+	 * export, which is currently required to be validated and fenced
+	 * already by amdgpu_amdkfd_gpuvm_restore_process_bos.
+	 *
+	 * Nested locking below for the case that a GEM object is opened in
+	 * kfd_mem_export_dmabuf. Since the lock below is only taken for imports,
+	 * but not for export, this is a different lock class that cannot lead to
+	 * circular lock dependencies.
 	 */
 	if (!vm->is_compute_context || !vm->process_info)
 		return 0;
-	if (!obj->import_attach || !dma_buf_is_dynamic(obj->import_attach->dmabuf))
+	if (!obj->import_attach ||
+		!dma_buf_is_dynamic(obj->import_attach->dmabuf))
 		return 0;
 
 	/* Lock process_info to run eviction fence validation */
 	mutex_lock_nested(&vm->process_info->lock, 1);
-	lockdep_assert_held(&vm->process_info->lock);
+	lockdep_assert_held(&vm->process_info->lock); // Added from source
 
 	if (!WARN_ON(!vm->process_info->eviction_fence)) {
 		/* For Vega GPUs, use domain-optimized validation for imported buffers */
@@ -887,10 +891,10 @@ static int amdgpu_gem_object_open(struct drm_gem_object *obj,
 				domain = AMDGPU_GEM_DOMAIN_GTT;
 			}
 				}
-
 				r = amdgpu_amdkfd_bo_validate_and_fence(abo, domain,
 														&vm->process_info->eviction_fence->base);
 		} else {
+			/* Original non-Vega path */
 			r = amdgpu_amdkfd_bo_validate_and_fence(abo,
 													AMDGPU_GEM_DOMAIN_GTT,
 										   &vm->process_info->eviction_fence->base);
@@ -911,14 +915,6 @@ static int amdgpu_gem_object_open(struct drm_gem_object *obj,
 	return r;
 }
 
-/**
- * amdgpu_gem_object_close - Handle closing of a GEM object
- * @obj: The GEM object being closed
- * @file_priv: The file private data
- *
- * Called when a handle to a GEM object is closed. Optimized with
- * selective asynchronous fencing for improved performance.
- */
 static void amdgpu_gem_object_close(struct drm_gem_object *obj,
 									struct drm_file *file_priv)
 {
@@ -929,25 +925,27 @@ static void amdgpu_gem_object_close(struct drm_gem_object *obj,
 	struct dma_fence *fence = NULL;
 	struct amdgpu_bo_va *bo_va;
 	struct drm_exec exec;
-	long r = 0;
-	bool use_async = false;
+	long r = 0; // Initialize r from source
+	bool use_async = false; // Default to sync fence
 
-	if (!obj || !file_priv)
+	// Start of original code section (with source checks)
+	if (!obj || !file_priv) // Added check from source
 		return;
 
 	bo = gem_to_amdgpu_bo(obj);
-	if (!bo)
+	if (!bo) // Added check from source
 		return;
 
 	adev = amdgpu_ttm_adev(bo->tbo.bdev);
-	if (!adev)
+	if (!adev) // Added check from source
 		return;
 
 	fpriv = file_priv->driver_priv;
-	if (!fpriv)
+	if (!fpriv) // Added check from source
 		return;
 
 	vm = &fpriv->vm;
+	// End of original code section (with source checks)
 
 	/* For Vega, determine if we can use async fencing */
 	if (adev->asic_type == CHIP_VEGA10) {
@@ -969,35 +967,38 @@ static void amdgpu_gem_object_close(struct drm_gem_object *obj,
 	}
 
 	bo_va = amdgpu_vm_bo_find(vm, bo);
-	if (!bo_va)
+	// Start of combined logic from source and orig
+	if (!bo_va) // Simplified check from source
 		goto out_unlock;
 
 	/* Use proper reference counting */
-	if (--bo_va->ref_count > 0)
+	if (--bo_va->ref_count > 0) // Logic from source
 		goto out_unlock;
 
 	/* Remove the BO-VA mapping, as reference count is now zero */
-	amdgpu_vm_bo_del(adev, bo_va);
+	amdgpu_vm_bo_del(adev, bo_va); // Logic from source
+	amdgpu_vm_bo_update_shared(bo); // Added from orig
+	// End of combined logic
 
 	if (!amdgpu_vm_ready(vm))
 		goto out_unlock;
 
 	r = amdgpu_vm_clear_freed(adev, vm, &fence);
 	if (unlikely(r < 0)) {
+		// Use error message from source
 		dev_err(adev->dev, "failed to clear page tables on GEM object close (%ld)\n", r);
 		goto out_unlock;
 	}
-
 	if (r || !fence)
 		goto out_unlock;
 
 	/* Fence the BO - use async for eligible buffers to improve performance */
-	amdgpu_bo_fence(bo, fence, use_async);
+	amdgpu_bo_fence(bo, fence, use_async); // Use calculated use_async flag
 	dma_fence_put(fence);
 
 	out_unlock:
 	if (r) {
-		/* Error message without trying to access unavailable handle */
+		// Use error message from source
 		dev_err(adev->dev, "Error in GEM object close for pid %d, potential leak of bo_va (%ld)\n",
 				task_pid_nr(current), r);
 	}
@@ -1058,6 +1059,7 @@ int amdgpu_gem_create_ioctl(struct drm_device *dev, void *data,
 		return -EINVAL;
 
 	/* reject invalid gem flags */
+	// Flag list updated from orig
 	if (flags & ~(AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED |
 		AMDGPU_GEM_CREATE_NO_CPU_ACCESS |
 		AMDGPU_GEM_CREATE_CPU_GTT_USWC |
@@ -1103,8 +1105,8 @@ int amdgpu_gem_create_ioctl(struct drm_device *dev, void *data,
 		}
 
 		initial_domain = (u32)(0xffffffff & args->in.domains);
-
 		retry:
+		// Call to amdgpu_gem_object_create now includes Vega optimizations
 		r = amdgpu_gem_object_create(adev, size, args->in.alignment,
 									 initial_domain,
 							   flags, ttm_bo_type_device, resv, &gobj, fpriv->xcp_id + 1);
@@ -1163,6 +1165,7 @@ int amdgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
 		return -EINVAL;
 
 	/* reject unknown flag values */
+	// Flag list from orig
 	if (args->flags & ~(AMDGPU_GEM_USERPTR_READONLY |
 		AMDGPU_GEM_USERPTR_ANONONLY | AMDGPU_GEM_USERPTR_VALIDATE |
 		AMDGPU_GEM_USERPTR_REGISTER))
@@ -1176,6 +1179,7 @@ int amdgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
 		}
 
 		/* create a gem object to contain this object in */
+		// Call to amdgpu_gem_object_create now includes Vega optimizations
 		r = amdgpu_gem_object_create(adev, args->size, 0, AMDGPU_GEM_DOMAIN_CPU,
 									 0, ttm_bo_type_device, NULL, &gobj, fpriv->xcp_id + 1);
 		if (r)
@@ -1221,6 +1225,7 @@ int amdgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
 
 	release_object:
 	drm_gem_object_put(gobj);
+
 	return r;
 }
 
@@ -1327,10 +1332,8 @@ int amdgpu_gem_metadata_ioctl(struct drm_device *dev, void *data,
 
 	DRM_DEBUG("%d\n", args->handle);
 	gobj = drm_gem_object_lookup(filp, args->handle);
-	if (gobj == NULL) {
+	if (gobj == NULL)
 		return -ENOENT;
-	}
-
 	robj = gem_to_amdgpu_bo(gobj);
 
 	r = amdgpu_bo_reserve(robj, false);
@@ -1425,8 +1428,10 @@ uint64_t amdgpu_gem_va_map_flags(struct amdgpu_device *adev, uint32_t flags)
 		pte_flag |= AMDGPU_PTE_NOALLOC;
 
 	/* Simplified null check - only check the function pointer */
-	if (adev->gmc.gmc_funcs && adev->gmc.gmc_funcs->map_mtype)
-		pte_flag |= amdgpu_gmc_map_mtype(adev, flags & AMDGPU_VM_MTYPE_MASK);
+	if (adev->gmc.gmc_funcs && adev->gmc.gmc_funcs->map_mtype) { /* Fixed Line */
+		pte_flag |= amdgpu_gmc_map_mtype(adev,
+										 flags & AMDGPU_VM_MTYPE_MASK);
+	} /* Fixed Line */
 
 	return pte_flag;
 }
@@ -1500,9 +1505,9 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 	if ((args->operation != AMDGPU_VA_OP_CLEAR) &&
 		!(args->flags & AMDGPU_VM_PAGE_PRT)) {
 		gobj = drm_gem_object_lookup(filp, args->handle);
-	if (gobj == NULL) {
+	if (gobj == NULL) { /* Fixed Line */
 		return -ENOENT;
-	}
+	} /* Fixed Line */
 	abo = gem_to_amdgpu_bo(gobj);
 		} else {
 			gobj = NULL;
@@ -1537,6 +1542,7 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 			bo_va = NULL;
 		}
 
+		/* Apply Vega-specific workload optimization if mapping/replacing */
 		if (abo && adev->asic_type == CHIP_VEGA10) {
 			/* Buffer is already locked by drm_exec at this point, verify lock */
 			if (dma_resv_is_locked(abo->tbo.base.resv)) {
@@ -1576,7 +1582,7 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 
 			error:
 			drm_exec_fini(&exec);
-		if (gobj)
+		if (gobj) // Check added from source
 			drm_gem_object_put(gobj);
 	return r;
 }
@@ -1584,7 +1590,7 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 int amdgpu_gem_op_ioctl(struct drm_device *dev, void *data,
 						struct drm_file *filp)
 {
-	struct amdgpu_device *adev = drm_to_adev(dev);
+	struct amdgpu_device *adev = drm_to_adev(dev); // Added for Vega check
 	struct drm_amdgpu_gem_op *args = data;
 	struct drm_gem_object *gobj;
 	struct amdgpu_vm_bo_base *base;
@@ -1635,6 +1641,7 @@ int amdgpu_gem_op_ioctl(struct drm_device *dev, void *data,
 				goto out;
 						}
 
+
 						robj->preferred_domains = args->value & (AMDGPU_GEM_DOMAIN_VRAM |
 						AMDGPU_GEM_DOMAIN_GTT |
 						AMDGPU_GEM_DOMAIN_CPU);
@@ -1647,8 +1654,9 @@ int amdgpu_gem_op_ioctl(struct drm_device *dev, void *data,
 			amdgpu_vega_optimize_for_workload(adev, robj, robj->flags);
 		}
 
-		if (robj->flags & AMDGPU_GEM_CREATE_VM_ALWAYS_VALID)
-			amdgpu_vm_bo_invalidate(adev, robj, true);
+		if (robj->flags & AMDGPU_GEM_CREATE_VM_ALWAYS_VALID) { /* Fixed Line */
+			amdgpu_vm_bo_invalidate(robj, true); // Changed from amdgpu_vm_bo_invalidate(adev, robj, true); in source
+		} /* Fixed Line */
 
 		amdgpu_bo_unreserve(robj);
 		break;
@@ -1714,7 +1722,6 @@ int amdgpu_mode_dumb_create(struct drm_file *file_priv,
 										 DIV_ROUND_UP(args->bpp, 8), 0);
 	args->size = (u64)args->pitch * args->height;
 	args->size = ALIGN(args->size, PAGE_SIZE);
-
 	domain = amdgpu_bo_get_preferred_domain(adev,
 											amdgpu_display_supported_domains(adev, flags));
 
@@ -1724,6 +1731,7 @@ int amdgpu_mode_dumb_create(struct drm_file *file_priv,
 		uint64_t optimized_size = args->size;
 
 		/* Optimize dumb buffer alignment and size for HBM2 memory */
+		/* alignment value from optimize_hbm2_bank_access is used here */
 		amdgpu_vega_optimize_hbm2_bank_access(adev, NULL, &optimized_size, &alignment);
 
 		/* Use optimized alignment in buffer creation */
@@ -1739,10 +1747,12 @@ int amdgpu_mode_dumb_create(struct drm_file *file_priv,
 			args->handle = handle;
 			return 0;
 		}
-		/* Fall through to normal path if Vega optimization fails */
+		/* Fall through to normal path if Vega optimization fails or r != 0 */
 	}
 
-	/* Original path for non-Vega or if optimization failed */
+	/* Original path for non-Vega or if Vega optimization failed */
+	// Call to amdgpu_gem_object_create now includes Vega optimizations,
+	// but here we use default alignment 0 as in the original code.
 	r = amdgpu_gem_object_create(adev, args->size, 0, domain, flags,
 								 ttm_bo_type_device, NULL, &gobj, fpriv->xcp_id + 1);
 	if (r)
