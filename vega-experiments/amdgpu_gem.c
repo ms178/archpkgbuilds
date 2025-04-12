@@ -143,8 +143,9 @@ static uint32_t amdgpu_vega_get_effective_vram_usage(struct amdgpu_device *adev)
  * @flags: Buffer creation flags
  * @domain: Pointer to domain flags to be modified
  *
- * Optimizes buffer placement for Vega GPUs based on workload classification.
- * Specifically tuned for DX12/Vulkan native and DXVK translation performance.
+ * Optimizes buffer placement for Vega GPUs based on buffer characteristics
+ * and memory pressure. Balances native Vulkan/DX12 performance with
+ * translation layer (DXVK, VKD3D-Proton) needs.
  *
  * Returns: true if placement was optimized, false otherwise
  */
@@ -163,101 +164,146 @@ static bool amdgpu_vega_optimize_buffer_placement(struct amdgpu_device *adev,
 	/* Get current VRAM usage percentage */
 	vram_usage = amdgpu_vega_get_effective_vram_usage(adev);
 
-	/* Validate module parameters to ensure they're in valid range */
-	if (amdgpu_vega_vram_pressure_low > 100 || amdgpu_vega_vram_pressure_mid > 100 ||
-		amdgpu_vega_vram_pressure_high > 100) {
-		/* Use safe defaults if invalid */
-		vram_usage = min_t(uint32_t, vram_usage, 85);
-		}
+	/* Validate module parameters */
+	amdgpu_vega_vram_pressure_low = clamp(amdgpu_vega_vram_pressure_low, 0, 100);
+	amdgpu_vega_vram_pressure_mid = clamp(amdgpu_vega_vram_pressure_mid, 0, 100);
+	amdgpu_vega_vram_pressure_high = clamp(amdgpu_vega_vram_pressure_high, 0, 100);
 
-		/*
-		 * Category 1: Textures and framebuffer resources (critical for gaming)
-		 * For DX12/Vulkan games, textures are performance-critical and benefit
-		 * greatly from HBM2 bandwidth
-		 */
-		if (flags & AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS) {
-			if (vram_usage >= amdgpu_vega_vram_pressure_high &&
-				size < AMDGPU_VEGA_MEDIUM_BUFFER_SIZE) {
-				/* Small textures can use GTT under extreme pressure */
-				*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) | AMDGPU_GEM_DOMAIN_GTT;
-				} else {
-					/* Prioritize VRAM for textures - critical for game performance */
-					*domain |= AMDGPU_GEM_DOMAIN_VRAM;
-				}
-				return true;
-		}
+	/* Ensure thresholds are ordered properly */
+	if (amdgpu_vega_vram_pressure_mid < amdgpu_vega_vram_pressure_low)
+		amdgpu_vega_vram_pressure_mid = amdgpu_vega_vram_pressure_low;
+	if (amdgpu_vega_vram_pressure_high < amdgpu_vega_vram_pressure_mid)
+		amdgpu_vega_vram_pressure_high = amdgpu_vega_vram_pressure_mid;
 
-		/*
-		 * Category 2: Compute resources (shader storage, image buffers)
-		 * DX12/Vulkan games heavily use compute shaders that need maximum bandwidth
-		 */
-		if (flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) {
-			if (vram_usage >= amdgpu_vega_vram_pressure_high &&
-				size > AMDGPU_VEGA_LARGE_BUFFER_SIZE) {
-				/* Very large compute buffers can use GTT under extreme pressure */
-				*domain |= AMDGPU_GEM_DOMAIN_GTT;
-				} else {
-					/* Keep compute resources in VRAM for best performance */
-					*domain |= AMDGPU_GEM_DOMAIN_VRAM;
-				}
-				return true;
-		}
-
-		/*
-		 * Category 3: Small buffers with CPU access (DXVK translation buffers)
-		 * DXVK generates many small, CPU-accessible buffers for API translation
-		 */
-		if (size <= AMDGPU_VEGA_SMALL_BUFFER_SIZE &&
-			(flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED)) {
-			if (vram_usage >= amdgpu_vega_vram_pressure_mid) {
-				/* Keep translation buffers in GTT under medium+ pressure */
-				*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) | AMDGPU_GEM_DOMAIN_GTT;
-			} else if (*domain == 0) {
-				/* Under low pressure, still prefer GTT for better CPU access */
-				*domain |= AMDGPU_GEM_DOMAIN_GTT;
+	/*
+	 * Category 1: Textures and framebuffer resources (VRAM_CONTIGUOUS)
+	 * These are critical for gaming performance and benefit greatly from HBM2 bandwidth
+	 */
+	if (flags & AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS) {
+		if (vram_usage >= amdgpu_vega_vram_pressure_high &&
+			size < AMDGPU_VEGA_MEDIUM_BUFFER_SIZE) {
+			/* Small textures can use GTT under high pressure */
+			*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) | AMDGPU_GEM_DOMAIN_GTT;
+			} else {
+				/* Keep textures in VRAM otherwise - critical for performance */
+				*domain |= AMDGPU_GEM_DOMAIN_VRAM;
 			}
 			return true;
-			}
+	}
 
-			/*
-			 * Category 4: Medium buffers (mixed usage)
-			 * Often used for dynamic resources or intermediate results
-			 */
-			if (size > AMDGPU_VEGA_SMALL_BUFFER_SIZE &&
-				size <= AMDGPU_VEGA_MEDIUM_BUFFER_SIZE) {
-				if (vram_usage >= amdgpu_vega_vram_pressure_mid) {
-					/* Use GTT under pressure */
-					*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) | AMDGPU_GEM_DOMAIN_GTT;
-				} else if (*domain == 0) {
-					/* Prefer VRAM for better GPU access */
+	/*
+	 * Category 2: Compute resources (NO_CPU_ACCESS)
+	 * These benefit from HBM2 bandwidth for compute shaders
+	 */
+	if (flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) {
+		if (vram_usage >= amdgpu_vega_vram_pressure_high &&
+			size > AMDGPU_VEGA_LARGE_BUFFER_SIZE) {
+			/* Very large compute buffers can use GTT under high pressure */
+			*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) | AMDGPU_GEM_DOMAIN_GTT;
+			} else {
+				/* Keep compute resources in VRAM otherwise */
+				*domain |= AMDGPU_GEM_DOMAIN_VRAM;
+			}
+			return true;
+	}
+
+	/*
+	 * Category 3: CPU-accessible resources (CPU_ACCESS_REQUIRED)
+	 * These need careful handling to balance CPU access with GPU performance
+	 * Critical for translation layers like DXVK and VKD3D-Proton
+	 */
+	if (flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED) {
+		/* Small CPU-accessible buffers */
+		if (size <= AMDGPU_VEGA_SMALL_BUFFER_SIZE) {
+			if (vram_usage >= amdgpu_vega_vram_pressure_high) {
+				/* Only force GTT under high pressure */
+				*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) | AMDGPU_GEM_DOMAIN_GTT;
+			} else if (*domain == 0) {
+				/* If domain is unspecified, prefer GTT for small CPU-accessible buffers */
+				*domain |= AMDGPU_GEM_DOMAIN_GTT;
+			}
+			/* Otherwise respect the user's domain choice */
+			return true;
+		}
+
+		/* Medium CPU-accessible buffers */
+		if (size <= AMDGPU_VEGA_MEDIUM_BUFFER_SIZE) {
+			if (vram_usage >= amdgpu_vega_vram_pressure_high) {
+				/* Only force GTT under high pressure */
+				*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) | AMDGPU_GEM_DOMAIN_GTT;
+			} else if (*domain == 0) {
+				/* If domain is unspecified, prefer VRAM for medium CPU-accessible buffers
+				 * This helps DXVK performance for GPU-bound resources that need CPU access
+				 */
+				*domain |= AMDGPU_GEM_DOMAIN_VRAM;
+			}
+			/* Otherwise respect the user's domain choice */
+			return true;
+		}
+
+		/* Large CPU-accessible buffers */
+		if (size > AMDGPU_VEGA_MEDIUM_BUFFER_SIZE) {
+			if (vram_usage >= amdgpu_vega_vram_pressure_high) {
+				/* Force GTT only under high pressure */
+				*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) | AMDGPU_GEM_DOMAIN_GTT;
+			} else if (*domain == 0) {
+				/* If domain is unspecified, decide based on size */
+				if (size > AMDGPU_VEGA_LARGE_BUFFER_SIZE) {
+					/* Very large buffers default to GTT */
+					*domain |= AMDGPU_GEM_DOMAIN_GTT;
+				} else {
+					/* Large but not huge buffers default to VRAM
+					 * This helps with large textures in DXVK that need CPU access
+					 */
 					*domain |= AMDGPU_GEM_DOMAIN_VRAM;
 				}
-				return true;
-				}
+			}
+			/* Otherwise respect the user's domain choice */
+			return true;
+		}
+	}
 
-				/*
-				 * Category 5: Large buffers
-				 * Typically used for large geometry, large textures, or large compute data
-				 */
-				if (size > AMDGPU_VEGA_MEDIUM_BUFFER_SIZE) {
-					/* For DX12/Vulkan, some large buffers are critical for performance */
-					if ((flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) &&
-						vram_usage < amdgpu_vega_vram_pressure_mid) {
-						/* Large shader buffers benefit from VRAM when pressure isn't high */
-						*domain |= AMDGPU_GEM_DOMAIN_VRAM;
-						} else if (vram_usage >= amdgpu_vega_vram_pressure_low &&
-							!(*domain & AMDGPU_GEM_DOMAIN_VRAM)) {
-							/* Otherwise use GTT for large buffers unless explicitly VRAM */
-							*domain |= AMDGPU_GEM_DOMAIN_GTT;
-							} else if (*domain == 0) {
-								/* Default large allocations to GTT unless otherwise specified */
-								*domain |= AMDGPU_GEM_DOMAIN_GTT;
-							}
-							return true;
-				}
+	/*
+	 * Category 4: Generic resources (no special flags)
+	 * Use a balanced approach based on size and pressure
+	 */
 
-				/* No specific optimization applied */
-				return false;
+	/* Small generic buffers */
+	if (size <= AMDGPU_VEGA_SMALL_BUFFER_SIZE) {
+		if (vram_usage >= amdgpu_vega_vram_pressure_high) {
+			/* Under high pressure, use GTT */
+			*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) | AMDGPU_GEM_DOMAIN_GTT;
+		} else if (*domain == 0) {
+			/* Default to VRAM for small generic buffers */
+			*domain |= AMDGPU_GEM_DOMAIN_VRAM;
+		}
+		return true;
+	}
+
+	/* Medium generic buffers */
+	if (size <= AMDGPU_VEGA_MEDIUM_BUFFER_SIZE) {
+		if (vram_usage >= amdgpu_vega_vram_pressure_high) {
+			/* Under high pressure, use GTT */
+			*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) | AMDGPU_GEM_DOMAIN_GTT;
+		} else if (*domain == 0) {
+			/* Default to VRAM for medium generic buffers */
+			*domain |= AMDGPU_GEM_DOMAIN_VRAM;
+		}
+		return true;
+	}
+
+	/* Large generic buffers */
+	if (vram_usage >= amdgpu_vega_vram_pressure_high) {
+		/* Only under high pressure, use GTT for large generic buffers */
+		*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) | AMDGPU_GEM_DOMAIN_GTT;
+	} else if (*domain == 0) {
+		/* Default to VRAM for large generic buffers unless pressure is high
+		 * This helps with large resources that might be GPU-bound
+		 */
+		*domain |= AMDGPU_GEM_DOMAIN_VRAM;
+	}
+
+	return true;
 }
 
 /**

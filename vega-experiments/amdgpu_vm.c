@@ -30,6 +30,7 @@
 #include <linux/interval_tree_generic.h>
 #include <linux/idr.h>
 #include <linux/dma-buf.h>
+#include <linux/list_sort.h>
 
 #include <drm/amdgpu_drm.h>
 #include <drm/drm_drv.h>
@@ -361,39 +362,99 @@ void amdgpu_vm_bo_update_shared(struct amdgpu_bo *bo)
  * amdgpu_vm_update_stats_locked - helper to update normal memory stat
  * @base: base structure for tracking BO usage in a VM
  * @res:  the ttm_resource to use for the purpose of accounting, may or may not
- *        be bo->tbo.resource
+ *        be bo->tbo.resource. Can be NULL, especially during decrement.
  * @sign: if we should add (+1) or subtract (-1) from the stat
  *
- * Caller need to have the vm status_lock held. Useful for when multiple update
- * need to happen at the same time.
+ * Updates the basic memory stat when bo is added/deleted/moved.
+ * Uses base->last_stat_memtype to track residency for accurate decrement.
+ * Caller must hold the vm status_lock.
  */
 static void amdgpu_vm_update_stats_locked(struct amdgpu_vm_bo_base *base,
-			    struct ttm_resource *res, int sign)
+										  struct ttm_resource *res, int sign)
 {
 	struct amdgpu_vm *vm = base->vm;
 	struct amdgpu_bo *bo = base->bo;
-	int64_t size = sign * amdgpu_bo_size(bo);
-	uint32_t bo_memtype = amdgpu_bo_mem_stats_placement(bo);
+	int64_t size;
+	uint32_t bo_memtype; /* The BO's preferred/intended placement */
+	uint32_t stat_memtype; /* The placement type for resident/evicted stats */
+	/* Get adev for logging context, assume vm and root.bo are valid */
+	struct amdgpu_device *adev = vm ? amdgpu_ttm_adev(vm->root.bo->tbo.bdev) : NULL;
 
-	/* For drm-total- and drm-shared-, BO are accounted by their preferred
-	 * placement, see also amdgpu_bo_mem_stats_placement.
-	 */
+
+	/* Can happen if BO is destroyed before VM or VM context is gone */
+	if (!bo || !vm || !adev)
+		return;
+
+	size = sign * amdgpu_bo_size(bo);
+	bo_memtype = amdgpu_bo_mem_stats_placement(bo);
+
+	/* Update private/shared count based on the preferred placement */
 	if (base->shared)
 		vm->stats[bo_memtype].drm.shared += size;
 	else
 		vm->stats[bo_memtype].drm.private += size;
 
-	if (res && res->mem_type < __AMDGPU_PL_NUM) {
-		uint32_t res_memtype = res->mem_type;
+	/* Determine the memory type for resident/evicted/purgeable stats */
+	if (sign == 1) {
+		/* --- Incrementing --- */
+		/* Use current resource if valid, otherwise assume preferred */
+		if (res && res->mem_type < __AMDGPU_PL_NUM) {
+			stat_memtype = res->mem_type;
+		} else {
+			/* BO is being added but has no TTM resource yet? Count as preferred */
+			stat_memtype = bo_memtype;
+			/* Note: This BO is not 'resident' anywhere yet in TTM terms */
+			/* We only update the private/shared counts above */
+			/* Let's skip resident/evicted/purgeable update for now in this unusual case */
+			/* OR should we count it as resident in preferred? Let's stick to TTM view */
+			/* If res is NULL, it implies not resident in TTM PL_* domains */
+			/* We'll store the intended type, but not mark resident yet */
+			base->last_stat_memtype = stat_memtype;
+			return; // Skip rest of updates if no resource on increment
+		}
+		/* Store the type used for this increment */
+		base->last_stat_memtype = stat_memtype;
 
-		vm->stats[res_memtype].drm.resident += size;
-		/* BO only count as purgeable if it is resident,
-		 * since otherwise there's nothing to purge.
-		 */
-		if (bo->flags & AMDGPU_GEM_CREATE_DISCARDABLE)
-			vm->stats[res_memtype].drm.purgeable += size;
-		if (!(bo->preferred_domains & amdgpu_mem_type_to_domain(res_memtype)))
+	} else { /* --- Decrementing (sign == -1) --- */
+		/* Use the LAST stored type */
+		stat_memtype = base->last_stat_memtype;
+
+		/* Fallback if last_stat_memtype was somehow never set */
+		if (stat_memtype >= __AMDGPU_PL_NUM) {
+			/* === FIX: Use %lu for unsigned long === */
+			dev_warn_once(adev->dev, "VM stats decrementing BO %p (size %lu) with invalid last_stat_memtype, falling back to bo_memtype %u\n",
+						  bo, amdgpu_bo_size(bo), bo_memtype);
+			stat_memtype = bo_memtype;
+			/* Set last_stat_memtype to the fallback used, for consistency */
+			base->last_stat_memtype = stat_memtype;
+		}
+		/* We don't reset last_stat_memtype after decrement, its last state remains */
+	}
+
+	/* --- Update resident/evicted/purgeable based on determined stat_memtype --- */
+
+	/* Update resident count for the determined stat_memtype */
+	/* Only apply if stat_memtype is a valid TTM placement */
+	if (stat_memtype < __AMDGPU_PL_NUM) {
+		vm->stats[stat_memtype].drm.resident += size;
+
+		/* Update purgeable count if applicable */
+		if (bo->flags & AMDGPU_GEM_CREATE_DISCARDABLE) {
+			/* size is negative during decrement, positive during increment */
+			vm->stats[stat_memtype].drm.purgeable += size;
+		}
+
+		/* Update evicted count for the preferred domain (bo_memtype) if */
+		/* the current/last known placement (stat_memtype) doesn't match it. */
+		if (!(bo->preferred_domains & amdgpu_mem_type_to_domain(stat_memtype))) {
 			vm->stats[bo_memtype].evicted += size;
+		}
+	} else {
+		/* This case might occur if the BO was counted but never placed */
+		/* E.g., if we skipped the resident update during increment */
+		/* === FIX: Use %lu for unsigned long === */
+		dev_warn_once(adev->dev, "VM stats skipping resident/evicted update for BO %p (size %lu) due to invalid stat_memtype %u\n",
+					  bo, amdgpu_bo_size(bo), stat_memtype);
 	}
 }
 
@@ -427,11 +488,12 @@ void amdgpu_vm_update_stats(struct amdgpu_vm_bo_base *base,
  *
  */
 void amdgpu_vm_bo_base_init(struct amdgpu_vm_bo_base *base,
-			    struct amdgpu_vm *vm, struct amdgpu_bo *bo)
+							struct amdgpu_vm *vm, struct amdgpu_bo *bo)
 {
 	base->vm = vm;
 	base->bo = bo;
 	base->next = NULL;
+	base->last_stat_memtype = __AMDGPU_PL_NUM; /* Initialize as invalid */
 	INIT_LIST_HEAD(&base->vm_status);
 
 	if (!bo)
@@ -441,6 +503,7 @@ void amdgpu_vm_bo_base_init(struct amdgpu_vm_bo_base *base,
 
 	spin_lock(&vm->status_lock);
 	base->shared = drm_gem_object_is_shared_for_memory_stats(&bo->tbo.base);
+	/* Call update_stats (+1) which will now store last_stat_memtype */
 	amdgpu_vm_update_stats_locked(base, bo->tbo.resource, +1);
 	spin_unlock(&vm->status_lock);
 
@@ -456,7 +519,7 @@ void amdgpu_vm_bo_base_init(struct amdgpu_vm_bo_base *base,
 		amdgpu_vm_bo_idle(base);
 
 	if (bo->preferred_domains &
-	    amdgpu_mem_type_to_domain(bo->tbo.resource->mem_type))
+		amdgpu_mem_type_to_domain(bo->tbo.resource->mem_type))
 		return;
 
 	/*
@@ -1485,29 +1548,63 @@ static void amdgpu_vm_prt_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
 }
 
 /**
- * amdgpu_vm_clear_freed - clear freed BOs in the PT
+ * compare_mappings - Helper function to compare mappings for sorting.
+ * @priv: Unused private data for list_sort.
+ * @a: LHS list_head.
+ * @b: RHS list_head.
+ *
+ * Compares two amdgpu_bo_va_mapping structures based on their start address.
+ */
+static int compare_mappings(void *priv, const struct list_head *a,
+							const struct list_head *b)
+{
+	struct amdgpu_bo_va_mapping *mapping_a;
+	struct amdgpu_bo_va_mapping *mapping_b;
+
+	mapping_a = list_entry(a, struct amdgpu_bo_va_mapping, list);
+	mapping_b = list_entry(b, struct amdgpu_bo_va_mapping, list);
+
+	if (mapping_a->start < mapping_b->start)
+		return -1;
+	if (mapping_a->start > mapping_b->start)
+		return 1;
+	/* If start addresses are equal, maintain original relative order (stable sort) */
+	/* list_sort is stable, so this fallback isn't strictly needed */
+	/* but doesn't hurt. Could also compare ->last for tie-breaking. */
+	return 0;
+}
+
+/**
+ * amdgpu_vm_clear_freed - clear freed BOs in the PT with batching
  *
  * @adev: amdgpu_device pointer
  * @vm: requested vm
  * @fence: optional resulting fence (unchanged if no work needed to be done
  * or if an error occurred)
  *
- * Make sure all freed BOs are cleared in the PT.
- * PTs have to be reserved and mutex must be locked!
+ * Make sure all freed BOs are cleared in the PT. Merges adjacent/overlapping
+ * ranges before updating page tables to reduce overhead. Optimized with
+ * branch prediction hints.
  *
  * Returns:
  * 0 for success.
  *
  */
 int amdgpu_vm_clear_freed(struct amdgpu_device *adev,
-			  struct amdgpu_vm *vm,
-			  struct dma_fence **fence)
+						  struct amdgpu_vm *vm,
+						  struct dma_fence **fence)
 {
-	struct amdgpu_bo_va_mapping *mapping;
+	struct amdgpu_bo_va_mapping *mapping, *tmp_mapping;
 	struct dma_fence *f = NULL;
 	struct amdgpu_sync sync;
-	int r;
+	LIST_HEAD(sorted_list);
+	uint64_t current_start = 0, current_end = 0;
+	bool range_active = false;
+	int r = 0;
 
+	/* Early exit if nothing to do */
+	if (unlikely(list_empty(&vm->freed)))
+		return 0;
 
 	/*
 	 * Implicitly sync to command submissions in the same VM before
@@ -1515,25 +1612,65 @@ int amdgpu_vm_clear_freed(struct amdgpu_device *adev,
 	 */
 	amdgpu_sync_create(&sync);
 	r = amdgpu_sync_resv(adev, &sync, vm->root.bo->tbo.base.resv,
-			     AMDGPU_SYNC_EQ_OWNER, vm);
-	if (r)
-		goto error_free;
+						 AMDGPU_SYNC_EQ_OWNER, vm);
+	if (unlikely(r))
+		goto error_free_sync;
 
-	while (!list_empty(&vm->freed)) {
-		mapping = list_first_entry(&vm->freed,
-			struct amdgpu_bo_va_mapping, list);
-		list_del(&mapping->list);
+	/* Transfer freed mappings to a temporary list for sorting */
+	spin_lock(&vm->status_lock);
+	list_splice_init(&vm->freed, &sorted_list);
+	spin_unlock(&vm->status_lock);
 
-		r = amdgpu_vm_update_range(adev, vm, false, false, true, false,
-					   &sync, mapping->start, mapping->last,
-					   0, 0, 0, NULL, NULL, &f);
-		amdgpu_vm_free_mapping(adev, vm, mapping, f);
-		if (r) {
-			dma_fence_put(f);
-			goto error_free;
+	/* Sort the list by start address */
+	list_sort(NULL, &sorted_list, compare_mappings);
+
+	/* Iterate through sorted list, merge ranges, and update */
+	list_for_each_entry_safe(mapping, tmp_mapping, &sorted_list, list) {
+		list_del(&mapping->list); // Remove from sorted list
+
+		if (!range_active) {
+			/* Start a new consolidated range */
+			current_start = mapping->start;
+			current_end = mapping->last;
+			range_active = true;
+		} else {
+			/* Check if current mapping overlaps or is adjacent */
+			if (likely(mapping->start <= current_end + 1)) {
+				/* Merge: Extend the current range */
+				current_end = max(current_end, mapping->last);
+			} else {
+				/* Gap detected: Process the previous consolidated range */
+				// trace_amdgpu_vm_clear_freed(vm, current_start, current_end + 1); // Removed non-existent tracepoint
+				r = amdgpu_vm_update_range(adev, vm, false, false, true, false,
+										   &sync, current_start, current_end,
+							   0, 0, 0, NULL, NULL, &f);
+				if (unlikely(r)) {
+					/* Free the current mapping before exiting */
+					amdgpu_vm_free_mapping(adev, vm, mapping, f);
+					goto error_cleanup_list;
+				}
+
+				/* Start a new range with the current mapping */
+				current_start = mapping->start;
+				current_end = mapping->last;
+			}
 		}
+
+		/* Free the original mapping struct after processing/merging */
+		amdgpu_vm_free_mapping(adev, vm, mapping, f);
 	}
 
+	/* Process the last consolidated range */
+	if (range_active) {
+		// trace_amdgpu_vm_clear_freed(vm, current_start, current_end + 1); // Removed non-existent tracepoint
+		r = amdgpu_vm_update_range(adev, vm, false, false, true, false,
+								   &sync, current_start, current_end,
+							 0, 0, 0, NULL, NULL, &f);
+		if (unlikely(r))
+			goto error_cleanup_list;
+	}
+
+	/* Update output fence if requested and we got a new fence */
 	if (fence && f) {
 		dma_fence_put(*fence);
 		*fence = f;
@@ -1541,10 +1678,18 @@ int amdgpu_vm_clear_freed(struct amdgpu_device *adev,
 		dma_fence_put(f);
 	}
 
-error_free:
+	error_free_sync:
 	amdgpu_sync_free(&sync);
 	return r;
 
+	error_cleanup_list:
+	/* If an error occurred, free any remaining unprocessed mappings */
+	list_for_each_entry_safe(mapping, tmp_mapping, &sorted_list, list) {
+		list_del(&mapping->list);
+		amdgpu_vm_free_mapping(adev, vm, mapping, f);
+	}
+	dma_fence_put(f); /* Put fence acquired before error */
+	goto error_free_sync;
 }
 
 /**
@@ -2717,95 +2862,114 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
 	unsigned long flags; /* For spinlock */
 	int i;
 
+	/* Lists to check for leftover bo_vas */
+	struct list_head *status_lists[] = {
+		&vm->idle, &vm->evicted, &vm->relocated, &vm->moved,
+		&vm->invalidated, &vm->done, &vm->evicted_user, NULL
+	};
+	struct list_head **current_list_ptr;
+
+
 	amdgpu_amdkfd_gpuvm_destroy_cb(adev, vm);
 
 	flush_work(&vm->pt_free_work);
 
-	/* Initialize the temporary list */
+	/* Initialize the temporary list for cleanup */
 	INIT_LIST_HEAD(&bo_vas_to_clean);
 
 	root = amdgpu_bo_ref(vm->root.bo);
-	/* Reserve needed to safely manipulate PTs and fences */
 	if (amdgpu_bo_reserve(root, true) == 0) {
 		amdgpu_vm_set_pasid(adev, vm, 0);
 		dma_fence_wait(vm->last_unlocked, false);
 		dma_fence_wait(vm->last_tlb_flush, false);
-		/* Make sure that all fence callbacks have completed */
+		/* Ensure fence callbacks complete */
 		spin_lock_irqsave(vm->last_tlb_flush->lock, flags);
 		spin_unlock_irqrestore(vm->last_tlb_flush->lock, flags);
 
-
-		/* Clear any remaining freed mappings */
+		/* Clear remaining freed mappings */
 		list_for_each_entry_safe(mapping, tmp_mapping, &vm->freed, list) {
 			if (mapping->flags & AMDGPU_PTE_PRT_FLAG(adev) && prt_fini_needed) {
 				amdgpu_vm_prt_fini(adev, vm);
 				prt_fini_needed = false;
 			}
-
 			list_del(&mapping->list);
 			amdgpu_vm_free_mapping(adev, vm, mapping, NULL);
 		}
 
-		/* Free the page table tree */
+		/* Free the page table tree (decrements stats for PT BOs) */
 		amdgpu_vm_pt_free_root(adev, vm);
 		amdgpu_bo_unreserve(root);
 	} else {
-		/* Should not happen, but try to recover */
 		dev_err(adev->dev, "Failed to reserve VM root BO for fini\n");
-		/* Can't safely free PTs or process freed list without reservation */
 	}
-	WARN_ON(vm->root.bo); /* root.bo should be NULL after pt_free_root */
+	WARN_ON(vm->root.bo);
 
 
-	/* Process remaining mappings in the interval tree and collect unique associated bo_vas */
+	/* Process remaining mappings in the interval tree if any exist */
 	if (!RB_EMPTY_ROOT(&vm->va.rb_root)) {
 		dev_warn(adev->dev, "still active mappings in vm interval tree during fini\n");
-
 		rbtree_postorder_for_each_entry_safe(mapping, tmp_mapping,
 											 &vm->va.rb_root, rb) {
 			bo_va = mapping->bo_va;
 			if (bo_va) {
 				/* Ensure list head is valid before moving */
-				if (list_empty_careful(&bo_va->base.vm_status))
+				/* Use list_empty_careful as state might be dubious */
+				if (list_empty_careful(&bo_va->base.vm_status)) {
 					INIT_LIST_HEAD(&bo_va->base.vm_status);
-
-				/* Move unique bo_va to our temporary list for cleanup */
-				list_move_tail(&bo_va->base.vm_status, &bo_vas_to_clean);
-
-				/* Remove mapping from its list (valids/invalids) */
+					/* Add to cleanup list only once */
+					list_add_tail(&bo_va->base.vm_status, &bo_vas_to_clean);
+				} else if (bo_va->base.vm_status.next != NULL) {
+					/* It's on a status list, move it to cleanup list */
+					/* list_move_tail handles uniqueness */
+					list_move_tail(&bo_va->base.vm_status, &bo_vas_to_clean);
+				}
 				list_del_init(&mapping->list);
-
-				mapping->bo_va = NULL; /* Prevent reuse */
+				mapping->bo_va = NULL;
 			}
-			/* Free the mapping structure itself */
 			kfree(mapping);
 											 }
-											 /* Clear the interval tree root manually after iteration */
 											 vm->va = RB_ROOT_CACHED;
 	}
 
-	/* Clean up the collected bo_vas that weren't cleaned via gem_close->vm_bo_del */
+	/* Check all status lists for any remaining bo_vas */
+	spin_lock_irqsave(&vm->status_lock, flags);
+	for (current_list_ptr = status_lists; *current_list_ptr; ++current_list_ptr) {
+		list_for_each_entry_safe(bo_va, next_bo_va, *current_list_ptr, base.vm_status) {
+			/* Move unique bo_va to our temporary cleanup list */
+			list_move_tail(&bo_va->base.vm_status, &bo_vas_to_clean);
+		}
+	}
+	spin_unlock_irqrestore(&vm->status_lock, flags);
+
+
+	/* Clean up all collected bo_vas (from tree and status lists) */
 	list_for_each_entry_safe(bo_va, next_bo_va, &bo_vas_to_clean, base.vm_status) {
 		struct amdgpu_bo *bo = bo_va->base.bo;
 		struct amdgpu_vm_bo_base **base_ptr;
+		bool unlinked = false; // Flag to track if we unlinked it
 
-		list_del_init(&bo_va->base.vm_status); /* Remove from temp list */
+		list_del_init(&bo_va->base.vm_status); /* Remove from cleanup list */
 
 		if (bo) {
-			/* Remove from bo's list (bo->vm_bo) */
+			/* Try to remove from bo's list (bo->vm_bo) */
 			for (base_ptr = &bo->vm_bo; *base_ptr; base_ptr = &(*base_ptr)->next) {
 				if (*base_ptr == &bo_va->base) {
 					*base_ptr = bo_va->base.next;
+					unlinked = true; // We successfully unlinked it
 					break;
 				}
 			}
 
-			/* Decrement stats - using the BO's current resource state */
-			spin_lock_irqsave(&vm->status_lock, flags);
-			amdgpu_vm_update_stats_locked(&bo_va->base, bo->tbo.resource, -1);
-			spin_unlock_irqrestore(&vm->status_lock, flags);
+			/* === FIX: Only decrement stats if we successfully unlinked it === */
+			if (unlinked) {
+				/* This implies bo_del did not run successfully/fully before */
+				spin_lock_irqsave(&vm->status_lock, flags);
+				amdgpu_vm_update_stats_locked(&bo_va->base, bo->tbo.resource, -1);
+				spin_unlock_irqrestore(&vm->status_lock, flags);
+			}
+			/* If !unlinked, assume bo_del already ran and decremented stats */
 
-			/* Clean up other BO related fields */
+			/* Clean up other BO related fields (safe regardless of unlinked status) */
 			if (amdgpu_vm_is_bo_always_valid(vm, bo))
 				ttm_bo_set_bulk_move(&bo->tbo, NULL);
 
@@ -2820,10 +2984,8 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
 
 	/* Handle any remaining PRT callbacks if necessary */
 	if (prt_fini_needed && !list_empty(&vm->freed)) {
-		/* This path should ideally not be taken if freed list processed above */
 		amdgpu_vm_prt_fini(adev, vm);
 	}
-
 
 	/* Final VM resource cleanup */
 	dma_fence_put(vm->last_unlocked);
@@ -2848,9 +3010,8 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
 		const char *tname = ti ? ti->task_name : "(unknown)";
 		int tgid = ti ? ti->tgid : 0;
 
-		/* This warning should ideally not appear after the fix */
 		dev_warn(adev->dev,
-				 "VM memory stats AFTER CLEANUP for proc %s(%d) task %s(%d) is non-zero when fini\n",
+				 "VM memory stats STILL NON-ZERO AFTER DOUBLE DECREMENT CHECK for proc %s(%d) task %s(%d) when fini\n",
 				 pname, pid, tname, tgid);
 	}
 
