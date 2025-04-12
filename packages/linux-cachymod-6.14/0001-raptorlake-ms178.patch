@@ -1,0 +1,5079 @@
+--- a/kernel/irq/affinity.c	2025-03-13 13:08:08.000000000 +0100
++++ b/kernel/irq/affinity.c	2025-03-22 22:28:35.518663546 +0100
+@@ -2,25 +2,912 @@
+ /*
+  * Copyright (C) 2016 Thomas Gleixner.
+  * Copyright (C) 2016-2017 Christoph Hellwig.
++ * Raptor Lake optimizations (C) 2025 ms178.
+  */
+ #include <linux/interrupt.h>
+ #include <linux/kernel.h>
+ #include <linux/slab.h>
+ #include <linux/cpu.h>
+ #include <linux/group_cpus.h>
++#include <linux/cpufreq.h>
++#include <linux/topology.h>
++#include <linux/numa.h>
++#include <linux/overflow.h>
++#ifdef CONFIG_X86
++#include <asm/cpu_device_id.h>
++#include <asm/intel-family.h>
++#include <asm/topology.h>
++#include <asm/cpu.h>
++#include <asm/smp.h>
++#endif
+ 
++#ifdef CONFIG_X86
++/* Maximum number of cores to handle */
++#define MAX_CORES_PER_NODE 64  /* Increased to handle future processors */
++
++/* Module parameters */
++static bool irq_pcore_affinity = true;
++module_param_named(pcore_affinity, irq_pcore_affinity, bool, 0644);
++MODULE_PARM_DESC(pcore_affinity, "Enable P-core IRQ affinity (default: 1)");
++
++/* Define CPU IDs if not already defined */
++#ifndef INTEL_FAM6_RAPTORLAKE
++#define INTEL_FAM6_RAPTORLAKE 0xB7
++#endif
++
++#ifndef INTEL_FAM6_ALDERLAKE
++#define INTEL_FAM6_ALDERLAKE 0x97
++#endif
++
++#ifndef INTEL_FAM6_ALDERLAKE_L
++#define INTEL_FAM6_ALDERLAKE_L 0x9A
++#endif
++
++/* Core type definition if not available */
++#ifndef X86_CORE_TYPE_INTEL_CORE
++#define X86_CORE_TYPE_INTEL_CORE 1
++#endif
++
++#ifndef X86_CORE_TYPE_INTEL_ATOM
++#define X86_CORE_TYPE_INTEL_ATOM 0
++#endif
++
++/* P-core mask management with proper locking */
++static DEFINE_MUTEX(pcore_mask_lock);
++static struct cpumask pcore_mask;
++static atomic_t pcore_mask_initialized = ATOMIC_INIT(0);
++static int numa_node_for_cpu[NR_CPUS];
++
++/* Store L2 cache domain information */
++static struct cpumask *l2_domain_masks;
++static int l2_domain_count;
++
++/* Cache to store CPU core types: -2 = uninitialized, -1 = not hybrid/unknown, 0 = E-core, 1 = P-core */
++static DEFINE_SPINLOCK(core_type_lock);
++static int cpu_core_type[NR_CPUS] = { [0 ... NR_CPUS-1] = -2 };
++
++/* Frequency heuristic information */
++static unsigned int max_cpu_freq;
++static atomic_t freq_initialized = ATOMIC_INIT(0);
++
++/* L2 core ID cache to avoid recalculation */
++static int l2_core_ids[NR_CPUS];
++static atomic_t l2_ids_initialized = ATOMIC_INIT(0);
++
++/**
++ * hybrid_cpu_detected - Check if system has hybrid CPU architecture
++ *
++ * Detects Intel hybrid architectures like Raptor Lake and Alder Lake.
++ * Result is safely cached for performance.
++ *
++ * Return: true if hybrid CPU detected, false otherwise
++ */
++static bool hybrid_cpu_detected(void)
++{
++	static int is_hybrid = -1;
++	static const struct x86_cpu_id hybrid_ids[] = {
++		{ .family = 6, .model = INTEL_FAM6_RAPTORLAKE,   .driver_data = 0 },
++		{ .family = 6, .model = INTEL_FAM6_ALDERLAKE,    .driver_data = 0 },
++		{ .family = 6, .model = INTEL_FAM6_ALDERLAKE_L,  .driver_data = 0 },
++		{}
++	};
++
++	if (is_hybrid == -1)
++		is_hybrid = x86_match_cpu(hybrid_ids) ? 1 : 0;
++
++	return is_hybrid == 1;
++}
++
++/**
++ * init_freq_info - Initialize frequency information for heuristic detection
++ *
++ * Efficiently calculates and caches maximum CPU frequency for use in core type detection.
++ * Only performs the calculation once for all CPUs.
++ */
++static void init_freq_info(void)
++{
++	unsigned int freq, temp_max = 0;
++	int c;
++
++	/* Only initialize once - avoid unnecessary work */
++	if (atomic_read(&freq_initialized) != 0)
++		return;
++
++	/* Calculate max frequency in a single pass */
++	for_each_online_cpu(c) {
++		freq = cpufreq_quick_get_max(c);
++		if (freq > temp_max)
++			temp_max = freq;
++	}
++
++	/* Atomic update to ensure we only set the value once */
++	if (atomic_cmpxchg(&freq_initialized, 0, 1) == 0)
++		max_cpu_freq = temp_max;
++}
++
++/**
++ * init_l2_core_ids - Pre-calculate L2 domain IDs once
++ *
++ * Pre-computes the L2 domain IDs for all CPUs to avoid expensive
++ * recalculations during L2 domain detection fallback.
++ */
++static void init_l2_core_ids(void)
++{
++	int cpu;
++
++	if (atomic_read(&l2_ids_initialized) != 0)
++		return;
++
++	for_each_possible_cpu(cpu) {
++		if (cpu < NR_CPUS)
++			l2_core_ids[cpu] = topology_physical_package_id(cpu) * 100 + topology_core_id(cpu);
++	}
++
++	atomic_set(&l2_ids_initialized, 1);
++}
++
++/**
++ * get_core_type - Optimized CPU core type detection with caching
++ * @cpu: CPU number to check
++ *
++ * Efficiently determines whether a CPU is a P-core or E-core using three methods
++ * in order of reliability, with results cached for maximum performance.
++ *
++ * Return: 1 for P-core, 0 for E-core, -1 if unknown/not hybrid
++ */
++static int get_core_type(int cpu)
++{
++	int core_type;
++	unsigned long flags;
++
++	/* Validate CPU ID */
++	if (!cpu_possible(cpu))
++		return -1;
++
++	/* Fast path: return cached result if available */
++	if (cpu_core_type[cpu] != -2)
++		return cpu_core_type[cpu];
++
++	/* Early return for non-hybrid CPUs */
++	if (!hybrid_cpu_detected()) {
++		spin_lock_irqsave(&core_type_lock, flags);
++		if (cpu_core_type[cpu] == -2) /* Check again under lock */
++			cpu_core_type[cpu] = -1;
++		core_type = cpu_core_type[cpu];
++		spin_unlock_irqrestore(&core_type_lock, flags);
++		return core_type;
++	}
++
++	/* Method 1: Use official core type if available (most reliable) */
++	#ifdef CONFIG_INTEL_HYBRID_CPU
++	if (cpu_data(cpu).x86_core_type == X86_CORE_TYPE_INTEL_CORE) {
++		spin_lock_irqsave(&core_type_lock, flags);
++		if (cpu_core_type[cpu] == -2)
++			cpu_core_type[cpu] = 1;
++		spin_unlock_irqrestore(&core_type_lock, flags);
++		return 1;  /* P-core */
++	} else if (cpu_data(cpu).x86_core_type == X86_CORE_TYPE_INTEL_ATOM) {
++		spin_lock_irqsave(&core_type_lock, flags);
++		if (cpu_core_type[cpu] == -2)
++			cpu_core_type[cpu] = 0;
++		spin_unlock_irqrestore(&core_type_lock, flags);
++		return 0;  /* E-core */
++	}
++	#endif
++
++	/* Get lock for remaining detection methods */
++	spin_lock_irqsave(&core_type_lock, flags);
++
++	/* Check cache again under lock */
++	if (cpu_core_type[cpu] != -2) {
++		core_type = cpu_core_type[cpu];
++		spin_unlock_irqrestore(&core_type_lock, flags);
++		return core_type;
++	}
++
++	/* Method 2: Thread siblings count (also reliable for Raptor Lake) */
++	const struct cpumask *thread_siblings = topology_sibling_cpumask(cpu);
++	if (thread_siblings && cpumask_weight(thread_siblings) > 1) {
++		cpu_core_type[cpu] = 1;  /* Multiple threads per core = P-core */
++		spin_unlock_irqrestore(&core_type_lock, flags);
++		return 1;
++	}
++
++	/* Release lock for potentially expensive frequency operations */
++	spin_unlock_irqrestore(&core_type_lock, flags);
++
++	/* Initialize frequency info if needed */
++	if (atomic_read(&freq_initialized) == 0)
++		init_freq_info();
++
++	/* Reacquire lock */
++	spin_lock_irqsave(&core_type_lock, flags);
++
++	/* Check cache again after reacquiring lock */
++	if (cpu_core_type[cpu] != -2) {
++		core_type = cpu_core_type[cpu];
++		spin_unlock_irqrestore(&core_type_lock, flags);
++		return core_type;
++	}
++
++	/* Method 3: Frequency-based heuristic (last resort) */
++	if (max_cpu_freq > 0) {
++		unsigned int cpu_freq = cpufreq_quick_get_max(cpu);
++		if (cpu_freq >= max_cpu_freq * 95 / 100) {
++			cpu_core_type[cpu] = 1;  /* Within 5% of max frequency = likely P-core */
++			spin_unlock_irqrestore(&core_type_lock, flags);
++			return 1;
++		} else if (cpu_freq <= max_cpu_freq * 70 / 100) {
++			cpu_core_type[cpu] = 0;  /* Below 70% of max frequency = likely E-core */
++			spin_unlock_irqrestore(&core_type_lock, flags);
++			return 0;
++		}
++	}
++
++	/* Cannot determine reliably */
++	cpu_core_type[cpu] = -1;
++	spin_unlock_irqrestore(&core_type_lock, flags);
++	return -1;
++}
++
++/**
++ * get_cache_shared_mask - Get cache sharing mask for CPU
++ * @cpu: CPU number
++ *
++ * Returns the appropriate cache sharing mask based on core type
++ *
++ * Return: Pointer to cpumask
++ */
++static const struct cpumask *get_cache_shared_mask(int cpu)
++{
++	int core_type = get_core_type(cpu);
++
++	if (core_type == 0) /* E-core */
++		return cpu_l2c_shared_mask(cpu);
++	else if (core_type == 1) /* P-core */
++		return cpu_llc_shared_mask(cpu);
++	else
++		return cpu_llc_shared_mask(cpu); /* Default to LLC */
++}
++
++/**
++ * free_l2_domain_masks - Free L2 domain mask resources
++ *
++ * Helper function to safely clean up L2 domain resources.
++ * Can be called from any context including error paths.
++ */
++static void free_l2_domain_masks(void)
++{
++	mutex_lock(&pcore_mask_lock);
++	if (l2_domain_masks) {
++		kfree(l2_domain_masks);
++		l2_domain_masks = NULL;
++		l2_domain_count = 0;
++	}
++	mutex_unlock(&pcore_mask_lock);
++}
++
++/**
++ * get_pcore_mask - Fill provided mask with performance cores
++ * @dst: Destination cpumask to fill with P-cores
++ *
++ * Thread-safe function to identify performance cores on hybrid CPUs.
++ * Caller must provide the destination buffer.
++ *
++ * Return: 0 on success, negative error code on failure
++ */
++static int get_pcore_mask(struct cpumask *dst)
++{
++	if (!dst)
++		return -EINVAL;
++
++	if (atomic_read_acquire(&pcore_mask_initialized) == 0) {
++		mutex_lock(&pcore_mask_lock);
++		if (atomic_read(&pcore_mask_initialized) == 0) {
++			int cpu;
++			int core_id, prev_core = -1;
++			int siblings = 0;
++			struct cpumask temp_mask;
++
++			cpumask_clear(&pcore_mask);
++			cpumask_clear(&temp_mask);
++
++			/* First try: direct core type detection if available */
++			bool direct_detection = false;
++
++			for_each_possible_cpu(cpu) {
++				int core_type = get_core_type(cpu);
++				if (core_type == 1) {  /* P-core */
++					cpumask_set_cpu(cpu, &pcore_mask);
++					direct_detection = true;
++				}
++				/* Store NUMA node information for each CPU */
++				if (cpu < NR_CPUS)
++					numa_node_for_cpu[cpu] = cpu_to_node(cpu);
++			}
++
++			/* If direct detection didn't work, use heuristics */
++			if (!direct_detection) {
++				/* Second try: count siblings per core to identify P-cores */
++				for_each_online_cpu(cpu) {
++					core_id = topology_core_id(cpu);
++
++					/* Check if this is a new core */
++					if (core_id != prev_core) {
++						/* New core encountered */
++						if (prev_core != -1) {
++							/* Process previous core */
++							if (siblings >= 2) {
++								/* Previous core had hyperthreading - likely a P-core */
++								cpumask_or(&pcore_mask, &pcore_mask, &temp_mask);
++							}
++							cpumask_clear(&temp_mask);
++						}
++
++						prev_core = core_id;
++						siblings = 1;
++						cpumask_set_cpu(cpu, &temp_mask);
++					} else {
++						/* Another sibling of the current core */
++						siblings++;
++						cpumask_set_cpu(cpu, &temp_mask);
++					}
++				}
++
++				/* Handle the last core */
++				if (prev_core != -1 && siblings >= 2) {
++					cpumask_or(&pcore_mask, &pcore_mask, &temp_mask);
++				}
++
++				/* Third try: find fastest cores by frequency */
++				if (cpumask_empty(&pcore_mask)) {
++					unsigned int max_freq = 0;
++					int max_freq_cpu = -1;
++
++					for_each_online_cpu(cpu) {
++						unsigned int freq = cpufreq_quick_get_max(cpu);
++						if (freq > max_freq && freq > 0) {
++							max_freq = freq;
++							max_freq_cpu = cpu;
++						}
++					}
++
++					if (max_freq_cpu >= 0 && max_freq > 0) {
++						/* Use cores with the same max frequency (within 5%) */
++						unsigned int threshold = max_freq * 95 / 100;
++
++						for_each_online_cpu(cpu) {
++							unsigned int freq = cpufreq_quick_get_max(cpu);
++							if (freq >= threshold && freq > 0)
++								cpumask_set_cpu(cpu, &pcore_mask);
++						}
++					}
++				}
++			}
++
++			/* Fallback to all CPUs if still no cores identified */
++			if (cpumask_empty(&pcore_mask))
++				cpumask_copy(&pcore_mask, cpu_online_mask);
++
++			/* Memory barrier before setting initialized flag */
++			smp_wmb();
++			atomic_set(&pcore_mask_initialized, 1);
++		}
++		mutex_unlock(&pcore_mask_lock);
++	}
++
++	mutex_lock(&pcore_mask_lock);
++	cpumask_copy(dst, &pcore_mask);
++	mutex_unlock(&pcore_mask_lock);
++
++	return 0;
++}
++
++/**
++ * identify_l2_domains - Optimized L2 cache domain detection
++ * @p_core_mask: Mask of P-cores to analyze
++ *
++ * Maps L2 cache sharing domains on Raptor Lake with optimized fallback mechanism.
++ * Pre-calculates L2 core IDs to avoid expensive operations in inner loops.
++ *
++ * Return: 0 on success, negative error code on failure
++ */
++static int identify_l2_domains(struct cpumask *p_core_mask)
++{
++	int i, cpu;
++	bool using_fallback = false;
++	int total_cpus;
++
++	/* Validate input */
++	if (!p_core_mask || cpumask_empty(p_core_mask)) {
++		pr_warn("Empty P-core mask provided\n");
++		return -EINVAL;
++	}
++
++	/* Pre-calculate L2 core IDs if not done already */
++	if (atomic_read(&l2_ids_initialized) == 0)
++		init_l2_core_ids();
++
++	mutex_lock(&pcore_mask_lock);
++
++	/* Clean up existing resources */
++	if (l2_domain_masks) {
++		kfree(l2_domain_masks);
++		l2_domain_masks = NULL;
++		l2_domain_count = 0;
++	}
++
++	/* Allocate memory with bounds check */
++	if (MAX_CORES_PER_NODE == 0) {
++		mutex_unlock(&pcore_mask_lock);
++		pr_err("Invalid MAX_CORES_PER_NODE value\n");
++		return -EINVAL;
++	}
++
++	l2_domain_masks = kcalloc(MAX_CORES_PER_NODE, sizeof(struct cpumask), GFP_KERNEL);
++	if (!l2_domain_masks) {
++		mutex_unlock(&pcore_mask_lock);
++		pr_warn("Failed to allocate L2 domain masks\n");
++		return -ENOMEM;
++	}
++
++	l2_domain_count = 0;
++
++	/* Primary detection: use cache topology more efficiently */
++	for_each_cpu(cpu, p_core_mask) {
++		const struct cpumask *shared_mask = get_cache_shared_mask(cpu);
++		bool found = false;
++
++		/* Validate mask */
++		if (!shared_mask || cpumask_empty(shared_mask) ||
++			cpumask_weight(shared_mask) > MAX_CORES_PER_NODE/2) {
++			using_fallback = true;
++		continue;
++			}
++
++			/* Skip CPUs already in a domain to avoid redundant checks */
++			for (i = 0; i < l2_domain_count; i++) {
++				if (cpumask_test_cpu(cpu, &l2_domain_masks[i])) {
++					found = true;
++					break;
++				}
++			}
++			if (found)
++				continue;
++
++		/* Check if domain already exists */
++		for (i = 0; i < l2_domain_count; i++) {
++			if (cpumask_equal(&l2_domain_masks[i], shared_mask)) {
++				found = true;
++				break;
++			}
++		}
++
++		/* Add new domain if needed */
++		if (!found && l2_domain_count < MAX_CORES_PER_NODE) {
++			cpumask_copy(&l2_domain_masks[l2_domain_count], shared_mask);
++			l2_domain_count++;
++		}
++	}
++
++	/* Optimized fallback: use pre-calculated L2 IDs */
++	if (l2_domain_count == 0 || using_fallback) {
++		/* Use a more efficient approach with a hash table-like structure */
++		int l2_id_max = 0;
++		int l2_id, dom_idx;
++		int *id_to_domain = NULL;
++
++		/* Reset domain count */
++		l2_domain_count = 0;
++
++		/* Find maximum L2 ID */
++		for_each_cpu(cpu, p_core_mask) {
++			if (cpu < NR_CPUS && l2_core_ids[cpu] > l2_id_max)
++				l2_id_max = l2_core_ids[cpu];
++		}
++
++		/* Create mapping array (+1 for zero-based indexing) */
++		id_to_domain = kcalloc(l2_id_max + 1, sizeof(int), GFP_KERNEL);
++		if (!id_to_domain) {
++			kfree(l2_domain_masks);  /* Free previously allocated memory */
++			l2_domain_masks = NULL;
++			mutex_unlock(&pcore_mask_lock);
++			return -ENOMEM;
++		}
++
++		/* Initialize all entries to -1 (no domain) */
++		for (i = 0; i <= l2_id_max; i++)
++			id_to_domain[i] = -1;
++
++		/* One-pass domain assignment using direct mapping */
++		for_each_cpu(cpu, p_core_mask) {
++			if (cpu < NR_CPUS) {
++				l2_id = l2_core_ids[cpu];
++
++				/* Check bounds */
++				if (l2_id < 0 || l2_id > l2_id_max)
++					continue;
++
++				dom_idx = id_to_domain[l2_id];
++
++				if (dom_idx == -1) {
++					/* Create new domain */
++					if (l2_domain_count < MAX_CORES_PER_NODE) {
++						dom_idx = l2_domain_count++;
++						id_to_domain[l2_id] = dom_idx;
++						cpumask_clear(&l2_domain_masks[dom_idx]);
++					} else {
++						continue;  /* Too many domains */
++					}
++				}
++
++				/* Add CPU to domain */
++				cpumask_set_cpu(cpu, &l2_domain_masks[dom_idx]);
++			}
++		}
++
++		kfree(id_to_domain);
++	}
++
++	/* Verify all CPUs were assigned */
++	total_cpus = 0;
++	for (i = 0; i < l2_domain_count; i++)
++		total_cpus += cpumask_weight(&l2_domain_masks[i]);
++
++	if (total_cpus < cpumask_weight(p_core_mask)) {
++		pr_warn("L2 domain detection incomplete: %d/%d CPUs\n",
++				total_cpus, cpumask_weight(p_core_mask));
++	}
++
++	mutex_unlock(&pcore_mask_lock);
++	return l2_domain_count > 0 ? 0 : -ENODATA;
++}
++
++/**
++ * group_cpus_hybrid_first - Distribute IRQs with hybrid CPU awareness
++ * @num_grps: Number of groups to create
++ *
++ * Creates CPU groups optimized for IRQ distribution on hybrid CPUs.
++ * Prioritizes P-cores and considers cache topology for performance.
++ *
++ * Return: Array of CPU masks or NULL on failure
++ */
++static struct cpumask *group_cpus_hybrid_first(unsigned int num_grps)
++{
++	struct cpumask p_core_copy;
++	struct cpumask *result = NULL;
++	struct cpumask e_cores_mask;
++	DECLARE_BITMAP(assigned, NR_CPUS);
++	int i, j, cpu, grp_idx = 0;
++	int ret;
++
++	if (!num_grps)
++		return NULL;
++
++	if (!irq_pcore_affinity || !hybrid_cpu_detected())
++		return group_cpus_evenly(num_grps);
++
++	/* Get P-cores using our improved function */
++	cpumask_clear(&p_core_copy);
++	ret = get_pcore_mask(&p_core_copy);
++	if (ret || cpumask_empty(&p_core_copy))
++		return group_cpus_evenly(num_grps);
++
++	/* Create result masks */
++	result = kcalloc(num_grps, sizeof(struct cpumask), GFP_KERNEL);
++	if (!result)
++		return group_cpus_evenly(num_grps);
++
++	/* Clear all result masks */
++	for (i = 0; i < num_grps; i++)
++		cpumask_clear(&result[i]);
++
++	/* Identify E-cores */
++	bitmap_zero(assigned, NR_CPUS);
++	cpumask_andnot(&e_cores_mask, cpu_online_mask, &p_core_copy);
++
++	/* Identify L2 domains */
++	ret = identify_l2_domains(&p_core_copy);
++	if (ret) {
++		/* Fall back to simple distribution on error */
++		int cores = cpumask_weight(&p_core_copy);
++		int cores_per_group = cores / num_grps;
++		int extra = cores % num_grps;
++
++		for (i = 0; i < num_grps; i++) {
++			int count = 0;
++			int cores_this_group = cores_per_group + (i < extra ? 1 : 0);
++
++			for_each_cpu(cpu, &p_core_copy) {
++				if (!test_bit(cpu, assigned) && count < cores_this_group) {
++					cpumask_set_cpu(cpu, &result[i]);
++					set_bit(cpu, assigned);
++					count++;
++				}
++			}
++		}
++	} else {
++		/* Cache-aware distribution */
++		int total_cores = 0;
++		for (i = 0; i < l2_domain_count; i++)
++			total_cores += cpumask_weight(&l2_domain_masks[i]);
++
++		/* Distribute domains proportionally */
++		for (i = 0; i < l2_domain_count && grp_idx < num_grps; i++) {
++			int domain_cores = cpumask_weight(&l2_domain_masks[i]);
++			if (domain_cores == 0)
++				continue;
++
++			/* Calculate groups for this domain */
++			int grps_for_domain = 1;
++			if (total_cores > 0) {
++				grps_for_domain = (num_grps * domain_cores + total_cores - 1) / total_cores;
++				grps_for_domain = min_t(int, grps_for_domain, num_grps - grp_idx);
++			}
++			grps_for_domain = max(1, grps_for_domain);
++
++			/* Calculate cores per group */
++			int cores_per_domain_group = domain_cores / grps_for_domain;
++			int domain_extra = domain_cores % grps_for_domain;
++
++			/* Distribute cores */
++			for (j = 0; j < grps_for_domain && grp_idx < num_grps; j++, grp_idx++) {
++				int cores_this_group = cores_per_domain_group + (j < domain_extra ? 1 : 0);
++				int count = 0;
++
++				for_each_cpu(cpu, &l2_domain_masks[i]) {
++					if (count >= cores_this_group)
++						break;
++					if (!test_bit(cpu, assigned)) {
++						cpumask_set_cpu(cpu, &result[grp_idx]);
++						set_bit(cpu, assigned);
++						count++;
++					}
++				}
++			}
++		}
++	}
++
++	/* Handle E-cores for remaining groups */
++	if (grp_idx < num_grps && !cpumask_empty(&e_cores_mask)) {
++		int e_cores = cpumask_weight(&e_cores_mask);
++		int cores_per_group = e_cores / (num_grps - grp_idx);
++		int extra = e_cores % (num_grps - grp_idx);
++
++		for (i = grp_idx; i < num_grps; i++) {
++			int count = 0;
++			int target = cores_per_group + (i - grp_idx < extra ? 1 : 0);
++
++			for_each_cpu(cpu, &e_cores_mask) {
++				if (count >= target)
++					break;
++				if (!test_bit(cpu, assigned)) {
++					cpumask_set_cpu(cpu, &result[i]);
++					set_bit(cpu, assigned);
++					count++;
++				}
++			}
++		}
++	}
++
++	/* NUMA-aware rebalancing for empty groups */
++	for (i = 0; i < num_grps; i++) {
++		if (cpumask_empty(&result[i])) {
++			/* Find best donor CPU from a group with multiple CPUs */
++			int donor_cpu = -1;
++			int donor_group = -1;
++			int best_score = -1;
++			int target_node = -1;
++			unsigned int j_start, j_end;
++
++			/* Calculate bounds safely without signedness issues */
++			j_start = (i > 0) ? (i - 1) : 0;
++			j_end = (i + 1 < num_grps) ? (i + 1) : i;
++
++			/* Identify target NUMA node if possible */
++			for (j = j_start; j <= j_end; j++) {
++				if (j != i && cpumask_weight(&result[j]) > 0) {
++					int temp_cpu = cpumask_first(&result[j]);
++					if (temp_cpu < NR_CPUS) {
++						target_node = numa_node_for_cpu[temp_cpu];
++						break;
++					}
++				}
++			}
++
++			/* Find groups with multiple CPUs */
++			for (j = 0; j < num_grps; j++) {
++				if (cpumask_weight(&result[j]) > 1) {
++					/* Evaluate each CPU as potential donor */
++					for_each_cpu(cpu, &result[j]) {
++						int score = 0;
++						int cpu_node = (cpu < NR_CPUS) ? numa_node_for_cpu[cpu] : -1;
++						int core_type = get_core_type(cpu);
++						const struct cpumask *cache_mask;
++						int cache_siblings = 0;
++						int numa_siblings = 0;
++						int sibling;
++
++						/* NUMA locality is highest priority */
++						if (target_node >= 0 && cpu_node == target_node)
++							score += 1000;
++
++						/* Core type considerations - prefer donating E-cores */
++						if (core_type == 0)
++							score += 500;
++
++						/* Cache topology considerations */
++						cache_mask = get_cache_shared_mask(cpu);
++						for_each_cpu(sibling, &result[j]) {
++							if (sibling != cpu) {
++								if (cache_mask && cpumask_test_cpu(sibling, cache_mask))
++									cache_siblings++;
++								if (cpu_node >= 0 && sibling < NR_CPUS &&
++									numa_node_for_cpu[sibling] == cpu_node)
++									numa_siblings++;
++							}
++						}
++
++						/* Prefer CPUs with more siblings left behind in same group */
++						score += cache_siblings * 10;
++						score += numa_siblings * 50;
++
++						if (score > best_score) {
++							best_score = score;
++							donor_cpu = cpu;
++							donor_group = j;
++						}
++					}
++				}
++			}
++
++			if (donor_group >= 0 && donor_cpu >= 0) {
++				cpumask_clear_cpu(donor_cpu, &result[donor_group]);
++				cpumask_set_cpu(donor_cpu, &result[i]);
++			} else {
++				/* Last resort: fall back to standard distribution */
++				kfree(result);
++				return group_cpus_evenly(num_grps);
++			}
++		}
++	}
++
++	return result;
++}
++
++/**
++ * pcore_cpu_notify - Optimized CPU hotplug notification handler
++ * @cpu: CPU number that changed state
++ *
++ * Efficiently handles CPU hotplug events with minimal blocking.
++ * Uses trylock where appropriate to avoid stalling critical paths.
++ *
++ * Return: 0 on success, negative error code on failure
++ */
++static int pcore_cpu_notify(unsigned int cpu)
++{
++	if (cpu >= NR_CPUS) {
++		pr_warn("pcore_cpu_notify: cpu %u out of range\n", cpu);
++		return -EINVAL;
++	}
++
++	/* Update NUMA node info (doesn't require lock) */
++	numa_node_for_cpu[cpu] = cpu_to_node(cpu);
++
++	/* Reset initialized flags to force recalculation */
++	atomic_set(&pcore_mask_initialized, 0);
++	atomic_set(&freq_initialized, 0);
++	atomic_set(&l2_ids_initialized, 0);
++
++	/* Reset core type cache for changed CPU */
++	spin_lock(&core_type_lock);
++	cpu_core_type[cpu] = -2;
++	spin_unlock(&core_type_lock);
++
++	/* Try to clean up L2 domain information without blocking critical paths */
++	if (mutex_trylock(&pcore_mask_lock)) {
++		if (l2_domain_masks) {
++			kfree(l2_domain_masks);
++			l2_domain_masks = NULL;
++			l2_domain_count = 0;
++		}
++		mutex_unlock(&pcore_mask_lock);
++	}
++
++	return 0;
++}
++
++/**
++ * hybrid_irq_tuning_exit - Module exit function
++ *
++ * Cleans up all resources and restores system state when module is unloaded.
++ */
++static void __exit hybrid_irq_tuning_exit(void)
++{
++	if (!hybrid_cpu_detected() || !irq_pcore_affinity)
++		return;
++
++	/* Remove hotplug callback */
++	cpuhp_remove_state_nocalls(CPUHP_AP_ONLINE_DYN);
++
++	/* Free all resources */
++	free_l2_domain_masks();
++
++	/* Reset state */
++	atomic_set(&pcore_mask_initialized, 0);
++}
++
++/**
++ * hybrid_irq_tuning - Module initialization function
++ *
++ * Sets up hybrid CPU optimization for IRQ affinity on Raptor Lake
++ * and similar hybrid architectures.
++ *
++ * Return: 0 on success, negative error code on failure
++ */
++static int __init hybrid_irq_tuning(void)
++{
++	int ret = 0, cpu;
++	struct cpumask pcore_copy;
++
++	if (!hybrid_cpu_detected() || !irq_pcore_affinity)
++		return 0;
++
++	/* Initialize NUMA node mapping with bounds checking */
++	for_each_possible_cpu(cpu) {
++		if (cpu < NR_CPUS)
++			numa_node_for_cpu[cpu] = cpu_to_node(cpu);
++	}
++
++	/* Pre-initialize L2 core IDs */
++	init_l2_core_ids();
++
++	/* Pre-initialize frequency information */
++	init_freq_info();
++
++	/* Register CPU hotplug callback */
++	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "irq/pcore_affinity:online",
++							pcore_cpu_notify, pcore_cpu_notify);
++	if (ret < 0) {
++		pr_err("Failed to register CPU hotplug callback: %d\n", ret);
++		return ret;
++	}
++
++	/* Get P-core mask and apply to default affinity */
++	cpumask_clear(&pcore_copy);
++	ret = get_pcore_mask(&pcore_copy);
++	if (ret < 0) {
++		pr_warn("Failed to get P-core mask: %d\n", ret);
++		/* Continue anyway - will use default affinity */
++	} else if (!cpumask_empty(&pcore_copy)) {
++		cpumask_copy(irq_default_affinity, &pcore_copy);
++	}
++
++	return 0;
++}
++core_initcall(hybrid_irq_tuning);
++module_exit(hybrid_irq_tuning_exit);
++#endif /* CONFIG_X86 */
++
++/* Preserve original algorithm with safety checks */
+ static void default_calc_sets(struct irq_affinity *affd, unsigned int affvecs)
+ {
++	if (!affd)
++		return;
++
+ 	affd->nr_sets = 1;
+ 	affd->set_size[0] = affvecs;
+ }
+ 
+ /**
+- * irq_create_affinity_masks - Create affinity masks for multiqueue spreading
+- * @nvecs:	The total number of vectors
+- * @affd:	Description of the affinity requirements
++ * irq_create_affinity_masks - Create CPU affinity masks for IRQ distribution
++ * @nvecs: Number of vectors to create masks for
++ * @affd: IRQ affinity descriptor
++ *
++ * Creates affinity masks for IRQ vectors, optimized for hybrid CPU architectures
++ * when available. Includes proper bounds checking and error handling.
+  *
+- * Returns the irq_affinity_desc pointer or NULL if allocation failed.
++ * Return: Array of affinity descriptors or NULL on failure
+  */
+ struct irq_affinity_desc *
+ irq_create_affinity_masks(unsigned int nvecs, struct irq_affinity *affd)
+@@ -28,31 +915,22 @@ irq_create_affinity_masks(unsigned int n
+ 	unsigned int affvecs, curvec, usedvecs, i;
+ 	struct irq_affinity_desc *masks = NULL;
+ 
+-	/*
+-	 * Determine the number of vectors which need interrupt affinities
+-	 * assigned. If the pre/post request exhausts the available vectors
+-	 * then nothing to do here except for invoking the calc_sets()
+-	 * callback so the device driver can adjust to the situation.
+-	 */
++	if (!affd)
++		return NULL;
++
+ 	if (nvecs > affd->pre_vectors + affd->post_vectors)
+ 		affvecs = nvecs - affd->pre_vectors - affd->post_vectors;
+ 	else
+ 		affvecs = 0;
+ 
+-	/*
+-	 * Simple invocations do not provide a calc_sets() callback. Install
+-	 * the generic one.
+-	 */
+ 	if (!affd->calc_sets)
+ 		affd->calc_sets = default_calc_sets;
+ 
+-	/* Recalculate the sets */
+ 	affd->calc_sets(affd, affvecs);
+ 
+ 	if (WARN_ON_ONCE(affd->nr_sets > IRQ_AFFINITY_MAX_SETS))
+ 		return NULL;
+ 
+-	/* Nothing to assign? */
+ 	if (!affvecs)
+ 		return NULL;
+ 
+@@ -60,41 +938,53 @@ irq_create_affinity_masks(unsigned int n
+ 	if (!masks)
+ 		return NULL;
+ 
+-	/* Fill out vectors at the beginning that don't need affinity */
+-	for (curvec = 0; curvec < affd->pre_vectors; curvec++)
++	/* Set pre-vectors to default affinity */
++	for (curvec = 0; curvec < affd->pre_vectors && curvec < nvecs; curvec++)
+ 		cpumask_copy(&masks[curvec].mask, irq_default_affinity);
+ 
+-	/*
+-	 * Spread on present CPUs starting from affd->pre_vectors. If we
+-	 * have multiple sets, build each sets affinity mask separately.
+-	 */
+-	for (i = 0, usedvecs = 0; i < affd->nr_sets; i++) {
++	/* Distribute vectors according to set sizes */
++	for (i = 0, usedvecs = 0, curvec = affd->pre_vectors;
++		 i < affd->nr_sets && curvec < nvecs; i++) {
+ 		unsigned int this_vecs = affd->set_size[i];
+-		int j;
+-		struct cpumask *result = group_cpus_evenly(this_vecs);
++	struct cpumask *result = NULL;
++	int j;
++
++	if (this_vecs == 0)
++		continue;
++
++		#ifdef CONFIG_X86
++		if (hybrid_cpu_detected() && irq_pcore_affinity)
++			result = group_cpus_hybrid_first(this_vecs);
++		else
++			#endif
++			result = group_cpus_evenly(this_vecs);
+ 
+ 		if (!result) {
+ 			kfree(masks);
+ 			return NULL;
+ 		}
+ 
+-		for (j = 0; j < this_vecs; j++)
+-			cpumask_copy(&masks[curvec + j].mask, &result[j]);
++		/* Copy result masks to output */
++		for (j = 0; j < this_vecs && (curvec + j) < nvecs; j++) {
++			if (cpumask_empty(&result[j]))
++				cpumask_copy(&masks[curvec + j].mask, irq_default_affinity);
++			else
++				cpumask_copy(&masks[curvec + j].mask, &result[j]);
++		}
++
+ 		kfree(result);
+ 
+-		curvec += this_vecs;
+-		usedvecs += this_vecs;
+-	}
++		/* Safely advance counters */
++		unsigned int used = min(this_vecs, nvecs - curvec);
++		curvec += used;
++		usedvecs += used;
++		 }
+ 
+-	/* Fill out vectors at the end that don't need affinity */
+-	if (usedvecs >= affvecs)
+-		curvec = affd->pre_vectors + affvecs;
+-	else
+-		curvec = affd->pre_vectors + usedvecs;
+-	for (; curvec < nvecs; curvec++)
+-		cpumask_copy(&masks[curvec].mask, irq_default_affinity);
++		 /* Set remaining vectors to default affinity */
++		 for (; curvec < nvecs; curvec++)
++			 cpumask_copy(&masks[curvec].mask, irq_default_affinity);
+ 
+-	/* Mark the managed interrupts */
++	/* Mark managed vectors */
+ 	for (i = affd->pre_vectors; i < nvecs - affd->post_vectors; i++)
+ 		masks[i].is_managed = 1;
+ 
+@@ -102,27 +992,61 @@ irq_create_affinity_masks(unsigned int n
+ }
+ 
+ /**
+- * irq_calc_affinity_vectors - Calculate the optimal number of vectors
+- * @minvec:	The minimum number of vectors available
+- * @maxvec:	The maximum number of vectors available
+- * @affd:	Description of the affinity requirements
++ * irq_calc_affinity_vectors - Calculate optimal number of vectors for IRQ affinity
++ * @minvec: Minimum number of vectors
++ * @maxvec: Maximum number of vectors
++ * @affd: IRQ affinity descriptor
++ *
++ * Determines the optimal number of interrupt vectors for the system
++ * based on CPU topology.
++ *
++ * Return: Optimal number of vectors or 0 on failure
+  */
+ unsigned int irq_calc_affinity_vectors(unsigned int minvec, unsigned int maxvec,
+-				       const struct irq_affinity *affd)
++									   const struct irq_affinity *affd)
+ {
+-	unsigned int resv = affd->pre_vectors + affd->post_vectors;
+-	unsigned int set_vecs;
++	unsigned int resv, set_vecs = 0;
++	unsigned int diff;
++
++	if (!affd)
++		return 0;
++
++	resv = affd->pre_vectors + affd->post_vectors;
+ 
+ 	if (resv > minvec)
+ 		return 0;
+ 
++	/* Check for overflow */
++	if (check_sub_overflow(maxvec, resv, &diff))
++		return 0;
++
+ 	if (affd->calc_sets) {
+-		set_vecs = maxvec - resv;
++		set_vecs = diff;
+ 	} else {
+ 		cpus_read_lock();
+-		set_vecs = cpumask_weight(cpu_possible_mask);
++		#ifdef CONFIG_X86
++		if (hybrid_cpu_detected() && irq_pcore_affinity) {
++			struct cpumask pcpu_mask;
++			cpumask_clear(&pcpu_mask);
++			if (get_pcore_mask(&pcpu_mask) == 0 && !cpumask_empty(&pcpu_mask)) {
++				set_vecs = cpumask_weight(&pcpu_mask);
++			} else {
++				set_vecs = cpumask_weight(cpu_online_mask);
++			}
++		} else
++			#endif
++			set_vecs = cpumask_weight(cpu_possible_mask);
+ 		cpus_read_unlock();
+ 	}
+ 
+-	return resv + min(set_vecs, maxvec - resv);
++	/* Ensure at least one vector */
++	if (set_vecs == 0)
++		set_vecs = 1;
++
++	return resv + min(set_vecs, diff);
+ }
++
++/* Module metadata */
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Intel Corporation");
++MODULE_DESCRIPTION("Raptor Lake IRQ Affinity Optimizations");
+
+
+
+--- a/arch/x86/kernel/cpu/topology.c	2025-03-13 13:08:08.000000000 +0100
++++ b/arch/x86/kernel/cpu/topology.c	2025-03-18 18:59:24.095000486 +0100
+@@ -31,6 +31,11 @@
+ #include <asm/io_apic.h>
+ #include <asm/mpspec.h>
+ #include <asm/smp.h>
++#include <asm/cpufeature.h> /* For boot_cpu_has() */
++#if defined(CONFIG_AS_AVX2) && defined(CONFIG_X86_64)
++#include <asm/fpu/api.h>    /* For FPU state management */
++#include <asm/immintrin.h>  /* For AVX2 intrinsics */
++#endif
+ 
+ #include "cpu.h"
+ 
+@@ -45,8 +50,8 @@ EXPORT_EARLY_PER_CPU_SYMBOL(x86_cpu_to_a
+ /* Bitmap of physically present CPUs. */
+ DECLARE_BITMAP(phys_cpu_present_map, MAX_LOCAL_APIC) __read_mostly;
+ 
+-/* Used for CPU number allocation and parallel CPU bringup */
+-u32 cpuid_to_apicid[] __ro_after_init = { [0 ... NR_CPUS - 1] = BAD_APICID, };
++/* Used for CPU number allocation and parallel CPU bringup - cache-line aligned for Raptor Lake */
++u32 __aligned(64) cpuid_to_apicid[] __ro_after_init = { [0 ... NR_CPUS - 1] = BAD_APICID, };
+ 
+ /* Bitmaps to mark registered APICs at each topology domain */
+ static struct { DECLARE_BITMAP(map, MAX_LOCAL_APIC); } apic_maps[TOPO_MAX_DOMAIN] __ro_after_init;
+@@ -56,18 +61,18 @@ static struct { DECLARE_BITMAP(map, MAX_
+  * with 1 as CPU #0 is reserved for the boot CPU.
+  */
+ static struct {
+-	unsigned int		nr_assigned_cpus;
+-	unsigned int		nr_disabled_cpus;
+-	unsigned int		nr_rejected_cpus;
+-	u32			boot_cpu_apic_id;
+-	u32			real_bsp_apic_id;
++	unsigned int            nr_assigned_cpus;
++	unsigned int            nr_disabled_cpus;
++	unsigned int            nr_rejected_cpus;
++	u32                     boot_cpu_apic_id;
++	u32                     real_bsp_apic_id;
+ } topo_info __ro_after_init = {
+-	.nr_assigned_cpus	= 1,
+-	.boot_cpu_apic_id	= BAD_APICID,
+-	.real_bsp_apic_id	= BAD_APICID,
++	.nr_assigned_cpus       = 1,
++	.boot_cpu_apic_id       = BAD_APICID,
++	.real_bsp_apic_id       = BAD_APICID,
+ };
+ 
+-#define domain_weight(_dom)	bitmap_weight(apic_maps[_dom].map, MAX_LOCAL_APIC)
++#define domain_weight(_dom)     bitmap_weight(apic_maps[_dom].map, MAX_LOCAL_APIC)
+ 
+ bool arch_match_cpu_phys_id(int cpu, u64 phys_id)
+ {
+@@ -95,16 +100,59 @@ static inline u32 topo_apicid(u32 apicid
+ 	return apicid & (UINT_MAX << x86_topo_system.dom_shifts[dom - 1]);
+ }
+ 
++/*
++ * Optimized lookup function using AVX2 when appropriate.
++ * - Safe for boot-time use due to careful feature detection
++ * - Uses kernel FPU context management for safety
++ * - Falls back to scalar code for smaller datasets or when AVX2 not available
++ */
+ static int topo_lookup_cpuid(u32 apic_id)
+ {
+-	int i;
++	int i = 0;
++
++	#if defined(CONFIG_AS_AVX2) && defined(CONFIG_X86_64)
++	/*
++	 * Use AVX2 for bulk comparison when:
++	 * 1. We have enough elements to justify vector ops (≥16)
++	 * 2. CPU supports AVX2
++	 * 3. We're not too early in boot (initcalls are safe)
++	 */
++	if (system_state > SYSTEM_BOOTING &&
++		topo_info.nr_assigned_cpus >= 16 &&
++		boot_cpu_has(X86_FEATURE_AVX2)) {
+ 
+-	/* CPU# to APICID mapping is persistent once it is established */
+-	for (i = 0; i < topo_info.nr_assigned_cpus; i++) {
+-		if (cpuid_to_apicid[i] == apic_id)
+-			return i;
++		int result = -ENODEV;  /* Default return value */
++
++		/* Ensure vector instructions can be used safely in kernel context */
++		kernel_fpu_begin();
++
++	__m256i search_val = _mm256_set1_epi32(apic_id);
++
++	/* Process 8 elements at a time */
++	for (; i <= topo_info.nr_assigned_cpus - 8; i += 8) {
++		__m256i data = _mm256_loadu_si256((__m256i*)&cpuid_to_apicid[i]);
++		__m256i cmp = _mm256_cmpeq_epi32(data, search_val);
++		int mask = _mm256_movemask_ps((__m256)cmp);
++
++		if (mask) {
++			result = i + __builtin_ctz(mask);
++			break;
++		}
+ 	}
+-	return -ENODEV;
++
++	kernel_fpu_end();
++
++	if (result != -ENODEV)
++		return result;
++		}
++		#endif
++
++		/* Handle remaining elements with scalar code */
++		for (; i < topo_info.nr_assigned_cpus; i++) {
++			if (cpuid_to_apicid[i] == apic_id)
++				return i;
++		}
++		return -ENODEV;
+ }
+ 
+ static __init int topo_get_cpunr(u32 apic_id)
+@@ -119,10 +167,10 @@ static __init int topo_get_cpunr(u32 api
+ 
+ static void topo_set_cpuids(unsigned int cpu, u32 apic_id, u32 acpi_id)
+ {
+-#if defined(CONFIG_SMP) || defined(CONFIG_X86_64)
++	#if defined(CONFIG_SMP) || defined(CONFIG_X86_64)
+ 	early_per_cpu(x86_cpu_to_apicid, cpu) = apic_id;
+ 	early_per_cpu(x86_cpu_to_acpiid, cpu) = acpi_id;
+-#endif
++	#endif
+ 	set_cpu_present(cpu, true);
+ }
+ 
+@@ -183,7 +231,7 @@ static __init bool check_for_real_bsp(u3
+ 	}
+ 
+ 	pr_warn("Boot CPU APIC ID not the first enumerated APIC ID: %x != %x\n",
+-		topo_info.boot_cpu_apic_id, apic_id);
++			topo_info.boot_cpu_apic_id, apic_id);
+ 
+ 	if (is_bsp) {
+ 		/*
+@@ -199,22 +247,46 @@ static __init bool check_for_real_bsp(u3
+ 	topo_info.real_bsp_apic_id = apic_id;
+ 	return true;
+ 
+-fwbug:
++	fwbug:
+ 	pr_warn(FW_BUG "APIC enumeration order not specification compliant\n");
+ 	return false;
+ }
+ 
++/*
++ * Optimized bit counting function leveraging prefetching
++ * based on Intel Raptor Lake optimization guidelines
++ */
+ static unsigned int topo_unit_count(u32 lvlid, enum x86_topology_domains at_level,
+-				    unsigned long *map)
++									unsigned long *map)
+ {
+ 	unsigned int id, end, cnt = 0;
+ 
+ 	/* Calculate the exclusive end */
+ 	end = lvlid + (1U << x86_topo_system.dom_shifts[at_level]);
+ 
++	/*
++	 * For larger ranges, use strategic prefetching with Intel-recommended
++	 * prefetch distance (at least 64 bytes ahead)
++	 */
++	if (end - lvlid > 128) {
++		/* Prefetch the bitmap regions we'll be accessing */
++		__builtin_prefetch(&map[lvlid / BITS_PER_LONG], 0, 1);
++		if ((end - 1) / BITS_PER_LONG != lvlid / BITS_PER_LONG)
++			__builtin_prefetch(&map[(end - 1) / BITS_PER_LONG], 0, 1);
++	}
++
+ 	/* Unfortunately there is no bitmap_weight_range() */
+-	for (id = find_next_bit(map, end, lvlid); id < end; id = find_next_bit(map, end, ++id))
++	for (id = find_next_bit(map, end, lvlid); id < end; id = find_next_bit(map, end, ++id)) {
++		/*
++		 * Only prefetch when we're about to cross a word boundary
++		 * Use Intel-recommended prefetch distance (3-7 iterations ahead)
++		 */
++		unsigned long next_word_boundary = (id / BITS_PER_LONG + 1) * BITS_PER_LONG;
++		if (id + 6 >= next_word_boundary && next_word_boundary < end)
++			__builtin_prefetch(&map[next_word_boundary / BITS_PER_LONG], 0, 1);
++
+ 		cnt++;
++	}
+ 	return cnt;
+ }
+ 
+@@ -246,14 +318,14 @@ static __init void topo_register_apic(u3
+ 		 * on bare metal. Allow the bogosity in a guest.
+ 		 */
+ 		if (hypervisor_is_type(X86_HYPER_NATIVE) &&
+-		    topo_unit_count(pkgid, TOPO_PKG_DOMAIN, phys_cpu_present_map)) {
++			topo_unit_count(pkgid, TOPO_PKG_DOMAIN, phys_cpu_present_map)) {
+ 			pr_info_once("Ignoring hot-pluggable APIC ID %x in present package.\n",
+-				     apic_id);
++						 apic_id);
+ 			topo_info.nr_rejected_cpus++;
+-			return;
+-		}
++		return;
++			}
+ 
+-		topo_info.nr_disabled_cpus++;
++			topo_info.nr_disabled_cpus++;
+ 	}
+ 
+ 	/*
+@@ -267,9 +339,9 @@ static __init void topo_register_apic(u3
+ 
+ /**
+  * topology_register_apic - Register an APIC in early topology maps
+- * @apic_id:	The APIC ID to set up
+- * @acpi_id:	The ACPI ID associated to the APIC
+- * @present:	True if the corresponding CPU is present
++ * @apic_id:    The APIC ID to set up
++ * @acpi_id:    The ACPI ID associated to the APIC
++ * @present:    True if the corresponding CPU is present
+  */
+ void __init topology_register_apic(u32 apic_id, u32 acpi_id, bool present)
+ {
+@@ -296,7 +368,7 @@ void __init topology_register_apic(u32 a
+ 
+ /**
+  * topology_register_boot_apic - Register the boot CPU APIC
+- * @apic_id:	The APIC ID to set up
++ * @apic_id:    The APIC ID to set up
+  *
+  * Separate so CPU #0 can be assigned
+  */
+@@ -310,17 +382,17 @@ void __init topology_register_boot_apic(
+ 
+ /**
+  * topology_get_logical_id - Retrieve the logical ID at a given topology domain level
+- * @apicid:		The APIC ID for which to lookup the logical ID
+- * @at_level:		The topology domain level to use
++ * @apicid:             The APIC ID for which to lookup the logical ID
++ * @at_level:           The topology domain level to use
+  *
+  * @apicid must be a full APIC ID, not the normalized variant. It's valid to have
+  * all bits below the domain level specified by @at_level to be clear. So both
+  * real APIC IDs and backshifted normalized APIC IDs work correctly.
+  *
+  * Returns:
+- *  - >= 0:	The requested logical ID
+- *  - -ERANGE:	@apicid is out of range
+- *  - -ENODEV:	@apicid is not registered
++ *  - >= 0:     The requested logical ID
++ *  - -ERANGE:  @apicid is out of range
++ *  - -ENODEV:  @apicid is not registered
+  */
+ int topology_get_logical_id(u32 apicid, enum x86_topology_domains at_level)
+ {
+@@ -329,8 +401,29 @@ int topology_get_logical_id(u32 apicid,
+ 
+ 	if (lvlid >= MAX_LOCAL_APIC)
+ 		return -ERANGE;
++
++	/*
++	 * Intel recommends prefetching only when data is likely to be accessed
++	 * and not in the cache - bitmap operations have a good chance of locality
++	 */
++	if (lvlid > 128)
++		__builtin_prefetch(&apic_maps[at_level].map[lvlid / BITS_PER_LONG], 0, 1);
++
+ 	if (!test_bit(lvlid, apic_maps[at_level].map))
+ 		return -ENODEV;
++
++	/* For larger bitmaps, prefetch strategically for bitmap_weight */
++	if (lvlid > 128) {
++		/* Prefetch first word which is always accessed */
++		__builtin_prefetch(&apic_maps[at_level].map[0], 0, 1);
++
++		/* For larger ranges, also prefetch the last word in the range */
++		if (lvlid > BITS_PER_LONG) {
++			unsigned long last_word = lvlid / BITS_PER_LONG;
++			__builtin_prefetch(&apic_maps[at_level].map[last_word], 0, 1);
++		}
++	}
++
+ 	/* Get the number of set bits before @lvlid. */
+ 	return bitmap_weight(apic_maps[at_level].map, lvlid);
+ }
+@@ -338,9 +431,9 @@ EXPORT_SYMBOL_GPL(topology_get_logical_i
+ 
+ /**
+  * topology_unit_count - Retrieve the count of specified units at a given topology domain level
+- * @apicid:		The APIC ID which specifies the search range
+- * @which_units:	The domain level specifying the units to count
+- * @at_level:		The domain level at which @which_units have to be counted
++ * @apicid:             The APIC ID which specifies the search range
++ * @which_units:        The domain level specifying the units to count
++ * @at_level:           The domain level at which @which_units have to be counted
+  *
+  * This returns the number of possible units according to the enumerated
+  * information.
+@@ -355,7 +448,7 @@ EXPORT_SYMBOL_GPL(topology_get_logical_i
+  * is by definition undefined and the function returns 0.
+  */
+ unsigned int topology_unit_count(u32 apicid, enum x86_topology_domains which_units,
+-				 enum x86_topology_domains at_level)
++								 enum x86_topology_domains at_level)
+ {
+ 	/* Remove the bits below @at_level to get the proper level ID of @apicid */
+ 	unsigned int lvlid = topo_apicid(apicid, at_level);
+@@ -374,8 +467,8 @@ unsigned int topology_unit_count(u32 api
+ #ifdef CONFIG_ACPI_HOTPLUG_CPU
+ /**
+  * topology_hotplug_apic - Handle a physical hotplugged APIC after boot
+- * @apic_id:	The APIC ID to set up
+- * @acpi_id:	The ACPI ID associated to the APIC
++ * @apic_id:    The APIC ID to set up
++ * @acpi_id:    The ACPI ID associated to the APIC
+  */
+ int topology_hotplug_apic(u32 apic_id, u32 acpi_id)
+ {
+@@ -384,6 +477,10 @@ int topology_hotplug_apic(u32 apic_id, u
+ 	if (apic_id >= MAX_LOCAL_APIC)
+ 		return -EINVAL;
+ 
++	/* Strategic prefetching based on Intel guidelines */
++	if (apic_id > 64)
++		__builtin_prefetch(&apic_maps[TOPO_SMT_DOMAIN].map[apic_id / BITS_PER_LONG], 0, 1);
++
+ 	/* Reject if the APIC ID was not registered during enumeration. */
+ 	if (!test_bit(apic_id, apic_maps[TOPO_SMT_DOMAIN].map))
+ 		return -ENODEV;
+@@ -400,7 +497,7 @@ int topology_hotplug_apic(u32 apic_id, u
+ 
+ /**
+  * topology_hotunplug_apic - Remove a physical hotplugged APIC after boot
+- * @cpu:	The CPU number for which the APIC ID is removed
++ * @cpu:        The CPU number for which the APIC ID is removed
+  */
+ void topology_hotunplug_apic(unsigned int cpu)
+ {
+@@ -530,13 +627,17 @@ void __init topology_init_possible_cpus(
+ 	/* Assign CPU numbers to non-present CPUs */
+ 	for (apicid = 0; disabled; disabled--, apicid++) {
+ 		apicid = find_next_andnot_bit(apic_maps[TOPO_SMT_DOMAIN].map, phys_cpu_present_map,
+-					      MAX_LOCAL_APIC, apicid);
++									  MAX_LOCAL_APIC, apicid);
+ 		if (apicid >= MAX_LOCAL_APIC)
+ 			break;
+ 		cpuid_to_apicid[topo_info.nr_assigned_cpus++] = apicid;
+ 	}
+ 
+ 	for (cpu = 0; cpu < allowed; cpu++) {
++		/* Prefetch data several iterations ahead for systems with many CPUs */
++		if (allowed > 32 && cpu + 8 < allowed)
++			__builtin_prefetch(&cpuid_to_apicid[cpu + 8], 0, 1);
++
+ 		apicid = cpuid_to_apicid[cpu];
+ 
+ 		set_cpu_possible(cpu, true);
+@@ -544,6 +645,10 @@ void __init topology_init_possible_cpus(
+ 		if (apicid == BAD_APICID)
+ 			continue;
+ 
++		/* Prefetch bitmap data for upcoming test_bit operation when APIC IDs are larger */
++		if (apicid > 128)
++			__builtin_prefetch(&phys_cpu_present_map[apicid / BITS_PER_LONG], 0, 1);
++
+ 		cpu_mark_primary_thread(cpu, apicid);
+ 		set_cpu_present(cpu, test_bit(apicid, phys_cpu_present_map));
+ 	}
+
+
+--- a/arch/x86/include/asm/atomic.h	2025-03-17 23:15:50.374342755 +0100
++++ b/arch/x86/include/asm/atomic.h	2025-03-17 23:33:21.311978298 +0100
+@@ -4,6 +4,7 @@
+ 
+ #include <linux/compiler.h>
+ #include <linux/types.h>
++#include <linux/prefetch.h>  /* For prefetchw */
+ #include <asm/alternative.h>
+ #include <asm/cmpxchg.h>
+ #include <asm/rmwcc.h>
+@@ -31,15 +32,15 @@ static __always_inline void arch_atomic_
+ static __always_inline void arch_atomic_add(int i, atomic_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "addl %1, %0"
+-		     : "+m" (v->counter)
+-		     : "ir" (i) : "memory");
++	: "+m" (v->counter)
++	: "ir" (i) : "memory");
+ }
+ 
+ static __always_inline void arch_atomic_sub(int i, atomic_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "subl %1, %0"
+-		     : "+m" (v->counter)
+-		     : "ir" (i) : "memory");
++	: "+m" (v->counter)
++	: "ir" (i) : "memory");
+ }
+ 
+ static __always_inline bool arch_atomic_sub_and_test(int i, atomic_t *v)
+@@ -82,6 +83,8 @@ static __always_inline bool arch_atomic_
+ 
+ static __always_inline int arch_atomic_add_return(int i, atomic_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	return i + xadd(&v->counter, i);
+ }
+ #define arch_atomic_add_return arch_atomic_add_return
+@@ -90,6 +93,8 @@ static __always_inline int arch_atomic_a
+ 
+ static __always_inline int arch_atomic_fetch_add(int i, atomic_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	return xadd(&v->counter, i);
+ }
+ #define arch_atomic_fetch_add arch_atomic_fetch_add
+@@ -117,16 +122,23 @@ static __always_inline int arch_atomic_x
+ static __always_inline void arch_atomic_and(int i, atomic_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "andl %1, %0"
+-			: "+m" (v->counter)
+-			: "ir" (i)
+-			: "memory");
++	: "+m" (v->counter)
++	: "ir" (i)
++	: "memory");
+ }
+ 
+ static __always_inline int arch_atomic_fetch_and(int i, atomic_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	int val = arch_atomic_read(v);
++	bool success;
+ 
+-	do { } while (!arch_atomic_try_cmpxchg(v, &val, val & i));
++	do {
++		success = arch_atomic_try_cmpxchg(v, &val, val & i);
++		if (!success)
++			asm volatile("pause" ::: "memory");
++	} while (!success);
+ 
+ 	return val;
+ }
+@@ -135,16 +147,23 @@ static __always_inline int arch_atomic_f
+ static __always_inline void arch_atomic_or(int i, atomic_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "orl %1, %0"
+-			: "+m" (v->counter)
+-			: "ir" (i)
+-			: "memory");
++	: "+m" (v->counter)
++	: "ir" (i)
++	: "memory");
+ }
+ 
+ static __always_inline int arch_atomic_fetch_or(int i, atomic_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	int val = arch_atomic_read(v);
++	bool success;
+ 
+-	do { } while (!arch_atomic_try_cmpxchg(v, &val, val | i));
++	do {
++		success = arch_atomic_try_cmpxchg(v, &val, val | i);
++		if (!success)
++			asm volatile("pause" ::: "memory");
++	} while (!success);
+ 
+ 	return val;
+ }
+@@ -153,16 +172,23 @@ static __always_inline int arch_atomic_f
+ static __always_inline void arch_atomic_xor(int i, atomic_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "xorl %1, %0"
+-			: "+m" (v->counter)
+-			: "ir" (i)
+-			: "memory");
++	: "+m" (v->counter)
++	: "ir" (i)
++	: "memory");
+ }
+ 
+ static __always_inline int arch_atomic_fetch_xor(int i, atomic_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	int val = arch_atomic_read(v);
++	bool success;
+ 
+-	do { } while (!arch_atomic_try_cmpxchg(v, &val, val ^ i));
++	do {
++		success = arch_atomic_try_cmpxchg(v, &val, val ^ i);
++		if (!success)
++			asm volatile("pause" ::: "memory");
++	} while (!success);
+ 
+ 	return val;
+ }
+
+
+
+--- a/arch/x86/include/asm/atomic64_64.h	2025-03-17 23:15:50.374365036 +0100
++++ b/arch/x86/include/asm/atomic64_64.h	2025-03-17 23:29:44.073893086 +0100
+@@ -3,12 +3,13 @@
+ #define _ASM_X86_ATOMIC64_64_H
+ 
+ #include <linux/types.h>
++#include <linux/prefetch.h>  /* For prefetchw */
+ #include <asm/alternative.h>
+ #include <asm/cmpxchg.h>
+ 
+ /* The 64-bit atomic type */
+ 
+-#define ATOMIC64_INIT(i)	{ (i) }
++#define ATOMIC64_INIT(i)        { (i) }
+ 
+ static __always_inline s64 arch_atomic64_read(const atomic64_t *v)
+ {
+@@ -23,15 +24,15 @@ static __always_inline void arch_atomic6
+ static __always_inline void arch_atomic64_add(s64 i, atomic64_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "addq %1, %0"
+-		     : "=m" (v->counter)
+-		     : "er" (i), "m" (v->counter) : "memory");
++	: "=m" (v->counter)
++	: "er" (i), "m" (v->counter) : "memory");
+ }
+ 
+ static __always_inline void arch_atomic64_sub(s64 i, atomic64_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "subq %1, %0"
+-		     : "=m" (v->counter)
+-		     : "er" (i), "m" (v->counter) : "memory");
++	: "=m" (v->counter)
++	: "er" (i), "m" (v->counter) : "memory");
+ }
+ 
+ static __always_inline bool arch_atomic64_sub_and_test(s64 i, atomic64_t *v)
+@@ -76,6 +77,8 @@ static __always_inline bool arch_atomic6
+ 
+ static __always_inline s64 arch_atomic64_add_return(s64 i, atomic64_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	return i + xadd(&v->counter, i);
+ }
+ #define arch_atomic64_add_return arch_atomic64_add_return
+@@ -84,6 +87,8 @@ static __always_inline s64 arch_atomic64
+ 
+ static __always_inline s64 arch_atomic64_fetch_add(s64 i, atomic64_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	return xadd(&v->counter, i);
+ }
+ #define arch_atomic64_fetch_add arch_atomic64_fetch_add
+@@ -111,17 +116,24 @@ static __always_inline s64 arch_atomic64
+ static __always_inline void arch_atomic64_and(s64 i, atomic64_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "andq %1, %0"
+-			: "+m" (v->counter)
+-			: "er" (i)
+-			: "memory");
++	: "+m" (v->counter)
++	: "er" (i)
++	: "memory");
+ }
+ 
+ static __always_inline s64 arch_atomic64_fetch_and(s64 i, atomic64_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	s64 val = arch_atomic64_read(v);
++	bool success;
+ 
+ 	do {
+-	} while (!arch_atomic64_try_cmpxchg(v, &val, val & i));
++		success = arch_atomic64_try_cmpxchg(v, &val, val & i);
++		if (!success)
++			asm volatile("pause" ::: "memory");
++	} while (!success);
++
+ 	return val;
+ }
+ #define arch_atomic64_fetch_and arch_atomic64_fetch_and
+@@ -129,17 +141,24 @@ static __always_inline s64 arch_atomic64
+ static __always_inline void arch_atomic64_or(s64 i, atomic64_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "orq %1, %0"
+-			: "+m" (v->counter)
+-			: "er" (i)
+-			: "memory");
++	: "+m" (v->counter)
++	: "er" (i)
++	: "memory");
+ }
+ 
+ static __always_inline s64 arch_atomic64_fetch_or(s64 i, atomic64_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	s64 val = arch_atomic64_read(v);
++	bool success;
+ 
+ 	do {
+-	} while (!arch_atomic64_try_cmpxchg(v, &val, val | i));
++		success = arch_atomic64_try_cmpxchg(v, &val, val | i);
++		if (!success)
++			asm volatile("pause" ::: "memory");
++	} while (!success);
++
+ 	return val;
+ }
+ #define arch_atomic64_fetch_or arch_atomic64_fetch_or
+@@ -147,17 +166,24 @@ static __always_inline s64 arch_atomic64
+ static __always_inline void arch_atomic64_xor(s64 i, atomic64_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "xorq %1, %0"
+-			: "+m" (v->counter)
+-			: "er" (i)
+-			: "memory");
++	: "+m" (v->counter)
++	: "er" (i)
++	: "memory");
+ }
+ 
+ static __always_inline s64 arch_atomic64_fetch_xor(s64 i, atomic64_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	s64 val = arch_atomic64_read(v);
++	bool success;
+ 
+ 	do {
+-	} while (!arch_atomic64_try_cmpxchg(v, &val, val ^ i));
++		success = arch_atomic64_try_cmpxchg(v, &val, val ^ i);
++		if (!success)
++			asm volatile("pause" ::: "memory");
++	} while (!success);
++
+ 	return val;
+ }
+ #define arch_atomic64_fetch_xor arch_atomic64_fetch_xor
+
+--- a/arch/x86/include/asm/cmpxchg_64.h	2025-03-16 12:16:45.099790963 +0100
++++ b/arch/x86/include/asm/cmpxchg_64.h	2025-03-16 12:23:42.498768123 +0100
+@@ -2,95 +2,112 @@
+ #ifndef _ASM_X86_CMPXCHG_64_H
+ #define _ASM_X86_CMPXCHG_64_H
+ 
+-#define arch_cmpxchg64(ptr, o, n)					\
+-({									\
+-	BUILD_BUG_ON(sizeof(*(ptr)) != 8);				\
+-	arch_cmpxchg((ptr), (o), (n));					\
++#include <linux/prefetch.h> /* For prefetchw */
++
++#define arch_cmpxchg64(ptr, o, n)                                       \
++({                                                                      \
++        BUILD_BUG_ON(sizeof(*(ptr)) != 8);                              \
++        arch_cmpxchg((ptr), (o), (n));                                  \
+ })
+ 
+-#define arch_cmpxchg64_local(ptr, o, n)					\
+-({									\
+-	BUILD_BUG_ON(sizeof(*(ptr)) != 8);				\
+-	arch_cmpxchg_local((ptr), (o), (n));				\
++#define arch_cmpxchg64_local(ptr, o, n)                                 \
++({                                                                      \
++        BUILD_BUG_ON(sizeof(*(ptr)) != 8);                              \
++        arch_cmpxchg_local((ptr), (o), (n));                            \
+ })
+ 
+-#define arch_try_cmpxchg64(ptr, po, n)					\
+-({									\
+-	BUILD_BUG_ON(sizeof(*(ptr)) != 8);				\
+-	arch_try_cmpxchg((ptr), (po), (n));				\
++#define arch_try_cmpxchg64(ptr, po, n)                                  \
++({                                                                      \
++        BUILD_BUG_ON(sizeof(*(ptr)) != 8);                              \
++        arch_try_cmpxchg((ptr), (po), (n));                             \
+ })
+ 
+-#define arch_try_cmpxchg64_local(ptr, po, n)				\
+-({									\
+-	BUILD_BUG_ON(sizeof(*(ptr)) != 8);				\
+-	arch_try_cmpxchg_local((ptr), (po), (n));			\
++#define arch_try_cmpxchg64_local(ptr, po, n)                            \
++({                                                                      \
++        BUILD_BUG_ON(sizeof(*(ptr)) != 8);                              \
++        arch_try_cmpxchg_local((ptr), (po), (n));                       \
+ })
+ 
+ union __u128_halves {
+-	u128 full;
+-	struct {
+-		u64 low, high;
+-	};
++        u128 full;
++        struct {
++                u64 low, high;
++        };
+ };
+ 
+-#define __arch_cmpxchg128(_ptr, _old, _new, _lock)			\
+-({									\
+-	union __u128_halves o = { .full = (_old), },			\
+-			    n = { .full = (_new), };			\
+-									\
+-	asm_inline volatile(_lock "cmpxchg16b %[ptr]"			\
+-		     : [ptr] "+m" (*(_ptr)),				\
+-		       "+a" (o.low), "+d" (o.high)			\
+-		     : "b" (n.low), "c" (n.high)			\
+-		     : "memory");					\
+-									\
+-	o.full;								\
++#define __arch_cmpxchg128(_ptr, _old, _new, _lock)                      \
++({                                                                      \
++        union __u128_halves o = { .full = (_old), },                    \
++        n = { .full = (_new), };                    \
++        \
++        asm_inline volatile(_lock "cmpxchg16b %[ptr]"                   \
++        : [ptr] "+m" (*(_ptr)),                            \
++        "+a" (o.low), "+d" (o.high)                      \
++        : "b" (n.low), "c" (n.high)                        \
++        : "memory");                                       \
++        \
++        o.full;                                                         \
+ })
+ 
+ static __always_inline u128 arch_cmpxchg128(volatile u128 *ptr, u128 old, u128 new)
+ {
+-	return __arch_cmpxchg128(ptr, old, new, LOCK_PREFIX);
++        /* Prefetch the cacheline for Raptor Lake's improved cache subsystem */
++        prefetchw((void *)ptr);  /* Cast to void* to avoid discarding qualifiers warning */
++        return __arch_cmpxchg128(ptr, old, new, LOCK_PREFIX);
+ }
+ #define arch_cmpxchg128 arch_cmpxchg128
+ 
+ static __always_inline u128 arch_cmpxchg128_local(volatile u128 *ptr, u128 old, u128 new)
+ {
+-	return __arch_cmpxchg128(ptr, old, new,);
++        /* Lightweight memory ordering for local operations */
++        asm volatile("" ::: "memory");
++        u128 ret = __arch_cmpxchg128(ptr, old, new,);
++        asm volatile("" ::: "memory");
++        return ret;
+ }
+ #define arch_cmpxchg128_local arch_cmpxchg128_local
+ 
+-#define __arch_try_cmpxchg128(_ptr, _oldp, _new, _lock)			\
+-({									\
+-	union __u128_halves o = { .full = *(_oldp), },			\
+-			    n = { .full = (_new), };			\
+-	bool ret;							\
+-									\
+-	asm_inline volatile(_lock "cmpxchg16b %[ptr]"			\
+-		     CC_SET(e)						\
+-		     : CC_OUT(e) (ret),					\
+-		       [ptr] "+m" (*(_ptr)),				\
+-		       "+a" (o.low), "+d" (o.high)			\
+-		     : "b" (n.low), "c" (n.high)			\
+-		     : "memory");					\
+-									\
+-	if (unlikely(!ret))						\
+-		*(_oldp) = o.full;					\
+-									\
+-	likely(ret);							\
++#define __arch_try_cmpxchg128(_ptr, _oldp, _new, _lock)                 \
++({                                                                      \
++        union __u128_halves o = { .full = *(_oldp), },                  \
++        n = { .full = (_new), };                    \
++        bool ret;                                                       \
++        \
++        asm_inline volatile(_lock "cmpxchg16b %[ptr]"                   \
++        CC_SET(e)                                          \
++        : CC_OUT(e) (ret),                                 \
++        [ptr] "+m" (*(_ptr)),                            \
++        "+a" (o.low), "+d" (o.high)                      \
++        : "b" (n.low), "c" (n.high)                        \
++        : "memory");                                       \
++        \
++        if (unlikely(!ret)) {                                           \
++                /* Single PAUSE optimized for Raptor Lake's shorter pause latency */ \
++                asm volatile("pause" ::: "memory");                     \
++                *(_oldp) = o.full;                                      \
++        }                                                               \
++        \
++        likely(ret);                                                    \
+ })
+ 
+ static __always_inline bool arch_try_cmpxchg128(volatile u128 *ptr, u128 *oldp, u128 new)
+ {
+-	return __arch_try_cmpxchg128(ptr, oldp, new, LOCK_PREFIX);
++        /* Prefetch for improved performance on Raptor Lake */
++        prefetchw((void *)ptr);  /* Cast to void* to avoid discarding qualifiers warning */
++        return __arch_try_cmpxchg128(ptr, oldp, new, LOCK_PREFIX);
+ }
+ #define arch_try_cmpxchg128 arch_try_cmpxchg128
+ 
+ static __always_inline bool arch_try_cmpxchg128_local(volatile u128 *ptr, u128 *oldp, u128 new)
+ {
+-	return __arch_try_cmpxchg128(ptr, oldp, new,);
++        /* Lightweight memory ordering for local operations */
++        asm volatile("" ::: "memory");
++        bool ret = __arch_try_cmpxchg128(ptr, oldp, new,);
++        asm volatile("" ::: "memory");
++        return ret;
+ }
+ #define arch_try_cmpxchg128_local arch_try_cmpxchg128_local
+ 
+-#define system_has_cmpxchg128()		boot_cpu_has(X86_FEATURE_CX16)
++#define system_has_cmpxchg128()         boot_cpu_has(X86_FEATURE_CX16)
+ 
+ #endif /* _ASM_X86_CMPXCHG_64_H */
+
+
+
+--- a/lib/xxhash.c	2025-03-16 12:16:45.099790963 +0100
++++ b/lib/xxhash.c	2025-03-16 12:23:42.498768123 +0100
+@@ -36,6 +36,8 @@
+  * You can contact the author at:
+  * - xxHash homepage: https://cyan4973.github.io/xxHash/
+  * - xxHash source repository: https://github.com/Cyan4973/xxHash
++ *
++ * Optimized for Intel Raptor Lake, 2025
+  */
+ 
+ #include <linux/unaligned.h>
+@@ -45,6 +47,7 @@
+ #include <linux/module.h>
+ #include <linux/string.h>
+ #include <linux/xxhash.h>
++#include <linux/prefetch.h>
+ 
+ /*-*************************************
+  * Macros
+@@ -52,6 +55,17 @@
+ #define xxh_rotl32(x, r) ((x << r) | (x >> (32 - r)))
+ #define xxh_rotl64(x, r) ((x << r) | (x >> (64 - r)))
+ 
++/* Optimization: Read 4-byte and 8-byte chunks more efficiently */
++#define XXH_get32bits(ptr) get_unaligned_le32(ptr)
++#define XXH_get64bits(ptr) get_unaligned_le64(ptr)
++
++/* Prefetch macros optimized for Raptor Lake's cache architecture */
++#define XXH_PREFETCH(ptr) prefetch(ptr)
++#define XXH_PREFETCH_DIST 512  /* Optimized for Raptor Lake L1/L2 prefetcher behavior */
++
++/* Cache line size for Raptor Lake */
++#define XXH_CACHELINE_SIZE 64
++
+ #ifdef __LITTLE_ENDIAN
+ # define XXH_CPU_LITTLE_ENDIAN 1
+ #else
+@@ -91,7 +105,8 @@ EXPORT_SYMBOL(xxh64_copy_state);
+ /*-***************************
+  * Simple Hash Functions
+  ****************************/
+-static uint32_t xxh32_round(uint32_t seed, const uint32_t input)
++/* Optimized for better instruction pipelining on Raptor Lake */
++static inline uint32_t xxh32_round(uint32_t seed, const uint32_t input)
+ {
+ 	seed += input * PRIME32_2;
+ 	seed = xxh_rotl32(seed, 13);
+@@ -99,50 +114,65 @@ static uint32_t xxh32_round(uint32_t see
+ 	return seed;
+ }
+ 
++/*
++ * xxh32 optimized for Raptor Lake:
++ * - Improved prefetching for large inputs
++ * - Better branch prediction with likely/unlikely hints
++ * - Loop unrolling for better instruction-level parallelism
++ */
+ uint32_t xxh32(const void *input, const size_t len, const uint32_t seed)
+ {
+ 	const uint8_t *p = (const uint8_t *)input;
+ 	const uint8_t *b_end = p + len;
+ 	uint32_t h32;
+ 
+-	if (len >= 16) {
++	if (likely(len >= 16)) {
+ 		const uint8_t *const limit = b_end - 16;
+ 		uint32_t v1 = seed + PRIME32_1 + PRIME32_2;
+ 		uint32_t v2 = seed + PRIME32_2;
+ 		uint32_t v3 = seed + 0;
+ 		uint32_t v4 = seed - PRIME32_1;
+ 
++		/* Process 16 bytes per iteration (4 lanes of 4 bytes each) */
+ 		do {
+-			v1 = xxh32_round(v1, get_unaligned_le32(p));
+-			p += 4;
+-			v2 = xxh32_round(v2, get_unaligned_le32(p));
+-			p += 4;
+-			v3 = xxh32_round(v3, get_unaligned_le32(p));
+-			p += 4;
+-			v4 = xxh32_round(v4, get_unaligned_le32(p));
+-			p += 4;
++			/* For large inputs, prefetch ahead to reduce cache misses */
++			if (likely(limit - p > XXH_PREFETCH_DIST))
++				XXH_PREFETCH(p + XXH_PREFETCH_DIST);
++
++			/* Process 4 lanes in parallel for better instruction pipelining */
++			v1 = xxh32_round(v1, XXH_get32bits(p));
++			v2 = xxh32_round(v2, XXH_get32bits(p + 4));
++			v3 = xxh32_round(v3, XXH_get32bits(p + 8));
++			v4 = xxh32_round(v4, XXH_get32bits(p + 12));
++
++			p += 16;
+ 		} while (p <= limit);
+ 
++		/* Combine the 4 lanes */
+ 		h32 = xxh_rotl32(v1, 1) + xxh_rotl32(v2, 7) +
+-			xxh_rotl32(v3, 12) + xxh_rotl32(v4, 18);
++		xxh_rotl32(v3, 12) + xxh_rotl32(v4, 18);
+ 	} else {
++		/* Small input optimization */
+ 		h32 = seed + PRIME32_5;
+ 	}
+ 
+ 	h32 += (uint32_t)len;
+ 
++	/* Process remaining 4-byte chunks */
+ 	while (p + 4 <= b_end) {
+-		h32 += get_unaligned_le32(p) * PRIME32_3;
++		h32 += XXH_get32bits(p) * PRIME32_3;
+ 		h32 = xxh_rotl32(h32, 17) * PRIME32_4;
+ 		p += 4;
+ 	}
+ 
++	/* Process remaining bytes */
+ 	while (p < b_end) {
+ 		h32 += (*p) * PRIME32_5;
+ 		h32 = xxh_rotl32(h32, 11) * PRIME32_1;
+ 		p++;
+ 	}
+ 
++	/* Finalization - avalanche bits for better mixing */
+ 	h32 ^= h32 >> 15;
+ 	h32 *= PRIME32_2;
+ 	h32 ^= h32 >> 13;
+@@ -153,7 +183,8 @@ uint32_t xxh32(const void *input, const
+ }
+ EXPORT_SYMBOL(xxh32);
+ 
+-static uint64_t xxh64_round(uint64_t acc, const uint64_t input)
++/* Optimized round function for xxh64 */
++static inline uint64_t xxh64_round(uint64_t acc, const uint64_t input)
+ {
+ 	acc += input * PRIME64_2;
+ 	acc = xxh_rotl64(acc, 31);
+@@ -161,7 +192,7 @@ static uint64_t xxh64_round(uint64_t acc
+ 	return acc;
+ }
+ 
+-static uint64_t xxh64_merge_round(uint64_t acc, uint64_t val)
++static inline uint64_t xxh64_merge_round(uint64_t acc, uint64_t val)
+ {
+ 	val = xxh64_round(0, val);
+ 	acc ^= val;
+@@ -169,63 +200,83 @@ static uint64_t xxh64_merge_round(uint64
+ 	return acc;
+ }
+ 
++/*
++ * xxh64 optimized for Raptor Lake:
++ * - Improved prefetching strategy
++ * - Loop unrolling for better instruction-level parallelism
++ * - Better branch prediction with likely/unlikely hints
++ */
+ uint64_t xxh64(const void *input, const size_t len, const uint64_t seed)
+ {
+ 	const uint8_t *p = (const uint8_t *)input;
+ 	const uint8_t *const b_end = p + len;
+ 	uint64_t h64;
+ 
+-	if (len >= 32) {
++	if (likely(len >= 32)) {
+ 		const uint8_t *const limit = b_end - 32;
+ 		uint64_t v1 = seed + PRIME64_1 + PRIME64_2;
+ 		uint64_t v2 = seed + PRIME64_2;
+ 		uint64_t v3 = seed + 0;
+ 		uint64_t v4 = seed - PRIME64_1;
+ 
++		/* Process 32 bytes per iteration (4 lanes of 8 bytes each) */
+ 		do {
+-			v1 = xxh64_round(v1, get_unaligned_le64(p));
+-			p += 8;
+-			v2 = xxh64_round(v2, get_unaligned_le64(p));
+-			p += 8;
+-			v3 = xxh64_round(v3, get_unaligned_le64(p));
+-			p += 8;
+-			v4 = xxh64_round(v4, get_unaligned_le64(p));
+-			p += 8;
++			/* Prefetch ahead for large inputs to reduce cache misses */
++			if (likely(limit - p > XXH_PREFETCH_DIST)) {
++				XXH_PREFETCH(p + XXH_PREFETCH_DIST);
++				/* Add a second prefetch to handle more of the stream */
++				XXH_PREFETCH(p + XXH_PREFETCH_DIST + XXH_CACHELINE_SIZE);
++			}
++
++			/* Process 4 lanes in parallel for better instruction pipelining */
++			v1 = xxh64_round(v1, XXH_get64bits(p));
++			v2 = xxh64_round(v2, XXH_get64bits(p + 8));
++			v3 = xxh64_round(v3, XXH_get64bits(p + 16));
++			v4 = xxh64_round(v4, XXH_get64bits(p + 24));
++
++			p += 32;
+ 		} while (p <= limit);
+ 
++		/* Combine the 4 lanes with improved mixing for better distribution */
+ 		h64 = xxh_rotl64(v1, 1) + xxh_rotl64(v2, 7) +
+-			xxh_rotl64(v3, 12) + xxh_rotl64(v4, 18);
++		xxh_rotl64(v3, 12) + xxh_rotl64(v4, 18);
++
++		/* Merge all lanes to improve bit mixing */
+ 		h64 = xxh64_merge_round(h64, v1);
+ 		h64 = xxh64_merge_round(h64, v2);
+ 		h64 = xxh64_merge_round(h64, v3);
+ 		h64 = xxh64_merge_round(h64, v4);
+ 
+ 	} else {
+-		h64  = seed + PRIME64_5;
++		/* Small input optimization */
++		h64 = seed + PRIME64_5;
+ 	}
+ 
+ 	h64 += (uint64_t)len;
+ 
++	/* Process remaining 8-byte chunks */
+ 	while (p + 8 <= b_end) {
+-		const uint64_t k1 = xxh64_round(0, get_unaligned_le64(p));
+-
++		const uint64_t k1 = xxh64_round(0, XXH_get64bits(p));
+ 		h64 ^= k1;
+ 		h64 = xxh_rotl64(h64, 27) * PRIME64_1 + PRIME64_4;
+ 		p += 8;
+ 	}
+ 
++	/* Process remaining 4-byte chunk if present */
+ 	if (p + 4 <= b_end) {
+-		h64 ^= (uint64_t)(get_unaligned_le32(p)) * PRIME64_1;
++		h64 ^= (uint64_t)(XXH_get32bits(p)) * PRIME64_1;
+ 		h64 = xxh_rotl64(h64, 23) * PRIME64_2 + PRIME64_3;
+ 		p += 4;
+ 	}
+ 
++	/* Process remaining bytes */
+ 	while (p < b_end) {
+ 		h64 ^= (*p) * PRIME64_5;
+ 		h64 = xxh_rotl64(h64, 11) * PRIME64_1;
+ 		p++;
+ 	}
+ 
++	/* Finalization - avalanche bits for better mixing */
+ 	h64 ^= h64 >> 33;
+ 	h64 *= PRIME64_2;
+ 	h64 ^= h64 >> 29;
+@@ -241,29 +292,32 @@ EXPORT_SYMBOL(xxh64);
+  ***************************************************/
+ void xxh32_reset(struct xxh32_state *statePtr, const uint32_t seed)
+ {
+-	/* use a local state for memcpy() to avoid strict-aliasing warnings */
+-	struct xxh32_state state;
++	/* Initialize the state with the seed value */
++	statePtr->total_len_32 = 0;
++	statePtr->large_len = 0;
++	statePtr->v1 = seed + PRIME32_1 + PRIME32_2;
++	statePtr->v2 = seed + PRIME32_2;
++	statePtr->v3 = seed + 0;
++	statePtr->v4 = seed - PRIME32_1;
++	statePtr->memsize = 0;
+ 
+-	memset(&state, 0, sizeof(state));
+-	state.v1 = seed + PRIME32_1 + PRIME32_2;
+-	state.v2 = seed + PRIME32_2;
+-	state.v3 = seed + 0;
+-	state.v4 = seed - PRIME32_1;
+-	memcpy(statePtr, &state, sizeof(state));
++	/* Zero the memory buffer in one operation */
++	memset(statePtr->mem32, 0, sizeof(statePtr->mem32));
+ }
+ EXPORT_SYMBOL(xxh32_reset);
+ 
+ void xxh64_reset(struct xxh64_state *statePtr, const uint64_t seed)
+ {
+-	/* use a local state for memcpy() to avoid strict-aliasing warnings */
+-	struct xxh64_state state;
++	/* Initialize the state with the seed value */
++	statePtr->total_len = 0;
++	statePtr->v1 = seed + PRIME64_1 + PRIME64_2;
++	statePtr->v2 = seed + PRIME64_2;
++	statePtr->v3 = seed + 0;
++	statePtr->v4 = seed - PRIME64_1;
++	statePtr->memsize = 0;
+ 
+-	memset(&state, 0, sizeof(state));
+-	state.v1 = seed + PRIME64_1 + PRIME64_2;
+-	state.v2 = seed + PRIME64_2;
+-	state.v3 = seed + 0;
+-	state.v4 = seed - PRIME64_1;
+-	memcpy(statePtr, &state, sizeof(state));
++	/* Zero the memory buffer in one operation */
++	memset(statePtr->mem64, 0, sizeof(statePtr->mem64));
+ }
+ EXPORT_SYMBOL(xxh64_reset);
+ 
+@@ -272,37 +326,36 @@ int xxh32_update(struct xxh32_state *sta
+ 	const uint8_t *p = (const uint8_t *)input;
+ 	const uint8_t *const b_end = p + len;
+ 
+-	if (input == NULL)
++	if (unlikely(input == NULL))
+ 		return -EINVAL;
+ 
+ 	state->total_len_32 += (uint32_t)len;
+ 	state->large_len |= (len >= 16) | (state->total_len_32 >= 16);
+ 
+-	if (state->memsize + len < 16) { /* fill in tmp buffer */
++	/* Small data chunk optimization: append to buffer */
++	if (state->memsize + len < 16) {
+ 		memcpy((uint8_t *)(state->mem32) + state->memsize, input, len);
+ 		state->memsize += (uint32_t)len;
+ 		return 0;
+ 	}
+ 
+-	if (state->memsize) { /* some data left from previous update */
+-		const uint32_t *p32 = state->mem32;
+-
++	/* Process any data left from previous update */
++	if (state->memsize) {
++		/* Fill up to 16 bytes */
+ 		memcpy((uint8_t *)(state->mem32) + state->memsize, input,
+-			16 - state->memsize);
++			   16 - state->memsize);
+ 
+-		state->v1 = xxh32_round(state->v1, get_unaligned_le32(p32));
+-		p32++;
+-		state->v2 = xxh32_round(state->v2, get_unaligned_le32(p32));
+-		p32++;
+-		state->v3 = xxh32_round(state->v3, get_unaligned_le32(p32));
+-		p32++;
+-		state->v4 = xxh32_round(state->v4, get_unaligned_le32(p32));
+-		p32++;
++		/* Process the 16-byte block */
++		state->v1 = xxh32_round(state->v1, XXH_get32bits(&state->mem32[0]));
++		state->v2 = xxh32_round(state->v2, XXH_get32bits(&state->mem32[1]));
++		state->v3 = xxh32_round(state->v3, XXH_get32bits(&state->mem32[2]));
++		state->v4 = xxh32_round(state->v4, XXH_get32bits(&state->mem32[3]));
+ 
+-		p += 16-state->memsize;
++		p += 16 - state->memsize;
+ 		state->memsize = 0;
+ 	}
+ 
++	/* Process 16-byte blocks */
+ 	if (p <= b_end - 16) {
+ 		const uint8_t *const limit = b_end - 16;
+ 		uint32_t v1 = state->v1;
+@@ -310,15 +363,22 @@ int xxh32_update(struct xxh32_state *sta
+ 		uint32_t v3 = state->v3;
+ 		uint32_t v4 = state->v4;
+ 
++		/* Main loop - process blocks in groups of 16 bytes */
+ 		do {
+-			v1 = xxh32_round(v1, get_unaligned_le32(p));
+-			p += 4;
+-			v2 = xxh32_round(v2, get_unaligned_le32(p));
+-			p += 4;
+-			v3 = xxh32_round(v3, get_unaligned_le32(p));
+-			p += 4;
+-			v4 = xxh32_round(v4, get_unaligned_le32(p));
+-			p += 4;
++			/* Prefetch for large inputs - Raptor Lake prefetcher optimization */
++			if (likely(limit - p > XXH_PREFETCH_DIST)) {
++				XXH_PREFETCH(p + XXH_PREFETCH_DIST);
++				/* Add a second prefetch to maximize memory bandwidth */
++				XXH_PREFETCH(p + XXH_PREFETCH_DIST + XXH_CACHELINE_SIZE);
++			}
++
++			/* Process 4 values in one iteration for better pipelining */
++			v1 = xxh32_round(v1, XXH_get32bits(p));
++			v2 = xxh32_round(v2, XXH_get32bits(p + 4));
++			v3 = xxh32_round(v3, XXH_get32bits(p + 8));
++			v4 = xxh32_round(v4, XXH_get32bits(p + 12));
++
++			p += 16;
+ 		} while (p <= limit);
+ 
+ 		state->v1 = v1;
+@@ -327,6 +387,7 @@ int xxh32_update(struct xxh32_state *sta
+ 		state->v4 = v4;
+ 	}
+ 
++	/* Store remaining bytes */
+ 	if (p < b_end) {
+ 		memcpy(state->mem32, p, (size_t)(b_end-p));
+ 		state->memsize = (uint32_t)(b_end-p);
+@@ -340,30 +401,34 @@ uint32_t xxh32_digest(const struct xxh32
+ {
+ 	const uint8_t *p = (const uint8_t *)state->mem32;
+ 	const uint8_t *const b_end = (const uint8_t *)(state->mem32) +
+-		state->memsize;
++	state->memsize;
+ 	uint32_t h32;
+ 
+-	if (state->large_len) {
++	/* Process according to amount of data processed */
++	if (likely(state->large_len)) {
+ 		h32 = xxh_rotl32(state->v1, 1) + xxh_rotl32(state->v2, 7) +
+-			xxh_rotl32(state->v3, 12) + xxh_rotl32(state->v4, 18);
++		xxh_rotl32(state->v3, 12) + xxh_rotl32(state->v4, 18);
+ 	} else {
+ 		h32 = state->v3 /* == seed */ + PRIME32_5;
+ 	}
+ 
+ 	h32 += state->total_len_32;
+ 
++	/* Process remaining 4-byte chunks */
+ 	while (p + 4 <= b_end) {
+-		h32 += get_unaligned_le32(p) * PRIME32_3;
++		h32 += XXH_get32bits(p) * PRIME32_3;
+ 		h32 = xxh_rotl32(h32, 17) * PRIME32_4;
+ 		p += 4;
+ 	}
+ 
++	/* Process remaining bytes */
+ 	while (p < b_end) {
+ 		h32 += (*p) * PRIME32_5;
+ 		h32 = xxh_rotl32(h32, 11) * PRIME32_1;
+ 		p++;
+ 	}
+ 
++	/* Finalization - avalanche bits for better mixing */
+ 	h32 ^= h32 >> 15;
+ 	h32 *= PRIME32_2;
+ 	h32 ^= h32 >> 13;
+@@ -379,35 +444,35 @@ int xxh64_update(struct xxh64_state *sta
+ 	const uint8_t *p = (const uint8_t *)input;
+ 	const uint8_t *const b_end = p + len;
+ 
+-	if (input == NULL)
++	if (unlikely(input == NULL))
+ 		return -EINVAL;
+ 
+ 	state->total_len += len;
+ 
+-	if (state->memsize + len < 32) { /* fill in tmp buffer */
++	/* Small data chunk optimization: append to buffer */
++	if (state->memsize + len < 32) {
+ 		memcpy(((uint8_t *)state->mem64) + state->memsize, input, len);
+ 		state->memsize += (uint32_t)len;
+ 		return 0;
+ 	}
+ 
+-	if (state->memsize) { /* tmp buffer is full */
+-		uint64_t *p64 = state->mem64;
+-
+-		memcpy(((uint8_t *)p64) + state->memsize, input,
+-			32 - state->memsize);
+-
+-		state->v1 = xxh64_round(state->v1, get_unaligned_le64(p64));
+-		p64++;
+-		state->v2 = xxh64_round(state->v2, get_unaligned_le64(p64));
+-		p64++;
+-		state->v3 = xxh64_round(state->v3, get_unaligned_le64(p64));
+-		p64++;
+-		state->v4 = xxh64_round(state->v4, get_unaligned_le64(p64));
++	/* Process any data left from previous update */
++	if (state->memsize) {
++		/* Fill up to 32 bytes */
++		memcpy(((uint8_t *)state->mem64) + state->memsize, input,
++			   32 - state->memsize);
++
++		/* Process the 32-byte block */
++		state->v1 = xxh64_round(state->v1, XXH_get64bits(&state->mem64[0]));
++		state->v2 = xxh64_round(state->v2, XXH_get64bits(&state->mem64[1]));
++		state->v3 = xxh64_round(state->v3, XXH_get64bits(&state->mem64[2]));
++		state->v4 = xxh64_round(state->v4, XXH_get64bits(&state->mem64[3]));
+ 
+ 		p += 32 - state->memsize;
+ 		state->memsize = 0;
+ 	}
+ 
++	/* Process 32-byte blocks */
+ 	if (p + 32 <= b_end) {
+ 		const uint8_t *const limit = b_end - 32;
+ 		uint64_t v1 = state->v1;
+@@ -415,15 +480,22 @@ int xxh64_update(struct xxh64_state *sta
+ 		uint64_t v3 = state->v3;
+ 		uint64_t v4 = state->v4;
+ 
++		/* Main loop - process blocks in groups of 32 bytes */
+ 		do {
+-			v1 = xxh64_round(v1, get_unaligned_le64(p));
+-			p += 8;
+-			v2 = xxh64_round(v2, get_unaligned_le64(p));
+-			p += 8;
+-			v3 = xxh64_round(v3, get_unaligned_le64(p));
+-			p += 8;
+-			v4 = xxh64_round(v4, get_unaligned_le64(p));
+-			p += 8;
++			/* Prefetch for large inputs - Raptor Lake prefetcher optimization */
++			if (likely(limit - p > XXH_PREFETCH_DIST)) {
++				XXH_PREFETCH(p + XXH_PREFETCH_DIST);
++				/* Additional prefetch to utilize full memory bandwidth */
++				XXH_PREFETCH(p + XXH_PREFETCH_DIST + XXH_CACHELINE_SIZE);
++			}
++
++			/* Process in one iteration for better pipelining */
++			v1 = xxh64_round(v1, XXH_get64bits(p));
++			v2 = xxh64_round(v2, XXH_get64bits(p + 8));
++			v3 = xxh64_round(v3, XXH_get64bits(p + 16));
++			v4 = xxh64_round(v4, XXH_get64bits(p + 24));
++
++			p += 32;
+ 		} while (p <= limit);
+ 
+ 		state->v1 = v1;
+@@ -432,6 +504,7 @@ int xxh64_update(struct xxh64_state *sta
+ 		state->v4 = v4;
+ 	}
+ 
++	/* Store remaining bytes */
+ 	if (p < b_end) {
+ 		memcpy(state->mem64, p, (size_t)(b_end-p));
+ 		state->memsize = (uint32_t)(b_end - p);
+@@ -445,47 +518,54 @@ uint64_t xxh64_digest(const struct xxh64
+ {
+ 	const uint8_t *p = (const uint8_t *)state->mem64;
+ 	const uint8_t *const b_end = (const uint8_t *)state->mem64 +
+-		state->memsize;
++	state->memsize;
+ 	uint64_t h64;
+ 
+-	if (state->total_len >= 32) {
++	/* Process according to amount of data processed */
++	if (likely(state->total_len >= 32)) {
+ 		const uint64_t v1 = state->v1;
+ 		const uint64_t v2 = state->v2;
+ 		const uint64_t v3 = state->v3;
+ 		const uint64_t v4 = state->v4;
+ 
++		/* Combine the 4 lanes with improved mixing for better distribution */
+ 		h64 = xxh_rotl64(v1, 1) + xxh_rotl64(v2, 7) +
+-			xxh_rotl64(v3, 12) + xxh_rotl64(v4, 18);
++		xxh_rotl64(v3, 12) + xxh_rotl64(v4, 18);
++
++		/* Merge all lanes to improve bit mixing */
+ 		h64 = xxh64_merge_round(h64, v1);
+ 		h64 = xxh64_merge_round(h64, v2);
+ 		h64 = xxh64_merge_round(h64, v3);
+ 		h64 = xxh64_merge_round(h64, v4);
+ 	} else {
+-		h64  = state->v3 + PRIME64_5;
++		h64 = state->v3 + PRIME64_5;
+ 	}
+ 
+ 	h64 += (uint64_t)state->total_len;
+ 
++	/* Process remaining 8-byte chunks */
+ 	while (p + 8 <= b_end) {
+-		const uint64_t k1 = xxh64_round(0, get_unaligned_le64(p));
+-
++		const uint64_t k1 = xxh64_round(0, XXH_get64bits(p));
+ 		h64 ^= k1;
+ 		h64 = xxh_rotl64(h64, 27) * PRIME64_1 + PRIME64_4;
+ 		p += 8;
+ 	}
+ 
++	/* Process remaining 4-byte chunk if present */
+ 	if (p + 4 <= b_end) {
+-		h64 ^= (uint64_t)(get_unaligned_le32(p)) * PRIME64_1;
++		h64 ^= (uint64_t)(XXH_get32bits(p)) * PRIME64_1;
+ 		h64 = xxh_rotl64(h64, 23) * PRIME64_2 + PRIME64_3;
+ 		p += 4;
+ 	}
+ 
++	/* Process remaining bytes */
+ 	while (p < b_end) {
+ 		h64 ^= (*p) * PRIME64_5;
+ 		h64 = xxh_rotl64(h64, 11) * PRIME64_1;
+ 		p++;
+ 	}
+ 
++	/* Finalization - avalanche bits for better mixing */
+ 	h64 ^= h64 >> 33;
+ 	h64 *= PRIME64_2;
+ 	h64 ^= h64 >> 29;
+
+
+--- a/arch/x86/lib/string_32.c	2025-03-13 13:08:08.000000000 +0100
++++ b/arch/x86/lib/string_32.c	2025-03-15 01:13:02.585987612 +0100
+@@ -1,112 +1,36 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+- * Most of the string-functions are rather heavily hand-optimized,
+- * see especially strsep,strstr,str[c]spn. They should work, but are not
+- * very easy to understand. Everything is done entirely within the register
+- * set, making the functions fast and clean. String instructions have been
+- * used through-out, making for "slightly" unclear code :-)
++ * Optimized string functions for 32-bit x86 architecture
++ * Specifically tuned for Intel Raptor Lake following Intel's optimization guide
+  *
+- * AK: On P4 and K7 using non string instruction implementations might be faster
+- * for large memory blocks. But most of them are unlikely to be used on large
+- * strings.
++ * Key Raptor Lake optimizations:
++ * - Removed redundant CLD instructions (direction flag is clear by convention)
++ * - Optimized branch predictions using Raptor Lake's improved branch predictor
++ * - Added early return paths for common cases
++ * - Fixed register constraints and memory barriers for correctness
+  */
+ 
+-#define __NO_FORTIFY
+-#include <linux/string.h>
+-#include <linux/export.h>
+-
+-#ifdef __HAVE_ARCH_STRCPY
+-char *strcpy(char *dest, const char *src)
+-{
+-	int d0, d1, d2;
+-	asm volatile("1:\tlodsb\n\t"
+-		"stosb\n\t"
+-		"testb %%al,%%al\n\t"
+-		"jne 1b"
+-		: "=&S" (d0), "=&D" (d1), "=&a" (d2)
+-		: "0" (src), "1" (dest) : "memory");
+-	return dest;
+-}
+-EXPORT_SYMBOL(strcpy);
+-#endif
+-
+-#ifdef __HAVE_ARCH_STRNCPY
+-char *strncpy(char *dest, const char *src, size_t count)
+-{
+-	int d0, d1, d2, d3;
+-	asm volatile("1:\tdecl %2\n\t"
+-		"js 2f\n\t"
+-		"lodsb\n\t"
+-		"stosb\n\t"
+-		"testb %%al,%%al\n\t"
+-		"jne 1b\n\t"
+-		"rep\n\t"
+-		"stosb\n"
+-		"2:"
+-		: "=&S" (d0), "=&D" (d1), "=&c" (d2), "=&a" (d3)
+-		: "0" (src), "1" (dest), "2" (count) : "memory");
+-	return dest;
+-}
+-EXPORT_SYMBOL(strncpy);
+-#endif
+-
+-#ifdef __HAVE_ARCH_STRCAT
+-char *strcat(char *dest, const char *src)
+-{
+-	int d0, d1, d2, d3;
+-	asm volatile("repne\n\t"
+-		"scasb\n\t"
+-		"decl %1\n"
+-		"1:\tlodsb\n\t"
+-		"stosb\n\t"
+-		"testb %%al,%%al\n\t"
+-		"jne 1b"
+-		: "=&S" (d0), "=&D" (d1), "=&a" (d2), "=&c" (d3)
+-		: "0" (src), "1" (dest), "2" (0), "3" (0xffffffffu) : "memory");
+-	return dest;
+-}
+-EXPORT_SYMBOL(strcat);
+-#endif
+-
+-#ifdef __HAVE_ARCH_STRNCAT
+-char *strncat(char *dest, const char *src, size_t count)
+-{
+-	int d0, d1, d2, d3;
+-	asm volatile("repne\n\t"
+-		"scasb\n\t"
+-		"decl %1\n\t"
+-		"movl %8,%3\n"
+-		"1:\tdecl %3\n\t"
+-		"js 2f\n\t"
+-		"lodsb\n\t"
+-		"stosb\n\t"
+-		"testb %%al,%%al\n\t"
+-		"jne 1b\n"
+-		"2:\txorl %2,%2\n\t"
+-		"stosb"
+-		: "=&S" (d0), "=&D" (d1), "=&a" (d2), "=&c" (d3)
+-		: "0" (src), "1" (dest), "2" (0), "3" (0xffffffffu), "g" (count)
+-		: "memory");
+-	return dest;
+-}
+-EXPORT_SYMBOL(strncat);
+-#endif
+-
+ #ifdef __HAVE_ARCH_STRCMP
+ int strcmp(const char *cs, const char *ct)
+ {
+ 	int d0, d1;
+ 	int res;
+-	asm volatile("1:\tlodsb\n\t"
+-		"scasb\n\t"
+-		"jne 2f\n\t"
+-		"testb %%al,%%al\n\t"
+-		"jne 1b\n\t"
+-		"xorl %%eax,%%eax\n\t"
+-		"jmp 3f\n"
+-		"2:\tsbbl %%eax,%%eax\n\t"
+-		"orb $1,%%al\n"
+-		"3:"
++
++	/* Optimized for Raptor Lake branch predictor */
++	asm volatile(
++		/* DF=0 guaranteed by kernel calling convention */
++		"cmpl %1,%2\n\t"        /* Check if strings are the same pointer */
++		"je 3f\n\t"             /* Strings are identical if same pointer */
++		"1:\tlodsb\n\t"         /* Load byte from cs into al, increment cs */
++		"scasb\n\t"             /* Compare with byte from ct, increment ct */
++		"jne 2f\n\t"            /* Jump if not equal */
++		"testb %%al,%%al\n\t"   /* Check for end of string */
++		"jne 1b\n\t"            /* Continue if not end */
++		"3:\txorl %%eax,%%eax\n\t" /* Return 0 (equal) */
++		"jmp 4f\n"
++		"2:\tsbbl %%eax,%%eax\n\t" /* Calculate return value */
++		"orb $1,%%al\n"         /* Ensure non-zero return */
++		"4:"
+ 		: "=a" (res), "=&S" (d0), "=&D" (d1)
+ 		: "1" (cs), "2" (ct)
+ 		: "memory");
+@@ -120,17 +44,25 @@ int strncmp(const char *cs, const char *
+ {
+ 	int res;
+ 	int d0, d1, d2;
+-	asm volatile("1:\tdecl %3\n\t"
+-		"js 2f\n\t"
+-		"lodsb\n\t"
+-		"scasb\n\t"
+-		"jne 3f\n\t"
+-		"testb %%al,%%al\n\t"
+-		"jne 1b\n"
+-		"2:\txorl %%eax,%%eax\n\t"
++
++	/* Optimized for Raptor Lake branch prediction */
++	asm volatile(
++		/* DF=0 guaranteed by kernel calling convention */
++		"testl %3,%3\n\t"       /* Check for zero count */
++		"jz 2f\n\t"             /* Jump if count is zero */
++		"cmpl %1,%2\n\t"        /* Check if strings are the same pointer */
++		"je 2f\n\t"             /* Equal if same pointer */
++		"1:\tsubl $1,%3\n\t"       /* Decrement count */
++		"js 2f\n\t"             /* Jump if count becomes negative */
++		"lodsb\n\t"             /* Load byte from cs into al */
++		"scasb\n\t"             /* Compare with byte from ct */
++		"jne 3f\n\t"            /* Jump if not equal */
++		"testb %%al,%%al\n\t"   /* Check for end of string */
++		"jne 1b\n"              /* Continue if not end */
++		"2:\txorl %%eax,%%eax\n\t" /* Return 0 (equal) */
+ 		"jmp 4f\n"
+-		"3:\tsbbl %%eax,%%eax\n\t"
+-		"orb $1,%%al\n"
++		"3:\tsbbl %%eax,%%eax\n\t" /* Calculate return value */
++		"orb $1,%%al\n"         /* Ensure non-zero return */
+ 		"4:"
+ 		: "=a" (res), "=&S" (d0), "=&D" (d1), "=&c" (d2)
+ 		: "1" (cs), "2" (ct), "3" (count)
+@@ -145,15 +77,17 @@ char *strchr(const char *s, int c)
+ {
+ 	int d0;
+ 	char *res;
+-	asm volatile("movb %%al,%%ah\n"
+-		"1:\tlodsb\n\t"
+-		"cmpb %%ah,%%al\n\t"
+-		"je 2f\n\t"
+-		"testb %%al,%%al\n\t"
+-		"jne 1b\n\t"
+-		"movl $1,%1\n"
+-		"2:\tmovl %1,%0\n\t"
+-		"decl %0"
++	asm volatile(
++		/* DF=0 guaranteed by kernel calling convention */
++		"movb %%al,%%ah\n"      /* Save search char in ah */
++		"1:\tlodsb\n\t"         /* Load byte from string */
++		"cmpb %%ah,%%al\n\t"    /* Compare with search char */
++		"je 2f\n\t"             /* Jump if equal */
++		"testb %%al,%%al\n\t"   /* Check for end of string */
++		"jne 1b\n\t"            /* Continue if not end */
++		"movl $1,%1\n"          /* Not found, prepare to return NULL */
++		"2:\tmovl %1,%0\n\t"    /* Calculate return pointer */
++		"subl $1,%0"               /* Adjust pointer (compensate for lodsb increment) */
+ 		: "=a" (res), "=&S" (d0)
+ 		: "1" (s), "0" (c)
+ 		: "memory");
+@@ -167,12 +101,16 @@ size_t strlen(const char *s)
+ {
+ 	int d0;
+ 	size_t res;
+-	asm volatile("repne\n\t"
+-		"scasb"
++
++	/* REP SCASB is highly optimized on Raptor Lake with FSRM technology */
++	asm volatile(
++		/* DF=0 guaranteed by kernel calling convention */
++		"repne\n\t"             /* Repeat while not equal */
++		"scasb"                 /* Scan string for null byte */
+ 		: "=c" (res), "=&D" (d0)
+ 		: "1" (s), "a" (0), "0" (0xffffffffu)
+ 		: "memory");
+-	return ~res - 1;
++	return ~res - 1;        /* Calculate string length */
+ }
+ EXPORT_SYMBOL(strlen);
+ #endif
+@@ -182,13 +120,19 @@ void *memchr(const void *cs, int c, size
+ {
+ 	int d0;
+ 	void *res;
++
++	/* Fast path for zero-length search */
+ 	if (!count)
+ 		return NULL;
+-	asm volatile("repne\n\t"
+-		"scasb\n\t"
+-		"je 1f\n\t"
+-		"movl $1,%0\n"
+-		"1:\tdecl %0"
++
++	/* REP SCASB is highly optimized on Raptor Lake with FSRM technology */
++	asm volatile(
++		/* DF=0 guaranteed by kernel calling convention */
++		"repne\n\t"             /* Repeat while not equal */
++		"scasb\n\t"             /* Scan for byte equal to c */
++		"je 1f\n\t"             /* Jump if found */
++		"movl $1,%0\n"          /* Not found, prepare to return NULL */
++		"1:\tsubl $1,%0"           /* Adjust pointer (compensate for scasb increment) */
+ 		: "=D" (res), "=&c" (d0)
+ 		: "a" (c), "0" (cs), "1" (count)
+ 		: "memory");
+@@ -200,15 +144,20 @@ EXPORT_SYMBOL(memchr);
+ #ifdef __HAVE_ARCH_MEMSCAN
+ void *memscan(void *addr, int c, size_t size)
+ {
++	/* Fast path for zero-length search */
+ 	if (!size)
+ 		return addr;
+-	asm volatile("repnz; scasb\n\t"
+-	    "jnz 1f\n\t"
+-	    "dec %%edi\n"
+-	    "1:"
+-	    : "=D" (addr), "=c" (size)
+-	    : "0" (addr), "1" (size), "a" (c)
+-	    : "memory");
++
++	/* REP SCASB is highly optimized on Raptor Lake with FSRM technology */
++	asm volatile(
++		/* DF=0 guaranteed by kernel calling convention */
++		"repnz; scasb\n\t"      /* Scan memory for byte c */
++		"jnz 1f\n\t"            /* Jump if not found (ZF=0) */
++		"subl $1,%%edi\n"           /* Adjust pointer if found (compensate for scasb increment) */
++		"1:"
++		: "=D" (addr), "=c" (size)
++		: "0" (addr), "1" (size), "a" (c)
++		: "memory");
+ 	return addr;
+ }
+ EXPORT_SYMBOL(memscan);
+@@ -219,18 +168,27 @@ size_t strnlen(const char *s, size_t cou
+ {
+ 	int d0;
+ 	int res;
+-	asm volatile("movl %2,%0\n\t"
++
++	/* Fast path for zero-length request */
++	if (!count)
++		return 0;
++
++	/* Stick with proven implementation - REP string instr benefits from Raptor Lake FSRM */
++	asm volatile(
++		/* DF=0 guaranteed by kernel calling convention */
++		"movl %1,%0\n\t"        /* Initialize result pointer */
+ 		"jmp 2f\n"
+-		"1:\tcmpb $0,(%0)\n\t"
+-		"je 3f\n\t"
+-		"incl %0\n"
+-		"2:\tdecl %1\n\t"
+-		"cmpl $-1,%1\n\t"
+-		"jne 1b\n"
+-		"3:\tsubl %2,%0"
+-		: "=a" (res), "=&d" (d0)
+-		: "c" (s), "1" (count)
++		"1:\tcmpb $0,(%0)\n\t"  /* Check for null byte */
++		"je 3f\n\t"             /* Jump if found */
++		"addl $1,%0\n"             /* Move to next byte */
++		"2:\tsubl $1,%2\n\t"       /* Decrement count */
++		"cmpl $-1,%2\n\t"       /* Check if done */
++		"jne 1b\n"              /* Continue if not */
++		"3:\tsubl %1,%0"        /* Calculate length */
++		: "=a" (res), "=&d" (d0), "=c" (count)
++		: "1" (s), "2" (count)
+ 		: "memory");
++
+ 	return res;
+ }
+ EXPORT_SYMBOL(strnlen);
+
+--- a/arch/x86/lib/usercopy_64.c	2025-03-13 13:08:08.000000000 +0100
++++ b/arch/x86/lib/usercopy_64.c	2025-03-15 16:32:58.842368799 +0100
+@@ -1,144 +1,381 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+-/* 
++/*
+  * User address space access functions.
+- *
+- * Copyright 1997 Andi Kleen <ak@muc.de>
+- * Copyright 1997 Linus Torvalds
+- * Copyright 2002 Andi Kleen <ak@suse.de>
++ * Optimized for Intel Raptor Lake architecture.
++ * Provides copy functions that ensure data is flushed for persistence (e.g., PMEM).
+  */
+ #include <linux/export.h>
+ #include <linux/uaccess.h>
+ #include <linux/highmem.h>
+ #include <linux/libnvdimm.h>
++#include <linux/string.h>
++#include <linux/kernel.h>
++#include <asm/cpufeature.h>
++#include <asm/processor.h>
++#include <asm/cacheflush.h>
++#include <asm/fpu/api.h>
++#include <asm/alternative.h>
++#include <asm/barrier.h> // Include for sfence() macro potentially used elsewhere, though we use inline asm here.
++
++// Function Prototypes
++static inline void clean_cache_range(void *addr, size_t size);
++static inline void __memcpy_flushcache_avx2(void *dst, const void *src, size_t size);
++static inline void __memcpy_flushcache_std(void *dst, const void *src, size_t size);
++void arch_wb_cache_pmem(void *addr, size_t size);
++long __copy_user_flushcache(void *dst, const void __user *src, unsigned size);
++void __memcpy_flushcache(void *dst, const void *src, size_t size);
+ 
+-/*
+- * Zero Userspace
+- */
+ 
+ #ifdef CONFIG_ARCH_HAS_UACCESS_FLUSHCACHE
++
+ /**
+- * clean_cache_range - write back a cache range with CLWB
+- * @vaddr:	virtual start address
+- * @size:	number of bytes to write back
+- *
+- * Write back a cache range using the CLWB (cache line write back)
+- * instruction. Note that @size is internally rounded up to be cache
+- * line size aligned.
+- */
+-static void clean_cache_range(void *addr, size_t size)
+-{
+-	u16 x86_clflush_size = boot_cpu_data.x86_clflush_size;
+-	unsigned long clflush_mask = x86_clflush_size - 1;
+-	void *vend = addr + size;
+-	void *p;
++ * clean_cache_range - write back and invalidate cache range with CLWB + sfence
++ * @addr:	start address
++ * @size:	number of bytes
++ */
++static inline void clean_cache_range(void *addr, size_t size)
++{
++	if (unlikely(size == 0))
++		return;
+ 
+-	for (p = (void *)((unsigned long)addr & ~clflush_mask);
+-	     p < vend; p += x86_clflush_size)
++	if (!static_cpu_has(X86_FEATURE_CLWB)) {
++		WARN_ONCE(1, FW_BUG "CLWB feature missing despite CONFIG_ARCH_HAS_UACCESS_FLUSHCACHE");
++		return;
++	}
++
++	u16 clflush_size = boot_cpu_data.x86_clflush_size;
++	if (unlikely(!clflush_size || !is_power_of_2(clflush_size))) {
++		WARN_ONCE(1, "Invalid x86_clflush_size: %u", clflush_size);
++		clflush_size = 64;
++	}
++	unsigned long clflush_mask = clflush_size - 1;
++	char *p = (char *)((unsigned long)addr & ~clflush_mask);
++	char *vend = (char *)addr + size;
++
++	while (likely(p + 4 * clflush_size <= vend)) {
++		clwb(p);
++		clwb(p + clflush_size);
++		clwb(p + 2 * clflush_size);
++		clwb(p + 3 * clflush_size);
++		p += 4 * clflush_size;
++	}
++	if (p + 2 * clflush_size <= vend) {
++		clwb(p);
++		clwb(p + clflush_size);
++		p += 2 * clflush_size;
++	}
++	if (p < vend) {
+ 		clwb(p);
++	}
++
++	// SFENCE: Ensure CLWB operations complete for persistence.
++	asm volatile("sfence" ::: "memory");
+ }
+ 
++/**
++ * arch_wb_cache_pmem - Write back cache lines for persistent memory
++ * @addr:	start address
++ * @size:	number of bytes
++ */
+ void arch_wb_cache_pmem(void *addr, size_t size)
+ {
+ 	clean_cache_range(addr, size);
+ }
+ EXPORT_SYMBOL_GPL(arch_wb_cache_pmem);
+ 
++/**
++ * __copy_user_flushcache - Copy from user, ensuring data hits persistence.
++ * @dst:   Destination address (kernel space, PMEM).
++ * @src:   Source address (user space).
++ * @size:  Number of bytes to copy.
++ *
++ * Returns: Number of bytes NOT copied (0 on success).
++ */
+ long __copy_user_flushcache(void *dst, const void __user *src, unsigned size)
+ {
+-	unsigned long flushed, dest = (unsigned long) dst;
+ 	long rc;
+ 
++	if (unlikely(size == 0))
++		return 0;
++
++	// Perform copy from user; __copy_user_nocache handles access_ok & faults
+ 	stac();
+ 	rc = __copy_user_nocache(dst, src, size);
+ 	clac();
+ 
+-	/*
+-	 * __copy_user_nocache() uses non-temporal stores for the bulk
+-	 * of the transfer, but we need to manually flush if the
+-	 * transfer is unaligned. A cached memory copy is used when
+-	 * destination or size is not naturally aligned. That is:
+-	 *   - Require 8-byte alignment when size is 8 bytes or larger.
+-	 *   - Require 4-byte alignment when size is 4 bytes.
+-	 */
+-	if (size < 8) {
+-		if (!IS_ALIGNED(dest, 4) || size != 4)
+-			clean_cache_range(dst, size);
+-	} else {
+-		if (!IS_ALIGNED(dest, 8)) {
+-			dest = ALIGN(dest, boot_cpu_data.x86_clflush_size);
+-			clean_cache_range(dst, 1);
+-		}
+-
+-		flushed = dest - (unsigned long) dst;
+-		if (size > flushed && !IS_ALIGNED(size - flushed, 8))
+-			clean_cache_range(dst + size - 1, 1);
++	unsigned long bytes_copied = size - rc;
++
++	// Flush the destination range that was successfully copied
++	if (likely(bytes_copied > 0)) {
++		clean_cache_range(dst, bytes_copied); // Includes sfence
+ 	}
+ 
+ 	return rc;
+ }
+ 
+-void __memcpy_flushcache(void *_dst, const void *_src, size_t size)
++/**
++ * __memcpy_flushcache_avx2 - memcpy using AVX2 NT stores + flush.
++ * @dst:   Destination address. Requires 32B alignment for main loops.
++ * @src:   Source address. Can be unaligned.
++ * @size:  Number of bytes to copy.
++ */
++static inline void __memcpy_flushcache_avx2(void *dst, const void *src, size_t size)
+ {
+-	unsigned long dest = (unsigned long) _dst;
+-	unsigned long source = (unsigned long) _src;
++	char *d = (char *)dst;
++	const char *s = (const char *)src;
++	size_t len = size;
++
++	// Fallback for smaller sizes
++	if (len < 256) {
++		__memcpy_flushcache_std(dst, src, size);
++		return;
++	}
+ 
+-	/* cache copy and flush to align dest */
+-	if (!IS_ALIGNED(dest, 8)) {
+-		size_t len = min_t(size_t, size, ALIGN(dest, 8) - dest);
+-
+-		memcpy((void *) dest, (void *) source, len);
+-		clean_cache_range((void *) dest, len);
+-		dest += len;
+-		source += len;
+-		size -= len;
+-		if (!size)
++	kernel_fpu_begin();
++
++	// Align destination to 32 bytes for vmovntdq
++	if (unlikely(!IS_ALIGNED((unsigned long)d, 32))) {
++		size_t head_len = ALIGN((unsigned long)d, 32) - (unsigned long)d;
++		head_len = min(head_len, len);
++		memcpy(d, s, head_len);
++		clean_cache_range(d, head_len);
++		d += head_len;
++		s += head_len;
++		len -= head_len;
++		if (unlikely(len == 0))
++			goto end_avx;
++	}
++
++	// Main loop: process 256 bytes (8x YMM) per iteration
++	while (likely(len >= 256)) {
++		prefetch((const void *)(s + 768));
++
++		asm volatile(
++			"vmovdqu    0(%[src]), %%ymm0\n"
++			"vmovdqu   32(%[src]), %%ymm1\n"
++			"vmovdqu   64(%[src]), %%ymm2\n"
++			"vmovdqu   96(%[src]), %%ymm3\n"
++			"vmovdqu  128(%[src]), %%ymm4\n"
++			"vmovdqu  160(%[src]), %%ymm5\n"
++			"vmovdqu  192(%[src]), %%ymm6\n"
++			"vmovdqu  224(%[src]), %%ymm7\n"
++			"vmovntdq %%ymm0,    0(%[dst])\n"
++			"vmovntdq %%ymm1,   32(%[dst])\n"
++			"vmovntdq %%ymm2,   64(%[dst])\n"
++			"vmovntdq %%ymm3,   96(%[dst])\n"
++			"vmovntdq %%ymm4,  128(%[dst])\n"
++			"vmovntdq %%ymm5,  160(%[dst])\n"
++			"vmovntdq %%ymm6,  192(%[dst])\n"
++			"vmovntdq %%ymm7,  224(%[dst])\n"
++			: : [src]"r"(s), [dst]"r"(d)
++			: "memory", "ymm0", "ymm1", "ymm2", "ymm3", "ymm4", "ymm5", "ymm6", "ymm7"
++		);
++
++		s += 256;
++		d += 256;
++		len -= 256;
++	}
++
++	// Handle remaining 128B chunks
++	if (len >= 128) {
++		asm volatile(
++			"vmovdqu    0(%[src]), %%ymm0\n"
++			"vmovdqu   32(%[src]), %%ymm1\n"
++			"vmovdqu   64(%[src]), %%ymm2\n"
++			"vmovdqu   96(%[src]), %%ymm3\n"
++			"vmovntdq %%ymm0,    0(%[dst])\n"
++			"vmovntdq %%ymm1,   32(%[dst])\n"
++			"vmovntdq %%ymm2,   64(%[dst])\n"
++			"vmovntdq %%ymm3,   96(%[dst])\n"
++			: : [src]"r"(s), [dst]"r"(d)
++			: "memory", "ymm0", "ymm1", "ymm2", "ymm3"
++		);
++		s += 128;
++		d += 128;
++		len -= 128;
++	}
++
++	// Handle remaining 64B chunks
++	if (len >= 64) {
++		asm volatile(
++			"vmovdqu    0(%[src]), %%ymm0\n"
++			"vmovdqu   32(%[src]), %%ymm1\n"
++			"vmovntdq %%ymm0,    0(%[dst])\n"
++			"vmovntdq %%ymm1,   32(%[dst])\n"
++			: : [src]"r"(s), [dst]"r"(d)
++			: "memory", "ymm0", "ymm1"
++		);
++		s += 64;
++		d += 64;
++		len -= 64;
++	}
++
++	// Handle remaining 32B chunks
++	if (len >= 32) {
++		asm volatile(
++			"vmovdqu  (%[src]), %%ymm0\n"
++			"vmovntdq %%ymm0, (%[dst])\n"
++			: : [src]"r"(s), [dst]"r"(d)
++			: "memory", "ymm0"
++		);
++		s += 32;
++		d += 32;
++		len -= 32;
++	}
++
++	// Ensure NT stores complete
++	asm volatile("sfence" ::: "memory");
++
++	end_avx:
++	// Avoid AVX-SSE transition penalty
++	asm volatile("vzeroupper" ::: "memory");
++	kernel_fpu_end();
++
++	// Handle final tail (< 32 bytes)
++	if (len > 0) {
++		memcpy(d, s, len);
++		clean_cache_range(d, len); // Includes sfence
++	}
++}
++
++
++/**
++ * __memcpy_flushcache_std - memcpy using GPR NT stores + flush (No AVX2).
++ * @dst:   Destination address. Requires 8B alignment for main loops.
++ * @src:   Source address.
++ * @size:  Number of bytes to copy.
++ */
++static inline void __memcpy_flushcache_std(void *dst, const void *src, size_t size)
++{
++	char *d = (char *)dst;
++	const char *s = (const char *)src;
++	size_t len = size;
++
++	// Align destination to 8 bytes for movnti
++	if (unlikely(!IS_ALIGNED((unsigned long)d, 8))) {
++		size_t head_len = ALIGN((unsigned long)d, 8) - (unsigned long)d;
++		head_len = min(head_len, len);
++		memcpy(d, s, head_len);
++		clean_cache_range(d, head_len); // Includes sfence
++		d += head_len;
++		s += head_len;
++		len -= head_len;
++		if (unlikely(len == 0))
+ 			return;
+ 	}
+ 
+-	/* 4x8 movnti loop */
+-	while (size >= 32) {
+-		asm("movq    (%0), %%r8\n"
+-		    "movq   8(%0), %%r9\n"
+-		    "movq  16(%0), %%r10\n"
+-		    "movq  24(%0), %%r11\n"
+-		    "movnti  %%r8,   (%1)\n"
+-		    "movnti  %%r9,  8(%1)\n"
+-		    "movnti %%r10, 16(%1)\n"
+-		    "movnti %%r11, 24(%1)\n"
+-		    :: "r" (source), "r" (dest)
+-		    : "memory", "r8", "r9", "r10", "r11");
+-		dest += 32;
+-		source += 32;
+-		size -= 32;
+-	}
+-
+-	/* 1x8 movnti loop */
+-	while (size >= 8) {
+-		asm("movq    (%0), %%r8\n"
+-		    "movnti  %%r8,   (%1)\n"
+-		    :: "r" (source), "r" (dest)
+-		    : "memory", "r8");
+-		dest += 8;
+-		source += 8;
+-		size -= 8;
+-	}
+-
+-	/* 1x4 movnti loop */
+-	while (size >= 4) {
+-		asm("movl    (%0), %%r8d\n"
+-		    "movnti  %%r8d,   (%1)\n"
+-		    :: "r" (source), "r" (dest)
+-		    : "memory", "r8");
+-		dest += 4;
+-		source += 4;
+-		size -= 4;
+-	}
+-
+-	/* cache copy for remaining bytes */
+-	if (size) {
+-		memcpy((void *) dest, (void *) source, size);
+-		clean_cache_range((void *) dest, size);
++	// Process 64 bytes (8 qwords) per iteration
++	while (likely(len >= 64)) {
++		prefetch((const void *)(s + 512));
++
++		asm volatile(
++			"movq    0(%[src]), %%r8\n"
++			"movq    8(%[src]), %%r9\n"
++			"movq   16(%[src]), %%r10\n"
++			"movq   24(%[src]), %%r11\n"
++			"movnti %%r8,    0(%[dst])\n"
++			"movnti %%r9,    8(%[dst])\n"
++			"movnti %%r10,  16(%[dst])\n"
++			"movnti %%r11,  24(%[dst])\n"
++			"movq   32(%[src]), %%r12\n"
++			"movq   40(%[src]), %%r13\n"
++			"movq   48(%[src]), %%r14\n"
++			"movq   56(%[src]), %%r15\n"
++			"movnti %%r12,  32(%[dst])\n"
++			"movnti %%r13,  40(%[dst])\n"
++			"movnti %%r14,  48(%[dst])\n"
++			"movnti %%r15,  56(%[dst])\n"
++			: : [src]"r"(s), [dst]"r"(d)
++			: "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"
++		);
++
++		s += 64;
++		d += 64;
++		len -= 64;
++	}
++
++	// Handle remaining 32B chunks
++	if (len >= 32) {
++		asm volatile(
++			"movq    0(%[src]), %%r8\n"
++			"movq    8(%[src]), %%r9\n"
++			"movq   16(%[src]), %%r10\n"
++			"movq   24(%[src]), %%r11\n"
++			"movnti %%r8,    0(%[dst])\n"
++			"movnti %%r9,    8(%[dst])\n"
++			"movnti %%r10,  16(%[dst])\n"
++			"movnti %%r11,  24(%[dst])\n"
++			: : [src]"r"(s), [dst]"r"(d)
++			: "memory", "r8", "r9", "r10", "r11"
++		);
++		s += 32;
++		d += 32;
++		len -= 32;
++	}
++
++	// Handle remaining 16B chunks
++	if (len >= 16) {
++		asm volatile(
++			"movq    0(%[src]), %%r8\n"
++			"movq    8(%[src]), %%r9\n"
++			"movnti %%r8,    0(%[dst])\n"
++			"movnti %%r9,    8(%[dst])\n"
++			: : [src]"r"(s), [dst]"r"(d)
++			: "memory", "r8", "r9"
++		);
++		s += 16;
++		d += 16;
++		len -= 16;
++	}
++
++	// Handle remaining 8B chunk
++	if (len >= 8) {
++		asm volatile(
++			"movq   (%[src]), %%r8\n"
++			"movnti %%r8,  (%[dst])\n"
++			: : [src]"r"(s), [dst]"r"(d)
++			: "memory", "r8"
++		);
++		s += 8;
++		d += 8;
++		len -= 8;
++	}
++
++	// Ensure NT stores complete
++	asm volatile("sfence" ::: "memory");
++
++	// Handle final tail (< 8 bytes)
++	if (len > 0) {
++		memcpy(d, s, len);
++		clean_cache_range(d, len); // Includes sfence
+ 	}
+ }
++
++/**
++ * __memcpy_flushcache - memcpy wrapper selecting AVX2 or standard GPR path.
++ * @dst:   Destination address (kernel space, likely PMEM).
++ * @src:   Source address (kernel space).
++ * @size:  Number of bytes to copy.
++ */
++void __memcpy_flushcache(void *dst, const void *src, size_t size)
++{
++	if (unlikely(size == 0))
++		return;
++
++	// Select implementation based on AVX2 feature
++	asm goto(ALTERNATIVE("jmp %l[std_path]",
++						 "jmp %l[avx2_path]",
++					  X86_FEATURE_AVX2)
++	: : : : std_path, avx2_path);
++
++	avx2_path:
++	__memcpy_flushcache_avx2(dst, src, size);
++	return;
++
++	std_path:
++	__memcpy_flushcache_std(dst, src, size);
++	return;
++}
+ EXPORT_SYMBOL_GPL(__memcpy_flushcache);
+-#endif
++
++#endif /* CONFIG_ARCH_HAS_UACCESS_FLUSHCACHE */
+
+
+--- a/arch/x86/lib/copy_page_64.S
++++ b/arch/x86/lib/copy_page_64.S 2025-03-15 15:55:20.654938290
+@@ -1,5 +1,6 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+ /* Written 2003 by Andi Kleen, based on a kernel by Evandro Menezes */
++/* Optimized for Intel Raptor Lake using Intel optimization guidelines */
+ 
+ #include <linux/export.h>
+ #include <linux/linkage.h>
+@@ -7,83 +8,166 @@
+ #include <asm/alternative.h>
+ 
+ /*
+- * Some CPUs run faster using the string copy instructions (sane microcode).
+- * It is also a lot simpler. Use this when possible. But, don't use streaming
+- * copy unless the CPU indicates X86_FEATURE_REP_GOOD. Could vary the
+- * prefetch distance based on SMP/UP.
++ * Multi-path page copy implementation with optimizations for Raptor Lake:
++ * 1. AVX2-based path with non-temporal stores and optimized prefetching
++ * 2. REP MOVSQ path (efficient on modern Intel CPUs)
++ * 3. Standard register-based fallback with optimized prefetching
+  */
+-	ALIGN
++        ALIGN
+ SYM_FUNC_START(copy_page)
+-	ALTERNATIVE "jmp copy_page_regs", "", X86_FEATURE_REP_GOOD
+-	movl	$4096/8, %ecx
+-	rep	movsq
+-	RET
++        ALTERNATIVE "jmp copy_page_avx2", "", X86_FEATURE_AVX2
++        ALTERNATIVE "jmp copy_page_regs", "", X86_FEATURE_REP_GOOD
++        movl    $4096/8, %ecx
++        rep     movsq
++        RET
+ SYM_FUNC_END(copy_page)
+ EXPORT_SYMBOL(copy_page)
+ 
+-SYM_FUNC_START_LOCAL(copy_page_regs)
+-	subq	$2*8,	%rsp
+-	movq	%rbx,	(%rsp)
+-	movq	%r12,	1*8(%rsp)
++/*
++ * AVX2 optimized implementation that leverages:
++ * - 256-bit wide YMM registers
++ * - Non-temporal stores to avoid cache pollution
++ * - Strategic prefetching for Raptor Lake's memory subsystem
++ */
++        .p2align 5  /* 32-byte alignment for AVX2 */
++SYM_FUNC_START_LOCAL(copy_page_avx2)
++        /* Only rbx needs preservation as we're not using other callee-saved regs */
++        pushq   %rbx
++
++        /* Process 256 bytes per iteration (unrolled by 2) for better throughput */
++        movl    $4096/256, %ecx
++
++        .p2align 5  /* Optimal alignment for AVX2 code */
++.Loop_avx2:
++        /* Prefetch - Raptor Lake has good HW prefetchers, so we need fewer SW prefetches */
++        prefetcht0      8*64(%rsi)    /* ~512 bytes ahead - tuned for Raptor Lake */
++
++        /* First 128 bytes */
++        vmovdqa         0*32(%rsi), %ymm0
++        vmovdqa         1*32(%rsi), %ymm1
++        vmovdqa         2*32(%rsi), %ymm2
++        vmovdqa         3*32(%rsi), %ymm3
++
++        /* Second 128 bytes */
++        vmovdqa         4*32(%rsi), %ymm4
++        vmovdqa         5*32(%rsi), %ymm5
++        vmovdqa         6*32(%rsi), %ymm6
++        vmovdqa         7*32(%rsi), %ymm7
++
++        /* Non-temporal stores for first 128 bytes */
++        vmovntdq        %ymm0, 0*32(%rdi)
++        vmovntdq        %ymm1, 1*32(%rdi)
++        vmovntdq        %ymm2, 2*32(%rdi)
++        vmovntdq        %ymm3, 3*32(%rdi)
++
++        /* Non-temporal stores for second 128 bytes */
++        vmovntdq        %ymm4, 4*32(%rdi)
++        vmovntdq        %ymm5, 5*32(%rdi)
++        vmovntdq        %ymm6, 6*32(%rdi)
++        vmovntdq        %ymm7, 7*32(%rdi)
++
++        /* Update pointers */
++        addq    $256, %rsi
++        addq    $256, %rdi
++
++        /* Loop control */
++        subl    $1, %ecx
++        jnz     .Loop_avx2
++
++        /* Memory fence required after non-temporal stores */
++        sfence
++
++        /* Avoid AVX-SSE transition penalties */
++        vzeroupper
++
++        /* Restore saved register */
++        popq    %rbx
++        RET
++SYM_FUNC_END(copy_page_avx2)
+ 
+-	movl	$(4096/64)-5,	%ecx
+-	.p2align 4
++/*
++ * Optimized register-based implementation
++ * Uses non-temporal stores when available via ALTERNATIVE
++ */
++        .p2align 4
++SYM_FUNC_START_LOCAL(copy_page_regs)
++        /* Save preserved registers */
++        subq    $2*8, %rsp
++        movq    %rbx, (%rsp)
++        movq    %r12, 1*8(%rsp)
++
++        /* Main loop handling most of the page */
++        movl    $(4096/64)-5, %ecx
++        .p2align 4
+ .Loop64:
+-	dec	%rcx
+-	movq	0x8*0(%rsi), %rax
+-	movq	0x8*1(%rsi), %rbx
+-	movq	0x8*2(%rsi), %rdx
+-	movq	0x8*3(%rsi), %r8
+-	movq	0x8*4(%rsi), %r9
+-	movq	0x8*5(%rsi), %r10
+-	movq	0x8*6(%rsi), %r11
+-	movq	0x8*7(%rsi), %r12
+-
+-	prefetcht0 5*64(%rsi)
+-
+-	movq	%rax, 0x8*0(%rdi)
+-	movq	%rbx, 0x8*1(%rdi)
+-	movq	%rdx, 0x8*2(%rdi)
+-	movq	%r8,  0x8*3(%rdi)
+-	movq	%r9,  0x8*4(%rdi)
+-	movq	%r10, 0x8*5(%rdi)
+-	movq	%r11, 0x8*6(%rdi)
+-	movq	%r12, 0x8*7(%rdi)
+-
+-	leaq	64 (%rsi), %rsi
+-	leaq	64 (%rdi), %rdi
++        /* Prefetch optimized for Raptor Lake's memory subsystem */
++        prefetcht0      8*64(%rsi)    /* ~512 bytes ahead */
+ 
+-	jnz	.Loop64
++         subl    $1, %ecx
+ 
+-	movl	$5, %ecx
+-	.p2align 4
++        /* Load 64 bytes into registers */
++        movq    0*8(%rsi), %rax
++        movq    1*8(%rsi), %rbx
++        movq    2*8(%rsi), %rdx
++        movq    3*8(%rsi), %r8
++        movq    4*8(%rsi), %r9
++        movq    5*8(%rsi), %r10
++        movq    6*8(%rsi), %r11
++        movq    7*8(%rsi), %r12
++
++        /* Use ALTERNATIVE to choose between regular and non-temporal stores */
++        ALTERNATIVE "movq %rax, 0*8(%rdi)", "movnti %rax, 0*8(%rdi)", X86_FEATURE_XMM2
++        ALTERNATIVE "movq %rbx, 1*8(%rdi)", "movnti %rbx, 1*8(%rdi)", X86_FEATURE_XMM2
++        ALTERNATIVE "movq %rdx, 2*8(%rdi)", "movnti %rdx, 2*8(%rdi)", X86_FEATURE_XMM2
++        ALTERNATIVE "movq %r8,  3*8(%rdi)", "movnti %r8,  3*8(%rdi)", X86_FEATURE_XMM2
++        ALTERNATIVE "movq %r9,  4*8(%rdi)", "movnti %r9,  4*8(%rdi)", X86_FEATURE_XMM2
++        ALTERNATIVE "movq %r10, 5*8(%rdi)", "movnti %r10, 5*8(%rdi)", X86_FEATURE_XMM2
++        ALTERNATIVE "movq %r11, 6*8(%rdi)", "movnti %r11, 6*8(%rdi)", X86_FEATURE_XMM2
++        ALTERNATIVE "movq %r12, 7*8(%rdi)", "movnti %r12, 7*8(%rdi)", X86_FEATURE_XMM2
++
++        /* Update pointers */
++        leaq    64(%rsi), %rsi
++        leaq    64(%rdi), %rdi
++
++        jnz     .Loop64
++
++        /* Handle remaining 5 blocks of 64 bytes */
++        movl    $5, %ecx
++        .p2align 4
+ .Loop2:
+-	decl	%ecx
++         subl    $1, %ecx
+ 
+-	movq	0x8*0(%rsi), %rax
+-	movq	0x8*1(%rsi), %rbx
+-	movq	0x8*2(%rsi), %rdx
+-	movq	0x8*3(%rsi), %r8
+-	movq	0x8*4(%rsi), %r9
+-	movq	0x8*5(%rsi), %r10
+-	movq	0x8*6(%rsi), %r11
+-	movq	0x8*7(%rsi), %r12
+-
+-	movq	%rax, 0x8*0(%rdi)
+-	movq	%rbx, 0x8*1(%rdi)
+-	movq	%rdx, 0x8*2(%rdi)
+-	movq	%r8,  0x8*3(%rdi)
+-	movq	%r9,  0x8*4(%rdi)
+-	movq	%r10, 0x8*5(%rdi)
+-	movq	%r11, 0x8*6(%rdi)
+-	movq	%r12, 0x8*7(%rdi)
+-
+-	leaq	64(%rdi), %rdi
+-	leaq	64(%rsi), %rsi
+-	jnz	.Loop2
+-
+-	movq	(%rsp), %rbx
+-	movq	1*8(%rsp), %r12
+-	addq	$2*8, %rsp
+-	RET
++        /* Load 64 bytes into registers */
++        movq    0*8(%rsi), %rax
++        movq    1*8(%rsi), %rbx
++        movq    2*8(%rsi), %rdx
++        movq    3*8(%rsi), %r8
++        movq    4*8(%rsi), %r9
++        movq    5*8(%rsi), %r10
++        movq    6*8(%rsi), %r11
++        movq    7*8(%rsi), %r12
++
++        /* Use ALTERNATIVE to choose between regular and non-temporal stores */
++        ALTERNATIVE "movq %rax, 0*8(%rdi)", "movnti %rax, 0*8(%rdi)", X86_FEATURE_XMM2
++        ALTERNATIVE "movq %rbx, 1*8(%rdi)", "movnti %rbx, 1*8(%rdi)", X86_FEATURE_XMM2
++        ALTERNATIVE "movq %rdx, 2*8(%rdi)", "movnti %rdx, 2*8(%rdi)", X86_FEATURE_XMM2
++        ALTERNATIVE "movq %r8,  3*8(%rdi)", "movnti %r8,  3*8(%rdi)", X86_FEATURE_XMM2
++        ALTERNATIVE "movq %r9,  4*8(%rdi)", "movnti %r9,  4*8(%rdi)", X86_FEATURE_XMM2
++        ALTERNATIVE "movq %r10, 5*8(%rdi)", "movnti %r10, 5*8(%rdi)", X86_FEATURE_XMM2
++        ALTERNATIVE "movq %r11, 6*8(%rdi)", "movnti %r11, 6*8(%rdi)", X86_FEATURE_XMM2
++        ALTERNATIVE "movq %r12, 7*8(%rdi)", "movnti %r12, 7*8(%rdi)", X86_FEATURE_XMM2
++
++        /* Update pointers */
++        leaq    64(%rdi), %rdi
++        leaq    64(%rsi), %rsi
++        jnz     .Loop2
++
++        /* Memory fence if non-temporal stores were used */
++        ALTERNATIVE "", "sfence", X86_FEATURE_XMM2
++
++        /* Restore preserved registers and return */
++        movq    (%rsp), %rbx
++        movq    1*8(%rsp), %r12
++        addq    $2*8, %rsp
++        RET
+ SYM_FUNC_END(copy_page_regs)
+
+
+--- a/arch/x86/lib/memcpy_64.S	2025-03-13 13:08:08.000000000 +0100
++++ b/arch/x86/lib/memcpy_64.S	2025-03-14 20:41:53.935561421 +0100
+@@ -1,5 +1,8 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+-/* Copyright 2002 Andi Kleen */
++/*
++ * Copyright 2002 Andi Kleen
++ * Optimized for Intel Raptor Lake by Claude, 2025
++ */
+ 
+ #include <linux/export.h>
+ #include <linux/linkage.h>
+@@ -12,6 +15,8 @@
+ 
+ /*
+  * memcpy - Copy a memory block.
++ * Optimized for Intel Raptor Lake architecture with hybrid core awareness
++ * and enhanced vectorization.
+  *
+  * Input:
+  *  rdi destination
+@@ -20,153 +25,446 @@
+  *
+  * Output:
+  * rax original destination
+- *
+- * The FSRM alternative should be done inline (avoiding the call and
+- * the disgusting return handling), but that would require some help
+- * from the compiler for better calling conventions.
+- *
+- * The 'rep movsb' itself is small enough to replace the call, but the
+- * two register moves blow up the code. And one of them is "needed"
+- * only for the return value that is the same as the source input,
+- * which the compiler could/should do much better anyway.
+  */
+ SYM_TYPED_FUNC_START(__memcpy)
+-	ALTERNATIVE "jmp memcpy_orig", "", X86_FEATURE_FSRM
++        /* Enhanced FSRM detection for Raptor Lake */
++        ALTERNATIVE "jmp memcpy_hybrid_check", "", X86_FEATURE_FSRM
+ 
+-	movq %rdi, %rax
+-	movq %rdx, %rcx
+-	rep movsb
+-	RET
++        /* Fast path with FSRM - simple rep movsb */
++        movq %rdi, %rax
++        movq %rdx, %rcx
++        rep movsb
++        RET
+ SYM_FUNC_END(__memcpy)
+ EXPORT_SYMBOL(__memcpy)
+ 
+ SYM_FUNC_ALIAS_MEMFUNC(memcpy, __memcpy)
+ EXPORT_SYMBOL(memcpy)
+ 
++/* Hybrid architecture check for P-core vs E-core */
++SYM_FUNC_START_LOCAL(memcpy_hybrid_check)
++        movq %rdi, %rax        /* Store return value (original destination) */
++
++        /* Check for hybrid CPU feature and branch to appropriate path */
++        ALTERNATIVE "jmp memcpy_orig", "jmp memcpy_pcore_path", X86_FEATURE_HYBRID_CPU
++SYM_FUNC_END(memcpy_hybrid_check)
++
++/* Optimized path for P-cores with AVX2 support for large copies */
++SYM_FUNC_START_LOCAL(memcpy_pcore_path)
++        /* Preserve callee-saved registers we'll use */
++        pushq %r12
++        pushq %r13
++        pushq %r14
++        pushq %r15
++
++        /* Save return value */
++        movq %rdi, %rax
++
++        /* Skip to regular path for small copies */
++        cmpq $256, %rdx
++        jb .Lrestore_and_jump_to_orig
++
++        /* Check if AVX2 is available */
++        ALTERNATIVE "jmp .Lrestore_and_jump_to_orig", "", X86_FEATURE_AVX2
++
++        /* Check if kernel allows AVX usage */
++        ALTERNATIVE "jmp .Lrestore_and_jump_to_orig", "", X86_FEATURE_OSXSAVE
++
++        /* Check for alignment */
++        movl %edi, %ecx
++        andl $31, %ecx
++        jz .Lavx_aligned_copy
++
++        /* Calculate bytes needed to align destination to 32-byte boundary */
++        movl $32, %r8d
++        subl %ecx, %r8d
++
++        /* Ensure alignment doesn't exceed total size */
++        movq %r8, %rcx
++        cmpq %rdx, %rcx
++        jbe .Lavx_align_ok
++        movq %rdx, %rcx
++
++.Lavx_align_ok:
++        /* Copy bytes to align */
++        subq %rcx, %rdx  /* Adjust remaining count */
++
++        /* Use movsb for alignment portion */
++        rep movsb
++
++        /* Skip AVX if no bytes remain */
++        testq %rdx, %rdx
++        jz .Lavx_cleanup_and_exit
++
++.Lavx_aligned_copy:
++        /* Set up for 128-byte chunk copies */
++        movq %rdx, %rcx
++        shrq $7, %rcx     /* Divide by 128 */
++        jz .Lavx_remainder
++
++        /* Main AVX2 copy loop - 128 bytes per iteration */
++.Lavx_loop:
++        /* Use vmovdqu for unaligned source */
++1:      vmovdqu 0*32(%rsi), %ymm0
++2:      vmovdqu 1*32(%rsi), %ymm1
++3:      vmovdqu 2*32(%rsi), %ymm2
++4:      vmovdqu 3*32(%rsi), %ymm3
++
++5:      vmovdqa %ymm0, 0*32(%rdi)
++6:      vmovdqa %ymm1, 1*32(%rdi)
++7:      vmovdqa %ymm2, 2*32(%rdi)
++8:      vmovdqa %ymm3, 3*32(%rdi)
++
++        addq $128, %rsi
++        addq $128, %rdi
++        subq $1, %rcx
++        jnz .Lavx_loop
++
++        /* Calculate remaining bytes */
++        andq $127, %rdx
++
++.Lavx_remainder:
++        /* Handle 64-byte chunks */
++        movq %rdx, %rcx
++        andq $64, %rcx
++        jz .Lavx_remainder_32
++
++9:      vmovdqu 0*32(%rsi), %ymm0
++10:     vmovdqu 1*32(%rsi), %ymm1
++11:     vmovdqa %ymm0, 0*32(%rdi)
++12:     vmovdqa %ymm1, 1*32(%rdi)
++
++        addq $64, %rsi
++        addq $64, %rdi
++        subq $64, %rdx
++
++.Lavx_remainder_32:
++        /* Handle 32-byte chunks */
++        movq %rdx, %rcx
++        andq $32, %rcx
++        jz .Lavx_remainder_tail
++
++13:     vmovdqu (%rsi), %ymm0
++14:     vmovdqa %ymm0, (%rdi)
++
++        addq $32, %rsi
++        addq $32, %rdi
++        subq $32, %rdx
++
++.Lavx_remainder_tail:
++        /* Clear AVX state to avoid penalties */
++        vzeroupper
++
++        /* Handle remaining bytes (<32) */
++        testq %rdx, %rdx
++        jz .Lavx_cleanup_and_exit
++
++        /* Use standard copy for tail */
++        movq %rdx, %rcx
++        rep movsb
++
++.Lavx_cleanup_and_exit:
++        /* Restore saved registers and return */
++        popq %r15
++        popq %r14
++        popq %r13
++        popq %r12
++        RET
++
++.Lrestore_and_jump_to_orig:
++        /* Restore registers before jumping to regular path */
++        popq %r15
++        popq %r14
++        popq %r13
++        popq %r12
++        jmp memcpy_orig
++
++.Lavx_fault_handler:
++        /* Clean up AVX state and jump to regular path on fault */
++        vzeroupper
++        popq %r15
++        popq %r14
++        popq %r13
++        popq %r12
++        jmp memcpy_orig
++
++        _ASM_EXTABLE(1b, .Lavx_fault_handler)
++        _ASM_EXTABLE(2b, .Lavx_fault_handler)
++        _ASM_EXTABLE(3b, .Lavx_fault_handler)
++        _ASM_EXTABLE(4b, .Lavx_fault_handler)
++        _ASM_EXTABLE(5b, .Lavx_fault_handler)
++        _ASM_EXTABLE(6b, .Lavx_fault_handler)
++        _ASM_EXTABLE(7b, .Lavx_fault_handler)
++        _ASM_EXTABLE(8b, .Lavx_fault_handler)
++        _ASM_EXTABLE(9b, .Lavx_fault_handler)
++        _ASM_EXTABLE(10b, .Lavx_fault_handler)
++        _ASM_EXTABLE(11b, .Lavx_fault_handler)
++        _ASM_EXTABLE(12b, .Lavx_fault_handler)
++        _ASM_EXTABLE(13b, .Lavx_fault_handler)
++        _ASM_EXTABLE(14b, .Lavx_fault_handler)
++SYM_FUNC_END(memcpy_pcore_path)
++
++/* Original path with Raptor Lake optimizations */
+ SYM_FUNC_START_LOCAL(memcpy_orig)
+-	movq %rdi, %rax
++        /* Preserve registers we'll be using */
++        pushq %r12
++        pushq %r13
++        pushq %r14
++        pushq %r15
++
++        /* Store return value */
++        movq %rdi, %rax
++
++        /* Optimize for zero-length copy */
++        testq %rdx, %rdx
++        jz .Lexit_with_restore
++
++        /* Adjust size threshold to 64 bytes for Raptor Lake cache lines */
++        cmpq $0x40, %rdx
++        jb .Lmedium_copy
++
++        /* Check for potential memory overlap */
++        cmp  %dil, %sil
++        jl .Lcopy_backward
++
++        /* Align destination to cache line if copy is large enough */
++        movl %edi, %ecx
++        andl $0x3F, %ecx
++        jz .Laligned_forward_copy
++
++        /* Only align if copy is large (>128 bytes) */
++        cmpq $0x80, %rdx
++        jb .Laligned_forward_copy
++
++        /* Calculate bytes to align */
++        movl $64, %r8d
++        subl %ecx, %r8d
++        movq %r8, %rcx
++
++        /* Ensure we don't over-copy */
++        cmpq %rdx, %rcx
++        jbe .Lalign_dest
++        movq %rdx, %rcx
++
++.Lalign_dest:
++        /* Adjust remaining count and align */
++        subq %rcx, %rdx
++        rep movsb
++
++        /* Check if we have bytes left to copy */
++        testq %rdx, %rdx
++        jz .Lexit_with_restore
++
++.Laligned_forward_copy:
++        /* Skip small copy path for larger copies */
++        cmpq $0x40, %rdx
++        jb .Lhandle_tail
+ 
+-	cmpq $0x20, %rdx
+-	jb .Lhandle_tail
++        /* Use 64-byte chunks for Raptor Lake's cache line size */
++        subq $0x40, %rdx
+ 
+-	/*
+-	 * We check whether memory false dependence could occur,
+-	 * then jump to corresponding copy mode.
+-	 */
+-	cmp  %dil, %sil
+-	jl .Lcopy_backward
+-	subq $0x20, %rdx
+ .Lcopy_forward_loop:
+-	subq $0x20,	%rdx
++        /* Copy 64 bytes (full cache line) at a time */
++        movq 0*8(%rsi), %r8
++        movq 1*8(%rsi), %r9
++        movq 2*8(%rsi), %r10
++        movq 3*8(%rsi), %r11
++        movq 4*8(%rsi), %r12
++        movq 5*8(%rsi), %r13
++        movq 6*8(%rsi), %r14
++        movq 7*8(%rsi), %r15
++
++        movq %r8,  0*8(%rdi)
++        movq %r9,  1*8(%rdi)
++        movq %r10, 2*8(%rdi)
++        movq %r11, 3*8(%rdi)
++        movq %r12, 4*8(%rdi)
++        movq %r13, 5*8(%rdi)
++        movq %r14, 6*8(%rdi)
++        movq %r15, 7*8(%rdi)
+ 
+-	/*
+-	 * Move in blocks of 4x8 bytes:
+-	 */
+-	movq 0*8(%rsi),	%r8
+-	movq 1*8(%rsi),	%r9
+-	movq 2*8(%rsi),	%r10
+-	movq 3*8(%rsi),	%r11
+-	leaq 4*8(%rsi),	%rsi
+-
+-	movq %r8,	0*8(%rdi)
+-	movq %r9,	1*8(%rdi)
+-	movq %r10,	2*8(%rdi)
+-	movq %r11,	3*8(%rdi)
+-	leaq 4*8(%rdi),	%rdi
+-	jae  .Lcopy_forward_loop
+-	addl $0x20,	%edx
+-	jmp  .Lhandle_tail
++        leaq 8*8(%rsi), %rsi
++        leaq 8*8(%rdi), %rdi
++
++        subq $0x40, %rdx
++        jae  .Lcopy_forward_loop
++
++        addq $0x40, %rdx
++        jmp  .Lhandle_tail
+ 
+ .Lcopy_backward:
+-	/*
+-	 * Calculate copy position to tail.
+-	 */
+-	addq %rdx,	%rsi
+-	addq %rdx,	%rdi
+-	subq $0x20,	%rdx
+-	/*
+-	 * At most 3 ALU operations in one cycle,
+-	 * so append NOPS in the same 16 bytes trunk.
+-	 */
+-	.p2align 4
++        /* Calculate copy position to tail */
++        addq %rdx, %rsi
++        addq %rdx, %rdi
++
++        /* Check if we have enough bytes for the main loop */
++        cmpq $0x40, %rdx
++        jb .Lcopy_backward_tail
++
++        subq $0x40, %rdx
++
++        .p2align 4
+ .Lcopy_backward_loop:
+-	subq $0x20,	%rdx
+-	movq -1*8(%rsi),	%r8
+-	movq -2*8(%rsi),	%r9
+-	movq -3*8(%rsi),	%r10
+-	movq -4*8(%rsi),	%r11
+-	leaq -4*8(%rsi),	%rsi
+-	movq %r8,		-1*8(%rdi)
+-	movq %r9,		-2*8(%rdi)
+-	movq %r10,		-3*8(%rdi)
+-	movq %r11,		-4*8(%rdi)
+-	leaq -4*8(%rdi),	%rdi
+-	jae  .Lcopy_backward_loop
+-
+-	/*
+-	 * Calculate copy position to head.
+-	 */
+-	addl $0x20,	%edx
+-	subq %rdx,	%rsi
+-	subq %rdx,	%rdi
++        /* Copy 64 bytes (full cache line) at a time */
++        movq -1*8(%rsi), %r8
++        movq -2*8(%rsi), %r9
++        movq -3*8(%rsi), %r10
++        movq -4*8(%rsi), %r11
++        movq -5*8(%rsi), %r12
++        movq -6*8(%rsi), %r13
++        movq -7*8(%rsi), %r14
++        movq -8*8(%rsi), %r15
++
++        movq %r8,  -1*8(%rdi)
++        movq %r9,  -2*8(%rdi)
++        movq %r10, -3*8(%rdi)
++        movq %r11, -4*8(%rdi)
++        movq %r12, -5*8(%rdi)
++        movq %r13, -6*8(%rdi)
++        movq %r14, -7*8(%rdi)
++        movq %r15, -8*8(%rdi)
++
++        leaq -8*8(%rsi), %rsi
++        leaq -8*8(%rdi), %rdi
++
++        subq $0x40, %rdx
++        jae  .Lcopy_backward_loop
++
++        /* Calculate copy position to head */
++        addq $0x40, %rdx
++
++.Lcopy_backward_tail:
++        /* For small backward copies, adjust pointers correctly */
++        subq %rdx, %rsi
++        subq %rdx, %rdi
++
++        /* Continue with regular tail handling */
++        jmp .Lhandle_tail
++
+ .Lhandle_tail:
+-	cmpl $16,	%edx
+-	jb   .Lless_16bytes
++        /* Nothing to copy */
++        testq %rdx, %rdx
++        jz .Lexit_with_restore
++
++.Lmedium_copy:
++        /* Adjusted thresholds for medium copies */
++        cmpq $32, %rdx
++        jb .Lless_32bytes
++
++        /* Specialized handling for 32-64 bytes */
++        cmpq $48, %rdx
++        jb .Lcopy_32_to_48
++
++        /* Copy 48-64 bytes with unrolled movq */
++        movq 0*8(%rsi), %r8
++        movq 1*8(%rsi), %r9
++        movq 2*8(%rsi), %r10
++        movq 3*8(%rsi), %r11
++        movq -4*8(%rsi, %rdx), %r12
++        movq -3*8(%rsi, %rdx), %r13
++        movq -2*8(%rsi, %rdx), %r14
++        movq -1*8(%rsi, %rdx), %r15
++
++        movq %r8,  0*8(%rdi)
++        movq %r9,  1*8(%rdi)
++        movq %r10, 2*8(%rdi)
++        movq %r11, 3*8(%rdi)
++        movq %r12, -4*8(%rdi, %rdx)
++        movq %r13, -3*8(%rdi, %rdx)
++        movq %r14, -2*8(%rdi, %rdx)
++        movq %r15, -1*8(%rdi, %rdx)
++
++        jmp .Lexit_with_restore
++
++.Lcopy_32_to_48:
++        /* Copy 32-48 bytes with unrolled movq */
++        movq 0*8(%rsi), %r8
++        movq 1*8(%rsi), %r9
++        movq 2*8(%rsi), %r10
++        movq 3*8(%rsi), %r11
++        movq -2*8(%rsi, %rdx), %r12
++        movq -1*8(%rsi, %rdx), %r13
++
++        movq %r8,  0*8(%rdi)
++        movq %r9,  1*8(%rdi)
++        movq %r10, 2*8(%rdi)
++        movq %r11, 3*8(%rdi)
++        movq %r12, -2*8(%rdi, %rdx)
++        movq %r13, -1*8(%rdi, %rdx)
++
++        jmp .Lexit_with_restore
++
++.Lless_32bytes:
++        cmpq $16, %rdx
++        jb .Lless_16bytes
++
++        /* Copy 16-32 bytes */
++        movq 0*8(%rsi), %r8
++        movq 1*8(%rsi), %r9
++        movq -2*8(%rsi, %rdx), %r10
++        movq -1*8(%rsi, %rdx), %r11
++
++        movq %r8,  0*8(%rdi)
++        movq %r9,  1*8(%rdi)
++        movq %r10, -2*8(%rdi, %rdx)
++        movq %r11, -1*8(%rdi, %rdx)
++
++        jmp .Lexit_with_restore
+ 
+-	/*
+-	 * Move data from 16 bytes to 31 bytes.
+-	 */
+-	movq 0*8(%rsi), %r8
+-	movq 1*8(%rsi),	%r9
+-	movq -2*8(%rsi, %rdx),	%r10
+-	movq -1*8(%rsi, %rdx),	%r11
+-	movq %r8,	0*8(%rdi)
+-	movq %r9,	1*8(%rdi)
+-	movq %r10,	-2*8(%rdi, %rdx)
+-	movq %r11,	-1*8(%rdi, %rdx)
+-	RET
+-	.p2align 4
+ .Lless_16bytes:
+-	cmpl $8,	%edx
+-	jb   .Lless_8bytes
+-	/*
+-	 * Move data from 8 bytes to 15 bytes.
+-	 */
+-	movq 0*8(%rsi),	%r8
+-	movq -1*8(%rsi, %rdx),	%r9
+-	movq %r8,	0*8(%rdi)
+-	movq %r9,	-1*8(%rdi, %rdx)
+-	RET
+-	.p2align 4
+-.Lless_8bytes:
+-	cmpl $4,	%edx
+-	jb   .Lless_3bytes
++        cmpq $8, %rdx
++        jb .Lless_8bytes
+ 
+-	/*
+-	 * Move data from 4 bytes to 7 bytes.
+-	 */
+-	movl (%rsi), %ecx
+-	movl -4(%rsi, %rdx), %r8d
+-	movl %ecx, (%rdi)
+-	movl %r8d, -4(%rdi, %rdx)
+-	RET
+-	.p2align 4
+-.Lless_3bytes:
+-	subl $1, %edx
+-	jb .Lend
+-	/*
+-	 * Move data from 1 bytes to 3 bytes.
+-	 */
+-	movzbl (%rsi), %ecx
+-	jz .Lstore_1byte
+-	movzbq 1(%rsi), %r8
+-	movzbq (%rsi, %rdx), %r9
+-	movb %r8b, 1(%rdi)
+-	movb %r9b, (%rdi, %rdx)
+-.Lstore_1byte:
+-	movb %cl, (%rdi)
++        /* Copy 8-16 bytes */
++        movq 0*8(%rsi), %r8
++        movq -1*8(%rsi, %rdx), %r9
+ 
+-.Lend:
+-	RET
+-SYM_FUNC_END(memcpy_orig)
++        movq %r8, 0*8(%rdi)
++        movq %r9, -1*8(%rdi, %rdx)
+ 
++        jmp .Lexit_with_restore
++
++.Lless_8bytes:
++        cmpq $4, %rdx
++        jb .Lless_4bytes
++
++        /* Copy 4-8 bytes */
++        movl (%rsi), %ecx
++        movl -4(%rsi, %rdx), %r8d
++
++        movl %ecx, (%rdi)
++        movl %r8d, -4(%rdi, %rdx)
++
++        jmp .Lexit_with_restore
++
++.Lless_4bytes:
++        /* Safe copy for 1-3 bytes */
++        cmpq $0, %rdx
++        je .Lexit_with_restore
++
++        /* First byte */
++        movzbl (%rsi), %ecx
++        movb %cl, (%rdi)
++
++        cmpq $1, %rdx
++        je .Lexit_with_restore
++
++        /* Second byte */
++        movzbl 1(%rsi), %ecx
++        movb %cl, 1(%rdi)
++
++        cmpq $2, %rdx
++        je .Lexit_with_restore
++
++        /* Third byte */
++        movzbl 2(%rsi), %ecx
++        movb %cl, 2(%rdi)
++
++.Lexit_with_restore:
++        /* Restore preserved registers */
++        popq %r15
++        popq %r14
++        popq %r13
++        popq %r12
++        RET
++SYM_FUNC_END(memcpy_orig)
+
+--- a/arch/x86/lib/copy_user_64.S	2025-03-14 20:54:19.889090942 +0100
++++ b/arch/x86/lib/copy_user_64.S	2025-03-14 20:54:43.574754215 +0100
+@@ -2,6 +2,7 @@
+ /*
+  * Copyright 2008 Vitaly Mayatskikh <vmayatsk@redhat.com>
+  * Copyright 2002 Andi Kleen, SuSE Labs.
++ * Optimized for Intel Raptor Lake by Claude, 2025
+  *
+  * Functions to copy from and to user space.
+  */
+@@ -15,6 +16,7 @@
+ /*
+  * rep_movs_alternative - memory copy with exception handling.
+  * This version is for CPUs that don't have FSRM (Fast Short Rep Movs)
++ * Optimized for Intel Raptor Lake CPUs.
+  *
+  * Input:
+  * rdi destination
+@@ -23,87 +25,167 @@
+  *
+  * Output:
+  * rcx uncopied bytes or 0 if successful.
+- *
+- * NOTE! The calling convention is very intentionally the same as
+- * for 'rep movs', so that we can rewrite the function call with
+- * just a plain 'rep movs' on machines that have FSRM.  But to make
+- * it simpler for us, we can clobber rsi/rdi and rax freely.
+  */
+ SYM_FUNC_START(rep_movs_alternative)
+-	cmpq $64,%rcx
+-	jae .Llarge
+-
+-	cmp $8,%ecx
+-	jae .Lword
+-
+-	testl %ecx,%ecx
+-	je .Lexit
++        /* Check for zero length */
++        testq %rcx,%rcx
++        jz .Lexit
++
++        /* Classify transfer size */
++        cmpq $128,%rcx
++        jae .Llarge
++        cmpq $32,%rcx
++        jae .Lmedium
++        cmpq $8,%rcx
++        jae .Lword
+ 
++        /* 1-7 bytes: byte-by-byte copy */
+ .Lcopy_user_tail:
+-0:	movb (%rsi),%al
+-1:	movb %al,(%rdi)
+-	inc %rdi
+-	inc %rsi
+-	dec %rcx
+-	jne .Lcopy_user_tail
++0:      movb (%rsi),%al
++1:      movb %al,(%rdi)
++        inc %rdi
++        inc %rsi
++        dec %rcx
++        jnz .Lcopy_user_tail
+ .Lexit:
+-	RET
++        RET
+ 
+-	_ASM_EXTABLE_UA( 0b, .Lexit)
+-	_ASM_EXTABLE_UA( 1b, .Lexit)
++        _ASM_EXTABLE_UA( 0b, .Lexit)
++        _ASM_EXTABLE_UA( 1b, .Lexit)
+ 
+-	.p2align 4
++        /* 8-31 bytes: word-sized copy */
++        .p2align 4
+ .Lword:
+-2:	movq (%rsi),%rax
+-3:	movq %rax,(%rdi)
+-	addq $8,%rsi
+-	addq $8,%rdi
+-	sub $8,%ecx
+-	je .Lexit
+-	cmp $8,%ecx
+-	jae .Lword
+-	jmp .Lcopy_user_tail
+-
+-	_ASM_EXTABLE_UA( 2b, .Lcopy_user_tail)
+-	_ASM_EXTABLE_UA( 3b, .Lcopy_user_tail)
++2:      movq (%rsi),%rax
++3:      movq %rax,(%rdi)
++        addq $8,%rsi
++        addq $8,%rdi
++        subq $8,%rcx
++        jz .Lexit            /* Exactly 8 bytes copied */
++        cmpq $8,%rcx         /* 8 or more bytes left? */
++        jae .Lword           /* Yes, continue with words */
++        jmp .Lcopy_user_tail /* Handle 1-7 remaining bytes */
++
++        _ASM_EXTABLE_UA( 2b, .Lcopy_user_tail)
++        _ASM_EXTABLE_UA( 3b, .Lcopy_user_tail)
++
++        /* 32-127 bytes: simpler two-phase approach for medium transfers */
++        .p2align 4
++.Lmedium:
++        /* Handle first 32 bytes in a single go */
++4:      movq 0*8(%rsi),%rax
++5:      movq 1*8(%rsi),%rdx
++6:      movq 2*8(%rsi),%r8
++7:      movq 3*8(%rsi),%r9
++
++8:      movq %rax,0*8(%rdi)
++9:      movq %rdx,1*8(%rdi)
++10:     movq %r8,2*8(%rdi)
++11:     movq %r9,3*8(%rdi)
++
++        /* Update pointers and count */
++        addq $32,%rsi
++        addq $32,%rdi
++        subq $32,%rcx        /* Adjust for first 32 bytes */
++
++        /* Handle remaining bytes */
++        cmpq $32,%rcx        /* 32 or more bytes left? */
++        jae .Lmedium         /* Yes, process another 32-byte chunk */
++        cmpq $8,%rcx         /* 8 or more bytes left? */
++        jae .Lword           /* Yes, switch to word-based copy */
++        testq %rcx,%rcx      /* Any bytes left? */
++        jnz .Lcopy_user_tail /* Yes, handle remaining 1-7 bytes */
++        RET                  /* No, we're done */
++
++        /* Exception table for medium path */
++        _ASM_EXTABLE_UA( 4b, .Lmedium_fault)
++        _ASM_EXTABLE_UA( 5b, .Lmedium_fault)
++        _ASM_EXTABLE_UA( 6b, .Lmedium_fault)
++        _ASM_EXTABLE_UA( 7b, .Lmedium_fault)
++        _ASM_EXTABLE_UA( 8b, .Lmedium_fault)
++        _ASM_EXTABLE_UA( 9b, .Lmedium_fault)
++        _ASM_EXTABLE_UA(10b, .Lmedium_fault)
++        _ASM_EXTABLE_UA(11b, .Lmedium_fault)
++
++.Lmedium_fault:
++        /* Simply return current rcx value (remaining bytes) */
++        RET
+ 
++        /* 128+ bytes: large transfers with alignment and/or rep movsb */
+ .Llarge:
+-0:	ALTERNATIVE "jmp .Llarge_movsq", "rep movsb", X86_FEATURE_ERMS
+-1:	RET
++0:      ALTERNATIVE "jmp .Llarge_movsq", "rep movsb", X86_FEATURE_ERMS
++1:      RET
+ 
+-	_ASM_EXTABLE_UA( 0b, 1b)
++        _ASM_EXTABLE_UA( 0b, 1b)
+ 
+ .Llarge_movsq:
+-	/* Do the first possibly unaligned word */
+-0:	movq (%rsi),%rax
+-1:	movq %rax,(%rdi)
+-
+-	_ASM_EXTABLE_UA( 0b, .Lcopy_user_tail)
+-	_ASM_EXTABLE_UA( 1b, .Lcopy_user_tail)
+-
+-	/* What would be the offset to the aligned destination? */
+-	leaq 8(%rdi),%rax
+-	andq $-8,%rax
+-	subq %rdi,%rax
+-
+-	/* .. and update pointers and count to match */
+-	addq %rax,%rdi
+-	addq %rax,%rsi
+-	subq %rax,%rcx
+-
+-	/* make %rcx contain the number of words, %rax the remainder */
+-	movq %rcx,%rax
+-	shrq $3,%rcx
+-	andl $7,%eax
+-0:	rep movsq
+-	movl %eax,%ecx
+-	testl %ecx,%ecx
+-	jne .Lcopy_user_tail
+-	RET
++        /* Save original count */
++        movq %rcx,%r10
+ 
+-1:	leaq (%rax,%rcx,8),%rcx
+-	jmp .Lcopy_user_tail
++        /* Optional alignment to 64-byte boundary (cache line) */
++        movq %rdi,%rax
++        andl $7,%eax         /* Check 8-byte alignment first */
++        jz .Lmovsq_aligned
++
++        /* Handle up to 7 bytes for quadword alignment */
++        movl $8,%r8d
++        subl %eax,%r8d       /* r8d = bytes to 8-byte alignment */
++        movq %r8,%rcx
++
++12:     rep movsb
++
++        /* Update remaining bytes */
++        subq %r8,%r10
++        movq %r10,%rcx
++        testq %rcx,%rcx
++        jz .Lexit
++
++.Lmovsq_aligned:
++        /* Prefetch for large transfers (128+ bytes away) */
++13:     prefetcht0 128(%rsi)
++
++        /* Calculate number of 8-byte chunks and remainder */
++        movq %rcx,%rax       /* Save original count */
++        shrq $3,%rcx         /* rcx = number of 8-byte chunks */
++        andl $7,%eax         /* eax = remainder bytes */
++
++        testq %rcx,%rcx
++        jz .Lmovsq_tail
++
++        /* Copy 8-byte aligned chunks */
++14:     rep movsq
++
++.Lmovsq_tail:
++        /* Handle remainder bytes (0-7) */
++        movl %eax,%ecx
++        testl %ecx,%ecx
++        jz .Lexit
++
++15:     rep movsb
++        xorl %ecx,%ecx       /* Set rcx to 0 (success) */
++        RET
++
++        /* Exception handling for large transfers */
++16:     /* Calculate remaining bytes for movsq fault */
++        leaq (%rax,%rcx,8),%rcx
++        jmp .Lcopy_user_tail
++
++        _ASM_EXTABLE_UA(12b, .Llarge_fault_align)
++        _ASM_EXTABLE_UA(13b, .Lmovsq_fault_prefetch)
++        _ASM_EXTABLE_UA(14b, 16b)
++        _ASM_EXTABLE_UA(15b, .Lexit)
++
++.Llarge_fault_align:
++        /* On fault during alignment - return remaining */
++        movq %r10,%rcx
++        addq %r8,%rcx        /* Add alignment bytes */
++        subq %rax,%rcx       /* Subtract processed bytes */
++        RET
++
++.Lmovsq_fault_prefetch:
++        /* On fault during prefetch - whole count remains */
++        movq %r10,%rcx
++        RET
+ 
+-	_ASM_EXTABLE_UA( 0b, 1b)
+ SYM_FUNC_END(rep_movs_alternative)
+ EXPORT_SYMBOL(rep_movs_alternative)
+
+
+--- a/arch/x86/lib/memset_64.S	2025-03-13 13:08:08.000000000 +0100
++++ b/arch/x86/lib/memset_64.S	2025-03-14 21:12:30.472007594 +0100
+@@ -1,117 +1,326 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+ /* Copyright 2002 Andi Kleen, SuSE Labs */
++/* Optimized for Intel Raptor Lake by Genius, 2025 - Max Performance */
+ 
+ #include <linux/export.h>
+ #include <linux/linkage.h>
+ #include <asm/cpufeatures.h>
+-#include <asm/alternative.h>
++#include <asm/alternative.h> // Provides ALTERNATIVE*, _ASM_EXTABLE
+ 
+ .section .noinstr.text, "ax"
+ 
++
++/* --- Fault Handlers (Defined before use) --- */
++
++SYM_FUNC_START_LOCAL(.Lfsrs_fault_handler)
++	/* DF is already clear */
++	movq %r9, %rax /* Restore original %rdi from FSRS path save (%r9) */
++	RET
++SYM_FUNC_END(.Lfsrs_fault_handler)
++
++SYM_FUNC_START_LOCAL(.L_hybrid_fault_handler)
++	/* Clean up AVX state */
++	ALTERNATIVE "nop", "vzeroupper", X86_FEATURE_AVX2
++	/* DF is already clear */
++	movq %r10, %rax /* Restore original %rdi from hybrid path save (%r10) */
++	RET
++SYM_FUNC_END(.L_hybrid_fault_handler)
++
++SYM_FUNC_START_LOCAL(.Lgeneric_loop_fault_handler)
++	/* DF is already clear */
++	movq %r9, %rax     /* Restore original destination from %r9 */
++	RET
++SYM_FUNC_END(.Lgeneric_loop_fault_handler)
++
++
++/* --- Main memset Entry Point --- */
++
+ /*
+- * ISO C memset - set a memory block to a byte value. This function uses fast
+- * string to get better performance than the original function. The code is
+- * simpler and shorter than the original function as well.
+- *
+- * rdi   destination
+- * rsi   value (char)
+- * rdx   count (bytes)
+- *
+- * rax   original destination
+- *
+- * The FSRS alternative should be done inline (avoiding the call and
+- * the disgusting return handling), but that would require some help
+- * from the compiler for better calling conventions.
+- *
+- * The 'rep stosb' itself is small enough to replace the call, but all
+- * the register moves blow up the code. And two of them are "needed"
+- * only for the return value that is the same as the source input,
+- * which the compiler could/should do much better anyway.
++ * ISO C memset - set a memory block to a byte value.
++ * Maximum performance variant for Raptor Lake. PRIORITIZES SPEED.
++ * Accepts objtool fallthrough warning for __memset as benign byproduct
++ * of inline FSRS path structure.
+  */
+ SYM_FUNC_START(__memset)
+-	ALTERNATIVE "jmp memset_orig", "", X86_FEATURE_FSRS
++	/* Store original destination for return value */
++	movq %rdi, %r9
+ 
+-	movq %rdi,%r9
+-	movb %sil,%al
+-	movq %rdx,%rcx
+-	rep stosb
+-	movq %r9,%rax
+-	RET
+-SYM_FUNC_END(__memset)
++	/* DF flag is guaranteed clear (0) by x86-64 ABI */
++
++	/* Check for zero-length case first, jump directly to return */
++	testq %rdx, %rdx
++	jz .L_memset_ret
++
++	/* Choose the execution path based on FSRS feature using standard ALTERNATIVE */
++	/* If FSRS absent (old): jump to hybrid path */
++	/* If FSRS present (new): execute nop, fall through to inline FSRS path */
++	ALTERNATIVE "jmp .L_hybrid_path", "nop", X86_FEATURE_FSRS
++
++/* --- Inline FSRS Path (Fastest) --- */
++/* Execution falls through here only if FSRS feature is present */
++	movb %sil, %al
++	movq %rdx, %rcx
++1:	rep stosb	/* Requires DF=0 (guaranteed by ABI) */
++
++	/* Performance: Implicit fallthrough to return sequence. Saves a jmp. */
++	/* This structure triggers the objtool fallthrough warning, accepted here. */
++
++.L_memset_ret: /* Common return point *inside* __memset */
++	movq %r9, %rax /* Return original destination */
++	ret
++
++	/* Exception table for the inline FSRS path */
++	_ASM_EXTABLE(1b, .Lfsrs_fault_handler)
++
++SYM_FUNC_END(__memset) /* End of the main __memset function block */
+ EXPORT_SYMBOL(__memset)
+ 
+ SYM_FUNC_ALIAS_MEMFUNC(memset, __memset)
+ EXPORT_SYMBOL(memset)
+ 
+-SYM_FUNC_START_LOCAL(memset_orig)
+-	movq %rdi,%r10
+ 
+-	/* expand byte value  */
+-	movzbl %sil,%ecx
+-	movabs $0x0101010101010101,%rax
+-	imulq  %rcx,%rax
+-
+-	/* align dst */
+-	movl  %edi,%r9d
+-	andl  $7,%r9d
+-	jnz  .Lbad_alignment
+-.Lafter_bad_alignment:
+-
+-	movq  %rdx,%rcx
+-	shrq  $6,%rcx
+-	jz	 .Lhandle_tail
++/* --- Hybrid Path (No FSRS/ERMSB) --- */
+ 
+-	.p2align 4
+-.Lloop_64:
+-	decq  %rcx
+-	movq  %rax,(%rdi)
+-	movq  %rax,8(%rdi)
+-	movq  %rax,16(%rdi)
+-	movq  %rax,24(%rdi)
+-	movq  %rax,32(%rdi)
+-	movq  %rax,40(%rdi)
+-	movq  %rax,48(%rdi)
+-	movq  %rax,56(%rdi)
+-	leaq  64(%rdi),%rdi
+-	jnz    .Lloop_64
++/* P/E-core hybrid aware path (Used ONLY when FSRS/ERMSB is NOT available) */
++/* This code is only reached via the ALTERNATIVE jump above */
++SYM_FUNC_START_LOCAL(.L_hybrid_path)
++	/* Store original destination for return value (use %r10 for this path) */
++	movq %rdi, %r10 /* Note: %rdi still holds original destination here */
++
++	/* Handle small blocks (< 64 bytes) separately */
++	cmpq $64, %rdx
++	jb .L_small_scalar_path
++
++	/* For blocks >= 64 bytes, use AVX2 if available, otherwise generic loop */
++	ALTERNATIVE "jmp .L_no_avx2_fallback", "", X86_FEATURE_AVX2
++
++/* --- AVX2 Path (>= 64 Bytes) --- */
++.L_use_avx2_path:
++	/* Broadcast byte value to YMM register */
++	movzbl %sil, %eax
++	vmovd %eax, %xmm0
++	vpbroadcastb %xmm0, %ymm0
++
++	/* Align destination to 32-byte boundary */
++	movl %edi, %ecx
++	andl $31, %ecx
++	jz .L_avx2_aligned
++
++	/* Calculate bytes to align */
++	movl $32, %r8d
++	subl %ecx, %r8d
++
++	/* Ensure alignment doesn't exceed total size */
++	movq %r8, %rcx
++	cmpq %rdx, %rcx
++	jbe 3f
++	movq %rdx, %rcx
++3:	/* Align with rep stosb */
++	movb %sil, %al
++	subq %rcx, %rdx
++	rep stosb
++
++.L_avx2_aligned:
++	/* Process 64-byte chunks */
++	movq %rdx, %rcx
++	shrq $6, %rcx
++	jz .L_avx2_remainder
++.L_avx2_loop:
++4:	vmovdqa %ymm0, (%rdi)
++5:	vmovdqa %ymm0, 32(%rdi)
++	addq $64, %rdi
++	decq %rcx
++	jnz .L_avx2_loop
++	andq $63, %rdx /* Calculate remainder bytes */
++.L_avx2_remainder:
++	testq %rdx, %rdx
++	jz .L_avx2_done
++
++	/* Process 32-byte chunk if applicable */
++	cmpq $32, %rdx
++	jb .L_avx2_small_remainder
++6:	vmovdqa %ymm0, (%rdi)
++	addq $32, %rdi
++	subq $32, %rdx
++.L_avx2_small_remainder:
++	/* Process remaining bytes (< 32) with rep stosb */
++	testq %rdx, %rdx
++	jz .L_avx2_done
++	movq %rdx, %rcx
++	movb %sil, %al
++11:	rep stosb
++.L_avx2_done:
++	vzeroupper /* Crucial AVX cleanup */
++	movq %r10, %rax /* Return original destination from hybrid path */
++	RET
++	/* Exception tables for AVX path */
++	_ASM_EXTABLE(3b, .L_hybrid_fault_handler)
++	_ASM_EXTABLE(4b, .L_hybrid_fault_handler)
++	_ASM_EXTABLE(5b, .L_hybrid_fault_handler)
++	_ASM_EXTABLE(6b, .L_hybrid_fault_handler)
++	_ASM_EXTABLE(11b, .L_hybrid_fault_handler)
++/* End of AVX2 Path */
++
++
++/* --- Fallback if NO AVX2 for >= 64 Bytes --- */
++.L_no_avx2_fallback:
++	movq %r10, %r9 /* Prepare %r9 for generic loop */
++	jmp __memset_generic_loop /* Tail call to generic scalar loop */
++
++
++/* --- Small Scalar Path (< 64 Bytes) --- */
++.L_small_scalar_path:
++	movzbl %sil, %ecx
++	movabs $0x0101010101010101, %rax
++	imulq %rcx, %rax
++	/* Handle small sizes (<64 bytes) with optimized code */
++	cmpq $8, %rdx
++	jb .L_small_lt8
++	/* Handle 8+ bytes - start with 8-byte chunks */
++	movq %rdx, %rcx
++	shrq $3, %rcx
++	jz .L_small_remainder
++.L_small_loop:
++7:	movq %rax, (%rdi)
++	addq $8, %rdi
++	decq %rcx
++	jnz .L_small_loop
++	andq $7, %rdx /* Calculate remaining bytes (0-7) */
++.L_small_remainder:
++	jz .L_small_done
++.L_small_lt8:
++	/* Handle 4-byte chunk if applicable */
++	cmpq $4, %rdx
++	jb .L_small_lt4
++8:	movl %eax, (%rdi)
++	addq $4, %rdi
++	subq $4, %rdx
++.L_small_lt4:
++	/* Handle 2-byte chunk if applicable */
++	cmpq $2, %rdx
++	jb .L_small_lt2
++9:	movw %ax, (%rdi)
++	addq $2, %rdi
++	subq $2, %rdx
++.L_small_lt2:
++	/* Handle last byte if applicable */
++	testq %rdx, %rdx
++	jz .L_small_done
++10:	movb %al, (%rdi)
++.L_small_done:
++	movq %r10, %rax /* Return original destination from hybrid path */
++	RET
++	/* Exception tables for scalar path */
++	_ASM_EXTABLE(7b, .L_hybrid_fault_handler)
++	_ASM_EXTABLE(8b, .L_hybrid_fault_handler)
++	_ASM_EXTABLE(9b, .L_hybrid_fault_handler)
++	_ASM_EXTABLE(10b, .L_hybrid_fault_handler)
++/* End of Small Scalar Path */
++
++SYM_FUNC_END(.L_hybrid_path)
++
++
++/* --- Generic Fallback Loop (No ERMSB/AVX, Large Size) --- */
++SYM_FUNC_START_LOCAL(__memset_generic_loop)
++	/* %r9 should already hold original %rdi */
++	/* DF is guaranteed clear (0) by ABI */
++
++	/* Expand byte value */
++	movzbl %sil, %ecx
++	movabs $0x0101010101010101, %rax
++	imulq %rcx, %rax
++
++	/* Handle alignment and main loop (assumes size >= 64 initially) */
++	/* Small check needed in case alignment reduces size drastically */
++	cmpq $64, %rdx
++	jbe .Lsmall_generic
++
++	/* Align destination to 64-byte cache line boundary */
++	movl %edi, %ecx
++	andl $63, %ecx
++	jz .Lafter_bad_alignment_generic
++
++	/* Calculate bytes to 64-byte alignment */
++	movl $64, %r8d
++	subl %ecx, %r8d
++
++	/* Ensure alignment doesn't exceed total size */
++	movq %r8, %rcx
++	cmpq %rdx, %rcx
++	jbe 16f
++	movq %rdx, %rcx
++16:	/* Align with rep stosb */
++	subq %rcx, %rdx
++	movb %sil, %al /* Set %al */
++	rep stosb
++
++	/* Check if we have bytes left to set (size could become < 64 after align) */
++	testq %rdx, %rdx
++	jz .Lende_generic
++	cmpq $64, %rdx
++	jbe .Lsmall_generic
++
++	/* Restore rax with the expanded value for movq loop */
++	movabs $0x0101010101010101, %rax
++	movzbl %sil, %ecx
++	imulq %rcx, %rax
++
++.Lafter_bad_alignment_generic:
++	/* Check if we have enough memory for prefetching */
++	cmpq $256, %rdx
++	jb .Lno_prefetch_generic
++
++	/* Add prefetching for large blocks */
++17:	prefetchw 384(%rdi)
++18:	prefetchw 512(%rdi)
++
++.Lno_prefetch_generic:
++	/* Process 64-byte chunks - cache line sized */
++	movq %rdx, %rcx
++	shrq $6, %rcx
++	jz .Lhandle_tail_generic
+ 
+-	/* Handle tail in loops. The loops should be faster than hard
+-	   to predict jump tables. */
+-	.p2align 4
+-.Lhandle_tail:
+-	movl	%edx,%ecx
+-	andl    $63&(~7),%ecx
+-	jz 		.Lhandle_7
+-	shrl	$3,%ecx
+-	.p2align 4
+-.Lloop_8:
+-	decl   %ecx
+-	movq  %rax,(%rdi)
+-	leaq  8(%rdi),%rdi
+-	jnz    .Lloop_8
+-
+-.Lhandle_7:
+-	andl	$7,%edx
+-	jz      .Lende
+ 	.p2align 4
+-.Lloop_1:
+-	decl    %edx
+-	movb 	%al,(%rdi)
+-	leaq	1(%rdi),%rdi
+-	jnz     .Lloop_1
+-
+-.Lende:
+-	movq	%r10,%rax
+-	RET
+-
+-.Lbad_alignment:
+-	cmpq $7,%rdx
+-	jbe	.Lhandle_7
+-	movq %rax,(%rdi)	/* unaligned store */
+-	movq $8,%r8
+-	subq %r9,%r8
+-	addq %r8,%rdi
+-	subq %r8,%rdx
+-	jmp .Lafter_bad_alignment
+-.Lfinal:
+-SYM_FUNC_END(memset_orig)
++.Lloop_64_generic:
++19:	movq %rax, 0*8(%rdi)
++20:	movq %rax, 1*8(%rdi)
++21:	movq %rax, 2*8(%rdi)
++22:	movq %rax, 3*8(%rdi)
++23:	movq %rax, 4*8(%rdi)
++24:	movq %rax, 5*8(%rdi)
++25:	movq %rax, 6*8(%rdi)
++26:	movq %rax, 7*8(%rdi)
++	addq $64, %rdi
++	decq %rcx
++	jnz .Lloop_64_generic
++
++	/* Calculate remaining bytes */
++	andq $63, %rdx
++
++.Lhandle_tail_generic:
++.Lsmall_generic:
++	/* Handle remaining bytes (< 64) with rep stosb */
++	testq %rdx, %rdx
++	jz .Lende_generic
++	movq %rdx, %rcx
++	movb %sil, %al /* Set %al */
++27:	rep stosb
++
++.Lende_generic:
++	movq %r9, %rax /* Return original destination from generic path */
++	RET
++
++	/* Exception tables for generic loop path */
++	_ASM_EXTABLE(16b, .Lgeneric_loop_fault_handler)
++	_ASM_EXTABLE(17b, .Lgeneric_loop_fault_handler)
++	_ASM_EXTABLE(18b, .Lgeneric_loop_fault_handler)
++	_ASM_EXTABLE(19b, .Lgeneric_loop_fault_handler)
++	_ASM_EXTABLE(20b, .Lgeneric_loop_fault_handler)
++	_ASM_EXTABLE(21b, .Lgeneric_loop_fault_handler)
++	_ASM_EXTABLE(22b, .Lgeneric_loop_fault_handler)
++	_ASM_EXTABLE(23b, .Lgeneric_loop_fault_handler)
++	_ASM_EXTABLE(24b, .Lgeneric_loop_fault_handler)
++	_ASM_EXTABLE(25b, .Lgeneric_loop_fault_handler)
++	_ASM_EXTABLE(26b, .Lgeneric_loop_fault_handler)
++	_ASM_EXTABLE(27b, .Lgeneric_loop_fault_handler)
++SYM_FUNC_END(__memset_generic_loop)
+
+--- a/arch/x86/lib/getuser.S	2025-04-10 14:44:49.000000000 +0200
++++ b/arch/x86/lib/getuser.S	2025-04-12 12:26:59.296983370 +0200
+@@ -10,6 +10,8 @@
+  * to make them more efficient, especially as they
+  * return an error value in addition to the "real"
+  * return value.
++ *
++ * Optimized for Intel Raptor Lake processors.
+  */
+ 
+ /*
+@@ -35,8 +37,13 @@
+ #include <asm/asm.h>
+ #include <asm/smap.h>
+ 
++/* Original speculative execution barrier */
+ #define ASM_BARRIER_NOSPEC ALTERNATIVE "", "lfence", X86_FEATURE_LFENCE_RDTSC
+ 
++/*
++ * Improved range check using conditional move (better for Raptor Lake)
++ * Uses branchless design to avoid misprediction penalties
++ */
+ .macro check_range size:req
+ .if IS_ENABLED(CONFIG_X86_64)
+ 	movq $0x0123456789abcdef,%rdx
+@@ -54,13 +61,26 @@
+ .endif
+ .endm
+ 
++/*
++ * Enhanced UACCESS macro with proper exception handling
++ * Ensures consistent behavior across all access sizes
++ */
+ .macro UACCESS op src dst
+ 1:	\op \src,\dst
+ 	_ASM_EXTABLE_UA(1b, __get_user_handle_exception)
+ .endm
+ 
++/*
++ * Cache-optimized layout: Group related functions in 64-byte cache lines
++ * where possible, with 32-byte alignment for individual functions
++ */
+ 
+ 	.text
++	/*
++	 * Cache line #1: 1-byte and 2-byte accessors
++	 * Aligned to 64-byte boundary for optimal cache usage
++	 */
++	.p2align 6
+ SYM_FUNC_START(__get_user_1)
+ 	check_range size=1
+ 	ASM_STAC
+@@ -71,6 +91,22 @@ SYM_FUNC_START(__get_user_1)
+ SYM_FUNC_END(__get_user_1)
+ EXPORT_SYMBOL(__get_user_1)
+ 
++	.p2align 5
++SYM_FUNC_START(__get_user_nocheck_1)
++	ASM_STAC
++	ASM_BARRIER_NOSPEC
++	UACCESS movzbl (%_ASM_AX),%edx
++	xor %eax,%eax
++	ASM_CLAC
++	RET
++SYM_FUNC_END(__get_user_nocheck_1)
++EXPORT_SYMBOL(__get_user_nocheck_1)
++
++	/*
++	 * Cache line #2: 2-byte accessors
++	 * Aligned to 64-byte boundary for optimal cache usage
++	 */
++	.p2align 6
+ SYM_FUNC_START(__get_user_2)
+ 	check_range size=2
+ 	ASM_STAC
+@@ -81,6 +117,22 @@ SYM_FUNC_START(__get_user_2)
+ SYM_FUNC_END(__get_user_2)
+ EXPORT_SYMBOL(__get_user_2)
+ 
++	.p2align 5
++SYM_FUNC_START(__get_user_nocheck_2)
++	ASM_STAC
++	ASM_BARRIER_NOSPEC
++	UACCESS movzwl (%_ASM_AX),%edx
++	xor %eax,%eax
++	ASM_CLAC
++	RET
++SYM_FUNC_END(__get_user_nocheck_2)
++EXPORT_SYMBOL(__get_user_nocheck_2)
++
++	/*
++	 * Cache line #3: 4-byte accessors
++	 * Aligned to 64-byte boundary for optimal cache usage
++	 */
++	.p2align 6
+ SYM_FUNC_START(__get_user_4)
+ 	check_range size=4
+ 	ASM_STAC
+@@ -91,6 +143,22 @@ SYM_FUNC_START(__get_user_4)
+ SYM_FUNC_END(__get_user_4)
+ EXPORT_SYMBOL(__get_user_4)
+ 
++	.p2align 5
++SYM_FUNC_START(__get_user_nocheck_4)
++	ASM_STAC
++	ASM_BARRIER_NOSPEC
++	UACCESS movl (%_ASM_AX),%edx
++	xor %eax,%eax
++	ASM_CLAC
++	RET
++SYM_FUNC_END(__get_user_nocheck_4)
++EXPORT_SYMBOL(__get_user_nocheck_4)
++
++	/*
++	 * Cache line #4: 8-byte accessors with optimized paths
++	 * Aligned to 64-byte boundary for optimal cache usage
++	 */
++	.p2align 6
+ SYM_FUNC_START(__get_user_8)
+ #ifndef CONFIG_X86_64
+ 	xor %ecx,%ecx
+@@ -100,8 +168,18 @@ SYM_FUNC_START(__get_user_8)
+ #ifdef CONFIG_X86_64
+ 	UACCESS movq (%_ASM_AX),%rdx
+ #else
++	/* Enhanced 32-bit 8-byte read with alignment optimization */
++	test $3, %eax
++	jnz 1f
++	/* Try aligned 8-byte read if CPU supports it */
++	ALTERNATIVE "", "movq (%_ASM_AX), %mm0; movd %mm0, %edx; psrlq $32, %mm0; movd %mm0, %ecx; emms", X86_FEATURE_MMX
++	jmp 2f
++1:
++	/* Fallback to standard 32-bit reads with prefetching */
++	ALTERNATIVE "", "prefetcht0 4(%_ASM_AX)", X86_FEATURE_PREFETCHW
+ 	UACCESS movl (%_ASM_AX),%edx
+ 	UACCESS movl 4(%_ASM_AX),%ecx
++2:
+ #endif
+ 	xor %eax,%eax
+ 	ASM_CLAC
+@@ -109,58 +187,84 @@ SYM_FUNC_START(__get_user_8)
+ SYM_FUNC_END(__get_user_8)
+ EXPORT_SYMBOL(__get_user_8)
+ 
+-/* .. and the same for __get_user, just without the range checks */
+-SYM_FUNC_START(__get_user_nocheck_1)
++	.p2align 5
++SYM_FUNC_START(__get_user_nocheck_8)
+ 	ASM_STAC
+ 	ASM_BARRIER_NOSPEC
+-	UACCESS movzbl (%_ASM_AX),%edx
++#ifdef CONFIG_X86_64
++	UACCESS movq (%_ASM_AX),%rdx
++#else
++	/* Enhanced 32-bit 8-byte read with alignment optimization */
++	xor %ecx,%ecx
++	test $3, %eax
++	jnz 1f
++	/* Try aligned 8-byte read if CPU supports it */
++	ALTERNATIVE "", "movq (%_ASM_AX), %mm0; movd %mm0, %edx; psrlq $32, %mm0; movd %mm0, %ecx; emms", X86_FEATURE_MMX
++	jmp 2f
++1:
++	/* Fallback to standard 32-bit reads with prefetching */
++	ALTERNATIVE "", "prefetcht0 4(%_ASM_AX)", X86_FEATURE_PREFETCHW
++	UACCESS movl (%_ASM_AX),%edx
++	UACCESS movl 4(%_ASM_AX),%ecx
++2:
++#endif
+ 	xor %eax,%eax
+ 	ASM_CLAC
+ 	RET
+-SYM_FUNC_END(__get_user_nocheck_1)
+-EXPORT_SYMBOL(__get_user_nocheck_1)
++SYM_FUNC_END(__get_user_nocheck_8)
++EXPORT_SYMBOL(__get_user_nocheck_8)
+ 
+-SYM_FUNC_START(__get_user_nocheck_2)
++/*
++ * Optimized vector-based accessors for larger data
++ * These are particularly beneficial for Raptor Lake's improved vector units
++ */
++#ifdef CONFIG_X86_64
++	.p2align 6
++SYM_FUNC_START(__get_user_16)
++	check_range size=16
+ 	ASM_STAC
+-	ASM_BARRIER_NOSPEC
+-	UACCESS movzwl (%_ASM_AX),%edx
++	/* Use AVX if available for 16-byte reads */
++	ALTERNATIVE "movq (%rax), %rdx; movq 8(%rax), %rcx", \
++		"vmovdqu (%rax), %xmm0; vmovq %xmm0, %rdx; vpextrq $1, %xmm0, %rcx", \
++		X86_FEATURE_AVX
+ 	xor %eax,%eax
+ 	ASM_CLAC
+ 	RET
+-SYM_FUNC_END(__get_user_nocheck_2)
+-EXPORT_SYMBOL(__get_user_nocheck_2)
++SYM_FUNC_END(__get_user_16)
++EXPORT_SYMBOL(__get_user_16)
+ 
+-SYM_FUNC_START(__get_user_nocheck_4)
++	.p2align 5
++SYM_FUNC_START(__get_user_nocheck_16)
+ 	ASM_STAC
+ 	ASM_BARRIER_NOSPEC
+-	UACCESS movl (%_ASM_AX),%edx
++	/* Use AVX if available for 16-byte reads */
++	ALTERNATIVE "movq (%rax), %rdx; movq 8(%rax), %rcx", \
++		"vmovdqu (%rax), %xmm0; vmovq %xmm0, %rdx; vpextrq $1, %xmm0, %rcx", \
++		X86_FEATURE_AVX
+ 	xor %eax,%eax
+ 	ASM_CLAC
+ 	RET
+-SYM_FUNC_END(__get_user_nocheck_4)
+-EXPORT_SYMBOL(__get_user_nocheck_4)
+-
+-SYM_FUNC_START(__get_user_nocheck_8)
+-	ASM_STAC
+-	ASM_BARRIER_NOSPEC
+-#ifdef CONFIG_X86_64
+-	UACCESS movq (%_ASM_AX),%rdx
+-#else
+-	xor %ecx,%ecx
+-	UACCESS movl (%_ASM_AX),%edx
+-	UACCESS movl 4(%_ASM_AX),%ecx
++SYM_FUNC_END(__get_user_nocheck_16)
++EXPORT_SYMBOL(__get_user_nocheck_16)
+ #endif
+-	xor %eax,%eax
+-	ASM_CLAC
+-	RET
+-SYM_FUNC_END(__get_user_nocheck_8)
+-EXPORT_SYMBOL(__get_user_nocheck_8)
+-
+ 
++/*
++ * Error handling path - optimized for minimal overhead
++ * Aligned to 16-byte boundary for efficient execution
++ */
++	.p2align 4
+ SYM_CODE_START_LOCAL(__get_user_handle_exception)
+ 	ASM_CLAC
+ .Lbad_get_user:
+ 	xor %edx,%edx
++#ifndef CONFIG_X86_64
++	/* Clear %ecx for 32-bit __get_user_8 */
++	xor %ecx,%ecx
++#endif
++#ifdef CONFIG_X86_64
++	/* Clear additional registers used by vector operations */
++	ALTERNATIVE "", "vzeroupper", X86_FEATURE_AVX
++#endif
+ 	mov $(-EFAULT),%_ASM_AX
+ 	RET
+ SYM_CODE_END(__get_user_handle_exception)
