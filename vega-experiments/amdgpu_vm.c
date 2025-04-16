@@ -179,14 +179,9 @@ int amdgpu_vm_set_pasid(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 static void amdgpu_vm_bo_evicted(struct amdgpu_vm_bo_base *vm_bo)
 {
 	struct amdgpu_vm *vm = vm_bo->vm;
-	struct amdgpu_bo *bo = vm_bo->bo;
-
 	vm_bo->moved = true;
 	spin_lock(&vm_bo->vm->status_lock);
-	if (bo->tbo.type == ttm_bo_type_kernel)
-		list_move(&vm_bo->vm_status, &vm->evicted);
-	else
-		list_move_tail(&vm_bo->vm_status, &vm->evicted);
+	list_move_tail(&vm_bo->vm_status, &vm->evicted);
 	spin_unlock(&vm_bo->vm->status_lock);
 }
 /**
@@ -354,8 +349,12 @@ void amdgpu_vm_bo_update_shared(struct amdgpu_bo *bo)
 {
 	struct amdgpu_vm_bo_base *base;
 
-	for (base = bo->vm_bo; base; base = base->next)
+	for (base = bo->vm_bo; base; base = base->next) {
+		bool shared = drm_gem_object_is_shared_for_memory_stats(&bo->tbo.base);
+		if (base->shared == shared)
+			continue;
 		amdgpu_vm_update_shared(base);
+	}
 }
 
 /**
@@ -375,13 +374,10 @@ static void amdgpu_vm_update_stats_locked(struct amdgpu_vm_bo_base *base,
 	struct amdgpu_vm *vm = base->vm;
 	struct amdgpu_bo *bo = base->bo;
 	int64_t size;
-	uint32_t bo_memtype; /* The BO's preferred/intended placement */
-	uint32_t stat_memtype; /* The placement type for resident/evicted stats */
-	/* Get adev for logging context, assume vm and root.bo are valid */
+	uint32_t bo_memtype;
+	uint32_t stat_memtype;
 	struct amdgpu_device *adev = vm ? amdgpu_ttm_adev(vm->root.bo->tbo.bdev) : NULL;
 
-
-	/* Can happen if BO is destroyed before VM or VM context is gone */
 	if (!bo || !vm || !adev)
 		return;
 
@@ -389,70 +385,40 @@ static void amdgpu_vm_update_stats_locked(struct amdgpu_vm_bo_base *base,
 	bo_memtype = amdgpu_bo_mem_stats_placement(bo);
 
 	/* Update private/shared count based on the preferred placement */
-	if (base->shared)
-		vm->stats[bo_memtype].drm.shared += size;
-	else
-		vm->stats[bo_memtype].drm.private += size;
+	if (base->shared) {
+		vm->stats[bo_memtype].drm.shared = max(0LL, (long long)vm->stats[bo_memtype].drm.shared + size);
+	} else {
+		vm->stats[bo_memtype].drm.private = max(0LL, (long long)vm->stats[bo_memtype].drm.private + size);
+	}
 
-	/* Determine the memory type for resident/evicted/purgeable stats */
 	if (sign == 1) {
-		/* --- Incrementing --- */
-		/* Use current resource if valid, otherwise assume preferred */
 		if (res && res->mem_type < __AMDGPU_PL_NUM) {
 			stat_memtype = res->mem_type;
 		} else {
-			/* BO is being added but has no TTM resource yet? Count as preferred */
 			stat_memtype = bo_memtype;
-			/* Note: This BO is not 'resident' anywhere yet in TTM terms */
-			/* We only update the private/shared counts above */
-			/* Let's skip resident/evicted/purgeable update for now in this unusual case */
-			/* OR should we count it as resident in preferred? Let's stick to TTM view */
-			/* If res is NULL, it implies not resident in TTM PL_* domains */
-			/* We'll store the intended type, but not mark resident yet */
 			base->last_stat_memtype = stat_memtype;
-			return; // Skip rest of updates if no resource on increment
+			return;
 		}
-		/* Store the type used for this increment */
 		base->last_stat_memtype = stat_memtype;
-
-	} else { /* --- Decrementing (sign == -1) --- */
-		/* Use the LAST stored type */
+	} else {
 		stat_memtype = base->last_stat_memtype;
-
-		/* Fallback if last_stat_memtype was somehow never set */
 		if (stat_memtype >= __AMDGPU_PL_NUM) {
-			/* === FIX: Use %lu for unsigned long === */
 			dev_warn_once(adev->dev, "VM stats decrementing BO %p (size %lu) with invalid last_stat_memtype, falling back to bo_memtype %u\n",
 						  bo, amdgpu_bo_size(bo), bo_memtype);
 			stat_memtype = bo_memtype;
-			/* Set last_stat_memtype to the fallback used, for consistency */
 			base->last_stat_memtype = stat_memtype;
 		}
-		/* We don't reset last_stat_memtype after decrement, its last state remains */
 	}
 
-	/* --- Update resident/evicted/purgeable based on determined stat_memtype --- */
-
-	/* Update resident count for the determined stat_memtype */
-	/* Only apply if stat_memtype is a valid TTM placement */
 	if (stat_memtype < __AMDGPU_PL_NUM) {
-		vm->stats[stat_memtype].drm.resident += size;
-
-		/* Update purgeable count if applicable */
+		vm->stats[stat_memtype].drm.resident = max(0LL, (long long)vm->stats[stat_memtype].drm.resident + size);
 		if (bo->flags & AMDGPU_GEM_CREATE_DISCARDABLE) {
-			/* size is negative during decrement, positive during increment */
-			vm->stats[stat_memtype].drm.purgeable += size;
+			vm->stats[stat_memtype].drm.purgeable = max(0LL, (long long)vm->stats[stat_memtype].drm.purgeable + size);
 		}
-
-		/* Update evicted count for the preferred domain (bo_memtype) if */
-		/* the current/last known placement (stat_memtype) doesn't match it. */
 		if (!(bo->preferred_domains & amdgpu_mem_type_to_domain(stat_memtype))) {
-			vm->stats[bo_memtype].evicted += size;
+			vm->stats[bo_memtype].evicted = max(0LL, (long long)vm->stats[bo_memtype].evicted + size);
 		}
 	} else {
-		/* This case might occur if the BO was counted but never placed */
-		/* E.g., if we skipped the resident update during increment */
-		/* === FIX: Use %lu for unsigned long === */
 		dev_warn_once(adev->dev, "VM stats skipping resident/evicted update for BO %p (size %lu) due to invalid stat_memtype %u\n",
 					  bo, amdgpu_bo_size(bo), stat_memtype);
 	}
@@ -1602,75 +1568,51 @@ int amdgpu_vm_clear_freed(struct amdgpu_device *adev,
 	bool range_active = false;
 	int r = 0;
 
-	/* Early exit if nothing to do */
-	if (unlikely(list_empty(&vm->freed)))
+	if (list_empty(&vm->freed))
 		return 0;
 
-	/*
-	 * Implicitly sync to command submissions in the same VM before
-	 * unmapping.
-	 */
 	amdgpu_sync_create(&sync);
 	r = amdgpu_sync_resv(adev, &sync, vm->root.bo->tbo.base.resv,
 						 AMDGPU_SYNC_EQ_OWNER, vm);
-	if (unlikely(r))
+	if (r)
 		goto error_free_sync;
 
-	/* Transfer freed mappings to a temporary list for sorting */
 	spin_lock(&vm->status_lock);
 	list_splice_init(&vm->freed, &sorted_list);
 	spin_unlock(&vm->status_lock);
 
-	/* Sort the list by start address */
 	list_sort(NULL, &sorted_list, compare_mappings);
 
-	/* Iterate through sorted list, merge ranges, and update */
 	list_for_each_entry_safe(mapping, tmp_mapping, &sorted_list, list) {
-		list_del(&mapping->list); // Remove from sorted list
-
+		list_del(&mapping->list);
 		if (!range_active) {
-			/* Start a new consolidated range */
 			current_start = mapping->start;
 			current_end = mapping->last;
 			range_active = true;
+		} else if (mapping->start <= current_end + 1) {
+			current_end = max(current_end, mapping->last);
 		} else {
-			/* Check if current mapping overlaps or is adjacent */
-			if (likely(mapping->start <= current_end + 1)) {
-				/* Merge: Extend the current range */
-				current_end = max(current_end, mapping->last);
-			} else {
-				/* Gap detected: Process the previous consolidated range */
-				// trace_amdgpu_vm_clear_freed(vm, current_start, current_end + 1); // Removed non-existent tracepoint
-				r = amdgpu_vm_update_range(adev, vm, false, false, true, false,
-										   &sync, current_start, current_end,
-							   0, 0, 0, NULL, NULL, &f);
-				if (unlikely(r)) {
-					/* Free the current mapping before exiting */
-					amdgpu_vm_free_mapping(adev, vm, mapping, f);
-					goto error_cleanup_list;
-				}
-
-				/* Start a new range with the current mapping */
-				current_start = mapping->start;
-				current_end = mapping->last;
+			r = amdgpu_vm_update_range(adev, vm, false, false, true, false,
+									   &sync, current_start, current_end,
+							  0, 0, 0, NULL, NULL, &f);
+			if (r) {
+				amdgpu_vm_free_mapping(adev, vm, mapping, f);
+				goto error_cleanup_list;
 			}
+			current_start = mapping->start;
+			current_end = mapping->last;
 		}
-
-		/* Free the original mapping struct after processing/merging */
 		amdgpu_vm_free_mapping(adev, vm, mapping, f);
 	}
 
-	/* Process the last consolidated range */
 	if (range_active) {
-		// trace_amdgpu_vm_clear_freed(vm, current_start, current_end + 1); // Removed non-existent tracepoint
 		r = amdgpu_vm_update_range(adev, vm, false, false, true, false,
 								   &sync, current_start, current_end,
 							 0, 0, 0, NULL, NULL, &f);
-		if (unlikely(r))
+		if (r)
 			goto error_cleanup_list;
 	}
 
-	/* Update output fence if requested and we got a new fence */
 	if (fence && f) {
 		dma_fence_put(*fence);
 		*fence = f;
@@ -1683,12 +1625,11 @@ int amdgpu_vm_clear_freed(struct amdgpu_device *adev,
 	return r;
 
 	error_cleanup_list:
-	/* If an error occurred, free any remaining unprocessed mappings */
 	list_for_each_entry_safe(mapping, tmp_mapping, &sorted_list, list) {
 		list_del(&mapping->list);
 		amdgpu_vm_free_mapping(adev, vm, mapping, f);
 	}
-	dma_fence_put(f); /* Put fence acquired before error */
+	dma_fence_put(f);
 	goto error_free_sync;
 }
 
@@ -2105,10 +2046,10 @@ int amdgpu_vm_bo_unmap(struct amdgpu_device *adev,
  * 0 for success, error for failure.
  */
 int amdgpu_vm_bo_clear_mappings(struct amdgpu_device *adev,
-				struct amdgpu_vm *vm,
-				uint64_t saddr, uint64_t size)
+								struct amdgpu_vm *vm,
+								uint64_t saddr, uint64_t size)
 {
-	struct amdgpu_bo_va_mapping *before, *after, *tmp, *next;
+	struct amdgpu_bo_va_mapping *before = NULL, *after = NULL, *tmp, *next;
 	LIST_HEAD(removed);
 	uint64_t eaddr;
 	int r;
@@ -2122,22 +2063,14 @@ int amdgpu_vm_bo_clear_mappings(struct amdgpu_device *adev,
 
 	/* Allocate all the needed memory */
 	before = kzalloc(sizeof(*before), GFP_KERNEL);
-	if (!before)
-		return -ENOMEM;
-	INIT_LIST_HEAD(&before->list);
-
 	after = kzalloc(sizeof(*after), GFP_KERNEL);
-	if (!after) {
-		kfree(before);
-		return -ENOMEM;
-	}
+
+	INIT_LIST_HEAD(&before->list);
 	INIT_LIST_HEAD(&after->list);
 
-	/* Now gather all removed mappings */
 	tmp = amdgpu_vm_it_iter_first(&vm->va, saddr, eaddr);
 	while (tmp) {
-		/* Remember mapping split at the start */
-		if (tmp->start < saddr) {
+		if (before && tmp->start < saddr) {
 			before->start = tmp->start;
 			before->last = saddr - 1;
 			before->offset = tmp->offset;
@@ -2145,64 +2078,44 @@ int amdgpu_vm_bo_clear_mappings(struct amdgpu_device *adev,
 			before->bo_va = tmp->bo_va;
 			list_add(&before->list, &tmp->bo_va->invalids);
 		}
-
-		/* Remember mapping split at the end */
-		if (tmp->last > eaddr) {
+		if (after && tmp->last > eaddr) {
 			after->start = eaddr + 1;
 			after->last = tmp->last;
-			after->offset = tmp->offset;
-			after->offset += (after->start - tmp->start) << PAGE_SHIFT;
+			after->offset = tmp->offset + ((after->start - tmp->start) << PAGE_SHIFT);
 			after->flags = tmp->flags;
 			after->bo_va = tmp->bo_va;
 			list_add(&after->list, &tmp->bo_va->invalids);
 		}
-
 		list_del(&tmp->list);
 		list_add(&tmp->list, &removed);
-
 		tmp = amdgpu_vm_it_iter_next(tmp, saddr, eaddr);
 	}
 
-	/* And free them up */
 	list_for_each_entry_safe(tmp, next, &removed, list) {
 		amdgpu_vm_it_remove(tmp, &vm->va);
 		list_del(&tmp->list);
-
-		if (tmp->start < saddr)
-		    tmp->start = saddr;
-		if (tmp->last > eaddr)
-		    tmp->last = eaddr;
-
 		tmp->bo_va = NULL;
 		list_add(&tmp->list, &vm->freed);
 		trace_amdgpu_vm_bo_unmap(NULL, tmp);
 	}
 
-	/* Insert partial mapping before the range */
-	if (!list_empty(&before->list)) {
+	if (before && !list_empty(&before->list)) {
 		struct amdgpu_bo *bo = before->bo_va->base.bo;
-
 		amdgpu_vm_it_insert(before, &vm->va);
 		if (before->flags & AMDGPU_PTE_PRT_FLAG(adev))
 			amdgpu_vm_prt_get(adev);
-
-		if (amdgpu_vm_is_bo_always_valid(vm, bo) &&
-		    !before->bo_va->base.moved)
+		if (amdgpu_vm_is_bo_always_valid(vm, bo) && !before->bo_va->base.moved)
 			amdgpu_vm_bo_moved(&before->bo_va->base);
 	} else {
 		kfree(before);
 	}
 
-	/* Insert partial mapping after the range */
-	if (!list_empty(&after->list)) {
+	if (after && !list_empty(&after->list)) {
 		struct amdgpu_bo *bo = after->bo_va->base.bo;
-
 		amdgpu_vm_it_insert(after, &vm->va);
 		if (after->flags & AMDGPU_PTE_PRT_FLAG(adev))
 			amdgpu_vm_prt_get(adev);
-
-		if (amdgpu_vm_is_bo_always_valid(vm, bo) &&
-		    !after->bo_va->base.moved)
+		if (amdgpu_vm_is_bo_always_valid(vm, bo) && !after->bo_va->base.moved)
 			amdgpu_vm_bo_moved(&after->bo_va->base);
 	} else {
 		kfree(after);
