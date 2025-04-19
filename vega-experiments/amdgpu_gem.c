@@ -506,122 +506,105 @@ amdgpu_vega_optimize_buffer_placement(struct amdgpu_device *adev,
 									  uint64_t              flags,
 									  uint32_t             *domain)
 {
-	uint32_t vram_usage;
-
 	if (!is_hbm2_vega(adev) || !domain)
 		return false;
 
-	vram_usage = amdgpu_vega_get_effective_vram_usage(adev);
+	/* ---------- current VRAM pressure -------------------------------- */
+	uint32_t usage = amdgpu_vega_get_effective_vram_usage(adev);
 
-	/* -------------------------------------------------- *
-	 * 1. Textures / scan‑out                             *
-	 * -------------------------------------------------- */
+	/* background tasks (nice > 4) act as if pressure is +5 pp */
+	if (task_nice(current) > 4 && usage < 95)
+		usage += 5;
+
+	/* ---------- pressure levels -------------------------------------- */
+	const uint32_t PRESS_MID  = 75;  /* proactive eviction for huge compute */
+	const uint32_t PRESS_HI   = amdgpu_vega_vram_pressure_high; /* ≈85 */
+	const uint32_t PRESS_CAT  = 90;  /* catastrophic – may override user   */
+
+	/* ---------- helpers ---------------------------------------------- */
+	#define FORCE_GTT() do { \
+	*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) | \
+	AMDGPU_GEM_DOMAIN_GTT; \
+	} while (0)
+
+	#define MAYBE_EWMA(sz) do { \
+	if ((sz) >= AMDGPU_VEGA_SMALL_BUFFER_SIZE) \
+		pb_account_eviction(); \
+	} while (0)
+
+	/* Respect explicit user domain unless pressure is catastrophic */
+	if (*domain && usage < PRESS_CAT)
+		return true;
+
+	/* ------------------------------------------------------------------
+	 * 1. Textures / scan‑out
+	 *    Keep in VRAM until usage >= 90 % and size < 8 MiB
+	 * ---------------------------------------------------------------- */
 	if (is_vega_texture(flags)) {
-		if (vram_usage >= amdgpu_vega_vram_pressure_high &&
-			size < AMDGPU_VEGA_MEDIUM_BUFFER_SIZE) {
-			*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) |
-			AMDGPU_GEM_DOMAIN_GTT;
-		if (size >= AMDGPU_VEGA_SMALL_BUFFER_SIZE)
-			pb_account_eviction();
-			} else {
-				*domain |= AMDGPU_GEM_DOMAIN_VRAM;
-			}
-			return true;
+		if (usage >= PRESS_CAT && size < (8ULL << 20)) {
+			FORCE_GTT();
+			MAYBE_EWMA(size);
+		} else {
+			*domain |= AMDGPU_GEM_DOMAIN_VRAM;
+		}
+		return true;
 	}
 
-	/* -------------------------------------------------- *
-	 * 2. Compute buffers (NO_CPU_ACCESS)                 *
-	 * -------------------------------------------------- */
+	/* ------------------------------------------------------------------
+	 * 2. Compute  (NO_CPU_ACCESS)
+	 *    Large >64 MiB leaves at 75 %, medium >16 MiB at 85 %
+	 * ---------------------------------------------------------------- */
 	if (is_vega_compute(flags)) {
-		if (vram_usage >= amdgpu_vega_vram_pressure_high &&
-			size > AMDGPU_VEGA_LARGE_BUFFER_SIZE) {
-			*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) |
-			AMDGPU_GEM_DOMAIN_GTT;
-		if (size >= AMDGPU_VEGA_SMALL_BUFFER_SIZE)
-			pb_account_eviction();
+		if ((usage >= PRESS_HI  && size > (16ULL << 20)) ||
+			(usage >= PRESS_MID && size > (64ULL << 20))) {
+			FORCE_GTT();
+		MAYBE_EWMA(size);
 			} else {
 				*domain |= AMDGPU_GEM_DOMAIN_VRAM;
 			}
 			return true;
 	}
 
-	/* -------------------------------------------------- *
-	 * 3. CPU‑accessible buffers                          *
-	 * -------------------------------------------------- */
+	/* ------------------------------------------------------------------
+	 * 3. CPU‑accessible
+	 * ---------------------------------------------------------------- */
 	if (is_vega_cpu_access(flags)) {
-		/* small ≤ 1 MiB */
-		if (size <= AMDGPU_VEGA_SMALL_BUFFER_SIZE) {
-			if (vram_usage >= amdgpu_vega_vram_pressure_high) {
-				*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) |
-				AMDGPU_GEM_DOMAIN_GTT;
-				/* tiny buffers ignored for bias */
-			} else if (*domain == 0) {
-				*domain |= AMDGPU_GEM_DOMAIN_GTT;
-			}
+		if (size <= AMDGPU_VEGA_SMALL_BUFFER_SIZE) {      /* ≤1 MiB */
+			FORCE_GTT();                     /* always GTT, no EWMA    */
 			return true;
 		}
-		/* medium ≤ 4 MiB */
-		if (size <= AMDGPU_VEGA_MEDIUM_BUFFER_SIZE) {
-			if (vram_usage >= amdgpu_vega_vram_pressure_high) {
-				*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) |
-				AMDGPU_GEM_DOMAIN_GTT;
-				if (size >= AMDGPU_VEGA_SMALL_BUFFER_SIZE)
-					pb_account_eviction();
-			} else if (*domain == 0) {
-				*domain |= AMDGPU_GEM_DOMAIN_VRAM;
-			}
+
+		if (size <= AMDGPU_VEGA_MEDIUM_BUFFER_SIZE) {     /* 1‑4 MiB */
+			if (usage >= PRESS_HI) { FORCE_GTT(); MAYBE_EWMA(size); }
+			else if (*domain == 0)  *domain |= AMDGPU_GEM_DOMAIN_VRAM;
 			return true;
 		}
-		/* large  > 4 MiB */
-		if (vram_usage >= amdgpu_vega_vram_pressure_high) {
-			*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) |
-			AMDGPU_GEM_DOMAIN_GTT;
-			if (size >= AMDGPU_VEGA_SMALL_BUFFER_SIZE)
-				pb_account_eviction();
-		} else if (*domain == 0) {
-			if (size > AMDGPU_VEGA_LARGE_BUFFER_SIZE)
-				*domain |= AMDGPU_GEM_DOMAIN_GTT;
-			else
-				*domain |= AMDGPU_GEM_DOMAIN_VRAM;
-		}
+
+		/* large CPU buffer */
+		if (usage >= PRESS_HI) { FORCE_GTT(); MAYBE_EWMA(size); }
+		else if (*domain == 0)  *domain |= AMDGPU_GEM_DOMAIN_VRAM;
 		return true;
 	}
 
-	/* -------------------------------------------------- *
-	 * 4. Generic buffers                                 *
-	 * -------------------------------------------------- */
-	if (size <= AMDGPU_VEGA_SMALL_BUFFER_SIZE) {
-		if (vram_usage >= amdgpu_vega_vram_pressure_high) {
-			*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) |
-			AMDGPU_GEM_DOMAIN_GTT;
-			/* ignore tiny */
-		} else if (*domain == 0) {
-			*domain |= AMDGPU_GEM_DOMAIN_VRAM;
-		}
+	/* ------------------------------------------------------------------
+	 * 4. Generic / uncategorised
+	 * ---------------------------------------------------------------- */
+	if (size <= AMDGPU_VEGA_SMALL_BUFFER_SIZE) {            /* ≤1 MiB */
+		if (usage >= PRESS_HI) { FORCE_GTT(); /* no EWMA */ }
+		else if (*domain == 0)  *domain |= AMDGPU_GEM_DOMAIN_VRAM;
 		return true;
 	}
 
-	if (size <= AMDGPU_VEGA_MEDIUM_BUFFER_SIZE) {
-		if (vram_usage >= amdgpu_vega_vram_pressure_high) {
-			*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) |
-			AMDGPU_GEM_DOMAIN_GTT;
-			if (size >= AMDGPU_VEGA_SMALL_BUFFER_SIZE)
-				pb_account_eviction();
-		} else if (*domain == 0) {
-			*domain |= AMDGPU_GEM_DOMAIN_VRAM;
-		}
+	if (size <= AMDGPU_VEGA_MEDIUM_BUFFER_SIZE) {           /* 1‑4 MiB */
+		if (usage >= PRESS_HI) { FORCE_GTT(); MAYBE_EWMA(size); }
+		else if (*domain == 0)  *domain |= AMDGPU_GEM_DOMAIN_VRAM;
 		return true;
 	}
 
-	/* large generic buffer */
-	if (vram_usage >= amdgpu_vega_vram_pressure_high) {
-		*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) |
-		AMDGPU_GEM_DOMAIN_GTT;
-		if (size >= AMDGPU_VEGA_SMALL_BUFFER_SIZE)
-			pb_account_eviction();
-	} else if (*domain == 0) {
-		*domain |= AMDGPU_GEM_DOMAIN_VRAM;
-	}
+	/* large generic */
+	if (usage >= PRESS_HI) { FORCE_GTT(); MAYBE_EWMA(size); }
+	else if (*domain == 0)  *domain |= AMDGPU_GEM_DOMAIN_VRAM;
+
 	return true;
 }
 
