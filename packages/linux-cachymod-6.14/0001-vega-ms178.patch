@@ -11,9 +11,11 @@
  #include <drm/ttm/ttm_bo.h>
  #include <drm/ttm/ttm_placement.h>
  #include <drm/ttm/ttm_range_manager.h>
-@@ -64,6 +66,10 @@
+@@ -63,7 +65,12 @@
+ 
  MODULE_IMPORT_NS("DMA_BUF");
  
++#define AMDGPU_TTM_CHUNK_VEGA64	(512ULL << 20)	/* 512 MiB burst size */
  #define AMDGPU_TTM_VRAM_MAX_DW_READ	((size_t)128)
 +#define STRIPE_THRESHOLD	(128ULL << 20)	/* 128 MiB */
 +
@@ -22,10 +24,20 @@
  
  static int amdgpu_ttm_backend_bind(struct ttm_device *bdev,
  				   struct ttm_tt *ttm,
-@@ -79,6 +85,49 @@ static int amdgpu_ttm_init_on_chip(struc
+@@ -79,6 +86,59 @@ static int amdgpu_ttm_init_on_chip(struc
  				  false, size_in_page);
  }
  
++static inline void gtt_window_lock_fast(struct amdgpu_device *adev)
++{
++	/* uncontended: take mutex immediately */
++	if (likely(mutex_trylock(&adev->mman.gtt_window_lock)))
++		return;
++
++	/* contended: sleep until owner releases */
++	mutex_lock(&adev->mman.gtt_window_lock);
++}
++
 +/*
 + * Make sure SDMA “buffer functions” are enabled when possible.
 + * Preconditions now include:
@@ -72,7 +84,7 @@
  /**
   * amdgpu_evict_flags - Compute placement flags
   *
-@@ -269,6 +318,83 @@ static int amdgpu_ttm_map_buffer(struct
+@@ -269,6 +329,83 @@ static int amdgpu_ttm_map_buffer(struct
  	return 0;
  }
  
@@ -156,7 +168,7 @@
  /**
   * amdgpu_ttm_copy_mem_to_mem - Helper function for copy
   * @adev: amdgpu device
-@@ -285,18 +411,19 @@ static int amdgpu_ttm_map_buffer(struct
+@@ -285,18 +422,18 @@ static int amdgpu_ttm_map_buffer(struct
   *
   */
  int amdgpu_ttm_copy_mem_to_mem(struct amdgpu_device *adev,
@@ -176,51 +188,66 @@
  	struct amdgpu_res_cursor src_mm, dst_mm;
 -	struct dma_fence *fence = NULL;
 +	struct dma_fence	*fence = NULL;
-+	struct amdgpu_bo	*abo_src, *abo_dst;
 +	uint32_t		copy_flags = 0;
-+	uint64_t		tiling_flags;
++	struct amdgpu_bo	*abo_src, *abo_dst;
  	int r = 0;
 -	uint32_t copy_flags = 0;
 -	struct amdgpu_bo *abo_src, *abo_dst;
  
  	if (!adev->mman.buffer_funcs_enabled) {
  		DRM_ERROR("Trying to move memory with ring turned off.\n");
-@@ -306,64 +433,64 @@ int amdgpu_ttm_copy_mem_to_mem(struct am
+@@ -306,53 +443,58 @@ int amdgpu_ttm_copy_mem_to_mem(struct am
  	amdgpu_res_first(src->mem, src->offset, size, &src_mm);
  	amdgpu_res_first(dst->mem, dst->offset, size, &dst_mm);
  
 -	mutex_lock(&adev->mman.gtt_window_lock);
--	while (src_mm.remaining) {
--		uint64_t from, to, cur_size, tiling_flags;
++	abo_src = ttm_to_amdgpu_bo(src->bo);
++	abo_dst = ttm_to_amdgpu_bo(dst->bo);
++
++	gtt_window_lock_fast(adev);
++
+ 	while (src_mm.remaining) {
+ 		uint64_t from, to, cur_size, tiling_flags;
 -		uint32_t num_type, data_format, max_com, write_compress_disable;
--		struct dma_fence *next;
--
++		uint32_t num_type, data_format, max_com, wcd;
+ 		struct dma_fence *next;
+ 
 -		/* Never copy more than 256MiB at once to avoid a timeout */
 -		cur_size = min3(src_mm.size, dst_mm.size, 256ULL << 20);
--
++		/* Vega64: burst 512 MiB, others stay at 256 MiB */
++		cur_size = min3(src_mm.size, dst_mm.size,
++						(adev->asic_type == CHIP_VEGA10) ?
++						AMDGPU_TTM_CHUNK_VEGA64 : (256ULL << 20));
+ 
 -		/* Map src to window 0 and dst to window 1. */
 -		r = amdgpu_ttm_map_buffer(src->bo, src->mem, &src_mm,
 -					  0, ring, tmz, &cur_size, &from);
--		if (r)
++		r = amdgpu_ttm_map_buffer(src->bo, src->mem, &src_mm, 0, ring,
++								  tmz, &cur_size, &from);
+ 		if (r)
 -			goto error;
-+	abo_src = ttm_to_amdgpu_bo(src->bo);
-+	abo_dst = ttm_to_amdgpu_bo(dst->bo);
++			goto out;
  
 -		r = amdgpu_ttm_map_buffer(dst->bo, dst->mem, &dst_mm,
 -					  1, ring, tmz, &cur_size, &to);
--		if (r)
++		r = amdgpu_ttm_map_buffer(dst->bo, dst->mem, &dst_mm, 1, ring,
++								  tmz, &cur_size, &to);
+ 		if (r)
 -			goto error;
--
++			goto out;
+ 
 -		abo_src = ttm_to_amdgpu_bo(src->bo);
 -		abo_dst = ttm_to_amdgpu_bo(dst->bo);
--		if (tmz)
--			copy_flags |= AMDGPU_COPY_FLAGS_TMZ;
--		if ((abo_src->flags & AMDGPU_GEM_CREATE_GFX12_DCC) &&
+ 		if (tmz)
+ 			copy_flags |= AMDGPU_COPY_FLAGS_TMZ;
+ 		if ((abo_src->flags & AMDGPU_GEM_CREATE_GFX12_DCC) &&
 -		    (abo_src->tbo.resource->mem_type == TTM_PL_VRAM))
--			copy_flags |= AMDGPU_COPY_FLAGS_READ_DECOMPRESSED;
--		if ((abo_dst->flags & AMDGPU_GEM_CREATE_GFX12_DCC) &&
++			(src->mem->mem_type == TTM_PL_VRAM))
+ 			copy_flags |= AMDGPU_COPY_FLAGS_READ_DECOMPRESSED;
+ 		if ((abo_dst->flags & AMDGPU_GEM_CREATE_GFX12_DCC) &&
 -		    (dst->mem->mem_type == TTM_PL_VRAM)) {
--			copy_flags |= AMDGPU_COPY_FLAGS_WRITE_COMPRESSED;
++			(dst->mem->mem_type == TTM_PL_VRAM)) {
+ 			copy_flags |= AMDGPU_COPY_FLAGS_WRITE_COMPRESSED;
 -			amdgpu_bo_get_tiling_flags(abo_dst, &tiling_flags);
 -			max_com = AMDGPU_TILING_GET(tiling_flags, GFX12_DCC_MAX_COMPRESSED_BLOCK);
 -			num_type = AMDGPU_TILING_GET(tiling_flags, GFX12_DCC_NUMBER_TYPE);
@@ -232,78 +259,44 @@
 -				       AMDGPU_COPY_FLAGS_SET(DATA_FORMAT, data_format) |
 -				       AMDGPU_COPY_FLAGS_SET(WRITE_COMPRESS_DISABLE,
 -							     write_compress_disable));
-+	if (tmz)
-+		copy_flags |= AMDGPU_COPY_FLAGS_TMZ;
-+	if ((abo_src->flags & AMDGPU_GEM_CREATE_GFX12_DCC) &&
-+		src->mem->mem_type == TTM_PL_VRAM)
-+		copy_flags |= AMDGPU_COPY_FLAGS_READ_DECOMPRESSED;
-+	if ((abo_dst->flags & AMDGPU_GEM_CREATE_GFX12_DCC) &&
-+		dst->mem->mem_type == TTM_PL_VRAM) {
-+		copy_flags |= AMDGPU_COPY_FLAGS_WRITE_COMPRESSED;
-+	amdgpu_bo_get_tiling_flags(abo_dst, &tiling_flags);
-+	copy_flags |= AMDGPU_COPY_FLAGS_SET(MAX_COMPRESSED,
-+										AMDGPU_TILING_GET(tiling_flags,
-+														  GFX12_DCC_MAX_COMPRESSED_BLOCK));
-+	copy_flags |= AMDGPU_COPY_FLAGS_SET(NUMBER_TYPE,
-+										AMDGPU_TILING_GET(tiling_flags, GFX12_DCC_NUMBER_TYPE));
-+	copy_flags |= AMDGPU_COPY_FLAGS_SET(DATA_FORMAT,
-+										AMDGPU_TILING_GET(tiling_flags, GFX12_DCC_DATA_FORMAT));
-+	copy_flags |= AMDGPU_COPY_FLAGS_SET(WRITE_COMPRESS_DISABLE,
-+										AMDGPU_TILING_GET(tiling_flags,
-+														  GFX12_DCC_WRITE_COMPRESS_DISABLE));
- 		}
+-		}
++		amdgpu_bo_get_tiling_flags(abo_dst, &tiling_flags);
++		max_com  = AMDGPU_TILING_GET(tiling_flags,
++									 GFX12_DCC_MAX_COMPRESSED_BLOCK);
++		num_type = AMDGPU_TILING_GET(tiling_flags,
++									 GFX12_DCC_NUMBER_TYPE);
++		data_format = AMDGPU_TILING_GET(tiling_flags,
++										GFX12_DCC_DATA_FORMAT);
++		wcd = AMDGPU_TILING_GET(tiling_flags,
++								GFX12_DCC_WRITE_COMPRESS_DISABLE);
++		copy_flags |= AMDGPU_COPY_FLAGS_SET(MAX_COMPRESSED, max_com) |
++		AMDGPU_COPY_FLAGS_SET(NUMBER_TYPE, num_type) |
++		AMDGPU_COPY_FLAGS_SET(DATA_FORMAT, data_format) |
++		AMDGPU_COPY_FLAGS_SET(WRITE_COMPRESS_DISABLE, wcd);
++			}
  
 -		r = amdgpu_copy_buffer(ring, from, to, cur_size, resv,
 -				       &next, false, true, copy_flags);
 -		if (r)
 -			goto error;
-+		mutex_lock(&adev->mman.gtt_window_lock);
-+		while (src_mm.remaining) {
-+			uint64_t cur_size;
-+			struct dma_fence *next;
-+			uint64_t from, to;
-+
-+			/* never copy more than 256 MiB at once */
-+			cur_size = min3(src_mm.size, dst_mm.size, 256ULL << 20);
-+
-+			r = amdgpu_ttm_map_buffer(src->bo, src->mem, &src_mm, 0,
-+									  ring, tmz, &cur_size, &from);
-+			if (r)
-+				goto error;
-+
-+			r = amdgpu_ttm_map_buffer(dst->bo, dst->mem, &dst_mm, 1,
-+									  ring, tmz, &cur_size, &to);
-+			if (r)
-+				goto error;
-+
 +			r = amdgpu_copy_buffer_striped(ring, from, to, cur_size,
 +										   resv, &next, copy_flags);
 +			if (r)
-+				goto error;
++				goto out;
  
--		dma_fence_put(fence);
--		fence = next;
-+			dma_fence_put(fence);
-+			fence = next;
- 
--		amdgpu_res_next(&src_mm, cur_size);
--		amdgpu_res_next(&dst_mm, cur_size);
--	}
+ 		dma_fence_put(fence);
+ 		fence = next;
+@@ -360,7 +502,8 @@ int amdgpu_ttm_copy_mem_to_mem(struct am
+ 		amdgpu_res_next(&src_mm, cur_size);
+ 		amdgpu_res_next(&dst_mm, cur_size);
+ 	}
 -error:
--	mutex_unlock(&adev->mman.gtt_window_lock);
--	if (f)
--		*f = dma_fence_get(fence);
-+			amdgpu_res_next(&src_mm, cur_size);
-+			amdgpu_res_next(&dst_mm, cur_size);
-+		}
-+		error:
-+		mutex_unlock(&adev->mman.gtt_window_lock);
-+		if (f)
-+			*f = dma_fence_get(fence);
- 	dma_fence_put(fence);
- 	return r;
- }
-@@ -482,115 +609,120 @@ static bool amdgpu_res_copyable(struct a
++
++	out:
+ 	mutex_unlock(&adev->mman.gtt_window_lock);
+ 	if (f)
+ 		*f = dma_fence_get(fence);
+@@ -482,115 +625,120 @@ static bool amdgpu_res_copyable(struct a
  }
  
  /*
@@ -359,19 +352,19 @@
 -	if (!old_mem || (old_mem->mem_type == TTM_PL_SYSTEM &&
 -			 bo->ttm == NULL)) {
 -		amdgpu_bo_move_notify(bo, evict, new_mem);
+-		ttm_bo_move_null(bo, new_mem);
+-		return 0;
+-	}
+-	if (old_mem->mem_type == TTM_PL_SYSTEM &&
+-	    (new_mem->mem_type == TTM_PL_TT ||
+-	     new_mem->mem_type == AMDGPU_PL_PREEMPT)) {
+-		amdgpu_bo_move_notify(bo, evict, new_mem);
 +		if (oldmem->mem_type == TTM_PL_SYSTEM &&
 +			(new_mem->mem_type == TTM_PL_TT ||
 +			new_mem->mem_type == AMDGPU_PL_PREEMPT)) {
 +			amdgpu_bo_move_notify(bo, evict, new_mem);
  		ttm_bo_move_null(bo, new_mem);
  		return 0;
--	}
--	if (old_mem->mem_type == TTM_PL_SYSTEM &&
--	    (new_mem->mem_type == TTM_PL_TT ||
--	     new_mem->mem_type == AMDGPU_PL_PREEMPT)) {
--		amdgpu_bo_move_notify(bo, evict, new_mem);
--		ttm_bo_move_null(bo, new_mem);
--		return 0;
 -	}
 -	if ((old_mem->mem_type == TTM_PL_TT ||
 -	     old_mem->mem_type == AMDGPU_PL_PREEMPT) &&
@@ -504,7 +497,7 @@
  	return 0;
  }
  
-@@ -1027,12 +1159,6 @@ int amdgpu_ttm_alloc_gart(struct ttm_buf
+@@ -1027,12 +1175,6 @@ int amdgpu_ttm_alloc_gart(struct ttm_buf
  	return 0;
  }
  
@@ -517,7 +510,7 @@
  void amdgpu_ttm_recover_gart(struct ttm_buffer_object *tbo)
  {
  	struct amdgpu_device *adev = amdgpu_ttm_adev(tbo->bdev);
-@@ -1043,6 +1169,9 @@ void amdgpu_ttm_recover_gart(struct ttm_
+@@ -1043,6 +1185,9 @@ void amdgpu_ttm_recover_gart(struct ttm_
  
  	flags = amdgpu_ttm_tt_pte_flags(adev, tbo->ttm, tbo->resource);
  	amdgpu_ttm_gart_bind(adev, tbo, flags);
@@ -527,7 +520,7 @@
  }
  
  /*
-@@ -1855,14 +1984,13 @@ int amdgpu_ttm_init(struct amdgpu_device
+@@ -1855,14 +2000,13 @@ int amdgpu_ttm_init(struct amdgpu_device
  	int r;
  
  	mutex_init(&adev->mman.gtt_window_lock);
@@ -547,7 +540,7 @@
  	if (r) {
  		DRM_ERROR("failed initializing buffer object driver(%d).\n", r);
  		return r;
-@@ -1875,154 +2003,115 @@ int amdgpu_ttm_init(struct amdgpu_device
+@@ -1875,154 +2019,115 @@ int amdgpu_ttm_init(struct amdgpu_device
  	}
  	adev->mman.initialized = true;
  
@@ -749,7 +742,7 @@
  	return 0;
  }
  
-@@ -2037,30 +2126,25 @@ void amdgpu_ttm_fini(struct amdgpu_devic
+@@ -2037,30 +2142,25 @@ void amdgpu_ttm_fini(struct amdgpu_devic
  		return;
  
  	amdgpu_ttm_pools_fini(adev);
@@ -784,7 +777,7 @@
  		drm_dev_exit(idx);
  	}
  
-@@ -2071,8 +2155,14 @@ void amdgpu_ttm_fini(struct amdgpu_devic
+@@ -2071,8 +2171,14 @@ void amdgpu_ttm_fini(struct amdgpu_devic
  	ttm_range_man_fini(&adev->mman.bdev, AMDGPU_PL_GWS);
  	ttm_range_man_fini(&adev->mman.bdev, AMDGPU_PL_OA);
  	ttm_range_man_fini(&adev->mman.bdev, AMDGPU_PL_DOORBELL);
@@ -799,6 +792,143 @@
  	DRM_INFO("amdgpu: ttm finalized\n");
  }
  
+@@ -2273,27 +2379,24 @@ static int amdgpu_ttm_fill_mem(struct am
+  * Returns:
+  * 0 for success or a negative error code on failure.
+  */
+-int amdgpu_ttm_clear_buffer(struct amdgpu_bo *bo,
+-			    struct dma_resv *resv,
+-			    struct dma_fence **fence)
++int amdgpu_ttm_clear_buffer(struct amdgpu_bo *bo, struct dma_resv *resv,
++							struct dma_fence **fence)
+ {
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
+-	struct amdgpu_ring *ring = adev->mman.buffer_funcs_ring;
++	struct amdgpu_ring *ring   = adev->mman.buffer_funcs_ring;
+ 	struct amdgpu_res_cursor cursor;
+ 	u64 addr;
+ 	int r = 0;
+ 
+-	if (!adev->mman.buffer_funcs_enabled)
+-		return -EINVAL;
+-
+-	if (!fence)
++	if (!adev->mman.buffer_funcs_enabled || !fence)
+ 		return -EINVAL;
+ 
+ 	*fence = dma_fence_get_stub();
+ 
+ 	amdgpu_res_first(bo->tbo.resource, 0, amdgpu_bo_size(bo), &cursor);
+ 
+-	mutex_lock(&adev->mman.gtt_window_lock);
++	gtt_window_lock_fast(adev);
++
+ 	while (cursor.remaining) {
+ 		struct dma_fence *next = NULL;
+ 		u64 size;
+@@ -2303,39 +2406,38 @@ int amdgpu_ttm_clear_buffer(struct amdgp
+ 			continue;
+ 		}
+ 
+-		/* Never clear more than 256MiB at once to avoid timeouts */
+-		size = min(cursor.size, 256ULL << 20);
+-
+-		r = amdgpu_ttm_map_buffer(&bo->tbo, bo->tbo.resource, &cursor,
+-					  1, ring, false, &size, &addr);
++		size = min(cursor.size,
++				   (adev->asic_type == CHIP_VEGA10) ?
++				   AMDGPU_TTM_CHUNK_VEGA64 : (256ULL << 20));
++
++		r = amdgpu_ttm_map_buffer(&bo->tbo, bo->tbo.resource,
++								  &cursor, 1, ring, false,
++							&size, &addr);
+ 		if (r)
+-			goto err;
++			goto out;
+ 
+ 		r = amdgpu_ttm_fill_mem(ring, 0, addr, size, resv,
+-					&next, true, true);
++								&next, true, true);
+ 		if (r)
+-			goto err;
++			goto out;
+ 
+ 		dma_fence_put(*fence);
+ 		*fence = next;
+ 
+ 		amdgpu_res_next(&cursor, size);
+ 	}
+-err:
++	out:
+ 	mutex_unlock(&adev->mman.gtt_window_lock);
+-
+ 	return r;
+ }
+ 
+-int amdgpu_fill_buffer(struct amdgpu_bo *bo,
+-			uint32_t src_data,
+-			struct dma_resv *resv,
+-			struct dma_fence **f,
+-			bool delayed)
++int amdgpu_fill_buffer(struct amdgpu_bo *bo, uint32_t src_data,
++					   struct dma_resv *resv, struct dma_fence **f,
++					   bool delayed)
+ {
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
+-	struct amdgpu_ring *ring = adev->mman.buffer_funcs_ring;
+-	struct dma_fence *fence = NULL;
++	struct amdgpu_ring   *ring = adev->mman.buffer_funcs_ring;
++	struct dma_fence     *fence = NULL;
+ 	struct amdgpu_res_cursor dst;
+ 	int r;
+ 
+@@ -2346,30 +2448,33 @@ int amdgpu_fill_buffer(struct amdgpu_bo
+ 
+ 	amdgpu_res_first(bo->tbo.resource, 0, amdgpu_bo_size(bo), &dst);
+ 
+-	mutex_lock(&adev->mman.gtt_window_lock);
++	gtt_window_lock_fast(adev);
++
+ 	while (dst.remaining) {
+ 		struct dma_fence *next;
+-		uint64_t cur_size, to;
++		u64 cur_size, to;
+ 
+-		/* Never fill more than 256MiB at once to avoid timeouts */
+-		cur_size = min(dst.size, 256ULL << 20);
+-
+-		r = amdgpu_ttm_map_buffer(&bo->tbo, bo->tbo.resource, &dst,
+-					  1, ring, false, &cur_size, &to);
++		cur_size = min(dst.size,
++					   (adev->asic_type == CHIP_VEGA10) ?
++					   AMDGPU_TTM_CHUNK_VEGA64 : (256ULL << 20));
++
++		r = amdgpu_ttm_map_buffer(&bo->tbo, bo->tbo.resource,
++								  &dst, 1, ring, false,
++							&cur_size, &to);
+ 		if (r)
+-			goto error;
++			goto out;
+ 
+-		r = amdgpu_ttm_fill_mem(ring, src_data, to, cur_size, resv,
+-					&next, true, delayed);
++		r = amdgpu_ttm_fill_mem(ring, src_data, to, cur_size,
++								resv, &next, true, delayed);
+ 		if (r)
+-			goto error;
++			goto out;
+ 
+ 		dma_fence_put(fence);
+ 		fence = next;
+ 
+ 		amdgpu_res_next(&dst, cur_size);
+ 	}
+-error:
++	out:
+ 	mutex_unlock(&adev->mman.gtt_window_lock);
+ 	if (f)
+ 		*f = dma_fence_get(fence);
+
 
 
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c	2025-04-10 14:44:49.000000000 +0200
