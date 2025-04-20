@@ -1,3 +1,237 @@
+--- a/drivers/cpufreq/intel_pstate.c	2025-04-13 11:40:05.273247310 +0200
++++ b/drivers/cpufreq/intel_pstate.c	2025-04-20 15:51:11.133723810 +0200
+@@ -18,6 +18,8 @@
+ #include <linux/sched/cpufreq.h>
+ #include <linux/sched/smt.h>
+ #include <linux/list.h>
++#include <linux/cache.h>
++#include <linux/math64.h>
+ #include <linux/cpu.h>
+ #include <linux/cpufreq.h>
+ #include <linux/sysfs.h>
+@@ -146,6 +148,8 @@ struct pstate_data {
+ 	unsigned int min_freq;
+ 	unsigned int max_freq;
+ 	unsigned int turbo_freq;
++
++	u32			scaling_recip;
+ };
+ 
+ /**
+@@ -187,81 +191,64 @@ struct global_params {
+ 	int min_perf_pct;
+ };
+ 
+-/**
+- * struct cpudata -	Per CPU instance data storage
+- * @cpu:		CPU number for this instance data
+- * @policy:		CPUFreq policy value
+- * @update_util:	CPUFreq utility callback information
+- * @update_util_set:	CPUFreq utility callback is set
+- * @iowait_boost:	iowait-related boost fraction
+- * @last_update:	Time of the last update.
+- * @pstate:		Stores P state limits for this CPU
+- * @vid:		Stores VID limits for this CPU
+- * @last_sample_time:	Last Sample time
+- * @aperf_mperf_shift:	APERF vs MPERF counting frequency difference
+- * @prev_aperf:		Last APERF value read from APERF MSR
+- * @prev_mperf:		Last MPERF value read from MPERF MSR
+- * @prev_tsc:		Last timestamp counter (TSC) value
+- * @sample:		Storage for storing last Sample data
+- * @min_perf_ratio:	Minimum capacity in terms of PERF or HWP ratios
+- * @max_perf_ratio:	Maximum capacity in terms of PERF or HWP ratios
+- * @acpi_perf_data:	Stores ACPI perf information read from _PSS
+- * @valid_pss_table:	Set to true for valid ACPI _PSS entries found
+- * @epp_powersave:	Last saved HWP energy performance preference
+- *			(EPP) or energy performance bias (EPB),
+- *			when policy switched to performance
+- * @epp_policy:		Last saved policy used to set EPP/EPB
+- * @epp_default:	Power on default HWP energy performance
+- *			preference/bias
+- * @epp_cached:		Cached HWP energy-performance preference value
+- * @hwp_req_cached:	Cached value of the last HWP Request MSR
+- * @hwp_cap_cached:	Cached value of the last HWP Capabilities MSR
+- * @last_io_update:	Last time when IO wake flag was set
+- * @capacity_perf:	Highest perf used for scale invariance
+- * @sched_flags:	Store scheduler flags for possible cross CPU update
+- * @hwp_boost_min:	Last HWP boosted min performance
+- * @suspended:		Whether or not the driver has been suspended.
+- * @hwp_notify_work:	workqueue for HWP notifications.
++/*
++ * cpudata – per‑CPU state used by intel_pstate
+  *
+- * This structure stores per CPU instance data for all CPUs.
++ * The first ≤128 bytes contain every field touched from the scheduler’s
++ * fast path.  A zero‑length, cache‑aligned dummy member forces the cold
++ * block to the next line.  The structure is TU‑local, so layout changes
++ * have no external impact.
+  */
+ struct cpudata {
+-	int cpu;
++	/* ---------- HOT block: accessed every tick / fast‑switch ------------- */
++	int				cpu;
++	struct pstate_data		pstate;
++	struct sample			sample;
++	u64				last_update;
++	u64				last_sample_time;
++	u64				hwp_req_cached;
++	unsigned int			iowait_boost;
++	int32_t				min_perf_ratio;
++	int32_t				max_perf_ratio;
++	unsigned int			sched_flags;
++
++	char				____pad_to_cacheline[0]
++	__aligned(L1_CACHE_BYTES);
++
++	/* ---------- COLD block: init‑time or low‑frequency accesses ---------- */
++	unsigned int			policy;
++
++	struct update_util_data		update_util;
++	bool				update_util_set;
++
++	u64				aperf_mperf_shift;
++	u64				prev_aperf;
++	u64				prev_mperf;
++	u64				prev_tsc;
+ 
+-	unsigned int policy;
+-	struct update_util_data update_util;
+-	bool   update_util_set;
+-
+-	struct pstate_data pstate;
+-	struct vid_data vid;
+-
+-	u64	last_update;
+-	u64	last_sample_time;
+-	u64	aperf_mperf_shift;
+-	u64	prev_aperf;
+-	u64	prev_mperf;
+-	u64	prev_tsc;
+-	struct sample sample;
+-	int32_t	min_perf_ratio;
+-	int32_t	max_perf_ratio;
+-#ifdef CONFIG_ACPI
++	struct vid_data			vid;
++
++	#ifdef CONFIG_ACPI
+ 	struct acpi_processor_performance acpi_perf_data;
+-	bool valid_pss_table;
+-#endif
+-	unsigned int iowait_boost;
+-	s16 epp_powersave;
+-	s16 epp_policy;
+-	s16 epp_default;
+-	s16 epp_cached;
+-	u64 hwp_req_cached;
+-	u64 hwp_cap_cached;
+-	u64 last_io_update;
+-	unsigned int capacity_perf;
+-	unsigned int sched_flags;
+-	u32 hwp_boost_min;
+-	bool suspended;
+-	struct delayed_work hwp_notify_work;
+-};
++	bool				valid_pss_table;
++	#endif
++	s16				epp_powersave;
++	s16				epp_policy;
++	s16				epp_default;
++	s16				epp_cached;
++
++	u64				hwp_cap_cached;
++	u64				last_io_update;
++	unsigned int			capacity_perf;
++	u32				hwp_boost_min;
++
++	bool				suspended;
++	struct delayed_work		hwp_notify_work;
++} ____cacheline_aligned_in_smp;
++
++/* Hot block must fit into two 64‑byte cache lines */
++static_assert(offsetof(struct cpudata, ____pad_to_cacheline) <= 128,
++			  "cpudata hot block exceeds two cache lines");
+ 
+ static struct cpudata **all_cpu_data;
+ 
+@@ -2255,20 +2242,26 @@ static void intel_pstate_set_min_pstate(
+ 	intel_pstate_set_pstate(cpu, cpu->pstate.min_pstate);
+ }
+ 
++/* ---------------------------------------------------------------------
++ * intel_pstate_get_cpu_pstates
++ *	Detect per‑CPU P‑state limits and cache the reciprocal of
++ *	.pstate.scaling to avoid run‑time 64‑bit divisions.
++ * --------------------------------------------------------------------- */
+ static void intel_pstate_get_cpu_pstates(struct cpudata *cpu)
+ {
+ 	int perf_ctl_max_phys = pstate_funcs.get_max_physical(cpu->cpu);
+-	int perf_ctl_scaling = pstate_funcs.get_scaling();
++	int perf_ctl_scaling  = pstate_funcs.get_scaling();
+ 
+-	cpu->pstate.min_pstate = pstate_funcs.get_min(cpu->cpu);
++	cpu->pstate.min_pstate          = pstate_funcs.get_min(cpu->cpu);
+ 	cpu->pstate.max_pstate_physical = perf_ctl_max_phys;
+-	cpu->pstate.perf_ctl_scaling = perf_ctl_scaling;
++	cpu->pstate.perf_ctl_scaling    = perf_ctl_scaling;
+ 
+ 	if (hwp_active && !hwp_mode_bdw) {
+ 		__intel_pstate_get_hwp_cap(cpu);
+ 
+ 		if (pstate_funcs.get_cpu_scaling) {
+-			cpu->pstate.scaling = pstate_funcs.get_cpu_scaling(cpu->cpu);
++			cpu->pstate.scaling =
++			pstate_funcs.get_cpu_scaling(cpu->cpu);
+ 			if (cpu->pstate.scaling != perf_ctl_scaling) {
+ 				intel_pstate_hybrid_hwp_adjust(cpu);
+ 				hwp_is_hybrid = true;
+@@ -2276,29 +2269,35 @@ static void intel_pstate_get_cpu_pstates
+ 		} else {
+ 			cpu->pstate.scaling = perf_ctl_scaling;
+ 		}
+-		/*
+-		 * If the CPU is going online for the first time and it was
+-		 * offline initially, asym capacity scaling needs to be updated.
+-		 */
++
+ 		hybrid_update_capacity(cpu);
+ 	} else {
+-		cpu->pstate.scaling = perf_ctl_scaling;
+-		cpu->pstate.max_pstate = pstate_funcs.get_max(cpu->cpu);
++		cpu->pstate.scaling      = perf_ctl_scaling;
++		cpu->pstate.max_pstate   = pstate_funcs.get_max(cpu->cpu);
+ 		cpu->pstate.turbo_pstate = pstate_funcs.get_turbo(cpu->cpu);
+ 	}
+ 
+ 	if (cpu->pstate.scaling == perf_ctl_scaling) {
+-		cpu->pstate.min_freq = cpu->pstate.min_pstate * perf_ctl_scaling;
+-		cpu->pstate.max_freq = cpu->pstate.max_pstate * perf_ctl_scaling;
+-		cpu->pstate.turbo_freq = cpu->pstate.turbo_pstate * perf_ctl_scaling;
++		cpu->pstate.min_freq =
++		cpu->pstate.min_pstate * perf_ctl_scaling;
++		cpu->pstate.max_freq =
++		cpu->pstate.max_pstate * perf_ctl_scaling;
++		cpu->pstate.turbo_freq =
++		cpu->pstate.turbo_pstate * perf_ctl_scaling;
+ 	}
+ 
+ 	if (pstate_funcs.get_aperf_mperf_shift)
+-		cpu->aperf_mperf_shift = pstate_funcs.get_aperf_mperf_shift();
++		cpu->aperf_mperf_shift =
++		pstate_funcs.get_aperf_mperf_shift();
+ 
+ 	if (pstate_funcs.get_vid)
+ 		pstate_funcs.get_vid(cpu);
+ 
++	/* Cache 32‑bit fixed‑point reciprocal for fast division */
++	cpu->pstate.scaling_recip =
++	div64_u64((1ULL << 32), cpu->pstate.scaling);
++
++	/* Leave the CPU at minimum after probing */
+ 	intel_pstate_set_min_pstate(cpu);
+ }
+ 
+
+
 --- a/kernel/irq/affinity.c	2025-03-13 13:08:08.000000000 +0100
 +++ b/kernel/irq/affinity.c	2025-03-22 22:28:35.518663546 +0100
 @@ -2,25 +2,912 @@
