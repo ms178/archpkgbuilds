@@ -2572,13 +2572,12 @@ static void sdma_v4_0_emit_fill_buffer(struct amdgpu_ib *ib,
 	ib->ptr[ib->length_dw++] = byte_count - 1;
 }
 
-/* SDMA v4 packet limit is (0x7FFFFF + 1) = 8 MiB */
 static const struct amdgpu_buffer_funcs sdma_v4_0_buffer_funcs = {
-	.copy_max_bytes = 0x800000,		/* 8 MiB */
+	.copy_max_bytes = 0x400000,		/* 4 MiB */
 	.copy_num_dw    = 7,
 	.emit_copy_buffer = sdma_v4_0_emit_copy_buffer,
 
-	.fill_max_bytes = 0x800000,		/* 8 MiB */
+	.fill_max_bytes = 0x400000,		/* 4 MiB */
 	.fill_num_dw    = 5,
 	.emit_fill_buffer = sdma_v4_0_emit_fill_buffer,
 };
