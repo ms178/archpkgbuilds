@@ -31,10 +31,10 @@ prepare() {
 
   autoreconf -vfi
 
-  # Create PGO workload script
+# Create PGO workload script
 cat > "$srcdir/pgo-workload.sh" << 'PGO_EOF'
 #!/usr/bin/env bash
-# nghttp2  –  rich PGO workload using nghttpd / nghttp / h2load
+# nghttp2 – rich PGO workload using nghttpd / nghttp / h2load
 # Usage: pgo-workload.sh <work‑dir> <examples‑bin‑dir>
 
 set -euo pipefail
@@ -42,31 +42,32 @@ set -euo pipefail
 ##############################################################################
 # Args & basic paths
 ##############################################################################
-WD=$1          # work directory
-BD=$2          # directory containing builtin apps (src/ by default)
+WD=$1                       # work directory
+BD=$2                       # directory containing builtin apps (src/)
 
 mkdir -p "$WD"
-cd       "$WD"
+cd "$WD" || { echo "Failed to cd into '$WD'" >&2; exit 1; }
 
 QCLIENT="$BD/nghttp"
 QSERVER="$BD/nghttpd"
 H2LOAD="$BD/h2load"
 
 for exe in "$QCLIENT" "$QSERVER" "$H2LOAD"; do
-  [[ -x $exe ]] || { echo "$exe missing" >&2; exit 1; }
+  [[ -x "$exe" ]] || { echo "Required executable '$exe' not found/executable" >&2; exit 1; }
 done
 
 ##############################################################################
-# Detect option spellings once (CLI is occasionally renamed)
+# Detect option spellings once (CLI varies between versions)
 ##############################################################################
 help_cli=$("$QCLIENT" --help 2>&1 || true)
+
 opt_stat=
 if   grep -q -- '--stat'    <<<"$help_cli"; then opt_stat=--stat
-elif grep -q -E '\s-i[ ,]'  <<<"$help_cli"; then opt_stat=-i
+elif grep -q -E '\s-s[ ,]'  <<<"$help_cli"; then opt_stat=-s
 fi
 
 opt_win=--window-bits
-grep -q -- '--window-bits'  <<<"$help_cli" || opt_win=-w
+grep -q -- '--window-bits' <<<"$help_cli" || opt_win=-w
 
 opt_hdr=--header-table-size
 grep -q -- '--header-table-size' <<<"$help_cli" || opt_hdr=-t
@@ -74,11 +75,39 @@ grep -q -- '--header-table-size' <<<"$help_cli" || opt_hdr=-t
 opt_cwin=--connection-window-bits
 grep -q -- '--connection-window-bits' <<<"$help_cli" || opt_cwin=--connection-window
 
+opt_max_streams=--max-concurrent-streams
+grep -q -- "$opt_max_streams" <<<"$help_cli" || opt_max_streams=-m
+
+opt_max_frame=--max-frame-size
+grep -q -- "$opt_max_frame" <<<"$help_cli" || true    # assume long form exists
+
+opt_no_push=--no-push        # usually stable
+
 ##############################################################################
-# Helper – create header/table/flow permutations fast
+# Helper functions
 ##############################################################################
-rt() { "$QCLIENT" -ansv "$@" >>client.log 2>&1 || true; }   # a=authority, n=no‑tls, s=show‑stat
-# (‑v = verbose frame log; add ‑a to always print :authority)
+rt() {                      # Run nghttp with common flags
+  local cmd=("$QCLIENT" -anv)
+  [[ -n $opt_stat ]] && cmd+=("$opt_stat")
+  "${cmd[@]}" "$@" >>client.log 2>&1 || true
+}
+
+is_listening() {            # is_listening <port>
+  local port=$1
+  if command -v ss >/dev/null; then
+    ss -lnt | grep -qE ":${port}(\s+|$)"
+  else
+    netstat -lnt | grep -qE ":${port}(\s+|$)"
+  fi
+}
+
+get_free_port() {           # find a free TCP port ≥8000
+  local p
+  for p in {8000..8100}; do
+    if ! is_listening "$p"; then echo "$p"; return 0; fi
+  done
+  echo "Error: no free port 8000‑8100" >&2; return 1
+}
 
 ##############################################################################
 # Test assets
@@ -87,115 +116,143 @@ dd if=/dev/urandom bs=1K  count=10  status=none of=small.bin
 dd if=/dev/urandom bs=1K  count=100 status=none of=medium.bin
 dd if=/dev/urandom bs=1M  count=5   status=none of=large.bin
 dd if=/dev/urandom bs=1K  count=100 status=none of=compressible.bin
-gzip -k compressible.bin
+gzip -kf compressible.bin
 
 cat > api.json <<'J'
 {"msg":"Hello HTTP/2","n":[1,2,3,4,5],"ok":true}
 J
 
 dd if=/dev/urandom bs=1K count=50 status=none of=image.jpg
-dd if=/dev/urandom bs=1M count=10 status=none of=chunked.bin
+dd if=/dev/urandom bs=1M count=10 status=none of=large_binary_file.bin
 
 cat > index.html <<'H'
 <!doctype html><title>nghttp2 PGO</title>
 <link rel="stylesheet" href="/style.css">
 <script src="/script.js"></script>
-<img src="/image.jpg">
+<img src="/image.jpg"><h1>Welcome!</h1>
 H
-echo "body{background:#eee}"                 > style.css
-echo "console.log('hello http2');"           > script.js
+echo "body{background:#eee;color:#333}"   > style.css
+echo "console.log('hello http2 PGO');"    > script.js
 
 ##############################################################################
-# Certificates (already generated and copied by PKGBUILD)
+# Certificates (supplied by PKGBUILD)
 ##############################################################################
 CRT=server.crt
 KEY=server.key
-[[ -f $CRT && -f $KEY ]] || { echo "certs missing" >&2; exit 1; }
+[[ -f $CRT && -f $KEY ]] || { echo "TLS cert/key missing" >&2; exit 1; }
 
 ##############################################################################
-# Launch server
+# Launch servers
 ##############################################################################
-"$QSERVER" -d "$WD" --push=/style.css --push=/script.js 8443 "$KEY" "$CRT" \
-   >server.log 2>&1 &
-SPID=$!
+TLS_PORT=8443
+H2C_PORT=$(get_free_port)
+
+echo "Starting TLS server on $TLS_PORT ..."
+"$QSERVER" -d "$WD" --push=/style.css --push=/script.js -- "$TLS_PORT" "$KEY" "$CRT" \
+  >server-tls.log 2>&1 &
+SPID_TLS=$!
+
+echo "Starting plaintext h2c server on $H2C_PORT ..."
+"$QSERVER" --no-tls -d "$WD" -- "$H2C_PORT" \
+  >server-h2c.log 2>&1 &
+SPID_H2C=$!
 
 cleanup() {
-  kill "$SPID" 2>/dev/null || true
-  wait "$SPID" 2>/dev/null || true
+  kill "$SPID_TLS" "$SPID_H2C" 2>/dev/null || true
+  wait "$SPID_TLS" "$SPID_H2C" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
-# wait until ready
-for _ in {1..10}; do
-  sleep .2
-  if ss -lnt | grep -q ':8443'; then break; fi
+# Wait for servers to listen
+for p in "$TLS_PORT" "$H2C_PORT"; do
+  for _ in {1..15}; do
+    if is_listening "$p"; then break; fi; sleep .2
+  done
+  is_listening "$p" || { echo "Port $p did not open" >&2; exit 1; }
 done
 
 ##############################################################################
-# PASS 1 – feature matrix with nghttp
+# PASS 1 – feature matrix (TLS)
 ##############################################################################
-rt https://localhost:8443/index.html
-rt https://localhost:8443/api.json
-rt https://localhost:8443/image.jpg
-rt https://localhost:8443/small.bin
-rt https://localhost:8443/compressible.bin.gz
-rt -c 10 https://localhost:8443/index.html https://localhost:8443/api.json https://localhost:8443/large.bin
+rt https://localhost:$TLS_PORT/index.html
+rt https://localhost:$TLS_PORT/api.json
+rt https://localhost:$TLS_PORT/image.jpg
+rt https://localhost:$TLS_PORT/small.bin
+rt https://localhost:$TLS_PORT/compressible.bin.gz
+rt -c 10 https://localhost:$TLS_PORT/index.html https://localhost:$TLS_PORT/api.json https://localhost:$TLS_PORT/large.bin
 
-rt $opt_stat https://localhost:8443/index.html
-rt $opt_win=16     https://localhost:8443/medium.bin
-rt $opt_win=28     https://localhost:8443/large.bin
-rt $opt_hdr=1024   https://localhost:8443/index.html
-rt $opt_hdr=8192   https://localhost:8443/medium.bin
-rt $opt_cwin=20    https://localhost:8443/large.bin
-rt --weight=16     https://localhost:8443/medium.bin
-rt --weight=255    https://localhost:8443/large.bin
-rt --no-dep        https://localhost:8443/index.html
-rt --padding=64    https://localhost:8443/medium.bin
-rt --padding=256   https://localhost:8443/large.bin
+[[ -n $opt_win ]]  && rt $opt_win=16  https://localhost:$TLS_PORT/medium.bin
+[[ -n $opt_win ]]  && rt $opt_win=28  https://localhost:$TLS_PORT/large.bin
+[[ -n $opt_hdr ]]  && rt $opt_hdr=1024 https://localhost:$TLS_PORT/index.html
+[[ -n $opt_hdr ]]  && rt $opt_hdr=8192 https://localhost:$TLS_PORT/medium.bin
+[[ -n $opt_cwin ]] && rt $opt_cwin=20 https://localhost:$TLS_PORT/large.bin
+rt --weight=16  https://localhost:$TLS_PORT/medium.bin
+rt --weight=255 https://localhost:$TLS_PORT/large.bin
+rt --no-dep     https://localhost:$TLS_PORT/index.html
+rt --padding=64  https://localhost:$TLS_PORT/medium.bin
+rt --padding=256 https://localhost:$TLS_PORT/large.bin
+[[ -n $opt_max_streams ]] && rt $opt_max_streams=5 https://localhost:$TLS_PORT/index.html
+[[ -n $opt_max_frame ]] && rt $opt_max_frame=16385 https://localhost:$TLS_PORT/medium.bin
+[[ -n $opt_no_push ]] && rt $opt_no_push https://localhost:$TLS_PORT/index.html
 
 printf 'X-Large-Header: %s\n' "$(head -c 16000 /dev/zero | tr '\0' A)" | \
-   "$QCLIENT" -ansv -H@- https://localhost:8443/index.html >>client.log 2>&1 || true
+  "$QCLIENT" -anv -H@- https://localhost:$TLS_PORT/index.html >>client.log 2>&1 || true
 printf 'X-Broken-Header: \xff\xff\n' | \
-   "$QCLIENT" -ansv -H@- https://localhost:8443/index.html >>client.log 2>&1 || true
-rt https://localhost:8443/nonexistent.html
-rt https://localhost:8443/chunked.bin
+  "$QCLIENT" -anv -H@- https://localhost:$TLS_PORT/index.html >>client.log 2>&1 || true
+
+rt https://localhost:$TLS_PORT/nonexistent.html
+rt https://localhost:$TLS_PORT/large_binary_file.bin
 
 ##############################################################################
-# PASS 2 – HTTP methods using curl (libcurl exercises nghttp2 internally)
+# PASS 1.5 – h2c
 ##############################################################################
-curl --http2-prior-knowledge -sS -o /dev/null -I https://localhost:8443/index.html --insecure
-echo PUT | curl --http2 -sS -X PUT -T- https://localhost:8443/api.json --insecure -o /dev/null
-curl --http2 -sS -X DELETE https://localhost:8443/api.json --insecure -o /dev/null
-curl --http2 -sS -X OPTIONS https://localhost:8443/index.html --insecure -o /dev/null
+rt http://localhost:$H2C_PORT/index.html
+rt http://localhost:$H2C_PORT/api.json
+rt http://localhost:$H2C_PORT/medium.bin
+rt -c 5 http://localhost:$H2C_PORT/small.bin http://localhost:$H2C_PORT/api.json
+rt http://localhost:$H2C_PORT/large.bin
 
 ##############################################################################
-# PASS 3 – concurrency & stress with h2load
+# PASS 2 – curl (TLS)
 ##############################################################################
-"$H2LOAD" -n 2000 -c 32 -m 16 -t "$(nproc)" https://localhost:8443/index.html \
-  >>h2load.log 2>&1 || true
-"$H2LOAD" -n 1000 -c 16 -m 16 -t "$(nproc)" https://localhost:8443/large.bin \
-  >>h2load.log 2>&1 || true
+curl --http2-prior-knowledge -kfsS -I https://localhost:$TLS_PORT/index.html -o /dev/null
+echo PUTDATA | curl --http2-prior-knowledge -kfsS -X PUT -T- https://localhost:$TLS_PORT/api.json -o /dev/null
+curl --http2-prior-knowledge -kfsS -X DELETE https://localhost:$TLS_PORT/api.json -o /dev/null
+curl --http2-prior-knowledge -kfsS -X OPTIONS https://localhost:$TLS_PORT/index.html -o /dev/null
+curl --http2-prior-knowledge -kfsS https://localhost:$TLS_PORT/large_binary_file.bin -o /dev/null
 
 ##############################################################################
-# PASS 4 – GOAWAY and RST_STREAM scenarios
+# PASS 3 – h2load
 ##############################################################################
-rt $opt_stat https://localhost:8443/index.html &
+NPROC=$(nproc || echo 2)
+"$H2LOAD" -n 2000  -c 32 -m 16 -t "$NPROC" https://localhost:$TLS_PORT/index.html >>h2load.log 2>&1 || true
+"$H2LOAD" -n 500   -c 16 -m  8 -t "$NPROC" https://localhost:$TLS_PORT/large.bin >>h2load.log 2>&1 || true
+"$H2LOAD" -n 10000 -c 64 -m 32 -t "$NPROC" https://localhost:$TLS_PORT/api.json  >>h2load.log 2>&1 || true
+
+##############################################################################
+# PASS 4 – GOAWAY / restart
+##############################################################################
+rt https://localhost:$TLS_PORT/large.bin &
 CID=$!
-sleep 1 && kill -TERM "$SPID" 2>/dev/null || true
+sleep .5
+kill -TERM "$SPID_TLS" 2>/dev/null || true
 wait "$CID" 2>/dev/null || true
 
-# restart server for final sequence
-"$QSERVER" -d "$WD" 8443 "$KEY" "$CRT" >server2.log 2>&1 &
-SPID=$!
-sleep .5
+"$QSERVER" -d "$WD" --push=/style.css --push=/script.js -- "$TLS_PORT" "$KEY" "$CRT" \
+  >server-tls2.log 2>&1 &
+SPID_TLS=$!
+for _ in {1..15}; do is_listening "$TLS_PORT" && break; sleep .2; done
 
-rt https://localhost:8443/index.html https://localhost:8443/style.css https://localhost:8443/script.js https://localhost:8443/image.jpg
-for i in {1..10}; do rt https://localhost:8443/api.json; done
+rt https://localhost:$TLS_PORT/index.html https://localhost:$TLS_PORT/style.css https://localhost:$TLS_PORT/script.js https://localhost:$TLS_PORT/image.jpg
+for i in {1..5}; do rt https://localhost:$TLS_PORT/api.json; done
 
-echo "HTTP/2 workload finished OK."
+echo "HTTP/2 PGO workload finished OK."
+
 PGO_EOF
 
 chmod +x "$srcdir/pgo-workload.sh"
+
+echo "PGO workload script '$srcdir/pgo-workload.sh' created successfully."
 
   # Generate self-signed certificates for HTTPS testing
   cd "$srcdir"
@@ -235,7 +292,6 @@ build() {
   # Configure with --enable-app to build the tools
   ./configure \
     --prefix=/usr \
-    --disable-python-bindings \
     --disable-static \
     --enable-app
 
@@ -272,7 +328,6 @@ build() {
   # Configure with --enable-app again
   ./configure \
     --prefix=/usr \
-    --disable-python-bindings \
     --disable-static \
     --enable-app
 
@@ -311,7 +366,6 @@ build() {
   ./configure \
     --prefix=/usr \
     --disable-examples \
-    --disable-python-bindings \
     --enable-lib-only
 
   make clean
