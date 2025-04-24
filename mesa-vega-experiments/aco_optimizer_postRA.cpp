@@ -413,56 +413,220 @@ namespace aco {
                   }
             }
 
-
-            /** @brief Converts V_MAD_F32 (VOP3) to V_MADMK/AK_F32 (VOP2) on GFX9 (Vega). */
-            bool
-            try_convert_mad_to_vop2(pr_opt_ctx& ctx, aco_ptr<Instruction>& instr)
+            static bool
+            try_convert_mad_to_vop2(pr_opt_ctx            &ctx,
+                                    aco_ptr<Instruction>  &instr)
             {
-                  // GFX9 Relevance: Targets specific VOP2 instructions available on Vega.
-                  if (ctx.program->gfx_level != amd_gfx_level::GFX9) return false; // Use scoped enum
-                  if (!instr || instr->opcode != aco_opcode::v_mad_f32 || instr->format == Format::VOP2) return false;
-                  if (instr->valu().omod != 0 || instr->valu().clamp) return false;
+                  if (ctx.program->gfx_level != amd_gfx_level::GFX9)
+                        return false;
 
-                  int constant_idx = -1; uint32_t constant_val = 0; bool constant_is_inline = false; int vgpr_count = 0;
+                  if (instr->opcode != aco_opcode::v_mad_f32 &&
+                        instr->opcode != aco_opcode::v_fma_f32)
+                        return false;
+
+                  /* bail if omod/clamp or any input modifiers are present */
+                  if (instr->valu().omod || instr->valu().clamp || instr->usesModifiers())
+                        return false;
+
+                  int       const_idx  = -1;
+                  uint32_t  const_val  = 0;
+                  int       vgpr_seen  = 0;
+
                   for (int i = 0; i < 3; ++i) {
-                        const Operand& op = instr->operands[i];
-                        // Use isConstant() and !isTemp() as proxy for inline/sgpr const, use isOfType for VGPR check
-                        if (op.isConstant() && !op.isLiteral() && op.size() == 4 && (op.isOfType(RegType::sgpr) || (op.isConstant() && !op.isTemp()))) {
-                              if (constant_idx != -1) return false; constant_idx = i; constant_val = op.constantValue(); constant_is_inline = !op.isOfType(RegType::sgpr) && op.isConstant(); // Refined inline check
-                        } else if (op.isOfType(RegType::vgpr) && op.size() == 4) { vgpr_count++; } else { return false; }
-                  }
-                  if (constant_idx == -1 || vgpr_count != 2) return false;
+                        const Operand &op = instr->operands[i];
 
-                  aco_opcode new_opcode; Operand op0, op1, op2;
-                  uint8_t neg_mask = instr->valu().neg; uint8_t abs_mask = instr->valu().abs; uint8_t new_neg_mask = 0; uint8_t new_abs_mask = 0;
-                  if (constant_idx == 1) { // D = V0 * Const + V2 -> MADMK(D, V0, Imm, V2)
-                        new_opcode = aco_opcode::v_madmk_f32; op0 = instr->operands[0]; op1 = Operand::literal32(constant_val); op2 = instr->operands[2];
-                        if (neg_mask & (1 << 0)) { new_neg_mask |= (1 << 0); } if (abs_mask & (1 << 0)) { new_abs_mask |= (1 << 0); } // Use braces
-                        if (neg_mask & (1 << 2)) { new_neg_mask |= (1 << 1); } if (abs_mask & (1 << 2)) { new_abs_mask |= (1 << 1); }
-                  } else if (constant_idx == 2) { // D = V0 * V1 + Const -> MADAK(D, V0, V1, Imm)
-                        new_opcode = aco_opcode::v_madak_f32; op0 = instr->operands[0]; op1 = instr->operands[1]; op2 = Operand::literal32(constant_val);
-                        if (neg_mask & (1 << 0)) { new_neg_mask |= (1 << 0); } if (abs_mask & (1 << 0)) { new_abs_mask |= (1 << 0); }
-                        if (neg_mask & (1 << 1)) { new_neg_mask |= (1 << 1); } if (abs_mask & (1 << 1)) { new_abs_mask |= (1 << 1); }
-                  } else { // D = Const * V1 + V2 -> MADMK(D, V1, Imm, V2)
-                        if (instr->valu().neg[0] || instr->valu().abs[0]) { return false; } // Use braces
-                        new_opcode = aco_opcode::v_madmk_f32;
-                        op0 = instr->operands[1]; op1 = Operand::literal32(constant_val); op2 = instr->operands[2];
-                        if (neg_mask & (1 << 1)) { new_neg_mask |= (1 << 0); } if (abs_mask & (1 << 1)) { new_abs_mask |= (1 << 0); }
-                        if (neg_mask & (1 << 2)) { new_neg_mask |= (1 << 1); } if (abs_mask & (1 << 2)) { new_abs_mask |= (1 << 1); }
+                        if (op.isConstant() && !op.isLiteral()) {
+                              if (const_idx != -1)
+                                    return false;                 /* more than one constant */
+                                    const_idx  = i;
+                              const_val  = op.constantValue();
+                        } else if (op.isOfType(RegType::vgpr)) {
+                              vgpr_seen++;
+                        } else {
+                              /* SGPR or literal constant – cannot convert */
+                              return false;
+                        }
                   }
 
-                  Operand& original_const_op = instr->operands[constant_idx]; Temp const_temp = original_const_op.getTemp();
-                  if (const_temp.id() != 0 && !constant_is_inline && const_temp.id() < ctx.uses.size()) { // Use id() != 0
-                        assert(original_const_op.isOfType(RegType::sgpr)); ctx.uses[const_temp.id()]--;
+                  if (const_idx == -1 || vgpr_seen != 2)
+                        return false;
+
+                  aco_opcode new_op  = (const_idx == 2) ?
+                  aco_opcode::v_madak_f32 :
+                  aco_opcode::v_madmk_f32;
+
+                  Operand src0, src1, src2;
+
+                  switch (const_idx) {
+                        case 0: /* K * v1 + v2  -> madmk   src0=v1,  imm, src2=v2 */
+                              src0 = instr->operands[1];
+                              src1 = Operand::literal32(const_val);
+                              src2 = instr->operands[2];
+                              break;
+                        case 1: /* v0 * K + v2  -> madmk   src0=v0,  imm, src2=v2 */
+                              src0 = instr->operands[0];
+                              src1 = Operand::literal32(const_val);
+                              src2 = instr->operands[2];
+                              break;
+                        case 2: /* v0 * v1 + K  -> madak   src0=v0, src1=v1, imm  */
+                              src0 = instr->operands[0];
+                              src1 = instr->operands[1];
+                              src2 = Operand::literal32(const_val);
+                              break;
+                        default:
+                              unreachable("invalid constant index");
                   }
-                  instr->opcode = new_opcode; instr->format = Format::VOP2;
-                  // Don't resize span. Just assign the 3 logical operands.
-                  // instr->operands.resize(3); <-- REMOVED
-                  instr->operands[0] = op0; instr->operands[1] = op1; instr->operands[2] = op2;
-                  instr->valu().neg = new_neg_mask; instr->valu().abs = new_abs_mask;
+
+                  /* rewrite in place -------------------------------------------------- */
+                  instr->opcode = new_op;
+                  instr->format = Format::VOP2;
+                  instr->operands[0] = src0;
+                  instr->operands[1] = src1;
+                  instr->operands[2] = src2;
+
                   return true;
             }
 
+
+            /* ---------------- literal & SOPK helpers -------------------------- */
+
+            static inline bool fits_inline_literal(uint32_t v)
+            {
+                  if (v <= 64u)
+                        return true;
+                  int32_t sv = (int32_t)v;
+                  if (sv >= -16 && sv <= -1)
+                        return true;
+
+                  /* common float inline values */
+                  switch (v) {
+                        case 0x3f800000u: /*  1.0f */
+                        case 0xbf800000u: /* -1.0f */
+                        case 0x3f000000u: /*  0.5f */
+                        case 0x40000000u: /*  2.0f */
+                        case 0x40800000u: /*  4.0f */
+                              return true;
+                        default:
+                              return false;
+                  }
+            }
+
+            static inline bool fits_simm16(int32_t v)
+            {
+                  return v >= -32768 && v <= 32767;
+            }
+
+            static aco_opcode sop2c_to_sopk(aco_opcode op)
+            {
+                  switch (op) {
+                        case aco_opcode::s_add_i32:      return aco_opcode::s_addk_i32;
+                        case aco_opcode::s_mul_i32:      return aco_opcode::s_mulk_i32;
+                        case aco_opcode::s_cmov_b32:     return aco_opcode::s_cmovk_i32;
+                        case aco_opcode::s_cmp_eq_i32:   return aco_opcode::s_cmpk_eq_i32;
+                        case aco_opcode::s_cmp_lg_i32:   return aco_opcode::s_cmpk_lg_i32;
+                        case aco_opcode::s_cmp_gt_i32:   return aco_opcode::s_cmpk_gt_i32;
+                        case aco_opcode::s_cmp_ge_i32:   return aco_opcode::s_cmpk_ge_i32;
+                        case aco_opcode::s_cmp_lt_i32:   return aco_opcode::s_cmpk_lt_i32;
+                        case aco_opcode::s_cmp_le_i32:   return aco_opcode::s_cmpk_le_i32;
+                        case aco_opcode::s_cmp_eq_u32:   return aco_opcode::s_cmpk_eq_u32;
+                        case aco_opcode::s_cmp_lg_u32:   return aco_opcode::s_cmpk_lg_u32;
+                        case aco_opcode::s_cmp_gt_u32:   return aco_opcode::s_cmpk_gt_u32;
+                        case aco_opcode::s_cmp_ge_u32:   return aco_opcode::s_cmpk_ge_u32;
+                        case aco_opcode::s_cmp_lt_u32:   return aco_opcode::s_cmpk_lt_u32;
+                        case aco_opcode::s_cmp_le_u32:   return aco_opcode::s_cmpk_le_u32;
+                        default:                         return aco_opcode::num_opcodes;
+                  }
+            }
+
+            static bool
+            try_promote_salu_literal(pr_opt_ctx &ctx, aco_ptr<Instruction> &instr)
+            {
+                  if (!instr->isSALU())
+                        return false;
+
+                  const unsigned op_cnt = instr->operands.size();
+                  if (op_cnt == 0 || op_cnt > 2)
+                        return false; /* only SOP1 / SOP2 / SOPC */
+
+                        for (unsigned i = 0; i < op_cnt; ++i) {
+                              Operand &op = instr->operands[i];
+
+                              /* Post‑RA SALU src must be a fixed SGPR temp of class s1 */
+                              if (!op.isTemp() || !op.isFixed() || op.regClass() != s1)
+                                    continue;
+
+                              /* Locate the defining instruction inside the same block */
+                              Idx def_idx = last_writer_idx(ctx, op);
+                              if (!def_idx.found() || def_idx.block != ctx.current_block->index)
+                                    continue;
+
+                              Instruction *def = ctx.get(def_idx);
+
+                              uint32_t imm32 = 0;
+                              bool     have_const = false;
+
+                              if (def->opcode == aco_opcode::s_mov_b32 &&
+                                    def->operands[0].isConstant()) {
+                                    imm32      = def->operands[0].constantValue();
+                              have_const = true;
+                                    } else if (def->opcode == aco_opcode::s_movk_i32) {
+                                          imm32      = static_cast<uint32_t>(static_cast<int16_t>(
+                                                def->salu().imm));
+                                          have_const = true;
+                                    }
+
+                                    if (!have_const)
+                                          continue;
+
+                              /* remember SGPR temp for proper use‑count handling */
+                              Temp sgpr_tmp = op.getTemp();
+
+                              /* -------- try inline literal first -------------------------- */
+                              if (fits_inline_literal(imm32)) {
+                                    op = Operand::c32(imm32);
+
+                                    if (sgpr_tmp.id() && sgpr_tmp.id() < ctx.uses.size())
+                                          --ctx.uses[sgpr_tmp.id()];
+
+                                    return true;
+                              }
+
+                              /* -------- otherwise attempt SOPK conversion ---------------- */
+                              if (!fits_simm16(static_cast<int32_t>(imm32)))
+                                    continue; /* value too large */
+
+                                    aco_opcode sopk_op = sop2c_to_sopk(instr->opcode);
+                              if (sopk_op == aco_opcode::num_opcodes)
+                                    continue; /* no SOPK twin */
+
+                                    /* build new SOPK instruction */
+                                    aco_ptr<Instruction> sopk(
+                                          create_instruction(sopk_op, Format::SOPK, 1,
+                                                             instr->definitions.size()));
+
+                                    /* copy definitions verbatim */
+                                    for (unsigned d = 0; d < instr->definitions.size(); ++d)
+                                          sopk->definitions[d] = instr->definitions[d];
+
+                              /* SOPK has exactly one SGPR operand (if any) */
+                              if (op_cnt == 2) {
+                                    const unsigned other = i ^ 1;
+                                    sopk->operands[0] = instr->operands[other];
+                              }
+
+                              sopk->salu().imm = static_cast<uint16_t>(
+                                    static_cast<int16_t>(imm32));
+
+                              /* adjust use‑counts: SGPR constant removed */
+                              if (sgpr_tmp.id() && sgpr_tmp.id() < ctx.uses.size())
+                                    --ctx.uses[sgpr_tmp.id()];
+
+                              instr.swap(sopk);
+                              return true;
+                        }
+
+                        return false;
+            }
 
             // --- Helpers for SGPR Literal Promotion ---
 
@@ -954,7 +1118,10 @@ namespace aco {
             {
                   if (!instr) { ctx.current_instr_idx++; return; }
                   if (is_dead(ctx.uses, instr.get())) { instr.reset(); ctx.current_instr_idx++; return; }
-
+                  if (ctx.program->gfx_level == amd_gfx_level::GFX9 &&
+                        try_promote_salu_literal(ctx, instr)) {
+                        ;
+                        }
                   unsigned original_index = ctx.current_instr_idx;
                   bool restructured = try_optimize_branching_sequence(ctx, instr);
                   if (restructured) {

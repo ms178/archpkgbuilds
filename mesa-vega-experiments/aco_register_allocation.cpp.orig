@@ -1280,8 +1280,15 @@ get_reg_impl(ra_ctx& ctx, const RegisterFile& reg_file, std::vector<parallelcopy
    /* mark and count killed operands */
    unsigned killed_ops = 0;
    std::bitset<256> is_killed_operand; /* per-register */
+   std::bitset<256> is_precolored;     /* per-register */
    for (unsigned j = 0; !is_phi(instr) && j < instr->operands.size(); j++) {
       Operand& op = instr->operands[j];
+      if (op.isTemp() && op.isPrecolored() && !op.isFirstKillBeforeDef() &&
+          bounds.contains(op.physReg())) {
+         for (unsigned i = 0; i < op.size(); ++i) {
+            is_precolored[(op.physReg() & 0xff) + i] = true;
+         }
+      }
       if (op.isTemp() && op.isFirstKillBeforeDef() && bounds.contains(op.physReg()) &&
           !reg_file.test(PhysReg{op.physReg().reg()}, align(op.bytes() + op.physReg().byte(), 4))) {
          assert(op.isFixed());
@@ -1291,6 +1298,14 @@ get_reg_impl(ra_ctx& ctx, const RegisterFile& reg_file, std::vector<parallelcopy
          }
 
          killed_ops += op.getTemp().size();
+      }
+   }
+   for (unsigned j = 0; !is_phi(instr) && j < instr->definitions.size(); j++) {
+      Definition& def = instr->definitions[j];
+      if (def.isTemp() && def.isPrecolored() && bounds.contains(def.physReg())) {
+         for (unsigned i = 0; i < def.size(); ++i) {
+            is_precolored[(def.physReg() & 0xff) + i] = true;
+         }
       }
    }
 
@@ -1336,6 +1351,10 @@ get_reg_impl(ra_ctx& ctx, const RegisterFile& reg_file, std::vector<parallelcopy
                remaining_op_moves--;
             }
             continue;
+         }
+         if (is_precolored[j & 0xFF]) {
+            found = false;
+            break;
          }
 
          if (reg_file[j] == 0 || reg_file[j] == last_var)
@@ -2104,9 +2123,12 @@ operand_can_use_reg(amd_gfx_level gfx_level, aco_ptr<Instruction>& instr, unsign
          return false;
       FALLTHROUGH;
    case Format::SOP2:
-   case Format::SOP1:
-      return get_op_fixed_to_def(instr.get()) != (int)idx ||
+   case Format::SOP1: {
+      auto fixed_ops = get_ops_fixed_to_def(instr.get());
+      return std::all_of(fixed_ops.begin(), fixed_ops.end(),
+                         [idx](auto op_idx) { return op_idx != idx; }) ||
              is_sgpr_writable_without_side_effects(gfx_level, reg);
+   }
    default:
       // TODO: there are more instructions with restrictions on registers
       return true;
@@ -2813,7 +2835,7 @@ get_affinities(ra_ctx& ctx)
             ctx.assignments[instr->operands[0].tempId()].m0 = true;
          }
 
-         int op_fixed_to_def0 = get_op_fixed_to_def(instr.get());
+         auto ops_fixed_to_defs = get_ops_fixed_to_def(instr.get());
          for (unsigned i = 0; i < instr->definitions.size(); i++) {
             const Definition& def = instr->definitions[i];
             if (!def.isTemp())
@@ -2827,8 +2849,8 @@ get_affinities(ra_ctx& ctx)
                Operand op;
                if (instr->opcode == aco_opcode::p_parallelcopy) {
                   op = instr->operands[i];
-               } else if (i == 0 && op_fixed_to_def0 != -1) {
-                  op = instr->operands[op_fixed_to_def0];
+               } else if (i < ops_fixed_to_defs.size()) {
+                  op = instr->operands[ops_fixed_to_defs[i]];
                } else if (vop3_can_use_vop2acc(ctx, instr.get())) {
                   op = instr->operands[2];
                } else if (i == 0 && sop2_can_use_sopk(ctx, instr.get())) {
@@ -3253,11 +3275,10 @@ register_allocation(Program* program, ra_test_policy policy)
           * We can't read from the old location because it's corrupted, and we can't write the new
           * location because that's used by a live-through operand.
           */
-         int op_fixed_to_def = get_op_fixed_to_def(instr.get());
-         if (op_fixed_to_def != -1) {
-            instr->definitions[0].setPrecolored(instr->operands[op_fixed_to_def].physReg());
-            instr->operands[op_fixed_to_def].setPrecolored(
-               instr->operands[op_fixed_to_def].physReg());
+         unsigned fixed_def_idx = 0;
+         for (auto op_idx : get_ops_fixed_to_def(instr.get())) {
+            instr->definitions[fixed_def_idx++].setPrecolored(instr->operands[op_idx].physReg());
+            instr->operands[op_idx].setPrecolored(instr->operands[op_idx].physReg());
          }
 
          /* handle fixed definitions first */
