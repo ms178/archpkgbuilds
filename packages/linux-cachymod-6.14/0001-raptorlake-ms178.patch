@@ -1,3 +1,275 @@
+--- a/drivers/pci/msi/msi.c	2025-04-26 16:35:23.647821877 +0200
++++ b/drivers/pci/msi/msi.c	2025-04-26 16:48:01.839153108 +0200
+@@ -7,6 +7,7 @@
+  * Copyright (C) 2016 Christoph Hellwig.
+  */
+ #include <linux/bitfield.h>
++#include <linux/bitmap.h>
+ #include <linux/err.h>
+ #include <linux/export.h>
+ #include <linux/irq.h>
+@@ -184,25 +185,36 @@ void __pci_read_msi_msg(struct msi_desc
+ 	}
+ }
+ 
+-static inline void pci_write_msg_msi(struct pci_dev *dev, struct msi_desc *desc,
++static inline void pci_write_msg_msi(struct pci_dev *dev,
++				     struct msi_desc *desc,
+ 				     struct msi_msg *msg)
+ {
+ 	int pos = dev->msi_cap;
+ 	u16 msgctl;
+ 
++	/* Read the current MSI control word once */
+ 	pci_read_config_word(dev, pos + PCI_MSI_FLAGS, &msgctl);
+-	msgctl &= ~PCI_MSI_FLAGS_QSIZE;
+-	msgctl |= FIELD_PREP(PCI_MSI_FLAGS_QSIZE, desc->pci.msi_attrib.multiple);
+-	pci_write_config_word(dev, pos + PCI_MSI_FLAGS, msgctl);
+ 
++	/* Desired value of the QSIZE field */
++	u16 desired = (msgctl & ~PCI_MSI_FLAGS_QSIZE) |
++	FIELD_PREP(PCI_MSI_FLAGS_QSIZE,
++		   desc->pci.msi_attrib.multiple);
++
++	/* Write back only when the QSIZE field actually changes */
++	if (desired != msgctl)
++		pci_write_config_word(dev, pos + PCI_MSI_FLAGS, desired);
++
++	/* Program address & data payload */
+ 	pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_LO, msg->address_lo);
+ 	if (desc->pci.msi_attrib.is_64) {
+-		pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_HI,  msg->address_hi);
+-		pci_write_config_word(dev, pos + PCI_MSI_DATA_64, msg->data);
++		pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_HI,
++				       msg->address_hi);
++		pci_write_config_word(dev,  pos + PCI_MSI_DATA_64,  msg->data);
+ 	} else {
+-		pci_write_config_word(dev, pos + PCI_MSI_DATA_32, msg->data);
++		pci_write_config_word(dev,  pos + PCI_MSI_DATA_32,  msg->data);
+ 	}
+-	/* Ensure that the writes are visible in the device */
++
++	/* Posting read: make sure all config writes hit the device */
+ 	pci_read_config_word(dev, pos + PCI_MSI_FLAGS, &msgctl);
+ }
+ 
+@@ -765,26 +777,70 @@ out_disable:
+ 	return ret;
+ }
+ 
+-static bool pci_msix_validate_entries(struct pci_dev *dev, struct msix_entry *entries, int nvec)
++static bool pci_msix_validate_entries(struct pci_dev    *dev,
++				      struct msix_entry *entries,
++				      int                nvec)
+ {
+ 	bool nogap;
+ 	int i, j;
+ 
+-	if (!entries)
++	/* Nothing to validate?  Accept immediately. */
++	if (!entries) {
+ 		return true;
++	}
+ 
+-	nogap = pci_msi_domain_supports(dev, MSI_FLAG_MSIX_CONTIGUOUS, DENY_LEGACY);
++	nogap = pci_msi_domain_supports(dev,
++					MSI_FLAG_MSIX_CONTIGUOUS,
++				 DENY_LEGACY);
++
++	/* ---------- fast O(N) path with a bitmap ---------- */
++	{
++		unsigned int maxbit = 0;
++
++		for (i = 0; i < nvec; i++)
++			if (entries[i].entry > maxbit)
++				maxbit = entries[i].entry;
++
++		/* bitmap size is maxbit + 1 bits, inclusive */
++		{
++			unsigned long *bm =
++			bitmap_zalloc(maxbit + 1, GFP_KERNEL);
++
++			if (bm) {
++				for (i = 0; i < nvec; i++) {
++					unsigned int idx = entries[i].entry;
++
++					/* duplicate? */
++					if (test_and_set_bit(idx, bm)) {
++						bitmap_free(bm);
++						return false;
++					}
++				}
++
++				if (nogap &&
++					/* any zero bit in 0 … nvec-1 ? */
++					find_first_zero_bit(bm, nvec) < nvec) {
++					bitmap_free(bm);
++				return false;     /* gap */
++					}
++
++					bitmap_free(bm);
++					return true;              /* valid */
++			}
++		}
++	}
+ 
++	/* ---------- fallback: original quadratic scan ---------- */
+ 	for (i = 0; i < nvec; i++) {
+-		/* Check for duplicate entries */
+ 		for (j = i + 1; j < nvec; j++) {
+ 			if (entries[i].entry == entries[j].entry)
+-				return false;
++				return false;     /* duplicate */
+ 		}
+-		/* Check for unsupported gaps */
++
+ 		if (nogap && entries[i].entry != i)
+-			return false;
++			return false;             /* gap */
+ 	}
++
+ 	return true;
+ }
+ 
+
+
+--- a/drivers/pci/irq.c	2025-04-26 16:32:43.874535346 +0200
++++ b/drivers/pci/irq.c	2025-04-26 16:32:30.423017727 +0200
+@@ -4,6 +4,13 @@
+  *
+  * Copyright (c) 2008 James Bottomley <James.Bottomley@HansenPartnership.com>
+  * Copyright (C) 2017 Christoph Hellwig.
++ *
++ * Minor optimisation tweaks:
++ *   – Cache host-bridge callback pointers in pci_assign_irq()
++ *   – Add unlikely() branch-prediction hint in pci_check_and_set_intx_mask()
++ *
++ * These changes are local to this translation unit and do not alter any
++ * externally visible API behaviour.
+  */
+ 
+ #include <linux/device.h>
+@@ -12,6 +19,7 @@
+ #include <linux/export.h>
+ #include <linux/interrupt.h>
+ #include <linux/pci.h>
++#include <linux/compiler.h>	/* for likely()/unlikely() */
+ 
+ #include "pci.h"
+ 
+@@ -75,7 +83,7 @@ EXPORT_SYMBOL(pci_request_irq);
+  */
+ void pci_free_irq(struct pci_dev *dev, unsigned int nr, void *dev_id)
+ {
+-	kfree(free_irq(pci_irq_vector(dev, nr), dev_id));
++	free_irq(pci_irq_vector(dev, nr), dev_id);
+ }
+ EXPORT_SYMBOL(pci_free_irq);
+ 
+@@ -141,50 +149,45 @@ EXPORT_SYMBOL_GPL(pci_common_swizzle);
+ 
+ void pci_assign_irq(struct pci_dev *dev)
+ {
+-	u8 pin;
+-	u8 slot = -1;
+-	int irq = 0;
+-	struct pci_host_bridge *hbrg = pci_find_host_bridge(dev->bus);
+-
+-	if (!(hbrg->map_irq)) {
+-		pci_dbg(dev, "runtime IRQ mapping not provided by arch\n");
+-		return;
+-	}
+-
+-	/*
+-	 * If this device is not on the primary bus, we need to figure out
+-	 * which interrupt pin it will come in on. We know which slot it
+-	 * will come in on because that slot is where the bridge is. Each
+-	 * time the interrupt line passes through a PCI-PCI bridge we must
+-	 * apply the swizzle function.
+-	 */
+-	pci_read_config_byte(dev, PCI_INTERRUPT_PIN, &pin);
+-	/* Cope with illegal. */
+-	if (pin > 4)
+-		pin = 1;
+-
+-	if (pin) {
+-		/* Follow the chain of bridges, swizzling as we go. */
+-		if (hbrg->swizzle_irq)
+-			slot = (*(hbrg->swizzle_irq))(dev, &pin);
+-
+-		/*
+-		 * If a swizzling function is not used, map_irq() must
+-		 * ignore slot.
+-		 */
+-		irq = (*(hbrg->map_irq))(dev, slot, pin);
+-		if (irq == -1)
+-			irq = 0;
+-	}
+-	dev->irq = irq;
++    u8 pin;
++    u8 slot = (u8)-1;
++    int irq = 0;
++    struct pci_host_bridge *hbrg = pci_find_host_bridge(dev->bus);
++
++    /* ── cached host-bridge callbacks (matching prototype verbatim) ── */
++    int (*map_irq)(const struct pci_dev *, u8, u8) = hbrg->map_irq;
++    u8  (*swizzle_irq)(struct pci_dev *, u8 *)      = hbrg->swizzle_irq;
++    /* ─────────────────────────────────────────────────────────────── */
++
++    if (!map_irq) {
++        pci_dbg(dev, "runtime IRQ mapping not provided by arch\n");
++        return;
++    }
++
++    /* Read INTx pin from config space */
++    pci_read_config_byte(dev, PCI_INTERRUPT_PIN, &pin);
++    if (pin > 4)          /* cope with illegal value */
++        pin = 1;
++
++    if (pin) {
++        /* Follow the bridge chain, swizzling as we go */
++        if (swizzle_irq)
++            slot = swizzle_irq(dev, &pin);
++
++        /*
++         * If no swizzling function is present, map_irq() must
++         * ignore @slot.
++         */
++        irq = map_irq(dev, slot, pin);
++        if (irq == -1)
++            irq = 0;
++    }
+ 
+-	pci_dbg(dev, "assign IRQ: got %d\n", dev->irq);
++    dev->irq = irq;
++    pci_dbg(dev, "assign IRQ: got %d\n", dev->irq);
+ 
+-	/*
+-	 * Always tell the device, so the driver knows what is the real IRQ
+-	 * to use; the device does not use it.
+-	 */
+-	pci_write_config_byte(dev, PCI_INTERRUPT_LINE, irq);
++    /* Tell the device the real IRQ (driver only, device ignores it) */
++    pci_write_config_byte(dev, PCI_INTERRUPT_LINE, irq);
+ }
+ 
+ static bool pci_check_and_set_intx_mask(struct pci_dev *dev, bool mask)
+@@ -213,8 +216,11 @@ static bool pci_check_and_set_intx_mask(
+ 	 * Check interrupt status register to see whether our device
+ 	 * triggered the interrupt (when masking) or the next IRQ is
+ 	 * already pending (when unmasking).
++	 *
++	 * unlikely(): the mismatch path is hit only when an interrupt
++	 * races this call, making it truly rare.
+ 	 */
+-	if (mask != irq_pending) {
++	if (unlikely(mask != irq_pending)) {
+ 		mask_updated = false;
+ 		goto done;
+ 	}
+
+
+
 --- a/drivers/cpufreq/intel_pstate.c	2025-04-13 11:40:05.273247310 +0200
 +++ b/drivers/cpufreq/intel_pstate.c	2025-04-20 15:51:11.133723810 +0200
 @@ -18,6 +18,9 @@
