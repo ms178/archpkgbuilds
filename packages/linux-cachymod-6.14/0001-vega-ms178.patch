@@ -1,3 +1,282 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h	2025-04-25 10:51:21.000000000 +0200
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h	2025-04-26 19:30:33.996606337 +0200
+@@ -25,6 +25,7 @@
+ #define __AMDGPU_IRQ_H__
+ 
+ #include <linux/irqdomain.h>
++#include <linux/irq_work.h>
+ #include "soc15_ih_clientid.h"
+ #include "amdgpu_ih.h"
+ 
+@@ -82,24 +83,38 @@ struct amdgpu_irq {
+ 	bool				installed;
+ 	unsigned int			irq;
+ 	spinlock_t			lock;
++
+ 	/* interrupt sources */
+ 	struct amdgpu_irq_client	client[AMDGPU_IRQ_CLIENTID_MAX];
+ 
+ 	/* status, etc. */
+-	bool				msi_enabled; /* msi enabled */
++	bool				msi_enabled;		/* MSI enabled */
+ 
+ 	/* interrupt rings */
+ 	struct amdgpu_ih_ring		ih, ih1, ih2, ih_soft;
+ 	const struct amdgpu_ih_funcs    *ih_funcs;
+-	struct work_struct		ih1_work, ih2_work, ih_soft_work;
++
++	/* legacy workqueue bottom-halves (kept for structure stability) */
++	struct work_struct		ih1_work;
++	struct work_struct		ih2_work;
++	struct work_struct		ih_soft_work;
++
++	/* new fast bottom-halves executed via irq_work */
++	struct irq_work			ih1_iw;
++	struct irq_work			ih2_iw;
++	struct irq_work			ih_soft_iw;
++
++	/* self-IRQ source */
+ 	struct amdgpu_irq_src		self_irq;
+ 
+-	/* gen irq stuff */
+-	struct irq_domain		*domain; /* GPU irq controller domain */
++	/* generic IRQ infrastructure */
++	struct irq_domain		*domain;		/* GPU IRQ domain */
+ 	unsigned			virq[AMDGPU_MAX_IRQ_SRC_ID];
+-	uint32_t                        srbm_soft_reset;
+-	u32                             retry_cam_doorbell_index;
+-	bool                            retry_cam_enabled;
++
++	/* misc */
++	uint32_t			srbm_soft_reset;
++	u32				retry_cam_doorbell_index;
++	bool				retry_cam_enabled;
+ };
+ 
+ enum interrupt_node_id_per_aid {
+
+
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c	2025-04-25 10:51:21.000000000 +0200
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c	2025-04-26 19:35:40.185257128 +0200
+@@ -43,6 +43,7 @@
+  */
+ 
+ #include <linux/irq.h>
++#include <linux/irq_work.h>
+ #include <linux/pci.h>
+ 
+ #include <drm/drm_vblank.h>
+@@ -114,6 +115,16 @@ const int node_id_to_phys_map[NODEID_MAX
+ 	[XCD7_NODEID] = 7,
+ };
+ 
++/* Fast bottom-half executed in soft-IRQ context */
++static void amdgpu_irq_handle_ih_soft_iw(struct irq_work *iw)
++{
++	struct amdgpu_device *adev =
++	container_of(iw, struct amdgpu_device, irq.ih_soft_iw);
++
++	/* same payload as the former workqueue handler */
++	amdgpu_ih_process(adev, &adev->irq.ih_soft);
++}
++
+ /**
+  * amdgpu_irq_disable_all - disable *all* interrupts
+  *
+@@ -123,31 +134,36 @@ const int node_id_to_phys_map[NODEID_MAX
+  */
+ void amdgpu_irq_disable_all(struct amdgpu_device *adev)
+ {
+-	unsigned long irqflags;
++	unsigned long flags;
+ 	unsigned int i, j, k;
+-	int r;
+ 
+-	spin_lock_irqsave(&adev->irq.lock, irqflags);
+-	for (i = 0; i < AMDGPU_IRQ_CLIENTID_MAX; ++i) {
+-		if (!adev->irq.client[i].sources)
++	spin_lock_irqsave(&adev->irq.lock, flags);
++
++	for (i = 0; i < AMDGPU_IRQ_CLIENTID_MAX; i++) {
++		struct amdgpu_irq_client *cl = &adev->irq.client[i];
++
++		if (!cl->sources)
+ 			continue;
+ 
+-		for (j = 0; j < AMDGPU_MAX_IRQ_SRC_ID; ++j) {
+-			struct amdgpu_irq_src *src = adev->irq.client[i].sources[j];
++		for (j = 0; j < AMDGPU_MAX_IRQ_SRC_ID; j++) {
++			struct amdgpu_irq_src *src = cl->sources[j];
+ 
+ 			if (!src || !src->funcs->set || !src->num_types)
+ 				continue;
+ 
+-			for (k = 0; k < src->num_types; ++k) {
+-				r = src->funcs->set(adev, src, k,
+-						    AMDGPU_IRQ_STATE_DISABLE);
+-				if (r)
+-					DRM_ERROR("error disabling interrupt (%d)\n",
+-						  r);
++			for (k = 0; k < src->num_types; k++) {
++				if (!atomic_read(&src->enabled_types[k]))
++					continue;
++
++				if (src->funcs->set(adev, src, k,
++					AMDGPU_IRQ_STATE_DISABLE))
++					DRM_ERROR("error disabling IRQ %u/%u\n",
++							  i, j);
+ 			}
+ 		}
+ 	}
+-	spin_unlock_irqrestore(&adev->irq.lock, irqflags);
++
++	spin_unlock_irqrestore(&adev->irq.lock, flags);
+ }
+ 
+ /**
+@@ -207,21 +223,6 @@ static void amdgpu_irq_handle_ih2(struct
+ }
+ 
+ /**
+- * amdgpu_irq_handle_ih_soft - kick of processing for ih_soft
+- *
+- * @work: work structure in struct amdgpu_irq
+- *
+- * Kick of processing IH soft ring.
+- */
+-static void amdgpu_irq_handle_ih_soft(struct work_struct *work)
+-{
+-	struct amdgpu_device *adev = container_of(work, struct amdgpu_device,
+-						  irq.ih_soft_work);
+-
+-	amdgpu_ih_process(adev, &adev->irq.ih_soft);
+-}
+-
+-/**
+  * amdgpu_msi_ok - check whether MSI functionality is enabled
+  *
+  * @adev: amdgpu device pointer (unused)
+@@ -273,55 +274,64 @@ int amdgpu_irq_init(struct amdgpu_device
+ 	unsigned int irq, flags;
+ 	int r;
+ 
++	/* ---------------- generic setup ---------------- */
+ 	spin_lock_init(&adev->irq.lock);
+ 
+-	/* Enable MSI if not disabled by module parameter */
+ 	adev->irq.msi_enabled = false;
++	flags = amdgpu_msi_ok(adev) ? PCI_IRQ_ALL_TYPES : PCI_IRQ_INTX;
+ 
+-	if (!amdgpu_msi_ok(adev))
+-		flags = PCI_IRQ_INTX;
+-	else
+-		flags = PCI_IRQ_ALL_TYPES;
+-
+-	/* we only need one vector */
+ 	r = pci_alloc_irq_vectors(adev->pdev, 1, 1, flags);
+ 	if (r < 0) {
+-		dev_err(adev->dev, "Failed to alloc msi vectors\n");
++		dev_err(adev->dev, "failed to allocate IRQ vector\n");
+ 		return r;
+ 	}
+ 
+ 	if (amdgpu_msi_ok(adev)) {
+ 		adev->irq.msi_enabled = true;
+-		dev_dbg(adev->dev, "using MSI/MSI-X.\n");
++		dev_dbg(adev->dev, "using MSI/MSI-X\n");
+ 	}
+ 
++	/* IH1 / IH2 still use workqueues */
+ 	INIT_WORK(&adev->irq.ih1_work, amdgpu_irq_handle_ih1);
+ 	INIT_WORK(&adev->irq.ih2_work, amdgpu_irq_handle_ih2);
+-	INIT_WORK(&adev->irq.ih_soft_work, amdgpu_irq_handle_ih_soft);
+ 
+-	/* Use vector 0 for MSI-X. */
+-	r = pci_irq_vector(adev->pdev, 0);
++	/* fast bottom-half for the software IH ring (irq_work) */
++	init_irq_work(&adev->irq.ih_soft_iw, amdgpu_irq_handle_ih_soft_iw);
++
++	/* ---------------- vector & handler ---------------- */
++	r = pci_irq_vector(adev->pdev, 0);	/* use vector 0 */
+ 	if (r < 0)
+ 		goto free_vectors;
+ 	irq = r;
+ 
+-	/* PCI devices require shared interrupts. */
+-	r = request_irq(irq, amdgpu_irq_handler, IRQF_SHARED, adev_to_drm(adev)->driver->name,
+-			adev_to_drm(adev));
++	r = request_irq(irq, amdgpu_irq_handler, IRQF_SHARED,
++					adev_to_drm(adev)->driver->name,
++					adev_to_drm(adev));
+ 	if (r)
+ 		goto free_vectors;
+ 
+-	adev->irq.installed = true;
+-	adev->irq.irq = irq;
++	/* ---------------- locality hint ------------------ */
++	#ifdef CONFIG_GENERIC_IRQ_MIGRATION
++	{
++		int node = dev_to_node(&adev->pdev->dev);
++		const struct cpumask *mask = (node >= 0) ?
++		cpumask_of_node(node) :
++		cpu_online_mask;
++
++		irq_set_affinity_hint(irq, mask);
++	}
++	#endif
++
++	adev->irq.installed            = true;
++	adev->irq.irq                  = irq;
+ 	adev_to_drm(adev)->max_vblank_count = 0x00ffffff;
+ 
+-	DRM_DEBUG("amdgpu: irq initialized.\n");
++	DRM_DEBUG("amdgpu: IRQ initialised\n");
+ 	return 0;
+ 
+-free_vectors:
++	free_vectors:
+ 	if (adev->irq.msi_enabled)
+ 		pci_free_irq_vectors(adev->pdev);
+-
+ 	adev->irq.msi_enabled = false;
+ 	return r;
+ }
+@@ -330,7 +340,13 @@ void amdgpu_irq_fini_hw(struct amdgpu_de
+ {
+ 	if (adev->irq.installed) {
+ 		free_irq(adev->irq.irq, adev_to_drm(adev));
++
++		#ifdef CONFIG_GENERIC_IRQ_MIGRATION
++		irq_set_affinity_hint(adev->irq.irq, NULL);
++		#endif
++
+ 		adev->irq.installed = false;
++
+ 		if (adev->irq.msi_enabled)
+ 			pci_free_irq_vectors(adev->pdev);
+ 	}
+@@ -506,11 +522,15 @@ void amdgpu_irq_dispatch(struct amdgpu_d
+  * if the hardware delegation to IH1 or IH2 doesn't work for some reason.
+  */
+ void amdgpu_irq_delegate(struct amdgpu_device *adev,
+-			 struct amdgpu_iv_entry *entry,
+-			 unsigned int num_dw)
++						 struct amdgpu_iv_entry *entry,
++						 unsigned int num_dw)
+ {
+-	amdgpu_ih_ring_write(adev, &adev->irq.ih_soft, entry->iv_entry, num_dw);
+-	schedule_work(&adev->irq.ih_soft_work);
++	/* write IV to the software ring first */
++	amdgpu_ih_ring_write(adev, &adev->irq.ih_soft,
++						 entry->iv_entry, num_dw);
++
++	/* queue fast bottom-half */
++	irq_work_queue(&adev->irq.ih_soft_iw);
+ }
+ 
+ /**
+
+
 --- a/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c	2025-04-10 14:44:49.000000000 +0200
 +++ b/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c	2025-04-19 23:06:54.825287367 +0200
 @@ -643,90 +643,65 @@ static int sdma_v4_0_init_microcode(stru
