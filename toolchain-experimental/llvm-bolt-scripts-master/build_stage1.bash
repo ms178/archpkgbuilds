@@ -14,7 +14,6 @@ echo "== Build with system clang"
 cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -DLLVM_BINUTILS_INCDIR=/usr/include \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCLANG_ENABLE_ARCMT=OFF \
     -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
     -DCLANG_PLUGIN_SUPPORT=OFF \
     -DLLVM_ENABLE_BINDINGS=OFF \

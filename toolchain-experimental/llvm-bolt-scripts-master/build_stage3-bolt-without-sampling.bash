@@ -65,22 +65,22 @@ optimize_binary() {
 
     echo "Optimizing ${binary}"
     LD_PRELOAD=/usr/lib/libmimalloc.so "${BOLTPATH}/llvm-bolt" "${binary}.org" \
-        --data "${profile}" \
-        -o "${binary}" \
-        --dyno-stats \
-        --lite=false \
-        --icf=all \
-        --plt=all \
-        --hugify \
-        --peepholes=all \
-        --x86-strip-redundant-address-size \
-        --indirect-call-promotion=all \
-        --reorder-blocks=ext-tsp \
-        --reorder-functions=cdsort \
-        --split-all-cold \
-        --split-eh \
-        --split-functions \
-        --split-strategy=cdsplit || return 1
+            --data "${profile}" \
+            -o "${binary}" \
+            --lite=false \
+            --reorder-functions=cdsort      \
+            --reorder-functions-use-hot-size \
+            --reorder-blocks=ext-tsp        \
+            --split-functions --split-strategy=cdsplit \
+            --hugify                        \
+            --icf=all                      \
+            --peepholes=all                 \
+            --reg-reassign --use-aggr-reg-reassign \
+            --align-functions=32 --align-blocks --block-alignment=16 \
+            --indirect-call-promotion=all --indirect-call-promotion-topn=3 \
+            --jump-tables=move              \
+            --dyno-stats \
+            --plt=all || return 1
 }
 
 # Optimize binaries
