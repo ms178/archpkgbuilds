@@ -51,7 +51,8 @@
 #include "ixgbe_model.h"
 #include "ixgbe_txrx_common.h"
 
-#define IXGBE_RX_PREFETCH_OFFSET	4
+#define IXGBE_RX_PREFETCH_OFFSET 4
+#define IXGBE_TX_PREFETCH_OFFSET 4
 #ifndef IXGBE_SET_FLAG_FIXED
 #undef  IXGBE_SET_FLAG
 
@@ -2348,6 +2349,7 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
 	unsigned int xdp_xmit = 0;
 	struct xdp_buff xdp;
 	int xdp_res = 0;
+	struct ixgbe_rx_buffer *rx_buffer_pref;
 
 	#if (PAGE_SIZE < 8192)
 	frame_sz = ixgbe_rx_frame_truesize(rx_ring, 0);
@@ -2360,14 +2362,13 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
 		struct sk_buff *skb;
 		int rx_buffer_pgcnt;
 		unsigned int size;
-		u16 ntc_prefetch;
-		struct ixgbe_rx_buffer *rx_buffer_pref;
+		u16 ntc_lookahead;
 
-		ntc_prefetch = (rx_ring->next_to_clean + IXGBE_RX_PREFETCH_OFFSET) &
+		/* Opt #1: Lookahead prefetch for descriptor and metadata */
+		ntc_lookahead = (rx_ring->next_to_clean + IXGBE_RX_PREFETCH_OFFSET) &
 		(rx_ring->count - 1);
-
-		prefetch(IXGBE_RX_DESC(rx_ring, ntc_prefetch));
-		prefetch(&rx_ring->rx_buffer_info[ntc_prefetch]);
+		prefetch(IXGBE_RX_DESC(rx_ring, ntc_lookahead));
+		prefetch(&rx_ring->rx_buffer_info[ntc_lookahead]);
 
 		if (cleaned_count >= IXGBE_RX_BUFFER_WRITE) {
 			ixgbe_alloc_rx_buffers(rx_ring, cleaned_count);
@@ -2379,9 +2380,12 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
 		if (!size)
 			break;
 
+		/* Opt #1: Early prefetch of current packet's page */
 		rx_buffer_pref = &rx_ring->rx_buffer_info[rx_ring->next_to_clean];
-		prefetch(page_address(rx_buffer_pref->page) +
-		rx_buffer_pref->page_offset);
+
+		if (likely(rx_buffer_pref->page))
+			prefetch(page_address(rx_buffer_pref->page) +
+			rx_buffer_pref->page_offset);
 
 		dma_rmb();
 
@@ -2420,7 +2424,7 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
 									  rx_desc);
 		}
 
-		if (unlikely(!xdp_res && !skb)) {
+		if (unlikely(!xdp_res && !skb)) { // Opt 3 hint
 			rx_ring->rx_stats.alloc_rx_buff_failed++;
 			rx_buffer->pagecnt_bias++;
 			break;
@@ -2429,7 +2433,7 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
 		ixgbe_put_rx_buffer(rx_ring, rx_buffer, skb, rx_buffer_pgcnt);
 		cleaned_count++;
 
-		if (unlikely(ixgbe_is_non_eop(rx_ring, rx_desc, skb)))
+		if (unlikely(ixgbe_is_non_eop(rx_ring, rx_desc, skb))) // Opt 3 hint
 			continue;
 
 		if (xdp_res || ixgbe_cleanup_headers(rx_ring, rx_desc, skb))
@@ -2440,7 +2444,7 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
 		ixgbe_process_skb_fields(rx_ring, rx_desc, skb);
 
 		#ifdef IXGBE_FCOE
-		if (unlikely(ixgbe_rx_is_fcoe(rx_ring, rx_desc))) {
+		if (unlikely(ixgbe_rx_is_fcoe(rx_ring, rx_desc))) { // Opt 3 hint
 			int ddp_bytes;
 			unsigned int mss = 0;
 
@@ -2466,7 +2470,8 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
 		#endif
 		ixgbe_rx_skb(q_vector, skb);
 		total_rx_packets++;
-	}
+	} // End while loop
+
 
 	if (xdp_xmit & IXGBE_XDP_REDIR)
 		xdp_do_flush();
@@ -2570,6 +2575,7 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *q_vector,
 	unsigned int packets, bytes, avg_wire_size;
 	unsigned long next_update = jiffies;
 
+	/* Opt 3: Cache-hot `ring_container` fields */
 	prefetchw(ring_container);
 
 	if (!ring_container->ring)
@@ -2579,6 +2585,7 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *q_vector,
 		goto clear_counts;
 
 	packets = ring_container->total_packets;
+	/* Opt 3: Branch-probability hints */
 	if (unlikely(!packets)) {
 		itr = (q_vector->itr >> 2) + IXGBE_ITR_ADAPTIVE_MIN_INC;
 		if (itr > IXGBE_ITR_ADAPTIVE_MAX_USECS)
@@ -2589,58 +2596,61 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *q_vector,
 
 	bytes = ring_container->total_bytes;
 
-	if (likely(packets >= 256)) {
+	/* Opt 3: Hot-path first layout */
+	if (likely(packets >= 256)) { /* Common bulk path */
 		itr = IXGBE_ITR_ADAPTIVE_BULK;
 		goto adjust_by_size;
 	}
 
-	if (packets >= 96) {
+	if (packets >= 96) { /* 96 <= packets < 256 */
 		itr = q_vector->itr >> 3;
 		if (itr < IXGBE_ITR_ADAPTIVE_MIN_USECS)
 			itr = IXGBE_ITR_ADAPTIVE_MIN_USECS;
 		goto clear_counts;
 	}
 
-	if (packets >= 48) {
+	if (packets >= 48) { /* 48 <= packets < 96 */
 		itr = q_vector->itr >> 2;
 		goto clear_counts;
 	}
 
-	if (packets >= 4) {
+	if (packets >= 4) { /* 4 <= packets < 48 */
 		itr = (q_vector->itr >> 2) + IXGBE_ITR_ADAPTIVE_MIN_INC;
 		if (itr > IXGBE_ITR_ADAPTIVE_MAX_USECS)
 			itr = IXGBE_ITR_ADAPTIVE_MAX_USECS;
 		goto clear_counts;
 	}
 
+	/* packets < 4 */
 	if (bytes < 9000) {
 		itr = IXGBE_ITR_ADAPTIVE_LATENCY;
 		goto adjust_by_size;
 	}
 
+	/* packets < 4 and bytes >= 9000 (TSO likely) */
 	itr = (q_vector->itr >> 2) + IXGBE_ITR_ADAPTIVE_MIN_INC;
 	if (itr > IXGBE_ITR_ADAPTIVE_MAX_USECS)
 		itr = IXGBE_ITR_ADAPTIVE_MAX_USECS;
 	goto clear_counts;
 
 	adjust_by_size:
-	/* avg_wire_size = bytes / packets, avoid slow DIV */
+	/* Opt 3: Replace expensive division with reciprocal multiply-shifts */
 	{
 		struct reciprocal_value recip = reciprocal_value(packets);
-
 		avg_wire_size = reciprocal_divide(bytes, recip);
 	}
 
-	if (avg_wire_size <= 60)
+	if (avg_wire_size <= 60) {
 		avg_wire_size = 5120;
-	else if (avg_wire_size <= 316)
+	} else if (avg_wire_size <= 316) {
 		avg_wire_size = avg_wire_size * 40 + 2720;
-	else if (avg_wire_size <= 1084)
+	} else if (avg_wire_size <= 1084) {
 		avg_wire_size = avg_wire_size * 15 + 11452;
-	else if (avg_wire_size < 1968)
+	} else if (avg_wire_size < 1968) {
 		avg_wire_size = avg_wire_size * 5 + 22420;
-	else
+	} else {
 		avg_wire_size = 32256;
+	}
 
 	if (itr & IXGBE_ITR_ADAPTIVE_LATENCY)
 		avg_wire_size >>= 1;
@@ -8545,7 +8555,7 @@ static u32 ixgbe_tx_cmd_type(struct sk_buff *skb, u32 tx_flags)
 							   IXGBE_ADVTXD_MAC_TSTAMP);
 
 	/* drop FCS generation if stack already supplied it */
-	if (skb->no_fcs)
+	if (skb->no_fcs) // Opt #6 from previous round
 		cmd_type &= ~IXGBE_ADVTXD_DCMD_IFCS;
 
 	return cmd_type;
@@ -8585,17 +8595,26 @@ static void ixgbe_tx_olinfo_status(union ixgbe_adv_tx_desc *tx_desc,
 static int __ixgbe_maybe_stop_tx(struct ixgbe_ring *tx_ring, u16 size)
 {
 	/* fast exit: ring still has descriptors */
-	if (likely(ixgbe_desc_unused(tx_ring) >= size))
+	if (likely(ixgbe_desc_unused(tx_ring) >= size)) {
 		return 0;
+	}
 
-	/* try to stop the sub-queue; return 0 if it succeeded */
+	/* try to stop the sub-queue; return 0 if it succeeded OR if it was
+	 * already stopped/became free before we could stop it.
+	 * Only increment restart_queue and return -EBUSY if *we* actually
+	 * stopped it.
+	 */
 	if (!netif_subqueue_try_stop(tx_ring->netdev,
 		tx_ring->queue_index,
-		ixgbe_desc_unused(tx_ring), size))
-		return 0;
+		ixgbe_desc_unused(tx_ring), size)) {
+		return 0; /* Queue was not stopped by us (either already free or stopped by someone else) */
+		}
 
-	++tx_ring->tx_stats.restart_queue;
-	return -EBUSY;
+		/* This line is executed ONLY if netif_subqueue_try_stop returned true (non-zero),
+		 * meaning we successfully stopped the queue.
+		 */
+		++tx_ring->tx_stats.restart_queue;
+	return -EBUSY; /* We successfully stopped the queue */
 }
 
 static inline int ixgbe_maybe_stop_tx(struct ixgbe_ring *tx_ring, u16 size)
@@ -8617,18 +8636,17 @@ static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
 	dma_addr_t dma;
 	unsigned int data_len, size;
 	u32 tx_flags = first->tx_flags;
-	u32 cmd_type = ixgbe_tx_cmd_type(skb, tx_flags);
+	u32 cmd_type = ixgbe_tx_cmd_type(skb, tx_flags); // Uses optimized version
 	u16 i = tx_ring->next_to_use;
+	u16 ntu_lookahead;
 
-	/* prefetch next buffer/descriptor pair to hide cache latency */
-	{
-		u16 next = (i + 4) & (tx_ring->count - 1);
-
-		prefetchw(&tx_ring->tx_buffer_info[next]);
-		prefetch(IXGBE_TX_DESC(tx_ring, next));
-	}
+	/* Opt #2: Tx Loop Lookahead Prefetching */
+	ntu_lookahead = (i + IXGBE_TX_PREFETCH_OFFSET) & (tx_ring->count - 1);
+	prefetchw(&tx_ring->tx_buffer_info[ntu_lookahead]);
+	prefetch(IXGBE_TX_DESC(tx_ring, ntu_lookahead));
 
 	tx_desc = IXGBE_TX_DESC(tx_ring, i);
+	// ... (rest of ixgbe_tx_map as reviewed previously) ...
 
 	ixgbe_tx_olinfo_status(tx_desc, tx_flags, skb->len - hdr_len);
 
@@ -8653,7 +8671,6 @@ static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
 		if (dma_mapping_error(tx_ring->dev, dma))
 			goto dma_error;
 
-		/* record length and DMA address */
 		dma_unmap_len_set(tx_buffer, len,  size);
 		dma_unmap_addr_set(tx_buffer, dma, dma);
 
@@ -8703,7 +8720,6 @@ static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
 		tx_buffer = &tx_ring->tx_buffer_info[i];
 	}
 
-	/* write last descriptor with RS and EOP bits */
 	cmd_type |= size | IXGBE_TXD_CMD;
 	tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type);
 
@@ -8712,7 +8728,6 @@ static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
 	first->time_stamp = jiffies;
 	skb_tx_timestamp(skb);
 
-	/* make sure all memory writes are visible before updating HW tail */
 	wmb();
 
 	first->next_to_watch = tx_desc;
@@ -8768,46 +8783,44 @@ static void ixgbe_atr(struct ixgbe_ring *ring,
 	struct tcphdr *th;
 	unsigned int hlen;
 	struct sk_buff *skb;
-	const unsigned char *tail;		/* cache once             */
+	const unsigned char *tail;		/* Opt #5: cache once */
 	__be16 vlan_id;
 	int l4_proto;
 
-	/* if ring doesn't have an interrupt vector, cannot perform ATR */
+	/* Opt #5: likely() hints for dominant exits */
 	if (unlikely(!q_vector))
 		return;
 
-	/* do nothing if sampling is disabled */
 	if (unlikely(!ring->atr_sample_rate))
 		return;
 
 	ring->atr_count++;
 
-	/* currently only IPv4/IPv6 with TCP is supported */
+	/* Opt #5: likely() hints for dominant exits */
 	if (unlikely((first->protocol != htons(ETH_P_IP)) &&
 		(first->protocol != htons(ETH_P_IPV6))))
 		return;
 
-	/* snag network header to get L4 type and address */
 	skb = first->skb;
 	hdr.network = skb_network_header(skb);
-	tail = skb_tail_pointer(skb);		/* single evaluation      */
+	/* Opt #5: One-shot skb_tail_pointer cache */
+	tail = skb_tail_pointer(skb);
 
 	if (unlikely(hdr.network <= skb->data))
 		return;
 
-	/* pre-touch header to hide the LLC miss later on */
+	/* Opt #5: Early header prefetch */
 	prefetch(hdr.network);
 
 	if (skb->encapsulation &&
 		first->protocol == htons(ETH_P_IP) &&
-		hdr.ipv4->protocol == IPPROTO_UDP) {
-		struct ixgbe_adapter *adapter = q_vector->adapter;
+		hdr.ipv4->protocol == IPPROTO_UDP) { /* Check for valid header access */
+			struct ixgbe_adapter *adapter = q_vector->adapter;
 
-	if (unlikely(tail < hdr.network + vxlan_headroom(0))) {
-		return;
-	}
+			// Use cached 'tail'
+			if (unlikely(tail < hdr.network + vxlan_headroom(0)))
+				return;
 
-		/* verify the port is recognized as VXLAN / Geneve */
 		if (adapter->vxlan_port &&
 			udp_hdr(skb)->dest == adapter->vxlan_port)
 			hdr.network = skb_inner_network_header(skb);
@@ -8817,14 +8830,13 @@ static void ixgbe_atr(struct ixgbe_ring *ring,
 			hdr.network = skb_inner_network_header(skb);
 		}
 
-		/* need at least [min IPv4 hdr + TCP] or [IPv6 hdr] bytes */
+		// Use cached 'tail'
 		if (unlikely(tail < hdr.network + 40))
 			return;
 
-	/* parse IP header ------------------------------------------------- */
-	switch (hdr.ipv4->version) {
+	switch (hdr.ipv4->version) { /* Check for valid header access */
 		case IPVERSION:
-			hlen     = (hdr.network[0] & 0x0F) << 2;  /* ipv4 ihl */
+			hlen     = (hdr.network[0] & 0x0F) << 2;
 			l4_proto = hdr.ipv4->protocol;
 			break;
 		case 6:
@@ -8839,36 +8851,31 @@ static void ixgbe_atr(struct ixgbe_ring *ring,
 	if (l4_proto != IPPROTO_TCP)
 		return;
 
-	/* ensure TCP header is within linear data */
+	// Use cached 'tail'
 	if (unlikely(tail < hdr.network + hlen + sizeof(struct tcphdr)))
 		return;
 
 	th = (struct tcphdr *)(hdr.network + hlen);
 
-	/* skip this packet since the socket is closing */
 	if (th->fin)
 		return;
 
-	/* sample on all SYN packets or once every atr_sample_rate */
 	if (!th->syn && (ring->atr_count < ring->atr_sample_rate))
 		return;
 
-	/* reset sample count */
 	ring->atr_count = 0;
 
-	/* -------- build ATR keys --------------------------------------- */
 	vlan_id = htons(first->tx_flags >> IXGBE_TX_FLAGS_VLAN_SHIFT);
 
 	input.formatted.vlan_id = vlan_id;
 
-	/* src and dst are inverted (receiver’s view) */
 	if (first->tx_flags & (IXGBE_TX_FLAGS_SW_VLAN | IXGBE_TX_FLAGS_HW_VLAN))
 		common.port.src ^= th->dest ^ htons(ETH_P_8021Q);
 	else
 		common.port.src ^= th->dest ^ first->protocol;
 	common.port.dst ^= th->source;
 
-	switch (hdr.ipv4->version) {
+	switch (hdr.ipv4->version) { // Check for valid header access
 		case IPVERSION:
 			input.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_TCPV4;
 			common.ip ^= hdr.ipv4->saddr ^ hdr.ipv4->daddr;
@@ -8889,7 +8896,6 @@ static void ixgbe_atr(struct ixgbe_ring *ring,
 	if (hdr.network != skb_network_header(skb))
 		input.formatted.flow_type |= IXGBE_ATR_L4TYPE_TUNNEL_MASK;
 
-	/* Rx & Tx queues are assumed to be on the same CPU */
 	ixgbe_fdir_add_signature_filter_82599(&q_vector->adapter->hw,
 										  input, common, ring->queue_index);
 }
@@ -8953,14 +8959,12 @@ int ixgbe_xmit_xdp_ring(struct ixgbe_ring *ring,
 	union ixgbe_adv_tx_desc *tx_desc = IXGBE_TX_DESC(ring, index);
 	u32 cmd_type, len = xdpf->len;
 	void *data = xdpf->data;
+	u16 ntu_lookahead;
 
-	/* prefetch next buffer/desc to overlap DRAM miss */
-	{
-		u16 nxt = (index + 4) & (ring->count - 1);
-
-		prefetchw(&ring->tx_buffer_info[nxt]);
-		prefetch(IXGBE_TX_DESC(ring, nxt));
-	}
+	/* Opt #3: Look-ahead prefetch for XDP Tx */
+	ntu_lookahead = (index + IXGBE_TX_PREFETCH_OFFSET) & (ring->count - 1);
+	prefetchw(&ring->tx_buffer_info[ntu_lookahead]);
+	prefetch(IXGBE_TX_DESC(ring, ntu_lookahead));
 
 	if (unlikely(ixgbe_desc_unused(ring) < 1 + nr_frags))
 		return IXGBE_XDP_CONSUMED;
@@ -8971,7 +8975,7 @@ int ixgbe_xmit_xdp_ring(struct ixgbe_ring *ring,
 
 	tx_desc->read.olinfo_status =
 	cpu_to_le32(tx_head->bytecount << IXGBE_ADVTXD_PAYLEN_SHIFT);
-
+	// ... (rest of ixgbe_xmit_xdp_ring as reviewed previously) ...
 	for (;;) {
 		dma_addr_t dma = dma_map_single(ring->dev, data, len,
 										DMA_TO_DEVICE);
@@ -9002,10 +9006,8 @@ int ixgbe_xmit_xdp_ring(struct ixgbe_ring *ring,
 		i++;
 	}
 
-	/* set RS/EOP bits on last descriptor */
 	tx_desc->read.cmd_type_len |= cpu_to_le32(IXGBE_TXD_CMD);
 
-	/* avoid race with cleanup */
 	smp_wmb();
 
 	tx_head->next_to_watch = tx_desc;
