@@ -8646,7 +8646,6 @@ static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
 	prefetch(IXGBE_TX_DESC(tx_ring, ntu_lookahead));
 
 	tx_desc = IXGBE_TX_DESC(tx_ring, i);
-	// ... (rest of ixgbe_tx_map as reviewed previously) ...
 
 	ixgbe_tx_olinfo_status(tx_desc, tx_flags, skb->len - hdr_len);
 
@@ -8975,7 +8974,7 @@ int ixgbe_xmit_xdp_ring(struct ixgbe_ring *ring,
 
 	tx_desc->read.olinfo_status =
 	cpu_to_le32(tx_head->bytecount << IXGBE_ADVTXD_PAYLEN_SHIFT);
-	// ... (rest of ixgbe_xmit_xdp_ring as reviewed previously) ...
+
 	for (;;) {
 		dma_addr_t dma = dma_map_single(ring->dev, data, len,
 										DMA_TO_DEVICE);
