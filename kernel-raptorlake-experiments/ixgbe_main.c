@@ -8525,25 +8525,24 @@ no_csum:
 	ixgbe_tx_ctxtdesc(tx_ring, vlan_macip_lens, fceof_saidx, type_tucmd, 0);
 }
 
-static u32 ixgbe_tx_cmd_type(struct sk_buff *skb, u32 tx_flags)
+static inline __maybe_unused
+u32 ixgbe_tx_cmd_type(const struct sk_buff *skb, u32 tx_flags)
 {
-	u32 cmd_type = IXGBE_ADVTXD_DTYP_DATA |
+	u32 cmd = IXGBE_ADVTXD_DTYP_DATA |
 	IXGBE_ADVTXD_DCMD_DEXT |
 	IXGBE_ADVTXD_DCMD_IFCS;
 
-	/* VLAN, TSO, timestamp */
-	cmd_type |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_HW_VLAN,
-							   IXGBE_ADVTXD_DCMD_VLE);
-	cmd_type |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_TSO,
-							   IXGBE_ADVTXD_DCMD_TSE);
-	cmd_type |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_TSTAMP,
-							   IXGBE_ADVTXD_MAC_TSTAMP);
+	cmd |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_HW_VLAN,
+						  IXGBE_ADVTXD_DCMD_VLE);
+	cmd |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_TSO,
+						  IXGBE_ADVTXD_DCMD_TSE);
+	cmd |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_TSTAMP,
+						  IXGBE_ADVTXD_MAC_TSTAMP);
 
-	/* drop FCS generation if stack already supplied it */
-	if (skb->no_fcs) // Opt #6 from previous round
-		cmd_type &= ~IXGBE_ADVTXD_DCMD_IFCS;
+	if (skb->no_fcs)
+		cmd &= ~IXGBE_ADVTXD_DCMD_IFCS;
 
-	return cmd_type;
+	return cmd;
 }
 
 static void ixgbe_tx_olinfo_status(union ixgbe_adv_tx_desc *tx_desc,
@@ -8610,86 +8609,137 @@ static inline int ixgbe_maybe_stop_tx(struct ixgbe_ring *tx_ring, u16 size)
 	return __ixgbe_maybe_stop_tx(tx_ring, size);
 }
 
+/* --------------------------------------------------------------- */
+/* DMA helpers – fall back if RELAXED is not available             */
+/* --------------------------------------------------------------- */
+#ifndef DMA_ATTR_RELAXED
+#ifdef DMA_ATTR_WEAK_ORDERING
+#define DMA_ATTR_RELAXED DMA_ATTR_WEAK_ORDERING
+#endif
+#endif
+
+#ifdef DMA_ATTR_RELAXED
+#define IXGBE_MAP_SINGLE(dev, buf, len) \
+dma_map_single_attrs((dev), (buf), (len), DMA_TO_DEVICE, \
+DMA_ATTR_RELAXED)
+#define IXGBE_MAP_PAGE(dev, page, off, len) \
+dma_map_page_attrs((dev), (page), (off), (len), \
+DMA_TO_DEVICE, DMA_ATTR_RELAXED)
+#define IXGBE_UNMAP_SINGLE(dev, addr, len) \
+dma_unmap_single_attrs((dev), (addr), (len), \
+DMA_TO_DEVICE, DMA_ATTR_RELAXED)
+#define IXGBE_UNMAP_PAGE(dev, addr, len) \
+dma_unmap_page_attrs((dev), (addr), (len), \
+DMA_TO_DEVICE, DMA_ATTR_RELAXED)
+#else
+#define IXGBE_MAP_SINGLE(dev, buf, len) \
+dma_map_single((dev), (buf), (len), DMA_TO_DEVICE)
+#define IXGBE_MAP_PAGE(dev, page, off, len) \
+dma_map_page((dev), (page), (off), (len), DMA_TO_DEVICE)
+#define IXGBE_UNMAP_SINGLE(dev, addr, len) \
+dma_unmap_single((dev), (addr), (len), DMA_TO_DEVICE)
+#define IXGBE_UNMAP_PAGE(dev, addr, len) \
+dma_unmap_page((dev), (addr), (len), DMA_TO_DEVICE)
+#endif
+
+/* --------------------------------------------------------------- */
+/* Tx-mapping routine                                              */
+/* --------------------------------------------------------------- */
 static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
 						struct ixgbe_tx_buffer *first,
 						const u8 hdr_len)
 {
-	struct sk_buff *skb = first->skb;
-	struct ixgbe_tx_buffer *tx_buffer;
-	union ixgbe_adv_tx_desc *tx_desc;
-	skb_frag_t *frag;
-	dma_addr_t dma;
-	unsigned int data_len, size;
-	u32 tx_flags = first->tx_flags;
-	u32 cmd_type = ixgbe_tx_cmd_type(skb, tx_flags); // Uses optimized version
-	u16 i = tx_ring->next_to_use;
-	u16 ntu_lookahead;
+	struct sk_buff          *skb = first->skb;
+	union ixgbe_adv_tx_desc *txd;
+	struct ixgbe_tx_buffer  *txb;
+	skb_frag_t              *frag;
+	dma_addr_t               dma;
+	unsigned int             size, data_len;
+	u32                      cmd_base;
+	u16                      i, look;
 
-	/* Opt #2: Tx Loop Lookahead Prefetching */
-	ntu_lookahead = (i + IXGBE_TX_PREFETCH_OFFSET) & (tx_ring->count - 1);
-	prefetchw(&tx_ring->tx_buffer_info[ntu_lookahead]);
-	prefetch(IXGBE_TX_DESC(tx_ring, ntu_lookahead));
+	/* Build base command word (in-line ixgbe_tx_cmd_type) */
+	cmd_base = IXGBE_ADVTXD_DTYP_DATA |
+	IXGBE_ADVTXD_DCMD_DEXT |
+	IXGBE_ADVTXD_DCMD_IFCS;
+	cmd_base |= IXGBE_SET_FLAG(first->tx_flags,
+							   IXGBE_TX_FLAGS_HW_VLAN,
+							IXGBE_ADVTXD_DCMD_VLE);
+	cmd_base |= IXGBE_SET_FLAG(first->tx_flags,
+							   IXGBE_TX_FLAGS_TSO,
+							IXGBE_ADVTXD_DCMD_TSE);
+	cmd_base |= IXGBE_SET_FLAG(first->tx_flags,
+							   IXGBE_TX_FLAGS_TSTAMP,
+							IXGBE_ADVTXD_MAC_TSTAMP);
+	if (skb->no_fcs)
+		cmd_base &= ~IXGBE_ADVTXD_DCMD_IFCS;
 
-	tx_desc = IXGBE_TX_DESC(tx_ring, i);
+	/* Prefetch look-ahead, works for any ring size */
+	i     = tx_ring->next_to_use;
+	look  = i + IXGBE_TX_PREFETCH_OFFSET;
+	if (look >= tx_ring->count)
+		look -= tx_ring->count;
+	prefetchw(&tx_ring->tx_buffer_info[look]);
+	prefetch(IXGBE_TX_DESC(tx_ring, look));
 
-	ixgbe_tx_olinfo_status(tx_desc, tx_flags, skb->len - hdr_len);
+	/* First descriptor */
+	txd = IXGBE_TX_DESC(tx_ring, i);
+	txb = &tx_ring->tx_buffer_info[i];
+	ixgbe_tx_olinfo_status(txd, first->tx_flags, skb->len - hdr_len);
 
-	size = skb_headlen(skb);
+	size     = skb_headlen(skb);
 	data_len = skb->data_len;
 
 	#ifdef IXGBE_FCOE
-	if (tx_flags & IXGBE_TX_FLAGS_FCOE) {
+	if (first->tx_flags & IXGBE_TX_FLAGS_FCOE) {
 		if (data_len < sizeof(struct fcoe_crc_eof)) {
-			size     -= sizeof(struct fcoe_crc_eof) - data_len;
-			data_len  = 0;
+			size    -= sizeof(struct fcoe_crc_eof) - data_len;
+			data_len = 0;
 		} else {
 			data_len -= sizeof(struct fcoe_crc_eof);
 		}
 	}
 	#endif
 
-	dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
-	tx_buffer = first;
+	/* Map linear part */
+	dma = IXGBE_MAP_SINGLE(tx_ring->dev, skb->data, size);
+	if (dma_mapping_error(tx_ring->dev, dma))
+		goto dma_err;
 
-	for (frag = &skb_shinfo(skb)->frags[0]; ; frag++) {
-		if (dma_mapping_error(tx_ring->dev, dma))
-			goto dma_error;
+	dma_unmap_len_set(txb, len, size);
+	dma_unmap_addr_set(txb, dma, dma);
+	txb->protocol = first->protocol;	/* ATR */
 
-		dma_unmap_len_set(tx_buffer, len,  size);
-		dma_unmap_addr_set(tx_buffer, dma, dma);
+	txd->read.buffer_addr  = cpu_to_le64(dma);
+	txd->read.cmd_type_len = cpu_to_le32(cmd_base | size);	/* length set! */
 
-		tx_desc->read.buffer_addr = cpu_to_le64(dma);
+	/* Split linear part if >8 KiB */
+	while (unlikely(size > IXGBE_MAX_DATA_PER_TXD)) {
+		txd->read.cmd_type_len =
+		cpu_to_le32(cmd_base | IXGBE_MAX_DATA_PER_TXD);
 
-		while (unlikely(size > IXGBE_MAX_DATA_PER_TXD)) {
-			tx_desc->read.cmd_type_len =
-			cpu_to_le32(cmd_type ^ IXGBE_MAX_DATA_PER_TXD);
-
-			i++;
-			tx_desc++;
-			if (i == tx_ring->count) {
-				tx_desc = IXGBE_TX_DESC(tx_ring, 0);
-				i = 0;
-			}
-			tx_desc->read.olinfo_status = 0;
-
-			dma  += IXGBE_MAX_DATA_PER_TXD;
-			size -= IXGBE_MAX_DATA_PER_TXD;
-
-			tx_desc->read.buffer_addr = cpu_to_le64(dma);
-		}
-
-		if (likely(!data_len))
-			break;
-
-		tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type ^ size);
-
-		i++;
-		tx_desc++;
-		if (i == tx_ring->count) {
-			tx_desc = IXGBE_TX_DESC(tx_ring, 0);
+		if (++i == tx_ring->count)
 			i = 0;
-		}
-		tx_desc->read.olinfo_status = 0;
+		txd = IXGBE_TX_DESC(tx_ring, i);
+		txb = &tx_ring->tx_buffer_info[i];
+
+		txb->skb = NULL; txb->xdpf = NULL; txb->protocol = 0;
+		dma_unmap_len_set(txb, len, 0);
+		dma_unmap_addr_set(txb, dma, 0);
+		txd->read.olinfo_status = 0;
+
+		dma  += IXGBE_MAX_DATA_PER_TXD;
+		size -= IXGBE_MAX_DATA_PER_TXD;
+		txd->read.buffer_addr  = cpu_to_le64(dma);
+		txd->read.cmd_type_len = cpu_to_le32(cmd_base | size);
+	}
+
+	/* Map each fragment */
+	for (frag = skb_shinfo(skb)->frags; data_len; ++frag) {
+		if (++i == tx_ring->count)
+			i = 0;
+		txd = IXGBE_TX_DESC(tx_ring, i);
+		txb = &tx_ring->tx_buffer_info[i];
 
 		#ifdef IXGBE_FCOE
 		size = min_t(unsigned int, data_len, skb_frag_size(frag));
@@ -8698,59 +8748,95 @@ static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
 		#endif
 		data_len -= size;
 
-		dma = skb_frag_dma_map(tx_ring->dev, frag, 0, size,
-							   DMA_TO_DEVICE);
+		dma = IXGBE_MAP_PAGE(tx_ring->dev,
+							 skb_frag_page(frag),
+							 skb_frag_off(frag),
+							 size);
+		if (dma_mapping_error(tx_ring->dev, dma))
+			goto dma_err;
 
-		tx_buffer = &tx_ring->tx_buffer_info[i];
+		dma_unmap_len_set(txb, len, size);
+		dma_unmap_addr_set(txb, dma, dma);
+		txb->skb = NULL; txb->xdpf = NULL;
+
+		txd->read.buffer_addr  = cpu_to_le64(dma);
+		txd->read.olinfo_status = 0;
+		txd->read.cmd_type_len = cpu_to_le32(cmd_base | size);
+
+		while (unlikely(size > IXGBE_MAX_DATA_PER_TXD)) {
+			txd->read.cmd_type_len =
+			cpu_to_le32(cmd_base | IXGBE_MAX_DATA_PER_TXD);
+
+			if (++i == tx_ring->count)
+				i = 0;
+			txd = IXGBE_TX_DESC(tx_ring, i);
+			txb = &tx_ring->tx_buffer_info[i];
+
+			txb->skb = NULL; txb->xdpf = NULL; txb->protocol = 0;
+			dma_unmap_len_set(txb, len, 0);
+			dma_unmap_addr_set(txb, dma, 0);
+			txd->read.olinfo_status = 0;
+
+			dma  += IXGBE_MAX_DATA_PER_TXD;
+			size -= IXGBE_MAX_DATA_PER_TXD;
+			txd->read.buffer_addr  = cpu_to_le64(dma);
+			txd->read.cmd_type_len = cpu_to_le32(cmd_base | size);
+		}
 	}
 
-	cmd_type |= size | IXGBE_TXD_CMD;
-	tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type);
-
-	netdev_tx_sent_queue(txring_txq(tx_ring), first->bytecount);
-
-	first->time_stamp = jiffies;
-	skb_tx_timestamp(skb);
-
+	/* Last descriptor – RS | EOP */
+	txd->read.cmd_type_len |= cpu_to_le32(IXGBE_TXD_CMD);
+	first->next_to_watch    = txd;
 	wmb();
-
-	first->next_to_watch = tx_desc;
 
 	if (++i == tx_ring->count)
 		i = 0;
 	tx_ring->next_to_use = i;
 
-	ixgbe_maybe_stop_tx(tx_ring, DESC_NEEDED);
+	netdev_tx_sent_queue(txring_txq(tx_ring), first->bytecount);
+	first->time_stamp = jiffies;
+	skb_tx_timestamp(skb);
 
+	ixgbe_maybe_stop_tx(tx_ring, DESC_NEEDED);
 	if (netif_xmit_stopped(txring_txq(tx_ring)) || !netdev_xmit_more())
-		writel(i, tx_ring->tail);
+		writel(tx_ring->next_to_use, tx_ring->tail);
 
 	return 0;
 
-	dma_error:
-	dev_err(tx_ring->dev, "TX DMA map failed\n");
+	/* ---------------- error unwind ------------------------------- */
+	dma_err:
+	{
+		u16 idx = tx_ring->next_to_use;
+		bool head = true;
 
-	for (;;) {
-		tx_buffer = &tx_ring->tx_buffer_info[i];
-		if (dma_unmap_len(tx_buffer, len))
-			dma_unmap_page(tx_ring->dev,
-						   dma_unmap_addr(tx_buffer, dma),
-						   dma_unmap_len(tx_buffer, len),
-						   DMA_TO_DEVICE);
-			dma_unmap_len_set(tx_buffer, len, 0);
-		if (tx_buffer == first)
-			break;
-		if (!i)
-			i = tx_ring->count;
-		i--;
+		while (1) {
+			struct ixgbe_tx_buffer *undo =
+			&tx_ring->tx_buffer_info[idx];
+
+			if (dma_unmap_len(undo, len)) {
+				if (head)
+					IXGBE_UNMAP_SINGLE(tx_ring->dev,
+									   dma_unmap_addr(undo, dma),
+									   dma_unmap_len(undo, len));
+					else
+						IXGBE_UNMAP_PAGE(tx_ring->dev,
+										 dma_unmap_addr(undo, dma),
+										 dma_unmap_len(undo, len));
+						dma_unmap_len_set(undo, len, 0);
+			}
+
+			if (idx == i)
+				break;
+			if (++idx == tx_ring->count)
+				idx = 0;
+			head = false;
+		}
+
+		dev_kfree_skb_any(first->skb);
+		first->skb = NULL;
+		first->next_to_watch = NULL;
+		return -1;
 	}
-
-	dev_kfree_skb_any(first->skb);
-	first->skb = NULL;
-
-	tx_ring->next_to_use = i;
-
-	return -1;
 }
 
 static void ixgbe_atr(struct ixgbe_ring *ring,
