@@ -150,18 +150,37 @@ MODULE_FIRMWARE("amdgpu/aldebaran_sjt_mec2.bin");
 #define mmGOLDEN_TSC_COUNT_LOWER_Renoir                0x0026
 #define mmGOLDEN_TSC_COUNT_LOWER_Renoir_BASE_IDX       1
 
-static int gfx9_wait_reg_off(struct amdgpu_device *adev, u32 offset,
-							 u32 mask, u32 val, unsigned long timeout_us)
+static __always_inline int
+gfx9_wait_reg_off(struct amdgpu_device *adev, u32 reg_offset_in_block,
+				  u32 mask, u32 val_target, unsigned long timeout_us)
 {
-	unsigned long deadline = jiffies + usecs_to_jiffies(timeout_us);
-	u32 tmp;
+	u32 current_read_val;
+	ktime_t timeout_expire;
+
+	if (timeout_us == 0) {
+		timeout_us = 2;
+	}
+
+	timeout_expire = ktime_add_us(ktime_get(), timeout_us);
 
 	do {
-		tmp = RREG32(offset);
-		if ((tmp & mask) == val)
+		current_read_val = RREG32(reg_offset_in_block);
+		if ((current_read_val & mask) == val_target)
 			return 0;
-		udelay(1);
-	} while (!time_after(jiffies, deadline));
+
+		cpu_relax();
+
+		if (timeout_us > 20 && ktime_before(ktime_get(), ktime_sub_us(timeout_expire, 1))) {
+			udelay(1);
+		} else if (timeout_us <= 20) {
+
+		}
+
+	} while (ktime_before(ktime_get(), timeout_expire));
+
+	current_read_val = RREG32(reg_offset_in_block);
+	if ((current_read_val & mask) == val_target)
+		return 0;
 
 	return -ETIMEDOUT;
 }
@@ -1705,44 +1724,63 @@ static void gfx_v9_0_get_csb_buffer(struct amdgpu_device *adev,
 
 static void gfx_v9_0_init_always_on_cu_mask(struct amdgpu_device *adev)
 {
-	struct amdgpu_cu_info *cu_info = &adev->gfx.cu_info;
-	uint32_t pg_always_on_cu_num = 2;
-	uint32_t always_on_cu_num;
-	uint32_t i, j, k;
-	uint32_t mask, cu_bitmap, counter;
+	struct amdgpu_cu_info *cu = &adev->gfx.cu_info;
+	const u32 pg_always_on = 2;		/* latch PG mask after CU #2  */
+	u32       ao_per_sh;			/* CUs left powered per SH    */
 
-	if (adev->flags & AMD_IS_APU)
-		always_on_cu_num = 4;
-	else if (amdgpu_ip_version(adev, GC_HWIP, 0) == IP_VERSION(9, 2, 1))
-		always_on_cu_num = 8;
-	else
-		always_on_cu_num = 12;
+	/* -------- decide policy -------------------------------------- */
+	if (adev->flags & AMD_IS_APU) {
+		ao_per_sh = 4;
+	} else if (amdgpu_ip_version(adev, GC_HWIP, 0) == IP_VERSION(9, 2, 1)) {
+		ao_per_sh = 8;		/* Vega12 */
+	} else {
+		ao_per_sh = 12;		/* Vega10/20 and newer dGPU */
+	}
 
 	mutex_lock(&adev->grbm_idx_mutex);
-	for (i = 0; i < adev->gfx.config.max_shader_engines; i++) {
-		for (j = 0; j < adev->gfx.config.max_sh_per_se; j++) {
-			mask = 1;
-			cu_bitmap = 0;
-			counter = 0;
-			amdgpu_gfx_select_se_sh(adev, i, j, 0xffffffff, 0);
 
-			for (k = 0; k < adev->gfx.config.max_cu_per_sh; k ++) {
-				if (cu_info->bitmap[0][i][j] & mask) {
-					if (counter == pg_always_on_cu_num)
-						WREG32_SOC15(GC, 0, mmRLC_PG_ALWAYS_ON_CU_MASK, cu_bitmap);
-					if (counter < always_on_cu_num)
-						cu_bitmap |= mask;
-					else
-						break;
-					counter++;
-				}
-				mask <<= 1;
+	for (u32 se = 0; se < adev->gfx.config.max_shader_engines; ++se) {
+		for (u32 sh = 0; sh < adev->gfx.config.max_sh_per_se; ++sh) {
+
+			const u32 idx_se = se & 3;          /* 0–3            */
+			const u32 idx_sh = sh + (se >> 2);  /* 0–1 for ≤8 SE  */
+
+			/* Future-proof: skip gracefully if table too small   */
+			if (idx_sh >= ARRAY_SIZE(cu->bitmap[0]))
+				continue;
+
+			/* Local copy (≤32 bits on every GFX9 ASIC)          */
+			unsigned long bitmap =
+			(unsigned long)cu->bitmap[idx_se][idx_sh];
+
+			u32 ao_bitmap = 0;
+			u32 seen      = 0;
+
+			/* Select target SE / SH --------------------------- */
+			amdgpu_gfx_select_se_sh(adev, se, sh, 0xffffffff, 0);
+
+			/* Fast CTZ loop ----------------------------------- */
+			while (bitmap && seen < ao_per_sh) {
+				const u32 bit = __ffs(bitmap);      /* BMI2/ctz */
+				if (seen == pg_always_on)
+					WREG32_SOC15(GC, 0,
+								 mmRLC_PG_ALWAYS_ON_CU_MASK,
+				  ao_bitmap);
+
+				ao_bitmap |= BIT(bit);
+				bitmap    &= bitmap - 1;	/* clear LSB */
+				++seen;
 			}
 
-			WREG32_SOC15(GC, 0, mmRLC_LB_ALWAYS_ACTIVE_CU_MASK, cu_bitmap);
-			cu_info->ao_cu_bitmap[i][j] = cu_bitmap;
+			/* Program mask for this SE/SH -------------------- */
+			WREG32_SOC15(GC, 0, mmRLC_LB_ALWAYS_ACTIVE_CU_MASK,
+						 ao_bitmap);
+
+			cu->ao_cu_bitmap[idx_se][idx_sh] = ao_bitmap;
 		}
 	}
+
+	/* Restore broadcast mode -------------------------------------- */
 	amdgpu_gfx_select_se_sh(adev, 0xffffffff, 0xffffffff, 0xffffffff, 0);
 	mutex_unlock(&adev->grbm_idx_mutex);
 }
