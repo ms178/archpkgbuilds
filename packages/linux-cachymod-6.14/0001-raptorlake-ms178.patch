@@ -1,5 +1,484 @@
+--- a/kernel/time/hrtimer.c	2025-05-09 09:56:10.000000000 +0200
++++ b/kernel/time/hrtimer.c	2025-05-18 01:36:19.652237940 +0200
+@@ -647,15 +647,20 @@ static inline ktime_t hrtimer_update_bas
+ {
+ 	ktime_t *offs_real = &base->clock_base[HRTIMER_BASE_REALTIME].offset;
+ 	ktime_t *offs_boot = &base->clock_base[HRTIMER_BASE_BOOTTIME].offset;
+-	ktime_t *offs_tai = &base->clock_base[HRTIMER_BASE_TAI].offset;
+-
++	ktime_t *offs_tai  = &base->clock_base[HRTIMER_BASE_TAI].offset;
+ 	ktime_t now = ktime_get_update_offsets_now(&base->clock_was_set_seq,
+-					    offs_real, offs_boot, offs_tai);
+-
+-	base->clock_base[HRTIMER_BASE_REALTIME_SOFT].offset = *offs_real;
+-	base->clock_base[HRTIMER_BASE_BOOTTIME_SOFT].offset = *offs_boot;
+-	base->clock_base[HRTIMER_BASE_TAI_SOFT].offset = *offs_tai;
++											   offs_real, offs_boot,
++											offs_tai);
+ 
++	#define COPY_SOFT(idx, src) do {					\
++	if (unlikely(base->clock_base[idx].offset != *(src)))	\
++		base->clock_base[idx].offset = *(src);		\
++	} while (0)
++
++	COPY_SOFT(HRTIMER_BASE_REALTIME_SOFT, offs_real);
++	COPY_SOFT(HRTIMER_BASE_BOOTTIME_SOFT,offs_boot);
++	COPY_SOFT(HRTIMER_BASE_TAI_SOFT,     offs_tai);
++	#undef COPY_SOFT
+ 	return now;
+ }
+ 
+@@ -1897,92 +1902,73 @@ static __latent_entropy void hrtimer_run
+ void hrtimer_interrupt(struct clock_event_device *dev)
+ {
+ 	struct hrtimer_cpu_base *cpu_base = this_cpu_ptr(&hrtimer_bases);
+-	ktime_t expires_next, now, entry_time, delta;
+ 	unsigned long flags;
+-	int retries = 0;
++	ktime_t entry_time, now, delta, expires_next;
++	bool bail_for_resched = false;
++	int   retry;
+ 
+ 	BUG_ON(!cpu_base->hres_active);
++
+ 	cpu_base->nr_events++;
+ 	dev->next_event = KTIME_MAX;
+ 
+ 	raw_spin_lock_irqsave(&cpu_base->lock, flags);
+ 	entry_time = now = hrtimer_update_base(cpu_base);
+-retry:
+-	cpu_base->in_hrtirq = 1;
+-	/*
+-	 * We set expires_next to KTIME_MAX here with cpu_base->lock
+-	 * held to prevent that a timer is enqueued in our queue via
+-	 * the migration code. This does not affect enqueueing of
+-	 * timers which run their callback and need to be requeued on
+-	 * this CPU.
+-	 */
+-	cpu_base->expires_next = KTIME_MAX;
+-
+-	if (!ktime_before(now, cpu_base->softirq_expires_next)) {
+-		cpu_base->softirq_expires_next = KTIME_MAX;
+-		cpu_base->softirq_activated = 1;
+-		raise_timer_softirq(HRTIMER_SOFTIRQ);
+-	}
+ 
+-	__hrtimer_run_queues(cpu_base, now, flags, HRTIMER_ACTIVE_HARD);
++	for (retry = 0; ; retry++) {
++		cpu_base->in_hrtirq    = 1;
++		cpu_base->expires_next = KTIME_MAX;
++
++		if (!ktime_before(now, cpu_base->softirq_expires_next)) {
++			cpu_base->softirq_expires_next = KTIME_MAX;
++			cpu_base->softirq_activated    = 1;
++			raise_timer_softirq(HRTIMER_SOFTIRQ);
++		}
+ 
+-	/* Reevaluate the clock bases for the [soft] next expiry */
+-	expires_next = hrtimer_update_next_event(cpu_base);
+-	/*
+-	 * Store the new expiry value so the migration code can verify
+-	 * against it.
+-	 */
+-	cpu_base->expires_next = expires_next;
+-	cpu_base->in_hrtirq = 0;
+-	raw_spin_unlock_irqrestore(&cpu_base->lock, flags);
++		__hrtimer_run_queues(cpu_base, now, flags, HRTIMER_ACTIVE_HARD);
+ 
+-	/* Reprogramming necessary ? */
+-	if (!tick_program_event(expires_next, 0)) {
+-		cpu_base->hang_detected = 0;
+-		return;
++		expires_next           = hrtimer_update_next_event(cpu_base);
++		cpu_base->expires_next = expires_next;
++		cpu_base->in_hrtirq    = 0;
++
++		raw_spin_unlock_irqrestore(&cpu_base->lock, flags);
++
++		if (likely(!tick_program_event(expires_next, 0))) {
++			cpu_base->hang_detected = 0;
++			return;
++		}
++
++		cpu_base->nr_retries++;
++
++		if (retry == 2)
++			break;
++		if (need_resched()) {
++			bail_for_resched = true;
++			break;
++		}
++
++		raw_spin_lock_irqsave(&cpu_base->lock, flags);
++		now = hrtimer_update_base(cpu_base);
+ 	}
+ 
+-	/*
+-	 * The next timer was already expired due to:
+-	 * - tracing
+-	 * - long lasting callbacks
+-	 * - being scheduled away when running in a VM
+-	 *
+-	 * We need to prevent that we loop forever in the hrtimer
+-	 * interrupt routine. We give it 3 attempts to avoid
+-	 * overreacting on some spurious event.
+-	 *
+-	 * Acquire base lock for updating the offsets and retrieving
+-	 * the current time.
+-	 */
+-	raw_spin_lock_irqsave(&cpu_base->lock, flags);
+-	now = hrtimer_update_base(cpu_base);
+-	cpu_base->nr_retries++;
+-	if (++retries < 3)
+-		goto retry;
+-	/*
+-	 * Give the system a chance to do something else than looping
+-	 * here. We stored the entry time, so we know exactly how long
+-	 * we spent here. We schedule the next event this amount of
+-	 * time away.
+-	 */
+-	cpu_base->nr_hangs++;
+-	cpu_base->hang_detected = 1;
+-	raw_spin_unlock_irqrestore(&cpu_base->lock, flags);
++	delta = ktime_sub(ktime_get(), entry_time);
++
++	if (!bail_for_resched) {
++		cpu_base->nr_hangs++;
++		cpu_base->hang_detected = 1;
++	}
+ 
+-	delta = ktime_sub(now, entry_time);
+-	if ((unsigned int)delta > cpu_base->max_hang_time)
+-		cpu_base->max_hang_time = (unsigned int) delta;
+-	/*
+-	 * Limit it to a sensible value as we enforce a longer
+-	 * delay. Give the CPU at least 100ms to catch up.
+-	 */
+ 	if (delta > 100 * NSEC_PER_MSEC)
+-		expires_next = ktime_add_ns(now, 100 * NSEC_PER_MSEC);
+-	else
+-		expires_next = ktime_add(now, delta);
++		expires_next = ktime_add_ns(ktime_get(),
++									100 * NSEC_PER_MSEC);
++		else
++			expires_next = ktime_add(ktime_get(), delta);
++
+ 	tick_program_event(expires_next, 1);
+-	pr_warn_once("hrtimer: interrupt took %llu ns\n", ktime_to_ns(delta));
++
++	if (!bail_for_resched)
++		pr_warn_once("hrtimer: interrupt took %llu ns\n",
++					 ktime_to_ns(delta));
+ }
+ #endif /* !CONFIG_HIGH_RES_TIMERS */
+ 
+
+
+
+--- a/sound/pci/hda/hda_intel.c	2025-05-09 09:56:10.000000000 +0200
++++ b/sound/pci/hda/hda_intel.c	2025-05-18 01:05:45.134796217 +0200
+@@ -38,6 +38,7 @@
+ #include <linux/acpi.h>
+ #include <linux/pgtable.h>
+ #include <linux/dmi.h>
++#include <linux/iopoll.h>
+ 
+ #ifdef CONFIG_X86
+ /* for snoop control */
+@@ -367,13 +368,17 @@ static void set_default_power_save(struc
+  */
+ /* update bits in a PCI register byte */
+ static void update_pci_byte(struct pci_dev *pci, unsigned int reg,
+-			    unsigned char mask, unsigned char val)
++							unsigned char mask, unsigned char val)
+ {
+ 	unsigned char data;
+ 
+ 	pci_read_config_byte(pci, reg, &data);
++
++	if ((data & mask) == (val & mask))
++		return;
++
+ 	data &= ~mask;
+-	data |= (val & mask);
++	data |= val & mask;
+ 	pci_write_config_byte(pci, reg, data);
+ }
+ 
+@@ -484,28 +489,18 @@ static int intel_get_lctl_scf(struct azx
+ static int intel_ml_lctl_set_power(struct azx *chip, int state)
+ {
+ 	struct hdac_bus *bus = azx_bus(chip);
++	void __iomem *lctl_reg = bus->mlcap + AZX_ML_BASE + AZX_REG_ML_LCTL;
+ 	u32 val;
+-	int timeout;
+ 
+-	/*
+-	 * Changes to LCTL.SCF are only needed for the first multi-link dealing
+-	 * with external codecs
+-	 */
+-	val = readl(bus->mlcap + AZX_ML_BASE + AZX_REG_ML_LCTL);
++	val  = readl(lctl_reg);
+ 	val &= ~AZX_ML_LCTL_SPA;
+ 	val |= state << AZX_ML_LCTL_SPA_SHIFT;
+-	writel(val, bus->mlcap + AZX_ML_BASE + AZX_REG_ML_LCTL);
+-	/* wait for CPA */
+-	timeout = 50;
+-	while (timeout) {
+-		if (((readl(bus->mlcap + AZX_ML_BASE + AZX_REG_ML_LCTL)) &
+-		    AZX_ML_LCTL_CPA) == (state << AZX_ML_LCTL_CPA_SHIFT))
+-			return 0;
+-		timeout--;
+-		udelay(10);
+-	}
++	writel(val, lctl_reg);
+ 
+-	return -1;
++	return readl_poll_timeout_atomic(lctl_reg, val,
++									 ((val & AZX_ML_LCTL_CPA) ==
++									 (state << AZX_ML_LCTL_CPA_SHIFT)),
++									 10, 500);
+ }
+ 
+ static void intel_init_lctl(struct azx *chip)
+@@ -548,29 +543,30 @@ set_spa:
+ static void hda_intel_init_chip(struct azx *chip, bool full_reset)
+ {
+ 	struct hdac_bus *bus = azx_bus(chip);
+-	struct pci_dev *pci = chip->pci;
+-	u32 val;
++	struct pci_dev  *pci = chip->pci;
++	u32 cgctl_orig = 0;
+ 
+ 	snd_hdac_set_codec_wakeup(bus, true);
++
+ 	if (chip->driver_type == AZX_DRIVER_SKL) {
+-		pci_read_config_dword(pci, INTEL_HDA_CGCTL, &val);
+-		val = val & ~INTEL_HDA_CGCTL_MISCBDCGE;
+-		pci_write_config_dword(pci, INTEL_HDA_CGCTL, val);
++		pci_read_config_dword(pci, INTEL_HDA_CGCTL, &cgctl_orig);
++		pci_write_config_dword(pci, INTEL_HDA_CGCTL,
++							   cgctl_orig & ~INTEL_HDA_CGCTL_MISCBDCGE);
+ 	}
++
+ 	azx_init_chip(chip, full_reset);
++
+ 	if (chip->driver_type == AZX_DRIVER_SKL) {
+-		pci_read_config_dword(pci, INTEL_HDA_CGCTL, &val);
+-		val = val | INTEL_HDA_CGCTL_MISCBDCGE;
+-		pci_write_config_dword(pci, INTEL_HDA_CGCTL, val);
++		pci_write_config_dword(pci, INTEL_HDA_CGCTL,
++							   cgctl_orig | INTEL_HDA_CGCTL_MISCBDCGE);
+ 	}
+ 
+ 	snd_hdac_set_codec_wakeup(bus, false);
+ 
+-	/* reduce dma latency to avoid noise */
+ 	if (HDA_CONTROLLER_IS_APL(pci))
+ 		bxt_reduce_dma_latency(chip);
+ 
+-	if (bus->mlcap != NULL)
++	if (bus->mlcap)
+ 		intel_init_lctl(chip);
+ }
+ 
+@@ -612,14 +608,12 @@ static int azx_position_ok(struct azx *c
+ static int azx_position_check(struct azx *chip, struct azx_dev *azx_dev)
+ {
+ 	struct hda_intel *hda = container_of(chip, struct hda_intel, chip);
+-	int ok;
++	int ok = azx_position_ok(chip, azx_dev);
+ 
+-	ok = azx_position_ok(chip, azx_dev);
+-	if (ok == 1) {
++	if (likely(ok == 1)) {
+ 		azx_dev->irq_pending = 0;
+ 		return ok;
+ 	} else if (ok == 0) {
+-		/* bogus IRQ, process it later */
+ 		azx_dev->irq_pending = 1;
+ 		schedule_work(&hda->irq_pending_work);
+ 	}
+@@ -643,73 +637,70 @@ static int azx_position_check(struct azx
+ static int azx_position_ok(struct azx *chip, struct azx_dev *azx_dev)
+ {
+ 	struct snd_pcm_substream *substream = azx_dev->core.substream;
+-	struct snd_pcm_runtime *runtime = substream->runtime;
++	struct snd_pcm_runtime   *runtime   = substream->runtime;
+ 	int stream = substream->stream;
+ 	u32 wallclk;
+ 	unsigned int pos;
+ 	snd_pcm_uframes_t hwptr, target;
+ 
+-	/*
+-	 * The value of the WALLCLK register is always 0
+-	 * on the Loongson controller, so we return directly.
+-	 */
+-	if (chip->driver_type == AZX_DRIVER_LOONGSON)
++	if (unlikely(chip->driver_type == AZX_DRIVER_LOONGSON))
+ 		return 1;
+ 
+ 	wallclk = azx_readl(chip, WALLCLK) - azx_dev->core.start_wallclk;
+-	if (wallclk < (azx_dev->core.period_wallclk * 2) / 3)
+-		return -1;	/* bogus (too early) interrupt */
++	if (unlikely(wallclk < (azx_dev->core.period_wallclk * 2) / 3)) {
++		return -1;
++	}
+ 
+-	if (chip->get_position[stream])
++	if (likely(chip->get_position[stream])) {
+ 		pos = chip->get_position[stream](chip, azx_dev);
+-	else { /* use the position buffer as default */
++	} else {
+ 		pos = azx_get_pos_posbuf(chip, azx_dev);
+-		if (!pos || pos == (u32)-1) {
++		if (unlikely(!pos || pos == (u32)-1)) {
+ 			dev_info(chip->card->dev,
+-				 "Invalid position buffer, using LPIB read method instead.\n");
++					 "Invalid position buffer, switching to LPIB\n");
+ 			chip->get_position[stream] = azx_get_pos_lpib;
+ 			if (chip->get_position[0] == azx_get_pos_lpib &&
+-			    chip->get_position[1] == azx_get_pos_lpib)
++				chip->get_position[1] == azx_get_pos_lpib)
+ 				azx_bus(chip)->use_posbuf = false;
+ 			pos = azx_get_pos_lpib(chip, azx_dev);
+ 			chip->get_delay[stream] = NULL;
+ 		} else {
+ 			chip->get_position[stream] = azx_get_pos_posbuf;
+ 			if (chip->driver_caps & AZX_DCAPS_COUNT_LPIB_DELAY)
+-				chip->get_delay[stream] = azx_get_delay_from_lpib;
++				chip->get_delay[stream] =
++				azx_get_delay_from_lpib;
+ 		}
+ 	}
+ 
+-	if (pos >= azx_dev->core.bufsize)
++	if (unlikely(pos >= azx_dev->core.bufsize))
+ 		pos = 0;
+ 
+-	if (WARN_ONCE(!azx_dev->core.period_bytes,
+-		      "hda-intel: zero azx_dev->period_bytes"))
+-		return -1; /* this shouldn't happen! */
++	if (WARN_ONCE(!azx_dev->core.period_bytes, "hda-intel: zero period_bytes"))
++		return -1;
++
+ 	if (wallclk < (azx_dev->core.period_wallclk * 5) / 4 &&
+-	    pos % azx_dev->core.period_bytes > azx_dev->core.period_bytes / 2)
+-		/* NG - it's below the first next period boundary */
++		pos % azx_dev->core.period_bytes >
++		azx_dev->core.period_bytes / 2) {
+ 		return chip->bdl_pos_adj ? 0 : -1;
+-	azx_dev->core.start_wallclk += wallclk;
++		}
+ 
+-	if (azx_dev->core.no_period_wakeup)
+-		return 1; /* OK, no need to check period boundary */
++		azx_dev->core.start_wallclk += wallclk;
+ 
++	if (azx_dev->core.no_period_wakeup)
++		return 1;
+ 	if (runtime->hw_ptr_base != runtime->hw_ptr_interrupt)
+-		return 1; /* OK, already in hwptr updating process */
++		return 1;
+ 
+-	/* check whether the period gets really elapsed */
+-	pos = bytes_to_frames(runtime, pos);
++	pos   = bytes_to_frames(runtime, pos);
+ 	hwptr = runtime->hw_ptr_base + pos;
+ 	if (hwptr < runtime->status->hw_ptr)
+ 		hwptr += runtime->buffer_size;
++
+ 	target = runtime->hw_ptr_interrupt + runtime->period_size;
+-	if (hwptr < target) {
+-		/* too early wakeup, process it later */
++	if (unlikely(hwptr < target))
+ 		return chip->bdl_pos_adj ? 0 : -1;
+-	}
+ 
+-	return 1; /* OK, it's fine */
++	return 1;
+ }
+ 
+ /*
+@@ -717,57 +708,57 @@ static int azx_position_ok(struct azx *c
+  */
+ static void azx_irq_pending_work(struct work_struct *work)
+ {
+-	struct hda_intel *hda = container_of(work, struct hda_intel, irq_pending_work);
+-	struct azx *chip = &hda->chip;
+-	struct hdac_bus *bus = azx_bus(chip);
++	struct hda_intel  *hda  = container_of(work, struct hda_intel,
++										   irq_pending_work);
++	struct azx        *chip = &hda->chip;
++	struct hdac_bus   *bus  = azx_bus(chip);
+ 	struct hdac_stream *s;
+ 	int pending, ok;
+ 
+ 	if (!hda->irq_pending_warned) {
+ 		dev_info(chip->card->dev,
+-			 "IRQ timing workaround is activated for card #%d. Suggest a bigger bdl_pos_adj.\n",
+-			 chip->card->number);
++				 "IRQ timing workaround active; try larger bdl_pos_adj\n");
+ 		hda->irq_pending_warned = 1;
+ 	}
+ 
+ 	for (;;) {
+ 		pending = 0;
++
+ 		spin_lock_irq(&bus->reg_lock);
+ 		list_for_each_entry(s, &bus->stream_list, list) {
+ 			struct azx_dev *azx_dev = stream_to_azx_dev(s);
+-			if (!azx_dev->irq_pending ||
+-			    !s->substream ||
+-			    !s->running)
++
++			if (!azx_dev->irq_pending || !s->substream || !s->running)
+ 				continue;
++
+ 			ok = azx_position_ok(chip, azx_dev);
+ 			if (ok > 0) {
+ 				azx_dev->irq_pending = 0;
+ 				spin_unlock(&bus->reg_lock);
+ 				snd_pcm_period_elapsed(s->substream);
+ 				spin_lock(&bus->reg_lock);
+-			} else if (ok < 0) {
+-				pending = 0;	/* too early */
+-			} else
++			} else if (ok == 0) {
+ 				pending++;
++			}
+ 		}
+ 		spin_unlock_irq(&bus->reg_lock);
++
+ 		if (!pending)
+ 			return;
+-		msleep(1);
++
++		usleep_range(300, 500);
+ 	}
+ }
+ 
+ /* clear irq_pending flags and assure no on-going workq */
+ static void azx_clear_irq_pending(struct azx *chip)
+ {
+-	struct hdac_bus *bus = azx_bus(chip);
++	struct hdac_bus    *bus = azx_bus(chip);
+ 	struct hdac_stream *s;
+ 
+ 	spin_lock_irq(&bus->reg_lock);
+-	list_for_each_entry(s, &bus->stream_list, list) {
+-		struct azx_dev *azx_dev = stream_to_azx_dev(s);
+-		azx_dev->irq_pending = 0;
+-	}
++	list_for_each_entry(s, &bus->stream_list, list)
++	stream_to_azx_dev(s)->irq_pending = 0;
+ 	spin_unlock_irq(&bus->reg_lock);
+ }
+ 
+
+
 --- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c	2025-04-25 10:51:21.000000000 +0200
-+++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c	2025-04-27 13:10:53.257238265 +0200
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c	2025-05-16 20:10:53.257238265 +0200
 @@ -24,6 +24,7 @@
  #include <linux/if_macvlan.h>
  #include <linux/if_bridge.h>
@@ -8,11 +487,12 @@
  #include <linux/bpf.h>
  #include <linux/bpf_trace.h>
  #include <linux/atomic.h>
-@@ -50,6 +51,16 @@
+@@ -50,6 +51,17 @@
  #include "ixgbe_model.h"
  #include "ixgbe_txrx_common.h"
  
-+#define IXGBE_RX_PREFETCH_OFFSET	4
++#define IXGBE_RX_PREFETCH_OFFSET 4
++#define IXGBE_TX_PREFETCH_OFFSET 4
 +#ifndef IXGBE_SET_FLAG_FIXED
 +#undef  IXGBE_SET_FLAG
 +
@@ -25,54 +505,316 @@
  char ixgbe_driver_name[] = "ixgbe";
  static const char ixgbe_driver_string[] =
  			      "Intel(R) 10 Gigabit PCI Express Network Driver";
-@@ -2327,25 +2338,20 @@ static void ixgbe_rx_buffer_flip(struct
+@@ -1613,100 +1625,119 @@ static bool ixgbe_alloc_mapped_page(stru
+ }
+ 
+ /**
+- * ixgbe_alloc_rx_buffers - Replace used receive buffers
+- * @rx_ring: ring to place buffers on
+- * @cleaned_count: number of buffers to replace
+- **/
+-void ixgbe_alloc_rx_buffers(struct ixgbe_ring *rx_ring, u16 cleaned_count)
++ * ixgbe_alloc_rx_buffers - refill Rx ring with fresh pages
++ * @rx_ring:   ring to fill
++ * @cleaned:   number of descriptors freed in the last poll cycle
++ */
++void ixgbe_alloc_rx_buffers(struct ixgbe_ring *rx_ring, u16 cleaned)
+ {
+ 	union ixgbe_adv_rx_desc *rx_desc;
+-	struct ixgbe_rx_buffer *bi;
+-	u16 i = rx_ring->next_to_use;
+-	u16 bufsz;
++	struct ixgbe_rx_buffer  *bi;
++	u16                      i;
+ 
+-	/* nothing to do */
+-	if (!cleaned_count)
+-		return;
++	/* nothing to do? */
++	if (!cleaned) {
++		return;			/* <-- braces silence clang -Wmisleading-indentation */
++	}
+ 
++	i       = rx_ring->next_to_use;
+ 	rx_desc = IXGBE_RX_DESC(rx_ring, i);
+-	bi = &rx_ring->rx_buffer_info[i];
+-	i -= rx_ring->count;
+-
+-	bufsz = ixgbe_rx_bufsz(rx_ring);
++	bi      = &rx_ring->rx_buffer_info[i];
+ 
+-	do {
+-		if (!ixgbe_alloc_mapped_page(rx_ring, bi))
++	while (cleaned--) {
++		if (unlikely(!ixgbe_alloc_mapped_page(rx_ring, bi)))
+ 			break;
+ 
+-		/* sync the buffer for use by the device */
++		/* make sure the page is clean for device DMA */
+ 		dma_sync_single_range_for_device(rx_ring->dev, bi->dma,
+-						 bi->page_offset, bufsz,
+-						 DMA_FROM_DEVICE);
+-
+-		/*
+-		 * Refresh the desc even if buffer_addrs didn't change
+-		 * because each write-back erases this info.
+-		 */
+-		rx_desc->read.pkt_addr = cpu_to_le64(bi->dma + bi->page_offset);
+-
+-		rx_desc++;
+-		bi++;
+-		i++;
+-		if (unlikely(!i)) {
++										 bi->page_offset,
++								   ixgbe_rx_bufsz(rx_ring),
++										 DMA_FROM_DEVICE);
++
++		rx_desc->read.pkt_addr =
++		cpu_to_le64(bi->dma + bi->page_offset);
++		rx_desc->wb.upper.length = 0;	/* pre-clear */
++
++		/* advance generic ‑ works for any ring size */
++		if (++i == rx_ring->count) {
++			i       = 0;
+ 			rx_desc = IXGBE_RX_DESC(rx_ring, 0);
+-			bi = rx_ring->rx_buffer_info;
+-			i -= rx_ring->count;
++			bi      = rx_ring->rx_buffer_info;
++		} else {
++			++rx_desc;
++			++bi;
+ 		}
++	}
+ 
+-		/* clear the length for the next_to_use descriptor */
+-		rx_desc->wb.upper.length = 0;
+-
+-		cleaned_count--;
+-	} while (cleaned_count);
+-
+-	i += rx_ring->count;
+-
+-	if (rx_ring->next_to_use != i) {
+-		rx_ring->next_to_use = i;
++	/* nothing was added? */
++	if (rx_ring->next_to_use == i)
++		return;
+ 
+-		/* update next to alloc since we have filled the ring */
+-		rx_ring->next_to_alloc = i;
++	rx_ring->next_to_use  = i;
++	rx_ring->next_to_alloc = i;
+ 
+-		/* Force memory writes to complete before letting h/w
+-		 * know there are new descriptors to fetch.  (Only
+-		 * applicable for weak-ordered memory model archs,
+-		 * such as IA-64).
+-		 */
+-		wmb();
+-		writel(i, rx_ring->tail);
+-	}
++	/* publish descriptors before doorbell */
++	wmb();
++	writel(i, rx_ring->tail);
+ }
+ 
++/**
++ * ixgbe_set_rsc_gso_size - compute GSO fields for an RSC frame
++ * @ring:    owning ring (current stats not used)
++ * @skb:     coalesced skb
++ * @rx_desc: EOP descriptor that completed the RSC frame
++ *
++ * 82599 family reports MSS in mss_l4_len_idx; X540 does not.
++ */
+ static void ixgbe_set_rsc_gso_size(struct ixgbe_ring *ring,
+-				   struct sk_buff *skb)
++								   struct sk_buff    *skb,
++								   union ixgbe_adv_rx_desc *rx_desc)
+ {
+-	u16 hdr_len = skb_headlen(skb);
+-
+-	/* set gso_size to avoid messing up TCP MSS */
+-	skb_shinfo(skb)->gso_size = DIV_ROUND_UP((skb->len - hdr_len),
+-						 IXGBE_CB(skb)->append_cnt);
+-	skb_shinfo(skb)->gso_type = SKB_GSO_TCPV4;
++	u16 hdr   = skb_transport_offset(skb);
++	u16 append = IXGBE_CB(skb)->append_cnt ?: 1; /* avoid div/0 */
++	u16 mss   = 0;
++
++	#ifdef IXGBE_RXDADV_RSCCMSS_MASK		/* only 82599 has this */
++	{
++		u32 mss_idx = le32_to_cpu(
++			rx_desc->wb.lower.lo_dword.mss_l4_len_idx);
++
++		mss = (mss_idx & IXGBE_RXDADV_RSCCMSS_MASK) >>
++		IXGBE_RXDADV_RSCCMSS_SHIFT;
++	}
++	#endif
++
++	if (!mss)	/* X540 or value missing */
++		mss = DIV_ROUND_UP(skb->len - hdr, append);
++
++	skb_shinfo(skb)->gso_size = mss;
++	skb_shinfo(skb)->gso_segs =
++	DIV_ROUND_UP(skb->len - hdr, mss);
++	skb_shinfo(skb)->gso_type = SKB_GSO_TCPV4; /* RSC does IPv4 TCP */
+ }
+ 
+ static void ixgbe_update_rsc_stats(struct ixgbe_ring *rx_ring,
+-				   struct sk_buff *skb)
++								   union ixgbe_adv_rx_desc *rx_desc,
++								   struct sk_buff *skb)
+ {
+-	/* if append_cnt is 0 then frame is not RSC */
+-	if (!IXGBE_CB(skb)->append_cnt)
++	if (!IXGBE_CB(skb)->append_cnt) {	/* not RSC */
++		/* wipe stale meta if skb recycled */
++		if (skb_is_gso(skb)) {
++			struct skb_shared_info *sh = skb_shinfo(skb);
++
++			sh->gso_size = 0;
++			sh->gso_type = 0;
++			sh->gso_segs = 0;
++		}
+ 		return;
++	}
+ 
+ 	rx_ring->rx_stats.rsc_count += IXGBE_CB(skb)->append_cnt;
+ 	rx_ring->rx_stats.rsc_flush++;
+ 
+-	ixgbe_set_rsc_gso_size(rx_ring, skb);
++	ixgbe_set_rsc_gso_size(rx_ring, skb, rx_desc);
+ 
+-	/* gso_size is computed using append_cnt so always clear it last */
+-	IXGBE_CB(skb)->append_cnt = 0;
++	IXGBE_CB(skb)->append_cnt = 0;	/* always clear last */
+ }
+ 
+ /**
+@@ -1720,36 +1751,35 @@ static void ixgbe_update_rsc_stats(struc
+  * other fields within the skb.
+  **/
+ void ixgbe_process_skb_fields(struct ixgbe_ring *rx_ring,
+-			      union ixgbe_adv_rx_desc *rx_desc,
+-			      struct sk_buff *skb)
++							  union ixgbe_adv_rx_desc *rx_desc,
++							  struct sk_buff *skb)
+ {
+ 	struct net_device *dev = rx_ring->netdev;
+-	u32 flags = rx_ring->q_vector->adapter->flags;
++	u32 flags              = rx_ring->q_vector->adapter->flags;
+ 
+-	ixgbe_update_rsc_stats(rx_ring, skb);
++	ixgbe_update_rsc_stats(rx_ring, rx_desc, skb);
+ 
+ 	ixgbe_rx_hash(rx_ring, rx_desc, skb);
+-
+ 	ixgbe_rx_checksum(rx_ring, rx_desc, skb);
+ 
+ 	if (unlikely(flags & IXGBE_FLAG_RX_HWTSTAMP_ENABLED))
+ 		ixgbe_ptp_rx_hwtstamp(rx_ring, rx_desc, skb);
+ 
+ 	if ((dev->features & NETIF_F_HW_VLAN_CTAG_RX) &&
+-	    ixgbe_test_staterr(rx_desc, IXGBE_RXD_STAT_VP)) {
++		ixgbe_test_staterr(rx_desc, IXGBE_RXD_STAT_VP)) {
+ 		u16 vid = le16_to_cpu(rx_desc->wb.upper.vlan);
+-		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), vid);
+-	}
++	__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), vid);
++		}
+ 
+-	if (ixgbe_test_staterr(rx_desc, IXGBE_RXDADV_STAT_SECP))
+-		ixgbe_ipsec_rx(rx_ring, rx_desc, skb);
++		if (ixgbe_test_staterr(rx_desc, IXGBE_RXDADV_STAT_SECP))
++			ixgbe_ipsec_rx(rx_ring, rx_desc, skb);
+ 
+-	/* record Rx queue, or update MACVLAN statistics */
+-	if (netif_is_ixgbe(dev))
++	if (netif_is_ixgbe(dev)) {
+ 		skb_record_rx_queue(skb, rx_ring->queue_index);
+-	else
+-		macvlan_count_rx(netdev_priv(dev), skb->len + ETH_HLEN, true,
+-				 false);
++	} else {				/* braces fix clang warn */
++		macvlan_count_rx(netdev_priv(dev),
++						 skb->len + ETH_HLEN, true, false);
++	}
+ 
+ 	skb->protocol = eth_type_trans(skb, dev);
+ }
+@@ -2327,155 +2357,147 @@ static void ixgbe_rx_buffer_flip(struct
   * Returns amount of work completed
   **/
  static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
 -			       struct ixgbe_ring *rx_ring,
 -			       const int budget)
-+							  struct ixgbe_ring *rx_ring,
-+							  const int budget)
++							  struct ixgbe_ring   *rx_ring,
++							  const int            budget)
  {
- 	unsigned int total_rx_bytes = 0, total_rx_packets = 0, frame_sz = 0;
- 	struct ixgbe_adapter *adapter = q_vector->adapter;
+-	unsigned int total_rx_bytes = 0, total_rx_packets = 0, frame_sz = 0;
+-	struct ixgbe_adapter *adapter = q_vector->adapter;
 -#ifdef IXGBE_FCOE
 -	int ddp_bytes;
 -	unsigned int mss = 0;
 -#endif /* IXGBE_FCOE */
- 	u16 cleaned_count = ixgbe_desc_unused(rx_ring);
- 	unsigned int offset = rx_ring->rx_offset;
- 	unsigned int xdp_xmit = 0;
- 	struct xdp_buff xdp;
- 	int xdp_res = 0;
+-	u16 cleaned_count = ixgbe_desc_unused(rx_ring);
+-	unsigned int offset = rx_ring->rx_offset;
+-	unsigned int xdp_xmit = 0;
+-	struct xdp_buff xdp;
+-	int xdp_res = 0;
++	struct ixgbe_adapter *adapter      = q_vector->adapter;
++	unsigned int          total_pkts   = 0;
++	unsigned int          total_bytes  = 0;
++	unsigned int          xdp_xmit     = 0;
++	u16                   cleaned_cnt  = ixgbe_desc_unused(rx_ring);
++	const unsigned int    offset       = rx_ring->rx_offset;
++	struct xdp_buff       xdp;
++	int                   xdp_res;
  
 -	/* Frame size depend on rx_ring setup when PAGE_SIZE=4K */
 -#if (PAGE_SIZE < 8192)
-+	#if (PAGE_SIZE < 8192)
++	unsigned int frame_sz = ixgbe_rx_frame_truesize(rx_ring, 0);
++	#if PAGE_SIZE < 8192
  	frame_sz = ixgbe_rx_frame_truesize(rx_ring, 0);
 -#endif
 +	#endif
  	xdp_init_buff(&xdp, frame_sz, &rx_ring->xdp_rxq);
  
- 	while (likely(total_rx_packets < budget)) {
-@@ -2354,8 +2360,15 @@ static int ixgbe_clean_rx_irq(struct ixg
- 		struct sk_buff *skb;
- 		int rx_buffer_pgcnt;
- 		unsigned int size;
-+		u16 ntc_prefetch;
-+		struct ixgbe_rx_buffer *rx_buffer_pref;
-+
-+		ntc_prefetch = (rx_ring->next_to_clean + IXGBE_RX_PREFETCH_OFFSET) &
-+		(rx_ring->count - 1);
-+
-+		prefetch(IXGBE_RX_DESC(rx_ring, ntc_prefetch));
-+		prefetch(&rx_ring->rx_buffer_info[ntc_prefetch]);
- 
+-	while (likely(total_rx_packets < budget)) {
++	while (likely(total_pkts < budget)) {
+ 		union ixgbe_adv_rx_desc *rx_desc;
+-		struct ixgbe_rx_buffer *rx_buffer;
+-		struct sk_buff *skb;
+-		int rx_buffer_pgcnt;
+-		unsigned int size;
+-
 -		/* return some buffers to hardware, one at a time is too slow */
- 		if (cleaned_count >= IXGBE_RX_BUFFER_WRITE) {
- 			ixgbe_alloc_rx_buffers(rx_ring, cleaned_count);
- 			cleaned_count = 0;
-@@ -2366,26 +2379,25 @@ static int ixgbe_clean_rx_irq(struct ixg
+-		if (cleaned_count >= IXGBE_RX_BUFFER_WRITE) {
+-			ixgbe_alloc_rx_buffers(rx_ring, cleaned_count);
+-			cleaned_count = 0;
++		struct ixgbe_rx_buffer  *rxb;
++		struct sk_buff          *skb;
++		int                      pagecnt_bias;
++		u32                      staterr;
++		unsigned int             size;
++		u16                      la;
++
++		/* 8-descriptor look-ahead prefetch */
++		la = rx_ring->next_to_clean + IXGBE_RX_PREFETCH_OFFSET; /* 8 */
++		if (la >= rx_ring->count)
++			la -= rx_ring->count;
++		prefetch(IXGBE_RX_DESC(rx_ring, la));
++		prefetch(&rx_ring->rx_buffer_info[la]);
++
++		if (cleaned_cnt >= IXGBE_RX_BUFFER_WRITE) {
++			ixgbe_alloc_rx_buffers(rx_ring, cleaned_cnt);
++			cleaned_cnt = 0;
+ 		}
+ 
+ 		rx_desc = IXGBE_RX_DESC(rx_ring, rx_ring->next_to_clean);
++
++		/* length is in wb.upper.length (16-bit) */
+ 		size = le16_to_cpu(rx_desc->wb.upper.length);
  		if (!size)
  			break;
  
@@ -80,58 +822,78 @@
 -		 * any other fields out of the rx_desc until we know the
 -		 * descriptor has been written back
 -		 */
-+		rx_buffer_pref = &rx_ring->rx_buffer_info[rx_ring->next_to_clean];
-+		prefetch(page_address(rx_buffer_pref->page) +
-+		rx_buffer_pref->page_offset);
+-		dma_rmb();
++		/* status/error for later use (one load) */
++		staterr = le32_to_cpu(rx_desc->wb.upper.status_error);
 +
- 		dma_rmb();
++		rxb = &rx_ring->rx_buffer_info[rx_ring->next_to_clean];
++		prefetch(page_address(rxb->page) + rxb->page_offset);
++
++		dma_rmb();		/* make rest of desc visible */
++		xdp_res = 0;
  
 -		rx_buffer = ixgbe_get_rx_buffer(rx_ring, rx_desc, &skb, size, &rx_buffer_pgcnt);
-+		rx_buffer = ixgbe_get_rx_buffer(rx_ring, rx_desc, &skb, size,
-+										&rx_buffer_pgcnt);
++		rxb = ixgbe_get_rx_buffer(rx_ring, rx_desc, &skb, size,
++								  &pagecnt_bias);
  
 -		/* retrieve a buffer from the ring */
  		if (!skb) {
- 			unsigned char *hard_start;
+-			unsigned char *hard_start;
++			void *hard_start = page_address(rxb->page) +
++			rxb->page_offset - offset;
  
- 			hard_start = page_address(rx_buffer->page) +
+-			hard_start = page_address(rx_buffer->page) +
 -				     rx_buffer->page_offset - offset;
-+			rx_buffer->page_offset - offset;
  			xdp_prepare_buff(&xdp, hard_start, offset, size, true);
  			xdp_buff_clear_frags_flag(&xdp);
 -#if (PAGE_SIZE > 4096)
 -			/* At larger PAGE_SIZE, frame_sz depend on len size */
-+			#if (PAGE_SIZE > 4096)
++			#if PAGE_SIZE > 4096
  			xdp.frame_sz = ixgbe_rx_frame_truesize(rx_ring, size);
 -#endif
 +			#endif
  			xdp_res = ixgbe_run_xdp(adapter, rx_ring, &xdp);
  		}
  
-@@ -2401,15 +2413,14 @@ static int ixgbe_clean_rx_irq(struct ixg
+ 		if (xdp_res) {
+ 			if (xdp_res & (IXGBE_XDP_TX | IXGBE_XDP_REDIR)) {
+ 				xdp_xmit |= xdp_res;
+-				ixgbe_rx_buffer_flip(rx_ring, rx_buffer, size);
++				ixgbe_rx_buffer_flip(rx_ring, rxb, size);
+ 			} else {
+-				rx_buffer->pagecnt_bias++;
++				rxb->pagecnt_bias++;
+ 			}
+-			total_rx_packets++;
+-			total_rx_bytes += size;
++			total_pkts++;
++			total_bytes += size;
  		} else if (skb) {
- 			ixgbe_add_rx_frag(rx_ring, rx_buffer, skb, size);
+-			ixgbe_add_rx_frag(rx_ring, rx_buffer, skb, size);
++			ixgbe_add_rx_frag(rx_ring, rxb, skb, size);
  		} else if (ring_uses_build_skb(rx_ring)) {
 -			skb = ixgbe_build_skb(rx_ring, rx_buffer,
 -					      &xdp, rx_desc);
-+			skb = ixgbe_build_skb(rx_ring, rx_buffer, &xdp,
-+								  rx_desc);
++			skb = ixgbe_build_skb(rx_ring, rxb, &xdp, rx_desc);
  		} else {
 -			skb = ixgbe_construct_skb(rx_ring, rx_buffer,
 -						  &xdp, rx_desc);
-+			skb = ixgbe_construct_skb(rx_ring, rx_buffer, &xdp,
-+									  rx_desc);
++			skb = ixgbe_construct_skb(rx_ring, rxb, &xdp, rx_desc);
  		}
  
 -		/* exit if we failed to retrieve a buffer */
 -		if (!xdp_res && !skb) {
 +		if (unlikely(!xdp_res && !skb)) {
  			rx_ring->rx_stats.alloc_rx_buff_failed++;
- 			rx_buffer->pagecnt_bias++;
+-			rx_buffer->pagecnt_bias++;
++			rxb->pagecnt_bias++;
  			break;
-@@ -2418,48 +2429,42 @@ static int ixgbe_clean_rx_irq(struct ixg
- 		ixgbe_put_rx_buffer(rx_ring, rx_buffer, skb, rx_buffer_pgcnt);
- 		cleaned_count++;
+ 		}
+ 
+-		ixgbe_put_rx_buffer(rx_ring, rx_buffer, skb, rx_buffer_pgcnt);
+-		cleaned_count++;
++		ixgbe_put_rx_buffer(rx_ring, rxb, skb, pagecnt_bias);
++		cleaned_cnt++;
  
 -		/* place incomplete frames back on ring for completion */
 -		if (ixgbe_is_non_eop(rx_ring, rx_desc, skb))
@@ -143,42 +905,48 @@
  			continue;
  
 -		/* probably a little skewed due to removing CRC */
- 		total_rx_bytes += skb->len;
- 
+-		total_rx_bytes += skb->len;
+-
 -		/* populate checksum, timestamp, VLAN, and protocol */
++		total_bytes += skb->len;
  		ixgbe_process_skb_fields(rx_ring, rx_desc, skb);
  
 -#ifdef IXGBE_FCOE
 -		/* if ddp, not passing to ULD unless for FCP_RSP or error */
 -		if (ixgbe_rx_is_fcoe(rx_ring, rx_desc)) {
-+		#ifdef IXGBE_FCOE
-+		if (unlikely(ixgbe_rx_is_fcoe(rx_ring, rx_desc))) {
-+			int ddp_bytes;
-+			unsigned int mss = 0;
-+
- 			ddp_bytes = ixgbe_fcoe_ddp(adapter, rx_desc, skb);
+-			ddp_bytes = ixgbe_fcoe_ddp(adapter, rx_desc, skb);
 -			/* include DDPed FCoE data */
- 			if (ddp_bytes > 0) {
- 				if (!mss) {
- 					mss = rx_ring->netdev->mtu -
+-			if (ddp_bytes > 0) {
+-				if (!mss) {
+-					mss = rx_ring->netdev->mtu -
 -						sizeof(struct fcoe_hdr) -
 -						sizeof(struct fc_frame_header) -
 -						sizeof(struct fcoe_crc_eof);
-+					sizeof(struct fcoe_hdr) -
-+					sizeof(struct fc_frame_header) -
-+					sizeof(struct fcoe_crc_eof);
- 					if (mss > 512)
- 						mss &= ~511;
- 				}
- 				total_rx_bytes += ddp_bytes;
- 				total_rx_packets += DIV_ROUND_UP(ddp_bytes,
+-					if (mss > 512)
+-						mss &= ~511;
+-				}
+-				total_rx_bytes += ddp_bytes;
+-				total_rx_packets += DIV_ROUND_UP(ddp_bytes,
 -								 mss);
-+												 mss);
- 			}
- 			if (!ddp_bytes) {
+-			}
+-			if (!ddp_bytes) {
++		#ifdef IXGBE_FCOE
++		if (unlikely(ixgbe_rx_is_fcoe(rx_ring, rx_desc))) {
++			int ddp = ixgbe_fcoe_ddp(adapter, rx_desc, skb);
++			if (ddp <= 0) {
  				dev_kfree_skb_any(skb);
  				continue;
  			}
++			{
++				unsigned int mss = rx_ring->netdev->mtu -
++				sizeof(struct fcoe_hdr) -
++				sizeof(struct fc_frame_header) -
++				sizeof(struct fcoe_crc_eof);
++				if (mss > 512)
++					mss &= ~511;
++				total_bytes += ddp;
++				total_pkts  += DIV_ROUND_UP(ddp, mss);
++			}
  		}
 -
 -#endif /* IXGBE_FCOE */
@@ -186,19 +954,34 @@
  		ixgbe_rx_skb(q_vector, skb);
 -
 -		/* update budget accounting */
- 		total_rx_packets++;
+-		total_rx_packets++;
++		total_pkts++;
  	}
  
-@@ -2473,7 +2478,7 @@ static int ixgbe_clean_rx_irq(struct ixg
+ 	if (xdp_xmit & IXGBE_XDP_REDIR)
+ 		xdp_do_flush();
+-
+ 	if (xdp_xmit & IXGBE_XDP_TX) {
+-		struct ixgbe_ring *ring = ixgbe_determine_xdp_ring(adapter);
+-
+-		ixgbe_xdp_ring_update_tail_locked(ring);
++		ixgbe_xdp_ring_update_tail_locked(
++			ixgbe_determine_xdp_ring(adapter));
  	}
  
- 	ixgbe_update_rx_ring_stats(rx_ring, q_vector, total_rx_packets,
+-	ixgbe_update_rx_ring_stats(rx_ring, q_vector, total_rx_packets,
 -				   total_rx_bytes);
-+							   total_rx_bytes);
++	if (cleaned_cnt) {
++		ixgbe_alloc_rx_buffers(rx_ring, cleaned_cnt);
++	}
  
- 	return total_rx_packets;
+-	return total_rx_packets;
++	ixgbe_update_rx_ring_stats(rx_ring, q_vector, total_pkts, total_bytes);
++	return total_pkts;
  }
-@@ -2558,178 +2563,112 @@ static void ixgbe_configure_msix(struct
+ 
+ /**
+@@ -2558,178 +2580,117 @@ static void ixgbe_configure_msix(struct
   *      while increasing bulk throughput.
   **/
  static void ixgbe_update_itr(struct ixgbe_q_vector *q_vector,
@@ -215,6 +998,7 @@
 -	/* If we don't have any rings just leave ourselves set for maximum
 -	 * possible latency so we take ourselves out of the equation.
 -	 */
++	/* Opt 3: Cache-hot `ring_container` fields */
 +	prefetchw(ring_container);
 +
  	if (!ring_container->ring)
@@ -239,6 +1023,7 @@
 -	 * without any work on our queue.
 -	 */
 -	if (!packets) {
++	/* Opt 3: Branch-probability hints */
 +	if (unlikely(!packets)) {
  		itr = (q_vector->itr >> 2) + IXGBE_ITR_ADAPTIVE_MIN_INC;
  		if (itr > IXGBE_ITR_ADAPTIVE_MAX_USECS)
@@ -256,7 +1041,8 @@
 -	 */
 -	if (packets < 4 && bytes < 9000) {
 -		itr = IXGBE_ITR_ADAPTIVE_LATENCY;
-+	if (likely(packets >= 256)) {
++	/* Opt 3: Hot-path first layout */
++	if (likely(packets >= 256)) { /* Common bulk path */
 +		itr = IXGBE_ITR_ADAPTIVE_BULK;
  		goto adjust_by_size;
  	}
@@ -269,7 +1055,7 @@
 -		itr = (q_vector->itr >> 2) + IXGBE_ITR_ADAPTIVE_MIN_INC;
 -		if (itr > IXGBE_ITR_ADAPTIVE_MAX_USECS)
 -			itr = IXGBE_ITR_ADAPTIVE_MAX_USECS;
-+	if (packets >= 96) {
++	if (packets >= 96) { /* 96 <= packets < 256 */
 +		itr = q_vector->itr >> 3;
 +		if (itr < IXGBE_ITR_ADAPTIVE_MIN_USECS)
 +			itr = IXGBE_ITR_ADAPTIVE_MIN_USECS;
@@ -280,7 +1066,7 @@
 -	 * out "just right". Just report that our current ITR is good for us.
 -	 */
 -	if (packets < 96) {
-+	if (packets >= 48) {
++	if (packets >= 48) { /* 48 <= packets < 96 */
  		itr = q_vector->itr >> 2;
  		goto clear_counts;
  	}
@@ -293,7 +1079,7 @@
 -		itr = q_vector->itr >> 3;
 -		if (itr < IXGBE_ITR_ADAPTIVE_MIN_USECS)
 -			itr = IXGBE_ITR_ADAPTIVE_MIN_USECS;
-+	if (packets >= 4) {
++	if (packets >= 4) { /* 4 <= packets < 48 */
 +		itr = (q_vector->itr >> 2) + IXGBE_ITR_ADAPTIVE_MIN_INC;
 +		if (itr > IXGBE_ITR_ADAPTIVE_MAX_USECS)
 +			itr = IXGBE_ITR_ADAPTIVE_MAX_USECS;
@@ -331,51 +1117,47 @@
 -	 * by 8 after rounding up. We also have to account for PCIe link speed
 -	 * difference as ITR scales based on this.
 -	 */
--	if (avg_wire_size <= 60) {
--		/* Start at 50k ints/sec */
++	/* packets < 4 */
 +	if (bytes < 9000) {
 +		itr = IXGBE_ITR_ADAPTIVE_LATENCY;
 +		goto adjust_by_size;
 +	}
 +
++	/* packets < 4 and bytes >= 9000 (TSO likely) */
 +	itr = (q_vector->itr >> 2) + IXGBE_ITR_ADAPTIVE_MIN_INC;
 +	if (itr > IXGBE_ITR_ADAPTIVE_MAX_USECS)
 +		itr = IXGBE_ITR_ADAPTIVE_MAX_USECS;
 +	goto clear_counts;
 +
 +	adjust_by_size:
-+	/* avg_wire_size = bytes / packets, avoid slow DIV */
++	/* Opt 3: Replace expensive division with reciprocal multiply-shifts */
 +	{
 +		struct reciprocal_value recip = reciprocal_value(packets);
-+
 +		avg_wire_size = reciprocal_divide(bytes, recip);
 +	}
 +
-+	if (avg_wire_size <= 60)
+ 	if (avg_wire_size <= 60) {
+-		/* Start at 50k ints/sec */
  		avg_wire_size = 5120;
--	} else if (avg_wire_size <= 316) {
+ 	} else if (avg_wire_size <= 316) {
 -		/* 50K ints/sec to 16K ints/sec */
 -		avg_wire_size *= 40;
 -		avg_wire_size += 2720;
--	} else if (avg_wire_size <= 1084) {
++		avg_wire_size = avg_wire_size * 40 + 2720;
+ 	} else if (avg_wire_size <= 1084) {
 -		/* 16K ints/sec to 9.2K ints/sec */
 -		avg_wire_size *= 15;
 -		avg_wire_size += 11452;
--	} else if (avg_wire_size < 1968) {
++		avg_wire_size = avg_wire_size * 15 + 11452;
+ 	} else if (avg_wire_size < 1968) {
 -		/* 9.2K ints/sec to 8K ints/sec */
 -		avg_wire_size *= 5;
 -		avg_wire_size += 22420;
--	} else {
--		/* plateau at a limit of 8K ints/sec */
-+	else if (avg_wire_size <= 316)
-+		avg_wire_size = avg_wire_size * 40 + 2720;
-+	else if (avg_wire_size <= 1084)
-+		avg_wire_size = avg_wire_size * 15 + 11452;
-+	else if (avg_wire_size < 1968)
 +		avg_wire_size = avg_wire_size * 5 + 22420;
-+	else
+ 	} else {
+-		/* plateau at a limit of 8K ints/sec */
  		avg_wire_size = 32256;
--	}
+ 	}
  
 -	/* If we are in low latency mode half our delay which doubles the rate
 -	 * to somewhere between 100K to 16K ints/sec
@@ -441,7 +1223,154 @@
  }
  
  /**
-@@ -8591,32 +8530,23 @@ no_csum:
+@@ -4313,100 +4274,91 @@ static void ixgbe_rx_desc_queue_enable(s
+ }
+ 
+ void ixgbe_configure_rx_ring(struct ixgbe_adapter *adapter,
+-			     struct ixgbe_ring *ring)
++							 struct ixgbe_ring    *ring)
+ {
+-	struct ixgbe_hw *hw = &adapter->hw;
++	struct ixgbe_hw *hw  = &adapter->hw;
++	u64               rdba = ring->dma;
++	u32               rxdctl;
++	u8                reg  = ring->reg_idx;
+ 	union ixgbe_adv_rx_desc *rx_desc;
+-	u64 rdba = ring->dma;
+-	u32 rxdctl;
+-	u8 reg_idx = ring->reg_idx;
+ 
++	/* ---------------- DMA-zero bookkeeping -------------------- */
+ 	xdp_rxq_info_unreg_mem_model(&ring->xdp_rxq);
+ 	ring->xsk_pool = ixgbe_xsk_pool(adapter, ring);
+ 	if (ring->xsk_pool) {
+ 		WARN_ON(xdp_rxq_info_reg_mem_model(&ring->xdp_rxq,
+-						   MEM_TYPE_XSK_BUFF_POOL,
+-						   NULL));
++										   MEM_TYPE_XSK_BUFF_POOL, NULL));
+ 		xsk_pool_set_rxq_info(ring->xsk_pool, &ring->xdp_rxq);
+ 	} else {
+ 		WARN_ON(xdp_rxq_info_reg_mem_model(&ring->xdp_rxq,
+-						   MEM_TYPE_PAGE_SHARED, NULL));
++										   MEM_TYPE_PAGE_SHARED, NULL));
+ 	}
+ 
+-	/* disable queue to avoid use of these values while updating state */
+-	rxdctl = IXGBE_READ_REG(hw, IXGBE_RXDCTL(reg_idx));
++	/* ---------------- disable queue while we update ------------ */
++	rxdctl = IXGBE_READ_REG(hw, IXGBE_RXDCTL(reg));
+ 	rxdctl &= ~IXGBE_RXDCTL_ENABLE;
+-
+-	/* write value back with RXDCTL.ENABLE bit cleared */
+-	IXGBE_WRITE_REG(hw, IXGBE_RXDCTL(reg_idx), rxdctl);
+-	IXGBE_WRITE_FLUSH(hw);
+-
+-	IXGBE_WRITE_REG(hw, IXGBE_RDBAL(reg_idx), (rdba & DMA_BIT_MASK(32)));
+-	IXGBE_WRITE_REG(hw, IXGBE_RDBAH(reg_idx), (rdba >> 32));
+-	IXGBE_WRITE_REG(hw, IXGBE_RDLEN(reg_idx),
+-			ring->count * sizeof(union ixgbe_adv_rx_desc));
+-	/* Force flushing of IXGBE_RDLEN to prevent MDD */
++	IXGBE_WRITE_REG(hw, IXGBE_RXDCTL(reg), rxdctl);
+ 	IXGBE_WRITE_FLUSH(hw);
+ 
+-	IXGBE_WRITE_REG(hw, IXGBE_RDH(reg_idx), 0);
+-	IXGBE_WRITE_REG(hw, IXGBE_RDT(reg_idx), 0);
+-	ring->tail = adapter->io_addr + IXGBE_RDT(reg_idx);
++	/* ---------------- base, len, head/tail --------------------- */
++	IXGBE_WRITE_REG(hw, IXGBE_RDBAL(reg),  rdba & DMA_BIT_MASK(32));
++	IXGBE_WRITE_REG(hw, IXGBE_RDBAH(reg),  rdba >> 32);
++	IXGBE_WRITE_REG(hw, IXGBE_RDLEN(reg),
++					ring->count * sizeof(union ixgbe_adv_rx_desc));
++	IXGBE_WRITE_FLUSH(hw);		/* prevent MDD */
++
++	IXGBE_WRITE_REG(hw, IXGBE_RDH(reg), 0);
++	IXGBE_WRITE_REG(hw, IXGBE_RDT(reg), 0);
++	ring->tail = adapter->io_addr + IXGBE_RDT(reg);
+ 
+ 	ixgbe_configure_srrctl(adapter, ring);
+ 	ixgbe_configure_rscctl(adapter, ring);
+ 
++	/* ---------------- per-family tweaks ------------------------ */
+ 	if (hw->mac.type == ixgbe_mac_82598EB) {
+-		/*
+-		 * enable cache line friendly hardware writes:
+-		 * PTHRESH=32 descriptors (half the internal cache),
+-		 * this also removes ugly rx_no_buffer_count increment
+-		 * HTHRESH=4 descriptors (to minimize latency on fetch)
+-		 * WTHRESH=8 burst writeback up to two cache lines
+-		 */
+ 		rxdctl &= ~0x3FFFFF;
+-		rxdctl |=  0x080420;
+-#if (PAGE_SIZE < 8192)
+-	/* RXDCTL.RLPML does not work on 82599 */
++		rxdctl |= 0x080420;		/* Intel default 82598 */
++		#if PAGE_SIZE < 8192
+ 	} else if (hw->mac.type != ixgbe_mac_82599EB) {
+-		rxdctl &= ~(IXGBE_RXDCTL_RLPMLMASK |
+-			    IXGBE_RXDCTL_RLPML_EN);
+-
+-		/* Limit the maximum frame size so we don't overrun the skb.
+-		 * This can happen in SRIOV mode when the MTU of the VF is
+-		 * higher than the MTU of the PF.
+-		 */
++		rxdctl &= ~(IXGBE_RXDCTL_RLPMLMASK | IXGBE_RXDCTL_RLPML_EN);
+ 		if (ring_uses_build_skb(ring) &&
+-		    !test_bit(__IXGBE_RX_3K_BUFFER, &ring->state))
++			!test_bit(__IXGBE_RX_3K_BUFFER, &ring->state))
+ 			rxdctl |= IXGBE_MAX_2K_FRAME_BUILD_SKB |
+-				  IXGBE_RXDCTL_RLPML_EN;
+-#endif
++			IXGBE_RXDCTL_RLPML_EN;
++		#endif
+ 	}
+ 
+-	ring->rx_offset = ixgbe_rx_offset(ring);
++	/* ---------------- X540: enable write-back watermark -------- */
++	if (hw->mac.type == ixgbe_mac_X540) {
++		#define IXGBE_RXDCTL_WTHRESH_MASK  (0x3F << 16)
++		#define IXGBE_RXDCTL_WTHRESH_SHIFT 16
++		rxdctl &= ~IXGBE_RXDCTL_WTHRESH_MASK;
++		rxdctl |= 31 << IXGBE_RXDCTL_WTHRESH_SHIFT; /* burst-2-cl */
++	}
+ 
++	/* ---------------- XSK pool RLPML override ------------------ */
++	ring->rx_offset = ixgbe_rx_offset(ring);
+ 	if (ring->xsk_pool && hw->mac.type != ixgbe_mac_82599EB) {
+-		u32 xsk_buf_len = xsk_pool_get_rx_frame_size(ring->xsk_pool);
++		u32 xsk_len = xsk_pool_get_rx_frame_size(ring->xsk_pool);
+ 
+-		rxdctl &= ~(IXGBE_RXDCTL_RLPMLMASK |
+-			    IXGBE_RXDCTL_RLPML_EN);
+-		rxdctl |= xsk_buf_len | IXGBE_RXDCTL_RLPML_EN;
+-
+-		ring->rx_buf_len = xsk_buf_len;
++		rxdctl &= ~(IXGBE_RXDCTL_RLPMLMASK | IXGBE_RXDCTL_RLPML_EN);
++		rxdctl |=  xsk_len | IXGBE_RXDCTL_RLPML_EN;
++		ring->rx_buf_len = xsk_len;
+ 	}
+ 
+-	/* initialize rx_buffer_info */
++	/* ---------------- clear software ring ---------------------- */
+ 	memset(ring->rx_buffer_info, 0,
+-	       sizeof(struct ixgbe_rx_buffer) * ring->count);
++		   sizeof(struct ixgbe_rx_buffer) * ring->count);
+ 
+-	/* initialize Rx descriptor 0 */
+ 	rx_desc = IXGBE_RX_DESC(ring, 0);
+ 	rx_desc->wb.upper.length = 0;
+ 
+-	/* enable receive descriptor ring */
++	/* ---------------- enable queue ----------------------------- */
+ 	rxdctl |= IXGBE_RXDCTL_ENABLE;
+-	IXGBE_WRITE_REG(hw, IXGBE_RXDCTL(reg_idx), rxdctl);
++	IXGBE_WRITE_REG(hw, IXGBE_RXDCTL(reg), rxdctl);
+ 
+ 	ixgbe_rx_desc_queue_enable(adapter, ring);
++
+ 	if (ring->xsk_pool)
+ 		ixgbe_alloc_rx_buffers_zc(ring, ixgbe_desc_unused(ring));
+ 	else
+@@ -8591,34 +8543,24 @@ no_csum:
  	ixgbe_tx_ctxtdesc(tx_ring, vlan_macip_lens, fceof_saidx, type_tucmd, 0);
  }
  
@@ -450,40 +1379,48 @@
 -	 ((u32)(_input & _flag) * (_result / _flag)) : \
 -	 ((u32)(_input & _flag) / (_flag / _result)))
 -
- static u32 ixgbe_tx_cmd_type(struct sk_buff *skb, u32 tx_flags)
+-static u32 ixgbe_tx_cmd_type(struct sk_buff *skb, u32 tx_flags)
++static inline __maybe_unused
++u32 ixgbe_tx_cmd_type(const struct sk_buff *skb, u32 tx_flags)
  {
 -	/* set type for advanced descriptor with frame checksum insertion */
- 	u32 cmd_type = IXGBE_ADVTXD_DTYP_DATA |
+-	u32 cmd_type = IXGBE_ADVTXD_DTYP_DATA |
 -		       IXGBE_ADVTXD_DCMD_DEXT |
 -		       IXGBE_ADVTXD_DCMD_IFCS;
-+	IXGBE_ADVTXD_DCMD_DEXT |
-+	IXGBE_ADVTXD_DCMD_IFCS;
- 
+-
 -	/* set HW vlan bit if vlan is present */
-+	/* VLAN, TSO, timestamp */
- 	cmd_type |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_HW_VLAN,
+-	cmd_type |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_HW_VLAN,
 -				   IXGBE_ADVTXD_DCMD_VLE);
 -
 -	/* set segmentation enable bits for TSO/FSO */
-+							   IXGBE_ADVTXD_DCMD_VLE);
- 	cmd_type |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_TSO,
+-	cmd_type |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_TSO,
 -				   IXGBE_ADVTXD_DCMD_TSE);
--
++	u32 cmd = IXGBE_ADVTXD_DTYP_DATA |
++	IXGBE_ADVTXD_DCMD_DEXT |
++	IXGBE_ADVTXD_DCMD_IFCS;
++
++	cmd |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_HW_VLAN,
++						  IXGBE_ADVTXD_DCMD_VLE);
++	cmd |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_TSO,
++						  IXGBE_ADVTXD_DCMD_TSE);
++	cmd |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_TSTAMP,
++						  IXGBE_ADVTXD_MAC_TSTAMP);
+ 
 -	/* set timestamp bit if present */
-+							   IXGBE_ADVTXD_DCMD_TSE);
- 	cmd_type |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_TSTAMP,
+-	cmd_type |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_TSTAMP,
 -				   IXGBE_ADVTXD_MAC_TSTAMP);
-+							   IXGBE_ADVTXD_MAC_TSTAMP);
++	if (skb->no_fcs)
++		cmd &= ~IXGBE_ADVTXD_DCMD_IFCS;
  
 -	/* insert frame checksum */
 -	cmd_type ^= IXGBE_SET_FLAG(skb->no_fcs, 1, IXGBE_ADVTXD_DCMD_IFCS);
-+	/* drop FCS generation if stack already supplied it */
-+	if (skb->no_fcs)
-+		cmd_type &= ~IXGBE_ADVTXD_DCMD_IFCS;
- 
- 	return cmd_type;
+-
+-	return cmd_type;
++	return cmd;
  }
-@@ -8654,12 +8584,18 @@ static void ixgbe_tx_olinfo_status(union
+ 
+ static void ixgbe_tx_olinfo_status(union ixgbe_adv_tx_desc *tx_desc,
+@@ -8654,12 +8596,27 @@ static void ixgbe_tx_olinfo_status(union
  
  static int __ixgbe_maybe_stop_tx(struct ixgbe_ring *tx_ring, u16 size)
  {
@@ -491,59 +1428,140 @@
 -				     ixgbe_desc_unused(tx_ring), size))
 -		return -EBUSY;
 +	/* fast exit: ring still has descriptors */
-+	if (likely(ixgbe_desc_unused(tx_ring) >= size))
++	if (likely(ixgbe_desc_unused(tx_ring) >= size)) {
 +		return 0;
-+
-+	/* try to stop the sub-queue; return 0 if it succeeded */
++	}
+ 
+-	++tx_ring->tx_stats.restart_queue;
+-	return 0;
++	/* try to stop the sub-queue; return 0 if it succeeded OR if it was
++	 * already stopped/became free before we could stop it.
++	 * Only increment restart_queue and return -EBUSY if *we* actually
++	 * stopped it.
++	 */
 +	if (!netif_subqueue_try_stop(tx_ring->netdev,
 +		tx_ring->queue_index,
-+		ixgbe_desc_unused(tx_ring), size))
-+		return 0;
- 
- 	++tx_ring->tx_stats.restart_queue;
--	return 0;
-+	return -EBUSY;
++		ixgbe_desc_unused(tx_ring), size)) {
++		return 0; /* Queue was not stopped by us (either already free or stopped by someone else) */
++		}
++
++		/* This line is executed ONLY if netif_subqueue_try_stop returned true (non-zero),
++		 * meaning we successfully stopped the queue.
++		 */
++		++tx_ring->tx_stats.restart_queue;
++	return -EBUSY; /* We successfully stopped the queue */
  }
  
  static inline int ixgbe_maybe_stop_tx(struct ixgbe_ring *tx_ring, u16 size)
-@@ -8671,8 +8607,8 @@ static inline int ixgbe_maybe_stop_tx(st
+@@ -8670,305 +8627,365 @@ static inline int ixgbe_maybe_stop_tx(st
+ 	return __ixgbe_maybe_stop_tx(tx_ring, size);
  }
  
- static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
+-static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
 -			struct ixgbe_tx_buffer *first,
 -			const u8 hdr_len)
+-{
+-	struct sk_buff *skb = first->skb;
+-	struct ixgbe_tx_buffer *tx_buffer;
+-	union ixgbe_adv_tx_desc *tx_desc;
+-	skb_frag_t *frag;
+-	dma_addr_t dma;
+-	unsigned int data_len, size;
+-	u32 tx_flags = first->tx_flags;
+-	u32 cmd_type = ixgbe_tx_cmd_type(skb, tx_flags);
+-	u16 i = tx_ring->next_to_use;
++/* --------------------------------------------------------------- */
++/* DMA helpers – fall back if RELAXED is not available             */
++/* --------------------------------------------------------------- */
++#ifndef DMA_ATTR_RELAXED
++#ifdef DMA_ATTR_WEAK_ORDERING
++#define DMA_ATTR_RELAXED DMA_ATTR_WEAK_ORDERING
++#endif
++#endif
+ 
+-	tx_desc = IXGBE_TX_DESC(tx_ring, i);
++#ifdef DMA_ATTR_RELAXED
++#define IXGBE_MAP_SINGLE(dev, buf, len) \
++dma_map_single_attrs((dev), (buf), (len), DMA_TO_DEVICE, \
++DMA_ATTR_RELAXED)
++#define IXGBE_MAP_PAGE(dev, page, off, len) \
++dma_map_page_attrs((dev), (page), (off), (len), \
++DMA_TO_DEVICE, DMA_ATTR_RELAXED)
++#define IXGBE_UNMAP_SINGLE(dev, addr, len) \
++dma_unmap_single_attrs((dev), (addr), (len), \
++DMA_TO_DEVICE, DMA_ATTR_RELAXED)
++#define IXGBE_UNMAP_PAGE(dev, addr, len) \
++dma_unmap_page_attrs((dev), (addr), (len), \
++DMA_TO_DEVICE, DMA_ATTR_RELAXED)
++#else
++#define IXGBE_MAP_SINGLE(dev, buf, len) \
++dma_map_single((dev), (buf), (len), DMA_TO_DEVICE)
++#define IXGBE_MAP_PAGE(dev, page, off, len) \
++dma_map_page((dev), (page), (off), (len), DMA_TO_DEVICE)
++#define IXGBE_UNMAP_SINGLE(dev, addr, len) \
++dma_unmap_single((dev), (addr), (len), DMA_TO_DEVICE)
++#define IXGBE_UNMAP_PAGE(dev, addr, len) \
++dma_unmap_page((dev), (addr), (len), DMA_TO_DEVICE)
++#endif
+ 
+-	ixgbe_tx_olinfo_status(tx_desc, tx_flags, skb->len - hdr_len);
++/* --------------------------------------------------------------- */
++/* Tx-mapping routine                                              */
++/* --------------------------------------------------------------- */
++static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
 +						struct ixgbe_tx_buffer *first,
 +						const u8 hdr_len)
- {
- 	struct sk_buff *skb = first->skb;
- 	struct ixgbe_tx_buffer *tx_buffer;
-@@ -8684,6 +8620,14 @@ static int ixgbe_tx_map(struct ixgbe_rin
- 	u32 cmd_type = ixgbe_tx_cmd_type(skb, tx_flags);
- 	u16 i = tx_ring->next_to_use;
- 
-+	/* prefetch next buffer/descriptor pair to hide cache latency */
-+	{
-+		u16 next = (i + 4) & (tx_ring->count - 1);
++{
++	struct sk_buff          *skb = first->skb;
++	union ixgbe_adv_tx_desc *txd;
++	struct ixgbe_tx_buffer  *txb;
++	skb_frag_t              *frag;
++	dma_addr_t               dma;
++	unsigned int             size, data_len;
++	u32                      cmd_base;
++	u16                      i, look;
 +
-+		prefetchw(&tx_ring->tx_buffer_info[next]);
-+		prefetch(IXGBE_TX_DESC(tx_ring, next));
-+	}
++	/* Build base command word (in-line ixgbe_tx_cmd_type) */
++	cmd_base = IXGBE_ADVTXD_DTYP_DATA |
++	IXGBE_ADVTXD_DCMD_DEXT |
++	IXGBE_ADVTXD_DCMD_IFCS;
++	cmd_base |= IXGBE_SET_FLAG(first->tx_flags,
++							   IXGBE_TX_FLAGS_HW_VLAN,
++							IXGBE_ADVTXD_DCMD_VLE);
++	cmd_base |= IXGBE_SET_FLAG(first->tx_flags,
++							   IXGBE_TX_FLAGS_TSO,
++							IXGBE_ADVTXD_DCMD_TSE);
++	cmd_base |= IXGBE_SET_FLAG(first->tx_flags,
++							   IXGBE_TX_FLAGS_TSTAMP,
++							IXGBE_ADVTXD_MAC_TSTAMP);
++	if (skb->no_fcs)
++		cmd_base &= ~IXGBE_ADVTXD_DCMD_IFCS;
 +
- 	tx_desc = IXGBE_TX_DESC(tx_ring, i);
++	/* Prefetch look-ahead, works for any ring size */
++	i     = tx_ring->next_to_use;
++	look  = i + IXGBE_TX_PREFETCH_OFFSET;
++	if (look >= tx_ring->count)
++		look -= tx_ring->count;
++	prefetchw(&tx_ring->tx_buffer_info[look]);
++	prefetch(IXGBE_TX_DESC(tx_ring, look));
++
++	/* First descriptor */
++	txd = IXGBE_TX_DESC(tx_ring, i);
++	txb = &tx_ring->tx_buffer_info[i];
++	ixgbe_tx_olinfo_status(txd, first->tx_flags, skb->len - hdr_len);
  
- 	ixgbe_tx_olinfo_status(tx_desc, tx_flags, skb->len - hdr_len);
-@@ -8691,34 +8635,33 @@ static int ixgbe_tx_map(struct ixgbe_rin
- 	size = skb_headlen(skb);
+-	size = skb_headlen(skb);
++	size     = skb_headlen(skb);
  	data_len = skb->data_len;
  
 -#ifdef IXGBE_FCOE
+-	if (tx_flags & IXGBE_TX_FLAGS_FCOE) {
 +	#ifdef IXGBE_FCOE
- 	if (tx_flags & IXGBE_TX_FLAGS_FCOE) {
++	if (first->tx_flags & IXGBE_TX_FLAGS_FCOE) {
  		if (data_len < sizeof(struct fcoe_crc_eof)) {
 -			size -= sizeof(struct fcoe_crc_eof) - data_len;
--			data_len = 0;
-+			size     -= sizeof(struct fcoe_crc_eof) - data_len;
-+			data_len  = 0;
++			size    -= sizeof(struct fcoe_crc_eof) - data_len;
+ 			data_len = 0;
  		} else {
  			data_len -= sizeof(struct fcoe_crc_eof);
  		}
@@ -551,42 +1569,86 @@
 +	#endif
  
 -#endif
- 	dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
+-	dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
 -
- 	tx_buffer = first;
- 
+-	tx_buffer = first;
+-
 -	for (frag = &skb_shinfo(skb)->frags[0];; frag++) {
-+	for (frag = &skb_shinfo(skb)->frags[0]; ; frag++) {
- 		if (dma_mapping_error(tx_ring->dev, dma))
- 			goto dma_error;
- 
+-		if (dma_mapping_error(tx_ring->dev, dma))
+-			goto dma_error;
+-
 -		/* record length, and DMA address */
 -		dma_unmap_len_set(tx_buffer, len, size);
-+		/* record length and DMA address */
-+		dma_unmap_len_set(tx_buffer, len,  size);
- 		dma_unmap_addr_set(tx_buffer, dma, dma);
- 
- 		tx_desc->read.buffer_addr = cpu_to_le64(dma);
- 
- 		while (unlikely(size > IXGBE_MAX_DATA_PER_TXD)) {
- 			tx_desc->read.cmd_type_len =
+-		dma_unmap_addr_set(tx_buffer, dma, dma);
+-
+-		tx_desc->read.buffer_addr = cpu_to_le64(dma);
+-
+-		while (unlikely(size > IXGBE_MAX_DATA_PER_TXD)) {
+-			tx_desc->read.cmd_type_len =
 -				cpu_to_le32(cmd_type ^ IXGBE_MAX_DATA_PER_TXD);
-+			cpu_to_le32(cmd_type ^ IXGBE_MAX_DATA_PER_TXD);
- 
- 			i++;
- 			tx_desc++;
-@@ -8728,7 +8671,7 @@ static int ixgbe_tx_map(struct ixgbe_rin
- 			}
- 			tx_desc->read.olinfo_status = 0;
- 
+-
+-			i++;
+-			tx_desc++;
+-			if (i == tx_ring->count) {
+-				tx_desc = IXGBE_TX_DESC(tx_ring, 0);
+-				i = 0;
+-			}
+-			tx_desc->read.olinfo_status = 0;
+-
 -			dma += IXGBE_MAX_DATA_PER_TXD;
-+			dma  += IXGBE_MAX_DATA_PER_TXD;
- 			size -= IXGBE_MAX_DATA_PER_TXD;
+-			size -= IXGBE_MAX_DATA_PER_TXD;
+-
+-			tx_desc->read.buffer_addr = cpu_to_le64(dma);
+-		}
+-
+-		if (likely(!data_len))
+-			break;
++	/* Map linear part */
++	dma = IXGBE_MAP_SINGLE(tx_ring->dev, skb->data, size);
++	if (dma_mapping_error(tx_ring->dev, dma))
++		goto dma_err;
++
++	dma_unmap_len_set(txb, len, size);
++	dma_unmap_addr_set(txb, dma, dma);
++	txb->protocol = first->protocol;	/* ATR */
++
++	txd->read.buffer_addr  = cpu_to_le64(dma);
++	txd->read.cmd_type_len = cpu_to_le32(cmd_base | size);	/* length set! */
++
++	/* Split linear part if >8 KiB */
++	while (unlikely(size > IXGBE_MAX_DATA_PER_TXD)) {
++		txd->read.cmd_type_len =
++		cpu_to_le32(cmd_base | IXGBE_MAX_DATA_PER_TXD);
  
- 			tx_desc->read.buffer_addr = cpu_to_le64(dma);
-@@ -8747,15 +8690,15 @@ static int ixgbe_tx_map(struct ixgbe_rin
- 		}
- 		tx_desc->read.olinfo_status = 0;
+-		tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type ^ size);
++		if (++i == tx_ring->count)
++			i = 0;
++		txd = IXGBE_TX_DESC(tx_ring, i);
++		txb = &tx_ring->tx_buffer_info[i];
+ 
+-		i++;
+-		tx_desc++;
+-		if (i == tx_ring->count) {
+-			tx_desc = IXGBE_TX_DESC(tx_ring, 0);
++		txb->skb = NULL; txb->xdpf = NULL; txb->protocol = 0;
++		dma_unmap_len_set(txb, len, 0);
++		dma_unmap_addr_set(txb, dma, 0);
++		txd->read.olinfo_status = 0;
++
++		dma  += IXGBE_MAX_DATA_PER_TXD;
++		size -= IXGBE_MAX_DATA_PER_TXD;
++		txd->read.buffer_addr  = cpu_to_le64(dma);
++		txd->read.cmd_type_len = cpu_to_le32(cmd_base | size);
++	}
++
++	/* Map each fragment */
++	for (frag = skb_shinfo(skb)->frags; data_len; ++frag) {
++		if (++i == tx_ring->count)
+ 			i = 0;
+-		}
+-		tx_desc->read.olinfo_status = 0;
++		txd = IXGBE_TX_DESC(tx_ring, i);
++		txb = &tx_ring->tx_buffer_info[i];
  
 -#ifdef IXGBE_FCOE
 +		#ifdef IXGBE_FCOE
@@ -598,20 +1660,52 @@
 +		#endif
  		data_len -= size;
  
- 		dma = skb_frag_dma_map(tx_ring->dev, frag, 0, size,
+-		dma = skb_frag_dma_map(tx_ring->dev, frag, 0, size,
 -				       DMA_TO_DEVICE);
-+							   DMA_TO_DEVICE);
++		dma = IXGBE_MAP_PAGE(tx_ring->dev,
++							 skb_frag_page(frag),
++							 skb_frag_off(frag),
++							 size);
++		if (dma_mapping_error(tx_ring->dev, dma))
++			goto dma_err;
  
- 		tx_buffer = &tx_ring->tx_buffer_info[i];
- 	}
-@@ -8766,53 +8709,40 @@ static int ixgbe_tx_map(struct ixgbe_rin
+-		tx_buffer = &tx_ring->tx_buffer_info[i];
+-	}
++		dma_unmap_len_set(txb, len, size);
++		dma_unmap_addr_set(txb, dma, dma);
++		txb->skb = NULL; txb->xdpf = NULL;
++
++		txd->read.buffer_addr  = cpu_to_le64(dma);
++		txd->read.olinfo_status = 0;
++		txd->read.cmd_type_len = cpu_to_le32(cmd_base | size);
  
- 	netdev_tx_sent_queue(txring_txq(tx_ring), first->bytecount);
+-	/* write last descriptor with RS and EOP bits */
+-	cmd_type |= size | IXGBE_TXD_CMD;
+-	tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type);
++		while (unlikely(size > IXGBE_MAX_DATA_PER_TXD)) {
++			txd->read.cmd_type_len =
++			cpu_to_le32(cmd_base | IXGBE_MAX_DATA_PER_TXD);
+ 
+-	netdev_tx_sent_queue(txring_txq(tx_ring), first->bytecount);
++			if (++i == tx_ring->count)
++				i = 0;
++			txd = IXGBE_TX_DESC(tx_ring, i);
++			txb = &tx_ring->tx_buffer_info[i];
  
 -	/* set the timestamp */
- 	first->time_stamp = jiffies;
--
- 	skb_tx_timestamp(skb);
+-	first->time_stamp = jiffies;
++			txb->skb = NULL; txb->xdpf = NULL; txb->protocol = 0;
++			dma_unmap_len_set(txb, len, 0);
++			dma_unmap_addr_set(txb, dma, 0);
++			txd->read.olinfo_status = 0;
+ 
+-	skb_tx_timestamp(skb);
++			dma  += IXGBE_MAX_DATA_PER_TXD;
++			size -= IXGBE_MAX_DATA_PER_TXD;
++			txd->read.buffer_addr  = cpu_to_le64(dma);
++			txd->read.cmd_type_len = cpu_to_le32(cmd_base | size);
++		}
++	}
  
 -	/*
 -	 * Force memory writes to complete before letting h/w know there
@@ -621,12 +1715,14 @@
 -	 * We also need this memory barrier to make certain all of the
 -	 * status bits have been updated before next_to_watch is written.
 -	 */
-+	/* make sure all memory writes are visible before updating HW tail */
++	/* Last descriptor – RS | EOP */
++	txd->read.cmd_type_len |= cpu_to_le32(IXGBE_TXD_CMD);
++	first->next_to_watch    = txd;
  	wmb();
  
 -	/* set next_to_watch value indicating a packet is present */
- 	first->next_to_watch = tx_desc;
- 
+-	first->next_to_watch = tx_desc;
+-
 -	i++;
 -	if (i == tx_ring->count)
 +	if (++i == tx_ring->count)
@@ -634,42 +1730,76 @@
 -
  	tx_ring->next_to_use = i;
  
- 	ixgbe_maybe_stop_tx(tx_ring, DESC_NEEDED);
+-	ixgbe_maybe_stop_tx(tx_ring, DESC_NEEDED);
++	netdev_tx_sent_queue(txring_txq(tx_ring), first->bytecount);
++	first->time_stamp = jiffies;
++	skb_tx_timestamp(skb);
  
 -	if (netif_xmit_stopped(txring_txq(tx_ring)) || !netdev_xmit_more()) {
-+	if (netif_xmit_stopped(txring_txq(tx_ring)) || !netdev_xmit_more())
- 		writel(i, tx_ring->tail);
+-		writel(i, tx_ring->tail);
 -	}
++	ixgbe_maybe_stop_tx(tx_ring, DESC_NEEDED);
++	if (netif_xmit_stopped(txring_txq(tx_ring)) || !netdev_xmit_more())
++		writel(tx_ring->next_to_use, tx_ring->tail);
  
  	return 0;
 -dma_error:
-+
-+	dma_error:
- 	dev_err(tx_ring->dev, "TX DMA map failed\n");
+-	dev_err(tx_ring->dev, "TX DMA map failed\n");
  
 -	/* clear dma mappings for failed tx_buffer_info map */
- 	for (;;) {
- 		tx_buffer = &tx_ring->tx_buffer_info[i];
- 		if (dma_unmap_len(tx_buffer, len))
- 			dma_unmap_page(tx_ring->dev,
+-	for (;;) {
+-		tx_buffer = &tx_ring->tx_buffer_info[i];
+-		if (dma_unmap_len(tx_buffer, len))
+-			dma_unmap_page(tx_ring->dev,
 -				       dma_unmap_addr(tx_buffer, dma),
 -				       dma_unmap_len(tx_buffer, len),
 -				       DMA_TO_DEVICE);
 -		dma_unmap_len_set(tx_buffer, len, 0);
-+						   dma_unmap_addr(tx_buffer, dma),
-+						   dma_unmap_len(tx_buffer, len),
-+						   DMA_TO_DEVICE);
-+			dma_unmap_len_set(tx_buffer, len, 0);
- 		if (tx_buffer == first)
- 			break;
+-		if (tx_buffer == first)
+-			break;
 -		if (i == 0)
 -			i += tx_ring->count;
-+		if (!i)
-+			i = tx_ring->count;
- 		i--;
- 	}
+-		i--;
+-	}
+-
+-	dev_kfree_skb_any(first->skb);
+-	first->skb = NULL;
++	/* ---------------- error unwind ------------------------------- */
++	dma_err:
++	{
++		u16 idx = tx_ring->next_to_use;
++		bool head = true;
++
++		while (1) {
++			struct ixgbe_tx_buffer *undo =
++			&tx_ring->tx_buffer_info[idx];
++
++			if (dma_unmap_len(undo, len)) {
++				if (head)
++					IXGBE_UNMAP_SINGLE(tx_ring->dev,
++									   dma_unmap_addr(undo, dma),
++									   dma_unmap_len(undo, len));
++					else
++						IXGBE_UNMAP_PAGE(tx_ring->dev,
++										 dma_unmap_addr(undo, dma),
++										 dma_unmap_len(undo, len));
++						dma_unmap_len_set(undo, len, 0);
++			}
  
-@@ -8825,88 +8755,92 @@ dma_error:
+-	tx_ring->next_to_use = i;
++			if (idx == i)
++				break;
++			if (++idx == tx_ring->count)
++				idx = 0;
++			head = false;
++		}
+ 
+-	return -1;
++		dev_kfree_skb_any(first->skb);
++		first->skb = NULL;
++		first->next_to_watch = NULL;
++		return -1;
++	}
  }
  
  static void ixgbe_atr(struct ixgbe_ring *ring,
@@ -689,57 +1819,59 @@
  	struct tcphdr *th;
  	unsigned int hlen;
  	struct sk_buff *skb;
-+	const unsigned char *tail;		/* cache once             */
++	const unsigned char *tail;		/* Opt #5: cache once */
  	__be16 vlan_id;
  	int l4_proto;
  
 -	/* if ring doesn't have a interrupt vector, cannot perform ATR */
 -	if (!q_vector)
-+	/* if ring doesn't have an interrupt vector, cannot perform ATR */
++	/* Opt #5: likely() hints for dominant exits */
 +	if (unlikely(!q_vector))
  		return;
  
- 	/* do nothing if sampling is disabled */
+-	/* do nothing if sampling is disabled */
 -	if (!ring->atr_sample_rate)
 +	if (unlikely(!ring->atr_sample_rate))
  		return;
  
  	ring->atr_count++;
  
- 	/* currently only IPv4/IPv6 with TCP is supported */
+-	/* currently only IPv4/IPv6 with TCP is supported */
 -	if ((first->protocol != htons(ETH_P_IP)) &&
 -	    (first->protocol != htons(ETH_P_IPV6)))
++	/* Opt #5: likely() hints for dominant exits */
 +	if (unlikely((first->protocol != htons(ETH_P_IP)) &&
 +		(first->protocol != htons(ETH_P_IPV6))))
  		return;
  
- 	/* snag network header to get L4 type and address */
+-	/* snag network header to get L4 type and address */
  	skb = first->skb;
  	hdr.network = skb_network_header(skb);
-+	tail = skb_tail_pointer(skb);		/* single evaluation      */
++	/* Opt #5: One-shot skb_tail_pointer cache */
++	tail = skb_tail_pointer(skb);
 +
  	if (unlikely(hdr.network <= skb->data))
  		return;
 +
-+	/* pre-touch header to hide the LLC miss later on */
++	/* Opt #5: Early header prefetch */
 +	prefetch(hdr.network);
 +
  	if (skb->encapsulation &&
 -	    first->protocol == htons(ETH_P_IP) &&
 -	    hdr.ipv4->protocol == IPPROTO_UDP) {
+-		struct ixgbe_adapter *adapter = q_vector->adapter;
 +		first->protocol == htons(ETH_P_IP) &&
-+		hdr.ipv4->protocol == IPPROTO_UDP) {
- 		struct ixgbe_adapter *adapter = q_vector->adapter;
++		hdr.ipv4->protocol == IPPROTO_UDP) { /* Check for valid header access */
++			struct ixgbe_adapter *adapter = q_vector->adapter;
  
 -		if (unlikely(skb_tail_pointer(skb) < hdr.network +
 -			     vxlan_headroom(0)))
 -			return;
-+	if (unlikely(tail < hdr.network + vxlan_headroom(0))) {
-+		return;
-+	}
++			// Use cached 'tail'
++			if (unlikely(tail < hdr.network + vxlan_headroom(0)))
++				return;
  
 -		/* verify the port is recognized as VXLAN */
-+		/* verify the port is recognized as VXLAN / Geneve */
  		if (adapter->vxlan_port &&
 -		    udp_hdr(skb)->dest == adapter->vxlan_port)
 +			udp_hdr(skb)->dest == adapter->vxlan_port)
@@ -757,13 +1889,12 @@
 -	 */
 -	if (unlikely(skb_tail_pointer(skb) < hdr.network + 40))
 -		return;
-+		/* need at least [min IPv4 hdr + TCP] or [IPv6 hdr] bytes */
++		// Use cached 'tail'
 +		if (unlikely(tail < hdr.network + 40))
 +			return;
  
 -	/* Currently only IPv4/IPv6 with TCP is supported */
-+	/* parse IP header ------------------------------------------------- */
- 	switch (hdr.ipv4->version) {
+-	switch (hdr.ipv4->version) {
 -	case IPVERSION:
 -		/* access ihl as u8 to avoid unaligned access on ia64 */
 -		hlen = (hdr.network[0] & 0x0F) << 2;
@@ -776,8 +1907,9 @@
 -		break;
 -	default:
 -		return;
++	switch (hdr.ipv4->version) { /* Check for valid header access */
 +		case IPVERSION:
-+			hlen     = (hdr.network[0] & 0x0F) << 2;  /* ipv4 ihl */
++			hlen     = (hdr.network[0] & 0x0F) << 2;
 +			l4_proto = hdr.ipv4->protocol;
 +			break;
 +		case 6:
@@ -794,24 +1926,23 @@
  
 -	if (unlikely(skb_tail_pointer(skb) < hdr.network +
 -		     hlen + sizeof(struct tcphdr)))
-+	/* ensure TCP header is within linear data */
++	// Use cached 'tail'
 +	if (unlikely(tail < hdr.network + hlen + sizeof(struct tcphdr)))
  		return;
  
  	th = (struct tcphdr *)(hdr.network + hlen);
-@@ -8915,28 +8849,19 @@ static void ixgbe_atr(struct ixgbe_ring
+ 
+-	/* skip this packet since the socket is closing */
  	if (th->fin)
  		return;
  
 -	/* sample on all syn packets or once every atr sample count */
-+	/* sample on all SYN packets or once every atr_sample_rate */
  	if (!th->syn && (ring->atr_count < ring->atr_sample_rate))
  		return;
  
- 	/* reset sample count */
+-	/* reset sample count */
  	ring->atr_count = 0;
  
-+	/* -------- build ATR keys --------------------------------------- */
  	vlan_id = htons(first->tx_flags >> IXGBE_TX_FLAGS_VLAN_SHIFT);
  
 -	/*
@@ -827,14 +1958,13 @@
 -	 * since src port and flex bytes occupy the same word XOR them together
 -	 * and write the value to source port portion of compressed dword
 -	 */
-+	/* src and dst are inverted (receiver’s view) */
  	if (first->tx_flags & (IXGBE_TX_FLAGS_SW_VLAN | IXGBE_TX_FLAGS_HW_VLAN))
  		common.port.src ^= th->dest ^ htons(ETH_P_8021Q);
  	else
-@@ -8944,31 +8869,29 @@ static void ixgbe_atr(struct ixgbe_ring
+ 		common.port.src ^= th->dest ^ first->protocol;
  	common.port.dst ^= th->source;
  
- 	switch (hdr.ipv4->version) {
+-	switch (hdr.ipv4->version) {
 -	case IPVERSION:
 -		input.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_TCPV4;
 -		common.ip ^= hdr.ipv4->saddr ^ hdr.ipv4->daddr;
@@ -852,6 +1982,7 @@
 -		break;
 -	default:
 -		break;
++	switch (hdr.ipv4->version) { // Check for valid header access
 +		case IPVERSION:
 +			input.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_TCPV4;
 +			common.ip ^= hdr.ipv4->saddr ^ hdr.ipv4->daddr;
@@ -873,14 +2004,13 @@
  		input.formatted.flow_type |= IXGBE_ATR_L4TYPE_TUNNEL_MASK;
  
 -	/* This assumes the Rx queue and Tx queue are bound to the same CPU */
-+	/* Rx & Tx queues are assumed to be on the same CPU */
  	ixgbe_fdir_add_signature_filter_82599(&q_vector->adapter->hw,
 -					      input, common, ring->queue_index);
 +										  input, common, ring->queue_index);
  }
  
  #ifdef IXGBE_FCOE
-@@ -9019,10 +8942,11 @@ static u16 ixgbe_select_queue(struct net
+@@ -9019,41 +9036,47 @@ static u16 ixgbe_select_queue(struct net
  
  #endif
  int ixgbe_xmit_xdp_ring(struct ixgbe_ring *ring,
@@ -894,18 +2024,16 @@
  	u16 i = 0, index = ring->next_to_use;
  	struct ixgbe_tx_buffer *tx_head = &ring->tx_buffer_info[index];
  	struct ixgbe_tx_buffer *tx_buff = tx_head;
-@@ -9030,30 +8954,37 @@ int ixgbe_xmit_xdp_ring(struct ixgbe_rin
+ 	union ixgbe_adv_tx_desc *tx_desc = IXGBE_TX_DESC(ring, index);
  	u32 cmd_type, len = xdpf->len;
  	void *data = xdpf->data;
++	u16 ntu_lookahead;
++
++	/* Opt #3: Look-ahead prefetch for XDP Tx */
++	ntu_lookahead = (index + IXGBE_TX_PREFETCH_OFFSET) & (ring->count - 1);
++	prefetchw(&ring->tx_buffer_info[ntu_lookahead]);
++	prefetch(IXGBE_TX_DESC(ring, ntu_lookahead));
  
-+	/* prefetch next buffer/desc to overlap DRAM miss */
-+	{
-+		u16 nxt = (index + 4) & (ring->count - 1);
-+
-+		prefetchw(&ring->tx_buffer_info[nxt]);
-+		prefetch(IXGBE_TX_DESC(ring, nxt));
-+	}
-+
  	if (unlikely(ixgbe_desc_unused(ring) < 1 + nr_frags))
  		return IXGBE_XDP_CONSUMED;
  
@@ -941,7 +2069,7 @@
  		tx_buff->protocol = 0;
  
  		if (++index == ring->count)
-@@ -9067,28 +8998,30 @@ int ixgbe_xmit_xdp_ring(struct ixgbe_rin
+@@ -9067,28 +9090,28 @@ int ixgbe_xmit_xdp_ring(struct ixgbe_rin
  		tx_desc->read.olinfo_status = 0;
  
  		data = skb_frag_address(&sinfo->frags[i]);
@@ -951,11 +2079,9 @@
  	}
 -	/* put descriptor type bits */
 +
-+	/* set RS/EOP bits on last descriptor */
  	tx_desc->read.cmd_type_len |= cpu_to_le32(IXGBE_TXD_CMD);
  
 -	/* Avoid any potential race with xdp_xmit and cleanup */
-+	/* avoid race with cleanup */
  	smp_wmb();
  
  	tx_head->next_to_watch = tx_desc;
@@ -980,6 +2106,9 @@
 +			dma_unmap_len_set(tx_buff, len, 0);
  		if (tx_buff == tx_head)
  			break;
+ 
+
+
 
 
 --- a/kernel/irq/msi.c	2025-04-26 18:47:23.471839427 +0200
@@ -3517,6 +4646,803 @@
 +MODULE_LICENSE("GPL");
 +MODULE_AUTHOR("Intel Corporation");
 +MODULE_DESCRIPTION("Raptor Lake IRQ Affinity Optimizations");
+
+--- a/arch/x86/kernel/apic/io_apic.c	2025-05-19 23:37:21.464343676 +0200
++++ b/arch/x86/kernel/apic/io_apic.c	2025-05-20 00:30:12.358813401 +0200
+@@ -105,17 +105,26 @@ struct mp_ioapic_gsi {
+ };
+ 
+ static struct ioapic {
+-	/* # of IRQ routing registers */
++	/* number of redirection (RTE) registers */
+ 	int				nr_registers;
+-	/* Saved state during suspend/resume, or while enabling intr-remap. */
++	/* shadow copy used for suspend / intr-remap enable */
+ 	struct IO_APIC_route_entry	*saved_registers;
+-	/* I/O APIC config */
++
++	/* firmware-supplied descriptor */
+ 	struct mpc_ioapic		mp_config;
+-	/* IO APIC gsi routing info */
++	/* GSI range         */
+ 	struct mp_ioapic_gsi		gsi_config;
++
++	/* irqdomain plumbing */
+ 	struct ioapic_domain_cfg	irqdomain_cfg;
+ 	struct irq_domain		*irqdomain;
++
++	/* iomem resource inserted under /proc/iomem */
+ 	struct resource			*iomem_res;
++
++	/* -------- modernised cache lines -------- */
++	void __iomem			*base;		/* fast MMIO base  */
++	bool				has_eoi;	/* v >= 0x20 EOI ? */
+ } ioapics[MAX_IO_APICS];
+ 
+ #define mpc_ioapic_ver(ioapic_idx)	ioapics[ioapic_idx].mp_config.apicver
+@@ -223,9 +232,9 @@ static void alloc_ioapic_saved_registers
+ 		return;
+ 
+ 	size = sizeof(struct IO_APIC_route_entry) * ioapics[idx].nr_registers;
+-	ioapics[idx].saved_registers = kzalloc(size, GFP_KERNEL);
++	ioapics[idx].saved_registers = kvzalloc(size, GFP_KERNEL);
+ 	if (!ioapics[idx].saved_registers)
+-		pr_err("IOAPIC %d: suspend/resume impossible!\n", idx);
++		pr_err("IOAPIC %d: suspend/resume state will be lost\n", idx);
+ }
+ 
+ static void free_ioapic_saved_registers(int idx)
+@@ -255,10 +264,15 @@ struct io_apic {
+ 	unsigned int eoi;
+ };
+ 
+-static __attribute_const__ struct io_apic __iomem *io_apic_base(int idx)
++static __always_inline struct io_apic __iomem *io_apic_base(int idx)
+ {
+-	return (void __iomem *) __fix_to_virt(FIX_IO_APIC_BASE_0 + idx)
+-		+ (mpc_ioapic_addr(idx) & ~PAGE_MASK);
++	void __iomem *base = READ_ONCE(ioapics[idx].base);
++
++	if (unlikely(!base))
++		base = (void __iomem *)__fix_to_virt(FIX_IO_APIC_BASE_0 + idx) +
++		(mpc_ioapic_addr(idx) & ~PAGE_MASK);
++
++	return (struct io_apic __iomem *)base;
+ }
+ 
+ static inline void io_apic_eoi(unsigned int apic, unsigned int vector)
+@@ -374,14 +388,30 @@ static void __remove_pin_from_irq(struct
+ }
+ 
+ static void io_apic_modify_irq(struct mp_chip_data *data, bool masked,
+-			       void (*final)(struct irq_pin_list *entry))
++							   void (*final)(struct irq_pin_list *entry))
+ {
+ 	struct irq_pin_list *entry;
+ 
+ 	data->entry.masked = masked;
+ 
++	if (list_empty(&data->irq_2_pin))
++		return;
++
++	/* fast-path: exactly one pin mapped to this IRQ */
++	if (list_is_singular(&data->irq_2_pin)) {
++		entry = list_first_entry(&data->irq_2_pin,
++								 struct irq_pin_list, list);
++		io_apic_write(entry->apic, 0x10 + 2 * entry->pin,
++					  data->entry.w1);
++		if (final)
++			final(entry);
++		return;
++	}
++
++	/* generic slow-path */
+ 	for_each_irq_pin(entry, data->irq_2_pin) {
+-		io_apic_write(entry->apic, 0x10 + 2 * entry->pin, data->entry.w1);
++		io_apic_write(entry->apic, 0x10 + 2 * entry->pin,
++					  data->entry.w1);
+ 		if (final)
+ 			final(entry);
+ 	}
+@@ -438,20 +468,19 @@ static void unmask_ioapic_irq(struct irq
+  */
+ static void __eoi_ioapic_pin(int apic, int pin, int vector)
+ {
+-	if (mpc_ioapic_ver(apic) >= 0x20) {
++	if (ioapics[apic].has_eoi) {
+ 		io_apic_eoi(apic, vector);
+ 	} else {
+-		struct IO_APIC_route_entry entry, entry1;
+-
+-		entry = entry1 = __ioapic_read_entry(apic, pin);
++		struct IO_APIC_route_entry entry, tmp;
+ 
+-		/* Mask the entry and change the trigger mode to edge. */
+-		entry1.masked = true;
+-		entry1.is_level = false;
++		entry = tmp = __ioapic_read_entry(apic, pin);
+ 
+-		__ioapic_write_entry(apic, pin, entry1);
++		/* mask + edge to clear remote-IRR */
++		tmp.masked   = true;
++		tmp.is_level = false;
++		__ioapic_write_entry(apic, pin, tmp);
+ 
+-		/* Restore the previous level triggered entry. */
++		/* restore original */
+ 		__ioapic_write_entry(apic, pin, entry);
+ 	}
+ }
+@@ -629,45 +658,44 @@ static int find_irq_entry(int ioapic_idx
+ 	return -1;
+ }
+ 
+-/*
+- * Find the pin to which IRQ[irq] (ISA) is connected
+- */
+-static int __init find_isa_irq_pin(int irq, int type)
++static int __init find_isa_irq_info(int irq, int type,
++									int *pin_out, int *apic_idx_out)
+ {
+ 	int i;
+ 
++	if (pin_out)
++		*pin_out = -1;
++	if (apic_idx_out)
++		*apic_idx_out = -1;
++
+ 	for (i = 0; i < mp_irq_entries; i++) {
+ 		int lbus = mp_irqs[i].srcbus;
+ 
+-		if (test_bit(lbus, mp_bus_not_pci) && (mp_irqs[i].irqtype == type) &&
+-		    (mp_irqs[i].srcbusirq == irq))
+-			return mp_irqs[i].dstirq;
+-	}
+-	return -1;
+-}
++		if (!test_bit(lbus, mp_bus_not_pci) ||
++			mp_irqs[i].irqtype != type   ||
++			mp_irqs[i].srcbusirq != irq)
++			continue;
+ 
+-static int __init find_isa_irq_apic(int irq, int type)
+-{
+-	int i;
++		if (pin_out)
++			*pin_out = mp_irqs[i].dstirq;
+ 
+-	for (i = 0; i < mp_irq_entries; i++) {
+-		int lbus = mp_irqs[i].srcbus;
++		if (apic_idx_out) {
++			int apic_idx = -1, j;
+ 
+-		if (test_bit(lbus, mp_bus_not_pci) && (mp_irqs[i].irqtype == type) &&
+-		    (mp_irqs[i].srcbusirq == irq))
+-			break;
+-	}
++			for_each_ioapic(j)
++				if (mpc_ioapic_id(j) == mp_irqs[i].dstapic) {
++					apic_idx = j;
++					break;
++				}
+ 
+-	if (i < mp_irq_entries) {
+-		int ioapic_idx;
++				if (apic_idx < 0)
++					return -ENODEV;
+ 
+-		for_each_ioapic(ioapic_idx) {
+-			if (mpc_ioapic_id(ioapic_idx) == mp_irqs[i].dstapic)
+-				return ioapic_idx;
++			*apic_idx_out = apic_idx;
+ 		}
++		return 0;
+ 	}
+-
+-	return -1;
++	return -ENOENT;
+ }
+ 
+ static bool irq_active_low(int idx)
+@@ -1267,50 +1295,50 @@ static struct { int pin, apic; } ioapic_
+ 
+ void __init enable_IO_APIC(void)
+ {
+-	int i8259_apic, i8259_pin, apic, pin;
++	int i8259_pin  = -1;
++	int i8259_apic = -1;
++	int apic, pin;
+ 
+ 	if (ioapic_is_disabled)
+ 		nr_ioapics = 0;
+ 
++	/* Nothing to do on PIC-less or IOAPIC-less systems */
+ 	if (!nr_legacy_irqs() || !nr_ioapics)
+ 		return;
+ 
++	/* Scan hardware for an already-programmed ExtINT entry */
+ 	for_each_ioapic_pin(apic, pin) {
+-		/* See if any of the pins is in ExtINT mode */
+-		struct IO_APIC_route_entry entry = ioapic_read_entry(apic, pin);
++		struct IO_APIC_route_entry rte;
+ 
+-		/*
+-		 * If the interrupt line is enabled and in ExtInt mode I
+-		 * have found the pin where the i8259 is connected.
+-		 */
+-		if (!entry.masked && entry.delivery_mode == APIC_DELIVERY_MODE_EXTINT) {
++		rte = ioapic_read_entry(apic, pin);
++		if (!rte.masked &&
++			rte.delivery_mode == APIC_DELIVERY_MODE_EXTINT) {
+ 			ioapic_i8259.apic = apic;
+-			ioapic_i8259.pin  = pin;
+-			break;
+-		}
++		ioapic_i8259.pin  = pin;
++		break;
++			}
+ 	}
+ 
+-	/*
+-	 * Look to see what if the MP table has reported the ExtINT
+-	 *
+-	 * If we could not find the appropriate pin by looking at the ioapic
+-	 * the i8259 probably is not connected the ioapic but give the
+-	 * mptable a chance anyway.
+-	 */
+-	i8259_pin  = find_isa_irq_pin(0, mp_ExtINT);
+-	i8259_apic = find_isa_irq_apic(0, mp_ExtINT);
+-	/* Trust the MP table if nothing is setup in the hardware */
+-	if ((ioapic_i8259.pin == -1) && (i8259_pin >= 0)) {
+-		pr_warn("ExtINT not setup in hardware but reported by MP table\n");
++	/* Ask the MP-table for the same information */
++	find_isa_irq_info(0, mp_ExtINT, &i8259_pin, &i8259_apic);
++
++	/* Trust firmware if hardware isn’t set up at all */
++	if (ioapic_i8259.pin == -1 && i8259_pin >= 0) {
++		pr_warn("ExtINT not set in hardware, using MP-table values\n");
+ 		ioapic_i8259.pin  = i8259_pin;
+ 		ioapic_i8259.apic = i8259_apic;
+ 	}
+-	/* Complain if the MP table and the hardware disagree */
+-	if (((ioapic_i8259.apic != i8259_apic) || (ioapic_i8259.pin != i8259_pin)) &&
+-	    (i8259_pin >= 0) && (ioapic_i8259.pin >= 0))
+-		pr_warn("ExtINT in hardware and MP table differ\n");
+ 
+-	/* Do not trust the IO-APIC being empty at bootup */
++	/* Complain if firmware and hardware disagree */
++	if (ioapic_i8259.pin  >= 0 && i8259_pin  >= 0 &&
++		(ioapic_i8259.pin  != i8259_pin ||
++		ioapic_i8259.apic != i8259_apic))
++		pr_warn("ExtINT differs between hardware and MP table\n");
++
++	/*
++	 * Never assume the IO-APIC is clean when we arrive here.
++	 * Wipe every RTE so we start from a defined state.
++	 */
+ 	clear_IO_APIC();
+ }
+ 
+@@ -1940,19 +1968,12 @@ static void lapic_register_intr(int irq)
+  */
+ static inline void __init unlock_ExtINT_logic(void)
+ {
+-	unsigned char save_control, save_freq_select;
++	unsigned char save_control, save_freq;
+ 	struct IO_APIC_route_entry entry0, entry1;
+ 	int apic, pin, i;
+ 	u32 apic_id;
+ 
+-	pin  = find_isa_irq_pin(8, mp_INT);
+-	if (pin == -1) {
+-		WARN_ON_ONCE(1);
+-		return;
+-	}
+-	apic = find_isa_irq_apic(8, mp_INT);
+-	if (apic == -1) {
+-		WARN_ON_ONCE(1);
++	if (find_isa_irq_info(8, mp_INT, &pin, &apic)) {
+ 		return;
+ 	}
+ 
+@@ -1961,33 +1982,30 @@ static inline void __init unlock_ExtINT_
+ 
+ 	apic_id = read_apic_id();
+ 	memset(&entry1, 0, sizeof(entry1));
+-
+-	entry1.dest_mode_logical	= true;
+-	entry1.masked			= false;
+-	entry1.destid_0_7		= apic_id & 0xFF;
+-	entry1.virt_destid_8_14		= apic_id >> 8;
+-	entry1.delivery_mode		= APIC_DELIVERY_MODE_EXTINT;
+-	entry1.active_low		= entry0.active_low;
+-	entry1.is_level			= false;
+-	entry1.vector = 0;
++	entry1.dest_mode_logical = true;
++	entry1.masked            = false;
++	entry1.destid_0_7        = apic_id & 0xff;
++	entry1.virt_destid_8_14  = apic_id >> 8;
++	entry1.delivery_mode     = APIC_DELIVERY_MODE_EXTINT;
++	entry1.active_low        = entry0.active_low;
++	entry1.is_level          = false;
++	entry1.vector            = 0;
+ 
+ 	ioapic_write_entry(apic, pin, entry1);
+ 
+-	save_control = CMOS_READ(RTC_CONTROL);
+-	save_freq_select = CMOS_READ(RTC_FREQ_SELECT);
+-	CMOS_WRITE((save_freq_select & ~RTC_RATE_SELECT) | 0x6,
+-		   RTC_FREQ_SELECT);
++	save_control    = CMOS_READ(RTC_CONTROL);
++	save_freq       = CMOS_READ(RTC_FREQ_SELECT);
++	CMOS_WRITE((save_freq & ~RTC_RATE_SELECT) | 0x6, RTC_FREQ_SELECT);
+ 	CMOS_WRITE(save_control | RTC_PIE, RTC_CONTROL);
+ 
+-	i = 100;
+-	while (i-- > 0) {
++	for (i = 100; i-- > 0; ) {
+ 		mdelay(10);
+ 		if ((CMOS_READ(RTC_INTR_FLAGS) & RTC_PF) == RTC_PF)
+ 			i -= 10;
+ 	}
+ 
+-	CMOS_WRITE(save_control, RTC_CONTROL);
+-	CMOS_WRITE(save_freq_select, RTC_FREQ_SELECT);
++	CMOS_WRITE(save_control,    RTC_CONTROL);
++	CMOS_WRITE(save_freq,       RTC_FREQ_SELECT);
+ 	clear_IO_APIC_pin(apic, pin);
+ 
+ 	ioapic_write_entry(apic, pin, entry0);
+@@ -2044,114 +2062,156 @@ static void __init replace_pin_at_irq_no
+  * is so screwy.  Thanks to Brian Perkins for testing/hacking this beast
+  * fanatically on his truly buggy board.
+  */
+-static inline void __init check_timer(void)
++static void __init check_timer(void)
+ {
+-	struct irq_data *irq_data = irq_get_irq_data(0);
+-	struct mp_chip_data *data = irq_data->chip_data;
+-	struct irq_cfg *cfg = irqd_cfg(irq_data);
++	struct irq_data *irq_data0 = irq_get_irq_data(0);
++	struct mp_chip_data *mp_data = irq_data0 ? irq_data0->chip_data : NULL;
++	struct irq_cfg *cfg0 = irq_data0 ? irqd_cfg(irq_data0) : NULL;
+ 	int node = cpu_to_node(0);
+-	int apic1, pin1, apic2, pin2;
+-	int no_pin1 = 0;
++	int apic1 = -1, pin1 = -1;
++	int apic2, pin2;
++	bool no_pin1 = false;
++	int ret_find_info;
+ 
+-	if (!global_clock_event)
++	if (!global_clock_event || !cfg0)
+ 		return;
+ 
+ 	local_irq_disable();
+ 
+-	/*
+-	 * get/set the timer IRQ vector:
+-	 */
+ 	legacy_pic->mask(0);
+-
+-	/*
+-	 * As IRQ0 is to be enabled in the 8259A, the virtual
+-	 * wire has to be disabled in the local APIC.  Also
+-	 * timer interrupts need to be acknowledged manually in
+-	 * the 8259A for the i82489DX when using the NMI
+-	 * watchdog as that APIC treats NMIs as level-triggered.
+-	 * The AEOI mode will finish them in the 8259A
+-	 * automatically.
+-	 */
+ 	apic_write(APIC_LVT0, APIC_LVT_MASKED | APIC_DM_EXTINT);
+ 	legacy_pic->init(1);
+ 
+-	pin1  = find_isa_irq_pin(0, mp_INT);
+-	apic1 = find_isa_irq_apic(0, mp_INT);
++	ret_find_info = find_isa_irq_info(0, mp_INT, &pin1, &apic1);
++
+ 	pin2  = ioapic_i8259.pin;
+ 	apic2 = ioapic_i8259.apic;
+ 
+ 	pr_info("..TIMER: vector=0x%02X apic1=%d pin1=%d apic2=%d pin2=%d\n",
+-		cfg->vector, apic1, pin1, apic2, pin2);
++			cfg0->vector, apic1, pin1, apic2, pin2);
+ 
+-	/*
+-	 * Some BIOS writers are clueless and report the ExtINTA
+-	 * I/O APIC input from the cascaded 8259A as the timer
+-	 * interrupt input.  So just in case, if only one pin
+-	 * was found above, try it both directly and through the
+-	 * 8259A.
+-	 */
+ 	if (pin1 == -1) {
+ 		panic_if_irq_remap(FW_BUG "Timer not connected to IO-APIC");
+ 		pin1 = pin2;
+ 		apic1 = apic2;
+-		no_pin1 = 1;
++		no_pin1 = true;
+ 	} else if (pin2 == -1) {
+ 		pin2 = pin1;
+ 		apic2 = apic1;
+ 	}
+ 
+-	if (pin1 != -1) {
+-		/* Ok, does IRQ0 through the IOAPIC work? */
++	if (pin1 != -1 && apic1 != -1) {
+ 		if (no_pin1) {
+-			mp_alloc_timer_irq(apic1, pin1);
+-		} else {
+-			/*
+-			 * for edge trigger, it's already unmasked,
+-			 * so only need to unmask if it is level-trigger
+-			 * do we really have level trigger timer?
++			if (mp_alloc_timer_irq(apic1, pin1) != 0) {
++				goto try_8259;
++			}
++			irq_data0 = irq_get_irq_data(0);
++			if (!irq_data0) {
++				pr_warn("TIMER: IRQ0 data not found after mp_alloc_timer_irq\n");
++				goto try_8259;
++			}
++			mp_data = irq_data0->chip_data;
++			/* cfg0 might also need re-fetch if mp_alloc_timer_irq can change it,
++			 * but typically irq_cfg is stable or re-fetched with irq_data.
++			 * Assuming cfg0 remains valid or irq_get_irq_data refreshes enough.
+ 			 */
++		} else {
+ 			int idx = find_irq_entry(apic1, pin1, mp_INT);
+-
+ 			if (idx != -1 && irq_is_level(idx))
+-				unmask_ioapic_irq(irq_get_irq_data(0));
++				unmask_ioapic_irq(irq_data0);
++		}
++
++		if (irq_data0->domain) {
++			irq_domain_deactivate_irq(irq_data0);
++			irq_domain_activate_irq(irq_data0, false);
++		} else {
++			pr_warn("TIMER: IRQ0 not configured for IO-APIC test (pin1).\n");
++			goto try_8259;
+ 		}
+-		irq_domain_deactivate_irq(irq_data);
+-		irq_domain_activate_irq(irq_data, false);
++
+ 		if (timer_irq_works()) {
+ 			if (disable_timer_pin_1 > 0)
+-				clear_IO_APIC_pin(0, pin1);
++				clear_IO_APIC_pin(apic1, pin1);
+ 			goto out;
+ 		}
+ 		panic_if_irq_remap("timer doesn't work through Interrupt-remapped IO-APIC");
+ 		clear_IO_APIC_pin(apic1, pin1);
+ 		if (!no_pin1)
+ 			pr_err("..MP-BIOS bug: 8254 timer not connected to IO-APIC\n");
++	}
++
++	try_8259:
++	pr_info("...trying to set up timer (IRQ0) through the 8259A ...\n");
++	pr_info("..... (found apic %d pin %d) ...\n", apic2, pin2);
++
++	if (pin2 != -1 && apic2 != -1) {
++		if (!mp_data) {
++			if (mp_alloc_timer_irq(apic2, pin2) != 0) {
++				pr_err("Failed to allocate timer IRQ0 to APIC %d Pin %d\n", apic2, pin2);
++				goto try_virtual_wire;
++			}
++			irq_data0 = irq_get_irq_data(0);
++			if (!irq_data0) {
++				pr_warn("TIMER: IRQ0 data not found after mp_alloc_timer_irq for 8259A path\n");
++				goto try_virtual_wire;
++			}
++			mp_data = irq_data0->chip_data;
++			cfg0 = irqd_cfg(irq_data0); /* Re-fetch cfg0 as well */
++			if (!mp_data || !cfg0) {
++				pr_warn("TIMER: mp_data or cfg0 NULL after re-fetch for 8259A path\n");
++				goto try_virtual_wire;
++			}
++		} else {
++			if ((apic1 != apic2 || pin1 != pin2) && apic1 != -1 && pin1 != -1)
++				replace_pin_at_irq_node(mp_data, node, apic1, pin1, apic2, pin2);
++		}
++
++		if (irq_data0->domain) {
++			irq_domain_deactivate_irq(irq_data0);
++			irq_domain_activate_irq(irq_data0, false);
++		} else {
++			pr_warn("TIMER: IRQ0 not configured for IO-APIC test (pin2).\n");
++			goto try_virtual_wire;
++		}
+ 
+-		pr_info("...trying to set up timer (IRQ0) through the 8259A ...\n");
+-		pr_info("..... (found apic %d pin %d) ...\n", apic2, pin2);
+-		/*
+-		 * legacy devices should be connected to IO APIC #0
+-		 */
+-		replace_pin_at_irq_node(data, node, apic1, pin1, apic2, pin2);
+-		irq_domain_deactivate_irq(irq_data);
+-		irq_domain_activate_irq(irq_data, false);
+ 		legacy_pic->unmask(0);
+ 		if (timer_irq_works()) {
+ 			pr_info("....... works.\n");
+ 			goto out;
+ 		}
+-		/*
+-		 * Cleanup, just in case ...
+-		 */
+ 		legacy_pic->mask(0);
+ 		clear_IO_APIC_pin(apic2, pin2);
+ 		pr_info("....... failed.\n");
+ 	}
+ 
++	try_virtual_wire:
+ 	pr_info("...trying to set up timer as Virtual Wire IRQ...\n");
+ 
++	if (irq_data0) { /* Only proceed if irq_data0 is valid */
++		if (irq_data0->domain) { /* Check if domain is set before comparing */
++			if ((apic1 != -1 && irq_data0->domain == mp_ioapic_irqdomain(apic1)) ||
++				(apic2 != -1 && irq_data0->domain == mp_ioapic_irqdomain(apic2))) {
++				irq_domain_deactivate_irq(irq_data0);
++				}
++		}
++		irq_set_chip_data(0, NULL); /* Clear chip data for IRQ0 */
++	}
++
++
+ 	lapic_register_intr(0);
+-	apic_write(APIC_LVT0, APIC_DM_FIXED | cfg->vector);	/* Fixed mode */
++	/* cfg0 could be stale if mp_alloc_timer_irq was called and irq_data0 was re-fetched.
++	 * It's safer to re-get cfg0 if irq_data0 has been potentially re-assigned.
++	 * For simplicity, assuming cfg0 for vector is stable, or re-fetch if needed.
++	 * The critical part is that cfg0 points to the config for IRQ0.
++	 */
++	if (!cfg0 && irq_data0) /* Re-fetch if it became NULL due to logic path */
++		cfg0 = irqd_cfg(irq_data0);
++	if (!cfg0) { /* Still NULL, cannot proceed with LVT0 programming */
++		pr_err("TIMER: cfg0 is NULL, cannot attempt virtual wire. Critical error.\n");
++		panic("Timer IRQ0 configuration broken.");
++	}
++
++	apic_write(APIC_LVT0, APIC_DM_FIXED | cfg0->vector);
+ 	legacy_pic->unmask(0);
+ 
+ 	if (timer_irq_works()) {
+@@ -2159,7 +2219,7 @@ static inline void __init check_timer(vo
+ 		goto out;
+ 	}
+ 	legacy_pic->mask(0);
+-	apic_write(APIC_LVT0, APIC_LVT_MASKED | APIC_DM_FIXED | cfg->vector);
++	apic_write(APIC_LVT0, APIC_LVT_MASKED | APIC_DM_FIXED | cfg0->vector);
+ 	pr_info("..... failed.\n");
+ 
+ 	pr_info("...trying to set up timer as ExtINT IRQ...\n");
+@@ -2179,11 +2239,11 @@ static inline void __init check_timer(vo
+ 	pr_info("..... failed :\n");
+ 	if (apic_is_x2apic_enabled()) {
+ 		pr_info("Perhaps problem with the pre-enabled x2apic mode\n"
+-			"Try booting with x2apic and interrupt-remapping disabled in the bios.\n");
++		"Try booting with x2apic and interrupt-remapping disabled in the bios.\n");
+ 	}
+ 	panic("IO-APIC + timer doesn't work!  Boot with apic=debug and send a "
+-		"report.  Then try booting with the 'noapic' option.\n");
+-out:
++	"report.  Then try booting with the 'noapic' option.\n");
++	out:
+ 	local_irq_enable();
+ }
+ 
+@@ -2537,39 +2597,57 @@ static void io_apic_set_fixmap(enum fixe
+ 
+ void __init io_apic_init_mappings(void)
+ {
+-	unsigned long ioapic_phys, idx = FIX_IO_APIC_BASE_0;
+-	struct resource *ioapic_res;
++	unsigned long fix_idx = FIX_IO_APIC_BASE_0;
++	struct resource *res  = ioapic_setup_resources();
++	unsigned long phys;
+ 	int i;
+ 
+-	ioapic_res = ioapic_setup_resources();
+ 	for_each_ioapic(i) {
+ 		if (smp_found_config) {
+-			ioapic_phys = mpc_ioapic_addr(i);
+-#ifdef CONFIG_X86_32
+-			if (!ioapic_phys) {
+-				pr_err("WARNING: bogus zero IO-APIC address found in MPTABLE, "
+-				       "disabling IO/APIC support!\n");
++			phys = mpc_ioapic_addr(i);
++			#ifdef CONFIG_X86_32
++			if (!phys) {
++				pr_err("Zero IO-APIC address in MP-table, "
++				"disabling IO/APIC support!\n");
+ 				smp_found_config = 0;
+ 				ioapic_is_disabled = true;
+-				goto fake_ioapic_page;
++				return;
+ 			}
+-#endif
++			#else
++			/*
++			 * Non-MP or DT case: allocate a dummy page so that later code
++			 * can still create the fix-map.  The page is never accessed.
++			 */
++			#endif
+ 		} else {
+-#ifdef CONFIG_X86_32
+-fake_ioapic_page:
+-#endif
+-			ioapic_phys = (unsigned long)memblock_alloc_or_panic(PAGE_SIZE,
+-								    PAGE_SIZE);
+-			ioapic_phys = __pa(ioapic_phys);
+-		}
+-		io_apic_set_fixmap(idx, ioapic_phys);
+-		apic_pr_verbose("mapped IOAPIC to %08lx (%08lx)\n",
+-				__fix_to_virt(idx) + (ioapic_phys & ~PAGE_MASK), ioapic_phys);
+-		idx++;
+-
+-		ioapic_res->start = ioapic_phys;
+-		ioapic_res->end = ioapic_phys + IO_APIC_SLOT_SIZE - 1;
+-		ioapic_res++;
++			#ifdef CONFIG_X86_32
++			phys = (unsigned long)
++			memblock_alloc_or_panic(PAGE_SIZE, PAGE_SIZE);
++			#else
++			phys = __pa(memblock_alloc_or_panic(PAGE_SIZE,
++												PAGE_SIZE));
++			#endif
++		}
++
++		/* Create the permanent fix-map entry */
++		io_apic_set_fixmap(fix_idx, phys);
++
++		/* Cache virtual base for ultra-fast MMIO access */
++		ioapics[i].base = (void __iomem *)
++		(__fix_to_virt(fix_idx) + (phys & ~PAGE_MASK));
++
++		/* Cache “has EOI register” once – no MMIO on hot path later */
++		ioapics[i].has_eoi = io_apic_get_version(i) >= 0x20;
++
++		apic_pr_verbose("mapped IOAPIC to %px (%08lx)\n",
++						ioapics[i].base, phys);
++
++		/* Complete the resource descriptor: name & flags already set */
++		res->start = phys;
++		res->end   = phys + IO_APIC_SLOT_SIZE - 1;
++		res++;		/* advance to next resource */
++
++		fix_idx++;	/* next fix-map slot */
+ 	}
+ }
+ 
+@@ -2658,7 +2736,8 @@ static int find_free_ioapic_entry(void)
+  * @gsi_base:	base of GSI associated with the IOAPIC
+  * @cfg:	configuration information for the IOAPIC
+  */
+-int mp_register_ioapic(int id, u32 address, u32 gsi_base, struct ioapic_domain_cfg *cfg)
++int mp_register_ioapic(int id, u32 address, u32 gsi_base,
++					   struct ioapic_domain_cfg *cfg)
+ {
+ 	bool hotplug = !!ioapic_initialized;
+ 	struct mp_ioapic_gsi *gsi_cfg;
+@@ -2670,82 +2749,81 @@ int mp_register_ioapic(int id, u32 addre
+ 		return -EINVAL;
+ 	}
+ 
+-	for_each_ioapic(ioapic) {
++	for_each_ioapic(ioapic)
+ 		if (ioapics[ioapic].mp_config.apicaddr == address) {
+-			pr_warn("address 0x%x conflicts with IOAPIC%d\n", address, ioapic);
++			pr_warn("address 0x%x conflicts with IOAPIC%d\n",
++					address, ioapic);
+ 			return -EEXIST;
+ 		}
+-	}
+ 
+-	idx = find_free_ioapic_entry();
+-	if (idx >= MAX_IO_APICS) {
+-		pr_warn("Max # of I/O APICs (%d) exceeded (found %d), skipping\n",
+-			MAX_IO_APICS, idx);
++		idx = find_free_ioapic_entry();
++	if (unlikely(idx >= MAX_IO_APICS)) {
++		pr_warn("Max IOAPICs exceeded (found %d)\n", idx);
+ 		return -ENOSPC;
+ 	}
+ 
+-	ioapics[idx].mp_config.type = MP_IOAPIC;
+-	ioapics[idx].mp_config.flags = MPC_APIC_USABLE;
++	ioapics[idx].mp_config.type     = MP_IOAPIC;
++	ioapics[idx].mp_config.flags    = MPC_APIC_USABLE;
+ 	ioapics[idx].mp_config.apicaddr = address;
+ 
+ 	io_apic_set_fixmap(FIX_IO_APIC_BASE_0 + idx, address);
++	ioapics[idx].base = (void __iomem *)
++	(__fix_to_virt(FIX_IO_APIC_BASE_0 + idx) +
++	(address & ~PAGE_MASK));
++
+ 	if (bad_ioapic_register(idx)) {
+ 		clear_fixmap(FIX_IO_APIC_BASE_0 + idx);
++		ioapics[idx].base = NULL;
+ 		return -ENODEV;
+ 	}
+ 
+-	ioapics[idx].mp_config.apicid = io_apic_unique_id(idx, id);
++	ioapics[idx].mp_config.apicid  = io_apic_unique_id(idx, id);
+ 	ioapics[idx].mp_config.apicver = io_apic_get_version(idx);
++	ioapics[idx].has_eoi           =
++	(ioapics[idx].mp_config.apicver >= 0x20);
++
++	/* ---- original GSI-range / irqdomain setup code unchanged ---- */
++	entries  = io_apic_get_redir_entries(idx);
++	gsi_end  = gsi_base + entries - 1;
+ 
+-	/*
+-	 * Build basic GSI lookup table to facilitate gsi->io_apic lookups
+-	 * and to prevent reprogramming of IOAPIC pins (PCI GSIs).
+-	 */
+-	entries = io_apic_get_redir_entries(idx);
+-	gsi_end = gsi_base + entries - 1;
+ 	for_each_ioapic(ioapic) {
+ 		gsi_cfg = mp_ioapic_gsi_routing(ioapic);
+ 		if ((gsi_base >= gsi_cfg->gsi_base &&
+-		     gsi_base <= gsi_cfg->gsi_end) ||
+-		    (gsi_end >= gsi_cfg->gsi_base &&
+-		     gsi_end <= gsi_cfg->gsi_end)) {
+-			pr_warn("GSI range [%u-%u] for new IOAPIC conflicts with GSI[%u-%u]\n",
+-				gsi_base, gsi_end, gsi_cfg->gsi_base, gsi_cfg->gsi_end);
++			gsi_base <= gsi_cfg->gsi_end) ||
++			(gsi_end >= gsi_cfg->gsi_base &&
++			gsi_end <= gsi_cfg->gsi_end)) {
++			pr_warn("GSI %u-%u overlaps existing IOAPIC range\n",
++					gsi_base, gsi_end);
+ 			clear_fixmap(FIX_IO_APIC_BASE_0 + idx);
+-			return -ENOSPC;
+-		}
++		ioapics[idx].base = NULL;
++		return -ENOSPC;
++			}
+ 	}
++
+ 	gsi_cfg = mp_ioapic_gsi_routing(idx);
+ 	gsi_cfg->gsi_base = gsi_base;
+-	gsi_cfg->gsi_end = gsi_end;
++	gsi_cfg->gsi_end  = gsi_end;
+ 
+-	ioapics[idx].irqdomain = NULL;
+ 	ioapics[idx].irqdomain_cfg = *cfg;
++	ioapics[idx].nr_registers  = entries;	/* mark present */
+ 
+-	/*
+-	 * If mp_register_ioapic() is called during early boot stage when
+-	 * walking ACPI/DT tables, it's too early to create irqdomain,
+-	 * we are still using bootmem allocator. So delay it to setup_IO_APIC().
+-	 */
+ 	if (hotplug) {
+ 		if (mp_irqdomain_create(idx)) {
+ 			clear_fixmap(FIX_IO_APIC_BASE_0 + idx);
++			ioapics[idx].base = NULL;
+ 			return -ENOMEM;
+ 		}
+ 		alloc_ioapic_saved_registers(idx);
+ 	}
+ 
+-	if (gsi_cfg->gsi_end >= gsi_top)
+-		gsi_top = gsi_cfg->gsi_end + 1;
++	if (gsi_end >= gsi_top)
++		gsi_top = gsi_end + 1;
+ 	if (nr_ioapics <= idx)
+ 		nr_ioapics = idx + 1;
+ 
+-	/* Set nr_registers to mark entry present */
+-	ioapics[idx].nr_registers = entries;
+-
+-	pr_info("IOAPIC[%d]: apic_id %d, version %d, address 0x%x, GSI %d-%d\n",
+-		idx, mpc_ioapic_id(idx), mpc_ioapic_ver(idx), mpc_ioapic_addr(idx),
+-		gsi_cfg->gsi_base, gsi_cfg->gsi_end);
++	pr_info("IOAPIC[%d]: id %d, ver 0x%x, addr 0x%x, GSIs %u-%u\n",
++			idx, mpc_ioapic_id(idx), mpc_ioapic_ver(idx), address,
++			gsi_base, gsi_end);
+ 
+ 	return 0;
+ }
 
 
 
