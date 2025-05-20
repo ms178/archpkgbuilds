@@ -179,14 +179,17 @@ void amdgpu_irq_disable_all(struct amdgpu_device *adev)
  */
 static irqreturn_t amdgpu_irq_handler(int irq, void *arg)
 {
-	struct drm_device *dev = (struct drm_device *) arg;
-	struct amdgpu_device *adev = drm_to_adev(dev);
+	struct amdgpu_device *adev = drm_to_adev(arg);
 	irqreturn_t ret;
 
 	ret = amdgpu_ih_process(adev, &adev->irq.ih);
-	if (ret == IRQ_HANDLED)
-		pm_runtime_mark_last_busy(dev->dev);
 
+	if (likely(ret == IRQ_HANDLED))
+		pm_runtime_mark_last_busy(adev->dev);
+	else if (unlikely(ret != IRQ_NONE))
+		DRM_ERROR("amdgpu: ih_process returned %d\n", ret);
+
+	/* Cheaper to call unconditionally than branch on ras_enabled      */
 	amdgpu_ras_interrupt_fatal_error_handler(adev);
 
 	return ret;
@@ -450,63 +453,65 @@ int amdgpu_irq_add_id(struct amdgpu_device *adev,
  * Dispatches IRQ to IP blocks.
  */
 void amdgpu_irq_dispatch(struct amdgpu_device *adev,
-			 struct amdgpu_ih_ring *ih)
+						 struct amdgpu_ih_ring *ih)
 {
-	u32 ring_index = ih->rptr >> 2;
-	struct amdgpu_iv_entry entry;
-	unsigned int client_id, src_id;
-	struct amdgpu_irq_src *src;
-	bool handled = false;
-	int r;
+	u32 ring_idx = ih->rptr >> 2;
 
-	entry.ih = ih;
-	entry.iv_entry = (const uint32_t *)&ih->ring[ring_index];
+	/* keep volatile to satisfy the type system */
+	const volatile u32 *iv_raw = &ih->ring[ring_idx];
+	const        u32  *iv_ptr = (const u32 *)iv_raw;
 
-	/*
-	 * timestamp is not supported on some legacy SOCs (cik, cz, iceland,
-	 * si and tonga), so initialize timestamp and timestamp_src to 0
-	 */
-	entry.timestamp = 0;
-	entry.timestamp_src = 0;
+	/* prefetch expects ‘const void *’; cast away volatile explicitly */
+	prefetch((const void *)iv_raw);
+
+	struct amdgpu_iv_entry entry = {
+		.ih            = ih,
+		.iv_entry      = iv_ptr,
+		.timestamp     = 0,
+		.timestamp_src = 0,
+	};
+	struct amdgpu_irq_src       *src;
+	bool                          handled = false;
+	unsigned int                  cid, sid;
+	int                           r;
 
 	amdgpu_ih_decode_iv(adev, &entry);
-
 	trace_amdgpu_iv(ih - &adev->irq.ih, &entry);
 
-	client_id = entry.client_id;
-	src_id = entry.src_id;
+	cid = entry.client_id;
+	sid = entry.src_id;
 
-	if (client_id >= AMDGPU_IRQ_CLIENTID_MAX) {
-		DRM_DEBUG("Invalid client_id in IV: %d\n", client_id);
+	/* -------- fast sanity checks --------------------------------- */
+	if (cid >= AMDGPU_IRQ_CLIENTID_MAX || sid >= AMDGPU_MAX_IRQ_SRC_ID)
+		goto unhandled;
 
-	} else	if (src_id >= AMDGPU_MAX_IRQ_SRC_ID) {
-		DRM_DEBUG("Invalid src_id in IV: %d\n", src_id);
+	if ((cid == AMDGPU_IRQ_CLIENTID_LEGACY ||
+		cid == SOC15_IH_CLIENTID_ISP) &&
+		unlikely(adev->irq.virq[sid])) {
+		generic_handle_domain_irq(adev->irq.domain, sid);
+	handled = true;
+	goto record_ts;
+		}
 
-	} else if (((client_id == AMDGPU_IRQ_CLIENTID_LEGACY) ||
-		    (client_id == SOC15_IH_CLIENTID_ISP)) &&
-		   adev->irq.virq[src_id]) {
-		generic_handle_domain_irq(adev->irq.domain, src_id);
+		struct amdgpu_irq_client *client = &adev->irq.client[cid];
+		if (likely(client->sources &&
+			(src = client->sources[sid]))) {
 
-	} else if (!adev->irq.client[client_id].sources) {
-		DRM_DEBUG("Unregistered interrupt client_id: %d src_id: %d\n",
-			  client_id, src_id);
-
-	} else if ((src = adev->irq.client[client_id].sources[src_id])) {
-		r = src->funcs->process(adev, src, &entry);
+			r = src->funcs->process(adev, src, &entry);
 		if (r < 0)
-			DRM_ERROR("error processing interrupt (%d)\n", r);
-		else if (r)
-			handled = true;
+			DRM_ERROR("amdgpu: error %d processing IRQ %u/%u\n",
+					  r, cid, sid);
+			else if (r)
+				handled = true;
+			} else {
+				DRM_DEBUG("Unregistered IRQ cid:%u sid:%u\n", cid, sid);
+			}
 
-	} else {
-		DRM_DEBUG("Unregistered interrupt src_id: %d of client_id:%d\n",
-			src_id, client_id);
-	}
+			unhandled:
+			if (!handled)
+				amdgpu_amdkfd_interrupt(adev, iv_ptr);
 
-	/* Send it to amdkfd as well if it isn't already handled */
-	if (!handled)
-		amdgpu_amdkfd_interrupt(adev, entry.iv_entry);
-
+	record_ts:
 	if (amdgpu_ih_ts_after(ih->processed_timestamp, entry.timestamp))
 		ih->processed_timestamp = entry.timestamp;
 }
@@ -525,11 +530,11 @@ void amdgpu_irq_delegate(struct amdgpu_device *adev,
 						 struct amdgpu_iv_entry *entry,
 						 unsigned int num_dw)
 {
-	/* write IV to the software ring first */
+	/* copy IV into the software ring */
 	amdgpu_ih_ring_write(adev, &adev->irq.ih_soft,
 						 entry->iv_entry, num_dw);
 
-	/* queue fast bottom-half */
+	/* queue bottom-half that lives inside ih_soft                      */
 	irq_work_queue(&adev->irq.ih_soft_iw);
 }
 
@@ -594,95 +599,60 @@ void amdgpu_irq_gpu_reset_resume_helper(struct amdgpu_device *adev)
 	}
 }
 
-/**
- * amdgpu_irq_get - enable interrupt
- *
- * @adev: amdgpu device pointer
- * @src: interrupt source pointer
- * @type: type of interrupt
- *
- * Enables specified type of interrupt on the specified source (all ASICs).
- *
- * Returns:
- * 0 on success or error code otherwise
- */
-int amdgpu_irq_get(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
-		   unsigned int type)
+static inline bool irq_ref_inc(struct amdgpu_irq_src *src, unsigned int t)
 {
-	if (!adev->irq.installed)
-		return -ENOENT;
-
-	if (type >= src->num_types)
-		return -EINVAL;
-
-	if (!src->enabled_types || !src->funcs->set)
-		return -EINVAL;
-
-	if (atomic_inc_return(&src->enabled_types[type]) == 1)
-		return amdgpu_irq_update(adev, src, type);
-
-	return 0;
+	/* full barrier via atomic op; returns true if counter became 1   */
+	return atomic_add_return(1, &src->enabled_types[t]) == 1;
 }
 
-/**
- * amdgpu_irq_put - disable interrupt
- *
- * @adev: amdgpu device pointer
- * @src: interrupt source pointer
- * @type: type of interrupt
- *
- * Enables specified type of interrupt on the specified source (all ASICs).
- *
- * Returns:
- * 0 on success or error code otherwise
- */
-int amdgpu_irq_put(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
-		   unsigned int type)
+static inline bool irq_ref_dec(struct amdgpu_irq_src *src, unsigned int t)
 {
-	if (!adev->irq.installed)
+	/* full barrier; true if it just reached 0                         */
+	return atomic_sub_and_test(1, &src->enabled_types[t]);
+}
+
+int amdgpu_irq_get(struct amdgpu_device *adev,
+				   struct amdgpu_irq_src *src, unsigned int type)
+{
+	if (unlikely(!adev->irq.installed))
 		return -ENOENT;
-
-	if (type >= src->num_types)
+	if (type >= src->num_types || !src->enabled_types || !src->funcs->set)
 		return -EINVAL;
 
-	if (!src->enabled_types || !src->funcs->set)
-		return -EINVAL;
+	/* Fast path: already enabled → nothing to do                      */
+	if (!irq_ref_inc(src, type))
+		return 0;
 
+	/* First user – program hardware (rare)                            */
+	return unlikely(amdgpu_irq_update(adev, src, type));
+}
+
+int amdgpu_irq_put(struct amdgpu_device *adev,
+				   struct amdgpu_irq_src *src, unsigned int type)
+{
+	if (unlikely(!adev->irq.installed))
+		return -ENOENT;
+	if (type >= src->num_types || !src->enabled_types || !src->funcs->set)
+		return -EINVAL;
 	if (WARN_ON(!amdgpu_irq_enabled(adev, src, type)))
 		return -EINVAL;
 
-	if (atomic_dec_and_test(&src->enabled_types[type]))
-		return amdgpu_irq_update(adev, src, type);
+	/* Fast path: more users remain                                     */
+	if (!irq_ref_dec(src, type))
+		return 0;
 
-	return 0;
+	/* Counter hit zero – disable in hardware (rare)                    */
+	return unlikely(amdgpu_irq_update(adev, src, type));
 }
 
-/**
- * amdgpu_irq_enabled - check whether interrupt is enabled or not
- *
- * @adev: amdgpu device pointer
- * @src: interrupt source pointer
- * @type: type of interrupt
- *
- * Checks whether the given type of interrupt is enabled on the given source.
- *
- * Returns:
- * *true* if interrupt is enabled, *false* if interrupt is disabled or on
- * invalid parameters
- */
-bool amdgpu_irq_enabled(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
-			unsigned int type)
+bool amdgpu_irq_enabled(struct amdgpu_device *adev,
+						struct amdgpu_irq_src *src, unsigned int type)
 {
-	if (!adev->irq.installed)
+	if (!adev->irq.installed || type >= src->num_types || !src->enabled_types)
 		return false;
 
-	if (type >= src->num_types)
-		return false;
-
-	if (!src->enabled_types || !src->funcs->set)
-		return false;
-
-	return !!atomic_read(&src->enabled_types[type]);
+	/* atomic_read() is already a single-copy atomic load on x86/arm64 */
+	return atomic_read(&src->enabled_types[type]) != 0;
 }
 
 /* XXX: Generic IRQ handling */
