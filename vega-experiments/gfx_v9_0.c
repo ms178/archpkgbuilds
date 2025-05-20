@@ -26,7 +26,6 @@
 #include <linux/firmware.h>
 #include <linux/module.h>
 #include <linux/pci.h>
-#include <linux/iopoll.h>
 
 #include "amdgpu.h"
 #include "amdgpu_gfx.h"
@@ -166,31 +165,41 @@ do {                                                                  \
 #define WREG32_SOC15_IF_CHANGED(ip, inst, reg, val_expr)                      \
 WREG32_IF_CHANGED(SOC15_REG_OFFSET(ip, inst, reg), (val_expr))
 
-#endif
+#endif /* GFX_V9_WREG_IF_CHANGED_H */
 
 static __always_inline int
-gfx9_wait_reg_off(struct amdgpu_device *adev,
-				  u32 reg_offset, u32 mask, u32 target,
-				  unsigned long timeout_us)
+gfx9_wait_reg_off(struct amdgpu_device *adev, u32 reg_offset_in_block,
+				  u32 mask, u32 val_target, unsigned long timeout_us)
 {
-	void __iomem *addr = adev->rmmio + reg_offset;
-	u32 val;
+	u32 current_read_val;
+	ktime_t timeout_expire;
 
-	if (unlikely(!timeout_us))
+	if (timeout_us == 0) {
 		timeout_us = 2;
-
-	if (in_atomic() || irqs_disabled()) {
-		return readl_poll_timeout_atomic(addr, val,
-										 (val & mask) == target,
-										 1,
-								   timeout_us);
-	} else {
-
-		return readl_poll_timeout(addr, val,
-								  (val & mask) == target,
-								  1,
-								  timeout_us);
 	}
+
+	timeout_expire = ktime_add_us(ktime_get(), timeout_us);
+
+	do {
+		current_read_val = RREG32(reg_offset_in_block);
+		if ((current_read_val & mask) == val_target)
+			return 0;
+
+		cpu_relax();
+
+		if (timeout_us > 20 && ktime_before(ktime_get(), ktime_sub_us(timeout_expire, 1))) {
+			udelay(1);
+		} else if (timeout_us <= 20) {
+
+		}
+
+	} while (ktime_before(ktime_get(), timeout_expire));
+
+	current_read_val = RREG32(reg_offset_in_block);
+	if ((current_read_val & mask) == val_target)
+		return 0;
+
+	return -ETIMEDOUT;
 }
 
 
@@ -3809,10 +3818,9 @@ static int gfx_v9_0_hw_fini(struct amdgpu_ip_block *ip_block)
 
 	if (amdgpu_ras_is_supported(adev, AMDGPU_RAS_BLOCK__GFX))
 		amdgpu_irq_put(adev, &adev->gfx.cp_ecc_error_irq, 0);
-
-	amdgpu_irq_put(adev, &adev->gfx.priv_reg_irq,   0);
-	amdgpu_irq_put(adev, &adev->gfx.priv_inst_irq,  0);
-	amdgpu_irq_put(adev, &adev->gfx.bad_op_irq,     0);
+	amdgpu_irq_put(adev, &adev->gfx.priv_reg_irq, 0);
+	amdgpu_irq_put(adev, &adev->gfx.priv_inst_irq, 0);
+	amdgpu_irq_put(adev, &adev->gfx.bad_op_irq, 0);
 
 	if (!amdgpu_ras_intr_triggered())
 		amdgpu_gfx_disable_kcq(adev, 0);
@@ -3825,15 +3833,10 @@ static int gfx_v9_0_hw_fini(struct amdgpu_ip_block *ip_block)
 
 	if (!amdgpu_in_reset(adev) && !adev->in_suspend) {
 		mutex_lock(&adev->srbm_mutex);
-
-		soc15_grbm_select(adev,
-						  adev->gfx.kiq[0].ring.me,
-					adev->gfx.kiq[0].ring.pipe,
-					adev->gfx.kiq[0].ring.queue,
-					0, 0);
-
+		soc15_grbm_select(adev, adev->gfx.kiq[0].ring.me,
+						  adev->gfx.kiq[0].ring.pipe,
+					adev->gfx.kiq[0].ring.queue, 0, 0);
 		gfx_v9_0_kiq_fini_register(&adev->gfx.kiq[0].ring);
-
 		soc15_grbm_select(adev, 0, 0, 0, 0, 0);
 		mutex_unlock(&adev->srbm_mutex);
 	}
@@ -4590,17 +4593,18 @@ static bool gfx_v9_0_is_rlc_enabled(struct amdgpu_device *adev)
 
 static void gfx_v9_0_set_safe_mode(struct amdgpu_device *adev, int xcc_id)
 {
-	u32 data;
+	uint32_t data;
+	unsigned i;
 
-	data  = RLC_SAFE_MODE__CMD_MASK;
+	data = RLC_SAFE_MODE__CMD_MASK;
 	data |= (1 << RLC_SAFE_MODE__MESSAGE__SHIFT);
 	WREG32_SOC15(GC, 0, mmRLC_SAFE_MODE, data);
 
-	gfx9_wait_reg_off(adev,
-					  SOC15_REG_OFFSET(GC, 0, mmRLC_SAFE_MODE),
-					  RLC_SAFE_MODE__CMD_MASK,
-				   0,
-				   adev->usec_timeout);
+	for (i = 0; i < adev->usec_timeout; i++) {
+		if (!REG_GET_FIELD(RREG32_SOC15(GC, 0, mmRLC_SAFE_MODE), RLC_SAFE_MODE, CMD))
+			break;
+		udelay(1);
+	}
 }
 
 static void gfx_v9_0_unset_safe_mode(struct amdgpu_device *adev, int xcc_id)
