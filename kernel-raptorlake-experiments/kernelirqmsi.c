@@ -18,26 +18,27 @@
 #include <linux/sysfs.h>
 #include <linux/types.h>
 #include <linux/xarray.h>
+#include <linux/percpu.h>
 
 #include "internals.h"
 
 static struct kmem_cache *msi_desc_cache __ro_after_init;
 
+#define MSI_MAG_SIZE    2
+
+static DEFINE_PER_CPU(struct msi_desc *, msi_magazine[MSI_MAG_SIZE]);
+static struct kmem_cache *msi_desc_cache __ro_after_init;
+
 static int __init msi_desc_cache_init(void)
 {
-	/*
-	 * SLAB_HWCACHE_ALIGN keeps objects in one cache-line, improving
-	 * locality when walking descriptor arrays during vector
-	 * allocation/free.
-	 *
-	 * Allocation failure is not fatal – we gracefully fall back to
-	 * kzalloc()/kfree()-pair in the hot-paths below.
-	 */
 	msi_desc_cache = kmem_cache_create("msi_desc_cache",
-					   sizeof(struct msi_desc),
-					   0, SLAB_HWCACHE_ALIGN, NULL);
+									   sizeof(struct msi_desc),
+									   0,
+									SLAB_HWCACHE_ALIGN,
+									NULL);
 	if (!msi_desc_cache)
-		pr_warn("MSI: unable to create msi_desc cache, falling back to kzalloc\n");
+		pr_warn("MSI: falling back to kzalloc() (no slab cache)\n");
+
 	return 0;
 }
 core_initcall(msi_desc_cache_init);
@@ -89,6 +90,32 @@ static void msi_domain_free_locked(struct device *dev, struct msi_ctrl *ctrl);
 static unsigned int msi_domain_get_hwsize(struct device *dev, unsigned int domid);
 static inline int msi_sysfs_create_group(struct device *dev);
 
+static __always_inline struct msi_desc *msi_mag_get(void)
+{
+	struct msi_desc **mag = this_cpu_ptr(msi_magazine);
+	struct msi_desc  *d   = mag[0];
+
+	if (d) {
+		mag[0] = mag[1];
+		mag[1] = NULL;
+	}
+	return d;
+}
+
+static __always_inline bool msi_mag_put(struct msi_desc *d)
+{
+	struct msi_desc **mag = this_cpu_ptr(msi_magazine);
+
+	if (!mag[0]) {
+		mag[0] = d;
+		return true;
+	}
+	if (!mag[1]) {
+		mag[1] = d;
+		return true;
+	}
+	return false;
+}
 
 /**
  * msi_alloc_desc - Allocate an initialized msi_desc
@@ -101,27 +128,32 @@ static inline int msi_sysfs_create_group(struct device *dev);
  *
  * Return: pointer to allocated &msi_desc on success or %NULL on failure
  */
-static struct msi_desc *msi_alloc_desc(struct device *dev, int nvec,
-				       const struct irq_affinity_desc *affinity)
+static struct msi_desc *
+msi_alloc_desc(struct device *dev, int nvec,
+			   const struct irq_affinity_desc *affinity)
 {
 	struct msi_desc *desc;
 
-	/* Prefer the SLAB cache if initialised, else fallback */
-	if (likely(msi_desc_cache))
-		desc = kmem_cache_zalloc(msi_desc_cache, GFP_KERNEL);
-	else
-		desc = kzalloc(sizeof(*desc), GFP_KERNEL);
+	/* 1. per-CPU magazine – zero cost */
+	preempt_disable();
+	desc = msi_mag_get();
+	preempt_enable();
 
-	if (!desc)
-		return NULL;
+	if (!desc) {
+		if (likely(msi_desc_cache))
+			desc = kmem_cache_zalloc(msi_desc_cache, GFP_KERNEL);
+		else
+			desc = kzalloc(sizeof(*desc), GFP_KERNEL);
+		if (!desc)
+			return NULL;
+	}
 
-	desc->dev = dev;
+	desc->dev       = dev;
 	desc->nvec_used = nvec;
 
 	if (affinity) {
 		desc->affinity = kmemdup_array(affinity, nvec,
-					       sizeof(*desc->affinity),
-					       GFP_KERNEL);
+									   sizeof(*affinity), GFP_KERNEL);
 		if (!desc->affinity) {
 			if (likely(msi_desc_cache))
 				kmem_cache_free(msi_desc_cache, desc);
@@ -136,6 +168,13 @@ static struct msi_desc *msi_alloc_desc(struct device *dev, int nvec,
 static void msi_free_desc(struct msi_desc *desc)
 {
 	kfree(desc->affinity);
+
+	preempt_disable();
+	if (msi_mag_put(desc)) {
+		preempt_enable();
+		return;
+	}
+	preempt_enable();
 
 	if (likely(msi_desc_cache))
 		kmem_cache_free(msi_desc_cache, desc);

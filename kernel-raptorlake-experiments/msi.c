@@ -777,70 +777,78 @@ out_disable:
 	return ret;
 }
 
-static bool pci_msix_validate_entries(struct pci_dev    *dev,
-				      struct msix_entry *entries,
-				      int                nvec)
+/* Validate @entries for duplicate indices, range and optional contiguity */
+static bool pci_msix_validate_entries(struct pci_dev      *dev,
+									  struct msix_entry   *entries,
+									  int                  nvec)
 {
-	bool nogap;
-	int i, j;
+	bool need_contig;
+	int  table_size;
+	unsigned int i, j, max = 0;
+	unsigned long *bm, stack_bm[4]; /* up to 256 bits on 64-bit */
 
-	/* Nothing to validate?  Accept immediately. */
-	if (!entries) {
+	if (!entries)
 		return true;
+
+	need_contig = pci_msi_domain_supports(dev,
+										  MSI_FLAG_MSIX_CONTIGUOUS,
+									   DENY_LEGACY);
+
+	table_size = pci_msix_vec_count(dev);
+	if (table_size < 0) {
+		return false;
 	}
+		/* range check & find max index */
+		for (i = 0; i < nvec; i++) {
+			if (entries[i].entry >= table_size)
+				return false;
 
-	nogap = pci_msi_domain_supports(dev,
-					MSI_FLAG_MSIX_CONTIGUOUS,
-				 DENY_LEGACY);
+			if (entries[i].entry > max)
+				max = entries[i].entry;
+		}
 
-	/* ---------- fast O(N) path with a bitmap ---------- */
-	{
-		unsigned int maxbit = 0;
+		/* choose on-stack bitmap when it fits */
+		if (max < (ARRAY_SIZE(stack_bm) * BITS_PER_LONG)) {
+			bitmap_zero(stack_bm, max + 1);
+			bm = stack_bm;
+		} else {
+			bm = bitmap_zalloc(max + 1, GFP_KERNEL);
+			if (!bm)
+				goto slow_fallback;
+		}
 
-		for (i = 0; i < nvec; i++)
-			if (entries[i].entry > maxbit)
-				maxbit = entries[i].entry;
+		for (i = 0; i < nvec; i++) {
+			u32 idx = entries[i].entry;
 
-		/* bitmap size is maxbit + 1 bits, inclusive */
-		{
-			unsigned long *bm =
-			bitmap_zalloc(maxbit + 1, GFP_KERNEL);
-
-			if (bm) {
-				for (i = 0; i < nvec; i++) {
-					unsigned int idx = entries[i].entry;
-
-					/* duplicate? */
-					if (test_and_set_bit(idx, bm)) {
-						bitmap_free(bm);
-						return false;
-					}
-				}
-
-				if (nogap &&
-					/* any zero bit in 0 … nvec-1 ? */
-					find_first_zero_bit(bm, nvec) < nvec) {
+			if (test_and_set_bit(idx, bm)) {
+				if (bm != stack_bm)
 					bitmap_free(bm);
-				return false;     /* gap */
-					}
-
-					bitmap_free(bm);
-					return true;              /* valid */
+				return false;		/* duplicate */
 			}
 		}
-	}
 
-	/* ---------- fallback: original quadratic scan ---------- */
+		if (need_contig &&
+			find_first_zero_bit(bm, nvec) < nvec) {
+			if (bm != stack_bm)
+				bitmap_free(bm);
+			return false;			/* gap */
+			}
+
+			if (bm != stack_bm)
+				bitmap_free(bm);
+	return true;
+
+	/* -------------------------------------------------------------------- */
+	slow_fallback:		/* kmalloc() failed – fall back to O(N²) scan */
+	/* -------------------------------------------------------------------- */
 	for (i = 0; i < nvec; i++) {
-		for (j = i + 1; j < nvec; j++) {
+		if (need_contig && entries[i].entry != i)
+			return false;
+
+		for (j = i + 1; j < nvec; j++)
 			if (entries[i].entry == entries[j].entry)
-				return false;     /* duplicate */
-		}
-
-		if (nogap && entries[i].entry != i)
-			return false;             /* gap */
+				return false;
 	}
-
 	return true;
 }
 

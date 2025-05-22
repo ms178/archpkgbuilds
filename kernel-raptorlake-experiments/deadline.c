@@ -1243,6 +1243,7 @@ dl_server_timer(struct hrtimer *timer, struct sched_dl_entity *dl_se)
 		return HRTIMER_RESTART;
 			}
 			dl_se->dl_defer_running = 1;
+			dl_se->dl_defer_armed   = 0;
 	}
 
 	dl_se->dl_server_idle = 0;

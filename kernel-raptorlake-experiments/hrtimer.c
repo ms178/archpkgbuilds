@@ -1896,8 +1896,8 @@ static __latent_entropy void hrtimer_run_softirq(void)
 #ifdef CONFIG_HIGH_RES_TIMERS
 
 /*
- * High resolution timer interrupt
- * Called with interrupts disabled
+ * High-resolution timer interrupt
+ * (called with interrupts disabled)
  */
 void hrtimer_interrupt(struct clock_event_device *dev)
 {
@@ -1905,7 +1905,7 @@ void hrtimer_interrupt(struct clock_event_device *dev)
 	unsigned long flags;
 	ktime_t entry_time, now, delta, expires_next;
 	bool bail_for_resched = false;
-	int   retry;
+	int retry;
 
 	BUG_ON(!cpu_base->hres_active);
 
@@ -1919,6 +1919,7 @@ void hrtimer_interrupt(struct clock_event_device *dev)
 		cpu_base->in_hrtirq    = 1;
 		cpu_base->expires_next = KTIME_MAX;
 
+		/* kick softirq side if necessary */
 		if (!ktime_before(now, cpu_base->softirq_expires_next)) {
 			cpu_base->softirq_expires_next = KTIME_MAX;
 			cpu_base->softirq_activated    = 1;
@@ -1933,6 +1934,7 @@ void hrtimer_interrupt(struct clock_event_device *dev)
 
 		raw_spin_unlock_irqrestore(&cpu_base->lock, flags);
 
+		/* try to program next expiry; succeed → done */
 		if (likely(!tick_program_event(expires_next, 0))) {
 			cpu_base->hang_detected = 0;
 			return;
@@ -1940,29 +1942,37 @@ void hrtimer_interrupt(struct clock_event_device *dev)
 
 		cpu_base->nr_retries++;
 
+		/* after three retries bail out */
 		if (retry == 2)
 			break;
+
 		if (need_resched()) {
 			bail_for_resched = true;
 			break;
 		}
 
+		/* retry with fresh base */
 		raw_spin_lock_irqsave(&cpu_base->lock, flags);
 		now = hrtimer_update_base(cpu_base);
 	}
 
-	delta = ktime_sub(ktime_get(), entry_time);
+	/* ---------- hang-recovery path ---------- */
+
+	/* single, monotonic timestamp for both delta and re-arm maths */
+	now   = ktime_get();
+	delta = ktime_sub(now, entry_time);
+	if (ktime_to_ns(delta) < 0)
+		delta = 0;
+
+	if (ktime_to_ns(delta) > 100 * NSEC_PER_MSEC)
+		expires_next = ktime_add_ns(now, 100 * NSEC_PER_MSEC);
+	else
+		expires_next = ktime_add(now, delta);
 
 	if (!bail_for_resched) {
 		cpu_base->nr_hangs++;
 		cpu_base->hang_detected = 1;
 	}
-
-	if (delta > 100 * NSEC_PER_MSEC)
-		expires_next = ktime_add_ns(ktime_get(),
-									100 * NSEC_PER_MSEC);
-		else
-			expires_next = ktime_add(ktime_get(), delta);
 
 	tick_program_event(expires_next, 1);
 
