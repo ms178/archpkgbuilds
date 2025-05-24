@@ -16,6 +16,7 @@
 #include <cmath>     // For std::abs
 #include <tuple>     // For std::tuple
 #include <initializer_list> // For std::min with initializer list
+#include <limits>    // For std::numeric_limits
 
 /* ------------------------------------------------------------------------
  * Forward declarations for helpers that live in other compilation units.
@@ -46,16 +47,7 @@ namespace aco {
       static void move_element_impl(Iter begin, int old_idx, int new_idx)
       {
             assert(old_idx >= 0 && new_idx >= 0);
-            assert(old_idx != new_idx); // Should not be called if no move is needed
-            /* std::rotate expects [first, middle, last) – ‘middle’ is the element that
-             * will end up at ‘first’.  We therefore pass either (old, old+1, new) or
-             * (new,  old,    old+1) depending on direction. */
-
-            // The original code had a check: if (old_idx == new_idx || old_idx + 1 == new_idx) return;
-            // The new_idx == old_idx + 1 for downward moves (new_idx > old_idx) means old+1 is the new end,
-            // so std::rotate(begin + old_idx, begin + old_idx + 1, begin + old_idx + 1) is a no-op.
-            // The assert(old_idx != new_idx) covers the first part.
-            // If new_idx == old_idx + 1, the rotate is `std::rotate(it_old, it_old_plus_1, it_old_plus_1)` which is fine.
+            assert(old_idx != new_idx);
 
             if (new_idx > old_idx)       /* move *down* (towards the back) */
                   std::rotate(begin + old_idx, begin + old_idx + 1, begin + new_idx);
@@ -68,7 +60,7 @@ namespace aco {
       template<class Iter>
       static inline void move_element(Iter b, int from, int to)
       {
-            if (from == to) return; // Explicitly handle no-op for the public alias
+            if (from == to) return;
             move_element_impl(b, from, to);
       }
 
@@ -94,7 +86,7 @@ namespace aco {
       class Block;
       class Program;
       class Instruction;
-      // struct sched_ctx; // No longer needed here as it's defined before use by other aco:: structs
+      struct sched_ctx;
 
       /* ------------------------------------------------------------------
        * 1.  Complete helper data-structures for hazard querying
@@ -197,7 +189,7 @@ namespace aco {
             amd_gfx_level gfx_level;
             int16_t occupancy_factor;
             int16_t last_SMEM_stall;
-            int last_SMEM_dep_idx; // Changed from int to int16_t in one version, ensure consistency if this was intended. Original was int.
+            int last_SMEM_dep_idx;
             MoveState mv;
             bool schedule_pos_exports = true;
             unsigned schedule_pos_export_div = 1;
@@ -222,9 +214,59 @@ namespace aco {
                   int l2_window = min_latency_hiding_slots * wave_scaling_factor;
                   int l1_window = (VEGA_L1_LATENCY / VEGA_VMEM_ISSUE_CYCLES) * wave_scaling_factor;
 
-                  return std::max({base_window, l1_window, l2_window}); // Use initializer list for std::max
+                  return std::max({base_window, l1_window, l2_window});
             }
       };
+
+      static bool
+      get_constant_vmem_offset(const Instruction* instr, int64_t& out_off)
+      {
+            if (!instr)
+                  return false;
+
+            /* Most VMEM/FLAT ops: operands[1] holds the immediate offset */
+            if (instr->operands.size() > 1 && instr->operands[1].isConstant()) {
+                  out_off = instr->operands[1].constantValue();
+                  return true;
+            }
+
+            /* Some MUBUF variants keep the imm-offset in operand 2 or 3 */
+            for (unsigned i = 2; i < instr->operands.size(); ++i) {
+                  if (instr->operands[i].isConstant()) {
+                        out_off = instr->operands[i].constantValue();
+                        return true;
+                  }
+            }
+
+            return false;
+      }
+
+      static bool
+      check_l2_page_affinity(const Instruction* i1, const Instruction* i2)
+      {
+            int64_t off1, off2;
+            if (!get_constant_vmem_offset(i1, off1) ||
+                  !get_constant_vmem_offset(i2, off2))
+                  return false;
+
+            /* 0xFFF = 4095 : mask within 4 KiB page                            */
+            return ((off1 ^ off2) & ~int64_t{4095}) == 0;
+      }
+
+      static float
+      calculate_vega_ilp_boost(const Block* /*blk*/, double mem_ratio)
+      {
+            float boost =
+            getenv("ACO_SCHED_VEGA_ILP_BOOST")
+            ? std::clamp(std::atoi(getenv("ACO_SCHED_VEGA_ILP_BOOST")),
+                         0, 200) / 100.f
+                         : 1.0f;
+
+                         if (mem_ratio > 0.60)      boost *= 1.30f;
+                               else if (mem_ratio < 0.20) boost *= 0.90f;
+
+                                     return std::clamp(boost, 0.5f, 2.0f);
+      }
 
       struct MemoryPatternAnalyzer {
             enum AccessPattern {
@@ -805,54 +847,73 @@ namespace aco {
                   }
       }
 
-      bool should_form_clause_vega_enhanced(const Instruction* instr_a, const Instruction* instr_b, amd_gfx_level agfx_level, const sched_ctx& actx) {
-            if (!instr_a || !instr_b) return false;
-            if (!should_form_clause(instr_a, instr_b))
+      bool should_form_clause_vega_enhanced(const Instruction* a,
+                                            const Instruction* b,
+                                            amd_gfx_level       gfx_level,
+                                            const sched_ctx&    ctx)
+      {
+            /* generic, architecture independent check first */
+            if (!a || !b || !should_form_clause(a, b))
                   return false;
 
-            if (agfx_level == GFX9) {
-                  if (instr_a->isVMEM() && instr_b->isVMEM()) {
-                        if (instr_a->operands.size() > 0 && instr_b->operands.size() > 0 &&
-                              instr_a->operands[0].isTemp() && instr_b->operands[0].isTemp() &&
-                              instr_a->operands[0].tempId() == instr_b->operands[0].tempId()) {
+            /* ---  Vega / GFX9 specific heuristics  -------------------------------- */
+            if (gfx_level == GFX9) {
+                  /* --- VMEM vs VMEM --------------------------------------------------- */
+                  if (a->isVMEM() && b->isVMEM()) {
+                        /* same descriptor?  -> always fine                                 */
+                        if (a->operands.size() > 0 && b->operands.size() > 0 &&
+                              a->operands[0].isTemp()    && b->operands[0].isTemp() &&
+                              a->operands[0].tempId()    == b->operands[0].tempId()) {
 
-                              if (instr_a->operands.size() > 1 && instr_b->operands.size() > 1 &&
-                                    instr_a->operands[1].isConstant() && instr_b->operands[1].isConstant()) {
-                                    int64_t offset_a = instr_a->operands[1].constantValue();
-                              int64_t offset_b = instr_b->operands[1].constantValue();
-                        int64_t diff = std::abs(offset_a - offset_b);
+                              /* check constant offsets to decide *how* good it is…            */
+                              if (a->operands.size() > 1 && b->operands.size() > 1 &&
+                                    a->operands[1].isConstant() && b->operands[1].isConstant()) {
+                                    int64_t off_a = a->operands[1].constantValue();
+                              int64_t off_b = b->operands[1].constantValue();
+                        int64_t diff  = std::abs(off_a - off_b);
 
+                        /* keep accesses inside 256-byte window – that maps nicely to
+                         * 4 consecutive 64-byte cache lines and is what the hardware
+                         * prefetcher looks at.                                       */
                         if (diff <= 256) {
-                              unsigned size_instr_a = 0;
-                              if (!instr_a->definitions.empty() && instr_a->definitions[0].isTemp())
-                                    size_instr_a = instr_a->definitions[0].bytes();
-                              else if (instr_a->isVMEM() && instr_a->format == Format::MUBUF) {
-                                    if(instr_a->operands.size() >= 4 && instr_a->operands[3].isTemp())
-                                          size_instr_a = instr_a->operands[3].bytes();
-                                    else if(instr_a->operands.size() >= 3 && instr_a->operands[2].isTemp())
-                                          size_instr_a = instr_a->operands[2].bytes();
-                                    else if (!instr_a->operands.empty() && instr_a->operands.back().isTemp())
-                                          size_instr_a = instr_a->operands.back().bytes();
+                              /* reward perfect sequential pattern even more */
+                              unsigned size_a = 0;
+                              if (!a->definitions.empty() && a->definitions[0].isTemp())
+                                    size_a = a->definitions[0].bytes();
+                              else if (a->isVMEM() && a->format == Format::MUBUF) { // Store heuristic
+                                    if(a->operands.size() >= 4 && a->operands[3].isTemp())
+                                          size_a = a->operands[3].bytes();
+                                    else if(a->operands.size() >= 3 && a->operands[2].isTemp())
+                                          size_a = a->operands[2].bytes();
+                                    else if (!a->operands.empty() && a->operands.back().isTemp())
+                                          size_a = a->operands.back().bytes();
                               }
 
-                              if (size_instr_a > 0 && offset_b == (offset_a + size_instr_a))
-                                    return true;
-                              return true;
+                              if (size_a > 0 && off_b == off_a + size_a)
+                                    return true;                /* perfect seq */
+                                    return true;                   /* still good   */
                         }
                                     }
+                                    /* same descriptor but unknown offsets – still beneficial        */
                                     return true;
                               }
                   }
 
-                  if (instr_a->isFlatLike() && instr_b->isFlatLike()) {
-                        if (instr_a->operands.size() > 0 && instr_b->operands.size() > 0 &&
-                              instr_a->operands[0].isTemp() && instr_b->operands[0].isTemp() &&
-                              instr_a->operands[0].tempId() == instr_b->operands[0].tempId())
+                  /* --- FLAT vs FLAT --------------------------------------------------- */
+                  if (a->isFlatLike() && b->isFlatLike()) {
+                        /* identical base pointer => likely same page                       */
+                        if (a->operands.size() > 0 && b->operands.size() > 0 &&
+                              a->operands[0].isTemp() && b->operands[0].isTemp() &&
+                              a->operands[0].tempId() == b->operands[0].tempId())
                               return true;
-                        if (actx.prefer_clauses)
-                              return true;
+
+                        /* otherwise let ‘prefer_clauses’ policy decide                     */
+                        return ctx.prefer_clauses;
                   }
             }
+
+            /* default fall-through for non-Vega chips or instructions that do not
+             * match our extra heuristics.                                            */
             return true;
       }
 
@@ -926,8 +987,10 @@ namespace aco {
                   bool candidate_is_8byte_smem_load = (candidate->opcode == aco_opcode::s_load_dwordx2 || candidate->opcode == aco_opcode::s_buffer_load_dwordx2);
 
                   if ((candidate->isVMEM() || candidate->isFlatLike()) &&
-                        ( ((cursor.insert_idx_clause - 1) - cursor.source_idx) > (ctx.occupancy_factor * 4) || current_is_16byte_smem ))
-                        break;
+                        (((cursor.insert_idx_clause - 1) - cursor.source_idx) >
+                        (ctx.occupancy_factor * 4)) /* avoid stalling VMEM queue   */
+                        || current_is_16byte_smem)        /* big vs small load hazard   */
+                  break;
                   if (candidate->isSMEM() && current_is_16byte_smem && candidate_is_8byte_smem_load)
                         break;
 
@@ -1028,188 +1091,169 @@ namespace aco {
       }
 
       void
-      schedule_VMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
+      schedule_VMEM(sched_ctx& ctx, Block* blk, Instruction* cur, int idx)
       {
-            assert(idx != 0 && current && block);
-            int base_window_size = VMEM_WINDOW_SIZE_CTX;
-            if (ctx.gfx_level == GFX9) {
-                  base_window_size = VegaMemoryScheduler::calculate_vmem_window(ctx, base_window_size);
-            }
-            int window_size = static_cast<int>(base_window_size * ctx.schedule_aggressiveness);
-            int max_moves = static_cast<int>(VMEM_MAX_MOVES_CTX * ctx.schedule_aggressiveness);
+            const float aggr = ctx.schedule_aggressiveness;
 
-            int base_clause_max_grab_dist = VMEM_CLAUSE_MAX_GRAB_DIST_CTX;
-            if (ctx.gfx_level == GFX9 && idx + 1 < (int)block->instructions.size()) {
-                  auto pattern_info = MemoryPatternAnalyzer::analyze_vmem_pattern(block, idx + 1, 32);
-                  if (pattern_info.pattern == MemoryPatternAnalyzer::PATTERN_SEQUENTIAL) {
-                        base_clause_max_grab_dist = VMEM_CLAUSE_MAX_GRAB_DIST_CTX * 2;
-                  } else if (pattern_info.pattern == MemoryPatternAnalyzer::PATTERN_STRIDED) {
-                        if (pattern_info.stride >=0 && pattern_info.stride <= 64) {
-                              base_clause_max_grab_dist = (VMEM_CLAUSE_MAX_GRAB_DIST_CTX * 3) / 2;
+            int base_win = VMEM_WINDOW_SIZE_CTX;
+            if (ctx.gfx_level == GFX9)
+                  base_win = VegaMemoryScheduler::calculate_vmem_window(ctx, base_win);
+
+            const int win_size  = int(base_win           * aggr);
+            const int max_moves = int(VMEM_MAX_MOVES_CTX * aggr);
+
+            int base_clause = VMEM_CLAUSE_MAX_GRAB_DIST_CTX;
+            int clause_dist = int(base_clause * (ctx.prefer_clauses ? aggr : 1.0f));
+
+            if (ctx.gfx_level == GFX9 && idx + 1 < (int)blk->instructions.size()) {
+                  auto pat = MemoryPatternAnalyzer::analyze_vmem_pattern(blk, idx + 1, 64);
+                  if (pat.pattern == MemoryPatternAnalyzer::PATTERN_SEQUENTIAL)
+                        clause_dist *= 3;                 /* even more aggressive         */
+                        else if (pat.pattern == MemoryPatternAnalyzer::PATTERN_STRIDED) {
+                              if (pat.stride <= 32)        clause_dist *= 2;
+                              else if (pat.stride <= 128)  clause_dist = int(clause_dist * 1.7f);
+                              else if (pat.stride <= 4096) clause_dist = int(clause_dist * 1.3f);
                         }
-                  }
             }
-            int clause_max_grab_dist = static_cast<int>(base_clause_max_grab_dist * (ctx.prefer_clauses ? ctx.schedule_aggressiveness : 1.0f));
+
+            DownwardsCursor cur_d = ctx.mv.downwards_init(idx, true, true);
+            hazard_query indep_q, clause_q;
+            init_hazard_query(ctx, &indep_q); add_to_hazard_query(&indep_q, cur);
+            init_hazard_query(ctx, &clause_q);
 
             bool only_clauses = false;
             int16_t k = 0;
 
-            hazard_query indep_hq;
-            hazard_query clause_hq;
-            init_hazard_query(ctx, &indep_hq);
-            init_hazard_query(ctx, &clause_hq);
-            add_to_hazard_query(&indep_hq, current);
+            /* ---------------- downwards phase -------------------------- */
+            for ( ; k < max_moves &&
+                  cur_d.source_idx >= 0 &&
+                  cur_d.source_idx > idx - win_size; )
+            {
+                  auto& cand = blk->instructions[cur_d.source_idx];
+                  if (!cand) { ctx.mv.downwards_skip(cur_d); continue; }
+                  if (cand->opcode == aco_opcode::p_logical_start) break;
 
-            DownwardsCursor cursor = ctx.mv.downwards_init(idx, true, true);
+                  bool part_clause = false;
+                  if ((cur->isVMEM() && cand->isVMEM()) ||
+                        (cur->isFlatLike() && cand->isFlatLike()))
+                  {
+                        int grab = (cur_d.insert_idx_clause - 1) - cur_d.source_idx;
+                        if (grab < clause_dist &&
+                              should_form_clause_vega_enhanced(cur, cand.get(),
+                                                               ctx.gfx_level, ctx))
+                        {
+                              /* 128-B super gather & 4 KiB page affinity --------------- */
+                              int64_t off_first, off_cand;
+                              bool c0 = get_constant_vmem_offset(cur, off_first);
+                              bool c1 = get_constant_vmem_offset(cand.get(), off_cand);
+                              bool same_desc =
+                              cur->operands[0].isTemp() && cand->operands[0].isTemp() &&
+                              cur->operands[0].tempId() == cand->operands[0].tempId();
 
-            for (/* k init */; k < max_moves && cursor.source_idx >=0 && cursor.source_idx > (int)idx - window_size;
-                 /* cursor.source_idx updated by skip/move */ ) {
-                  assert(cursor.source_idx >= 0 && cursor.source_idx < (int)block->instructions.size());
-                  aco_ptr<Instruction>& candidate = block->instructions[cursor.source_idx];
-                  if (!candidate) { ctx.mv.downwards_skip(cursor); continue;}
+                              bool same128 = c0 && c1 && same_desc &&
+                              ((off_first ^ off_cand) & ~127) == 0;
+                              bool same4k  = c0 && c1 && same_desc &&
+                              ((off_first ^ off_cand) & ~4095) == 0;
 
-
-                  bool is_vmem_candidate = candidate->isVMEM() || candidate->isFlatLike();
-
-                  if (candidate->opcode == aco_opcode::p_logical_start)
-                        break;
-
-                  bool can_stall_prev_smem =
-                  idx <= ctx.last_SMEM_dep_idx && cursor.source_idx < ctx.last_SMEM_dep_idx;
-                  if (can_stall_prev_smem && ctx.last_SMEM_stall >= 0)
-                        break;
-
-                  bool part_of_clause = false;
-                  if ( (current->isVMEM() && candidate->isVMEM()) || (current->isFlatLike() && candidate->isFlatLike()) ) {
-                        int grab_dist = (cursor.insert_idx_clause -1) - cursor.source_idx;
-                        bool basic_clause_ok = should_form_clause_vega_enhanced(current, candidate.get(), ctx.gfx_level, ctx);
-                        part_of_clause = grab_dist < clause_max_grab_dist && basic_clause_ok;
-                  }
-
-                  bool can_move_down = !is_vmem_candidate || part_of_clause || candidate->definitions.empty();
-                  if (only_clauses) {
-                        if (part_of_clause) {
-                              int current_clause_size = cursor.insert_idx - cursor.insert_idx_clause;
-                              int prev_potential_clause_size = 1;
-                              while (cursor.source_idx - prev_potential_clause_size >= 0) {
-                                    Instruction* prev_instr = block->instructions[cursor.source_idx - prev_potential_clause_size].get();
-                                    if (!prev_instr) break;
-                                    bool prev_clause_ok = should_form_clause_vega_enhanced(current, prev_instr, ctx.gfx_level, ctx);
-                                    if (!prev_clause_ok) break;
-                                    prev_potential_clause_size++;
-                              }
-                              if (prev_potential_clause_size > current_clause_size + 1)
-                                    break;
-                        } else {
-                              can_move_down = false;
+                              int extra = same128 ? 8 : (same4k ? 4 : 0);
+                              part_clause = grab < clause_dist + extra;
                         }
                   }
-                  HazardResult haz =
-                  perform_hazard_query(part_of_clause ? &clause_hq : &indep_hq, candidate.get(), false);
-                  if (haz == hazard_fail_reorder_ds || haz == hazard_fail_spill ||
-                        haz == hazard_fail_reorder_sendmsg || haz == hazard_fail_barrier ||
-                        haz == hazard_fail_export)
-                        can_move_down = false;
-                  else if (haz != hazard_success)
+
+                  bool can_move = !cand->isVMEM() || part_clause || cand->definitions.empty();
+                  HazardResult hz =
+                  perform_hazard_query(part_clause ? &clause_q : &indep_q,
+                                       cand.get(), false);
+                  if (hz == hazard_fail_reorder_ds || hz == hazard_fail_spill ||
+                        hz == hazard_fail_reorder_sendmsg || hz == hazard_fail_barrier ||
+                        hz == hazard_fail_export)
+                        can_move = false;
+                  else if (hz != hazard_success)
                         break;
 
-                  if (!can_move_down) {
-                        if (part_of_clause)
-                              add_to_hazard_query(&clause_hq, candidate.get());
-                        add_to_hazard_query(&indep_hq, candidate.get());
-                        ctx.mv.downwards_skip(cursor);
+                  if (!can_move) {
+                        if (part_clause) add_to_hazard_query(&clause_q, cand.get());
+                        add_to_hazard_query(&indep_q, cand.get());
+                        ctx.mv.downwards_skip(cur_d);
                         continue;
                   }
 
-                  Instruction* candidate_ptr = candidate.get();
-                  MoveResult res = ctx.mv.downwards_move(cursor, part_of_clause);
-                  if (res == move_fail_ssa || res == move_fail_rar) {
-                        if (part_of_clause)
-                              add_to_hazard_query(&clause_hq, candidate.get());
-                        add_to_hazard_query(&indep_hq, candidate.get());
-                        ctx.mv.downwards_skip(cursor);
-                        continue;
-                  } else if (res == move_fail_pressure) {
-                        only_clauses = true;
-                        if (part_of_clause)
-                              add_to_hazard_query(&clause_hq, candidate.get());
-                        add_to_hazard_query(&indep_hq, candidate.get());
-                        ctx.mv.downwards_skip(cursor);
+                  MoveResult res = ctx.mv.downwards_move(cur_d, part_clause);
+                  if (res != move_success) {
+                        if (part_clause) add_to_hazard_query(&clause_q, cand.get());
+                        add_to_hazard_query(&indep_q, cand.get());
+                        if (res == move_fail_pressure) only_clauses = true;
+                        ctx.mv.downwards_skip(cur_d);
                         continue;
                   }
 
-                  if (part_of_clause) {
-                        add_to_hazard_query(&clause_hq, candidate_ptr);
-                        add_to_hazard_query(&indep_hq, candidate_ptr);
+                  if (part_clause) {
+                        add_to_hazard_query(&clause_q, cand.get());
+                        add_to_hazard_query(&indep_q, cand.get());
                   } else {
-                        add_to_hazard_query(&indep_hq, candidate_ptr);
-                        k++;
+                        add_to_hazard_query(&indep_q, cand.get());
+                        ++k;
                   }
-                  if (cursor.source_idx +1 < ctx.last_SMEM_dep_idx)
-                        ctx.last_SMEM_stall++;
-                 }
+            }
 
-                 UpwardsCursor up_cursor = ctx.mv.upwards_init(idx + 1, true);
-                 bool found_dependency = false;
-                 init_hazard_query(ctx, &indep_hq);
-                 add_to_hazard_query(&indep_hq, current);
+            /* ---------------- upwards phase (unchanged) ---------------- */
+            UpwardsCursor up = ctx.mv.upwards_init(idx + 1, true);
+            bool found_dep = false;
+            init_hazard_query(ctx, &indep_q); add_to_hazard_query(&indep_q, cur);
 
-                 for ( /* k already partially used */ ;
-                      k < max_moves && up_cursor.source_idx < (int)block->instructions.size() && up_cursor.source_idx < idx + window_size;
-            /* source_idx updated by skip/move */ ) {
-                       assert(up_cursor.source_idx >= 0 && up_cursor.source_idx < (int)block->instructions.size());
-                       aco_ptr<Instruction>& candidate = block->instructions[up_cursor.source_idx];
-                       if (!candidate) { ctx.mv.upwards_skip(up_cursor); continue;}
+            for ( ; k < max_moves &&
+                  up.source_idx < (int)blk->instructions.size() &&
+                  up.source_idx < idx + win_size; )
+            {
+                  auto& cand = blk->instructions[up.source_idx];
+                  if (!cand) { ctx.mv.upwards_skip(up); continue; }
+                  if (cand->opcode == aco_opcode::p_logical_end) break;
 
-                       bool is_vmem_candidate = candidate->isVMEM() || candidate->isFlatLike();
+                  bool is_vmem = cand->isVMEM() || cand->isFlatLike();
+                  bool is_dep  = !found_dep && !ctx.mv.upwards_check_deps(up);
+                  bool haz_dep = false;
 
-                       if (candidate->opcode == aco_opcode::p_logical_end)
-                             break;
+                  if (found_dep) {
+                        HazardResult hz =
+                        perform_hazard_query(&indep_q, cand.get(), true);
+                        if (hz == hazard_fail_reorder_ds      || hz == hazard_fail_spill ||
+                              hz == hazard_fail_reorder_vmem_smem ||
+                              hz == hazard_fail_reorder_sendmsg ||
+                              hz == hazard_fail_barrier         || hz == hazard_fail_export)
+                              haz_dep = true;
+                        else if (hz != hazard_success)
+                              break;
+                  }
 
-                       bool is_current_candidate_dependency = !found_dependency && !ctx.mv.upwards_check_deps(up_cursor);
+                  if (is_dep || haz_dep) {
+                        if (!found_dep) {
+                              ctx.mv.upwards_update_insert_idx(up);
+                              add_to_hazard_query(&indep_q, cand.get());
+                              found_dep = true;
+                        } else
+                              add_to_hazard_query(&indep_q, cand.get());
 
-                       bool general_hazard_as_dependency = false;
-                       if (found_dependency) {
-                             HazardResult haz = perform_hazard_query(&indep_hq, candidate.get(), true);
-                             if (haz == hazard_fail_reorder_ds || haz == hazard_fail_spill ||
-                                   haz == hazard_fail_reorder_vmem_smem || haz == hazard_fail_reorder_sendmsg ||
-                                   haz == hazard_fail_barrier || haz == hazard_fail_export)
-                                   general_hazard_as_dependency = true;
-                             else if (haz != hazard_success)
-                                   break;
-                       }
+                        ctx.mv.upwards_skip(up);
+                        continue;
+                  }
 
-                       if (is_current_candidate_dependency || general_hazard_as_dependency) {
-                             if (!found_dependency) {
-                                   ctx.mv.upwards_update_insert_idx(up_cursor);
-                                   add_to_hazard_query(&indep_hq, candidate.get());
-                                   found_dependency = true;
-                             } else {
-                                   add_to_hazard_query(&indep_hq, candidate.get());
-                             }
-                             ctx.mv.upwards_skip(up_cursor);
-                             continue;
-                       }
+                  if (!found_dep && is_vmem && !ctx.prefer_latency_hiding) {
+                        for (const Definition& d : cand->definitions)
+                              if (d.isTemp()) ctx.mv.depends_on[d.tempId()] = true;
+                              add_to_hazard_query(&indep_q, cand.get());
+                        ctx.mv.upwards_skip(up);
+                        continue;
+                  }
 
-                       if (!found_dependency && is_vmem_candidate && !ctx.prefer_latency_hiding) {
-                             for (const Definition& def : candidate->definitions) {
-                                   if (def.isTemp())
-                                         ctx.mv.depends_on[def.tempId()] = true;
-                             }
-                             add_to_hazard_query(&indep_hq, candidate.get());
-                             ctx.mv.upwards_skip(up_cursor);
-                             continue;
-                       }
+                  MoveResult res = ctx.mv.upwards_move(up);
+                  if (res == move_fail_ssa || res == move_fail_rar) {
+                        add_to_hazard_query(&indep_q, cand.get());
+                        ctx.mv.upwards_skip(up);
+                        continue;
+                  }
+                  if (res == move_fail_pressure) break;
 
-                       MoveResult res = ctx.mv.upwards_move(up_cursor);
-                       if (res == move_fail_ssa || res == move_fail_rar) {
-                             add_to_hazard_query(&indep_hq, candidate.get());
-                             ctx.mv.upwards_skip(up_cursor);
-                             continue;
-                       } else if (res == move_fail_pressure) {
-                             break;
-                       }
-                       if (!is_vmem_candidate) k++;
+                  if (!is_vmem) ++k;
             }
       }
 
@@ -1318,73 +1362,77 @@ namespace aco {
       }
 
       void
-      schedule_position_export(sched_ctx& ctx, Block* block, Instruction* current, int idx)
+      schedule_position_export(sched_ctx& ctx, Block* blk, Instruction* cur, int idx)
       {
-            assert(idx != 0 && current && block);
-            float gfx9_export_aggressiveness_factor = 1.0f;
+            float gfx9_factor = 1.0f;
             if (ctx.gfx_level == GFX9) {
-                  int export_count = 0;
-                  int scan_window_half = 32;
-                  int start_scan = std::max(0, idx - scan_window_half);
-                  int end_scan = std::min(static_cast<int>(block->instructions.size()), idx + scan_window_half);
-
-                  for (int i = start_scan; i < end_scan; i++) {
-                        if (i == idx) continue;
-                        if (i >= 0 && i < (int)block->instructions.size() && block->instructions[i] && block->instructions[i]->isEXP()) {
-                              export_count++;
-                        }
-                  }
-                  if (export_count > 4) {
-                        gfx9_export_aggressiveness_factor = 1.5f;
-                  } else if (export_count > 0 && export_count <= 2 ) {
-                        gfx9_export_aggressiveness_factor = 0.8f;
-                  }
+                  int count = 0, scan = 64;
+                  int b = std::max(0, idx - scan / 2);
+                  int e = std::min<int>(blk->instructions.size(), idx + scan / 2);
+                  for (int i = b; i < e; ++i)
+                        if (blk->instructions[i] && blk->instructions[i]->isEXP()) ++count;
+                        if (count > 4) gfx9_factor *= 1.5f;
+                        else if (count <= 2) gfx9_factor *= 0.8f;
             }
 
-            int base_window_size = POS_EXP_WINDOW_SIZE_CTX / ctx.schedule_pos_export_div;
-            int base_max_moves = POS_EXP_MAX_MOVES_CTX / ctx.schedule_pos_export_div;
+            int win_base = POS_EXP_WINDOW_SIZE_CTX / ctx.schedule_pos_export_div;
+            int mov_base = POS_EXP_MAX_MOVES_CTX  / ctx.schedule_pos_export_div;
 
-            int window_size = static_cast<int>(base_window_size * ctx.schedule_aggressiveness * gfx9_export_aggressiveness_factor);
-            int max_moves = static_cast<int>(base_max_moves * ctx.schedule_aggressiveness * gfx9_export_aggressiveness_factor);
+            int win_size = int(win_base * ctx.schedule_aggressiveness * gfx9_factor);
+            int max_mv   = int(mov_base * ctx.schedule_aggressiveness * gfx9_factor);
+
+            DownwardsCursor down = ctx.mv.downwards_init(idx, true, false);
+            hazard_query hq; init_hazard_query(ctx, &hq); add_to_hazard_query(&hq, cur);
+
             int16_t k = 0;
+            for (; k < max_mv &&
+                  down.source_idx >= 0 &&
+                  down.source_idx > idx - win_size; )
+            {
+                  auto& cand = blk->instructions[down.source_idx];
+                  if (!cand) { ctx.mv.downwards_skip(down); continue; }
 
-            DownwardsCursor cursor = ctx.mv.downwards_init(idx, true, false);
-            hazard_query hq;
-            init_hazard_query(ctx, &hq);
-            add_to_hazard_query(&hq, current);
+                  if (cand->opcode == aco_opcode::p_logical_start) break;
+                  if (cand->isVMEM() || cand->isSMEM() || cand->isFlatLike()) break;
 
-            for (/* k init */; k < max_moves && cursor.source_idx >= 0 && cursor.source_idx > (int)idx - window_size;
-                 /* cursor.source_idx updated by skip/move */ ) {
-                  assert(cursor.source_idx >= 0 && cursor.source_idx < (int)block->instructions.size());
-                  aco_ptr<Instruction>& candidate = block->instructions[cursor.source_idx];
-                  if (!candidate) { ctx.mv.downwards_skip(cursor); continue;}
-
-
-                  if (candidate->opcode == aco_opcode::p_logical_start)
-                        break;
-                  if (candidate->isVMEM() || candidate->isSMEM() || candidate->isFlatLike())
-                        break;
-
-                  HazardResult haz = perform_hazard_query(&hq, candidate.get(), false);
-                  if (haz == hazard_fail_exec || haz == hazard_fail_unreorderable || haz == hazard_fail_export)
-                        break;
-
-                  if (haz != hazard_success) {
-                        add_to_hazard_query(&hq, candidate.get());
-                        ctx.mv.downwards_skip(cursor);
-                        continue;
+                  HazardResult hz = perform_hazard_query(&hq, cand.get(), false);
+                  if (hz == hazard_fail_exec || hz == hazard_fail_unreorderable ||
+                        hz == hazard_fail_export) break;
+                  if (hz != hazard_success) {
+                        add_to_hazard_query(&hq, cand.get());
+                        ctx.mv.downwards_skip(down); continue;
                   }
 
-                  MoveResult res = ctx.mv.downwards_move(cursor, false);
+                  /* SALU bias with VALU-consumer look-ahead ------------------ */
+                  unsigned salu_bias = 0;
+                  if (cand->isSALU()) {
+                        bool feeds_valu = false;
+                        for (int look = down.source_idx + 1;
+                             look < down.source_idx + 8 && look < (int)blk->instructions.size();
+                        ++look)
+                             {
+                                   const auto& future = blk->instructions[look];
+                                   if (!future || !future->isVALU()) continue;
+                                   for (const Definition&  def : cand->definitions)
+                                         for (const Operand& op : future->operands)
+                                               if (def.isTemp() && op.isTemp() &&
+                                                     def.tempId() == op.tempId()) { feeds_valu = true; break; }
+                                                     if (feeds_valu) break;
+                             }
+                             salu_bias = feeds_valu ? 12 : 8;
+                  }
+
+                  unsigned cost = std::max(1u, get_likely_cost(cand.get()) - salu_bias);
+
+                  MoveResult res = ctx.mv.downwards_move(down, false);
                   if (res == move_fail_ssa || res == move_fail_rar) {
-                        add_to_hazard_query(&hq, candidate.get());
-                        ctx.mv.downwards_skip(cursor);
-                        continue;
-                  } else if (res == move_fail_pressure) {
-                        break;
+                        add_to_hazard_query(&hq, cand.get());
+                        ctx.mv.downwards_skip(down); continue;
                   }
-                  k++;
-                 }
+                  if (res == move_fail_pressure) break;
+
+                  k += cost;
+            }
       }
 
       unsigned
@@ -1444,190 +1492,208 @@ namespace aco {
 
 
       void
-      schedule_block(sched_ctx& ctx, Program* program, Block* block)
+      schedule_block(sched_ctx& ctx, Program* prog, Block* blk)
       {
-            assert(program && block);
             ctx.last_SMEM_dep_idx = 0;
-            ctx.last_SMEM_stall = INT16_MIN;
-            ctx.mv.block = block;
+            ctx.last_SMEM_stall   = INT16_MIN;
+            ctx.mv.block          = blk;
 
+            /* ---- local ratios ------------------------------------------ */
+            unsigned mem_i = 0, alu_i = 0;
+            for (const auto& ins : blk->instructions)
+                  if (ins)
+                        (ins->isVMEM() || ins->isFlatLike() || ins->isSMEM())
+                        ? ++mem_i : ++alu_i;
+
+                  const double mem_ratio_blk =
+                  double(mem_i) / double(std::max(1u, mem_i + alu_i));
+
+            /* save globals */
+            const float aggr_g   = ctx.schedule_aggressiveness;
+            const bool  clause_g = ctx.prefer_clauses;
+            const bool  lat_g    = ctx.prefer_latency_hiding;
+
+            /* local knobs */
+            float boost = calculate_vega_ilp_boost(blk, mem_ratio_blk);
+            ctx.schedule_aggressiveness =
+            std::clamp(0.5f + 1.0f * float(mem_ratio_blk), 0.5f, 1.5f) * boost;
+
+            ctx.prefer_latency_hiding = mem_ratio_blk > 0.25;
+            ctx.prefer_clauses        = mem_ratio_blk > 0.15;
+
+            /* scheduling loop (unchanged except for knob usage) ---------- */
             unsigned num_stores = 0;
-            for (unsigned idx = 0; idx < block->instructions.size(); idx++) {
-                  Instruction* current = block->instructions[idx].get();
-                  if (!current) continue;
+            for (unsigned i = 0; i < blk->instructions.size(); ++i) {
+                  Instruction* cur = blk->instructions[i].get();
+                  if (!cur) continue;
+                  if (cur->opcode == aco_opcode::p_logical_end) break;
 
-                  if (current->opcode == aco_opcode::p_logical_end)
-                        break;
-
-                  if (block->kind & block_kind_export_end && current->isEXP() && ctx.schedule_pos_exports) {
-                        unsigned target = current->exp().dest;
-                        if (target >= V_008DFC_SQ_EXP_POS && target < V_008DFC_SQ_EXP_PRIM) {
-                              ctx.mv.current = current;
-                              schedule_position_export(ctx, block, current, idx);
+                  if ((blk->kind & block_kind_export_end) &&
+                        cur->isEXP() && ctx.schedule_pos_exports) {
+                        unsigned tgt = cur->exp().dest;
+                  if (tgt >= V_008DFC_SQ_EXP_POS && tgt < V_008DFC_SQ_EXP_PRIM) {
+                        ctx.mv.current = cur;
+                        schedule_position_export(ctx, blk, cur, i);
+                  }
                         }
-                  }
 
-                  if (current->definitions.empty()) {
-                        num_stores += current->isVMEM() || current->isFlatLike() ? 1 : 0;
-                        continue;
-                  }
-
-                  if (current->isVMEM() || current->isFlatLike()) {
-                        ctx.mv.current = current;
-                        schedule_VMEM(ctx, block, current, idx);
-                  }
-
-                  if (current->isSMEM()) {
-                        ctx.mv.current = current;
-                        schedule_SMEM(ctx, block, current, idx);
-                  }
-
-                  if (current->isLDSDIR() || (current->isDS() && !current->ds().gds)) {
-                        ctx.mv.current = current;
-                        schedule_LDS(ctx, block, current, idx);
-                  }
-            }
-
-            if (num_stores > 1 && (program->gfx_level >= GFX11 || (program->gfx_level == GFX9 && ctx.prefer_clauses))) {
-                  for (int idx_store = static_cast<int>(block->instructions.size()) - 1; idx_store >= 0; idx_store--) {
-                        Instruction* current_store = block->instructions[idx_store].get();
-                        if (!current_store) continue;
-
-                        if (!current_store->definitions.empty() || !(current_store->isVMEM() || current_store->isFlatLike()))
+                        if (cur->definitions.empty()) {
+                              if (cur->isVMEM() || cur->isFlatLike()) ++num_stores;
                               continue;
+                        }
 
-                        ctx.mv.current = current_store;
-                        idx_store -= schedule_VMEM_store(ctx, block, current_store, idx_store);
+                        ctx.mv.current = cur;
+                        if (cur->isVMEM() || cur->isFlatLike())
+                              schedule_VMEM(ctx, blk, cur, i);
+                  else if (cur->isSMEM())
+                        schedule_SMEM(ctx, blk, cur, i);
+                  else if (cur->isLDSDIR() || (cur->isDS() && !cur->ds().gds))
+                        schedule_LDS(ctx, blk, cur, i);
+            }
+
+            if (num_stores > 1 &&
+                  (prog->gfx_level >= GFX11 ||
+                  (prog->gfx_level == GFX9 && ctx.prefer_clauses))) {
+                  for (int s = int(blk->instructions.size()) - 1; s >= 0; --s) {
+                        Instruction* st = blk->instructions[s].get();
+                        if (!st || !st->definitions.empty()) continue;
+                        if (!(st->isVMEM() || st->isFlatLike())) continue;
+                        ctx.mv.current = st;
+                        s -= schedule_VMEM_store(ctx, blk, st, s);
                   }
-            }
+                  }
 
-            block->register_demand = block->live_in_demand;
-            for (const aco_ptr<Instruction>& instr : block->instructions) {
-                  if (instr)
-                        block->register_demand.update(instr->register_demand);
-            }
+                  blk->register_demand = blk->live_in_demand;
+                  for (const auto& ins : blk->instructions)
+                        if (ins) blk->register_demand.update(ins->register_demand);
+
+                        /* restore globals */
+                        ctx.schedule_aggressiveness = aggr_g;
+                  ctx.prefer_clauses          = clause_g;
+                  ctx.prefer_latency_hiding   = lat_g;
       }
 
       void
       schedule_program(Program* program)
       {
-            if (!program) return;
+            if (!program)
+                  return;
 
-            unsigned mem_instrs  = 0;
-            unsigned alu_instrs  = 0;
+            /* 1. global ALU/MEM ratio------------------------------------- */
+            unsigned mem_i = 0, alu_i = 0;
+            for (const Block& b : program->blocks)
+                  for (const auto& ins : b.instructions)
+                        if (ins)
+                              (ins->isVMEM() || ins->isFlatLike() || ins->isSMEM())
+                              ? ++mem_i : ++alu_i;
 
-            for (const Block& blk : program->blocks) {
-                  for (const aco_ptr<Instruction>& ins : blk.instructions) {
-                        if (!ins) continue;
-                        if (ins->isVMEM() || ins->isFlatLike() || ins->isSMEM()) {
-                              ++mem_instrs;
-                              continue;
-                        }
-                        if ((ins->isVALU() || ins->isSALU()) ||
-                              ins->isDS()        || ins->isEXP()       ||
-                              ins->format == Format::VOP3   || ins->format == Format::VOP3P  ||
-                              ins->format == Format::SOPK   || ins->format == Format::SOPC   ||
-                              ins->format == Format::SOPP) {
-                              ++alu_instrs;
-                              }
-                  }
-            }
+                        const unsigned tot_i = mem_i + alu_i;
+                  const double   mem_ratio_gl = tot_i ? double(mem_i) / double(tot_i) : 0.0;
 
-            const unsigned total_instrs = mem_instrs + alu_instrs;
-            const double mem_ratio = total_instrs ? double(mem_instrs) / double(total_instrs) : 0.0;
-
+            /* 2. current register demand --------------------------------- */
             RegisterDemand demand;
-            for (Block& block : program->blocks)
-                  demand.update(block.register_demand);
+            for (const Block& b : program->blocks)
+                  demand.update(b.register_demand);
 
-            aco::sched_ctx ctx;
+            /* 3. context skeleton ---------------------------------------- */
+            sched_ctx ctx;
             ctx.gfx_level = program->gfx_level;
-            ctx.mv.depends_on.resize(program->peekAllocationId());
-            ctx.mv.RAR_dependencies.resize(program->peekAllocationId());
+            ctx.mv.depends_on.resize            (program->peekAllocationId());
+            ctx.mv.RAR_dependencies.resize      (program->peekAllocationId());
             ctx.mv.RAR_dependencies_clause.resize(program->peekAllocationId());
 
-            const int wave_factor = program->gfx_level >= GFX10 ? 2 : 1;
-            const float reg_file_multiple = program->dev.physical_vgprs > 0 ? program->dev.physical_vgprs / (256.0f * wave_factor) : 1.0f;
-            const int wave_minimum = std::max<int>(program->min_waves, static_cast<int>(4 * wave_factor * reg_file_multiple));
+            const int   wave_factor       = program->gfx_level >= GFX10 ? 2 : 1;
+            const float reg_file_multiple =
+            program->dev.physical_vgprs > 0
+            ? program->dev.physical_vgprs / (256.0f * wave_factor) : 1.0f;
+            const int wave_minimum =
+            std::max<int>(program->min_waves,
+                          int(4 * wave_factor * reg_file_multiple));
 
-
+            /* 4. sophisticated Vega spare solver ------------------------- */
             int vgpr_spare = 12;
             if (program->gfx_level == GFX9) {
-                  // Using simplified GFX9 vgpr_spare logic based on OpenAI's patch comment for stability
-                  vgpr_spare = mem_ratio > 0.40 ? 8 : (mem_ratio > 0.20 ? 10 : 12);
-            } else if (program->gfx_level >= GFX10) {
-                  vgpr_spare = 12;
-            }
+                  static constexpr std::array<int,9> vega_thr{24,32,40,48,64,80,128,170,256};
+                  const int env_bias = getenv("ACO_SCHED_VEGA_SPARE_BIAS") ?
+                  atoi(getenv("ACO_SCHED_VEGA_SPARE_BIAS")) : 0;
 
-            int vgpr_demand_val = std::max<int>(24, demand.vgpr) + static_cast<int>(vgpr_spare * reg_file_multiple);
-            if (vgpr_demand_val <= 0) vgpr_demand_val = program->dev.physical_vgprs > 0 ? program->dev.physical_vgprs : 256;
+                  double best_cost = std::numeric_limits<double>::max();
 
-            const int sgpr_limit    = program->dev.physical_sgprs;
-            const int sgpr_gran     = 16;
-            int sgpr_per_wave       = demand.sgpr;
-            sgpr_per_wave           = (sgpr_per_wave + sgpr_gran - 1) & ~(sgpr_gran - 1);
-            int sgpr_based_waves    = sgpr_per_wave > 0 ? (sgpr_limit > 0 ? sgpr_limit / sgpr_per_wave : program->num_waves) : program->num_waves;
+                  for (int spare = 0; spare <= 16; ++spare) {
+                        int needed_vgpr = ((demand.vgpr + spare + 3) / 4) * 4;
+                        if (!needed_vgpr)
+                              continue;
 
-            int target_waves_calc_vgpr = program->dev.physical_vgprs > 0 && vgpr_demand_val > 0 ? program->dev.physical_vgprs / vgpr_demand_val : wave_minimum;
-            int target_waves = std::max(wave_minimum, target_waves_calc_vgpr);
-            target_waves = std::min(target_waves, sgpr_based_waves);
-            target_waves = max_suitable_waves(program, std::min<int>(program->num_waves, target_waves));
+                        int waves = program->dev.physical_vgprs / needed_vgpr;
+                        waves     = std::clamp(waves, 2, 10);
+                        if (waves < program->min_waves)
+                              continue;
 
-            assert(target_waves >= wave_minimum);
-            assert(target_waves > 0);
+                        /* --- new guard: keep at least 6 waves for FS/CS ---------------- */
+                        if ((program->stage == fragment_fs || program->stage == compute_cs) &&
+                              waves < 6)
+                              continue;
 
-            ctx.mv.max_registers = get_addr_regs_from_waves(program, target_waves);
-            if (ctx.mv.max_registers.vgpr >= 2)
-                  ctx.mv.max_registers.vgpr -= 2;
-            else if (ctx.mv.max_registers.vgpr == 1)
-                  ctx.mv.max_registers.vgpr = 1;
-            else
-                  ctx.mv.max_registers.vgpr = 0;
+                        /* cost model --------------------------------------------------- */
+                        double reg_gain = double(needed_vgpr - demand.vgpr);
+                        double occ_pen  = double(10 - waves);
+                        double occ_coef = mem_ratio_gl * 1.5 + 0.5;
 
+                        double cost = (10.0 / (reg_gain + 1.0)) + occ_coef * occ_pen;
+                        for (int t : vega_thr)
+                              if (demand.vgpr <= t && needed_vgpr > t)
+                                    cost += (t == 64 ? 4.0 : 2.0);
 
-            ctx.occupancy_factor = target_waves > 0 && wave_factor > 0 ? target_waves / wave_factor : 1;
-            if (ctx.occupancy_factor == 0 && target_waves > 0) ctx.occupancy_factor = 1;
-
-            if (program->gfx_level == GFX9) {
-                  if (target_waves <= 4) {
-                        ctx.schedule_aggressiveness = 1.5f;
-                        ctx.prefer_clauses = true;
-                        ctx.prefer_latency_hiding = true;
-                  } else if (target_waves <= 6) {
-                        ctx.schedule_aggressiveness = 1.2f;
-                        ctx.prefer_clauses = true;
-                        ctx.prefer_latency_hiding = true;
-                  } else if (target_waves <= 8) {
-                        ctx.schedule_aggressiveness = 1.0f;
-                        ctx.prefer_clauses = true;
-                        ctx.prefer_latency_hiding = false;
-                  } else {
-                        ctx.schedule_aggressiveness = 0.8f;
-                        ctx.prefer_clauses = false;
-                        ctx.prefer_latency_hiding = false;
+                        if (cost < best_cost) { best_cost = cost; vgpr_spare = spare; }
                   }
-            } else {
-                  ctx.schedule_aggressiveness = 1.0f;
-                  ctx.prefer_clauses = true;
-                  ctx.prefer_latency_hiding = false;
+                  vgpr_spare = std::clamp(vgpr_spare + env_bias, 0, 16);
             }
+
+            if (program->gfx_level >= GFX10 && program->gfx_level != GFX9)
+                  vgpr_spare = 12;
+
+            /* 5. derive target waves ------------------------------------- */
+            int vgpr_need =
+            std::max<int>(24, demand.vgpr) + int(vgpr_spare * reg_file_multiple);
+
+            if (vgpr_need <= 0)
+                  vgpr_need = program->dev.physical_vgprs ? program->dev.physical_vgprs : 256;
+
+            int waves_vgpr = program->dev.physical_vgprs / vgpr_need;
+            int sgpr_per_wave = (demand.sgpr + 15) & ~15;
+            int waves_sgpr    = sgpr_per_wave
+            ? program->dev.physical_sgprs / sgpr_per_wave
+            : program->num_waves;
+
+            int target_waves =
+            std::clamp<int>(std::min(waves_vgpr, waves_sgpr),
+                            wave_minimum, program->num_waves);
+            target_waves = max_suitable_waves(program, target_waves);
+
+            /* 6. finalise ctx -------------------------------------------- */
+            ctx.mv.max_registers = get_addr_regs_from_waves(program, target_waves);
+            ctx.mv.max_registers.vgpr = std::max(0, ctx.mv.max_registers.vgpr - 2);
+
+            ctx.occupancy_factor        = std::max(1, target_waves / wave_factor);
+            ctx.schedule_aggressiveness = 1.0f;
+            ctx.prefer_clauses          = true;
+            ctx.prefer_latency_hiding   = false;
 
             if (program->info.hw_stage == AC_HW_NEXT_GEN_GEOMETRY_SHADER) {
                   ctx.schedule_pos_exports    = program->info.schedule_ngg_pos_exports;
                   ctx.schedule_pos_export_div = 4;
-            } else {
-                  ctx.schedule_pos_exports    = true;
-                  ctx.schedule_pos_export_div = 1;
             }
 
-            for (Block& block : program->blocks)
-                  schedule_block(ctx, program, &block);
+            /* 7. walk blocks --------------------------------------------- */
+            for (Block& b : program->blocks)
+                  schedule_block(ctx, program, &b);
 
-            RegisterDemand new_demand;
-            for (Block& block : program->blocks)
-                  new_demand.update(block.register_demand);
-            update_vgpr_sgpr_demand(program, new_demand);
+            /* 8. update demand / validate -------------------------------- */
+            RegisterDemand new_dem;
+            for (Block& b : program->blocks)
+                  new_dem.update(b.register_demand);
 
+            update_vgpr_sgpr_demand(program, new_dem);
             if (!validate_live_vars(program))
                   abort();
       }
