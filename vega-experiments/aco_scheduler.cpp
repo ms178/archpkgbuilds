@@ -200,22 +200,48 @@ namespace aco {
 
       struct VegaMemoryScheduler {
             static constexpr int VEGA_VMEM_ISSUE_CYCLES = 4;
-            static constexpr int VEGA_L2_LATENCY = 100;
-            static constexpr int VEGA_L1_LATENCY = 16;      /* LDS / texture cache */
+            static constexpr int VEGA_L1_LATENCY = 16;      /* Vector L1 cache */
+            static constexpr int VEGA_L2_LATENCY = 100;     /* L2 cache */
+            static constexpr int VEGA_HBM2_LATENCY = 200;   /* HBM2 memory */
+            static constexpr int VEGA_MAX_WAVES_PER_SIMD = 10;
 
-            static int calculate_vmem_window(const sched_ctx& ctx, int base_window) {
+            static int calculate_vmem_window_enhanced(const sched_ctx& ctx, int base_window,
+                                                      double local_mem_ratio) {
                   int effective_waves = std::min(static_cast<int>(ctx.occupancy_factor), 8);
-                  int min_latency_hiding_slots = VEGA_L2_LATENCY / VEGA_VMEM_ISSUE_CYCLES;
-                  int wave_scaling_factor = std::max(1, (10 - effective_waves) / 2);
 
-                  /* We use a dual-window model: one window big enough to hide L1 misses,
-                   * one for L2 misses and pick the larger of the two, then compare
-                   * against the caller supplied base_window.                                                  */
-                  int l2_window = min_latency_hiding_slots * wave_scaling_factor;
-                  int l1_window = (VEGA_L1_LATENCY / VEGA_VMEM_ISSUE_CYCLES) * wave_scaling_factor;
+                  /* Calculate minimum slots needed to hide latency at each memory level */
+                  int l1_hiding_slots = VEGA_L1_LATENCY / VEGA_VMEM_ISSUE_CYCLES;      /* 4 slots */
+                  int l2_hiding_slots = VEGA_L2_LATENCY / VEGA_VMEM_ISSUE_CYCLES;      /* 25 slots */
+                  int hbm2_hiding_slots = VEGA_HBM2_LATENCY / VEGA_VMEM_ISSUE_CYCLES;  /* 50 slots */
 
-                  return std::max({base_window, l1_window, l2_window});
-            }
+                  /* Wave scaling: fewer waves need larger windows for latency hiding */
+                  /* More waves provide natural latency hiding through wave switching */
+                  float wave_scaling = 1.0f + (float(VEGA_MAX_WAVES_PER_SIMD - effective_waves) /
+                  float(VEGA_MAX_WAVES_PER_SIMD)) * 1.5f;
+
+                  /* Memory ratio scaling: more memory-bound workloads benefit from larger windows */
+                  float mem_scaling = 1.0f + (local_mem_ratio * 0.6f);
+
+                  /* Calculate windows for different cache levels */
+                  int l1_window = int(l1_hiding_slots * wave_scaling * mem_scaling);
+                  int l2_window = int(l2_hiding_slots * wave_scaling * mem_scaling);
+                  int hbm2_window = int(hbm2_hiding_slots * wave_scaling);
+
+                  /* Use the largest required window */
+                  int calculated_window = std::max({base_window, l1_window, l2_window, hbm2_window});
+
+                  /* Apply reasonable caps to prevent excessive compile time */
+                  int max_window_multiplier = (effective_waves < 4) ? 4 :
+                  (effective_waves < 6) ? 3 : 2;
+                  int max_window = base_window * max_window_multiplier;
+
+                  /* Additional cap based on local memory ratio */
+                  if (local_mem_ratio < 0.3) {
+                        max_window = std::min(max_window, base_window * 2); /* Conservative for compute-bound */
+                  }
+
+                  return std::clamp(calculated_window, base_window, max_window);
+                                                      }
       };
 
       static bool
@@ -241,31 +267,158 @@ namespace aco {
             return false;
       }
 
-      static bool
-      check_l2_page_affinity(const Instruction* i1, const Instruction* i2)
+      static unsigned get_vmem_access_size(const Instruction* instr)
       {
+            if (!instr) return 0;
+
+            /* Load operations - check definition size */
+            if (!instr->definitions.empty() && instr->definitions[0].isTemp()) {
+                  return instr->definitions[0].bytes();
+            }
+            /* Store operations - check operand size */
+            else if (instr->isVMEM() && instr->format == Format::MUBUF) {
+                  /* MUBUF store - check data operands in typical order */
+                  if (instr->operands.size() >= 4 && instr->operands[3].isTemp())
+                        return instr->operands[3].bytes();
+                  else if (instr->operands.size() >= 3 && instr->operands[2].isTemp())
+                        return instr->operands[2].bytes();
+                  else if (!instr->operands.empty() && instr->operands.back().isTemp())
+                        return instr->operands.back().bytes();
+            }
+
+            return 0;
+      }
+
+      static double calculate_local_memory_ratio_simple(const Block* blk, int center_idx) {
+            if (!blk || center_idx < 0 || center_idx >= (int)blk->instructions.size())
+                  return 0.0;
+
+            constexpr int WINDOW_SIZE = 32;
+            int start = std::max(0, center_idx - WINDOW_SIZE/2);
+            int end = std::min((int)blk->instructions.size(), center_idx + WINDOW_SIZE/2);
+
+            int mem_count = 0, total_count = 0;
+
+            for (int i = start; i < end; i++) {
+                  const auto& instr = blk->instructions[i];
+                  if (instr) {
+                        total_count++;
+                        /* Count all memory operations (VMEM, FLAT, SMEM) */
+                        if (instr->isVMEM() || instr->isFlatLike() || instr->isSMEM()) {
+                              mem_count++;
+                        }
+                  }
+            }
+
+            return total_count > 0 ? double(mem_count) / double(total_count) : 0.0;
+      }
+
+      static bool check_l2_page_affinity(const Instruction* i1, const Instruction* i2)
+      {
+            if (!i1 || !i2) return false;
+
             int64_t off1, off2;
-            if (!get_constant_vmem_offset(i1, off1) ||
-                  !get_constant_vmem_offset(i2, off2))
+            if (!get_constant_vmem_offset(i1, off1) || !get_constant_vmem_offset(i2, off2))
                   return false;
 
-            /* 0xFFF = 4095 : mask within 4 KiB page                            */
+            /* 4KiB page affinity check - simpler and more robust than exact L2 modeling */
+            /* Accesses within the same 4KiB page are likely to benefit from L2 locality */
             return ((off1 ^ off2) & ~int64_t{4095}) == 0;
       }
 
-      static float
-      calculate_vega_ilp_boost(const Block* /*blk*/, double mem_ratio)
+      static float calculate_vega_ilp_boost(const Block* blk, double mem_ratio)
       {
-            float boost =
-            getenv("ACO_SCHED_VEGA_ILP_BOOST")
-            ? std::clamp(std::atoi(getenv("ACO_SCHED_VEGA_ILP_BOOST")),
-                         0, 200) / 100.f
-                         : 1.0f;
+            /* Respect environment variable for manual tuning */
+            float base_boost = getenv("ACO_SCHED_VEGA_ILP_BOOST")
+            ? std::clamp(std::atoi(getenv("ACO_SCHED_VEGA_ILP_BOOST")), 0, 200) / 100.f
+            : 1.0f;
 
-                         if (mem_ratio > 0.60)      boost *= 1.30f;
-                               else if (mem_ratio < 0.20) boost *= 0.90f;
+            /* More granular memory ratio scaling */
+            if (mem_ratio > 0.75) {
+                  base_boost *= 1.4f;  /* Very memory-bound: aggressive scheduling */
+            } else if (mem_ratio > 0.60) {
+                  base_boost *= 1.25f; /* Memory-bound: moderately aggressive */
+            } else if (mem_ratio > 0.40) {
+                  base_boost *= 1.1f;  /* Balanced: slight boost */
+            } else if (mem_ratio < 0.20) {
+                  base_boost *= 0.85f; /* Compute-bound: more conservative */
+            }
 
-                                     return std::clamp(boost, 0.5f, 2.0f);
+            /* Additional boost for VMEM-dense blocks */
+            if (blk) {
+                  int vmem_count = 0, total_count = 0;
+                  for (const auto& instr : blk->instructions) {
+                        if (instr) {
+                              total_count++;
+                              if (instr->isVMEM() || instr->isFlatLike()) {
+                                    vmem_count++;
+                              }
+                        }
+                  }
+
+                  if (total_count > 0) {
+                        float vmem_density = float(vmem_count) / float(total_count);
+                        if (vmem_density > 0.5f) {
+                              base_boost *= 1.15f;
+                        }
+                  }
+            }
+
+            return std::clamp(base_boost, 0.5f, 2.5f);
+      }
+
+      static void adjust_vega_scheduling_context(sched_ctx& ctx, const Block* blk, double mem_ratio_blk)
+      {
+            if (ctx.gfx_level != GFX9) return;
+
+            float occupancy_factor = float(ctx.occupancy_factor) / 10.0f; // Normalize to 0-1
+
+            /* Multi-dimensional tuning based on occupancy and memory characteristics */
+
+            // High occupancy + memory-bound = more aggressive clause formation
+            if (occupancy_factor > 0.7f && mem_ratio_blk > 0.6f) {
+                  ctx.schedule_aggressiveness *= 1.1f;
+                  ctx.prefer_clauses = true;
+                  ctx.prefer_latency_hiding = true;
+            }
+
+            // Low occupancy + compute-bound = focus on register pressure
+            else if (occupancy_factor < 0.4f && mem_ratio_blk < 0.3f) {
+                  ctx.schedule_aggressiveness *= 0.9f;
+                  ctx.prefer_clauses = false;
+                  /* Keep prefer_latency_hiding as-is since we still want some ILP */
+            }
+
+            // Medium occupancy + very memory-bound = prioritize memory coalescing
+            else if (occupancy_factor >= 0.4f && occupancy_factor <= 0.7f && mem_ratio_blk > 0.8f) {
+                  ctx.prefer_clauses = true;
+                  ctx.schedule_aggressiveness *= 1.05f; /* Slight boost */
+            }
+
+            /* Additional VMEM density consideration for fine-tuning */
+            if (blk) {
+                  int vmem_count = 0, total_count = 0;
+                  for (const auto& instr : blk->instructions) {
+                        if (instr) {
+                              total_count++;
+                              if (instr->isVMEM() || instr->isFlatLike()) {
+                                    vmem_count++;
+                              }
+                        }
+                  }
+
+                  if (total_count > 0) {
+                        float vmem_density = float(vmem_count) / float(total_count);
+                        if (vmem_density > 0.6f) {
+                              /* Very VMEM-dense blocks benefit from aggressive scheduling */
+                              ctx.schedule_aggressiveness *= 1.08f;
+                              ctx.prefer_clauses = true;
+                        }
+                  }
+            }
+
+            /* Clamp to reasonable bounds to prevent runaway values */
+            ctx.schedule_aggressiveness = std::clamp(ctx.schedule_aggressiveness, 0.5f, 2.0f);
       }
 
       struct MemoryPatternAnalyzer {
@@ -847,73 +1000,92 @@ namespace aco {
                   }
       }
 
-      bool should_form_clause_vega_enhanced(const Instruction* a,
-                                            const Instruction* b,
-                                            amd_gfx_level       gfx_level,
-                                            const sched_ctx&    ctx)
+      // Complete replacement for should_form_clause_vega_enhanced
+      bool should_form_clause_vega_enhanced(const Instruction* a, const Instruction* b,
+                                            amd_gfx_level gfx_level, const sched_ctx& ctx)
       {
-            /* generic, architecture independent check first */
+            /* Generic, architecture independent check first */
             if (!a || !b || !should_form_clause(a, b))
                   return false;
 
             /* ---  Vega / GFX9 specific heuristics  -------------------------------- */
             if (gfx_level == GFX9) {
-                  /* --- VMEM vs VMEM --------------------------------------------------- */
+                  /* --- VMEM vs VMEM with comprehensive HBM2 and L2 awareness -------- */
                   if (a->isVMEM() && b->isVMEM()) {
-                        /* same descriptor?  -> always fine                                 */
+                        /* Same descriptor? -> apply advanced memory hierarchy optimizations */
                         if (a->operands.size() > 0 && b->operands.size() > 0 &&
-                              a->operands[0].isTemp()    && b->operands[0].isTemp() &&
-                              a->operands[0].tempId()    == b->operands[0].tempId()) {
+                              a->operands[0].isTemp() && b->operands[0].isTemp() &&
+                              a->operands[0].tempId() == b->operands[0].tempId()) {
 
-                              /* check constant offsets to decide *how* good it is…            */
-                              if (a->operands.size() > 1 && b->operands.size() > 1 &&
-                                    a->operands[1].isConstant() && b->operands[1].isConstant()) {
-                                    int64_t off_a = a->operands[1].constantValue();
-                              int64_t off_b = b->operands[1].constantValue();
-                        int64_t diff  = std::abs(off_a - off_b);
+                              int64_t off_a, off_b;
+                        if (get_constant_vmem_offset(a, off_a) && get_constant_vmem_offset(b, off_b)) {
 
-                        /* keep accesses inside 256-byte window – that maps nicely to
-                         * 4 consecutive 64-byte cache lines and is what the hardware
-                         * prefetcher looks at.                                       */
-                        if (diff <= 256) {
-                              /* reward perfect sequential pattern even more */
-                              unsigned size_a = 0;
-                              if (!a->definitions.empty() && a->definitions[0].isTemp())
-                                    size_a = a->definitions[0].bytes();
-                              else if (a->isVMEM() && a->format == Format::MUBUF) { // Store heuristic
-                                    if(a->operands.size() >= 4 && a->operands[3].isTemp())
-                                          size_a = a->operands[3].bytes();
-                                    else if(a->operands.size() >= 3 && a->operands[2].isTemp())
-                                          size_a = a->operands[2].bytes();
-                                    else if (!a->operands.empty() && a->operands.back().isTemp())
-                                          size_a = a->operands.back().bytes();
+                              /* HBM2 channel affinity check (bits [8:6]) */
+                              int channel_a = (off_a >> 6) & 7;
+                              int channel_b = (off_b >> 6) & 7;
+
+                              if (channel_a != channel_b) {
+                                    /* Different HBM2 channels - excellent for parallel access */
+                                    return true;
                               }
 
-                              if (size_a > 0 && off_b == off_a + size_a)
-                                    return true;                /* perfect seq */
-                                    return true;                   /* still good   */
+                              /* Same channel - check for bank conflicts (bits [11:9]) */
+                              int bank_a = (off_a >> 9) & 7;
+                              int bank_b = (off_b >> 9) & 7;
+
+                              if (bank_a == bank_b) {
+                                    /* Same bank within same channel - potential conflict */
+                                    /* Only clause if very close together (same cache line) */
+                                    int64_t diff = std::abs(off_a - off_b);
+                                    if (diff <= 64) return true;  /* Within cache line */
+
+                                          /* Fallback: check for L2 page affinity */
+                                          return check_l2_page_affinity(a, b);
+                              }
+
+                              /* Different banks, same channel - still good */
+                              int64_t diff = std::abs(off_a - off_b);
+                              if (diff <= 256) {
+                                    /* Enhanced sequential pattern detection */
+                                    unsigned size_a = get_vmem_access_size(a);
+                                    if (size_a > 0 && off_b == off_a + size_a)
+                                          return true;  /* Perfect sequential access */
+                                          return true;      /* Good locality within channel */
+                              }
                         }
-                                    }
-                                    /* same descriptor but unknown offsets – still beneficial        */
-                                    return true;
+                        /* Same descriptor but unknown offsets – still beneficial */
+                        return true;
                               }
                   }
 
-                  /* --- FLAT vs FLAT --------------------------------------------------- */
+                  /* --- Enhanced MIMG texture cache optimization ------------------- */
+                  if (a->format == Format::MIMG && b->format == Format::MIMG) {
+                        /* Check if both use same texture descriptor (typically operand 2) */
+                        if (a->operands.size() > 2 && b->operands.size() > 2 &&
+                              a->operands[2].isTemp() && b->operands[2].isTemp() &&
+                              a->operands[2].tempId() == b->operands[2].tempId()) {
+                              return true; /* Same texture descriptor - excellent for texture cache */
+                              }
+                  }
+
+                  /* --- FLAT vs FLAT with L2 page affinity ------------------------- */
                   if (a->isFlatLike() && b->isFlatLike()) {
-                        /* identical base pointer => likely same page                       */
+                        /* Identical base pointer => likely same page */
                         if (a->operands.size() > 0 && b->operands.size() > 0 &&
                               a->operands[0].isTemp() && b->operands[0].isTemp() &&
-                              a->operands[0].tempId() == b->operands[0].tempId())
-                              return true;
+                              a->operands[0].tempId() == b->operands[0].tempId()) {
 
-                        /* otherwise let ‘prefer_clauses’ policy decide                     */
-                        return ctx.prefer_clauses;
+                              /* Apply L2 page affinity check for FLAT operations */
+                              if (check_l2_page_affinity(a, b))
+                                    return true;
+                              }
+
+                              /* Otherwise let 'prefer_clauses' policy decide */
+                              return ctx.prefer_clauses;
                   }
             }
 
-            /* default fall-through for non-Vega chips or instructions that do not
-             * match our extra heuristics.                                            */
+            /* Default fall-through for non-Vega chips or other instruction types */
             return true;
       }
 
@@ -1090,25 +1262,28 @@ namespace aco {
             ctx.last_SMEM_stall = smem_base - static_cast<int16_t>(ctx.occupancy_factor) - k;
       }
 
-      void
-      schedule_VMEM(sched_ctx& ctx, Block* blk, Instruction* cur, int idx)
+      void schedule_VMEM_enhanced(sched_ctx& ctx, Block* blk, Instruction* cur, int idx)
       {
             const float aggr = ctx.schedule_aggressiveness;
 
+            /* Calculate enhanced VMEM window for GFX9 */
             int base_win = VMEM_WINDOW_SIZE_CTX;
-            if (ctx.gfx_level == GFX9)
-                  base_win = VegaMemoryScheduler::calculate_vmem_window(ctx, base_win);
+            if (ctx.gfx_level == GFX9) {
+                  double local_mem_ratio = calculate_local_memory_ratio_simple(blk, idx);
+                  base_win = VegaMemoryScheduler::calculate_vmem_window_enhanced(ctx, base_win, local_mem_ratio);
+            }
 
-            const int win_size  = int(base_win           * aggr);
+            const int win_size  = int(base_win * aggr);
             const int max_moves = int(VMEM_MAX_MOVES_CTX * aggr);
 
             int base_clause = VMEM_CLAUSE_MAX_GRAB_DIST_CTX;
             int clause_dist = int(base_clause * (ctx.prefer_clauses ? aggr : 1.0f));
 
+            /* Enhanced clause distance for GFX9 based on access patterns */
             if (ctx.gfx_level == GFX9 && idx + 1 < (int)blk->instructions.size()) {
                   auto pat = MemoryPatternAnalyzer::analyze_vmem_pattern(blk, idx + 1, 64);
                   if (pat.pattern == MemoryPatternAnalyzer::PATTERN_SEQUENTIAL)
-                        clause_dist *= 3;                 /* even more aggressive         */
+                        clause_dist *= 3;                   /* Very aggressive for sequential */
                         else if (pat.pattern == MemoryPatternAnalyzer::PATTERN_STRIDED) {
                               if (pat.stride <= 32)        clause_dist *= 2;
                               else if (pat.stride <= 128)  clause_dist = int(clause_dist * 1.7f);
@@ -1124,7 +1299,7 @@ namespace aco {
             bool only_clauses = false;
             int16_t k = 0;
 
-            /* ---------------- downwards phase -------------------------- */
+            /* ---------------- downwards phase with L2 affinity bonus ----------- */
             for ( ; k < max_moves &&
                   cur_d.source_idx >= 0 &&
                   cur_d.source_idx > idx - win_size; )
@@ -1138,32 +1313,23 @@ namespace aco {
                         (cur->isFlatLike() && cand->isFlatLike()))
                   {
                         int grab = (cur_d.insert_idx_clause - 1) - cur_d.source_idx;
-                        if (grab < clause_dist &&
-                              should_form_clause_vega_enhanced(cur, cand.get(),
-                                                               ctx.gfx_level, ctx))
+                        int effective_clause_dist = clause_dist;
+
+                        /* L2 cache affinity bonus - double grab distance for L2-friendly accesses */
+                        if (ctx.gfx_level == GFX9 && check_l2_page_affinity(cur, cand.get())) {
+                              effective_clause_dist *= 2;
+                        }
+
+                        if (grab < effective_clause_dist &&
+                              should_form_clause_vega_enhanced(cur, cand.get(), ctx.gfx_level, ctx))
                         {
-                              /* 128-B super gather & 4 KiB page affinity --------------- */
-                              int64_t off_first, off_cand;
-                              bool c0 = get_constant_vmem_offset(cur, off_first);
-                              bool c1 = get_constant_vmem_offset(cand.get(), off_cand);
-                              bool same_desc =
-                              cur->operands[0].isTemp() && cand->operands[0].isTemp() &&
-                              cur->operands[0].tempId() == cand->operands[0].tempId();
-
-                              bool same128 = c0 && c1 && same_desc &&
-                              ((off_first ^ off_cand) & ~127) == 0;
-                              bool same4k  = c0 && c1 && same_desc &&
-                              ((off_first ^ off_cand) & ~4095) == 0;
-
-                              int extra = same128 ? 8 : (same4k ? 4 : 0);
-                              part_clause = grab < clause_dist + extra;
+                              part_clause = true;
                         }
                   }
 
                   bool can_move = !cand->isVMEM() || part_clause || cand->definitions.empty();
-                  HazardResult hz =
-                  perform_hazard_query(part_clause ? &clause_q : &indep_q,
-                                       cand.get(), false);
+                  HazardResult hz = perform_hazard_query(part_clause ? &clause_q : &indep_q,
+                                                         cand.get(), false);
                   if (hz == hazard_fail_reorder_ds || hz == hazard_fail_spill ||
                         hz == hazard_fail_reorder_sendmsg || hz == hazard_fail_barrier ||
                         hz == hazard_fail_export)
@@ -1214,8 +1380,7 @@ namespace aco {
                   bool haz_dep = false;
 
                   if (found_dep) {
-                        HazardResult hz =
-                        perform_hazard_query(&indep_q, cand.get(), true);
+                        HazardResult hz = perform_hazard_query(&indep_q, cand.get(), true);
                         if (hz == hazard_fail_reorder_ds      || hz == hazard_fail_spill ||
                               hz == hazard_fail_reorder_vmem_smem ||
                               hz == hazard_fail_reorder_sendmsg ||
@@ -1490,30 +1655,27 @@ namespace aco {
             return skip;
       }
 
-
-      void
-      schedule_block(sched_ctx& ctx, Program* prog, Block* blk)
+      void schedule_block(sched_ctx& ctx, Program* prog, Block* blk)
       {
             ctx.last_SMEM_dep_idx = 0;
             ctx.last_SMEM_stall   = INT16_MIN;
             ctx.mv.block          = blk;
 
-            /* ---- local ratios ------------------------------------------ */
+            /* ---- Calculate block-level memory characteristics ---- */
             unsigned mem_i = 0, alu_i = 0;
             for (const auto& ins : blk->instructions)
                   if (ins)
                         (ins->isVMEM() || ins->isFlatLike() || ins->isSMEM())
                         ? ++mem_i : ++alu_i;
 
-                  const double mem_ratio_blk =
-                  double(mem_i) / double(std::max(1u, mem_i + alu_i));
+                  const double mem_ratio_blk = double(mem_i) / double(std::max(1u, mem_i + alu_i));
 
-            /* save globals */
+            /* Save global context */
             const float aggr_g   = ctx.schedule_aggressiveness;
             const bool  clause_g = ctx.prefer_clauses;
             const bool  lat_g    = ctx.prefer_latency_hiding;
 
-            /* local knobs */
+            /* Apply enhanced ILP boost calculation */
             float boost = calculate_vega_ilp_boost(blk, mem_ratio_blk);
             ctx.schedule_aggressiveness =
             std::clamp(0.5f + 1.0f * float(mem_ratio_blk), 0.5f, 1.5f) * boost;
@@ -1521,7 +1683,12 @@ namespace aco {
             ctx.prefer_latency_hiding = mem_ratio_blk > 0.25;
             ctx.prefer_clauses        = mem_ratio_blk > 0.15;
 
-            /* scheduling loop (unchanged except for knob usage) ---------- */
+            /* Apply Vega-specific context fine-tuning ONCE per block */
+            if (ctx.gfx_level == GFX9) {
+                  adjust_vega_scheduling_context(ctx, blk, mem_ratio_blk);
+            }
+
+            /* Main scheduling loop with enhanced functions */
             unsigned num_stores = 0;
             for (unsigned i = 0; i < blk->instructions.size(); ++i) {
                   Instruction* cur = blk->instructions[i].get();
@@ -1544,13 +1711,14 @@ namespace aco {
 
                         ctx.mv.current = cur;
                         if (cur->isVMEM() || cur->isFlatLike())
-                              schedule_VMEM(ctx, blk, cur, i);
-                  else if (cur->isSMEM())
-                        schedule_SMEM(ctx, blk, cur, i);
+                              schedule_VMEM_enhanced(ctx, blk, cur, i);  /* Use enhanced version */
+                              else if (cur->isSMEM())
+                                    schedule_SMEM(ctx, blk, cur, i);
                   else if (cur->isLDSDIR() || (cur->isDS() && !cur->ds().gds))
                         schedule_LDS(ctx, blk, cur, i);
             }
 
+            /* Enhanced store scheduling for GFX9 */
             if (num_stores > 1 &&
                   (prog->gfx_level >= GFX11 ||
                   (prog->gfx_level == GFX9 && ctx.prefer_clauses))) {
@@ -1567,7 +1735,7 @@ namespace aco {
                   for (const auto& ins : blk->instructions)
                         if (ins) blk->register_demand.update(ins->register_demand);
 
-                        /* restore globals */
+                        /* Restore global context */
                         ctx.schedule_aggressiveness = aggr_g;
                   ctx.prefer_clauses          = clause_g;
                   ctx.prefer_latency_hiding   = lat_g;
