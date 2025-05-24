@@ -1,46 +1,36 @@
-/*
- * Copyright © 2018 Valve Corporation
- *
- * SPDX-License-Identifier: MIT
- */
-
 #include "aco_builder.h"
 #include "aco_ir.h"
 
 #include "common/amdgfxregs.h"
 
 #include <algorithm>
-#include <cassert>   // For assert()
-#include <cstring>   // For memset
+#include <cassert>
+#include <cstring>
 #include <vector>
-#include <cmath>     // For std::abs
-#include <tuple>     // For std::tuple
-#include <initializer_list> // For std::min with initializer list
-#include <limits>    // For std::numeric_limits
+#include <cmath>
+#include <tuple>
+#include <initializer_list>
+#include <limits>
+#include <memory>
+#include <functional>
+#include <unordered_set>
 
-/* ------------------------------------------------------------------------
- * Forward declarations for helpers that live in other compilation units.
- * ----------------------------------------------------------------------*/
 namespace aco {
-      // These are assumed to be defined in aco_ir.cpp or similar
-      // bool   is_done_sendmsg(amd_gfx_level, const Instruction*);
-      // bool   is_pos_prim_export(amd_gfx_level, const Instruction*);
-      // memory_sync_info get_sync_info_with_hack(const Instruction*);
-
-      /*  Forward declaration for the generic clause helper that lives in another
-       *  compilation unit.  Required so we can call it in our Vega-enhanced
-       *  wrapper. */
       bool should_form_clause(const Instruction* a, const Instruction* b);
 
-} // namespace aco
+      class InstructionPropertyCache;
+      class VegaClauseEvaluator;
+      class SimplePatternScheduler;
+      struct sched_ctx;
+      struct MoveState;
+      struct DownwardsCursor;
+      struct UpwardsCursor;
+      struct memory_event_set;
+      struct hazard_query;
+      struct MemoryPatternAnalyzer;
+      struct VegaMemoryScheduler;
+}
 
-
-/* ------------------------------------------------------------------------
- *  Tiny helper: move a single element inside a contiguous container while
- *  keeping the relative order of every other element.  Implemented with
- *  std::rotate() which is linear in the distance moved and requires no
- *  additional storage.
- * ----------------------------------------------------------------------*/
 namespace aco {
 
       template<class Iter>
@@ -49,14 +39,12 @@ namespace aco {
             assert(old_idx >= 0 && new_idx >= 0);
             assert(old_idx != new_idx);
 
-            if (new_idx > old_idx)       /* move *down* (towards the back) */
+            if (new_idx > old_idx)
                   std::rotate(begin + old_idx, begin + old_idx + 1, begin + new_idx);
-            else                         /* move *up* (towards the front)  */
+            else
                   std::rotate(begin + new_idx, begin + old_idx,     begin + old_idx + 1);
       }
 
-      /* Small convenience wrapper so the original call-sites do not have to change
-       * if we ever replace the implementation. */
       template<class Iter>
       static inline void move_element(Iter b, int from, int to)
       {
@@ -64,33 +52,431 @@ namespace aco {
             move_element_impl(b, from, to);
       }
 
-} // namespace aco
+      static bool
+      get_constant_vmem_offset(const Instruction* instr, int64_t& out_off)
+      {
+            if (!instr)
+                  return false;
+
+            if (instr->operands.size() > 1 && instr->operands[1].isConstant()) {
+                  out_off = instr->operands[1].constantValue();
+                  return true;
+            }
+
+            for (unsigned i = 2; i < instr->operands.size(); ++i) {
+                  if (instr->operands[i].isConstant()) {
+                        out_off = instr->operands[i].constantValue();
+                        return true;
+                  }
+            }
+            return false;
+      }
+
+      static unsigned get_vmem_access_size(const Instruction* instr)
+      {
+            if (!instr) return 0;
+
+            if (!instr->definitions.empty() && instr->definitions[0].isTemp()) {
+                  return instr->definitions[0].bytes();
+            }
+            else if (instr->isVMEM() && instr->format == Format::MUBUF) {
+                  if (instr->operands.size() >= 4 && instr->operands[3].isTemp())
+                        return instr->operands[3].bytes();
+                  else if (instr->operands.size() >= 3 && instr->operands[2].isTemp())
+                        return instr->operands[2].bytes();
+                  else if (!instr->operands.empty() && instr->operands.back().isTemp())
+                        return instr->operands.back().bytes();
+            }
+            return 0;
+      }
+
+      class InstructionPropertyCache {
+      private:
+            struct CachedProperties {
+                  int64_t constant_offset;
+                  uint16_t access_size;
+                  uint8_t has_constant_offset : 1;
+                  uint8_t access_size_valid : 1;
+                  uint8_t reserved : 6;
+            };
+
+            static constexpr size_t CACHE_SIZE = 512;
+            static constexpr size_t CACHE_MASK = CACHE_SIZE - 1;
+
+            struct Entry {
+                  const Instruction* key = nullptr;
+                  CachedProperties props = {};
+            };
+
+            alignas(64) Entry cache[CACHE_SIZE];
+
+            void reset_entry(Entry& e, const Instruction* new_key) {
+                  e.key = new_key;
+                  e.props = {};
+            }
+
+      public:
+            InstructionPropertyCache() {
+                  std::memset(cache, 0, sizeof(cache));
+            }
+
+            bool get_constant_offset(const Instruction* instr, int64_t& offset) {
+                  size_t idx = (reinterpret_cast<uintptr_t>(instr) >> 3) & CACHE_MASK;
+                  Entry& e = cache[idx];
+
+                  if (e.key == instr && e.props.has_constant_offset) {
+                        offset = e.props.constant_offset;
+                        return true;
+                  }
+
+                  if (e.key != instr) {
+                        reset_entry(e, instr);
+                  }
+
+                  bool valid = aco::get_constant_vmem_offset(instr, offset);
+                  e.props.constant_offset = offset;
+                  e.props.has_constant_offset = valid ? 1 : 0;
+
+                  return valid;
+            }
+
+            uint16_t get_access_size(const Instruction* instr) {
+                  size_t idx = (reinterpret_cast<uintptr_t>(instr) >> 3) & CACHE_MASK;
+                  Entry& e = cache[idx];
+
+                  if (e.key == instr && e.props.access_size_valid) {
+                        return e.props.access_size;
+                  }
+
+                  if (e.key != instr) {
+                        reset_entry(e, instr);
+                  }
+
+                  uint16_t size = aco::get_vmem_access_size(instr);
+                  e.props.access_size = size;
+                  e.props.access_size_valid = 1;
+
+                  return size;
+            }
+
+            void prefetch(const Instruction* instr) {
+                  if (instr) {
+                        size_t idx = (reinterpret_cast<uintptr_t>(instr) >> 3) & CACHE_MASK;
+                        __builtin_prefetch(&cache[idx], 0, 1);
+                  }
+            }
+      };
+
+      enum MoveResult {
+            move_success,
+            move_fail_ssa,
+            move_fail_rar,
+            move_fail_pressure,
+      };
+
+      struct MoveState {
+            RegisterDemand max_registers;
+            Block* block;
+            Instruction* current;
+            bool improved_rar;
+            std::vector<uint8_t> depends_on;
+            std::vector<uint8_t> RAR_dependencies;
+            std::vector<uint8_t> RAR_dependencies_clause;
+
+            DownwardsCursor downwards_init(int current_idx, bool improved_rar, bool may_form_clauses);
+            MoveResult downwards_move(DownwardsCursor&, bool clause);
+            void downwards_skip(DownwardsCursor&);
+            UpwardsCursor upwards_init(int source_idx, bool improved_rar);
+            bool upwards_check_deps(UpwardsCursor&);
+            void upwards_update_insert_idx(UpwardsCursor&);
+            MoveResult upwards_move(UpwardsCursor&);
+            void upwards_skip(UpwardsCursor&);
+      };
+
+      struct sched_ctx {
+            amd_gfx_level gfx_level;
+            int16_t occupancy_factor;
+            int16_t last_SMEM_stall;
+            int last_SMEM_dep_idx;
+            MoveState mv;
+            bool schedule_pos_exports = true;
+            unsigned schedule_pos_export_div = 1;
+            float schedule_aggressiveness = 1.0f;
+            bool prefer_clauses = true;
+            bool prefer_latency_hiding = false;
+
+            std::unique_ptr<InstructionPropertyCache> prop_cache;
+            std::unique_ptr<VegaClauseEvaluator> clause_eval;
+            std::unique_ptr<SimplePatternScheduler> pattern_scheduler;
+
+            void init_caches();
+      };
 
 
-// Using CTX suffix to denote these are context-dependent and need careful use
-#define SMEM_WINDOW_SIZE_CTX    (256 - ctx.occupancy_factor * 16)
-#define VMEM_WINDOW_SIZE_CTX    (1024 - ctx.occupancy_factor * 64)
-#define POS_EXP_WINDOW_SIZE_CTX 512
-#define SMEM_MAX_MOVES_CTX      (128 - ctx.occupancy_factor * 8)
-#define VMEM_MAX_MOVES_CTX      (256 - ctx.occupancy_factor * 16)
-#define LDSDIR_MAX_MOVES_CTX    10
-#define LDS_MAX_MOVES_CTX       32
-#define VMEM_CLAUSE_MAX_GRAB_DIST_CTX       (ctx.occupancy_factor * 2)
-#define VMEM_STORE_CLAUSE_MAX_GRAB_DIST_CTX (ctx.occupancy_factor * 4)
-#define POS_EXP_MAX_MOVES_CTX         512
+      class VegaClauseEvaluator {
+      private:
+            InstructionPropertyCache& cache;
+
+            static constexpr int VEGA_HBM2_CHANNELS = 8;
+            static constexpr int VEGA_CHANNEL_INTERLEAVE = 256;
+            static constexpr int VEGA_L1_LINE_SIZE = 64;
+            static constexpr int VEGA_L2_SECTOR_SIZE = 64;
+            static constexpr int VEGA_BANK_STRIDE = 4;
+            static constexpr int VEGA_BANK_COUNT = 32;
+
+            static int get_hbm2_channel(int64_t addr) {
+                  return (addr / VEGA_CHANNEL_INTERLEAVE) % VEGA_HBM2_CHANNELS;
+            }
+
+            static int get_l1_bank(int64_t addr) {
+                  return (addr / VEGA_BANK_STRIDE) % VEGA_BANK_COUNT;
+            }
+
+      public:
+            VegaClauseEvaluator(InstructionPropertyCache& c) : cache(c) {}
+
+            enum ClauseScore {
+                  CLAUSE_BAD = 0,
+                  CLAUSE_NEUTRAL = 1,
+                  CLAUSE_GOOD = 2,
+                  CLAUSE_EXCELLENT = 3
+            };
+
+            ClauseScore evaluate_clause(const Instruction* a, const Instruction* b,
+                                        const sched_ctx& ctx) {
+                  if (!a || !b || a->operands.empty() || b->operands.empty())
+                        return CLAUSE_BAD;
+
+                  if (!a->operands[0].isTemp() || !b->operands[0].isTemp() ||
+                        a->operands[0].tempId() != b->operands[0].tempId())
+                        return CLAUSE_BAD;
+
+                  int64_t offset_a, offset_b;
+                  if (!cache.get_constant_offset(a, offset_a) ||
+                        !cache.get_constant_offset(b, offset_b))
+                        return CLAUSE_NEUTRAL;
+
+                  int64_t diff = offset_b - offset_a;
+                  int64_t abs_diff = std::abs(diff);
+
+                  uint16_t size_a = cache.get_access_size(a);
+                  if (diff == size_a && size_a > 0) {
+                        return CLAUSE_EXCELLENT;
+                  }
+
+                  if (abs_diff < VEGA_L1_LINE_SIZE) {
+                        int bank_a = get_l1_bank(offset_a);
+                        int bank_b = get_l1_bank(offset_b);
+                        if (bank_a != bank_b) {
+                              return CLAUSE_EXCELLENT;
+                        }
+                        if (abs_diff >= VEGA_BANK_STRIDE * 2) {
+                              return CLAUSE_GOOD;
+                        } else if (abs_diff >= VEGA_BANK_STRIDE) {
+                              return CLAUSE_NEUTRAL;
+                        } else {
+                              return CLAUSE_BAD;
+                        }
+                  }
+
+                  if (abs_diff < 256) {
+                        int chan_a = get_hbm2_channel(offset_a);
+                        int chan_b = get_hbm2_channel(offset_b);
+
+                        if (chan_a != chan_b) {
+                              return CLAUSE_GOOD;
+                        }
+
+                        if (abs_diff < 128) {
+                              return CLAUSE_NEUTRAL;
+                        }
+                  }
+
+                  bool same_page = ((offset_a ^ offset_b) & ~0xFFF) == 0;
+                  if (same_page && abs_diff < 2048) {
+                        if (ctx.occupancy_factor >= 6) {
+                              return CLAUSE_GOOD;
+                        } else {
+                              if (abs_diff < 512) {
+                                    return CLAUSE_NEUTRAL;
+                              }
+                        }
+                  }
+                  return CLAUSE_BAD;
+                                        }
+
+                                        bool should_form_clause(const Instruction* a, const Instruction* b,
+                                                                const sched_ctx& ctx) {
+                                              ClauseScore score = evaluate_clause(a, b, ctx);
+                                              ClauseScore min_score = ctx.prefer_clauses ? CLAUSE_NEUTRAL : CLAUSE_GOOD;
+
+                                              if (ctx.occupancy_factor >= 8 && ctx.prefer_clauses) {
+                                                    min_score = std::max(min_score, CLAUSE_GOOD);
+                                              }
+                                              return score >= min_score;
+                                                                }
+      };
+
+      class SimplePatternScheduler {
+      public:
+            struct PatternInfo {
+                  enum Type { SEQUENTIAL, STRIDED, RANDOM };
+                  Type type;
+                  float confidence;
+                  int stride;
+                  int sample_count;
+            };
+      private:
+            InstructionPropertyCache& cache;
+            VegaClauseEvaluator& evaluator;
 
 
-namespace aco {
+            PatternInfo detect_pattern_robust(const Block* block, int center, int window) {
+                  PatternInfo info = {PatternInfo::RANDOM, 0.0f, 0, 0};
+                  std::vector<std::pair<int, int64_t>> offset_pairs;
 
-      // Forward declarations within aco namespace
-      class Block;
-      class Program;
-      class Instruction;
-      struct sched_ctx;
+                  for (int i = std::max(0, center - window/2);
+                       i < std::min((int)block->instructions.size(), center + window/2); i++) {
+                        auto* instr = block->instructions[i].get();
+                        if (!instr || !instr->isVMEM()) continue;
 
-      /* ------------------------------------------------------------------
-       * 1.  Complete helper data-structures for hazard querying
-       * ----------------------------------------------------------------*/
+                        int64_t offset;
+                        if (cache.get_constant_offset(instr, offset)) {
+                              offset_pairs.push_back({i, offset});
+                        }
+                       }
+
+                       info.sample_count = offset_pairs.size();
+                       if (offset_pairs.size() < 3) return info;
+
+                       std::vector<int64_t> strides;
+                  for (size_t i = 1; i < offset_pairs.size(); i++) {
+                        strides.push_back(offset_pairs[i].second - offset_pairs[i-1].second);
+                  }
+
+                  if (strides.empty()) return info;
+
+                  std::sort(strides.begin(), strides.end());
+                  int64_t common_stride = strides[0];
+                  int max_count = 1, current_count = 1;
+
+                  for (size_t i = 1; i < strides.size(); i++) {
+                        if (strides[i] == strides[i-1]) {
+                              current_count++;
+                        } else {
+                              if (current_count > max_count) {
+                                    max_count = current_count;
+                                    common_stride = strides[i-1];
+                              }
+                              current_count = 1;
+                        }
+                  }
+                  if (current_count > max_count) {
+                        max_count = current_count;
+                        common_stride = strides.back();
+                  }
+
+
+                  info.confidence = float(max_count) / float(strides.size());
+                  info.stride = common_stride;
+
+                  if (info.confidence > 0.75f) {
+                        uint16_t access_size = 0;
+                        if (!offset_pairs.empty()) {
+                              access_size = cache.get_access_size(block->instructions[offset_pairs[0].first].get());
+                        }
+                        if (common_stride > 0 && common_stride == access_size && access_size > 0) {
+                              info.type = PatternInfo::SEQUENTIAL;
+                        } else if (common_stride > 0 && common_stride <= 64) {
+                              info.type = PatternInfo::SEQUENTIAL;
+                        } else if (common_stride > 0 && common_stride <= 4096) {
+                              info.type = PatternInfo::STRIDED;
+                        }
+                  }
+                  return info;
+            }
+
+            float calculate_clause_threshold_adjustment(float clause_bias,
+                                                        VegaClauseEvaluator::ClauseScore score) {
+                  if (score == VegaClauseEvaluator::CLAUSE_BAD ||
+                        score == VegaClauseEvaluator::CLAUSE_EXCELLENT)
+                        return 0.0f;
+
+                  if (score == VegaClauseEvaluator::CLAUSE_NEUTRAL) {
+                        return clause_bias;
+                  } else {
+                        return clause_bias * 0.5f;
+                  }
+                                                        }
+
+                                                        void schedule_VMEM_enhanced_with_pattern_bias(
+                                                              sched_ctx& ctx, Block* block, Instruction* current, int idx,
+                                                              float clause_bias, const PatternInfo& pattern);
+
+      public:
+            SimplePatternScheduler(InstructionPropertyCache& c, VegaClauseEvaluator& e)
+            : cache(c), evaluator(e) {}
+
+            void schedule_vmem_adaptive(sched_ctx& ctx, Block* block,
+                                        Instruction* current, int idx) {
+                  PatternInfo pattern_info = detect_pattern_robust(block, idx, 28);
+                  float aggressiveness_factor = 1.0f;
+                  float dynamic_clause_bias = 0.0f;
+
+                  if (pattern_info.confidence > 0.6f && pattern_info.sample_count >= 5) {
+                        switch (pattern_info.type) {
+                              case PatternInfo::SEQUENTIAL:
+                                    aggressiveness_factor = 1.0f + 0.3f * pattern_info.confidence;
+                                    dynamic_clause_bias = 0.4f * pattern_info.confidence;
+                                    break;
+                              case PatternInfo::STRIDED:
+                                    if (pattern_info.stride <= 256) {
+                                          aggressiveness_factor = 1.0f + 0.1f * pattern_info.confidence;
+                                          dynamic_clause_bias = 0.2f * pattern_info.confidence;
+                                    } else if (pattern_info.stride <= 1024) {
+                                          aggressiveness_factor = 1.0f + 0.15f * pattern_info.confidence;
+                                          dynamic_clause_bias = 0.0f;
+                                    } else {
+                                          aggressiveness_factor = 1.0f + 0.2f * pattern_info.confidence;
+                                          dynamic_clause_bias = -0.2f * pattern_info.confidence;
+                                    }
+                                    break;
+                              case PatternInfo::RANDOM:
+                                    aggressiveness_factor = 1.0f + 0.3f * pattern_info.confidence;
+                                    dynamic_clause_bias = -0.3f * pattern_info.confidence;
+                                    break;
+                        }
+                  }
+
+                  float saved_aggressiveness = ctx.schedule_aggressiveness;
+                  ctx.schedule_aggressiveness *= aggressiveness_factor;
+                  ctx.schedule_aggressiveness = std::clamp(ctx.schedule_aggressiveness, 0.5f, saved_aggressiveness * 1.5f);
+
+
+                  schedule_VMEM_enhanced_with_pattern_bias(ctx, block, current, idx, dynamic_clause_bias, pattern_info);
+                  ctx.schedule_aggressiveness = saved_aggressiveness;
+                                        }
+      };
+
+      void sched_ctx::init_caches() {
+            prop_cache = std::make_unique<InstructionPropertyCache>();
+            clause_eval = std::make_unique<VegaClauseEvaluator>(*prop_cache);
+            pattern_scheduler = std::make_unique<SimplePatternScheduler>(*prop_cache, *clause_eval);
+      }
+
+
+      #define SMEM_WINDOW_SIZE_CTX    (256 - ctx.occupancy_factor * 16)
+      #define VMEM_WINDOW_SIZE_CTX    (1024 - ctx.occupancy_factor * 64)
+      #define POS_EXP_WINDOW_SIZE_CTX 512
+      #define SMEM_MAX_MOVES_CTX      (128 - ctx.occupancy_factor * 8)
+      #define VMEM_MAX_MOVES_CTX      (256 - ctx.occupancy_factor * 16)
+      #define LDSDIR_MAX_MOVES_CTX    10
+      #define LDS_MAX_MOVES_CTX       32
+      #define VMEM_CLAUSE_MAX_GRAB_DIST_CTX       (ctx.occupancy_factor * 2)
+      #define VMEM_STORE_CLAUSE_MAX_GRAB_DIST_CTX (ctx.occupancy_factor * 4)
+      #define POS_EXP_MAX_MOVES_CTX         512
+
+
       struct memory_event_set {
             bool     has_control_barrier = false;
             unsigned bar_acquire         = 0;
@@ -126,14 +512,6 @@ namespace aco {
       };
 
 
-      // Core scheduling structures and types
-      enum MoveResult {
-            move_success,
-            move_fail_ssa,
-            move_fail_rar,
-            move_fail_pressure,
-      };
-
       struct DownwardsCursor {
             int source_idx;
             int insert_idx_clause;
@@ -146,7 +524,7 @@ namespace aco {
             DownwardsCursor(int current_idx, RegisterDemand initial_clause_demand)
             : source_idx(current_idx - 1), insert_idx_clause(current_idx), insert_idx(current_idx + 1),
             clause_demand(initial_clause_demand)
-            {}
+            { total_demand = RegisterDemand(); insert_demand_clause = RegisterDemand(); insert_demand = RegisterDemand(); }
 
             inline void verify_invariants(const Block*) {}
       };
@@ -160,134 +538,52 @@ namespace aco {
             UpwardsCursor(int source_idx_) : source_idx(source_idx_)
             {
                   insert_idx = -1;
+                  total_demand = RegisterDemand(); insert_demand = RegisterDemand();
             }
 
             bool has_insert_idx() const { return insert_idx != -1; }
             inline void verify_invariants(const Block*) {}
       };
 
-      struct MoveState {
-            RegisterDemand max_registers;
-            Block* block;
-            Instruction* current;
-            bool improved_rar;
-            std::vector<uint8_t> depends_on;
-            std::vector<uint8_t> RAR_dependencies;
-            std::vector<uint8_t> RAR_dependencies_clause;
-
-            DownwardsCursor downwards_init(int current_idx, bool improved_rar, bool may_form_clauses);
-            MoveResult downwards_move(DownwardsCursor&, bool clause);
-            void downwards_skip(DownwardsCursor&);
-            UpwardsCursor upwards_init(int source_idx, bool improved_rar);
-            bool upwards_check_deps(UpwardsCursor&);
-            void upwards_update_insert_idx(UpwardsCursor&);
-            MoveResult upwards_move(UpwardsCursor&);
-            void upwards_skip(UpwardsCursor&);
-      };
-
-      struct sched_ctx {
-            amd_gfx_level gfx_level;
-            int16_t occupancy_factor;
-            int16_t last_SMEM_stall;
-            int last_SMEM_dep_idx;
-            MoveState mv;
-            bool schedule_pos_exports = true;
-            unsigned schedule_pos_export_div = 1;
-            float schedule_aggressiveness = 1.0f;
-            bool prefer_clauses = true;
-            bool prefer_latency_hiding = false;
-      };
-
       struct VegaMemoryScheduler {
             static constexpr int VEGA_VMEM_ISSUE_CYCLES = 4;
-            static constexpr int VEGA_L1_LATENCY = 16;      /* Vector L1 cache */
-            static constexpr int VEGA_L2_LATENCY = 100;     /* L2 cache */
-            static constexpr int VEGA_HBM2_LATENCY = 200;   /* HBM2 memory */
+            static constexpr int VEGA_L1_LATENCY = 20;
+            static constexpr int VEGA_L2_LATENCY = 130;
+            static constexpr int VEGA_HBM2_LATENCY = 240;
             static constexpr int VEGA_MAX_WAVES_PER_SIMD = 10;
 
             static int calculate_vmem_window_enhanced(const sched_ctx& ctx, int base_window,
                                                       double local_mem_ratio) {
-                  int effective_waves = std::min(static_cast<int>(ctx.occupancy_factor), 8);
+                  int effective_waves = std::min(static_cast<int>(ctx.occupancy_factor), VEGA_MAX_WAVES_PER_SIMD);
+                  if (effective_waves <= 0) effective_waves = 1;
 
-                  /* Calculate minimum slots needed to hide latency at each memory level */
-                  int l1_hiding_slots = VEGA_L1_LATENCY / VEGA_VMEM_ISSUE_CYCLES;      /* 4 slots */
-                  int l2_hiding_slots = VEGA_L2_LATENCY / VEGA_VMEM_ISSUE_CYCLES;      /* 25 slots */
-                  int hbm2_hiding_slots = VEGA_HBM2_LATENCY / VEGA_VMEM_ISSUE_CYCLES;  /* 50 slots */
+                  int l1_hiding_slots = (VEGA_L1_LATENCY + VEGA_VMEM_ISSUE_CYCLES -1) / VEGA_VMEM_ISSUE_CYCLES;
+                  int l2_hiding_slots = (VEGA_L2_LATENCY + VEGA_VMEM_ISSUE_CYCLES -1) / VEGA_VMEM_ISSUE_CYCLES;
+                  int hbm2_hiding_slots = (VEGA_HBM2_LATENCY + VEGA_VMEM_ISSUE_CYCLES -1) / VEGA_VMEM_ISSUE_CYCLES;
 
-                  /* Wave scaling: fewer waves need larger windows for latency hiding */
-                  /* More waves provide natural latency hiding through wave switching */
                   float wave_scaling = 1.0f + (float(VEGA_MAX_WAVES_PER_SIMD - effective_waves) /
-                  float(VEGA_MAX_WAVES_PER_SIMD)) * 1.5f;
+                  float(VEGA_MAX_WAVES_PER_SIMD)) * 1.25f;
 
-                  /* Memory ratio scaling: more memory-bound workloads benefit from larger windows */
                   float mem_scaling = 1.0f + (local_mem_ratio * 0.6f);
 
-                  /* Calculate windows for different cache levels */
                   int l1_window = int(l1_hiding_slots * wave_scaling * mem_scaling);
                   int l2_window = int(l2_hiding_slots * wave_scaling * mem_scaling);
                   int hbm2_window = int(hbm2_hiding_slots * wave_scaling);
 
-                  /* Use the largest required window */
                   int calculated_window = std::max({base_window, l1_window, l2_window, hbm2_window});
 
-                  /* Apply reasonable caps to prevent excessive compile time */
                   int max_window_multiplier = (effective_waves < 4) ? 4 :
                   (effective_waves < 6) ? 3 : 2;
                   int max_window = base_window * max_window_multiplier;
 
-                  /* Additional cap based on local memory ratio */
                   if (local_mem_ratio < 0.3) {
-                        max_window = std::min(max_window, base_window * 2); /* Conservative for compute-bound */
+                        max_window = std::min(max_window, int(base_window * 2.0));
                   }
 
                   return std::clamp(calculated_window, base_window, max_window);
                                                       }
       };
 
-      static bool
-      get_constant_vmem_offset(const Instruction* instr, int64_t& out_off)
-      {
-            if (!instr)
-                  return false;
-
-            /* Most VMEM/FLAT ops: operands[1] holds the immediate offset */
-            if (instr->operands.size() > 1 && instr->operands[1].isConstant()) {
-                  out_off = instr->operands[1].constantValue();
-                  return true;
-            }
-
-            /* Some MUBUF variants keep the imm-offset in operand 2 or 3 */
-            for (unsigned i = 2; i < instr->operands.size(); ++i) {
-                  if (instr->operands[i].isConstant()) {
-                        out_off = instr->operands[i].constantValue();
-                        return true;
-                  }
-            }
-
-            return false;
-      }
-
-      static unsigned get_vmem_access_size(const Instruction* instr)
-      {
-            if (!instr) return 0;
-
-            /* Load operations - check definition size */
-            if (!instr->definitions.empty() && instr->definitions[0].isTemp()) {
-                  return instr->definitions[0].bytes();
-            }
-            /* Store operations - check operand size */
-            else if (instr->isVMEM() && instr->format == Format::MUBUF) {
-                  /* MUBUF store - check data operands in typical order */
-                  if (instr->operands.size() >= 4 && instr->operands[3].isTemp())
-                        return instr->operands[3].bytes();
-                  else if (instr->operands.size() >= 3 && instr->operands[2].isTemp())
-                        return instr->operands[2].bytes();
-                  else if (!instr->operands.empty() && instr->operands.back().isTemp())
-                        return instr->operands.back().bytes();
-            }
-
-            return 0;
-      }
 
       static double calculate_local_memory_ratio_simple(const Block* blk, int center_idx) {
             if (!blk || center_idx < 0 || center_idx >= (int)blk->instructions.size())
@@ -303,7 +599,6 @@ namespace aco {
                   const auto& instr = blk->instructions[i];
                   if (instr) {
                         total_count++;
-                        /* Count all memory operations (VMEM, FLAT, SMEM) */
                         if (instr->isVMEM() || instr->isFlatLike() || instr->isSMEM()) {
                               mem_count++;
                         }
@@ -318,33 +613,28 @@ namespace aco {
             if (!i1 || !i2) return false;
 
             int64_t off1, off2;
-            if (!get_constant_vmem_offset(i1, off1) || !get_constant_vmem_offset(i2, off2))
+            if (!aco::get_constant_vmem_offset(i1, off1) || !aco::get_constant_vmem_offset(i2, off2))
                   return false;
 
-            /* 4KiB page affinity check - simpler and more robust than exact L2 modeling */
-            /* Accesses within the same 4KiB page are likely to benefit from L2 locality */
-            return ((off1 ^ off2) & ~int64_t{4095}) == 0;
+            return ((off1 ^ off2) & ~int64_t(4095)) == 0;
       }
 
       static float calculate_vega_ilp_boost(const Block* blk, double mem_ratio)
       {
-            /* Respect environment variable for manual tuning */
             float base_boost = getenv("ACO_SCHED_VEGA_ILP_BOOST")
             ? std::clamp(std::atoi(getenv("ACO_SCHED_VEGA_ILP_BOOST")), 0, 200) / 100.f
             : 1.0f;
 
-            /* More granular memory ratio scaling */
             if (mem_ratio > 0.75) {
-                  base_boost *= 1.4f;  /* Very memory-bound: aggressive scheduling */
+                  base_boost *= 1.15f;
             } else if (mem_ratio > 0.60) {
-                  base_boost *= 1.25f; /* Memory-bound: moderately aggressive */
+                  base_boost *= 1.08f;
             } else if (mem_ratio > 0.40) {
-                  base_boost *= 1.1f;  /* Balanced: slight boost */
+                  base_boost *= 1.03f;
             } else if (mem_ratio < 0.20) {
-                  base_boost *= 0.85f; /* Compute-bound: more conservative */
+                  base_boost *= 0.92f;
             }
 
-            /* Additional boost for VMEM-dense blocks */
             if (blk) {
                   int vmem_count = 0, total_count = 0;
                   for (const auto& instr : blk->instructions) {
@@ -359,43 +649,34 @@ namespace aco {
                   if (total_count > 0) {
                         float vmem_density = float(vmem_count) / float(total_count);
                         if (vmem_density > 0.5f) {
-                              base_boost *= 1.15f;
+                              base_boost *= 1.05f;
                         }
                   }
             }
 
-            return std::clamp(base_boost, 0.5f, 2.5f);
+            return std::clamp(base_boost, 0.7f, 1.4f);
       }
 
       static void adjust_vega_scheduling_context(sched_ctx& ctx, const Block* blk, double mem_ratio_blk)
       {
             if (ctx.gfx_level != GFX9) return;
 
-            float occupancy_factor = float(ctx.occupancy_factor) / 10.0f; // Normalize to 0-1
+            float occupancy_factor_scaled = float(ctx.occupancy_factor) / 10.0f;
 
-            /* Multi-dimensional tuning based on occupancy and memory characteristics */
-
-            // High occupancy + memory-bound = more aggressive clause formation
-            if (occupancy_factor > 0.7f && mem_ratio_blk > 0.6f) {
-                  ctx.schedule_aggressiveness *= 1.1f;
+            if (occupancy_factor_scaled > 0.7f && mem_ratio_blk > 0.6f) {
+                  ctx.schedule_aggressiveness *= 1.05f;
                   ctx.prefer_clauses = true;
                   ctx.prefer_latency_hiding = true;
             }
-
-            // Low occupancy + compute-bound = focus on register pressure
-            else if (occupancy_factor < 0.4f && mem_ratio_blk < 0.3f) {
+            else if (occupancy_factor_scaled < 0.4f && mem_ratio_blk < 0.3f) {
                   ctx.schedule_aggressiveness *= 0.9f;
                   ctx.prefer_clauses = false;
-                  /* Keep prefer_latency_hiding as-is since we still want some ILP */
             }
-
-            // Medium occupancy + very memory-bound = prioritize memory coalescing
-            else if (occupancy_factor >= 0.4f && occupancy_factor <= 0.7f && mem_ratio_blk > 0.8f) {
+            else if (occupancy_factor_scaled >= 0.4f && occupancy_factor_scaled <= 0.7f && mem_ratio_blk > 0.8f) {
                   ctx.prefer_clauses = true;
-                  ctx.schedule_aggressiveness *= 1.05f; /* Slight boost */
+                  ctx.schedule_aggressiveness *= 1.05f;
             }
 
-            /* Additional VMEM density consideration for fine-tuning */
             if (blk) {
                   int vmem_count = 0, total_count = 0;
                   for (const auto& instr : blk->instructions) {
@@ -410,15 +691,12 @@ namespace aco {
                   if (total_count > 0) {
                         float vmem_density = float(vmem_count) / float(total_count);
                         if (vmem_density > 0.6f) {
-                              /* Very VMEM-dense blocks benefit from aggressive scheduling */
-                              ctx.schedule_aggressiveness *= 1.08f;
+                              ctx.schedule_aggressiveness *= 1.04f;
                               ctx.prefer_clauses = true;
                         }
                   }
             }
-
-            /* Clamp to reasonable bounds to prevent runaway values */
-            ctx.schedule_aggressiveness = std::clamp(ctx.schedule_aggressiveness, 0.5f, 2.0f);
+            ctx.schedule_aggressiveness = std::clamp(ctx.schedule_aggressiveness, 0.5f, 1.6f);
       }
 
       struct MemoryPatternAnalyzer {
@@ -507,8 +785,6 @@ namespace aco {
             }
       };
 
-
-      // Hazard query helper function implementations
       void
       init_hazard_query(const sched_ctx& ctx, hazard_query* query)
       {
@@ -706,7 +982,6 @@ namespace aco {
             return hazard_success;
       }
 
-      // MoveState methods
       DownwardsCursor
       MoveState::downwards_init(int current_idx, bool improved_rar_, bool may_form_clauses)
       {
@@ -1000,93 +1275,16 @@ namespace aco {
                   }
       }
 
-      // Complete replacement for should_form_clause_vega_enhanced
       bool should_form_clause_vega_enhanced(const Instruction* a, const Instruction* b,
                                             amd_gfx_level gfx_level, const sched_ctx& ctx)
       {
-            /* Generic, architecture independent check first */
-            if (!a || !b || !should_form_clause(a, b))
-                  return false;
-
-            /* ---  Vega / GFX9 specific heuristics  -------------------------------- */
-            if (gfx_level == GFX9) {
-                  /* --- VMEM vs VMEM with comprehensive HBM2 and L2 awareness -------- */
-                  if (a->isVMEM() && b->isVMEM()) {
-                        /* Same descriptor? -> apply advanced memory hierarchy optimizations */
-                        if (a->operands.size() > 0 && b->operands.size() > 0 &&
-                              a->operands[0].isTemp() && b->operands[0].isTemp() &&
-                              a->operands[0].tempId() == b->operands[0].tempId()) {
-
-                              int64_t off_a, off_b;
-                        if (get_constant_vmem_offset(a, off_a) && get_constant_vmem_offset(b, off_b)) {
-
-                              /* HBM2 channel affinity check (bits [8:6]) */
-                              int channel_a = (off_a >> 6) & 7;
-                              int channel_b = (off_b >> 6) & 7;
-
-                              if (channel_a != channel_b) {
-                                    /* Different HBM2 channels - excellent for parallel access */
-                                    return true;
-                              }
-
-                              /* Same channel - check for bank conflicts (bits [11:9]) */
-                              int bank_a = (off_a >> 9) & 7;
-                              int bank_b = (off_b >> 9) & 7;
-
-                              if (bank_a == bank_b) {
-                                    /* Same bank within same channel - potential conflict */
-                                    /* Only clause if very close together (same cache line) */
-                                    int64_t diff = std::abs(off_a - off_b);
-                                    if (diff <= 64) return true;  /* Within cache line */
-
-                                          /* Fallback: check for L2 page affinity */
-                                          return check_l2_page_affinity(a, b);
-                              }
-
-                              /* Different banks, same channel - still good */
-                              int64_t diff = std::abs(off_a - off_b);
-                              if (diff <= 256) {
-                                    /* Enhanced sequential pattern detection */
-                                    unsigned size_a = get_vmem_access_size(a);
-                                    if (size_a > 0 && off_b == off_a + size_a)
-                                          return true;  /* Perfect sequential access */
-                                          return true;      /* Good locality within channel */
-                              }
-                        }
-                        /* Same descriptor but unknown offsets – still beneficial */
-                        return true;
-                              }
-                  }
-
-                  /* --- Enhanced MIMG texture cache optimization ------------------- */
-                  if (a->format == Format::MIMG && b->format == Format::MIMG) {
-                        /* Check if both use same texture descriptor (typically operand 2) */
-                        if (a->operands.size() > 2 && b->operands.size() > 2 &&
-                              a->operands[2].isTemp() && b->operands[2].isTemp() &&
-                              a->operands[2].tempId() == b->operands[2].tempId()) {
-                              return true; /* Same texture descriptor - excellent for texture cache */
-                              }
-                  }
-
-                  /* --- FLAT vs FLAT with L2 page affinity ------------------------- */
-                  if (a->isFlatLike() && b->isFlatLike()) {
-                        /* Identical base pointer => likely same page */
-                        if (a->operands.size() > 0 && b->operands.size() > 0 &&
-                              a->operands[0].isTemp() && b->operands[0].isTemp() &&
-                              a->operands[0].tempId() == b->operands[0].tempId()) {
-
-                              /* Apply L2 page affinity check for FLAT operations */
-                              if (check_l2_page_affinity(a, b))
-                                    return true;
-                              }
-
-                              /* Otherwise let 'prefer_clauses' policy decide */
-                              return ctx.prefer_clauses;
-                  }
+            if (!ctx.clause_eval) {
+                  return should_form_clause(a, b);
             }
-
-            /* Default fall-through for non-Vega chips or other instruction types */
-            return true;
+            if (gfx_level != GFX9) {
+                  return should_form_clause(a,b);
+            }
+            return ctx.clause_eval->should_form_clause(a, b, ctx);
       }
 
 
@@ -1097,6 +1295,8 @@ namespace aco {
             int base_window_size = SMEM_WINDOW_SIZE_CTX;
             int base_max_moves = SMEM_MAX_MOVES_CTX;
             int16_t k = 0;
+            const int smem_base_latency_hiding_target = (ctx.gfx_level == GFX9 ? 9 : 10);
+
 
             if (ctx.gfx_level == GFX9) {
                   bool is_descriptor_load = false;
@@ -1120,9 +1320,9 @@ namespace aco {
                         }
                   }
 
-                  if (check_distance > 0 && recent_scalar_loads > check_distance / 4) {
-                        base_window_size = base_window_size * 2 / 3;
-                        base_max_moves = base_max_moves * 2 / 3;
+                  if (check_distance > 0 && recent_scalar_loads > check_distance / 3) {
+                        base_window_size = base_window_size * 3 / 4;
+                        base_max_moves = base_max_moves * 3 / 4;
                   }
             }
 
@@ -1140,8 +1340,8 @@ namespace aco {
 
             DownwardsCursor cursor = ctx.mv.downwards_init(idx, false, false);
 
-            for (/* k init above */; k < max_moves && cursor.source_idx >= 0 && cursor.source_idx > (int)idx - window_size;
-                 /* cursor.source_idx updated by skip/move */ ) {
+            for ( ; k < max_moves && cursor.source_idx >= 0 && cursor.source_idx > (int)idx - window_size;
+            ) {
                   assert(cursor.source_idx >= 0 && cursor.source_idx < (int)block->instructions.size());
                   aco_ptr<Instruction>& candidate = block->instructions[cursor.source_idx];
                   if (!candidate) { ctx.mv.downwards_skip(cursor); continue;}
@@ -1156,15 +1356,13 @@ namespace aco {
                         break;
 
                   bool current_is_16byte_smem = (current->opcode == aco_opcode::s_load_dwordx4 || current->opcode == aco_opcode::s_buffer_load_dwordx4);
-                  bool candidate_is_8byte_smem_load = (candidate->opcode == aco_opcode::s_load_dwordx2 || candidate->opcode == aco_opcode::s_buffer_load_dwordx2);
 
                   if ((candidate->isVMEM() || candidate->isFlatLike()) &&
-                        (((cursor.insert_idx_clause - 1) - cursor.source_idx) >
-                        (ctx.occupancy_factor * 4)) /* avoid stalling VMEM queue   */
-                        || current_is_16byte_smem)        /* big vs small load hazard   */
-                  break;
-                  if (candidate->isSMEM() && current_is_16byte_smem && candidate_is_8byte_smem_load)
-                        break;
+                        (((cursor.insert_idx_clause - 1) - cursor.source_idx) > (ctx.occupancy_factor * 6))
+                  ) {
+                        if (current_is_16byte_smem) break;
+                  }
+
 
                   bool can_move_down = true;
                   HazardResult haz = perform_hazard_query(&hq_down, candidate.get(), false);
@@ -1193,85 +1391,93 @@ namespace aco {
                   if (cursor.source_idx +1 < ctx.last_SMEM_dep_idx)
                         ctx.last_SMEM_stall++;
                   k++;
-                 }
+            }
 
-                 UpwardsCursor up_cursor = ctx.mv.upwards_init(idx + 1, false);
-                 bool found_dependency = false;
-                 hazard_query hq_up;
-                 init_hazard_query(ctx, &hq_up);
-                 add_to_hazard_query(&hq_up, current);
+            UpwardsCursor up_cursor = ctx.mv.upwards_init(idx + 1, false);
+            bool found_dependency = false;
+            hazard_query hq_up;
+            init_hazard_query(ctx, &hq_up);
+            add_to_hazard_query(&hq_up, current);
 
-                 for ( /* k already partially used */;
-                      k < max_moves && up_cursor.source_idx < (int)block->instructions.size() && up_cursor.source_idx < idx + window_size;
-            /* source_idx incremented by skip/move */ ) {
-                       assert(up_cursor.source_idx >= 0 && up_cursor.source_idx < (int)block->instructions.size());
-                       aco_ptr<Instruction>& candidate = block->instructions[up_cursor.source_idx];
-                       if (!candidate) { ctx.mv.upwards_skip(up_cursor); continue;}
+            for ( ;
+                 k < max_moves && up_cursor.source_idx < (int)block->instructions.size() && up_cursor.source_idx < idx + window_size;
+            ) {
+                  assert(up_cursor.source_idx >= 0 && up_cursor.source_idx < (int)block->instructions.size());
+                  aco_ptr<Instruction>& candidate = block->instructions[up_cursor.source_idx];
+                  if (!candidate) { ctx.mv.upwards_skip(up_cursor); continue;}
 
 
-                       if (candidate->opcode == aco_opcode::p_logical_end)
-                             break;
+                  if (candidate->opcode == aco_opcode::p_logical_end)
+                        break;
 
-                       bool is_current_candidate_dependency = !found_dependency && !ctx.mv.upwards_check_deps(up_cursor);
-                       if (is_current_candidate_dependency && (candidate->isVMEM() || candidate->isFlatLike()))
-                             break;
+                  bool is_current_candidate_dependency = !found_dependency && !ctx.mv.upwards_check_deps(up_cursor);
+                  if (is_current_candidate_dependency && (candidate->isVMEM() || candidate->isFlatLike()))
+                        break;
 
-                       bool general_hazard_as_dependency = false;
-                       if (found_dependency) {
-                             HazardResult haz = perform_hazard_query(&hq_up, candidate.get(), true);
-                             if (haz == hazard_fail_reorder_ds || haz == hazard_fail_spill ||
-                                   haz == hazard_fail_reorder_sendmsg || haz == hazard_fail_barrier ||
-                                   haz == hazard_fail_export)
-                                   general_hazard_as_dependency = true;
-                             else if (haz != hazard_success)
-                                   break;
-                       }
+                  bool general_hazard_as_dependency = false;
+                  if (found_dependency) {
+                        HazardResult haz = perform_hazard_query(&hq_up, candidate.get(), true);
+                        if (haz == hazard_fail_reorder_ds || haz == hazard_fail_spill ||
+                              haz == hazard_fail_reorder_sendmsg || haz == hazard_fail_barrier ||
+                              haz == hazard_fail_export)
+                              general_hazard_as_dependency = true;
+                        else if (haz != hazard_success)
+                              break;
+                  }
 
-                       if (is_current_candidate_dependency || general_hazard_as_dependency) {
-                             if (!found_dependency) {
-                                   ctx.mv.upwards_update_insert_idx(up_cursor);
-                                   add_to_hazard_query(&hq_up, candidate.get());
-                                   found_dependency = true;
-                             } else {
-                                   add_to_hazard_query(&hq_up, candidate.get());
-                             }
-                             ctx.mv.upwards_skip(up_cursor);
-                             continue;
-                       }
+                  if (is_current_candidate_dependency || general_hazard_as_dependency) {
+                        if (!found_dependency) {
+                              ctx.mv.upwards_update_insert_idx(up_cursor);
+                              add_to_hazard_query(&hq_up, candidate.get());
+                              found_dependency = true;
+                        } else {
+                              add_to_hazard_query(&hq_up, candidate.get());
+                        }
+                        ctx.mv.upwards_skip(up_cursor);
+                        continue;
+                  }
 
-                       if (!found_dependency && (candidate->isVMEM() || candidate->isFlatLike())) {
-                             ctx.mv.upwards_skip(up_cursor);
-                             continue;
-                       }
+                  if (!found_dependency && (candidate->isVMEM() || candidate->isFlatLike())) {
+                        ctx.mv.upwards_skip(up_cursor);
+                        continue;
+                  }
 
-                       MoveResult res = ctx.mv.upwards_move(up_cursor);
-                       if (res == move_fail_ssa || res == move_fail_rar) {
-                             if (res == move_fail_ssa && (candidate->isVMEM() || candidate->isFlatLike()))
-                                   break;
-                             add_to_hazard_query(&hq_up, candidate.get());
-                             ctx.mv.upwards_skip(up_cursor);
-                             continue;
-                       } else if (res == move_fail_pressure) {
-                             break;
-                       }
-                       k++;
+                  MoveResult res = ctx.mv.upwards_move(up_cursor);
+                  if (res == move_fail_ssa || res == move_fail_rar) {
+                        if (res == move_fail_ssa && (candidate->isVMEM() || candidate->isFlatLike()))
+                              break;
+                        add_to_hazard_query(&hq_up, candidate.get());
+                        ctx.mv.upwards_skip(up_cursor);
+                        continue;
+                  } else if (res == move_fail_pressure) {
+                        break;
+                  }
+                  k++;
             }
 
             ctx.last_SMEM_dep_idx = found_dependency ? up_cursor.insert_idx : 0;
-            const int smem_base = ctx.gfx_level == GFX9 ? 9 : 10;
-            ctx.last_SMEM_stall = smem_base - static_cast<int16_t>(ctx.occupancy_factor) - k;
+            ctx.last_SMEM_stall = smem_base_latency_hiding_target - static_cast<int16_t>(ctx.occupancy_factor) - k;
       }
 
-      void schedule_VMEM_enhanced(sched_ctx& ctx, Block* blk, Instruction* cur, int idx)
+      void SimplePatternScheduler::schedule_VMEM_enhanced_with_pattern_bias(
+            sched_ctx& ctx, Block* block, Instruction* current, int idx,
+            float clause_bias, const SimplePatternScheduler::PatternInfo& pattern)
       {
             const float aggr = ctx.schedule_aggressiveness;
-
-            /* Calculate enhanced VMEM window for GFX9 */
             int base_win = VMEM_WINDOW_SIZE_CTX;
+
+            if (pattern.confidence > 0.7f) {
+                  if (pattern.type == PatternInfo::RANDOM) {
+                        base_win = int(base_win * 1.3f);
+                  } else if (pattern.type == PatternInfo::SEQUENTIAL) {
+                        base_win = int(base_win * 0.9f);
+                  }
+            }
             if (ctx.gfx_level == GFX9) {
-                  double local_mem_ratio = calculate_local_memory_ratio_simple(blk, idx);
+                  double local_mem_ratio = calculate_local_memory_ratio_simple(block, idx);
                   base_win = VegaMemoryScheduler::calculate_vmem_window_enhanced(ctx, base_win, local_mem_ratio);
             }
+
 
             const int win_size  = int(base_win * aggr);
             const int max_moves = int(VMEM_MAX_MOVES_CTX * aggr);
@@ -1279,56 +1485,58 @@ namespace aco {
             int base_clause = VMEM_CLAUSE_MAX_GRAB_DIST_CTX;
             int clause_dist = int(base_clause * (ctx.prefer_clauses ? aggr : 1.0f));
 
-            /* Enhanced clause distance for GFX9 based on access patterns */
-            if (ctx.gfx_level == GFX9 && idx + 1 < (int)blk->instructions.size()) {
-                  auto pat = MemoryPatternAnalyzer::analyze_vmem_pattern(blk, idx + 1, 64);
-                  if (pat.pattern == MemoryPatternAnalyzer::PATTERN_SEQUENTIAL)
-                        clause_dist *= 3;                   /* Very aggressive for sequential */
-                        else if (pat.pattern == MemoryPatternAnalyzer::PATTERN_STRIDED) {
-                              if (pat.stride <= 32)        clause_dist *= 2;
-                              else if (pat.stride <= 128)  clause_dist = int(clause_dist * 1.7f);
-                              else if (pat.stride <= 4096) clause_dist = int(clause_dist * 1.3f);
-                        }
+            if (pattern.confidence > 0.7f && pattern.type == PatternInfo::SEQUENTIAL && ctx.gfx_level == GFX9) {
+                  clause_dist = int(clause_dist * 2.0f);
+            } else if (ctx.gfx_level == GFX9 && idx + 1 < (int)block->instructions.size()){
+                  auto pat_old = MemoryPatternAnalyzer::analyze_vmem_pattern(block, idx + 1, 64);
+                  if (pat_old.pattern == MemoryPatternAnalyzer::PATTERN_SEQUENTIAL)
+                        clause_dist = int(clause_dist * 2.5f);
+                  else if (pat_old.pattern == MemoryPatternAnalyzer::PATTERN_STRIDED) {
+                        if (pat_old.stride <= 32) clause_dist = int(clause_dist * 1.75f);
+                        else if (pat_old.stride <= 128) clause_dist = int(clause_dist * 1.5f);
+                        else if (pat_old.stride <= 4096) clause_dist = int(clause_dist * 1.2f);
+                  }
             }
 
+
             DownwardsCursor cur_d = ctx.mv.downwards_init(idx, true, true);
-            hazard_query indep_q, clause_q;
-            init_hazard_query(ctx, &indep_q); add_to_hazard_query(&indep_q, cur);
-            init_hazard_query(ctx, &clause_q);
+            hazard_query indep_q, clause_q_local;
+            init_hazard_query(ctx, &indep_q); add_to_hazard_query(&indep_q, current);
+            init_hazard_query(ctx, &clause_q_local);
 
             bool only_clauses = false;
             int16_t k = 0;
 
-            /* ---------------- downwards phase with L2 affinity bonus ----------- */
             for ( ; k < max_moves &&
                   cur_d.source_idx >= 0 &&
                   cur_d.source_idx > idx - win_size; )
             {
-                  auto& cand = blk->instructions[cur_d.source_idx];
+                  auto& cand = block->instructions[cur_d.source_idx];
                   if (!cand) { ctx.mv.downwards_skip(cur_d); continue; }
                   if (cand->opcode == aco_opcode::p_logical_start) break;
 
                   bool part_clause = false;
-                  if ((cur->isVMEM() && cand->isVMEM()) ||
-                        (cur->isFlatLike() && cand->isFlatLike()))
+                  if ((current->isVMEM() && cand->isVMEM()) ||
+                        (current->isFlatLike() && cand->isFlatLike()))
                   {
                         int grab = (cur_d.insert_idx_clause - 1) - cur_d.source_idx;
-                        int effective_clause_dist = clause_dist;
-
-                        /* L2 cache affinity bonus - double grab distance for L2-friendly accesses */
-                        if (ctx.gfx_level == GFX9 && check_l2_page_affinity(cur, cand.get())) {
-                              effective_clause_dist *= 2;
-                        }
-
-                        if (grab < effective_clause_dist &&
-                              should_form_clause_vega_enhanced(cur, cand.get(), ctx.gfx_level, ctx))
-                        {
-                              part_clause = true;
+                        if (grab < clause_dist) {
+                              auto score = evaluator.evaluate_clause(current, cand.get(), ctx);
+                              float adjustment = calculate_clause_threshold_adjustment(clause_bias, score);
+                              if (score == VegaClauseEvaluator::CLAUSE_EXCELLENT) {
+                                    part_clause = true;
+                              } else if (score == VegaClauseEvaluator::CLAUSE_GOOD) {
+                                    part_clause = (adjustment >= -0.1f);
+                              } else if (score == VegaClauseEvaluator::CLAUSE_NEUTRAL) {
+                                    part_clause = (adjustment > 0.1f);
+                              } else {
+                                    part_clause = false;
+                              }
                         }
                   }
 
                   bool can_move = !cand->isVMEM() || part_clause || cand->definitions.empty();
-                  HazardResult hz = perform_hazard_query(part_clause ? &clause_q : &indep_q,
+                  HazardResult hz = perform_hazard_query(part_clause ? &clause_q_local : &indep_q,
                                                          cand.get(), false);
                   if (hz == hazard_fail_reorder_ds || hz == hazard_fail_spill ||
                         hz == hazard_fail_reorder_sendmsg || hz == hazard_fail_barrier ||
@@ -1338,7 +1546,7 @@ namespace aco {
                         break;
 
                   if (!can_move) {
-                        if (part_clause) add_to_hazard_query(&clause_q, cand.get());
+                        if (part_clause) add_to_hazard_query(&clause_q_local, cand.get());
                         add_to_hazard_query(&indep_q, cand.get());
                         ctx.mv.downwards_skip(cur_d);
                         continue;
@@ -1346,7 +1554,7 @@ namespace aco {
 
                   MoveResult res = ctx.mv.downwards_move(cur_d, part_clause);
                   if (res != move_success) {
-                        if (part_clause) add_to_hazard_query(&clause_q, cand.get());
+                        if (part_clause) add_to_hazard_query(&clause_q_local, cand.get());
                         add_to_hazard_query(&indep_q, cand.get());
                         if (res == move_fail_pressure) only_clauses = true;
                         ctx.mv.downwards_skip(cur_d);
@@ -1354,7 +1562,7 @@ namespace aco {
                   }
 
                   if (part_clause) {
-                        add_to_hazard_query(&clause_q, cand.get());
+                        add_to_hazard_query(&clause_q_local, cand.get());
                         add_to_hazard_query(&indep_q, cand.get());
                   } else {
                         add_to_hazard_query(&indep_q, cand.get());
@@ -1362,16 +1570,15 @@ namespace aco {
                   }
             }
 
-            /* ---------------- upwards phase (unchanged) ---------------- */
             UpwardsCursor up = ctx.mv.upwards_init(idx + 1, true);
             bool found_dep = false;
-            init_hazard_query(ctx, &indep_q); add_to_hazard_query(&indep_q, cur);
+            init_hazard_query(ctx, &indep_q); add_to_hazard_query(&indep_q, current);
 
             for ( ; k < max_moves &&
-                  up.source_idx < (int)blk->instructions.size() &&
+                  up.source_idx < (int)block->instructions.size() &&
                   up.source_idx < idx + win_size; )
             {
-                  auto& cand = blk->instructions[up.source_idx];
+                  auto& cand = block->instructions[up.source_idx];
                   if (!cand) { ctx.mv.upwards_skip(up); continue; }
                   if (cand->opcode == aco_opcode::p_logical_end) break;
 
@@ -1409,8 +1616,12 @@ namespace aco {
                         ctx.mv.upwards_skip(up);
                         continue;
                   }
+                  if (pattern.type == PatternInfo::SEQUENTIAL &&
+                        pattern.confidence > 0.8f && k > max_moves / 2) {
+                        break;
+                        }
 
-                  MoveResult res = ctx.mv.upwards_move(up);
+                        MoveResult res = ctx.mv.upwards_move(up);
                   if (res == move_fail_ssa || res == move_fail_rar) {
                         add_to_hazard_query(&indep_q, cand.get());
                         ctx.mv.upwards_skip(up);
@@ -1421,7 +1632,6 @@ namespace aco {
                   if (!is_vmem) ++k;
             }
       }
-
       void
       schedule_LDS(sched_ctx& ctx, Block* block, Instruction* current, int idx)
       {
@@ -1430,9 +1640,9 @@ namespace aco {
             int base_max_moves = current->isLDSDIR() ? LDSDIR_MAX_MOVES_CTX : LDS_MAX_MOVES_CTX;
 
             if (ctx.gfx_level == GFX9) {
-                  base_max_moves = base_max_moves * 3 / 2;
+                  base_max_moves = base_max_moves * 5 / 4;
                   if (ctx.occupancy_factor > 8) {
-                        base_max_moves = base_max_moves * 2 / 3;
+                        base_max_moves = base_max_moves * 3 / 4;
                   }
             }
             int window_size = static_cast<int>(base_window_size * ctx.schedule_aggressiveness);
@@ -1445,7 +1655,7 @@ namespace aco {
 
             DownwardsCursor cursor = ctx.mv.downwards_init(idx, true, false);
 
-            for (int i_down = 0; k < max_moves && i_down < window_size && cursor.source_idx >=0; /* i_down incr in loop */ ) {
+            for (int i_down = 0; k < max_moves && cursor.source_idx >=0 && (idx - cursor.source_idx) < window_size;  ) {
                   assert(cursor.source_idx < (int)block->instructions.size());
                   aco_ptr<Instruction>& candidate = block->instructions[cursor.source_idx];
                   if (!candidate) { ctx.mv.downwards_skip(cursor); i_down++; continue; }
@@ -1460,10 +1670,19 @@ namespace aco {
                         i_down++;
                         continue;
                   }
-
-                  if (perform_hazard_query(&hq_down, candidate.get(), false) != hazard_success ||
-                        ctx.mv.downwards_move(cursor, false) != move_success)
+                  HazardResult haz = perform_hazard_query(&hq_down, candidate.get(), false);
+                  if (haz != hazard_success) {
                         break;
+                  }
+                  MoveResult move_res = ctx.mv.downwards_move(cursor, false);
+                  if (move_res != move_success) {
+                        add_to_hazard_query(&hq_down, candidate.get());
+                        ctx.mv.downwards_skip(cursor);
+                        if(move_res == move_fail_pressure) break;
+                        i_down++;
+                        continue;
+                  }
+
 
                   k++;
                   i_down++;
@@ -1476,50 +1695,37 @@ namespace aco {
             init_hazard_query(ctx, &hq_up);
             add_to_hazard_query(&hq_up, current);
 
-            bool first_loop_broke_lds = false;
-            for (; k < max_moves && i_up < window_size && up_cursor.source_idx < (int)block->instructions.size(); i_up++) {
+            for (; k < max_moves && up_cursor.source_idx < (int)block->instructions.size() && i_up < window_size; i_up++) {
                   assert(up_cursor.source_idx >= 0 && up_cursor.source_idx < (int)block->instructions.size());
                   aco_ptr<Instruction>& candidate = block->instructions[up_cursor.source_idx];
                   if (!candidate) { ctx.mv.upwards_skip(up_cursor); continue;}
 
                   bool is_mem = candidate->isVMEM() || candidate->isFlatLike() || candidate->isSMEM();
                   if (candidate->opcode == aco_opcode::p_logical_end || is_mem) {
-                        first_loop_broke_lds = true; break;
+                        break;
                   }
 
                   if (!ctx.mv.upwards_check_deps(up_cursor)) {
                         add_to_hazard_query(&hq_up, candidate.get());
                         ctx.mv.upwards_update_insert_idx(up_cursor);
-                        ctx.mv.upwards_skip(up_cursor);
                         found_dependency = true;
-                        first_loop_broke_lds = true; break;
+                        ctx.mv.upwards_skip(up_cursor);
+                        break;
                   }
-                  add_to_hazard_query(&hq_up, candidate.get());
-                  ctx.mv.upwards_skip(up_cursor);
-            }
-
-            if (first_loop_broke_lds && i_up < window_size && up_cursor.source_idx < (int)block->instructions.size() && found_dependency) {
-                  // i_up is correct for the next loop
-            }
-
-
-            for (; found_dependency && k < max_moves && i_up < window_size && up_cursor.source_idx < (int)block->instructions.size(); i_up++) {
-                  assert(up_cursor.source_idx >=0 && up_cursor.source_idx < (int)block->instructions.size());
-                  aco_ptr<Instruction>& candidate = block->instructions[up_cursor.source_idx];
-                  if (!candidate) { ctx.mv.upwards_skip(up_cursor); continue;}
-
-
-                  bool is_mem = candidate->isVMEM() || candidate->isFlatLike() || candidate->isSMEM();
-                  if (candidate->opcode == aco_opcode::p_logical_end || is_mem)
-                        break;
-
                   HazardResult haz = perform_hazard_query(&hq_up, candidate.get(), true);
-                  if (haz == hazard_fail_exec || haz == hazard_fail_unreorderable)
+                  if (haz != hazard_success) {
+                        add_to_hazard_query(&hq_up, candidate.get());
+                        if(!found_dependency) {
+                              ctx.mv.upwards_update_insert_idx(up_cursor);
+                        }
+                        ctx.mv.upwards_skip(up_cursor);
                         break;
-
-                  if (haz != hazard_success || ctx.mv.upwards_move(up_cursor) != move_success) {
+                  }
+                  MoveResult res = ctx.mv.upwards_move(up_cursor);
+                  if (res != move_success) {
                         add_to_hazard_query(&hq_up, candidate.get());
                         ctx.mv.upwards_skip(up_cursor);
+                        if (res == move_fail_pressure) break;
                   } else {
                         k++;
                   }
@@ -1568,7 +1774,6 @@ namespace aco {
                         ctx.mv.downwards_skip(down); continue;
                   }
 
-                  /* SALU bias with VALU-consumer look-ahead ------------------ */
                   unsigned salu_bias = 0;
                   if (cand->isSALU()) {
                         bool feeds_valu = false;
@@ -1655,13 +1860,12 @@ namespace aco {
             return skip;
       }
 
-      void schedule_block(sched_ctx& ctx, Program* prog, Block* blk)
+      void schedule_block_perfected(sched_ctx& ctx, Program* prog, Block* blk)
       {
             ctx.last_SMEM_dep_idx = 0;
             ctx.last_SMEM_stall   = INT16_MIN;
             ctx.mv.block          = blk;
 
-            /* ---- Calculate block-level memory characteristics ---- */
             unsigned mem_i = 0, alu_i = 0;
             for (const auto& ins : blk->instructions)
                   if (ins)
@@ -1670,12 +1874,10 @@ namespace aco {
 
                   const double mem_ratio_blk = double(mem_i) / double(std::max(1u, mem_i + alu_i));
 
-            /* Save global context */
             const float aggr_g   = ctx.schedule_aggressiveness;
             const bool  clause_g = ctx.prefer_clauses;
             const bool  lat_g    = ctx.prefer_latency_hiding;
 
-            /* Apply enhanced ILP boost calculation */
             float boost = calculate_vega_ilp_boost(blk, mem_ratio_blk);
             ctx.schedule_aggressiveness =
             std::clamp(0.5f + 1.0f * float(mem_ratio_blk), 0.5f, 1.5f) * boost;
@@ -1683,12 +1885,10 @@ namespace aco {
             ctx.prefer_latency_hiding = mem_ratio_blk > 0.25;
             ctx.prefer_clauses        = mem_ratio_blk > 0.15;
 
-            /* Apply Vega-specific context fine-tuning ONCE per block */
             if (ctx.gfx_level == GFX9) {
                   adjust_vega_scheduling_context(ctx, blk, mem_ratio_blk);
             }
 
-            /* Main scheduling loop with enhanced functions */
             unsigned num_stores = 0;
             for (unsigned i = 0; i < blk->instructions.size(); ++i) {
                   Instruction* cur = blk->instructions[i].get();
@@ -1710,15 +1910,21 @@ namespace aco {
                         }
 
                         ctx.mv.current = cur;
-                        if (cur->isVMEM() || cur->isFlatLike())
-                              schedule_VMEM_enhanced(ctx, blk, cur, i);  /* Use enhanced version */
-                              else if (cur->isSMEM())
-                                    schedule_SMEM(ctx, blk, cur, i);
-                  else if (cur->isLDSDIR() || (cur->isDS() && !cur->ds().gds))
-                        schedule_LDS(ctx, blk, cur, i);
+                        if (cur->isVMEM() || cur->isFlatLike()) {
+                              assert(ctx.prop_cache && ctx.pattern_scheduler);
+                              for (int j = i + 1; j < std::min((int)blk->instructions.size(), (int)i + 8); j++) {
+                                    if (blk->instructions[j]) {
+                                          ctx.prop_cache->prefetch(blk->instructions[j].get());
+                                    }
+                              }
+                              ctx.pattern_scheduler->schedule_vmem_adaptive(ctx, blk, cur, i);
+                        } else if (cur->isSMEM()) {
+                              schedule_SMEM(ctx, blk, cur, i);
+                        } else if (cur->isLDSDIR() || (cur->isDS() && !cur->ds().gds)) {
+                              schedule_LDS(ctx, blk, cur, i);
+                        }
             }
 
-            /* Enhanced store scheduling for GFX9 */
             if (num_stores > 1 &&
                   (prog->gfx_level >= GFX11 ||
                   (prog->gfx_level == GFX9 && ctx.prefer_clauses))) {
@@ -1735,10 +1941,9 @@ namespace aco {
                   for (const auto& ins : blk->instructions)
                         if (ins) blk->register_demand.update(ins->register_demand);
 
-                        /* Restore global context */
                         ctx.schedule_aggressiveness = aggr_g;
-                  ctx.prefer_clauses          = clause_g;
-                  ctx.prefer_latency_hiding   = lat_g;
+            ctx.prefer_clauses          = clause_g;
+            ctx.prefer_latency_hiding   = lat_g;
       }
 
       void
@@ -1747,7 +1952,6 @@ namespace aco {
             if (!program)
                   return;
 
-            /* 1. global ALU/MEM ratio------------------------------------- */
             unsigned mem_i = 0, alu_i = 0;
             for (const Block& b : program->blocks)
                   for (const auto& ins : b.instructions)
@@ -1758,17 +1962,17 @@ namespace aco {
                         const unsigned tot_i = mem_i + alu_i;
                   const double   mem_ratio_gl = tot_i ? double(mem_i) / double(tot_i) : 0.0;
 
-            /* 2. current register demand --------------------------------- */
             RegisterDemand demand;
             for (const Block& b : program->blocks)
                   demand.update(b.register_demand);
 
-            /* 3. context skeleton ---------------------------------------- */
             sched_ctx ctx;
             ctx.gfx_level = program->gfx_level;
             ctx.mv.depends_on.resize            (program->peekAllocationId());
             ctx.mv.RAR_dependencies.resize      (program->peekAllocationId());
             ctx.mv.RAR_dependencies_clause.resize(program->peekAllocationId());
+
+            ctx.init_caches();
 
             const int   wave_factor       = program->gfx_level >= GFX10 ? 2 : 1;
             const float reg_file_multiple =
@@ -1778,7 +1982,6 @@ namespace aco {
             std::max<int>(program->min_waves,
                           int(4 * wave_factor * reg_file_multiple));
 
-            /* 4. sophisticated Vega spare solver ------------------------- */
             int vgpr_spare = 12;
             if (program->gfx_level == GFX9) {
                   static constexpr std::array<int,9> vega_thr{24,32,40,48,64,80,128,170,256};
@@ -1786,48 +1989,47 @@ namespace aco {
                   atoi(getenv("ACO_SCHED_VEGA_SPARE_BIAS")) : 0;
 
                   double best_cost = std::numeric_limits<double>::max();
+                  int best_spare_for_cost = 0;
 
-                  for (int spare = 0; spare <= 16; ++spare) {
-                        int needed_vgpr = ((demand.vgpr + spare + 3) / 4) * 4;
+                  for (int spare_candidate = 0; spare_candidate <= 16; ++spare_candidate) {
+                        int needed_vgpr = ((demand.vgpr + spare_candidate + 3) / 4) * 4;
                         if (!needed_vgpr)
+                              needed_vgpr = 4;
+
+                        int waves_for_vgpr_config = program->dev.physical_vgprs / needed_vgpr;
+                        waves_for_vgpr_config     = std::clamp(waves_for_vgpr_config, 1, 10);
+
+                        if (waves_for_vgpr_config < program->min_waves)
                               continue;
 
-                        int waves = program->dev.physical_vgprs / needed_vgpr;
-                        waves     = std::clamp(waves, 2, 10);
-                        if (waves < program->min_waves)
-                              continue;
-
-                        /* --- new guard: keep at least 6 waves for FS/CS ---------------- */
                         if ((program->stage == fragment_fs || program->stage == compute_cs) &&
-                              waves < 6)
+                              waves_for_vgpr_config < 6 && program->dev.physical_vgprs >=256)
                               continue;
 
-                        /* cost model --------------------------------------------------- */
-                        double reg_gain = double(needed_vgpr - demand.vgpr);
-                        double occ_pen  = double(10 - waves);
-                        double occ_coef = mem_ratio_gl * 1.5 + 0.5;
+                        double reg_gain_cost = double(needed_vgpr - demand.vgpr);
+                        double occ_pen_val  = double(10 - waves_for_vgpr_config);
+                        double occ_coef = mem_ratio_gl * 1.0 + 0.5;
 
-                        double cost = (10.0 / (reg_gain + 1.0)) + occ_coef * occ_pen;
+                        double current_cost = (10.0 / (reg_gain_cost + 1.0)) + occ_coef * occ_pen_val;
                         for (int t : vega_thr)
                               if (demand.vgpr <= t && needed_vgpr > t)
-                                    cost += (t == 64 ? 4.0 : 2.0);
+                                    current_cost += (t == 64 ? 4.0 : 2.0);
 
-                        if (cost < best_cost) { best_cost = cost; vgpr_spare = spare; }
+                        if (current_cost < best_cost) { best_cost = current_cost; best_spare_for_cost = spare_candidate; }
                   }
-                  vgpr_spare = std::clamp(vgpr_spare + env_bias, 0, 16);
+                  vgpr_spare = std::clamp(best_spare_for_cost + env_bias, 0, 16);
+            } else if (program->gfx_level >= GFX10) {
+                  vgpr_spare = 12;
             }
 
-            if (program->gfx_level >= GFX10 && program->gfx_level != GFX9)
-                  vgpr_spare = 12;
 
-            /* 5. derive target waves ------------------------------------- */
-            int vgpr_need =
+            int vgpr_need_final =
             std::max<int>(24, demand.vgpr) + int(vgpr_spare * reg_file_multiple);
 
-            if (vgpr_need <= 0)
-                  vgpr_need = program->dev.physical_vgprs ? program->dev.physical_vgprs : 256;
+            if (vgpr_need_final <= 0)
+                  vgpr_need_final = program->dev.physical_vgprs ? program->dev.physical_vgprs : 256;
 
-            int waves_vgpr = program->dev.physical_vgprs / vgpr_need;
+            int waves_vgpr = program->dev.physical_vgprs / vgpr_need_final;
             int sgpr_per_wave = (demand.sgpr + 15) & ~15;
             int waves_sgpr    = sgpr_per_wave
             ? program->dev.physical_sgprs / sgpr_per_wave
@@ -1838,7 +2040,6 @@ namespace aco {
                             wave_minimum, program->num_waves);
             target_waves = max_suitable_waves(program, target_waves);
 
-            /* 6. finalise ctx -------------------------------------------- */
             ctx.mv.max_registers = get_addr_regs_from_waves(program, target_waves);
             ctx.mv.max_registers.vgpr = std::max(0, ctx.mv.max_registers.vgpr - 2);
 
@@ -1852,11 +2053,9 @@ namespace aco {
                   ctx.schedule_pos_export_div = 4;
             }
 
-            /* 7. walk blocks --------------------------------------------- */
             for (Block& b : program->blocks)
-                  schedule_block(ctx, program, &b);
+                  schedule_block_perfected(ctx, program, &b);
 
-            /* 8. update demand / validate -------------------------------- */
             RegisterDemand new_dem;
             for (Block& b : program->blocks)
                   new_dem.update(b.register_demand);
@@ -1866,4 +2065,4 @@ namespace aco {
                   abort();
       }
 
-} // namespace aco
+}
