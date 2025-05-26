@@ -386,37 +386,28 @@ namespace aco {
                   }
                   return 0;
             } else if (UNLIKELY(program->gfx_level == GFX8)) {
-                  if (UNLIKELY(program->dev.xnack_enabled)) {
-                        if (UNLIKELY(needs_scratch_memory)) {
+                  if (UNLIKELY(needs_scratch_memory)) {
+                        if (UNLIKELY(program->dev.xnack_enabled)) {
                               return 6;
-                        } else if (LIKELY(program->needs_vcc)) {
+                        } else {
                               return 4;
                         }
-                        return 2;
-                  } else {
-                        if (UNLIKELY(needs_scratch_memory)) {
-                              return 4;
-                        } else if (LIKELY(program->needs_vcc)) {
-                              return 2;
-                        }
-                        return 0;
                   }
+                  else if (UNLIKELY(program->dev.xnack_enabled)) {
+                        return 4;
+                  } else if (LIKELY(program->needs_vcc)) {
+                        return 2;
+                  }
+                  return 0;
             } else if (UNLIKELY(program->gfx_level == GFX9)) {
-                  if (UNLIKELY(program->dev.xnack_enabled)) {
-                        if (UNLIKELY(needs_scratch_memory)) {
-                              return 4;
-                        } else if (LIKELY(program->needs_vcc)) {
-                              return 4;
-                        }
+                  if (UNLIKELY(needs_scratch_memory)) {
+                        return 6;
+                  } else if (UNLIKELY(program->dev.xnack_enabled)) {
+                        return 4;
+                  } else if (LIKELY(program->needs_vcc)) {
                         return 2;
-                  } else {
-                        if (UNLIKELY(needs_scratch_memory)) {
-                              return 4;
-                        } else if (LIKELY(program->needs_vcc)) {
-                              return 2;
-                        }
-                        return 0;
                   }
+                  return 0;
             } else {
                   assert(!program->dev.xnack_enabled && "XNACK not supported on GFX10+");
                   if (UNLIKELY(needs_scratch_memory)) {
