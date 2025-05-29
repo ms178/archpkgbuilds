@@ -83,85 +83,128 @@ void amdgpu_bo_placement_from_domain(struct amdgpu_bo *abo, u32 domain)
 	u64 flags = abo->flags;
 	u32 c = 0;
 
-	if (domain & AMDGPU_GEM_DOMAIN_VRAM) {
+	static_assert(AMDGPU_GEM_DOMAIN_CPU == 0x1, "AMDGPU_GEM_DOMAIN_CPU ABI definition changed!");
+	static_assert(AMDGPU_GEM_DOMAIN_GTT == 0x2, "AMDGPU_GEM_DOMAIN_GTT ABI definition changed!");
+	static_assert(AMDGPU_GEM_DOMAIN_VRAM == 0x4, "AMDGPU_GEM_DOMAIN_VRAM ABI definition changed!");
+
+	BUILD_BUG_ON(AMDGPU_BO_MAX_PLACEMENTS < 2);
+
+	if (domain == AMDGPU_GEM_DOMAIN_VRAM) {
 		unsigned int visible_pfn = adev->gmc.visible_vram_size >> PAGE_SHIFT;
 		int8_t mem_id = KFD_XCP_MEM_ID(adev, abo->xcp_id);
 
-		if (likely(adev->gmc.mem_partitions && mem_id >= 0)) {
+		if (likely(adev->gmc.mem_partitions &&
+			mem_id >= 0 && mem_id < min_t(int, adev->gmc.num_mem_partitions, 8))) {
 			places[c].fpfn = adev->gmc.mem_partitions[mem_id].range.fpfn;
-			places[c].lpfn = adev->gmc.mem_partitions[mem_id].range.lpfn + 1;
-		} else {
-			places[c].fpfn = 0;
-			places[c].lpfn = 0;
-		}
-		places[c].mem_type = TTM_PL_VRAM;
-		places[c].flags = 0;
+		places[c].lpfn = adev->gmc.mem_partitions[mem_id].range.lpfn + 1;
+			} else {
+				places[c].fpfn = 0;
+				places[c].lpfn = 0;
+			}
+			places[c].mem_type = TTM_PL_VRAM;
+			places[c].flags = 0;
 
-		if (flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED)
-			places[c].lpfn = min_not_zero(places[c].lpfn, visible_pfn);
+			if (flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED)
+				places[c].lpfn = min_not_zero(places[c].lpfn, visible_pfn);
 		else
 			places[c].flags |= TTM_PL_FLAG_TOPDOWN;
 
 		if (unlikely(abo->tbo.type == ttm_bo_type_kernel &&
 			flags & AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS))
 			places[c].flags |= TTM_PL_FLAG_CONTIGUOUS;
-
 		c++;
-	}
-
-	if (unlikely(domain & AMDGPU_GEM_DOMAIN_DOORBELL)) {
+	} else if (domain == AMDGPU_GEM_DOMAIN_GTT) {
 		places[c].fpfn = 0;
 		places[c].lpfn = 0;
-		places[c].mem_type = AMDGPU_PL_DOORBELL;
-		places[c].flags = 0;
-		c++;
-	}
-
-	if (domain & AMDGPU_GEM_DOMAIN_GTT) {
-		places[c].fpfn = 0;
-		places[c].lpfn = 0;
-		places[c].mem_type =
-		abo->flags & AMDGPU_GEM_CREATE_PREEMPTIBLE ?
+		places[c].mem_type = abo->flags & AMDGPU_GEM_CREATE_PREEMPTIBLE ?
 		AMDGPU_PL_PREEMPT : TTM_PL_TT;
 		places[c].flags = 0;
 		if (abo->tbo.resource && !(adev->flags & AMD_IS_APU) &&
 			domain & abo->preferred_domains & AMDGPU_GEM_DOMAIN_VRAM)
-			places[c].flags |= TTM_PL_FLAG_FALLBACK;
+		places[c].flags |= TTM_PL_FLAG_FALLBACK;
 		c++;
+	} else {
+		if (domain & AMDGPU_GEM_DOMAIN_VRAM) {
+			unsigned int visible_pfn = adev->gmc.visible_vram_size >> PAGE_SHIFT;
+			int8_t mem_id = KFD_XCP_MEM_ID(adev, abo->xcp_id);
+
+			if (likely(adev->gmc.mem_partitions &&
+				mem_id >= 0 && mem_id < min_t(int, adev->gmc.num_mem_partitions, 8))) {
+				places[c].fpfn = adev->gmc.mem_partitions[mem_id].range.fpfn;
+			places[c].lpfn = adev->gmc.mem_partitions[mem_id].range.lpfn + 1;
+				} else {
+					places[c].fpfn = 0;
+					places[c].lpfn = 0;
+				}
+				places[c].mem_type = TTM_PL_VRAM;
+				places[c].flags = 0;
+
+				if (flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED)
+					places[c].lpfn = min_not_zero(places[c].lpfn, visible_pfn);
+			else
+				places[c].flags |= TTM_PL_FLAG_TOPDOWN;
+
+			if (unlikely(abo->tbo.type == ttm_bo_type_kernel &&
+				flags & AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS))
+				places[c].flags |= TTM_PL_FLAG_CONTIGUOUS;
+			c++;
+		}
+
+		if (unlikely(domain & AMDGPU_GEM_DOMAIN_DOORBELL)) {
+			places[c].fpfn = 0;
+			places[c].lpfn = 0;
+			places[c].mem_type = AMDGPU_PL_DOORBELL;
+			places[c].flags = 0;
+			c++;
+		}
+
+		if (domain & AMDGPU_GEM_DOMAIN_GTT) {
+			places[c].fpfn = 0;
+			places[c].lpfn = 0;
+			places[c].mem_type =
+			abo->flags & AMDGPU_GEM_CREATE_PREEMPTIBLE ?
+			AMDGPU_PL_PREEMPT : TTM_PL_TT;
+			places[c].flags = 0;
+			if (abo->tbo.resource && !(adev->flags & AMD_IS_APU) &&
+				domain & abo->preferred_domains & AMDGPU_GEM_DOMAIN_VRAM)
+				places[c].flags |= TTM_PL_FLAG_FALLBACK;
+			c++;
+		}
+
+		if (domain & AMDGPU_GEM_DOMAIN_CPU) {
+			places[c].fpfn = 0;
+			places[c].lpfn = 0;
+			places[c].mem_type = TTM_PL_SYSTEM;
+			places[c].flags = 0;
+			c++;
+		}
+
+		if (unlikely(domain & AMDGPU_GEM_DOMAIN_GDS)) {
+			places[c].fpfn = 0;
+			places[c].lpfn = 0;
+			places[c].mem_type = AMDGPU_PL_GDS;
+			places[c].flags = 0;
+			c++;
+		}
+
+		if (unlikely(domain & AMDGPU_GEM_DOMAIN_GWS)) {
+			places[c].fpfn = 0;
+			places[c].lpfn = 0;
+			places[c].mem_type = AMDGPU_PL_GWS;
+			places[c].flags = 0;
+			c++;
+		}
+
+		if (unlikely(domain & AMDGPU_GEM_DOMAIN_OA)) {
+			places[c].fpfn = 0;
+			places[c].lpfn = 0;
+			places[c].mem_type = AMDGPU_PL_OA;
+			places[c].flags = 0;
+			c++;
+		}
 	}
 
-	if (domain & AMDGPU_GEM_DOMAIN_CPU) {
-		places[c].fpfn = 0;
-		places[c].lpfn = 0;
-		places[c].mem_type = TTM_PL_SYSTEM;
-		places[c].flags = 0;
-		c++;
-	}
-
-	if (unlikely(domain & AMDGPU_GEM_DOMAIN_GDS)) {
-		places[c].fpfn = 0;
-		places[c].lpfn = 0;
-		places[c].mem_type = AMDGPU_PL_GDS;
-		places[c].flags = 0;
-		c++;
-	}
-
-	if (unlikely(domain & AMDGPU_GEM_DOMAIN_GWS)) {
-		places[c].fpfn = 0;
-		places[c].lpfn = 0;
-		places[c].mem_type = AMDGPU_PL_GWS;
-		places[c].flags = 0;
-		c++;
-	}
-
-	if (unlikely(domain & AMDGPU_GEM_DOMAIN_OA)) {
-		places[c].fpfn = 0;
-		places[c].lpfn = 0;
-		places[c].mem_type = AMDGPU_PL_OA;
-		places[c].flags = 0;
-		c++;
-	}
-
+	BUG_ON(c == 0 && domain != 0);
 	BUG_ON(c > AMDGPU_BO_MAX_PLACEMENTS);
 
 	placement->num_placement = c;
@@ -1096,13 +1139,7 @@ uint32_t amdgpu_bo_mem_stats_placement(struct amdgpu_bo *bo)
 uint32_t amdgpu_bo_get_preferred_domain(struct amdgpu_device *adev,
 										uint32_t domain)
 {
-	if (likely((domain == (AMDGPU_GEM_DOMAIN_VRAM | AMDGPU_GEM_DOMAIN_GTT)) &&
-		((adev->asic_type == CHIP_CARRIZO) || (adev->asic_type == CHIP_STONEY)))) {
-		domain = AMDGPU_GEM_DOMAIN_VRAM;
-	if (adev->gmc.real_vram_size <= AMDGPU_SG_THRESHOLD)
-		domain = AMDGPU_GEM_DOMAIN_GTT;
-		}
-		return domain;
+	return domain;
 }
 
 #if defined(CONFIG_DEBUG_FS)
