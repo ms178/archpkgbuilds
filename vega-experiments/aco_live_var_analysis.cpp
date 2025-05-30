@@ -203,6 +203,16 @@ namespace aco {
                               }
                         }
 
+                        bool is_vector_op = false;
+                        for (Operand& op : insn->operands) {
+                              op.setKill(false);
+                              bool lateKill =
+                              (UNLIKELY(op.hasRegClass() && op.regClass().is_linear_vgpr() && !op.isUndefined() && has_vgpr_def));
+                              lateKill |= is_vector_op || op.isVectorAligned();
+                              op.setLateKill(lateKill);
+                              is_vector_op = op.isVectorAligned();
+                        }
+
                         if (UNLIKELY(ctx.program->gfx_level >= GFX10 && insn->isVALU() &&
                               insn->definitions.back().regClass() == s2)) {
                               bool carry_in = insn->opcode == aco_opcode::v_addc_co_u32 ||
@@ -230,26 +240,19 @@ namespace aco {
                                           insn->operands[1].setLateKill(true);
                                     }
 
-                                    for (Operand& op : insn->operands) {
-                                          op.setKill(false);
-                                          if (UNLIKELY(op.hasRegClass() && op.regClass().is_linear_vgpr() && !op.isUndefined() &&
-                                                has_vgpr_def))
-                                                op.setLateKill(true);
-                                    }
-
                                     RegisterDemand operand_demand;
-
                                     auto tied_defs = get_tied_defs(insn);
                                     for (auto op_idx : tied_defs) {
                                           Temp tmp = insn->operands[op_idx].getTemp();
-                                          if (UNLIKELY(std::any_of(tied_defs.begin(), tied_defs.end(),
-                                                [&](uint32_t i) { return i < op_idx && insn->operands[i].getTemp() == tmp; }))) {
+                                          if (UNLIKELY(std::any_of(tied_defs.begin(), tied_defs.end(), [&](uint32_t i)
+                                          { return i < op_idx && insn->operands[i].getTemp() == tmp; }))) {
                                                 operand_demand += tmp;
-                                          insn->operands[op_idx].setCopyKill(true);
-                                                }
-                                                insn->operands[op_idx].setClobbered(true);
+                                                insn->operands[op_idx].setCopyKill(true);
+                                          }
+                                          insn->operands[op_idx].setClobbered(true);
                                     }
 
+                                    is_vector_op = false;
                                     for (unsigned i = 0; i < insn->operands.size(); ++i) {
                                           Operand& operand = insn->operands[i];
                                           if (UNLIKELY(!operand.isTemp()))
@@ -261,7 +264,8 @@ namespace aco {
                                                 ctx.program->needs_vcc |= operand.physReg() == vcc;
 
                                                 if (UNLIKELY(std::any_of(insn->definitions.begin(), insn->definitions.end(),
-                                                      [=](const Definition& def) {
+                                                      [=](const Definition& def)
+                                                      {
                                                             return def.isFixed() &&
                                                             def.physReg() + def.size() > operand.physReg() &&
                                                             operand.physReg() + operand.size() > def.physReg();
@@ -273,6 +277,27 @@ namespace aco {
                                                             operand_demand += temp;
                                                             insn->operands[j].setCopyKill(true);
                                                       }
+                                                }
+                                          }
+
+                                          if (is_vector_op || operand.isVectorAligned()) {
+                                                bool other_is_vector_op = false;
+                                                for (unsigned j = 0; j < i; j++) {
+                                                      if ((other_is_vector_op || insn->operands[j].isVectorAligned()) &&
+                                                            insn->operands[j].getTemp() == temp) {
+                                                            operand_demand += temp;
+                                                      insn->register_demand += temp;
+                                                      operand.setCopyKill(true);
+                                                      break;
+                                                            }
+                                                            other_is_vector_op = insn->operands[j].isVectorAligned();
+                                                }
+                                          }
+
+                                          if (UNLIKELY(operand.isLateKill())) {
+                                                for (Operand& other : insn->operands) {
+                                                      if (other.isTemp() && other.getTemp() == operand.getTemp())
+                                                            other.setLateKill(true);
                                                 }
                                           }
 
@@ -291,6 +316,7 @@ namespace aco {
                                           } else if (UNLIKELY(operand.isClobbered())) {
                                                 operand_demand += temp;
                                           }
+                                          is_vector_op = operand.isVectorAligned();
                                     }
 
                                     operand_demand += new_demand;
