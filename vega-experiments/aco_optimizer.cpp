@@ -1884,6 +1884,25 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       ctx.info[def.tempId()].parent_instr = instr.get();
 }
 
+/* PhysReg helpers (they are enum‐like in ACO) */
+#ifndef EXEC_LO
+#define EXEC_LO PhysReg{exec}
+#define EXEC_HI PhysReg{exec+1}
+#endif
+
+static inline bool is_exec_lo(const Operand& op)
+{
+    return op.isFixed() && op.physReg() == EXEC_LO;
+}
+static inline bool is_exec_hi(const Operand& op)
+{
+    return op.isFixed() && op.physReg() == EXEC_HI;
+}
+static inline bool is_vcc(const Operand& op)
+{
+    return op.isFixed() && (op.physReg() == vcc || op.physReg() == vcc_hi);
+}
+
 unsigned
 original_temp_id(opt_ctx& ctx, Temp tmp)
 {
@@ -2109,210 +2128,171 @@ combine_three_valu_op(opt_ctx& ctx, aco_ptr<Instruction>& instr, aco_opcode op2,
    return false;
 }
 
-/* Recognise   (x >> imm) | (y << (32-imm))          -> v_alignbit_b32 y, x, imm
- * and         (x >> (8*k)) | (y << (32-8*k))        -> v_alignbyte_b32 y, x, k (0-3)
- *
- * Restrictions:
- *   ‑ both shifts must be *_lsh?rev_b32 with a literal shift amount
- *   ‑ the shift results must be used only by the OR we are visiting
- *   ‑ no modifiers (abs/neg/…)
- *   ‑ imm ∈ [1, 31]  (0/32 are nop; the OR will already have been DCEd)
- */
 static bool
-combine_alignbit_like(opt_ctx&                     ctx,
-                      aco_ptr<Instruction>&        or_instr,
-                      aco_opcode                   target_opcode,
-                      unsigned                     granularity /* 1 for bit, 8 for byte */)
+combine_alignbit_like(opt_ctx&              ctx,
+                      aco_ptr<Instruction>& or_instr,
+                      aco_opcode            target,
+                      unsigned              granularity)
 {
-    /* Sanity: are we at the correct opcode and granularity? */
-    if (or_instr->operands.size() != 2 ||
-        or_instr->opcode           != aco_opcode::v_or_b32 ||
-        granularity == 0)
+    if (or_instr->opcode != aco_opcode::v_or_b32 ||
+        or_instr->operands.size() != 2 ||
+        granularity == 0 ||
+        ctx.program->gfx_level < GFX9)
         return false;
 
-    /* Helper lambdas ------------------------------------------------------ */
-    auto is_shift_candidate =
-    [&](Operand& op,
-        unsigned* shift /*out*/,
-        Operand*  value /*out*/,
-        bool*     is_shr /*out*/) -> bool
-        {
-            if (!op.isTemp())
-                return false;
+    /* ---------- recognise   v_lshrrev / v_lshlrev  -------------------- */
+    auto match_shift = [&](Operand op, unsigned& amount, Operand& src,
+                           bool& is_shr) -> bool {
+                               if (!op.isTemp())
+                                   return false;
+                               Instruction* sh = ctx.info[op.tempId()].parent_instr;
+                               if (!sh || ctx.uses[op.tempId()] != 1)
+                                   return false;
 
-            Instruction* sh = ctx.info[op.tempId()].parent_instr;
-            if (!sh || ctx.uses[op.tempId()] != 1)
-                return false;
+                               if (sh->opcode == aco_opcode::v_lshrrev_b32)
+                                   is_shr = true;
+                               else if (sh->opcode == aco_opcode::v_lshlrev_b32)
+                                   is_shr = false;
+                               else
+                                   return false;
 
-            /* match v_lshrrev_b32 imm, src  (shift right)
-             * or     v_lshlrev_b32 imm, src  (shift left )                 */
-            bool shr = false;
-            if (sh->opcode == aco_opcode::v_lshrrev_b32)
-                shr = true;
-            else if (sh->opcode == aco_opcode::v_lshlrev_b32)
-                shr = false;
-            else
-                return false;
+                               if (!sh->operands[0].isLiteral() ||
+                                   sh->operands[0].constantValue() >= 32)
+                                   return false;
 
-            if (!sh->operands[0].isLiteral() || sh->operands[0].constantValue() >= 32)
-                return false;
+                               amount = sh->operands[0].constantValue();
+                               if (amount == 0 || amount >= 32 || amount % granularity)
+                                   return false;
 
-            unsigned imm = sh->operands[0].constantValue();
-            if (imm == 0 || imm >= 32 || (imm % granularity))
-                return false; /* Either no-op or wrong granularity */
+                               src = sh->operands[1];
+                               return true;
+                           };
 
-                /* good, fill the out-params                                      */
-                if (shift) *shift = imm;
-                if (value) *value = sh->operands[1]; /* real source (second operand) */
-                    if (is_shr) *is_shr = shr;
-                    return true;
-        };
+                           unsigned a_amt = 0, b_amt = 0;
+                           Operand  a_src,  b_src;
+                           bool     a_shr = false, b_shr = false;
 
-        /* Try to match both operands ----------------------------------------- */
-        unsigned  s0_shift  = 0, s1_shift  = 0;
-        Operand   s0_value,     s1_value;
-        bool      s0_is_shr = false, s1_is_shr = false;
+                           if (!match_shift(or_instr->operands[0], a_amt, a_src, a_shr) ||
+                               !match_shift(or_instr->operands[1], b_amt, b_src, b_shr))
+                               return false;
 
-        if (!is_shift_candidate(or_instr->operands[0], &s0_shift, &s0_value, &s0_is_shr) ||
-            !is_shift_candidate(or_instr->operands[1], &s1_shift, &s1_value, &s1_is_shr))
-            return false;
+                           if (a_shr == b_shr)                     /* need one left, one right */
+                               return false;
+    if (a_amt + b_amt != 32)                /* must be complementary    */
+        return false;
 
-        /* We need one left and one right shift and complementary amounts ------*/
-        if (s0_is_shr == s1_is_shr)
-            return false;                               /* both left or both right */
+    /* choose mapping that fits ISA:  dst = (src0 >> imm) | (src1 << (32-imm)) */
+    Operand src0 = a_shr ? a_src : b_src;   /* right-shift origin */
+    Operand src1 = a_shr ? b_src : a_src;   /* left-shift origin  */
+    unsigned imm = a_shr ? a_amt : b_amt;   /* right-shift amount */
 
-            unsigned imm  = s0_is_shr ? s0_shift : s1_shift;        /* right-shift amount  */
-            unsigned limm = s0_is_shr ? s1_shift : s0_shift;        /* left-shift amount   */
-            if (imm + limm != 32 || imm % granularity)
-                return false;                               /* not complementary */
+    aco_ptr<Instruction> ali{
+        create_instruction(target, Format::VOP3, 3, 1)};
 
-                /* Build replacement instruction -------------------------------------- */
-                aco_ptr<Instruction> new_instr{
-                    create_instruction(target_opcode, Format::VOP3, 3, 1)};
+        ali->operands[0] = src0;
+        ali->operands[1] = src1;
+        ali->operands[2] = Operand::c32(imm / granularity);
+        ali->definitions[0] = or_instr->definitions[0];
+        ali->pass_flags     = or_instr->pass_flags;
 
-                    /* According to ISA: dst = (src0 << imm) | (src1 >> (N-imm))
-                     * -> src0 = left-shift source, src1 = right-shift source                */
-                    Operand left_src  = s0_is_shr ? s1_value : s0_value;
-                    Operand right_src = s0_is_shr ? s0_value : s1_value;
+        ctx.uses[or_instr->operands[0].tempId()]--;
+        ctx.uses[or_instr->operands[1].tempId()]--;
 
-                    new_instr->operands[0] = left_src;
-                    new_instr->operands[1] = right_src;
-                    new_instr->operands[2] = Operand::c32(imm / granularity); /* byte shift if granularity==8 */
+        if (src0.isTemp()) ctx.uses[src0.tempId()]++;
+            if (src1.isTemp()) ctx.uses[src1.tempId()]++;
 
-                    new_instr->definitions[0] = or_instr->definitions[0];
-                    new_instr->pass_flags     = or_instr->pass_flags;
-
-                    /* Update SSA-use information ----------------------------------------- */
-                    ctx.uses[new_instr->operands[0].isTemp() ? new_instr->operands[0].tempId() : 0]++;
-                    ctx.uses[new_instr->operands[1].isTemp() ? new_instr->operands[1].tempId() : 0]++;
-
-                    ctx.uses[or_instr->operands[0].tempId()]--;
-                    ctx.uses[or_instr->operands[1].tempId()]--;
-
-                    /* Install the new instruction and fix bookkeeping -------------------- */
-                    or_instr = std::move(new_instr);
-                    ctx.info[or_instr->definitions[0].tempId()].parent_instr = or_instr.get();
-                    return true;
+            or_instr = std::move(ali);
+    ctx.info[or_instr->definitions[0].tempId()].parent_instr = or_instr.get();
+    return true;
 }
 
 static inline bool
 combine_alignbit_b32(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 {
-    return combine_alignbit_like(ctx, instr, aco_opcode::v_alignbit_b32, 1 /*bit*/);
+    return combine_alignbit_like(ctx, instr, aco_opcode::v_alignbit_b32, 1);
 }
 
 static inline bool
 combine_alignbyte_b32(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 {
-    return combine_alignbit_like(ctx, instr, aco_opcode::v_alignbyte_b32, 8 /*byte*/);
+    return combine_alignbit_like(ctx, instr, aco_opcode::v_alignbyte_b32, 8);
 }
 
 static bool
 combine_bfi_b32(opt_ctx& ctx, aco_ptr<Instruction>& or_instr)
 {
     if (or_instr->opcode != aco_opcode::v_or_b32 ||
-        ctx.program->gfx_level  <  GFX9)
+        ctx.program->gfx_level < GFX9)
         return false;
 
-    auto match_and =
-    [&](Operand& in,
-        Operand*  val /*out*/,
-        uint32_t* lit /*out*/) -> bool
-        {
-            if (!in.isTemp())
-                return false;
-
-            Instruction* and_instr = ctx.info[in.tempId()].parent_instr;
-            if (!and_instr ||
-                ctx.uses[in.tempId()] != 1 ||
-                and_instr->opcode != aco_opcode::v_and_b32)
-                return false;
-
-            /* One operand must be literal, the other is the real source. */
-            if (and_instr->operands[0].isLiteral()) {
-                *lit = and_instr->operands[0].constantValue();
-                *val = and_instr->operands[1];
-            } else if (and_instr->operands[1].isLiteral()) {
-                *lit = and_instr->operands[1].constantValue();
-                *val = and_instr->operands[0];
-            } else {
-                return false;
-            }
-            return true;
-        };
-
-        /* Try to match both OR operands … */
-        Operand  base, ins;
-        uint32_t lit_base_mask = 0, lit_ins_mask = 0;
-
-        if (!match_and(or_instr->operands[0], &base, &lit_base_mask) ||
-            !match_and(or_instr->operands[1], &ins,  &lit_ins_mask))
-            return false;
-
-        /* … and make sure the masks are complements. */
-        if ((lit_base_mask ^ lit_ins_mask) != 0xffffffffu)
-            return false;
-
-    /* Decide which part is the insert and which the base so that
-     *  dst = (mask & ins) | (~mask & base).                              */
-    Operand  op_base, op_ins;
-    uint32_t mask = 0;
-    if ((lit_ins_mask & lit_base_mask) == 0)
+    /* ---- helper to match “src & literal” ----------------------------- */
+    auto match_and_side = [&](Operand in, Operand& src, uint32_t& lit) -> bool
     {
-        /* One is mask, the other is ~mask.  We need (mask & ins).     */
-        if (lit_ins_mask < lit_base_mask) {
-            mask    = lit_ins_mask;
-            op_ins  = ins;
-            op_base = base;
-        } else {
-            mask    = lit_base_mask;
-            op_ins  = base;
-            op_base = ins;
+        if (!in.isTemp())
+            return false;
+
+        Instruction* and_i = ctx.info[in.tempId()].parent_instr;
+        if (!and_i || and_i->opcode != aco_opcode::v_and_b32 ||
+            ctx.uses[in.tempId()] != 1)
+            return false;
+
+        for (unsigned op = 0; op < 2; ++op) {
+            if (and_i->operands[op].isLiteral()) {
+                uint32_t imm = and_i->operands[op].constantValue();
+
+                /* must be VERD/inline constant so instruction can dual issue */
+                if (!Operand::is_constant_representable(imm, 4))
+                    return false;
+
+                lit = imm;
+                src = and_i->operands[1 ^ op];
+                return true;
+            }
         }
-    } else {
-        /* Not complementary in the expected way.                        */
         return false;
+    };
+
+    /* ---- analyse both OR operands ------------------------------------ */
+    Operand   val0, val1;
+    uint32_t  mask0 = 0, mask1 = 0;
+
+    if (!match_and_side(or_instr->operands[0], val0, mask0) ||
+        !match_and_side(or_instr->operands[1], val1, mask1))
+        return false;
+
+    /* masks must form a perfect complement */
+    if ((mask0 ^ mask1) != 0xffffffffu || mask0 == 0 || mask0 == 0xffffffffu)
+        return false;
+
+    /* decide which side is mask / ~mask */
+    Operand  base, ins;
+    uint32_t mask;
+    if (mask1 == (~mask0)) {
+        ins  = val0;   base = val1;   mask = mask0;
+    } else { /* mask0 == ~mask1 */
+        ins  = val1;   base = val0;   mask = mask1;
     }
 
-    /* Build v_bfi_b32 --------------------------------------------------- */
+    /* ---- build v_bfi_b32 --------------------------------------------- */
     aco_ptr<Instruction> bfi{
         create_instruction(aco_opcode::v_bfi_b32, Format::VOP3, 3, 1)};
 
-        bfi->operands[0] = op_base;             /* src0 */
-        bfi->operands[1] = op_ins;              /* src1 */
-        bfi->operands[2] = Operand::c32(mask);  /* src2 (mask) */
-
+        bfi->operands[0]    = base;
+        bfi->operands[1]    = ins;
+        bfi->operands[2]    = Operand::c32(mask);    /* inline const */
         bfi->definitions[0] = or_instr->definitions[0];
         bfi->pass_flags     = or_instr->pass_flags;
 
-        /* Update use-counts (the two &-results disappear) ------------------ */
-        ctx.uses[or_instr->operands[0].tempId()]--;
+        /* ---- SSA bookkeeping --------------------------------------------- */
+        ctx.uses[or_instr->operands[0].tempId()]--;   /* kill AND temps */
         ctx.uses[or_instr->operands[1].tempId()]--;
 
-        /* Insert the new instruction, patch SSA info ----------------------- */
-        or_instr = std::move(bfi);
-        ctx.info[or_instr->definitions[0].tempId()].parent_instr = or_instr.get();
-        return true;
+        if (base.isTemp()) ctx.uses[base.tempId()]++; /* new direct uses */
+            if (ins .isTemp()) ctx.uses[ins .tempId()]++;
+
+            or_instr = std::move(bfi);
+    ctx.info[or_instr->definitions[0].tempId()].parent_instr = or_instr.get();
+    return true;
 }
 
 static bool
@@ -2322,22 +2302,21 @@ combine_bfe_b32(opt_ctx& ctx, aco_ptr<Instruction>& and_instr)
         ctx.program->gfx_level < GFX8)
         return false;
 
-    /* literal contiguous mask?  ----------------------------------- */
     if (!and_instr->operands[1].isLiteral())
         return false;
     uint32_t mask = and_instr->operands[1].constantValue();
-    if (!mask || (mask & (mask + 1u)) != 0)
-        return false;                             /* not 0…01…1 */
-
-        unsigned width = util_bitcount(mask);        /* popcount == width */
-        if (width > 32)
-            return false;
-
-    /* unique user and upstream shift ------------------------------ */
-    if (!and_instr->operands[0].isTemp() ||
-        ctx.uses[and_instr->operands[0].tempId()] != 1)
+    if (!mask || (mask & (mask + 1u)) != 0u)
         return false;
-    Instruction* sh = ctx.info[and_instr->operands[0].tempId()].parent_instr;
+
+    unsigned width = util_bitcount(mask);
+
+    if (!and_instr->operands[0].isTemp())
+        return false;
+    unsigned tmp_id = and_instr->operands[0].tempId();
+    if (ctx.uses[tmp_id] != 1)
+        return false;
+
+    Instruction* sh = ctx.info[tmp_id].parent_instr;
     if (!sh || !(sh->opcode == aco_opcode::v_lshrrev_b32 ||
         sh->opcode == aco_opcode::v_ashrrev_i32))
         return false;
@@ -2346,23 +2325,144 @@ combine_bfe_b32(opt_ctx& ctx, aco_ptr<Instruction>& and_instr)
         return false;
 
     unsigned offset = sh->operands[0].constantValue();
+    if (offset + width > 32)
+        return false;
 
-    /* build bfe ---------------------------------------------------- */
-    aco_opcode bfe_op = sh->opcode == aco_opcode::v_lshrrev_b32 ?
-    aco_opcode::v_bfe_u32 : aco_opcode::v_bfe_i32;
+        aco_opcode bfe_op = (sh->opcode == aco_opcode::v_lshrrev_b32)
+        ? aco_opcode::v_bfe_u32
+        : aco_opcode::v_bfe_i32;
 
-    aco_ptr<Instruction> bfe{create_instruction(bfe_op, Format::VOP3, 3, 1)};
-    bfe->operands[0] = sh->operands[1];           /* src */
-    bfe->operands[1] = Operand::c32(offset);      /* offset */
-    bfe->operands[2] = Operand::c32(width);       /* width  */
-    bfe->definitions[0] = and_instr->definitions[0];
-    bfe->pass_flags     = and_instr->pass_flags;
+    unsigned enc_width = (width == 32) ? 0 : width;
 
-    /* fix uses & SSA ---------------------------------------------- */
-    ctx.uses[and_instr->operands[0].tempId()]--;
-    and_instr = std::move(bfe);
+    aco_ptr<Instruction> bfe{
+        create_instruction(bfe_op, Format::VOP3, 3, 1)};
+
+        Operand src_val = sh->operands[1];
+
+        bfe->operands[0]    = src_val;
+        bfe->operands[1]    = Operand::c32(offset);
+        bfe->operands[2]    = Operand::c32(enc_width);
+        bfe->definitions[0] = and_instr->definitions[0];
+        bfe->pass_flags     = and_instr->pass_flags;
+
+        ctx.uses[tmp_id]--;
+        if (src_val.isTemp()) ctx.uses[src_val.tempId()]++;
+
+            and_instr = std::move(bfe);
     ctx.info[and_instr->definitions[0].tempId()].parent_instr = and_instr.get();
     return true;
+}
+
+static bool
+combine_bcnt_mbcnt(opt_ctx& ctx, aco_ptr<Instruction>& add_instr)
+{
+    if (add_instr->opcode != aco_opcode::v_add_u32 ||
+        add_instr->usesModifiers() ||
+        ctx.program->gfx_level < GFX9)
+        return false;
+
+    int          bcnt_idx = -1;
+    Instruction* bcnt     = nullptr;
+
+    for (unsigned i = 0; i < 2; ++i) {
+        if (!add_instr->operands[i].isTemp())
+            continue;
+
+        unsigned tmp_id = add_instr->operands[i].tempId();
+        if (ctx.uses[tmp_id] != 1)
+            continue;
+
+        Instruction* cand = ctx.info[tmp_id].parent_instr;
+        if (!cand || cand->opcode != aco_opcode::v_bcnt_u32_b32)
+            continue;
+
+        if (!cand->operands[1].isLiteral() ||
+            !cand->operands[1].constantEquals(0))
+            continue;
+
+        bcnt_idx = i;
+        bcnt     = cand;
+        break;
+    }
+
+    if (!bcnt)
+        return false;
+
+    if (!(is_exec_lo(bcnt->operands[0]) || is_exec_hi(bcnt->operands[0])))
+        return false;
+
+    bool lo_segment    = is_exec_lo(bcnt->operands[0]);
+    aco_opcode mbcnt_op = lo_segment ? aco_opcode::v_mbcnt_lo_u32_b32
+    : aco_opcode::v_mbcnt_hi_u32_b32;
+
+    Operand carry_in = add_instr->operands[1u ^ bcnt_idx];
+
+    aco_ptr<Instruction> mbcnt{
+        create_instruction(mbcnt_op, Format::VOP3, 2, 1)};
+
+        mbcnt->operands[0]    = bcnt->operands[0];
+        mbcnt->operands[1]    = carry_in;
+        mbcnt->definitions[0] = add_instr->definitions[0];
+        mbcnt->pass_flags     = add_instr->pass_flags;
+
+        ctx.uses[add_instr->operands[bcnt_idx].tempId()]--;
+
+        add_instr = std::move(mbcnt);
+        ctx.info[add_instr->definitions[0].tempId()].parent_instr = add_instr.get();
+        return true;
+}
+
+static bool
+combine_sad_u8(opt_ctx& ctx, aco_ptr<Instruction>& add_instr)
+{
+    if (add_instr->opcode != aco_opcode::v_add_u32 ||
+        add_instr->usesModifiers() ||
+        ctx.program->gfx_level < GFX9)
+        return false;
+
+    int          sad_idx = -1;
+    Instruction* sad     = nullptr;
+
+    for (unsigned i = 0; i < 2; ++i) {
+        if (!add_instr->operands[i].isTemp())
+            continue;
+
+        unsigned tmp_id = add_instr->operands[i].tempId();
+        if (ctx.uses[tmp_id] != 1)
+            continue;
+
+        Instruction* cand = ctx.info[tmp_id].parent_instr;
+        if (!cand ||
+            !((cand->opcode == aco_opcode::v_sad_u8) ||
+            (cand->opcode == aco_opcode::v_sad_hi_u8)))
+            continue;
+
+        if (!cand->operands[2].isLiteral() ||
+            !cand->operands[2].constantEquals(0))
+            continue;
+
+        sad_idx = i;
+        sad     = cand;
+        break;
+    }
+
+    if (!sad)
+        return false;
+
+    aco_ptr<Instruction> fused{
+        create_instruction(sad->opcode, Format::VOP3, 3, 1)};
+
+        fused->operands[0] = sad->operands[0];
+        fused->operands[1] = sad->operands[1];
+        fused->operands[2] = add_instr->operands[1u ^ sad_idx];
+        fused->definitions[0] = add_instr->definitions[0];
+        fused->pass_flags     = add_instr->pass_flags;
+
+        ctx.uses[add_instr->operands[sad_idx].tempId()]--;
+
+        add_instr = std::move(fused);
+        ctx.info[add_instr->definitions[0].tempId()].parent_instr = add_instr.get();
+        return true;
 }
 
 /* creates v_lshl_add_u32, v_lshl_or_b32 or v_and_or_b32 */
@@ -4469,6 +4569,8 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          } else if (combine_add_or_then_and_lshl(ctx, instr)) {
          }
       }
+      if (!combine_bcnt_mbcnt(ctx, instr))
+          combine_sad_u8(ctx, instr);
    } else if ((instr->opcode == aco_opcode::v_add_co_u32 ||
                instr->opcode == aco_opcode::v_add_co_u32_e64) &&
               !instr->usesModifiers()) {
@@ -4508,6 +4610,8 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       combine_sabsdiff(ctx, instr);
    } else if (instr->opcode == aco_opcode::v_and_b32) {
       combine_v_andor_not(ctx, instr);
+      if (!combine_bfe_b32(ctx, instr)) {
+      }
    } else if (instr->opcode == aco_opcode::v_fma_f32 || instr->opcode == aco_opcode::v_fma_f16) {
       /* set existing v_fma_f32 with label_mad so we can create v_fmamk_f32/v_fmaak_f32.
        * since ctx.uses[mad_info::mul_temp_id] is always 0, we don't have to worry about

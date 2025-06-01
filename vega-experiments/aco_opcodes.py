@@ -986,7 +986,6 @@ VOP2 = {
    ("v_fmac_f16",          dst(F16),      src(F16, F16, F16), op(gfx10=0x36)),
    ("v_fmamk_f16",         dst(noMods(F16)), noMods(src(F16, F16, IMM)), op(gfx10=0x37)),
    ("v_fmaak_f16",         dst(noMods(F16)), noMods(src(F16, F16, IMM)), op(gfx10=0x38)),
-   ("v_pk_fmac_f16",       dst(noMods(PkF16)), noMods(src(PkF16, PkF16, PkF16)), op(gfx10=0x3c)),
    ("v_dot2c_f32_f16",     dst(noMods(F32)), noMods(src(PkF16, PkF16, F32)), op(gfx9=0x37, gfx10=0x02, gfx12=-1)), #v_dot2acc_f32_f16 in GFX11
    ("v_add_f64",           dst(F64),      src(F64, F64), op(gfx12=0x02), InstrClass.ValuDoubleAdd),
    ("v_mul_f64",           dst(F64),      src(F64, F64), op(gfx12=0x06), InstrClass.ValuDoubleAdd),
@@ -1199,15 +1198,16 @@ VOPP = {
    ("v_pk_max_u16",     dst(PkU16), src(PkU16, PkU16), op(gfx9=0x0c)),
    ("v_pk_min_u16",     dst(PkU16), src(PkU16, PkU16), op(gfx9=0x0d)),
    ("v_pk_fma_f16",     dst(PkF16), src(PkF16, PkF16, PkF16), op(gfx9=0x0e)),
+   ("v_pk_fmac_f16",    dst(PkF16), src(PkF16, PkF16, PkF16), op(gfx9=0x1ea, gfx10=0x3c), InstrClass.ValuFma),
    ("v_pk_add_f16",     dst(PkF16), src(PkF16, PkF16), op(gfx9=0x0f)),
    ("v_pk_mul_f16",     dst(PkF16), src(PkF16, PkF16), op(gfx9=0x10)),
    ("v_pk_min_f16",     dst(PkF16), src(PkF16, PkF16), op(gfx9=0x11, gfx12=0x1b)), # called v_pk_min_num_f16 in GFX12
    ("v_pk_max_f16",     dst(PkF16), src(PkF16, PkF16), op(gfx9=0x12, gfx12=0x1c)), # called v_pk_min_num_f16 in GFX12
    ("v_pk_minimum_f16", dst(PkF16), src(PkF16, PkF16), op(gfx12=0x1d)),
    ("v_pk_maximum_f16", dst(PkF16), src(PkF16, PkF16), op(gfx12=0x1e)),
-   ("v_fma_mix_f32",    dst(F32), src(F32, F32, F32), op(gfx9=0x20)), # v_mad_mix_f32 in VEGA ISA, v_fma_mix_f32 in RDNA ISA
-   ("v_fma_mixlo_f16",  dst(F16), src(F32, F32, F32), op(gfx9=0x21)), # v_mad_mixlo_f16 in VEGA ISA, v_fma_mixlo_f16 in RDNA ISA
-   ("v_fma_mixhi_f16",  dst(F16), src(F32, F32, F32), op(gfx9=0x22)), # v_mad_mixhi_f16 in VEGA ISA, v_fma_mixhi_f16 in RDNA ISA
+   ("v_fma_mix_f32",    dst(F32), src(F32, F32, F32), op(gfx9=0x20), InstrClass.ValuFma),
+   ("v_fma_mixlo_f16",  dst(F16), src(F32, F32, F32), op(gfx9=0x21), InstrClass.ValuFma),
+   ("v_fma_mixhi_f16",  dst(F16), src(F32, F32, F32), op(gfx9=0x22), InstrClass.ValuFma),
    ("v_dot2_i32_i16",      dst(U32), src(PkU16, PkU16, U32), op(gfx9=0x26, gfx10=0x14, gfx11=-1)),
    ("v_dot2_u32_u16",      dst(U32), src(PkU16, PkU16, U32), op(gfx9=0x27, gfx10=0x15, gfx11=-1)),
    ("v_dot4_i32_iu8",      dst(U32), src(PkU16, PkU16, U32), op(gfx11=0x16)),
@@ -1275,8 +1275,8 @@ for (name, defs, ops, num) in VINTERP:
 # VOP3 instructions: 3 inputs, 1 output
 # VOP3b instructions: have a unique scalar output, e.g. VOP2 with vcc out
 VOP3 = {
-   ("v_mad_legacy_f32",        dst(F32), src(F32, F32, F32), op(0x140, gfx8=0x1c0, gfx10=0x140, gfx11=-1)), # GFX6-GFX10
-   ("v_mad_f32",               dst(F32), src(F32, F32, F32), op(0x141, gfx8=0x1c1, gfx10=0x141, gfx11=-1)),
+   ("v_mad_legacy_f32",        dst(F32), src(mods(F32), mods(F32), mods(F32)), op(0x140, gfx8=0x1c0, gfx10=0x140, gfx11=-1)), # GFX6-GFX10
+   ("v_mad_f32",               dst(F32), src(mods(F32), mods(F32), mods(F32)), op(0x141, gfx8=0x1c1, gfx10=0x141, gfx11=-1)),
    ("v_mad_i32_i24",           dst(U32), src(U32, U32, U32), op(0x142, gfx8=0x1c2, gfx10=0x142, gfx11=0x20a)),
    ("v_mad_u32_u24",           dst(U32), src(U32, U32, U32), op(0x143, gfx8=0x1c3, gfx10=0x143, gfx11=0x20b)),
    ("v_cubeid_f32",            dst(F32), src(F32, F32, F32), op(0x144, gfx8=0x1c4, gfx10=0x144, gfx11=0x20c)),
@@ -1286,8 +1286,8 @@ VOP3 = {
    ("v_bfe_u32",               dst(U32), src(U32, U32, U32), op(0x148, gfx8=0x1c8, gfx10=0x148, gfx11=0x210)),
    ("v_bfe_i32",               dst(U32), src(U32, U32, U32), op(0x149, gfx8=0x1c9, gfx10=0x149, gfx11=0x211)),
    ("v_bfi_b32",               dst(U32), src(U32, U32, U32), op(0x14a, gfx8=0x1ca, gfx10=0x14a, gfx11=0x212)),
-   ("v_fma_f32",               dst(F32), src(F32, F32, F32), op(0x14b, gfx8=0x1cb, gfx10=0x14b, gfx11=0x213), InstrClass.ValuFma),
-   ("v_fma_f64",               dst(F64), src(F64, F64, F64), op(0x14c, gfx8=0x1cc, gfx10=0x14c, gfx11=0x214), InstrClass.ValuDouble),
+   ("v_fma_f32",               dst(F32), src(mods(F32), mods(F32), mods(F32)), op(0x14b, gfx8=0x1cb, gfx10=0x14b, gfx11=0x213), InstrClass.ValuFma),
+   ("v_fma_f64",               dst(F64), src(mods(F64), mods(F64), mods(F64)), op(0x14c, gfx8=0x1cc, gfx10=0x14c, gfx11=0x214), InstrClass.ValuDouble),
    ("v_lerp_u8",               dst(U32), src(U32, U32, U32), op(0x14d, gfx8=0x1cd, gfx10=0x14d, gfx11=0x215)),
    ("v_alignbit_b32",          dst(U32), src(mods(U32), mods(U32), U16), op(0x14e, gfx8=0x1ce, gfx10=0x14e, gfx11=0x216)),
    ("v_alignbyte_b32",         dst(U32), src(mods(U32), mods(U32), U16), op(0x14f, gfx8=0x1cf, gfx10=0x14f, gfx11=0x217)),
