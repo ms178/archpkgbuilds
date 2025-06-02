@@ -217,7 +217,7 @@ struct amdgpu_vm_bo_base {
 	 * Protected by vm status_lock. Used to ensure decrement matches.
 	 * Initialized to __AMDGPU_PL_NUM (invalid).
 	 */
-	uint32_t			last_stat_memtype; // <<< Added Field
+	uint32_t			last_stat_memtype;
 };
 
 /* provided by hw blocks that can write ptes, e.g., sdma */
@@ -379,10 +379,6 @@ struct amdgpu_vm {
 
 	/* BOs which are invalidated, has been updated in the PTs */
 	struct list_head        done;
-
-	/* PT BOs scheduled to free and fill with zero if vm_resv is not hold */
-	struct list_head	pt_freed;
-	struct work_struct	pt_free_work;
 
 	/* contains the page directory */
 	struct amdgpu_vm_bo_base     root;
