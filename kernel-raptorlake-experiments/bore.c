@@ -1,3 +1,38 @@
+/*
+ * Burst-Oriented Response Enhancer (BORE) CPU Scheduler - Core Logic & Tuning
+ * Copyright (C) 2021-2024 Masahito Suzuki <firelzrd@gmail.com>
+ *
+ * This version incorporates several enhancements over the upstream BORE 5.9.6
+ * (commit a5aad25a91f5), primarily focused on:
+ *
+ * 1.  Advanced Intel Hybrid CPU (P/E core) detection and adaptation:
+ *     - Automatic detection of P/E core topology via kernel interfaces.
+ *     - Dynamic application of P/E core-specific tunables for penalty
+ *       offset, penalty scaling, and smoothing factors.
+ *     - Raptor Lake specific tunings are automatically applied if detected.
+ *     - Uses a static key (`bore_core_aware_key`) for efficient conditional
+ *       execution of core-aware logic in hot paths.
+ *     - CPU hotplug support for updating topology information.
+ *     - Deferred initialization of core-aware features if topology information
+ *       is not immediately available at early boot, with a late_initcall retry.
+ *
+ * 2.  Refined Initialization and Sysctl Handling:
+ *     - More robust sysctl registration using `register_sysctl_sz` with
+ *       explicit table sizing.
+ *     - Sysctl table for core-aware tunables.
+ *     - Tunable definitions (`DEF_U8`, `DEF_U32`) for clarity.
+ *     - Pre-computation of a penalty scale lookup table (`bore_scale_tbl`).
+ *
+ * 3.  Code Structure and Clarity:
+ *     - Organized into numbered sections for better readability.
+ *     - Clear separation of tunables, constants, and functional blocks.
+ *     - Explicit `pr_fmt` for BORE-specific kernel messages.
+ *
+ * For the original BORE implementation and concepts, please refer to
+ * Masahito Suzuki's work. This file focuses on the core BORE logic
+ * and its integration with hybrid CPU awareness.
+ */
+
 #undef pr_fmt
 #define pr_fmt(fmt) "BORE: " fmt
 
