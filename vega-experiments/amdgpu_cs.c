@@ -177,182 +177,176 @@ static int amdgpu_cs_pass1(struct amdgpu_cs_parser *p,
 {
 	struct amdgpu_fpriv *fpriv  = p->filp->driver_priv;
 	struct amdgpu_vm    *vm     = &fpriv->vm;
-	uint32_t            uf_off  = 0;
 	unsigned int        num_ibs[AMDGPU_CS_GANG_SIZE] = { };
-	size_t              total_kdata = 0;
+	uint32_t            uf_off  = 0;
+	size_t              total_kdata = 0, pool_off = 0;
+	u64                *u_chunk_ptrs        = NULL;
+	u64                *u_chunk_data_addrs  = NULL;
 	int                 i, r = 0;
 
-	/* ---------------------------------------------------------------- */
-	/* 1. Copy the array of user chunk pointers                         */
-	/* ---------------------------------------------------------------- */
+	/* ---- 1.  basic array of user pointers -------------------------------- */
 	if (!cs->in.num_chunks || cs->in.num_chunks > AMDGPU_CS_MAX_CHUNKS)
 		return -EINVAL;
 
-	u64 *u_chunk_ptrs =
-	kvmalloc_array(cs->in.num_chunks, sizeof(u64), GFP_KERNEL);
+	u_chunk_ptrs = kvmalloc_array(cs->in.num_chunks, sizeof(u64), GFP_KERNEL);
 	if (!u_chunk_ptrs)
 		return -ENOMEM;
 
-	if (copy_from_user(u_chunk_ptrs,
-		u64_to_user_ptr(cs->in.chunks),
-					   cs->in.num_chunks * sizeof(u64))) {
+	if (copy_from_user(u_chunk_ptrs, u64_to_user_ptr(cs->in.chunks),
+		cs->in.num_chunks * sizeof(u64))) {
 		r = -EFAULT;
-	goto err_free_ptrs;
-					   }
+	goto out;
+		}
 
-					   /* ---------------------------------------------------------------- */
-					   /* 2. Allocate the parser->chunks array                             */
-					   /* ---------------------------------------------------------------- */
-					   p->nchunks = cs->in.num_chunks;
-					   p->chunks  = kvmalloc_array(p->nchunks,
-												   sizeof(struct amdgpu_cs_chunk),
-												   GFP_KERNEL);
-					   if (!p->chunks) {
-						   r = -ENOMEM;
-						   goto err_free_ptrs;
-					   }
+		/* ---- 2. parser->chunks ------------------------------------------------ */
+		p->nchunks = cs->in.num_chunks;
+		p->chunks  = kvmalloc_array(p->nchunks, sizeof(*p->chunks), GFP_KERNEL);
+		if (!p->chunks) {
+			r = -ENOMEM;
+			goto out;
+		}
 
-					   /* We also need one temporary array to remember each chunk_data addr */
-					   u64 *u_chunk_data_addrs =
-					   kvmalloc_array(p->nchunks, sizeof(u64), GFP_KERNEL);
-					   if (!u_chunk_data_addrs) {
-						   r = -ENOMEM;
-						   goto err_free_chunks;
-					   }
+		/* temp helper array */
+		u_chunk_data_addrs = kvmalloc_array(p->nchunks, sizeof(u64), GFP_KERNEL);
+		if (!u_chunk_data_addrs) {
+			r = -ENOMEM;
+			goto err_free_chunks;
+		}
 
-					   /* ---------------------------------------------------------------- */
-					   /* 3. First pass: validate headers + sum total_kdata                */
-					   /* ---------------------------------------------------------------- */
-					   for (i = 0; i < p->nchunks; ++i) {
-						   struct drm_amdgpu_cs_chunk __user *uhdr =
-						   u64_to_user_ptr(u_chunk_ptrs[i]);
-						   struct drm_amdgpu_cs_chunk khdr;
+		/* ---- 3. first pass : header checks & size accounting ----------------- */
+		for (i = 0; i < p->nchunks; ++i) {
+			struct drm_amdgpu_cs_chunk __user *uhdr =
+			u64_to_user_ptr(u_chunk_ptrs[i]);
+			struct drm_amdgpu_cs_chunk khdr;
+			size_t bytes;
 
-						   if (copy_from_user(&khdr, uhdr, sizeof(khdr))) {
-							   r = -EFAULT;
-							   goto err_free_data_addrs;
-						   }
+			if (copy_from_user(&khdr, uhdr, sizeof(khdr))) {
+				r = -EFAULT;
+				goto err_free_tmp;
+			}
 
-						   /* Length bounds and overflow check */
-						   if (khdr.length_dw > (UINT_MAX / 4)) {	/* 4 bytes per DW */
-							   r = -EINVAL;
-							   goto err_free_data_addrs;
-						   }
+			/* length_dw must fit into size_t * 4 */
+			if (khdr.length_dw > (SIZE_MAX / 4)) {
+				r = -EINVAL;
+				goto err_free_tmp;
+			}
+			bytes = (size_t)khdr.length_dw * 4;
 
-						   p->chunks[i].chunk_id  = khdr.chunk_id;
-						   p->chunks[i].length_dw = khdr.length_dw;
-						   u_chunk_data_addrs[i]  = khdr.chunk_data;
+			/* overflow-safe accumulation */
+			if (total_kdata > SIZE_MAX - bytes) {
+				r = -ENOMEM;
+				goto err_free_tmp;
+			}
+			total_kdata += bytes;
+			if (total_kdata > KMALLOC_MAX_SIZE) {
+				r = -ENOMEM;
+				goto err_free_tmp;
+			}
 
-						   total_kdata += (size_t)khdr.length_dw * 4;
-						   if (total_kdata > KMALLOC_MAX_SIZE) { /* overflow guard */
-							   r = -ENOMEM;
-							   goto err_free_data_addrs;
-						   }
-					   }
+			p->chunks[i].chunk_id   = khdr.chunk_id;
+			p->chunks[i].length_dw  = khdr.length_dw;
+			u_chunk_data_addrs[i]   = khdr.chunk_data;
+		}
 
-					   /* ---------------------------------------------------------------- */
-					   /* 4. Allocate one contiguous kdata pool                            */
-					   /* ---------------------------------------------------------------- */
-					   p->kdata_pool = kvmalloc(total_kdata, GFP_KERNEL);
-					   if (!p->kdata_pool) {
-						   r = -ENOMEM;
-						   goto err_free_data_addrs;
-					   }
+		if (!total_kdata) {
+			r = -EINVAL;		/* nothing to execute */
+			goto err_free_tmp;
+		}
 
-					   /* ---------------------------------------------------------------- */
-					   /* 5. Second pass: copy kdata & run early semantic checks           */
-					   /* ---------------------------------------------------------------- */
-					   size_t pool_off = 0;
+		/* ---- 4. one contiguous pool ------------------------------------------ */
+		p->kdata_pool = kvmalloc(total_kdata, GFP_KERNEL);
+		if (!p->kdata_pool) {
+			r = -ENOMEM;
+			goto err_free_tmp;
+		}
 
-					   for (i = 0; i < p->nchunks; ++i) {
-						   size_t bytes = (size_t)p->chunks[i].length_dw * 4;
+		/* ---- 5. second pass : copy data & early semantic checks -------------- */
+		for (i = 0; i < p->nchunks; ++i) {
+			size_t bytes = (size_t)p->chunks[i].length_dw * 4;
 
-						   p->chunks[i].kdata = (uint32_t *)((u8 *)p->kdata_pool + pool_off);
+			p->chunks[i].kdata = (uint32_t *)((u8 *)p->kdata_pool + pool_off);
 
-						   if (copy_from_user(p->chunks[i].kdata,
-							   u64_to_user_ptr(u_chunk_data_addrs[i]),
-											  bytes)) {
-							   r = -EFAULT;
-						   goto err_free_data_addrs;
-											  }
+			if (copy_from_user(p->chunks[i].kdata,
+				u64_to_user_ptr(u_chunk_data_addrs[i]),
+							   bytes)) {
+				r = -EFAULT;
+			goto err_free_pool;
+							   }
 
-											  /* —— Early per-chunk validation (unchanged logic) ———— */
-											  switch (p->chunks[i].chunk_id) {
-												  case AMDGPU_CHUNK_ID_IB:
-													  r = amdgpu_cs_p1_ib(p, p->chunks[i].kdata, num_ibs);
-													  break;
-												  case AMDGPU_CHUNK_ID_FENCE:
-													  r = amdgpu_cs_p1_user_fence(p, p->chunks[i].kdata,
-																				  &uf_off);
-													  break;
-												  case AMDGPU_CHUNK_ID_BO_HANDLES:
-													  if (p->bo_list)
-														  r = -EINVAL;
-												  else {
-													  r = amdgpu_cs_p1_bo_handles(p,
-																				  p->chunks[i].kdata);
-												  }
-													  break;
-												  case AMDGPU_CHUNK_ID_DEPENDENCIES:
-												  case AMDGPU_CHUNK_ID_SYNCOBJ_IN:
-												  case AMDGPU_CHUNK_ID_SYNCOBJ_OUT:
-												  case AMDGPU_CHUNK_ID_SCHEDULED_DEPENDENCIES:
-												  case AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT:
-												  case AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL:
-												  case AMDGPU_CHUNK_ID_CP_GFX_SHADOW:
-													  r = 0; /* handled later */
-													  break;
-												  default:
-													  r = -EINVAL;
-											  }
-											  if (r)
-												  goto err_free_data_addrs;
+							   switch (p->chunks[i].chunk_id) {
+								   case AMDGPU_CHUNK_ID_IB:
+									   r = amdgpu_cs_p1_ib(p, p->chunks[i].kdata, num_ibs);
+									   break;
+								   case AMDGPU_CHUNK_ID_FENCE:
+									   r = amdgpu_cs_p1_user_fence(p, p->chunks[i].kdata, &uf_off);
+									   break;
+								   case AMDGPU_CHUNK_ID_BO_HANDLES:
+									   if (p->bo_list) {
+										   r = -EINVAL;
+									   } else {
+										   r = amdgpu_cs_p1_bo_handles(p, p->chunks[i].kdata);
+									   }
+									   break;
+								   case AMDGPU_CHUNK_ID_DEPENDENCIES:
+								   case AMDGPU_CHUNK_ID_SYNCOBJ_IN:
+								   case AMDGPU_CHUNK_ID_SYNCOBJ_OUT:
+								   case AMDGPU_CHUNK_ID_SCHEDULED_DEPENDENCIES:
+								   case AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT:
+								   case AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL:
+								   case AMDGPU_CHUNK_ID_CP_GFX_SHADOW:
+									   r = 0;		/* handled later */
+									   break;
+								   default:
+									   r = -EINVAL;
+							   }
+							   if (r)
+								   goto err_free_pool;
 
-						   pool_off += bytes;
-					   }
+			pool_off += bytes;
+		}
 
-					   /* ---------------------------------------------------------------- */
-					   /* 6. Allocate CS jobs (unchanged)                                  */
-					   /* ---------------------------------------------------------------- */
-					   for (i = 0; i < p->gang_size; ++i) {
-						   r = amdgpu_job_alloc(p->adev, vm, p->entities[i], vm,
-												num_ibs[i], &p->jobs[i]);
-						   if (r)
-							   goto err_free_data_addrs;
+		/* ---- 6. need at least one entity / job -------------------------------- */
+		if (!p->gang_size) {
+			r = -EINVAL;
+			goto err_free_pool;
+		}
 
-						   p->jobs[i]->enforce_isolation =
-						   p->adev->enforce_isolation[fpriv->xcp_id];
-					   }
-					   p->gang_leader = p->jobs[p->gang_leader_idx];
+		for (i = 0; i < p->gang_size; ++i) {
+			r = amdgpu_job_alloc(p->adev, vm, p->entities[i], vm, num_ibs[i], &p->jobs[i]);
+			if (r)
+				goto err_free_pool;
+			p->jobs[i]->enforce_isolation = p->adev->enforce_isolation[fpriv->xcp_id];
+		}
 
-					   if (p->ctx->generation != p->gang_leader->generation) {
-						   r = -ECANCELED;
-						   goto err_free_data_addrs;
-					   }
+		p->gang_leader = p->jobs[p->gang_leader_idx];
 
-					   if (p->uf_bo)
-						   p->gang_leader->uf_addr = uf_off;
+		if (p->ctx->generation != p->gang_leader->generation) {
+			r = -ECANCELED;
+			goto err_free_pool;
+		}
+
+		if (p->uf_bo)
+			p->gang_leader->uf_addr = uf_off;
 
 	amdgpu_vm_set_task_info(vm);
 
-	/* —— success ——————————————————————————————— */
+	/* ---- success --------------------------------------------------------- */
 	r = 0;
 	goto out;
 
-	/* ---------------------------------------------------------------- */
-	/* 7. Error paths – free allocations                                */
-	/* ---------------------------------------------------------------- */
-	err_free_data_addrs:
+	/* ---- error paths ------------------------------------------------------ */
+	err_free_pool:
 	kvfree(p->kdata_pool);
 	p->kdata_pool = NULL;
 	for (i = 0; i < p->nchunks; ++i)
 		p->chunks[i].kdata = NULL;
+	err_free_tmp:
+	kvfree(u_chunk_data_addrs);
+	u_chunk_data_addrs = NULL;
 	err_free_chunks:
 	kvfree(p->chunks);
-	p->chunks = NULL;
+	p->chunks  = NULL;
 	p->nchunks = 0;
-	err_free_ptrs:
-	kvfree(u_chunk_ptrs);
 	out:
 	kvfree(u_chunk_data_addrs);
 	kvfree(u_chunk_ptrs);
@@ -711,66 +705,66 @@ static void amdgpu_cs_get_threshold_for_moves(struct amdgpu_device *adev,
 											  u64 *max_bytes,
 											  u64 *max_vis_bytes)
 {
-	const s64 us_upper_bound = 200000;	/* 200 ms  */
-	s64 now_us, delta_us;
-	u64 free_vram, total_vram, used_vram;
+	const s64 us_upper_bound = 200000;	/* 200 ms */
+	s64 now_us, delta_us, accum_us, accum_us_vis;
+	u64 total_vram, used_vram, free_vram;
 
-	/* Fast-exit if throttling disabled */
-	if (unlikely(!adev->mm_stats.log2_max_MBps)) {
-		*max_bytes     = 0;
-		*max_vis_bytes = 0;
+	if (!adev->mm_stats.log2_max_MBps) {
+		*max_bytes = *max_vis_bytes = 0;
 		return;
 	}
 
-	/* —— Work done without holding the spin-lock ——————————— */
-	now_us     = ktime_to_us(ktime_get());
+	spin_lock(&adev->mm_stats.lock);
+
+	now_us   = ktime_to_us(ktime_get());
+	delta_us = now_us - adev->mm_stats.last_update_us;
+	if (delta_us < 0)
+		delta_us = 0;
+
+	adev->mm_stats.last_update_us = now_us;
+
+	/* ---- global VRAM ----------------------------------------------------- */
 	total_vram = adev->gmc.real_vram_size -
 	atomic64_read(&adev->vram_pin_size);
 	used_vram  = ttm_resource_manager_usage(&adev->mman.vram_mgr.manager);
 	free_vram  = (used_vram >= total_vram) ? 0 : total_vram - used_vram;
-	delta_us   = now_us - READ_ONCE(adev->mm_stats.last_update_us);
 
-	/* —— Critical section: mutate shared counters only ——————— */
-	spin_lock(&adev->mm_stats.lock);
-
-	adev->mm_stats.last_update_us = now_us;
 	adev->mm_stats.accum_us =
 	min(adev->mm_stats.accum_us + delta_us, us_upper_bound);
 
-	if (free_vram >= 128 * 1024 * 1024 || free_vram >= total_vram / 8) {
-		s64 min_us = (!(adev->flags & AMD_IS_APU)) ?
-		bytes_to_us(adev, free_vram / 4) : 0;
+	if (free_vram >= 128ull * 1024 * 1024 || free_vram >= total_vram / 8) {
+		s64 min_us = (adev->flags & AMD_IS_APU) ?
+		0 : bytes_to_us(adev, free_vram / 4);
 		if (min_us > adev->mm_stats.accum_us)
 			adev->mm_stats.accum_us = min_us;
 	}
 
-	/* Visible-VRAM accounting (same rules) */
+	/* ---- visible VRAM ---------------------------------------------------- */
 	if (!amdgpu_gmc_vram_full_visible(&adev->gmc)) {
-		u64 total_vis = adev->gmc.visible_vram_size;
-		u64 used_vis  = amdgpu_vram_mgr_vis_usage(&adev->mman.vram_mgr);
+		u64 tot_vis = adev->gmc.visible_vram_size;
+		u64 used_vis = amdgpu_vram_mgr_vis_usage(&adev->mman.vram_mgr);
 
-		if (used_vis < total_vis) {
-			u64 free_vis = total_vis - used_vis;
+		if (used_vis < tot_vis) {
+			u64 free_vis = tot_vis - used_vis;
 
 			adev->mm_stats.accum_us_vis =
 			min(adev->mm_stats.accum_us_vis + delta_us,
 				us_upper_bound);
 
-			if (free_vis >= total_vis / 2) {
-				s64 min_vis_us = bytes_to_us(adev, free_vis / 2);
-				if (min_vis_us > adev->mm_stats.accum_us_vis)
-					adev->mm_stats.accum_us_vis = min_vis_us;
+			if (free_vis >= tot_vis / 2) {
+				s64 min_vis = bytes_to_us(adev, free_vis / 2);
+				if (min_vis > adev->mm_stats.accum_us_vis)
+					adev->mm_stats.accum_us_vis = min_vis;
 			}
 		}
 	}
 
-	/* Snapshot for post-lock maths */
-	s64 accum_us      = adev->mm_stats.accum_us;
-	s64 accum_us_vis  = adev->mm_stats.accum_us_vis;
+	/* take copies for post-lock conversion */
+	accum_us      = adev->mm_stats.accum_us;
+	accum_us_vis  = adev->mm_stats.accum_us_vis;
 
 	spin_unlock(&adev->mm_stats.lock);
 
-	/* —— Cheap conversions outside the lock ——————————————— */
 	*max_bytes     = us_to_bytes(adev, accum_us);
 	*max_vis_bytes = amdgpu_gmc_vram_full_visible(&adev->gmc) ?
 	0 : us_to_bytes(adev, accum_us_vis);
@@ -1410,13 +1404,22 @@ static void amdgpu_cs_parser_fini(struct amdgpu_cs_parser *parser)
 	if (parser->bo_list)
 		amdgpu_bo_list_put(parser->bo_list);
 
-	for (i = 0; i < parser->nchunks; i++)
-		kvfree(parser->chunks[i].kdata);
+	/* Release command data */
+	if (parser->kdata_pool) {
+		kvfree(parser->kdata_pool);
+	} else {
+		/* legacy path – per-chunk allocations */
+		for (i = 0; i < parser->nchunks; i++)
+			kvfree(parser->chunks[i].kdata);
+	}
+
 	kvfree(parser->chunks);
+
 	for (i = 0; i < parser->gang_size; ++i) {
 		if (parser->jobs[i])
 			amdgpu_job_free(parser->jobs[i]);
 	}
+
 	amdgpu_bo_unref(&parser->uf_bo);
 }
 

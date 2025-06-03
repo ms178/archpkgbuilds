@@ -475,6 +475,17 @@ struct amdgpu_vm_manager {
 	struct xarray				pasids;
 	/* Global registration of recent page fault information */
 	struct amdgpu_vm_fault_info	fault_info;
+
+	/* Vega 10 optimization statistics */
+	struct {
+		atomic64_t tlb_flushes_skipped;
+		atomic64_t pt_evictions_prioritized;
+		atomic64_t small_bos_vram;
+		atomic64_t large_bos_gtt;
+		atomic64_t vm_batch_splits;
+		atomic64_t mtype_cc_small;
+		atomic64_t mtype_uc_streaming;
+	} vega10_stats;
 };
 
 struct amdgpu_bo_va_mapping;

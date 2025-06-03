@@ -52,7 +52,7 @@ static inline void
 amdgpu_amdkfd_remove_fence_on_pt_pd_bos(struct amdgpu_bo *bo) { }
 #endif
 
-static void amdgpu_bo_destroy(struct ttm_buffer_object *tbo)
+void amdgpu_bo_destroy(struct ttm_buffer_object *tbo)
 {
 	struct amdgpu_bo *bo = ttm_to_amdgpu_bo(tbo);
 
@@ -65,7 +65,7 @@ static void amdgpu_bo_destroy(struct ttm_buffer_object *tbo)
 	kvfree(bo);
 }
 
-static void amdgpu_bo_user_destroy(struct ttm_buffer_object *tbo)
+void amdgpu_bo_user_destroy(struct ttm_buffer_object *tbo)
 {
 	struct amdgpu_bo *bo = ttm_to_amdgpu_bo(tbo);
 	struct amdgpu_bo_user *ubo;
@@ -507,18 +507,6 @@ bool amdgpu_bo_support_uswc(u64 bo_flags)
 }
 
 /*
- * Automatic clean-up for the pre-TTM-initialised amdgpu_bo
- * (GNU17: we can use the “cleanup” attribute safely).
- */
-static void __bo_preinit_cleanup(struct amdgpu_bo **pbo)
-{
-	if (pbo && *pbo) {
-		drm_gem_object_release(&(*pbo)->tbo.base);
-		kvfree(*pbo);
-	}
-}
-
-/*
  * Allocate an AMDGPU BO with bullet-proof unwinding and zero leaks.
  *
  * This implementation:
@@ -538,11 +526,7 @@ int amdgpu_bo_create(struct amdgpu_device *adev,
 		.allow_res_evict    = (bp->type != ttm_bo_type_kernel),
 		.resv               = bp->resv,
 	};
-
-	/* auto-cleanup pointer – will be nulled before successful return */
-	__attribute__((cleanup(__bo_preinit_cleanup)))
 	struct amdgpu_bo *bo = NULL;
-
 	unsigned long size_bytes = bp->size;
 	unsigned long page_align;
 	int r;
@@ -564,12 +548,15 @@ int amdgpu_bo_create(struct amdgpu_device *adev,
 	}
 
 	BUG_ON(bp->bo_ptr_size < sizeof(struct amdgpu_bo));
+	*bo_ptr = NULL;
 
 	/* -------- object allocation ------------------------------------ */
 	bo = kvzalloc(bp->bo_ptr_size, GFP_KERNEL);
 	if (!bo) {
 		return -ENOMEM;
 	}
+
+	spin_lock_init(&bo->vm_lock);
 
 	drm_gem_private_object_init(adev_to_drm(adev), &bo->tbo.base,
 								size_bytes);
@@ -580,9 +567,9 @@ int amdgpu_bo_create(struct amdgpu_device *adev,
 	bp->preferred_domain : bp->domain;
 	bo->allowed_domains   = bo->preferred_domains;
 
-	if (bp->type != ttm_bo_type_kernel
-		&& !(bp->flags & AMDGPU_GEM_CREATE_DISCARDABLE)
-		&& bo->allowed_domains == AMDGPU_GEM_DOMAIN_VRAM) {
+	if (bp->type != ttm_bo_type_kernel &&
+		!(bp->flags & AMDGPU_GEM_CREATE_DISCARDABLE) &&
+		bo->allowed_domains == AMDGPU_GEM_DOMAIN_VRAM) {
 		bo->allowed_domains |= AMDGPU_GEM_DOMAIN_GTT;
 		}
 
@@ -608,24 +595,47 @@ int amdgpu_bo_create(struct amdgpu_device *adev,
 		((bp->flags & AMDGPU_GEM_CREATE_DISCARDABLE) ? 0 : 1);
 
 	if (!bp->destroy) {
-		bp->destroy = &amdgpu_bo_destroy;
+		/* Default destroy if not specified */
+		if (bp->bo_ptr_size == sizeof(struct amdgpu_bo_user))
+			bp->destroy = &amdgpu_bo_user_destroy;
+		else
+			bp->destroy = &amdgpu_bo_destroy;
 	}
 
 	/* -------- core TTM initialisation ------------------------------ */
 	r = ttm_bo_init_reserved(&adev->mman.bdev, &bo->tbo, bp->type,
 							 &bo->placement, page_align,
 						  &ctx, NULL, bp->resv, bp->destroy);
-	if (r) {
-		return r;               /* auto-cleanup triggers */
+	if (unlikely(r)) {
+		/*
+		 * TTM init failed. GEM object was inited but TTM didn't take
+		 * full ownership. Release GEM resources and then kvfree the
+		 * 'bo' structure. The spinlock doesn't need explicit destroy
+		 * if the memory containing it is freed.
+		 */
+		drm_gem_object_release(&bo->tbo.base);
+		kvfree(bo); // Safe to kvfree, TTM's destroy won't be called.
+		return r;
 	}
 
 	/* -------- optional VRAM clear ---------------------------------- */
 	if ((bp->flags & AMDGPU_GEM_CREATE_VRAM_CLEARED) &&
 		bo->tbo.resource->mem_type == TTM_PL_VRAM) {
 		struct dma_fence *fence;
+
 	r = amdgpu_ttm_clear_buffer(bo, bo->tbo.base.resv, &fence);
-	if (r) {
-		goto err_unlock;
+	if (unlikely(r)) {
+		/*
+		 * TTM init succeeded. If VRAM clear fails, use
+		 * ttm_bo_put for cleanup. ttm_bo_put will call our
+		 * bp->destroy, which calls amdgpu_bo_destroy/user_destroy,
+		 * and TTM core will kvfree 'bo'.
+		 */
+		if (!bp->resv) /* Unlock if we locked it */
+			dma_resv_unlock(bo->tbo.base.resv);
+		ttm_bo_put(&bo->tbo);
+		*bo_ptr = NULL;
+		return r;
 	}
 	dma_resv_add_fence(bo->tbo.base.resv, fence,
 					   DMA_RESV_USAGE_KERNEL);
@@ -633,23 +643,16 @@ int amdgpu_bo_create(struct amdgpu_device *adev,
 		}
 
 		/* -------- success path ----------------------------------------- */
-		if (!bp->resv) {
+		if (!bp->resv)
 			amdgpu_bo_unreserve(bo);
-		}
-		if (bp->type == ttm_bo_type_device) {
-			bo->flags &= ~AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
-		}
-		*bo_ptr = bo;        /* transfer ownership          */
-		bo      = NULL;      /* suppress cleanup-handler     */
 
-		trace_amdgpu_bo_create(*bo_ptr);
-		return 0;
+	if (bp->type == ttm_bo_type_device)
+		bo->flags &= ~AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
 
-		err_unlock:
-		if (!bp->resv) {
-			dma_resv_unlock(bo->tbo.base.resv);
-		}
-		return r;            /* auto-cleanup still active    */
+	*bo_ptr = bo;
+
+	trace_amdgpu_bo_create(*bo_ptr);
+	return 0;
 }
 
 int amdgpu_bo_create_user(struct amdgpu_device *adev,
