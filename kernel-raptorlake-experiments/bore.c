@@ -464,12 +464,13 @@ binary_smooth(u32 new_val, u32 old_val, enum x86_topology_cpu_type ctype)
 
 static __always_inline u8 effective_prio(struct task_struct *p)
 {
-	int prio_val = NICE_TO_PRIO(p->static_prio);
+	/* user task priority in range 0-39 (see include/linux/sched/prio.h) */
+	int prio_val = p->static_prio - MAX_RT_PRIO;	/* 0 … 39 */
 
-	if (likely(sched_bore)) {
+	if (likely(sched_bore))
 		prio_val = max(0, prio_val - (int)p->se.burst_score);
-	}
-	return min_t(int, NICE_WIDTH - 1, prio_val);
+
+	return min_t(int, NICE_WIDTH - 1, prio_val);	/* clamp to 0 … 39 */
 }
 
 static void reweight_task_by_prio(struct task_struct *p, int prio_val)
