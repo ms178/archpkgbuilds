@@ -585,7 +585,7 @@ can_use_opsel(amd_gfx_level gfx_level, aco_opcode op, int idx)
    case aco_opcode::v_interp_p2_f16_f32_inreg:
    case aco_opcode::v_interp_p2_rtz_f16_f32_inreg: return idx == -1 || idx == 0;
    case aco_opcode::v_alignbyte_b32:
-   case aco_opcode::v_alignbit_b32: return idx == 2;
+   case aco_opcode::v_alignbit_b32: return idx == 0 || idx == 1;
    case aco_opcode::v_cvt_pkrtz_f16_f32:
    case aco_opcode::v_cvt_pknorm_i16_f32:
    case aco_opcode::v_cvt_pknorm_u16_f32:

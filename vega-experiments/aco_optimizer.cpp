@@ -70,12 +70,11 @@ enum Label {
 };
 
 static constexpr uint64_t instr_mod_labels =
-label_omod2 | label_omod4 | label_omod5 | label_clamp | label_insert | label_f2f16 |
-label_canonicalized | label_precise;
+label_omod2 | label_omod4 | label_omod5 | label_clamp | label_insert | label_f2f16;
 
 static constexpr uint64_t temp_labels = label_abs | label_neg | label_temp | label_b2f |
                                         label_uniform_bool | label_scc_invert | label_b2i |
-                                        label_fcanonicalize;
+                                        label_fcanonicalize | label_canonicalized | label_precise;
 static constexpr uint32_t val_labels =
    label_constant_32bit | label_constant_64bit | label_constant_16bit | label_literal | label_mad;
 
