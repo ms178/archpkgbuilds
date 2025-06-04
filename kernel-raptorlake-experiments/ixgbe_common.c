@@ -2565,8 +2565,9 @@ gio_disable_fail:
 	 */
 	poll = ixgbe_pcie_timeout_poll(hw);
 	for (i = 0; i < poll; i++) {
-		udelay(100);
-		value = ixgbe_read_pci_cfg_word(hw, IXGBE_PCI_DEVICE_STATUS);
+		usleep_range(100, 150);       /* was: udelay(100) */
+		value = ixgbe_read_pci_cfg_word(hw,
+						IXGBE_PCI_DEVICE_STATUS);
 		if (ixgbe_removed(hw->hw_addr))
 			return 0;
 		if (!(value & IXGBE_PCI_DEVICE_STATUS_TRANSACTION_PENDING))
@@ -2693,9 +2694,9 @@ int ixgbe_disable_rx_buff_generic(struct ixgbe_hw *hw)
 		secrxreg = IXGBE_READ_REG(hw, IXGBE_SECRXSTAT);
 		if (secrxreg & IXGBE_SECRXSTAT_SECRX_RDY)
 			break;
-		else
-			/* Use interrupt-safe sleep just in case */
-			udelay(1000);
+
+		/* 1 ms pause – but yield the CPU while we wait          */
+		usleep_range(1000, 1500);   /* was: udelay(1000) */
 	}
 
 	/* For informational purposes only */
@@ -3526,132 +3527,61 @@ int ixgbe_get_device_caps_generic(struct ixgbe_hw *hw, u16 *device_caps)
  * @strategy: packet buffer allocation strategy
  **/
 void ixgbe_set_rxpba_generic(struct ixgbe_hw *hw,
-							 int num_active_tc,
-							 u32 fdir_headroom_kb,
-							 int strategy)
+			     int num_pb,
+			     u32 headroom,
+			     int strategy)
 {
-	struct ixgbe_adapter *adapter = (struct ixgbe_adapter *)hw->back;
-	u32 total_physical_pb_kb;
-	u32 assignable_pb_for_tcs_kb;
-	unsigned int allocated_pb_kb[MAX_TRAFFIC_CLASS] = {0};
-	int i;
-	bool pfc_globally_active = false; // Default to false
+	u32 pbsize = hw->mac.rx_pb_size;
+	int i = 0;
+	u32 rxpktsize, txpktsize, txpbthresh;
 
-	if (num_active_tc == 0)
-		num_active_tc = 1;
+	/* Reserve headroom */
+	pbsize -= headroom;
 
-	if (adapter && (adapter->flags & IXGBE_FLAG_DCB_ENABLED)) { // adapter check for safety
-		if (adapter->dcbx_cap & DCB_CAP_DCBX_VER_CEE) {
-			pfc_globally_active = adapter->dcb_cfg.pfc_mode_enable;
-		} else if (adapter->ixgbe_ieee_pfc) {
-			pfc_globally_active = !!(adapter->ixgbe_ieee_pfc->pfc_en);
-		}
+	if (!num_pb)
+		num_pb = 1;
+
+	/* Divide remaining packet buffer space amongst the number
+	 * of packet buffers requested using supplied strategy.
+	 */
+	switch (strategy) {
+	case (PBA_STRATEGY_WEIGHTED):
+		/* pba_80_48 strategy weight first half of packet buffer with
+		 * 5/8 of the packet buffer space.
+		 */
+		rxpktsize = ((pbsize * 5 * 2) / (num_pb * 8));
+		pbsize -= rxpktsize * (num_pb / 2);
+		rxpktsize <<= IXGBE_RXPBSIZE_SHIFT;
+		for (; i < (num_pb / 2); i++)
+			IXGBE_WRITE_REG(hw, IXGBE_RXPBSIZE(i), rxpktsize);
+		fallthrough; /* configure remaining packet buffers */
+	case (PBA_STRATEGY_EQUAL):
+		/* Divide the remaining Rx packet buffer evenly among the TCs */
+		rxpktsize = (pbsize / (num_pb - i)) << IXGBE_RXPBSIZE_SHIFT;
+		for (; i < num_pb; i++)
+			IXGBE_WRITE_REG(hw, IXGBE_RXPBSIZE(i), rxpktsize);
+		break;
+	default:
+		break;
 	}
 
-	total_physical_pb_kb = ixgbe_get_total_physical_rx_pb_kb(hw);
-	assignable_pb_for_tcs_kb = (total_physical_pb_kb > fdir_headroom_kb) ?
-	(total_physical_pb_kb - fdir_headroom_kb) : 0;
-
-	if (hw->mac.type >= ixgbe_mac_X540 && pfc_globally_active && adapter) { // adapter check
-		unsigned int ideal_tc_pb_req_kb[MAX_TRAFFIC_CLASS] = {0};
-		unsigned int min_tc_pb_req_kb[MAX_TRAFFIC_CLASS] = {0};
-		unsigned int sum_ideal_req_kb = 0;
-		unsigned int sum_min_req_kb = 0;
-		unsigned int x540_dv_kb = ixgbe_calculate_x540_dv_kb(adapter);
-		bool is_pfc_tc_eff[MAX_TRAFFIC_CLASS] = {false}; // Effective PFC status for this TC
-
-		for (i = 0; i < num_active_tc; i++) {
-			unsigned int max_frame_bytes = ixgbe_get_max_frame_tc_bytes(adapter, i);
-			unsigned int min_fcrtl = ixgbe_calculate_min_fcrtl_kb(max_frame_bytes);
-			unsigned int target_hyst = ixgbe_calculate_target_hysteresis_kb(max_frame_bytes);
-			unsigned int min_hyst = max((max_frame_bytes + 1023) / 1024, (unsigned int)IXGBE_PFC_ABSOLUTE_MIN_HYSTERESIS_KB);
-
-			is_pfc_tc_eff[i] = ixgbe_is_tc_pfc_enabled(adapter, i);
-
-			if (is_pfc_tc_eff[i]) {
-				ideal_tc_pb_req_kb[i] = min_fcrtl + target_hyst + x540_dv_kb;
-				min_tc_pb_req_kb[i]   = min_fcrtl + min_hyst    + x540_dv_kb;
-			} else {
-				ideal_tc_pb_req_kb[i] = min_fcrtl;
-				min_tc_pb_req_kb[i]   = min_fcrtl;
-			}
-			ideal_tc_pb_req_kb[i] = max(ideal_tc_pb_req_kb[i], (unsigned int)IXGBE_MIN_ALLOCATED_PB_KB);
-			min_tc_pb_req_kb[i]   = max(min_tc_pb_req_kb[i],   (unsigned int)IXGBE_MIN_ALLOCATED_PB_KB);
-
-			sum_ideal_req_kb += ideal_tc_pb_req_kb[i];
-			sum_min_req_kb   += min_tc_pb_req_kb[i];
-		}
-
-		if (sum_ideal_req_kb <= assignable_pb_for_tcs_kb) {
-			unsigned int surplus_kb = assignable_pb_for_tcs_kb - sum_ideal_req_kb;
-			unsigned int pfc_tc_count_for_surplus = 0;
-			for (i = 0; i < num_active_tc; i++) {
-				allocated_pb_kb[i] = ideal_tc_pb_req_kb[i];
-				if (is_pfc_tc_eff[i])
-					pfc_tc_count_for_surplus++;
-			}
-			if (surplus_kb > 0 && pfc_tc_count_for_surplus > 0) {
-				unsigned int extra_per_pfc_tc = surplus_kb / pfc_tc_count_for_surplus;
-				for (i = 0; i < num_active_tc; i++) {
-					if (is_pfc_tc_eff[i])
-						allocated_pb_kb[i] += extra_per_pfc_tc;
-				}
-			}
-		} else if (sum_min_req_kb <= assignable_pb_for_tcs_kb) {
-			long allocatable_above_min_kb = assignable_pb_for_tcs_kb - sum_min_req_kb;
-			u64 sum_flex_desire = 0; /* Sum of (ideal - min) for TCs where ideal > min */
-
-			for (i = 0; i < num_active_tc; i++) {
-				allocated_pb_kb[i] = min_tc_pb_req_kb[i];
-				if (ideal_tc_pb_req_kb[i] > min_tc_pb_req_kb[i])
-					sum_flex_desire += (ideal_tc_pb_req_kb[i] - min_tc_pb_req_kb[i]);
-			}
-
-			if (sum_flex_desire > 0) { // Avoid division by zero
-				for (i = 0; i < num_active_tc; i++) {
-					if (ideal_tc_pb_req_kb[i] > min_tc_pb_req_kb[i]) {
-						u64 extra_alloc = (u64)allocatable_above_min_kb *
-						(ideal_tc_pb_req_kb[i] - min_tc_pb_req_kb[i]);
-						do_div(extra_alloc, sum_flex_desire);
-						allocated_pb_kb[i] += (unsigned int)extra_alloc;
-					}
-				}
-			}
-			/* Distribute any small rounding remainder if assignable_pb_for_tcs_kb was not perfectly divisible */
-			unsigned int current_sum_alloc = 0;
-			for (i = 0; i < num_active_tc; ++i) current_sum_alloc += allocated_pb_kb[i];
-			if (current_sum_alloc < assignable_pb_for_tcs_kb && num_active_tc > 0) {
-				allocated_pb_kb[0] += (assignable_pb_for_tcs_kb - current_sum_alloc);
-			}
-		} else {
-			/* Severe deficit. Log and do best-effort equal split of what's available. */
-			if (adapter) // adapter can be NULL if hw->back is not set (e.g. during early init)
-				e_warn(drv, "Rx PB space %uKB insufficient for ALL TC minimums %uKB. Using equal split.\n",
-					   assignable_pb_for_tcs_kb, sum_min_req_kb);
-				if (num_active_tc > 0) {
-					unsigned int pb_per_tc_kb = assignable_pb_for_tcs_kb / num_active_tc;
-					for (i = 0; i < num_active_tc; i++) {
-						allocated_pb_kb[i] = max((unsigned int)IXGBE_MIN_ALLOCATED_PB_KB, pb_per_tc_kb);
-					}
-				}
-		}
-	} else {
-		/* Fallback to original simpler strategy */
-		if (num_active_tc > 0) {
-			unsigned int pb_per_tc_kb = assignable_pb_for_tcs_kb / num_active_tc;
-			for (i = 0; i < num_active_tc; i++)
-				allocated_pb_kb[i] = pb_per_tc_kb;
-		}
+	/*
+	 * Setup Tx packet buffer and threshold equally for all TCs
+	 * TXPBTHRESH register is set in K so divide by 1024 and subtract
+	 * 10 since the largest packet we support is just over 9K.
+	 */
+	txpktsize = IXGBE_TXPBSIZE_MAX / num_pb;
+	txpbthresh = (txpktsize / 1024) - IXGBE_TXPKT_SIZE_MAX;
+	for (i = 0; i < num_pb; i++) {
+		IXGBE_WRITE_REG(hw, IXGBE_TXPBSIZE(i), txpktsize);
+		IXGBE_WRITE_REG(hw, IXGBE_TXPBTHRESH(i), txpbthresh);
 	}
 
-	/* Write the final allocated packet buffer sizes to hardware */
-	for (i = 0; i < num_active_tc; i++) {
-		allocated_pb_kb[i] = max(allocated_pb_kb[i], (unsigned int)IXGBE_MIN_ALLOCATED_PB_KB);
-		IXGBE_WRITE_REG(hw, IXGBE_RXPBSIZE(i), allocated_pb_kb[i]);
-	}
-	/* Clear unused TCs */
-	for (; i < MAX_TRAFFIC_CLASS; i++) {
+	/* Clear unused TCs, if any, to zero buffer size*/
+	for (; i < IXGBE_MAX_PB; i++) {
 		IXGBE_WRITE_REG(hw, IXGBE_RXPBSIZE(i), 0);
+		IXGBE_WRITE_REG(hw, IXGBE_TXPBSIZE(i), 0);
+		IXGBE_WRITE_REG(hw, IXGBE_TXPBTHRESH(i), 0);
 	}
 }
 
@@ -3815,9 +3745,16 @@ int ixgbe_host_interface_command(struct ixgbe_hw *hw, void *buffer,
 	dword_len = (buf_len + 3) >> 2;
 
 	/* Pull in the rest of the buffer (bi is where we left off) */
-	for (; bi <= dword_len; bi++) {
-		u32arr[bi] = IXGBE_READ_REG_ARRAY(hw, IXGBE_FLEX_MNG, bi);
-		le32_to_cpus(&u32arr[bi]);
+	{
+		/* Header size has not changed – still ‘hdr_size’ bytes.   */
+		const u16 hdr_dwords   = hdr_size >> 2;
+		const u16 payl_dwords  = (buf_len + 3) >> 2;     /* round-up */
+		const u16 total_dwords = hdr_dwords + payl_dwords;
+
+		for (; bi < total_dwords; bi++) {
+			u32arr[bi] = IXGBE_READ_REG_ARRAY(hw, IXGBE_FLEX_MNG, bi);
+			le32_to_cpus(&u32arr[bi]);
+		}
 	}
 
 rel_out:
@@ -3920,8 +3857,9 @@ void ixgbe_clear_tx_pending(struct ixgbe_hw *hw)
 	 */
 	poll = ixgbe_pcie_timeout_poll(hw);
 	for (i = 0; i < poll; i++) {
-		usleep_range(100, 200);
-		value = ixgbe_read_pci_cfg_word(hw, IXGBE_PCI_DEVICE_STATUS);
+		usleep_range(100, 150);       /* was: udelay(100) */
+		value = ixgbe_read_pci_cfg_word(hw,
+						IXGBE_PCI_DEVICE_STATUS);
 		if (ixgbe_removed(hw->hw_addr))
 			break;
 		if (!(value & IXGBE_PCI_DEVICE_STATUS_TRANSACTION_PENDING))
