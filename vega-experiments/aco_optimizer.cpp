@@ -3606,7 +3606,7 @@ static inline bool
 is_literal_valid_for_vop3p_vega(aco_opcode op, const Operand& lit) noexcept
 {
     if (op == aco_opcode::v_pk_mad_i16)
-        return false;
+        return true;
 
     if (op == aco_opcode::v_pk_fma_f16 || op == aco_opcode::v_pk_mad_u16) {
         return lit.isConstant() &&
