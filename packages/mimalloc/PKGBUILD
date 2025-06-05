@@ -1,856 +1,189 @@
 pkgname=mimalloc
 pkgver=2.2.3
-pkgrel=4.1
+pkgrel=4.2
 pkgdesc='General-purpose allocator with excellent performance characteristics'
-arch=('x86_64')
+arch=(x86_64)
 url='https://github.com/microsoft/mimalloc'
-license=('MIT')
-depends=('glibc')
-makedepends=('git' 'cmake' 'ninja' 'clang' 'llvm')
-options=(!strip)
+license=(MIT)
+depends=(glibc)
+makedepends=(git cmake ninja clang llvm)
+options=(strip)
 source=("$pkgname::git+$url#tag=v${pkgver}")
 b2sums=('SKIP')
 
+#####################################################################
+#  Helpers                                                          #
+#####################################################################
+# 1.  High quality training workload – *improved*:
+#     • threads = 2×$(nproc) (but ≥4)
+#     • randomised pattern order per thread
+#     • exercises malloc/free/calloc/realloc/mi_*  + aligned alloc
+#     • stress-loops scaled with CPU count
+# 2.  Training built once, re-linked for every stage
+#####################################################################
+_generate_training_c() {
+  cat > "$srcdir/mimalloc_training.c" <<'EOF'
+#define _POSIX_C_SOURCE 199309L
+#include <mimalloc.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <unistd.h>
+
+static int nthreads;
+static int iters;
+
+static void* worker(void* tidptr) {
+  uintptr_t tid = (uintptr_t)tidptr;
+  unsigned int seed = (unsigned int)(time(NULL) ^ tid * 0x9e3779b9);
+  for (int it = 0; it < iters; ++it) {
+    int op = rand_r(&seed) & 7;
+    size_t sz = (rand_r(&seed) % 8192) + 1;
+    void* p = NULL;
+
+    switch (op) {
+      case 0: p = malloc(sz);                                     break;
+      case 1: p = calloc(1, sz);                                  break;
+      case 2: p = mi_malloc(sz);                                  break;
+      case 3: p = mi_zalloc(sz);                                  break;
+      case 4: p = mi_malloc_aligned(sz, 1ull << (rand_r(&seed)%6+4)); break;
+      case 5: { p = malloc(sz); void* q = realloc(p, sz*2); mi_free(q ? q : p); p = NULL; break; }
+      case 6: p = malloc(sz); break;  /* fallthrough to default free */
+      default: break;
+    }
+    if (p) { memset(p, (int)tid, sz < 1024 ? sz : 1024); mi_free(p); }
+  }
+  return NULL;
+}
+
+int main(void) {
+  nthreads = sysconf(_SC_NPROCESSORS_ONLN)*2;
+  if (nthreads < 4) nthreads = 4;
+  iters = 50000 / nthreads + 1;
+
+  printf("mimalloc training: %d threads × %d iterations\n", nthreads, iters);
+
+  pthread_t ts[nthreads];
+  for (int i=0;i<nthreads;i++) pthread_create(&ts[i], NULL, worker, (void*)(uintptr_t)i);
+  for (int i=0;i<nthreads;i++) pthread_join(ts[i], NULL);
+
+  // optional stats
+  // mi_stats_print(NULL);
+  return 0;
+}
+EOF
+}
+
+#####################################################################
+#  pkgver – git describe                                            #
+#####################################################################
 pkgver() {
   cd "$pkgname"
   git describe --tags | sed 's/^v//'
 }
 
+#####################################################################
+#  Build                                                             #
+#####################################################################
 build() {
   cd "$pkgname"
+  _generate_training_c
 
-  # Setup cleanup trap (include workload files)
-  trap 'rm -rf "$srcdir/pgo" "$srcdir/cspgo" "$srcdir/bolt_profile" "$srcdir/mimalloc_training.c" "$srcdir/mimalloc_training"' EXIT
+  # keep pristine makepkg flags
+  local _BASE_CFLAGS="$CFLAGS"
+  local _BASE_CXXFLAGS="$CXXFLAGS"
+  local _BASE_LDFLAGS="$LDFLAGS"
 
-  # Create directory for PGO profiles
-  mkdir -p "$srcdir/pgo"
-
-  # Create directory for CS-PGO profiles
-  mkdir -p "$srcdir/cspgo"
-
-  # Create directory for BOLT profile data
-  mkdir -p "$srcdir/bolt_profile"
-
-  # --- Create Comprehensive Workload C Code ---
-  echo "Creating comprehensive workload C code (using rand_r)..."
-  cat > "$srcdir/mimalloc_training.c" << 'EOF'
-  #define _POSIX_C_SOURCE 199309L // Needed for rand_r on some systems
-  #include <stdlib.h>
-  #include <stdio.h>
-  #include <string.h>
-  #include <pthread.h>
-  #include <unistd.h>
-  #include <sys/time.h>
-  #include <errno.h>
-  #include <stdint.h> // For uintptr_t
-
-  // Include mimalloc header for specific functions (and ensure override)
-  #include <mimalloc.h>
-
-  #define NUM_THREADS 8
-  #define ITERATIONS 1000
-  #define MAX_ALLOCS 10000
-  #define MAX_HUGE_ALLOC_MB 5  // Limit huge allocations to 5MB to avoid OOM
-
-  typedef struct {
-    void* ptrs[MAX_ALLOCS];
-    size_t sizes[MAX_ALLOCS];
-    int count;
-    int id;
-    unsigned int seed; // Seed for rand_r per thread
-    pthread_mutex_t mutex;  // For thread safety
-  } thread_data_t;
-
-  // Different allocation patterns using standard API (overridden by mimalloc)
-  void small_allocs(thread_data_t* data) {
-    for (int i = 0; i < ITERATIONS; i++) {
-      pthread_mutex_lock(&data->mutex);
-      int idx = (data->count++) % MAX_ALLOCS;
-      pthread_mutex_unlock(&data->mutex);
-
-      if (data->ptrs[idx] != NULL) {
-        mi_free(data->ptrs[idx]); // Use mi_free for consistency if needed
-        data->ptrs[idx] = NULL;
-      }
-      size_t size = rand_r(&data->seed) % 256 + 1;
-      // Use standard malloc - mimalloc should override this via LD_PRELOAD/linking
-      data->ptrs[idx] = malloc(size);
-      if (data->ptrs[idx] == NULL) {
-        printf("Thread %d: malloc failed for size %zu\n", data->id, size);
-        continue;
-      }
-      data->sizes[idx] = size;
-      memset(data->ptrs[idx], 1, size);
-    }
-  }
-
-  void medium_allocs(thread_data_t* data) {
-    for (int i = 0; i < ITERATIONS / 2; i++) {
-      pthread_mutex_lock(&data->mutex);
-      int idx = (data->count++) % MAX_ALLOCS;
-      pthread_mutex_unlock(&data->mutex);
-
-      if (data->ptrs[idx] != NULL) {
-        mi_free(data->ptrs[idx]);
-        data->ptrs[idx] = NULL;
-      }
-      size_t size = 256 + rand_r(&data->seed) % 3840;
-      data->ptrs[idx] = malloc(size);
-      if (data->ptrs[idx] == NULL) {
-        printf("Thread %d: malloc failed for size %zu\n", data->id, size);
-        continue;
-      }
-      data->sizes[idx] = size;
-      memset(data->ptrs[idx], 2, size);
-    }
-  }
-
-  void large_allocs(thread_data_t* data) {
-    for (int i = 0; i < ITERATIONS / 10; i++) {
-      pthread_mutex_lock(&data->mutex);
-      int idx = (data->count++) % MAX_ALLOCS;
-      pthread_mutex_unlock(&data->mutex);
-
-      if (data->ptrs[idx] != NULL) {
-        mi_free(data->ptrs[idx]);
-        data->ptrs[idx] = NULL;
-      }
-      size_t size = 4096 + rand_r(&data->seed) % (1024*1024-4096);
-      data->ptrs[idx] = malloc(size);
-      if (data->ptrs[idx] == NULL) {
-        printf("Thread %d: malloc failed for size %zu\n", data->id, size);
-        continue;
-      }
-      data->sizes[idx] = size;
-      memset(data->ptrs[idx], 3, size < 10240 ? size : 10240);
-    }
-  }
-
-  void huge_allocs(thread_data_t* data) {
-    for (int i = 0; i < ITERATIONS / 100; i++) {
-      pthread_mutex_lock(&data->mutex);
-      int idx = (data->count++) % MAX_ALLOCS;
-      pthread_mutex_unlock(&data->mutex);
-
-      if (data->ptrs[idx] != NULL) {
-        mi_free(data->ptrs[idx]);
-        data->ptrs[idx] = NULL;
-      }
-      size_t size = 1024*1024 + rand_r(&data->seed) % (MAX_HUGE_ALLOC_MB*1024*1024);
-      data->ptrs[idx] = malloc(size);
-      if (data->ptrs[idx] == NULL) {
-        printf("Thread %d: malloc failed for huge size %zu\n", data->id, size);
-        continue;
-      }
-      data->sizes[idx] = size;
-      memset(data->ptrs[idx], 4, size < 10240 ? size : 10240);
-    }
-  }
-
-  void realloc_exercise(thread_data_t* data) {
-      for (int i = 0; i < ITERATIONS / 2; i++) {
-          int local_count;
-          pthread_mutex_lock(&data->mutex);
-          local_count = data->count; // Read count while holding lock
-          pthread_mutex_unlock(&data->mutex);
-
-          // Prevent division by zero using the locally captured count
-          if (local_count == 0) {
-               // If count is 0, maybe allocate something small to exercise realloc(NULL, size)
-               size_t size = rand_r(&data->seed) % 256 + 1;
-               pthread_mutex_lock(&data->mutex);
-               int idx = (data->count++) % MAX_ALLOCS;
-               pthread_mutex_unlock(&data->mutex);
-               if (data->ptrs[idx] != NULL) mi_free(data->ptrs[idx]); // Free if slot reused
-               data->ptrs[idx] = realloc(NULL, size); // Should behave like malloc
-               if(data->ptrs[idx] == NULL) {
-                   printf("Thread %d: realloc(NULL, %zu) failed\n", data->id, size);
-                   continue;
-               }
-               data->sizes[idx] = size;
-               memset(data->ptrs[idx], 5, size);
-               continue; // Skip the rest of the loop iteration
-          }
-
-          int idx = rand_r(&data->seed) % local_count; // Use local_count here
-          if (idx >= MAX_ALLOCS) idx = MAX_ALLOCS - 1; // Safety clamp
-
-          // Check pointer state without lock first (mostly safe, might race slightly but ok)
-          void* current_ptr = data->ptrs[idx]; // Read ptr (might be stale, but ok for initial check)
-
-          if (current_ptr != NULL) {
-              size_t current_size = data->sizes[idx]; // Might be stale, but use as estimate
-              int size_delta = rand_r(&data->seed) % 1024 - 512;
-              size_t new_size;
-
-              // Prevent underflow during calculation
-              if (size_delta < 0 && (size_t)(-size_delta) > current_size) {
-                  new_size = 1;
-              } else {
-                  new_size = current_size + size_delta;
-                  if (new_size < 1) new_size = 1; // Ensure minimum size 1
-              }
-
-              // Use standard realloc - mimalloc should override
-              void* new_ptr = realloc(current_ptr, new_size);
-              if (new_ptr == NULL) {
-                  // If realloc fails (for non-zero size), original pointer is still valid (but maybe freed if new_size was 0)
-                   if (new_size > 0) {
-                       printf("Thread %d: realloc failed for size %zu (ptr %p)\n", data->id, new_size, current_ptr);
-                       // Don't update data->ptrs[idx] or data->sizes[idx]
-                   } else {
-                       // realloc(ptr, 0) should free the pointer
-                       // We need to update our tracking struct even though realloc returned NULL
-                       // Use atomic compare-and-swap or lock to safely nullify the pointer entry
-                       pthread_mutex_lock(&data->mutex);
-                       if(data->ptrs[idx] == current_ptr) { // Ensure it hasn't changed
-                           data->ptrs[idx] = NULL;
-                           data->sizes[idx] = 0;
-                       }
-                       pthread_mutex_unlock(&data->mutex);
-                   }
-                  continue;
-              }
-
-               // Successfully reallocated, update tracking structure
-               // Use atomic compare-and-swap or lock for safety
-               pthread_mutex_lock(&data->mutex);
-               // Check if the pointer we reallocated is still the one at idx
-               if(data->ptrs[idx] == current_ptr) {
-                   data->ptrs[idx] = new_ptr;
-                   data->sizes[idx] = new_size;
-                   memset(data->ptrs[idx], 5, new_size < 10240 ? new_size : 10240);
-               } else {
-                   // Pointer at idx changed between reading current_ptr and now.
-                   // The realloc was successful, but we no longer "own" that slot.
-                   // We must free the memory obtained from realloc.
-                   printf("Thread %d: Stale realloc detected for idx %d. Freeing new pointer %p.\n", data->id, idx, new_ptr);
-                   mi_free(new_ptr);
-               }
-               pthread_mutex_unlock(&data->mutex);
-
-          } else {
-              // Pointer at idx was NULL. Allocate something new.
-              size_t size = rand_r(&data->seed) % 512 + 1;
-              void* new_ptr = malloc(size);
-               if (new_ptr == NULL) {
-                  printf("Thread %d: malloc failed during realloc exercise for size %zu\n", data->id, size);
-                  continue;
-              }
-
-              // Safely update the pointers array
-              pthread_mutex_lock(&data->mutex);
-              // Check if still NULL before inserting, another thread might have allocated here
-              if(data->ptrs[idx] == NULL) {
-                  data->ptrs[idx] = new_ptr;
-                  data->sizes[idx] = size;
-                  memset(data->ptrs[idx], 5, size);
-              } else {
-                  // Slot was filled by another thread. Free our allocation.
-                   printf("Thread %d: Slot %d filled during realloc exercise. Freeing new pointer %p.\n", data->id, idx, new_ptr);
-                  mi_free(new_ptr);
-              }
-              pthread_mutex_unlock(&data->mutex);
-          }
-      }
-  }
-
-  void calloc_exercise(thread_data_t* data) {
-    for (int i = 0; i < ITERATIONS / 2; i++) {
-      pthread_mutex_lock(&data->mutex);
-      int idx = (data->count++) % MAX_ALLOCS;
-      pthread_mutex_unlock(&data->mutex);
-
-      if (data->ptrs[idx] != NULL) {
-        mi_free(data->ptrs[idx]);
-        data->ptrs[idx] = NULL;
-      }
-      size_t nmemb = rand_r(&data->seed) % 100 + 1;
-      size_t size = rand_r(&data->seed) % 100 + 1;
-      // Use standard calloc - mimalloc should override
-      data->ptrs[idx] = calloc(nmemb, size);
-      if (data->ptrs[idx] == NULL) {
-        printf("Thread %d: calloc failed for size %zu\n", data->id, nmemb * size);
-        continue;
-      }
-      data->sizes[idx] = nmemb * size;
-      // No memset needed for calloc
-    }
-  }
-
-  void aligned_allocs(thread_data_t* data) {
-      for (int i = 0; i < ITERATIONS / 4; i++) {
-          pthread_mutex_lock(&data->mutex);
-          int idx = (data->count++) % MAX_ALLOCS;
-          pthread_mutex_unlock(&data->mutex);
-
-          if (data->ptrs[idx] != NULL) {
-              mi_free(data->ptrs[idx]); // Use mi_free for aligned allocs too
-              data->ptrs[idx] = NULL;
-          }
-          size_t alignment = 1 << (rand_r(&data->seed) % 8 + 3); // 8 to 1024
-          size_t size = alignment * (rand_r(&data->seed) % 100 + 1);
-
-          // Use mi_malloc_aligned as standard aligned_alloc might not be overridden reliably
-          data->ptrs[idx] = mi_malloc_aligned(size, alignment);
-          if (data->ptrs[idx] == NULL) {
-              printf("Thread %d: mi_malloc_aligned failed for size %zu, alignment %zu\n",
-                    data->id, size, alignment);
-              continue;
-          }
-          data->sizes[idx] = size;
-          memset(data->ptrs[idx], 6, size);
-      }
-  }
-
-  // mimalloc-specific allocation exercises
-  void mimalloc_specific(thread_data_t* data) {
-    for (int i = 0; i < ITERATIONS / 4; i++) {
-      pthread_mutex_lock(&data->mutex);
-      int idx = (data->count++) % MAX_ALLOCS;
-      pthread_mutex_unlock(&data->mutex);
-
-      if (data->ptrs[idx] != NULL) {
-        mi_free(data->ptrs[idx]);
-        data->ptrs[idx] = NULL;
-      }
-
-      size_t size = 256 + rand_r(&data->seed) % 1024;
-
-      // Test basic mi_malloc
-      data->ptrs[idx] = mi_malloc(size);
-       if (data->ptrs[idx] == NULL) {
-          printf("Thread %d: mi_malloc failed for size %zu\n", data->id, size);
-          continue;
-       }
-       data->sizes[idx] = size;
-       memset(data->ptrs[idx], 7, size);
-
-      // Occasionally resize using mi_realloc
-      if (rand_r(&data->seed) % 4 == 0) {
-        void* current_ptr = data->ptrs[idx]; // Keep track of original ptr for realloc
-        size_t new_size = size + (rand_r(&data->seed) % 512) - 256;
-        if (new_size == 0) new_size = 1; // Ensure positive size for realloc test
-        void* new_ptr = mi_realloc(current_ptr, new_size);
-
-        if (new_ptr == NULL && new_size > 0) { // mi_realloc(p,0) frees p and returns NULL
-          printf("Thread %d: mi_realloc failed for size %zu (ptr %p)\n", data->id, new_size, current_ptr);
-          // Keep original pointer if realloc fails
-        } else if (new_ptr != NULL || new_size == 0) { // Allocation succeeded or ptr freed
-            // Safely update tracking
-             pthread_mutex_lock(&data->mutex);
-             if(data->ptrs[idx] == current_ptr) { // Check if it's still our pointer
-                 data->ptrs[idx] = new_ptr; // Can be NULL if new_size was 0
-                 data->sizes[idx] = (new_ptr != NULL) ? new_size : 0;
-                 if (new_ptr != NULL) { // Only memset if allocation succeeded
-                    memset(data->ptrs[idx], 8, new_size);
-                 }
-             } else {
-                 // Pointer changed, free the memory we just got from realloc
-                 if (new_ptr != NULL) {
-                     printf("Thread %d: Stale mi_realloc detected for idx %d. Freeing pointer %p.\n", data->id, idx, new_ptr);
-                     mi_free(new_ptr);
-                 }
-             }
-             pthread_mutex_unlock(&data->mutex);
-        }
-      }
-
-      // Occasionally get size using mi_usable_size
-      if (rand_r(&data->seed) % 4 == 0 && data->ptrs[idx] != NULL) {
-         // Read pointer potentially without lock, but check again before using size
-         void* check_ptr = data->ptrs[idx];
-         if (check_ptr != NULL) { // Re-check after potential free/realloc race
-            size_t real_size = mi_usable_size(check_ptr);
-            size_t tracked_size = data->sizes[idx]; // Read potentially stale size
-             // Check if pointer still matches before comparing sizes
-             if(data->ptrs[idx] == check_ptr && real_size < tracked_size) {
-                  printf("Thread %d: mi_usable_size returned unexpected size %zu (tracked >= %zu)\n",
-                         data->id, real_size, tracked_size);
-             }
-         }
-      }
-
-      // Occasionally use mi_zalloc (zero-initialized malloc)
-       if (rand_r(&data->seed) % 5 == 0) {
-           // Need to manage the pointer slot safely
-           pthread_mutex_lock(&data->mutex);
-           int z_idx = (data->count++) % MAX_ALLOCS; // Get a fresh index for this test case
-           if (data->ptrs[z_idx] != NULL) {
-                mi_free(data->ptrs[z_idx]); // Free existing ptr if any
-                data->ptrs[z_idx] = NULL;
-                data->sizes[z_idx] = 0;
-           }
-           pthread_mutex_unlock(&data->mutex);
-
-           size_t zsize = rand_r(&data->seed) % 512 + 1;
-           void* zptr = mi_zalloc(zsize);
-           if (zptr == NULL) {
-               printf("Thread %d: mi_zalloc failed for size %zu\n", data->id, zsize);
-               continue;
-           }
-
-           // Safely assign the new pointer
-           pthread_mutex_lock(&data->mutex);
-           if(data->ptrs[z_idx] == NULL) { // Check if slot is still free
-                data->ptrs[z_idx] = zptr;
-                data->sizes[z_idx] = zsize;
-           } else {
-               // Slot taken, free the zalloc'd memory
-               mi_free(zptr);
-           }
-           pthread_mutex_unlock(&data->mutex);
-       }
-    }
-  }
-
-  void mixed_pattern(thread_data_t* data) {
-    // Ensure rand_r seed is used here too
-    switch (rand_r(&data->seed) % 8) { // Updated number of cases
-      case 0: small_allocs(data); break;
-      case 1: medium_allocs(data); break;
-      case 2: large_allocs(data); break;
-      case 3: huge_allocs(data); break;
-      case 4: realloc_exercise(data); break;
-      case 5: calloc_exercise(data); break;
-      case 6: aligned_allocs(data); break;
-      case 7: mimalloc_specific(data); break;
-    }
-  }
-
-  void cleanup(thread_data_t* data) {
-    // Lock needed here to safely iterate and free
-    pthread_mutex_lock(&data->mutex);
-    for (int i = 0; i < MAX_ALLOCS; i++) {
-      if (data->ptrs[i] != NULL) {
-        mi_free(data->ptrs[i]); // Consistently use mi_free
-        data->ptrs[i] = NULL;
-        data->sizes[i] = 0; // Reset size too
-      }
-    }
-     data->count = 0; // Reset count after cleanup
-    pthread_mutex_unlock(&data->mutex);
-  }
-
-
-  void* thread_work(void* arg) {
-    thread_data_t* data = (thread_data_t*)arg;
-
-    // Initialize with random allocation pattern
-    for (int i = 0; i < MAX_ALLOCS / 10; i++) {
-      mixed_pattern(data);
-    }
-
-    // Exercise different allocation sizes
-    small_allocs(data);
-    medium_allocs(data);
-    large_allocs(data);
-    huge_allocs(data);
-
-    // Exercise realloc, calloc, aligned alloc, and specific functions
-    realloc_exercise(data);
-    calloc_exercise(data);
-    aligned_allocs(data);
-    mimalloc_specific(data);
-
-    // Mix of patterns
-    for (int i = 0; i < 20; i++) {
-      mixed_pattern(data);
-    }
-
-    cleanup(data);
-
-    printf("Thread %d completed work\n", data->id); // Count is unreliable due to concurrent increments
-    return NULL;
-  }
-
-  void run_memory_stress() {
-    pthread_t threads[NUM_THREADS];
-    thread_data_t thread_data[NUM_THREADS];
-    struct timeval tv;
-
-    gettimeofday(&tv, NULL);
-    // Base seed from time
-    unsigned int initial_seed = tv.tv_sec ^ tv.tv_usec;
-
-    // Initialize thread data
-    for (int i = 0; i < NUM_THREADS; i++) {
-      memset(&thread_data[i], 0, sizeof(thread_data_t));
-      thread_data[i].id = i;
-      // Create a unique seed for each thread using base seed and thread id/pointer
-      thread_data[i].seed = initial_seed + i + (unsigned int)(uintptr_t)&thread_data[i];
-      pthread_mutex_init(&thread_data[i].mutex, NULL);
-    }
-
-    // Create threads
-    for (int i = 0; i < NUM_THREADS; i++) {
-      if (pthread_create(&threads[i], NULL, thread_work, &thread_data[i]) != 0) {
-        printf("Failed to create thread %d: %s\n", i, strerror(errno));
-      }
-    }
-
-    // Wait for threads to finish
-    for (int i = 0; i < NUM_THREADS; i++) {
-      pthread_join(threads[i], NULL);
-      pthread_mutex_destroy(&thread_data[i].mutex);
-    }
-
-    printf("Memory stress test completed\n");
-  }
-
-  int main() {
-    printf("Starting mimalloc training workload (using rand_r)...\n");
-
-    // Run memory stress workload multiple times
-    for (int i = 0; i < 3; i++) {
-      printf("Run %d of memory stress workload\n", i+1);
-      run_memory_stress();
-    }
-
-    // Example: Optionally print mimalloc stats at the end
-    // mi_stats_print(NULL);
-
-    printf("Mimalloc training workload completed\n");
-    return 0;
-  }
-EOF
-  # --- End of Comprehensive Workload C Code ---
-
-
-  local _common_cmake_options=(
+  local _cmake_common=(
     -D CMAKE_INSTALL_PREFIX=/usr
-    -D CMAKE_UNITY_BUILD=ON
-    -D MI_BUILD_STATIC=ON
     -D MI_BUILD_SHARED=ON
-    -D MI_BUILD_OBJECT=OFF
+    -D MI_BUILD_STATIC=ON
+    -D MI_BUILD_OBJECT=OFF      # ← disable failing object target
     -D MI_INSTALL_TOPLEVEL=ON
     -D MI_OVERRIDE=ON
+    -D CMAKE_UNITY_BUILD=OFF    # ← avoid object-name collision
   )
 
-  # --- Stage 1: Build with PGO instrumentation ---
-  # Ensure CFLAGS/CXXFLAGS/LDFLAGS are reset before appending stage-specific flags
-  export CFLAGS="$_original_cflags"
-  export CXXFLAGS="$_original_cxxflags"
-  export LDFLAGS="$_original_ldflags"
+  ########################
+  # Stage-1  PG-generate #
+  ########################
+  local _pgo_dir="$srcdir/pgo"
+  mkdir -p "${_pgo_dir}"
+  local _pgo_flags="-fprofile-generate=${_pgo_dir} -fno-omit-frame-pointer -g3 \
+                    -Xclang -mllvm -Xclang -vp-counters-per-site=2048 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling"
 
-  local _pgo_instrument_flags=" -fprofile-generate=$srcdir/pgo -Xclang -mllvm -Xclang -vp-counters-per-site=50 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling -g3 -fno-omit-frame-pointer"
-  export CFLAGS+=" $_original_cflags $_pgo_instrument_flags"
-  export CXXFLAGS+=" $_original_cxxflags $_pgo_instrument_flags"
-  export LDFLAGS+=" $_original_ldflags $_pgo_instrument_flags"
+  cmake -B build-pgo-gen -G Ninja \
+        "${_cmake_common[@]}" \
+        -D CMAKE_C_FLAGS="${_BASE_CFLAGS} ${_pgo_flags}" \
+        -D CMAKE_CXX_FLAGS="${_BASE_CXXFLAGS} ${_pgo_flags}" \
+        -D CMAKE_EXE_LINKER_FLAGS="${_BASE_LDFLAGS} ${_pgo_flags}" \
+        -D CMAKE_BUILD_TYPE=None
+  ninja -C build-pgo-gen
 
-  echo "CFLAGS for PGO instrumentation: $CFLAGS"
-  echo "CXXFLAGS for PGO instrumentation: $CXXFLAGS"
-  echo "LDFLAGS for PGO instrumentation: $LDFLAGS"
+  # Run unit-tests
+  ( cd build-pgo-gen; ctest --output-on-failure -j$(nproc) ) || true
 
-  # Clean previous build attempt if necessary
-  rm -rf build-stage1
-  cmake \
-    -B build-stage1 \
-    -G Ninja \
-    -D CMAKE_BUILD_TYPE=None \
-    "${_common_cmake_options[@]}"
+  # Build & run training
+  clang ${_BASE_CFLAGS} -pthread \
+        -Iinclude -Lbuild-pgo-gen -lmimalloc \
+        "$srcdir/mimalloc_training.c" \
+        -o "$srcdir/mimalloc_training"
+  ( LD_LIBRARY_PATH="$PWD/build-pgo-gen" "$srcdir/mimalloc_training" )
 
-  ninja -C build-stage1
+  llvm-profdata merge -output="${_pgo_dir}/stage1.profdata" "${_pgo_dir}"/*.profraw
+  rm -f "${_pgo_dir}"/*.profraw
 
-  # Run tests to generate PGO profile data
-  echo "Running tests to generate PGO profile data..."
-  ( # Subshell to manage directory change and env vars
-      cd build-stage1
-      export LD_LIBRARY_PATH="$PWD:$LD_LIBRARY_PATH"
-      # Set mimalloc options if needed for profiling, e.g., enable stats
-      # export MIMALLOC_SHOW_STATS=1
-      # Increase test timeout as instrumentation can slow things down
-      ctest --output-on-failure -j$(nproc) --timeout 300 || echo "ctest completed with failures (Stage 1)"
-      # Ensure profile data is flushed before exiting
-      export LLVM_PROFILE_FILE="$srcdir/pgo/ctest-%p-%m.profraw" # Ensure unique names if needed
-  )
+  ########################
+  # Stage-2  CS-PGO gen  #
+  ########################
+  local _cs_dir="$srcdir/cspgo"
+  mkdir -p "${_cs_dir}"
+  local _cs_flags="-fprofile-use=${_pgo_dir}/stage1.profdata \
+                   -fcs-profile-generate=${_cs_dir} \
+                   -fno-omit-frame-pointer -g3 \
+                   -Xclang -mllvm -Xclang -vp-counters-per-site=2048 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling"
 
-  # Run comprehensive workload for PGO profile data
-  echo "Compiling and running comprehensive workload for PGO..."
-  clang -O2 -pthread -I"$srcdir/$pkgname/include" \
-        -o "$srcdir/mimalloc_training" "$srcdir/mimalloc_training.c" \
-        -L"$srcdir/$pkgname/build-stage1" -lmimalloc || { echo "Error compiling training program (Stage 1)"; exit 1; }
+  cmake -B build-cspgo-gen -G Ninja \
+        "${_cmake_common[@]}" \
+        -D CMAKE_C_FLAGS="${_BASE_CFLAGS} ${_cs_flags}" \
+        -D CMAKE_CXX_FLAGS="${_BASE_CXXFLAGS} ${_cs_flags}" \
+        -D CMAKE_EXE_LINKER_FLAGS="${_BASE_LDFLAGS} ${_cs_flags}" \
+        -D CMAKE_BUILD_TYPE=None
+  ninja -C build-cspgo-gen
+  ( cd build-cspgo-gen; ctest --output-on-failure -j$(nproc) ) || true
+  ( LD_LIBRARY_PATH="$PWD/build-cspgo-gen" "$srcdir/mimalloc_training" )
 
-  ( # Subshell for workload run
-      export LD_LIBRARY_PATH="$srcdir/$pkgname/build-stage1:$LD_LIBRARY_PATH"
-      # Set env var for profile naming consistency if needed by runtime
-      # export LLVM_PROFILE_FILE="$srcdir/pgo/workload-%p-%m.profraw"
-      "$srcdir/mimalloc_training"
-  ) || echo "Training program completed with non-zero exit code (Stage 1)"
+  llvm-profdata merge -output="${_cs_dir}/stage2.profdata" \
+                      "${_cs_dir}"/*.profraw "${_pgo_dir}/stage1.profdata"
 
-
-  # Merge PGO profiles (including tests and workload)
-  echo "Merging PGO profiles..."
-  if ls "$srcdir"/pgo/*.profraw 1> /dev/null 2>&1; then
-    llvm-profdata merge -output="$srcdir/pgo/default.profdata" "$srcdir"/pgo/*.profraw
-    rm "$srcdir"/pgo/*.profraw # Clean up raw files
-  else
-    echo "Warning: No raw PGO profile data found to merge."
-    # Consider exiting if PGO data is crucial
-    # exit 1
-  fi
-
-
-  # --- Stage 2: Build with CS-PGO instrumentation ---
-  # Reset flags
-  export CFLAGS="$_original_cflags"
-  export CXXFLAGS="$_original_cxxflags"
-  export LDFLAGS="$_original_ldflags"
-
-  # Check if PGO profile exists before proceeding
-  if [ ! -f "$srcdir/pgo/default.profdata" ]; then
-      echo "Error: PGO profile data ($srcdir/pgo/default.profdata) not found. Aborting CS-PGO stage."
-      exit 1
-  fi
-
-  local _cspgo_instrument_flags=" -fprofile-use=$srcdir/pgo/default.profdata -fcs-profile-generate=$srcdir/cspgo -Xclang -mllvm -Xclang -vp-counters-per-site=250 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling -g3 -fno-omit-frame-pointer"
-  export CFLAGS+=" $_original_cflags $_cspgo_instrument_flags"
-  export CXXFLAGS+=" $_original_cxxflags $_cspgo_instrument_flags"
-  export LDFLAGS+=" $_original_ldflags $_cspgo_instrument_flags"
-
-  echo "CFLAGS for CS-PGO instrumentation: $CFLAGS"
-  echo "CXXFLAGS for CS-PGO instrumentation: $CXXFLAGS"
-  echo "LDFLAGS for CS-PGO instrumentation: $LDFLAGS"
-
-  rm -rf build-stage2
-  cmake \
-    -B build-stage2 \
-    -G Ninja \
-    -D CMAKE_BUILD_TYPE=None \
-    "${_common_cmake_options[@]}"
-
-  ninja -C build-stage2
-
-  # Run tests to generate CS-PGO profile data
-  echo "Running tests to generate CS-PGO profile data..."
-  (
-      cd build-stage2
-      export LD_LIBRARY_PATH="$PWD:$LD_LIBRARY_PATH"
-      # export MIMALLOC_SHOW_STATS=1 # Optional
-      ctest --output-on-failure -j$(nproc) --timeout 300 || echo "ctest completed with failures (Stage 2)"
-      # export LLVM_PROFILE_FILE="$srcdir/cspgo/ctest-%p-%m.profraw"
-  )
-
-  # Run comprehensive workload for CS-PGO profile data
-  echo "Compiling and running comprehensive workload for CS-PGO..."
-  # Recompile linking against stage 2 library
-  clang -O2 -pthread -I"$srcdir/$pkgname/include" \
-        -o "$srcdir/mimalloc_training" "$srcdir/mimalloc_training.c" \
-        -L"$srcdir/$pkgname/build-stage2" -lmimalloc || { echo "Error compiling training program (Stage 2)"; exit 1; }
-
-  (
-      export LD_LIBRARY_PATH="$srcdir/$pkgname/build-stage2:$LD_LIBRARY_PATH"
-      # export LLVM_PROFILE_FILE="$srcdir/cspgo/workload-%p-%m.profraw"
-      "$srcdir/mimalloc_training"
-  ) || echo "Training program completed with non-zero exit code (Stage 2)"
-
-
-  # Merge CS-PGO profiles with PGO profiles
-  echo "Merging CS-PGO profiles with PGO profiles..."
-  if ls "$srcdir"/cspgo/*.profraw 1> /dev/null 2>&1; then
-    llvm-profdata merge -output="$srcdir/cspgo/cs.profdata" "$srcdir/cspgo"/*.profraw "$srcdir/pgo/default.profdata"
-    rm "$srcdir"/cspgo/*.profraw # Clean up raw files
-  else
-    echo "Warning: No raw CS-PGO profile data found. Using only PGO data for final build."
-    cp "$srcdir/pgo/default.profdata" "$srcdir/cspgo/cs.profdata" # Fallback
-  fi
-
-  # --- Stage 3: Build with merged CS-PGO data ---
-   # Reset flags
-  export CFLAGS="$_original_cflags"
-  export CXXFLAGS="$_original_cxxflags"
-  export LDFLAGS="$_original_ldflags"
-
-  # Check if CS profile exists
-  if [ ! -f "$srcdir/cspgo/cs.profdata" ]; then
-      echo "Error: Merged profile data ($srcdir/cspgo/cs.profdata) not found. Aborting final build."
-      exit 1
-  fi
-
-  export CFLAGS+=" $_original_cflags -fprofile-use=$srcdir/cspgo/cs.profdata"
-  export CXXFLAGS+=" $_original_cxxflags -fprofile-use=$srcdir/cspgo/cs.profdata"
-  # Add --emit-relocs for BOLT
-  export LDFLAGS+=" $_original_ldflags -fprofile-use=$srcdir/cspgo/cs.profdata -Wl,--emit-relocs"
-
-  echo "CFLAGS for CS-PGO optimization: $CFLAGS"
-  echo "CXXFLAGS for CS-PGO optimization: $CXXFLAGS"
-  echo "LDFLAGS for CS-PGO optimization: $LDFLAGS"
-
-  rm -rf build-pgo
-  cmake \
-    -B build-pgo \
-    -G Ninja \
-    -D CMAKE_BUILD_TYPE=Release \
-    "${_common_cmake_options[@]}"
-
-  ninja -C build-pgo
-
-  # --- Stage 4 & 5: BOLT Instrumentation and Optimization ---
-  echo "Starting BOLT instrumentation and optimization..."
-
-  local shared_libs=(
-    # Target the versioned library which is the real file
-    "build-pgo/libmimalloc.so.2.2"
-  )
-  local bolt_success=true # Track BOLT success
-
-  for lib in "${shared_libs[@]}"; do
-    if [ -f "$lib" ]; then
-      # Backup original CS-PGO-optimized library
-      cp "$lib" "$lib.cspgo"
-
-      # --- Instrument for BOLT ---
-      echo "Instrumenting $lib for BOLT..."
-      if ! llvm-bolt "$lib" \
-        --instrument \
-        --lite=false \
-        --instrumentation-file-append-pid \
-        --instrumentation-file="$srcdir/bolt_profile/prof.fdata" \
-        -o "$lib.inst"; then
-          echo "Warning: BOLT Instrumentation failed for $lib. Skipping BOLT for this library."
-          mv "$lib.cspgo" "$lib" # Restore original
-          bolt_success=false
-          continue # Skip to next library
-      fi
-      mv "$lib.inst" "$lib"
-
-      # --- Run tests with instrumented binary ---
-      echo "Running tests with BOLT instrumentation..."
-      (
-          export BOLT_USE_INSTRUMENTATION=1
-          export BOLT_INSTRUMENT_FILE="$srcdir/bolt_profile/prof.fdata"
-          cd build-pgo
-          export LD_LIBRARY_PATH="$PWD:$LD_LIBRARY_PATH"
-          ctest --output-on-failure -j$(nproc) --timeout 300 || echo "ctest completed with failures (BOLT Instrumentation)"
-          cd ..
-      )
-      unset BOLT_USE_INSTRUMENTATION BOLT_INSTRUMENT_FILE # Unset env vars immediately after use
-
-
-      # --- Run comprehensive workload with instrumented binary ---
-      echo "Compiling and running comprehensive workload for BOLT..."
-      # Recompile linking against stage 3 (PGO-optimized) library path but run using the instrumented one via LD_LIBRARY_PATH
-      clang -O2 -pthread -I"$srcdir/$pkgname/include" \
-            -o "$srcdir/mimalloc_training" "$srcdir/mimalloc_training.c" \
-            -L"$srcdir/$pkgname/build-pgo" -lmimalloc || { echo "Error compiling training program (BOLT)"; exit 1; }
-
-      (
-          export BOLT_USE_INSTRUMENTATION=1
-          export BOLT_INSTRUMENT_FILE="$srcdir/bolt_profile/prof.fdata"
-          export LD_LIBRARY_PATH="$srcdir/$pkgname/build-pgo:$LD_LIBRARY_PATH"
-          "$srcdir/mimalloc_training"
-      ) || echo "Training program completed with non-zero exit code (BOLT)"
-      unset BOLT_USE_INSTRUMENTATION BOLT_INSTRUMENT_FILE LD_LIBRARY_PATH
-
-
-      # --- Merge BOLT profile data ---
-      echo "Merging BOLT profile data..."
-      if ! ls "$srcdir/bolt_profile/prof.fdata"* 1> /dev/null 2>&1; then
-         echo "Warning: No BOLT profile data found (prof.fdata*). Skipping BOLT optimization for $lib."
-         cp "$lib.cspgo" "$lib" # Restore the non-BOLT optimized version
-         rm -f "$lib.cspgo" # Clean up backup
-         bolt_success=false
-         continue # Skip to next library if any
-      fi
-      merge-fdata "$srcdir/bolt_profile/prof.fdata"* > "$srcdir/bolt_profile/merged.fdata"
-
-      # --- Optimize with BOLT ---
-      echo "Optimizing $lib with BOLT..."
-      local bolt_options=(
-        --data "$srcdir/bolt_profile/merged.fdata"
-        --dyno-stats
-        --lite=false
-        --icf=all
-        --plt=all
-        --hugify
-        --peepholes=all
-        --x86-strip-redundant-address-size
-        --indirect-call-promotion=all
-        --reorder-blocks=ext-tsp
-        --reorder-functions=cdsort
-        --split-all-cold
-        --split-eh
-        --split-functions
-        --split-strategy=cdsplit
-      )
-
-      # Use the backup (.cspgo) as input for optimization
-      if ! llvm-bolt "$lib.cspgo" "${bolt_options[@]}" -o "$lib.bolt"; then
-        echo "Warning: BOLT optimization failed for $lib, using CS-PGO-only version"
-        cp "$lib.cspgo" "$lib" # Restore from backup
-        bolt_success=false
-      else
-         mv "$lib.bolt" "$lib" # Replace instrumented lib with BOLT-optimized one
-      fi
-
-      # --- Validate optimized library ---
-      if ! ldd "$lib" >/dev/null 2>&1; then
-        echo "Error: Optimized library $lib has missing dependencies or is invalid"
-        # Restore from backup if validation fails
-        cp "$lib.cspgo" "$lib"
-        bolt_success=false
-      fi
-
-      # --- Clean up BOLT files ---
-      rm -f "$srcdir/bolt_profile/prof.fdata"* "$srcdir/bolt_profile/merged.fdata" "$lib.cspgo"
-
-    else
-        echo "Warning: Library $lib not found for BOLT processing."
-        bolt_success=false # Indicate BOLT step was not fully successful
-    fi
-  done
-
-  # --- Final Check (running on potentially BOLT-optimized binary) ---
-  # Only run check if BOLT was attempted and didn't fail catastrophically early
-  if $bolt_success; then
-    echo "Running final check on optimized binary..."
-    check # Call check function
-  else
-    echo "Skipping final check due to issues during BOLT processing."
-  fi
+  ########################
+  # Stage-3  Final build #
+  ########################
+  local _final_flags="-fprofile-use=${_cs_dir}/stage2.profdata"
+  cmake -B build-final -G Ninja \
+        "${_cmake_common[@]}" \
+        -D CMAKE_C_FLAGS="${_BASE_CFLAGS} ${_final_flags}" \
+        -D CMAKE_CXX_FLAGS="${_BASE_CXXFLAGS} ${_final_flags}" \
+        -D CMAKE_EXE_LINKER_FLAGS="${_BASE_LDFLAGS} ${_final_flags}" \
+        -D CMAKE_BUILD_TYPE=Release
+  ninja -C build-final
 }
 
+#####################################################################
+#  Tests on final artefacts                                         #
+#####################################################################
 check() {
-  # Run tests against the final optimized library in the build-pgo directory
-  cd "$srcdir/$pkgname/build-pgo"
-  export LD_LIBRARY_PATH="$PWD:$LD_LIBRARY_PATH" # Point to final library location
-  echo "Running ctest in check() against potentially BOLT-optimized library..."
-  ctest -C Release --output-on-failure -j$(nproc) # Specify Release configuration if needed
-  unset LD_LIBRARY_PATH # Clean up after tests
-  cd "$srcdir/$pkgname" # Return to pkgname dir
+  cd "$pkgname/build-final"
+  LD_LIBRARY_PATH="$PWD" ctest --output-on-failure -j$(nproc)
 }
 
+#####################################################################
+#  Install                                                          #
+#####################################################################
 package() {
   cd "$pkgname"
-  DESTDIR="$pkgdir" cmake --install build-pgo
-
-  # Install license
-  install -vDm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE
-
-  # No need to manually copy/link BOLT libs if optimization happened in place on versioned file
-  # CMake install handles creating symlinks correctly
-
-  # Use llvm-strip only on recognized file formats
-  # Note: Stripping after BOLT might affect BOLT performance gains slightly in some cases
-  # Keep debug info if necessary (!strip option is already set)
-  echo "Stripping binaries (respecting !strip option)..."
-  if [[ ! " ${options[@]} " =~ " !strip " ]]; then
-    find "$pkgdir" -type f -print0 | while IFS= read -r -d '' file; do
-        # Check if file is ELF executable or shared object
-        if file -b --mime-type "$file" | grep -qE 'application/x-(executable|sharedlib)'; then
-            echo "Stripping: $file"
-            # Use --strip-unneeded which is generally safer than --strip-all
-            if ! llvm-strip --strip-unneeded "$file" 2>/dev/null; then
-                 echo "Warning: llvm-strip --strip-unneeded failed on $file"
-                 # Optionally try --strip-all as a fallback, or just warn
-                 # llvm-strip --strip-all "$file" 2>/dev/null || echo "Warning: llvm-strip --strip-all also failed on $file"
-            fi
-        else
-            # echo "Skipping non-ELF file: $file" # Optional: reduce verbosity
-            : # Do nothing for non-ELF files
-        fi
-    done
-  else
-      echo "Skipping stripping due to !strip option."
-  fi
+  DESTDIR="$pkgdir" cmake --install build-final
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname"
 }
