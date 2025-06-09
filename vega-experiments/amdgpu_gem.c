@@ -60,8 +60,8 @@
  * The values are only advisory; a maximum age of 2 ms is enforced.
  */
 struct vega_vram_cache_pc {
-	u32 pct;      /* cached VRAM usage in % (0-100)  */
-	u64 ns_last;  /* timestamp (ns) of last refresh  */
+	u32 pct;      /* cached usage in % */
+	u64 ns_last;  /* timestamp (ns)    */
 } __aligned(L1_CACHE_BYTES);
 
 static DEFINE_PER_CPU(struct vega_vram_cache_pc, vram_cache_pc);
@@ -102,7 +102,7 @@ amdgpu_gem_static_branch_init(struct amdgpu_device *adev)
 }
 
 #define TBO_MAX_BYTES   (64u << 10)
-#define TBO_CACHE_DEPTH 16
+#define TBO_CACHE_DEPTH 32
 #define TBO_CACHEABLE_USER_FLAGS (AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED | \
 AMDGPU_GEM_CREATE_CPU_GTT_USWC)
 
@@ -146,18 +146,18 @@ tbo_cache_try_get(unsigned long size, u64 user_flags,
 	struct amdgpu_bo *bo = NULL;
 	unsigned int cpu;
 
-	if (unlikely(!static_branch_unlikely(&tbo_cache_key))           ||
-		unlikely(size                         > TBO_MAX_BYTES)      ||
-		unlikely(domain                       != AMDGPU_GEM_DOMAIN_GTT) ||
-		unlikely((user_flags & ~TBO_CACHEABLE_USER_FLAGS) != 0)     ||
-		unlikely(resv != NULL)                                      ||
-		unlikely(align                        > PAGE_SIZE))
+	if (unlikely(!static_branch_unlikely(&tbo_cache_key))                  ||
+		unlikely(size       > TBO_MAX_BYTES)                               ||
+		unlikely(domain     != AMDGPU_GEM_DOMAIN_GTT)                      ||
+		unlikely(user_flags & ~TBO_CACHEABLE_USER_FLAGS)                   ||
+		unlikely(resv)                                                     ||
+		unlikely(align      > PAGE_SIZE))
 		return NULL;
 
-	cpu = get_cpu();				/* pin task to CPU   */
+	cpu = get_cpu();
 	c   = per_cpu_ptr(&tiny_bo_cache, cpu);
 
-	if (likely(c->top)) {
+	if (c->top) {
 		bo = c->slot[--c->top];
 		prefetch(bo);
 	}
@@ -173,28 +173,29 @@ static bool tbo_cache_put(struct amdgpu_bo *bo)
 	unsigned int cpu;
 
 	if (unlikely(!bo) ||
-		unlikely(!static_branch_unlikely(&tbo_cache_key))          ||
-		unlikely(bo->tbo.base.size            > TBO_MAX_BYTES)     ||
-		unlikely(bo->preferred_domains        != AMDGPU_GEM_DOMAIN_GTT) ||
+		unlikely(!static_branch_unlikely(&tbo_cache_key))                  ||
+		unlikely(bo->tbo.base.size  > TBO_MAX_BYTES)                       ||
+		unlikely(bo->preferred_domains != AMDGPU_GEM_DOMAIN_GTT)           ||
 		unlikely((bo->tbo.page_alignment << PAGE_SHIFT) > PAGE_SIZE))
 		return false;
 
 	flags = bo->flags & ~AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE;
-	if (unlikely(flags & ~TBO_CACHEABLE_USER_FLAGS))
+	if (flags & ~TBO_CACHEABLE_USER_FLAGS)
 		return false;
 
 	cpu = get_cpu();
 	c   = per_cpu_ptr(&tiny_bo_cache, cpu);
 
-	if (unlikely(c->top >= TBO_CACHE_DEPTH)) {
+	if (c->top >= TBO_CACHE_DEPTH) {
 		put_cpu();
 		return false;
 	}
 
-	/* resurrect: cache now owns the single reference */
+	/* resurrect: cache owns the single reference */
 	kref_init(&bo->tbo.base.refcount);
 	c->slot[c->top++] = bo;
 	put_cpu();
+
 	return true;
 }
 
@@ -285,17 +286,17 @@ static __always_inline u32
 amdgpu_vega_get_vram_usage_cached(struct amdgpu_device *adev)
 {
 	const s64 max_age_ns = 2 * NSEC_PER_MSEC;
-	unsigned int cpu;
-	struct vega_vram_cache_pc *c;
 	u64 now;
 	u32 pct;
+	struct vega_vram_cache_pc *c;
+	unsigned int cpu;
 
 	if (unlikely(!adev))
 		return 0;
 
-	cpu = get_cpu();
+	cpu = get_cpu();				/* stay on this CPU */
 	c   = per_cpu_ptr(&vram_cache_pc, cpu);
-	now = KTIME_FAST_NS();
+	now = ktime_get_mono_fast_ns();
 
 	if (likely(now - c->ns_last < max_age_ns)) {
 		pct = READ_ONCE(c->pct);
@@ -304,13 +305,13 @@ amdgpu_vega_get_vram_usage_cached(struct amdgpu_device *adev)
 	}
 	put_cpu();
 
-	/* slow-path: refresh */
+	/* refresh – slow path */
 	pct = __amdgpu_vega_get_vram_usage(adev);
 
 	cpu = get_cpu();
 	c   = per_cpu_ptr(&vram_cache_pc, cpu);
-	smp_store_release(&c->pct, pct); /* publish value */
-	WRITE_ONCE(c->ns_last, now);     /* then timestamp */
+	smp_store_release(&c->pct, pct);
+	WRITE_ONCE(c->ns_last, now);
 	put_cpu();
 
 	return pct;
