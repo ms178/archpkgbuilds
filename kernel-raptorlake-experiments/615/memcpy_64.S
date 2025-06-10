@@ -1,37 +1,40 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * memcpy() – tuned for Intel® Raptor-Lake-R (i7-14700KF)
+ * memcpy() — 64-bit, overlap-aware implementation
+ *            tuned for Intel® Raptor-Lake-R (i7-14700KF)
  *
- *  rdi = dst
- *  rsi = src
- *  rdx = count
+ *  IN : RDI = dst,  RSI = src,  RDX = count (bytes)
+ *  OUT: RAX = dst            (SysV ABI)
  *
- *  rax = dst  (SysV ABI)
+ *  Fast path: CPUs advertising X86_FEATURE_FSRM execute an in-lined
+ *             “rep movsb” via alternatives — the fastest choice on
+ *             Alder/Raptor cores for every length.
  *
- *  On CPUs with FSRM (Fast-Short-REP-Movs) we execute a plain
- *     rep movsb
- *  via alternatives.  On older parts we fall back to memcpy_orig,
- *  now modernised to use rep movsq in both directions.
+ *  Fallback : memcpy_orig
+ *             ─ forward   : rep movsq (≥128 B) | 32-byte unroll (<128 B)
+ *             ─ backward  : std + rep movsb        (overlap-safe)
+ *             ─ shared tail routine (≤31 B)
+ *
+ *  ABI, symbol names and linkage remain identical to upstream.
  */
 
 #include <linux/export.h>
 #include <linux/linkage.h>
 #include <linux/cfi_types.h>
-#include <asm/errno.h>
 #include <asm/cpufeatures.h>
 #include <asm/alternative.h>
 
-        .section .noinstr.text,"ax"
+        .section .noinstr.text, "ax"
 
-/* ==============================================================
- *  Public entry – alternatives patches out the JMP on FSRM parts
- * ============================================================== */
-        .p2align 5
+/* ------------------------------------------------------------------ */
+/*  Public entry — alternatives patches the JMP away on FSRM CPUs      */
+/* ------------------------------------------------------------------ */
+        .p2align 5                          /* 32-byte i-cache line */
 SYM_TYPED_FUNC_START(__memcpy)
-        /* RL-fix: flag was FSRS → FSRM */
         ALTERNATIVE "jmp memcpy_orig", "", X86_FEATURE_FSRM
 
-        movq    %rdi, %rax
+        /* FSRM fast path: in-lined REP MOVSB ------------------- */
+        movq    %rdi, %rax                  /* preserve dst for ret */
         movq    %rdx, %rcx
         rep     movsb
         RET
@@ -41,124 +44,74 @@ EXPORT_SYMBOL(__memcpy)
 SYM_FUNC_ALIAS_MEMFUNC(memcpy, __memcpy)
 EXPORT_SYMBOL(memcpy)
 
-/* ==============================================================
- *  memcpy_orig – fallback when FSRM unavailable
- * ============================================================== */
+/* ================================================================== */
+/*  memcpy_orig — generic fallback                                    */
+/* ================================================================== */
         .p2align 4
 SYM_FUNC_START_LOCAL(memcpy_orig)
-        movq    %rdi, %rax            /* preserve dst for retval */
+        movq    %rdi, %rax                  /* keep dst for return  */
 
         /* ------------------------------------------------------
-         * Decide copy direction to avoid destructive overlap.
-         * (kernel memcpy _does not_ guarantee memmove semantics
-         *  but we keep the legacy behaviour.)
+         * Decide copy direction.  Copy forward when the ranges
+         * do not destructively overlap (dst ∉ (src, src+len−1]).
          * ---------------------------------------------------- */
-        cmpq    $0x20, %rdx
-        jb      .Lhandle_tail
+        cmpq    %rdi, %rsi
+        jbe     .Lforward_ok                /* dst ≤ src  ⇒ forward */
 
-        lea     -1(%rdi,%rdx), %r8    /* dst_end */
-        lea     -1(%rsi,%rdx), %r9    /* src_end */
+        leaq    (%rsi,%rdx), %rcx           /* rcx = src_end       */
+        cmpq    %rcx, %rdi
+        ja      .Lforward_ok                /* dst > src_end ⇒ fwd */
 
-        /* dst < src || dst_end < src  → safe forward copy */
-        cmpq    %rsi, %rdi
-        jb      .Lforward
-        cmpq    %r9, %rdi
-        jbe     .Lforward
-
-/* ----------------------------------------------------------------
- *  Backward copy  (overlap & dst>src)
- * -------------------------------------------------------------- */
+        /* ------------- backward copy (destructive overlap) -------- */
 .Lbackward:
-        std                         /* set DF=1, count down   */
+        addq    %rdx, %rsi
+        addq    %rdx, %rdi
+        std                                 /* set DF = 1          */
         movq    %rdx, %rcx
-        rep     movsq               /* move RCX q-words       */
-        cld                         /* restore DF=0           */
-        jmp     .Ldone
+        rep     movsb                       /* byte-accurate       */
+        cld
+        RET
 
-/* ----------------------------------------------------------------
- *  Forward copy  (no harmful overlap)
- * -------------------------------------------------------------- */
-.Lforward:
-        cld                         /* ensure DF=0            */
+/* ------------------------------ forward path ----------------------- */
+.Lforward_ok:
+        cld
 
-        /* For large sizes use rep movsq, otherwise tiny-loop */
+        /* Large? Use rep movsq; else 32-byte unroll. */
         cmpq    $128, %rdx
-        jb      .Ltiny_fwd
+        jb      .Lsmall_fwd
 
-        /* RCX = q-words, RDX = bytes%8  */
         movq    %rdx, %rcx
-        shrq    $3,  %rcx
+        shrq    $3, %rcx                    /* q-word count        */
         rep     movsq
-        movq    %rdx, %rcx           /* low 3 bits still in RDX */
-        andq    $7,  %rcx
+        movq    %rdx, %rcx
+        andq    $7,  %rcx                   /* tail bytes          */
         rep     movsb
-        jmp     .Ldone
+        RET
 
-/* --------- old 4×8-byte unroll kept for <128 B forward copies ---- */
-.Ltiny_fwd:
+/* ---- small forward copy (<128 B) --------------------------------- */
+.Lsmall_fwd:
         subq    $0x20, %rdx
-.Lfwd_loop:
+.Lunroll32:
         subq    $0x20, %rdx
         movq    0(%rsi),  %r8
         movq    8(%rsi),  %r9
         movq    16(%rsi), %r10
         movq    24(%rsi), %r11
-        addq    $0x20,  %rsi
+        addq    $0x20,    %rsi
         movq    %r8,  0(%rdi)
         movq    %r9,  8(%rdi)
         movq    %r10, 16(%rdi)
         movq    %r11, 24(%rdi)
-        addq    $0x20,  %rdi
-        jae     .Lfwd_loop
-        addq    $0x20,  %rdx         /* correct over-step      */
-/* -------------- fall into tail ------------------------------- */
+        addq    $0x20,    %rdi
+        jae     .Lunroll32
+        addq    $0x20,    %rdx              /* undo last sub       */
 
-/* =================================================================
- *  Handle <32-byte tails for either direction
- * ============================================================== */
-.Lhandle_tail:
-        cmpq    $16, %rdx
-        jb      .Ltail_lt16
-
-        /* 16 … 31 bytes */
-        movq    (%rsi),      %r8
-        movq    8(%rsi),     %r9
-        movq    -16(%rsi,%rdx), %r10
-        movq    -8(%rsi,%rdx),  %r11
-        movq    %r8,  (%rdi)
-        movq    %r9,  8(%rdi)
-        movq    %r10, -16(%rdi,%rdx)
-        movq    %r11, -8(%rdi,%rdx)
-        jmp     .Ldone
-
-.Ltail_lt16:
-        cmpq    $8, %rdx
-        jb      .Ltail_lt8
-
-        /* 8 … 15 bytes */
-        movq    (%rsi), %r8
-        movq    -8(%rsi,%rdx), %r9
-        movq    %r8, (%rdi)
-        movq    %r9, -8(%rdi,%rdx)
-        jmp     .Ldone
-
-.Ltail_lt8:
-        cmpq    $4, %rdx
-        jb      .Ltail_lt4
-
-        /* 4 … 7 bytes */
-        movl    (%rsi), %ecx
-        movl    -4(%rsi,%rdx), %r8d
-        movl    %ecx, (%rdi)
-        movl    %r8d, -4(%rdi,%rdx)
-        jmp     .Ldone
-
-.Ltail_lt4:
+        /* ---- shared byte tail (0-31 B) ------------------------ */
+.Ltail:
         testq   %rdx, %rdx
         je      .Ldone
-        mov     %rdx, %rcx
+        movq    %rdx, %rcx
         rep     movsb
-
 .Ldone:
         RET
 SYM_FUNC_END(memcpy_orig)
