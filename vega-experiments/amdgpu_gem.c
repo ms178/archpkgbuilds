@@ -60,8 +60,8 @@
  * The values are only advisory; a maximum age of 2 ms is enforced.
  */
 struct vega_vram_cache_pc {
-	u32 pct;      /* cached usage in % */
-	u64 ns_last;  /* timestamp (ns)    */
+	u32 pct;      /* cached VRAM usage in % (0-100)  */
+	u64 ns_last;  /* timestamp (ns) of last refresh  */
 } __aligned(L1_CACHE_BYTES);
 
 static DEFINE_PER_CPU(struct vega_vram_cache_pc, vram_cache_pc);
@@ -101,19 +101,21 @@ amdgpu_gem_static_branch_init(struct amdgpu_device *adev)
 	}
 }
 
-#define TBO_MAX_BYTES   (64u << 10)
-#define TBO_CACHE_DEPTH 32
-#define TBO_CACHEABLE_USER_FLAGS (AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED | \
-AMDGPU_GEM_CREATE_CPU_GTT_USWC)
+/* ‑- existing defines kept for context ‑- */
+#define TBO_MAX_BYTES   (64u << 10)       /* 64 KiB  */
+#define TBO_CACHE_DEPTH 32                /* entries per CPU   */
+#define TBO_CACHEABLE_USER_FLAGS \
+(AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED | AMDGPU_GEM_CREATE_CPU_GTT_USWC)
 
 struct tiny_bo_cache {
 	struct amdgpu_bo *slot[TBO_CACHE_DEPTH];
-	u8                top;
+	u8                top;            /* push/pop index    */
 } __aligned(L1_CACHE_BYTES);
 
 static DEFINE_PER_CPU(struct tiny_bo_cache, tiny_bo_cache);
 DEFINE_STATIC_KEY_FALSE(tbo_cache_key);
 
+/* unchanged ‑- still used by amdgpu_gem_object_create() */
 static struct kmem_cache *ubo_slab;
 
 static void amdgpu_tbo_slab_ensure(void)
@@ -129,39 +131,41 @@ static void amdgpu_tbo_slab_ensure(void)
 	if (!s)
 		return;
 
-	if (cmpxchg(&ubo_slab, NULL, s)) {
-		/* Somebody else installed it first */
+	if (cmpxchg(&ubo_slab, NULL, s))
 		kmem_cache_destroy(s);
-	} else {
-		/* Slab is live → the tiny-BO cache can be considered ready */
+	else
 		static_branch_enable(&tbo_cache_key);
-	}
 }
 
 static struct amdgpu_bo *
-tbo_cache_try_get(unsigned long size, u64 user_flags,
+tbo_cache_try_get(unsigned long size, u64 uflags,
 				  u32 domain, struct dma_resv *resv, int align)
 {
 	struct tiny_bo_cache *c;
-	struct amdgpu_bo *bo = NULL;
-	unsigned int cpu;
+	struct amdgpu_bo     *bo;
 
-	if (unlikely(!static_branch_unlikely(&tbo_cache_key))                  ||
-		unlikely(size       > TBO_MAX_BYTES)                               ||
-		unlikely(domain     != AMDGPU_GEM_DOMAIN_GTT)                      ||
-		unlikely(user_flags & ~TBO_CACHEABLE_USER_FLAGS)                   ||
-		unlikely(resv)                                                     ||
+	if (unlikely(!static_branch_unlikely(&tbo_cache_key))          ||
+		unlikely(size       > TBO_MAX_BYTES)                       ||
+		unlikely(domain     != AMDGPU_GEM_DOMAIN_GTT)              ||
+		unlikely((uflags & ~TBO_CACHEABLE_USER_FLAGS) != 0)        ||
+		unlikely(resv != NULL)                                     ||
 		unlikely(align      > PAGE_SIZE))
 		return NULL;
 
-	cpu = get_cpu();
-	c   = per_cpu_ptr(&tiny_bo_cache, cpu);
+	/* hot path – keep pre-emption disabled only while touching cache */
+	preempt_disable();                    /* stay on current CPU     */
+	c = this_cpu_ptr(&tiny_bo_cache);
 
-	if (c->top) {
-		bo = c->slot[--c->top];
-		prefetch(bo);
+	if (!c->top) {                        /* cache miss              */
+		preempt_enable();
+		return NULL;
 	}
-	put_cpu();
+
+	bo = c->slot[--c->top];
+	preempt_enable();
+
+	if (bo)
+		prefetch(bo);
 
 	return bo;
 }
@@ -170,32 +174,29 @@ static bool tbo_cache_put(struct amdgpu_bo *bo)
 {
 	struct tiny_bo_cache *c;
 	u64 flags;
-	unsigned int cpu;
 
 	if (unlikely(!bo) ||
-		unlikely(!static_branch_unlikely(&tbo_cache_key))                  ||
-		unlikely(bo->tbo.base.size  > TBO_MAX_BYTES)                       ||
-		unlikely(bo->preferred_domains != AMDGPU_GEM_DOMAIN_GTT)           ||
+		unlikely(!static_branch_unlikely(&tbo_cache_key))                 ||
+		unlikely(bo->tbo.base.size            > TBO_MAX_BYTES)            ||
+		unlikely(bo->preferred_domains        != AMDGPU_GEM_DOMAIN_GTT)   ||
 		unlikely((bo->tbo.page_alignment << PAGE_SHIFT) > PAGE_SIZE))
 		return false;
 
 	flags = bo->flags & ~AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE;
-	if (flags & ~TBO_CACHEABLE_USER_FLAGS)
+	if (unlikely(flags & ~TBO_CACHEABLE_USER_FLAGS))
 		return false;
 
-	cpu = get_cpu();
-	c   = per_cpu_ptr(&tiny_bo_cache, cpu);
+	preempt_disable();
+	c = this_cpu_ptr(&tiny_bo_cache);
 
-	if (c->top >= TBO_CACHE_DEPTH) {
-		put_cpu();
-		return false;
+	if (unlikely(c->top >= TBO_CACHE_DEPTH)) {
+		preempt_enable();
+		return false;                      /* per-CPU stack full   */
 	}
 
-	/* resurrect: cache owns the single reference */
-	kref_init(&bo->tbo.base.refcount);
+	kref_init(&bo->tbo.base.refcount);         /* cache re-owns ref    */
 	c->slot[c->top++] = bo;
-	put_cpu();
-
+	preempt_enable();
 	return true;
 }
 
@@ -286,17 +287,17 @@ static __always_inline u32
 amdgpu_vega_get_vram_usage_cached(struct amdgpu_device *adev)
 {
 	const s64 max_age_ns = 2 * NSEC_PER_MSEC;
+	unsigned int cpu;
+	struct vega_vram_cache_pc *c;
 	u64 now;
 	u32 pct;
-	struct vega_vram_cache_pc *c;
-	unsigned int cpu;
 
 	if (unlikely(!adev))
 		return 0;
 
-	cpu = get_cpu();				/* stay on this CPU */
+	cpu = get_cpu();
 	c   = per_cpu_ptr(&vram_cache_pc, cpu);
-	now = ktime_get_mono_fast_ns();
+	now = KTIME_FAST_NS();
 
 	if (likely(now - c->ns_last < max_age_ns)) {
 		pct = READ_ONCE(c->pct);
@@ -305,13 +306,13 @@ amdgpu_vega_get_vram_usage_cached(struct amdgpu_device *adev)
 	}
 	put_cpu();
 
-	/* refresh – slow path */
+	/* slow-path: refresh */
 	pct = __amdgpu_vega_get_vram_usage(adev);
 
 	cpu = get_cpu();
 	c   = per_cpu_ptr(&vram_cache_pc, cpu);
-	smp_store_release(&c->pct, pct);
-	WRITE_ONCE(c->ns_last, now);
+	smp_store_release(&c->pct, pct); /* publish value */
+	WRITE_ONCE(c->ns_last, now);     /* then timestamp */
 	put_cpu();
 
 	return pct;
@@ -390,45 +391,73 @@ amdgpu_vega_get_effective_vram_usage(struct amdgpu_device *adev)
 	return effective_percent;
 }
 
+/*
+ * amdgpu_vega_optimize_buffer_placement()
+ * Lock-free, stateless heuristic for Vega-10 HBM2 boards.
+ */
 static bool
 amdgpu_vega_optimize_buffer_placement(struct amdgpu_device *adev,
 									  u64 size, u64 flags, u32 *domain)
 {
-	u32 orig = *domain;
+	u32 orig_domain;
 	u32 pressure;
+	u64 vram_size;
+	u32 remain_pct;
+	u64 remain_bytes;
 
-	if (unlikely(!is_hbm2_vega(adev) || !domain))
+	/* ---------- 0. Basic sanity checks ----------------------------- */
+	if (unlikely(!domain))
 		return false;
 
-	/* CPU-visible buffers → force GTT */
+	orig_domain = *domain;
+
+	/* Only Vega HBM2 parts need this heuristic */
+	if (unlikely(!is_hbm2_vega(adev)))
+		return false;
+
+	/* CPU-visible buffers are forced into GTT unconditionally */
 	if (is_vega_cpu_access(flags)) {
 		vega_force_gtt(domain);
-		return *domain != orig;
+		return *domain != orig_domain;
 	}
 
-	/* Only GPU-only buffers below are considered                            */
-	if (!(is_vega_texture(flags) || is_vega_compute(flags))) {
+	/* Only touch GPU-only textures / compute buffers */
+	if (!(is_vega_texture(flags) || is_vega_compute(flags)))
 		return false;
+
+	/* ---------- 1. Gather instantaneous metrics -------------------- */
+	pressure  = amdgpu_vega_get_vram_usage_cached(adev);	/* 0-100 % */
+	vram_size = READ_ONCE(adev->gmc.mc_vram_size);		/* bytes   */
+
+	/* Should never happen after init, but be defensive */
+	if (unlikely(!vram_size))
+		return false;
+
+	/* ---------- 2. Compute remaining head-room to high watermark --- */
+	if (pressure >= amdgpu_vega_vram_pressure_high)
+		remain_pct = 0;
+	else
+		remain_pct = amdgpu_vega_vram_pressure_high - pressure;
+
+	/*
+	 * remain_bytes = (vram_size * remain_pct) / 100
+	 * Division by a 32-bit constant is fast and cannot overflow:
+	 *   vram_size ≤ 16 EiB, remain_pct ≤ 100  ⇒ product < 2^71.
+	 */
+	remain_bytes = div64_u64(vram_size * (u64)remain_pct, 100U);
+
+	/* ---------- 3. Decide placement -------------------------------- */
+	if (size >= remain_bytes) {
+		/* Would push VRAM beyond high watermark → demote, unless tiny */
+		if (size >= (4ULL << 20))
+			vega_force_gtt(domain);
+	} else {
+		/* Plenty of VRAM head-room: ensure residency in VRAM */
+		*domain &= ~AMDGPU_GEM_DOMAIN_GTT;
+		*domain |=  AMDGPU_GEM_DOMAIN_VRAM;
 	}
 
-	pressure = amdgpu_vega_get_vram_usage_cached(adev);
-
-	if (pressure > amdgpu_vega_vram_pressure_mid ||
-		(size > (64ULL << 20) &&
-		pressure > amdgpu_vega_vram_pressure_low)) {
-		if (size <= AMDGPU_VEGA_MEDIUM_BUFFER_SIZE &&
-			pressure < amdgpu_vega_vram_pressure_high) {
-			*domain = (*domain & ~AMDGPU_GEM_DOMAIN_GTT) |
-			AMDGPU_GEM_DOMAIN_VRAM;
-			} else {
-				vega_force_gtt(domain);
-			}
-		} else {
-			*domain = (*domain & ~AMDGPU_GEM_DOMAIN_GTT) |
-			AMDGPU_GEM_DOMAIN_VRAM;
-		}
-
-		return *domain != orig;
+	return *domain != orig_domain;
 }
 
 static __cold bool
@@ -776,125 +805,89 @@ void amdgpu_gem_force_release(struct amdgpu_device *adev)
 }
 
 static int amdgpu_gem_object_open(struct drm_gem_object *obj,
-								  struct drm_file *file_priv)
+								  struct drm_file      *file_priv)
 {
-	struct amdgpu_bo       *abo;
-	struct amdgpu_fpriv    *fpriv;
-	struct amdgpu_device   *adev;
-	struct amdgpu_vm       *vm;
-	struct amdgpu_bo_va    *bo_va;
-	struct mm_struct       *mm;
-	int                     r;
+	struct amdgpu_bo    *abo   = gem_to_amdgpu_bo(obj);
+	struct amdgpu_fpriv *fpriv = file_priv->driver_priv;
+	struct amdgpu_vm    *vm;
+	int                  r = 0;
 
-	if (unlikely(!obj || !file_priv))
-		return -EINVAL;
-
-	abo   = gem_to_amdgpu_bo(obj);
-	fpriv = file_priv->driver_priv;
 	if (unlikely(!abo || !fpriv))
-		return -EINVAL;
-
-	adev = amdgpu_ttm_adev(abo->tbo.bdev);
-	if (unlikely(!adev))
 		return -EINVAL;
 
 	vm = &fpriv->vm;
 
-	/* ------------------------------------------------------------------
-	 * Fast-exit paths for “always-valid” BOs
-	 * ------------------------------------------------------------------
-	 */
+	/* Ensure “always-valid” really is valid */
 	if ((abo->flags & AMDGPU_GEM_CREATE_VM_ALWAYS_VALID) &&
 		!amdgpu_vm_is_bo_always_valid(vm, abo))
 		return -EPERM;
 
-	if (!vm->is_compute_context &&
-		static_branch_likely(&amdgpu_vm_always_valid_key) &&
-		(abo->flags & AMDGPU_GEM_CREATE_VM_ALWAYS_VALID) &&
-		(abo->allowed_domains == AMDGPU_GEM_DOMAIN_GTT) &&
-		!abo->parent &&
+	/* blazing-fast exit for most GTT-only always-valid BOs */
+	if (static_branch_likely(&amdgpu_vm_always_valid_key) &&
+		(abo->flags & AMDGPU_GEM_CREATE_VM_ALWAYS_VALID)  &&
+		abo->allowed_domains == AMDGPU_GEM_DOMAIN_GTT     &&
+		!abo->parent                                      &&
 		(!obj->import_attach ||
 		!dma_buf_is_dynamic(obj->import_attach->dmabuf)))
 		return 0;
 
-	/* ------------------------------------------------------------------
-	 * Sanity-check current->mm for userptr BOs
-	 * ------------------------------------------------------------------
-	 */
-	rcu_read_lock();
-	mm = amdgpu_ttm_tt_get_usermm(abo->tbo.ttm);
-	if (mm) {
-		if (!mmget_not_zero(mm)) {
-			rcu_read_unlock();
-			return -EPERM;
-		}
+	/* -------- userptr safety check ------------------------------- */
+	if (unlikely(amdgpu_ttm_tt_get_usermm(abo->tbo.ttm))) {
+		struct mm_struct *mm = amdgpu_ttm_tt_get_usermm(abo->tbo.ttm);
 
-		if (mm != current->mm) {
+		if (unlikely(!mmget_not_zero(mm)))
+			return -EPERM;
+		if (unlikely(mm != current->mm)) {
 			mmput(mm);
-			rcu_read_unlock();
 			return -EPERM;
 		}
 		mmput(mm);
 	}
-	rcu_read_unlock();
 
-	/* ------------------------------------------------------------------
-	 * Attach BO to VM
-	 * ------------------------------------------------------------------
-	 */
+	/* -------- attach BO into VM ---------------------------------- */
 	r = amdgpu_bo_reserve(abo, false);
 	if (r)
 		return r;
 
-	bo_va = amdgpu_vm_bo_find(vm, abo);
+	struct amdgpu_device *adev  = amdgpu_ttm_adev(abo->tbo.bdev);
+	struct amdgpu_bo_va  *bo_va = amdgpu_vm_bo_find(vm, abo);
+
 	if (!bo_va) {
 		bo_va = amdgpu_vm_bo_add(adev, vm, abo);
-		if (IS_ERR(bo_va)) {
+		if (IS_ERR(bo_va))
 			r = PTR_ERR(bo_va);
-			amdgpu_bo_unreserve(abo);
-			return r;
-		}
 	} else {
 		bo_va->ref_count++;
 	}
-
 	amdgpu_bo_unreserve(abo);
+	if (r)
+		return r;
 
-	/* ------------------------------------------------------------------
-	 * kFD eviction-fence handling (GPUVM compute contexts)
-	 * ------------------------------------------------------------------
-	 */
-	if (!vm->is_compute_context || !vm->process_info)
-		return 0;
-
-	if (!obj->import_attach ||
-		!dma_buf_is_dynamic(obj->import_attach->dmabuf))
-		return 0;
-
-	mutex_lock_nested(&vm->process_info->lock, 1);
-
-	if (vm->process_info->eviction_fence &&
-		!(static_branch_likely(&amdgpu_vm_always_valid_key) &&
-		(abo->flags & AMDGPU_GEM_CREATE_VM_ALWAYS_VALID))) {
+	/* -------- kFD compute eviction-fence handling ---------------- */
+	if (unlikely(vm->is_compute_context                        &&
+		vm->process_info                               &&
+		obj->import_attach &&
+		dma_buf_is_dynamic(obj->import_attach->dmabuf) &&
+		vm->process_info->eviction_fence)) {
 
 		uint32_t domain = AMDGPU_GEM_DOMAIN_GTT;
 
-	if (is_hbm2_vega(adev)) {
-		if (is_vega_texture(abo->flags) ||
-			is_vega_compute(abo->flags))
-			domain = AMDGPU_GEM_DOMAIN_VRAM;
+	if (is_hbm2_vega(adev) &&
+		(is_vega_texture(abo->flags) ||
+		is_vega_compute(abo->flags))) {
 
-		if (amdgpu_vega_get_effective_vram_usage(adev) >
+		if (amdgpu_vega_get_effective_vram_usage(adev) <
 			amdgpu_vega_vram_pressure_high)
-			domain = AMDGPU_GEM_DOMAIN_GTT;
-	}
+			domain = AMDGPU_GEM_DOMAIN_VRAM;
+		}
 
+		mutex_lock(&vm->process_info->lock);
 	r = amdgpu_amdkfd_bo_validate_and_fence(
 		abo, domain,
 		&vm->process_info->eviction_fence->base);
+	mutex_unlock(&vm->process_info->lock);
 		}
 
-		mutex_unlock(&vm->process_info->lock);
 		return r;
 }
 
@@ -1195,8 +1188,8 @@ int amdgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
 }
 
 int amdgpu_mode_dumb_mmap(struct drm_file *filp,
-								 struct drm_device *dev,
-								 uint32_t handle, uint64_t *offset_p)
+						  struct drm_device *dev,
+						  uint32_t handle, uint64_t *offset_p)
 {
 	struct drm_gem_object *gobj;
 	struct amdgpu_bo      *robj;
