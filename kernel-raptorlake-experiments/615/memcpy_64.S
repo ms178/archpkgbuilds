@@ -74,7 +74,6 @@ SYM_FUNC_START_LOCAL(memcpy_orig)
 
 /* ------------------------------ forward path ----------------------- */
 .Lforward_ok:
-        cld
 
         /* Large? Use rep movsq; else 32-byte unroll. */
         cmpq    $128, %rdx

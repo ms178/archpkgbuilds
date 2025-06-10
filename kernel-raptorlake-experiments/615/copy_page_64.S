@@ -19,15 +19,11 @@
  * ============================================================== */
 	.p2align 5
 SYM_FUNC_START(copy_page)
-	.cfi_startproc
-
 	ALTERNATIVE "jmp copy_page_regs", "", X86_FEATURE_REP_GOOD
 
 	movl	$4096, %ecx
 	rep	movsb
 	RET
-
-	.cfi_endproc
 SYM_FUNC_END(copy_page)
 EXPORT_SYMBOL(copy_page)
 
@@ -35,23 +31,16 @@ EXPORT_SYMBOL(copy_page)
  *  Hand-unrolled fallback
  * ============================================================== */
 	.p2align 4
-SYM_FUNC_START_LOCAL(copy_page_regs)
-	.cfi_startproc
-
-	/* --- prologue: save RBX, R12 --- */
+SYM_FUNC_START(copy_page_regs)
+	/* Save callee-saved registers */
 	pushq	%rbx
-	.cfi_adjust_cfa_offset 8
-	.cfi_offset %rbx, -8
-
 	pushq	%r12
-	.cfi_adjust_cfa_offset 8
-	.cfi_offset %r12, -16
 
 	/* 64 iterations × 64 B = 4096 B */
 	movl	$64, %ecx
 
 .Lloop64:
-	/* loads */
+	/* Load 64 bytes from source */
 	movq	0(%rsi),  %rax
 	movq	8(%rsi),  %rbx
 	movq	16(%rsi), %rdx
@@ -61,7 +50,7 @@ SYM_FUNC_START_LOCAL(copy_page_regs)
 	movq	48(%rsi), %r11
 	movq	56(%rsi), %r12
 
-	/* stores */
+	/* Store 64 bytes to destination */
 	movq	%rax,  0(%rdi)
 	movq	%rbx,  8(%rdi)
 	movq	%rdx,  16(%rdi)
@@ -71,17 +60,14 @@ SYM_FUNC_START_LOCAL(copy_page_regs)
 	movq	%r11,  48(%rdi)
 	movq	%r12,  56(%rdi)
 
+	/* Advance pointers */
 	addq	$64, %rsi
 	addq	$64, %rdi
 	dec	%ecx
 	jne	.Lloop64
 
-	/* --- epilogue --- */
+	/* Restore registers and return */
 	popq	%r12
-	.cfi_adjust_cfa_offset -8
 	popq	%rbx
-	.cfi_adjust_cfa_offset -8
 	RET
-
-	.cfi_endproc
 SYM_FUNC_END(copy_page_regs)

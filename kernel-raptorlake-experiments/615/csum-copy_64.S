@@ -14,12 +14,6 @@
  *      RAX : 64-bit checksum (undefined on exception)
  *
  *  Clobbers: RBX, RCX, RDX, R8-R15, RFLAGS
- *
- *  This is the historical scalar implementation with the following fixes:
- *      • correct macro invocation (“source” / “dest” on their own line)
- *      • proper CFI directives wrapped inside .cfi_startproc/.cfi_endproc
- *      • no custom CFI_* macros that GAS/LLVM do not understand
- *      • style clean-ups: tabs, 80-col comments, consistent casing
  */
 
 #include <linux/linkage.h>
@@ -41,21 +35,13 @@
 
 /* ----------------------------------------------------------------- */
 SYM_FUNC_START(csum_partial_copy_generic)
-	.cfi_startproc
-
 	/* Spill callee-saved that we clobber */
 	subq	$5*8, %rsp
-	.cfi_adjust_cfa_offset 40
 	movq	%rbx, 0*8(%rsp)
-	.cfi_offset %rbx, -40
 	movq	%r12, 1*8(%rsp)
-	.cfi_offset %r12, -32
 	movq	%r14, 2*8(%rsp)
-	.cfi_offset %r14, -24
 	movq	%r13, 3*8(%rsp)
-	.cfi_offset %r13, -16
 	movq	%r15, 4*8(%rsp)
-	.cfi_offset %r15, -8
 
 	movl	$-1, %eax	/* preset carry (for first ADC)   */
 	xorl	%r9d, %r9d	/* r9 = 0 (used for final adc)    */
@@ -216,7 +202,6 @@ SYM_FUNC_START(csum_partial_copy_generic)
 	movq	3*8(%rsp), %r13
 	movq	4*8(%rsp), %r15
 	addq	$5*8, %rsp
-	.cfi_adjust_cfa_offset -40
 	RET
 
 /* ================================================================
@@ -291,5 +276,4 @@ SYM_FUNC_START(csum_partial_copy_generic)
 	xorl	%eax, %eax
 	jmp	.Lout
 
-	.cfi_endproc
 SYM_FUNC_END(csum_partial_copy_generic)
