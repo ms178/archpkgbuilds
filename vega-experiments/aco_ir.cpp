@@ -454,8 +454,7 @@ can_use_DPP(amd_gfx_level gfx_level, const aco_ptr<Instruction>& instr, bool dpp
           instr->opcode != aco_opcode::v_permlanex16_b32 &&
           instr->opcode != aco_opcode::v_permlane64_b32 &&
           instr->opcode != aco_opcode::v_readlane_b32_e64 &&
-          instr->opcode != aco_opcode::v_writelane_b32_e64 &&
-          instr->opcode != aco_opcode::p_v_cvt_pk_u8_f32;
+          instr->opcode != aco_opcode::v_writelane_b32_e64;
 }
 
 aco_ptr<Instruction>
@@ -536,9 +535,14 @@ can_use_input_modifiers(amd_gfx_level gfx_level, aco_opcode op, int idx)
 bool
 can_use_opsel(amd_gfx_level gfx_level, aco_opcode op, int idx)
 {
-      /* opsel is only GFX9+ */
-      if (gfx_level < GFX9)
+      if (((uint16_t)instr_info.format[static_cast<int>(op)] & (uint16_t)Format::VOP3P))
             return false;
+
+      if (gfx_level < GFX9) {
+            if (gfx_level >= GFX11 && (get_gfx11_true16_mask(op) & BITFIELD_BIT(idx == -1 ? 3 : idx)))
+                  return true;
+            return false;
+      }
 
       switch (op) {
             case aco_opcode::v_div_fixup_f16:
@@ -571,37 +575,74 @@ can_use_opsel(amd_gfx_level gfx_level, aco_opcode op, int idx)
             case aco_opcode::v_and_b16:
             case aco_opcode::v_or_b16:
             case aco_opcode::v_xor_b16:
-            case aco_opcode::v_mul_lo_u16_e64: return true;
-            case aco_opcode::v_pack_b32_f16:
-            case aco_opcode::v_cvt_pknorm_i16_f16:
-            case aco_opcode::v_cvt_pknorm_u16_f16: return idx != -1;
-            case aco_opcode::v_mad_u32_u16:
-            case aco_opcode::v_mad_i32_i16: return idx >= 0 && idx < 2;
-            case aco_opcode::v_dot2_f16_f16:
-            case aco_opcode::v_dot2_bf16_bf16: return idx == -1 || idx == 2;
-            case aco_opcode::v_cndmask_b16: return idx != 2;
-            case aco_opcode::v_interp_p10_f16_f32_inreg:
-            case aco_opcode::v_interp_p10_rtz_f16_f32_inreg: return idx == 0 || idx == 2;
-            case aco_opcode::v_interp_p2_f16_f32_inreg:
-            case aco_opcode::v_interp_p2_rtz_f16_f32_inreg: return idx == -1 || idx == 0;
-            case aco_opcode::v_alignbyte_b32:
-            case aco_opcode::v_alignbit_b32: return idx == 0 || idx == 1;
-            case aco_opcode::v_cvt_pkrtz_f16_f32:
-            case aco_opcode::v_cvt_pknorm_i16_f32:
-            case aco_opcode::v_cvt_pknorm_u16_f32:
-            case aco_opcode::v_cvt_pk_i16_i32:
-            case aco_opcode::v_cvt_pk_u16_u32: return false;
-            case aco_opcode::v_interp_p1_f32:
-            case aco_opcode::v_interp_p2_f32: return false; /* This was the bug */
-            case aco_opcode::v_interp_p2_f16: return (idx == 0 || idx == 2);
-            case aco_opcode::v_mad_legacy_f16:
-            case aco_opcode::v_mad_legacy_i16:
-            case aco_opcode::v_mad_legacy_u16:
-            case aco_opcode::v_fma_legacy_f16:
-            case aco_opcode::v_div_fixup_legacy_f16: return (idx >= 0 && idx < 3);
-            default:
-                  return gfx_level >= GFX11 && (get_gfx11_true16_mask(op) & BITFIELD_BIT(idx == -1 ? 3 : idx));
+            case aco_opcode::v_mul_lo_u16_e64:
+                  return true;
+
+                  case aco_opcode::v_pack_b32_f16:
+                  case aco_opcode::v_cvt_pknorm_i16_f16:
+                  case aco_opcode::v_cvt_pknorm_u16_f16:
+                        return idx != -1;
+
+                  case aco_opcode::v_mad_u32_u16:
+                  case aco_opcode::v_mad_i32_i16:
+                        return idx >= 0 && idx < 2;
+
+                  case aco_opcode::v_dot2_f16_f16:
+                  case aco_opcode::v_dot2_bf16_bf16:
+                        return idx == -1 || idx == 2;
+
+                  case aco_opcode::v_cndmask_b16:
+                        return idx != 2;
+
+                  case aco_opcode::v_interp_p10_f16_f32_inreg:
+                  case aco_opcode::v_interp_p10_rtz_f16_f32_inreg:
+                        return idx == 0 || idx == 2;
+                  case aco_opcode::v_interp_p2_f16_f32_inreg:
+                  case aco_opcode::v_interp_p2_rtz_f16_f32_inreg:
+                        return idx == -1 || idx == 0;
+
+                  case aco_opcode::v_cvt_pkrtz_f16_f32:
+                  case aco_opcode::v_cvt_pknorm_i16_f32:
+                  case aco_opcode::v_cvt_pknorm_u16_f32:
+                  case aco_opcode::v_cvt_pk_i16_i32:
+                  case aco_opcode::v_cvt_pk_u16_u32:
+                        return false;
+
+                  case aco_opcode::v_interp_p1_f32:
+                  case aco_opcode::v_interp_p2_f32:
+                        break;
+
+                        /* Fixed cases based on VEGA ISA */
+                        case aco_opcode::v_alignbit_b32:
+                        case aco_opcode::v_alignbyte_b32:
+                              return idx >= 0 && idx < 2;
+
+                        case aco_opcode::v_interp_p2_f16:
+                              return idx == 0;
+
+                        case aco_opcode::v_mad_legacy_f16:
+                        case aco_opcode::v_mad_legacy_i16:
+                        case aco_opcode::v_mad_legacy_u16:
+                        case aco_opcode::v_fma_legacy_f16:
+                        case aco_opcode::v_div_fixup_legacy_f16:
+                              return idx >= 0 && idx < 3;
+
+                        default:
+                              break;
       }
+
+      if (gfx_level >= GFX11 && (get_gfx11_true16_mask(op) & BITFIELD_BIT(idx == -1 ? 3 : idx))) {
+            return true;
+      }
+
+      Format format = instr_info.format[static_cast<int>(op)];
+      if ((uint16_t)format & (uint16_t)Format::VOP3) {
+            if (idx >= 0 && (unsigned)idx < instr_info.alu_opcode_infos[static_cast<int>(op)].num_operands) {
+                  return can_use_input_modifiers(gfx_level, op, idx);
+            }
+      }
+
+      return false;
 }
 
 bool
@@ -1467,19 +1508,21 @@ get_tied_defs(Instruction* instr)
 }
 
 uint8_t
-get_vmem_type(enum amd_gfx_level gfx_level, Instruction* instr)
+get_vmem_type(amd_gfx_level gfx_level, radeon_family family, Instruction* instr)
 {
-   if (instr->opcode == aco_opcode::image_bvh64_intersect_ray ||
+   if (instr->opcode == aco_opcode::image_bvh_intersect_ray ||
+       instr->opcode == aco_opcode::image_bvh64_intersect_ray ||
+       instr->opcode == aco_opcode::image_bvh_dual_intersect_ray ||
        instr->opcode == aco_opcode::image_bvh8_intersect_ray) {
       return vmem_bvh;
-   } else if (gfx_level >= GFX12 && instr->opcode == aco_opcode::image_msaa_load) {
+   } else if (instr->opcode == aco_opcode::image_msaa_load) {
       return vmem_sampler;
    } else if (instr->isMIMG() && !instr->operands[1].isUndefined() &&
               instr->operands[1].regClass() == s4) {
-      bool point_sample_accel =
-         gfx_level == GFX11_5 && (instr->opcode == aco_opcode::image_sample ||
-                                  instr->opcode == aco_opcode::image_sample_l ||
-                                  instr->opcode == aco_opcode::image_sample_lz);
+      bool point_sample_accel = gfx_level == GFX11_5 && family != CHIP_GFX1153 &&
+                                (instr->opcode == aco_opcode::image_sample ||
+                                 instr->opcode == aco_opcode::image_sample_l ||
+                                 instr->opcode == aco_opcode::image_sample_lz);
       return vmem_sampler | (point_sample_accel ? vmem_nosampler : 0);
    } else if (instr->isVMEM() || instr->isScratch() || instr->isGlobal()) {
       return vmem_nosampler;
