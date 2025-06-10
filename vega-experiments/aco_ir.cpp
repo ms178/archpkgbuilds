@@ -536,72 +536,72 @@ can_use_input_modifiers(amd_gfx_level gfx_level, aco_opcode op, int idx)
 bool
 can_use_opsel(amd_gfx_level gfx_level, aco_opcode op, int idx)
 {
-   /* opsel is only GFX9+ */
-   if (gfx_level < GFX9)
-      return false;
+      /* opsel is only GFX9+ */
+      if (gfx_level < GFX9)
+            return false;
 
-   switch (op) {
-   case aco_opcode::v_div_fixup_f16:
-   case aco_opcode::v_fma_f16:
-   case aco_opcode::v_mad_f16:
-   case aco_opcode::v_mad_u16:
-   case aco_opcode::v_mad_i16:
-   case aco_opcode::v_med3_f16:
-   case aco_opcode::v_med3_i16:
-   case aco_opcode::v_med3_u16:
-   case aco_opcode::v_min3_f16:
-   case aco_opcode::v_min3_i16:
-   case aco_opcode::v_min3_u16:
-   case aco_opcode::v_max3_f16:
-   case aco_opcode::v_max3_i16:
-   case aco_opcode::v_max3_u16:
-   case aco_opcode::v_minmax_f16:
-   case aco_opcode::v_maxmin_f16:
-   case aco_opcode::v_max_u16_e64:
-   case aco_opcode::v_max_i16_e64:
-   case aco_opcode::v_min_u16_e64:
-   case aco_opcode::v_min_i16_e64:
-   case aco_opcode::v_add_i16:
-   case aco_opcode::v_sub_i16:
-   case aco_opcode::v_add_u16_e64:
-   case aco_opcode::v_sub_u16_e64:
-   case aco_opcode::v_lshlrev_b16_e64:
-   case aco_opcode::v_lshrrev_b16_e64:
-   case aco_opcode::v_ashrrev_i16_e64:
-   case aco_opcode::v_and_b16:
-   case aco_opcode::v_or_b16:
-   case aco_opcode::v_xor_b16:
-   case aco_opcode::v_mul_lo_u16_e64: return true;
-   case aco_opcode::v_pack_b32_f16:
-   case aco_opcode::v_cvt_pknorm_i16_f16:
-   case aco_opcode::v_cvt_pknorm_u16_f16: return idx != -1;
-   case aco_opcode::v_mad_u32_u16:
-   case aco_opcode::v_mad_i32_i16: return idx >= 0 && idx < 2;
-   case aco_opcode::v_dot2_f16_f16:
-   case aco_opcode::v_dot2_bf16_bf16: return idx == -1 || idx == 2;
-   case aco_opcode::v_cndmask_b16: return idx != 2;
-   case aco_opcode::v_interp_p10_f16_f32_inreg:
-   case aco_opcode::v_interp_p10_rtz_f16_f32_inreg: return idx == 0 || idx == 2;
-   case aco_opcode::v_interp_p2_f16_f32_inreg:
-   case aco_opcode::v_interp_p2_rtz_f16_f32_inreg: return idx == -1 || idx == 0;
-   case aco_opcode::v_alignbyte_b32:
-   case aco_opcode::v_alignbit_b32: return idx == 0 || idx == 1;
-   case aco_opcode::v_cvt_pkrtz_f16_f32:
-   case aco_opcode::v_cvt_pknorm_i16_f32:
-   case aco_opcode::v_cvt_pknorm_u16_f32:
-   case aco_opcode::v_cvt_pk_i16_i32:
-   case aco_opcode::v_cvt_pk_u16_u32: return false;
-   case aco_opcode::v_interp_p1_f32:
-   case aco_opcode::v_interp_p2_f32: break;
-   case aco_opcode::v_interp_p2_f16: return (idx == 0 || idx == 2);
-   case aco_opcode::v_mad_legacy_f16:
-   case aco_opcode::v_mad_legacy_i16:
-   case aco_opcode::v_mad_legacy_u16:
-   case aco_opcode::v_fma_legacy_f16:
-   case aco_opcode::v_div_fixup_legacy_f16: return (idx >= 0 && idx < 3);
-   default:
-      return gfx_level >= GFX11 && (get_gfx11_true16_mask(op) & BITFIELD_BIT(idx == -1 ? 3 : idx));
-   }
+      switch (op) {
+            case aco_opcode::v_div_fixup_f16:
+            case aco_opcode::v_fma_f16:
+            case aco_opcode::v_mad_f16:
+            case aco_opcode::v_mad_u16:
+            case aco_opcode::v_mad_i16:
+            case aco_opcode::v_med3_f16:
+            case aco_opcode::v_med3_i16:
+            case aco_opcode::v_med3_u16:
+            case aco_opcode::v_min3_f16:
+            case aco_opcode::v_min3_i16:
+            case aco_opcode::v_min3_u16:
+            case aco_opcode::v_max3_f16:
+            case aco_opcode::v_max3_i16:
+            case aco_opcode::v_max3_u16:
+            case aco_opcode::v_minmax_f16:
+            case aco_opcode::v_maxmin_f16:
+            case aco_opcode::v_max_u16_e64:
+            case aco_opcode::v_max_i16_e64:
+            case aco_opcode::v_min_u16_e64:
+            case aco_opcode::v_min_i16_e64:
+            case aco_opcode::v_add_i16:
+            case aco_opcode::v_sub_i16:
+            case aco_opcode::v_add_u16_e64:
+            case aco_opcode::v_sub_u16_e64:
+            case aco_opcode::v_lshlrev_b16_e64:
+            case aco_opcode::v_lshrrev_b16_e64:
+            case aco_opcode::v_ashrrev_i16_e64:
+            case aco_opcode::v_and_b16:
+            case aco_opcode::v_or_b16:
+            case aco_opcode::v_xor_b16:
+            case aco_opcode::v_mul_lo_u16_e64: return true;
+            case aco_opcode::v_pack_b32_f16:
+            case aco_opcode::v_cvt_pknorm_i16_f16:
+            case aco_opcode::v_cvt_pknorm_u16_f16: return idx != -1;
+            case aco_opcode::v_mad_u32_u16:
+            case aco_opcode::v_mad_i32_i16: return idx >= 0 && idx < 2;
+            case aco_opcode::v_dot2_f16_f16:
+            case aco_opcode::v_dot2_bf16_bf16: return idx == -1 || idx == 2;
+            case aco_opcode::v_cndmask_b16: return idx != 2;
+            case aco_opcode::v_interp_p10_f16_f32_inreg:
+            case aco_opcode::v_interp_p10_rtz_f16_f32_inreg: return idx == 0 || idx == 2;
+            case aco_opcode::v_interp_p2_f16_f32_inreg:
+            case aco_opcode::v_interp_p2_rtz_f16_f32_inreg: return idx == -1 || idx == 0;
+            case aco_opcode::v_alignbyte_b32:
+            case aco_opcode::v_alignbit_b32: return idx == 0 || idx == 1;
+            case aco_opcode::v_cvt_pkrtz_f16_f32:
+            case aco_opcode::v_cvt_pknorm_i16_f32:
+            case aco_opcode::v_cvt_pknorm_u16_f32:
+            case aco_opcode::v_cvt_pk_i16_i32:
+            case aco_opcode::v_cvt_pk_u16_u32: return false;
+            case aco_opcode::v_interp_p1_f32:
+            case aco_opcode::v_interp_p2_f32: return false; /* This was the bug */
+            case aco_opcode::v_interp_p2_f16: return (idx == 0 || idx == 2);
+            case aco_opcode::v_mad_legacy_f16:
+            case aco_opcode::v_mad_legacy_i16:
+            case aco_opcode::v_mad_legacy_u16:
+            case aco_opcode::v_fma_legacy_f16:
+            case aco_opcode::v_div_fixup_legacy_f16: return (idx >= 0 && idx < 3);
+            default:
+                  return gfx_level >= GFX11 && (get_gfx11_true16_mask(op) & BITFIELD_BIT(idx == -1 ? 3 : idx));
+      }
 }
 
 bool
