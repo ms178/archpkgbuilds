@@ -29,11 +29,9 @@
 #include "amdgpu_vm.h"
 
 #ifdef CONFIG_X86
-# define fast_ctz64(x)	((unsigned int)__builtin_ctzll((unsigned long long)(x)))
-# define fast_clz64(x)	((unsigned int)__builtin_clzll((unsigned long long)(x)))
+# define fast_ctz64(x) ((unsigned int)__builtin_ctzll((unsigned long long)(x)))
 #else
-# define fast_ctz64(x)	(ffsll((x)) - 1)
-# define fast_clz64(x)	(63u - fls64((x)))
+# define fast_ctz64(x) ((unsigned int)(ffsll((x)) - 1))
 #endif
 
 #define PT_UPDATE_BULK	256u
@@ -660,20 +658,23 @@ static void amdgpu_vm_pte_fragment(struct amdgpu_vm_update_params *params,
 {
 	unsigned int max_frag;
 
-	if (params->adev->asic_type < CHIP_VEGA10)
+	if (params->adev->asic_type < CHIP_VEGA10) {
 		max_frag = params->adev->vm_manager.fragment_size;
-	else
+	} else {
 		max_frag = 31;
+	}
 
+	/* system pages are non-continuous */
 	if (params->pages_addr) {
 		*frag     = 0;
 		*frag_end = end;
 		return;
 	}
 
+	/* This calculation intentionally wraps if no bit is set.        */
 	*frag = min_t(unsigned int,
-				  fast_ctz64(start),
-				  fast_clz64(end - start));
+				  fast_ctz64(start),           /* alignment restriction */
+				  fls64(end - start) - 1);      /* span restriction      */
 
 	if (*frag >= max_frag) {
 		*frag     = max_frag;
@@ -707,6 +708,7 @@ int amdgpu_vm_ptes_update(struct amdgpu_vm_update_params *params,
 	unsigned int frag;
 	int r;
 
+	/* first fragment */
 	amdgpu_vm_pte_fragment(params, frag_start, end, flags,
 						   &frag, &frag_end);
 
@@ -718,10 +720,11 @@ int amdgpu_vm_ptes_update(struct amdgpu_vm_update_params *params,
 		struct amdgpu_bo *pt;
 
 		if (!params->unlocked) {
-			r = amdgpu_vm_pt_alloc(adev, params->vm, &cursor,
-								   params->immediate);
-			if (r)
+			r = amdgpu_vm_pt_alloc(adev, params->vm,
+								   &cursor, params->immediate);
+			if (r) {
 				return r;
+			}
 		}
 
 		shift        = amdgpu_vm_pt_level_shift(adev, cursor.level);
@@ -729,105 +732,103 @@ int amdgpu_vm_ptes_update(struct amdgpu_vm_update_params *params,
 												cursor.level - 1);
 
 		if (params->unlocked) {
-			if (amdgpu_vm_pt_descendant(adev, &cursor))
+			if (amdgpu_vm_pt_descendant(adev, &cursor)) {
 				continue;
-		} else if (adev->asic_type < CHIP_VEGA10 &&
+			}
+		} else if ((adev->asic_type < CHIP_VEGA10) &&
 			(flags & AMDGPU_PTE_VALID)) {
 			if (cursor.level != AMDGPU_VM_PTB) {
-				if (!amdgpu_vm_pt_descendant(adev, &cursor))
+				if (!amdgpu_vm_pt_descendant(adev, &cursor)) {
 					return -ENOENT;
+				}
 				continue;
 			}
 			} else if (frag < shift) {
-				if (amdgpu_vm_pt_descendant(adev, &cursor))
+				if (amdgpu_vm_pt_descendant(adev, &cursor)) {
 					continue;
+				}
 			} else if (frag >= parent_shift) {
-				if (!amdgpu_vm_pt_ancestor(&cursor))
+				if (!amdgpu_vm_pt_ancestor(&cursor)) {
 					return -EINVAL;
+				}
 				continue;
 			}
 
 			pt = cursor.entry->bo;
 			if (!pt) {
-				if (flags & AMDGPU_PTE_VALID)
+				if (flags & AMDGPU_PTE_VALID) {
 					return -ENOENT;
-
-				if (!amdgpu_vm_pt_ancestor(&cursor))
+				}
+				if (!amdgpu_vm_pt_ancestor(&cursor)) {
 					return -EINVAL;
+				}
 
-				pt        = cursor.entry->bo;
-				shift     = parent_shift;
-				frag_end  = max(frag_end,
-								ALIGN(frag_start + 1, 1ULL << shift));
+				pt       = cursor.entry->bo;
+				shift    = parent_shift;
+				frag_end = max(frag_end,
+							   ALIGN(frag_start + 1, 1ULL << shift));
 			}
 
-			incr      = (u64)AMDGPU_GPU_PAGE_SIZE << shift;
-			mask      = amdgpu_vm_pt_entries_mask(adev, cursor.level);
-			pe_start  = ((cursor.pfn >> shift) & mask) * 8;
+			incr     = (u64)AMDGPU_GPU_PAGE_SIZE << shift;
+			mask     = amdgpu_vm_pt_entries_mask(adev, cursor.level);
+			pe_start = ((cursor.pfn >> shift) & mask) * 8;
 
-			if (cursor.level < AMDGPU_VM_PTB && params->unlocked)
+			if ((cursor.level < AMDGPU_VM_PTB) && params->unlocked) {
 				entry_end = 1ULL << shift;
-		else {
-			entry_end  = ((u64)mask + 1) << shift;
-		}
-		entry_end += cursor.pfn & ~(entry_end - 1);
-		entry_end  = min(entry_end, end);
+			} else {
+				entry_end = ((u64)mask + 1) << shift;
+			}
+			entry_end += cursor.pfn & ~(entry_end - 1);
+			entry_end  = min(entry_end, end);
 
-		do {
-			u64 upd_end   = min(entry_end, frag_end);
-			unsigned int nptes =
-			(upd_end - frag_start) >> shift;
-			u64 upd_flags = flags | AMDGPU_PTE_FRAG(frag);
+			do {
+				struct amdgpu_vm *vm = params->vm;
+				u64 upd_end      = min(entry_end, frag_end);
+				unsigned int nptes =
+				(upd_end - frag_start) >> shift;
+				u64 upd_flags   = flags | AMDGPU_PTE_FRAG(frag);
 
-			nptes = max(nptes, 1u);
-
-			while (nptes) {
-				unsigned int chunk = min(nptes, PT_UPDATE_BULK);
+				nptes = max(nptes, 1u);
 
 				trace_amdgpu_vm_update_ptes(params, frag_start,
-											frag_start +
-											(chunk << shift),
-											min(chunk, 32u),
+											upd_end,
+								min(nptes, 32u),
 											dst, incr, upd_flags,
-								params->vm->task_info ?
-								params->vm->task_info->tgid : 0,
-								params->vm->immediate.fence_context);
+								vm->task_info ?
+								vm->task_info->tgid : 0,
+								vm->immediate.fence_context);
 
 				amdgpu_vm_pte_update_flags(params,
 										   to_amdgpu_bo_vm(pt),
 										   cursor.level,
 							   pe_start, dst,
-							   chunk, incr,
-							   upd_flags);
+							   nptes, incr, upd_flags);
 
-				pe_start  += chunk * 8;
-				dst       += chunk * incr;
-				frag_start += chunk * incr;
-				nptes     -= chunk;
-			}
+				pe_start  += nptes * 8;
+				dst       += nptes * incr;
+				frag_start = upd_end;
 
-			if (frag_start >= frag_end) {
-				amdgpu_vm_pte_fragment(params,
-									   frag_start, end,
-						   flags,
-						   &frag, &frag_end);
-				if (frag < shift)
-					break;
-			}
-		} while (frag_start < entry_end);
-
-		if (amdgpu_vm_pt_descendant(adev, &cursor)) {
-			while (cursor.pfn < frag_start) {
-				if (cursor.entry->bo) {
-					params->needs_flush = true;
-					amdgpu_vm_pt_add_list(params,
-										  &cursor);
+				if (frag_start >= frag_end) {
+					amdgpu_vm_pte_fragment(params, frag_start, end,
+										   flags,
+							&frag, &frag_end);
+					if (frag < shift) {
+						break;
+					}
 				}
+			} while (frag_start < entry_end);
+
+			if (amdgpu_vm_pt_descendant(adev, &cursor)) {
+				while (cursor.pfn < frag_start) {
+					if (cursor.entry->bo) {
+						params->needs_flush = true;
+						amdgpu_vm_pt_add_list(params, &cursor);
+					}
+					amdgpu_vm_pt_next(adev, &cursor);
+				}
+			} else if (frag >= shift) {
 				amdgpu_vm_pt_next(adev, &cursor);
 			}
-		} else if (frag >= shift) {
-			amdgpu_vm_pt_next(adev, &cursor);
-		}
 	}
 
 	return 0;
