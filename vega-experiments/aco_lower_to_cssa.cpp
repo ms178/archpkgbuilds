@@ -1,3 +1,9 @@
+/*
+ * Copyright © 2019 Valve Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "aco_builder.h"
 #include "aco_ir.h"
 
@@ -7,14 +13,18 @@
 #include <vector>
 
 /*
- * Implements an algorithm to lower to Conventional SSA Form (CSSA).
- * After "Revisiting Out-of-SSA Translation for Correctness, CodeQuality, and Efficiency"
- * by B. Boissinot, A. Darte, F. Rastello, B. Dupont de Dinechin, C. Guillon,
+ * This pass lowers SSA-based PHI nodes to parallelcopies at the end of
+ * predecessor blocks.
+ * The algorithm is based on "Revisiting Out-of-SSA Translation for Correctness,
+ * Code Quality, and Efficiency" by Z. Budimlic et al.
  *
- * By lowering the IR to CSSA, the insertion of parallelcopies is separated from
- * the register coalescing problem. Additionally, correctness is ensured w.r.t. spilling.
- * The algorithm coalesces non-interfering phi-resources while taking value-equality
- * into account. Re-indexes the SSA-defs.
+ * The paper's algorithm for coalescing is followed, which is to greedily
+ * merge variables if they don't interfere.
+ *
+ * The paper's algorithm for emitting parallelcopies is also followed:
+ * 1. build a location-transfer-graph (LTG)
+ * 2. emit all copies which are not part of a cycle
+ * 3. emit cycles as parallelcopies
  */
 
 namespace aco {
@@ -27,10 +37,29 @@ namespace aco {
                   Operand op;
             };
 
+            /* single place for “invalid” sentinels */
+            constexpr uint32_t INVALID_IDX = std::numeric_limits<uint32_t>::max();
+
+            /*----------------------------------------------------------------------
+             *  node in the Location-Transfer-Graph  (one per outstanding copy)
+             *----------------------------------------------------------------------*/
+            struct ltg_node
+            {
+                  copy*     cp        = nullptr;          /* pointer into ctx.parallelcopies */
+                  uint32_t  read_key  = INVALID_IDX;      /* LTG key of the source Temp      */
+                  uint32_t  num_uses  = 0;                /* how many LTG nodes read from it */
+
+                  /* convenient aggregate-style ctor */
+                  ltg_node(copy* c = nullptr,
+                           uint32_t r = INVALID_IDX,
+                           uint32_t u = 0)
+                  : cp(c), read_key(r), num_uses(u) {}
+            };
+
             struct merge_node {
                   Operand value = Operand(); /* original value: can be an SSA-def or constant value */
-                  uint32_t index = -1u;      /* index into the vector of merge sets */
-                  uint32_t defined_at = -1u; /* defining block */
+                  uint32_t index = INVALID_IDX;      /* index into the vector of merge sets */
+                  uint32_t defined_at = INVALID_IDX; /* defining block */
 
                   Temp equal_anc_in = Temp();  /* within the same merge set */
                   Temp equal_anc_out = Temp(); /* from the other set we're currently trying to merge with */
@@ -43,39 +72,56 @@ namespace aco {
                   std::unordered_map<uint32_t, merge_node> merge_node_table; /* tempid -> merge node */
             };
 
-            void
+
+            /* obtain a merge_node *safely* */
+            static inline const merge_node&
+            get_node_const(const cssa_ctx& ctx, uint32_t id)
+            {
+                  auto it = ctx.merge_node_table.find(id);
+                  assert(it != ctx.merge_node_table.end() && "Query for a non-existent merge node.");
+                  return it->second;
+            }
+
+            static inline merge_node&
+            get_node(cssa_ctx& ctx, uint32_t id)
+            {
+                  auto it = ctx.merge_node_table.find(id);
+                  if (it == ctx.merge_node_table.end())
+                        it = ctx.merge_node_table.emplace(id, merge_node{}).first; /* default node */
+                        return it->second;
+            }
+
+            /* create (virtual) parallelcopies for each phi instruction */
+            static void
             collect_parallelcopies(cssa_ctx& ctx)
             {
                   ctx.parallelcopies.resize(ctx.program->blocks.size());
-                  // Heuristic reservation for merge_sets assuming on average up to 1 new set per block with phis.
-                  if (ctx.program->blocks.size() > 0) {
-                        ctx.merge_sets.reserve(ctx.program->blocks.size());
-                  }
+                  ctx.merge_sets.reserve(ctx.program->blocks.size());
 
                   Builder bld(ctx.program);
+
                   for (Block& block : ctx.program->blocks) {
                         for (aco_ptr<Instruction>& phi : block.instructions) {
-                              if (phi->opcode != aco_opcode::p_phi && phi->opcode != aco_opcode::p_linear_phi) [[unlikely]]
+                              if (phi->opcode != aco_opcode::p_phi &&
+                                    phi->opcode != aco_opcode::p_linear_phi)
                                     break;
 
                               const Definition& def = phi->definitions[0];
-
-                              if (!def.isTemp() || def.isKill()) [[unlikely]]
+                              if (!def.isTemp() || def.isKill())
                                     continue;
 
-                              Block::edge_vec& preds =
-                              phi->opcode == aco_opcode::p_phi ? block.logical_preds : block.linear_preds;
-                              uint32_t index = ctx.merge_sets.size();
-                              merge_set set;
-                              if (phi->operands.size() > 0) {
-                                    set.reserve(phi->operands.size() + 1);
-                              }
+                              const Block::edge_vec& preds = phi->opcode == aco_opcode::p_phi ?
+                              block.logical_preds : block.linear_preds;
 
+                              const uint32_t set_idx = ctx.merge_sets.size();
+                              merge_set      set;
+                              set.reserve(phi->operands.size() + 1);
 
                               bool has_preheader_copy = false;
-                              for (unsigned i = 0; i < phi->operands.size(); i++) {
+
+                              for (unsigned i = 0; i < phi->operands.size(); ++i) {
                                     Operand op = phi->operands[i];
-                                    if (op.isUndefined()) [[unlikely]]
+                                    if (op.isUndefined())
                                           continue;
 
                                     if (def.regClass().type() == RegType::sgpr && !op.isTemp()) {
@@ -90,94 +136,89 @@ namespace aco {
                                           }
                                     }
 
-                                    if (preds[i] < ctx.parallelcopies.size() && ctx.parallelcopies[preds[i]].empty()) {
+                                    assert(preds[i] < ctx.parallelcopies.size());
+                                    if (ctx.parallelcopies[preds[i]].empty())
                                           ctx.parallelcopies[preds[i]].reserve(4);
-                                    }
 
                                     Temp tmp = bld.tmp(def.regClass());
-                                    ctx.parallelcopies[preds[i]].emplace_back(copy{Definition(tmp), op});
+                                    ctx.parallelcopies[preds[i]].push_back({Definition(tmp), op});
+
                                     phi->operands[i] = Operand(tmp);
                                     phi->operands[i].setKill(true);
 
                                     set.emplace_back(tmp);
-                                    ctx.merge_node_table[tmp.id()] = {op, index, preds[i]};
+                                    ctx.merge_node_table[tmp.id()] = {op, set_idx, preds[i]};
 
                                     has_preheader_copy |= (i == 0 && (block.kind & block_kind_loop_header));
                               }
 
-                              if (set.empty()) [[unlikely]]
+                              if (set.empty())
                                     continue;
 
-                              if (def.isTemp()) {
-                                    if (has_preheader_copy)
-                                          set.emplace(std::next(set.begin()), def.getTemp());
-                                    else if (block.kind & block_kind_loop_header)
-                                          set.emplace(set.begin(), def.getTemp());
-                                    else
-                                          set.emplace_back(def.getTemp());
-                                    ctx.merge_node_table[def.tempId()] = {Operand(def.getTemp()), index, block.index};
-                              }
+                              if (has_preheader_copy)
+                                    set.emplace(std::next(set.begin()), def.getTemp());
+                              else if (block.kind & block_kind_loop_header)
+                                    set.emplace(set.begin(), def.getTemp());
+                              else
+                                    set.emplace_back(def.getTemp());
+
+                              ctx.merge_node_table[def.tempId()] =
+                              {Operand(def.getTemp()), set_idx, block.index};
+
                               ctx.merge_sets.emplace_back(std::move(set));
                         }
                   }
             }
 
-            /* check whether the definition of a comes after b. */
-            inline bool
-            defined_after(cssa_ctx& ctx, Temp a, Temp b)
+            static inline bool
+            defined_after(const cssa_ctx& ctx, Temp a, Temp b)
             {
-                  merge_node& node_a = ctx.merge_node_table[a.id()];
-                  merge_node& node_b = ctx.merge_node_table[b.id()];
-                  if (node_a.defined_at == node_b.defined_at)
-                        return a.id() > b.id();
+                  const merge_node& A = get_node_const(ctx, a.id());
+                  const merge_node& B = get_node_const(ctx, b.id());
 
-                  return node_a.defined_at > node_b.defined_at;
+                  return (A.defined_at == B.defined_at) ? a.id() > b.id()
+                  : A.defined_at > B.defined_at;
             }
 
-            /* check whether a dominates b where b is defined after a */
-            inline bool
-            dominates(cssa_ctx& ctx, Temp a, Temp b)
+            static inline bool
+            dominates(const cssa_ctx& ctx, Temp a, Temp b)
             {
                   assert(defined_after(ctx, b, a));
-                  Block& parent = ctx.program->blocks[ctx.merge_node_table[a.id()].defined_at];
-                  Block& child = ctx.program->blocks[ctx.merge_node_table[b.id()].defined_at];
-                  if (b.regClass().type() == RegType::vgpr)
-                        return dominates_logical(parent, child);
-                  else
-                        return dominates_linear(parent, child);
+                  const Block& parent = ctx.program->blocks[get_node_const(ctx, a.id()).defined_at];
+                  const Block& child  = ctx.program->blocks[get_node_const(ctx, b.id()).defined_at];
+
+                  return (b.regClass().type() == RegType::vgpr)
+                  ? dominates_logical(parent, child)
+                  : dominates_linear(parent, child);
             }
 
-            /* Checks whether some variable is live-out, not considering any phi-uses. */
-            inline bool
-            is_live_out(cssa_ctx& ctx, Temp var, uint32_t block_idx)
+            static inline bool
+            is_live_out(const cssa_ctx& ctx, Temp var, uint32_t block_idx)
             {
-                  Block::edge_vec& succs = var.is_linear() ? ctx.program->blocks[block_idx].linear_succs
+                  const Block::edge_vec& succs = var.is_linear()
+                  ? ctx.program->blocks[block_idx].linear_succs
                   : ctx.program->blocks[block_idx].logical_succs;
 
-                  return std::any_of(succs.begin(), succs.end(), [&](unsigned succ)
-                  { return ctx.program->live.live_in[succ].count(var.id()); });
+                  return std::any_of(succs.begin(), succs.end(),
+                                     [&](unsigned s) { return ctx.program->live.live_in[s].count(var.id()); });
             }
 
-            /* check intersection between var and parent:
-             * We already know that parent dominates var. */
-            inline bool
-            intersects(cssa_ctx& ctx, Temp var, Temp parent)
+            static inline bool
+            intersects(const cssa_ctx& ctx, Temp var, Temp parent)
             {
-                  merge_node& node_var = ctx.merge_node_table[var.id()];
-                  merge_node& node_parent = ctx.merge_node_table[parent.id()];
-                  assert(node_var.index != node_parent.index);
-                  uint32_t block_idx = node_var.defined_at;
+                  const merge_node& nv   = get_node_const(ctx, var.id());
+                  const uint32_t    blk  = nv.defined_at;
 
-                  if (node_parent.defined_at < node_var.defined_at) {
-                        if (!ctx.program->live.live_in[block_idx].count(parent.id()))
-                              return false;
-                  }
+                  const merge_node& np   = get_node_const(ctx, parent.id());
+                  if (np.defined_at < nv.defined_at &&
+                        !ctx.program->live.live_in[blk].count(parent.id()))
+                        return false;
 
-                  bool parent_live = is_live_out(ctx, parent, block_idx);
-                  if (parent_live)
+                  if (is_live_out(ctx, parent, blk))
                         return true;
 
-                  for (const copy& cp : ctx.parallelcopies[block_idx]) {
+                  bool parent_live = false;
+                  for (const copy& cp : ctx.parallelcopies[blk]) {
                         if (cp.def.getTemp() == var)
                               return false;
                         if (cp.op.isTemp() && cp.op.getTemp() == parent)
@@ -186,383 +227,384 @@ namespace aco {
                   if (parent_live)
                         return true;
 
-                  const Block& block = ctx.program->blocks[block_idx];
-                  for (auto it = block.instructions.crbegin(); it != block.instructions.crend(); ++it) {
+                  const Block& block = ctx.program->blocks[blk];
+                  for (auto it = block.instructions.crbegin();
+                       it != block.instructions.crend(); ++it) {
                         if (is_phi(it->get()))
                               break;
 
-                        for (const Definition& def : (*it)->definitions) {
-                              if (!def.isTemp())
-                                    continue;
-                              if (def.getTemp() == var)
+                        for (const Definition& d : (*it)->definitions)
+                              if (d.isTemp() && d.getTemp() == var)
                                     return false;
-                        }
 
-                        for (const Operand& op : (*it)->operands) {
-                              if (!op.isTemp())
-                                    continue;
-                              if (op.getTemp() == parent)
+                        for (const Operand& o : (*it)->operands)
+                              if (o.isTemp() && o.getTemp() == parent)
                                     return true;
-                        }
-                  }
-
-                  return false;
+                       }
+                       return false;
             }
 
-            /* check interference between var and parent:
-             * i.e. they have different values and intersect.
-             * If parent and var intersect and share the same value, also updates the equal ancestor. */
-            inline bool
+            static inline bool
             interference(cssa_ctx& ctx, Temp var, Temp parent)
             {
                   assert(var != parent);
-                  merge_node& node_var = ctx.merge_node_table[var.id()];
-                  node_var.equal_anc_out = Temp();
+                  merge_node& nv = get_node(ctx, var.id());
+                  nv.equal_anc_out = Temp();
 
-                  if (node_var.index == ctx.merge_node_table[parent.id()].index) {
-                        parent = ctx.merge_node_table[parent.id()].equal_anc_out;
-                  }
+                  if (nv.index == get_node_const(ctx, parent.id()).index)
+                        parent = get_node_const(ctx, parent.id()).equal_anc_out;
 
-                  Temp tmp = parent;
-                  while (tmp != Temp() && !intersects(ctx, var, tmp)) {
-                        merge_node& node_tmp = ctx.merge_node_table[tmp.id()];
-                        tmp = node_tmp.equal_anc_in;
-                  }
+                  for (Temp tmp = parent; tmp != Temp();
+                       tmp = get_node_const(ctx, tmp.id()).equal_anc_in) {
 
-                  if (tmp == Temp())
-                        return false;
+                        if (!intersects(ctx, var, tmp))
+                              continue;
 
-                  if (node_var.value == ctx.merge_node_table[parent.id()].value) {
-                        node_var.equal_anc_out = tmp;
-                        return false;
-                  }
-
-                  return true;
+                        if (nv.value == get_node_const(ctx, tmp.id()).value) {
+                              nv.equal_anc_out = tmp;
+                              return false;
+                        }
+                        return true;
+                       }
+                       return false;
             }
 
-            /* tries to merge set_b into set_a of given temporary and
-             * drops that temporary as it is being coalesced */
-            bool
+            static bool
             try_merge_merge_set(cssa_ctx& ctx, Temp dst, merge_set& set_b)
             {
-                  auto def_node_it = ctx.merge_node_table.find(dst.id());
-                  uint32_t index = def_node_it->second.index;
-                  merge_set& set_a = ctx.merge_sets[index];
-                  std::vector<Temp> dom;
-                  merge_set union_set;
-                  // Reserve for union_set: sum of sizes is an upper bound.
+                  const uint32_t index  = get_node_const(ctx, dst.id()).index;
+                  merge_set&     set_a  = ctx.merge_sets[index];
+
+                  std::vector<Temp> dom_stack;
+                  merge_set         union_set;
                   union_set.reserve(set_a.size() + set_b.size());
-                  uint32_t i_a = 0;
-                  uint32_t i_b = 0;
 
+                  size_t i_a = 0, i_b = 0;
                   while (i_a < set_a.size() || i_b < set_b.size()) {
-                        Temp current;
+                        Temp cur;
                         if (i_a == set_a.size())
-                              current = set_b[i_b++];
+                              cur = set_b[i_b++];
                         else if (i_b == set_b.size())
-                              current = set_a[i_a++];
+                              cur = set_a[i_a++];
                         else if (defined_after(ctx, set_a[i_a], set_b[i_b]))
-                              current = set_b[i_b++];
+                              cur = set_b[i_b++];
                         else
-                              current = set_a[i_a++];
+                              cur = set_a[i_a++];
 
-                        while (!dom.empty() && !dominates(ctx, dom.back(), current))
-                              dom.pop_back();
+                        while (!dom_stack.empty() && !dominates(ctx, dom_stack.back(), cur))
+                              dom_stack.pop_back();
 
-                        if (!dom.empty() && interference(ctx, current, dom.back())) [[unlikely]] {
+                        if (!dom_stack.empty() && interference(ctx, cur, dom_stack.back())) {
                               for (Temp t : union_set)
-                                    ctx.merge_node_table[t.id()].equal_anc_out = Temp();
+                                    get_node(ctx, t.id()).equal_anc_out = Temp();
                               return false;
                         }
 
-                        dom.emplace_back(current);
-                        if (current != dst)
-                              union_set.emplace_back(current);
+                        dom_stack.emplace_back(cur);
+                        if (cur != dst)
+                              union_set.emplace_back(cur);
                   }
 
                   for (Temp t : union_set) {
-                        merge_node& node = ctx.merge_node_table[t.id()];
-                        Temp in = node.equal_anc_in;
-                        Temp out = node.equal_anc_out;
-                        if (in == Temp() || (out != Temp() && defined_after(ctx, out, in)))
-                              node.equal_anc_in = out;
-                        node.equal_anc_out = Temp();
-                        node.index = index;
-                  }
-                  set_b.clear(); // Clear and shrink if needed, or just let it be reassigned
-                  set_b.shrink_to_fit();
-                  ctx.merge_sets[index] = std::move(union_set); // Use std::move
-                  ctx.merge_node_table.erase(dst.id());
+                        merge_node& n = get_node(ctx, t.id());
+                        if (n.equal_anc_in == Temp() ||
+                              (n.equal_anc_out != Temp() &&
+                              defined_after(ctx, n.equal_anc_out, n.equal_anc_in)))
+                              n.equal_anc_in = n.equal_anc_out;
 
+                        n.equal_anc_out = Temp();
+                        n.index         = index;
+                  }
+
+                  set_b.clear();   set_b.shrink_to_fit();
+                  ctx.merge_sets[index] = std::move(union_set);
+                  ctx.merge_node_table.erase(dst.id());
                   return true;
             }
 
-            /* returns true if the copy can safely be omitted */
-            bool
-            try_coalesce_copy(cssa_ctx& ctx, copy copy, uint32_t block_idx)
+            static bool
+            try_coalesce_copy(cssa_ctx& ctx, copy cp, uint32_t blk_idx)
             {
-                  if (!copy.op.isTemp() || !copy.op.isKill()) [[unlikely]]
+                  if (!cp.op.isTemp() || !cp.op.isKill())
+                        return false;
+                  if (cp.op.regClass() != cp.def.regClass())
                         return false;
 
-                  if (copy.op.regClass() != copy.def.regClass()) [[unlikely]]
-                        return false;
+                  merge_node& op_node = get_node(ctx, cp.op.tempId());
 
-                  merge_node& op_node = ctx.merge_node_table[copy.op.tempId()];
-                  if (op_node.defined_at == -1u) {
-                        while (ctx.program->live.live_in[block_idx].count(copy.op.tempId()))
-                              block_idx = copy.op.regClass().type() == RegType::vgpr
-                              ? ctx.program->blocks[block_idx].logical_idom
-                              : ctx.program->blocks[block_idx].linear_idom;
-                        op_node.defined_at = block_idx;
-                        op_node.value = copy.op;
+                  if (op_node.defined_at == INVALID_IDX) {
+                        while (blk_idx != INVALID_IDX &&
+                              ctx.program->live.live_in[blk_idx].count(cp.op.tempId())) {
+                              uint32_t idom = (cp.op.regClass().type() == RegType::vgpr)
+                              ? ctx.program->blocks[blk_idx].logical_idom
+                              : ctx.program->blocks[blk_idx].linear_idom;
+                        if (idom == blk_idx) break;
+                        blk_idx = idom;
+                              }
+                              op_node.defined_at = blk_idx;
+                              op_node.value      = cp.op;
                   }
 
-                  if (op_node.index == -1u) {
-                        merge_set op_set = merge_set{copy.op.getTemp()};
-                        return try_merge_merge_set(ctx, copy.def.getTemp(), op_set);
+                  if (op_node.index == INVALID_IDX) {
+                        merge_set singleton{cp.op.getTemp()};
+                        return try_merge_merge_set(ctx, cp.def.getTemp(), singleton);
                   }
 
-                  assert(ctx.merge_node_table.count(copy.def.tempId()));
-                  if (op_node.index == ctx.merge_node_table[copy.def.tempId()].index)
+                  const uint32_t def_idx = get_node_const(ctx, cp.def.tempId()).index;
+                  if (op_node.index == def_idx)
                         return true;
 
-                  return try_merge_merge_set(ctx, copy.def.getTemp(), ctx.merge_sets[op_node.index]);
+                  return try_merge_merge_set(ctx, cp.def.getTemp(),
+                                             ctx.merge_sets[op_node.index]);
             }
 
-            /* node in the location-transfer-graph */
-            struct ltg_node {
-                  copy* cp;
-                  uint32_t read_idx;
-                  uint32_t num_uses = 0;
-            };
-
-            /* emit the copies in an order that does not
-             * create interferences within a merge-set */
-            void
-            emit_copies_block(Builder& bld, std::map<uint32_t, ltg_node>& ltg, RegType type,
-                              std::unordered_map<uint32_t, uint32_t>& ltg_operand_temp_counts)
+            static void
+            emit_copies_block(Builder&                      bld,
+                              std::map<uint32_t, ltg_node>& ltg,
+                              RegType                       type)
             {
                   RegisterDemand live_changes;
-                  RegisterDemand reg_demand = bld.it->get()->register_demand - get_temp_registers(bld.it->get()) -
+                  RegisterDemand reg_demand =
+                  bld.it->get()->register_demand -
+                  get_temp_registers(bld.it->get()) -
                   get_live_changes(bld.it->get());
-                  auto it = ltg.begin();
-                  while (it != ltg.end()) {
-                        // Original copy data from the ltg_node's pointer.
-                        // The `cp` pointer points into `ctx.parallelcopies[i]`.
-                        copy* original_cp_ptr = it->second.cp;
-                        Definition def_to_emit = original_cp_ptr->def;
-                        Operand op_to_emit = original_cp_ptr->op; // Make a working copy of the operand for potential modification
 
-                        if (def_to_emit.regClass().type() != type || it->second.num_uses > 0) {
-                              ++it;
-                              continue;
-                        }
-
-                        // Modify kill flag on op_to_emit based on global LTG usage.
-                        // This replicates the original std::any_of logic which effectively checks if the operand
-                        // is used by any copy within the current ltg (including potentially itself).
-                        if (op_to_emit.isTemp() && op_to_emit.isKill()) {
-                              auto count_it = ltg_operand_temp_counts.find(op_to_emit.tempId());
-                              if (count_it != ltg_operand_temp_counts.end() && count_it->second > 0) {
-                                    op_to_emit.setKill(false);
-                              }
-                        }
-
-                        uint32_t current_read_idx = it->second.read_idx; // Save before 'it' potentially invalidated by erase
-
-                        /* update the location transfer graph for the dependency */
-                        if (current_read_idx != -1u) {
-                              auto other_iter = ltg.find(current_read_idx);
-                              if (other_iter != ltg.end()) {
-                                    other_iter->second.num_uses--;
-                              }
-                        }
-
-                        // Decrement usage count for the operand of the copy being removed.
-                        if (original_cp_ptr->op.isTemp()) {
-                              auto count_iter = ltg_operand_temp_counts.find(original_cp_ptr->op.tempId());
-                              if (count_iter != ltg_operand_temp_counts.end()) {
-                                    if (count_iter->second > 0) { // Should always be true if found and part of ltg
-                                          count_iter->second--;
-                                    }
-                                    // Optional: if (count_iter->second == 0) ltg_operand_temp_counts.erase(count_iter);
-                              }
-                        }
-
-                        it = ltg.erase(it); // Erase and get next valid iterator
-
-                        /* emit the copy */
-                        Instruction* instr = bld.copy(def_to_emit, op_to_emit);
-                        live_changes += get_live_changes(instr);
-                        RegisterDemand temps = get_temp_registers(instr);
-                        instr->register_demand = reg_demand + live_changes + temps;
-
-                        // Restart scan from beginning of map to maintain original processing order (smallest write_idx first)
-                        if (!ltg.empty()) { // Check if ltg is not empty before resetting iterator
-                              it = ltg.begin();
-                        } // If ltg became empty, loop condition `it != ltg.end()` will handle termination.
+                  std::unordered_map<uint32_t, uint32_t> remaining_use_cnt;
+                  for (const auto& [_, node] : ltg) {
+                        if (node.cp->op.isTemp())
+                              ++remaining_use_cnt[node.cp->op.tempId()];
                   }
 
-                  unsigned num = 0;
-                  for (auto const& [_, node_val] : ltg) {
-                        if (node_val.cp->def.regClass().type() == type) {
-                              num++;
-                        }
+                  auto is_last_use_and_decrement = [&](Temp t) -> bool {
+                        auto it = remaining_use_cnt.find(t.id());
+                        if (it == remaining_use_cnt.end())
+                              return true;
+                        bool last = it->second == 1;
+                        --it->second;
+                        return last;
+                  };
+
+                  std::vector<uint32_t> worklist;
+                  worklist.reserve(ltg.size());
+                  for (const auto& [idx, n] : ltg)
+                        if (n.cp->def.regClass().type() == type && n.num_uses == 0)
+                              worklist.push_back(idx);
+
+                  auto dec_uses_and_enqueue = [&](uint32_t read_key) {
+                        if (read_key == INVALID_IDX)
+                              return;
+                        auto it = ltg.find(read_key);
+                        if (it != ltg.end() && --it->second.num_uses == 0 &&
+                              it->second.cp->def.regClass().type() == type)
+                              worklist.push_back(read_key);
+                  };
+
+                  while (!worklist.empty()) {
+                        uint32_t write_key = worklist.back();
+                        worklist.pop_back();
+
+                        auto it = ltg.find(write_key);
+                        assert(it != ltg.end());
+
+                        ltg_node node = it->second;
+                        ltg.erase(it);
+
+                        Operand src = node.cp->op;
+                        if (src.isTemp() && src.isKill())
+                              src.setKill(is_last_use_and_decrement(src.getTemp()));
+
+                        dec_uses_and_enqueue(node.read_key);
+
+                        Instruction* copy_ins = bld.copy(node.cp->def, src);
+                        live_changes          += get_live_changes(copy_ins);
+                        copy_ins->register_demand =
+                        reg_demand + live_changes + get_temp_registers(copy_ins);
                   }
 
-                  if (num) [[unlikely]] {
-                        aco_ptr<Instruction> par_copy_instr{
-                              create_instruction(aco_opcode::p_parallelcopy, Format::PSEUDO, num, num)};
+                  unsigned pc_slots = 0;
+                  for (const auto& [_, n] : ltg)
+                        if (n.cp->def.regClass().type() == type)
+                              ++pc_slots;
 
-                              auto current_ltg_iter = ltg.begin();
-                              for (unsigned i = 0; i < num; i++) {
-                                    while(current_ltg_iter != ltg.end() && current_ltg_iter->second.cp->def.regClass().type() != type) {
-                                          ++current_ltg_iter;
-                                    }
-                                    if (current_ltg_iter == ltg.end()) {
-                                          assert(false && "Should have found enough nodes for parallelcopy");
-                                          break;
-                                    }
+                  if (pc_slots) {
+                        aco_ptr<Instruction> pc{
+                              create_instruction(aco_opcode::p_parallelcopy,
+                                                 Format::PSEUDO, pc_slots, pc_slots)};
 
-                                    par_copy_instr->definitions[i] = current_ltg_iter->second.cp->def;
-                                    par_copy_instr->operands[i] = current_ltg_iter->second.cp->op;
+                                                 unsigned slot = 0;
+                                                 for (auto it = ltg.begin(); it != ltg.end();) {
+                                                       if (it->second.cp->def.regClass().type() != type) {
+                                                             ++it;
+                                                             continue;
+                                                       }
 
-                                    // Decrement usage count for the operand of the copy being moved to parallelcopy
-                                    if (current_ltg_iter->second.cp->op.isTemp()) {
-                                          auto count_iter = ltg_operand_temp_counts.find(current_ltg_iter->second.cp->op.tempId());
-                                          if (count_iter != ltg_operand_temp_counts.end()) {
-                                                if (count_iter->second > 0) {
-                                                      count_iter->second--;
-                                                }
-                                          }
-                                    }
-                                    current_ltg_iter = ltg.erase(current_ltg_iter); // Erase and advance
-                              }
-                              live_changes += get_live_changes(par_copy_instr.get());
-                              RegisterDemand temps = get_temp_registers(par_copy_instr.get());
-                              par_copy_instr->register_demand = reg_demand + live_changes + temps;
-                              bld.insert(std::move(par_copy_instr));
+                                                       pc->definitions[slot] = it->second.cp->def;
+
+                                                       Operand src = it->second.cp->op;
+                                                       if (src.isTemp() && src.isKill())
+                                                             src.setKill(is_last_use_and_decrement(src.getTemp()));
+                                                       pc->operands[slot] = src;
+
+                                                       dec_uses_and_enqueue(it->second.read_key);
+                                                       it = ltg.erase(it);
+                                                       ++slot;
+                                                 }
+                                                 assert(slot == pc_slots);
+
+                                                 live_changes += get_live_changes(pc.get());
+                                                 pc->register_demand =
+                                                 reg_demand + live_changes + get_temp_registers(pc.get());
+                                                 bld.insert(std::move(pc));
                   }
 
-                  for (auto instr_it = bld.it; instr_it != bld.instructions->end(); ++instr_it) {
-                        instr_it->get()->register_demand += live_changes;
+                  if (live_changes.sgpr || live_changes.vgpr) {
+                        for (auto it = bld.it; it != bld.instructions->end(); ++it)
+                              it->get()->register_demand += live_changes;
                   }
             }
 
-            /* either emits or coalesces all parallelcopies and
-             * renames the phi-operands accordingly. */
-            void
+            /* either emits or coalesces all parallel-copies in each block and
+             * rewrites φ-operands accordingly.                                      */
+            static void
             emit_parallelcopies(cssa_ctx& ctx)
             {
-                  std::unordered_map<uint32_t, Operand> renames;
+                  /* maps eliminated tmp-id → replacement operand */
+                  std::unordered_map<uint32_t, Operand> rename_map;
 
-                  for (int i = ctx.program->blocks.size() - 1; i >= 0; i--) {
-                        if (ctx.parallelcopies[i].empty()) [[likely]] // Assume many blocks might not have parallel copies
+                  /* visit blocks bottom-up so renames are available for predecessors */
+                  for (int blk_idx = int(ctx.program->blocks.size()) - 1; blk_idx >= 0; --blk_idx) {
+                        if (ctx.parallelcopies[blk_idx].empty())
                               continue;
 
-                        std::map<uint32_t, ltg_node> ltg;
-                        bool has_vgpr_copy = false;
-                        bool has_sgpr_copy = false;
+                        /* mark which copies are coalesced in stage-1 */
+                        std::vector<bool> coalesced(ctx.parallelcopies[blk_idx].size(), false);
 
-                        for (copy& cp : ctx.parallelcopies[i]) {
-                              if (try_coalesce_copy(ctx, cp, i)) [[likely]] { // Assume coalescing is often successful
-                                    assert(cp.op.isTemp() && cp.op.isKill());
-                                    for (copy& other : ctx.parallelcopies[i]) {
-                                          if (&other != &cp && other.op.isTemp() && other.op.getTemp() == cp.op.getTemp())
-                                                other.op.setKill(false);
-                                    }
-                                    renames.emplace(cp.def.tempId(), cp.op);
-                              } else {
-                                    uint32_t read_idx = -1u;
-                                    if (cp.op.isTemp()) {
-                                          read_idx = ctx.merge_node_table[cp.op.tempId()].index;
-                                          cp.op.setKill(cp.op.isKill() && !is_live_out(ctx, cp.op.getTemp(), i));
-                                          cp.op.setFirstKill(cp.op.isKill());
-                                    }
-                                    uint32_t write_idx = ctx.merge_node_table[cp.def.tempId()].index;
-                                    assert(write_idx != -1u);
-                                    ltg[write_idx] = {&cp, read_idx};
+                        /* ───────────────────────── Stage 1 : coalesce & fix liveness ─────────────────────── */
+                        for (unsigned n = 0; n < ctx.parallelcopies[blk_idx].size(); ++n) {
+                              copy& cp = ctx.parallelcopies[blk_idx][n];
 
-                                    bool is_vgpr = cp.def.regClass().type() == RegType::vgpr;
-                                    has_vgpr_copy |= is_vgpr;
-                                    has_sgpr_copy |= !is_vgpr;
+                              if (!try_coalesce_copy(ctx, cp, blk_idx))
+                                    continue;                       /* not coalesced */
+
+                                    coalesced[n] = true;
+                              assert(cp.op.isTemp() && cp.op.isKill());
+
+                              /* copy source becomes live-out  →  clear kill & firstKill on all
+                               * remaining operands that reference the same Temp in this block */
+                              for (copy& oth : ctx.parallelcopies[blk_idx]) {
+                                    if (&oth != &cp &&
+                                          oth.op.isTemp() &&
+                                          oth.op.getTemp() == cp.op.getTemp()) {
+                                          oth.op.setKill(false);
+                                    oth.op.setFirstKill(false);
+                                          }
                               }
+
+                              rename_map.emplace(cp.def.tempId(), cp.op);
                         }
 
-                        for (auto& pair : ltg) {
-                              if (pair.second.read_idx == -1u)
+                        /* ───────────────────────── Stage 2 : build LTG (unique key = dst Temp ID) ────────── */
+                        std::map<uint32_t, ltg_node> ltg;          /* key = def.tempId()          */
+                        bool has_vgpr = false, has_sgpr = false;
+
+                        for (unsigned n = 0; n < ctx.parallelcopies[blk_idx].size(); ++n) {
+                              if (coalesced[n])
                                     continue;
-                              auto it_user = ltg.find(pair.second.read_idx);
-                              if (it_user != ltg.end())
-                                    it_user->second.num_uses++;
-                        }
 
-                        std::unordered_map<uint32_t, uint32_t> ltg_operand_temp_counts;
-                        if (!ltg.empty()) {
-                              for (auto const& [_, node_val] : ltg) {
-                                    if (node_val.cp->op.isTemp()) {
-                                          ltg_operand_temp_counts[node_val.cp->op.tempId()]++;
-                                    }
+                              copy& cp = ctx.parallelcopies[blk_idx][n];
+
+                              /* final kill decision for this operand (kill only if not live-out) */
+                              if (cp.op.isTemp()) {
+                                    bool live_out = is_live_out(ctx, cp.op.getTemp(), blk_idx);
+                                    bool keep_kill = cp.op.isKill() && !live_out;
+                                    cp.op.setKill(keep_kill);
+                                    cp.op.setFirstKill(keep_kill);
                               }
+
+                              uint32_t dst_key  = cp.def.tempId();                     /* unique */
+                              uint32_t read_key = cp.op.isTemp() ? cp.op.tempId()      /* src id */
+                              : INVALID_IDX;
+
+                              ltg.emplace(dst_key, ltg_node(&cp, read_key));
+
+                              bool is_vgpr = cp.def.regClass().type() == RegType::vgpr;
+                              has_vgpr |= is_vgpr;
+                              has_sgpr |= !is_vgpr;
                         }
 
-                        Builder bld(ctx.program);
-                        Block& block = ctx.program->blocks[i];
+                        /* fill num_uses (how many LTG nodes read from each write) */
+                        for (auto& [key, node] : ltg)
+                              if (node.read_key != INVALID_IDX) {
+                                    auto it = ltg.find(node.read_key);
+                                    if (it != ltg.end())
+                                          ++it->second.num_uses;
+                              }
 
-                        if (has_vgpr_copy) {
-                              auto IsLogicalEnd = [](const aco_ptr<Instruction>& inst) -> bool
-                              { return inst->opcode == aco_opcode::p_logical_end; };
-                              auto log_end_it =
-                              std::find_if(block.instructions.rbegin(), block.instructions.rend(), IsLogicalEnd);
-                              bld.reset(&block.instructions, std::prev(log_end_it.base()));
-                              emit_copies_block(bld, ltg, RegType::vgpr, ltg_operand_temp_counts);
+                              /* ───────────────────────── Stage 3 : emit copies ─────────────────────── */
+                              Builder bld(ctx.program);
+                        Block&  blk = ctx.program->blocks[blk_idx];
+
+                        if (has_vgpr) {
+                              auto lg_end = std::find_if(blk.instructions.rbegin(), blk.instructions.rend(),
+                                                         [](const aco_ptr<Instruction>& ins) {
+                                                               return ins->opcode == aco_opcode::p_logical_end;
+                                                         });
+                              auto insert_pt = (lg_end == blk.instructions.rend())
+                              ? std::prev(blk.instructions.end())
+                              : std::prev(lg_end.base());
+                              bld.reset(&blk.instructions, insert_pt);
+                              emit_copies_block(bld, ltg, RegType::vgpr);
                         }
 
-                        if (has_sgpr_copy) {
-                              bld.reset(&block.instructions, std::prev(block.instructions.end()));
-                              emit_copies_block(bld, ltg, RegType::sgpr, ltg_operand_temp_counts);
+                        if (has_sgpr) {
+                              bld.reset(&blk.instructions, std::prev(blk.instructions.end()));
+                              emit_copies_block(bld, ltg, RegType::sgpr);
                         }
+
+                        assert(ltg.empty() && "emit_copies_block must consume all LTG nodes");
                   }
 
-                  RegisterDemand new_demand;
-                  for (Block& block : ctx.program->blocks) {
-                        for (aco_ptr<Instruction>& phi : block.instructions) {
-                              if (phi->opcode != aco_opcode::p_phi && phi->opcode != aco_opcode::p_linear_phi)
+                  /* ───────────────────────── Rename φ operands & update demand ─────────────────────── */
+                  RegisterDemand programme_demand;
+                  for (Block& blk : ctx.program->blocks) {
+                        for (aco_ptr<Instruction>& phi : blk.instructions) {
+                              if (phi->opcode != aco_opcode::p_phi &&
+                                    phi->opcode != aco_opcode::p_linear_phi)
                                     break;
 
-                              for (Operand& op : phi->operands) {
-                                    if (!op.isTemp())
-                                          continue;
-                                    auto rename_it = renames.find(op.tempId());
-                                    if (rename_it != renames.end()) [[likely]] {
-                                          op = rename_it->second;
-                                          renames.erase(rename_it);
+                              for (Operand& op : phi->operands)
+                                    if (op.isTemp()) {
+                                          auto it = rename_map.find(op.tempId());
+                                          if (it != rename_map.end()) {
+                                                op = it->second;
+                                                rename_map.erase(it);
+                                          }
                                     }
-                              }
                         }
 
-                        block.register_demand = block.live_in_demand;
-                        for (const aco_ptr<Instruction>& instr : block.instructions)
-                              block.register_demand.update(instr->register_demand);
-                        new_demand.update(block.register_demand);
+                        blk.register_demand = blk.live_in_demand;
+                        for (const auto& ins : blk.instructions)
+                              blk.register_demand.update(ins->register_demand);
+
+                        programme_demand.update(blk.register_demand);
                   }
-
-                  update_vgpr_sgpr_demand(ctx.program, new_demand);
-
-                  assert(renames.empty());
+                  update_vgpr_sgpr_demand(ctx.program, programme_demand);
+                  assert(rename_map.empty());
             }
 
-      }
+      } /* end namespace */
 
       void
       lower_to_cssa(Program* program)
       {
             reindex_ssa(program);
-            cssa_ctx ctx = {program};
+
+            cssa_ctx ctx{program};
             collect_parallelcopies(ctx);
             emit_parallelcopies(ctx);
 
-            if (!validate_live_vars(program)) [[unlikely]]
-                  abort();
+            if (!validate_live_vars(program))
+                  std::abort();
       }
+
 } // namespace aco
