@@ -100,33 +100,46 @@ namespace aco {
                   program->dev.physical_vgprs = 256;
                   program->dev.vgpr_alloc_granule = 4;
 
-                  if (gfx_level >= GFX10) {
-                        program->dev.physical_sgprs = 128 * 20; /* enough for max waves */
-                        program->dev.sgpr_alloc_granule = 128;
-                        program->dev.sgpr_limit =
-                        108; /* includes VCC, which can be treated as s[106-107] on GFX10+ */
+                  switch (gfx_level) {
+                        case GFX12:
+                              [[fallthrough]];
+                        case GFX11_5:
+                              [[fallthrough]];
+                        case GFX11:
+                              [[fallthrough]];
+                        case GFX10_3:
+                              [[fallthrough]];
+                        case GFX10:
+                              program->dev.physical_sgprs = 128 * 20;
+                              program->dev.sgpr_alloc_granule = 128;
+                              program->dev.sgpr_limit = 108;
 
-                        if (family == CHIP_NAVI31 || family == CHIP_NAVI32 || family == CHIP_GFX1151 ||
-                              gfx_level >= GFX12) {
-                              program->dev.physical_vgprs = program->wave_size == 32 ? 1536 : 768;
-                        program->dev.vgpr_alloc_granule = program->wave_size == 32 ? 24 : 12;
-                              } else {
-                                    program->dev.physical_vgprs = program->wave_size == 32 ? 1024 : 512;
-                                    if (gfx_level >= GFX10_3)
-                                          program->dev.vgpr_alloc_granule = program->wave_size == 32 ? 16 : 8;
-                                    else
-                                          program->dev.vgpr_alloc_granule = program->wave_size == 32 ? 8 : 4;
-                              }
-                  } else if (program->gfx_level >= GFX8) {
-                        program->dev.physical_sgprs = 800;
-                        program->dev.sgpr_alloc_granule = 16;
-                        program->dev.sgpr_limit = 102;
-                        if (family == CHIP_TONGA || family == CHIP_ICELAND)
-                              program->dev.sgpr_alloc_granule = 96; /* workaround hardware bug */
-                  } else {
-                        program->dev.physical_sgprs = 512;
-                        program->dev.sgpr_alloc_granule = 8;
-                        program->dev.sgpr_limit = 104;
+                              if (family == CHIP_NAVI31 || family == CHIP_NAVI32 || family == CHIP_GFX1151 ||
+                                    gfx_level >= GFX12) {
+                                    program->dev.physical_vgprs = program->wave_size == 32 ? 1536 : 768;
+                              program->dev.vgpr_alloc_granule = program->wave_size == 32 ? 24 : 12;
+                                    } else {
+                                          program->dev.physical_vgprs = program->wave_size == 32 ? 1024 : 512;
+                                          if (gfx_level >= GFX10_3)
+                                                program->dev.vgpr_alloc_granule = program->wave_size == 32 ? 16 : 8;
+                                          else
+                                                program->dev.vgpr_alloc_granule = program->wave_size == 32 ? 8 : 4;
+                                    }
+                                    break;
+                        case GFX9:
+                              [[fallthrough]];
+                        case GFX8:
+                              program->dev.physical_sgprs = 800;
+                              program->dev.sgpr_alloc_granule = 16;
+                              program->dev.sgpr_limit = 102;
+                              if (family == CHIP_TONGA || family == CHIP_ICELAND)
+                                    program->dev.sgpr_alloc_granule = 96;
+                        break;
+                        default:
+                              program->dev.physical_sgprs = 512;
+                              program->dev.sgpr_alloc_granule = 8;
+                              program->dev.sgpr_limit = 104;
+                              break;
                   }
 
                   if (program->stage == raytracing_cs)
@@ -270,10 +283,14 @@ namespace aco {
             bool
             can_use_SDWA(amd_gfx_level gfx_level, const aco_ptr<Instruction>& instr, bool pre_ra)
             {
-                  if (!instr->isVALU())
+                  if (!instr->isVALU()) [[unlikely]]
                         return false;
 
-                  if (gfx_level < GFX8 || gfx_level >= GFX11 || instr->isDPP() || instr->isVOP3P())
+                  /* SDWA is GFX8-GFX10. Vega is GFX9. This check is critical. */
+                  if (gfx_level < GFX8 || gfx_level >= GFX11) [[unlikely]]
+                        return false;
+
+                  if (instr->isDPP() || instr->isVOP3P())
                         return false;
 
                   if (instr->isSDWA())
@@ -281,11 +298,11 @@ namespace aco {
 
                   if (instr->isVOP3()) {
                         VALU_instruction& vop3 = instr->valu();
+                        if (vop3.omod && gfx_level < GFX9) /* omod is fine on Vega */
+                              return false;
+                        if (vop3.clamp && instr->isVOPC() && gfx_level != GFX8) /* clamp on VOPC is fine on Vega */
+                              return false;
                         if (instr->format == Format::VOP3)
-                              return false;
-                        if (vop3.clamp && instr->isVOPC() && gfx_level != GFX8)
-                              return false;
-                        if (vop3.omod && gfx_level < GFX9)
                               return false;
 
                         // TODO: return true if we know we will use vcc
@@ -295,6 +312,7 @@ namespace aco {
                         for (unsigned i = 1; i < instr->operands.size(); i++) {
                               if (instr->operands[i].isLiteral())
                                     return false;
+                              /* SGPR sources are fine on Vega */
                               if (gfx_level < GFX9 && !instr->operands[i].isOfType(RegType::vgpr))
                                     return false;
                         }
@@ -306,6 +324,7 @@ namespace aco {
                   if (!instr->operands.empty()) {
                         if (instr->operands[0].isLiteral())
                               return false;
+                        /* SGPR sources are fine on Vega */
                         if (gfx_level < GFX9 && !instr->operands[0].isOfType(RegType::vgpr))
                               return false;
                         if (instr->operands[0].bytes() > 4)
@@ -948,24 +967,23 @@ namespace aco {
                   aco_opcode vcmpx;
             };
 
-            static ALWAYS_INLINE bool
-            get_cmp_info(aco_opcode op, CmpInfo* info)
+            static constexpr CmpInfo
+            generate_cmp_info(aco_opcode op)
             {
-                  info->swapped = aco_opcode::num_opcodes;
-                  info->inverse = aco_opcode::num_opcodes;
-                  info->vcmpx = aco_opcode::num_opcodes;
+                  CmpInfo info = {aco_opcode::num_opcodes, aco_opcode::num_opcodes, aco_opcode::num_opcodes};
                   switch (op) {
                         // clang-format off
                         #define CMP2(ord, unord, ord_swap, unord_swap, sz)                                                 \
                         case aco_opcode::v_cmp_##ord##_f##sz:                                                           \
+                              info.swapped = aco_opcode::v_cmp_##ord_swap##_f##sz;                                         \
+                              info.inverse = aco_opcode::v_cmp_n##ord##_f##sz;                                             \
+                              info.vcmpx = aco_opcode::v_cmpx_##ord##_f##sz;                                               \
+                              return info;                                                                                \
                         case aco_opcode::v_cmp_n##unord##_f##sz:                                                        \
-                              info->swapped = op == aco_opcode::v_cmp_##ord##_f##sz ? aco_opcode::v_cmp_##ord_swap##_f##sz \
-                              : aco_opcode::v_cmp_n##unord_swap##_f##sz;   \
-                              info->inverse = op == aco_opcode::v_cmp_n##unord##_f##sz ? aco_opcode::v_cmp_##unord##_f##sz \
-                              : aco_opcode::v_cmp_n##ord##_f##sz; \
-                              info->vcmpx = op == aco_opcode::v_cmp_##ord##_f##sz ? aco_opcode::v_cmpx_##ord##_f##sz       \
-                              : aco_opcode::v_cmpx_n##unord##_f##sz;   \
-                              return true;
+                              info.swapped = aco_opcode::v_cmp_n##unord_swap##_f##sz;                                      \
+                              info.inverse = aco_opcode::v_cmp_##unord##_f##sz;                                            \
+                              info.vcmpx = aco_opcode::v_cmpx_n##unord##_f##sz;                                             \
+                              return info;
                               #define CMP(ord, unord, ord_swap, unord_swap)                                                      \
                               CMP2(ord, unord, ord_swap, unord_swap, 16)                                                      \
                               CMP2(ord, unord, ord_swap, unord_swap, 32)                                                      \
@@ -980,25 +998,25 @@ namespace aco {
                               #undef CMP2
                               #define ORD_TEST(sz)                                                                               \
                         case aco_opcode::v_cmp_u_f##sz:                                                                 \
-                              info->swapped = aco_opcode::v_cmp_u_f##sz;                                                   \
-                              info->inverse = aco_opcode::v_cmp_o_f##sz;                                                   \
-                              info->vcmpx = aco_opcode::v_cmpx_u_f##sz;                                                    \
-                              return true;                                                                                 \
+                              info.swapped = aco_opcode::v_cmp_u_f##sz;                                                   \
+                              info.inverse = aco_opcode::v_cmp_o_f##sz;                                                   \
+                              info.vcmpx = aco_opcode::v_cmpx_u_f##sz;                                                    \
+                              return info;                                                                                 \
                         case aco_opcode::v_cmp_o_f##sz:                                                                 \
-                              info->swapped = aco_opcode::v_cmp_o_f##sz;                                                   \
-                              info->inverse = aco_opcode::v_cmp_u_f##sz;                                                   \
-                              info->vcmpx = aco_opcode::v_cmpx_o_f##sz;                                                    \
-                              return true;
+                              info.swapped = aco_opcode::v_cmp_o_f##sz;                                                   \
+                              info.inverse = aco_opcode::v_cmp_u_f##sz;                                                   \
+                              info.vcmpx = aco_opcode::v_cmpx_o_f##sz;                                                    \
+                              return info;
                               ORD_TEST(16)
                               ORD_TEST(32)
                               ORD_TEST(64)
                               #undef ORD_TEST
                               #define CMPI2(op, swap, inv, type, sz)                                                             \
                         case aco_opcode::v_cmp_##op##_##type##sz:                                                       \
-                              info->swapped = aco_opcode::v_cmp_##swap##_##type##sz;                                       \
-                              info->inverse = aco_opcode::v_cmp_##inv##_##type##sz;                                        \
-                              info->vcmpx = aco_opcode::v_cmpx_##op##_##type##sz;                                          \
-                              return true;
+                              info.swapped = aco_opcode::v_cmp_##swap##_##type##sz;                                       \
+                              info.inverse = aco_opcode::v_cmp_##inv##_##type##sz;                                        \
+                              info.vcmpx = aco_opcode::v_cmpx_##op##_##type##sz;                                          \
+                              return info;
                               #define CMPI(op, swap, inv)                                                                        \
                               CMPI2(op, swap, inv, i, 16)                                                                     \
                               CMPI2(op, swap, inv, u, 16)                                                                     \
@@ -1016,36 +1034,59 @@ namespace aco {
                               #undef CMPI2
                               #define CMPCLASS(sz)                                                                               \
                         case aco_opcode::v_cmp_class_f##sz:                                                             \
-                              info->vcmpx = aco_opcode::v_cmpx_class_f##sz;                                                \
-                              return true;
+                              info.vcmpx = aco_opcode::v_cmpx_class_f##sz;                                                \
+                              return info;
                               CMPCLASS(16)
                               CMPCLASS(32)
                               CMPCLASS(64)
                               #undef CMPCLASS
                               // clang-format on
-                        default: return false;
+                        default: return info;
                   }
+            }
+
+            static constexpr auto cmp_info_table = []() {
+                  std::array<CmpInfo, (size_t)aco_opcode::num_opcodes> table{};
+                  for (unsigned i = 0; i < (unsigned)aco_opcode::num_opcodes; ++i) {
+                        table[i] = generate_cmp_info((aco_opcode)i);
+                  }
+                  return table;
+            }();
+
+            static_assert(cmp_info_table[(size_t)aco_opcode::v_cmp_lt_f32].swapped == aco_opcode::v_cmp_gt_f32);
+            static_assert(cmp_info_table[(size_t)aco_opcode::v_cmp_lt_f32].inverse == aco_opcode::v_cmp_nlt_f32);
+            static_assert(cmp_info_table[(size_t)aco_opcode::v_cmp_lt_i32].vcmpx == aco_opcode::v_cmpx_lt_i32);
+            static_assert(cmp_info_table[(size_t)aco_opcode::v_add_f32].swapped == aco_opcode::num_opcodes, "Non-compare opcode check");
+
+            static ALWAYS_INLINE bool
+            get_cmp_info(aco_opcode op, CmpInfo* info)
+            {
+                  *info = cmp_info_table[static_cast<size_t>(op)];
+                  return info->vcmpx != aco_opcode::num_opcodes || info->inverse != aco_opcode::num_opcodes;
             }
 
             aco_opcode
             get_vcmp_inverse(aco_opcode op)
             {
                   CmpInfo info;
-                  return get_cmp_info(op, &info) ? info.inverse : aco_opcode::num_opcodes;
+                  get_cmp_info(op, &info);
+                  return info.inverse;
             }
 
             aco_opcode
             get_vcmp_swapped(aco_opcode op)
             {
                   CmpInfo info;
-                  return get_cmp_info(op, &info) ? info.swapped : aco_opcode::num_opcodes;
+                  get_cmp_info(op, &info);
+                  return info.swapped;
             }
 
             aco_opcode
             get_vcmpx(aco_opcode op)
             {
                   CmpInfo info;
-                  return get_cmp_info(op, &info) ? info.vcmpx : aco_opcode::num_opcodes;
+                  get_cmp_info(op, &info);
+                  return info.vcmpx;
             }
 
             bool
@@ -1055,20 +1096,9 @@ namespace aco {
                   return !get_cmp_info(op, &info);
             }
 
-            aco_opcode
-            get_swapped_opcode(aco_opcode opcode, unsigned idx0, unsigned idx1)
+            static constexpr aco_opcode
+            generate_swapped_opcode_map(aco_opcode opcode)
             {
-                  if (idx0 == idx1)
-                        return opcode;
-
-                  if (idx0 > idx1)
-                        std::swap(idx0, idx1);
-
-                  CmpInfo info;
-                  if (get_cmp_info(opcode, &info) && info.swapped != aco_opcode::num_opcodes)
-                        return info.swapped;
-
-                  /* opcodes not relevant for DPP or SGPRs optimizations are not included. */
                   switch (opcode) {
                         case aco_opcode::v_add_u32:
                         case aco_opcode::v_add_co_u32:
@@ -1129,19 +1159,7 @@ namespace aco {
                         case aco_opcode::v_max_i16_e64:
                         case aco_opcode::v_min_i16_e64:
                         case aco_opcode::v_max_u16_e64:
-                        case aco_opcode::v_min_u16_e64: return opcode;
-                        case aco_opcode::v_sub_f16: return aco_opcode::v_subrev_f16;
-                        case aco_opcode::v_sub_f32: return aco_opcode::v_subrev_f32;
-                        case aco_opcode::v_sub_co_u32: return aco_opcode::v_subrev_co_u32;
-                        case aco_opcode::v_sub_u16: return aco_opcode::v_subrev_u16;
-                        case aco_opcode::v_sub_u32: return aco_opcode::v_subrev_u32;
-                        case aco_opcode::v_sub_co_u32_e64: return aco_opcode::v_subrev_co_u32_e64;
-                        case aco_opcode::v_subrev_f16: return aco_opcode::v_sub_f16;
-                        case aco_opcode::v_subrev_f32: return aco_opcode::v_sub_f32;
-                        case aco_opcode::v_subrev_co_u32: return aco_opcode::v_sub_co_u32;
-                        case aco_opcode::v_subrev_u16: return aco_opcode::v_sub_u16;
-                        case aco_opcode::v_subrev_u32: return aco_opcode::v_sub_u32;
-                        case aco_opcode::v_subrev_co_u32_e64: return aco_opcode::v_sub_co_u32_e64;
+                        case aco_opcode::v_min_u16_e64:
                         case aco_opcode::v_addc_co_u32:
                         case aco_opcode::v_mad_i32_i24:
                         case aco_opcode::v_mad_u32_u24:
@@ -1162,8 +1180,6 @@ namespace aco {
                         case aco_opcode::v_maxmin_f16:
                         case aco_opcode::v_minmax_f16:
                         case aco_opcode::v_maxmin_u32:
-                        case aco_opcode::v_minmax_u32:
-                        case aco_opcode::v_maxmin_i32:
                         case aco_opcode::v_minmax_i32:
                         case aco_opcode::v_fma_f32:
                         case aco_opcode::v_fma_legacy_f32:
@@ -1183,24 +1199,105 @@ namespace aco {
                         case aco_opcode::v_fma_mix_f32:
                         case aco_opcode::v_fma_mixlo_f16:
                         case aco_opcode::v_fma_mixhi_f16:
-                        case aco_opcode::v_pk_fmac_f16: {
-                              if (idx1 == 2)
-                                    return aco_opcode::num_opcodes;
+                        case aco_opcode::v_pk_fmac_f16:
                               return opcode;
-                        }
-                        case aco_opcode::v_subb_co_u32: {
-                              if (idx1 == 2)
-                                    return aco_opcode::num_opcodes;
-                              return aco_opcode::v_subbrev_co_u32;
-                        }
-                        case aco_opcode::v_subbrev_co_u32: {
-                              if (idx1 == 2)
-                                    return aco_opcode::num_opcodes;
-                              return aco_opcode::v_subb_co_u32;
-                        }
-                        case aco_opcode::v_med3_f32: /* order matters for clamp+GFX8+denorm ftz. */
+                        case aco_opcode::v_sub_f16: return aco_opcode::v_subrev_f16;
+                        case aco_opcode::v_sub_f32: return aco_opcode::v_subrev_f32;
+                        case aco_opcode::v_sub_co_u32: return aco_opcode::v_subrev_co_u32;
+                        case aco_opcode::v_sub_u16: return aco_opcode::v_subrev_u16;
+                        case aco_opcode::v_sub_u32: return aco_opcode::v_subrev_u32;
+                        case aco_opcode::v_sub_co_u32_e64: return aco_opcode::v_subrev_co_u32_e64;
+                        case aco_opcode::v_subrev_f16: return aco_opcode::v_sub_f16;
+                        case aco_opcode::v_subrev_f32: return aco_opcode::v_sub_f32;
+                        case aco_opcode::v_subrev_co_u32: return aco_opcode::v_sub_co_u32;
+                        case aco_opcode::v_subrev_u16: return aco_opcode::v_sub_u16;
+                        case aco_opcode::v_subrev_u32: return aco_opcode::v_sub_u32;
+                        case aco_opcode::v_subrev_co_u32_e64: return aco_opcode::v_sub_co_u32_e64;
+                        case aco_opcode::v_subb_co_u32: return aco_opcode::v_subbrev_co_u32;
+                        case aco_opcode::v_subbrev_co_u32: return aco_opcode::v_subb_co_u32;
                         default: return aco_opcode::num_opcodes;
                   }
+            }
+
+            static constexpr auto swapped_opcode_table = []() {
+                  std::array<aco_opcode, (size_t)aco_opcode::num_opcodes> table{};
+                  for (unsigned i = 0; i < (unsigned)aco_opcode::num_opcodes; ++i) {
+                        table[i] = generate_swapped_opcode_map((aco_opcode)i);
+                  }
+                  return table;
+            }();
+
+            static_assert(swapped_opcode_table[(size_t)aco_opcode::v_sub_f32] == aco_opcode::v_subrev_f32);
+            static_assert(swapped_opcode_table[(size_t)aco_opcode::v_add_f32] == aco_opcode::v_add_f32);
+            static_assert(swapped_opcode_table[(size_t)aco_opcode::v_med3_f32] == aco_opcode::num_opcodes);
+
+            aco_opcode
+            get_swapped_opcode(aco_opcode opcode, unsigned idx0, unsigned idx1)
+            {
+                  if (idx0 == idx1)
+                        return opcode;
+
+                  if (idx0 > idx1)
+                        std::swap(idx0, idx1);
+
+                  CmpInfo info;
+                  if (get_cmp_info(opcode, &info) && info.swapped != aco_opcode::num_opcodes)
+                        return info.swapped;
+
+                  aco_opcode swapped = swapped_opcode_table[static_cast<size_t>(opcode)];
+                  if (swapped == aco_opcode::num_opcodes)
+                        return swapped;
+
+                  if (idx1 == 2) {
+                        switch (opcode) {
+                              case aco_opcode::v_addc_co_u32:
+                              case aco_opcode::v_subb_co_u32:
+                              case aco_opcode::v_subbrev_co_u32:
+                              case aco_opcode::v_mad_i32_i24:
+                              case aco_opcode::v_mad_u32_u24:
+                              case aco_opcode::v_lerp_u8:
+                              case aco_opcode::v_sad_u8:
+                              case aco_opcode::v_sad_hi_u8:
+                              case aco_opcode::v_sad_u16:
+                              case aco_opcode::v_sad_u32:
+                              case aco_opcode::v_xad_u32:
+                              case aco_opcode::v_add_lshl_u32:
+                              case aco_opcode::v_and_or_b32:
+                              case aco_opcode::v_mad_u16:
+                              case aco_opcode::v_mad_i16:
+                              case aco_opcode::v_mad_u32_u16:
+                              case aco_opcode::v_mad_i32_i16:
+                              case aco_opcode::v_maxmin_f32:
+                              case aco_opcode::v_minmax_f32:
+                              case aco_opcode::v_maxmin_f16:
+                              case aco_opcode::v_minmax_f16:
+                              case aco_opcode::v_maxmin_u32:
+                              case aco_opcode::v_minmax_i32:
+                              case aco_opcode::v_fma_f32:
+                              case aco_opcode::v_fma_legacy_f32:
+                              case aco_opcode::v_fmac_f32:
+                              case aco_opcode::v_fmac_legacy_f32:
+                              case aco_opcode::v_mac_f32:
+                              case aco_opcode::v_mac_legacy_f32:
+                              case aco_opcode::v_fma_f16:
+                              case aco_opcode::v_fmac_f16:
+                              case aco_opcode::v_mac_f16:
+                              case aco_opcode::v_dot4c_i32_i8:
+                              case aco_opcode::v_dot2c_f32_f16:
+                              case aco_opcode::v_dot2_f32_f16:
+                              case aco_opcode::v_dot2_f32_bf16:
+                              case aco_opcode::v_dot2_f16_f16:
+                              case aco_opcode::v_dot2_bf16_bf16:
+                              case aco_opcode::v_fma_mix_f32:
+                              case aco_opcode::v_fma_mixlo_f16:
+                              case aco_opcode::v_fma_mixhi_f16:
+                              case aco_opcode::v_pk_fmac_f16:
+                                    return aco_opcode::num_opcodes;
+                              default:
+                                    break;
+                        }
+                  }
+                  return swapped;
             }
 
             bool
@@ -1645,42 +1742,48 @@ namespace aco {
                   instr_info.classes[(int)opcode] == instr_class::valu_pseudo_scalar_trans;
             }
 
+            static constexpr auto instr_data_size_table = []() {
+                  std::array<size_t, 256> table{};
+                  table[static_cast<size_t>(Format::SOP1)] = sizeof(SALU_instruction);
+                  table[static_cast<size_t>(Format::SOP2)] = sizeof(SALU_instruction);
+                  table[static_cast<size_t>(Format::SOPC)] = sizeof(SALU_instruction);
+                  table[static_cast<size_t>(Format::SOPK)] = sizeof(SALU_instruction);
+                  table[static_cast<size_t>(Format::SOPP)] = sizeof(SALU_instruction);
+                  table[static_cast<size_t>(Format::SMEM)] = sizeof(SMEM_instruction);
+                  table[static_cast<size_t>(Format::PSEUDO)] = sizeof(Pseudo_instruction);
+                  table[static_cast<size_t>(Format::PSEUDO_BARRIER)] = sizeof(Pseudo_barrier_instruction);
+                  table[static_cast<size_t>(Format::PSEUDO_REDUCTION)] = sizeof(Pseudo_reduction_instruction);
+                  table[static_cast<size_t>(Format::PSEUDO_BRANCH)] = sizeof(Pseudo_branch_instruction);
+                  table[static_cast<size_t>(Format::DS)] = sizeof(DS_instruction);
+                  table[static_cast<size_t>(Format::FLAT)] = sizeof(FLAT_instruction);
+                  table[static_cast<size_t>(Format::GLOBAL)] = sizeof(FLAT_instruction);
+                  table[static_cast<size_t>(Format::SCRATCH)] = sizeof(FLAT_instruction);
+                  table[static_cast<size_t>(Format::LDSDIR)] = sizeof(LDSDIR_instruction);
+                  table[static_cast<size_t>(Format::MTBUF)] = sizeof(MTBUF_instruction);
+                  table[static_cast<size_t>(Format::MUBUF)] = sizeof(MUBUF_instruction);
+                  table[static_cast<size_t>(Format::MIMG)] = sizeof(MIMG_instruction);
+                  table[static_cast<size_t>(Format::VOPD)] = sizeof(VOPD_instruction);
+                  table[static_cast<size_t>(Format::VINTERP_INREG)] = sizeof(VINTERP_inreg_instruction);
+                  table[static_cast<size_t>(Format::VINTRP)] = sizeof(VINTRP_instruction);
+                  table[static_cast<size_t>(Format::EXP)] = sizeof(Export_instruction);
+                  return table;
+            }();
+
             size_t
             get_instr_data_size(Format format)
             {
-                  switch (format) {
-                        case Format::SOP1:
-                        case Format::SOP2:
-                        case Format::SOPC:
-                        case Format::SOPK:
-                        case Format::SOPP: return sizeof(SALU_instruction);
-                        case Format::SMEM: return sizeof(SMEM_instruction);
-                        case Format::PSEUDO: return sizeof(Pseudo_instruction);
-                        case Format::PSEUDO_BARRIER: return sizeof(Pseudo_barrier_instruction);
-                        case Format::PSEUDO_REDUCTION: return sizeof(Pseudo_reduction_instruction);
-                        case Format::PSEUDO_BRANCH: return sizeof(Pseudo_branch_instruction);
-                        case Format::DS: return sizeof(DS_instruction);
-                        case Format::FLAT:
-                        case Format::GLOBAL:
-                        case Format::SCRATCH: return sizeof(FLAT_instruction);
-                        case Format::LDSDIR: return sizeof(LDSDIR_instruction);
-                        case Format::MTBUF: return sizeof(MTBUF_instruction);
-                        case Format::MUBUF: return sizeof(MUBUF_instruction);
-                        case Format::MIMG: return sizeof(MIMG_instruction);
-                        case Format::VOPD: return sizeof(VOPD_instruction);
-                        case Format::VINTERP_INREG: return sizeof(VINTERP_inreg_instruction);
-                        case Format::VINTRP: return sizeof(VINTRP_instruction);
-                        case Format::EXP: return sizeof(Export_instruction);
-                        default:
-                              if ((uint16_t)format & (uint16_t)Format::DPP16)
-                                    return sizeof(DPP16_instruction);
-                        else if ((uint16_t)format & (uint16_t)Format::DPP8)
-                              return sizeof(DPP8_instruction);
-                        else if ((uint16_t)format & (uint16_t)Format::SDWA)
-                              return sizeof(SDWA_instruction);
-                        else
-                              return sizeof(VALU_instruction);
-                  }
+                  if ((uint16_t)format & (uint16_t)Format::DPP16)
+                        return sizeof(DPP16_instruction);
+                  else if ((uint16_t)format & (uint16_t)Format::DPP8)
+                        return sizeof(DPP8_instruction);
+                  else if ((uint16_t)format & (uint16_t)Format::SDWA)
+                        return sizeof(SDWA_instruction);
+
+                  size_t size = instr_data_size_table[static_cast<uint16_t>(format) & 0xFF];
+                  if (size > 0) [[likely]]
+                        return size;
+                  else
+                        return sizeof(VALU_instruction);
             }
 
             Instruction*
