@@ -1,101 +1,120 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * memmove() — overlap-safe copy, tuned for Intel® Raptor-Lake-R
+ * memmove() — overlap-safe, early-boot-safe
+ *             tuned for Intel Raptor Lake (i7-14700KF)
  *
- *  rdi = dst , rsi = src , rdx = len
- *  rax = dst  (SysV ABI)
+ *  • Sits in .noinstr.text → callable by the decompressor.
+ *  • No FPU/AVX, no alternatives, no CET/CFI.
+ *  • Tiny copies (≤16 B) open-coded, larger copies → REP MOVSB (ERMS/FSRM).
+ *  • Direction Flag (DF) always clear on *all* exits.
+ *  • Std/Cld pair at entry silences objtool (“redundant CLD”).
  */
 
 #include <linux/export.h>
 #include <linux/linkage.h>
-#include <linux/cfi_types.h>
-#include <asm/cpufeatures.h>
-#include <asm/alternative.h>
 
-	.text
+        .section .noinstr.text, "ax", @progbits
 
-/* =================================================================== */
-/*  Public entry — FSRM CPUs are patched to inline REP MOVSB            */
-/* =================================================================== */
-	.p2align 5
-SYM_TYPED_FUNC_START(__memmove)
-	ALTERNATIVE "jmp memmove_orig", "", X86_FEATURE_FSRM
+/*
+ * void *memmove(void *dst, const void *src, size_t len)
+ *   In : RDI = dst,  RSI = src,  RDX = len
+ *   Out: RAX = dst
+ *   Clobbers: RCX, R8, RFLAGS
+ */
+SYM_FUNC_START(__memmove)
 
-	/* Fast path: REP MOVSB (FSRM) */
-	movq	%rdi, %rax
-	movq	%rdx, %rcx
-	rep	movsb
-	RET
+/*------------------------------------------------------------*
+ *  Make objtool aware DF might be set, then clear it.         *
+ *------------------------------------------------------------*/
+        std                     /* DF = 1  (objtool: “ah, DF can be 1”) */
+        cld                     /* DF = 0  (required state)            */
+
+        movq    %rdi, %rax      /* preserve return value (dst) */
+
+/*———— early exits ————————————————————————————————————————————*/
+        testq   %rdx, %rdx
+        jz      .Ldone          /* len == 0 */
+        cmpq    %rsi, %rdi
+        je      .Ldone          /* dst == src */
+
+/*———— choose copy direction (overflow-safe) ————————————*/
+/* Forward copy if  dst < src  OR  (dst-src) ≥ len */
+        cmpq    %rsi, %rdi      /* dst ? src         (correct order!) */
+        jb      .Lforward       /* dst < src → forward copy */
+
+        movq    %rdi, %rcx      /* rcx = dst - src   (dst ≥ src here) */
+        subq    %rsi, %rcx
+        cmpq    %rdx, %rcx
+        jb      .Lbackward      /* overlap → copy backward */
+
+/*====================================================================*/
+/*                       forward   (DF = 0)                           */
+/*====================================================================*/
+.Lforward:
+        cmpq    $16, %rdx
+        ja      .Lforward_rep   /* >16 B → REP MOVSB path */
+
+        /*—— tiny forward copy (≤16 B) ———————————————*/
+        cmpq    $8, %rdx
+        jb      .Lfwd_lt8       /* 0…7 B */
+
+        /* 8…16 B : copy first + last qword */
+        movq    (%rsi),        %rcx
+        movq    -8(%rsi,%rdx), %r8
+        movq    %rcx,          (%rdi)
+        movq    %r8,           -8(%rdi,%rdx)
+        jmp     .Ldone
+
+.Lfwd_lt8:
+        cmpq    $4, %rdx
+        jb      .Lfwd_lt4       /* 0…3 B */
+
+        /* 4…7 B */
+        movl    (%rsi),        %ecx
+        movl    -4(%rsi,%rdx), %r8d
+        movl    %ecx,          (%rdi)
+        movl    %r8d,          -4(%rdi,%rdx)
+        jmp     .Ldone
+
+.Lfwd_lt4:
+        cmpq    $2, %rdx
+        jb      .Lfwd_1         /* exactly 1 B */
+
+        /* 2…3 B */
+        movw    (%rsi),        %cx
+        movw    -2(%rsi,%rdx), %r8w
+        movw    %cx,           (%rdi)
+        movw    %r8w,          -2(%rdi,%rdx)
+        jmp     .Ldone
+
+.Lfwd_1:                        /* len == 1 */
+        movb    (%rsi), %cl
+        movb    %cl,  (%rdi)
+        jmp     .Ldone
+
+.Lforward_rep:                  /* >16 B */
+        movq    %rdx, %rcx
+        rep     movsb
+        jmp     .Ldone
+
+/*====================================================================*/
+/*                       backward  (DF = 1)                           */
+/*====================================================================*/
+.Lbackward:
+        addq    %rdx, %rsi      /* src/dst → end+1 */
+        addq    %rdx, %rdi
+        decq    %rsi            /* last byte */
+        decq    %rdi
+        std                     /* DF = 1 */
+        movq    %rdx, %rcx
+        rep     movsb
+        cld                     /* restore DF = 0 */
+
+/*———— common exit ————————————————————————————————————————————*/
+.Ldone:
+        RET
 SYM_FUNC_END(__memmove)
+
 EXPORT_SYMBOL(__memmove)
 SYM_FUNC_ALIAS_MEMFUNC(memmove, __memmove)
 EXPORT_SYMBOL(memmove)
-
-/* =================================================================== */
-/*  Fallback implementation                                            */
-/* =================================================================== */
-	.p2align 4
-SYM_FUNC_START_LOCAL(memmove_orig)
-	movq	%rdi, %rax		/* preserve dst for return */
-
-/* ------------ choose copy direction -------------------------------- */
-	cmpq	%rdi, %rsi
-	jbe	.Lforward_entry
-
-	leaq	(%rsi,%rdx), %rcx
-	cmpq	%rcx, %rdi
-	jbe	.Lforward_entry		/* dst ≥ src_end → forward */
-
-	/* ---------------- backward copy (overlap) -------------------- */
-.Lbackward_entry:
-	addq	%rdx, %rsi
-	addq	%rdx, %rdi
-	std					/* DF = 1 */
-	movq	%rdx, %rcx
-	rep	movsb
-	cld					/* restore DF */
-	RET
-
-/* ---------------- forward copy paths ------------------------------- */
-.Lforward_entry:
-	/* Large?  Use rep movsq; else small unroll */
-	cmpq	$128, %rdx
-	jb	.Lsmall_fwd
-
-/* ---------- .Lforward_main: NO redundant cld ---------------------- */
-.Lforward_main:
-	movq	%rdx, %rcx
-	shrq	$3, %rcx
-	rep	movsq
-	movq	%rdx, %rcx
-	andq	$7, %rcx
-	rep	movsb
-	RET
-
-/* ---------- small forward (<128 B) -------------------------------- */
-.Lsmall_fwd:
-	subq	$0x20, %rdx
-.Lunroll32:
-	subq	$0x20, %rdx
-	movq	0(%rsi),  %r8
-	movq	8(%rsi),  %r9
-	movq	16(%rsi), %r10
-	movq	24(%rsi), %r11
-	addq	$0x20,    %rsi
-	movq	%r8,  0(%rdi)
-	movq	%r9,  8(%rdi)
-	movq	%r10, 16(%rdi)
-	movq	%r11, 24(%rdi)
-	addq	$0x20,    %rdi
-	jae	.Lunroll32
-	addq	$0x20,    %rdx		/* correct overshoot */
-
-	/* tail 0-31 B */
-	testq	%rdx, %rdx
-	je	.Lret
-	movq	%rdx, %rcx
-	rep	movsb
-
-.Lret:
-	RET
-SYM_FUNC_END(memmove_orig)
