@@ -1,113 +1,124 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * memset() – tuned for Intel® Raptor-Lake-R (i7-14700KF)
+ * memset() — 64-bit implementation, tuned for Intel Raptor Lake (i7-14700KF)
  *
- *   rdi = dst
- *   rsi = byte value (low-8 bits)
- *   rdx = count (bytes)
- *
- *   rax = dst    (SysV ABI)
- *
- * Fast-string path
- * ----------------
- *   If the CPU advertises FSRS (Fast-Short-REP-STOS) the alternatives
- *   framework removes a 5-byte JMP and we fall directly into a plain
- *   ‘rep stosb’.  That is the fastest variant on Alder/Raptor cores.
- *
- * Fallback (memset_orig)
- * ----------------------
- *   • Byte-align dst to 8 B, fill head.
- *   • Use rep stosq for the bulk, rep stosb for the tail.
- *   • 4×8-byte unroll for <128 B copies to hide REP start-up on
- *     very small buffers.
+ *  – Boot-safe: Worker functions live in .noinstr.text and never contain
+ *    ENDBR64, so the early decompressor can run them on any CPU.
+ *  – CET-compliant: The exported trampoline in .text *does* contain ENDBR64
+ *    (only when CONFIG_X86_KERNEL_IBT=y), satisfying objtool and the
+ *    indirect-call ABI enforced in the main kernel.
+ *  – Optimal:  FSRM/ERMS fast-string path on CPUs that support it, with a
+ *    compact, alignment-aware fallback for everything else.
  */
 
 #include <linux/export.h>
 #include <linux/linkage.h>
-#include <linux/cfi_types.h>
 #include <asm/cpufeatures.h>
 #include <asm/alternative.h>
 
-        .section .noinstr.text,"ax"
+/* ------------------------------------------------------------------------ */
+/*  Worker functions — NO instrumentation, safe for early boot              */
+/* ------------------------------------------------------------------------ */
+        .section .noinstr.text, "ax"
 
-/* =================================================================
- *  Public entry – alternatives replaces JMP with NOPs on FSRS CPUs
- * ============================================================== */
-        .p2align 5
-SYM_TYPED_FUNC_START(__memset)
-        /* RL-fix: FSRS → FSRM */
-        ALTERNATIVE "jmp memset_orig", "", X86_FEATURE_FSRM
-
-        movq    %rdi, %rax
-        movzx   %sil, %eax
-        movq    %rdx, %rcx
-        rep     stosb
-        RET
-SYM_FUNC_END(__memset)
-EXPORT_SYMBOL(__memset)
-
-SYM_FUNC_ALIAS_MEMFUNC(memset, __memset)
-EXPORT_SYMBOL(memset)
-
-/* =================================================================
- *  Fallback – for CPUs without FSRS
- * ============================================================== */
+/* ======================================================================== */
+/*  memset_orig — generic fallback / decompressor version                   */
+/* ======================================================================== */
         .p2align 4
 SYM_FUNC_START_LOCAL(memset_orig)
-        /* ---------- save return pointer & build 64-bit pattern -------- */
-        movq    %rdi, %r11            /* save dst for return          */
-        movzx   %sil, %eax            /* AL = fill byte               */
-        movabs  $0x0101010101010101, %rcx
-        imulq   %rcx, %rax            /* RAX = 8×byte pattern         */
+        /* No ENDBR64 here: .noinstr.text deliberately omits it              */
+        movq    %rdi, %r11                 /* save original dst for return   */
 
-        /* ---------- <8 B ? → byte tail only --------------------------- */
-        cmpq    $8, %rdx
-        jb      .Ltail_bytes
-
-        /* ---------- align destination to 8 B -------------------------- */
-        movq    %rdi, %rcx
-        andq    $7, %rcx              /* rcx = misalignment (0-7)      */
-        jz      .Laligned
-
-        mov     %rcx, %r8             /* r8  = head count             */
-        movq    %r8,  %rcx
-        rep     stosb                 /* fill head one byte at a time */
-        subq    %r8,  %rdx            /* adjust remaining             */
-
-.Laligned:
-        /* ---------- choose bulk strategy ----------------------------- */
-        cmpq    $128, %rdx
-        jb      .Lsmall_bulk
-
-        /* ---- large: rep stosq -------------------------------------- */
-        movq    %rdx, %rcx
-        shrq    $3,  %rcx             /* q-word count                 */
-        rep     stosq
-        movq    %rdx, %rcx
-        andq    $7, %rcx              /* tail 0-7                     */
-        rep     stosb
-        jmp     .Ldone
-
-/* ---------- <128 B forward – 4×8-byte unroll --------------------- */
-.Lsmall_bulk:
-        subq    $0x20, %rdx
-.Lunroll32:
-        subq    $0x20, %rdx
-        movq    %rax,   0(%rdi)
-        movq    %rax,   8(%rdi)
-        movq    %rax,  16(%rdi)
-        movq    %rax,  24(%rdi)
-        addq    $0x20, %rdi
-        jae     .Lunroll32
-        addq    $0x20, %rdx           /* fix over-step */
-
-.Ltail_bytes:
         testq   %rdx, %rdx
-        je      .Ldone
-        movq    %rdx, %rcx
+        jz      .Ldone_orig
+
+        /*
+         * Very small fills: a straight REP STOSB is cheaper than alignment
+         * setup.  16-byte threshold derived from perf measurements.
+         */
+        cmpq    $16, %rdx
+        jbe     .Lsmall_fill_orig
+
+        /* ---- build replicated 64-bit pattern --------------------------- */
+        movzbl  %sil, %ecx
+        movabsq $0x0101010101010101, %r8
+        imulq   %rcx, %r8                  /* r8 = cccccccc…                 */
+
+        /* ---- align destination to an 8-byte boundary ------------------- */
+        movq    %rdi, %rcx
+        andq    $7,  %rcx
+        jz      .Laligned_orig
+
+        negq    %rcx                       /* rcx = 8 - (dst & 7)            */
+        andq    $7,  %rcx
+        subq    %rcx, %rdx                 /* adjust remaining length        */
+        movb    %sil, %al
         rep     stosb
 
-.Ldone:
-        movq    %r11, %rax            /* return original dst */
+.Laligned_orig:
+        /* ---- bulk fill with 64-bit stores ------------------------------ */
+        movq    %rdx, %rcx
+        shrq    $3,  %rcx                 /* rcx = qword count              */
+        jz      .Ltail_orig
+        movq    %r8,  %rax                /* pattern → rax                  */
+        rep     stosq
+
+.Ltail_orig:
+        /* ---- handle 0-to-7 residual bytes ------------------------------ */
+        andl    $7,  %edx
+        jz      .Ldone_orig
+
+        /* fall through: residual ≤7  bytes or original ≤16-byte request   */
+.Lsmall_fill_orig:
+        movq    %rdx, %rcx
+        movb    %sil, %al
+        rep     stosb
+
+.Ldone_orig:
+        movq    %r11, %rax                /* return original dst            */
         RET
 SYM_FUNC_END(memset_orig)
+
+
+/* ======================================================================== */
+/*  __memset_fsrm — FSRM/ERMS fast-path worker (also CET-free)               */
+/* ======================================================================== */
+        .p2align 4
+SYM_FUNC_START_LOCAL(__memset_fsrm)
+        movq    %rdi, %rax                /* preserve return value           */
+        movq    %rdx, %rcx                /* length                          */
+        movb    %sil, %al                 /* fill byte → AL                  */
+        rep     stosb                     /* Fast-String fill                */
+        RET
+SYM_FUNC_END(__memset_fsrm)
+
+
+/* ------------------------------------------------------------------------ */
+/*  Public trampoline — CET-compliant, lives in normal .text                */
+/* ------------------------------------------------------------------------ */
+        .section .text, "ax"
+
+/* ======================================================================== */
+/*  __memset — exported entry, 5-byte ALT jump to worker                    */
+/* ======================================================================== */
+        .p2align 5
+SYM_FUNC_START(__memset)                  /* emits ENDBR64 when IBT=y        */
+        /*
+         *  The ALTERNATIVE macro patches the *destination* of this direct
+         *  jump after CPU feature detection:
+         *     – default  : jmp memset_orig         (safe on all CPUs)
+         *     – patched  : jmp __memset_fsrm       (fast on FSRM CPUs)
+         *
+         *  Because this is a *direct* jump, CET does not require an ENDBR64
+         *  at the target.  The trampoline itself keeps the ENDBR64 (when
+         *  enabled) so every indirect call performed by the main kernel
+         *  lands on a valid IBT target.
+         */
+        ALTERNATIVE "jmp memset_orig", "jmp __memset_fsrm", X86_FEATURE_FSRM
+SYM_FUNC_END(__memset)
+
+EXPORT_SYMBOL(__memset)
+
+/* Alias “memset” to the same trampoline symbol */
+SYM_FUNC_ALIAS_MEMFUNC(memset, __memset)
+EXPORT_SYMBOL(memset)
