@@ -85,7 +85,6 @@ struct vega_pressure_cache_pc {
 static DEFINE_PER_CPU(struct vega_pressure_cache_pc, pressure_cache_pc);
 
 struct vega_vram_state {
-	/* seqcount_spinlock_t is optimal for this read-mostly data */
 	seqcount_spinlock_t seq;
 	u64        size_bytes;
 	u64        reciprocal_100;
@@ -93,7 +92,6 @@ struct vega_vram_state {
 	spinlock_t lock; /* The spinlock for the seqcount */
 };
 
-/* Correctly initialized structure */
 static struct vega_vram_state vram_state = {
 	.seq = SEQCNT_SPINLOCK_ZERO(vram_state.seq, &vram_state.lock),
 	.size_bytes = 0,
@@ -195,7 +193,6 @@ tbo_cache_try_get(unsigned long size, u64 user_flags,
 	if (unlikely(size > TBO_MAX_BYTES || resv || align > PAGE_SIZE))
 		return NULL;
 
-	/* Per-CPU access is lockless and safe */
 	c = this_cpu_ptr(&tiny_bo_cache);
 
 	if (domain == AMDGPU_GEM_DOMAIN_GTT) {
@@ -276,12 +273,13 @@ static bool tbo_cache_put(struct amdgpu_bo *bo)
 #define AMDGPU_VEGA_HBM2_MIN_ALIGNMENT   (256 * 1024)
 #define FAST_VA_MAP_MAX_BYTES		 (64u << 10)
 
-static int amdgpu_vega_vram_pressure_mid  __ro_after_init = 75;
-static int amdgpu_vega_vram_pressure_high __ro_after_init = 90;
+/* Tuned VRAM pressure thresholds for more proactive management */
+static int amdgpu_vega_vram_pressure_mid  __ro_after_init = 70;
+static int amdgpu_vega_vram_pressure_high __ro_after_init = 80;
 
 void amdgpu_vega_vram_thresholds_init(void)
 {
-	amdgpu_vega_vram_pressure_mid  = clamp(amdgpu_vega_vram_pressure_mid,  50, 90);
+	amdgpu_vega_vram_pressure_mid  = clamp(amdgpu_vega_vram_pressure_mid, 50, 90);
 	amdgpu_vega_vram_pressure_high = clamp(amdgpu_vega_vram_pressure_high, 70, 95);
 
 	if (amdgpu_vega_vram_pressure_high <= amdgpu_vega_vram_pressure_mid)
@@ -289,9 +287,9 @@ void amdgpu_vega_vram_thresholds_init(void)
 }
 
 module_param_named(vram_pressure_mid, amdgpu_vega_vram_pressure_mid,  int, 0644);
-MODULE_PARM_DESC(vram_pressure_mid,  "Mid VRAM pressure threshold for Vega (75)");
+MODULE_PARM_DESC(vram_pressure_mid,  "Mid VRAM pressure threshold for Vega (70)");
 module_param_named(vram_pressure_high, amdgpu_vega_vram_pressure_high, int, 0644);
-MODULE_PARM_DESC(vram_pressure_high, "High VRAM pressure threshold for Vega (90)");
+MODULE_PARM_DESC(vram_pressure_high, "High VRAM pressure threshold for Vega (80)");
 
 static __always_inline bool is_vega_texture(uint64_t flags)
 {
@@ -336,7 +334,6 @@ static u32 __amdgpu_vega_get_vram_usage(struct amdgpu_device *adev)
 	unsigned long *stamp_ptr = this_cpu_ptr(&stamp);
 	unsigned long j = jiffies;
 
-	/* Correctly initialize per-CPU timestamp on first use */
 	if (unlikely(*stamp_ptr == 0))
 		*stamp_ptr = j;
 
@@ -363,22 +360,18 @@ amdgpu_vega_get_vram_pressure_state(struct amdgpu_device *adev)
 	u32 pct_now, bias, yellow_th, red_th;
 	enum vega_vram_pressure_state new_state;
 
-	if (unlikely(!adev)) {
+	if (unlikely(!adev))
 		return VEGA_VRAM_GREEN;
-	}
 
 	c = this_cpu_ptr(&pressure_cache_pc);
 	now_jts = jiffies;
 
-	if (likely(time_before(now_jts, c->jts_last_update + (HZ / 100)))) {
+	if (likely(time_before(now_jts, c->jts_last_update + (HZ / 100))))
 		return c->state;
-	}
 
-	/* Race-free atomic decay logic */
 	static unsigned long last_decay_j;
 	if (time_after_eq(now_jts, READ_ONCE(last_decay_j) + (HZ / 4))) {
 		int old_val, new_val;
-
 		do {
 			old_val = atomic_read(&vram_state.eviction_rate_ewma);
 			new_val = max(0, old_val - ((old_val + 15) >> 4));
@@ -387,9 +380,7 @@ amdgpu_vega_get_vram_pressure_state(struct amdgpu_device *adev)
 	}
 
 	pct_now = __amdgpu_vega_get_vram_usage(adev);
-
 	bias = min_t(u32, atomic_read(&vram_state.eviction_rate_ewma) >> EW_UNIT_SHIFT, 25u);
-
 	yellow_th = max_t(u32, amdgpu_vega_vram_pressure_mid  - bias, 50);
 	red_th    = max_t(u32, amdgpu_vega_vram_pressure_high - bias, 75);
 
@@ -403,9 +394,8 @@ amdgpu_vega_get_vram_pressure_state(struct amdgpu_device *adev)
 
 	if (new_state != c->state) {
 		s32 delta = (s32)pct_now - (s32)c->pct_last;
-		if (abs(delta) < 3) {
+		if (abs(delta) < 3)
 			new_state = c->state;
-		}
 	}
 
 	c->state = new_state;
@@ -434,10 +424,12 @@ static inline void pb_decay(struct pid_bias_entry *e, u64 now_ns)
 
 	shifts = div64_u64(delta_ns, PB_DECAY_FACTOR_NS);
 	if (shifts) {
-		if (shifts >= 16)
+		if (shifts >= 16) {
 			e->ewma = 0;
-		else
-			e->ewma >>= min(shifts, 8u);
+		} else {
+			/* Tuned decay: less aggressive to preserve history */
+			e->ewma >>= min(shifts, 4u);
+		}
 		e->ns_last = now_ns;
 	}
 }
@@ -483,7 +475,6 @@ static void pb_account_eviction(void)
 	if (unlikely(!tgid))
 		return;
 
-	/* Correctly use INT_MAX as the limit */
 	atomic_add_unless(&vram_state.eviction_rate_ewma, EW_INC_PER_FAULT, INT_MAX);
 
 	tbl = this_cpu_ptr(pid_bias_tbl);
@@ -556,7 +547,6 @@ amdgpu_vega_optimize_hbm2_bank_access(struct amdgpu_device *adev,
 	if (!is_power_of_2(want) || want == *align_in_out)
 		return false;
 
-	/* Add overflow protection before calling ALIGN */
 	if (unlikely(sz > U64_MAX - (want - 1)))
 		return false;
 
@@ -572,7 +562,8 @@ amdgpu_vega_determine_optimal_prefetch(struct amdgpu_device *adev,
 {
 	unsigned int pages_total, want;
 	enum vega_vram_pressure_state st;
-	static const u8 scale_pct[3] = { 100, 50, 12 };
+	/* Tuned scaling: 200% green, 100% yellow, 25% red */
+	static const u8 scale_pct[3] = { 200, 100, 25 };
 
 	if (unlikely(!is_hbm2_vega(adev) || !bo || !base_pages))
 		return base_pages;
@@ -587,20 +578,20 @@ amdgpu_vega_determine_optimal_prefetch(struct amdgpu_device *adev,
 	if (bo->preferred_domains & AMDGPU_GEM_DOMAIN_GTT)
 		want = max(want >> 1, 1u);
 
-	if ((bo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) && pages_total > 256) {
-		if (st == VEGA_VRAM_GREEN)
-			want = min(want * 2, pages_total);
-	}
+	if ((bo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) &&
+		pages_total > 256 && st == VEGA_VRAM_GREEN) {
+		want = min(want * 2, pages_total);
+		}
 
-	if (pages_total <= 128 && st == VEGA_VRAM_GREEN)
-		want = pages_total;
+		if (pages_total <= 128 && st == VEGA_VRAM_GREEN)
+			want = pages_total;
 
 	return clamp(want, 1u, pages_total);
 }
 
 static bool
 amdgpu_vega_optimize_buffer_placement(struct amdgpu_device *adev,
-									  struct amdgpu_bo *bo, /* nullable */
+									  struct amdgpu_bo *bo,
 									  u64 size, u64 flags, u32 *domain)
 {
 	const bool cpu_acc = is_vega_cpu_access(flags);
@@ -615,6 +606,8 @@ amdgpu_vega_optimize_buffer_placement(struct amdgpu_device *adev,
 			return false;
 		} else {
 			*domain = (*domain & ~AMDGPU_GEM_DOMAIN_VRAM) | AMDGPU_GEM_DOMAIN_GTT;
+			/* Tuned: Account for all GTT migrations */
+			pb_account_eviction();
 			return true;
 		}
 	}
@@ -657,7 +650,7 @@ amdgpu_vega_optimize_buffer_placement(struct amdgpu_device *adev,
 		*domain &= ~(AMDGPU_GEM_DOMAIN_VRAM | AMDGPU_GEM_DOMAIN_GTT);
 		*domain |=  want_dom;
 
-		if (want_dom == AMDGPU_GEM_DOMAIN_GTT && size > (256ULL << 10))
+		if (want_dom == AMDGPU_GEM_DOMAIN_GTT)
 			pb_account_eviction();
 		return true;
 	}
@@ -1237,16 +1230,12 @@ int amdgpu_gem_create_ioctl(struct drm_device *dev, void *data,
 							   fpriv->xcp_id + 1);
 
 		if (likely(!r)) {
-			/* Success on the first or second attempt. */
 			break;
 		} else {
-			/* Allocation failed, check if we can retry. */
 			if (r == -ENOMEM && (alloc_domain & AMDGPU_GEM_DOMAIN_VRAM)) {
-				/* Failed in VRAM due to no space. Try GTT-only next. */
 				alloc_domain = AMDGPU_GEM_DOMAIN_GTT;
 				continue;
 			} else {
-				/* Any other error is unrecoverable, exit the loop. */
 				goto out_unreserve;
 			}
 		}
@@ -1484,7 +1473,6 @@ int amdgpu_gem_metadata_ioctl(struct drm_device *dev, void *data,
 				break;
 			}
 			r = amdgpu_bo_set_tiling_flags(robj, args->data.tiling_info);
-
 			if (!r) {
 				r = amdgpu_bo_set_metadata(robj, args->data.data,
 										   args->data.data_size_bytes,
