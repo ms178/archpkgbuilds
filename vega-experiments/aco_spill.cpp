@@ -49,9 +49,12 @@ namespace aco {
             };
 
             struct use_info {
-                  uint32_t num_uses = 0;
-                  uint32_t last_use = 0;
-                  float score() { return num_uses ? static_cast<float>(last_use) / static_cast<float>(num_uses) : 0.0f; }
+                  uint32_t num_uses  = 0;
+                  uint32_t last_use  = 0;
+                  float    cached    = 0.0f;
+
+                  [[gnu::always_inline]]
+                  float score() const noexcept { return cached; }
             };
 
             struct spill_ctx {
@@ -152,14 +155,20 @@ namespace aco {
                         return spill_id;
                   }
 
-                  void add_interference(uint32_t first, uint32_t second)
+                  [[gnu::always_inline]]
+                  inline void add_interference(uint32_t first, uint32_t second)
                   {
+                        /* Skip mixed SGPR/VGPR pairs */
                         if (interferences[first].first.type() != interferences[second].first.type())
                               return;
 
-                        bool inserted = interferences[first].second.insert(second).second;
-                        if (LIKELY(inserted))
-                              interferences[second].second.insert(first);
+                        /* Insert in one set; if it was already present we’re done         */
+                        auto& set_first = interferences[first].second;
+                        if (!set_first.insert(second).second)   /* duplicate? leave         */
+                              return;
+
+                        /* Maintain symmetry                                               */
+                        interferences[second].second.insert(first);
                   }
 
                   uint32_t allocate_spill_id(RegClass rc)
@@ -173,52 +182,55 @@ namespace aco {
                   uint32_t next_spill_id = 0;
             };
 
-            void
-            gather_ssa_use_info(spill_ctx& ctx)
+            static void gather_ssa_use_info(spill_ctx& ctx)
             {
-                  unsigned instruction_idx = 0;
-                  for (Block& block : ctx.program->blocks) {
-                        for (int i = block.instructions.size() - 1; i >= 0; i--) {
-                              aco_ptr<Instruction>& instr = block.instructions[i];
-                              for (const Operand& op : instr->operands) {
+                  unsigned instr_base = 0;
+                  for (Block& blk : ctx.program->blocks) {
+                        for (int i = blk.instructions.size() - 1; i >= 0; --i) {
+                              const aco_ptr<Instruction>& ins = blk.instructions[i];
+                              for (const Operand& op : ins->operands) {
                                     if (LIKELY(op.isTemp())) {
-                                          use_info& info = ctx.ssa_infos[op.tempId()];
-                                          info.num_uses++;
-                                          info.last_use = std::max(info.last_use, instruction_idx + i);
+                                          use_info& ui = ctx.ssa_infos[op.tempId()];
+                                          ++ui.num_uses;
+                                          ui.last_use =
+                                          std::max(ui.last_use,
+                                                   instr_base + static_cast<unsigned>(i));
                                     }
                               }
                         }
 
-                        if (UNLIKELY(block.kind & block_kind_loop_header)) {
-                              for (unsigned t : ctx.program->live.live_in[block.index])
-                                    ctx.ssa_infos[t].num_uses++;
+                        if (blk.kind & block_kind_loop_header) {
+                              for (unsigned t : ctx.program->live.live_in[blk.index])
+                                    ++ctx.ssa_infos[t].num_uses;
                         }
-
-                        instruction_idx += block.instructions.size();
+                        instr_base += blk.instructions.size();
                   }
+
+                  for (use_info& ui : ctx.ssa_infos)
+                        ui.cached = ui.num_uses ?
+                        static_cast<float>(ui.last_use) / ui.num_uses : 0.0f;
             }
 
-            bool
-            should_rematerialize(aco_ptr<Instruction>& instr)
+            [[gnu::always_inline]]
+            static inline bool should_rematerialize(const aco_ptr<Instruction>& ins)
             {
-                  if (UNLIKELY(instr->format != Format::VOP1 && instr->format != Format::SOP1 &&
-                        instr->format != Format::PSEUDO && instr->format != Format::SOPK))
-                        return false;
-                  if (UNLIKELY(instr->isPseudo() && instr->opcode != aco_opcode::p_create_vector &&
-                        instr->opcode != aco_opcode::p_parallelcopy))
-                        return false;
-                  if (UNLIKELY(instr->isSOPK() && instr->opcode != aco_opcode::s_movk_i32))
+                  if (ins->format != Format::VOP1 && ins->format != Format::SOP1 &&
+                        ins->format != Format::PSEUDO && ins->format != Format::SOPK)
                         return false;
 
-                  for (const Operand& op : instr->operands) {
-                        if (LIKELY(!op.isConstant()))
+                  if (ins->isPseudo() &&
+                        ins->opcode != aco_opcode::p_create_vector &&
+                        ins->opcode != aco_opcode::p_parallelcopy)
+                        return false;
+
+                  if (ins->isSOPK() && ins->opcode != aco_opcode::s_movk_i32)
+                        return false;
+
+                  for (const Operand& op : ins->operands)
+                        if (!op.isConstant())
                               return false;
-                  }
 
-                  if (UNLIKELY(instr->definitions.size() > 1))
-                        return false;
-
-                  return true;
+                  return ins->definitions.size() == 1;
             }
 
             aco_ptr<Instruction>
@@ -279,6 +291,21 @@ namespace aco {
                   }
             }
 
+            [[gnu::always_inline]]
+            static inline bool is_spillable(spill_ctx& ctx, Temp var)
+            {
+                  if (var.regClass().is_linear_vgpr())
+                        return false;
+
+                  auto eq = [var](Temp t) { return t == var; };
+                  return var != ctx.program->stack_ptr &&
+                  var != ctx.program->static_scratch_rsrc &&
+                  std::none_of(ctx.program->scratch_offsets.begin(),
+                               ctx.program->scratch_offsets.end(), eq) &&
+                               std::none_of(ctx.program->private_segment_buffers.begin(),
+                                            ctx.program->private_segment_buffers.end(), eq);
+            }
+
             RegisterDemand
             init_live_in_vars(spill_ctx& ctx, Block* block, unsigned block_idx)
             {
@@ -330,7 +357,7 @@ namespace aco {
                               for (unsigned t : live_in) {
                                     Temp var = Temp(t, ctx.program->temp_rc[t]);
                                     if (var.type() != type || ctx.spills_entry[block_idx].count(var) ||
-                                          var.regClass().is_linear_vgpr())
+                                          !is_spillable(ctx, var))
                                           continue;
 
                                     unsigned can_remat = ctx.remat.count(var);
@@ -372,7 +399,7 @@ namespace aco {
                                           continue;
                                     Temp var = phi->definitions[0].getTemp();
                                     if (var.type() == type && !ctx.spills_entry[block_idx].count(var) &&
-                                          ctx.ssa_infos[var.id()].score() > score) {
+                                          ctx.ssa_infos[var.id()].score() > score && is_spillable(ctx, var)) {
                                           to_spill = var;
                                     score = ctx.ssa_infos[var.id()].score();
                                           }
@@ -491,7 +518,7 @@ namespace aco {
                         while (it != partial_spills.end()) {
                               assert(!ctx.spills_entry[block_idx].count(it->first));
 
-                              if (it->first.type() == type && !it->first.regClass().is_linear_vgpr() &&
+                              if (it->first.type() == type && is_spillable(ctx, it->first) &&
                                     ((it->second && !best_is_partial_spill) ||
                                     (it->second == best_is_partial_spill && ctx.ssa_infos[it->first.id()].score() > score))) {
                                     score = ctx.ssa_infos[it->first.id()].score();
@@ -852,7 +879,7 @@ namespace aco {
                                     for (unsigned t : ctx.program->live.live_in[block_idx]) {
                                           RegClass rc = ctx.program->temp_rc[t];
                                           Temp var = Temp(t, rc);
-                                          if (rc.type() != type || current_spills.count(var) || rc.is_linear_vgpr())
+                                          if (rc.type() != type || current_spills.count(var) || !is_spillable(ctx, var))
                                                 continue;
 
                                           unsigned can_rematerialize = ctx.remat.count(var);
@@ -1026,336 +1053,293 @@ namespace aco {
                   }
             }
 
-            Temp
-            load_scratch_resource(spill_ctx& ctx, Builder& bld, bool apply_scratch_offset_to_input_buffer)
-            {
-                  Temp private_segment_buffer;
-                  if (!ctx.program->private_segment_buffers.empty())
-                        private_segment_buffer = ctx.program->private_segment_buffers[ctx.resume_idx];
-
-                  if (!private_segment_buffer.bytes()) {
-                        Temp addr_lo =
-                        bld.sop1(aco_opcode::p_load_symbol, bld.def(s1), Operand::c32(aco_symbol_scratch_addr_lo));
-                        Temp addr_hi =
-                        bld.sop1(aco_opcode::p_load_symbol, bld.def(s1), Operand::c32(aco_symbol_scratch_addr_hi));
-                        private_segment_buffer =
-                        bld.pseudo(aco_opcode::p_create_vector, bld.def(s2), addr_lo, addr_hi);
-                  } else if (ctx.program->stage.hw != AC_HW_COMPUTE_SHADER) {
-                        private_segment_buffer =
-                        bld.smem(aco_opcode::s_load_dwordx2, bld.def(s2), private_segment_buffer, Operand::zero());
-                  }
-
-                  if (apply_scratch_offset_to_input_buffer) {
-                        Temp addr_lo = bld.tmp(s1);
-                        Temp addr_hi = bld.tmp(s1);
-                        bld.pseudo(aco_opcode::p_split_vector, Definition(addr_lo), Definition(addr_hi),
-                                   private_segment_buffer);
-
-                        Temp carry = bld.tmp(s1);
-                        addr_lo = bld.sop2(aco_opcode::s_add_u32, bld.def(s1), bld.scc(Definition(carry)), addr_lo,
-                                           ctx.program->scratch_offsets[ctx.resume_idx]);
-                        addr_hi = bld.sop2(aco_opcode::s_addc_u32, bld.def(s1), bld.def(s1, scc), addr_hi,
-                                           Operand::c32(0), bld.scc(carry));
-
-                        private_segment_buffer =
-                        bld.pseudo(aco_opcode::p_create_vector, bld.def(s2), addr_lo, addr_hi);
-                  }
-
-                  struct ac_buffer_state ac_state = {0};
-                  uint32_t desc[4];
-
-                  ac_state.size = 0xffffffff;
-                  ac_state.format = PIPE_FORMAT_R32_FLOAT;
-                  for (int i = 0; i < 4; i++)
-                        ac_state.swizzle[i] = PIPE_SWIZZLE_0;
-                  ac_state.element_size = ctx.program->gfx_level <= GFX8 ? 1u : 0u;
-                  ac_state.index_stride = ctx.program->wave_size == 64 ? 3u : 2u;
-                  ac_state.add_tid = true;
-                  ac_state.gfx10_oob_select = V_008F0C_OOB_SELECT_RAW;
-
-                  ac_build_buffer_descriptor(ctx.program->gfx_level, &ac_state, desc);
-
-                  return bld.pseudo(aco_opcode::p_create_vector, bld.def(s4), private_segment_buffer,
-                                    Operand::c32(desc[2]), Operand::c32(desc[3]));
-            }
-
             static inline void
             setup_vgpr_spill_reload(spill_ctx&                        ctx,
                                     Block&                            block,
                                     std::vector<aco_ptr<Instruction>>& instructions,
                                     uint32_t                          spill_slot,
-                                    Temp&                             scratch_offset_sgpr,
+                                    Operand&                          scratch_offset_sgpr,
                                     unsigned*                         offset_val)
             {
-                  scratch_offset_sgpr = Temp();
+                  scratch_offset_sgpr = Operand();                      /* reset */
 
-                  const uint32_t wave_size  = ctx.program->wave_size;
-                  const uint32_t scratch_bytes_per_wave = ctx.program->config->scratch_bytes_per_wave;
+                  const uint32_t wave_size               = ctx.program->wave_size;
+                  const uint32_t scratch_bytes_per_wave  = ctx.program->config->scratch_bytes_per_wave;
                   const uint32_t scratch_size_per_thread = scratch_bytes_per_wave / wave_size;
 
-                  uint32_t offset_range_bytes;
-                  if (LIKELY(ctx.program->gfx_level >= GFX9)) {
-                        offset_range_bytes = ctx.program->dev.scratch_global_offset_max
-                        - ctx.program->dev.scratch_global_offset_min;
-                  } else {
-                        offset_range_bytes = (scratch_size_per_thread < ctx.program->dev.buf_offset_max)
-                        ? (ctx.program->dev.buf_offset_max - scratch_size_per_thread)
-                        : 0u;
+                  /* ---------- usable address range (32-bit safe) ---------------- */
+                  uint32_t offset_range_bytes = 0;
+                  if (ctx.program->gfx_level >= GFX9) {
+                        offset_range_bytes = ctx.program->dev.scratch_global_offset_max -
+                        ctx.program->dev.scratch_global_offset_min;
+                  } else if (scratch_size_per_thread < ctx.program->dev.buf_offset_max) {
+                        offset_range_bytes = ctx.program->dev.buf_offset_max - scratch_size_per_thread;
                   }
 
-                  const bool overflow_needs_sgpr_offset = UNLIKELY((ctx.vgpr_spill_slots > 0 ? ctx.vgpr_spill_slots -1u : 0u) * 4u > offset_range_bytes);
-
+                  const bool overflow_needs_sgpr_offset =
+                  static_cast<uint64_t>(ctx.vgpr_spill_slots ? ctx.vgpr_spill_slots - 1u : 0u) * 4ull >
+                  static_cast<uint64_t>(offset_range_bytes);
 
                   Builder rsrc_bld(ctx.program);
 
-                  if (UNLIKELY(block.kind & block_kind_top_level)) {
+                  /* ensure we always own a dominating insertion point               */
+                  if (block.kind & block_kind_top_level) {
                         rsrc_bld.reset(&instructions);
-                  } else if (LIKELY(ctx.scratch_rsrc == Temp() &&
-                        (!overflow_needs_sgpr_offset || ctx.program->gfx_level < GFX9)))
+                  } else if (ctx.scratch_rsrc == Temp() &&
+                        (!overflow_needs_sgpr_offset || ctx.program->gfx_level < GFX9))
                   {
-                        Block* tl_block = &block;
-                        while (!(tl_block->kind & block_kind_top_level))
-                              tl_block = &ctx.program->blocks[tl_block->linear_idom];
+                        /* walk to first dominator that has the top-level flag */
+                        Block* tl_blk = &block;
+                        while (!(tl_blk->kind & block_kind_top_level))
+                              tl_blk = &ctx.program->blocks[tl_blk->linear_idom];
 
-                        auto& prev_instrs = tl_block->instructions;
-                        size_t insert_idx = prev_instrs.size();
-
-                        while (insert_idx > 0 &&
-                              prev_instrs[insert_idx - 1]->opcode != aco_opcode::p_logical_end)
-                        {
-                              --insert_idx;
-                        }
-
-                        if (insert_idx == 0 && !prev_instrs.empty() && prev_instrs[0]->opcode != aco_opcode::p_logical_end) {
-                              insert_idx = prev_instrs.size();
-                        } else if (insert_idx > 0 && prev_instrs[insert_idx-1]->opcode != aco_opcode::p_logical_end) {
-                              insert_idx = prev_instrs.size();
-                        }
-
-
-                        rsrc_bld.reset(&prev_instrs, std::next(prev_instrs.begin(), insert_idx));
+                        auto& instrs = tl_blk->instructions;
+                        auto insert_it = std::find_if(instrs.rbegin(), instrs.rend(),
+                                                      [](const aco_ptr<Instruction>& i)
+                                                      { return i->opcode == aco_opcode::p_logical_end; })
+                        .base();
+                        rsrc_bld.reset(&instrs, insert_it);
                   }
 
                   Builder offset_sgpr_bld = rsrc_bld;
-                  if (UNLIKELY(overflow_needs_sgpr_offset && ctx.program->gfx_level < GFX9)) // GFX9+ handles overflow differently
+                  if (overflow_needs_sgpr_offset && ctx.program->gfx_level < GFX9)
                         offset_sgpr_bld.reset(&instructions);
 
+                  /* ------------------- compute final byte offset ----------------- */
                   *offset_val = spill_slot * 4u;
 
-                  if (LIKELY(ctx.program->gfx_level >= GFX9)) {
+                  if (ctx.program->gfx_level >= GFX9) {
                         *offset_val += ctx.program->dev.scratch_global_offset_min;
 
-                        if (LIKELY(ctx.scratch_rsrc == Temp())) {
-                              int32_t saddr_val = int32_t(scratch_size_per_thread) -
-                              int32_t(ctx.program->dev.scratch_global_offset_min);
-                              if (UNLIKELY(int32_t(*offset_val) >
-                                    int32_t(ctx.program->dev.scratch_global_offset_max))) {
-                                    saddr_val += int32_t(*offset_val) - int32_t(ctx.program->dev.scratch_global_offset_max);
-                              *offset_val = ctx.program->dev.scratch_global_offset_max;
-                                    }
-                                    ctx.scratch_rsrc =
-                                    offset_sgpr_bld.copy(offset_sgpr_bld.def(s1), Operand::c32(uint32_t(saddr_val)));
-                        }
+                        if (ctx.scratch_rsrc == Temp()) {
+                              int64_t saddr_val = int64_t(scratch_size_per_thread) -
+                              int64_t(ctx.program->dev.scratch_global_offset_min);
 
-                  } else {
-                        if (UNLIKELY(ctx.scratch_rsrc == Temp()))
-                              ctx.scratch_rsrc = load_scratch_resource(ctx, rsrc_bld, overflow_needs_sgpr_offset);
-
-                        if (UNLIKELY(overflow_needs_sgpr_offset)) {
-                              const uint32_t soffset_literal =
-                              scratch_bytes_per_wave +
-                              *offset_val * wave_size;
-
-                              Temp& cached_offset_sgpr = ctx.block_scratch_offset[block.index];
-                              if (cached_offset_sgpr == Temp()) {
-                                    cached_offset_sgpr =
-                                    offset_sgpr_bld.copy(offset_sgpr_bld.def(s1), Operand::c32(soffset_literal));
+                              if (static_cast<int64_t>(*offset_val) >
+                                    static_cast<int64_t>(ctx.program->dev.scratch_global_offset_max))
+                              {
+                                    saddr_val += int64_t(*offset_val) -
+                                    int64_t(ctx.program->dev.scratch_global_offset_max);
+                                    *offset_val = ctx.program->dev.scratch_global_offset_max;
                               }
-                              scratch_offset_sgpr = cached_offset_sgpr;
-                              *offset_val         = 0u;
-                        } else {
-                              *offset_val += scratch_size_per_thread;
+
+                              ctx.scratch_rsrc =
+                              ctx.program->stack_ptr.id() ?
+                              offset_sgpr_bld.sop2(aco_opcode::s_add_u32, offset_sgpr_bld.def(s1),
+                                                   Definition(scc, s1),
+                                                   Operand(ctx.program->stack_ptr),
+                                                   Operand::c32(static_cast<uint32_t>(saddr_val)))
+                              : offset_sgpr_bld.copy(offset_sgpr_bld.def(s1),
+                                                     Operand::c32(static_cast<uint32_t>(saddr_val)));
                         }
+                  } else {
+                        /* --------------------- pre-GFX9 path ------------------------ */
+                        if (ctx.scratch_rsrc == Temp())
+                              ctx.scratch_rsrc = load_scratch_resource(ctx.program, rsrc_bld,
+                                                                       ctx.resume_idx,
+                                                                       overflow_needs_sgpr_offset);
+
+                              if (overflow_needs_sgpr_offset) {
+                                    const uint64_t literal64 =
+                                    uint64_t(scratch_bytes_per_wave) +
+                                    uint64_t(*offset_val) * uint64_t(wave_size);
+                                    const uint32_t soffset_literal = static_cast<uint32_t>(
+                                          std::min<uint64_t>(literal64, 0xffffFFFFu));          /* clamp */
+
+                                    Temp& cached = ctx.block_scratch_offset[block.index];
+                                    if (cached == Temp())
+                                          cached = offset_sgpr_bld.copy(offset_sgpr_bld.def(s1),
+                                                                        Operand::c32(soffset_literal));
+
+                                          scratch_offset_sgpr = Operand(cached);
+                                    *offset_val         = 0u;  /* consumed in SGPR */
+                              } else {
+                                    if (scratch_offset_sgpr.isUndefined())
+                                          scratch_offset_sgpr = Operand::zero();
+                                    *offset_val += scratch_size_per_thread;
+                              }
                   }
             }
 
-            static void
-            spill_vgpr(spill_ctx& ctx, Block& block,
-                       std::vector<aco_ptr<Instruction>>& instructions,
-                       aco_ptr<Instruction>& spill,
-                       std::vector<uint32_t>& slots)
+
+            static void spill_vgpr(spill_ctx& ctx, Block& blk,
+                                   std::vector<aco_ptr<Instruction>>& out,
+                                   aco_ptr<Instruction>&              spill,
+                                   std::vector<uint32_t>&             slots)
             {
                   ctx.program->config->spilled_vgprs += spill->operands[0].size();
 
-                  const uint32_t spill_id   = spill->operands[1].constantValue();
-                  const uint32_t spill_slot = slots[spill_id];
+                  const uint32_t id   = spill->operands[1].constantValue();
+                  const uint32_t slot = slots[id];
 
-                  Temp scratch_offset_sgpr;
+                  Operand soff;
                   if (!ctx.program->scratch_offsets.empty())
-                        scratch_offset_sgpr = ctx.program->scratch_offsets[ctx.resume_idx];
+                        soff = Operand(ctx.program->scratch_offsets[ctx.resume_idx]);
 
-                  unsigned offset_val;
-                  setup_vgpr_spill_reload(ctx, block, instructions, spill_slot,
-                                          scratch_offset_sgpr, &offset_val);
+                  unsigned offs;
+                  setup_vgpr_spill_reload(ctx, blk, out, slot, soff, &offs);
 
-                  Temp src = spill->operands[0].getTemp();
-                  assert(src.type() == RegType::vgpr && !src.is_linear());
-                  Builder bld(ctx.program, &instructions);
+                  Temp   src  = spill->operands[0].getTemp();
+                  const bool gfx9p = ctx.program->gfx_level >= GFX9;
+                  Builder bld(ctx.program, &out);
 
-                  const bool gfx9_or_later = ctx.program->gfx_level >= GFX9;
-
-                  if (LIKELY(src.size() == 4 && !(offset_val & 0xf))) {
-                        if (gfx9_or_later) {
+                  if (LIKELY(src.size() == 4 && LIKELY(!(offs & 0xf)))) {
+                        if (gfx9p) {
                               bld.scratch(aco_opcode::scratch_store_dwordx4, Operand(v1),
-                                          ctx.scratch_rsrc, src, offset_val,
+                                          ctx.scratch_rsrc, src, offs,
                                           memory_sync_info(storage_vgpr_spill, semantic_private));
                         } else {
-                              Instruction* instr = bld.mubuf(aco_opcode::buffer_store_dwordx4,
-                                                             ctx.scratch_rsrc, Operand(v1),
-                                                             scratch_offset_sgpr, src, offset_val, false);
-                              instr->mubuf().sync  = memory_sync_info(storage_vgpr_spill, semantic_private);
-                              instr->mubuf().cache.value = ac_swizzled;
+                              Instruction* inst = bld.mubuf(aco_opcode::buffer_store_dwordx4,
+                                                            ctx.scratch_rsrc, Operand(v1),
+                                                            soff, src, offs, false);
+                              inst->mubuf().sync  = memory_sync_info(storage_vgpr_spill, semantic_private);
+                              inst->mubuf().cache.value = ac_swizzled;
                         }
                         return;
                   }
 
-                  if (LIKELY(src.size() == 2 && !(offset_val & 0x7))) {
-                        if (gfx9_or_later) {
+                  if (LIKELY(src.size() == 2 && LIKELY(!(offs & 0x7)))) {
+                        if (gfx9p) {
                               bld.scratch(aco_opcode::scratch_store_dwordx2, Operand(v1),
-                                          ctx.scratch_rsrc, src, offset_val,
+                                          ctx.scratch_rsrc, src, offs,
                                           memory_sync_info(storage_vgpr_spill, semantic_private));
                         } else {
-                              Instruction* instr = bld.mubuf(aco_opcode::buffer_store_dwordx2,
-                                                             ctx.scratch_rsrc, Operand(v1),
-                                                             scratch_offset_sgpr, src, offset_val, false);
-                              instr->mubuf().sync  = memory_sync_info(storage_vgpr_spill, semantic_private);
-                              instr->mubuf().cache.value = ac_swizzled;
+                              Instruction* inst = bld.mubuf(aco_opcode::buffer_store_dwordx2,
+                                                            ctx.scratch_rsrc, Operand(v1),
+                                                            soff, src, offs, false);
+                              inst->mubuf().sync  = memory_sync_info(storage_vgpr_spill, semantic_private);
+                              inst->mubuf().cache.value = ac_swizzled;
                         }
                         return;
                   }
 
-                  if (UNLIKELY(src.size() > 1)) {
+                  if (src.size() > 1) {
                         Instruction* split =
                         create_instruction(aco_opcode::p_split_vector, Format::PSEUDO, 1,
                                            src.size());
                         split->operands[0] = Operand(src);
-                        for (unsigned i = 0; i < src.size(); ++i)
-                              split->definitions[i] = bld.def(v1);
+
+                        std::array<Temp, 32> elems{};                    /* safe upper-bound */
+                        assert(src.size() <= elems.size());
+
+                        for (unsigned i = 0; i < src.size(); ++i) {
+                              elems[i]              = bld.def(v1).getTemp();
+                              split->definitions[i] = Definition(elems[i]);
+                        }
                         bld.insert(split);
-                        for (unsigned i = 0; i < src.size(); ++i, offset_val += 4) {
-                              Temp elem = split->definitions[i].getTemp();
-                              if (gfx9_or_later) {
+
+                        for (unsigned i = 0; i < src.size(); ++i, offs += 4) {
+                              Temp e = elems[i];
+                              if (gfx9p) {
                                     bld.scratch(aco_opcode::scratch_store_dword, Operand(v1),
-                                                ctx.scratch_rsrc, elem, offset_val,
+                                                ctx.scratch_rsrc, e, offs,
                                                 memory_sync_info(storage_vgpr_spill, semantic_private));
                               } else {
-                                    Instruction* instr =
-                                    bld.mubuf(aco_opcode::buffer_store_dword, ctx.scratch_rsrc,
-                                              Operand(v1), scratch_offset_sgpr, elem, offset_val, false);
-                                    instr->mubuf().sync  = memory_sync_info(storage_vgpr_spill, semantic_private);
-                                    instr->mubuf().cache.value = ac_swizzled;
+                                    Instruction* inst = bld.mubuf(aco_opcode::buffer_store_dword,
+                                                                  ctx.scratch_rsrc, Operand(v1),
+                                                                  soff, e, offs, false);
+                                    inst->mubuf().sync  = memory_sync_info(storage_vgpr_spill, semantic_private);
+                                    inst->mubuf().cache.value = ac_swizzled;
                               }
                         }
-                  } else if (gfx9_or_later) {
+                  } else if (gfx9p) {
                         bld.scratch(aco_opcode::scratch_store_dword, Operand(v1),
-                                    ctx.scratch_rsrc, src, offset_val,
+                                    ctx.scratch_rsrc, src, offs,
                                     memory_sync_info(storage_vgpr_spill, semantic_private));
                   } else {
-                        Instruction* instr =
-                        bld.mubuf(aco_opcode::buffer_store_dword, ctx.scratch_rsrc,
-                                  Operand(v1), scratch_offset_sgpr, src, offset_val, false);
-                        instr->mubuf().sync  = memory_sync_info(storage_vgpr_spill, semantic_private);
-                        instr->mubuf().cache.value = ac_swizzled;
+                        Instruction* inst = bld.mubuf(aco_opcode::buffer_store_dword,
+                                                      ctx.scratch_rsrc, Operand(v1),
+                                                      soff, src, offs, false);
+                        inst->mubuf().sync  = memory_sync_info(storage_vgpr_spill, semantic_private);
+                        inst->mubuf().cache.value = ac_swizzled;
                   }
             }
 
-            static void
-            reload_vgpr(spill_ctx& ctx, Block& block,
-                        std::vector<aco_ptr<Instruction>>& instructions,
-                        aco_ptr<Instruction>& reload,
-                        std::vector<uint32_t>& slots)
+            static void reload_vgpr(spill_ctx& ctx, Block& blk,
+                                    std::vector<aco_ptr<Instruction>>& out,
+                                    aco_ptr<Instruction>&              reload,
+                                    std::vector<uint32_t>&             slots)
             {
-                  const uint32_t spill_id   = reload->operands[0].constantValue();
-                  const uint32_t spill_slot = slots[spill_id];
+                  const uint32_t id   = reload->operands[0].constantValue();
+                  const uint32_t slot = slots[id];
 
-                  Temp scratch_offset_sgpr;
+                  Operand soff;
                   if (!ctx.program->scratch_offsets.empty())
-                        scratch_offset_sgpr = ctx.program->scratch_offsets[ctx.resume_idx];
+                        soff = Operand(ctx.program->scratch_offsets[ctx.resume_idx]);
 
-                  unsigned offset_val;
-                  setup_vgpr_spill_reload(ctx, block, instructions, spill_slot,
-                                          scratch_offset_sgpr, &offset_val);
+                  unsigned offs;
+                  setup_vgpr_spill_reload(ctx, blk, out, slot, soff, &offs);
 
                   Definition dst = reload->definitions[0];
-                  Builder bld(ctx.program, &instructions);
+                  Builder    bld(ctx.program, &out);
+                  const bool gfx9p = ctx.program->gfx_level >= GFX9;
 
-                  const bool gfx9_or_later = ctx.program->gfx_level >= GFX9;
-
-                  if (LIKELY(dst.size() == 4 && !(offset_val & 0xf))) {
-                        if (gfx9_or_later) {
+                  if (LIKELY(dst.size() == 4 && LIKELY(!(offs & 0xf)))) {
+                        if (gfx9p) {
                               bld.scratch(aco_opcode::scratch_load_dwordx4, dst, Operand(v1),
-                                          ctx.scratch_rsrc, offset_val,
+                                          ctx.scratch_rsrc, offs,
                                           memory_sync_info(storage_vgpr_spill, semantic_private));
                         } else {
-                              Instruction* instr =
-                              bld.mubuf(aco_opcode::buffer_load_dwordx4, dst,
-                                        ctx.scratch_rsrc, Operand(v1),
-                                        scratch_offset_sgpr, offset_val, false);
-                              instr->mubuf().sync  = memory_sync_info(storage_vgpr_spill, semantic_private);
-                              instr->mubuf().cache.value = ac_swizzled;
+                              Instruction* inst = bld.mubuf(aco_opcode::buffer_load_dwordx4, dst,
+                                                            ctx.scratch_rsrc, Operand(v1),
+                                                            soff, offs, false);
+                              inst->mubuf().sync  = memory_sync_info(storage_vgpr_spill, semantic_private);
+                              inst->mubuf().cache.value = ac_swizzled;
                         }
                         return;
                   }
 
-                  if (LIKELY(dst.size() == 2 && !(offset_val & 0x7))) {
-                        if (gfx9_or_later) {
+                  if (LIKELY(dst.size() == 2 && LIKELY(!(offs & 0x7)))) {
+                        if (gfx9p) {
                               bld.scratch(aco_opcode::scratch_load_dwordx2, dst, Operand(v1),
-                                          ctx.scratch_rsrc, offset_val,
+                                          ctx.scratch_rsrc, offs,
                                           memory_sync_info(storage_vgpr_spill, semantic_private));
                         } else {
-                              Instruction* instr =
-                              bld.mubuf(aco_opcode::buffer_load_dwordx2, dst,
-                                        ctx.scratch_rsrc, Operand(v1),
-                                        scratch_offset_sgpr, offset_val, false);
-                              instr->mubuf().sync  = memory_sync_info(storage_vgpr_spill, semantic_private);
-                              instr->mubuf().cache.value = ac_swizzled;
+                              Instruction* inst = bld.mubuf(aco_opcode::buffer_load_dwordx2, dst,
+                                                            ctx.scratch_rsrc, Operand(v1),
+                                                            soff, offs, false);
+                              inst->mubuf().sync  = memory_sync_info(storage_vgpr_spill, semantic_private);
+                              inst->mubuf().cache.value = ac_swizzled;
                         }
                         return;
                   }
 
-                  if (UNLIKELY(dst.size() > 1)) {
+                  if (dst.size() > 1) {
                         Instruction* vec =
                         create_instruction(aco_opcode::p_create_vector, Format::PSEUDO,
                                            dst.size(), 1);
                         vec->definitions[0] = dst;
-                        for (unsigned i = 0; i < dst.size(); ++i, offset_val += 4) {
-                              Temp tmp = bld.tmp(v1);
-                              vec->operands[i] = Operand(tmp);
-                              if (gfx9_or_later) {
-                                    bld.scratch(aco_opcode::scratch_load_dword, Definition(tmp),
-                                                Operand(v1), ctx.scratch_rsrc, offset_val,
+
+                        std::array<Temp, 32> elems{};
+                        assert(dst.size() <= elems.size());
+
+                        for (unsigned i = 0; i < dst.size(); ++i, offs += 4) {
+                              elems[i]        = bld.tmp(v1);
+                              vec->operands[i] = Operand(elems[i]);
+
+                              if (gfx9p) {
+                                    bld.scratch(aco_opcode::scratch_load_dword, Definition(elems[i]),
+                                                Operand(v1), ctx.scratch_rsrc, offs,
                                                 memory_sync_info(storage_vgpr_spill, semantic_private));
                               } else {
-                                    Instruction* instr =
-                                    bld.mubuf(aco_opcode::buffer_load_dword, Definition(tmp),
-                                              ctx.scratch_rsrc, Operand(v1),
-                                              scratch_offset_sgpr, offset_val, false);
-                                    instr->mubuf().sync  = memory_sync_info(storage_vgpr_spill, semantic_private);
-                                    instr->mubuf().cache.value = ac_swizzled;
+                                    Instruction* inst = bld.mubuf(aco_opcode::buffer_load_dword,
+                                                                  Definition(elems[i]), ctx.scratch_rsrc,
+                                                                  Operand(v1), soff, offs, false);
+                                    inst->mubuf().sync  = memory_sync_info(storage_vgpr_spill, semantic_private);
+                                    inst->mubuf().cache.value = ac_swizzled;
                               }
                         }
                         bld.insert(vec);
-                  } else if (gfx9_or_later) {
+                  } else if (gfx9p) {
                         bld.scratch(aco_opcode::scratch_load_dword, dst, Operand(v1),
-                                    ctx.scratch_rsrc, offset_val,
+                                    ctx.scratch_rsrc, offs,
                                     memory_sync_info(storage_vgpr_spill, semantic_private));
                   } else {
-                        Instruction* instr =
-                        bld.mubuf(aco_opcode::buffer_load_dword, dst,
-                                  ctx.scratch_rsrc, Operand(v1),
-                                  scratch_offset_sgpr, offset_val, false);
-                        instr->mubuf().sync  = memory_sync_info(storage_vgpr_spill, semantic_private);
-                        instr->mubuf().cache.value = ac_swizzled;
+                        Instruction* inst = bld.mubuf(aco_opcode::buffer_load_dword, dst,
+                                                      ctx.scratch_rsrc, Operand(v1),
+                                                      soff, offs, false);
+                        inst->mubuf().sync  = memory_sync_info(storage_vgpr_spill, semantic_private);
+                        inst->mubuf().cache.value = ac_swizzled;
                   }
             }
 
@@ -1376,110 +1360,134 @@ namespace aco {
                   }
             }
 
+            [[gnu::always_inline]]
             static inline unsigned
             find_available_slot(std::vector<uint8_t>& used,
-                                unsigned             wave_size,
-                                unsigned             size,
-                                bool                 is_sgpr)
+                                unsigned              wave_size,
+                                unsigned              size,
+                                bool                  is_sgpr)
             {
-                  const unsigned wmask     = wave_size - 1;
-                  unsigned       slot      = 0;
+                  const unsigned wmask   = wave_size - 1;
+                  const unsigned word_sz = 64;
 
+                  auto ensure_size = [&](unsigned idx) {
+                        if (idx >= used.size())
+                              used.resize(idx + 1u, 0);
+                  };
+
+                  unsigned bit = 0;
                   while (true) {
-                        bool region_ok = true;
-                        for (unsigned i = 0; LIKELY(i < size); ++i) {
-                              if (UNLIKELY(slot + i >= used.size())) {
-                                    used.resize(slot + i + 1, 0);
-                              }
-                              if (UNLIKELY(used[slot + i])) {
-                                    region_ok = false;
-                                    break;
-                              }
-                        }
-                        if (UNLIKELY(!region_ok)) {
-                              ++slot;
+                        /* make sure we can safely read this 64-bit window */
+                        ensure_size(bit + word_sz - 1u);
+
+                        /* gather 64 flag-bytes into single word (0/1 → bit) */
+                        uint64_t word = 0;
+                        for (unsigned i = 0; i < word_sz; ++i)
+                              word |= uint64_t(used[bit + i]) << i;
+
+                        /* remove out-of-range bits in the final partial word */
+                        const unsigned remaining = used.size() - bit;
+                        if (remaining < word_sz)
+                              word &= (remaining ? ((1ull << remaining) - 1ull) : 0ull);
+
+                        /* all busy -> skip whole word */
+                        if (!~word) { bit += word_sz; continue; }
+
+                        /* free bit in ‘word’ */
+                        uint64_t inv = ~word;
+                        if (!inv) { bit += word_sz; continue; }
+                        unsigned free_bit = bit + __builtin_ctzll(inv);
+
+                        /* SGPR bank wrap rule */
+                        if (is_sgpr && ((free_bit & wmask) + size > wave_size)) {
+                              bit = (free_bit + wave_size) & ~wmask;
                               continue;
                         }
 
-                        if (UNLIKELY(is_sgpr && ((slot & wmask) + size > wave_size))) {
-                              slot = (slot + wave_size) & ~wmask;
-                              continue;
-                        }
-                        if (slot + size > used.size())
-                              used.resize(slot + size, 0);
+                        /* verify entire region is free & grow vector if needed */
+                        ensure_size(free_bit + size - 1u);
+                        bool ok = true;
+                        for (unsigned i = 0; i < size; ++i)
+                              if (used[free_bit + i]) { ok = false; break; }
+                              if (!ok) { ++bit; continue; }
 
-                        std::fill_n(used.begin(), std::min<size_t>(used.size(), slot + size), 0);
-                        return slot;
+                              /* mark busy region */
+                              std::fill_n(&used[free_bit], size, uint8_t{1});
+                        return free_bit;
                   }
             }
 
             static inline void
-            assign_spill_slots_helper(spill_ctx& ctx, RegType type, std::vector<bool>& is_assigned,
-                                      std::vector<uint32_t>& slots, unsigned* num_slots,
-                                      std::vector<uint8_t>& temp_slots_used_marker)
+            assign_spill_slots_helper(spill_ctx& ctx, RegType type,
+                                      std::vector<bool>&     is_assigned,
+                                      std::vector<uint32_t>& slots,
+                                      unsigned*              num_slots,
+                                      std::vector<uint8_t>&  marker)
             {
-                  for (std::vector<uint32_t>& vec : ctx.affinities) {
-                        if (vec.empty() || ctx.interferences[vec[0]].first.type() != type)
+                  auto fast_clear = [&]() {
+                        if (!marker.empty())
+                              std::memset(marker.data(), 0, marker.size());
+                  };
+
+                  /* -------- handle affinity groups first ---------------- */
+                  for (auto& grp : ctx.affinities) {
+                        if (grp.empty() ||
+                              ctx.interferences[grp[0]].first.type() != type)
                               continue;
 
-                        bool any_reloaded_in_group = false;
-                        for (unsigned id : vec) {
-                              if (ctx.is_reloaded[id]) {
-                                    any_reloaded_in_group = true;
-                                    break;
-                              }
-                        }
-                        if (UNLIKELY(!any_reloaded_in_group)) continue;
+                        bool any_reload = false;
+                        for (uint32_t id : grp)
+                              if (ctx.is_reloaded[id]) { any_reload = true; break; }
+                              if (!any_reload) continue;
 
-
-                        temp_slots_used_marker.assign(temp_slots_used_marker.size(), 0);
-                        for (unsigned id : vec) {
+                              fast_clear();
+                        for (uint32_t id : grp) {
                               if (!ctx.is_reloaded[id]) continue;
-                              for (unsigned other : ctx.interferences[id].second) {
+                              for (uint32_t other : ctx.interferences[id].second) {
                                     if (!is_assigned[other]) continue;
-                                    RegClass other_rc = ctx.interferences[other].first;
-                                    unsigned other_slot = slots[other];
-                                    size_t end_interf = other_slot + other_rc.size();
-                                    if (end_interf > temp_slots_used_marker.size())
-                                          temp_slots_used_marker.resize(end_interf, 0);
-                                    std::fill(temp_slots_used_marker.begin() + other_slot, temp_slots_used_marker.begin() + end_interf, 1);
+                                    unsigned o_slot = slots[other];
+                                    unsigned end    = o_slot + ctx.interferences[other].first.size();
+                                    if (end > marker.size()) marker.resize(end, 0);
+                                    std::fill(marker.begin() + o_slot, marker.begin() + end, 1);
                               }
                         }
 
-                        unsigned slot_for_group = find_available_slot(
-                              temp_slots_used_marker, ctx.wave_size, ctx.interferences[vec[0]].first.size(), type == RegType::sgpr);
+                        unsigned grp_slot = find_available_slot(marker, ctx.wave_size,
+                                                                ctx.interferences[grp[0]].first.size(),
+                                                                type == RegType::sgpr);
 
-                        for (unsigned id : vec) {
+                        for (uint32_t id : grp)
                               if (ctx.is_reloaded[id]) {
-                                    assert(!is_assigned[id]);
-                                    slots[id] = slot_for_group;
+                                    slots[id]       = grp_slot;
                                     is_assigned[id] = true;
                               }
-                        }
-                        *num_slots = std::max(*num_slots, slot_for_group + ctx.interferences[vec[0]].first.size());
+                              *num_slots = std::max(*num_slots,
+                                                    grp_slot + ctx.interferences[grp[0]].first.size());
                   }
 
-                  for (unsigned id = 0; id < ctx.interferences.size(); id++) {
-                        if (is_assigned[id] || !ctx.is_reloaded[id] || ctx.interferences[id].first.type() != type)
+                  /* -------- remaining ids -------------------------------------- */
+                  for (unsigned id = 0; id < ctx.interferences.size(); ++id) {
+                        if (is_assigned[id] || !ctx.is_reloaded[id] ||
+                              ctx.interferences[id].first.type() != type)
                               continue;
 
-                        temp_slots_used_marker.assign(temp_slots_used_marker.size(), 0);
-                        for (unsigned other : ctx.interferences[id].second) {
+                        fast_clear();
+                        for (uint32_t other : ctx.interferences[id].second) {
                               if (!is_assigned[other]) continue;
-                              RegClass other_rc = ctx.interferences[other].first;
-                              unsigned other_slot = slots[other];
-                              size_t end_interf = other_slot + other_rc.size();
-                              if (end_interf > temp_slots_used_marker.size())
-                                    temp_slots_used_marker.resize(end_interf, 0);
-                              std::fill(temp_slots_used_marker.begin() + other_slot, temp_slots_used_marker.begin() + end_interf, 1);
+                              unsigned o_slot = slots[other];
+                              unsigned end    = o_slot + ctx.interferences[other].first.size();
+                              if (end > marker.size()) marker.resize(end, 0);
+                              std::fill(marker.begin() + o_slot, marker.begin() + end, 1);
                         }
 
-                        unsigned slot_for_id = find_available_slot(
-                              temp_slots_used_marker, ctx.wave_size, ctx.interferences[id].first.size(), type == RegType::sgpr);
+                        unsigned my_slot = find_available_slot(marker, ctx.wave_size,
+                                                               ctx.interferences[id].first.size(),
+                                                               type == RegType::sgpr);
 
-                        slots[id] = slot_for_id;
+                        slots[id]       = my_slot;
                         is_assigned[id] = true;
-                        *num_slots = std::max(*num_slots, slot_for_id + ctx.interferences[id].first.size());
+                        *num_slots      = std::max(*num_slots,
+                                                   my_slot + ctx.interferences[id].first.size());
                   }
             }
 
@@ -1683,9 +1691,10 @@ namespace aco {
             }
             if (demand.vgpr + extra_vgprs > limit.vgpr) {
                   if (program->gfx_level >= GFX9)
-                        extra_sgprs = 1;
-                  else
-                        extra_sgprs = 5;
+                        extra_sgprs =
+                        program->stack_ptr.id() ? 2 : 1; /* SADDR + scc for stack pointer additions */
+                        else
+                              extra_sgprs = 5;
                   if (UNLIKELY(demand.sgpr + extra_sgprs > limit.sgpr)) {
                         unsigned sgpr_spills = demand.sgpr + extra_sgprs - limit.sgpr;
                         extra_vgprs = DIV_ROUND_UP(sgpr_spills * 2u, program->wave_size) + 1u;
