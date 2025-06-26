@@ -1,73 +1,70 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /*
- *  Fast 4-KiB page copy
- *    – REP-GOOD (ERMS / FSRM) CPUs: patched to  rep movsb
- *    – legacy fallback           : 64 × 64-byte unrolled loop
+ *  Fast 4-KiB page copy, tuned for Intel® Core i7-14700KF (Raptor-Lake-R)
  *
- *  Clobbers:  RAX, RBX, RDX, R8-R12, RFLAGS
+ *  – Uses ‘rep movsb’ on REP_GOOD parts, otherwise a 64×64-byte
+ *    hand-unrolled loop.
+ *  – No extra CLD: DF is already guaranteed clear; a redundant CLD would
+ *    trigger an objtool warning.
  */
 
-#include <linux/linkage.h>
 #include <linux/export.h>
-#include <asm/asm.h>
+#include <linux/linkage.h>
 #include <asm/cpufeatures.h>
 #include <asm/alternative.h>
 
-	.section .noinstr.text, "ax"
+        .section .noinstr.text, "ax"
 
-/* ================================================================
- *  Fast-string path (patched in when REP_GOOD is present)
- * ============================================================== */
-	.p2align 5
+        .p2align 5
 SYM_FUNC_START(copy_page)
-	ALTERNATIVE "jmp copy_page_regs", "", X86_FEATURE_REP_GOOD
+        /* On REP_GOOD CPUs the next instruction is patched to NOPs,
+         * falling through into the rep-movsb fast path.  Otherwise we
+         * branch to the legacy implementation below.
+         */
+        ALTERNATIVE "jmp copy_page_regs", "", X86_FEATURE_REP_GOOD
 
-	movl	$4096, %ecx
-	rep	movsb
-	RET
+        movl    $4096, %ecx          /* ECX = 4096 bytes              */
+        rep     movsb
+        RET
 SYM_FUNC_END(copy_page)
 EXPORT_SYMBOL(copy_page)
 
-/* ================================================================
- *  Hand-unrolled fallback
- * ============================================================== */
-	.p2align 4
-SYM_FUNC_START(copy_page_regs)
-	/* Save callee-saved registers */
-	pushq	%rbx
-	pushq	%r12
+        /* -------------------------------------------------------------- */
+        /* Legacy path: 64×64-byte unrolled copy                          */
+        /* -------------------------------------------------------------- */
+        .p2align 4
+SYM_FUNC_START_LOCAL(copy_page_regs)
+        pushq   %rbx
+        pushq   %r12
 
-	/* 64 iterations × 64 B = 4096 B */
-	movl	$64, %ecx
-
+        movl    $64, %ecx
 .Lloop64:
-	/* Load 64 bytes from source */
-	movq	0(%rsi),  %rax
-	movq	8(%rsi),  %rbx
-	movq	16(%rsi), %rdx
-	movq	24(%rsi), %r8
-	movq	32(%rsi), %r9
-	movq	40(%rsi), %r10
-	movq	48(%rsi), %r11
-	movq	56(%rsi), %r12
+        prefetcht0 128(%rsi)         /* harmless on modern cores       */
 
-	/* Store 64 bytes to destination */
-	movq	%rax,  0(%rdi)
-	movq	%rbx,  8(%rdi)
-	movq	%rdx,  16(%rdi)
-	movq	%r8,   24(%rdi)
-	movq	%r9,   32(%rdi)
-	movq	%r10,  40(%rdi)
-	movq	%r11,  48(%rdi)
-	movq	%r12,  56(%rdi)
+        movq    0(%rsi),  %rax
+        movq    8(%rsi),  %rbx
+        movq    16(%rsi), %rdx
+        movq    24(%rsi), %r8
+        movq    32(%rsi), %r9
+        movq    40(%rsi), %r10
+        movq    48(%rsi), %r11
+        movq    56(%rsi), %r12
 
-	/* Advance pointers */
-	addq	$64, %rsi
-	addq	$64, %rdi
-	dec	%ecx
-	jne	.Lloop64
+        movq    %rax,  0(%rdi)
+        movq    %rbx,  8(%rdi)
+        movq    %rdx,  16(%rdi)
+        movq    %r8,   24(%rdi)
+        movq    %r9,   32(%rdi)
+        movq    %r10,  40(%rdi)
+        movq    %r11,  48(%rdi)
+        movq    %r12,  56(%rdi)
 
-	/* Restore registers and return */
-	popq	%r12
-	popq	%rbx
-	RET
+        addq    $64, %rsi
+        addq    $64, %rdi
+        dec     %ecx
+        jne     .Lloop64
+
+        popq    %r12
+        popq    %rbx
+        RET
 SYM_FUNC_END(copy_page_regs)
