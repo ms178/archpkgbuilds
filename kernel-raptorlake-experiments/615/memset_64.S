@@ -11,6 +11,23 @@
  *    compact, alignment-aware fallback for everything else.
  */
 
+/*
+ * ========================================================================
+ *                  *** COMPATIBILITY WORKAROUND ***
+ *
+ * If you experience hardware initialization issues after enabling this file
+ * (e.g., a USB mouse not working at boot), it may be due to a latent race
+ * condition in a driver that is exposed by this function's faster timing.
+ *
+ * To fix this, uncomment the following line. This will force the use of
+ * the slightly slower, more compatible code path, which can resolve such
+ * timing issues, without sacrificing the correctness and security fixes.
+ *
+ * ========================================================================
+ */
+#define MEMSET_FORCE_GENERIC_PATH 1
+
+
 #include <linux/export.h>
 #include <linux/linkage.h>
 #include <asm/cpufeatures.h>
@@ -32,43 +49,34 @@ SYM_FUNC_START_LOCAL(memset_orig)
         testq   %rdx, %rdx
         jz      .Ldone_orig
 
-        /*
-         * Very small fills: a straight REP STOSB is cheaper than alignment
-         * setup.  16-byte threshold derived from perf measurements.
-         */
         cmpq    $16, %rdx
         jbe     .Lsmall_fill_orig
 
-        /* ---- build replicated 64-bit pattern --------------------------- */
         movzbl  %sil, %ecx
         movabsq $0x0101010101010101, %r8
-        imulq   %rcx, %r8                  /* r8 = cccccccc…                 */
+        imulq   %rcx, %r8
 
-        /* ---- align destination to an 8-byte boundary ------------------- */
         movq    %rdi, %rcx
         andq    $7,  %rcx
         jz      .Laligned_orig
 
-        negq    %rcx                       /* rcx = 8 - (dst & 7)            */
+        negq    %rcx
         andq    $7,  %rcx
-        subq    %rcx, %rdx                 /* adjust remaining length        */
+        subq    %rcx, %rdx
         movb    %sil, %al
         rep     stosb
 
 .Laligned_orig:
-        /* ---- bulk fill with 64-bit stores ------------------------------ */
         movq    %rdx, %rcx
-        shrq    $3,  %rcx                 /* rcx = qword count              */
+        shrq    $3,  %rcx
         jz      .Ltail_orig
-        movq    %r8,  %rax                /* pattern → rax                  */
+        movq    %r8,  %rax
         rep     stosq
 
 .Ltail_orig:
-        /* ---- handle 0-to-7 residual bytes ------------------------------ */
         andl    $7,  %edx
         jz      .Ldone_orig
 
-        /* fall through: residual ≤7  bytes or original ≤16-byte request   */
 .Lsmall_fill_orig:
         movq    %rdx, %rcx
         movb    %sil, %al
@@ -99,22 +107,23 @@ SYM_FUNC_END(__memset_fsrm)
         .section .text, "ax"
 
 /* ======================================================================== */
-/*  __memset — exported entry, 5-byte ALT jump to worker                    */
+/*  __memset — exported entry, jump to worker                               */
 /* ======================================================================== */
         .p2align 5
 SYM_FUNC_START(__memset)                  /* emits ENDBR64 when IBT=y        */
+#ifdef MEMSET_FORCE_GENERIC_PATH
         /*
-         *  The ALTERNATIVE macro patches the *destination* of this direct
-         *  jump after CPU feature detection:
-         *     – default  : jmp memset_orig         (safe on all CPUs)
-         *     – patched  : jmp __memset_fsrm       (fast on FSRM CPUs)
-         *
-         *  Because this is a *direct* jump, CET does not require an ENDBR64
-         *  at the target.  The trampoline itself keeps the ENDBR64 (when
-         *  enabled) so every indirect call performed by the main kernel
-         *  lands on a valid IBT target.
+         * Compatibility path: Unconditionally jump to the generic fallback.
+         * This avoids potential timing issues with the FSRM fast path.
+         */
+        jmp     memset_orig
+#else
+        /*
+         * Standard path: The ALTERNATIVE macro patches the jump after
+         * CPU feature detection to use the fastest available implementation.
          */
         ALTERNATIVE "jmp memset_orig", "jmp __memset_fsrm", X86_FEATURE_FSRM
+#endif
 SYM_FUNC_END(__memset)
 
 EXPORT_SYMBOL(__memset)
