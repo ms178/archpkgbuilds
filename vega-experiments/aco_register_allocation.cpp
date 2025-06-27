@@ -968,7 +968,7 @@ namespace aco {
                   }
 
                   /* Phase 2: Coalesce moves and allocate new temporaries. This loop is now
-                   *          careful about dependencies. */
+                   *          dependency-aware. */
                   for (auto it = parallelcopies.begin(); it != parallelcopies.end();) {
                         if (it->def.isTemp()) {
                               ++it;
@@ -978,7 +978,7 @@ namespace aco {
                         bool is_copy_kill = it->copy_kill >= 0;
                         bool coalesced = false;
 
-                        /* Coalesce with instruction definitions */
+                        /* Coalesce with instruction definitions (not possible for copy-kill). */
                         if (!is_copy_kill) {
                               for (Definition& def : instr->definitions) {
                                     if (def.isTemp() && def.getTemp() == it->op.getTemp()) {
@@ -1006,18 +1006,15 @@ namespace aco {
                         }
                         if (coalesced) continue;
 
-                        /* Coalesce with other parallelcopies. This is the dangerous part.
-                         * We must ensure we don't read from a register that is also a
-                         * destination in this parallelcopy block. */
-                        bool can_coalesce_with_pc = true;
+                        bool source_is_also_a_dest = false;
                         for (const auto& pc_check : parallelcopies) {
-                              if (pc_check.def.physReg() == it->op.physReg()) {
-                                    can_coalesce_with_pc = false;
+                              if (&pc_check != &(*it) && pc_check.def.physReg() == it->op.physReg()) {
+                                    source_is_also_a_dest = true;
                                     break;
                               }
                         }
 
-                        if (can_coalesce_with_pc) {
+                        if (!source_is_also_a_dest) {
                               for (parallelcopy& other : parallelcopies) {
                                     if (other.def.isTemp() && it->op.getTemp() == other.def.getTemp()) {
                                           if (is_copy_kill) {
@@ -3183,160 +3180,210 @@ resolve_vector_operands(ra_ctx&                     ctx,
                   }
             }
 
+            /*--------------------------------------------------------------------
+             *  Derive register-affinity hints for the register allocator
+             *------------------------------------------------------------------*/
             static void
             get_affinities(ra_ctx& ctx)
             {
-                  std::vector<std::vector<Temp>> phi_sets;
-                  aco::unordered_map<uint32_t, unsigned> tmp_to_phi_set(ctx.memory);
+                  /* merge-sets for phi operands (vec[0] = canonical Temp) */
+                  std::vector<std::vector<Temp>>          phi_sets;
+                  aco::unordered_map<uint32_t, unsigned>  tmp2set(ctx.memory);
 
-                  for (auto blk_it = ctx.program->blocks.rbegin(); blk_it != ctx.program->blocks.rend(); ++blk_it) {
+                  /* reverse CFG walk so loop-header phis are handled after the body */
+                  for (auto blk_it = ctx.program->blocks.rbegin();
+                       blk_it != ctx.program->blocks.rend(); ++blk_it) {
+
                         Block& block = *blk_it;
+
+                        /* vector-phi helper for this block */
                         std::map<Operand*, std::vector<vector_info>> vector_phis;
 
+                        /* ───────────────── 1. scan instructions bottom-up until phis ───────────────── */
                         auto inst_it = block.instructions.rbegin();
                         for (; inst_it != block.instructions.rend(); ++inst_it) {
                               aco_ptr<Instruction>& instr = *inst_it;
                               if (is_phi(instr))
-                                    break;
+                                    break;                                           /* reached phi zone */
 
-                              /* --- Vector Operand & Special Register Affinities --- */
-                              if (instr->opcode == aco_opcode::p_create_vector) {
-                                    for (const Operand& op : instr->operands)
-                                          if (op.isTemp() && op.isFirstKill() &&
-                                                op.getTemp().type() == instr->definitions[0].getTemp().type())
-                                                ctx.vectors[op.tempId()] = vector_info(instr.get());
-                              } else if (instr->format == Format::MIMG && instr->operands.size() > 4 && !instr->mimg().strict_wqm) {
-                                    bool is_vec = false;
-                                    unsigned vec_start = 3;
+                                    /* ---------- p_create_vector affinities ------------------ */
+                                    if (instr->opcode == aco_opcode::p_create_vector) {
+                                          for (const Operand& op : instr->operands)
+                                                if (op.isTemp() && op.isFirstKill() &&
+                                                      op.getTemp().type() ==
+                                                      instr->definitions[0].getTemp().type())
+                                                      ctx.vectors[op.tempId()] = vector_info(instr.get());
+                                    }
+                                    /* ---------- MIMG vectorised operands -------------------- */
+                                    else if (instr->format == Format::MIMG && instr->operands.size() > 4 &&
+                                          !instr->mimg().strict_wqm) {
+                                          bool vec     = false;
+                                    unsigned beg = 3;
                                     for (unsigned i = 3; i < instr->operands.size(); ++i) {
-                                          bool is_aligned = instr->operands[i].isVectorAligned();
-                                          if (is_vec || is_aligned)
-                                                ctx.vectors[instr->operands[i].tempId()] = vector_info(instr.get(), vec_start, !is_aligned);
-                                          is_vec = is_aligned;
-                                          if (!is_vec) vec_start = i + 1;
+                                          bool aligned = instr->operands[i].isVectorAligned();
+                                          if (vec || aligned)
+                                                ctx.vectors[instr->operands[i].tempId()] =
+                                                vector_info(instr.get(), beg, !aligned);
+                                          vec = aligned;
+                                          if (!vec) beg = i + 1;
                                     }
-                              } else if (instr->opcode == aco_opcode::p_split_vector && instr->operands[0].isFirstKillBeforeDef()) {
-                                    ctx.split_vectors[instr->operands[0].tempId()] = instr.get();
-                              } else if (instr->isVOPC() && !instr->isVOP3() && (!instr->isSDWA() || ctx.program->gfx_level == GFX8)) {
-                                    if (instr->definitions[0].isTemp()) {
-                                          Temp res = instr->definitions[0].getTemp();
-                                          int uses = 0;
-                                          Instruction* user = nullptr;
-                                          for (auto fwd_it = (inst_it + 1).base(); fwd_it != block.instructions.end(); ++fwd_it) {
-                                                Instruction* current_instr = fwd_it->get();
-                                                if (breaks_linear_flow(current_instr)) break;
-                                                for (const Operand& op : current_instr->operands) {
-                                                      if (op.isTemp() && op.tempId() == res.id()) {
-                                                            uses++;
-                                                            user = current_instr;
-                                                      }
-                                                }
-                                                if (uses > 1) break;
                                           }
-                                          if (uses == 1 && user && (user->opcode == aco_opcode::s_cbranch_scc0 || user->opcode == aco_opcode::s_cbranch_scc1))
-                                                ctx.assignments[res.id()].vcc = true;
-                                    }
-                              } else if (instr->isVOP2() && !instr->isVOP3()) {
-                                    if (instr->operands.size() == 3 && instr->operands[2].isTemp() &&
-                                          instr->operands[2].regClass().type() == RegType::sgpr)
-                                          ctx.assignments[instr->operands[2].tempId()].vcc = true;
-                                    if (instr->definitions.size() == 2)
-                                          ctx.assignments[instr->definitions[1].tempId()].vcc = true;
-                              } else if (instr->opcode == aco_opcode::s_sendmsg) {
-                                    ctx.assignments[instr->operands[0].tempId()].m0 = true;
-                              }
+                                          /* ---------- p_split_vector affinities ------------------- */
+                                          else if (instr->opcode == aco_opcode::p_split_vector &&
+                                                instr->operands[0].isFirstKillBeforeDef()) {
+                                                ctx.split_vectors[instr->operands[0].tempId()] = instr.get();
+                                                }
+                                                /* ---------- VOPC -> single SCC-branch  →  VCC hint ------- */
+                                                else if (instr->isVOPC() && !instr->isVOP3() &&
+                                                      (!instr->isSDWA() || ctx.program->gfx_level == GFX8) &&
+                                                      instr->definitions[0].isTemp())
+                                                {
+                                                      Temp res = instr->definitions[0].getTemp();
+                                                      int uses = 0;
+                                                      Instruction* user = nullptr;
 
-                              /* --- Propagate Phi-Related Affinities Backwards --- */
-                              auto tied_defs = get_tied_defs(instr.get());
-                              for (unsigned i = 0; i < instr->definitions.size(); i++) {
-                                    const Definition& def = instr->definitions[i];
-                                    if (!def.isTemp()) continue;
+                                                      for (auto fwd = inst_it.base(); fwd != block.instructions.end(); ++fwd) {
+                                                            if (breaks_linear_flow(fwd->get()))
+                                                                  break;                                   /* left linear region */
 
-                                    auto it = tmp_to_phi_set.find(def.tempId());
-                                    if (it == tmp_to_phi_set.end()) continue;
+                                                                  for (const Operand& o : (*fwd)->operands)
+                                                                        if (o.isTemp() && o.tempId() == res.id()) {
+                                                                              ++uses;
+                                                                              user = fwd->get();
+                                                                        }
+                                                                        if (uses > 1)
+                                                                              break;
+                                                      }
 
-                                    unsigned set_idx = it->second;
-                                    if (def.regClass() != phi_sets[set_idx][0].regClass()) continue;
+                                                      if (uses == 1 && user &&
+                                                            (user->opcode == aco_opcode::s_cbranch_scc0 ||
+                                                            user->opcode == aco_opcode::s_cbranch_scc1))
+                                                            ctx.assignments[res.id()].vcc = true;
+                                                }
+                                                /* ---------- VOP2 tied-SGPR / SCC result ------------------ */
+                                                else if (instr->isVOP2() && !instr->isVOP3()) {
+                                                      if (instr->operands.size() == 3 && instr->operands[2].isTemp() &&
+                                                            instr->operands[2].regClass().type() == RegType::sgpr)
+                                                            ctx.assignments[instr->operands[2].tempId()].vcc = true;
+                                                      if (instr->definitions.size() == 2)
+                                                            ctx.assignments[instr->definitions[1].tempId()].vcc = true;
+                                                }
+                                                /* ---------- s_and_b* writing SCC & reading EXEC ---------- */
+                                                else if ((instr->opcode == aco_opcode::s_and_b32 ||
+                                                      instr->opcode == aco_opcode::s_and_b64) &&
+                                                      !instr->definitions[1].isKill() &&
+                                                      instr->operands[0].isTemp() &&
+                                                      instr->operands[1].isFixed() &&
+                                                      instr->operands[1].physReg() == exec)
+                                                      ctx.assignments[instr->operands[0].tempId()].vcc = true;
 
-                                    phi_sets[set_idx][0] = def.getTemp();
+                                                /* ---------- sendmsg uses m0 ------------------------------ */
+                                                else if (instr->opcode == aco_opcode::s_sendmsg) {
+                                                      ctx.assignments[instr->operands[0].tempId()].m0 = true;
+                                                }
 
-                                    Operand op;
-                                    if (instr->opcode == aco_opcode::p_parallelcopy) {
-                                          op = instr->operands[i];
-                                    } else if (i < tied_defs.size()) {
-                                          op = instr->operands[tied_defs[i]];
-                                    } else if (vop3_can_use_vop2acc(ctx, instr.get())) {
-                                          op = instr->operands[2];
-                                    } else if (i == 0 && sop2_can_use_sopk(ctx, instr.get())) {
-                                          op = instr->operands[instr->operands[0].isLiteral() ? 1 : 0];
-                                    } else {
-                                          continue;
-                                    }
+                                                /* ---------- propagate phi-related affinities ------------- */
+                                                auto tied = get_tied_defs(instr.get());
+                                                for (unsigned i = 0; i < instr->definitions.size(); ++i) {
+                                                      const Definition& def = instr->definitions[i];
+                                                      if (!def.isTemp())
+                                                            continue;
 
-                                    if (op.isTemp() && op.isFirstKillBeforeDef() && def.regClass() == op.regClass()) {
-                                          phi_sets[set_idx].push_back(op.getTemp());
-                                          tmp_to_phi_set[op.tempId()] = set_idx;
-                                    }
-                              }
+                                                      auto it = tmp2set.find(def.tempId());
+                                                      if (it == tmp2set.end())
+                                                            continue;
+
+                                                      unsigned set_id = it->second;
+                                                      if (def.regClass() != phi_sets[set_id][0].regClass())
+                                                            continue;
+
+                                                      phi_sets[set_id][0] = def.getTemp();
+
+                                                      Operand src;
+                                                      if (instr->opcode == aco_opcode::p_parallelcopy)
+                                                            src = instr->operands[i];
+                                                      else if (i < tied.size())
+                                                            src = instr->operands[tied[i]];
+                                                      else if (vop3_can_use_vop2acc(ctx, instr.get()))
+                                                            src = instr->operands[2];
+                                                      else if (i == 0 && sop2_can_use_sopk(ctx, instr.get())) {
+                                                            /* sop2_can_use_sopk guarantees exactly one literal.
+                                                             * Pick the NON-literal operand. */
+                                                            src = instr->operands[instr->operands[0].isLiteral() ? 1 : 0];
+                                                      } else
+                                                            continue;
+
+                                                      if (src.isTemp() && src.isFirstKillBeforeDef() &&
+                                                            src.regClass() == def.regClass()) {
+                                                            phi_sets[set_id].push_back(src.getTemp());
+                                                      tmp2set[src.tempId()] = set_id;
+                                                            }
+                                                }
                         }
 
-                        /* 2. Process phi instructions for this block */
+                        /* ───────────────── 2. process phi instructions ───────────────── */
                         for (; inst_it != block.instructions.rend(); ++inst_it) {
                               aco_ptr<Instruction>& phi = *inst_it;
                               assert(is_phi(phi));
 
                               if (phi->definitions[0].isKill() || phi->definitions[0].isFixed())
                                     continue;
-                              assert(phi->definitions[0].isTemp());
 
-                              unsigned set_idx;
-                              auto it = tmp_to_phi_set.find(phi->definitions[0].tempId());
-                              if (it != tmp_to_phi_set.end()) {
-                                    set_idx = it->second;
-                                    phi_sets[set_idx][0] = phi->definitions[0].getTemp();
+                              unsigned set_id;
+                              auto it = tmp2set.find(phi->definitions[0].tempId());
+                              if (it == tmp2set.end()) {
+                                    set_id = phi_sets.size();
+                                    phi_sets.push_back({phi->definitions[0].getTemp()});
+                                    tmp2set.emplace(phi->definitions[0].tempId(), set_id);
                               } else {
-                                    set_idx = phi_sets.size();
-                                    phi_sets.emplace_back(std::vector<Temp>{phi->definitions[0].getTemp()});
-                                    tmp_to_phi_set[phi->definitions[0].tempId()] = set_idx;
+                                    set_id = it->second;
+                                    phi_sets[set_id][0] = phi->definitions[0].getTemp();
                               }
 
-                              for (const Operand& op : phi->operands) {
-                                    if (op.isTemp() && op.isKill() && op.regClass() == phi->definitions[0].regClass()) {
-                                          phi_sets[set_idx].push_back(op.getTemp());
-                                          if (!(block.kind & block_kind_loop_header))
-                                                tmp_to_phi_set[op.tempId()] = set_idx;
-                                    }
-                              }
-                              create_phi_vector_affinities(ctx, phi, vector_phis);
+                              for (const Operand& op : phi->operands)
+                                    if (op.isTemp() && op.isKill() &&
+                                          op.regClass() == phi->definitions[0].regClass()) {
+                                          phi_sets[set_id].push_back(op.getTemp());
+                                    if (!(block.kind & block_kind_loop_header))
+                                          tmp2set[op.tempId()] = set_id;
+                                          }
+
+                                          /* pass vector_phis as required */
+                                          create_phi_vector_affinities(ctx, phi, vector_phis);
                         }
 
-                        /* 3. Handle loop-exit placeholders for nested affinities */
+                        /* ───────────────── 3. loop-exit: header-phi placeholders ─────────── */
                         if (block.kind & block_kind_loop_exit) {
-                              auto header_it = blk_it;
-                              while ((header_it + 1) != ctx.program->blocks.rend() && (header_it + 1)->loop_nest_depth > block.loop_nest_depth)
-                                    ++header_it;
+                              auto header = blk_it;
+                              while ((header + 1) != ctx.program->blocks.rend() &&
+                                    (header + 1)->loop_nest_depth > block.loop_nest_depth)
+                                    ++header;
 
-                              for (aco_ptr<Instruction>& phi : header_it->instructions) {
-                                    if (!is_phi(phi) || phi->definitions[0].isKill() || phi->definitions[0].isFixed())
+                              for (aco_ptr<Instruction>& phi : header->instructions) {
+                                    if (!is_phi(phi))
+                                          break;
+                                    if (phi->definitions[0].isKill() || phi->definitions[0].isFixed())
+                                          continue;
+                                    if (tmp2set.count(phi->definitions[0].tempId()))
                                           continue;
 
-                                    if (tmp_to_phi_set.find(phi->definitions[0].tempId()) == tmp_to_phi_set.end()) {
-                                          unsigned set_idx = phi_sets.size();
-                                          tmp_to_phi_set[phi->definitions[0].tempId()] = set_idx;
-                                          phi_sets.emplace_back(std::vector<Temp>{phi->definitions[0].getTemp()});
-                                    }
+                                    unsigned id = phi_sets.size();
+                                    phi_sets.push_back({phi->definitions[0].getTemp()});
+                                    tmp2set[phi->definitions[0].tempId()] = id;
+
+                                    for (unsigned i = 1; i < phi->operands.size(); ++i)
+                                          if (phi->operands[i].isTemp() && phi->operands[i].isKill() &&
+                                                phi->operands[i].regClass() == phi->definitions[0].regClass())
+                                                tmp2set[phi->operands[i].tempId()] = id;
                               }
                         }
-                  }
+                       }
 
-                  /* 4. Finalize all collected affinities */
-                  for (const std::vector<Temp>& set : phi_sets) {
-                        Temp canonical = set[0];
-                        for (size_t i = 1; i < set.size(); ++i) {
-                              if (set[i].id() != canonical.id())
-                                    ctx.assignments[set[i].id()].affinity = canonical.id();
-                        }
-                  }
+                       /* ───────────────── 4. final affinity links ─────────────────── */
+                       for (const auto& vec : phi_sets)
+                             for (unsigned i = 1; i < vec.size(); ++i)
+                                   if (vec[i].id() != vec[0].id())
+                                         ctx.assignments[vec[i].id()].affinity = vec[0].id();
             }
 
             void
@@ -3396,44 +3443,38 @@ resolve_vector_operands(ra_ctx&                     ctx,
                   (void)ctx;
                   (void)reg_file;
 
-                  /*
-                   * GATE 1: Check if the instruction is eligible for folding.
-                   * The helper function sop2_can_use_sopk is already verified as correct
-                   * and rigorously enforces all ISA constraints.
-                   */
                   if (!sop2_can_use_sopk(ctx, instr.get()))
                         return;
 
                   /*
-                   * GATE 2: Extract information from the original SOP2 instruction.
+                   * GATE 1: Extract information from the original SOP2 instruction.
                    * The helper guarantees that operands[0] is the tied SGPR temporary
                    * and operands[1] is the literal.
                    */
                   const Operand& tied_op = instr->operands[0];
                   const Operand& lit_op  = instr->operands[1];
                   const uint16_t imm16   = static_cast<uint16_t>(lit_op.constantValue() & 0xFFFFu);
-                  const bool defines_scc = instr->definitions.size() > 1;
 
                   /*
-                   * GATE 3: Create the new SOPK instruction with the correct structure.
-                   * SOPK has 1 source operand and 1 or 2 definitions (dest + optional SCC).
+                   * GATE 2: Create the new SOPK instruction with the correct structure.
+                   * SOPK has 1 source operand and 1 primary destination. The SCC output
+                   * is an implicit property of the opcode.
                    */
-                  const unsigned def_count = defines_scc ? 2 : 1;
                   aco_ptr<Instruction> sopk{
-                        create_instruction(aco_opcode::s_nop, Format::SOPK, def_count, 1)};
+                        create_instruction(aco_opcode::s_nop, Format::SOPK, 1, 1)};
 
                         /*
-                         * GATE 4: Correctly set up the tied operand and definitions, preserving
-                         *         all flags from the original instruction.
+                         * GATE 3: Set up the tied operand and definition.
+                         * This is the most critical part. The Definition and Operand must be
+                         * consistent and all original flags must be preserved.
                          */
-                        for (unsigned i = 0; i < def_count; ++i) {
-                              sopk->definitions[i] = instr->definitions[i];
-                        }
+                        sopk->definitions[0] = instr->definitions[0];
 
                         sopk->operands[0] = tied_op;
 
                         /*
-                         * GATE 5: Set the immediate value and remap the opcode.
+                         * GATE 4: Set the immediate value and remap the opcode.
+                         * The new opcodes implicitly handle the SCC definition correctly.
                          */
                         sopk->salu().imm = imm16;
 
@@ -3453,7 +3494,7 @@ resolve_vector_operands(ra_ctx&                     ctx,
                         }
 
                         /*
-                         * GATE 6: Atomically replace the old instruction in the IR with the new one.
+                         * GATE 5: Atomically replace the old instruction in the IR.
                          */
                         instr = std::move(sopk);
             }
