@@ -25,6 +25,8 @@ namespace aco {
             struct ra_ctx;
             struct DefInfo;
 
+            void add_rename(ra_ctx& ctx, Temp orig_val, Temp new_val);
+
             unsigned get_subdword_operand_stride(amd_gfx_level gfx_level, const aco_ptr<Instruction>& instr,
                                                  unsigned idx, RegClass rc);
             void add_subdword_operand(ra_ctx& ctx, aco_ptr<Instruction>& instr, unsigned idx, unsigned byte,
@@ -941,221 +943,118 @@ namespace aco {
             }
 
             void
-            update_renames(ra_ctx&                     ctx,
-                           RegisterFile&               reg_file,
-                           std::vector<parallelcopy>&  parallelcopies,
-                           aco_ptr<Instruction>&       instr,
-                           bool                        fill_operands = false,
-                           bool                        clear_operands = true)
+            update_renames(ra_ctx& ctx, RegisterFile& reg_file,
+                           std::vector<parallelcopy>& parallelcopies,
+                           aco_ptr<Instruction>& instr, bool fill_operands = false, bool clear_operands = true)
             {
-                  using TempId = unsigned;
+                  if (parallelcopies.empty())
+                        return;
 
-                  struct OperandInfo {
-                        Operand* ptr;
-                        unsigned idx;
-                  };
-
-                  auto rf_clear_if_needed = [&](const parallelcopy& pc) {
-                        if (!pc.def.isTemp() && pc.copy_kill < 0)
-                              reg_file.clear(pc.op);
-                  };
-
-                  auto rf_fill_if_needed = [&](const Definition& def, bool do_fill) {
-                        if (do_fill)
-                              reg_file.fill(def);
-                  };
-
-                  auto fix_kill_flags = [](std::vector<OperandInfo>& list,
-                                           std::bitset<2>&           first_seen,
-                                           bool                      kill_val,
-                                           bool                      omit_renaming)
-                  {
-                        for (OperandInfo& info : list) {
-                              Operand& op = *info.ptr;
-                              if (first_seen[omit_renaming]) {
-                                    op.setFirstKill(kill_val);
-                                    first_seen.set(omit_renaming, false);
-                              } else
-                                    op.setKill(kill_val);
+                  /* Phase 1: Clear non-copy-kill source operands from the register file. */
+                  if (clear_operands) {
+                        for (const parallelcopy& copy : parallelcopies) {
+                              if (copy.def.isTemp() || copy.copy_kill >= 0)
+                                    continue;
+                              reg_file.clear(copy.op);
                         }
-                  };
-
-                  /* ------------------------------------------------------------------ *
-                   *  1. Early register-file cleanup                                    *
-                   * ------------------------------------------------------------------ */
-                  if (clear_operands)
-                        for (const parallelcopy& pc : parallelcopies)
-                              rf_clear_if_needed(pc);
-
-                  /* ------------------------------------------------------------------ *
-                   *  2. Build fast lookup tables                                       *
-                   * ------------------------------------------------------------------ */
-                  std::unordered_map<TempId, Definition*>                     def_of;
-                  std::unordered_map<TempId, std::vector<OperandInfo>>        uses_of;
-                  std::unordered_map<TempId, vector_operand*>                 vec_of;
-
-                  /* defs ------------------------------------------------------------- */
-                  for (Definition& def : instr->definitions)
-                        if (def.isTemp())
-                              def_of.emplace(def.tempId(), &def);
-
-                  /* operands --------------------------------------------------------- */
-                  for (unsigned i = 0; i < instr->operands.size(); ++i) {
-                        Operand& op = instr->operands[i];
-                        if (op.isTemp())
-                              uses_of[op.tempId()].push_back({&op, i});
                   }
 
-                  /* vector operands -------------------------------------------------- */
-                  for (vector_operand& vec : ctx.vector_operands)
-                        if (vec.def.isTemp())
-                              vec_of.emplace(vec.def.tempId(), &vec);
-
-                  /* ------------------------------------------------------------------ *
-                   *  3. Main single-pass processing                                   *
-                   * ------------------------------------------------------------------ */
-                  for (auto it = parallelcopies.begin(); it != parallelcopies.end();)
-                  {
-                        parallelcopy& pc          = *it;
-
-                        /* 3.a  Ignore copies that define a tmp produced by this instr --- */
-                        if (pc.def.isTemp()) { ++it; continue; }
-
-                        const bool     is_copy_kill = pc.copy_kill >= 0;
-                        const TempId   src_id       = pc.op.getTemp().id();
-                        const PhysReg  dst_reg      = pc.def.physReg();
-
-                        /* ----------------------------------------------------------------
-                         * Case 1 : the temp is one of the instruction’s definitions
-                         * ---------------------------------------------------------------- */
-                        if (!is_copy_kill) {
-                              if (auto it_def = def_of.find(src_id); it_def != def_of.end()) {
-                                    Definition& def = *it_def->second;
-
-                                    /* move the definition */
-                                    def.setFixed(dst_reg);
-                                    reg_file.fill(def);
-                                    ctx.assignments[def.tempId()].reg = dst_reg;
-
-                                    it = parallelcopies.erase(it);
-                                    continue;
-                              }
-                        }
-
-                        /* ----------------------------------------------------------------
-                         * Case 2 : the temp is a vector operand
-                         * ---------------------------------------------------------------- */
-                        if (auto it_vec = vec_of.find(src_id); it_vec != vec_of.end()) {
-                              vector_operand& vec = *it_vec->second;
-
-                              vec.def.setFixed(dst_reg);
-                              reg_file.fill(vec.def);
-                              ctx.assignments[vec.def.tempId()].reg = dst_reg;
-
-                              it = parallelcopies.erase(it);
+                  /* Phase 2: Coalesce moves where possible and allocate new temporaries for the rest. */
+                  for (auto it = parallelcopies.begin(); it != parallelcopies.end();) {
+                        if (it->def.isTemp()) {
+                              ++it;
                               continue;
                         }
 
-                        /* ----------------------------------------------------------------
-                         * Case 3 : the temp is defined by another parallelcopy
-                         * ---------------------------------------------------------------- */
-                        parallelcopy* other_pc = nullptr;
-                        if (!is_copy_kill) { /* copy-kill copies can't be coalesced this way */
-                              for (parallelcopy& candidate : parallelcopies) {
-                                    if (candidate.def.isTemp() && candidate.def.getTemp().id() == src_id) {
-                                          other_pc = &candidate;
+                        bool is_copy_kill = it->copy_kill >= 0;
+                        bool coalesced = false;
+
+                        /* Attempt to coalesce with instruction definitions (not possible for copy-kill). */
+                        if (!is_copy_kill) {
+                              for (Definition& def : instr->definitions) {
+                                    if (def.isTemp() && def.getTemp() == it->op.getTemp()) {
+                                          def.setFixed(it->def.physReg());
+                                          reg_file.fill(def);
+                                          ctx.assignments[def.tempId()].reg = def.physReg();
+                                          it = parallelcopies.erase(it);
+                                          coalesced = true;
                                           break;
                                     }
                               }
+                              if (coalesced) continue;
                         }
 
-                        if (other_pc) {
-                              parallelcopy& other = *other_pc;
+                        /* Attempt to coalesce with vector operand definitions. */
+                        for (vector_operand& vec : ctx.vector_operands) {
+                              if (vec.def.getTemp() == it->op.getTemp()) {
+                                    vec.def.setFixed(it->def.physReg());
+                                    reg_file.fill(vec.def);
+                                    ctx.assignments[vec.def.tempId()].reg = vec.def.physReg();
+                                    it = parallelcopies.erase(it);
+                                    coalesced = true;
+                                    break;
+                              }
+                        }
+                        if (coalesced) continue;
 
-                              /* normal copy: move the definition to dst_reg */
-                              other.def.setFixed(dst_reg);
-                              ctx.assignments[other.def.tempId()].reg = dst_reg;
-
-                              /* rename operands that reference the other.def temp */
-                              bool fill = true;
-                              if (auto it_uses = uses_of.find(other.def.tempId()); it_uses != uses_of.end()) {
-                                    std::bitset<2> first_seen(3); // Fixed: both bits set to true
-
-                                    for (OperandInfo& info : it_uses->second) {
-                                          Operand& op = *info.ptr;
-
-                                          /* only rename pre-coloured if reg matches */
-                                          bool omit_rename = op.isPrecolored() && op.physReg() != dst_reg;
-
-                                          /* If we omit renaming the operand is considered killed   */
-                                          bool kill = op.isKill() || omit_rename;
-
-                                          fix_kill_flags(it_uses->second, first_seen, kill, omit_rename);
-
-                                          if (omit_rename)
-                                                continue;
-
-                                          op.setTemp(other.def.getTemp());
-                                          if (op.isFixed())
-                                                op.setFixed(dst_reg);
-
-                                          bool rf_before = op.isPrecolored();
-                                          fill = !op.isKillBeforeDef() || rf_before || fill_operands;
+                        /* Attempt to coalesce with other parallelcopy definitions. */
+                        for (parallelcopy& other : parallelcopies) {
+                              if (other.def.isTemp() && it->op.getTemp() == other.def.getTemp()) {
+                                    if (is_copy_kill) {
+                                          it->op = other.op;
+                                    } else {
+                                          other.def.setFixed(it->def.physReg());
+                                          ctx.assignments[other.def.tempId()].reg = other.def.physReg();
+                                          it = parallelcopies.erase(it);
+                                          coalesced = true;
                                     }
+                                    break;
                               }
-                              rf_fill_if_needed(other.def, fill);
-
-                              /* remove *this* parallelcopy */
-                              it = parallelcopies.erase(it);
-                              continue;
                         }
+                        if (coalesced) continue;
 
-
-                        /* ----------------------------------------------------------------
-                         * Case 4 : fall-back – need fresh temporary + operand renaming
-                         * ---------------------------------------------------------------- */
-                        pc.def.setTemp(ctx.program->allocateTmp(pc.def.regClass()));
-                        ctx.assignments.emplace_back(dst_reg, pc.def.regClass());
+                        /* If no coalescing was possible, allocate a new temporary. */
+                        it->def.setTemp(ctx.program->allocateTmp(it->def.regClass()));
+                        ctx.assignments.emplace_back(it->def.physReg(), it->def.regClass());
                         assert(ctx.assignments.size() == ctx.program->peekAllocationId());
+                        ++it;
+                  }
 
-                        /* Determine the “representative” operand (copy_op) -------------- */
-                        const Operand& copy_op =
-                        is_copy_kill ? instr->operands[pc.copy_kill] : pc.op;
+                  /* Phase 3: Rename all instruction operands based on the final set of parallelcopies. */
+                  for (const parallelcopy& copy : parallelcopies) {
+                        if (!copy.def.isTemp())
+                              continue;
 
-                        bool fill          = !is_copy_kill;
-                        std::bitset<2> first_seen(3); // Fixed: both bits set to true
+                        Temp new_temp = copy.def.getTemp();
+                        Temp old_temp = copy.op.getTemp();
+                        bool fill_reg = (copy.copy_kill < 0);
 
-                        if (auto it_use = uses_of.find(copy_op.tempId()); it_use != uses_of.end()) {
-                              for (OperandInfo& info : it_use->second) {
-                                    Operand& op  = *info.ptr;
-                                    const bool is_this_kill_idx = is_copy_kill && info.idx == static_cast<unsigned>(pc.copy_kill);
+                        for (unsigned i = 0; i < instr->operands.size(); ++i) {
+                              Operand& op = instr->operands[i];
+                              if (!op.isTemp() || op.tempId() != old_temp.id())
+                                    continue;
 
-                                    bool omit_rename = op.isPrecolored() && op.physReg() != dst_reg;
-                                    omit_rename     |= is_copy_kill && !is_this_kill_idx;
+                              bool is_the_copy_kill_operand = (copy.copy_kill >= 0 && (unsigned)copy.copy_kill == i);
+                              if (copy.copy_kill >= 0 && !is_the_copy_kill_operand)
+                                    continue;
 
-                                    /* kill logic mirrors original code ------------------------ */
-                                    bool kill =
-                                    op.isKill() ||
-                                    ( omit_rename && !is_copy_kill) ||
-                                    (!omit_rename &&  is_copy_kill);
+                              op.setTemp(new_temp);
+                              if (op.isFixed())
+                                    op.setFixed(copy.def.physReg());
 
-                                    fix_kill_flags(it_use->second, first_seen, kill, omit_rename);
-
-                                    if (omit_rename)
-                                          continue;
-
-                                    op.setTemp(pc.def.getTemp());
-                                    if (op.isFixed())
-                                          op.setFixed(dst_reg);
-
-                                    assert(!op.isPrecolored() || fill_operands);
-                                    assert(!is_copy_kill || fill_operands);
-                                    fill = !op.isKillBeforeDef() || fill_operands;
-                              }
+                              if (!op.isKillBeforeDef())
+                                    fill_reg = true;
                         }
 
-                        rf_fill_if_needed(pc.def, fill);
-                        ++it;
+                        if (fill_reg || fill_operands)
+                              reg_file.fill(copy.def);
+
+                        /* For normal copies, update the global SSA renaming state. */
+                        if (copy.copy_kill < 0) {
+                              auto orig_it = ctx.orig_names.find(old_temp.id());
+                              Temp orig = (orig_it != ctx.orig_names.end()) ? orig_it->second : old_temp;
+                              add_rename(ctx, orig, new_temp);
+                        }
                   }
             }
 
@@ -3532,22 +3431,17 @@ resolve_vector_operands(ra_ctx&                     ctx,
                   instr->format = Format::SOPK;
                   instr->salu().imm = instr->operands[lit_idx].constantValue() & 0xffff;
 
-                  /* Re-order operands to match the SOPK format: dst, src0 (temp).
-                   * The literal operand is encoded in the immediate field and is removed. */
-                  if (lit_idx == 0) {
-                        // s_cselect_b32 is non-commutative and already handled in sop2_can_use_sopk.
-                        // For other ops, swap to get the literal into the second source position.
+                  /* For commutative opcodes, ensure the temp is in operand[0]. s_cselect is handled by sop2_can_use_sopk. */
+                  if (lit_idx == 0 && instr->opcode != aco_opcode::s_cselect_b32) {
                         std::swap(instr->operands[0], instr->operands[1]);
                   }
 
-                  // After the potential swap, the literal is now at index 1. Pop it.
-                  // The temp is now correctly at index 0.
-                  if (instr->operands.size() > 1)
-                        instr->operands.pop_back();
+                  // The temp is now at index 0. Pop the literal at index 1.
+                  instr->operands.pop_back();
 
                   /* Remap the opcode to its SOPK variant. */
                   switch (instr->opcode) {
-                        case aco_opcode::s_add_u32: // falls through
+                        case aco_opcode::s_add_u32:
                         case aco_opcode::s_add_i32:
                               instr->opcode = aco_opcode::s_addk_i32;
                               break;
