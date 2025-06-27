@@ -1137,8 +1137,8 @@
 
 
 --- a/src/amd/compiler/aco_register_allocation.cpp	2025-05-30 14:11:47.937806865 +0200
-+++ b/src/amd/compiler/aco_register_allocation.cpp	2025-05-30 16:23:37.312701919 +0200
-@@ -15,3747 +15,4164 @@
++++ b/src/amd/compiler/aco_register_allocation.cpp	2025-06-27 16:23:37.312701919 +0200
+@@ -15,3747 +15,4207 @@
  #include <map>
  #include <optional>
  #include <vector>
@@ -1312,7 +1312,8 @@
 -
 -   /* Inclusive lower bound */
 -   PhysReg lo() const { return lo_; }
-+            void add_rename(ra_ctx& ctx, Temp orig_val, Temp new_val);
++            static constexpr uint32_t RF_SLOT_BLOCKED  = 0xFFFFFFFFu; /* permanently reserved */
++            static constexpr uint32_t RF_SLOT_SUBDWORD = 0xF0000000u; /* “contains sub-dword” */
  
 -   /* Exclusive upper bound */
 -   PhysReg hi() const { return PhysReg{lo() + size}; }
@@ -1322,8 +1323,8 @@
 -      lo_ = PhysReg{lo_.reg() + stride};
 -      return *this;
 -   }
--
--   bool operator!=(const PhysRegInterval& oth) const { return lo_ != oth.lo_ || size != oth.size; }
++            void add_rename(ra_ctx& ctx, Temp orig_val, Temp new_val);
++
 +            unsigned get_subdword_operand_stride(amd_gfx_level gfx_level, const aco_ptr<Instruction>& instr,
 +                                                 unsigned idx, RegClass rc);
 +            void add_subdword_operand(ra_ctx& ctx, aco_ptr<Instruction>& instr, unsigned idx, unsigned byte,
@@ -1549,8 +1550,7 @@
 +                  return a.hi() > b.lo() && b.hi() > a.lo();
 +            }
  
--   /* Construct a half-open interval, excluding the end register */
--   static PhysRegInterval from_until(PhysReg first, PhysReg end) { return {first, end - first}; }
+-   bool operator!=(const PhysRegInterval& oth) const { return lo_ != oth.lo_ || size != oth.size; }
 +            /* Gets the stride for full (non-subdword) registers */
 +            uint32_t
 +            get_stride(RegClass rc)
@@ -1569,7 +1569,8 @@
 +                  }
 +            }
  
--   bool contains(PhysReg reg) const { return lo() <= reg && reg < hi(); }
+-   /* Construct a half-open interval, excluding the end register */
+-   static PhysRegInterval from_until(PhysReg first, PhysReg end) { return {first, end - first}; }
 +            PhysRegInterval
 +            get_reg_bounds(ra_ctx& ctx, RegType type, bool linear_vgpr)
 +            {
@@ -1586,17 +1587,17 @@
 +                  }
 +            }
  
--   bool contains(const PhysRegInterval& needle) const
--   {
--      return needle.lo() >= lo() && needle.hi() <= hi();
--   }
+-   bool contains(PhysReg reg) const { return lo() <= reg && reg < hi(); }
 +            PhysRegInterval
 +            get_reg_bounds(ra_ctx& ctx, RegClass rc)
 +            {
 +                  return get_reg_bounds(ctx, rc.type(), rc.is_linear_vgpr());
 +            }
  
--   PhysRegIterator begin() const { return {lo_}; }
+-   bool contains(const PhysRegInterval& needle) const
+-   {
+-      return needle.lo() >= lo() && needle.hi() <= hi();
+-   }
 +            struct DefInfo {
 +                  PhysRegInterval bounds;
 +                  uint8_t size;
@@ -1675,42 +1676,47 @@
 +                  }
 +
 +                  /* Returns true if any of the bytes in the given range are allocated or blocked */
-+                  bool test(PhysReg start, unsigned num_bytes) const
++                  bool
++                  test(PhysReg start, unsigned bytes) const
 +                  {
-+                        if (LIKELY(num_bytes == 0))
++                        if (!bytes)
 +                              return false;
 +
 +                        const unsigned first_dw = start.reg();
-+                        const unsigned last_byte_idx = start.reg_b + num_bytes - 1;
-+                        const unsigned last_dw  = last_byte_idx / 4;
++                        const unsigned start_byte_abs = start.reg_b;
++
++                        const unsigned last_byte_abs = start_byte_abs + bytes - 1;
++                        const unsigned last_dw = last_byte_abs / 4;
 +
 +                        for (unsigned dw = first_dw; dw <= last_dw; ++dw) {
-+                              PhysReg reg_dw{dw};                         /* byte == 0             */
-+                              const uint32_t slot_val = regs[reg_dw];
++                              const uint32_t slot = regs[dw];
 +
-+                              /* Fast path – anything but “free or sub-dword” sets the bit.        */
-+                              if (slot_val & 0x0FFFFFFFu)
++                              /* Fast path for empty or fully blocked DWORDs */
++                              if (slot == 0u || slot == RF_SLOT_BLOCKED)
++                                    continue;
++
++                              /* Fast path for fully occupied DWORD */
++                              if (slot != RF_SLOT_SUBDWORD)
 +                                    return true;
 +
-+                              /* Sub-dword allocation: check the relevant bytes only.              */
-+                              if (slot_val == 0xF0000000u) {
-+                                    auto it = subdword_regs.find(reg_dw);
-+                                    if (it == subdword_regs.end())
-+                                          continue;                             /* stale marker – ignore */
++                              /* Sub-dword path: must perform precise byte-level check */
++                              auto it = subdword_regs.find(dw);
++                              if (it == subdword_regs.end())
++                                    continue; /* Stale marker, treat as empty */
 +
-+                                          const std::array<uint32_t, 4>& sub = it->second;
++                                    const std::array<uint32_t, 4>& sub = it->second;
 +
-+                                    const unsigned lo_byte =
-+                                    (dw == first_dw) ? start.byte() : 0u;
-+                                    const unsigned hi_byte =
-+                                    (dw == last_dw)  ? (last_byte_idx & 3u) : 3u;
++                              /* Determine which bytes of *this specific DWORD* we need to check */
++                              const unsigned lo_byte_in_dw = (dw == first_dw) ? start.byte() : 0u;
++                              const unsigned hi_byte_in_dw = (dw == last_dw) ? (last_byte_abs & 3u) : 3u;
 +
-+                                    for (unsigned b = lo_byte; b <= hi_byte; ++b)
-+                                          if (sub[b])
-+                                                return true;
++                              for (unsigned b = lo_byte_in_dw; b <= hi_byte_in_dw; ++b) {
++                                    if (sub[b])
++                                          return true; /* Found a conflict */
 +                              }
 +                        }
-+                        return false;
++
++                        return false; /* No conflicts found, the interval is free */
 +                  }
 +
 +                  void block(PhysReg start, RegClass rc)
@@ -1877,8 +1883,7 @@
 +                  }
 +            }
  
--   PhysRegIterator end() const { return {PhysReg{lo_ + size}}; }
--};
+-   PhysRegIterator begin() const { return {lo_}; }
 +            /* helper function for debugging */
 +            UNUSED void
 +            print_regs(ra_ctx& ctx, PhysRegInterval regs, const RegisterFile& reg_file)
@@ -1953,11 +1958,8 @@
 +                  }
 +            }
  
--bool
--intersects(const PhysRegInterval& a, const PhysRegInterval& b)
--{
--   return a.hi() > b.lo() && b.hi() > a.lo();
--}
+-   PhysRegIterator end() const { return {PhysReg{lo_ + size}}; }
+-};
 +            bool
 +            is_sgpr_writable_without_side_effects(amd_gfx_level gfx_level, PhysReg reg)
 +            {
@@ -1969,22 +1971,10 @@
 +                  (!has_flat_scr_lo_gfx7_or_xnack_mask || (reg.reg() != 104 && reg.reg() != 105));
 +            }
  
--/* Gets the stride for full (non-subdword) registers */
--uint32_t
--get_stride(RegClass rc)
+-bool
+-intersects(const PhysRegInterval& a, const PhysRegInterval& b)
 -{
--   if (rc.type() == RegType::vgpr) {
--      return 1;
--   } else {
--      uint32_t size = rc.size();
--      if (size == 2) {
--         return 2;
--      } else if (size >= 4 && util_is_power_of_two_or_zero(size)) {
--         return 4;
--      } else {
--         return 1;
--      }
--   }
+-   return a.hi() > b.lo() && b.hi() > a.lo();
 -}
 +            unsigned
 +            get_subdword_operand_stride(amd_gfx_level gfx_level, const aco_ptr<Instruction>& instr,
@@ -2026,16 +2016,21 @@
 +                  }
 +            }
  
--PhysRegInterval
--get_reg_bounds(ra_ctx& ctx, RegType type, bool linear_vgpr)
+-/* Gets the stride for full (non-subdword) registers */
+-uint32_t
+-get_stride(RegClass rc)
 -{
--   uint16_t linear_vgpr_start = ctx.vgpr_bounds - ctx.num_linear_vgprs;
--   if (type == RegType::vgpr && linear_vgpr) {
--      return PhysRegInterval{PhysReg(256 + linear_vgpr_start), ctx.num_linear_vgprs};
--   } else if (type == RegType::vgpr) {
--      return PhysRegInterval{PhysReg(256), linear_vgpr_start};
+-   if (rc.type() == RegType::vgpr) {
+-      return 1;
 -   } else {
--      return PhysRegInterval{PhysReg(0), ctx.sgpr_bounds};
+-      uint32_t size = rc.size();
+-      if (size == 2) {
+-         return 2;
+-      } else if (size >= 4 && util_is_power_of_two_or_zero(size)) {
+-         return 4;
+-      } else {
+-         return 1;
+-      }
 -   }
 -}
 +            void
@@ -2106,9 +2101,16 @@
 +            }
  
 -PhysRegInterval
--get_reg_bounds(ra_ctx& ctx, RegClass rc)
+-get_reg_bounds(ra_ctx& ctx, RegType type, bool linear_vgpr)
 -{
--   return get_reg_bounds(ctx, rc.type(), rc.is_linear_vgpr());
+-   uint16_t linear_vgpr_start = ctx.vgpr_bounds - ctx.num_linear_vgprs;
+-   if (type == RegType::vgpr && linear_vgpr) {
+-      return PhysRegInterval{PhysReg(256 + linear_vgpr_start), ctx.num_linear_vgprs};
+-   } else if (type == RegType::vgpr) {
+-      return PhysRegInterval{PhysReg(256), linear_vgpr_start};
+-   } else {
+-      return PhysRegInterval{PhysReg(0), ctx.sgpr_bounds};
+-   }
 -}
 +            void
 +            DefInfo::get_subdword_definition_info(Program* program, const aco_ptr<Instruction>& instr)
@@ -2195,14 +2197,11 @@
 +                  }
 +            }
  
--struct DefInfo {
--   PhysRegInterval bounds;
--   uint8_t size;
--   uint8_t stride;
--   /* Even if stride=4, we might be able to write to the high half instead without preserving the
--    * low half. In that case, data_stride=2. */
--   uint8_t data_stride;
--   RegClass rc;
+-PhysRegInterval
+-get_reg_bounds(ra_ctx& ctx, RegClass rc)
+-{
+-   return get_reg_bounds(ctx, rc.type(), rc.is_linear_vgpr());
+-}
 +            void
 +            add_subdword_definition(Program* program, aco_ptr<Instruction>& instr, PhysReg reg,
 +                                    bool allow_16bit_write)
@@ -2280,6 +2279,30 @@
 +                        unreachable("Something went wrong: Impossible register assignment.");
 +            }
  
+-struct DefInfo {
+-   PhysRegInterval bounds;
+-   uint8_t size;
+-   uint8_t stride;
+-   /* Even if stride=4, we might be able to write to the high half instead without preserving the
+-    * low half. In that case, data_stride=2. */
+-   uint8_t data_stride;
+-   RegClass rc;
++            void
++            adjust_max_used_regs(ra_ctx& ctx, RegClass rc, unsigned reg)
++            {
++                  uint16_t max_addressible_sgpr = ctx.limit.sgpr;
++                  unsigned size = rc.size();
++                  if (rc.type() == RegType::vgpr) {
++                        assert(reg >= 256);
++                        uint16_t hi = reg - 256 + size - 1;
++                        assert(hi <= 255);
++                        ctx.max_used_vgpr = std::max(ctx.max_used_vgpr, hi);
++                  } else if (reg + rc.size() <= max_addressible_sgpr) {
++                        uint16_t hi = reg + size - 1;
++                        ctx.max_used_sgpr = std::max(ctx.max_used_sgpr, std::min(hi, max_addressible_sgpr));
++                  }
++            }
+ 
 -   DefInfo(ra_ctx& ctx, aco_ptr<Instruction>& instr, RegClass rc_, int operand) : rc(rc_)
 -   {
 -      size = rc.size();
@@ -2315,25 +2338,6 @@
 -            bounds.size = vcc - bounds.lo();
 -      }
 +            void
-+            adjust_max_used_regs(ra_ctx& ctx, RegClass rc, unsigned reg)
-+            {
-+                  uint16_t max_addressible_sgpr = ctx.limit.sgpr;
-+                  unsigned size = rc.size();
-+                  if (rc.type() == RegType::vgpr) {
-+                        assert(reg >= 256);
-+                        uint16_t hi = reg - 256 + size - 1;
-+                        assert(hi <= 255);
-+                        ctx.max_used_vgpr = std::max(ctx.max_used_vgpr, hi);
-+                  } else if (reg + rc.size() <= max_addressible_sgpr) {
-+                        uint16_t hi = reg + size - 1;
-+                        ctx.max_used_sgpr = std::max(ctx.max_used_sgpr, std::min(hi, max_addressible_sgpr));
-+                  }
-+            }
- 
--      if (!data_stride)
--         data_stride = rc.is_subdword() ? stride : (stride * 4);
--   }
-+            void
 +            update_renames(ra_ctx& ctx, RegisterFile& reg_file,
 +                           std::vector<parallelcopy>& parallelcopies,
 +                           aco_ptr<Instruction>& instr, bool fill_operands = false, bool clear_operands = true)
@@ -2350,7 +2354,8 @@
 +                        }
 +                  }
 +
-+                  /* Phase 2: Coalesce moves where possible and allocate new temporaries for the rest. */
++                  /* Phase 2: Coalesce moves and allocate new temporaries. This loop is now
++                   *          dependency-aware. */
 +                  for (auto it = parallelcopies.begin(); it != parallelcopies.end();) {
 +                        if (it->def.isTemp()) {
 +                              ++it;
@@ -2360,7 +2365,7 @@
 +                        bool is_copy_kill = it->copy_kill >= 0;
 +                        bool coalesced = false;
 +
-+                        /* Attempt to coalesce with instruction definitions (not possible for copy-kill). */
++                        /* Coalesce with instruction definitions (not possible for copy-kill). */
 +                        if (!is_copy_kill) {
 +                              for (Definition& def : instr->definitions) {
 +                                    if (def.isTemp() && def.getTemp() == it->op.getTemp()) {
@@ -2375,7 +2380,7 @@
 +                              if (coalesced) continue;
 +                        }
 +
-+                        /* Attempt to coalesce with vector operand definitions. */
++                        /* Coalesce with vector operands */
 +                        for (vector_operand& vec : ctx.vector_operands) {
 +                              if (vec.def.getTemp() == it->op.getTemp()) {
 +                                    vec.def.setFixed(it->def.physReg());
@@ -2388,26 +2393,34 @@
 +                        }
 +                        if (coalesced) continue;
 +
-+                        /* Attempt to coalesce with other parallelcopy definitions. */
-+                        for (parallelcopy& other : parallelcopies) {
-+                              if (other.def.isTemp() && it->op.getTemp() == other.def.getTemp()) {
-+                                    if (is_copy_kill) {
-+                                          it->op = other.op;
-+                                    } else {
-+                                          other.def.setFixed(it->def.physReg());
-+                                          ctx.assignments[other.def.tempId()].reg = other.def.physReg();
-+                                          it = parallelcopies.erase(it);
-+                                          coalesced = true;
-+                                    }
++                        bool source_is_also_a_dest = false;
++                        for (const auto& pc_check : parallelcopies) {
++                              if (&pc_check != &(*it) && pc_check.def.physReg() == it->op.physReg()) {
++                                    source_is_also_a_dest = true;
 +                                    break;
 +                              }
 +                        }
-+                        if (coalesced) continue;
++
++                        if (!source_is_also_a_dest) {
++                              for (parallelcopy& other : parallelcopies) {
++                                    if (other.def.isTemp() && it->op.getTemp() == other.def.getTemp()) {
++                                          if (is_copy_kill) {
++                                                it->op = other.op;
++                                          } else {
++                                                other.def.setFixed(it->def.physReg());
++                                                ctx.assignments[other.def.tempId()].reg = other.def.physReg();
++                                                it = parallelcopies.erase(it);
++                                                coalesced = true;
++                                          }
++                                          break;
++                                    }
++                              }
++                              if (coalesced) continue;
++                        }
 +
 +                        /* If no coalescing was possible, allocate a new temporary. */
 +                        it->def.setTemp(ctx.program->allocateTmp(it->def.regClass()));
 +                        ctx.assignments.emplace_back(it->def.physReg(), it->def.regClass());
-+                        assert(ctx.assignments.size() == ctx.program->peekAllocationId());
 +                        ++it;
 +                  }
 +
@@ -2440,7 +2453,6 @@
 +                        if (fill_reg || fill_operands)
 +                              reg_file.fill(copy.def);
 +
-+                        /* For normal copies, update the global SSA renaming state. */
 +                        if (copy.copy_kill < 0) {
 +                              auto orig_it = ctx.orig_names.find(old_temp.id());
 +                              Temp orig = (orig_it != ctx.orig_names.end()) ? orig_it->second : old_temp;
@@ -2449,9 +2461,9 @@
 +                  }
 +            }
  
--private:
--   void get_subdword_definition_info(Program* program, const aco_ptr<Instruction>& instr);
--};
+-      if (!data_stride)
+-         data_stride = rc.is_subdword() ? stride : (stride * 4);
+-   }
 +            std::optional<PhysReg>
 +            get_reg_simple(ra_ctx& ctx, const RegisterFile& reg_file, DefInfo info)
 +            {
@@ -2542,61 +2554,53 @@
 +                             }
 +                       }
  
--class RegisterFile {
--public:
--   RegisterFile() { regs.fill(0); }
+-private:
+-   void get_subdword_definition_info(Program* program, const aco_ptr<Instruction>& instr);
+-};
 +                       return {};
 +            }
  
--   std::array<uint32_t, 512> regs;
--   std::map<uint32_t, std::array<uint32_t, 4>> subdword_regs;
-+            std::vector<unsigned> find_vars(ra_ctx& ctx, const RegisterFile& reg_file,
-+                                            const PhysRegInterval reg_interval)
+-class RegisterFile {
+-public:
+-   RegisterFile() { regs.fill(0); }
++            std::vector<unsigned>
++            find_vars(ra_ctx& ctx, const RegisterFile& reg_file, const PhysRegInterval interval)
 +            {
++                  (void)ctx;
++
 +                  std::vector<unsigned> vars;
-+                  if (UNLIKELY(reg_interval.size == 0))
-+                        return vars;
++                  vars.reserve(16);
 +
-+                  vars.reserve(
-+                        std::max(static_cast<size_t>(16),
-+                                 static_cast<size_t>(reg_interval.size) * 2)
-+                  );
++                  std::unordered_set<unsigned> seen;
++                  seen.reserve(16);
 +
-+                  unsigned last_added_id = 0;
++                  for (PhysReg reg_dw : interval) {
++                        const uint32_t slot_val = reg_file.regs[reg_dw.reg()];
 +
-+                  for (PhysReg reg_iter_dw : reg_interval) {
-+                        uint32_t dword_val = reg_file.regs[reg_iter_dw.reg()];
-+
-+                        if (dword_val == 0xFFFFFFFF)
++                        if (slot_val == 0u || slot_val == RF_SLOT_BLOCKED)
 +                              continue;
 +
-+                        if (dword_val == 0xF0000000) {
-+                              auto it = reg_file.subdword_regs.find(reg_iter_dw.reg());
-+                              assert(it != reg_file.subdword_regs.end() && "Subdword container marked but no entry in map");
-+                              if (LIKELY(it != reg_file.subdword_regs.end())) {
-+                                    const std::array<uint32_t, 4>& sub_array = it->second;
-+                                    for (unsigned k = 0; k < 4; ++k) {
-+                                          uint32_t id = sub_array[k];
-+                                          if (id != 0 && id != 0xFFFFFFFF) {
-+                                                if (id != last_added_id) {
-+                                                      vars.push_back(id);
-+                                                      last_added_id = id;
-+                                                }
-+                                          } else if (id == 0) {
-+                                                last_added_id = 0;
-+                                          }
-+                                    }
++                        if (slot_val != RF_SLOT_SUBDWORD) {
++                              if (seen.insert(slot_val).second)
++                                    vars.push_back(slot_val);
++                              continue;
++                        }
++
++                        auto it = reg_file.subdword_regs.find(reg_dw.reg());
++                        if (it == reg_file.subdword_regs.end())
++                              continue;
++
++                        const std::array<uint32_t, 4>& sub = it->second;
++                        for (uint32_t id : sub) {
++                              if (id && id != RF_SLOT_BLOCKED) {
++                                    if (seen.insert(id).second)
++                                          vars.push_back(id);
 +                              }
-+                        } else if (dword_val != 0) {
-+                              unsigned id = dword_val;
-+                              if (id != last_added_id) {
-+                                    vars.push_back(id);
-+                                    last_added_id = id;
-+                              }
-+                        } else {
-+                              last_added_id = 0;
 +                        }
 +                  }
+ 
+-   std::array<uint32_t, 512> regs;
+-   std::map<uint32_t, std::array<uint32_t, 4>> subdword_regs;
 +                  return vars;
 +            }
  
@@ -2859,7 +2863,7 @@
 -      else
 -         fill(start, rc.size(), 0xFFFFFFFF);
 -   }
--
+ 
 -   bool is_blocked(PhysReg start) const
 -   {
 -      if (regs[start] == 0xFFFFFFFF)
@@ -2873,7 +2877,7 @@
 -      }
 -      return false;
 -   }
- 
+-
 -   bool is_empty_or_blocked(PhysReg start) const
 -   {
 -      /* Empty is 0, blocked is 0xFFFFFFFF, so to check both we compare the
@@ -3175,7 +3179,7 @@
 -         printf("  %+4d ", std::distance(regs.begin(), line_begin_it));
 -      }
 -      const auto line_end_it = std::next(line_begin_it, regs_in_line);
--
+ 
 -      for (auto reg_it = line_begin_it; reg_it != line_end_it; ++reg_it) {
 -         bool has_adjacent_variable =
 -            (std::next(reg_it) != line_end_it &&
@@ -3186,7 +3190,40 @@
 -      line_begin_it = line_end_it;
 -      printf("\n");
 -   }
--
++            bool
++            get_reg_specified(ra_ctx& ctx, const RegisterFile& reg_file, RegClass rc,
++                              aco_ptr<Instruction>& instr, PhysReg reg, int operand)
++            {
++                  /* catch out-of-range registers */
++                  if (reg >= PhysReg{512}) {
++                        return false;
++                  }
++
++                  DefInfo info(ctx, instr, rc, operand);
++
++                  if (reg.reg_b % info.data_stride)
++                        return false;
++
++                  assert(util_is_power_of_two_nonzero(info.stride));
++                  reg.reg_b &= ~(info.stride - 1);
++
++                  PhysRegInterval reg_win = {PhysReg(reg.reg()), info.rc.size()};
++                  PhysRegInterval vcc_win = {vcc, 2};
++                  /* VCC is outside the bounds */
++                  bool is_vcc =
++                  info.rc.type() == RegType::sgpr && vcc_win.contains(reg_win) && ctx.program->needs_vcc;
++                  bool is_m0 = info.rc == s1 && reg == m0 && can_write_m0(instr);
++                  if (!info.bounds.contains(reg_win) && !is_vcc && !is_m0)
++                        return false;
++
++                  if (instr_info.classes[(int)instr->opcode] == instr_class::valu_pseudo_scalar_trans) {
++                        /* RDNA4 ISA doc, 7.10. Pseudo-scalar Transcendental ALU ops:
++                         * - VCC may not be used as a destination
++                         */
++                        if (vcc_win.contains(reg_win))
++                              return false;
++                  }
+ 
 -   const unsigned free_regs =
 -      std::count_if(regs.begin(), regs.end(), [&](auto reg) { return !reg_file[reg]; });
 -   printf("%u/%u used, %u/%u free\n", regs.size - free_regs, regs.size, free_regs, regs.size);
@@ -3222,7 +3259,9 @@
 -      printf("\n");
 -   }
 -}
--
++                  if (reg_file.test(reg, info.rc.bytes()))
++                        return false;
+ 
 -bool
 -is_sgpr_writable_without_side_effects(amd_gfx_level gfx_level, PhysReg reg)
 -{
@@ -3459,7 +3498,7 @@
 -      instr->valu().opsel[3] = true; /* dst in high half */
 -      return;
 -   }
- 
+-
 -   if (reg.byte() == 0)
 -      return;
 -   else if (instr->opcode == aco_opcode::v_interp_p2_f16)
@@ -3601,40 +3640,7 @@
 -      }
 -      if (is_def)
 -         continue;
-+            bool
-+            get_reg_specified(ra_ctx& ctx, const RegisterFile& reg_file, RegClass rc,
-+                              aco_ptr<Instruction>& instr, PhysReg reg, int operand)
-+            {
-+                  /* catch out-of-range registers */
-+                  if (reg >= PhysReg{512}) {
-+                        return false;
-+                  }
-+
-+                  DefInfo info(ctx, instr, rc, operand);
-+
-+                  if (reg.reg_b % info.data_stride)
-+                        return false;
-+
-+                  assert(util_is_power_of_two_nonzero(info.stride));
-+                  reg.reg_b &= ~(info.stride - 1);
-+
-+                  PhysRegInterval reg_win = {PhysReg(reg.reg()), info.rc.size()};
-+                  PhysRegInterval vcc_win = {vcc, 2};
-+                  /* VCC is outside the bounds */
-+                  bool is_vcc =
-+                  info.rc.type() == RegType::sgpr && vcc_win.contains(reg_win) && ctx.program->needs_vcc;
-+                  bool is_m0 = info.rc == s1 && reg == m0 && can_write_m0(instr);
-+                  if (!info.bounds.contains(reg_win) && !is_vcc && !is_m0)
-+                        return false;
-+
-+                  if (instr_info.classes[(int)instr->opcode] == instr_class::valu_pseudo_scalar_trans) {
-+                        /* RDNA4 ISA doc, 7.10. Pseudo-scalar Transcendental ALU ops:
-+                         * - VCC may not be used as a destination
-+                         */
-+                        if (vcc_win.contains(reg_win))
-+                              return false;
-+                  }
- 
+-
 -      parallelcopy& copy = *it;
 -      copy.def.setTemp(ctx.program->allocateTmp(copy.def.regClass()));
 -      ctx.assignments.emplace_back(copy.def.physReg(), copy.def.regClass());
@@ -3687,9 +3693,7 @@
 -      /* Apply changes to register file. */
 -      if (fill)
 -         reg_file.fill(copy.def);
-+                  if (reg_file.test(reg, info.rc.bytes()))
-+                        return false;
- 
+-
 -      ++it;
 -   }
 -}
@@ -4079,7 +4083,7 @@
 -            res = get_reg_simple(ctx, reg_file, info);
 -         }
 -      }
- 
+-
 -      if (res) {
 -         /* mark the area as blocked */
 -         reg_file.block(*res, var.rc);
@@ -4092,7 +4096,7 @@
 -         parallelcopies.emplace_back(pc_op, pc_def);
 -         continue;
 -      }
--
+ 
 -      PhysReg best_pos = bounds.lo();
 -      unsigned num_moves = 0xFF;
 -      unsigned num_vars = 0;
@@ -4212,7 +4216,7 @@
 +                  return {};
              }
 -         }
- 
+-
 -         if (found) {
 -            best_pos = reg_win.lo();
 -            num_moves = k;
@@ -4246,19 +4250,7 @@
 -
 -   return true;
 -}
-+            bool
-+            compact_linear_vgprs(ra_ctx& ctx, const RegisterFile& reg_file,
-+                                 std::vector<parallelcopy>& parallelcopies)
-+            {
-+                  PhysRegInterval linear_vgpr_bounds = get_reg_bounds(ctx, RegType::vgpr, true);
-+                  int zeros = reg_file.count_zero(linear_vgpr_bounds);
-+                  if (zeros == 0)
-+                        return false;
-+
-+                  std::vector<IDAndRegClass> vars;
-+                  for (unsigned id : find_vars(ctx, reg_file, linear_vgpr_bounds))
-+                        vars.emplace_back(id, ctx.assignments[id].rc);
- 
+-
 -std::optional<PhysReg>
 -get_reg_impl(ra_ctx& ctx, const RegisterFile& reg_file, std::vector<parallelcopy>& parallelcopies,
 -             const DefInfo& info, aco_ptr<Instruction>& instr)
@@ -4302,17 +4294,29 @@
 -         }
 -      }
 -   }
+-
+-   assert((regs_free + ctx.num_linear_vgprs) >= size);
+ 
+-   /* we might have to move dead operands to dst in order to make space */
+-   unsigned op_moves = 0;
++            bool
++            compact_linear_vgprs(ra_ctx& ctx, const RegisterFile& reg_file,
++                                 std::vector<parallelcopy>& parallelcopies)
++            {
++                  PhysRegInterval linear_vgpr_bounds = get_reg_bounds(ctx, RegType::vgpr, true);
++                  int zeros = reg_file.count_zero(linear_vgpr_bounds);
++                  if (zeros == 0)
++                        return false;
++
++                  std::vector<IDAndRegClass> vars;
++                  for (unsigned id : find_vars(ctx, reg_file, linear_vgpr_bounds))
++                        vars.emplace_back(id, ctx.assignments[id].rc);
+ 
+-   if (size > (regs_free - killed_ops))
+-      op_moves = size - (regs_free - killed_ops);
 +                  ctx.num_linear_vgprs -= zeros;
 +                  compact_relocate_vars(ctx, vars, parallelcopies, get_reg_bounds(ctx, RegType::vgpr, true).lo());
  
--   assert((regs_free + ctx.num_linear_vgprs) >= size);
--
--   /* we might have to move dead operands to dst in order to make space */
--   unsigned op_moves = 0;
--
--   if (size > (regs_free - killed_ops))
--      op_moves = size - (regs_free - killed_ops);
--
 -   /* find the best position to place the definition */
 -   PhysRegInterval best_win = {bounds.lo(), size};
 -   unsigned num_moves = 0xFF;
@@ -7097,57 +7101,94 @@
 -         create_phi_vector_affinities(ctx, instr, vector_phis);
 -      }
 +            static bool
-+            sop2_can_use_sopk(const ra_ctx& ctx, Instruction* instr)
++            sop2_can_use_sopk(const ra_ctx&       ctx,      /* kept for API symmetry      */
++                              const Instruction*  instr)
 +            {
-+                  /* 1. Opcode Whitelist: Only instructions with a true SOPK variant in the
-+                   *    ACO opcode enum (defined in aco_opcodes.py) are considered. Logical
-+                   *    operations (AND/OR/XOR) are NOT included as they lack this direct
-+                   *    encoding path in ACO's GFX9 backend. */
-+                  switch (instr->opcode) {
++                  (void)ctx; /* Unused in this function, but kept for a consistent API. */
++
++                  /*
++                   * GATE 1: Structural Requirements
++                   * The instruction must be a valid pointer, have the SOP2 format, and
++                   * exactly two operands.
++                   */
++                  if (!instr || instr->format != Format::SOP2 || instr->operands.size() != 2)
++                        return false;
++
++                  const aco_opcode op = instr->opcode;
++
++                  /*
++                   * GATE 2: Opcode Whitelist
++                   * Only a specific subset of SOP2 instructions have a corresponding SOPK
++                   * encoding.
++                   */
++                  switch (op) {
 +                        case aco_opcode::s_add_i32:
 +                        case aco_opcode::s_mul_i32:
 +                        case aco_opcode::s_cselect_b32:
-+                              break;
++                              break; /* Always eligible. */
 +
 +                        case aco_opcode::s_add_u32:
-+                              /* s_addk_i32 does not write a carry-out. This optimization is only
-+                               * safe if the carry-out result (in SCC) is dead. */
-+                              if (!instr->definitions[1].isKill())
++                              /* s_addk_i32 does not write the carry-out bit (SCC). This fold is only
++                               * safe if the original instruction's carry-out was not used. We
++                               * verify this by checking if the SCC definition is marked as 'killed'. */
++                              if (instr->definitions.size() < 2 || !instr->definitions[1].isKill())
 +                                    return false;
 +                        break;
 +
 +                        default:
-+                              return false; /* This opcode has no SOPK variant in ACO. */
++                              return false; /* This opcode has no SOPK variant. */
 +                  }
 +
-+                  /* 2. Operand Count: Must be a standard 2-source instruction. */
-+                  if (instr->operands.size() != 2)
++                  /*
++                   * GATE 3: Operand Pattern
++                   * The pattern must be exactly one literal operand and one SGPR temporary.
++                   */
++                  const bool is_lit0 = instr->operands[0].isLiteral();
++                  const bool is_lit1 = instr->operands[1].isLiteral();
++                  if (is_lit0 == is_lit1) /* Rejects if 0 or 2 literals. */
 +                        return false;
 +
-+                  /* 3. Operand Types: Must have exactly one literal and one SGPR. */
-+                  bool src0_is_lit = instr->operands[0].isLiteral();
-+                  bool src1_is_lit = instr->operands[1].isLiteral();
-+                  if (src0_is_lit == src1_is_lit) /* Need exactly ONE literal. */
++                  const unsigned lit_idx = is_lit0 ? 0u : 1u;
++                  const unsigned reg_idx = is_lit0 ? 1u : 0u;
++
++                  /*
++                   * GATE 4: Tied-Operand Constraint (ISA Mandate)
++                   * For SOPK, the destination register (SDST) is implicitly the same as the
++                   * first source operand (SSRC0). We must verify this relationship holds.
++                   */
++                  if (reg_idx != 0u) /* The SGPR must be the first source operand. */
 +                        return false;
 +
-+                  unsigned lit_idx = src0_is_lit ? 0 : 1;
-+                  unsigned temp_idx = !lit_idx;
-+
-+                  /* 4. ISA Constraint: s_cselect_b32 requires the literal in the second source operand (VSRC1).
-+                   *    Other supported opcodes are commutative, so the literal can be swapped into position. */
-+                  if (instr->opcode == aco_opcode::s_cselect_b32 && lit_idx != 1)
++                  const Operand& reg_op = instr->operands[0];
++                  if (!reg_op.isTemp()) /* Must be a temporary, not a fixed hardware reg. */
 +                        return false;
 +
-+                  /* 5. The non-literal operand must be a temporary SGPR that is killed, allowing it
-+                   *    to be reused as the tied destination of the two-operand SOPK form. */
-+                  if (!instr->operands[temp_idx].isTemp() ||
-+                        !instr->operands[temp_idx].isKillBeforeDef())
++                  /* The temporary used by the source operand must be killed by this
++                   * instruction, making it available to be overwritten as the destination. */
++                  if (!reg_op.isKillBeforeDef())
 +                        return false;
 +
-+                  /* 6. Immediate Range Check: The literal must fit within a signed 16-bit integer.
-+                   *    All supported _k variants sign-extend their immediate. */
-+                  uint32_t imm = instr->operands[lit_idx].constantValue();
-+                  if (imm > 0x7fff && imm < 0xffff8000u) /* outside [-32768, 32767] */
++                  /* The destination temporary's ID must match the source temporary's ID. */
++                  if (!instr->definitions[0].isTemp() ||
++                        instr->definitions[0].tempId() != reg_op.tempId())
++                        return false;
++
++                  /*
++                   * GATE 5: Non-Commutative Opcode Constraint
++                   * s_cselect is not commutative. The literal must be in the SSRC1 position.
++                   * This is implicitly handled by the reg_idx check above for s_cselect,
++                   * but an explicit check makes the logic clearer.
++                   */
++                  if (op == aco_opcode::s_cselect_b32 && lit_idx != 1u)
++                        return false;
++
++                  /*
++                   * GATE 6: Immediate Value Range
++                   * The literal must fit within a 16-bit signed integer, as this is the
++                   * size of the immediate field in the SOPK format.
++                   */
++                  const uint32_t imm = instr->operands[lit_idx].constantValue();
++                  if (imm > 0x7FFFu && imm < 0xFFFF8000u) /* Check if outside [-32768, 32767] */
 +                        return false;
  
 -      /* visit the loop header phis first in order to create nested affinities */
@@ -7177,7 +7218,7 @@
 -               if (op.isTemp() && op.isKill() && op.regClass() == phi->definitions[0].regClass()) {
 -                  temp_to_phi_resources[op.tempId()] = index;
 -               }
-+                  return true;
++                  return true; /* All checks passed. The instruction can be folded. */
              }
 -         }
 -      }
@@ -7220,7 +7261,7 @@
 -      unsigned hi = (literal >> (instr->valu().opsel_hi[0] * 16)) & 0xffff;
 -      instr->operands[0] = Operand::literal32(lo | (hi << 16));
 -   }
--
+ 
 -   instr->format = (Format)(((unsigned)withoutVOP3(instr->format) & ~(unsigned)Format::VOP3P) |
 -                            (unsigned)Format::VOP2);
 -   instr->valu().opsel_lo = 0;
@@ -7277,7 +7318,7 @@
 -   default: unreachable("illegal instruction");
 -   }
 -}
- 
+-
 -void
 -optimize_encoding(ra_ctx& ctx, RegisterFile& register_file, aco_ptr<Instruction>& instr)
 -{
@@ -7353,7 +7394,7 @@
 +                  }
              }
 -         }
- 
+-
 -         /* Avoid unrenaming killed operands because it can increase the cost of instructions like
 -          * p_create_vector. */
 -         use_original &= !op.isKillBeforeDef();
@@ -7532,7 +7573,7 @@
 -   emit_parallel_copy_internal(ctx, copies, instr, instructions, temp_in_scc,
 -                               register_file);
 -}
--
+ 
 -} /* end namespace */
 -
 -void
@@ -7601,15 +7642,17 @@
 +             * We require only a minimal whitelist that is guaranteed to exist on all
 +             * supported ISA versions.                                               */
 +            static inline bool
-+            breaks_linear_flow(Instruction* ins)
++            breaks_linear_flow(const Instruction* ins)
 +            {
-+                  if (ins->isBranch())                  /* any explicit branch           */
++                  if (!ins)
 +                        return true;
-+                  if (ins->format == Format::EXP)       /* EXP/EXPORT terminates a wave  */
++
++                  if (ins->isBranch() || ins->format == Format::EXP)
 +                        return true;
-+                  switch (ins->opcode) {                /* small, always-present set     */
-+                        case aco_opcode::p_demote_to_helper:  /* kill-like                    */
-+                        case aco_opcode::s_endpgm:            /* shader termination           */
++
++                  switch (ins->opcode) {
++                        case aco_opcode::p_demote_to_helper:
++                        case aco_opcode::s_endpgm:
 +                              return true;
 +                        default:
 +                              return false;
@@ -8022,68 +8065,67 @@
 -         if (!ctx.vector_operands.empty())
 -            resolve_vector_operands(ctx, register_file, parallelcopy, instr);
 +            static void
-+            optimize_encoding_sopk(ra_ctx& ctx, RegisterFile& reg_file, aco_ptr<Instruction>& instr)
++            optimize_encoding_sopk(ra_ctx&               ctx,       /* currently unused    */
++                                   RegisterFile&         reg_file, /* currently unused    */
++                                   aco_ptr<Instruction>& instr)
 +            {
++                  (void)ctx;
++                  (void)reg_file;
++
 +                  if (!sop2_can_use_sopk(ctx, instr.get()))
 +                        return;
 +
-+                  /* Determine literal and temporary operand indices. */
-+                  unsigned lit_idx = instr->operands[0].isLiteral() ? 0 : 1;
-+                  unsigned temp_idx = !lit_idx;
-+                  PhysReg temp_reg = instr->operands[temp_idx].physReg();
++                  /*
++                   * GATE 1: Extract information from the original SOP2 instruction.
++                   * The helper guarantees that operands[0] is the tied SGPR temporary
++                   * and operands[1] is the literal.
++                   */
++                  const Operand& tied_op = instr->operands[0];
++                  const Operand& lit_op  = instr->operands[1];
++                  const uint16_t imm16   = static_cast<uint16_t>(lit_op.constantValue() & 0xFFFFu);
 +
-+                  /* The tied source/destination register must be a general-purpose SGPR. */
-+                  if (!is_sgpr_writable_without_side_effects(ctx.program->gfx_level, temp_reg))
-+                        return;
++                  /*
++                   * GATE 2: Create the new SOPK instruction with the correct structure.
++                   * SOPK has 1 source operand and 1 primary destination. The SCC output
++                   * is an implicit property of the opcode.
++                   */
++                  aco_ptr<Instruction> sopk{
++                        create_instruction(aco_opcode::s_nop, Format::SOPK, 1, 1)};
 +
-+                  /* Respect destination affinity: do not perform this optimization if it would
-+                   * prevent a more valuable move to a different, available affinity register. */
-+                  unsigned dst_id = instr->definitions[0].tempId();
-+                  if (ctx.assignments[dst_id].affinity) {
-+                        const assignment& aff = ctx.assignments[ctx.assignments[dst_id].affinity];
-+                        if (aff.assigned && aff.reg != temp_reg) {
-+                              bool is_conflicted = reg_file.test(aff.reg, instr->operands[temp_idx].bytes());
-+                              if (!is_conflicted) {
-+                                    for (const Operand& op : instr->operands) {
-+                                          if (op.isKillBeforeDef() && op.physReg() == aff.reg) {
-+                                                is_conflicted = true;
-+                                                break;
-+                                          }
-+                                    }
-+                              }
-+                              /* If the affinity register is available and not conflicted, prioritize that move. */
-+                              if (!is_conflicted)
-+                                    return;
++                        /*
++                         * GATE 3: Set up the tied operand and definition.
++                         * This is the most critical part. The Definition and Operand must be
++                         * consistent and all original flags must be preserved.
++                         */
++                        sopk->definitions[0] = instr->definitions[0];
++
++                        sopk->operands[0] = tied_op;
++
++                        /*
++                         * GATE 4: Set the immediate value and remap the opcode.
++                         * The new opcodes implicitly handle the SCC definition correctly.
++                         */
++                        sopk->salu().imm = imm16;
++
++                        switch (instr->opcode) {
++                              case aco_opcode::s_add_i32:
++                              case aco_opcode::s_add_u32:
++                                    sopk->opcode = aco_opcode::s_addk_i32;
++                                    break;
++                              case aco_opcode::s_mul_i32:
++                                    sopk->opcode = aco_opcode::s_mulk_i32;
++                                    break;
++                              case aco_opcode::s_cselect_b32:
++                                    sopk->opcode = aco_opcode::s_cmovk_i32;
++                                    break;
++                              default:
++                                    unreachable("unexpected opcode in optimize_encoding_sopk()");
 +                        }
-+                  }
 +
-+                  /* --- Perform the fold to SOPK --- */
-+                  instr->format = Format::SOPK;
-+                  instr->salu().imm = instr->operands[lit_idx].constantValue() & 0xffff;
-+
-+                  /* For commutative opcodes, ensure the temp is in operand[0]. s_cselect is handled by sop2_can_use_sopk. */
-+                  if (lit_idx == 0 && instr->opcode != aco_opcode::s_cselect_b32) {
-+                        std::swap(instr->operands[0], instr->operands[1]);
-+                  }
-+
-+                  // The temp is now at index 0. Pop the literal at index 1.
-+                  instr->operands.pop_back();
-+
-+                  /* Remap the opcode to its SOPK variant. */
-+                  switch (instr->opcode) {
-+                        case aco_opcode::s_add_u32:
-+                        case aco_opcode::s_add_i32:
-+                              instr->opcode = aco_opcode::s_addk_i32;
-+                              break;
-+                        case aco_opcode::s_mul_i32:
-+                              instr->opcode = aco_opcode::s_mulk_i32;
-+                              break;
-+                        case aco_opcode::s_cselect_b32:
-+                              instr->opcode = aco_opcode::s_cmovk_i32;
-+                              break;
-+                        default:
-+                              unreachable("unexpected opcode reaching SOPK conversion");
-+                  }
++                        /*
++                         * GATE 5: Atomically replace the old instruction in the IR.
++                         */
++                        instr = std::move(sopk);
 +            }
  
 -         /* This ignores tied defs and vector aligned operands because they are late-kill. */
