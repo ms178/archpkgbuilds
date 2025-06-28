@@ -1,0 +1,219 @@
+/*
+ * Copyright © 2025 Advanced Micro Devices, Inc.
+ * SPDX-License-Identifier: MIT
+ */
+
+/* All groups of adjacent independent loads are sorted as follows:
+ * 1. If 2 or more loads use the same binding, they must be next to each other.
+ * 2. If a use of load A is before a use of load B and both loads use different
+ *    bindings, load A must be before load B. If load group A and load group B
+ *    are groups of loads using the same binding, then the closest use of all
+ *    loads from each group is used to determine the ordering of the groups.
+ *
+ * The shader is walked from the end to the beginning, so that loads are more
+ * likely to match the order of stores.
+ *
+ * It's recommended to run nir_group_loads(nir, nir_group_all) to move
+ * independent loads next to each other.
+ *
+ * This improves performance on certain GPU architectures.
+ */
+
+#include "nir.h"
+#include "util/u_dynarray.h"
+
+static unsigned
+get_closest_use(nir_instr *instr)
+{
+   uint32_t min = UINT32_MAX;
+
+   nir_foreach_use_including_if(src, nir_instr_def(instr)) {
+      /* TODO: Which instr->index should we use for ifs? */
+      assert(!nir_src_is_if(src));
+      min = MIN2(min, nir_src_parent_instr(src)->index);
+   }
+   return min;
+}
+
+static int
+compare_binding(nir_instr **a, nir_instr **b)
+{
+   nir_instr *ia = nir_get_load_resource(*a);
+   nir_instr *ib = nir_get_load_resource(*b);
+
+   if (ia != ib)
+      return ia->index > ib->index ? 1 : -1;
+
+   return 0;
+}
+
+static int
+compare_uses(nir_instr **a, nir_instr **b)
+{
+   return nir_instr_def(*a)->index - nir_instr_def(*b)->index;
+}
+
+static bool
+reorder_loads(nir_instr *first, nir_instr *last, struct util_dynarray *scratch)
+{
+   unsigned first_instr_index = first->index;
+   /* Sort loads by binding. */
+   unsigned num_loads = nir_sort_instr(&first, &last, compare_binding, scratch);
+
+   /* Gather information about the loads. */
+   struct load_info {
+      nir_instr *binding;
+      unsigned closest_use;
+      unsigned same_binding_group_index;
+   } *info = (struct load_info*)alloca(sizeof(info[0]) * num_loads);
+   unsigned i, group_index;
+   nir_instr *instr;
+
+   for (i = 0, group_index = 0, instr = first; i < num_loads;
+        i++, instr = nir_instr_next(instr)) {
+      info[i].binding = nir_get_load_resource(instr);
+      info[i].closest_use = get_closest_use(instr);
+
+      if (i && info[i].binding != info[i - 1].binding)
+         group_index++;
+
+      info[i].same_binding_group_index = group_index;
+   }
+
+   /* For a group of loads using the same binding, set their closest use to
+    * the minimum of all loads in the group. This will keep those loads together.
+    */
+   for (i = 0, instr = first; i < num_loads; i++, instr = nir_instr_next(instr)) {
+      unsigned min = info[i].closest_use;
+      unsigned num = 1;
+
+      for (unsigned j = i + 1;
+           j < num_loads &&
+           info[j].same_binding_group_index == info[i].same_binding_group_index; j++) {
+         min = MIN2(min, info[j].closest_use);
+         num++;
+      }
+
+      if (num > 1) {
+         info[i].closest_use = min;
+         for (unsigned j = i + 1;
+              j < num_loads &&
+              info[j].same_binding_group_index == info[i].same_binding_group_index; j++)
+            info[j].closest_use = min;
+
+         /* We processed all instructions in this group. Move to the next group. */
+         i += num - 1;
+         for (unsigned j = 0; j < num - 1; j++)
+            instr = nir_instr_next(instr);
+      }
+   }
+
+   /* Use nir_def::index to store the index of the closest use for the comparison. */
+   for (i = 0, instr = first; i < num_loads; i++, instr = nir_instr_next(instr))
+      nir_instr_def(instr)->index = info[i].closest_use;
+
+   /* Sort loads by the distance of their use.
+    *
+    * TODO: This relies on qsort being stable to keep loads that use the same
+    * resource together. qsort is only stable with glibc because it's implemented
+    * as a merge sort there, so it's OK to use qsort with that. We should add
+    * our own merge sort into Mesa to have a stable sort on all systems.
+    */
+   nir_sort_instr(&first, &last, compare_uses, scratch);
+
+   /* Recompute nir_instr::index of loads after reordering. */
+   for (i = 0, instr = first; i < num_loads; i++, instr = nir_instr_next(instr))
+      instr->index = first_instr_index + i;
+
+   return true;
+}
+
+static bool
+process_block(nir_block *block, struct util_dynarray *scratch)
+{
+   /* Find a group of adjacent loads that will be reordered. */
+   nir_instr *last = NULL, *first = NULL;
+   bool progress = false;
+
+   nir_foreach_instr_reverse(instr, block) {
+      if (nir_is_grouped_load(instr)) {
+         if (!last) {
+            /* Start a new group (in the reverse order). */
+            assert(!first);
+            last = instr;
+            continue;
+         }
+
+         /* If any use isn't after "last", we have to break the group. */
+         bool break_group = false;
+         nir_foreach_use(src, nir_instr_def(instr)) {
+            nir_instr *use = nir_src_parent_instr(src);
+
+            if (use->index < instr->index) {
+               /* "use" is a phi at the beginning of a loop. Accept it because
+                * it's equivalent to being used at the end of the loop.
+                */
+               assert(use->type == nir_instr_type_phi);
+               assert(use->block->cf_node.type == nir_cf_node_loop);
+            } else if (use->index <= last->index) {
+               /* The use isn't after "last", so this is a different group. */
+               break_group = true;
+               break;
+            }
+         }
+
+         if (break_group) {
+            if (first && last)
+               progress |= reorder_loads(first, last, scratch);
+
+            /* Start a new group. */
+            first = NULL;
+            last = instr;
+            continue;
+         }
+
+         /* Add the load into the group. */
+         first = instr;
+         continue;
+      }
+
+      /* We are outside a group. Reorder the group we found. */
+      if (first && last)
+         progress |= reorder_loads(first, last, scratch);
+
+      first = NULL;
+      last = NULL;
+   }
+
+   if (first && last)
+      progress |= reorder_loads(first, last, scratch);
+
+   return progress;
+}
+
+bool
+nir_reorder_adjacent_loads(nir_shader *shader)
+{
+   struct util_dynarray scratch;
+   util_dynarray_init(&scratch, NULL);
+   bool any_progress = false;
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_metadata_require(impl, nir_metadata_instr_index);
+      bool progress = false;
+
+      nir_foreach_block_reverse(block, impl) {
+         progress |= process_block(block, &scratch);
+      }
+
+      any_progress |= nir_progress(progress, impl,
+                                   nir_metadata_control_flow |
+                                   nir_metadata_loop_analysis);
+      /* The pass overwrites def indices. Recompute them. */
+      if (progress)
+         nir_index_ssa_defs(impl);
+   }
+
+   util_dynarray_fini(&scratch);
+   return any_progress;
+}
