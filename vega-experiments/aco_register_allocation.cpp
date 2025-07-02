@@ -376,37 +376,66 @@ namespace aco {
                   bool
                   test(PhysReg start, unsigned bytes) const
                   {
+                        /* 0-byte probe → always free. */
                         if (UNLIKELY(!bytes))
                               return false;
 
-                        const unsigned start_byte_abs = start.reg_b;
-                        const unsigned last_byte_abs = start_byte_abs + bytes - 1;
-                        const unsigned first_dw = start.reg();
-                        const unsigned last_dw = last_byte_abs / 4;
+                        const unsigned start_byte_abs = start.reg_b;            /* absolute byte idx */
+                        const unsigned last_byte_abs  = start_byte_abs + bytes - 1u;
+                        const unsigned first_dw       = start.reg();            /* 32-bit index      */
+                        const unsigned last_dw        = last_byte_abs >> 2;     /* /4                */
 
-                        for (unsigned dw = first_dw; dw <= last_dw; ++dw) {
+                        for (unsigned dw = first_dw; dw <= last_dw; ) {
+
+                              /* ---- 64-bit fast path ------------------------------------------- */
+                              if (LIKELY(dw + 1u <= last_dw)) {
+                                    uint64_t pair;
+                                    /*  memcpy avoids alignment/aliasing UB, works for any arch.  */
+                                    ::memcpy(&pair, &regs[dw], sizeof(pair));
+
+                                    /* Both DWORDs completely empty → skip. */
+                                    if (LIKELY(pair == 0ull)) {
+                                          dw += 2u;
+                                          continue;
+                                    }
+                              }
+
                               const uint32_t slot = regs[dw];
 
-                              if (LIKELY(slot == 0u))
+                              if (!slot) {            /* absolutely empty DWORD */
+                                    ++dw;
                                     continue;
-                              if (UNLIKELY(slot == RF_SLOT_BLOCKED))
-                                    return true;
-                              if (slot != RF_SLOT_SUBDWORD)
-                                    return true;
-
-                              /* Sub-dword path: precise byte-level checking required. */
-                              auto it = subdword_regs.find(dw);
-                              if (UNLIKELY(it == subdword_regs.end()))
-                                    continue; /* Stale marker, treat as empty. */
-
-                                    const std::array<uint32_t, 4>& sub = it->second;
-                              const unsigned lo_byte = (dw == first_dw) ? start.byte() : 0u;
-                              const unsigned hi_byte = (dw == last_dw) ? (last_byte_abs & 3u) : 3u;
-
-                              for (unsigned b = lo_byte; b <= hi_byte; ++b) {
-                                    if (sub[b])
-                                          return true;
                               }
+
+                              if (slot == RF_SLOT_BLOCKED)   /* permanently blocked DWORD */
+                                    return true;
+
+                              if (slot != RF_SLOT_SUBDWORD)  /* occupied by a full-DWORD var */
+                                    return true;
+
+                              /* ---- sub-DWORD path -------------------------------------------- */
+                              auto it = subdword_regs.find(dw);
+                              if (UNLIKELY(it == subdword_regs.end())) {   /* stale marker */
+                                    ++dw;
+                                    continue;
+                              }
+
+                              const std::array<uint32_t, 4>& sub = it->second;
+                              const unsigned lo_byte = (dw == first_dw) ? start.byte()        : 0u;
+                              const unsigned hi_byte = (dw == last_dw)  ? (last_byte_abs & 3u): 3u;
+
+                              /* Pack occupancy bits. */
+                              const uint8_t occ  = uint8_t(bool(sub[0]))
+                              | uint8_t(bool(sub[1])) << 1
+                              | uint8_t(bool(sub[2])) << 2
+                              | uint8_t(bool(sub[3])) << 3;
+
+                              const uint8_t mask = uint8_t(((1u << (hi_byte - lo_byte + 1u)) - 1u) << lo_byte);
+
+                              if (occ & mask)
+                                    return true;
+
+                              ++dw;
                         }
                         return false;
                   }
@@ -1070,38 +1099,51 @@ namespace aco {
             }
 
             std::optional<PhysReg>
-            get_reg_simple(ra_ctx& ctx, const RegisterFile& reg_file, DefInfo info)
+            get_reg_simple(ra_ctx&              ctx,
+                           const RegisterFile&  reg_file,
+                           DefInfo              info)
             {
                   PhysRegInterval bounds = info.bounds;
-                  const uint32_t size = info.size;
-                  const RegClass rc = info.rc;
-                  uint32_t stride_dw = rc.is_subdword() ? DIV_ROUND_UP(info.stride, 4u) : info.stride;
+                  const uint32_t  size   = info.size;
+                  const RegClass  rc     = info.rc;
+                  uint32_t stride_dw     = rc.is_subdword()
+                  ? DIV_ROUND_UP(info.stride, 4u)
+                  : info.stride;
 
+                  /* Recursive stride splitting (unchanged algorithm). */
                   if (stride_dw < size && !rc.is_subdword()) {
                         DefInfo nested = info;
-                        nested.stride = stride_dw * 2;
+                        nested.stride  = stride_dw * 2u;
                         if (size % nested.stride == 0) {
-                              if (auto res = get_reg_simple(ctx, reg_file, nested))
-                                    return res;
+                              if (auto r = get_reg_simple(ctx, reg_file, nested))
+                                    return r;
                         }
                   }
 
-                  PhysRegIterator& rr_it = rc.type() == RegType::vgpr ? ctx.rr_vgpr_it : ctx.rr_sgpr_it;
-                  if (stride_dw == 1 && rr_it != bounds.begin() && bounds.contains(rr_it.reg)) {
-                        DefInfo upper_info = info;
-                        upper_info.bounds = PhysRegInterval::from_until(rr_it.reg, bounds.hi());
-                        if (auto res = get_reg_simple(ctx, reg_file, upper_info))
-                              return res;
+                  /* Round-robin iterator handling. */
+                  PhysRegIterator& rr_it = rc.type() == RegType::vgpr ? ctx.rr_vgpr_it
+                  : ctx.rr_sgpr_it;
+                  if (stride_dw == 1u && rr_it != bounds.begin() && bounds.contains(rr_it.reg)) {
+                        DefInfo upper = info;
+                        upper.bounds  = PhysRegInterval::from_until(rr_it.reg, bounds.hi());
+                        if (auto r = get_reg_simple(ctx, reg_file, upper))
+                              return r;
                         bounds = PhysRegInterval::from_until(bounds.lo(), rr_it.reg);
                   }
 
-                  auto is_free = [&](PhysReg r) {
-                        return reg_file[r] == 0 && !ctx.war_hint[r];
-                  };
-
+                  /* -------- Main free-window scan ----------------------------------- */
                   for (PhysRegInterval win{bounds.lo(), size}; win.hi() <= bounds.hi(); win += stride_dw) {
-                        if (std::all_of(win.begin(), win.end(), is_free)) {
-                              if (stride_dw == 1) {
+
+                        bool window_free = true;
+                        for (PhysReg r : win) {
+                              if (UNLIKELY(reg_file[r] || ctx.war_hint[r])) {
+                                    window_free = false;
+                                    break;
+                              }
+                        }
+
+                        if (window_free) {
+                              if (stride_dw == 1u) {
                                     PhysRegIterator new_rr{PhysReg{win.lo() + size}};
                                     if (new_rr < bounds.end())
                                           rr_it = new_rr;
@@ -1111,20 +1153,25 @@ namespace aco {
                         }
                   }
 
+                  /* -------- sub-DWORD fallback -------------------------------------- */
                   if (rc.is_subdword()) {
                         const unsigned byte_stride = info.stride;
-                        const unsigned byte_size = rc.bytes();
+                        const unsigned byte_size   = rc.bytes();
 
                         for (unsigned dw_idx = bounds.lo().reg(); dw_idx < bounds.hi().reg(); ++dw_idx) {
+
                               PhysReg dw_reg{dw_idx};
-                              if (ctx.war_hint[dw_reg] || reg_file[dw_reg] == RF_SLOT_BLOCKED || (reg_file[dw_reg] > 0 && reg_file[dw_reg] != RF_SLOT_SUBDWORD))
+                              if (ctx.war_hint[dw_reg] ||
+                                    reg_file[dw_reg] == RF_SLOT_BLOCKED ||
+                                    (reg_file[dw_reg] > 0u && reg_file[dw_reg] != RF_SLOT_SUBDWORD))
                                     continue;
 
-                              for (unsigned byte_off = 0; byte_off < 4; byte_off += byte_stride) {
-                                    PhysReg candidate = dw_reg;
-                                    candidate.reg_b += byte_off;
+                              for (unsigned byte_off = 0u; byte_off < 4u; byte_off += byte_stride) {
 
-                                    PhysReg end_reg = candidate.advance(byte_size - 1);
+                                    PhysReg candidate = dw_reg;
+                                    candidate.reg_b  += byte_off;
+
+                                    PhysReg end_reg  = candidate.advance(byte_size - 1u);
                                     if (end_reg >= bounds.hi())
                                           continue;
 
@@ -1135,7 +1182,6 @@ namespace aco {
                               }
                         }
                   }
-
                   return {};
             }
 
@@ -2101,102 +2147,124 @@ namespace aco {
             }
 
             PhysReg
-            get_reg_create_vector(ra_ctx& ctx, const RegisterFile& reg_file, Temp temp,
+            get_reg_create_vector(ra_ctx&                    ctx,
+                                  const RegisterFile&        reg_file,
+                                  Temp                       temp,
                                   std::vector<parallelcopy>& parallelcopies,
-                                  aco_ptr<Instruction>& instr)
+                                  aco_ptr<Instruction>&      instr)
             {
-                  const RegClass rc = temp.regClass();
-                  const unsigned size_dw = rc.size();
-                  const unsigned bytes = rc.bytes();
-                  const unsigned stride_dw = get_stride(rc);
+                  const RegClass rc         = temp.regClass();
+                  const unsigned size_dw    = rc.size();
+                  const unsigned bytes      = rc.bytes();
+                  const unsigned stride_dw  = get_stride(rc);
                   const PhysRegInterval bounds = get_reg_bounds(ctx, rc);
 
-                  PhysReg best_pos{0xFFFu};
+                  PhysReg  best_pos   {0xFFFu};
                   unsigned best_moves = 0xFFFFu;
-                  bool best_avoid = true;
-                  uint32_t correct_mask = 0;
+                  bool     best_avoid = true;
+                  uint32_t correct_mask = 0u;
 
-                  unsigned offset = 0;
-                  for (unsigned i = 0; i < instr->operands.size(); ++i) {
+                  /* ------------------------------------------------------------------ */
+                  unsigned offset = 0u;
+                  for (unsigned i = 0u; i < instr->operands.size(); ++i) {
+
                         const Operand& op = instr->operands[i];
 
-                        if (op.isTemp() && op.getTemp().type() == rc.type() &&
-                              !reg_file.test(op.physReg(), op.bytes()) && offset <= op.physReg().reg_b) {
-                              unsigned reg_lo_byte = op.physReg().reg_b - offset;
-                        if ((reg_lo_byte & 3u) == 0) {
+                        if (op.isTemp() &&
+                              op.getTemp().type() == rc.type() &&
+                              !reg_file.test(op.physReg(), op.bytes()) &&
+                              offset <= op.physReg().reg_b)
+                        {
+                              const unsigned reg_lo_byte = op.physReg().reg_b - offset;
+                              if (reg_lo_byte & 3u) { offset += op.bytes(); continue; }
+
                               PhysRegInterval win{PhysReg{reg_lo_byte / 4u}, size_dw};
 
-                              if (bounds.contains(win) && (win.lo().reg() % stride_dw) == 0) {
-                                    bool can_place = true;
-                                    if ((win.lo() > bounds.lo() && reg_file[win.lo()] &&
-                                          reg_file.get_id(win.lo()) == reg_file.get_id(win.lo().advance(-1))) ||
-                                          (win.hi() < bounds.hi() && reg_file[win.hi().advance(-1)] &&
-                                          reg_file.get_id(win.hi().advance(-1)) == reg_file.get_id(win.hi()))) {
-                                          can_place = false;
-                                          }
+                              if (!bounds.contains(win) || (win.lo().reg() % stride_dw)) {
+                                    offset += op.bytes();
+                                    continue;
+                              }
 
-                                          if (can_place) {
-                                                unsigned moves = 0;
-                                                bool avoid = false;
-                                                bool has_linear_vgpr = false;
+                              /* Reject windows merging with previous/next multi-DWORD var. */
+                              bool can_place = true;
+                              if ((win.lo() > bounds.lo() &&
+                                    reg_file[win.lo()] &&
+                                    reg_file.get_id(win.lo()) == reg_file.get_id(win.lo().advance(-1))) ||
+                                    (win.hi() < bounds.hi() &&
+                                    reg_file[win.hi().advance(-1)] &&
+                                    reg_file.get_id(win.hi().advance(-1)) == reg_file.get_id(win.hi())))
+                                    can_place = false;
 
-                                                for (PhysReg r : win) {
-                                                      uint32_t v = reg_file[r];
-                                                      if (v == 0) continue;
-                                                      if (v == RF_SLOT_SUBDWORD) {
-                                                            moves += 4;
-                                                      } else {
-                                                            moves += 4;
-                                                            has_linear_vgpr |= ctx.assignments[v].rc.is_linear_vgpr();
-                                                      }
-                                                      avoid |= ctx.war_hint[r];
-                                                }
+                              if (!can_place) { offset += op.bytes(); continue; }
 
-                                                if (!has_linear_vgpr) {
-                                                      uint32_t correct_new = 0;
-                                                      unsigned off2 = 0;
-                                                      for (unsigned j = 0; j < instr->operands.size(); ++j) {
-                                                            const Operand& op2 = instr->operands[j];
-                                                            if (op2.isTemp() && op2.physReg().reg_b == win.lo().reg() * 4u + off2)
-                                                                  correct_new |= 1u << j;
-                                                            else
-                                                                  moves += op2.bytes();
-                                                            off2 += op2.bytes();
-                                                      }
+                              /* -------- cost model ---------------------------------------- */
+                              unsigned moves           = 0u;
+                              bool     avoid           = false;
+                              bool     has_linear_vgpr = false;
 
-                                                      bool aligned4 = (rc == RegClass::v4) && !(win.lo().reg() & 3u);
-                                                      if (moves < best_moves ||
-                                                            (moves == best_moves && !avoid && best_avoid) ||
-                                                            (moves == best_moves && avoid == best_avoid && aligned4)) {
-                                                            best_pos = win.lo();
-                                                      best_moves = moves;
-                                                      best_avoid = avoid;
-                                                      correct_mask = correct_new;
-                                                            }
-                                                }
-                                          }
+                              for (PhysReg r : win) {
+                                    if (moves >= best_moves) break;   /* early bail-out */
+                                          uint32_t v = reg_file[r];
+                                    if (!v) continue;
+
+                                    moves += 4u;
+                                    if (v != RF_SLOT_SUBDWORD)
+                                          has_linear_vgpr |= ctx.assignments[v].rc.is_linear_vgpr();
+                                    avoid |= ctx.war_hint[r];
+                              }
+
+                              if (has_linear_vgpr || moves >= best_moves) { offset += op.bytes(); continue; }
+
+                              uint32_t corr_mask = 0u;
+                              unsigned  off2     = 0u;
+                              for (unsigned j = 0u; j < instr->operands.size(); ++j) {
+                                    const Operand& op2 = instr->operands[j];
+
+                                    if (op2.isTemp() &&
+                                          op2.physReg().reg_b == win.lo().reg() * 4u + off2)
+                                          corr_mask |= 1u << j;
+                                    else
+                                          moves += op2.bytes();
+
+                                    if (moves >= best_moves) break; /* early bail-out */
+                                          off2 += op2.bytes();
+                              }
+
+                              bool aligned4 = (rc == RegClass::v4) && !(win.lo().reg() & 3u);
+
+                              if (moves < best_moves ||
+                                    (moves == best_moves && !avoid && best_avoid) ||
+                                    (moves == best_moves && avoid == best_avoid && aligned4))
+                              {
+                                    best_pos     = win.lo();
+                                    best_moves   = moves;
+                                    best_avoid   = avoid;
+                                    correct_mask = corr_mask;
                               }
                         }
-                              }
-                              offset += op.bytes();
+
+                        offset += op.bytes();
                   }
 
+                  /* Too expensive? → fall back. */
                   if (best_moves >= bytes * 2u)
                         return get_reg(ctx, reg_file, temp, parallelcopies, instr);
 
+                  /* No candidate at all → try other allocators. */
                   if (best_moves == 0xFFFFu) {
                         DefInfo info(ctx, instr, rc, -1);
-                        if (auto res = get_reg_simple(ctx, reg_file, info))
-                              return *res;
+                        if (auto r = get_reg_simple(ctx, reg_file, info))
+                              return *r;
                         return get_reg(ctx, reg_file, temp, parallelcopies, instr);
                   }
 
+                  /* ------------------------------------------------------------------ */
                   RegisterFile tmp_file(reg_file);
                   tmp_file.fill_killed_operands(instr.get());
-                  for (unsigned i = 0; i < instr->operands.size(); ++i) {
+
+                  for (unsigned i = 0u; i < instr->operands.size(); ++i)
                         if ((correct_mask >> i) & 1u && instr->operands[i].isKill())
                               tmp_file.clear(instr->operands[i]);
-                  }
 
                   const PhysRegInterval win{best_pos, size_dw};
                   std::vector<unsigned> vars = collect_vars(ctx, tmp_file, win);
@@ -2977,54 +3045,50 @@ resolve_vector_operands(ra_ctx&                     ctx,
                   return true;
             }
 
-            static bool
-            sop2_can_use_sopk(const ra_ctx& ctx, const Instruction* instr)
+            static inline bool
+            sop2_can_use_sopk(const ra_ctx& /*ctx*/, const Instruction* instr)
             {
-                  (void)ctx;
-                  if (UNLIKELY(!instr || instr->format != Format::SOP2 || instr->operands.size() != 2))
+                  if (UNLIKELY(!instr) ||
+                        instr->format != Format::SOP2 ||
+                        instr->operands.size() != 2u)
                         return false;
 
+                  /* Fast explicit check without UB shifts. */
                   const aco_opcode op = instr->opcode;
-                  switch (op) {
-                        case aco_opcode::s_add_i32:
-                        case aco_opcode::s_mul_i32:
-                        case aco_opcode::s_cselect_b32:
-                              break;
-                        case aco_opcode::s_add_u32:
-                              if (instr->definitions.size() < 2 || !instr->definitions[1].isKill())
-                                    return false;
-                        break;
-                        default:
-                              return false;
-                  }
+                  const bool k_capable =
+                  op == aco_opcode::s_add_i32      ||
+                  op == aco_opcode::s_add_u32      ||
+                  op == aco_opcode::s_mul_i32      ||
+                  op == aco_opcode::s_cselect_b32;
 
-                  if (instr->operands[0].isLiteral() || !instr->operands[1].isLiteral())
+                  if (!k_capable)
                         return false;
 
-                  const Operand& sgpr_op = instr->operands[0];
-                  if (!sgpr_op.isTemp() || !sgpr_op.isKillBeforeDef())
+                  /* Extra restriction for s_add_u32. */
+                  if (op == aco_opcode::s_add_u32 &&
+                        (instr->definitions.size() < 2u || !instr->definitions[1].isKill()))
                         return false;
 
-                  /* A tied operand means the definition must use the same register as a source.
-                   * In SSA, this means the definition's Temp must be the same as the source's.
-                   * We use get_tied_defs() as the canonical way to check this relationship.
-                   * The const_cast is a necessary evil because the helper isn't const-correct. */
-                  auto tied_defs = get_tied_defs(const_cast<Instruction*>(instr));
-                  if (tied_defs.empty() || tied_defs[0] != 0 ||
-                        instr->definitions[0].tempId() != sgpr_op.tempId())
+                  const Operand& op0 = instr->operands[0];
+                  const Operand& op1 = instr->operands[1];
+
+                  if (!op0.isTemp()    ||  /* SGPR, not literal            */
+                        !op0.isLiteral() ||  /* first operand literal flag    */
+                        op1.isLiteral())    /* second operand must NOT be literal */
+                  return false;
+
+                  if (!op0.isKillBeforeDef())
                         return false;
 
-                  /* On Vega, SOP2 can use inline constants from -16 to 64. SOPK is only
-                   * needed for larger immediates that still fit in 16 bits. */
-                  const uint32_t imm = instr->operands[1].constantValue();
-                  if (int32_t(imm) >= -16 && int32_t(imm) <= 64)
-                        return false;
+                  /* Verify tied-def. */
+                  if (auto tied = get_tied_defs(const_cast<Instruction*>(instr));
+                      tied.empty() || tied[0] != 0u ||
+                      instr->definitions[0].tempId() != op0.tempId())
+                      return false;
 
-                  const int32_t simm = static_cast<int32_t>(imm);
-                  if (simm < -32768 || simm > 32767)
-                        return false;
-
-                  return true;
+                  /* Inline constants –16…64 keep SOP2; >16-bit doesn’t fit SOPK. */
+                  const int32_t imm = op1.constantValue();
+                  return (imm < -16 || imm > 64) && imm >= -32768 && imm <= 32767;
             }
 
             void
@@ -3344,50 +3408,44 @@ resolve_vector_operands(ra_ctx&                     ctx,
             }
 
             static void
-            optimize_encoding_sopk(ra_ctx& ctx, RegisterFile& reg_file, aco_ptr<Instruction>& instr)
+            optimize_encoding_sopk(ra_ctx&        ctx,
+                                   RegisterFile&  reg_file,
+                                   aco_ptr<Instruction>& instr)
             {
                   if (!sop2_can_use_sopk(ctx, instr.get()))
                         return;
 
                   const Operand& tied_op = instr->operands[0];
-                  unsigned def_id = instr->definitions[0].tempId();
+                  const unsigned def_id  = instr->definitions[0].tempId();
+
+                  /* Early exit when SGPR already WAR-hinted or pinned by affinity. */
+                  if (ctx.war_hint[tied_op.physReg()])
+                        return;
+
                   if (ctx.assignments[def_id].affinity) {
-                        assignment& affinity = ctx.assignments[ctx.assignments[def_id].affinity];
-                        if (affinity.assigned && affinity.reg != tied_op.physReg()) {
-                              bool is_affinity_reg_available = !reg_file.test(affinity.reg, tied_op.bytes()) ||
-                              std::any_of(instr->operands.begin(), instr->operands.end(),
-                                          [&](const Operand& op) {
-                                                return op.isKillBeforeDef() && op.physReg() == affinity.reg;
-                                          });
-                              if (is_affinity_reg_available)
-                                    return;
-                        }
+                        const assignment& aff = ctx.assignments[ctx.assignments[def_id].affinity];
+                        if (aff.assigned && aff.reg == tied_op.physReg())
+                              return;
                   }
 
                   const Operand& lit_op = instr->operands[1];
-                  const uint16_t imm16 = static_cast<uint16_t>(lit_op.constantValue());
+                  const uint16_t imm16  = static_cast<uint16_t>(lit_op.constantValue());
 
-                  aco_ptr<Instruction> sopk{create_instruction(aco_opcode::s_nop, Format::SOPK, 1, 1)};
-                  sopk->definitions[0] = instr->definitions[0];
-                  sopk->operands[0] = tied_op;
-                  sopk->salu().imm = imm16;
+                  aco_ptr<Instruction> sopk{create_instruction(aco_opcode::s_nop,
+                        Format::SOPK, 1, 1)};
+                        sopk->definitions[0] = instr->definitions[0];
+                        sopk->operands[0]    = tied_op;
+                        sopk->salu().imm     = imm16;
 
-                  switch (instr->opcode) {
-                        case aco_opcode::s_add_i32:
-                        case aco_opcode::s_add_u32:
-                              sopk->opcode = aco_opcode::s_addk_i32;
-                              break;
-                        case aco_opcode::s_mul_i32:
-                              sopk->opcode = aco_opcode::s_mulk_i32;
-                              break;
-                        case aco_opcode::s_cselect_b32:
-                              sopk->opcode = aco_opcode::s_cmovk_i32;
-                              break;
-                        default:
-                              unreachable("Unexpected opcode in optimize_encoding_sopk");
-                  }
+                        switch (instr->opcode) {
+                              case aco_opcode::s_add_i32:
+                              case aco_opcode::s_add_u32:   sopk->opcode = aco_opcode::s_addk_i32;  break;
+                              case aco_opcode::s_mul_i32:   sopk->opcode = aco_opcode::s_mulk_i32;  break;
+                              case aco_opcode::s_cselect_b32: sopk->opcode = aco_opcode::s_cmovk_i32; break;
+                              default: unreachable("invalid SOP2 opcode for SOPK optimisation");
+                        }
 
-                  instr = std::move(sopk);
+                        instr = std::move(sopk);
             }
 
             void
