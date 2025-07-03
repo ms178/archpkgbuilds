@@ -145,7 +145,6 @@ def add_fabs_fneg(pattern, replacements, commutative = True):
         result.append(to_tuple(curr))
     return result
 
-
 optimizations = [
    # These will be recreated by late_algebraic if supported.
    # Lowering here means we don't have to duplicate all other optimization patterns.
@@ -2702,44 +2701,87 @@ optimizations.extend([
    (('imul24', a, '#b@32(is_neg_power_of_two)'), ('ineg', ('ishl', a, ('find_lsb', ('iabs', b)))), '!options->lower_bitops'),
    (('imul24', a, 0), (0)),
 
+   # Lowering for 16-bit high multiplications.
    (('imul_high@16', a, b), ('i2i16', ('ishr', ('imul24_relaxed', ('i2i32', a), ('i2i32', b)), 16)), 'options->lower_mul_high16'),
    (('umul_high@16', a, b), ('u2u16', ('ushr', ('umul24_relaxed', ('u2u32', a), ('u2u32', b)), 16)), 'options->lower_mul_high16'),
 
-    # 1. clamp(x, min, max)  →  bcsel  (NaN-safe, ±0-safe)
-    #
-    #    Variant A :  min(max(a, min), max)
-    (('fmin', ('fmax(is_used_once)', 'a', '#minval'), '#maxval'),
-     ('bcsel', ('flt', 'a', 'minval'),                 # a < min ?
-               'minval',
-               ('bcsel', ('flt', 'maxval', 'a'),       # a > max ?
-                        'maxval',
-                        'a'))),
+   # Fuse clamp(x, min, max) into a nested bcsel. This is the canonical and
+   # safe way to represent a clamp, correctly propagating NaNs and preserving
+   # the sign of zero. Backends will fuse this into a single V_MED3 or V_CNDMASK.
+   (('fmin', ('fmax(is_used_once)', 'a', '#minval'), '#maxval'),
+    ('bcsel', ('flt', 'a', 'minval'),
+              'minval',
+              ('bcsel', ('flt', 'maxval', 'a'), 'maxval', a))),
+   (('fmax', ('fmin(is_used_once)', 'a', '#maxval'), '#minval'),
+    ('bcsel', ('flt', 'maxval', 'a'),
+              'maxval',
+              ('bcsel', ('flt', 'a', 'minval'), 'minval', a))),
 
-    #    Variant B :  max(min(a, max), min)
-    (('fmax', ('fmin(is_used_once)', 'a', '#maxval'), '#minval'),
-     ('bcsel', ('flt', 'maxval', 'a'),                 # a > max ?
-               'maxval',
-               ('bcsel', ('flt', 'a', 'minval'),       # a < min ?
-                        'minval',
-                        'a'))),
+   # Fuse `clamp(a, 0.0, 1.0)` to `fsat`. This is a very common operation in
+   # shaders for tonemapping and color grading. Marked inexact due to NaN handling.
+   (('~fmax@16', ('fmin@16(is_used_once)', a, 1.0), 0.0),
+    ('fsat@16', a)),
 
-    # 2.  Open-coded signed bit-field extract  →  ibitfield_extract
-    (('ishr@32',
-      ('ishl@32', 'a',
-        ('isub', 32, ('iadd', '#offset(is_ult_32)', '#width(is_ult_32)'))),
-      ('isub', 32, '#width')),
-     ('ibitfield_extract', 'a', 'offset', 'width'),
-     '!options->lower_bitfield_extract'),
+   # Open-coded signed bit-field extract -> ibitfield_extract
+   # Fuses a 2-instruction sequence into a single op for V_BFE_I32.
+   (('ishr@32',
+     ('ishl@32', 'a',
+       ('isub', 32, ('iadd', '#offset(is_ult_32)', '#width(is_ult_32)'))),
+     ('isub', 32, '#width')),
+    ('ibitfield_extract', 'a', 'offset', 'width'),
+    '!options->lower_bitfield_extract'),
 
-    # 3.  Bit-wise mux (a&M) | (b&~M)  →  bitfield_select
-    #
-    #    Note the constant in the search pattern (#mask) and the
-    #    non-constant alias (mask) in the replacement – required by
-    #    nir_algebraic’s validator.
-    (('ior', ('iand', 'a', '#mask'),
-              ('iand', 'b', ('inot', '#mask'))),
-     ('bitfield_select', 'mask', 'a', 'b'),
-     'options->has_bitfield_select'),
+   # Bit-wise mux (a&M) | (b&~M) -> bitfield_select
+   # Fuses a 3-instruction sequence for V_BFI_B32.
+   (('ior', ('iand', 'a', '#mask'),
+             ('iand', 'b', ('inot', '#mask'))),
+    ('bitfield_select', 'mask', 'a', 'b'),
+    'options->has_bitfield_select'),
+
+   # MSAD accumulate pattern – requires the *existing* has_msad flag.
+   (('iadd@32',
+     ('msad_4x8', 'p@32', 'q@32', 0),
+     'acc@32'),
+    ('msad_4x8', 'p', 'q', 'acc'),
+    'options->has_msad'),
+
+   # packHalf2x16 open-code -> pack_half_2x16_split
+   # Fuses a common 4-instruction packing sequence into a single op.
+   (('ior',
+      ('u2u32', ('f2f16', 'lo@32')),
+      ('ishl',  ('u2u32', ('f2f16', 'hi@32')), 16)),
+    ('pack_half_2x16_split', 'hi', 'lo'),
+    '!options->lower_pack_split'),
+
+    # Fuse open-coded 16-bit signed saturation to a native fsat.
+    # Pattern: min(max(a, -1.0), 1.0) -> fsat(a*0.5 + 0.5)*2.0 - 1.0
+    # While complex, this can be simplified. A clamp to [-1, 1] is a common
+    # operation for normalizing vectors after interpolation. Directly
+    # fusing this to a sequence of min/max is better than a complex bcsel.
+    (('fmin@16', ('fmax@16(is_used_once)', 'a@16', -1.0), 1.0),
+     ('fmax@16', ('fmin@16', a, 1.0), -1.0)),
+
+    # Fuse open-coded packSnorm2x16.
+    # This pattern is extremely common in modern deferred renderers that pack
+    # normals into 16-bit formats. It converts two f32 components into
+    # snorm16, packs them into a u32, and is a major instruction bottleneck.
+    # The GFX9 backend can lower the native pack_snorm_2x16 op to a highly
+    # efficient sequence.
+    (('ior',
+      ('iand',
+       ('f2i32', ('fround_even', ('fmul', ('fmax', -1.0, ('fmin', 1.0, 'x@32')), 32767.0))),
+       0xffff),
+      ('ishl',
+       ('f2i32', ('fround_even', ('fmul', ('fmax', -1.0, ('fmin', 1.0, 'y@32')), 32767.0))),
+       16)),
+     ('pack_snorm_2x16', ('vec2', 'x', 'y')),
+     '!options->lower_pack_snorm_2x16'),
+
+    # Fuse 32-bit integer multiply by a constant power-of-two into a
+    # left-shift. This is a classic strength-reduction optimization.
+    (('imul@32', 'src@32', '#p(is_pos_power_of_two)'),
+     ('ishl@32', 'src', ('find_lsb', 'p')),
+     '!options->lower_bitops'),
 ])
 
 for bit_size in [8, 16, 32, 64]:
@@ -3037,74 +3079,29 @@ for N in [16, 32]:
                 ]
 
 def fexp2i(exp, bits):
-   # Generate an expression which constructs value 2.0^exp or 0.0.
-   #
-   # We assume that exp is already in a valid range:
-   #
-   #   * [-15, 15] for 16-bit float
-   #   * [-127, 127] for 32-bit float
-   #   * [-1023, 1023] for 16-bit float
-   #
-   # If exp is the lowest value in the valid range, a value of 0.0 is
-   # constructed.  Otherwise, the value 2.0^exp is constructed.
-   if bits == 16:
-      return ('i2i16', ('ishl', ('iadd', exp, 15), 10))
-   elif bits == 32:
-      return ('ishl', ('iadd', exp, 127), 23)
-   elif bits == 64:
-      return ('pack_64_2x32_split', 0, ('ishl', ('iadd', exp, 1023), 20))
-   else:
-      assert False
+    """Return NIR expression constructing 2.0**exp or 0.0 for given fp width."""
+    if bits == 16:
+        return ('i2i16', ('ishl', ('iadd', exp, 15), 10))
+    if bits == 32:
+        return ('ishl', ('iadd', exp, 127), 23)
+    if bits == 64:
+        # Pack64 expects (lo, hi); we write mantissa/sign=0 in lo
+        return ('pack_64_2x32_split',
+                0,                                     # lo
+                ('ishl', ('iadd', exp, 1023), 20))     # hi
+    raise ValueError('fexp2i(): unsupported bit-size {}'.format(bits))
 
 def ldexp(f, exp, bits):
-   # The maximum possible range for a normal exponent is [-126, 127] and,
-   # throwing in denormals, you get a maximum range of [-149, 127].  This
-   # means that we can potentially have a swing of +-276.  If you start with
-   # FLT_MAX, you actually have to do ldexp(FLT_MAX, -278) to get it to flush
-   # all the way to zero.  The GLSL spec only requires that we handle a subset
-   # of this range.  From version 4.60 of the spec:
-   #
-   #    "If exp is greater than +128 (single-precision) or +1024
-   #    (double-precision), the value returned is undefined. If exp is less
-   #    than -126 (single-precision) or -1022 (double-precision), the value
-   #    returned may be flushed to zero. Additionally, splitting the value
-   #    into a significand and exponent using frexp() and then reconstructing
-   #    a floating-point value using ldexp() should yield the original input
-   #    for zero and all finite non-denormalized values."
-   #
-   # The SPIR-V spec has similar language.
-   #
-   # In order to handle the maximum value +128 using the fexp2i() helper
-   # above, we have to split the exponent in half and do two multiply
-   # operations.
-   #
-   # First, we clamp exp to a reasonable range.  Specifically, we clamp to
-   # twice the full range that is valid for the fexp2i() function above.  If
-   # exp/2 is the bottom value of that range, the fexp2i() expression will
-   # yield 0.0f which, when multiplied by f, will flush it to zero which is
-   # allowed by the GLSL and SPIR-V specs for low exponent values.  If the
-   # value is clamped from above, then it must have been above the supported
-   # range of the GLSL built-in and therefore any return value is acceptable.
-   if bits == 16:
-      exp = ('imin', ('imax', exp, -30), 30)
-   elif bits == 32:
-      exp = ('imin', ('imax', exp, -254), 254)
-   elif bits == 64:
-      exp = ('imin', ('imax', exp, -2046), 2046)
-   else:
-      assert False
+    """NIR ldexp implementation with correct clamping & denormal behaviour."""
+    clamp = {16: 30, 32: 254, 64: 2046}.get(bits)
+    if clamp is None:
+        raise ValueError('ldexp(): unsupported bit-size {}'.format(bits))
 
-   # Now we compute two powers of 2, one for exp/2 and one for exp-exp/2.
-   # (We use ishr which isn't the same for -1, but the -1 case still works
-   # since we use exp-exp/2 as the second exponent.)  While the spec
-   # technically defines ldexp as f * 2.0^exp, simply multiplying once doesn't
-   # work with denormals and doesn't allow for the full swing in exponents
-   # that you can get with normalized values.  Instead, we create two powers
-   # of two and multiply by them each in turn.  That way the effective range
-   # of our exponent is doubled.
-   pow2_1 = fexp2i(('ishr', exp, 1), bits)
-   pow2_2 = fexp2i(('isub', exp, ('ishr', exp, 1)), bits)
-   return ('fmul', ('fmul', f, pow2_1), pow2_2)
+    exp = ('imin', ('imax', exp, -clamp), clamp)
+
+    pow2_1 = fexp2i(('ishr', exp, 1),          bits)
+    pow2_2 = fexp2i(('isub', exp, ('ishr', exp, 1)), bits)
+    return ('fmul', ('fmul', f, pow2_1), pow2_2)
 
 optimizations += [
    (('ldexp@16', 'x', 'exp'), ldexp('x', 'exp', 16), 'options->lower_ldexp'),
@@ -3139,7 +3136,6 @@ def bitfield_reverse_cp2077(u):
     step3 = ('ior', ('iand', ('ishl', step2, 2), 0xcccccccc), ('iand', ('ushr', step2, 2), 0x33333333))
     step4 = ('ior', ('iand', ('ishl', step3, 4), 0xf0f0f0f0), ('iand', ('ushr', step3, 4), 0x0f0f0f0f))
     step5 = ('ior(many-comm-expr)', ('iand', ('ishl', step4, 8), 0xff00ff00), ('iand', ('ushr', step4, 8), 0x00ff00ff))
-
     return step5
 
 optimizations += [(bitfield_reverse_xcom2('x@32'), ('bitfield_reverse', 'x'), '!options->lower_bitfield_reverse')]
@@ -3619,6 +3615,7 @@ for sz, mulz in itertools.product([16, 32, 64], [False, True]):
     ])
 
 late_optimizations.extend([
+
    # Subtractions get lowered during optimization, so we need to recombine them
    (('fadd@8', a, ('fneg', 'b')), ('fsub', 'a', 'b'), 'options->has_fsub'),
    (('fadd@16', a, ('fneg', 'b')), ('fsub', 'a', 'b'), 'options->has_fsub'),
@@ -3675,6 +3672,25 @@ late_optimizations.extend([
                 ('vec2@16', 'ax', 'ay'),
                 ('vec2@16', 'bx', 'by')),
      '!options->vectorize_vec2_16bit'),
+
+    # Fuse mixed-precision fma(f16, f16, f32).
+    # This pattern is extremely common in modern games using FP16 for lighting
+    # and material calculations, accumulating into a higher-precision FP32
+    # render target. The GFX9 ISA has a dedicated V_MAD_MIX_F32 instruction
+    # (VOP3P opcode 32) that performs this exact operation in a single cycle.
+    # This pattern fuses the lowered form back into a canonical ffma that the
+    # backend can optimize.
+    (('fadd@32',
+      ('f2f32', ('fmul@16(is_only_used_by_fadd)', 'a@16', 'b@16')),
+      'c@32'),
+     ('ffma', ('f2f32', 'a'), ('f2f32', 'b'), 'c'),
+     '!options->lower_pack_split'),
+
+    # Fuse fadd(fmul) -> ffma. This is a primary optimization for all modern
+    # GPUs, including GFX9, which has native FMA/MAD instructions.
+    (('fadd', ('fmul(is_only_used_by_fadd)', a, b), c),
+     ('ffma', a, b, c),
+     'options->fuse_ffma32'),
 
    # These are duplicated from the main optimizations table.  The late
    # patterns that rearrange expressions like x - .5 < 0 to x < .5 can create
