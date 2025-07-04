@@ -32,6 +32,8 @@
 #include "util/u_math.h"
 #include "nir.h"
 #include "nir_range_analysis.h"
+#include <stdbool.h>
+#include <stdint.h>
 
 #ifndef likely
 #  define likely(x)   __builtin_expect(!!(x), 1)
@@ -40,113 +42,176 @@
 #  define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
 
-/* -------- Generic 8-bit literal (-16…64 or pow2 up to 0x4000) -------- */
 static inline bool
 is_imm_8bit(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
             unsigned src, unsigned num_components, const uint8_t *swizzle)
 {
       const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
-      if (unlikely(cv == NULL))
+      if (unlikely(!cv)) {
             return false;
-
-      unsigned bits = instr->src[src].src.ssa->bit_size;
-      if (bits != 16 && bits != 32)
-            return false;
-
-      for (unsigned i = 0; i < num_components; ++i) {
-            int64_t v = nir_src_comp_as_int(instr->src[src].src, swizzle[i]);
-            bool ok = (v >= 0  && v <= 64)      ||
-            (v >= -16 && v <= -1)     ||
-            util_is_power_of_two_or_zero64(v);
-            if (unlikely(!ok))
-                  return false;
       }
-      return true;
-}
 
-/* -------- 16-bit float 0.0 / 1.0 (inline FP literal on GFX9) -------- */
-static inline bool
-is_imm_fp16_zero_or_one(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
-                        unsigned src, unsigned num_components,
-                        const uint8_t *swizzle)
-{
-      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
-      if (unlikely(cv == NULL) ||
-            instr->src[src].src.ssa->bit_size != 16)
+      unsigned bit_size = instr->src[src].src.ssa->bit_size;
+      if (bit_size != 16 && bit_size != 32) {
             return false;
-
-      for (unsigned i = 0; i < num_components; ++i) {
-            uint16_t h = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]) & 0xffffu;
-            if (h != 0x0000u && h != 0x3c00u) /* 0.0h / 1.0h */
-                  return false;
       }
-      return true;
-}
 
-/* ---------------------- 16-bit NaN detection ------------------------- */
-static inline bool
-is_fp16_nan(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
-            unsigned src, unsigned num_components, const uint8_t *swizzle)
-{
-      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
-      if (unlikely(cv == NULL) ||
-            instr->src[src].src.ssa->bit_size != 16)
-            return false;
+      for (unsigned i = 0; i < num_components; i++) {
+            int64_t val = nir_src_comp_as_int(instr->src[src].src, swizzle[i]);
 
-      for (unsigned i = 0; i < num_components; ++i) {
-            uint16_t h = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]) & 0xffffu;
-            if ((h & 0x7c00u) != 0x7c00u) /* exponent all ones */
-                  return false;
-      }
-      return true;
-}
+            bool is_small_int = (val >= -16 && val <= 64);
+            bool is_pos_pow2 = (val > 0 && val <= 0x4000 && util_is_power_of_two_or_zero64(val));
+            bool is_neg_pow2 = (val < 0 && val >= -0x4000 && util_is_power_of_two_or_zero64(-val));
 
-/* =====================  tuned power-of-two helpers ==================== */
-
-static inline bool
-is_pos_power_of_two(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
-                    unsigned src, unsigned num_components,
-                    const uint8_t *swizzle)
-{
-      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
-      if (unlikely(cv == NULL))
-            return false;
-
-      nir_alu_type base =
-      nir_alu_type_get_base_type(nir_op_infos[instr->op].input_types[src]);
-
-      for (unsigned i = 0; i < num_components; ++i) {
-            if (base == nir_type_int) {
-                  int64_t v = nir_src_comp_as_int(instr->src[src].src, swizzle[i]);
-                  if (unlikely(v <= 0 || !util_is_power_of_two_or_zero64(v)))
-                        return false;
-            } else if (base == nir_type_uint) {
-                  uint64_t v = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
-                  if (unlikely(v == 0 || !util_is_power_of_two_or_zero64(v)))
-                        return false;
-            } else {
+            if (!is_small_int && !is_pos_pow2 && !is_neg_pow2) {
                   return false;
             }
       }
       return true;
 }
 
+/**
+ * Check if a 16-bit float is 0.0 or 1.0
+ *
+ * These values can be encoded as inline constants on GFX9,
+ * saving a register and memory fetch.
+ */
+static inline bool
+is_imm_fp16_zero_or_one(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
+                        unsigned src, unsigned num_components,
+                        const uint8_t *swizzle)
+{
+      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
+      if (unlikely(!cv))
+            return false;
+
+      if (instr->src[src].src.ssa->bit_size != 16)
+            return false;
+
+      for (unsigned i = 0; i < num_components; i++) {
+            uint16_t bits = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
+
+            /* Check for exact bit patterns:
+             * 0x0000 = +0.0f16
+             * 0x8000 = -0.0f16 (also accepted as zero)
+             * 0x3c00 = 1.0f16
+             */
+            if (bits != 0x0000 && bits != 0x8000 && bits != 0x3c00)
+                  return false;
+      }
+
+      return true;
+}
+
+/**
+ * Check if a 16-bit float value is NaN
+ *
+ * IEEE 754 half-precision NaN:
+ * - Sign bit: any (bit 15)
+ * - Exponent: all ones (bits 14-10 = 0x1f)
+ * - Mantissa: non-zero (bits 9-0)
+ */
+static inline bool
+is_fp16_nan(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
+            unsigned src, unsigned num_components, const uint8_t *swizzle)
+{
+      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
+      if (unlikely(!cv))
+            return false;
+
+      if (instr->src[src].src.ssa->bit_size != 16)
+            return false;
+
+      for (unsigned i = 0; i < num_components; i++) {
+            uint16_t bits = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
+
+            /* Extract exponent (bits 14-10) and mantissa (bits 9-0) */
+            uint16_t exp_bits = (bits >> 10) & 0x1f;
+            uint16_t mantissa = bits & 0x3ff;
+
+            /* NaN requires: exponent = 0x1f (all ones) AND mantissa != 0 */
+            if (exp_bits != 0x1f || mantissa == 0)
+                  return false;
+      }
+
+      return true;
+}
+
+/**
+ * Check if value is a positive power of two
+ *
+ * Used for strength reduction: imul(x, pow2) -> ishl(x, log2(pow2))
+ * This saves cycles on GFX9 where shifts are faster than multiplies.
+ */
+static inline bool
+is_pos_power_of_two(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
+                    unsigned src, unsigned num_components,
+                    const uint8_t *swizzle)
+{
+      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
+      if (unlikely(!cv)) {
+            return false;
+      }
+
+      nir_alu_type type = nir_op_infos[instr->op].input_types[src];
+      nir_alu_type base_type = nir_alu_type_get_base_type(type);
+
+      for (unsigned i = 0; i < num_components; i++) {
+            switch (base_type) {
+                  case nir_type_int: {
+                        int64_t val = nir_src_comp_as_int(instr->src[src].src, swizzle[i]);
+                        if (val <= 0 || !util_is_power_of_two_or_zero64(val))
+                              return false;
+                        break;
+                  }
+                  case nir_type_uint: {
+                        uint64_t val = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
+                        if (val == 0 || !util_is_power_of_two_or_zero64(val))
+                              return false;
+                        break;
+                  }
+                  default:
+                        return false;
+            }
+      }
+      return true;
+}
+
+/**
+ * Check if value is a negative power of two
+ *
+ * Used for patterns like: imul(x, -pow2) -> ineg(ishl(x, log2(pow2)))
+ */
 static inline bool
 is_neg_power_of_two(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
                     unsigned src, unsigned num_components,
                     const uint8_t *swizzle)
 {
       const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
-      if (unlikely(cv == NULL))
+      if (unlikely(!cv))
             return false;
 
-      int64_t int_min = u_intN_min(instr->src[src].src.ssa->bit_size);
+      /* Only signed integers can be negative */
+      nir_alu_type type = nir_op_infos[instr->op].input_types[src];
+      if (nir_alu_type_get_base_type(type) != nir_type_int)
+            return false;
 
-      for (unsigned i = 0; i < num_components; ++i) {
-            int64_t v = nir_src_comp_as_int(instr->src[src].src, swizzle[i]);
-            if (unlikely(v == int_min || v >= 0 || !util_is_power_of_two_or_zero64(-v)))
+      /* Get the minimum representable value for overflow checking */
+      unsigned bit_size = instr->src[src].src.ssa->bit_size;
+      int64_t int_min = u_intN_min(bit_size);
+
+      for (unsigned i = 0; i < num_components; i++) {
+            int64_t val = nir_src_comp_as_int(instr->src[src].src, swizzle[i]);
+
+            /* INT_MIN is technically a power of two, but -INT_MIN overflows */
+            if (val == int_min || val >= 0)
+                  return false;
+
+            /* Check if -val is a power of two */
+            if (!util_is_power_of_two_or_zero64(-val))
                   return false;
       }
+
       return true;
 }
 
@@ -381,13 +446,27 @@ is_ult(const nir_alu_instr *instr, unsigned src, unsigned num_components, const 
    return true;
 }
 
-/** Is value unsigned less than 32? */
+/**
+ * Check if value is less than 32
+ *
+ * Used for shift amount validation on 32-bit operations.
+ */
 static inline bool
 is_ult_32(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
           unsigned src, unsigned num_components,
           const uint8_t *swizzle)
 {
-   return is_ult(instr, src, num_components, swizzle, 32);
+      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
+      if (unlikely(!cv))
+            return false;
+
+      for (unsigned i = 0; i < num_components; i++) {
+            uint32_t val = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
+            if (val >= 32)
+                  return false;
+      }
+
+      return true;
 }
 
 /** Is value unsigned less than 0xfffc07fc? */
@@ -566,7 +645,7 @@ has_multiple_uses(struct hash_table *ht, const nir_alu_instr *instr,
 static inline bool
 is_used_once(const nir_alu_instr *instr)
 {
-   return list_is_singular(&instr->def.uses);
+      return list_is_singular(&instr->def.uses);
 }
 
 static inline bool
@@ -690,29 +769,44 @@ is_only_used_as_float_impl(const nir_alu_instr *instr, unsigned depth)
 static inline bool
 is_only_used_as_float(const nir_alu_instr *instr)
 {
-   return is_only_used_as_float_impl(instr, 0);
+      if (instr->op != nir_op_vec2)
+            return false;
+
+      nir_foreach_use(use, &instr->def) {
+            nir_instr *parent = nir_src_parent_instr(use);
+            if (parent->type != nir_instr_type_alu)
+                  return false;
+
+            nir_alu_instr *alu = nir_instr_as_alu(parent);
+            nir_alu_type type = nir_op_infos[alu->op].input_types[0];
+            if (nir_alu_type_get_base_type(type) != nir_type_float)
+                  return false;
+      }
+
+      return true;
 }
 
 static inline bool
 is_only_used_by_fadd(const nir_alu_instr *instr)
 {
-   nir_foreach_use(src, &instr->def) {
-      const nir_instr *const user_instr = nir_src_parent_instr(src);
-      if (user_instr->type != nir_instr_type_alu)
-         return false;
+      nir_foreach_use(src, &instr->def) {
+            const nir_instr *user_instr = nir_src_parent_instr(src);
+            if (user_instr->type != nir_instr_type_alu) {
+                  return false;
+            }
 
-      const nir_alu_instr *const user_alu = nir_instr_as_alu(user_instr);
-      assert(instr != user_alu);
+            const nir_alu_instr *user_alu = nir_instr_as_alu(user_instr);
+            assert(instr != user_alu);
 
-      if (user_alu->op == nir_op_fneg || user_alu->op == nir_op_fabs) {
-         if (!is_only_used_by_fadd(user_alu))
-            return false;
-      } else if (user_alu->op != nir_op_fadd) {
-         return false;
+            if (user_alu->op == nir_op_fneg || user_alu->op == nir_op_fabs) {
+                  if (!is_only_used_by_fadd(user_alu)) {
+                        return false;
+                  }
+            } else if (user_alu->op != nir_op_fadd) {
+                  return false;
+            }
       }
-   }
-
-   return true;
+      return true;
 }
 
 static inline bool
@@ -899,39 +993,50 @@ is_const_bfm(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
 }
 
 /**
- * Returns whether the 5 LSBs of an operand are non-zero.
+ * Check if the 5 least significant bits are non-zero
+ *
+ * Used for bit manipulation patterns.
  */
 static inline bool
 is_5lsb_not_zero(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
                  unsigned src, unsigned num_components,
                  const uint8_t *swizzle)
 {
-   if (nir_src_as_const_value(instr->src[src].src) == NULL)
-      return false;
-
-   for (unsigned i = 0; i < num_components; i++) {
-      const uint64_t c = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
-      if ((c & 0x1f) == 0)
-         return false;
-   }
-
-   return true;
-}
-
-static inline bool
-is_not_uint_max(UNUSED struct hash_table *ht,
-                const nir_alu_instr      *instr,
-                unsigned                  src,
-                unsigned                  num_components,
-                const uint8_t           *swizzle)
-{
-      if (!nir_src_as_const_value(instr->src[src].src))
+      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
+      if (unlikely(!cv))
             return false;
 
-      for (unsigned i = 0; i < num_components; ++i) {
-            uint64_t v = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
-            if (v == UINT16_MAX)       /* 0xffff */
+      for (unsigned i = 0; i < num_components; i++) {
+            uint32_t val = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
+            if ((val & 0x1f) == 0)
                   return false;
+      }
+
+      return true;
+}
+
+/**
+ * Check if value is not UINT_MAX for its bit size
+ *
+ * Used to ensure safe increment operations won't overflow.
+ */
+static inline bool
+is_not_uint_max(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
+                unsigned src, unsigned num_components,
+                const uint8_t *swizzle)
+{
+      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
+      if (unlikely(!cv)) {
+            return true; /* Not a constant, assume it might not be max */
+      }
+
+      uint64_t uint_max = u_uintN_max(instr->src[src].src.ssa->bit_size);
+
+      for (unsigned i = 0; i < num_components; i++) {
+            uint64_t val = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
+            if (val == uint_max) {
+                  return false;
+            }
       }
       return true;
 }
@@ -939,13 +1044,13 @@ is_not_uint_max(UNUSED struct hash_table *ht,
 static inline bool
 no_signed_wrap(const nir_alu_instr *instr)
 {
-   return instr->no_signed_wrap;
+      return instr->no_signed_wrap;
 }
 
 static inline bool
 no_unsigned_wrap(const nir_alu_instr *instr)
 {
-   return instr->no_unsigned_wrap;
+      return instr->no_unsigned_wrap;
 }
 
 static inline bool
@@ -1043,11 +1148,21 @@ is_a_number_not_positive(struct hash_table *ht, const nir_alu_instr *instr,
 }
 
 static inline bool
-is_not_zero(struct hash_table *ht, const nir_alu_instr *instr, unsigned src,
-            UNUSED unsigned num_components, UNUSED const uint8_t *swizzle)
+is_not_zero(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
+            unsigned src, unsigned num_components,
+            const uint8_t *swizzle)
 {
-   const struct ssa_result_range v = nir_analyze_range(ht, instr, src);
-   return v.range == lt_zero || v.range == gt_zero || v.range == ne_zero;
+      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
+      if (unlikely(!cv)) {
+            return false; /* Not a constant, can't guarantee non-zero */
+      }
+
+      for (unsigned i = 0; i < num_components; i++) {
+            if (nir_src_comp_as_uint(instr->src[src].src, swizzle[i]) == 0) {
+                  return false;
+            }
+      }
+      return true;
 }
 
 static inline bool

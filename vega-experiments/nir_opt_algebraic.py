@@ -2705,83 +2705,39 @@ optimizations.extend([
    (('imul_high@16', a, b), ('i2i16', ('ishr', ('imul24_relaxed', ('i2i32', a), ('i2i32', b)), 16)), 'options->lower_mul_high16'),
    (('umul_high@16', a, b), ('u2u16', ('ushr', ('umul24_relaxed', ('u2u32', a), ('u2u32', b)), 16)), 'options->lower_mul_high16'),
 
-   # Fuse clamp(x, min, max) into a nested bcsel. This is the canonical and
-   # safe way to represent a clamp, correctly propagating NaNs and preserving
-   # the sign of zero. Backends will fuse this into a single V_MED3 or V_CNDMASK.
+   # Optimize vec2 unsigned comparison predicates to usub_sat with clamp.
+   (('b2i16', ('vec2', ('ult',  'a@16', 'b@16'), ('ult', 'c@16', 'd@16'))),
+    ('umin@16', ('vec2', 1, 1), ('usub_sat@16', ('vec2', 'b', 'd'), ('vec2', 'a', 'c'))),
+    'options->vectorize_vec2_16bit && !options->lower_usub_sat'),
+   (('b2i16', ('vec2', ('uge', 'a@16', '#b(is_not_zero)'), ('uge', 'c@16', '#d(is_not_zero)'))),
+    ('umin@16', ('vec2', 1, 1), ('usub_sat@16', ('vec2', 'a', 'c'), ('iadd@16', ('vec2', 'b', 'd'), ('vec2', -1, -1)))),
+    'options->vectorize_vec2_16bit && !options->lower_usub_sat'),
+   (('b2i16', ('vec2', ('uge', '#a(is_not_uint_max)', 'b@16'), ('uge', '#c(is_not_uint_max)', 'd@16'))),
+    ('umin@16', ('vec2', 1, 1), ('usub_sat@16', ('iadd@16', ('vec2', 'a', 'c'), ('vec2', 1, 1)), ('vec2', 'b', 'd'))),
+    'options->vectorize_vec2_16bit && !options->lower_usub_sat'),
+
+   # Clamp-to-range transforms (NaN & ±0 safe)
    (('fmin', ('fmax(is_used_once)', 'a', '#minval'), '#maxval'),
-    ('bcsel', ('flt', 'a', 'minval'),
-              'minval',
-              ('bcsel', ('flt', 'maxval', 'a'), 'maxval', a))),
+    ('bcsel', ('flt', 'a', 'minval'), 'minval', ('bcsel', ('flt', 'maxval', 'a'), 'maxval', 'a'))),
    (('fmax', ('fmin(is_used_once)', 'a', '#maxval'), '#minval'),
-    ('bcsel', ('flt', 'maxval', 'a'),
-              'maxval',
-              ('bcsel', ('flt', 'a', 'minval'), 'minval', a))),
+    ('bcsel', ('flt', 'maxval', 'a'), 'maxval', ('bcsel', ('flt', 'a', 'minval'), 'minval', 'a'))),
+   (('~fmax@32', ('fmin@32(is_used_once)', 'v@32', 1.0), 0.0), ('fsat@32', 'v')),
+   (('~fmax@16', ('fmin@16(is_used_once)', 'v@16', 1.0), 0.0), ('fsat@16', 'v')),
 
-   # Fuse `clamp(a, 0.0, 1.0)` to `fsat`. This is a very common operation in
-   # shaders for tonemapping and color grading. Marked inexact due to NaN handling.
-   (('~fmax@16', ('fmin@16(is_used_once)', a, 1.0), 0.0),
-    ('fsat@16', a)),
+   # Bitfield / bit-op fusions
+   (('ishr@32', ('ishl@32', 'src', ('isub', 32, ('iadd', '#offset(is_ult_32)', '#width(is_ult_32)'))), ('isub', 32, '#width')),
+    ('ibitfield_extract', 'src', 'offset', 'width'), '!options->lower_bitfield_extract'),
+   (('ior', ('iand', 'a', '#mask'), ('iand', 'b', ('inot', '#mask'))),
+    ('bitfield_select', 'mask', 'a', 'b'), 'options->has_bitfield_select'),
+   (('iadd@32', ('msad_4x8', 'p@32', 'q@32', 0), 'acc@32'),
+    ('msad_4x8', 'p', 'q', 'acc'), 'options->has_msad'),
 
-   # Open-coded signed bit-field extract -> ibitfield_extract
-   # Fuses a 2-instruction sequence into a single op for V_BFE_I32.
-   (('ishr@32',
-     ('ishl@32', 'a',
-       ('isub', 32, ('iadd', '#offset(is_ult_32)', '#width(is_ult_32)'))),
-     ('isub', 32, '#width')),
-    ('ibitfield_extract', 'a', 'offset', 'width'),
-    '!options->lower_bitfield_extract'),
-
-   # Bit-wise mux (a&M) | (b&~M) -> bitfield_select
-   # Fuses a 3-instruction sequence for V_BFI_B32.
-   (('ior', ('iand', 'a', '#mask'),
-             ('iand', 'b', ('inot', '#mask'))),
-    ('bitfield_select', 'mask', 'a', 'b'),
-    'options->has_bitfield_select'),
-
-   # MSAD accumulate pattern – requires the *existing* has_msad flag.
-   (('iadd@32',
-     ('msad_4x8', 'p@32', 'q@32', 0),
-     'acc@32'),
-    ('msad_4x8', 'p', 'q', 'acc'),
-    'options->has_msad'),
-
-   # packHalf2x16 open-code -> pack_half_2x16_split
-   # Fuses a common 4-instruction packing sequence into a single op.
-   (('ior',
-      ('u2u32', ('f2f16', 'lo@32')),
-      ('ishl',  ('u2u32', ('f2f16', 'hi@32')), 16)),
-    ('pack_half_2x16_split', 'hi', 'lo'),
-    '!options->lower_pack_split'),
-
-    # Fuse open-coded 16-bit signed saturation to a native fsat.
-    # Pattern: min(max(a, -1.0), 1.0) -> fsat(a*0.5 + 0.5)*2.0 - 1.0
-    # While complex, this can be simplified. A clamp to [-1, 1] is a common
-    # operation for normalizing vectors after interpolation. Directly
-    # fusing this to a sequence of min/max is better than a complex bcsel.
-    (('fmin@16', ('fmax@16(is_used_once)', 'a@16', -1.0), 1.0),
-     ('fmax@16', ('fmin@16', a, 1.0), -1.0)),
-
-    # Fuse open-coded packSnorm2x16.
-    # This pattern is extremely common in modern deferred renderers that pack
-    # normals into 16-bit formats. It converts two f32 components into
-    # snorm16, packs them into a u32, and is a major instruction bottleneck.
-    # The GFX9 backend can lower the native pack_snorm_2x16 op to a highly
-    # efficient sequence.
-    (('ior',
-      ('iand',
-       ('f2i32', ('fround_even', ('fmul', ('fmax', -1.0, ('fmin', 1.0, 'x@32')), 32767.0))),
-       0xffff),
-      ('ishl',
-       ('f2i32', ('fround_even', ('fmul', ('fmax', -1.0, ('fmin', 1.0, 'y@32')), 32767.0))),
-       16)),
-     ('pack_snorm_2x16', ('vec2', 'x', 'y')),
-     '!options->lower_pack_snorm_2x16'),
-
-    # Fuse 32-bit integer multiply by a constant power-of-two into a
-    # left-shift. This is a classic strength-reduction optimization.
-    (('imul@32', 'src@32', '#p(is_pos_power_of_two)'),
-     ('ishl@32', 'src', ('find_lsb', 'p')),
-     '!options->lower_bitops'),
+   # Packing fusions
+   (('ior', ('u2u32', ('f2f16', 'lo@32')), ('ishl',  ('u2u32', ('f2f16', 'hi@32')), 16)),
+    ('pack_half_2x16_split', 'hi', 'lo'), '!options->lower_pack_split'),
+   (('ior', ('iand', ('f2i32', ('fround_even', ('fmul', ('fmax', -1.0, ('fmin', 1.0, 'x@32')), 32767.0))), 0xffff),
+     ('ishl', ('f2i32', ('fround_even', ('fmul', ('fmax', -1.0, ('fmin', 1.0, 'y@32')), 32767.0))), 16)),
+    ('pack_snorm_2x16', ('vec2', 'x', 'y')), '!options->lower_pack_snorm_2x16'),
 ])
 
 for bit_size in [8, 16, 32, 64]:
@@ -3109,38 +3065,27 @@ optimizations += [
    (('ldexp@64', 'x', 'exp'), ldexp('x', 'exp', 64), 'options->lower_ldexp'),
 ]
 
-# XCOM 2 (OpenGL) open-codes bitfieldReverse()
-def bitfield_reverse_xcom2(u):
-    step1 = ('iadd', ('ishl', u, 16), ('ushr', u, 16))
-    step2 = ('iadd', ('iand', ('ishl', step1, 1), 0xaaaaaaaa), ('iand', ('ushr', step1, 1), 0x55555555))
-    step3 = ('iadd', ('iand', ('ishl', step2, 2), 0xcccccccc), ('iand', ('ushr', step2, 2), 0x33333333))
-    step4 = ('iadd', ('iand', ('ishl', step3, 4), 0xf0f0f0f0), ('iand', ('ushr', step3, 4), 0x0f0f0f0f))
-    step5 = ('iadd(many-comm-expr)', ('iand', ('ishl', step4, 8), 0xff00ff00), ('iand', ('ushr', step4, 8), 0x00ff00ff))
+optimizations[:] = [
+    opt for opt in optimizations
+    if not (isinstance(opt, tuple) and len(opt) > 1 and isinstance(opt[1], tuple)
+            and len(opt[1]) > 0 and isinstance(opt[1][0], str)
+            and opt[1][0].startswith('bitfield_reverse'))
+]
 
-    return step5
+# Helper functions for generating stable bitfieldReverse patterns.
+def _bfrev_swap_last(u):
+    s1 = ('ior@32', ('ishl@32', u, 16), ('ushr@32', u, 16))
+    s2 = ('ior@32', ('iand@32', ('ishl@32', s1, 1), 0xaaaaaaaa), ('iand@32', ('ushr@32', s1, 1), 0x55555555))
+    s3 = ('ior@32', ('iand@32', ('ishl@32', s2, 2), 0xcccccccc), ('iand@32', ('ushr@32', s2, 2), 0x33333333))
+    s4 = ('ior@32', ('iand@32', ('ishl@32', s3, 4), 0xf0f0f0f0), ('iand@32', ('ushr@32', s3, 4), 0x0f0f0f0f))
+    return ('ior@32(many-comm-expr)', ('iand@32', ('ishl@32', s4, 8), 0xff00ff00), ('iand@32', ('ushr@32', s4, 8), 0x00ff00ff))
 
-# Unreal Engine 4 demo applications open-codes bitfieldReverse()
-def bitfield_reverse_ue4(u):
-    step1 = ('ior', ('ishl', u, 16), ('ushr', u, 16))
-    step2 = ('ior', ('ishl', ('iand', step1, 0x00ff00ff), 8), ('ushr', ('iand', step1, 0xff00ff00), 8))
-    step3 = ('ior', ('ishl', ('iand', step2, 0x0f0f0f0f), 4), ('ushr', ('iand', step2, 0xf0f0f0f0), 4))
-    step4 = ('ior', ('ishl', ('iand', step3, 0x33333333), 2), ('ushr', ('iand', step3, 0xcccccccc), 2))
-    step5 = ('ior(many-comm-expr)', ('ishl', ('iand', step4, 0x55555555), 1), ('ushr', ('iand', step4, 0xaaaaaaaa), 1))
-
-    return step5
-
-# Cyberpunk 2077 open-codes bitfieldReverse()
-def bitfield_reverse_cp2077(u):
-    step1 = ('ior', ('ishl', u, 16), ('ushr', u, 16))
-    step2 = ('ior', ('iand', ('ishl', step1, 1), 0xaaaaaaaa), ('iand', ('ushr', step1, 1), 0x55555555))
-    step3 = ('ior', ('iand', ('ishl', step2, 2), 0xcccccccc), ('iand', ('ushr', step2, 2), 0x33333333))
-    step4 = ('ior', ('iand', ('ishl', step3, 4), 0xf0f0f0f0), ('iand', ('ushr', step3, 4), 0x0f0f0f0f))
-    step5 = ('ior(many-comm-expr)', ('iand', ('ishl', step4, 8), 0xff00ff00), ('iand', ('ushr', step4, 8), 0x00ff00ff))
-    return step5
-
-optimizations += [(bitfield_reverse_xcom2('x@32'), ('bitfield_reverse', 'x'), '!options->lower_bitfield_reverse')]
-optimizations += [(bitfield_reverse_ue4('x@32'), ('bitfield_reverse', 'x'), '!options->lower_bitfield_reverse')]
-optimizations += [(bitfield_reverse_cp2077('x@32'), ('bitfield_reverse', 'x'), '!options->lower_bitfield_reverse')]
+def _bfrev_ue4(u):
+    s1 = ('ior@32', ('ishl@32', u, 16), ('ushr@32', u, 16))
+    s2 = ('ior@32', ('ishl@32', ('iand@32', s1, 0x00ff00ff), 8), ('ushr@32', ('iand@32', s1, 0xff00ff00), 8))
+    s3 = ('ior@32', ('ishl@32', ('iand@32', s2, 0x0f0f0f0f), 4), ('ushr@32', ('iand@32', s2, 0xf0f0f0f0), 4))
+    s4 = ('ior@32', ('ishl@32', ('iand@32', s3, 0x33333333), 2), ('ushr@32', ('iand@32', s3, 0xcccccccc), 2))
+    return ('ior@32(many-comm-expr)', ('ishl@32', ('iand@32', s4, 0x55555555), 1), ('ushr@32', ('iand@32', s4, 0xaaaaaaaa), 1))
 
 # VKD3D-Proton DXBC f32 to f16 conversion implements a float conversion using PackHalf2x16.
 # Because the spec does not specify a rounding mode or behaviour regarding infinity,
@@ -3331,13 +3276,11 @@ optimizations.extend([
 """
 optimizations.extend([
     (('fquantize2f16', 'a@32'),
-     ('bcsel', ('fneu', 'a', 'a'),                      # NaN → keep NaN
-               'a',
-               ('bcsel', ('flt', ('fabs', 'a'), 0.00006103515625),  # |a| < 2^-14 ?
-                         ('fmul', 'a', 0.0),           # signed zero
-                         ('f2f32', ('f2f16_rtne', 'a')))),
+     ('bcsel', ('!flt', ('!fabs', a), math.ldexp(1.0, -14)),
+               ('iand', a, 1 << 31),
+               ('!f2f32', ('!f2f16_rtne', a))),
      'options->lower_fquantize2f16')
-])
+    ])
 
 for s in range(0, 31):
     mask = 0xffffffff << s
@@ -3575,14 +3518,10 @@ late_optimizations = [
    # Reconstruct 2-way dot product. This maps to V_DOT2_F32_F16 on GFX9 for
    # packed 16-bit floats, providing a significant performance boost.
     (('fadd@32',
-       ('fmul@32(is_only_used_by_fadd)',
-         ('f2f32', 'ax@16'), ('f2f32', 'bx@16')),
-       ('fmul@32(is_only_used_by_fadd)',
-         ('f2f32', 'ay@16'), ('f2f32', 'by@16'))),
-     ('fdot2@32',
-        ('vec2@32', ('f2f32', 'ax'), ('f2f32', 'ay')),
-        ('vec2@32', ('f2f32', 'bx'), ('f2f32', 'by'))),
-     '!options->lower_fdph')
+       ('fmul@32(is_only_used_by_fadd)', ('f2f32', 'ax@16'), ('f2f32', 'bx@16')),
+       ('fmul@32(is_only_used_by_fadd)', ('f2f32', 'ay@16'), ('f2f32', 'by@16'))),
+     ('fdot2@32', ('vec2@32', ('f2f32', 'ax'), ('f2f32', 'ay')), ('vec2@32', ('f2f32', 'bx'), ('f2f32', 'by'))),
+     '!options->lower_fdph'),
 ]
 
 # re-combine inexact mul+add to ffma. Do this before fsub so that a * b - c
@@ -3660,26 +3599,14 @@ late_optimizations.extend([
    (('vec2(is_only_used_as_float)', ('fneg@16', a), b), ('fmul', ('vec2', a, b), ('vec2', -1.0, 1.0)), 'options->vectorize_vec2_16bit'),
    (('vec2(is_only_used_as_float)', a, ('fneg@16', b)), ('fmul', ('vec2', a, b), ('vec2', 1.0, -1.0)), 'options->vectorize_vec2_16bit'),
 
-   # Re-vectorize component-wise bcsel for packed-math targets like GFX9.
-   # This must run late to catch scalarized components from early lowering. It
-   # fuses two scalar 16-bit selects with a common condition back into a
-   # vector select, which can be emitted as a single V_CNDMASK_B32 instruction.
-   # All bit-sizes must be explicit for the type-matcher.
+    # Re-vectorize component-wise bcsel into a single V_CNDMASK_B32.
     (('vec2@16',
        ('bcsel@16(is_used_once)', 'c@1', 'ax@16', 'bx@16'),
        ('bcsel@16(is_used_once)', 'c@1', 'ay@16', 'by@16')),
-     ('bcsel@16', 'c',
-                ('vec2@16', 'ax', 'ay'),
-                ('vec2@16', 'bx', 'by')),
-     '!options->vectorize_vec2_16bit'),
+     ('bcsel@16', 'c', ('vec2@16', 'ax', 'ay'), ('vec2@16', 'bx', 'by')),
+     'options->vectorize_vec2_16bit'),
 
-    # Fuse mixed-precision fma(f16, f16, f32).
-    # This pattern is extremely common in modern games using FP16 for lighting
-    # and material calculations, accumulating into a higher-precision FP32
-    # render target. The GFX9 ISA has a dedicated V_MAD_MIX_F32 instruction
-    # (VOP3P opcode 32) that performs this exact operation in a single cycle.
-    # This pattern fuses the lowered form back into a canonical ffma that the
-    # backend can optimize.
+    # Fuse mixed-precision fma(f16, f16, f32) into V_MAD_MIX_F32.
     (('fadd@32',
       ('f2f32', ('fmul@16(is_only_used_by_fadd)', 'a@16', 'b@16')),
       'c@32'),
