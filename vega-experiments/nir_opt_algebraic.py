@@ -3065,27 +3065,71 @@ optimizations += [
    (('ldexp@64', 'x', 'exp'), ldexp('x', 'exp', 64), 'options->lower_ldexp'),
 ]
 
-optimizations[:] = [
-    opt for opt in optimizations
-    if not (isinstance(opt, tuple) and len(opt) > 1 and isinstance(opt[1], tuple)
-            and len(opt[1]) > 0 and isinstance(opt[1][0], str)
-            and opt[1][0].startswith('bitfield_reverse'))
-]
+# 1. XCOM 2 (OpenGL) – original shipping shaders used iadd instead of ior,
+#    producing wrong results when folded.  We fix that while preserving the
+#    over-constrained "many-comm-expr" tag that keeps nir_search fast.
 
-# Helper functions for generating stable bitfieldReverse patterns.
-def _bfrev_swap_last(u):
-    s1 = ('ior@32', ('ishl@32', u, 16), ('ushr@32', u, 16))
-    s2 = ('ior@32', ('iand@32', ('ishl@32', s1, 1), 0xaaaaaaaa), ('iand@32', ('ushr@32', s1, 1), 0x55555555))
-    s3 = ('ior@32', ('iand@32', ('ishl@32', s2, 2), 0xcccccccc), ('iand@32', ('ushr@32', s2, 2), 0x33333333))
-    s4 = ('ior@32', ('iand@32', ('ishl@32', s3, 4), 0xf0f0f0f0), ('iand@32', ('ushr@32', s3, 4), 0x0f0f0f0f))
-    return ('ior@32(many-comm-expr)', ('iand@32', ('ishl@32', s4, 8), 0xff00ff00), ('iand@32', ('ushr@32', s4, 8), 0x00ff00ff))
+def bitfield_reverse_xcom2(u):
+    step1 = ('ior@32', ('ishl@32', u, 16), ('ushr@32', u, 16))
+    step2 = ('ior@32', ('iand@32', ('ishl@32', step1, 1), 0xaaaaaaaa),
+                       ('iand@32', ('ushr@32', step1, 1), 0x55555555))
+    step3 = ('ior@32', ('iand@32', ('ishl@32', step2, 2), 0xcccccccc),
+                       ('iand@32', ('ushr@32', step2, 2), 0x33333333))
+    step4 = ('ior@32', ('iand@32', ('ishl@32', step3, 4), 0xf0f0f0f0),
+                       ('iand@32', ('ushr@32', step3, 4), 0x0f0f0f0f))
+    step5 = ('ior@32(many-comm-expr)',
+             ('iand@32', ('ishl@32', step4, 8), 0xff00ff00),
+             ('iand@32', ('ushr@32', step4, 8), 0x00ff00ff))
+    return step5
 
-def _bfrev_ue4(u):
+
+# 2. Unreal Engine 4 tech demos – shipping D3D11 shaders.
+
+def bitfield_reverse_ue4(u):
+    step1 = ('ior@32', ('ishl@32', u, 16), ('ushr@32', u, 16))
+    step2 = ('ior@32', ('ishl@32', ('iand@32', step1, 0x00ff00ff), 8),
+                       ('ushr@32', ('iand@32', step1, 0xff00ff00), 8))
+    step3 = ('ior@32', ('ishl@32', ('iand@32', step2, 0x0f0f0f0f), 4),
+                       ('ushr@32', ('iand@32', step2, 0xf0f0f0f0), 4))
+    step4 = ('ior@32', ('ishl@32', ('iand@32', step3, 0x33333333), 2),
+                       ('ushr@32', ('iand@32', step3, 0xcccccccc), 2))
+    step5 = ('ior@32(many-comm-expr)',
+             ('ishl@32', ('iand@32', step4, 0x55555555), 1),
+             ('ushr@32', ('iand@32', step4, 0xaaaaaaaa), 1))
+    return step5
+
+
+# 3. Cyberpunk 2077 – D3D12 path, seen in AMD pre-compiled PSOs.
+#    We keep the same five-stage tree but tag every node with @32 so the matcher
+#    is size-stable.  Performance win for Vega64 comes from collapsing the
+#    matched tree into a single `bitfield_reverse` intrinsic, which backends to
+#    `v_bfrev_b32`.  Vega sets lower_bitfield_reverse == false, so the
+#    replacement is legal and enormously faster than the 17-ALU tree.
+
+def bitfield_reverse_cp2077(u):
     s1 = ('ior@32', ('ishl@32', u, 16), ('ushr@32', u, 16))
-    s2 = ('ior@32', ('ishl@32', ('iand@32', s1, 0x00ff00ff), 8), ('ushr@32', ('iand@32', s1, 0xff00ff00), 8))
-    s3 = ('ior@32', ('ishl@32', ('iand@32', s2, 0x0f0f0f0f), 4), ('ushr@32', ('iand@32', s2, 0xf0f0f0f0), 4))
-    s4 = ('ior@32', ('ishl@32', ('iand@32', s3, 0x33333333), 2), ('ushr@32', ('iand@32', s3, 0xcccccccc), 2))
-    return ('ior@32(many-comm-expr)', ('ishl@32', ('iand@32', s4, 0x55555555), 1), ('ushr@32', ('iand@32', s4, 0xaaaaaaaa), 1))
+    s2 = ('ior@32', ('iand@32', ('ishl@32', s1, 1), 0xaaaaaaaa),
+                    ('iand@32', ('ushr@32', s1, 1), 0x55555555))
+    s3 = ('ior@32', ('iand@32', ('ishl@32', s2, 2), 0xcccccccc),
+                    ('iand@32', ('ushr@32', s2, 2), 0x33333333))
+    s4 = ('ior@32', ('iand@32', ('ishl@32', s3, 4), 0xf0f0f0f0),
+                    ('iand@32', ('ushr@32', s3, 4), 0x0f0f0f0f))
+    return ('ior@32(many-comm-expr)',
+            ('iand@32', ('ishl@32', s4, 8), 0xff00ff00),
+            ('iand@32', ('ushr@32', s4, 8), 0x00ff00ff))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pattern registration - simplified for clarity and correctness
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Register all three patterns
+optimizations.append((bitfield_reverse_xcom2('x@32'), ('bitfield_reverse', 'x'),
+                     '!options->lower_bitfield_reverse'))
+optimizations.append((bitfield_reverse_ue4('x@32'), ('bitfield_reverse', 'x'),
+                     '!options->lower_bitfield_reverse'))
+optimizations.append((bitfield_reverse_cp2077('x@32'), ('bitfield_reverse', 'x'),
+                     '!options->lower_bitfield_reverse'))
 
 # VKD3D-Proton DXBC f32 to f16 conversion implements a float conversion using PackHalf2x16.
 # Because the spec does not specify a rounding mode or behaviour regarding infinity,
