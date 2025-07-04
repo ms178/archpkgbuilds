@@ -2738,6 +2738,43 @@ optimizations.extend([
    (('ior', ('iand', ('f2i32', ('fround_even', ('fmul', ('fmax', -1.0, ('fmin', 1.0, 'x@32')), 32767.0))), 0xffff),
      ('ishl', ('f2i32', ('fround_even', ('fmul', ('fmax', -1.0, ('fmin', 1.0, 'y@32')), 32767.0))), 16)),
     ('pack_snorm_2x16', ('vec2', 'x', 'y')), '!options->lower_pack_snorm_2x16'),
+
+   # Strength reduction for imul by small GFX9 inline constants.
+   # This is now handled by specific, robust C++ helpers.
+   # imul(a, 3) -> a + (a << 1)
+   (('imul', a, '#b(is_imm_3)'), ('iadd', ('ishl', a, 1), a)),
+   # imul(a, 5) -> a + (a << 2)
+   (('imul', a, '#b(is_imm_5)'), ('iadd', ('ishl', a, 2), a)),
+   # imul(a, 9) -> a + (a << 3)
+   (('imul', a, '#b(is_imm_9)'), ('iadd', ('ishl', a, 3), a)),
+
+   # fmin(a, -a) -> -abs(a)
+   (('fmin', a, ('fneg', a)), ('fneg', ('fabs', a))),
+   # fmax(a, -a) -> abs(a)
+   (('fmax', a, ('fneg', a)), ('fabs', a)),
+
+   # bcsel(b2i(a) != const, ...) -> bcsel(a, ...)
+   # The result of b2i is 0 or 1. If the constant is not zero, the comparison
+   # is equivalent to b2i(a) != 0, which is just `a`.
+   (('bcsel', ('ine', ('b2i', 'a@1'), '#b(is_not_zero)'), c, d), ('bcsel', a, c, d)),
+
+   # bcsel(b2i(a) == const, ...) -> bcsel(a && const==1, ...)
+   # If the constant is 1, this is `a`. If it's any other non-zero value,
+   # this is always false. Constant propagation will handle the b==1 case.
+   (('bcsel', ('ieq', ('b2i', 'a@1'), '#b(is_not_zero)'), c, d), ('bcsel', ('iand', a, ('ieq', b, 1)), c, d)),
+
+   # fsat(fabs(a)) is the same as fsat(a) because fsat clamps negative values to 0 anyway.
+   (('fsat', ('fabs(is_used_once)', a)), ('fsat', a)),
+
+   # fsat(fneg(a)) where a is known to be in [0, 1] is the same as fneg(a).
+   # The fsat is redundant because -a will be in [-1, 0], and fsat clamps to [0,1],
+   # so the result is always 0.
+   (('fsat', ('fneg(is_used_once)', 'a(is_zero_to_one)')), 0.0),
+
+   # fsat(fneg(a)) where a is known to be <= 0 is the same as fsat(-a).
+   # If a <= 0, then -a >= 0. So fsat(-a) is just fsat applied to a non-negative number.
+   (('fsat', ('fneg(is_used_once)', 'a(is_not_positive)')), ('fsat', ('fneg', a))),
+
 ])
 
 for bit_size in [8, 16, 32, 64]:

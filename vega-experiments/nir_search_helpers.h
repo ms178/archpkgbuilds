@@ -66,8 +66,8 @@
  * @return True if all checked components are valid GFX9+ inline constants.
  */
 static inline bool
-is_imm_8bit(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
-            unsigned src, unsigned num_components, const uint8_t *swizzle)
+is_gfx9_inline_const(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
+                     unsigned src, unsigned num_components, const uint8_t *swizzle)
 {
       const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
       if (unlikely(!cv)) {
@@ -99,6 +99,69 @@ is_imm_8bit(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
 
             /* If it's not in any of the allowed categories, it's not an inline const. */
             return false;
+      }
+      return true;
+}
+
+/**
+ * @brief Check if an integer constant is exactly 3.
+ *
+ * Used for strength reduction: imul(a, 3) -> iadd(ishl(a, 1), a).
+ */
+static inline bool
+is_imm_3(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
+         unsigned src, unsigned num_components,
+         const uint8_t *swizzle)
+{
+      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
+      if (unlikely(!cv))
+            return false;
+
+      for (unsigned i = 0; i < num_components; i++) {
+            if (nir_src_comp_as_int(instr->src[src].src, swizzle[i]) != 3)
+                  return false;
+      }
+      return true;
+}
+
+/**
+ * @brief Check if an integer constant is exactly 5.
+ *
+ * Used for strength reduction: imul(a, 5) -> iadd(ishl(a, 2), a).
+ */
+static inline bool
+is_imm_5(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
+         unsigned src, unsigned num_components,
+         const uint8_t *swizzle)
+{
+      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
+      if (unlikely(!cv))
+            return false;
+
+      for (unsigned i = 0; i < num_components; i++) {
+            if (nir_src_comp_as_int(instr->src[src].src, swizzle[i]) != 5)
+                  return false;
+      }
+      return true;
+}
+
+/**
+ * @brief Check if an integer constant is exactly 9.
+ *
+ * Used for strength reduction: imul(a, 9) -> iadd(ishl(a, 3), a).
+ */
+static inline bool
+is_imm_9(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
+         unsigned src, unsigned num_components,
+         const uint8_t *swizzle)
+{
+      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
+      if (unlikely(!cv))
+            return false;
+
+      for (unsigned i = 0; i < num_components; i++) {
+            if (nir_src_comp_as_int(instr->src[src].src, swizzle[i]) != 9)
+                  return false;
       }
       return true;
 }
