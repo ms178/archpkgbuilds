@@ -1,0 +1,839 @@
+--- a/src/util/thread.h	2025-07-05 23:59:58.545397731 +0200
++++ b/src/util/thread.h	2025-07-06 00:01:11.635771822 +0200
+@@ -14,6 +14,10 @@
+ #include "./rc/util_rc.h"
+ #include "./rc/util_rc_ptr.h"
+ 
++#ifdef DXVK_ARCH_X86
++#include <immintrin.h>
++#endif
++
+ namespace dxvk {
+ 
+   /**
+@@ -24,7 +28,7 @@ namespace dxvk {
+     Lowest,
+   };
+ 
+-#ifdef _WIN32
++  #ifdef _WIN32
+ 
+   using ThreadProc = std::function<void()>;
+ 
+@@ -43,12 +47,19 @@ namespace dxvk {
+ 
+     HANDLE                handle = nullptr;
+     DWORD                 id     = 0;
+-    std::atomic<uint32_t> refs   = { 2u };
++    alignas(64) std::atomic<uint32_t> refs = { 2u };
+     ThreadProc            proc;
+ 
+     void decRef() {
+-      if (refs.fetch_sub(1, std::memory_order_release) == 1)
++      uint32_t old = refs.fetch_sub(1, std::memory_order_acq_rel);
++      if (old == 1) {
++        std::atomic_thread_fence(std::memory_order_acquire);
+         delete this;
++      }
++    }
++
++    void incRef() {
++      refs.fetch_add(1, std::memory_order_relaxed);
+     }
+   };
+ 
+@@ -173,6 +184,52 @@ namespace dxvk {
+ 
+ 
+   /**
++   * \brief Hybrid spin-mutex implementation
++   *
++   * Spins briefly before falling back to SRW lock to reduce
++   * context switch overhead for short critical sections.
++   */
++  class spin_mutex {
++  public:
++    using native_handle_type = PSRWLOCK;
++
++    spin_mutex() : m_lock(SRWLOCK_INIT) { }
++
++    spin_mutex(const spin_mutex&) = delete;
++    spin_mutex& operator = (const spin_mutex&) = delete;
++
++    void lock() {
++      // Spin up to 1000 times (tuned for modern CPUs)
++      for (uint32_t spin = 0; spin < 1000; spin++) {
++        if (try_lock())
++          return;
++
++        #ifdef DXVK_ARCH_X86
++        _mm_pause();
++        #endif
++      }
++
++      AcquireSRWLockExclusive(&m_lock);
++    }
++
++    void unlock() {
++      ReleaseSRWLockExclusive(&m_lock);
++    }
++
++    bool try_lock() {
++      return TryAcquireSRWLockExclusive(&m_lock);
++    }
++
++    native_handle_type native_handle() {
++      return &m_lock;
++    }
++
++  private:
++    SRWLOCK m_lock;
++  };
++
++
++  /**
+    * \brief Recursive mutex implementation
+    *
+    * Drop-in replacement for \c std::recursive_mutex that
+@@ -232,6 +289,7 @@ namespace dxvk {
+ 
+     condition_variable() {
+       InitializeConditionVariable(&m_cond);
++      m_waiters.store(0, std::memory_order_relaxed);
+     }
+ 
+     condition_variable(condition_variable&) = delete;
+@@ -239,16 +297,20 @@ namespace dxvk {
+     condition_variable& operator = (condition_variable&) = delete;
+ 
+     void notify_one() {
+-      WakeConditionVariable(&m_cond);
++      if (m_waiters.load(std::memory_order_acquire) > 0)
++        WakeConditionVariable(&m_cond);
+     }
+ 
+     void notify_all() {
+-      WakeAllConditionVariable(&m_cond);
++      if (m_waiters.load(std::memory_order_acquire) > 0)
++        WakeAllConditionVariable(&m_cond);
+     }
+ 
+     void wait(std::unique_lock<dxvk::mutex>& lock) {
++      m_waiters.fetch_add(1, std::memory_order_acq_rel);
+       auto srw = lock.mutex()->native_handle();
+       SleepConditionVariableSRW(&m_cond, srw, INFINITE, 0);
++      m_waiters.fetch_sub(1, std::memory_order_acq_rel);
+     }
+ 
+     template<typename Predicate>
+@@ -262,8 +324,8 @@ namespace dxvk {
+       auto now = Clock::now();
+ 
+       return (now < time)
+-        ? wait_for(lock, now - time)
+-        : std::cv_status::timeout;
++      ? wait_for(lock, time - now)
++      : std::cv_status::timeout;
+     }
+ 
+     template<typename Clock, typename Duration, typename Predicate>
+@@ -272,17 +334,21 @@ namespace dxvk {
+         return true;
+ 
+       auto now = Clock::now();
+-      return now < time && wait_for(lock, now - time, pred);
++      return now < time && wait_for(lock, time - now, pred);
+     }
+ 
+     template<typename Rep, typename Period>
+     std::cv_status wait_for(std::unique_lock<dxvk::mutex>& lock, const std::chrono::duration<Rep, Period>& timeout) {
++      m_waiters.fetch_add(1, std::memory_order_acq_rel);
++
+       auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
+       auto srw = lock.mutex()->native_handle();
+ 
+-      return SleepConditionVariableSRW(&m_cond, srw, ms.count(), 0)
+-        ? std::cv_status::no_timeout
+-        : std::cv_status::timeout;
++      bool result = SleepConditionVariableSRW(&m_cond, srw, ms.count(), 0);
++
++      m_waiters.fetch_sub(1, std::memory_order_acq_rel);
++
++      return result ? std::cv_status::no_timeout : std::cv_status::timeout;
+     }
+ 
+     template<typename Rep, typename Period, typename Predicate>
+@@ -302,10 +368,11 @@ namespace dxvk {
+   private:
+ 
+     CONDITION_VARIABLE m_cond;
++    alignas(64) std::atomic<uint32_t> m_waiters;
+ 
+   };
+ 
+-#else
++  #else
+   class thread : public std::thread {
+   public:
+     using std::thread::thread;
+@@ -316,11 +383,11 @@ namespace dxvk {
+       switch (priority) {
+         default:
+         case ThreadPriority::Normal: policy = SCHED_OTHER; break;
+-#ifndef __linux__
++        #ifndef __linux__
+         case ThreadPriority::Lowest: policy = SCHED_OTHER; break;
+-#else
++        #else
+         case ThreadPriority::Lowest: policy = SCHED_IDLE;  break;
+-#endif
++        #endif
+       }
+       ::pthread_setschedparam(this->native_handle(), policy, &param);
+     }
+@@ -329,6 +396,7 @@ namespace dxvk {
+   using mutex              = std::mutex;
+   using recursive_mutex    = std::recursive_mutex;
+   using condition_variable = std::condition_variable;
++  using spin_mutex         = std::mutex;  // Fallback to regular mutex
+ 
+   namespace this_thread {
+     inline void yield() {
+@@ -341,6 +409,6 @@ namespace dxvk {
+       return false;
+     }
+   }
+-#endif
++  #endif
+ 
+ }
+
+
+--- a/src/util/thread.cpp	2025-07-05 23:59:55.224477951 +0200
++++ b/src/util/thread.cpp	2025-07-06 00:01:46.855182990 +0200
+@@ -3,6 +3,10 @@
+ #include "thread.h"
+ #include "util_likely.h"
+ 
++#ifdef DXVK_ARCH_X86
++#include <intrin.h>
++#endif
++
+ #ifdef _WIN32
+ 
+ namespace dxvk {
+@@ -10,8 +14,8 @@ namespace dxvk {
+   thread::thread(ThreadProc&& proc)
+   : m_data(new ThreadData(std::move(proc))) {
+     m_data->handle = ::CreateThread(nullptr, 0x100000,
+-      thread::threadProc, m_data, STACK_SIZE_PARAM_IS_A_RESERVATION,
+-      &m_data->id);
++                                    thread::threadProc, m_data, STACK_SIZE_PARAM_IS_A_RESERVATION,
++                                    &m_data->id);
+ 
+     if (!m_data->handle) {
+       delete m_data;
+@@ -49,14 +53,35 @@ namespace dxvk {
+     }
+ 
+     if (m_data)
+-      ::SetThreadPriority(m_data->handle, int32_t(value));
++      ::SetThreadPriority(m_data->handle, value);
+   }
+ 
+ 
+   uint32_t thread::hardware_concurrency() {
++    static uint32_t s_concurrency = 0;
++
++    if (likely(s_concurrency != 0))
++      return s_concurrency;
++
+     SYSTEM_INFO info = { };
+     ::GetSystemInfo(&info);
+-    return info.dwNumberOfProcessors;
++
++    DWORD logicalProcessors = info.dwNumberOfProcessors;
++
++    #ifdef DXVK_ARCH_X86
++    int cpuInfo[4];
++    __cpuid(cpuInfo, 0x0B);
++
++    if (cpuInfo[1] & 0xFFFF) {
++      uint32_t threadsPerCore = cpuInfo[1] & 0xFFFF;
++      s_concurrency = logicalProcessors / threadsPerCore;
++    } else
++      #endif
++    {
++      s_concurrency = (logicalProcessors > 4) ? (logicalProcessors / 2) : logicalProcessors;
++    }
++
++    return s_concurrency;
+   }
+ 
+ 
+@@ -85,7 +110,7 @@ namespace dxvk::this_thread {
+     static auto RtlDllShutdownInProgress = reinterpret_cast<PFN_RtlDllShutdownInProgress>(
+       ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "RtlDllShutdownInProgress"));
+ 
+-    return RtlDllShutdownInProgress();
++    return RtlDllShutdownInProgress && RtlDllShutdownInProgress();
+   }
+ 
+ }
+@@ -93,19 +118,15 @@ namespace dxvk::this_thread {
+ #else
+ 
+ namespace dxvk::this_thread {
+-  
++
+   static std::atomic<uint32_t> g_threadCtr = { 0u };
+   static thread_local uint32_t g_threadId  = 0u;
+-  
+-  // This implementation returns thread ids unique to the current instance.
+-  // ie. if you use this across multiple .so's then you might get conflicting ids.
+-  //
+-  // This isn't an issue for us, as it is only used by the spinlock implementation,
+-  // but may be for you if you use this elsewhere.
++
+   uint32_t get_id() {
+-    if (unlikely(!g_threadId))
+-      g_threadId = ++g_threadCtr;
++    if (likely(g_threadId != 0))
++      return g_threadId;
+ 
++    g_threadId = g_threadCtr.fetch_add(1, std::memory_order_relaxed) + 1;
+     return g_threadId;
+   }
+ 
+
+
+--- a/src/util/util_bit.h	2025-07-05 23:05:07.187210703 +0200
++++ b/src/util/util_bit.h	2025-07-05 23:16:19.036245223 +0200
+@@ -1,31 +1,31 @@
+ #pragma once
+ 
+ #if (defined(__x86_64__) && !defined(__arm64ec__)) || (defined(_M_X64) && !defined(_M_ARM64EC)) \
+-    || defined(__i386__) || defined(_M_IX86) || defined(__e2k__)
+-  #define DXVK_ARCH_X86
+-  #if defined(__x86_64__) || defined(_M_X64) || defined(__e2k__)
+-    #define DXVK_ARCH_X86_64
+-  #endif
++|| defined(__i386__) || defined(_M_IX86)
++#define DXVK_ARCH_X86
++#if defined(__x86_64__) || defined(_M_X64)
++#define DXVK_ARCH_X86_64
++#endif
+ #elif defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
+-  #define DXVK_ARCH_ARM64
++#define DXVK_ARCH_ARM64
++#elif defined(__e2k__)
++// E2K is a distinct architecture, not x86
++#define DXVK_ARCH_E2K
+ #endif
+ 
+ #ifdef DXVK_ARCH_X86
+-  #ifndef _MSC_VER
+-    #if defined(_WIN32) && (defined(__AVX__) || defined(__AVX2__))
+-      #error "AVX-enabled builds not supported due to stack alignment issues."
+-    #endif
+-    #if defined(__WINE__) && defined(__clang__)
+-      #pragma push_macro("_WIN32")
+-      #undef _WIN32
+-    #endif
+-    #include <x86intrin.h>
+-    #if defined(__WINE__) && defined(__clang__)
+-      #pragma pop_macro("_WIN32")
+-    #endif
+-  #else
+-    #include <intrin.h>
+-  #endif
++#ifndef _MSC_VER
++#if defined(__WINE__) && defined(__clang__)
++#pragma push_macro("_WIN32")
++#undef _WIN32
++#endif
++#include <x86intrin.h>
++#if defined(__WINE__) && defined(__clang__)
++#pragma pop_macro("_WIN32")
++#endif
++#else
++#include <intrin.h>
++#endif
+ #endif
+ 
+ #include "util_likely.h"
+@@ -49,14 +49,46 @@ namespace dxvk::bit {
+     std::memcpy(&dst, &src, sizeof(T));
+     return dst;
+   }
+-  
++
+   template<typename T>
+   T extract(T value, uint32_t fst, uint32_t lst) {
+-    return (value >> fst) & ~(~T(0) << (lst - fst + 1));
++    // Ensure we don't shift by >= bit width (undefined behavior)
++    constexpr uint32_t TBits = sizeof(T) * 8;
++    if (fst >= TBits)
++      return T(0);
++
++    // Calculate shift amount safely
++    uint32_t width = (lst >= fst) ? (lst - fst + 1) : 0;
++    if (width == 0 || width > TBits)
++      return (fst < TBits) ? (value >> fst) : T(0);
++
++    // Mask generation that avoids UB for width == TBits
++    T mask = (width == TBits) ? ~T(0) : ((T(1) << width) - 1);
++    return (value >> fst) & mask;
+   }
+ 
+   template<typename T>
+   T popcnt(T n) {
++    static_assert(std::is_unsigned<T>::value, "popcnt requires unsigned type");
++
++    #if defined(__POPCNT__) && (defined(__GNUC__) || defined(__clang__))
++    if constexpr (sizeof(T) <= 4) {
++      return static_cast<T>(__builtin_popcount(static_cast<uint32_t>(n)));
++    } else if constexpr (sizeof(T) == 8) {
++      return static_cast<T>(__builtin_popcountll(static_cast<uint64_t>(n)));
++    }
++    #elif defined(_MSC_VER) && !defined(__clang__) && defined(DXVK_ARCH_X86)
++    if constexpr (sizeof(T) <= 4) {
++      return static_cast<T>(__popcnt(static_cast<uint32_t>(n)));
++    }
++    #if defined(DXVK_ARCH_X86_64)
++    else if constexpr (sizeof(T) == 8) {
++      return static_cast<T>(__popcnt64(static_cast<uint64_t>(n)));
++    }
++    #endif
++    #endif
++
++    // Fallback to software implementation
+     n -= ((n >> 1u) & T(0x5555555555555555ull));
+     n = (n & T(0x3333333333333333ull)) + ((n >> 2u) & T(0x3333333333333333ull));
+     n = (n + (n >> 4u)) & T(0x0f0f0f0f0f0f0f0full);
+@@ -66,9 +98,10 @@ namespace dxvk::bit {
+ 
+   inline uint32_t tzcnt(uint32_t n) {
+     #if defined(_MSC_VER) && !defined(__clang__)
+-    if(n == 0)
+-      return 32;
+-    return _tzcnt_u32(n);
++    unsigned long idx;
++    if (_BitScanForward(&idx, n))
++      return idx;
++    return 32;
+     #elif defined(__BMI__)
+     return __tzcnt_u32(n);
+     #elif defined(DXVK_ARCH_X86) && (defined(__GNUC__) || defined(__clang__))
+@@ -92,7 +125,7 @@ namespace dxvk::bit {
+     return n != 0 ? __builtin_ctz(n) : 32;
+     #else
+     uint32_t r = 31;
+-    n &= -n;
++    n &= -int32_t(n);
+     r -= (n & 0x0000FFFF) ? 16 : 0;
+     r -= (n & 0x00FF00FF) ?  8 : 0;
+     r -= (n & 0x0F0F0F0F) ?  4 : 0;
+@@ -104,9 +137,10 @@ namespace dxvk::bit {
+ 
+   inline uint32_t tzcnt(uint64_t n) {
+     #if defined(DXVK_ARCH_X86_64) && defined(_MSC_VER) && !defined(__clang__)
+-    if(n == 0)
+-      return 64;
+-    return (uint32_t)_tzcnt_u64(n);
++    unsigned long idx;
++    if (_BitScanForward64(&idx, n))
++      return static_cast<uint32_t>(idx);
++    return 64;
+     #elif defined(DXVK_ARCH_X86_64) && defined(__BMI__)
+     return __tzcnt_u64(n);
+     #elif defined(DXVK_ARCH_X86_64) && (defined(__GNUC__) || defined(__clang__))
+@@ -120,7 +154,7 @@ namespace dxvk::bit {
+       : "=&r" (res), "=&r" (tmp)
+       : "r" (n)
+       : "cc");
+-    return res;
++    return static_cast<uint32_t>(res);
+     #elif defined(__GNUC__) || defined(__clang__)
+     return n != 0 ? __builtin_ctzll(n) : 64;
+     #else
+@@ -137,7 +171,7 @@ namespace dxvk::bit {
+   inline uint32_t bsf(uint32_t n) {
+     #if (defined(__GNUC__) || defined(__clang__)) && !defined(__BMI__) && defined(DXVK_ARCH_X86)
+     uint32_t res;
+-    asm ("tzcnt %1,%0"
++    asm ("bsf %1,%0"
+     : "=r" (res)
+     : "r" (n)
+     : "cc");
+@@ -150,11 +184,11 @@ namespace dxvk::bit {
+   inline uint32_t bsf(uint64_t n) {
+     #if (defined(__GNUC__) || defined(__clang__)) && !defined(__BMI__) && defined(DXVK_ARCH_X86_64)
+     uint64_t res;
+-    asm ("tzcnt %1,%0"
++    asm ("bsf %1,%0"
+     : "=r" (res)
+     : "r" (n)
+     : "cc");
+-    return res;
++    return static_cast<uint32_t>(res);
+     #else
+     return tzcnt(n);
+     #endif
+@@ -163,10 +197,9 @@ namespace dxvk::bit {
+   inline uint32_t lzcnt(uint32_t n) {
+     #if defined(_MSC_VER) && !defined(__clang__) && !defined(__LZCNT__)
+     unsigned long bsr;
+-    if(n == 0)
+-      return 32;
+-    _BitScanReverse(&bsr, n);
+-    return 31-bsr;
++    if (_BitScanReverse(&bsr, n))
++      return 31 - bsr;
++    return 32;
+     #elif (defined(_MSC_VER) && !defined(__clang__)) || defined(__LZCNT__)
+     return _lzcnt_u32(n);
+     #elif defined(__GNUC__) || defined(__clang__)
+@@ -174,28 +207,27 @@ namespace dxvk::bit {
+     #else
+     uint32_t r = 0;
+ 
+-    if (n == 0)	return 32;
++    if (n == 0) return 32;
+ 
+     if (n <= 0x0000FFFF) { r += 16; n <<= 16; }
+-    if (n <= 0x00FFFFFF) { r += 8;  n <<= 8; }
+-    if (n <= 0x0FFFFFFF) { r += 4;  n <<= 4; }
+-    if (n <= 0x3FFFFFFF) { r += 2;  n <<= 2; }
+-    if (n <= 0x7FFFFFFF) { r += 1;  n <<= 1; }
++    if (n <= 0x00FFFFFF) { r +=  8; n <<=  8; }
++    if (n <= 0x0FFFFFFF) { r +=  4; n <<=  4; }
++    if (n <= 0x3FFFFFFF) { r +=  2; n <<=  2; }
++    if (n <= 0x7FFFFFFF) { r +=  1; n <<=  1; }
+ 
+     return r;
+     #endif
+   }
+ 
+   inline uint32_t lzcnt(uint64_t n) {
+-    #if defined(_MSC_VER) && !defined(__clang__) && !defined(__LZCNT__) && defined(DXVK_ARCH_X86_64)
++    #if defined(DXVK_ARCH_X86_64) && defined(_MSC_VER) && !defined(__clang__) && !defined(__LZCNT__)
+     unsigned long bsr;
+-    if(n == 0)
+-      return 64;
+-    _BitScanReverse64(&bsr, n);
+-    return 63-bsr;
+-    #elif defined(DXVK_ARCH_X86_64) && ((defined(_MSC_VER) && !defined(__clang__)) && defined(__LZCNT__))
+-    return _lzcnt_u64(n);
+-    #elif defined(DXVK_ARCH_X86_64) && (defined(__GNUC__) || defined(__clang__))
++    if (_BitScanReverse64(&bsr, n))
++      return 63 - bsr;
++    return 64;
++    #elif defined(DXVK_ARCH_X86_64) && ((defined(_MSC_VER) && !defined(__clang__)) || defined(__LZCNT__))
++    return static_cast<uint32_t>(_lzcnt_u64(n));
++    #elif defined(__GNUC__) || defined(__clang__)
+     return n != 0 ? __builtin_clzll(n) : 64;
+     #else
+     uint32_t lo = uint32_t(n);
+@@ -233,6 +265,12 @@ namespace dxvk::bit {
+    */
+   inline void bclear(void* mem, size_t size) {
+     #if defined(DXVK_ARCH_X86) && (defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER))
++    // For small clears, memset is faster due to overhead
++    if (size <= 256) {
++      std::memset(mem, 0, size);
++      return;
++    }
++
+     auto zero = _mm_setzero_si128();
+ 
+     #if defined(__clang__)
+@@ -241,12 +279,13 @@ namespace dxvk::bit {
+     #pragma GCC unroll 0
+     #endif
+     for (size_t i = 0; i < size; i += 64u) {
+-      auto* ptr = reinterpret_cast<__m128i*>(mem) + i / sizeof(zero);
++      auto* ptr = reinterpret_cast<__m128i*>(reinterpret_cast<char*>(mem) + i);
+       _mm_stream_si128(ptr + 0u, zero);
+       _mm_stream_si128(ptr + 1u, zero);
+       _mm_stream_si128(ptr + 2u, zero);
+       _mm_stream_si128(ptr + 3u, zero);
+     }
++    _mm_sfence();
+     #else
+     std::memset(mem, 0, size);
+     #endif
+@@ -275,13 +314,14 @@ namespace dxvk::bit {
+     #pragma GCC unroll 0
+     #endif
+ 
+-    for ( ; i < 2 * (sizeof(T) / 32); i += 2) {
++    // Process 32 bytes at a time for better ILP
++    for ( ; i + 1 < sizeof(T) / 16; i += 2) {
+       __m128i eq0 = _mm_cmpeq_epi8(
+         _mm_load_si128(ai + i),
+-        _mm_load_si128(bi + i));
++                                   _mm_load_si128(bi + i));
+       __m128i eq1 = _mm_cmpeq_epi8(
+         _mm_load_si128(ai + i + 1),
+-        _mm_load_si128(bi + i + 1));
++                                   _mm_load_si128(bi + i + 1));
+       __m128i eq = _mm_and_si128(eq0, eq1);
+ 
+       int mask = _mm_movemask_epi8(eq);
+@@ -289,10 +329,11 @@ namespace dxvk::bit {
+         return false;
+     }
+ 
++    // Handle last 16 bytes if needed
+     for ( ; i < sizeof(T) / 16; i++) {
+       __m128i eq = _mm_cmpeq_epi8(
+         _mm_load_si128(ai + i),
+-        _mm_load_si128(bi + i));
++                                  _mm_load_si128(bi + i));
+ 
+       int mask = _mm_movemask_epi8(eq);
+       if (mask != 0xFFFF)
+@@ -311,7 +352,7 @@ namespace dxvk::bit {
+   public:
+ 
+     constexpr bitset()
+-      : m_dwords() {
++    : m_dwords() {
+ 
+     }
+ 
+@@ -410,10 +451,16 @@ namespace dxvk::bit {
+       uint32_t fullDwords = bits / 32;
+       uint32_t offset = bits % 32;
+ 
+-      for (size_t i = 0; i < fullDwords; i++)
++      // Clear all dwords first
++      for (size_t i = 0; i < Dwords; i++)
++        m_dwords[i] = 0;
++
++      // Set full dwords
++      for (size_t i = 0; i < fullDwords && i < Dwords; i++)
+         m_dwords[i] = std::numeric_limits<uint32_t>::max();
+-     
+-      if (offset > 0)
++
++      // Set partial dword
++      if (offset > 0 && fullDwords < Dwords)
+         m_dwords[fullDwords] = (1u << offset) - 1;
+     }
+ 
+@@ -430,13 +477,21 @@ namespace dxvk::bit {
+       uint32_t dword = idx / 32;
+       uint32_t bit   = idx % 32;
+ 
++      // Return false for out-of-bounds access
++      if (dword >= m_dwords.size())
++        return false;
++
+       return m_dwords[dword] & (1u << bit);
+     }
+ 
+     void ensureSize(uint32_t bitCount) {
+-      uint32_t dword = bitCount / 32;
+-      if (unlikely(dword >= m_dwords.size())) {
+-        m_dwords.resize(dword + 1);
++      // Prevent overflow in dword calculation
++      if (bitCount == 0)
++        return;
++
++      uint32_t dwordCount = (bitCount - 1) / 32 + 1;
++      if (unlikely(dwordCount > m_dwords.size())) {
++        m_dwords.resize(dwordCount);
+       }
+       m_bitCount = std::max(m_bitCount, bitCount);
+     }
+@@ -444,8 +499,8 @@ namespace dxvk::bit {
+     void set(uint32_t idx, bool value) {
+       ensureSize(idx + 1);
+ 
+-      uint32_t dword = 0;
+-      uint32_t bit   = idx;
++      uint32_t dword = idx / 32;
++      uint32_t bit   = idx % 32;
+ 
+       if (value)
+         m_dwords[dword] |= 1u << bit;
+@@ -454,8 +509,6 @@ namespace dxvk::bit {
+     }
+ 
+     bool exchange(uint32_t idx, bool value) {
+-      ensureSize(idx + 1);
+-
+       bool oldValue = get(idx);
+       set(idx, value);
+       return oldValue;
+@@ -471,14 +524,18 @@ namespace dxvk::bit {
+     }
+ 
+     void setAll() {
++      if (m_dwords.empty())
++        return;
++
++      // Set all complete dwords
++      for (size_t i = 0; i < m_dwords.size() - 1; i++)
++        m_dwords[i] = std::numeric_limits<uint32_t>::max();
++
++      // Handle last dword
+       if (m_bitCount % 32 == 0) {
+-        for (size_t i = 0; i < m_dwords.size(); i++)
+-          m_dwords[i] = std::numeric_limits<uint32_t>::max();
++        m_dwords[m_dwords.size() - 1] = std::numeric_limits<uint32_t>::max();
+       }
+       else {
+-        for (size_t i = 0; i < m_dwords.size() - 1; i++)
+-          m_dwords[i] = std::numeric_limits<uint32_t>::max();
+-
+         m_dwords[m_dwords.size() - 1] = (1u << (m_bitCount % 32)) - 1;
+       }
+     }
+@@ -519,11 +576,36 @@ namespace dxvk::bit {
+       uint32_t fullDwords = bits / 32;
+       uint32_t offset = bits % 32;
+ 
+-      for (size_t i = 0; i < fullDwords; i++)
+-        m_dwords[i] = std::numeric_limits<uint32_t>::max();
++      // Optimize for common case of clearing then setting many bits
++      #if defined(DXVK_ARCH_X86) && (defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER))
++      // Use SSE2 for bulk operations when beneficial
++      if (fullDwords >= 8) {
++        __m128i ones = _mm_set1_epi32(-1);
++        size_t i = 0;
++
++        // Set full dwords in chunks of 4
++        for (; i + 3 < fullDwords; i += 4) {
++          _mm_storeu_si128(reinterpret_cast<__m128i*>(&m_dwords[i]), ones);
++        }
+ 
+-      if (offset > 0)
++        // Handle remainder
++        for (; i < fullDwords && i < m_dwords.size(); i++)
++          m_dwords[i] = std::numeric_limits<uint32_t>::max();
++      } else
++        #endif
++      {
++        // Standard implementation for small sets
++        for (size_t i = 0; i < fullDwords && i < m_dwords.size(); i++)
++          m_dwords[i] = std::numeric_limits<uint32_t>::max();
++      }
++
++      // Set partial dword
++      if (offset > 0 && fullDwords < m_dwords.size())
+         m_dwords[fullDwords] = (1u << offset) - 1;
++
++      // Clear remaining dwords
++      for (size_t i = fullDwords + (offset > 0 ? 1 : 0); i < m_dwords.size(); i++)
++        m_dwords[i] = 0;
+     }
+ 
+   private:
+@@ -547,7 +629,7 @@ namespace dxvk::bit {
+       using reference = T;
+ 
+       explicit iterator(T flags)
+-        : m_mask(flags) { }
++      : m_mask(flags) { }
+ 
+       iterator& operator ++ () {
+         m_mask &= m_mask - 1;
+@@ -574,10 +656,10 @@ namespace dxvk::bit {
+     };
+ 
+     BitMask()
+-      : m_mask(0) { }
++    : m_mask(0) { }
+ 
+     explicit BitMask(T n)
+-      : m_mask(n) { }
++    : m_mask(n) { }
+ 
+     iterator begin() {
+       return iterator(m_mask);
+@@ -607,25 +689,29 @@ namespace dxvk::bit {
+    */
+   template<typename T, int32_t I, int32_t F>
+   T encodeFixed(float n) {
++    static_assert(I + F <= int32_t(sizeof(T) * 8), "Fixed point format exceeds type size");
++    static_assert(I >= 0 && F >= 0, "Fixed point format requires non-negative bit counts");
++
+     if (n != n)
+       return 0u;
+ 
+     n *= float(1u << F);
+ 
+     if constexpr (std::is_signed_v<T>) {
+-      n = std::max(n, -float(1u << (I + F - 1u)));
+-      n = std::min(n,  float(1u << (I + F - 1u)) - 1.0f);
++      n = std::max(n, -float(1ull << (I + F - 1u)));
++      n = std::min(n,  float((1ull << (I + F - 1u)) - 1u));
+       n += n < 0.0f ? -0.5f : 0.5f;
+     } else {
+       n = std::max(n, 0.0f);
+-      n = std::min(n, float(1u << (I + F)) - 1.0f);
++      n = std::min(n, float((1ull << (I + F)) - 1u));
+       n += 0.5f;
+     }
+ 
+     T result = T(n);
+ 
+-    if constexpr (std::is_signed_v<T>)
+-      result &= ((T(1u) << (I + F)) - 1u);
++    // Mask to ensure we only use I+F bits
++    if constexpr (I + F < int32_t(sizeof(T) * 8))
++      result &= ((T(1) << (I + F)) - 1u);
+ 
+     return result;
+   }
+@@ -642,9 +728,15 @@ namespace dxvk::bit {
+    */
+   template<typename T, int32_t I, int32_t F>
+   float decodeFixed(T n) {
++    static_assert(I + F <= int32_t(sizeof(T) * 8), "Fixed point format exceeds type size");
++    static_assert(I >= 0 && F >= 0, "Fixed point format requires non-negative bit counts");
++
+     // Sign-extend as necessary
+-    if constexpr (std::is_signed_v<T>)
+-      n -= (n & (T(1u) << (I + F - 1u))) << 1u;
++    if constexpr (std::is_signed_v<T> && I + F < int32_t(sizeof(T) * 8)) {
++      // Check sign bit and extend if set
++      if (n & (T(1) << (I + F - 1)))
++        n |= ~((T(1) << (I + F)) - 1u);
++    }
+ 
+     return float(n) / float(1u << F);
+   }
+@@ -684,7 +776,14 @@ namespace dxvk::bit {
+    * \returns Morton code of x and y
+    */
+   inline uint32_t interleave(uint16_t x, uint16_t y) {
++    #if defined(__BMI2__) && (defined(__GNUC__) || defined(__clang__))
++    // Use PDEP to deposit bits with Morton code pattern
++    uint32_t x_spread = _pdep_u32(x, 0x55555555u);
++    uint32_t y_spread = _pdep_u32(y, 0xAAAAAAAAu);
++    return x_spread | y_spread;
++    #else
+     return split2(x) | (split2(y) << 1u);
++    #endif
+   }
+ 
+ 
+@@ -694,7 +793,14 @@ namespace dxvk::bit {
+    * All three numbers must fit into 16 bits.
+    */
+   inline uint64_t interleave(uint16_t x, uint16_t y, uint16_t z) {
++    #if defined(__BMI2__) && defined(DXVK_ARCH_X86_64) && (defined(__GNUC__) || defined(__clang__))
++    uint64_t x_spread = _pdep_u64(x, 0x1249249249249249ull);
++    uint64_t y_spread = _pdep_u64(y, 0x2492492492492492ull);
++    uint64_t z_spread = _pdep_u64(z, 0x4924924924924924ull);
++    return x_spread | y_spread | z_spread;
++    #else
+     return split3(x) | (split3(y) << 1u) | (split3(z) << 2u);
++    #endif
+   }
+ 
+ 
