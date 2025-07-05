@@ -40,18 +40,16 @@ static unsigned long long quirks;
 module_param(quirks, ullong, S_IRUGO);
 MODULE_PARM_DESC(quirks, "Bit flags for quirks to be enabled as default");
 
-static bool td_on_ring(struct xhci_td *td, struct xhci_ring *ring)
+static bool td_on_ring(const struct xhci_td *td, const struct xhci_ring *ring)
 {
 	struct xhci_segment *seg;
 
-	if (!td || !td->start_seg) {
+	if (!td || !td->start_seg || !ring || !ring->first_seg)
 		return false;
-	}
 
 	xhci_for_each_ring_seg(ring->first_seg, seg) {
-		if (seg == td->start_seg) {
+		if (seg == td->start_seg)
 			return true;
-		}
 	}
 
 	return false;
@@ -1575,145 +1573,123 @@ static int xhci_check_ep0_maxpacket(struct xhci_hcd *xhci, struct xhci_virt_devi
 	return ret;
 }
 
+/* ======================================================================= */
+/*  xhci_urb_enqueue()                                                     */
+/* ======================================================================= */
 /*
- * non-error returns are a promise to giveback() the urb later
- * we drop ownership so next owner (or urb unlink) can get it
+ * Non-error return promises usb-core that giveback() will be invoked later.
+ * Ownership of @urb is released here; completion or unlink becomes next owner.
  */
 static int xhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,
-							gfp_t mem_flags)
+							gfp_t           mem_flags)
 {
-	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
-	unsigned int slot_id, ep_index;
+	struct xhci_hcd         *xhci;
 	struct xhci_virt_device *vdev;
-	struct urb_priv *urb_priv;
-	unsigned long flags;
-	int ret = 0;
-	int num_tds;
+	struct urb_priv         *priv;
+	unsigned int             slot_id, ep_index;
+	unsigned long            flags;
+	size_t                   alloc_sz;
+	int                      num_tds;
+	int                      ret = 0;
 
-	/*
-	 * ===================================================================
-	 * Stage 1: Lockless Validation (Fail Fast)
-	 * ===================================================================
-	 * Perform all cheap, pointer-based, and state-based sanity checks
-	 * before any resource allocation or locking. This ensures that invalid
-	 * or premature requests are rejected with minimal overhead.
-	 */
-	if (!urb || !urb->ep || !urb->dev) {
+	/* ---------- Stage-1 : cheap parameter / state validation ---------- */
+	if (unlikely(!hcd || !urb || !urb->ep || !urb->dev))
 		return -EINVAL;
-	}
-	if (urb->dev->state < USB_STATE_ADDRESS) {
+
+	if (unlikely(urb->dev->state < USB_STATE_ADDRESS))
 		return -ENODEV;
-	}
 
 	slot_id = urb->dev->slot_id;
-	/* A slot_id of 0 is invalid and indicates the device is not yet addressed. */
-	if (!slot_id) {
+	if (unlikely(!slot_id))
 		return -ENODEV;
-	}
 
-	vdev = xhci->devs[slot_id];
-	/*
-	 * This check is critical. If vdev is NULL, the device has been torn
-	 * down, but an URB is still in-flight. This can happen during rapid
-	 * device disconnects. We must reject it.
-	 */
-	if (!vdev) {
+	xhci = hcd_to_xhci(hcd);
+
+	/* vdev may already be torn down by a hot-unplug                */
+	vdev = READ_ONCE(xhci->devs[slot_id]);
+	if (unlikely(!vdev))
 		return -ENODEV;
-	}
+
 	ep_index = xhci_get_endpoint_index(&urb->ep->desc);
 
-	trace_xhci_urb_enqueue(urb);
-
-	/*
-	 * ===================================================================
-	 * Stage 2: Pre-computation and Resource Allocation
-	 * ===================================================================
-	 * Calculate the number of Transfer Descriptors (TDs) needed and
-	 * allocate the URB's private data structure. These operations are
-	 * performed *before* taking the spinlock, as kzalloc can sleep and
-	 * holding a lock during allocation is a severe performance bottleneck
-	 * and a source of potential deadlocks.
-	 */
+	/* ---------- Stage-2 : TD budget calculation + priv alloc ---------- */
 	if (usb_endpoint_xfer_isoc(&urb->ep->desc)) {
+		if (unlikely(!urb->number_of_packets))
+			return -EINVAL;
 		num_tds = urb->number_of_packets;
 	} else if (usb_endpoint_is_bulk_out(&urb->ep->desc) &&
 		(urb->transfer_flags & URB_ZERO_PACKET) &&
-		urb->transfer_buffer_length > 0 &&
-		(urb->transfer_buffer_length % usb_endpoint_maxp(&urb->ep->desc) == 0)) {
-		num_tds = 2; /* One for data, one for the zero-length packet. */
+		urb->transfer_buffer_length &&
+		!(urb->transfer_buffer_length %
+		usb_endpoint_maxp(&urb->ep->desc))) {
+		num_tds = 2;					/* data + ZLP */
 		} else {
 			num_tds = 1;
 		}
 
-		urb_priv = kzalloc(struct_size(urb_priv, td, num_tds), mem_flags);
-	if (!urb_priv) {
+		alloc_sz = struct_size(priv, td, num_tds);	/* overflow-safe */
+		if (unlikely(alloc_sz == SIZE_MAX))
+			return -EOVERFLOW;
+
+	priv = kzalloc(alloc_sz, mem_flags);
+	if (unlikely(!priv))
 		return -ENOMEM;
-	}
 
-	urb_priv->num_tds = num_tds;
-	urb_priv->num_tds_done = 0;
-	urb->hcpriv = urb_priv;
+	priv->num_tds      = num_tds;
+	priv->num_tds_done = 0;
+	urb->hcpriv        = priv;
 
-	/*
-	 * ===================================================================
-	 * Stage 3: Critical Section
-	 * ===================================================================
-	 * The spinlock now protects the absolute minimum set of operations:
-	 * re-validating state that could have changed concurrently, and the
-	 * actual, very fast, queueing operation.
-	 */
+	/* ---------- Stage-3 : critical section (micro-seconds) ------------ */
 	spin_lock_irqsave(&xhci->lock, flags);
 
-	/* Re-validate critical state that may have changed since our initial checks. */
+	/* Re-validate dynamic state under the lock                           */
+	vdev = xhci->devs[slot_id];
+	if (unlikely(!vdev)) {
+		ret = -ENODEV;
+		goto err_free_unlock;
+	}
+
+	ret = xhci_check_args(hcd, urb->dev, urb->ep, true, true, __func__);
+	if (ret <= 0) {
+		ret = ret ? ret : -EINVAL;
+		goto err_free_unlock;
+	}
+
 	if (unlikely(!HCD_HW_ACCESSIBLE(hcd))) {
 		ret = -ESHUTDOWN;
-		goto free_priv_and_unlock;
+		goto err_free_unlock;
 	}
 
 	if (unlikely(vdev->flags & VDEV_PORT_ERROR)) {
-		xhci_dbg(xhci, "Rejecting URB for slot %u with port error\n", slot_id);
 		ret = -ENODEV;
-		goto free_priv_and_unlock;
+		goto err_free_unlock;
 	}
 
 	if (unlikely(xhci->xhc_state & (XHCI_STATE_DYING | XHCI_STATE_HALTED))) {
-		xhci_dbg(xhci, "Rejecting URB %p for dying host\n", urb);
 		ret = -ESHUTDOWN;
-		goto free_priv_and_unlock;
+		goto err_free_unlock;
 	}
 
-	/*
-	 * Check if the endpoint is in a transitional state (e.g., being
-	 * reset or having streams configured). This is a critical check
-	 * to prevent queueing to an unstable endpoint.
-	 */
 	if (unlikely(vdev->eps[ep_index].ep_state &
 		(EP_GETTING_STREAMS | EP_GETTING_NO_STREAMS |
 		EP_SOFT_CLEAR_TOGGLE))) {
-		xhci_warn(xhci,
-				  "Can't enqueue URB, ep %u on slot %u in transition state %x\n",
-			ep_index, slot_id, vdev->eps[ep_index].ep_state);
 		ret = -EINVAL;
-	goto free_priv_and_unlock;
+	goto err_free_unlock;
 		}
 
-		/*
-		 * Dispatch to the type-specific queueing function. These functions
-		 * are now guaranteed to be working with a valid, checked state.
-		 * GFP_ATOMIC is passed as these functions are now under spinlock.
-		 */
+		/* ---------------- Queue according to endpoint type ---------------- */
 		switch (usb_endpoint_type(&urb->ep->desc)) {
 			case USB_ENDPOINT_XFER_CONTROL:
-				ret = xhci_queue_ctrl_tx(xhci, GFP_ATOMIC, urb,
-										 slot_id, ep_index);
+				ret = xhci_queue_ctrl_tx (xhci, GFP_ATOMIC, urb,
+										  slot_id, ep_index);
 				break;
 			case USB_ENDPOINT_XFER_BULK:
-				ret = xhci_queue_bulk_tx(xhci, GFP_ATOMIC, urb,
-										 slot_id, ep_index);
+				ret = xhci_queue_bulk_tx (xhci, GFP_ATOMIC, urb,
+										  slot_id, ep_index);
 				break;
 			case USB_ENDPOINT_XFER_INT:
-				ret = xhci_queue_intr_tx(xhci, GFP_ATOMIC, urb,
-										 slot_id, ep_index);
+				ret = xhci_queue_intr_tx (xhci, GFP_ATOMIC, urb,
+										  slot_id, ep_index);
 				break;
 			case USB_ENDPOINT_XFER_ISOC:
 				ret = xhci_queue_isoc_tx_prepare(xhci, GFP_ATOMIC, urb,
@@ -1721,232 +1697,149 @@ static int xhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,
 				break;
 			default:
 				ret = -EINVAL;
-				break;
 		}
 
-		/*
-		 * If the queueing operation failed (e.g., ring is full), we must
-		 * clean up the hcpriv we attached earlier before unlocking.
-		 */
-		if (unlikely(ret)) {
-			goto free_priv_and_unlock;
-		}
+		if (unlikely(ret))
+			goto err_free_unlock;
 
-		spin_unlock_irqrestore(&xhci->lock, flags);
+	spin_unlock_irqrestore(&xhci->lock, flags);
+	trace_xhci_urb_enqueue(urb);
+	return 0;
 
-		return 0;
-
-		free_priv_and_unlock:
-		xhci_urb_free_priv(urb_priv);
-		urb->hcpriv = NULL;
-		spin_unlock_irqrestore(&xhci->lock, flags);
-		return ret;
+	err_free_unlock:
+	spin_unlock_irqrestore(&xhci->lock, flags);
+	xhci_urb_free_priv(priv);
+	urb->hcpriv = NULL;
+	return ret;
 }
 
-/*
- * Remove the URB's TD from the endpoint ring.  This may cause the HC to stop
- * USB transfers, potentially stopping in the middle of a TRB buffer.  The HC
- * should pick up where it left off in the TD, unless a Set Transfer Ring
- * Dequeue Pointer is issued.
- *
- * The TRBs that make up the buffers for the canceled URB will be "removed" from
- * the ring.  Since the ring is a contiguous structure, they can't be physically
- * removed.  Instead, there are two options:
- *
- *  1) If the HC is in the middle of processing the URB to be canceled, we
- *     simply move the ring's dequeue pointer past those TRBs using the Set
- *     Transfer Ring Dequeue Pointer command.  This will be the common case,
- *     when drivers timeout on the last submitted URB and attempt to cancel.
- *
- *  2) If the HC is in the middle of a different TD, we turn the TRBs into a
- *     series of 1-TRB transfer no-op TDs.  (No-ops shouldn't be chained.)  The
- *     HC will need to invalidate the any TRBs it has cached after the stop
- *     endpoint command, as noted in the xHCI 0.95 errata.
- *
- *  3) The TD may have completed by the time the Stop Endpoint Command
- *     completes, so software needs to handle that case too.
- *
- * This function should protect against the TD enqueueing code ringing the
- * doorbell while this code is waiting for a Stop Endpoint command to complete.
- * It also needs to account for multiple cancellations on happening at the same
- * time for the same endpoint.
- *
- * Note that this function can be called in any context, or so says
- * usb_hcd_unlink_urb()
- */
+/* ====================================================================== */
+/*  xhci_urb_dequeue()                                                    */
+/* ====================================================================== */
 static int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 {
-	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
+	struct xhci_hcd         *xhci  = hcd_to_xhci(hcd);
 	struct xhci_virt_device *vdev;
-	struct xhci_virt_ep *ep;
-	struct xhci_ring *ep_ring;
-	struct urb_priv *urb_priv;
-	struct xhci_td *td;
-	struct xhci_command *command = NULL;
-	unsigned long flags;
-	u32 temp;
-	int ret, i;
-	unsigned int ep_index;
+	struct xhci_virt_ep     *ep;
+	struct xhci_ring        *ring;
+	struct urb_priv         *priv;
+	struct xhci_td          *td;
+	struct xhci_command     *cmd   = NULL;
+	unsigned int             ep_index;
+	unsigned long            flags;
+	u32                      hcsts;
+	int                      i, ret = 0;
 
 	spin_lock_irqsave(&xhci->lock, flags);
 	trace_xhci_urb_dequeue(urb);
 
-	/*
-	 * ===================================================================
-	 * Step 1: Standard Unlink Validation
-	 * ===================================================================
-	 * Use the kernel's helper to check if the URB is already being unlinked
-	 * or has already completed. This atomically handles race conditions
-	 * with the completion path.
-	 */
 	ret = usb_hcd_check_unlink_urb(hcd, urb, status);
 	if (ret) {
 		spin_unlock_irqrestore(&xhci->lock, flags);
 		return ret;
 	}
 
-	/*
-	 * ===================================================================
-	 * Step 2: Context Verification
-	 * ===================================================================
-	 * Ensure all our internal data structures are still valid.
-	 */
-	vdev = xhci->devs[urb->dev->slot_id];
-	urb_priv = urb->hcpriv;
-	if (!vdev || !urb_priv) {
-		goto giveback_urb_unlock;
-	}
+	/* -------------- Re-validate objects still exist ------------------- */
+	vdev  = xhci->devs[urb->dev->slot_id];
+	priv  = urb->hcpriv;
+	if (unlikely(!vdev || !priv))
+		goto giveback;
 
 	ep_index = xhci_get_endpoint_index(&urb->ep->desc);
-	ep = &vdev->eps[ep_index];
-	ep_ring = xhci_urb_to_transfer_ring(xhci, urb);
-	if (!ep_ring) {
-		goto giveback_urb_unlock;
-	}
+	ep       = &vdev->eps[ep_index];
+	ring     = xhci_urb_to_transfer_ring(xhci, urb);
+	if (unlikely(!ring))
+		goto giveback;
 
-	/*
-	 * ===================================================================
-	 * Step 3: Critical Ring/TD Association Check
-	 * ===================================================================
-	 * This is the crucial check that was previously omitted. We must verify
-	 * that the TD associated with the URB is actually on the *current*
-	 * endpoint ring. This protects against a race where the ring is
-	 * reallocated, invalidating the TD's segment pointers.
-	 */
-	if (!td_on_ring(&urb_priv->td[0], ep_ring)) {
-		xhci_warn(xhci, "URB %p's TD not on endpoint ring, assuming stale and giving back.\n", urb);
-		for (i = urb_priv->num_tds_done; i < urb_priv->num_tds; i++) {
-			td = &urb_priv->td[i];
-			list_del_init(&td->cancelled_td_list);
-		}
-		goto giveback_urb_unlock;
-	}
+	if (unlikely(!td_on_ring(&priv->td[0], ring)))
+		goto giveback;
 
-	/*
-	 * ===================================================================
-	 * Step 4: Handle Terminal Host States
-	 * ===================================================================
-	 */
-	temp = readl(&xhci->op_regs->status);
-	if (temp == ~(u32)0 || (xhci->xhc_state & XHCI_STATE_DYING)) {
+	/* -------------- Controller fatal state handling ------------------- */
+	hcsts = readl(&xhci->op_regs->status);
+	if (hcsts == ~(u32)0 || (xhci->xhc_state & XHCI_STATE_DYING)) {
 		xhci_hc_died(xhci);
 		spin_unlock_irqrestore(&xhci->lock, flags);
-		return 0; /* The URB will be given back later by the die handler. */
+		return 0;
 	}
 
 	if (xhci->xhc_state & XHCI_STATE_HALTED) {
-		xhci_dbg_trace(xhci, trace_xhci_dbg_cancel_urb,
-					   "HC halted, freeing TD manually for URB %p", urb);
-		for (i = urb_priv->num_tds_done; i < urb_priv->num_tds; i++) {
-			td = &urb_priv->td[i];
+		for (i = priv->num_tds_done; i < priv->num_tds; i++) {
+			td = &priv->td[i];
 			list_del_init(&td->td_list);
 			list_del_init(&td->cancelled_td_list);
 		}
-		goto giveback_urb_unlock;
+		goto giveback;
 	}
 
-	/*
-	 * ===================================================================
-	 * Step 5: Mark TDs for Cancellation
-	 * ===================================================================
-	 * Atomically add all outstanding TDs for this URB to the endpoint's
-	 * 'cancelled_td_list'. This is the core cancellation action.
-	 */
-	for (i = urb_priv->num_tds_done; i < urb_priv->num_tds; i++) {
-		td = &urb_priv->td[i];
+	/* -------------- Mark outstanding TDs cancelled -------------------- */
+	for (i = priv->num_tds_done; i < priv->num_tds; i++) {
+		td = &priv->td[i];
 		if (list_empty(&td->cancelled_td_list)) {
 			td->cancel_status = TD_DIRTY;
-			list_add_tail(&td->cancelled_td_list, &ep->cancelled_td_list);
+			list_add_tail(&td->cancelled_td_list,
+						  &ep->cancelled_td_list);
 		}
 	}
 
-	/*
-	 * ===================================================================
-	 * Step 6: Issue Stop Endpoint Command if Necessary
-	 * ===================================================================
-	 */
+	/* -------------- Decide whether Stop-EP is needed ------------------ */
 	if (ep->ep_state & (EP_STOP_CMD_PENDING | EP_HALTED | SET_DEQ_PENDING)) {
-		/* A command is already pending. Its completion will handle our cancelled TDs. */
-		xhci_dbg(xhci, "Stop EP cmd already pending for slot %d, ep %d\n",
-				 urb->dev->slot_id, ep_index);
-		ret = 0;
-	} else if (ep->ep_state & EP_CLEARING_TT) {
-		/* EP is already stopped. Process the cancelled TDs now. */
-		xhci_process_cancelled_tds(ep);
-		ret = 0;
-	} else {
-		/* We must issue a new Stop Endpoint command. */
-		ep->ep_state |= EP_STOP_CMD_PENDING;
-		ep->stop_time = jiffies;
-
-		/* Drop the lock to allocate memory for the command. */
-		spin_unlock_irqrestore(&xhci->lock, flags);
-
-		command = xhci_alloc_command(xhci, false, GFP_ATOMIC);
-		if (!command) {
-			/* This is a critical failure. We can't stop the endpoint. */
-			spin_lock_irqsave(&xhci->lock, flags);
-			ep->ep_state &= ~EP_STOP_CMD_PENDING;
-			/* We can't safely clean the cancelled_td_list here, as the TDs are on the ring. */
-			spin_unlock_irqrestore(&xhci->lock, flags);
-			xhci_warn(xhci, "Cannot allocate Stop EP command, URB %p may not be cancelled\n", urb);
-			return -ENOMEM;
-		}
-
-		spin_lock_irqsave(&xhci->lock, flags);
-
-		/* Re-check state after re-acquiring lock. Another thread might have acted. */
-		if (ep->ep_state & EP_STOP_CMD_PENDING) {
-			ret = xhci_queue_stop_endpoint(xhci, command, urb->dev->slot_id,
-										   ep_index, 0);
-			if (ret) {
-				ep->ep_state &= ~EP_STOP_CMD_PENDING;
-				spin_unlock_irqrestore(&xhci->lock, flags);
-				xhci_free_command(xhci, command);
-				return ret;
-			}
-			xhci_ring_cmd_db(xhci);
-		} else {
-			/* Another thread stopped the EP while we were unlocked. */
-			spin_unlock_irqrestore(&xhci->lock, flags);
-			xhci_free_command(xhci, command);
-			return 0;
-		}
+		goto unlock_ok;
 	}
+
+	if (ep->ep_state & EP_CLEARING_TT) {
+		xhci_process_cancelled_tds(ep);
+		goto unlock_ok;
+	}
+
+	ep->ep_state |= EP_STOP_CMD_PENDING;
+	ep->stop_time = jiffies;
 
 	spin_unlock_irqrestore(&xhci->lock, flags);
+
+	/* GFP_ATOMIC avoids the boot-time stall observed with GFP_KERNEL.   */
+	cmd = xhci_alloc_command(xhci, false, GFP_ATOMIC);
+	if (unlikely(!cmd)) {
+		status = -ENOMEM;
+		goto giveback_nolock;
+	}
+
+	spin_lock_irqsave(&xhci->lock, flags);
+
+	if (!(ep->ep_state & EP_STOP_CMD_PENDING)) {
+		spin_unlock_irqrestore(&xhci->lock, flags);
+		xhci_free_command(xhci, cmd);
+		return 0;
+	}
+
+	ret = xhci_queue_stop_endpoint(xhci, cmd,
+								   urb->dev->slot_id, ep_index, 0);
+	if (unlikely(ret)) {
+		ep->ep_state &= ~EP_STOP_CMD_PENDING;
+		spin_unlock_irqrestore(&xhci->lock, flags);
+		xhci_free_command(xhci, cmd);
+		status = ret;
+		goto giveback_nolock;
+	}
+
+	xhci_ring_cmd_db(xhci);
+
+	unlock_ok:
+	spin_unlock_irqrestore(&xhci->lock, flags);
+	return 0;
+
+	/* ----------- Synchronous give-back (error / stale path) ----------- */
+	giveback:
+	usb_hcd_unlink_urb_from_ep(hcd, urb);
+	if (priv)
+		xhci_urb_free_priv(priv);
+	spin_unlock_irqrestore(&xhci->lock, flags);
+	usb_hcd_giveback_urb(hcd, urb, status);
 	return ret;
 
-	giveback_urb_unlock:
-	/*
-	 * Common giveback path for cases where cancellation is not possible
-	 * or has been implicitly completed. This is the safe exit path.
-	 */
-	if (urb_priv) {
-		xhci_urb_free_priv(urb_priv);
-	}
+	giveback_nolock:
 	usb_hcd_unlink_urb_from_ep(hcd, urb);
-	spin_unlock_irqrestore(&xhci->lock, flags);
+	if (priv)
+		xhci_urb_free_priv(priv);
 	usb_hcd_giveback_urb(hcd, urb, status);
 	return ret;
 }
