@@ -46,8 +46,9 @@ namespace dxvk {
     : proc(std::move(proc_)) { }
 
     ~ThreadData() {
-      if (handle)
+      if (handle) {
         CloseHandle(handle);
+      }
     }
 
     HANDLE                handle = nullptr;
@@ -87,14 +88,23 @@ namespace dxvk {
     : m_data(std::exchange(other.m_data, nullptr)) { }
 
     thread& operator = (thread&& other) noexcept {
-      if (m_data)
+      if (joinable()) {
+        std::terminate();
+      }
+
+      if (m_data) {
         m_data->decRef();
+      }
 
       m_data = std::exchange(other.m_data, nullptr);
       return *this;
     }
 
     void detach() {
+      if (!joinable()) {
+        throw std::system_error(std::make_error_code(std::errc::invalid_argument), "Thread not detachable");
+      }
+
       m_data->decRef();
       m_data = nullptr;
     }
@@ -199,47 +209,33 @@ namespace dxvk {
     fast_mutex& operator = (const fast_mutex&) = delete;
 
     DXVK_FORCE_INLINE void lock() noexcept {
-      // Try once before spinning
-      if (try_lock()) {
+      if (likely(try_lock())) {
         return;
       }
 
-      // Adaptive spinning with pause instruction
-      static constexpr uint32_t max_spins = 4000;
-
-      for (uint32_t spin = 0; spin < max_spins; spin++) {
-        // Pause to reduce power and improve performance
+      // Phase 1: Aggressive spin for ultra-short contention.
+      for (uint32_t i = 0; i < 64; i++) {
         #if defined(DXVK_ARCH_X86)
         #if defined(_MSC_VER)
         _mm_pause();
         #elif defined(__GNUC__) || defined(__clang__)
         __builtin_ia32_pause();
         #endif
-        #else
-        // Generic yield for non-x86
-        std::this_thread::yield();
         #endif
-
         if (try_lock()) {
           return;
         }
+      }
 
-        // Exponential backoff after initial spins
-        if (spin > 1000) {
-          uint32_t backoff_iterations = (spin - 1000) / 1000;
-          for (uint32_t i = 0; i < backoff_iterations; i++) {
-            #if defined(DXVK_ARCH_X86)
-            #if defined(_MSC_VER)
-            _mm_pause();
-            #elif defined(__GNUC__) || defined(__clang__)
-            __builtin_ia32_pause();
-            #endif
-            #endif
-          }
+      // Phase 2: Yielding spin for short-term contention.
+      for (uint32_t i = 0; i < 16; i++) {
+        dxvk::this_thread::yield();
+        if (try_lock()) {
+          return;
         }
       }
 
-      // Fall back to OS mutex
+      // Phase 3: Fall back to a blocking OS call.
       AcquireSRWLockExclusive(&m_lock);
     }
 
@@ -344,14 +340,14 @@ namespace dxvk {
 
     template<typename Predicate>
     void wait(std::unique_lock<dxvk::mutex>& lock, Predicate pred) {
-      while (!pred())
+      while (!pred()) {
         wait(lock);
+      }
     }
 
     template<typename Clock, typename Duration>
     std::cv_status wait_until(std::unique_lock<dxvk::mutex>& lock, const std::chrono::time_point<Clock, Duration>& time) {
       auto now = Clock::now();
-
       return (now < time)
       ? wait_for(lock, time - now)
       : std::cv_status::timeout;
@@ -359,11 +355,12 @@ namespace dxvk {
 
     template<typename Clock, typename Duration, typename Predicate>
     bool wait_until(std::unique_lock<dxvk::mutex>& lock, const std::chrono::time_point<Clock, Duration>& time, Predicate pred) {
-      if (pred())
-        return true;
-
-      auto now = Clock::now();
-      return now < time && wait_for(lock, time - now, pred);
+      while (!pred()) {
+        if (wait_until(lock, time) == std::cv_status::timeout) {
+          return pred();
+        }
+      }
+      return true;
     }
 
     template<typename Rep, typename Period>
@@ -371,19 +368,24 @@ namespace dxvk {
       auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
       auto srw = lock.mutex()->native_handle();
 
-      return SleepConditionVariableSRW(&m_cond, srw, ms.count(), 0)
+      if (ms.count() < 0) {
+        ms = std::chrono::milliseconds(0);
+      }
+
+      return SleepConditionVariableSRW(&m_cond, srw, DWORD(ms.count()), 0)
       ? std::cv_status::no_timeout
       : std::cv_status::timeout;
     }
 
     template<typename Rep, typename Period, typename Predicate>
     bool wait_for(std::unique_lock<dxvk::mutex>& lock, const std::chrono::duration<Rep, Period>& timeout, Predicate pred) {
-      bool result = pred();
-
-      if (!result && wait_for(lock, timeout) == std::cv_status::no_timeout)
-        result = pred();
-
-      return result;
+      auto end_time = std::chrono::steady_clock::now() + timeout;
+      while (!pred()) {
+        if (wait_for(lock, end_time - std::chrono::steady_clock::now()) == std::cv_status::timeout) {
+          return pred();
+        }
+      }
+      return true;
     }
 
     DXVK_FORCE_INLINE native_handle_type native_handle() noexcept {
@@ -397,13 +399,14 @@ namespace dxvk {
   };
 
   #else
+  #include <sched.h>
   class thread : public std::thread {
   public:
     using std::thread::thread;
 
     void set_priority(ThreadPriority priority) {
-      ::sched_param param = {};
-      int32_t policy;
+      sched_param param = {};
+      int policy;
       switch (priority) {
         default:
         case ThreadPriority::Normal: policy = SCHED_OTHER; break;
@@ -413,7 +416,7 @@ namespace dxvk {
         case ThreadPriority::Lowest: policy = SCHED_IDLE;  break;
         #endif
       }
-      ::pthread_setschedparam(this->native_handle(), policy, &param);
+      pthread_setschedparam(this->native_handle(), policy, ¶m);
     }
   };
 

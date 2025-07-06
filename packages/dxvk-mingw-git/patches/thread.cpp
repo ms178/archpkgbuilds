@@ -1,6 +1,8 @@
 #include <atomic>
+#include <vector>
 
 #include "thread.h"
+#include "util_bit.h"
 #include "util_likely.h"
 
 #ifdef _WIN32
@@ -30,26 +32,34 @@ namespace dxvk {
 
 
   thread::~thread() {
-    if (joinable())
+    if (joinable()) {
       std::terminate();
+    }
   }
 
 
   void thread::join() {
-    if (!joinable())
+    if (!joinable()) {
       throw std::system_error(std::make_error_code(std::errc::invalid_argument), "Thread not joinable");
+    }
 
-    if (get_id() == this_thread::get_id())
+    if (get_id() == this_thread::get_id()) {
       throw std::system_error(std::make_error_code(std::errc::resource_deadlock_would_occur), "Cannot join current thread");
+    }
 
-    if(::WaitForSingleObjectEx(m_data->handle, INFINITE, FALSE) == WAIT_FAILED)
+    if(::WaitForSingleObjectEx(m_data->handle, INFINITE, FALSE) == WAIT_FAILED) {
       throw std::system_error(std::make_error_code(std::errc::invalid_argument), "Joining thread failed");
+    }
 
     detach();
   }
 
 
   void thread::set_priority(ThreadPriority priority) {
+    if (!joinable()) {
+      return;
+    }
+
     int32_t value;
     switch (priority) {
       default:
@@ -57,21 +67,49 @@ namespace dxvk {
       case ThreadPriority::Lowest: value = THREAD_PRIORITY_LOWEST; break;
     }
 
-    if (m_data)
+    if (m_data) {
       ::SetThreadPriority(m_data->handle, value);
+    }
   }
 
 
   uint32_t thread::hardware_concurrency() {
-    // Try Windows 7+ API for processor groups
-    using GetActiveProcessorCount_t = DWORD (WINAPI *)(WORD);
-    static auto pGetActiveProcessorCount = reinterpret_cast<GetActiveProcessorCount_t>(
-      ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"), "GetActiveProcessorCount"));
+    using GetLogicalProcessorInformationEx_t = BOOL (WINAPI *)(LOGICAL_PROCESSOR_RELATIONSHIP, PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, PDWORD);
+    static auto pGetLogicalProcessorInformationEx = reinterpret_cast<GetLogicalProcessorInformationEx_t>(
+      ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"), "GetLogicalProcessorInformationEx"));
 
-    if (pGetActiveProcessorCount)
-      return pGetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    if (pGetLogicalProcessorInformationEx) {
+      DWORD length = 0;
+      pGetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
 
-    // Fallback to legacy API
+      if (length > 0) {
+        std::vector<char> buffer(length);
+        auto info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data());
+
+        if (pGetLogicalProcessorInformationEx(RelationProcessorCore, info, &length)) {
+          uint32_t pCoreCount = 0;
+          uint32_t totalLogicalCoreCount = 0;
+          DWORD offset = 0;
+
+          while (offset < length) {
+            auto currentInfo = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data() + offset);
+
+            uint32_t logicalProcessorsInCore = dxvk::bit::popcnt(currentInfo->Processor.GroupMask[0].Mask);
+            totalLogicalCoreCount += logicalProcessorsInCore;
+
+            if (currentInfo->Processor.EfficiencyClass == 0) {
+              pCoreCount += logicalProcessorsInCore;
+            }
+            offset += currentInfo->Size;
+          }
+
+          if (pCoreCount > 0 && pCoreCount < totalLogicalCoreCount) {
+            return pCoreCount;
+          }
+        }
+      }
+    }
+
     SYSTEM_INFO info = { };
     ::GetSystemInfo(&info);
     return info.dwNumberOfProcessors;
@@ -110,22 +148,26 @@ namespace dxvk::this_thread {
 
 #else
 
+#if defined(__linux__)
+#include <unistd.h>
+#endif
+
 namespace dxvk::this_thread {
 
-  static std::atomic<uint32_t> g_threadCtr = { 0u };
-  static thread_local uint32_t g_threadId  = 0u;
-
-  // This implementation returns thread ids unique to the current instance.
-  // ie. if you use this across multiple .so's then you might get conflicting ids.
-  //
-  // This isn't an issue for us, as it is only used by the spinlock implementation,
-  // but may be for you if you use this elsewhere.
   uint32_t get_id() {
-    if (likely(g_threadId != 0))
-      return g_threadId;
+    static thread_local uint32_t t_id = 0u;
 
-    g_threadId = ++g_threadCtr;
-    return g_threadId;
+    if (likely(t_id != 0u)) {
+      return t_id;
+    }
+
+    #if defined(__linux__)
+    t_id = static_cast<uint32_t>(::gettid());
+    #else
+    static std::atomic<uint32_t> g_threadCtr = { 0u };
+    t_id = ++g_threadCtr;
+    #endif
+    return t_id;
   }
 
 }
