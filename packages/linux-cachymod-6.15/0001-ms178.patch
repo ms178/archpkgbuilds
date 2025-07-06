@@ -1,134 +1,716 @@
 --- a/drivers/usb/host/xhci.c	2025-06-19 15:41:08.000000000 +0200
 +++ b/drivers/usb/host/xhci.c	2025-06-26 01:59:47.529699115 +0200
-@@ -1530,14 +1530,15 @@ static int xhci_check_ep0_maxpacket(stru
-  * non-error returns are a promise to giveback() the urb later
-  * we drop ownership so next owner (or urb unlink) can get it
+@@ -40,11 +40,11 @@ static unsigned long long quirks;
+ module_param(quirks, ullong, S_IRUGO);
+ MODULE_PARM_DESC(quirks, "Bit flags for quirks to be enabled as default");
+ 
+-static bool td_on_ring(struct xhci_td *td, struct xhci_ring *ring)
++static bool td_on_ring(const struct xhci_td *td, const struct xhci_ring *ring)
+ {
+ 	struct xhci_segment *seg;
+ 
+-	if (!td || !td->start_seg)
++	if (!td || !td->start_seg || !ring || !ring->first_seg)
+ 		return false;
+ 
+ 	xhci_for_each_ring_seg(ring->first_seg, seg) {
+@@ -778,22 +778,69 @@ static void xhci_clear_command_ring(stru
+ {
+ 	struct xhci_ring *ring;
+ 	struct xhci_segment *seg;
++	u32 val;
+ 
+ 	ring = xhci->cmd_ring;
++
++	/*
++	 * This loop prepares the command ring for suspend by clearing all TRBs
++	 * and ensuring the Link TRB at the end of each segment is correctly
++	 * configured with its Cycle bit cleared.
++	 */
+ 	xhci_for_each_ring_seg(ring->first_seg, seg) {
+-		/* erase all TRBs before the link */
++		/*
++		 * This function is called during suspend and must be robust
++		 * against memory access race conditions. A naive approach of
++		 * memset followed by a read-modify-write on the final TRB can
++		 * race with CPU zero-store optimizations on weakly-ordered
++		 * DMA-coherent memory, leading to data corruption.
++		 *
++		 * The safe sequence is:
++		 * 1. Read the Link TRB's control field into a register *before*
++		 *    any writes to its cache line occur. This captures its
++		 *    current state, including the Chain (CH) bit.
++		 * 2. Perform a partial memset() on only the data TRBs, leaving
++		 *    the Link TRB untouched. This avoids the race.
++		 * 3. Modify the control field value in the register according
++		 *    to spec and write it back.
++		 */
++		val = le32_to_cpu(seg->trbs[TRBS_PER_SEGMENT - 1].link.control);
++
++		/*
++		 * Zero out all TRBs in the segment *except* for the last one,
++		 * which is the Link TRB. This ensures we do not write to the
++		 * cache line we just read from, thus avoiding the hazard.
++		 */
+ 		memset(seg->trbs, 0, sizeof(union xhci_trb) * (TRBS_PER_SEGMENT - 1));
+-		/* clear link cycle bit */
+-		seg->trbs[TRBS_PER_SEGMENT - 1].link.control &= cpu_to_le32(~TRB_CYCLE);
++
++		/*
++		 * Now, manipulate the control word in our local variable.
++		 * Per xHCI specification 4.9.4:
++		 * - The Cycle bit (C, bit 0) must be cleared for the link to be
++		 *   valid for the HC on resume.
++		 * - The Toggle Cycle bit (TC, bit 1) **shall be '1'**.
++		 *
++		 * We use the universally defined BIT(1) macro to set the TC bit.
++		 * This preserves the existing Chain bit (CH) and other flags by
++		 * using a RMW on 'val' and then explicitly ORing the mandatory TC bit.
++		 */
++		val &= ~TRB_CYCLE;
++		val |= BIT(1); /* Set Toggle Cycle (TC) bit */
++
++		/*
++		 * Write the corrected value back. This is now a single, safe write
++		 * that correctly sets up the Link TRB for the next host run.
++		 */
++		seg->trbs[TRBS_PER_SEGMENT - 1].link.control = cpu_to_le32(val);
+ 	}
+ 
++	/* Reset the software's view of the ring's state. */
+ 	xhci_initialize_ring_info(ring);
++
+ 	/*
+-	 * Reset the hardware dequeue pointer.
+-	 * Yes, this will need to be re-written after resume, but we're paranoid
+-	 * and want to make sure the hardware doesn't access bogus memory
+-	 * because, say, the BIOS or an SMI started the host without changing
+-	 * the command ring pointers.
++	 * Synchronize the hardware's dequeue pointer with the software's state.
++	 * This is critical as the HC does not save this pointer in its suspend
++	 * well.
+ 	 */
+ 	xhci_set_cmd_ring_deq(xhci);
+ }
+@@ -1526,274 +1573,274 @@ static int xhci_check_ep0_maxpacket(stru
+ 	return ret;
+ }
+ 
++/* ======================================================================= */
++/*  xhci_urb_enqueue()                                                     */
++/* ======================================================================= */
+ /*
+- * non-error returns are a promise to giveback() the urb later
+- * we drop ownership so next owner (or urb unlink) can get it
++ * Non-error return promises usb-core that giveback() will be invoked later.
++ * Ownership of @urb is released here; completion or unlink becomes next owner.
   */
 -static int xhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 +static int xhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,
-+			    gfp_t mem_flags)
++							gfp_t           mem_flags)
  {
- 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
- 	unsigned long flags;
- 	int ret = 0;
- 	unsigned int slot_id, ep_index;
- 	unsigned int *ep_state;
+-	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
+-	unsigned long flags;
+-	int ret = 0;
+-	unsigned int slot_id, ep_index;
+-	unsigned int *ep_state;
 -	struct urb_priv	*urb_priv;
-+	struct urb_priv *urb_priv;
- 	int num_tds;
+-	int num_tds;
++	struct xhci_hcd         *xhci;
++	struct xhci_virt_device *vdev;
++	struct urb_priv         *priv;
++	unsigned int             slot_id, ep_index;
++	unsigned long            flags;
++	size_t                   alloc_sz;
++	int                      num_tds;
++	int                      ret = 0;
++
++	/* ---------- Stage-1 : cheap parameter / state validation ---------- */
++	if (unlikely(!hcd || !urb || !urb->ep || !urb->dev))
++		return -EINVAL;
++
++	if (unlikely(urb->dev->state < USB_STATE_ADDRESS))
++		return -ENODEV;
++
++	slot_id = urb->dev->slot_id;
++	if (unlikely(!slot_id))
++		return -ENODEV;
++
++	xhci = hcd_to_xhci(hcd);
++
++	/* vdev may already be torn down by a hot-unplug                */
++	vdev = READ_ONCE(xhci->devs[slot_id]);
++	if (unlikely(!vdev))
++		return -ENODEV;
  
  	ep_index = xhci_get_endpoint_index(&urb->ep->desc);
-@@ -1545,68 +1546,65 @@ static int xhci_urb_enqueue(struct usb_h
- 	if (usb_endpoint_xfer_isoc(&urb->ep->desc))
+ 
+-	if (usb_endpoint_xfer_isoc(&urb->ep->desc))
++	/* ---------- Stage-2 : TD budget calculation + priv alloc ---------- */
++	if (usb_endpoint_xfer_isoc(&urb->ep->desc)) {
++		if (unlikely(!urb->number_of_packets))
++			return -EINVAL;
  		num_tds = urb->number_of_packets;
- 	else if (usb_endpoint_is_bulk_out(&urb->ep->desc) &&
+-	else if (usb_endpoint_is_bulk_out(&urb->ep->desc) &&
 -	    urb->transfer_buffer_length > 0 &&
 -	    urb->transfer_flags & URB_ZERO_PACKET &&
 -	    !(urb->transfer_buffer_length % usb_endpoint_maxp(&urb->ep->desc)))
-+		 urb->transfer_buffer_length &&
-+		 (urb->transfer_flags & URB_ZERO_PACKET) &&
-+		 !(urb->transfer_buffer_length %
-+		   usb_endpoint_maxp(&urb->ep->desc)))
- 		num_tds = 2;
- 	else
- 		num_tds = 1;
+-		num_tds = 2;
+-	else
+-		num_tds = 1;
++	} else if (usb_endpoint_is_bulk_out(&urb->ep->desc) &&
++		(urb->transfer_flags & URB_ZERO_PACKET) &&
++		urb->transfer_buffer_length &&
++		!(urb->transfer_buffer_length %
++		usb_endpoint_maxp(&urb->ep->desc))) {
++		num_tds = 2;					/* data + ZLP */
++		} else {
++			num_tds = 1;
++		}
  
- 	urb_priv = kzalloc(struct_size(urb_priv, td, num_tds), mem_flags);
+-	urb_priv = kzalloc(struct_size(urb_priv, td, num_tds), mem_flags);
 -	if (!urb_priv)
-+	if (unlikely(!urb_priv))
- 		return -ENOMEM;
+-		return -ENOMEM;
++		alloc_sz = struct_size(priv, td, num_tds);	/* overflow-safe */
++		if (unlikely(alloc_sz == SIZE_MAX))
++			return -EOVERFLOW;
  
 -	urb_priv->num_tds = num_tds;
-+	urb_priv->num_tds      = num_tds;
- 	urb_priv->num_tds_done = 0;
+-	urb_priv->num_tds_done = 0;
 -	urb->hcpriv = urb_priv;
-+	urb->hcpriv            = urb_priv;
++	priv = kzalloc(alloc_sz, mem_flags);
++	if (unlikely(!priv))
++		return -ENOMEM;
  
- 	trace_xhci_urb_enqueue(urb);
+-	trace_xhci_urb_enqueue(urb);
++	priv->num_tds      = num_tds;
++	priv->num_tds_done = 0;
++	urb->hcpriv        = priv;
  
++	/* ---------- Stage-3 : critical section (micro-seconds) ------------ */
  	spin_lock_irqsave(&xhci->lock, flags);
  
 -	ret = xhci_check_args(hcd, urb->dev, urb->ep,
 -			      true, true, __func__);
--	if (ret <= 0) {
++	/* Re-validate dynamic state under the lock                           */
++	vdev = xhci->devs[slot_id];
++	if (unlikely(!vdev)) {
++		ret = -ENODEV;
++		goto err_free_unlock;
++	}
++
 +	ret = xhci_check_args(hcd, urb->dev, urb->ep, true, true, __func__);
-+	if (unlikely(ret <= 0)) {
+ 	if (ret <= 0) {
  		ret = ret ? ret : -EINVAL;
- 		goto free_priv;
+-		goto free_priv;
++		goto err_free_unlock;
  	}
  
- 	slot_id = urb->dev->slot_id;
- 
+-	slot_id = urb->dev->slot_id;
+-
 -	if (!HCD_HW_ACCESSIBLE(hcd)) {
 +	if (unlikely(!HCD_HW_ACCESSIBLE(hcd))) {
  		ret = -ESHUTDOWN;
- 		goto free_priv;
+-		goto free_priv;
++		goto err_free_unlock;
  	}
  
 -	if (xhci->devs[slot_id]->flags & VDEV_PORT_ERROR) {
 -		xhci_dbg(xhci, "Can't queue urb, port error, link inactive\n");
-+	if (unlikely(xhci->devs[slot_id]->flags & VDEV_PORT_ERROR)) {
-+		xhci_dbg(xhci, "Can't queue urb, port error\n");
++	if (unlikely(vdev->flags & VDEV_PORT_ERROR)) {
  		ret = -ENODEV;
- 		goto free_priv;
+-		goto free_priv;
++		goto err_free_unlock;
  	}
  
 -	if (xhci->xhc_state & XHCI_STATE_DYING) {
 -		xhci_dbg(xhci, "Ep 0x%x: URB %p submitted for non-responsive xHCI host.\n",
 -			 urb->ep->desc.bEndpointAddress, urb);
-+	if (unlikely(READ_ONCE(xhci->xhc_state) & XHCI_STATE_DYING)) {
-+		xhci_dbg(xhci, "URB %p submitted for dying host\n", urb);
++	if (unlikely(xhci->xhc_state & (XHCI_STATE_DYING | XHCI_STATE_HALTED))) {
  		ret = -ESHUTDOWN;
- 		goto free_priv;
+-		goto free_priv;
++		goto err_free_unlock;
  	}
  
- 	ep_state = &xhci->devs[slot_id]->eps[ep_index].ep_state;
- 
+-	ep_state = &xhci->devs[slot_id]->eps[ep_index].ep_state;
+-
 -	if (*ep_state & (EP_GETTING_STREAMS | EP_GETTING_NO_STREAMS)) {
 -		xhci_warn(xhci, "WARN: Can't enqueue URB, ep in streams transition state %x\n",
-+	if (unlikely(*ep_state &
-+		      (EP_GETTING_STREAMS | EP_GETTING_NO_STREAMS |
-+		       EP_SOFT_CLEAR_TOGGLE))) {
-+		xhci_warn(xhci,
-+			  "Can't enqueue URB, ep in transition state %x\n",
- 			  *ep_state);
- 		ret = -EINVAL;
- 		goto free_priv;
- 	}
--	if (*ep_state & EP_SOFT_CLEAR_TOGGLE) {
--		xhci_warn(xhci, "Can't enqueue URB while manually clearing toggle\n");
+-			  *ep_state);
 -		ret = -EINVAL;
 -		goto free_priv;
 -	}
+-	if (*ep_state & EP_SOFT_CLEAR_TOGGLE) {
+-		xhci_warn(xhci, "Can't enqueue URB while manually clearing toggle\n");
++	if (unlikely(vdev->eps[ep_index].ep_state &
++		(EP_GETTING_STREAMS | EP_GETTING_NO_STREAMS |
++		EP_SOFT_CLEAR_TOGGLE))) {
+ 		ret = -EINVAL;
+-		goto free_priv;
+-	}
++	goto err_free_unlock;
++		}
++
++		/* ---------------- Queue according to endpoint type ---------------- */
++		switch (usb_endpoint_type(&urb->ep->desc)) {
++			case USB_ENDPOINT_XFER_CONTROL:
++				ret = xhci_queue_ctrl_tx (xhci, GFP_ATOMIC, urb,
++										  slot_id, ep_index);
++				break;
++			case USB_ENDPOINT_XFER_BULK:
++				ret = xhci_queue_bulk_tx (xhci, GFP_ATOMIC, urb,
++										  slot_id, ep_index);
++				break;
++			case USB_ENDPOINT_XFER_INT:
++				ret = xhci_queue_intr_tx (xhci, GFP_ATOMIC, urb,
++										  slot_id, ep_index);
++				break;
++			case USB_ENDPOINT_XFER_ISOC:
++				ret = xhci_queue_isoc_tx_prepare(xhci, GFP_ATOMIC, urb,
++												 slot_id, ep_index);
++				break;
++			default:
++				ret = -EINVAL;
++		}
  
-+	/* Fast switch by endpoint type */
- 	switch (usb_endpoint_type(&urb->ep->desc)) {
--
- 	case USB_ENDPOINT_XFER_CONTROL:
- 		ret = xhci_queue_ctrl_tx(xhci, GFP_ATOMIC, urb,
- 					 slot_id, ep_index);
-@@ -1617,15 +1615,16 @@ static int xhci_urb_enqueue(struct usb_h
- 		break;
- 	case USB_ENDPOINT_XFER_INT:
- 		ret = xhci_queue_intr_tx(xhci, GFP_ATOMIC, urb,
+-	switch (usb_endpoint_type(&urb->ep->desc)) {
++		if (unlikely(ret))
++			goto err_free_unlock;
+ 
+-	case USB_ENDPOINT_XFER_CONTROL:
+-		ret = xhci_queue_ctrl_tx(xhci, GFP_ATOMIC, urb,
+-					 slot_id, ep_index);
+-		break;
+-	case USB_ENDPOINT_XFER_BULK:
+-		ret = xhci_queue_bulk_tx(xhci, GFP_ATOMIC, urb,
+-					 slot_id, ep_index);
+-		break;
+-	case USB_ENDPOINT_XFER_INT:
+-		ret = xhci_queue_intr_tx(xhci, GFP_ATOMIC, urb,
 -				slot_id, ep_index);
-+					 slot_id, ep_index);
- 		break;
- 	case USB_ENDPOINT_XFER_ISOC:
- 		ret = xhci_queue_isoc_tx_prepare(xhci, GFP_ATOMIC, urb,
+-		break;
+-	case USB_ENDPOINT_XFER_ISOC:
+-		ret = xhci_queue_isoc_tx_prepare(xhci, GFP_ATOMIC, urb,
 -				slot_id, ep_index);
-+						 slot_id, ep_index);
-+		break;
- 	}
+-	}
++	spin_unlock_irqrestore(&xhci->lock, flags);
++	trace_xhci_urb_enqueue(urb);
++	return 0;
  
 -	if (ret) {
- free_priv:
+-free_priv:
+-		xhci_urb_free_priv(urb_priv);
+-		urb->hcpriv = NULL;
+-	}
++	err_free_unlock:
+ 	spin_unlock_irqrestore(&xhci->lock, flags);
++	xhci_urb_free_priv(priv);
++	urb->hcpriv = NULL;
+ 	return ret;
+ }
+ 
+-/*
+- * Remove the URB's TD from the endpoint ring.  This may cause the HC to stop
+- * USB transfers, potentially stopping in the middle of a TRB buffer.  The HC
+- * should pick up where it left off in the TD, unless a Set Transfer Ring
+- * Dequeue Pointer is issued.
+- *
+- * The TRBs that make up the buffers for the canceled URB will be "removed" from
+- * the ring.  Since the ring is a contiguous structure, they can't be physically
+- * removed.  Instead, there are two options:
+- *
+- *  1) If the HC is in the middle of processing the URB to be canceled, we
+- *     simply move the ring's dequeue pointer past those TRBs using the Set
+- *     Transfer Ring Dequeue Pointer command.  This will be the common case,
+- *     when drivers timeout on the last submitted URB and attempt to cancel.
+- *
+- *  2) If the HC is in the middle of a different TD, we turn the TRBs into a
+- *     series of 1-TRB transfer no-op TDs.  (No-ops shouldn't be chained.)  The
+- *     HC will need to invalidate the any TRBs it has cached after the stop
+- *     endpoint command, as noted in the xHCI 0.95 errata.
+- *
+- *  3) The TD may have completed by the time the Stop Endpoint Command
+- *     completes, so software needs to handle that case too.
+- *
+- * This function should protect against the TD enqueueing code ringing the
+- * doorbell while this code is waiting for a Stop Endpoint command to complete.
+- * It also needs to account for multiple cancellations on happening at the same
+- * time for the same endpoint.
+- *
+- * Note that this function can be called in any context, or so says
+- * usb_hcd_unlink_urb()
+- */
++/* ====================================================================== */
++/*  xhci_urb_dequeue()                                                    */
++/* ====================================================================== */
+ static int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
+ {
+-	unsigned long flags;
+-	int ret, i;
+-	u32 temp;
+-	struct xhci_hcd *xhci;
+-	struct urb_priv	*urb_priv;
+-	struct xhci_td *td;
+-	unsigned int ep_index;
+-	struct xhci_ring *ep_ring;
+-	struct xhci_virt_ep *ep;
+-	struct xhci_command *command;
++	struct xhci_hcd         *xhci  = hcd_to_xhci(hcd);
+ 	struct xhci_virt_device *vdev;
++	struct xhci_virt_ep     *ep;
++	struct xhci_ring        *ring;
++	struct urb_priv         *priv;
++	struct xhci_td          *td;
++	struct xhci_command     *cmd   = NULL;
++	unsigned int             ep_index;
++	unsigned long            flags;
++	u32                      hcsts;
++	int                      i, ret = 0;
+ 
+-	xhci = hcd_to_xhci(hcd);
+ 	spin_lock_irqsave(&xhci->lock, flags);
+-
+ 	trace_xhci_urb_dequeue(urb);
+ 
+-	/* Make sure the URB hasn't completed or been unlinked already */
+ 	ret = usb_hcd_check_unlink_urb(hcd, urb, status);
+-	if (ret)
+-		goto done;
 +	if (ret) {
- 		xhci_urb_free_priv(urb_priv);
- 		urb->hcpriv = NULL;
++		spin_unlock_irqrestore(&xhci->lock, flags);
++		return ret;
++	}
+ 
+-	/* give back URB now if we can't queue it for cancel */
+-	vdev = xhci->devs[urb->dev->slot_id];
+-	urb_priv = urb->hcpriv;
+-	if (!vdev || !urb_priv)
+-		goto err_giveback;
++	/* -------------- Re-validate objects still exist ------------------- */
++	vdev  = xhci->devs[urb->dev->slot_id];
++	priv  = urb->hcpriv;
++	if (unlikely(!vdev || !priv))
++		goto giveback;
+ 
+ 	ep_index = xhci_get_endpoint_index(&urb->ep->desc);
+-	ep = &vdev->eps[ep_index];
+-	ep_ring = xhci_urb_to_transfer_ring(xhci, urb);
+-	if (!ep || !ep_ring)
+-		goto err_giveback;
+-
+-	/* If xHC is dead take it down and return ALL URBs in xhci_hc_died() */
+-	temp = readl(&xhci->op_regs->status);
+-	if (temp == ~(u32)0 || xhci->xhc_state & XHCI_STATE_DYING) {
++	ep       = &vdev->eps[ep_index];
++	ring     = xhci_urb_to_transfer_ring(xhci, urb);
++	if (unlikely(!ring))
++		goto giveback;
++
++	if (unlikely(!td_on_ring(&priv->td[0], ring)))
++		goto giveback;
++
++	/* -------------- Controller fatal state handling ------------------- */
++	hcsts = readl(&xhci->op_regs->status);
++	if (hcsts == ~(u32)0 || (xhci->xhc_state & XHCI_STATE_DYING)) {
+ 		xhci_hc_died(xhci);
+-		goto done;
++		spin_unlock_irqrestore(&xhci->lock, flags);
++		return 0;
  	}
-
-
+ 
+-	/*
+-	 * check ring is not re-allocated since URB was enqueued. If it is, then
+-	 * make sure none of the ring related pointers in this URB private data
+-	 * are touched, such as td_list, otherwise we overwrite freed data
+-	 */
+-	if (!td_on_ring(&urb_priv->td[0], ep_ring)) {
+-		xhci_err(xhci, "Canceled URB td not found on endpoint ring");
+-		for (i = urb_priv->num_tds_done; i < urb_priv->num_tds; i++) {
+-			td = &urb_priv->td[i];
+-			if (!list_empty(&td->cancelled_td_list))
+-				list_del_init(&td->cancelled_td_list);
++	if (xhci->xhc_state & XHCI_STATE_HALTED) {
++		for (i = priv->num_tds_done; i < priv->num_tds; i++) {
++			td = &priv->td[i];
++			list_del_init(&td->td_list);
++			list_del_init(&td->cancelled_td_list);
+ 		}
+-		goto err_giveback;
++		goto giveback;
+ 	}
+ 
+-	if (xhci->xhc_state & XHCI_STATE_HALTED) {
+-		xhci_dbg_trace(xhci, trace_xhci_dbg_cancel_urb,
+-				"HC halted, freeing TD manually.");
+-		for (i = urb_priv->num_tds_done;
+-		     i < urb_priv->num_tds;
+-		     i++) {
+-			td = &urb_priv->td[i];
+-			if (!list_empty(&td->td_list))
+-				list_del_init(&td->td_list);
+-			if (!list_empty(&td->cancelled_td_list))
+-				list_del_init(&td->cancelled_td_list);
+-		}
+-		goto err_giveback;
+-	}
+-
+-	i = urb_priv->num_tds_done;
+-	if (i < urb_priv->num_tds)
+-		xhci_dbg_trace(xhci, trace_xhci_dbg_cancel_urb,
+-				"Cancel URB %p, dev %s, ep 0x%x, "
+-				"starting at offset 0x%llx",
+-				urb, urb->dev->devpath,
+-				urb->ep->desc.bEndpointAddress,
+-				(unsigned long long) xhci_trb_virt_to_dma(
+-					urb_priv->td[i].start_seg,
+-					urb_priv->td[i].start_trb));
+-
+-	for (; i < urb_priv->num_tds; i++) {
+-		td = &urb_priv->td[i];
+-		/* TD can already be on cancelled list if ep halted on it */
++	/* -------------- Mark outstanding TDs cancelled -------------------- */
++	for (i = priv->num_tds_done; i < priv->num_tds; i++) {
++		td = &priv->td[i];
+ 		if (list_empty(&td->cancelled_td_list)) {
+ 			td->cancel_status = TD_DIRTY;
+ 			list_add_tail(&td->cancelled_td_list,
+-				      &ep->cancelled_td_list);
++						  &ep->cancelled_td_list);
+ 		}
+ 	}
+ 
+-	/* These completion handlers will sort out cancelled TDs for us */
++	/* -------------- Decide whether Stop-EP is needed ------------------ */
+ 	if (ep->ep_state & (EP_STOP_CMD_PENDING | EP_HALTED | SET_DEQ_PENDING)) {
+-		xhci_dbg(xhci, "Not queuing Stop Endpoint on slot %d ep %d in state 0x%x\n",
+-				urb->dev->slot_id, ep_index, ep->ep_state);
+-		goto done;
++		goto unlock_ok;
+ 	}
+ 
+-	/* In this case no commands are pending but the endpoint is stopped */
+ 	if (ep->ep_state & EP_CLEARING_TT) {
+-		/* and cancelled TDs can be given back right away */
+-		xhci_dbg(xhci, "Invalidating TDs instantly on slot %d ep %d in state 0x%x\n",
+-				urb->dev->slot_id, ep_index, ep->ep_state);
+ 		xhci_process_cancelled_tds(ep);
+-	} else {
+-		/* Otherwise, queue a new Stop Endpoint command */
+-		command = xhci_alloc_command(xhci, false, GFP_ATOMIC);
+-		if (!command) {
+-			ret = -ENOMEM;
+-			goto done;
+-		}
+-		ep->stop_time = jiffies;
+-		ep->ep_state |= EP_STOP_CMD_PENDING;
+-		xhci_queue_stop_endpoint(xhci, command, urb->dev->slot_id,
+-					 ep_index, 0);
+-		xhci_ring_cmd_db(xhci);
++		goto unlock_ok;
+ 	}
+-done:
++
++	ep->ep_state |= EP_STOP_CMD_PENDING;
++	ep->stop_time = jiffies;
++
+ 	spin_unlock_irqrestore(&xhci->lock, flags);
+-	return ret;
+ 
+-err_giveback:
+-	if (urb_priv)
+-		xhci_urb_free_priv(urb_priv);
++	/* GFP_ATOMIC avoids the boot-time stall observed with GFP_KERNEL.   */
++	cmd = xhci_alloc_command(xhci, false, GFP_ATOMIC);
++	if (unlikely(!cmd)) {
++		status = -ENOMEM;
++		goto giveback_nolock;
++	}
++
++	spin_lock_irqsave(&xhci->lock, flags);
++
++	if (!(ep->ep_state & EP_STOP_CMD_PENDING)) {
++		spin_unlock_irqrestore(&xhci->lock, flags);
++		xhci_free_command(xhci, cmd);
++		return 0;
++	}
++
++	ret = xhci_queue_stop_endpoint(xhci, cmd,
++								   urb->dev->slot_id, ep_index, 0);
++	if (unlikely(ret)) {
++		ep->ep_state &= ~EP_STOP_CMD_PENDING;
++		spin_unlock_irqrestore(&xhci->lock, flags);
++		xhci_free_command(xhci, cmd);
++		status = ret;
++		goto giveback_nolock;
++	}
++
++	xhci_ring_cmd_db(xhci);
++
++	unlock_ok:
++	spin_unlock_irqrestore(&xhci->lock, flags);
++	return 0;
++
++	/* ----------- Synchronous give-back (error / stale path) ----------- */
++	giveback:
+ 	usb_hcd_unlink_urb_from_ep(hcd, urb);
++	if (priv)
++		xhci_urb_free_priv(priv);
+ 	spin_unlock_irqrestore(&xhci->lock, flags);
+-	usb_hcd_giveback_urb(hcd, urb, -ESHUTDOWN);
++	usb_hcd_giveback_urb(hcd, urb, status);
++	return ret;
++
++	giveback_nolock:
++	usb_hcd_unlink_urb_from_ep(hcd, urb);
++	if (priv)
++		xhci_urb_free_priv(priv);
++	usb_hcd_giveback_urb(hcd, urb, status);
+ 	return ret;
+ }
+ 
+@@ -5261,20 +5308,12 @@ static void xhci_hcd_init_usb3_data(stru
+ int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks)
+ {
+ 	struct xhci_hcd		*xhci;
+-	/*
+-	 * TODO: Check with DWC3 clients for sysdev according to
+-	 * quirks
+-	 */
+ 	struct device		*dev = hcd->self.sysdev;
+ 	int			retval;
+ 
+-	/* Accept arbitrarily long scatter-gather lists */
++	/* Set HCD capabilities */
+ 	hcd->self.sg_tablesize = ~0;
+-
+-	/* support to build packet from discontinuous buffers */
+ 	hcd->self.no_sg_constraint = 1;
+-
+-	/* XHCI controllers don't stop the ep queue on short packets :| */
+ 	hcd->self.no_stop_on_short = 1;
+ 
+ 	xhci = hcd_to_xhci(hcd);
+@@ -5288,9 +5327,10 @@ int xhci_gen_setup(struct usb_hcd *hcd,
+ 	xhci->main_hcd = hcd;
+ 	xhci->cap_regs = hcd->regs;
+ 	xhci->op_regs = hcd->regs +
+-		HC_LENGTH(readl(&xhci->cap_regs->hc_capbase));
++	HC_LENGTH(readl(&xhci->cap_regs->hc_capbase));
+ 	xhci->run_regs = hcd->regs +
+-		(readl(&xhci->cap_regs->run_regs_off) & RTSOFF_MASK);
++	(readl(&xhci->cap_regs->run_regs_off) & RTSOFF_MASK);
++
+ 	/* Cache read-only capability registers */
+ 	xhci->hcs_params1 = readl(&xhci->cap_regs->hcs_params1);
+ 	xhci->hcs_params2 = readl(&xhci->cap_regs->hcs_params2);
+@@ -5300,9 +5340,8 @@ int xhci_gen_setup(struct usb_hcd *hcd,
+ 	if (xhci->hci_version > 0x100)
+ 		xhci->hcc_params2 = readl(&xhci->cap_regs->hcc_params2);
+ 
+-	/* xhci-plat or xhci-pci might have set max_interrupters already */
+-	if ((!xhci->max_interrupters) ||
+-	    xhci->max_interrupters > HCS_MAX_INTRS(xhci->hcs_params1))
++	if (!xhci->max_interrupters ||
++		xhci->max_interrupters > HCS_MAX_INTRS(xhci->hcs_params1))
+ 		xhci->max_interrupters = HCS_MAX_INTRS(xhci->hcs_params1);
+ 
+ 	xhci->quirks |= quirks;
+@@ -5310,19 +5349,15 @@ int xhci_gen_setup(struct usb_hcd *hcd,
+ 	if (get_quirks)
+ 		get_quirks(dev, xhci);
+ 
+-	/* In xhci controllers which follow xhci 1.0 spec gives a spurious
+-	 * success event after a short transfer. This quirk will ignore such
+-	 * spurious event.
+-	 */
+ 	if (xhci->hci_version > 0x96)
+ 		xhci->quirks |= XHCI_SPURIOUS_SUCCESS;
+ 
+ 	if (xhci->hci_version == 0x95 && link_quirk) {
+-		xhci_dbg(xhci, "QUIRK: Not clearing Link TRB chain bits");
++		xhci_dbg(xhci, "QUIRK: Not clearing Link TRB chain bits\n");
+ 		xhci->quirks |= XHCI_LINK_TRB_QUIRK;
+ 	}
+ 
+-	/* Make sure the HC is halted. */
++	/* Make sure the HC is halted before we touch anything. */
+ 	retval = xhci_halt(xhci);
+ 	if (retval)
+ 		return retval;
+@@ -5330,42 +5365,42 @@ int xhci_gen_setup(struct usb_hcd *hcd,
+ 	xhci_zero_64b_regs(xhci);
+ 
+ 	xhci_dbg(xhci, "Resetting HCD\n");
+-	/* Reset the internal HC memory state and registers. */
+ 	retval = xhci_reset(xhci, XHCI_RESET_LONG_USEC);
+ 	if (retval)
+ 		return retval;
+ 	xhci_dbg(xhci, "Reset complete\n");
+ 
+-	/*
+-	 * On some xHCI controllers (e.g. R-Car SoCs), the AC64 bit (bit 0)
+-	 * of HCCPARAMS1 is set to 1. However, the xHCs don't support 64-bit
+-	 * address memory pointers actually. So, this driver clears the AC64
+-	 * bit of xhci->hcc_params to call dma_set_coherent_mask(dev,
+-	 * DMA_BIT_MASK(32)) in this xhci_gen_setup().
+-	 */
+ 	if (xhci->quirks & XHCI_NO_64BIT_SUPPORT)
+ 		xhci->hcc_params &= ~BIT(0);
+ 
+-	/* Set dma_mask and coherent_dma_mask to 64-bits,
+-	 * if xHC supports 64-bit addressing */
+-	if (HCC_64BIT_ADDR(xhci->hcc_params) &&
+-			!dma_set_mask(dev, DMA_BIT_MASK(64))) {
+-		xhci_dbg(xhci, "Enabling 64-bit DMA addresses.\n");
+-		dma_set_coherent_mask(dev, DMA_BIT_MASK(64));
++	/*
++	 * Set DMA mask. Using dma_set_mask_and_coherent() is the modern,
++	 * preferred way to set both masks atomically. We pass U64_MAX
++	 * directly for the 64-bit case to avoid the compiler warning
++	 * generated by the DMA_BIT_MASK(64) macro.
++	 */
++	if (HCC_64BIT_ADDR(xhci->hcc_params)) {
++		retval = dma_set_mask_and_coherent(dev, U64_MAX);
++		if (retval) {
++			xhci_warn(xhci, "Could not set 64-bit DMA mask, falling back to 32-bit.\n");
++			retval = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++			if (retval) {
++				dev_err(dev, "Failed to set any DMA mask.\n");
++				return retval;
++			}
++		} else {
++			xhci_dbg(xhci, "Enabling 64-bit DMA addresses.\n");
++		}
+ 	} else {
+-		/*
+-		 * This is to avoid error in cases where a 32-bit USB
+-		 * controller is used on a 64-bit capable system.
+-		 */
+-		retval = dma_set_mask(dev, DMA_BIT_MASK(32));
+-		if (retval)
++		retval = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++		if (retval) {
++			dev_err(dev, "Failed to set 32-bit DMA mask.\n");
+ 			return retval;
++		}
+ 		xhci_dbg(xhci, "Enabling 32-bit DMA addresses.\n");
+-		dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
+ 	}
+ 
+ 	xhci_dbg(xhci, "Calling HCD init\n");
+-	/* Initialize HCD and host controller data structures. */
+ 	retval = xhci_init(hcd);
+ 	if (retval)
+ 		return retval;
+@@ -5377,7 +5412,7 @@ int xhci_gen_setup(struct usb_hcd *hcd,
+ 		xhci_hcd_init_usb2_data(xhci, hcd);
+ 
+ 	xhci_info(xhci, "hcc params 0x%08x hci version 0x%x quirks 0x%016llx\n",
+-		  xhci->hcc_params, xhci->hci_version, xhci->quirks);
++			  xhci->hcc_params, xhci->hci_version, xhci->quirks);
+ 
+ 	return 0;
+ }
 
 From: Peter Zijlstra <peterz@infradead.org>
 
@@ -3217,431 +3799,6 @@ index b7bb13045dd8..a25597926715 100644
 +}
 +early_initcall(sched_detect_clusters);
 
-
-
-From cfb8df75f010cad3d43ac9bd1eb41fe83520f847 Mon Sep 17 00:00:00 2001
-From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 15 Jun 2025 03:37:19 +0900
-Subject: [PATCH] Kcompressd-Unofficial v0.5
-
----
- include/linux/mmzone.h |   7 +++
- include/linux/swap.h   |   2 +
- mm/mm_init.c           |   1 +
- mm/page_io.c           | 138 +++++++++++++++++++++++++++++++++++++++++
- mm/swap.h              |   6 ++
- mm/vmscan.c            |  39 ++++++++++++
- 6 files changed, 193 insertions(+)
-
-diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
-index 6ccec1bf28..c17785f4eb 100644
---- a/include/linux/mmzone.h
-+++ b/include/linux/mmzone.h
-@@ -23,6 +23,7 @@
- #include <linux/page-flags.h>
- #include <linux/local_lock.h>
- #include <linux/zswap.h>
-+#include <linux/kfifo.h>
- #include <asm/page.h>
- 
- /* Free memory management - zoned buddy allocator.  */
-@@ -1398,6 +1399,12 @@ typedef struct pglist_data {
- 
- 	int kswapd_failures;		/* Number of 'reclaimed == 0' runs */
- 
-+#define KCOMPRESS_FIFO_SIZE 256
-+	wait_queue_head_t kcompressd_wait;
-+	struct task_struct *kcompressd;
-+	struct kfifo kcompress_fifo;
-+	spinlock_t kcompress_fifo_lock;
-+
- #ifdef CONFIG_COMPACTION
- 	int kcompactd_max_order;
- 	enum zone_type kcompactd_highest_zoneidx;
-diff --git a/include/linux/swap.h b/include/linux/swap.h
-index db46b25a65..2e5cec9b45 100644
---- a/include/linux/swap.h
-+++ b/include/linux/swap.h
-@@ -682,5 +682,7 @@ static inline bool mem_cgroup_swap_full(struct folio *folio)
- }
- #endif
- 
-+extern int vm_kcompressd;
-+
- #endif /* __KERNEL__*/
- #endif /* _LINUX_SWAP_H */
-diff --git a/mm/mm_init.c b/mm/mm_init.c
-index eedce9321e..4d5c0ce9d8 100644
---- a/mm/mm_init.c
-+++ b/mm/mm_init.c
-@@ -1410,6 +1410,7 @@ static void __meminit pgdat_init_internals(struct pglist_data *pgdat)
- 	pgdat_init_kcompactd(pgdat);
- 
- 	init_waitqueue_head(&pgdat->kswapd_wait);
-+	init_waitqueue_head(&pgdat->kcompressd_wait);
- 	init_waitqueue_head(&pgdat->pfmemalloc_wait);
- 
- 	for (i = 0; i < NR_VMSCAN_THROTTLE; i++)
-diff --git a/mm/page_io.c b/mm/page_io.c
-index 4bce19df55..e82fe750ee 100644
---- a/mm/page_io.c
-+++ b/mm/page_io.c
-@@ -25,6 +25,8 @@
- #include <linux/sched/task.h>
- #include <linux/delayacct.h>
- #include <linux/zswap.h>
-+#include <linux/cpumask.h>
-+#include <linux/kfifo.h>
- #include "swap.h"
- 
- static void __end_swap_bio_write(struct bio *bio)
-@@ -233,6 +235,102 @@ static void swap_zeromap_folio_clear(struct folio *folio)
- 	}
- }
- 
-+/*
-+ * do_swapout() - Write a folio to swap space
-+ * @folio: The folio to write out
-+ *
-+ * This function writes the folio to swap space, either using zswap or
-+ * synchronous write. It ensures that the folio is unlocked and the
-+ * reference count is decremented after the operation.
-+ */
-+static inline void do_swapout(struct folio *folio)
-+{
-+	struct writeback_control wbc = {
-+		.sync_mode = WB_SYNC_NONE,
-+		.nr_to_write = SWAP_CLUSTER_MAX,
-+		.range_start = 0,
-+		.range_end = LLONG_MAX,
-+		.for_reclaim = 1,
-+	};
-+
-+	if (zswap_store(folio)) {
-+		count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
-+		folio_unlock(folio);
-+	} else
-+		__swap_writepage(folio, &wbc); /* Implies folio_unlock(folio) */
-+
-+	/* Decrement the folio reference count */
-+	folio_put(folio);
-+}
-+
-+/*
-+ * kcompressd_store() - Off-load folio compression to kcompressd
-+ * @folio: The folio to compress
-+ *
-+ * This function attempts to off-load the compression of the folio to
-+ * kcompressd. If kcompressd is not available or the folio cannot be
-+ * compressed, it falls back to synchronous write.
-+ *
-+ * Returns true if the folio was successfully queued for compression,
-+ * false otherwise.
-+ */
-+static bool kcompressd_store(struct folio *folio)
-+{
-+	pg_data_t *pgdat = NODE_DATA(numa_node_id());
-+	unsigned int ret, sysctl_kcompressd = vm_kcompressd;
-+	struct folio *head = NULL;
-+
-+	/* Only kswapd can use kcompressd */
-+	if (!current_is_kswapd())
-+		return false;
-+
-+	/* kcompressd must be enabled and running */
-+	if (!sysctl_kcompressd || unlikely(!pgdat->kcompressd))
-+		return false;
-+
-+	/* We can only off-load anon folios */
-+	if (!folio_test_anon(folio))
-+		return false;
-+
-+	/* Fall back to synchronously return AOP_WRITEPAGE_ACTIVATE */
-+	if (!mem_cgroup_zswap_writeback_enabled(folio_memcg(folio)))
-+		return false;
-+
-+	/* Swap device must be sync-efficient */
-+	if (!zswap_is_enabled() &&
-+		!data_race(swp_swap_info(folio->swap)->flags & SWP_SYNCHRONOUS_IO))
-+		return false;
-+
-+	/* If the kcompress_fifo is full, we must swap out the head
-+	 * folio to make space for the new folio.
-+	 */
-+	scoped_guard(spinlock_irqsave, &pgdat->kcompress_fifo_lock)
-+		if (kfifo_len(&pgdat->kcompress_fifo) >= sysctl_kcompressd * sizeof(folio) &&
-+				unlikely(!kfifo_out(&pgdat->kcompress_fifo, &head, sizeof(folio))))
-+			/* Can't dequeue the head folio. Fall back to synchronous write. */
-+			return false;
-+
-+	/* Increment the folio reference count to avoid it being freed */
-+	folio_get(folio);
-+
-+	/* Enqueue the folio for compression */
-+	ret = kfifo_in(&pgdat->kcompress_fifo, &folio, sizeof(folio));
-+	if (likely(ret))
-+		/* We successfully enqueued the folio. wake up kcompressd */
-+		wake_up_interruptible(&pgdat->kcompressd_wait);
-+	else
-+		/* Enqueue failed, so we must cancel the reference count */
-+		folio_put(folio);
-+
-+	/* If we had to swap out the head folio, do it now.
-+	 * This will block until the folio is written out.
-+	 */
-+	if (head)
-+		do_swapout(head);
-+
-+	return ret;
-+}
-+
- /*
-  * We may have stale swap cache pages in memory: notice
-  * them here and get rid of the unnecessary final write.
-@@ -275,6 +373,15 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
- 		 */
- 		swap_zeromap_folio_clear(folio);
- 	}
-+
-+	/*
-+	 * Compression within zswap and zram might block rmap, unmap
-+	 * of both file and anon pages, try to do compression async
-+	 * if possible
-+	 */
-+	if (kcompressd_store(folio))
-+		return 0;
-+
- 	if (zswap_store(folio)) {
- 		count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
- 		folio_unlock(folio);
-@@ -289,6 +396,37 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
- 	return 0;
- }
- 
-+/*
-+ * kcompressd() - Kernel thread for compressing folios
-+ * @p: Pointer to pg_data_t structure
-+ *
-+ * This function runs in a kernel thread and waits for folios to be
-+ * queued for compression. It processes the folios by calling do_swapout()
-+ * on them, which handles the actual writing to swap space.
-+ */
-+int kcompressd(void *p)
-+{
-+	pg_data_t *pgdat = (pg_data_t *)p;
-+	struct folio *folio;
-+	/* * kcompressd runs with PF_MEMALLOC and PF_KSWAPD flags set to
-+	 * allow it to allocate memory for compression without being
-+	 * restricted by the current memory allocation context.
-+	 * Also PF_KSWAPD prevents Intel Graphics driver from crashing
-+	 * the system in i915_gem_shrinker.c:i915_gem_shrinker_scan()
-+	 */
-+	current->flags |= PF_MEMALLOC | PF_KSWAPD;
-+
-+	while (!kthread_should_stop()) {
-+		wait_event_interruptible(pgdat->kcompressd_wait,
-+				!kfifo_is_empty(&pgdat->kcompress_fifo));
-+
-+		while (kfifo_out_locked(&pgdat->kcompress_fifo,
-+				&folio, sizeof(folio), &pgdat->kcompress_fifo_lock))
-+			do_swapout(folio);
-+	}
-+	return 0;
-+}
-+
- static inline void count_swpout_vm_event(struct folio *folio)
- {
- #ifdef CONFIG_TRANSPARENT_HUGEPAGE
-diff --git a/mm/swap.h b/mm/swap.h
-index 6f4a3f927e..3579da413d 100644
---- a/mm/swap.h
-+++ b/mm/swap.h
-@@ -22,6 +22,7 @@ static inline void swap_read_unplug(struct swap_iocb *plug)
- void swap_write_unplug(struct swap_iocb *sio);
- int swap_writepage(struct page *page, struct writeback_control *wbc);
- void __swap_writepage(struct folio *folio, struct writeback_control *wbc);
-+int kcompressd(void *p);
- 
- /* linux/mm/swap_state.c */
- /* One swap address space for each 64M swap space */
-@@ -199,6 +200,11 @@ static inline int swap_zeromap_batch(swp_entry_t entry, int max_nr,
- 	return 0;
- }
- 
-+static inline int kcompressd(void *p)
-+{
-+	return 0;
-+}
-+
- #endif /* CONFIG_SWAP */
- 
- #endif /* _MM_SWAP_H */
-diff --git a/mm/vmscan.c b/mm/vmscan.c
-index 3783e45bfc..8873a2f308 100644
---- a/mm/vmscan.c
-+++ b/mm/vmscan.c
-@@ -7420,6 +7420,7 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
- void __meminit kswapd_run(int nid)
- {
- 	pg_data_t *pgdat = NODE_DATA(nid);
-+	int ret;
- 
- 	pgdat_kswapd_lock(pgdat);
- 	if (!pgdat->kswapd) {
-@@ -7433,7 +7434,28 @@ void __meminit kswapd_run(int nid)
- 		} else {
- 			wake_up_process(pgdat->kswapd);
- 		}
-+		ret = kfifo_alloc(&pgdat->kcompress_fifo,
-+				KCOMPRESS_FIFO_SIZE * sizeof(struct folio *),
-+				GFP_KERNEL);
-+		if (ret) {
-+			pr_err("%s: fail to kfifo_alloc\n", __func__);
-+			goto out;
-+		}
-+
-+		printk(KERN_INFO "Kcompressd-Unofficial 0.5 by Masahito Suzuki (forked from Kcompressd by Qun-Wei Lin from MediaTek)");
-+		spin_lock_init(&pgdat->kcompress_fifo_lock);
-+		pgdat->kcompressd = kthread_create_on_node(kcompressd, pgdat, nid,
-+				"kcompressd%d", nid);
-+		if (IS_ERR(pgdat->kcompressd)) {
-+			pr_err("Failed to start kcompressd on node %d，ret=%ld\n",
-+					nid, PTR_ERR(pgdat->kcompressd));
-+			pgdat->kcompressd = NULL;
-+			kfifo_free(&pgdat->kcompress_fifo);
-+		} else {
-+			wake_up_process(pgdat->kcompressd);
-+		}
- 	}
-+out:
- 	pgdat_kswapd_unlock(pgdat);
- }
- 
-@@ -7452,9 +7474,17 @@ void __meminit kswapd_stop(int nid)
- 		kthread_stop(kswapd);
- 		pgdat->kswapd = NULL;
- 	}
-+	if (pgdat->kcompressd) {
-+		kthread_stop(pgdat->kcompressd);
-+		pgdat->kcompressd = NULL;
-+		kfifo_free(&pgdat->kcompress_fifo);
-+	}
- 	pgdat_kswapd_unlock(pgdat);
- }
- 
-+int vm_kcompressd = 24;
-+static int SYSCTL_KCOMPRESS_FIFO_SIZE = KCOMPRESS_FIFO_SIZE;
-+
- static const struct ctl_table vmscan_sysctl_table[] = {
- 	{
- 		.procname	= "swappiness",
-@@ -7465,6 +7495,15 @@ static const struct ctl_table vmscan_sysctl_table[] = {
- 		.extra1		= SYSCTL_ZERO,
- 		.extra2		= SYSCTL_TWO_HUNDRED,
- 	},
-+	{
-+		.procname	= "kcompressd",
-+		.data		= &vm_kcompressd,
-+		.maxlen		= sizeof(int),
-+		.mode		= 0644,
-+		.proc_handler = proc_dointvec_minmax,
-+		.extra1		= SYSCTL_ZERO,
-+		.extra2		= &SYSCTL_KCOMPRESS_FIFO_SIZE,
-+	},
- #ifdef CONFIG_NUMA
- 	{
- 		.procname	= "zone_reclaim_mode",
--- 
-2.34.1
-
-From: Mario Limonciello <mario.limonciello at amd.com>
-
-commit 017fbb6690c22 ("drm/amdgpu/discovery: check ip_discovery fw file
-available") added support for reading an amdgpu IP discovery bin file
-for some specific products. If it's not found then it will fallback to
-hardcoded values. However if it's not found there is also a lot of noise
-about missing files and errors.
-
-Adjust the error handling to decrease most messages to DEBUG and to show
-users less about missing files.
-
-Reported-by: Marcus Seyfarth <m.seyfarth at gmail.com>
-Closes: https://gitlab.freedesktop.org/drm/amd/-/issues/4312
-Tested-by: Marcus Seyfarth <m.seyfarth at gmail.com>
-Fixes: 017fbb6690c22 ("drm/amdgpu/discovery: check ip_discovery fw file available")
-Signed-off-by: Mario Limonciello <mario.limonciello at amd.com>
----
-v2:
- * Add tag
- * Push error message into default flow only
----
- drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c | 25 ++++++++-----------
- 1 file changed, 10 insertions(+), 15 deletions(-)
-
-diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c
-index a0e9bf9b27108..a29bd807e59f8 100644
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c
-@@ -321,10 +321,9 @@ static int amdgpu_discovery_read_binary_from_file(struct amdgpu_device *adev,
- 	const struct firmware *fw;
- 	int r;
- 
--	r = request_firmware(&fw, fw_name, adev->dev);
-+	r = firmware_request_nowarn(&fw, fw_name, adev->dev);
- 	if (r) {
--		dev_err(adev->dev, "can't load firmware \"%s\"\n",
--			fw_name);
-+		drm_info(&adev->ddev, "Optional firmware \"%s\" was not found\n", fw_name);
- 		return r;
- 	}
- 
-@@ -459,16 +458,12 @@ static int amdgpu_discovery_init(struct amdgpu_device *adev)
- 	/* Read from file if it is the preferred option */
- 	fw_name = amdgpu_discovery_get_fw_name(adev);
- 	if (fw_name != NULL) {
--		dev_info(adev->dev, "use ip discovery information from file");
-+		drm_dbg(&adev->ddev, "use ip discovery information from file");
- 		r = amdgpu_discovery_read_binary_from_file(adev, adev->mman.discovery_bin, fw_name);
--
--		if (r) {
--			dev_err(adev->dev, "failed to read ip discovery binary from file\n");
--			r = -EINVAL;
-+		if (r)
- 			goto out;
--		}
--
- 	} else {
-+		drm_dbg(&adev->ddev, "use ip discovery information from memory");
- 		r = amdgpu_discovery_read_binary_from_mem(
- 			adev, adev->mman.discovery_bin);
- 		if (r)
-@@ -1338,10 +1333,8 @@ static int amdgpu_discovery_reg_base_init(struct amdgpu_device *adev)
- 	int r;
- 
- 	r = amdgpu_discovery_init(adev);
--	if (r) {
--		DRM_ERROR("amdgpu_discovery_init failed\n");
-+	if (r)
- 		return r;
--	}
- 
- 	wafl_ver = 0;
- 	adev->gfx.xcc_mask = 0;
-@@ -2579,8 +2572,10 @@ int amdgpu_discovery_set_ip_blocks(struct amdgpu_device *adev)
- 		break;
- 	default:
- 		r = amdgpu_discovery_reg_base_init(adev);
--		if (r)
--			return -EINVAL;
-+		if (r) {
-+			drm_err(&adev->ddev, "discovery failed: %d\n", r);
-+			return r;
-+		}
- 
- 		amdgpu_discovery_harvest_ip(adev);
- 		amdgpu_discovery_get_gfx_info(adev);
--- 
-2.43.0
 
 Enable the cleaner shader for other GFX9.x series of GPUs to provide
 data isolation between GPU workloads. The cleaner shader is responsible
