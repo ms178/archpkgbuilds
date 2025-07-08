@@ -1,198 +1,328 @@
 --- thread.cpp.orig	2025-07-05 23:59:55.224477951 +0200
-+++ thread.cpp	2025-07-06 18:59:42.587903205 +0200
-@@ -1,114 +1,138 @@
++++ thread.cpp	2025-07-08 18:26:22.171606735 +0200
+@@ -1,114 +1,276 @@
++/*  thread.cpp – DXVK threading implementation
++ *  ------------------------------------------
++ *  FINAL, FAIR & HYBRID-CPU AWARE
++ */
++
  #include <atomic>
++#include <system_error>
 +#include <vector>
  
  #include "thread.h"
 +#include "util_bit.h"
  #include "util_likely.h"
  
++#ifdef DXVK_ARCH_X86
++#include <x86intrin.h>
++#endif
++
++/* ===================================================================== */
++/*  Windows implementation                                               */
++/* ===================================================================== */
  #ifdef _WIN32
--
- namespace dxvk {
+ 
+-namespace dxvk {
++/*  Older SDK compatibility – PRS                                          */
++#ifndef SYSTEM_CPU_SET_INFORMATION_ALLOCATED_FLAG
++# define SYSTEM_CPU_SET_INFORMATION_ALLOCATED_FLAG 0x2
++#endif
++#ifndef SYSTEM_CPU_SET_INFORMATION_PARKED_FLAG
++# define SYSTEM_CPU_SET_INFORMATION_PARKED_FLAG    0x1
++#endif
  
 -  thread::thread(ThreadProc&& proc)
 -  : m_data(new ThreadData(std::move(proc))) {
 -    m_data->handle = ::CreateThread(nullptr, 0x100000,
 -      thread::threadProc, m_data, STACK_SIZE_PARAM_IS_A_RESERVATION,
 -      &m_data->id);
-+  /*---------------------- constructor ------------------------------------*/
-+  thread::thread(ThreadProc&& proc) : m_data(new ThreadData(std::move(proc))) {
-+    /* forbid thread creation during DLL detach (prevents GPU hang crash) */
-+    if (this_thread::isInModuleDetachment()) {
-+      delete m_data; m_data = nullptr;
-+      throw std::system_error(std::make_error_code(std::errc::operation_canceled),
-+                              "DXVK: thread creation during module detach");
-+    }
-+
-+    m_data->handle = ::CreateThread(nullptr,
-+                                    1 << 20,        /* 1 MiB reserve */
-+                                    threadProc,
-+                                    m_data,
-+                                    STACK_SIZE_PARAM_IS_A_RESERVATION,
-+                                    &m_data->id);
++namespace dxvk {
  
-     if (!m_data->handle) {
+-    if (!m_data->handle) {
 -      delete m_data;
 -      throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again), "Failed to create thread");
-+      delete m_data; m_data = nullptr;
-+      throw std::system_error(
-+        std::make_error_code(std::errc::resource_unavailable_try_again),
-+                              "DXVK: CreateThread failed");
++  /* --------------------------------------------------------------------- */
++  /*  CPU-set discovery & steering (shared)                                */
++  /* --------------------------------------------------------------------- */
++  namespace {
++
++    struct CpuSetDatabase {
++      std::vector<ULONG> pSets;
++      std::vector<ULONG> eSets;
++
++      using PFN_GetCpuInfo = BOOL (WINAPI*)(PSYSTEM_CPU_SET_INFORMATION, ULONG,
++                                            PULONG, HANDLE, ULONG);
++      using PFN_SetThreadSets = BOOL (WINAPI*)(HANDLE, const ULONG*, ULONG);
++
++      PFN_GetCpuInfo     pGetInfo = nullptr;
++      PFN_SetThreadSets  pSetSets = nullptr;
++      bool available = false;
++
++      CpuSetDatabase() { init(); }
++
++    private:
++      void init() {
++        HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");
++        if (!k32) return;
++
++        pGetInfo = reinterpret_cast<PFN_GetCpuInfo>(
++          ::GetProcAddress(k32, "GetSystemCpuSetInformation"));
++        pSetSets = reinterpret_cast<PFN_SetThreadSets>(
++          ::GetProcAddress(k32, "SetThreadSelectedCpuSets"));
++        if (!pGetInfo || !pSetSets) return;
++
++        ULONG len = 0;
++        if (!pGetInfo(nullptr, 0, &len, ::GetCurrentProcess(), 0) &&
++          ::GetLastError() != ERROR_INSUFFICIENT_BUFFER)
++          return;
++        if (!len) return;
++
++        std::vector<char> buf(len);
++        if (!pGetInfo(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data()),
++          len, &len, ::GetCurrentProcess(), 0))
++          return;
++
++        ULONG off = 0;
++        while (off < len) {
++          auto* info = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data() + off);
++          if (info->Type == CpuSetInformation) {
++            const auto& cs = info->CpuSet;
++            if (!(cs.AllFlags & SYSTEM_CPU_SET_INFORMATION_ALLOCATED_FLAG) ||
++              (cs.AllFlags & SYSTEM_CPU_SET_INFORMATION_PARKED_FLAG)) {
++              /* unusable */
++              } else if (cs.EfficiencyClass == 0)
++                pSets.push_back(cs.Id);
++            else
++              eSets.push_back(cs.Id);
++          }
++          off += info->Size;
++        }
++        available = !pSets.empty() || !eSets.empty();
++      }
++    };
++    CpuSetDatabase& cpuDb() { static CpuSetDatabase db; return db; }
++
++    void applyCpuSetAffinity(HANDLE thr, ThreadPriority prio) {
++      auto& db = cpuDb();
++      if (!db.available) return;
++      const std::vector<ULONG>& tgt =
++      (prio == ThreadPriority::Lowest) ? db.eSets : db.pSets;
++      if (!tgt.empty())
++        db.pSetSets(thr, tgt.data(), static_cast<ULONG>(tgt.size()));
      }
-   }
+-  }
  
--
-+  /*---------------------- destructor -------------------------------------*/
-   thread::~thread() {
++  } /* anonymous namespace */
+ 
+-  thread::~thread() {
 -    if (joinable())
 -      std::terminate();
-+    if (joinable()) std::terminate();   /* std::thread semantics */
++  /* --------------------------------------------------------------------- */
++  /*  fast_mutex – Pillar 1 – Ticket lock                                  */
++  /* --------------------------------------------------------------------- */
++  void fast_mutex::lock() noexcept {
++    /* Get our ticket (upper 32 bits) */
++    uint64_t prev = m_ctr.fetch_add(1ull << 32, std::memory_order_acq_rel);
++    const uint32_t my = static_cast<uint32_t>(prev >> 32);
++
++    /* Spin until head == my ticket */
++    for (uint32_t spin = 0;; ++spin) {
++      uint32_t head = static_cast<uint32_t>(m_ctr.load(std::memory_order_acquire));
++      if (head == my)
++        return;
++
++      if (spin < 128) {
++        #     ifdef DXVK_ARCH_X86
++        _mm_pause();
++        #     endif
++      } else {
++        this_thread::yield();
++      }
++    }
    }
  
-+  /*---------------------- detach -----------------------------------------*/
-+  void thread::detach() {
-+    if (!joinable())
-+      throw std::system_error(std::make_error_code(std::errc::invalid_argument),
-+                              "DXVK: detach on non-joinable thread");
-+      m_data->decRef();
-+    m_data = nullptr;
++  void fast_mutex::unlock() noexcept {
++    m_ctr.fetch_add(1, std::memory_order_release);  /* ++head */
 +  }
  
-+  /*---------------------- join -------------------------------------------*/
-   void thread::join() {
-     if (!joinable())
+-  void thread::join() {
+-    if (!joinable())
 -      throw std::system_error(std::make_error_code(std::errc::invalid_argument), "Thread not joinable");
 -
 -    if (get_id() == this_thread::get_id())
 -      throw std::system_error(std::make_error_code(std::errc::resource_deadlock_would_occur), "Cannot join current thread");
--
++  bool fast_mutex::try_lock() noexcept {
++    uint64_t cur = m_ctr.load(std::memory_order_acquire);
++    const uint32_t head = static_cast<uint32_t>(cur);
++    const uint32_t tail = static_cast<uint32_t>(cur >> 32);
++    if (head != tail) return false;                 /* busy */
++
++      return m_ctr.compare_exchange_strong(cur,
++                                           cur + (1ull << 32),                     /* ++tail */
++                                           std::memory_order_acq_rel,
++                                           std::memory_order_relaxed);
++  }
+ 
 -    if(::WaitForSingleObjectEx(m_data->handle, INFINITE, FALSE) == WAIT_FAILED)
 -      throw std::system_error(std::make_error_code(std::errc::invalid_argument), "Joining thread failed");
--
--    detach();
-+      throw std::system_error(std::make_error_code(std::errc::invalid_argument),
-+                              "DXVK: join on non-joinable thread");
-+      if (get_id() == this_thread::get_id())
-+        throw std::system_error(std::make_error_code(
-+          std::errc::resource_deadlock_would_occur),
-+          "DXVK: cannot join current thread");
-+
-+        if (::WaitForSingleObjectEx(m_data->handle, INFINITE, FALSE) == WAIT_FAILED)
-+          throw std::system_error(std::make_error_code(std::errc::io_error),
-+                                  "DXVK: WaitForSingleObjectEx failed");
-+          detach();
-+  }
-+
-+  /*---------------------- set_priority -----------------------------------*/
-+  void thread::set_priority(ThreadPriority p) {
-+    if (!joinable()) return;
-+    int val = (p == ThreadPriority::Lowest)
-+    ? THREAD_PRIORITY_LOWEST : THREAD_PRIORITY_NORMAL;
-+    ::SetThreadPriority(m_data->handle, val);
-   }
++  /* --------------------------------------------------------------------- */
++  /*  thread constructors / dtor                                           */
++  /* --------------------------------------------------------------------- */
++  thread::thread(ThreadProc&& proc)
++  : thread(std::move(proc), ThreadPriority::Normal) {}
  
--
+-    detach();
+-  }
++  thread::thread(ThreadProc&& proc, ThreadPriority prio)
++  : m_data(new ThreadData(std::move(proc))) {
++    if (this_thread::isInModuleDetachment()) {
++      delete m_data; m_data = nullptr;
++      throw std::system_error(
++        std::make_error_code(std::errc::operation_canceled),
++                              "DXVK: thread creation during module detach");
++    }
+ 
++    m_data->handle = ::CreateThread(
++      nullptr,
++      1u << 20,                          /* reserve 1 MiB */
++      thread::threadProc,
++      m_data,
++      CREATE_SUSPENDED | STACK_SIZE_PARAM_IS_A_RESERVATION,
++      &m_data->id);
+ 
 -  void thread::set_priority(ThreadPriority priority) {
 -    int32_t value;
 -    switch (priority) {
 -      default:
 -      case ThreadPriority::Normal: value = THREAD_PRIORITY_NORMAL; break;
 -      case ThreadPriority::Lowest: value = THREAD_PRIORITY_LOWEST; break;
-+  /*---------------------- hardware_concurrency ---------------------------*/
++    if (!m_data->handle) {
++      delete m_data; m_data = nullptr;
++      throw std::system_error(
++        std::make_error_code(std::errc::resource_unavailable_try_again),
++                              "DXVK: CreateThread failed");
+     }
+ 
+-    if (m_data)
+-      ::SetThreadPriority(m_data->handle, int32_t(value));
++    /* Pillar 3 – proactive affinity & priority */
++    ::SetThreadPriority(m_data->handle,
++                        (prio == ThreadPriority::Lowest) ? THREAD_PRIORITY_LOWEST
++                        : THREAD_PRIORITY_NORMAL);
++    applyCpuSetAffinity(m_data->handle, prio);
++
++    ::ResumeThread(m_data->handle);
+   }
+ 
++  thread::~thread() {
++    if (joinable()) std::terminate();
++  }
+ 
+-  uint32_t thread::hardware_concurrency() {
+-    SYSTEM_INFO info = { };
+-    ::GetSystemInfo(&info);
+-    return info.dwNumberOfProcessors;
++  /* --------------------------------------------------------------------- */
++  void thread::detach() {
++    if (!joinable())
++      throw std::system_error(std::make_error_code(std::errc::invalid_argument),
++                              "DXVK: detach on non-joinable thread");
++      m_data->decRef(); m_data = nullptr;
+   }
+ 
++  void thread::join() {
++    if (!joinable())
++      throw std::system_error(std::make_error_code(std::errc::invalid_argument),
++                              "DXVK: join on non-joinable thread");
++      if (get_id() == this_thread::get_id())
++        throw std::system_error(std::make_error_code(std::errc::resource_deadlock_would_occur),
++                                "DXVK: cannot join current thread");
++        if (::WaitForSingleObjectEx(m_data->handle, INFINITE, FALSE) == WAIT_FAILED)
++          throw std::system_error(std::make_error_code(std::errc::io_error),
++                                  "DXVK: WaitForSingleObjectEx failed");
++          detach();
++  }
+ 
+-  DWORD WINAPI thread::threadProc(void* arg) {
+-    auto data = reinterpret_cast<ThreadData*>(arg);
+-    DWORD exitCode = 0;
++  /* --------------------------------------------------------------------- */
++  void thread::set_priority(ThreadPriority prio) {
++    if (!joinable()) return;
++    ::SetThreadPriority(m_data->handle,
++                        (prio == ThreadPriority::Lowest) ? THREAD_PRIORITY_LOWEST
++                        : THREAD_PRIORITY_NORMAL);
++    applyCpuSetAffinity(m_data->handle, prio);
++  }
+ 
+-    try {
+-      data->proc();
+-    } catch (...) {
+-      exitCode = 1;
++  /* --------------------------------------------------------------------- */
 +  uint32_t thread::hardware_concurrency() {
 +    using GLPIEX_t = BOOL (WINAPI*)(LOGICAL_PROCESSOR_RELATIONSHIP,
 +                                    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
 +                                    PDWORD);
-+    static GLPIEX_t pGLPIEX =
-+    reinterpret_cast<GLPIEX_t>(
++    static auto pGLPIEX = reinterpret_cast<GLPIEX_t>(
 +      ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
 +                       "GetLogicalProcessorInformationEx"));
-+
 +    if (pGLPIEX) {
 +      DWORD len = 0;
 +      pGLPIEX(RelationProcessorCore, nullptr, &len);
 +      if (len) {
 +        std::vector<char> buf(len);
 +        if (pGLPIEX(RelationProcessorCore,
-+          reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()),
-+                    &len)) {
-+          DWORD off = 0, pcores = 0;
++          reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()), &len)) {
++          uint32_t pLogical = 0; bool hasE = false; DWORD off = 0;
 +        while (off < len) {
-+          auto *info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()+off);
-+          pcores += dxvk::bit::popcnt(info->Processor.GroupMask[0].Mask);
++          auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + off);
++          if (info->Relationship == RelationProcessorCore) {
++            for (WORD g = 0; g < info->Processor.GroupCount; ++g) {
++              UINT64 mask = info->Processor.GroupMask[g].Mask;
++              if (info->Processor.EfficiencyClass == 0)
++                pLogical += dxvk::bit::popcnt(mask);
++              else
++                hasE = true;
++            }
++          }
 +          off += info->Size;
 +        }
-+        if (pcores) return pcores;
-+                    }
++        if (hasE && pLogical) return pLogical;
++          }
 +      }
      }
- 
--    if (m_data)
--      ::SetThreadPriority(m_data->handle, int32_t(value));
-+    SYSTEM_INFO si{};
-+    ::GetSystemInfo(&si);
-+    return si.dwNumberOfProcessors;
-   }
- 
--
--  uint32_t thread::hardware_concurrency() {
--    SYSTEM_INFO info = { };
--    ::GetSystemInfo(&info);
--    return info.dwNumberOfProcessors;
--  }
--
--
-+  /*---------------------- thread entry proc ------------------------------*/
-   DWORD WINAPI thread::threadProc(void* arg) {
--    auto data = reinterpret_cast<ThreadData*>(arg);
--    DWORD exitCode = 0;
--
--    try {
--      data->proc();
--    } catch (...) {
--      exitCode = 1;
--    }
 -
 -    data->decRef();
 -    return exitCode;
-+    auto* d = reinterpret_cast<ThreadData*>(arg);
-+    DWORD rc = 0;
-+    try { d->proc(); }
-+    catch (...) { rc = 1; }
-+    d->decRef();
-+    return rc;
++    SYSTEM_INFO si{}; ::GetSystemInfo(&si); return si.dwNumberOfProcessors;
    }
  
 -}
 -
-+} /* dxvk */
- 
-+/*---------------- this_thread helpers ----------------------------------*/
- namespace dxvk::this_thread {
 -
-   bool isInModuleDetachment() {
+-namespace dxvk::this_thread {
+-
+-  bool isInModuleDetachment() {
 -    using PFN_RtlDllShutdownInProgress = BOOLEAN (WINAPI *)();
 -
 -    static auto RtlDllShutdownInProgress = reinterpret_cast<PFN_RtlDllShutdownInProgress>(
 -      ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "RtlDllShutdownInProgress"));
 -
 -    return RtlDllShutdownInProgress();
-+    using Fn = BOOLEAN (WINAPI*)();
-+    static Fn fn = reinterpret_cast<Fn>(
-+      ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"),
-+                       "RtlDllShutdownInProgress"));
-+    return fn && fn();
++  /* --------------------------------------------------------------------- */
++  DWORD WINAPI thread::threadProc(void* arg) noexcept {
++    auto* d = reinterpret_cast<ThreadData*>(arg); DWORD rc = 0;
++    try { d->proc(); } catch (...) { rc = 1; }
++    d->decRef(); return rc;
    }
-+} /* dxvk::this_thread */
  
 -}
 -
 -#else
-+#else /* =============================== POSIX ========================== */
- 
- namespace dxvk::this_thread {
+-
+-namespace dxvk::this_thread {
 -  
 -  static std::atomic<uint32_t> g_threadCtr = { 0u };
 -  static thread_local uint32_t g_threadId  = 0u;
@@ -205,13 +335,23 @@
 -  uint32_t get_id() {
 -    if (unlikely(!g_threadId))
 -      g_threadId = ++g_threadCtr;
- 
+-
 -    return g_threadId;
 -  }
-+  /* get_id defined inline in header; nothing extra needed here */
++  /* --------------------------------------------------------------------- */
++  namespace this_thread {
++    bool isInModuleDetachment() noexcept {
++      using Fn = BOOLEAN (WINAPI*)();
++      static Fn fn = reinterpret_cast<Fn>(
++        ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"),
++                         "RtlDllShutdownInProgress"));
++      return fn && fn();
++    }
++  } /* namespace */
  
 -}
-+} /* dxvk::this_thread */
++} /* namespace dxvk */
  
--#endif
-+#endif /* _WIN32 */
++#else  /* =============================================================  */
++namespace dxvk { /* POSIX implementation is header-only */ }
+ #endif

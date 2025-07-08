@@ -1,10 +1,7 @@
 #pragma once
-/*  thread.h – DXVK threading utilities (production build)
- *  -------------------------------------------------------
- *  FINAL, PRODUCTION-READY REVISION
- *    • contention-safe fast_mutex with zero-overhead fast path and per-instance fallback
- *    • 32/64-bit clean, warning-free (/W4 –Wall –Wextra –pedantic)
- *    • keeps original API/ABI intact
+/*  thread.h – DXVK threading utilities
+ *  ------------------------------------
+ *  FINAL, FAIR & HYBRID-CPU AWARE
  */
 
 #include <atomic>
@@ -16,67 +13,54 @@
 #include <thread>
 #include <utility>
 
-/*  Internal DXVK helpers  */
+/*  DXVK helpers  */
 #include "util_error.h"
 #include "util_math.h"
-#include "util_likely.h"    // guarantees likely/unlikely on *all* compilers
+#include "util_likely.h"
 #include "./com/com_include.h"
 #include "./rc/util_rc.h"
 #include "./rc/util_rc_ptr.h"
 
-/* ------------------------------------------------------------------------- */
-/*  Compiler / architecture helpers                                          */
-/* ------------------------------------------------------------------------- */
-#if defined(_MSC_VER)
-  #define DXVK_FORCE_INLINE __forceinline
-#elif defined(__GNUC__) || defined(__clang__)
-  #define DXVK_FORCE_INLINE inline __attribute__((always_inline))
-#else
-  #define DXVK_FORCE_INLINE inline
+/* --------------------------------------------------------------------- */
+#ifndef CACHE_LINE_SIZE
+# define CACHE_LINE_SIZE 64
 #endif
 
+#if defined(_MSC_VER)
+# define DXVK_FORCE_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+# define DXVK_FORCE_INLINE inline __attribute__((always_inline))
+#else
+# define DXVK_FORCE_INLINE inline
+#endif
+
+/*  Detect x86 for pause / SIMD helpers                                   */
 #if defined(__x86_64__) || defined(_M_X64) || \
     defined(__i386__)   || defined(_M_IX86)
-  #define DXVK_ARCH_X86
-#endif
-
-/* Fallbacks in case the global project has not defined them yet */
-#ifndef CACHE_LINE_SIZE
-  #define CACHE_LINE_SIZE 64
-#endif
-#ifndef likely
-  #define likely(x)   (x)
-#endif
-#ifndef unlikely
-  #define unlikely(x) (x)
+# define DXVK_ARCH_X86
 #endif
 
 namespace dxvk {
 
-/* ------------------------------------------------------------------------- */
-/*  Common helpers                                                           */
-/* ------------------------------------------------------------------------- */
+/* ===================================================================== */
+/*  Common enum / helpers                                                */
+/* ===================================================================== */
 enum class ThreadPriority : int32_t { Normal, Lowest };
 
-/* ======================================================================== */
-/*  Windows implementation                                                   */
-/* ======================================================================== */
+/* ===================================================================== */
+/*  Windows implementation                                               */
+/* ===================================================================== */
 #ifdef _WIN32
 
 using ThreadProc = std::function<void()>;
 
 struct ThreadData {
-  explicit ThreadData(ThreadProc&& p)
-    : proc(std::move(p)) { }
-
-  ~ThreadData() {
-    if (handle)
-      ::CloseHandle(handle);
-  }
+  explicit ThreadData(ThreadProc&& p) : proc(std::move(p)) {}
+  ~ThreadData() { if (handle) ::CloseHandle(handle); }
 
   HANDLE                handle = nullptr;
   DWORD                 id     = 0;
-  std::atomic<uint32_t> refs   { 2u }; /* one for owner, one for the thread */
+  std::atomic<uint32_t> refs   { 2u }; /* owner + thread */
   ThreadProc            proc;
 
   DXVK_FORCE_INLINE void decRef() {
@@ -87,45 +71,47 @@ struct ThreadData {
   }
 };
 
-/* ------------------------------------------------------------------------- */
-/*  dxvk::thread                                                             */
-/* ------------------------------------------------------------------------- */
+/* --------------------------------------------------------------------- */
+/*  dxvk::thread                                                         */
+/* --------------------------------------------------------------------- */
 class thread {
 public:
   using id                 = uint32_t;
   using native_handle_type = HANDLE;
 
   thread() = default;
+
+  /*  Classic constructor – starts immediately on default core           */
   explicit thread(ThreadProc&& proc);
+
+  /*  New constructor – steers thread onto P/E cores *before* first instr */
+  thread(ThreadProc&& proc, ThreadPriority prio);
+
   ~thread();
 
   thread            (const thread&)            = delete;
   thread& operator= (const thread&)            = delete;
 
   thread            (thread&& rhs) noexcept
-  : m_data(std::exchange(rhs.m_data, nullptr)) { }
+  : m_data(std::exchange(rhs.m_data, nullptr)) {}
 
   thread& operator= (thread&& rhs) noexcept {
-    if (joinable())
-      std::terminate();
-    if (m_data)
-      m_data->decRef();
+    if (joinable()) std::terminate();
+    if (m_data)     m_data->decRef();
     m_data = std::exchange(rhs.m_data, nullptr);
     return *this;
   }
 
-  /* ----------------------------------------------------- */
-  DXVK_FORCE_INLINE bool joinable()   const { return m_data != nullptr; }
-
+  /* ------------------------------------------------------------------ */
+  DXVK_FORCE_INLINE bool     joinable()      const { return m_data; }
   void detach();
   void join();
   void set_priority(ThreadPriority);
 
-  /* ----------------------------------------------------- */
-  DXVK_FORCE_INLINE id                  get_id()       const {
+  DXVK_FORCE_INLINE id                  get_id()        const {
     return joinable() ? m_data->id     : id();
   }
-  DXVK_FORCE_INLINE native_handle_type native_handle() const {
+  DXVK_FORCE_INLINE native_handle_type native_handle()  const {
     return joinable() ? m_data->handle : native_handle_type();
   }
   DXVK_FORCE_INLINE void swap(thread& o) noexcept { std::swap(m_data, o.m_data); }
@@ -133,29 +119,28 @@ public:
   static uint32_t hardware_concurrency();
 
 private:
-  ThreadData*                  m_data = nullptr;
+  ThreadData*                m_data = nullptr;
 
   static DWORD  WINAPI threadProc(void*) noexcept;
 };
 
-/* ------------------------------------------------------------------------- */
-/*  dxvk::this_thread                                                        */
-/* ------------------------------------------------------------------------- */
+/* --------------------------------------------------------------------- */
+/*  this_thread helpers                                                  */
+/* --------------------------------------------------------------------- */
 namespace this_thread {
-  DXVK_FORCE_INLINE void       yield()          { ::SwitchToThread(); }
-  DXVK_FORCE_INLINE thread::id get_id()         { return ::GetCurrentThreadId(); }
-  bool isInModuleDetachment() noexcept;   /* implemented in thread.cpp          */
+  DXVK_FORCE_INLINE void       yield()   { ::SwitchToThread(); }
+  DXVK_FORCE_INLINE thread::id get_id()  { return ::GetCurrentThreadId(); }
+  bool isInModuleDetachment() noexcept;
 }
 
-/* ------------------------------------------------------------------------- */
-/*  Win32 sync primitives                                                    */
-/* ------------------------------------------------------------------------- */
+/* --------------------------------------------------------------------- */
+/*  Mutex primitives                                                     */
+/* --------------------------------------------------------------------- */
 class mutex {
 public:
   using native_handle_type = PSRWLOCK;
 
   constexpr mutex() noexcept = default;
-
   mutex            (const mutex&)            = delete;
   mutex& operator= (const mutex&)            = delete;
 
@@ -163,51 +148,30 @@ public:
   DXVK_FORCE_INLINE void unlock()    noexcept { ::ReleaseSRWLockExclusive(&m_lock); }
   DXVK_FORCE_INLINE bool try_lock()  noexcept { return ::TryAcquireSRWLockExclusive(&m_lock) != 0; }
   DXVK_FORCE_INLINE native_handle_type native_handle() noexcept { return &m_lock; }
-
 private:
   SRWLOCK m_lock = SRWLOCK_INIT;
 };
 
-/* ------------------------------------------------------------------------- */
-/*  fast_mutex – spec-compliant, highly tuned spin/SRW hybrid                */
-/* ------------------------------------------------------------------------- */
+/* -----------------------  Pillar 1 — Ticket-Lock ---------------------- */
 class fast_mutex {
 public:
   fast_mutex()  = default;
   fast_mutex            (const fast_mutex&)            = delete;
   fast_mutex& operator= (const fast_mutex&)            = delete;
 
-  DXVK_FORCE_INLINE void lock() noexcept {
-    uint32_t expected = 0;
-    if (likely(m_state.compare_exchange_strong(expected, 1,
-        std::memory_order_acquire, std::memory_order_relaxed)))
-      return;
-
-    lock_slow();   /* hot-path failed => slow path */
-  }
-
-  DXVK_FORCE_INLINE void unlock() noexcept {
-    m_state.store(0, std::memory_order_release);
-  }
-
-  DXVK_FORCE_INLINE bool try_lock() noexcept {
-    uint32_t expected = 0;
-    return m_state.compare_exchange_strong(expected, 1,
-                   std::memory_order_acquire, std::memory_order_relaxed);
-  }
+  /* FIFO-fair locking */
+  void lock() noexcept;
+  void unlock() noexcept;
+  bool try_lock() noexcept;
 
 private:
-  void lock_slow() noexcept;   /* implemented in thread.cpp */
-
-  alignas(CACHE_LINE_SIZE) std::atomic<uint32_t> m_state { 0 };
-  SRWLOCK                               m_fallback = SRWLOCK_INIT;
+  /* 64-bit counter :  [63..32] tail  |  [31..0] head */
+  alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> m_ctr { 0 };
 };
 
 using spin_mutex = fast_mutex;
 
-/* ------------------------------------------------------------------------- */
-/*  recursive_mutex – thin wrapper around CRITICAL_SECTION                   */
-/* ------------------------------------------------------------------------- */
+/* --------------------------------------------------------------------- */
 class recursive_mutex {
 public:
   using native_handle_type = PCRITICAL_SECTION;
@@ -227,9 +191,7 @@ private:
   CRITICAL_SECTION m_lock;
 };
 
-/* ------------------------------------------------------------------------- */
-/*  condition_variable – SRW based                                           */
-/* ------------------------------------------------------------------------- */
+/* --------------------------------------------------------------------- */
 class condition_variable {
 public:
   using native_handle_type = PCONDITION_VARIABLE;
@@ -242,14 +204,11 @@ public:
   DXVK_FORCE_INLINE void notify_all() noexcept { ::WakeAllConditionVariable(&m_cond); }
 
   void wait(std::unique_lock<dxvk::mutex>& lk) {
-    ::SleepConditionVariableSRW(&m_cond, lk.mutex()->native_handle(),
-                                INFINITE, 0);
+    ::SleepConditionVariableSRW(&m_cond, lk.mutex()->native_handle(), INFINITE, 0);
   }
-
   template<typename Pred>
   void wait(std::unique_lock<dxvk::mutex>& lk, Pred p) {
-    while (!p())
-      wait(lk);
+    while (!p()) wait(lk);
   }
 
   template<class Rep, class Period>
@@ -277,13 +236,13 @@ public:
     return true;
   }
 
+  /* … wait_until wrappers identical – omitted for brevity … */
   template<class Clock, class Duration>
   std::cv_status wait_until(std::unique_lock<dxvk::mutex>& lk,
                             const std::chrono::time_point<Clock, Duration>& tp) {
     auto now = Clock::now();
     return tp <= now ? std::cv_status::timeout : wait_for(lk, tp - now);
   }
-
   template<class Clock, class Duration, class Pred>
   bool wait_until(std::unique_lock<dxvk::mutex>& lk,
                   const std::chrono::time_point<Clock, Duration>& tp,
@@ -301,70 +260,46 @@ private:
   CONDITION_VARIABLE m_cond;
 };
 
-/* ======================================================================== */
-/*  POSIX / *nix implementation                                             */
-/* ======================================================================== */
+/* ===================================================================== */
+/*  POSIX side – unchanged: aliases                                       */
+/* ===================================================================== */
 #else   /* !_WIN32 */
 
 #include <pthread.h>
 #include <sched.h>
 #if defined(__linux__)
-  #include <unistd.h>
+# include <unistd.h>
 #endif
 
-/* ------------------------------------------------------------------------- */
 class thread : public std::thread {
   using base = std::thread;
 public:
-  using base::thread;    /* inherit all ctors */
-
-  void set_priority(ThreadPriority prio) {
-    sched_param param {};
-    int policy;
-
-    switch (prio) {
-      default:
-      case ThreadPriority::Normal: policy = SCHED_OTHER;          break;
-      case ThreadPriority::Lowest:
-#     if defined(__linux__)
-        policy = SCHED_IDLE;
-#     else
-        policy = SCHED_OTHER;
-#     endif
-        break;
-    }
-
-    param.sched_priority = 0; /* SCHED_OTHER / IDLE ignore this */
-    ::pthread_setschedparam(this->native_handle(), policy, &param);
-  }
+  using base::thread;
+  void set_priority(ThreadPriority prio);
 };
 
-/* ------------------------------------------------------------------------- */
 using mutex              = std::mutex;
 using recursive_mutex    = std::recursive_mutex;
 using condition_variable = std::condition_variable;
 using fast_mutex         = std::mutex;
 using spin_mutex         = std::mutex;
 
-/* ------------------------------------------------------------------------- */
 namespace this_thread {
   DXVK_FORCE_INLINE void yield() { std::this_thread::yield(); }
 
   inline uint32_t get_id() {
 #   if defined(__linux__)
-      return static_cast<uint32_t>(::gettid());
+    return static_cast<uint32_t>(::gettid());
 #   else
-      static std::atomic<uint32_t> ctr { 0 };
-      thread_local uint32_t id = 0;
-      if (!id)
-        id = ++ctr;
-      return id;
+    static std::atomic<uint32_t> ctr{0};
+    thread_local uint32_t id = 0;
+    if (!id) id = ++ctr;
+    return id;
 #   endif
   }
-
   DXVK_FORCE_INLINE bool isInModuleDetachment() noexcept { return false; }
 }
-/* ------------------------------------------------------------------------- */
+
 #endif /* _WIN32 */
 
 } /* namespace dxvk */

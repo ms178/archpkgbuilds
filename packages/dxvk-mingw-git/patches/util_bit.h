@@ -290,44 +290,62 @@ namespace dxvk::bit {
     if constexpr (alignof(T) >= 32 && sizeof(T) >= 64) {
       for (; offset + 64 <= sizeof(T); offset += 64) {
         _mm_prefetch(p1 + offset + 256, _MM_HINT_T0);
-        __m256i v_a0 = _mm256_load_si256(
-          reinterpret_cast<const __m256i*>(p1 + offset));
-        __m256i v_b0 = _mm256_load_si256(
-          reinterpret_cast<const __m256i*>(p2 + offset));
-        __m256i v_a1 = _mm256_load_si256(
-          reinterpret_cast<const __m256i*>(p1 + offset + 32));
-        __m256i v_b1 = _mm256_load_si256(
-          reinterpret_cast<const __m256i*>(p2 + offset + 32));
-        __m256i neq  = _mm256_or_si256(
-          _mm256_xor_si256(v_a0, v_b0),
-                                       _mm256_xor_si256(v_a1, v_b1));
-        if (!_mm256_testz_si256(neq, neq))
-          return false;
+        __m256i A0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(p1 + offset));
+        __m256i B0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(p2 + offset));
+        __m256i A1 = _mm256_load_si256(reinterpret_cast<const __m256i*>(p1 + offset + 32));
+        __m256i B1 = _mm256_load_si256(reinterpret_cast<const __m256i*>(p2 + offset + 32));
+        __m256i neq = _mm256_or_si256(_mm256_xor_si256(A0, B0),
+                                      _mm256_xor_si256(A1, B1));
+        if (!_mm256_testz_si256(neq, neq)) return false;
       }
     }
-    # endif /* AVX2 */
+    # endif
 
     if constexpr (sizeof(T) >= 32) {
       for (; offset + 32 <= sizeof(T); offset += 32) {
         _mm_prefetch(p1 + offset + 128, _MM_HINT_T0);
-        __m128i v_a0 = _mm_load_si128(
-          reinterpret_cast<const __m128i*>(p1 + offset));
-        __m128i v_b0 = _mm_load_si128(
-          reinterpret_cast<const __m128i*>(p2 + offset));
-        __m128i v_a1 = _mm_load_si128(
-          reinterpret_cast<const __m128i*>(p1 + offset + 16));
-        __m128i v_b1 = _mm_load_si128(
-          reinterpret_cast<const __m128i*>(p2 + offset + 16));
-        __m128i neq  = _mm_or_si128(
-          _mm_xor_si128(v_a0, v_b0),
-                                    _mm_xor_si128(v_a1, v_b1));
-        if (_mm_movemask_epi8(neq))
-          return false;
+        __m128i A0 = _mm_load_si128(reinterpret_cast<const __m128i*>(p1 + offset));
+        __m128i B0 = _mm_load_si128(reinterpret_cast<const __m128i*>(p2 + offset));
+        __m128i A1 = _mm_load_si128(reinterpret_cast<const __m128i*>(p1 + offset + 16));
+        __m128i B1 = _mm_load_si128(reinterpret_cast<const __m128i*>(p2 + offset + 16));
+        __m128i neq = _mm_or_si128(_mm_xor_si128(A0, B0),
+                                   _mm_xor_si128(A1, B1));
+        if (_mm_movemask_epi8(neq)) return false;
       }
     }
 
-    if (offset < sizeof(T))
-      return !std::memcmp(p1 + offset, p2 + offset, sizeof(T) - offset);
+    /* --------------- Pillar 2 – Masked vector tail -------------------- */
+    const size_t rem = sizeof(T) - offset;
+    if (rem) {
+      #   if defined(__AVX2__)
+      if (rem >= 16) {
+        /* Load last 16 bytes once, overlaps earlier but still valid        */
+        const char* tail1 = p1 + sizeof(T) - 16;
+        const char* tail2 = p2 + sizeof(T) - 16;
+        __m128i A = _mm_loadu_si128(reinterpret_cast<const __m128i*>(tail1));
+        __m128i B = _mm_loadu_si128(reinterpret_cast<const __m128i*>(tail2));
+        if (_mm_movemask_epi8(_mm_xor_si128(A, B))) return false;
+        return true;
+      }
+      /* 1-15 bytes – masked load (no over-read)                           */
+      __m128i mask{};
+      alignas(16) static const uint32_t mTable[17] = {
+        0x00000000u, 0x000000ffu, 0x0000ffffu, 0x00ffffffu,
+        0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu,
+        0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu,
+        0xffffffffu, 0xffffffffu, 0xffffffffu };
+        mask = _mm_set_epi32(0, 0, 0, mTable[rem]);
+        const char* tail1 = p1 + sizeof(T) - rem;
+        const char* tail2 = p2 + sizeof(T) - rem;
+        __m128i A = _mm_maskload_epi32(reinterpret_cast<const int*>(tail1), mask);
+        __m128i B = _mm_maskload_epi32(reinterpret_cast<const int*>(tail2), mask);
+        if (_mm_movemask_epi8(_mm_xor_si128(A, B))) return false;
+        return true;
+      #   else
+      /* Fallback scalar compare – extremely rare on AVX2-capable CPUs     */
+      return !std::memcmp(p1 + offset, p2 + offset, rem);
+      #   endif
+    }
     return true;
     #else
     return !std::memcmp(a, b, sizeof(T));
