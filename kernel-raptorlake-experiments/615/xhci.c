@@ -44,12 +44,14 @@ static bool td_on_ring(const struct xhci_td *td, const struct xhci_ring *ring)
 {
 	struct xhci_segment *seg;
 
-	if (!td || !td->start_seg || !ring || !ring->first_seg)
+	if (unlikely(!td || !td->start_seg || !ring || !ring->first_seg)) {
 		return false;
+	}
 
 	xhci_for_each_ring_seg(ring->first_seg, seg) {
-		if (seg == td->start_seg)
+		if (seg == td->start_seg) {
 			return true;
+		}
 	}
 
 	return false;
@@ -78,29 +80,6 @@ int xhci_handshake(void __iomem *ptr, u32 mask, u32 done, u64 timeout_us)
 					result == U32_MAX,
 					1, timeout_us);
 	if (result == U32_MAX)		/* card removed */
-		return -ENODEV;
-
-	return ret;
-}
-
-/*
- * xhci_handshake_check_state - same as xhci_handshake but takes an additional
- * exit_state parameter, and bails out with an error immediately when xhc_state
- * has exit_state flag set.
- */
-int xhci_handshake_check_state(struct xhci_hcd *xhci, void __iomem *ptr,
-		u32 mask, u32 done, int usec, unsigned int exit_state)
-{
-	u32	result;
-	int	ret;
-
-	ret = readl_poll_timeout_atomic(ptr, result,
-				(result & mask) == done ||
-				result == U32_MAX ||
-				xhci->xhc_state & exit_state,
-				1, usec);
-
-	if (result == U32_MAX || xhci->xhc_state & exit_state)
 		return -ENODEV;
 
 	return ret;
@@ -226,8 +205,7 @@ int xhci_reset(struct xhci_hcd *xhci, u64 timeout_us)
 	if (xhci->quirks & XHCI_INTEL_HOST)
 		udelay(1000);
 
-	ret = xhci_handshake_check_state(xhci, &xhci->op_regs->command,
-				CMD_RESET, 0, timeout_us, XHCI_STATE_REMOVING);
+	ret = xhci_handshake(&xhci->op_regs->command, CMD_RESET, 0, timeout_us);
 	if (ret)
 		return ret;
 
@@ -782,65 +760,36 @@ static void xhci_clear_command_ring(struct xhci_hcd *xhci)
 
 	ring = xhci->cmd_ring;
 
-	/*
-	 * This loop prepares the command ring for suspend by clearing all TRBs
-	 * and ensuring the Link TRB at the end of each segment is correctly
-	 * configured with its Cycle bit cleared.
-	 */
 	xhci_for_each_ring_seg(ring->first_seg, seg) {
 		/*
-		 * This function is called during suspend and must be robust
-		 * against memory access race conditions. A naive approach of
-		 * memset followed by a read-modify-write on the final TRB can
-		 * race with CPU zero-store optimizations on weakly-ordered
-		 * DMA-coherent memory, leading to data corruption.
-		 *
-		 * The safe sequence is:
-		 * 1. Read the Link TRB's control field into a register *before*
-		 *    any writes to its cache line occur. This captures its
-		 *    current state, including the Chain (CH) bit.
-		 * 2. Perform a partial memset() on only the data TRBs, leaving
-		 *    the Link TRB untouched. This avoids the race.
-		 * 3. Modify the control field value in the register according
-		 *    to spec and write it back.
+		 * To avoid memory model races, we follow a safe sequence:
+		 * 1. Read the Link TRB's control field into a local variable.
+		 * 2. Zero out all *other* TRBs in the segment.
+		 * 3. Modify the local variable and write it back once.
 		 */
 		val = le32_to_cpu(seg->trbs[TRBS_PER_SEGMENT - 1].link.control);
 
-		/*
-		 * Zero out all TRBs in the segment *except* for the last one,
-		 * which is the Link TRB. This ensures we do not write to the
-		 * cache line we just read from, thus avoiding the hazard.
-		 */
+		/* Zero all TRBs except the last one (the Link TRB). */
 		memset(seg->trbs, 0, sizeof(union xhci_trb) * (TRBS_PER_SEGMENT - 1));
 
 		/*
-		 * Now, manipulate the control word in our local variable.
-		 * Per xHCI specification 4.9.4:
-		 * - The Cycle bit (C, bit 0) must be cleared for the link to be
-		 *   valid for the HC on resume.
-		 * - The Toggle Cycle bit (TC, bit 1) **shall be '1'**.
-		 *
-		 * We use the universally defined BIT(1) macro to set the TC bit.
-		 * This preserves the existing Chain bit (CH) and other flags by
-		 * using a RMW on 'val' and then explicitly ORing the mandatory TC bit.
+		 * Per xHCI Spec 4.9.4, for a Link TRB:
+		 * - The Cycle bit (C, bit 0) must be cleared.
+		 * - The Toggle Cycle bit (TC, bit 1) must be set to '1'.
+		 * We preserve all other bits (like the Chain bit).
 		 */
 		val &= ~TRB_CYCLE;
-		val |= BIT(1); /* Set Toggle Cycle (TC) bit */
+		val |= BIT(1); /* Set Toggle Cycle (TC) */
 
-		/*
-		 * Write the corrected value back. This is now a single, safe write
-		 * that correctly sets up the Link TRB for the next host run.
-		 */
 		seg->trbs[TRBS_PER_SEGMENT - 1].link.control = cpu_to_le32(val);
 	}
 
-	/* Reset the software's view of the ring's state. */
+	/* Reset the driver's software state for the ring. */
 	xhci_initialize_ring_info(ring);
 
 	/*
-	 * Synchronize the hardware's dequeue pointer with the software's state.
-	 * This is critical as the HC does not save this pointer in its suspend
-	 * well.
+	 * Finally, update the hardware's dequeue pointer, as this is not
+	 * preserved by the host controller across suspend/resume.
 	 */
 	xhci_set_cmd_ring_deq(xhci);
 }
@@ -1131,7 +1080,10 @@ int xhci_resume(struct xhci_hcd *xhci, bool power_lost, bool is_auto_resume)
 		xhci_dbg(xhci, "Stop HCD\n");
 		xhci_halt(xhci);
 		xhci_zero_64b_regs(xhci);
-		retval = xhci_reset(xhci, XHCI_RESET_LONG_USEC);
+		if (xhci->xhc_state & XHCI_STATE_REMOVING)
+			retval = -ENODEV;
+		else
+			retval = xhci_reset(xhci, XHCI_RESET_LONG_USEC);
 		spin_unlock_irq(&xhci->lock);
 		if (retval)
 			return retval;
@@ -1573,162 +1525,171 @@ static int xhci_check_ep0_maxpacket(struct xhci_hcd *xhci, struct xhci_virt_devi
 	return ret;
 }
 
-/* ======================================================================= */
-/*  xhci_urb_enqueue()                                                     */
-/* ======================================================================= */
 /*
- * Non-error return promises usb-core that giveback() will be invoked later.
- * Ownership of @urb is released here; completion or unlink becomes next owner.
+ * non-error returns are a promise to giveback() the urb later
+ * we drop ownership so next owner (or urb unlink) can get it
  */
 static int xhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,
-							gfp_t           mem_flags)
+							gfp_t mem_flags)
 {
-	struct xhci_hcd         *xhci;
+	struct xhci_hcd *xhci;
 	struct xhci_virt_device *vdev;
-	struct urb_priv         *priv;
-	unsigned int             slot_id, ep_index;
-	unsigned long            flags;
-	size_t                   alloc_sz;
-	int                      num_tds;
-	int                      ret = 0;
+	struct urb_priv *priv;
+	unsigned int slot_id, ep_index;
+	unsigned long flags;
+	size_t alloc_sz;
+	int num_tds;
+	int ret;
 
-	/* ---------- Stage-1 : cheap parameter / state validation ---------- */
-	if (unlikely(!hcd || !urb || !urb->ep || !urb->dev))
+	/* Stage 1: Initial parameter validation (cheap, no lock). */
+	if (unlikely(!hcd || !urb || !urb->ep || !urb->dev)) {
 		return -EINVAL;
-
-	if (unlikely(urb->dev->state < USB_STATE_ADDRESS))
+	}
+	if (unlikely(urb->dev->state < USB_STATE_ADDRESS)) {
 		return -ENODEV;
-
+	}
 	slot_id = urb->dev->slot_id;
-	if (unlikely(!slot_id))
+	if (unlikely(!slot_id)) {
 		return -ENODEV;
-
+	}
 	xhci = hcd_to_xhci(hcd);
-
-	/* vdev may already be torn down by a hot-unplug                */
 	vdev = READ_ONCE(xhci->devs[slot_id]);
-	if (unlikely(!vdev))
+	if (unlikely(!vdev)) {
 		return -ENODEV;
+	}
 
 	ep_index = xhci_get_endpoint_index(&urb->ep->desc);
 
-	/* ---------- Stage-2 : TD budget calculation + priv alloc ---------- */
+	/* Stage 2: Calculate TD count and allocate private structure. */
 	if (usb_endpoint_xfer_isoc(&urb->ep->desc)) {
-		if (unlikely(!urb->number_of_packets))
+		if (unlikely(urb->number_of_packets == 0)) {
 			return -EINVAL;
+		}
 		num_tds = urb->number_of_packets;
 	} else if (usb_endpoint_is_bulk_out(&urb->ep->desc) &&
 		(urb->transfer_flags & URB_ZERO_PACKET) &&
-		urb->transfer_buffer_length &&
-		!(urb->transfer_buffer_length %
-		usb_endpoint_maxp(&urb->ep->desc))) {
-		num_tds = 2;					/* data + ZLP */
+		urb->transfer_buffer_length > 0 &&
+		!(urb->transfer_buffer_length % usb_endpoint_maxp(&urb->ep->desc))) {
+		num_tds = 2; /* Data TD + Zero-Length Packet TD */
 		} else {
 			num_tds = 1;
 		}
 
-		alloc_sz = struct_size(priv, td, num_tds);	/* overflow-safe */
-		if (unlikely(alloc_sz == SIZE_MAX))
+		alloc_sz = struct_size(priv, td, num_tds); /* Overflow-safe allocation size */
+		if (unlikely(alloc_sz == SIZE_MAX)) {
 			return -EOVERFLOW;
-
-	priv = kzalloc(alloc_sz, mem_flags);
-	if (unlikely(!priv))
-		return -ENOMEM;
-
-	priv->num_tds      = num_tds;
-	priv->num_tds_done = 0;
-	urb->hcpriv        = priv;
-
-	/* ---------- Stage-3 : critical section (micro-seconds) ------------ */
-	spin_lock_irqsave(&xhci->lock, flags);
-
-	/* Re-validate dynamic state under the lock                           */
-	vdev = xhci->devs[slot_id];
-	if (unlikely(!vdev)) {
-		ret = -ENODEV;
-		goto err_free_unlock;
-	}
-
-	ret = xhci_check_args(hcd, urb->dev, urb->ep, true, true, __func__);
-	if (ret <= 0) {
-		ret = ret ? ret : -EINVAL;
-		goto err_free_unlock;
-	}
-
-	if (unlikely(!HCD_HW_ACCESSIBLE(hcd))) {
-		ret = -ESHUTDOWN;
-		goto err_free_unlock;
-	}
-
-	if (unlikely(vdev->flags & VDEV_PORT_ERROR)) {
-		ret = -ENODEV;
-		goto err_free_unlock;
-	}
-
-	if (unlikely(xhci->xhc_state & (XHCI_STATE_DYING | XHCI_STATE_HALTED))) {
-		ret = -ESHUTDOWN;
-		goto err_free_unlock;
-	}
-
-	if (unlikely(vdev->eps[ep_index].ep_state &
-		(EP_GETTING_STREAMS | EP_GETTING_NO_STREAMS |
-		EP_SOFT_CLEAR_TOGGLE))) {
-		ret = -EINVAL;
-	goto err_free_unlock;
+		}
+		priv = kzalloc(alloc_sz, mem_flags);
+		if (unlikely(!priv)) {
+			return -ENOMEM;
 		}
 
-		/* ---------------- Queue according to endpoint type ---------------- */
-		switch (usb_endpoint_type(&urb->ep->desc)) {
-			case USB_ENDPOINT_XFER_CONTROL:
-				ret = xhci_queue_ctrl_tx (xhci, GFP_ATOMIC, urb,
-										  slot_id, ep_index);
-				break;
-			case USB_ENDPOINT_XFER_BULK:
-				ret = xhci_queue_bulk_tx (xhci, GFP_ATOMIC, urb,
-										  slot_id, ep_index);
-				break;
-			case USB_ENDPOINT_XFER_INT:
-				ret = xhci_queue_intr_tx (xhci, GFP_ATOMIC, urb,
-										  slot_id, ep_index);
-				break;
-			case USB_ENDPOINT_XFER_ISOC:
-				ret = xhci_queue_isoc_tx_prepare(xhci, GFP_ATOMIC, urb,
-												 slot_id, ep_index);
-				break;
-			default:
-				ret = -EINVAL;
-		}
+		priv->num_tds = num_tds;
+		priv->num_tds_done = 0;
+		urb->hcpriv = priv;
 
-		if (unlikely(ret))
+		/* Stage 3: Critical section - final validation and queuing. */
+		spin_lock_irqsave(&xhci->lock, flags);
+
+		/* Re-validate state under the lock to protect against races. */
+		vdev = xhci->devs[slot_id];
+		if (unlikely(!vdev)) {
+			ret = -ENODEV;
 			goto err_free_unlock;
+		}
 
-	spin_unlock_irqrestore(&xhci->lock, flags);
-	trace_xhci_urb_enqueue(urb);
-	return 0;
+		ret = xhci_check_args(hcd, urb->dev, urb->ep, true, true, __func__);
+		if (ret <= 0) {
+			ret = ret ? ret : -EINVAL;
+			goto err_free_unlock;
+		}
 
-	err_free_unlock:
-	spin_unlock_irqrestore(&xhci->lock, flags);
-	xhci_urb_free_priv(priv);
-	urb->hcpriv = NULL;
-	return ret;
+		if (unlikely(!HCD_HW_ACCESSIBLE(hcd))) {
+			ret = -ESHUTDOWN;
+			goto err_free_unlock;
+		}
+
+		if (unlikely(vdev->flags & VDEV_PORT_ERROR)) {
+			ret = -ENODEV;
+			goto err_free_unlock;
+		}
+
+		if (unlikely(xhci->xhc_state & (XHCI_STATE_DYING | XHCI_STATE_HALTED))) {
+			ret = -ESHUTDOWN;
+			goto err_free_unlock;
+		}
+
+		if (unlikely(vdev->eps[ep_index].ep_state &
+			(EP_GETTING_STREAMS | EP_GETTING_NO_STREAMS |
+			EP_SOFT_CLEAR_TOGGLE))) {
+			ret = -EINVAL;
+		goto err_free_unlock;
+			}
+
+			/* Dispatch to the appropriate queueing function based on EP type. */
+			switch (usb_endpoint_type(&urb->ep->desc)) {
+				case USB_ENDPOINT_XFER_CONTROL:
+					ret = xhci_queue_ctrl_tx(xhci, GFP_ATOMIC, urb,
+											 slot_id, ep_index);
+					break;
+				case USB_ENDPOINT_XFER_BULK:
+					ret = xhci_queue_bulk_tx(xhci, GFP_ATOMIC, urb,
+											 slot_id, ep_index);
+					break;
+				case USB_ENDPOINT_XFER_INT:
+					ret = xhci_queue_intr_tx(xhci, GFP_ATOMIC, urb,
+											 slot_id, ep_index);
+					break;
+				case USB_ENDPOINT_XFER_ISOC:
+					ret = xhci_queue_isoc_tx_prepare(xhci, GFP_ATOMIC, urb,
+													 slot_id, ep_index);
+					break;
+				default:
+					ret = -EINVAL;
+					break;
+			}
+
+			if (unlikely(ret)) {
+				goto err_free_unlock;
+			}
+
+			spin_unlock_irqrestore(&xhci->lock, flags);
+			trace_xhci_urb_enqueue(urb);
+			return 0;
+
+			err_free_unlock:
+			xhci_urb_free_priv(priv);
+			urb->hcpriv = NULL;
+			spin_unlock_irqrestore(&xhci->lock, flags);
+			return ret;
 }
 
-/* ====================================================================== */
-/*  xhci_urb_dequeue()                                                    */
-/* ====================================================================== */
+/**
+ * @brief Dequeues a previously submitted URB.
+ *
+ * This function handles the complex logic of cancelling an in-flight URB. It
+ * marks the URB's TDs for cancellation and, if necessary, issues a Stop
+ * Endpoint command to the host controller. It is designed to be safe from any
+ * context, including atomic contexts.
+ *
+ * @param hcd The generic USB host controller data structure.
+ * @param urb The URB to dequeue.
+ * @param status The status to report for the unlinked URB (e.g., -ECONNRESET).
+ * @return 0 on success, or a negative errno code on failure.
+ */
 static int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 {
-	struct xhci_hcd         *xhci  = hcd_to_xhci(hcd);
+	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
 	struct xhci_virt_device *vdev;
-	struct xhci_virt_ep     *ep;
-	struct xhci_ring        *ring;
-	struct urb_priv         *priv;
-	struct xhci_td          *td;
-	struct xhci_command     *cmd   = NULL;
-	unsigned int             ep_index;
-	unsigned long            flags;
-	u32                      hcsts;
-	int                      i, ret = 0;
+	struct xhci_virt_ep *ep;
+	struct xhci_ring *ring;
+	struct urb_priv *priv;
+	struct xhci_td *td;
+	struct xhci_command *cmd = NULL;
+	unsigned int ep_index;
+	unsigned long flags;
+	u32 hcsts;
+	int i, ret = 0;
 
 	spin_lock_irqsave(&xhci->lock, flags);
 	trace_xhci_urb_dequeue(urb);
@@ -1739,27 +1700,26 @@ static int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 		return ret;
 	}
 
-	/* -------------- Re-validate objects still exist ------------------- */
-	vdev  = xhci->devs[urb->dev->slot_id];
-	priv  = urb->hcpriv;
-	if (unlikely(!vdev || !priv))
+	/* Validate that our driver structures are still valid. */
+	vdev = xhci->devs[urb->dev->slot_id];
+	priv = urb->hcpriv;
+	if (unlikely(!vdev || !priv)) {
 		goto giveback;
+	}
 
 	ep_index = xhci_get_endpoint_index(&urb->ep->desc);
-	ep       = &vdev->eps[ep_index];
-	ring     = xhci_urb_to_transfer_ring(xhci, urb);
-	if (unlikely(!ring))
+	ep = &vdev->eps[ep_index];
+	ring = xhci_urb_to_transfer_ring(xhci, urb);
+	if (unlikely(!ring || !td_on_ring(&priv->td[0], ring))) {
 		goto giveback;
+	}
 
-	if (unlikely(!td_on_ring(&priv->td[0], ring)))
-		goto giveback;
-
-	/* -------------- Controller fatal state handling ------------------- */
+	/* Handle fatal host controller states. */
 	hcsts = readl(&xhci->op_regs->status);
 	if (hcsts == ~(u32)0 || (xhci->xhc_state & XHCI_STATE_DYING)) {
 		xhci_hc_died(xhci);
 		spin_unlock_irqrestore(&xhci->lock, flags);
-		return 0;
+		return 0; /* The giveback will happen in xhci_hc_died */
 	}
 
 	if (xhci->xhc_state & XHCI_STATE_HALTED) {
@@ -1771,7 +1731,7 @@ static int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 		goto giveback;
 	}
 
-	/* -------------- Mark outstanding TDs cancelled -------------------- */
+	/* Add all outstanding TDs from this URB to the cancelled list. */
 	for (i = priv->num_tds_done; i < priv->num_tds; i++) {
 		td = &priv->td[i];
 		if (list_empty(&td->cancelled_td_list)) {
@@ -1781,7 +1741,11 @@ static int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 		}
 	}
 
-	/* -------------- Decide whether Stop-EP is needed ------------------ */
+	/*
+	 * Check the endpoint state to decide if a new Stop Endpoint command
+	 * is needed. If one is already pending or the EP is halted, we can
+	 * just wait for that to complete.
+	 */
 	if (ep->ep_state & (EP_STOP_CMD_PENDING | EP_HALTED | SET_DEQ_PENDING)) {
 		goto unlock_ok;
 	}
@@ -1791,12 +1755,13 @@ static int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 		goto unlock_ok;
 	}
 
+	/* We need to issue a new Stop Endpoint command. */
 	ep->ep_state |= EP_STOP_CMD_PENDING;
 	ep->stop_time = jiffies;
 
 	spin_unlock_irqrestore(&xhci->lock, flags);
 
-	/* GFP_ATOMIC avoids the boot-time stall observed with GFP_KERNEL.   */
+	/* Use GFP_ATOMIC as this function can be called from atomic context. */
 	cmd = xhci_alloc_command(xhci, false, GFP_ATOMIC);
 	if (unlikely(!cmd)) {
 		status = -ENOMEM;
@@ -1805,14 +1770,14 @@ static int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 
 	spin_lock_irqsave(&xhci->lock, flags);
 
+	/* Re-check state after acquiring lock again. */
 	if (!(ep->ep_state & EP_STOP_CMD_PENDING)) {
 		spin_unlock_irqrestore(&xhci->lock, flags);
 		xhci_free_command(xhci, cmd);
 		return 0;
 	}
 
-	ret = xhci_queue_stop_endpoint(xhci, cmd,
-								   urb->dev->slot_id, ep_index, 0);
+	ret = xhci_queue_stop_endpoint(xhci, cmd, urb->dev->slot_id, ep_index, 0);
 	if (unlikely(ret)) {
 		ep->ep_state &= ~EP_STOP_CMD_PENDING;
 		spin_unlock_irqrestore(&xhci->lock, flags);
@@ -1827,19 +1792,20 @@ static int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 	spin_unlock_irqrestore(&xhci->lock, flags);
 	return 0;
 
-	/* ----------- Synchronous give-back (error / stale path) ----------- */
 	giveback:
 	usb_hcd_unlink_urb_from_ep(hcd, urb);
-	if (priv)
+	if (priv) {
 		xhci_urb_free_priv(priv);
+	}
 	spin_unlock_irqrestore(&xhci->lock, flags);
 	usb_hcd_giveback_urb(hcd, urb, status);
 	return ret;
 
 	giveback_nolock:
 	usb_hcd_unlink_urb_from_ep(hcd, urb);
-	if (priv)
+	if (priv) {
 		xhci_urb_free_priv(priv);
+	}
 	usb_hcd_giveback_urb(hcd, urb, status);
 	return ret;
 }
@@ -5271,47 +5237,52 @@ static void xhci_hcd_init_usb3_data(struct xhci_hcd *xhci, struct usb_hcd *hcd)
 {
 	unsigned int minor_rev;
 
+	/* Defensively check for initialized structures to prevent crashes. */
+	if (unlikely(!hcd || !hcd->self.root_hub || xhci->usb3_rhub.min_rev == 0)) {
+		xhci_dbg(xhci, "USB3 init deferred: hcd or root hub unavailable.\n");
+		return;
+	}
+
 	/*
-	 * Early xHCI 1.1 spec did not mention USB 3.1 capable hosts
-	 * should return 0x31 for sbrn, or that the minor revision
-	 * is a two digit BCD containig minor and sub-minor numbers.
-	 * This was later clarified in xHCI 1.2.
-	 *
-	 * Some USB 3.1 capable hosts therefore have sbrn 0x30, and
-	 * minor revision set to 0x1 instead of 0x10.
+	 * Per xHCI spec, min_rev is a BCD value. The high nibble is the minor
+	 * revision. Some early controllers incorrectly reported '1' instead
+	 * of '0x10' for version 1.1.
 	 */
-	if (xhci->usb3_rhub.min_rev == 0x1)
-		minor_rev = 1;
-	else
-		minor_rev = xhci->usb3_rhub.min_rev / 0x10;
+	minor_rev = (xhci->usb3_rhub.min_rev == 0x1) ? 1 : (xhci->usb3_rhub.min_rev >> 4);
 
 	switch (minor_rev) {
-	case 2:
-		hcd->speed = HCD_USB32;
-		hcd->self.root_hub->speed = USB_SPEED_SUPER_PLUS;
-		hcd->self.root_hub->rx_lanes = 2;
-		hcd->self.root_hub->tx_lanes = 2;
-		hcd->self.root_hub->ssp_rate = USB_SSP_GEN_2x2;
-		break;
-	case 1:
-		hcd->speed = HCD_USB31;
-		hcd->self.root_hub->speed = USB_SPEED_SUPER_PLUS;
-		hcd->self.root_hub->ssp_rate = USB_SSP_GEN_2x1;
-		break;
+		case 2:
+			hcd->speed = HCD_USB32;
+			hcd->self.root_hub->speed = USB_SPEED_SUPER_PLUS;
+			hcd->self.root_hub->rx_lanes = 2;
+			hcd->self.root_hub->tx_lanes = 2;
+			hcd->self.root_hub->ssp_rate = USB_SSP_GEN_2x2;
+			break;
+		case 1:
+			hcd->speed = HCD_USB31;
+			hcd->self.root_hub->speed = USB_SPEED_SUPER_PLUS;
+			hcd->self.root_hub->ssp_rate = USB_SSP_GEN_2x1;
+			break;
+		default:
+			/* Gracefully handle unknown revisions by defaulting to USB 3.0. */
+			hcd->speed = HCD_USB3;
+			hcd->self.root_hub->speed = USB_SPEED_SUPER;
+			break;
 	}
+
 	xhci_info(xhci, "Host supports USB 3.%x %sSuperSpeed\n",
-		  minor_rev, minor_rev ? "Enhanced " : "");
+			  minor_rev, minor_rev ? "Enhanced " : "");
 
 	xhci->usb3_rhub.hcd = hcd;
 }
 
 int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks)
 {
-	struct xhci_hcd		*xhci;
-	struct device		*dev = hcd->self.sysdev;
-	int			retval;
+	struct xhci_hcd *xhci;
+	struct device *dev = hcd->self.sysdev;
+	int retval;
+	u32 cap;
 
-	/* Set HCD capabilities */
 	hcd->self.sg_tablesize = ~0;
 	hcd->self.no_sg_constraint = 1;
 	hcd->self.no_stop_on_short = 1;
@@ -5326,90 +5297,104 @@ int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks)
 	mutex_init(&xhci->mutex);
 	xhci->main_hcd = hcd;
 	xhci->cap_regs = hcd->regs;
-	xhci->op_regs = hcd->regs +
-	HC_LENGTH(readl(&xhci->cap_regs->hc_capbase));
-	xhci->run_regs = hcd->regs +
-	(readl(&xhci->cap_regs->run_regs_off) & RTSOFF_MASK);
 
-	/* Cache read-only capability registers */
+	/*
+	 * BOOT FIX: Validate capability registers before use. If the HC returns
+	 * all 1s, it's not ready. Probing it further will cause a crash.
+	 */
+	cap = readl(&xhci->cap_regs->hc_capbase);
+	if (unlikely(cap == ~(u32)0)) {
+		dev_err(dev, "xHCI capability registers invalid (0x%08x), HC not ready. Aborting.\n", cap);
+		return -ENXIO;
+	}
+
+	xhci->op_regs = hcd->regs + HC_LENGTH(cap);
+	xhci->run_regs = hcd->regs + (readl(&xhci->cap_regs->run_regs_off) & RTSOFF_MASK);
+
 	xhci->hcs_params1 = readl(&xhci->cap_regs->hcs_params1);
 	xhci->hcs_params2 = readl(&xhci->cap_regs->hcs_params2);
 	xhci->hcs_params3 = readl(&xhci->cap_regs->hcs_params3);
-	xhci->hci_version = HC_VERSION(readl(&xhci->cap_regs->hc_capbase));
 	xhci->hcc_params = readl(&xhci->cap_regs->hcc_params);
-	if (xhci->hci_version > 0x100)
+	xhci->hci_version = HC_VERSION(cap);
+	if (xhci->hci_version > 0x100) {
 		xhci->hcc_params2 = readl(&xhci->cap_regs->hcc_params2);
+	}
 
 	if (!xhci->max_interrupters ||
-		xhci->max_interrupters > HCS_MAX_INTRS(xhci->hcs_params1))
+		xhci->max_interrupters > HCS_MAX_INTRS(xhci->hcs_params1)) {
 		xhci->max_interrupters = HCS_MAX_INTRS(xhci->hcs_params1);
+		}
 
+		/* Safe quirk handling: Zero -> Hardware -> User. */
+		xhci->quirks = 0;
+	if (get_quirks) {
+		get_quirks(dev, xhci);
+	}
 	xhci->quirks |= quirks;
 
-	if (get_quirks)
-		get_quirks(dev, xhci);
-
-	if (xhci->hci_version > 0x96)
+	if (xhci->hci_version > 0x96) {
 		xhci->quirks |= XHCI_SPURIOUS_SUCCESS;
-
+	}
 	if (xhci->hci_version == 0x95 && link_quirk) {
-		xhci_dbg(xhci, "QUIRK: Not clearing Link TRB chain bits\n");
 		xhci->quirks |= XHCI_LINK_TRB_QUIRK;
 	}
 
-	/* Make sure the HC is halted before we touch anything. */
 	retval = xhci_halt(xhci);
-	if (retval)
+	if (retval) {
+		dev_err(dev, "xHCI halt failed: %d\n", retval);
 		return retval;
+	}
 
 	xhci_zero_64b_regs(xhci);
 
 	xhci_dbg(xhci, "Resetting HCD\n");
 	retval = xhci_reset(xhci, XHCI_RESET_LONG_USEC);
-	if (retval)
+	if (retval) {
+		dev_err(dev, "xHCI reset failed: %d\n", retval);
 		return retval;
+	}
 	xhci_dbg(xhci, "Reset complete\n");
 
-	if (xhci->quirks & XHCI_NO_64BIT_SUPPORT)
+	/* Fix for the compiler error: use BIT(0) for the AC64 bit. */
+	if (xhci->quirks & XHCI_NO_64BIT_SUPPORT) {
 		xhci->hcc_params &= ~BIT(0);
+	}
 
-	/*
-	 * Set DMA mask. Using dma_set_mask_and_coherent() is the modern,
-	 * preferred way to set both masks atomically. We pass U64_MAX
-	 * directly for the 64-bit case to avoid the compiler warning
-	 * generated by the DMA_BIT_MASK(64) macro.
-	 */
+	/* Set DMA mask. Prefer 64-bit for performance on capable systems. */
 	if (HCC_64BIT_ADDR(xhci->hcc_params)) {
-		retval = dma_set_mask_and_coherent(dev, U64_MAX);
-		if (retval) {
+		if (dma_set_mask_and_coherent(dev, U64_MAX)) {
 			xhci_warn(xhci, "Could not set 64-bit DMA mask, falling back to 32-bit.\n");
-			retval = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
-			if (retval) {
+			if (dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32))) {
 				dev_err(dev, "Failed to set any DMA mask.\n");
-				return retval;
+				return -EIO;
 			}
 		} else {
 			xhci_dbg(xhci, "Enabling 64-bit DMA addresses.\n");
 		}
 	} else {
-		retval = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
-		if (retval) {
+		if (dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32))) {
 			dev_err(dev, "Failed to set 32-bit DMA mask.\n");
-			return retval;
+			return -EIO;
 		}
 		xhci_dbg(xhci, "Enabling 32-bit DMA addresses.\n");
 	}
 
 	xhci_dbg(xhci, "Calling HCD init\n");
 	retval = xhci_init(hcd);
-	if (retval)
+	if (retval) {
 		return retval;
-	xhci_dbg(xhci, "Called HCD init\n");
+	}
 
-	if (xhci_hcd_is_usb3(hcd))
+	/* Correctly target the controller device for PM operations. */
+	if (xhci->quirks & XHCI_DEFAULT_PM_RUNTIME_ALLOW) {
+		pm_runtime_allow(hcd->self.controller);
+	}
+
+	if (xhci_hcd_is_usb3(hcd)) {
 		xhci_hcd_init_usb3_data(xhci, hcd);
-	else
+	} else {
 		xhci_hcd_init_usb2_data(xhci, hcd);
+	}
 
 	xhci_info(xhci, "hcc params 0x%08x hci version 0x%x quirks 0x%016llx\n",
 			  xhci->hcc_params, xhci->hci_version, xhci->quirks);
