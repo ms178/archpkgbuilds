@@ -103,8 +103,11 @@ extern "C" {
       static inline int
       u_bit_scan(unsigned *mask)
       {
+            if (!*mask) {
+                  return -1;
+            }
             const int i = ffs(*mask) - 1;
-            *mask &= ~(1u << i); /* Slightly safer than XOR for i=-1 case. */
+            *mask &= ~(1u << i);
             return i;
       }
 
@@ -116,6 +119,9 @@ extern "C" {
             static inline int
             u_bit_scan64(uint64_t *mask)
             {
+                  if (!*mask) {
+                        return -1;
+                  }
                   const int i = ffsll(*mask) - 1;
                   *mask &= ~(1ull << i);
                   return i;
@@ -125,6 +131,16 @@ extern "C" {
             for (uint64_t __dword = (dword), b;                     \
                   ((b) = ffsll(__dword) - 1, __dword);      \
                   __dword &= ~(1ull << (b)))
+
+                  /* Given two bitmasks, loop over all bits of both of them.
+                   * Bits of mask1 are: b = scan_bit(mask1);
+                   * Bits of mask2 are: b = offset + scan_bit(mask2);
+                   */
+                  #define u_foreach_bit64_two_masks(b, mask1, offset, mask2)                          \
+                     for (uint64_t __mask1 = (mask1), __mask2 = (mask2), b;                           \
+                          (__mask1 ? ((b) = ffsll(__mask1) - 1)                                       \
+                                   : ((b) = ffsll(__mask2) - 1 + offset), __mask1 || __mask2);        \
+                          __mask1 ? (__mask1 &= ~(1ull << (b))) : (__mask2 &= ~(1ull << (b - offset))))
 
                   /* Determine if an uint32_t value is a power of two. */
                   static inline bool
@@ -324,9 +340,13 @@ extern "C" {
                   util_widen_mask(uint32_t mask, unsigned multiplier)
                   {
                         uint32_t new_mask = 0;
-                        unsigned i;
-                        u_foreach_bit(i, mask)
-                        new_mask |= ((1u << multiplier) - 1u) << (i * multiplier);
+                        /*
+                         * The 'i' loop variable is declared by the u_foreach_bit macro itself.
+                         * A separate "unsigned i;" declaration is redundant and causes -Wshadow.
+                         */
+                        u_foreach_bit(i, mask) {
+                              new_mask |= ((1u << multiplier) - 1u) << (i * multiplier);
+                        }
                         return new_mask;
                   }
 

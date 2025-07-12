@@ -813,7 +813,8 @@ namespace aco {
                   }
 
                   if (instr->isVALU()) {
-                        assert(rc.bytes() <= 2);
+                        if (rc.bytes() == 3)
+                              rc = v1;
 
                         if (can_use_SDWA(gfx_level, instr, false) || instr->opcode == aco_opcode::v_cvt_pk_u8_f32)
                               return;

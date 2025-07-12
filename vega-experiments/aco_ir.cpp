@@ -11,6 +11,8 @@
 #include "util/u_debug.h"
 
 #include "c11/threads.h"
+#include "ac_descriptors.h"
+#include "amdgfxregs.h"
 
 namespace aco {
 
@@ -243,6 +245,7 @@ namespace aco {
                   program->next_fp_mode.denorm32 = 0;
                   program->next_fp_mode.round16_64 = fp_round_ne;
                   program->next_fp_mode.round32 = fp_round_ne;
+                  program->needs_fp_mode_insertion = false;
             }
 
             bool
@@ -594,50 +597,64 @@ namespace aco {
                         case aco_opcode::v_and_b16:
                         case aco_opcode::v_or_b16:
                         case aco_opcode::v_xor_b16:
-                        case aco_opcode::v_mul_lo_u16_e64: return true;
+                        case aco_opcode::v_mul_lo_u16_e64:
+                              return true;
 
                         case aco_opcode::v_pack_b32_f16:
                         case aco_opcode::v_cvt_pknorm_i16_f16:
-                        case aco_opcode::v_cvt_pknorm_u16_f16: return idx != -1;
+                        case aco_opcode::v_cvt_pknorm_u16_f16:
+                              return idx != -1;
 
                         case aco_opcode::v_mad_u32_u16:
-                        case aco_opcode::v_mad_i32_i16: return idx >= 0 && idx < 2;
+                        case aco_opcode::v_mad_i32_i16:
+                              return idx >= 0 && idx < 2;
 
                         case aco_opcode::v_dot2_f16_f16:
-                        case aco_opcode::v_dot2_bf16_bf16: return idx == -1 || idx == 2;
+                        case aco_opcode::v_dot2_bf16_bf16:
+                              return idx == -1 || idx == 2;
 
-                        case aco_opcode::v_cndmask_b16: return idx != 2;
+                        case aco_opcode::v_cndmask_b16:
+                              return idx != 2;
 
                         case aco_opcode::v_interp_p10_f16_f32_inreg:
-                        case aco_opcode::v_interp_p10_rtz_f16_f32_inreg: return idx == 0 || idx == 2;
+                        case aco_opcode::v_interp_p10_rtz_f16_f32_inreg:
+                              return idx == 0 || idx == 2;
                         case aco_opcode::v_interp_p2_f16_f32_inreg:
-                        case aco_opcode::v_interp_p2_rtz_f16_f32_inreg: return idx == -1 || idx == 0;
+                        case aco_opcode::v_interp_p2_rtz_f16_f32_inreg:
+                              return idx == -1 || idx == 0;
                         case aco_opcode::v_cvt_pk_fp8_f32:
                         case aco_opcode::p_v_cvt_pk_fp8_f32_ovfl:
-                        case aco_opcode::v_cvt_pk_bf8_f32: return idx == -1;
+                        case aco_opcode::v_cvt_pk_bf8_f32:
+                              return idx == -1;
 
                         case aco_opcode::v_cvt_pkrtz_f16_f32:
                         case aco_opcode::v_cvt_pknorm_i16_f32:
                         case aco_opcode::v_cvt_pknorm_u16_f32:
                         case aco_opcode::v_cvt_pk_i16_i32:
-                        case aco_opcode::v_cvt_pk_u16_u32: return false;
+                        case aco_opcode::v_cvt_pk_u16_u32:
+                              return false;
 
                         case aco_opcode::v_interp_p1_f32:
-                        case aco_opcode::v_interp_p2_f32: break;
+                        case aco_opcode::v_interp_p2_f32:
+                              break;
 
-                        /* Fixed cases based on VEGA ISA */
-                        case aco_opcode::v_alignbit_b32:
-                        case aco_opcode::v_alignbyte_b32: return idx >= 0 && idx < 2;
+                              /* Fixed cases based on VEGA ISA */
+                              case aco_opcode::v_alignbit_b32:
+                              case aco_opcode::v_alignbyte_b32:
+                                    return idx >= 0 && idx < 2;
 
-                        case aco_opcode::v_interp_p2_f16: return idx == 0;
+                              case aco_opcode::v_interp_p2_f16:
+                                    return idx == 0;
 
-                        case aco_opcode::v_mad_legacy_f16:
-                        case aco_opcode::v_mad_legacy_i16:
-                        case aco_opcode::v_mad_legacy_u16:
-                        case aco_opcode::v_fma_legacy_f16:
-                        case aco_opcode::v_div_fixup_legacy_f16: return idx >= 0 && idx < 3;
+                              case aco_opcode::v_mad_legacy_f16:
+                              case aco_opcode::v_mad_legacy_i16:
+                              case aco_opcode::v_mad_legacy_u16:
+                              case aco_opcode::v_fma_legacy_f16:
+                              case aco_opcode::v_div_fixup_legacy_f16:
+                                    return idx >= 0 && idx < 3;
 
-                        default: break;
+                              default:
+                                    break;
                   }
 
                   if (gfx_level >= GFX11 && (get_gfx11_true16_mask(op) & BITFIELD_BIT(idx == -1 ? 3 : idx))) {
@@ -766,7 +783,8 @@ namespace aco {
                         case aco_opcode::v_sqrt_f16:
                         case aco_opcode::v_trunc_f16:
                         case aco_opcode::v_swap_b16:
-                        case aco_opcode::v_mov_b16: return 0x1 | 0x8;
+                        case aco_opcode::v_mov_b16:
+                              return 0x1 | 0x8;
                         case aco_opcode::v_add_f16:
                         case aco_opcode::v_fmaak_f16:
                         case aco_opcode::v_fmac_f16:
@@ -779,12 +797,14 @@ namespace aco {
                         case aco_opcode::v_subrev_f16:
                         case aco_opcode::v_and_b16:
                         case aco_opcode::v_or_b16:
-                        case aco_opcode::v_xor_b16: return 0x3 | 0x8;
+                        case aco_opcode::v_xor_b16:
+                              return 0x3 | 0x8;
                         case aco_opcode::v_cvt_pk_f32_fp8:
                         case aco_opcode::v_cvt_pk_f32_bf8:
                         case aco_opcode::v_cvt_f32_f16:
                         case aco_opcode::v_cvt_i32_i16:
-                        case aco_opcode::v_cvt_u32_u16: return 0x1;
+                        case aco_opcode::v_cvt_u32_u16:
+                              return 0x1;
                         case aco_opcode::v_cmp_class_f16:
                         case aco_opcode::v_cmp_eq_f16:
                         case aco_opcode::v_cmp_eq_i16:
@@ -838,10 +858,13 @@ namespace aco {
                         case aco_opcode::v_cmpx_nlg_f16:
                         case aco_opcode::v_cmpx_nlt_f16:
                         case aco_opcode::v_cmpx_o_f16:
-                        case aco_opcode::v_cmpx_u_f16: return 0x3;
+                        case aco_opcode::v_cmpx_u_f16:
+                              return 0x3;
                         case aco_opcode::v_cvt_f16_f32:
-                        case aco_opcode::v_sat_pk_u8_i16: return 0x8;
-                        default: return 0x0;
+                        case aco_opcode::v_sat_pk_u8_i16:
+                              return 0x8;
+                        default:
+                              return 0x0;
                   }
             }
 
@@ -1784,6 +1807,66 @@ namespace aco {
                         return size;
                   else
                         return sizeof(VALU_instruction);
+            }
+
+            Temp
+            load_scratch_resource(Program* program, Builder& bld, unsigned resume_idx,
+                                  bool apply_scratch_offset)
+            {
+                  if (program->static_scratch_rsrc != Temp()) {
+                        /* We can't apply any offsets when using a static resource. */
+                        assert(!apply_scratch_offset || program->scratch_offsets.empty());
+                        return program->static_scratch_rsrc;
+                  }
+                  Temp private_segment_buffer;
+                  if (!program->private_segment_buffers.empty())
+                        private_segment_buffer = program->private_segment_buffers[resume_idx];
+                  if (!private_segment_buffer.bytes()) {
+                        Temp addr_lo =
+                        bld.sop1(aco_opcode::p_load_symbol, bld.def(s1), Operand::c32(aco_symbol_scratch_addr_lo));
+                        Temp addr_hi =
+                        bld.sop1(aco_opcode::p_load_symbol, bld.def(s1), Operand::c32(aco_symbol_scratch_addr_hi));
+                        private_segment_buffer =
+                        bld.pseudo(aco_opcode::p_create_vector, bld.def(s2), addr_lo, addr_hi);
+                  } else if (program->stage.hw != AC_HW_COMPUTE_SHADER) {
+                        private_segment_buffer =
+                        bld.smem(aco_opcode::s_load_dwordx2, bld.def(s2), private_segment_buffer, Operand::zero());
+                  }
+
+                  if (apply_scratch_offset && !program->scratch_offsets.empty()) {
+                        Temp addr_lo = bld.tmp(s1);
+                        Temp addr_hi = bld.tmp(s1);
+                        bld.pseudo(aco_opcode::p_split_vector, Definition(addr_lo), Definition(addr_hi),
+                                   private_segment_buffer);
+
+                        Temp carry = bld.tmp(s1);
+                        Temp scratch_offset = program->scratch_offsets[resume_idx];
+                        addr_lo = bld.sop2(aco_opcode::s_add_u32, bld.def(s1), bld.scc(Definition(carry)), addr_lo,
+                                           scratch_offset);
+                        addr_hi = bld.sop2(aco_opcode::s_addc_u32, bld.def(s1), bld.def(s1, scc), addr_hi,
+                                           Operand::c32(0), bld.scc(carry));
+
+                        private_segment_buffer =
+                        bld.pseudo(aco_opcode::p_create_vector, bld.def(s2), addr_lo, addr_hi);
+                  }
+
+                  struct ac_buffer_state ac_state = {0};
+                  uint32_t desc[4];
+
+                  ac_state.size = 0xffffffff;
+                  ac_state.format = PIPE_FORMAT_R32_FLOAT;
+                  for (int i = 0; i < 4; i++)
+                        ac_state.swizzle[i] = PIPE_SWIZZLE_0;
+                  /* older generations need element size = 4 bytes. element size removed in GFX9 */
+                  ac_state.element_size = program->gfx_level <= GFX8 ? 1u : 0u;
+                  ac_state.index_stride = program->wave_size == 64 ? 3u : 2u;
+                  ac_state.add_tid = true;
+                  ac_state.gfx10_oob_select = V_008F0C_OOB_SELECT_RAW;
+
+                  ac_build_buffer_descriptor(program->gfx_level, &ac_state, desc);
+
+                  return bld.pseudo(aco_opcode::p_create_vector, bld.def(s4), private_segment_buffer,
+                                    Operand::c32(desc[2]), Operand::c32(desc[3]));
             }
 
             Instruction*

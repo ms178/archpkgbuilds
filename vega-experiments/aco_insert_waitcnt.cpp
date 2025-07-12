@@ -9,11 +9,11 @@
 
 #include "common/sid.h"
 
+#include <array>
 #include <map>
+#include <optional>
 #include <stack>
 #include <vector>
-#include <optional>
-#include <array>
 
 namespace aco {
 
@@ -46,17 +46,16 @@ namespace aco {
                   event_gds = 1 << 2,
                   event_vmem = 1 << 3,
                   event_vmem_store = 1 << 4, /* GFX10+ */
-                  event_flat = 1 << 5,
-                  event_exp_pos = 1 << 6,
-                  event_exp_param = 1 << 7,
-                  event_exp_mrt_null = 1 << 8,
-                  event_gds_gpr_lock = 1 << 9,
-                  event_vmem_gpr_lock = 1 << 10,
-                  event_sendmsg = 1 << 11,
-                  event_ldsdir = 1 << 12,
-                  event_vmem_sample = 1 << 13, /* GFX12+ */
-                  event_vmem_bvh = 1 << 14,    /* GFX12+ */
-                  num_events = 15,
+                  event_exp_pos = 1 << 5,
+                  event_exp_param = 1 << 6,
+                  event_exp_mrt_null = 1 << 7,
+                  event_gds_gpr_lock = 1 << 8,
+                  event_vmem_gpr_lock = 1 << 9,
+                  event_sendmsg = 1 << 10,
+                  event_ldsdir = 1 << 11,
+                  event_vmem_sample = 1 << 12, /* GFX12+ */
+                  event_vmem_bvh = 1 << 13,    /* GFX12+ */
+                  num_events = 14,
             };
 
             enum counter_type : uint8_t {
@@ -72,9 +71,9 @@ namespace aco {
 
             struct wait_entry {
                   wait_imm imm;
-                  uint32_t events;  /* use wait_event notion */
+                  uint32_t events;       /* use wait_event notion */
                   uint32_t logical_events; /* use wait_event notion */
-                  uint8_t counters; /* use counter_type notion */
+                  uint8_t counters;     /* use counter_type notion */
                   bool wait_on_read : 1;
                   uint8_t vmem_types : 4; /* use vmem_type notion. for counter_vm. */
                   uint8_t vm_mask : 2;    /* which halves of the VGPR event_vmem uses */
@@ -84,7 +83,8 @@ namespace aco {
                   wait_on_read(wait_on_read_), vmem_types(0), vm_mask(0)
                   {}
 
-                  bool join(const wait_entry& other)
+                  bool
+                  join(const wait_entry& other)
                   {
                         bool changed = (other.events & ~events) || (other.counters & ~counters) ||
                         (other.wait_on_read && !wait_on_read) || (other.vmem_types & ~vmem_types) ||
@@ -98,14 +98,13 @@ namespace aco {
                         return changed;
                   }
 
-                  void remove_wait(wait_type type, uint32_t type_events)
+                  void
+                  remove_wait(wait_type type, uint32_t type_events)
                   {
                         counters &= ~(1 << type);
                         imm[type] = wait_imm::unset_counter;
 
-                        events &= ~type_events | event_flat;
-                        if (!(counters & counter_lgkm) && !(counters & counter_vm))
-                              events &= ~(type_events & event_flat);
+                        events &= ~type_events;
 
                         logical_events &= events;
                         if (type == wait_type_vm)
@@ -114,7 +113,8 @@ namespace aco {
                               vm_mask = 0;
                   }
 
-                  UNUSED void print(FILE* output) const
+                  UNUSED void
+                  print(FILE* output) const
                   {
                         imm.print(output);
                         if (events)
@@ -145,8 +145,8 @@ namespace aco {
 
                         events[wait_type_exp] = event_exp_pos | event_exp_param | event_exp_mrt_null |
                         event_gds_gpr_lock | event_vmem_gpr_lock | event_ldsdir;
-                        events[wait_type_lgkm] = event_smem | event_lds | event_gds | event_flat | event_sendmsg;
-                        events[wait_type_vm] = event_vmem | event_flat;
+                        events[wait_type_lgkm] = event_smem | event_lds | event_gds | event_sendmsg;
+                        events[wait_type_vm] = event_vmem;
                         events[wait_type_vs] = event_vmem_store;
                         if (gfx_level >= GFX12) {
                               events[wait_type_sample] = event_vmem_sample;
@@ -156,14 +156,18 @@ namespace aco {
                         }
 
                         for (unsigned i = 0; i < wait_type_num; i++) {
-                              u_foreach_bit (j, events[i])
+                              u_foreach_bit(j, events[i])
                               counters[j] |= (1 << i);
                         }
 
-                        unordered_events = event_smem | (gfx_level < GFX10 ? event_flat : 0);
+                        unordered_events = event_smem;
                   }
 
-                  uint8_t get_counters_for_event(wait_event event) const { return counters[ffs(event) - 1]; }
+                  uint8_t
+                  get_counters_for_event(wait_event event) const
+                  {
+                        return counters[ffs(event) - 1];
+                  }
 
             private:
                   /* Bitfields of counters affected by each event */
@@ -190,7 +194,8 @@ namespace aco {
                   : program(program_), gfx_level(program_->gfx_level), info(info_)
                   {}
 
-                  bool join(const wait_ctx* other, bool logical, bool logical_merge)
+                  bool
+                  join(const wait_ctx* other, bool logical, bool logical_merge)
                   {
                         bool changed = (other->pending_flat_lgkm && !pending_flat_lgkm) ||
                         (other->pending_flat_vm && !pending_flat_vm) || (~nonzero & other->nonzero);
@@ -233,7 +238,8 @@ namespace aco {
                         return changed;
                   }
 
-                  UNUSED void print(FILE* output) const
+                  UNUSED void
+                  print(FILE* output) const
                   {
                         for (unsigned i = 0; i < wait_type_num; i++)
                               fprintf(output, "nonzero[%u]: %u\n", i, nonzero & (1 << i) ? 1 : 0);
@@ -274,53 +280,58 @@ namespace aco {
                   constexpr uint32_t full_mask = 0xffffffffu;
 
                   /* default: full_mask; specialisations override */
-                  template <aco_opcode Op> struct mask_val { static constexpr uint32_t v = full_mask; };
+                  template <aco_opcode Op>
+                  struct mask_val {
+                        static constexpr uint32_t v = full_mask;
+                  };
 
-                  #define MAP(OP, M)  template <> struct mask_val<aco_opcode::OP> {              \
-                  static constexpr uint32_t v = M;                        \
+                  #define MAP(OP, M)                                                                                 \
+                  template <>                                                                                     \
+                  struct mask_val<aco_opcode::OP> {                                                               \
+                        static constexpr uint32_t v = M;                                                             \
                   }
 
                   /* 16-bit: lower half ----------------------------------------------------- */
-                  MAP(buffer_load_format_d16_x,        0x1);
-                  MAP(buffer_load_ubyte_d16,           0x1);
-                  MAP(buffer_load_sbyte_d16,           0x1);
-                  MAP(buffer_load_short_d16,           0x1);
-                  MAP(tbuffer_load_format_d16_x,       0x1);
-                  MAP(flat_load_ubyte_d16,             0x1);
-                  MAP(flat_load_sbyte_d16,             0x1);
-                  MAP(flat_load_short_d16,             0x1);
-                  MAP(global_load_ubyte_d16,           0x1);
-                  MAP(global_load_sbyte_d16,           0x1);
-                  MAP(global_load_short_d16,           0x1);
-                  MAP(scratch_load_ubyte_d16,          0x1);
-                  MAP(scratch_load_sbyte_d16,          0x1);
-                  MAP(scratch_load_short_d16,          0x1);
+                  MAP(buffer_load_format_d16_x, 0x1);
+                  MAP(buffer_load_ubyte_d16, 0x1);
+                  MAP(buffer_load_sbyte_d16, 0x1);
+                  MAP(buffer_load_short_d16, 0x1);
+                  MAP(tbuffer_load_format_d16_x, 0x1);
+                  MAP(flat_load_ubyte_d16, 0x1);
+                  MAP(flat_load_sbyte_d16, 0x1);
+                  MAP(flat_load_short_d16, 0x1);
+                  MAP(global_load_ubyte_d16, 0x1);
+                  MAP(global_load_sbyte_d16, 0x1);
+                  MAP(global_load_short_d16, 0x1);
+                  MAP(scratch_load_ubyte_d16, 0x1);
+                  MAP(scratch_load_sbyte_d16, 0x1);
+                  MAP(scratch_load_short_d16, 0x1);
 
                   /* 16-bit: upper half ----------------------------------------------------- */
-                  MAP(buffer_load_format_d16_hi_x,     0x2);
-                  MAP(buffer_load_ubyte_d16_hi,        0x2);
-                  MAP(buffer_load_sbyte_d16_hi,        0x2);
-                  MAP(buffer_load_short_d16_hi,        0x2);
-                  MAP(flat_load_ubyte_d16_hi,          0x2);
-                  MAP(flat_load_sbyte_d16_hi,          0x2);
-                  MAP(flat_load_short_d16_hi,          0x2);
-                  MAP(global_load_ubyte_d16_hi,        0x2);
-                  MAP(global_load_sbyte_d16_hi,        0x2);
-                  MAP(global_load_short_d16_hi,        0x2);
-                  MAP(scratch_load_ubyte_d16_hi,       0x2);
-                  MAP(scratch_load_sbyte_d16_hi,       0x2);
-                  MAP(scratch_load_short_d16_hi,       0x2);
+                  MAP(buffer_load_format_d16_hi_x, 0x2);
+                  MAP(buffer_load_ubyte_d16_hi, 0x2);
+                  MAP(buffer_load_sbyte_d16_hi, 0x2);
+                  MAP(buffer_load_short_d16_hi, 0x2);
+                  MAP(flat_load_ubyte_d16_hi, 0x2);
+                  MAP(flat_load_sbyte_d16_hi, 0x2);
+                  MAP(flat_load_short_d16_hi, 0x2);
+                  MAP(global_load_ubyte_d16_hi, 0x2);
+                  MAP(global_load_sbyte_d16_hi, 0x2);
+                  MAP(global_load_short_d16_hi, 0x2);
+                  MAP(scratch_load_ubyte_d16_hi, 0x2);
+                  MAP(scratch_load_sbyte_d16_hi, 0x2);
+                  MAP(scratch_load_short_d16_hi, 0x2);
 
                   /* 16-bit RGB ------------------------------------------------------------- */
-                  MAP(buffer_load_format_d16_xyz,      0x7);
-                  MAP(tbuffer_load_format_d16_xyz,     0x7);
+                  MAP(buffer_load_format_d16_xyz, 0x7);
+                  MAP(tbuffer_load_format_d16_xyz, 0x7);
                   #undef MAP
 
                   template <std::size_t... I>
                   constexpr std::array<uint32_t, static_cast<std::size_t>(aco_opcode::num_opcodes)>
                   build_mask_tbl(std::index_sequence<I...>)
                   {
-                        return { mask_val<static_cast<aco_opcode>(I)>::v... };
+                        return {mask_val<static_cast<aco_opcode>(I)>::v...};
                   }
 
                   constexpr auto vmem_mask_tbl =
@@ -348,16 +359,16 @@ namespace aco {
                          */
                         if (ctx.gfx_level >= GFX11) {
                               uint32_t ds_vmem_events =
-                              event_lds | event_gds | event_vmem | event_vmem_sample | event_vmem_bvh | event_flat;
+                              event_lds | event_gds | event_vmem | event_vmem_sample | event_vmem_bvh;
                               events |= ds_vmem_events;
                         }
 
                         uint32_t counters = 0;
-                        u_foreach_bit (i, entry.events & events)
+                        u_foreach_bit(i, entry.events & events)
                         counters |= ctx.info->get_counters_for_event((wait_event)(1 << i));
 
                         wait_imm imm;
-                        u_foreach_bit (i, entry.counters & counters)
+                        u_foreach_bit(i, entry.counters & counters)
                         imm[i] = entry.imm[i];
 
                         return imm;
@@ -370,14 +381,16 @@ namespace aco {
             check_instr(wait_ctx& ctx, wait_imm& wait, Instruction* instr)
             {
                   for (const Operand op : instr->operands) {
-                        if (op.isConstant() || op.isUndefined())
+                        if (op.isConstant() || op.isUndefined()) {
                               continue;
+                        }
 
                         /* check consecutively read gprs */
                         for (unsigned j = 0; j < op.size(); j++) {
                               std::map<PhysReg, wait_entry>::iterator it = ctx.gpr_map.find(PhysReg{op.physReg() + j});
-                              if (it != ctx.gpr_map.end() && it->second.wait_on_read)
+                              if (it != ctx.gpr_map.end() && it->second.wait_on_read) {
                                     wait.combine(get_imm(ctx, PhysReg{op.physReg() + j}, it->second));
+                              }
                         }
                   }
 
@@ -387,8 +400,9 @@ namespace aco {
                               PhysReg reg{def.physReg() + j};
 
                               std::map<PhysReg, wait_entry>::iterator it = ctx.gpr_map.find(reg);
-                              if (it == ctx.gpr_map.end())
+                              if (it == ctx.gpr_map.end()) {
                                     continue;
+                              }
 
                               wait_imm reg_imm = get_imm(ctx, reg, it->second);
 
@@ -416,16 +430,18 @@ namespace aco {
                                     bool different_lanes = (it->second.logical_events & ctx.info->events[type]) == 0;
 
                                     if ((event_matches && type_matches && ctx.gfx_level < GFX12) || different_halves ||
-                                          different_lanes)
+                                          different_lanes) {
                                           reg_imm[type] = wait_imm::unset_counter;
+                                          }
                               }
 
                               /* LDS reads and writes return in the order they were issued. same for GDS */
                               if (instr->isDS() && (it->second.events & ctx.info->events[wait_type_lgkm]) ==
-                                    (instr->ds().gds ? event_gds : event_lds))
+                                    (instr->ds().gds ? event_gds : event_lds)) {
                                     reg_imm.lgkm = wait_imm::unset_counter;
+                                    }
 
-                              wait.combine(reg_imm);
+                                    wait.combine(reg_imm);
                         }
                   }
             }
@@ -444,16 +460,21 @@ namespace aco {
                               sync_scope bar_scope_lds = MIN2(sync.scope, scope_workgroup);
 
                               uint16_t events = ctx.barrier_events[idx];
-                              if (bar_scope_lds <= subgroup_scope)
+                              if (bar_scope_lds <= subgroup_scope) {
                                     events &= ~event_lds;
+                              }
 
-                              /* Until GFX11, in non-WGP, the L1 (L0 on GFX10+) cache keeps all memory operations
-                               * in-order for the same workgroup */
-                              if (ctx.gfx_level < GFX11 && !ctx.program->wgp_mode && sync.scope <= scope_workgroup)
+                              /* On GFX9 (and GFX10), in non-WGP mode, the L1 cache keeps all memory operations
+                               * in-order for the same workgroup. We can safely elide waits at a workgroup
+                               * barrier because the hardware already guarantees the necessary ordering.
+                               */
+                              if (ctx.gfx_level < GFX11 && !ctx.program->wgp_mode && sync.scope <= scope_workgroup) {
                                     events &= ~(event_vmem | event_vmem_store | event_smem);
+                              }
 
-                              if (events)
+                              if (events) {
                                     imm.combine(ctx.barrier_imm[idx]);
+                              }
                         }
                   }
             }
@@ -461,7 +482,7 @@ namespace aco {
             void
             force_waitcnt(wait_ctx& ctx, wait_imm& imm)
             {
-                  u_foreach_bit (i, ctx.nonzero)
+                  u_foreach_bit(i, ctx.nonzero)
                   imm[i] = 0;
             }
 
@@ -500,7 +521,7 @@ namespace aco {
                         if (ctx.program->has_smem_buffer_or_global_loads)
                               c |= counter_lgkm;
 
-                              u_foreach_bit (i, c & ctx.nonzero)
+                              u_foreach_bit(i, c & ctx.nonzero)
                               imm[i] = 0;
                               }
 
@@ -532,55 +553,58 @@ namespace aco {
                               imm.combine(ctx.barrier_imm[ffs(storage_gds) - 1]);
                               }
 
-                              if (instr->opcode == aco_opcode::p_barrier)
+                              if (instr->opcode == aco_opcode::p_barrier) {
                                     perform_barrier(ctx, imm, instr->barrier().sync, semantic_acqrel);
-                  else
-                        perform_barrier(ctx, imm, sync_info, semantic_release);
+                              } else {
+                                    perform_barrier(ctx, imm, sync_info, semantic_release);
+                              }
 
-                  if (!imm.empty()) {
-                        if (ctx.pending_flat_vm && imm.vm != wait_imm::unset_counter)
-                              imm.vm = 0;
-                        if (ctx.pending_flat_lgkm && imm.lgkm != wait_imm::unset_counter)
-                              imm.lgkm = 0;
+                              if (!imm.empty()) {
+                                    if (ctx.pending_flat_vm && imm.vm != wait_imm::unset_counter)
+                                          imm.vm = 0;
+                                    if (ctx.pending_flat_lgkm && imm.lgkm != wait_imm::unset_counter)
+                                          imm.lgkm = 0;
 
-                        /* reset counters */
-                        for (unsigned i = 0; i < wait_type_num; i++)
-                              ctx.nonzero &= imm[i] == 0 ? ~BITFIELD_BIT(i) : UINT32_MAX;
+                                    /* reset counters */
+                                    for (unsigned i = 0; i < wait_type_num; i++) {
+                                          ctx.nonzero &= imm[i] == 0 ? ~BITFIELD_BIT(i) : UINT32_MAX;
+                                    }
 
-                        /* update barrier wait imms */
-                        for (unsigned i = 0; i < storage_count; i++) {
-                              wait_imm& bar = ctx.barrier_imm[i];
-                              uint16_t& bar_ev = ctx.barrier_events[i];
-                              for (unsigned j = 0; j < wait_type_num; j++) {
-                                    if (bar[j] != wait_imm::unset_counter && imm[j] <= bar[j]) {
-                                          bar[j] = wait_imm::unset_counter;
-                                          bar_ev &= ~ctx.info->events[j] | event_flat;
+                                    /* update barrier wait imms */
+                                    for (unsigned i = 0; i < storage_count; i++) {
+                                          wait_imm& bar = ctx.barrier_imm[i];
+                                          uint16_t& bar_ev = ctx.barrier_events[i];
+                                          for (unsigned j = 0; j < wait_type_num; j++) {
+                                                if (bar[j] != wait_imm::unset_counter && imm[j] <= bar[j]) {
+                                                      bar[j] = wait_imm::unset_counter;
+                                                      bar_ev &= ~ctx.info->events[j];
+                                                }
+                                          }
+                                    }
+
+                                    /* remove all gprs with higher counter from map */
+                                    std::map<PhysReg, wait_entry>::iterator it = ctx.gpr_map.begin();
+                                    while (it != ctx.gpr_map.end()) {
+                                          for (unsigned i = 0; i < wait_type_num; i++) {
+                                                if (imm[i] != wait_imm::unset_counter && imm[i] <= it->second.imm[i]) {
+                                                      it->second.remove_wait((wait_type)i, ctx.info->events[i]);
+                                                }
+                                          }
+                                          if (!it->second.counters) {
+                                                it = ctx.gpr_map.erase(it);
+                                          } else {
+                                                it++;
+                                          }
                                     }
                               }
-                              if (bar.vm == wait_imm::unset_counter && bar.lgkm == wait_imm::unset_counter)
-                                    bar_ev &= ~event_flat;
-                        }
 
-                        /* remove all gprs with higher counter from map */
-                        std::map<PhysReg, wait_entry>::iterator it = ctx.gpr_map.begin();
-                        while (it != ctx.gpr_map.end()) {
-                              for (unsigned i = 0; i < wait_type_num; i++) {
-                                    if (imm[i] != wait_imm::unset_counter && imm[i] <= it->second.imm[i])
-                                          it->second.remove_wait((wait_type)i, ctx.info->events[i]);
+                              if (imm.vm == 0) {
+                                    ctx.pending_flat_vm = false;
                               }
-                              if (!it->second.counters)
-                                    it = ctx.gpr_map.erase(it);
-                              else
-                                    it++;
-                        }
-                  }
-
-                  if (imm.vm == 0)
-                        ctx.pending_flat_vm = false;
-                  if (imm.lgkm == 0) {
-                        ctx.pending_flat_lgkm = false;
-                        ctx.pending_s_buffer_store = false;
-                  }
+                              if (imm.lgkm == 0) {
+                                    ctx.pending_flat_lgkm = false;
+                                    ctx.pending_s_buffer_store = false;
+                              }
             }
 
             void
@@ -595,10 +619,11 @@ namespace aco {
 
                         if (sync.storage & (1 << i) && (!(sync.semantics & semantic_private) || ignore_private)) {
                               bar_ev |= event;
-                              u_foreach_bit (j, counters)
+                              u_foreach_bit(j, counters)
                               bar[j] = 0;
                         } else if (!(bar_ev & ctx.info->unordered_events) && !(ctx.info->unordered_events & event)) {
-                              u_foreach_bit (j, counters) {
+                              u_foreach_bit(j, counters)
+                              {
                                     if (bar[j] != wait_imm::unset_counter && (bar_ev & ctx.info->events[j]) == event)
                                           bar[j] = std::min<uint16_t>(bar[j] + 1, ctx.info->max_cnt[j]);
                               }
@@ -618,11 +643,6 @@ namespace aco {
                   if (ctx.info->unordered_events & event)
                         return;
 
-                  if (ctx.pending_flat_lgkm)
-                        counters &= ~counter_lgkm;
-                  if (ctx.pending_flat_vm)
-                        counters &= ~counter_vm;
-
                   for (std::pair<const PhysReg, wait_entry>& e : ctx.gpr_map) {
                         wait_entry& entry = e.second;
 
@@ -631,50 +651,12 @@ namespace aco {
 
                         assert(entry.events);
 
-                        u_foreach_bit (i, counters) {
+                        u_foreach_bit(i, counters)
+                        {
                               if ((entry.events & ctx.info->events[i]) == event)
                                     entry.imm[i] = std::min<uint16_t>(entry.imm[i] + 1, ctx.info->max_cnt[i]);
                         }
                   }
-            }
-
-            /* Vega (GFX8/9) FLAT load/store counter handling.
-             *
-             *  – For FLAT loads, only VM_CNT is relevant *unless* the program uses LDS.
-             *  – For FLAT stores, both VM_CNT and LGKM_CNT are required because the
-             *    hardware path is ambiguous at compile time.
-             *  – If the program doesn’t allocate LDS at all (config->lds_size == 0), we can
-             *    safely drop LGKM waits for loads, saving up to 15 wait states.
-             *
-             * This function is called only when gfx_level < GFX10 and the instruction
-             * has at least one definition (i.e., a load).
-             */
-            static void
-            update_counters_for_flat_load(wait_ctx& ctx, memory_sync_info sync = {})
-            {
-                  assert(ctx.gfx_level < GFX10);
-
-                  /* A FLAT store has no definitions. A load always does.
-                   * This function is only called for loads due to the check at the call-site.
-                   */
-                  const bool is_store = false;
-
-                  /* Decide which counters must be aged */
-                  uint8_t needed = counter_vm; /* Always track VM_CNT for the texture cache path */
-                  if (is_store || ctx.program->config->lds_size) /* LDS path possible? */
-                        needed |= counter_lgkm;                 /* Also track LGKM_CNT for the LDS path */
-
-                        ctx.nonzero |= needed;
-                  update_barrier_imm(ctx, needed, event_flat, sync);
-
-                  /* Zero out the chosen counter(s) for every live wait_entry */
-                  for (auto& [_, entry] : ctx.gpr_map) {
-                        if ((needed & counter_vm)   && (entry.counters & counter_vm))   entry.imm.vm   = 0;
-                        if ((needed & counter_lgkm) && (entry.counters & counter_lgkm)) entry.imm.lgkm = 0;
-                  }
-
-                  ctx.pending_flat_vm   = needed & counter_vm;
-                  ctx.pending_flat_lgkm = needed & counter_lgkm;
             }
 
             void
@@ -683,7 +665,7 @@ namespace aco {
             {
                   uint16_t counters = ctx.info->get_counters_for_event(event);
                   wait_imm imm;
-                  u_foreach_bit (i, counters)
+                  u_foreach_bit(i, counters)
                   imm[i] = 0;
 
                   wait_entry new_entry(event, imm, counters, wait_on_read);
@@ -723,12 +705,13 @@ namespace aco {
                               Export_instruction& exp_instr = instr->exp();
 
                               wait_event ev;
-                              if (exp_instr.dest <= 9)
+                              if (exp_instr.dest <= 9) {
                                     ev = event_exp_mrt_null;
-                              else if (exp_instr.dest <= 15)
+                              } else if (exp_instr.dest <= 15) {
                                     ev = event_exp_pos;
-                              else
+                              } else {
                                     ev = event_exp_param;
+                              }
                               update_counters(ctx, ev);
 
                               /* insert new entries for exported vgprs */
@@ -744,38 +727,63 @@ namespace aco {
                         }
                         case Format::FLAT: {
                               FLAT_instruction& flat = instr->flat();
-                              if (ctx.gfx_level < GFX10 && !instr->definitions.empty())
-                                    update_counters_for_flat_load(ctx, flat.sync);
-                              else
-                                    update_counters(ctx, event_flat, flat.sync);
+                              wait_event vmem_ev = get_vmem_event(ctx, instr, vmem_nosampler);
+                              bool may_use_lds = flat.may_use_lds;
 
-                              if (!instr->definitions.empty())
-                                    insert_wait_entry(ctx, instr->definitions[0], event_flat);
+                              // On GFX9, a FLAT instruction can go to either LDS or the texture cache (VMEM).
+                              // It must therefore increment both counters. However, if the program allocates
+                              // no LDS memory, it's impossible for it to use the LDS path.
+                              if (ctx.program->config->lds_size == 0) {
+                                    may_use_lds = false;
+                              }
+
+                              // Always update VMEM counters for the texture cache path.
+                              update_counters(ctx, vmem_ev, flat.sync);
+                              if (may_use_lds) {
+                                    update_counters(ctx, event_lds, flat.sync);
+                              }
+
+                              if (!instr->definitions.empty()) {
+                                    insert_wait_entry(ctx, instr->definitions[0], vmem_ev, 0, get_vmem_mask(ctx, instr));
+                                    if (may_use_lds) {
+                                          insert_wait_entry(ctx, instr->definitions[0], event_lds);
+                                    }
+                              }
+
+                              // GFX9-specific: A FLAT load forces subsequent waits for both counters to be 0.
+                              if (ctx.gfx_level < GFX10 && !instr->definitions.empty() && may_use_lds) {
+                                    ctx.pending_flat_lgkm = true;
+                                    ctx.pending_flat_vm = true;
+                              }
                               break;
                         }
                         case Format::SMEM: {
                               SMEM_instruction& smem = instr->smem();
                               update_counters(ctx, event_smem, smem.sync);
 
-                              if (!instr->definitions.empty())
+                              if (!instr->definitions.empty()) {
                                     insert_wait_entry(ctx, instr->definitions[0], event_smem);
-                              else if (ctx.gfx_level >= GFX10 && !smem.sync.can_reorder())
+                              } else if (ctx.gfx_level >= GFX10 && !smem.sync.can_reorder()) {
                                     ctx.pending_s_buffer_store = true;
+                              }
 
                               break;
                         }
                         case Format::DS: {
                               DS_instruction& ds = instr->ds();
                               update_counters(ctx, ds.gds ? event_gds : event_lds, ds.sync);
-                              if (ds.gds)
+                              if (ds.gds) {
                                     update_counters(ctx, event_gds_gpr_lock);
+                              }
 
-                              if (!instr->definitions.empty())
+                              if (!instr->definitions.empty()) {
                                     insert_wait_entry(ctx, instr->definitions[0], ds.gds ? event_gds : event_lds);
+                              }
 
                               if (ds.gds) {
-                                    for (const Operand& op : instr->operands)
+                                    for (const Operand& op : instr->operands) {
                                           insert_wait_entry(ctx, op, event_gds_gpr_lock);
+                                    }
                                     insert_wait_entry(ctx, exec, s2, event_gds_gpr_lock, false);
                               }
                               break;
@@ -797,8 +805,9 @@ namespace aco {
 
                               update_counters(ctx, ev, get_sync_info(instr));
 
-                              for (auto& definition : instr->definitions)
+                              for (auto& definition : instr->definitions) {
                                     insert_wait_entry(ctx, definition, ev, type, mask);
+                              }
 
                               if (ctx.gfx_level == GFX6 && instr->format != Format::MIMG && instr->operands.size() == 4) {
                                     update_counters(ctx, event_vmem_gpr_lock);
@@ -811,8 +820,9 @@ namespace aco {
                               break;
                         }
                         case Format::SOPP: {
-                              if (instr->opcode == aco_opcode::s_sendmsg || instr->opcode == aco_opcode::s_sendmsghalt)
+                              if (instr->opcode == aco_opcode::s_sendmsg || instr->opcode == aco_opcode::s_sendmsghalt) {
                                     update_counters(ctx, event_sendmsg);
+                              }
                               break;
                         }
                         case Format::SOP1: {
@@ -823,7 +833,8 @@ namespace aco {
                                     }
                                     break;
                         }
-                        default: break;
+                        default:
+                              break;
                   }
             }
 
@@ -858,6 +869,7 @@ namespace aco {
             handle_block(Program* program, Block& block, wait_ctx& ctx)
             {
                   std::vector<aco_ptr<Instruction>> new_instructions;
+                  new_instructions.reserve(block.instructions.size());
 
                   wait_imm queued_imm;
 
@@ -877,16 +889,18 @@ namespace aco {
                               std::optional<std::bitset<512>> regs_written;
                               for (clause_end = i + 1; clause_end < block.instructions.size(); clause_end++) {
                                     Instruction* next = block.instructions[clause_end].get();
-                                    if (!should_form_clause(instr.get(), next))
+                                    if (!should_form_clause(instr.get(), next)) {
                                           break;
+                                    }
 
                                     if (!regs_written) {
                                           regs_written.emplace();
                                           check_clause_raw(*regs_written, instr.get());
                                     }
 
-                                    if (!check_clause_raw(*regs_written, next))
+                                    if (!check_clause_raw(*regs_written, next)) {
                                           break;
+                                    }
 
                                     kill(queued_imm, next, ctx, get_sync_info(next));
                               }
@@ -895,13 +909,16 @@ namespace aco {
                         gen(instr.get(), ctx);
 
                         if (instr->format != Format::PSEUDO_BARRIER && !is_wait) {
+                              // Optimization: Fold a pending s_waitcnt expcnt(N) into the v_interp instruction.
+                              // This avoids a pipeline stall by using the instruction's own wait mechanism.
                               if (instr->isVINTERP_INREG() && queued_imm.exp != wait_imm::unset_counter) {
                                     instr->vinterp_inreg().wait_exp = MIN2(instr->vinterp_inreg().wait_exp, queued_imm.exp);
-                                    queued_imm.exp = wait_imm::unset_counter;
+                                    queued_imm.exp = wait_imm::unset_counter; // The wait is now handled by the instruction.
                               }
 
-                              if (!queued_imm.empty())
+                              if (!queued_imm.empty()) {
                                     emit_waitcnt(ctx, new_instructions, queued_imm);
+                              }
 
                               bool is_ordered_count_acquire =
                               instr->opcode == aco_opcode::ds_ordered_count &&
@@ -910,19 +927,22 @@ namespace aco {
                               new_instructions.emplace_back(std::move(instr));
                               perform_barrier(ctx, queued_imm, sync_info, semantic_acquire);
 
-                              if (is_ordered_count_acquire)
+                              if (is_ordered_count_acquire) {
                                     queued_imm.combine(ctx.barrier_imm[ffs(storage_gds) - 1]);
+                              }
                         }
                   }
 
                   /* For last block of a program which has succeed shader part, wait all memory ops done
                    * before go to next shader part.
                    */
-                  if (block.kind & block_kind_end_with_regs)
+                  if (block.kind & block_kind_end_with_regs) {
                         force_waitcnt(ctx, queued_imm);
+                  }
 
-                  if (!queued_imm.empty())
+                  if (!queued_imm.empty()) {
                         emit_waitcnt(ctx, new_instructions, queued_imm);
+                  }
 
                   block.instructions.swap(new_instructions);
             }
@@ -986,8 +1006,7 @@ namespace aco {
                   bool logical_merge =
                   current.logical_preds.size() > 1 &&
                   std::any_of(current.linear_preds.begin(), current.linear_preds.end(),
-                              [&](unsigned pred)
-                              {
+                              [&](unsigned pred) {
                                     return std::find(current.logical_preds.begin(), current.logical_preds.end(),
                                                      pred) == current.logical_preds.end();
                               });
