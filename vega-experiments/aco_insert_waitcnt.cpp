@@ -35,9 +35,6 @@ namespace aco {
              * - or erase gprs with counters higher than to be waited for.
              */
 
-            // TODO: do a more clever insertion of wait_cnt (lgkm_cnt)
-            // when there is a load followed by a use of a previous load
-
             /* Instructions of the same event will finish in-order except for smem
              * and maybe flat. Instructions of different events may not finish in-order. */
             enum wait_event : uint32_t {
@@ -730,14 +727,16 @@ namespace aco {
                               wait_event vmem_ev = get_vmem_event(ctx, instr, vmem_nosampler);
                               bool may_use_lds = flat.may_use_lds;
 
-                              // On GFX9, a FLAT instruction can go to either LDS or the texture cache (VMEM).
-                              // It must therefore increment both counters. However, if the program allocates
-                              // no LDS memory, it's impossible for it to use the LDS path.
+                              /* GFX9: A FLAT instruction can target either the LDS or the texture cache (VMEM).
+                               * It must therefore increment both LGKM and VM counters. The one exception is if
+                               * the program has not allocated any LDS space, in which case the LDS path is
+                               * impossible.
+                               */
                               if (ctx.program->config->lds_size == 0) {
                                     may_use_lds = false;
                               }
 
-                              // Always update VMEM counters for the texture cache path.
+                              /* Always update VMEM counters for the texture cache path. */
                               update_counters(ctx, vmem_ev, flat.sync);
                               if (may_use_lds) {
                                     update_counters(ctx, event_lds, flat.sync);
@@ -750,7 +749,9 @@ namespace aco {
                                     }
                               }
 
-                              // GFX9-specific: A FLAT load forces subsequent waits for both counters to be 0.
+                              /* GFX9-specific: A FLAT load forces subsequent waits for both counters to be 0 because
+                               * the return path is ambiguous.
+                               */
                               if (ctx.gfx_level < GFX10 && !instr->definitions.empty() && may_use_lds) {
                                     ctx.pending_flat_lgkm = true;
                                     ctx.pending_flat_vm = true;
