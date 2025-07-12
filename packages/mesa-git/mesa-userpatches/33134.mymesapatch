@@ -997,12 +997,266 @@ diff --git a/src/gallium/drivers/radeonsi/si_shader.c b/src/gallium/drivers/rade
 index 70704c87b46f0..43066bd34e85c 100644
 --- a/src/gallium/drivers/radeonsi/si_shader.c
 +++ b/src/gallium/drivers/radeonsi/si_shader.c
-@@ -1776,7 +1776,8 @@ static void run_late_optimization_and_lowering_passes(struct si_nir_shader_ctx *
-    /* This helps LLVM form VMEM clauses and thus get more GPU cache hits.
-     * 200 is tuned for Viewperf. It should be done last.
+@@ -426,12 +426,29 @@ static void calculate_needed_lds_size(st
+       shader->is_gs_copy_shader ? MESA_SHADER_VERTEX : shader->selector->stage;
+ 
+    if (sscreen->info.gfx_level >= GFX9 && stage <= MESA_SHADER_GEOMETRY &&
+-       (stage == MESA_SHADER_GEOMETRY || shader->key.ge.as_ngg)) {
+-      unsigned size_in_dw = shader->key.ge.as_ngg ? shader->ngg.info.esgs_lds_size
+-                                                  : shader->gs_info.esgs_lds_size;
+-
+-      if (stage == MESA_SHADER_GEOMETRY && shader->key.ge.as_ngg)
+-         size_in_dw += shader->ngg.info.ngg_out_lds_size;
++       (shader->key.ge.as_ngg || stage == MESA_SHADER_GEOMETRY)) {
++      unsigned size_in_dw = 0;
++      if (shader->key.ge.as_ngg) {
++         size_in_dw = shader->ngg.info.esgs_lds_size;
++         if (stage == MESA_SHADER_GEOMETRY) {
++            size_in_dw += shader->ngg.info.ngg_out_lds_size;
++         }
++      } else if (stage == MESA_SHADER_GEOMETRY) {
++         /*
++          * For legacy GS, calculate a tighter LDS size based on the number
++          * of invocations, not just the maximum possible vertex count.
++          * This is a significant occupancy win for GS with low invocation counts.
++          * The previous_stage_sel must be present for a separate GS part.
++          */
++         struct si_shader_selector *es_sel = shader->previous_stage_sel;
++         assert(es_sel);
++         ac_legacy_gs_compute_subgroup_info(shader->selector->info.base.gs.input_primitive,
++                                            shader->selector->info.base.gs.vertices_out,
++                                            shader->selector->info.base.gs.invocations,
++                                            es_sel->info.esgs_vertex_stride,
++                                            &shader->gs_info);
++         size_in_dw = shader->gs_info.esgs_lds_size;
++      }
+ 
+       shader->config.lds_size =
+          DIV_ROUND_UP(size_in_dw * 4, get_lds_granularity(sscreen, stage));
+@@ -443,8 +460,9 @@ static void calculate_needed_lds_size(st
+    }
+ 
+    /* Check that the LDS size is within hw limits. */
+-   assert(shader->config.lds_size * get_lds_granularity(sscreen, stage) <=
+-          (sscreen->info.gfx_level == GFX6 ? 32 : 64) * 1024);
++   unsigned lds_size_in_bytes = shader->config.lds_size * get_lds_granularity(sscreen, stage);
++   unsigned lds_hw_limit = (sscreen->info.gfx_level == GFX6 ? 32 : 64) * 1024;
++   assert(lds_size_in_bytes <= lds_hw_limit);
+ }
+ 
+ static int upload_binary_raw(struct si_screen *sscreen, struct si_shader *shader,
+@@ -599,39 +617,54 @@ out:
+    ac_rtld_close(&rtld_binary);
+ }
+ 
+-static void si_calculate_max_simd_waves(struct si_shader *shader)
++void si_calculate_max_simd_waves(struct si_shader *shader)
+ {
+    struct si_screen *sscreen = shader->selector->screen;
+    struct ac_shader_config *conf = &shader->config;
+-   unsigned lds_increment = get_lds_granularity(sscreen, shader->selector->stage);
++   gl_shader_stage stage = shader->selector->stage;
++   unsigned lds_increment = get_lds_granularity(sscreen, stage);
+    unsigned lds_per_wave = 0;
+    unsigned max_simd_waves;
+ 
+    max_simd_waves = sscreen->info.max_waves_per_simd;
+ 
+-   /* Compute LDS usage for PS. */
+-   switch (shader->selector->stage) {
+-   case MESA_SHADER_FRAGMENT:
+-      /* The minimum usage per wave is (num_inputs * 48). The maximum
+-       * usage is (num_inputs * 48 * 16).
+-       * We can get anything in between and it varies between waves.
+-       *
+-       * The 48 bytes per input for a single primitive is equal to
+-       * 4 bytes/component * 4 components/input * 3 points.
++   /* Compute LDS usage per wave. */
++   switch (stage) {
++   case MESA_SHADER_FRAGMENT: {
++      /*
++       * GFX9+ hardware interpolation for non-flat inputs uses LDS space.
++       * Instead of a pessimistic worst-case calculation, compute a more
++       * precise LDS size based on which inputs are actually interpolated.
++       * This is critical for occupancy. We iterate the final post-prolog
++       * list of PS inputs from the variant info.
+        *
+-       * Other stages don't know the size at compile time or don't
+-       * allocate LDS per wave, but instead they do it per thread group.
++       * Each non-flat interpolated input uses 48 bytes of LDS (a vec4's worth).
+        */
+-      lds_per_wave = conf->lds_size * lds_increment +
+-                     align(shader->info.num_ps_inputs * 48, lds_increment);
++      unsigned interp_lds_bytes = 0;
++      if (sscreen->info.gfx_level >= GFX9) {
++         for (unsigned i = 0; i < shader->info.num_ps_inputs; i++) {
++            if (shader->info.ps_inputs[i].interpolate != INTERP_MODE_FLAT) {
++               interp_lds_bytes += 48;
++            }
++         }
++      }
++      lds_per_wave = conf->lds_size * lds_increment + align(interp_lds_bytes, lds_increment);
+       break;
++   }
+    case MESA_SHADER_COMPUTE: {
+-         unsigned max_workgroup_size = si_get_max_workgroup_size(shader);
++      unsigned max_workgroup_size = si_get_max_workgroup_size(shader);
++      if (max_workgroup_size > shader->wave_size) {
+          lds_per_wave = (conf->lds_size * lds_increment) /
+                         DIV_ROUND_UP(max_workgroup_size, shader->wave_size);
++      } else {
++         lds_per_wave = conf->lds_size * lds_increment;
+       }
+       break;
+-   default:;
++   }
++   default: {
++      lds_per_wave = conf->lds_size * lds_increment;
++      break;
++   }
+    }
+ 
+    /* Compute the per-SIMD wave counts. */
+@@ -641,8 +674,9 @@ static void si_calculate_max_simd_waves(
+    }
+ 
+    if (conf->num_vgprs) {
+-      /* GFX 10.3 internally:
+-       * - aligns VGPRS to 16 for Wave32 and 8 for Wave64
++      /*
++       * GFX10.3 internally:
++       * - aligns VGPRs to 16 for Wave32 and 8 for Wave64
+        * - aligns LDS to 1024
+        *
+        * For shader-db stats, set num_vgprs that the hw actually uses.
+@@ -662,8 +696,9 @@ static void si_calculate_max_simd_waves(
+    }
+ 
+    unsigned max_lds_per_simd = sscreen->info.lds_size_per_workgroup / 4;
+-   if (lds_per_wave)
++   if (lds_per_wave > 0) {
+       max_simd_waves = MIN2(max_simd_waves, max_lds_per_simd / lds_per_wave);
++   }
+ 
+    shader->info.max_simd_waves = max_simd_waves;
+ }
+@@ -1490,10 +1525,42 @@ static void run_late_optimization_and_lo
+    nir_shader *nir = ctx->nir;
+    bool progress = false;
+ 
++   /*
++    * For compute shaders, if the workgroup size is guaranteed to be less than
++    * or equal to the wave size, all barriers are no-ops and can be removed.
++    * This is a safe optimization as si_get_max_workgroup_size gives us a
++    * guaranteed upper bound based on static shader properties.
++    */
++   if (nir->info.stage == MESA_SHADER_COMPUTE) {
++      if (si_get_max_workgroup_size(shader) <= shader->wave_size) {
++         bool removed_barriers = false;
++         nir_foreach_function_impl(impl, nir) {
++            nir_foreach_block(block, impl) {
++               nir_foreach_instr_safe(instr, block) {
++                  if (instr->type == nir_instr_type_intrinsic) {
++                     nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
++                     if (intrin->intrinsic == nir_intrinsic_barrier) {
++                        nir_instr_remove(instr);
++                        removed_barriers = true;
++                     }
++                  }
++               }
++            }
++            if (removed_barriers) {
++               nir_progress(true, impl, nir_metadata_control_flow);
++            }
++         }
++         if (removed_barriers) {
++            progress = true;
++         }
++      }
++   }
++
+    si_init_shader_args(shader, &ctx->args, &nir->info);
+ 
+-   if (nir->info.stage == MESA_SHADER_FRAGMENT)
++   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+       NIR_PASS(progress, nir, nir_lower_fragcoord_wtrans);
++   }
+ 
+    NIR_PASS(progress, nir, ac_nir_lower_tex,
+             &(ac_nir_lower_tex_options){
+@@ -1501,12 +1568,14 @@ static void run_late_optimization_and_lo
+                .lower_array_layer_round_even = !sel->screen->info.conformant_trunc_coord,
+             });
+ 
+-   if (nir->info.uses_resource_info_query)
++   if (nir->info.uses_resource_info_query) {
+       NIR_PASS(progress, nir, ac_nir_lower_resinfo, sel->screen->info.gfx_level);
++   }
+ 
+    /* This must be before si_nir_lower_resource. */
+-   if (!sel->screen->info.has_image_opcodes)
++   if (!sel->screen->info.has_image_opcodes) {
+       NIR_PASS(progress, nir, ac_nir_lower_image_opcodes);
++   }
+ 
+    /* LLVM does not work well with this, so is handled in llvm backend waterfall. */
+    if (nir->info.use_aco_amd && ctx->temp_info.has_non_uniform_tex_access) {
+@@ -1523,8 +1592,9 @@ static void run_late_optimization_and_lo
+        (nir->info.stage == MESA_SHADER_GEOMETRY && shader->key.ge.as_ngg)) &&
+       !shader->key.ge.as_ls && !shader->key.ge.as_es;
+ 
+-   if (nir->info.stage == MESA_SHADER_VERTEX)
++   if (nir->info.stage == MESA_SHADER_VERTEX) {
+       NIR_PASS(progress, nir, si_nir_lower_vs_inputs, shader, &ctx->args);
++   }
+ 
+    progress |= si_lower_io_to_mem(shader, nir);
+ 
+@@ -1667,12 +1737,14 @@ static void run_late_optimization_and_lo
+    NIR_PASS(progress, nir, ac_nir_lower_mem_access_bit_sizes,
+             sel->screen->info.gfx_level, !nir->info.use_aco_amd);
+ 
+-   if (nir->info.stage == MESA_SHADER_KERNEL)
++   if (nir->info.stage == MESA_SHADER_KERNEL) {
+       NIR_PASS(progress, nir, ac_nir_lower_global_access);
++   }
+ 
+    if (ac_nir_might_lower_bit_size(nir)) {
+-      if (sel->screen->info.gfx_level >= GFX8)
++      if (sel->screen->info.gfx_level >= GFX8) {
+          nir_divergence_analysis(nir);
++      }
+ 
+       NIR_PASS(progress, nir, nir_lower_bit_size, ac_nir_lower_bit_size_callback,
+                &sel->screen->info.gfx_level);
+@@ -1681,8 +1753,9 @@ static void run_late_optimization_and_lo
+    /* This must be after lowering resources to descriptor loads and before lowering intrinsics
+     * to args and lowering int64.
      */
--   NIR_PASS_V(nir, nir_group_loads, nir_group_same_resource_only, 200);
-+   NIR_PASS_V(nir, nir_group_loads, nir_group_all, 200);
+-   if (nir->info.use_aco_amd)
++   if (nir->info.use_aco_amd) {
+       progress |= ac_nir_optimize_uniform_atomics(nir);
++   }
+ 
+    NIR_PASS(progress, nir, nir_lower_int64);
+    NIR_PASS(progress, nir, si_nir_lower_abi, shader, &ctx->args);
+@@ -1727,10 +1800,17 @@ static void run_late_optimization_and_lo
+    /* This must be done after si_nir_late_opts() because it may generate vec const. */
+    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
+ 
+-   /* This helps LLVM form VMEM clauses and thus get more GPU cache hits.
+-    * 200 is tuned for Viewperf. It should be done last.
++   /*
++    * These final passes improve instruction scheduling for memory access.
++    * First, group all independent loads together to create larger contiguous
++    * blocks of loads. This is more aggressive than only grouping loads from
++    * the same resource.
++    * Second, reorder the loads within those blocks. Loads whose results are
++    * needed later are scheduled earlier, maximizing the latency-hiding
++    * window for the entire group. This is highly effective on GFX9+.
+     */
+-   NIR_PASS(_, nir, nir_group_loads, nir_group_same_resource_only, 200);
++   NIR_PASS(_, nir, nir_group_loads, nir_group_all, 200);
 +   NIR_PASS(_, nir, nir_reorder_adjacent_loads);
  }
  
