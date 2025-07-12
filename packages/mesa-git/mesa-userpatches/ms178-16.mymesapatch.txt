@@ -1,0 +1,789 @@
+--- a/src/compiler/nir/nir_search_helpers.h	2025-07-03 16:06:36.651695479 +0200
++++ b/src/compiler/nir/nir_search_helpers.h	2025-07-03 16:14:42.904633471 +0200
+@@ -32,66 +32,201 @@
+ #include "util/u_math.h"
+ #include "nir.h"
+ #include "nir_range_analysis.h"
++#include <stdbool.h>
++#include <stdint.h>
+ 
++#ifndef likely
++#  define likely(x)   __builtin_expect(!!(x), 1)
++#endif
++#ifndef unlikely
++#  define unlikely(x) __builtin_expect(!!(x), 0)
++#endif
++
++/* -------- Generic 8-bit literal (-16…64 or pow2 up to 0x4000) -------- */
++static inline bool
++is_imm_8bit(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
++            unsigned src, unsigned num_components, const uint8_t *swizzle)
++{
++      /* Validate source is constant */
++      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
++      if (unlikely(!cv))
++            return false;
++
++      /* Only 16 and 32-bit values can use inline constants on GFX9 */
++      unsigned bit_size = instr->src[src].src.ssa->bit_size;
++      if (bit_size != 16 && bit_size != 32)
++            return false;
++
++      /* Check each component */
++      for (unsigned i = 0; i < num_components; i++) {
++            /* Get value as signed integer for range checks */
++            int64_t val = nir_src_comp_as_int(instr->src[src].src, swizzle[i]);
++
++            /* Check if value fits in inline constant encoding:
++             * 1. Small integers [-16, 64]
++             * 2. Powers of 2 up to 0x4000 (16384)
++             * 3. Negative powers of 2 down to -0x4000
++             */
++            bool is_small_int = (val >= -16 && val <= 64);
++            bool is_pow2 = (val > 0 && val <= 0x4000 &&
++            util_is_power_of_two_or_zero64(val));
++            bool is_neg_pow2 = (val < 0 && val >= -0x4000 &&
++            util_is_power_of_two_or_zero64(-val));
++
++            if (!is_small_int && !is_pow2 && !is_neg_pow2)
++                  return false;
++      }
++
++      return true;
++}
++
++/**
++ * Check if a 16-bit float is 0.0 or 1.0
++ *
++ * These values can be encoded as inline constants on GFX9,
++ * saving a register and memory fetch.
++ */
+ static inline bool
+-is_pos_power_of_two(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
+-                    unsigned src, unsigned num_components,
+-                    const uint8_t *swizzle)
++is_imm_fp16_zero_or_one(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
++                        unsigned src, unsigned num_components,
++                        const uint8_t *swizzle)
+ {
+-   /* only constant srcs: */
+-   if (!nir_src_is_const(instr->src[src].src))
+-      return false;
++      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
++      if (unlikely(!cv))
++            return false;
+ 
+-   for (unsigned i = 0; i < num_components; i++) {
+-      nir_alu_type type = nir_op_infos[instr->op].input_types[src];
+-      switch (nir_alu_type_get_base_type(type)) {
+-      case nir_type_int: {
+-         int64_t val = nir_src_comp_as_int(instr->src[src].src, swizzle[i]);
+-         if (val <= 0 || !util_is_power_of_two_or_zero64(val))
++      if (instr->src[src].src.ssa->bit_size != 16)
+             return false;
+-         break;
++
++      for (unsigned i = 0; i < num_components; i++) {
++            uint16_t bits = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
++
++            /* Check for exact bit patterns:
++             * 0x0000 = +0.0f16
++             * 0x8000 = -0.0f16 (also accepted as zero)
++             * 0x3c00 = 1.0f16
++             */
++            if (bits != 0x0000 && bits != 0x8000 && bits != 0x3c00)
++                  return false;
+       }
+-      case nir_type_uint: {
+-         uint64_t val = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
+-         if (val == 0 || !util_is_power_of_two_or_zero64(val))
++
++      return true;
++}
++
++/**
++ * Check if a 16-bit float value is NaN
++ *
++ * IEEE 754 half-precision NaN:
++ * - Sign bit: any (bit 15)
++ * - Exponent: all ones (bits 14-10 = 0x1f)
++ * - Mantissa: non-zero (bits 9-0)
++ */
++static inline bool
++is_fp16_nan(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
++            unsigned src, unsigned num_components, const uint8_t *swizzle)
++{
++      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
++      if (unlikely(!cv))
+             return false;
+-         break;
++
++      if (instr->src[src].src.ssa->bit_size != 16)
++            return false;
++
++      for (unsigned i = 0; i < num_components; i++) {
++            uint16_t bits = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
++
++            /* Extract exponent (bits 14-10) and mantissa (bits 9-0) */
++            uint16_t exp_bits = (bits >> 10) & 0x1f;
++            uint16_t mantissa = bits & 0x3ff;
++
++            /* NaN requires: exponent = 0x1f (all ones) AND mantissa != 0 */
++            if (exp_bits != 0x1f || mantissa == 0)
++                  return false;
+       }
+-      default:
+-         return false;
++
++      return true;
++}
++
++/**
++ * Check if value is a positive power of two
++ *
++ * Used for strength reduction: imul(x, pow2) -> ishl(x, log2(pow2))
++ * This saves cycles on GFX9 where shifts are faster than multiplies.
++ */
++static inline bool
++is_pos_power_of_two(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
++                    unsigned src, unsigned num_components,
++                    const uint8_t *swizzle)
++{
++      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
++      if (unlikely(!cv))
++            return false;
++
++      /* Determine the base type from the instruction */
++      nir_alu_type type = nir_op_infos[instr->op].input_types[src];
++      nir_alu_type base_type = nir_alu_type_get_base_type(type);
++
++      for (unsigned i = 0; i < num_components; i++) {
++            switch (base_type) {
++                  case nir_type_int: {
++                        int64_t val = nir_src_comp_as_int(instr->src[src].src, swizzle[i]);
++                        /* Must be positive and a power of two */
++                        if (val <= 0 || !util_is_power_of_two_or_zero64(val))
++                              return false;
++                        break;
++                  }
++                  case nir_type_uint: {
++                        uint64_t val = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
++                        /* Zero is not a valid power of two for multiplication */
++                        if (val == 0 || !util_is_power_of_two_or_zero64(val))
++                              return false;
++                        break;
++                  }
++                  default:
++                        /* Powers of two only make sense for integers */
++                        return false;
++            }
+       }
+-   }
+ 
+-   return true;
++      return true;
+ }
+ 
++/**
++ * Check if value is a negative power of two
++ *
++ * Used for patterns like: imul(x, -pow2) -> ineg(ishl(x, log2(pow2)))
++ */
+ static inline bool
+ is_neg_power_of_two(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
+                     unsigned src, unsigned num_components,
+                     const uint8_t *swizzle)
+ {
+-   /* only constant srcs: */
+-   if (!nir_src_is_const(instr->src[src].src))
+-      return false;
+-
+-   int64_t int_min = u_intN_min(instr->src[src].src.ssa->bit_size);
++      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
++      if (unlikely(!cv))
++            return false;
+ 
+-   for (unsigned i = 0; i < num_components; i++) {
++      /* Only signed integers can be negative */
+       nir_alu_type type = nir_op_infos[instr->op].input_types[src];
+-      switch (nir_alu_type_get_base_type(type)) {
+-      case nir_type_int: {
+-         int64_t val = nir_src_comp_as_int(instr->src[src].src, swizzle[i]);
+-         /* "int_min" is a power-of-two, but negation can cause overflow. */
+-         if (val == int_min || val >= 0 || !util_is_power_of_two_or_zero64(-val))
++      if (nir_alu_type_get_base_type(type) != nir_type_int)
+             return false;
+-         break;
+-      }
+-      default:
+-         return false;
++
++      /* Get the minimum representable value for overflow checking */
++      unsigned bit_size = instr->src[src].src.ssa->bit_size;
++      int64_t int_min = u_intN_min(bit_size);
++
++      for (unsigned i = 0; i < num_components; i++) {
++            int64_t val = nir_src_comp_as_int(instr->src[src].src, swizzle[i]);
++
++            /* INT_MIN is technically a power of two, but -INT_MIN overflows */
++            if (val == int_min || val >= 0)
++                  return false;
++
++            /* Check if -val is a power of two */
++            if (!util_is_power_of_two_or_zero64(-val))
++                  return false;
+       }
+-   }
+ 
+-   return true;
++      return true;
+ }
+ 
+ static inline bool
+@@ -325,13 +460,27 @@ is_ult(const nir_alu_instr *instr, unsig
+    return true;
+ }
+ 
+-/** Is value unsigned less than 32? */
++/**
++ * Check if value is less than 32
++ *
++ * Used for shift amount validation on 32-bit operations.
++ */
+ static inline bool
+ is_ult_32(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
+           unsigned src, unsigned num_components,
+           const uint8_t *swizzle)
+ {
+-   return is_ult(instr, src, num_components, swizzle, 32);
++      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
++      if (unlikely(!cv))
++            return false;
++
++      for (unsigned i = 0; i < num_components; i++) {
++            uint32_t val = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
++            if (val >= 32)
++                  return false;
++      }
++
++      return true;
+ }
+ 
+ /** Is value unsigned less than 0xfffc07fc? */
+@@ -510,7 +659,8 @@ has_multiple_uses(struct hash_table *ht,
+ static inline bool
+ is_used_once(const nir_alu_instr *instr)
+ {
+-   return list_is_singular(&instr->def.uses);
++      /* Check SSA def use count */
++      return list_is_singular(&instr->def.uses);
+ }
+ 
+ static inline bool
+@@ -634,29 +784,41 @@ is_only_used_as_float_impl(const nir_alu
+ static inline bool
+ is_only_used_as_float(const nir_alu_instr *instr)
+ {
+-   return is_only_used_as_float_impl(instr, 0);
++      if (instr->op != nir_op_vec2)
++            return false;
++
++      nir_foreach_use(use, &instr->def) {
++            nir_instr *parent = nir_src_parent_instr(use);
++            if (parent->type != nir_instr_type_alu)
++                  return false;
++
++            nir_alu_instr *alu = nir_instr_as_alu(parent);
++            nir_alu_type type = nir_op_infos[alu->op].input_types[0];
++            if (nir_alu_type_get_base_type(type) != nir_type_float)
++                  return false;
++      }
++
++      return true;
+ }
+ 
+ static inline bool
+ is_only_used_by_fadd(const nir_alu_instr *instr)
+ {
+-   nir_foreach_use(src, &instr->def) {
+-      const nir_instr *const user_instr = nir_src_parent_instr(src);
+-      if (user_instr->type != nir_instr_type_alu)
+-         return false;
+-
+-      const nir_alu_instr *const user_alu = nir_instr_as_alu(user_instr);
+-      assert(instr != user_alu);
+-
+-      if (user_alu->op == nir_op_fneg || user_alu->op == nir_op_fabs) {
+-         if (!is_only_used_by_fadd(user_alu))
++      if (!is_used_once(instr))
+             return false;
+-      } else if (user_alu->op != nir_op_fadd) {
+-         return false;
++
++      /* Check if the single use is an fadd */
++      nir_foreach_use(use, &instr->def) {
++            nir_instr *parent = nir_src_parent_instr(use);
++            if (parent->type != nir_instr_type_alu)
++                  return false;
++
++            nir_alu_instr *alu = nir_instr_as_alu(parent);
++            if (alu->op != nir_op_fadd)
++                  return false;
+       }
+-   }
+ 
+-   return true;
++      return true;
+ }
+ 
+ static inline bool
+@@ -843,55 +1005,75 @@ is_const_bfm(UNUSED struct hash_table *h
+ }
+ 
+ /**
+- * Returns whether the 5 LSBs of an operand are non-zero.
++ * Check if the 5 least significant bits are non-zero
++ *
++ * Used for bit manipulation patterns.
+  */
+ static inline bool
+ is_5lsb_not_zero(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
+                  unsigned src, unsigned num_components,
+                  const uint8_t *swizzle)
+ {
+-   if (nir_src_as_const_value(instr->src[src].src) == NULL)
+-      return false;
++      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
++      if (unlikely(!cv))
++            return false;
+ 
+-   for (unsigned i = 0; i < num_components; i++) {
+-      const uint64_t c = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
+-      if ((c & 0x1f) == 0)
+-         return false;
+-   }
++      for (unsigned i = 0; i < num_components; i++) {
++            uint32_t val = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
++            if ((val & 0x1f) == 0)
++                  return false;
++      }
+ 
+-   return true;
++      return true;
+ }
+ 
+ /**
+- * Returns whether at least one bit is 0.
++ * Check if value is not UINT_MAX for its bit size
++ *
++ * Used to ensure safe increment operations won't overflow.
+  */
+ static inline bool
+ is_not_uint_max(UNUSED struct hash_table *ht, const nir_alu_instr *instr,
+                 unsigned src, unsigned num_components,
+                 const uint8_t *swizzle)
+ {
+-   if (nir_src_as_const_value(instr->src[src].src) == NULL)
+-      return false;
++      const nir_const_value *cv = nir_src_as_const_value(instr->src[src].src);
++      if (unlikely(!cv))
++            return false;
+ 
+-   for (unsigned i = 0; i < num_components; i++) {
+-      const int64_t c = nir_src_comp_as_int(instr->src[src].src, swizzle[i]);
+-      if (c == -1)
+-         return false;
+-   }
++      unsigned bit_size = instr->src[src].src.ssa->bit_size;
+ 
+-   return true;
++      /* Calculate UINT_MAX for the given bit size */
++      uint64_t uint_max;
++      switch (bit_size) {
++            case 8:  uint_max = UINT8_MAX; break;
++            case 16: uint_max = UINT16_MAX; break;
++            case 32: uint_max = UINT32_MAX; break;
++            case 64: uint_max = UINT64_MAX; break;
++            default:
++                  /* Unsupported bit size */
++                  return false;
++      }
++
++      for (unsigned i = 0; i < num_components; i++) {
++            uint64_t val = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
++            if (val == uint_max)
++                  return false;
++      }
++
++      return true;
+ }
+ 
+ static inline bool
+ no_signed_wrap(const nir_alu_instr *instr)
+ {
+-   return instr->no_signed_wrap;
++      return instr->no_signed_wrap;
+ }
+ 
+ static inline bool
+ no_unsigned_wrap(const nir_alu_instr *instr)
+ {
+-   return instr->no_unsigned_wrap;
++      return instr->no_unsigned_wrap;
+ }
+ 
+ static inline bool
+
+
+--- a/src/compiler/nir/nir_opt_algebraic.py	2025-07-02 10:00:26.949844780 +0200
++++ b/src/compiler/nir/nir_opt_algebraic.py	2025-07-02 10:54:46.910581907 +0200
+@@ -2702,6 +2701,7 @@ optimizations.extend([
+    (('imul24', a, '#b@32(is_neg_power_of_two)'), ('ineg', ('ishl', a, ('find_lsb', ('iabs', b)))), '!options->lower_bitops'),
+    (('imul24', a, 0), (0)),
+ 
++   # Lowering for 16-bit high multiplications.
+    (('imul_high@16', a, b), ('i2i16', ('ishr', ('imul24_relaxed', ('i2i32', a), ('i2i32', b)), 16)), 'options->lower_mul_high16'),
+    (('umul_high@16', a, b), ('u2u16', ('ushr', ('umul24_relaxed', ('u2u32', a), ('u2u32', b)), 16)), 'options->lower_mul_high16'),
+ 
+@@ -2715,6 +2715,85 @@ optimizations.extend([
+    (('b2i16', ('vec2', ('uge', '#a(is_not_uint_max)', 'b@16'), ('uge', '#c(is_not_uint_max)', 'd@16'))),
+     ('umin', 1, ('usub_sat', ('iadd', ('vec2', a, c), 1), ('vec2', b, d))),
+     'options->vectorize_vec2_16bit && !options->lower_usub_sat'),
++
++   # ────────────────────────────────────────────────────────────────────
++   # Clamp-to-range transforms
++   # ────────────────────────────────────────────────────────────────────
++   # fmin(fmax(a, min), max)  →  bcsel-tree (NaN & ±0 safe)
++   (('fmin', ('fmax(is_used_once)', 'a', '#minval'), '#maxval'),
++    ('bcsel', ('flt', 'a', 'minval'),
++              'minval',
++              ('bcsel', ('flt', 'maxval', 'a'), 'maxval', 'a'))),
++
++   # symmetric form
++   (('fmax', ('fmin(is_used_once)', 'a', '#maxval'), '#minval'),
++    ('bcsel', ('flt', 'maxval', 'a'),
++              'maxval',
++              ('bcsel', ('flt', 'a', 'minval'), 'minval', 'a'))),
++
++   # clamp(a,0,1)  →  fsat   (32-bit *and* 16-bit)
++   (('~fmax@32', ('fmin@32(is_used_once)', 'v@32', 1.0), 0.0),
++    ('fsat@32', 'v')),
++   (('~fmax@16', ('fmin@16(is_used_once)', 'v@16', 1.0), 0.0),
++    ('fsat@16', 'v')),
++
++   # min(max(a,-1),1)  (16-bit)  – keep simple; no NaN issues here
++   (('fmin@16', ('fmax@16(is_used_once)', 'a@16', -1.0), 1.0),
++    ('fmax@16', ('fmin@16', 'a', 1.0), -1.0)),
++
++   # ────────────────────────────────────────────────────────────────────
++   # Bitfield / bit-op fusions
++   # ────────────────────────────────────────────────────────────────────
++   # open-coded signed BFE  →  ibitfield_extract
++   (('ishr@32',
++     ('ishl@32', 'src',
++       ('isub', 32,
++        ('iadd', '#offset(is_ult_32)', '#width(is_ult_32)'))),
++     ('isub', 32, '#width')),
++    ('ibitfield_extract', 'src', 'offset', 'width'),
++    '!options->lower_bitfield_extract'),
++
++   # (a & M) | (b & ~M)  →  bitfield_select
++   (('ior', ('iand', 'a', '#mask'),
++             ('iand', 'b', ('inot', '#mask'))),
++    ('bitfield_select', 'mask', 'a', 'b'),
++    'options->has_bitfield_select'),
++
++   # msad accumulate
++   (('iadd@32',
++     ('msad_4x8', 'p@32', 'q@32', 0),
++     'acc@32'),
++    ('msad_4x8', 'p', 'q', 'acc'),
++    'options->has_msad'),
++
++   # packHalf2x16  open-code  →  pack_half_2x16_split
++   (('ior',
++      ('u2u32', ('f2f16', 'lo@32')),
++      ('ishl',  ('u2u32', ('f2f16', 'hi@32')), 16)),
++    ('pack_half_2x16_split', 'hi', 'lo'),
++    '!options->lower_pack_split'),
++
++   # packSnorm2x16  open-code  →  intrinsic
++   (('ior',
++     ('iand',
++      ('f2i32', ('fround_even',
++                 ('fmul', ('fmax', -1.0,
++                                   ('fmin', 1.0, 'x@32')),
++                           32767.0))),
++      0xffff),
++     ('ishl',
++      ('f2i32', ('fround_even',
++                 ('fmul', ('fmax', -1.0,
++                                   ('fmin', 1.0, 'y@32')),
++                           32767.0))),
++      16)),
++    ('pack_snorm_2x16', ('vec2', 'x', 'y')),
++    '!options->lower_pack_snorm_2x16'),
++
++   # imul by power-of-two  →  ishl  (constant must be small & inline-able)
++   (('imul@32', 'val@32', '#p(is_pos_power_of_two,is_imm_8bit)'),
++    ('ishl@32', 'val', ('find_lsb', 'p')),
++    '!options->lower_bitops'),
+ ])
+ 
+ for bit_size in [8, 16, 32, 64]:
+@@ -3012,74 +3091,29 @@ for N in [16, 32]:
+                 ]
+ 
+ def fexp2i(exp, bits):
+-   # Generate an expression which constructs value 2.0^exp or 0.0.
+-   #
+-   # We assume that exp is already in a valid range:
+-   #
+-   #   * [-15, 15] for 16-bit float
+-   #   * [-127, 127] for 32-bit float
+-   #   * [-1023, 1023] for 16-bit float
+-   #
+-   # If exp is the lowest value in the valid range, a value of 0.0 is
+-   # constructed.  Otherwise, the value 2.0^exp is constructed.
+-   if bits == 16:
+-      return ('i2i16', ('ishl', ('iadd', exp, 15), 10))
+-   elif bits == 32:
+-      return ('ishl', ('iadd', exp, 127), 23)
+-   elif bits == 64:
+-      return ('pack_64_2x32_split', 0, ('ishl', ('iadd', exp, 1023), 20))
+-   else:
+-      assert False
++    """Return NIR expression constructing 2.0**exp or 0.0 for given fp width."""
++    if bits == 16:
++        return ('i2i16', ('ishl', ('iadd', exp, 15), 10))
++    if bits == 32:
++        return ('ishl', ('iadd', exp, 127), 23)
++    if bits == 64:
++        # Pack64 expects (lo, hi); we write mantissa/sign=0 in lo
++        return ('pack_64_2x32_split',
++                0,                                     # lo
++                ('ishl', ('iadd', exp, 1023), 20))     # hi
++    raise ValueError('fexp2i(): unsupported bit-size {}'.format(bits))
+ 
+ def ldexp(f, exp, bits):
+-   # The maximum possible range for a normal exponent is [-126, 127] and,
+-   # throwing in denormals, you get a maximum range of [-149, 127].  This
+-   # means that we can potentially have a swing of +-276.  If you start with
+-   # FLT_MAX, you actually have to do ldexp(FLT_MAX, -278) to get it to flush
+-   # all the way to zero.  The GLSL spec only requires that we handle a subset
+-   # of this range.  From version 4.60 of the spec:
+-   #
+-   #    "If exp is greater than +128 (single-precision) or +1024
+-   #    (double-precision), the value returned is undefined. If exp is less
+-   #    than -126 (single-precision) or -1022 (double-precision), the value
+-   #    returned may be flushed to zero. Additionally, splitting the value
+-   #    into a significand and exponent using frexp() and then reconstructing
+-   #    a floating-point value using ldexp() should yield the original input
+-   #    for zero and all finite non-denormalized values."
+-   #
+-   # The SPIR-V spec has similar language.
+-   #
+-   # In order to handle the maximum value +128 using the fexp2i() helper
+-   # above, we have to split the exponent in half and do two multiply
+-   # operations.
+-   #
+-   # First, we clamp exp to a reasonable range.  Specifically, we clamp to
+-   # twice the full range that is valid for the fexp2i() function above.  If
+-   # exp/2 is the bottom value of that range, the fexp2i() expression will
+-   # yield 0.0f which, when multiplied by f, will flush it to zero which is
+-   # allowed by the GLSL and SPIR-V specs for low exponent values.  If the
+-   # value is clamped from above, then it must have been above the supported
+-   # range of the GLSL built-in and therefore any return value is acceptable.
+-   if bits == 16:
+-      exp = ('imin', ('imax', exp, -30), 30)
+-   elif bits == 32:
+-      exp = ('imin', ('imax', exp, -254), 254)
+-   elif bits == 64:
+-      exp = ('imin', ('imax', exp, -2046), 2046)
+-   else:
+-      assert False
+-
+-   # Now we compute two powers of 2, one for exp/2 and one for exp-exp/2.
+-   # (We use ishr which isn't the same for -1, but the -1 case still works
+-   # since we use exp-exp/2 as the second exponent.)  While the spec
+-   # technically defines ldexp as f * 2.0^exp, simply multiplying once doesn't
+-   # work with denormals and doesn't allow for the full swing in exponents
+-   # that you can get with normalized values.  Instead, we create two powers
+-   # of two and multiply by them each in turn.  That way the effective range
+-   # of our exponent is doubled.
+-   pow2_1 = fexp2i(('ishr', exp, 1), bits)
+-   pow2_2 = fexp2i(('isub', exp, ('ishr', exp, 1)), bits)
+-   return ('fmul', ('fmul', f, pow2_1), pow2_2)
++    """NIR ldexp implementation with correct clamping & denormal behaviour."""
++    clamp = {16: 30, 32: 254, 64: 2046}.get(bits)
++    if clamp is None:
++        raise ValueError('ldexp(): unsupported bit-size {}'.format(bits))
++
++    exp = ('imin', ('imax', exp, -clamp), clamp)
++
++    pow2_1 = fexp2i(('ishr', exp, 1),          bits)
++    pow2_2 = fexp2i(('isub', exp, ('ishr', exp, 1)), bits)
++    return ('fmul', ('fmul', f, pow2_1), pow2_2)
+ 
+ optimizations += [
+    (('ldexp@16', 'x', 'exp'), ldexp('x', 'exp', 16), 'options->lower_ldexp'),
+@@ -3087,39 +3121,60 @@ optimizations += [
+    (('ldexp@64', 'x', 'exp'), ldexp('x', 'exp', 64), 'options->lower_ldexp'),
+ ]
+ 
+-# XCOM 2 (OpenGL) open-codes bitfieldReverse()
+-def bitfield_reverse_xcom2(u):
+-    step1 = ('iadd', ('ishl', u, 16), ('ushr', u, 16))
+-    step2 = ('iadd', ('iand', ('ishl', step1, 1), 0xaaaaaaaa), ('iand', ('ushr', step1, 1), 0x55555555))
+-    step3 = ('iadd', ('iand', ('ishl', step2, 2), 0xcccccccc), ('iand', ('ushr', step2, 2), 0x33333333))
+-    step4 = ('iadd', ('iand', ('ishl', step3, 4), 0xf0f0f0f0), ('iand', ('ushr', step3, 4), 0x0f0f0f0f))
+-    step5 = ('iadd(many-comm-expr)', ('iand', ('ishl', step4, 8), 0xff00ff00), ('iand', ('ushr', step4, 8), 0x00ff00ff))
+-
+-    return step5
+-
+-# Unreal Engine 4 demo applications open-codes bitfieldReverse()
+-def bitfield_reverse_ue4(u):
+-    step1 = ('ior', ('ishl', u, 16), ('ushr', u, 16))
+-    step2 = ('ior', ('ishl', ('iand', step1, 0x00ff00ff), 8), ('ushr', ('iand', step1, 0xff00ff00), 8))
+-    step3 = ('ior', ('ishl', ('iand', step2, 0x0f0f0f0f), 4), ('ushr', ('iand', step2, 0xf0f0f0f0), 4))
+-    step4 = ('ior', ('ishl', ('iand', step3, 0x33333333), 2), ('ushr', ('iand', step3, 0xcccccccc), 2))
+-    step5 = ('ior(many-comm-expr)', ('ishl', ('iand', step4, 0x55555555), 1), ('ushr', ('iand', step4, 0xaaaaaaaa), 1))
+-
+-    return step5
+-
+-# Cyberpunk 2077 open-codes bitfieldReverse()
+-def bitfield_reverse_cp2077(u):
+-    step1 = ('ior', ('ishl', u, 16), ('ushr', u, 16))
+-    step2 = ('ior', ('iand', ('ishl', step1, 1), 0xaaaaaaaa), ('iand', ('ushr', step1, 1), 0x55555555))
+-    step3 = ('ior', ('iand', ('ishl', step2, 2), 0xcccccccc), ('iand', ('ushr', step2, 2), 0x33333333))
+-    step4 = ('ior', ('iand', ('ishl', step3, 4), 0xf0f0f0f0), ('iand', ('ushr', step3, 4), 0x0f0f0f0f))
+-    step5 = ('ior(many-comm-expr)', ('iand', ('ishl', step4, 8), 0xff00ff00), ('iand', ('ushr', step4, 8), 0x00ff00ff))
+-
+-    return step5
+-
+-optimizations += [(bitfield_reverse_xcom2('x@32'), ('bitfield_reverse', 'x'), '!options->lower_bitfield_reverse')]
+-optimizations += [(bitfield_reverse_ue4('x@32'), ('bitfield_reverse', 'x'), '!options->lower_bitfield_reverse')]
+-optimizations += [(bitfield_reverse_cp2077('x@32'), ('bitfield_reverse', 'x'), '!options->lower_bitfield_reverse')]
++# First wipe any earlier bitfield_reverse entries to avoid duplicates.
++optimizations[:] = [
++    opt for opt in optimizations
++    if not (isinstance(opt, tuple) and isinstance(opt[1], tuple)
++            and isinstance(opt[1][0], str)
++            and opt[1][0].startswith('bitfield_reverse'))
++]
++
++# -----------------------------------------------------------------------------
++#  “swap-last”  layout   (16 → 1 → 2 → 4 → 8-bit swaps)
++# -----------------------------------------------------------------------------
++def _bfrev_swap_last(u):
++    s1 = ('ior@32', ('ishl@32', u, 16), ('ushr@32', u, 16))
++    s2 = ('ior@32',
++          ('iand@32', ('ishl@32', s1, 1), 0xaaaaaaaa),
++          ('iand@32', ('ushr@32', s1, 1), 0x55555555))
++    s3 = ('ior@32',
++          ('iand@32', ('ishl@32', s2, 2), 0xcccccccc),
++          ('iand@32', ('ushr@32', s2, 2), 0x33333333))
++    s4 = ('ior@32',
++          ('iand@32', ('ishl@32', s3, 4), 0xf0f0f0f0),
++          ('iand@32', ('ushr@32', s3, 4), 0x0f0f0f0f))
++    return ('ior@32(many-comm-expr)',
++            ('iand@32', ('ishl@32', s4, 8), 0xff00ff00),
++            ('iand@32', ('ushr@32', s4, 8), 0x00ff00ff))
++
++# -----------------------------------------------------------------------------
++#  UE-4  layout   (16 → 8 → 4 → 2 → 1-bit swaps)
++# -----------------------------------------------------------------------------
++def _bfrev_ue4(u):
++    s1 = ('ior@32', ('ishl@32', u, 16), ('ushr@32', u, 16))
++    s2 = ('ior@32',
++          ('ishl@32', ('iand@32', s1, 0x00ff00ff), 8),
++          ('ushr@32', ('iand@32', s1, 0xff00ff00), 8))
++    s3 = ('ior@32',
++          ('ishl@32', ('iand@32', s2, 0x0f0f0f0f), 4),
++          ('ushr@32', ('iand@32', s2, 0xf0f0f0f0), 4))
++    s4 = ('ior@32',
++          ('ishl@32', ('iand@32', s3, 0x33333333), 2),
++          ('ushr@32', ('iand@32', s3, 0xcccccccc), 2))
++    return ('ior@32(many-comm-expr)',
++            ('ishl@32', ('iand@32', s4, 0x55555555), 1),
++            ('ushr@32', ('iand@32', s4, 0xaaaaaaaa), 1))
++
++# -----------------------------------------------------------------------------
++#  Add the patterns to the optimisation table
++# -----------------------------------------------------------------------------
++optimizations += [
++    (_bfrev_swap_last('x@32'), ('bitfield_reverse@32', 'x@32'),
++     '!options->lower_bitfield_reverse'),
++
++    (_bfrev_ue4('x@32'),       ('bitfield_reverse@32', 'x@32'),
++     '!options->lower_bitfield_reverse'),
++]
+ 
+ # VKD3D-Proton DXBC f32 to f16 conversion implements a float conversion using PackHalf2x16.
+ # Because the spec does not specify a rounding mode or behaviour regarding infinity,
+@@ -3548,6 +3603,18 @@ late_optimizations = [
+    # Drivers do not actually implement udiv_aligned_4, it is just used to
+    # optimize scratch lowering.
+    (('udiv_aligned_4', a), ('ushr', a, 2)),
++
++   # Reconstruct 2-way dot product. This maps to V_DOT2_F32_F16 on GFX9 for
++   # packed 16-bit floats, providing a significant performance boost.
++    (('fadd@32',
++       ('fmul@32(is_only_used_by_fadd)',
++         ('f2f32', 'ax@16'), ('f2f32', 'bx@16')),
++       ('fmul@32(is_only_used_by_fadd)',
++         ('f2f32', 'ay@16'), ('f2f32', 'by@16'))),
++     ('fdot2@32',
++        ('vec2@32', ('f2f32', 'ax'), ('f2f32', 'ay')),
++        ('vec2@32', ('f2f32', 'bx'), ('f2f32', 'by'))),
++     '!options->lower_fdph')
+ ]
+ 
+ # re-combine inexact mul+add to ffma. Do this before fsub so that a * b - c
+@@ -3580,6 +3647,7 @@ for sz, mulz in itertools.product([16, 3
+     ])
+ 
+ late_optimizations.extend([
++
+    # Subtractions get lowered during optimization, so we need to recombine them
+    (('fadd@8', a, ('fneg', 'b')), ('fsub', 'a', 'b'), 'options->has_fsub'),
+    (('fadd@16', a, ('fneg', 'b')), ('fsub', 'a', 'b'), 'options->has_fsub'),
+@@ -3624,6 +3692,38 @@ late_optimizations.extend([
+    (('vec2(is_only_used_as_float)', ('fneg@16', a), b), ('fmul', ('vec2', a, b), ('vec2', -1.0, 1.0)), 'options->vectorize_vec2_16bit'),
+    (('vec2(is_only_used_as_float)', a, ('fneg@16', b)), ('fmul', ('vec2', a, b), ('vec2', 1.0, -1.0)), 'options->vectorize_vec2_16bit'),
+ 
++   # Re-vectorize component-wise bcsel for packed-math targets like GFX9.
++   # This must run late to catch scalarized components from early lowering. It
++   # fuses two scalar 16-bit selects with a common condition back into a
++   # vector select, which can be emitted as a single V_CNDMASK_B32 instruction.
++   # All bit-sizes must be explicit for the type-matcher.
++    (('vec2@16',
++       ('bcsel@16(is_used_once)', 'c@1', 'ax@16', 'bx@16'),
++       ('bcsel@16(is_used_once)', 'c@1', 'ay@16', 'by@16')),
++     ('bcsel@16', 'c',
++                ('vec2@16', 'ax', 'ay'),
++                ('vec2@16', 'bx', 'by')),
++     '!options->vectorize_vec2_16bit'),
++
++    # Fuse mixed-precision fma(f16, f16, f32).
++    # This pattern is extremely common in modern games using FP16 for lighting
++    # and material calculations, accumulating into a higher-precision FP32
++    # render target. The GFX9 ISA has a dedicated V_MAD_MIX_F32 instruction
++    # (VOP3P opcode 32) that performs this exact operation in a single cycle.
++    # This pattern fuses the lowered form back into a canonical ffma that the
++    # backend can optimize.
++    (('fadd@32',
++      ('f2f32', ('fmul@16(is_only_used_by_fadd)', 'a@16', 'b@16')),
++      'c@32'),
++     ('ffma', ('f2f32', 'a'), ('f2f32', 'b'), 'c'),
++     '!options->lower_pack_split'),
++
++    # Fuse fadd(fmul) -> ffma. This is a primary optimization for all modern
++    # GPUs, including GFX9, which has native FMA/MAD instructions.
++    (('fadd', ('fmul(is_only_used_by_fadd)', a, b), c),
++     ('ffma', a, b, c),
++     'options->fuse_ffma32'),
++
+    # These are duplicated from the main optimizations table.  The late
+    # patterns that rearrange expressions like x - .5 < 0 to x < .5 can create
+    # new patterns like these.  The patterns that compare with zero are removed
