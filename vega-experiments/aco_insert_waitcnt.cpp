@@ -556,6 +556,11 @@ namespace aco {
                                     perform_barrier(ctx, imm, sync_info, semantic_release);
                               }
 
+                              if (ctx.pending_flat_vm  && imm.vm   == wait_imm::unset_counter)
+                                    imm.vm   = 0;
+                              if (ctx.pending_flat_lgkm && imm.lgkm == wait_imm::unset_counter)
+                                    imm.lgkm = 0;
+
                               if (!imm.empty()) {
                                     if (ctx.pending_flat_vm && imm.vm != wait_imm::unset_counter)
                                           imm.vm = 0;
