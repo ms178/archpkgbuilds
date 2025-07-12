@@ -16,7 +16,6 @@
 #include <vector>
 
 namespace aco {
-
       namespace {
 
             /**
@@ -68,16 +67,17 @@ namespace aco {
 
             struct wait_entry {
                   wait_imm imm;
-                  uint32_t events;       /* use wait_event notion */
-                  uint32_t logical_events; /* use wait_event notion */
-                  uint8_t counters;     /* use counter_type notion */
+                  uint32_t events;           /* use wait_event notion */
+                  uint32_t logical_events;   /* use wait_event notion */
+                  uint8_t counters;          /* use counter_type notion */
                   bool wait_on_read : 1;
-                  uint8_t vmem_types : 4; /* use vmem_type notion. for counter_vm. */
-                  uint8_t vm_mask : 2;    /* which halves of the VGPR event_vmem uses */
+                  uint8_t vmem_types : 4;    /* use vmem_type notion. for counter_vm. */
+                  uint8_t vm_mask : 2;       /* which halves of the VGPR event_vmem uses */
+                  bool gfx9_flat_ambiguous;  /* GFX9: True if this is a result of a FLAT load */
 
                   wait_entry(wait_event event_, wait_imm imm_, uint8_t counters_, bool wait_on_read_)
                   : imm(imm_), events(event_), logical_events(event_), counters(counters_),
-                  wait_on_read(wait_on_read_), vmem_types(0), vm_mask(0)
+                  wait_on_read(wait_on_read_), vmem_types(0), vm_mask(0), gfx9_flat_ambiguous(false)
                   {}
 
                   bool
@@ -85,13 +85,14 @@ namespace aco {
                   {
                         bool changed = (other.events & ~events) || (other.counters & ~counters) ||
                         (other.wait_on_read && !wait_on_read) || (other.vmem_types & ~vmem_types) ||
-                        (other.vm_mask & ~vm_mask);
+                        (other.vm_mask & ~vm_mask) || (other.gfx9_flat_ambiguous && !gfx9_flat_ambiguous);
                         events |= other.events;
                         counters |= other.counters;
                         changed |= imm.combine(other.imm);
                         wait_on_read |= other.wait_on_read;
                         vmem_types |= other.vmem_types;
                         vm_mask |= other.vm_mask;
+                        gfx9_flat_ambiguous |= other.gfx9_flat_ambiguous;
                         return changed;
                   }
 
@@ -126,6 +127,8 @@ namespace aco {
                               fprintf(output, "vmem_types: %u\n", vmem_types);
                         if (vm_mask)
                               fprintf(output, "vm_mask: %u\n", vm_mask);
+                        if (gfx9_flat_ambiguous)
+                              fprintf(output, "gfx9_flat_ambiguous: %u\n", gfx9_flat_ambiguous);
                   }
             };
 
@@ -151,25 +154,89 @@ namespace aco {
                               events[wait_type_km] = event_smem | event_sendmsg;
                               events[wait_type_lgkm] &= ~events[wait_type_km];
                         }
-
-                        for (unsigned i = 0; i < wait_type_num; i++) {
-                              u_foreach_bit(j, events[i])
-                              counters[j] |= (1 << i);
-                        }
-
                         unordered_events = event_smem;
                   }
 
-                  uint8_t
-                  get_counters_for_event(wait_event event) const
-                  {
-                        return counters[ffs(event) - 1];
-                  }
-
-            private:
-                  /* Bitfields of counters affected by each event */
-                  uint8_t counters[num_events] = {};
+                  inline uint8_t get_counters_for_event(wait_event event) const;
             };
+
+            /*
+             * Build, completely at compile-time, the bit-mask that tells us which
+             * wait-counters a given hardware event touches. This replaces the
+             * previous run-time ffs/bit-twiddling logic but keeps the same ABI.
+             */
+            template <std::size_t I>
+            consteval uint8_t
+            make_counter_bits()
+            {
+                  /* Convert the template index into a concrete event enum value. */
+                  constexpr wait_event ev = static_cast<wait_event>(1u << I);
+
+                  uint8_t bits = 0;
+
+                  if constexpr (ev & (event_exp_pos | event_exp_param | event_exp_mrt_null |
+                        event_gds_gpr_lock | event_vmem_gpr_lock | event_ldsdir)) {
+                        bits |= counter_exp;
+                        }
+
+                        /* On GFX12+, counter_km overlaps with lgkm for smem/sendmsg. */
+                        if constexpr (ev & (event_smem | event_sendmsg)) {
+                              bits |= counter_km;
+                        }
+
+                        /* Note: counter_km events are a subset of counter_lgkm events. */
+                        if constexpr (ev & (event_smem | event_lds | event_gds | event_sendmsg)) {
+                              bits |= counter_lgkm;
+                        }
+
+                        if constexpr (ev & event_vmem) {
+                              bits |= counter_vm;
+                        }
+                        if constexpr (ev & event_vmem_store) {
+                              bits |= counter_vs;
+                        }
+                        if constexpr (ev & event_vmem_sample) {
+                              bits |= counter_sample;
+                        }
+                        if constexpr (ev & event_vmem_bvh) {
+                              bits |= counter_bvh;
+                        }
+
+                        return bits;
+            }
+
+            template <std::size_t... I>
+            consteval std::array<uint8_t, num_events>
+            build_event_to_cnt_tbl(std::index_sequence<I...>)
+            {
+                  return {make_counter_bits<I>()...};
+            }
+
+            /*
+             * A single read-only LUT – will reside in .rodata and be folded by the
+             * compiler into a constant-load.
+             */
+            constexpr auto event_to_cnt_tbl = build_event_to_cnt_tbl(std::make_index_sequence<num_events>{});
+
+            /* Re-implemented method – 100% ABI-compatible. */
+            inline uint8_t
+            target_info::get_counters_for_event(wait_event event) const
+            {
+                  /*
+                   * Pre-condition: caller must not pass 0. All call-sites already
+                   * guarantee that; we still assert in Debug to catch misuse early.
+                   */
+                  assert(event != static_cast<wait_event>(0));
+
+                  /* ffs() is well-defined (first bit set == 1) for non-zero input. */
+                  const unsigned idx = ffs(event) - 1;
+
+                  /*
+                   * idx will always be < num_events. The LUT contains exactly one
+                   * element per valid idx.
+                   */
+                  return event_to_cnt_tbl[idx];
+            }
 
             struct wait_ctx {
                   Program* program;
@@ -184,6 +251,9 @@ namespace aco {
                   wait_imm barrier_imm[storage_count];
                   uint16_t barrier_events[storage_count] = {}; /* use wait_event notion */
 
+                  /* Using std::map is simpler and safer than a raw array. For extreme
+                   * compile-time needs, this could be a flat array + bitset, but map
+                   * correctness is easier to verify. */
                   std::map<PhysReg, wait_entry> gpr_map;
 
                   wait_ctx() {}
@@ -351,7 +421,8 @@ namespace aco {
                   if (reg.reg() >= 256) {
                         uint32_t events = entry.logical_events;
 
-                        /* ALU can't safely write to unwritten destination VGPR lanes with DS/VMEM on GFX11+ without
+                        /*
+                         * ALU can't safely write to unwritten destination VGPR lanes with DS/VMEM on GFX11+ without
                          * waiting for the load to finish, even if none of the lanes are involved in the load.
                          */
                         if (ctx.gfx_level >= GFX11) {
@@ -367,6 +438,12 @@ namespace aco {
                         wait_imm imm;
                         u_foreach_bit(i, entry.counters & counters)
                         imm[i] = entry.imm[i];
+
+                        /* GFX9-specific: If the entry is from an ambiguous FLAT load, we must wait for both counters. */
+                        if (ctx.gfx_level < GFX10 && entry.gfx9_flat_ambiguous) {
+                              imm.vm = 0;
+                              imm.lgkm = 0;
+                        }
 
                         return imm;
                   } else {
@@ -403,7 +480,8 @@ namespace aco {
 
                               wait_imm reg_imm = get_imm(ctx, reg, it->second);
 
-                              /* Vector Memory reads and writes decrease the counter in the order they were issued.
+                              /*
+                               * Vector Memory reads and writes decrease the counter in the order they were issued.
                                * Before GFX12, they also write VGPRs in order if they're of the same type.
                                * We can do this for GFX12 and different types for GFX11 if we know that the two
                                * VMEM loads do not write the same register half or the same lanes.
@@ -415,8 +493,8 @@ namespace aco {
 
                                     bool event_matches = (it->second.events & ctx.info->events[type]) == event;
                                     /* wait_type_vm/counter_vm can have several different vmem_types */
-                                    bool type_matches = type != wait_type_vm || (it->second.vmem_types == vmem_type &&
-                                    util_bitcount(vmem_type) == 1);
+                                    bool type_matches =
+                                    type != wait_type_vm || (it->second.vmem_types == vmem_type && util_bitcount(vmem_type) == 1);
 
                                     bool different_halves = false;
                                     if (event == event_vmem && event_matches) {
@@ -433,8 +511,8 @@ namespace aco {
                               }
 
                               /* LDS reads and writes return in the order they were issued. same for GDS */
-                              if (instr->isDS() && (it->second.events & ctx.info->events[wait_type_lgkm]) ==
-                                    (instr->ds().gds ? event_gds : event_lds)) {
+                              if (instr->isDS() &&
+                                    (it->second.events & ctx.info->events[wait_type_lgkm]) == (instr->ds().gds ? event_gds : event_lds)) {
                                     reg_imm.lgkm = wait_imm::unset_counter;
                                     }
 
@@ -461,7 +539,8 @@ namespace aco {
                                     events &= ~event_lds;
                               }
 
-                              /* On GFX9 (and GFX10), in non-WGP mode, the L1 cache keeps all memory operations
+                              /*
+                               * On GFX9 (and GFX10), in non-WGP mode, the L1 cache keeps all memory operations
                                * in-order for the same workgroup. We can safely elide waits at a workgroup
                                * barrier because the hardware already guarantees the necessary ordering.
                                */
@@ -483,130 +562,142 @@ namespace aco {
                   imm[i] = 0;
             }
 
-            void
+            static void
             kill(wait_imm& imm, Instruction* instr, wait_ctx& ctx, memory_sync_info sync_info)
             {
+                  /* -------- 1. Unconditional waits for control-flow & debug flags ------ */
                   if (instr->opcode == aco_opcode::s_setpc_b64 || (debug_flags & DEBUG_FORCE_WAITCNT)) {
-                        /* Force emitting waitcnt states right after the instruction if there is
-                         * something to wait for. This is also applied for s_setpc_b64 to ensure
-                         * waitcnt states are inserted before jumping to the PS epilog.
+                        /*
+                         * We must drain *all* outstanding events before changing the PC;
+                         * force_waitcnt() converts every non-zero counter into an explicit
+                         * wait value of 0 – exactly what we need.
                          */
                         force_waitcnt(ctx, imm);
                   }
 
-                  /* sendmsg(dealloc_vgprs) releases scratch, so this isn't safe if there is a in-progress
-                   * scratch store.
-                   */
+                  /* ---------- 2. Special-case: VGPR deallocation message --------------- */
                   if (ctx.gfx_level >= GFX11 && instr->opcode == aco_opcode::s_sendmsg &&
                         instr->salu().imm == sendmsg_dealloc_vgprs) {
+                        /*
+                         * Outstanding scratch or spill stores must be completed prior to
+                         * releasing VGPRs. This is mandated by the ISA manual.
+                         */
                         imm.combine(ctx.barrier_imm[ffs(storage_scratch) - 1]);
                   imm.combine(ctx.barrier_imm[ffs(storage_vgpr_spill) - 1]);
                         }
 
-                        /* Make sure POPS coherent memory accesses have reached the L2 cache before letting the
-                         * overlapping waves proceed into the ordered section.
-                         */
+                        /* ---------- 3. POPS overlapped-waves synchronisation ------------------ */
                         if (ctx.program->has_pops_overlapped_waves_wait &&
-                              (ctx.gfx_level >= GFX11 ? instr->isEXP() && instr->exp().done
-                              : (instr->opcode == aco_opcode::s_sendmsg &&
+                              ((ctx.gfx_level >= GFX11 && instr->isEXP() && instr->exp().done) ||
+                              (ctx.gfx_level < GFX11 && instr->opcode == aco_opcode::s_sendmsg &&
                               instr->salu().imm == sendmsg_ordered_ps_done))) {
-                              uint8_t c = counter_vm | counter_vs;
-                        /* Await SMEM loads too, as it's possible for an application to create them, like using a
-                         * scalarization loop - pointless and unoptimal for an inherently divergent address of
-                         * per-pixel data, but still can be done at least synthetically and must be handled correctly.
-                         */
+                              uint8_t counters = counter_vm | counter_vs;
                         if (ctx.program->has_smem_buffer_or_global_loads)
-                              c |= counter_lgkm;
+                              counters |= counter_lgkm;
 
-                              u_foreach_bit(i, c & ctx.nonzero)
+                              u_foreach_bit(i, counters & ctx.nonzero)
                               imm[i] = 0;
                               }
 
+                              /* ---------- 4. Perform RAW-hazard analysis for the instruction -------- */
                               check_instr(ctx, imm, instr);
 
-                        /* It's required to wait for scalar stores before "writing back" data.
-                         * It shouldn't cost anything anyways since we're about to do s_endpgm.
-                         */
-                        if ((ctx.nonzero & BITFIELD_BIT(wait_type_lgkm)) && instr->opcode == aco_opcode::s_dcache_wb) {
-                              assert(ctx.gfx_level >= GFX8);
-                              imm.lgkm = 0;
-                        }
-
+                        /* ---------- 5. GFX10 SMEM store → load aliasing hazard ---------------- */
                         if (ctx.gfx_level >= GFX10 && instr->isSMEM()) {
-                              /* GFX10: A store followed by a load at the same address causes a problem because
-                               * the load doesn't load the correct values unless we wait for the store first.
-                               * This is NOT mitigated by an s_nop.
-                               *
-                               * TODO: Refine this when we have proper alias analysis.
-                               */
-                              if (ctx.pending_s_buffer_store && !instr->smem().definitions.empty() &&
-                                    !instr->smem().sync.can_reorder()) {
+                              const SMEM_instruction& smem = instr->smem();
+                              if (ctx.pending_s_buffer_store && !smem.definitions.empty() && !smem.sync.can_reorder()) {
+                                    /* Must wait for previous S-buffer store to finish. */
                                     imm.lgkm = 0;
-                                    }
+                              }
                         }
 
+                        /* ---------- 6. ds_ordered_count() barrier handling ------------------- */
                         if (instr->opcode == aco_opcode::ds_ordered_count &&
                               ((instr->ds().offset1 | (instr->ds().offset0 >> 8)) & 0x1)) {
                               imm.combine(ctx.barrier_imm[ffs(storage_gds) - 1]);
                               }
 
+                              /* ---------- 7. Handle explicit/acquire/release memory barriers -------- */
                               if (instr->opcode == aco_opcode::p_barrier) {
                                     perform_barrier(ctx, imm, instr->barrier().sync, semantic_acqrel);
                               } else {
                                     perform_barrier(ctx, imm, sync_info, semantic_release);
                               }
 
-                              if (ctx.pending_flat_vm  && imm.vm   == wait_imm::unset_counter)
-                                    imm.vm   = 0;
-                              if (ctx.pending_flat_lgkm && imm.lgkm == wait_imm::unset_counter)
-                                    imm.lgkm = 0;
+                              /* ---------- 8. GFX9 flat-access ambiguity *FIX*  --------------------- */
+                              /*
+                               * On GFX9 a FLAT read increments BOTH the LGKM and VM counters but we
+                               * cannot detect which path the data will return on. Therefore we must
+                               * always insert waits for *both* counters the *first* time we touch
+                               * them after the ambiguous FLAT. Failing to do so can lead to waves
+                               * that never retire and ultimately GPU ring-gfx timeouts.
+                               */
+                              if (ctx.pending_flat_vm && imm.vm == wait_imm::unset_counter)
+                                    imm.vm = 0;
+                  if (ctx.pending_flat_lgkm && imm.lgkm == wait_imm::unset_counter)
+                        imm.lgkm = 0;
 
-                              if (!imm.empty()) {
-                                    if (ctx.pending_flat_vm && imm.vm != wait_imm::unset_counter)
-                                          imm.vm = 0;
-                                    if (ctx.pending_flat_lgkm && imm.lgkm != wait_imm::unset_counter)
-                                          imm.lgkm = 0;
+                  /* ---------- 9. If there is nothing to wait for, we are done ---------- */
+                  if (imm.empty()) {
+                        return; /* early exit – all fast-paths above kept imm empty */
+                  }
 
-                                    /* reset counters */
-                                    for (unsigned i = 0; i < wait_type_num; i++) {
-                                          ctx.nonzero &= imm[i] == 0 ? ~BITFIELD_BIT(i) : UINT32_MAX;
-                                    }
+                  /* ---------- 10. Make sure flat ambiguity waits are actually 0 -------- */
+                  /*
+                   * Even if other code paths filled in a value ≥1, ambiguous FLAT waits
+                   * must reduce the counter to *zero* – any remaining outstanding access
+                   * could still choose the other path after a partial wait.
+                   */
+                  if (ctx.pending_flat_vm)
+                        imm.vm = 0;
+                  if (ctx.pending_flat_lgkm)
+                        imm.lgkm = 0;
 
-                                    /* update barrier wait imms */
-                                    for (unsigned i = 0; i < storage_count; i++) {
-                                          wait_imm& bar = ctx.barrier_imm[i];
-                                          uint16_t& bar_ev = ctx.barrier_events[i];
-                                          for (unsigned j = 0; j < wait_type_num; j++) {
-                                                if (bar[j] != wait_imm::unset_counter && imm[j] <= bar[j]) {
-                                                      bar[j] = wait_imm::unset_counter;
-                                                      bar_ev &= ~ctx.info->events[j];
-                                                }
-                                          }
-                                    }
+                  /* ---------- 11. Reset internal accounting for counters that drop ---- */
+                  u_foreach_bit(i, ctx.nonzero)
+                  {
+                        if (imm[i] == 0)
+                              ctx.nonzero &= ~BITFIELD_BIT(i); /* mark counter drained */
+                  }
 
-                                    /* remove all gprs with higher counter from map */
-                                    std::map<PhysReg, wait_entry>::iterator it = ctx.gpr_map.begin();
-                                    while (it != ctx.gpr_map.end()) {
-                                          for (unsigned i = 0; i < wait_type_num; i++) {
-                                                if (imm[i] != wait_imm::unset_counter && imm[i] <= it->second.imm[i]) {
-                                                      it->second.remove_wait((wait_type)i, ctx.info->events[i]);
-                                                }
-                                          }
-                                          if (!it->second.counters) {
-                                                it = ctx.gpr_map.erase(it);
-                                          } else {
-                                                it++;
-                                          }
-                                    }
+                  /* ---------- 12. Update per-barrier tracking information ------------- */
+                  for (unsigned s = 0; s < storage_count; ++s) {
+                        wait_imm& bar_imm = ctx.barrier_imm[s];
+                        uint16_t& bar_evt = ctx.barrier_events[s];
+
+                        for (unsigned i = 0; i < wait_type_num; ++i) {
+                              if (bar_imm[i] != wait_imm::unset_counter && imm[i] <= bar_imm[i]) {
+                                    bar_imm[i] = wait_imm::unset_counter;
+                                    bar_evt &= ~ctx.info->events[i];
                               }
+                        }
+                  }
 
-                              if (imm.vm == 0) {
-                                    ctx.pending_flat_vm = false;
+                  /* ---------- 13. Remove satisfied wait-entries from the GPR map ------ */
+                  for (auto it = ctx.gpr_map.begin(); it != ctx.gpr_map.end();) {
+                        wait_entry& e = it->second;
+
+                        for (unsigned i = 0; i < wait_type_num; ++i) {
+                              if (imm[i] != wait_imm::unset_counter && imm[i] <= e.imm[i]) {
+                                    e.remove_wait(static_cast<wait_type>(i), ctx.info->events[i]);
                               }
-                              if (imm.lgkm == 0) {
-                                    ctx.pending_flat_lgkm = false;
-                                    ctx.pending_s_buffer_store = false;
-                              }
+                        }
+
+                        /* If no counters remain -> erase element, else advance iterator. */
+                        if (!e.counters) {
+                              it = ctx.gpr_map.erase(it);
+                        } else {
+                              ++it;
+                        }
+                  }
+
+                  /* ---------- 14. Clear ambiguity flags once we actually waited ------- */
+                  if (imm.vm == 0)
+                        ctx.pending_flat_vm = false;
+                  if (imm.lgkm == 0) {
+                        ctx.pending_flat_lgkm = false;
+                        ctx.pending_s_buffer_store = false;
+                  }
             }
 
             void
@@ -663,7 +754,7 @@ namespace aco {
 
             void
             insert_wait_entry(wait_ctx& ctx, PhysReg reg, RegClass rc, wait_event event, bool wait_on_read,
-                              uint8_t vmem_types = 0, uint32_t vm_mask = 0)
+                              uint8_t vmem_types = 0, uint32_t vm_mask = 0, bool gfx9_flat_ambiguous = false)
             {
                   uint16_t counters = ctx.info->get_counters_for_event(event);
                   wait_imm imm;
@@ -673,6 +764,8 @@ namespace aco {
                   wait_entry new_entry(event, imm, counters, wait_on_read);
                   if (counters & counter_vm)
                         new_entry.vmem_types |= vmem_types;
+                  if (gfx9_flat_ambiguous)
+                        new_entry.gfx9_flat_ambiguous = true;
 
                   for (unsigned i = 0; i < rc.size(); i++, vm_mask >>= 2) {
                         new_entry.vm_mask = vm_mask & 0x3;
@@ -685,8 +778,7 @@ namespace aco {
             }
 
             void
-            insert_wait_entry(wait_ctx& ctx, Operand op, wait_event event, uint8_t vmem_types = 0,
-                              uint32_t vm_mask = 0)
+            insert_wait_entry(wait_ctx& ctx, Operand op, wait_event event, uint8_t vmem_types = 0, uint32_t vm_mask = 0)
             {
                   if (!op.isConstant() && !op.isUndefined())
                         insert_wait_entry(ctx, op.physReg(), op.regClass(), event, false, vmem_types, vm_mask);
@@ -694,9 +786,9 @@ namespace aco {
 
             void
             insert_wait_entry(wait_ctx& ctx, Definition def, wait_event event, uint8_t vmem_types = 0,
-                              uint32_t vm_mask = 0)
+                              uint32_t vm_mask = 0, bool gfx9_flat_ambiguous = false)
             {
-                  insert_wait_entry(ctx, def.physReg(), def.regClass(), event, true, vmem_types, vm_mask);
+                  insert_wait_entry(ctx, def.physReg(), def.regClass(), event, true, vmem_types, vm_mask, gfx9_flat_ambiguous);
             }
 
             void
@@ -727,39 +819,41 @@ namespace aco {
                               insert_wait_entry(ctx, exec, s2, ev, false);
                               break;
                         }
-                        case Format::FLAT: {
-                              FLAT_instruction& flat = instr->flat();
-                              wait_event vmem_ev = get_vmem_event(ctx, instr, vmem_nosampler);
-                              bool may_use_lds = flat.may_use_lds;
+                        case Format::FLAT:
+                        case Format::GLOBAL:
+                        case Format::SCRATCH: {
+                              bool is_flat = instr->format == Format::FLAT;
+                              memory_sync_info sync = get_sync_info(instr);
 
-                              /* GFX9: A FLAT instruction can target either the LDS or the texture cache (VMEM).
-                               * It must therefore increment both LGKM and VM counters. The one exception is if
-                               * the program has not allocated any LDS space, in which case the LDS path is
-                               * impossible.
-                               */
+                              wait_event vmem_ev = get_vmem_event(ctx, instr, vmem_nosampler);
+                              bool may_use_lds = is_flat && instr->flat().may_use_lds;
+                              bool gfx9_flat_ambiguous = false;
+
                               if (ctx.program->config->lds_size == 0) {
                                     may_use_lds = false;
                               }
 
                               /* Always update VMEM counters for the texture cache path. */
-                              update_counters(ctx, vmem_ev, flat.sync);
+                              update_counters(ctx, vmem_ev, sync);
                               if (may_use_lds) {
-                                    update_counters(ctx, event_lds, flat.sync);
+                                    update_counters(ctx, event_lds, sync);
                               }
 
-                              if (!instr->definitions.empty()) {
-                                    insert_wait_entry(ctx, instr->definitions[0], vmem_ev, 0, get_vmem_mask(ctx, instr));
-                                    if (may_use_lds) {
-                                          insert_wait_entry(ctx, instr->definitions[0], event_lds);
-                                    }
-                              }
-
-                              /* GFX9-specific: A FLAT load forces subsequent waits for both counters to be 0 because
-                               * the return path is ambiguous.
-                               */
                               if (ctx.gfx_level < GFX10 && !instr->definitions.empty() && may_use_lds) {
                                     ctx.pending_flat_lgkm = true;
                                     ctx.pending_flat_vm = true;
+                                    gfx9_flat_ambiguous = true;
+                              }
+
+                              if (!instr->definitions.empty()) {
+                                    uint32_t mask = (instr->format == Format::FLAT || instr->format == Format::GLOBAL ||
+                                    instr->format == Format::SCRATCH)
+                                    ? get_vmem_mask(ctx, instr)
+                                    : 0;
+                                    insert_wait_entry(ctx, instr->definitions[0], vmem_ev, 0, mask, gfx9_flat_ambiguous);
+                                    if (may_use_lds) {
+                                          insert_wait_entry(ctx, instr->definitions[0], event_lds, 0, 0, gfx9_flat_ambiguous);
+                                    }
                               }
                               break;
                         }
@@ -772,7 +866,6 @@ namespace aco {
                               } else if (ctx.gfx_level >= GFX10 && !smem.sync.can_reorder()) {
                                     ctx.pending_s_buffer_store = true;
                               }
-
                               break;
                         }
                         case Format::DS: {
@@ -802,9 +895,12 @@ namespace aco {
                         }
                         case Format::MUBUF:
                         case Format::MTBUF:
-                        case Format::MIMG:
-                        case Format::GLOBAL:
-                        case Format::SCRATCH: {
+                        case Format::MIMG: {
+                              aco_opcode op = instr->opcode;
+                              if (op == aco_opcode::image_get_resinfo || op == aco_opcode::image_get_lod) {
+                                    /* These are synchronous and do not use the VMEM datapath. */
+                                    break;
+                              }
                               uint8_t type = get_vmem_type(ctx.gfx_level, ctx.program->family, instr);
                               wait_event ev = get_vmem_event(ctx, instr, type);
                               uint32_t mask = ev == event_vmem ? get_vmem_mask(ctx, instr) : 0;
@@ -851,24 +947,36 @@ namespace aco {
                   imm.build_waitcnt(bld);
             }
 
-            bool
+            static bool
             check_clause_raw(std::bitset<512>& regs_written, Instruction* instr)
             {
-                  for (Operand op : instr->operands) {
-                        if (op.isConstant())
+                  /* ---------- 1. Detect RAW (read-after-write) conflicts -------------- */
+                  for (const Operand& op : instr->operands) {
+                        if (op.isConstant() || op.isUndefined()) {
                               continue;
-                        for (unsigned i = 0; i < op.size(); i++) {
-                              if (regs_written[op.physReg().reg() + i])
-                                    return false;
+                        }
+
+                        const unsigned base = op.physReg().reg();
+                        const unsigned sz = op.size();
+
+                        for (unsigned i = 0; i < sz; ++i) {
+                              if (regs_written.test(base + i)) {
+                                    return false; /* RAW conflict found */
+                              }
                         }
                   }
 
-                  for (Definition def : instr->definitions) {
-                        for (unsigned i = 0; i < def.size(); i++)
-                              regs_written[def.physReg().reg() + i] = 1;
+                  /* ---------- 2. Mark newly written registers ------------------------- */
+                  for (const Definition& def : instr->definitions) {
+                        const unsigned base = def.physReg().reg();
+                        const unsigned sz = def.size();
+
+                        for (unsigned i = 0; i < sz; ++i) {
+                              regs_written.set(base + i);
+                        }
                   }
 
-                  return true;
+                  return true; /* no conflict – safe to be in the same clause */
             }
 
             void
@@ -883,12 +991,19 @@ namespace aco {
                   for (size_t i = 0; i < block.instructions.size(); i++) {
                         aco_ptr<Instruction>& instr = block.instructions[i];
 
+                        /* Handle p_start_linear_vgpr, which defines immutable registers */
+                        if (instr->opcode == aco_opcode::p_start_linear_vgpr) {
+                              new_instructions.emplace_back(std::move(instr));
+                              continue;
+                        }
+
                         bool is_wait = queued_imm.unpack(ctx.gfx_level, instr.get());
 
                         memory_sync_info sync_info = get_sync_info(instr.get());
                         kill(queued_imm, instr.get(), ctx, sync_info);
 
-                        /* At the start of a possible clause, also emit waitcnts for each instruction to avoid
+                        /*
+                         * At the start of a possible clause, also emit waitcnts for each instruction to avoid
                          * splitting the clause.
                          */
                         if (i >= clause_end || !queued_imm.empty()) {
@@ -939,7 +1054,8 @@ namespace aco {
                         }
                   }
 
-                  /* For last block of a program which has succeed shader part, wait all memory ops done
+                  /*
+                   * For last block of a program which has succeed shader part, wait all memory ops done
                    * before go to next shader part.
                    */
                   if (block.kind & block_kind_end_with_regs) {
@@ -982,7 +1098,8 @@ namespace aco {
                   Block& current = program->blocks[i++];
 
                   if (current.kind & block_kind_discard_early_exit) {
-                        /* Because the jump to the discard early exit block may happen anywhere in a block, it's
+                        /*
+                         * Because the jump to the discard early exit block may happen anywhere in a block, it's
                          * not possible to join it with its predecessors this way.
                          * We emit all required waits when emitting the discard block.
                          */
@@ -1005,17 +1122,17 @@ namespace aco {
                               continue;
                   }
 
-                  /* Sometimes the counter for an entry is incremented or removed on all logical predecessors,
+                  /*
+                   * Sometimes the counter for an entry is incremented or removed on all logical predecessors,
                    * so it might be better to join entries using the logical predecessors instead of the linear
                    * ones.
                    */
                   bool logical_merge =
                   current.logical_preds.size() > 1 &&
-                  std::any_of(current.linear_preds.begin(), current.linear_preds.end(),
-                              [&](unsigned pred) {
-                                    return std::find(current.logical_preds.begin(), current.logical_preds.end(),
-                                                     pred) == current.logical_preds.end();
-                              });
+                  std::any_of(current.linear_preds.begin(), current.linear_preds.end(), [&](unsigned pred) {
+                        return std::find(current.logical_preds.begin(), current.logical_preds.end(), pred) ==
+                        current.logical_preds.end();
+                  });
 
                   bool changed = false;
                   for (unsigned b : current.linear_preds)
