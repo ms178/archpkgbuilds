@@ -139,7 +139,6 @@ DEF_U8(sched_burst_smoothness_short_e, BORE_DEF_BURST_SMOOTHNESS_SHORT);
 DEF_U8(sched_burst_pcore_hog_threshold_pct, BORE_DEF_PCORE_HOG_THRESHOLD_PCT);
 DEF_U8(sched_burst_pcore_hog_penalty_add, BORE_DEF_PCORE_HOG_PENALTY_ADD);
 
-
 /* ================================================================== */
 /*                          2.  Constants                             */
 /* ================================================================== */
@@ -149,17 +148,16 @@ DEF_U8(sched_burst_pcore_hog_penalty_add, BORE_DEF_PCORE_HOG_PENALTY_ADD);
 #define MAX_ECORE_OFFSET_ADJUST    10
 #define MIN_EFFECTIVE_OFFSET       4
 
-
 /* ================================================================== */
 /*                       3.  Static key                               */
 /* ================================================================== */
 DEFINE_STATIC_KEY_FALSE(bore_core_aware_key);
 
-
 /* ================================================================== */
 /*        3a.  Per-CPU “penalty params” cache (+ generation)          */
 /* ================================================================== */
 struct bore_penalty_param {
+	u64 offset_check;
 	u32 scale;
 	s16 itd_pri;
 	u8  offset;
@@ -178,17 +176,16 @@ static inline void bore_bump_penalty_gen(void)
 
 static inline const struct bore_penalty_param *bore_get_param(int cpu)
 {
-	struct bore_penalty_param *pp = &per_cpu(bore_penalty, cpu);
-	u8  g_now = (u8)atomic_read(&bore_penalty_gen);
-	s16 itd_now = arch_asym_cpu_priority(cpu);
+	/* This hot path assumes it is always called for the current CPU's rq. */
+	const struct bore_penalty_param *pp = this_cpu_ptr(&bore_penalty);
 
-	if (unlikely(pp->gen != g_now || pp->itd_pri != itd_now)) {
+	if (unlikely(pp->gen != (u8)atomic_read(&bore_penalty_gen) ||
+		pp->itd_pri != arch_asym_cpu_priority(cpu))) {
 		bore_build_penalty_param_for_cpu(cpu);
-	}
+		}
 
-	return pp;
+		return pp;
 }
-
 
 /* ================================================================== */
 /*                 4.  Per-CPU CPU-type cache                         */
@@ -203,7 +200,6 @@ static __always_inline enum x86_topology_cpu_type bore_get_cpu_type(int cpu)
 	return TOPO_CPU_TYPE_UNKNOWN;
 }
 
-
 /* ================================================================== */
 /*                       5.  Scale LUT                                */
 /* ================================================================== */
@@ -216,7 +212,6 @@ static void __init bore_build_scale_tbl(void)
 		bore_scale_tbl[i] = div_u64((u64)BORE_DEF_BURST_PENALTY_SCALE * i, 100);
 	}
 }
-
 
 /* ================================================================== */
 /*                     6.  Hybrid detection                           */
@@ -243,7 +238,6 @@ static bool __init is_intel_hybrid(void)
 {
 	return boot_cpu_has(X86_FEATURE_HYBRID_CPU) || is_intel_raptor_lake();
 }
-
 
 /* ================================================================== */
 /*          7.  Topology scan + deferred static-key enable            */
@@ -281,6 +275,8 @@ static void bore_build_penalty_param_for_cpu(int cpu)
 	pp->scale   = scale;
 	pp->offset  = offset;
 	pp->itd_pri = itd_pr;
+	/* Pre-calculate the threshold for the zero-penalty fast path. */
+	pp->offset_check = 1ULL << (offset - 1);
 	pp->gen     = (u8)atomic_read(&bore_penalty_gen);
 }
 
@@ -372,33 +368,51 @@ static int __init bore_late_topology_final_check(void)
 	return 0;
 }
 
-
 /* ================================================================== */
 /*                       8.  Penalty math                             */
 /* ================================================================== */
-static u32 log2p1_u64_u32fp(u64 v, u8 fp)
+static __always_inline u32 log2p1_u64_u32fp(u64 v, u8 fp)
 {
-	if (!v) {
+	u32 exponent, mantissa;
+
+	if (unlikely(!v))
 		return 0;
-	}
-	u32 exponent = fls64(v);
-	u32 mantissa = (u32)(v << (64 - exponent) >> (64 - fp - 1));
+
+	#if defined(__GNUC__) || defined(__clang__)
+	/* Use fast hardware instruction via compiler builtin. */
+	exponent = 64 - __builtin_clzll(v);
+	#else
+	exponent = fls64(v);
+	#endif
+	/*
+	 * Calculate the mantissa.
+	 * 1. Shift v left to align its MSB with bit 63.
+	 * 2. Shift left again by 1 to remove the implicit leading '1'.
+	 * 3. Shift right to extract the top `fp` bits of the fractional part.
+	 */
+	mantissa = (u32)((v << (64 - exponent)) << 1 >> (64 - fp));
 	return (exponent << fp) | mantissa;
 }
 
 static u32 __calc_burst_penalty(u64 burst_time, int cpu)
 {
 	const struct bore_penalty_param *pp = bore_get_param(cpu);
+	s32 penalty;
+	u64 scaled_penalty;
+
+	/* Optimization #1: Fast path for tasks with burst time too small to incur penalty. */
+	if (burst_time < pp->offset_check)
+		return 0;
 
 	s32 greed = (s32)log2p1_u64_u32fp(burst_time, BURST_PENALTY_SHIFT);
 	s32 tolerance = (s32)pp->offset << BURST_PENALTY_SHIFT;
-	s32 penalty = greed - tolerance;
+	penalty = greed - tolerance;
 
-	if (penalty <= 0) {
+	/* This check is theoretically redundant due to the fast path, but kept for safety. */
+	if (unlikely(penalty <= 0))
 		return 0;
-	}
 
-	u64 scaled_penalty = (u64)(u32)penalty * pp->scale;
+	scaled_penalty = (u64)(u32)penalty * pp->scale;
 	return min_t(u32, MAX_BURST_PENALTY, (u32)(scaled_penalty >> 10));
 }
 
@@ -415,7 +429,6 @@ static __always_inline u64 __unscale_slice(u64 d, u8 pr)
 	pr = min_t(u8, NICE_WIDTH - 1, pr);
 	return mul_u64_u32_shr(d, sched_prio_to_weight[pr], 10);
 }
-
 
 /* ================================================================== */
 /*                   9.  Smoothing & prio helpers                     */
@@ -463,7 +476,6 @@ static void reweight_task_by_prio(struct task_struct *p, int prio_val)
 	reweight_entity(cfs_rq, se, scale_load(sched_prio_to_weight[prio_val]), true);
 	se->load.inv_weight = sched_prio_to_wmult[prio_val];
 }
-
 
 /* ================================================================== */
 /*                   10.  Hot-path updates                            */
@@ -563,7 +575,6 @@ void restart_burst_rescale_deadline(struct sched_entity *se)
 	}
 }
 EXPORT_SYMBOL_GPL(restart_burst_rescale_deadline);
-
 
 /* ================================================================== */
 /*                11.  Inheritance & cache                            */
@@ -802,7 +813,6 @@ void sched_clone_bore(struct task_struct *p, struct task_struct *parent, u64 clo
 }
 EXPORT_SYMBOL_GPL(sched_clone_bore);
 
-
 /* ================================================================== */
 /*                       12.  Reset helpers                           */
 /* ================================================================== */
@@ -853,7 +863,6 @@ static void reset_all_task_weights_for_bore_toggle(void)
 	rcu_read_unlock();
 	pr_info("Task weight reset complete.\n");
 }
-
 
 /* ================================================================== */
 /*                          13.  Sysctl                               */
