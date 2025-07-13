@@ -437,6 +437,8 @@ ScheduleTreeOptimizer::applyTileBandOpt(isl::schedule_node Node, const Optimizer
     if (OAI->TTI) {
       // Corrected API call for getUnrollingPreferences.
       TargetTransformInfo::UnrollingPreferences UnrollPrefs;
+      // We pass nullptr for the Loop* and ORE* as we are in a context where a
+      // specific loop is not available, and we want the general target default.
       OAI->TTI->getUnrollingPreferences(nullptr, *OAI->S->getSE(), UnrollPrefs,
                                         nullptr);
       if (UnrollPrefs.Count > 0) {
@@ -524,6 +526,7 @@ isl::schedule_node ScheduleTreeOptimizer::optimizeScheduleNode(
 static unsigned countOuterParallelBands(const isl::schedule &Schedule) {
     unsigned Count = 0;
     if (isl::schedule_node Root = Schedule.get_root(); !Root.is_null()) {
+      // Corrected lambda signature to return isl::stat.
       Root.foreach_ancestor_top_down(
           [&](const isl::schedule_node &node) -> isl::stat {
             if (node.isa<isl::schedule_node_band>() &&
