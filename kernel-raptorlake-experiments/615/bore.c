@@ -973,7 +973,7 @@ static struct ctl_table bore_sysctls[] = {
 		.maxlen         = sizeof(uint),
 		.mode           = 0644,
 		.proc_handler   = bore_uint_sysctl_gen_handler,
-		.extra1         = SYSCTL_ONE,  /* Prevent div0 */
+		.extra1         = SYSCTL_ZERO,
 		.extra2         = (void *)&bore_sysctl_val_scale_max,
 	},
 	{
@@ -1094,14 +1094,14 @@ static struct ctl_table bore_sysctls[] = {
 		.extra1       = SYSCTL_ZERO,
 		.extra2       = (void *)&bore_sysctl_val_nicew,
 	},
-	{ /* Sentinel */ }
+	{ .procname = NULL }   /* Sentinel - marks end of table */
 };
 
 static struct ctl_table_header *bore_sysctl_header;
 
 static int __init bore_sysctl_init(void)
 {
-	bore_sysctl_header = register_sysctl_sz("kernel", bore_sysctls, ARRAY_SIZE(bore_sysctls));
+	bore_sysctl_header = register_sysctl_sz("kernel", bore_sysctls, ARRAY_SIZE(bore_sysctls) - 1);
 	if (!bore_sysctl_header) {
 		pr_err("failed to register sysctl table\n");
 		return -ENOMEM;
@@ -1110,7 +1110,6 @@ static int __init bore_sysctl_init(void)
 	return 0;
 }
 #endif /* CONFIG_SYSCTL */
-
 
 /* ================================================================== */
 /*                          14.  Init                                 */
