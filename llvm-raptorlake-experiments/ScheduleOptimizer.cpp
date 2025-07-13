@@ -229,6 +229,9 @@ struct OptimizerAdditionalInfoTy {
 // ScheduleTreeOptimizer - A set of post-scheduling transformations.
 //===----------------------------------------------------------------------===//
 
+// Forward-declarations for helper functions.
+static bool isSimpleInnermostBand(const isl::schedule_node &Node);
+
 class ScheduleTreeOptimizer final {
 public:
   static isl::schedule
@@ -257,23 +260,28 @@ struct InsertSimdMarkers final : ScheduleNodeRewriter<InsertSimdMarkers> {
 
   isl::schedule_node visitBand(isl::schedule_node_band Band) {
     isl::schedule_node Node = visitChildren(Band);
-    if (!Node.first_child().isa<isl::schedule_node_leaf>()) {
-      return Node;
+    if (!Node.isa<isl::schedule_node_band>()) {
+        return Node;
     }
 
-    Node = Band.insert_mark(isl::id::alloc(Band.ctx(), "SIMD", nullptr));
+    isl::schedule_node_band BandNode = Node.as<isl::schedule_node_band>();
 
+    if (!isSimpleInnermostBand(BandNode)) {
+      return BandNode;
+    }
+
+    isl::schedule_node_band ModifiedBand = BandNode;
     if (TTI) {
       unsigned RegBitWidth = TTI->getLoadStoreVecRegBitWidth(0);
       if (RegBitWidth > 0) {
         unsigned Alignment = llvm::divideCeil(RegBitWidth, 8);
         std::string OptStr = "{ align[" + std::to_string(Alignment) + "] }";
-        isl::union_set AlignOpts = isl::union_set(Node.ctx(), OptStr);
-        Node = Node.as<isl::schedule_node_band>().set_ast_build_options(AlignOpts);
+        isl::union_set AlignOpts = isl::union_set(ModifiedBand.ctx(), OptStr);
+        ModifiedBand = ModifiedBand.set_ast_build_options(AlignOpts);
       }
     }
     NumVectorizedBands++;
-    return Node;
+    return ModifiedBand.insert_mark(isl::id::alloc(Band.ctx(), "SIMD", nullptr));
   }
 };
 
@@ -523,17 +531,17 @@ isl::schedule_node ScheduleTreeOptimizer::optimizeScheduleNode(
   return Node;
 }
 
-static unsigned countOuterParallelBands(const isl::schedule &Schedule) {
+static unsigned countParallelBands(const isl::schedule &Schedule) {
     unsigned Count = 0;
     if (isl::schedule_node Root = Schedule.get_root(); !Root.is_null()) {
-      // Corrected lambda signature to return isl::stat.
-      Root.foreach_ancestor_top_down(
-          [&](const isl::schedule_node &node) -> isl::stat {
-            if (node.isa<isl::schedule_node_band>() &&
-                node.as<isl::schedule_node_band>().get_permutable()) {
-              Count++;
+      Root.foreach_descendant_top_down(
+          [&](const isl::schedule_node &node) -> isl::boolean {
+            if (node.isa<isl::schedule_node_band>()) {
+                if (node.as<isl::schedule_node_band>().get_permutable()) {
+                    Count++;
+                }
             }
-            return isl::stat::ok();
+            return isl::boolean(true); // Continue traversal
           });
     }
     return Count;
@@ -544,8 +552,8 @@ bool ScheduleTreeOptimizer::isProfitableSchedule(Scop &S,
   auto OldSchedule = S.getScheduleTree();
   assert(!OldSchedule.is_null() && "Original schedule should be valid");
 
-  unsigned NewParallelBands = countOuterParallelBands(NewSchedule);
-  unsigned OldParallelBands = countOuterParallelBands(OldSchedule);
+  unsigned NewParallelBands = countParallelBands(NewSchedule);
+  unsigned OldParallelBands = countParallelBands(OldSchedule);
 
   if (NewParallelBands > OldParallelBands) {
     return true;
