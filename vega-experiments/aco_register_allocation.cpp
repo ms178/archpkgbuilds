@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <cstring>
 #include <map>
 #include <optional>
 #include <vector>
@@ -304,43 +305,51 @@ namespace aco {
                   uint8_t data_stride;
                   RegClass rc;
 
-                  DefInfo(ra_ctx& ctx, aco_ptr<Instruction>& instr, RegClass rc_, int operand) : rc(rc_)
+                  DefInfo(ra_ctx&              ctx,
+                          aco_ptr<Instruction>& instr,
+                          RegClass              rc_,
+                          int                   operand)
+                  : rc(rc_)
                   {
-                        size = rc.size();
-                        stride = get_stride(rc);
-                        data_stride = 0;
+                        size        = rc.size();
+                        stride      = get_stride(rc) * 4u;
+                        data_stride = 0u;
+                        bounds      = get_reg_bounds(ctx, rc_);
 
-                        bounds = get_reg_bounds(ctx, rc);
-
+                        /* -------- sub-DWORD operand/definition cases ---------------------- */
                         if (rc.is_subdword() && operand >= 0) {
-                              /* stride in bytes */
                               stride = get_subdword_operand_stride(ctx.program->gfx_level, instr, operand, rc);
                         } else if (rc.is_subdword()) {
                               get_subdword_definition_info(ctx.program, instr);
-                        } else if (instr->isMIMG() && instr->mimg().d16 && ctx.program->gfx_level <= GFX9) {
-                              /* Workaround GFX9 hardware bug for D16 image instructions: FeatureImageGather4D16Bug
-                               *
-                               * The register use is not calculated correctly, and the hardware assumes a
-                               * full dword per component. Don't use the last registers of the register file.
-                               * Otherwise, the instruction will be skipped.
-                               *
-                               * https://reviews.llvm.org/D81172
-                               */
-                              bool imageGather4D16Bug = operand == -1 && rc == v2 && instr->mimg().dmask != 0xF;
-                              assert(ctx.program->gfx_level == GFX9 && "Image D16 on GFX8 not supported.");
+                        }
 
-                              if (imageGather4D16Bug)
-                                    bounds.size -= MAX2(rc.bytes() / 4 - ctx.num_linear_vgprs, 0);
-                        } else if (instr_info.classes[(int)instr->opcode] == instr_class::valu_pseudo_scalar_trans) {
-                              /* RDNA4 ISA doc, 7.10. Pseudo-scalar Transcendental ALU ops:
-                               * - VCC may not be used as a destination
-                               */
+                        /* -------- ImageGather4 D16 HW bug (GFX9) -------------------------- */
+                        else if (instr->isMIMG() && instr->mimg().d16 && ctx.program->gfx_level <= GFX9) {
+                              const bool gather4_bug = (operand == -1) && (rc == v2) && (instr->mimg().dmask != 0xF);
+                              if (gather4_bug) {
+                                    const PhysRegInterval full = get_reg_bounds(ctx, rc);
+                                    const unsigned danger_dws  = std::max<unsigned>(rc.bytes() / 4u, 1u);
+
+                                    /* Soft-block the problematic last DWORD(s) for *this* instr.   */
+                                    for (unsigned off = 0; off < danger_dws; ++off) {
+                                          const unsigned idx = full.hi().reg() - 1u - off;
+                                          if (idx < ctx.war_hint.size())
+                                                ctx.war_hint.set(idx);
+                                    }
+                                    /* Do NOT shrink bounds – avoids global VGPR loss.             */
+                              }
+                        }
+
+                        /* -------- Pseudo-scalar transcendentals may not write VCC --------- */
+                        else if (instr_info.classes[static_cast<int>(instr->opcode)]
+                              == instr_class::valu_pseudo_scalar_trans)
+                        {
                               if (bounds.contains(vcc))
                                     bounds.size = vcc - bounds.lo();
                         }
 
                         if (!data_stride)
-                              data_stride = rc.is_subdword() ? stride : (stride * 4);
+                              data_stride = stride;
                   }
 
             private:
@@ -360,10 +369,33 @@ namespace aco {
 
                   unsigned count_zero(PhysRegInterval reg_interval) const
                   {
-                        unsigned res = 0;
-                        for (PhysReg reg : reg_interval)
-                              res += !regs[reg];
-                        return res;
+                        /* Interval size is at most 512 DWORDs – fits easily in unsigned.      */
+                        const unsigned first_dw = reg_interval.lo().reg();
+                        const unsigned dwords   = reg_interval.size;
+                        const uint32_t* base    = regs.data() + first_dw;
+
+                        unsigned free = 0;
+                        unsigned i    = 0;
+
+                        /* Process two DWORDs per iteration via memcpy’ed 64-bit load.         */
+                        for (; i + 2u <= dwords; i += 2u) {
+                              uint64_t pair;
+                              ::memcpy(&pair, base + i, sizeof(pair));      /* alias-free load     */
+
+                              if (pair == 0ull) {
+                                    free += 2u;                                /* both DWORDs empty   */
+                              } else {
+                                    const uint32_t lo = static_cast<uint32_t>( pair         & 0xffffffffu);
+                                    const uint32_t hi = static_cast<uint32_t>((pair >> 32u) & 0xffffffffu);
+                                    free += (lo == 0u) + (hi == 0u);
+                              }
+                        }
+
+                        /* Handle trailing single DWORD, if any.                              */
+                        for (; i < dwords; ++i)
+                              free += (base[i] == 0u);
+
+                        return free;
                   }
 
                   static inline unsigned byte_index_of(const PhysReg& r) noexcept
@@ -678,6 +710,20 @@ namespace aco {
                   }
             }
 
+            static inline bool hazardous_vcc_write(const ra_ctx& ctx) noexcept
+            {
+                  /* No previous VCC-defining instruction recorded → safe. */
+                  if (!ctx.last_vcc_defining_instr_ptr)
+                        return false;
+
+                  /* If that instruction itself is a branch we are also safe. */
+                  constexpr instr_class kBranch = instr_class::branch;
+                  const instr_class cls =
+                  instr_info.classes[static_cast<int>(ctx.last_vcc_defining_instr_ptr->opcode)];
+
+                  return cls != kBranch;   /* true  → hazard, avoid another VCC write */
+            }
+
             bool
             is_sgpr_writable_without_side_effects(amd_gfx_level gfx_level, PhysReg reg)
             {
@@ -689,44 +735,46 @@ namespace aco {
                   (!has_flat_scr_lo_gfx7_or_xnack_mask || (reg.reg() != 104 && reg.reg() != 105));
             }
 
-            unsigned
-            get_subdword_operand_stride(amd_gfx_level gfx_level, const aco_ptr<Instruction>& instr,
-                                        unsigned idx, RegClass rc)
+            unsigned get_subdword_operand_stride(amd_gfx_level               gfx_level,
+                                                 const aco_ptr<Instruction>& instr,
+                                                 unsigned                    idx,
+                                                 RegClass                    rc)
             {
                   assert(gfx_level >= GFX8);
-                  if (instr->isPseudo()) {
-                        /* v_readfirstlane_b32 cannot use SDWA */
-                        if (instr->opcode == aco_opcode::p_as_uniform)
-                              return 4;
-                        else
-                              return rc.bytes() % 2 == 0 ? 2 : 1;
-                  }
-
                   assert(rc.bytes() <= 2);
-                  if (instr->isVALU()) {
-                        if (can_use_SDWA(gfx_level, instr, false))
-                              return rc.bytes();
-                        if (can_use_opsel(gfx_level, instr->opcode, idx))
-                              return 2;
-                        if (instr->isVOP3P())
-                              return 2;
-                  }
 
-                  switch (instr->opcode) {
-                        case aco_opcode::v_cvt_f32_ubyte0: return 1;
-                        case aco_opcode::ds_write_b8:
-                        case aco_opcode::ds_write_b16: return gfx_level >= GFX9 ? 2 : 4;
-                        case aco_opcode::buffer_store_byte:
-                        case aco_opcode::buffer_store_short:
-                        case aco_opcode::buffer_store_format_d16_x:
-                        case aco_opcode::flat_store_byte:
-                        case aco_opcode::flat_store_short:
-                        case aco_opcode::scratch_store_byte:
-                        case aco_opcode::scratch_store_short:
-                        case aco_opcode::global_store_byte:
-                        case aco_opcode::global_store_short: return gfx_level >= GFX9 ? 2 : 4;
-                        default: return 4;
-                  }
+                  /* 1) SDWA – best choice on VALU. */
+                  if (instr->isVALU() && can_use_SDWA(gfx_level, instr, /*is_def=*/false))
+                        return rc.bytes();                     /* 1 for 8-bit, 2 for 16-bit */
+
+                        /* 2) Pseudo ops. */
+                        if (instr->isPseudo()) {
+                              return (instr->opcode == aco_opcode::p_as_uniform) ? 4u
+                              : ((rc.bytes() % 2u) == 0u ? 2u : 1u);
+                        }
+
+                        /* 3) VALU fall-back: opSel or VOP3P. */
+                        if (instr->isVALU()) {
+                              if (can_use_opsel(gfx_level, instr->opcode, idx) || instr->isVOP3P())
+                                    return 2u;
+                        }
+
+                        /* 4) Non-VALU opcode specific cases. */
+                        switch (instr->opcode) {
+                              case aco_opcode::v_cvt_f32_ubyte0:                                 return 1u;
+                              case aco_opcode::ds_write_b8:
+                              case aco_opcode::ds_write_b16:
+                              case aco_opcode::buffer_store_byte:
+                              case aco_opcode::buffer_store_short:
+                              case aco_opcode::buffer_store_format_d16_x:
+                              case aco_opcode::flat_store_byte:
+                              case aco_opcode::flat_store_short:
+                              case aco_opcode::scratch_store_byte:
+                              case aco_opcode::scratch_store_short:
+                              case aco_opcode::global_store_byte:
+                              case aco_opcode::global_store_short:                               return (gfx_level >= GFX9) ? 2u : 4u;
+                              default:                                                           return 4u;
+                        }
             }
 
             void
@@ -807,7 +855,7 @@ namespace aco {
                   if (instr->isPseudo()) {
                         if (instr->opcode == aco_opcode::p_interp_gfx11) {
                               rc = RegClass(RegType::vgpr, rc.size());
-                              stride = 1;
+                              stride = 4;
                         }
                         return;
                   }
@@ -820,7 +868,7 @@ namespace aco {
                               return;
 
                         rc = instr_is_16bit(gfx_level, instr->opcode) ? v2b : v1;
-                        stride = rc == v2b ? 4 : 1;
+                        stride = 4;
                         if (instr->opcode == aco_opcode::v_fma_mixlo_f16 ||
                               can_use_opsel(gfx_level, instr->opcode, -1)) {
                               data_stride = 2;
@@ -851,7 +899,7 @@ namespace aco {
                               assert(gfx_level >= GFX9);
                               if (program->dev.sram_ecc_enabled) {
                                     rc = v1;
-                                    stride = 1;
+                                    stride = 4;
                                     data_stride = 2;
                               } else {
                                     stride = 2;
@@ -862,24 +910,19 @@ namespace aco {
                         case aco_opcode::buffer_load_format_d16_xyz:
                         case aco_opcode::tbuffer_load_format_d16_xyz: {
                               assert(gfx_level >= GFX9);
-                              if (program->dev.sram_ecc_enabled) {
+                              stride = 4;
+                              if (program->dev.sram_ecc_enabled)
                                     rc = v2;
-                                    stride = 1;
-                              } else {
-                                    stride = 4;
-                              }
                               return;
                         }
                         default: break;
                   }
 
-                  if (instr->isMIMG() && instr->mimg().d16 && !program->dev.sram_ecc_enabled) {
+                  stride = 4;
+                  if (instr->isMIMG() && instr->mimg().d16 && !program->dev.sram_ecc_enabled)
                         assert(gfx_level >= GFX9);
-                        stride = 4;
-                  } else {
+                  else
                         rc = RegClass(RegType::vgpr, rc.size());
-                        stride = 1;
-                  }
             }
 
             void
@@ -1343,7 +1386,8 @@ namespace aco {
                               info.bounds = PhysRegInterval::from_until(bounds.lo(), MIN2(def_reg.lo(), bounds.hi()));
                               res = get_reg_simple(ctx, reg_file, info);
                               if (!res && def_reg.hi() <= bounds.hi()) {
-                                    unsigned lo = (def_reg.hi() + info.stride - 1) & ~(info.stride - 1);
+                                    unsigned stride = DIV_ROUND_UP(info.stride, 4);
+                                    unsigned lo = (def_reg.hi() + stride - 1) & ~(stride - 1);
                                     info.bounds = PhysRegInterval::from_until(PhysReg{lo}, bounds.hi());
                                     res = get_reg_simple(ctx, reg_file, info);
                               }
@@ -1367,7 +1411,7 @@ namespace aco {
                         unsigned num_vars = 0;
 
                         /* we use a sliding window to find potential positions */
-                        unsigned stride = var.rc.is_subdword() ? 1 : info.stride;
+                        unsigned stride = DIV_ROUND_UP(info.stride, 4);
                         for (PhysRegInterval reg_win{bounds.lo(), size}; reg_win.hi() <= bounds.hi();
                              reg_win += stride) {
                               if (!is_dead_operand && intersects(reg_win, def_reg))
@@ -1453,200 +1497,213 @@ namespace aco {
             }
 
             std::optional<PhysReg>
-            get_reg_impl(ra_ctx& ctx, const RegisterFile& reg_file, std::vector<parallelcopy>& parallelcopies,
-                         const DefInfo& info, aco_ptr<Instruction>& instr)
+            get_reg_impl(ra_ctx&                    ctx,
+                         const RegisterFile&        reg_file,
+                         std::vector<parallelcopy>& parallelcopies,
+                         const DefInfo&             info,
+                         aco_ptr<Instruction>&      instr)
             {
                   const PhysRegInterval& bounds = info.bounds;
-                  uint32_t size = info.size;
-                  uint32_t stride = info.rc.is_subdword() ? DIV_ROUND_UP(info.stride, 4) : info.stride;
-                  RegClass rc = info.rc;
+                  const uint32_t         size   = info.size;
+                  const uint32_t         stride_dw = DIV_ROUND_UP(info.stride, 4u);
+                  const RegClass         rc     = info.rc;
 
-                  /* check how many free regs we have */
-                  unsigned regs_free = reg_file.count_zero(get_reg_bounds(ctx, rc));
+                  /* 1. quick simple attempt */
+                  if (auto simple = get_reg_simple(ctx, reg_file, info))
+                        return simple;
 
-                  /* mark and count killed operands */
+                  /* 2. free-register bookkeeping */
+                  const unsigned regs_free = reg_file.count_zero(get_reg_bounds(ctx, rc));
+
                   unsigned killed_ops = 0;
-                  std::bitset<256> is_killed_operand; /* per-register */
-                  std::bitset<256> is_precolored;     /* per-register */
-                  for (unsigned j = 0; !is_phi(instr) && j < instr->operands.size(); j++) {
-                        Operand& op = instr->operands[j];
-                        if (op.isTemp() && op.isPrecolored() && !op.isFirstKillBeforeDef() &&
-                              bounds.contains(op.physReg())) {
-                              for (unsigned i = 0; i < op.size(); ++i) {
-                                    is_precolored[(op.physReg() & 0xff) + i] = true;
+                  std::bitset<256> is_killed_operand;
+                  std::bitset<256> is_precolored;
+
+                  if (!is_phi(instr)) {
+                        /* mark killed operands / pre-coloured */
+                        for (const Operand& op : instr->operands) {
+                              if (op.isTemp() && op.isPrecolored() && !op.isFirstKillBeforeDef()
+                                    && bounds.contains(op.physReg()))
+                              {
+                                    for (unsigned i = 0; i < op.size(); ++i)
+                                          is_precolored[(op.physReg() & 0xffu) + i] = true;
                               }
-                              }
+
                               if (op.isTemp() && op.isFirstKillBeforeDef() && bounds.contains(op.physReg()) &&
-                                    !reg_file.test(PhysReg{op.physReg().reg()}, align(op.bytes() + op.physReg().byte(), 4))) {
-                                    assert(op.isFixed());
-
-                              for (unsigned i = 0; i < op.size(); ++i) {
-                                    is_killed_operand[(op.physReg() & 0xff) + i] = true;
+                                    !reg_file.test(PhysReg{op.physReg().reg()},
+                                                   align(op.bytes() + op.physReg().byte(), 4u)))
+                              {
+                                    for (unsigned i = 0; i < op.size(); ++i)
+                                          is_killed_operand[(op.physReg() & 0xffu) + i] = true;
+                                    killed_ops += op.getTemp().size();
                               }
+                        }
 
-                              killed_ops += op.getTemp().size();
-                                    }
-                  }
-                  for (unsigned j = 0; !is_phi(instr) && j < instr->definitions.size(); j++) {
-                        Definition& def = instr->definitions[j];
-                        if (def.isTemp() && def.isPrecolored() && bounds.contains(def.physReg())) {
-                              for (unsigned i = 0; i < def.size(); ++i) {
-                                    is_precolored[(def.physReg() & 0xff) + i] = true;
+                        for (const Definition& def : instr->definitions) {
+                              if (def.isTemp() && def.isPrecolored() && bounds.contains(def.physReg())) {
+                                    for (unsigned i = 0; i < def.size(); ++i)
+                                          is_precolored[(def.physReg() & 0xffu) + i] = true;
                               }
                         }
                   }
 
-                  assert((regs_free + ctx.num_linear_vgprs) >= size);
+                  const unsigned op_moves =
+                  (size > regs_free - killed_ops) ? (size - (regs_free - killed_ops)) : 0u;
 
-                  /* we might have to move dead operands to dst in order to make space */
-                  unsigned op_moves = 0;
+                  /* 3. sliding window search */
+                  PhysRegInterval best_win{bounds.lo(), size};
+                  unsigned best_moves = 0xffffffffu;
+                  unsigned best_vars  = 0u;
 
-                  if (size > (regs_free - killed_ops))
-                        op_moves = size - (regs_free - killed_ops);
-
-                  /* find the best position to place the definition */
-                  PhysRegInterval best_win = {bounds.lo(), size};
-                  unsigned num_moves = 0xFF;
-                  unsigned num_vars = 0;
-
-                  /* we use a sliding window to check potential positions */
-                  for (PhysRegInterval reg_win = {bounds.lo(), size}; reg_win.hi() <= bounds.hi();
-                       reg_win += stride) {
-                        /* first check if the register window starts in the middle of an
-                         * allocated variable: this is what we have to fix to allow for
-                         * num_moves > size */
-                        if (reg_win.lo() > bounds.lo() && !reg_file.is_empty_or_blocked(reg_win.lo()) &&
-                              reg_file.get_id(reg_win.lo()) == reg_file.get_id(reg_win.lo().advance(-1)))
+                  for (PhysRegInterval win{bounds.lo(), size}; win.hi() <= bounds.hi(); win += stride_dw) {
+                        /* avoid live-range splits at window edges */
+                        if (win.lo() > bounds.lo() &&
+                              !reg_file.is_empty_or_blocked(win.lo()) &&
+                              reg_file.get_id(win.lo()) == reg_file.get_id(win.lo().advance(-1)))
                               continue;
-                        if (reg_win.hi() < bounds.hi() && !reg_file.is_empty_or_blocked(reg_win.hi().advance(-1)) &&
-                              reg_file.get_id(reg_win.hi().advance(-1)) == reg_file.get_id(reg_win.hi()))
+                        if (win.hi() < bounds.hi() &&
+                              !reg_file.is_empty_or_blocked(win.hi().advance(-1)) &&
+                              reg_file.get_id(win.hi().advance(-1)) == reg_file.get_id(win.hi()))
                               continue;
 
-                        /* second, check that we have at most k=num_moves elements in the window
-                         * and no element is larger than the currently processed one */
-                        unsigned k = op_moves;
-                        unsigned n = 0;
-                        unsigned remaining_op_moves = op_moves;
-                        unsigned last_var = 0;
-                        bool found = true;
-                        bool aligned = rc == RegClass::v4 && reg_win.lo() % 4 == 0;
-                        for (const PhysReg j : reg_win) {
-                              /* dead operands effectively reduce the number of estimated moves */
-                              if (is_killed_operand[j & 0xFF]) {
-                                    if (remaining_op_moves) {
-                                          k--;
-                                          remaining_op_moves--;
+                        /* 4-SGPR alignment preference for dwordx4 SMEM */
+                        if (ctx.program->gfx_level == GFX9 &&
+                              rc == s4 && instr->isSMEM() &&
+                              ((win.lo() & 3u) != 0u))
+                              continue;
+
+                        unsigned moves   = op_moves;
+                        unsigned nvars   = 0u;
+                        unsigned remain  = op_moves;
+                        unsigned last_id = 0u;
+                        bool     ok      = true;
+
+                        for (PhysReg r : win) {
+                              if (is_killed_operand[r & 0xFFu]) {
+                                    if (remain) { --moves; --remain; }
+                                    continue;
+                              }
+                              if (is_precolored[r & 0xFFu]) {
+                                    ok = false; break;
+                              }
+
+                              const uint32_t slot = reg_file[r];
+                              if (slot == 0u || slot == last_id)
+                                    continue;
+
+                              if (slot == 0xF0000000u) {
+                                    ++moves; ++nvars; continue;
+                              }
+
+                              const assignment& a = ctx.assignments[slot];
+                              if (a.rc.size() >= size || a.rc.is_linear_vgpr()) {
+                                    ok = false; break;
+                              }
+
+                              moves += a.rc.size();
+                              ++nvars;
+                              last_id = slot;
+
+                              if (moves > best_moves ||
+                                    (moves == best_moves && nvars <= best_vars)) {
+                                    ok = false; break;
                                     }
-                                    continue;
-                              }
-                              if (is_precolored[j & 0xFF]) {
-                                    found = false;
-                                    break;
-                              }
-
-                              if (reg_file[j] == 0 || reg_file[j] == last_var)
-                                    continue;
-
-                              if (reg_file[j] == 0xF0000000) {
-                                    k += 1;
-                                    n++;
-                                    continue;
-                              }
-
-                              if (ctx.assignments[reg_file[j]].rc.size() >= size) {
-                                    found = false;
-                                    break;
-                              }
-
-                              /* we cannot split live ranges of linear vgprs */
-                              if (ctx.assignments[reg_file[j]].rc.is_linear_vgpr()) {
-                                    found = false;
-                                    break;
-                              }
-
-                              k += ctx.assignments[reg_file[j]].rc.size();
-                              n++;
-                              last_var = reg_file[j];
                         }
 
-                        if (!found || k > num_moves)
-                              continue;
-                        if (k == num_moves && n < num_vars)
-                              continue;
-                        if (!aligned && k == num_moves && n == num_vars)
+                        if (!ok)
                               continue;
 
-                        if (found) {
-                              best_win = reg_win;
-                              num_moves = k;
-                              num_vars = n;
-                        }
-                       }
+                        best_win   = win;
+                        best_moves = moves;
+                        best_vars  = nvars;
+                  }
 
-                       if (num_moves == 0xFF)
-                             return {};
+                  if (best_moves == 0xffffffffu)
+                        return {};                           /* must spill                */
 
-                  /* now, we figured the placement for our definition */
-                  RegisterFile tmp_file(reg_file);
-
-                  /* p_create_vector: also re-place killed operands in the definition space */
+                        /* 4. relocate blocking vars */
+                        RegisterFile tmp(reg_file);
                   if (instr->opcode == aco_opcode::p_create_vector)
-                        tmp_file.fill_killed_operands(instr.get());
+                        tmp.fill_killed_operands(instr.get());
 
-                  std::vector<unsigned> vars = collect_vars(ctx, tmp_file, best_win);
+                  std::vector<unsigned> blocking = collect_vars(ctx, tmp, best_win);
 
-                  /* re-enable killed operands */
                   if (!is_phi(instr) && instr->opcode != aco_opcode::p_create_vector)
-                        tmp_file.fill_killed_operands(instr.get());
+                        tmp.fill_killed_operands(instr.get());
 
-                  std::vector<parallelcopy> pc;
-                  if (!get_regs_for_copies(ctx, tmp_file, pc, vars, instr, best_win))
-                        return {};
+                  std::vector<parallelcopy> pc_local;
+                  if (!get_regs_for_copies(ctx, tmp, pc_local, blocking, instr, best_win))
+                        return {};                           /* spill path                */
 
-                  parallelcopies.insert(parallelcopies.end(), pc.begin(), pc.end());
+                        parallelcopies.insert(parallelcopies.end(), pc_local.begin(), pc_local.end());
 
                   adjust_max_used_regs(ctx, rc, best_win.lo());
                   return best_win.lo();
             }
 
-            bool
-            get_reg_specified(ra_ctx& ctx, const RegisterFile& reg_file, RegClass rc,
-                              aco_ptr<Instruction>& instr, PhysReg reg, int operand)
+            bool get_reg_specified(ra_ctx&               ctx,
+                                   const RegisterFile&   reg_file,
+                                   RegClass              rc,
+                                   aco_ptr<Instruction>& instr,
+                                   PhysReg               reg,
+                                   int                   operand)
             {
-                  /* catch out-of-range registers */
-                  if (reg >= PhysReg{512}) {
-                        return false;
-                  }
-
-                  DefInfo info(ctx, instr, rc, operand);
-
-                  if (reg.reg_b % info.data_stride)
+                  /* -------- quick out-of-range test --------------------------------- */
+                  if (reg >= PhysReg{512})
                         return false;
 
-                  assert(util_is_power_of_two_nonzero(info.stride));
-                  reg.reg_b &= ~(info.stride - 1);
+                        DefInfo info(ctx, instr, rc, operand);
 
-                  PhysRegInterval reg_win = {PhysReg(reg.reg()), info.rc.size()};
-                  PhysRegInterval vcc_win = {vcc, 2};
-                  /* VCC is outside the bounds */
-                  bool is_vcc =
-                  info.rc.type() == RegType::sgpr && vcc_win.contains(reg_win) && ctx.program->needs_vcc;
-                  bool is_m0 = info.rc == s1 && reg == m0 && can_write_m0(instr);
-                  if (!info.bounds.contains(reg_win) && !is_vcc && !is_m0)
-                        return false;
-
-                  if (instr_info.classes[(int)instr->opcode] == instr_class::valu_pseudo_scalar_trans) {
-                        /* RDNA4 ISA doc, 7.10. Pseudo-scalar Transcendental ALU ops:
-                         * - VCC may not be used as a destination
-                         */
-                        if (vcc_win.contains(reg_win))
+                        /* byte-alignment wrt data stride */
+                        if (reg.reg_b % info.data_stride)
                               return false;
-                  }
 
-                  if (reg_file.test(reg, info.rc.bytes()))
+                  /* dword stride alignment (stride is power-of-two) */
+                  reg.reg_b &= ~(info.stride - 1u);
+
+                  PhysRegInterval win{PhysReg(reg.reg()), info.rc.size()};
+                  PhysRegInterval vcc_win{vcc, 2};
+
+                  const bool want_vcc = (rc.type() == RegType::sgpr) &&
+                  vcc_win.contains(win) &&
+                  ctx.program->needs_vcc;
+
+                  const bool want_m0  = (rc == s1) &&
+                  (reg == m0) &&
+                  can_write_m0(instr);
+
+                  if (!info.bounds.contains(win) && !want_vcc && !want_m0)
                         return false;
 
-                  adjust_max_used_regs(ctx, info.rc, reg_win.lo());
+                  /* Transcendentals may not write VCC */
+                  if (instr_info.classes[static_cast<int>(instr->opcode)]
+                        == instr_class::valu_pseudo_scalar_trans &&
+                        vcc_win.contains(win))
+                        return false;
+
+                  /* Avoid re-emitting a VCC write that would trigger the hazard */
+                  if (want_vcc && hazardous_vcc_write(ctx))
+                        return false;
+
+                  /* Prefer 4-SGPR alignment for dwordx4 SMEM destinations (GFX9) */
+                  const bool needs_quad_align =
+                  (ctx.program->gfx_level == GFX9) &&
+                  (rc == s4) &&
+                  instr->isSMEM() &&
+                  ((win.lo() & 3u) != 0u);
+
+                  if (needs_quad_align)
+                        return false;
+
+                  /* Occupancy test */
+                  if (reg_file.test(reg, rc.bytes()))
+                        return false;
+
+                  adjust_max_used_regs(ctx, rc, win.lo());
+
+                  if (want_vcc)
+                        ctx.last_vcc_defining_instr_ptr = instr.get();
+
                   return true;
             }
 
@@ -1715,8 +1772,8 @@ namespace aco {
                         sorted.begin(), sorted.end(),
                             [=, &ctx](const IDAndInfo& a, const IDAndInfo& b)
                             {
-                                  unsigned a_stride = MAX2(a.info.stride * (a.info.rc.is_subdword() ? 1 : 4), 4);
-                                  unsigned b_stride = MAX2(b.info.stride * (b.info.rc.is_subdword() ? 1 : 4), 4);
+                                  unsigned a_stride = MAX2(a.info.stride, 4);
+                                  unsigned b_stride = MAX2(b.info.stride, 4);
                                   /* Since the SGPR bounds should always be a multiple of two, we can place
                                    * variables in this order:
                                    * - the usual 4 SGPR aligned variables
@@ -1747,8 +1804,7 @@ namespace aco {
                   PhysReg next_reg = start;
                   PhysReg space_reg;
                   for (IDAndInfo& var : sorted) {
-                        unsigned stride = var.info.rc.is_subdword() ? var.info.stride : var.info.stride * 4;
-                        next_reg.reg_b = align(next_reg.reg_b, MAX2(stride, 4));
+                        next_reg.reg_b = align(next_reg.reg_b, MAX2(var.info.stride, 4));
 
                         /* 0xffffffff is a special variable ID used reserve a space for killed
                          * operands and definitions.
