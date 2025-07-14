@@ -139,32 +139,47 @@ radv_sdma_pixel_area_to_blocks(const unsigned linear_slice_pitch, const unsigned
 }
 
 static struct radv_sdma_chunked_copy_info
-radv_sdma_get_chunked_copy_info(const struct radv_device *const device,
-                                const struct radv_sdma_surf *const img, const VkExtent3D extent)
+radv_sdma_get_chunked_copy_info(const struct radv_device           *device,
+                                const struct radv_sdma_surf        *img,
+                                const VkExtent3D                    extent)
 {
-    const unsigned extent_horizontal_blocks =
-    DIV_ROUND_UP(extent.width * img->texel_scale, img->blk_w);
-    const unsigned extent_vertical_blocks = DIV_ROUND_UP(extent.height, img->blk_h);
-    const unsigned aligned_row_pitch = ALIGN(extent_horizontal_blocks, 4);
-    const unsigned aligned_row_bytes = aligned_row_pitch * img->bpp;
+    (void)device; /* currently unused but kept for future tuning hooks */
 
-    /* Assume that we can always copy at least one full row at a time. */
-    const unsigned max_num_rows_per_copy =
-    MIN2(RADV_SDMA_TRANSFER_TEMP_BYTES / aligned_row_bytes, extent.height);
-    assert(max_num_rows_per_copy > 0);
+    /* Block-dimension horizontal/vertical extents ------------------- */
+    const unsigned horiz_blk = DIV_ROUND_UP(extent.width  * img->texel_scale,
+                                            img->blk_w);
+    const unsigned vert_blk  = DIV_ROUND_UP(extent.height,
+                                            img->blk_h);
 
-    /* Ensure that the number of rows copied at a time is a power of two. */
-    const unsigned num_rows_per_copy =
-    MAX2(1, util_next_power_of_two(max_num_rows_per_copy + 1) / 2);
+    const unsigned aligned_row_pitch  = ALIGN(horiz_blk, 4u);
+    const uint64_t aligned_row_bytes  = (uint64_t)aligned_row_pitch * img->bpp;
+    const uint64_t temp_cap           = RADV_SDMA_TRANSFER_TEMP_BYTES;
 
-    const struct radv_sdma_chunked_copy_info r = {
-        .extent_horizontal_blocks = extent_horizontal_blocks,
-        .extent_vertical_blocks = extent_vertical_blocks,
-        .aligned_row_pitch = aligned_row_pitch,
-        .num_rows_per_copy = num_rows_per_copy,
+    assert(aligned_row_bytes && aligned_row_bytes <= temp_cap);
+
+    /* Max #rows that physically fit into the temp buffer ------------- */
+    const uint64_t max_rows_fit = MIN2(temp_cap / aligned_row_bytes,
+                                       (uint64_t)extent.height);
+    assert(max_rows_fit); /* guaranteed by previous assert            */
+
+    /* Choose largest power-of-two ≤ max_rows_fit  -------------------- */
+    #if defined(__clang__) || defined(__GNUC__)
+    const unsigned pow2_rows =
+    1u << (31u - __builtin_clz((uint32_t)max_rows_fit));
+    #else
+    /* portable fallback */
+    unsigned pow2_rows = 1;
+    while (pow2_rows * 2u <= max_rows_fit)
+        pow2_rows <<= 1;
+    #endif
+
+    const struct radv_sdma_chunked_copy_info info = {
+        .extent_horizontal_blocks = horiz_blk,
+        .extent_vertical_blocks   = vert_blk,
+        .aligned_row_pitch        = aligned_row_pitch,
+        .num_rows_per_copy        = MAX2(1u, pow2_rows),
     };
-
-    return r;
+    return info;
 }
 
 static uint32_t
@@ -447,86 +462,92 @@ radv_sdma_emit_write_data_head(struct radeon_cmdbuf *cs, uint64_t va, uint32_t c
 }
 
 void
-radv_sdma_copy_memory(const struct radv_device *device, struct radeon_cmdbuf *cs, uint64_t src_va,
-                      uint64_t dst_va, uint64_t size)
+radv_sdma_copy_memory(const struct radv_device *device,
+                      struct radeon_cmdbuf     *cs,
+                      uint64_t                  src_va,
+                      uint64_t                  dst_va,
+                      uint64_t                  size)
 {
-    if (size == 0)
+    if (!size)
         return;
 
     const struct radv_physical_device *pdev = radv_device_physical(device);
-    const enum sdma_version ver = pdev->info.sdma_ip_version;
-    const unsigned max_size_per_packet =
-    ver >= SDMA_5_2 ? SDMA_V5_2_COPY_MAX_BYTES : SDMA_V2_0_COPY_MAX_BYTES;
+    const enum  sdma_version ver = pdev->info.sdma_ip_version;
 
-    unsigned align = ~0u;
-    unsigned ncopy = DIV_ROUND_UP(size, max_size_per_packet);
+    /* -----------------------------------------------------------------
+     * Maximum line length (bytes) per LINEAR packet.
+     * Only two macros exist in Mesa headers; SDMA 4.x/6.x share the
+     * 26-bit “length-1” field →  0x03_FFFF_FF   ( 64 MiB − 1 ).
+     * ----------------------------------------------------------------*/
+    const uint32_t max_bytes =
+    (ver >= SDMA_5_2) ? SDMA_V5_2_COPY_MAX_BYTES :     /* 1 GiB −1    */
+    (ver >= SDMA_4_0) ? 0x03FFFFFFu :                  /* 64 MiB −1    */
+    SDMA_V2_0_COPY_MAX_BYTES;      /* 2 MiB  −1    */
 
-    assert(ver >= SDMA_2_0);
+    /* SDMA 4+ encodes “length-1”; older versions encode exact length.   */
+    const bool     len_minus_one = ver >= SDMA_4_0;
 
-    /* SDMA FW automatically enables a faster dword copy mode when
-     * source, destination and size are all dword-aligned.
-     *
-     * When source and destination are dword-aligned, round down the size to
-     * take advantage of faster dword copy, and copy the remaining few bytes
-     * with the last copy packet.
-     */
-    if ((src_va & 0x3) == 0 && (dst_va & 0x3) == 0 && size > 4 && (size & 0x3) != 0) {
-        align = ~0x3u;
-        ncopy++;
-    }
-
-    radeon_check_space(device->ws, cs, ncopy * 7);
+    /* Command-stream space reservation (7 DW per packet)               */
+    const unsigned n_pkts = DIV_ROUND_UP(size, (uint64_t)max_bytes);
+    radeon_check_space(device->ws, cs, n_pkts * 7);
 
     radeon_begin(cs);
+    while (size) {
+        const uint64_t chunk = MIN2(size, (uint64_t)max_bytes);
 
-    for (unsigned i = 0; i < ncopy; i++) {
-        unsigned csize = size >= 4 ? MIN2(size & align, max_size_per_packet) : size;
-        radeon_emit(SDMA_PACKET(SDMA_OPCODE_COPY, SDMA_COPY_SUB_OPCODE_LINEAR, 0));
-        radeon_emit(ver >= SDMA_4_0 ? csize - 1 : csize);
-        radeon_emit(0); /* src/dst endian swap */
+        radeon_emit(SDMA_PACKET(SDMA_OPCODE_COPY,
+                                SDMA_COPY_SUB_OPCODE_LINEAR, 0));
+        radeon_emit(len_minus_one ? (uint32_t)(chunk - 1)
+        : (uint32_t)chunk);
+        radeon_emit(0);                        /* DW2: endian swap = 0   */
         radeon_emit(src_va);
         radeon_emit(src_va >> 32);
         radeon_emit(dst_va);
         radeon_emit(dst_va >> 32);
-        dst_va += csize;
-        src_va += csize;
-        size -= csize;
-    }
 
+        src_va += chunk;
+        dst_va += chunk;
+        size   -= chunk;
+    }
     radeon_end();
 }
 
 void
-radv_sdma_fill_memory(const struct radv_device *device, struct radeon_cmdbuf *cs, const uint64_t va,
-                      const uint64_t size, const uint32_t value)
+radv_sdma_fill_memory(const struct radv_device *device,
+                      struct radeon_cmdbuf     *cs,
+                      uint64_t                  va,
+                      uint64_t                  size,
+                      uint32_t                  value)
 {
+    if (!size)
+        return;
+
     const struct radv_physical_device *pdev = radv_device_physical(device);
-
-    const uint32_t fill_size = 2; /* count is in dwords */
-    const uint32_t header =
-    SDMA_PACKET(SDMA_OPCODE_CONSTANT_FILL, 0, 0) | (fill_size & 0x3) << 30;
-
     const enum sdma_version ver = pdev->info.sdma_ip_version;
-    assert(ver >= SDMA_2_4);
+    assert(ver >= SDMA_2_4);                     /* opcode availability */
 
-    const unsigned length_bits = (ver >= SDMA_6_0) ? 30 : (ver >= SDMA_4_0) ? 26 : 22;
+    const uint32_t header =
+    SDMA_PACKET(SDMA_OPCODE_CONSTANT_FILL, 0, 0) | (2u << 30); /* 32-bit */
 
-    const uint64_t max_fill_bytes = BITFIELD64_MASK(length_bits) & ~0x3ull;
+    /* Max byte count per packet (length field width)                   */
+    const unsigned len_bits = (ver >= SDMA_6_0) ? 30 :
+    (ver >= SDMA_4_0) ? 26 : 22;
+    const uint64_t max_bytes = BITFIELD64_MASK(len_bits) & ~0x3ull;
 
-    const unsigned num_packets = DIV_ROUND_UP(size, max_fill_bytes);
-    assert(cs->cdw + num_packets * 5 <= cs->max_dw);
+    const unsigned pkts = DIV_ROUND_UP(size, max_bytes);
+    radeon_check_space(device->ws, cs, pkts * 5);
 
     radeon_begin(cs);
-    for (unsigned i = 0; i < num_packets; ++i) {
-        const uint64_t offset = (uint64_t)i * max_fill_bytes;
-        const uint64_t fill_bytes = MIN2(size - offset, max_fill_bytes);
-        const uint64_t fill_va = va + offset;
+    for (unsigned i = 0; i < pkts; ++i) {
+        const uint64_t off   = (uint64_t)i * max_bytes;
+        const uint64_t bytes = MIN2(size - off, max_bytes);
+        const uint64_t dst   = va + off;
 
         radeon_emit(header);
-        radeon_emit(fill_va);
-        radeon_emit(fill_va >> 32);
-        radeon_emit(value);
-        radeon_emit(fill_bytes - 1);
+        radeon_emit(dst);
+        radeon_emit(dst >> 32);
+        radeon_emit(value);                      /* pattern DW0           */
+        radeon_emit((uint32_t)(bytes - 1));      /* DW4: byte count-1     */
     }
     radeon_end();
 }
@@ -760,90 +781,114 @@ radv_sdma_use_unaligned_buffer_image_copy(const struct radv_device *device,
 }
 
 void
-radv_sdma_copy_buffer_image_unaligned(const struct radv_device *device, struct radeon_cmdbuf *cs,
-                                      const struct radv_sdma_surf *buf,
-                                      const struct radv_sdma_surf *img_in,
-                                      const VkExtent3D base_extent,
-                                      struct radeon_winsys_bo *temp_bo, bool to_image)
+radv_sdma_copy_buffer_image_unaligned(const struct radv_device       *device,
+                                      struct radeon_cmdbuf           *cs,
+                                      const struct radv_sdma_surf    *buf,     /* always linear */
+                                      const struct radv_sdma_surf    *img_in,  /* may be tiled  */
+                                      const VkExtent3D                base_extent,
+                                      struct radeon_winsys_bo        *temp_bo,
+                                      bool                            to_image)
 {
+    /* ---------- 1. Pre-compute layout information ------------------ */
     const struct radv_sdma_chunked_copy_info info =
     radv_sdma_get_chunked_copy_info(device, img_in, base_extent);
-    struct radv_sdma_surf img = *img_in;
+
+    struct radv_sdma_surf img = *img_in;      /* mutable working copy  */
     struct radv_sdma_surf tmp = {
-        .va = temp_bo->va,
-        .bpp = img.bpp,
-        .blk_w = img.blk_w,
-        .blk_h = img.blk_h,
-        .pitch = info.aligned_row_pitch * img.blk_w,
-        .slice_pitch =
-        info.aligned_row_pitch * img.blk_w * info.extent_vertical_blocks * img.blk_h,
+        .va          = temp_bo->va,
+        .bpp         = img.bpp,
+        .blk_w       = img.blk_w,
+        .blk_h       = img.blk_h,
+        .pitch       = info.aligned_row_pitch * img.blk_w,  /* texels   */
+        .slice_pitch = info.aligned_row_pitch * img.blk_w *
+        info.extent_vertical_blocks * img.blk_h,
         .texel_scale = buf->texel_scale,
     };
+
+    const uint64_t row_bytes_tmp = (uint64_t)info.aligned_row_pitch * img.bpp;
+
+    const uint64_t buf_pitch_blk   =
+    radv_sdma_pixels_to_blocks(buf->pitch, img.blk_w);
+    const uint64_t buf_slice_blk   =
+    radv_sdma_pixel_area_to_blocks(buf->slice_pitch,
+                                   img.blk_w, img.blk_h);
 
     VkExtent3D extent = base_extent;
     extent.depth = 1;
 
+    /* ---------- 2. Depth-slice loop -------------------------------- */
     for (unsigned slice = 0; slice < base_extent.depth; ++slice) {
-        for (unsigned row_chunk_start = 0; row_chunk_start < info.extent_vertical_blocks;
-             row_chunk_start += info.num_rows_per_copy) {
-            const unsigned rows_in_chunk =
-            MIN2(info.extent_vertical_blocks - row_chunk_start, info.num_rows_per_copy);
 
-        img.offset.y = img_in->offset.y + row_chunk_start * img.blk_h;
-        img.offset.z = img_in->offset.z + slice;
-        extent.height = rows_in_chunk * img.blk_h;
-        tmp.slice_pitch = tmp.pitch * rows_in_chunk * img.blk_h;
+        /* ---------- vertical chunk loop ----------------------------- */
+        for (unsigned row_chunk_start = 0;
+             row_chunk_start < info.extent_vertical_blocks;
+        row_chunk_start += info.num_rows_per_copy)
+             {
+                 const unsigned rows = MIN2(info.extent_vertical_blocks - row_chunk_start,
+                                            info.num_rows_per_copy);
 
-        if (!to_image) {
-            /* Copy the rows from the source image to the temporary buffer. */
-            if (img.is_linear)
-                radv_sdma_emit_copy_linear_sub_window(device, cs, &img, &tmp, extent);
-            else
-                radv_sdma_emit_copy_tiled_sub_window(device, cs, &img, &tmp, extent, true);
+                 img.offset.y = img_in->offset.y + row_chunk_start * img.blk_h;
+                 img.offset.z = img_in->offset.z + slice;
+                 extent.height = rows * img.blk_h;
 
-            /* Wait for the copy to finish. */
-            radv_sdma_emit_nop(device, cs);
-        }
+                 tmp.slice_pitch = tmp.pitch * rows * img.blk_h;
 
-        /* buffer to image: copy each row from source buffer to temporary buffer.
-         * image to buffer: copy each row from temporary buffer to destination buffer.
-         */
-        for (unsigned r = 0; r < rows_in_chunk; ++r) {
-            /*
-             * FIX: Correctly calculate the source/destination buffer VA for each row.
-             * The original code contained a critical bug where it mixed block-based
-             * and element-based pitch calculations. The correct calculation uses the
-             * original element-based pitches from the `buf` surf info. To prevent
-             * overflow with large images, all parts of the offset calculation are
-             * promoted to 64-bit before multiplication.
-             */
-            const uint64_t current_row_in_buffer = row_chunk_start + r;
-            const uint64_t buf_byte_offset =
-            ((uint64_t)slice * buf->slice_pitch + (uint64_t)current_row_in_buffer * buf->pitch) *
-            buf->bpp;
+                 /* ---- STEP 1: image → tmp when *reading* from image ----- */
+                 if (!to_image) {
+                     if (img.is_linear)
+                         radv_sdma_emit_copy_linear_sub_window(device, cs, &img, &tmp, extent);
+                     else
+                         radv_sdma_emit_copy_tiled_sub_window(device, cs, &img, &tmp,
+                                                              extent, /*detile*/ true);
+                         radv_sdma_emit_nop(device, cs);
+                 }
 
-            const uint64_t buf_va = buf->va + buf_byte_offset;
-            const uint64_t tmp_va = tmp.va + (uint64_t)r * info.aligned_row_pitch * img.bpp;
-            radv_sdma_copy_memory(device, cs, to_image ? buf_va : tmp_va,
-                                  to_image ? tmp_va : buf_va,
-                                  info.extent_horizontal_blocks * img.bpp);
-        }
+                 /* ---- STEP 2: buffer ↔ tmp   (try single bulk copy) ----- */
+                 const bool contiguous =
+                 (buf_pitch_blk == info.extent_horizontal_blocks) &&
+                 (row_bytes_tmp   == (uint64_t)buf_pitch_blk * img.bpp);
 
-        /* Wait for the copy to finish. */
-        radv_sdma_emit_nop(device, cs);
+                 const uint64_t buf_base_off =
+                 ((uint64_t)slice * buf_slice_blk +
+                 (uint64_t)row_chunk_start) * buf_pitch_blk * img.bpp;
 
-        if (to_image) {
-            /* Copy the rows from the temporary buffer to the destination image. */
-            if (img.is_linear)
-                radv_sdma_emit_copy_linear_sub_window(device, cs, &tmp, &img, extent);
-            else
-                radv_sdma_emit_copy_tiled_sub_window(device, cs, &img, &tmp, extent, false);
+                 if (contiguous) {
+                     /* One big copy covers all rows in the chunk ---------- */
+                     const uint64_t bytes =
+                     (uint64_t)rows * row_bytes_tmp;
 
-            /* Wait for the copy to finish. */
-            radv_sdma_emit_nop(device, cs);
-        }
-             }
-    }
+                     radv_sdma_copy_memory(device, cs,
+                                           to_image ? buf->va + buf_base_off : tmp.va,
+                                           to_image ? tmp.va : buf->va + buf_base_off,
+                                           bytes);
+                 } else {
+                     /* Fallback: per-row copies (rare when user sets custom pitches) */
+                     for (unsigned r = 0; r < rows; ++r) {
+                         const uint64_t buf_row_off =
+                         buf_base_off + (uint64_t)r * buf_pitch_blk * img.bpp;
+                         const uint64_t tmp_row_off =
+                         (uint64_t)r * row_bytes_tmp;
+
+                         radv_sdma_copy_memory(device, cs,
+                                               to_image ? buf->va + buf_row_off : tmp.va + tmp_row_off,
+                                               to_image ? tmp.va + tmp_row_off : buf->va + buf_row_off,
+                                               row_bytes_tmp);
+                     }
+                 }
+
+                 radv_sdma_emit_nop(device, cs);
+
+                 /* ---- STEP 3: tmp → image when *writing* to image ------- */
+                 if (to_image) {
+                     if (img.is_linear)
+                         radv_sdma_emit_copy_linear_sub_window(device, cs, &tmp, &img, extent);
+                     else
+                         radv_sdma_emit_copy_tiled_sub_window(device, cs, &img, &tmp,
+                                                              extent, /*detile*/ false);
+                         radv_sdma_emit_nop(device, cs);
+                 }
+             } /* chunk */
+    } /* slice */
 }
 
 void
