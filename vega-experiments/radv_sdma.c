@@ -492,77 +492,37 @@ radv_sdma_fill_memory(const struct radv_device *device,
                       const uint32_t            value)
 {
     const struct radv_physical_device *pdev = radv_device_physical(device);
+
+    const uint32_t fill_size = 2; /* count is in dwords */
+    const uint32_t header =
+    SDMA_PACKET(SDMA_OPCODE_CONSTANT_FILL, 0, 0) |
+    (fill_size & 0x3) << 30;
+
     const enum sdma_version ver = pdev->info.sdma_ip_version;
-
-    /* CONSTANT_FILL is always a dword (4-byte) fill operation. Ensure alignment to prevent corruption. */
-    assert((va % 4) == 0);
-    assert((size % 4) == 0);
-    if (size == 0)
-        return;
-
     assert(ver >= SDMA_2_4);
 
-    uint64_t max_fill_dwords;
-    unsigned packet_dwords;
-    bool count_in_header = false;
-    bool count_before_value = false;
+    const unsigned length_bits =
+    (ver >= SDMA_6_0) ? 30 :
+    (ver >= SDMA_4_0) ? 26 : 22;
 
-    if (ver >= SDMA_6_0) {
-        /* SDMA6/7 (GFX11/12): 5 dwords, count in dword3, value in dword4, max 2^22 dwords. */
-        max_fill_dwords = (1ULL << 22);
-        packet_dwords = 5;
-        count_before_value = true;
-    } else if (ver >= SDMA_5_2) {
-        /* SDMA5.2 (RDNA2/GFX10.3): 5 dwords, count in dword3, value in dword4, max 2^22 dwords. */
-        max_fill_dwords = (1ULL << 22);
-        packet_dwords = 5;
-        count_before_value = true;
-    } else if (ver >= SDMA_5_0) {
-        /* SDMA5.0 (RDNA1/GFX10): 5 dwords, value in dword3, count in dword4, max 2^21 dwords. */
-        max_fill_dwords = (1ULL << 21);
-        packet_dwords = 5;
-    } else {
-        /* SDMA4 (Vega/GFX9): 4 dwords, count (22 bits) in header <<8, max 2^22 dwords. */
-        max_fill_dwords = (1ULL << 22);
-        packet_dwords = 4;
-        count_in_header = true;
-    }
+    const uint64_t max_fill_bytes =
+    BITFIELD64_MASK(length_bits) & ~0x3ull;
 
-    const uint64_t max_fill_bytes = max_fill_dwords * 4;
     const unsigned num_packets = DIV_ROUND_UP(size, max_fill_bytes);
-    ASSERTED unsigned cdw_max = radeon_check_space(device->ws, cs, num_packets * packet_dwords);
+    ASSERTED unsigned cdw_max = radeon_check_space(device->ws, cs,
+                                                   num_packets * 5);
 
     radeon_begin(cs);
     for (unsigned i = 0; i < num_packets; ++i) {
-        const uint64_t offset = (uint64_t)i * max_fill_bytes;
+        const uint64_t offset     = (uint64_t)i * max_fill_bytes;
         const uint64_t fill_bytes = MIN2(size - offset, max_fill_bytes);
-        const uint64_t fill_va = va + offset;
-        const uint64_t num_dwords = fill_bytes / 4;
-        const uint64_t count = num_dwords - 1;
+        const uint64_t fill_va    = va + offset;
 
-        /* Ensure no overflow in count field. */
-        assert(count < (1ULL << 32));
-
-        uint32_t header = SDMA_PACKET(SDMA_OPCODE_CONSTANT_FILL, 0, 0);
-        if (count_in_header) {
-            /* For SDMA4, count is embedded in header bits 29:8. */
-            header |= (uint32_t)(count << 8);
-            radeon_emit(header);
-            radeon_emit((uint32_t)fill_va);
-            radeon_emit((uint32_t)(fill_va >> 32));
-            radeon_emit(value);
-        } else {
-            radeon_emit(header);
-            radeon_emit((uint32_t)fill_va);
-            radeon_emit((uint32_t)(fill_va >> 32));
-            if (count_before_value) {
-                radeon_emit((uint32_t)count);
-                radeon_emit(value);
-            } else {
-                radeon_emit(value);
-                radeon_emit((uint32_t)count);
-            }
-        }
+        radeon_emit(header);
+        radeon_emit(fill_va);
+        radeon_emit(fill_va >> 32);
+        radeon_emit(value);
+        radeon_emit(fill_bytes - 1);
     }
     radeon_end();
     assert(cs->cdw <= cdw_max);
