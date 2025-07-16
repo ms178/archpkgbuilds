@@ -145,6 +145,7 @@ def add_fabs_fneg(pattern, replacements, commutative = True):
         result.append(to_tuple(curr))
     return result
 
+
 optimizations = [
    # These will be recreated by late_algebraic if supported.
    # Lowering here means we don't have to duplicate all other optimization patterns.
@@ -484,10 +485,10 @@ optimizations.extend([
    (('ffma@64', a, b, c), ('fadd', ('fmul', a, b), c), 'options->lower_ffma64'),
    (('ffmaz', a, b, c), ('fadd', ('fmulz', a, b), c), 'options->lower_ffma32'),
    # Always lower inexact ffma, because it will be fused back by late optimizations (nir_opt_algebraic_late).
-   (('~ffma@16', a, b, c), ('fadd', ('fmul', a, b), c), 'options->fuse_ffma16'),
-   (('~ffma@32', a, b, c), ('fadd', ('fmul', a, b), c), 'options->fuse_ffma32'),
-   (('~ffma@64', a, b, c), ('fadd', ('fmul', a, b), c), 'options->fuse_ffma64'),
-   (('~ffmaz', a, b, c), ('fadd', ('fmulz', a, b), c), 'options->fuse_ffma32'),
+   (('ffma@16(contract)', a, b, c), ('fadd', ('fmul', a, b), c), 'options->fuse_ffma16'),
+   (('ffma@32(contract)', a, b, c), ('fadd', ('fmul', a, b), c), 'options->fuse_ffma32'),
+   (('ffma@64(contract)', a, b, c), ('fadd', ('fmul', a, b), c), 'options->fuse_ffma64'),
+   (('ffmaz(contract)', a, b, c), ('fadd', ('fmulz', a, b), c), 'options->fuse_ffma32'),
 
    (('~fmul', ('fadd', ('bcsel', a, ('fmul', b, c), 0), '#d'), '#e'),
     ('bcsel', a, ('fmul', ('fadd', ('fmul', b, c), d), e), ('fmul', d, e))),
@@ -1144,6 +1145,18 @@ for s in [16, 32, 64]:
        # support fp16 don't support int16.
        (('bcsel@{}'.format(s), ('feq', a, 0.0), 1.0, ('i2f{}'.format(s), ('iadd', ('b2i{}'.format(s), ('flt', 0.0, 'a@{}'.format(s))), ('ineg', ('b2i{}'.format(s), ('flt', 'a@{}'.format(s), 0.0)))))),
         ('i2f{}'.format(s), ('iadd', ('b2i32', ('!fge', a, 0.0)), ('ineg', ('b2i32', ('!flt', a, 0.0)))))),
+
+       # Signed pow() used in Control. It's not enough to match just the
+       # copysign piece because we would require extra instructions to handle
+       # the various floating point special cases. Specializing to the pow
+       # sequence lets us collapse all the sign fixup code.
+       (('fmul', ('fexp2', ('fmul', ('flog2', ('fabs', a)), b)),
+         ('i2f', ('iadd',           ('b2i', ('flt', 0.0, a)),
+                          ('ineg', ('b2i', ('flt', a, 0.0)))))),
+
+        ('bcsel', ('!flt', a, 0.0),
+         ('fneg', ('fexp2', ('fmul', ('flog2', ('fabs', a)), b))),
+                  ('fexp2', ('fmul', ('flog2', ('fabs', a)), b)))),
 
        (('bcsel', a, ('b2f(is_used_once)', 'b@{}'.format(s)), ('b2f', 'c@{}'.format(s))), ('b2f', ('bcsel', a, b, c))),
 
@@ -2775,6 +2788,13 @@ optimizations.extend([
    # If a <= 0, then -a >= 0. So fsat(-a) is just fsat applied to a non-negative number.
    (('fsat', ('fneg(is_used_once)', 'a(is_not_positive)')), ('fsat', ('fneg', a))),
 
+   # Fuse fmin(fmax(a, 0.0), 1.0) into fsat(a). This is a common pattern for
+   # clamping values to the [0, 1] range. The fsat intrinsic can often be
+   # implemented for free using an output modifier on a preceding VALU instruction
+   # on Vega, making this a significant "two-for-one" optimization. The
+   # transformation is safe with respect to NaNs.
+   (('fmin', ('fmax(is_used_once)', a, 0.0), 1.0), ('fsat', a), '!options->lower_fsat'),
+
 ])
 
 for bit_size in [8, 16, 32, 64]:
@@ -3618,7 +3638,7 @@ for sz, mulz in itertools.product([16, 32, 64], [False, True]):
     fmul = ('fmulz' if mulz else 'fmul') + '(is_only_used_by_fadd)'
     ffma = 'ffmaz' if mulz else 'ffma'
 
-    fadd = '~fadd@{}'.format(sz)
+    fadd = 'fadd@{}(contract)'.format(sz)
     option = 'options->fuse_ffma{}'.format(sz)
 
     late_optimizations.extend([
@@ -3635,7 +3655,6 @@ for sz, mulz in itertools.product([16, 32, 64], [False, True]):
     ])
 
 late_optimizations.extend([
-
    # Subtractions get lowered during optimization, so we need to recombine them
    (('fadd@8', a, ('fneg', 'b')), ('fsub', 'a', 'b'), 'options->has_fsub'),
    (('fadd@16', a, ('fneg', 'b')), ('fsub', 'a', 'b'), 'options->has_fsub'),
