@@ -1153,9 +1153,6 @@ namespace aco {
 
                   /* Main free-window scan using a sliding window. */
                   for (PhysRegInterval win{bounds.lo(), size}; win.hi() <= bounds.hi(); win += stride_dw) {
-                        if (UNLIKELY(ctx.war_hint[win.lo()])) {
-                              continue; /* Optimization: skip windows starting with a WAR hazard. */
-                        }
                         if (std::all_of(win.begin(), win.end(), is_free)) {
                               if (stride_dw == 1u) {
                                     PhysRegIterator new_rr{PhysReg{win.lo() + size}};
@@ -1469,23 +1466,20 @@ namespace aco {
             }
 
             std::optional<PhysReg>
-            get_reg_impl(ra_ctx&                    ctx,
-                         const RegisterFile&        reg_file,
-                         std::vector<parallelcopy>& parallelcopies,
-                         const DefInfo&             info,
-                         aco_ptr<Instruction>&      instr)
+            get_reg_impl(ra_ctx& ctx, const RegisterFile& reg_file, std::vector<parallelcopy>& parallelcopies,
+                         const DefInfo& info, aco_ptr<Instruction>& instr)
             {
                   const PhysRegInterval& bounds = info.bounds;
-                  const uint32_t         size   = info.size;
-                  const uint32_t         stride_dw = DIV_ROUND_UP(info.stride, 4u);
-                  const RegClass         rc     = info.rc;
+                  uint32_t size = info.size;
+                  uint32_t stride_dw = DIV_ROUND_UP(info.stride, 4u);
+                  RegClass rc = info.rc;
 
-                  /* 1. quick simple attempt */
+                  /* 1. Quick simple attempt */
                   if (auto simple = get_reg_simple(ctx, reg_file, info))
                         return simple;
 
-                  /* 2. free-register bookkeeping */
-                  const unsigned regs_free = reg_file.count_zero(get_reg_bounds(ctx, rc));
+                  /* 2. Free-register bookkeeping */
+                  unsigned regs_free = reg_file.count_zero(get_reg_bounds(ctx, rc));
 
                   unsigned killed_ops = 0;
                   std::bitset<256> is_killed_operand;
@@ -1494,21 +1488,19 @@ namespace aco {
                   if (!is_phi(instr)) {
                         /* mark killed operands / pre-coloured */
                         for (const Operand& op : instr->operands) {
-                              if (op.isTemp() && op.isPrecolored() && !op.isFirstKillBeforeDef()
-                                    && bounds.contains(op.physReg()))
-                              {
+                              if (op.isTemp() && op.isPrecolored() && !op.isFirstKillBeforeDef() &&
+                                    bounds.contains(op.physReg())) {
                                     for (unsigned i = 0; i < op.size(); ++i)
                                           is_precolored[(op.physReg() & 0xffu) + i] = true;
-                              }
+                                    }
 
-                              if (op.isTemp() && op.isFirstKillBeforeDef() && bounds.contains(op.physReg()) &&
-                                    !reg_file.test(PhysReg{op.physReg().reg()},
-                                                   align(op.bytes() + op.physReg().byte(), 4u)))
-                              {
-                                    for (unsigned i = 0; i < op.size(); ++i)
-                                          is_killed_operand[(op.physReg() & 0xffu) + i] = true;
-                                    killed_ops += op.getTemp().size();
-                              }
+                                    if (op.isTemp() && op.isFirstKillBeforeDef() && bounds.contains(op.physReg()) &&
+                                          !reg_file.test(PhysReg{op.physReg().reg()},
+                                                         align(op.bytes() + op.physReg().byte(), 4u))) {
+                                          for (unsigned i = 0; i < op.size(); ++i)
+                                                is_killed_operand[(op.physReg() & 0xffu) + i] = true;
+                                          killed_ops += op.getTemp().size();
+                                                         }
                         }
 
                         for (const Definition& def : instr->definitions) {
@@ -1519,16 +1511,16 @@ namespace aco {
                         }
                   }
 
-                  const unsigned op_moves =
-                  (size > regs_free - killed_ops) ? (size - (regs_free - killed_ops)) : 0u;
+                  const unsigned op_moves = (size > regs_free - killed_ops) ? (size - (regs_free - killed_ops)) : 0u;
 
-                  /* 3. sliding window search */
+                  /* 3. Sliding window search with cost model */
                   PhysRegInterval best_win{bounds.lo(), size};
                   unsigned best_moves = 0xffffffffu;
                   unsigned best_vars  = 0u;
+                  const unsigned cost_for_hazard = 1; /* Penalty for using a WAR-hinted register */
 
                   for (PhysRegInterval win{bounds.lo(), size}; win.hi() <= bounds.hi(); win += stride_dw) {
-                        /* avoid live-range splits at window edges */
+                        /* Avoid live-range splits at window edges */
                         if (win.lo() > bounds.lo() &&
                               !reg_file.is_empty_or_blocked(win.lo()) &&
                               reg_file.get_id(win.lo()) == reg_file.get_id(win.lo().advance(-1)))
@@ -1544,13 +1536,17 @@ namespace aco {
                               ((win.lo() & 3u) != 0u))
                               continue;
 
-                        unsigned moves   = op_moves;
-                        unsigned nvars   = 0u;
-                        unsigned remain  = op_moves;
+                        unsigned moves = op_moves;
+                        unsigned nvars = 0u;
+                        unsigned remain = op_moves;
                         unsigned last_id = 0u;
-                        bool     ok      = true;
+                        bool ok = true;
+                        bool has_hazard = false;
 
                         for (PhysReg r : win) {
+                              if (ctx.war_hint[r])
+                                    has_hazard = true;
+
                               if (is_killed_operand[r & 0xFFu]) {
                                     if (remain) { --moves; --remain; }
                                     continue;
@@ -1585,15 +1581,21 @@ namespace aco {
                         if (!ok)
                               continue;
 
-                        best_win   = win;
+                        if (has_hazard)
+                              moves += cost_for_hazard;
+
+                        if (moves < best_moves ||
+                              (moves == best_moves && nvars > best_vars)) {
+                              best_win   = win;
                         best_moves = moves;
                         best_vars  = nvars;
+                              }
                   }
 
                   if (best_moves == 0xffffffffu)
                         return {};                           /* must spill                */
 
-                        /* 4. relocate blocking vars */
+                        /* 4. Relocate blocking vars */
                         RegisterFile tmp(reg_file);
                   if (instr->opcode == aco_opcode::p_create_vector)
                         tmp.fill_killed_operands(instr.get());
@@ -3469,20 +3471,17 @@ namespace aco {
                         return;
                   }
 
-                  /* Identify which operand (if any) is a literal suitable for SOPK's 16-bit signed immediate. */
-                  int literal_idx = -1;
-                  int32_t imm_val = 0;
-
+                  /* Helper to check if a 32-bit constant value fits in a signed 16-bit immediate. */
                   auto is_s16 = [](uint32_t val) -> bool {
                         return (int32_t)val >= INT16_MIN && (int32_t)val <= INT16_MAX;
                   };
 
+                  /* Identify which operand (if any) is a literal suitable for SOPK's 16-bit signed immediate. */
+                  int literal_idx = -1;
                   if (instr->operands[1].isLiteral() && is_s16(instr->operands[1].constantValue())) {
                         literal_idx = 1;
-                        imm_val = instr->operands[1].constantValue();
                   } else if (instr->operands[0].isLiteral() && is_s16(instr->operands[0].constantValue())) {
                         literal_idx = 0;
-                        imm_val = instr->operands[0].constantValue();
                   }
 
                   if (literal_idx == -1) {
@@ -3491,6 +3490,7 @@ namespace aco {
 
                   const int reg_op_idx = 1 - literal_idx;
                   const Operand& reg_op = instr->operands[reg_op_idx];
+                  const Operand& lit_op = instr->operands[literal_idx];
 
                   /* The register operand must be a temporary that is killed to ensure the tie is valid. */
                   if (!reg_op.isTemp() || !reg_op.isKillBeforeDef()) {
@@ -3505,6 +3505,8 @@ namespace aco {
                         case aco_opcode::s_add_u32:
                               /* Promotion to s_addk_i32 is valid if Dst == RegSrc. */
                               if (tied_to_reg_op) {
+                                    /* s_add_u32 also has a carry-out to SCC, which s_addk_i32 does as well.
+                                     * We must ensure the SCC output from the original instruction is killed. */
                                     if (instr->opcode == aco_opcode::s_add_u32 &&
                                           (instr->definitions.size() < 2 || !instr->definitions[1].isKill())) {
                                           break;
@@ -3539,20 +3541,21 @@ namespace aco {
                         return;
                         }
 
-                        if (ctx.assignments[instr->definitions[0].tempId()].affinity) {
-                              const assignment& aff = ctx.assignments[ctx.assignments[instr->definitions[0].tempId()].affinity];
-                              if (aff.assigned && aff.reg != reg_op.physReg()) {
-                                    return; /* Affinity requirement conflicts with tied operand. */
-                              }
+                        const unsigned def_id = instr->definitions[0].tempId();
+                  if (ctx.assignments[def_id].affinity) {
+                        const assignment& aff = ctx.assignments[ctx.assignments[def_id].affinity];
+                        if (aff.assigned && aff.reg != reg_op.physReg()) {
+                              return; /* Affinity requirement conflicts with tied operand. */
                         }
+                  }
 
-                        /* Perform the promotion to the more compact SOPK format. */
-                        aco_ptr<Instruction> sopk{create_instruction(new_op, Format::SOPK, 1, 1)};
-                        sopk->definitions[0] = instr->definitions[0];
-                        sopk->operands[0] = reg_op;
-                        sopk->salu().imm = static_cast<uint16_t>(imm_val);
+                  /* Perform the promotion to the more compact SOPK format. */
+                  aco_ptr<Instruction> sopk{create_instruction(new_op, Format::SOPK, 1, 1)};
+                  sopk->definitions[0] = instr->definitions[0];
+                  sopk->operands[0] = reg_op;
+                  sopk->salu().imm = static_cast<uint16_t>(lit_op.constantValue());
 
-                        instr = std::move(sopk);
+                  instr = std::move(sopk);
             }
 
             void
