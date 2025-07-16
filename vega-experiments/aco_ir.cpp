@@ -1604,7 +1604,8 @@ namespace aco {
                         instr->opcode == aco_opcode::s_fmac_f16) {
                         ops.push_back(2);
                         } else if (instr->opcode == aco_opcode::s_addk_i32 || instr->opcode == aco_opcode::s_mulk_i32 ||
-                              instr->opcode == aco_opcode::s_cmovk_i32) {
+                              instr->opcode == aco_opcode::s_cmovk_i32 ||
+                              instr->opcode == aco_opcode::ds_bvh_stack_push4_pop1_rtn_b32) {
                               ops.push_back(0);
                               } else if (instr->isMUBUF() && instr->definitions.size() == 1 && instr->operands.size() == 4) {
                                     ops.push_back(3);
@@ -1613,8 +1614,8 @@ namespace aco {
                                     ops.push_back(2);
                                     } else if (instr->opcode == aco_opcode::image_bvh8_intersect_ray) {
                                           /* VADDR starts at 3. */
-                                          ops.push_back(3 + 2);
-                                          ops.push_back(3 + 3);
+                                          ops.push_back(3 + 4);
+                                          ops.push_back(3 + 7);
                                     }
                                     return ops;
             }
