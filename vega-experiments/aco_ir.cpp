@@ -286,68 +286,90 @@ namespace aco {
             bool
             can_use_SDWA(amd_gfx_level gfx_level, const aco_ptr<Instruction>& instr, bool pre_ra)
             {
-                  if (!instr->isVALU()) [[unlikely]]
+                  if (!instr->isVALU()) [[unlikely]] {
                         return false;
+                  }
 
-                  /* SDWA is GFX8-GFX10. Vega is GFX9. This check is critical. */
-                  if (gfx_level < GFX8 || gfx_level >= GFX11) [[unlikely]]
+                  /* SDWA is a GFX8, GFX9, and GFX10 feature. */
+                  if (gfx_level < GFX8 || gfx_level >= GFX11) [[unlikely]] {
                         return false;
+                  }
 
-                  if (instr->isDPP() || instr->isVOP3P())
+                  if (instr->isDPP() || instr->isVOP3P()) {
                         return false;
+                  }
 
-                  if (instr->isSDWA())
+                  if (instr->isSDWA()) {
                         return true;
+                  }
 
                   if (instr->isVOP3()) {
                         VALU_instruction& vop3 = instr->valu();
-                        if (vop3.omod && gfx_level < GFX9) /* omod is fine on Vega */
+
+                        /* OMOD with SDWA is a GFX9+ feature. */
+                        if (vop3.omod && gfx_level < GFX9) {
                               return false;
-                        if (vop3.clamp && instr->isVOPC() && gfx_level != GFX8) /* clamp on VOPC is fine on Vega */
+                        }
+                        /* Clamp on VOPC with SDWA is problematic on GFX9+. */
+                        if (vop3.clamp && instr->isVOPC() && gfx_level >= GFX9) {
                               return false;
-                        if (instr->format == Format::VOP3)
+                        }
+                        if (instr->format == Format::VOP3) {
                               return false;
+                        }
 
                         // TODO: return true if we know we will use vcc
-                        if (!pre_ra && instr->definitions.size() >= 2)
+                        if (!pre_ra && instr->definitions.size() >= 2) {
                               return false;
+                        }
 
                         for (unsigned i = 1; i < instr->operands.size(); i++) {
-                              if (instr->operands[i].isLiteral())
+                              if (instr->operands[i].isLiteral()) {
                                     return false;
-                              /* SGPR sources are fine on Vega */
-                              if (gfx_level < GFX9 && !instr->operands[i].isOfType(RegType::vgpr))
+                              }
+                              /* SGPR sources with SDWA is a GFX9+ feature. */
+                              if (gfx_level < GFX9 && !instr->operands[i].isOfType(RegType::vgpr)) {
                                     return false;
+                              }
                         }
                   }
 
-                  if (!instr->definitions.empty() && instr->definitions[0].bytes() > 4 && !instr->isVOPC())
+                  if (!instr->definitions.empty() && instr->definitions[0].bytes() > 4 && !instr->isVOPC()) {
                         return false;
+                  }
 
                   if (!instr->operands.empty()) {
-                        if (instr->operands[0].isLiteral())
+                        if (instr->operands[0].isLiteral()) {
                               return false;
-                        /* SGPR sources are fine on Vega */
-                        if (gfx_level < GFX9 && !instr->operands[0].isOfType(RegType::vgpr))
+                        }
+                        /* SGPR sources with SDWA is a GFX9+ feature. */
+                        if (gfx_level < GFX9 && !instr->operands[0].isOfType(RegType::vgpr)) {
                               return false;
-                        if (instr->operands[0].bytes() > 4)
+                        }
+                        if (instr->operands[0].bytes() > 4) {
                               return false;
-                        if (instr->operands.size() > 1 && instr->operands[1].bytes() > 4)
+                        }
+                        if (instr->operands.size() > 1 && instr->operands[1].bytes() > 4) {
                               return false;
+                        }
                   }
 
                   bool is_mac = instr->opcode == aco_opcode::v_mac_f32 || instr->opcode == aco_opcode::v_mac_f16 ||
                   instr->opcode == aco_opcode::v_fmac_f32 || instr->opcode == aco_opcode::v_fmac_f16;
 
-                  if (gfx_level != GFX8 && is_mac)
+                  if (gfx_level != GFX8 && is_mac) {
                         return false;
+                  }
 
                   // TODO: return true if we know we will use vcc
-                  if (!pre_ra && instr->isVOPC() && gfx_level == GFX8)
+                  if (!pre_ra && instr->isVOPC() && gfx_level == GFX8) {
                         return false;
-                  if (!pre_ra && instr->operands.size() >= 3 && !is_mac)
+                  }
+                  if (!pre_ra && instr->operands.size() >= 3 && !is_mac) {
                         return false;
+                  }
 
+                  /* List of instructions that are fundamentally incompatible with SDWA encoding. */
                   return instr->opcode != aco_opcode::v_madmk_f32 && instr->opcode != aco_opcode::v_madak_f32 &&
                   instr->opcode != aco_opcode::v_madmk_f16 && instr->opcode != aco_opcode::v_madak_f16 &&
                   instr->opcode != aco_opcode::v_fmamk_f32 && instr->opcode != aco_opcode::v_fmaak_f32 &&
@@ -557,16 +579,20 @@ namespace aco {
             bool
             can_use_opsel(amd_gfx_level gfx_level, aco_opcode op, int idx)
             {
-                  if (((uint16_t)instr_info.format[static_cast<int>(op)] & (uint16_t)Format::VOP3P))
-                        return false;
-
-                  if (gfx_level < GFX9) {
-                        if (gfx_level >= GFX11 && (get_gfx11_true16_mask(op) & BITFIELD_BIT(idx == -1 ? 3 : idx)))
-                              return true;
+                  if (static_cast<uint16_t>(instr_info.format[static_cast<int>(op)]) & static_cast<uint16_t>(Format::VOP3P)) {
                         return false;
                   }
 
+                  /* Opsel is a GFX9+ feature. GFX11 has its own logic handled by get_gfx11_true16_mask. */
+                  if (gfx_level == GFX11) {
+                        return get_gfx11_true16_mask(op) & BITFIELD_BIT(idx == -1 ? 3 : idx);
+                  } else if (gfx_level < GFX9) {
+                        return false;
+                  }
+
+                  /* GFX9-specific opsel logic, verified against the ISA manual. */
                   switch (op) {
+                        /* Common VOP3A 16-bit instructions */
                         case aco_opcode::v_div_fixup_f16:
                         case aco_opcode::v_fma_f16:
                         case aco_opcode::v_mad_f16:
@@ -598,77 +624,49 @@ namespace aco {
                         case aco_opcode::v_or_b16:
                         case aco_opcode::v_xor_b16:
                         case aco_opcode::v_mul_lo_u16_e64:
-                              return true;
+                              return true; /* All operands support opsel */
 
-                        case aco_opcode::v_pack_b32_f16:
-                        case aco_opcode::v_cvt_pknorm_i16_f16:
-                        case aco_opcode::v_cvt_pknorm_u16_f16:
-                              return idx != -1;
+                              /* Instructions with specific operand restrictions */
+                              case aco_opcode::v_pack_b32_f16:
+                              case aco_opcode::v_cvt_pknorm_i16_f16:
+                              case aco_opcode::v_cvt_pknorm_u16_f16:
+                                    return idx != -1; /* All source operands support opsel, but not the whole instruction */
+                              case aco_opcode::v_mad_u32_u16:
+                              case aco_opcode::v_mad_i32_i16:
+                                    return idx >= 0 && idx < 2; /* src0 and src1 */
+                              case aco_opcode::v_dot2_f16_f16:
+                              case aco_opcode::v_dot2_bf16_bf16:
+                                    return idx == -1 || idx == 2; /* acc (dst) and src2 */
+                              case aco_opcode::v_cndmask_b16:
+                                    return idx != 2; /* src0 and src1 */
+                              case aco_opcode::v_interp_p10_f16_f32_inreg:
+                              case aco_opcode::v_interp_p10_rtz_f16_f32_inreg:
+                                    return idx == 0 || idx == 2; /* src0 and src2 */
+                              case aco_opcode::v_interp_p2_f16_f32_inreg:
+                              case aco_opcode::v_interp_p2_rtz_f16_f32_inreg:
+                                    return idx == -1 || idx == 0; /* dst and src0 */
+                              case aco_opcode::v_cvt_pk_fp8_f32:
+                              case aco_opcode::p_v_cvt_pk_fp8_f32_ovfl:
+                              case aco_opcode::v_cvt_pk_bf8_f32:
+                                    return idx == -1; /* Only dst */
 
-                        case aco_opcode::v_mad_u32_u16:
-                        case aco_opcode::v_mad_i32_i16:
-                              return idx >= 0 && idx < 2;
+                                    /* ISA-documented VOP3A instructions on Vega that support opsel */
+                                    case aco_opcode::v_alignbit_b32:
+                                    case aco_opcode::v_alignbyte_b32:
+                                          return idx >= 0 && idx < 2; /* src0 and src1 */
+                                    case aco_opcode::v_interp_p2_f16:
+                                          return idx == 0; /* src0 only */
+                                    case aco_opcode::v_mad_legacy_f16:
+                                    case aco_opcode::v_mad_legacy_i16:
+                                    case aco_opcode::v_mad_legacy_u16:
+                                    case aco_opcode::v_fma_legacy_f16:
+                                    case aco_opcode::v_div_fixup_legacy_f16:
+                                          return idx >= 0 && idx < 3; /* src0, src1, and src2 */
 
-                        case aco_opcode::v_dot2_f16_f16:
-                        case aco_opcode::v_dot2_bf16_bf16:
-                              return idx == -1 || idx == 2;
-
-                        case aco_opcode::v_cndmask_b16:
-                              return idx != 2;
-
-                        case aco_opcode::v_interp_p10_f16_f32_inreg:
-                        case aco_opcode::v_interp_p10_rtz_f16_f32_inreg:
-                              return idx == 0 || idx == 2;
-                        case aco_opcode::v_interp_p2_f16_f32_inreg:
-                        case aco_opcode::v_interp_p2_rtz_f16_f32_inreg:
-                              return idx == -1 || idx == 0;
-                        case aco_opcode::v_cvt_pk_fp8_f32:
-                        case aco_opcode::p_v_cvt_pk_fp8_f32_ovfl:
-                        case aco_opcode::v_cvt_pk_bf8_f32:
-                              return idx == -1;
-
-                        case aco_opcode::v_cvt_pkrtz_f16_f32:
-                        case aco_opcode::v_cvt_pknorm_i16_f32:
-                        case aco_opcode::v_cvt_pknorm_u16_f32:
-                        case aco_opcode::v_cvt_pk_i16_i32:
-                        case aco_opcode::v_cvt_pk_u16_u32:
-                              return false;
-
-                        case aco_opcode::v_interp_p1_f32:
-                        case aco_opcode::v_interp_p2_f32:
-                              break;
-
-                              /* Fixed cases based on VEGA ISA */
-                              case aco_opcode::v_alignbit_b32:
-                              case aco_opcode::v_alignbyte_b32:
-                                    return idx >= 0 && idx < 2;
-
-                              case aco_opcode::v_interp_p2_f16:
-                                    return idx == 0;
-
-                              case aco_opcode::v_mad_legacy_f16:
-                              case aco_opcode::v_mad_legacy_i16:
-                              case aco_opcode::v_mad_legacy_u16:
-                              case aco_opcode::v_fma_legacy_f16:
-                              case aco_opcode::v_div_fixup_legacy_f16:
-                                    return idx >= 0 && idx < 3;
-
-                              default:
-                                    break;
+                                    default:
+                                          /* If not explicitly listed, it does not support opsel on GFX9. */
+                                          return false;
                   }
-
-                  if (gfx_level >= GFX11 && (get_gfx11_true16_mask(op) & BITFIELD_BIT(idx == -1 ? 3 : idx))) {
-                        return true;
-                  }
-
-                  Format format = instr_info.format[static_cast<int>(op)];
-                  if ((uint16_t)format & (uint16_t)Format::VOP3) {
-                        if (idx >= 0 && (unsigned)idx < instr_info.alu_opcode_infos[static_cast<int>(op)].num_operands) {
-                              return can_use_input_modifiers(gfx_level, op, idx);
-                        }
-                  }
-
-                  return false;
             }
 
             bool
