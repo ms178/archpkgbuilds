@@ -711,7 +711,8 @@ DefInfo::get_subdword_definition_info(Program* program, const aco_ptr<Instructio
    }
 
    switch (instr->opcode) {
-   case aco_opcode::v_interp_p2_f16: return;
+   case aco_opcode::v_interp_p2_f16:
+      return;
    /* D16 loads with _hi version */
    case aco_opcode::ds_read_u8_d16:
    case aco_opcode::ds_read_i8_d16:
@@ -735,6 +736,7 @@ DefInfo::get_subdword_definition_info(Program* program, const aco_ptr<Instructio
          stride = 4;
          data_stride = 2;
       } else {
+         /* GFX9 optimization: D16 loads can write to high or low half if ECC is off. */
          stride = 2;
       }
       return;
@@ -748,7 +750,8 @@ DefInfo::get_subdword_definition_info(Program* program, const aco_ptr<Instructio
          rc = v2;
       return;
    }
-   default: break;
+   default:
+      break;
    }
 
    stride = 4;
