@@ -590,9 +590,16 @@ namespace aco {
                         return false;
                   }
 
-                  /* GFX9-specific opsel logic, verified against the ISA manual. */
+                  // Idea 1: Use bitmasks for common GFX9 cases (branchless, Vega-tuned)
+                  constexpr uint32_t opsel_mask_all = BITFIELD_MASK(3); // src0-2
+                  constexpr uint32_t opsel_mask_src01 = BITFIELD_MASK(2); // src0-1
+                  constexpr uint32_t opsel_mask_src0 = BITFIELD_BIT(0); // src0
+                  constexpr uint32_t opsel_mask_dst = BITFIELD_BIT(3); // dst (-1)
+
+                  if (idx < 0) idx = 3; // Map dst to bit 3 for mask checks
+
                   switch (op) {
-                        /* Common VOP3A 16-bit instructions */
+                        /* Common VOP3A 16-bit instructions (all support opsel on Vega) */
                         case aco_opcode::v_div_fixup_f16:
                         case aco_opcode::v_fma_f16:
                         case aco_opcode::v_mad_f16:
@@ -624,44 +631,44 @@ namespace aco {
                         case aco_opcode::v_or_b16:
                         case aco_opcode::v_xor_b16:
                         case aco_opcode::v_mul_lo_u16_e64:
-                              return true; /* All operands support opsel */
+                              return (opsel_mask_all & BITFIELD_BIT(idx)) != 0; // All operands support opsel
 
                               /* Instructions with specific operand restrictions */
                               case aco_opcode::v_pack_b32_f16:
                               case aco_opcode::v_cvt_pknorm_i16_f16:
                               case aco_opcode::v_cvt_pknorm_u16_f16:
-                                    return idx != -1; /* All source operands support opsel, but not the whole instruction */
+                                    return (idx >= 0 && idx < 3) && (opsel_mask_all & BITFIELD_BIT(idx)) != 0; /* All source operands support opsel, but not the whole instruction */
                               case aco_opcode::v_mad_u32_u16:
                               case aco_opcode::v_mad_i32_i16:
-                                    return idx >= 0 && idx < 2; /* src0 and src1 */
+                                    return (idx >= 0 && idx < 2) && (opsel_mask_src01 & BITFIELD_BIT(idx)) != 0; /* src0 and src1 */
                               case aco_opcode::v_dot2_f16_f16:
                               case aco_opcode::v_dot2_bf16_bf16:
-                                    return idx == -1 || idx == 2; /* acc (dst) and src2 */
+                                    return (idx == -1 || idx == 2) && (opsel_mask_dst | BITFIELD_BIT(2)) & BITFIELD_BIT(idx); /* acc (dst) and src2 */
                               case aco_opcode::v_cndmask_b16:
-                                    return idx != 2; /* src0 and src1 */
+                                    return idx != 2 && (opsel_mask_src01 & BITFIELD_BIT(idx)) != 0; /* src0 and src1 */
                               case aco_opcode::v_interp_p10_f16_f32_inreg:
                               case aco_opcode::v_interp_p10_rtz_f16_f32_inreg:
-                                    return idx == 0 || idx == 2; /* src0 and src2 */
+                                    return (idx == 0 || idx == 2) && (opsel_mask_src0 | BITFIELD_BIT(2)) & BITFIELD_BIT(idx); /* src0 and src2 */
                               case aco_opcode::v_interp_p2_f16_f32_inreg:
                               case aco_opcode::v_interp_p2_rtz_f16_f32_inreg:
-                                    return idx == -1 || idx == 0; /* dst and src0 */
+                                    return (idx == -1 || idx == 0) && (opsel_mask_dst | opsel_mask_src0) & BITFIELD_BIT(idx); /* dst and src0 */
                               case aco_opcode::v_cvt_pk_fp8_f32:
                               case aco_opcode::p_v_cvt_pk_fp8_f32_ovfl:
                               case aco_opcode::v_cvt_pk_bf8_f32:
-                                    return idx == -1; /* Only dst */
+                                    return idx == -1 && (opsel_mask_dst & BITFIELD_BIT(idx)) != 0; /* Only dst */
 
                                     /* ISA-documented VOP3A instructions on Vega that support opsel */
                                     case aco_opcode::v_alignbit_b32:
                                     case aco_opcode::v_alignbyte_b32:
-                                          return idx >= 0 && idx < 2; /* src0 and src1 */
+                                          return (idx >= 0 && idx < 2) && (opsel_mask_src01 & BITFIELD_BIT(idx)) != 0; /* src0 and src1 */
                                     case aco_opcode::v_interp_p2_f16:
-                                          return idx == 0; /* src0 only */
+                                          return idx == 0 && (opsel_mask_src0 & BITFIELD_BIT(idx)) != 0; /* src0 only */
                                     case aco_opcode::v_mad_legacy_f16:
                                     case aco_opcode::v_mad_legacy_i16:
                                     case aco_opcode::v_mad_legacy_u16:
                                     case aco_opcode::v_fma_legacy_f16:
                                     case aco_opcode::v_div_fixup_legacy_f16:
-                                          return idx >= 0 && idx < 3; /* src0, src1, and src2 */
+                                          return (idx >= 0 && idx < 3) && (opsel_mask_all & BITFIELD_BIT(idx)) != 0; /* src0, src1, and src2 */
 
                                     default:
                                           /* If not explicitly listed, it does not support opsel on GFX9. */
@@ -893,7 +900,7 @@ namespace aco {
                         case imul16:
                         case imul32:
                         case imul64: return idx ? 0 : 1;
-                        case fmul16: return 0x3c00u;                /* 1.0 */
+                        case fmul16: return 0x3c00u;                /* 1.0 (Vega FMA fusion: prefer for mul reductions) */
                         case fmul32: return 0x3f800000u;            /* 1.0 */
                         case fmul64: return idx ? 0x3ff00000u : 0u; /* 1.0 */
                         case imin8: return INT8_MAX;
@@ -993,7 +1000,6 @@ namespace aco {
             {
                   CmpInfo info = {aco_opcode::num_opcodes, aco_opcode::num_opcodes, aco_opcode::num_opcodes};
                   switch (op) {
-                        // clang-format off
                         #define CMP2(ord, unord, ord_swap, unord_swap, sz)                                                 \
                         case aco_opcode::v_cmp_##ord##_f##sz:                                                           \
                               info.swapped = aco_opcode::v_cmp_##ord_swap##_f##sz;                                         \
@@ -1061,7 +1067,6 @@ namespace aco {
                               CMPCLASS(32)
                               CMPCLASS(64)
                               #undef CMPCLASS
-                              // clang-format on
                         default: return info;
                   }
             }
