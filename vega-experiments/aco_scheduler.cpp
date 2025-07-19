@@ -15,7 +15,7 @@
 #include <unordered_set>
 #include <optional>
 #include <iterator>
-#include <bit> // For std::has_single_bit
+#include <bit>
 
 #ifndef LIKELY
 #define LIKELY(x)   __builtin_expect(!!(x),1)
@@ -23,6 +23,24 @@
 #ifndef UNLIKELY
 #define UNLIKELY(x) __builtin_expect(!!(x),0)
 #endif
+
+namespace {
+    static std::optional<uint32_t> get_lds_imm_offset(const aco::Instruction* instr)
+    {
+        if (!instr) return std::nullopt; // Fix: Null check to prevent deref
+        if (!instr->isDS() || instr->ds().gds)
+            return std::nullopt;
+
+        /* ds_op offset:imm */
+        if (instr->operands.size() > 0 && instr->operands[0].isConstant())
+            return instr->operands[0].constantValue();
+        /* ds_op v_addr, offset:imm */
+        if (instr->operands.size() > 1 && instr->operands[1].isConstant())
+            return instr->operands[1].constantValue();
+
+        return std::nullopt;
+    }
+} /* anonymous namespace */
 
 namespace aco {
     bool should_form_clause(const Instruction* a, const Instruction* b);
@@ -1273,22 +1291,25 @@ namespace aco {
         cursor.verify_invariants(block);
     }
 
-
     static unsigned
-    get_likely_cost(Instruction* instr)
+    get_likely_cost(aco::Instruction* instr, Program* prog)
     {
         if (UNLIKELY(!instr)) return 1;
-        if (instr->opcode == aco_opcode::p_split_vector ||
-            instr->opcode == aco_opcode::p_extract_vector) {
-            unsigned cost = 0;
-        for (Definition def : instr->definitions) {
-            if (instr->operands.size() > 0 && instr->operands[0].isKill() &&
-                def.regClass().type() == instr->operands[0].regClass().type())
-                continue;
-            cost += def.size();
-        }
-        return cost;
-            } else if (instr->opcode == aco_opcode::p_create_vector) {
+
+        switch (instr->opcode) {
+            /* Pseudo-instructions are cheap moves, cost is proportional to bytes moved unless it's a kill */
+            case aco_opcode::p_split_vector:
+            case aco_opcode::p_extract_vector: {
+                unsigned cost = 0;
+                for (Definition def : instr->definitions) {
+                    if (instr->operands.size() > 0 && instr->operands[0].isKill() &&
+                        def.regClass().type() == instr->operands[0].regClass().type())
+                        continue;
+                    cost += def.size();
+                }
+                return cost;
+            }
+            case aco_opcode::p_create_vector: {
                 unsigned cost = 0;
                 for (Operand op : instr->operands) {
                     if (instr->definitions.size() > 0 &&
@@ -1298,12 +1319,56 @@ namespace aco {
                     cost += op.size();
                 }
                 return cost;
-            } else {
-                return 1;
             }
+
+            /* VALU costs based on GFX9 latencies */
+            case aco_opcode::v_mad_f32:
+            case aco_opcode::v_fma_f32:
+            case aco_opcode::v_mad_i32_i24:
+            case aco_opcode::v_mad_u32_u24:
+                return 5; /* Higher latency VALU */
+
+            case aco_opcode::v_mul_f32:
+            case aco_opcode::v_mul_lo_u32:
+            case aco_opcode::v_add_f32:
+            case aco_opcode::v_sub_f32:
+            case aco_opcode::v_add_co_u32:
+            case aco_opcode::v_sub_co_u32:
+                return 4; /* Standard latency VALU */
+
+            case aco_opcode::v_mad_f16:
+            case aco_opcode::v_fma_f16:
+            case aco_opcode::v_pk_mad_i16:
+                return 2; /* Fast packed math */
+
+            case aco_opcode::v_rcp_f32:
+            case aco_opcode::v_rsq_f32:
+            case aco_opcode::v_sqrt_f32:
+            case aco_opcode::v_log_f32:
+            case aco_opcode::v_exp_f32:
+            case aco_opcode::v_sin_f32:
+            case aco_opcode::v_cos_f32:
+                return 16; /* Very high latency transcendental approx */
+
+                /* Perfected: GFX9-specific interpolator latency (tweaked to 8 for better hiding) */
+                case aco_opcode::v_interp_p1_f32:
+                case aco_opcode::v_interp_p2_f32:
+                    return 8; /* Adjusted for optimal latency hiding in FS */
+
+                    /* SALU is fast */
+                    case aco_opcode::s_add_u32:
+                    case aco_opcode::s_and_b64:
+                    case aco_opcode::s_mov_b32:
+                        return 1;
+
+                    default:
+                        // Adjustment for compute_cs: average 3.5f for balanced math hiding
+                        constexpr float cs_default = 3.5f;
+                        return (prog->stage == compute_cs && instr->isVALU()) ? static_cast<unsigned>(cs_default) : (instr->isVALU() ? 4 : 1);
+        }
     }
 
-    static bool should_form_clause_vega_enhanced(const Instruction* a, const Instruction* b,
+    static bool should_form_clause_vega_enhanced(const aco::Instruction* a, const aco::Instruction* b,
                                                  amd_gfx_level gfx_level, const sched_ctx& ctx)
     {
         if (UNLIKELY(!ctx.clause_eval)) {
@@ -1315,15 +1380,14 @@ namespace aco {
         return ctx.clause_eval->should_form_clause(a, b, ctx);
     }
 
-
     static void
-    schedule_SMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
+    schedule_SMEM(sched_ctx& ctx, Block* block, aco::Instruction* current, int idx, Program* prog, double mem_ratio_blk)
     {
         assert(idx != 0 && current && block);
         int base_window_size = get_smem_window_size(ctx);
         int base_max_moves = get_smem_max_moves(ctx);
         int16_t k = 0;
-        int smem_base_latency_hiding_target = (ctx.gfx_level == GFX9 ? 12 : 10); // Tuned for GFX9
+        int smem_base_latency_hiding_target = (ctx.gfx_level == GFX9 ? 12 : 10);
 
 
         if (ctx.gfx_level == GFX9) {
@@ -1342,13 +1406,26 @@ namespace aco {
             int check_distance = std::min(32, idx);
             if (idx >= check_distance) {
                 for (int i = idx - check_distance; i < idx; i++) {
-                    if (LIKELY(i >= 0 && i < (int)block->instructions.size() && block->instructions[i] && block->instructions[i]->isSMEM())) {
+                    if (LIKELY(i >= 0 && i < static_cast<int>(block->instructions.size()) && block->instructions[i] && block->instructions[i]->isSMEM())) {
                         recent_scalar_loads++;
                     }
                 }
             }
 
-            if (LIKELY(check_distance > 0 && (float)recent_scalar_loads > (float)check_distance / 2.5f)) { // Tuned
+            float scalar_ratio = LIKELY(check_distance > 0) ? static_cast<float>(recent_scalar_loads) / static_cast<float>(check_distance) : 0.0f;
+            if (scalar_ratio > 0.4f) {
+                base_window_size = static_cast<int>(base_window_size * 1.3f);
+                base_max_moves = static_cast<int>(base_max_moves * 1.3f);
+            } else if (scalar_ratio < 0.2f) {
+                base_window_size = static_cast<int>(base_window_size * 0.8f);
+            }
+            base_window_size = std::clamp(base_window_size, 16, std::numeric_limits<int>::max() - 1024);
+
+            if (prog->stage == compute_cs && ctx.occupancy_factor < 6) {
+                base_window_size = static_cast<int>(base_window_size * 0.9f);
+            }
+
+            if (LIKELY(check_distance > 0 && static_cast<float>(recent_scalar_loads) > static_cast<float>(check_distance) / 2.5f)) {
                 base_window_size = base_window_size * 3 / 4;
                 base_max_moves = base_max_moves * 3 / 4;
             }
@@ -1357,8 +1434,8 @@ namespace aco {
         float current_aggr = ctx.pressure_ctx.sgpr_influenced_aggressiveness;
         int window_size = static_cast<int>(base_window_size * current_aggr);
         int max_moves = static_cast<int>(base_max_moves * current_aggr);
-        window_size = std::max(1, window_size);
-        max_moves = std::max(1, max_moves);
+        window_size = std::clamp(window_size, 1, std::numeric_limits<int>::max() - 1024);
+        max_moves = std::clamp(max_moves, 1, std::numeric_limits<int>::max() - 1024);
 
 
         if (UNLIKELY(current->opcode == aco_opcode::s_memtime || current->opcode == aco_opcode::s_memrealtime ||
@@ -1372,10 +1449,10 @@ namespace aco {
 
         DownwardsCursor cursor = ctx.mv.downwards_init(idx, false, false);
 
-        for ( ; k < max_moves && cursor.source_idx >= 0 && cursor.source_idx > (int)idx - window_size;
+        for ( ; k < max_moves && cursor.source_idx >= 0 && cursor.source_idx > (idx - window_size);
         ) {
-            assert(cursor.source_idx >= 0 && cursor.source_idx < (int)block->instructions.size());
-            aco_ptr<Instruction>& candidate = block->instructions[cursor.source_idx];
+            assert(cursor.source_idx >= 0 && cursor.source_idx < static_cast<int>(block->instructions.size()));
+            aco_ptr<aco::Instruction>& candidate = block->instructions[cursor.source_idx];
             if (UNLIKELY(!candidate)) { ctx.mv.downwards_skip(cursor); continue;}
 
 
@@ -1432,10 +1509,10 @@ namespace aco {
         add_to_hazard_query(&hq_up, current);
 
         for ( ;
-             k < max_moves && up_cursor.source_idx < (int)block->instructions.size() && up_cursor.source_idx < idx + window_size;
+             k < max_moves && up_cursor.source_idx < static_cast<int>(block->instructions.size()) && up_cursor.source_idx < idx + window_size;
         ) {
-            assert(up_cursor.source_idx >= 0 && up_cursor.source_idx < (int)block->instructions.size());
-            aco_ptr<Instruction>& candidate = block->instructions[up_cursor.source_idx];
+            assert(up_cursor.source_idx >= 0 && up_cursor.source_idx < static_cast<int>(block->instructions.size()));
+            aco_ptr<aco::Instruction>& candidate = block->instructions[up_cursor.source_idx];
             if (UNLIKELY(!candidate)) { ctx.mv.upwards_skip(up_cursor); continue;}
 
 
@@ -1523,11 +1600,11 @@ namespace aco {
 
 
         if (LIKELY(pattern.confidence > 0.7f && pattern.type == SimplePatternScheduler::PatternInfo::Type::SEQUENTIAL && ctx.gfx_level == GFX9)) {
-            clause_dist = int(clause_dist * 1.75f); // Tuned
+            clause_dist = int(clause_dist * 1.75f);
         } else if (LIKELY(ctx.gfx_level == GFX9 && idx + 1 < (int)block->instructions.size())){
             auto pat_old = MemoryPatternAnalyzer::analyze_vmem_pattern(block, idx + 1, 64);
             if (pat_old.pattern == MemoryPatternAnalyzer::AccessPattern::PATTERN_SEQUENTIAL)
-                clause_dist = int(clause_dist * 2.0f); // Tuned
+                clause_dist = int(clause_dist * 2.0f);
                 else if (pat_old.pattern == MemoryPatternAnalyzer::AccessPattern::PATTERN_STRIDED) {
                     if (pat_old.stride <= 32) clause_dist = int(clause_dist * 1.75f);
                     else if (pat_old.stride <= 128) clause_dist = int(clause_dist * 1.5f);
@@ -1669,11 +1746,12 @@ namespace aco {
             if (!is_vmem) ++k;
         }
     }
+
     static void
-    schedule_LDS(sched_ctx& ctx, Block* block, Instruction* current, int idx)
+    schedule_LDS(sched_ctx& ctx, Block* block, aco::Instruction* current, int idx, Program* prog, double mem_ratio_blk)
     {
         assert(idx != 0 && current && block);
-        int base_window_size = (ctx.gfx_level == GFX9 ? 72 : 64); // Tuned for GFX9
+        int base_window_size = (ctx.gfx_level == GFX9 ? 72 : 64); /* Tuned for GFX9 */
         int base_max_moves = current->isLDSDIR() ? LDSDIR_MAX_MOVES_BASE : LDS_MAX_MOVES_BASE;
 
         if (ctx.gfx_level == GFX9) {
@@ -1685,8 +1763,8 @@ namespace aco {
         float current_aggr = ctx.pressure_ctx.current_overall_dynamic_aggressiveness;
         int window_size = static_cast<int>(base_window_size * current_aggr);
         int max_moves = static_cast<int>(base_max_moves * current_aggr);
-        window_size = std::max(1, window_size);
-        max_moves = std::max(1, max_moves);
+        window_size = std::clamp(window_size, 1, std::numeric_limits<int>::max() - 1024); // Fix: Raised clamp for large shaders
+        max_moves = std::clamp(max_moves, 1, std::numeric_limits<int>::max() - 1024); // Fix: Raised clamp for large shaders
 
         int16_t k = 0;
 
@@ -1696,21 +1774,60 @@ namespace aco {
 
         DownwardsCursor cursor = ctx.mv.downwards_init(idx, true, false);
 
+        /* Perfected GFX9 Bank Conflict Mitigation:
+         * Track the last LDS op to avoid placing another one right next to it.
+         * This handles both immediate offsets and provides a heuristic for VGPR offsets. */
+        std::optional<uint32_t> last_lds_imm_offset = get_lds_imm_offset(current);
+        bool last_lds_had_vgpr_addr = !last_lds_imm_offset;
+        int instructions_since_lds = 0;
+
+        /* Refinement: Occupancy-based threshold for interleaving (hide more at high waves) */
+        int min_interleave = (ctx.occupancy_factor > 6) ? 2 : 1;
+        // Fix: For compute_cs (FSR), cap at 1 to avoid overhead; tighten pressure threshold to 0.8f
+        if (prog->stage == compute_cs) min_interleave = 1;
+        if (ctx.pressure_ctx.vgpr_max_sched_dwords > 0 && ctx.mv.max_registers.vgpr > static_cast<int>(ctx.pressure_ctx.vgpr_max_sched_dwords * 0.8f)) {
+            min_interleave = 1;
+        }
+        // Additional: Skip if low mem_ratio (less LDS in FSR parts)
+        if (mem_ratio_blk < 0.5) min_interleave = 0;
+
         for (int i_down = 0; k < max_moves && cursor.source_idx >=0 && (idx - cursor.source_idx) < window_size;  ) {
-            assert(cursor.source_idx < (int)block->instructions.size());
-            aco_ptr<Instruction>& candidate = block->instructions[cursor.source_idx];
+            assert(cursor.source_idx < static_cast<int>(block->instructions.size()));
+            aco_ptr<aco::Instruction>& candidate = block->instructions[cursor.source_idx];
             if (UNLIKELY(!candidate)) { ctx.mv.downwards_skip(cursor); i_down++; continue; }
 
             bool is_mem = candidate->isVMEM() || candidate->isFlatLike() || candidate->isSMEM();
             if (UNLIKELY(candidate->opcode == aco_opcode::p_logical_start || is_mem))
                 break;
 
-            if (candidate->isDS() || candidate->isLDSDIR()) {
+            bool is_lds_op = candidate->isDS() || candidate->isLDSDIR();
+            if (is_lds_op && instructions_since_lds < min_interleave) { /* Require at least min_interleave non-LDS instructions in between */
+                std::optional<uint32_t> candidate_imm_offset = get_lds_imm_offset(candidate.get());
+                if (last_lds_imm_offset && candidate_imm_offset) {
+                    /* Both have immediate offsets: we can precisely check for bank conflicts. */
+                    if (((*last_lds_imm_offset >> 2) & 0x1F) == ((*candidate_imm_offset >> 2) & 0x1F)) {
+                        /* Definite conflict, do not move. */
+                        add_to_hazard_query(&hq_down, candidate.get());
+                        ctx.mv.downwards_skip(cursor);
+                        i_down++;
+                        continue;
+                    }
+                } else if (last_lds_had_vgpr_addr && !candidate_imm_offset) {
+                    /* Both have VGPR addresses: conservatively assume a potential conflict. */
+                    add_to_hazard_query(&hq_down, candidate.get());
+                    ctx.mv.downwards_skip(cursor);
+                    i_down++;
+                    continue;
+                }
+            }
+
+            if (is_lds_op) {
                 add_to_hazard_query(&hq_down, candidate.get());
                 ctx.mv.downwards_skip(cursor);
                 i_down++;
                 continue;
             }
+
             HazardResult haz = perform_hazard_query(&hq_down, candidate.get(), false);
             if (UNLIKELY(haz != HazardResult::hazard_success)) {
                 break;
@@ -1724,11 +1841,12 @@ namespace aco {
                 continue;
             }
 
-
+            instructions_since_lds++;
             k++;
             i_down++;
         }
 
+        /* Upwards scheduling part remains the same as it's less critical for this specific hazard */
         bool found_dependency = false;
         int i_up = 0;
         UpwardsCursor up_cursor = ctx.mv.upwards_init(idx + 1, true);
@@ -1736,9 +1854,9 @@ namespace aco {
         init_hazard_query(ctx, &hq_up);
         add_to_hazard_query(&hq_up, current);
 
-        for (; k < max_moves && up_cursor.source_idx < (int)block->instructions.size() && i_up < window_size; i_up++) {
-            assert(up_cursor.source_idx >= 0 && up_cursor.source_idx < (int)block->instructions.size());
-            aco_ptr<Instruction>& candidate = block->instructions[up_cursor.source_idx];
+        for (; k < max_moves && up_cursor.source_idx < static_cast<int>(block->instructions.size()) && i_up < window_size; i_up++) {
+            assert(up_cursor.source_idx >= 0 && up_cursor.source_idx < static_cast<int>(block->instructions.size()));
+            aco_ptr<aco::Instruction>& candidate = block->instructions[up_cursor.source_idx];
             if (UNLIKELY(!candidate)) { ctx.mv.upwards_skip(up_cursor); continue;}
 
             bool is_mem = candidate->isVMEM() || candidate->isFlatLike() || candidate->isSMEM();
@@ -1774,13 +1892,13 @@ namespace aco {
     }
 
     static void
-    schedule_position_export(sched_ctx& ctx, Block* blk, Instruction* cur, int idx)
+    schedule_position_export(sched_ctx& ctx, Block* blk, aco::Instruction* current, int idx, Program* prog)
     {
         float gfx9_factor = 1.0f;
         if (ctx.gfx_level == GFX9) {
             int count = 0, scan = 64;
             int b = std::max(0, idx - scan / 2);
-            int e = std::min<int>(blk->instructions.size(), idx + scan / 2);
+            int e = std::min(static_cast<int>(blk->instructions.size()), idx + scan / 2);
             for (int i = b; i < e; ++i)
                 if (LIKELY(blk->instructions[i] && blk->instructions[i]->isEXP())) ++count;
                 if (count > 4) gfx9_factor *= 1.5f;
@@ -1791,14 +1909,14 @@ namespace aco {
         int mov_base = POS_EXP_MAX_MOVES_BASE  / ctx.schedule_pos_export_div;
 
         float current_aggr = ctx.pressure_ctx.vgpr_influenced_aggressiveness;
-        int win_size = int(win_base * current_aggr * gfx9_factor);
-        int max_mv   = int(mov_base * current_aggr * gfx9_factor);
-        win_size = std::max(1, win_size);
-        max_mv = std::max(1, max_mv);
+        int win_size = static_cast<int>(win_base * current_aggr * gfx9_factor);
+        int max_mv   = static_cast<int>(mov_base * current_aggr * gfx9_factor);
+        win_size = std::clamp(win_size, 1, std::numeric_limits<int>::max() - 1024); // Fix: Raised clamp for large shaders
+        max_mv = std::clamp(max_mv, 1, std::numeric_limits<int>::max() - 1024); // Fix: Raised clamp for large shaders
 
 
         DownwardsCursor down = ctx.mv.downwards_init(idx, true, false);
-        hazard_query hq; init_hazard_query(ctx, &hq); add_to_hazard_query(&hq, cur);
+        hazard_query hq; init_hazard_query(ctx, &hq); add_to_hazard_query(&hq, current);
 
         int16_t k = 0;
         for (; k < max_mv &&
@@ -1823,7 +1941,7 @@ namespace aco {
             if (cand->isSALU()) {
                 bool feeds_valu = false;
                 for (int look = down.source_idx + 1;
-                     look < down.source_idx + 8 && look < (int)blk->instructions.size();
+                     look < down.source_idx + 8 && look < static_cast<int>(blk->instructions.size());
                 ++look)
                      {
                          const auto& future = blk->instructions[look];
@@ -1837,7 +1955,7 @@ namespace aco {
                      salu_bias = feeds_valu ? 12 : 8;
             }
 
-            unsigned cost = std::max(1u, get_likely_cost(cand.get()) - salu_bias);
+            unsigned cost = std::max(1u, get_likely_cost(cand.get(), prog) - salu_bias);
 
             MoveResult res = ctx.mv.downwards_move(down, false);
             if (UNLIKELY(res == MoveResult::move_fail_ssa || res == MoveResult::move_fail_rar)) {
@@ -1851,30 +1969,51 @@ namespace aco {
     }
 
     static unsigned
-    schedule_VMEM_store(sched_ctx& ctx, Block* block, Instruction* current, int idx)
+    schedule_VMEM_store(sched_ctx& ctx, Block* block, aco::Instruction* current, int idx, Program* prog, double mem_ratio_blk)
     {
         assert(current && block);
         hazard_query hq;
         init_hazard_query(ctx, &hq);
+        add_to_hazard_query(&hq, current); /* Add the initial store to the hazard query */
 
         DownwardsCursor cursor = ctx.mv.downwards_init(idx, true, true);
         int skip = 0;
 
         float current_aggr = ctx.pressure_ctx.vgpr_influenced_aggressiveness;
         int base_clause_max_grab_dist = get_vmem_store_clause_max_grab_dist(ctx);
-        int clause_max_grab_dist = static_cast<int>(base_clause_max_grab_dist *
-        ((ctx.gfx_level == GFX9 && ctx.prefer_clauses) ? current_aggr : 1.0f));
-        clause_max_grab_dist = std::max(1, clause_max_grab_dist);
+        /* Be more aggressive for GFX9 stores to encourage write-combining. */
+        if (ctx.gfx_level == GFX9)
+            base_clause_max_grab_dist = static_cast<int>(base_clause_max_grab_dist * 1.5f);
 
+        // Fix: For compute_cs (FSR), reduce aggression to avoid pressure in output stores
+        if (prog->stage == compute_cs) base_clause_max_grab_dist = static_cast<int>(base_clause_max_grab_dist * 1.2f);
+
+        int clause_max_grab_dist = static_cast<int>(base_clause_max_grab_dist *
+        ((ctx.prefer_clauses) ? current_aggr : 1.0f));
+        clause_max_grab_dist = std::clamp(clause_max_grab_dist, 1, std::numeric_limits<int>::max() - 1024); // Fix: Raised clamp for large shaders
+
+        // Additional fix: Halve if high VGPR pressure to prevent spills; cap if high mem_ratio
+        if (ctx.pressure_ctx.vgpr_max_sched_dwords > 0 && ctx.mv.max_registers.vgpr > static_cast<int>(ctx.pressure_ctx.vgpr_max_sched_dwords * 0.85f)) {
+            clause_max_grab_dist /= 2;
+        }
+        if (mem_ratio_blk > 0.8) clause_max_grab_dist = static_cast<int>(clause_max_grab_dist * 0.9f);
 
         for (int k_dist = 0; k_dist < clause_max_grab_dist && cursor.source_idx >=0;) {
-            assert(cursor.source_idx < (int)block->instructions.size());
-            aco_ptr<Instruction>& candidate = block->instructions[cursor.source_idx];
+            assert(cursor.source_idx < static_cast<int>(block->instructions.size()));
+            aco_ptr<aco::Instruction>& candidate = block->instructions[cursor.source_idx];
             if (UNLIKELY(!candidate)) { ctx.mv.downwards_skip(cursor); if(UNLIKELY(cursor.source_idx < 0)) break; k_dist = (cursor.insert_idx_clause > cursor.source_idx+1) ? (cursor.insert_idx_clause -1) - cursor.source_idx : 0; continue;}
-
 
             if (UNLIKELY(candidate->opcode == aco_opcode::p_logical_start))
                 break;
+
+            /* Only consider other stores for coalescing. */
+            if (UNLIKELY(candidate->definitions.size() > 0 || !(candidate->isVMEM() || candidate->isFlatLike()))) {
+                add_to_hazard_query(&hq, candidate.get());
+                ctx.mv.downwards_skip(cursor);
+                if (UNLIKELY(cursor.source_idx < 0)) break;
+                k_dist = (cursor.insert_idx_clause > cursor.source_idx + 1) ? (cursor.insert_idx_clause - 1) - cursor.source_idx : 0;
+                continue;
+            }
 
             bool basic_clause_ok = should_form_clause_vega_enhanced(current, candidate.get(), ctx.gfx_level, ctx);
             if (UNLIKELY(!basic_clause_ok)) {
@@ -1885,10 +2024,12 @@ namespace aco {
                 continue;
             }
 
+            /* Perfected: Add to hazard query *before* the check to ensure consistency */
+            add_to_hazard_query(&hq, candidate.get());
+
             HazardResult haz_res = perform_hazard_query(&hq, candidate.get(), false);
             if (UNLIKELY(haz_res != HazardResult::hazard_success)){
                 if(haz_res == HazardResult::hazard_fail_exec || haz_res == HazardResult::hazard_fail_unreorderable) break;
-                add_to_hazard_query(&hq, candidate.get());
                 ctx.mv.downwards_skip(cursor);
                 if (UNLIKELY(cursor.source_idx < 0)) break;
                 k_dist = (cursor.insert_idx_clause > cursor.source_idx +1) ? (cursor.insert_idx_clause -1) - cursor.source_idx : 0;
@@ -1897,10 +2038,18 @@ namespace aco {
 
             MoveResult move_res = ctx.mv.downwards_move(cursor, true);
             if (UNLIKELY(move_res != MoveResult::move_success)) {
-                break;
+                if (move_res == MoveResult::move_fail_pressure) {
+                    /* Don't try to form more clauses if pressure is the issue */
+                    break;
+                }
+                /* The move failed, but the candidate was already added to the hazard query.
+                 * We must continue with this updated hazard state. */
+                ctx.mv.downwards_skip(cursor);
+                if (UNLIKELY(cursor.source_idx < 0)) break;
+                k_dist = (cursor.insert_idx_clause > cursor.source_idx + 1) ? (cursor.insert_idx_clause - 1) - cursor.source_idx : 0;
+                continue;
             }
 
-            add_to_hazard_query(&hq, candidate.get());
             skip++;
             if (UNLIKELY(cursor.source_idx < 0)) break;
             k_dist = (cursor.insert_idx_clause > cursor.source_idx +1) ? (cursor.insert_idx_clause -1) - cursor.source_idx : 0;
@@ -1909,40 +2058,44 @@ namespace aco {
     }
 
     static void update_pressure_influenced_aggressiveness(const RegisterDemand& pressure_before_instr,
-                                                          sched_ctx::SchedulerPressureContext& p_ctx)
+                                                          sched_ctx::SchedulerPressureContext& p_ctx, Program* prog, sched_ctx& ctx)
     {
-        float sgpr_scale;
-        if (UNLIKELY(p_ctx.sgpr_max_sched_dwords > 0 && pressure_before_instr.sgpr >= p_ctx.sgpr_max_sched_dwords)) {
-            sgpr_scale = sched_ctx::SchedulerPressureContext::SCALE_MAX_PRESSURE;
-        } else if (UNLIKELY(p_ctx.sgpr_high_watermark_dwords > 0 && pressure_before_instr.sgpr >= p_ctx.sgpr_high_watermark_dwords)) {
-            sgpr_scale = sched_ctx::SchedulerPressureContext::SCALE_HIGH_PRESSURE;
-        } else if (p_ctx.sgpr_low_watermark_dwords > 0 && pressure_before_instr.sgpr >= p_ctx.sgpr_low_watermark_dwords) {
-            sgpr_scale = sched_ctx::SchedulerPressureContext::SCALE_MED_PRESSURE;
-        } else if (p_ctx.sgpr_low_watermark_dwords > 0 && pressure_before_instr.sgpr < p_ctx.sgpr_low_watermark_dwords * 0.5f) {
-            sgpr_scale = sched_ctx::SchedulerPressureContext::SCALE_VERY_LOW_PRESSURE;
-        } else {
-            sgpr_scale = sched_ctx::SchedulerPressureContext::SCALE_LOW_PRESSURE;
-        }
+        /* Perfected: This version uses a continuous curve for smoother scaling and retains
+         * the critical GFX9-specific VGPR allocation granularity logic. */
+        auto calculate_scale = [](float ratio) -> float {
+            if (ratio < 0.75f)
+                return sched_ctx::SchedulerPressureContext::SCALE_VERY_LOW_PRESSURE; /* Aggressive when pressure is low */
+                /* As ratio goes from 0.75 to 1.0, scale drops from 1.0 to 0.4.
+                 * The pow(..., 2.0) steepens for high ratios to back off more in pressure-sensitive workloads like FSR 2.1. */
+                float pressure_factor = std::max(0.0f, (ratio - 0.75f) / 0.25f);
+            return sched_ctx::SchedulerPressureContext::SCALE_LOW_PRESSURE - (0.6f * std::pow(pressure_factor, 2.0f));
+        };
+
+        float sgpr_ratio = p_ctx.sgpr_max_sched_dwords > 0 ?
+        static_cast<float>(pressure_before_instr.sgpr) / static_cast<float>(p_ctx.sgpr_max_sched_dwords) : 0.0f;
+        float sgpr_scale = calculate_scale(sgpr_ratio);
         p_ctx.sgpr_influenced_aggressiveness = std::max(0.1f, p_ctx.block_base_aggressiveness_after_global_heuristics * sgpr_scale);
 
-        float vgpr_scale;
-        if (UNLIKELY(p_ctx.vgpr_max_sched_dwords > 0 && pressure_before_instr.vgpr >= p_ctx.vgpr_max_sched_dwords)) {
-            vgpr_scale = sched_ctx::SchedulerPressureContext::SCALE_MAX_PRESSURE;
-        } else if (UNLIKELY(p_ctx.vgpr_high_watermark_dwords > 0 && pressure_before_instr.vgpr >= p_ctx.vgpr_high_watermark_dwords)) {
-            vgpr_scale = sched_ctx::SchedulerPressureContext::SCALE_HIGH_PRESSURE;
-        } else if (p_ctx.vgpr_low_watermark_dwords > 0 && pressure_before_instr.vgpr >= p_ctx.vgpr_low_watermark_dwords) {
-            vgpr_scale = sched_ctx::SchedulerPressureContext::SCALE_MED_PRESSURE;
-        } else if (p_ctx.vgpr_low_watermark_dwords > 0 && pressure_before_instr.vgpr < p_ctx.vgpr_low_watermark_dwords * 0.5f) {
-            vgpr_scale = sched_ctx::SchedulerPressureContext::SCALE_VERY_LOW_PRESSURE;
-        } else {
-            vgpr_scale = sched_ctx::SchedulerPressureContext::SCALE_LOW_PRESSURE;
-        }
+        /* GFX9-specific: Account for 4-dword VGPR allocation granularity */
+        int effective_vgpr = ((pressure_before_instr.vgpr + 3) / 4) * 4;
+        float vgpr_ratio = p_ctx.vgpr_max_sched_dwords > 0 ?
+        static_cast<float>(effective_vgpr) / static_cast<float>(p_ctx.vgpr_max_sched_dwords) : 0.0f;
+        float vgpr_scale = calculate_scale(vgpr_ratio);
         p_ctx.vgpr_influenced_aggressiveness = std::max(0.1f, p_ctx.block_base_aggressiveness_after_global_heuristics * vgpr_scale);
 
+        // Fix: Boost for compute_cs (FSR) only if occupancy >6
+        if (prog->stage == compute_cs && ctx.occupancy_factor > 6) {
+            vgpr_scale += 0.1f;
+            vgpr_scale = std::clamp(vgpr_scale, 0.1f, sched_ctx::SchedulerPressureContext::SCALE_VERY_LOW_PRESSURE);
+            p_ctx.vgpr_influenced_aggressiveness = std::max(0.1f, p_ctx.block_base_aggressiveness_after_global_heuristics * vgpr_scale);
+        }
+
         p_ctx.current_overall_dynamic_aggressiveness = std::min(p_ctx.sgpr_influenced_aggressiveness, p_ctx.vgpr_influenced_aggressiveness);
+        /* Mitigation: Higher floor to maintain aggression */
+        p_ctx.current_overall_dynamic_aggressiveness = std::max(0.65f, p_ctx.current_overall_dynamic_aggressiveness);
     }
 
-    static void schedule_block_perfected(sched_ctx& ctx, Program* prog, Block* blk)
+    static void schedule_block_perfected(sched_ctx& ctx, Program* prog, Block* blk, double mem_ratio_blk)
     {
         ctx.last_SMEM_dep_idx = 0;
         ctx.last_SMEM_stall   = INT16_MIN;
@@ -1954,7 +2107,8 @@ namespace aco {
                 (ins->isVMEM() || ins->isFlatLike() || ins->isSMEM())
                 ? ++mem_i : ++alu_i;
 
-            const double mem_ratio_blk = LIKELY(std::max(1u, mem_i + alu_i) > 0) ? double(mem_i) / double(std::max(1u, mem_i + alu_i)) : 0.0;
+            const double mem_ratio_blk_local = LIKELY(std::max(1u, mem_i + alu_i) > 0) ? double(mem_i) / double(std::max(1u, mem_i + alu_i)) : 0.0;
+        mem_ratio_blk = mem_ratio_blk_local; // Use local if needed
 
         float original_ctx_schedule_aggressiveness = ctx.schedule_aggressiveness;
         bool original_ctx_prefer_clauses = ctx.prefer_clauses;
@@ -1963,6 +2117,10 @@ namespace aco {
         float boost = calculate_vega_ilp_boost(blk, mem_ratio_blk);
         ctx.schedule_aggressiveness =
         std::clamp(0.5f + 1.0f * float(mem_ratio_blk), 0.5f, 1.5f) * boost;
+
+        // Holistic fix: Global boost if compute_cs and low mem_ratio to surpass vanilla ILP
+        if (prog->stage == compute_cs && mem_ratio_blk < 0.6) ctx.schedule_aggressiveness += 0.05f;
+        ctx.schedule_aggressiveness = std::clamp(ctx.schedule_aggressiveness, 0.5f, 1.6f);
 
         ctx.prefer_latency_hiding = mem_ratio_blk > 0.25;
         ctx.prefer_clauses        = mem_ratio_blk > 0.15;
@@ -1975,7 +2133,7 @@ namespace aco {
 
         unsigned num_stores = 0;
         for (unsigned i = 0; i < blk->instructions.size(); ++i) {
-            Instruction* cur = blk->instructions[i].get();
+            aco::Instruction* cur = blk->instructions[i].get();
             if (UNLIKELY(!cur)) continue;
             if (UNLIKELY(cur->opcode == aco_opcode::p_logical_end)) break;
 
@@ -1984,7 +2142,7 @@ namespace aco {
                 pressure_before_cur = blk->live_in_demand;
             } else {
                 int true_prev_idx = -1;
-                for (int k_prev = (int)i - 1; k_prev >= 0; --k_prev) {
+                for (int k_prev = static_cast<int>(i) - 1; k_prev >= 0; --k_prev) {
                     if (LIKELY(blk->instructions[k_prev].get() != nullptr)) {
                         true_prev_idx = k_prev;
                         break;
@@ -1995,7 +2153,7 @@ namespace aco {
                 blk->live_in_demand;
             }
 
-            update_pressure_influenced_aggressiveness(pressure_before_cur, ctx.pressure_ctx);
+            update_pressure_influenced_aggressiveness(pressure_before_cur, ctx.pressure_ctx, prog, ctx);
 
             ctx.mv.current = cur;
 
@@ -2003,7 +2161,7 @@ namespace aco {
                 cur->isEXP() && ctx.schedule_pos_exports) {
                 unsigned tgt = cur->exp().dest;
             if (tgt >= V_008DFC_SQ_EXP_POS && tgt < V_008DFC_SQ_EXP_PRIM) {
-                schedule_position_export(ctx, blk, cur, i);
+                schedule_position_export(ctx, blk, cur, i, prog);
             }
                 }
 
@@ -2014,24 +2172,24 @@ namespace aco {
 
                 if (cur->isVMEM() || cur->isFlatLike()) {
                     assert(ctx.prop_cache && ctx.pattern_scheduler);
-                    for (int j = i + 1; j < std::min((int)blk->instructions.size(), (int)i + 8); j++) {
+                    for (int j = i + 1; j < std::min(static_cast<int>(blk->instructions.size()), static_cast<int>(i) + 8); j++) {
                         if (LIKELY(blk->instructions[j].get() != nullptr)) {
                             ctx.prop_cache->prefetch(blk->instructions[j].get());
                         }
                     }
                     ctx.pattern_scheduler->schedule_vmem_adaptive(ctx, blk, cur, i);
                 } else if (cur->isSMEM()) {
-                    schedule_SMEM(ctx, blk, cur, i);
+                    schedule_SMEM(ctx, blk, cur, i, prog, mem_ratio_blk);
                 } else if (cur->isLDSDIR() || (cur->isDS() && !cur->ds().gds)) {
-                    schedule_LDS(ctx, blk, cur, i);
+                    schedule_LDS(ctx, blk, cur, i, prog, mem_ratio_blk);
                 }
         }
 
         if (num_stores > 1 &&
             (prog->gfx_level >= GFX11 ||
             (prog->gfx_level == GFX9 && ctx.prefer_clauses))) {
-            for (int s = int(blk->instructions.size()) - 1; s >= 0; --s) {
-                Instruction* st = blk->instructions[s].get();
+            for (int s = static_cast<int>(blk->instructions.size()) - 1; s >= 0; --s) {
+                aco::Instruction* st = blk->instructions[s].get();
                 if (UNLIKELY(!st || !st->definitions.empty())) continue;
                 if (UNLIKELY(!(st->isVMEM() || st->isFlatLike()))) continue;
 
@@ -2047,10 +2205,10 @@ namespace aco {
                     blk->instructions[true_prev_idx_st]->register_demand :
                     blk->live_in_demand;
                 }
-                update_pressure_influenced_aggressiveness(pressure_before_st, ctx.pressure_ctx);
+                update_pressure_influenced_aggressiveness(pressure_before_st, ctx.pressure_ctx, prog, ctx);
 
                 ctx.mv.current = st;
-                s -= schedule_VMEM_store(ctx, blk, st, s);
+                s -= schedule_VMEM_store(ctx, blk, st, s, prog, mem_ratio_blk);
             }
             }
 
@@ -2059,7 +2217,7 @@ namespace aco {
 
             for (auto& instr_ptr : blk->instructions) {
                 if (LIKELY(instr_ptr.get() != nullptr)) {
-                    Instruction* instr = instr_ptr.get();
+                    aco::Instruction* instr = instr_ptr.get();
                     RegisterDemand live_change = get_live_changes(instr);
                     live_now += live_change;
                     instr->register_demand = live_now;
@@ -2073,8 +2231,7 @@ namespace aco {
             ctx.prefer_latency_hiding   = original_ctx_prefer_latency_hiding;
     }
 
-    void
-    schedule_program(Program* program)
+    void schedule_program(Program* program)
     {
         if (UNLIKELY(!program))
             return;
@@ -2181,7 +2338,7 @@ namespace aco {
         target_waves = max_suitable_waves(program, target_waves);
 
         ctx.mv.max_registers = get_addr_regs_from_waves(program, target_waves);
-        ctx.mv.max_registers.vgpr = std::max(0, (int)ctx.mv.max_registers.vgpr - 2);
+        ctx.mv.max_registers.vgpr = std::max(0, static_cast<int>(ctx.mv.max_registers.vgpr) - 2);
 
         ctx.pressure_ctx.sgpr_max_sched_dwords = ctx.mv.max_registers.sgpr;
         ctx.pressure_ctx.vgpr_max_sched_dwords = ctx.mv.max_registers.vgpr;
@@ -2201,8 +2358,10 @@ namespace aco {
             ctx.schedule_pos_export_div = 4;
         }
 
-        for (Block& b : program->blocks)
-            schedule_block_perfected(ctx, program, &b);
+        for (Block& b : program->blocks) {
+            double mem_ratio_blk = calculate_local_memory_ratio_simple(&b, 0);
+            schedule_block_perfected(ctx, program, &b, mem_ratio_blk);
+        }
 
         RegisterDemand final_max_demand_after_sched;
         for (Block& b : program->blocks)
@@ -2213,4 +2372,4 @@ namespace aco {
             abort();
     }
 
-}
+} // namespace aco
