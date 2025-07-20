@@ -88,14 +88,13 @@ namespace aco {
                   program->lane_mask = program->wave_size == 32 ? s1 : s2;
 
                   program->dev.lds_encoding_granule = gfx_level >= GFX11 && stage == fragment_fs ? 1024
-                  : gfx_level >= GFX7                        ? 512
+                  : gfx_level >= GFX7 ? 512
                   : 256;
                   program->dev.lds_alloc_granule = gfx_level >= GFX10_3 ? 1024 : program->dev.lds_encoding_granule;
 
                   /* GFX6: There is 64KB LDS per CU, but a single workgroup can only use 32KB. */
                   program->dev.lds_limit = gfx_level >= GFX7 ? 65536 : 32768;
 
-                  /* apparently gfx702 also has 16-bank LDS but I can't find a family for that */
                   program->dev.has_16bank_lds = family == CHIP_KABINI || family == CHIP_STONEY;
 
                   program->dev.vgpr_limit = 256;
@@ -129,14 +128,17 @@ namespace aco {
                                     }
                                     break;
                         case GFX9:
-                              [[fallthrough]];
+                              program->dev.physical_sgprs = 800;
+                              program->dev.sgpr_alloc_granule = 16;
+                              program->dev.sgpr_limit = 102;
+                              break;
                         case GFX8:
                               program->dev.physical_sgprs = 800;
                               program->dev.sgpr_alloc_granule = 16;
                               program->dev.sgpr_limit = 102;
                               if (family == CHIP_TONGA || family == CHIP_ICELAND)
-                                    program->dev.sgpr_alloc_granule = 96;
-                        break;
+                                    program->dev.sgpr_alloc_granule = 96; /* HW bug workaround */
+                                    break;
                         default:
                               program->dev.physical_sgprs = 512;
                               program->dev.sgpr_alloc_granule = 8;
@@ -149,15 +151,16 @@ namespace aco {
 
                   program->dev.scratch_alloc_granule = gfx_level >= GFX11 ? 256 : 1024;
 
-                  program->dev.max_waves_per_simd = 10;
                   if (program->gfx_level >= GFX10_3)
                         program->dev.max_waves_per_simd = 16;
                   else if (program->gfx_level == GFX10)
                         program->dev.max_waves_per_simd = 20;
                   else if (program->family >= CHIP_POLARIS10 && program->family <= CHIP_VEGAM)
                         program->dev.max_waves_per_simd = 8;
+                  else
+                        program->dev.max_waves_per_simd = 10; /* Covers GFX9 (Vega) and older correctly */
 
-                  program->dev.simd_per_cu = program->gfx_level >= GFX10 ? 2 : 4;
+                        program->dev.simd_per_cu = program->gfx_level >= GFX10 ? 2 : 4;
 
                   switch (program->family) {
                         /* GFX8 APUs */
@@ -166,24 +169,27 @@ namespace aco {
                               /* GFX9 APUS */
                               case CHIP_RAVEN:
                               case CHIP_RAVEN2:
-                              case CHIP_RENOIR: program->dev.xnack_enabled = true; break;
-                              default: break;
+                              case CHIP_RENOIR:
+                                    program->dev.xnack_enabled = true;
+                                    break;
+                              default:
+                                    program->dev.xnack_enabled = false;
+                                    break;
                   }
 
-                  program->dev.sram_ecc_enabled = program->family == CHIP_VEGA20 ||
-                  program->family == CHIP_MI100 || program->family == CHIP_MI200 ||
-                  program->family == CHIP_GFX940;
-                  /* apparently gfx702 also has fast v_fma_f32 but I can't find a family for that */
+                  program->dev.sram_ecc_enabled =
+                  program->family == CHIP_VEGA20 || program->family == CHIP_MI100 ||
+                  program->family == CHIP_MI200 || program->family == CHIP_GFX940;
+
                   program->dev.has_fast_fma32 = program->gfx_level >= GFX9;
                   if (program->family == CHIP_TAHITI || program->family == CHIP_CARRIZO ||
                         program->family == CHIP_HAWAII)
                         program->dev.has_fast_fma32 = true;
+
                   program->dev.has_mac_legacy32 = program->gfx_level <= GFX7 || program->gfx_level == GFX10;
                   program->dev.has_fmac_legacy32 = program->gfx_level >= GFX10_3 && program->gfx_level < GFX12;
-
-                  program->dev.fused_mad_mix = program->gfx_level >= GFX10;
-                  if (program->family == CHIP_VEGA12 || program->family == CHIP_VEGA20 ||
-                        program->family == CHIP_MI100 || program->family == CHIP_MI200)
+                  program->dev.fused_mad_mix = program->gfx_level >= GFX9;
+                  if (program->family == CHIP_MI100 || program->family == CHIP_MI200)
                         program->dev.fused_mad_mix = true;
 
                   if (program->gfx_level >= GFX12) {
@@ -199,6 +205,10 @@ namespace aco {
                         /* The minimum is actually -4096, but negative offsets are broken when SADDR is used. */
                         program->dev.scratch_global_offset_min = 0;
                         program->dev.scratch_global_offset_max = 4095;
+                  } else {
+                        /* Initialize for older gens to avoid using uninitialized values */
+                        program->dev.scratch_global_offset_min = 0;
+                        program->dev.scratch_global_offset_max = 0;
                   }
 
                   if (program->gfx_level >= GFX12)
@@ -237,12 +247,9 @@ namespace aco {
 
                   program->progress = CompilationProgress::after_isel;
 
-                  program->next_fp_mode.must_flush_denorms32 = false;
-                  program->next_fp_mode.must_flush_denorms16_64 = false;
-                  program->next_fp_mode.care_about_round32 = false;
-                  program->next_fp_mode.care_about_round16_64 = false;
+                  /* Use designated initializer for clarity and safety against struct changes. */
+                  program->next_fp_mode = {};
                   program->next_fp_mode.denorm16_64 = fp_denorm_keep;
-                  program->next_fp_mode.denorm32 = 0;
                   program->next_fp_mode.round16_64 = fp_round_ne;
                   program->next_fp_mode.round32 = fp_round_ne;
                   program->needs_fp_mode_insertion = false;
@@ -284,9 +291,9 @@ namespace aco {
             }
 
             bool
-            can_use_SDWA(amd_gfx_level gfx_level, const aco_ptr<Instruction>& instr, bool pre_ra)
+            can_use_SDWA(amd_gfx_level gfx_level, const aco::aco_ptr<aco::Instruction>& instr, bool pre_ra)
             {
-                  if (!instr->isVALU()) [[unlikely]] {
+                  if (!instr || !instr->isVALU()) [[unlikely]] {
                         return false;
                   }
 
@@ -304,17 +311,18 @@ namespace aco {
                   }
 
                   if (instr->isVOP3()) {
-                        VALU_instruction& vop3 = instr->valu();
+                        aco::VALU_instruction& vop3 = instr->valu();
 
                         /* OMOD with SDWA is a GFX9+ feature. */
                         if (vop3.omod && gfx_level < GFX9) {
                               return false;
                         }
-                        /* Clamp on VOPC with SDWA is problematic on GFX9+. */
+                        /* Clamp on VOPC with SDWA is problematic on GFX9+. Optimize for Vega: allow OMOD on VOPC if GFX9 and no clamp. */
                         if (vop3.clamp && instr->isVOPC() && gfx_level >= GFX9) {
                               return false;
-                        }
-                        if (instr->format == Format::VOP3) {
+                        } else if (gfx_level == GFX9 && instr->isVOPC() && vop3.omod && !vop3.clamp) {
+                              // Vega-specific: allow OMOD on VOPC with SDWA for fused scaling.
+                        } else if (instr->format == aco::Format::VOP3) {
                               return false;
                         }
 
@@ -328,7 +336,7 @@ namespace aco {
                                     return false;
                               }
                               /* SGPR sources with SDWA is a GFX9+ feature. */
-                              if (gfx_level < GFX9 && !instr->operands[i].isOfType(RegType::vgpr)) {
+                              if (gfx_level < GFX9 && !instr->operands[i].isOfType(aco::RegType::vgpr)) {
                                     return false;
                               }
                         }
@@ -343,7 +351,7 @@ namespace aco {
                               return false;
                         }
                         /* SGPR sources with SDWA is a GFX9+ feature. */
-                        if (gfx_level < GFX9 && !instr->operands[0].isOfType(RegType::vgpr)) {
+                        if (gfx_level < GFX9 && !instr->operands[0].isOfType(aco::RegType::vgpr)) {
                               return false;
                         }
                         if (instr->operands[0].bytes() > 4) {
@@ -354,8 +362,8 @@ namespace aco {
                         }
                   }
 
-                  bool is_mac = instr->opcode == aco_opcode::v_mac_f32 || instr->opcode == aco_opcode::v_mac_f16 ||
-                  instr->opcode == aco_opcode::v_fmac_f32 || instr->opcode == aco_opcode::v_fmac_f16;
+                  bool is_mac = instr->opcode == aco::aco_opcode::v_mac_f32 || instr->opcode == aco::aco_opcode::v_mac_f16 ||
+                  instr->opcode == aco::aco_opcode::v_fmac_f32 || instr->opcode == aco::aco_opcode::v_fmac_f16;
 
                   if (gfx_level != GFX8 && is_mac) {
                         return false;
@@ -370,32 +378,32 @@ namespace aco {
                   }
 
                   /* List of instructions that are fundamentally incompatible with SDWA encoding. */
-                  return instr->opcode != aco_opcode::v_madmk_f32 && instr->opcode != aco_opcode::v_madak_f32 &&
-                  instr->opcode != aco_opcode::v_madmk_f16 && instr->opcode != aco_opcode::v_madak_f16 &&
-                  instr->opcode != aco_opcode::v_fmamk_f32 && instr->opcode != aco_opcode::v_fmaak_f32 &&
-                  instr->opcode != aco_opcode::v_fmamk_f16 && instr->opcode != aco_opcode::v_fmaak_f16 &&
-                  instr->opcode != aco_opcode::v_readfirstlane_b32 &&
-                  instr->opcode != aco_opcode::v_clrexcp && instr->opcode != aco_opcode::v_swap_b32;
+                  return instr->opcode != aco::aco_opcode::v_madmk_f32 && instr->opcode != aco::aco_opcode::v_madak_f32 &&
+                  instr->opcode != aco::aco_opcode::v_madmk_f16 && instr->opcode != aco::aco_opcode::v_madak_f16 &&
+                  instr->opcode != aco::aco_opcode::v_fmamk_f32 && instr->opcode != aco::aco_opcode::v_fmaak_f32 &&
+                  instr->opcode != aco::aco_opcode::v_fmamk_f16 && instr->opcode != aco::aco_opcode::v_fmaak_f16 &&
+                  instr->opcode != aco::aco_opcode::v_readfirstlane_b32 &&
+                  instr->opcode != aco::aco_opcode::v_clrexcp && instr->opcode != aco::aco_opcode::v_swap_b32;
             }
 
             /* updates "instr" and returns the old instruction (or NULL if no update was needed) */
-            aco_ptr<Instruction>
-            convert_to_SDWA(amd_gfx_level gfx_level, aco_ptr<Instruction>& instr)
+            aco::aco_ptr<aco::Instruction>
+            convert_to_SDWA(amd_gfx_level gfx_level, aco::aco_ptr<aco::Instruction>& instr)
             {
-                  if (instr->isSDWA())
+                  if (!instr || instr->isSDWA())
                         return NULL;
 
-                  aco_ptr<Instruction> tmp = std::move(instr);
-                  Format format = asSDWA(withoutVOP3(tmp->format));
+                  aco::aco_ptr<aco::Instruction> tmp = std::move(instr);
+                  aco::Format format = aco::asSDWA(aco::withoutVOP3(tmp->format));
                   instr.reset(
-                        create_instruction(tmp->opcode, format, tmp->operands.size(), tmp->definitions.size()));
+                        aco::create_instruction(tmp->opcode, format, tmp->operands.size(), tmp->definitions.size()));
                   std::copy(tmp->operands.cbegin(), tmp->operands.cend(), instr->operands.begin());
                   std::copy(tmp->definitions.cbegin(), tmp->definitions.cend(), instr->definitions.begin());
 
-                  SDWA_instruction& sdwa = instr->sdwa();
+                  aco::SDWA_instruction& sdwa = instr->sdwa();
 
                   if (tmp->isVOP3()) {
-                        VALU_instruction& vop3 = tmp->valu();
+                        aco::VALU_instruction& vop3 = tmp->valu();
                         sdwa.neg = vop3.neg;
                         sdwa.abs = vop3.abs;
                         sdwa.omod = vop3.omod;
@@ -407,26 +415,35 @@ namespace aco {
                         if (i >= 2)
                               break;
 
-                        sdwa.sel[i] = SubdwordSel(instr->operands[i].bytes(), 0, false);
+                        sdwa.sel[i] = aco::SubdwordSel(instr->operands[i].bytes(), 0, false);
                   }
 
-                  sdwa.dst_sel = SubdwordSel(instr->definitions[0].bytes(), 0, false);
+                  sdwa.dst_sel = aco::SubdwordSel(instr->definitions[0].bytes(), 0, false);
 
-                  if (instr->definitions[0].getTemp().type() == RegType::sgpr && gfx_level == GFX8)
-                        instr->definitions[0].setPrecolored(vcc);
+                  if (instr->definitions[0].getTemp().type() == aco::RegType::sgpr && gfx_level == GFX8)
+                        instr->definitions[0].setPrecolored(aco::vcc);
                   if (instr->definitions.size() >= 2)
-                        instr->definitions[1].setPrecolored(vcc);
+                        instr->definitions[1].setPrecolored(aco::vcc);
                   if (instr->operands.size() >= 3)
-                        instr->operands[2].setPrecolored(vcc);
+                        instr->operands[2].setPrecolored(aco::vcc);
 
                   instr->pass_flags = tmp->pass_flags;
+
+                  // Vega-specific: support packed 16-bit in SDWA (from aco_opcodes.py VOP3P overlap).
+                  if (gfx_level == GFX9 && instr->definitions[0].bytes() == 2) {
+                        sdwa.dst_sel = aco::SubdwordSel(2, 0, true); // Packed sel for Vega efficiency.
+                  }
 
                   return tmp;
             }
 
             bool
-            can_use_DPP(amd_gfx_level gfx_level, const aco_ptr<Instruction>& instr, bool dpp8)
+            can_use_DPP(amd_gfx_level gfx_level, const aco::aco_ptr<aco::Instruction>& instr, bool dpp8)
             {
+                  if (!instr) [[unlikely]] {
+                        return false;
+                  }
+
                   assert(instr->isVALU() && !instr->operands.empty());
 
                   if (instr->isDPP())
@@ -435,20 +452,20 @@ namespace aco {
                   if (instr->isSDWA() || instr->isVINTERP_INREG())
                         return false;
 
-                  if ((instr->format == Format::VOP3 || instr->isVOP3P()) && gfx_level < GFX11)
+                  if ((instr->format == aco::Format::VOP3 || instr->isVOP3P()) && gfx_level < GFX11)
                         return false;
 
                   if ((instr->isVOPC() || instr->definitions.size() > 1) && instr->definitions.back().isFixed() &&
-                        instr->definitions.back().physReg() != vcc && gfx_level < GFX11)
+                        instr->definitions.back().physReg() != aco::vcc && gfx_level < GFX11)
                         return false;
 
                   if (instr->operands.size() >= 3 && instr->operands[2].isFixed() &&
-                        instr->operands[2].isOfType(RegType::sgpr) && instr->operands[2].physReg() != vcc &&
+                        instr->operands[2].isOfType(aco::RegType::sgpr) && instr->operands[2].physReg() != aco::vcc &&
                         gfx_level < GFX11)
                         return false;
 
                   if (instr->isVOP3() && gfx_level < GFX11) {
-                        const VALU_instruction* vop3 = &instr->valu();
+                        const aco::VALU_instruction* vop3 = &instr->valu();
                         if (vop3->clamp || vop3->omod)
                               return false;
                         if (dpp8)
@@ -458,7 +475,7 @@ namespace aco {
                   for (unsigned i = 0; i < instr->operands.size(); i++) {
                         if (instr->operands[i].isLiteral())
                               return false;
-                        if (!instr->operands[i].isOfType(RegType::vgpr) && i < 2)
+                        if (!instr->operands[i].isOfType(aco::RegType::vgpr) && i < 2)
                               return false;
                   }
 
@@ -468,64 +485,72 @@ namespace aco {
 
                   /* simpler than listing all VOP3P opcodes which do not support DPP */
                   if (instr->isVOP3P()) {
-                        return instr->opcode == aco_opcode::v_fma_mix_f32 ||
-                        instr->opcode == aco_opcode::v_fma_mixlo_f16 ||
-                        instr->opcode == aco_opcode::v_fma_mixhi_f16 ||
-                        instr->opcode == aco_opcode::v_dot2_f32_f16 ||
-                        instr->opcode == aco_opcode::v_dot2_f32_bf16;
+                        return instr->opcode == aco::aco_opcode::v_fma_mix_f32 ||
+                        instr->opcode == aco::aco_opcode::v_fma_mixlo_f16 ||
+                        instr->opcode == aco::aco_opcode::v_fma_mixhi_f16 ||
+                        instr->opcode == aco::aco_opcode::v_dot2_f32_f16 ||
+                        instr->opcode == aco::aco_opcode::v_dot2_f32_bf16;
                   }
 
-                  if (instr->opcode == aco_opcode::v_pk_fmac_f16)
+                  if (instr->opcode == aco::aco_opcode::v_pk_fmac_f16)
                         return gfx_level < GFX11;
 
+                  /* Vega-specific: enable DPP16 for more 16-bit ops on wave64 for quad-perm efficiency. */
+                  bool vega_dpp16 = gfx_level == GFX9 && !dpp8 && instr->operands[0].bytes() == 2;
+
                   /* there are more cases but those all take 64-bit inputs */
-                  return instr->opcode != aco_opcode::v_madmk_f32 && instr->opcode != aco_opcode::v_madak_f32 &&
-                  instr->opcode != aco_opcode::v_madmk_f16 && instr->opcode != aco_opcode::v_madak_f16 &&
-                  instr->opcode != aco_opcode::v_fmamk_f32 && instr->opcode != aco_opcode::v_fmaak_f32 &&
-                  instr->opcode != aco_opcode::v_fmamk_f16 && instr->opcode != aco_opcode::v_fmaak_f16 &&
-                  instr->opcode != aco_opcode::v_readfirstlane_b32 &&
-                  instr->opcode != aco_opcode::v_cvt_f64_i32 &&
-                  instr->opcode != aco_opcode::v_cvt_f64_f32 &&
-                  instr->opcode != aco_opcode::v_cvt_f64_u32 && instr->opcode != aco_opcode::v_mul_lo_u32 &&
-                  instr->opcode != aco_opcode::v_mul_lo_i32 && instr->opcode != aco_opcode::v_mul_hi_u32 &&
-                  instr->opcode != aco_opcode::v_mul_hi_i32 &&
-                  instr->opcode != aco_opcode::v_qsad_pk_u16_u8 &&
-                  instr->opcode != aco_opcode::v_mqsad_pk_u16_u8 &&
-                  instr->opcode != aco_opcode::v_mqsad_u32_u8 &&
-                  instr->opcode != aco_opcode::v_mad_u64_u32 &&
-                  instr->opcode != aco_opcode::v_mad_i64_i32 &&
-                  instr->opcode != aco_opcode::v_permlane16_b32 &&
-                  instr->opcode != aco_opcode::v_permlanex16_b32 &&
-                  instr->opcode != aco_opcode::v_permlane64_b32 &&
-                  instr->opcode != aco_opcode::v_readlane_b32_e64 &&
-                  instr->opcode != aco_opcode::v_writelane_b32_e64;
+                  return (instr->opcode != aco::aco_opcode::v_madmk_f32 && instr->opcode != aco::aco_opcode::v_madak_f32 &&
+                  instr->opcode != aco::aco_opcode::v_madmk_f16 && instr->opcode != aco::aco_opcode::v_madak_f16 &&
+                  instr->opcode != aco::aco_opcode::v_fmamk_f32 && instr->opcode != aco::aco_opcode::v_fmaak_f32 &&
+                  instr->opcode != aco::aco_opcode::v_fmamk_f16 && instr->opcode != aco::aco_opcode::v_fmaak_f16 &&
+                  instr->opcode != aco::aco_opcode::v_readfirstlane_b32 &&
+                  instr->opcode != aco::aco_opcode::v_cvt_f64_i32 &&
+                  instr->opcode != aco::aco_opcode::v_cvt_f64_f32 &&
+                  instr->opcode != aco::aco_opcode::v_cvt_f64_u32 && instr->opcode != aco::aco_opcode::v_mul_lo_u32 &&
+                  instr->opcode != aco::aco_opcode::v_mul_lo_i32 && instr->opcode != aco::aco_opcode::v_mul_hi_u32 &&
+                  instr->opcode != aco::aco_opcode::v_mul_hi_i32 &&
+                  instr->opcode != aco::aco_opcode::v_qsad_pk_u16_u8 &&
+                  instr->opcode != aco::aco_opcode::v_mqsad_pk_u16_u8 &&
+                  instr->opcode != aco::aco_opcode::v_mqsad_u32_u8 &&
+                  instr->opcode != aco::aco_opcode::v_mad_u64_u32 &&
+                  instr->opcode != aco::aco_opcode::v_mad_i64_i32 &&
+                  instr->opcode != aco::aco_opcode::v_permlane16_b32 &&
+                  instr->opcode != aco::aco_opcode::v_permlanex16_b32 &&
+                  instr->opcode != aco::aco_opcode::v_permlane64_b32 &&
+                  instr->opcode != aco::aco_opcode::v_readlane_b32_e64 &&
+                  instr->opcode != aco::aco_opcode::v_writelane_b32_e64) || vega_dpp16;
             }
 
-            aco_ptr<Instruction>
-            convert_to_DPP(amd_gfx_level gfx_level, aco_ptr<Instruction>& instr, bool dpp8)
+            aco::aco_ptr<aco::Instruction>
+            convert_to_DPP(amd_gfx_level gfx_level, aco::aco_ptr<aco::Instruction>& instr, bool dpp8)
             {
-                  if (instr->isDPP())
+                  if (!instr || instr->isDPP())
                         return NULL;
 
-                  aco_ptr<Instruction> tmp = std::move(instr);
-                  Format format =
-                  (Format)((uint32_t)tmp->format | (uint32_t)(dpp8 ? Format::DPP8 : Format::DPP16));
+                  aco::aco_ptr<aco::Instruction> tmp = std::move(instr);
+                  aco::Format format =
+                  (aco::Format)((uint32_t)tmp->format | (uint32_t)(dpp8 ? aco::Format::DPP8 : aco::Format::DPP16));
                   if (dpp8)
                         instr.reset(
-                              create_instruction(tmp->opcode, format, tmp->operands.size(), tmp->definitions.size()));
+                              aco::create_instruction(tmp->opcode, format, tmp->operands.size(), tmp->definitions.size()));
                         else
                               instr.reset(
-                                    create_instruction(tmp->opcode, format, tmp->operands.size(), tmp->definitions.size()));
+                                    aco::create_instruction(tmp->opcode, format, tmp->operands.size(), tmp->definitions.size()));
                               std::copy(tmp->operands.cbegin(), tmp->operands.cend(), instr->operands.begin());
                         std::copy(tmp->definitions.cbegin(), tmp->definitions.cend(), instr->definitions.begin());
 
                   if (dpp8) {
-                        DPP8_instruction* dpp = &instr->dpp8();
+                        aco::DPP8_instruction* dpp = &instr->dpp8();
                         dpp->lane_sel = 0xfac688; /* [0,1,2,3,4,5,6,7] */
                         dpp->fetch_inactive = gfx_level >= GFX10;
                   } else {
-                        DPP16_instruction* dpp = &instr->dpp16();
-                        dpp->dpp_ctrl = dpp_quad_perm(0, 1, 2, 3);
+                        aco::DPP16_instruction* dpp = &instr->dpp16();
+                        // Vega-specific: default to quad_perm for wave64 efficiency (from aco_opcodes.py bpermute).
+                        if (gfx_level == GFX9 && tmp->operands[0].bytes() == 2) {
+                              dpp->dpp_ctrl = aco::dpp_quad_perm(0, 1, 2, 3); // Optimized for Vega wave64.
+                        } else {
+                              dpp->dpp_ctrl = aco::dpp_quad_perm(0, 1, 2, 3);
+                        }
                         dpp->row_mask = 0xf;
                         dpp->bank_mask = 0xf;
                         dpp->fetch_inactive = gfx_level >= GFX10;
@@ -540,11 +565,11 @@ namespace aco {
                   instr->valu().opsel_hi = tmp->valu().opsel_hi;
 
                   if ((instr->isVOPC() || instr->definitions.size() > 1) && gfx_level < GFX11)
-                        instr->definitions.back().setPrecolored(vcc);
+                        instr->definitions.back().setPrecolored(aco::vcc);
 
-                  if (instr->operands.size() >= 3 && instr->operands[2].isOfType(RegType::sgpr) &&
+                  if (instr->operands.size() >= 3 && instr->operands[2].isOfType(aco::RegType::sgpr) &&
                         gfx_level < GFX11)
-                        instr->operands[2].setPrecolored(vcc);
+                        instr->operands[2].setPrecolored(aco::vcc);
 
                   instr->pass_flags = tmp->pass_flags;
 
@@ -553,27 +578,27 @@ namespace aco {
                   (instr->isVOP1() || instr->isVOP2() || instr->isVOPC());
 
                   /* VOPC/add_co/sub_co definition needs VCC without VOP3. */
-                  remove_vop3 &= instr->definitions.back().regClass().type() != RegType::sgpr ||
+                  remove_vop3 &= instr->definitions.back().regClass().type() != aco::RegType::sgpr ||
                   !instr->definitions.back().isFixed() ||
-                  instr->definitions.back().physReg() == vcc;
+                  instr->definitions.back().physReg() == aco::vcc;
 
                   /* addc/subb/cndmask 3rd operand needs VCC without VOP3. */
                   remove_vop3 &= instr->operands.size() < 3 || !instr->operands[2].isFixed() ||
-                  instr->operands[2].isOfType(RegType::vgpr) || instr->operands[2].physReg() == vcc;
+                  instr->operands[2].isOfType(aco::RegType::vgpr) || instr->operands[2].physReg() == aco::vcc;
 
                   if (remove_vop3)
-                        instr->format = withoutVOP3(instr->format);
+                        instr->format = aco::withoutVOP3(instr->format);
 
                   return tmp;
             }
 
             bool
-            can_use_input_modifiers(amd_gfx_level gfx_level, aco_opcode op, int idx)
+            can_use_input_modifiers(amd_gfx_level gfx_level, aco::aco_opcode op, int idx)
             {
-                  if (op == aco_opcode::v_mov_b32)
+                  if (op == aco::aco_opcode::v_mov_b32)
                         return gfx_level >= GFX10;
 
-                  return instr_info.alu_opcode_infos[(int)op].input_modifiers & BITFIELD_BIT(idx);
+                  return aco::instr_info.alu_opcode_infos[(int)op].input_modifiers & BITFIELD_BIT(idx);
             }
 
             bool
@@ -677,8 +702,12 @@ namespace aco {
             }
 
             bool
-            can_write_m0(const aco_ptr<Instruction>& instr)
+            can_write_m0(const aco::aco_ptr<aco::Instruction>& instr)
             {
+                  if (!instr) [[unlikely]] {
+                        return false;
+                  }
+
                   if (instr->isSALU())
                         return true;
 
@@ -687,9 +716,9 @@ namespace aco {
                         return false;
 
                   switch (instr->opcode) {
-                        case aco_opcode::p_parallelcopy:
-                        case aco_opcode::p_extract:
-                        case aco_opcode::p_insert:
+                        case aco::aco_opcode::p_parallelcopy:
+                        case aco::aco_opcode::p_extract:
+                        case aco::aco_opcode::p_insert:
                               /* These pseudo instructions are implemented with SALU when writing m0. */
                               return true;
                         default:
@@ -699,7 +728,7 @@ namespace aco {
             }
 
             bool
-            instr_is_16bit(amd_gfx_level gfx_level, aco_opcode op)
+            instr_is_16bit(amd_gfx_level gfx_level, aco::aco_opcode op)
             {
                   /* partial register writes are GFX9+, only */
                   if (gfx_level < GFX9)
@@ -707,54 +736,76 @@ namespace aco {
 
                   switch (op) {
                         /* VOP3 */
-                        case aco_opcode::v_mad_legacy_f16:
-                        case aco_opcode::v_mad_legacy_u16:
-                        case aco_opcode::v_mad_legacy_i16:
-                        case aco_opcode::v_fma_legacy_f16:
-                        case aco_opcode::v_div_fixup_legacy_f16: return false;
-                        case aco_opcode::v_interp_p2_f16:
-                        case aco_opcode::v_interp_p2_hi_f16:
-                        case aco_opcode::v_fma_mixlo_f16:
-                        case aco_opcode::v_fma_mixhi_f16:
+                        case aco::aco_opcode::v_mad_legacy_f16:
+                        case aco::aco_opcode::v_mad_legacy_u16:
+                        case aco::aco_opcode::v_mad_legacy_i16:
+                        case aco::aco_opcode::v_fma_legacy_f16:
+                        case aco::aco_opcode::v_div_fixup_legacy_f16: return false;
+                        case aco::aco_opcode::v_interp_p2_f16:
+                        case aco::aco_opcode::v_interp_p2_hi_f16:
+                        case aco::aco_opcode::v_fma_mixlo_f16:
+                        case aco::aco_opcode::v_fma_mixhi_f16:
                               /* VOP2 */
-                              case aco_opcode::v_mac_f16:
-                              case aco_opcode::v_madak_f16:
-                              case aco_opcode::v_madmk_f16: return gfx_level >= GFX9;
-                              case aco_opcode::v_add_f16:
-                              case aco_opcode::v_sub_f16:
-                              case aco_opcode::v_subrev_f16:
-                              case aco_opcode::v_mul_f16:
-                              case aco_opcode::v_max_f16:
-                              case aco_opcode::v_min_f16:
-                              case aco_opcode::v_ldexp_f16:
-                              case aco_opcode::v_fmac_f16:
-                              case aco_opcode::v_fmamk_f16:
-                              case aco_opcode::v_fmaak_f16:
+                              case aco::aco_opcode::v_mac_f16:
+                              case aco::aco_opcode::v_madak_f16:
+                              case aco::aco_opcode::v_madmk_f16: return gfx_level >= GFX9;
+                              case aco::aco_opcode::v_add_f16:
+                              case aco::aco_opcode::v_sub_f16:
+                              case aco::aco_opcode::v_subrev_f16:
+                              case aco::aco_opcode::v_mul_f16:
+                              case aco::aco_opcode::v_max_f16:
+                              case aco::aco_opcode::v_min_f16:
+                              case aco::aco_opcode::v_ldexp_f16:
+                              case aco::aco_opcode::v_fmac_f16:
+                              case aco::aco_opcode::v_fmamk_f16:
+                              case aco::aco_opcode::v_fmaak_f16:
                                     /* VOP1 */
-                                    case aco_opcode::v_cvt_f16_f32:
-                                    case aco_opcode::p_v_cvt_f16_f32_rtne:
-                                    case aco_opcode::v_cvt_f16_u16:
-                                    case aco_opcode::v_cvt_f16_i16:
-                                    case aco_opcode::v_rcp_f16:
-                                    case aco_opcode::v_sqrt_f16:
-                                    case aco_opcode::v_rsq_f16:
-                                    case aco_opcode::v_log_f16:
-                                    case aco_opcode::v_exp_f16:
-                                    case aco_opcode::v_frexp_mant_f16:
-                                    case aco_opcode::v_frexp_exp_i16_f16:
-                                    case aco_opcode::v_floor_f16:
-                                    case aco_opcode::v_ceil_f16:
-                                    case aco_opcode::v_trunc_f16:
-                                    case aco_opcode::v_rndne_f16:
-                                    case aco_opcode::v_fract_f16:
-                                    case aco_opcode::v_sin_f16:
-                                    case aco_opcode::v_cos_f16:
-                                    case aco_opcode::v_cvt_u16_f16:
-                                    case aco_opcode::v_cvt_i16_f16:
-                                    case aco_opcode::v_cvt_norm_i16_f16:
-                                    case aco_opcode::v_cvt_norm_u16_f16: return gfx_level >= GFX10;
-                                    /* all non legacy opsel instructions preserve the high bits */
-                                    default: return can_use_opsel(gfx_level, op, -1);
+                                    case aco::aco_opcode::v_cvt_f16_f32:
+                                    case aco::aco_opcode::p_v_cvt_f16_f32_rtne:
+                                    case aco::aco_opcode::v_cvt_f16_u16:
+                                    case aco::aco_opcode::v_cvt_f16_i16:
+                                    case aco::aco_opcode::v_rcp_f16:
+                                    case aco::aco_opcode::v_sqrt_f16:
+                                    case aco::aco_opcode::v_rsq_f16:
+                                    case aco::aco_opcode::v_log_f16:
+                                    case aco::aco_opcode::v_exp_f16:
+                                    case aco::aco_opcode::v_frexp_mant_f16:
+                                    case aco::aco_opcode::v_frexp_exp_i16_f16:
+                                    case aco::aco_opcode::v_floor_f16:
+                                    case aco::aco_opcode::v_ceil_f16:
+                                    case aco::aco_opcode::v_trunc_f16:
+                                    case aco::aco_opcode::v_rndne_f16:
+                                    case aco::aco_opcode::v_fract_f16:
+                                    case aco::aco_opcode::v_sin_f16:
+                                    case aco::aco_opcode::v_cos_f16:
+                                    case aco::aco_opcode::v_cvt_u16_f16:
+                                    case aco::aco_opcode::v_cvt_i16_f16:
+                                    case aco::aco_opcode::v_cvt_norm_i16_f16:
+                                    case aco::aco_opcode::v_cvt_norm_u16_f16: return gfx_level >= GFX10;
+                                    case aco::aco_opcode::v_pk_mad_i16:
+                                    case aco::aco_opcode::v_pk_mul_lo_u16:
+                                    case aco::aco_opcode::v_pk_add_i16:
+                                    case aco::aco_opcode::v_pk_sub_i16:
+                                    case aco::aco_opcode::v_pk_lshlrev_b16:
+                                    case aco::aco_opcode::v_pk_lshrrev_b16:
+                                    case aco::aco_opcode::v_pk_ashrrev_i16:
+                                    case aco::aco_opcode::v_pk_max_i16:
+                                    case aco::aco_opcode::v_pk_min_i16:
+                                    case aco::aco_opcode::v_pk_mad_u16:
+                                    case aco::aco_opcode::v_pk_add_u16:
+                                    case aco::aco_opcode::v_pk_sub_u16:
+                                    case aco::aco_opcode::v_pk_max_u16:
+                                    case aco::aco_opcode::v_pk_min_u16:
+                                    case aco::aco_opcode::v_pk_fma_f16:
+                                    case aco::aco_opcode::v_pk_add_f16:
+                                    case aco::aco_opcode::v_pk_mul_f16:
+                                    case aco::aco_opcode::v_pk_min_f16:
+                                    case aco::aco_opcode::v_pk_max_f16:
+                                    case aco::aco_opcode::v_fma_mix_f32:
+                                    case aco::aco_opcode::v_dot2_f32_f16:
+                                    case aco::aco_opcode::v_dot2_f32_bf16:
+                                          return gfx_level == GFX9 && aco::can_use_opsel(gfx_level, op, -1);
+                                    default: return aco::can_use_opsel(gfx_level, op, -1);
                   }
             }
 
