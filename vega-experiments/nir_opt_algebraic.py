@@ -3114,7 +3114,7 @@ def ldexp(f, exp, bits):
 
     pow2_1 = fexp2i(('ishr', exp, 1),          bits)
     pow2_2 = fexp2i(('isub', exp, ('ishr', exp, 1)), bits)
-    return ('fmul', ('fmul', f, pow2_1), pow2_2)
+    return ('!fmul', ('!fmul', f, pow2_1), pow2_2)
 
 optimizations += [
    (('ldexp@16', 'x', 'exp'), ldexp('x', 'exp', 16), 'options->lower_ldexp'),
