@@ -1,10 +1,6 @@
-# Maintainer:  Vincent Grande (shoober420) <shoober420@gmail.com>
-# Contributor: Jan Alexander Steffens (heftig) <heftig@archlinux.org>
-# Contributor: Jan de Groot <jgc@archlinux.org>
-
 pkgbase=harfbuzz-git
 pkgname=(harfbuzz-git harfbuzz-icu-git)
-pkgver=8.5.0+129+g3c435d867
+pkgver=11.3.2+2+g03387e3fd
 pkgrel=1
 pkgdesc="OpenType text shaping engine"
 url="https://www.freedesktop.org/wiki/Software/HarfBuzz"
@@ -12,8 +8,7 @@ arch=(x86_64)
 license=(MIT)
 depends=(chafa)
 makedepends=(glib2 freetype2 chafa graphite harfbuzz cairo icu gobject-introspection
-             ragel git python meson)
-#checkdepends=(python-fonttools python-setuptools)
+             ragel git python meson llvm python-fonttools python-setuptools clang lld)
 source=("git+https://github.com/harfbuzz/harfbuzz")
 sha256sums=('SKIP')
 
@@ -26,31 +21,150 @@ prepare() {
   cd harfbuzz
 
   # Harfbuzz wants no exceptions
-  CFLAGS="${CFLAGS/-fexceptions/}"
-  CXXFLAGS="${CXXFLAGS/-fexceptions/}"
+  #CFLAGS="${CFLAGS/-fexceptions/}"
+  #CXXFLAGS="${CXXFLAGS/-fexceptions/}"
 
+  # Use Clang/LLVM toolchain
+  export CC=clang
+  export CXX=clang++
+  export LD=lld
+  export AR=llvm-ar
+  export NM=llvm-nm
+  export STRIP=llvm-strip
+  export OBJCOPY=llvm-objcopy
+  export OBJDUMP=llvm-objdump
+  export READELF=llvm-readelf
+  export RANLIB=llvm-ranlib
+  export HOSTCC=clang
+  export HOSTCXX=clang++
 }
 
 build() {
-  arch-meson harfbuzz build \
-      -D graphite2=enabled \
-      -D tests=disabled \
-      -D b_ndebug=true \
-      -D b_pie=false \
-      -D c_std=gnu18 \
-      -D cpp_std=gnu++2a \
-      -D python.bytecompile=2 \
-      --unity=on \
-      --buildtype=release \
-      -D docs=disabled
+  # Common meson options (excluding tests and b_ndebug, which vary by stage)
+  local common_meson_args=(
+    -D graphite2=enabled
+    -D b_pie=false
+    -D c_std=gnu18
+    -D cpp_std=gnu++2a
+    -D python.bytecompile=2
+    --unity=off
+    --buildtype=plain
+    -D docs=disabled
+    -D b_lto=true
+  )
+
+  # Store original flags
+  CFLAGS_ORIG="$CFLAGS"
+  CXXFLAGS_ORIG="$CXXFLAGS"
+  LDFLAGS_ORIG="$LDFLAGS"
+
+  # Common optimization flags for all stages to ensure consistency
+  local common_cflags="-fno-common -ffunction-sections -fdata-sections"
+  local common_cxxflags="$common_cflags"
+  local common_ldflags="-fuse-ld=lld -Wl,--lto-O3 -Wl,--gc-sections"
+
+  # Instrumentation flags (used in stages 1 and 2)
+  local instr_flags="-fno-omit-frame-pointer -g3 -Xclang -mllvm -Xclang -vp-counters-per-site=50 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling"
+
+  # Ensure a clean build environment by removing existing build directories
+  rm -rf build build-pgo1 build-pgo2 pgo_raw pgo_cs tmp
+
+  # Create directories for PGO profiles
+  mkdir -p pgo_raw pgo_cs
+  chmod -R u+w pgo_raw pgo_cs
+
+  # --- Stage 1: Standard PGO - First round with standard instrumentation ---
+  echo "Stage 1: Building with standard PGO instrumentation..."
+
+  local pgo_dir="$srcdir/pgo_raw"
+  local cflags="$CFLAGS_ORIG $common_cflags $instr_flags -fprofile-generate=$pgo_dir"
+  local cxxflags="$CXXFLAGS_ORIG $common_cxxflags $instr_flags -fprofile-generate=$pgo_dir"
+  local ldflags="$LDFLAGS_ORIG $common_ldflags $instr_flags -fprofile-generate=$pgo_dir"
+
+  arch-meson harfbuzz build-pgo1 "${common_meson_args[@]}" \
+    -D tests=enabled \
+    -D b_ndebug=false \
+    -D c_args="$cflags" \
+    -D cpp_args="$cxxflags" \
+    -D c_link_args="$ldflags" \
+    -D cpp_link_args="$ldflags"
+  meson compile -C build-pgo1
+
+  # Run training workload (tests) to generate standard profiles
+  echo "Running tests to generate standard PGO profile data..."
+  mkdir -p tmp
+  if ! TMPDIR="$PWD/tmp" meson test -C build-pgo1 --print-errorlogs; then
+    echo "Warning: Some tests failed during standard PGO profile generation. Profile data may be incomplete."
+  fi
+  rm -r tmp
+
+  # Check if profile data exists
+  if ! ls "$pgo_dir"/*.profraw >/dev/null 2>&1; then
+    echo "Error: No standard PGO profile data generated. Aborting."
+    exit 1
+  fi
+
+  # Merge standard profile data
+  echo "Merging standard PGO profile data..."
+  if ! llvm-profdata merge -output="$srcdir/standard.profdata" "$pgo_dir"/*.profraw; then
+    echo "Error: Failed to merge standard PGO profile data."
+    exit 1
+  fi
+
+  # --- Stage 2: Context-Sensitive PGO - Second round using first profile ---
+  echo "Stage 2: Building with context-sensitive PGO instrumentation..."
+
+  local cs_dir="$srcdir/pgo_cs"
+  local cflags="$CFLAGS_ORIG $common_cflags $instr_flags -fprofile-use=$srcdir/standard.profdata -fcs-profile-generate=$cs_dir"
+  local cxxflags="$CXXFLAGS_ORIG $common_cxxflags $instr_flags -fprofile-use=$srcdir/standard.profdata -fcs-profile-generate=$cs_dir"
+  local ldflags="$LDFLAGS_ORIG $common_ldflags $instr_flags -fprofile-use=$srcdir/standard.profdata -fcs-profile-generate=$cs_dir"
+
+  arch-meson harfbuzz build-pgo2 "${common_meson_args[@]}" \
+    -D tests=enabled \
+    -D b_ndebug=false \
+    -D c_args="$cflags" \
+    -D cpp_args="$cxxflags" \
+    -D c_link_args="$ldflags" \
+    -D cpp_link_args="$ldflags"
+  meson compile -C build-pgo2
+
+  # Run training workload again to generate context-sensitive profiles
+  echo "Running tests to generate context-sensitive PGO profile data..."
+  mkdir -p tmp
+  if ! TMPDIR="$PWD/tmp" meson test -C build-pgo2 --print-errorlogs; then
+    echo "Warning: Some tests failed during context-sensitive PGO profile generation. Profile data may be incomplete."
+  fi
+  rm -r tmp
+
+  # Check if profile data exists
+  if ! ls "$cs_dir"/*.profraw >/dev/null 2>&1; then
+    echo "Error: No context-sensitive PGO profile data generated. Aborting."
+    exit 1
+  fi
+
+  # Merge context-sensitive profile with standard profile
+  echo "Merging context-sensitive profile with standard profile..."
+  if ! llvm-profdata merge -output="$srcdir/merged.profdata" "$cs_dir"/*.profraw "$srcdir/standard.profdata"; then
+    echo "Error: Failed to merge context-sensitive PGO profile data."
+    exit 1
+  fi
+
+  # --- Final stage: Build with merged PGO data ---
+  echo "Stage 3: Building final version with merged profile data..."
+
+  local cflags="$CFLAGS_ORIG $common_cflags -fprofile-use=$srcdir/merged.profdata"
+  local cxxflags="$CXXFLAGS_ORIG $common_cxxflags -fprofile-use=$srcdir/merged.profdata"
+  local ldflags="$LDFLAGS_ORIG $common_ldflags -fprofile-use=$srcdir/merged.profdata"
+
+  arch-meson harfbuzz build "${common_meson_args[@]}" \
+    -D tests=disabled \
+    -D b_ndebug=true \
+    -D c_args="$cflags" \
+    -D cpp_args="$cxxflags" \
+    -D c_link_args="$ldflags" \
+    -D cpp_link_args="$ldflags"
   meson compile -C build
 }
-
-#check() {
-#  mkdir -p tmp
-#  TMPDIR="$PWD/tmp" meson test -C build --print-errorlogs
-#  rm -r tmp
-#}
 
 package_harfbuzz-git() {
   provides=(harfbuzz libharfbuzz.so libharfbuzz-subset.so libharfbuzz-gobject.so)
