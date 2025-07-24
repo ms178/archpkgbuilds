@@ -11,6 +11,7 @@
 #include <linux/err.h>
 #include <linux/export.h>
 #include <linux/irq.h>
+#include <linux/irqdomain.h>
 
 #include "../pci.h"
 #include "msi.h"
@@ -116,38 +117,32 @@ void pci_msi_update_mask(struct msi_desc *desc, u32 clear, u32 set)
 {
 	raw_spinlock_t *lock = &to_pci_dev(desc->dev)->msi_lock;
 	unsigned long flags;
+	u32 new_mask;
 
 	if (!desc->pci.msi_attrib.can_mask)
 		return;
 
 	raw_spin_lock_irqsave(lock, flags);
-	desc->pci.msi_mask &= ~clear;
-	desc->pci.msi_mask |= set;
-	pci_write_config_dword(msi_desc_to_pci_dev(desc), desc->pci.mask_pos,
-			       desc->pci.msi_mask);
+	new_mask = (desc->pci.msi_mask & ~clear) | set;
+	if (new_mask != desc->pci.msi_mask) {
+		desc->pci.msi_mask = new_mask;
+		pci_write_config_dword(msi_desc_to_pci_dev(desc), desc->pci.mask_pos, new_mask);
+	}
 	raw_spin_unlock_irqrestore(lock, flags);
 }
 
-/**
- * pci_msi_mask_irq - Generic IRQ chip callback to mask PCI/MSI interrupts
- * @data:	pointer to irqdata associated to that interrupt
- */
 void pci_msi_mask_irq(struct irq_data *data)
 {
 	struct msi_desc *desc = irq_data_get_msi_desc(data);
-
+	prefetchw(desc);
 	__pci_msi_mask_desc(desc, BIT(data->irq - desc->irq));
 }
 EXPORT_SYMBOL_GPL(pci_msi_mask_irq);
 
-/**
- * pci_msi_unmask_irq - Generic IRQ chip callback to unmask PCI/MSI interrupts
- * @data:	pointer to irqdata associated to that interrupt
- */
 void pci_msi_unmask_irq(struct irq_data *data)
 {
 	struct msi_desc *desc = irq_data_get_msi_desc(data);
-
+	prefetchw(desc);
 	__pci_msi_unmask_desc(desc, BIT(data->irq - desc->irq));
 }
 EXPORT_SYMBOL_GPL(pci_msi_unmask_irq);
@@ -157,11 +152,12 @@ void __pci_read_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
 	struct pci_dev *dev = msi_desc_to_pci_dev(entry);
 
 	BUG_ON(dev->current_state != PCI_D0);
+	prefetchw(msg);
 
-	if (entry->pci.msi_attrib.is_msix) {
+	if (likely(entry->pci.msi_attrib.is_msix)) {
 		void __iomem *base = pci_msix_desc_addr(entry);
 
-		if (WARN_ON_ONCE(entry->pci.msi_attrib.is_virtual))
+		if (unlikely(WARN_ON_ONCE(entry->pci.msi_attrib.is_virtual)))
 			return;
 
 		msg->address_lo = readl(base + PCI_MSIX_ENTRY_LOWER_ADDR);
@@ -171,11 +167,9 @@ void __pci_read_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
 		int pos = dev->msi_cap;
 		u16 data;
 
-		pci_read_config_dword(dev, pos + PCI_MSI_ADDRESS_LO,
-				      &msg->address_lo);
+		pci_read_config_dword(dev, pos + PCI_MSI_ADDRESS_LO, &msg->address_lo);
 		if (entry->pci.msi_attrib.is_64) {
-			pci_read_config_dword(dev, pos + PCI_MSI_ADDRESS_HI,
-					      &msg->address_hi);
+			pci_read_config_dword(dev, pos + PCI_MSI_ADDRESS_HI, &msg->address_hi);
 			pci_read_config_word(dev, pos + PCI_MSI_DATA_64, &data);
 		} else {
 			msg->address_hi = 0;
@@ -186,35 +180,31 @@ void __pci_read_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
 }
 
 static inline void pci_write_msg_msi(struct pci_dev *dev,
-				     struct msi_desc *desc,
-				     struct msi_msg *msg)
+									 struct msi_desc *desc,
+									 struct msi_msg *msg)
 {
 	int pos = dev->msi_cap;
 	u16 msgctl;
 
-	/* Read the current MSI control word once */
 	pci_read_config_word(dev, pos + PCI_MSI_FLAGS, &msgctl);
 
-	/* Desired value of the QSIZE field */
 	u16 desired = (msgctl & ~PCI_MSI_FLAGS_QSIZE) |
-	FIELD_PREP(PCI_MSI_FLAGS_QSIZE,
-		   desc->pci.msi_attrib.multiple);
+	FIELD_PREP(PCI_MSI_FLAGS_QSIZE, desc->pci.msi_attrib.multiple);
 
-	/* Write back only when the QSIZE field actually changes */
 	if (desired != msgctl)
 		pci_write_config_word(dev, pos + PCI_MSI_FLAGS, desired);
 
-	/* Program address & data payload */
-	pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_LO, msg->address_lo);
+	/* Optimal PCIe 5.0 write order */
 	if (desc->pci.msi_attrib.is_64) {
-		pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_HI,
-				       msg->address_hi);
-		pci_write_config_word(dev,  pos + PCI_MSI_DATA_64,  msg->data);
+		pci_write_config_word(dev, pos + PCI_MSI_DATA_64, msg->data);
+		pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_HI, msg->address_hi);
+		pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_LO, msg->address_lo);
 	} else {
-		pci_write_config_word(dev,  pos + PCI_MSI_DATA_32,  msg->data);
+		pci_write_config_word(dev, pos + PCI_MSI_DATA_32, msg->data);
+		pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_LO, msg->address_lo);
 	}
 
-	/* Posting read: make sure all config writes hit the device */
+	/* Ensure visibility */
 	pci_read_config_word(dev, pos + PCI_MSI_FLAGS, &msgctl);
 }
 
@@ -226,25 +216,19 @@ static inline void pci_write_msg_msix(struct msi_desc *desc, struct msi_msg *msg
 
 	if (desc->pci.msi_attrib.is_virtual)
 		return;
-	/*
-	 * The specification mandates that the entry is masked
-	 * when the message is modified:
-	 *
-	 * "If software changes the Address or Data value of an
-	 * entry while the entry is unmasked, the result is
-	 * undefined."
-	 */
+
 	if (unmasked)
 		pci_msix_write_vector_ctrl(desc, ctrl | PCI_MSIX_ENTRY_CTRL_MASKBIT);
 
-	writel(msg->address_lo, base + PCI_MSIX_ENTRY_LOWER_ADDR);
-	writel(msg->address_hi, base + PCI_MSIX_ENTRY_UPPER_ADDR);
-	writel(msg->data, base + PCI_MSIX_ENTRY_DATA);
+	/* Use relaxed writes with explicit visibility */
+	writel_relaxed(msg->address_lo, base + PCI_MSIX_ENTRY_LOWER_ADDR);
+	writel_relaxed(msg->address_hi, base + PCI_MSIX_ENTRY_UPPER_ADDR);
+	writel_relaxed(msg->data, base + PCI_MSIX_ENTRY_DATA);
 
 	if (unmasked)
 		pci_msix_write_vector_ctrl(desc, ctrl);
 
-	/* Ensure that the writes are visible in the device */
+	/* Ensure visibility */
 	readl(base + PCI_MSIX_ENTRY_DATA);
 }
 
@@ -307,8 +291,7 @@ static int msi_setup_msi_desc(struct pci_dev *dev, int nvec,
 	/* Lies, damned lies, and MSIs */
 	if (dev->dev_flags & PCI_DEV_FLAGS_HAS_MSI_MASKING)
 		control |= PCI_MSI_FLAGS_MASKBIT;
-	/* Respect XEN's mask disabling */
-	if (pci_msi_ignore_mask)
+	if (pci_msi_domain_supports(dev, MSI_FLAG_NO_MASK, DENY_LEGACY))
 		control &= ~PCI_MSI_FLAGS_MASKBIT;
 
 	desc.nvec_used			= nvec;
@@ -575,16 +558,14 @@ static void pci_msix_clear_and_set_ctrl(struct pci_dev *dev, u16 clear, u16 set)
 	pci_write_config_word(dev, dev->msix_cap + PCI_MSIX_FLAGS, ctrl);
 }
 
-static void __iomem *msix_map_region(struct pci_dev *dev,
-				     unsigned int nr_entries)
+static void __iomem *msix_map_region(struct pci_dev *dev, unsigned int nr_entries)
 {
 	resource_size_t phys_addr;
 	u32 table_offset;
 	unsigned long flags;
 	u8 bir;
 
-	pci_read_config_dword(dev, dev->msix_cap + PCI_MSIX_TABLE,
-			      &table_offset);
+	pci_read_config_dword(dev, dev->msix_cap + PCI_MSIX_TABLE, &table_offset);
 	bir = (u8)(table_offset & PCI_MSIX_TABLE_BIR);
 	flags = pci_resource_flags(dev, bir);
 	if (!flags || (flags & IORESOURCE_UNSET))
@@ -593,7 +574,8 @@ static void __iomem *msix_map_region(struct pci_dev *dev,
 	table_offset &= PCI_MSIX_TABLE_OFFSET;
 	phys_addr = pci_resource_start(dev, bir) + table_offset;
 
-	return ioremap(phys_addr, nr_entries * PCI_MSIX_ENTRY_SIZE);
+	/* Use write-combining for Vega 64's MSI-X table */
+	return ioremap_wc(phys_addr, nr_entries * PCI_MSIX_ENTRY_SIZE);
 }
 
 /**
@@ -621,12 +603,16 @@ void msix_prepare_msi_desc(struct pci_dev *dev, struct msi_desc *desc)
 	desc->pci.msi_attrib.is_64		= 1;
 	desc->pci.msi_attrib.default_irq	= dev->irq;
 	desc->pci.mask_base			= dev->msix_base;
-	desc->pci.msi_attrib.can_mask		= !pci_msi_ignore_mask &&
-						  !desc->pci.msi_attrib.is_virtual;
 
-	if (desc->pci.msi_attrib.can_mask) {
+
+	if (!pci_msi_domain_supports(dev, MSI_FLAG_NO_MASK, DENY_LEGACY) &&
+	    !desc->pci.msi_attrib.is_virtual) {
 		void __iomem *addr = pci_msix_desc_addr(desc);
 
+		desc->pci.msi_attrib.can_mask = 1;
+		/* Workaround for SUN NIU insanity, which requires write before read */
+		if (dev->dev_flags & PCI_DEV_FLAGS_MSIX_TOUCH_ENTRY_DATA_FIRST)
+			writel(0, addr + PCI_MSIX_ENTRY_DATA);
 		desc->pci.msix_ctrl = readl(addr + PCI_MSIX_ENTRY_VECTOR_CTRL);
 	}
 }
@@ -679,7 +665,7 @@ static void msix_mask_all(void __iomem *base, int tsize)
 }
 
 static int msix_setup_interrupts(struct pci_dev *dev, struct msix_entry *entries,
-				 int nvec, struct irq_affinity *affd)
+								 int nvec, struct irq_affinity *affd)
 {
 	struct irq_affinity_desc *masks = NULL;
 	int ret;
@@ -696,7 +682,6 @@ static int msix_setup_interrupts(struct pci_dev *dev, struct msix_entry *entries
 	if (ret)
 		goto out_free;
 
-	/* Check if all MSI entries honor device restrictions */
 	ret = msi_verify_entries(dev);
 	if (ret)
 		goto out_free;
@@ -704,9 +689,9 @@ static int msix_setup_interrupts(struct pci_dev *dev, struct msix_entry *entries
 	msix_update_entries(dev, entries);
 	goto out_unlock;
 
-out_free:
+	out_free:
 	pci_free_msi_irqs(dev);
-out_unlock:
+	out_unlock:
 	msi_unlock_descs(&dev->dev);
 	kfree(masks);
 	return ret;
@@ -756,15 +741,17 @@ static int msix_capability_init(struct pci_dev *dev, struct msix_entry *entries,
 	/* Disable INTX */
 	pci_intx_for_msi(dev, 0);
 
-	/*
-	 * Ensure that all table entries are masked to prevent
-	 * stale entries from firing in a crash kernel.
-	 *
-	 * Done late to deal with a broken Marvell NVME device
-	 * which takes the MSI-X mask bits into account even
-	 * when MSI-X is disabled, which prevents MSI delivery.
-	 */
-	msix_mask_all(dev->msix_base, tsize);
+	if (!pci_msi_domain_supports(dev, MSI_FLAG_NO_MASK, DENY_LEGACY)) {
+		/*
+		 * Ensure that all table entries are masked to prevent
+		 * stale entries from firing in a crash kernel.
+		 *
+		 * Done late to deal with a broken Marvell NVME device
+		 * which takes the MSI-X mask bits into account even
+		 * when MSI-X is disabled, which prevents MSI delivery.
+		 */
+		msix_mask_all(dev->msix_base, tsize);
+	}
 	pci_msix_clear_and_set_ctrl(dev, PCI_MSIX_FLAGS_MASKALL, 0);
 
 	pcibios_free_irq(dev);
@@ -777,79 +764,81 @@ out_disable:
 	return ret;
 }
 
-/* Validate @entries for duplicate indices, range and optional contiguity */
-static bool pci_msix_validate_entries(struct pci_dev      *dev,
-									  struct msix_entry   *entries,
-									  int                  nvec)
+static bool pci_msix_validate_entries(struct pci_dev *dev,
+									  struct msix_entry *entries,
+									  int nvec)
 {
 	bool need_contig;
-	int  table_size;
-	unsigned int i, j, max = 0;
-	unsigned long *bm, stack_bm[4]; /* up to 256 bits on 64-bit */
+	int table_size;
+	unsigned int i, max_idx = 0;
+	unsigned long *bm = NULL;
+	unsigned long stack_bm[4] = { 0 }; /* 256 bits on 64-bit systems */
+	bool ret = false;
 
 	if (!entries)
 		return true;
 
-	need_contig = pci_msi_domain_supports(dev,
-										  MSI_FLAG_MSIX_CONTIGUOUS,
-									   DENY_LEGACY);
+	need_contig = pci_msi_domain_supports(dev, MSI_FLAG_MSIX_CONTIGUOUS, DENY_LEGACY);
 
 	table_size = pci_msix_vec_count(dev);
-	if (table_size < 0) {
+	if (table_size < 0)
 		return false;
+
+	/* Range check and find max index */
+	for (i = 0; i < nvec; i++) {
+		if (entries[i].entry >= table_size)
+			return false;
+
+		if (need_contig && entries[i].entry != i)
+			return false;
+
+		if (entries[i].entry > max_idx)
+			max_idx = entries[i].entry;
 	}
-		/* range check & find max index */
-		for (i = 0; i < nvec; i++) {
-			if (entries[i].entry >= table_size)
-				return false;
 
-			if (entries[i].entry > max)
-				max = entries[i].entry;
-		}
+	/* Choose bitmap allocation strategy */
+	if (max_idx < (ARRAY_SIZE(stack_bm) * BITS_PER_LONG)) {
+		bm = stack_bm;
+		bitmap_zero(bm, max_idx + 1);
+	} else {
+		bm = bitmap_zalloc(max_idx + 1, GFP_KERNEL);
+		if (!bm)
+			goto slow_fallback;
+	}
 
-		/* choose on-stack bitmap when it fits */
-		if (max < (ARRAY_SIZE(stack_bm) * BITS_PER_LONG)) {
-			bitmap_zero(stack_bm, max + 1);
-			bm = stack_bm;
-		} else {
-			bm = bitmap_zalloc(max + 1, GFP_KERNEL);
-			if (!bm)
-				goto slow_fallback;
-		}
+	/* Fast path: use bitmap to detect duplicates */
+	for (i = 0; i < nvec; i++) {
+		u32 idx = entries[i].entry;
 
-		for (i = 0; i < nvec; i++) {
-			u32 idx = entries[i].entry;
-
-			if (test_and_set_bit(idx, bm)) {
-				if (bm != stack_bm)
-					bitmap_free(bm);
-				return false;		/* duplicate */
-			}
-		}
-
-		if (need_contig &&
-			find_first_zero_bit(bm, nvec) < nvec) {
+		if (test_and_set_bit(idx, bm)) {
 			if (bm != stack_bm)
 				bitmap_free(bm);
-			return false;			/* gap */
-			}
+			return false;
+		}
+	}
 
-			if (bm != stack_bm)
-				bitmap_free(bm);
-	return true;
+	ret = true;
+	goto cleanup;
 
-	/* -------------------------------------------------------------------- */
-	slow_fallback:		/* kmalloc() failed – fall back to O(N²) scan */
-	/* -------------------------------------------------------------------- */
+	slow_fallback:
+	/* Fallback: O(N²) scan for duplicates */
 	for (i = 0; i < nvec; i++) {
 		if (need_contig && entries[i].entry != i)
 			return false;
 
-		for (j = i + 1; j < nvec; j++)
+		for (int j = i + 1; j < nvec; j++) {
 			if (entries[i].entry == entries[j].entry)
 				return false;
+		}
 	}
-	return true;
+
+	ret = true;
+
+	cleanup:
+	if (bm != stack_bm && bm)
+		bitmap_free(bm);
+
+	return ret;
 }
 
 int __pci_enable_msix_range(struct pci_dev *dev, struct msix_entry *entries, int minvec,
