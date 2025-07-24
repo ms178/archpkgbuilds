@@ -8,6 +8,7 @@
  */
 #include <linux/bitfield.h>
 #include <linux/bitmap.h>
+#include <linux/compiler_attributes.h>
 #include <linux/err.h>
 #include <linux/export.h>
 #include <linux/irq.h>
@@ -655,13 +656,56 @@ static void msix_update_entries(struct pci_dev *dev, struct msix_entry *entries)
 static void msix_mask_all(void __iomem *base, int tsize)
 {
 	u32 ctrl = PCI_MSIX_ENTRY_CTRL_MASKBIT;
-	int i;
+	int groups;
 
-	if (pci_msi_ignore_mask)
+	if (pci_msi_ignore_mask || tsize <= 0)
 		return;
 
-	for (i = 0; i < tsize; i++, base += PCI_MSIX_ENTRY_SIZE)
-		writel(ctrl, base + PCI_MSIX_ENTRY_VECTOR_CTRL);
+	groups = tsize / 8;
+	tsize %= 8;
+
+	/* Process full 8-entry groups */
+	while (groups--) {
+		writel(ctrl, base + PCI_MSIX_ENTRY_VECTOR_CTRL); base += PCI_MSIX_ENTRY_SIZE;
+		writel(ctrl, base + PCI_MSIX_ENTRY_VECTOR_CTRL); base += PCI_MSIX_ENTRY_SIZE;
+		writel(ctrl, base + PCI_MSIX_ENTRY_VECTOR_CTRL); base += PCI_MSIX_ENTRY_SIZE;
+		writel(ctrl, base + PCI_MSIX_ENTRY_VECTOR_CTRL); base += PCI_MSIX_ENTRY_SIZE;
+		writel(ctrl, base + PCI_MSIX_ENTRY_VECTOR_CTRL); base += PCI_MSIX_ENTRY_SIZE;
+		writel(ctrl, base + PCI_MSIX_ENTRY_VECTOR_CTRL); base += PCI_MSIX_ENTRY_SIZE;
+		writel(ctrl, base + PCI_MSIX_ENTRY_VECTOR_CTRL); base += PCI_MSIX_ENTRY_SIZE;
+		writel(ctrl, base + PCI_MSIX_ENTRY_VECTOR_CTRL); base += PCI_MSIX_ENTRY_SIZE;
+	}
+
+	/* Process remaining entries (0–7) with explicit fallthrough */
+	switch (tsize) {
+		case 7:
+			writel(ctrl, base + PCI_MSIX_ENTRY_VECTOR_CTRL);
+			base += PCI_MSIX_ENTRY_SIZE;
+			fallthrough;
+		case 6:
+			writel(ctrl, base + PCI_MSIX_ENTRY_VECTOR_CTRL);
+			base += PCI_MSIX_ENTRY_SIZE;
+			fallthrough;
+		case 5:
+			writel(ctrl, base + PCI_MSIX_ENTRY_VECTOR_CTRL);
+			base += PCI_MSIX_ENTRY_SIZE;
+			fallthrough;
+		case 4:
+			writel(ctrl, base + PCI_MSIX_ENTRY_VECTOR_CTRL);
+			base += PCI_MSIX_ENTRY_SIZE;
+			fallthrough;
+		case 3:
+			writel(ctrl, base + PCI_MSIX_ENTRY_VECTOR_CTRL);
+			base += PCI_MSIX_ENTRY_SIZE;
+			fallthrough;
+		case 2:
+			writel(ctrl, base + PCI_MSIX_ENTRY_VECTOR_CTRL);
+			base += PCI_MSIX_ENTRY_SIZE;
+			fallthrough;
+		case 1:
+			writel(ctrl, base + PCI_MSIX_ENTRY_VECTOR_CTRL);
+			/* No final base increment needed */
+	}
 }
 
 static int msix_setup_interrupts(struct pci_dev *dev, struct msix_entry *entries,
