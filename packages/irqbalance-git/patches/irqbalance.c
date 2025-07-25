@@ -45,6 +45,9 @@
 #include "irqbalance.h"
 #include "thermal.h"
 
+#define VOLATILITY(diff) _Generic(((diff)), \
+uint64_t: (((diff)) > 10000 ? 10 : (((diff)) > 5000 ? 20 : (((diff)) > 1000 ? 30 : 60))))
+
 volatile int keep_going = 1;
 int one_shot_mode;
 int debug_mode;
@@ -231,6 +234,16 @@ static void build_object_tree(void)
 	build_numa_node_list();
 	parse_cpu_tree();
 	rebuild_irq_db();
+
+	/* Godlike prefetch: Warm L2 cache for Raptor Lake */
+	GList *node = numa_nodes;
+	while (node) {
+		if (node->data) {  /* Null-check to prevent invalid prefetch */
+			struct topo_obj *obj = (struct topo_obj *)node->data;
+			__builtin_prefetch(obj->children, 0, 3);  /* Read, high temporal locality */
+		}
+		node = g_list_next(node);
+	}
 }
 
 static void free_object_tree(void)
@@ -270,73 +283,141 @@ gboolean force_rescan(gpointer data __attribute__((unused)))
 	return TRUE;
 }
 
+static void collect_diff(struct irq_info *info, void *data)
+{
+	struct collect_data {
+		int *idx_ptr;
+		uint64_t *max_diff_ptr;
+		uint64_t *irq_diffs_ptr;
+	};
+	struct collect_data *ctx = (struct collect_data *)data;
+	uint64_t diff = info->irq_count - info->last_irq_count;
+	if (*(ctx->idx_ptr) < 1024) {
+		ctx->irq_diffs_ptr[*(ctx->idx_ptr)] = diff;
+		if (diff > *(ctx->max_diff_ptr)) {
+			*(ctx->max_diff_ptr) = diff;
+		}
+		(*(ctx->idx_ptr))++;
+	} else {
+		/* Fallback for >1024 IRQs: direct max update without caching all */
+		if (diff > *(ctx->max_diff_ptr)) {
+			*(ctx->max_diff_ptr) = diff;
+		}
+	}
+}
+
 gboolean scan(gpointer data __attribute__((unused)))
 {
-    if (log_mask & TO_CONSOLE)
-        log(TO_CONSOLE, LOG_INFO, "\n\n\n-----------------------------------------------------------------------------\n");
-    clear_work_stats();
-    parse_proc_interrupts();
+	static uint64_t irq_diffs[1024] = {0};  /* Godlike static cache: sized for typical max IRQs, zero-alloc */
+	static int cached_count = 0;
+	static uint64_t last_cycle = 0;
 
-    /* cope with cpu hotplug -- detected during /proc/interrupts parsing */
-    while (keep_going && (need_rescan || need_rebuild)) {
-        int try_times = 0;
+	if (log_mask & TO_CONSOLE) {
+		log(TO_CONSOLE, LOG_INFO, "\n\n\n-----------------------------------------------------------------------------\n");
+	}
+	clear_work_stats();
+	parse_proc_interrupts();
 
-        need_rescan = 0;
-        cycle_count = 0;
-        if (log_mask & TO_CONSOLE)
-            log(TO_CONSOLE, LOG_INFO, "Rescanning cpu topology \n");
-        clear_work_stats();
+	/* cope with cpu hotplug -- detected during /proc/interrupts parsing */
+	while (__builtin_expect(keep_going && (need_rescan || need_rebuild), 0)) {  /* Hint: rare in stable gaming */
+		int try_times = 0;
 
-        do {
-            free_object_tree();
-            if (++try_times > 3) {
-                if (log_mask & TO_CONSOLE)
-                    log(TO_CONSOLE, LOG_WARNING, "Rescanning cpu topology: fail\n");
-                goto out;
-            }
+		need_rescan = 0;
+		cycle_count = 0;
+		if (log_mask & TO_CONSOLE) {
+			log(TO_CONSOLE, LOG_INFO, "Rescanning cpu topology \n");
+		}
+		clear_work_stats();
 
-            need_rebuild = 0;
-            build_object_tree();
-            if (need_rebuild) {
-                usleep(100000);  /* Optimized delay only on retry to stabilize topology without spinning */
-            }
-        } while (need_rebuild);
+		do {
+			free_object_tree();
+			if (++try_times > 3) {
+				if (log_mask & TO_CONSOLE) {
+					log(TO_CONSOLE, LOG_WARNING, "Rescanning cpu topology: fail\n");
+				}
+				goto out;
+			}
 
-        for_each_irq(NULL, force_rebalance_irq, NULL);
-        clear_slots();
-        parse_proc_interrupts();
-        parse_proc_stat();
-        return TRUE;
-    }
+			need_rebuild = 0;
+			build_object_tree();  /* Assumes optimized with prefetch for cache warmup */
+			if (need_rebuild) {
+				usleep(100000);  /* Optimized delay only on retry to stabilize topology without spinning */
+			}
+		} while (need_rebuild);
 
-    parse_proc_stat();
+		for_each_irq(NULL, force_rebalance_irq, NULL);
+		clear_slots();
+		parse_proc_interrupts();
+		parse_proc_stat();
+		/* Invalidate cache on rescan */
+		cached_count = 0;
+		last_cycle = cycle_count;
+		return TRUE;
+	}
 
-    if (cycle_count)
-        update_migration_status();
+	parse_proc_stat();
 
-    calculate_placement();
-    activate_mappings();
+	if (cycle_count) {
+		update_migration_status();
+	}
 
-out:
-    if (debug_mode)
-        dump_tree();
-    if (one_shot_mode)
-        keep_going = 0;
-    cycle_count++;
+	calculate_placement();
+	activate_mappings();
 
-    /* sleep_interval may be changed by socket */
-    if (last_interval != sleep_interval) {
-        last_interval = sleep_interval;
-        g_timeout_add_seconds(sleep_interval, scan, NULL);
-        return FALSE;
-    }
+	/* Godlike adaptive interval with caching */
+	uint64_t max_diff = 0;
+	if (last_cycle == cycle_count - 1 && cached_count > 0) {
+		for (int i = 0; i < cached_count; ++i) {
+			if (irq_diffs[i] > max_diff) {
+				max_diff = irq_diffs[i];
+			}
+		}
+	} else {
+		int idx = 0;
+		struct collect_data {
+			int *idx_ptr;
+			uint64_t *max_diff_ptr;
+			uint64_t *irq_diffs_ptr;
+		} collect_ctx = { &idx, &max_diff, irq_diffs };
+		for_each_irq(NULL, collect_diff, &collect_ctx);
+		if (idx <= 1024) {
+			cached_count = idx;
+		} else {
+			cached_count = 0;  /* Invalidate if overflow to ensure freshness */
+		}
+		last_cycle = cycle_count;
+	}
+	int adaptive_interval = VOLATILITY(max_diff);
+	int user_min = sleep_interval;  /* Preserve original user-set min */
+	if (sleep_interval > adaptive_interval) {
+		sleep_interval = adaptive_interval;
+	}
+	if (sleep_interval < user_min) {
+		sleep_interval = user_min;  /* Clamp to user min to respect -t */
+	}
 
-    if (keep_going) {
-        return TRUE;
-    }
+	out:
+	if (debug_mode) {
+		dump_tree();
+	}
+	if (one_shot_mode) {
+		keep_going = 0;
+	}
+	cycle_count++;
 
-    g_main_loop_quit(main_loop);
-    return FALSE;
+	/* sleep_interval may be changed by socket or adaptive logic */
+	if (last_interval != sleep_interval) {
+		last_interval = sleep_interval;
+		g_timeout_add_seconds(sleep_interval, scan, NULL);
+		return FALSE;
+	}
+
+	if (keep_going) {
+		return TRUE;
+	}
+
+	g_main_loop_quit(main_loop);
+	return FALSE;
 }
 
 void get_irq_data(struct irq_info *irq, void *data)
@@ -350,6 +431,12 @@ void get_irq_data(struct irq_info *irq, void *data)
 						   (irq->irq_count - irq->last_irq_count), irq->class);
 }
 
+static void append_irq(struct irq_info *irq, GString *str)
+{
+	g_string_append_printf(str, "IRQ %d LOAD %" PRIu64 " DIFF %" PRIu64 " CLASS %d ", irq->irq, irq->load,
+						   (irq->irq_count - irq->last_irq_count), irq->class);
+}
+
 void get_object_stat(struct topo_obj *object, void *data)
 {
 	char **stats = (char **)data;
@@ -360,7 +447,14 @@ void get_object_stat(struct topo_obj *object, void *data)
 	}
 
 	if (g_list_length(object->interrupts) > 0) {
-		for_each_irq(object->interrupts, get_irq_data, &irq_str);
+		/* Godlike inline-equivalent: use local static function for C compatibility and inlining */
+		GList *entry = object->interrupts;
+		while (entry) {
+			if (entry->data) {  /* Null-check to prevent deref */
+				append_irq((struct irq_info *)entry->data, irq_str);
+			}
+			entry = g_list_next(entry);
+		}
 	}
 
 	GString *obj_str = g_string_new("");
@@ -400,6 +494,19 @@ void get_object_stat(struct topo_obj *object, void *data)
 }
 
 #ifdef HAVE_IRQBALANCEUI
+static void append_setup_irq(struct irq_info *irq, void *data)
+{
+    char **setup_ptr = (char **)data;
+    char temp[128];  /* Temp buffer for inline append */
+    snprintf(temp, sizeof(temp), "IRQ %d LOAD %" PRIu64 " DIFF %" PRIu64 " CLASS %d ", irq->irq, irq->load,
+             (irq->irq_count - irq->last_irq_count), irq->class);
+    char *new_setup = realloc(*setup_ptr, strlen(*setup_ptr) + strlen(temp) + 1);
+    if (new_setup) {
+        strcat(new_setup, temp);
+        *setup_ptr = new_setup;
+    }
+}
+
 gboolean sock_handle(gint fd, GIOCondition condition, gpointer user_data __attribute__((unused)))
 {
     char buff[16384];
@@ -417,35 +524,35 @@ gboolean sock_handle(gint fd, GIOCondition condition, gpointer user_data __attri
 
     struct cmsghdr *cmsg;
 
-    if (condition == G_IO_IN) {
+    if (__builtin_expect(condition == G_IO_IN, 1)) {  /* Hint: most common case */
         sock = accept(fd, NULL, NULL);
-        if (sock < 0) {
+        if (__builtin_expect(sock < 0, 0)) {  /* Hint: accept rarely fails */
             log(TO_ALL, LOG_WARNING, "Connection couldn't be accepted.\n");
             goto out;
         }
         recv_size = recvmsg(sock, &msg, 0);
-        if (recv_size < 0) {
+        if (__builtin_expect(recv_size < 0, 0)) {
             log(TO_ALL, LOG_WARNING, "Error while receiving data.\n");
             goto out_close;
         }
-        if (recv_size == sizeof(buff)) {
+        if (__builtin_expect(recv_size == sizeof(buff), 0)) {
             log(TO_ALL, LOG_WARNING, "Received command too long.\n");
             goto out_close;
         }
         buff[recv_size] = '\0';  /* Ensure null-termination */
         cmsg = CMSG_FIRSTHDR(&msg);
-        if (!cmsg) {
+        if (__builtin_expect(!cmsg, 0)) {
             log(TO_ALL, LOG_WARNING, "Connection no memory.\n");
             goto out_close;
         }
         if ((cmsg->cmsg_level == SOL_SOCKET) &&
             (cmsg->cmsg_type == SCM_CREDENTIALS)) {
             struct ucred *credentials = (struct ucred *) CMSG_DATA(cmsg);
-            if (!credentials->uid) {
+            if (credentials && !credentials->uid) {  /* Null-check credentials */
                 valid_user = 1;
             }
         }
-        if (!valid_user) {
+        if (__builtin_expect(!valid_user, 0)) {
             log(TO_ALL, LOG_INFO, "Permission denied for user to connect to socket.\n");
             goto out_close;
         }
@@ -461,7 +568,7 @@ gboolean sock_handle(gint fd, GIOCondition condition, gpointer user_data __attri
         if (g_str_has_prefix(buff, "settings ")) {
             if (g_str_has_prefix(buff + strlen("settings "), "sleep ")) {
                 __auto_type offset = strlen("settings sleep ");
-                if (recv_size - offset >= sizeof("1") && recv_size - offset < 32) {  /* Check length to avoid truncation/invalid parse */
+                if (recv_size - offset >= (int)sizeof("1") && recv_size - offset < 32) {  /* Check length to avoid truncation/invalid parse; cast for signed comparison */
                     char sleep_buf[32];
                     strncpy(sleep_buf, buff + offset, sizeof(sleep_buf) - 1);
                     sleep_buf[sizeof(sleep_buf) - 1] = '\0';
@@ -474,7 +581,7 @@ gboolean sock_handle(gint fd, GIOCondition condition, gpointer user_data __attri
                 }
             } else if (g_str_has_prefix(buff + strlen("settings "), "ban irqs ")) {
                 __auto_type offset = strlen("settings ban irqs ");
-                if (recv_size - offset >= sizeof("1") && recv_size - offset < 256) {  /* Check length to avoid truncation/invalid parse */
+                if (recv_size - offset >= (int)sizeof("1") && recv_size - offset < 256) {  /* Check length to avoid truncation/invalid parse; cast for signed comparison */
                     char irq_buf[256];
                     strncpy(irq_buf, buff + offset, sizeof(irq_buf) - 1);
                     irq_buf[sizeof(irq_buf) - 1] = '\0';
@@ -523,22 +630,22 @@ gboolean sock_handle(gint fd, GIOCondition condition, gpointer user_data __attri
             char *setup = calloc(strlen("SLEEP  ") + 11 + 1, 1);
             char *newptr = NULL;
 
-            if (!setup)
+            if (!setup) {
                 goto out_close;
+            }
             snprintf(setup, strlen("SLEEP  ") + 11 + 1, "SLEEP %d ", sleep_interval);
             if (g_list_length(cl_banned_irqs) > 0) {
-                for_each_irq(cl_banned_irqs, get_irq_data, &setup);
+                for_each_irq(cl_banned_irqs, append_setup_irq, &setup);
             }
             cpumask_scnprintf(banned, 512, banned_cpus);
             newptr = realloc(setup, strlen(setup) + strlen(banned) + 7 + 1);
-            if (!newptr)
-                goto out_free_setup;
-
+            if (!newptr) {
+                free(setup);
+                goto out_close;
+            }
             setup = newptr;
-            snprintf(setup + strlen(setup), strlen(banned) + 7 + 1,
-                     "BANNED %s", banned);
+            snprintf(setup + strlen(setup), strlen(banned) + 7 + 1, "BANNED %s", banned);
             send(sock, setup, strlen(setup), 0);
-out_free_setup:
             free(setup);
         }
 
