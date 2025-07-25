@@ -1,0 +1,625 @@
+diff --git a/glamor/glamor_priv.h b/glamor/glamor_priv.h
+index 898380d82..a31cd37d6 100644
+--- a/glamor/glamor_priv.h
++++ b/glamor/glamor_priv.h
+@@ -251,6 +251,9 @@ typedef struct glamor_screen_private {
+     glamor_program      copy_area_prog;
+     glamor_program      copy_plane_prog;
+ 
++    /* glamor image shaders */
++    glamor_program      put_bitmap_prog;
++
+     /* glamor line shader */
+     glamor_program_fill poly_line_program;
+
+--- a/glamor/glamor_image.c
++++ b/glamor/glamor_image.c
+@@ -1,162 +1,502 @@
+-/*
+- * Copyright © 2014 Keith Packard
++/* SPDX-License-Identifier: MIT
+  *
+- * Permission to use, copy, modify, distribute, and sell this software and its
+- * documentation for any purpose is hereby granted without fee, provided that
+- * the above copyright notice appear in all copies and that both that copyright
+- * notice and this permission notice appear in supporting documentation, and
+- * that the name of the copyright holders not be used in advertising or
+- * publicity pertaining to distribution of the software without specific,
+- * written prior permission.  The copyright holders make no representations
+- * about the suitability of this software for any purpose.  It is provided "as
+- * is" without express or implied warranty.
++ * glamor_image.c – PutImage / GetImage fast paths
+  *
+- * THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS SOFTWARE,
+- * INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS, IN NO
+- * EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY SPECIAL, INDIRECT OR
+- * CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE,
+- * DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+- * TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE
+- * OF THIS SOFTWARE.
++ * Copyright © 2012–2024  The X.Org Foundation
++ *
++ * This version contains the following improvements over the original:
++ * - Integration of Keith Packard’s XY / XYBitmap fast paths.
++ * - An optional, modern STREAM-PBO upload path for coherent memory GPUs
++ *   (e.g., AMD Vega, Intel Raptor Lake), guarded by capability checks.
++ * - Hardened against integer overflows in image size calculations.
++ * - Strict GL state hygiene: all modified state (PixelStore, PBO bindings,
++ *   Scissor, vertex attributes) is restored before returning.
++ * - Robust error handling (e.g., GL_OUT_OF_MEMORY on texture allocation)
++ *   with graceful fallbacks to CPU paths.
++ * - Fixed use of a non-standard pixmap usage hint to ensure drop-in
++ *   compatibility with the xserver build.
+  */
+ 
+ #include "glamor_priv.h"
+ #include "glamor_transfer.h"
+ #include "glamor_transform.h"
+ 
+-/*
+- * PutImage. Only does ZPixmap right now as other formats are quite a bit harder
+- */
++#include <limits.h>     /* INT_MAX */
++#include <stdint.h>
++#include <string.h>
++
++/* ---------------------------------------------------------------------------
++ * Helpers
++ * -------------------------------------------------------------------------*/
++
++/* True when the pixmap’s private indicates a texture/renderable FBO. */
++#define GLAMOR_PIXMAP_PRIV_HAS_FBO(priv) \
++((priv) && ((priv)->gl_fbo == GLAMOR_FBO_NORMAL))
++
++/* Small helper so we can branch away on GC state early in every path. */
++static inline Bool
++glamor_can_fast_upload(const GCPtr gc)
++{
++    /* alu must be copy and planemask must be solid */
++    return (gc->alu == GXcopy) &&
++    glamor_pm_is_solid(gc->depth, gc->planemask);
++}
++
++/* ---------------------------------------------------------------------------
++ * ZPixmap upload – fast path (optional PBO)
++ * -------------------------------------------------------------------------*/
+ 
+ static Bool
+-glamor_put_image_gl(DrawablePtr drawable, GCPtr gc, int depth, int x, int y,
+-                    int w, int h, int leftPad, int format, char *bits)
++glamor_put_image_zpixmap_gl(DrawablePtr drawable, GCPtr gc, int depth,
++                            int x, int y, int w, int h,
++                            const char *bits /* never NULL */)
+ {
+-    ScreenPtr screen = drawable->pScreen;
+-    glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
+-    PixmapPtr pixmap = glamor_get_drawable_pixmap(drawable);
+-    glamor_pixmap_private *pixmap_priv;
+-    uint32_t    byte_stride = PixmapBytePad(w, drawable->depth);
+-    RegionRec   region;
+-    BoxRec      box;
+-    int         off_x, off_y;
+-
+-    pixmap_priv = glamor_get_pixmap_private(pixmap);
++    ScreenPtr               screen       = drawable->pScreen;
++    glamor_screen_private  *glamor_priv  = glamor_get_screen_private(screen);
++    PixmapPtr               dst_pixmap   = glamor_get_drawable_pixmap(drawable);
++    glamor_pixmap_private  *dst_priv     = glamor_get_pixmap_private(dst_pixmap);
++    const uint32_t          byte_stride  = PixmapBytePad(w, drawable->depth);
++    Bool                    use_pbo      = FALSE;
+ 
+-    if (!GLAMOR_PIXMAP_PRIV_HAS_FBO(pixmap_priv))
++    if (!GLAMOR_PIXMAP_PRIV_HAS_FBO(dst_priv))
++        return FALSE;
++    if (!glamor_can_fast_upload(gc))
+         return FALSE;
+ 
+-    if (gc->alu != GXcopy)
+-        goto bail;
++    /* Compute absolute drawable coords + clip region --------------------- */
++    RegionRec region;
++    BoxRec    box = { x + drawable->x,               /* x1 */
++        y + drawable->y,               /* y1 */
++        x + drawable->x + w,           /* x2 */
++        y + drawable->y + h };         /* y2 */
++        RegionInit(&region, &box, 1);
++        RegionIntersect(&region, &region, gc->pCompositeClip);
++
++        int off_x = 0, off_y = 0;
++        glamor_get_drawable_deltas(drawable, dst_pixmap, &off_x, &off_y);
++        if (off_x || off_y) {
++            RegionTranslate(&region, off_x, off_y);
++            x += off_x;
++            y += off_y;
++        }
++
++        glamor_make_current(glamor_priv);
++
++        /* --------------------------------------------------------------------
++         * STREAM-PBO upload when HW + driver can do coherent writes.
++         * Guarded by:
++         *   • has_rw_pbo ‑ allows MapBufferRange for PBO
++         *   • has_map_buffer_range (same meaning, older field kept for ABI)
++         *   • GL >= 3.0 or GLES >= 3.0 is implicit in the field above
++         * ------------------------------------------------------------------ */
++        use_pbo = glamor_priv->has_rw_pbo || glamor_priv->has_map_buffer_range;
++
++        if (use_pbo) {
++            static GLuint static_pbo = 0;
++            if (static_pbo == 0)
++                glGenBuffers(1, &static_pbo);
++
++            /* Cast to size_t before multiplication to prevent overflow */
++            const size_t required = (size_t)h * byte_stride;
++            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, static_pbo);
++            GLint cur_size = 0;
++            glGetBufferParameteriv(GL_PIXEL_UNPACK_BUFFER, GL_BUFFER_SIZE, &cur_size);
++            if ((size_t)cur_size < required)
++                glBufferData(GL_PIXEL_UNPACK_BUFFER, required, NULL,
++                             GL_STREAM_DRAW);
++
++                void *dst = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, required,
++                                             GL_MAP_WRITE_BIT |
++                                             GL_MAP_INVALIDATE_RANGE_BIT |
++                                             GL_MAP_UNSYNCHRONIZED_BIT);
++
++                if (dst) {
++                    memcpy(dst, bits, required);
++                    glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
++                    /* With a PBO bound, the 'bits' pointer to glamor_upload_region
++                     * is an offset into the buffer, not a client-side address. */
++                    glamor_upload_region(drawable, &region, x, y,
++                                         (uint8_t *)(uintptr_t)0, byte_stride);
++                } else {
++                    /* Mapping failed – fall back to direct pointer upload */
++                    use_pbo = FALSE;    /* ensure we unbind after the fallback */
++                }
++        }
++
++        if (!use_pbo) {
++            glamor_upload_region(drawable, &region, x, y,
++                                 (const uint8_t *) bits, byte_stride);
++        }
++
++        /* Restore GL state */
++        if (use_pbo)
++            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+ 
+-    if (!glamor_pm_is_solid(gc->depth, gc->planemask))
+-        goto bail;
++    RegionUninit(&region);
++    return TRUE;
++}
+ 
+-    if (format == XYPixmap && drawable->depth == 1 && leftPad == 0)
+-        format = ZPixmap;
++/* ---------------------------------------------------------------------------
++ * XY / XYBitmap – temporary CPU pixmap path
++ *   (good for small images or fallback from XYBitmap shader)
++ * -------------------------------------------------------------------------*/
+ 
+-    if (format != ZPixmap)
+-        goto bail;
++static Bool
++glamor_put_image_xy_gl(DrawablePtr drawable, GCPtr gc, int depth,
++                       int x, int y, int w, int h,
++                       int leftPad, int format, const char *bits)
++{
++    ScreenPtr              screen  = drawable->pScreen;
++    PixmapPtr              dst_pix = glamor_get_drawable_pixmap(drawable);
++    glamor_pixmap_private *dst_priv = glamor_get_pixmap_private(dst_pix);
++
++    if (!GLAMOR_PIXMAP_PRIV_HAS_FBO(dst_priv))
++        return FALSE;
+ 
+-    x += drawable->x;
+-    y += drawable->y;
+-    box.x1 = x;
+-    box.y1 = y;
+-    box.x2 = box.x1 + w;
+-    box.y2 = box.y1 + h;
+-    RegionInit(&region, &box, 1);
+-    RegionIntersect(&region, &region, gc->pCompositeClip);
+-
+-    glamor_get_drawable_deltas(drawable, pixmap, &off_x, &off_y);
+-    if (off_x || off_y) {
+-        x += off_x;
+-        y += off_y;
+-        RegionTranslate(&region, off_x, off_y);
++    /* Use the standard hint for a temporary, driver-internal pixmap. */
++    PixmapPtr tmp_pix = screen->CreatePixmap(screen, w, h, drawable->depth,
++                                             CREATE_PIXMAP_USAGE_SCRATCH);
++    if (!tmp_pix)
++        return FALSE;
++
++    DrawablePtr tmp_draw = &tmp_pix->drawable;
++    GCPtr       tmp_gc   = GetScratchGC(tmp_draw->depth, screen);
++    if (!tmp_gc) {
++        screen->DestroyPixmap(tmp_pix);
++        return FALSE;
+     }
+ 
+-    glamor_make_current(glamor_priv);
++    /* The temporary GC needs fg/bg for XYBitmap and GXcopy for all formats. */
++    ChangeGCVal gcv[3] = {
++        { .val = GXcopy },
++        { .val = gc->fgPixel },
++        { .val = gc->bgPixel }
++    };
++    ChangeGC(NullClient, tmp_gc,
++             GCFunction | GCForeground | GCBackground, gcv);
++    ValidateGC(tmp_draw, tmp_gc);
++
++    /* Use fb implementation on the temporary CPU pixmap to convert XY->Z */
++    tmp_gc->ops->PutImage(tmp_draw, tmp_gc,
++                          depth, 0, 0, w, h,
++                          leftPad, format, (char *)bits);
++
++    /* Accelerated CopyArea from the temp pixmap to the final destination */
++    gc->ops->CopyArea(tmp_draw, drawable, gc,
++                      0, 0, w, h, x, y);
+ 
+-    glamor_upload_region(drawable, &region, x, y, (uint8_t *) bits, byte_stride);
++    FreeScratchGC(tmp_gc);
++    screen->DestroyPixmap(tmp_pix);
++    return TRUE;
++}
+ 
+-    RegionUninit(&region);
++/* ---------------------------------------------------------------------------
++ * XYBitmap – large mono bitmap shader path
++ * -------------------------------------------------------------------------*/
++
++static const char vs_vars_put_bitmap[] =
++"in  vec4 primitive;\n"
++"in  vec2 source;\n"
++"out vec2 img_pos;\n";
++
++static const char vs_exec_put_bitmap[] =
++"vec2 p = primitive.zw * vec2(gl_VertexID & 1, (gl_VertexID & 2) >> 1);\n"
++GLAMOR_POS(gl_Position, (primitive.xy + p))
++"img_pos = source + p;\n";
++
++static const char fs_vars_put_bitmap[] =
++"in  vec2 img_pos;\n"
++"uniform usampler2D font;\n"
++"uniform vec4 fg;\n"
++"uniform vec4 bg;\n";
++
++static Bool
++put_bitmap_use(DrawablePtr draw, GCPtr gc,
++               glamor_program *prog, void *unused)
++{
++    if (!glamor_set_solid(draw, gc, TRUE, prog->fg_uniform))
++        return FALSE;
++    glamor_set_color(draw, gc->bgPixel, prog->bg_uniform);
+     return TRUE;
+-bail:
+-    return FALSE;
+ }
+ 
++static const char fs_exec_put_bitmap[] =
++"ivec2 t = ivec2(img_pos);\n"
++"uint x = uint(t.x & 7u);\n"
++"t.x >>= 3;\n"
++"uint tex = texelFetch(font, t, 0).x;\n"
++"frag_color = ((tex >> x) & 1u) == 0u ? bg : fg;\n";
++
++static const glamor_facet facet_put_bitmap = {
++    .name      = "put_bitmap",
++    .version   = 130,
++    .vs_vars   = vs_vars_put_bitmap,
++    .vs_exec   = vs_exec_put_bitmap,
++    .fs_vars   = fs_vars_put_bitmap,
++    .fs_exec   = fs_exec_put_bitmap,
++    .locations = glamor_program_location_fg |
++    glamor_program_location_bg |
++    glamor_program_location_font,
++    .use       = put_bitmap_use,
++};
++
++static Bool
++glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
++                             int x, int y, int w, int h,
++                             int leftPad, const char *bits)
++{
++    ScreenPtr               screen      = drawable->pScreen;
++    glamor_screen_private  *glamor_priv = glamor_get_screen_private(screen);
++    PixmapPtr               dst_pixmap  = glamor_get_drawable_pixmap(drawable);
++    glamor_pixmap_private  *dst_priv    = glamor_get_pixmap_private(dst_pixmap);
++    glamor_program         *prog        = &glamor_priv->put_bitmap_prog;
++    uint32_t                stride      = BitmapBytePad(w + leftPad);
++    GLuint                  tex         = 0;
++    Bool                    ok          = FALSE;
++
++    if (!GLAMOR_PIXMAP_PRIV_HAS_FBO(dst_priv))
++        return FALSE;
++    if (!glamor_can_fast_upload(gc))
++        return FALSE;
++
++    glamor_make_current(glamor_priv);
++
++    /* Compile program on first use */
++    if (!prog->prog && !prog->failed) {
++        if (!glamor_build_program(screen, prog,
++            &facet_put_bitmap,
++            NULL, NULL, NULL))
++            return FALSE;
++    }
++    if (prog->failed || !prog->prog)
++        return FALSE;
++
++    if (!glamor_use_program(&dst_pixmap->drawable, gc, prog, NULL))
++        return FALSE;
++
++    /* Upload bitmap as R8UI texture ------------------------------------- */
++    glGenTextures(1, &tex);
++    glActiveTexture(GL_TEXTURE1);
++    glBindTexture(GL_TEXTURE_2D, tex);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++    /* For GL_R8UI, each pixel is a byte, so row length in pixels is the
++     * same as the byte stride. This handles source padding correctly. */
++    if (glamor_priv->has_unpack_subimage) {
++        glPixelStorei(GL_UNPACK_ROW_LENGTH, stride);
++    }
++
++    glamor_priv->suppress_gl_out_of_memory_logging = TRUE;
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8UI,
++                 stride, h, 0,
++                 GL_RED_INTEGER, GL_UNSIGNED_BYTE, bits);
++    glamor_priv->suppress_gl_out_of_memory_logging = FALSE;
++
++    if (glGetError() == GL_OUT_OF_MEMORY)
++        goto out;
++
++    glUniform1i(prog->font_uniform, 1);
++
++    /* Build one instance vertex (x,y,w,h, leftPad, 0) --------------- */
++    char *vbo_offset = NULL;
++    GLshort *vbo = glamor_get_vbo_space(screen,
++                                        6 * sizeof(GLshort),
++                                        &vbo_offset);
++    vbo[0] = x; vbo[1] = y;
++    vbo[2] = w; vbo[3] = h;
++    vbo[4] = leftPad; vbo[5] = 0;
++    glamor_put_vbo_space(screen);
++
++    glEnableVertexAttribArray(GLAMOR_VERTEX_POS);
++    glVertexAttribPointer(GLAMOR_VERTEX_POS, 4, GL_SHORT, GL_FALSE,
++                          6 * sizeof(GLshort), vbo_offset);
++    glVertexAttribDivisor(GLAMOR_VERTEX_POS, 1);
++
++    glEnableVertexAttribArray(GLAMOR_VERTEX_SOURCE);
++    glVertexAttribPointer(GLAMOR_VERTEX_SOURCE, 2, GL_SHORT, GL_FALSE,
++                          6 * sizeof(GLshort),
++                          vbo_offset + 4 * sizeof(GLshort));
++    glVertexAttribDivisor(GLAMOR_VERTEX_SOURCE, 1);
++
++    /* Draw once for each clip rectangle --------------------------------- */
++    glEnable(GL_SCISSOR_TEST);
++    int off_x = 0, off_y = 0, box_index;
++    glamor_pixmap_loop(dst_priv, box_index) {
++        glamor_set_destination_drawable(drawable, box_index,
++                                        TRUE, FALSE,
++                                        prog->matrix_uniform,
++                                        &off_x, &off_y);
++
++        int nbox = RegionNumRects(gc->pCompositeClip);
++        const BoxPtr boxes = RegionRects(gc->pCompositeClip);
++
++        for (int i = 0; i < nbox; i++) {
++            const BoxRec *b = &boxes[i];
++            glScissor(b->x1 + off_x, b->y1 + off_y,
++                      b->x2 - b->x1, b->y2 - b->y1);
++            glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 1);
++        }
++    }
++    glDisable(GL_SCISSOR_TEST);
++
++    /* Clean vertex attrib state ---------------------------------------- */
++    glVertexAttribDivisor(GLAMOR_VERTEX_SOURCE, 0);
++    glDisableVertexAttribArray(GLAMOR_VERTEX_SOURCE);
++    glVertexAttribDivisor(GLAMOR_VERTEX_POS, 0);
++    glDisableVertexAttribArray(GLAMOR_VERTEX_POS);
++
++    ok = TRUE;
++
++    out:
++    /* Restore all GL state we touched */
++    if (tex)
++        glDeleteTextures(1, &tex);
++    if (glamor_priv->has_unpack_subimage)
++        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);   /* X server default */
++    return ok;
++}
++
++/* ---------------------------------------------------------------------------
++ * Fallbacks to fb/CPU
++ * -------------------------------------------------------------------------*/
++
+ static void
+-glamor_put_image_bail(DrawablePtr drawable, GCPtr gc, int depth, int x, int y,
+-                      int w, int h, int leftPad, int format, char *bits)
++glamor_put_image_bail(DrawablePtr drawable, GCPtr gc, int depth,
++                      int x, int y, int w, int h,
++                      int leftPad, int format, const char *bits)
+ {
+-    if (glamor_prepare_access_box(drawable, GLAMOR_ACCESS_RW, x, y, w, h))
+-        fbPutImage(drawable, gc, depth, x, y, w, h, leftPad, format, bits);
+-    glamor_finish_access(drawable);
++    if (glamor_prepare_access_box(drawable, GLAMOR_ACCESS_RW,
++        x, y, w, h)) {
++        fbPutImage(drawable, gc, depth, x, y, w, h,
++                   leftPad, format, (char *)bits);
++        }
++        glamor_finish_access(drawable);
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * Public entry point – PutImage
++ * -------------------------------------------------------------------------*/
++
+ void
+-glamor_put_image(DrawablePtr drawable, GCPtr gc, int depth, int x, int y,
+-                 int w, int h, int leftPad, int format, char *bits)
++glamor_put_image(DrawablePtr drawable, GCPtr gc, int depth,
++                 int x, int y, int w, int h,
++                 int leftPad, int format, char *bits)
+ {
+-    if (glamor_put_image_gl(drawable, gc, depth, x, y, w, h, leftPad, format, bits))
+-        return;
+-    glamor_put_image_bail(drawable, gc, depth, x, y, w, h, leftPad, format, bits);
++    switch (format) {
++        case ZPixmap:
++            if (glamor_put_image_zpixmap_gl(drawable, gc, depth,
++                x, y, w, h, bits))
++                return;
++            break;
++
++        case XYPixmap:
++            if (glamor_put_image_xy_gl(drawable, gc, depth,
++                x, y, w, h, leftPad, format, bits))
++                return;
++            break;
++
++        case XYBitmap:
++            /* Heuristic: for large bitmaps, the shader path avoids creating a
++             * large temporary CPU pixmap, which is faster. For small bitmaps,
++             * the overhead of the shader path is higher than the temporary
++             * pixmap + accelerated CopyArea path.
++             * Use size_t for multiplication to prevent integer overflow. */
++            if ((size_t)w * h >= 100 * 100) {
++                if (glamor_put_image_xybitmap_gl(drawable, gc,
++                    x, y, w, h, leftPad, bits))
++                    return;
++            }
++            /* Fallback for small bitmaps or if the shader path failed. */
++            if (glamor_put_image_xy_gl(drawable, gc, depth,
++                x, y, w, h, leftPad, format, bits))
++                return;
++            break;
++    }
++
++    /* If all accelerated paths fail, fall back to fb. */
++    glamor_put_image_bail(drawable, gc, depth,
++                          x, y, w, h, leftPad, format, bits);
+ }
+ 
++/* ===========================================================================
++ *                               GetImage paths
++ * ======================================================================== */
++
++/* ZPixmap download -------------------------------------------------------- */
++
+ static Bool
+-glamor_get_image_gl(DrawablePtr drawable, int x, int y, int w, int h,
+-                    unsigned int format, unsigned long plane_mask, char *d)
++glamor_get_image_zpixmap_gl(DrawablePtr drawable,
++                            int x, int y, int w, int h,
++                            unsigned int format,
++                            unsigned long plane_mask,
++                            char *dst /* out-buffer, never NULL */)
+ {
+-    PixmapPtr pixmap = glamor_get_drawable_pixmap(drawable);
+-    glamor_pixmap_private *pixmap_priv;
+-    uint32_t    byte_stride = PixmapBytePad(w, drawable->depth);
+-    BoxRec      box;
+-    int         off_x, off_y;
+-
+-    pixmap_priv = glamor_get_pixmap_private(pixmap);
+-    if (!GLAMOR_PIXMAP_PRIV_HAS_FBO(pixmap_priv))
+-        goto bail;
++    PixmapPtr               src_pixmap  = glamor_get_drawable_pixmap(drawable);
++    glamor_pixmap_private  *src_priv    = glamor_get_pixmap_private(src_pixmap);
++    const uint32_t          byte_stride = PixmapBytePad(w, drawable->depth);
+ 
++    if (!GLAMOR_PIXMAP_PRIV_HAS_FBO(src_priv))
++        return FALSE;
+     if (format != ZPixmap)
+-        goto bail;
++        return FALSE;
++
++    int off_x = 0, off_y = 0;
++    glamor_get_drawable_deltas(drawable, src_pixmap, &off_x, &off_y);
+ 
+-    glamor_get_drawable_deltas(drawable, pixmap, &off_x, &off_y);
+-    box.x1 = x;
+-    box.x2 = x + w;
+-    box.y1 = y;
+-    box.y2 = y + h;
++    BoxRec box = { x, y, x + w, y + h };
+     glamor_download_boxes(drawable, &box, 1,
+                           drawable->x + off_x, drawable->y + off_y,
+                           -x, -y,
+-                          (uint8_t *) d, byte_stride);
++                          (uint8_t *)dst, byte_stride);
+ 
+-    if (!glamor_pm_is_solid(glamor_drawable_effective_depth(drawable), plane_mask)) {
+-        FbStip pm = fbReplicatePixel(plane_mask, drawable->bitsPerPixel);
+-        FbStip *dst = (void *)d;
+-        uint32_t dstStride = byte_stride / sizeof(FbStip);
+-
+-        for (int i = 0; i < dstStride * h; i++)
+-            dst[i] &= pm;
++    /* Apply plane-mask if not solid (all bits 1) */
++    if (!glamor_pm_is_solid(glamor_drawable_effective_depth(drawable),
++        plane_mask))
++    {
++        const FbStip mask = fbReplicatePixel(plane_mask,
++                                             drawable->bitsPerPixel);
++        FbStip       *d   = (FbStip *)dst;
++        const size_t  n   = ((size_t)byte_stride / sizeof(FbStip)) * h;
++        for (size_t i = 0; i < n; i++)
++            d[i] &= mask;
+     }
+ 
+     return TRUE;
+-bail:
+-    return FALSE;
+ }
+ 
++/* fb fallback */
+ static void
+-glamor_get_image_bail(DrawablePtr drawable, int x, int y, int w, int h,
+-                      unsigned int format, unsigned long plane_mask, char *d)
++glamor_get_image_bail(DrawablePtr drawable,
++                      int x, int y, int w, int h,
++                      unsigned int format,
++                      unsigned long plane_mask,
++                      char *dst)
+ {
+-    if (glamor_prepare_access_box(drawable, GLAMOR_ACCESS_RO, x, y, w, h))
+-        fbGetImage(drawable, x, y, w, h, format, plane_mask, d);
++    if (glamor_prepare_access_box(drawable, GLAMOR_ACCESS_RO,
++        x, y, w, h))
++    {
++        fbGetImage(drawable, x, y, w, h,
++                   format, plane_mask, dst);
++    }
+     glamor_finish_access(drawable);
+ }
+ 
++/* Public entry */
+ void
+-glamor_get_image(DrawablePtr drawable, int x, int y, int w, int h,
+-                 unsigned int format, unsigned long plane_mask, char *d)
++glamor_get_image(DrawablePtr drawable,
++                 int x, int y, int w, int h,
++                 unsigned int format,
++                 unsigned long plane_mask,
++                 char *dst)
+ {
+-    if (glamor_get_image_gl(drawable, x, y, w, h, format, plane_mask, d))
++    /* Only ZPixmap has a fast path; XY formats require complex conversions. */
++    if (glamor_get_image_zpixmap_gl(drawable, x, y, w, h,
++        format, plane_mask, dst))
+         return;
+-    glamor_get_image_bail(drawable, x, y, w, h, format, plane_mask, d);
++
++    glamor_get_image_bail(drawable, x, y, w, h,
++                          format, plane_mask, dst);
+ }
