@@ -347,6 +347,8 @@ insn("p_boolean_phi")
 insn("p_as_uniform")
 insn("p_unit_test")
 
+insn("p_callee_stack_ptr")
+
 insn("p_create_vector")
 insn("p_extract_vector")
 insn("p_split_vector")
@@ -1365,8 +1367,8 @@ VOP3 = {
    ("v_interp_p1ll_f16",       dst(F32), src(F32, M0), op(gfx8=0x274, gfx10=0x342, gfx11=-1)),
    ("v_interp_p1lv_f16",       dst(F32), src(F32, M0, F16), op(gfx8=0x275, gfx10=0x343, gfx11=-1)),
    ("v_interp_p2_legacy_f16",  dst(F16), src(F32, M0, F32), op(gfx8=0x276, gfx10=-1)),
-   ("v_interp_p2_f16",         dst(F16), src(mods(F32), noMods(M0), mods(F32)), op(gfx9=0x277, gfx10=0x35a, gfx11=-1)),
-   ("v_interp_p2_hi_f16",      dst(F16), src(F32, M0, F32), op(gfx9=0x277, gfx10=0x35a, gfx11=-1)),
+   ("v_interp_p2_f16",         dst(mods(F16)), src(mods(F32), noMods(M0), mods(F32)), op(gfx9=0x277)),
+   ("v_interp_p2_hi_f16",      dst(mods(F16)), src(F32, M0, F32), op(gfx9=0x277)),
    ("v_ldexp_f32",             dst(F32), src(F32, U32), op(0x12b, gfx8=0x288, gfx10=0x362, gfx11=0x31c)),
    ("v_readlane_b32_e64",      dst(U32), src(U32, U32), op(gfx8=0x289, gfx10=0x360)),
    ("v_writelane_b32_e64",     dst(U32), src(U32, U32, U32), op(gfx8=0x28a, gfx10=0x361)),
@@ -1449,6 +1451,7 @@ VOP3 = {
    ("v_permlane16_var_b32",    dst(U32), src(U32, U32), op(gfx12=0x30f)),
    ("v_permlanex16_var_b32",   dst(U32), src(U32, U32), op(gfx12=0x310)),
    ("v_cvt_pk_fp8_f32",        dst(PkF8), src(F32, F32), op(gfx12=0x369)),
+   ("p_v_cvt_pk_fp8_f32_ovfl", dst(PkF8), src(F32, F32), op(-1)),
    ("v_cvt_pk_bf8_f32",        dst(PkBF8), src(F32, F32), op(gfx12=0x36a)),
    ("v_cvt_sr_fp8_f32",        dst(F8), src(F32, U32), op(gfx12=0x36b)),
    ("v_cvt_sr_bf8_f32",        dst(BF8), src(F32, U32), op(gfx12=0x36c)),
@@ -1647,6 +1650,9 @@ DS = {
    ("ds_pk_add_rtn_f16",       op(gfx12=0xaa)),
    ("ds_pk_add_bf16",          op(gfx12=0x9b)),
    ("ds_pk_add_rtn_bf16",      op(gfx12=0xab)),
+   ("ds_bvh_stack_push4_pop1_rtn_b32", op(gfx11=0xad, gfx12=0xe0)), #ds_bvh_stack_rtn in GFX11
+   ("ds_bvh_stack_push8_pop1_rtn_b32", op(gfx12=0xe1)),
+   ("ds_bvh_stack_push8_pop2_rtn_b64", op(gfx12=0xe2)),
 }
 for (name, num) in DS:
     insn(name, num, Format.DS, InstrClass.DS)

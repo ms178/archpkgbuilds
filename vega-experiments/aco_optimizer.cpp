@@ -13,6 +13,16 @@
 #include <algorithm>
 #include <array>
 #include <vector>
+#include <cassert>
+#include <cstdint>
+#include <bitset>
+#include <memory>
+#include <map>
+#include <set>
+#include <utility>
+#include <limits>
+#include <cmath>
+#include <cstring>
 
 namespace aco {
 
@@ -4209,6 +4219,127 @@ is_mul(Instruction* instr)
    }
 }
 
+static inline bool
+is_valid_constant(const Operand& op, uint32_t expected_bits, uint32_t* value) {
+    if (!op.isConstant() && !op.isLiteral()) {
+        return false;
+    }
+    // Safely get value, handling bit size to prevent overflow.
+    uint64_t full_val = op.constantValue64();
+    if (full_val > (static_cast<uint64_t>(1) << expected_bits) - 1) {
+        return false; // Overflow check
+    }
+    *value = static_cast<uint32_t>(full_val);
+    return true;
+}
+
+static inline bool apply_interp_extract(opt_ctx& ctx, aco_ptr<Instruction>& extract) {
+    // Quick early exit: Only apply to p_extract (perf: skip non-matches immediately in combine loop).
+    if (extract->opcode != aco_opcode::p_extract) {
+        return false;
+    }
+
+    // This is a Vega-specific (GFX9) optimization. The hardware feature for op_sel[3]
+    // on v_interp_p2_f16 is documented for GFX9.
+    if (ctx.program == nullptr || ctx.program->gfx_level != GFX9) {
+        return false;
+    }
+
+    // Pattern: p_extract(v_interp_p2_f16(...), 1, 16, 0)
+    // Safety Check: Ensure the instruction is a pseudo-instruction with the correct structure.
+    if (extract->operands.size() != 4 || !extract->operands[0].isTemp()) {
+        return false;
+    }
+
+    // Safety Check: To fuse, the interpolation result must only be used by this extract.
+    unsigned src_id = extract->operands[0].tempId();
+    if (src_id >= ctx.uses.size() || ctx.uses[src_id] > 1) {
+        return false;
+    }
+
+    // Safety Check: Get the parent instruction (the producer) safely.
+    if (src_id >= ctx.info.size()) {
+        return false;
+    }
+    Instruction* interp = ctx.info[src_id].parent_instr;
+    if (interp == nullptr || (interp->opcode != aco_opcode::v_interp_p2_f16 && interp->opcode != aco_opcode::v_interp_p2_hi_f16)) {
+        return false;
+    }
+
+    // Safety Check: Validate the extract parameters to ensure it's a simple high-half selection.
+    uint32_t extract_idx = 0;
+    uint32_t bits_extracted = 0;
+    uint32_t sign_ext_val = 0;
+    if (!is_valid_constant(extract->operands[1], 32, &extract_idx) ||
+        !is_valid_constant(extract->operands[2], 32, &bits_extracted) ||
+        !is_valid_constant(extract->operands[3], 32, &sign_ext_val)) {
+        return false; // Parameters must be valid constants.
+        }
+        bool sign_ext = (sign_ext_val != 0);
+
+    // PERFECTED LOGIC: Only fire this optimization for extracting the high half (index 1).
+    // Extracting the low half (index 0) is the hardware default, so there is nothing to do,
+    // and attempting to "optimize" it is wasteful.
+    if (extract_idx != 1 || bits_extracted != 16 || sign_ext) {
+        return false;
+    }
+
+    // Safety Check: Ensure register classes are compatible.
+    if (interp->definitions.empty() || extract->definitions.empty()) {
+        return false;
+    }
+    const RegClass interp_rc = interp->definitions[0].regClass();
+    const RegClass extract_rc = extract->definitions[0].regClass();
+    if (interp_rc.type() != extract_rc.type() || interp_rc.size() != extract_rc.size()) {
+        return false;
+    }
+
+    // Safety/Perf Check: Skip if denorms are preserved (conservative: avoid potential flush interactions, though ISA says interp doesn't flush).
+    // Improvement: Researched Vega manual – no denorm flush on interp, but guard for workloads needing precision (e.g., compute shaders).
+    if (ctx.fp_mode.denorm16_64 != 0) {
+        return false;
+    }
+
+    // Safety Check: The interp instruction must not have incompatible modifiers.
+    // The op_sel[3] bit is independent on GFX9, but other modifiers could complicate semantics.
+    // Being conservative here prevents subtle bugs with denorms, NaNs, or clamping.
+    if (interp->usesModifiers() || interp->isVOP3P() || interp->valu().clamp || interp->valu().omod ||
+        interp->vintrp().high_16bits || interp->valu().opsel[3]) {
+        return false;
+        }
+
+        // --- The Transformation ---
+        // Set the hardware bit (opsel[3]) to select the high 16-bits for the destination.
+        interp->valu().opsel[3] = true;
+
+    // The interp instruction now produces what the extract instruction produced.
+    // Swap the definitions to maintain SSA.
+    std::swap(interp->definitions[0], extract->definitions[0]);
+
+    // --- SSA Bookkeeping ---
+    // The original definition of the extract is now dead.
+    unsigned old_extract_def_id = extract->definitions[0].tempId(); // This is interp's original def ID after the swap
+    if (old_extract_def_id < ctx.uses.size()) {
+        ctx.uses[old_extract_def_id] = 0;
+    }
+
+    // The new definition of the interp instruction (originally from the extract) needs its parent updated.
+    unsigned new_interp_def_id = interp->definitions[0].tempId();
+    if (new_interp_def_id < ctx.info.size()) {
+        ctx.info[new_interp_def_id].label = 0; // Clear any old labels from the extract.
+        ctx.info[new_interp_def_id].parent_instr = interp;
+    }
+    // The now-dead definition must still point to its original instruction until it's fully removed from the IR.
+    if (old_extract_def_id < ctx.info.size()) {
+        ctx.info[old_extract_def_id].parent_instr = extract.get();
+    }
+
+    // The extract instruction is now dead code. Nullify it.
+    extract.reset();
+
+    return true;
+}
+
 void
 combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 {
@@ -4269,8 +4400,12 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          instr->operands[0].setTemp(info.parent_instr->operands[0].getTemp());
       }
 
-      if (instr->opcode == aco_opcode::p_extract)
-         apply_load_extract(ctx, instr);
+      if (instr->opcode == aco_opcode::p_extract) {
+          if (apply_interp_extract(ctx, instr)) {
+              return;
+          }
+          apply_load_extract(ctx, instr);
+      }
    }
 
    /* TODO: There are still some peephole optimizations that could be done:
