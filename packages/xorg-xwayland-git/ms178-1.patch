@@ -1,3 +1,980 @@
+--- a/hw/xwayland/xwayland-present.c	2025-07-26 09:12:16.955985549 +0200
++++ a/hw/xwayland/xwayland-present.c	2025-07-26 09:13:52.121013328 +0200
+@@ -86,6 +86,13 @@ xwl_present_window_get_priv(WindowPtr wi
+         xorg_list_init(&xwl_present_window->idle_queue);
+         xorg_list_init(&xwl_present_window->blocked_queue);
+ 
++        xwl_present_window->flip_queue_empty = TRUE;
++        xwl_present_window->msc_cached = FALSE;
++        xwl_present_window->flip_eligible_cache = 0;
++        xwl_present_window->last_delta = 0;
++        xwl_present_window->msc_call_count = 0;
++        xwl_present_window->last_bump = GetTimeInMillis();
++
+         dixSetPrivate(&window->devPrivates,
+                       &xwl_present_window_private_key,
+                       xwl_present_window);
+@@ -100,6 +107,8 @@ xwl_present_event_from_id(WindowPtr pres
+     present_window_priv_ptr window_priv = present_get_window_priv(present_window, TRUE);
+     struct xwl_present_event *event;
+ 
++    if (!window_priv) return NULL;
++
+     xorg_list_for_each_entry(event, &window_priv->vblank, vblank.window_list) {
+         if (event->vblank.event_id == event_id)
+             return event;
+@@ -135,7 +144,7 @@ xwl_present_for_each_frame_callback(stru
+     xorg_list_for_each_entry_safe(xwl_present_window, tmp,
+                                   &xwl_window->frame_callback_list,
+                                   frame_callback_list)
+-        iter_func(xwl_present_window);
++    iter_func(xwl_present_window);
+ 
+     entered_for_each_frame_callback = FALSE;
+ }
+@@ -156,18 +165,11 @@ xwl_present_timer_callback(OsTimerPtr ti
+ static present_vblank_ptr
+ xwl_present_get_pending_flip(struct xwl_present_window *xwl_present_window)
+ {
+-    present_vblank_ptr flip_pending;
+-
+-    if (xorg_list_is_empty(&xwl_present_window->flip_queue))
+-        return NULL;
+-
+-    flip_pending = xorg_list_first_entry(&xwl_present_window->flip_queue, present_vblank_rec,
+-                                         event_queue);
+-
+-    if (flip_pending->queued)
+-        return NULL;
++    if (xwl_present_window == NULL) return NULL;
++    if (xwl_present_window->flip_queue_empty) return NULL;
+ 
+-    return flip_pending;
++    present_vblank_ptr flip_pending = xorg_list_first_entry(&xwl_present_window->flip_queue, present_vblank_rec, event_queue);
++    return (flip_pending->queued ? NULL : flip_pending);  // Branchless return
+ }
+ 
+ static inline Bool
+@@ -176,46 +178,40 @@ xwl_present_has_pending_events(struct xw
+     present_vblank_ptr flip_pending = xwl_present_get_pending_flip(xwl_present_window);
+ 
+     return (flip_pending && flip_pending->sync_flip) ||
+-           !xorg_list_is_empty(&xwl_present_window->wait_list) ||
+-           !xorg_list_is_empty(&xwl_present_window->blocked_queue);
++    !xorg_list_is_empty(&xwl_present_window->wait_list) ||
++    !xorg_list_is_empty(&xwl_present_window->blocked_queue);
+ }
+ 
+ void
+ xwl_present_reset_timer(struct xwl_present_window *xwl_present_window)
+ {
+-    if (xwl_present_has_pending_events(xwl_present_window)) {
+-        struct xwl_window *xwl_window = xwl_window_from_window(xwl_present_window->window);
+-        CARD32 now = GetTimeInMillis();
+-        CARD32 timeout;
+-
+-        if (xwl_window && xwl_window->frame_callback &&
+-            !xorg_list_is_empty(&xwl_present_window->frame_callback_list))
+-            timeout = TIMER_LEN_FLIP;
+-        else
+-            timeout = TIMER_LEN_COPY;
++    if (!xwl_present_has_pending_events(xwl_present_window)) {
++        xwl_present_free_timer(xwl_present_window);
++        return;
++    }
+ 
+-        /* Make sure the timer callback runs if at least a second has passed
+-         * since we first armed the timer. This can happen e.g. if the Wayland
+-         * compositor doesn't send a pending frame event, e.g. because the
+-         * Wayland surface isn't visible anywhere.
+-         */
+-        if (xwl_present_window->timer_armed) {
+-            if ((int)(now - xwl_present_window->timer_armed) > 1000) {
+-                xwl_present_timer_callback(xwl_present_window->frame_timer, now,
+-                                           xwl_present_window);
+-                return;
+-            }
+-        } else {
+-            xwl_present_window->timer_armed = now;
++    struct xwl_window *xwl_window = xwl_window_from_window(xwl_present_window->window);
++    CARD32 now = GetTimeInMillis();
++    CARD32 timeout = (xwl_window && xwl_window->frame_callback &&
++    !xorg_list_is_empty(&xwl_present_window->frame_callback_list)) ? TIMER_LEN_FLIP : TIMER_LEN_COPY;
++
++    // Predictive EMA: timeout = 0.5 * timeout + 0.5 * last_delta (safe shifts)
++    CARD32 predicted = (timeout >> 1) + (xwl_present_window->last_delta >> 1);
++    timeout = (predicted < 2 ? 2 : (predicted > 1000 ? 1000 : predicted));
++
++    if (xwl_present_window->timer_armed) {
++        CARD32 delta = now - xwl_present_window->timer_armed;
++        xwl_present_window->last_delta = (delta + xwl_present_window->last_delta) >> 1;  // Update EMA safely
++        if (delta > 1000) {
++            xwl_present_timer_callback(xwl_present_window->frame_timer, now, xwl_present_window);
++            return;
+         }
+-
+-        xwl_present_window->frame_timer = TimerSet(xwl_present_window->frame_timer,
+-                                                   0, timeout,
+-                                                   &xwl_present_timer_callback,
+-                                                   xwl_present_window);
+     } else {
+-        xwl_present_free_timer(xwl_present_window);
++        xwl_present_window->timer_armed = now;
+     }
++
++    xwl_present_window->frame_timer = TimerSet(xwl_present_window->frame_timer, 0, timeout,
++                                               &xwl_present_timer_callback, xwl_present_window);
+ }
+ 
+ 
+@@ -243,31 +239,35 @@ xwl_present_get_ust_msc(ScreenPtr screen
+                         uint64_t *msc)
+ {
+     struct xwl_present_window *xwl_present_window = xwl_present_window_get_priv(present_window);
+-    if (!xwl_present_window)
++    if (!xwl_present_window) {
+         return BadAlloc;
++    }
+ 
+-    *ust = xwl_present_window->ust;
+-    *msc = xwl_present_window->msc;
++    /* Lazy every other call or if stale */
++    CARD32 now = GetTimeInMillis();
++    if ((xwl_present_window->msc_call_count++ % 2) == 0 || !xwl_present_window->msc_cached ||
++        (now - xwl_present_window->last_bump > 1000)) {
++        xwl_present_window->ust = GetTimeInMicros();
++    xwl_present_window->msc_cached = TRUE;
++    xwl_present_window->last_bump = now;
++    /* msc remains unchanged; only ust refreshed */
++        }
++
++        *ust = xwl_present_window->ust;
++        *msc = xwl_present_window->msc;
+ 
+-    return Success;
++        return Success;
+ }
+ 
+ static uint64_t
+ xwl_present_get_exec_msc(uint32_t options, uint64_t target_msc)
+ {
+-    /* Synchronous Xwayland presentations always complete (at least) one frame after they
+-     * are executed
+-     */
+     if (options & PresentOptionAsyncMayTear)
+         return target_msc;
+ 
+     return target_msc - 1;
+ }
+ 
+-/*
+- * When the wait fence or previous flip is completed, it's time
+- * to re-try the request
+- */
+ static void
+ xwl_present_re_execute(present_vblank_ptr vblank)
+ {
+@@ -275,7 +275,6 @@ xwl_present_re_execute(present_vblank_pt
+     uint64_t ust = 0, crtc_msc = 0;
+ 
+     (void) xwl_present_get_ust_msc(vblank->screen, vblank->window, &ust, &crtc_msc);
+-    /* re-compute target / exec msc */
+     vblank->target_msc = present_get_target_msc(0, crtc_msc,
+                                                 event->divisor,
+                                                 event->remainder,
+@@ -290,9 +289,9 @@ xwl_present_re_execute(present_vblank_pt
+                                  vblank->event_id,
+                                  vblank->exec_msc) == Success) {
+         return;
+-    }
++                                 }
+ 
+-    xwl_present_execute(vblank, ust, crtc_msc);
++                                 xwl_present_execute(vblank, ust, crtc_msc);
+ }
+ 
+ static void
+@@ -319,18 +318,64 @@ xwl_present_release_pixmap(struct xwl_pr
+     event->pixmap = NULL;
+ }
+ 
++// Pooling for events (static array, refcount for safety)
++#define EVENT_POOL_SIZE 4
++static struct xwl_present_event *event_pool[EVENT_POOL_SIZE];
++static int event_pool_refcounts[EVENT_POOL_SIZE] = {0};
++static Bool event_pool_initialized = FALSE;
++
++static void
++xwl_present_init_event_pool(void)
++{
++    if (event_pool_initialized) return;
++    event_pool_initialized = TRUE;
++
++    for (int i = 0; i < EVENT_POOL_SIZE; i++) {
++        event_pool[i] = calloc(1, sizeof(struct xwl_present_event));
++        if (!event_pool[i]) FatalError("Event pool alloc failed");
++    }
++}
++
++static struct xwl_present_event *
++xwl_present_alloc_event(void)
++{
++    for (int i = 0; i < EVENT_POOL_SIZE; i++) {
++        if (event_pool_refcounts[i] == 0) {
++            event_pool_refcounts[i] = 1;
++            return event_pool[i];
++        }
++    }
++    // Fallback
++    return calloc(1, sizeof(struct xwl_present_event));
++}
++
+ static void
+ xwl_present_free_event(struct xwl_present_event *event)
+ {
+     xwl_present_release_pixmap(event);
+     xorg_list_del(&event->vblank.event_queue);
+-    present_vblank_destroy(&event->vblank);
++
++    // Find in pool
++    Bool pooled = FALSE;
++    for (int i = 0; i < EVENT_POOL_SIZE; i++) {
++        if (event_pool[i] == event) {
++            event_pool_refcounts[i]--;
++            pooled = TRUE;
++            break;
++        }
++    }
++    if (!pooled) {
++        present_vblank_destroy(&event->vblank);
++        free(event);
++    } else {
++        present_vblank_destroy(&event->vblank);
++    }
+ }
+ 
+ static void
+ xwl_present_free_idle_vblank(present_vblank_ptr vblank)
+ {
+-#if defined(XWL_HAS_GLAMOR) && defined(DRI3)
++    #if defined(XWL_HAS_GLAMOR) && defined(DRI3)
+     if (vblank->release_syncobj) {
+         /* transfer implicit fence to release syncobj */
+         int fence_fd = xwl_glamor_dmabuf_export_sync_file(vblank->pixmap);
+@@ -338,10 +383,10 @@ xwl_present_free_idle_vblank(present_vbl
+                                               vblank->release_point,
+                                               fence_fd);
+     } else
+-#endif /* defined(XWL_HAS_GLAMOR) && defined(DRI3) */
++        #endif /* defined(XWL_HAS_GLAMOR) && defined(DRI3) */
+         present_pixmap_idle(vblank->pixmap, vblank->window,
+                             vblank->serial, vblank->idle_fence);
+-    xwl_present_free_event(xwl_present_event_from_vblank(vblank));
++        xwl_present_free_event(xwl_present_event_from_vblank(vblank));
+ }
+ 
+ static WindowPtr
+@@ -373,7 +418,9 @@ xwl_present_flips_stop(WindowPtr window)
+ 
+     /* Free any left over idle vblanks */
+     xorg_list_for_each_entry_safe(vblank, tmp, &xwl_present_window->idle_queue, event_queue)
+-        xwl_present_free_idle_vblank(vblank);
++    xwl_present_free_idle_vblank(vblank);
++
++    xwl_present_window->flip_queue_empty = xorg_list_is_empty(&xwl_present_window->flip_queue);
+ 
+     if (xwl_present_window->flip_active) {
+         struct xwl_present_event *event;
+@@ -389,15 +436,16 @@ xwl_present_flips_stop(WindowPtr window)
+     }
+ 
+     xwl_present_flip_try_ready(xwl_present_window);
++    xwl_present_window->flip_queue_empty = xorg_list_is_empty(&xwl_present_window->flip_queue);
+ }
+ 
+ static void
+ xwl_present_flip_notify_vblank(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
+ {
+     WindowPtr                   window = vblank->window;
+-#ifdef DRI3
++    #ifdef DRI3
+     struct xwl_screen *xwl_screen = xwl_screen_get(window->drawable.pScreen);
+-#endif /* DRI3 */
++    #endif /* DRI3 */
+     struct xwl_present_window *xwl_present_window = xwl_present_window_priv(window);
+     uint8_t mode = PresentCompleteModeFlip;
+ 
+@@ -409,17 +457,18 @@ xwl_present_flip_notify_vblank(present_v
+     assert (&vblank->event_queue == xwl_present_window->flip_queue.next);
+ 
+     xorg_list_del(&vblank->event_queue);
++    xwl_present_window->flip_queue_empty = xorg_list_is_empty(&xwl_present_window->flip_queue);
+ 
+     if (xwl_present_window->flip_active) {
+         struct xwl_present_event *event =
+-            xwl_present_event_from_vblank(xwl_present_window->flip_active);
++        xwl_present_event_from_vblank(xwl_present_window->flip_active);
+ 
+         if (!event->pixmap
+-#ifdef DRI3
++            #ifdef DRI3
+             /* If this flip used explicit sync, we won't get a release event */
+             || (xwl_screen->explicit_sync && vblank->release_syncobj)
+-#endif /* DRI3 */
+-            ) {
++            #endif /* DRI3 */
++        ) {
+             xwl_present_free_event(event);
+         } else
+             /* Put the previous flip in the idle_queue and wait for further notice from
+@@ -439,6 +488,7 @@ xwl_present_flip_notify_vblank(present_v
+         xwl_present_flips_stop(window);
+ 
+     xwl_present_flip_try_ready(xwl_present_window);
++    xwl_present_window->flip_queue_empty = xorg_list_is_empty(&xwl_present_window->flip_queue);
+ }
+ 
+ static void
+@@ -484,7 +534,7 @@ xwl_present_cleanup(WindowPtr window)
+     if (window_priv) {
+         /* Clear remaining events */
+         xorg_list_for_each_entry_safe(event, tmp, &window_priv->vblank, vblank.window_list)
+-            xwl_present_free_event(event);
++        xwl_present_free_event(event);
+     }
+ 
+     /* Clear timer */
+@@ -511,7 +561,7 @@ xwl_present_buffer_release(void *data)
+ 
+     vblank = &event->vblank;
+ 
+-#if defined(XWL_HAS_GLAMOR) && defined(DRI3)
++    #if defined(XWL_HAS_GLAMOR) && defined(DRI3)
+     if (vblank->release_syncobj) {
+         /* transfer implicit fence to release syncobj */
+         int fence_fd = xwl_glamor_dmabuf_export_sync_file(vblank->pixmap);
+@@ -519,7 +569,7 @@ xwl_present_buffer_release(void *data)
+                                               vblank->release_point,
+                                               fence_fd);
+     } else
+-#endif /* defined(XWL_HAS_GLAMOR) && defined(DRI3) */
++        #endif /* defined(XWL_HAS_GLAMOR) && defined(DRI3) */
+         present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
+ 
+     xwl_present_window = xwl_present_window_priv(vblank->window);
+@@ -541,10 +591,15 @@ xwl_present_msc_bump(struct xwl_present_
+ 
+     xwl_present_window->timer_armed = 0;
+ 
++    /* Mark cache valid after update */
++    xwl_present_window->msc_cached = TRUE;
++
+     if (flip_pending && flip_pending->sync_flip)
+         xwl_present_flip_notify_vblank(flip_pending, xwl_present_window->ust, msc);
+ 
+     xorg_list_for_each_entry_safe(vblank, tmp, &xwl_present_window->wait_list, event_queue) {
++        __builtin_prefetch(tmp);  /* Prefetch next for Raptor Lake cache efficiency */
++
+         if (vblank->exec_msc <= msc) {
+             DebugPresent(("\te %" PRIu64 " ust %" PRIu64 " msc %" PRIu64 "\n",
+                           vblank->event_id, xwl_present_window->ust, msc));
+@@ -587,8 +642,8 @@ xwl_present_frame_callback(struct xwl_pr
+ 
+ static void
+ xwl_present_sync_callback(void *data,
+-               struct wl_callback *callback,
+-               uint32_t time)
++                          struct wl_callback *callback,
++                          uint32_t time)
+ {
+     present_vblank_ptr vblank = data;
+     struct xwl_present_window *xwl_present_window = xwl_present_window_get_priv(vblank->window);
+@@ -651,13 +706,13 @@ xwl_present_queue_vblank(ScreenPtr scree
+         xorg_list_is_empty(&xwl_present_window->frame_callback_list)) {
+         xorg_list_add(&xwl_present_window->frame_callback_list,
+                       &xwl_window->frame_callback_list);
+-    }
++        }
+ 
+-    if ((xwl_window && xwl_window->frame_callback) ||
+-        !xwl_present_window->frame_timer)
+-        xwl_present_reset_timer(xwl_present_window);
++        if ((xwl_window && xwl_window->frame_callback) ||
++            !xwl_present_window->frame_timer)
++            xwl_present_reset_timer(xwl_present_window);
+ 
+-    return Success;
++        return Success;
+ }
+ 
+ /*
+@@ -686,13 +741,13 @@ xwl_present_abort_vblank(ScreenPtr scree
+ static void
+ xwl_present_flush(WindowPtr window)
+ {
+-#ifdef XWL_HAS_GLAMOR
++    #ifdef XWL_HAS_GLAMOR
+     ScreenPtr screen = window->drawable.pScreen;
+     struct xwl_screen *xwl_screen = xwl_screen_get(screen);
+ 
+     if (xwl_screen->glamor)
+         glamor_block_handler(screen);
+-#endif
++    #endif
+ }
+ 
+ static void
+@@ -720,10 +775,10 @@ static int
+ xwl_present_flush_fenced(WindowPtr window)
+ {
+     int fence = -1;
+-#ifdef XWL_HAS_GLAMOR
++    #ifdef XWL_HAS_GLAMOR
+     struct xwl_screen *xwl_screen = xwl_screen_get(window->drawable.pScreen);
+     fence = xwl_glamor_get_fence(xwl_screen);
+-#endif /* XWL_HAS_GLAMOR */
++    #endif /* XWL_HAS_GLAMOR */
+     xwl_present_flush(window);
+     return fence;
+ }
+@@ -795,7 +850,7 @@ xwl_present_check_flip(RRCrtcPtr crtc,
+     if (!RegionEqual(&xwl_window->toplevel->winSize, &present_window->winSize))
+         return FALSE;
+ 
+-#ifdef XWL_HAS_GLAMOR
++    #ifdef XWL_HAS_GLAMOR
+     if (!xwl_glamor_supports_implicit_sync(xwl_window->xwl_screen) &&
+         !xwl_window->xwl_screen->explicit_sync)
+         return FALSE;
+@@ -803,7 +858,7 @@ xwl_present_check_flip(RRCrtcPtr crtc,
+     if (xwl_window->xwl_screen->glamor &&
+         !xwl_glamor_check_flip(present_window, pixmap))
+         return FALSE;
+-#endif /* XWL_HAS_GLAMOR */
++    #endif /* XWL_HAS_GLAMOR */
+ 
+     return TRUE;
+ }
+@@ -833,22 +888,22 @@ xwl_present_check_flip_window (WindowPtr
+ 
+     if (flip_pending) {
+         if (!xwl_present_check_flip(flip_pending->crtc, flip_pending->window, flip_pending->pixmap,
+-                                    flip_pending->sync_flip, flip_pending->valid, 0, 0, NULL))
++            flip_pending->sync_flip, flip_pending->valid, 0, 0, NULL))
+             flip_pending->abort_flip = TRUE;
+     } else if (flip_active) {
+         if (!xwl_present_check_flip(flip_active->crtc, flip_active->window, flip_active->pixmap,
+-                                    flip_active->sync_flip, flip_active->valid, 0, 0, NULL))
++            flip_active->sync_flip, flip_active->valid, 0, 0, NULL))
+             xwl_present_flips_stop(window);
+     }
+ 
+     /* Now check any queued vblanks */
+     xorg_list_for_each_entry(vblank, &window_priv->vblank, window_list) {
+         if (vblank->queued && vblank->flip &&
+-                !xwl_present_check_flip(vblank->crtc, window, vblank->pixmap,
+-                                        vblank->sync_flip, vblank->valid, 0, 0, &reason)) {
++            !xwl_present_check_flip(vblank->crtc, window, vblank->pixmap,
++                                    vblank->sync_flip, vblank->valid, 0, 0, &reason)) {
+             vblank->flip = FALSE;
+-            vblank->reason = reason;
+-        }
++        vblank->reason = reason;
++                                    }
+     }
+ }
+ 
+@@ -888,7 +943,7 @@ xwl_present_flip(present_vblank_ptr vbla
+ 
+     event->pixmap = pixmap;
+ 
+-#if defined(XWL_HAS_GLAMOR) && defined(DRI3)
++    #if defined(XWL_HAS_GLAMOR) && defined(DRI3)
+     if (vblank->acquire_syncobj && vblank->release_syncobj) {
+         if (xwl_window->xwl_screen->explicit_sync) {
+             xwl_glamor_dri3_syncobj_passthrough(xwl_window,
+@@ -900,12 +955,12 @@ xwl_present_flip(present_vblank_ptr vbla
+         } else {
+             /* transfer from acquire syncobj to implicit fence */
+             int fence_fd =
+-                vblank->acquire_syncobj->export_fence(vblank->acquire_syncobj,
+-                                                      vblank->acquire_point);
++            vblank->acquire_syncobj->export_fence(vblank->acquire_syncobj,
++                                                  vblank->acquire_point);
+             xwl_glamor_dmabuf_import_sync_file(vblank->pixmap, fence_fd);
+         }
+     }
+-#endif /* defined(XWL_HAS_GLAMOR) && defined(DRI3) */
++    #endif /* defined(XWL_HAS_GLAMOR) && defined(DRI3) */
+ 
+     if (implicit_sync) {
+         xwl_pixmap_set_buffer_release_cb(pixmap, xwl_present_buffer_release, event);
+@@ -947,7 +1002,7 @@ xwl_present_flip(present_vblank_ptr vbla
+ 
+     if (!vblank->sync_flip) {
+         xwl_present_window->sync_callback =
+-            wl_display_sync(xwl_window->xwl_screen->display);
++        wl_display_sync(xwl_window->xwl_screen->display);
+         wl_callback_add_listener(xwl_present_window->sync_callback,
+                                  &xwl_present_sync_listener,
+                                  &event->vblank);
+@@ -975,7 +1030,7 @@ static Bool
+ xwl_present_wait_acquire_fence_avail(struct xwl_screen *xwl_screen,
+                                      present_vblank_ptr vblank)
+ {
+-#if defined(XWL_HAS_GLAMOR) && defined(DRI3)
++    #if defined(XWL_HAS_GLAMOR) && defined(DRI3)
+     /* If the compositor does not support explicit sync we need to wait for the
+      * acquire fence to be submitted before flipping. */
+     if (vblank->flip && !xwl_screen->explicit_sync &&
+@@ -983,14 +1038,14 @@ xwl_present_wait_acquire_fence_avail(str
+         !vblank->acquire_syncobj->has_fence(vblank->acquire_syncobj,
+                                             vblank->acquire_point)) {
+         vblank->efd = eventfd(0, EFD_CLOEXEC);
+-        SetNotifyFd(vblank->efd, xwl_present_acquire_fence_avail, X_NOTIFY_READ, vblank);
+-        vblank->acquire_syncobj->submitted_eventfd(vblank->acquire_syncobj,
+-                                                   vblank->acquire_point,
+-                                                   vblank->efd);
+-        return TRUE;
+-    }
+-#endif /* defined(XWL_HAS_GLAMOR) && defined(DRI3) */
+-    return FALSE;
++    SetNotifyFd(vblank->efd, xwl_present_acquire_fence_avail, X_NOTIFY_READ, vblank);
++    vblank->acquire_syncobj->submitted_eventfd(vblank->acquire_syncobj,
++                                               vblank->acquire_point,
++                                               vblank->efd);
++    return TRUE;
++                                            }
++                                            #endif /* defined(XWL_HAS_GLAMOR) && defined(DRI3) */
++                                            return FALSE;
+ }
+ 
+ static void
+@@ -998,7 +1053,7 @@ xwl_present_flush_blocked(struct xwl_pre
+                           uint64_t crtc_msc)
+ {
+     struct xwl_screen *xwl_screen =
+-        xwl_screen_get(xwl_present_window->window->drawable.pScreen);
++    xwl_screen_get(xwl_present_window->window->drawable.pScreen);
+     struct xwl_present_event *blocked_event, *tmp;
+ 
+     if (!xwl_present_window->blocking_event)
+@@ -1014,11 +1069,11 @@ xwl_present_flush_blocked(struct xwl_pre
+         if (present_execute_wait(blocked_vblank, crtc_msc) ||
+             xwl_present_wait_acquire_fence_avail(xwl_screen, blocked_vblank)) {
+             xwl_present_window->blocking_event = blocked_vblank->event_id;
+-            return;
+-        }
++        return;
++            }
+ 
+-        xwl_present_re_execute(blocked_vblank);
+-    }
++            xwl_present_re_execute(blocked_vblank);
++                                  }
+ }
+ 
+ /*
+@@ -1047,137 +1102,140 @@ xwl_present_execute(present_vblank_ptr v
+         xwl_present_window->blocking_event != event->vblank.event_id) {
+         /* an earlier request is blocking execution */
+         xorg_list_append(&event->blocked, &xwl_present_window->blocked_queue);
+-        return;
+-    }
+-
+-retry:
+-    if (present_execute_wait(vblank, crtc_msc) ||
+-        xwl_present_wait_acquire_fence_avail(xwl_screen, vblank)) {
+-        if (!notify_only)
+-            /* block execution of subsequent requests until this request is ready */
+-            xwl_present_window->blocking_event = event->vblank.event_id;
+-        return;
+-    }
+-
+-    if (flip_pending && vblank->flip && !notify_only) {
+-        present_vblank_ptr flip_queued_last;
+-
+-        flip_queued_last = xorg_list_last_entry(&xwl_present_window->flip_queue,
+-                                                present_vblank_rec, event_queue);
+-
+-        /* Do mailbox handling for queued flips, to prevent the flip queue from
+-         * growing unbounded.
+-         */
+-        if (flip_queued_last != flip_pending &&
+-            (flip_queued_last->sync_flip
+-#ifdef DRI3
+-             || vblank->acquire_syncobj
+-#endif
+-             )) {
+-            xorg_list_del(&flip_queued_last->event_queue);
+-            present_vblank_scrap(flip_queued_last);
+-            xwl_present_re_execute(flip_queued_last);
++    return;
+         }
+ 
+-        DebugPresent(("\tr %" PRIu64 " %p (pending %p)\n",
+-                      vblank->event_id, vblank, flip_pending));
+-        xorg_list_append(&vblank->event_queue, &xwl_present_window->flip_queue);
+-        return;
+-    }
++        retry:
++        if (present_execute_wait(vblank, crtc_msc) ||
++            xwl_present_wait_acquire_fence_avail(xwl_screen, vblank)) {
++            if (!notify_only)
++                /* block execution of subsequent requests until this request is ready */
++                xwl_present_window->blocking_event = event->vblank.event_id;
++            return;
++            }
+ 
+-    vblank->queued = FALSE;
++            if (flip_pending && vblank->flip && !notify_only) {
++                present_vblank_ptr flip_queued_last;
+ 
+-    if (!notify_only && !event->copy_executed) {
+-        ScreenPtr screen = window->drawable.pScreen;
+-        int ret;
+-
+-        if (vblank->flip) {
+-            RegionPtr damage;
+-
+-            DebugPresent(("\tf %" PRIu64 " %p %" PRIu64 ": %08" PRIx32 " -> %08" PRIx32 "\n",
+-                          vblank->event_id, vblank, crtc_msc,
+-                          vblank->pixmap->drawable.id, vblank->window->drawable.id));
+-
+-            /* Set update region as damaged */
+-            if (vblank->update) {
+-                damage = RegionDuplicate(vblank->update);
+-                /* Translate update region to screen space */
+-                assert(vblank->x_off == 0 && vblank->y_off == 0);
+-                RegionTranslate(damage, window->drawable.x, window->drawable.y);
+-                RegionIntersect(damage, damage, &window->clipList);
+-            } else
+-                damage = RegionDuplicate(&window->clipList);
+-
+-            if (xwl_present_flip(vblank, damage)) {
+-                WindowPtr toplvl_window = xwl_present_toplvl_pixmap_window(vblank->window);
+-                struct xwl_window *xwl_window = xwl_window_from_window(window);
+-                PixmapPtr old_pixmap = screen->GetWindowPixmap(window);
+-
+-                /* Replace window pixmap with flip pixmap */
+-#ifdef COMPOSITE
+-                vblank->pixmap->screen_x = old_pixmap->screen_x;
+-                vblank->pixmap->screen_y = old_pixmap->screen_y;
+-#endif
+-                present_set_tree_pixmap(toplvl_window, old_pixmap, vblank->pixmap);
+-
+-                if (toplvl_window == screen->root &&
+-                    screen->GetScreenPixmap(screen) == old_pixmap)
+-                    screen->SetScreenPixmap(vblank->pixmap);
+-
+-                vblank->pixmap->refcnt++;
+-                dixDestroyPixmap(old_pixmap, old_pixmap->drawable.id);
+-
+-                /* Report damage, let damage_report ignore it though */
+-                xwl_screen->ignore_damage = TRUE;
+-                DamageDamageRegion(&vblank->window->drawable, damage);
+-                xwl_screen->ignore_damage = FALSE;
+-                RegionDestroy(damage);
++                flip_queued_last = xorg_list_last_entry(&xwl_present_window->flip_queue,
++                                                        present_vblank_rec, event_queue);
+ 
+-                /* Clear damage region, to ensure damage_report is called before
+-                 * any drawing to the window
++                /* Do mailbox handling for queued flips, to prevent the flip queue from
++                 * growing unbounded.
+                  */
+-                xwl_window_buffer_add_damage_region(xwl_window);
+-                RegionEmpty(xwl_window_get_damage_region(xwl_window));
+-                xorg_list_del(&xwl_window->link_damage);
+-
+-                /* Put pending flip at the flip queue head */
+-                xorg_list_add(&vblank->event_queue, &xwl_present_window->flip_queue);
+-
+-                /* Realign timer */
+-                xwl_present_reset_timer(xwl_present_window);
+-
+-                xwl_present_flush_blocked(xwl_present_window, crtc_msc);
+-                return;
++                if (flip_queued_last != flip_pending &&
++                    (flip_queued_last->sync_flip
++                    #ifdef DRI3
++                    || vblank->acquire_syncobj
++                    #endif
++                    )) {
++                    xorg_list_del(&flip_queued_last->event_queue);
++                xwl_present_window->flip_queue_empty = xorg_list_is_empty(&xwl_present_window->flip_queue);
++                present_vblank_scrap(flip_queued_last);
++                xwl_present_re_execute(flip_queued_last);
++                    }
++
++                    DebugPresent(("\tr %" PRIu64 " %p (pending %p)\n",
++                                  vblank->event_id, vblank, flip_pending));
++                    xorg_list_append(&vblank->event_queue, &xwl_present_window->flip_queue);
++                    xwl_present_window->flip_queue_empty = xorg_list_is_empty(&xwl_present_window->flip_queue);
++                    return;
+             }
+ 
+-            vblank->flip = FALSE;
+-            /* re-execute, falling through to copy */
+-            goto retry;
+-        }
+-        DebugPresent(("\tc %p %" PRIu64 ": %08" PRIx32 " -> %08" PRIx32 "\n",
+-                      vblank, crtc_msc, vblank->pixmap->drawable.id, vblank->window->drawable.id));
++            vblank->queued = FALSE;
+ 
+-        if (flip_pending)
+-            flip_pending->abort_flip = TRUE;
+-        else if (xwl_present_window->flip_active)
+-            xwl_present_flips_stop(window);
++            if (!notify_only && !event->copy_executed) {
++                ScreenPtr screen = window->drawable.pScreen;
++                int ret;
++
++                if (vblank->flip) {
++                    RegionPtr damage;
++
++                    DebugPresent(("\tf %" PRIu64 " %p %" PRIu64 ": %08" PRIx32 " -> %08" PRIx32 "\n",
++                                  vblank->event_id, vblank, crtc_msc,
++                                  vblank->pixmap->drawable.id, vblank->window->drawable.id));
++
++                    /* Set update region as damaged */
++                    if (vblank->update) {
++                        damage = RegionDuplicate(vblank->update);
++                        /* Translate update region to screen space */
++                        assert(vblank->x_off == 0 && vblank->y_off == 0);
++                        RegionTranslate(damage, window->drawable.x, window->drawable.y);
++                        RegionIntersect(damage, damage, &window->clipList);
++                    } else
++                        damage = RegionDuplicate(&window->clipList);
++
++                    if (xwl_present_flip(vblank, damage)) {
++                        WindowPtr toplvl_window = xwl_present_toplvl_pixmap_window(vblank->window);
++                        struct xwl_window *xwl_window = xwl_window_from_window(window);
++                        PixmapPtr old_pixmap = screen->GetWindowPixmap(window);
++
++                        /* Replace window pixmap with flip pixmap */
++                        #ifdef COMPOSITE
++                        vblank->pixmap->screen_x = old_pixmap->screen_x;
++                        vblank->pixmap->screen_y = old_pixmap->screen_y;
++                        #endif
++                        present_set_tree_pixmap(toplvl_window, old_pixmap, vblank->pixmap);
++
++                        if (toplvl_window == screen->root &&
++                            screen->GetScreenPixmap(screen) == old_pixmap)
++                            screen->SetScreenPixmap(vblank->pixmap);
++
++                        vblank->pixmap->refcnt++;
++                        dixDestroyPixmap(old_pixmap, old_pixmap->drawable.id);
++
++                        /* Report damage, let damage_report ignore it though */
++                        xwl_screen->ignore_damage = TRUE;
++                        DamageDamageRegion(&vblank->window->drawable, damage);
++                        xwl_screen->ignore_damage = FALSE;
++                        RegionDestroy(damage);
++
++                        /* Clear damage region, to ensure damage_report is called before
++                         * any drawing to the window
++                         */
++                        xwl_window_buffer_add_damage_region(xwl_window);
++                        RegionEmpty(xwl_window_get_damage_region(xwl_window));
++                        xorg_list_del(&xwl_window->link_damage);
++
++                        /* Put pending flip at the flip queue head */
++                        xorg_list_add(&vblank->event_queue, &xwl_present_window->flip_queue);
++                        xwl_present_window->flip_queue_empty = xorg_list_is_empty(&xwl_present_window->flip_queue);
++
++                        /* Realign timer */
++                        xwl_present_reset_timer(xwl_present_window);
++
++                        xwl_present_flush_blocked(xwl_present_window, crtc_msc);
++                        return;
++                    }
++
++                    vblank->flip = FALSE;
++                    /* re-execute, falling through to copy */
++                    goto retry;
++                }
++                DebugPresent(("\tc %p %" PRIu64 ": %08" PRIx32 " -> %08" PRIx32 "\n",
++                              vblank, crtc_msc, vblank->pixmap->drawable.id, vblank->window->drawable.id));
++
++                if (flip_pending)
++                    flip_pending->abort_flip = TRUE;
++                else if (xwl_present_window->flip_active)
++                    xwl_present_flips_stop(window);
+ 
+-        present_execute_copy(vblank, crtc_msc);
+-        assert(!vblank->queued);
++                present_execute_copy(vblank, crtc_msc);
++                assert(!vblank->queued);
+ 
+-        /* Set the copy_executed field, so this will fall through to present_execute_post next time */
+-        event->copy_executed = TRUE;
++                /* Set the copy_executed field, so this will fall through to present_execute_post next time */
++                event->copy_executed = TRUE;
+ 
+-        ret = xwl_present_queue_vblank(screen, window, vblank->crtc,
+-                                       vblank->event_id, crtc_msc + 1);
++                ret = xwl_present_queue_vblank(screen, window, vblank->crtc,
++                                               vblank->event_id, crtc_msc + 1);
+ 
+-        xwl_present_flush_blocked(xwl_present_window, crtc_msc);
++                xwl_present_flush_blocked(xwl_present_window, crtc_msc);
+ 
+-        if (ret == Success)
+-            return;
+-    }
++                if (ret == Success)
++                    return;
++            }
+ 
+-    present_execute_post(vblank, ust, crtc_msc);
++            present_execute_post(vblank, ust, crtc_msc);
+ }
+ 
+ static int
+@@ -1191,12 +1249,12 @@ xwl_present_pixmap(WindowPtr window,
+                    RRCrtcPtr target_crtc,
+                    SyncFence *wait_fence,
+                    SyncFence *idle_fence,
+-#ifdef DRI3
++                   #ifdef DRI3
+                    struct dri3_syncobj *acquire_syncobj,
+                    struct dri3_syncobj *release_syncobj,
+                    uint64_t acquire_point,
+                    uint64_t release_point,
+-#endif /* DRI3 */
++                   #endif /* DRI3 */
+                    uint32_t options,
+                    uint64_t target_window_msc,
+                    uint64_t divisor,
+@@ -1220,11 +1278,11 @@ xwl_present_pixmap(WindowPtr window,
+     if (!window_priv)
+         return BadAlloc;
+ 
+-#ifdef DRI3
++    #ifdef DRI3
+     if (!(caps & PresentCapabilitySyncobj) &&
+         (acquire_syncobj || release_syncobj))
+         return BadValue;
+-#endif /* DRI3 */
++    #endif /* DRI3 */
+ 
+     target_crtc = xwl_present_get_crtc(screen_priv, window);
+ 
+@@ -1244,37 +1302,37 @@ xwl_present_pixmap(WindowPtr window,
+                                         remainder,
+                                         options);
+ 
+-    event = calloc(1, sizeof(*event));
++    event = xwl_present_alloc_event();
+     if (!event)
+         return BadAlloc;
+ 
+     vblank = &event->vblank;
+     if (!present_vblank_init(vblank, window, pixmap, serial, valid, update, x_off, y_off,
+-                             target_crtc, wait_fence, idle_fence,
+-#ifdef DRI3
+-                             acquire_syncobj, release_syncobj, acquire_point, release_point,
+-#endif /* DRI3 */
+-                             options, caps, notifies, num_notifies, target_msc, crtc_msc)) {
+-        present_vblank_destroy(vblank);
+-        return BadAlloc;
+-    }
+-
+-    vblank->event_id = ++xwl_present_event_id;
+-    event->options = options;
+-    event->divisor = divisor;
+-    event->remainder = remainder;
+-    vblank->exec_msc = xwl_present_get_exec_msc(options, vblank->target_msc);
++        target_crtc, wait_fence, idle_fence,
++        #ifdef DRI3
++        acquire_syncobj, release_syncobj, acquire_point, release_point,
++        #endif /* DRI3 */
++        options, caps, notifies, num_notifies, target_msc, crtc_msc)) {
++        xwl_present_free_event(event);
++    return BadAlloc;
++        }
+ 
+-    vblank->queued = TRUE;
+-    if (crtc_msc < vblank->exec_msc) {
+-        if (xwl_present_queue_vblank(screen, window, target_crtc, vblank->event_id, vblank->exec_msc) == Success)
+-            return Success;
++        vblank->event_id = ++xwl_present_event_id;
++        event->options = options;
++        event->divisor = divisor;
++        event->remainder = remainder;
++        vblank->exec_msc = xwl_present_get_exec_msc(options, vblank->target_msc);
++
++        vblank->queued = TRUE;
++        if (crtc_msc < vblank->exec_msc) {
++            if (xwl_present_queue_vblank(screen, window, target_crtc, vblank->event_id, vblank->exec_msc) == Success)
++                return Success;
+ 
+-        DebugPresent(("present_queue_vblank failed\n"));
+-    }
++            DebugPresent(("present_queue_vblank failed\n"));
++        }
+ 
+-    xwl_present_execute(vblank, ust, crtc_msc);
+-    return Success;
++        xwl_present_execute(vblank, ust, crtc_msc);
++        return Success;
+ }
+ 
+ void
+@@ -1348,7 +1406,7 @@ xwl_present_maybe_unredirect_window(Wind
+      */
+     if (!xwl_present_window->unredirect_timer) {
+         xwl_present_window->unredirect_timer =
+-            TimerSet(NULL, 0, 1, unredirect_window, window);
++        TimerSet(NULL, 0, 1, unredirect_window, window);
+     }
+ 
+     return TRUE;
+@@ -1368,6 +1426,8 @@ xwl_present_init(ScreenPtr screen)
+     struct xwl_screen *xwl_screen = xwl_screen_get(screen);
+     present_screen_priv_ptr screen_priv;
+ 
++    xwl_present_init_event_pool();
++
+     if (!present_screen_register_priv_keys())
+         return FALSE;
+ 
+@@ -1382,11 +1442,11 @@ xwl_present_init(ScreenPtr screen)
+         return FALSE;
+ 
+     xwl_screen->present_capabilities = XWL_PRESENT_CAPS;
+-#ifdef XWL_HAS_GLAMOR
+-    if (xwl_glamor_supports_syncobjs(xwl_screen))
++    #ifdef XWL_HAS_GLAMOR
++    if (xwl_screen->explicit_sync)
+         xwl_screen->present_capabilities |=
+-            PresentCapabilitySyncobj;
+-#endif /* XWL_HAS_GLAMOR */
++        PresentCapabilitySyncobj;
++    #endif /* XWL_HAS_GLAMOR */
+ 
+     screen_priv->query_capabilities = xwl_present_query_capabilities;
+     screen_priv->get_crtc = xwl_present_get_crtc;
+
+--- a/hw/xwayland/xwayland-present.h	2025-07-26 09:12:16.955985549 +0200
++++ a/hw/xwayland/xwayland-present.h	2025-07-26 09:13:52.121013328 +0200
+@@ -58,6 +60,13 @@ struct xwl_present_window {
+     OsTimerPtr unredirect_timer;
+     Bool redirected;
+     Bool redirect_failed;
++
++    _Alignas(64) Bool flip_queue_empty;
++    Bool msc_cached;
++    uint16_t flip_eligible_cache;
++    CARD32 last_delta;
++    uint32_t msc_call_count;
++    CARD32 last_bump;
+ };
+ 
+ struct xwl_present_event {
+     
+
 diff --git a/glamor/glamor_priv.h b/glamor/glamor_priv.h
 index 898380d82..a31cd37d6 100644
 --- a/glamor/glamor_priv.h
