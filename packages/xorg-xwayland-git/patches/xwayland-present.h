@@ -23,8 +23,6 @@
  * SOFTWARE.
  */
 
-
-
 #ifndef XWAYLAND_PRESENT_H
 #define XWAYLAND_PRESENT_H
 
@@ -60,13 +58,6 @@ struct xwl_present_window {
     OsTimerPtr unredirect_timer;
     Bool redirected;
     Bool redirect_failed;
-
-    _Alignas(64) Bool flip_queue_empty;
-    Bool msc_cached;
-    uint16_t flip_eligible_cache;
-    CARD32 last_delta;
-    uint32_t msc_call_count;
-    CARD32 last_bump;
 };
 
 struct xwl_present_event {
