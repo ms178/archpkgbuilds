@@ -586,6 +586,8 @@ xwl_present_msc_bump(struct xwl_present_window *xwl_present_window)
     present_vblank_ptr flip_pending = xwl_present_get_pending_flip(xwl_present_window);
     uint64_t msc = ++xwl_present_window->msc;
     present_vblank_ptr vblank, tmp;
+    struct xorg_list to_execute;
+    int count = 0;
 
     xwl_present_window->ust = GetTimeInMicros();
 
@@ -597,15 +599,27 @@ xwl_present_msc_bump(struct xwl_present_window *xwl_present_window)
     if (flip_pending && flip_pending->sync_flip)
         xwl_present_flip_notify_vblank(flip_pending, xwl_present_window->ust, msc);
 
+    if (xorg_list_is_empty(&xwl_present_window->wait_list))
+        return;
+
+    /* Collect events to execute in a temp list to avoid modifying during iteration */
+    xorg_list_init(&to_execute);
+
     xorg_list_for_each_entry_safe(vblank, tmp, &xwl_present_window->wait_list, event_queue) {
-        __builtin_prefetch(tmp);  /* Prefetch next for Raptor Lake cache efficiency */
-
         if (vblank->exec_msc <= msc) {
-            DebugPresent(("\te %" PRIu64 " ust %" PRIu64 " msc %" PRIu64 "\n",
-                          vblank->event_id, xwl_present_window->ust, msc));
-
-            xwl_present_execute(vblank, xwl_present_window->ust, msc);
+            xorg_list_del(&vblank->event_queue);
+            xorg_list_append(&vblank->event_queue, &to_execute);
+            count++;
         }
+    }
+
+    /* Now execute safely */
+    xorg_list_for_each_entry_safe(vblank, tmp, &to_execute, event_queue) {
+        xorg_list_del(&vblank->event_queue);
+        DebugPresent(("\te %" PRIu64 " ust %" PRIu64 " msc %" PRIu64 "\n",
+                      vblank->event_id, xwl_present_window->ust, msc));
+
+        xwl_present_execute(vblank, xwl_present_window->ust, msc);
     }
 }
 
