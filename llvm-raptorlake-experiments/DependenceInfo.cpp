@@ -187,19 +187,13 @@ static void fixSetToZero(isl::set Zero, isl::union_set *User) {
 }
 
 void Dependences::addPrivatizationDependences(isl_union_map *TC) {
-  // This function takes ownership of the transitive closure (TC) map.
   TC_RED = TC;
 
-  // The transitive closure computed by ISL might be an over-approximation. To
-  // prevent the creation of cyclic dependencies, which would be a correctness
-  // bug, we must sanitize the TC by removing any dependencies that are not
-  // lexicographically positive with respect to the schedule. This is a critical
-  // step for robustness.
   isl_union_set *UDeltas = isl_union_map_deltas(isl_union_map_copy(TC_RED));
   isl_union_set *Universe = isl_union_set_universe(isl_union_set_copy(UDeltas));
+
   isl::union_set Zero =
   isl::manage(isl_union_set_empty(isl_union_set_get_space(Universe)));
-
   for (isl::set Set : isl::manage_copy(Universe).get_set_list()) {
     fixSetToZero(Set, &Zero);
   }
@@ -215,29 +209,19 @@ void Dependences::addPrivatizationDependences(isl_union_map *TC) {
     return;
   }
 
-  // Now, widen the RAW, WAW, and WAR dependencies using the sanitized
-  // transitive closure. This is a conservative but correct approach. We compose
-  // the dependencies with the transitive closure in both directions. This
-  // ensures that any access that depends on a reduction is made to depend on the
-  // entire reduction, and any access that is a source for a dependency into a
-  // reduction is also properly connected.
   isl_union_map **Maps[] = {&RAW, &WAW, &WAR};
   for (unsigned u = 0; u < 3; u++) {
     isl_union_map **Map = Maps[u];
     isl_union_map *PrivMap;
 
-    // Widen by composing TC_RED o Map
     PrivMap = isl_union_map_apply_range(isl_union_map_copy(TC_RED),
                                         isl_union_map_copy(*Map));
 
-    // Widen by composing Map o TC_RED and union the results.
-    // isl_union_map_apply_range(B, A) computes A o B.
     isl_union_map *Map_o_TC =
     isl_union_map_apply_range(isl_union_map_copy(*Map),
                               isl_union_map_copy(TC_RED));
 
     PrivMap = isl_union_map_union(PrivMap, Map_o_TC);
-
     *Map = isl_union_map_union(*Map, PrivMap);
   }
 
@@ -277,7 +261,33 @@ void Dependences::calculateDependences(Scop &S) {
   collectInfo(S, Read, MustWrite, MayWrite, ReductionTagMap, TaggedStmtDomain,
               Level);
 
-  bool HasReductions =
+  // OPTIMIZATION: Add fast paths for trivial cases.
+  isl_union_map *AllWrites = isl_union_map_union(isl_union_map_copy(MustWrite),
+                                                 isl_union_map_copy(MayWrite));
+  if (isl_union_map_is_empty(AllWrites)) {
+    isl_space *Space = S.getParamSpace().release();
+    RAW = isl_union_map_empty(isl_space_copy(Space));
+    WAR = isl_union_map_empty(isl_space_copy(Space));
+    WAW = isl_union_map_empty(isl_space_copy(Space));
+    RED = isl_union_map_empty(isl_space_copy(Space));
+    TC_RED = isl_union_map_empty(Space);
+    isl_union_map_free(AllWrites);
+    isl_union_map_free(Read);
+    isl_union_map_free(MustWrite);
+    isl_union_map_free(MayWrite);
+    isl_union_map_free(ReductionTagMap);
+    isl_union_set_free(TaggedStmtDomain);
+    return;
+  }
+  if (isl_union_map_is_empty(Read)) {
+    isl_space *Space = S.getParamSpace().release();
+    RAW = isl_union_map_empty(isl_space_copy(Space));
+    WAR = isl_union_map_empty(Space);
+    // Fall through to calculate WAW dependencies.
+  }
+  isl_union_map_free(AllWrites);
+
+  bool HasRedructions =
   UseReductions && !isl_union_map_is_empty(ReductionTagMap);
 
   POLLY_DEBUG(dbgs() << "Read: " << Read << '\n';
@@ -288,7 +298,7 @@ void Dependences::calculateDependences(Scop &S) {
 
   Schedule = S.getScheduleTree().release();
 
-  if (!HasReductions) {
+  if (!HasRedructions) {
     isl_union_map_free(ReductionTagMap);
     if (Level > AL_Statement) {
       auto TaggedMap =
@@ -314,114 +324,70 @@ void Dependences::calculateDependences(Scop &S) {
 
   isl_union_map *StrictWAW = nullptr;
   {
-    IslMaxOperationsGuard MaxOpGuard(IslCtx.get(), OptComputeOut);
+    IslMaxOperationsGuard MaxOpGuard(getIslCtx(), OptComputeOut);
 
-    RAW = WAW = WAR = RED = nullptr;
-    isl_union_map *Write = isl_union_map_union(isl_union_map_copy(MustWrite),
-                                               isl_union_map_copy(MayWrite));
+    if (!RAW) { // If not handled by a fast path
+      isl_union_map *Write = isl_union_map_union(isl_union_map_copy(MustWrite),
+                                                 isl_union_map_copy(MayWrite));
 
-    // For performance on multi-core CPUs like Raptor Lake, we parallelize the
-    // four independent, expensive flow computations. To use ISL in multiple
-    // threads safely without the high overhead of creating new contexts, we
-    // temporarily set the error handler to ISL_ON_ERROR_CONTINUE. This prevents
-    // aborts and allows us to check for null results in each thread, which is
-    // a safe and efficient way to handle errors in a parallel context.
-    int OldOnError = isl_options_get_on_error(IslCtx.get());
-    isl_options_set_on_error(IslCtx.get(), ISL_ON_ERROR_CONTINUE);
+      isl_union_flow *Flow = buildFlow(Write, Write, Read, nullptr, Schedule);
+      StrictWAW = isl_union_flow_get_must_dependence(Flow);
+      isl_union_flow_free(Flow);
 
-    auto compute_raw = [&]() -> isl_union_map * {
-      isl_union_flow *Flow;
       if (OptAnalysisType == VALUE_BASED_ANALYSIS) {
         Flow = buildFlow(Read, MustWrite, MayWrite, nullptr, Schedule);
+        RAW = isl_union_flow_get_may_dependence(Flow);
+        isl_union_flow_free(Flow);
+
+        Flow = buildFlow(Write, nullptr, Read, MustWrite, Schedule);
+        WAR = isl_union_flow_get_may_dependence(Flow);
+        isl_union_flow_free(Flow);
       } else {
         Flow = buildFlow(Read, nullptr, Write, nullptr, Schedule);
-      }
-      auto Dep = isl_union_flow_get_may_dependence(Flow);
-      isl_union_flow_free(Flow);
-      return Dep;
-    };
+        RAW = isl_union_flow_get_may_dependence(Flow);
+        isl_union_flow_free(Flow);
 
-    auto compute_waw = [&]() -> isl_union_map * {
-      isl_union_flow *Flow =
-      buildFlow(Write, MustWrite, MayWrite, nullptr, Schedule);
-      auto Dep = isl_union_flow_get_may_dependence(Flow);
-      isl_union_flow_free(Flow);
-      return Dep;
-    };
-
-    auto compute_war = [&]() -> isl_union_map * {
-      isl_union_flow *Flow;
-      if (OptAnalysisType == VALUE_BASED_ANALYSIS) {
-        Flow = buildFlow(Write, nullptr, Read, MustWrite, Schedule);
-      } else {
         Flow = buildFlow(Write, nullptr, Read, nullptr, Schedule);
+        WAR = isl_union_flow_get_may_dependence(Flow);
+        isl_union_flow_free(Flow);
       }
-      auto Dep = isl_union_flow_get_may_dependence(Flow);
+      Flow = buildFlow(Write, MustWrite, MayWrite, nullptr, Schedule);
+      WAW = isl_union_flow_get_may_dependence(Flow);
       isl_union_flow_free(Flow);
-      return Dep;
-    };
 
-    auto compute_strict_waw = [&]() -> isl_union_map * {
-      isl_union_flow *Flow =
-      buildFlow(Write, MustWrite, MayWrite, nullptr, Schedule);
-      auto Dep = isl_union_flow_get_must_dependence(Flow);
-      isl_union_flow_free(Flow);
-      return Dep;
-    };
+      isl_union_map_free(Write);
+    }
 
-    // Launch tasks asynchronously.
-    std::future<isl_union_map *> RAW_future =
-    std::async(std::launch::async, compute_raw);
-    std::future<isl_union_map *> WAW_future =
-    std::async(std::launch::async, compute_waw);
-    std::future<isl_union_map *> WAR_future =
-    std::async(std::launch::async, compute_war);
-    std::future<isl_union_map *> StrictWAW_future =
-    std::async(std::launch::async, compute_strict_waw);
-
-    // Block until all tasks are complete and retrieve results.
-    RAW = RAW_future.get();
-    WAW = WAW_future.get();
-    WAR = WAR_future.get();
-    StrictWAW = StrictWAW_future.get();
-
-    // Restore the original error handling behavior.
-    isl_options_set_on_error(IslCtx.get(), OldOnError);
-
-    // All tasks are complete, so we can now safely free the resources they used.
-    isl_union_map_free(Write);
     isl_union_map_free(MustWrite);
     isl_union_map_free(MayWrite);
     isl_union_map_free(Read);
     isl_schedule_free(Schedule);
 
-    // If any task failed (returned null) or if ISL hit its computation quota,
-    // the results are invalid. We must abandon the entire analysis.
-    if (!RAW || !WAW || !WAR || !StrictWAW ||
-      isl_ctx_last_error(IslCtx.get()) == isl_error_quota) {
+    if (isl_ctx_last_error(getIslCtx()) == isl_error_quota) {
       isl_union_map_free(RAW);
-    isl_union_map_free(WAW);
-    isl_union_map_free(WAR);
-    isl_union_map_free(StrictWAW);
-    RAW = WAW = WAR = StrictWAW = nullptr;
-    isl_ctx_reset_error(IslCtx.get());
-      }
+      isl_union_map_free(WAW);
+      isl_union_map_free(WAR);
+      isl_union_map_free(StrictWAW);
+      RAW = WAW = WAR = StrictWAW = nullptr;
+      isl_ctx_reset_error(getIslCtx());
+    }
 
-      if (hasValidDependences()) {
-        RAW = isl_union_map_coalesce(RAW);
-        WAW = isl_union_map_coalesce(WAW);
-        WAR = isl_union_map_coalesce(WAR);
-      }
+    if (hasValidDependences()) {
+      RAW = isl_union_map_coalesce(RAW);
+      WAW = isl_union_map_coalesce(WAW);
+      WAR = isl_union_map_coalesce(WAR);
+    }
   }
 
   if (!hasValidDependences()) {
-    isl_union_map_free(ReductionTagMap);
     isl_union_set_free(TaggedStmtDomain);
+    if (HasRedructions)
+      isl_union_map_free(ReductionTagMap);
     RED = TC_RED = nullptr;
     return;
   }
 
-  if (!HasReductions && Level == AL_Statement) {
+  if (!HasRedructions && Level == AL_Statement) {
     RED = isl_union_map_empty(isl_union_map_get_space(RAW));
     TC_RED = isl_union_map_empty(isl_union_set_get_space(TaggedStmtDomain));
     isl_union_set_free(TaggedStmtDomain);
@@ -443,7 +409,7 @@ void Dependences::calculateDependences(Scop &S) {
   });
 
   RED = isl_union_map_empty(isl_union_map_get_space(RAW));
-  if (HasReductions) {
+  if (HasRedructions) {
     for (ScopStmt &Stmt : S) {
       for (MemoryAccess *MA : Stmt) {
         if (!MA->isReductionLike())
@@ -458,7 +424,7 @@ void Dependences::calculateDependences(Scop &S) {
     RED = isl_union_map_intersect(RED, StrictWAW);
   }
 
-  if (HasReductions && !isl_union_map_is_empty(RED)) {
+  if (HasRedructions && !isl_union_map_is_empty(RED)) {
     isl_bool exact;
     isl_union_map *Current_TC_RED =
     isl_union_map_transitive_closure(isl_union_map_copy(RED), &exact);
@@ -511,24 +477,12 @@ void Dependences::calculateDependences(Scop &S) {
   if (TC_RED)
     TC_RED = isl_union_map_zip(TC_RED);
 
-  POLLY_DEBUG({
-    dbgs() << "Zipped Dependences:\n";
-    dump();
-    dbgs() << "\n";
-  });
-
   RAW = isl_union_set_unwrap(isl_union_map_domain(RAW));
   WAW = isl_union_set_unwrap(isl_union_map_domain(WAW));
   WAR = isl_union_set_unwrap(isl_union_map_domain(WAR));
   RED = isl_union_set_unwrap(isl_union_map_domain(RED));
   if (TC_RED)
     TC_RED = isl_union_set_unwrap(isl_union_map_domain(TC_RED));
-
-  POLLY_DEBUG({
-    dbgs() << "Unwrapped Dependences:\n";
-    dump();
-    dbgs() << "\n";
-  });
 
   RAW = isl_union_map_union(RAW, STMT_RAW);
   WAW = isl_union_map_union(WAW, STMT_WAW);
@@ -566,6 +520,7 @@ bool Dependences::isValidSchedule(
     }
 
     isl::union_map Schedule = isl::union_map::empty(S.getIslCtx());
+    isl::space TimeSpace;
 
     for (ScopStmt &Stmt : S) {
         isl::map StmtScat;
@@ -577,45 +532,36 @@ bool Dependences::isValidSchedule(
         }
         assert(!StmtScat.is_null() &&
                "Schedules that contain extension nodes require special handling.");
+
+        if (TimeSpace.is_null() && !StmtScat.is_empty()) {
+            TimeSpace = StmtScat.get_space().range();
+        }
+
         Schedule = Schedule.unite(StmtScat);
     }
 
-    // Apply the new schedule to the dependencies to get time-to-time dependences.
     Dependences = Dependences.apply_domain(Schedule).apply_range(Schedule);
+    if (Dependences.is_empty()) {
+        return true;
+    }
 
-    // A schedule is valid if for every dependence `src -> sink`, the source
-    // timestamp is lexicographically less than or equal to the sink timestamp.
-    // A violation occurs if `src >_lex sink` for any dependence.
-    //
-    // The C++ bindings for ISL do not provide `lex_gt` on `union_map`. The correct
-    // and robust way to check for violations is to iterate through each
-    // constituent `map` and check for lexicographical violations individually.
+    if (TimeSpace.is_null()) {
+        return true;
+    }
+    isl::map LexGT_Relation = isl::map::lex_gt(TimeSpace);
+
     for (isl::map DepMap : Dependences.get_map_list()) {
         if (DepMap.is_empty()) {
             continue;
         }
 
-        // Get the space of the schedule time points. The domain and range
-        // spaces of the time-to-time dependence map are the same.
-        isl::space TimeSpace = DepMap.get_space().range();
-
-        // Construct the lexicographical ">" relation on this space.
-        // This creates a map `{[t1] -> [t2] : t1, t2 in TimeSpace and t1 >_lex t2}`.
-        // As the compiler and header file indicated, `isl::map::lex_gt` is a
-        // static-like method that takes a space as an argument.
-        isl::map LexGT_Relation = isl::map::lex_gt(TimeSpace);
-
-        // Intersect the dependence map with the ">" relation. The result contains
-        // all dependencies that violate the schedule.
         isl::map Violations = DepMap.intersect(LexGT_Relation);
 
-        // If this intersection is not empty, we have found a violation.
         if (!Violations.is_empty()) {
             return false;
         }
     }
 
-    // If no violations were found in any of the constituent maps, the schedule is valid.
     return true;
 }
 
@@ -751,8 +697,9 @@ DependenceAnalysis::Result::getDependences(Dependences::AnalysisLevel Level) {
   return recomputeDependences(Level);
 }
 
-const Dependences &DependenceAnalysis::Result::recomputeDependences(
-    Dependences::AnalysisLevel Level) {
+const Dependences &
+DependenceAnalysis::Result::recomputeDependences(
+  Dependences::AnalysisLevel Level) {
   D[Level].reset(new Dependences(S.getSharedIslCtx(), Level));
   D[Level]->calculateDependences(S);
   return *D[Level];
