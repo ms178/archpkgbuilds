@@ -29,7 +29,8 @@ cmake -G Ninja ${TOPLEV}/llvm-project/llvm \
     -DLLVM_DEFAULT_TARGET_TRIPLE="x86_64-pc-linux-gnu" \
     -DLLVM_USE_LINKER=lld \
     -DLLVM_USE_PERF=OFF \
-    -DLLVM_ENABLE_PROJECTS="clang;lld;bolt" \
+    -DLLVM_POLLY_LINK_INTO_TOOLS=ON \
+    -DLLVM_ENABLE_PROJECTS="clang;lld;bolt;polly" \
     -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
     -DLLVM_TARGETS_TO_BUILD="X86" \
     -D CMAKE_C_FLAGS="-O3 -march=native -mtune=native -fprofile-use=/home/marcus/Downloads/clang.profdata -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables" \

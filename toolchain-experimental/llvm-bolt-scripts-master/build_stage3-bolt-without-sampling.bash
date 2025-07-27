@@ -29,7 +29,7 @@ instrument_binary() {
 }
 
 # Instrument binaries
-instrument_binary "${CPATH}/clang-21"
+instrument_binary "${CPATH}/clang-22"
 instrument_binary "${CPATH}/lld"
 
 # Configure build
@@ -46,7 +46,7 @@ cmake -G Ninja ../llvm-project/llvm \
     -D CMAKE_SHARED_LINKER_FLAGS="-Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -march=native -mtune=native -fuse-ld=lld -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -Wl,--push-state -Wl,-whole-archive -lmimalloc -Wl,--pop-state -lpthread -lstdc++ -lm -ldl" \
     -DLLVM_VP_COUNTERS_PER_SITE=10 \
     -DCMAKE_AR="${CPATH}/llvm-ar" \
-    -DCMAKE_C_COMPILER="${CPATH}/clang-21" \
+    -DCMAKE_C_COMPILER="${CPATH}/clang-22" \
     -DCMAKE_CXX_COMPILER="${CPATH}/clang++" \
     -DLLVM_USE_LINKER="${CPATH}/ld.lld" \
     -DCMAKE_RANLIB="${CPATH}/llvm-ranlib" \
@@ -84,7 +84,7 @@ optimize_binary() {
 }
 
 # Optimize binaries
-optimize_binary "${CPATH}/clang-21"
+optimize_binary "${CPATH}/clang-22"
 optimize_binary "${CPATH}/lld"
 
 echo "Optimized binaries are ready at ${CPATH}"
