@@ -51,6 +51,10 @@
 #include "ixgbe_model.h"
 #include "ixgbe_txrx_common.h"
 
+static char *gaming_atr_ranges = "27000-27050,7777-7999,6112-6119,9960-9969,3074-3075,5000-5500,8393-8400";
+module_param(gaming_atr_ranges, charp, 0644);
+MODULE_PARM_DESC(gaming_atr_ranges, "Comma-separated UDP port ranges for gaming ATR (e.g., 27000-27050,7777-7999)");
+
 #define IXGBE_RX_PREFETCH_OFFSET 8
 #define IXGBE_TX_PREFETCH_OFFSET 8
 #ifndef IXGBE_SET_FLAG_FIXED
@@ -8859,6 +8863,70 @@ dma_err:
     return -1;
 }
 
+static void ixgbe_setup_gaming_atr(struct ixgbe_adapter *adapter) {
+    struct ixgbe_hw *hw = &adapter->hw;
+    char *ranges_copy;
+    char *token;
+    int total_ports = 0;
+    int idx = 0;
+    u16 soft_id = 0;  /* Incremental soft ID for FDIR to avoid collisions */
+    struct { u16 start; u16 end; } port_ranges[8];  /* Max 8 ranges to avoid FDIR exhaustion */
+
+    if (!gaming_atr_ranges || !*gaming_atr_ranges) {
+        return;  /* Disabled if empty */
+    }
+
+    /* Safe copy to prevent param modification (avoids UAF) */
+    ranges_copy = kstrdup(gaming_atr_ranges, GFP_KERNEL);
+    if (!ranges_copy) {
+        e_warn(drv, "Failed to allocate memory for gaming ATR ranges\n");
+        return;
+    }
+
+    spin_lock(&adapter->fdir_perfect_lock);  /* Lock for concurrent safety (e.g., module reload) */
+
+    /* Parse comma-separated ranges (e.g., "27000-27050,7777-7999") */
+    while ((token = strsep(&ranges_copy, ",")) && idx < ARRAY_SIZE(port_ranges)) {
+        char *dash = strchr(token, '-');
+        u16 start, end;
+        if (dash && !kstrtou16(token, 10, &start) && !kstrtou16(dash + 1, 10, &end) &&
+            start < end && start > 0 && end <= 65535) {  /* Safe parsing, bounds check */
+            port_ranges[idx].start = start;
+            port_ranges[idx].end = end;
+            total_ports += (end - start + 1);
+            if (total_ports > 512) {  /* Cap to prevent FDIR exhaustion on x540 (8192 limit) */
+                e_warn(drv, "Gaming ATR: Too many ports (%d), capping at 512\n", total_ports);
+                break;
+            }
+            idx++;
+        }
+    }
+
+    /* Program FDIR filters for UDP dst ports to low-latency queue (e.g., 0) */
+    for (int i = 0; i < idx; i++) {
+        for (u16 port = port_ranges[i].start; port <= port_ranges[i].end; port++) {
+            union ixgbe_atr_input atr_input = {0};
+            union ixgbe_atr_input mask = {0};
+
+            atr_input.formatted.dst_port = htons(port);  /* Big-endian for hw */
+            mask.formatted.dst_port = 0xFFFF;  /* Mask to match only dst_port */
+
+            /* IPv4 UDP */
+            atr_input.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV4;
+            ixgbe_atr_compute_perfect_hash_82599(&atr_input, &mask);
+            ixgbe_fdir_write_perfect_filter_82599(hw, &atr_input, soft_id++, 0 /* gaming queue */);
+
+            /* IPv6 UDP (for dual-stack games) */
+            atr_input.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV6;
+            ixgbe_atr_compute_perfect_hash_82599(&atr_input, &mask);
+            ixgbe_fdir_write_perfect_filter_82599(hw, &atr_input, soft_id++, 0 /* gaming queue */);
+        }
+    }
+
+    spin_unlock(&adapter->fdir_perfect_lock);
+    kfree(ranges_copy);  /* Safe free, no UAF */
+}
+
 static void ixgbe_atr(struct ixgbe_ring *ring,
                       struct ixgbe_tx_buffer *first) {
     struct ixgbe_q_vector *q_vector = ring->q_vector;
@@ -8946,6 +9014,7 @@ static void ixgbe_atr(struct ixgbe_ring *ring,
     }
 
     if (unlikely(l4_proto != IPPROTO_TCP)) {  /* Rare non-TCP in gaming */
+        /* Gaming extension: UDP handled at init via FDIR; skip here for perf */
         return;
     }
 
@@ -11240,6 +11309,17 @@ static void ixgbe_set_fw_version(struct ixgbe_adapter *adapter)
  * ixgbe_probe initializes an adapter identified by a pci_dev structure.
  * The OS initialization, configuring of the adapter private structure,
  * and a hardware reset occur.
+ */
+/**
+ * ixgbe_probe - Device Initialization Routine
+ * @pdev: PCI device information struct
+ * @ent: entry in ixgbe_pci_tbl
+ *
+ * Returns 0 on success, negative on failure
+ *
+ * ixgbe_probe initializes an adapter identified by a pci_dev structure.
+ * The OS initialization, configuring of the adapter private structure,
+ * and a hardware reset occur.
  **/
 static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
@@ -11706,6 +11786,8 @@ skip_sriov:
 		goto err_netdev;
 
 	return 0;
+
+ixgbe_setup_gaming_atr(adapter);
 
 err_netdev:
 	unregister_netdev(netdev);
