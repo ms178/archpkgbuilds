@@ -604,28 +604,30 @@ namespace aco {
             bool
             can_use_opsel(amd_gfx_level gfx_level, aco_opcode op, int idx)
             {
-                  if (static_cast<uint16_t>(instr_info.format[static_cast<int>(op)]) & static_cast<uint16_t>(Format::VOP3P)) {
+                  /* VOP3P is the packed math encoding; it has its own dedicated fields for neg/opsel
+                   * and is not subject to this logic, which is for promoting other VALU ops to the VOP3A encoding. */
+                  if (static_cast<uint16_t>(instr_info.format[static_cast<int>(op)]) & static_cast<uint16_t>(Format::VOP3P))
                         return false;
-                  }
 
-                  /* Opsel is a GFX9+ feature. GFX11 has its own logic handled by get_gfx11_true16_mask. */
+                  /* Opsel (in this context) is a GFX9/GFX10 feature. GFX11 has its own separate logic. */
                   if (gfx_level == GFX11) {
                         return get_gfx11_true16_mask(op) & BITFIELD_BIT(idx == -1 ? 3 : idx);
                   } else if (gfx_level < GFX9) {
                         return false;
                   }
 
-                  // Idea 1: Use bitmasks for common GFX9 cases (branchless, Vega-tuned)
-                  constexpr uint32_t opsel_mask_all = BITFIELD_MASK(3); // src0-2
-                  constexpr uint32_t opsel_mask_src01 = BITFIELD_MASK(2); // src0-1
-                  constexpr uint32_t opsel_mask_src0 = BITFIELD_BIT(0); // src0
-                  constexpr uint32_t opsel_mask_dst = BITFIELD_BIT(3); // dst (-1)
+                  // Map destination index (-1) to bit 3 for consistent mask checking.
+                  if (idx < 0)
+                        idx = 3;
 
-                  if (idx < 0) idx = 3; // Map dst to bit 3 for mask checks
+                  // Bitmasks for operand positions.
+                  constexpr uint32_t opsel_mask_src_all = BITFIELD_BIT(0) | BITFIELD_BIT(1) | BITFIELD_BIT(2);
+                  constexpr uint32_t opsel_mask_src01 = BITFIELD_BIT(0) | BITFIELD_BIT(1);
+                  constexpr uint32_t opsel_mask_dst = BITFIELD_BIT(3);
 
                   switch (op) {
-                        /* Common VOP3A 16-bit instructions (all support opsel on Vega) */
-                        case aco_opcode::v_div_fixup_f16:
+                        /* == Group 1: Three-source 16-bit VOP3A instructions == */
+                        /* These instructions natively support opsel on all three sources. */
                         case aco_opcode::v_fma_f16:
                         case aco_opcode::v_mad_f16:
                         case aco_opcode::v_mad_u16:
@@ -639,65 +641,54 @@ namespace aco {
                         case aco_opcode::v_max3_f16:
                         case aco_opcode::v_max3_i16:
                         case aco_opcode::v_max3_u16:
-                        case aco_opcode::v_minmax_f16:
-                        case aco_opcode::v_maxmin_f16:
-                        case aco_opcode::v_max_u16_e64:
-                        case aco_opcode::v_max_i16_e64:
-                        case aco_opcode::v_min_u16_e64:
-                        case aco_opcode::v_min_i16_e64:
-                        case aco_opcode::v_add_i16:
-                        case aco_opcode::v_sub_i16:
-                        case aco_opcode::v_add_u16_e64:
-                        case aco_opcode::v_sub_u16_e64:
-                        case aco_opcode::v_lshlrev_b16_e64:
-                        case aco_opcode::v_lshrrev_b16_e64:
-                        case aco_opcode::v_ashrrev_i16_e64:
-                        case aco_opcode::v_and_b16:
-                        case aco_opcode::v_or_b16:
-                        case aco_opcode::v_xor_b16:
-                        case aco_opcode::v_mul_lo_u16_e64:
-                              return (opsel_mask_all & BITFIELD_BIT(idx)) != 0; // All operands support opsel
+                        case aco_opcode::v_fma_legacy_f16:
+                        case aco_opcode::v_mad_legacy_f16:
+                        case aco_opcode::v_mad_legacy_i16:
+                        case aco_opcode::v_mad_legacy_u16:
+                        case aco_opcode::v_div_fixup_legacy_f16:
+                        case aco_opcode::v_div_fixup_f16:
+                              return (opsel_mask_src_all & BITFIELD_BIT(idx));
 
-                              /* Instructions with specific operand restrictions */
-                              case aco_opcode::v_pack_b32_f16:
-                              case aco_opcode::v_cvt_pknorm_i16_f16:
-                              case aco_opcode::v_cvt_pknorm_u16_f16:
-                                    return (idx >= 0 && idx < 3) && (opsel_mask_all & BITFIELD_BIT(idx)) != 0; /* All source operands support opsel, but not the whole instruction */
-                              case aco_opcode::v_mad_u32_u16:
-                              case aco_opcode::v_mad_i32_i16:
-                                    return (idx >= 0 && idx < 2) && (opsel_mask_src01 & BITFIELD_BIT(idx)) != 0; /* src0 and src1 */
-                              case aco_opcode::v_dot2_f16_f16:
-                              case aco_opcode::v_dot2_bf16_bf16:
-                                    return (idx == -1 || idx == 2) && (opsel_mask_dst | BITFIELD_BIT(2)) & BITFIELD_BIT(idx); /* acc (dst) and src2 */
-                              case aco_opcode::v_cndmask_b16:
-                                    return idx != 2 && (opsel_mask_src01 & BITFIELD_BIT(idx)) != 0; /* src0 and src1 */
-                              case aco_opcode::v_interp_p10_f16_f32_inreg:
-                              case aco_opcode::v_interp_p10_rtz_f16_f32_inreg:
-                                    return (idx == 0 || idx == 2) && (opsel_mask_src0 | BITFIELD_BIT(2)) & BITFIELD_BIT(idx); /* src0 and src2 */
-                              case aco_opcode::v_interp_p2_f16_f32_inreg:
-                              case aco_opcode::v_interp_p2_rtz_f16_f32_inreg:
-                                    return (idx == -1 || idx == 0) && (opsel_mask_dst | opsel_mask_src0) & BITFIELD_BIT(idx); /* dst and src0 */
-                              case aco_opcode::v_cvt_pk_fp8_f32:
-                              case aco_opcode::p_v_cvt_pk_fp8_f32_ovfl:
-                              case aco_opcode::v_cvt_pk_bf8_f32:
-                                    return idx == -1 && (opsel_mask_dst & BITFIELD_BIT(idx)) != 0; /* Only dst */
+                              /* == Group 2: Two-source 16-bit VOP3A-promotable instructions == */
+                              /* These are typically VOP2 but can use VOP3A. All sources support opsel. */
+                              case aco_opcode::v_add_i16:
+                              case aco_opcode::v_sub_i16:
+                              case aco_opcode::v_add_u16_e64:
+                              case aco_opcode::v_sub_u16_e64:
+                              case aco_opcode::v_mul_lo_u16_e64:
+                              case aco_opcode::v_min_i16_e64:
+                              case aco_opcode::v_min_u16_e64:
+                              case aco_opcode::v_max_i16_e64:
+                              case aco_opcode::v_max_u16_e64:
+                              case aco_opcode::v_lshlrev_b16_e64:
+                              case aco_opcode::v_lshrrev_b16_e64:
+                              case aco_opcode::v_ashrrev_i16_e64:
+                              case aco_opcode::v_and_b16:
+                              case aco_opcode::v_or_b16:
+                              case aco_opcode::v_xor_b16:
+                              case aco_opcode::v_minmax_f16:
+                              case aco_opcode::v_maxmin_f16:
+                                    return (opsel_mask_src01 & BITFIELD_BIT(idx));
 
-                                    /* ISA-documented VOP3A instructions on Vega that support opsel */
-                                    case aco_opcode::v_alignbit_b32:
-                                    case aco_opcode::v_alignbyte_b32:
-                                          return (idx >= 0 && idx < 2) && (opsel_mask_src01 & BITFIELD_BIT(idx)) != 0; /* src0 and src1 */
-                                    case aco_opcode::v_interp_p2_f16:
-                                          return idx == 0 && (opsel_mask_src0 & BITFIELD_BIT(idx)) != 0; /* src0 only */
-                                    case aco_opcode::v_mad_legacy_f16:
-                                    case aco_opcode::v_mad_legacy_i16:
-                                    case aco_opcode::v_mad_legacy_u16:
-                                    case aco_opcode::v_fma_legacy_f16:
-                                    case aco_opcode::v_div_fixup_legacy_f16:
-                                          return (idx >= 0 && idx < 3) && (opsel_mask_all & BITFIELD_BIT(idx)) != 0; /* src0, src1, and src2 */
+                                    /* == Group 3: Instructions with special/restricted opsel support == */
+                                    case aco_opcode::v_mad_u32_u16:
+                                    case aco_opcode::v_mad_i32_i16:
+                                          return (opsel_mask_src01 & BITFIELD_BIT(idx)); // Only the 16-bit sources (src0, src1)
+                                    case aco_opcode::v_cvt_pknorm_i16_f16:
+                                    case aco_opcode::v_cvt_pknorm_u16_f16:
+                                          return idx < 3; // All source operands, but not dst
+                                    case aco_opcode::v_dot2_f16_f16:
+                                    case aco_opcode::v_dot2_bf16_bf16:
+                                          return (BITFIELD_BIT(2) | opsel_mask_dst) & BITFIELD_BIT(idx); // src2 and dst (accumulator)
 
-                                    default:
-                                          /* If not explicitly listed, it does not support opsel on GFX9. */
-                                          return false;
+                                          /* v_interp_p2_f16 can use opsel on dst, src0(attr), and src2(I/J) on Vega.
+                                           * This is essential for the interp+extract fusion. */
+                                          case aco_opcode::v_interp_p2_f16:
+                                                return (BITFIELD_BIT(0) | BITFIELD_BIT(2) | opsel_mask_dst) & BITFIELD_BIT(idx);
+
+                                          default:
+                                                /* If not explicitly listed, assume it does not support VOP3A promotion for opsel. */
+                                                return false;
                   }
             }
 
@@ -976,7 +967,7 @@ namespace aco {
                         case fmax16: return 0xfc00u;                /* negative infinity */
                         case fmax32: return 0xff800000u;            /* negative infinity */
                         case fmax64: return idx ? 0xfff00000u : 0u; /* negative infinity */
-                        default: unreachable("Invalid reduction operation"); break;
+                        default: UNREACHABLE("Invalid reduction operation"); break;
                   }
                   return 0;
             }
@@ -1658,16 +1649,18 @@ namespace aco {
                         instr->opcode == aco_opcode::s_fmac_f16) {
                         ops.push_back(2);
                         } else if (instr->opcode == aco_opcode::s_addk_i32 || instr->opcode == aco_opcode::s_mulk_i32 ||
-                              instr->opcode == aco_opcode::s_cmovk_i32 ||
-                              instr->opcode == aco_opcode::ds_bvh_stack_push4_pop1_rtn_b32) {
+                              instr->opcode == aco_opcode::s_cmovk_i32) {
+                              /* These SOPK instructions have an implicit source operand which is the same as the destination. */
                               ops.push_back(0);
                               } else if (instr->isMUBUF() && instr->definitions.size() == 1 && instr->operands.size() == 4) {
+                                    /* MUBUF atomic instructions with a return value have the data source/destination tied. */
                                     ops.push_back(3);
                               } else if (instr->isMIMG() && instr->definitions.size() == 1 &&
                                     !instr->operands[2].isUndefined()) {
+                                    /* MIMG atomic instructions with a return value have the data source/destination tied. */
                                     ops.push_back(2);
                                     } else if (instr->opcode == aco_opcode::image_bvh8_intersect_ray) {
-                                          /* VADDR starts at 3. */
+                                          /* VADDR for this RT instruction has tied operands */
                                           ops.push_back(3 + 4);
                                           ops.push_back(3 + 7);
                                     }
