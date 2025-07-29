@@ -604,91 +604,124 @@ namespace aco {
             bool
             can_use_opsel(amd_gfx_level gfx_level, aco_opcode op, int idx)
             {
-                  /* VOP3P is the packed math encoding; it has its own dedicated fields for neg/opsel
-                   * and is not subject to this logic, which is for promoting other VALU ops to the VOP3A encoding. */
-                  if (static_cast<uint16_t>(instr_info.format[static_cast<int>(op)]) & static_cast<uint16_t>(Format::VOP3P))
-                        return false;
+            /*
+            * This function determines if a VALU instruction can be promoted to the 64-bit VOP3A
+            * encoding to gain access to the 16-bit operand selection feature ("opsel").
+            * This is a GFX9 and GFX10 feature.
+            */
 
-                  /* Opsel (in this context) is a GFX9/GFX10 feature. GFX11 has its own separate logic. */
-                  if (gfx_level == GFX11) {
-                        return get_gfx11_true16_mask(op) & BITFIELD_BIT(idx == -1 ? 3 : idx);
-                  } else if (gfx_level < GFX9) {
-                        return false;
-                  }
+            /* GFX11 has a completely different encoding ("true 16-bit") for this functionality. */
+            if (gfx_level >= GFX11) {
+                  return get_gfx11_true16_mask(op) & BITFIELD_BIT(idx == -1 ? 3 : idx);
+            }
 
-                  // Map destination index (-1) to bit 3 for consistent mask checking.
-                  if (idx < 0)
-                        idx = 3;
+            /* This feature does not exist on GFX8 and older. */
+            if (gfx_level < GFX9) {
+                  return false;
+            }
 
-                  // Bitmasks for operand positions.
-                  constexpr uint32_t opsel_mask_src_all = BITFIELD_BIT(0) | BITFIELD_BIT(1) | BITFIELD_BIT(2);
-                  constexpr uint32_t opsel_mask_src01 = BITFIELD_BIT(0) | BITFIELD_BIT(1);
-                  constexpr uint32_t opsel_mask_dst = BITFIELD_BIT(3);
+            /* VOP3P is the "packed math" encoding. It has its own dedicated fields for 16-bit
+            * operations and is NOT promoted to VOP3A. Therefore, this logic does not apply.
+            * See Vega ISA Reference Guide, Section 13.3.6. */
+            if (static_cast<uint16_t>(instr_info.format[static_cast<int>(op)]) & static_cast<uint16_t>(Format::VOP3P))
+                  return false;
 
-                  switch (op) {
-                        /* == Group 1: Three-source 16-bit VOP3A instructions == */
-                        /* These instructions natively support opsel on all three sources. */
-                        case aco_opcode::v_fma_f16:
-                        case aco_opcode::v_mad_f16:
-                        case aco_opcode::v_mad_u16:
-                        case aco_opcode::v_mad_i16:
-                        case aco_opcode::v_med3_f16:
-                        case aco_opcode::v_med3_i16:
-                        case aco_opcode::v_med3_u16:
-                        case aco_opcode::v_min3_f16:
-                        case aco_opcode::v_min3_i16:
-                        case aco_opcode::v_min3_u16:
-                        case aco_opcode::v_max3_f16:
-                        case aco_opcode::v_max3_i16:
-                        case aco_opcode::v_max3_u16:
-                        case aco_opcode::v_fma_legacy_f16:
-                        case aco_opcode::v_mad_legacy_f16:
-                        case aco_opcode::v_mad_legacy_i16:
-                        case aco_opcode::v_mad_legacy_u16:
-                        case aco_opcode::v_div_fixup_legacy_f16:
-                        case aco_opcode::v_div_fixup_f16:
-                              return (opsel_mask_src_all & BITFIELD_BIT(idx));
+            /* Map destination index (-1) to bit 3 for consistent mask checking, matching the VOP3A encoding. */
+            int check_idx = (idx < 0) ? 3 : idx;
 
-                              /* == Group 2: Two-source 16-bit VOP3A-promotable instructions == */
-                              /* These are typically VOP2 but can use VOP3A. All sources support opsel. */
-                              case aco_opcode::v_add_i16:
-                              case aco_opcode::v_sub_i16:
-                              case aco_opcode::v_add_u16_e64:
-                              case aco_opcode::v_sub_u16_e64:
-                              case aco_opcode::v_mul_lo_u16_e64:
-                              case aco_opcode::v_min_i16_e64:
-                              case aco_opcode::v_min_u16_e64:
-                              case aco_opcode::v_max_i16_e64:
-                              case aco_opcode::v_max_u16_e64:
-                              case aco_opcode::v_lshlrev_b16_e64:
-                              case aco_opcode::v_lshrrev_b16_e64:
-                              case aco_opcode::v_ashrrev_i16_e64:
-                              case aco_opcode::v_and_b16:
-                              case aco_opcode::v_or_b16:
-                              case aco_opcode::v_xor_b16:
-                              case aco_opcode::v_minmax_f16:
-                              case aco_opcode::v_maxmin_f16:
-                                    return (opsel_mask_src01 & BITFIELD_BIT(idx));
+            switch (op) {
+            /*
+            * Group 1: Native VOP3A 16-bit Instructions (See Vega ISA, Section 12.12)
+            * These are natively 3-input, 16-bit operations on GFX9 and can always use opsel on sources.
+            */
+            case aco_opcode::v_fma_f16:
+            case aco_opcode::v_mad_f16:
+            case aco_opcode::v_mad_u16:
+            case aco_opcode::v_mad_i16:
+            case aco_opcode::v_med3_f16:
+            case aco_opcode::v_med3_i16:
+            case aco_opcode::v_med3_u16:
+            case aco_opcode::v_min3_f16:
+            case aco_opcode::v_min3_i16:
+            case aco_opcode::v_min3_u16:
+            case aco_opcode::v_max3_f16:
+            case aco_opcode::v_max3_i16:
+            case aco_opcode::v_max3_u16:
+            /* Legacy ops are VOP3-only on GFX8, but VOP3A on GFX9. */
+            case aco_opcode::v_fma_legacy_f16:
+            case aco_opcode::v_mad_legacy_f16:
+            case aco_opcode::v_mad_legacy_i16:
+            case aco_opcode::v_mad_legacy_u16:
+            case aco_opcode::v_div_fixup_legacy_f16:
+            case aco_opcode::v_div_fixup_f16:
+                  return check_idx < 3; /* Sources 0, 1, 2 are valid. */
 
-                                    /* == Group 3: Instructions with special/restricted opsel support == */
-                                    case aco_opcode::v_mad_u32_u16:
-                                    case aco_opcode::v_mad_i32_i16:
-                                          return (opsel_mask_src01 & BITFIELD_BIT(idx)); // Only the 16-bit sources (src0, src1)
-                                    case aco_opcode::v_cvt_pknorm_i16_f16:
-                                    case aco_opcode::v_cvt_pknorm_u16_f16:
-                                          return idx < 3; // All source operands, but not dst
-                                    case aco_opcode::v_dot2_f16_f16:
-                                    case aco_opcode::v_dot2_bf16_bf16:
-                                          return (BITFIELD_BIT(2) | opsel_mask_dst) & BITFIELD_BIT(idx); // src2 and dst (accumulator)
+            /*
+            * Group 2: VOP1/VOP2 Instructions Promotable to VOP3A on GFX9/GFX10
+            * This is the key architectural capability. Any 16-bit VOP1/VOP2 can use the VOP3A
+            * encoding to gain access to modifiers, including opsel. This list is exhaustive for GFX9.
+            */
+            case aco_opcode::v_mac_f16: /* 3-source VOP2, promotable */
+            case aco_opcode::v_add_f16:
+            case aco_opcode::v_sub_f16:
+            case aco_opcode::v_subrev_f16:
+            case aco_opcode::v_mul_f16:
+            case aco_opcode::v_max_f16:
+            case aco_opcode::v_min_f16:
+            case aco_opcode::v_ldexp_f16:
+            case aco_opcode::v_add_u16:
+            case aco_opcode::v_sub_u16:
+            case aco_opcode::v_subrev_u16:
+            case aco_opcode::v_mul_lo_u16:
+            case aco_opcode::v_lshlrev_b16:
+            case aco_opcode::v_lshrrev_b16:
+            case aco_opcode::v_ashrrev_i16:
+            case aco_opcode::v_max_u16:
+            case aco_opcode::v_max_i16:
+            case aco_opcode::v_min_u16:
+            case aco_opcode::v_min_i16:
+            /* The following opcodes are suffixed with _e64 in aco_opcodes.py for GFX9 compatibility */
+            case aco_opcode::v_add_i16:
+            case aco_opcode::v_sub_i16:
+            case aco_opcode::v_add_u16_e64:
+            case aco_opcode::v_sub_u16_e64:
+            case aco_opcode::v_mul_lo_u16_e64:
+            case aco_opcode::v_min_i16_e64:
+            case aco_opcode::v_min_u16_e64:
+            case aco_opcode::v_max_i16_e64:
+            case aco_opcode::v_max_u16_e64:
+            case aco_opcode::v_lshlrev_b16_e64:
+            case aco_opcode::v_lshrrev_b16_e64:
+            case aco_opcode::v_ashrrev_i16_e64:
+            case aco_opcode::v_and_b16:
+            case aco_opcode::v_or_b16:
+            case aco_opcode::v_xor_b16:
+            case aco_opcode::v_minmax_f16:
+            case aco_opcode::v_maxmin_f16:
+                  return check_idx < (op == aco_opcode::v_mac_f16 ? 3 : 2);
 
-                                          /* v_interp_p2_f16 can use opsel on dst, src0(attr), and src2(I/J) on Vega.
-                                           * This is essential for the interp+extract fusion. */
-                                          case aco_opcode::v_interp_p2_f16:
-                                                return (BITFIELD_BIT(0) | BITFIELD_BIT(2) | opsel_mask_dst) & BITFIELD_BIT(idx);
+            /*
+            * Group 3: Instructions with Special or Restricted Opsel Support
+            */
+            case aco_opcode::v_mad_u32_u16:
+            case aco_opcode::v_mad_i32_i16:
+                  return check_idx < 2; /* Only the 16-bit sources (src0, src1). */
+            case aco_opcode::v_cvt_pknorm_i16_f16:
+            case aco_opcode::v_cvt_pknorm_u16_f16:
+                  return check_idx < 3; /* All source operands, but not dst. */
+            case aco_opcode::v_dot2_f16_f16:
+            case aco_opcode::v_dot2_bf16_bf16:
+                  return check_idx == 2 || check_idx == 3; /* src2 (accumulator in) and dst (accumulator out). */
 
-                                          default:
-                                                /* If not explicitly listed, assume it does not support VOP3A promotion for opsel. */
-                                                return false;
+            /* v_interp_p2_f16 is critical for graphics. It can use opsel on the destination
+            * to fuse a subsequent p_extract of the high 16 bits, which is a common pattern.
+            * It can also use opsel on its attribute (src0) and barycentric (src2) inputs. */
+            case aco_opcode::v_interp_p2_f16:
+                  return check_idx == 0 || check_idx == 2 || check_idx == 3;
+
+            default:
+                  /* If an instruction is not explicitly listed, it does not support VOP3A promotion for opsel. */
+                  return false;
                   }
             }
 
