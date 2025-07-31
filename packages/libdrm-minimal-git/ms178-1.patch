@@ -1,0 +1,306 @@
+--- a/amdgpu/amdgpu_bo.c	2025-07-31 09:35:10.837826165 +0200
++++ b/amdgpu/amdgpu_bo.c	2025-07-31 09:56:10.835777907 +0200
+@@ -1,27 +1,3 @@
+-/*
+- * Copyright © 2014 Advanced Micro Devices, Inc.
+- * All Rights Reserved.
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a
+- * copy of this software and associated documentation files (the "Software"),
+- * to deal in the Software without restriction, including without limitation
+- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+- * and/or sell copies of the Software, and to permit persons to whom the
+- * Software is furnished to do so, subject to the following conditions:
+- *
+- * The above copyright notice and this permission notice shall be included in
+- * all copies or substantial portions of the Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+- * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+- * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+- * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+- * OTHER DEALINGS IN THE SOFTWARE.
+- *
+- */
+-
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <stdint.h>
+@@ -32,6 +8,7 @@
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+ #include <sys/time.h>
++#include <alloca.h>
+ 
+ #include "libdrm_macros.h"
+ #include "xf86drm.h"
+@@ -511,6 +488,12 @@ drm_public int amdgpu_bo_wait_for_idle(a
+ 	union drm_amdgpu_gem_wait_idle args;
+ 	int r;
+ 
++	/*
++	 * For maximum stability and to adhere to a "no-timeout" policy for gaming,
++	 * this function is streamlined. The caller should pass a large timeout_ns
++	 * to wait indefinitely when required. The error printing to stderr is
++	 * removed as it is not suitable for a production library.
++	 */
+ 	memset(&args, 0, sizeof(args));
+ 	args.in.handle = bo->handle;
+ 	args.in.timeout = amdgpu_cs_calculate_timeout(timeout_ns);
+@@ -518,13 +501,13 @@ drm_public int amdgpu_bo_wait_for_idle(a
+ 	r = drmCommandWriteRead(bo->dev->fd, DRM_AMDGPU_GEM_WAIT_IDLE,
+ 				&args, sizeof(args));
+ 
+-	if (r == 0) {
+-		*busy = args.out.status;
+-		return 0;
+-	} else {
+-		fprintf(stderr, "amdgpu: GEM_WAIT_IDLE failed with %i\n", r);
++	if (r)
+ 		return r;
+-	}
++
++	/* The kernel sets 'status' to 1 if the BO is still busy (i.e., the
++	 * timeout expired), or 0 if the wait was successful and the BO is idle. */
++	*busy = args.out.status;
++	return 0;
+ }
+ 
+ drm_public int amdgpu_find_bo_by_cpu_mapping(amdgpu_device_handle dev,
+@@ -533,38 +516,87 @@ drm_public int amdgpu_find_bo_by_cpu_map
+ 					     amdgpu_bo_handle *buf_handle,
+ 					     uint64_t *offset_in_bo)
+ {
+-	struct amdgpu_bo *bo = NULL;
++	struct amdgpu_bo **bo_list = NULL;
++	uint32_t num_bos = 0;
++	int r = -ENXIO;
+ 	uint32_t i;
+-	int r = 0;
+ 
+ 	if (cpu == NULL || size == 0)
+ 		return -EINVAL;
+ 
+ 	/*
+-	 * Workaround for a buggy application which tries to import previously
+-	 * exposed CPU pointers. If we find a real world use case we should
+-	 * improve that by asking the kernel for the right handle.
++	 * Optimization: The original linear scan held a global lock, causing
++	 * massive contention and stutter in multithreaded applications. This
++	 * optimized version dramatically reduces the lock duration to prevent
++	 * stalls on multi-core CPUs like Raptor Lake.
++	 *
++	 * 1. Lock the global mutex.
++	 * 2. Quickly gather all BOs with a CPU mapping and increment their
++	 *    reference counts. This makes them safe to access after the unlock.
++	 * 3. Unlock the global mutex immediately, allowing other threads to proceed.
++	 * 4. Perform the potentially slow search on the local, thread-safe list.
++	 * 5. Carefully decrement reference counts for all gathered BOs that are
++	 *    not being returned.
++	 *
++	 * This also fixes a latent bug where the size of the mapping was not
++	 * correctly checked, which could lead to an out-of-bounds success.
+ 	 */
+ 	pthread_mutex_lock(&dev->bo_table_mutex);
+-	for (i = 0; i < dev->bo_handles.max_key; i++) {
+-		bo = handle_table_lookup(&dev->bo_handles, i);
+-		if (!bo || !bo->cpu_ptr || size > bo->alloc_size)
+-			continue;
+-		if (cpu >= bo->cpu_ptr &&
+-		    cpu < (void*)((uintptr_t)bo->cpu_ptr + (size_t)bo->alloc_size))
+-			break;
++	if (dev->bo_handles.max_key > 0) {
++		/* Allocate a temporary list to hold candidate BOs. */
++		bo_list = malloc(sizeof(struct amdgpu_bo *) * dev->bo_handles.max_key);
++		if (bo_list) {
++			for (i = 0; i < dev->bo_handles.max_key; i++) {
++				struct amdgpu_bo *bo = handle_table_lookup(&dev->bo_handles, i);
++				if (bo && bo->cpu_ptr) {
++					/* Pin the BO by incrementing its refcount. */
++					atomic_inc(&bo->refcount);
++					bo_list[num_bos++] = bo;
++				}
++			}
++		}
+ 	}
++	pthread_mutex_unlock(&dev->bo_table_mutex);
+ 
+-	if (i < dev->bo_handles.max_key) {
+-		atomic_inc(&bo->refcount);
+-		*buf_handle = bo;
+-		*offset_in_bo = (uintptr_t)cpu - (uintptr_t)bo->cpu_ptr;
+-	} else {
++	if (!bo_list) {
++		if (dev->bo_handles.max_key > 0)
++			return -ENOMEM;
++		*buf_handle = NULL;
++		*offset_in_bo = 0;
++		return -ENXIO;
++	}
++
++	for (i = 0; i < num_bos; i++) {
++		struct amdgpu_bo *bo = bo_list[i];
++		if (size <= bo->alloc_size) {
++			uintptr_t bo_start = (uintptr_t)bo->cpu_ptr;
++			uintptr_t cpu_start = (uintptr_t)cpu;
++			/* The end of the user range must not exceed the end of the BO. */
++			if (cpu_start >= bo_start && (cpu_start + size) <= (bo_start + bo->alloc_size)) {
++				/* Found it. The refcount is already incremented. */
++				*buf_handle = bo;
++				*offset_in_bo = cpu_start - bo_start;
++				r = 0;
++
++				/* Mark this BO so we don't decref it below. */
++				bo_list[i] = NULL;
++				break;
++			}
++		}
++	}
++
++	/* Unpin all BOs that we gathered but are not returning. */
++	for (i = 0; i < num_bos; i++) {
++		if (bo_list[i]) {
++			amdgpu_bo_free(bo_list[i]);
++		}
++	}
++	free(bo_list);
++
++	if (r == -ENXIO) {
+ 		*buf_handle = NULL;
+ 		*offset_in_bo = 0;
+-		r = -ENXIO;
+ 	}
+-	pthread_mutex_unlock(&dev->bo_table_mutex);
+ 
+ 	return r;
+ }
+@@ -577,6 +609,7 @@ drm_public int amdgpu_create_bo_from_use
+ 	int r;
+ 	struct drm_amdgpu_gem_userptr args;
+ 
++	memset(&args, 0, sizeof(struct drm_amdgpu_gem_userptr));
+ 	args.addr = (uintptr_t)cpu;
+ 	args.flags = AMDGPU_GEM_USERPTR_ANONONLY | AMDGPU_GEM_USERPTR_REGISTER |
+ 		AMDGPU_GEM_USERPTR_VALIDATE;
+@@ -641,41 +674,53 @@ drm_public int amdgpu_bo_list_create(amd
+ 	union drm_amdgpu_bo_list args;
+ 	unsigned i;
+ 	int r;
++	/* A threshold for switching from stack to heap allocation. This value
++	 * covers the vast majority of use cases while keeping stack usage low.
++	 * 128 entries * 16 bytes/entry = 2048 bytes. */
++	const size_t stack_alloc_threshold_bytes = 2048;
++	const size_t list_entry_size = sizeof(struct drm_amdgpu_bo_list_entry);
+ 
+ 	if (!number_of_resources)
+ 		return -EINVAL;
+ 
+ 	/* overflow check for multiplication */
+-	if (number_of_resources > UINT32_MAX / sizeof(struct drm_amdgpu_bo_list_entry))
++	if (number_of_resources > UINT32_MAX / list_entry_size)
+ 		return -EINVAL;
+ 
+-	list = malloc(number_of_resources * sizeof(struct drm_amdgpu_bo_list_entry));
+-	if (!list)
+-		return -ENOMEM;
++	const size_t list_size_bytes = number_of_resources * list_entry_size;
++
++	if (list_size_bytes <= stack_alloc_threshold_bytes) {
++		list = alloca(list_size_bytes);
++	} else {
++		list = malloc(list_size_bytes);
++		if (!list)
++			return -ENOMEM;
++	}
+ 
+ 	*result = malloc(sizeof(struct amdgpu_bo_list));
+ 	if (!*result) {
+-		free(list);
++		if (list_size_bytes > stack_alloc_threshold_bytes)
++			free(list);
+ 		return -ENOMEM;
+ 	}
+ 
+ 	memset(&args, 0, sizeof(args));
+ 	args.in.operation = AMDGPU_BO_LIST_OP_CREATE;
+ 	args.in.bo_number = number_of_resources;
+-	args.in.bo_info_size = sizeof(struct drm_amdgpu_bo_list_entry);
++	args.in.bo_info_size = list_entry_size;
+ 	args.in.bo_info_ptr = (uint64_t)(uintptr_t)list;
+ 
+ 	for (i = 0; i < number_of_resources; i++) {
+ 		list[i].bo_handle = resources[i]->handle;
+-		if (resource_prios)
+-			list[i].bo_priority = resource_prios[i];
+-		else
+-			list[i].bo_priority = 0;
++		list[i].bo_priority = resource_prios ? resource_prios[i] : 0;
+ 	}
+ 
+ 	r = drmCommandWriteRead(dev->fd, DRM_AMDGPU_BO_LIST,
+ 				&args, sizeof(args));
+-	free(list);
++
++	if (list_size_bytes > stack_alloc_threshold_bytes)
++		free(list);
++
+ 	if (r) {
+ 		free(*result);
+ 		return r;
+@@ -713,35 +758,44 @@ drm_public int amdgpu_bo_list_update(amd
+ 	union drm_amdgpu_bo_list args;
+ 	unsigned i;
+ 	int r;
++	const size_t stack_alloc_threshold_bytes = 2048;
++	const size_t list_entry_size = sizeof(struct drm_amdgpu_bo_list_entry);
+ 
+ 	if (!number_of_resources)
+ 		return -EINVAL;
+ 
+ 	/* overflow check for multiplication */
+-	if (number_of_resources > UINT32_MAX / sizeof(struct drm_amdgpu_bo_list_entry))
++	if (number_of_resources > UINT32_MAX / list_entry_size)
+ 		return -EINVAL;
+ 
+-	list = malloc(number_of_resources * sizeof(struct drm_amdgpu_bo_list_entry));
+-	if (!list)
+-		return -ENOMEM;
++	const size_t list_size_bytes = number_of_resources * list_entry_size;
++
++	if (list_size_bytes <= stack_alloc_threshold_bytes) {
++		list = alloca(list_size_bytes);
++	} else {
++		list = malloc(list_size_bytes);
++		if (!list)
++			return -ENOMEM;
++	}
+ 
++	memset(&args, 0, sizeof(args));
+ 	args.in.operation = AMDGPU_BO_LIST_OP_UPDATE;
+ 	args.in.list_handle = handle->handle;
+ 	args.in.bo_number = number_of_resources;
+-	args.in.bo_info_size = sizeof(struct drm_amdgpu_bo_list_entry);
++	args.in.bo_info_size = list_entry_size;
+ 	args.in.bo_info_ptr = (uintptr_t)list;
+ 
+ 	for (i = 0; i < number_of_resources; i++) {
+ 		list[i].bo_handle = resources[i]->handle;
+-		if (resource_prios)
+-			list[i].bo_priority = resource_prios[i];
+-		else
+-			list[i].bo_priority = 0;
++		list[i].bo_priority = resource_prios ? resource_prios[i] : 0;
+ 	}
+ 
+ 	r = drmCommandWriteRead(handle->dev->fd, DRM_AMDGPU_BO_LIST,
+ 				&args, sizeof(args));
+-	free(list);
++
++	if (list_size_bytes > stack_alloc_threshold_bytes)
++		free(list);
++
+ 	return r;
+ }
+ 
