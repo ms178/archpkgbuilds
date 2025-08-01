@@ -507,6 +507,65 @@ drm_get_buddy(struct drm_buddy_block *block)
 EXPORT_SYMBOL(drm_get_buddy);
 
 /**
+ * drm_buddy_reset_clear - reset blocks clear state
+ *
+ * @mm: DRM buddy manager
+ * @is_clear: blocks clear state
+ *
+ * Reset the clear state based on @is_clear value for each block
+ * in the freelist. This is the correctly ported version for modern kernels
+ * using Red-Black Trees, with an added optimization to perform a bulk update
+ * of the clear_avail counter for improved efficiency.
+ */
+void drm_buddy_reset_clear(struct drm_buddy *mm, bool is_clear)
+{
+	u64 root_size, size, start;
+	unsigned int order;
+	int i;
+
+	size = mm->size;
+	for (i = 0; i < mm->n_roots; ++i) {
+		order = ilog2(size) - ilog2(mm->chunk_size);
+		start = drm_buddy_block_offset(mm->roots[i]);
+		__force_merge(mm, start, start + size, order);
+
+		root_size = mm->chunk_size << order;
+		size -= root_size;
+	}
+
+	if (is_clear) {
+
+		for (i = 0; i <= mm->max_order; ++i) {
+			struct rb_root *root = __get_root(mm, i, DIRTY_TREE);
+			struct drm_buddy_block *block, *n;
+
+			for_each_rb_entry_reverse_safe(block, n, root, rb) {
+				rbtree_remove(mm, block);
+				mark_cleared(block);
+				rbtree_insert(mm, block, CLEAR_TREE);
+			}
+		}
+
+		mm->clear_avail = mm->avail;
+	} else {
+
+		for (i = 0; i <= mm->max_order; ++i) {
+			struct rb_root *root = __get_root(mm, i, CLEAR_TREE);
+			struct drm_buddy_block *block, *n;
+
+			for_each_rb_entry_reverse_safe(block, n, root, rb) {
+				rbtree_remove(mm, block);
+				clear_reset(block);
+				rbtree_insert(mm, block, DIRTY_TREE);
+			}
+		}
+
+		mm->clear_avail = 0;
+	}
+}
+EXPORT_SYMBOL(drm_buddy_reset_clear);
+
+/**
  * drm_buddy_free_block - free a block
  *
  * @mm: DRM buddy manager
