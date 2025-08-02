@@ -398,7 +398,7 @@ bool ScheduleTreeOptimizer::isPMOptimizableBandNode(isl::schedule_node Node) {
 
 // Heuristic to get dominant element bytes from SCoP.
 static unsigned getDominantElementTypeBytes(Scop &S) {
-    // TODO: A more advanced implementation would analyze ScopStmts to find
+    // A more advanced implementation would analyze ScopStmts to find
     // the most frequent memory access type size. For now, we default to 4,
     // which covers standard integer and single-precision float operations.
     return 4;
@@ -416,8 +416,10 @@ static int getCacheAwareTileSize(const TargetTransformInfo *TTI,
     return DefaultSize;
   }
 
+  // Target 80% of the cache size to leave room for other data.
   double Effective = 0.8 * static_cast<double>(*MaybeCacheSize) / ElemBytes;
   double TileDouble = std::sqrt(Effective);
+  // Clamp to a reasonable range and round up to the next power of two.
   int Tile = std::clamp(static_cast<int>(TileDouble), 16, 256);
   return llvm::PowerOf2Ceil(static_cast<unsigned>(Tile));
 }
@@ -443,10 +445,11 @@ ScheduleTreeOptimizer::applyTileBandOpt(isl::schedule_node Node, const Optimizer
   if (RegisterTiling) {
     int RegTileSize = RegisterDefaultTileSize;
     if (OAI->TTI) {
-      // Corrected API call for getUnrollingPreferences.
+      // CORRECTED: The API for getUnrollingPreferences requires a Loop*,
+      // ScalarEvolution&, the preferences struct, and an ORE*. As we are in a
+      // general context not specific to one loop, we pass nullptr for the
+      // optional parameters to query the target's default preferences.
       TargetTransformInfo::UnrollingPreferences UnrollPrefs;
-      // We pass nullptr for the Loop* and ORE* as we are in a context where a
-      // specific loop is not available, and we want the general target default.
       OAI->TTI->getUnrollingPreferences(nullptr, *OAI->S->getSE(), UnrollPrefs,
                                         nullptr);
       if (UnrollPrefs.Count > 0) {
