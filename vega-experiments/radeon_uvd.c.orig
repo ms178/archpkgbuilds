@@ -513,6 +513,7 @@ static struct ruvd_h264 get_h264_msg(struct ruvd_decoder *dec, struct pipe_h264_
    result.sps_info_flags |= pic->pps->sps->mb_adaptive_frame_field_flag << 1;
    result.sps_info_flags |= pic->pps->sps->frame_mbs_only_flag << 2;
    result.sps_info_flags |= pic->pps->sps->delta_pic_order_always_zero_flag << 3;
+   result.sps_info_flags |= pic->pps->sps->gaps_in_frame_num_value_allowed_flag << 5;
 
    result.chroma_format = pic->pps->sps->chroma_format_idc;
    result.bit_depth_luma_minus8 = pic->pps->sps->bit_depth_luma_minus8;
@@ -1184,7 +1185,7 @@ static int ruvd_end_frame(struct pipe_video_codec *decoder, struct pipe_video_bu
                FB_BUFFER_OFFSET + dec->fb_size, RADEON_USAGE_READ, RADEON_DOMAIN_GTT);
    set_reg(dec, dec->reg.cntl, 1);
 
-   flush(dec, picture->flush_flags, picture->fence);
+   flush(dec, picture->flush_flags, picture->out_fence);
    next_buffer(dec);
    return 0;
 }
