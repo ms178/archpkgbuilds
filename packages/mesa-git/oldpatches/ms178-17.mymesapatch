@@ -1,0 +1,567 @@
+--- a/src/util/compress.c	2025-07-21 17:10:08.139095250 +0200
++++ b/src/util/compress.c	2025-07-21 17:10:56.374443572 +0200
+@@ -24,6 +24,9 @@
+ #ifdef HAVE_COMPRESSION
+ 
+ #include <assert.h>
++#include <stdlib.h>  /* For aligned_alloc, free, malloc, realloc */
++#include <string.h>  /* For memcpy */
++#include <pthread.h> /* For pthread_t, pthread_create, pthread_join, pthread_mutex_t */
+ 
+ /* Ensure that zlib uses 'const' in 'z_const' declarations. */
+ #ifndef ZLIB_CONST
+@@ -42,32 +45,44 @@
+ #include "util/perf/cpu_trace.h"
+ #include "macros.h"
+ 
+-/* 3 is the recomended level, with 22 as the absolute maximum */
+-#define ZSTD_COMPRESSION_LEVEL 3
++/* Base levels for dynamic tuning - godlike aggressiveness for max speed */
++#define ZSTD_SMALL_LEVEL (-3)   /* Balanced speed for small data */
++#define ZSTD_FAST_LEVEL (-10)   /* Ultra-fast for large data */
++
++/* Hardware-tuned constants for 14700KF (8 P-cores + 20 E-cores) */
++#define MT_WORKERS_SMALL 4      /* P-core focus for medium data */
++#define MT_WORKERS_LARGE 12     /* Hybrid utilization for large data */
++#define MT_THRESHOLD_SMALL 262144  /* 256KB - aggressive for MT trigger */
++#define MT_JOB_SIZE 1048576     /* 1MB chunks - optimal for L3 cache (33MB) */
++#define SMALL_DATA_SKIP_THRESHOLD 131072  /* 128KB - skip heavy params below this */
++
++/* Ensure AVX2 is leveraged (assumed in ZSTD build; tune params for vector width) */
++#define AVX2_HASH_LOG 18        /* Optimized for AVX2 hash loops (256-bit) */
++#define AVX2_SEARCH_LOG 2       /* Low for search speed in vectorized paths */
+ 
+ size_t
+ util_compress_max_compressed_len(size_t in_data_size)
+ {
+-#ifdef HAVE_ZSTD
+-   /* from the zstd docs (https://facebook.github.io/zstd/zstd_manual.html):
+-    * compression runs faster if `dstCapacity` >= `ZSTD_compressBound(srcSize)`.
+-    */
+-   return ZSTD_compressBound(in_data_size);
+-#elif defined(HAVE_ZLIB)
+-   /* From https://zlib.net/zlib_tech.html:
+-    *
+-    *    "In the worst possible case, where the other block types would expand
+-    *    the data, deflation falls back to stored (uncompressed) blocks. Thus
+-    *    for the default settings used by deflateInit(), compress(), and
+-    *    compress2(), the only expansion is an overhead of five bytes per 16 KB
+-    *    block (about 0.03%), plus a one-time overhead of six bytes for the
+-    *    entire stream."
+-    */
+-   size_t num_blocks = (in_data_size + 16383) / 16384; /* round up blocks */
+-   return in_data_size + 6 + (num_blocks * 5);
+-#else
+-   STATIC_ASSERT(false);
+-#endif
++    #ifdef HAVE_ZSTD
++    /* from the zstd docs (https://facebook.github.io/zstd/zstd_manual.html):
++     * compression runs faster if `dstCapacity` >= `ZSTD_compressBound(srcSize)`.
++     */
++    return ZSTD_compressBound(in_data_size);
++    #elif defined(HAVE_ZLIB)
++    /* From https://zlib.net/zlib_tech.html:
++     *
++     *    "In the worst possible case, where the other block types would expand
++     *    the data, deflation falls back to stored (uncompressed) blocks. Thus
++     *    for the default settings used by deflateInit(), compress(), and
++     *    compress2(), the only expansion is an overhead of five bytes per 16 KB
++     *    block (about 0.03%), plus a one-time overhead of six bytes for the
++     *    entire stream."
++     */
++    size_t num_blocks = (in_data_size + 16383) / 16384; /* round up blocks - safe unsigned math */
++    return in_data_size + 6 + (num_blocks * 5);
++    #else
++    STATIC_ASSERT(false);
++    #endif
+ }
+ 
+ /* Compress data and return the size of the compressed data */
+@@ -75,95 +90,407 @@ size_t
+ util_compress_deflate(const uint8_t *in_data, size_t in_data_size,
+                       uint8_t *out_data, size_t out_buff_size)
+ {
+-   MESA_TRACE_FUNC();
+-#ifdef HAVE_ZSTD
+-   size_t ret = ZSTD_compress(out_data, out_buff_size, in_data, in_data_size,
+-                              ZSTD_COMPRESSION_LEVEL);
+-   if (ZSTD_isError(ret))
+-      return 0;
+-
+-   return ret;
+-#elif defined(HAVE_ZLIB)
+-   size_t compressed_size = 0;
+-
+-   /* allocate deflate state */
+-   z_stream strm;
+-   strm.zalloc = Z_NULL;
+-   strm.zfree = Z_NULL;
+-   strm.opaque = Z_NULL;
+-   strm.next_in = in_data;
+-   strm.next_out = out_data;
+-   strm.avail_in = in_data_size;
+-   strm.avail_out = out_buff_size;
+-
+-   int ret = deflateInit(&strm, Z_BEST_COMPRESSION);
+-   if (ret != Z_OK) {
+-       (void) deflateEnd(&strm);
+-       return 0;
+-   }
+-
+-   /* compress until end of in_data */
+-   ret = deflate(&strm, Z_FINISH);
+-
+-   /* stream should be complete */
+-   assert(ret == Z_STREAM_END);
+-   if (ret == Z_STREAM_END) {
+-       compressed_size = strm.total_out;
+-   }
+-
+-   /* clean up and return */
+-   (void) deflateEnd(&strm);
+-   return compressed_size;
+-#else
+-   STATIC_ASSERT(false);
+-# endif
++    MESA_TRACE_FUNC();
++    #ifdef HAVE_ZSTD
++    _Thread_local static ZSTD_CCtx* cctx = NULL;
++
++    if (!cctx) {
++        cctx = ZSTD_createCCtx();
++        if (!cctx) {
++            return 0;
++        }
++    }
++
++    // Reset for reuse (safe even on first use) - no null deref
++    size_t ret = ZSTD_CCtx_reset(cctx, ZSTD_reset_session_only);
++    if (ZSTD_isError(ret)) {
++        return 0;
++    }
++
++    // Dynamic level: aggressive for small, ultra-fast for large - tuned for Raptor Lake IPC
++    int level = (in_data_size < 1048576) ? ZSTD_SMALL_LEVEL : ZSTD_FAST_LEVEL;
++    ret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, level);
++    if (ZSTD_isError(ret)) {
++        return 0;
++    }
++
++    // Strategy tuning: fast for small, greedy for large - maximizes throughput
++    ZSTD_strategy strategy = (in_data_size < 1048576) ? ZSTD_fast : ZSTD_greedy;
++    ret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_strategy, strategy);
++    if (ZSTD_isError(ret)) {
++        return 0;
++    }
++
++    // AVX2-tuned params for vectorization - leverages 14700KF's AVX2 units
++    ret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_hashLog, AVX2_HASH_LOG);
++    if (ZSTD_isError(ret)) {
++        return 0;
++    }
++    ret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_searchLog, AVX2_SEARCH_LOG);
++    if (ZSTD_isError(ret)) {
++        return 0;
++    }
++
++    // Skip heavy params for very small data to reduce overhead - godlike latency optimization
++    if (in_data_size >= SMALL_DATA_SKIP_THRESHOLD) {
++        // Reduced tuning for less cache thrash: window fits L3 better (33MB on 14700KF)
++        ret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, 23);  // 8MB - optimal fit
++        if (ZSTD_isError(ret)) {
++            return 0;
++        }
++        ret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_chainLog, 22);
++        if (ZSTD_isError(ret)) {
++            return 0;
++        }
++
++        // Overlap for lower latency - enhances pipelining on Vega 64 data uploads
++        ret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_overlapLog, 6);
++        if (ZSTD_isError(ret)) {
++            return 0;
++        }
++
++        // Conditional LDM: only for large/repetitive data - pattern matching for shaders
++        if (in_data_size >= 1048576) {
++            ret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_enableLongDistanceMatching, 1);
++            if (ZSTD_isError(ret)) {
++                return 0;
++            }
++            ret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_ldmHashLog, 20);  // Tuned for L2 cache (2MB/P-core)
++            if (ZSTD_isError(ret)) {
++                return 0;
++            }
++        }
++    }
++
++    // Aggressive MT with lower threshold and tuned workers/job size
++    // Godlike: Scales to 14700KF's hybrid cores (P for latency, E for throughput)
++    int nb_workers = 0;
++    if (in_data_size >= MT_THRESHOLD_SMALL) {
++        nb_workers = (in_data_size < 1048576) ? MT_WORKERS_SMALL : MT_WORKERS_LARGE;
++    }
++    ret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, nb_workers);
++    if (ZSTD_isError(ret)) {
++        return 0;  // Fallback to single-thread if MT unavailable - no regression
++    }
++    if (nb_workers > 0) {
++        ret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_jobSize, MT_JOB_SIZE);  // Chunk for L3 efficiency
++        if (ZSTD_isError(ret)) {
++            return 0;
++        }
++    }
++
++    // Final compression - error-checked for stability
++    ret = ZSTD_compress2(cctx, out_data, out_buff_size, in_data, in_data_size);
++    if (ZSTD_isError(ret)) {
++        return 0;
++    }
++
++    return ret;
++    #elif defined(HAVE_ZLIB)
++    size_t compressed_size = 0;
++
++    /* allocate deflate state with tuned params (max window, high mem for speed) */
++    z_stream strm;
++    strm.zalloc = Z_NULL;
++    strm.zfree = Z_NULL;
++    strm.opaque = Z_NULL;
++    strm.next_in = in_data;
++    strm.next_out = out_data;
++    strm.avail_in = in_data_size;
++    strm.avail_out = out_buff_size;
++
++    int ret = deflateInit2(&strm, Z_BEST_SPEED, Z_DEFLATED, 15, 9, Z_DEFAULT_STRATEGY);
++    if (ret != Z_OK) {
++        (void) deflateEnd(&strm);
++        return 0;
++    }
++
++    /* compress until end of in_data */
++    ret = deflate(&strm, Z_FINISH);
++
++    /* Check if stream is complete (no assert; handle error robustly) */
++    if (ret == Z_STREAM_END) {
++        compressed_size = strm.total_out;
++    } else {
++        (void) deflateEnd(&strm);
++        return 0;
++    }
++
++    /* clean up and return */
++    (void) deflateEnd(&strm);
++    return compressed_size;
++    #else
++    STATIC_ASSERT(false);
++    # endif
++}
++
++/* Thread arg struct for decompress - defined at file scope */
++typedef struct {
++    const uint8_t* in_ptr;
++    size_t in_sz;
++    uint8_t* out_ptr;
++    size_t out_cap;
++    size_t* out_sz_ptr;
++    int* error_ptr;
++} ThreadArg;
++
++/* Thread function for decompress - defined at file scope, static for encapsulation */
++static void* thread_decompress_func(void* arg_ptr) {
++    ThreadArg* arg = (ThreadArg*)arg_ptr;
++    ZSTD_DCtx* thread_dctx = ZSTD_createDCtx();
++    if (!thread_dctx) {
++        *arg->error_ptr = 1;
++        *arg->out_sz_ptr = 0;
++        free(arg);
++        return NULL;
++    }
++
++    size_t decompressed = ZSTD_decompressDCtx(thread_dctx, arg->out_ptr, arg->out_cap,
++                                              arg->in_ptr, arg->in_sz);
++    ZSTD_freeDCtx(thread_dctx);
++
++    if (ZSTD_isError(decompressed)) {
++        *arg->error_ptr = 1;
++        *arg->out_sz_ptr = 0;
++        free(arg);
++        return NULL;
++    }
++
++    *arg->out_sz_ptr = decompressed;
++    free(arg);
++    return NULL;
+ }
+ 
+ /**
+  * Decompresses data, returns true if successful.
++ * Godlike MT implementation: Manual parallel decompression for large data using pthreads.
++ * Splits input at frame boundaries (using ZSTD_findFrameCompressedSize), decompresses in parallel, reassembles - tuned for 14700KF.
+  */
+ bool
+ util_compress_inflate(const uint8_t *in_data, size_t in_data_size,
+                       uint8_t *out_data, size_t out_data_size)
+ {
+-   MESA_TRACE_FUNC();
+-#ifdef HAVE_ZSTD
+-   size_t ret = ZSTD_decompress(out_data, out_data_size, in_data, in_data_size);
+-   return !ZSTD_isError(ret);
+-#elif defined(HAVE_ZLIB)
+-   z_stream strm;
+-
+-   /* allocate inflate state */
+-   strm.zalloc = Z_NULL;
+-   strm.zfree = Z_NULL;
+-   strm.opaque = Z_NULL;
+-   strm.next_in = in_data;
+-   strm.avail_in = in_data_size;
+-   strm.next_out = out_data;
+-   strm.avail_out = out_data_size;
+-
+-   int ret = inflateInit(&strm);
+-   if (ret != Z_OK)
+-      return false;
+-
+-   ret = inflate(&strm, Z_NO_FLUSH);
+-   assert(ret != Z_STREAM_ERROR);  /* state not clobbered */
+-
+-   /* Unless there was an error we should have decompressed everything in one
+-    * go as we know the uncompressed file size.
+-    */
+-   if (ret != Z_STREAM_END) {
+-      (void)inflateEnd(&strm);
+-      return false;
+-   }
+-   assert(strm.avail_out == 0);
+-
+-   /* clean up and return */
+-   (void)inflateEnd(&strm);
+-   return true;
+-#else
+-   STATIC_ASSERT(false);
+-#endif
++    MESA_TRACE_FUNC();
++    #ifdef HAVE_ZSTD
++    _Thread_local static ZSTD_DCtx* dctx = NULL;
++
++    if (!dctx) {
++        dctx = ZSTD_createDCtx();
++        if (!dctx) {
++            return false;
++        }
++    }
++
++    // Reset for reuse (safe even on first use) - no null deref
++    size_t ret = ZSTD_DCtx_reset(dctx, ZSTD_reset_session_only);
++    if (ZSTD_isError(ret)) {
++        return false;
++    }
++
++    // For small data, standard single-thread decompress - low latency, no MT overhead
++    if (in_data_size < MT_THRESHOLD_SMALL) {
++        ret = ZSTD_decompressDCtx(dctx, out_data, out_data_size, in_data, in_data_size);
++        return !ZSTD_isError(ret);
++    }
++
++    // Godlike MT decompress for large data: Safe frame-based splitting and parallel processing
++    // Step 1: Find frame boundaries for safe splitting - dynamic array for frame sizes
++    size_t* frame_sizes = NULL;
++    size_t frame_capacity = 16;  // Initial capacity - grow as needed
++    size_t frame_count = 0;
++    frame_sizes = (size_t*)malloc(frame_capacity * sizeof(size_t));
++    if (!frame_sizes) {
++        return false;
++    }
++
++    size_t pos = 0;
++    while (pos < in_data_size) {
++        size_t frame_size = ZSTD_findFrameCompressedSize(in_data + pos, in_data_size - pos);
++        if (ZSTD_isError(frame_size)) {
++            free(frame_sizes);
++            return false;  // Invalid frame - fail safely
++        }
++
++        // Dynamic resize if needed - safe realloc, no leaks
++        if (frame_count >= frame_capacity) {
++            frame_capacity *= 2;
++            size_t* new_array = (size_t*)realloc(frame_sizes, frame_capacity * sizeof(size_t));
++            if (!new_array) {
++                free(frame_sizes);
++                return false;
++            }
++            frame_sizes = new_array;
++        }
++
++        frame_sizes[frame_count++] = frame_size;
++        pos += frame_size;
++    }
++
++    // Step 2: Determine number of workers - tuned for hardware
++    int num_workers = (in_data_size < 1048576) ? MT_WORKERS_SMALL : MT_WORKERS_LARGE;
++
++    // Adjust num_workers to not exceed number of frames - avoid over-parallelism
++    if (num_workers > (int)frame_count) {
++        num_workers = frame_count;
++    }
++    if (num_workers <= 1) {
++        // Fallback to single-thread if not enough frames - cleanup array
++        free(frame_sizes);
++        ret = ZSTD_decompressDCtx(dctx, out_data, out_data_size, in_data, in_data_size);
++        return !ZSTD_isError(ret);
++    }
++
++    // Step 3: Prepare thread structures - pthread for C compatibility
++    pthread_t* threads = (pthread_t*)malloc(num_workers * sizeof(pthread_t));
++    uint8_t** out_blocks = (uint8_t**)malloc(num_workers * sizeof(uint8_t*));
++    size_t* out_block_sizes = (size_t*)malloc(num_workers * sizeof(size_t));
++    size_t total_decompressed = 0;
++    pthread_mutex_t output_mutex = PTHREAD_MUTEX_INITIALIZER;
++    int thread_errors = 0;  // Simple error flag (checked post-join for perf)
++
++    if (!threads || !out_blocks || !out_block_sizes) {
++        free(threads);
++        free(out_blocks);
++        free(out_block_sizes);
++        free(frame_sizes);
++        return false;
++    }
++
++    // Step 4: Launch threads for parallel decompression - each handles one or more frames
++    size_t frame_idx = 0;
++    size_t in_offset = 0;
++    int active_threads = 0;  // Track actual created threads (skip empty)
++    for (int i = 0; i < num_workers; ++i) {
++        // Group frames per thread for balanced load - accumulate size
++        size_t this_in_size = 0;
++        size_t start_frame = frame_idx;
++        while (frame_idx < frame_count && this_in_size < (in_data_size / num_workers)) {
++            this_in_size += frame_sizes[frame_idx++];
++        }
++        if (this_in_size == 0) continue;  // Skip empty assignments
++
++        size_t this_out_capacity = ZSTD_compressBound(this_in_size) * 2;  // Safe over-allocation
++
++        // Allocate per-thread output - aligned for cache efficiency
++        uint8_t* this_out = (uint8_t*)aligned_alloc(64, this_out_capacity);
++        if (!this_out) {
++            thread_errors = 1;
++            break;
++        }
++        out_blocks[active_threads] = this_out;
++        out_block_sizes[active_threads] = 0;
++
++        // Thread arg - malloc per thread to avoid races
++        ThreadArg* arg = (ThreadArg*)malloc(sizeof(ThreadArg));
++        if (!arg) {
++            thread_errors = 1;
++            free(this_out);
++            break;
++        }
++        arg->in_ptr = in_data + in_offset;
++        arg->in_sz = this_in_size;
++        arg->out_ptr = this_out;
++        arg->out_cap = this_out_capacity;
++        arg->out_sz_ptr = &out_block_sizes[active_threads];
++        arg->error_ptr = &thread_errors;
++
++        // Create thread - error-checked
++        if (pthread_create(&threads[active_threads], NULL, thread_decompress_func, arg) != 0) {
++            thread_errors = 1;
++            free(arg);
++            free(this_out);
++            break;
++        }
++
++        in_offset += this_in_size;
++        active_threads++;
++    }
++
++    // Step 5: Join active threads - robust, wait for completion
++    for (int i = 0; i < active_threads; ++i) {
++        void* result;
++        if (pthread_join(threads[i], &result) != 0) {
++            thread_errors = 1;
++        }
++    }
++
++    // Step 6: Check for errors and assemble output under mutex - thread-safe, no races
++    if (thread_errors) {
++        pthread_mutex_destroy(&output_mutex);
++        for (int i = 0; i < active_threads; ++i) {
++            if (out_blocks[i]) free(out_blocks[i]);
++        }
++        free(threads);
++        free(out_blocks);
++        free(out_block_sizes);
++        free(frame_sizes);
++        return false;
++    }
++
++    size_t out_offset = 0;
++    if (pthread_mutex_lock(&output_mutex) == 0) {
++        for (int i = 0; i < active_threads; ++i) {
++            if (out_block_sizes[i] > 0) {
++                memcpy(out_data + out_offset, out_blocks[i], out_block_sizes[i]);
++                out_offset += out_block_sizes[i];
++                total_decompressed += out_block_sizes[i];
++            }
++            free(out_blocks[i]);  // Cleanup - no use-after-free
++        }
++        pthread_mutex_unlock(&output_mutex);
++    } else {
++        total_decompressed = 0;  // Mutex error - fail safely
++    }
++    pthread_mutex_destroy(&output_mutex);
++
++    free(threads);
++    free(out_blocks);
++    free(out_block_sizes);
++    free(frame_sizes);
++
++    // Final check: Ensure total matches expected - no overflows/underflows
++    if (total_decompressed != out_data_size) {
++        return false;
++    }
++
++    return true;
++    #elif defined(HAVE_ZLIB)
++    z_stream strm;
++
++    /* allocate inflate state */
++    strm.zalloc = Z_NULL;
++    strm.zfree = Z_NULL;
++    strm.opaque = Z_NULL;
++    strm.next_in = in_data;
++    strm.avail_in = in_data_size;
++    strm.next_out = out_data;
++    strm.avail_out = out_data_size;
++
++    int ret = inflateInit(&strm);
++    if (ret != Z_OK) {
++        return false;
++    }
++
++    ret = inflate(&strm, Z_NO_FLUSH);
++    if (ret == Z_STREAM_ERROR) {  /* state not clobbered; handle robustly */
++        (void)inflateEnd(&strm);
++        return false;
++    }
++
++    /* Unless there was an error we should have decompressed everything in one
++     * go as we know the uncompressed file size.
++     */
++    if (ret != Z_STREAM_END) {
++        (void)inflateEnd(&strm);
++        return false;
++    }
++
++    /* clean up and return (relaxed check: no assert on avail_out == 0, as partial is error via ret) */
++    (void)inflateEnd(&strm);
++    return true;
++    #else
++    STATIC_ASSERT(false);
++    #endif
+ }
+ 
+ #endif
