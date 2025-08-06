@@ -44,6 +44,8 @@
 #include <linux/completion.h>
 #include <linux/atomic.h>
 #include <asm/fpu/api.h>
+#include <asm/cpufeature.h>
+#include <asm/irq.h>
 
 #include <drm/amdgpu_drm.h>
 #include <drm/drm_drv.h>
@@ -648,31 +650,60 @@ static inline u32 pb_get_bias(void)
     h   = pb_hash(tgid);
     now_ns = sched_clock();
 
-    // Neat trick: Vectorized scan for matches (SSE for Raptor Lake speed-up)
-    #if defined(CONFIG_X86_64) && defined(CONFIG_X86_FEATURE_SSE)
-    if (cpu_has(cpu, X86_FEATURE_SSE)) {  // Runtime check for safety
-        kernel_fpu_begin();  // Save FPU state (critical for kernel safety)
-        __m128i vec_tgid = _mm_set1_epi32(tgid);
-        for (i = 0; i < PB_ENTRIES - 3; i += 4) {  // Unroll by 4, leave remainder for fallback
-            __m128i vec_entries = _mm_loadu_si128((__m128i*)&tbl[(h + i) & PB_HASH_MASK].tgid);
-            __m128i cmp = _mm_cmpeq_epi32(vec_tgid, vec_entries);
-            int mask = _mm_movemask_epi8(cmp);
-            if (mask) {
-                int idx = __builtin_ctz(mask | 0x10000) / 4;  // |0x10000 ensures non-zero, avoids UB
-                struct pid_bias_entry *e = &tbl[(h + i + idx) & PB_HASH_MASK];
+    // Neat trick: Hybrid AVX2 (primary) + BMI2 fallback for optimal speed across workloads (no pressure gate—features always attempted if safe)
+    #if defined(CONFIG_X86_64)
+    if (!irqs_disabled()) {  // Skip in IRQ to prevent timeouts
+        // Try AVX2 first (high parallelism for contended gaming like Cyberpunk)
+        #ifdef CONFIG_X86_FEATURE_AVX2
+        if (cpu_has(cpu, X86_FEATURE_AVX2)) {
+            kernel_fpu_begin();
+            __m256i vec_tgid = _mm256_set1_epi32(tgid);
+            for (i = 0; i < PB_ENTRIES; i += 8) {
+                __m256i vec_entries = _mm256_loadu_si256((__m256i*)&tbl[(h + i) & PB_HASH_MASK].tgid);
+                __m256i cmp = _mm256_cmpeq_epi32(vec_tgid, vec_entries);
+                int mask = _mm256_movemask_epi8(cmp);
+                if (mask) {
+                    int idx = min(__builtin_ctz(mask | 0x10000000) / 4, 7u);
+                    struct pid_bias_entry *e = &tbl[(h + i + idx) & PB_HASH_MASK];
+                    if (now_ns - e->ns_last > NSEC_PER_SEC)
+                        e->ewma = 0;
+                    pb_decay(e, now_ns);
+                    ret = e->ewma >> EW_UNIT_SHIFT;
+                    kernel_fpu_end();
+                    put_cpu();
+                    return ret;
+                }
+            }
+            kernel_fpu_end();
+        }
+        #endif
+
+        // BMI2 fallback (bit-packing for moderate loads like Troy, no FPU overhead)
+        #ifdef CONFIG_X86_FEATURE_BMI2
+        if (cpu_has(cpu, X86_FEATURE_BMI2)) {
+            u64 packed = 0;
+            for (i = 0; i < PB_ENTRIES; i += 2) {  // Pack 2 per iter for u64
+                u32 t1 = tbl[(h + i) & PB_HASH_MASK].tgid;
+                u32 t2 = tbl[(h + i + 1) & PB_HASH_MASK].tgid;
+                packed |= _pdep_u64((u64)(t1 == tgid) , 1ULL << (unsigned)(i % 64)) |  // Unsigned shift avoids UB
+                          _pdep_u64((u64)(t2 == tgid) , 1ULL << (unsigned)((i + 1) % 64));
+            }
+            if (packed) {
+                int idx = min(__builtin_ctzll(packed), PB_ENTRIES - 1u);  // Clamp for safety
+                struct pid_bias_entry *e = &tbl[(h + idx) & PB_HASH_MASK];
                 if (now_ns - e->ns_last > NSEC_PER_SEC)
                     e->ewma = 0;
                 pb_decay(e, now_ns);
                 ret = e->ewma >> EW_UNIT_SHIFT;
-                kernel_fpu_end();  // Restore FPU
                 put_cpu();
-                return ret;  // Early return (removes unused label)
+                return ret;
             }
         }
-        kernel_fpu_end();  // Restore if no match
+        #endif
     }
     #endif
-    // Fallback scalar loop (handles remainder, non-x86, or no SSE)
+
+    // Fallback scalar loop (handles low-pressure, non-vector, or all safe cases)
     for (i = 0; i < PB_ENTRIES; ++i, h = (h + 1) & PB_HASH_MASK) {
         struct pid_bias_entry *e = &tbl[h];
 
