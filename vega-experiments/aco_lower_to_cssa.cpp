@@ -1,3 +1,9 @@
+/*
+ * Copyright © 2019 Valve Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "aco_builder.h"
 #include "aco_ir.h"
 
