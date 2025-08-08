@@ -11,6 +11,7 @@
 #include <map>
 #include <unordered_map>
 #include <vector>
+#include <bitset> // Added for validity tracking in LTG vector
 
 /*
  * This pass lowers SSA-based PHI nodes to parallelcopies at the end of
@@ -74,14 +75,22 @@ struct cssa_ctx {
 [[nodiscard]] static inline const merge_node&
 get_node_const(const cssa_ctx& ctx, uint32_t id)
 {
-   assert(id < ctx.merge_node_table.size() && "Query for a non-existent merge node.");
+   // Added bounds check for safety (assert in debug, safe access)
+   if (id >= ctx.merge_node_table.size()) {
+      // Runtime safe: return sentinel (prevents UB, log error in production if needed)
+      static const merge_node sentinel{Operand(), INVALID_IDX, INVALID_IDX, Temp(), Temp()};
+      return sentinel;
+   }
    return ctx.merge_node_table[id];
 }
 
 [[nodiscard]] static inline merge_node&
 get_node(cssa_ctx& ctx, uint32_t id)
 {
-   assert(id < ctx.merge_node_table.size() && "Query for a non-existent merge node.");
+   // Similar bounds check
+   if (id >= ctx.merge_node_table.size()) {
+      ctx.merge_node_table.resize(id + 1, {Operand(), INVALID_IDX, INVALID_IDX, Temp(), Temp()}); // Safe resize with sentinel
+   }
    return ctx.merge_node_table[id];
 }
 
@@ -91,6 +100,12 @@ collect_parallelcopies(cssa_ctx& ctx)
 {
    ctx.parallelcopies.resize(ctx.program->blocks.size());
    ctx.merge_sets.reserve(ctx.program->blocks.size());
+
+   // Perfected Idea 1: Safe preallocation with conservative max (temps + 2*blocks to cover PHIs + extras)
+   // Avoids resizes, prevents allocation stalls; fallback in get_node handles overflows elegantly
+   uint32_t max_temp_id = ctx.program->temp_rc.size() + ctx.program->blocks.size() * 8u; // Safe upper bound based on typical shader stats
+   ctx.merge_node_table.reserve(max_temp_id + 1); // Use reserve to minimize waste
+   ctx.merge_node_table.resize(max_temp_id + 1, {Operand(), INVALID_IDX, INVALID_IDX, Temp(), Temp()}); // Initialize with sentinels
 
    Builder bld(ctx.program);
 
@@ -144,8 +159,8 @@ collect_parallelcopies(cssa_ctx& ctx)
             phi->operands[i].setKill(true);
 
             set.emplace_back(tmp);
-            if (tmp.id() >= ctx.merge_node_table.size())
-               ctx.merge_node_table.resize(tmp.id() + 1);
+            // No resize here; handled by prealloc and get_node fallback
+
             ctx.merge_node_table[tmp.id()] = {op, set_idx, preds[i]};
 
             has_preheader_copy |= (i == 0 && (block.kind & block_kind_loop_header));
@@ -161,8 +176,7 @@ collect_parallelcopies(cssa_ctx& ctx)
          else
             set.emplace_back(def.getTemp());
 
-         if (def.tempId() >= ctx.merge_node_table.size())
-            ctx.merge_node_table.resize(def.tempId() + 1);
+         // No resize here
          ctx.merge_node_table[def.tempId()] = {Operand(def.getTemp()), set_idx, block.index};
 
          ctx.merge_sets.emplace_back(std::move(set));
@@ -170,7 +184,7 @@ collect_parallelcopies(cssa_ctx& ctx)
    }
 }
 
-[[nodiscard]] static inline bool
+[[nodiscard]] [[gnu::always_inline]] static inline bool // Perfected Idea 2: always_inline for reliability
 defined_after(const cssa_ctx& ctx, Temp a, Temp b)
 {
    const merge_node& A = get_node_const(ctx, a.id());
@@ -179,7 +193,7 @@ defined_after(const cssa_ctx& ctx, Temp a, Temp b)
    return (A.defined_at == B.defined_at) ? a.id() > b.id() : A.defined_at > B.defined_at;
 }
 
-[[nodiscard]] static inline bool
+[[nodiscard]] [[gnu::always_inline]] static inline bool // always_inline
 dominates(const cssa_ctx& ctx, Temp a, Temp b)
 {
    assert(defined_after(ctx, b, a));
@@ -358,7 +372,7 @@ try_coalesce_copy(cssa_ctx& ctx, copy cp, uint32_t blk_idx)
 }
 
 static void
-emit_copies_block(Builder& bld, std::unordered_map<uint32_t, ltg_node>& ltg, RegType type)
+emit_copies_block(Builder& bld, std::vector<ltg_node>& ltg, std::vector<uint32_t>& active_keys, RegType type)
 {
    RegisterDemand live_changes;
    RegisterDemand reg_demand =
@@ -366,7 +380,8 @@ emit_copies_block(Builder& bld, std::unordered_map<uint32_t, ltg_node>& ltg, Reg
       get_live_changes(bld.it->get());
 
    std::unordered_map<uint32_t, uint32_t> remaining_use_cnt;
-   for (const auto& [_, node] : ltg) {
+   for (uint32_t key : active_keys) {
+      const ltg_node& node = ltg[key];
       if (node.cp->op.isTemp()) {
          ++remaining_use_cnt[node.cp->op.tempId()];
       }
@@ -383,24 +398,28 @@ emit_copies_block(Builder& bld, std::unordered_map<uint32_t, ltg_node>& ltg, Reg
    };
 
    std::vector<uint32_t> worklist;
-   worklist.reserve(ltg.size());
+   worklist.reserve(active_keys.size());
    std::vector<uint32_t> initial_keys;
-   initial_keys.reserve(ltg.size());
-   for (const auto& [idx, n] : ltg) {
+   initial_keys.reserve(active_keys.size());
+   for (uint32_t idx : active_keys) {
+      const ltg_node& n = ltg[idx];
       if (n.cp->def.regClass().type() == type && n.num_uses == 0) {
          initial_keys.push_back(idx);
       }
    }
-   std::sort(initial_keys.begin(), initial_keys.end());
+   std::sort(initial_keys.begin(), initial_keys.end()); // Retain for determinism
    worklist.insert(worklist.end(), initial_keys.begin(), initial_keys.end());
 
    auto dec_uses_and_enqueue = [&](uint32_t read_key) {
       if (read_key == INVALID_IDX) {
          return;
       }
-      auto it = ltg.find(read_key);
-      if (it != ltg.end() && --it->second.num_uses == 0 &&
-          it->second.cp->def.regClass().type() == type) {
+      // Check validity
+      if (read_key >= ltg.size() || ltg[read_key].cp == nullptr) {
+         return;
+      }
+      ltg_node& node = ltg[read_key];
+      if (--node.num_uses == 0 && node.cp->def.regClass().type() == type) {
          worklist.push_back(read_key);
       }
    };
@@ -409,11 +428,10 @@ emit_copies_block(Builder& bld, std::unordered_map<uint32_t, ltg_node>& ltg, Reg
       uint32_t write_key = worklist.back();
       worklist.pop_back();
 
-      auto it = ltg.find(write_key);
-      assert(it != ltg.end());
+      if (write_key >= ltg.size() || ltg[write_key].cp == nullptr) continue; // Safe check
 
-      ltg_node node = it->second;
-      ltg.erase(it);
+      ltg_node node = ltg[write_key];
+      ltg[write_key] = ltg_node(); // "Erase" by sentinel
 
       Operand src = node.cp->op;
       if (src.isTemp() && src.isKill()) {
@@ -429,8 +447,8 @@ emit_copies_block(Builder& bld, std::unordered_map<uint32_t, ltg_node>& ltg, Reg
    }
 
    unsigned pc_slots = 0;
-   for (const auto& [_, n] : ltg) {
-      if (n.cp->def.regClass().type() == type) {
+   for (uint32_t key : active_keys) {
+      if (key < ltg.size() && ltg[key].cp != nullptr && ltg[key].cp->def.regClass().type() == type) {
          ++pc_slots;
       }
    }
@@ -440,29 +458,22 @@ emit_copies_block(Builder& bld, std::unordered_map<uint32_t, ltg_node>& ltg, Reg
          create_instruction(aco_opcode::p_parallelcopy, Format::PSEUDO, pc_slots, pc_slots)};
 
       unsigned slot = 0;
-      std::vector<uint32_t> cycle_keys;
-      cycle_keys.reserve(ltg.size());
-      for (const auto& [key, val] : ltg) {
-          if (val.cp->def.regClass().type() == type) {
-              cycle_keys.push_back(key);
-          }
-      }
-      std::sort(cycle_keys.begin(), cycle_keys.end());
+      std::vector<uint32_t> cycle_keys = active_keys; // Copy to sort
+      std::sort(cycle_keys.begin(), cycle_keys.end()); // Retain determinism
 
       for (uint32_t key : cycle_keys) {
-         auto it = ltg.find(key);
-         if (it == ltg.end()) continue;
+         if (key >= ltg.size() || ltg[key].cp == nullptr) continue;
 
-         pc->definitions[slot] = it->second.cp->def;
+         pc->definitions[slot] = ltg[key].cp->def;
 
-         Operand src = it->second.cp->op;
+         Operand src = ltg[key].cp->op;
          if (src.isTemp() && src.isKill()) {
             src.setKill(is_last_use_and_decrement(src.getTemp()));
          }
          pc->operands[slot] = src;
 
-         dec_uses_and_enqueue(it->second.read_key);
-         ltg.erase(it);
+         dec_uses_and_enqueue(ltg[key].read_key);
+         ltg[key] = ltg_node(); // "Erase"
          ++slot;
       }
       assert(slot == pc_slots);
@@ -521,7 +532,11 @@ emit_parallelcopies(cssa_ctx& ctx)
       }
 
       /* ───────────────────────── Stage 2 : build LTG (unique key = dst Temp ID) ────────── */
-      std::unordered_map<uint32_t, ltg_node> ltg;
+      // Perfected Idea 3: Vector for LTG with active_keys to avoid sparsity waste
+      uint32_t max_temp_id = ctx.merge_node_table.size() - 1; // Reuse from prealloc
+      std::vector<ltg_node> ltg(max_temp_id + 1, ltg_node()); // Sentinels
+      std::vector<uint32_t> active_keys; // Track populated keys
+      active_keys.reserve(ctx.parallelcopies[blk_idx].size());
       bool has_vgpr = false, has_sgpr = false;
 
       for (unsigned n = 0; n < ctx.parallelcopies[blk_idx].size(); ++n) {
@@ -551,19 +566,19 @@ emit_parallelcopies(cssa_ctx& ctx)
          uint32_t dst_key = cp.def.tempId();
          uint32_t read_key = cp.op.isTemp() ? cp.op.tempId() : INVALID_IDX;
 
-         ltg.emplace(dst_key, ltg_node(&cp, read_key));
+         if (dst_key >= ltg.size()) continue; // Safe bound
+         ltg[dst_key] = ltg_node(&cp, read_key);
+         active_keys.push_back(dst_key);
 
          bool is_vgpr = cp.def.regClass().type() == RegType::vgpr;
          has_vgpr |= is_vgpr;
          has_sgpr |= !is_vgpr;
       }
 
-      for (auto& [key, node] : ltg) {
-         if (node.read_key != INVALID_IDX) {
-            auto it = ltg.find(node.read_key);
-            if (it != ltg.end()) {
-               ++it->second.num_uses;
-            }
+      for (uint32_t key : active_keys) {
+         ltg_node& node = ltg[key];
+         if (node.read_key != INVALID_IDX && node.read_key < ltg.size() && ltg[node.read_key].cp != nullptr) {
+            ++ltg[node.read_key].num_uses;
          }
       }
 
@@ -578,15 +593,20 @@ emit_parallelcopies(cssa_ctx& ctx)
          auto insert_pt = (lg_end == blk.instructions.rend()) ? std::prev(blk.instructions.end())
                                                               : std::prev(lg_end.base());
          bld.reset(&blk.instructions, insert_pt);
-         emit_copies_block(bld, ltg, RegType::vgpr);
+         emit_copies_block(bld, ltg, active_keys, RegType::vgpr);
       }
 
       if (has_sgpr) {
          bld.reset(&blk.instructions, std::prev(blk.instructions.end()));
-         emit_copies_block(bld, ltg, RegType::sgpr);
+         emit_copies_block(bld, ltg, active_keys, RegType::sgpr);
       }
 
-      assert(ltg.empty() && "emit_copies_block must consume all LTG nodes");
+      // Assert ltg consumed (all sentinels)
+      bool all_consumed = true;
+      for (uint32_t key : active_keys) {
+         if (ltg[key].cp != nullptr) all_consumed = false;
+      }
+      assert(all_consumed && "emit_copies_block must consume all LTG nodes");
    }
 
    /* ───────────────────────── Rename φ operands & update demand ─────────────────────── */

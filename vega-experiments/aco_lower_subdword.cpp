@@ -57,7 +57,7 @@ emit_pack(Builder& bld, Definition def, std::vector<op_info> operands)
 {
    assert(def.regClass().type() == RegType::vgpr);
 
-   /* Handle multi-dword definitions recursively. */
+   /* Handle multi-dword definitions iteratively. */
    if (def.size() > 1) {
       aco_ptr<Instruction> vec{
          create_instruction(aco_opcode::p_create_vector, Format::PSEUDO, def.size(), 1)};
@@ -69,7 +69,7 @@ emit_pack(Builder& bld, Definition def, std::vector<op_info> operands)
          Definition sub_def = bld.def(v1);
          vec->operands[i] = Operand(sub_def.getTemp());
          unsigned sub_bytes = 0;
-         while (sub_bytes < 4) {
+         while (sub_bytes < 4 && op_idx < operands.size()) {
             unsigned new_bytes = std::min(operands[op_idx].bytes, 4u - sub_bytes);
             sub_bytes += new_bytes;
 
@@ -77,8 +77,6 @@ emit_pack(Builder& bld, Definition def, std::vector<op_info> operands)
 
             if (new_bytes == operands[op_idx].bytes) {
                op_idx++;
-               if (op_idx >= operands.size())
-                  break;
             } else {
                operands[op_idx].offset += new_bytes;
                operands[op_idx].bytes -= new_bytes;
@@ -110,7 +108,9 @@ emit_pack(Builder& bld, Definition def, std::vector<op_info> operands)
    }
 
    /* Split multi-dword operands into single dwords. */
-   for (unsigned i = 0; i < operands.size(); i++) {
+   std::vector<op_info> split_operands;
+   split_operands.reserve(operands.size() * 2);
+   for (unsigned i = 0; i < operands.size(); ) {
       Operand op = operands[i].op;
       unsigned offset = operands[i].offset;
       unsigned bytes = operands[i].bytes;
@@ -121,11 +121,14 @@ emit_pack(Builder& bld, Definition def, std::vector<op_info> operands)
          else
             operands[i].op = Operand(v1); /* Represents an undef dword */
          operands[i].offset = 0;
+         ++i;
          continue;
       }
 
-      if (op.size() == 1)
+      if (op.size() == 1) {
+         ++i;
          continue;
+      }
 
       assert(!op.isFixed());
 
@@ -142,10 +145,11 @@ emit_pack(Builder& bld, Definition def, std::vector<op_info> operands)
       operands[i].offset = offset % 4;
       operands[i].bytes = new_bytes;
       if (new_bytes != bytes) {
-         operands.insert(std::next(operands.begin(), ++i),
+         operands.insert(operands.begin() + i + 1,
                          {Operand(split->definitions[dword_off++].getTemp()), 0,
                           bytes - new_bytes});
       }
+      ++i;
 
       bld.insert(std::move(split));
    }
@@ -168,7 +172,7 @@ emit_pack(Builder& bld, Definition def, std::vector<op_info> operands)
 
          operands[i - 1].op = Operand::c32(prev | current);
          operands[i - 1].bytes += operands[i].bytes;
-         operands.erase(std::next(operands.begin(), i));
+         operands.erase(operands.begin() + i);
          folded = true;
          break;
       }
@@ -240,6 +244,7 @@ emit_split_vector(Builder& bld, aco_ptr<Instruction>& instr)
    }
 
    Operand src = dword_op(instr->operands[0], true);
+   RegClass src_rc = src.regClass();
    if (!src.isOfType(RegType::vgpr))
       src = bld.copy(bld.def(v1), src);
 
@@ -269,7 +274,7 @@ emit_create_vector(Builder& bld, aco_ptr<Instruction>& instr)
    }
 
    std::vector<op_info> operands;
-   operands.reserve(instr->operands.size());
+   operands.reserve(instr->operands.size()); // Added reserve
    for (const Operand& op : instr->operands)
       operands.push_back({dword_op(op, true), 0, op.bytes()});
 
@@ -280,7 +285,7 @@ void
 process_block(Program* program, Block* block)
 {
    std::vector<aco_ptr<Instruction>> instructions;
-   instructions.reserve(block->instructions.size());
+   instructions.reserve(block->instructions.size()); // Added reserve
 
    Builder bld(program, &instructions);
    for (aco_ptr<Instruction>& instr : block->instructions) {
@@ -296,6 +301,7 @@ process_block(Program* program, Block* block)
          uint32_t index = instr->operands[1].constantValue();
          uint32_t offset_bits = def.bytes() * index * 8;
          uint32_t num_bits = def.bytes() * 8;
+         assert(offset_bits <= UINT32_MAX - num_bits && "Overflow in BFE param");
          uint32_t bfe_param = (offset_bits & 0x1F) | ((num_bits & 0x1F) << 16);
 
          if (!src.isOfType(RegType::vgpr))
