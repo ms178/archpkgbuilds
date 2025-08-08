@@ -1,0 +1,106 @@
+--- a/src/amd/compiler/instruction_selection/aco_isel_setup.cpp	2025-07-21 22:07:21.084777262 +0200
++++ b/src/amd/compiler/instruction_selection/aco_isel_setup.cpp	2025-07-21 22:16:00.003821217 +0200
+@@ -12,6 +12,10 @@
+ 
+ #include "ac_nir.h"
+ #include <vector>
++#include <bitset>
++#include <vector>
++#include <cmath>
++#include <unordered_set>
+ 
+ namespace aco {
+ 
+@@ -388,6 +392,80 @@ init_context(isel_context* ctx, nir_shad
+    ctx->program->allocateRange(impl->ssa_alloc);
+    RegClass* regclasses = ctx->program->temp_rc.data() + ctx->first_temp_id;
+ 
++   // Godlike Vega GFX9 pre-pass: Identify MUL/IMUL defs in potential FMA chains (up to depth 4).
++   // Use a map<def_index, force_vgpr> to mark safe promotions (no specials, same block, single-use).
++   std::unordered_map<unsigned, bool> fma_candidates;
++   constexpr bool is_gfx9 = true;
++   if constexpr (is_gfx9) {
++      bool is_cs = ctx->stage.has(SWStage::CS);
++      bool low_pressure = (ctx->program->max_reg_demand.vgpr < 48);
++      bool enable_opt = low_pressure || !is_cs;  // Enable for non-CS, or low-pressure CS.
++      if (enable_opt) {
++         nir_foreach_block(block, impl) {
++            nir_foreach_instr(instr, block) {
++               if (instr->type != nir_instr_type_alu) continue;
++               nir_alu_instr* alu = nir_instr_as_alu(instr);
++               nir_op mul_op = (alu->op == nir_op_fmul || alu->op == nir_op_imul) ? alu->op : nir_op_bcsel;
++               if (mul_op == nir_op_bcsel || alu->def.bit_size != 32 || alu->def.divergent) continue;
++
++               // Check for specials conservatively.
++               bool has_special = false;
++               for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; ++i) {
++                  nir_src src = alu->src[i].src;
++                  if (nir_src_is_divergent(&src) || !nir_src_is_const(src)) {
++                     has_special = true;
++                     break;
++                  }
++                  nir_const_value* vals = nir_src_as_const_value(src);
++                  unsigned src_components = nir_src_num_components(src);
++                  unsigned src_bit_size = nir_src_bit_size(src);
++                  for (unsigned c = 0; c < src_components; ++c) {
++                     nir_const_value val = vals[c];
++                     if (src_bit_size == 32 && (std::isnan(val.f32) || std::isinf(val.f32))) {
++                        has_special = true;
++                        break;
++                     }
++                  }
++                  if (has_special) break;
++               }
++               if (has_special) continue;
++
++               // Check uses for ADD chain (up to depth 4).
++               unsigned chain_length = 0;
++               nir_def* current_def = &alu->def;
++               bool single_use_chain = true;
++               while (chain_length < 4 && single_use_chain) {  // Godlike: Deeper chains for more fusions.
++                  unsigned use_count = 0;
++                  bool found_add = false;
++                  nir_foreach_use(src, current_def) {
++                     use_count++;
++                     if (use_count > 1) {
++                        single_use_chain = false;
++                        break;
++                     }
++                     nir_instr* parent = nir_src_parent_instr(src);
++                     if (parent->type == nir_instr_type_alu && parent->block == instr->block) {
++                        nir_alu_instr* use_alu = nir_instr_as_alu(parent);
++                        nir_op add_op = (mul_op == nir_op_fmul) ? nir_op_fadd : nir_op_iadd;
++                        nir_op mad_op = (mul_op == nir_op_fmul) ? nir_op_ffma : nir_op_imad;
++                        if ((use_alu->op == add_op || use_alu->op == mad_op) &&
++                            use_alu->def.bit_size == 32) {
++                           found_add = true;
++                           current_def = &use_alu->def;
++                           chain_length++;
++                        }
++                     }
++                  }
++                  if (!found_add || !single_use_chain) break;
++               }
++               if (chain_length >= 1 && single_use_chain) {  // At least MUL -> ADD, single-use chain.
++                  fma_candidates[alu->def.index] = true;
++               }
++            }
++         }
++      }
++   }
++
+    /* TODO: make this recursive to improve compile times */
+    bool done = false;
+    while (!done) {
+@@ -404,6 +482,11 @@ init_context(isel_context* ctx, nir_shad
+                    aco_nir_op_supports_packed_math_16bit(alu_instr))
+                   type = RegType::vgpr;
+ 
++               // Apply force_vgpr_for_fma if marked in pre-pass (overrides to VGPR for fusion).
++               if (fma_candidates.count(alu_instr->def.index)) {
++                  type = RegType::vgpr;
++               }
++
+                switch (alu_instr->op) {
+                case nir_op_f2i16:
+                case nir_op_f2u16:
