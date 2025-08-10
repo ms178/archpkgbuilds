@@ -63,8 +63,8 @@
 /* --- Forward declarations --- */
 static inline u32 pb_get_bias(void);
 static bool amdgpu_vega_optimize_for_workload(struct amdgpu_device *adev,
-                                              struct amdgpu_bo *bo,
-                                              uint64_t flags);
+											  struct amdgpu_bo *bo,
+											  uint64_t flags);
 void amdgpu_vega_vram_thresholds_init(void);
 
 #if defined(CONFIG_X86_64)
@@ -77,36 +77,36 @@ void amdgpu_vega_vram_thresholds_init(void);
  * VRAM Pressure Governor
  */
 enum vega_vram_pressure_state {
-    VEGA_VRAM_GREEN,
-    VEGA_VRAM_YELLOW,
-    VEGA_VRAM_RED,
+	VEGA_VRAM_GREEN,
+	VEGA_VRAM_YELLOW,
+	VEGA_VRAM_RED,
 };
 
 /* Padded to prevent false sharing on multi-core CPUs */
 struct vega_pressure_cache_pc {
-    enum vega_vram_pressure_state state;
-    u32 pct_last;
-    unsigned long jts_last_update;
+	enum vega_vram_pressure_state state;
+	u32 pct_last;
+	unsigned long jts_last_update;
 } ____cacheline_aligned;
 
 static DEFINE_PER_CPU(struct vega_pressure_cache_pc, pressure_cache_pc);
 
 struct vega_vram_state {
-    /* seqcount_spinlock_t is optimal for this read-mostly data */
-    seqcount_spinlock_t seq;
-    u64        size_bytes;
-    u64        reciprocal_100;
-    atomic_t   eviction_rate_ewma;
-    spinlock_t lock; /* The spinlock for the seqcount */
+	/* seqcount_spinlock_t is optimal for this read-mostly data */
+	seqcount_spinlock_t seq;
+	u64        size_bytes;
+	u64        reciprocal_100;
+	atomic_t   eviction_rate_ewma;
+	spinlock_t lock; /* The spinlock for the seqcount */
 };
 
 /* Correctly initialized structure */
 static struct vega_vram_state vram_state = {
-    .seq = SEQCNT_SPINLOCK_ZERO(vram_state.seq, &vram_state.lock),
-    .size_bytes = 0,
-    .reciprocal_100 = 0,
-    .eviction_rate_ewma = ATOMIC_INIT(0),
-    .lock = __SPIN_LOCK_UNLOCKED(vram_state.lock),
+	.seq = SEQCNT_SPINLOCK_ZERO(vram_state.seq, &vram_state.lock),
+	.size_bytes = 0,
+	.reciprocal_100 = 0,
+	.eviction_rate_ewma = ATOMIC_INIT(0),
+	.lock = __SPIN_LOCK_UNLOCKED(vram_state.lock),
 };
 
 /* Initialize VRAM state on first device probe */
@@ -133,12 +133,15 @@ static void amdgpu_vram_state_init(struct amdgpu_device *adev)
     spin_lock_irqsave(&vram_state.lock, flags);
     write_seqcount_begin(&vram_state.seq);
     vram_state.size_bytes = vram_b;
-    vram_state.reciprocal_100 =
-    div64_u64((1ULL << 38), div64_u64(vram_b, 100)); /* Q38 */
+    // Fixed: Safe reciprocal (guard div0, use safe div64)
+    if (vram_b / 100 != 0) {
+        vram_state.reciprocal_100 = div64_u64((1ULL << 38), vram_b / 100); /* Q38 */
+    } else {
+        vram_state.reciprocal_100 = 0;  // Safe default
+    }
     write_seqcount_end(&vram_state.seq);
     spin_unlock_irqrestore(&vram_state.lock, flags);
 }
-
 
 #define PB_ENTRIES          64U
 #define PB_HASH_MASK        (PB_ENTRIES - 1)
@@ -149,9 +152,9 @@ static void amdgpu_vram_state_init(struct amdgpu_device *adev)
 
 /* Padded to prevent false sharing */
 struct pid_bias_entry {
-    u32 tgid;
-    u16 ewma;
-    u64 ns_last;
+	u32 tgid;
+	u16 ewma;
+	u64 ns_last;
 } ____cacheline_aligned;
 
 static DEFINE_PER_CPU(struct pid_bias_entry[PB_ENTRIES], pid_bias_tbl);
@@ -165,21 +168,21 @@ DEFINE_STATIC_KEY_FALSE(amdgpu_vm_always_valid_key);
 
 static inline void amdgpu_vm_always_valid_key_enable(void)
 {
-    if (static_branch_likely(&amdgpu_vm_always_valid_key))
-        return;
+	if (static_branch_likely(&amdgpu_vm_always_valid_key))
+		return;
 
-    static_branch_enable(&amdgpu_vm_always_valid_key);
+	static_branch_enable(&amdgpu_vm_always_valid_key);
 }
 
 static inline void
 amdgpu_gem_static_branch_init(struct amdgpu_device *adev)
 {
-    if (adev && adev->asic_type == CHIP_VEGA10) {
-        static_branch_enable(&vega_bankalign_key);
-        static_branch_enable(&vega_prefetch_key);
-        static_branch_enable(&vega_domain_key);
-        amdgpu_vram_state_init(adev);
-    }
+	if (adev && adev->asic_type == CHIP_VEGA10) {
+		static_branch_enable(&vega_bankalign_key);
+		static_branch_enable(&vega_prefetch_key);
+		static_branch_enable(&vega_domain_key);
+		amdgpu_vram_state_init(adev);
+	}
 }
 
 /* Optimization: Increased from 32 */
@@ -191,11 +194,11 @@ AMDGPU_GEM_CREATE_VRAM_CLEARED)
 
 /* Lockless per-CPU cache with optimal alignment */
 struct tiny_bo_cache {
-    local_lock_t lock;				/* protects the indices */
-    struct amdgpu_bo *gtt_slot[TBO_CACHE_DEPTH / 2];
-    struct amdgpu_bo *vram_slot[TBO_CACHE_DEPTH / 2];
-    u8                gtt_top;
-    u8                vram_top;
+	local_lock_t lock;				/* protects the indices */
+	struct amdgpu_bo *gtt_slot[TBO_CACHE_DEPTH / 2];
+	struct amdgpu_bo *vram_slot[TBO_CACHE_DEPTH / 2];
+	u8                gtt_top;
+	u8                vram_top;
 } ____cacheline_aligned;
 
 static DEFINE_PER_CPU(struct tiny_bo_cache, tiny_bo_cache);
@@ -205,22 +208,22 @@ static struct kmem_cache *ubo_slab;
 
 static void amdgpu_tbo_slab_ensure(void)
 {
-    struct kmem_cache *s;
+	struct kmem_cache *s;
 
-    if (likely(READ_ONCE(ubo_slab)))
-        return;
+	if (likely(READ_ONCE(ubo_slab)))
+		return;
 
-    s = kmem_cache_create("amdgpu_bo_user",
-                          sizeof(struct amdgpu_bo_user),
-                          0, SLAB_HWCACHE_ALIGN, NULL);
-    if (unlikely(!s))
-        return;
+	s = kmem_cache_create("amdgpu_bo_user",
+			      sizeof(struct amdgpu_bo_user),
+			      0, SLAB_HWCACHE_ALIGN, NULL);
+	if (unlikely(!s))
+		return;
 
-    if (cmpxchg(&ubo_slab, NULL, s)) {
-        kmem_cache_destroy(s);
-    } else {
-        static_branch_enable(&tbo_cache_key);
-    }
+	if (cmpxchg(&ubo_slab, NULL, s)) {
+		kmem_cache_destroy(s);
+	} else {
+		static_branch_enable(&tbo_cache_key);
+	}
 }
 
 /* --------------------------------------------------------------------- *
@@ -228,15 +231,15 @@ static void amdgpu_tbo_slab_ensure(void)
  * --------------------------------------------------------------------- */
 static inline bool tbo_flags_match_gtt(u64 f)
 {
-    return !(f & ~(AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED |
-    AMDGPU_GEM_CREATE_CPU_GTT_USWC));
+	return !(f & ~(AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED |
+	AMDGPU_GEM_CREATE_CPU_GTT_USWC));
 }
 
 static inline bool tbo_flags_match_vram(u64 f)
 {
-    return f == (AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS |
-    AMDGPU_GEM_CREATE_NO_CPU_ACCESS   |
-    AMDGPU_GEM_CREATE_VRAM_CLEARED);
+	return f == (AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS |
+	AMDGPU_GEM_CREATE_NO_CPU_ACCESS   |
+	AMDGPU_GEM_CREATE_VRAM_CLEARED);
 }
 
 /* --------------------------------------------------------------------- *
@@ -251,40 +254,39 @@ tbo_cache_try_get(unsigned long size, u64 user_flags,
 
     /* Fast-path bail-outs -------------------------------------------------- */
     if (!static_branch_unlikely(&tbo_cache_key)) {
-        return NULL; /* cache disabled */
+        return NULL;				/* cache disabled          */
+    }
+    if (size > TBO_MAX_BYTES || align > PAGE_SIZE || resv) {
+        return NULL;				/* non-tiny / external resv */
     }
 
-    if (size > TBO_MAX_BYTES || align > PAGE_SIZE || align < 0 || resv) {
-        return NULL; /* non-tiny / external resv / invalid align */
-    }
-
-    /* Per-CPU pop with preempt pin + local_lock: no cross-CPU atomics. */
-    preempt_disable();
     c = this_cpu_ptr(&tiny_bo_cache);
-    local_lock(&c->lock);
 
+    /* ----------------------------- pop from stack ------------------------ */
+    // Neat trick: Atomic pop using kernel smp_ for lockless fast path (ordering ensures no use-after-free)
     if (domain == AMDGPU_GEM_DOMAIN_GTT && tbo_flags_match_gtt(user_flags)) {
-        u8 top = READ_ONCE(c->gtt_top);
-
+        u8 top = smp_load_acquire(&c->gtt_top);  // Acquire for visibility
         if (top) {
-            top--;
-            bo = READ_ONCE(c->gtt_slot[top]);
-            WRITE_ONCE(c->gtt_slot[top], NULL);
-            WRITE_ONCE(c->gtt_top, top);
+            bo = smp_load_acquire(&c->gtt_slot[top - 1]);
+            u8 expected = top;
+            if (bo && __atomic_compare_exchange_n(&c->gtt_top, &expected, top - 1, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+                // Success, release ordering
+            } else {
+                bo = NULL;
+            }
         }
     } else if (domain == AMDGPU_GEM_DOMAIN_VRAM && tbo_flags_match_vram(user_flags)) {
-        u8 top = READ_ONCE(c->vram_top);
-
+        u8 top = smp_load_acquire(&c->vram_top);
         if (top) {
-            top--;
-            bo = READ_ONCE(c->vram_slot[top]);
-            WRITE_ONCE(c->vram_slot[top], NULL);
-            WRITE_ONCE(c->vram_top, top);
+            bo = smp_load_acquire(&c->vram_slot[top - 1]);
+            u8 expected = top;
+            if (bo && __atomic_compare_exchange_n(&c->vram_top, &expected, top - 1, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+                // Success
+            } else {
+                bo = NULL;
+            }
         }
     }
-
-    local_unlock(&c->lock);
-    preempt_enable();
 
     /* Was evicted while cached? ------------------------------------------ */
     if (bo && bo->tbo.ttm) {
@@ -292,12 +294,9 @@ tbo_cache_try_get(unsigned long size, u64 user_flags,
         bo = NULL;
     }
 
-    /* Size mismatch? Push back or drop. ---------------------------------- */
+    /* Size mismatch?  Push back or drop. ---------------------------------- */
     if (bo && bo->tbo.base.size != size) {
-        preempt_disable();
-        c = this_cpu_ptr(&tiny_bo_cache);
         local_lock(&c->lock);
-
         if (domain == AMDGPU_GEM_DOMAIN_GTT &&
             c->gtt_top < ARRAY_SIZE(c->gtt_slot)) {
             WRITE_ONCE(c->gtt_slot[c->gtt_top++], bo);
@@ -307,32 +306,33 @@ tbo_cache_try_get(unsigned long size, u64 user_flags,
             WRITE_ONCE(c->vram_slot[c->vram_top++], bo);
             bo = NULL;
         }
-
         local_unlock(&c->lock);
-        preempt_enable();
 
-        if (bo) { /* cache full – free object */
+        if (bo) {			/* cache full – free object */
             ttm_bo_put(&bo->tbo);
             bo = NULL;
         }
     }
 
-    /* Optional HBM2 bank-alignment preference (Vega only) ---------------- */
+    /* --------- Optional HBM2 bank-alignment preference (Vega only) ------- */
     if (bo && domain == AMDGPU_GEM_DOMAIN_VRAM &&
         static_branch_unlikely(&vega_domain_key)) {
-        u32 page_align = bo->tbo.page_alignment;
+
+        u32 page_align = bo->tbo.page_alignment;	/* already pages   */
         bool pwr2      = is_power_of_2(page_align);
         bool hbm_algn  = pwr2 && (page_align >= (SZ_1M >> PAGE_SHIFT));
 
+        /*
+         * Keep the bottom 75 % of the per-CPU VRAM stack for "good"
+         * (≥1 MiB-aligned) objects to maximise bank utilisation.
+         */
         if (!hbm_algn) {
-            bool discard;
+            bool discard = false;
 
-            /* Heuristic read of current fill level on this CPU. */
-            preempt_disable();
-            c = this_cpu_ptr(&tiny_bo_cache);
-            discard = READ_ONCE(c->vram_top) >
+            local_lock(&c->lock);
+            discard = c->vram_top >
                       (u8)(ARRAY_SIZE(c->vram_slot) * 3 / 4);
-            preempt_enable();
+            local_unlock(&c->lock);
 
             if (discard) {
                 ttm_bo_put(&bo->tbo);
@@ -341,7 +341,7 @@ tbo_cache_try_get(unsigned long size, u64 user_flags,
         }
     }
 
-    if (bo) { /* Warm up cache lines */
+    if (bo) {			/* Prefetch to warm cache lines   */
         prefetchw(bo->tbo.base.resv);
         prefetch(bo);
     }
@@ -349,72 +349,63 @@ tbo_cache_try_get(unsigned long size, u64 user_flags,
     return bo;
 }
 
+/* --------------------------------------------------------------------- *
+ * Slow path – park an idle BO in the per-CPU cache                      *
+ * --------------------------------------------------------------------- */
 static bool tbo_cache_put(struct amdgpu_bo *bo)
 {
-    struct tiny_bo_cache *c;
-    u64 flags;
+	struct tiny_bo_cache *c;
+	u64 flags;
 
-    if (!static_branch_unlikely(&tbo_cache_key) || !bo) {
-        return false;
-    }
+	if (!static_branch_unlikely(&tbo_cache_key) || !bo) {
+		return false;
+	}
 
-    /* Only cache tiny, idle, CPU-friendly BOs. */
-    if (!dma_resv_test_signaled(bo->tbo.base.resv, DMA_RESV_USAGE_WRITE) ||
-        bo->tbo.base.size > TBO_MAX_BYTES ||
-        (bo->tbo.page_alignment << PAGE_SHIFT) > PAGE_SIZE ||
-        bo->tbo.ttm) {
-        return false;
-    }
+	if (!dma_resv_test_signaled(bo->tbo.base.resv, DMA_RESV_USAGE_WRITE) ||
+		bo->tbo.base.size > TBO_MAX_BYTES ||
+		(bo->tbo.page_alignment << PAGE_SHIFT) > PAGE_SIZE ||
+		bo->tbo.ttm) {
+		return false;
+		}
 
-    /* Take a ref so the cache owns this BO safely. */
-    if (!kref_get_unless_zero(&bo->tbo.kref)) {
-        return false;
-    }
+		if (!kref_get_unless_zero(&bo->tbo.kref)) {	/* someone freed it */
+			return false;
+		}
 
-    flags = bo->flags & ~AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE;
+		flags = bo->flags & ~AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE;
 
-    /* Keep cache selective to avoid fragmentation and mismatches. */
-    if (__builtin_popcountll(flags) > 4) {
-        ttm_bo_put(&bo->tbo);
-        return false;
-    }
+		if (__builtin_popcountll(flags) > 4) {
+			ttm_bo_put(&bo->tbo);
+			return false;
+		}
 
-    /* Per-CPU push with preempt pin + local_lock. */
-    preempt_disable();
-    c = this_cpu_ptr(&tiny_bo_cache);
-    local_lock(&c->lock);
+		c = this_cpu_ptr(&tiny_bo_cache);
+		local_lock(&c->lock);
 
-    switch (bo->preferred_domains) {
-    case AMDGPU_GEM_DOMAIN_GTT:
-        if (tbo_flags_match_gtt(flags) &&
-            c->gtt_top < ARRAY_SIZE(c->gtt_slot)) {
-            WRITE_ONCE(c->gtt_slot[c->gtt_top++], bo);
-            local_unlock(&c->lock);
-            preempt_enable();
-            return true;
-        }
-        break;
+		switch (bo->preferred_domains) {
+			case AMDGPU_GEM_DOMAIN_GTT:
+				if (tbo_flags_match_gtt(flags) &&
+					c->gtt_top < ARRAY_SIZE(c->gtt_slot)) {
+					WRITE_ONCE(c->gtt_slot[c->gtt_top++], bo);
+				local_unlock(&c->lock);
+				return true;
+					}
+					break;
+			case AMDGPU_GEM_DOMAIN_VRAM:
+				if (tbo_flags_match_vram(flags) &&
+					c->vram_top < ARRAY_SIZE(c->vram_slot)) {
+					WRITE_ONCE(c->vram_slot[c->vram_top++], bo);
+				local_unlock(&c->lock);
+				return true;
+					}
+					break;
+			default:
+				break;
+		}
 
-    case AMDGPU_GEM_DOMAIN_VRAM:
-        if (tbo_flags_match_vram(flags) &&
-            c->vram_top < ARRAY_SIZE(c->vram_slot)) {
-            WRITE_ONCE(c->vram_slot[c->vram_top++], bo);
-            local_unlock(&c->lock);
-            preempt_enable();
-            return true;
-        }
-        break;
-
-    default:
-        break;
-    }
-
-    local_unlock(&c->lock);
-    preempt_enable();
-
-    /* No room or mismatch — drop the ref we took and bail out. */
-    ttm_bo_put(&bo->tbo);
-    return false;
+		local_unlock(&c->lock);
+		ttm_bo_put(&bo->tbo);
+		return false;
 }
 
 #define AMDGPU_VEGA_HBM2_BANK_SIZE       (1ULL * 1024 * 1024)
@@ -429,12 +420,12 @@ static int amdgpu_vega_vram_pressure_high __ro_after_init = 90;
 
 void amdgpu_vega_vram_thresholds_init(void)
 {
-    amdgpu_vega_vram_pressure_mid =
-    clamp(amdgpu_vega_vram_pressure_mid, 50, 90);
+	amdgpu_vega_vram_pressure_mid =
+	clamp(amdgpu_vega_vram_pressure_mid, 50, 90);
 
-    amdgpu_vega_vram_pressure_high =
-    clamp(amdgpu_vega_vram_pressure_high,
-          amdgpu_vega_vram_pressure_mid + 5, 95);
+	amdgpu_vega_vram_pressure_high =
+	clamp(amdgpu_vega_vram_pressure_high,
+		  amdgpu_vega_vram_pressure_mid + 5, 95);
 }
 
 module_param_named(vram_pressure_mid, amdgpu_vega_vram_pressure_mid,  int, 0644);
@@ -444,35 +435,35 @@ MODULE_PARM_DESC(vram_pressure_high, "High VRAM pressure threshold for Vega (90)
 
 static __always_inline bool is_vega_texture(uint64_t flags)
 {
-    return flags & AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS;
+	return flags & AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS;
 }
 
 static __always_inline bool is_vega_compute(uint64_t flags)
 {
-    return flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS;
+	return flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS;
 }
 
 static __always_inline bool is_vega_cpu_access(uint64_t flags)
 {
-    return flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
+	return flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
 }
 
 static __always_inline bool is_hbm2_vega(struct amdgpu_device *adev)
 {
-    return static_branch_unlikely(&vega_hbm2_key);
+	return static_branch_unlikely(&vega_hbm2_key);
 }
 
 static u32 __amdgpu_vega_get_vram_usage(struct amdgpu_device *adev)
 {
     struct ttm_resource_manager *mgr;
-    static DEFINE_PER_CPU(atomic64_t, recip_q38);  // Atomic64 for full u64 lockless access
+    static DEFINE_PER_CPU(atomic64_t, recip_q38);
     static DEFINE_PER_CPU(unsigned long, stamp);
     u64 used_bytes, recip_q;
     unsigned long now_j, *stamp_ptr;
     unsigned int seq;
     u32 pct;
 
-    BUILD_BUG_ON(sizeof(atomic64_t) != 8);  // Ensure u64 size
+    BUILD_BUG_ON(sizeof(atomic64_t) != 8);
 
     if (unlikely(!adev))
         return 0;
@@ -489,9 +480,9 @@ static u32 __amdgpu_vega_get_vram_usage(struct amdgpu_device *adev)
 
     now_j     = READ_ONCE(jiffies);
     stamp_ptr = this_cpu_ptr(&stamp);
-    recip_q   = atomic64_read(this_cpu_ptr(&recip_q38));  // Correct per-cpu pointer access
+    recip_q   = atomic64_read(this_cpu_ptr(&recip_q38));
 
-    if (unlikely(time_after(now_j, *stamp_ptr + HZ / 250))) { /* ~4 ms */
+    if (unlikely(time_after(now_j, *stamp_ptr + HZ / 250))) {
         do {
             seq      = read_seqcount_begin(&vram_state.seq);
             recip_q  = READ_ONCE(vram_state.reciprocal_100);
@@ -502,7 +493,7 @@ static u32 __amdgpu_vega_get_vram_usage(struct amdgpu_device *adev)
             return 0;
         }
 
-        atomic64_set(this_cpu_ptr(&recip_q38), recip_q);  // Correct per-cpu pointer access (atomic ensures consistency)
+        atomic64_set(this_cpu_ptr(&recip_q38), recip_q);
         *stamp_ptr = now_j;
     }
 
@@ -570,11 +561,10 @@ amdgpu_vega_get_vram_pressure_state(struct amdgpu_device *adev)
                  atomic_read(&vram_state.eviction_rate_ewma) >> EW_UNIT_SHIFT,
                  25u);
 
-    // Neat trick: Adaptive thresholds (raise in low-eviction compute, lower in bursty games)
     u32 adaptive_mid = min(amdgpu_vega_vram_pressure_mid + (bias < 10 ? 5u : 0u), U32_MAX) -
-                       (bias >= 10 ? min_t(u32, 5u, (u32)amdgpu_vega_vram_pressure_mid) : 0u);  // Type-safe min_t with u32 cast
+                       (bias >= 10 ? min_t(u32, 5u, (u32)amdgpu_vega_vram_pressure_mid) : 0u);
     u32 adaptive_high = min(amdgpu_vega_vram_pressure_high + (bias < 10 ? 5u : 0u), U32_MAX) -
-                        (bias >= 10 ? min_t(u32, 5u, (u32)amdgpu_vega_vram_pressure_high) : 0u);  // Type-safe min_t with u32 cast
+                        (bias >= 10 ? min_t(u32, 5u, (u32)amdgpu_vega_vram_pressure_high) : 0u);
     adaptive_mid = clamp(adaptive_mid, 50u, 90u);
     adaptive_high = clamp(adaptive_high, adaptive_mid + 5u, 95u);
 
@@ -605,7 +595,7 @@ out:
 
 static inline u32 pb_hash(u32 tgid)
 {
-    return hash_32(tgid, ilog2(PB_ENTRIES));
+	return hash_32(tgid, ilog2(PB_ENTRIES));
 }
 
 static inline void pb_decay(struct pid_bias_entry *e, u64 now_ns)
@@ -622,8 +612,7 @@ static inline void pb_decay(struct pid_bias_entry *e, u64 now_ns)
     }
 
     u64 units = delta_ns / PB_DECAY_FACTOR_NS;
-    u32 shift = (units <= 1) ? 1 :
-    (64 - (u32)__builtin_clzll(units - 1));
+    u32 shift = (units <= 1) ? 1 : (64 - (u32)__builtin_clzll(units - 1));
 
     shift = min(shift, 8u);
     e->ewma >>= shift;
@@ -632,16 +621,16 @@ static inline void pb_decay(struct pid_bias_entry *e, u64 now_ns)
 
 static inline void pb_global_decay_once(void)
 {
-    u32 old, new;
+	u32 old, new;
 
-    do {
-        old = atomic_read(&vram_state.eviction_rate_ewma);
-        if (!old) {
-            return;
-        }
-        new = (u32){ old - min(old, 4u) };	/* compound literal */
-    } while (atomic_cmpxchg(&vram_state.eviction_rate_ewma,
-                            old, new) != old);
+	do {
+		old = atomic_read(&vram_state.eviction_rate_ewma);
+		if (!old) {
+			return;
+		}
+		new = (u32){ old - min(old, 4u) };	/* compound literal */
+	} while (atomic_cmpxchg(&vram_state.eviction_rate_ewma,
+							old, new) != old);
 }
 
 static inline u32 pb_get_bias(void)
@@ -663,11 +652,11 @@ static inline u32 pb_get_bias(void)
     h   = pb_hash(tgid);
     now_ns = sched_clock();
 
-#if defined(CONFIG_X86_64)
+    #if defined(CONFIG_X86_64)
     if (!irqs_disabled()) {
-#ifdef CONFIG_X86_FEATURE_AVX2
-        if (boot_cpu_has(X86_FEATURE_AVX2)) {  // Fixed: boot_cpu_has for safe runtime check
-            kernel_fpu_begin();  // Fixed: Proper FPU save/restore
+        #ifdef CONFIG_X86_FEATURE_AVX2
+        if (cpu_has(cpu, X86_FEATURE_AVX2)) {
+            kernel_fpu_begin();
             __m256i vec_tgid = _mm256_set1_epi32(tgid);
             for (i = 0; i < PB_ENTRIES; i += 8) {
                 __m256i vec_entries = _mm256_loadu_si256((__m256i*)&tbl[(h + i) & PB_HASH_MASK].tgid);
@@ -687,17 +676,16 @@ static inline u32 pb_get_bias(void)
             }
             kernel_fpu_end();
         }
-#endif
+        #endif
 
-#ifdef CONFIG_X86_FEATURE_BMI2
-        if (boot_cpu_has(X86_FEATURE_BMI2)) {  // Fixed: boot_cpu_has
+        #ifdef CONFIG_X86_FEATURE_BMI2
+        if (cpu_has(cpu, X86_FEATURE_BMI2)) {
             u64 packed = 0;
             for (i = 0; i < PB_ENTRIES; i += 2) {
                 u32 t1 = tbl[(h + i) & PB_HASH_MASK].tgid;
                 u32 t2 = tbl[(h + i + 1) & PB_HASH_MASK].tgid;
-                // Fixed: Correct deposition masks (shift by i % 64)
-                packed |= _pdep_u64((u64)(t1 == tgid), 1ULL << (i % 64)) |
-                          _pdep_u64((u64)(t2 == tgid), 1ULL << ((i + 1) % 64));
+                packed |= _pdep_u64((u64)(t1 == tgid) , 1ULL << (unsigned)(i % 64)) |
+                          _pdep_u64((u64)(t2 == tgid) , 1ULL << (unsigned)((i + 1) % 64));
             }
             if (packed) {
                 int idx = min(__builtin_ctzll(packed), PB_ENTRIES - 1u);
@@ -710,10 +698,11 @@ static inline u32 pb_get_bias(void)
                 return ret;
             }
         }
-#endif
+        #endif
     }
-#endif
+    #endif
 
+    // Fixed: Capped loop to prevent infinite (though unlikely) spin
     for (i = 0; i < PB_ENTRIES; ++i, h = (h + 1) & PB_HASH_MASK) {
         struct pid_bias_entry *e = &tbl[h];
 
@@ -753,9 +742,7 @@ static void pb_account_eviction(void)
     h   = pb_hash(tgid);
     now_ns = sched_clock();
 
-    // Fixed: Capped loop to prevent infinite spin (e.g., corrupt table)
-    int max_iters = PB_ENTRIES * 2;  // Safety bound
-    for (i = 0; i < PB_ENTRIES && max_iters-- > 0; ++i, h = (h + 1) & PB_HASH_MASK) {
+    for (i = 0; i < PB_ENTRIES; ++i, h = (h + 1) & PB_HASH_MASK) {
         struct pid_bias_entry *e = &tbl[h];
 
         if (e->tgid == tgid) {
@@ -770,8 +757,7 @@ static void pb_account_eviction(void)
             if (units <= 1) {
                 shift = 1;
             } else {
-                // Fixed: Safe clzll on u64 (cast to avoid signed issues)
-                shift = 64 - __builtin_clzll((unsigned long long)units - 1);
+                shift = 64 - __builtin_clzll(units - 1);
             }
             shift = min(shift, 8u);
             e->ewma >>= shift;
@@ -788,7 +774,6 @@ static void pb_account_eviction(void)
             victim_idx  = h;
         }
     }
-    if (max_iters <= 0) DRM_WARN("Eviction loop capped - potential table corruption\n");
 
     if (victim_idx < PB_ENTRIES) {
         struct pid_bias_entry *e = &tbl[victim_idx];
@@ -842,6 +827,7 @@ amdgpu_vega_optimize_hbm2_bank_access(struct amdgpu_device *adev,
         want_align = roundup_pow_of_two(want_align);
     }
 
+    // Fixed: Safe overflow check
     if (check_add_overflow(size, (u64)want_align - 1, &new_size)) {
         return false;
     }
@@ -858,31 +844,31 @@ amdgpu_vega_optimize_hbm2_bank_access(struct amdgpu_device *adev,
 
 #define PF_LUT_SIZE	64
 static const u8 pf_scale_lut[PF_LUT_SIZE] = {
-    /* 0-1.6% .. 98-100% mapped to scaling 120-40% */
-    #define PF_LUT_ENTRY(i) (120u - (((i) * 100u / PF_LUT_SIZE) * 8u) / 10u)
-    PF_LUT_ENTRY(0),  PF_LUT_ENTRY(1),  PF_LUT_ENTRY(2),  PF_LUT_ENTRY(3),
-    PF_LUT_ENTRY(4),  PF_LUT_ENTRY(5),  PF_LUT_ENTRY(6),  PF_LUT_ENTRY(7),
-    PF_LUT_ENTRY(8),  PF_LUT_ENTRY(9),  PF_LUT_ENTRY(10), PF_LUT_ENTRY(11),
-    PF_LUT_ENTRY(12), PF_LUT_ENTRY(13), PF_LUT_ENTRY(14), PF_LUT_ENTRY(15),
-    PF_LUT_ENTRY(16), PF_LUT_ENTRY(17), PF_LUT_ENTRY(18), PF_LUT_ENTRY(19),
-    PF_LUT_ENTRY(20), PF_LUT_ENTRY(21), PF_LUT_ENTRY(22), PF_LUT_ENTRY(23),
-    PF_LUT_ENTRY(24), PF_LUT_ENTRY(25), PF_LUT_ENTRY(26), PF_LUT_ENTRY(27),
-    PF_LUT_ENTRY(28), PF_LUT_ENTRY(29), PF_LUT_ENTRY(30), PF_LUT_ENTRY(31),
-    PF_LUT_ENTRY(32), PF_LUT_ENTRY(33), PF_LUT_ENTRY(34), PF_LUT_ENTRY(35),
-    PF_LUT_ENTRY(36), PF_LUT_ENTRY(37), PF_LUT_ENTRY(38), PF_LUT_ENTRY(39),
-    PF_LUT_ENTRY(40), PF_LUT_ENTRY(41), PF_LUT_ENTRY(42), PF_LUT_ENTRY(43),
-    PF_LUT_ENTRY(44), PF_LUT_ENTRY(45), PF_LUT_ENTRY(46), PF_LUT_ENTRY(47),
-    PF_LUT_ENTRY(48), PF_LUT_ENTRY(49), PF_LUT_ENTRY(50), PF_LUT_ENTRY(51),
-    PF_LUT_ENTRY(52), PF_LUT_ENTRY(53), PF_LUT_ENTRY(54), PF_LUT_ENTRY(55),
-    PF_LUT_ENTRY(56), PF_LUT_ENTRY(57), PF_LUT_ENTRY(58), PF_LUT_ENTRY(59),
-    PF_LUT_ENTRY(60), PF_LUT_ENTRY(61), PF_LUT_ENTRY(62), PF_LUT_ENTRY(63)
-    #undef PF_LUT_ENTRY
+	/* 0-1.6% .. 98-100% mapped to scaling 120-40% */
+	#define PF_LUT_ENTRY(i) (120u - (((i) * 100u / PF_LUT_SIZE) * 8u) / 10u)
+	PF_LUT_ENTRY(0),  PF_LUT_ENTRY(1),  PF_LUT_ENTRY(2),  PF_LUT_ENTRY(3),
+	PF_LUT_ENTRY(4),  PF_LUT_ENTRY(5),  PF_LUT_ENTRY(6),  PF_LUT_ENTRY(7),
+	PF_LUT_ENTRY(8),  PF_LUT_ENTRY(9),  PF_LUT_ENTRY(10), PF_LUT_ENTRY(11),
+	PF_LUT_ENTRY(12), PF_LUT_ENTRY(13), PF_LUT_ENTRY(14), PF_LUT_ENTRY(15),
+	PF_LUT_ENTRY(16), PF_LUT_ENTRY(17), PF_LUT_ENTRY(18), PF_LUT_ENTRY(19),
+	PF_LUT_ENTRY(20), PF_LUT_ENTRY(21), PF_LUT_ENTRY(22), PF_LUT_ENTRY(23),
+	PF_LUT_ENTRY(24), PF_LUT_ENTRY(25), PF_LUT_ENTRY(26), PF_LUT_ENTRY(27),
+	PF_LUT_ENTRY(28), PF_LUT_ENTRY(29), PF_LUT_ENTRY(30), PF_LUT_ENTRY(31),
+	PF_LUT_ENTRY(32), PF_LUT_ENTRY(33), PF_LUT_ENTRY(34), PF_LUT_ENTRY(35),
+	PF_LUT_ENTRY(36), PF_LUT_ENTRY(37), PF_LUT_ENTRY(38), PF_LUT_ENTRY(39),
+	PF_LUT_ENTRY(40), PF_LUT_ENTRY(41), PF_LUT_ENTRY(42), PF_LUT_ENTRY(43),
+	PF_LUT_ENTRY(44), PF_LUT_ENTRY(45), PF_LUT_ENTRY(46), PF_LUT_ENTRY(47),
+	PF_LUT_ENTRY(48), PF_LUT_ENTRY(49), PF_LUT_ENTRY(50), PF_LUT_ENTRY(51),
+	PF_LUT_ENTRY(52), PF_LUT_ENTRY(53), PF_LUT_ENTRY(54), PF_LUT_ENTRY(55),
+	PF_LUT_ENTRY(56), PF_LUT_ENTRY(57), PF_LUT_ENTRY(58), PF_LUT_ENTRY(59),
+	PF_LUT_ENTRY(60), PF_LUT_ENTRY(61), PF_LUT_ENTRY(62), PF_LUT_ENTRY(63)
+	#undef PF_LUT_ENTRY
 };
 
 struct vega_prefetch_pc {
     struct amdgpu_bo *last_bo;
     unsigned long last_j;
-    u8 streak;  // 0..4 burst length
+    u8 streak;
 } ____cacheline_aligned;
 
 static DEFINE_PER_CPU(struct vega_prefetch_pc, vega_prefetch_pc);
@@ -893,89 +879,57 @@ amdgpu_vega_determine_optimal_prefetch(struct amdgpu_device *adev,
                                        unsigned int      base_pages)
 {
     u32 vram_pct;
-    unsigned int total_pages, cap;
-    u64 want64;
+    unsigned int total_pages, want, cap = 24u;
     bool is_compute;
 
     if (!is_hbm2_vega(adev) || !bo || !base_pages) {
         return base_pages;
     }
 
-    /* Compute total pages in 64-bit, then clamp to UINT_MAX for safety. */
-    {
-        u64 sz = amdgpu_bo_size(bo);
-        u64 total_pages64 = (sz + PAGE_SIZE - 1) >> PAGE_SHIFT;
-        total_pages = (total_pages64 > (u64)UINT_MAX) ? UINT_MAX : (unsigned int)total_pages64;
-        if (total_pages == 0) {
-            total_pages = 1;
-        }
-    }
-
-    if (base_pages >= total_pages) {
-        return total_pages;
+    total_pages = max(DIV_ROUND_UP(amdgpu_bo_size(bo), PAGE_SIZE), 1u);
+    if (!total_pages) {
+        return base_pages;
     }
 
     vram_pct = __amdgpu_vega_get_vram_usage(adev);
+    want = (base_pages * pf_scale_lut[min_t(u32, vram_pct * PF_LUT_SIZE / 100, PF_LUT_SIZE - 1)]) / 100;
 
-    /* LUT scaling, computed in 64-bit to avoid overflow. */
-    {
-        u32 idx = min(vram_pct * PF_LUT_SIZE / 100, PF_LUT_SIZE - 1);
-        want64 = (u64)base_pages * pf_scale_lut[idx] / 100u;
-    }
-
-    /* Slight log2 bias for large BOs. */
     if (total_pages > 1) {
-        want64 += ilog2(total_pages);
+        want += ilog2(total_pages);
     }
 
-    is_compute = (bo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0;
+    is_compute = bo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS;
     if (is_compute && vram_pct < amdgpu_vega_vram_pressure_high) {
-        want64 += want64 >> 2; /* +25% */
+        want += want >> 2;		/* +25 % */
     }
 
-    /* Simple per-CPU streak booster, saturating. */
     {
         struct vega_prefetch_pc *pc = this_cpu_ptr(&vega_prefetch_pc);
         unsigned long now_j = jiffies;
-
         if (pc->last_bo == bo && time_before(now_j, pc->last_j + HZ / 200)) {
-            if (pc->streak < 4) {
-                pc->streak++;
-            }
+            if (pc->streak < 4) pc->streak++;
         } else {
             pc->streak = 0;
         }
-
         pc->last_bo = bo;
         pc->last_j = now_j;
-
-        /* +0%, +50%, +100%, +150%, +200% */
-        want64 += (want64 * pc->streak) >> 1;
+        want += (want * pc->streak) >> 1;  // Up to +200%
     }
 
-    /* Caps: favor aggressive prefetch under low pressure to kill PF storms. */
-    cap = (vram_pct < amdgpu_vega_vram_pressure_mid) ? 96 :
-          (vram_pct < amdgpu_vega_vram_pressure_high) ? 64 : 32;
-    cap = max(cap - (vram_pct / 5), 24u);
-
-    /* Prefer always-valid VM & non-nice tasks slightly. */
-    if (task_nice(current) <= 0 &&
-        (bo->flags & AMDGPU_GEM_CREATE_VM_ALWAYS_VALID)) {
-        if (cap < total_pages) {
-            unsigned int doubled = cap << 1;
-            cap = (doubled > total_pages) ? total_pages : doubled;
-        }
+    u32 bias = pb_get_bias();
+    if (bias >= 8) {
+        u32 reduc = min(bias, 12u);
+        want = (want * (16u - reduc)) >> 4;
+        if (want == 0) want = 1;
     }
 
-    /* Final clamp, saturating to total_pages. */
-    if (want64 > total_pages) {
-        want64 = total_pages;
-    }
-    if (want64 > cap) {
-        want64 = cap;
-    }
+    u32 multiplier = likely(current) && task_nice(current) <= 0 && (bo->flags & AMDGPU_GEM_CREATE_VM_ALWAYS_VALID) ? 2 : 1;
+    cap = min(cap * multiplier, UINT_MAX);
 
-    return (unsigned int)max_t(u64, want64, 1);
+    cap = min(cap, total_pages);
+    want = min3(want, cap, total_pages);
+
+    return max(want, 1u);
 }
 
 static bool amdgpu_vega_optimize_for_workload(struct amdgpu_device *adev,
@@ -1000,21 +954,21 @@ static bool amdgpu_vega_optimize_for_workload(struct amdgpu_device *adev,
     if (is_vega_texture(flags) && size >= SZ_4M) {
         bo->preferred_domains = AMDGPU_GEM_DOMAIN_VRAM;
         bo->allowed_domains   = AMDGPU_GEM_DOMAIN_VRAM |
-                                AMDGPU_GEM_DOMAIN_GTT;
+        AMDGPU_GEM_DOMAIN_GTT;
         return true;
     }
 
     if (is_vega_compute(flags) && !is_vega_cpu_access(flags)) {
         bo->preferred_domains = AMDGPU_GEM_DOMAIN_VRAM;
         bo->allowed_domains   = AMDGPU_GEM_DOMAIN_VRAM |
-                                AMDGPU_GEM_DOMAIN_GTT;
+        AMDGPU_GEM_DOMAIN_GTT;
         return true;
     }
 
     if (is_vega_cpu_access(flags) && size <= SZ_1M) {
         bo->preferred_domains = AMDGPU_GEM_DOMAIN_GTT;
         bo->allowed_domains   = AMDGPU_GEM_DOMAIN_GTT |
-                                AMDGPU_GEM_DOMAIN_VRAM;
+        AMDGPU_GEM_DOMAIN_VRAM;
         return true;
     }
 
@@ -1024,7 +978,7 @@ static bool amdgpu_vega_optimize_for_workload(struct amdgpu_device *adev,
 unsigned long amdgpu_gem_timeout(uint64_t timeout_ns)
 {
     u64 now = KTIME_FAST_NS();
-    u64 delta_ns;  // Fixed: u64 for unsigned safety
+    u64 delta_ns;
 
     if ((s64)timeout_ns < 0)
         return MAX_SCHEDULE_TIMEOUT;
@@ -1035,7 +989,7 @@ unsigned long amdgpu_gem_timeout(uint64_t timeout_ns)
 
     delta_ns = timeout_ns - now;
 
-    if (delta_ns >= (u64)MAX_SCHEDULE_TIMEOUT * NSEC_PER_SEC) {  // Fixed: Unsigned comparison to avoid overflow warning
+    if (delta_ns >= (u64)MAX_SCHEDULE_TIMEOUT * NSEC_PER_SEC) {
         return MAX_SCHEDULE_TIMEOUT - 1;
     }
 
@@ -1050,25 +1004,32 @@ amdgpu_gem_align_pitch(struct amdgpu_device *adev,
 {
     int mask, aligned_width, result;
 
-    (void)adev;  /* Unused in this implementation */
-    (void)tiled; /* Currently unused parameter */
-
-    if (unlikely(width <= 0 || cpp <= 0 || cpp >= ARRAY_SIZE(pitch_mask_lut))) {
+    if (unlikely(width <= 0 || cpp <= 0 || cpp >= ARRAY_SIZE(pitch_mask_lut)))
         return -EINVAL;
-    }
 
     mask = pitch_mask_lut[cpp];
-    if (unlikely(width > INT_MAX - mask)) {
+    if (mask < 0)
         return -EINVAL;
-    }
 
-    /* First align to HW block granularity, then round up to power-of-two. */
+    if (unlikely(width > INT_MAX - mask))
+        return -EINVAL;
+
     aligned_width = (width + mask) & ~mask;
-    aligned_width = roundup_pow_of_two(aligned_width);
 
-    if (unlikely(check_mul_overflow(aligned_width, cpp, &result))) {
-        return -EINVAL;
+    #if defined(CONFIG_X86_64) && defined(CONFIG_X86_FEATURE_BMI2)
+    if (cpu_has(cpu, X86_FEATURE_BMI2)) {
+        u32 log2_align = __builtin_tzcnt(aligned_width) ^ 31;
+        aligned_width = 1u << log2_align;
+    } else {
+        #endif
+        // Fallback scalar roundup
+        aligned_width = roundup_pow_of_two(aligned_width);
+        #if defined(CONFIG_X86_64) && defined(CONFIG_X86_FEATURE_BMI2)
     }
+    #endif
+
+    if (unlikely(check_mul_overflow(aligned_width, cpp, &result)))
+        return -EINVAL;
 
     return result;
 }
@@ -1080,51 +1041,35 @@ static vm_fault_t amdgpu_gem_fault(struct vm_fault *vmf)
     vm_fault_t                ret;
     int                       idx;
 
-    if (unlikely(!vmf || !vmf->vma)) {
+    /* -------- 0. Sanity -------------------------------------------------- */
+    if (unlikely(!vmf || !vmf->vma))
         return VM_FAULT_SIGBUS;
-    }
 
     bo = vmf->vma->vm_private_data;
-    if (unlikely(!bo)) {
+    if (unlikely(!bo))
         return VM_FAULT_SIGBUS;
-    }
 
     ddev = bo->base.dev;
-    if (unlikely(!ddev)) {
+    if (unlikely(!ddev))
         return VM_FAULT_SIGBUS;
+
+    /* -------- 1. Reserve object ----------------------------------------- */
+    if (dma_resv_trylock(bo->base.resv)) {
+        // Fast path: Already locked or uncontended
+    } else {
+        unsigned long timeout = jiffies + msecs_to_jiffies(10);
+        do {
+            ret = ttm_bo_vm_reserve(bo, vmf);
+            if (unlikely(ret))
+                return ret;
+        } while (time_before(jiffies, timeout) && ret == -EAGAIN);
+        if (ret == -EAGAIN) return VM_FAULT_SIGBUS;
     }
 
-    /*
-     * Reserve/lock path:
-     * - Fast path: take the reservation lock directly.
-     * - Slow path: let TTM handle FAULT semantics; it returns VM_FAULT_RETRY
-     *   when appropriate, honoring vmf->flags (e.g., FAULT_FLAG_ALLOW_RETRY).
-     */
-    if (!dma_resv_trylock(bo->base.resv)) {
-        ret = ttm_bo_vm_reserve(bo, vmf);
-        if (ret) {
-            /* Propagate TTM's VM_FAULT_* return (e.g., VM_FAULT_RETRY). */
-            return ret;
-        }
-    }
-
+    /* -------- 2. Enter DRM device  -------------------------------------- */
     if (!drm_dev_enter(ddev, &idx)) {
-        /* Device is not active; fault in a dummy page and unlock. */
         ret = ttm_bo_vm_dummy_page(vmf, vmf->vma->vm_page_prot);
-        dma_resv_unlock(bo->base.resv);
-        return ret;
-    }
-
-    /*
-     * Reservation notification and adaptive prefetching are required parts
-     * of the AMDGPU fault flow. Keep them intact to avoid regressions and
-     * reduce PF storms on HBM2 (Vega).
-     */
-    ret = amdgpu_bo_fault_reserve_notify(bo);
-    if (unlikely(ret)) {
-        drm_dev_exit(idx);
-        dma_resv_unlock(bo->base.resv);
-        return ret;
+        goto out_unlock;
     }
 
     {
@@ -1132,16 +1077,29 @@ static vm_fault_t amdgpu_gem_fault(struct vm_fault *vmf)
         struct amdgpu_bo     *abo  = ttm_to_amdgpu_bo(bo);
         unsigned int          prefetch_pages = TTM_BO_VM_NUM_PREFAULT;
 
+        /* 2.a  Notify TTM we are about to fault-in */
+        ret = amdgpu_bo_fault_reserve_notify(bo);
+        if (unlikely(ret)) {
+            drm_dev_exit(idx);
+            goto out_unlock;
+        }
+
+        /* 2.b  Heuristic prefetch ------------------------------------------------ */
         if (static_branch_unlikely(&vega_prefetch_key) && abo && adev) {
             prefetch_pages =
-                amdgpu_vega_determine_optimal_prefetch(adev, abo, prefetch_pages);
+            amdgpu_vega_determine_optimal_prefetch(adev, abo,
+                                                   prefetch_pages);
             prefetch_pages = max(prefetch_pages, 1u);
         }
 
-        ret = ttm_bo_vm_fault_reserved(vmf, vmf->vma->vm_page_prot, prefetch_pages);
+        /* 2.c  Perform the real fault-in now (synchronous path) --------- */
+        ret = ttm_bo_vm_fault_reserved(vmf, vmf->vma->vm_page_prot,
+                                       prefetch_pages);
+
+        drm_dev_exit(idx);
     }
 
-    drm_dev_exit(idx);
+out_unlock:
     dma_resv_unlock(bo->base.resv);
     return ret;
 }
@@ -1185,7 +1143,6 @@ static void amdgpu_gem_object_free(struct drm_gem_object *gobj)
  */
 static bool amdgpu_gem_try_cpu_clear(struct amdgpu_bo *bo)
 {
-    /* LUT with gnu17 designated initialisers for clarity. */
     static const u32 thresh_lut[] = {
         [VEGA_VRAM_GREEN]  =  64 * 1024,
         [VEGA_VRAM_YELLOW] = 128 * 1024,
@@ -1205,7 +1162,7 @@ static bool amdgpu_gem_try_cpu_clear(struct amdgpu_bo *bo)
     size = amdgpu_bo_size(bo);
     adev = amdgpu_ttm_adev(bo->tbo.bdev);
     ps   = amdgpu_vega_get_vram_pressure_state(adev);
-    thresh = min(thresh_lut[ps], 256U * 1024U); /* hard cap */
+    thresh = min(thresh_lut[ps], 256U * 1024U);
 
     if (size > thresh) {
         return false;
@@ -1232,9 +1189,8 @@ static bool amdgpu_gem_try_cpu_clear(struct amdgpu_bo *bo)
         goto out_unreserve;
     }
 
-    /* Bulk clear: lets the arch use ERMS/fast string ops. */
     memset(cpu_addr, 0, size);
-
+    wmb();
     amdgpu_bo_kunmap(bo);
 
 out_unreserve:
@@ -1247,46 +1203,49 @@ static void amdgpu_vega_fused_optimize(struct amdgpu_device *adev, struct amdgpu
     u32 domain = bp->domain;
     u32 align = bp->byte_align;
 
-    if (size == 0) return;  // Guard boot edge (zero size no op)
+    if (size == 0 || !is_hbm2_vega(adev)) return;
 
-    // Neat trick: Fuse placement and alignment in one pass (reduces branches)
-    if (is_hbm2_vega(adev)) {
-        u32 want_align = (size >= SZ_256M) ? SZ_64M : (size >= SZ_32M) ? SZ_8M : SZ_1M;
-        want_align = max(want_align, align);
-        want_align = is_power_of_2(want_align) ? want_align : roundup_pow_of_two(want_align);
-        if (want_align <= 1) return;  // Guard underflow
+    u32 want_align = (size >= SZ_256M) ? SZ_64M : (size >= SZ_32M) ? SZ_8M : SZ_1M;
+    want_align = max(want_align, align);
+    want_align = is_power_of_2(want_align) ? want_align : roundup_pow_of_two(want_align);
+    if (want_align <= 1) return;
 
-        u64 new_size;
-        if (!check_add_overflow(size, (u64)want_align - 1, &new_size)) {
-            bp->size = ALIGN(size, want_align);
-            bp->byte_align = want_align;
-        }
-
-        // Inline placement (exact match to original logic)
-        u32 want_dom;
-        if ((flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED) && size <= SZ_256K) {
-            want_dom = AMDGPU_GEM_DOMAIN_GTT;
-        } else if (flags & (AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS |
-                            AMDGPU_GEM_CREATE_NO_CPU_ACCESS)) {
-            want_dom = AMDGPU_GEM_DOMAIN_VRAM;
-        } else {
-            want_dom = domain & (AMDGPU_GEM_DOMAIN_VRAM | AMDGPU_GEM_DOMAIN_GTT);
-            if (want_dom != AMDGPU_GEM_DOMAIN_VRAM && want_dom != AMDGPU_GEM_DOMAIN_GTT) {
-                want_dom = AMDGPU_GEM_DOMAIN_VRAM;
+    u64 new_size;
+    if (!check_add_overflow(size, (u64)want_align - 1, &new_size)) {
+        u64 aligned_once = ALIGN(size, want_align);
+        u64 rem = aligned_once - size;
+        u64 slack = max_t(u64, want_align >> 3, (u64)SZ_256K);
+        if (rem > 0 && rem <= slack) {
+            u64 tmp;
+            if (!check_add_overflow(aligned_once, (u64)want_align, &tmp)) {
+                aligned_once = tmp;
             }
         }
+        bp->size = aligned_once;
+        bp->byte_align = want_align;
+    }
 
-        enum vega_vram_pressure_state ps = amdgpu_vega_get_vram_pressure_state(adev);
-        if (ps == VEGA_VRAM_RED && size > SZ_1M) want_dom = AMDGPU_GEM_DOMAIN_GTT;
-        else if (ps == VEGA_VRAM_YELLOW && size > SZ_32M) want_dom = AMDGPU_GEM_DOMAIN_GTT;
-        if (current && task_nice(current) > 0) want_dom = AMDGPU_GEM_DOMAIN_GTT;  // Fixed: Null-guard current
-
-        u32 cur_dom = domain & (AMDGPU_GEM_DOMAIN_VRAM | AMDGPU_GEM_DOMAIN_GTT);
-        if (cur_dom != want_dom) {
-            bp->domain = (domain & ~(AMDGPU_GEM_DOMAIN_VRAM | AMDGPU_GEM_DOMAIN_GTT)) | want_dom;
-            if (cur_dom == AMDGPU_GEM_DOMAIN_VRAM && want_dom == AMDGPU_GEM_DOMAIN_GTT) pb_account_eviction();
-            smp_mb();  // Fixed: Barrier for visibility on multi-core
+    u32 want_dom;
+    if ((flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED) && size <= SZ_256K) {
+        want_dom = AMDGPU_GEM_DOMAIN_GTT;
+    } else if (flags & (AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS | AMDGPU_GEM_CREATE_NO_CPU_ACCESS)) {
+        want_dom = AMDGPU_GEM_DOMAIN_VRAM;
+    } else {
+        want_dom = domain & (AMDGPU_GEM_DOMAIN_VRAM | AMDGPU_GEM_DOMAIN_GTT);
+        if (want_dom != AMDGPU_GEM_DOMAIN_VRAM && want_dom != AMDGPU_GEM_DOMAIN_GTT) {
+            want_dom = AMDGPU_GEM_DOMAIN_VRAM;
         }
+    }
+
+    enum vega_vram_pressure_state ps = amdgpu_vega_get_vram_pressure_state(adev);
+    if (ps == VEGA_VRAM_RED && size > SZ_1M) want_dom = AMDGPU_GEM_DOMAIN_GTT;
+    else if (ps == VEGA_VRAM_YELLOW && size > SZ_32M) want_dom = AMDGPU_GEM_DOMAIN_GTT;
+    if (current && task_nice(current) > 0) want_dom = AMDGPU_GEM_DOMAIN_GTT;
+
+    u32 cur_dom = domain & (AMDGPU_GEM_DOMAIN_VRAM | AMDGPU_GEM_DOMAIN_GTT);
+    if (cur_dom != want_dom) {
+        bp->domain = (domain & ~(AMDGPU_GEM_DOMAIN_VRAM | AMDGPU_GEM_DOMAIN_GTT)) | want_dom;
+        if (cur_dom == AMDGPU_GEM_DOMAIN_VRAM && want_dom == AMDGPU_GEM_DOMAIN_GTT) pb_account_eviction();
     }
 }
 
@@ -1301,7 +1260,7 @@ int amdgpu_gem_object_create(struct amdgpu_device *adev,
     struct amdgpu_bo_user *ubo = NULL;
     struct amdgpu_bo *bo       = NULL;
     u32   byte_align;
-    int   r, retries = 0;
+    int   r;
 
     if (WARN_ON(!adev || !obj))
         return -EINVAL;
@@ -1352,15 +1311,8 @@ int amdgpu_gem_object_create(struct amdgpu_device *adev,
         return 0;
     }
 
-    // Fixed: Retry slab alloc on OOM (up to 3 times) for stability under pressure
-    if (ubo_slab) {
-        do {
-            ubo = kmem_cache_zalloc(ubo_slab, GFP_KERNEL | __GFP_NOWARN | __GFP_RETRY_MAYFAIL);
-            if (ubo) break;
-            retries++;
-            cond_resched();  // Yield to avoid softlock under OOM
-        } while (retries < 3);
-    }
+    if (ubo_slab)
+        ubo = kmem_cache_zalloc(ubo_slab, GFP_KERNEL | __GFP_NOWARN);
 
     if (!ubo) {
         r = amdgpu_bo_create(adev, &bp, &bo);
@@ -1378,8 +1330,6 @@ int amdgpu_gem_object_create(struct amdgpu_device *adev,
     if (bo->flags & AMDGPU_GEM_CREATE_VRAM_CLEARED) {
         if (amdgpu_gem_try_cpu_clear(bo))
             bo->flags &= ~AMDGPU_GEM_CREATE_VRAM_CLEARED;
-        else
-            DRM_WARN("CPU clear failed - falling back to GPU\n");  // Fixed: Log for debug, but continue
     }
 
     *obj = &bo->tbo.base;
@@ -1411,7 +1361,7 @@ void amdgpu_gem_force_release(struct amdgpu_device *adev)
         LIST_HEAD(release_list);
         struct release_node *n, *tmp;
 
-#define OOM_BATCH_SIZE 32
+        #define OOM_BATCH_SIZE 32
         struct drm_gem_object *oom_objs[OOM_BATCH_SIZE];
         unsigned int oom_cnt = 0;
 
@@ -1422,7 +1372,7 @@ void amdgpu_gem_force_release(struct amdgpu_device *adev)
             if (!kref_get_unless_zero(&gobj->refcount))
                 continue;
 
-            n = kmalloc(sizeof(*n), GFP_ATOMIC | __GFP_NOWARN);  // Fixed: Added NOWARN to reduce log spam under OOM
+            n = kmalloc(sizeof(*n), GFP_ATOMIC | __GFP_NOWARN);
             if (likely(n)) {
                 n->obj = gobj;
                 list_add_tail(&n->node, &release_list);
@@ -1430,7 +1380,7 @@ void amdgpu_gem_force_release(struct amdgpu_device *adev)
                 oom_objs[oom_cnt++] = gobj;
             } else {
                 dev_warn_once(ddev->dev, "OOM in force_release, potential leak\n");
-                drm_gem_object_put(gobj);  // Fixed: Put on all failure paths to avoid leaks
+                drm_gem_object_put(gobj);
             }
         }
         idr_destroy(&file->object_idr);
@@ -1613,7 +1563,7 @@ amdgpu_gem_object_close(struct drm_gem_object *obj, struct drm_file *file_priv)
         r = amdgpu_vm_clear_freed(adev, vm, &fence);
         if (unlikely(r < 0)) {
             dev_err(adev->dev, "failed to clear page tables on GEM close (%ld)\n", r);
-            // Fixed: Continue but signal error for upper layers
+            goto out_unlock;
         }
     }
 
@@ -1634,7 +1584,7 @@ static int amdgpu_gem_object_mmap(struct drm_gem_object *obj, struct vm_area_str
 {
     struct amdgpu_bo *bo;
 
-    if (unlikely(!obj || !vma))
+    if (unlikely(!obj))
         return -EINVAL;
 
     bo = gem_to_amdgpu_bo(obj);
@@ -1836,9 +1786,6 @@ int amdgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
         amdgpu_bo_unreserve(bo);
         if (unlikely(r))
             goto user_pages_done;
-
-        // Fixed: Add GPU sync wait to ensure validation complete (prevent stale data)
-        dma_resv_wait_timeout(bo->tbo.base.resv, DMA_RESV_USAGE_READ, false, msecs_to_jiffies(100));
     }
 
     r = drm_gem_handle_create(filp, gobj, &handle);
@@ -1847,11 +1794,11 @@ int amdgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
 
     args->handle = handle;
 
-user_pages_done:
+    user_pages_done:
     if ((args->flags & AMDGPU_GEM_USERPTR_VALIDATE) && range)
         amdgpu_ttm_tt_get_user_pages_done(bo->tbo.ttm, range);
 
-release_object:
+    release_object:
     drm_gem_object_put(gobj);
     return r;
 }
@@ -1879,11 +1826,11 @@ int amdgpu_mode_dumb_mmap(struct drm_file *filp,
     if (amdgpu_ttm_tt_get_usermm(robj->tbo.ttm) ||
         (robj->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS)) {
         drm_gem_object_put(gobj);
-        return -EPERM;
-    }
-    *offset_p = amdgpu_bo_mmap_offset(robj);
-    drm_gem_object_put(gobj);
-    return 0;
+    return -EPERM;
+        }
+        *offset_p = amdgpu_bo_mmap_offset(robj);
+        drm_gem_object_put(gobj);
+        return 0;
 }
 
 int amdgpu_gem_mmap_ioctl(struct drm_device *dev, void *data,
@@ -1930,11 +1877,9 @@ int amdgpu_gem_wait_idle_ioctl(struct drm_device *dev, void *data,
     ret = dma_resv_wait_timeout(robj->tbo.base.resv, DMA_RESV_USAGE_READ,
                                 true, timeout);
 
-    if (ret > 0) {  // Fixed: Correct check (ret > 0 means success with remaining time)
+    if (ret >= 0) {
         memset(args, 0, sizeof(*args));
-        args->out.status = (ret == 0);  // Timeout if exactly 0
-    } else if (ret == 0) {
-        r = -ETIMEDOUT;
+        args->out.status = (ret == 0);
     } else {
         r = ret;
     }
@@ -2020,7 +1965,7 @@ uint64_t amdgpu_gem_va_map_flags(struct amdgpu_device *adev, uint32_t flags)
     if (flags & AMDGPU_VM_PAGE_NOALLOC)
         pte_flag |= AMDGPU_PTE_NOALLOC;
 
-    if (adev->gmc.gmc_funcs && adev->gmc.gmc_funcs->map_mtype)  // Fixed: Null-guard funcs
+    if (likely(adev->gmc.gmc_funcs && adev->gmc.gmc_funcs->map_mtype))
         pte_flag |= amdgpu_gmc_map_mtype(adev, flags & AMDGPU_VM_MTYPE_MASK);
 
     return pte_flag;
@@ -2033,7 +1978,7 @@ static int amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
 {
     int r;
 
-    if (unlikely(!adev || !vm))
+    if (unlikely(!adev || !vm || !bo_va))
         return -EINVAL;
 
     if (!amdgpu_vm_ready(vm))
@@ -2148,44 +2093,7 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
     switch (args->operation) {
         case AMDGPU_VA_OP_MAP:
         case AMDGPU_VA_OP_REPLACE:
-            // Neat trick: BMI2-packed flag fusion if available (reduces branches)
-            #if defined(CONFIG_X86_64) && defined(CONFIG_X86_FEATURE_BMI2)
-            if (boot_cpu_has(X86_FEATURE_BMI2)) {  // Fixed: boot_cpu_has for safe runtime check
-                u64 packed = 0;
-                packed |= _pdep_u64((args->flags & AMDGPU_VM_PAGE_EXECUTABLE) ? 1 : 0, 1ULL << 0);
-                packed |= _pdep_u64((args->flags & AMDGPU_VM_PAGE_READABLE) ? 1 : 0, 1ULL << 1);
-                packed |= _pdep_u64((args->flags & AMDGPU_VM_PAGE_WRITEABLE) ? 1 : 0, 1ULL << 2);
-                packed |= _pdep_u64((args->flags & AMDGPU_VM_PAGE_PRT && adev) ? 1 : 0, 1ULL << 3);
-                packed |= _pdep_u64((args->flags & AMDGPU_VM_PAGE_NOALLOC) ? 1 : 0, 1ULL << 4);
-                // Mtype as bitfield (mask to 3 bits for MTYPE)
-                u64 mtype_bits = (args->flags & AMDGPU_VM_MTYPE_MASK) >> __builtin_ctz(AMDGPU_VM_MTYPE_MASK);
-                packed |= _pdep_u64(mtype_bits, 7ULL << 5);  // Bits 5-7 for mtype
-
-                map_flags = 0;
-                if (packed & (1ULL << 0)) map_flags |= AMDGPU_PTE_EXECUTABLE;
-                if (packed & (1ULL << 1)) map_flags |= AMDGPU_PTE_READABLE;
-                if (packed & (1ULL << 2)) map_flags |= AMDGPU_PTE_WRITEABLE;
-                if (packed & (1ULL << 3)) map_flags |= AMDGPU_PTE_PRT_FLAG(adev);
-                if (packed & (1ULL << 4)) map_flags |= AMDGPU_PTE_NOALLOC;
-                if (likely(adev->gmc.gmc_funcs && adev->gmc.gmc_funcs->map_mtype)) {
-                    u32 mtype = (packed >> 5) & 7;  // Extract mtype bits
-                    map_flags |= amdgpu_gmc_map_mtype(adev, mtype << __builtin_ctz(AMDGPU_VM_MTYPE_MASK));
-                }
-            } else {
-            #endif
-                // Fallback scalar fusion (if no BMI2 or for safety)
-                map_flags = 0;
-                map_flags |= (args->flags & AMDGPU_VM_PAGE_EXECUTABLE) ? AMDGPU_PTE_EXECUTABLE : 0;
-                map_flags |= (args->flags & AMDGPU_VM_PAGE_READABLE) ? AMDGPU_PTE_READABLE : 0;
-                map_flags |= (args->flags & AMDGPU_VM_PAGE_WRITEABLE) ? AMDGPU_PTE_WRITEABLE : 0;
-                if (args->flags & AMDGPU_VM_PAGE_PRT && adev)
-                    map_flags |= AMDGPU_PTE_PRT_FLAG(adev);
-                map_flags |= (args->flags & AMDGPU_VM_PAGE_NOALLOC) ? AMDGPU_PTE_NOALLOC : 0;
-                if (likely(adev->gmc.gmc_funcs && adev->gmc.gmc_funcs->map_mtype))
-                    map_flags |= amdgpu_gmc_map_mtype(adev, args->flags & AMDGPU_VM_MTYPE_MASK);
-            #if defined(CONFIG_X86_64) && defined(CONFIG_X86_FEATURE_BMI2)
-            }
-            #endif
+            map_flags = amdgpu_gem_va_map_flags(adev, args->flags);
             if (args->operation == AMDGPU_VA_OP_MAP) {
                 r = amdgpu_vm_bo_map(adev, bo_va, args->va_address,
                                      args->offset_in_bo, args->map_size, map_flags);
@@ -2202,7 +2110,7 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
             break;
         default:
             r = -EINVAL;
-            break;  // Fixed: Explicit break on default to prevent fallthrough
+            break;
     }
 
     if (!r && !(args->flags & AMDGPU_VM_DELAY_UPDATE) && !adev->debug_vm)
@@ -2281,7 +2189,7 @@ int amdgpu_gem_op_ioctl(struct drm_device *dev, void *data,
             }
 
             if (robj->tbo.base.dma_buf) {
-                dma_resv_lock(robj->tbo.base.resv, NULL);  // Fixed: Use dma_resv_lock for safe xgmi check (correct, deadlock-free)
+                dma_resv_lock(robj->tbo.base.resv, NULL);
                 for (base = robj->vm_bo; base; base = base->next) {
                     if (amdgpu_xgmi_same_hive(adev, amdgpu_ttm_adev(base->vm->root.bo->tbo.bdev))) {
                         r = -EINVAL;
@@ -2439,7 +2347,7 @@ DEFINE_SHOW_ATTRIBUTE(amdgpu_debugfs_gem_info);
 
 void amdgpu_debugfs_gem_init(struct amdgpu_device *adev)
 {
-#if defined(CONFIG_DEBUG_FS)
+    #if defined(CONFIG_DEBUG_FS)
     struct drm_minor *minor;
     struct dentry *root;
 
@@ -2456,5 +2364,5 @@ void amdgpu_debugfs_gem_init(struct amdgpu_device *adev)
 
     debugfs_create_file("amdgpu_gem_info", 0444, root, adev,
                         &amdgpu_debugfs_gem_info_fops);
-#endif
+    #endif
 }
