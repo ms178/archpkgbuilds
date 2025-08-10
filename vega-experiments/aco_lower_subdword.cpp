@@ -29,8 +29,15 @@ dword_def(Program* program, Definition def)
 {
    def.setTemp(dword_temp(def.getTemp()));
 
-   if (def.isTemp())
-      program->temp_rc[def.tempId()] = def.regClass();
+   if (def.isTemp()) {
+      uint32_t id = def.tempId();
+      if (id < program->temp_rc.size()) {
+         program->temp_rc[id] = def.regClass();
+      } else {
+         program->temp_rc.resize(id + 1, RegClass());
+         program->temp_rc[id] = def.regClass();
+      }
+   }
 
    return def;
 }
@@ -57,7 +64,7 @@ emit_pack(Builder& bld, Definition def, std::vector<op_info> operands)
 {
    assert(def.regClass().type() == RegType::vgpr);
 
-   /* Handle multi-dword definitions iteratively. */
+   /* Handle multi-dword definitions iteratively to avoid recursion depth issues. */
    if (def.size() > 1) {
       aco_ptr<Instruction> vec{
          create_instruction(aco_opcode::p_create_vector, Format::PSEUDO, def.size(), 1)};
@@ -66,6 +73,7 @@ emit_pack(Builder& bld, Definition def, std::vector<op_info> operands)
       unsigned op_idx = 0;
       for (unsigned i = 0; i < def.size(); i++) {
          std::vector<op_info> sub_operands;
+         sub_operands.reserve(operands.size() - op_idx);
          Definition sub_def = bld.def(v1);
          vec->operands[i] = Operand(sub_def.getTemp());
          unsigned sub_bytes = 0;
@@ -116,10 +124,13 @@ emit_pack(Builder& bld, Definition def, std::vector<op_info> operands)
       unsigned bytes = operands[i].bytes;
 
       if (op.isUndefined() || op.isConstant()) {
-         if (op.isConstant())
-            operands[i].op = Operand::c32(op.constantValue64() >> (offset * 8));
-         else
+         if (op.isConstant()) {
+            uint64_t val = op.constantValue64();
+            assert(offset < 8 && "Invalid offset for constant");
+            operands[i].op = Operand::c32(static_cast<uint32_t>(val >> (offset * 8)));
+         } else {
             operands[i].op = Operand(v1); /* Represents an undef dword */
+         }
          operands[i].offset = 0;
          ++i;
          continue;
@@ -140,14 +151,19 @@ emit_pack(Builder& bld, Definition def, std::vector<op_info> operands)
          split->definitions[j] = bld.def(rc);
 
       unsigned dword_off = offset / 4;
-      unsigned new_bytes = std::min(4u - (offset % 4), bytes);
-      operands[i].op = Operand(split->definitions[dword_off++].getTemp());
-      operands[i].offset = offset % 4;
+      unsigned byte_off = offset % 4;
+      unsigned new_bytes = std::min(4u - byte_off, bytes);
+      operands[i].op = Operand(split->definitions[dword_off].getTemp());
+      operands[i].offset = byte_off;
       operands[i].bytes = new_bytes;
-      if (new_bytes != bytes) {
+
+      bytes -= new_bytes;
+      offset += new_bytes;
+      if (bytes > 0) {
+         dword_off = offset / 4;
+         byte_off = offset % 4;
          operands.insert(operands.begin() + i + 1,
-                         {Operand(split->definitions[dword_off++].getTemp()), 0,
-                          bytes - new_bytes});
+                         {Operand(split->definitions[dword_off].getTemp()), byte_off, bytes});
       }
       ++i;
 
@@ -235,7 +251,7 @@ void
 emit_split_vector(Builder& bld, aco_ptr<Instruction>& instr)
 {
    bool needs_lowering = false;
-   for (Definition& def : instr->definitions)
+   for (const Definition& def : instr->definitions)
       needs_lowering |= def.regClass().is_subdword();
 
    if (!needs_lowering) {
@@ -265,7 +281,7 @@ emit_create_vector(Builder& bld, aco_ptr<Instruction>& instr)
 {
    instr->definitions[0] = dword_def(bld.program, instr->definitions[0]);
    bool needs_lowering = false;
-   for (Operand& op : instr->operands)
+   for (const Operand& op : instr->operands)
       needs_lowering |= (op.hasRegClass() && op.regClass().is_subdword()) || op.bytes() < 4;
 
    if (!needs_lowering) {
@@ -274,7 +290,7 @@ emit_create_vector(Builder& bld, aco_ptr<Instruction>& instr)
    }
 
    std::vector<op_info> operands;
-   operands.reserve(instr->operands.size()); // Added reserve
+   operands.reserve(instr->operands.size());
    for (const Operand& op : instr->operands)
       operands.push_back({dword_op(op, true), 0, op.bytes()});
 
@@ -285,7 +301,7 @@ void
 process_block(Program* program, Block* block)
 {
    std::vector<aco_ptr<Instruction>> instructions;
-   instructions.reserve(block->instructions.size()); // Added reserve
+   instructions.reserve(block->instructions.size());
 
    Builder bld(program, &instructions);
    for (aco_ptr<Instruction>& instr : block->instructions) {

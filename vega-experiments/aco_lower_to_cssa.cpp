@@ -101,11 +101,59 @@ collect_parallelcopies(cssa_ctx& ctx)
    ctx.parallelcopies.resize(ctx.program->blocks.size());
    ctx.merge_sets.reserve(ctx.program->blocks.size());
 
-   // Perfected Idea 1: Safe preallocation with conservative max (temps + 2*blocks to cover PHIs + extras)
-   // Avoids resizes, prevents allocation stalls; fallback in get_node handles overflows elegantly
-   uint32_t max_temp_id = ctx.program->temp_rc.size() + ctx.program->blocks.size() * 8u; // Safe upper bound based on typical shader stats
-   ctx.merge_node_table.reserve(max_temp_id + 1); // Use reserve to minimize waste
-   ctx.merge_node_table.resize(max_temp_id + 1, {Operand(), INVALID_IDX, INVALID_IDX, Temp(), Temp()}); // Initialize with sentinels
+   // Pre-count the number of extra temps needed for accurate preallocation
+   uint32_t extra_temps = 0;
+   uint32_t extra_defs = 0;
+   for (const Block& block : ctx.program->blocks) {
+      bool is_phi = true;
+      for (const aco_ptr<Instruction>& phi : block.instructions) {
+         if (phi->opcode != aco_opcode::p_phi && phi->opcode != aco_opcode::p_linear_phi) {
+            is_phi = false;
+            break;
+         }
+
+         const Definition& def = phi->definitions[0];
+         if (!def.isTemp() || def.isKill())
+            continue;
+
+         extra_defs++;
+
+         const Block::edge_vec& preds =
+            phi->opcode == aco_opcode::p_phi ? block.logical_preds : block.linear_preds;
+
+         for (unsigned i = 0; i < phi->operands.size(); ++i) {
+            Operand op = phi->operands[i];
+            if (op.isUndefined())
+               continue;
+
+            if (def.regClass().type() == RegType::sgpr && !op.isTemp()) {
+               if (op.isConstant()) {
+                  if (ctx.program->gfx_level >= GFX10) {
+                     if (op.size() == 1 && !op.isLiteral())
+                        continue;
+                  } else {
+                     bool can_be_inlined = op.isLiteral() || (op.size() == 1 && op.constantValue() >= -16 && op.constantValue() <= 64);
+                     if (can_be_inlined)
+                        continue;
+                  }
+               } else {
+                  assert(op.isFixed() && op.physReg() == exec);
+                  continue;
+               }
+            }
+
+            extra_temps++;
+         }
+      }
+      if (!is_phi)
+         continue;
+   }
+
+   // Safe upper bound: existing temps + extra temps for copies + extra for defs + padding for safety
+   uint32_t num_temps = ctx.program->temp_rc.size();
+   uint32_t max_temp_id = num_temps + extra_temps + extra_defs + ctx.program->blocks.size() * 2u;
+   ctx.merge_node_table.reserve(max_temp_id + 1);
+   ctx.merge_node_table.resize(max_temp_id + 1, {Operand(), INVALID_IDX, INVALID_IDX, Temp(), Temp()});
 
    Builder bld(ctx.program);
 
@@ -159,7 +207,6 @@ collect_parallelcopies(cssa_ctx& ctx)
             phi->operands[i].setKill(true);
 
             set.emplace_back(tmp);
-            // No resize here; handled by prealloc and get_node fallback
 
             ctx.merge_node_table[tmp.id()] = {op, set_idx, preds[i]};
 
@@ -176,7 +223,6 @@ collect_parallelcopies(cssa_ctx& ctx)
          else
             set.emplace_back(def.getTemp());
 
-         // No resize here
          ctx.merge_node_table[def.tempId()] = {Operand(def.getTemp()), set_idx, block.index};
 
          ctx.merge_sets.emplace_back(std::move(set));
@@ -184,7 +230,7 @@ collect_parallelcopies(cssa_ctx& ctx)
    }
 }
 
-[[nodiscard]] [[gnu::always_inline]] static inline bool // Perfected Idea 2: always_inline for reliability
+[[nodiscard]] [[gnu::always_inline]] static inline bool
 defined_after(const cssa_ctx& ctx, Temp a, Temp b)
 {
    const merge_node& A = get_node_const(ctx, a.id());
@@ -193,7 +239,7 @@ defined_after(const cssa_ctx& ctx, Temp a, Temp b)
    return (A.defined_at == B.defined_at) ? a.id() > b.id() : A.defined_at > B.defined_at;
 }
 
-[[nodiscard]] [[gnu::always_inline]] static inline bool // always_inline
+[[nodiscard]] [[gnu::always_inline]] static inline bool
 dominates(const cssa_ctx& ctx, Temp a, Temp b)
 {
    assert(defined_after(ctx, b, a));
@@ -211,12 +257,14 @@ is_live_out(const cssa_ctx& ctx, Temp var, uint32_t block_idx)
                                      ? ctx.program->blocks[block_idx].linear_succs
                                      : ctx.program->blocks[block_idx].logical_succs;
 
-   return std::any_of(
-      succs.begin(), succs.end(),
-      [&](unsigned s) { return ctx.program->live.live_in[s].count(var.id()); });
+   for (unsigned s : succs) {
+      if (ctx.program->live.live_in[s].count(var.id()))
+         return true;
+   }
+   return false;
 }
 
-[[nodiscard]] static inline bool
+[[nodiscard]] [[gnu::always_inline]] static inline bool
 intersects(const cssa_ctx& ctx, Temp var, Temp parent)
 {
    const merge_node& nv = get_node_const(ctx, var.id());
@@ -255,7 +303,7 @@ intersects(const cssa_ctx& ctx, Temp var, Temp parent)
    return false;
 }
 
-[[nodiscard]] static inline bool
+[[nodiscard]] [[gnu::always_inline]] static inline bool
 interference(cssa_ctx& ctx, Temp var, Temp parent)
 {
    assert(var != parent);
@@ -495,7 +543,8 @@ emit_copies_block(Builder& bld, std::vector<ltg_node>& ltg, std::vector<uint32_t
 static void
 emit_parallelcopies(cssa_ctx& ctx)
 {
-   std::unordered_map<uint32_t, Operand> rename_map;
+   const uint32_t max_temp_id = ctx.merge_node_table.size() - 1;
+   std::vector<std::pair<bool, Operand>> rename_map(max_temp_id + 1, {false, Operand()});
 
    for (int blk_idx = int(ctx.program->blocks.size()) - 1; blk_idx >= 0; --blk_idx) {
       if (ctx.parallelcopies[blk_idx].empty()) {
@@ -527,15 +576,15 @@ emit_parallelcopies(cssa_ctx& ctx)
                   oth.op.setFirstKill(false);
                }
             }
-            rename_map.emplace(cp.def.tempId(), cp.op);
+            if (cp.def.tempId() <= max_temp_id) {
+               rename_map[cp.def.tempId()] = {true, cp.op};
+            }
          }
       }
 
       /* ───────────────────────── Stage 2 : build LTG (unique key = dst Temp ID) ────────── */
-      // Perfected Idea 3: Vector for LTG with active_keys to avoid sparsity waste
-      uint32_t max_temp_id = ctx.merge_node_table.size() - 1; // Reuse from prealloc
-      std::vector<ltg_node> ltg(max_temp_id + 1, ltg_node()); // Sentinels
-      std::vector<uint32_t> active_keys; // Track populated keys
+      std::vector<ltg_node> ltg(max_temp_id + 1, ltg_node());
+      std::vector<uint32_t> active_keys;
       active_keys.reserve(ctx.parallelcopies[blk_idx].size());
       bool has_vgpr = false, has_sgpr = false;
 
@@ -547,12 +596,12 @@ emit_parallelcopies(cssa_ctx& ctx)
          copy& cp = ctx.parallelcopies[blk_idx][n];
 
          if (cp.op.isTemp()) {
-            auto it = rename_map.find(cp.op.tempId());
-            while (it != rename_map.end()) {
-               cp.op = it->second;
+            uint32_t id = cp.op.tempId();
+            while (id <= max_temp_id && rename_map[id].first) {
+               cp.op = rename_map[id].second;
                if (!cp.op.isTemp())
                   break;
-               it = rename_map.find(cp.op.tempId());
+               id = cp.op.tempId();
             }
          }
 
@@ -619,12 +668,12 @@ emit_parallelcopies(cssa_ctx& ctx)
 
          for (Operand& op : phi->operands) {
             if (op.isTemp()) {
-               auto it = rename_map.find(op.tempId());
-               while (it != rename_map.end()) {
-                  op = it->second;
+               uint32_t id = op.tempId();
+               while (id <= max_temp_id && rename_map[id].first) {
+                  op = rename_map[id].second;
                   if (!op.isTemp())
                      break;
-                  it = rename_map.find(op.tempId());
+                  id = op.tempId();
                }
             }
          }
