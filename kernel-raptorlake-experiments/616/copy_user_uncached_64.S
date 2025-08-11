@@ -22,18 +22,16 @@
  *
  *  Exception Handling Strategy:
  *  This implementation uses a robust exception handling model built with
- *  pure assembly directives. If a page fault occurs on a user-space read
- *  or a machine check on a kernel-space write, the exception table redirects
- *  execution to a state-specific fixup handler.
+ *  pure assembly directives that conform to the kernel's 12-byte entry
+ *  format. If a page fault or machine check occurs, the exception table
+ *  redirects execution to a state-specific fixup handler.
  *
  *  The fixup logic is designed to be mathematically sound:
- *    - Each potential faulting instruction has an entry in the exception
- *      table pointing to a handler.
- *    - The handler is responsible for calculating the number of bytes that
- *      were not copied and adding them back to the main counter in %rdx.
+ *    - The handler calculates the number of bytes that were not copied
+ *      in the failing block and adds them back to the main counter in %rdx.
  *    - Handlers for user-space load faults also issue an SFENCE to ensure
  *      any preceding non-temporal stores are globally visible before
- *      returning the error.
+ *      returning the error, preventing data corruption on other devices.
  */
 
 #include <linux/export.h>
@@ -210,57 +208,58 @@ SYM_FUNC_START(__copy_user_nocache)
 
 /*
  * Exception table entries built with pure assembly directives.
- * This section is placed in __ex_table by the linker.
+ * Format: .long <from_addr - .>, .long <to_addr - .>, .long <type>
+ * This creates the 12-byte entries required by objtool.
  */
 	.section __ex_table,"a"
 	.balign 8
 	/* Head alignment faults */
-	.long 1b - ., .Lfixup_head - .
-	.long 2b - ., .Lfixup_head - .
-	.long 3b - ., .Lfixup_head - .
-	.long 4b - ., .Lfixup_head - .
-	.long 5b - ., .Lfixup_head - .
-	.long 6b - ., .Lfixup_head - .
+	.long 1b - ., .Lfixup_head - ., 0
+	.long 2b - ., .Lfixup_head - ., 0
+	.long 3b - ., .Lfixup_head - ., 0
+	.long 4b - ., .Lfixup_head - ., 0
+	.long 5b - ., .Lfixup_head - ., 0
+	.long 6b - ., .Lfixup_head - ., 0
 
 	/* Main loop faults */
-	.long 10b - ., .Lfixup_load_0 - .
-	.long 11b - ., .Lfixup_load_0 - .
-	.long 12b - ., .Lfixup_load_0 - .
-	.long 13b - ., .Lfixup_load_0 - .
-	.long 20b - ., .Lfixup_store_0 - .
-	.long 21b - ., .Lfixup_store_8 - .
-	.long 22b - ., .Lfixup_store_16 - .
-	.long 23b - ., .Lfixup_store_24 - .
+	.long 10b - ., .Lfixup_load_0 - ., 0
+	.long 11b - ., .Lfixup_load_0 - ., 0
+	.long 12b - ., .Lfixup_load_0 - ., 0
+	.long 13b - ., .Lfixup_load_0 - ., 0
+	.long 20b - ., .Lfixup_store_0 - ., 0
+	.long 21b - ., .Lfixup_store_8 - ., 0
+	.long 22b - ., .Lfixup_store_16 - ., 0
+	.long 23b - ., .Lfixup_store_24 - ., 0
 
-	.long 30b - ., .Lfixup_load_32 - .
-	.long 31b - ., .Lfixup_load_32 - .
-	.long 32b - ., .Lfixup_load_32 - .
-	.long 33b - ., .Lfixup_load_32 - .
-	.long 40b - ., .Lfixup_store_32 - .
-	.long 41b - ., .Lfixup_store_40 - .
-	.long 42b - ., .Lfixup_store_48 - .
-	.long 43b - ., .Lfixup_store_56 - .
+	.long 30b - ., .Lfixup_load_32 - ., 0
+	.long 31b - ., .Lfixup_load_32 - ., 0
+	.long 32b - ., .Lfixup_load_32 - ., 0
+	.long 33b - ., .Lfixup_load_32 - ., 0
+	.long 40b - ., .Lfixup_store_32 - ., 0
+	.long 41b - ., .Lfixup_store_40 - ., 0
+	.long 42b - ., .Lfixup_store_48 - ., 0
+	.long 43b - ., .Lfixup_store_56 - ., 0
 
-	.long 50b - ., .Lfixup_load_64 - .
-	.long 51b - ., .Lfixup_load_64 - .
-	.long 52b - ., .Lfixup_load_64 - .
-	.long 53b - ., .Lfixup_load_64 - .
-	.long 60b - ., .Lfixup_store_64 - .
-	.long 61b - ., .Lfixup_store_72 - .
-	.long 62b - ., .Lfixup_store_80 - .
-	.long 63b - ., .Lfixup_store_88 - .
+	.long 50b - ., .Lfixup_load_64 - ., 0
+	.long 51b - ., .Lfixup_load_64 - ., 0
+	.long 52b - ., .Lfixup_load_64 - ., 0
+	.long 53b - ., .Lfixup_load_64 - ., 0
+	.long 60b - ., .Lfixup_store_64 - ., 0
+	.long 61b - ., .Lfixup_store_72 - ., 0
+	.long 62b - ., .Lfixup_store_80 - ., 0
+	.long 63b - ., .Lfixup_store_88 - ., 0
 
-	.long 70b - ., .Lfixup_load_96 - .
-	.long 71b - ., .Lfixup_load_96 - .
-	.long 72b - ., .Lfixup_load_96 - .
-	.long 73b - ., .Lfixup_load_96 - .
-	.long 80b - ., .Lfixup_store_96 - .
-	.long 81b - ., .Lfixup_store_104 - .
-	.long 82b - ., .Lfixup_store_112 - .
-	.long 83b - ., .Lfixup_store_120 - .
+	.long 70b - ., .Lfixup_load_96 - ., 0
+	.long 71b - ., .Lfixup_load_96 - ., 0
+	.long 72b - ., .Lfixup_load_96 - ., 0
+	.long 73b - ., .Lfixup_load_96 - ., 0
+	.long 80b - ., .Lfixup_store_96 - ., 0
+	.long 81b - ., .Lfixup_store_104 - ., 0
+	.long 82b - ., .Lfixup_store_112 - ., 0
+	.long 83b - ., .Lfixup_store_120 - ., 0
 
 	/* Tail fault */
-	.long 90b - ., .Lfixup_tail - .
+	.long 90b - ., .Lfixup_tail - ., 0
 	.previous
 
 SYM_FUNC_END(__copy_user_nocache)
