@@ -16,7 +16,8 @@
  *  allocs). Holistic: Optimized for high-throughput workloads like networking/DMA on Raptor
  *  Lake (leverages 256-bit NT stores, large L2/L3 caches, fast sfence). Maintains original
  *  API/ABI. Fixed all assembly errors: Proper local labels (.Lscalar_10:), precomputed macro
- *  immediates, correct _ASM_EXTABLE_UA usage.
+ *  immediates, correct _ASM_EXTABLE_UA usage. Fixed linker error by including asm/cpufeatures.h
+ *  for X86_FEATURE_AVX2 definition.
  */
 
 #include <linux/export.h>
@@ -24,6 +25,7 @@
 #include <linux/objtool.h>
 #include <asm/asm.h>
 #include <asm/alternative.h>
+#include <asm/cpufeatures.h>
 
 		.p2align 5
 SYM_FUNC_START(__copy_user_nocache)
