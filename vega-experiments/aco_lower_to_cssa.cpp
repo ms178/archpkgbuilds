@@ -11,22 +11,9 @@
 #include <map>
 #include <unordered_map>
 #include <vector>
-#include <bitset> // Added for validity tracking in LTG vector
-
-/*
- * This pass lowers SSA-based PHI nodes to parallelcopies at the end of
- * predecessor blocks.
- * The algorithm is based on "Revisiting Out-of-SSA Translation for Correctness,
- * Code Quality, and Efficiency" by Z. Budimlic et al.
- *
- * The paper's algorithm for coalescing is followed, which is to greedily
- * merge variables if they don't interfere.
- *
- * The paper's algorithm for emitting parallelcopies is also followed:
- * 1. build a location-transfer-graph (LTG)
- * 2. emit all copies which are not part of a cycle
- * 3. emit cycles as parallelcopies
- */
+#include <bitset> // for possible future validity tracking (kept for parity)
+#include <limits>
+#include <cassert>
 
 namespace aco {
 namespace {
@@ -71,28 +58,107 @@ struct cssa_ctx {
    std::vector<merge_node> merge_node_table;
 };
 
+/* -------------------------------
+ * Helper accessors & rename map
+ * ------------------------------- */
 
+/* get_node_const - OOB assert in debug; sentinel in release to avoid UB */
 [[nodiscard]] static inline const merge_node&
 get_node_const(const cssa_ctx& ctx, uint32_t id)
 {
-   // Added bounds check for safety (assert in debug, safe access)
+   assert(id < ctx.merge_node_table.size() && "merge_node_table OOB: likely undercount in collect_parallelcopies()");
    if (id >= ctx.merge_node_table.size()) {
-      // Runtime safe: return sentinel (prevents UB, log error in production if needed)
       static const merge_node sentinel{Operand(), INVALID_IDX, INVALID_IDX, Temp(), Temp()};
       return sentinel;
    }
    return ctx.merge_node_table[id];
 }
 
+/* get_node - ensures table is large enough and returns mutable ref */
 [[nodiscard]] static inline merge_node&
 get_node(cssa_ctx& ctx, uint32_t id)
 {
-   // Similar bounds check
    if (id >= ctx.merge_node_table.size()) {
-      ctx.merge_node_table.resize(id + 1, {Operand(), INVALID_IDX, INVALID_IDX, Temp(), Temp()}); // Safe resize with sentinel
+      /* resize to accommodate: keep semantics stable by initializing with defaults */
+      ctx.merge_node_table.resize(id + 1, {Operand(), INVALID_IDX, INVALID_IDX, Temp(), Temp()});
    }
    return ctx.merge_node_table[id];
 }
+
+/* Sparse rename map: map from temp id -> resolved Operand.
+ * We use unordered_map to avoid allocating a huge vector for programs with sparse/sparse-high temp ids.
+ */
+using rename_map_t = std::unordered_map<uint32_t, Operand>;
+
+/* resolve_rename: resolves a temp id to its final operand using rename_map and
+ * performs path compression where possible. Returns either a non-temp Operand
+ * (constant/fixed) or an Operand with a temp that has no further rename.
+ */
+static Operand
+resolve_rename(rename_map_t& rename_map, uint32_t id)
+{
+   auto it = rename_map.find(id);
+   if (it == rename_map.end())
+      return Operand();
+
+   Operand cur = it->second;
+   if (!cur.isTemp())
+      return cur;
+
+   // Walk chain, collecting visited ids for compression
+   std::vector<uint32_t> visited;
+   visited.reserve(8);
+   uint32_t cur_id = cur.getTemp().id();
+
+   while (true) {
+      auto it2 = rename_map.find(cur_id);
+      if (it2 == rename_map.end()) {
+         // reached final operand
+         break;
+      }
+      // avoid pathological infinite loops; if loops exist, break
+      if (visited.size() > 2048) {
+         break;
+      }
+      visited.push_back(cur_id);
+      Operand next = it2->second;
+      if (!next.isTemp()) {
+         cur = next;
+         break;
+      }
+      cur = next;
+      cur_id = cur.getTemp().id();
+   }
+
+   // Path compression: point all visited entries to final operand `cur`.
+   for (uint32_t v : visited) {
+      rename_map[v] = cur;
+   }
+   // Also compress the original id
+   rename_map[id] = cur;
+   return cur;
+}
+
+/* Convenience: check if rename exists */
+static inline bool
+rename_has(const rename_map_t& rename_map, uint32_t id)
+{
+   return rename_map.find(id) != rename_map.end();
+}
+
+/* Set rename mapping */
+static inline void
+rename_set(rename_map_t& rename_map, uint32_t id, const Operand& op)
+{
+   // Avoid storing trivial mapping to itself; but op could equal the same temp id -> we store anyway if op isn't same temp.
+   if (op.isTemp() && op.getTemp().id() == id)
+      return;
+   rename_map[id] = op;
+}
+
+/* -------------------------------
+ * collect_parallelcopies
+ * ------------------------------- */
 
 /* create (virtual) parallelcopies for each phi instruction */
 static void
@@ -105,10 +171,9 @@ collect_parallelcopies(cssa_ctx& ctx)
    uint32_t extra_temps = 0;
    uint32_t extra_defs = 0;
    for (const Block& block : ctx.program->blocks) {
-      bool is_phi = true;
+      // iterate only over leading phi instructions (stop at first non-phi)
       for (const aco_ptr<Instruction>& phi : block.instructions) {
          if (phi->opcode != aco_opcode::p_phi && phi->opcode != aco_opcode::p_linear_phi) {
-            is_phi = false;
             break;
          }
 
@@ -145,8 +210,6 @@ collect_parallelcopies(cssa_ctx& ctx)
             extra_temps++;
          }
       }
-      if (!is_phi)
-         continue;
    }
 
    // Safe upper bound: existing temps + extra temps for copies + extra for defs + padding for safety
@@ -158,6 +221,7 @@ collect_parallelcopies(cssa_ctx& ctx)
    Builder bld(ctx.program);
 
    for (Block& block : ctx.program->blocks) {
+      // iterate only over leading phi instructions (stop at first non-phi)
       for (aco_ptr<Instruction>& phi : block.instructions) {
          if (phi->opcode != aco_opcode::p_phi && phi->opcode != aco_opcode::p_linear_phi)
             break;
@@ -196,6 +260,8 @@ collect_parallelcopies(cssa_ctx& ctx)
                }
             }
 
+            // preds[i] must exist; assert to catch structural IR issues
+            assert(preds.size() > i);
             assert(preds[i] < ctx.parallelcopies.size());
             if (ctx.parallelcopies[preds[i]].empty())
                ctx.parallelcopies[preds[i]].reserve(4);
@@ -208,6 +274,10 @@ collect_parallelcopies(cssa_ctx& ctx)
 
             set.emplace_back(tmp);
 
+            // ensure merge_node_table size covers tmp.id()
+            if (tmp.id() >= ctx.merge_node_table.size()) {
+               ctx.merge_node_table.resize(tmp.id() + 1, {Operand(), INVALID_IDX, INVALID_IDX, Temp(), Temp()});
+            }
             ctx.merge_node_table[tmp.id()] = {op, set_idx, preds[i]};
 
             has_preheader_copy |= (i == 0 && (block.kind & block_kind_loop_header));
@@ -223,6 +293,10 @@ collect_parallelcopies(cssa_ctx& ctx)
          else
             set.emplace_back(def.getTemp());
 
+         // ensure merge_node_table size covers def.tempId()
+         if (def.tempId() >= ctx.merge_node_table.size()) {
+            ctx.merge_node_table.resize(def.tempId() + 1, {Operand(), INVALID_IDX, INVALID_IDX, Temp(), Temp()});
+         }
          ctx.merge_node_table[def.tempId()] = {Operand(def.getTemp()), set_idx, block.index};
 
          ctx.merge_sets.emplace_back(std::move(set));
@@ -230,11 +304,19 @@ collect_parallelcopies(cssa_ctx& ctx)
    }
 }
 
+/* -------------------------------
+ * utility predicates
+ * ------------------------------- */
+
 [[nodiscard]] [[gnu::always_inline]] static inline bool
 defined_after(const cssa_ctx& ctx, Temp a, Temp b)
 {
    const merge_node& A = get_node_const(ctx, a.id());
    const merge_node& B = get_node_const(ctx, b.id());
+
+   // If either node had invalid defined_at we conservatively consider id ordering
+   if (A.defined_at == INVALID_IDX || B.defined_at == INVALID_IDX)
+      return a.id() > b.id();
 
    return (A.defined_at == B.defined_at) ? a.id() > b.id() : A.defined_at > B.defined_at;
 }
@@ -243,8 +325,13 @@ defined_after(const cssa_ctx& ctx, Temp a, Temp b)
 dominates(const cssa_ctx& ctx, Temp a, Temp b)
 {
    assert(defined_after(ctx, b, a));
-   const Block& parent = ctx.program->blocks[get_node_const(ctx, a.id()).defined_at];
-   const Block& child = ctx.program->blocks[get_node_const(ctx, b.id()).defined_at];
+   const merge_node& A = get_node_const(ctx, a.id());
+   const merge_node& B = get_node_const(ctx, b.id());
+   if (A.defined_at == INVALID_IDX || B.defined_at == INVALID_IDX)
+      return false;
+
+   const Block& parent = ctx.program->blocks[A.defined_at];
+   const Block& child = ctx.program->blocks[B.defined_at];
 
    return (b.regClass().type() == RegType::vgpr) ? dominates_logical(parent, child)
                                                  : dominates_linear(parent, child);
@@ -419,8 +506,17 @@ try_coalesce_copy(cssa_ctx& ctx, copy cp, uint32_t blk_idx)
    return try_merge_merge_set(ctx, cp.def.getTemp(), ctx.merge_sets[op_node.index]);
 }
 
+/* emit_copies_block: emits single copies and a parallelcopy for cycles.
+ * - ltg is block-local vector indexed by local temp ids <= local_max_temp
+ * - ltg_valid marks which entries are populated (since we allocate tight).
+ */
 static void
-emit_copies_block(Builder& bld, std::vector<ltg_node>& ltg, std::vector<uint32_t>& active_keys, RegType type)
+emit_copies_block(Builder& bld,
+                  std::vector<ltg_node>& ltg,
+                  std::vector<char>& ltg_valid,
+                  std::vector<uint32_t>& active_keys,
+                  RegType type,
+                  rename_map_t& rename_map)
 {
    RegisterDemand live_changes;
    RegisterDemand reg_demand =
@@ -429,6 +525,8 @@ emit_copies_block(Builder& bld, std::vector<ltg_node>& ltg, std::vector<uint32_t
 
    std::unordered_map<uint32_t, uint32_t> remaining_use_cnt;
    for (uint32_t key : active_keys) {
+      if (key >= ltg.size()) continue;
+      if (!ltg_valid[key]) continue;
       const ltg_node& node = ltg[key];
       if (node.cp->op.isTemp()) {
          ++remaining_use_cnt[node.cp->op.tempId()];
@@ -450,6 +548,8 @@ emit_copies_block(Builder& bld, std::vector<ltg_node>& ltg, std::vector<uint32_t
    std::vector<uint32_t> initial_keys;
    initial_keys.reserve(active_keys.size());
    for (uint32_t idx : active_keys) {
+      if (idx >= ltg.size()) continue;
+      if (!ltg_valid[idx]) continue;
       const ltg_node& n = ltg[idx];
       if (n.cp->def.regClass().type() == type && n.num_uses == 0) {
          initial_keys.push_back(idx);
@@ -462,13 +562,15 @@ emit_copies_block(Builder& bld, std::vector<ltg_node>& ltg, std::vector<uint32_t
       if (read_key == INVALID_IDX) {
          return;
       }
-      // Check validity
-      if (read_key >= ltg.size() || ltg[read_key].cp == nullptr) {
+      if (read_key >= ltg.size() || !ltg_valid[read_key]) {
          return;
       }
       ltg_node& node = ltg[read_key];
-      if (--node.num_uses == 0 && node.cp->def.regClass().type() == type) {
-         worklist.push_back(read_key);
+      if (node.num_uses > 0) {
+         --node.num_uses;
+         if (node.num_uses == 0 && node.cp->def.regClass().type() == type) {
+            worklist.push_back(read_key);
+         }
       }
    };
 
@@ -476,10 +578,12 @@ emit_copies_block(Builder& bld, std::vector<ltg_node>& ltg, std::vector<uint32_t
       uint32_t write_key = worklist.back();
       worklist.pop_back();
 
-      if (write_key >= ltg.size() || ltg[write_key].cp == nullptr) continue; // Safe check
+      if (write_key >= ltg.size() || !ltg_valid[write_key]) continue;
 
       ltg_node node = ltg[write_key];
-      ltg[write_key] = ltg_node(); // "Erase" by sentinel
+      // erase
+      ltg_valid[write_key] = 0;
+      ltg[write_key] = ltg_node();
 
       Operand src = node.cp->op;
       if (src.isTemp() && src.isKill()) {
@@ -487,6 +591,16 @@ emit_copies_block(Builder& bld, std::vector<ltg_node>& ltg, std::vector<uint32_t
       }
 
       dec_uses_and_enqueue(node.read_key);
+
+      // If src is a temp and has a rename, resolve it (path compressed)
+      if (src.isTemp()) {
+         uint32_t rid = src.getTemp().id();
+         if (rename_has(rename_map, rid)) {
+            Operand resolved = resolve_rename(rename_map, rid);
+            if (!resolved.isUndefined())
+               src = resolved;
+         }
+      }
 
       Instruction* copy_ins = bld.copy(node.cp->def, src);
       live_changes += get_live_changes(copy_ins);
@@ -496,7 +610,7 @@ emit_copies_block(Builder& bld, std::vector<ltg_node>& ltg, std::vector<uint32_t
 
    unsigned pc_slots = 0;
    for (uint32_t key : active_keys) {
-      if (key < ltg.size() && ltg[key].cp != nullptr && ltg[key].cp->def.regClass().type() == type) {
+      if (key < ltg.size() && ltg_valid[key] && ltg[key].cp != nullptr && ltg[key].cp->def.regClass().type() == type) {
          ++pc_slots;
       }
    }
@@ -506,22 +620,44 @@ emit_copies_block(Builder& bld, std::vector<ltg_node>& ltg, std::vector<uint32_t
          create_instruction(aco_opcode::p_parallelcopy, Format::PSEUDO, pc_slots, pc_slots)};
 
       unsigned slot = 0;
-      std::vector<uint32_t> cycle_keys = active_keys; // Copy to sort
+      std::vector<uint32_t> cycle_keys;
+      cycle_keys.reserve(active_keys.size());
+      for (uint32_t key : active_keys) {
+         if (key < ltg.size() && ltg_valid[key]) {
+            cycle_keys.push_back(key);
+         }
+      }
       std::sort(cycle_keys.begin(), cycle_keys.end()); // Retain determinism
 
       for (uint32_t key : cycle_keys) {
-         if (key >= ltg.size() || ltg[key].cp == nullptr) continue;
+         if (key >= ltg.size() || !ltg_valid[key]) continue;
 
-         pc->definitions[slot] = ltg[key].cp->def;
+         ltg_node& node = ltg[key];
+         if (node.cp == nullptr) continue;
 
-         Operand src = ltg[key].cp->op;
+         pc->definitions[slot] = node.cp->def;
+
+         Operand src = node.cp->op;
+
+         // Resolve rename mapping (path compressed)
+         if (src.isTemp()) {
+            uint32_t rid = src.getTemp().id();
+            if (rename_has(rename_map, rid)) {
+               Operand resolved = resolve_rename(rename_map, rid);
+               if (!resolved.isUndefined())
+                  src = resolved;
+            }
+         }
+
          if (src.isTemp() && src.isKill()) {
             src.setKill(is_last_use_and_decrement(src.getTemp()));
          }
          pc->operands[slot] = src;
 
-         dec_uses_and_enqueue(ltg[key].read_key);
-         ltg[key] = ltg_node(); // "Erase"
+         dec_uses_and_enqueue(node.read_key);
+         // erase
+         ltg_valid[key] = 0;
+         ltg[key] = ltg_node();
          ++slot;
       }
       assert(slot == pc_slots);
@@ -543,8 +679,10 @@ emit_copies_block(Builder& bld, std::vector<ltg_node>& ltg, std::vector<uint32_t
 static void
 emit_parallelcopies(cssa_ctx& ctx)
 {
-   const uint32_t max_temp_id = ctx.merge_node_table.size() - 1;
-   std::vector<std::pair<bool, Operand>> rename_map(max_temp_id + 1, {false, Operand()});
+   const uint32_t max_temp_id = ctx.merge_node_table.size() ? (ctx.merge_node_table.size() - 1) : 0;
+
+   // Use sparse rename_map to avoid allocation of huge vector when temp ids are sparse.
+   rename_map_t rename_map;
 
    for (int blk_idx = int(ctx.program->blocks.size()) - 1; blk_idx >= 0; --blk_idx) {
       if (ctx.parallelcopies[blk_idx].empty()) {
@@ -576,14 +714,30 @@ emit_parallelcopies(cssa_ctx& ctx)
                   oth.op.setFirstKill(false);
                }
             }
+
+            // record rename as sparse mapping
             if (cp.def.tempId() <= max_temp_id) {
-               rename_map[cp.def.tempId()] = {true, cp.op};
+               rename_set(rename_map, cp.def.tempId(), cp.op);
             }
          }
       }
 
       /* ───────────────────────── Stage 2 : build LTG (unique key = dst Temp ID) ────────── */
-      std::vector<ltg_node> ltg(max_temp_id + 1, ltg_node());
+      // compute a block-local max temp id to allocate tight ltg arrays
+      uint32_t local_max_temp = 0;
+      for (unsigned n = 0; n < ctx.parallelcopies[blk_idx].size(); ++n) {
+         if (coalesced[n]) continue;
+         const copy& cp = ctx.parallelcopies[blk_idx][n];
+         uint32_t dst = cp.def.tempId();
+         local_max_temp = std::max(local_max_temp, dst);
+         if (cp.op.isTemp()) {
+            local_max_temp = std::max(local_max_temp, cp.op.tempId());
+         }
+      }
+
+      // allocate tight LTG and validity bitmap
+      std::vector<ltg_node> ltg(local_max_temp + 1, ltg_node());
+      std::vector<char> ltg_valid(local_max_temp + 1, 0);
       std::vector<uint32_t> active_keys;
       active_keys.reserve(ctx.parallelcopies[blk_idx].size());
       bool has_vgpr = false, has_sgpr = false;
@@ -597,11 +751,15 @@ emit_parallelcopies(cssa_ctx& ctx)
 
          if (cp.op.isTemp()) {
             uint32_t id = cp.op.tempId();
-            while (id <= max_temp_id && rename_map[id].first) {
-               cp.op = rename_map[id].second;
-               if (!cp.op.isTemp())
-                  break;
-               id = cp.op.tempId();
+            if (rename_has(rename_map, id)) {
+               Operand resolved = resolve_rename(rename_map, id);
+               if (!resolved.isUndefined())
+                  cp.op = resolved;
+               if (!cp.op.isTemp()) {
+                  // become immediate/fixed; we keep as-is
+               } else {
+                  id = cp.op.tempId();
+               }
             }
          }
 
@@ -615,8 +773,9 @@ emit_parallelcopies(cssa_ctx& ctx)
          uint32_t dst_key = cp.def.tempId();
          uint32_t read_key = cp.op.isTemp() ? cp.op.tempId() : INVALID_IDX;
 
-         if (dst_key >= ltg.size()) continue; // Safe bound
+         if (dst_key > local_max_temp) continue; // safety bound: should not happen
          ltg[dst_key] = ltg_node(&cp, read_key);
+         ltg_valid[dst_key] = 1;
          active_keys.push_back(dst_key);
 
          bool is_vgpr = cp.def.regClass().type() == RegType::vgpr;
@@ -625,9 +784,11 @@ emit_parallelcopies(cssa_ctx& ctx)
       }
 
       for (uint32_t key : active_keys) {
-         ltg_node& node = ltg[key];
-         if (node.read_key != INVALID_IDX && node.read_key < ltg.size() && ltg[node.read_key].cp != nullptr) {
-            ++ltg[node.read_key].num_uses;
+         if (key < ltg.size() && ltg_valid[key]) {
+            ltg_node& node = ltg[key];
+            if (node.read_key != INVALID_IDX && node.read_key < ltg.size() && ltg_valid[node.read_key] && ltg[node.read_key].cp != nullptr) {
+               ++ltg[node.read_key].num_uses;
+            }
          }
       }
 
@@ -642,20 +803,22 @@ emit_parallelcopies(cssa_ctx& ctx)
          auto insert_pt = (lg_end == blk.instructions.rend()) ? std::prev(blk.instructions.end())
                                                               : std::prev(lg_end.base());
          bld.reset(&blk.instructions, insert_pt);
-         emit_copies_block(bld, ltg, active_keys, RegType::vgpr);
+         emit_copies_block(bld, ltg, ltg_valid, active_keys, RegType::vgpr, rename_map);
       }
 
       if (has_sgpr) {
          bld.reset(&blk.instructions, std::prev(blk.instructions.end()));
-         emit_copies_block(bld, ltg, active_keys, RegType::sgpr);
+         emit_copies_block(bld, ltg, ltg_valid, active_keys, RegType::sgpr, rename_map);
       }
 
       // Assert ltg consumed (all sentinels)
-      bool all_consumed = true;
       for (uint32_t key : active_keys) {
-         if (ltg[key].cp != nullptr) all_consumed = false;
+         if (key < ltg.size() && ltg_valid[key]) {
+            // If something remains, it's a logic bug: assert in debug.
+            assert(!"emit_copies_block must consume all LTG nodes");
+            break;
+         }
       }
-      assert(all_consumed && "emit_copies_block must consume all LTG nodes");
    }
 
    /* ───────────────────────── Rename φ operands & update demand ─────────────────────── */
@@ -669,11 +832,11 @@ emit_parallelcopies(cssa_ctx& ctx)
          for (Operand& op : phi->operands) {
             if (op.isTemp()) {
                uint32_t id = op.tempId();
-               while (id <= max_temp_id && rename_map[id].first) {
-                  op = rename_map[id].second;
-                  if (!op.isTemp())
-                     break;
-                  id = op.tempId();
+               // Use resolve_rename if mapping exists
+               if (rename_has(rename_map, id)) {
+                  Operand resolved = resolve_rename(rename_map, id);
+                  if (!resolved.isUndefined())
+                     op = resolved;
                }
             }
          }
