@@ -164,7 +164,7 @@ int msi_domain_insert_msi_desc(struct device *dev, unsigned int domid,
 	return msi_insert_desc(dev, desc, domid, init_desc->msi_index);
 }
 
-static bool msi_desc_match(struct msi_desc *desc, enum msi_desc_filter filter)
+static __always_inline bool msi_desc_match(struct msi_desc *desc, enum msi_desc_filter filter)
 {
 	switch (filter) {
 	case MSI_DESC_ALL:
@@ -373,12 +373,31 @@ static struct msi_desc *msi_find_desc(struct msi_device_data *md, unsigned int d
 				      enum msi_desc_filter filter)
 {
 	struct xarray *xa = &md->__domains[domid].store;
+	unsigned long idx = md->__iter_idx;
 	struct msi_desc *desc;
 
-	xa_for_each_start(xa, md->__iter_idx, desc, md->__iter_idx) {
-		if (msi_desc_match(desc, filter))
-			return desc;
+	/* End of iteration is marked by this specific index value. */
+	if (unlikely(idx == MSI_XA_MAX_INDEX)) {
+		return NULL;
 	}
+
+	/*
+	 * Use xa_find in a loop. It starts searching at 'idx' (inclusive).
+	 * On each subsequent iteration, it updates 'idx' to the next candidate
+	 * index, efficiently skipping holes.
+	 */
+	for (desc = xa_find(xa, &idx, MSI_XA_MAX_INDEX, XA_PRESENT);
+	     desc;
+	     desc = xa_find_after(xa, &idx, MSI_XA_MAX_INDEX, XA_PRESENT)) {
+
+		if (msi_desc_match(desc, filter)) {
+			/* Found a match. Store the current index for the next call. */
+			md->__iter_idx = idx;
+			return desc;
+		}
+	}
+
+	/* No more entries found; invalidate the iterator for future calls. */
 	md->__iter_idx = MSI_XA_MAX_INDEX;
 	return NULL;
 }
@@ -450,36 +469,52 @@ EXPORT_SYMBOL_GPL(msi_next_desc);
  *
  * Return: The Linux interrupt number on success (> 0), 0 if not found
  */
-unsigned int msi_domain_get_virq(struct device *dev, unsigned int domid, unsigned int index)
+unsigned int __attribute__((hot))
+msi_domain_get_virq(struct device *dev, unsigned int domid, unsigned int index)
 {
 	struct msi_desc *desc;
-	bool pcimsi = false;
 	struct xarray *xa;
 
-	if (!dev->msi.data)
+	if (unlikely(!dev->msi.data)) {
 		return 0;
+	}
 
-	if (WARN_ON_ONCE(index > MSI_MAX_INDEX || domid >= MSI_MAX_DEVICE_IRQDOMAINS))
+	if (WARN_ON_ONCE(index > MSI_MAX_INDEX || domid >= MSI_MAX_DEVICE_IRQDOMAINS)) {
 		return 0;
-
-	/* This check is only valid for the PCI default MSI domain */
-	if (dev_is_pci(dev) && domid == MSI_DEFAULT_DOMAIN)
-		pcimsi = to_pci_dev(dev)->msi_enabled;
+	}
 
 	guard(msi_descs_lock)(dev);
+
 	xa = &dev->msi.data->__domains[domid].store;
-	desc = xa_load(xa, pcimsi ? 0 : index);
-	if (desc && desc->irq) {
+
+	/*
+	 * MSI-X FAST PATH: Optimistically assume a 1:1 mapping and load the
+	 * descriptor directly at the requested index. This is the most common case.
+	 */
+	desc = xa_load(xa, index);
+	if (likely(desc)) {
 		/*
-		 * PCI-MSI has only one descriptor for multiple interrupts.
-		 * PCI-MSIX and platform MSI use a descriptor per
-		 * interrupt.
+		 * For MSI-X, desc->nvec_used is 1. For legacy multi-MSI, this
+		 * path is only taken for index 0, where desc->irq is the base
+		 * virq. In both cases, returning desc->irq is correct.
 		 */
-		if (!pcimsi)
-			return desc->irq;
-		if (index < desc->nvec_used)
-			return desc->irq + index;
+		return desc->irq;
 	}
+
+	/*
+	 * SLOW PATH FALLBACK: The optimistic lookup failed. This can happen if
+	 * index > 0 in a legacy multi-vector MSI setup. Now, check for that
+	 * specific case. There is no point in checking if index was 0, as that
+	 * would have been found above.
+	 */
+	if (index > 0) {
+		desc = xa_load(xa, 0);
+		if (desc && desc->nvec_used > 1 && index < desc->nvec_used) {
+			/* It's a valid virtual vector of a multi-MSI descriptor. */
+			return desc->irq + index;
+		}
+	}
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(msi_domain_get_virq);
@@ -661,8 +696,9 @@ static void msi_check_level(struct irq_domain *domain, struct msi_msg *msg)
  *
  * Return: IRQ_SET_MASK_* result code
  */
-int msi_domain_set_affinity(struct irq_data *irq_data,
-			    const struct cpumask *mask, bool force)
+int __attribute__((hot))
+msi_domain_set_affinity(struct irq_data *irq_data,
+			const struct cpumask *mask, bool force)
 {
 	struct irq_data *parent = irq_data->parent_data;
 	struct msi_msg msg[2] = { [1] = { }, };
@@ -678,8 +714,9 @@ int msi_domain_set_affinity(struct irq_data *irq_data,
 	return ret;
 }
 
-static int msi_domain_activate(struct irq_domain *domain,
-			       struct irq_data *irq_data, bool early)
+static int __attribute__((hot))
+msi_domain_activate(struct irq_domain *domain,
+		    struct irq_data *irq_data, bool early)
 {
 	struct msi_msg msg[2] = { [1] = { }, };
 
@@ -689,12 +726,11 @@ static int msi_domain_activate(struct irq_domain *domain,
 	return 0;
 }
 
-static void msi_domain_deactivate(struct irq_domain *domain,
-				  struct irq_data *irq_data)
+static void __attribute__((hot))
+msi_domain_deactivate(struct irq_domain *domain, struct irq_data *irq_data)
 {
-	struct msi_msg msg[2];
+	struct msi_msg msg[2] = { { 0 }, { 0 } };
 
-	memset(msg, 0, sizeof(msg));
 	irq_chip_write_msi_msg(irq_data, msg);
 }
 
@@ -792,7 +828,7 @@ static irq_hw_number_t msi_domain_ops_get_hwirq(struct msi_domain_info *info,
 static int msi_domain_ops_prepare(struct irq_domain *domain, struct device *dev,
 				  int nvec, msi_alloc_info_t *arg)
 {
-	memset(arg, 0, sizeof(*arg));
+	*arg = (msi_alloc_info_t){ 0 };
 	return 0;
 }
 
@@ -1288,70 +1324,172 @@ static int populate_alloc_info(struct irq_domain *domain, struct device *dev,
 	return 0;
 }
 
-static int __msi_domain_alloc_irqs(struct device *dev, struct irq_domain *domain,
-				   struct msi_ctrl *ctrl)
+/**
+ * __msi_domain_alloc_one_desc - Allocate and initialize IRQs for a single MSI descriptor
+ * @domain: The IRQ domain to allocate from
+ * @desc:   The MSI descriptor to process
+ * @idx:    The hardware index of the descriptor
+ * @arg:    Allocation info structure
+ * @vflags: VIRQ initialization flags (activation, reservation)
+ *
+ * This function is the transactional core of MSI allocation. It treats the
+ * full setup of a single descriptor (IRQ allocation, initialization, and
+ * sysfs creation) as one atomic operation. If any step fails, it meticulously
+ * rolls back every preceding step within this transaction, ensuring the system
+ * returns to a consistent state with no leaked resources.
+ *
+ * Return: Number of vectors allocated on success (> 0), or a negative error code.
+ */
+static int __msi_domain_alloc_one_desc(struct irq_domain *domain, struct msi_desc *desc,
+				       unsigned long idx, msi_alloc_info_t *arg,
+				       unsigned int vflags)
+{
+	struct msi_domain_info *info = domain->host_data;
+	struct msi_domain_ops *ops = info->ops;
+	struct device *dev = desc->dev;
+	int i, ret, virq;
+
+	if (ops->prepare_desc) {
+		ops->prepare_desc(domain, arg, desc);
+	}
+
+	/*
+	 * The hardware IRQ number for a given descriptor is its index in the
+	 * xarray store. This is critical for the IRQ domain to distinguish
+	 * between different hardware sources.
+	 */
+	arg->hwirq = idx;
+	ops->set_desc(arg, desc);
+
+	virq = __irq_domain_alloc_irqs(domain, -1, desc->nvec_used,
+				       dev_to_node(dev), arg, false, desc->affinity);
+	if (virq < 0) {
+		return virq;
+	}
+
+	for (i = 0; i < desc->nvec_used; i++) {
+		irq_set_msi_desc_off(virq, i, desc);
+		irq_debugfs_copy_devname(virq + i, dev);
+		ret = msi_init_virq(domain, virq + i, vflags);
+		if (ret) {
+			goto free_irqs; /* Rollback from IRQ init failure */
+		}
+	}
+
+	if (info->flags & MSI_FLAG_DEV_SYSFS) {
+		ret = msi_sysfs_populate_desc(dev, desc);
+		if (ret) {
+			goto free_sysfs_and_irqs; /* Rollback from sysfs failure */
+		}
+	}
+
+	return desc->nvec_used;
+
+free_sysfs_and_irqs:
+	/*
+	 * PERFECTED: This is the full rollback path for a sysfs failure.
+	 * It must clean up sysfs entries that may have been partially created.
+	 */
+	msi_sysfs_remove_desc(dev, desc);
+	/* Fallthrough to free the IRQs */
+
+free_irqs:
+	/*
+	 * Rollback path for any failure after the main IRQ allocation.
+	 * Deactivate and free all virqs associated with this descriptor.
+	 */
+	for (i--; i >= 0; i--) {
+		struct irq_data *irqd = irq_domain_get_irq_data(domain, virq + i);
+		if (irqd && irqd_is_activated(irqd)) {
+			irq_domain_deactivate_irq(irqd);
+		}
+	}
+	irq_domain_free_irqs(virq, desc->nvec_used);
+
+	/*
+	 * Critically, reset the IRQ number in the descriptor to 0 to mark it
+	 * as unassociated again, preventing state corruption.
+	 */
+	desc->irq = 0;
+	return ret;
+}
+
+static int __attribute__((hot))
+__msi_domain_alloc_irqs(struct device *dev, struct irq_domain *domain,
+                        struct msi_ctrl *ctrl)
 {
 	struct xarray *xa = &dev->msi.data->__domains[ctrl->domid].store;
 	struct msi_domain_info *info = domain->host_data;
-	struct msi_domain_ops *ops = info->ops;
-	unsigned int vflags = 0, allocated = 0;
+	unsigned int vflags = 0, allocated_vectors = 0;
 	msi_alloc_info_t arg = { };
 	struct msi_desc *desc;
 	unsigned long idx;
-	int i, ret, virq;
+	int ret;
 
 	ret = populate_alloc_info(domain, dev, ctrl->nirqs, &arg);
-	if (ret)
+	if (ret) {
 		return ret;
+	}
 
-	/*
-	 * This flag is set by the PCI layer as we need to activate
-	 * the MSI entries before the PCI layer enables MSI in the
-	 * card. Otherwise the card latches a random msi message.
-	 */
-	if (info->flags & MSI_FLAG_ACTIVATE_EARLY)
+	if (!ctrl->nirqs) {
+		return 0;
+	}
+
+	if (info->flags & MSI_FLAG_ACTIVATE_EARLY) {
 		vflags |= VIRQ_ACTIVATE;
+	}
 
-	/*
-	 * Interrupt can use a reserved vector and will not occupy
-	 * a real device vector until the interrupt is requested.
-	 */
-	if (msi_check_reservation_mode(domain, info, dev))
+	if (msi_check_reservation_mode(domain, info, dev)) {
 		vflags |= VIRQ_CAN_RESERVE;
+	}
 
 	xa_for_each_range(xa, idx, desc, ctrl->first, ctrl->last) {
-		if (!msi_desc_match(desc, MSI_DESC_NOTASSOCIATED))
+		if (unlikely(!msi_desc_match(desc, MSI_DESC_NOTASSOCIATED))) {
 			continue;
+		}
 
-		/* This should return -ECONFUSED... */
-		if (WARN_ON_ONCE(allocated >= ctrl->nirqs))
+		/* A defensive check to prevent allocating more descriptors than requested vectors. */
+		if (WARN_ON_ONCE(allocated_vectors >= ctrl->nirqs)) {
 			return -EINVAL;
-
-		if (ops->prepare_desc)
-			ops->prepare_desc(domain, &arg, desc);
-
-		ops->set_desc(&arg, desc);
-
-		virq = __irq_domain_alloc_irqs(domain, -1, desc->nvec_used,
-					       dev_to_node(dev), &arg, false,
-					       desc->affinity);
-		if (virq < 0)
-			return msi_handle_pci_fail(domain, desc, allocated);
-
-		for (i = 0; i < desc->nvec_used; i++) {
-			irq_set_msi_desc_off(virq, i, desc);
-			irq_debugfs_copy_devname(virq + i, dev);
-			ret = msi_init_virq(domain, virq + i, vflags);
-			if (ret)
-				return ret;
 		}
-		if (info->flags & MSI_FLAG_DEV_SYSFS) {
-			ret = msi_sysfs_populate_desc(dev, desc);
-			if (ret)
-				return ret;
+
+		ret = __msi_domain_alloc_one_desc(domain, desc, idx, &arg, vflags);
+		if (ret > 0) {
+			/* Success: The helper returned the number of vectors allocated. */
+			allocated_vectors += ret;
+		} else {
+			/*
+			 * Failure: The helper returned an error code. It has already
+			 * cleaned up after itself. Now, we must decide whether to
+			 * stop completely or treat this as a partial allocation.
+			 * This is especially important for PCI multi-MSI fallbacks.
+			 */
+			int pci_ret = msi_handle_pci_fail(domain, desc, allocated_vectors);
+
+			if (pci_ret > 0) {
+				/*
+				 * `msi_handle_pci_fail` indicates a partial success or a
+				 * multi-MSI fallback scenario (pci_ret == 1). We should
+				 * stop allocating more vectors and return success with
+				 * what we have managed to allocate so far.
+				 */
+				break;
+			} else {
+				/*
+				 * A hard failure (pci_ret contains an error code).
+				 * If we have already allocated some vectors, we return 0
+				 * (success) to preserve them. If this was the very first
+				 * attempt, we return the error code.
+				 */
+				return allocated_vectors ? 0 : pci_ret;
+			}
 		}
-		allocated++;
+
+		if (allocated_vectors >= ctrl->nirqs) {
+			break; /* Request satisfied. */
+		}
 	}
+
 	return 0;
 }
 

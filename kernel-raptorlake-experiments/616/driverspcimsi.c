@@ -7,6 +7,8 @@
  * Copyright (C) 2016 Christoph Hellwig.
  */
 #include <linux/bitfield.h>
+#include <linux/bitmap.h>
+#include <linux/prefetch.h>
 #include <linux/err.h>
 #include <linux/export.h>
 #include <linux/irq.h>
@@ -115,15 +117,18 @@ void pci_msi_update_mask(struct msi_desc *desc, u32 clear, u32 set)
 {
 	raw_spinlock_t *lock = &to_pci_dev(desc->dev)->msi_lock;
 	unsigned long flags;
+	u32 new_mask;
 
 	if (!desc->pci.msi_attrib.can_mask)
 		return;
 
 	raw_spin_lock_irqsave(lock, flags);
-	desc->pci.msi_mask &= ~clear;
-	desc->pci.msi_mask |= set;
-	pci_write_config_dword(msi_desc_to_pci_dev(desc), desc->pci.mask_pos,
-			       desc->pci.msi_mask);
+	new_mask = (desc->pci.msi_mask & ~clear) | set;
+	if (new_mask != desc->pci.msi_mask) {
+		desc->pci.msi_mask = new_mask;
+		pci_write_config_dword(msi_desc_to_pci_dev(desc), desc->pci.mask_pos,
+				       new_mask);
+	}
 	raw_spin_unlock_irqrestore(lock, flags);
 }
 
@@ -135,6 +140,7 @@ void pci_msi_mask_irq(struct irq_data *data)
 {
 	struct msi_desc *desc = irq_data_get_msi_desc(data);
 
+	prefetchw(desc);
 	__pci_msi_mask_desc(desc, BIT(data->irq - desc->irq));
 }
 EXPORT_SYMBOL_GPL(pci_msi_mask_irq);
@@ -147,6 +153,7 @@ void pci_msi_unmask_irq(struct irq_data *data)
 {
 	struct msi_desc *desc = irq_data_get_msi_desc(data);
 
+	prefetchw(desc);
 	__pci_msi_unmask_desc(desc, BIT(data->irq - desc->irq));
 }
 EXPORT_SYMBOL_GPL(pci_msi_unmask_irq);
@@ -156,6 +163,7 @@ void __pci_read_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
 	struct pci_dev *dev = msi_desc_to_pci_dev(entry);
 
 	BUG_ON(dev->current_state != PCI_D0);
+	prefetchw(msg);
 
 	if (entry->pci.msi_attrib.is_msix) {
 		void __iomem *base = pci_msix_desc_addr(entry);
@@ -188,12 +196,13 @@ static inline void pci_write_msg_msi(struct pci_dev *dev, struct msi_desc *desc,
 				     struct msi_msg *msg)
 {
 	int pos = dev->msi_cap;
-	u16 msgctl;
+	u16 msgctl, desired;
 
 	pci_read_config_word(dev, pos + PCI_MSI_FLAGS, &msgctl);
-	msgctl &= ~PCI_MSI_FLAGS_QSIZE;
-	msgctl |= FIELD_PREP(PCI_MSI_FLAGS_QSIZE, desc->pci.msi_attrib.multiple);
-	pci_write_config_word(dev, pos + PCI_MSI_FLAGS, msgctl);
+	desired = (msgctl & ~PCI_MSI_FLAGS_QSIZE) |
+		  FIELD_PREP(PCI_MSI_FLAGS_QSIZE, desc->pci.msi_attrib.multiple);
+	if (desired != msgctl)
+		pci_write_config_word(dev, pos + PCI_MSI_FLAGS, desired);
 
 	pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_LO, msg->address_lo);
 	if (desc->pci.msi_attrib.is_64) {
@@ -273,13 +282,13 @@ static void pci_intx_for_msi(struct pci_dev *dev, int enable)
 
 static void pci_msi_set_enable(struct pci_dev *dev, int enable)
 {
-	u16 control;
+	u16 control, new_control;
 
 	pci_read_config_word(dev, dev->msi_cap + PCI_MSI_FLAGS, &control);
-	control &= ~PCI_MSI_FLAGS_ENABLE;
-	if (enable)
-		control |= PCI_MSI_FLAGS_ENABLE;
-	pci_write_config_word(dev, dev->msi_cap + PCI_MSI_FLAGS, control);
+	new_control = enable ? (control | PCI_MSI_FLAGS_ENABLE)
+			     : (control & ~PCI_MSI_FLAGS_ENABLE);
+	if (new_control != control)
+		pci_write_config_word(dev, dev->msi_cap + PCI_MSI_FLAGS, new_control);
 }
 
 static int msi_setup_msi_desc(struct pci_dev *dev, int nvec,
@@ -488,7 +497,7 @@ int pci_msi_vec_count(struct pci_dev *dev)
 		return -EINVAL;
 
 	pci_read_config_word(dev, dev->msi_cap + PCI_MSI_FLAGS, &msgctl);
-	ret = 1 << FIELD_GET(PCI_MSI_FLAGS_QMASK, msgctl);
+	ret = 1U << FIELD_GET(PCI_MSI_FLAGS_QMASK, msgctl);
 
 	return ret;
 }
@@ -768,23 +777,57 @@ out_disable:
 static bool pci_msix_validate_entries(struct pci_dev *dev, struct msix_entry *entries, int nvec)
 {
 	bool nogap;
-	int i, j;
+	unsigned int i, max_idx = 0;
+	unsigned long stack_bm[4] = { 0 }; /* up to 256 bits on 64-bit */
+	unsigned long *bm;
+	size_t bits;
 
 	if (!entries)
 		return true;
 
 	nogap = pci_msi_domain_supports(dev, MSI_FLAG_MSIX_CONTIGUOUS, DENY_LEGACY);
 
-	for (i = 0; i < nvec; i++) {
-		/* Check for duplicate entries */
-		for (j = i + 1; j < nvec; j++) {
-			if (entries[i].entry == entries[j].entry)
-				return false;
-		}
-		/* Check for unsupported gaps */
+	/* Check contiguity requirement and locate maximum index */
+	for (i = 0; i < (unsigned int)nvec; i++) {
 		if (nogap && entries[i].entry != i)
 			return false;
+		if (entries[i].entry > max_idx)
+			max_idx = entries[i].entry;
 	}
+
+	/* Bitmap fast path to detect duplicates */
+	bits = (size_t)max_idx + 1U;
+	if (bits <= ARRAY_SIZE(stack_bm) * BITS_PER_LONG) {
+		bm = stack_bm;
+		bitmap_zero(bm, bits);
+	} else {
+		bm = bitmap_zalloc(bits, GFP_KERNEL);
+		if (!bm) {
+			/* Fallback to O(N²) duplicate scan */
+			for (i = 0; i < (unsigned int)nvec; i++) {
+				unsigned int j;
+				if (nogap && entries[i].entry != i)
+					return false;
+				for (j = i + 1; j < (unsigned int)nvec; j++) {
+					if (entries[i].entry == entries[j].entry)
+						return false;
+				}
+			}
+			return true;
+		}
+	}
+
+	for (i = 0; i < (unsigned int)nvec; i++) {
+		u32 idx = entries[i].entry;
+		if (test_and_set_bit(idx, bm)) {
+			if (bm != stack_bm)
+				bitmap_free(bm);
+			return false;
+		}
+	}
+
+	if (bm != stack_bm)
+		bitmap_free(bm);
 	return true;
 }
 
