@@ -42,6 +42,7 @@
  * support is used (with mapping between virtual and hardware IRQs).
  */
 
+#include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/pci.h>
 
@@ -161,16 +162,20 @@ void amdgpu_irq_disable_all(struct amdgpu_device *adev)
  * Returns:
  * result of handling the IRQ, as defined by &irqreturn_t
  */
-static irqreturn_t amdgpu_irq_handler(int irq, void *arg)
+static irqreturn_t __attribute__((hot))
+amdgpu_irq_handler(int irq, void *arg)
 {
-	struct drm_device *dev = (struct drm_device *) arg;
+	struct drm_device *dev = (struct drm_device *)arg;
 	struct amdgpu_device *adev = drm_to_adev(dev);
 	irqreturn_t ret;
 
 	ret = amdgpu_ih_process(adev, &adev->irq.ih);
-	if (ret == IRQ_HANDLED)
+
+	/* Only touch PM runtime accounting when we actually handled work */
+	if (likely(ret == IRQ_HANDLED))
 		pm_runtime_mark_last_busy(dev->dev);
 
+	/* Preserve original semantics: always invoke the RAS fatal handler */
 	amdgpu_ras_interrupt_fatal_error_handler(adev);
 
 	return ret;
@@ -234,12 +239,8 @@ static void amdgpu_irq_handle_ih_soft(struct work_struct *work)
  */
 static bool amdgpu_msi_ok(struct amdgpu_device *adev)
 {
-	if (amdgpu_msi == 1)
-		return true;
-	else if (amdgpu_msi == 0)
-		return false;
-
-	return true;
+	/* Enable MSI/MSI-X unless explicitly disabled via module parameter */
+	return amdgpu_msi != 0;
 }
 
 static void amdgpu_restore_msix(struct amdgpu_device *adev)
@@ -278,10 +279,7 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
 	/* Enable MSI if not disabled by module parameter */
 	adev->irq.msi_enabled = false;
 
-	if (!amdgpu_msi_ok(adev))
-		flags = PCI_IRQ_INTX;
-	else
-		flags = PCI_IRQ_ALL_TYPES;
+	flags = amdgpu_msi_ok(adev) ? PCI_IRQ_ALL_TYPES : PCI_IRQ_INTX;
 
 	/* we only need one vector */
 	r = pci_alloc_irq_vectors(adev->pdev, 1, 1, flags);
@@ -299,14 +297,15 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
 	INIT_WORK(&adev->irq.ih2_work, amdgpu_irq_handle_ih2);
 	INIT_WORK(&adev->irq.ih_soft_work, amdgpu_irq_handle_ih_soft);
 
-	/* Use vector 0 for MSI-X. */
+	/* Use vector 0 for MSI/MSI-X. */
 	r = pci_irq_vector(adev->pdev, 0);
 	if (r < 0)
 		goto free_vectors;
 	irq = r;
 
 	/* PCI devices require shared interrupts. */
-	r = request_irq(irq, amdgpu_irq_handler, IRQF_SHARED, adev_to_drm(adev)->driver->name,
+	r = request_irq(irq, amdgpu_irq_handler, IRQF_SHARED,
+			adev_to_drm(adev)->driver->name,
 			adev_to_drm(adev));
 	if (r)
 		goto free_vectors;
@@ -314,6 +313,37 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
 	adev->irq.installed = true;
 	adev->irq.irq = irq;
 	adev_to_drm(adev)->max_vblank_count = 0x00ffffff;
+
+	/*
+	 * GPU IRQ affinity hint: steer the vector to a CPU local to the GPU's
+	 * NUMA node to reduce cross-core traffic and cache thrash. This is a
+	 * non-binding hint (the kernel/irqbalance may still adjust it).
+	 */
+#ifdef CONFIG_SMP
+	{
+		cpumask_t mask;
+		int node, cpu;
+
+		cpumask_clear(&mask);
+
+		node = dev_to_node(adev->dev);
+		if (node >= 0) {
+			const struct cpumask *nmask = cpumask_of_node(node);
+			cpu = cpumask_any_and(nmask, cpu_online_mask);
+		} else {
+			cpu = cpumask_first(cpu_online_mask);
+		}
+
+		if (cpu >= nr_cpu_ids)
+			cpu = cpumask_first(cpu_online_mask);
+
+		if (cpu < nr_cpu_ids) {
+			cpumask_set_cpu(cpu, &mask);
+			/* Best-effort hint; ignore return */
+			irq_set_affinity_hint(irq, &mask);
+		}
+	}
+#endif
 
 	DRM_DEBUG("amdgpu: irq initialized.\n");
 	return 0;
@@ -329,6 +359,10 @@ free_vectors:
 void amdgpu_irq_fini_hw(struct amdgpu_device *adev)
 {
 	if (adev->irq.installed) {
+		#ifdef CONFIG_SMP
+		/* Clear any affinity hint before teardown */
+		irq_set_affinity_hint(adev->irq.irq, NULL);
+		#endif
 		free_irq(adev->irq.irq, adev_to_drm(adev));
 		adev->irq.installed = false;
 		if (adev->irq.msi_enabled)
@@ -433,22 +467,23 @@ int amdgpu_irq_add_id(struct amdgpu_device *adev,
  *
  * Dispatches IRQ to IP blocks.
  */
-void amdgpu_irq_dispatch(struct amdgpu_device *adev,
-			 struct amdgpu_ih_ring *ih)
+void __attribute__((hot))
+amdgpu_irq_dispatch(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih)
 {
 	u32 ring_index = ih->rptr >> 2;
 	struct amdgpu_iv_entry entry;
 	unsigned int client_id, src_id;
 	struct amdgpu_irq_src *src;
+	struct amdgpu_irq_src **srcs;
 	bool handled = false;
 	int r;
 
 	entry.ih = ih;
-	entry.iv_entry = (const uint32_t *)&ih->ring[ring_index];
+	entry.iv_entry = (const u32 *)&ih->ring[ring_index];
 
 	/*
-	 * timestamp is not supported on some legacy SOCs (cik, cz, iceland,
-	 * si and tonga), so initialize timestamp and timestamp_src to 0
+	 * Timestamp is not supported on some legacy SOCs (cik, cz, iceland,
+	 * si and tonga), so initialize timestamp and timestamp_src to 0.
 	 */
 	entry.timestamp = 0;
 	entry.timestamp_src = 0;
@@ -460,35 +495,46 @@ void amdgpu_irq_dispatch(struct amdgpu_device *adev,
 	client_id = entry.client_id;
 	src_id = entry.src_id;
 
-	if (client_id >= AMDGPU_IRQ_CLIENTID_MAX) {
-		DRM_DEBUG("Invalid client_id in IV: %d\n", client_id);
+	/* Fast path: valid IDs */
+	if (likely(client_id < AMDGPU_IRQ_CLIENTID_MAX &&
+		   src_id < AMDGPU_MAX_IRQ_SRC_ID)) {
 
-	} else	if (src_id >= AMDGPU_MAX_IRQ_SRC_ID) {
-		DRM_DEBUG("Invalid src_id in IV: %d\n", src_id);
+		/* Legacy/ISP sources handled via irqdomain; do not mark handled */
+		if (unlikely(((client_id == AMDGPU_IRQ_CLIENTID_LEGACY) ||
+			      (client_id == SOC15_IH_CLIENTID_ISP)) &&
+			     adev->irq.virq[src_id])) {
+			generic_handle_domain_irq(adev->irq.domain, src_id);
+			goto out_kfd;
+		}
 
-	} else if (((client_id == AMDGPU_IRQ_CLIENTID_LEGACY) ||
-		    (client_id == SOC15_IH_CLIENTID_ISP)) &&
-		   adev->irq.virq[src_id]) {
-		generic_handle_domain_irq(adev->irq.domain, src_id);
-
-	} else if (!adev->irq.client[client_id].sources) {
-		DRM_DEBUG("Unregistered interrupt client_id: %d src_id: %d\n",
-			  client_id, src_id);
-
-	} else if ((src = adev->irq.client[client_id].sources[src_id])) {
-		r = src->funcs->process(adev, src, &entry);
-		if (r < 0)
-			DRM_ERROR("error processing interrupt (%d)\n", r);
-		else if (r)
-			handled = true;
-
+		/* Load the per-client source table once */
+		srcs = READ_ONCE(adev->irq.client[client_id].sources);
+		if (likely(srcs)) {
+			/* Load the src pointer once */
+			src = READ_ONCE(srcs[src_id]);
+			if (likely(src)) {
+				r = src->funcs->process(adev, src, &entry);
+				if (unlikely(r < 0)) {
+					DRM_ERROR("error processing interrupt (%d)\n", r);
+				} else if (r) {
+					handled = true;
+				}
+			} else {
+				DRM_DEBUG("Unregistered interrupt src_id: %u of client_id:%u\n",
+					  src_id, client_id);
+			}
+		} else {
+			DRM_DEBUG("Unregistered interrupt client_id: %u src_id: %u\n",
+				  client_id, src_id);
+		}
 	} else {
-		DRM_DEBUG("Unregistered interrupt src_id: %d of client_id:%d\n",
-			src_id, client_id);
+		DRM_DEBUG("Invalid IV ids: client_id=%u src_id=%u\n",
+			  client_id, src_id);
 	}
 
+out_kfd:
 	/* Send it to amdkfd as well if it isn't already handled */
-	if (!handled)
+	if (unlikely(!handled))
 		amdgpu_amdkfd_interrupt(adev, entry.iv_entry);
 
 	if (amdgpu_ih_ts_after(ih->processed_timestamp, entry.timestamp))
