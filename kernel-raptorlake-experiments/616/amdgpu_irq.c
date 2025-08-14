@@ -45,6 +45,7 @@
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/pci.h>
+#include <linux/reboot.h>
 
 #include <drm/drm_vblank.h>
 #include <drm/amdgpu_drm.h>
@@ -600,24 +601,87 @@ int amdgpu_irq_update(struct amdgpu_device *adev,
  */
 void amdgpu_irq_gpu_reset_resume_helper(struct amdgpu_device *adev)
 {
-	int i, j, k;
+	struct amdgpu_irq_src *src;
+	unsigned long irqflags;
+	enum amdgpu_interrupt_state state;
+	int i, j, k, r;
 
-	if (amdgpu_sriov_vf(adev) || amdgpu_passthrough(adev))
+	/*
+	 * This is the kernel's global system state. It is not exported via
+	 * EXPORT_SYMBOL, so we must declare it extern here to check if a
+	 * reboot or shutdown is in progress.
+	 */
+	extern enum system_states system_state;
+
+	/*
+	 * CRITICAL CORRECTNESS FIX:
+	 * This function is designed to RESUME interrupt functionality after a
+	 * GPU-specific reset. It is fundamentally unsafe to execute during a
+	 * system-wide shutdown or reboot sequence (e.g., SYSTEM_REBOOT,
+	 * SYSTEM_HALT, SYSTEM_POWER_OFF). During shutdown, the hardware and
+	 * underlying subsystems (like PCI) are in an unpredictable state.
+	 * Attempting to access hardware here can lead to a kernel panic.
+	 * This check prevents such unsafe execution.
+	 */
+	if (system_state != SYSTEM_RUNNING) {
+		return;
+	}
+
+	if (amdgpu_sriov_vf(adev) || amdgpu_passthrough(adev)) {
 		amdgpu_restore_msix(adev);
+	}
+
+	/*
+	 * PERFORMANCE & CORRECTNESS FIX:
+	 * The original logic called amdgpu_irq_update() inside the innermost
+	 * loop, causing hundreds of expensive spinlock acquire/release cycles
+	 * ("lock churning") during a time-sensitive GPU recovery.
+	 *
+	 * The corrected logic acquires the lock exactly ONCE before iterating.
+	 * It then safely replicates the core logic of amdgpu_irq_update()
+	 * within this single, protected context. This is significantly more
+	 * efficient and maintains the required serialization for hardware access.
+	 */
+	spin_lock_irqsave(&adev->irq.lock, irqflags);
 
 	for (i = 0; i < AMDGPU_IRQ_CLIENTID_MAX; ++i) {
-		if (!adev->irq.client[i].sources)
+		if (!adev->irq.client[i].sources) {
 			continue;
+		}
 
 		for (j = 0; j < AMDGPU_MAX_IRQ_SRC_ID; ++j) {
-			struct amdgpu_irq_src *src = adev->irq.client[i].sources[j];
+			src = adev->irq.client[i].sources[j];
 
-			if (!src || !src->funcs || !src->funcs->set)
+			/* Null checks for robustness */
+			if (!src || !src->funcs || !src->funcs->set) {
 				continue;
-			for (k = 0; k < src->num_types; k++)
-				amdgpu_irq_update(adev, src, k);
+			}
+
+			for (k = 0; k < src->num_types; k++) {
+				/*
+				 * Determine the desired state for this specific
+				 * interrupt type based on its reference count.
+				 */
+				if (amdgpu_irq_enabled(adev, src, k)) {
+					state = AMDGPU_IRQ_STATE_ENABLE;
+				} else {
+					state = AMDGPU_IRQ_STATE_DISABLE;
+				}
+
+				/*
+				 * Directly call the hardware-specific function
+				 * to apply the determined state.
+				 */
+				r = src->funcs->set(adev, src, k, state);
+				if (r) {
+					DRM_ERROR("error updating interrupt state for client %d, source %d, type %d (err %d)\n",
+						  i, j, k, r);
+				}
+			}
 		}
 	}
+
+	spin_unlock_irqrestore(&adev->irq.lock, irqflags);
 }
 
 /**
