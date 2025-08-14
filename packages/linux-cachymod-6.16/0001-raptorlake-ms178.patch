@@ -523,192 +523,228 @@
 
 --- a/kernel/time/hrtimer.c	2025-05-09 09:56:10.000000000 +0200
 +++ b/kernel/time/hrtimer.c	2025-05-18 01:36:19.652237940 +0200
-@@ -647,15 +647,20 @@ static inline ktime_t hrtimer_update_bas
+@@ -635,14 +635,23 @@ static inline ktime_t hrtimer_update_bas
  {
  	ktime_t *offs_real = &base->clock_base[HRTIMER_BASE_REALTIME].offset;
  	ktime_t *offs_boot = &base->clock_base[HRTIMER_BASE_BOOTTIME].offset;
 -	ktime_t *offs_tai = &base->clock_base[HRTIMER_BASE_TAI].offset;
--
 +	ktime_t *offs_tai  = &base->clock_base[HRTIMER_BASE_TAI].offset;
- 	ktime_t now = ktime_get_update_offsets_now(&base->clock_was_set_seq,
++	ktime_t now;
+ 
+-	ktime_t now = ktime_get_update_offsets_now(&base->clock_was_set_seq,
 -					    offs_real, offs_boot, offs_tai);
--
++	now = ktime_get_update_offsets_now(&base->clock_was_set_seq,
++					   offs_real, offs_boot, offs_tai);
+ 
 -	base->clock_base[HRTIMER_BASE_REALTIME_SOFT].offset = *offs_real;
 -	base->clock_base[HRTIMER_BASE_BOOTTIME_SOFT].offset = *offs_boot;
 -	base->clock_base[HRTIMER_BASE_TAI_SOFT].offset = *offs_tai;
-+											   offs_real, offs_boot,
-+											offs_tai);
++	/*
++	 * Single-branch update: If any hard offset changed, update all corresponding
++	 * soft offsets. Reduces branches and avoids redundant cacheline dirties.
++	 */
++	if (unlikely(base->clock_base[HRTIMER_BASE_REALTIME_SOFT].offset != *offs_real ||
++		     base->clock_base[HRTIMER_BASE_BOOTTIME_SOFT].offset != *offs_boot  ||
++		     base->clock_base[HRTIMER_BASE_TAI_SOFT].offset     != *offs_tai)) {
++		base->clock_base[HRTIMER_BASE_REALTIME_SOFT].offset = *offs_real;
++		base->clock_base[HRTIMER_BASE_BOOTTIME_SOFT].offset = *offs_boot;
++		base->clock_base[HRTIMER_BASE_TAI_SOFT].offset      = *offs_tai;
++	}
  
-+	#define COPY_SOFT(idx, src) do {					\
-+	if (unlikely(base->clock_base[idx].offset != *(src)))	\
-+		base->clock_base[idx].offset = *(src);		\
-+	} while (0)
-+
-+	COPY_SOFT(HRTIMER_BASE_REALTIME_SOFT, offs_real);
-+	COPY_SOFT(HRTIMER_BASE_BOOTTIME_SOFT,offs_boot);
-+	COPY_SOFT(HRTIMER_BASE_TAI_SOFT,     offs_tai);
-+	#undef COPY_SOFT
  	return now;
  }
+@@ -1223,32 +1232,19 @@ static int __hrtimer_start_range_ns(stru
+ 	bool force_local, first;
  
-@@ -1891,98 +1896,89 @@ static __latent_entropy void hrtimer_run
- #ifdef CONFIG_HIGH_RES_TIMERS
+ 	/*
+-	 * If the timer is on the local cpu base and is the first expiring
+-	 * timer then this might end up reprogramming the hardware twice
+-	 * (on removal and on enqueue). To avoid that by prevent the
+-	 * reprogram on removal, keep the timer local to the current CPU
+-	 * and enforce reprogramming after it is queued no matter whether
+-	 * it is the new first expiring timer again or not.
++	 * If the timer is on the local CPU and is the first expiring timer,
++	 * avoid reprogramming twice: keep it local and enforce reprogramming
++	 * after enqueue.
+ 	 */
+-	force_local = base->cpu_base == this_cpu_base;
+-	force_local &= base->cpu_base->next_timer == timer;
++	force_local = (base->cpu_base == this_cpu_base) &&
++		      (base->cpu_base->next_timer == timer);
  
- /*
-- * High resolution timer interrupt
-- * Called with interrupts disabled
-+ * High-resolution timer interrupt
-+ * (called with interrupts disabled)
-  */
- void hrtimer_interrupt(struct clock_event_device *dev)
- {
- 	struct hrtimer_cpu_base *cpu_base = this_cpu_ptr(&hrtimer_bases);
--	ktime_t expires_next, now, entry_time, delta;
- 	unsigned long flags;
--	int retries = 0;
-+	ktime_t entry_time, now, delta, expires_next;
-+	bool bail_for_resched = false;
-+	int retry;
- 
- 	BUG_ON(!cpu_base->hres_active);
-+
- 	cpu_base->nr_events++;
- 	dev->next_event = KTIME_MAX;
- 
- 	raw_spin_lock_irqsave(&cpu_base->lock, flags);
- 	entry_time = now = hrtimer_update_base(cpu_base);
--retry:
--	cpu_base->in_hrtirq = 1;
 -	/*
--	 * We set expires_next to KTIME_MAX here with cpu_base->lock
--	 * held to prevent that a timer is enqueued in our queue via
--	 * the migration code. This does not affect enqueueing of
--	 * timers which run their callback and need to be requeued on
--	 * this CPU.
+-	 * Don't force local queuing if this enqueue happens on a unplugged
+-	 * CPU after hrtimer_cpu_dying() has been invoked.
 -	 */
--	cpu_base->expires_next = KTIME_MAX;
--
--	if (!ktime_before(now, cpu_base->softirq_expires_next)) {
--		cpu_base->softirq_expires_next = KTIME_MAX;
--		cpu_base->softirq_activated = 1;
--		raise_timer_softirq(HRTIMER_SOFTIRQ);
++	/* Don't force local if this CPU is being unplugged. */
+ 	force_local &= this_cpu_base->online;
+ 
+ 	/*
+-	 * Remove an active timer from the queue. In case it is not queued
+-	 * on the current CPU, make sure that remove_hrtimer() updates the
+-	 * remote data correctly.
+-	 *
+-	 * If it's on the current CPU and the first expiring timer, then
+-	 * skip reprogramming, keep the timer local and enforce
+-	 * reprogramming later if it was the first expiring timer.  This
+-	 * avoids programming the underlying clock event twice (once at
+-	 * removal and once after enqueue).
++	 * Remove active timer from the queue; if it's the current CPU's first,
++	 * skip reprogramming on removal.
+ 	 */
+ 	remove_hrtimer(timer, base, true, force_local);
+ 
+@@ -1259,29 +1255,22 @@ static int __hrtimer_start_range_ns(stru
+ 
+ 	hrtimer_set_expires_range_ns(timer, tim, delta_ns);
+ 
+-	/* Switch the timer base, if necessary: */
+-	if (!force_local) {
+-		new_base = switch_hrtimer_base(timer, base,
+-					       mode & HRTIMER_MODE_PINNED);
+-	} else {
++	/* Switch base via the upstream migration protocol when not forced local. */
++	if (!force_local)
++		new_base = switch_hrtimer_base(timer, base, mode & HRTIMER_MODE_PINNED);
++	else
+ 		new_base = base;
 -	}
  
--	__hrtimer_run_queues(cpu_base, now, flags, HRTIMER_ACTIVE_HARD);
-+	for (retry = 0; ; retry++) {
-+		cpu_base->in_hrtirq    = 1;
-+		cpu_base->expires_next = KTIME_MAX;
+ 	first = enqueue_hrtimer(timer, new_base, mode);
 +
-+		/* kick softirq side if necessary */
-+		if (!ktime_before(now, cpu_base->softirq_expires_next)) {
-+			cpu_base->softirq_expires_next = KTIME_MAX;
-+			cpu_base->softirq_activated    = 1;
-+			raise_timer_softirq(HRTIMER_SOFTIRQ);
-+		}
+ 	if (!force_local) {
+ 		/*
+-		 * If the current CPU base is online, then the timer is
+-		 * never queued on a remote CPU if it would be the first
+-		 * expiring timer there.
++		 * If the current base is online, we never queue a remote-first timer.
++		 * If current base is offline and we queued a remote-first one, kick it.
+ 		 */
+ 		if (hrtimer_base_is_online(this_cpu_base))
+ 			return first;
  
--	/* Reevaluate the clock bases for the [soft] next expiry */
--	expires_next = hrtimer_update_next_event(cpu_base);
--	/*
--	 * Store the new expiry value so the migration code can verify
--	 * against it.
--	 */
--	cpu_base->expires_next = expires_next;
--	cpu_base->in_hrtirq = 0;
--	raw_spin_unlock_irqrestore(&cpu_base->lock, flags);
-+		__hrtimer_run_queues(cpu_base, now, flags, HRTIMER_ACTIVE_HARD);
+-		/*
+-		 * Timer was enqueued remote because the current base is
+-		 * already offline. If the timer is the first to expire,
+-		 * kick the remote CPU to reprogram the clock event.
+-		 */
+ 		if (first) {
+ 			struct hrtimer_cpu_base *new_cpu_base = new_base->cpu_base;
  
--	/* Reprogramming necessary ? */
--	if (!tick_program_event(expires_next, 0)) {
--		cpu_base->hang_detected = 0;
--		return;
-+		expires_next           = hrtimer_update_next_event(cpu_base);
-+		cpu_base->expires_next = expires_next;
-+		cpu_base->in_hrtirq    = 0;
-+
-+		raw_spin_unlock_irqrestore(&cpu_base->lock, flags);
-+
-+		/* try to program next expiry; succeed → done */
-+		if (likely(!tick_program_event(expires_next, 0))) {
-+			cpu_base->hang_detected = 0;
-+			return;
-+		}
-+
-+		cpu_base->nr_retries++;
-+
-+		/* after three retries bail out */
-+		if (retry == 2)
-+			break;
-+
-+		if (need_resched()) {
-+			bail_for_resched = true;
-+			break;
-+		}
-+
-+		/* retry with fresh base */
-+		raw_spin_lock_irqsave(&cpu_base->lock, flags);
-+		now = hrtimer_update_base(cpu_base);
+@@ -1290,11 +1279,7 @@ static int __hrtimer_start_range_ns(stru
+ 		return 0;
  	}
  
 -	/*
--	 * The next timer was already expired due to:
--	 * - tracing
--	 * - long lasting callbacks
--	 * - being scheduled away when running in a VM
--	 *
--	 * We need to prevent that we loop forever in the hrtimer
--	 * interrupt routine. We give it 3 attempts to avoid
--	 * overreacting on some spurious event.
--	 *
--	 * Acquire base lock for updating the offsets and retrieving
--	 * the current time.
+-	 * Timer was forced to stay on the current CPU to avoid
+-	 * reprogramming on removal and enqueue. Force reprogram the
+-	 * hardware by evaluating the new first expiring timer.
 -	 */
--	raw_spin_lock_irqsave(&cpu_base->lock, flags);
--	now = hrtimer_update_base(cpu_base);
--	cpu_base->nr_retries++;
--	if (++retries < 3)
--		goto retry;
--	/*
--	 * Give the system a chance to do something else than looping
--	 * here. We stored the entry time, so we know exactly how long
--	 * we spent here. We schedule the next event this amount of
--	 * time away.
--	 */
--	cpu_base->nr_hangs++;
--	cpu_base->hang_detected = 1;
--	raw_spin_unlock_irqrestore(&cpu_base->lock, flags);
-+	/* ---------- hang-recovery path ---------- */
- 
-+	/* single, monotonic timestamp for both delta and re-arm maths */
-+	now   = ktime_get();
- 	delta = ktime_sub(now, entry_time);
--	if ((unsigned int)delta > cpu_base->max_hang_time)
--		cpu_base->max_hang_time = (unsigned int) delta;
--	/*
--	 * Limit it to a sensible value as we enforce a longer
--	 * delay. Give the CPU at least 100ms to catch up.
--	 */
--	if (delta > 100 * NSEC_PER_MSEC)
-+	if (ktime_to_ns(delta) < 0)
-+		delta = 0;
-+
-+	if (ktime_to_ns(delta) > 100 * NSEC_PER_MSEC)
- 		expires_next = ktime_add_ns(now, 100 * NSEC_PER_MSEC);
- 	else
- 		expires_next = ktime_add(now, delta);
-+
-+	if (!bail_for_resched) {
-+		cpu_base->nr_hangs++;
-+		cpu_base->hang_detected = 1;
-+	}
-+
- 	tick_program_event(expires_next, 1);
--	pr_warn_once("hrtimer: interrupt took %llu ns\n", ktime_to_ns(delta));
-+
-+	if (!bail_for_resched)
-+		pr_warn_once("hrtimer: interrupt took %llu ns\n",
-+					 ktime_to_ns(delta));
++	/* Forced local: re-evaluate and reprogram locally once. */
+ 	hrtimer_force_reprogram(new_base->cpu_base, 1);
+ 	return 0;
  }
- #endif /* !CONFIG_HIGH_RES_TIMERS */
+@@ -1730,30 +1715,17 @@ static void __run_hrtimer(struct hrtimer
+ 	base->running = timer;
+ 
+ 	/*
+-	 * Separate the ->running assignment from the ->state assignment.
+-	 *
+-	 * As with a regular write barrier, this ensures the read side in
+-	 * hrtimer_active() cannot observe base->running == NULL &&
+-	 * timer->state == INACTIVE.
++	 * Separate ->running from ->state to prevent hrtimer_active() false negatives.
+ 	 */
+ 	raw_write_seqcount_barrier(&base->seq);
+ 
+ 	__remove_hrtimer(timer, base, HRTIMER_STATE_INACTIVE, 0);
+ 	fn = ACCESS_PRIVATE(timer, function);
+ 
+-	/*
+-	 * Clear the 'is relative' flag for the TIME_LOW_RES case. If the
+-	 * timer is restarted with a period then it becomes an absolute
+-	 * timer. If its not restarted it does not matter.
+-	 */
+ 	if (IS_ENABLED(CONFIG_TIME_LOW_RES))
+ 		timer->is_rel = false;
+ 
+-	/*
+-	 * The timer is marked as running in the CPU base, so it is
+-	 * protected against migration to a different CPU even if the lock
+-	 * is dropped.
+-	 */
++	/* Drop the lock while executing the callback. */
+ 	raw_spin_unlock_irqrestore(&cpu_base->lock, flags);
+ 	trace_hrtimer_expire_entry(timer, now);
+ 	expires_in_hardirq = lockdep_hrtimer_enter(timer);
+@@ -1765,33 +1737,23 @@ static void __run_hrtimer(struct hrtimer
+ 	raw_spin_lock_irq(&cpu_base->lock);
+ 
+ 	/*
+-	 * Note: We clear the running state after enqueue_hrtimer and
+-	 * we do not reprogram the event hardware. Happens either in
+-	 * hrtimer_start_range_ns() or in hrtimer_interrupt()
+-	 *
+-	 * Note: Because we dropped the cpu_base->lock above,
+-	 * hrtimer_start_range_ns() can have popped in and enqueued the timer
+-	 * for us already.
++	 * If requested to restart and not already requeued by someone else,
++	 * requeue as absolute time.
+ 	 */
+ 	if (restart != HRTIMER_NORESTART &&
+ 	    !(timer->state & HRTIMER_STATE_ENQUEUED))
+ 		enqueue_hrtimer(timer, base, HRTIMER_MODE_ABS);
+ 
+-	/*
+-	 * Separate the ->running assignment from the ->state assignment.
+-	 *
+-	 * As with a regular write barrier, this ensures the read side in
+-	 * hrtimer_active() cannot observe base->running.timer == NULL &&
+-	 * timer->state == INACTIVE.
+-	 */
++	/* Again separate running/state for hrtimer_active() correctness. */
+ 	raw_write_seqcount_barrier(&base->seq);
+ 
+ 	WARN_ON_ONCE(base->running != timer);
+ 	base->running = NULL;
+ }
+ 
+-static void __hrtimer_run_queues(struct hrtimer_cpu_base *cpu_base, ktime_t now,
+-				 unsigned long flags, unsigned int active_mask)
++static __attribute__((hot)) void
++__hrtimer_run_queues(struct hrtimer_cpu_base *cpu_base, ktime_t now,
++		     unsigned long flags, unsigned int active_mask)
+ {
+ 	struct hrtimer_clock_base *base;
+ 	unsigned int active = cpu_base->active_bases & active_mask;
+@@ -1807,17 +1769,17 @@ static void __hrtimer_run_queues(struct
+ 
+ 			timer = container_of(node, struct hrtimer, node);
+ 
++			/* Prefetch likely successor to hide rb-tree pointer latency */
++			{
++				struct timerqueue_node *next_node = timerqueue_iterate_next(node);
++				if (likely(next_node)) {
++					__builtin_prefetch(container_of(next_node, struct hrtimer, node), 0, 1);
++				}
++			}
++
+ 			/*
+-			 * The immediate goal for using the softexpires is
+-			 * minimizing wakeups, not running timers at the
+-			 * earliest interrupt after their soft expiration.
+-			 * This allows us to avoid using a Priority Search
+-			 * Tree, which can answer a stabbing query for
+-			 * overlapping intervals and instead use the simple
+-			 * BST we already have.
+-			 * We don't add extra wakeups by delaying timers that
+-			 * are right-of a not yet expired timer, because that
+-			 * timer will have to trigger a wakeup anyway.
++			 * Respect soft-expiry policy: minimize wakeups by not running timers
++			 * before their soft expiry.
+ 			 */
+ 			if (basenow < hrtimer_get_softexpires_tv64(timer))
+ 				break;
 
 --- a/sound/pci/hda/hda_intel.c	2025-05-09 09:56:10.000000000 +0200
 +++ b/sound/pci/hda/hda_intel.c	2025-05-18 01:05:45.134796217 +0200
@@ -3652,12 +3688,515 @@
  err_register:
 
 --- a/kernel/irq/msi.c	2025-04-26 18:47:23.471839427 +0200
-+++ b/kernel/irq/msi.c	2025-05-22 18:49:17.109525975 +0200
-
-
++++ b/kernel/irq/msi.c	2025-08-13 18:49:17.109525975 +0200
+@@ -9,6 +9,7 @@
+  * PCI compatible and non PCI compatible devices.
+  */
+ #include <linux/device.h>
++#include <linux/interrupt.h>
+ #include <linux/irq.h>
+ #include <linux/irqdomain.h>
+ #include <linux/msi.h>
+@@ -164,7 +165,7 @@ int msi_domain_insert_msi_desc(struct de
+ 	return msi_insert_desc(dev, desc, domid, init_desc->msi_index);
+ }
+ 
+-static bool msi_desc_match(struct msi_desc *desc, enum msi_desc_filter filter)
++static __always_inline bool msi_desc_match(struct msi_desc *desc, enum msi_desc_filter filter)
+ {
+ 	switch (filter) {
+ 	case MSI_DESC_ALL:
+@@ -373,12 +374,31 @@ static struct msi_desc *msi_find_desc(st
+ 				      enum msi_desc_filter filter)
+ {
+ 	struct xarray *xa = &md->__domains[domid].store;
++	unsigned long idx = md->__iter_idx;
+ 	struct msi_desc *desc;
+ 
+-	xa_for_each_start(xa, md->__iter_idx, desc, md->__iter_idx) {
+-		if (msi_desc_match(desc, filter))
++	/* End of iteration is marked by this specific index value. */
++	if (unlikely(idx == MSI_XA_MAX_INDEX)) {
++		return NULL;
++	}
++
++	/*
++	 * Use xa_find in a loop. It starts searching at 'idx' (inclusive).
++	 * On each subsequent iteration, it updates 'idx' to the next candidate
++	 * index, efficiently skipping holes.
++	 */
++	for (desc = xa_find(xa, &idx, MSI_XA_MAX_INDEX, XA_PRESENT);
++	     desc;
++	     desc = xa_find_after(xa, &idx, MSI_XA_MAX_INDEX, XA_PRESENT)) {
++
++		if (msi_desc_match(desc, filter)) {
++			/* Found a match. Store the current index for the next call. */
++			md->__iter_idx = idx;
+ 			return desc;
++		}
+ 	}
++
++	/* No more entries found; invalidate the iterator for future calls. */
+ 	md->__iter_idx = MSI_XA_MAX_INDEX;
+ 	return NULL;
+ }
+@@ -450,36 +470,44 @@ EXPORT_SYMBOL_GPL(msi_next_desc);
+  *
+  * Return: The Linux interrupt number on success (> 0), 0 if not found
+  */
+-unsigned int msi_domain_get_virq(struct device *dev, unsigned int domid, unsigned int index)
++unsigned int __attribute__((hot))
++msi_domain_get_virq(struct device *dev, unsigned int domid, unsigned int index)
+ {
+ 	struct msi_desc *desc;
+-	bool pcimsi = false;
+ 	struct xarray *xa;
++	bool pcimsi = false;
+ 
++	/* Fast reject */
+ 	if (!dev->msi.data)
+ 		return 0;
+ 
++	/* Bounds and domain sanity */
+ 	if (WARN_ON_ONCE(index > MSI_MAX_INDEX || domid >= MSI_MAX_DEVICE_IRQDOMAINS))
+ 		return 0;
+ 
+-	/* This check is only valid for the PCI default MSI domain */
++	/*
++	 * Only the PCI default MSI domain uses the single-descriptor,
++	 * multi-vector (base + index) mapping.
++	 */
+ 	if (dev_is_pci(dev) && domid == MSI_DEFAULT_DOMAIN)
+ 		pcimsi = to_pci_dev(dev)->msi_enabled;
+ 
+ 	guard(msi_descs_lock)(dev);
++
+ 	xa = &dev->msi.data->__domains[domid].store;
++
++	/* MSI-X and non-PCI-MSI: 1:1 mapping at the requested index */
+ 	desc = xa_load(xa, pcimsi ? 0 : index);
+ 	if (desc && desc->irq) {
+-		/*
+-		 * PCI-MSI has only one descriptor for multiple interrupts.
+-		 * PCI-MSIX and platform MSI use a descriptor per
+-		 * interrupt.
+-		 */
+ 		if (!pcimsi)
+ 			return desc->irq;
++
++		/* PCI-MSI: single descriptor, multiple vectors */
+ 		if (index < desc->nvec_used)
+ 			return desc->irq + index;
+ 	}
++
++	/* Not found or not associated */
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(msi_domain_get_virq);
+@@ -661,8 +689,9 @@ static void msi_check_level(struct irq_d
+  *
+  * Return: IRQ_SET_MASK_* result code
+  */
+-int msi_domain_set_affinity(struct irq_data *irq_data,
+-			    const struct cpumask *mask, bool force)
++int __attribute__((hot))
++msi_domain_set_affinity(struct irq_data *irq_data,
++			const struct cpumask *mask, bool force)
+ {
+ 	struct irq_data *parent = irq_data->parent_data;
+ 	struct msi_msg msg[2] = { [1] = { }, };
+@@ -678,8 +707,9 @@ int msi_domain_set_affinity(struct irq_d
+ 	return ret;
+ }
+ 
+-static int msi_domain_activate(struct irq_domain *domain,
+-			       struct irq_data *irq_data, bool early)
++static int __attribute__((hot))
++msi_domain_activate(struct irq_domain *domain,
++		    struct irq_data *irq_data, bool early)
+ {
+ 	struct msi_msg msg[2] = { [1] = { }, };
+ 
+@@ -689,12 +719,11 @@ static int msi_domain_activate(struct ir
+ 	return 0;
+ }
+ 
+-static void msi_domain_deactivate(struct irq_domain *domain,
+-				  struct irq_data *irq_data)
++static void __attribute__((hot))
++msi_domain_deactivate(struct irq_domain *domain, struct irq_data *irq_data)
+ {
+-	struct msi_msg msg[2];
++	struct msi_msg msg[2] = { { 0 }, { 0 } };
+ 
+-	memset(msg, 0, sizeof(msg));
+ 	irq_chip_write_msi_msg(irq_data, msg);
+ }
+ 
+@@ -792,7 +821,7 @@ static irq_hw_number_t msi_domain_ops_ge
+ static int msi_domain_ops_prepare(struct irq_domain *domain, struct device *dev,
+ 				  int nvec, msi_alloc_info_t *arg)
+ {
+-	memset(arg, 0, sizeof(*arg));
++	*arg = (msi_alloc_info_t){ 0 };
+ 	return 0;
+ }
+ 
+@@ -1288,73 +1317,137 @@ static int populate_alloc_info(struct ir
+ 	return 0;
+ }
+ 
+-static int __msi_domain_alloc_irqs(struct device *dev, struct irq_domain *domain,
+-				   struct msi_ctrl *ctrl)
++static int __attribute__((hot))
++__msi_domain_alloc_irqs(struct device *dev,
++			struct irq_domain *domain,
++			struct msi_ctrl *ctrl)
+ {
+ 	struct xarray *xa = &dev->msi.data->__domains[ctrl->domid].store;
+ 	struct msi_domain_info *info = domain->host_data;
+ 	struct msi_domain_ops *ops = info->ops;
+-	unsigned int vflags = 0, allocated = 0;
+-	msi_alloc_info_t arg = { };
++	unsigned int vflags = 0;
++	unsigned int allocated_vectors = 0;
++	unsigned int allocated_descs = 0;
++	msi_alloc_info_t arg = (msi_alloc_info_t){ 0 };
+ 	struct msi_desc *desc;
+ 	unsigned long idx;
+-	int i, ret, virq;
++	int ret;
+ 
+ 	ret = populate_alloc_info(domain, dev, ctrl->nirqs, &arg);
+ 	if (ret)
+ 		return ret;
+ 
+-	/*
+-	 * This flag is set by the PCI layer as we need to activate
+-	 * the MSI entries before the PCI layer enables MSI in the
+-	 * card. Otherwise the card latches a random msi message.
+-	 */
++	if (!ctrl->nirqs)
++		return 0;
++
+ 	if (info->flags & MSI_FLAG_ACTIVATE_EARLY)
+ 		vflags |= VIRQ_ACTIVATE;
+ 
+-	/*
+-	 * Interrupt can use a reserved vector and will not occupy
+-	 * a real device vector until the interrupt is requested.
+-	 */
+ 	if (msi_check_reservation_mode(domain, info, dev))
+ 		vflags |= VIRQ_CAN_RESERVE;
+ 
+ 	xa_for_each_range(xa, idx, desc, ctrl->first, ctrl->last) {
+-		if (!msi_desc_match(desc, MSI_DESC_NOTASSOCIATED))
++		irq_hw_number_t old_hwirq;
++		int i, virq, nvec;
++
++		if (unlikely(!msi_desc_match(desc, MSI_DESC_NOTASSOCIATED)))
+ 			continue;
+ 
+-		/* This should return -ECONFUSED... */
+-		if (WARN_ON_ONCE(allocated >= ctrl->nirqs))
++		/* Guard against exceeding requested vector count */
++		if (WARN_ON_ONCE(allocated_vectors >= ctrl->nirqs))
+ 			return -EINVAL;
+ 
++		/* Allow provider hook to prepare alloc info (including custom hwirq) */
+ 		if (ops->prepare_desc)
+ 			ops->prepare_desc(domain, &arg, desc);
+ 
++		/*
++		 * Default hwirq assignment:
++		 * If provider uses the default get_hwirq() (reads arg->hwirq) and
++		 * prepare_desc() did not assign a specific value, set arg.hwirq to
++		 * the descriptor index to ensure unique mappings.
++		 */
++		old_hwirq = arg.hwirq;
++		if (ops->get_hwirq == msi_domain_ops_default.get_hwirq &&
++		    arg.hwirq == old_hwirq)
++			arg.hwirq = (irq_hw_number_t)idx;
++
+ 		ops->set_desc(&arg, desc);
+ 
+-		virq = __irq_domain_alloc_irqs(domain, -1, desc->nvec_used,
++		nvec = desc->nvec_used;
++
++		/* Allocation-phase: __irq_domain_alloc_irqs() can fail (before any init) */
++		virq = __irq_domain_alloc_irqs(domain, -1, nvec,
+ 					       dev_to_node(dev), &arg, false,
+ 					       desc->affinity);
+ 		if (virq < 0)
+-			return msi_handle_pci_fail(domain, desc, allocated);
++			return msi_handle_pci_fail(domain, desc, allocated_descs);
+ 
+-		for (i = 0; i < desc->nvec_used; i++) {
++		/* Initialize each allocated IRQ and associate it with desc */
++		for (i = 0; i < nvec; i++) {
+ 			irq_set_msi_desc_off(virq, i, desc);
+ 			irq_debugfs_copy_devname(virq + i, dev);
+ 			ret = msi_init_virq(domain, virq + i, vflags);
+-			if (ret)
++			if (ret) {
++				/* Roll back initialization and allocation for this descriptor */
++				while (--i >= 0) {
++					struct irq_data *irqd =
++						irq_domain_get_irq_data(domain, virq + i);
++					if (irqd && irqd_is_activated(irqd))
++						irq_domain_deactivate_irq(irqd);
++				}
++				irq_domain_free_irqs(virq, nvec);
++				desc->irq = 0;
+ 				return ret;
++			}
+ 		}
++
++		/* Optional sysfs per-descriptor exposure */
+ 		if (info->flags & MSI_FLAG_DEV_SYSFS) {
+ 			ret = msi_sysfs_populate_desc(dev, desc);
+-			if (ret)
++			if (ret) {
++				/* Roll back sysfs and IRQs */
++				msi_sysfs_remove_desc(dev, desc);
++				for (i = 0; i < nvec; i++) {
++					struct irq_data *irqd =
++						irq_domain_get_irq_data(domain, virq + i);
++					if (irqd && irqd_is_activated(irqd))
++						irq_domain_deactivate_irq(irqd);
++				}
++				irq_domain_free_irqs(virq, nvec);
++				desc->irq = 0;
+ 				return ret;
++			}
++		}
++
++#ifdef CONFIG_SMP
++		/*
++		 * PERFORMANCE: Install per-vector affinity hints, if provided.
++		 * Non-binding; helps policy/irqbalance keep MSI-X vectors spread as
++		 * intended to reduce contention with game threads.
++		 */
++		if (desc->affinity) {
++			for (i = 0; i < nvec; i++) {
++				const struct cpumask *mask = &desc->affinity[i].mask;
++
++				if (mask)
++					irq_set_affinity_hint(virq + i, mask);
++			}
+ 		}
+-		allocated++;
++#endif
++
++		allocated_vectors += (unsigned int)nvec;
++		allocated_descs++;
++
++		/* Stop once the request is satisfied */
++		if (allocated_vectors >= ctrl->nirqs)
++			break;
+ 	}
++
+ 	return 0;
+ }
+ 
++
+ static int msi_domain_alloc_simple_msi_descs(struct device *dev,
+ 					     struct msi_domain_info *info,
+ 					     struct msi_ctrl *ctrl)
+@@ -1608,16 +1701,21 @@ static void __msi_domain_free_irqs(struc
+ 		if (!msi_desc_match(desc, MSI_DESC_ASSOCIATED))
+ 			continue;
+ 
+-		/* Make sure all interrupts are deactivated */
++		/* Deactivate and free all vectors; clear affinity hints first */
+ 		for (i = 0; i < desc->nvec_used; i++) {
++#ifdef CONFIG_SMP
++			irq_set_affinity_hint(desc->irq + i, NULL);
++#endif
+ 			irqd = irq_domain_get_irq_data(domain, desc->irq + i);
+ 			if (irqd && irqd_is_activated(irqd))
+ 				irq_domain_deactivate_irq(irqd);
+ 		}
+ 
+ 		irq_domain_free_irqs(desc->irq, desc->nvec_used);
++
+ 		if (info->flags & MSI_FLAG_DEV_SYSFS)
+ 			msi_sysfs_remove_desc(dev, desc);
++
+ 		desc->irq = 0;
+ 	}
+ }
+ 
 --- a/drivers/pci/msi/msi.c	2025-04-26 16:35:23.647821877 +0200
-+++ b/drivers/pci/msi/msi.c	2025-05-22 16:48:01.839153108 +0200
-
++++ b/drivers/pci/msi/msi.c	2025-08-13 16:48:01.839153108 +0200
+@@ -7,6 +7,8 @@
+  * Copyright (C) 2016 Christoph Hellwig.
+  */
+ #include <linux/bitfield.h>
++#include <linux/bitmap.h>
++#include <linux/prefetch.h>
+ #include <linux/err.h>
+ #include <linux/export.h>
+ #include <linux/irq.h>
+@@ -115,15 +117,18 @@ void pci_msi_update_mask(struct msi_desc
+ {
+ 	raw_spinlock_t *lock = &to_pci_dev(desc->dev)->msi_lock;
+ 	unsigned long flags;
++	u32 new_mask;
+ 
+ 	if (!desc->pci.msi_attrib.can_mask)
+ 		return;
+ 
+ 	raw_spin_lock_irqsave(lock, flags);
+-	desc->pci.msi_mask &= ~clear;
+-	desc->pci.msi_mask |= set;
+-	pci_write_config_dword(msi_desc_to_pci_dev(desc), desc->pci.mask_pos,
+-			       desc->pci.msi_mask);
++	new_mask = (desc->pci.msi_mask & ~clear) | set;
++	if (new_mask != desc->pci.msi_mask) {
++		desc->pci.msi_mask = new_mask;
++		pci_write_config_dword(msi_desc_to_pci_dev(desc), desc->pci.mask_pos,
++				       new_mask);
++	}
+ 	raw_spin_unlock_irqrestore(lock, flags);
+ }
+ 
+@@ -135,6 +140,7 @@ void pci_msi_mask_irq(struct irq_data *d
+ {
+ 	struct msi_desc *desc = irq_data_get_msi_desc(data);
+ 
++	prefetchw(desc);
+ 	__pci_msi_mask_desc(desc, BIT(data->irq - desc->irq));
+ }
+ EXPORT_SYMBOL_GPL(pci_msi_mask_irq);
+@@ -147,6 +153,7 @@ void pci_msi_unmask_irq(struct irq_data
+ {
+ 	struct msi_desc *desc = irq_data_get_msi_desc(data);
+ 
++	prefetchw(desc);
+ 	__pci_msi_unmask_desc(desc, BIT(data->irq - desc->irq));
+ }
+ EXPORT_SYMBOL_GPL(pci_msi_unmask_irq);
+@@ -156,6 +163,7 @@ void __pci_read_msi_msg(struct msi_desc
+ 	struct pci_dev *dev = msi_desc_to_pci_dev(entry);
+ 
+ 	BUG_ON(dev->current_state != PCI_D0);
++	prefetchw(msg);
+ 
+ 	if (entry->pci.msi_attrib.is_msix) {
+ 		void __iomem *base = pci_msix_desc_addr(entry);
+@@ -188,12 +196,13 @@ static inline void pci_write_msg_msi(str
+ 				     struct msi_msg *msg)
+ {
+ 	int pos = dev->msi_cap;
+-	u16 msgctl;
++	u16 msgctl, desired;
+ 
+ 	pci_read_config_word(dev, pos + PCI_MSI_FLAGS, &msgctl);
+-	msgctl &= ~PCI_MSI_FLAGS_QSIZE;
+-	msgctl |= FIELD_PREP(PCI_MSI_FLAGS_QSIZE, desc->pci.msi_attrib.multiple);
+-	pci_write_config_word(dev, pos + PCI_MSI_FLAGS, msgctl);
++	desired = (msgctl & ~PCI_MSI_FLAGS_QSIZE) |
++		  FIELD_PREP(PCI_MSI_FLAGS_QSIZE, desc->pci.msi_attrib.multiple);
++	if (desired != msgctl)
++		pci_write_config_word(dev, pos + PCI_MSI_FLAGS, desired);
+ 
+ 	pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_LO, msg->address_lo);
+ 	if (desc->pci.msi_attrib.is_64) {
+@@ -273,13 +282,13 @@ static void pci_intx_for_msi(struct pci_
+ 
+ static void pci_msi_set_enable(struct pci_dev *dev, int enable)
+ {
+-	u16 control;
++	u16 control, new_control;
+ 
+ 	pci_read_config_word(dev, dev->msi_cap + PCI_MSI_FLAGS, &control);
+-	control &= ~PCI_MSI_FLAGS_ENABLE;
+-	if (enable)
+-		control |= PCI_MSI_FLAGS_ENABLE;
+-	pci_write_config_word(dev, dev->msi_cap + PCI_MSI_FLAGS, control);
++	new_control = enable ? (control | PCI_MSI_FLAGS_ENABLE)
++			     : (control & ~PCI_MSI_FLAGS_ENABLE);
++	if (new_control != control)
++		pci_write_config_word(dev, dev->msi_cap + PCI_MSI_FLAGS, new_control);
+ }
+ 
+ static int msi_setup_msi_desc(struct pci_dev *dev, int nvec,
+@@ -488,7 +497,7 @@ int pci_msi_vec_count(struct pci_dev *de
+ 		return -EINVAL;
+ 
+ 	pci_read_config_word(dev, dev->msi_cap + PCI_MSI_FLAGS, &msgctl);
+-	ret = 1 << FIELD_GET(PCI_MSI_FLAGS_QMASK, msgctl);
++	ret = 1U << FIELD_GET(PCI_MSI_FLAGS_QMASK, msgctl);
+ 
+ 	return ret;
+ }
+@@ -768,23 +777,57 @@ out_disable:
+ static bool pci_msix_validate_entries(struct pci_dev *dev, struct msix_entry *entries, int nvec)
+ {
+ 	bool nogap;
+-	int i, j;
++	unsigned int i, max_idx = 0;
++	unsigned long stack_bm[4] = { 0 }; /* up to 256 bits on 64-bit */
++	unsigned long *bm;
++	size_t bits;
+ 
+ 	if (!entries)
+ 		return true;
+ 
+ 	nogap = pci_msi_domain_supports(dev, MSI_FLAG_MSIX_CONTIGUOUS, DENY_LEGACY);
+ 
+-	for (i = 0; i < nvec; i++) {
+-		/* Check for duplicate entries */
+-		for (j = i + 1; j < nvec; j++) {
+-			if (entries[i].entry == entries[j].entry)
+-				return false;
+-		}
+-		/* Check for unsupported gaps */
++	/* Check contiguity requirement and locate maximum index */
++	for (i = 0; i < (unsigned int)nvec; i++) {
+ 		if (nogap && entries[i].entry != i)
+ 			return false;
++		if (entries[i].entry > max_idx)
++			max_idx = entries[i].entry;
++	}
++
++	/* Bitmap fast path to detect duplicates */
++	bits = (size_t)max_idx + 1U;
++	if (bits <= ARRAY_SIZE(stack_bm) * BITS_PER_LONG) {
++		bm = stack_bm;
++		bitmap_zero(bm, bits);
++	} else {
++		bm = bitmap_zalloc(bits, GFP_KERNEL);
++		if (!bm) {
++			/* Fallback to O(N²) duplicate scan */
++			for (i = 0; i < (unsigned int)nvec; i++) {
++				unsigned int j;
++				if (nogap && entries[i].entry != i)
++					return false;
++				for (j = i + 1; j < (unsigned int)nvec; j++) {
++					if (entries[i].entry == entries[j].entry)
++						return false;
++				}
++			}
++			return true;
++		}
++	}
++
++	for (i = 0; i < (unsigned int)nvec; i++) {
++		u32 idx = entries[i].entry;
++		if (test_and_set_bit(idx, bm)) {
++			if (bm != stack_bm)
++				bitmap_free(bm);
++			return false;
++		}
+ 	}
++
++	if (bm != stack_bm)
++		bitmap_free(bm);
+ 	return true;
+ }
+ 
 
 --- a/drivers/pci/irq.c	2025-04-26 16:32:43.874535346 +0200
 +++ b/drivers/pci/irq.c	2025-04-26 16:32:30.423017727 +0200
@@ -3798,7 +4337,361 @@
 
 --- a/drivers/cpufreq/intel_pstate.c	2025-04-13 11:40:05.273247310 +0200
 +++ b/drivers/cpufreq/intel_pstate.c	2025-04-20 15:51:11.133723810 +0200
-
+@@ -20,6 +20,7 @@
+ #include <linux/list.h>
+ #include <linux/cpu.h>
+ #include <linux/cpufreq.h>
++#include <linux/math64.h>
+ #include <linux/sysfs.h>
+ #include <linux/types.h>
+ #include <linux/fs.h>
+@@ -60,6 +61,53 @@
+ #define fp_ext_toint(X) ((X) >> EXT_FRAC_BITS)
+ #define int_ext_tofp(X) ((int64_t)(X) << EXT_FRAC_BITS)
+ 
++static inline u64 ip_div_u64_recip_floor(u64 n, u64 d)
++{
++	if (unlikely(d == 0)) {
++		return 0;
++	}
++
++	return div64_u64(n, d);
++}
++
++static inline u64 ip_div_u64_recip_ceil(u64 n, u64 d)
++{
++	u64 rem;
++	u64 q;
++
++	if (unlikely(d == 0)) {
++		return 0;
++	}
++
++	q = div64_u64_rem(n, d, &rem);
++	if (rem) {
++		q++;
++	}
++
++	return q;
++}
++
++static inline u64 ip_div_u64_recip_round_closest(u64 n, u64 d)
++{
++	u64 rem;
++	u64 q;
++
++	if (unlikely(d == 0)) {
++		return 0;
++	}
++
++	q = div64_u64_rem(n, d, &rem);
++
++	/* Round to nearest: if 2*rem >= d then increment q.
++	 * Compare without overflow: (2*rem >= d) <=> (rem >= d - rem).
++	 */
++	if (rem >= d - rem) {
++		q++;
++	}
++
++	return q;
++}
++
+ static inline int32_t mul_fp(int32_t x, int32_t y)
+ {
+ 	return ((int64_t)x * (int64_t)y) >> FRAC_BITS;
+@@ -1302,53 +1350,58 @@ static void intel_pstate_hwp_set(unsigne
+ 	if (cpu_data->policy == CPUFREQ_POLICY_PERFORMANCE)
+ 		min = max;
+ 
+-	rdmsrq_on_cpu(cpu, MSR_HWP_REQUEST, &value);
++	/* Avoid redundant RDMSR: trust cached value unless empty. */
++	value = READ_ONCE(cpu_data->hwp_req_cached);
++	if (unlikely(!value))
++		rdmsrq_on_cpu(cpu, MSR_HWP_REQUEST, &value);
+ 
++	/* Update min/max perf fields. */
+ 	value &= ~HWP_MIN_PERF(~0L);
+ 	value |= HWP_MIN_PERF(min);
+ 
+ 	value &= ~HWP_MAX_PERF(~0L);
+ 	value |= HWP_MAX_PERF(max);
+ 
+-	if (cpu_data->epp_policy == cpu_data->policy)
+-		goto skip_epp;
+-
+-	cpu_data->epp_policy = cpu_data->policy;
+-
+-	if (cpu_data->policy == CPUFREQ_POLICY_PERFORMANCE) {
+-		epp = intel_pstate_get_epp(cpu_data, value);
+-		cpu_data->epp_powersave = epp;
+-		/* If EPP read was failed, then don't try to write */
+-		if (epp < 0)
+-			goto skip_epp;
++	/* EPP handling: re-evaluate only if policy changed. */
++	if (cpu_data->epp_policy != cpu_data->policy) {
++		cpu_data->epp_policy = cpu_data->policy;
++
++		if (cpu_data->policy == CPUFREQ_POLICY_PERFORMANCE) {
++			epp = intel_pstate_get_epp(cpu_data, value);
++			cpu_data->epp_powersave = epp;
++			/* If EPP read failed, do not attempt to write. */
++			if (epp >= 0) {
++				epp = 0; /* performance EPP */
++			} else {
++				goto skip_epp;
++			}
++		} else {
++			/* Skip when saved value is invalid. */
++			if (cpu_data->epp_powersave < 0)
++				goto skip_epp;
+ 
+-		epp = 0;
+-	} else {
+-		/* skip setting EPP, when saved value is invalid */
+-		if (cpu_data->epp_powersave < 0)
+-			goto skip_epp;
++			/*
++			 * If current EPP is not zero (not performance) or user changed it,
++			 * do not override here.
++			 */
++			epp = intel_pstate_get_epp(cpu_data, value);
++			if (epp)
++				goto skip_epp;
+ 
+-		/*
+-		 * No need to restore EPP when it is not zero. This
+-		 * means:
+-		 *  - Policy is not changed
+-		 *  - user has manually changed
+-		 *  - Error reading EPB
+-		 */
+-		epp = intel_pstate_get_epp(cpu_data, value);
+-		if (epp)
+-			goto skip_epp;
++			epp = cpu_data->epp_powersave;
++		}
+ 
+-		epp = cpu_data->epp_powersave;
+-	}
+-	if (boot_cpu_has(X86_FEATURE_HWP_EPP)) {
+-		value &= ~GENMASK_ULL(31, 24);
+-		value |= (u64)epp << 24;
+-	} else {
+-		intel_pstate_set_epb(cpu, epp);
++		if (boot_cpu_has(X86_FEATURE_HWP_EPP)) {
++			value &= ~GENMASK_ULL(31, 24);
++			value |= (u64)epp << 24;
++		} else {
++			intel_pstate_set_epb(cpu, epp);
++		}
+ 	}
++
+ skip_epp:
+ 	WRITE_ONCE(cpu_data->hwp_req_cached, value);
++	/* Ensure the write goes to the target CPU context. */
+ 	wrmsrq_on_cpu(cpu, MSR_HWP_REQUEST, value);
+ }
+ 
+@@ -2534,10 +2587,12 @@ static inline void intel_pstate_update_u
+ {
+ 	struct cpudata *cpu = container_of(data, struct cpudata, update_util);
+ 
++	/* Accumulate flags; no atomic needed, per-CPU execution assumed. */
+ 	cpu->sched_flags |= flags;
+ 
+-	if (smp_processor_id() == cpu->cpu)
++	if (likely(smp_processor_id() == cpu->cpu)) {
+ 		intel_pstate_update_util_hwp_local(cpu, time);
++	}
+ }
+ 
+ static inline void intel_pstate_calc_avg_perf(struct cpudata *cpu)
+@@ -2679,16 +2734,28 @@ static void intel_pstate_update_util(str
+ 				     unsigned int flags)
+ {
+ 	struct cpudata *cpu = container_of(data, struct cpudata, update_util);
+-	u64 delta_ns;
+ 
+-	/* Don't allow remote callbacks */
+-	if (smp_processor_id() != cpu->cpu)
++	/* Don't allow remote callbacks (should not occur, but be defensive). */
++	if (unlikely(smp_processor_id() != cpu->cpu)) {
+ 		return;
++	}
+ 
+-	delta_ns = time - cpu->last_update;
+-	if (flags & SCHED_CPUFREQ_IOWAIT) {
+-		/* Start over if the CPU may have been idle. */
++	u64 delta_ns = time - cpu->last_update;
++
++	/* Hot path: most of the time, there is no IOWAIT flag. */
++	if (likely(!(flags & SCHED_CPUFREQ_IOWAIT))) {
++		if (cpu->iowait_boost) {
++			/* Clear iowait_boost if the CPU may have been idle. */
++			if (delta_ns > TICK_NSEC) {
++				cpu->iowait_boost = 0;
++			} else {
++				cpu->iowait_boost >>= 1;
++			}
++		}
++	} else {
++		/* IOWAIT path. Handle boost escalation and re-priming. */
+ 		if (delta_ns > TICK_NSEC) {
++			/* Start over if the CPU may have been idle. */
+ 			cpu->iowait_boost = ONE_EIGHTH_FP;
+ 		} else if (cpu->iowait_boost >= ONE_EIGHTH_FP) {
+ 			cpu->iowait_boost <<= 1;
+@@ -2697,14 +2764,11 @@ static void intel_pstate_update_util(str
+ 		} else {
+ 			cpu->iowait_boost = ONE_EIGHTH_FP;
+ 		}
+-	} else if (cpu->iowait_boost) {
+-		/* Clear iowait_boost if the CPU may have been idle. */
+-		if (delta_ns > TICK_NSEC)
+-			cpu->iowait_boost = 0;
+-		else
+-			cpu->iowait_boost >>= 1;
+ 	}
++
+ 	cpu->last_update = time;
++
++	/* Sample at 10ms cadence (INTEL_PSTATE_SAMPLING_INTERVAL). */
+ 	delta_ns = time - cpu->sample.time;
+ 	if ((s64)delta_ns < INTEL_PSTATE_SAMPLING_INTERVAL)
+ 		return;
+@@ -2893,24 +2957,32 @@ static void intel_pstate_update_perf_lim
+ 	int perf_ctl_scaling = cpu->pstate.perf_ctl_scaling;
+ 	int32_t max_policy_perf, min_policy_perf;
+ 
+-	max_policy_perf = policy_max / perf_ctl_scaling;
++	/* Defensive: avoid division by zero if FW anomaly (should not happen). */
++	if (unlikely(perf_ctl_scaling <= 0)) {
++		max_policy_perf = 0;
++		min_policy_perf = 0;
++		goto finalize;
++	}
++
++	/* Exact floor division for policy limits via internal helpers. */
++	max_policy_perf = (int32_t)ip_div_u64_recip_floor((u64)policy_max, (u64)perf_ctl_scaling);
+ 	if (policy_max == policy_min) {
+ 		min_policy_perf = max_policy_perf;
+ 	} else {
+-		min_policy_perf = policy_min / perf_ctl_scaling;
+-		min_policy_perf = clamp_t(int32_t, min_policy_perf,
+-					  0, max_policy_perf);
++		min_policy_perf = (int32_t)ip_div_u64_recip_floor((u64)policy_min, (u64)perf_ctl_scaling);
++		min_policy_perf = clamp_t(int32_t, min_policy_perf, 0, max_policy_perf);
+ 	}
+ 
+ 	/*
+-	 * HWP needs some special consideration, because HWP_REQUEST uses
+-	 * abstract values to represent performance rather than pure ratios.
++	 * HWP needs special handling: HWP_REQUEST uses abstract performance
++	 * levels; map perf_ctl-based values back to HWP scale when necessary.
+ 	 */
+ 	if (hwp_active && cpu->pstate.scaling != perf_ctl_scaling) {
+ 		int freq;
+ 
+ 		freq = max_policy_perf * perf_ctl_scaling;
+ 		max_policy_perf = intel_pstate_freq_to_hwp(cpu, freq);
++
+ 		freq = min_policy_perf * perf_ctl_scaling;
+ 		min_policy_perf = intel_pstate_freq_to_hwp(cpu, freq);
+ 	}
+@@ -2918,6 +2990,7 @@ static void intel_pstate_update_perf_lim
+ 	pr_debug("cpu:%d min_policy_perf:%d max_policy_perf:%d\n",
+ 		 cpu->cpu, min_policy_perf, max_policy_perf);
+ 
++finalize:
+ 	/* Normalize user input to [min_perf, max_perf] */
+ 	if (per_cpu_limits) {
+ 		cpu->min_perf_ratio = min_policy_perf;
+@@ -2939,14 +3012,12 @@ static void intel_pstate_update_perf_lim
+ 		cpu->max_perf_ratio = min(max_policy_perf, global_max);
+ 		cpu->max_perf_ratio = max(min_policy_perf, cpu->max_perf_ratio);
+ 
+-		/* Make sure min_perf <= max_perf */
+-		cpu->min_perf_ratio = min(cpu->min_perf_ratio,
+-					  cpu->max_perf_ratio);
+-
++		/* Ensure min_perf <= max_perf */
++		cpu->min_perf_ratio = min(cpu->min_perf_ratio, cpu->max_perf_ratio);
+ 	}
++
+ 	pr_debug("cpu:%d max_perf_ratio:%d min_perf_ratio:%d\n", cpu->cpu,
+-		 cpu->max_perf_ratio,
+-		 cpu->min_perf_ratio);
++		 cpu->max_perf_ratio, cpu->min_perf_ratio);
+ }
+ 
+ static int intel_pstate_set_policy(struct cpufreq_policy *policy)
+@@ -3784,25 +3855,46 @@ static const struct x86_cpu_id intel_epp
+ 	 * AlderLake Mobile CPUs.
+ 	 */
+ 	X86_MATCH_VFM(INTEL_ALDERLAKE_L, HWP_SET_DEF_BALANCE_PERF_EPP(102)),
++
+ 	X86_MATCH_VFM(INTEL_SAPPHIRERAPIDS_X, HWP_SET_DEF_BALANCE_PERF_EPP(32)),
+ 	X86_MATCH_VFM(INTEL_EMERALDRAPIDS_X, HWP_SET_DEF_BALANCE_PERF_EPP(32)),
+ 	X86_MATCH_VFM(INTEL_GRANITERAPIDS_X, HWP_SET_DEF_BALANCE_PERF_EPP(32)),
+ 	X86_MATCH_VFM(INTEL_GRANITERAPIDS_D, HWP_SET_DEF_BALANCE_PERF_EPP(32)),
++
++	/* Platform guidance: balanced gaming/desktop tuning. */
+ 	X86_MATCH_VFM(INTEL_METEORLAKE_L, HWP_SET_EPP_VALUES(HWP_EPP_POWERSAVE,
+ 		      179, 64, 16)),
+ 	X86_MATCH_VFM(INTEL_ARROWLAKE, HWP_SET_EPP_VALUES(HWP_EPP_POWERSAVE,
+ 		      179, 64, 16)),
++
++	/* New: Raptor Lake defaults tuned for gaming responsiveness. */
++	X86_MATCH_VFM(INTEL_RAPTORLAKE,   HWP_SET_EPP_VALUES(HWP_EPP_POWERSAVE, 179, 64, 0)),
++	X86_MATCH_VFM(INTEL_RAPTORLAKE_P, HWP_SET_EPP_VALUES(HWP_EPP_POWERSAVE, 179, 64, 0)),
++	X86_MATCH_VFM(INTEL_RAPTORLAKE_S, HWP_SET_EPP_VALUES(HWP_EPP_POWERSAVE, 179, 64, 0)),
++
+ 	{}
+ };
+ 
+ static const struct x86_cpu_id intel_hybrid_scaling_factor[] = {
+-	X86_MATCH_VFM(INTEL_ALDERLAKE, HYBRID_SCALING_FACTOR_ADL),
+-	X86_MATCH_VFM(INTEL_ALDERLAKE_L, HYBRID_SCALING_FACTOR_ADL),
+-	X86_MATCH_VFM(INTEL_RAPTORLAKE, HYBRID_SCALING_FACTOR_ADL),
+-	X86_MATCH_VFM(INTEL_RAPTORLAKE_P, HYBRID_SCALING_FACTOR_ADL),
+-	X86_MATCH_VFM(INTEL_RAPTORLAKE_S, HYBRID_SCALING_FACTOR_ADL),
+-	X86_MATCH_VFM(INTEL_METEORLAKE_L, HYBRID_SCALING_FACTOR_MTL),
+-	X86_MATCH_VFM(INTEL_LUNARLAKE_M, HYBRID_SCALING_FACTOR_LNL),
++	X86_MATCH_VFM(INTEL_ALDERLAKE,     HYBRID_SCALING_FACTOR_ADL), /* 78741 */
++	X86_MATCH_VFM(INTEL_ALDERLAKE_L,   HYBRID_SCALING_FACTOR_ADL),
++
++	/* Raptor Lake: use 80000 for improved perf-to-frequency mapping. */
++	X86_MATCH_VFM(INTEL_RAPTORLAKE,    HYBRID_SCALING_FACTOR_MTL), /* 80000 */
++	X86_MATCH_VFM(INTEL_RAPTORLAKE_P,  HYBRID_SCALING_FACTOR_MTL),
++	X86_MATCH_VFM(INTEL_RAPTORLAKE_S,  HYBRID_SCALING_FACTOR_MTL),
++
++	X86_MATCH_VFM(INTEL_METEORLAKE_L,  HYBRID_SCALING_FACTOR_MTL), /* 80000 */
++	X86_MATCH_VFM(INTEL_LUNARLAKE_M,   HYBRID_SCALING_FACTOR_LNL), /* 86957 */
++
++	{}
++};
++
++/* Raptor Lake family match for minor tuning at init time. */
++static const struct x86_cpu_id raptorlake_ids[] __initconst = {
++	X86_MATCH_VFM(INTEL_RAPTORLAKE,   1),
++	X86_MATCH_VFM(INTEL_RAPTORLAKE_P, 1),
++	X86_MATCH_VFM(INTEL_RAPTORLAKE_S, 1),
+ 	{}
+ };
+ 
+@@ -3919,6 +4011,12 @@ hwp_cpu_matched:
+ 			pr_debug("hybrid scaling factor: %d\n", hybrid_scaling_factor);
+ 		}
+ 
++		/* Raptor Lake gaming-friendly iowait boost hold time. */
++		if (x86_match_cpu(raptorlake_ids)) {
++			hwp_boost_hold_time_ns = 5 * NSEC_PER_MSEC;
++			pr_debug("Raptor Lake: set HWP boost hold time to %d ns\n",
++				 hwp_boost_hold_time_ns);
++		}
+ 	}
+ 
+ 	mutex_lock(&intel_pstate_driver_lock);
 
 
 --- a/kernel/irq/affinity.c	2025-03-13 13:08:08.000000000 +0100
