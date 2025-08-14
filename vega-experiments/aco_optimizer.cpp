@@ -53,38 +53,46 @@ struct mad_info {
 };
 
 enum Label {
-    label_constant_32bit = 1 << 1,
-    label_abs = 1 << 2,
-    label_neg = 1 << 3,
-    label_temp = 1 << 5,
-    label_literal = 1 << 6,
-    label_mad = 1 << 7,
-    label_omod2 = 1 << 8,
-    label_omod4 = 1 << 9,
-    label_omod5 = 1 << 10,
-    label_clamp = 1 << 12,
-    label_b2f = 1 << 16,
-    label_uniform_bool = 1 << 21,
-    label_constant_64bit = 1 << 22,
-    label_uniform_bitwise = 1 << 23,
-    label_scc_invert = 1 << 24,
-    label_scc_needed = 1 << 26,
-    label_b2i = 1 << 27,
-    label_fcanonicalize = 1 << 28,
-    label_constant_16bit = 1 << 29,
-    label_canonicalized = 1ull << 32,
-    label_extract = 1ull << 33,
-    label_insert = 1ull << 34,
-    label_precise = 1ull << 35,
-    label_f2f16 = 1ull << 38,
+   label_constant_32bit = 1 << 1,
+   /* label_{abs,neg,mul,omod2,omod4,omod5,clamp} are used for both 16 and
+    * 32-bit operations but this shouldn't cause any issues because we don't
+    * look through any conversions */
+   label_abs = 1 << 2,
+   label_neg = 1 << 3,
+   label_temp = 1 << 5,
+   label_literal = 1 << 6,
+   label_mad = 1 << 7,
+   label_omod2 = 1 << 8,
+   label_omod4 = 1 << 9,
+   label_omod5 = 1 << 10,
+   label_clamp = 1 << 12,
+   label_b2f = 1 << 16,
+   /* This label means that it's either 0 or -1, and the ssa_info::temp is an s1 which is 0 or 1. */
+   label_uniform_bool = 1 << 21,
+   label_constant_64bit = 1 << 22,
+   /* This label is added to the first definition of s_not/s_or/s_xor/s_and when all operands are
+    * uniform_bool or uniform_bitwise. The first definition of ssa_info::instr would be 0 or -1 and
+    * the second is SCC.
+    */
+   label_uniform_bitwise = 1 << 23,
+   /* This label means that it's either 0 or 1 and ssa_info::temp is the inverse. */
+   label_scc_invert = 1 << 24,
+   label_scc_needed = 1 << 26,
+   label_b2i = 1 << 27,
+   label_fcanonicalize = 1 << 28,
+   label_constant_16bit = 1 << 29,
+   label_canonicalized = 1ull << 32, /* 1ull to prevent sign extension */
+   label_extract = 1ull << 33,
+   label_insert = 1ull << 34,
+   label_f2f16 = 1ull << 38,
 };
 
 static constexpr uint64_t instr_mod_labels =
-label_omod2 | label_omod4 | label_omod5 | label_clamp | label_insert | label_f2f16;
+   label_omod2 | label_omod4 | label_omod5 | label_clamp | label_insert | label_f2f16;
 
 static constexpr uint64_t temp_labels = label_abs | label_neg | label_temp | label_b2f |
                                         label_uniform_bool | label_scc_invert | label_b2i |
-                                        label_fcanonicalize | label_canonicalized | label_precise;
+                                        label_fcanonicalize;
 static constexpr uint32_t val_labels =
    label_constant_32bit | label_constant_64bit | label_constant_16bit | label_literal | label_mad;
 
@@ -92,174 +100,251 @@ static_assert((instr_mod_labels & temp_labels) == 0, "labels cannot intersect");
 static_assert((instr_mod_labels & val_labels) == 0, "labels cannot intersect");
 static_assert((temp_labels & val_labels) == 0, "labels cannot intersect");
 
-struct ssa_info
-{
-    uint64_t label = 0;
+struct ssa_info {
+   uint64_t label;
+   union {
+      uint32_t val;
+      Temp temp;
+      Instruction* mod_instr;
+   };
+   Instruction* parent_instr;
 
-    union {
-        uint32_t     val;
-        Temp         temp;
-        Instruction* mod_instr;
-    };
+   ssa_info() : label(0) {}
 
-    Instruction* parent_instr = nullptr;
+   void add_label(Label new_label)
+   {
+      if (new_label & instr_mod_labels) {
+         label &= ~instr_mod_labels;
+         label &= ~(temp_labels | val_labels); /* instr, temp and val alias */
+      }
 
-    constexpr ssa_info() noexcept : label(0), val(0), parent_instr(nullptr) {}
-    ~ssa_info() = default;
+      if (new_label & temp_labels) {
+         label &= ~temp_labels;
+         label &= ~(instr_mod_labels | val_labels); /* instr, temp and val alias */
+      }
 
-    void add_label(Label new_label)
-    {
-        if (!new_label)
-            return;
+      uint32_t const_labels =
+         label_literal | label_constant_32bit | label_constant_64bit | label_constant_16bit;
+      if (new_label & const_labels) {
+         label &= ~val_labels | const_labels;
+         label &= ~(instr_mod_labels | temp_labels); /* instr, temp and val alias */
+      } else if (new_label & val_labels) {
+         label &= ~val_labels;
+         label &= ~(instr_mod_labels | temp_labels); /* instr, temp and val alias */
+      }
 
-        constexpr uint64_t const_labels =
-        label_literal | label_constant_32bit |
-        label_constant_64bit | label_constant_16bit;
+      label |= new_label;
+   }
 
-        const bool is_instr = new_label & instr_mod_labels;
-        const bool is_temp  = new_label & temp_labels;
-        const bool is_const = new_label & const_labels;
-        const bool is_val   = (!is_const) && (new_label & val_labels);
+   void set_constant(amd_gfx_level gfx_level, uint64_t constant)
+   {
+      Operand op16 = Operand::c16(constant);
+      Operand op32 = Operand::get_const(gfx_level, constant, 4);
+      add_label(label_literal);
+      val = constant;
 
-        if (is_instr)
-            label &= ~(instr_mod_labels | temp_labels | val_labels);
-        else if (is_temp)
-            label &= ~(temp_labels | instr_mod_labels | val_labels);
-        else if (is_const || is_val)
-            label &= ~(val_labels | instr_mod_labels | temp_labels);
+      /* check that no upper bits are lost in case of packed 16bit constants */
+      if (gfx_level >= GFX8 && !op16.isLiteral() &&
+          op16.constantValue16(true) == ((constant >> 16) & 0xffff))
+         add_label(label_constant_16bit);
 
-        label |= new_label;
-    }
+      if (!op32.isLiteral())
+         add_label(label_constant_32bit);
 
-    /* ------------------------------------------------------------------ */
-    /* 3.  Constant/Literal helpers                                        */
-    /* ------------------------------------------------------------------ */
-    void set_constant(amd_gfx_level gfx_level, uint64_t constant)
-    {
-        Operand op16 = Operand::c16(constant);
-        Operand op32 = Operand::get_const(gfx_level, constant, 4);
+      if (Operand::is_constant_representable(constant, 8))
+         add_label(label_constant_64bit);
 
-        add_label(label_literal);
-        val = constant;
+      if (label & label_constant_64bit) {
+         val = Operand::c64(constant).constantValue();
+         if (val != constant)
+            label &= ~(label_literal | label_constant_16bit | label_constant_32bit);
+      }
+   }
 
-        /* packed-16 inline    (both 16-bit halves equal & representable) */
-        if (gfx_level >= GFX8 && !op16.isLiteral() &&
-            op16.constantValue16(true) == ((constant >> 16) & 0xffff))
-            add_label(label_constant_16bit);
+   bool is_constant(unsigned bits)
+   {
+      switch (bits) {
+      case 8: return label & label_literal;
+      case 16: return label & label_constant_16bit;
+      case 32: return label & label_constant_32bit;
+      case 64: return label & label_constant_64bit;
+      }
+      return false;
+   }
 
-        if (!op32.isLiteral())
-            add_label(label_constant_32bit);
+   bool is_literal(unsigned bits)
+   {
+      bool is_lit = label & label_literal;
+      switch (bits) {
+      case 8: return false;
+      case 16: return is_lit && ~(label & label_constant_16bit);
+      case 32: return is_lit && ~(label & label_constant_32bit);
+      case 64: return false;
+      }
+      return false;
+   }
 
-        if (Operand::is_constant_representable(constant, 8))
-            add_label(label_constant_64bit);
+   bool is_constant_or_literal(unsigned bits)
+   {
+      if (bits == 64)
+         return label & label_constant_64bit;
+      else
+         return label & label_literal;
+   }
 
-        /* Prefer 64-bit inline const if available                         */
-        if (label & label_constant_64bit) {
-            val = Operand::c64(constant).constantValue();
-            if (val != constant)            /* information loss → strip      */
-                label &= ~(label_literal | label_constant_16bit |
-                label_constant_32bit);
-        }
-    }
+   void set_abs(Temp abs_temp)
+   {
+      add_label(label_abs);
+      temp = abs_temp;
+   }
 
-    bool is_constant(unsigned bits) const
-    {
-        switch (bits) {
-            case  8: return label & label_literal;
-            case 16: return label & label_constant_16bit;
-            case 32: return label & label_constant_32bit;
-            case 64: return label & label_constant_64bit;
-            default: return false;
-        }
-    }
+   bool is_abs() { return label & label_abs; }
 
-    bool is_literal(unsigned bits) const
-    {
-        const bool lit = label & label_literal;
-        switch (bits) {
-            case  8: return false; /* 8-bit always inline, never “literal”      */
-            case 16: return lit && !(label & label_constant_16bit);
-            case 32: return lit && !(label & label_constant_32bit);
-            case 64: return lit && !(label & label_constant_64bit);
-            default: return false;
-        }
-    }
+   void set_neg(Temp neg_temp)
+   {
+      add_label(label_neg);
+      temp = neg_temp;
+   }
 
-    bool is_constant_or_literal(unsigned bits) const
-    {
-        return is_constant(bits) || is_literal(bits);
-    }
+   bool is_neg() { return label & label_neg; }
 
-    /* ------------------------------------------------------------------ */
-    /* 4.  Fast setters / testers (public API remains unchanged)           */
-    /* ------------------------------------------------------------------ */
-    /* ---- abs / neg --------------------------------------------------- */
-    void set_abs(Temp t)              { add_label(label_abs); temp = t; }
-    bool is_abs()               const { return label & label_abs; }
+   void set_neg_abs(Temp neg_abs_temp)
+   {
+      add_label((Label)((uint32_t)label_abs | (uint32_t)label_neg));
+      temp = neg_abs_temp;
+   }
 
-    void set_neg(Temp t)              { add_label(label_neg); temp = t; }
-    bool is_neg()               const { return label & label_neg; }
+   void set_temp(Temp tmp)
+   {
+      add_label(label_temp);
+      temp = tmp;
+   }
 
-    void set_neg_abs(Temp t)
-    {
-        add_label(static_cast<Label>(label_abs | label_neg));
-        temp = t;
-    }
+   bool is_temp() { return label & label_temp; }
 
-    /* ---- plain temp -------------------------------------------------- */
-    void set_temp(Temp t)             { add_label(label_temp); temp = t; }
-    bool is_temp()              const { return label & label_temp; }
+   void set_mad(uint32_t mad_info_idx)
+   {
+      add_label(label_mad);
+      val = mad_info_idx;
+   }
 
-    /* ---- MAD marker -------------------------------------------------- */
-    void set_mad(uint32_t idx)        { add_label(label_mad);  val = idx; }
-    bool is_mad()               const { return label & label_mad; }
+   bool is_mad() { return label & label_mad; }
 
-    /* ---- omod / clamp / f2f16 / insert ------------------------------- */
-    void set_omod2 (Instruction* m)   { add_label(label_omod2);  mod_instr = m; }
-    bool is_omod2()             const { return label & label_omod2; }
+   void set_omod2(Instruction* mul)
+   {
+      if (label & temp_labels)
+         return;
+      add_label(label_omod2);
+      mod_instr = mul;
+   }
 
-    void set_omod4 (Instruction* m)   { add_label(label_omod4);  mod_instr = m; }
-    bool is_omod4()             const { return label & label_omod4; }
+   bool is_omod2() { return label & label_omod2; }
 
-    void set_omod5 (Instruction* m)   { add_label(label_omod5);  mod_instr = m; }
-    bool is_omod5()             const { return label & label_omod5; }
+   void set_omod4(Instruction* mul)
+   {
+      if (label & temp_labels)
+         return;
+      add_label(label_omod4);
+      mod_instr = mul;
+   }
 
-    void set_clamp (Instruction* m)   { add_label(label_clamp);  mod_instr = m; }
-    bool is_clamp()             const { return label & label_clamp; }
+   bool is_omod4() { return label & label_omod4; }
 
-    void set_f2f16(Instruction* m)    { add_label(label_f2f16); mod_instr = m; }
-    bool is_f2f16()            const { return label & label_f2f16; }
+   void set_omod5(Instruction* mul)
+   {
+      if (label & temp_labels)
+         return;
+      add_label(label_omod5);
+      mod_instr = mul;
+   }
 
-    void set_insert(Instruction* m)   { add_label(label_insert); mod_instr = m; }
-    bool is_insert()            const { return label & label_insert; }
+   bool is_omod5() { return label & label_omod5; }
 
-    /* ---- misc helpers ------------------------------------------------ */
-    void set_b2f(Temp t)              { add_label(label_b2f);   temp = t; }
-    bool is_b2f()               const { return label & label_b2f; }
+   void set_clamp(Instruction* med3)
+   {
+      if (label & temp_labels)
+         return;
+      add_label(label_clamp);
+      mod_instr = med3;
+   }
 
-    void set_uniform_bitwise()        { add_label(label_uniform_bitwise); }
-    bool is_uniform_bitwise()   const { return label & label_uniform_bitwise; }
+   bool is_clamp() { return label & label_clamp; }
 
-    void set_scc_needed()             { add_label(label_scc_needed); }
-    bool is_scc_needed()        const { return label & label_scc_needed; }
+   void set_f2f16(Instruction* conv)
+   {
+      if (label & temp_labels)
+         return;
+      add_label(label_f2f16);
+      mod_instr = conv;
+   }
 
-    void set_scc_invert(Temp t)       { add_label(label_scc_invert); temp = t; }
-    bool is_scc_invert()        const { return label & label_scc_invert; }
+   bool is_f2f16() { return label & label_f2f16; }
 
-    void set_uniform_bool(Temp t)     { add_label(label_uniform_bool); temp = t; }
-    bool is_uniform_bool()      const { return label & label_uniform_bool; }
+   void set_b2f(Temp b2f_val)
+   {
+      add_label(label_b2f);
+      temp = b2f_val;
+   }
 
-    void set_b2i(Temp t)              { add_label(label_b2i);  temp = t; }
-    bool is_b2i()               const { return label & label_b2i; }
+   bool is_b2f() { return label & label_b2f; }
 
-    void set_fcanonicalize(Temp t)    { add_label(label_fcanonicalize); temp = t; }
-    bool is_fcanonicalize()     const { return label & label_fcanonicalize; }
+   void set_uniform_bitwise() { add_label(label_uniform_bitwise); }
 
-    void set_canonicalized()          { add_label(label_canonicalized); }
-    bool is_canonicalized()     const { return label & label_canonicalized; }
+   bool is_uniform_bitwise() { return label & label_uniform_bitwise; }
 
-    void set_extract()                { add_label(label_extract); }
-    bool is_extract()           const { return label & label_extract; }
+   void set_scc_needed() { add_label(label_scc_needed); }
+
+   bool is_scc_needed() { return label & label_scc_needed; }
+
+   void set_scc_invert(Temp scc_inv)
+   {
+      add_label(label_scc_invert);
+      temp = scc_inv;
+   }
+
+   bool is_scc_invert() { return label & label_scc_invert; }
+
+   void set_uniform_bool(Temp uniform_bool)
+   {
+      add_label(label_uniform_bool);
+      temp = uniform_bool;
+   }
+
+   bool is_uniform_bool() { return label & label_uniform_bool; }
+
+   void set_b2i(Temp b2i_val)
+   {
+      add_label(label_b2i);
+      temp = b2i_val;
+   }
+
+   bool is_b2i() { return label & label_b2i; }
+
+   void set_fcanonicalize(Temp tmp)
+   {
+      add_label(label_fcanonicalize);
+      temp = tmp;
+   }
+
+   bool is_fcanonicalize() { return label & label_fcanonicalize; }
+
+   void set_canonicalized() { add_label(label_canonicalized); }
+
+   bool is_canonicalized() { return label & label_canonicalized; }
+
+   void set_extract() { add_label(label_extract); }
+
+   bool is_extract() { return label & label_extract; }
+
+   void set_insert(Instruction* insert)
+   {
+      if (label & temp_labels)
+         return;
+      add_label(label_insert);
+      mod_instr = insert;
+   }
+
+   bool is_insert() { return label & label_insert; }
 };
 
 struct opt_ctx {
@@ -271,6 +356,16 @@ struct opt_ctx {
    std::vector<mad_info> mad_infos;
    std::vector<uint16_t> uses;
 };
+
+static bool combine_bfi_b32(opt_ctx& ctx, aco_ptr<Instruction>& or_instr);
+static bool combine_bfe_b32(opt_ctx& ctx, aco_ptr<Instruction>& instr);
+static bool combine_bcnt_mbcnt(opt_ctx& ctx, aco_ptr<Instruction>& add_instr);
+static bool combine_sad_u8(opt_ctx& ctx, aco_ptr<Instruction>& add_instr);
+static bool apply_interp_extract(opt_ctx& ctx, aco_ptr<Instruction>& extract);
+static bool combine_alignbit_like(opt_ctx& ctx, aco_ptr<Instruction>& or_instr, aco_opcode target, unsigned granularity);
+static inline bool combine_alignbit_b32(opt_ctx& ctx, aco_ptr<Instruction>& instr);
+static inline bool combine_alignbyte_b32(opt_ctx& ctx, aco_ptr<Instruction>& instr);
+bool apply_load_extract(opt_ctx& ctx, aco_ptr<Instruction>& extract);
 
 bool
 can_use_VOP3(opt_ctx& ctx, const aco_ptr<Instruction>& instr)
@@ -398,7 +493,11 @@ can_apply_sgprs(opt_ctx& ctx, aco_ptr<Instruction>& instr)
           instr->opcode != aco_opcode::v_wmma_f16_16x16x16_f16 &&
           instr->opcode != aco_opcode::v_wmma_bf16_16x16x16_bf16 &&
           instr->opcode != aco_opcode::v_wmma_i32_16x16x16_iu8 &&
-          instr->opcode != aco_opcode::v_wmma_i32_16x16x16_iu4;
+          instr->opcode != aco_opcode::v_wmma_i32_16x16x16_iu4 &&
+          instr->opcode != aco_opcode::v_wmma_f32_16x16x16_fp8_fp8 &&
+          instr->opcode != aco_opcode::v_wmma_f32_16x16x16_fp8_bf8 &&
+          instr->opcode != aco_opcode::v_wmma_f32_16x16x16_bf8_fp8 &&
+          instr->opcode != aco_opcode::v_wmma_f32_16x16x16_bf8_bf8;
 }
 
 /* only covers special cases */
@@ -443,6 +542,7 @@ alu_can_accept_constant(const aco_ptr<Instruction>& instr, unsigned operand)
    case aco_opcode::p_bpermute_readlane:
    case aco_opcode::p_bpermute_shared_vgpr:
    case aco_opcode::p_bpermute_permlane:
+   case aco_opcode::p_permlane64_shared_vgpr:
    case aco_opcode::p_interp_gfx11:
    case aco_opcode::p_dual_src_export_gfx11:
    case aco_opcode::v_interp_p1_f32:
@@ -460,6 +560,10 @@ alu_can_accept_constant(const aco_ptr<Instruction>& instr, unsigned operand)
    case aco_opcode::v_dot2_bf16_bf16: /* TODO */
    case aco_opcode::v_wmma_f32_16x16x16_f16:
    case aco_opcode::v_wmma_f32_16x16x16_bf16:
+   case aco_opcode::v_wmma_f32_16x16x16_fp8_fp8:
+   case aco_opcode::v_wmma_f32_16x16x16_fp8_bf8:
+   case aco_opcode::v_wmma_f32_16x16x16_bf8_fp8:
+   case aco_opcode::v_wmma_f32_16x16x16_bf8_bf8:
    case aco_opcode::v_wmma_f16_16x16x16_f16:
    case aco_opcode::v_wmma_bf16_16x16x16_bf16:
    case aco_opcode::v_wmma_i32_16x16x16_iu8:
@@ -698,48 +802,6 @@ get_constant_op(opt_ctx& ctx, ssa_info info, uint32_t bits)
    return Operand::get_const(ctx.program->gfx_level, info.val, bits / 8u);
 }
 
-template <typename GfxEnum>
-static inline bool can_use_inline_constant(GfxEnum /*gfx_level*/,
-                                           uint32_t imm)
-{
-    /* Small signed/unsigned integers (0‥64, -16‥-1) -------------------- */
-    if (imm <= 64u || imm >= 0xfffffff0u)
-        return true;
-
-    /* Canonical IEEE-754 fp constants – perfect-hash on the top nibble -- */
-    constexpr uint8_t canonical_fp_lut[16] = {
-        /* 0x0 … 0xF  */
-        0,0,0,0,  /* 0x0-0x3 */
-        0,0,0,0,  /* 0x4-0x7 */
-        1,1,      /* 0x8 =  1.0f  / 0x9 = -1.0f   */
-        1,1,      /* 0xA =  2.0f  / 0xB = -2.0f   */
-        0,0,0,0   /* 0xC-0xF (the 4.0/-4.0 cases sit at 0x40/0xC0) */
-    };
-
-    const uint8_t high_nib = static_cast<uint8_t>(imm >> 24);
-    if ((high_nib == 0x3F || high_nib == 0xBF) && canonical_fp_lut[(imm>>20)&0xF])
-        return true;                           /* ±0.5 / ±1   */
-        if ((high_nib == 0x40 || high_nib == 0xC0) &&
-            ((imm & 0x00ffffffu) == 0))           /* ±2 / ±4     */
-        return true;
-
-    return false;
-}
-
-static inline bool
-is_literal_valid_for_vop3p_vega(aco_opcode op, const Operand& lit) noexcept
-{
-   if (op == aco_opcode::v_pk_mad_i16)
-      return true;
-
-   if (op == aco_opcode::v_pk_fma_f16 || op == aco_opcode::v_pk_mad_u16) {
-      return lit.isConstant() &&
-             can_use_inline_constant(GFX9, lit.constantValue());
-   }
-
-   return true;
-}
-
 void
 propagate_constants_vop3p(opt_ctx& ctx, aco_ptr<Instruction>& instr, ssa_info& info, unsigned i)
 {
@@ -838,14 +900,6 @@ propagate_constants_vop3p(opt_ctx& ctx, aco_ptr<Instruction>& instr, ssa_info& i
 
    vop3p->opsel_lo[i] = opsel_lo;
    vop3p->opsel_hi[i] = opsel_hi;
-
-   // GFX9-specific: Fold literals by sign-extending or shifting if possible
-   if (ctx.program->gfx_level == GFX9 && instr->operands[i].isLiteral() && is_literal_valid_for_vop3p_vega(instr->opcode, instr->operands[i])) {
-      uint32_t val = instr->operands[i].constantValue();
-      if (Operand::is_constant_representable(val, bits) || (bits == 32 && Operand::is_constant_representable(static_cast<uint64_t>(val) << 16, 4))) {
-         instr->operands[i] = Operand::get_const(GFX9, val, bits / 8u); // Fold to inline
-      }
-   }
 }
 
 bool
@@ -1147,8 +1201,8 @@ can_eliminate_and_exec(opt_ctx& ctx, Temp tmp, unsigned pass_flags, bool allow_c
 
    if (allow_cselect && instr->pass_flags == pass_flags &&
        (instr->opcode == aco_opcode::s_cselect_b32 || instr->opcode == aco_opcode::s_cselect_b64)) {
-      return (instr->operands[0].constantEquals(0) && instr->operands[1].constantEquals((unsigned)-1)) ||
-             (instr->operands[1].constantEquals(0) && instr->operands[0].constantEquals((unsigned)-1));
+      return (instr->operands[0].constantEquals(0) && instr->operands[1].constantEquals(-1)) ||
+             (instr->operands[1].constantEquals(0) && instr->operands[0].constantEquals(-1));
    }
 
    if (instr->operands.size() != 2 || instr->pass_flags != pass_flags)
@@ -1497,7 +1551,10 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          if (has_usable_ds_offset && i == 0 &&
              parse_base_offset(ctx, instr.get(), i, &base, &offset, false) &&
              base.regClass() == instr->operands[i].regClass() &&
-             instr->opcode != aco_opcode::ds_swizzle_b32) {
+             instr->opcode != aco_opcode::ds_swizzle_b32 &&
+             instr->opcode != aco_opcode::ds_bvh_stack_push4_pop1_rtn_b32 &&
+             instr->opcode != aco_opcode::ds_bvh_stack_push8_pop1_rtn_b32 &&
+             instr->opcode != aco_opcode::ds_bvh_stack_push8_pop2_rtn_b64) {
             if (instr->opcode == aco_opcode::ds_write2_b32 ||
                 instr->opcode == aco_opcode::ds_read2_b32 ||
                 instr->opcode == aco_opcode::ds_write2_b64 ||
@@ -1588,37 +1645,56 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          }
       }
 
+      offset = 0;
+      for (unsigned i = 0; i < ops.size(); i++) {
+         if (ops[i].isTemp()) {
+            if (ctx.info[ops[i].tempId()].is_temp() &&
+                ops[i].regClass() == ctx.info[ops[i].tempId()].temp.regClass()) {
+               ops[i].setTemp(ctx.info[ops[i].tempId()].temp);
+            }
+
+            /* If this and the following operands make up all definitions of a `p_split_vector`,
+             * replace them with the operand of the `p_split_vector` instruction.
+             */
+            Instruction* parent = ctx.info[ops[i].tempId()].parent_instr;
+            if (parent->opcode == aco_opcode::p_split_vector &&
+                (offset % 4 == 0 || parent->operands[0].bytes() < 4) &&
+                parent->definitions.size() <= ops.size() - i) {
+               copy_prop = true;
+               for (unsigned j = 0; copy_prop && j < parent->definitions.size(); j++) {
+                  copy_prop &= ops[i + j].isTemp() &&
+                               ops[i + j].getTemp() == parent->definitions[j].getTemp();
+               }
+
+               if (copy_prop) {
+                  ops.erase(ops.begin() + i + 1, ops.begin() + i + parent->definitions.size());
+                  ops[i] = parent->operands[0];
+               }
+            }
+         }
+
+         offset += ops[i].bytes();
+      }
+
       /* combine expanded operands to new vector */
-      if (ops.size() != instr->operands.size()) {
-         assert(ops.size() > instr->operands.size());
+      if (ops.size() <= instr->operands.size()) {
+         while (instr->operands.size() > ops.size())
+            instr->operands.pop_back();
+
+         if (ops.size() == 1) {
+            instr->opcode = aco_opcode::p_parallelcopy;
+            if (ops[0].isTemp())
+               ctx.info[instr->definitions[0].tempId()].set_temp(ops[0].getTemp());
+         }
+      } else {
          Definition def = instr->definitions[0];
          instr.reset(
             create_instruction(aco_opcode::p_create_vector, Format::PSEUDO, ops.size(), 1));
-         for (unsigned i = 0; i < ops.size(); i++) {
-            if (ops[i].isTemp() && ctx.info[ops[i].tempId()].is_temp() &&
-                ops[i].regClass() == ctx.info[ops[i].tempId()].temp.regClass())
-               ops[i].setTemp(ctx.info[ops[i].tempId()].temp);
-            instr->operands[i] = ops[i];
-         }
          instr->definitions[0] = def;
-      } else {
-         for (unsigned i = 0; i < ops.size(); i++) {
-            assert(instr->operands[i] == ops[i]);
-         }
       }
 
-      if (instr->operands.size() == 2 && instr->operands[1].isTemp()) {
-         /* check if this is created from split_vector */
-         ssa_info& info = ctx.info[instr->operands[1].tempId()];
-         if (info.parent_instr->opcode == aco_opcode::p_split_vector) {
-            Instruction* split = info.parent_instr;
-            if (instr->operands[0].isTemp() &&
-                instr->operands[0].getTemp() == split->definitions[0].getTemp() &&
-                instr->operands[1].getTemp() == split->definitions[1].getTemp() &&
-                instr->definitions[0].regClass() == split->operands[0].regClass())
-               ctx.info[instr->definitions[0].tempId()].set_temp(split->operands[0].getTemp());
-         }
-      }
+      for (unsigned i = 0; i < ops.size(); i++)
+         instr->operands[i] = ops[i];
       break;
    }
    case aco_opcode::p_split_vector: {
@@ -1861,15 +1937,11 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
              * uniform bool into divergent */
             ctx.info[instr->definitions[1].tempId()].set_temp(
                ctx.info[instr->operands[0].tempId()].temp);
-            ctx.info[instr->definitions[0].tempId()].set_uniform_bool(
-               ctx.info[instr->operands[0].tempId()].temp);
             break;
          } else if (ctx.info[instr->operands[0].tempId()].is_uniform_bitwise()) {
             /* Try to get rid of the superfluous s_and_b64, since the uniform bitwise instruction
              * already produces the same SCC */
             ctx.info[instr->definitions[1].tempId()].set_temp(
-               ctx.info[instr->operands[0].tempId()].parent_instr->definitions[1].getTemp());
-            ctx.info[instr->definitions[0].tempId()].set_uniform_bool(
                ctx.info[instr->operands[0].tempId()].parent_instr->definitions[1].getTemp());
             break;
          } else if ((ctx.program->stage.num_sw_stages() > 1 ||
@@ -1900,8 +1972,7 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       if (instr->operands[0].constantEquals((unsigned)-1) && instr->operands[1].constantEquals(0)) {
          /* Found a cselect that operates on a uniform bool that comes from eg. s_cmp */
          ctx.info[instr->definitions[0].tempId()].set_uniform_bool(instr->operands[2].getTemp());
-      }
-      if (instr->operands[2].isTemp() && ctx.info[instr->operands[2].tempId()].is_scc_invert()) {
+      } else if (instr->operands[2].isTemp() && ctx.info[instr->operands[2].tempId()].is_scc_invert()) {
          /* Flip the operands to get rid of the scc_invert instruction */
          std::swap(instr->operands[0], instr->operands[1]);
          instr->operands[2].setTemp(ctx.info[instr->operands[2].tempId()].temp);
@@ -1947,25 +2018,6 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    /* Set parent_instr for all SSA definitions. */
    for (const Definition& def : instr->definitions)
       ctx.info[def.tempId()].parent_instr = instr.get();
-}
-
-/* PhysReg helpers (they are enum‐like in ACO) */
-#ifndef EXEC_LO
-#define EXEC_LO PhysReg{exec}
-#define EXEC_HI PhysReg{exec+1}
-#endif
-
-static inline bool is_exec_lo(const Operand& op)
-{
-    return op.isFixed() && op.physReg() == EXEC_LO;
-}
-static inline bool is_exec_hi(const Operand& op)
-{
-    return op.isFixed() && op.physReg() == EXEC_HI;
-}
-static inline bool is_vcc(const Operand& op)
-{
-    return op.isFixed() && (op.physReg() == vcc || op.physReg() == vcc_hi);
 }
 
 unsigned
@@ -2193,356 +2245,427 @@ combine_three_valu_op(opt_ctx& ctx, aco_ptr<Instruction>& instr, aco_opcode op2,
    return false;
 }
 
+/* combines a series of shifts and masks with an OR into a single v_alignbit_b32 or v_alignbyte_b32 instruction. */
 static bool
-combine_alignbit_like(opt_ctx&              ctx,
-                      aco_ptr<Instruction>& or_instr,
-                      aco_opcode            target,
-                      unsigned              granularity)
+combine_alignbit_like(opt_ctx& ctx, aco_ptr<Instruction>& or_instr, aco_opcode target, unsigned granularity)
 {
-    if (or_instr->opcode != aco_opcode::v_or_b32 ||
-        or_instr->operands.size() != 2 ||
-        granularity == 0 ||
-        ctx.program->gfx_level < GFX9)
-        return false;
+   if (or_instr->opcode != aco_opcode::v_or_b32 || or_instr->operands.size() != 2 ||
+       granularity == 0 || ctx.program->gfx_level < GFX9) {
+      return false;
+   }
 
-    /* ---------- recognise   v_lshrrev / v_lshlrev  -------------------- */
-    auto match_shift = [&](Operand op, unsigned& amount, Operand& src,
-                           bool& is_shr) -> bool {
-                               if (!op.isTemp())
-                                   return false;
-                               Instruction* sh = ctx.info[op.tempId()].parent_instr;
-                               if (!sh || ctx.uses[op.tempId()] != 1)
-                                   return false;
+   /* Match v_lshrrev or v_lshlrev with a constant shift amount. */
+   auto match_shift = [&](Operand op, unsigned& amount, Operand& src, bool& is_shr) -> bool
+   {
+      if (!op.isTemp())
+         return false;
+      Instruction* sh = ctx.info[op.tempId()].parent_instr;
+      if (!sh || ctx.uses[op.tempId()] != 1)
+         return false;
 
-                               if (sh->opcode == aco_opcode::v_lshrrev_b32)
-                                   is_shr = true;
-                               else if (sh->opcode == aco_opcode::v_lshlrev_b32)
-                                   is_shr = false;
-                               else
-                                   return false;
+      if (sh->opcode == aco_opcode::v_lshrrev_b32)
+         is_shr = true;
+      else if (sh->opcode == aco_opcode::v_lshlrev_b32)
+         is_shr = false;
+      else
+         return false;
 
-                               if (!sh->operands[0].isLiteral() ||
-                                   sh->operands[0].constantValue() >= 32)
-                                   return false;
+      if (!sh->operands[0].isConstant() || sh->operands[0].constantValue() >= 32)
+         return false;
 
-                               amount = sh->operands[0].constantValue();
-                               if (amount == 0 || amount >= 32 || amount % granularity)
-                                   return false;
+      amount = sh->operands[0].constantValue();
+      if (amount == 0 || amount >= 32 || amount % granularity)
+         return false;
 
-                               src = sh->operands[1];
-                               return true;
-                           };
+      src = sh->operands[1];
+      return true;
+   };
 
-                           unsigned a_amt = 0, b_amt = 0;
-                           Operand  a_src,  b_src;
-                           bool     a_shr = false, b_shr = false;
+   unsigned a_amt = 0, b_amt = 0;
+   Operand a_src, b_src;
+   bool a_shr = false, b_shr = false;
 
-                           if (!match_shift(or_instr->operands[0], a_amt, a_src, a_shr) ||
-                               !match_shift(or_instr->operands[1], b_amt, b_src, b_shr))
-                               return false;
+   if (!match_shift(or_instr->operands[0], a_amt, a_src, a_shr) ||
+       !match_shift(or_instr->operands[1], b_amt, b_src, b_shr))
+      return false;
 
-                           if (a_shr == b_shr)                     /* need one left, one right */
-                               return false;
-    if (a_amt + b_amt != 32)                /* must be complementary    */
-        return false;
+   if (a_shr == b_shr) /* must have one left and one right shift */
+      return false;
+   if (a_amt + b_amt != 32) /* shifts must be complementary */
+      return false;
 
-    /* choose mapping that fits ISA:  dst = (src0 >> imm) | (src1 << (32-imm)) */
-    Operand src0 = a_shr ? a_src : b_src;   /* right-shift origin */
-    Operand src1 = a_shr ? b_src : a_src;   /* left-shift origin  */
-    unsigned imm = a_shr ? a_amt : b_amt;   /* right-shift amount */
+   /* The ISA encoding is: dst = (src0 >> imm) | (src1 << (32-imm)) */
+   Operand src0 = a_shr ? a_src : b_src;   /* right-shifted source */
+   Operand src1 = a_shr ? b_src : a_src;   /* left-shifted source  */
+   unsigned imm = a_shr ? a_amt : b_amt; /* right-shift amount */
 
-    aco_ptr<Instruction> ali{
-        create_instruction(target, Format::VOP3, 3, 1)};
+   aco_ptr<Instruction> ali{create_instruction(target, Format::VOP3, 3, 1)};
+   ali->operands[0] = src0;
+   ali->operands[1] = src1;
+   ali->operands[2] = Operand::c32(imm / granularity);
+   ali->definitions[0] = or_instr->definitions[0];
+   ali->pass_flags = or_instr->pass_flags;
 
-        ali->operands[0] = src0;
-        ali->operands[1] = src1;
-        ali->operands[2] = Operand::c32(imm / granularity);
-        ali->definitions[0] = or_instr->definitions[0];
-        ali->pass_flags     = or_instr->pass_flags;
+   ctx.uses[or_instr->operands[0].tempId()]--;
+   ctx.uses[or_instr->operands[1].tempId()]--;
+   if (src0.isTemp())
+      ctx.uses[src0.tempId()]++;
+   if (src1.isTemp())
+      ctx.uses[src1.tempId()]++;
 
-        ctx.uses[or_instr->operands[0].tempId()]--;
-        ctx.uses[or_instr->operands[1].tempId()]--;
-
-        if (src0.isTemp()) ctx.uses[src0.tempId()]++;
-            if (src1.isTemp()) ctx.uses[src1.tempId()]++;
-
-            or_instr = std::move(ali);
-    ctx.info[or_instr->definitions[0].tempId()].parent_instr = or_instr.get();
-    return true;
+   or_instr = std::move(ali);
+   ctx.info[or_instr->definitions[0].tempId()].parent_instr = or_instr.get();
+   return true;
 }
 
 static inline bool
 combine_alignbit_b32(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 {
-    return combine_alignbit_like(ctx, instr, aco_opcode::v_alignbit_b32, 1);
+   return combine_alignbit_like(ctx, instr, aco_opcode::v_alignbit_b32, 1);
 }
 
 static inline bool
 combine_alignbyte_b32(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 {
-    return combine_alignbit_like(ctx, instr, aco_opcode::v_alignbyte_b32, 8);
+   return combine_alignbit_like(ctx, instr, aco_opcode::v_alignbyte_b32, 8);
 }
 
 static bool
 combine_bfi_b32(opt_ctx& ctx, aco_ptr<Instruction>& or_instr)
 {
-    if (or_instr->opcode != aco_opcode::v_or_b32 ||
-        ctx.program->gfx_level < GFX9)
-        return false;
+   /* V_BFI_B32 is GFX9+ and does not support input modifiers. */
+   if (or_instr->opcode != aco_opcode::v_or_b32 || or_instr->usesModifiers() || ctx.program->gfx_level < GFX9) {
+      return false;
+   }
 
-    /* ---- helper to match “src & literal” ----------------------------- */
-    auto match_and_side = [&](Operand in, Operand& src, uint32_t& lit) -> bool
-    {
-        if (!in.isTemp())
-            return false;
+   /* Helper to match the pattern “src & literal_mask” */
+   auto match_and_side = [&](Operand in, Operand& src, uint32_t& lit) -> bool
+   {
+      if (!in.isTemp()) {
+         return false;
+      }
 
-        Instruction* and_i = ctx.info[in.tempId()].parent_instr;
-        if (!and_i || and_i->opcode != aco_opcode::v_and_b32 ||
-            ctx.uses[in.tempId()] != 1)
-            return false;
+      Instruction* and_i = ctx.info[in.tempId()].parent_instr;
+      /* The AND instruction also must not have modifiers. */
+      if (!and_i || and_i->opcode != aco_opcode::v_and_b32 || ctx.uses[in.tempId()] != 1 || and_i->usesModifiers()) {
+         return false;
+      }
 
-        for (unsigned op = 0; op < 2; ++op) {
-            if (and_i->operands[op].isLiteral()) {
-                uint32_t imm = and_i->operands[op].constantValue();
-
-                /* must be VERD/inline constant so instruction can dual issue */
-                if (!Operand::is_constant_representable(imm, 4))
-                    return false;
-
-                lit = imm;
-                src = and_i->operands[1 ^ op];
-                return true;
+      for (unsigned op = 0; op < 2; ++op) {
+         if (and_i->operands[op].isConstant()) {
+            uint32_t imm = and_i->operands[op].constantValue();
+            /* The mask must be an inline constant for best performance. */
+            if (!Operand::is_constant_representable(imm, 4)) {
+               return false;
             }
-        }
-        return false;
-    };
+            lit = imm;
+            src = and_i->operands[1 ^ op];
+            return true;
+         }
+      }
+      return false;
+   };
 
-    /* ---- analyse both OR operands ------------------------------------ */
-    Operand   val0, val1;
-    uint32_t  mask0 = 0, mask1 = 0;
+   Operand val0, val1;
+   uint32_t mask0 = 0, mask1 = 0;
 
-    if (!match_and_side(or_instr->operands[0], val0, mask0) ||
-        !match_and_side(or_instr->operands[1], val1, mask1))
-        return false;
+   if (!match_and_side(or_instr->operands[0], val0, mask0) ||
+       !match_and_side(or_instr->operands[1], val1, mask1)) {
+      return false;
+   }
 
-    /* masks must form a perfect complement */
-    if ((mask0 ^ mask1) != 0xffffffffu || mask0 == 0 || mask0 == 0xffffffffu)
-        return false;
+   /* The masks must be perfect bitwise complements of each other. */
+   if ((mask0 | mask1) != 0xffffffffu || (mask0 & mask1) != 0) {
+      return false;
+   }
 
-    /* decide which side is mask / ~mask */
-    Operand  base, ins;
-    uint32_t mask;
-    if (mask1 == (~mask0)) {
-        ins  = val0;   base = val1;   mask = mask0;
-    } else { /* mask0 == ~mask1 */
-        ins  = val1;   base = val0;   mask = mask1;
-    }
+   /* The Vega ISA for V_BFI_B32 is: Dst = (Src1 & Src0) | (Src2 & ~Src0)
+    * This means Src0 is the mask, Src1 is the value to insert, and Src2 is the base.
+    * We need to match our pattern: (ins & mask) | (base & ~mask)
+    */
+   Operand base, ins;
+   uint32_t mask;
 
-    /* ---- build v_bfi_b32 --------------------------------------------- */
-    aco_ptr<Instruction> bfi{
-        create_instruction(aco_opcode::v_bfi_b32, Format::VOP3, 3, 1)};
+   if (mask1 == ~mask0) {
+      ins = val0;  /* val0 was ANDed with mask0 */
+      base = val1; /* val1 was ANDed with ~mask0 */
+      mask = mask0;
+   } else if (mask0 == ~mask1) {
+      ins = val1;  /* val1 was ANDed with mask1 */
+      base = val0; /* val0 was ANDed with ~mask1 */
+      mask = mask1;
+   } else {
+      return false; /* Should not be reached due to the check above */
+   }
 
-        bfi->operands[0]    = base;
-        bfi->operands[1]    = ins;
-        bfi->operands[2]    = Operand::c32(mask);    /* inline const */
-        bfi->definitions[0] = or_instr->definitions[0];
-        bfi->pass_flags     = or_instr->pass_flags;
+   aco_ptr<Instruction> bfi{create_instruction(aco_opcode::v_bfi_b32, Format::VOP3, 3, 1)};
+   bfi->operands[0] = Operand::c32(mask); /* Src0 <- mask */
+   bfi->operands[1] = ins;                /* Src1 <- insert value */
+   bfi->operands[2] = base;               /* Src2 <- base value */
+   bfi->definitions[0] = or_instr->definitions[0];
+   bfi->pass_flags = or_instr->pass_flags;
 
-        /* ---- SSA bookkeeping --------------------------------------------- */
-        ctx.uses[or_instr->operands[0].tempId()]--;   /* kill AND temps */
-        ctx.uses[or_instr->operands[1].tempId()]--;
+   /* Update SSA use-counts correctly */
+   ctx.uses[or_instr->operands[0].tempId()]--;
+   ctx.uses[or_instr->operands[1].tempId()]--;
+   if (base.isTemp()) {
+      ctx.uses[base.tempId()]++;
+   }
+   if (ins.isTemp()) {
+      ctx.uses[ins.tempId()]++;
+   }
 
-        if (base.isTemp()) ctx.uses[base.tempId()]++; /* new direct uses */
-            if (ins .isTemp()) ctx.uses[ins .tempId()]++;
-
-            or_instr = std::move(bfi);
-    ctx.info[or_instr->definitions[0].tempId()].parent_instr = or_instr.get();
-    return true;
+   or_instr = std::move(bfi);
+   ctx.info[or_instr->definitions[0].tempId()].parent_instr = or_instr.get();
+   return true;
 }
 
 static bool
 combine_bfe_b32(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 {
-    if (ctx.program->gfx_level < GFX8)
-        return false;
+   if (ctx.program->gfx_level < GFX8)
+      return false;
 
-    Operand src_val;
-    uint32_t offset = 0, width = 0;
-    bool is_signed = false;
+   Operand src_val;
+   uint32_t offset = 0, width = 0;
+   bool is_signed = false;
 
-    if (instr->opcode == aco_opcode::v_and_b32 && instr->operands[1].isLiteral()) {
-        uint32_t mask = instr->operands[1].constantValue();
-        /* Check if mask is contiguous low bits (e.g., 0x0000FFFF); branchless via popcount */
-        width = util_bitcount(mask);
-        if (!mask || (mask & (mask + 1u)) != 0u || width > 31) /* Vega max width 31 (enc 0-30) */
-            return false;
+   /* Pattern 1: (src >> offset) & mask */
+   if (instr->opcode == aco_opcode::v_and_b32 && instr->operands[1].isConstant()) {
+      uint32_t mask = instr->operands[1].constantValue();
+      width = util_bitcount(mask);
+      if (!mask || (mask & (mask + 1u)) != 0u || width > 31)
+         return false;
 
-        if (!instr->operands[0].isTemp() || ctx.uses[instr->operands[0].tempId()] != 1)
-            return false;
+      if (!instr->operands[0].isTemp() || ctx.uses[instr->operands[0].tempId()] != 1)
+         return false;
 
-        Instruction* sh = ctx.info[instr->operands[0].tempId()].parent_instr;
-        if (!sh || !(sh->opcode == aco_opcode::v_lshrrev_b32 || sh->opcode == aco_opcode::v_ashrrev_i32))
-            return false;
-        if (!sh->operands[0].isLiteral() || sh->operands[0].constantValue() >= 32)
-            return false;
+      Instruction* sh = ctx.info[instr->operands[0].tempId()].parent_instr;
+      if (!sh || !(sh->opcode == aco_opcode::v_lshrrev_b32 || sh->opcode == aco_opcode::v_ashrrev_i32))
+         return false;
+      if (!sh->operands[0].isConstant() || sh->operands[0].constantValue() >= 32)
+         return false;
 
-        offset = sh->operands[0].constantValue();
-        if (offset + width > 32)
-            return false;
+      offset = sh->operands[0].constantValue();
+      if (offset + width > 32)
+         return false;
 
-        is_signed = sh->opcode == aco_opcode::v_ashrrev_i32;
-        src_val = sh->operands[1];
-    }
+      is_signed = sh->opcode == aco_opcode::v_ashrrev_i32;
+      src_val = sh->operands[1];
+   }
+   /* Pattern 2: (src << c1) >> c2 */
+   else if ((instr->opcode == aco_opcode::v_lshrrev_b32 || instr->opcode == aco_opcode::v_ashrrev_i32) && instr->operands[0].isConstant()) {
+      uint32_t c2 = instr->operands[0].constantValue();
+      if (!instr->operands[1].isTemp() || ctx.uses[instr->operands[1].tempId()] != 1)
+         return false;
 
-    else if (instr->opcode == aco_opcode::v_lshrrev_b32 && instr->operands[0].isLiteral()) {
-        uint32_t c2 = instr->operands[0].constantValue();
-        if (!instr->operands[1].isTemp() || ctx.uses[instr->operands[1].tempId()] != 1)
-            return false;
+      Instruction* lshl = ctx.info[instr->operands[1].tempId()].parent_instr;
+      if (!lshl || lshl->opcode != aco_opcode::v_lshlrev_b32 || !lshl->operands[0].isConstant())
+         return false;
 
-        Instruction* lshl = ctx.info[instr->operands[1].tempId()].parent_instr;
-        if (!lshl || lshl->opcode != aco_opcode::v_lshlrev_b32 || !lshl->operands[0].isLiteral())
-            return false;
+      uint32_t c1 = lshl->operands[0].constantValue();
+      if (c1 >= 32 || c2 >= 32 || c2 < c1)
+         return false;
 
-        uint32_t c1 = lshl->operands[0].constantValue();
-        if (c1 >= 32 || c2 >= 32 || c2 < c1)
-            return false;
+      offset = c1;
+      width = 32 - c2;
+      if (width == 0)
+         return false;
+      is_signed = instr->opcode == aco_opcode::v_ashrrev_i32;
+      src_val = lshl->operands[1];
+   } else {
+      return false;
+   }
 
-        offset = c1;
-        width = 32 - c2;
-        if (width == 0)
-            return false;
-        is_signed = false;
-        src_val = lshl->operands[1];
-    } else {
-        return false;
-    }
+   aco_opcode bfe_op = is_signed ? aco_opcode::v_bfe_i32 : aco_opcode::v_bfe_u32;
 
-    aco_opcode bfe_op = is_signed ? aco_opcode::v_bfe_i32 : aco_opcode::v_bfe_u32;
+   unsigned enc_width = width - 1u;
 
-    /* Per Vega ISA, width encoded as (width - 1); 0 means width=1, 31 means 32 */
-    unsigned enc_width = width - 1u;
+   aco_ptr<Instruction> bfe{create_instruction(bfe_op, Format::VOP3, 3, 1)};
+   bfe->operands[0] = src_val;
+   bfe->operands[1] = Operand::c32(offset);
+   bfe->operands[2] = Operand::c32(enc_width);
+   bfe->definitions[0] = instr->definitions[0];
+   bfe->pass_flags = instr->pass_flags;
 
-    aco_ptr<Instruction> bfe{create_instruction(bfe_op, Format::VOP3, 3, 1)};
+   ctx.uses[instr->operands[0].tempId()]--;
+   if (src_val.isTemp())
+      ctx.uses[src_val.tempId()]++;
 
-    bfe->operands[0] = src_val;
-    bfe->operands[1] = Operand::c32(offset);
-    bfe->operands[2] = Operand::c32(enc_width);
-    bfe->definitions[0] = instr->definitions[0];
-    bfe->pass_flags = instr->pass_flags;
-
-    ctx.uses[instr->operands[0].tempId()]--;
-    if (src_val.isTemp())
-        ctx.uses[src_val.tempId()]++;
-
-    instr = std::move(bfe);
-    ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
-    return true;
+   instr = std::move(bfe);
+   ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
+   return true;
 }
 
 static bool
 combine_bcnt_mbcnt(opt_ctx& ctx, aco_ptr<Instruction>& add_instr)
 {
-    if (add_instr->opcode != aco_opcode::v_add_u32 || add_instr->usesModifiers() ||
-        ctx.program->gfx_level < GFX9)
-        return false;
+   if (add_instr->opcode != aco_opcode::v_add_u32 || add_instr->usesModifiers() ||
+       ctx.program->gfx_level < GFX9)
+      return false;
 
-    int bcnt_idx = -1;
-    Instruction* bcnt = nullptr;
+   int bcnt_idx = -1;
+   Instruction* bcnt = nullptr;
 
-    for (unsigned i = 0; i < 2; ++i) {
-        if (!add_instr->operands[i].isTemp())
-            continue;
-        unsigned tmp_id = add_instr->operands[i].tempId();
-        if (ctx.uses[tmp_id] != 1)
-            continue;
+   for (unsigned i = 0; i < 2; ++i) {
+      if (!add_instr->operands[i].isTemp())
+         continue;
+      unsigned tmp_id = add_instr->operands[i].tempId();
+      if (ctx.uses[tmp_id] != 1)
+         continue;
 
-        Instruction* cand = ctx.info[tmp_id].parent_instr;
-        if (!cand || cand->opcode != aco_opcode::v_bcnt_u32_b32)
-            continue;
+      Instruction* cand = ctx.info[tmp_id].parent_instr;
+      if (!cand || cand->opcode != aco_opcode::v_bcnt_u32_b32)
+         continue;
 
-        if (!cand->operands[1].isLiteral() || !cand->operands[1].constantEquals(0))
-            continue;
+      if (!cand->operands[1].isConstant() || !cand->operands[1].constantEquals(0))
+         continue;
 
-        if (is_exec_lo(cand->operands[0]) || is_exec_hi(cand->operands[0])) {
-            bcnt_idx = i;
-            bcnt = cand;
-            break;
-        }
-    }
+      if (cand->operands[0].isFixed() && (cand->operands[0].physReg() == exec || cand->operands[0].physReg() == exec_hi)) {
+         bcnt_idx = i;
+         bcnt = cand;
+         break;
+      }
+   }
 
-    if (!bcnt)
-        return false;
+   if (!bcnt)
+      return false;
 
-    bool lo_segment = is_exec_lo(bcnt->operands[0]);
-    aco_opcode mbcnt_op = lo_segment ? aco_opcode::v_mbcnt_lo_u32_b32 : aco_opcode::v_mbcnt_hi_u32_b32;
-    Operand carry_in = add_instr->operands[1u ^ bcnt_idx];
+   bool lo_segment = bcnt->operands[0].physReg() == exec;
+   aco_opcode mbcnt_op = lo_segment ? aco_opcode::v_mbcnt_lo_u32_b32 : aco_opcode::v_mbcnt_hi_u32_b32;
+   Operand carry_in = add_instr->operands[1u ^ bcnt_idx];
 
-    aco_ptr<Instruction> mbcnt{create_instruction(mbcnt_op, Format::VOP3, 2, 1)};
-    mbcnt->operands[0] = bcnt->operands[0];
-    mbcnt->operands[1] = carry_in;
-    mbcnt->definitions[0] = add_instr->definitions[0];
-    mbcnt->pass_flags = add_instr->pass_flags;
+   aco_ptr<Instruction> mbcnt{create_instruction(mbcnt_op, Format::VOP3, 2, 1)};
+   mbcnt->operands[0] = bcnt->operands[0];
+   mbcnt->operands[1] = carry_in;
+   mbcnt->definitions[0] = add_instr->definitions[0];
+   mbcnt->pass_flags = add_instr->pass_flags;
 
-    /* Update SSA use-counts */
-    ctx.uses[add_instr->operands[bcnt_idx].tempId()]--;
-    if (carry_in.isTemp())
-        ctx.uses[carry_in.tempId()]++;
+   ctx.uses[add_instr->operands[bcnt_idx].tempId()]--;
+   if (carry_in.isTemp())
+      ctx.uses[carry_in.tempId()]++;
 
-    add_instr = std::move(mbcnt);
-    ctx.info[add_instr->definitions[0].tempId()].parent_instr = add_instr.get();
-    return true;
+   add_instr = std::move(mbcnt);
+   ctx.info[add_instr->definitions[0].tempId()].parent_instr = add_instr.get();
+   return true;
 }
 
 static bool
 combine_sad_u8(opt_ctx& ctx, aco_ptr<Instruction>& add_instr)
 {
-    if (add_instr->opcode != aco_opcode::v_add_u32 ||
-        add_instr->usesModifiers() ||
-        ctx.program->gfx_level < GFX9)
-        return false;
+   if (add_instr->opcode != aco_opcode::v_add_u32 ||
+       add_instr->usesModifiers() ||
+       ctx.program->gfx_level < GFX9)
+      return false;
 
-    int          sad_idx = -1;
-    Instruction* sad     = nullptr;
+   int sad_idx = -1;
+   Instruction* sad = nullptr;
 
-    for (unsigned i = 0; i < 2; ++i) {
-        if (!add_instr->operands[i].isTemp())
-            continue;
+   for (unsigned i = 0; i < 2; ++i) {
+      if (!add_instr->operands[i].isTemp())
+         continue;
 
-        unsigned tmp_id = add_instr->operands[i].tempId();
-        if (ctx.uses[tmp_id] != 1)
-            continue;
+      unsigned tmp_id = add_instr->operands[i].tempId();
+      if (ctx.uses[tmp_id] != 1)
+         continue;
 
-        Instruction* cand = ctx.info[tmp_id].parent_instr;
-        if (!cand ||
-            !((cand->opcode == aco_opcode::v_sad_u8) ||
+      Instruction* cand = ctx.info[tmp_id].parent_instr;
+      if (!cand ||
+          !((cand->opcode == aco_opcode::v_sad_u8) ||
             (cand->opcode == aco_opcode::v_sad_hi_u8)))
-            continue;
+         continue;
 
-        if (!cand->operands[2].isLiteral() ||
-            !cand->operands[2].constantEquals(0))
-            continue;
+      if (!cand->operands[2].isConstant() ||
+          !cand->operands[2].constantEquals(0))
+         continue;
 
-        sad_idx = i;
-        sad = cand;
-        break;
+      sad_idx = i;
+      sad = cand;
+      break;
+   }
+
+   if (!sad)
+      return false;
+
+   aco_ptr<Instruction> fused{
+      create_instruction(sad->opcode, Format::VOP3, 3, 1)};
+
+   fused->operands[0] = sad->operands[0];
+   fused->operands[1] = sad->operands[1];
+   fused->operands[2] = add_instr->operands[1u ^ sad_idx];
+   fused->definitions[0] = add_instr->definitions[0];
+   fused->pass_flags = add_instr->pass_flags;
+
+   ctx.uses[add_instr->operands[sad_idx].tempId()]--;
+
+   add_instr = std::move(fused);
+   ctx.info[add_instr->definitions[0].tempId()].parent_instr = add_instr.get();
+   return true;
+}
+
+static bool
+apply_interp_extract(opt_ctx& ctx, aco_ptr<Instruction>& extract)
+{
+    // This is a high-value, Vega-specific (GFX9) optimization.
+    if (ctx.program->gfx_level != GFX9) {
+        return false;
     }
 
-    if (!sad)
+    // Pattern Match: p_extract(tmp, 1, 16, 0) where tmp is from v_interp_p2_f16.
+    if (extract->opcode != aco_opcode::p_extract || extract->operands.size() != 4 || !extract->operands[0].isTemp()) {
         return false;
+    }
 
-    aco_ptr<Instruction> fused{
-        create_instruction(sad->opcode, Format::VOP3, 3, 1)};
+    // To fuse, the interpolation result must only be used by this extract.
+    unsigned src_id = extract->operands[0].tempId();
+    if (ctx.uses[src_id] > 1) {
+        return false;
+    }
 
-    fused->operands[0] = sad->operands[0];
-    fused->operands[1] = sad->operands[1];
-    fused->operands[2] = add_instr->operands[1u ^ sad_idx];
-    fused->definitions[0] = add_instr->definitions[0];
-    fused->pass_flags     = add_instr->pass_flags;
+    Instruction* interp = ctx.info[src_id].parent_instr;
+    // This optimization is only for the standard v_interp_p2_f16.
+    if (!interp || interp->opcode != aco_opcode::v_interp_p2_f16) {
+        return false;
+    }
 
-    ctx.uses[add_instr->operands[sad_idx].tempId()]--;
+    if (!extract->operands[1].isConstant() || !extract->operands[2].isConstant() || !extract->operands[3].isConstant()) {
+        return false;
+    }
+    uint32_t extract_idx = extract->operands[1].constantValue();
+    uint32_t bits_extracted = extract->operands[2].constantValue();
+    uint32_t sign_ext_val = extract->operands[3].constantValue();
 
-    add_instr = std::move(fused);
-    ctx.info[add_instr->definitions[0].tempId()].parent_instr = add_instr.get();
+    // The extract must be for the high 16 bits (index 1), unsigned.
+    if (extract_idx != 1 || bits_extracted != 16 || sign_ext_val != 0) {
+        return false;
+    }
+
+    // ISA Safety Check: The VOP3A destination OPSEL bit is independent of input modifiers (ABS/NEG),
+    // but we must ensure it's not already set and that there are no output modifiers.
+    if (interp->valu().clamp || interp->valu().omod || interp->valu().opsel[3]) {
+        return false;
+    }
+
+    // --- The Transformation ---
+    // According to the Vega ISA (VOP3A, pg. 262), setting OPSEL[14] selects the
+    // high half for the 16-bit destination.
+    interp->valu().opsel[3] = true;
+
+    // The interp instruction now produces the result that the extract produced.
+    // Swap the definitions to maintain the SSA graph.
+    unsigned old_extract_def_id = extract->definitions[0].tempId();
+    std::swap(interp->definitions[0], extract->definitions[0]);
+    unsigned new_interp_def_id = interp->definitions[0].tempId();
+
+    // --- SSA Bookkeeping ---
+    /* The original extract-result (old_extract_def_id) is now generated by
+     * `interp`. Keep that pointer intact and leave the use-count unchanged. */
+    ctx.info[new_interp_def_id].parent_instr = interp;
+    ctx.info[new_interp_def_id].label = 0; /* scrub stale flags */
+    ctx.info[old_extract_def_id].parent_instr = interp;
+
+    /* The p_extract itself is now dead – remove it. */
+    extract.reset();
     return true;
 }
 
@@ -2737,7 +2860,8 @@ combine_minmax(opt_ctx& ctx, aco_ptr<Instruction>& instr, aco_opcode opposite, a
  * s_not_b64(s_or_b64(a, b)) -> s_nor_b64(a, b)
  * s_not_b64(s_xor_b64(a, b)) -> s_xnor_b64(a, b) */
 bool
-combine_salu_not_bitwise(opt_ctx& ctx, aco_ptr<Instruction>& instr) {
+combine_salu_not_bitwise(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+{
    /* checks */
    if (!instr->operands[0].isTemp())
       return false;
@@ -2755,20 +2879,6 @@ combine_salu_not_bitwise(opt_ctx& ctx, aco_ptr<Instruction>& instr) {
    case aco_opcode::s_or_b64:
    case aco_opcode::s_xor_b64: break;
    default: return false;
-   }
-
-   // GFX9-specific: Fuse chained uniform bitwise ops
-   if (ctx.program->gfx_level == GFX9 && ctx.info[instr->operands[0].tempId()].is_uniform_bitwise()) {
-      op2_instr->opcode = (op2_instr->opcode == aco_opcode::s_and_b32) ? aco_opcode::s_andn2_b32 : aco_opcode::s_orn2_b32;
-      std::swap(instr->definitions[0], op2_instr->definitions[0]);
-      std::swap(instr->definitions[1], op2_instr->definitions[1]);
-      ctx.uses[instr->operands[0].tempId()]--;
-      ctx.info[op2_instr->definitions[0].tempId()].label = 0;
-      ctx.info[op2_instr->definitions[0].tempId()].parent_instr = op2_instr;
-      ctx.info[op2_instr->definitions[1].tempId()].parent_instr = op2_instr;
-      ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
-      ctx.info[instr->definitions[1].tempId()].parent_instr = instr.get();
-      return true;
    }
 
    /* create instruction */
@@ -3500,7 +3610,7 @@ apply_load_extract(opt_ctx& ctx, aco_ptr<Instruction>& extract)
    else if (bits_loaded == 16 && load->isSMEM() && !is_s_buffer)
       load->opcode = sign_ext ? aco_opcode::s_load_sshort : aco_opcode::s_load_ushort;
    else
-      unreachable("Forgot to add opcode above.");
+      UNREACHABLE("Forgot to add opcode above.");
 
    if (dst_bitsize <= 16 && ctx.program->gfx_level >= GFX9) {
       switch (load->opcode) {
@@ -3669,235 +3779,191 @@ propagate_swizzles(VALU_instruction* instr, bool opsel_lo, bool opsel_hi)
    }
 }
 
-static void
-propagate_swizzles_vega(VALU_instruction* vop3p, bool opsel_lo, bool opsel_hi) noexcept
-{
-    if (!vop3p)
-        return;
-
-    constexpr unsigned N = 3;
-
-    /* Whole-word flip: both halves come from former "hi" ------------- */
-    if (opsel_lo && opsel_hi) {
-        for (unsigned s = 0; s < N; ++s) {
-            /* Use XOR swap for bitfields since they support it efficiently */
-            const bool d1 = vop3p->opsel_lo[s] ^ vop3p->opsel_hi[s];
-            vop3p->opsel_lo[s] ^= d1;
-            vop3p->opsel_hi[s] ^= d1;
-
-            const bool d2 = vop3p->neg_lo[s] ^ vop3p->neg_hi[s];
-            vop3p->neg_lo[s] ^= d2;
-            vop3p->neg_hi[s] ^= d2;
-        }
-        return;
-    }
-
-    /* Partial swizzle cases ------------------------------------------ */
-    const bool hi_to_lo = opsel_lo;   /* move hi → lo */
-    const bool lo_to_hi = !opsel_hi;  /* move lo → hi */
-
-    for (unsigned s = 0; s < N; ++s) {
-        const bool orig_opsel_lo = vop3p->opsel_lo[s];
-        const bool orig_opsel_hi = vop3p->opsel_hi[s];
-        const bool orig_neg_lo = vop3p->neg_lo[s];
-        const bool orig_neg_hi = vop3p->neg_hi[s];
-
-        /* Apply conditional assignments based on swizzle flags */
-        vop3p->opsel_lo[s] = hi_to_lo ? orig_opsel_hi : orig_opsel_lo;
-        vop3p->opsel_hi[s] = lo_to_hi ? orig_opsel_lo : orig_opsel_hi;
-
-        vop3p->neg_lo[s] = hi_to_lo ? orig_neg_hi : orig_neg_lo;
-        vop3p->neg_hi[s] = lo_to_hi ? orig_neg_lo : orig_neg_hi;
-    }
-}
 
 void
 combine_vop3p(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 {
-    if (!instr || !instr->isVOP3P()) [[unlikely]] {
-        return;
-    }
+   if (!instr || !instr->isVOP3P()) [[unlikely]] {
+      return;
+   }
 
-    /*
-     * === Pass 1: Clamp Propagation ===
-     * Folds `clamp(mul(X, 1.0))` into `clamp(X)`. The mul by 1.0 becomes a p_parallelcopy.
-     */
-    if (instr->opcode == aco_opcode::v_pk_mul_f16 && instr->valu().clamp &&
-        instr->operands.size() >= 2 && instr->operands[1].isConstant() &&
-        instr->operands[1].constantValue() == 0x3C003C00 /* packed {1.0, 1.0} */ &&
-        instr->operands[0].isTemp() && ctx.uses[instr->operands[0].tempId()] == 1) {
+   VALU_instruction* vop3p = &instr->valu();
 
-        Instruction* producer = ctx.info[instr->operands[0].tempId()].parent_instr;
-        if (producer && producer->isVOP3P() && !producer->valu().clamp &&
-            instr_info.alu_opcode_infos[(int)producer->opcode].output_modifiers) {
+   /*
+    * === Pass 1: Clamp Propagation ===
+    * Folds `clamp(mul(X, 1.0))` into `clamp(X)`. The mul by 1.0 becomes a p_parallelcopy.
+    */
+   if (instr->opcode == aco_opcode::v_pk_mul_f16 && instr->valu().clamp &&
+       instr->operands.size() >= 2 && instr->operands[1].isConstant() &&
+       instr->operands[1].constantValue() == 0x3C003C00 /* packed {1.0, 1.0} */ &&
+       instr->operands[0].isTemp() && ctx.uses[instr->operands[0].tempId()] == 1) {
 
-            producer->valu().clamp = true;
-            propagate_swizzles(&producer->valu(), instr->valu().opsel_lo[0], instr->valu().opsel_hi[0]);
+      Instruction* producer = follow_operand(ctx, instr->operands[0], true);
+      if (producer && producer->isVOP3P() && !producer->valu().clamp &&
+          instr_info.alu_opcode_infos[(int)producer->opcode].output_modifiers) {
 
-            aco_ptr<Instruction> pc{create_instruction(aco_opcode::p_parallelcopy, Format::PSEUDO, 1, 1)};
-            pc->operands[0] = Operand(producer->definitions[0].getTemp());
-            pc->definitions[0] = instr->definitions[0];
-            pc->pass_flags = instr->pass_flags;
+         producer->valu().clamp = true;
+         propagate_swizzles(&producer->valu(), instr->valu().opsel_lo[0], instr->valu().opsel_hi[0]);
 
-            ctx.info[instr->definitions[0].tempId()].parent_instr = pc.get();
-            ctx.info[instr->definitions[0].tempId()].set_temp(pc->operands[0].getTemp());
-            ctx.uses[producer->definitions[0].tempId()]++;
-            instr = std::move(pc);
-            return;
-        }
-    }
+         aco_ptr<Instruction> pc{create_instruction(aco_opcode::p_parallelcopy, Format::PSEUDO, 1, 1)};
+         pc->operands[0] = Operand(producer->definitions[0].getTemp());
+         pc->definitions[0] = instr->definitions[0];
+         pc->pass_flags = instr->pass_flags;
 
-    /*
-     * === Pass 2: FNEG Folding ===
-     * Folds a `v_pk_mul_f16(X, -1.0)` into the input modifiers of this instruction.
-     */
-    VALU_instruction* v = &instr->valu();
-    for (unsigned i = 0; i < instr->operands.size(); ++i) {
-        if (!can_use_input_modifiers(ctx.program->gfx_level, instr->opcode, i)) {
-            continue;
-        }
+         ctx.info[instr->definitions[0].tempId()].parent_instr = pc.get();
+         ctx.info[instr->definitions[0].tempId()].set_temp(pc->operands[0].getTemp());
+         ctx.uses[producer->definitions[0].tempId()]++;
+         instr = std::move(pc);
+         return;
+      }
+   }
 
-        Operand& op = instr->operands[i];
-        if (!op.isTemp() || ctx.uses[op.tempId()] != 1) {
-            continue;
-        }
+   /*
+    * === Pass 2: FNEG Folding ===
+    * Folds a `v_pk_mul_f16(X, -1.0)` into the input modifiers of this instruction.
+    */
+   VALU_instruction* v = &instr->valu();
+   for (unsigned i = 0; i < instr->operands.size(); ++i) {
+      if (!can_use_input_modifiers(ctx.program->gfx_level, instr->opcode, i)) {
+         continue;
+      }
 
-        Instruction* neg = ctx.info[op.tempId()].parent_instr;
-        if (!neg || neg->opcode != aco_opcode::v_pk_mul_f16 || neg->valu().clamp) {
-            continue;
-        }
+      Instruction* neg = follow_operand(ctx, instr->operands[i], true);
+      if (!neg || neg->opcode != aco_opcode::v_pk_mul_f16 || neg->valu().clamp) {
+         continue;
+      }
 
-        unsigned const_idx = neg->operands[0].constantEquals(0xBC00BC00) ? 0 : (neg->operands[1].constantEquals(0xBC00BC00) ? 1 : 2);
-        if (const_idx > 1) {
-            continue;
-        }
+      unsigned const_idx = neg->operands[0].constantEquals(0xBC00BC00) ? 0 : (neg->operands[1].constantEquals(0xBC00BC00) ? 1 : 2);
+      if (const_idx > 1) {
+         continue;
+      }
 
-        unsigned src_idx = 1 - const_idx;
-        VALU_instruction& nv = neg->valu();
+      unsigned src_idx = 1 - const_idx;
+      VALU_instruction& nv = neg->valu();
 
-        if (nv.opsel_lo[const_idx] || nv.opsel_hi[const_idx] || nv.neg_lo[const_idx] || nv.neg_hi[const_idx]) {
-            continue;
-        }
+      if (nv.opsel_lo[const_idx] || nv.opsel_hi[const_idx] || nv.neg_lo[const_idx] || nv.neg_hi[const_idx]) {
+         continue;
+      }
 
-        if (neg->operands[src_idx].isLiteral()) {
-            continue;
-        }
+      if (neg->operands[src_idx].isLiteral()) {
+         continue;
+      }
 
-        bool sel_lo = v->opsel_lo[i];
-        bool sel_hi = v->opsel_hi[i];
-        v->neg_lo[i] ^= sel_lo ? nv.neg_hi[src_idx] ^ 1 : nv.neg_lo[src_idx] ^ 1;
-        v->neg_hi[i] ^= sel_hi ? nv.neg_hi[src_idx] ^ 1 : nv.neg_lo[src_idx] ^ 1;
-        v->opsel_lo[i] = sel_lo ? nv.opsel_hi[src_idx] : nv.opsel_lo[src_idx];
-        v->opsel_hi[i] = sel_hi ? nv.opsel_hi[src_idx] : nv.opsel_lo[src_idx];
+      bool sel_lo = v->opsel_lo[i];
+      bool sel_hi = v->opsel_hi[i];
+      v->neg_lo[i] ^= sel_lo ? nv.neg_hi[src_idx] ^ 1 : nv.neg_lo[src_idx] ^ 1;
+      v->neg_hi[i] ^= sel_hi ? nv.neg_hi[src_idx] ^ 1 : nv.neg_lo[src_idx] ^ 1;
+      v->opsel_lo[i] = sel_lo ? nv.opsel_hi[src_idx] : nv.opsel_lo[src_idx];
+      v->opsel_hi[i] = sel_hi ? nv.opsel_hi[src_idx] : nv.opsel_lo[src_idx];
 
-        instr->operands[i] = copy_operand(ctx, neg->operands[src_idx]);
-        decrease_uses(ctx, neg);
-    }
+      instr->operands[i] = copy_operand(ctx, neg->operands[src_idx]);
+      decrease_uses(ctx, neg);
+   }
 
-    /*
-     * === Pass 3: FMA/MAD Formation ===
-     * Fuses `v_pk_add(v_pk_mul(A, B), C)` into `v_pk_fma(A, B, C)`.
-     */
-    const bool is_fadd = instr->opcode == aco_opcode::v_pk_add_f16;
-    const bool is_uadd = instr->opcode == aco_opcode::v_pk_add_u16;
-    if ((!is_fadd && !is_uadd) || (is_fadd && instr->definitions[0].isPrecise())) {
-        return;
-    }
+   /*
+    * === Pass 3: FMA/MAD Formation ===
+    * Fuses `v_pk_add(v_pk_mul(A, B), C)` into `v_pk_fma(A, B, C)`.
+    */
+   const bool is_fadd = instr->opcode == aco_opcode::v_pk_add_f16;
+   const bool is_uadd = instr->opcode == aco_opcode::v_pk_add_u16;
+   if ((!is_fadd && !is_uadd) || (is_fadd && instr->definitions[0].isPrecise())) {
+      return;
+   }
 
-    Instruction* mul_instr = nullptr;
-    unsigned add_op_idx = 0;
+   Instruction* mul_instr = nullptr;
+   unsigned add_op_idx = 0;
 
-    for (unsigned i = 0; i < 2; i++) {
-        if (!instr->operands[i].isTemp() || ctx.uses[instr->operands[i].tempId()] != 1) {
-            continue;
-        }
+   for (unsigned i = 0; i < 2; i++) {
+      if (!instr->operands[i].isTemp() || ctx.uses[instr->operands[i].tempId()] != 1) {
+         continue;
+      }
 
-        Instruction* candidate = ctx.info[instr->operands[i].tempId()].parent_instr;
-        if (!candidate || candidate->valu().clamp || (is_fadd && candidate->valu().omod)) {
-            continue;
-        }
+      Instruction* candidate = follow_operand(ctx, instr->operands[i], true);
+      if (!candidate || !candidate->isVOP3P() || candidate->valu().clamp || (is_fadd && candidate->valu().omod)) {
+         continue;
+      }
 
-        bool mul_ok = (is_fadd && candidate->opcode == aco_opcode::v_pk_mul_f16 && !candidate->definitions[0].isPrecise()) ||
-                      (is_uadd && candidate->opcode == aco_opcode::v_pk_mul_lo_u16);
-        if (!mul_ok) {
-            continue;
-        }
+      bool mul_ok = (is_fadd && candidate->opcode == aco_opcode::v_pk_mul_f16 && !candidate->definitions[0].isPrecise()) ||
+                    (is_uadd && candidate->opcode == aco_opcode::v_pk_mul_lo_u16);
+      if (!mul_ok) {
+         continue;
+      }
 
-        mul_instr = candidate;
-        add_op_idx = 1 - i;
-        break;
-    }
+      mul_instr = candidate;
+      add_op_idx = 1 - i;
+      break;
+   }
 
-    if (!mul_instr) {
-        return;
-    }
+   if (!mul_instr) {
+      return;
+   }
 
-    aco_opcode mad_op = is_fadd ? aco_opcode::v_pk_fma_f16 : aco_opcode::v_pk_mad_u16;
-    aco_ptr<Instruction> mad{create_instruction(mad_op, Format::VOP3P, 3, 1)};
-    mad->operands[0] = copy_operand(ctx, mul_instr->operands[0]);
-    mad->operands[1] = copy_operand(ctx, mul_instr->operands[1]);
-    mad->operands[2] = instr->operands[add_op_idx];
-    mad->definitions[0] = instr->definitions[0];
-    mad->pass_flags = instr->pass_flags;
-    mad->definitions[0].setPrecise(instr->definitions[0].isPrecise() || mul_instr->definitions[0].isPrecise());
+   aco_opcode mad_op = is_fadd ? aco_opcode::v_pk_fma_f16 : aco_opcode::v_pk_mad_u16;
+   aco_ptr<Instruction> mad{create_instruction(mad_op, Format::VOP3P, 3, 1)};
+   mad->operands[0] = copy_operand(ctx, mul_instr->operands[0]);
+   mad->operands[1] = copy_operand(ctx, mul_instr->operands[1]);
+   mad->operands[2] = instr->operands[add_op_idx];
+   mad->definitions[0] = instr->definitions[0];
+   mad->pass_flags = instr->pass_flags;
+   mad->definitions[0].setPrecise(instr->definitions[0].isPrecise() || mul_instr->definitions[0].isPrecise());
 
-    VALU_instruction& mad_v = mad->valu();
-    VALU_instruction& add_v = instr->valu();
-    VALU_instruction& mul_v = mul_instr->valu();
+   VALU_instruction& mad_v = mad->valu();
+   VALU_instruction& add_v = instr->valu();
+   VALU_instruction& mul_v = mul_instr->valu();
 
-    mad_v.clamp = add_v.clamp;
-    mad_v.neg_lo = mul_v.neg_lo; mad_v.neg_hi = mul_v.neg_hi;
-    mad_v.opsel_lo = mul_v.opsel_lo; mad_v.opsel_hi = mul_v.opsel_hi;
+   mad_v.clamp = add_v.clamp;
+   mad_v.neg_lo = mul_v.neg_lo; mad_v.neg_hi = mul_v.neg_hi;
+   mad_v.opsel_lo = mul_v.opsel_lo; mad_v.opsel_hi = mul_v.opsel_hi;
 
-    propagate_swizzles(&mad_v, add_v.opsel_lo[1 - add_op_idx], add_v.opsel_hi[1 - add_op_idx]);
+   propagate_swizzles(&mad_v, add_v.opsel_lo[1 - add_op_idx], add_v.opsel_hi[1 - add_op_idx]);
 
-    unsigned neg_prop_idx = mad->operands[0].isConstant() ? 1 : 0;
-    mad_v.neg_lo[neg_prop_idx] ^= add_v.neg_lo[1 - add_op_idx];
-    mad_v.neg_hi[neg_prop_idx] ^= add_v.neg_hi[1 - add_op_idx];
-    mad_v.opsel_lo[2] = add_v.opsel_lo[add_op_idx];
-    mad_v.opsel_hi[2] = add_v.opsel_hi[add_op_idx];
-    mad_v.neg_lo[2] = add_v.neg_lo[add_op_idx];
-    mad_v.neg_hi[2] = add_v.neg_hi[add_op_idx];
+   unsigned neg_prop_idx = mad->operands[0].isConstant() ? 1 : 0;
+   mad_v.neg_lo[neg_prop_idx] ^= add_v.neg_lo[1 - add_op_idx];
+   mad_v.neg_hi[neg_prop_idx] ^= add_v.neg_hi[1 - add_op_idx];
+   mad_v.opsel_lo[2] = add_v.opsel_lo[add_op_idx];
+   mad_v.opsel_hi[2] = add_v.opsel_hi[add_op_idx];
+   mad_v.neg_lo[2] = add_v.neg_lo[add_op_idx];
+   mad_v.neg_hi[2] = add_v.neg_hi[add_op_idx];
 
-    aco_ptr<Instruction> old_add = std::move(instr);
-    ctx.mad_infos.emplace_back(std::move(old_add), mul_instr->definitions[0].tempId());
-    instr = std::move(mad);
-    ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
-    ctx.info[instr->definitions[0].tempId()].set_mad(ctx.mad_infos.size() - 1);
-    decrease_uses(ctx, mul_instr);
+   aco_ptr<Instruction> old_add = std::move(instr);
+   ctx.mad_infos.emplace_back(std::move(old_add), mul_instr->definitions[0].tempId());
+   instr = std::move(mad);
+   ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
+   ctx.info[instr->definitions[0].tempId()].set_mad(ctx.mad_infos.size() - 1);
+   decrease_uses(ctx, mul_instr);
 
-    /*
-     * === Pass 4: FMA to DOT2 Fusion (Vega Performance Win) ===
-     * Fuses `v_pk_fma_f16(A, B, 0)` into `v_dot2_f32_f16(A, B, 0)`.
-     */
-    if (ctx.program->gfx_level == GFX9 && instr->opcode == aco_opcode::v_pk_fma_f16 &&
-        instr->operands[2].isConstant() && instr->operands[2].constantValue() == 0 &&
-        !instr->valu().neg_lo[2] && !instr->valu().neg_hi[2]) {
+   /*
+    * === Pass 4: FMA to DOT2 Fusion (Vega Performance Win) ===
+    * Fuses `v_pk_fma_f16(A, B, 0)` into `v_dot2_f32_f16(A, B, 0)`.
+    */
+   if (ctx.program->gfx_level == GFX9 && instr->opcode == aco_opcode::v_pk_fma_f16 &&
+       instr->operands[2].isConstant() && instr->operands[2].constantValue() == 0 &&
+       !instr->valu().neg_lo[2] && !instr->valu().neg_hi[2]) {
 
-        const bool can_fuse_dot2 = (instr->valu().opsel_lo[0] == instr->valu().opsel_hi[0]) &&
-                                   (instr->valu().opsel_lo[1] == instr->valu().opsel_hi[1]) &&
-                                   (instr->valu().neg_lo[0] == instr->valu().neg_hi[0]) &&
-                                   (instr->valu().neg_lo[1] == instr->valu().neg_hi[1]);
+      const bool can_fuse_dot2 = (instr->valu().opsel_lo[0] == instr->valu().opsel_hi[0]) &&
+                                 (instr->valu().opsel_lo[1] == instr->valu().opsel_hi[1]) &&
+                                 (instr->valu().neg_lo[0] == instr->valu().neg_hi[0]) &&
+                                 (instr->valu().neg_lo[1] == instr->valu().neg_hi[1]);
 
-        if (can_fuse_dot2) [[likely]] {
-            aco_ptr<Instruction> dot2{create_instruction(aco_opcode::v_dot2_f32_f16, Format::VOP3, 3, 1)};
-            dot2->operands[0] = instr->operands[0];
-            dot2->operands[1] = instr->operands[1];
-            dot2->operands[2] = Operand::c32(0u);
-            dot2->definitions[0] = instr->definitions[0];
-            dot2->pass_flags = instr->pass_flags;
+      if (can_fuse_dot2) [[likely]] {
+         aco_ptr<Instruction> dot2{create_instruction(aco_opcode::v_dot2_f32_f16, Format::VOP3, 3, 1)};
+         dot2->operands[0] = instr->operands[0];
+         dot2->operands[1] = instr->operands[1];
+         dot2->operands[2] = Operand::c32(0u);
+         dot2->definitions[0] = instr->definitions[0];
+         dot2->pass_flags = instr->pass_flags;
 
-            VALU_instruction& dot2_v = dot2->valu();
-            dot2_v.opsel[0] = instr->valu().opsel_lo[0];
-            dot2_v.opsel[1] = instr->valu().opsel_lo[1];
-            dot2_v.neg[0] = instr->valu().neg_lo[0];
-            dot2_v.neg[1] = instr->valu().neg_lo[1];
-            dot2_v.clamp = instr->valu().clamp;
+         VALU_instruction& dot2_v = dot2->valu();
+         dot2_v.opsel[0] = instr->valu().opsel_lo[0];
+         dot2_v.opsel[1] = instr->valu().opsel_lo[1];
+         dot2_v.neg[0] = instr->valu().neg_lo[0];
+         dot2_v.neg[1] = instr->valu().neg_lo[1];
+         dot2_v.clamp = instr->valu().clamp;
 
-            instr = std::move(dot2);
-            ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
-        }
-    }
+         instr = std::move(dot2);
+         ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
+      }
+   }
 }
 
 bool
@@ -4058,18 +4124,6 @@ combine_mad_mix(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          instr->valu().abs[i] = abs;
       }
    }
-
-   // GFX9-specific: Prioritize packed fp16 VOPP if all inputs fp16
-   if (ctx.program->gfx_level == GFX9 && instr->opcode == aco_opcode::v_fma_mixlo_f16) {
-      bool all_fp16 = true;
-      for (const Operand& op : instr->operands) {
-         if (op.bytes() != 2) all_fp16 = false;
-      }
-      if (all_fp16) {
-         instr->opcode = aco_opcode::v_pk_fma_f16;
-         instr->format = Format::VOP3P;
-      }
-   }
 }
 
 // TODO: we could possibly move the whole label_instruction pass to combine_instruction:
@@ -4117,89 +4171,10 @@ is_mul(Instruction* instr)
    }
 }
 
-static inline bool
-is_valid_constant(const Operand& op, uint32_t expected_bits, uint32_t* value) {
-    if (!op.isConstant() && !op.isLiteral()) {
-        return false;
-    }
-    // Safely get value, handling bit size to prevent overflow.
-    uint64_t full_val = op.constantValue64();
-    if (full_val > (static_cast<uint64_t>(1) << expected_bits) - 1) {
-        return false; // Overflow check
-    }
-    *value = static_cast<uint32_t>(full_val);
-    return true;
-}
-
-static inline bool
-apply_interp_extract(opt_ctx& ctx, aco_ptr<Instruction>& extract)
-{
-    // This is a high-value, Vega-specific (GFX9) optimization.
-    if (ctx.program->gfx_level != GFX9) [[unlikely]] {
-        return false;
-    }
-
-    // Pattern Match: p_extract(tmp, 1, 16, 0) where tmp is from v_interp_p2_f16.
-    if (extract->operands.size() != 4 || !extract->operands[0].isTemp()) {
-        return false;
-    }
-
-    // To fuse, the interpolation result must only be used by this extract.
-    unsigned src_id = extract->operands[0].tempId();
-    if (ctx.uses[src_id] > 1) {
-        return false;
-    }
-
-    Instruction* interp = ctx.info[src_id].parent_instr;
-    // This optimization is only for the standard v_interp_p2_f16.
-    if (!interp || interp->opcode != aco_opcode::v_interp_p2_f16) {
-        return false;
-    }
-
-    // CORRECTED: Use the proper two-step check for constant operands.
-    if (!extract->operands[1].isConstant() || !extract->operands[2].isConstant() || !extract->operands[3].isConstant()) {
-        return false;
-    }
-    uint32_t extract_idx = extract->operands[1].constantValue();
-    uint32_t bits_extracted = extract->operands[2].constantValue();
-    uint32_t sign_ext_val = extract->operands[3].constantValue();
-
-    // The extract must be for the high 16 bits (index 1), unsigned.
-    if (extract_idx != 1 || bits_extracted != 16 || sign_ext_val != 0) {
-        return false;
-    }
-
-    // ISA Safety Check: The VOP3A destination OPSEL bit is independent of input modifiers (ABS/NEG),
-    // but we must ensure it's not already set and that there are no output modifiers.
-    if (interp->valu().clamp || interp->valu().omod || interp->valu().opsel[3]) {
-        return false;
-    }
-
-    // --- The Transformation ---
-    // According to the Vega ISA (VOP3A, pg. 262), setting OPSEL[14] selects the
-    // high half for the 16-bit destination.
-    interp->valu().opsel[3] = true;
-
-    // The interp instruction now produces the result that the extract produced.
-    // Swap the definitions to maintain the SSA graph.
-    unsigned old_extract_def_id = extract->definitions[0].tempId();
-    std::swap(interp->definitions[0], extract->definitions[0]);
-    unsigned new_interp_def_id = interp->definitions[0].tempId();
-
-    // --- SSA Bookkeeping ---
-    ctx.uses[old_extract_def_id] = 0;
-    ctx.info[new_interp_def_id].parent_instr = interp;
-    ctx.info[new_interp_def_id].label = 0;
-    ctx.info[old_extract_def_id].parent_instr = extract.get();
-
-    extract.reset();
-    return true;
-}
-
 void
 combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 {
-   if (instr->definitions.empty() || is_dead(ctx.uses, instr.get()))
+   if (!instr || instr->definitions.empty() || is_dead(ctx.uses, instr.get()))
       return;
 
    if (instr->isVALU() || instr->isSALU()) {
@@ -4263,16 +4238,6 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
           apply_load_extract(ctx, instr);
       }
    }
-
-   /* TODO: There are still some peephole optimizations that could be done:
-    * - abs(a - b) -> s_absdiff_i32
-    * - various patterns for s_bitcmp{0,1}_b32 and s_bitset{0,1}_b32
-    * - patterns for v_alignbit_b32 and v_alignbyte_b32
-    * These aren't probably too interesting though.
-    * There are also patterns for v_cmp_class_f{16,32,64}. This is difficult but
-    * probably more useful than the previously mentioned optimizations.
-    * The various comparison optimizations also currently only work with 32-bit
-    * floats. */
 
    /* neg(mul(a, b)) -> mul(neg(a), b), abs(mul(a, b)) -> mul(abs(a), abs(b)) */
    if ((ctx.info[instr->definitions[0].tempId()].label & (label_neg | label_abs)) &&
@@ -4547,17 +4512,17 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
             return;
          }
       }
-    } else if (instr->opcode == aco_opcode::v_or_b32 && ctx.program->gfx_level >= GFX9) {
-      if (combine_three_valu_op(ctx, instr, aco_opcode::s_or_b32, aco_opcode::v_or3_b32, "012", 1 | 2)) {
+   } else if (instr->opcode == aco_opcode::v_or_b32 && ctx.program->gfx_level >= GFX9) {
+      if (combine_three_valu_op(ctx, instr, aco_opcode::s_or_b32, aco_opcode::v_or3_b32, "012",
+                                1 | 2)) {
       } else if (combine_three_valu_op(ctx, instr, aco_opcode::v_or_b32, aco_opcode::v_or3_b32,
-                        "012", 1 | 2)) {
+                                       "012", 1 | 2)) {
       } else if (combine_add_or_then_and_lshl(ctx, instr)) {
       } else if (combine_v_andor_not(ctx, instr)) {
       } else if (combine_alignbit_b32(ctx, instr)) {
       } else if (combine_alignbyte_b32(ctx, instr)) {
       } else if (combine_bfi_b32(ctx, instr)) {
-      } else if (combine_bfe_b32(ctx, instr)) {
-    }
+      }
    } else if (instr->opcode == aco_opcode::v_xor_b32 && ctx.program->gfx_level >= GFX10) {
       if (combine_three_valu_op(ctx, instr, aco_opcode::v_xor_b32, aco_opcode::v_xor3_b32, "012",
                                 1 | 2)) {
@@ -4596,8 +4561,9 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          } else if (combine_add_or_then_and_lshl(ctx, instr)) {
          }
       }
-      if (!combine_bcnt_mbcnt(ctx, instr))
+      if (!combine_bcnt_mbcnt(ctx, instr)) {
           combine_sad_u8(ctx, instr);
+      }
    } else if ((instr->opcode == aco_opcode::v_add_co_u32 ||
                instr->opcode == aco_opcode::v_add_co_u32_e64) &&
               !instr->usesModifiers()) {
@@ -4635,9 +4601,9 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       combine_salu_n2(ctx, instr);
    } else if (instr->opcode == aco_opcode::s_abs_i32) {
       combine_sabsdiff(ctx, instr);
-   } else if (instr->opcode == aco_opcode::v_and_b32) {
-      combine_v_andor_not(ctx, instr);
+   } else if (instr->opcode == aco_opcode::v_and_b32 || instr->opcode == aco_opcode::v_lshrrev_b32 || instr->opcode == aco_opcode::v_ashrrev_i32) {
       if (!combine_bfe_b32(ctx, instr)) {
+         combine_v_andor_not(ctx, instr);
       }
    } else if (instr->opcode == aco_opcode::v_fma_f32 || instr->opcode == aco_opcode::v_fma_f16) {
       /* set existing v_fma_f32 with label_mad so we can create v_fmamk_f32/v_fmaak_f32.
@@ -4731,7 +4697,8 @@ remat_constants_instr(opt_ctx& ctx, aco::map<Temp, remat_entry>& constants, Inst
  * again by re-emitting constants in every basic block.
  */
 void
-rematerialize_constants(opt_ctx& ctx) {
+rematerialize_constants(opt_ctx& ctx)
+{
    aco::monotonic_buffer_resource memory(1024);
    aco::map<Temp, remat_entry> constants(memory);
 
@@ -4743,8 +4710,11 @@ rematerialize_constants(opt_ctx& ctx) {
       }
    }
 
-   constexpr bool is_gfx9 = true;
+   /* For Vega, be more aggressive with rematerialization when VGPR pressure is high,
+    * as this can free up SGPRs and potentially avoid spilling them to VGPRs.
+    */
    constexpr unsigned vgpr_threshold = 64;
+
    for (Block& block : ctx.program->blocks) {
       if (block.logical_idom == -1)
          continue;
@@ -4754,20 +4724,29 @@ rematerialize_constants(opt_ctx& ctx) {
 
       ctx.instructions.reserve(block.instructions.size());
 
-      // GFX9-specific: Dynamic threshold based on VGPR demand
       unsigned dynamic_threshold = (ctx.program->gfx_level == GFX9 && ctx.program->max_reg_demand.vgpr > vgpr_threshold) ? 2 : 1;
       bool remat_enabled = (ctx.program->max_reg_demand.vgpr < vgpr_threshold) || (constants.size() > dynamic_threshold);
 
       for (aco_ptr<Instruction>& instr : block.instructions) {
          if (!instr)
             continue;
-         if (remat_enabled) {
+         if (remat_enabled && !is_phi(instr)) {
             remat_constants_instr(ctx, constants, instr.get(), block.index);
          }
+
          ctx.instructions.emplace_back(instr.release());
       }
 
       block.instructions = std::move(ctx.instructions);
+   }
+}
+
+static inline void
+safe_dec_use(opt_ctx& ctx, const Operand& op)
+{
+   if (op.isTemp()) {
+      assert(op.tempId() < ctx.uses.size());
+      ctx.uses[op.tempId()]--;
    }
 }
 
@@ -4789,13 +4768,31 @@ to_uniform_bool_instr(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    case aco_opcode::s_or_b64: instr->opcode = aco_opcode::s_or_b32; break;
    case aco_opcode::s_xor_b32:
    case aco_opcode::s_xor_b64: instr->opcode = aco_opcode::s_absdiff_i32; break;
+   case aco_opcode::s_not_b32:
+   case aco_opcode::s_not_b64: {
+      aco_ptr<Instruction> new_instr{
+         create_instruction(aco_opcode::s_absdiff_i32, Format::SOP2, 2, 2)};
+      new_instr->operands[0] = instr->operands[0];
+      new_instr->operands[1] = Operand::c32(1);
+      new_instr->definitions[0] = instr->definitions[0];
+      new_instr->definitions[1] = instr->definitions[1];
+      new_instr->pass_flags = instr->pass_flags;
+      instr = std::move(new_instr);
+      ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
+      ctx.info[instr->definitions[1].tempId()].parent_instr = instr.get();
+      break;
+   }
    default:
       /* Don't transform other instructions. They are very unlikely to appear here. */
       return false;
    }
 
    for (Operand& op : instr->operands) {
-      ctx.uses[op.tempId()]--;
+      /* This check is now redundant due to the loop above, but kept for safety. */
+      if (!op.isTemp())
+         continue;
+
+      safe_dec_use(ctx, op);
 
       if (ctx.info[op.tempId()].is_uniform_bool()) {
          /* Just use the uniform boolean temp. */
@@ -4812,7 +4809,7 @@ to_uniform_bool_instr(opt_ctx& ctx, aco_ptr<Instruction>& instr)
                 pred_instr->definitions[1].physReg() == scc);
          op.setTemp(pred_instr->definitions[1].getTemp());
       } else {
-         unreachable("Invalid operand on uniform bitwise instruction.");
+         UNREACHABLE("Invalid operand on uniform bitwise instruction.");
       }
 
       ctx.uses[op.tempId()]++;
@@ -5264,7 +5261,7 @@ sopc_is_signed(aco_opcode opcode)
       SOPC(ge)
       SOPC(lt)
       SOPC(le)
-   default: unreachable("Not a valid SOPC instruction.");
+   default: UNREACHABLE("Not a valid SOPC instruction.");
    }
 #undef SOPC
 }
@@ -5531,6 +5528,29 @@ validate_opt_ctx(opt_ctx& ctx)
    }
 }
 
+void rename_loop_header_phis(opt_ctx& ctx) {
+   for (Block& block : ctx.program->blocks) {
+      if (!(block.kind & block_kind_loop_header))
+         continue;
+
+      for (auto& instr : block.instructions) {
+         if (!is_phi(instr))
+            break;
+
+         for (unsigned i = 0; i < instr->operands.size(); i++) {
+            if (!instr->operands[i].isTemp())
+               continue;
+
+            ssa_info info = ctx.info[instr->operands[i].tempId()];
+            while (info.is_temp()) {
+               pseudo_propagate_temp(ctx, instr, info.temp, i);
+               info = ctx.info[info.temp.id()];
+            }
+         }
+      }
+   }
+}
+
 } /* end namespace */
 
 void
@@ -5546,6 +5566,10 @@ optimize(Program* program)
       for (aco_ptr<Instruction>& instr : block.instructions)
          label_instruction(ctx, instr);
    }
+
+   validate_opt_ctx(ctx);
+
+   rename_loop_header_phis(ctx);
 
    validate_opt_ctx(ctx);
 

@@ -429,6 +429,11 @@ insn("p_bpermute_shared_vgpr")
 # operands: linear VGPR, index * 4, input data, same half (bool)
 insn("p_bpermute_permlane")
 
+# simulates v_permlane64_b32 behavior using shared vgprs (for GFX10/10.3)
+# definitions result VGPR
+# operands: input data
+insn("p_permlane64_shared_vgpr")
+
 # creates a lane mask where only the first active lane is selected
 insn("p_elect")
 
@@ -989,6 +994,7 @@ VOP2 = {
    ("v_fmac_f16",          dst(F16),      src(F16, F16, F16), op(gfx10=0x36)),
    ("v_fmamk_f16",         dst(noMods(F16)), noMods(src(F16, F16, IMM)), op(gfx10=0x37)),
    ("v_fmaak_f16",         dst(noMods(F16)), noMods(src(F16, F16, IMM)), op(gfx10=0x38)),
+   ("v_pk_fmac_f16",       dst(noMods(PkF16)), noMods(src(PkF16, PkF16, PkF16)), op(gfx10=0x3c), InstrClass.ValuFma),
    ("v_dot2c_f32_f16",     dst(noMods(F32)), noMods(src(PkF16, PkF16, F32)), op(gfx9=0x37, gfx10=0x02, gfx12=-1)), #v_dot2acc_f32_f16 in GFX11
    ("v_add_f64",           dst(F64),      src(F64, F64), op(gfx12=0x02), InstrClass.ValuDoubleAdd),
    ("v_mul_f64",           dst(F64),      src(F64, F64), op(gfx12=0x06), InstrClass.ValuDoubleAdd),
@@ -1201,7 +1207,6 @@ VOPP = {
    ("v_pk_max_u16",     dst(PkU16), src(PkU16, PkU16), op(gfx9=0x0c)),
    ("v_pk_min_u16",     dst(PkU16), src(PkU16, PkU16), op(gfx9=0x0d)),
    ("v_pk_fma_f16",     dst(PkF16), src(PkF16, PkF16, PkF16), op(gfx9=0x0e)),
-   ("v_pk_fmac_f16",    dst(PkF16), src(PkF16, PkF16, PkF16), op(gfx9=0x1ea, gfx10=0x3c), InstrClass.ValuFma),
    ("v_pk_add_f16",     dst(PkF16), src(PkF16, PkF16), op(gfx9=0x0f)),
    ("v_pk_mul_f16",     dst(PkF16), src(PkF16, PkF16), op(gfx9=0x10)),
    ("v_pk_min_f16",     dst(PkF16), src(PkF16, PkF16), op(gfx9=0x11, gfx12=0x1b)), # called v_pk_min_num_f16 in GFX12
