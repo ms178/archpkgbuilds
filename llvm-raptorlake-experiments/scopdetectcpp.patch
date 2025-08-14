@@ -1,0 +1,467 @@
+--- ScopDetection.cpp.orig	2025-07-27 20:25:04.400923963 +0200
++++ ScopDetection.cpp	2025-07-27 22:12:01.822093655 +0200
+@@ -104,6 +104,34 @@ static cl::opt<int> ProfitabilityMinPerL
+              "region is considered profitable"),
+     cl::Hidden, cl::ValueRequired, cl::init(100000000), cl::cat(PollyCategory));
+ 
++// PERFECTED CODE INTEGRATION: Add new cl::opt definitions for perfected heuristics.
++// These are unsigned to match the semantics of the values they are compared
++// against, preventing signedness warnings and ensuring correctness.
++
++static cl::opt<unsigned> PollyScopsMaxBlocks(
++    "polly-scops-max-blocks",
++    cl::desc("The maximum number of basic blocks in a function to be "
++             "considered for Scop detection by Polly"),
++    cl::Hidden, cl::init(20000), cl::cat(PollyCategory));
++
++static cl::opt<unsigned> PollyMaxSubRegions(
++    "polly-max-subregions",
++    cl::desc("The maximum number of sub-regions in a region to be "
++             "considered for Scop detection by Polly"),
++    cl::Hidden, cl::init(512), cl::cat(PollyCategory));
++
++static cl::opt<unsigned> PollyMinMemops(
++    "polly-min-memops",
++    cl::desc("The minimal number of memory operations in a single-loop Scop "
++             "to be considered profitable"),
++    cl::Hidden, cl::ValueRequired, cl::init(8), cl::cat(PollyCategory));
++
++static cl::opt<unsigned> PollyMaxSwitchCases(
++    "polly-max-switch-cases",
++    cl::desc("The maximal number of cases in a switch statement to be "
++             "considered for Scop detection by Polly"),
++    cl::Hidden, cl::init(32), cl::cat(PollyCategory));
++
+ bool polly::PollyProcessUnprofitable;
+ 
+ static cl::opt<bool, true> XPollyProcessUnprofitable(
+@@ -348,8 +376,6 @@ void ScopDetection::detect(Function &F)
+   if (!PollyProcessUnprofitable && LI.empty())
+     return;
+ 
+-  Region *TopRegion = RI.getTopLevelRegion();
+-
+   if (!OnlyFunctions.empty() &&
+       !doesStringMatchAnyRegex(F.getName(), OnlyFunctions))
+     return;
+@@ -360,6 +386,7 @@ void ScopDetection::detect(Function &F)
+   if (!isValidFunction(F))
+     return;
+ 
++  Region *TopRegion = RI.getTopLevelRegion();
+   findScops(*TopRegion);
+ 
+   NumScopRegions += ValidRegions.size();
+@@ -1301,61 +1328,62 @@ bool ScopDetection::canUseISLTripCount(L
+   return true;
+ }
+ 
++// PERFECTED CODE INTEGRATION: Replace isValidLoop with the perfected version.
+ bool ScopDetection::isValidLoop(Loop *L, DetectionContext &Context) {
+-  // Loops that contain part but not all of the blocks of a region cannot be
+-  // handled by the schedule generation. Such loop constructs can happen
+-  // because a region can contain BBs that have no path to the exit block
+-  // (Infinite loops, UnreachableInst), but such blocks are never part of a
+-  // loop.
+-  //
+-  // _______________
+-  // | Loop Header | <-----------.
+-  // ---------------             |
+-  //        |                    |
+-  // _______________       ______________
+-  // | RegionEntry |-----> | RegionExit |----->
+-  // ---------------       --------------
+-  //        |
+-  // _______________
+-  // | EndlessLoop | <--.
+-  // ---------------    |
+-  //       |            |
+-  //       \------------/
+-  //
+-  // In the example above, the loop (LoopHeader,RegionEntry,RegionExit) is
+-  // neither entirely contained in the region RegionEntry->RegionExit
+-  // (containing RegionEntry,EndlessLoop) nor is the region entirely contained
+-  // in the loop.
+-  // The block EndlessLoop is contained in the region because Region::contains
+-  // tests whether it is not dominated by RegionExit. This is probably to not
+-  // having to query the PostdominatorTree. Instead of an endless loop, a dead
+-  // end can also be formed by an UnreachableInst. This case is already caught
+-  // by isErrorBlock(). We hence only have to reject endless loops here.
+-  if (!hasExitingBlocks(L))
++  // Loops must have at least one reachable exit to be analyzable.
++  if (!hasExitingBlocks(L)) {
+     return invalid<ReportLoopHasNoExit>(Context, /*Assert=*/true, L);
++  }
+ 
+-  // The algorithm for domain construction assumes that loops has only a single
+-  // exit block (and hence corresponds to a subregion). Note that we cannot use
+-  // L->getExitBlock() because it does not check whether all exiting edges point
+-  // to the same BB.
++  // Perfected Initiative 3: Speculative Analysis of Loops with Error-Path Exits.
++  // The polyhedral model requires a single "hot-path" exit to define loop
++  // bounds cleanly. However, production code (especially in drivers) is full of
++  // loops with a main hot-path exit and several cold-path error-checking exits.
++  // We relax the single-exit constraint by speculatively ignoring any exit that
++  // leads to a well-defined "error block".
+   SmallVector<BasicBlock *, 4> ExitBlocks;
+   L->getExitBlocks(ExitBlocks);
+-  BasicBlock *TheExitBlock = ExitBlocks[0];
++  BasicBlock *TheHotPathExitBlock = nullptr;
++
+   for (BasicBlock *ExitBB : ExitBlocks) {
+-    if (TheExitBlock != ExitBB)
+-      return invalid<ReportLoopHasMultipleExits>(Context, /*Assert=*/true, L);
++    // An error block is considered a cold path and is ignored for the purpose
++    // of defining the loop's primary control flow.
++    if (isErrorBlock(*ExitBB, Context.CurRegion)) {
++      continue;
++    }
++
++    // If we have already found one hot-path exit, finding another means this
++    // loop has ambiguous control flow on its hot path and cannot be modeled.
++    if (TheHotPathExitBlock) {
++      if (TheHotPathExitBlock != ExitBB) {
++        return invalid<ReportLoopHasMultipleExits>(Context, /*Assert=*/true, L);
++      }
++    } else {
++      TheHotPathExitBlock = ExitBB;
++    }
++  }
++
++  // If we found no hot-path exits, the loop's only exits lead to
++  // error conditions. On the hot path, it is effectively an infinite loop, which
++  // we cannot model.
++  if (!TheHotPathExitBlock) {
++    return invalid<ReportLoopHasMultipleExits>(Context, /*Assert=*/true, L);
+   }
+ 
+-  if (canUseISLTripCount(L, Context))
++  // With a single, well-defined hot-path exit, we can now proceed with the
++  // standard affine analysis of the loop's trip count.
++  if (canUseISLTripCount(L, Context)) {
+     return true;
++  }
+ 
+   if (AllowNonAffineSubLoops && AllowNonAffineSubRegions) {
+     Region *R = RI.getRegionFor(L->getHeader());
+-    while (R != &Context.CurRegion && !R->contains(L))
++    while (R != &Context.CurRegion && !R->contains(L)) {
+       R = R->getParent();
+-
+-    if (addOverApproximatedRegion(R, Context))
++    }
++    if (addOverApproximatedRegion(R, Context)) {
+       return true;
++    }
+   }
+ 
+   const SCEV *LoopCount = SE.getBackedgeTakenCount(L);
+@@ -1571,10 +1599,11 @@ void ScopDetection::findScops(Region &R)
+   DetectionContext &Context = *Entry;
+ 
+   bool DidBailout = true;
+-  if (!PollyProcessUnprofitable && regionWithoutLoops(R, LI))
++  if (!PollyProcessUnprofitable && regionWithoutLoops(R, LI)) {
+     invalid<ReportUnprofitable>(Context, /*Assert=*/true, &R);
+-  else
++  } else {
+     DidBailout = !isValidRegion(Context);
++  }
+ 
+   (void)DidBailout;
+   if (KeepGoing) {
+@@ -1586,42 +1615,59 @@ void ScopDetection::findScops(Region &R)
+            "isValidRegion must short-circuit iff the ScoP is invalid");
+   }
+ 
+-  if (Context.IsInvalid) {
+-    removeCachedResults(R);
+-  } else {
++  // If the current region is a valid Scop, we mark it and do not need to
++  // check its sub-regions. We will try to expand it later.
++  if (!Context.IsInvalid) {
+     ValidRegions.insert(&R);
+     return;
+   }
+ 
+-  for (auto &SubRegion : R)
++  removeCachedResults(R);
++
++  // If the region is invalid, we now check its sub-regions.
++  // This is the location of the potential recursive explosion.
++
++  std::vector<Region *> RegionsToExpand;
++  unsigned SubRegionCounter = 0;
++
++  for (auto &SubRegion : R) {
++    // 1. Count: Check if we have exceeded the sub-region limit.
++    if (++SubRegionCounter > PollyMaxSubRegions) {
++      POLLY_DEBUG(dbgs() << "Polly: Region '" << R.getNameStr()
++                        << "' has too many sub-regions (>" << PollyMaxSubRegions
++                        << "). Skipping recursion to prevent stack overflow.\n");
++      // If the limit is exceeded, we must not continue. We cannot recurse
++      // further, and we cannot try to expand, as we haven't processed all
++      // sub-regions. Bail out of all processing for this region.
++      return;
++    }
++
++    // 2. Recurse: If the limit is not hit, perform the recursive analysis.
+     findScops(*SubRegion);
+ 
+-  // Try to expand regions.
+-  //
+-  // As the region tree normally only contains canonical regions, non canonical
+-  // regions that form a Scop are not found. Therefore, those non canonical
+-  // regions are checked by expanding the canonical ones.
+-
+-  std::vector<Region *> ToExpand;
+-
+-  for (auto &SubRegion : R)
+-    ToExpand.push_back(SubRegion.get());
+-
+-  for (Region *CurrentRegion : ToExpand) {
+-    // Skip invalid regions. Regions may become invalid, if they are element of
+-    // an already expanded region.
+-    if (!ValidRegions.count(CurrentRegion))
++    // 3. Collect: Add the sub-region to the list for a potential expansion
++    //    attempt later. This avoids a second or third loop over the children.
++    RegionsToExpand.push_back(SubRegion.get());
++  }
++
++  // After successfully analyzing all sub-regions (without hitting the limit),
++  // we can now try to expand any valid Scops we found within them.
++  for (Region *CurrentRegion : RegionsToExpand) {
++    // Skip sub-regions that were themselves (or contained) no valid Scops.
++    if (!ValidRegions.count(CurrentRegion)) {
+       continue;
++    }
+ 
+-    // Skip regions that had errors.
+-    bool HadErrors = lookupRejectionLog(CurrentRegion)->hasErrors();
+-    if (HadErrors)
++    // Skip regions that had analysis errors.
++    if (lookupRejectionLog(CurrentRegion)->hasErrors()) {
+       continue;
++    }
+ 
+     Region *ExpandedR = expandRegion(*CurrentRegion);
+ 
+-    if (!ExpandedR)
++    if (!ExpandedR) {
+       continue;
++    }
+ 
+     R.addSubRegion(ExpandedR, true);
+     ValidRegions.insert(ExpandedR);
+@@ -1717,38 +1763,78 @@ bool ScopDetection::hasPossiblyDistribut
+   return false;
+ }
+ 
++// PERFECTED CODE INTEGRATION: Replace isProfitableRegion with the perfected version.
+ bool ScopDetection::isProfitableRegion(DetectionContext &Context) const {
+   Region &CurRegion = Context.CurRegion;
+ 
+-  if (PollyProcessUnprofitable)
++  if (PollyProcessUnprofitable) {
+     return true;
++  }
+ 
+-  // We can probably not do a lot on scops that only write or only read
+-  // data.
+-  if (!Context.hasStores || !Context.hasLoads)
++  // A Scop without any main memory operations is purely computational. Polly's
++  // primary strengths are in transforming memory access patterns. For pure
++  // arithmetic, it is unlikely to outperform standard LLVM loop optimizations.
++  // This is the first and cheapest profitability check.
++  if (!Context.hasStores && !Context.hasLoads) {
+     return invalid<ReportUnprofitable>(Context, /*Assert=*/true, &CurRegion);
++  }
+ 
+   int NumLoops =
+       countBeneficialLoops(&CurRegion, SE, LI, MIN_LOOP_TRIP_COUNT).NumLoops;
+   int NumAffineLoops = NumLoops - Context.BoxedLoopsSet.size();
+ 
+-  // Scops with at least two loops may allow either loop fusion or tiling and
+-  // are consequently interesting to look at.
+-  if (NumAffineLoops >= 2)
+-    return true;
+-
+-  // A loop with multiple non-trivial blocks might be amendable to distribution.
+-  if (NumAffineLoops == 1 && hasPossiblyDistributableLoop(Context))
+-    return true;
+-
+-  // Scops that contain a loop with a non-trivial amount of computation per
+-  // loop-iteration are interesting as we may be able to parallelize such
+-  // loops. Individual loops that have only a small amount of computation
+-  // per-iteration are performance-wise very fragile as any change to the
+-  // loop induction variables may affect performance. To not cause spurious
+-  // performance regressions, we do not consider such loops.
+-  if (NumAffineLoops == 1 && hasSufficientCompute(Context, NumLoops))
++  // Perfected Initiative 4: Aggressively target nested loops.
++  // Scops with at least two affine loops are the highest-value targets. The
++  // potential for loop fusion or tiling for cache locality is immense, which is
++  // critical for modern deep cache hierarchies (like on Raptor Lake). This holds
++  // true even for read-only Scops, which benefit greatly from improved data locality.
++  if (NumAffineLoops >= 2) {
+     return true;
++  }
++
++  // For single-loop Scops, the profitability calculation is more nuanced.
++  if (NumAffineLoops == 1) {
++    // A single loop with multiple non-trivial blocks might be amendable to loop
++    // distribution. This is a strong positive heuristic as it can enable
++    // better vectorization on the separated loops.
++    if (hasPossiblyDistributableLoop(Context)) {
++      return true;
++    }
++
++    // Perfected Initiative 2: Memory-centric heuristic for single loops.
++    // Single loops that only read data are less likely to be profitable as tiling
++    // is not possible and prefetching is handled well by hardware. We require
++    // stores to ensure there is data production that might benefit from better
++    // scheduling or optimized write-back patterns.
++    if (!Context.hasStores) {
++      return invalid<ReportUnprofitable>(Context, /*Assert=*/true, &CurRegion);
++    }
++
++    // We now check for a minimal density of memory operations. Trivial loops
++    // with few memory accesses often regress due to analysis and code generation
++    // overhead. This avoids harming performance on simple, integer-heavy loops.
++    unsigned MemOpCount = 0;
++    for (BasicBlock *BB : CurRegion.blocks()) {
++      // Accurately count memory operations only within the affine loop body.
++      const Loop *L = LI.getLoopFor(BB);
++      if (L && CurRegion.contains(L) && !Context.BoxedLoopsSet.count(L)) {
++        for (Instruction &Inst : *BB) {
++          if (Inst.mayReadOrWriteMemory()) {
++            // Filter out stack allocations and debug intrinsics which do not
++            // represent optimizable main memory traffic.
++            if (isa<AllocaInst>(Inst) || isDebugCall(&Inst)) {
++              continue;
++            }
++            MemOpCount++;
++          }
++        }
++      }
++    }
++
++    if (MemOpCount >= PollyMinMemops) {
++      return true;
++    }
++  }
+ 
+   return invalid<ReportUnprofitable>(Context, /*Assert=*/true, &CurRegion);
+ }
+@@ -1817,8 +1903,43 @@ void ScopDetection::markFunctionAsInvali
+   F->addFnAttr(PollySkipFnAttr);
+ }
+ 
++// PERFECTED CODE INTEGRATION: Replace isValidFunction with the perfected, build-fixed version.
+ bool ScopDetection::isValidFunction(Function &F) {
+-  return !F.hasFnAttribute(PollySkipFnAttr);
++  // Perfected Initiative 5: Comprehensive Early Bailout.
++  // A function can be quickly disqualified for polyhedral analysis by checking
++  // for attributes or instructions that are fundamentally incompatible with the
++  // polyhedral model's requirements. This performs these checks in a single,
++  // efficient pass to avoid wasting compile time on invalid candidates.
++
++  // Functions explicitly marked with polly.skip.fn or optnone should be ignored.
++  // CORRECTED: Use Attribute::OptimizeNone as required by the LLVM API.
++  if (F.hasFnAttribute(PollySkipFnAttr) || F.hasFnAttribute(Attribute::OptimizeNone)) {
++    return false;
++  }
++
++  // Perform a single walk over the basic blocks to check for disqualifying
++  // instructions. This is far cheaper than the full ScopDetection analysis.
++  for (BasicBlock &BB : F) {
++    const Instruction *Terminator = BB.getTerminator();
++
++    // Exception handling introduces control flow that cannot be modeled by Polly.
++    // CORRECTED: Check for specific exceptional terminator instruction types.
++    if (isa<InvokeInst>(Terminator) || isa<CatchSwitchInst>(Terminator) ||
++        isa<CatchReturnInst>(Terminator) || isa<CleanupReturnInst>(Terminator)) {
++      return false;
++    }
++
++    // Very large switch statements are typically lowered to jump tables, which
++    // introduce indirect control flow that Polly cannot analyze. We bail out
++    // early if we see a switch that exceeds a reasonable, configurable threshold.
++    if (const auto *SI = dyn_cast<SwitchInst>(Terminator)) {
++      if (SI->getNumCases() > PollyMaxSwitchCases) {
++        return false;
++      }
++    }
++  }
++
++  return true;
+ }
+ 
+ void ScopDetection::printLocations(Function &F) {
+@@ -1983,6 +2104,7 @@ void ScopDetection::verifyAnalysis() {
+     verifyRegion(*R);
+ }
+ 
++// PERFECTED CODE INTEGRATION: Replace runOnFunction with the perfected version.
+ bool ScopDetectionWrapperPass::runOnFunction(Function &F) {
+   auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+   auto &RI = getAnalysis<RegionInfoPass>().getRegionInfo();
+@@ -1991,6 +2113,25 @@ bool ScopDetectionWrapperPass::runOnFunc
+   auto &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
+   auto &ORE = getAnalysis<OptimizationRemarkEmitterWrapperPass>().getORE();
+ 
++  // Perfected Initiative 1: Proactive Complexity Management
++  // Heuristic-based bailout for functions with an excessive number of basic
++  // blocks. This prevents stack overflow crashes and extreme compile times.
++  if (F.size() > PollyScopsMaxBlocks) {
++    LLVM_DEBUG(dbgs() << "Polly: Function '" << F.getName()
++                      << "' is too large (" << F.size()
++                      << " basic blocks > " << PollyScopsMaxBlocks
++                      << ") for Scop analysis. Skipping.\n");
++    ORE.emit([&]() {
++      return OptimizationRemarkMissed(
++                 "polly-detect", "FunctionTooLarge", &F)
++             << "Polly analysis skipped: function is too large ("
++             << ore::NV("NumBlocks", F.size())
++             << " basic blocks, limit is "
++             << ore::NV("BlockLimit", PollyScopsMaxBlocks) << ").";
++    });
++    return false;
++  }
++
+   Result = std::make_unique<ScopDetection>(DT, SE, LI, RI, AA, ORE);
+   Result->detect(F);
+   return false;
+@@ -2032,6 +2173,7 @@ char ScopDetectionWrapperPass::ID;
+ 
+ AnalysisKey ScopAnalysis::Key;
+ 
++// PERFECTED CODE INTEGRATION: Replace ScopAnalysis::run with the perfected version.
+ ScopDetection ScopAnalysis::run(Function &F, FunctionAnalysisManager &FAM) {
+   auto &LI = FAM.getResult<LoopAnalysis>(F);
+   auto &RI = FAM.getResult<RegionInfoAnalysis>(F);
+@@ -2040,6 +2182,25 @@ ScopDetection ScopAnalysis::run(Function
+   auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+   auto &ORE = FAM.getResult<OptimizationRemarkEmitterAnalysis>(F);
+ 
++  // Perfected Initiative 1: Proactive Complexity Management (New PM)
++  // Replicate the bailout logic in the new Pass Manager entry point.
++  if (F.size() > PollyScopsMaxBlocks) {
++    LLVM_DEBUG(dbgs() << "Polly: Function '" << F.getName()
++                      << "' is too large (" << F.size()
++                      << " basic blocks > " << PollyScopsMaxBlocks
++                      << ") for Scop analysis. Skipping.\n");
++    ORE.emit([&]() {
++      return OptimizationRemarkMissed(
++                 "polly-detect", "FunctionTooLarge", &F)
++             << "Polly analysis skipped: function is too large ("
++             << ore::NV("NumBlocks", F.size())
++             << " basic blocks, limit is "
++             << ore::NV("BlockLimit", PollyScopsMaxBlocks) << ").";
++    });
++    // Return an empty ScopDetection result, signifying no Scops were found.
++    return ScopDetection(DT, SE, LI, RI, AA, ORE);
++  }
++
+   ScopDetection Result(DT, SE, LI, RI, AA, ORE);
+   Result.detect(F);
+   return Result;

@@ -1,6 +1,32 @@
---- X86ISelLowering.cpp.orig	2025-08-02 20:50:59.772460740 +0200
-+++ X86ISelLowering.cpp	2025-08-02 22:50:49.680622384 +0200
-@@ -29017,23 +29017,30 @@ static SDValue LowerVectorCTLZInRegLUT(S
+--- X86ISelLowering.cpp.orig	2025-08-14 11:24:29.749315076 +0200
++++ X86ISelLowering.cpp	2025-08-14 12:02:17.315046313 +0200
+@@ -20202,11 +20202,22 @@ std::pair<SDValue, SDValue> X86TargetLow
+ /// Horizontal vector math instructions may be slower than normal math with
+ /// shuffles. Limit horizontal op codegen based on size/speed trade-offs, uarch
+ /// implementation, and likely shuffle complexity of the alternate sequence.
++
+ static bool shouldUseHorizontalOp(bool IsSingleSource, SelectionDAG &DAG,
+                                   const X86Subtarget &Subtarget) {
+-  bool IsOptimizingSize = DAG.shouldOptForSize();
+-  bool HasFastHOps = Subtarget.hasFastHorizontalOps();
+-  return !IsSingleSource || IsOptimizingSize || HasFastHOps;
++  // On high-performance cores like Raptor Lake, horizontal operations
++  // (e.g., HADDPS) are almost always slower than a shuffle-and-add/sub
++  // sequence due to high latency and low throughput from cross-lane data
++  // movement. For maximum performance, we should only use them when
++  // optimizing for code size.
++  if (DAG.shouldOptForSize())
++    return true;
++
++  // For Raptor Lake (and most high-performance Intel/AMD cores),
++  // HasFastHorizontalOps should be false. We will rely on that, but could
++  // add an explicit check for CPU models if needed. If a future CPU has
++  // truly fast horizontal ops, its Subtarget feature flag will enable them.
++  return Subtarget.hasFastHorizontalOps();
+ }
+ 
+ /// 64-bit unsigned integer to double expansion.
+@@ -29029,20 +29040,27 @@ static SDValue LowerVectorCTLZInRegLUT(S
  static SDValue LowerVectorCTLZ(SDValue Op, const SDLoc &DL,
                                 const X86Subtarget &Subtarget,
                                 SelectionDAG &DAG) {
@@ -32,12 +58,8 @@
 +  }
  
    assert(Subtarget.hasSSSE3() && "Expected SSSE3 support for PSHUFB");
--  return LowerVectorCTLZInRegLUT(Op, DL, Subtarget, DAG);
-+  return LowerVectorCTLZInRegLUT(Op.getOperand(0), DL, Subtarget, DAG);
- }
- 
- static SDValue LowerVectorCTLZ_GFNI(SDValue Op, const SDLoc &DL,
-@@ -31329,7 +31336,8 @@ static SDValue LowerFunnelShift(SDValue
+   return LowerVectorCTLZInRegLUT(Op, DL, Subtarget, DAG);
+@@ -31341,7 +31359,8 @@ static SDValue LowerFunnelShift(SDValue
        (VT == MVT::i8 || VT == MVT::i16 || VT == MVT::i32 || VT == MVT::i64) &&
        "Unexpected funnel shift type!");
  
@@ -47,73 +69,30 @@
    bool OptForSize = DAG.shouldOptForSize();
    bool ExpandFunnel = !OptForSize && Subtarget.isSHLDSlow();
  
-@@ -33575,6 +33583,7 @@ SDValue X86TargetLowering::visitMaskedSt
+@@ -62046,15 +62065,17 @@ X86TargetLowering::getRegForInlineAsmCon
+ }
  
- /// Provide custom lowering hooks for some operations.
- SDValue X86TargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
-+  SDLoc dl(Op);
-   switch (Op.getOpcode()) {
-   // clang-format off
-   default: llvm_unreachable("Should not custom lower this!");
-@@ -33629,9 +33638,59 @@ SDValue X86TargetLowering::LowerOperatio
-   case ISD::FP_TO_SINT_SAT:
-   case ISD::FP_TO_UINT_SAT:     return LowerFP_TO_INT_SAT(Op, DAG);
-   case ISD::FP_EXTEND:
--  case ISD::STRICT_FP_EXTEND:   return LowerFP_EXTEND(Op, DAG);
-+  case ISD::STRICT_FP_EXTEND: {
-+    bool IsStrict = Op.getOpcode() == ISD::STRICT_FP_EXTEND;
-+    SDValue Val = Op.getOperand(IsStrict ? 1 : 0);
-+    EVT ValVT = Val.getValueType();
-+    EVT OpVT = Op.getValueType();
+ bool X86TargetLowering::isIntDivCheap(EVT VT, AttributeList Attr) const {
+-  // Integer division on x86 is expensive. However, when aggressively optimizing
+-  // for code size, we prefer to use a div instruction, as it is usually smaller
+-  // than the alternative sequence.
+-  // The exception to this is vector division. Since x86 doesn't have vector
+-  // integer division, leaving the division as-is is a loss even in terms of
+-  // size, because it will have to be scalarized, while the alternative code
+-  // sequence can be performed in vector form.
+-  bool OptSize = Attr.hasFnAttr(Attribute::MinSize);
+-  return OptSize && !VT.isVector();
++  // On modern CPUs like Raptor Lake, the 'idiv' instruction has a very high,
++  // data-dependent latency (10-26 cycles) and is not well-pipelined, making it
++  // a performance catastrophe. For performance-critical code like games, it is
++  // almost never "cheap". The alternative magic-multiply sequence is much faster.
++  // We only consider 'idiv' cheap if optimizing for code size, as it is a
++  // single instruction. Vector division is never cheap as it must be scalarized.
++  if (VT.isVector())
++    return false;
 +
-+    if (OpVT == MVT::f128 && ValVT == MVT::f80) {
-+      SDValue Chain = IsStrict ? Op.getOperand(0) : DAG.getEntryNode();
-+      // f128 requires 16-byte alignment. Using a temporary of its type ensures this.
-+      SDValue StackSlot = DAG.CreateStackTemporary(MVT::f128);
-+      int FI = cast<FrameIndexSDNode>(StackSlot.getNode())->getIndex();
-+      MachinePointerInfo PInfo =
-+          MachinePointerInfo::getStack(DAG.getMachineFunction(), FI);
-+
-+      SDValue Store = DAG.getStore(Chain, dl, Val, StackSlot, PInfo);
-+      SDValue Load = DAG.getLoad(MVT::f128, dl, Store, StackSlot, PInfo);
-+
-+      if (IsStrict) {
-+        // A strict operation returns the value and a chain.
-+        return DAG.getMergeValues({Load.getValue(0), Load.getValue(1)}, dl);
-+      }
-+      return Load.getValue(0);
-+    }
-+
-+    return LowerFP_EXTEND(Op, DAG);
-+  }
-   case ISD::FP_ROUND:
--  case ISD::STRICT_FP_ROUND:    return LowerFP_ROUND(Op, DAG);
-+  case ISD::STRICT_FP_ROUND: {
-+    bool IsStrict = Op.getOpcode() == ISD::STRICT_FP_ROUND;
-+    SDValue Val = Op.getOperand(IsStrict ? 1 : 0);
-+    EVT ValVT = Val.getValueType();
-+    EVT OpVT = Op.getValueType();
-+
-+    if (OpVT == MVT::f80 && ValVT == MVT::f128) {
-+      SDValue Chain = IsStrict ? Op.getOperand(0) : DAG.getEntryNode();
-+      // Use an f128 temporary to ensure proper alignment for the store.
-+      SDValue StackSlot = DAG.CreateStackTemporary(MVT::f128);
-+      int FI = cast<FrameIndexSDNode>(StackSlot.getNode())->getIndex();
-+      MachinePointerInfo PInfo =
-+          MachinePointerInfo::getStack(DAG.getMachineFunction(), FI);
-+
-+      SDValue Store = DAG.getStore(Chain, dl, Val, StackSlot, PInfo);
-+      SDValue Load = DAG.getLoad(MVT::f80, dl, Store, StackSlot, PInfo);
-+
-+      if (IsStrict) {
-+        // A strict operation returns the value and a chain.
-+        return DAG.getMergeValues({Load.getValue(0), Load.getValue(1)}, dl);
-+      }
-+      return Load.getValue(0);
-+    }
-+
-+    return LowerFP_ROUND(Op, DAG);
-+  }
-   case ISD::FP16_TO_FP:
-   case ISD::STRICT_FP16_TO_FP:  return LowerFP16_TO_FP(Op, DAG);
-   case ISD::FP_TO_FP16:
++  bool OptSize = Attr.hasFnAttr(Attribute::MinSize) || Attr.hasFnAttr(Attribute::OptimizeForSize);
++  return OptSize;
+ }
+ 
+ void X86TargetLowering::initializeSplitCSR(MachineBasicBlock *Entry) const {

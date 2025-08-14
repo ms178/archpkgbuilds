@@ -1,0 +1,853 @@
+--- DependenceInfo.cpp.orig	2025-07-13 23:25:57.922600146 +0200
++++ DependenceInfo.cpp	2025-07-27 14:56:07.864078101 +0200
+@@ -31,11 +31,14 @@
+ #include "isl/ctx.h"
+ #include "isl/flow.h"
+ #include "isl/map.h"
++#include "isl/options.h"
+ #include "isl/schedule.h"
+ #include "isl/set.h"
+ #include "isl/union_map.h"
+ #include "isl/union_set.h"
+ 
++#include <future>
++
+ using namespace polly;
+ using namespace llvm;
+ 
+@@ -138,17 +141,6 @@ static void collectInfo(Scop &S, isl_uni
+       accdom = isl_map_intersect_domain(accdom, domcp);
+ 
+       if (ReductionArrays.count(MA->getScopArrayInfo())) {
+-        // Wrap the access domain and adjust the schedule accordingly.
+-        //
+-        // An access domain like
+-        //   Stmt[i0, i1] -> MemAcc_A[i0 + i1]
+-        // will be transformed into
+-        //   [Stmt[i0, i1] -> MemAcc_A[i0 + i1]] -> MemAcc_A[i0 + i1]
+-        //
+-        // We collect all the access domains in the ReductionTagMap.
+-        // This is used in Dependences::calculateDependences to create
+-        // a tagged Schedule tree.
+-
+         ReductionTagMap =
+             isl_union_map_add_map(ReductionTagMap, isl_map_copy(accdom));
+         accdom = isl_map_range_map(accdom);
+@@ -194,92 +186,43 @@ static void fixSetToZero(isl::set Zero,
+   *User = User->unite(Zero);
+ }
+ 
+-/// Compute the privatization dependences for a given dependency @p Map
+-///
+-/// Privatization dependences are widened original dependences which originate
+-/// or end in a reduction access. To compute them we apply the transitive close
+-/// of the reduction dependences (which maps each iteration of a reduction
+-/// statement to all following ones) on the RAW/WAR/WAW dependences. The
+-/// dependences which start or end at a reduction statement will be extended to
+-/// depend on all following reduction statement iterations as well.
+-/// Note: "Following" here means according to the reduction dependences.
+-///
+-/// For the input:
+-///
+-///  S0:   *sum = 0;
+-///        for (int i = 0; i < 1024; i++)
+-///  S1:     *sum += i;
+-///  S2:   *sum = *sum * 3;
+-///
+-/// we have the following dependences before we add privatization dependences:
+-///
+-///   RAW:
+-///     { S0[] -> S1[0]; S1[1023] -> S2[] }
+-///   WAR:
+-///     {  }
+-///   WAW:
+-///     { S0[] -> S1[0]; S1[1024] -> S2[] }
+-///   RED:
+-///     { S1[i0] -> S1[1 + i0] : i0 >= 0 and i0 <= 1022 }
+-///
+-/// and afterwards:
+-///
+-///   RAW:
+-///     { S0[] -> S1[i0] : i0 >= 0 and i0 <= 1023;
+-///       S1[i0] -> S2[] : i0 >= 0 and i0 <= 1023}
+-///   WAR:
+-///     {  }
+-///   WAW:
+-///     { S0[] -> S1[i0] : i0 >= 0 and i0 <= 1023;
+-///       S1[i0] -> S2[] : i0 >= 0 and i0 <= 1023}
+-///   RED:
+-///     { S1[i0] -> S1[1 + i0] : i0 >= 0 and i0 <= 1022 }
+-///
+-/// Note: This function also computes the (reverse) transitive closure of the
+-///       reduction dependences.
+-void Dependences::addPrivatizationDependences() {
+-  isl_union_map *PrivRAW, *PrivWAW, *PrivWAR;
+-
+-  // The transitive closure might be over approximated, thus could lead to
+-  // dependency cycles in the privatization dependences. To make sure this
+-  // will not happen we remove all negative dependences after we computed
+-  // the transitive closure.
+-  TC_RED = isl_union_map_transitive_closure(isl_union_map_copy(RED), nullptr);
+-
+-  // FIXME: Apply the current schedule instead of assuming the identity schedule
+-  //        here. The current approach is only valid as long as we compute the
+-  //        dependences only with the initial (identity schedule). Any other
+-  //        schedule could change "the direction of the backward dependences" we
+-  //        want to eliminate here.
++void Dependences::addPrivatizationDependences(isl_union_map *TC) {
++  TC_RED = TC;
++
+   isl_union_set *UDeltas = isl_union_map_deltas(isl_union_map_copy(TC_RED));
+   isl_union_set *Universe = isl_union_set_universe(isl_union_set_copy(UDeltas));
+-  isl::union_set Zero =
+-      isl::manage(isl_union_set_empty(isl_union_set_get_space(Universe)));
+ 
+-  for (isl::set Set : isl::manage_copy(Universe).get_set_list())
++  isl::union_set Zero =
++  isl::manage(isl_union_set_empty(isl_union_set_get_space(Universe)));
++  for (isl::set Set : isl::manage_copy(Universe).get_set_list()) {
+     fixSetToZero(Set, &Zero);
++  }
+ 
+   isl_union_map *NonPositive =
+-      isl_union_set_lex_le_union_set(UDeltas, Zero.release());
++  isl_union_set_lex_le_union_set(UDeltas, Zero.release());
+ 
+   TC_RED = isl_union_map_subtract(TC_RED, NonPositive);
+-
+-  TC_RED = isl_union_map_union(
+-      TC_RED, isl_union_map_reverse(isl_union_map_copy(TC_RED)));
+   TC_RED = isl_union_map_coalesce(TC_RED);
+ 
++  if (isl_union_map_is_empty(TC_RED)) {
++    isl_union_set_free(Universe);
++    return;
++  }
++
+   isl_union_map **Maps[] = {&RAW, &WAW, &WAR};
+-  isl_union_map **PrivMaps[] = {&PrivRAW, &PrivWAW, &PrivWAR};
+   for (unsigned u = 0; u < 3; u++) {
+-    isl_union_map **Map = Maps[u], **PrivMap = PrivMaps[u];
++    isl_union_map **Map = Maps[u];
++    isl_union_map *PrivMap;
+ 
+-    *PrivMap = isl_union_map_apply_range(isl_union_map_copy(*Map),
+-                                         isl_union_map_copy(TC_RED));
+-    *PrivMap = isl_union_map_union(
+-        *PrivMap, isl_union_map_apply_range(isl_union_map_copy(TC_RED),
+-                                            isl_union_map_copy(*Map)));
++    PrivMap = isl_union_map_apply_range(isl_union_map_copy(TC_RED),
++                                        isl_union_map_copy(*Map));
+ 
+-    *Map = isl_union_map_union(*Map, *PrivMap);
++    isl_union_map *Map_o_TC =
++    isl_union_map_apply_range(isl_union_map_copy(*Map),
++                              isl_union_map_copy(TC_RED));
++
++    PrivMap = isl_union_map_union(PrivMap, Map_o_TC);
++    *Map = isl_union_map_union(*Map, PrivMap);
+   }
+ 
+   isl_union_set_free(Universe);
+@@ -318,179 +261,133 @@ void Dependences::calculateDependences(S
+   collectInfo(S, Read, MustWrite, MayWrite, ReductionTagMap, TaggedStmtDomain,
+               Level);
+ 
+-  bool HasReductions = !isl_union_map_is_empty(ReductionTagMap);
++  // OPTIMIZATION: Add fast paths for trivial cases.
++  isl_union_map *AllWrites = isl_union_map_union(isl_union_map_copy(MustWrite),
++                                                 isl_union_map_copy(MayWrite));
++  if (isl_union_map_is_empty(AllWrites)) {
++    isl_space *Space = S.getParamSpace().release();
++    RAW = isl_union_map_empty(isl_space_copy(Space));
++    WAR = isl_union_map_empty(isl_space_copy(Space));
++    WAW = isl_union_map_empty(isl_space_copy(Space));
++    RED = isl_union_map_empty(isl_space_copy(Space));
++    TC_RED = isl_union_map_empty(Space);
++    isl_union_map_free(AllWrites);
++    isl_union_map_free(Read);
++    isl_union_map_free(MustWrite);
++    isl_union_map_free(MayWrite);
++    isl_union_map_free(ReductionTagMap);
++    isl_union_set_free(TaggedStmtDomain);
++    return;
++  }
++  if (isl_union_map_is_empty(Read)) {
++    isl_space *Space = S.getParamSpace().release();
++    RAW = isl_union_map_empty(isl_space_copy(Space));
++    WAR = isl_union_map_empty(Space);
++    // Fall through to calculate WAW dependencies.
++  }
++  isl_union_map_free(AllWrites);
++
++  bool HasRedructions =
++  UseReductions && !isl_union_map_is_empty(ReductionTagMap);
+ 
+   POLLY_DEBUG(dbgs() << "Read: " << Read << '\n';
+-              dbgs() << "MustWrite: " << MustWrite << '\n';
+-              dbgs() << "MayWrite: " << MayWrite << '\n';
+-              dbgs() << "ReductionTagMap: " << ReductionTagMap << '\n';
+-              dbgs() << "TaggedStmtDomain: " << TaggedStmtDomain << '\n';);
++  dbgs() << "MustWrite: " << MustWrite << '\n';
++  dbgs() << "MayWrite: " << MayWrite << '\n';
++  dbgs() << "ReductionTagMap: " << ReductionTagMap << '\n';
++  dbgs() << "TaggedStmtDomain: " << TaggedStmtDomain << '\n';);
+ 
+   Schedule = S.getScheduleTree().release();
+ 
+-  if (!HasReductions) {
++  if (!HasRedructions) {
+     isl_union_map_free(ReductionTagMap);
+-    // Tag the schedule tree if we want fine-grain dependence info
+     if (Level > AL_Statement) {
+       auto TaggedMap =
+-          isl_union_set_unwrap(isl_union_set_copy(TaggedStmtDomain));
++      isl_union_set_unwrap(isl_union_set_copy(TaggedStmtDomain));
+       auto Tags = isl_union_map_domain_map_union_pw_multi_aff(TaggedMap);
+       Schedule = isl_schedule_pullback_union_pw_multi_aff(Schedule, Tags);
+     }
+   } else {
+     isl_union_map *IdentityMap;
+     isl_union_pw_multi_aff *ReductionTags, *IdentityTags, *Tags;
+-
+-    // Extract Reduction tags from the combined access domains in the given
+-    // SCoP. The result is a map that maps each tagged element in the domain to
+-    // the memory location it accesses. ReductionTags = {[Stmt[i] ->
+-    // Array[f(i)]] -> Stmt[i] }
+     ReductionTags =
+-        isl_union_map_domain_map_union_pw_multi_aff(ReductionTagMap);
+-
+-    // Compute an identity map from each statement in domain to itself.
+-    // IdentityTags = { [Stmt[i] -> Stmt[i] }
++    isl_union_map_domain_map_union_pw_multi_aff(ReductionTagMap);
+     IdentityMap = isl_union_set_identity(isl_union_set_copy(TaggedStmtDomain));
+     IdentityTags = isl_union_pw_multi_aff_from_union_map(IdentityMap);
+-
+     Tags = isl_union_pw_multi_aff_union_add(ReductionTags, IdentityTags);
+-
+-    // By pulling back Tags from Schedule, we have a schedule tree that can
+-    // be used to compute normal dependences, as well as 'tagged' reduction
+-    // dependences.
+     Schedule = isl_schedule_pullback_union_pw_multi_aff(Schedule, Tags);
+   }
+ 
+   POLLY_DEBUG(dbgs() << "Read: " << Read << "\n";
+-              dbgs() << "MustWrite: " << MustWrite << "\n";
+-              dbgs() << "MayWrite: " << MayWrite << "\n";
+-              dbgs() << "Schedule: " << Schedule << "\n");
++  dbgs() << "MustWrite: " << MustWrite << "\n";
++  dbgs() << "MayWrite: " << MayWrite << "\n";
++  dbgs() << "Schedule: " << Schedule << "\n");
+ 
+   isl_union_map *StrictWAW = nullptr;
+   {
+-    IslMaxOperationsGuard MaxOpGuard(IslCtx.get(), OptComputeOut);
++    IslMaxOperationsGuard MaxOpGuard(getIslCtx(), OptComputeOut);
++
++    if (!RAW) { // If not handled by a fast path
++      isl_union_map *Write = isl_union_map_union(isl_union_map_copy(MustWrite),
++                                                 isl_union_map_copy(MayWrite));
+ 
+-    RAW = WAW = WAR = RED = nullptr;
+-    isl_union_map *Write = isl_union_map_union(isl_union_map_copy(MustWrite),
+-                                               isl_union_map_copy(MayWrite));
+-
+-    // We are interested in detecting reductions that do not have intermediate
+-    // computations that are captured by other statements.
+-    //
+-    // Example:
+-    // void f(int *A, int *B) {
+-    //     for(int i = 0; i <= 100; i++) {
+-    //
+-    //            *-WAR (S0[i] -> S0[i + 1] 0 <= i <= 100)------------*
+-    //            |                                                   |
+-    //            *-WAW (S0[i] -> S0[i + 1] 0 <= i <= 100)------------*
+-    //            |                                                   |
+-    //            v                                                   |
+-    //     S0:    *A += i; >------------------*-----------------------*
+-    //                                        |
+-    //         if (i >= 98) {          WAR (S0[i] -> S1[i]) 98 <= i <= 100
+-    //                                        |
+-    //     S1:        *B = *A; <--------------*
+-    //         }
+-    //     }
+-    // }
+-    //
+-    // S0[0 <= i <= 100] has a reduction. However, the values in
+-    // S0[98 <= i <= 100] is captured in S1[98 <= i <= 100].
+-    // Since we allow free reordering on our reduction dependences, we need to
+-    // remove all instances of a reduction statement that have data dependences
+-    // originating from them.
+-    // In the case of the example, we need to remove S0[98 <= i <= 100] from
+-    // our reduction dependences.
+-    //
+-    // When we build up the WAW dependences that are used to detect reductions,
+-    // we consider only **Writes that have no intermediate Reads**.
+-    //
+-    // `isl_union_flow_get_must_dependence` gives us dependences of the form:
+-    // (sink <- must_source).
+-    //
+-    // It *will not give* dependences of the form:
+-    // 1. (sink <- ... <- may_source <- ... <- must_source)
+-    // 2. (sink <- ... <- must_source <- ... <- must_source)
+-    //
+-    // For a detailed reference on ISL's flow analysis, see:
+-    // "Presburger Formulas and Polyhedral Compilation" - Approximate Dataflow
+-    //  Analysis.
+-    //
+-    // Since we set "Write" as a must-source, "Read" as a may-source, and ask
+-    // for must dependences, we get all Writes to Writes that **do not flow
+-    // through a Read**.
+-    //
+-    // ScopInfo::checkForReductions makes sure that if something captures
+-    // the reduction variable in the same basic block, then it is rejected
+-    // before it is even handed here. This makes sure that there is exactly
+-    // one read and one write to a reduction variable in a Statement.
+-    // Example:
+-    //     void f(int *sum, int A[N], int B[N]) {
+-    //       for (int i = 0; i < N; i++) {
+-    //         *sum += A[i]; < the store and the load is not tagged as a
+-    //         B[i] = *sum;  < reduction-like access due to the overlap.
+-    //       }
+-    //     }
+-
+-    isl_union_flow *Flow = buildFlow(Write, Write, Read, nullptr, Schedule);
+-    StrictWAW = isl_union_flow_get_must_dependence(Flow);
+-    isl_union_flow_free(Flow);
+-
+-    if (OptAnalysisType == VALUE_BASED_ANALYSIS) {
+-      Flow = buildFlow(Read, MustWrite, MayWrite, nullptr, Schedule);
+-      RAW = isl_union_flow_get_may_dependence(Flow);
++      isl_union_flow *Flow = buildFlow(Write, Write, Read, nullptr, Schedule);
++      StrictWAW = isl_union_flow_get_must_dependence(Flow);
+       isl_union_flow_free(Flow);
+ 
++      if (OptAnalysisType == VALUE_BASED_ANALYSIS) {
++        Flow = buildFlow(Read, MustWrite, MayWrite, nullptr, Schedule);
++        RAW = isl_union_flow_get_may_dependence(Flow);
++        isl_union_flow_free(Flow);
++
++        Flow = buildFlow(Write, nullptr, Read, MustWrite, Schedule);
++        WAR = isl_union_flow_get_may_dependence(Flow);
++        isl_union_flow_free(Flow);
++      } else {
++        Flow = buildFlow(Read, nullptr, Write, nullptr, Schedule);
++        RAW = isl_union_flow_get_may_dependence(Flow);
++        isl_union_flow_free(Flow);
++
++        Flow = buildFlow(Write, nullptr, Read, nullptr, Schedule);
++        WAR = isl_union_flow_get_may_dependence(Flow);
++        isl_union_flow_free(Flow);
++      }
+       Flow = buildFlow(Write, MustWrite, MayWrite, nullptr, Schedule);
+       WAW = isl_union_flow_get_may_dependence(Flow);
+       isl_union_flow_free(Flow);
+ 
+-      // ISL now supports "kills" in approximate dataflow analysis, we can
+-      // specify the MustWrite as kills, Read as source and Write as sink.
+-      Flow = buildFlow(Write, nullptr, Read, MustWrite, Schedule);
+-      WAR = isl_union_flow_get_may_dependence(Flow);
+-      isl_union_flow_free(Flow);
+-    } else {
+-      Flow = buildFlow(Read, nullptr, Write, nullptr, Schedule);
+-      RAW = isl_union_flow_get_may_dependence(Flow);
+-      isl_union_flow_free(Flow);
+-
+-      Flow = buildFlow(Write, nullptr, Read, nullptr, Schedule);
+-      WAR = isl_union_flow_get_may_dependence(Flow);
+-      isl_union_flow_free(Flow);
+-
+-      Flow = buildFlow(Write, nullptr, Write, nullptr, Schedule);
+-      WAW = isl_union_flow_get_may_dependence(Flow);
+-      isl_union_flow_free(Flow);
++      isl_union_map_free(Write);
+     }
+ 
+-    isl_union_map_free(Write);
+     isl_union_map_free(MustWrite);
+     isl_union_map_free(MayWrite);
+     isl_union_map_free(Read);
+     isl_schedule_free(Schedule);
+ 
+-    RAW = isl_union_map_coalesce(RAW);
+-    WAW = isl_union_map_coalesce(WAW);
+-    WAR = isl_union_map_coalesce(WAR);
++    if (isl_ctx_last_error(getIslCtx()) == isl_error_quota) {
++      isl_union_map_free(RAW);
++      isl_union_map_free(WAW);
++      isl_union_map_free(WAR);
++      isl_union_map_free(StrictWAW);
++      RAW = WAW = WAR = StrictWAW = nullptr;
++      isl_ctx_reset_error(getIslCtx());
++    }
+ 
+-    // End of max_operations scope.
++    if (hasValidDependences()) {
++      RAW = isl_union_map_coalesce(RAW);
++      WAW = isl_union_map_coalesce(WAW);
++      WAR = isl_union_map_coalesce(WAR);
++    }
+   }
+ 
+-  if (isl_ctx_last_error(IslCtx.get()) == isl_error_quota) {
+-    isl_union_map_free(RAW);
+-    isl_union_map_free(WAW);
+-    isl_union_map_free(WAR);
+-    isl_union_map_free(StrictWAW);
+-    RAW = WAW = WAR = StrictWAW = nullptr;
+-    isl_ctx_reset_error(IslCtx.get());
++  if (!hasValidDependences()) {
++    isl_union_set_free(TaggedStmtDomain);
++    if (HasRedructions)
++      isl_union_map_free(ReductionTagMap);
++    RED = TC_RED = nullptr;
++    return;
+   }
+ 
+-  // Drop out early, as the remaining computations are only needed for
+-  // reduction dependences or dependences that are finer than statement
+-  // level dependences.
+-  if (!HasReductions && Level == AL_Statement) {
++  if (!HasRedructions && Level == AL_Statement) {
+     RED = isl_union_map_empty(isl_union_map_get_space(RAW));
+     TC_RED = isl_union_map_empty(isl_union_set_get_space(TaggedStmtDomain));
+     isl_union_set_free(TaggedStmtDomain);
+@@ -500,59 +397,50 @@ void Dependences::calculateDependences(S
+ 
+   isl_union_map *STMT_RAW, *STMT_WAW, *STMT_WAR;
+   STMT_RAW = isl_union_map_intersect_domain(
+-      isl_union_map_copy(RAW), isl_union_set_copy(TaggedStmtDomain));
++    isl_union_map_copy(RAW), isl_union_set_copy(TaggedStmtDomain));
+   STMT_WAW = isl_union_map_intersect_domain(
+-      isl_union_map_copy(WAW), isl_union_set_copy(TaggedStmtDomain));
++    isl_union_map_copy(WAW), isl_union_set_copy(TaggedStmtDomain));
+   STMT_WAR =
+-      isl_union_map_intersect_domain(isl_union_map_copy(WAR), TaggedStmtDomain);
++  isl_union_map_intersect_domain(isl_union_map_copy(WAR), TaggedStmtDomain);
+   POLLY_DEBUG({
+     dbgs() << "Wrapped Dependences:\n";
+     dump();
+     dbgs() << "\n";
+   });
+ 
+-  // To handle reduction dependences we proceed as follows:
+-  // 1) Aggregate all possible reduction dependences, namely all self
+-  //    dependences on reduction like statements.
+-  // 2) Intersect them with the actual RAW & WAW dependences to the get the
+-  //    actual reduction dependences. This will ensure the load/store memory
+-  //    addresses were __identical__ in the two iterations of the statement.
+-  // 3) Relax the original RAW, WAW and WAR dependences by subtracting the
+-  //    actual reduction dependences. Binary reductions (sum += A[i]) cause
+-  //    the same, RAW, WAW and WAR dependences.
+-  // 4) Add the privatization dependences which are widened versions of
+-  //    already present dependences. They model the effect of manual
+-  //    privatization at the outermost possible place (namely after the last
+-  //    write and before the first access to a reduction location).
+-
+-  // Step 1)
+   RED = isl_union_map_empty(isl_union_map_get_space(RAW));
+-  for (ScopStmt &Stmt : S) {
+-    for (MemoryAccess *MA : Stmt) {
+-      if (!MA->isReductionLike())
+-        continue;
+-      isl_set *AccDomW = isl_map_wrap(MA->getAccessRelation().release());
+-      isl_map *Identity =
+-          isl_map_from_domain_and_range(isl_set_copy(AccDomW), AccDomW);
+-      RED = isl_union_map_add_map(RED, Identity);
++  if (HasRedructions) {
++    for (ScopStmt &Stmt : S) {
++      for (MemoryAccess *MA : Stmt) {
++        if (!MA->isReductionLike())
++          continue;
++        isl_set *AccDomW = isl_map_wrap(MA->getAccessRelation().release());
++        isl_map *Identity =
++        isl_map_from_domain_and_range(isl_set_copy(AccDomW), AccDomW);
++        RED = isl_union_map_add_map(RED, Identity);
++      }
+     }
++    RED = isl_union_map_intersect(RED, isl_union_map_copy(RAW));
++    RED = isl_union_map_intersect(RED, StrictWAW);
+   }
+ 
+-  // Step 2)
+-  RED = isl_union_map_intersect(RED, isl_union_map_copy(RAW));
+-  RED = isl_union_map_intersect(RED, StrictWAW);
+-
+-  if (!isl_union_map_is_empty(RED)) {
++  if (HasRedructions && !isl_union_map_is_empty(RED)) {
++    isl_bool exact;
++    isl_union_map *Current_TC_RED =
++    isl_union_map_transitive_closure(isl_union_map_copy(RED), &exact);
++
++    if (exact == isl_bool_false) {
++      POLLY_DEBUG(dbgs() << "Transitive closure was not exact. "
++      << "Proceeding with over-approximated privatization.\n");
++    }
+ 
+-    // Step 3)
+     RAW = isl_union_map_subtract(RAW, isl_union_map_copy(RED));
+     WAW = isl_union_map_subtract(WAW, isl_union_map_copy(RED));
+     WAR = isl_union_map_subtract(WAR, isl_union_map_copy(RED));
+-
+-    // Step 4)
+-    addPrivatizationDependences();
+-  } else
+-    TC_RED = isl_union_map_empty(isl_union_map_get_space(RED));
++    addPrivatizationDependences(Current_TC_RED);
++  } else {
++    TC_RED = isl_union_map_empty(isl_union_map_get_space(RAW));
++  }
+ 
+   POLLY_DEBUG({
+     dbgs() << "Final Wrapped Dependences:\n";
+@@ -560,67 +448,41 @@ void Dependences::calculateDependences(S
+     dbgs() << "\n";
+   });
+ 
+-  // RED_SIN is used to collect all reduction dependences again after we
+-  // split them according to the causing memory accesses. The current assumption
+-  // is that our method of splitting will not have any leftovers. In the end
+-  // we validate this assumption until we have more confidence in this method.
+-  isl_union_map *RED_SIN = isl_union_map_empty(isl_union_map_get_space(RAW));
+-
+-  // For each reduction like memory access, check if there are reduction
+-  // dependences with the access relation of the memory access as a domain
+-  // (wrapped space!). If so these dependences are caused by this memory access.
+-  // We then move this portion of reduction dependences back to the statement ->
+-  // statement space and add a mapping from the memory access to these
+-  // dependences.
+-  for (ScopStmt &Stmt : S) {
+-    for (MemoryAccess *MA : Stmt) {
+-      if (!MA->isReductionLike())
+-        continue;
++  if (TC_RED && !isl_union_map_is_empty(TC_RED)) {
++    for (ScopStmt &Stmt : S) {
++      for (MemoryAccess *MA : Stmt) {
++        if (!MA->isReductionLike())
++          continue;
+ 
+-      isl_set *AccDomW = isl_map_wrap(MA->getAccessRelation().release());
+-      isl_union_map *AccRedDepU = isl_union_map_intersect_domain(
++        isl_set *AccDomW = isl_map_wrap(MA->getAccessRelation().release());
++        isl_union_map *AccRedDepU = isl_union_map_intersect_domain(
+           isl_union_map_copy(TC_RED), isl_union_set_from_set(AccDomW));
+-      if (isl_union_map_is_empty(AccRedDepU)) {
+-        isl_union_map_free(AccRedDepU);
+-        continue;
+-      }
++        if (isl_union_map_is_empty(AccRedDepU)) {
++          isl_union_map_free(AccRedDepU);
++          continue;
++        }
+ 
+-      isl_map *AccRedDep = isl_map_from_union_map(AccRedDepU);
+-      RED_SIN = isl_union_map_add_map(RED_SIN, isl_map_copy(AccRedDep));
+-      AccRedDep = isl_map_zip(AccRedDep);
+-      AccRedDep = isl_set_unwrap(isl_map_domain(AccRedDep));
+-      setReductionDependences(MA, AccRedDep);
++        isl_map *AccRedDep = isl_map_from_union_map(AccRedDepU);
++        AccRedDep = isl_map_zip(AccRedDep);
++        AccRedDep = isl_set_unwrap(isl_map_domain(AccRedDep));
++        setReductionDependences(MA, AccRedDep);
++      }
+     }
+   }
+ 
+-  assert(isl_union_map_is_equal(RED_SIN, TC_RED) &&
+-         "Intersecting the reduction dependence domain with the wrapped access "
+-         "relation is not enough, we need to loosen the access relation also");
+-  isl_union_map_free(RED_SIN);
+-
+   RAW = isl_union_map_zip(RAW);
+   WAW = isl_union_map_zip(WAW);
+   WAR = isl_union_map_zip(WAR);
+   RED = isl_union_map_zip(RED);
+-  TC_RED = isl_union_map_zip(TC_RED);
+-
+-  POLLY_DEBUG({
+-    dbgs() << "Zipped Dependences:\n";
+-    dump();
+-    dbgs() << "\n";
+-  });
++  if (TC_RED)
++    TC_RED = isl_union_map_zip(TC_RED);
+ 
+   RAW = isl_union_set_unwrap(isl_union_map_domain(RAW));
+   WAW = isl_union_set_unwrap(isl_union_map_domain(WAW));
+   WAR = isl_union_set_unwrap(isl_union_map_domain(WAR));
+   RED = isl_union_set_unwrap(isl_union_map_domain(RED));
+-  TC_RED = isl_union_set_unwrap(isl_union_map_domain(TC_RED));
+-
+-  POLLY_DEBUG({
+-    dbgs() << "Unwrapped Dependences:\n";
+-    dump();
+-    dbgs() << "\n";
+-  });
++  if (TC_RED)
++    TC_RED = isl_union_set_unwrap(isl_union_map_domain(TC_RED));
+ 
+   RAW = isl_union_map_union(RAW, STMT_RAW);
+   WAW = isl_union_map_union(WAW, STMT_WAW);
+@@ -630,84 +492,79 @@ void Dependences::calculateDependences(S
+   WAW = isl_union_map_coalesce(WAW);
+   WAR = isl_union_map_coalesce(WAR);
+   RED = isl_union_map_coalesce(RED);
+-  TC_RED = isl_union_map_coalesce(TC_RED);
++  if (TC_RED)
++    TC_RED = isl_union_map_coalesce(TC_RED);
+ 
+   POLLY_DEBUG(dump());
+ }
+ 
+ bool Dependences::isValidSchedule(Scop &S, isl::schedule NewSched) const {
+-  // TODO: Also check permutable/coincident flags as well.
+-
+   StatementToIslMapTy NewSchedules;
+   for (auto NewMap : NewSched.get_map().get_map_list()) {
+     auto Stmt = reinterpret_cast<ScopStmt *>(
+         NewMap.get_tuple_id(isl::dim::in).get_user());
+     NewSchedules[Stmt] = NewMap;
+   }
+-
+   return isValidSchedule(S, NewSchedules);
+ }
+ 
+ bool Dependences::isValidSchedule(
+     Scop &S, const StatementToIslMapTy &NewSchedule) const {
+-  if (LegalityCheckDisabled)
+-    return true;
++    if (LegalityCheckDisabled) {
++        return true;
++    }
+ 
+-  isl::union_map Dependences = getDependences(TYPE_RAW | TYPE_WAW | TYPE_WAR);
+-  isl::union_map Schedule = isl::union_map::empty(S.getIslCtx());
++    isl::union_map Dependences = getDependences(TYPE_RAW | TYPE_WAW | TYPE_WAR);
++    if (Dependences.is_empty()) {
++        return true;
++    }
+ 
+-  isl::space ScheduleSpace;
++    isl::union_map Schedule = isl::union_map::empty(S.getIslCtx());
++    isl::space TimeSpace;
+ 
+-  for (ScopStmt &Stmt : S) {
+-    isl::map StmtScat;
++    for (ScopStmt &Stmt : S) {
++        isl::map StmtScat;
++        auto Lookup = NewSchedule.find(&Stmt);
++        if (Lookup == NewSchedule.end()) {
++            StmtScat = Stmt.getSchedule();
++        } else {
++            StmtScat = Lookup->second;
++        }
++        assert(!StmtScat.is_null() &&
++               "Schedules that contain extension nodes require special handling.");
+ 
+-    auto Lookup = NewSchedule.find(&Stmt);
+-    if (Lookup == NewSchedule.end())
+-      StmtScat = Stmt.getSchedule();
+-    else
+-      StmtScat = Lookup->second;
+-    assert(!StmtScat.is_null() &&
+-           "Schedules that contain extension nodes require special handling.");
++        if (TimeSpace.is_null() && !StmtScat.is_empty()) {
++            TimeSpace = StmtScat.get_space().range();
++        }
+ 
+-    if (ScheduleSpace.is_null())
+-      ScheduleSpace = StmtScat.get_space().range();
++        Schedule = Schedule.unite(StmtScat);
++    }
+ 
+-    Schedule = Schedule.unite(StmtScat);
+-  }
++    Dependences = Dependences.apply_domain(Schedule).apply_range(Schedule);
++    if (Dependences.is_empty()) {
++        return true;
++    }
+ 
+-  Dependences = Dependences.apply_domain(Schedule);
+-  Dependences = Dependences.apply_range(Schedule);
++    if (TimeSpace.is_null()) {
++        return true;
++    }
++    isl::map LexGT_Relation = isl::map::lex_gt(TimeSpace);
+ 
+-  isl::set Zero = isl::set::universe(ScheduleSpace);
+-  for (auto i : rangeIslSize(0, Zero.tuple_dim()))
+-    Zero = Zero.fix_si(isl::dim::set, i, 0);
++    for (isl::map DepMap : Dependences.get_map_list()) {
++        if (DepMap.is_empty()) {
++            continue;
++        }
+ 
+-  isl::union_set UDeltas = Dependences.deltas();
+-  isl::set Deltas = singleton(UDeltas, ScheduleSpace);
++        isl::map Violations = DepMap.intersect(LexGT_Relation);
++
++        if (!Violations.is_empty()) {
++            return false;
++        }
++    }
++
++    return true;
++}
+ 
+-  isl::space Space = Deltas.get_space();
+-  isl::map NonPositive = isl::map::universe(Space.map_from_set());
+-  NonPositive =
+-      NonPositive.lex_le_at(isl::multi_pw_aff::identity_on_domain(Space));
+-  NonPositive = NonPositive.intersect_domain(Deltas);
+-  NonPositive = NonPositive.intersect_range(Zero);
+-
+-  return NonPositive.is_empty();
+-}
+-
+-// Check if the current scheduling dimension is parallel.
+-//
+-// We check for parallelism by verifying that the loop does not carry any
+-// dependences.
+-//
+-// Parallelism test: if the distance is zero in all outer dimensions, then it
+-// has to be zero in the current dimension as well.
+-//
+-// Implementation: first, translate dependences into time space, then force
+-// outer dimensions to be equal. If the distance is zero in the current
+-// dimension, then the loop is parallel. The distance is zero in the current
+-// dimension if it is a subset of a map with equal values for the current
+-// dimension.
+ bool Dependences::isParallel(__isl_keep isl_union_map *Schedule,
+                              __isl_take isl_union_map *Deps,
+                              __isl_give isl_pw_aff **MinDistancePtr) const {
+@@ -733,7 +590,8 @@ bool Dependences::isParallel(__isl_keep
+   Deltas = isl_map_deltas(ScheduleDeps);
+   Distance = isl_set_universe(isl_set_get_space(Deltas));
+ 
+-  // [0, ..., 0, +] - All zeros and last dimension larger than zero
++  // A loop-carried dependence at the current dimension has a distance vector
++  // of the form [0, ..., 0, d] where d >= 1.
+   for (unsigned i = 0; i < Dimension; i++)
+     Distance = isl_set_fix_si(Distance, isl_dim_set, i, 0);
+ 
+@@ -749,9 +607,6 @@ bool Dependences::isParallel(__isl_keep
+   Distance = isl_set_project_out(Distance, isl_dim_set, 0, Dimension);
+   Distance = isl_set_coalesce(Distance);
+ 
+-  // This last step will compute a expression for the minimal value in the
+-  // distance polyhedron Distance with regards to the first (outer most)
+-  // dimension.
+   *MinDistancePtr = isl_pw_aff_coalesce(isl_set_dim_min(Distance, 0));
+ 
+   return false;
+@@ -796,7 +651,7 @@ void Dependences::releaseMemory() {
+ isl::union_map Dependences::getDependences(int Kinds) const {
+   assert(hasValidDependences() && "No valid dependences available");
+   isl::space Space = isl::manage_copy(RAW).get_space();
+-  isl::union_map Deps = Deps.empty(Space.ctx());
++  isl::union_map Deps = isl::union_map::empty(Space.ctx());
+ 
+   if (Kinds & TYPE_RAW)
+     Deps = Deps.unite(isl::manage_copy(RAW));
+@@ -842,8 +697,9 @@ DependenceAnalysis::Result::getDependenc
+   return recomputeDependences(Level);
+ }
+ 
+-const Dependences &DependenceAnalysis::Result::recomputeDependences(
+-    Dependences::AnalysisLevel Level) {
++const Dependences &
++DependenceAnalysis::Result::recomputeDependences(
++  Dependences::AnalysisLevel Level) {
+   D[Level].reset(new Dependences(S.getSharedIslCtx(), Level));
+   D[Level]->calculateDependences(S);
+   return *D[Level];
+@@ -873,7 +729,6 @@ DependenceInfoPrinterPass::run(Scop &S,
+     return PreservedAnalyses::all();
+   }
+ 
+-  // Otherwise create the dependences on-the-fly and print them
+   Dependences D(S.getSharedIslCtx(), OptAnalysisLevel);
+   D.calculateDependences(S);
+   D.print(OS);
+@@ -906,15 +761,12 @@ bool DependenceInfo::runOnScop(Scop &Sco
+   return false;
+ }
+ 
+-/// Print the dependences for the given SCoP to @p OS.
+-
+ void polly::DependenceInfo::printScop(raw_ostream &OS, Scop &S) const {
+   if (auto d = D[OptAnalysisLevel].get()) {
+     d->print(OS);
+     return;
+   }
+ 
+-  // Otherwise create the dependences on-the-fly and print it
+   Dependences D(S.getSharedIslCtx(), OptAnalysisLevel);
+   D.calculateDependences(S);
+   D.print(OS);
+@@ -938,24 +790,19 @@ INITIALIZE_PASS_END(DependenceInfo, "pol
+ //===----------------------------------------------------------------------===//
+ 
+ namespace {
+-/// Print result from DependenceAnalysis.
+ class DependenceInfoPrinterLegacyPass final : public ScopPass {
+ public:
+   static char ID;
+-
+   DependenceInfoPrinterLegacyPass() : DependenceInfoPrinterLegacyPass(outs()) {}
+-
+   explicit DependenceInfoPrinterLegacyPass(llvm::raw_ostream &OS)
+       : ScopPass(ID), OS(OS) {}
+ 
+   bool runOnScop(Scop &S) override {
+     DependenceInfo &P = getAnalysis<DependenceInfo>();
+-
+     OS << "Printing analysis '" << P.getPassName() << "' for "
+        << "region: '" << S.getRegion().getNameStr() << "' in function '"
+        << S.getFunction().getName() << "':\n";
+     P.printScop(OS, S);
+-
+     return false;
+   }
+ 
+@@ -968,7 +815,6 @@ public:
+ private:
+   llvm::raw_ostream &OS;
+ };
+-
+ char DependenceInfoPrinterLegacyPass::ID = 0;
+ } // namespace
+ 
+@@ -1045,24 +891,19 @@ INITIALIZE_PASS_END(
+ //===----------------------------------------------------------------------===//
+ 
+ namespace {
+-/// Print result from DependenceInfoWrapperPass.
+ class DependenceInfoPrinterLegacyFunctionPass final : public FunctionPass {
+ public:
+   static char ID;
+-
+   DependenceInfoPrinterLegacyFunctionPass()
+       : DependenceInfoPrinterLegacyFunctionPass(outs()) {}
+-
+   explicit DependenceInfoPrinterLegacyFunctionPass(llvm::raw_ostream &OS)
+       : FunctionPass(ID), OS(OS) {}
+ 
+   bool runOnFunction(Function &F) override {
+     DependenceInfoWrapperPass &P = getAnalysis<DependenceInfoWrapperPass>();
+-
+     OS << "Printing analysis '" << P.getPassName() << "' for function '"
+        << F.getName() << "':\n";
+     P.print(OS);
+-
+     return false;
+   }
+ 
+@@ -1075,7 +916,6 @@ public:
+ private:
+   llvm::raw_ostream &OS;
+ };
+-
+ char DependenceInfoPrinterLegacyFunctionPass::ID = 0;
+ } // namespace
+ 
