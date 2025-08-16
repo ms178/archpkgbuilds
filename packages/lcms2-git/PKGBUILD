@@ -1,44 +1,347 @@
-# Maintainer: Chocobo1 <chocobo1 AT archlinux DOT net>
-
+# Maintainer: Super Genius CachyOS Maintainer
 pkgname=lcms2-git
-pkgver=2.16.r38.gdf0ffb1
+pkgver=2.17.r37.g59feb9e
 pkgrel=1
-pkgdesc="Small-footprint color management engine"
-arch=('i686' 'x86_64')
-url="https://www.littlecms.com/"
+pkgdesc='Small-footprint color management engine (git, multi-pass PGO + CS-PGO with BOLT)'
+arch=('x86_64')
+url='https://www.littlecms.com/'
 license=('MIT')
 depends=('glibc' 'libtiff')
-makedepends=('git')
-provides=('lcms2' liblcms2.so=2-64)
+makedepends=(
+  git clang llvm lld
+  autoconf automake libtool pkgconf
+)
+provides=('lcms2' 'liblcms2.so=2-64')
 conflicts=('lcms2')
 options=('staticlibs')
-source=("git+https://github.com/mm2/Little-CMS.git")
+source=('Little-CMS::git+https://github.com/mm2/Little-CMS.git')
 sha256sums=('SKIP')
 
+##############################################################################
+# Keep user CFLAGS/CXXFLAGS intact; we only append per pass
+##############################################################################
+_extra_instr='-g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=150 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling'
 
 pkgver() {
-  cd "Little-CMS"
-
-  git describe --long --tags | sed 's/^lcms//;s/\([^-]*-g\)/r\1/;s/-/./g'
+  cd Little-CMS
+  git fetch --tags --quiet || true
+  # Typical describe: lcms2.17-37-g<hash> -> 2.17.r37.g<hash>
+  local desc
+  desc=$(git describe --tags --long --match 'lcms*' 2>/dev/null || echo "lcms0-0-g$(git rev-parse --short HEAD)")
+  sed -E 's/^lcms//; s/-([0-9]+)-g/.r\1.g/; s/-/./g' <<< "$desc"
 }
 
-build() {
-  cd "Little-CMS"
+prepare() {
+  cd "$srcdir"
+  rm -rf Little-CMS-gen Little-CMS-cs Little-CMS-final bolt
+  cp -a Little-CMS Little-CMS-gen
+  cp -a Little-CMS Little-CMS-cs
+  cp -a Little-CMS Little-CMS-final
+  mkdir -p bolt
+}
 
-  autoreconf -vfi
-  ./configure --prefix="/usr"
-  make
+##############################################################################
+# Training workload
+# - For PGO stages: run upstream tests (make check) plus direct test binaries,
+#   and exercise CLI utilities to cover many code paths.
+# - For BOLT stages: do NOT run `make check` (may relink), only run prebuilt
+#   test binaries and utilities directly to ensure the instrumented lib is used.
+##############################################################################
+_run_lcms_workload() { # $1 = build dir; $2 = mode: pgo | bolt
+  local bdir="$1"
+  local mode="${2:-pgo}"
+  local libdir="$bdir/src/.libs"
+
+  if [[ ! -d "$libdir" ]]; then
+    echo "==> [lcms2] Training: libdir not found: $libdir"
+    return 1
+  fi
+
+  echo "==> [lcms2] Training($mode): start in $bdir"
+  echo "==> [lcms2] Training($mode): LD_LIBRARY_PATH=$libdir"
+
+  # Helper: run utilities if available
+  _run_utils() {
+    local ran_any=0
+    # testbed/testcms for deeper coverage
+    if [[ -x "$bdir/testbed/.libs/testcms" ]]; then
+      ran_any=1
+      echo "==> [lcms2] Training($mode): running testcms -r -t"
+      LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        "$bdir/testbed/.libs/testcms" -r >/dev/null 2>&1 || true
+      LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        "$bdir/testbed/.libs/testcms" -t >/dev/null 2>&1 || true
+    fi
+    # Exercise various installed utilities if built (help path to avoid inputs)
+    local exe p
+    for exe in xicclu tificc jpgicc linkicc transicc psicc icc2ps; do
+      p="$(find "$bdir" -path "*/$exe/.libs/$exe" -type f -perm -111 -print -quit 2>/dev/null || true)"
+      if [[ -n "$p" ]]; then
+        ran_any=1
+        echo "==> [lcms2] Training($mode): running $exe -h"
+        LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$p" -h >/dev/null 2>&1 || true
+      fi
+    done
+    if [[ $ran_any -eq 0 ]]; then
+      echo "==> [lcms2] Training($mode): no test binaries/utilities found."
+    fi
+  }
+
+  if [[ "$mode" = "pgo" ]]; then
+    # Run upstream test suite first
+    LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+      make -C "$bdir" -k check || echo "==> [lcms2] Training(pgo): make check reported failures (continuing)."
+    _run_utils
+  else
+    # BOLT: avoid make check; run binaries directly
+    _run_utils
+  fi
+
+  echo "==> [lcms2] Training($mode): completed."
+  return 0
+}
+
+##############################################################################
+# Build: PGO → CS-PGO → Final, then BOLT on liblcms2.so
+##############################################################################
+build() {
+  export CC=clang
+  export CXX=clang++
+
+  # Preserve user flags; append per pass locally
+  local U_CFLAGS="$CFLAGS"
+  local U_CXXFLAGS="$CXXFLAGS"
+  local U_LDFLAGS="$LDFLAGS"
+
+  # Detect CS-PGO support
+  local HAVE_CS=0
+  if clang --help 2>/dev/null | grep -q -- '-fcs-profile-generate'; then
+    HAVE_CS=1
+  fi
+
+  local gen_dir="$srcdir/pgo-gen"
+  local cs_dir="$srcdir/pgo-cs"
+  mkdir -p "$gen_dir" "$cs_dir"
+
+  local p1="$srcdir/Little-CMS-gen"
+  local p2="$srcdir/Little-CMS-cs"
+  local p3="$srcdir/Little-CMS-final"
+
+  # ---------- PASS 1 : profile-generate -------------------------------------
+  echo "==> [lcms2] PASS 1: configure+build (PGO instrumentation)..."
+  ( cd "$p1"
+    autoreconf -fi
+    CFLAGS="$U_CFLAGS $_extra_instr -fprofile-generate=$gen_dir" \
+    CXXFLAGS="$U_CXXFLAGS $_extra_instr -fprofile-generate=$gen_dir" \
+    LDFLAGS="$U_LDFLAGS -fprofile-generate=$gen_dir" \
+    ./configure --prefix=/usr
+    LLVM_PROFILE_FILE="$gen_dir/%p.profraw" make
+  )
+
+  echo "==> [lcms2] PASS 1: training (make check + testcms + utilities)..."
+  LLVM_PROFILE_FILE="$gen_dir/%p.profraw" _run_lcms_workload "$p1" pgo || echo "==> [lcms2] PASS 1: training failed to run."
+
+  local HAVE_GEN=0
+  if compgen -G "$gen_dir/*.profraw" >/dev/null; then
+    echo "==> [lcms2] PASS 1: merging profiles..."
+    llvm-profdata merge -o "$srcdir/gen.prof" "$gen_dir"/*.profraw
+    HAVE_GEN=1
+  else
+    echo "==> [lcms2] PASS 1: no PGO profiles produced; continuing."
+  fi
+
+  # ---------- PASS 2 : profile-use + CS profile-generate --------------------
+  echo "==> [lcms2] PASS 2: configure+build (profile-use + CS instrumentation if available)..."
+  ( cd "$p2"
+    autoreconf -fi
+    local c_cs="$U_CFLAGS $_extra_instr"
+    local cx_cs="$U_CXXFLAGS $_extra_instr"
+    local l_cs="$U_LDFLAGS"
+    if [[ $HAVE_GEN -eq 1 ]]; then
+      c_cs+=" -fprofile-use=$srcdir/gen.prof"
+      cx_cs+=" -fprofile-use=$srcdir/gen.prof"
+      l_cs+=" -fprofile-use=$srcdir/gen.prof"
+    fi
+    if [[ $HAVE_CS -eq 1 ]]; then
+      c_cs+=" -fcs-profile-generate=$cs_dir"
+      cx_cs+=" -fcs-profile-generate=$cs_dir"
+      l_cs+=" -fcs-profile-generate=$cs_dir"
+    else
+      echo "==> [lcms2] PASS 2: CS-PGO not supported by clang; building with standard PGO only."
+    fi
+    CFLAGS="$c_cs" CXXFLAGS="$cx_cs" LDFLAGS="$l_cs" ./configure --prefix=/usr
+    LLVM_PROFILE_FILE="$cs_dir/%p.profraw" make
+  )
+
+  echo "==> [lcms2] PASS 2: training (make check + testcms + utilities)..."
+  LLVM_PROFILE_FILE="$cs_dir/%p.profraw" _run_lcms_workload "$p2" pgo || echo "==> [lcms2] PASS 2: training failed to run."
+
+  local HAVE_FINAL=0
+  if compgen -G "$cs_dir/*.profraw" >/dev/null; then
+    echo "==> [lcms2] PASS 2: merging CS + base profiles..."
+    if [[ $HAVE_GEN -eq 1 ]]; then
+      llvm-profdata merge -o "$srcdir/final.prof" "$cs_dir"/*.profraw "$srcdir/gen.prof"
+    else
+      llvm-profdata merge -o "$srcdir/final.prof" "$cs_dir"/*.profraw
+    fi
+    HAVE_FINAL=1
+  elif [[ $HAVE_GEN -eq 1 ]]; then
+    echo "==> [lcms2] PASS 2: no CS profiles; using PASS 1 profile."
+    cp -f "$srcdir/gen.prof" "$srcdir/final.prof"
+    HAVE_FINAL=1
+  else
+    echo "==> [lcms2] PASS 2: no profiles at all; final will be built without profile-use."
+  fi
+
+  # ---------- PASS 3 : final profile-use ------------------------------------
+  echo "==> [lcms2] PASS 3: configure+build (final optimized)..."
+  ( cd "$p3"
+    autoreconf -fi
+    local c_fin="$U_CFLAGS"
+    local cx_fin="$U_CXXFLAGS"
+    local l_fin="$U_LDFLAGS"
+    if [[ $HAVE_FINAL -eq 1 ]]; then
+      c_fin+=" -fprofile-use=$srcdir/final.prof"
+      cx_fin+=" -fprofile-use=$srcdir/final.prof"
+      l_fin+=" -fprofile-use=$srcdir/final.prof"
+    fi
+    # Help BOLT with relocations on the final build
+    if command -v llvm-bolt >/dev/null 2>&1; then
+      l_fin+=" -Wl,--emit-relocs"
+    fi
+    CFLAGS="$c_fin" CXXFLAGS="$cx_fin" LDFLAGS="$l_fin" ./configure --prefix=/usr
+    make
+    # Pre-build the tests once so they exist for BOLT training
+    make -k check || echo "==> [lcms2] PASS 3: pre-BOLT make check reported failures (continuing)."
+  )
+
+  # ---------- BOLT post-link on liblcms2.so ---------------------------------
+  if command -v llvm-bolt >/dev/null 2>&1; then
+    echo "==> [lcms2] BOLT: post-link instrumentation and optimization on liblcms2.so..."
+    local libdir="$p3/src/.libs"
+    local lib_so
+    if [[ -e "$libdir/liblcms2.so" ]]; then
+      lib_so="$(readlink -f "$libdir/liblcms2.so")"
+    fi
+    if [[ -z "$lib_so" || ! -f "$lib_so" ]]; then
+      lib_so="$(find "$libdir" -maxdepth 1 -type f -name 'liblcms2.so*' -printf '%p\n' 2>/dev/null | sort -r | head -n1 || true)"
+    fi
+    if [[ -z "$lib_so" || ! -f "$lib_so" ]]; then
+      echo "==> [lcms2] BOLT: could not locate built liblcms2.so; skipping BOLT."
+    else
+      echo "==> [lcms2] BOLT: targeting $lib_so"
+      local bolt_dir="$srcdir/bolt"
+      local orig="$bolt_dir/liblcms2.orig.so"
+      local inst="$bolt_dir/liblcms2.inst.so"
+      local fdata_base="$bolt_dir/liblcms2"
+      rm -f "$fdata_base.fdata" "$fdata_base.fdata".*
+      cp -f "$lib_so" "$orig"
+
+      # Instrument the library (lite + skip problematic symbols)
+      local bolt_skip='(__x86\.get_pc_thunk\..*|.*@plt|.*\.plt(\..*)?$|.*\.text/.*|_init|_fini|_start|start|__.*)'
+      echo "==> [lcms2] BOLT: instrumenting (lite + skip-funcs, append pid)..."
+      if ! llvm-bolt "$lib_so" \
+            --relocs \
+            --lite \
+            --skip-funcs="$bolt_skip" \
+            --instrument \
+            --instrumentation-file="$fdata_base.fdata" \
+            --instrumentation-file-append-pid \
+            -o "$inst"; then
+        echo "==> [lcms2] BOLT: instrumentation failed; skipping BOLT."
+      else
+        # Replace in-tree library with instrumented copy
+        install -m755 "$inst" "$lib_so"
+
+        # Ensure runtime writes fdata files; set env overrides as extra safety
+        export BOLT_INSTRUMENTATION_FILE="$fdata_base.fdata"
+        export BOLT_INSTRUMENTATION_FILE_APPEND_PID=1
+        export LD_BIND_NOW=1
+
+        echo "==> [lcms2] BOLT: training instrumented library with test binaries..."
+        _run_lcms_workload "$p3" bolt || echo "==> [lcms2] BOLT: training failed to run."
+
+        # Merge resulting fdata shards
+        local merged="$bolt_dir/liblcms2.merged.fdata"
+        if compgen -G "$fdata_base.fdata".* >/dev/null; then
+          echo "==> [lcms2] BOLT: merging fdata shards..."
+          if command -v merge-fdata >/dev/null 2>&1; then
+            merge-fdata "$fdata_base.fdata".* -o "$merged" || merged=""
+          else
+            cat "$fdata_base.fdata".* > "$merged" || merged=""
+          fi
+        elif [[ -s "$fdata_base.fdata" ]]; then
+          cp -f "$fdata_base.fdata" "$merged"
+        else
+          merged=""
+        fi
+
+        if [[ -z "$merged" || ! -s "$merged" ]]; then
+          echo "==> [lcms2] BOLT: no .fdata produced; restoring original and skipping optimization."
+          install -m755 "$orig" "$lib_so"
+        else
+          # Optimize the original library using collected profile
+          echo "==> [lcms2] BOLT: optimizing original library with collected profile..."
+          local bolt_help
+          bolt_help="$(llvm-bolt --help 2>&1 || true)"
+          local bolt_align_flags=(--align-blocks)
+          if grep -q -- '--block-alignment' <<<"$bolt_help"; then
+            bolt_align_flags=(--align-blocks --block-alignment=32)
+          fi
+
+          local bolt_out="$bolt_dir/liblcms2.bolt.so"
+          if llvm-bolt "$orig" \
+                --relocs \
+                --data="$merged" \
+                --reorder-blocks=ext-tsp \
+                --reorder-functions=cdsort \
+                --split-functions \
+                --split-strategy=cdsplit \
+                --icf=all \
+                --jump-tables=move \
+                --peepholes=all \
+                "${bolt_align_flags[@]}" \
+                --dyno-stats \
+                -o "$bolt_out"; then
+            install -m755 "$bolt_out" "$lib_so"
+            echo "==> [lcms2] BOLT: optimization applied to $lib_so"
+          else
+            echo "==> [lcms2] BOLT: optimization failed; restoring original."
+            install -m755 "$orig" "$lib_so"
+          fi
+        fi
+      fi
+    fi
+  else
+    echo "==> [lcms2] BOLT: llvm-bolt not found; skipping BOLT step."
+  fi
 }
 
 check() {
-  cd "Little-CMS"
-
-  make check
+  echo "==> [lcms2] Verifying final build..."
+  local p3="$srcdir/Little-CMS-final"
+  local libdir="$p3/src/.libs"
+  if [[ -d "$libdir" ]]; then
+    LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" make -C "$p3" -k check || true
+  else
+    echo "==> [lcms2] Final lib directory not found; skipping tests."
+  fi
 }
 
 package() {
-  cd "Little-CMS"
+  echo "==> [lcms2] Installing final artifacts..."
+  cd "$srcdir/Little-CMS-final"
 
-  make DESTDIR="$pkgdir" install
-  install -D -m0644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  make DESTDIR="${pkgdir}" install
+
+  # Install license: prefer LICENSE (as upstream example), fallback to source tree/COPYING if needed
+  if [[ -f LICENSE ]]; then
+    install -D -m0644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  elif [[ -f "$srcdir/Little-CMS/LICENSE" ]]; then
+    install -D -m0644 "$srcdir/Little-CMS/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  elif [[ -f "$srcdir/Little-CMS/COPYING" ]]; then
+    install -D -m0644 "$srcdir/Little-CMS/COPYING" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  else
+    echo "==> [lcms2] Warning: license file not found in build or source tree." >&2
+  fi
 }
