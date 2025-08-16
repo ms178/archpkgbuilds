@@ -30,6 +30,7 @@
 
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <xorg-server.h>
 /* Driver data structures */
 #include "amdgpu_drv.h"
 #include "amdgpu_bo_helper.h"
@@ -38,9 +39,6 @@
 #include "amdgpu_probe.h"
 #include "micmap.h"
 #include "mipointrst.h"
-#include "dix.h"
-#include "dixstruct.h"
-#include <X11/Xproto.h>
 
 #include "amdgpu_version.h"
 #include "shadow.h"
@@ -65,26 +63,17 @@
 
 #include <gbm.h>
 
-#if (defined(__GNUC__) && (__GNUC__ >= 3)) || defined(__clang__)
-#define likely(x)   __builtin_expect(!!(x),1)
-#define unlikely(x) __builtin_expect(!!(x),0)
+#if defined(__GNUC__) || defined(__clang__)
+#define AMDGPU_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define AMDGPU_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define AMDGPU_HOT         __attribute__((hot))
+#define AMDGPU_COLD        __attribute__((cold))
 #else
-#define likely(x)   (x)
-#define unlikely(x) (x)
+#define AMDGPU_LIKELY(x)   (x)
+#define AMDGPU_UNLIKELY(x) (x)
+#define AMDGPU_HOT
+#define AMDGPU_COLD
 #endif
-
-static volatile int vrr_prop_lock = 0;
-
-static inline void vrr_lock(void)
-{
-	while (__sync_lock_test_and_set(&vrr_prop_lock, 1))
-		;                       /* spin  */
-}
-
-static inline void vrr_unlock(void)
-{
-	__sync_lock_release(&vrr_prop_lock);
-}
 
 static DevPrivateKeyRec amdgpu_window_private_key;
 static DevScreenPrivateKeyRec amdgpu_client_private_key;
@@ -141,43 +130,34 @@ amdgpu_vrr_property_update(WindowPtr window, Bool variable_refresh)
 static int
 amdgpu_change_property(ClientPtr client)
 {
-	/* Declare the request pointer “stuff” *before* any use ------------ */
+	WindowPtr window;
+	int ret;
+
 	REQUEST(xChangePropertyReq);
 
-	WindowPtr window = NULL;
-	int       ret;
-
-	/* ---------------------------------------------------------------- *
-	 * 1.  Temporarily unwrap this client’s request vector
-	 *     We lock only around the vector manipulation to avoid dead-
-	 *     locks should the real handler call back into property code.
-	 * ---------------------------------------------------------------- */
-	vrr_lock();
 	client->requestVector[X_ChangeProperty] = saved_change_property;
-	vrr_unlock();
+	ret = saved_change_property(client);
 
-	ret = saved_change_property(client);          /* do the real work */
+	if (restore_property_vector)
+		return ret;
 
-	/* ---------------------------------------------------------------- *
-	 * 2.  Re-wrap and, if the request touches _VARIABLE_REFRESH,
-	 *     update our internal VRR state.
-	 * ---------------------------------------------------------------- */
-	vrr_lock();
+	client->requestVector[X_ChangeProperty] = amdgpu_change_property;
 
-	if (!restore_property_vector)
-		client->requestVector[X_ChangeProperty] = amdgpu_change_property;
+	if (ret != Success)
+		return ret;
 
-	if (ret == Success &&
-		dixLookupWindow(&window, stuff->window, client, DixSetPropAccess) == Success &&
-		stuff->property == amdgpu_vrr_atom &&
-		xf86ScreenToScrn(window->drawable.pScreen)->PreInit == AMDGPUPreInit_KMS &&
-		stuff->format == 32 && stuff->nUnits == 1)
-	{
-		amdgpu_vrr_property_update(window,
-								   ((uint32_t *)(stuff + 1))[0] != 0);
+	ret = dixLookupWindow(&window, stuff->window, client, DixSetPropAccess);
+	if (ret != Success)
+		return ret;
+
+	if (stuff->property == amdgpu_vrr_atom &&
+	    xf86ScreenToScrn(window->drawable.pScreen)->PreInit ==
+	    AMDGPUPreInit_KMS && stuff->format == 32 && stuff->nUnits == 1) {
+		uint32_t *value = (uint32_t*)(stuff + 1);
+
+		amdgpu_vrr_property_update(window, *value != 0);
 	}
 
-	vrr_unlock();
 	return ret;
 }
 
@@ -185,68 +165,75 @@ amdgpu_change_property(ClientPtr client)
 static int
 amdgpu_delete_property(ClientPtr client)
 {
-	/* Declare “stuff” immediately – required for C99 and later -------- */
+	WindowPtr window;
+	int ret;
+
 	REQUEST(xDeletePropertyReq);
 
-	WindowPtr window = NULL;
-	int       ret;
-
-	/* Unwrap this particular client instance -------------------------- */
-	vrr_lock();
 	client->requestVector[X_DeleteProperty] = saved_delete_property;
-	vrr_unlock();
-
 	ret = saved_delete_property(client);
 
-	/* Re-wrap and handle VRR reset ------------------------------------ */
-	vrr_lock();
+	if (restore_property_vector)
+		return ret;
 
-	if (!restore_property_vector)
-		client->requestVector[X_DeleteProperty] = amdgpu_delete_property;
+	client->requestVector[X_DeleteProperty] = amdgpu_delete_property;
 
-	if (ret == Success &&
-		dixLookupWindow(&window, stuff->window, client, DixSetPropAccess) == Success &&
-		stuff->property == amdgpu_vrr_atom &&
-		xf86ScreenToScrn(window->drawable.pScreen)->PreInit == AMDGPUPreInit_KMS)
-	{
+	if (ret != Success)
+		return ret;
+
+	ret = dixLookupWindow(&window, stuff->window, client, DixSetPropAccess);
+	if (ret != Success)
+		return ret;
+
+	if (stuff->property == amdgpu_vrr_atom &&
+	    xf86ScreenToScrn(window->drawable.pScreen)->PreInit ==
+	    AMDGPUPreInit_KMS)
 		amdgpu_vrr_property_update(window, FALSE);
-	}
 
-	vrr_unlock();
 	return ret;
 }
 
 static void
 amdgpu_unwrap_property_requests(ScrnInfoPtr scrn)
 {
-	int i;
+    int i;
 
-	vrr_lock();
-	if (!amdgpu_property_vectors_wrapped) {
-		vrr_unlock();
-		return;
-	}
+    if (!amdgpu_property_vectors_wrapped)
+        return;
 
-	if (ProcVector[X_ChangeProperty] == amdgpu_change_property)
-		ProcVector[X_ChangeProperty] = saved_change_property;
+    if (ProcVector[X_ChangeProperty] == amdgpu_change_property)
+        ProcVector[X_ChangeProperty] = saved_change_property;
+    else
+        restore_property_vector = TRUE;
 
-	if (ProcVector[X_DeleteProperty] == amdgpu_delete_property)
-		ProcVector[X_DeleteProperty] = saved_delete_property;
+    if (ProcVector[X_DeleteProperty] == amdgpu_delete_property)
+        ProcVector[X_DeleteProperty] = saved_delete_property;
+    else
+        restore_property_vector = TRUE;
 
-	for (i = 0; i < currentMaxClients; ++i) {
-		if (!clients[i])
-			continue;
+    for (i = 0; i < currentMaxClients; i++) {
+        if (!clients[i])
+            continue;
 
-		if (clients[i]->requestVector[X_ChangeProperty] == amdgpu_change_property)
-			clients[i]->requestVector[X_ChangeProperty] = saved_change_property;
+        if (clients[i]->requestVector[X_ChangeProperty] == amdgpu_change_property) {
+            clients[i]->requestVector[X_ChangeProperty] = saved_change_property;
+        } else {
+            restore_property_vector = TRUE;
+        }
 
-		if (clients[i]->requestVector[X_DeleteProperty] == amdgpu_delete_property)
-			clients[i]->requestVector[X_DeleteProperty] = saved_delete_property;
-	}
+        if (clients[i]->requestVector[X_DeleteProperty] == amdgpu_delete_property) {
+            clients[i]->requestVector[X_DeleteProperty] = saved_delete_property;
+        } else {
+            restore_property_vector = TRUE;
+        }
+    }
 
-	amdgpu_property_vectors_wrapped = FALSE;
-	restore_property_vector         = FALSE;
-	vrr_unlock();
+    if (restore_property_vector) {
+        xf86DrvMsg(scrn->scrnIndex, X_WARNING,
+                   "Couldn't unwrap some window property request vectors\n");
+    }
+
+    amdgpu_property_vectors_wrapped = FALSE;
 }
 
 extern _X_EXPORT int gAMDGPUEntityIndex;
@@ -344,21 +331,13 @@ amdgpuUpdatePacked(ScreenPtr pScreen, shadowBufPtr pBuf)
 }
 
 static inline Bool
-callback_needs_flush(AMDGPUInfoPtr                    info,
-					 struct amdgpu_client_priv *const client_priv)
+callback_needs_flush(AMDGPUInfoPtr info, struct amdgpu_client_priv *client_priv)
 {
-	if (unlikely(!client_priv))
-		return FALSE;
+    if (AMDGPU_UNLIKELY(!client_priv))
+        return FALSE;
 
-	/* Hide the inevitable cache miss.  1 = high temporal locality.       */
-	__builtin_prefetch(client_priv, 0, 1);
-
-	/*
-	 * `needs_flush` and `gpu_flushed` are monotonically increasing
-	 * 32-bit counters.  Simple inequality is sufficient and immune to
-	 * wrap-around in unsigned arithmetic space.
-	 */
-	return client_priv->needs_flush != info->gpu_flushed;
+    // Wrap-safe comparison: flush only if needs_flush is ahead of gpu_flushed
+    return ((int32_t)(client_priv->needs_flush - info->gpu_flushed)) > 0;
 }
 
 static void
@@ -491,150 +470,176 @@ static Bool AMDGPUCreateScreenResources_KMS(ScreenPtr pScreen)
 	return TRUE;
 }
 
-static __attribute__((hot)) Bool
+static AMDGPU_HOT Bool
 amdgpu_scanout_extents_intersect(xf86CrtcPtr xf86_crtc, BoxPtr extents)
 {
-	/* Early out – full reject if extents are *completely* outside CRTC */
-	if (!xf86_crtc->driverIsPerformingTransform &&
-		!xf86_crtc->scrn->is_gpu)
-	{
-		if (extents->x2 <= xf86_crtc->x ||
-			extents->x1 >= xf86_crtc->x + xf86_crtc->mode.HDisplay ||
-			extents->y2 <= xf86_crtc->y ||
-			extents->y1 >= xf86_crtc->y + xf86_crtc->mode.VDisplay)
-			return FALSE;
-	}
+    const Bool is_gpu = xf86_crtc->scrn->is_gpu;
+    const Bool needs_transform = xf86_crtc->driverIsPerformingTransform;
 
-	/* Translate into CRTC-local space and inflate for filters */
-	if (xf86_crtc->scrn->is_gpu) {
-		extents->x1 -= xf86_crtc->x;
-		extents->y1 -= xf86_crtc->y;
-		extents->x2 -= xf86_crtc->x;
-		extents->y2 -= xf86_crtc->y;
-	} else {
-		extents->x1 -= xf86_crtc->filter_width  >> 1;
-		extents->x2 += xf86_crtc->filter_width  >> 1;
-		extents->y1 -= xf86_crtc->filter_height >> 1;
-		extents->y2 += xf86_crtc->filter_height >> 1;
+    if (!is_gpu) {
+        const int fx = xf86_crtc->filter_width  >> 1;
+        const int fy = xf86_crtc->filter_height >> 1;
 
-		if (xf86_crtc->driverIsPerformingTransform)
-			pixman_f_transform_bounds(&xf86_crtc->f_framebuffer_to_crtc,
-									  extents);
-	}
+        // Correct early-reject: include filter inflation in the bounds test
+        if (!needs_transform) {
+            if (extents->x2 + fx <= xf86_crtc->x ||
+                extents->x1 - fx >= xf86_crtc->x + xf86_crtc->mode.HDisplay ||
+                extents->y2 + fy <= xf86_crtc->y ||
+                extents->y1 - fy >= xf86_crtc->y + xf86_crtc->mode.VDisplay)
+                return FALSE;
+        }
 
-	/* Clamp */
-	extents->x1 = max(extents->x1, 0);
-	extents->y1 = max(extents->y1, 0);
-	extents->x2 = min(extents->x2, xf86_crtc->mode.HDisplay);
-	extents->y2 = min(extents->y2, xf86_crtc->mode.VDisplay);
+        // Translate/inflate for non-GPU screen
+        extents->x1 -= fx;
+        extents->x2 += fx;
+        extents->y1 -= fy;
+        extents->y2 += fy;
 
-	return (extents->x1 < extents->x2) && (extents->y1 < extents->y2);
+        if (needs_transform) {
+            pixman_f_transform_bounds(&xf86_crtc->f_framebuffer_to_crtc, extents);
+        }
+    } else {
+        // GPU screen path: translate into CRTC-local space
+        extents->x1 -= xf86_crtc->x;
+        extents->y1 -= xf86_crtc->y;
+        extents->x2 -= xf86_crtc->x;
+        extents->y2 -= xf86_crtc->y;
+    }
+
+    // Clamp
+    extents->x1 = max(extents->x1, 0);
+    extents->y1 = max(extents->y1, 0);
+    extents->x2 = min(extents->x2, xf86_crtc->mode.HDisplay);
+    extents->y2 = min(extents->y2, xf86_crtc->mode.VDisplay);
+
+    return (extents->x1 < extents->x2) && (extents->y1 < extents->y2);
 }
 
-static __attribute__((hot)) RegionPtr
-transform_region(RegionPtr               region,
-				 struct pixman_f_transform *transform,
-				 int                        w,
-				 int                        h)
+static AMDGPU_HOT RegionPtr
+transform_region(RegionPtr region, struct pixman_f_transform *transform,
+                 int w, int h)
 {
-	const int nboxes = RegionNumRects(region);
-	const BoxPtr boxes = RegionRects(region);
+    const int nboxes = RegionNumRects(region);
+    const BoxPtr boxes = RegionRects(region);
 
-	if (nboxes == 0)
-		return RegionCreate(NULL, 0);
+    if (nboxes <= 0)
+        return RegionCreate(NULL, 0);
 
-	/* Use stack scratch for the common tiny case */
-	enum { SCRATCH_RECTS = 64 };
-	static xRectangle rect_static[SCRATCH_RECTS];
-	xRectangle *rects = (nboxes <= SCRATCH_RECTS) ?
-	rect_static :
-	calloc(nboxes, sizeof(*rects));
+    if (nboxes == 1) {
+        BoxRec b = boxes[0];
+        pixman_f_transform_bounds(transform, &b);
+        if (b.x1 < 0) b.x1 = 0;
+        if (b.y1 < 0) b.y1 = 0;
+        if (b.x2 >  w) b.x2 = w;
+        if (b.y2 >  h) b.y2 = h;
+        if (b.x1 >= b.x2 || b.y1 >= b.y2)
+            return RegionCreate(NULL, 0);
 
-	if (!rects) {                     /* OOM – safest fallback */
-		xf86Msg(X_WARNING,
-				"amdgpu: transform_region OOM, duplicating region\n");
-		return RegionDuplicate(region);
-	}
+        xRectangle rect = { .x = b.x1, .y = b.y1,
+                            .width = (uint16_t)(b.x2 - b.x1),
+                            .height = (uint16_t)(b.y2 - b.y1) };
+        return RegionFromRects(1, &rect, CT_UNSORTED);
+    }
 
-	int nrects = 0;
-	for (int i = 0; i < nboxes; ++i) {
-		BoxRec b = boxes[i];
+    enum { SBO = 64 };
+    xRectangle stack_rects[SBO];
+    xRectangle *rects = (nboxes <= SBO) ? stack_rects :
+                        (xRectangle*)malloc((size_t)nboxes * sizeof(*rects));
+    if (!rects) {
+        xf86Msg(X_WARNING, "amdgpu: transform_region OOM, duplicating region\n");
+        return RegionDuplicate(region);
+    }
 
-		pixman_f_transform_bounds(transform, &b);
+    int nrects = 0;
+    for (int i = 0; i < nboxes; ++i) {
+        BoxRec b = boxes[i];
+        pixman_f_transform_bounds(transform, &b);
 
-		/* Clip to target */
-		if (b.x1 < 0)       b.x1 = 0;
-		if (b.y1 < 0)       b.y1 = 0;
-		if (b.x2 >  w)      b.x2 = w;
-		if (b.y2 >  h)      b.y2 = h;
+        if (b.x1 < 0) b.x1 = 0;
+        if (b.y1 < 0) b.y1 = 0;
+        if (b.x2 >  w) b.x2 = w;
+        if (b.y2 >  h) b.y2 = h;
+        if (b.x1 >= b.x2 || b.y1 >= b.y2)
+            continue;
 
-		if (b.x1 >= b.x2 || b.y1 >= b.y2)
-			continue;
+        rects[nrects].x = (int16_t)b.x1;
+        rects[nrects].y = (int16_t)b.y1;
+        rects[nrects].width  = (uint16_t)(b.x2 - b.x1);
+        rects[nrects].height = (uint16_t)(b.y2 - b.y1);
+        ++nrects;
+    }
 
-		rects[nrects].x      = b.x1;
-		rects[nrects].y      = b.y1;
-		rects[nrects].width  = b.x2 - b.x1;
-		rects[nrects].height = b.y2 - b.y1;
-		++nrects;
-	}
-
-	RegionPtr out = RegionFromRects(nrects, rects, CT_UNSORTED);
-
-	if (rects != rect_static)
-		free(rects);
-
-	return out;
+    RegionPtr out = RegionFromRects(nrects, rects, CT_UNSORTED);
+    if (rects != stack_rects) free(rects);
+    return out;
 }
 
-static void
-amdgpu_sync_scanout_pixmaps(xf86CrtcPtr xf86_crtc, RegionPtr new_region,
-							int scanout_id)
+static AMDGPU_HOT void
+amdgpu_sync_scanout_pixmaps(xf86CrtcPtr xf86_crtc, RegionPtr new_region, int scanout_id)
 {
-	drmmode_crtc_private_ptr drmmode_crtc = xf86_crtc->driver_private;
-	DrawablePtr dst = &drmmode_crtc->scanout[scanout_id]->drawable;
-	DrawablePtr src = &drmmode_crtc->scanout[scanout_id ^ 1]->drawable;
-	RegionPtr last_region = &drmmode_crtc->scanout_last_region;
-	ScrnInfoPtr scrn = xf86_crtc->scrn;
-	ScreenPtr pScreen = scrn->pScreen;
-	RegionRec remaining;
-	RegionPtr sync_region = NULL;
-	BoxRec extents;
-	GCPtr gc;
+    drmmode_crtc_private_ptr drmmode_crtc = xf86_crtc->driver_private;
+    DrawablePtr dst = &drmmode_crtc->scanout[scanout_id]->drawable;
+    DrawablePtr src = &drmmode_crtc->scanout[scanout_id ^ 1]->drawable;
+    RegionPtr last_region = &drmmode_crtc->scanout_last_region;
+    ScrnInfoPtr scrn = xf86_crtc->scrn;
+    ScreenPtr pScreen = scrn->pScreen;
+    RegionRec remaining;
+    RegionPtr sync_region = NULL;
+    BoxRec extents;
 
-	if (RegionNil(last_region))
-		return;
+    if (RegionNil(last_region))
+        return;
 
-	RegionNull(&remaining);
-	RegionSubtract(&remaining, last_region, new_region);
-	if (RegionNil(&remaining))
-		goto uninit;
+    RegionNull(&remaining);
+    RegionSubtract(&remaining, last_region, new_region);
+    if (RegionNil(&remaining))
+        goto uninit;
 
-	extents = *RegionExtents(&remaining);
-	if (!amdgpu_scanout_extents_intersect(xf86_crtc, &extents))
-		goto uninit;
+    extents = *RegionExtents(&remaining);
+    if (!amdgpu_scanout_extents_intersect(xf86_crtc, &extents))
+        goto uninit;
 
-	if (xf86_crtc->driverIsPerformingTransform) {
-		sync_region = transform_region(&remaining,
-					       &xf86_crtc->f_framebuffer_to_crtc,
-					       dst->width, dst->height);
-	} else {
-		sync_region = RegionDuplicate(&remaining);
-		RegionTranslate(sync_region, -xf86_crtc->x, -xf86_crtc->y);
-	}
+    if (!xf86_crtc->driverIsPerformingTransform && RegionNumRects(&remaining) == 1) {
+        const BoxPtr r = RegionRects(&remaining);
+        const int rx1 = r->x1 - xf86_crtc->x;
+        const int ry1 = r->y1 - xf86_crtc->y;
+        const int w   = r->x2 - r->x1;
+        const int h   = r->y2 - r->y1;
+        if (w > 0 && h > 0) {
+            GCPtr gc = GetScratchGC(dst->depth, pScreen);
+            if (gc) {
+                ValidateGC(dst, gc);
+                gc->ops->CopyArea(src, dst, gc, rx1, ry1, w, h, rx1, ry1);
+                FreeScratchGC(gc);
+            }
+        }
+        goto uninit;
+    }
 
-	gc = GetScratchGC(dst->depth, pScreen);
-	if (gc) {
-		gc->funcs->ChangeClip(gc, CT_REGION, sync_region, 0);
-		ValidateGC(dst, gc);
-		sync_region = NULL;
-		gc->ops->CopyArea(src, dst, gc, 0, 0, dst->width, dst->height, 0, 0);
-		FreeScratchGC(gc);
-	}
+    if (xf86_crtc->driverIsPerformingTransform) {
+        sync_region = transform_region(&remaining,
+                                       &xf86_crtc->f_framebuffer_to_crtc,
+                                       dst->width, dst->height);
+    } else {
+        sync_region = RegionDuplicate(&remaining);
+        RegionTranslate(sync_region, -xf86_crtc->x, -xf86_crtc->y);
+    }
 
- uninit:
-	if (sync_region)
-		RegionDestroy(sync_region);
-	RegionUninit(&remaining);
+    {
+        GCPtr gc = GetScratchGC(dst->depth, pScreen);
+        if (gc) {
+            gc->funcs->ChangeClip(gc, CT_REGION, sync_region, 0);
+            ValidateGC(dst, gc);
+            sync_region = NULL;
+            gc->ops->CopyArea(src, dst, gc, 0, 0, dst->width, dst->height, 0, 0);
+            FreeScratchGC(gc);
+        }
+    }
+
+uninit:
+    if (sync_region)
+        RegionDestroy(sync_region);
+    RegionUninit(&remaining);
 }
 
 static void
@@ -665,29 +670,50 @@ amdgpu_scanout_flip_handler(xf86CrtcPtr crtc, uint32_t msc, uint64_t usec,
 }
 
 
-static RegionPtr
+static AMDGPU_HOT RegionPtr
 dirty_region(PixmapDirtyUpdatePtr dirty)
 {
-	RegionPtr damageregion = DamageRegion(dirty->damage);
-	RegionPtr dstregion;
+    RegionPtr damageregion = DamageRegion(dirty->damage);
 
-	if (dirty->rotation != RR_Rotate_0) {
-		dstregion = transform_region(damageregion,
-					     &dirty->f_inverse,
-					     dirty->secondary_dst->drawable.width,
-					     dirty->secondary_dst->drawable.height);
-	} else
-	{
-		RegionRec pixregion;
+    if (RegionNil(damageregion))
+        return RegionCreate(NULL, 0);
 
-		dstregion = RegionDuplicate(damageregion);
-		RegionTranslate(dstregion, -dirty->x, -dirty->y);
-		PixmapRegionInit(&pixregion, dirty->secondary_dst);
-		RegionIntersect(dstregion, dstregion, &pixregion);
-		RegionUninit(&pixregion);
-	}
+    if (dirty->rotation != RR_Rotate_0) {
+        return transform_region(damageregion, &dirty->f_inverse,
+                                dirty->secondary_dst->drawable.width,
+                                dirty->secondary_dst->drawable.height);
+    } else {
+        const int nboxes = RegionNumRects(damageregion);
+        const BoxPtr boxes = RegionRects(damageregion);
 
-	return dstregion;
+        if (nboxes == 1) {
+            BoxRec b = boxes[0];
+            b.x1 -= dirty->x; b.y1 -= dirty->y;
+            b.x2 -= dirty->x; b.y2 -= dirty->y;
+
+            if (b.x1 < 0) b.x1 = 0;
+            if (b.y1 < 0) b.y1 = 0;
+            const int w = dirty->secondary_dst->drawable.width;
+            const int h = dirty->secondary_dst->drawable.height;
+            if (b.x2 > w) b.x2 = w;
+            if (b.y2 > h) b.y2 = h;
+
+            if (b.x1 >= b.x2 || b.y1 >= b.y2)
+                return RegionCreate(NULL, 0);
+
+            return RegionCreate(&b, 1);
+        }
+
+        RegionPtr dstregion = RegionDuplicate(damageregion);
+        RegionTranslate(dstregion, -dirty->x, -dirty->y);
+
+        RegionRec pixregion;
+        PixmapRegionInit(&pixregion, dirty->secondary_dst);
+        RegionIntersect(dstregion, dstregion, &pixregion);
+        RegionUninit(&pixregion);
+
+        return dstregion;
+    }
 }
 
 static void
@@ -1047,87 +1073,92 @@ amdgpuSourceValidate(DrawablePtr draw, int x, int y, int w, int h,
 {
 }
 
-Bool
-amdgpu_scanout_do_update(xf86CrtcPtr xf86_crtc, int scanout_id,
-			 PixmapPtr src_pix, BoxRec extents)
+static inline Bool pict_transform_is_identity(const PictTransform *t)
 {
-	drmmode_crtc_private_ptr drmmode_crtc = xf86_crtc->driver_private;
-	RegionRec region = { .extents = extents, .data = NULL };
-	ScrnInfoPtr scrn = xf86_crtc->scrn;
-	ScreenPtr pScreen = scrn->pScreen;
-	DrawablePtr pDraw;
+    if (!t) return FALSE;
+    return t->matrix[0][0] == (1 << 16) && t->matrix[0][1] == 0 && t->matrix[0][2] == 0 &&
+           t->matrix[1][0] == 0 && t->matrix[1][1] == (1 << 16) && t->matrix[1][2] == 0 &&
+           t->matrix[2][0] == 0 && t->matrix[2][1] == 0 && t->matrix[2][2] == (1 << 16);
+}
 
-	if (!xf86_crtc->enabled ||
-	    !drmmode_crtc->scanout[scanout_id] ||
-	    extents.x1 >= extents.x2 || extents.y1 >= extents.y2)
-		return FALSE;
+AMDGPU_HOT Bool
+amdgpu_scanout_do_update(xf86CrtcPtr xf86_crtc, int scanout_id,
+                         PixmapPtr src_pix, BoxRec extents)
+{
+    drmmode_crtc_private_ptr drmmode_crtc = xf86_crtc->driver_private;
+    RegionRec region = { .extents = extents, .data = NULL };
+    ScrnInfoPtr scrn = xf86_crtc->scrn;
+    ScreenPtr pScreen = scrn->pScreen;
 
-	pDraw = &drmmode_crtc->scanout[scanout_id]->drawable;
-	if (!amdgpu_scanout_extents_intersect(xf86_crtc, &extents))
-		return FALSE;
+    if (AMDGPU_UNLIKELY(!xf86_crtc->enabled ||
+                        !drmmode_crtc->scanout[scanout_id] ||
+                        extents.x1 >= extents.x2 || extents.y1 >= extents.y2))
+        return FALSE;
 
-	if (drmmode_crtc->tear_free) {
-		amdgpu_sync_scanout_pixmaps(xf86_crtc, &region, scanout_id);
-		RegionCopy(&drmmode_crtc->scanout_last_region, &region);
-	}
+    DrawablePtr pDraw = &drmmode_crtc->scanout[scanout_id]->drawable;
+    if (!amdgpu_scanout_extents_intersect(xf86_crtc, &extents))
+        return FALSE;
 
-	if (xf86_crtc->driverIsPerformingTransform) {
-		SourceValidateProcPtr SourceValidate = pScreen->SourceValidate;
-		PictFormatPtr format = PictureWindowFormat(pScreen->root);
-		int error;
-		PicturePtr src, dst;
+    if (drmmode_crtc->tear_free) {
+        amdgpu_sync_scanout_pixmaps(xf86_crtc, &region, scanout_id);
+        RegionCopy(&drmmode_crtc->scanout_last_region, &region);
+    }
 
-		src = CreatePicture(None, &src_pix->drawable, format, 0L, NULL,
-				    serverClient, &error);
-		if (!src) {
-			ErrorF("Failed to create source picture for transformed scanout "
-			       "update\n");
-			goto out;
-		}
+    const Bool needs_transform =
+        xf86_crtc->driverIsPerformingTransform &&
+        !(pict_transform_is_identity(&xf86_crtc->crtc_to_framebuffer) && !xf86_crtc->filter);
 
-		dst = CreatePicture(None, pDraw, format, 0L, NULL, serverClient, &error);
-		if (!dst) {
-			ErrorF("Failed to create destination picture for transformed scanout "
-			       "update\n");
-			goto free_src;
-		}
-		error = SetPictureTransform(src, &xf86_crtc->crtc_to_framebuffer);
-		if (error) {
-			ErrorF("SetPictureTransform failed for transformed scanout "
-			       "update\n");
-			goto free_dst;
-		}
+    if (needs_transform) {
+        SourceValidateProcPtr SourceValidate = pScreen->SourceValidate;
+        PictFormatPtr format = PictureWindowFormat(pScreen->root);
+        int error;
+        PicturePtr src = CreatePicture(None, &src_pix->drawable, format, 0L, NULL,
+                                       serverClient, &error);
+        if (!src) {
+            ErrorF("Failed to create source picture for transformed scanout update\n");
+            goto blit_path;
+        }
 
-		if (xf86_crtc->filter)
-			SetPicturePictFilter(src, xf86_crtc->filter, xf86_crtc->params,
-					     xf86_crtc->nparams);
+        PicturePtr dst = CreatePicture(None, pDraw, format, 0L, NULL, serverClient, &error);
+        if (!dst) {
+            ErrorF("Failed to create destination picture for transformed scanout update\n");
+            FreePicture(src, None);
+            goto blit_path;
+        }
 
-		pScreen->SourceValidate = amdgpuSourceValidate;
-		CompositePicture(PictOpSrc,
-				 src, NULL, dst,
-				 extents.x1, extents.y1, 0, 0, extents.x1,
-				 extents.y1, extents.x2 - extents.x1,
-				 extents.y2 - extents.y1);
-		pScreen->SourceValidate = SourceValidate;
+        error = SetPictureTransform(src, &xf86_crtc->crtc_to_framebuffer);
+        if (error) {
+            ErrorF("SetPictureTransform failed for transformed scanout update\n");
+            FreePicture(dst, None);
+            FreePicture(src, None);
+            goto blit_path;
+        }
 
- free_dst:
-		FreePicture(dst, None);
- free_src:
-		FreePicture(src, None);
-	} else
- out:
-	{
-		GCPtr gc = GetScratchGC(pDraw->depth, pScreen);
+        if (xf86_crtc->filter)
+            SetPicturePictFilter(src, xf86_crtc->filter, xf86_crtc->params, xf86_crtc->nparams);
 
-		ValidateGC(pDraw, gc);
-		(*gc->ops->CopyArea)(&src_pix->drawable, pDraw, gc,
-				     xf86_crtc->x + extents.x1, xf86_crtc->y + extents.y1,
-				     extents.x2 - extents.x1, extents.y2 - extents.y1,
-				     extents.x1, extents.y1);
-		FreeScratchGC(gc);
-	}
+        pScreen->SourceValidate = amdgpuSourceValidate;
+        CompositePicture(PictOpSrc, src, NULL, dst,
+                         extents.x1, extents.y1, 0, 0,
+                         extents.x1, extents.y1,
+                         extents.x2 - extents.x1, extents.y2 - extents.y1);
+        pScreen->SourceValidate = SourceValidate;
 
-	return TRUE;
+        FreePicture(dst, None);
+        FreePicture(src, None);
+        return TRUE;
+    }
+
+blit_path: {
+        GCPtr gc = GetScratchGC(pDraw->depth, pScreen);
+        ValidateGC(pDraw, gc);
+        gc->ops->CopyArea(&src_pix->drawable, pDraw, gc,
+                          xf86_crtc->x + extents.x1, xf86_crtc->y + extents.y1,
+                          extents.x2 - extents.x1, extents.y2 - extents.y1,
+                          extents.x1, extents.y1);
+        FreeScratchGC(gc);
+        return TRUE;
+    }
 }
 
 static void
