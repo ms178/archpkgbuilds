@@ -1,10 +1,24 @@
 /*
- * 2024-04 • “Beyond-genius” refresh by <your-name-here>
+ * Copyright © 2013-2014 Intel Corporation
+ * Copyright © 2015 Advanced Micro Devices, Inc.
  *
- *  – Hardened FD handling
- *  – Early-out fast paths (LIKELY/UNLIKELY) for Intel Raptor-Lake µ-arch
- *  – All error paths guaranteed to close FDs / free memory
- *  – Compile-time compatible with every Xorg that still supports DRI3
+ * Permission to use, copy, modify, distribute, and sell this software and its
+ * documentation for any purpose is hereby granted without fee, provided that
+ * the above copyright notice appear in all copies and that both that copyright
+ * notice and this permission notice appear in supporting documentation, and
+ * that the name of the copyright holders not be used in advertising or
+ * publicity pertaining to distribution of the software without specific,
+ * written prior permission.  The copyright holders make no representations
+ * about the suitability of this software for any purpose.  It is provided "as
+ * is" without express or implied warranty.
+ *
+ * THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS SOFTWARE,
+ * INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS, IN NO
+ * EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY SPECIAL, INDIRECT OR
+ * CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE,
+ * DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+ * TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE
+ * OF THIS SOFTWARE.
  */
 
 #define _GNU_SOURCE             /* dup3() */
@@ -13,6 +27,9 @@
 #include <libgen.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <limits.h>
+#include <string.h>
 
 #include "amdgpu_drv.h"
 #ifdef HAVE_DRI3_H
@@ -24,6 +41,23 @@
 
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
+
+/* Hot/Cold function layout hints (advisory to compiler) */
+#if defined(__GNUC__) || defined(__clang__)
+# ifndef AMDGPU_HOT
+#  define AMDGPU_HOT  __attribute__((hot))
+# endif
+# ifndef AMDGPU_COLD
+#  define AMDGPU_COLD __attribute__((cold))
+# endif
+#else
+# ifndef AMDGPU_HOT
+#  define AMDGPU_HOT
+# endif
+# ifndef AMDGPU_COLD
+#  define AMDGPU_COLD
+# endif
+#endif
 
 /* --------------------------------------------------------------------- */
 /* Small RAII helper so we never forget to close() on error              */
@@ -40,7 +74,7 @@ static inline void fdg_cleanup(struct fd_guard *g)
 }
 
 /* ========== 1. Node opening helpers =================================== */
-static int
+static AMDGPU_HOT int
 open_node(const char *path, int *out)
 {
 	struct fd_guard g; fdg_init(&g);
@@ -58,7 +92,7 @@ open_node(const char *path, int *out)
 }
 
 /* ---------- 1a. /dev/dri/card* (master) ------------------------------- */
-static int
+static AMDGPU_HOT int
 amdgpu_open_card_node(ScreenPtr screen, int *out)
 {
 	ScrnInfoPtr   scrn   = xf86ScreenToScrn(screen);
@@ -74,22 +108,29 @@ amdgpu_open_card_node(ScreenPtr screen, int *out)
 
 	/* 2) Check whether authentication is even necessary ---------------- */
 	if (drmGetMagic(g.fd, &magic) < 0) {
-		if (errno == EACCES) {                  /* render-node masquerading */
-			*out = fdg_move(&g); fdg_cleanup(&g); return Success;
+		/* Some kernels/drivers return EACCES/EOPNOTSUPP/ENOTTY when auth is not needed */
+		if (errno == EACCES || errno == EOPNOTSUPP || errno == ENOTTY) {
+			*out = fdg_move(&g);
+			fdg_cleanup(&g);
+			return Success;
 		}
-		fdg_cleanup(&g); return BadMatch;
+		fdg_cleanup(&g);
+		return BadMatch;
 	}
 
 	/* 3) Authenticate the FD with the server’s already-master FD -------- */
 	if (drmAuthMagic(ent->fd, magic) < 0) {
-		fdg_cleanup(&g); return BadMatch;
+		fdg_cleanup(&g);
+		return BadMatch;
 	}
 
-	*out = fdg_move(&g); fdg_cleanup(&g); return Success;
+	*out = fdg_move(&g);
+	fdg_cleanup(&g);
+	return Success;
 }
 
 /* ---------- 1b. /dev/dri/render* -------------------------------------- */
-static int
+static AMDGPU_HOT int
 amdgpu_open_render_node(ScreenPtr screen, int *out)
 {
 	ScrnInfoPtr  scrn = xf86ScreenToScrn(screen);
@@ -102,10 +143,10 @@ amdgpu_open_render_node(ScreenPtr screen, int *out)
 }
 
 /* ---------- 1c. Public entry used by DRI3 ----------------------------- */
-static int
+static AMDGPU_HOT int
 amdgpu_dri3_open(ScreenPtr      screen,
-				 RRProviderPtr  provider _X_UNUSED,
-				 int           *out)
+                 RRProviderPtr  provider _X_UNUSED,
+                 int           *out)
 {
 	/* Try render node first (fast-path, no auth). */
 	int ret = amdgpu_open_render_node(screen, out);
@@ -118,13 +159,13 @@ amdgpu_dri3_open(ScreenPtr      screen,
 
 /* ========== 2. Optional ssh-guard for ancient servers ================= */
 #if DRI3_SCREEN_INFO_VERSION >= 1 && \
-XORG_VERSION_CURRENT <= XORG_VERSION_NUMERIC(1,18,99,1,0)
+    XORG_VERSION_CURRENT <= XORG_VERSION_NUMERIC(1,18,99,1,0)
 
-static int
+static AMDGPU_HOT int
 amdgpu_dri3_open_client(ClientPtr     client,
-						ScreenPtr     screen,
-						RRProviderPtr provider,
-						int          *out)
+                        ScreenPtr     screen,
+                        RRProviderPtr provider,
+                        int          *out)
 {
 	const char *cmd = GetClientCmdName(client);
 	if (cmd) {
@@ -145,17 +186,24 @@ amdgpu_dri3_open_client(ClientPtr     client,
 /* ---- 3a. validation helpers ----------------------------------------- */
 static inline Bool
 validate_pixmap_dims(uint16_t width, uint16_t height,
-					 uint8_t depth, uint8_t bpp, uint16_t stride)
+                     uint8_t depth, uint8_t bpp, uint16_t stride)
 {
 	if (UNLIKELY(width == 0 || height == 0))
 		return FALSE;
 
 	/* Only canonical formats that both X and DRM agree on. */
 	switch (bpp) {
-		case 8:  if (depth != 8)  return FALSE; break;
-		case 16: if (depth != 15 && depth != 16) return FALSE; break;
-		case 32: if (depth < 24)  return FALSE; break;
-		default: return FALSE;
+	case 8:
+		if (depth != 8) return FALSE;
+		break;
+	case 16:
+		if (depth != 15 && depth != 16) return FALSE;
+		break;
+	case 32:
+		if (depth < 24) return FALSE;
+		break;
+	default:
+		return FALSE;
 	}
 
 	/* stride must be large enough and contain no overflow */
@@ -164,75 +212,90 @@ validate_pixmap_dims(uint16_t width, uint16_t height,
 }
 
 /* ---- 3b. FD → Pixmap ------------------------------------------------- */
-static PixmapPtr
+static AMDGPU_HOT PixmapPtr
 amdgpu_dri3_pixmap_from_fd(ScreenPtr  screen,
-						   int        fd,
-						   CARD16     width,
-						   CARD16     height,
-						   CARD16     stride,
-						   CARD8      depth,
-						   CARD8      bpp)
+                           int        fd,
+                           CARD16     width,
+                           CARD16     height,
+                           CARD16     stride,
+                           CARD8      depth,
+                           CARD8      bpp)
 {
 	if (UNLIKELY(!validate_pixmap_dims(width, height, depth, bpp, stride)))
 		return NULL;
 
-	#ifdef USE_GLAMOR
+#ifdef USE_GLAMOR
 	ScrnInfoPtr   scrn = xf86ScreenToScrn(screen);
 	AMDGPUInfoPtr info = AMDGPUPTR(scrn);
 
 	if (info->use_glamor) {
 		PixmapPtr pix = glamor_pixmap_from_fd(screen, fd, width, height,
-											  stride, depth, bpp);
+		                                      stride, depth, bpp);
 		if (pix) {
-			struct amdgpu_pixmap *priv = calloc(1, sizeof(*priv));
-			if (LIKELY(priv)) {
-				amdgpu_set_pixmap_private(pix, priv);
-				pix->usage_hint |= AMDGPU_CREATE_PIXMAP_DRI2;
-				return pix;
+			/* Only allocate a new private if none attached yet */
+			if (!amdgpu_get_pixmap_private(pix)) {
+				struct amdgpu_pixmap *priv = (struct amdgpu_pixmap *)calloc(1, sizeof(*priv));
+				if (LIKELY(priv)) {
+					amdgpu_set_pixmap_private(pix, priv);
+				} else {
+					screen->DestroyPixmap(pix);
+					return NULL;
+				}
 			}
-			screen->DestroyPixmap(pix);
+			pix->usage_hint |= AMDGPU_CREATE_PIXMAP_DRI2;
+			return pix;
 		}
 		return NULL;
 	}
-	#endif /* USE_GLAMOR */
+#endif /* USE_GLAMOR */
 
-	/* Fallback: no glamor.  We duplicate the FD so ownership stays clear. */
+	/* Fallback: no glamor. We duplicate the FD so ownership stays clear. */
 	struct fd_guard g; fdg_init(&g);
 	g.fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
 	if (g.fd < 0)
 		return NULL;
 
 	PixmapPtr pix = screen->CreatePixmap(screen, 0, 0, depth,
-										 AMDGPU_CREATE_PIXMAP_DRI2);
-	if (UNLIKELY(!pix))
-	{ fdg_cleanup(&g); return NULL; }
+	                                     AMDGPU_CREATE_PIXMAP_DRI2);
+	if (UNLIKELY(!pix)) {
+		fdg_cleanup(&g);
+		return NULL;
+	}
 
-	if (!screen->ModifyPixmapHeader(pix, width, height, 0, bpp, stride, NULL))
-	{ screen->DestroyPixmap(pix); fdg_cleanup(&g); return NULL; }
+	if (!screen->ModifyPixmapHeader(pix, width, height, 0, bpp, stride, NULL)) {
+		screen->DestroyPixmap(pix);
+		fdg_cleanup(&g);
+		return NULL;
+	}
 
-	if (!screen->SetSharedPixmapBacking(pix, (void*)(intptr_t)fdg_move(&g)))
-	{ screen->DestroyPixmap(pix); fdg_cleanup(&g); return NULL; }
+	if (!screen->SetSharedPixmapBacking(pix, (void *)(intptr_t)fdg_move(&g))) {
+		screen->DestroyPixmap(pix);
+		fdg_cleanup(&g);
+		return NULL;
+	}
 
 	fdg_cleanup(&g);      /* nothing left to close */
 	return pix;
 }
 
 /* ---- 3c. Pixmap → FD ------------------------------------------------- */
-static int
+static AMDGPU_HOT int
 amdgpu_dri3_fd_from_pixmap(ScreenPtr screen, PixmapPtr pix,
-						   CARD16 *stride /* out */, CARD32 *size /* out */)
+                           CARD16 *stride /* out */, CARD32 *size /* out */)
 {
-	#ifdef USE_GLAMOR
+#ifdef USE_GLAMOR
 	ScrnInfoPtr   scrn = xf86ScreenToScrn(screen);
 	AMDGPUInfoPtr info = AMDGPUPTR(scrn);
 
 	if (info->use_glamor) {
 		int fd = glamor_fd_from_pixmap(screen, pix, stride, size);
-		if (fd >= 0)
+		if (fd >= 0) {
 			amdgpu_glamor_flush(scrn);          /* make sure GPU finished */
 			return fd;
+		}
+		/* fall through to BO export if glamor path failed */
 	}
-	#endif
+#endif
 
 	struct amdgpu_buffer *bo = amdgpu_get_pixmap_bo(pix);
 	if (UNLIKELY(!bo))
@@ -247,24 +310,24 @@ amdgpu_dri3_fd_from_pixmap(ScreenPtr screen, PixmapPtr pix,
 
 	uint32_t fd;
 	if (UNLIKELY(amdgpu_bo_export(bo->bo.amdgpu,
-		amdgpu_bo_handle_type_dma_buf_fd, &fd)))
+	                              amdgpu_bo_handle_type_dma_buf_fd, &fd)))
 		return -1;
 
 	*stride = (CARD16)pix->devKind;
-	*size   = info_bo.alloc_size;
+	*size   = (CARD32)info_bo.alloc_size;
 	return (int)fd;
 }
 
 /* ========== 4. DRI3 screen-info trampoline ============================ */
 static dri3_screen_info_rec amdgpu_dri3_screen_info = {
-	#if DRI3_SCREEN_INFO_VERSION >= 1 && \
-	XORG_VERSION_CURRENT <= XORG_VERSION_NUMERIC(1,18,99,1,0)
-	.version      = 1,
-	.open_client  = amdgpu_dri3_open_client,
-	#else
-	.version      = 0,
-	.open         = amdgpu_dri3_open,
-	#endif
+#if DRI3_SCREEN_INFO_VERSION >= 1 && \
+    XORG_VERSION_CURRENT <= XORG_VERSION_NUMERIC(1,18,99,1,0)
+	.version        = 1,
+	.open_client    = amdgpu_dri3_open_client,
+#else
+	.version        = 0,
+	.open           = amdgpu_dri3_open,
+#endif
 	.pixmap_from_fd = amdgpu_dri3_pixmap_from_fd,
 	.fd_from_pixmap = amdgpu_dri3_fd_from_pixmap
 };
@@ -273,11 +336,11 @@ static dri3_screen_info_rec amdgpu_dri3_screen_info = {
 Bool
 amdgpu_dri3_screen_init(ScreenPtr screen)
 {
-	#ifndef HAVE_DRI3_H
+#ifndef HAVE_DRI3_H
 	xf86DrvMsg(xf86ScreenToScrn(screen)->scrnIndex, X_INFO,
-			   "DRI3 not built into this driver\n");
+	           "DRI3 not built into this driver\n");
 	return FALSE;
-	#else
+#else
 	ScrnInfoPtr  scrn = xf86ScreenToScrn(screen);
 	AMDGPUEntPtr ent  = AMDGPUEntPriv(scrn);
 
@@ -289,5 +352,5 @@ amdgpu_dri3_screen_init(ScreenPtr screen)
 		return FALSE;
 	}
 	return TRUE;
-	#endif /* HAVE_DRI3_H */
+#endif /* HAVE_DRI3_H */
 }
