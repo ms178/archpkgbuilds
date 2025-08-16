@@ -1,26 +1,25 @@
+# Maintainer: Super Genius CachyOS Maintainer
 pkgname=xf86-video-amdgpu-git
 _pkgname=xf86-video-amdgpu
-pkgver=23.0.0.r26.gb696afa
+pkgver=25.0.0.r0.g69dbd66
 pkgrel=1
-pkgdesc="X.org amdgpu video driver (Meson build, Git version, CachyOS optimisations)"
+pkgdesc='Xorg amdgpu video driver (git, multi-pass PGO + CS-PGO with optional BOLT; tuned for real GPU)'
 arch=('x86_64')
 url='https://xorg.freedesktop.org/'
-license=('custom:MIT')
+license=('MIT')
+groups=('xorg-drivers')
 
 depends=(
-  'systemd-libs'  # libudev
-  'mesa'
-  'libdrm'
+  systemd-libs   # libudev
+  mesa
+  libdrm
 )
-
 makedepends=(
-  'git'
-  'meson'
-  'ninja'
-  'xorg-server-devel'
-  'xorgproto'
-  'pixman'
-  'systemd'
+  git meson ninja clang llvm lld
+  xorg-server xorg-server-devel xorgproto pixman systemd
+  mesa-demos           # glxinfo/glxgears for training
+  glmark2              # extra GPU load during training (optional)
+  # Optional: llvm-bolt perf2bolt (if present, BOLT step will run; otherwise skipped)
 )
 
 conflicts=('xf86-video-amdgpu' 'xorg-server<1.20.0')
@@ -29,67 +28,409 @@ provides=(
   "${_pkgname}=${pkgver}"
   'xf86-video-amdgpu'
 )
-groups=('xorg-drivers')
 
 source=(
   "${pkgname}::git+https://gitlab.freedesktop.org/xorg/driver/${_pkgname}.git"
   'amdgpu_dri2.c.patch'
 )
+sha256sums=('SKIP' 'SKIP')
 
-sha256sums=('SKIP'
-            'SKIP')
+##############################################################################
+# Extra instrumentation flags – append only; do not alter user CFLAGS/CXXFLAGS
+##############################################################################
+_extra_instr='-g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=150 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling'
 
-#######################################################################
-# FUNCTIONS
-#######################################################################
+##############################################################################
+# Meson options (shared by all passes)
+##############################################################################
+_meson_opts=(
+  -Db_ndebug=true
+  -Db_lto=false
+  -Dc_std=gnu2x
+  --wrap-mode=nofallback
+
+  -Dudev=enabled
+  -Dglamor=enabled
+  -Dmoduledir=/usr/lib/xorg/modules
+  -Dconfigdir=/usr/share/X11/xorg.conf.d
+)
 
 pkgver() {
   cd "${srcdir}/${pkgname}"
-  # Strip the project prefix and translate the git describe output into pkgver-style
-  git describe --long --tags \
-    | sed 's/^xf86-video-amdgpu-//' \
-    | sed 's/\([^-]*-g\)/r\1/;s/-/./g'
+  # Robust describe: fall back if tags are not available
+  local descr
+  descr=$(git describe --tags --long 2>/dev/null || printf 'xf86-video-amdgpu-0-0-g%s' "$(git rev-parse --short HEAD)")
+  # Examples:
+  #   xf86-video-amdgpu-23.0.0-26-gb696afa -> 23.0.0.r26.gb696afa
+  #   xf86-video-amdgpu-23.0.0-rc1-26-gdeadbee -> 23.0.0.rc1.r26.gdeadbee
+  sed -E '
+    s/^xf86-video-amdgpu-//;
+    s/-([0-9]+)-g/.r\1.g/;
+    s/-/./g
+  ' <<< "$descr"
 }
 
 prepare() {
   cd "${srcdir}/${pkgname}"
-
-  # Apply downstream patch(es)
+  echo "==> [amdgpu-ddx] Applying patch: amdgpu_dri2.c.patch"
   patch -Np1 -i "${srcdir}/amdgpu_dri2.c.patch"
 }
 
+##############################################################################
+# Training workload for the DDX
+# - Attempts to run a minimal Xorg server using our installed module tree.
+# - On Wayland (e.g. KWin/Wayland), DRM is typically busy: we skip by default.
+#   To force training anyway, export AMDGPU_TRAIN=1 before building.
+# - Always fail-safe: if training cannot run, we continue the build.
+# - Logs clearly when training is run, skipped, or fails.
+# - If env BOLT_PERF_OUT is set and perf is available, Xorg is launched under
+#   perf record to produce perf.data for perf2bolt.
+##############################################################################
+_run_ddx_workload() { # $1 = DESTDIR root containing our installed module tree
+  local inst_root="$1"
+  local modpath="${inst_root}/usr/lib/xorg/modules"
+  local xorg_bin
+  xorg_bin=$(command -v Xorg || true)
+  if [[ -z "$xorg_bin" ]]; then
+    echo "==> [amdgpu-ddx] Xorg not found; skipping amdgpu DDX training."
+    return 0
+  fi
+
+  # Skip training if Wayland compositor is active unless explicitly requested.
+  if [[ -n ${WAYLAND_DISPLAY:-} && "${AMDGPU_TRAIN:-0}" != "1" ]]; then
+    echo "==> [amdgpu-ddx] Wayland session detected (${WAYLAND_DISPLAY}); skipping amdgpu DDX training. Set AMDGPU_TRAIN=1 to force."
+    return 0
+  fi
+
+  # Require primary DRM device to exist
+  if [[ ! -e /dev/dri/card0 ]]; then
+    echo "==> [amdgpu-ddx] /dev/dri/card0 not found; cannot train amdgpu DDX. Skipping."
+    return 0
+  fi
+
+  local tmpdir disp logf xconf
+  tmpdir=$(mktemp -d --tmpdir amdgpu-ddx-train.XXXXXX)
+  disp=":84"
+  logf="${tmpdir}/Xorg.log"
+  xconf="${tmpdir}/xorg.conf"
+
+  # Minimal configuration to force the amdgpu driver with glamor
+  cat >"$xconf" <<EOF
+Section "ServerFlags"
+  Option "AllowEmptyInitialConfiguration" "true"
+  Option "DontVTSwitch" "true"
+  Option "AutoAddGPU" "true"
+EndSection
+
+Section "Module"
+  Load "glamoregl"
+  Load "dri2"
+  Load "dri3"
+EndSection
+
+Section "Files"
+  ModulePath "${modpath}"
+  ModulePath "/usr/lib/xorg/modules"
+EndSection
+
+Section "Device"
+  Identifier "AMD"
+  Driver "amdgpu"
+  Option "DRI" "3"
+  Option "TearFree" "true"
+  Option "AccelMethod" "glamor"
+EndSection
+
+Section "Screen"
+  Identifier "Screen0"
+  Device "AMD"
+EndSection
+EOF
+
+  echo "==> [amdgpu-ddx] Starting Xorg ${disp} for training (log: ${logf})..."
+  local xcmd=("${xorg_bin}" "${disp}" -noreset -nolisten tcp -logfile "${logf}" -config "${xconf}")
+  if [[ -n "${BOLT_PERF_OUT:-}" && -n "$(command -v perf || true)" ]]; then
+    echo "==> [amdgpu-ddx] Launching Xorg under perf record -> ${BOLT_PERF_OUT}"
+    perf record -o "${BOLT_PERF_OUT}" -F "${AMDGPU_PERF_FREQ:-800}" -g --call-graph dwarf -- "${xcmd[@]}" >/dev/null 2>&1 &
+  else
+    "${xcmd[@]}" >/dev/null 2>&1 &
+  fi
+  local xpid=$!
+
+  # Wait for server to become responsive
+  for _ in {1..120}; do
+    DISPLAY="${disp}" xdpyinfo >/dev/null 2>&1 && break
+    sleep 0.1
+  done
+  if ! DISPLAY="${disp}" xdpyinfo >/dev/null 2>&1; then
+    echo "==> [amdgpu-ddx] Xorg did not come up for training (see ${logf}). Skipping training."
+    kill "$xpid" 2>/dev/null || true
+    wait "$xpid" 2>/dev/null || true
+    rm -rf "$tmpdir"
+    return 0
+  fi
+
+  # Run a short but representative client load
+  echo "==> [amdgpu-ddx] Running client load on ${disp}..."
+  local GEARS_PID=''
+  if command -v glxgears >/dev/null 2>&1; then
+    DISPLAY="${disp}" glxgears >/dev/null 2>&1 &
+    GEARS_PID=$!
+  fi
+
+  if command -v glmark2 >/dev/null 2>&1; then
+    DISPLAY="${disp}" glmark2 -b build:use-fbo=true:duration=3000 >/dev/null 2>&1 || true
+    DISPLAY="${disp}" glmark2 -b jellyfish:duration=3000 >/dev/null 2>&1 || true
+  else
+    if command -v glxinfo >/dev/null 2>&1; then
+      DISPLAY="${disp}" glxinfo -B >/dev/null 2>&1 || true
+      DISPLAY="${disp}" glxinfo -l >/dev/null 2>&1 || true
+    fi
+    sleep 5
+  fi
+
+  [[ -n "$GEARS_PID" ]] && { kill "$GEARS_PID" 2>/dev/null || true; wait "$GEARS_PID" 2>/dev/null || true; }
+
+  # Encourage a clean flush of profile data
+  kill -INT "$xpid" 2>/dev/null || true
+  for _ in {1..50}; do
+    kill -0 "$xpid" 2>/dev/null || { xpid=''; break; }
+    sleep 0.1
+  done
+  if [[ -n "$xpid" ]]; then
+    kill -TERM "$xpid" 2>/dev/null || true
+    wait "$xpid" 2>/dev/null || true
+  fi
+
+  echo "==> [amdgpu-ddx] Training complete. Xorg log at ${logf}"
+  rm -rf "$tmpdir"
+  return 0
+}
+
+##############################################################################
+# Build: PGO → CS-PGO → Final, with optional BOLT on amdgpu_drv.so
+##############################################################################
 build() {
+  export CC=clang
+  export CXX=clang++
+
+  # Preserve user flags; only append via Meson args
+  local U_CFLAGS="$CFLAGS"
+  local U_CXXFLAGS="$CXXFLAGS"
+  local U_LDFLAGS="$LDFLAGS"
+
+  # Detect if Clang supports CS-PGO
+  local HAVE_CS=0
+  if clang --help 2>/dev/null | grep -q -- '-fcs-profile-generate'; then
+    HAVE_CS=1
+  fi
+
+  local gen_dir="$srcdir/pgo-gen"
+  local cs_dir="$srcdir/pgo-cs"
+  mkdir -p "$gen_dir" "$cs_dir"
+
   cd "${srcdir}/${pkgname}"
 
-  # Hardened flags break Xorg modules (FS#55102 / FS#54845)
-  export CFLAGS="${CFLAGS//-fno-plt/}"
-  export CXXFLAGS="${CXXFLAGS//-fno-plt/}"
-  export LDFLAGS="${LDFLAGS//,-z,now/}"
+  # ---------- PASS 1 : profile-generate -------------------------------------
+  echo "==> [amdgpu-ddx] PASS 1: Building with PGO instrumentation..."
+  local c_gen="$U_CFLAGS $_extra_instr -fprofile-generate=$gen_dir"
+  local link_gen="$U_LDFLAGS -fprofile-generate=$gen_dir"
+  arch-meson . build-gen "${_meson_opts[@]}" --buildtype=release \
+    -Dc_args="$c_gen" -Dcpp_args="$c_gen" \
+    -Dc_link_args="$link_gen" -Dcpp_link_args="$link_gen"
+  ninja -C build-gen
 
-  # Meson build directory
-  local _builddir='build'
+  # Install to a temp root for training
+  local inst_gen="$srcdir/inst-gen"
+  DESTDIR="$inst_gen" meson install -C build-gen
 
-  meson setup "${_builddir}" \
-    --prefix=/usr \
-    --buildtype=release \
-    -Dudev=enabled \
-    -Dglamor=enabled \
-    -Dmoduledir=/usr/lib/xorg/modules \
-    -Dconfigdir=/usr/share/X11/xorg.conf.d
+  # Run workload: profiles are written by the Xorg process (the server)
+  echo "==> [amdgpu-ddx] PASS 1: Running training workload (if possible)..."
+  LLVM_PROFILE_FILE="$gen_dir/amdgpu-%p.profraw" _run_ddx_workload "$inst_gen"
 
-  meson compile -C "${_builddir}"
+  local have_gen=0
+  if compgen -G "$gen_dir/*.profraw" >/dev/null; then
+    echo "==> [amdgpu-ddx] PASS 1: Merging PGO profiles..."
+    llvm-profdata merge -o "$srcdir/gen.prof" "$gen_dir"/*.profraw
+    have_gen=1
+  else
+    echo "==> [amdgpu-ddx] PASS 1: No PGO profiles generated; continuing without profile-use."
+  fi
+
+  # ---------- PASS 2 : profile-use + CS profile-generate --------------------
+  echo "==> [amdgpu-ddx] PASS 2: Building with profile-use and CS instrumentation..."
+  local c_cs="$U_CFLAGS $_extra_instr"
+  local link_cs="$U_LDFLAGS"
+  if [[ $have_gen -eq 1 ]]; then
+    c_cs+=" -fprofile-use=$srcdir/gen.prof"
+    link_cs+=" -fprofile-use=$srcdir/gen.prof"
+  fi
+  if [[ $HAVE_CS -eq 1 ]]; then
+    c_cs+=" -fcs-profile-generate=$cs_dir"
+    link_cs+=" -fcs-profile-generate=$cs_dir"
+  else
+    echo "==> [amdgpu-ddx] PASS 2: Clang has no CS-PGO support; building with standard PGO only."
+  fi
+
+  arch-meson . build-cs "${_meson_opts[@]}" --buildtype=release \
+    -Dc_args="$c_cs" -Dcpp_args="$c_cs" \
+    -Dc_link_args="$link_cs" -Dcpp_link_args="$link_cs"
+  ninja -C build-cs
+
+  local inst_cs="$srcdir/inst-cs"
+  DESTDIR="$inst_cs" meson install -C build-cs
+
+  echo "==> [amdgpu-ddx] PASS 2: Running training workload (if possible)..."
+  LLVM_PROFILE_FILE="$cs_dir/amdgpu-cs-%p.profraw" _run_ddx_workload "$inst_cs"
+
+  local have_cs=0
+  if compgen -G "$cs_dir/*.profraw" >/dev/null; then
+    echo "==> [amdgpu-ddx] PASS 2: Merging CS-PGO profiles..."
+    if [[ $have_gen -eq 1 ]]; then
+      llvm-profdata merge -o "$srcdir/final.prof" "$cs_dir"/*.profraw "$srcdir/gen.prof"
+    else
+      llvm-profdata merge -o "$srcdir/final.prof" "$cs_dir"/*.profraw
+    fi
+    have_cs=1
+  else
+    if [[ $have_gen -eq 1 ]]; then
+      echo "==> [amdgpu-ddx] PASS 2: No CS profiles; falling back to PASS 1 profile."
+      cp -f "$srcdir/gen.prof" "$srcdir/final.prof"
+      have_cs=1
+    else
+      echo "==> [amdgpu-ddx] PASS 2: No profiles at all; proceeding without profile-use."
+    fi
+  fi
+
+  # ---------- PASS 3 : final profile-use ------------------------------------
+  echo "==> [amdgpu-ddx] PASS 3: Building final optimized module..."
+  local c_fin="$U_CFLAGS"
+  local link_fin="$U_LDFLAGS"
+  if [[ $have_cs -eq 1 || $have_gen -eq 1 ]]; then
+    c_fin+=" -fprofile-use=$srcdir/final.prof"
+    link_fin+=" -fprofile-use=$srcdir/final.prof"
+  fi
+
+  # Emit relocs if BOLT present to improve post-link profiling quality.
+  if command -v llvm-bolt >/dev/null 2>&1; then
+    link_fin+=" -Wl,--emit-relocs"
+  fi
+
+  arch-meson . build-final "${_meson_opts[@]}" --buildtype=release \
+    -Dc_args="$c_fin" -Dcpp_args="$c_fin" \
+    -Dc_link_args="$link_fin" -Dcpp_link_args="$link_fin"
+  ninja -C build-final
+
+  # Install to temp to get the built module path easily for BOLT training
+  local inst_final="$srcdir/inst-final"
+  DESTDIR="$inst_final" meson install -C build-final
+
+  # ---------- Optional: BOLT post-link on amdgpu_drv.so ---------------------
+  if command -v llvm-bolt >/dev/null 2>&1; then
+    echo "==> [amdgpu-ddx] BOLT: post-link instrumentation and optimization on amdgpu_drv.so..."
+    local mod_inst="${inst_final}/usr/lib/xorg/modules/drivers/amdgpu_drv.so"
+    if [[ ! -f "$mod_inst" ]]; then
+      echo "==> [amdgpu-ddx] BOLT: amdgpu_drv.so not found at ${mod_inst}; skipping BOLT."
+      return 0
+    fi
+
+    local bolt_dir="$srcdir/bolt"
+    mkdir -p "$bolt_dir"
+    cp -f "$mod_inst" "$bolt_dir/amdgpu_drv.orig.so"
+
+    # Instrument the installed module for training
+    rm -f "$bolt_dir/boltprof.fdata"
+    local bolt_skip='(__x86\.get_pc_thunk\..*|.*@plt|.*\.plt.*|.*\.text/.*|__.*|_init|_fini|_start|start)'
+    echo "==> [amdgpu-ddx] BOLT: Instrumenting module (lite mode, skip-funcs pattern)..."
+    if ! llvm-bolt "$mod_inst" \
+        --relocs \
+        --lite \
+        --skip-funcs="$bolt_skip" \
+        --instrument \
+        --instrumentation-file="$bolt_dir/boltprof.fdata" \
+        -o "$bolt_dir/amdgpu_drv.inst.so"; then
+      echo "==> [amdgpu-ddx] BOLT: instrumentation failed. Attempting perf-based fallback..."
+
+      if command -v perf >/dev/null 2>&1 && command -v perf2bolt >/dev/null 2>&1; then
+        local perf_data="$bolt_dir/perf.data"
+        BOLT_PERF_OUT="$perf_data" _run_ddx_workload "$inst_final"
+
+        if [[ -s "$perf_data" ]]; then
+          echo "==> [amdgpu-ddx] BOLT: Converting perf.data -> fdata"
+          if ! perf2bolt -p "$perf_data" -o "$bolt_dir/boltprof.fdata" -- "$bolt_dir/amdgpu_drv.orig.so"; then
+            echo "==> [amdgpu-ddx] BOLT: perf2bolt failed; skipping BOLT optimization."
+            return 0
+          fi
+        else
+          echo "==> [amdgpu-ddx] BOLT: perf.data not produced; skipping BOLT optimization."
+          return 0
+        fi
+      else
+        echo "==> [amdgpu-ddx] BOLT: perf/perf2bolt not available; skipping BOLT."
+        return 0
+      fi
+    else
+      # Use the instrumented module for training by replacing in the temp install root
+      install -m755 "$bolt_dir/amdgpu_drv.inst.so" "$mod_inst"
+      echo "==> [amdgpu-ddx] BOLT: Running training with instrumented module..."
+      _run_ddx_workload "$inst_final"
+      if [[ ! -s "$bolt_dir/boltprof.fdata" ]]; then
+        echo "==> [amdgpu-ddx] BOLT: No instrumented profile produced; skipping BOLT optimization."
+        return 0
+      fi
+    fi
+
+    # Compatibility handling for alignment flags across llvm-bolt versions
+    local bolt_help
+    bolt_help="$(llvm-bolt --help 2>&1 || true)"
+    local bolt_align_flags=(--align-blocks)
+    if grep -q -- '--block-alignment' <<<"$bolt_help"; then
+      bolt_align_flags=(--align-blocks --block-alignment=32)
+    fi
+
+    echo "==> [amdgpu-ddx] BOLT: Optimizing original module with collected profile..."
+    if ! llvm-bolt "$bolt_dir/amdgpu_drv.orig.so" \
+          --relocs \
+          --data="$bolt_dir/boltprof.fdata" \
+          --reorder-blocks=ext-tsp \
+          --reorder-functions=cdsort \
+          --split-functions \
+          --split-strategy=cdsplit \
+          --icf=all \
+          --jump-tables=move \
+          --peepholes=all \
+          "${bolt_align_flags[@]}" \
+          --dyno-stats \
+          -o "$bolt_dir/amdgpu_drv.bolt.so"; then
+      echo "==> [amdgpu-ddx] BOLT: optimization failed; skipping."
+      return 0
+    fi
+
+    # Replace the build artifact so packaging picks up the optimized module
+    local built_so
+    built_so="$(find "$PWD/build-final" -type f -name 'amdgpu_drv.so' -print -quit || true)"
+    if [[ -n "$built_so" ]]; then
+      install -m755 "$bolt_dir/amdgpu_drv.bolt.so" "$built_so"
+      echo "==> [amdgpu-ddx] BOLT: optimization applied to build tree ($built_so)."
+    else
+      echo "==> [amdgpu-ddx] BOLT: could not locate amdgpu_drv.so in build tree; installing optimized module into temp root."
+      install -m755 "$bolt_dir/amdgpu_drv.bolt.so" "$mod_inst"
+    fi
+  else
+    echo "==> [amdgpu-ddx] BOLT: llvm-bolt not found; skipping BOLT step."
+  fi
 }
 
 check() {
-  cd "${srcdir}/${pkgname}/build"
-  meson test --print-errorlogs
+  # Upstream does not ship a test suite for this driver
+  echo "==> [amdgpu-ddx] No upstream tests; skipping meson test."
 }
 
 package() {
-  cd "${srcdir}/${pkgname}/build"
-  DESTDIR="${pkgdir}" meson install
+  echo "==> [amdgpu-ddx] Installing build-final artifacts..."
+  DESTDIR="${pkgdir}" meson install -C "${srcdir}/${pkgname}/build-final"
 
   # License
-  install -Dm644 ../COPYING \
+  install -Dm644 "${srcdir}/${pkgname}/COPYING" \
     "${pkgdir}/usr/share/licenses/${pkgname}/COPYING"
 }
