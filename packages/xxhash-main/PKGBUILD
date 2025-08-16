@@ -1,36 +1,300 @@
-# Maintainer: Maxime Gauduin <alucryd@archlinux.org>
-# Contributor: Fabien Dubosson <fabien.dubosson@gmail.com>
-# Contributor: Konstantin Gizdov <arch@kge.com>
-
+# Maintainer: Super Genius CachyOS Maintainer
 pkgname=xxhash
-pkgver=0.8.3
-pkgrel=3.1
-pkgdesc='Extremely fast non-cryptographic hash algorithm'
+pkgver=0.7.4.r959.g7aee8d0
+pkgrel=1
+pkgdesc='Extremely fast non-cryptographic hash algorithm (multi-pass PGO + CS-PGO with optional BOLT; tuned for real workloads)'
 arch=(x86_64)
 url=https://cyan4973.github.io/xxHash/
-license=(
-  GPL2
-  BSD
-)
+license=(GPL2 BSD)
 depends=(glibc)
-makedepends=(git)
+makedepends=(git clang llvm lld)
 provides=(libxxhash.so)
-_tag=e626a72bc2321cd320e953a0ccf1584cad60f363
+
+# Track a specific upstream commit/tag for reproducibility
+_tag=7aee8d0a341bb574f7c139c769e1db115b42cc3c
 source=(git+https://github.com/Cyan4973/xxHash.git#tag=${_tag})
 b2sums=('SKIP')
 
+##############################################################################
+# Extra instrumentation flags – append only; do not alter user CFLAGS/CXXFLAGS
+##############################################################################
+_extra_instr='-g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=150 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling'
+
 pkgver() {
   cd xxHash
-  git describe --tags | sed 's/^v//'
+  # Make sure tags are present even on commit checkouts
+  git fetch --tags --force --quiet || true
+
+  # Prefer tag-based version: vX.Y[.Z][-pre]-N-gHASH -> X.Y[.Z][.pre].rN.gHASH
+  local desc
+  if desc=$(git describe --tags --long --match 'v[0-9]*' 2>/dev/null); then
+    desc="${desc#v}"
+    # Handle prereleases and ensure commit count is captured as .rN.gHASH
+    # Examples:
+    #   0.8.3-26-gdeadbee        -> 0.8.3.r26.gdeadbee
+    #   0.8.3-rc1-5-gcafebabe    -> 0.8.3.rc1.r5.gcafebabe
+    desc=$(sed -E 's/-([0-9]+)-g/.r\1.g/; s/-/./g' <<<"$desc")
+    printf '%s' "$desc"
+    return
+  fi
+
+  # Fallback if no matching tags are reachable
+  printf '0.0.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
+prepare() {
+  cd "$srcdir"
+  # Ensure clean per-pass trees to avoid object reuse across PGO stages
+  rm -rf xxHash-gen xxHash-cs xxHash-final
+  cp -a xxHash xxHash-gen
+  cp -a xxHash xxHash-cs
+  cp -a xxHash xxHash-final
+}
+
+##############################################################################
+# Training workload
+# - Locates built xxhsum and libxxhash.so inside the given build dir (handles
+#   xxHash's cachedObjs layout).
+# - Exercises xxhsum across all algorithms in bench mode for representative load.
+# - Prints clear logs on success/failure, and never aborts the build.
+##############################################################################
+_run_xxhash_workload() { # $1 = build_dir (required), $2 = explicit_bin (optional), $3 = explicit_libdir (optional)
+  local build_dir="$1"
+  local explicit_bin="${2:-}"
+  local explicit_lib="${3:-}"
+
+  # Locate xxhsum binary
+  local xxhsum_bin=''
+  if [[ -n "$explicit_bin" && -x "$explicit_bin" ]]; then
+    xxhsum_bin="$explicit_bin"
+  else
+    # Prefer binaries in cachedObjs first, then top-level cli
+    xxhsum_bin="$(find "$build_dir" -type f -name xxhsum -perm -111 2>/dev/null | sort -r | head -n1 || true)"
+  fi
+
+  # Locate libxxhash.so directory
+  local lib_dir=''
+  if [[ -n "$explicit_lib" && -d "$explicit_lib" ]]; then
+    lib_dir="$explicit_lib"
+  else
+    lib_dir="$(find "$build_dir" -type f -name 'libxxhash.so*' -printf '%h\n' 2>/dev/null | sort -u | head -n1 || true)"
+    [[ -z "$lib_dir" && -d "$build_dir/lib" ]] && lib_dir="$build_dir/lib"
+  fi
+
+  if [[ -z "$xxhsum_bin" || ! -x "$xxhsum_bin" ]]; then
+    echo "==> [xxhash] Training: xxhsum not found or not executable in: $build_dir (explicit: ${explicit_bin:-none})"
+    return 1
+  fi
+  if [[ -z "$lib_dir" || ! -d "$lib_dir" ]]; then
+    echo "==> [xxhash] Training: libxxhash.so directory not found in: $build_dir (explicit: ${explicit_lib:-none})"
+    return 1
+  fi
+
+  echo "==> [xxhash] Training: using binary: $xxhsum_bin"
+  echo "==> [xxhash] Training: using libdir: $lib_dir"
+
+  local algo_flags=(-H0 -H1 -H2 -H3)
+  local rc=0
+
+  for a in "${algo_flags[@]}"; do
+    echo "==> [xxhash] Training: bench quick $a"
+    LD_LIBRARY_PATH="$lib_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+      "$xxhsum_bin" -b -q "$a" >/dev/null 2>&1 || rc=1
+
+    echo "==> [xxhash] Training: bench iter=4 $a"
+    LD_LIBRARY_PATH="$lib_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+      "$xxhsum_bin" -bi4 -q "$a" >/dev/null 2>&1 || rc=1
+  done
+
+  if [[ $rc -ne 0 ]]; then
+    echo "==> [xxhash] Training: some bench runs failed (continuing build)."
+  else
+    echo "==> [xxhash] Training: workload completed successfully."
+  fi
+  return 0
+}
+
+##############################################################################
+# Build: PGO → CS-PGO → Final, with optional BOLT on xxhsum
+##############################################################################
 build() {
-  make PREFIX=/usr DISPATCH=0 XXH_X86DISPATCH_ALLOW_AVX=1 -C xxHash
+  export CC=clang
+  export CXX=clang++
+
+  # Preserve user flags; only append via per-pass variables
+  local U_CFLAGS="$CFLAGS"
+  local U_LDFLAGS="$LDFLAGS"
+
+  # Detect CS-PGO support
+  local HAVE_CS=0
+  if clang --help 2>/dev/null | grep -q -- '-fcs-profile-generate'; then
+    HAVE_CS=1
+  fi
+
+  local gen_dir="$srcdir/pgo-gen"
+  local cs_dir="$srcdir/pgo-cs"
+  mkdir -p "$gen_dir" "$cs_dir"
+
+  # Common make arguments (preserve original options)
+  local mk_common=(PREFIX=/usr DISPATCH=0 XXH_X86DISPATCH_ALLOW_AVX=1)
+  local p1_dir="$srcdir/xxHash-gen"
+  local p2_dir="$srcdir/xxHash-cs"
+  local p3_dir="$srcdir/xxHash-final"
+
+  # ---------- PASS 1 : profile-generate -------------------------------------
+  echo "==> [xxhash] PASS 1: Building with PGO instrumentation..."
+  CFLAGS="$U_CFLAGS $_extra_instr -fprofile-generate=$gen_dir" \
+  LDFLAGS="$U_LDFLAGS -fprofile-generate=$gen_dir" \
+  make -C "$p1_dir" "${mk_common[@]}"
+
+  echo "==> [xxhash] PASS 1: Running training workload..."
+  LLVM_PROFILE_FILE="$gen_dir/%p.%m.profraw" \
+    _run_xxhash_workload "$p1_dir" || echo "==> [xxhash] PASS 1: Training failed to run."
+
+  local have_gen=0
+  if compgen -G "$gen_dir/*.profraw" >/dev/null; then
+    echo "==> [xxhash] PASS 1: Merging PGO profiles..."
+    llvm-profdata merge -o "$srcdir/gen.prof" "$gen_dir"/*.profraw
+    have_gen=1
+  else
+    echo "==> [xxhash] PASS 1: No PGO profiles generated; continuing without profile-use."
+  fi
+
+  # ---------- PASS 2 : profile-use + CS profile-generate --------------------
+  echo "==> [xxhash] PASS 2: Building with profile-use and CS instrumentation..."
+  local c_cs="$U_CFLAGS $_extra_instr"
+  local l_cs="$U_LDFLAGS"
+  if [[ $have_gen -eq 1 ]]; then
+    c_cs+=" -fprofile-use=$srcdir/gen.prof"
+    l_cs+=" -fprofile-use=$srcdir/gen.prof"
+  fi
+  if [[ $HAVE_CS -eq 1 ]]; then
+    c_cs+=" -fcs-profile-generate=$cs_dir"
+    l_cs+=" -fcs-profile-generate=$cs_dir"
+  else
+    echo "==> [xxhash] PASS 2: Clang without CS-PGO; building with standard PGO only."
+  fi
+
+  CFLAGS="$c_cs" LDFLAGS="$l_cs" \
+  make -C "$p2_dir" "${mk_common[@]}"
+
+  echo "==> [xxhash] PASS 2: Running training workload..."
+  LLVM_PROFILE_FILE="$cs_dir/%p.%m.profraw" \
+    _run_xxhash_workload "$p2_dir" || echo "==> [xxhash] PASS 2: Training failed to run."
+
+  local have_final_prof=0
+  if compgen -G "$cs_dir/*.profraw" >/dev/null; then
+    echo "==> [xxhash] PASS 2: Merging CS-PGO and base profiles..."
+    if [[ $have_gen -eq 1 ]]; then
+      llvm-profdata merge -o "$srcdir/final.prof" "$cs_dir"/*.profraw "$srcdir/gen.prof"
+    else
+      llvm-profdata merge -o "$srcdir/final.prof" "$cs_dir"/*.profraw
+    fi
+    have_final_prof=1
+  elif [[ $have_gen -eq 1 ]]; then
+    echo "==> [xxhash] PASS 2: No CS-PGO profiles; falling back to PASS 1 profile."
+    cp -f "$srcdir/gen.prof" "$srcdir/final.prof"
+    have_final_prof=1
+  else
+    echo "==> [xxhash] PASS 2: No profiles at all; proceeding without profile-use."
+  fi
+
+  # ---------- PASS 3 : final profile-use ------------------------------------
+  echo "==> [xxhash] PASS 3: Building final optimized artifacts..."
+  local c_fin="$U_CFLAGS"
+  local l_fin="$U_LDFLAGS"
+  if [[ $have_final_prof -eq 1 ]]; then
+    c_fin+=" -fprofile-use=$srcdir/final.prof"
+    l_fin+=" -fprofile-use=$srcdir/final.prof"
+  fi
+
+  # Emit relocs if BOLT present to improve post-link profiling quality.
+  if command -v llvm-bolt >/dev/null 2>&1; then
+    l_fin+=" -Wl,--emit-relocs"
+  fi
+
+  CFLAGS="$c_fin" LDFLAGS="$l_fin" \
+  make -C "$p3_dir" "${mk_common[@]}"
+
+  # ---------- Optional: BOLT post-link on xxhsum binary ---------------------
+  if command -v llvm-bolt >/dev/null 2>&1; then
+    echo "==> [xxhash] BOLT: post-link instrumentation and optimization on xxhsum..."
+    local bolt_dir="$srcdir/bolt"
+    mkdir -p "$bolt_dir"
+
+    # Locate the final xxhsum and its lib dir
+    local xxhsum_bin
+    xxhsum_bin="$(find "$p3_dir" -type f -name xxhsum -perm -111 2>/dev/null | sort -r | head -n1 || true)"
+    if [[ -z "$xxhsum_bin" ]]; then
+      echo "==> [xxhash] BOLT: xxhsum not found; skipping BOLT."
+    else
+      local lib_dir
+      lib_dir="$(find "$p3_dir" -type f -name 'libxxhash.so*' -printf '%h\n' 2>/dev/null | sort -u | head -n1 || true)"
+      [[ -z "$lib_dir" && -d "$p3_dir/lib" ]] && lib_dir="$p3_dir/lib"
+
+      cp -f "$xxhsum_bin" "$bolt_dir/xxhsum.orig"
+
+      # Instrument; skip problematic synthetic/plt symbols to avoid relocation issues seen in practice.
+      rm -f "$bolt_dir/xxhsum.fdata"
+      local bolt_skip='(__x86\.get_pc_thunk\..*|.*@plt|.*\.plt(\..*)?$|.*\.text/.*|_init|_fini|_start|start|__.*)'
+      echo "==> [xxhash] BOLT: Instrumenting with --lite and skip-funcs..."
+      if ! llvm-bolt "$xxhsum_bin" \
+            --relocs \
+            --lite \
+            --skip-funcs="$bolt_skip" \
+            --instrument \
+            --instrumentation-file="$bolt_dir/xxhsum.fdata" \
+            -o "$bolt_dir/xxhsum.inst"; then
+        echo "==> [xxhash] BOLT: instrumentation failed; skipping BOLT."
+      else
+        echo "==> [xxhash] BOLT: Running training on instrumented xxhsum..."
+        _run_xxhash_workload "$p3_dir" "$bolt_dir/xxhsum.inst" "$lib_dir" || echo "==> [xxhash] BOLT: Training with instrumented binary failed."
+        if [[ ! -s "$bolt_dir/xxhsum.fdata" ]]; then
+          echo "==> [xxhash] BOLT: No instrumented profile produced; skipping optimization."
+        else
+          # Compatibility handling for alignment flags across llvm-bolt versions
+          local bolt_help
+          bolt_help="$(llvm-bolt --help 2>&1 || true)"
+          local bolt_align_flags=(--align-blocks)
+          if grep -q -- '--block-alignment' <<<"$bolt_help"; then
+            bolt_align_flags=(--align-blocks --block-alignment=32)
+          fi
+
+          echo "==> [xxhash] BOLT: Optimizing original xxhsum with collected profile..."
+          if llvm-bolt "$bolt_dir/xxhsum.orig" \
+                --relocs \
+                --data="$bolt_dir/xxhsum.fdata" \
+                --reorder-blocks=ext-tsp \
+                --reorder-functions=cdsort \
+                --split-functions \
+                --split-strategy=cdsplit \
+                --icf=all \
+                --jump-tables=move \
+                --peepholes=all \
+                "${bolt_align_flags[@]}" \
+                --dyno-stats \
+                -o "$bolt_dir/xxhsum.bolt"; then
+            install -m755 "$bolt_dir/xxhsum.bolt" "$xxhsum_bin"
+            echo "==> [xxhash] BOLT: optimization applied to build tree binary: $xxhsum_bin"
+          else
+            echo "==> [xxhash] BOLT: optimization failed; skipping."
+          fi
+        fi
+      fi
+    fi
+  else
+    echo "==> [xxhash] BOLT: llvm-bolt not found; skipping BOLT step."
+  fi
 }
 
 package() {
-  make PREFIX=/usr DISPATCH=0 XXH_X86DISPATCH_ALLOW_AVX=1 DESTDIR="${pkgdir}" -C xxHash install
-  install -Dm 644 xxHash/LICENSE -t "${pkgdir}"/usr/share/licenses/xxhash
+  echo "==> [xxhash] Installing build-final artifacts..."
+  local p3_dir="$srcdir/xxHash-final"
+  make -C "$p3_dir" PREFIX=/usr DISPATCH=0 XXH_X86DISPATCH_ALLOW_AVX=1 DESTDIR="${pkgdir}" install
+
+  # License
+  install -Dm644 "$srcdir/xxHash/LICENSE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }
 
-# vim: ts=2 sw=2 et:
+# vim: ts=2 sw=2 et
