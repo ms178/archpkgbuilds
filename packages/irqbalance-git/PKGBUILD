@@ -23,6 +23,7 @@ prepare() {
     [[ $src = *.patch ]] || continue
     patch -Np1 -i "../${src}"
   done
+
   # Create the training workload script
   cat > "$srcdir/training-workload.sh" << 'EOF'
 #!/bin/bash
@@ -30,38 +31,20 @@ set -e
 
 # Get number of CPUs for proper workload scaling
 NUM_CPUS=$(nproc)
-DURATION=60
+DURATION=45 # Reduced duration to be less taxing
+WORKDIR=$(pwd)
 
-# Create a cleanup function to ensure we terminate all processes
+# Create a cleanup function to ensure we terminate all child processes
 cleanup() {
-  echo "Stopping workload and cleaning up (pid: $$)..."
-
-  # Kill all child processes with their process groups
-  pkill -P $$ || true
-
-  # Specifically kill processes we know about
-  if [ -n "$IRQ_PID" ]; then kill $IRQ_PID 2>/dev/null || true; fi
-  if [ -n "$STRESS_PID" ]; then kill $STRESS_PID 2>/dev/null || true; fi
-  if [ -n "$FIO_PID" ]; then kill $FIO_PID 2>/dev/null || true; fi
-  if [ -n "$PING_PID" ]; then kill $PING_PID 2>/dev/null || true; fi
-
-  # Clean up other process groups
-  for pid in $DD_PIDS $FIND_PIDS; do
-    if [ -n "$pid" ]; then kill $pid 2>/dev/null || true; fi
-  done
-
-  # Force kill any remaining descendants
+  echo "Stopping workload and cleaning up (trapped signal)..."
+  # Use pkill to send TERM signal to all children of this script's process group
+  pkill -P $$
+  sleep 1
+  # Force kill any that remain
   pkill -9 -P $$ 2>/dev/null || true
-
   # Clean up temporary files
-  if [ -n "$TEMP_FIO_FILE" ] && [ -f "$TEMP_FIO_FILE" ]; then
-    rm -f "$TEMP_FIO_FILE" 2>/dev/null || true
-  fi
-  for i in $(seq 1 3); do
-    rm -f /tmp/temp_dd_file_$i 2>/dev/null || true
-  done
-
-  echo "Training workload cleanup completed"
+  rm -f "$WORKDIR"/fiotest* "$WORKDIR"/temp_dd_file_* 2>/dev/null || true
+  echo "Training workload cleanup completed."
 }
 
 # Set trap for various signals to ensure cleanup
@@ -71,117 +54,80 @@ trap cleanup EXIT INT TERM
 run_if_available() {
   if command -v "$1" >/dev/null 2>&1; then
     "$@" &
-    local pid=$!
-    echo "Started $1 (PID: $pid)"
+    echo "Started $1 (PID: $!)"
     return 0
   else
-    echo "Warning: $1 not available, skipping"
+    echo "Warning: $1 not available, skipping."
     return 1
   fi
 }
 
-# Start irqbalance in debug mode
-# We're going to ignore permission errors, they're expected when running without root
 echo "Starting irqbalance in debug/foreground mode..."
+# Run irqbalance in the background
 ./irqbalance --debug --foreground 2>&1 | grep -v "Cannot change IRQ" | grep -v "affinity is now unmanaged" &
-IRQ_PID=$!
 
 echo "Letting irqbalance initialize for 2 seconds..."
 sleep 2
 
-echo "Starting mixed workload for $DURATION seconds..."
+echo "Starting safer mixed workload for $DURATION seconds..."
 
-# CPU and memory stress
-run_if_available stress-ng --cpu $NUM_CPUS --cpu-method all --vm $(($NUM_CPUS/2)) --vm-bytes 256M --timeout ${DURATION}s &
-STRESS_PID=$!
+# CPU and a more conservative memory stress
+run_if_available stress-ng --cpu $NUM_CPUS --cpu-method all --vm 1 --vm-bytes 128M --timeout ${DURATION}s &
 
-# I/O stress if fio is available
+# I/O stress if fio is available, writing to the current directory
 if command -v fio >/dev/null 2>&1; then
-  TEMP_FIO_FILE=$(mktemp -d)/fiotest
-  fio --name=random-write --ioengine=posixaio --rw=randwrite --bs=4k --size=100m --numjobs=4 --iodepth=16 --runtime=$((DURATION-10)) --time_based --end_fsync=1 --filename=$TEMP_FIO_FILE &
-  FIO_PID=$!
-  echo "Started fio (PID: $FIO_PID)"
+  fio --name=random-write --ioengine=posixaio --rw=randwrite --bs=4k --size=50m --numjobs=2 \
+      --iodepth=8 --runtime=$((DURATION-5)) --time_based --end_fsync=1 \
+      --filename="$WORKDIR/fiotest" &
 fi
 
 # Network activity (localhost)
-if command -v ping >/dev/null 2>&1; then
-  ping -c 1000 localhost >/dev/null 2>&1 &
-  PING_PID=$!
-  echo "Started ping (PID: $PING_PID)"
+run_if_available ping -i 0.1 -c 300 localhost &>/dev/null &
+
+# Generate interrupts with disc I/O, writing to current directory to avoid filling /tmp
+for i in $(seq 1 2); do
+  dd if=/dev/zero of="$WORKDIR/temp_dd_file_$i" bs=1M count=20 conv=fsync &>/dev/null &
+done
+
+# Controlled system call storm to avoid PID exhaustion
+if command -v find >/dev/null 2>&1 && command -v xargs >/dev/null 2>&1; then
+    find /sys/devices -type f -readable -print0 2>/dev/null | xargs -0 -n 1 -P "$NUM_CPUS" head -c 1 >/dev/null 2>&1 &
 fi
-
-# Generate interrupts with disc I/O
-DD_PIDS=""
-for i in $(seq 1 3); do
-  dd if=/dev/zero of=/tmp/temp_dd_file_$i bs=1M count=50 conv=fsync &>/dev/null &
-  DD_PIDS="$DD_PIDS $!"
-done
-
-# Interrupt system calls
-for i in $(seq 1 50); do
-  sync &
-done
-
-# Random system operations that generate interrupts
-FIND_PIDS=""
-for i in $(seq 1 3); do
-  find /proc -type f -maxdepth 3 -readable -exec head -n1 {} \; >/dev/null 2>&1 &
-  FIND_PIDS="$FIND_PIDS $!"
-done
 
 # Let everything run for the specified duration
 echo "Waiting for $DURATION seconds to complete workload..."
 sleep $DURATION
 
-# Cleanup is handled by the EXIT trap
-echo "Training workload completed"
+echo "Training workload completed."
 EOF
 
   chmod +x "$srcdir/training-workload.sh"
 
-  # Create a separate script for monitoring
+  # The irq-monitor.sh script is fine, no changes needed there.
   cat > "$srcdir/irq-monitor.sh" << 'EOF'
 #!/bin/bash
-# Monitor script to collect interrupt statistics during training
-
 OUTFILE="$1"
 INTERVAL=1
-DURATION=60
-
-# Cleanup function for proper termination
+DURATION=45
 cleanup() {
   echo "Terminating interrupt monitoring..."
-  # Nothing specific to clean up here
 }
-
-# Set trap for various signals
 trap cleanup EXIT INT TERM
-
 if [ -z "$OUTFILE" ]; then
   OUTFILE="/tmp/irq_stats.txt"
 fi
-
 echo "Starting interrupt monitoring, writing to $OUTFILE"
 echo "Time,Total IRQs,CPU Distribution" > "$OUTFILE"
-
 start_time=$(date +%s)
 end_time=$((start_time + DURATION))
-
 while [ $(date +%s) -lt $end_time ]; do
-  # Get current time
   current=$(date +%s)
   elapsed=$((current - start_time))
-
-  # Get interrupt counts
   irq_total=$(grep -s "intr" /proc/stat | awk '{print $2}')
   irq_per_cpu=$(grep -s "intr" /proc/stat | cut -d' ' -f3- | tr ' ' ',')
-
-  # Log the data
   echo "$elapsed,$irq_total,$irq_per_cpu" >> "$OUTFILE"
-
   sleep $INTERVAL
 done
-
 echo "Monitoring complete. Statistics saved to $OUTFILE"
 EOF
 
