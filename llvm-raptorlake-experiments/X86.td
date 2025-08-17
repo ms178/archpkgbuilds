@@ -1300,14 +1300,13 @@ def ProcessorFeatures {
   list<SubtargetFeature> ADLFeatures =
     !listconcat(TRMFeatures, ADLAdditionalFeatures);
 
-  // Raptor Lake (client, no AVX-512): enable fast string ops + prefer 128-bit compute
+  // Raptor Lake (client, no AVX-512): enable fast string ops + prefer 256-bit compute
   list<SubtargetFeature> RLAdditionalFeatures = [FeatureERMSB, FeatureFSRM];
   list<SubtargetFeature> RLFeatures =
     !listconcat(ADLFeatures, RLAdditionalFeatures);
 
-  list<SubtargetFeature> RLAdditionalTuning = [TuningPrefer128Bit];
-  list<SubtargetFeature> RLTuning =
-    !listconcat(ADLTuning, RLAdditionalTuning);
+  list<SubtargetFeature> RLAdditionalTuning = [TuningPrefer256Bit];
+  list<SubtargetFeature> RLTuning = !listconcat(ADLTuning, RLAdditionalTuning);
 
   // Gracemont
   list<SubtargetFeature> GRTTuning = [TuningMacroFusion,
@@ -1317,7 +1316,9 @@ def ProcessorFeatures {
                                       TuningFast15ByteNOP,
                                       TuningFastVariablePerLaneShuffle,
                                       TuningPOPCNTFalseDeps,
-                                      TuningInsertVZEROUPPER];
+                                      TuningInsertVZEROUPPER,
+                                      TuningPrefer128Bit,
+                                      TuningNoDomainDelay];
 
   // Arrowlake
   list<SubtargetFeature> ARLAdditionalFeatures = [FeatureCMPCCXADD,
