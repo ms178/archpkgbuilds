@@ -43,7 +43,8 @@
  */
 
 #include <linux/irq.h>
-#include <linux/irq_work.h>
+#include <linux/interrupt.h>
+#include <linux/irqdomain.h>
 #include <linux/pci.h>
 
 #include <drm/drm_vblank.h>
@@ -115,18 +116,8 @@ const int node_id_to_phys_map[NODEID_MAX] = {
 	[XCD7_NODEID] = 7,
 };
 
-/* Fast bottom-half executed in soft-IRQ context */
-static void amdgpu_irq_handle_ih_soft_iw(struct irq_work *iw)
-{
-	struct amdgpu_device *adev =
-	container_of(iw, struct amdgpu_device, irq.ih_soft_iw);
-
-	/* same payload as the former workqueue handler */
-	amdgpu_ih_process(adev, &adev->irq.ih_soft);
-}
-
 /**
- * amdgpu_irq_disable_all - disable *all* interrupts
+ * amdgpu_irq_disable_all - disable all interrupts
  *
  * @adev: amdgpu device pointer
  *
@@ -134,36 +125,38 @@ static void amdgpu_irq_handle_ih_soft_iw(struct irq_work *iw)
  */
 void amdgpu_irq_disable_all(struct amdgpu_device *adev)
 {
-	unsigned long flags;
+	unsigned long irqflags;
 	unsigned int i, j, k;
+	int r;
 
-	spin_lock_irqsave(&adev->irq.lock, flags);
-
-	for (i = 0; i < AMDGPU_IRQ_CLIENTID_MAX; i++) {
-		struct amdgpu_irq_client *cl = &adev->irq.client[i];
-
-		if (!cl->sources)
+	spin_lock_irqsave(&adev->irq.lock, irqflags);
+	for (i = 0; i < AMDGPU_IRQ_CLIENTID_MAX; ++i) {
+		if (!adev->irq.client[i].sources)
 			continue;
 
-		for (j = 0; j < AMDGPU_MAX_IRQ_SRC_ID; j++) {
-			struct amdgpu_irq_src *src = cl->sources[j];
+		for (j = 0; j < AMDGPU_MAX_IRQ_SRC_ID; ++j) {
+			struct amdgpu_irq_src *src = adev->irq.client[i].sources[j];
 
-			if (!src || !src->funcs->set || !src->num_types)
+			if (!src || !src->funcs || !src->funcs->set || !src->num_types)
 				continue;
 
-			for (k = 0; k < src->num_types; k++) {
-				if (!atomic_read(&src->enabled_types[k]))
+			for (k = 0; k < src->num_types; ++k) {
+				/*
+				 * Avoid redundant programming when the type is obviously
+				 * disabled (if enabled_types is available). For sources
+				 * without enabled_types tracking, proceed unconditionally.
+				 */
+				if (src->enabled_types &&
+				    atomic_read(&src->enabled_types[k]) == 0)
 					continue;
 
-				if (src->funcs->set(adev, src, k,
-					AMDGPU_IRQ_STATE_DISABLE))
-					DRM_ERROR("error disabling IRQ %u/%u\n",
-							  i, j);
+				r = src->funcs->set(adev, src, k, AMDGPU_IRQ_STATE_DISABLE);
+				if (r)
+					DRM_ERROR("error disabling interrupt (%d)\n", r);
 			}
 		}
 	}
-
-	spin_unlock_irqrestore(&adev->irq.lock, flags);
+	spin_unlock_irqrestore(&adev->irq.lock, irqflags);
 }
 
 /**
@@ -179,17 +172,15 @@ void amdgpu_irq_disable_all(struct amdgpu_device *adev)
  */
 static irqreturn_t amdgpu_irq_handler(int irq, void *arg)
 {
-	struct amdgpu_device *adev = drm_to_adev(arg);
+	struct drm_device *dev = (struct drm_device *)arg;
+	struct amdgpu_device *adev = drm_to_adev(dev);
 	irqreturn_t ret;
 
 	ret = amdgpu_ih_process(adev, &adev->irq.ih);
+	if (ret == IRQ_HANDLED)
+		pm_runtime_mark_last_busy(dev->dev);
 
-	if (likely(ret == IRQ_HANDLED))
-		pm_runtime_mark_last_busy(adev->dev);
-	else if (unlikely(ret != IRQ_NONE))
-		DRM_ERROR("amdgpu: ih_process returned %d\n", ret);
-
-	/* Cheaper to call unconditionally than branch on ras_enabled      */
+	/* Cheaper to call unconditionally than branch on ras_enabled */
 	amdgpu_ras_interrupt_fatal_error_handler(adev);
 
 	return ret;
@@ -226,6 +217,21 @@ static void amdgpu_irq_handle_ih2(struct work_struct *work)
 }
 
 /**
+ * amdgpu_irq_handle_ih_soft - kick of processing for ih_soft
+ *
+ * @work: work structure in struct amdgpu_irq
+ *
+ * Kick of processing IH soft ring.
+ */
+static void amdgpu_irq_handle_ih_soft(struct work_struct *work)
+{
+	struct amdgpu_device *adev = container_of(work, struct amdgpu_device,
+						  irq.ih_soft_work);
+
+	amdgpu_ih_process(adev, &adev->irq.ih_soft);
+}
+
+/**
  * amdgpu_msi_ok - check whether MSI functionality is enabled
  *
  * @adev: amdgpu device pointer (unused)
@@ -234,7 +240,7 @@ static void amdgpu_irq_handle_ih2(struct work_struct *work)
  * (all ASICs).
  *
  * Returns:
- * *true* if MSIs are allowed to be enabled or *false* otherwise
+ * true if MSIs are allowed to be enabled or false otherwise
  */
 static bool amdgpu_msi_ok(struct amdgpu_device *adev)
 {
@@ -277,64 +283,69 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
 	unsigned int irq, flags;
 	int r;
 
-	/* ---------------- generic setup ---------------- */
 	spin_lock_init(&adev->irq.lock);
 
+	/* Enable MSI if not disabled by module parameter */
 	adev->irq.msi_enabled = false;
-	flags = amdgpu_msi_ok(adev) ? PCI_IRQ_ALL_TYPES : PCI_IRQ_INTX;
 
+	if (!amdgpu_msi_ok(adev))
+		flags = PCI_IRQ_INTX;
+	else
+		flags = PCI_IRQ_ALL_TYPES;
+
+	/* we only need one vector */
 	r = pci_alloc_irq_vectors(adev->pdev, 1, 1, flags);
 	if (r < 0) {
-		dev_err(adev->dev, "failed to allocate IRQ vector\n");
+		dev_err(adev->dev, "Failed to alloc msi vectors\n");
 		return r;
 	}
 
-	if (amdgpu_msi_ok(adev)) {
+	/*
+	 * Determine whether MSI/MSI-X was actually enabled by the PCI core.
+	 * Freeing vectors must be done unconditionally, regardless of type.
+	 */
+	if (adev->pdev->msi_enabled || adev->pdev->msix_enabled) {
 		adev->irq.msi_enabled = true;
-		dev_dbg(adev->dev, "using MSI/MSI-X\n");
+		dev_dbg(adev->dev, "using MSI/MSI-X.\n");
 	}
 
-	/* IH1 / IH2 still use workqueues */
 	INIT_WORK(&adev->irq.ih1_work, amdgpu_irq_handle_ih1);
 	INIT_WORK(&adev->irq.ih2_work, amdgpu_irq_handle_ih2);
+	INIT_WORK(&adev->irq.ih_soft_work, amdgpu_irq_handle_ih_soft);
 
-	/* fast bottom-half for the software IH ring (irq_work) */
-	init_irq_work(&adev->irq.ih_soft_iw, amdgpu_irq_handle_ih_soft_iw);
-
-	/* ---------------- vector & handler ---------------- */
-	r = pci_irq_vector(adev->pdev, 0);	/* use vector 0 */
+	/* Use vector 0 for IRQ */
+	r = pci_irq_vector(adev->pdev, 0);
 	if (r < 0)
 		goto free_vectors;
 	irq = r;
 
+	/* PCI devices require shared interrupts. */
 	r = request_irq(irq, amdgpu_irq_handler, IRQF_SHARED,
-					adev_to_drm(adev)->driver->name,
-					adev_to_drm(adev));
+			adev_to_drm(adev)->driver->name,
+			adev_to_drm(adev));
 	if (r)
 		goto free_vectors;
 
-	/* ---------------- locality hint ------------------ */
-	#ifdef CONFIG_GENERIC_IRQ_MIGRATION
+#ifdef CONFIG_GENERIC_IRQ_MIGRATION
+	/* Provide a best-effort locality hint based on device NUMA node */
 	{
 		int node = dev_to_node(&adev->pdev->dev);
-		const struct cpumask *mask = (node >= 0) ?
-		cpumask_of_node(node) :
-		cpu_online_mask;
+		const struct cpumask *mask = (node >= 0) ? cpumask_of_node(node) : cpu_online_mask;
 
 		irq_set_affinity_hint(irq, mask);
 	}
-	#endif
+#endif
 
-	adev->irq.installed            = true;
-	adev->irq.irq                  = irq;
+	adev->irq.installed = true;
+	adev->irq.irq = irq;
 	adev_to_drm(adev)->max_vblank_count = 0x00ffffff;
 
-	DRM_DEBUG("amdgpu: IRQ initialised\n");
+	DRM_DEBUG("amdgpu: irq initialized.\n");
 	return 0;
 
-	free_vectors:
-	if (adev->irq.msi_enabled)
-		pci_free_irq_vectors(adev->pdev);
+free_vectors:
+	/* Always free vectors if pci_alloc_irq_vectors() succeeded */
+	pci_free_irq_vectors(adev->pdev);
 	adev->irq.msi_enabled = false;
 	return r;
 }
@@ -343,15 +354,13 @@ void amdgpu_irq_fini_hw(struct amdgpu_device *adev)
 {
 	if (adev->irq.installed) {
 		free_irq(adev->irq.irq, adev_to_drm(adev));
-
-		#ifdef CONFIG_GENERIC_IRQ_MIGRATION
+#ifdef CONFIG_GENERIC_IRQ_MIGRATION
 		irq_set_affinity_hint(adev->irq.irq, NULL);
-		#endif
-
+#endif
 		adev->irq.installed = false;
-
-		if (adev->irq.msi_enabled)
-			pci_free_irq_vectors(adev->pdev);
+		/* Always free vectors regardless of MSI/MSI-X/INTx */
+		pci_free_irq_vectors(adev->pdev);
+		adev->irq.msi_enabled = false;
 	}
 
 	amdgpu_ih_ring_fini(adev, &adev->irq.ih_soft);
@@ -414,7 +423,7 @@ int amdgpu_irq_add_id(struct amdgpu_device *adev,
 	if (src_id >= AMDGPU_MAX_IRQ_SRC_ID)
 		return -EINVAL;
 
-	if (!source->funcs)
+	if (!source || !source->funcs)
 		return -EINVAL;
 
 	if (!adev->irq.client[client_id].sources) {
@@ -432,8 +441,7 @@ int amdgpu_irq_add_id(struct amdgpu_device *adev,
 	if (source->num_types && !source->enabled_types) {
 		atomic_t *types;
 
-		types = kcalloc(source->num_types, sizeof(atomic_t),
-				GFP_KERNEL);
+		types = kcalloc(source->num_types, sizeof(atomic_t), GFP_KERNEL);
 		if (!types)
 			return -ENOMEM;
 
@@ -453,65 +461,84 @@ int amdgpu_irq_add_id(struct amdgpu_device *adev,
  * Dispatches IRQ to IP blocks.
  */
 void amdgpu_irq_dispatch(struct amdgpu_device *adev,
-						 struct amdgpu_ih_ring *ih)
+			 struct amdgpu_ih_ring *ih)
 {
-	u32 ring_idx = ih->rptr >> 2;
+	u32 ring_index = ih->rptr >> 2;
+	struct amdgpu_iv_entry entry;
+	unsigned int client_id, src_id;
+	struct amdgpu_irq_src *src;
+	bool handled = false;
+	int r;
 
-	/* keep volatile to satisfy the type system */
-	const volatile u32 *iv_raw = &ih->ring[ring_idx];
-	const        u32  *iv_ptr = (const u32 *)iv_raw;
+	entry.ih = ih;
+	entry.iv_entry = (const u32 *)&ih->ring[ring_index];
 
-	/* prefetch expects ‘const void *’; cast away volatile explicitly */
-	prefetch((const void *)iv_raw);
-
-	struct amdgpu_iv_entry entry = {
-		.ih            = ih,
-		.iv_entry      = iv_ptr,
-		.timestamp     = 0,
-		.timestamp_src = 0,
-	};
-	struct amdgpu_irq_src       *src;
-	bool                          handled = false;
-	unsigned int                  cid, sid;
-	int                           r;
+	/*
+	 * timestamp is not supported on some legacy SOCs (cik, cz, iceland,
+	 * si and tonga), so initialize timestamp and timestamp_src to 0
+	 */
+	entry.timestamp = 0;
+	entry.timestamp_src = 0;
 
 	amdgpu_ih_decode_iv(adev, &entry);
-	trace_amdgpu_iv(ih - &adev->irq.ih, &entry);
 
-	cid = entry.client_id;
-	sid = entry.src_id;
+	/* Compute a stable ring identifier without undefined pointer arithmetic */
+	{
+		int ih_id = -1;
 
-	/* -------- fast sanity checks --------------------------------- */
-	if (cid >= AMDGPU_IRQ_CLIENTID_MAX || sid >= AMDGPU_MAX_IRQ_SRC_ID)
-		goto unhandled;
+		if (ih == &adev->irq.ih)
+			ih_id = 0;
+		else if (ih == &adev->irq.ih1)
+			ih_id = 1;
+		else if (ih == &adev->irq.ih2)
+			ih_id = 2;
+		else if (ih == &adev->irq.ih_soft)
+			ih_id = 3;
 
-	if ((cid == AMDGPU_IRQ_CLIENTID_LEGACY ||
-		cid == SOC15_IH_CLIENTID_ISP) &&
-		unlikely(adev->irq.virq[sid])) {
-		generic_handle_domain_irq(adev->irq.domain, sid);
-	handled = true;
-	goto record_ts;
-		}
+		trace_amdgpu_iv(ih_id, &entry);
+	}
 
-		struct amdgpu_irq_client *client = &adev->irq.client[cid];
-		if (likely(client->sources &&
-			(src = client->sources[sid]))) {
+	client_id = entry.client_id;
+	src_id = entry.src_id;
 
-			r = src->funcs->process(adev, src, &entry);
+	if (client_id >= AMDGPU_IRQ_CLIENTID_MAX) {
+		DRM_DEBUG("Invalid client_id in IV: %d\n", client_id);
+
+	} else if (src_id >= AMDGPU_MAX_IRQ_SRC_ID) {
+		DRM_DEBUG("Invalid src_id in IV: %d\n", src_id);
+
+	} else if (((client_id == AMDGPU_IRQ_CLIENTID_LEGACY) ||
+		    (client_id == SOC15_IH_CLIENTID_ISP)) &&
+		   adev->irq.virq[src_id]) {
+		/*
+		 * Delegate specific client IDs to Linux IRQ domain when a mapping exists.
+		 * Require both domain and mapping to be present to avoid NULL deref if the
+		 * domain was removed during teardown.
+		 */
+		struct irq_domain *domain = READ_ONCE(adev->irq.domain);
+		if (domain)
+			generic_handle_domain_irq(domain, src_id);
+
+	} else if (!adev->irq.client[client_id].sources) {
+		DRM_DEBUG("Unregistered interrupt client_id: %d src_id: %d\n",
+			  client_id, src_id);
+
+	} else if ((src = adev->irq.client[client_id].sources[src_id])) {
+		r = src->funcs->process(adev, src, &entry);
 		if (r < 0)
-			DRM_ERROR("amdgpu: error %d processing IRQ %u/%u\n",
-					  r, cid, sid);
-			else if (r)
-				handled = true;
-			} else {
-				DRM_DEBUG("Unregistered IRQ cid:%u sid:%u\n", cid, sid);
-			}
+			DRM_ERROR("error processing interrupt (%d)\n", r);
+		else if (r)
+			handled = true;
 
-			unhandled:
-			if (!handled)
-				amdgpu_amdkfd_interrupt(adev, iv_ptr);
+	} else {
+		DRM_DEBUG("Unregistered interrupt src_id: %d of client_id:%d\n",
+			  src_id, client_id);
+	}
 
-	record_ts:
+	/* Send it to amdkfd as well if it isn't already handled */
+	if (!handled)
+		amdgpu_amdkfd_interrupt(adev, entry.iv_entry);
+
 	if (amdgpu_ih_ts_after(ih->processed_timestamp, entry.timestamp))
 		ih->processed_timestamp = entry.timestamp;
 }
@@ -527,15 +554,11 @@ void amdgpu_irq_dispatch(struct amdgpu_device *adev,
  * if the hardware delegation to IH1 or IH2 doesn't work for some reason.
  */
 void amdgpu_irq_delegate(struct amdgpu_device *adev,
-						 struct amdgpu_iv_entry *entry,
-						 unsigned int num_dw)
+			 struct amdgpu_iv_entry *entry,
+			 unsigned int num_dw)
 {
-	/* copy IV into the software ring */
-	amdgpu_ih_ring_write(adev, &adev->irq.ih_soft,
-						 entry->iv_entry, num_dw);
-
-	/* queue bottom-half that lives inside ih_soft                      */
-	irq_work_queue(&adev->irq.ih_soft_iw);
+	amdgpu_ih_ring_write(adev, &adev->irq.ih_soft, entry->iv_entry, num_dw);
+	schedule_work(&adev->irq.ih_soft_work);
 }
 
 /**
@@ -548,7 +571,7 @@ void amdgpu_irq_delegate(struct amdgpu_device *adev,
  * Updates interrupt state for the specific source (all ASICs).
  */
 int amdgpu_irq_update(struct amdgpu_device *adev,
-			     struct amdgpu_irq_src *src, unsigned int type)
+		      struct amdgpu_irq_src *src, unsigned int type)
 {
 	unsigned long irqflags;
 	enum amdgpu_interrupt_state state;
@@ -556,8 +579,9 @@ int amdgpu_irq_update(struct amdgpu_device *adev,
 
 	spin_lock_irqsave(&adev->irq.lock, irqflags);
 
-	/* We need to determine after taking the lock, otherwise
-	 * we might disable just enabled interrupts again
+	/*
+	 * Determine after taking the lock; otherwise we might disable
+	 * just-enabled interrupts again.
 	 */
 	if (amdgpu_irq_enabled(adev, src, type))
 		state = AMDGPU_IRQ_STATE_ENABLE;
@@ -599,60 +623,99 @@ void amdgpu_irq_gpu_reset_resume_helper(struct amdgpu_device *adev)
 	}
 }
 
-static inline bool irq_ref_inc(struct amdgpu_irq_src *src, unsigned int t)
+/**
+ * amdgpu_irq_get - enable interrupt
+ *
+ * @adev: amdgpu device pointer
+ * @src: interrupt source pointer
+ * @type: type of interrupt
+ *
+ * Enables specified type of interrupt on the specified source (all ASICs).
+ *
+ * Returns:
+ * 0 on success or error code otherwise
+ */
+int amdgpu_irq_get(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
+		   unsigned int type)
 {
-	/* full barrier via atomic op; returns true if counter became 1   */
-	return atomic_add_return(1, &src->enabled_types[t]) == 1;
-}
-
-static inline bool irq_ref_dec(struct amdgpu_irq_src *src, unsigned int t)
-{
-	/* full barrier; true if it just reached 0                         */
-	return atomic_sub_and_test(1, &src->enabled_types[t]);
-}
-
-int amdgpu_irq_get(struct amdgpu_device *adev,
-				   struct amdgpu_irq_src *src, unsigned int type)
-{
-	if (unlikely(!adev->irq.installed))
+	if (!adev->irq.installed)
 		return -ENOENT;
-	if (type >= src->num_types || !src->enabled_types || !src->funcs->set)
+
+	if (type >= src->num_types)
 		return -EINVAL;
 
-	/* Fast path: already enabled → nothing to do                      */
-	if (!irq_ref_inc(src, type))
-		return 0;
+	if (!src->enabled_types || !src->funcs->set)
+		return -EINVAL;
 
-	/* First user – program hardware (rare)                            */
-	return unlikely(amdgpu_irq_update(adev, src, type));
+	if (atomic_inc_return(&src->enabled_types[type]) == 1)
+		return amdgpu_irq_update(adev, src, type);
+
+	return 0;
 }
 
-int amdgpu_irq_put(struct amdgpu_device *adev,
-				   struct amdgpu_irq_src *src, unsigned int type)
+/**
+ * amdgpu_irq_put - disable interrupt
+ *
+ * @adev: amdgpu device pointer
+ * @src: interrupt source pointer
+ * @type: type of interrupt
+ *
+ * Disables specified type of interrupt on the specified source (all ASICs).
+ *
+ * Returns:
+ * 0 on success or error code otherwise
+ */
+int amdgpu_irq_put(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
+		   unsigned int type)
 {
-	if (unlikely(!adev->irq.installed))
-		return -ENOENT;
-	if (type >= src->num_types || !src->enabled_types || !src->funcs->set)
+	/* When the threshold is reached, the interrupt source may not be enabled. */
+	if (amdgpu_ras_is_rma(adev))
 		return -EINVAL;
+
+	if (!adev->irq.installed)
+		return -ENOENT;
+
+	if (type >= src->num_types)
+		return -EINVAL;
+
+	if (!src->enabled_types || !src->funcs->set)
+		return -EINVAL;
+
 	if (WARN_ON(!amdgpu_irq_enabled(adev, src, type)))
 		return -EINVAL;
 
-	/* Fast path: more users remain                                     */
-	if (!irq_ref_dec(src, type))
-		return 0;
+	if (atomic_dec_and_test(&src->enabled_types[type]))
+		return amdgpu_irq_update(adev, src, type);
 
-	/* Counter hit zero – disable in hardware (rare)                    */
-	return unlikely(amdgpu_irq_update(adev, src, type));
+	return 0;
 }
 
-bool amdgpu_irq_enabled(struct amdgpu_device *adev,
-						struct amdgpu_irq_src *src, unsigned int type)
+/**
+ * amdgpu_irq_enabled - check whether interrupt is enabled or not
+ *
+ * @adev: amdgpu device pointer
+ * @src: interrupt source pointer
+ * @type: type of interrupt
+ *
+ * Checks whether the given type of interrupt is enabled on the given source.
+ *
+ * Returns:
+ * true if interrupt is enabled, false if interrupt is disabled or on
+ * invalid parameters
+ */
+bool amdgpu_irq_enabled(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
+			unsigned int type)
 {
-	if (!adev->irq.installed || type >= src->num_types || !src->enabled_types)
+	if (!adev->irq.installed)
 		return false;
 
-	/* atomic_read() is already a single-copy atomic load on x86/arm64 */
-	return atomic_read(&src->enabled_types[type]) != 0;
+	if (type >= src->num_types)
+		return false;
+
+	if (!src->enabled_types || !src->funcs->set)
+		return false;
+
+	return !!atomic_read(&src->enabled_types[type]);
 }
 
 /* XXX: Generic IRQ handling */
@@ -692,8 +755,7 @@ static int amdgpu_irqdomain_map(struct irq_domain *d,
 	if (hwirq >= AMDGPU_MAX_IRQ_SRC_ID)
 		return -EPERM;
 
-	irq_set_chip_and_handler(irq,
-				 &amdgpu_irq_chip, handle_simple_irq);
+	irq_set_chip_and_handler(irq, &amdgpu_irq_chip, handle_simple_irq);
 	return 0;
 }
 
@@ -715,8 +777,8 @@ static const struct irq_domain_ops amdgpu_hw_irqdomain_ops = {
  */
 int amdgpu_irq_add_domain(struct amdgpu_device *adev)
 {
-	adev->irq.domain = irq_domain_add_linear(NULL, AMDGPU_MAX_IRQ_SRC_ID,
-						 &amdgpu_hw_irqdomain_ops, adev);
+	adev->irq.domain = irq_domain_create_linear(NULL, AMDGPU_MAX_IRQ_SRC_ID,
+						    &amdgpu_hw_irqdomain_ops, adev);
 	if (!adev->irq.domain) {
 		DRM_ERROR("GPU irq add domain failed\n");
 		return -ENODEV;
@@ -735,7 +797,21 @@ int amdgpu_irq_add_domain(struct amdgpu_device *adev)
  */
 void amdgpu_irq_remove_domain(struct amdgpu_device *adev)
 {
+	unsigned int i;
+
 	if (adev->irq.domain) {
+		/*
+		 * Dispose mappings to avoid stale virq numbers pointing at a removed
+		 * domain. This prevents later misuse in dispatch paths.
+		 */
+		for (i = 0; i < AMDGPU_MAX_IRQ_SRC_ID; ++i) {
+			unsigned int virq = READ_ONCE(adev->irq.virq[i]);
+
+			if (virq) {
+				irq_dispose_mapping(virq);
+				WRITE_ONCE(adev->irq.virq[i], 0);
+			}
+		}
 		irq_domain_remove(adev->irq.domain);
 		adev->irq.domain = NULL;
 	}
@@ -752,11 +828,20 @@ void amdgpu_irq_remove_domain(struct amdgpu_device *adev)
  * by a different driver (e.g., ACP).
  *
  * Returns:
- * Linux IRQ
+ * Linux IRQ (0 on error)
  */
 unsigned int amdgpu_irq_create_mapping(struct amdgpu_device *adev, unsigned int src_id)
 {
-	adev->irq.virq[src_id] = irq_create_mapping(adev->irq.domain, src_id);
+	unsigned int virq;
 
-	return adev->irq.virq[src_id];
+	if (src_id >= AMDGPU_MAX_IRQ_SRC_ID)
+		return 0;
+
+	if (!adev->irq.domain)
+		return 0;
+
+	virq = irq_create_mapping(adev->irq.domain, src_id);
+	WRITE_ONCE(adev->irq.virq[src_id], virq);
+
+	return virq;
 }
