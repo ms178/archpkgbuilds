@@ -1,49 +1,104 @@
+# Maintainer: Super Genius CachyOS Maintainer
 pkgname=nodejs
-pkgver=23.6.0
-pkgrel=3.1
-pkgdesc='Evented I/O for V8 javascript'
+pkgver=24.6.0
+pkgrel=6
+pkgdesc='Evented I/O for V8 JavaScript (PGO + BOLT; advanced instrumentation)'
 arch=('x86_64')
 url='https://nodejs.org/'
 license=('MIT')
-options=(!strip)
+options=('!strip')
 depends=(
-  'brotli'
-  'c-ares'
-  'icu'
-  'libnghttp2'
-  'libnghttp3'
-  'libngtcp2'
-  'libuv'
-  'openssl'
-  'zlib'
+  brotli
+  c-ares
+  icu
+  libnghttp2
+  libnghttp3
+  libngtcp2
+  libuv
+  openssl
+  zlib
 )
 makedepends=(
-  'git'
-  'procps-ng'
-  'python'
-  'llvm'
-  'perf'
+  git
+  procps-ng
+  python
+  clang
+  llvm
+  lld
 )
 
-source=("git+https://github.com/nodejs/node.git#tag=v$pkgver?signed"
-        "0001-test-make-test-crypto-hash-compatible-with-OpenSSL-3.patch"
-        "0002-test-adjust-OpenSSL-error-code-for-3.4.0.patch"
-        "0001-test-disable-openssl-3.4.0-incompatible-tests.patch")
+source=("node::git+https://github.com/nodejs/node.git#tag=v$pkgver?signed")
 sha512sums=('SKIP')
 
+# Advanced compile-time instrumentation for higher quality PGO (compile-time only)
+_extra_instr='-g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=150 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling'
+
+# Strip pre-existing -fprofile-* from user flags to avoid mixing generate/use
+_strip_profile_flags() {
+  local out=() tok
+  for tok in $@; do
+    case "$tok" in
+      -fprofile-generate|-fprofile-generate=*|-fprofile-use|-fprofile-use=*|-fprofile-sample-use=*|-fauto-profile=*|-fcs-profile-generate=*)
+        ;;
+      *) out+=("$tok");;
+    esac
+  done
+  printf '%s ' "${out[@]}"
+}
+
 prepare() {
+  cd "$srcdir"
+  rm -rf node-gen node-opt
+  cp -a node node-gen
+  cp -a node node-opt
+}
 
-  export LDFLAGS+=" -Wl,--emit-relocs"
+# Build runtime env pointing to the just-built lib directory
+_env_with_build_libs() {
+  local outdir="$1"  # usually $PWD/out/Release
+  echo "LD_LIBRARY_PATH=$outdir:${LD_LIBRARY_PATH:-}"
+}
 
-  cd node
-  patch -Np1 -i ../0001-test-make-test-crypto-hash-compatible-with-OpenSSL-3.patch
-  #patch -Np1 -i ../0002-test-adjust-OpenSSL-error-code-for-3.4.0.patch
-  patch -Np1 -i ../0001-test-disable-openssl-3.4.0-incompatible-tests.patch
+# Curated, bounded training workload for Node (diverse core subsystems)
+_run_node_workload() { # $1=node binary; $2=out/Release directory
+  local nodebin="$1"
+  local outdir="$2"
+  local env_ld; env_ld="$(_env_with_build_libs "$outdir")"
+
+  _rt() { local secs="$1"; shift; timeout -k 2 "$secs" "$@" >/dev/null 2>&1 || true; }
+
+  # CPU + version
+  _rt 20 env $env_ld "$nodebin" -e "console.log(process.version); for(let i=0;i<8e6;i++);"
+  # Filesystem I/O
+  _rt 20 env $env_ld "$nodebin" -e "const fs=require('fs');fs.writeFileSync('pgo.tmp','x'.repeat(2e6));fs.readFileSync('pgo.tmp');fs.unlinkSync('pgo.tmp');"
+  # JSON/Buffer/TypedArrays
+  _rt 20 env $env_ld "$nodebin" -e "const a=[];for(let i=0;i<2e4;i++)a.push({i, s:'x'+i, b:Buffer.alloc(256)});const j=JSON.stringify(a);JSON.parse(j);"
+  # Crypto + zlib
+  _rt 20 env $env_ld "$nodebin" -e "const c=require('crypto');let h;for(let i=0;i<2e4;i++)h=c.createHash('sha256').update(String(i)).digest('hex');const z=require('zlib');for(let i=0;i<300;i++)z.gzipSync(Buffer.alloc(8192));"
+  # Streams/events
+  _rt 20 env $env_ld "$nodebin" -e "const {Readable}=require('stream');let s=Readable.from((function*(){for(let i=0;i<5e4;i++) yield 'data'+i})());s.on('data',()=>{});"
+  # Net/http loopback
+  _rt 25 env $env_ld "$nodebin" -e "const http=require('http');const srv=http.createServer((req,res)=>{res.end('ok')}).listen(0,()=>{const p=srv.address().port;let n=0;const send=()=>{http.get({port:p,path:'/'},r=>{r.resume();if(++n<200) send(); else srv.close();});};send();});"
+  # Child process
+  _rt 20 env $env_ld "$nodebin" -e "const {spawnSync}=require('child_process');for(let i=0;i<8;i++)spawnSync(process.execPath,['-e','1+1']);"
+  # URL parsing
+  _rt 15 env $env_ld "$nodebin" -e "const url=require('url');for(let i=0;i<5e4;i++)url.parse('http://example.com/path?a='+i);"
 }
 
 build() {
-  cd node
+  # Respect user CC/CXX/flags from makepkg.conf; only append pass-specific PGO/BOLT flags
+  local BASE_CFLAGS;   BASE_CFLAGS="$(_strip_profile_flags $CFLAGS)"
+  local BASE_CXXFLAGS; BASE_CXXFLAGS="$(_strip_profile_flags $CXXFLAGS)"
+  local BASE_LDFLAGS="$LDFLAGS"
 
+  # ---------------- PASS 1: PGO-instrumented build ----------------
+  local gen_dir="$srcdir/pgo-gen"; mkdir -p "$gen_dir"
+  local CFLAGS_GEN="$BASE_CFLAGS ${_extra_instr} -fprofile-generate=$gen_dir"
+  local CXXFLAGS_GEN="$BASE_CXXFLAGS ${_extra_instr} -fprofile-generate=$gen_dir"
+  local LDFLAGS_GEN="$BASE_LDFLAGS -fprofile-generate=$gen_dir"
+
+  cd "$srcdir/node-gen"
+  CFLAGS="$CFLAGS_GEN" CXXFLAGS="$CXXFLAGS_GEN" LDFLAGS="$LDFLAGS_GEN" \
   ./configure \
     --prefix=/usr \
     --with-intl=system-icu \
@@ -59,74 +114,193 @@ build() {
     --shared-cares \
     --shared-brotli
 
-  make -j$(nproc)
+  CFLAGS="$CFLAGS_GEN" CXXFLAGS="$CXXFLAGS_GEN" LDFLAGS="$LDFLAGS_GEN" \
+  make -j"$(nproc)"
 
-  # Statt make test ein spezifisches Test-Target verwenden
-  # das keine Abhängigkeit von der problematischen CRC-Implementierung hat
-  perf record --max-size=6G -F 1700 -e cycles:u,cache-misses:u,branch-misses:u -b -o perf.data -- \
-    timeout 120 make test-js-native-api || :
+  echo "==> PGO training..."
+  local node_gen="$PWD/out/Release/node"
+  LLVM_PROFILE_FILE="$gen_dir/node.%p.profraw" _run_node_workload "$node_gen" "$PWD/out/Release" || true
 
-  # Fügen Sie Fehlerprüfung hinzu
-  if [ ! -f perf.data ]; then
-    echo "Perf data collection failed"
-    exit 1
+  if compgen -G "$gen_dir"/*.profraw >/dev/null; then
+    llvm-profdata merge -o "$srcdir/pgo-merged.profdata" "$gen_dir"/*.profraw
+  else
+    echo "Warning: no PGO .profraw produced; proceeding without profile-use."
+    : > "$srcdir/pgo-merged.profdata" || true
   fi
 
-  # Convert perf data to BOLT format
-  perf2bolt ./out/Release/node -p perf.data -o node.fdata || exit 1
+  # ---------------- PASS 2: optimized build (with --emit-relocs for BOLT) ----------------
+  local CFLAGS_USE="$BASE_CFLAGS"
+  local CXXFLAGS_USE="$BASE_CXXFLAGS"
+  local LDFLAGS_USE="$BASE_LDFLAGS -Wl,--emit-relocs"
+  if [[ -s "$srcdir/pgo-merged.profdata" ]]; then
+    CFLAGS_USE+=" -fprofile-use=$srcdir/pgo-merged.profdata -Wno-profile-instr-missing -Wno-profile-instr-out-of-date"
+    CXXFLAGS_USE+=" -fprofile-use=$srcdir/pgo-merged.profdata -Wno-profile-instr-missing -Wno-profile-instr-out-of-date"
+    LDFLAGS_USE+=" -fprofile-use=$srcdir/pgo-merged.profdata"
+  fi
 
-  # Rest des BOLT-Optimierungsprozesses wie gehabt
-  llvm-bolt ./out/Release/node -o ./out/Release/node.bolt \
-    --data ./node.fdata \
-    --dyno-stats \
-    --cu-processing-batch-size=64 \
-    --eliminate-unreachable \
-    --frame-opt=all \
-    --icf=all \
-    --jump-tables=aggressive \
-    --min-branch-clusters \
-    --stoke \
-    --sctc-mode=always \
-    --plt=all \
-    --hot-data \
-    --hot-text \
-    --frame-opt-rm-stores \
-    --peepholes=all \
-    --infer-stale-profile=1 \
-    --x86-strip-redundant-address-size \
-    --indirect-call-promotion=all \
-    --reg-reassign \
-    --use-aggr-reg-reassign \
-    --reorder-blocks=ext-tsp \
-    --reorder-functions=cdsort \
-    --split-all-cold \
-    --split-eh \
-    --split-functions \
-    --split-strategy=cdsplit \
-    --skip-funcs=Builtins_.*
+  cd "$srcdir/node-opt"
+  CFLAGS="$CFLAGS_USE" CXXFLAGS="$CXXFLAGS_USE" LDFLAGS="$LDFLAGS_USE" \
+  ./configure \
+    --prefix=/usr \
+    --with-intl=system-icu \
+    --without-npm \
+    --shared \
+    --shared-openssl \
+    --shared-zlib \
+    --shared-libuv \
+    --experimental-http-parser \
+    --shared-nghttp2 \
+    --shared-nghttp3 \
+    --shared-ngtcp2 \
+    --shared-cares \
+    --shared-brotli
 
-  mv ./out/Release/node.bolt ./out/Release/node
+  CFLAGS="$CFLAGS_USE" CXXFLAGS="$CXXFLAGS_USE" LDFLAGS="$LDFLAGS_USE" \
+  make -j"$(nproc)"
+
+  # ---------------- BOLT instrumentation, training, and optimization ----------------
+  if command -v llvm-bolt >/dev/null 2>&1; then
+    echo "==> BOLT: instrumenting and optimizing node and libnode"
+    local bolt_dir="$srcdir/bolt"; mkdir -p "$bolt_dir"
+    local outdir="$PWD/out/Release"
+    local nodebin="$outdir/node"
+    local libnode
+    libnode="$(readlink -f "$outdir/libnode.so" 2>/dev/null || true)"
+    [[ -z "$libnode" || ! -f "$libnode" ]] && libnode="$(find "$outdir" -maxdepth 1 -type f -name 'libnode.so*' -print -quit || true)"
+
+    # Save originals
+    cp -f "$nodebin" "$bolt_dir/node.orig"
+    [[ -n "$libnode" ]] && cp -f "$libnode" "$bolt_dir/libnode.so.orig"
+
+    # Instrument node
+    if llvm-bolt "$nodebin" \
+          --relocs --lite=false \
+          --instrument --instrumentation-file="$bolt_dir/node.fdata" --instrumentation-file-append-pid \
+          -o "$bolt_dir/node.inst"; then
+      install -m755 "$bolt_dir/node.inst" "$nodebin"
+    else
+      echo "BOLT: instrumentation failed for node; skipping BOLT."
+      return 0
+    fi
+
+    # Instrument libnode separately (if present)
+    local lib_present=0
+    if [[ -n "$libnode" && -f "$libnode" ]]; then
+      lib_present=1
+      if llvm-bolt "$libnode" \
+            --relocs --lite=false \
+            --instrument --instrumentation-file="$bolt_dir/libnode.fdata" --instrumentation-file-append-pid \
+            -o "$bolt_dir/libnode.so.inst"; then
+        install -m755 "$bolt_dir/libnode.so.inst" "$libnode"
+      else
+        echo "BOLT: instrumentation failed for libnode.so; continuing without lib optimization."
+        lib_present=0
+        [[ -f "$bolt_dir/libnode.so.orig" ]] && install -m755 "$bolt_dir/libnode.so.orig" "$libnode"
+      fi
+    fi
+
+    # Training (force loading instrumented lib via LD_PRELOAD if present)
+    _run_node_workload "$nodebin" "$outdir" || true
+    local env_ld; env_ld="$(_env_with_build_libs "$outdir")"
+    if [[ -n "$libnode" && -f "$libnode" ]]; then
+      env $env_ld LD_PRELOAD="$libnode" timeout -k 2 20 "$nodebin" -e "for(let i=0;i<5e5;i++)Math.sqrt(i)" >/dev/null 2>&1 || true
+    else
+      env $env_ld timeout -k 2 20 "$nodebin" -e "for(let i=0;i<5e5;i++)Math.sqrt(i)" >/dev/null 2>&1 || true
+    fi
+
+    # Merge node fdata
+    local merged_node="$bolt_dir/node.merged.fdata"
+    if compgen -G "$bolt_dir/node.fdata".* >/dev/null; then
+      if command -v merge-fdata >/dev/null 2>&1; then
+        merge-fdata "$bolt_dir/node.fdata".* -o "$merged_node" || true
+      else
+        cat "$bolt_dir/node.fdata".* > "$merged_node" || true
+      fi
+    elif [[ -s "$bolt_dir/node.fdata" ]]; then
+      cp -f "$bolt_dir/node.fdata" "$merged_node"
+    fi
+
+    # Merge libnode fdata
+    local merged_lib="$bolt_dir/libnode.merged.fdata"
+    if [[ $lib_present -eq 1 ]]; then
+      if compgen -G "$bolt_dir/libnode.fdata".* >/dev/null; then
+        if command -v merge-fdata >/dev/null 2>&1; then
+          merge-fdata "$bolt_dir/libnode.fdata".* -o "$merged_lib" || true
+        else
+          cat "$bolt_dir/libnode.fdata".* > "$merged_lib" || true
+        fi
+      elif [[ -s "$bolt_dir/libnode.fdata" ]]; then
+        cp -f "$bolt_dir/libnode.fdata" "$merged_lib"
+      fi
+    fi
+
+    # Optimize node and install back
+    if [[ -s "$merged_node" ]]; then
+      local bolt_help; bolt_help="$(llvm-bolt --help 2>&1 || true)"
+      local align_flags=(--align-blocks)
+      grep -q -- '--block-alignment' <<<"$bolt_help" && align_flags=(--align-blocks --block-alignment=32)
+
+      if llvm-bolt "$bolt_dir/node.orig" \
+            --relocs --data="$merged_node" \
+            --reorder-blocks=ext-tsp --reorder-functions=cdsort \
+            --split-functions --split-strategy=cdsplit \
+            --icf=all --jump-tables=move --peepholes=all \
+            --reg-reassign --use-aggr-reg-reassign \
+            "${align_flags[@]}" --dyno-stats \
+            -o "$bolt_dir/node.bolt"; then
+        install -m755 "$bolt_dir/node.bolt" "$nodebin"
+      else
+        echo "BOLT: node optimization failed; restoring PGO node"
+        install -m755 "$bolt_dir/node.orig" "$nodebin"
+      fi
+    else
+      echo "BOLT: no node fdata; restoring PGO node"
+      install -m755 "$bolt_dir/node.orig" "$nodebin"
+    fi
+
+    # Optimize libnode if profiled
+    if [[ $lib_present -eq 1 && -s "$merged_lib" ]]; then
+      if llvm-bolt "$bolt_dir/libnode.so.orig" \
+            --relocs --data="$merged_lib" \
+            --reorder-blocks=ext-tsp --reorder-functions=cdsort \
+            --split-functions --split-strategy=cdsplit \
+            --icf=all --jump-tables=move --peepholes=all \
+            --reg-reassign --use-aggr-reg-reassign \
+            "${align_flags[@]}" --dyno-stats \
+            -o "$bolt_dir/libnode.so.bolt"; then
+        install -m755 "$bolt_dir/libnode.so.bolt" "$libnode"
+      else
+        echo "BOLT: libnode optimization failed; restoring PGO lib"
+        install -m755 "$bolt_dir/libnode.so.orig" "$libnode"
+      fi
+    elif [[ $lib_present -eq 1 ]]; then
+      echo "BOLT: no libnode fdata; restoring PGO lib"
+      install -m755 "$bolt_dir/libnode.so.orig" "$libnode"
+    fi
+  else
+    echo "llvm-bolt not found; skipping BOLT."
+  fi
 }
 
-#check() {
-#  cd node
-#  make test || :
-#}
-
 package() {
-  cd node
+  cd "$srcdir/node-opt"
   make DESTDIR="$pkgdir" install
-  install -Dm644 LICENSE -t "$pkgdir"/usr/share/licenses/nodejs/
 
-  # Use llvm-strip only on recognized file formats
-  find "$pkgdir" -type f \( -name '*.so*' -o -name '*.a' -o -executable \) -print0 | while IFS= read -r -d '' file; do
-    if llvm-strip --strip-unneeded "$file" 2>/dev/null || llvm-strip --strip-all "$file" 2>/dev/null; then
-      echo "Stripped: $file"
-    else
-      echo "Skipping: $file (not a valid object file)" >&2
-    fi
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+
+  # Manual strip (since !strip)
+  find "$pkgdir" -type f KATEX_INLINE_OPEN -name '*.so*' -o -executable KATEX_INLINE_CLOSE -print0 | while IFS= read -r -d '' f; do
+    llvm-strip --strip-unneeded "$f" 2>/dev/null || true
   done
 
-  cd "$pkgdir"/usr/lib
-  ln -s libnode.so.* libnode.so
+  # Ensure libnode.so symlink exists (for embedders)
+  if [[ -d "$pkgdir/usr/lib" ]]; then
+    pushd "$pkgdir/usr/lib" >/dev/null
+    local soname
+    soname="$(ls -1 libnode.so.* 2>/dev/null | head -n1 || true)"
+    if [[ -n "$soname" && ! -e libnode.so ]]; then
+      ln -sf "$soname" libnode.so
+    fi
+    popd >/dev/null
+  fi
 }
