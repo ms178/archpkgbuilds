@@ -290,9 +290,26 @@ radv_write_data(struct radv_cmd_buffer *cmd_buffer, const unsigned engine_sel, c
 static void
 radv_emit_clear_data(struct radv_cmd_buffer *cmd_buffer, unsigned engine_sel, uint64_t va, unsigned size)
 {
-   uint32_t *zeroes = alloca(size);
-   memset(zeroes, 0, size);
-   radv_write_data(cmd_buffer, engine_sel, va, size / 4, zeroes, false);
+   /* 256-byte static zero buffer; resides in .rodata; avoids alloca and stack probes. */
+   static const uint32_t zeros[64] = {0};
+
+   /* All call sites use 4-byte multiples. Keep an assert and also a runtime guard. */
+   assert(size > 0 && (size % 4) == 0);
+
+   if (size <= sizeof(zeros)) {
+      /* Fast path: single write for tiny clears (typical: 8–256 bytes). */
+      radv_write_data(cmd_buffer, engine_sel, va, size / 4, zeros, false);
+      return;
+   }
+
+   /* Rare path: clear larger regions safely in chunks to avoid stack allocations. */
+   unsigned remaining = size;
+   while (remaining) {
+      const unsigned chunk = remaining > sizeof(zeros) ? sizeof(zeros) : remaining;
+      radv_write_data(cmd_buffer, engine_sel, va, chunk / 4, zeros, false);
+      va += chunk;
+      remaining -= chunk;
+   }
 }
 
 static void
@@ -1775,13 +1792,21 @@ radv_emit_binning_state(struct radv_cmd_buffer *cmd_buffer)
 static void
 radv_emit_shader_prefetch(struct radv_cmd_buffer *cmd_buffer, struct radv_shader *shader)
 {
-   uint64_t va;
-
    if (!shader)
       return;
 
-   va = radv_shader_get_va(shader);
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   struct radv_cmd_stream *cs = cmd_buffer->cs;
 
+   /* Invariant: Never prefetch a VA unless its BO is in the IB's validation list.
+    * Otherwise, the CP DMA might touch an unmapped VA, leading to gfx ring timeout.
+    * Adding the buffer is idempotent and cheap for already-added BOs.
+    */
+   radv_cs_add_buffer(device->ws, cs->b, shader->bo);
+
+   const uint64_t va = radv_shader_get_va(shader);
+
+   /* Prefetch shader code into L2. This is a hint; it doesn't alter state. */
    radv_cp_dma_prefetch(cmd_buffer, va, shader->code_size);
 }
 
@@ -3052,6 +3077,11 @@ radv_emit_graphics_shaders(struct radv_cmd_buffer *cmd_buffer)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
+
+   /* Warm L2 for first-stage graphics (VS/VBO/MS) as early as possible.
+    * Safe due to BO validation inside radv_emit_shader_prefetch().
+    */
+   radv_emit_graphics_prefetch(cmd_buffer, true);
 
    radv_foreach_stage (s, cmd_buffer->state.active_stages & RADV_GRAPHICS_STAGE_BITS) {
       switch (s) {
@@ -4870,48 +4900,38 @@ radv_emit_guardband_state(struct radv_cmd_buffer *cmd_buffer)
    const struct radv_dynamic_state *d = &cmd_buffer->state.dynamic;
    unsigned rast_prim = radv_get_rasterization_prim(cmd_buffer);
    const bool draw_points = radv_rast_prim_is_point(rast_prim) || radv_polygon_mode_is_point(d->vk.rs.polygon_mode);
-   const bool draw_lines = radv_rast_prim_is_line(rast_prim) || radv_polygon_mode_is_line(d->vk.rs.polygon_mode);
+   const bool draw_lines  = radv_rast_prim_is_line(rast_prim)  || radv_polygon_mode_is_line(d->vk.rs.polygon_mode);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
-   int i;
-   float guardband_x = INFINITY, guardband_y = INFINITY;
-   float discard_x = 1.0f, discard_y = 1.0f;
-   const float max_range = 32767.0f;
 
    if (!d->vk.vp.viewport_count)
       return;
 
-   for (i = 0; i < d->vk.vp.viewport_count; i++) {
-      float scale_x = fabsf(d->hw_vp.xform[i].scale[0]);
-      float scale_y = fabsf(d->hw_vp.xform[i].scale[1]);
-      const float translate_x = fabsf(d->hw_vp.xform[i].translate[0]);
-      const float translate_y = fabsf(d->hw_vp.xform[i].translate[1]);
+   const float max_range = 32767.0f;
+   float guardband_x = INFINITY, guardband_y = INFINITY;
+   float discard_x = 1.0f, discard_y = 1.0f;
 
-      if (scale_x < 0.5)
-         scale_x = 0.5;
-      if (scale_y < 0.5)
-         scale_y = 0.5;
+   const bool wide = draw_points || draw_lines;
+   const float pixels = draw_points ? 8191.875f : d->vk.rs.line.width;
+   const float halfpix = pixels * 0.5f;
 
-      guardband_x = MIN2(guardband_x, (max_range - translate_x) / scale_x);
-      guardband_y = MIN2(guardband_y, (max_range - translate_y) / scale_y);
+   for (unsigned i = 0; i < d->vk.vp.viewport_count; i++) {
+      float sx = fabsf(d->hw_vp.xform[i].scale[0]);
+      float sy = fabsf(d->hw_vp.xform[i].scale[1]);
+      sx = fmaxf(sx, 0.5f);
+      sy = fmaxf(sy, 0.5f);
 
-      if (draw_points || draw_lines) {
-         /* When rendering wide points or lines, we need to be more conservative about when to
-          * discard them entirely. */
-         float pixels;
+      const float tx = fabsf(d->hw_vp.xform[i].translate[0]);
+      const float ty = fabsf(d->hw_vp.xform[i].translate[1]);
 
-         if (draw_points) {
-            pixels = 8191.875f;
-         } else {
-            pixels = d->vk.rs.line.width;
-         }
+      const float gbx = (max_range - tx) / sx;
+      const float gby = (max_range - ty) / sy;
 
-         /* Add half the point size / line width. */
-         discard_x += pixels / (2.0 * scale_x);
-         discard_y += pixels / (2.0 * scale_y);
+      guardband_x = fminf(guardband_x, gbx);
+      guardband_y = fminf(guardband_y, gby);
 
-         /* Discard primitives that would lie entirely outside the clip region. */
-         discard_x = MIN2(discard_x, guardband_x);
-         discard_y = MIN2(discard_y, guardband_y);
+      if (wide) {
+         discard_x = fminf(discard_x + (halfpix / sx), guardband_x);
+         discard_y = fminf(discard_y + (halfpix / sy), guardband_y);
       }
    }
 
@@ -6110,14 +6130,17 @@ radv_get_ia_multi_vgt_param(struct radv_cmd_buffer *cmd_buffer, bool instanced_d
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const struct radeon_info *gpu_info = &pdev->info;
-
-   /* Start with the pre-calculated base value from the pipeline. */
-   uint32_t ia_multi_vgt_param = cmd_buffer->state.ia_multi_vgt_param.base;
-   bool wd_switch_on_eop = G_028AA8_WD_SWITCH_ON_EOP(ia_multi_vgt_param);
-   bool ia_switch_on_eoi = G_028AA8_SWITCH_ON_EOI(ia_multi_vgt_param);
-   bool partial_vs_wave = G_028AA8_PARTIAL_VS_WAVE_ON(ia_multi_vgt_param);
-
+   const unsigned max_primgroup_in_wave = 2;
+   /* SWITCH_ON_EOP(0) is always preferable. */
+   bool wd_switch_on_eop = false;
+   bool ia_switch_on_eop = false;
+   bool ia_switch_on_eoi = false;
+   bool partial_vs_wave = false;
+   bool partial_es_wave = cmd_buffer->state.ia_multi_vgt_param.partial_es_wave;
+   bool multi_instances_smaller_than_primgroup;
+   struct radv_prim_vertex_count prim_vertex_count = prim_size_table[topology];
    unsigned primgroup_size;
+
    if (radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_TESS_CTRL)) {
       primgroup_size = num_tess_patches;
    } else if (radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_GEOMETRY)) {
@@ -6126,50 +6149,112 @@ radv_get_ia_multi_vgt_param(struct radv_cmd_buffer *cmd_buffer, bool instanced_d
       primgroup_size = 128; /* recommended without a GS */
    }
 
-   /* Dynamically-determined hardware workarounds and performance heuristics. */
-   if (gpu_info->gfx_level >= GFX7) {
-      struct radv_prim_vertex_count prim_vertex_count = prim_size_table[topology];
-      if (radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_TESS_CTRL) && topology == V_008958_DI_PT_PATCH) {
+   /* GS requirement. */
+   if (radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_GEOMETRY) && gpu_info->gfx_level <= GFX8) {
+      unsigned gs_table_depth = pdev->gs_table_depth;
+      if (SI_GS_PER_ES / primgroup_size >= gs_table_depth - 3)
+         partial_es_wave = true;
+   }
+
+   if (radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_TESS_CTRL)) {
+      if (topology == V_008958_DI_PT_PATCH) {
          prim_vertex_count.min = patch_control_points;
          prim_vertex_count.incr = 1;
       }
+   }
 
-      bool multi_instances_smaller_than_primgroup = indirect_draw;
-      if (!multi_instances_smaller_than_primgroup && instanced_draw) {
-         uint32_t num_prims = radv_prims_for_vertices(&prim_vertex_count, draw_vertex_count);
-         if (num_prims < primgroup_size)
-            multi_instances_smaller_than_primgroup = true;
-      }
+   multi_instances_smaller_than_primgroup = indirect_draw;
+   if (!multi_instances_smaller_than_primgroup && instanced_draw) {
+      uint32_t num_prims = radv_prims_for_vertices(&prim_vertex_count, draw_vertex_count);
+      if (num_prims < primgroup_size)
+         multi_instances_smaller_than_primgroup = true;
+   }
 
+   ia_switch_on_eoi = cmd_buffer->state.ia_multi_vgt_param.ia_switch_on_eoi;
+   partial_vs_wave = cmd_buffer->state.ia_multi_vgt_param.partial_vs_wave;
+
+   if (gpu_info->gfx_level >= GFX7) {
+      /* WD_SWITCH_ON_EOP has no effect on GPUs with less than
+       * 4 shader engines. Set 1 to pass the assertion below.
+       * The other cases are hardware requirements. */
+      if (gpu_info->max_se < 4 || topology == V_008958_DI_PT_POLYGON || topology == V_008958_DI_PT_LINELOOP ||
+          topology == V_008958_DI_PT_TRIFAN || topology == V_008958_DI_PT_TRISTRIP_ADJ ||
+          (prim_restart_enable && (gpu_info->family < CHIP_POLARIS10 ||
+                                   (topology != V_008958_DI_PT_POINTLIST && topology != V_008958_DI_PT_LINESTRIP))))
+         wd_switch_on_eop = true;
+
+      /* Hawaii hangs if instancing is enabled and WD_SWITCH_ON_EOP is 0.
+       * We don't know that for indirect drawing, so treat it as
+       * always problematic. */
       if (gpu_info->family == CHIP_HAWAII && (instanced_draw || indirect_draw))
          wd_switch_on_eop = true;
 
+      /* Performance recommendation for 4 SE Gfx7-8 parts if
+       * instances are smaller than a primgroup.
+       * Assume indirect draws always use small instances.
+       * This is needed for good VS wave utilization.
+       */
       if (gpu_info->gfx_level <= GFX8 && gpu_info->max_se == 4 && multi_instances_smaller_than_primgroup)
          wd_switch_on_eop = true;
 
+      /* Hardware requirement when drawing primitives from a stream
+       * output buffer.
+       */
       if (count_from_stream_output)
          wd_switch_on_eop = true;
 
+      /* Required on GFX7 and later. */
       if (gpu_info->max_se > 2 && !wd_switch_on_eop)
          ia_switch_on_eoi = true;
-      else
-         ia_switch_on_eoi = false; /* WD_SWITCH_ON_EOP=1 implies IA_SWITCH_ON_EOI=0 */
 
-      if (ia_switch_on_eoi && (gpu_info->family == CHIP_HAWAII || (gpu_info->gfx_level == GFX8)))
+      /* Required by Hawaii and, for some special cases, by GFX8. */
+      if (ia_switch_on_eoi &&
+          (gpu_info->family == CHIP_HAWAII ||
+           (gpu_info->gfx_level == GFX8 &&
+            /* max primgroup in wave is always 2 - leave this for documentation */
+            (radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_GEOMETRY) || max_primgroup_in_wave != 2))))
          partial_vs_wave = true;
 
+      /* Instancing bug on Bonaire. */
       if (gpu_info->family == CHIP_BONAIRE && ia_switch_on_eoi && (instanced_draw || indirect_draw))
          partial_vs_wave = true;
+
+      /* If the WD switch is false, the IA switch must be false too. */
+      assert(wd_switch_on_eop || !ia_switch_on_eop);
+   }
+   /* If SWITCH_ON_EOI is set, PARTIAL_ES_WAVE must be set too. */
+   if (gpu_info->gfx_level <= GFX8 && ia_switch_on_eoi)
+      partial_es_wave = true;
+
+   if (radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_GEOMETRY)) {
+      /* GS hw bug with single-primitive instances and SWITCH_ON_EOI.
+       * The hw doc says all multi-SE chips are affected, but amdgpu-pro Vulkan
+       * only applies it to Hawaii. Do what amdgpu-pro Vulkan does.
+       */
+      if (gpu_info->family == CHIP_HAWAII && ia_switch_on_eoi) {
+         bool set_vgt_flush = indirect_draw;
+         if (!set_vgt_flush && instanced_draw) {
+            uint32_t num_prims = radv_prims_for_vertices(&prim_vertex_count, draw_vertex_count);
+            if (num_prims <= 1)
+               set_vgt_flush = true;
+         }
+         if (set_vgt_flush)
+            cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_VGT_FLUSH;
+      }
    }
 
-   /* Re-apply flags to the base value. */
-   ia_multi_vgt_param &= ~(S_028AA8_PRIMGROUP_SIZE(~0) | S_028AA8_WD_SWITCH_ON_EOP(1) | S_028AA8_SWITCH_ON_EOI(1) | S_028AA8_PARTIAL_VS_WAVE_ON(1));
-   ia_multi_vgt_param |= S_028AA8_PRIMGROUP_SIZE(primgroup_size - 1) |
-                         S_028AA8_WD_SWITCH_ON_EOP(wd_switch_on_eop) |
-                         S_028AA8_SWITCH_ON_EOI(ia_switch_on_eoi) |
-                         S_028AA8_PARTIAL_VS_WAVE_ON(partial_vs_wave);
+   /* Workaround for a VGT hang when strip primitive types are used with
+    * primitive restart.
+    */
+   if (prim_restart_enable && (topology == V_008958_DI_PT_LINESTRIP || topology == V_008958_DI_PT_TRISTRIP ||
+                               topology == V_008958_DI_PT_LINESTRIP_ADJ || topology == V_008958_DI_PT_TRISTRIP_ADJ)) {
+      partial_vs_wave = true;
+   }
 
-   return ia_multi_vgt_param;
+   return cmd_buffer->state.ia_multi_vgt_param.base | S_028AA8_PRIMGROUP_SIZE(primgroup_size - 1) |
+          S_028AA8_SWITCH_ON_EOP(ia_switch_on_eop) | S_028AA8_SWITCH_ON_EOI(ia_switch_on_eoi) |
+          S_028AA8_PARTIAL_VS_WAVE_ON(partial_vs_wave) | S_028AA8_PARTIAL_ES_WAVE_ON(partial_es_wave) |
+          S_028AA8_WD_SWITCH_ON_EOP(gpu_info->gfx_level >= GFX7 ? wd_switch_on_eop : 0);
 }
 
 static void
@@ -6425,32 +6510,65 @@ can_skip_buffer_l2_flushes(struct radv_device *device)
  * RB and the shader caches, we always invalidate L2 on the src side, as we can
  * use our knowledge of past usage to optimize flushes away.
  */
-
 enum radv_cmd_flush_bits
-radv_src_access_flush(struct radv_cmd_buffer *cmd_buffer, VkPipelineStageFlags2 src_stages, VkAccessFlags2 src_flags,
-                      VkAccessFlags3KHR src3_flags, const struct radv_image *image,
+radv_src_access_flush(struct radv_cmd_buffer *cmd_buffer,
+                      VkPipelineStageFlags2 src_stages,
+                      VkAccessFlags2 src_flags,
+                      VkAccessFlags3KHR src3_flags,
+                      const struct radv_image *image,
                       const VkImageSubresourceRange *range)
 {
-   const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   (void)src3_flags; /* API parameter; not needed here. Keep ABI stable. */
 
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+
+   /* Expand stage-dependent access flags per Vulkan spec so we operate
+    * on a fully expanded source access set.
+    */
    src_flags = vk_expand_src_access_flags2(src_stages, src_flags);
 
-   bool has_CB_meta = true, has_DB_meta = true;
-   bool image_is_coherent = image ? radv_image_is_l2_coherent(device, image, range) : false;
+   /* Tracking flags for metadata support on the given image. */
+   bool has_CB_meta = true;
+   bool has_DB_meta = true;
+
+   /* Determine whether the resource (image or buffer) is L2-coherent.
+    * - For images: query per-image coherence (format/usage/layout family).
+    * - For buffers (image == NULL): use the GPU capability/heuristic to
+    *   decide if buffer L2 flushes can be skipped.
+    */
+   const bool resource_is_coherent =
+      image ? radv_image_is_l2_coherent(device, image, range)
+            : can_skip_buffer_l2_flushes(device);
+
    enum radv_cmd_flush_bits flush_bits = 0;
 
+   /* If we have an image, determine if CB/DB metadata paths are enabled. */
    if (image) {
       if (!radv_image_has_CB_metadata(image))
          has_CB_meta = false;
+      /* HTILE enabled => DB/HTILE metadata exists on this mip. */
       if (!radv_htile_enabled(image, range ? range->baseMipLevel : 0))
          has_DB_meta = false;
    }
 
-   if (src_flags & VK_ACCESS_2_COMMAND_PREPROCESS_WRITE_BIT_EXT)
+   /* Command preprocess writes (e.g., DGC/NGG meta):
+    * Conservative L2 invalidate to ensure command streams are visible.
+    * This path is rare and correctness-sensitive.
+    */
+   if (src_flags & VK_ACCESS_2_COMMAND_PREPROCESS_WRITE_BIT_EXT) {
       flush_bits |= RADV_CMD_FLAG_INV_L2;
+   }
 
-   if (src_flags & (VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)) {
+   /* SSBO and Acceleration Structure writes:
+    * Ensure visibility for consumers. If the write is to an IMAGE via meta operations
+    * (no STORAGE usage), flush the appropriate block (CB/DB) too.
+    * For buffers on parts with coherent L2, avoid heavy L2 invalidations.
+    */
+   if (src_flags & (VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                    VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)) {
+
       if (image && !(image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
+         /* These writes likely went through CB/DB or other non-storage image paths. */
          if (vk_format_is_depth_or_stencil(image->vk.format)) {
             flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_DB;
          } else {
@@ -6458,37 +6576,69 @@ radv_src_access_flush(struct radv_cmd_buffer *cmd_buffer, VkPipelineStageFlags2 
          }
       }
 
-      if (!image_is_coherent)
+      /* Only touch L2 if the resource isn't L2-coherent. Buffers on GFX9+ often are coherent. */
+      if (!resource_is_coherent) {
+         /* Invalidate L2 on source side for generic shader/AS writes to discard stale clean lines
+          * and synchronize with units that may have bypassed L2 (e.g., SDMA or non-coherent paths).
+          * Destination side will handle its own client cache invalidations (e.g., VCACHE/SCACHE).
+          */
          flush_bits |= RADV_CMD_FLAG_INV_L2;
+      }
    }
 
-   if (src_flags &
-       (VK_ACCESS_2_TRANSFORM_FEEDBACK_WRITE_BIT_EXT | VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT)) {
-      if (!image_is_coherent)
+   /* Transform feedback writes and counters are buffer writes.
+    * If not L2-coherent, publish results by writing back dirty L2 lines. */
+   if (src_flags & (VK_ACCESS_2_TRANSFORM_FEEDBACK_WRITE_BIT_EXT |
+                    VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT)) {
+      if (!resource_is_coherent) {
          flush_bits |= RADV_CMD_FLAG_WB_L2;
+      }
    }
 
+   /* Color attachment writes:
+    * - Always flush+invalidate CB to force data out of RB caches.
+    * - If the image is not L2-coherent, write back dirty L2 lines to VRAM
+    *   (publishes results without thrashing clean data).
+    * - Invalidate CB metadata (DCC) when present.
+    */
    if (src_flags & VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT) {
       flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB;
-      if (!image_is_coherent)
-         flush_bits |= RADV_CMD_FLAG_WB_L2; /* Correctly use WB_L2 to publish results to VRAM */
+
+      if (!resource_is_coherent)
+         flush_bits |= RADV_CMD_FLAG_WB_L2;
+
       if (has_CB_meta)
          flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB_META;
    }
 
+   /* Depth/stencil attachment writes:
+    * - Always flush+invalidate DB to force data out of DB caches.
+    * - If the image is not L2-coherent, write back dirty L2 lines to VRAM.
+    * - Invalidate DB metadata (HTILE) when enabled.
+    */
    if (src_flags & VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT) {
       flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_DB;
-      if (!image_is_coherent)
-         flush_bits |= RADV_CMD_FLAG_WB_L2; /* Correctly use WB_L2 to publish results to VRAM */
+
+      if (!resource_is_coherent)
+         flush_bits |= RADV_CMD_FLAG_WB_L2;
+
       if (has_DB_meta)
          flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_DB_META;
    }
 
+   /* Transfer writes (copies/blits/clears):
+    * - Conservative: flush both CB and DB (some transfer paths use either).
+    * - If the resource is not L2-coherent, invalidate L2 on the source side,
+    *   because SDMA or other paths may bypass L2, leaving stale clean lines.
+    * - Invalidate metadata as needed.
+    */
    if (src_flags & VK_ACCESS_2_TRANSFER_WRITE_BIT) {
-      flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB | RADV_CMD_FLAG_FLUSH_AND_INV_DB;
+      flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB |
+                    RADV_CMD_FLAG_FLUSH_AND_INV_DB;
 
-      if (!image_is_coherent)
-         flush_bits |= RADV_CMD_FLAG_INV_L2; /* Transfers are less predictable, INV_L2 is safer here. */
+      if (!resource_is_coherent)
+         flush_bits |= RADV_CMD_FLAG_INV_L2;
+
       if (has_CB_meta)
          flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB_META;
       if (has_DB_meta)
@@ -7248,6 +7398,9 @@ radv_emit_compute_pipeline(struct radv_cmd_buffer *cmd_buffer, struct radv_compu
 
    if (pipeline == cmd_buffer->state.emitted_compute_pipeline)
       return;
+
+   /* Warm L2 for CS before programming. Safe due to BO validation in prefetch. */
+   radv_emit_compute_prefetch(cmd_buffer);
 
    radeon_check_space(device->ws, cs->b, pdev->info.gfx_level >= GFX10 ? 25 : 22);
 
