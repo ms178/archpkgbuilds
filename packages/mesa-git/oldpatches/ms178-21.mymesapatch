@@ -1,0 +1,283 @@
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -534,26 +534,36 @@ bool
+ radv_cmd_buffer_upload_alloc_aligned(struct radv_cmd_buffer *cmd_buffer, unsigned size, unsigned alignment,
+                                      unsigned *out_offset, void **ptr)
+ {
++   /* All uploads must be 4-byte aligned. */
+    assert(size % 4 == 0);
+ 
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+    const struct radeon_info *gpu_info = &pdev->info;
+ 
+-   /* Align to the scalar cache line size if it results in this allocation
+-    * being placed in less of them.
+-    */
+    unsigned offset = cmd_buffer->upload.offset;
+-   unsigned line_size = gpu_info->gfx_level >= GFX10 ? 64 : 32;
+-   unsigned gap = align(offset, line_size) - offset;
+-   if ((size & (line_size - 1)) > gap)
+-      offset = align(offset, line_size);
+ 
+-   if (alignment)
+-      offset = align(offset, alignment);
++   /* For GFX9 (Vega), the scalar cache line size is 32 bytes.
++    * We always align to at least this size to ensure that shader fetches
++    * of descriptors or constants do not suffer from cache-line splits.
++    * The requested 'alignment' is respected if it is larger.
++    */
++   const unsigned line_size = gpu_info->gfx_level >= GFX10 ? 64 : 32;
++
++   /* Determine the required alignment. Use the larger of the requested
++    * alignment and the hardware's cache line size. This can be done
++    * branchlessly.
++    */
++   unsigned final_alignment = alignment > line_size ? alignment : line_size;
++
++   /* Align the offset. The align() macro is typically branchless. */
++   offset = align(offset, final_alignment);
++
+    if (offset + size > cmd_buffer->upload.size) {
+-      if (!radv_cmd_buffer_resize_upload_buf(cmd_buffer, size))
++      if (!radv_cmd_buffer_resize_upload_buf(cmd_buffer, size)) {
+          return false;
++      }
++      /* After resizing, the new offset is always 0, which is already aligned. */
+       offset = 0;
+    }
+ 
+@@ -6051,16 +6061,34 @@ struct radv_prim_vertex_count {
+ static inline unsigned
+ radv_prims_for_vertices(struct radv_prim_vertex_count *info, unsigned num)
+ {
+-   if (num == 0)
++   if (num < info->min) {
+       return 0;
++   }
+ 
+-   if (info->incr == 0)
++   /* This check also implicitly handles info->incr == 0, preventing division by zero. */
++   if (info->incr == 0) {
+       return 0;
++   }
+ 
+-   if (num < info->min)
+-      return 0;
++   const unsigned n = num - info->min;
+ 
+-   return 1 + ((num - info->min) / info->incr);
++   switch (info->incr) {
++   case 1:
++      return 1 + n;
++   case 2:
++      return 1 + (n >> 1);
++   case 3:
++      /* Fast unsigned division by 3: (n * 0xAAAAAAAB) >> 33 */
++      return 1 + (unsigned)(((uint64_t)n * 0xAAAAAAABull) >> 33);
++   case 4:
++      return 1 + (n >> 2);
++   case 6:
++      /* Fast unsigned division by 6: (n * 0x2AAAAAAB) >> 33 */
++      return 1 + (unsigned)(((uint64_t)n * 0x2AAAAAABull) >> 33);
++   default:
++      /* Fallback for uncommon divisors. */
++      return 1 + (n / info->incr);
++   }
+ }
+ 
+ static const struct radv_prim_vertex_count prim_size_table[] = {
+@@ -6082,17 +6110,14 @@ radv_get_ia_multi_vgt_param(struct radv_
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+    const struct radeon_info *gpu_info = &pdev->info;
+-   const unsigned max_primgroup_in_wave = 2;
+-   /* SWITCH_ON_EOP(0) is always preferable. */
+-   bool wd_switch_on_eop = false;
+-   bool ia_switch_on_eop = false;
+-   bool ia_switch_on_eoi = false;
+-   bool partial_vs_wave = false;
+-   bool partial_es_wave = cmd_buffer->state.ia_multi_vgt_param.partial_es_wave;
+-   bool multi_instances_smaller_than_primgroup;
+-   struct radv_prim_vertex_count prim_vertex_count = prim_size_table[topology];
+-   unsigned primgroup_size;
+ 
++   /* Start with the pre-calculated base value from the pipeline. */
++   uint32_t ia_multi_vgt_param = cmd_buffer->state.ia_multi_vgt_param.base;
++   bool wd_switch_on_eop = G_028AA8_WD_SWITCH_ON_EOP(ia_multi_vgt_param);
++   bool ia_switch_on_eoi = G_028AA8_SWITCH_ON_EOI(ia_multi_vgt_param);
++   bool partial_vs_wave = G_028AA8_PARTIAL_VS_WAVE_ON(ia_multi_vgt_param);
++
++   unsigned primgroup_size;
+    if (radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_TESS_CTRL)) {
+       primgroup_size = num_tess_patches;
+    } else if (radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_GEOMETRY)) {
+@@ -6101,112 +6126,50 @@ radv_get_ia_multi_vgt_param(struct radv_
+       primgroup_size = 128; /* recommended without a GS */
+    }
+ 
+-   /* GS requirement. */
+-   if (radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_GEOMETRY) && gpu_info->gfx_level <= GFX8) {
+-      unsigned gs_table_depth = pdev->gs_table_depth;
+-      if (SI_GS_PER_ES / primgroup_size >= gs_table_depth - 3)
+-         partial_es_wave = true;
+-   }
+-
+-   if (radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_TESS_CTRL)) {
+-      if (topology == V_008958_DI_PT_PATCH) {
++   /* Dynamically-determined hardware workarounds and performance heuristics. */
++   if (gpu_info->gfx_level >= GFX7) {
++      struct radv_prim_vertex_count prim_vertex_count = prim_size_table[topology];
++      if (radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_TESS_CTRL) && topology == V_008958_DI_PT_PATCH) {
+          prim_vertex_count.min = patch_control_points;
+          prim_vertex_count.incr = 1;
+       }
+-   }
+-
+-   multi_instances_smaller_than_primgroup = indirect_draw;
+-   if (!multi_instances_smaller_than_primgroup && instanced_draw) {
+-      uint32_t num_prims = radv_prims_for_vertices(&prim_vertex_count, draw_vertex_count);
+-      if (num_prims < primgroup_size)
+-         multi_instances_smaller_than_primgroup = true;
+-   }
+-
+-   ia_switch_on_eoi = cmd_buffer->state.ia_multi_vgt_param.ia_switch_on_eoi;
+-   partial_vs_wave = cmd_buffer->state.ia_multi_vgt_param.partial_vs_wave;
+ 
+-   if (gpu_info->gfx_level >= GFX7) {
+-      /* WD_SWITCH_ON_EOP has no effect on GPUs with less than
+-       * 4 shader engines. Set 1 to pass the assertion below.
+-       * The other cases are hardware requirements. */
+-      if (gpu_info->max_se < 4 || topology == V_008958_DI_PT_POLYGON || topology == V_008958_DI_PT_LINELOOP ||
+-          topology == V_008958_DI_PT_TRIFAN || topology == V_008958_DI_PT_TRISTRIP_ADJ ||
+-          (prim_restart_enable && (gpu_info->family < CHIP_POLARIS10 ||
+-                                   (topology != V_008958_DI_PT_POINTLIST && topology != V_008958_DI_PT_LINESTRIP))))
+-         wd_switch_on_eop = true;
++      bool multi_instances_smaller_than_primgroup = indirect_draw;
++      if (!multi_instances_smaller_than_primgroup && instanced_draw) {
++         uint32_t num_prims = radv_prims_for_vertices(&prim_vertex_count, draw_vertex_count);
++         if (num_prims < primgroup_size)
++            multi_instances_smaller_than_primgroup = true;
++      }
+ 
+-      /* Hawaii hangs if instancing is enabled and WD_SWITCH_ON_EOP is 0.
+-       * We don't know that for indirect drawing, so treat it as
+-       * always problematic. */
+       if (gpu_info->family == CHIP_HAWAII && (instanced_draw || indirect_draw))
+          wd_switch_on_eop = true;
+ 
+-      /* Performance recommendation for 4 SE Gfx7-8 parts if
+-       * instances are smaller than a primgroup.
+-       * Assume indirect draws always use small instances.
+-       * This is needed for good VS wave utilization.
+-       */
+       if (gpu_info->gfx_level <= GFX8 && gpu_info->max_se == 4 && multi_instances_smaller_than_primgroup)
+          wd_switch_on_eop = true;
+ 
+-      /* Hardware requirement when drawing primitives from a stream
+-       * output buffer.
+-       */
+       if (count_from_stream_output)
+          wd_switch_on_eop = true;
+ 
+-      /* Required on GFX7 and later. */
+       if (gpu_info->max_se > 2 && !wd_switch_on_eop)
+          ia_switch_on_eoi = true;
++      else
++         ia_switch_on_eoi = false; /* WD_SWITCH_ON_EOP=1 implies IA_SWITCH_ON_EOI=0 */
+ 
+-      /* Required by Hawaii and, for some special cases, by GFX8. */
+-      if (ia_switch_on_eoi &&
+-          (gpu_info->family == CHIP_HAWAII ||
+-           (gpu_info->gfx_level == GFX8 &&
+-            /* max primgroup in wave is always 2 - leave this for documentation */
+-            (radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_GEOMETRY) || max_primgroup_in_wave != 2))))
++      if (ia_switch_on_eoi && (gpu_info->family == CHIP_HAWAII || (gpu_info->gfx_level == GFX8)))
+          partial_vs_wave = true;
+ 
+-      /* Instancing bug on Bonaire. */
+       if (gpu_info->family == CHIP_BONAIRE && ia_switch_on_eoi && (instanced_draw || indirect_draw))
+          partial_vs_wave = true;
+-
+-      /* If the WD switch is false, the IA switch must be false too. */
+-      assert(wd_switch_on_eop || !ia_switch_on_eop);
+-   }
+-   /* If SWITCH_ON_EOI is set, PARTIAL_ES_WAVE must be set too. */
+-   if (gpu_info->gfx_level <= GFX8 && ia_switch_on_eoi)
+-      partial_es_wave = true;
+-
+-   if (radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_GEOMETRY)) {
+-      /* GS hw bug with single-primitive instances and SWITCH_ON_EOI.
+-       * The hw doc says all multi-SE chips are affected, but amdgpu-pro Vulkan
+-       * only applies it to Hawaii. Do what amdgpu-pro Vulkan does.
+-       */
+-      if (gpu_info->family == CHIP_HAWAII && ia_switch_on_eoi) {
+-         bool set_vgt_flush = indirect_draw;
+-         if (!set_vgt_flush && instanced_draw) {
+-            uint32_t num_prims = radv_prims_for_vertices(&prim_vertex_count, draw_vertex_count);
+-            if (num_prims <= 1)
+-               set_vgt_flush = true;
+-         }
+-         if (set_vgt_flush)
+-            cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_VGT_FLUSH;
+-      }
+    }
+ 
+-   /* Workaround for a VGT hang when strip primitive types are used with
+-    * primitive restart.
+-    */
+-   if (prim_restart_enable && (topology == V_008958_DI_PT_LINESTRIP || topology == V_008958_DI_PT_TRISTRIP ||
+-                               topology == V_008958_DI_PT_LINESTRIP_ADJ || topology == V_008958_DI_PT_TRISTRIP_ADJ)) {
+-      partial_vs_wave = true;
+-   }
++   /* Re-apply flags to the base value. */
++   ia_multi_vgt_param &= ~(S_028AA8_PRIMGROUP_SIZE(~0) | S_028AA8_WD_SWITCH_ON_EOP(1) | S_028AA8_SWITCH_ON_EOI(1) | S_028AA8_PARTIAL_VS_WAVE_ON(1));
++   ia_multi_vgt_param |= S_028AA8_PRIMGROUP_SIZE(primgroup_size - 1) |
++                         S_028AA8_WD_SWITCH_ON_EOP(wd_switch_on_eop) |
++                         S_028AA8_SWITCH_ON_EOI(ia_switch_on_eoi) |
++                         S_028AA8_PARTIAL_VS_WAVE_ON(partial_vs_wave);
+ 
+-   return cmd_buffer->state.ia_multi_vgt_param.base | S_028AA8_PRIMGROUP_SIZE(primgroup_size - 1) |
+-          S_028AA8_SWITCH_ON_EOP(ia_switch_on_eop) | S_028AA8_SWITCH_ON_EOI(ia_switch_on_eoi) |
+-          S_028AA8_PARTIAL_VS_WAVE_ON(partial_vs_wave) | S_028AA8_PARTIAL_ES_WAVE_ON(partial_es_wave) |
+-          S_028AA8_WD_SWITCH_ON_EOP(gpu_info->gfx_level >= GFX7 ? wd_switch_on_eop : 0);
++   return ia_multi_vgt_param;
+ }
+ 
+ static void
+@@ -6487,9 +6450,6 @@ radv_src_access_flush(struct radv_cmd_bu
+       flush_bits |= RADV_CMD_FLAG_INV_L2;
+ 
+    if (src_flags & (VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)) {
+-      /* since the STORAGE bit isn't set we know that this is a meta operation.
+-       * on the dst flush side we skip CB/DB flushes without the STORAGE bit, so
+-       * set it here. */
+       if (image && !(image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
+          if (vk_format_is_depth_or_stencil(image->vk.format)) {
+             flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_DB;
+@@ -6510,12 +6470,16 @@ radv_src_access_flush(struct radv_cmd_bu
+ 
+    if (src_flags & VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT) {
+       flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB;
++      if (!image_is_coherent)
++         flush_bits |= RADV_CMD_FLAG_WB_L2; /* Correctly use WB_L2 to publish results to VRAM */
+       if (has_CB_meta)
+          flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB_META;
+    }
+ 
+    if (src_flags & VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT) {
+       flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_DB;
++      if (!image_is_coherent)
++         flush_bits |= RADV_CMD_FLAG_WB_L2; /* Correctly use WB_L2 to publish results to VRAM */
+       if (has_DB_meta)
+          flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_DB_META;
+    }
+@@ -6524,7 +6488,7 @@ radv_src_access_flush(struct radv_cmd_bu
+       flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB | RADV_CMD_FLAG_FLUSH_AND_INV_DB;
+ 
+       if (!image_is_coherent)
+-         flush_bits |= RADV_CMD_FLAG_INV_L2;
++         flush_bits |= RADV_CMD_FLAG_INV_L2; /* Transfers are less predictable, INV_L2 is safer here. */
+       if (has_CB_meta)
+          flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB_META;
+       if (has_DB_meta)
