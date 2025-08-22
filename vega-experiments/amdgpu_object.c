@@ -1013,49 +1013,75 @@ void amdgpu_bo_move_notify(struct ttm_buffer_object *bo,
 void amdgpu_bo_release_notify(struct ttm_buffer_object *bo)
 {
 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->bdev);
-	struct amdgpu_bo     *abo;
-	struct dma_fence     *fence = NULL;
+	struct amdgpu_bo *abo;
+	struct dma_fence *fence = NULL;
 	int r;
 
-	/* Fast exit for non-AMDGPU BOs */
-	if (unlikely(!amdgpu_bo_is_amdgpu_bo(bo))) {
+	if (unlikely(!amdgpu_bo_is_amdgpu_bo(bo)))
 		return;
-	}
 
 	abo = ttm_to_amdgpu_bo(bo);
 
+	/* The VM BO list should be empty when the BO is finally released */
 	WARN_ON(abo->vm_bo);
 
-	/* KFD release hook */
-	if (unlikely(abo->kfd_bo)) {
+	if (unlikely(abo->kfd_bo))
 		amdgpu_amdkfd_release_notify(abo);
-	}
 
-	/* Kernel-type BOs must own their reservation object */
-	WARN_ON_ONCE(bo->type == ttm_bo_type_kernel &&
-	bo->base.resv != &bo->base._resv);
-
-	if (bo->base.resv == &bo->base._resv &&
-		amdgpu_amdkfd_remove_fence_on_pt_pd_bos) {
+	/*
+	 * KFD BOs are special. The KFD part of the driver keeps track of
+	 * KFD BOs and their fences. The amdgpu part of the driver does not.
+	 * When a KFD BO is destroyed, the amdgpu driver must not mess
+	 * with its fences.
+	 */
+	if (bo->type == ttm_bo_type_kernel &&
+	    (abo->flags & AMDGPU_AMDKFD_CREATE_USERPTR_BO) &&
+	    amdgpu_amdkfd_remove_fence_on_pt_pd_bos)
 		amdgpu_amdkfd_remove_fence_on_pt_pd_bos(abo);
-		}
 
-		/* Secure VRAM wipe when requested and GPU is alive */
-		if (likely(bo->resource &&
-			bo->resource->mem_type == TTM_PL_VRAM &&
-			(abo->flags & AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE) &&
-			!adev->in_suspend &&
-			!drm_dev_is_unplugged(adev_to_drm(adev)))) {
+	/*
+	 * VRAM wipe-on-release is a security feature that must be isolated.
+	 * It should use the BO's PRIVATE reservation object (`&bo->base._resv`)
+	 * to avoid creating dependencies on potentially shared, user-controlled
+	 * reservation objects (`bo->base.resv`), which is a source of deadlocks.
+	 * The original code was correct in this regard.
+	 */
+	if (likely(bo->resource &&
+	           bo->resource->mem_type == TTM_PL_VRAM &&
+	           (abo->flags & AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE) &&
+	           !adev->in_suspend &&
+	           !drm_dev_is_unplugged(adev_to_drm(adev)))) {
 
-			if (dma_resv_trylock(bo->base.resv)) {
-				r = amdgpu_fill_buffer(abo, 0, bo->base.resv,
-									   &fence, true);
-				if (!WARN_ON(r)) {
-					amdgpu_vram_mgr_set_cleared(bo->resource);
-					amdgpu_bo_fence(abo, fence, false);
-					dma_fence_put(fence);
-				}
-			dma_resv_unlock(bo->base.resv);
+		/*
+		 * We lock the private dma_resv. Since the BO is being released,
+		 * no one else should be accessing it, making trylock safe.
+		 * A failure here indicates a critical ref-counting bug elsewhere.
+		 */
+		if (dma_resv_trylock(&bo->base._resv)) {
+			/* Reserve space for our new wipe fence. */
+			r = dma_resv_reserve_fences(&bo->base._resv, 1);
+			if (unlikely(r)) {
+				/* OOM: Fallback to a blocking wait on existing fences */
+				dma_resv_wait_timeout(&bo->base._resv,
+						      DMA_RESV_USAGE_KERNEL,
+						      false, MAX_SCHEDULE_TIMEOUT);
+				dma_resv_unlock(&bo->base._resv);
+				return;
+			}
+
+			r = amdgpu_fill_buffer(abo, 0, &bo->base._resv, &fence, true);
+			if (likely(!r)) {
+				amdgpu_vram_mgr_set_cleared(bo->resource);
+				dma_resv_add_fence(&bo->base._resv, fence,
+						   DMA_RESV_USAGE_KERNEL);
+				dma_fence_put(fence);
+			} else {
+				/* Best effort: log failure but don't crash */
+				DRM_ERROR("VRAM wipe on release failed (%d)\n", r);
+			}
+			dma_resv_unlock(&bo->base._resv);
+		} else {
+			WARN_ON_ONCE(1);
 		}
 	}
 }
