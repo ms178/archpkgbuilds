@@ -8017,6 +8017,7 @@ static void ixgbe_teardown_gaming_atr(struct ixgbe_adapter *adapter)
 	struct ixgbe_hw *hw;
 	u16 i, cnt;
 	bool can_touch_hw = false;
+	const u16 half = IXGBE_MAX_GAMING_FILTERS / 2;
 
 	if (unlikely(!adapter))
 		return;
@@ -8027,6 +8028,7 @@ static void ixgbe_teardown_gaming_atr(struct ixgbe_adapter *adapter)
 	if (!cnt)
 		return;
 
+	/* HW access allowed only if device is running and present */
 	if (netif_running(adapter->netdev) &&
 	    adapter->pdev && pci_device_is_present(adapter->pdev))
 		can_touch_hw = true;
@@ -8046,36 +8048,37 @@ static void ixgbe_teardown_gaming_atr(struct ixgbe_adapter *adapter)
 	}
 
 	if (can_touch_hw) {
+		/* Serialize FDIR rule removals; erase helpers are not expected to sleep. */
 		spin_lock_bh(&adapter->fdir_perfect_lock);
 
 		for (i = 0; i < cnt; i++) {
 			u16 port = READ_ONCE(adapter->gaming_fdir_ids[i]);
+			union ixgbe_atr_input in;
 
 			if (!port)
 				continue;
 
-			{
-				union ixgbe_atr_input in;
-				memset(&in, 0, sizeof(in));
+			memset(&in, 0, sizeof(in));
+			in.formatted.dst_port = cpu_to_be16(port);
+
+			if (i < half) {
+				/* IPv4 partition */
 				in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV4;
-				in.formatted.dst_port  = cpu_to_be16(port);
 				(void)ixgbe_fdir_erase_perfect_filter_82599(hw, &in, i);
+			} else {
+#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
+				/* IPv6 partition */
+				in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV6;
+				(void)ixgbe_fdir_erase_perfect_filter_82599(hw, &in, i);
+#endif
 			}
 
-#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
-			{
-				union ixgbe_atr_input in6;
-				memset(&in6, 0, sizeof(in6));
-				in6.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV6;
-				in6.formatted.dst_port  = cpu_to_be16(port);
-				(void)ixgbe_fdir_erase_perfect_filter_82599(hw, &in6, i);
-			}
-#endif
 			WRITE_ONCE(adapter->gaming_fdir_ids[i], 0);
 		}
 
 		spin_unlock_bh(&adapter->fdir_perfect_lock);
 	} else {
+		/* HW not touchable: just reset software bookkeeping */
 		for (i = 0; i < cnt; i++)
 			WRITE_ONCE(adapter->gaming_fdir_ids[i], 0);
 	}
@@ -8085,21 +8088,18 @@ static void ixgbe_teardown_gaming_atr(struct ixgbe_adapter *adapter)
 
 static void ixgbe_setup_gaming_atr(struct ixgbe_adapter *adapter)
 {
-	struct ixgbe_hw *hw;
-	char *ranges_copy = NULL;
-	char *cur, *tok;
-	int ret = 0;
-	u32 added = 0, failures = 0;
-	unsigned int idx = 0;
-	u16 steer_queue = 0; /* steer to RX queue 0 by default */
-	const size_t max_filters = ARRAY_SIZE(adapter->gaming_fdir_ids);
-	int attempt;
+	struct ixgbe_hw *hw = &adapter->hw;
+	char *ranges_copy, *cur, *tok;
+	int ret;
+	u16 v4_used = 0;
+	#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
+	u16 v6_used = 0;
+	#endif
+	const u16 total = IXGBE_MAX_GAMING_FILTERS;
+	const u16 half = total / 2;
+	u32 added = 0, attempted = 0, failures = 0;
 
-	if (unlikely(!adapter))
-		return;
-
-	hw = &adapter->hw;
-
+	/* Supported MAC families only (82599/X540/X550) */
 	switch (hw->mac.type) {
 	case ixgbe_mac_82599EB:
 	case ixgbe_mac_X540:
@@ -8111,166 +8111,137 @@ static void ixgbe_setup_gaming_atr(struct ixgbe_adapter *adapter)
 		return;
 	}
 
-	if (!netif_running(adapter->netdev) || !adapter->pdev ||
-	    !pci_device_is_present(adapter->pdev))
+	/* Sleepable-context and idempotence guard */
+	if (!netif_running(adapter->netdev))
+		return;
+	if (adapter->gaming_fdir_count)
 		return;
 
-	if (adapter->num_vfs)
-		return;
-
-	if (READ_ONCE(adapter->gaming_fdir_count))
-		return;
-
+	/* Nothing to program if no port list */
 	if (!gaming_atr_ranges || !*gaming_atr_ranges)
 		return;
 
 	ranges_copy = kstrdup(gaming_atr_ranges, GFP_KERNEL);
-	if (!ranges_copy) {
-		e_warn(drv, "Gaming ATR: OOM parsing ranges\n");
+	if (!ranges_copy)
 		return;
-	}
 	cur = ranges_copy;
 
-	/* Prepare mask */
+	/* 1) Program single global input mask (dst_port only). Bail on failure (coexistence). */
 	{
 		union ixgbe_atr_input mask;
+
 		memset(&mask, 0, sizeof(mask));
 		mask.formatted.dst_port = cpu_to_be16(0xFFFF);
 
-		for (attempt = 0; attempt < ATR_FDIR_MASK_RETRIES; attempt++) {
-			/* Short critical section: acquire lock only for the non-sleeping mask write attempt. */
-			spin_lock_bh(&adapter->fdir_perfect_lock);
-
-			/* Double-check idempotence under lock */
-			if (READ_ONCE(adapter->gaming_fdir_count)) {
-				spin_unlock_bh(&adapter->fdir_perfect_lock);
-				kfree(ranges_copy);
-				return;
-			}
-
-			ret = ixgbe_fdir_set_input_mask_82599(hw, &mask);
-
-			/* On success, keep the lock held and proceed to program filters */
-			if (ret == 0)
-				break;
-
-			/* Otherwise release lock immediately — do not sleep while locked */
-			spin_unlock_bh(&adapter->fdir_perfect_lock);
-
-			/* Permanent unsupported -> bail immediately */
-			if (ret == -EOPNOTSUPP || ret == -ENOTTY) {
-				e_warn(drv, "Gaming ATR: FDIR mask unsupported (err=%d)\n", ret);
-				kfree(ranges_copy);
-				return;
-			}
-
-			/* Transient errors -> try to recover (reinit + backoff). These can sleep. */
-			if (ret == -EIO || ret == -EBUSY || ret == -EAGAIN) {
-				e_info(drv, "Gaming ATR: FDIR mask attempt %d failed (%d); reinit and retry\n",
-				       attempt + 1, ret);
-
-				/* Reinitialize FDIR tables outside the lock (may sleep internally). */
-				(void)ixgbe_reinit_fdir_tables_82599(hw);
-
-				/* Exponential backoff */
-				if (attempt < 2)
-					usleep_range(ATR_FDIR_SHORT_UDELAY_MIN, ATR_FDIR_SHORT_UDELAY_MAX);
-				else
-					msleep(ATR_FDIR_LONG_MS_BASE << (attempt - 2));
-
-				continue;
-			}
-
-			/* Any other unexpected error: log and bail out. */
-			e_warn(drv, "Gaming ATR: FDIR mask failed unexpected err=%d; skipping\n", ret);
-			kfree(ranges_copy);
-			return;
-		}
-
-		/* If we exhausted retries without success, report and exit */
+		ret = ixgbe_fdir_set_input_mask_82599(hw, &mask);
 		if (ret) {
-			e_warn(drv, "Gaming ATR: FDIR mask failed %d; skipping\n", ret);
+			e_warn(drv, "Gaming ATR: FDIR mask setup failed (%d); skipping\n", ret);
 			kfree(ranges_copy);
 			return;
 		}
-
-		/* We are holding adapter->fdir_perfect_lock here. Proceed to program filters. */
 	}
 
-	/* Program perfect filters while holding fdir_perfect_lock */
-	for (; (tok = strsep(&cur, ",")); ) {
-		unsigned int lo, hi;
+	/* 2) Enable perfect mode using driver’s default PB allocation. Retry once if transient. */
+	ret = ixgbe_init_fdir_perfect_82599(hw, adapter->fdir_pballoc);
+	if (ret) {
+		usleep_range(2000, 3000);
+		ret = ixgbe_init_fdir_perfect_82599(hw, adapter->fdir_pballoc);
+		if (ret) {
+			e_warn(drv, "Gaming ATR: perfect mode enable failed (%d)\n", ret);
+			kfree(ranges_copy);
+			return;
+		}
+	}
+
+	/* 3) Program UDP perfect rules in deterministic soft_id partitions */
+	memset(adapter->gaming_fdir_ids, 0, sizeof(adapter->gaming_fdir_ids));
+
+	while ((tok = strsep(&cur, ","))) {
+		u16 start_port, end_port;
+		char *dash;
 
 		if (!*tok)
 			continue;
 
-		if (sscanf(tok, "%u-%u", &lo, &hi) != 2) {
-			if (sscanf(tok, "%u", &lo) != 1)
+		dash = strchr(tok, '-');
+		if (dash) {
+			*dash = '\0';
+			if (kstrtou16(tok, 10, &start_port) ||
+			    kstrtou16(dash + 1, 10, &end_port) ||
+			    start_port == 0 || end_port < start_port)
 				continue;
-			hi = lo;
+		} else {
+			if (kstrtou16(tok, 10, &start_port) || start_port == 0)
+				continue;
+			end_port = start_port;
 		}
 
-		if (lo > hi)
-			continue;
-
-		if (hi > 65535)
-			hi = 65535;
-
-		for (; lo <= hi; lo++) {
+		for (; start_port <= end_port; start_port++) {
 			union ixgbe_atr_input in;
-			int write_ret;
+			u8 steer_queue = 0;
 
-			if (idx >= max_filters) {
-				e_warn(drv, "Gaming ATR: reached max filter count %zu; stopping\n", max_filters);
-				break;
-			}
+			/* Steer to queue 0 by default; avoid dereferencing rx_ring if not ready */
+			if (adapter->rx_ring_count > 0 && adapter->rx_ring[0])
+				steer_queue = adapter->rx_ring[0]->reg_idx;
 
-			memset(&in, 0, sizeof(in));
-			in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV4;
-			in.formatted.dst_port  = cpu_to_be16((u16)lo);
+			/* Install IPv4 rule in lower half of soft_id space if capacity remains */
+			if (v4_used < half) {
+				memset(&in, 0, sizeof(in));
+				in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV4;
+				in.formatted.dst_port  = cpu_to_be16(start_port);
 
-			/* Non-sleeping write attempt(s) only while holding lock. Do one immediate retry. */
-			write_ret = ixgbe_fdir_write_perfect_filter_82599(hw, &in, steer_queue, (u16)idx);
-			if (write_ret) {
-				/* immediate second non-sleeping attempt */
-				write_ret = ixgbe_fdir_write_perfect_filter_82599(hw, &in, steer_queue, (u16)idx);
-				if (write_ret) {
+				attempted++;
+				ret = ixgbe_fdir_write_perfect_filter_82599(hw, &in, v4_used, steer_queue);
+				if (ret) {
 					failures++;
-					e_info(drv, "Gaming ATR: failed to add filter port %u (err=%d)\n", lo, write_ret);
-					/* Skip this port */
-					continue;
+				} else {
+					adapter->gaming_fdir_ids[v4_used] = start_port;
+					added++;
 				}
+				v4_used++;
 			}
-
-			/* record the port in bookkeeping */
-			WRITE_ONCE(adapter->gaming_fdir_ids[idx], (u16)lo);
-			idx++;
-			added++;
 
 #ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
-			/* best-effort IPv6 variant; don't abort on failure */
-			{
-				union ixgbe_atr_input in6;
-				memset(&in6, 0, sizeof(in6));
-				in6.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV6;
-				in6.formatted.dst_port  = cpu_to_be16((u16)lo);
-				(void)ixgbe_fdir_write_perfect_filter_82599(hw, &in6, steer_queue, (u16)(idx - 1));
+			/* Install IPv6 rule in upper half if capacity remains */
+			if (v6_used < half) {
+				memset(&in, 0, sizeof(in));
+				in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV6;
+				in.formatted.dst_port  = cpu_to_be16(start_port);
+
+				attempted++;
+				ret = ixgbe_fdir_write_perfect_filter_82599(hw, &in, half + v6_used, steer_queue);
+				if (ret) {
+					failures++;
+				} else {
+					adapter->gaming_fdir_ids[half + v6_used] = start_port;
+					added++;
+				}
+				v6_used++;
 			}
 #endif
-		}
 
-		if (idx >= max_filters)
-			break;
+			/* Stop if both partitions are full */
+			if (v4_used >= half
+#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
+			    && v6_used >= half
+#endif
+			) {
+				goto out_publish;
+			}
+		}
 	}
 
-	/* Publish count while holding lock to avoid races with teardown */
-	WRITE_ONCE(adapter->gaming_fdir_count, (u16)idx);
+out_publish:
+	/* Publish count covering both partitions (max installed sid + 1). */
+#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
+	adapter->gaming_fdir_count = max_t(u16, v4_used, (u16)(half + v6_used));
+#else
+	adapter->gaming_fdir_count = v4_used;
+#endif
 
-	/* Release lock */
-	spin_unlock_bh(&adapter->fdir_perfect_lock);
-
-	e_info(drv, "Gaming ATR: installed %u perfect UDP filters (failures=%u) to RXQ %u\n",
-	       added, failures, steer_queue);
+	if (added > 0)
+		e_info(drv, "Gaming ATR: installed %u UDP filters (attempted=%u, failures=%u)\n",
+		       added, attempted, failures);
 
 	kfree(ranges_copy);
 }
@@ -8316,6 +8287,7 @@ static void ixgbe_watchdog_link_is_up(struct ixgbe_adapter *adapter)
 	}
 
 	adapter->last_rx_ptp_check = jiffies;
+
 	if (test_bit(__IXGBE_PTP_RUNNING, &adapter->state))
 		ixgbe_ptp_start_cyclecounter(adapter);
 
