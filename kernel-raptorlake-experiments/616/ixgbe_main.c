@@ -1850,6 +1850,54 @@ static void ixgbe_update_rsc_stats(struct ixgbe_ring *rx_ring,
 	IXGBE_CB(skb)->append_cnt = 0;  /* always clear last */
 }
 
+/* Initialize FDIR for Gaming ATR: perfect match on UDP destination port only.
+ * Minimal-invasive: no new adapter state, no new locks; uses existing fdir_perfect_lock.
+ * Safe on: 82599/X540/X550 families. No effect on 82598.
+ */
+static void ixgbe_init_gaming_fdir(struct ixgbe_adapter *adapter)
+{
+    struct ixgbe_hw *hw = &adapter->hw;
+    union ixgbe_atr_input mask;
+    int ret;
+
+    /* Only supported on 82599/X540/X550 families */
+    switch (hw->mac.type) {
+    case ixgbe_mac_82599EB:
+    case ixgbe_mac_X540:
+    case ixgbe_mac_X550:
+    case ixgbe_mac_X550EM_x:
+    case ixgbe_mac_x550em_a:
+        break;
+    default:
+        /* Disable feature gracefully on unsupported hardware */
+        adapter->flags2 &= ~IXGBE_FLAG2_GAMING_ATR_ENABLED;
+        return;
+    }
+
+    /* Gaming ATR uses perfect filters; ensure we don't use signature/hash */
+    adapter->flags &= ~IXGBE_FLAG_FDIR_HASH_CAPABLE;
+    adapter->flags |= IXGBE_FLAG_FDIR_PERFECT_CAPABLE;
+
+    /* Mask: match only UDP destination port; all other fields masked out */
+    memset(&mask, 0, sizeof(mask));
+    mask.formatted.dst_port = cpu_to_be16(0xFFFF);
+
+    ret = ixgbe_fdir_set_input_mask_82599(hw, &mask);
+    if (ret) {
+        e_warn(drv, "Gaming ATR: input mask setup failed (%d); disabling\n", ret);
+        adapter->flags2 &= ~IXGBE_FLAG2_GAMING_ATR_ENABLED;
+        return;
+    }
+
+    /* Initialize perfect mode with current PB allocation */
+    ret = ixgbe_init_fdir_perfect_82599(hw, adapter->fdir_pballoc);
+    if (ret) {
+        e_warn(drv, "Gaming ATR: perfect mode init failed (%d); disabling\n", ret);
+        adapter->flags2 &= ~IXGBE_FLAG2_GAMING_ATR_ENABLED;
+        return;
+    }
+}
+
 /**
  * ixgbe_process_skb_fields - Populate skb header fields from Rx descriptor
  * @rx_ring: rx descriptor ring packet is being transacted on
@@ -5829,7 +5877,10 @@ static void ixgbe_configure_dfwd(struct ixgbe_adapter *adapter)
 static void ixgbe_configure(struct ixgbe_adapter *adapter)
 {
 	struct ixgbe_hw *hw = &adapter->hw;
-
+	/* Minimal-invasive Gaming ATR enablement: initialize FDIR perfect mode early */
+	if (adapter->flags2 & IXGBE_FLAG2_GAMING_ATR_ENABLED) {
+		ixgbe_init_gaming_fdir(adapter);
+	}
 	ixgbe_configure_pb(adapter);
 #ifdef CONFIG_IXGBE_DCB
 	ixgbe_configure_dcb(adapter);
@@ -8088,241 +8139,242 @@ static void ixgbe_teardown_gaming_atr(struct ixgbe_adapter *adapter)
 
 static void ixgbe_setup_gaming_atr(struct ixgbe_adapter *adapter)
 {
-	struct ixgbe_hw *hw = &adapter->hw;
-	char *ranges_copy, *cur, *tok;
-	int ret;
-	u16 v4_used = 0;
-	#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
-	u16 v6_used = 0;
-	#endif
-	const u16 total = IXGBE_MAX_GAMING_FILTERS;
-	const u16 half = total / 2;
-	u32 added = 0, attempted = 0, failures = 0;
-
-	/* Supported MAC families only (82599/X540/X550) */
-	switch (hw->mac.type) {
-	case ixgbe_mac_82599EB:
-	case ixgbe_mac_X540:
-	case ixgbe_mac_X550:
-	case ixgbe_mac_X550EM_x:
-	case ixgbe_mac_x550em_a:
-		break;
-	default:
-		return;
-	}
-
-	/* Sleepable-context and idempotence guard */
-	if (!netif_running(adapter->netdev))
-		return;
-	if (adapter->gaming_fdir_count)
-		return;
-
-	/* Nothing to program if no port list */
-	if (!gaming_atr_ranges || !*gaming_atr_ranges)
-		return;
-
-	ranges_copy = kstrdup(gaming_atr_ranges, GFP_KERNEL);
-	if (!ranges_copy)
-		return;
-	cur = ranges_copy;
-
-	/* 1) Program single global input mask (dst_port only). Bail on failure (coexistence). */
-	{
-		union ixgbe_atr_input mask;
-
-		memset(&mask, 0, sizeof(mask));
-		mask.formatted.dst_port = cpu_to_be16(0xFFFF);
-
-		ret = ixgbe_fdir_set_input_mask_82599(hw, &mask);
-		if (ret) {
-			e_warn(drv, "Gaming ATR: FDIR mask setup failed (%d); skipping\n", ret);
-			kfree(ranges_copy);
-			return;
-		}
-	}
-
-	/* 2) Enable perfect mode using driver’s default PB allocation. Retry once if transient. */
-	ret = ixgbe_init_fdir_perfect_82599(hw, adapter->fdir_pballoc);
-	if (ret) {
-		usleep_range(2000, 3000);
-		ret = ixgbe_init_fdir_perfect_82599(hw, adapter->fdir_pballoc);
-		if (ret) {
-			e_warn(drv, "Gaming ATR: perfect mode enable failed (%d)\n", ret);
-			kfree(ranges_copy);
-			return;
-		}
-	}
-
-	/* 3) Program UDP perfect rules in deterministic soft_id partitions */
-	memset(adapter->gaming_fdir_ids, 0, sizeof(adapter->gaming_fdir_ids));
-
-	while ((tok = strsep(&cur, ","))) {
-		u16 start_port, end_port;
-		char *dash;
-
-		if (!*tok)
-			continue;
-
-		dash = strchr(tok, '-');
-		if (dash) {
-			*dash = '\0';
-			if (kstrtou16(tok, 10, &start_port) ||
-			    kstrtou16(dash + 1, 10, &end_port) ||
-			    start_port == 0 || end_port < start_port)
-				continue;
-		} else {
-			if (kstrtou16(tok, 10, &start_port) || start_port == 0)
-				continue;
-			end_port = start_port;
-		}
-
-		for (; start_port <= end_port; start_port++) {
-			union ixgbe_atr_input in;
-			u8 steer_queue = 0;
-
-			/* Steer to queue 0 by default; avoid dereferencing rx_ring if not ready */
-			if (adapter->rx_ring_count > 0 && adapter->rx_ring[0])
-				steer_queue = adapter->rx_ring[0]->reg_idx;
-
-			/* Install IPv4 rule in lower half of soft_id space if capacity remains */
-			if (v4_used < half) {
-				memset(&in, 0, sizeof(in));
-				in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV4;
-				in.formatted.dst_port  = cpu_to_be16(start_port);
-
-				attempted++;
-				ret = ixgbe_fdir_write_perfect_filter_82599(hw, &in, v4_used, steer_queue);
-				if (ret) {
-					failures++;
-				} else {
-					adapter->gaming_fdir_ids[v4_used] = start_port;
-					added++;
-				}
-				v4_used++;
-			}
-
+    struct ixgbe_hw *hw = &adapter->hw;
+    const char *ranges_param;
+    char *ranges_copy, *cur, *tok;
+    const u16 soft_id_limit = 64;            /* bounded footprint */
+    const u16 half = soft_id_limit / 2;      /* IPv4 half, IPv6 half */
+    u16 v4_soft_id = 0;
 #ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
-			/* Install IPv6 rule in upper half if capacity remains */
-			if (v6_used < half) {
-				memset(&in, 0, sizeof(in));
-				in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV6;
-				in.formatted.dst_port  = cpu_to_be16(start_port);
-
-				attempted++;
-				ret = ixgbe_fdir_write_perfect_filter_82599(hw, &in, half + v6_used, steer_queue);
-				if (ret) {
-					failures++;
-				} else {
-					adapter->gaming_fdir_ids[half + v6_used] = start_port;
-					added++;
-				}
-				v6_used++;
-			}
-#endif
-
-			/* Stop if both partitions are full */
-			if (v4_used >= half
-#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
-			    && v6_used >= half
-#endif
-			) {
-				goto out_publish;
-			}
-		}
-	}
-
-out_publish:
-	/* Publish count covering both partitions (max installed sid + 1). */
-#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
-	adapter->gaming_fdir_count = max_t(u16, v4_used, (u16)(half + v6_used));
+    u16 v6_soft_id = half;
+    bool have_v6 = true;
 #else
-	adapter->gaming_fdir_count = v4_used;
+    bool have_v6 = false;
+#endif
+    u8 steer_queue = 0;
+    int programmed = 0, attempts = 0;
+
+    /* Feature gate */
+    if (!(adapter->flags2 & IXGBE_FLAG2_GAMING_ATR_ENABLED)) {
+        return;
+    }
+
+    /* Hardware family support gate: 82598 does not support FDIR perfect mode */
+    switch (hw->mac.type) {
+    case ixgbe_mac_82599EB:
+    case ixgbe_mac_X540:
+    case ixgbe_mac_X550:
+    case ixgbe_mac_X550EM_x:
+    case ixgbe_mac_x550em_a:
+        break;
+    default:
+        return;
+    }
+
+    /* Snapshot the module parameter string safely */
+    ranges_param = READ_ONCE(gaming_atr_ranges);
+    if (!ranges_param || !*ranges_param) {
+        return;
+    }
+
+    /* Determine a stable steering queue:
+     * Only dereference rx_ring[0] after verifying num_rx_queues > 0.
+     * Do not boolean-test adapter->rx_ring itself (array decays to pointer).
+     */
+    if (adapter->num_rx_queues > 0) {
+        struct ixgbe_ring *ring0 = adapter->rx_ring[0];
+        if (ring0) {
+            steer_queue = ring0->reg_idx;
+        } else {
+            steer_queue = 0;
+        }
+    } else {
+        steer_queue = 0;
+    }
+
+    /* Duplicate ranges string for tokenization */
+    ranges_copy = kstrdup(ranges_param, GFP_KERNEL);
+    if (!ranges_copy) {
+        return;
+    }
+    cur = ranges_copy;
+
+    /* Serialize perfect filter programming against other FDIR users */
+    spin_lock_bh(&adapter->fdir_perfect_lock);
+
+    /* Parse comma-separated ranges; for each port, add IPv4 and IPv6 (if available) */
+    while ((tok = strsep(&cur, ","))) {
+        u16 start_port, end_port;
+        char *dash;
+
+        if (!*tok)
+            continue;
+
+        dash = strchr(tok, '-');
+        if (dash) {
+            *dash = '\0';
+            if (kstrtou16(tok, 10, &start_port) ||
+                kstrtou16(dash + 1, 10, &end_port) ||
+                start_port == 0 || end_port < start_port) {
+                continue;
+            }
+        } else {
+            if (kstrtou16(tok, 10, &start_port) || start_port == 0)
+                continue;
+            end_port = start_port;
+        }
+
+        for (; start_port <= end_port; start_port++) {
+            union ixgbe_atr_input in;
+            int ret;
+
+            /* IPv4 slot: [0 .. half-1] */
+            if (v4_soft_id < half) {
+                memset(&in, 0, sizeof(in));
+                in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV4;
+                in.formatted.dst_port  = cpu_to_be16(start_port);
+
+                attempts++;
+                ret = ixgbe_fdir_write_perfect_filter_82599(hw, &in, v4_soft_id, steer_queue);
+                if (!ret) {
+                    programmed++;
+                }
+                v4_soft_id++;
+            }
+
+#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
+            /* IPv6 slot: [half .. soft_id_limit-1] */
+            if (have_v6 && v6_soft_id < soft_id_limit) {
+                memset(&in, 0, sizeof(in));
+                in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV6;
+                in.formatted.dst_port  = cpu_to_be16(start_port);
+
+                attempts++;
+                ret = ixgbe_fdir_write_perfect_filter_82599(hw, &in, v6_soft_id, steer_queue);
+                if (!ret) {
+                    programmed++;
+                }
+                v6_soft_id++;
+            }
 #endif
 
-	if (added > 0)
-		e_info(drv, "Gaming ATR: installed %u UDP filters (attempted=%u, failures=%u)\n",
-		       added, attempted, failures);
+            /* Stop early if both partitions are full */
+            if (v4_soft_id >= half && (!have_v6
+#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
+                                       || v6_soft_id >= soft_id_limit
+#endif
+                                       )) {
+                goto out_unlock;
+            }
+        }
+    }
 
-	kfree(ranges_copy);
+out_unlock:
+    spin_unlock_bh(&adapter->fdir_perfect_lock);
+
+    kfree(ranges_copy);
+
+    if (programmed) {
+        e_info(drv, "Gaming ATR: programmed %d UDP filters (attempted=%d)%s\n",
+               programmed, attempts,
+               have_v6 ? " [IPv4+IPv6]" : " [IPv4]");
+    }
 }
 
 static void ixgbe_watchdog_link_is_up(struct ixgbe_adapter *adapter)
 {
-	struct net_device *netdev = adapter->netdev;
-	struct ixgbe_hw *hw = &adapter->hw;
-	u32 link_speed = adapter->link_speed;
-	const char *speed_str;
-	bool flow_rx, flow_tx;
+    struct net_device *netdev = adapter->netdev;
+    struct ixgbe_hw *hw = &adapter->hw;
+    u32 link_speed = adapter->link_speed;
+    const char *speed_str;
+    bool flow_rx, flow_tx;
 
-	/* only continue if link was previously down */
-	if (netif_carrier_ok(netdev))
-		return;
+    /* only continue if link was previously down */
+    if (netif_carrier_ok(netdev)) {
+        return;
+    }
 
-	adapter->flags2 &= ~IXGBE_FLAG2_SEARCH_FOR_SFP;
+    adapter->flags2 &= ~IXGBE_FLAG2_SEARCH_FOR_SFP;
 
-	switch (hw->mac.type) {
-	case ixgbe_mac_82598EB: {
-		u32 frctl = IXGBE_READ_REG(hw, IXGBE_FCTRL);
-		u32 rmcs  = IXGBE_READ_REG(hw, IXGBE_RMCS);
-		flow_rx = !!(frctl & IXGBE_FCTRL_RFCE);
-		flow_tx = !!(rmcs  & IXGBE_RMCS_TFCE_802_3X);
-	}
-		break;
-	case ixgbe_mac_82599EB:
-	case ixgbe_mac_X540:
-	case ixgbe_mac_X550:
-	case ixgbe_mac_X550EM_x:
-	case ixgbe_mac_x550em_a:
-	case ixgbe_mac_e610: {
-		u32 mflcn = IXGBE_READ_REG(hw, IXGBE_MFLCN);
-		u32 fccfg = IXGBE_READ_REG(hw, IXGBE_FCCFG);
-		flow_rx = !!(mflcn & IXGBE_MFLCN_RFCE);
-		flow_tx = !!(fccfg & IXGBE_FCCFG_TFCE_802_3X);
-	}
-		break;
-	default:
-		flow_tx = false;
-		flow_rx = false;
-		break;
-	}
+    switch (hw->mac.type) {
+    case ixgbe_mac_82598EB: {
+        u32 frctl = IXGBE_READ_REG(hw, IXGBE_FCTRL);
+        u32 rmcs  = IXGBE_READ_REG(hw, IXGBE_RMCS);
 
-	adapter->last_rx_ptp_check = jiffies;
+        flow_rx = !!(frctl & IXGBE_FCTRL_RFCE);
+        flow_tx = !!(rmcs  & IXGBE_RMCS_TFCE_802_3X);
+        break;
+    }
+    case ixgbe_mac_82599EB:
+    case ixgbe_mac_X540:
+    case ixgbe_mac_X550:
+    case ixgbe_mac_X550EM_x:
+    case ixgbe_mac_x550em_a:
+    case ixgbe_mac_e610: {
+        u32 mflcn = IXGBE_READ_REG(hw, IXGBE_MFLCN);
+        u32 fccfg = IXGBE_READ_REG(hw, IXGBE_FCCFG);
 
-	if (test_bit(__IXGBE_PTP_RUNNING, &adapter->state))
-		ixgbe_ptp_start_cyclecounter(adapter);
+        flow_rx = !!(mflcn & IXGBE_MFLCN_RFCE);
+        flow_tx = !!(fccfg & IXGBE_FCCFG_TFCE_802_3X);
+        break;
+    }
+    default:
+        flow_tx = false;
+        flow_rx = false;
+        break;
+    }
 
-	switch (link_speed) {
-	case IXGBE_LINK_SPEED_10GB_FULL: speed_str = "10 Gbps"; break;
-	case IXGBE_LINK_SPEED_5GB_FULL:  speed_str = "5 Gbps"; break;
-	case IXGBE_LINK_SPEED_2_5GB_FULL:speed_str = "2.5 Gbps"; break;
-	case IXGBE_LINK_SPEED_1GB_FULL:  speed_str = "1 Gbps"; break;
-	case IXGBE_LINK_SPEED_100_FULL:  speed_str = "100 Mbps"; break;
-	case IXGBE_LINK_SPEED_10_FULL:   speed_str = "10 Mbps"; break;
-	default:                          speed_str = "unknown speed"; break;
-	}
+    /* update PTP-cycle state if running */
+    adapter->last_rx_ptp_check = jiffies;
 
-	e_info(drv, "NIC Link is Up %s, Flow Control: %s\n", speed_str,
-	       (flow_rx && flow_tx) ? "RX/TX" : (flow_rx ? "RX" : (flow_tx ? "TX" : "None")));
+    if (test_bit(__IXGBE_PTP_RUNNING, &adapter->state)) {
+        ixgbe_ptp_start_cyclecounter(adapter);
+    }
 
-	/* publish carrier first, then enable traffic */
-	netif_carrier_on(netdev);
-	ixgbe_check_vf_rate_limit(adapter);
+    switch (link_speed) {
+    case IXGBE_LINK_SPEED_10GB_FULL:
+        speed_str = "10 Gbps";
+        break;
+    case IXGBE_LINK_SPEED_5GB_FULL:
+        speed_str = "5 Gbps";
+        break;
+    case IXGBE_LINK_SPEED_2_5GB_FULL:
+        speed_str = "2.5 Gbps";
+        break;
+    case IXGBE_LINK_SPEED_1GB_FULL:
+        speed_str = "1 Gbps";
+        break;
+    case IXGBE_LINK_SPEED_100_FULL:
+        speed_str = "100 Mbps";
+        break;
+    case IXGBE_LINK_SPEED_10_FULL:
+        speed_str = "10 Mbps";
+        break;
+    default:
+        speed_str = "unknown speed";
+        break;
+    }
 
-	/* enable transmits */
-	netif_tx_wake_all_queues(netdev);
+    e_info(drv, "NIC Link is Up %s, Flow Control: %s\n", speed_str,
+           (flow_rx && flow_tx) ? "RX/TX" : (flow_rx ? "RX" : (flow_tx ? "TX" : "None")));
 
-	/* update the default user priority for VFs */
-	ixgbe_update_default_up(adapter);
+    /* publish carrier first, then enable traffic */
+    netif_carrier_on(netdev);
+    ixgbe_check_vf_rate_limit(adapter);
 
-	/* Program Gaming ATR rules once per bring-up (sleepable, no spinlocks held) */
-	if (likely(netif_running(netdev)) &&
-	    gaming_atr_ranges && *gaming_atr_ranges &&
-	    adapter->gaming_fdir_count == 0) {
-		ixgbe_setup_gaming_atr(adapter);
-	}
+    /* enable transmits */
+    netif_tx_wake_all_queues(netdev);
 
-	/* notify VFs */
-	ixgbe_ping_all_vfs(adapter);
+    /* update the default user priority for VFs */
+    ixgbe_update_default_up(adapter);
+
+    /* Minimal-invasive Gaming ATR: program perfect UDP filters at link-up */
+    if (adapter->flags2 & IXGBE_FLAG2_GAMING_ATR_ENABLED) {
+        ixgbe_setup_gaming_atr(adapter);
+    }
+
+    /* notify VFs that link has changed */
+    ixgbe_ping_all_vfs(adapter);
 }
 
 /**

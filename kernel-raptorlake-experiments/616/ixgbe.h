@@ -678,6 +678,7 @@ struct ixgbe_adapter {
 #define IXGBE_FLAG2_MOD_POWER_UNSUPPORTED	BIT(22)
 #define IXGBE_FLAG2_API_MISMATCH		BIT(23)
 #define IXGBE_FLAG2_FW_ROLLBACK			BIT(24)
+#define IXGBE_FLAG2_GAMING_ATR_ENABLED	BIT(25)
 
 	/* Tx fast path data */
 	int num_tx_queues;
@@ -843,7 +844,8 @@ struct ixgbe_adapter {
 	spinlock_t vfs_lock;
 
 	/* Gaming ATR feature state */
-#define IXGBE_MAX_GAMING_FILTERS 512
+	spinlock_t gaming_fdir_lock;
+#define IXGBE_MAX_GAMING_FILTERS 128
 	u16 gaming_fdir_ids[IXGBE_MAX_GAMING_FILTERS];
 	int gaming_fdir_count;
 };
