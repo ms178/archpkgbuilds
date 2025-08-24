@@ -10,6 +10,7 @@
 #include <linux/vmalloc.h>
 #include <linux/string.h>
 #include <linux/in.h>
+#include <linux/irq.h>
 #include <linux/interrupt.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
@@ -3603,106 +3604,310 @@ int ixgbe_poll(struct napi_struct *napi, int budget)
 	return min(work_done, budget - 1);
 }
 
-/**
- * ixgbe_request_msix_irqs - Initialize MSI-X interrupts
- * @adapter: board private structure
+/* Return true if 'cpu' is the primary SMT thread of its core.
+ * We select the first logical CPU in the sibling set as the "primary".
+ * This avoids pinning IRQs to both hyperthreads of the same core.
+ */
+static __always_inline bool ixgbe_is_primary_thread(unsigned int cpu)
+{
+	const struct cpumask *sibs = topology_sibling_cpumask(cpu);
+
+	if (!sibs)
+		return true; /* No SMT information: treat as primary. */
+
+	return cpu == cpumask_first(sibs);
+}
+
+/* Return a relative CPU capacity (higher => faster). On x86 this maps to the
+ * scheduler's CPU capacity scale and is sufficient to distinguish P-cores from
+ * E-cores on hybrid architectures like Raptor Lake.
+ */
+static __always_inline unsigned long ixgbe_cpu_capacity(unsigned int cpu)
+{
+	return topology_get_cpu_scale(cpu);
+}
+
+/* Build a high-quality affinity mask for MSI-X:
+ * 1) Restrict to NIC's NUMA node if present; otherwise use all online CPUs.
+ * 2) Select only primary SMT threads (avoid hyperthread contention).
+ * 3) Prefer P-cores: keep CPUs whose capacity is within ~12.5% of max capacity.
+ *    (This robustly selects P-cores on Raptor Lake; if not hybrid, all cores
+ *     share the same capacity and thus stay selected.)
+ * 4) Provide graceful fallback to primary threads, then to NUMA mask, then online.
  *
- * ixgbe_request_msix_irqs allocates MSI-X vectors and requests
- * interrupts from the kernel.
- **/
+ * Output:
+ *   pref_mask: cpumask_var_t provided by caller (must be allocated); filled here.
+ *
+ * Returns 0 on success, negative error on failure (no masks are leaked).
+ */
+static int ixgbe_build_performance_mask(struct ixgbe_adapter *adapter,
+					cpumask_var_t pref_mask)
+{
+	cpumask_var_t node_mask, primaries, pcore_mask;
+	unsigned int cpu;
+	int node;
+	unsigned long cap, max_cap = 0;
+	unsigned long pcore_thresh;
+
+	if (!zalloc_cpumask_var(&node_mask, GFP_KERNEL) ||
+	    !zalloc_cpumask_var(&primaries, GFP_KERNEL) ||
+	    !zalloc_cpumask_var(&pcore_mask, GFP_KERNEL)) {
+		free_cpumask_var(node_mask);
+		free_cpumask_var(primaries);
+		free_cpumask_var(pcore_mask);
+		return -ENOMEM;
+	}
+
+	/* Step 1: start with NUMA-local CPUs (or all online CPUs if no NUMA node). */
+	node = dev_to_node(&adapter->pdev->dev);
+	if (node != NUMA_NO_NODE) {
+		cpumask_copy(node_mask, cpumask_of_node(node));
+		if (cpumask_empty(node_mask))
+			cpumask_copy(node_mask, cpu_online_mask);
+	} else {
+		cpumask_copy(node_mask, cpu_online_mask);
+	}
+
+	/* Step 2: keep only primary SMT threads. */
+	cpumask_clear(primaries);
+	for_each_cpu(cpu, node_mask) {
+		if (cpumask_test_cpu(cpu, cpu_online_mask) && ixgbe_is_primary_thread(cpu))
+			cpumask_set_cpu(cpu, primaries);
+	}
+
+	/* Step 3: infer P-cores via capacity and keep top-tier capacity CPUs.
+	 * Determine max capacity among primaries.
+	 */
+	for_each_cpu(cpu, primaries) {
+		cap = ixgbe_cpu_capacity(cpu);
+		if (cap > max_cap)
+			max_cap = cap;
+	}
+
+	/* Threshold for P-cores: keep CPUs with capacity >= (7/8)*max_cap.
+	 * This selects P-cores on hybrid Intel CPUs, and keeps all CPUs on uniform systems.
+	 */
+	pcore_thresh = (max_cap * 7) / 8;
+	cpumask_clear(pcore_mask);
+	for_each_cpu(cpu, primaries) {
+		cap = ixgbe_cpu_capacity(cpu);
+		if (cap >= pcore_thresh)
+			cpumask_set_cpu(cpu, pcore_mask);
+	}
+
+	/* Final preference selection with graceful fallback. */
+	if (!cpumask_empty(pcore_mask)) {
+		cpumask_copy(pref_mask, pcore_mask);
+	} else if (!cpumask_empty(primaries)) {
+		cpumask_copy(pref_mask, primaries);
+	} else if (!cpumask_empty(node_mask)) {
+		cpumask_copy(pref_mask, node_mask);
+	} else {
+		cpumask_copy(pref_mask, cpu_online_mask);
+	}
+
+	free_cpumask_var(node_mask);
+	free_cpumask_var(primaries);
+	free_cpumask_var(pcore_mask);
+	return 0;
+}
+
+/* Conservative starting CPU selector using the preferred mask.
+ * We do not rely on non-exported scheduler internals; simply return
+ * the first CPU in the preferred set, with a robust fallback.
+ */
+static unsigned int ixgbe_calculate_irq_load(struct ixgbe_adapter *adapter,
+					     const struct cpumask *pref_mask)
+{
+	unsigned int cpu = cpumask_first(pref_mask);
+
+	if (cpu >= nr_cpu_ids)
+		cpu = smp_processor_id();
+
+	return cpu;
+}
+
+/* Post-initialization IRQ affinity optimizer:
+ * - Deterministically spreads queue vectors across the preferred CPU mask.
+ * - Ensures each vector is pinned to a single CPU (cache warmth, reduced jitter).
+ * - Safe in process context; avoids non-exported APIs.
+ */
+static void ixgbe_optimize_irq_affinity(struct ixgbe_adapter *adapter)
+{
+	int v;
+	cpumask_var_t pref;
+	unsigned int node;
+	bool have_pref = false;
+
+	if (!adapter || !adapter->msix_entries)
+		return;
+
+	if (zalloc_cpumask_var(&pref, GFP_KERNEL)) {
+		if (!ixgbe_build_performance_mask(adapter, pref))
+			have_pref = !cpumask_empty(pref);
+	}
+
+	node = dev_to_node(&adapter->pdev->dev);
+
+	for (v = 0; v < adapter->num_q_vectors; v++) {
+		struct ixgbe_q_vector *qv = adapter->q_vector[v];
+		struct msix_entry *entry = adapter->msix_entries + v;
+		cpumask_t one;
+		unsigned int cpu;
+
+		if (!qv)
+			continue;
+
+		cpumask_clear(&one);
+
+		if (have_pref) {
+			/* Spread across preferred CPUs in a stable, index-based manner. */
+			unsigned int step = v;
+
+			cpu = cpumask_first(pref);
+			while (step-- && cpu < nr_cpu_ids) {
+				cpu = cpumask_next(cpu, pref);
+				if (cpu >= nr_cpu_ids)
+					cpu = cpumask_first(pref);
+			}
+		} else {
+			/* Fallback: local spread across NUMA node (harmless on single-NUMA). */
+			cpu = cpumask_local_spread(v, node);
+		}
+
+		if (cpu >= nr_cpu_ids)
+			cpu = 0;
+
+		cpumask_set_cpu(cpu, &one);
+		irq_set_affinity_and_hint(entry->vector, &one);
+	}
+
+	if (have_pref)
+		free_cpumask_var(pref);
+}
+
+/* MSI-X request with P/E-core aware, SMT-primary-only pinning.
+ * - Pins each queue vector to a single CPU from the preferred mask returned by
+ *   ixgbe_build_performance_mask() (favoring P-cores on Raptor Lake).
+ * - Robust resource management and unwind.
+ * - Maintains the original ABI (function signature).
+ */
 static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
 {
-    struct net_device *netdev = adapter->netdev;
-    unsigned int ri = 0, ti = 0;
-    int vector = 0, err = 0;
-    unsigned int cpu, pick;
-    struct cpumask prim_core_mask;
+	struct net_device *netdev = adapter->netdev;
+	unsigned int ri = 0, ti = 0;
+	int vector, err;
+	cpumask_var_t perf_mask;
+	unsigned int pick;
 
-    if (!adapter || !adapter->msix_entries)
-        return -EINVAL;
+	if (unlikely(!adapter || !adapter->msix_entries))
+		return -EINVAL;
 
-    /* Build prim_core_mask: one "primary" logical CPU per physical core */
-    cpumask_clear(&prim_core_mask);
+	if (!zalloc_cpumask_var(&perf_mask, GFP_KERNEL))
+		return -ENOMEM;
 
-    for_each_online_cpu(cpu) {
-        const struct cpumask *sib = topology_sibling_cpumask(cpu);
-        unsigned int primary = cpumask_first(sib);
-        if (primary >= nr_cpu_ids)
-            continue;
-        if (!cpumask_test_cpu(primary, &prim_core_mask))
-            cpumask_set_cpu(primary, &prim_core_mask);
-    }
+	err = ixgbe_build_performance_mask(adapter, perf_mask);
+	if (err) {
+		e_err(probe, "Failed to build performance CPU mask: %d\n", err);
+		free_cpumask_var(perf_mask);
+		return err;
+	}
 
-    /* fallback if prim_core_mask ends up empty */
-    if (cpumask_empty(&prim_core_mask))
-        cpumask_copy(&prim_core_mask, cpu_online_mask);
+	pick = ixgbe_calculate_irq_load(adapter, perf_mask);
 
-    pick = cpumask_first(&prim_core_mask);
-    if (pick >= nr_cpu_ids)
-        pick = cpumask_first(cpu_online_mask);
+	/* Queue-vector IRQs */
+	for (vector = 0; vector < adapter->num_q_vectors; vector++) {
+		struct ixgbe_q_vector *q_vector = adapter->q_vector[vector];
+		struct msix_entry *entry = &adapter->msix_entries[vector];
+		cpumask_t one;
 
-    /* Request IRQs for q_vectors */
-    for (vector = 0; vector < adapter->num_q_vectors; vector++) {
-        struct ixgbe_q_vector *q_vector = adapter->q_vector[vector];
-        struct msix_entry *entry = &adapter->msix_entries[vector];
+		if (unlikely(!q_vector))
+			continue;
 
-        if (!q_vector)
-            continue;
+		if (q_vector->tx.ring && q_vector->rx.ring) {
+			snprintf(q_vector->name, sizeof(q_vector->name),
+				 "%s-TxRx-%u", netdev->name, ri++);
+		} else if (q_vector->rx.ring) {
+			snprintf(q_vector->name, sizeof(q_vector->name),
+				 "%s-rx-%u", netdev->name, ri++);
+		} else if (q_vector->tx.ring) {
+			snprintf(q_vector->name, sizeof(q_vector->name),
+				 "%s-tx-%u", netdev->name, ti++);
+		} else {
+			/* Unused q_vector: skip cleanly */
+			continue;
+		}
 
-        if (q_vector->tx.ring && q_vector->rx.ring)
-            snprintf(q_vector->name, sizeof(q_vector->name), "%s-TxRx-%u", netdev->name, ri++);
-        else if (q_vector->rx.ring)
-            snprintf(q_vector->name, sizeof(q_vector->name), "%s-rx-%u", netdev->name, ri++);
-        else if (q_vector->tx.ring)
-            snprintf(q_vector->name, sizeof(q_vector->name), "%s-tx-%u", netdev->name, ti++);
-        else
-            continue;
+		err = request_irq(entry->vector, ixgbe_msix_clean_rings,
+				  IRQF_NO_AUTOEN | IRQF_NO_THREAD,
+				  q_vector->name, q_vector);
+		if (unlikely(err)) {
+			e_err(probe, "request_irq failed for MSIx vector %d: %d\n",
+			      vector, err);
+			goto unwind_irqs;
+		}
 
-        err = request_irq(entry->vector, ixgbe_msix_clean_rings, 0,
-                          q_vector->name, q_vector);
-        if (err) {
-            e_err(probe, "request_irq failed for MSIx vector %d err %d\n", vector, err);
-            goto free_queue_irqs;
-        }
+		/* Pin to a single preferred CPU. */
+		cpumask_clear(&one);
+		if (cpumask_test_cpu(pick, perf_mask))
+			cpumask_set_cpu(pick, &one);
+		else
+			cpumask_set_cpu(cpumask_first(perf_mask), &one);
 
-        /* Provide an affinity hint: prefer the next primary CPU */
-        cpumask_clear(&q_vector->affinity_mask);
-        cpumask_set_cpu(pick, &q_vector->affinity_mask);
-        irq_update_affinity_hint(entry->vector, &q_vector->affinity_mask);
+		irq_set_affinity_and_hint(entry->vector, &one);
+		enable_irq(entry->vector);
 
-        /* Advance pick round-robin around prim_core_mask */
-        pick = cpumask_next_wrap((int)pick, &prim_core_mask);
-        if (pick >= nr_cpu_ids)
-            pick = cpumask_first(&prim_core_mask);
-    }
+		/* Next CPU in mask (2-arg cpumask_next_wrap per target kernel). */
+		pick = cpumask_next_wrap(pick, perf_mask);
+	}
 
-    /* Request "other causes" vector if one exists (after queue vectors) */
-    if (vector < adapter->num_q_vectors + 1) {
-        err = request_irq(adapter->msix_entries[vector].vector,
-                          ixgbe_msix_other, 0, netdev->name, adapter);
-        if (err) {
-            e_err(probe, "request_irq for msix_other failed: %d\n", err);
-            goto free_queue_irqs;
-        }
-    }
+	/* "Other causes" vector: pin to the first preferred CPU. */
+	if (vector < adapter->num_q_vectors + 1) {
+		int other_vec = vector;
+		cpumask_t one;
 
-    return 0;
+		err = request_irq(adapter->msix_entries[other_vec].vector,
+				  ixgbe_msix_other, IRQF_NO_AUTOEN,
+				  netdev->name, adapter);
+		if (err) {
+			e_err(probe, "request_irq for msix_other failed: %d\n", err);
+			goto unwind_irqs;
+		}
 
-free_queue_irqs:
-    /* unwind previously requested IRQs */
-    while (vector--) {
-        struct msix_entry *entry = &adapter->msix_entries[vector];
-        struct ixgbe_q_vector *q_vector = adapter->q_vector[vector];
+		cpumask_clear(&one);
+		cpumask_set_cpu(cpumask_first(perf_mask), &one);
+		irq_set_affinity_and_hint(adapter->msix_entries[other_vec].vector, &one);
+		enable_irq(adapter->msix_entries[other_vec].vector);
+	}
 
-        irq_update_affinity_hint(entry->vector, NULL);
-        free_irq(entry->vector, q_vector);
-    }
-    adapter->flags &= ~IXGBE_FLAG_MSIX_ENABLED;
-    pci_disable_msix(adapter->pdev);
-    kfree(adapter->msix_entries);
-    adapter->msix_entries = NULL;
+	/* Final deterministic rebalancing (optional but cheap and safe). */
+	ixgbe_optimize_irq_affinity(adapter);
 
-    return err;
+	free_cpumask_var(perf_mask);
+	return 0;
+
+unwind_irqs:
+	/* Free any vectors we already requested; clear affinity hints. */
+	while (vector--) {
+		struct msix_entry *entry = &adapter->msix_entries[vector];
+		struct ixgbe_q_vector *q_vector = adapter->q_vector[vector];
+
+		if (q_vector) {
+			irq_set_affinity_and_hint(entry->vector, NULL);
+			free_irq(entry->vector, q_vector);
+		}
+	}
+
+	free_cpumask_var(perf_mask);
+
+	if (adapter->flags & IXGBE_FLAG_MSIX_ENABLED) {
+		pci_disable_msix(adapter->pdev);
+		adapter->flags &= ~IXGBE_FLAG_MSIX_ENABLED;
+	}
+	kfree(adapter->msix_entries);
+	adapter->msix_entries = NULL;
+
+	return err;
 }
 
 /**
