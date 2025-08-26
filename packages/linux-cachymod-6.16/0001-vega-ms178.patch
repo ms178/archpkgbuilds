@@ -4508,13 +4508,12 @@
 -	 * may be slow
 -	 * See https://bugs.freedesktop.org/show_bug.cgi?id=88758
 -	 */
--
++	#elif defined(CONFIG_X86) && !defined(CONFIG_X86_PAT)
+ 
 -#ifndef CONFIG_COMPILE_TEST
 -#warning Please enable CONFIG_MTRR and CONFIG_X86_PAT for better performance \
 -	 thanks to write-combining
 -#endif
-+	#elif defined(CONFIG_X86) && !defined(CONFIG_X86_PAT)
-+
 +	#ifndef CONFIG_COMPILE_TEST
 +	#warning Please enable CONFIG_MTRR and CONFIG_X86_PAT for better performance \
 +	thanks to write-combining
@@ -4544,11 +4543,11 @@
 - * @adev: amdgpu device object
 - * @bp: parameters to be used for the buffer object
 - * @bo_ptr: pointer to the buffer object pointer
+- *
+- * Creates an &amdgpu_bo buffer object.
 +/*
 + * Allocate an AMDGPU BO with bullet-proof unwinding and zero leaks.
   *
-- * Creates an &amdgpu_bo buffer object.
-- *
 - * Returns:
 - * 0 for success or a negative error code on failure.
 + * This implementation:
@@ -5307,7 +5306,7 @@
  		return;
  
  	abo = ttm_to_amdgpu_bo(bo);
-@@ -1252,82 +1002,64 @@ void amdgpu_bo_move_notify(struct ttm_bu
+@@ -1252,82 +1002,90 @@ void amdgpu_bo_move_notify(struct ttm_bu
  
  	amdgpu_bo_kunmap(abo);
  
@@ -5334,38 +5333,42 @@
  {
  	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->bdev);
 -	struct dma_fence *fence = NULL;
--	struct amdgpu_bo *abo;
-+	struct amdgpu_bo     *abo;
-+	struct dma_fence     *fence = NULL;
+ 	struct amdgpu_bo *abo;
++	struct dma_fence *fence = NULL;
  	int r;
  
 -	if (!amdgpu_bo_is_amdgpu_bo(bo))
-+	/* Fast exit for non-AMDGPU BOs */
-+	if (unlikely(!amdgpu_bo_is_amdgpu_bo(bo))) {
++	if (unlikely(!amdgpu_bo_is_amdgpu_bo(bo)))
  		return;
-+	}
  
  	abo = ttm_to_amdgpu_bo(bo);
  
++	/* The VM BO list should be empty when the BO is finally released */
  	WARN_ON(abo->vm_bo);
  
 -	if (abo->kfd_bo)
-+	/* KFD release hook */
-+	if (unlikely(abo->kfd_bo)) {
++	if (unlikely(abo->kfd_bo))
  		amdgpu_amdkfd_release_notify(abo);
-+	}
  
--	/*
+ 	/*
 -	 * We lock the private dma_resv object here and since the BO is about to
 -	 * be released nobody else should have a pointer to it.
 -	 * So when this locking here fails something is wrong with the reference
 -	 * counting.
--	 */
++	 * KFD BOs are special. The KFD part of the driver keeps track of
++	 * KFD BOs and their fences. The amdgpu part of the driver does not.
++	 * When a KFD BO is destroyed, the amdgpu driver must not mess
++	 * with its fences.
+ 	 */
 -	if (WARN_ON_ONCE(!dma_resv_trylock(&bo->base._resv)))
 -		return;
 -
 -	amdgpu_amdkfd_remove_all_eviction_fences(abo);
--
++	if (bo->type == ttm_bo_type_kernel &&
++	    (abo->flags & AMDGPU_AMDKFD_CREATE_USERPTR_BO) &&
++	    amdgpu_amdkfd_remove_fence_on_pt_pd_bos)
++		amdgpu_amdkfd_remove_fence_on_pt_pd_bos(abo);
+ 
 -	if (!bo->resource || bo->resource->mem_type != TTM_PL_VRAM ||
 -	    !(abo->flags & AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE) ||
 -	    adev->in_suspend || drm_dev_is_unplugged(adev_to_drm(adev)))
@@ -5378,37 +5381,54 @@
 -	r = amdgpu_fill_buffer(abo, 0, &bo->base._resv, &fence, true);
 -	if (WARN_ON(r))
 -		goto out;
--
++	/*
++	 * VRAM wipe-on-release is a security feature that must be isolated.
++	 * It should use the BO's PRIVATE reservation object (`&bo->base._resv`)
++	 * to avoid creating dependencies on potentially shared, user-controlled
++	 * reservation objects (`bo->base.resv`), which is a source of deadlocks.
++	 * The original code was correct in this regard.
++	 */
++	if (likely(bo->resource &&
++	           bo->resource->mem_type == TTM_PL_VRAM &&
++	           (abo->flags & AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE) &&
++	           !adev->in_suspend &&
++	           !drm_dev_is_unplugged(adev_to_drm(adev)))) {
+ 
 -	amdgpu_vram_mgr_set_cleared(bo->resource);
 -	dma_resv_add_fence(&bo->base._resv, fence, DMA_RESV_USAGE_KERNEL);
 -	dma_fence_put(fence);
-+	/* Kernel-type BOs must own their reservation object */
-+	WARN_ON_ONCE(bo->type == ttm_bo_type_kernel &&
-+	bo->base.resv != &bo->base._resv);
-+
-+	if (bo->base.resv == &bo->base._resv &&
-+		amdgpu_amdkfd_remove_fence_on_pt_pd_bos) {
-+		amdgpu_amdkfd_remove_fence_on_pt_pd_bos(abo);
-+		}
++		/*
++		 * We lock the private dma_resv. Since the BO is being released,
++		 * no one else should be accessing it, making trylock safe.
++		 * A failure here indicates a critical ref-counting bug elsewhere.
++		 */
++		if (dma_resv_trylock(&bo->base._resv)) {
++			/* Reserve space for our new wipe fence. */
++			r = dma_resv_reserve_fences(&bo->base._resv, 1);
++			if (unlikely(r)) {
++				/* OOM: Fallback to a blocking wait on existing fences */
++				dma_resv_wait_timeout(&bo->base._resv,
++						      DMA_RESV_USAGE_KERNEL,
++						      false, MAX_SCHEDULE_TIMEOUT);
++				dma_resv_unlock(&bo->base._resv);
++				return;
++			}
  
 -out:
 -	dma_resv_unlock(&bo->base._resv);
-+		/* Secure VRAM wipe when requested and GPU is alive */
-+		if (likely(bo->resource &&
-+			bo->resource->mem_type == TTM_PL_VRAM &&
-+			(abo->flags & AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE) &&
-+			!adev->in_suspend &&
-+			!drm_dev_is_unplugged(adev_to_drm(adev)))) {
-+
-+			if (dma_resv_trylock(bo->base.resv)) {
-+				r = amdgpu_fill_buffer(abo, 0, bo->base.resv,
-+									   &fence, true);
-+				if (!WARN_ON(r)) {
-+					amdgpu_vram_mgr_set_cleared(bo->resource);
-+					amdgpu_bo_fence(abo, fence, false);
-+					dma_fence_put(fence);
-+				}
-+			dma_resv_unlock(bo->base.resv);
++			r = amdgpu_fill_buffer(abo, 0, &bo->base._resv, &fence, true);
++			if (likely(!r)) {
++				amdgpu_vram_mgr_set_cleared(bo->resource);
++				dma_resv_add_fence(&bo->base._resv, fence,
++						   DMA_RESV_USAGE_KERNEL);
++				dma_fence_put(fence);
++			} else {
++				/* Best effort: log failure but don't crash */
++				DRM_ERROR("VRAM wipe on release failed (%d)\n", r);
++			}
++			dma_resv_unlock(&bo->base._resv);
++		} else {
++			WARN_ON_ONCE(1);
 +		}
 +	}
  }
@@ -5427,7 +5447,7 @@
  vm_fault_t amdgpu_bo_fault_reserve_notify(struct ttm_buffer_object *bo)
  {
  	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->bdev);
-@@ -1335,22 +1067,18 @@ vm_fault_t amdgpu_bo_fault_reserve_notif
+@@ -1335,22 +1093,18 @@ vm_fault_t amdgpu_bo_fault_reserve_notif
  	struct amdgpu_bo *abo = ttm_to_amdgpu_bo(bo);
  	int r;
  
@@ -5453,7 +5473,7 @@
  	abo->placements[0].flags |= TTM_PL_FLAG_DESIRED;
  
  	r = ttm_bo_validate(bo, &abo->placement, &ctx);
-@@ -1359,57 +1087,33 @@ vm_fault_t amdgpu_bo_fault_reserve_notif
+@@ -1359,57 +1113,33 @@ vm_fault_t amdgpu_bo_fault_reserve_notif
  	else if (unlikely(r))
  		return VM_FAULT_SIGBUS;
  
@@ -5518,7 +5538,7 @@
  {
  	struct amdgpu_sync sync;
  	int r;
-@@ -1421,53 +1125,26 @@ int amdgpu_bo_sync_wait_resv(struct amdg
+@@ -1421,53 +1151,26 @@ int amdgpu_bo_sync_wait_resv(struct amdg
  	return r;
  }
  
@@ -5575,7 +5595,7 @@
  u64 amdgpu_bo_gpu_offset_no_check(struct amdgpu_bo *bo)
  {
  	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
-@@ -1476,92 +1153,54 @@ u64 amdgpu_bo_gpu_offset_no_check(struct
+@@ -1476,92 +1179,54 @@ u64 amdgpu_bo_gpu_offset_no_check(struct
  	if (bo->tbo.resource->mem_type == TTM_PL_TT)
  		offset = amdgpu_gmc_agp_addr(&bo->tbo);
  
@@ -5694,7 +5714,7 @@
  u64 amdgpu_bo_print_info(int id, struct amdgpu_bo *bo, struct seq_file *m)
  {
  	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
-@@ -1571,39 +1210,39 @@ u64 amdgpu_bo_print_info(int id, struct
+@@ -1571,39 +1236,39 @@ u64 amdgpu_bo_print_info(int id, struct
  	unsigned int pin_count;
  	u64 size;
  
@@ -5761,7 +5781,7 @@
  			}
  		}
  		dma_resv_unlock(bo->tbo.base.resv);
-@@ -1613,7 +1252,7 @@ u64 amdgpu_bo_print_info(int id, struct
+@@ -1613,7 +1278,7 @@ u64 amdgpu_bo_print_info(int id, struct
  
  	size = amdgpu_bo_size(bo);
  	seq_printf(m, "\t\t0x%08x: %12lld byte %s",

@@ -1,3 +1,631 @@
+Thomas pointed out that i915 is using apply_page_range instead of
+vm_insert_pfn_prot to circumvent the PAT lookup and generally speed up
+the page fault handling.
+
+I've thought I give it a try and measure how much this can improve
+things and it turned that mapping a 1GiB buffer is now more than 4x times
+faster than before.
+
+Signed-off-by: Christian König <christian.koenig at amd.com>
+---
+ drivers/gpu/drm/ttm/ttm_bo_vm.c | 130 ++++++++++++++++----------------
+ 1 file changed, 64 insertions(+), 66 deletions(-)
+
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_vm.c b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+index a194db83421d..93764b166678 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo_vm.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+@@ -28,7 +28,6 @@
+ /*
+  * Authors: Thomas Hellstrom <thellstrom-at-vmware-dot-com>
+  */
+-
+ #define pr_fmt(fmt) "[TTM] " fmt
+ 
+ #include <drm/ttm/ttm_bo.h>
+@@ -38,8 +37,13 @@
+ #include <drm/drm_drv.h>
+ #include <drm/drm_managed.h>
+ 
++#include <linux/mm.h>
++#include <linux/minmax.h>
++#include <linux/prefetch.h>
++#include <asm/pgtable.h>
++
+ static vm_fault_t ttm_bo_vm_fault_idle(struct ttm_buffer_object *bo,
+-				struct vm_fault *vmf)
++				       struct vm_fault *vmf)
+ {
+ 	long err = 0;
+ 
+@@ -51,7 +55,7 @@ static vm_fault_t ttm_bo_vm_fault_idle(s
+ 
+ 	/*
+ 	 * If possible, avoid waiting for GPU with mmap_lock
+-	 * held.  We only do this if the fault allows retry and this
++	 * held. We only do this if the fault allows retry and this
+ 	 * is the first attempt.
+ 	 */
+ 	if (fault_flag_allow_retry_first(vmf->flags)) {
+@@ -75,14 +79,14 @@ static vm_fault_t ttm_bo_vm_fault_idle(s
+ 				    MAX_SCHEDULE_TIMEOUT);
+ 	if (unlikely(err < 0)) {
+ 		return (err != -ERESTARTSYS) ? VM_FAULT_SIGBUS :
+-			VM_FAULT_NOPAGE;
++					       VM_FAULT_NOPAGE;
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-static unsigned long ttm_bo_io_mem_pfn(struct ttm_buffer_object *bo,
+-				       unsigned long page_offset)
++static inline unsigned long ttm_bo_io_mem_pfn(struct ttm_buffer_object *bo,
++					      unsigned long page_offset)
+ {
+ 	struct ttm_device *bdev = bo->bdev;
+ 
+@@ -97,17 +101,6 @@ static unsigned long ttm_bo_io_mem_pfn(s
+  * @bo: The buffer object
+  * @vmf: The fault structure handed to the callback
+  *
+- * vm callbacks like fault() and *_mkwrite() allow for the mmap_lock to be dropped
+- * during long waits, and after the wait the callback will be restarted. This
+- * is to allow other threads using the same virtual memory space concurrent
+- * access to map(), unmap() completely unrelated buffer objects. TTM buffer
+- * object reservations sometimes wait for GPU and should therefore be
+- * considered long waits. This function reserves the buffer object interruptibly
+- * taking this into account. Starvation is avoided by the vm system not
+- * allowing too many repeated restarts.
+- * This function is intended to be used in customized fault() and _mkwrite()
+- * handlers.
+- *
+  * Return:
+  *    0 on success and the bo was reserved.
+  *    VM_FAULT_RETRY if blocking wait.
+@@ -132,8 +125,7 @@ vm_fault_t ttm_bo_vm_reserve(struct ttm_
+ 			if (!(vmf->flags & FAULT_FLAG_RETRY_NOWAIT)) {
+ 				drm_gem_object_get(&bo->base);
+ 				mmap_read_unlock(vmf->vma->vm_mm);
+-				if (!dma_resv_lock_interruptible(bo->base.resv,
+-								 NULL))
++				if (!dma_resv_lock_interruptible(bo->base.resv, NULL))
+ 					dma_resv_unlock(bo->base.resv);
+ 				drm_gem_object_put(&bo->base);
+ 			}
+@@ -160,6 +152,45 @@ vm_fault_t ttm_bo_vm_reserve(struct ttm_
+ }
+ EXPORT_SYMBOL(ttm_bo_vm_reserve);
+ 
++/* State bag for calls to ttm_bo_vm_apply_cb */
++struct ttm_bo_vm_bag {
++	struct mm_struct               *mm;
++	struct ttm_buffer_object       *bo;
++	struct ttm_tt                  *ttm;
++	struct page                   **pages;
++	unsigned long                   page_offset;
++	unsigned long                   page_last;
++	pgprot_t                        prot;
++	bool                            is_iomem;
++};
++
++/* Callback to fill in a specific PTE */
++static int ttm_bo_vm_apply_cb(pte_t *pte, unsigned long addr, void *data)
++{
++	struct ttm_bo_vm_bag *bag = data;
++	unsigned long pfn;
++
++	if (bag->is_iomem) {
++		pfn = ttm_bo_io_mem_pfn(bag->bo, bag->page_offset);
++	} else {
++		struct page *page = bag->pages[bag->page_offset];
++
++		if (unlikely(!page))
++			return -ENOMEM;
++
++		/* Help cache warmup on the page-pointer array for the next PTE */
++		if (bag->page_offset + 1 < bag->page_last)
++			prefetch(&bag->pages[bag->page_offset + 1]);
++
++		pfn = page_to_pfn(page);
++	}
++
++	/* Special PTE are not associated with any struct page */
++	set_pte_at(bag->mm, addr, pte, pte_mkspecial(pfn_pte(pfn, bag->prot)));
++	bag->page_offset++;
++	return 0;
++}
++
+ /**
+  * ttm_bo_vm_fault_reserved - TTM fault helper
+  * @vmf: The struct vm_fault given as argument to the fault callback
+@@ -168,10 +199,6 @@ EXPORT_SYMBOL(ttm_bo_vm_reserve);
+  * specify this based on madvice settings and the size of the GPU object
+  * backed by the memory.
+  *
+- * This function inserts one or more page table entries pointing to the
+- * memory backing the buffer object, and then returns a return code
+- * instructing the caller to retry the page access.
+- *
+  * Return:
+  *   VM_FAULT_NOPAGE on success or pending signal
+  *   VM_FAULT_SIGBUS on unspecified error
+@@ -183,100 +210,89 @@ vm_fault_t ttm_bo_vm_fault_reserved(stru
+ 				    pgoff_t num_prefault)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+-	struct ttm_buffer_object *bo = vma->vm_private_data;
+-	struct ttm_device *bdev = bo->bdev;
+-	unsigned long page_offset;
+-	unsigned long page_last;
+-	unsigned long pfn;
+-	struct ttm_tt *ttm = NULL;
+-	struct page *page;
++	struct ttm_bo_vm_bag bag = {
++		.mm = vma->vm_mm,
++		.bo = vma->vm_private_data,
++		.ttm = NULL,
++		.pages = NULL,
++		.page_offset = 0,
++		.page_last = 0,
++		.prot = prot,
++		.is_iomem = false,
++	};
++	unsigned long size;
+ 	int err;
+-	pgoff_t i;
+-	vm_fault_t ret = VM_FAULT_NOPAGE;
+-	unsigned long address = vmf->address;
+ 
+ 	/*
+ 	 * Wait for buffer data in transit, due to a pipelined
+ 	 * move.
+ 	 */
+-	ret = ttm_bo_vm_fault_idle(bo, vmf);
+-	if (unlikely(ret != 0))
+-		return ret;
++	{
++		vm_fault_t ret = ttm_bo_vm_fault_idle(bag.bo, vmf);
++		if (unlikely(ret != 0))
++			return ret;
++	}
+ 
+-	err = ttm_mem_io_reserve(bdev, bo->resource);
++	err = ttm_mem_io_reserve(bag.bo->bdev, bag.bo->resource);
+ 	if (unlikely(err != 0))
+ 		return VM_FAULT_SIGBUS;
+ 
+-	page_offset = ((address - vma->vm_start) >> PAGE_SHIFT) +
+-		vma->vm_pgoff - drm_vma_node_start(&bo->base.vma_node);
+-	page_last = vma_pages(vma) + vma->vm_pgoff -
+-		drm_vma_node_start(&bo->base.vma_node);
+-
+-	if (unlikely(page_offset >= PFN_UP(bo->base.size)))
++	bag.page_offset = ((vmf->address - vma->vm_start) >> PAGE_SHIFT) +
++			  vma->vm_pgoff - drm_vma_node_start(&bag.bo->base.vma_node);
++	if (unlikely(bag.page_offset >= PFN_UP(bag.bo->base.size)))
+ 		return VM_FAULT_SIGBUS;
+ 
+-	prot = ttm_io_prot(bo, bo->resource, prot);
+-	if (!bo->resource->bus.is_iomem) {
++	/*
++	 * Compute effective window: clamp by requested prefault size,
++	 * VMA end, and BO size.
++	 */
++	{
++		unsigned long max_pages_left_bo =
++			PFN_UP(bag.bo->base.size) - bag.page_offset;
++		unsigned long req_bytes = (unsigned long)num_prefault << PAGE_SHIFT;
++		unsigned long vma_bytes = vma->vm_end - vmf->address;
++
++		size = min3(req_bytes, vma_bytes, max_pages_left_bo << PAGE_SHIFT);
++		bag.page_last = bag.page_offset + (size >> PAGE_SHIFT);
++	}
++
++	bag.prot = ttm_io_prot(bag.bo, bag.bo->resource, bag.prot);
++	bag.is_iomem = bag.bo->resource->bus.is_iomem;
++
++	if (!bag.is_iomem) {
+ 		struct ttm_operation_ctx ctx = {
+ 			.interruptible = true,
+ 			.no_wait_gpu = false,
+ 		};
+ 
+-		ttm = bo->ttm;
+-		err = ttm_bo_populate(bo, &ctx);
+-		if (err) {
+-			if (err == -EINTR || err == -ERESTARTSYS ||
+-			    err == -EAGAIN)
+-				return VM_FAULT_NOPAGE;
++		bag.ttm = bag.bo->ttm;
++		err = ttm_bo_populate(bag.bo, &ctx);
++		if (err)
++			goto error;
+ 
+-			pr_debug("TTM fault hit %pe.\n", ERR_PTR(err));
+-			return VM_FAULT_SIGBUS;
+-		}
++		bag.pages = bag.ttm->pages;
+ 	} else {
+ 		/* Iomem should not be marked encrypted */
+-		prot = pgprot_decrypted(prot);
++		bag.prot = pgprot_decrypted(bag.prot);
+ 	}
+ 
+-	/*
+-	 * Speculatively prefault a number of pages. Only error on
+-	 * first page.
+-	 */
+-	for (i = 0; i < num_prefault; ++i) {
+-		if (bo->resource->bus.is_iomem) {
+-			pfn = ttm_bo_io_mem_pfn(bo, page_offset);
+-		} else {
+-			page = ttm->pages[page_offset];
+-			if (unlikely(!page && i == 0)) {
+-				return VM_FAULT_OOM;
+-			} else if (unlikely(!page)) {
+-				break;
+-			}
+-			pfn = page_to_pfn(page);
+-		}
++	/* Speculatively prefault a number of pages in one batch. */
++	err = apply_to_page_range(vma->vm_mm, vmf->address, size,
++				  ttm_bo_vm_apply_cb, &bag);
++
++error:
++	if (err == -EINTR || err == -ERESTARTSYS || err == -EAGAIN)
++		return VM_FAULT_NOPAGE;
+ 
+-		/*
+-		 * Note that the value of @prot at this point may differ from
+-		 * the value of @vma->vm_page_prot in the caching- and
+-		 * encryption bits. This is because the exact location of the
+-		 * data may not be known at mmap() time and may also change
+-		 * at arbitrary times while the data is mmap'ed.
+-		 * See vmf_insert_pfn_prot() for a discussion.
+-		 */
+-		ret = vmf_insert_pfn_prot(vma, address, pfn, prot);
+-
+-		/* Never error on prefaulted PTEs */
+-		if (unlikely((ret & VM_FAULT_ERROR))) {
+-			if (i == 0)
+-				return VM_FAULT_NOPAGE;
+-			else
+-				break;
+-		}
++	if (err == -ENOMEM)
++		return VM_FAULT_OOM;
+ 
+-		address += PAGE_SIZE;
+-		if (unlikely(++page_offset >= page_last))
+-			break;
++	if (err) {
++		pr_debug("TTM fault hit %pe.\n", ERR_PTR(err));
++		return VM_FAULT_SIGBUS;
+ 	}
+-	return ret;
++
++	return VM_FAULT_NOPAGE;
+ }
+ EXPORT_SYMBOL(ttm_bo_vm_fault_reserved);
+ 
+@@ -287,17 +303,33 @@ static void ttm_bo_release_dummy_page(st
+ 	__free_page(dummy_page);
+ }
+ 
++/* Dummy-mapping callback bag and function */
++struct ttm_bo_vm_dummy_bag {
++	struct mm_struct *mm;
++	pgprot_t prot;
++	unsigned long pfn;
++};
++
++static int ttm_bo_vm_dummy_cb(pte_t *pte, unsigned long addr, void *data)
++{
++	const struct ttm_bo_vm_dummy_bag *bag = data;
++
++	set_pte_at(bag->mm, addr, pte, pte_mkspecial(pfn_pte(bag->pfn, bag->prot)));
++	return 0;
++}
++
+ vm_fault_t ttm_bo_vm_dummy_page(struct vm_fault *vmf, pgprot_t prot)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	struct ttm_buffer_object *bo = vma->vm_private_data;
+ 	struct drm_device *ddev = bo->base.dev;
+ 	vm_fault_t ret = VM_FAULT_NOPAGE;
+-	unsigned long address;
+-	unsigned long pfn;
+ 	struct page *page;
++	struct ttm_bo_vm_dummy_bag bag;
++	unsigned long size;
++	int err;
+ 
+-	/* Allocate new dummy page to map all the VA range in this VMA to it*/
++	/* Allocate new dummy page to map all the VA range in this VMA to it */
+ 	page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+ 	if (!page)
+ 		return VM_FAULT_OOM;
+@@ -306,17 +338,34 @@ vm_fault_t ttm_bo_vm_dummy_page(struct v
+ 	if (drmm_add_action_or_reset(ddev, ttm_bo_release_dummy_page, page))
+ 		return VM_FAULT_OOM;
+ 
+-	pfn = page_to_pfn(page);
++	bag.mm = vma->vm_mm;
++	bag.prot = prot;
++	bag.pfn = page_to_pfn(page);
++	size = vma->vm_end - vma->vm_start;
+ 
+ 	/* Prefault the entire VMA range right away to avoid further faults */
+-	for (address = vma->vm_start; address < vma->vm_end;
+-	     address += PAGE_SIZE)
+-		ret = vmf_insert_pfn_prot(vma, address, pfn, prot);
++	err = apply_to_page_range(vma->vm_mm, vma->vm_start, size,
++				  ttm_bo_vm_dummy_cb, &bag);
++	if (err == -ENOMEM)
++		return VM_FAULT_OOM;
++	if (err)
++		return VM_FAULT_SIGBUS;
+ 
+ 	return ret;
+ }
+ EXPORT_SYMBOL(ttm_bo_vm_dummy_page);
+ 
++/* Compute effective prefault pages (PMD-sized on 3+-level page tables) */
++static inline pgoff_t ttm_bo_vm_compute_prefault(pgoff_t np)
++{
++#if defined(CONFIG_PGTABLE_LEVELS) && (CONFIG_PGTABLE_LEVELS > 2)
++	const pgoff_t pmd_pages = 1UL << (PMD_SHIFT - PAGE_SHIFT);
++	if (np < pmd_pages)
++		np = pmd_pages;
++#endif
++	return np;
++}
++
+ vm_fault_t ttm_bo_vm_fault(struct vm_fault *vmf)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+@@ -332,7 +381,8 @@ vm_fault_t ttm_bo_vm_fault(struct vm_fau
+ 
+ 	prot = vma->vm_page_prot;
+ 	if (drm_dev_enter(ddev, &idx)) {
+-		ret = ttm_bo_vm_fault_reserved(vmf, prot, TTM_BO_VM_NUM_PREFAULT);
++		const pgoff_t eff_prefault = ttm_bo_vm_compute_prefault(TTM_BO_VM_NUM_PREFAULT);
++		ret = ttm_bo_vm_fault_reserved(vmf, prot, eff_prefault);
+ 		drm_dev_exit(idx);
+ 	} else {
+ 		ret = ttm_bo_vm_dummy_page(vmf, prot);
+@@ -370,10 +420,11 @@ static int ttm_bo_vm_access_kmap(struct
+ 				 uint8_t *buf, int len, int write)
+ {
+ 	unsigned long page = offset >> PAGE_SHIFT;
+-	unsigned long bytes_left = len;
++	unsigned long bytes_left = (unsigned long)len;
+ 	int ret;
+ 
+-	/* Copy a page at a time, that way no extra virtual address
++	/*
++	 * Copy a page at a time, that way no extra virtual address
+ 	 * mapping is needed
+ 	 */
+ 	offset -= page << PAGE_SHIFT;
+@@ -389,10 +440,11 @@ static int ttm_bo_vm_access_kmap(struct
+ 
+ 		ptr = (uint8_t *)ttm_kmap_obj_virtual(&map, &is_iomem) + offset;
+ 		WARN_ON_ONCE(is_iomem);
+-		if (write)
++		if (write) {
+ 			memcpy(ptr, buf, bytes);
+-		else
++		} else {
+ 			memcpy(buf, ptr, bytes);
++		}
+ 		ttm_bo_kunmap(&map);
+ 
+ 		page++;
+@@ -413,10 +465,6 @@ static int ttm_bo_vm_access_kmap(struct
+  * @len: length of access
+  * @write: write access
+  *
+- * Utility function to access a buffer object. Useful when buffer object cannot
+- * be easily mapped (non-contiguous, non-visible, etc...). Should not directly
+- * be exported to user space via a peak / poke interface.
+- *
+  * Returns:
+  * @len if successful, negative error code on failure.
+  */
+@@ -425,7 +473,7 @@ int ttm_bo_access(struct ttm_buffer_obje
+ {
+ 	int ret;
+ 
+-	if (len < 1 || (offset + len) > bo->base.size)
++	if (len < 1 || (offset + (unsigned long)len) > bo->base.size)
+ 		return -EIO;
+ 
+ 	ret = ttm_bo_reserve(bo, true, false, NULL);
+@@ -439,11 +487,11 @@ int ttm_bo_access(struct ttm_buffer_obje
+ 		ret = ttm_bo_vm_access_kmap(bo, offset, buf, len, write);
+ 		break;
+ 	default:
+-		if (bo->bdev->funcs->access_memory)
+-			ret = bo->bdev->funcs->access_memory
+-				(bo, offset, buf, len, write);
+-		else
++		if (bo->bdev->funcs->access_memory) {
++			ret = bo->bdev->funcs->access_memory(bo, offset, buf, len, write);
++		} else {
+ 			ret = -EIO;
++		}
+ 	}
+ 
+ 	ttm_bo_unreserve(bo);
+@@ -498,7 +546,6 @@ int ttm_bo_mmap_obj(struct vm_area_struc
+ 	 * Note: We're transferring the bo reference to
+ 	 * vma->vm_private_data here.
+ 	 */
+-
+ 	vma->vm_private_data = bo;
+ 
+ 	vm_flags_set(vma, VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
+
+-- 
+2.43.0
+
+Now that we have improved the handling faulting in a full PMD only
+increases the overhead on my test system from 21us to 29us if only a
+single page is requested, but massively improves the performance for
+all other use cases.
+
+So re-apply that change again to improve the fault handling for large
+allocations bringing us close to improving it by a factor of 10.
+
+This reverts commit c358a809cb58af944d496944391a240e02f5837a.
+
+Signed-off-by: Christian König <christian.koenig at amd.com>
+---
+ include/drm/ttm/ttm_bo.h | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/include/drm/ttm/ttm_bo.h b/include/drm/ttm/ttm_bo.h
+index 903cd1030110..e96477606207 100644
+--- a/include/drm/ttm/ttm_bo.h
++++ b/include/drm/ttm/ttm_bo.h
+@@ -39,7 +39,11 @@
+ #include "ttm_device.h"
+ 
+ /* Default number of pre-faulted pages in the TTM fault handler */
++#if CONFIG_PGTABLE_LEVELS > 2
++#define TTM_BO_VM_NUM_PREFAULT (1 << (PMD_SHIFT - PAGE_SHIFT))
++#else
+ #define TTM_BO_VM_NUM_PREFAULT 16
++#endif
+ 
+ struct iosys_map;
+ 
+-- 
+2.43.0
+
+On some x86 systems (old AMD Athlons, Intel Luna Lake) we have the problem
+that changing the caching flags of system memory requires changing the
+global MTRR/PAT tables since those CPUs can't handle aliasing caching
+attributes.
+
+But on most modern x86 system (e.g. AMD CPUs after 2004) we actually
+don't need that any more and can update the caching flags directly in the
+PTEs of the userspace and kernel mappings.
+
+We already do this with encryption on x86 64bit for quite a while and all
+other supported platforms (Sparc, PowerPC, ARM, MIPS, LONGARCH) as well as
+the i915 driver have never done anything different either.
+
+So stop changing the global chaching flags for CPU systems which don't
+need it and just insert a clflush to be on the safe side so that we never
+return memory with dirty cache lines.
+
+Testing on a Ryzen 5 and 7 shows that the clflush has absolutely no
+performance impact, but I'm still waiting for CI systems to confirm
+functional correctness.
+
+v2: drop the pool only on AMD CPUs for now
+
+Signed-off-by: Christian König <christian.koenig at amd.com>
+---
+ drivers/gpu/drm/ttm/ttm_pool.c | 37 +++++++++++++++++++++++++---------
+ 1 file changed, 28 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/ttm/ttm_pool.c b/drivers/gpu/drm/ttm/ttm_pool.c
+index 83b10706ba89..3f830fb2aea5 100644
+--- a/drivers/gpu/drm/ttm/ttm_pool.c
++++ b/drivers/gpu/drm/ttm/ttm_pool.c
+@@ -45,6 +45,7 @@
+ #include <drm/ttm/ttm_pool.h>
+ #include <drm/ttm/ttm_tt.h>
+ #include <drm/ttm/ttm_bo.h>
++#include <drm/drm_cache.h>
+ 
+ #include "ttm_module.h"
+ 
+@@ -119,6 +120,8 @@ module_param(page_pool_size, ulong, 0644);
+ 
+ static atomic_long_t allocated_pages;
+ 
++static bool skip_caching_adjustment;
++
+ static struct ttm_pool_type global_write_combined[NR_PAGE_ORDERS];
+ static struct ttm_pool_type global_uncached[NR_PAGE_ORDERS];
+ 
+@@ -195,7 +198,8 @@ static void ttm_pool_free_page(struct ttm_pool *pool, enum ttm_caching caching,
+ 	/* We don't care that set_pages_wb is inefficient here. This is only
+ 	 * used when we have to shrink and CPU overhead is irrelevant then.
+ 	 */
+-	if (caching != ttm_cached && !PageHighMem(p))
++	if (!skip_caching_adjustment &&
++	    caching != ttm_cached && !PageHighMem(p))
+ 		set_pages_wb(p, 1 << order);
+ #endif
+ 
+@@ -223,13 +227,19 @@ static int ttm_pool_apply_caching(struct ttm_pool_alloc_state *alloc)
+ 	if (!num_pages)
+ 		return 0;
+ 
+-	switch (alloc->tt_caching) {
+-	case ttm_cached:
+-		break;
+-	case ttm_write_combined:
+-		return set_pages_array_wc(alloc->caching_divide, num_pages);
+-	case ttm_uncached:
+-		return set_pages_array_uc(alloc->caching_divide, num_pages);
++	if (skip_caching_adjustment) {
++		drm_clflush_pages(alloc->caching_divide, num_pages);
++	} else {
++		switch (alloc->tt_caching) {
++		case ttm_cached:
++			break;
++		case ttm_write_combined:
++			return set_pages_array_wc(alloc->caching_divide,
++						  num_pages);
++		case ttm_uncached:
++			return set_pages_array_uc(alloc->caching_divide,
++						  num_pages);
++		}
+ 	}
+ #endif
+ 	alloc->caching_divide = alloc->pages;
+@@ -342,6 +352,9 @@ static struct ttm_pool_type *ttm_pool_select_type(struct ttm_pool *pool,
+ 		return &pool->caching[caching].orders[order];
+ 
+ #ifdef CONFIG_X86
++	if (skip_caching_adjustment)
++		return NULL;
++
+ 	switch (caching) {
+ 	case ttm_write_combined:
+ 		if (pool->nid != NUMA_NO_NODE)
+@@ -981,7 +994,7 @@ long ttm_pool_backup(struct ttm_pool *pool, struct ttm_tt *tt,
+ 
+ #ifdef CONFIG_X86
+ 	/* Anything returned to the system needs to be cached. */
+-	if (tt->caching != ttm_cached)
++	if (!skip_caching_adjustment && tt->caching != ttm_cached)
+ 		set_pages_array_wb(tt->pages, tt->num_pages);
+ #endif
+ 
+@@ -1296,6 +1309,12 @@ int ttm_pool_mgr_init(unsigned long num_pages)
+ 	spin_lock_init(&shrinker_lock);
+ 	INIT_LIST_HEAD(&shrinker_list);
+ 
++#ifdef CONFIG_X86
++	skip_caching_adjustment =
++		(boot_cpu_data.x86_vendor == X86_VENDOR_INTEL) &&
++		static_cpu_has(X86_FEATURE_CLFLUSH);
++#endif
++
+ 	for (i = 0; i < NR_PAGE_ORDERS; ++i) {
+ 		ttm_pool_type_init(&global_write_combined[i], NULL,
+ 				   ttm_write_combined, i);
+-- 
+2.43.0
+
 --- a/kernel/irq/manage.c	2025-08-15 16:39:37.000000000 +0200
 +++ b/kernel/irq/manage.c	2025-08-17 18:57:30.373144306 +0200
 @@ -482,16 +482,17 @@ EXPORT_SYMBOL_GPL(irq_force_affinity);
