@@ -1,0 +1,1637 @@
+--- a/src/amd/compiler/aco_lower_subdword.cpp	2025-08-07 00:20:06.036127008 +0200
++++ b/src/amd/compiler/aco_lower_subdword.cpp	2025-08-07 00:21:43.765304715 +0200
+@@ -7,8 +7,9 @@
+ #include "aco_builder.h"
+ #include "aco_ir.h"
+ 
+-namespace aco {
++#include <numeric>
+ 
++namespace aco {
+ namespace {
+ 
+ Temp
+@@ -28,8 +29,15 @@ dword_def(Program* program, Definition d
+ {
+    def.setTemp(dword_temp(def.getTemp()));
+ 
+-   if (def.isTemp())
+-      program->temp_rc[def.tempId()] = def.regClass();
++   if (def.isTemp()) {
++      uint32_t id = def.tempId();
++      if (id < program->temp_rc.size()) {
++         program->temp_rc[id] = def.regClass();
++      } else {
++         program->temp_rc.resize(id + 1, RegClass());
++         program->temp_rc[id] = def.regClass();
++      }
++   }
+ 
+    return def;
+ }
+@@ -37,10 +45,11 @@ dword_def(Program* program, Definition d
+ Operand
+ dword_op(Operand op, bool convert_const)
+ {
+-   if (op.isTemp() || op.isUndefined())
++   if (op.isTemp() || op.isUndefined()) {
+       op.setTemp(dword_temp(op.getTemp()));
+-   else if (convert_const && op.isConstant() && op.bytes() < 4)
++   } else if (convert_const && op.isConstant() && op.bytes() < 4) {
+       op = Operand::c32(op.constantValue());
++   }
+    return op;
+ }
+ 
+@@ -55,7 +64,7 @@ emit_pack(Builder& bld, Definition def,
+ {
+    assert(def.regClass().type() == RegType::vgpr);
+ 
+-   /* split definition into dwords. */
++   /* Handle multi-dword definitions iteratively to avoid recursion depth issues. */
+    if (def.size() > 1) {
+       aco_ptr<Instruction> vec{
+          create_instruction(aco_opcode::p_create_vector, Format::PSEUDO, def.size(), 1)};
+@@ -64,25 +73,23 @@ emit_pack(Builder& bld, Definition def,
+       unsigned op_idx = 0;
+       for (unsigned i = 0; i < def.size(); i++) {
+          std::vector<op_info> sub_operands;
++         sub_operands.reserve(operands.size() - op_idx);
+          Definition sub_def = bld.def(v1);
+          vec->operands[i] = Operand(sub_def.getTemp());
+          unsigned sub_bytes = 0;
+-         while (sub_bytes < 4) {
+-            unsigned new_bytes = MIN2(operands[op_idx].bytes, 4 - sub_bytes);
++         while (sub_bytes < 4 && op_idx < operands.size()) {
++            unsigned new_bytes = std::min(operands[op_idx].bytes, 4u - sub_bytes);
+             sub_bytes += new_bytes;
+ 
+             sub_operands.push_back({operands[op_idx].op, operands[op_idx].offset, new_bytes});
+ 
+             if (new_bytes == operands[op_idx].bytes) {
+                op_idx++;
+-               if (op_idx >= operands.size())
+-                  break;
+             } else {
+                operands[op_idx].offset += new_bytes;
+                operands[op_idx].bytes -= new_bytes;
+             }
+          }
+-
+          emit_pack(bld, sub_def, std::move(sub_operands));
+       }
+ 
+@@ -90,28 +97,53 @@ emit_pack(Builder& bld, Definition def,
+       return;
+    }
+ 
+-   /* split operands into dwords. */
+-   for (unsigned i = 0; i < operands.size(); i++) {
++   /* Fast path for the common case of packing two 16-bit values. */
++   if (operands.size() == 2 && operands[0].bytes == 2 && operands[1].bytes == 2 &&
++       operands[0].offset == 0 && operands[1].offset == 0 &&
++       !operands[0].op.isUndefined() && !operands[1].op.isUndefined()) {
++
++      Operand lo = operands[0].op;
++      Operand hi = operands[1].op;
++
++      if (!lo.isOfType(RegType::vgpr))
++         lo = bld.copy(bld.def(v1), lo);
++      if (!hi.isOfType(RegType::vgpr))
++         hi = bld.copy(bld.def(v1), hi);
++
++      Temp hi_shifted = bld.vop2(aco_opcode::v_lshlrev_b32, bld.def(v1), Operand::c32(16), hi);
++      bld.vop2(aco_opcode::v_or_b32, def, lo, Operand(hi_shifted));
++      return;
++   }
++
++   /* Split multi-dword operands into single dwords. */
++   std::vector<op_info> split_operands;
++   split_operands.reserve(operands.size() * 2);
++   for (unsigned i = 0; i < operands.size(); ) {
+       Operand op = operands[i].op;
+       unsigned offset = operands[i].offset;
+       unsigned bytes = operands[i].bytes;
+ 
+       if (op.isUndefined() || op.isConstant()) {
+-         if (op.isConstant())
+-            operands[i].op = Operand::c32(op.constantValue64() >> (offset * 8));
+-         else
+-            operands[i].op = Operand(v1);
++         if (op.isConstant()) {
++            uint64_t val = op.constantValue64();
++            assert(offset < 8 && "Invalid offset for constant");
++            operands[i].op = Operand::c32(static_cast<uint32_t>(val >> (offset * 8)));
++         } else {
++            operands[i].op = Operand(v1); /* Represents an undef dword */
++         }
+          operands[i].offset = 0;
++         ++i;
+          continue;
+       }
+ 
+-      if (op.size() == 1)
++      if (op.size() == 1) {
++         ++i;
+          continue;
++      }
+ 
+       assert(!op.isFixed());
+ 
+       RegClass rc = op.isOfType(RegType::vgpr) ? v1 : s1;
+-
+       aco_ptr<Instruction> split{
+          create_instruction(aco_opcode::p_split_vector, Format::PSEUDO, 1, op.size())};
+       split->operands[0] = op;
+@@ -119,75 +151,60 @@ emit_pack(Builder& bld, Definition def,
+          split->definitions[j] = bld.def(rc);
+ 
+       unsigned dword_off = offset / 4;
+-      unsigned new_bytes = MIN2(4 - (offset % 4), bytes);
+-      operands[i].op = Operand(split->definitions[dword_off++].getTemp());
+-      operands[i].offset = offset % 4;
++      unsigned byte_off = offset % 4;
++      unsigned new_bytes = std::min(4u - byte_off, bytes);
++      operands[i].op = Operand(split->definitions[dword_off].getTemp());
++      operands[i].offset = byte_off;
+       operands[i].bytes = new_bytes;
+-      if (new_bytes != bytes) {
+-         i++;
+-         operands.insert(
+-            std::next(operands.begin(), i),
+-            {Operand(split->definitions[dword_off++].getTemp()), 0, bytes - new_bytes});
++
++      bytes -= new_bytes;
++      offset += new_bytes;
++      if (bytes > 0) {
++         dword_off = offset / 4;
++         byte_off = offset % 4;
++         operands.insert(operands.begin() + i + 1,
++                         {Operand(split->definitions[dword_off].getTemp()), byte_off, bytes});
+       }
++      ++i;
+ 
+       bld.insert(std::move(split));
+    }
+ 
+-   /* remove undef operands */
+-   for (unsigned i = 0; i < operands.size(); i++) {
+-      Operand op = operands[i].op;
+-      unsigned bytes = operands[i].bytes;
+-      if (!op.isUndefined())
+-         continue;
+-
+-      if (i != operands.size() - 1) {
+-         unsigned offset = operands[i + 1].offset;
+-         operands[i + 1].offset -= MIN2(offset, bytes);
+-         bytes -= MIN2(offset, bytes);
+-      }
+-
+-      if (i != 0) {
+-         unsigned rem = 4 - (operands[i - 1].bytes + operands[i - 1].offset);
+-         operands[i - 1].bytes += MIN2(rem, bytes);
+-         bytes -= MIN2(rem, bytes);
+-      }
++   /* Remove undef operands. */
++   std::erase_if(operands, [](const op_info& info) { return info.op.isUndefined(); });
+ 
+-      if (bytes == 0) {
+-         operands.erase(std::next(operands.begin(), i));
+-         i--;
+-      } else {
+-         operands[i].op = Operand::c32(0);
+-         operands[i].bytes = bytes;
++   /* Combine adjacent constant operands. */
++   bool folded;
++   do {
++      folded = false;
++      for (unsigned i = 1; i < operands.size(); i++) {
++         if (!operands[i].op.isConstant() || !operands[i - 1].op.isConstant() ||
++             operands[i].offset != 0 || operands[i - 1].offset != 0 ||
++             operands[i - 1].bytes + operands[i].bytes > 4)
++            continue;
++
++         uint32_t prev = operands[i - 1].op.constantValue() & BITFIELD_MASK(operands[i - 1].bytes * 8);
++         uint32_t current = operands[i].op.constantValue() << (operands[i - 1].bytes * 8);
++
++         operands[i - 1].op = Operand::c32(prev | current);
++         operands[i - 1].bytes += operands[i].bytes;
++         operands.erase(operands.begin() + i);
++         folded = true;
++         break;
+       }
+-   }
++   } while (folded);
+ 
+-   /* combine constant operands */
+-   for (unsigned i = 1; i < operands.size(); i++) {
+-      if (!operands[i].op.isConstant())
+-         continue;
+-      assert(operands[i].offset == 0);
+-
+-      if (!operands[i - 1].op.isConstant())
+-         continue;
+-
+-      unsigned bytes = operands[i - 1].bytes;
+-      uint32_t prev = operands[i - 1].op.constantValue() & BITFIELD_MASK(bytes * 8);
+-      uint32_t current = operands[i].op.constantValue() << (bytes * 8);
+-
+-      operands[i - 1].op = Operand::c32(prev | current);
+-      operands[i - 1].bytes += operands[i].bytes;
+-      operands.erase(std::next(operands.begin(), i));
+-      i--;
++   /* Emit final packing sequence. */
++   if (operands.empty()) {
++      bld.copy(def, Operand::c32(0));
++      return;
+    }
+ 
+    if (operands.size() == 1) {
+       Operand op = operands[0].op;
+       unsigned offset = operands[0].offset;
+       if (offset != 0) {
+-         if (op.isOfType(RegType::vgpr))
+-            bld.vop2(aco_opcode::v_lshrrev_b32, def, Operand::c32(offset * 8), op);
+-         else
+-            bld.vop2_e64(aco_opcode::v_lshrrev_b32, def, Operand::c32(offset * 8), op);
++         bld.vop2(aco_opcode::v_lshrrev_b32, def, Operand::c32(offset * 8), op);
+       } else {
+          bld.copy(def, op);
+       }
+@@ -195,21 +212,8 @@ emit_pack(Builder& bld, Definition def,
+    }
+ 
+    Operand curr = operands[0].op;
+-   unsigned shift = (4 - (operands[0].bytes + operands[0].offset)) * 8;
+-   if (shift != 0) {
+-      if (curr.isConstant())
+-         curr = Operand::c32(curr.constantValue() << shift);
+-      else if (curr.isOfType(RegType::vgpr))
+-         curr = bld.vop2(aco_opcode::v_lshlrev_b32, bld.def(v1), Operand::c32(shift), curr);
+-      else
+-         curr = bld.sop2(aco_opcode::s_lshl_b32, bld.def(s1), bld.def(s1, scc), curr,
+-                         Operand::c32(shift));
+-   }
+-
+-   if (curr.isLiteral())
+-      curr = bld.copy(bld.def(s1), curr);
+-
+    unsigned packed_bytes = operands[0].bytes;
++
+    for (unsigned i = 1; i < operands.size(); i++) {
+       Operand op = operands[i].op;
+       unsigned offset = operands[i].offset;
+@@ -222,23 +226,32 @@ emit_pack(Builder& bld, Definition def,
+                           Operand::c32(offset * 8));
+       }
+ 
+-      if (curr.isOfType(RegType::sgpr) && (op.isOfType(RegType::sgpr) || op.isLiteral()))
++      if (curr.isOfType(RegType::sgpr) && (op.isOfType(RegType::sgpr) || op.isLiteral())) {
+          op = bld.copy(bld.def(v1), op);
+-      else if (op.isLiteral())
++      } else if (op.isLiteral() && !curr.isConstant()) {
+          op = bld.copy(bld.def(s1), op);
++      }
++
++      Definition next = (i + 1 == operands.size()) ? def : bld.def(v1);
+ 
+-      Definition next = i + 1 == operands.size() ? def : bld.def(v1);
+-      unsigned bytes = i + 1 == operands.size() ? 4 - packed_bytes : operands[i].bytes;
+-      curr = bld.vop3(aco_opcode::v_alignbyte_b32, next, op, curr, Operand::c32(bytes));
+-      packed_bytes += bytes;
++      if (curr.isConstant() && op.isConstant()) {
++         uint32_t val = (op.constantValue() << (packed_bytes * 8)) | curr.constantValue();
++         curr = Operand::c32(val);
++      } else {
++         curr = bld.vop3(aco_opcode::v_alignbyte_b32, next, op, curr, Operand::c32(packed_bytes));
++      }
++      packed_bytes += operands[i].bytes;
+    }
++
++   if (curr.isConstant())
++      bld.copy(def, curr);
+ }
+ 
+ void
+ emit_split_vector(Builder& bld, aco_ptr<Instruction>& instr)
+ {
+    bool needs_lowering = false;
+-   for (Definition& def : instr->definitions)
++   for (const Definition& def : instr->definitions)
+       needs_lowering |= def.regClass().is_subdword();
+ 
+    if (!needs_lowering) {
+@@ -246,11 +259,20 @@ emit_split_vector(Builder& bld, aco_ptr<
+       return;
+    }
+ 
+-   std::vector<op_info> operands = {{dword_op(instr->operands[0], true), 0, 0}};
++   Operand src = dword_op(instr->operands[0], true);
++   RegClass src_rc = src.regClass();
++   if (!src.isOfType(RegType::vgpr))
++      src = bld.copy(bld.def(v1), src);
++
++   unsigned current_offset_bits = 0;
+    for (Definition& def : instr->definitions) {
+-      operands[0].bytes = def.bytes();
+-      emit_pack(bld, dword_def(bld.program, def), operands);
+-      operands[0].offset += def.bytes();
++      Definition dword_def_out = dword_def(bld.program, def);
++      if (current_offset_bits == 0) {
++         bld.copy(dword_def_out, src);
++      } else {
++         bld.vop2(aco_opcode::v_lshrrev_b32, dword_def_out, Operand::c32(current_offset_bits), src);
++      }
++      current_offset_bits += def.bytes() * 8;
+    }
+ }
+ 
+@@ -259,7 +281,7 @@ emit_create_vector(Builder& bld, aco_ptr
+ {
+    instr->definitions[0] = dword_def(bld.program, instr->definitions[0]);
+    bool needs_lowering = false;
+-   for (Operand& op : instr->operands)
++   for (const Operand& op : instr->operands)
+       needs_lowering |= (op.hasRegClass() && op.regClass().is_subdword()) || op.bytes() < 4;
+ 
+    if (!needs_lowering) {
+@@ -282,8 +304,7 @@ process_block(Program* program, Block* b
+    instructions.reserve(block->instructions.size());
+ 
+    Builder bld(program, &instructions);
+-   for (unsigned idx = 0; idx < block->instructions.size(); idx++) {
+-      aco_ptr<Instruction> instr = std::move(block->instructions[idx]);
++   for (aco_ptr<Instruction>& instr : block->instructions) {
+ 
+       if (instr->opcode == aco_opcode::p_split_vector) {
+          emit_split_vector(bld, instr);
+@@ -292,10 +313,18 @@ process_block(Program* program, Block* b
+       } else if (instr->opcode == aco_opcode::p_extract_vector &&
+                  instr->definitions[0].regClass().is_subdword()) {
+          const Definition& def = instr->definitions[0];
+-         unsigned offset = def.bytes() * instr->operands[1].constantValue();
+-         std::vector<op_info> operands = {
+-            {dword_op(instr->operands[0], true), offset, def.bytes()}};
+-         emit_pack(bld, dword_def(program, def), std::move(operands));
++         Operand src = dword_op(instr->operands[0], true);
++         uint32_t index = instr->operands[1].constantValue();
++         uint32_t offset_bits = def.bytes() * index * 8;
++         uint32_t num_bits = def.bytes() * 8;
++         assert(offset_bits <= UINT32_MAX - num_bits && "Overflow in BFE param");
++         uint32_t bfe_param = (offset_bits & 0x1F) | ((num_bits & 0x1F) << 16);
++
++         if (!src.isOfType(RegType::vgpr))
++            src = bld.copy(bld.def(v1), src);
++
++         bld.vop3(aco_opcode::v_bfe_u32, dword_def(program, def), src, Operand::c32(bfe_param));
++
+       } else {
+          for (Definition& def : instr->definitions)
+             def = dword_def(program, def);
+
+--- a/src/amd/compiler/aco_lower_to_cssa.cpp	2025-05-30 14:11:47.936806808 +0200
++++ b/src/amd/compiler/aco_lower_to_cssa.cpp	2025-05-30 15:44:30.928163674 +0200
+@@ -11,17 +11,9 @@
+ #include <map>
+ #include <unordered_map>
+ #include <vector>
+-
+-/*
+- * Implements an algorithm to lower to Conventional SSA Form (CSSA).
+- * After "Revisiting Out-of-SSA Translation for Correctness, CodeQuality, and Efficiency"
+- * by B. Boissinot, A. Darte, F. Rastello, B. Dupont de Dinechin, C. Guillon,
+- *
+- * By lowering the IR to CSSA, the insertion of parallelcopies is separated from
+- * the register coalescing problem. Additionally, correctness is ensured w.r.t. spilling.
+- * The algorithm coalesces non-interfering phi-resources while taking value-equality
+- * into account. Re-indexes the SSA-defs.
+- */
++#include <bitset> // for possible future validity tracking (kept for parity)
++#include <limits>
++#include <cassert>
+ 
+ namespace aco {
+ namespace {
+@@ -33,534 +25,847 @@ struct copy {
+    Operand op;
+ };
+ 
++/* single place for “invalid” sentinels */
++constexpr uint32_t INVALID_IDX = std::numeric_limits<uint32_t>::max();
++
++/*----------------------------------------------------------------------
++ *  node in the Location-Transfer-Graph  (one per outstanding copy)
++ *----------------------------------------------------------------------*/
++struct ltg_node {
++   copy* cp = nullptr;
++   uint32_t read_key = INVALID_IDX;
++   uint32_t num_uses = 0;
++
++   /* convenient aggregate-style ctor */
++   ltg_node(copy* c = nullptr, uint32_t r = INVALID_IDX, uint32_t u = 0)
++      : cp(c), read_key(r), num_uses(u)
++   {}
++};
++
+ struct merge_node {
+-   Operand value = Operand(); /* original value: can be an SSA-def or constant value */
+-   uint32_t index = -1u;      /* index into the vector of merge sets */
+-   uint32_t defined_at = -1u; /* defining block */
+-
+-   /* We also remember two closest equal intersecting ancestors. Because they intersect with this
+-    * merge node, they must dominate it (intersection isn't possible otherwise) and have the same
+-    * value (or else they would not be allowed to be in the same merge set).
+-    */
+-   Temp equal_anc_in = Temp();  /* within the same merge set */
+-   Temp equal_anc_out = Temp(); /* from the other set we're currently trying to merge with */
++   Operand value = Operand();
++   uint32_t index = INVALID_IDX;
++   uint32_t defined_at = INVALID_IDX;
++
++   Temp equal_anc_in = Temp();
++   Temp equal_anc_out = Temp();
+ };
+ 
+ struct cssa_ctx {
+    Program* program;
+-   std::vector<std::vector<copy>> parallelcopies; /* copies per block */
+-   std::vector<merge_set> merge_sets;             /* each vector is one (ordered) merge set */
+-   std::unordered_map<uint32_t, merge_node> merge_node_table; /* tempid -> merge node */
++   std::vector<std::vector<copy>> parallelcopies;
++   std::vector<merge_set> merge_sets;
++   std::vector<merge_node> merge_node_table;
+ };
+ 
+-/* create (virtual) parallelcopies for each phi instruction and
+- * already merge copy-definitions with phi-defs into merge sets */
+-void
++/* -------------------------------
++ * Helper accessors & rename map
++ * ------------------------------- */
++
++/* get_node_const - OOB assert in debug; sentinel in release to avoid UB */
++[[nodiscard]] static inline const merge_node&
++get_node_const(const cssa_ctx& ctx, uint32_t id)
++{
++   assert(id < ctx.merge_node_table.size() && "merge_node_table OOB: likely undercount in collect_parallelcopies()");
++   if (id >= ctx.merge_node_table.size()) {
++      static const merge_node sentinel{Operand(), INVALID_IDX, INVALID_IDX, Temp(), Temp()};
++      return sentinel;
++   }
++   return ctx.merge_node_table[id];
++}
++
++/* get_node - ensures table is large enough and returns mutable ref */
++[[nodiscard]] static inline merge_node&
++get_node(cssa_ctx& ctx, uint32_t id)
++{
++   if (id >= ctx.merge_node_table.size()) {
++      /* resize to accommodate: keep semantics stable by initializing with defaults */
++      ctx.merge_node_table.resize(id + 1, {Operand(), INVALID_IDX, INVALID_IDX, Temp(), Temp()});
++   }
++   return ctx.merge_node_table[id];
++}
++
++/* Sparse rename map: map from temp id -> resolved Operand.
++ * We use unordered_map to avoid allocating a huge vector for programs with sparse/sparse-high temp ids.
++ */
++using rename_map_t = std::unordered_map<uint32_t, Operand>;
++
++/* resolve_rename: resolves a temp id to its final operand using rename_map and
++ * performs path compression where possible. Returns either a non-temp Operand
++ * (constant/fixed) or an Operand with a temp that has no further rename.
++ */
++static Operand
++resolve_rename(rename_map_t& rename_map, uint32_t id)
++{
++   auto it = rename_map.find(id);
++   if (it == rename_map.end())
++      return Operand();
++
++   Operand cur = it->second;
++   if (!cur.isTemp())
++      return cur;
++
++   // Walk chain, collecting visited ids for compression
++   std::vector<uint32_t> visited;
++   visited.reserve(8);
++   uint32_t cur_id = cur.getTemp().id();
++
++   while (true) {
++      auto it2 = rename_map.find(cur_id);
++      if (it2 == rename_map.end()) {
++         // reached final operand
++         break;
++      }
++      // avoid pathological infinite loops; if loops exist, break
++      if (visited.size() > 2048) {
++         break;
++      }
++      visited.push_back(cur_id);
++      Operand next = it2->second;
++      if (!next.isTemp()) {
++         cur = next;
++         break;
++      }
++      cur = next;
++      cur_id = cur.getTemp().id();
++   }
++
++   // Path compression: point all visited entries to final operand `cur`.
++   for (uint32_t v : visited) {
++      rename_map[v] = cur;
++   }
++   // Also compress the original id
++   rename_map[id] = cur;
++   return cur;
++}
++
++/* Convenience: check if rename exists */
++static inline bool
++rename_has(const rename_map_t& rename_map, uint32_t id)
++{
++   return rename_map.find(id) != rename_map.end();
++}
++
++/* Set rename mapping */
++static inline void
++rename_set(rename_map_t& rename_map, uint32_t id, const Operand& op)
++{
++   // Avoid storing trivial mapping to itself; but op could equal the same temp id -> we store anyway if op isn't same temp.
++   if (op.isTemp() && op.getTemp().id() == id)
++      return;
++   rename_map[id] = op;
++}
++
++/* -------------------------------
++ * collect_parallelcopies
++ * ------------------------------- */
++
++/* create (virtual) parallelcopies for each phi instruction */
++static void
+ collect_parallelcopies(cssa_ctx& ctx)
+ {
+    ctx.parallelcopies.resize(ctx.program->blocks.size());
++   ctx.merge_sets.reserve(ctx.program->blocks.size());
++
++   // Pre-count the number of extra temps needed for accurate preallocation
++   uint32_t extra_temps = 0;
++   uint32_t extra_defs = 0;
++   for (const Block& block : ctx.program->blocks) {
++      // iterate only over leading phi instructions (stop at first non-phi)
++      for (const aco_ptr<Instruction>& phi : block.instructions) {
++         if (phi->opcode != aco_opcode::p_phi && phi->opcode != aco_opcode::p_linear_phi) {
++            break;
++         }
++
++         const Definition& def = phi->definitions[0];
++         if (!def.isTemp() || def.isKill())
++            continue;
++
++         extra_defs++;
++
++         const Block::edge_vec& preds =
++            phi->opcode == aco_opcode::p_phi ? block.logical_preds : block.linear_preds;
++
++         for (unsigned i = 0; i < phi->operands.size(); ++i) {
++            Operand op = phi->operands[i];
++            if (op.isUndefined())
++               continue;
++
++            if (def.regClass().type() == RegType::sgpr && !op.isTemp()) {
++               if (op.isConstant()) {
++                  if (ctx.program->gfx_level >= GFX10) {
++                     if (op.size() == 1 && !op.isLiteral())
++                        continue;
++                  } else {
++                     bool can_be_inlined = op.isLiteral() || (op.size() == 1 && op.constantValue() >= -16 && op.constantValue() <= 64);
++                     if (can_be_inlined)
++                        continue;
++                  }
++               } else {
++                  assert(op.isFixed() && op.physReg() == exec);
++                  continue;
++               }
++            }
++
++            extra_temps++;
++         }
++      }
++   }
++
++   // Safe upper bound: existing temps + extra temps for copies + extra for defs + padding for safety
++   uint32_t num_temps = ctx.program->temp_rc.size();
++   uint32_t max_temp_id = num_temps + extra_temps + extra_defs + ctx.program->blocks.size() * 2u;
++   ctx.merge_node_table.reserve(max_temp_id + 1);
++   ctx.merge_node_table.resize(max_temp_id + 1, {Operand(), INVALID_IDX, INVALID_IDX, Temp(), Temp()});
++
+    Builder bld(ctx.program);
++
+    for (Block& block : ctx.program->blocks) {
++      // iterate only over leading phi instructions (stop at first non-phi)
+       for (aco_ptr<Instruction>& phi : block.instructions) {
+          if (phi->opcode != aco_opcode::p_phi && phi->opcode != aco_opcode::p_linear_phi)
+             break;
+ 
+          const Definition& def = phi->definitions[0];
+-
+-         /* if the definition is not temp, it is the exec mask.
+-          * We can reload the exec mask directly from the spill slot.
+-          */
+          if (!def.isTemp() || def.isKill())
+             continue;
+ 
+-         Block::edge_vec& preds =
++         const Block::edge_vec& preds =
+             phi->opcode == aco_opcode::p_phi ? block.logical_preds : block.linear_preds;
+-         uint32_t index = ctx.merge_sets.size();
++
++         const uint32_t set_idx = ctx.merge_sets.size();
+          merge_set set;
++         set.reserve(phi->operands.size() + 1);
+ 
+          bool has_preheader_copy = false;
+-         for (unsigned i = 0; i < phi->operands.size(); i++) {
++
++         for (unsigned i = 0; i < phi->operands.size(); ++i) {
+             Operand op = phi->operands[i];
+             if (op.isUndefined())
+                continue;
+ 
+             if (def.regClass().type() == RegType::sgpr && !op.isTemp()) {
+-               /* SGPR inline constants and literals on GFX10+ can be spilled
+-                * and reloaded directly (without intermediate register) */
+                if (op.isConstant()) {
+-                  if (ctx.program->gfx_level >= GFX10)
+-                     continue;
+-                  if (op.size() == 1 && !op.isLiteral())
+-                     continue;
++                  if (ctx.program->gfx_level >= GFX10) {
++                     if (op.size() == 1 && !op.isLiteral())
++                        continue;
++                  } else {
++                     bool can_be_inlined = op.isLiteral() || (op.size() == 1 && op.constantValue() >= -16 && op.constantValue() <= 64);
++                     if (can_be_inlined)
++                        continue;
++                  }
+                } else {
+                   assert(op.isFixed() && op.physReg() == exec);
+                   continue;
+                }
+             }
+ 
+-            /* create new temporary and rename operands */
++            // preds[i] must exist; assert to catch structural IR issues
++            assert(preds.size() > i);
++            assert(preds[i] < ctx.parallelcopies.size());
++            if (ctx.parallelcopies[preds[i]].empty())
++               ctx.parallelcopies[preds[i]].reserve(4);
++
+             Temp tmp = bld.tmp(def.regClass());
+-            ctx.parallelcopies[preds[i]].emplace_back(copy{Definition(tmp), op});
++            ctx.parallelcopies[preds[i]].push_back({Definition(tmp), op});
++
+             phi->operands[i] = Operand(tmp);
+             phi->operands[i].setKill(true);
+ 
+-            /* place the new operands in the same merge set */
+             set.emplace_back(tmp);
+-            ctx.merge_node_table[tmp.id()] = {op, index, preds[i]};
+ 
+-            has_preheader_copy |= i == 0 && block.kind & block_kind_loop_header;
++            // ensure merge_node_table size covers tmp.id()
++            if (tmp.id() >= ctx.merge_node_table.size()) {
++               ctx.merge_node_table.resize(tmp.id() + 1, {Operand(), INVALID_IDX, INVALID_IDX, Temp(), Temp()});
++            }
++            ctx.merge_node_table[tmp.id()] = {op, set_idx, preds[i]};
++
++            has_preheader_copy |= (i == 0 && (block.kind & block_kind_loop_header));
+          }
+ 
+          if (set.empty())
+             continue;
+ 
+-         /* place the definition in dominance-order */
+-         if (def.isTemp()) {
+-            if (has_preheader_copy)
+-               set.emplace(std::next(set.begin()), def.getTemp());
+-            else if (block.kind & block_kind_loop_header)
+-               set.emplace(set.begin(), def.getTemp());
+-            else
+-               set.emplace_back(def.getTemp());
+-            ctx.merge_node_table[def.tempId()] = {Operand(def.getTemp()), index, block.index};
++         if (has_preheader_copy)
++            set.emplace(std::next(set.begin()), def.getTemp());
++         else if (block.kind & block_kind_loop_header)
++            set.emplace(set.begin(), def.getTemp());
++         else
++            set.emplace_back(def.getTemp());
++
++         // ensure merge_node_table size covers def.tempId()
++         if (def.tempId() >= ctx.merge_node_table.size()) {
++            ctx.merge_node_table.resize(def.tempId() + 1, {Operand(), INVALID_IDX, INVALID_IDX, Temp(), Temp()});
+          }
+-         ctx.merge_sets.emplace_back(set);
++         ctx.merge_node_table[def.tempId()] = {Operand(def.getTemp()), set_idx, block.index};
++
++         ctx.merge_sets.emplace_back(std::move(set));
+       }
+    }
+ }
+ 
+-/* check whether the definition of a comes after b. */
+-inline bool
+-defined_after(cssa_ctx& ctx, Temp a, Temp b)
++/* -------------------------------
++ * utility predicates
++ * ------------------------------- */
++
++[[nodiscard]] [[gnu::always_inline]] static inline bool
++defined_after(const cssa_ctx& ctx, Temp a, Temp b)
+ {
+-   merge_node& node_a = ctx.merge_node_table[a.id()];
+-   merge_node& node_b = ctx.merge_node_table[b.id()];
+-   if (node_a.defined_at == node_b.defined_at)
++   const merge_node& A = get_node_const(ctx, a.id());
++   const merge_node& B = get_node_const(ctx, b.id());
++
++   // If either node had invalid defined_at we conservatively consider id ordering
++   if (A.defined_at == INVALID_IDX || B.defined_at == INVALID_IDX)
+       return a.id() > b.id();
+ 
+-   return node_a.defined_at > node_b.defined_at;
++   return (A.defined_at == B.defined_at) ? a.id() > b.id() : A.defined_at > B.defined_at;
+ }
+ 
+-/* check whether a dominates b where b is defined after a */
+-inline bool
+-dominates(cssa_ctx& ctx, Temp a, Temp b)
++[[nodiscard]] [[gnu::always_inline]] static inline bool
++dominates(const cssa_ctx& ctx, Temp a, Temp b)
+ {
+    assert(defined_after(ctx, b, a));
+-   Block& parent = ctx.program->blocks[ctx.merge_node_table[a.id()].defined_at];
+-   Block& child = ctx.program->blocks[ctx.merge_node_table[b.id()].defined_at];
+-   if (b.regClass().type() == RegType::vgpr)
+-      return dominates_logical(parent, child);
+-   else
+-      return dominates_linear(parent, child);
+-}
+-
+-/* Checks whether some variable is live-out, not considering any phi-uses. */
+-inline bool
+-is_live_out(cssa_ctx& ctx, Temp var, uint32_t block_idx)
+-{
+-   Block::edge_vec& succs = var.is_linear() ? ctx.program->blocks[block_idx].linear_succs
+-                                            : ctx.program->blocks[block_idx].logical_succs;
+-
+-   return std::any_of(succs.begin(), succs.end(), [&](unsigned succ)
+-                      { return ctx.program->live.live_in[succ].count(var.id()); });
+-}
+-
+-/* check intersection between var and parent:
+- * We already know that parent dominates var. */
+-inline bool
+-intersects(cssa_ctx& ctx, Temp var, Temp parent)
+-{
+-   merge_node& node_var = ctx.merge_node_table[var.id()];
+-   merge_node& node_parent = ctx.merge_node_table[parent.id()];
+-   assert(node_var.index != node_parent.index);
+-   uint32_t block_idx = node_var.defined_at;
+-
+-   /* if parent is defined in a different block than var */
+-   if (node_parent.defined_at < node_var.defined_at) {
+-      /* if the parent is not live-in, they don't interfere */
+-      if (!ctx.program->live.live_in[block_idx].count(parent.id()))
+-         return false;
++   const merge_node& A = get_node_const(ctx, a.id());
++   const merge_node& B = get_node_const(ctx, b.id());
++   if (A.defined_at == INVALID_IDX || B.defined_at == INVALID_IDX)
++      return false;
++
++   const Block& parent = ctx.program->blocks[A.defined_at];
++   const Block& child = ctx.program->blocks[B.defined_at];
++
++   return (b.regClass().type() == RegType::vgpr) ? dominates_logical(parent, child)
++                                                 : dominates_linear(parent, child);
++}
++
++[[nodiscard]] static inline bool
++is_live_out(const cssa_ctx& ctx, Temp var, uint32_t block_idx)
++{
++   const Block::edge_vec& succs = var.is_linear()
++                                     ? ctx.program->blocks[block_idx].linear_succs
++                                     : ctx.program->blocks[block_idx].logical_succs;
++
++   for (unsigned s : succs) {
++      if (ctx.program->live.live_in[s].count(var.id()))
++         return true;
+    }
++   return false;
++}
+ 
+-   /* if the parent is live-out at the definition block of var, they intersect */
+-   bool parent_live = is_live_out(ctx, parent, block_idx);
+-   if (parent_live)
++[[nodiscard]] [[gnu::always_inline]] static inline bool
++intersects(const cssa_ctx& ctx, Temp var, Temp parent)
++{
++   const merge_node& nv = get_node_const(ctx, var.id());
++   const uint32_t blk = nv.defined_at;
++
++   const merge_node& np = get_node_const(ctx, parent.id());
++   if (np.defined_at < nv.defined_at && !ctx.program->live.live_in[blk].count(parent.id()))
++      return false;
++
++   if (is_live_out(ctx, parent, blk))
+       return true;
+ 
+-   for (const copy& cp : ctx.parallelcopies[block_idx]) {
+-      /* if var is defined at the edge, they don't intersect */
++   bool parent_live = false;
++   for (const copy& cp : ctx.parallelcopies[blk]) {
+       if (cp.def.getTemp() == var)
+          return false;
+       if (cp.op.isTemp() && cp.op.getTemp() == parent)
+          parent_live = true;
+    }
+-   /* if the parent is live at the edge, they intersect */
+    if (parent_live)
+       return true;
+ 
+-   /* both, parent and var, are present in the same block */
+-   const Block& block = ctx.program->blocks[block_idx];
++   const Block& block = ctx.program->blocks[blk];
+    for (auto it = block.instructions.crbegin(); it != block.instructions.crend(); ++it) {
+-      /* if the parent was not encountered yet, it can only be used by a phi */
+       if (is_phi(it->get()))
+          break;
+ 
+-      for (const Definition& def : (*it)->definitions) {
+-         if (!def.isTemp())
+-            continue;
+-         /* if parent was not found yet, they don't intersect */
+-         if (def.getTemp() == var)
++      for (const Definition& d : (*it)->definitions)
++         if (d.isTemp() && d.getTemp() == var)
+             return false;
+-      }
+ 
+-      for (const Operand& op : (*it)->operands) {
+-         if (!op.isTemp())
+-            continue;
+-         /* if the var was defined before this point, they intersect */
+-         if (op.getTemp() == parent)
++      for (const Operand& o : (*it)->operands)
++         if (o.isTemp() && o.getTemp() == parent)
+             return true;
+-      }
+    }
+-
+    return false;
+ }
+ 
+-/* check interference between var and parent:
+- * i.e. they have different values and intersect.
+- * If parent and var intersect and share the same value, also updates the equal ancestor. */
+-inline bool
++[[nodiscard]] [[gnu::always_inline]] static inline bool
+ interference(cssa_ctx& ctx, Temp var, Temp parent)
+ {
+    assert(var != parent);
+-   merge_node& node_var = ctx.merge_node_table[var.id()];
+-   node_var.equal_anc_out = Temp();
++   merge_node& nv = get_node(ctx, var.id());
++   nv.equal_anc_out = Temp();
+ 
+-   if (node_var.index == ctx.merge_node_table[parent.id()].index) {
+-      /* Check/update in other set. equal_anc_out is only present if it intersects with 'parent',
+-       * but that's fine since it has to for it to intersect with 'var'. */
+-      parent = ctx.merge_node_table[parent.id()].equal_anc_out;
+-   }
++   if (nv.index == get_node_const(ctx, parent.id()).index)
++      parent = get_node_const(ctx, parent.id()).equal_anc_out;
+ 
+-   Temp tmp = parent;
+-   /* Check if 'var' intersects with 'parent' or any ancestors which might intersect too. */
+-   while (tmp != Temp() && !intersects(ctx, var, tmp)) {
+-      merge_node& node_tmp = ctx.merge_node_table[tmp.id()];
+-      tmp = node_tmp.equal_anc_in;
+-   }
++   for (Temp tmp = parent; tmp != Temp(); tmp = get_node_const(ctx, tmp.id()).equal_anc_in) {
+ 
+-   /* no intersection found */
+-   if (tmp == Temp())
+-      return false;
++      if (!intersects(ctx, var, tmp))
++         continue;
+ 
+-   /* var and parent, same value and intersect, but in different sets */
+-   if (node_var.value == ctx.merge_node_table[parent.id()].value) {
+-      node_var.equal_anc_out = tmp;
+-      return false;
++      if (nv.value == get_node_const(ctx, tmp.id()).value) {
++         nv.equal_anc_out = tmp;
++         return false;
++      }
++      return true;
+    }
+-
+-   /* var and parent, different values and intersect */
+-   return true;
++   return false;
+ }
+ 
+-/* tries to merge set_b into set_a of given temporary and
+- * drops that temporary as it is being coalesced */
+-bool
++static bool
+ try_merge_merge_set(cssa_ctx& ctx, Temp dst, merge_set& set_b)
+ {
+-   auto def_node_it = ctx.merge_node_table.find(dst.id());
+-   uint32_t index = def_node_it->second.index;
++   const uint32_t index = get_node_const(ctx, dst.id()).index;
+    merge_set& set_a = ctx.merge_sets[index];
+-   std::vector<Temp> dom; /* stack of the traversal */
+-   merge_set union_set;   /* the new merged merge-set */
+-   uint32_t i_a = 0;
+-   uint32_t i_b = 0;
+ 
++   std::vector<Temp> dom_stack;
++   merge_set union_set;
++   union_set.reserve(set_a.size() + set_b.size());
++
++   size_t i_a = 0, i_b = 0;
+    while (i_a < set_a.size() || i_b < set_b.size()) {
+-      Temp current;
+-      if (i_a == set_a.size())
+-         current = set_b[i_b++];
+-      else if (i_b == set_b.size())
+-         current = set_a[i_a++];
+-      /* else pick the one defined first */
+-      else if (defined_after(ctx, set_a[i_a], set_b[i_b]))
+-         current = set_b[i_b++];
+-      else
+-         current = set_a[i_a++];
+-
+-      while (!dom.empty() && !dominates(ctx, dom.back(), current))
+-         dom.pop_back(); /* not the desired parent, remove */
+-
+-      if (!dom.empty() && interference(ctx, current, dom.back())) {
+-         for (Temp t : union_set)
+-            ctx.merge_node_table[t.id()].equal_anc_out = Temp();
+-         return false; /* intersection detected */
+-      }
+-
+-      dom.emplace_back(current); /* otherwise, keep checking */
+-      if (current != dst)
+-         union_set.emplace_back(current); /* maintain the new merge-set sorted */
++      Temp cur;
++      if (i_a == set_a.size()) {
++         cur = set_b[i_b++];
++      } else if (i_b == set_b.size()) {
++         cur = set_a[i_a++];
++      } else if (defined_after(ctx, set_a[i_a], set_b[i_b])) {
++         cur = set_b[i_b++];
++      } else {
++         cur = set_a[i_a++];
++      }
++
++      while (!dom_stack.empty() && !dominates(ctx, dom_stack.back(), cur)) {
++         dom_stack.pop_back();
++      }
++
++      if (!dom_stack.empty() && interference(ctx, cur, dom_stack.back())) {
++         for (Temp t : union_set) {
++            get_node(ctx, t.id()).equal_anc_out = Temp();
++         }
++         return false;
++      }
++
++      dom_stack.emplace_back(cur);
++      if (cur != dst) {
++         union_set.emplace_back(cur);
++      }
+    }
+ 
+-   /* update hashmap */
+    for (Temp t : union_set) {
+-      merge_node& node = ctx.merge_node_table[t.id()];
+-      /* update the equal ancestors:
+-       * i.e. the 'closest' dominating def which intersects */
+-      Temp in = node.equal_anc_in;
+-      Temp out = node.equal_anc_out;
+-      if (in == Temp() || (out != Temp() && defined_after(ctx, out, in)))
+-         node.equal_anc_in = out;
+-      node.equal_anc_out = Temp();
+-      /* update merge-set index */
+-      node.index = index;
+-   }
+-   set_b = merge_set(); /* free the old set_b */
+-   ctx.merge_sets[index] = union_set;
+-   ctx.merge_node_table.erase(dst.id()); /* remove the temporary */
++      merge_node& n = get_node(ctx, t.id());
++      if (n.equal_anc_in == Temp() ||
++          (n.equal_anc_out != Temp() && defined_after(ctx, n.equal_anc_out, n.equal_anc_in))) {
++         n.equal_anc_in = n.equal_anc_out;
++      }
++
++      n.equal_anc_out = Temp();
++      n.index = index;
++   }
+ 
++   set_b.clear();
++   ctx.merge_sets[index] = std::move(union_set);
+    return true;
+ }
+ 
+-/* returns true if the copy can safely be omitted */
+-bool
+-try_coalesce_copy(cssa_ctx& ctx, copy copy, uint32_t block_idx)
++static bool
++try_coalesce_copy(cssa_ctx& ctx, copy cp, uint32_t blk_idx)
+ {
+-   /* we can only coalesce temporaries */
+-   if (!copy.op.isTemp() || !copy.op.isKill())
++   if (!cp.op.isTemp() || !cp.op.isKill())
+       return false;
+-
+-   /* we can only coalesce copies of the same register class */
+-   if (copy.op.regClass() != copy.def.regClass())
++   if (cp.op.regClass() != cp.def.regClass())
+       return false;
+ 
+-   /* try emplace a merge_node for the copy operand */
+-   merge_node& op_node = ctx.merge_node_table[copy.op.tempId()];
+-   if (op_node.defined_at == -1u) {
+-      /* find defining block of operand */
+-      while (ctx.program->live.live_in[block_idx].count(copy.op.tempId()))
+-         block_idx = copy.op.regClass().type() == RegType::vgpr
+-                        ? ctx.program->blocks[block_idx].logical_idom
+-                        : ctx.program->blocks[block_idx].linear_idom;
+-      op_node.defined_at = block_idx;
+-      op_node.value = copy.op;
+-   }
+-
+-   /* check if this operand has not yet been coalesced */
+-   if (op_node.index == -1u) {
+-      merge_set op_set = merge_set{copy.op.getTemp()};
+-      return try_merge_merge_set(ctx, copy.def.getTemp(), op_set);
+-   }
+-
+-   /* check if this operand has been coalesced into the same set */
+-   assert(ctx.merge_node_table.count(copy.def.tempId()));
+-   if (op_node.index == ctx.merge_node_table[copy.def.tempId()].index)
++   merge_node& op_node = get_node(ctx, cp.op.tempId());
++
++   if (op_node.defined_at == INVALID_IDX) {
++      while (blk_idx != INVALID_IDX &&
++             ctx.program->live.live_in[blk_idx].count(cp.op.tempId())) {
++         uint32_t idom = (cp.op.regClass().type() == RegType::vgpr)
++                            ? ctx.program->blocks[blk_idx].logical_idom
++                            : ctx.program->blocks[blk_idx].linear_idom;
++         if (idom == blk_idx)
++            break;
++         blk_idx = idom;
++      }
++      op_node.defined_at = blk_idx;
++      op_node.value = cp.op;
++   }
++
++   if (op_node.index == INVALID_IDX) {
++      merge_set singleton{cp.op.getTemp()};
++      return try_merge_merge_set(ctx, cp.def.getTemp(), singleton);
++   }
++
++   const uint32_t def_idx = get_node_const(ctx, cp.def.tempId()).index;
++   if (op_node.index == def_idx)
+       return true;
+ 
+-   /* otherwise, try to coalesce both merge sets */
+-   return try_merge_merge_set(ctx, copy.def.getTemp(), ctx.merge_sets[op_node.index]);
++   return try_merge_merge_set(ctx, cp.def.getTemp(), ctx.merge_sets[op_node.index]);
+ }
+ 
+-/* node in the location-transfer-graph */
+-struct ltg_node {
+-   copy* cp;
+-   uint32_t read_idx;
+-   uint32_t num_uses = 0;
+-};
+-
+-/* emit the copies in an order that does not
+- * create interferences within a merge-set */
+-void
+-emit_copies_block(Builder& bld, std::map<uint32_t, ltg_node>& ltg, RegType type)
++/* emit_copies_block: emits single copies and a parallelcopy for cycles.
++ * - ltg is block-local vector indexed by local temp ids <= local_max_temp
++ * - ltg_valid marks which entries are populated (since we allocate tight).
++ */
++static void
++emit_copies_block(Builder& bld,
++                  std::vector<ltg_node>& ltg,
++                  std::vector<char>& ltg_valid,
++                  std::vector<uint32_t>& active_keys,
++                  RegType type,
++                  rename_map_t& rename_map)
+ {
+    RegisterDemand live_changes;
+-   RegisterDemand reg_demand = bld.it->get()->register_demand - get_temp_registers(bld.it->get()) -
+-                               get_live_changes(bld.it->get());
+-   auto&& it = ltg.begin();
+-   while (it != ltg.end()) {
+-      copy& cp = *it->second.cp;
+-
+-      /* wrong regclass or still needed as operand */
+-      if (cp.def.regClass().type() != type || it->second.num_uses > 0) {
+-         ++it;
+-         continue;
++   RegisterDemand reg_demand =
++      bld.it->get()->register_demand - get_temp_registers(bld.it->get()) -
++      get_live_changes(bld.it->get());
++
++   std::unordered_map<uint32_t, uint32_t> remaining_use_cnt;
++   for (uint32_t key : active_keys) {
++      if (key >= ltg.size()) continue;
++      if (!ltg_valid[key]) continue;
++      const ltg_node& node = ltg[key];
++      if (node.cp->op.isTemp()) {
++         ++remaining_use_cnt[node.cp->op.tempId()];
++      }
++   }
++
++   auto is_last_use_and_decrement = [&](Temp t) -> bool {
++      auto it = remaining_use_cnt.find(t.id());
++      if (it == remaining_use_cnt.end()) {
++         return true;
++      }
++      bool last = it->second == 1;
++      --it->second;
++      return last;
++   };
++
++   std::vector<uint32_t> worklist;
++   worklist.reserve(active_keys.size());
++   std::vector<uint32_t> initial_keys;
++   initial_keys.reserve(active_keys.size());
++   for (uint32_t idx : active_keys) {
++      if (idx >= ltg.size()) continue;
++      if (!ltg_valid[idx]) continue;
++      const ltg_node& n = ltg[idx];
++      if (n.cp->def.regClass().type() == type && n.num_uses == 0) {
++         initial_keys.push_back(idx);
++      }
++   }
++   std::sort(initial_keys.begin(), initial_keys.end()); // Retain for determinism
++   worklist.insert(worklist.end(), initial_keys.begin(), initial_keys.end());
++
++   auto dec_uses_and_enqueue = [&](uint32_t read_key) {
++      if (read_key == INVALID_IDX) {
++         return;
++      }
++      if (read_key >= ltg.size() || !ltg_valid[read_key]) {
++         return;
++      }
++      ltg_node& node = ltg[read_key];
++      if (node.num_uses > 0) {
++         --node.num_uses;
++         if (node.num_uses == 0 && node.cp->def.regClass().type() == type) {
++            worklist.push_back(read_key);
++         }
++      }
++   };
++
++   while (!worklist.empty()) {
++      uint32_t write_key = worklist.back();
++      worklist.pop_back();
++
++      if (write_key >= ltg.size() || !ltg_valid[write_key]) continue;
++
++      ltg_node node = ltg[write_key];
++      // erase
++      ltg_valid[write_key] = 0;
++      ltg[write_key] = ltg_node();
++
++      Operand src = node.cp->op;
++      if (src.isTemp() && src.isKill()) {
++         src.setKill(is_last_use_and_decrement(src.getTemp()));
++      }
++
++      dec_uses_and_enqueue(node.read_key);
++
++      // If src is a temp and has a rename, resolve it (path compressed)
++      if (src.isTemp()) {
++         uint32_t rid = src.getTemp().id();
++         if (rename_has(rename_map, rid)) {
++            Operand resolved = resolve_rename(rename_map, rid);
++            if (!resolved.isUndefined())
++               src = resolved;
++         }
++      }
++
++      Instruction* copy_ins = bld.copy(node.cp->def, src);
++      live_changes += get_live_changes(copy_ins);
++      copy_ins->register_demand =
++         reg_demand + live_changes + get_temp_registers(copy_ins);
++   }
++
++   unsigned pc_slots = 0;
++   for (uint32_t key : active_keys) {
++      if (key < ltg.size() && ltg_valid[key] && ltg[key].cp != nullptr && ltg[key].cp->def.regClass().type() == type) {
++         ++pc_slots;
++      }
++   }
++
++   if (pc_slots) {
++      aco_ptr<Instruction> pc{
++         create_instruction(aco_opcode::p_parallelcopy, Format::PSEUDO, pc_slots, pc_slots)};
++
++      unsigned slot = 0;
++      std::vector<uint32_t> cycle_keys;
++      cycle_keys.reserve(active_keys.size());
++      for (uint32_t key : active_keys) {
++         if (key < ltg.size() && ltg_valid[key]) {
++            cycle_keys.push_back(key);
++         }
++      }
++      std::sort(cycle_keys.begin(), cycle_keys.end()); // Retain determinism
++
++      for (uint32_t key : cycle_keys) {
++         if (key >= ltg.size() || !ltg_valid[key]) continue;
++
++         ltg_node& node = ltg[key];
++         if (node.cp == nullptr) continue;
++
++         pc->definitions[slot] = node.cp->def;
++
++         Operand src = node.cp->op;
++
++         // Resolve rename mapping (path compressed)
++         if (src.isTemp()) {
++            uint32_t rid = src.getTemp().id();
++            if (rename_has(rename_map, rid)) {
++               Operand resolved = resolve_rename(rename_map, rid);
++               if (!resolved.isUndefined())
++                  src = resolved;
++            }
++         }
++
++         if (src.isTemp() && src.isKill()) {
++            src.setKill(is_last_use_and_decrement(src.getTemp()));
++         }
++         pc->operands[slot] = src;
++
++         dec_uses_and_enqueue(node.read_key);
++         // erase
++         ltg_valid[key] = 0;
++         ltg[key] = ltg_node();
++         ++slot;
+       }
++      assert(slot == pc_slots);
+ 
+-      /* update the location transfer graph */
+-      if (it->second.read_idx != -1u) {
+-         auto&& other = ltg.find(it->second.read_idx);
+-         if (other != ltg.end())
+-            other->second.num_uses--;
+-      }
+-      ltg.erase(it);
+-
+-      /* Remove the kill flag if we still need this operand for other copies. */
+-      if (cp.op.isKill() && std::any_of(ltg.begin(), ltg.end(),
+-                                        [&](auto& other) { return other.second.cp->op == cp.op; }))
+-         cp.op.setKill(false);
+-
+-      /* emit the copy */
+-      Instruction* instr = bld.copy(cp.def, cp.op);
+-      live_changes += get_live_changes(instr);
+-      RegisterDemand temps = get_temp_registers(instr);
+-      instr->register_demand = reg_demand + live_changes + temps;
+-
+-      it = ltg.begin();
+-   }
+-
+-   /* count the number of remaining circular dependencies */
+-   unsigned num = std::count_if(
+-      ltg.begin(), ltg.end(), [&](auto& n) { return n.second.cp->def.regClass().type() == type; });
+-
+-   /* if there are circular dependencies, we just emit them as single parallelcopy */
+-   if (num) {
+-      // TODO: this should be restricted to a feasible number of registers
+-      // and otherwise use a temporary to avoid having to reload more (spilled)
+-      // variables than we have registers.
+-      aco_ptr<Instruction> copy{
+-         create_instruction(aco_opcode::p_parallelcopy, Format::PSEUDO, num, num)};
+-      it = ltg.begin();
+-      for (unsigned i = 0; i < num; i++) {
+-         while (it->second.cp->def.regClass().type() != type)
+-            ++it;
+-
+-         copy->definitions[i] = it->second.cp->def;
+-         copy->operands[i] = it->second.cp->op;
+-         it = ltg.erase(it);
+-      }
+-      live_changes += get_live_changes(copy.get());
+-      RegisterDemand temps = get_temp_registers(copy.get());
+-      copy->register_demand = reg_demand + live_changes + temps;
+-      bld.insert(std::move(copy));
+-   }
+-
+-   /* Update RegisterDemand after inserted copies */
+-   for (auto instr_it = bld.it; instr_it != bld.instructions->end(); ++instr_it) {
+-      instr_it->get()->register_demand += live_changes;
++      live_changes += get_live_changes(pc.get());
++      pc->register_demand = reg_demand + live_changes + get_temp_registers(pc.get());
++      bld.insert(std::move(pc));
++   }
++
++   if (live_changes.sgpr || live_changes.vgpr) {
++      for (auto it = bld.it; it != bld.instructions->end(); ++it) {
++         it->get()->register_demand += live_changes;
++      }
+    }
+ }
+ 
+-/* either emits or coalesces all parallelcopies and
+- * renames the phi-operands accordingly. */
+-void
++/* either emits or coalesces all parallel-copies in each block and
++ * rewrites φ-operands accordingly.                                      */
++static void
+ emit_parallelcopies(cssa_ctx& ctx)
+ {
+-   std::unordered_map<uint32_t, Operand> renames;
++   const uint32_t max_temp_id = ctx.merge_node_table.size() ? (ctx.merge_node_table.size() - 1) : 0;
+ 
+-   /* we iterate backwards to prioritize coalescing in else-blocks */
+-   for (int i = ctx.program->blocks.size() - 1; i >= 0; i--) {
+-      if (ctx.parallelcopies[i].empty())
++   // Use sparse rename_map to avoid allocation of huge vector when temp ids are sparse.
++   rename_map_t rename_map;
++
++   for (int blk_idx = int(ctx.program->blocks.size()) - 1; blk_idx >= 0; --blk_idx) {
++      if (ctx.parallelcopies[blk_idx].empty()) {
+          continue;
++      }
++
++      std::vector<bool> coalesced(ctx.parallelcopies[blk_idx].size(), false);
++
++      /* ───────────────────────── Stage 1 : coalesce & fix liveness ─────────────────────── */
++      for (int reg_type_pass = 0; reg_type_pass < 2; ++reg_type_pass) {
++         RegType current_type = (reg_type_pass == 0) ? RegType::vgpr : RegType::sgpr;
++
++         for (unsigned n = 0; n < ctx.parallelcopies[blk_idx].size(); ++n) {
++            copy& cp = ctx.parallelcopies[blk_idx][n];
++            if (cp.def.regClass().type() != current_type || coalesced[n]) {
++               continue;
++            }
++
++            if (!try_coalesce_copy(ctx, cp, blk_idx)) {
++               continue;
++            }
+ 
+-      std::map<uint32_t, ltg_node> ltg;
+-      bool has_vgpr_copy = false;
+-      bool has_sgpr_copy = false;
+-
+-      /* first, try to coalesce all parallelcopies */
+-      for (copy& cp : ctx.parallelcopies[i]) {
+-         if (try_coalesce_copy(ctx, cp, i)) {
++            coalesced[n] = true;
+             assert(cp.op.isTemp() && cp.op.isKill());
+-            /* As this temp will be used as phi operand and becomes live-out,
+-             * remove the kill flag from any other copy of this same temp.
+-             */
+-            for (copy& other : ctx.parallelcopies[i]) {
+-               if (&other != &cp && other.op.isTemp() && other.op.getTemp() == cp.op.getTemp())
+-                  other.op.setKill(false);
+-            }
+-            renames.emplace(cp.def.tempId(), cp.op);
+-         } else {
+-            uint32_t read_idx = -1u;
+-            if (cp.op.isTemp()) {
+-               read_idx = ctx.merge_node_table[cp.op.tempId()].index;
+-               /* In case the original phi-operand was killed, it might still be live-out
+-                * if the logical successor is not the same as linear successors.
+-                * Thus, re-check whether the temp is live-out.
+-                */
+-               cp.op.setKill(cp.op.isKill() && !is_live_out(ctx, cp.op.getTemp(), i));
+-               cp.op.setFirstKill(cp.op.isKill());
+-            }
+-            uint32_t write_idx = ctx.merge_node_table[cp.def.tempId()].index;
+-            assert(write_idx != -1u);
+-            ltg[write_idx] = {&cp, read_idx};
+-
+-            bool is_vgpr = cp.def.regClass().type() == RegType::vgpr;
+-            has_vgpr_copy |= is_vgpr;
+-            has_sgpr_copy |= !is_vgpr;
++
++            for (copy& oth : ctx.parallelcopies[blk_idx]) {
++               if (&oth != &cp && oth.op.isTemp() && oth.op.getTemp() == cp.op.getTemp()) {
++                  oth.op.setKill(false);
++                  oth.op.setFirstKill(false);
++               }
++            }
++
++            // record rename as sparse mapping
++            if (cp.def.tempId() <= max_temp_id) {
++               rename_set(rename_map, cp.def.tempId(), cp.op);
++            }
+          }
+       }
+ 
+-      /* build location-transfer-graph */
+-      for (auto& pair : ltg) {
+-         if (pair.second.read_idx == -1u)
+-            continue;
+-         auto&& it = ltg.find(pair.second.read_idx);
+-         if (it != ltg.end())
+-            it->second.num_uses++;
++      /* ───────────────────────── Stage 2 : build LTG (unique key = dst Temp ID) ────────── */
++      // compute a block-local max temp id to allocate tight ltg arrays
++      uint32_t local_max_temp = 0;
++      for (unsigned n = 0; n < ctx.parallelcopies[blk_idx].size(); ++n) {
++         if (coalesced[n]) continue;
++         const copy& cp = ctx.parallelcopies[blk_idx][n];
++         uint32_t dst = cp.def.tempId();
++         local_max_temp = std::max(local_max_temp, dst);
++         if (cp.op.isTemp()) {
++            local_max_temp = std::max(local_max_temp, cp.op.tempId());
++         }
+       }
+ 
+-      /* emit parallelcopies ordered */
+-      Builder bld(ctx.program);
+-      Block& block = ctx.program->blocks[i];
++      // allocate tight LTG and validity bitmap
++      std::vector<ltg_node> ltg(local_max_temp + 1, ltg_node());
++      std::vector<char> ltg_valid(local_max_temp + 1, 0);
++      std::vector<uint32_t> active_keys;
++      active_keys.reserve(ctx.parallelcopies[blk_idx].size());
++      bool has_vgpr = false, has_sgpr = false;
++
++      for (unsigned n = 0; n < ctx.parallelcopies[blk_idx].size(); ++n) {
++         if (coalesced[n]) {
++            continue;
++         }
++
++         copy& cp = ctx.parallelcopies[blk_idx][n];
+ 
+-      if (has_vgpr_copy) {
+-         /* emit VGPR copies */
+-         auto IsLogicalEnd = [](const aco_ptr<Instruction>& inst) -> bool
+-         { return inst->opcode == aco_opcode::p_logical_end; };
+-         auto it =
+-            std::find_if(block.instructions.rbegin(), block.instructions.rend(), IsLogicalEnd);
+-         bld.reset(&block.instructions, std::prev(it.base()));
+-         emit_copies_block(bld, ltg, RegType::vgpr);
++         if (cp.op.isTemp()) {
++            uint32_t id = cp.op.tempId();
++            if (rename_has(rename_map, id)) {
++               Operand resolved = resolve_rename(rename_map, id);
++               if (!resolved.isUndefined())
++                  cp.op = resolved;
++               if (!cp.op.isTemp()) {
++                  // become immediate/fixed; we keep as-is
++               } else {
++                  id = cp.op.tempId();
++               }
++            }
++         }
++
++         if (cp.op.isTemp()) {
++            bool live_out = is_live_out(ctx, cp.op.getTemp(), blk_idx);
++            bool keep_kill = cp.op.isKill() && !live_out;
++            cp.op.setKill(keep_kill);
++            cp.op.setFirstKill(keep_kill);
++         }
++
++         uint32_t dst_key = cp.def.tempId();
++         uint32_t read_key = cp.op.isTemp() ? cp.op.tempId() : INVALID_IDX;
++
++         if (dst_key > local_max_temp) continue; // safety bound: should not happen
++         ltg[dst_key] = ltg_node(&cp, read_key);
++         ltg_valid[dst_key] = 1;
++         active_keys.push_back(dst_key);
++
++         bool is_vgpr = cp.def.regClass().type() == RegType::vgpr;
++         has_vgpr |= is_vgpr;
++         has_sgpr |= !is_vgpr;
++      }
++
++      for (uint32_t key : active_keys) {
++         if (key < ltg.size() && ltg_valid[key]) {
++            ltg_node& node = ltg[key];
++            if (node.read_key != INVALID_IDX && node.read_key < ltg.size() && ltg_valid[node.read_key] && ltg[node.read_key].cp != nullptr) {
++               ++ltg[node.read_key].num_uses;
++            }
++         }
+       }
+ 
+-      if (has_sgpr_copy) {
+-         /* emit SGPR copies */
+-         bld.reset(&block.instructions, std::prev(block.instructions.end()));
+-         emit_copies_block(bld, ltg, RegType::sgpr);
++      /* ───────────────────────── Stage 3 : emit copies ─────────────────────── */
++      Builder bld(ctx.program);
++      Block& blk = ctx.program->blocks[blk_idx];
++
++      if (has_vgpr) {
++         auto lg_end = std::find_if(
++            blk.instructions.rbegin(), blk.instructions.rend(),
++            [](const aco_ptr<Instruction>& ins) { return ins->opcode == aco_opcode::p_logical_end; });
++         auto insert_pt = (lg_end == blk.instructions.rend()) ? std::prev(blk.instructions.end())
++                                                              : std::prev(lg_end.base());
++         bld.reset(&blk.instructions, insert_pt);
++         emit_copies_block(bld, ltg, ltg_valid, active_keys, RegType::vgpr, rename_map);
++      }
++
++      if (has_sgpr) {
++         bld.reset(&blk.instructions, std::prev(blk.instructions.end()));
++         emit_copies_block(bld, ltg, ltg_valid, active_keys, RegType::sgpr, rename_map);
++      }
++
++      // Assert ltg consumed (all sentinels)
++      for (uint32_t key : active_keys) {
++         if (key < ltg.size() && ltg_valid[key]) {
++            // If something remains, it's a logic bug: assert in debug.
++            assert(!"emit_copies_block must consume all LTG nodes");
++            break;
++         }
+       }
+    }
+ 
+-   RegisterDemand new_demand;
+-   for (Block& block : ctx.program->blocks) {
+-      /* Finally, rename coalesced phi operands */
+-      for (aco_ptr<Instruction>& phi : block.instructions) {
+-         if (phi->opcode != aco_opcode::p_phi && phi->opcode != aco_opcode::p_linear_phi)
++   /* ───────────────────────── Rename φ operands & update demand ─────────────────────── */
++   RegisterDemand programme_demand;
++   for (Block& blk : ctx.program->blocks) {
++      for (aco_ptr<Instruction>& phi : blk.instructions) {
++         if (phi->opcode != aco_opcode::p_phi && phi->opcode != aco_opcode::p_linear_phi) {
+             break;
++         }
+ 
+          for (Operand& op : phi->operands) {
+-            if (!op.isTemp())
+-               continue;
+-            auto&& it = renames.find(op.tempId());
+-            if (it != renames.end()) {
+-               op = it->second;
+-               renames.erase(it);
++            if (op.isTemp()) {
++               uint32_t id = op.tempId();
++               // Use resolve_rename if mapping exists
++               if (rename_has(rename_map, id)) {
++                  Operand resolved = resolve_rename(rename_map, id);
++                  if (!resolved.isUndefined())
++                     op = resolved;
++               }
+             }
+          }
+       }
+ 
+-      /* Resummarize the block's register demand */
+-      block.register_demand = block.live_in_demand;
+-      for (const aco_ptr<Instruction>& instr : block.instructions)
+-         block.register_demand.update(instr->register_demand);
+-      new_demand.update(block.register_demand);
+-   }
+-
+-   /* Update max_reg_demand and num_waves */
+-   update_vgpr_sgpr_demand(ctx.program, new_demand);
++      blk.register_demand = blk.live_in_demand;
++      for (const auto& ins : blk.instructions) {
++         blk.register_demand.update(ins->register_demand);
++      }
+ 
+-   assert(renames.empty());
++      programme_demand.update(blk.register_demand);
++   }
++   update_vgpr_sgpr_demand(ctx.program, programme_demand);
+ }
+ 
+-} /* end namespace */
++} // namespace
+ 
+ void
+ lower_to_cssa(Program* program)
+ {
+    reindex_ssa(program);
+-   cssa_ctx ctx = {program};
++
++   cssa_ctx ctx{program};
+    collect_parallelcopies(ctx);
+    emit_parallelcopies(ctx);
+ 
+-   /* Validate live variable information */
+-   if (!validate_live_vars(program))
+-      abort();
++   if (!validate_live_vars(program)) {
++      std::abort();
++   }
+ }
++
+ } // namespace aco
