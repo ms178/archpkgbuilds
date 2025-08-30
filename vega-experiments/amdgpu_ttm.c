@@ -41,10 +41,8 @@
 #include <linux/dma-buf.h>
 #include <linux/sizes.h>
 #include <linux/module.h>
-#include <linux/dma-fence-array.h>
 
 #include <drm/drm_drv.h>
-#include <drm/gpu_scheduler.h>
 #include <drm/ttm/ttm_bo.h>
 #include <drm/ttm/ttm_placement.h>
 #include <drm/ttm/ttm_range_manager.h>
@@ -65,46 +63,7 @@
 
 MODULE_IMPORT_NS("DMA_BUF");
 
-/* ---------------------------------------------------------------------- */
-/*  Forward declarations                                                  */
-/* ---------------------------------------------------------------------- */
-static int amdgpu_copy_buffer_multi(struct amdgpu_device *adev,
-									struct drm_gpu_scheduler **scheds,
-									unsigned int numscheds,
-									u64 src, u64 dst, u64 bytes,
-									u32 copy_flags,
-									struct dma_resv *resv,
-									struct dma_fence **fence_out);
-
-/*
- * Submit one copy either in parallel (when the multi-ring entity is ready)
- * or on the legacy SDMA-0 path.  On error @err is set to the errno and
- * @fence_var unchanged.  On success @fence_var receives a ref-counted fence.
- */
-#define TTM_DO_COPY_PARALLEL(adev, src, dst, sz, flags, resv, fence_var, err) \
-do {								\
-	if (amdgpu_ttm_entity_initialized &&			\
-		(adev)->sdma.num_instances > 1) {			\
-			err = amdgpu_copy_buffer_multi(		\
-			(adev), amdgpu_ttm_scheds,		\
-			(adev)->sdma.num_instances,		\
-			(src), (dst), (sz), (flags), (resv),	\
-			&(fence_var));				\
-		} else {						\
-			err = amdgpu_copy_buffer(			\
-			(adev)->mman.buffer_funcs_ring,		\
-			(src), (dst), (u32)(sz), (resv),		\
-			&(fence_var), false, true, (flags));	\
-		}							\
-} while (0)
-
-#define AMDGPU_TTM_CHUNK_VEGA64	(512ULL << 20)	/* 512 MiB burst size */
 #define AMDGPU_TTM_VRAM_MAX_DW_READ	((size_t)128)
-#define STRIPE_THRESHOLD	(128ULL << 20)	/* 128 MiB */
-
-static struct drm_sched_entity amdgpu_ttm_sched_entity;
-static struct drm_gpu_scheduler **amdgpu_ttm_scheds;
-static bool amdgpu_ttm_entity_initialized;
 
 static int amdgpu_ttm_backend_bind(struct ttm_device *bdev,
 				   struct ttm_tt *ttm,
@@ -120,40 +79,22 @@ static int amdgpu_ttm_init_on_chip(struct amdgpu_device *adev,
 				  false, size_in_page);
 }
 
-static __always_inline u64 vega_ttm_chunk_bytes(struct amdgpu_device *adev)
-{
-	return (adev->asic_type == CHIP_VEGA10) ? (512ULL << 20) : (256ULL << 20);
-}
-
 static __always_inline void gtt_window_lock_fast(struct amdgpu_device *adev)
 {
-	/* uncontended: take mutex immediately */
 	if (likely(mutex_trylock(&adev->mman.gtt_window_lock)))
 		return;
-
-	/* contended: sleep until owner releases */
 	mutex_lock(&adev->mman.gtt_window_lock);
 }
 
-/*
- * Make sure SDMA “buffer functions” are enabled when possible.
- * Preconditions now include:
- *   – buffer_funcs_ring exists
- *   – its scheduler reports at least one run‑queue
- *   – the ring is marked ready
- * This guarantees drm_sched_entity_init() will succeed.
- */
-static void amdgpu_ttm_auto_enable_buffer_funcs(struct amdgpu_device *adev)
+static __always_inline u64 amdgpu_ttm_chunk_bytes(struct amdgpu_device *adev)
 {
-	struct amdgpu_ring *ring;
-
-	if (adev->mman.buffer_funcs_enabled || (adev->flags & AMD_IS_APU))
-		return;
-
-	ring = READ_ONCE(adev->mman.buffer_funcs_ring);
-	if (ring && READ_ONCE(ring->sched.ready)) {
-		DRM_DEBUG_DRIVER("amdgpu_ttm: enabling SDMA buffer functions\n");
-		amdgpu_ttm_set_buffer_funcs_status(adev, true);
+	switch (adev->asic_type) {
+	case CHIP_VEGA10:
+	case CHIP_VEGA12:
+	case CHIP_VEGA20:
+		return 512ULL << 20; /* 512 MiB */
+	default:
+		return 256ULL << 20; /* 256 MiB */
 	}
 }
 
@@ -239,7 +180,7 @@ static void amdgpu_evict_flags(struct ttm_buffer_object *bo,
 	*placement = abo->placement;
 }
 
-/**
+/*
  * amdgpu_ttm_map_buffer - Map memory into the GART windows
  * @bo: buffer object to map
  * @mem: memory object to map
@@ -252,209 +193,228 @@ static void amdgpu_evict_flags(struct ttm_buffer_object *bo,
  *
  * Setup one of the GART windows to access a specific piece of memory or return
  * the physical address for local memory.
+ *
+ * Vega-safe and upstream-compatible improvements:
+ *  - Upload exactly the PTE bytes (8B per GPU page) in copy_max_bytes chunks.
+ *  - Align the inline PTE payload in the IB to 8 bytes.
+ *  - Avoids SDMA packet overruns and preserves ordering (high_pr entity).
  */
-/* completely replace the existing body */
 static int amdgpu_ttm_map_buffer(struct ttm_buffer_object *bo,
-								 struct ttm_resource *mem,
-								 struct amdgpu_res_cursor *mm_cur,
-								 unsigned int window,
-								 struct amdgpu_ring *ring,
-								 bool tmz,          /* TMZ mapping wanted   */
-								 u64  *size,        /* in/out: bytes        */
-								 u64  *addr)        /* out  : gpu address   */
+				 struct ttm_resource *mem,
+				 struct amdgpu_res_cursor *mm_cur,
+				 unsigned int window, struct amdgpu_ring *ring,
+				 bool tmz, uint64_t *size, uint64_t *addr)
 {
 	struct amdgpu_device *adev = ring->adev;
-	unsigned int off_in_pg, num_pages, num_dw;
-	u64 flags, src_addr, dst_addr;
-	struct amdgpu_job *job        = NULL;
+	unsigned int offset, num_pages;
+	u64 src_addr, dst_addr;
+	u64 pte_bytes, copied;
+	u32 max_bytes;
+	u32 loops, num_dw;         /* command DWs */
+	u32 ib_cmd_bytes;          /* bytes used by commands */
+	u32 pte_off;               /* byte offset of inline PTE payload */
+	u32 total_ib_bytes;        /* total IB size: commands + PTE payload */
+	struct amdgpu_job *job = NULL;
 	void *cpu_addr;
+	u64 flags;
+	unsigned int i;
 	int r;
 
-	/* ------------------------------------------------------------------
-	 * Preconditions
-	 * ------------------------------------------------------------------
-	 */
-	if (WARN_ON(adev->mman.buffer_funcs->copy_max_bytes <
-		AMDGPU_GTT_MAX_TRANSFER_SIZE * 8))
+	if (WARN_ON(!bo || !mem || !mm_cur || !size || !addr || !ring))
 		return -EINVAL;
 
 	if (WARN_ON(mem->mem_type == AMDGPU_PL_PREEMPT))
 		return -EINVAL;
 
-	/* VRAM that is directly visible → no GART window needed          */
+	/* Direct VRAM access path if not TMZ */
 	if (!tmz && mem->start != AMDGPU_BO_INVALID_OFFSET) {
-		*addr = amdgpu_ttm_domain_start(adev, mem->mem_type) +
-		mm_cur->start;
+		*addr = amdgpu_ttm_domain_start(adev, mem->mem_type) + mm_cur->start;
 		return 0;
 	}
 
-	/* ------------------------------------------------------------------
-	 * Window size / page calculations
-	 * ------------------------------------------------------------------
-	 */
-	off_in_pg = mm_cur->start & ~PAGE_MASK;
-	num_pages = PFN_UP(*size + off_in_pg);
-	num_pages = min_t(unsigned int, num_pages,
-					  AMDGPU_GTT_MAX_TRANSFER_SIZE);
-
-	/* shrink @size when the window cannot map it completely          */
-	*size     = min(*size,
-					(u64)num_pages * PAGE_SIZE - off_in_pg);
-	if (WARN_ON(*size == 0))
-		return -EINVAL;
-
-	if (WARN_ON(*size > U32_MAX))
+	offset = mm_cur->start & ~PAGE_MASK;
+	if (*size > (U64_MAX - offset))
 		return -E2BIG;
 
-	/* ------------------------------------------------------------------
-	 * Allocate temporary IB that carries the PTEs + copy packet
-	 *   bytes   = job header             (num_dw * 4)
-	 *            + num_pages PTEs        ( 8 bytes / page)
-	 * ------------------------------------------------------------------
-	 */
-	num_dw = ALIGN(adev->mman.buffer_funcs->copy_num_dw, 8);
+	num_pages = PFN_UP(*size + offset);
+	num_pages = min_t(u32, num_pages, AMDGPU_GTT_MAX_TRANSFER_SIZE);
+
+	*size = min_t(u64, *size, (u64)num_pages * PAGE_SIZE - offset);
+	if (unlikely(*size == 0))
+		return -EINVAL;
+
+	*addr = adev->gmc.gart_start +
+		(u64)window * (u64)AMDGPU_GTT_MAX_TRANSFER_SIZE *
+		(u64)AMDGPU_GPU_PAGE_SIZE + (u64)offset;
+
+	max_bytes = adev->mman.buffer_funcs->copy_max_bytes;
+	pte_bytes = (u64)num_pages * 8ULL * AMDGPU_GPU_PAGES_IN_CPU_PAGE;
+	loops = DIV_ROUND_UP_ULL(pte_bytes, max_bytes);
+	num_dw = ALIGN(loops * adev->mman.buffer_funcs->copy_num_dw, 8);
+	ib_cmd_bytes = num_dw * 4;
+	pte_off = ALIGN(ib_cmd_bytes, 8);
+
+	if (pte_bytes > U32_MAX || pte_off > U32_MAX ||
+	    (u64)pte_off + pte_bytes > U32_MAX)
+		return -E2BIG;
+
+	total_ib_bytes = pte_off + (u32)pte_bytes;
+
 	r = amdgpu_job_alloc_with_ib(adev, &adev->mman.high_pr,
-								 AMDGPU_FENCE_OWNER_UNDEFINED,
-							  num_dw * 4 + num_pages * 8,
-							  AMDGPU_IB_POOL_DELAYED, &job);
+				     AMDGPU_FENCE_OWNER_UNDEFINED,
+				     total_ib_bytes,
+				     AMDGPU_IB_POOL_DELAYED, &job);
 	if (r)
 		return r;
 
-	src_addr = job->ibs[0].gpu_addr + num_dw * 4;
 	dst_addr = amdgpu_bo_gpu_offset(adev->gart.bo) +
-	window * AMDGPU_GTT_MAX_TRANSFER_SIZE * 8;
+		   (u64)window * (u64)AMDGPU_GTT_MAX_TRANSFER_SIZE * 8ULL;
+	src_addr = job->ibs[0].gpu_addr + pte_off;
 
-	amdgpu_emit_copy_buffer(adev, &job->ibs[0],
-							src_addr, dst_addr,
-						 (u32)*size, 0);
-
-	amdgpu_ring_pad_ib(ring, &job->ibs[0]);
-	WARN_ON(job->ibs[0].length_dw > num_dw);
-
-	/* ------------------------------------------------------------------
-	 * Build PTEs
-	 * ------------------------------------------------------------------
-	 */
 	flags = amdgpu_ttm_tt_pte_flags(adev, bo->ttm, mem);
 	if (tmz)
 		flags |= AMDGPU_PTE_TMZ;
 
-	cpu_addr = &job->ibs[0].ptr[num_dw];
+	cpu_addr = (void *)((u8 *)job->ibs[0].ptr + pte_off);
 
 	if (mem->mem_type == TTM_PL_TT) {
-		dma_addr_t *daddr = &bo->ttm->dma_address[mm_cur->start >>
-		PAGE_SHIFT];
-		amdgpu_gart_map(adev, 0, num_pages, daddr, flags, cpu_addr);
-	} else { /* VRAM – build linear DMA addresses                       */
-		dma_addr_t dma = mm_cur->start + adev->vm_manager.vram_base_offset;
-		unsigned int i;
+		dma_addr_t *dma_addr;
+
+		if (!bo->ttm || !bo->ttm->dma_address) {
+			amdgpu_job_free(job);
+			return -EINVAL;
+		}
+
+		dma_addr = &bo->ttm->dma_address[mm_cur->start >> PAGE_SHIFT];
+		amdgpu_gart_map(adev, 0, num_pages, dma_addr, flags, cpu_addr);
+	} else if (mem->mem_type == TTM_PL_VRAM) {
+		dma_addr_t dma_address = mm_cur->start + adev->vm_manager.vram_base_offset;
 
 		for (i = 0; i < num_pages; ++i) {
-			amdgpu_gart_map(adev, i << PAGE_SHIFT, 1, &dma,
-							flags, cpu_addr);
-			dma += PAGE_SIZE;
+			amdgpu_gart_map(adev, (u64)i << PAGE_SHIFT, 1,
+					&dma_address, flags, cpu_addr);
+			dma_address += PAGE_SIZE;
 		}
+	} else {
+		amdgpu_job_free(job);
+		return -EINVAL;
 	}
 
-	dma_fence_put(amdgpu_job_submit(job));
+	copied = 0;
+	while (copied < pte_bytes) {
+		u32 cur = min_t(u64, pte_bytes - copied, max_bytes);
 
-	/* final GPU address inside the chosen window                     */
-	*addr = adev->gmc.gart_start +
-	(u64)window * AMDGPU_GTT_MAX_TRANSFER_SIZE *
-	AMDGPU_GPU_PAGE_SIZE + off_in_pg;
+		amdgpu_emit_copy_buffer(adev, &job->ibs[0],
+					src_addr + copied,
+					dst_addr + copied,
+					cur, 0);
+		copied += cur;
+	}
+
+	amdgpu_ring_pad_ib(ring, &job->ibs[0]);
+	WARN_ON(job->ibs[0].length_dw > num_dw);
+
+	dma_fence_put(amdgpu_job_submit(job));
 	return 0;
 }
 
+/**
+ * amdgpu_ttm_copy_mem_to_mem - Helper function for copy
+ * @adev: amdgpu device
+ * @src: buffer/address where to read from
+ * @dst: buffer/address where to write to
+ * @size: number of bytes to copy
+ * @tmz: if a secure copy should be used
+ * @resv: resv object to sync to
+ * @f: Returns the last fence if multiple jobs are submitted.
+ *
+ * The function copies @size bytes from {src->mem + src->offset} to
+ * {dst->mem + dst->offset}. src->bo and dst->bo could be same BO for a
+ * move and different for a BO to BO copy.
+ *
+ * Optimization (Idea #4):
+ *  - Use gtt_window_lock_fast() to reduce uncontended lock overhead.
+ */
 int amdgpu_ttm_copy_mem_to_mem(struct amdgpu_device *adev,
-							   const struct amdgpu_copy_mem *src,
-							   const struct amdgpu_copy_mem *dst,
-							   u64 size, bool tmz,
-							   struct dma_resv *resv,
-							   struct dma_fence **fence_out)
+			       const struct amdgpu_copy_mem *src,
+			       const struct amdgpu_copy_mem *dst,
+			       uint64_t size, bool tmz,
+			       struct dma_resv *resv,
+			       struct dma_fence **f)
 {
 	struct amdgpu_ring *ring = adev->mman.buffer_funcs_ring;
 	struct amdgpu_res_cursor src_mm, dst_mm;
 	struct dma_fence *fence = NULL;
-	u32 copy_flags = 0;
 	int r = 0;
+	uint32_t copy_flags = 0;
+	struct amdgpu_bo *abo_src, *abo_dst;
 
-	/* Sanity ---------------------------------------------------------------- */
-	if (!ring || !ring->sched.ready || !adev->mman.buffer_funcs_enabled)
+	if (!adev->mman.buffer_funcs_enabled) {
+		DRM_ERROR("Trying to move memory with ring turned off.\n");
 		return -EINVAL;
+	}
 
-	if (!src || !dst || !src->bo || !dst->bo || !src->mem || !dst->mem)
-		return -EINVAL;
+	amdgpu_res_first(src->mem, src->offset, size, &src_mm);
+	amdgpu_res_first(dst->mem, dst->offset, size, &dst_mm);
 
-	/* Flags ----------------------------------------------------------------- */
-	if (tmz)
-		copy_flags |= AMDGPU_COPY_FLAGS_TMZ;
+	gtt_window_lock_fast(adev);
+	while (src_mm.remaining) {
+		uint64_t from, to, cur_size, tiling_flags;
+		uint32_t num_type, data_format, max_com, write_compress_disable;
+		struct dma_fence *next;
 
-	if ((ttm_to_amdgpu_bo(src->bo)->flags & AMDGPU_GEM_CREATE_GFX12_DCC) &&
-		src->mem->mem_type == TTM_PL_VRAM)
-		copy_flags |= AMDGPU_COPY_FLAGS_READ_DECOMPRESSED;
+		/* Never copy more than 256MiB at once to avoid a timeout */
+		cur_size = min3(src_mm.size, dst_mm.size, 256ULL << 20);
 
-	if ((ttm_to_amdgpu_bo(dst->bo)->flags & AMDGPU_GEM_CREATE_GFX12_DCC) &&
-		dst->mem->mem_type == TTM_PL_VRAM) {
-		u64 tiling_flags;
-	u32 mc, nt, df, wcd;
+		/* Map src to window 0 and dst to window 1. */
+		r = amdgpu_ttm_map_buffer(src->bo, src->mem, &src_mm,
+					  0, ring, tmz, &cur_size, &from);
+		if (r)
+			goto error;
 
-	amdgpu_bo_get_tiling_flags(ttm_to_amdgpu_bo(dst->bo),
-							   &tiling_flags);
-	mc  = AMDGPU_TILING_GET(tiling_flags,
-							GFX12_DCC_MAX_COMPRESSED_BLOCK);
-	nt  = AMDGPU_TILING_GET(tiling_flags,
-							GFX12_DCC_NUMBER_TYPE);
-	df  = AMDGPU_TILING_GET(tiling_flags,
-							GFX12_DCC_DATA_FORMAT);
-	wcd = AMDGPU_TILING_GET(tiling_flags,
-							GFX12_DCC_WRITE_COMPRESS_DISABLE);
+		r = amdgpu_ttm_map_buffer(dst->bo, dst->mem, &dst_mm,
+					  1, ring, tmz, &cur_size, &to);
+		if (r)
+			goto error;
 
-	copy_flags |= AMDGPU_COPY_FLAGS_WRITE_COMPRESSED           |
-	AMDGPU_COPY_FLAGS_SET(MAX_COMPRESSED, mc)     |
-	AMDGPU_COPY_FLAGS_SET(NUMBER_TYPE,  nt)       |
-	AMDGPU_COPY_FLAGS_SET(DATA_FORMAT,  df)       |
-	AMDGPU_COPY_FLAGS_SET(WRITE_COMPRESS_DISABLE, wcd);
+		abo_src = ttm_to_amdgpu_bo(src->bo);
+		abo_dst = ttm_to_amdgpu_bo(dst->bo);
+		if (tmz)
+			copy_flags |= AMDGPU_COPY_FLAGS_TMZ;
+		if ((abo_src->flags & AMDGPU_GEM_CREATE_GFX12_DCC) &&
+		    (abo_src->tbo.resource->mem_type == TTM_PL_VRAM))
+			copy_flags |= AMDGPU_COPY_FLAGS_READ_DECOMPRESSED;
+		if ((abo_dst->flags & AMDGPU_GEM_CREATE_GFX12_DCC) &&
+		    (dst->mem->mem_type == TTM_PL_VRAM)) {
+			copy_flags |= AMDGPU_COPY_FLAGS_WRITE_COMPRESSED;
+			amdgpu_bo_get_tiling_flags(abo_dst, &tiling_flags);
+			max_com = AMDGPU_TILING_GET(tiling_flags, GFX12_DCC_MAX_COMPRESSED_BLOCK);
+			num_type = AMDGPU_TILING_GET(tiling_flags, GFX12_DCC_NUMBER_TYPE);
+			data_format = AMDGPU_TILING_GET(tiling_flags, GFX12_DCC_DATA_FORMAT);
+			write_compress_disable =
+				AMDGPU_TILING_GET(tiling_flags, GFX12_DCC_WRITE_COMPRESS_DISABLE);
+			copy_flags |= (AMDGPU_COPY_FLAGS_SET(MAX_COMPRESSED, max_com) |
+				       AMDGPU_COPY_FLAGS_SET(NUMBER_TYPE, num_type) |
+				       AMDGPU_COPY_FLAGS_SET(DATA_FORMAT, data_format) |
+				       AMDGPU_COPY_FLAGS_SET(WRITE_COMPRESS_DISABLE,
+							     write_compress_disable));
 		}
 
-		/* Chunked processing ---------------------------------------------------- */
-		amdgpu_res_first(src->mem, src->offset, size, &src_mm);
-		amdgpu_res_first(dst->mem, dst->offset, size, &dst_mm);
+		r = amdgpu_copy_buffer(ring, from, to, (u32)cur_size, resv,
+				       &next, false, true, copy_flags);
+		if (r)
+			goto error;
 
-		gtt_window_lock_fast(adev);
+		dma_fence_put(fence);
+		fence = next;
 
-		while (src_mm.remaining) {
-			u64 cur_size = min3(src_mm.size, dst_mm.size, 256ULL << 20);
-			u64 from, to;
-			struct dma_fence *next = NULL;
-
-			/* map source / destination windows */
-			r = amdgpu_ttm_map_buffer(src->bo, src->mem, &src_mm, 0, ring,
-									  tmz, &cur_size, &from);
-			if (r)
-				break;
-
-			r = amdgpu_ttm_map_buffer(dst->bo, dst->mem, &dst_mm, 1, ring,
-									  tmz, &cur_size, &to);
-			if (r)
-				break;
-
-			/* issue copy (parallel when possible) */
-			TTM_DO_COPY_PARALLEL(adev, from, to, cur_size,
-								 copy_flags, resv, next, r);
-			if (r)
-				break;
-
-			dma_fence_put(fence);
-			fence = next;
-
-			amdgpu_res_next(&src_mm, cur_size);
-			amdgpu_res_next(&dst_mm, cur_size);
-		}
-
-		mutex_unlock(&adev->mman.gtt_window_lock);
-
-		if (fence_out)
-			*fence_out = dma_fence_get(fence);
+		amdgpu_res_next(&src_mm, cur_size);
+		amdgpu_res_next(&dst_mm, cur_size);
+	}
+error:
+	mutex_unlock(&adev->mman.gtt_window_lock);
+	if (f)
+		*f = dma_fence_get(fence);
 	dma_fence_put(fence);
 	return r;
 }
@@ -464,11 +424,12 @@ int amdgpu_ttm_copy_mem_to_mem(struct amdgpu_device *adev,
  *
  * This is a helper called by amdgpu_bo_move() and amdgpu_move_vram_ram() to
  * help move buffers to and from VRAM.
+ *
  */
 static int amdgpu_move_blit(struct ttm_buffer_object *bo,
-							bool evict,
-							struct ttm_resource *new_mem,
-							struct ttm_resource *old_mem)
+			    bool evict,
+			    struct ttm_resource *new_mem,
+			    struct ttm_resource *old_mem)
 {
 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->bdev);
 	struct amdgpu_ring   *ring = adev->mman.buffer_funcs_ring;
@@ -494,20 +455,21 @@ static int amdgpu_move_blit(struct ttm_buffer_object *bo,
 		struct dma_fence *next = NULL;
 
 		r = amdgpu_ttm_map_buffer(bo, old_mem, &src_mm, 0, ring,
-								  amdgpu_bo_encrypted(ttm_to_amdgpu_bo(bo)),
-								  &cur_size, &from);
+					  amdgpu_bo_encrypted(ttm_to_amdgpu_bo(bo)),
+					  &cur_size, &from);
 		if (r)
 			break;
 
 		r = amdgpu_ttm_map_buffer(bo, new_mem, &dst_mm, 1, ring,
-								  amdgpu_bo_encrypted(ttm_to_amdgpu_bo(bo)),
-								  &cur_size, &to);
+					  amdgpu_bo_encrypted(ttm_to_amdgpu_bo(bo)),
+					  &cur_size, &to);
 		if (r)
 			break;
 
-		TTM_DO_COPY_PARALLEL(adev, from, to, cur_size,
-							 copy_flags, bo->base.resv,
-					   next, r);
+		/* Schedule the copy buffer */
+		r = amdgpu_copy_buffer(ring, from, to, (u32)cur_size,
+				       bo->base.resv, &next,
+				       false, true, copy_flags);
 		if (r)
 			break;
 
@@ -522,11 +484,9 @@ static int amdgpu_move_blit(struct ttm_buffer_object *bo,
 
 	if (!r) {
 		if (bo->type == ttm_bo_type_kernel)
-			r = ttm_bo_move_accel_cleanup(bo, fence,
-										  true, false, new_mem);
-			else
-				r = ttm_bo_move_accel_cleanup(bo, fence,
-											  evict, true, new_mem);
+			r = ttm_bo_move_accel_cleanup(bo, fence, true, false, new_mem);
+		else
+			r = ttm_bo_move_accel_cleanup(bo, fence, evict, true, new_mem);
 	}
 
 	dma_fence_put(fence);
@@ -584,130 +544,115 @@ static bool amdgpu_res_copyable(struct amdgpu_device *adev,
 	return true;
 }
 
-/**
- * amdgpu_bo_move - move a BO to a new memory location
- * @bo: The buffer object to move.
- * @evict: Whether this move is an eviction.
- * @ctx: The TTM operation context.
- * @new_mem: The new memory resource to move to.
- * @hop: TTM placement hop info for multi-hop moves.
+/*
+ * amdgpu_bo_move - Move a buffer object to a new memory location
  *
- * This function handles the movement of buffer objects between different
- * memory types. It now uses a dedicated, high-priority scheduler entity
- * that can run on both SDMA rings in parallel, allowing the hardware
- * scheduler to manage the copy with maximum efficiency and throughput.
- *
- * Return: 0 on success, negative error code on failure.
+ * Called by ttm_bo_handle_move_mem()
  */
-static int amdgpu_bo_move(struct ttm_buffer_object *bo,
-						  bool evict,
-						  struct ttm_operation_ctx *ctx,
-						  struct ttm_resource *new_mem,
-						  struct ttm_place *hop)
+static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+			  struct ttm_operation_ctx *ctx,
+			  struct ttm_resource *new_mem,
+			  struct ttm_place *hop)
 {
-	struct amdgpu_device	*adev    = amdgpu_ttm_adev(bo->bdev);
-	struct amdgpu_bo	*abo     = ttm_to_amdgpu_bo(bo);
-	struct ttm_resource	*old_mem = bo->resource;
-	bool			 have_sdma;
-	int			 r;
+	struct amdgpu_device *adev;
+	struct amdgpu_bo *abo;
+	struct ttm_resource *old_mem = bo->resource;
+	int r;
 
-	amdgpu_ttm_auto_enable_buffer_funcs(adev);
-
-	/*
-	 * Fast paths that involve no data copy
-	 */
 	if (new_mem->mem_type == TTM_PL_TT ||
-		new_mem->mem_type == AMDGPU_PL_PREEMPT) {
+	    new_mem->mem_type == AMDGPU_PL_PREEMPT) {
 		r = amdgpu_ttm_backend_bind(bo->bdev, bo->ttm, new_mem);
-	if (r)
-		return r;
-		}
+		if (r)
+			return r;
+	}
 
-		if (!old_mem ||
-			(old_mem->mem_type == TTM_PL_SYSTEM && !bo->ttm)) {
-			amdgpu_bo_move_notify(bo, evict, new_mem);
+	abo = ttm_to_amdgpu_bo(bo);
+	adev = amdgpu_ttm_adev(bo->bdev);
+
+	if (!old_mem || (old_mem->mem_type == TTM_PL_SYSTEM &&
+			 bo->ttm == NULL)) {
+		amdgpu_bo_move_notify(bo, evict, new_mem);
 		ttm_bo_move_null(bo, new_mem);
-	return 0;
-			}
+		return 0;
+	}
+	if (old_mem->mem_type == TTM_PL_SYSTEM &&
+	    (new_mem->mem_type == TTM_PL_TT ||
+	     new_mem->mem_type == AMDGPU_PL_PREEMPT)) {
+		amdgpu_bo_move_notify(bo, evict, new_mem);
+		ttm_bo_move_null(bo, new_mem);
+		return 0;
+	}
+	if ((old_mem->mem_type == TTM_PL_TT ||
+	     old_mem->mem_type == AMDGPU_PL_PREEMPT) &&
+	    new_mem->mem_type == TTM_PL_SYSTEM) {
+		r = ttm_bo_wait_ctx(bo, ctx);
+		if (r)
+			return r;
 
-			if (old_mem->mem_type == TTM_PL_SYSTEM &&
-				(new_mem->mem_type == TTM_PL_TT ||
-				new_mem->mem_type == AMDGPU_PL_PREEMPT)) {
-				amdgpu_bo_move_notify(bo, evict, new_mem);
-			ttm_bo_move_null(bo, new_mem);
-			return 0;
-				}
+		amdgpu_ttm_backend_unbind(bo->bdev, bo->ttm);
+		amdgpu_bo_move_notify(bo, evict, new_mem);
+		ttm_resource_free(bo, &bo->resource);
+		ttm_bo_assign_mem(bo, new_mem);
+		return 0;
+	}
 
-				if ((old_mem->mem_type == TTM_PL_TT ||
-					old_mem->mem_type == AMDGPU_PL_PREEMPT) &&
-					new_mem->mem_type == TTM_PL_SYSTEM) {
-					r = ttm_bo_wait_ctx(bo, ctx);
-				if (r) {
-					return r;
-				}
+	if (old_mem->mem_type == AMDGPU_PL_GDS ||
+	    old_mem->mem_type == AMDGPU_PL_GWS ||
+	    old_mem->mem_type == AMDGPU_PL_OA ||
+	    old_mem->mem_type == AMDGPU_PL_DOORBELL ||
+	    new_mem->mem_type == AMDGPU_PL_GDS ||
+	    new_mem->mem_type == AMDGPU_PL_GWS ||
+	    new_mem->mem_type == AMDGPU_PL_OA ||
+	    new_mem->mem_type == AMDGPU_PL_DOORBELL) {
+		/* Nothing to save here */
+		amdgpu_bo_move_notify(bo, evict, new_mem);
+		ttm_bo_move_null(bo, new_mem);
+		return 0;
+	}
 
-				amdgpu_ttm_backend_unbind(bo->bdev, bo->ttm);
-				amdgpu_bo_move_notify(bo, evict, new_mem);
-				ttm_resource_free(bo, &bo->resource);
-				ttm_bo_assign_mem(bo, new_mem);
-				return 0;
-					}
+	if (bo->type == ttm_bo_type_device &&
+	    new_mem->mem_type == TTM_PL_VRAM &&
+	    old_mem->mem_type != TTM_PL_VRAM) {
+		/* amdgpu_bo_fault_reserve_notify will re-set this if the CPU
+		 * accesses the BO after it's moved.
+		 */
+		abo->flags &= ~AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
+	}
 
-					if (old_mem->mem_type == AMDGPU_PL_GDS ||
-						old_mem->mem_type == AMDGPU_PL_GWS ||
-						old_mem->mem_type == AMDGPU_PL_OA  ||
-						old_mem->mem_type == AMDGPU_PL_DOORBELL ||
-						new_mem->mem_type == AMDGPU_PL_GDS ||
-						new_mem->mem_type == AMDGPU_PL_GWS ||
-						new_mem->mem_type == AMDGPU_PL_OA  ||
-						new_mem->mem_type == AMDGPU_PL_DOORBELL) {
-						amdgpu_bo_move_notify(bo, evict, new_mem);
-					ttm_bo_move_null(bo, new_mem);
-					return 0;
-						}
+	if (adev->mman.buffer_funcs_enabled &&
+	    ((old_mem->mem_type == TTM_PL_SYSTEM &&
+	      new_mem->mem_type == TTM_PL_VRAM) ||
+	     (old_mem->mem_type == TTM_PL_VRAM &&
+	      new_mem->mem_type == TTM_PL_SYSTEM))) {
+		hop->fpfn = 0;
+		hop->lpfn = 0;
+		hop->mem_type = TTM_PL_TT;
+		hop->flags = TTM_PL_FLAG_TEMPORARY;
+		return -EMULTIHOP;
+	}
 
-						if (bo->type == ttm_bo_type_device &&
-							new_mem->mem_type == TTM_PL_VRAM &&
-							old_mem->mem_type != TTM_PL_VRAM)
-							abo->flags &= ~AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
-
-						/* visible-VRAM boundary crossing → temporary TT hop */
-						if (adev->mman.buffer_funcs_enabled &&
-							((old_mem->mem_type == TTM_PL_SYSTEM &&
-							new_mem->mem_type == TTM_PL_VRAM) ||
-							(old_mem->mem_type == TTM_PL_VRAM &&
-							new_mem->mem_type == TTM_PL_SYSTEM))) {
-							hop->fpfn	= 0;
-						hop->lpfn	= 0;
-						hop->mem_type	= TTM_PL_TT;
-						hop->flags	= TTM_PL_FLAG_TEMPORARY;
-						return -EMULTIHOP;
-							}
-
-							amdgpu_bo_move_notify(bo, evict, new_mem);
-
-							have_sdma = adev->mman.buffer_funcs_enabled;
-							if (have_sdma)
-								r = amdgpu_move_blit(bo, evict, new_mem, old_mem);
+	amdgpu_bo_move_notify(bo, evict, new_mem);
+	if (adev->mman.buffer_funcs_enabled)
+		r = amdgpu_move_blit(bo, evict, new_mem, old_mem);
 	else
 		r = -ENODEV;
 
-	/* memcpy fallback */
 	if (r) {
+		/* Check that all memory is CPU accessible */
 		if (!amdgpu_res_copyable(adev, old_mem) ||
-			!amdgpu_res_copyable(adev, new_mem)) {
-			pr_err("amdgpu: BO move failed – SDMA unavailable and memcpy not possible\n");
-		return r;
-			}
+		    !amdgpu_res_copyable(adev, new_mem)) {
+			pr_err("Move buffer fallback to memcpy unavailable\n");
+			return r;
+		}
 
-			r = ttm_bo_move_memcpy(bo, ctx, new_mem);
-			if (r)
-				return r;
+		r = ttm_bo_move_memcpy(bo, ctx, new_mem);
+		if (r)
+			return r;
 	}
 
+	/* update statistics after the move */
 	if (evict)
 		atomic64_inc(&adev->num_evictions);
-
 	atomic64_add(bo->base.size, &adev->num_bytes_moved);
 	return 0;
 }
@@ -811,6 +756,10 @@ struct amdgpu_ttm_tt {
  *
  * Calling function must call amdgpu_ttm_tt_userptr_range_done() once and only
  * once afterwards to stop HMM tracking
+ *
+ * Improvement:
+ *  - Better diagnostics on -EPERM to guide userspace about long-term pinning
+ *    restrictions with writable mappings (COW/DAX/RO).
  */
 int amdgpu_ttm_tt_get_user_pages(struct amdgpu_bo *bo, struct page **pages,
 				 struct hmm_range **range)
@@ -842,7 +791,7 @@ int amdgpu_ttm_tt_get_user_pages(struct amdgpu_bo *bo, struct page **pages,
 		goto out_unlock;
 	}
 	if (unlikely((gtt->userflags & AMDGPU_GEM_USERPTR_ANONONLY) &&
-		vma->vm_file)) {
+		     vma->vm_file)) {
 		r = -EPERM;
 		goto out_unlock;
 	}
@@ -852,8 +801,16 @@ int amdgpu_ttm_tt_get_user_pages(struct amdgpu_bo *bo, struct page **pages,
 				       readonly, NULL, pages, range);
 out_unlock:
 	mmap_read_unlock(mm);
-	if (r)
-		pr_debug("failed %d to get user pages 0x%lx\n", r, start);
+	if (r) {
+		if (r == -EPERM) {
+			DRM_ERROR("init_user_pages: pin denied (-EPERM) at 0x%lx; "
+				  "READONLY=%d. For writable long-term pins, avoid MAP_PRIVATE/COW or DAX; "
+				  "for read-only, set AMDGPU_GEM_USERPTR_READONLY.\n",
+				  start, readonly);
+		} else {
+			DRM_DEBUG_DRIVER("init_user_pages: failed %d at 0x%lx\n", r, start);
+		}
+	}
 
 	mmput(mm);
 
@@ -1145,6 +1102,12 @@ int amdgpu_ttm_alloc_gart(struct ttm_buffer_object *bo)
 	return 0;
 }
 
+/*
+ * amdgpu_ttm_recover_gart - Rebind GTT pages
+ *
+ * Called by amdgpu_gtt_mgr_recover() from amdgpu_device_reset() to
+ * rebind GTT pages during a GPU reset.
+ */
 void amdgpu_ttm_recover_gart(struct ttm_buffer_object *tbo)
 {
 	struct amdgpu_device *adev = amdgpu_ttm_adev(tbo->bdev);
@@ -1155,9 +1118,6 @@ void amdgpu_ttm_recover_gart(struct ttm_buffer_object *tbo)
 
 	flags = amdgpu_ttm_tt_pte_flags(adev, tbo->ttm, tbo->resource);
 	amdgpu_ttm_gart_bind(adev, tbo, flags);
-
-	/* Re‑arm SDMA buffer functions after GPU reset. */
-	amdgpu_ttm_auto_enable_buffer_funcs(adev);
 }
 
 /*
@@ -1967,160 +1927,192 @@ static void amdgpu_ttm_pools_fini(struct amdgpu_device *adev)
 int amdgpu_ttm_init(struct amdgpu_device *adev)
 {
 	uint64_t gtt_size;
-	int r, i;
+	int r;
 
-	/* ----------------------------------------------------------------
-	 * Generic TTM & pool initialisation
-	 * ----------------------------------------------------------------
-	 */
 	mutex_init(&adev->mman.gtt_window_lock);
-	dma_set_max_seg_size(adev->dev, UINT_MAX);
 
-	r = ttm_device_init(&adev->mman.bdev, &amdgpu_bo_driver,
-						adev->dev,
-					 adev_to_drm(adev)->anon_inode->i_mapping,
-						adev_to_drm(adev)->vma_offset_manager,
-						adev->need_swiotlb,
-					 dma_addressing_limited(adev->dev));
+	dma_set_max_seg_size(adev->dev, UINT_MAX);
+	/* No others user of address space so set it to 0 */
+	r = ttm_device_init(&adev->mman.bdev, &amdgpu_bo_driver, adev->dev,
+			       adev_to_drm(adev)->anon_inode->i_mapping,
+			       adev_to_drm(adev)->vma_offset_manager,
+			       adev->need_swiotlb,
+			       dma_addressing_limited(adev->dev));
 	if (r) {
-		DRM_ERROR("TTM: device-init failed (%d)\n", r);
+		DRM_ERROR("failed initializing buffer object driver(%d).\n", r);
 		return r;
 	}
 
 	r = amdgpu_ttm_pools_init(adev);
 	if (r) {
-		DRM_ERROR("TTM: pool-init failed (%d)\n", r);
+		DRM_ERROR("failed to init ttm pools(%d).\n", r);
 		return r;
 	}
 	adev->mman.initialized = true;
 
-	/* ----------------------------------------------------------------
-	 * VRAM / GTT managers
-	 * ----------------------------------------------------------------
-	 */
+	/* Initialize VRAM pool with all of VRAM divided into pages */
 	r = amdgpu_vram_mgr_init(adev);
-	if (r)
+	if (r) {
+		DRM_ERROR("Failed initializing VRAM heap.\n");
 		return r;
-
-	amdgpu_ttm_set_buffer_funcs_status(adev, false);
-
-	#ifdef CONFIG_64BIT
-	#ifdef CONFIG_X86
-	if (adev->gmc.xgmi.connected_to_cpu)
-		adev->mman.aper_base_kaddr =
-		ioremap_cache(adev->gmc.aper_base,
-					  adev->gmc.visible_vram_size);
-		else if (!adev->gmc.is_app_apu)
-			adev->mman.aper_base_kaddr =
-			ioremap_wc(adev->gmc.aper_base,
-					   adev->gmc.visible_vram_size);
-			#endif
-			#endif
-
-			/* reserved VRAM regions (fw, driver, TMR, stolen …) */
-			if (amdgpu_ttm_fw_reserve_vram_init(adev))
-				return -ENOMEM;
-	if (amdgpu_ttm_drv_reserve_vram_init(adev))
-		return -ENOMEM;
-	if (adev->mman.discovery_bin && amdgpu_ttm_reserve_tmr(adev))
-		return -ENOMEM;
-	if (!adev->gmc.is_app_apu) {
-		if (amdgpu_bo_create_kernel_at(adev, 0,
-			adev->mman.stolen_vga_size,
-			&adev->mman.stolen_vga_memory,
-			NULL))
-			return -ENOMEM;
-		if (amdgpu_bo_create_kernel_at(adev, adev->mman.stolen_vga_size,
-			adev->mman.stolen_extended_size,
-			&adev->mman.stolen_extended_memory,
-			NULL))
-			return -ENOMEM;
-		if (amdgpu_bo_create_kernel_at(adev,
-			adev->mman.stolen_reserved_offset,
-			adev->mman.stolen_reserved_size,
-			&adev->mman.stolen_reserved_memory,
-			NULL))
-			return -ENOMEM;
 	}
 
-	DRM_INFO("amdgpu: %uM of VRAM ready\n",
-			 (unsigned)(adev->gmc.real_vram_size >> 20));
+	/* Change the size here instead of the init above so only lpfn is affected */
+	amdgpu_ttm_set_buffer_funcs_status(adev, false);
+#ifdef CONFIG_64BIT
+#ifdef CONFIG_X86
+	if (adev->gmc.xgmi.connected_to_cpu)
+		adev->mman.aper_base_kaddr = ioremap_cache(adev->gmc.aper_base,
+				adev->gmc.visible_vram_size);
 
-	/* ---------------- GTT size ------------------------------------- */
-	gtt_size = (amdgpu_gtt_size == -1) ?
-	(u64)ttm_tt_pages_limit() << PAGE_SHIFT :
-	((u64)amdgpu_gtt_size << 20);
+	else if (adev->gmc.is_app_apu)
+		DRM_DEBUG_DRIVER(
+			"No need to ioremap when real vram size is 0\n");
+	else
+#endif
+		adev->mman.aper_base_kaddr = ioremap_wc(adev->gmc.aper_base,
+				adev->gmc.visible_vram_size);
+#endif
 
-	r = amdgpu_gtt_mgr_init(adev, gtt_size);
+	/*
+	 *The reserved vram for firmware must be pinned to the specified
+	 *place on the VRAM, so reserve it early.
+	 */
+	r = amdgpu_ttm_fw_reserve_vram_init(adev);
 	if (r)
 		return r;
 
-	DRM_INFO("amdgpu: %uM of GTT ready\n",
-			 (unsigned)(gtt_size >> 20));
+	/*
+	 *The reserved vram for driver must be pinned to the specified
+	 *place on the VRAM, so reserve it early.
+	 */
+	r = amdgpu_ttm_drv_reserve_vram_init(adev);
+	if (r)
+		return r;
 
-	/* ---------------- on-chip heaps, doorbells, preempt ------------ */
-	if (amdgpu_ttm_init_on_chip(adev, AMDGPU_PL_DOORBELL,
-		adev->doorbell.size >> PAGE_SHIFT))
-		return -ENOMEM;
+	/*
+	 * only NAVI10 and onwards ASIC support for IP discovery.
+	 * If IP discovery enabled, a block of memory should be
+	 * reserved for IP discovey.
+	 */
+	if (adev->mman.discovery_bin) {
+		r = amdgpu_ttm_reserve_tmr(adev);
+		if (r)
+			return r;
+	}
 
-	if (amdgpu_doorbell_create_kernel_doorbells(adev))
-		return -ENOMEM;
+	/* allocate memory as required for VGA
+	 * This is used for VGA emulation and pre-OS scanout buffers to
+	 * avoid display artifacts while transitioning between pre-OS
+	 * and driver.
+	 */
+	if (!adev->gmc.is_app_apu) {
+		r = amdgpu_bo_create_kernel_at(adev, 0,
+					       adev->mman.stolen_vga_size,
+					       &adev->mman.stolen_vga_memory,
+					       NULL);
+		if (r)
+			return r;
 
-	if (amdgpu_preempt_mgr_init(adev))
-		return -ENOMEM;
+		r = amdgpu_bo_create_kernel_at(adev, adev->mman.stolen_vga_size,
+					       adev->mman.stolen_extended_size,
+					       &adev->mman.stolen_extended_memory,
+					       NULL);
 
-	if (amdgpu_ttm_init_on_chip(adev, AMDGPU_PL_GDS, adev->gds.gds_size) ||
-		amdgpu_ttm_init_on_chip(adev, AMDGPU_PL_GWS, adev->gds.gws_size) ||
-		amdgpu_ttm_init_on_chip(adev, AMDGPU_PL_OA,  adev->gds.oa_size))
-		return -ENOMEM;
+		if (r)
+			return r;
 
-	/* ---------------- debug helper BO for SDMA VRAM access --------- */
+		r = amdgpu_bo_create_kernel_at(adev,
+					       adev->mman.stolen_reserved_offset,
+					       adev->mman.stolen_reserved_size,
+					       &adev->mman.stolen_reserved_memory,
+					       NULL);
+		if (r)
+			return r;
+	} else {
+		DRM_DEBUG_DRIVER("Skipped stolen memory reservation\n");
+	}
+
+	DRM_INFO("amdgpu: %uM of VRAM memory ready\n",
+		 (unsigned int)(adev->gmc.real_vram_size / (1024 * 1024)));
+
+	/* Compute GTT size, either based on TTM limit
+	 * or whatever the user passed on module init.
+	 */
+	gtt_size = ttm_tt_pages_limit() << PAGE_SHIFT;
+	if (amdgpu_gtt_size != -1) {
+		uint64_t configured_size = (uint64_t)amdgpu_gtt_size << 20;
+
+		drm_warn(&adev->ddev,
+			"Configuring gttsize via module parameter is deprecated, please use ttm.pages_limit\n");
+		if (gtt_size != configured_size)
+			drm_warn(&adev->ddev,
+				"GTT size has been set as %llu but TTM size has been set as %llu, this is unusual\n",
+				configured_size, gtt_size);
+
+		gtt_size = configured_size;
+	}
+
+	/* Initialize GTT memory pool */
+	r = amdgpu_gtt_mgr_init(adev, gtt_size);
+	if (r) {
+		DRM_ERROR("Failed initializing GTT heap.\n");
+		return r;
+	}
+	DRM_INFO("amdgpu: %uM of GTT memory ready.\n",
+		 (unsigned int)(gtt_size / (1024 * 1024)));
+
+	if (adev->flags & AMD_IS_APU) {
+		if (adev->gmc.real_vram_size < gtt_size)
+			adev->apu_prefer_gtt = true;
+	}
+
+	/* Initialize doorbell pool on PCI BAR */
+	r = amdgpu_ttm_init_on_chip(adev, AMDGPU_PL_DOORBELL, adev->doorbell.size / PAGE_SIZE);
+	if (r) {
+		DRM_ERROR("Failed initializing doorbell heap.\n");
+		return r;
+	}
+
+	/* Create a boorbell page for kernel usages */
+	r = amdgpu_doorbell_create_kernel_doorbells(adev);
+	if (r) {
+		DRM_ERROR("Failed to initialize kernel doorbells.\n");
+		return r;
+	}
+
+	/* Initialize preemptible memory pool */
+	r = amdgpu_preempt_mgr_init(adev);
+	if (r) {
+		DRM_ERROR("Failed initializing PREEMPT heap.\n");
+		return r;
+	}
+
+	/* Initialize various on-chip memory pools */
+	r = amdgpu_ttm_init_on_chip(adev, AMDGPU_PL_GDS, adev->gds.gds_size);
+	if (r) {
+		DRM_ERROR("Failed initializing GDS heap.\n");
+		return r;
+	}
+
+	r = amdgpu_ttm_init_on_chip(adev, AMDGPU_PL_GWS, adev->gds.gws_size);
+	if (r) {
+		DRM_ERROR("Failed initializing gws heap.\n");
+		return r;
+	}
+
+	r = amdgpu_ttm_init_on_chip(adev, AMDGPU_PL_OA, adev->gds.oa_size);
+	if (r) {
+		DRM_ERROR("Failed initializing oa heap.\n");
+		return r;
+	}
 	if (amdgpu_bo_create_kernel(adev, PAGE_SIZE, PAGE_SIZE,
-		AMDGPU_GEM_DOMAIN_GTT,
-		&adev->mman.sdma_access_bo, NULL,
-		&adev->mman.sdma_access_ptr))
+				AMDGPU_GEM_DOMAIN_GTT,
+				&adev->mman.sdma_access_bo, NULL,
+				&adev->mman.sdma_access_ptr))
 		DRM_WARN("Debug VRAM access will use slowpath MM access\n");
 
-	/* ----------------------------------------------------------------
-	 * Enable buffer-funcs and set up copy scheduler entity
-	 * ----------------------------------------------------------------
-	 */
-	amdgpu_ttm_auto_enable_buffer_funcs(adev);
-
-	if (adev->mman.buffer_funcs_enabled &&
-		adev->sdma.num_instances >= 1) {
-
-		amdgpu_ttm_scheds = kcalloc(adev->sdma.num_instances,
-									sizeof(*amdgpu_ttm_scheds),
-									GFP_KERNEL);
-		if (!amdgpu_ttm_scheds) {
-			DRM_WARN("TTM: no memory for SDMA entity array – "
-			"parallel copies disabled\n");
-			goto done;	/* still succeed with single SDMA */
-		}
-
-		for (i = 0; i < adev->sdma.num_instances; ++i)
-			amdgpu_ttm_scheds[i] =
-			&adev->sdma.instance[i].ring.sched;
-
-		r = drm_sched_entity_init(&amdgpu_ttm_sched_entity,
-								  DRM_SCHED_PRIORITY_HIGH,
-							amdgpu_ttm_scheds,
-							adev->sdma.num_instances, NULL);
-		if (r) {
-			kfree(amdgpu_ttm_scheds);
-			amdgpu_ttm_scheds = NULL;
-			DRM_WARN("TTM: parallel SDMA disabled "
-			"(entity-init failed %d)\n", r);
-		} else {
-			amdgpu_ttm_entity_initialized = true;
-			DRM_INFO("TTM: parallel SDMA (%u engines) enabled\n",
-					 adev->sdma.num_instances);
-		}
-		}
-
-		done:
-		return 0;
+	return 0;
 }
 
 /*
@@ -2133,60 +2125,45 @@ void amdgpu_ttm_fini(struct amdgpu_device *adev)
 	if (!adev->mman.initialized)
 		return;
 
-	/* Per-partition page-pools (APUs / XGMI) */
 	amdgpu_ttm_pools_fini(adev);
-	amdgpu_ttm_training_reserve_vram_fini(adev);
 
-	/* Free stolen and reserved VRAM regions (dGPU only) */
+	amdgpu_ttm_training_reserve_vram_fini(adev);
+	/* return the stolen vga memory back to VRAM */
 	if (!adev->gmc.is_app_apu) {
-		amdgpu_bo_free_kernel(&adev->mman.stolen_vga_memory,
-							  NULL, NULL);
-		amdgpu_bo_free_kernel(&adev->mman.stolen_extended_memory,
-							  NULL, NULL);
-		amdgpu_bo_free_kernel(&adev->mman.fw_reserved_memory,
-							  NULL, NULL);
+		amdgpu_bo_free_kernel(&adev->mman.stolen_vga_memory, NULL, NULL);
+		amdgpu_bo_free_kernel(&adev->mman.stolen_extended_memory, NULL, NULL);
+		/* return the FW reserved memory back to VRAM */
+		amdgpu_bo_free_kernel(&adev->mman.fw_reserved_memory, NULL,
+				      NULL);
 		if (adev->mman.stolen_reserved_size)
 			amdgpu_bo_free_kernel(&adev->mman.stolen_reserved_memory,
-								  NULL, NULL);
+					      NULL, NULL);
 	}
-
-	/* SDMA access helper buffer                                   */
 	amdgpu_bo_free_kernel(&adev->mman.sdma_access_bo, NULL,
-						  &adev->mman.sdma_access_ptr);
-
-	/* Reserved VRAM regions from firmware & driver parameters     */
+					&adev->mman.sdma_access_ptr);
 	amdgpu_ttm_fw_reserve_vram_fini(adev);
 	amdgpu_ttm_drv_reserve_vram_fini(adev);
 
-	/* I/O-remapped visible VRAM aperture                          */
 	if (drm_dev_enter(adev_to_drm(adev), &idx)) {
+
 		if (adev->mman.aper_base_kaddr)
 			iounmap(adev->mman.aper_base_kaddr);
 		adev->mman.aper_base_kaddr = NULL;
+
 		drm_dev_exit(idx);
 	}
 
-	/* Resource managers                                            */
 	amdgpu_vram_mgr_fini(adev);
 	amdgpu_gtt_mgr_fini(adev);
 	amdgpu_preempt_mgr_fini(adev);
+	amdgpu_doorbell_fini(adev);
+
 	ttm_range_man_fini(&adev->mman.bdev, AMDGPU_PL_GDS);
 	ttm_range_man_fini(&adev->mman.bdev, AMDGPU_PL_GWS);
 	ttm_range_man_fini(&adev->mman.bdev, AMDGPU_PL_OA);
 	ttm_range_man_fini(&adev->mman.bdev, AMDGPU_PL_DOORBELL);
-
-	/* Core TTM device                                              */
 	ttm_device_fini(&adev->mman.bdev);
 	adev->mman.initialized = false;
-
-	/* Dedicated scheduler entity for parallel TTM moves            */
-	if (amdgpu_ttm_entity_initialized) {
-		drm_sched_entity_destroy(&amdgpu_ttm_sched_entity);
-		kfree(amdgpu_ttm_scheds);
-		amdgpu_ttm_scheds           = NULL;
-		amdgpu_ttm_entity_initialized = false;
-	}
-
 	DRM_INFO("amdgpu: ttm finalized\n");
 }
 
@@ -2339,151 +2316,41 @@ error_free:
 	return r;
 }
 
-static int amdgpu_ttm_fill_mem(struct amdgpu_ring *ring,
-							   u32 src_data, u64 dst_addr, u32 byte_count,
-							   struct dma_resv *resv,
-							   struct dma_fence **fence,
-							   bool vm_needs_flush, bool delayed)
+static int amdgpu_ttm_fill_mem(struct amdgpu_ring *ring, uint32_t src_data,
+			       uint64_t dst_addr, uint32_t byte_count,
+			       struct dma_resv *resv,
+			       struct dma_fence **fence,
+			       bool vm_needs_flush, bool delayed)
 {
 	struct amdgpu_device *adev = ring->adev;
-	u32 max_bytes  = adev->mman.buffer_funcs->fill_max_bytes;
 	unsigned int num_loops, num_dw;
 	struct amdgpu_job *job;
+	uint32_t max_bytes;
+	unsigned int i;
 	int r;
 
-	if (WARN_ON(byte_count == 0))
-		return -EINVAL;
-
-	num_loops = DIV_ROUND_UP(byte_count, max_bytes);
-	num_dw    = ALIGN(num_loops * adev->mman.buffer_funcs->fill_num_dw, 8);
-
-	r = amdgpu_ttm_prepare_job(adev, false, num_dw, resv,
-							   vm_needs_flush, &job, delayed);
+	max_bytes = adev->mman.buffer_funcs->fill_max_bytes;
+	num_loops = DIV_ROUND_UP_ULL(byte_count, max_bytes);
+	num_dw = ALIGN(num_loops * adev->mman.buffer_funcs->fill_num_dw, 8);
+	r = amdgpu_ttm_prepare_job(adev, false, num_dw, resv, vm_needs_flush,
+				   &job, delayed);
 	if (r)
 		return r;
 
-	while (byte_count) {
-		u32 cur = min(byte_count, max_bytes);
+	for (i = 0; i < num_loops; i++) {
+		uint32_t cur_size = min(byte_count, max_bytes);
 
-		amdgpu_emit_fill_buffer(adev, &job->ibs[0],
-								src_data, dst_addr, cur);
+		amdgpu_emit_fill_buffer(adev, &job->ibs[0], src_data, dst_addr,
+					cur_size);
 
-		dst_addr   += cur;
-		byte_count -= cur;
+		dst_addr += cur_size;
+		byte_count -= cur_size;
 	}
 
 	amdgpu_ring_pad_ib(ring, &job->ibs[0]);
 	WARN_ON(job->ibs[0].length_dw > num_dw);
-
 	*fence = amdgpu_job_submit(job);
 	return 0;
-}
-
-/*
- * Submit one large copy as N independent jobs that the drm-scheduler
- * can execute on several SDMA rings in parallel.
- *
- * scheds[]      : array of <=16 scheduler pointers (at least one)
- * numscheds     : number of valid entries in scheds[]
- * fence_out     : optional; combined fence is returned when !NULL
- */
-static int amdgpu_copy_buffer_multi(struct amdgpu_device *adev,
-									struct drm_gpu_scheduler **scheds,
-									unsigned int numscheds,
-									u64  src, u64 dst, u64 bytes,
-									u32  copy_flags,
-									struct dma_resv *resv,
-									struct dma_fence **fence_out)
-{
-	const u32 pkt_max  = adev->mman.buffer_funcs->copy_max_bytes;
-	const u32 stripe   = 256u << 20;          /* 256 MiB per job      */
-	unsigned int njobs = DIV_ROUND_UP_ULL(bytes, stripe);
-	struct dma_fence **farr = NULL;
-	struct dma_fence_array *fa;
-	unsigned int i;
-	int r = 0;
-
-	if (WARN_ON(!numscheds || !scheds))
-		return -EINVAL;
-	if (njobs > 16)                            /* sanity for stack use */
-		return -E2BIG;
-
-	farr = kcalloc(njobs, sizeof(*farr), GFP_KERNEL);
-	if (!farr)
-		return -ENOMEM;
-
-	for (i = 0; i < njobs; ++i) {
-		u64 this_sz   = min_t(u64, bytes, stripe);
-		struct drm_gpu_scheduler *sched = scheds[i % numscheds];
-		struct amdgpu_ring *ring =
-		container_of(sched, struct amdgpu_ring, sched);
-		struct drm_sched_entity ent;
-		struct amdgpu_job *job;
-		u32 loops = DIV_ROUND_UP(this_sz, pkt_max);
-		u32 ndw   = ALIGN(loops *
-		adev->mman.buffer_funcs->copy_num_dw, 8);
-		int tmp;
-
-		/* transient entity pointing at exactly one scheduler       */
-		tmp = drm_sched_entity_init(&ent, DRM_SCHED_PRIORITY_KERNEL,
-									&sched, 1, NULL);
-		if (tmp) { r = tmp; goto err_loop; }
-
-		tmp = amdgpu_job_alloc_with_ib(adev, &ent,
-									   AMDGPU_FENCE_OWNER_UNDEFINED,
-								 ndw * 4,
-								 AMDGPU_IB_POOL_DELAYED, &job);
-		if (tmp) {
-			r = tmp;
-			drm_sched_entity_fini(&ent);
-			goto err_loop;
-		}
-
-		/* dependencies                                              */
-		if (resv) {
-			tmp = drm_sched_job_add_resv_dependencies(&job->base,
-													  resv,
-											 DMA_RESV_USAGE_BOOKKEEP);
-			if (tmp) {
-				amdgpu_job_free(job);
-				drm_sched_entity_fini(&ent);
-				r = tmp;
-				goto err_loop;
-			}
-		}
-
-		/* build IB                                                 */
-		while (this_sz) {
-			u32 cur = min_t(u64, this_sz, pkt_max);
-
-			amdgpu_emit_copy_buffer(adev, &job->ibs[0],
-									src, dst, cur, copy_flags);
-			src     += cur;
-			dst     += cur;
-			this_sz -= cur;
-		}
-
-		amdgpu_ring_pad_ib(ring, &job->ibs[0]);
-		WARN_ON(job->ibs[0].length_dw > ndw);
-
-		farr[i] = amdgpu_job_submit(job);
-		bytes  -= min_t(u64, stripe, bytes);
-
-		/* entity will be destroyed when all queued jobs finished  */
-		drm_sched_entity_fini(&ent);
-	}
-
-	fa = dma_fence_array_create(njobs, farr, 0, GFP_KERNEL, false);
-	if (!fa)
-		r = -ENOMEM;
-	else if (fence_out)
-		*fence_out = &fa->base;
-
-	err_loop:
-	while (i--)
-		dma_fence_put(farr[i]);
-	kfree(farr);
-	return r;
 }
 
 /**
@@ -2493,111 +2360,115 @@ static int amdgpu_copy_buffer_multi(struct amdgpu_device *adev,
  * @fence: dma_fence associated with the operation
  *
  * Clear the memory buffer resource.
- *
- * Returns:
- * 0 for success or a negative error code on failure.
  */
-int amdgpu_ttm_clear_buffer(struct amdgpu_bo *bo, struct dma_resv *resv,
-							struct dma_fence **fence_out)
+int amdgpu_ttm_clear_buffer(struct amdgpu_bo *bo,
+			    struct dma_resv *resv,
+			    struct dma_fence **fence)
 {
 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
-	struct amdgpu_ring   *ring = adev->mman.buffer_funcs_ring;
-	struct amdgpu_res_cursor cur;
-	u64 chunk = vega_ttm_chunk_bytes(adev);
-	struct dma_fence *fence = NULL;
+	struct amdgpu_ring *ring = adev->mman.buffer_funcs_ring;
+	struct amdgpu_res_cursor cursor;
+	u64 addr;
 	int r = 0;
 
-	if (!adev->mman.buffer_funcs_enabled || !ring || !ring->sched.ready)
+	if (!adev->mman.buffer_funcs_enabled)
 		return -EINVAL;
 
-	amdgpu_res_first(bo->tbo.resource, 0,
-					 amdgpu_bo_size(bo), &cur);
+	if (!fence)
+		return -EINVAL;
+
+	*fence = dma_fence_get_stub();
+
+	amdgpu_res_first(bo->tbo.resource, 0, amdgpu_bo_size(bo), &cursor);
 
 	gtt_window_lock_fast(adev);
-
-	while (cur.remaining) {
-		u64 size = min(cur.size, chunk);
-		u64 addr;
+	while (cursor.remaining) {
 		struct dma_fence *next = NULL;
+		u64 size;
 
-		if (amdgpu_res_cleared(&cur)) {
-			amdgpu_res_next(&cur, cur.size);
+		if (amdgpu_res_cleared(&cursor)) {
+			amdgpu_res_next(&cursor, cursor.size);
 			continue;
 		}
 
-		r = amdgpu_ttm_map_buffer(&bo->tbo, bo->tbo.resource,
-								  &cur, 1, ring, false,
-							&size, &addr);
+		/* Never clear more than 256MiB at once to avoid timeouts */
+		size = min(cursor.size, 256ULL << 20);
+
+		r = amdgpu_ttm_map_buffer(&bo->tbo, bo->tbo.resource, &cursor,
+					  1, ring, false, &size, &addr);
 		if (r)
-			break;
+			goto err;
 
-		r = amdgpu_ttm_fill_mem(ring, 0, addr, (u32)size,
-								resv, &next, true, true);
-		if (r) {
-			/* fill_mem already cleaned up its job */
-			break;
-		}
+		r = amdgpu_ttm_fill_mem(ring, 0, addr, (u32)size, resv,
+					&next, true, true);
+		if (r)
+			goto err;
 
-		dma_fence_put(fence);
-		fence = next;
-		amdgpu_res_next(&cur, size);
+		dma_fence_put(*fence);
+		*fence = next;
+
+		amdgpu_res_next(&cursor, size);
 	}
-
+err:
 	mutex_unlock(&adev->mman.gtt_window_lock);
 
-	if (!r && fence_out)
-		*fence_out = dma_fence_get(fence);
-
-	dma_fence_put(fence);
 	return r;
 }
 
-int amdgpu_fill_buffer(struct amdgpu_bo *bo, u32 pattern,
-					   struct dma_resv *resv, struct dma_fence **fence_out,
-					   bool delayed)
+/**
+ * amdgpu_fill_buffer - fill BO with a pattern
+ * @bo: BO to fill
+ * @src_data: dword pattern
+ * @resv: reservation object
+ * @f: returns fence
+ * @delayed: requested low priority submission
+ */
+int amdgpu_fill_buffer(struct amdgpu_bo *bo,
+			uint32_t src_data,
+			struct dma_resv *resv,
+			struct dma_fence **f,
+			bool delayed)
 {
 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
-	struct amdgpu_ring   *ring = adev->mman.buffer_funcs_ring;
-	struct amdgpu_res_cursor dst;
+	struct amdgpu_ring *ring = adev->mman.buffer_funcs_ring;
 	struct dma_fence *fence = NULL;
-	u64 chunk = vega_ttm_chunk_bytes(adev);
-	int r = 0;
+	struct amdgpu_res_cursor dst;
+	int r;
 
-	if (!adev->mman.buffer_funcs_enabled || !ring || !ring->sched.ready)
+	if (!adev->mman.buffer_funcs_enabled) {
+		DRM_ERROR("Trying to clear memory with ring turned off.\n");
 		return -EINVAL;
+	}
 
 	amdgpu_res_first(bo->tbo.resource, 0, amdgpu_bo_size(bo), &dst);
 
 	gtt_window_lock_fast(adev);
-
 	while (dst.remaining) {
-		u64 cur_size = min(dst.size, chunk);
-		u64 addr;
-		struct dma_fence *next = NULL;
+		struct dma_fence *next;
+		uint64_t cur_size, to;
 
-		r = amdgpu_ttm_map_buffer(&bo->tbo, bo->tbo.resource,
-								  &dst, 1, ring, false,
-							&cur_size, &addr);
-		if (r)
-			break;
+		/* Never fill more than 256MiB at once to avoid timeouts */
+		cur_size = min(dst.size, 256ULL << 20);
 
-		/* Use existing helper – it already supports delayed flag   */
-		r = amdgpu_ttm_fill_mem(ring, pattern, addr,
-								(u32)cur_size, resv, &next,
-								true, delayed);
+		r = amdgpu_ttm_map_buffer(&bo->tbo, bo->tbo.resource, &dst,
+					  1, ring, false, &cur_size, &to);
 		if (r)
-			break;
+			goto error;
+
+		r = amdgpu_ttm_fill_mem(ring, src_data, to, (u32)cur_size, resv,
+					&next, true, delayed);
+		if (r)
+			goto error;
 
 		dma_fence_put(fence);
 		fence = next;
 
 		amdgpu_res_next(&dst, cur_size);
 	}
-
+error:
 	mutex_unlock(&adev->mman.gtt_window_lock);
-
-	if (fence_out)
-		*fence_out = dma_fence_get(fence);
+	if (f)
+		*f = dma_fence_get(fence);
 	dma_fence_put(fence);
 	return r;
 }

@@ -646,7 +646,8 @@ int amdgpu_bo_create(struct amdgpu_device *adev,
 		if (!bp->resv)
 			amdgpu_bo_unreserve(bo);
 
-	if (bp->type == ttm_bo_type_device)
+	if (bp->type == ttm_bo_type_device &&
+		!(bo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS))
 		bo->flags &= ~AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
 
 	*bo_ptr = bo;
