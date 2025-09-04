@@ -1,3 +1,171 @@
+From: Han Guangjiang <hanguangjiang@xxxxxxxxxxx>
+
+When both CPU cgroup and memory cgroup are enabled with parent cgroup
+resource limits much smaller than child cgroup's, the system frequently
+hangs with NULL pointer dereference:
+
+Unable to handle kernel NULL pointer dereference
+at virtual address 0000000000000051
+Internal error: Oops: 0000000096000006 [#1] PREEMPT_RT SMP
+pc : pick_task_fair+0x68/0x150
+Call trace:
+ pick_task_fair+0x68/0x150
+ pick_next_task_fair+0x30/0x3b8
+ __schedule+0x180/0xb98
+ preempt_schedule+0x48/0x60
+ rt_mutex_slowunlock+0x298/0x340
+ rt_spin_unlock+0x84/0xa0
+ page_vma_mapped_walk+0x1c8/0x478
+ folio_referenced_one+0xdc/0x490
+ rmap_walk_file+0x11c/0x200
+ folio_referenced+0x160/0x1e8
+ shrink_folio_list+0x5c4/0xc60
+ shrink_lruvec+0x5f8/0xb88
+ shrink_node+0x308/0x940
+ do_try_to_free_pages+0xd4/0x540
+ try_to_free_mem_cgroup_pages+0x12c/0x2c0
+
+The issue can be mitigated by increasing parent cgroup's CPU resources,
+or completely resolved by disabling DELAY_DEQUEUE feature.
+
+SCHED_FEAT(DELAY_DEQUEUE, false)
+
+With CONFIG_SCHED_DEBUG enabled, the following warning appears:
+
+WARNING: CPU: 1 PID: 27 at kernel/sched/fair.c:704 update_entity_lag+0xa8/0xd0
+!se->on_rq
+Call trace:
+ update_entity_lag+0xa8/0xd0
+ dequeue_entity+0x90/0x538
+ dequeue_entities+0xd0/0x490
+ dequeue_task_fair+0xcc/0x230
+ rt_mutex_setprio+0x2ec/0x4d8
+ rtlock_slowlock_locked+0x6c8/0xce8
+
+The warning indicates se->on_rq is 0, meaning dequeue_entity() was
+entered at least twice and executed update_entity_lag().
+
+Root cause analysis:
+In rt_mutex_setprio(), there are two dequeue_task() calls:
+1. First call: dequeue immediately if task is delay-dequeued
+2. Second call: dequeue running tasks
+
+Through debugging, we observed that for the same task, both dequeue_task()
+calls are actually executed. The task is a sched_delayed task on cfs_rq,
+which confirms our analysis that dequeue_entity() is entered at least
+twice.
+
+Semantically, rt_mutex handles scheduling and priority inheritance, and
+should only dequeue/enqueue running tasks. A sched_delayed task is
+essentially non-running, so the second dequeue_task() should not execute.
+
+Further analysis of dequeue_entities() shows multiple cfs_rq_throttled()
+checks. At the function's end, __block_task() updates sched_delayed
+tasks to non-running state. However, when cgroup throttling occurs, the
+function returns early without executing __block_task(), leaving the
+sched_delayed task in running state. This causes the unexpected second
+dequeue_task() in rt_mutex_setprio(), leading to system crash.
+
+We initially tried modifying the two cfs_rq_throttled() return points in
+dequeue_entities() to jump to the __block_task() condition check, which
+resolved the issue completely.
+
+This patch takes a cleaner approach by moving the __block_task()
+operation from dequeue_entities() to finish_delayed_dequeue_entity(),
+ensuring sched_delayed tasks are properly marked as non-running
+regardless of cgroup throttling status.
+
+Fixes: 152e11f6df29 ("sched/fair: Implement delayed dequeue")
+Signed-off-by: Han Guangjiang <hanguangjiang@xxxxxxxxxxx>
+---
+ kernel/sched/fair.c | 21 ++++++---------------
+ 1 file changed, 6 insertions(+), 15 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index b173a059315c..d6c2a604358f 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -5373,6 +5373,12 @@ static inline void finish_delayed_dequeue_entity(struct sched_entity *se)
+ 	clear_delayed(se);
+ 	if (sched_feat(DELAY_ZERO) && se->vlag > 0)
+ 		se->vlag = 0;
++
++	if (entity_is_task(se)) {
++		struct task_struct *p = task_of(se);
++
++		__block_task(task_rq(p), p);
++	}
+ }
+ 
+ static bool
+@@ -7048,21 +7054,6 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
+ 	if (unlikely(!was_sched_idle && sched_idle_rq(rq)))
+ 		rq->next_balance = jiffies;
+ 
+-	if (p && task_delayed) {
+-		WARN_ON_ONCE(!task_sleep);
+-		WARN_ON_ONCE(p->on_rq != 1);
+-
+-		/* Fix-up what dequeue_task_fair() skipped */
+-		hrtick_update(rq);
+-
+-		/*
+-		 * Fix-up what block_task() skipped.
+-		 *
+-		 * Must be last, @p might not be valid after this.
+-		 */
+-		__block_task(rq, p);
+-	}
+-
+ 	return 1;
+ }
+ 
+-- 
+2.25.1
+
+From: Rafael J. Wysocki <rafael.j.wysocki@xxxxxxxxx>
+
+Christian has reported that commit a430c11f4015 ("intel_idle: Rescan
+"dead" SMT siblings during initialization") broke the use case in
+which both nosmt and maxcpus were added to the kernel command line
+because it caused CPUs that were not SMT siblings to be brought
+online during the intel_idle driver initialization in violation of the
+maxcpus limit.
+
+The underlying reason for this is a missing topology_is_primary_thread()
+check in cpuhp_smt_enable() which causes that function to put online
+more CPUs than just the SMT siblings that it is supposed to handle.
+
+Add the missing check to address the issue.
+
+Fixes: a430c11f4015 ("intel_idle: Rescan "dead" SMT siblings during initialization")
+Fixes: f694481b1d31 ("ACPI: processor: Rescan "dead" SMT siblings during initialization")
+Closes: https://lore.kernel.org/linux-pm/724616a2-6374-4ba3-8ce3-ea9c45e2ae3b@xxxxxxx/
+Reported-by: Christian Loehle <christian.loehle@xxxxxxx>
+Tested-by: Christian Loehle <christian.loehle@xxxxxxx>
+Cc: 6.16+ <stable@xxxxxxxxxxxxxxx> # 6.16+
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@xxxxxxxxx>
+---
+ kernel/cpu.c |    6 ++++++
+ 1 file changed, 6 insertions(+)
+
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@ -2710,6 +2710,12 @@
+ 	cpu_maps_update_begin();
+ 	cpu_smt_control = CPU_SMT_ENABLED;
+ 	for_each_present_cpu(cpu) {
++		/*
++		 * Avoid accidentally onlining primary thread CPUs that have
++		 * been taken offline.
++		 */
++		if (topology_is_primary_thread(cpu))
++			continue;
+ 		/* Skip online CPUs and CPUs on offline nodes */
+ 		if (cpu_online(cpu) || !node_online(cpu_to_node(cpu)))
+ 			continue;
+
+
 When a task is migrated out, there is a probability that the tg->load_avg
 value will become abnormal. The reason is as follows.
 
@@ -3629,826 +3797,7 @@ index 7e2963efe800..7cc9d50e3e11 100644
 2.40.1
 
 --- a/drivers/usb/host/xhci.c	2025-06-19 15:41:08.000000000 +0200
-+++ b/drivers/usb/host/xhci.c	2025-06-26 01:59:47.529699115 +0200
-@@ -40,16 +40,18 @@ static unsigned long long quirks;
- module_param(quirks, ullong, S_IRUGO);
- MODULE_PARM_DESC(quirks, "Bit flags for quirks to be enabled as default");
- 
--static bool td_on_ring(struct xhci_td *td, struct xhci_ring *ring)
-+static bool td_on_ring(const struct xhci_td *td, const struct xhci_ring *ring)
- {
- 	struct xhci_segment *seg;
- 
--	if (!td || !td->start_seg)
-+	if (unlikely(!td || !td->start_seg || !ring || !ring->first_seg)) {
- 		return false;
-+	}
- 
- 	xhci_for_each_ring_seg(ring->first_seg, seg) {
--		if (seg == td->start_seg)
-+		if (seg == td->start_seg) {
- 			return true;
-+		}
- 	}
- 
- 	return false;
-@@ -754,22 +756,40 @@ static void xhci_clear_command_ring(stru
- {
- 	struct xhci_ring *ring;
- 	struct xhci_segment *seg;
-+	u32 val;
- 
- 	ring = xhci->cmd_ring;
-+
- 	xhci_for_each_ring_seg(ring->first_seg, seg) {
--		/* erase all TRBs before the link */
-+		/*
-+		 * To avoid memory model races, we follow a safe sequence:
-+		 * 1. Read the Link TRB's control field into a local variable.
-+		 * 2. Zero out all *other* TRBs in the segment.
-+		 * 3. Modify the local variable and write it back once.
-+		 */
-+		val = le32_to_cpu(seg->trbs[TRBS_PER_SEGMENT - 1].link.control);
-+
-+		/* Zero all TRBs except the last one (the Link TRB). */
- 		memset(seg->trbs, 0, sizeof(union xhci_trb) * (TRBS_PER_SEGMENT - 1));
--		/* clear link cycle bit */
--		seg->trbs[TRBS_PER_SEGMENT - 1].link.control &= cpu_to_le32(~TRB_CYCLE);
-+
-+		/*
-+		 * Per xHCI Spec 4.9.4, for a Link TRB:
-+		 * - The Cycle bit (C, bit 0) must be cleared.
-+		 * - The Toggle Cycle bit (TC, bit 1) must be set to '1'.
-+		 * We preserve all other bits (like the Chain bit).
-+		 */
-+		val &= ~TRB_CYCLE;
-+		val |= BIT(1); /* Set Toggle Cycle (TC) */
-+
-+		seg->trbs[TRBS_PER_SEGMENT - 1].link.control = cpu_to_le32(val);
- 	}
- 
-+	/* Reset the driver's software state for the ring. */
- 	xhci_initialize_ring_info(ring);
-+
- 	/*
--	 * Reset the hardware dequeue pointer.
--	 * Yes, this will need to be re-written after resume, but we're paranoid
--	 * and want to make sure the hardware doesn't access bogus memory
--	 * because, say, the BIOS or an SMI started the host without changing
--	 * the command ring pointers.
-+	 * Finally, update the hardware's dequeue pointer, as this is not
-+	 * preserved by the host controller across suspend/resume.
- 	 */
- 	xhci_set_cmd_ring_deq(xhci);
- }
-@@ -1509,270 +1529,271 @@ static int xhci_check_ep0_maxpacket(stru
-  * non-error returns are a promise to giveback() the urb later
-  * we drop ownership so next owner (or urb unlink) can get it
-  */
--static int xhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
-+static int xhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,
-+							gfp_t           mem_flags)
- {
--	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
--	unsigned long flags;
--	int ret = 0;
--	unsigned int slot_id, ep_index;
--	unsigned int *ep_state;
--	struct urb_priv	*urb_priv;
--	int num_tds;
-+	struct xhci_hcd         *xhci;
-+	struct xhci_virt_device *vdev;
-+	struct urb_priv         *priv;
-+	unsigned int             slot_id, ep_index;
-+	unsigned long            flags;
-+	size_t                   alloc_sz;
-+	int                      num_tds;
-+	int                      ret = 0;
-+
-+	/* Stage 1: Initial parameter validation (cheap, no lock). */
-+	if (unlikely(!hcd || !urb || !urb->ep || !urb->dev)) {
-+		return -EINVAL;
-+	}
-+	if (unlikely(urb->dev->state < USB_STATE_ADDRESS)) {
-+		return -ENODEV;
-+	}
-+	slot_id = urb->dev->slot_id;
-+	if (unlikely(!slot_id)) {
-+		return -ENODEV;
-+	}
-+	xhci = hcd_to_xhci(hcd);
-+	vdev = READ_ONCE(xhci->devs[slot_id]);
-+	if (unlikely(!vdev)) {
-+		return -ENODEV;
-+	}
- 
- 	ep_index = xhci_get_endpoint_index(&urb->ep->desc);
- 
--	if (usb_endpoint_xfer_isoc(&urb->ep->desc))
-+	/* Stage 2: Calculate TD count and allocate private structure. */
-+	if (usb_endpoint_xfer_isoc(&urb->ep->desc)) {
-+		if (unlikely(urb->number_of_packets == 0)) {
-+			return -EINVAL;
-+		}
- 		num_tds = urb->number_of_packets;
--	else if (usb_endpoint_is_bulk_out(&urb->ep->desc) &&
--	    urb->transfer_buffer_length > 0 &&
--	    urb->transfer_flags & URB_ZERO_PACKET &&
--	    !(urb->transfer_buffer_length % usb_endpoint_maxp(&urb->ep->desc)))
--		num_tds = 2;
--	else
--		num_tds = 1;
--
--	urb_priv = kzalloc(struct_size(urb_priv, td, num_tds), mem_flags);
--	if (!urb_priv)
--		return -ENOMEM;
-+	} else if (usb_endpoint_is_bulk_out(&urb->ep->desc) &&
-+		(urb->transfer_flags & URB_ZERO_PACKET) &&
-+		urb->transfer_buffer_length > 0 &&
-+		!(urb->transfer_buffer_length % usb_endpoint_maxp(&urb->ep->desc))) {
-+		num_tds = 2; /* Data TD + Zero-Length Packet TD */
-+		} else {
-+			num_tds = 1;
-+		}
- 
--	urb_priv->num_tds = num_tds;
--	urb_priv->num_tds_done = 0;
--	urb->hcpriv = urb_priv;
-+		alloc_sz = struct_size(priv, td, num_tds); /* Overflow-safe allocation size */
-+		if (unlikely(alloc_sz == SIZE_MAX)) {
-+			return -EOVERFLOW;
-+		}
-+		priv = kzalloc(alloc_sz, mem_flags);
-+		if (unlikely(!priv)) {
-+			return -ENOMEM;
-+		}
- 
--	trace_xhci_urb_enqueue(urb);
-+		priv->num_tds = num_tds;
-+		priv->num_tds_done = 0;
-+		urb->hcpriv = priv;
- 
--	spin_lock_irqsave(&xhci->lock, flags);
-+		/* Stage 3: Critical section - final validation and queuing. */
-+		spin_lock_irqsave(&xhci->lock, flags);
- 
--	ret = xhci_check_args(hcd, urb->dev, urb->ep,
--			      true, true, __func__);
--	if (ret <= 0) {
--		ret = ret ? ret : -EINVAL;
--		goto free_priv;
--	}
-+		/* Re-validate state under the lock to protect against races. */
-+		vdev = xhci->devs[slot_id];
-+		if (unlikely(!vdev)) {
-+			ret = -ENODEV;
-+			goto err_free_unlock;
-+		}
- 
--	slot_id = urb->dev->slot_id;
-+		ret = xhci_check_args(hcd, urb->dev, urb->ep, true, true, __func__);
-+		if (ret <= 0) {
-+			ret = ret ? ret : -EINVAL;
-+			goto err_free_unlock;
-+		}
- 
--	if (!HCD_HW_ACCESSIBLE(hcd)) {
--		ret = -ESHUTDOWN;
--		goto free_priv;
--	}
-+		if (unlikely(!HCD_HW_ACCESSIBLE(hcd))) {
-+			ret = -ESHUTDOWN;
-+			goto err_free_unlock;
-+		}
- 
--	if (xhci->devs[slot_id]->flags & VDEV_PORT_ERROR) {
--		xhci_dbg(xhci, "Can't queue urb, port error, link inactive\n");
--		ret = -ENODEV;
--		goto free_priv;
--	}
-+		if (unlikely(vdev->flags & VDEV_PORT_ERROR)) {
-+			ret = -ENODEV;
-+			goto err_free_unlock;
-+		}
- 
--	if (xhci->xhc_state & XHCI_STATE_DYING) {
--		xhci_dbg(xhci, "Ep 0x%x: URB %p submitted for non-responsive xHCI host.\n",
--			 urb->ep->desc.bEndpointAddress, urb);
--		ret = -ESHUTDOWN;
--		goto free_priv;
--	}
-+		if (unlikely(xhci->xhc_state & (XHCI_STATE_DYING | XHCI_STATE_HALTED))) {
-+			ret = -ESHUTDOWN;
-+			goto err_free_unlock;
-+		}
- 
--	ep_state = &xhci->devs[slot_id]->eps[ep_index].ep_state;
-+		if (unlikely(vdev->eps[ep_index].ep_state &
-+			(EP_GETTING_STREAMS | EP_GETTING_NO_STREAMS |
-+			EP_SOFT_CLEAR_TOGGLE))) {
-+			ret = -EINVAL;
-+		goto err_free_unlock;
-+			}
- 
--	if (*ep_state & (EP_GETTING_STREAMS | EP_GETTING_NO_STREAMS)) {
--		xhci_warn(xhci, "WARN: Can't enqueue URB, ep in streams transition state %x\n",
--			  *ep_state);
--		ret = -EINVAL;
--		goto free_priv;
--	}
--	if (*ep_state & EP_SOFT_CLEAR_TOGGLE) {
--		xhci_warn(xhci, "Can't enqueue URB while manually clearing toggle\n");
--		ret = -EINVAL;
--		goto free_priv;
--	}
-+			/* Dispatch to the appropriate queueing function based on EP type. */
-+			switch (usb_endpoint_type(&urb->ep->desc)) {
-+				case USB_ENDPOINT_XFER_CONTROL:
-+					ret = xhci_queue_ctrl_tx(xhci, GFP_ATOMIC, urb,
-+											 slot_id, ep_index);
-+					break;
-+				case USB_ENDPOINT_XFER_BULK:
-+					ret = xhci_queue_bulk_tx(xhci, GFP_ATOMIC, urb,
-+											 slot_id, ep_index);
-+					break;
-+				case USB_ENDPOINT_XFER_INT:
-+					ret = xhci_queue_intr_tx(xhci, GFP_ATOMIC, urb,
-+											 slot_id, ep_index);
-+					break;
-+				case USB_ENDPOINT_XFER_ISOC:
-+					ret = xhci_queue_isoc_tx_prepare(xhci, GFP_ATOMIC, urb,
-+													 slot_id, ep_index);
-+					break;
-+				default:
-+					ret = -EINVAL;
-+					break;
-+			}
- 
--	switch (usb_endpoint_type(&urb->ep->desc)) {
-+			if (unlikely(ret)) {
-+				goto err_free_unlock;
-+			}
- 
--	case USB_ENDPOINT_XFER_CONTROL:
--		ret = xhci_queue_ctrl_tx(xhci, GFP_ATOMIC, urb,
--					 slot_id, ep_index);
--		break;
--	case USB_ENDPOINT_XFER_BULK:
--		ret = xhci_queue_bulk_tx(xhci, GFP_ATOMIC, urb,
--					 slot_id, ep_index);
--		break;
--	case USB_ENDPOINT_XFER_INT:
--		ret = xhci_queue_intr_tx(xhci, GFP_ATOMIC, urb,
--				slot_id, ep_index);
--		break;
--	case USB_ENDPOINT_XFER_ISOC:
--		ret = xhci_queue_isoc_tx_prepare(xhci, GFP_ATOMIC, urb,
--				slot_id, ep_index);
--	}
-+			spin_unlock_irqrestore(&xhci->lock, flags);
-+			trace_xhci_urb_enqueue(urb);
-+			return 0;
- 
--	if (ret) {
--free_priv:
--		xhci_urb_free_priv(urb_priv);
--		urb->hcpriv = NULL;
--	}
--	spin_unlock_irqrestore(&xhci->lock, flags);
--	return ret;
-+			err_free_unlock:
-+			xhci_urb_free_priv(priv);
-+			urb->hcpriv = NULL;
-+			spin_unlock_irqrestore(&xhci->lock, flags);
-+			return ret;
- }
- 
--/*
-- * Remove the URB's TD from the endpoint ring.  This may cause the HC to stop
-- * USB transfers, potentially stopping in the middle of a TRB buffer.  The HC
-- * should pick up where it left off in the TD, unless a Set Transfer Ring
-- * Dequeue Pointer is issued.
-- *
-- * The TRBs that make up the buffers for the canceled URB will be "removed" from
-- * the ring.  Since the ring is a contiguous structure, they can't be physically
-- * removed.  Instead, there are two options:
-- *
-- *  1) If the HC is in the middle of processing the URB to be canceled, we
-- *     simply move the ring's dequeue pointer past those TRBs using the Set
-- *     Transfer Ring Dequeue Pointer command.  This will be the common case,
-- *     when drivers timeout on the last submitted URB and attempt to cancel.
-- *
-- *  2) If the HC is in the middle of a different TD, we turn the TRBs into a
-- *     series of 1-TRB transfer no-op TDs.  (No-ops shouldn't be chained.)  The
-- *     HC will need to invalidate the any TRBs it has cached after the stop
-- *     endpoint command, as noted in the xHCI 0.95 errata.
-- *
-- *  3) The TD may have completed by the time the Stop Endpoint Command
-- *     completes, so software needs to handle that case too.
-- *
-- * This function should protect against the TD enqueueing code ringing the
-- * doorbell while this code is waiting for a Stop Endpoint command to complete.
-- * It also needs to account for multiple cancellations on happening at the same
-- * time for the same endpoint.
-- *
-- * Note that this function can be called in any context, or so says
-- * usb_hcd_unlink_urb()
-- */
- static int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
- {
--	unsigned long flags;
--	int ret, i;
--	u32 temp;
--	struct xhci_hcd *xhci;
--	struct urb_priv	*urb_priv;
-+	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
-+	struct xhci_virt_device *vdev;
-+	struct xhci_virt_ep *ep;
-+	struct xhci_ring *ring;
-+	struct urb_priv *priv;
- 	struct xhci_td *td;
-+	struct xhci_command *cmd = NULL;
- 	unsigned int ep_index;
--	struct xhci_ring *ep_ring;
--	struct xhci_virt_ep *ep;
--	struct xhci_command *command;
--	struct xhci_virt_device *vdev;
-+	unsigned long flags;
-+	u32 hcsts;
-+	int i, ret = 0;
- 
--	xhci = hcd_to_xhci(hcd);
- 	spin_lock_irqsave(&xhci->lock, flags);
--
- 	trace_xhci_urb_dequeue(urb);
- 
--	/* Make sure the URB hasn't completed or been unlinked already */
- 	ret = usb_hcd_check_unlink_urb(hcd, urb, status);
--	if (ret)
--		goto done;
-+	if (ret) {
-+		spin_unlock_irqrestore(&xhci->lock, flags);
-+		return ret;
-+	}
- 
--	/* give back URB now if we can't queue it for cancel */
-+	/* Validate that our driver structures are still valid. */
- 	vdev = xhci->devs[urb->dev->slot_id];
--	urb_priv = urb->hcpriv;
--	if (!vdev || !urb_priv)
--		goto err_giveback;
-+	priv = urb->hcpriv;
-+	if (unlikely(!vdev || !priv)) {
-+		goto giveback;
-+	}
- 
- 	ep_index = xhci_get_endpoint_index(&urb->ep->desc);
- 	ep = &vdev->eps[ep_index];
--	ep_ring = xhci_urb_to_transfer_ring(xhci, urb);
--	if (!ep || !ep_ring)
--		goto err_giveback;
-+	ring = xhci_urb_to_transfer_ring(xhci, urb);
-+	if (unlikely(!ring || !td_on_ring(&priv->td[0], ring))) {
-+		goto giveback;
-+	}
- 
--	/* If xHC is dead take it down and return ALL URBs in xhci_hc_died() */
--	temp = readl(&xhci->op_regs->status);
--	if (temp == ~(u32)0 || xhci->xhc_state & XHCI_STATE_DYING) {
-+	/* Handle fatal host controller states. */
-+	hcsts = readl(&xhci->op_regs->status);
-+	if (hcsts == ~(u32)0 || (xhci->xhc_state & XHCI_STATE_DYING)) {
- 		xhci_hc_died(xhci);
--		goto done;
-+		spin_unlock_irqrestore(&xhci->lock, flags);
-+		return 0; /* The giveback will happen in xhci_hc_died */
- 	}
- 
--	/*
--	 * check ring is not re-allocated since URB was enqueued. If it is, then
--	 * make sure none of the ring related pointers in this URB private data
--	 * are touched, such as td_list, otherwise we overwrite freed data
--	 */
--	if (!td_on_ring(&urb_priv->td[0], ep_ring)) {
--		xhci_err(xhci, "Canceled URB td not found on endpoint ring");
--		for (i = urb_priv->num_tds_done; i < urb_priv->num_tds; i++) {
--			td = &urb_priv->td[i];
--			if (!list_empty(&td->cancelled_td_list))
--				list_del_init(&td->cancelled_td_list);
-+	if (xhci->xhc_state & XHCI_STATE_HALTED) {
-+		for (i = priv->num_tds_done; i < priv->num_tds; i++) {
-+			td = &priv->td[i];
-+			list_del_init(&td->td_list);
-+			list_del_init(&td->cancelled_td_list);
- 		}
--		goto err_giveback;
-+		goto giveback;
- 	}
- 
--	if (xhci->xhc_state & XHCI_STATE_HALTED) {
--		xhci_dbg_trace(xhci, trace_xhci_dbg_cancel_urb,
--				"HC halted, freeing TD manually.");
--		for (i = urb_priv->num_tds_done;
--		     i < urb_priv->num_tds;
--		     i++) {
--			td = &urb_priv->td[i];
--			if (!list_empty(&td->td_list))
--				list_del_init(&td->td_list);
--			if (!list_empty(&td->cancelled_td_list))
--				list_del_init(&td->cancelled_td_list);
--		}
--		goto err_giveback;
--	}
--
--	i = urb_priv->num_tds_done;
--	if (i < urb_priv->num_tds)
--		xhci_dbg_trace(xhci, trace_xhci_dbg_cancel_urb,
--				"Cancel URB %p, dev %s, ep 0x%x, "
--				"starting at offset 0x%llx",
--				urb, urb->dev->devpath,
--				urb->ep->desc.bEndpointAddress,
--				(unsigned long long) xhci_trb_virt_to_dma(
--					urb_priv->td[i].start_seg,
--					urb_priv->td[i].start_trb));
--
--	for (; i < urb_priv->num_tds; i++) {
--		td = &urb_priv->td[i];
--		/* TD can already be on cancelled list if ep halted on it */
-+	/* Add all outstanding TDs from this URB to the cancelled list. */
-+	for (i = priv->num_tds_done; i < priv->num_tds; i++) {
-+		td = &priv->td[i];
- 		if (list_empty(&td->cancelled_td_list)) {
- 			td->cancel_status = TD_DIRTY;
- 			list_add_tail(&td->cancelled_td_list,
--				      &ep->cancelled_td_list);
-+						  &ep->cancelled_td_list);
- 		}
- 	}
- 
--	/* These completion handlers will sort out cancelled TDs for us */
-+	/*
-+	 * Check the endpoint state to decide if a new Stop Endpoint command
-+	 * is needed. If one is already pending or the EP is halted, we can
-+	 * just wait for that to complete.
-+	 */
- 	if (ep->ep_state & (EP_STOP_CMD_PENDING | EP_HALTED | SET_DEQ_PENDING)) {
--		xhci_dbg(xhci, "Not queuing Stop Endpoint on slot %d ep %d in state 0x%x\n",
--				urb->dev->slot_id, ep_index, ep->ep_state);
--		goto done;
-+		goto unlock_ok;
- 	}
- 
--	/* In this case no commands are pending but the endpoint is stopped */
- 	if (ep->ep_state & EP_CLEARING_TT) {
--		/* and cancelled TDs can be given back right away */
--		xhci_dbg(xhci, "Invalidating TDs instantly on slot %d ep %d in state 0x%x\n",
--				urb->dev->slot_id, ep_index, ep->ep_state);
- 		xhci_process_cancelled_tds(ep);
--	} else {
--		/* Otherwise, queue a new Stop Endpoint command */
--		command = xhci_alloc_command(xhci, false, GFP_ATOMIC);
--		if (!command) {
--			ret = -ENOMEM;
--			goto done;
--		}
--		ep->stop_time = jiffies;
--		ep->ep_state |= EP_STOP_CMD_PENDING;
--		xhci_queue_stop_endpoint(xhci, command, urb->dev->slot_id,
--					 ep_index, 0);
--		xhci_ring_cmd_db(xhci);
-+		goto unlock_ok;
- 	}
--done:
-+
-+	/* We need to issue a new Stop Endpoint command. */
-+	ep->ep_state |= EP_STOP_CMD_PENDING;
-+	ep->stop_time = jiffies;
-+
- 	spin_unlock_irqrestore(&xhci->lock, flags);
--	return ret;
- 
--err_giveback:
--	if (urb_priv)
--		xhci_urb_free_priv(urb_priv);
-+	/* Use GFP_ATOMIC as this function can be called from atomic context. */
-+	cmd = xhci_alloc_command(xhci, false, GFP_ATOMIC);
-+	if (unlikely(!cmd)) {
-+		status = -ENOMEM;
-+		goto giveback_nolock;
-+	}
-+
-+	spin_lock_irqsave(&xhci->lock, flags);
-+
-+	/* Re-check state after acquiring lock again. */
-+	if (!(ep->ep_state & EP_STOP_CMD_PENDING)) {
-+		spin_unlock_irqrestore(&xhci->lock, flags);
-+		xhci_free_command(xhci, cmd);
-+		return 0;
-+	}
-+
-+	ret = xhci_queue_stop_endpoint(xhci, cmd, urb->dev->slot_id, ep_index, 0);
-+	if (unlikely(ret)) {
-+		ep->ep_state &= ~EP_STOP_CMD_PENDING;
-+		spin_unlock_irqrestore(&xhci->lock, flags);
-+		xhci_free_command(xhci, cmd);
-+		status = ret;
-+		goto giveback_nolock;
-+	}
-+
-+	xhci_ring_cmd_db(xhci);
-+
-+	unlock_ok:
-+	spin_unlock_irqrestore(&xhci->lock, flags);
-+	return 0;
-+
-+	giveback:
- 	usb_hcd_unlink_urb_from_ep(hcd, urb);
-+	if (priv) {
-+		xhci_urb_free_priv(priv);
-+	}
- 	spin_unlock_irqrestore(&xhci->lock, flags);
--	usb_hcd_giveback_urb(hcd, urb, -ESHUTDOWN);
-+	usb_hcd_giveback_urb(hcd, urb, status);
-+	return ret;
-+
-+	giveback_nolock:
-+	usb_hcd_unlink_urb_from_ep(hcd, urb);
-+	if (priv) {
-+		xhci_urb_free_priv(priv);
-+	}
-+	usb_hcd_giveback_urb(hcd, urb, status);
- 	return ret;
- }
- 
-@@ -5203,57 +5224,68 @@ static void xhci_hcd_init_usb3_data(stru
- {
- 	unsigned int minor_rev;
- 
-+	/* Defensively check for initialized structures to prevent crashes. */
-+	if (unlikely(!hcd || !hcd->self.root_hub || xhci->usb3_rhub.min_rev == 0)) {
-+		xhci_dbg(xhci, "USB3 init deferred: hcd or root hub unavailable.\n");
-+		return;
-+	}
-+
- 	/*
--	 * Early xHCI 1.1 spec did not mention USB 3.1 capable hosts
--	 * should return 0x31 for sbrn, or that the minor revision
--	 * is a two digit BCD containig minor and sub-minor numbers.
--	 * This was later clarified in xHCI 1.2.
--	 *
--	 * Some USB 3.1 capable hosts therefore have sbrn 0x30, and
--	 * minor revision set to 0x1 instead of 0x10.
-+	 * Per xHCI spec, min_rev is a BCD value. The high nibble is the minor
-+	 * revision. Some early controllers incorrectly reported '1' instead
-+	 * of '0x10' for version 1.1. The '>> 4' is an idiomatic and efficient
-+	 * way to extract the high nibble.
- 	 */
--	if (xhci->usb3_rhub.min_rev == 0x1)
--		minor_rev = 1;
--	else
--		minor_rev = xhci->usb3_rhub.min_rev / 0x10;
-+	minor_rev = (xhci->usb3_rhub.min_rev == 0x1) ? 1 : (xhci->usb3_rhub.min_rev >> 4);
- 
- 	switch (minor_rev) {
--	case 2:
--		hcd->speed = HCD_USB32;
--		hcd->self.root_hub->speed = USB_SPEED_SUPER_PLUS;
--		hcd->self.root_hub->rx_lanes = 2;
--		hcd->self.root_hub->tx_lanes = 2;
--		hcd->self.root_hub->ssp_rate = USB_SSP_GEN_2x2;
--		break;
--	case 1:
--		hcd->speed = HCD_USB31;
--		hcd->self.root_hub->speed = USB_SPEED_SUPER_PLUS;
--		hcd->self.root_hub->ssp_rate = USB_SSP_GEN_2x1;
--		break;
-+		case 2:
-+			hcd->speed = HCD_USB32;
-+			hcd->self.root_hub->speed = USB_SPEED_SUPER_PLUS;
-+			hcd->self.root_hub->rx_lanes = 2;
-+			hcd->self.root_hub->tx_lanes = 2;
-+			hcd->self.root_hub->ssp_rate = USB_SSP_GEN_2x2;
-+			break;
-+		case 1:
-+			hcd->speed = HCD_USB31;
-+			hcd->self.root_hub->speed = USB_SPEED_SUPER_PLUS;
-+			hcd->self.root_hub->ssp_rate = USB_SSP_GEN_2x1;
-+			break;
-+		default:
-+			/* Gracefully handle unknown revisions by defaulting to USB 3.0. */
-+			hcd->speed = HCD_USB3;
-+			hcd->self.root_hub->speed = USB_SPEED_SUPER;
-+			break;
- 	}
-+
- 	xhci_info(xhci, "Host supports USB 3.%x %sSuperSpeed\n",
--		  minor_rev, minor_rev ? "Enhanced " : "");
-+			  minor_rev, minor_rev ? "Enhanced " : "");
- 
- 	xhci->usb3_rhub.hcd = hcd;
- }
- 
-+/**
-+ * @brief Generic setup for an xHCI host controller.
-+ *
-+ * This is the main entry point for initializing the xHCI driver. It performs
-+ * critical hardware validation, sets up DMA, applies quirks, resets the
-+ * hardware, and initializes all necessary driver data structures. This function
-+ * is hardened to prevent boot failures on systems where the xHCI hardware is
-+ * not immediately ready.
-+ *
-+ * @param hcd The generic HCD to be set up.
-+ * @param get_quirks A callback function to apply platform-specific quirks.
-+ * @return 0 on success, or a negative errno code on failure.
-+ */
- int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks)
- {
--	struct xhci_hcd		*xhci;
--	/*
--	 * TODO: Check with DWC3 clients for sysdev according to
--	 * quirks
--	 */
--	struct device		*dev = hcd->self.sysdev;
--	int			retval;
-+	struct xhci_hcd *xhci;
-+	struct device *dev = hcd->self.sysdev;
-+	int retval;
-+	u32 cap;
- 
--	/* Accept arbitrarily long scatter-gather lists */
- 	hcd->self.sg_tablesize = ~0;
--
--	/* support to build packet from discontinuous buffers */
- 	hcd->self.no_sg_constraint = 1;
--
--	/* XHCI controllers don't stop the ep queue on short packets :| */
- 	hcd->self.no_stop_on_short = 1;
- 
- 	xhci = hcd_to_xhci(hcd);
-@@ -5264,99 +5296,110 @@ int xhci_gen_setup(struct usb_hcd *hcd,
- 	}
- 
- 	mutex_init(&xhci->mutex);
-+	spin_lock_init(&xhci->lock);
- 	xhci->main_hcd = hcd;
- 	xhci->cap_regs = hcd->regs;
--	xhci->op_regs = hcd->regs +
--		HC_LENGTH(readl(&xhci->cap_regs->hc_capbase));
--	xhci->run_regs = hcd->regs +
--		(readl(&xhci->cap_regs->run_regs_off) & RTSOFF_MASK);
--	/* Cache read-only capability registers */
-+
-+	/*
-+	 * BOOT FIX: Validate capability registers before use. If the HC returns
-+	 * all 1s, it's not ready. Probing it further will cause a crash.
-+	 */
-+	cap = readl(&xhci->cap_regs->hc_capbase);
-+	if (unlikely(cap == ~(u32)0)) {
-+		dev_err(dev, "xHCI capability registers invalid (0x%08x), HC not ready. Aborting.\n", cap);
-+		return -ENXIO;
-+	}
-+
-+	xhci->op_regs = hcd->regs + HC_LENGTH(cap);
-+	xhci->run_regs = hcd->regs + (readl(&xhci->cap_regs->run_regs_off) & RTSOFF_MASK);
-+
- 	xhci->hcs_params1 = readl(&xhci->cap_regs->hcs_params1);
- 	xhci->hcs_params2 = readl(&xhci->cap_regs->hcs_params2);
- 	xhci->hcs_params3 = readl(&xhci->cap_regs->hcs_params3);
--	xhci->hci_version = HC_VERSION(readl(&xhci->cap_regs->hc_capbase));
- 	xhci->hcc_params = readl(&xhci->cap_regs->hcc_params);
--	if (xhci->hci_version > 0x100)
-+	xhci->hci_version = HC_VERSION(cap);
-+	if (xhci->hci_version > 0x100) {
- 		xhci->hcc_params2 = readl(&xhci->cap_regs->hcc_params2);
-+	}
- 
--	/* xhci-plat or xhci-pci might have set max_interrupters already */
--	if ((!xhci->max_interrupters) ||
--	    xhci->max_interrupters > HCS_MAX_INTRS(xhci->hcs_params1))
-+	if (!xhci->max_interrupters ||
-+		xhci->max_interrupters > HCS_MAX_INTRS(xhci->hcs_params1)) {
- 		xhci->max_interrupters = HCS_MAX_INTRS(xhci->hcs_params1);
-+		}
- 
--	xhci->quirks |= quirks;
--
--	if (get_quirks)
-+		/* Safe quirk handling: Zero -> Hardware -> User. */
-+		xhci->quirks = 0;
-+	if (get_quirks) {
- 		get_quirks(dev, xhci);
-+	}
-+	xhci->quirks |= quirks;
- 
--	/* In xhci controllers which follow xhci 1.0 spec gives a spurious
--	 * success event after a short transfer. This quirk will ignore such
--	 * spurious event.
--	 */
--	if (xhci->hci_version > 0x96)
-+	if (xhci->hci_version > 0x96) {
- 		xhci->quirks |= XHCI_SPURIOUS_SUCCESS;
--
-+	}
- 	if (xhci->hci_version == 0x95 && link_quirk) {
--		xhci_dbg(xhci, "QUIRK: Not clearing Link TRB chain bits");
- 		xhci->quirks |= XHCI_LINK_TRB_QUIRK;
- 	}
- 
--	/* Make sure the HC is halted. */
- 	retval = xhci_halt(xhci);
--	if (retval)
-+	if (retval) {
-+		dev_err(dev, "xHCI halt failed: %d\n", retval);
- 		return retval;
-+	}
- 
- 	xhci_zero_64b_regs(xhci);
- 
- 	xhci_dbg(xhci, "Resetting HCD\n");
--	/* Reset the internal HC memory state and registers. */
- 	retval = xhci_reset(xhci, XHCI_RESET_LONG_USEC);
--	if (retval)
-+	if (retval) {
-+		dev_err(dev, "xHCI reset failed: %d\n", retval);
- 		return retval;
-+	}
- 	xhci_dbg(xhci, "Reset complete\n");
- 
--	/*
--	 * On some xHCI controllers (e.g. R-Car SoCs), the AC64 bit (bit 0)
--	 * of HCCPARAMS1 is set to 1. However, the xHCs don't support 64-bit
--	 * address memory pointers actually. So, this driver clears the AC64
--	 * bit of xhci->hcc_params to call dma_set_coherent_mask(dev,
--	 * DMA_BIT_MASK(32)) in this xhci_gen_setup().
--	 */
--	if (xhci->quirks & XHCI_NO_64BIT_SUPPORT)
-+	/* Correctly clear the AC64 capability bit if the quirk is set. */
-+	if (xhci->quirks & XHCI_NO_64BIT_SUPPORT) {
- 		xhci->hcc_params &= ~BIT(0);
-+	}
- 
--	/* Set dma_mask and coherent_dma_mask to 64-bits,
--	 * if xHC supports 64-bit addressing */
--	if (HCC_64BIT_ADDR(xhci->hcc_params) &&
--			!dma_set_mask(dev, DMA_BIT_MASK(64))) {
--		xhci_dbg(xhci, "Enabling 64-bit DMA addresses.\n");
--		dma_set_coherent_mask(dev, DMA_BIT_MASK(64));
-+	/* Set DMA mask. Prefer 64-bit for performance on capable systems. */
-+	if (HCC_64BIT_ADDR(xhci->hcc_params)) {
-+		if (dma_set_mask_and_coherent(dev, U64_MAX)) {
-+			xhci_warn(xhci, "Could not set 64-bit DMA mask, falling back to 32-bit.\n");
-+			if (dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32))) {
-+				dev_err(dev, "Failed to set any DMA mask.\n");
-+				return -EIO;
-+			}
-+		} else {
-+			xhci_dbg(xhci, "Enabling 64-bit DMA addresses.\n");
-+		}
- 	} else {
--		/*
--		 * This is to avoid error in cases where a 32-bit USB
--		 * controller is used on a 64-bit capable system.
--		 */
--		retval = dma_set_mask(dev, DMA_BIT_MASK(32));
--		if (retval)
--			return retval;
-+		if (dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32))) {
-+			dev_err(dev, "Failed to set 32-bit DMA mask.\n");
-+			return -EIO;
-+		}
- 		xhci_dbg(xhci, "Enabling 32-bit DMA addresses.\n");
--		dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
- 	}
- 
- 	xhci_dbg(xhci, "Calling HCD init\n");
--	/* Initialize HCD and host controller data structures. */
- 	retval = xhci_init(hcd);
--	if (retval)
-+	if (retval) {
- 		return retval;
--	xhci_dbg(xhci, "Called HCD init\n");
-+	}
- 
--	if (xhci_hcd_is_usb3(hcd))
--		xhci_hcd_init_usb3_data(xhci, hcd);
--	else
-+	/* Correctly target the controller device for PM operations. */
-+	if (xhci->quirks & XHCI_DEFAULT_PM_RUNTIME_ALLOW) {
-+		pm_runtime_allow(hcd->self.controller);
-+	}
-+
-+	if (usb_hcd_is_primary_hcd(hcd)) {
- 		xhci_hcd_init_usb2_data(xhci, hcd);
-+	} else {
-+		xhci_hcd_init_usb3_data(xhci, hcd);
-+	}
- 
- 	xhci_info(xhci, "hcc params 0x%08x hci version 0x%x quirks 0x%016llx\n",
--		  xhci->hcc_params, xhci->hci_version, xhci->quirks);
-+			  xhci->hcc_params, xhci->hci_version, xhci->quirks);
- 
- 	return 0;
- }
++++ b/drivers/usb/host/xhci.c	2025-09-03 01:59:47.529699115 +0200
 
 From: Peter Zijlstra <peterz@infradead.org>
 
