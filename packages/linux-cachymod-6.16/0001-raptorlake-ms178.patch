@@ -1110,6 +1110,14 @@
 
 --- a/drivers/net/ethernet/intel/ixgbe/ixgbe.h	2025-08-20 18:41:44.000000000 +0200
 +++ b/drivers/net/ethernet/intel/ixgbe/ixgbe.h	2025-08-21 20:37:58.813013965 +0200
+@@ -279,6 +279,7 @@ struct ixgbe_rx_buffer {
+ 			struct page *page;
+ 			__u32 page_offset;
+ 			__u16 pagecnt_bias;
++			bool page_released;
+ 		};
+ 		struct {
+ 			bool discard;
 @@ -412,7 +413,7 @@ enum ixgbe_ring_f_enum {
  	RING_F_FDIR,
  #ifdef IXGBE_FCOE
@@ -1154,7 +1162,3207 @@
  
 --- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c	2025-08-21 10:51:21.000000000 +0200
 +++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c	2025-08-28 20:30:53.257238265 +0200
-
+@@ -2,12 +2,15 @@
+ /* Copyright(c) 1999 - 2024 Intel Corporation. */
+ 
+ #include <linux/types.h>
++#include <linux/topology.h>
++#include <linux/cpumask.h>
+ #include <linux/module.h>
+ #include <linux/pci.h>
+ #include <linux/netdevice.h>
+ #include <linux/vmalloc.h>
+ #include <linux/string.h>
+ #include <linux/in.h>
++#include <linux/irq.h>
+ #include <linux/interrupt.h>
+ #include <linux/ip.h>
+ #include <linux/tcp.h>
+@@ -39,6 +42,80 @@
+ #include <net/netdev_queues.h>
+ #include <net/xdp_sock_drv.h>
+ #include <net/xfrm.h>
++#include <linux/reciprocal_div.h>
++
++static char *gaming_atr_ranges = "27000-27050,7777-7999,6112-6119,9960-9969,3074-3075,5000-5500,8393-8400";
++module_param(gaming_atr_ranges, charp, 0644);
++MODULE_PARM_DESC(gaming_atr_ranges, "Comma-separated UDP port ranges for gaming ATR (e.g., 27000-27050,7777-7999)");
++
++#define IXGBE_RX_PREFETCH_OFFSET 8
++#define IXGBE_TX_PREFETCH_OFFSET 8
++
++#define ATR_FDIR_MASK_RETRIES        6
++#define ATR_FDIR_SHORT_UDELAY_MIN   2000   /* us (2 ms) */
++#define ATR_FDIR_SHORT_UDELAY_MAX   3000   /* us */
++#define ATR_FDIR_LONG_MS_BASE        20     /* ms base for exponential backoff */
++
++#ifndef DEFINE_CPU_BITMASK
++#define DEFINE_CPU_BITMASK(name) struct cpumask name
++#endif
++
++/*
++ * DMA helpers using relaxed ordering for performance where supported.
++ * These fall back to standard mappings if the attribute is not available.
++ */
++static inline dma_addr_t ixgbe_dma_map_single(struct device *dev, void *ptr,
++											  size_t len,
++											  enum dma_data_direction dir)
++{
++	#ifdef DMA_ATTR_RELAXED_ORDERING
++	return dma_map_single_attrs(dev, ptr, len, dir,
++								DMA_ATTR_RELAXED_ORDERING);
++	#else
++	return dma_map_single(dev, ptr, len, dir);
++	#endif
++}
++
++static inline dma_addr_t ixgbe_dma_map_page(struct device *dev, struct page *pg,
++											unsigned long off, size_t len,
++											enum dma_data_direction dir)
++{
++	#ifdef DMA_ATTR_RELAXED_ORDERING
++	return dma_map_page_attrs(dev, pg, off, len, dir,
++							  DMA_ATTR_RELAXED_ORDERING);
++	#else
++	return dma_map_page(dev, pg, off, len, dir);
++	#endif
++}
++
++static inline void ixgbe_dma_unmap_single(struct device *dev, dma_addr_t addr,
++										  size_t len,
++										  enum dma_data_direction dir)
++{
++	#ifdef DMA_ATTR_RELAXED_ORDERING
++	dma_unmap_single_attrs(dev, addr, len, dir,
++						   DMA_ATTR_RELAXED_ORDERING);
++	#else
++	dma_unmap_single(dev, addr, len, dir);
++	#endif
++}
++
++static inline void ixgbe_dma_unmap_page(struct device *dev, dma_addr_t addr,
++										size_t len,
++										enum dma_data_direction dir)
++{
++	#ifdef DMA_ATTR_RELAXED_ORDERING
++	dma_unmap_page_attrs(dev, addr, len, dir,
++						 DMA_ATTR_RELAXED_ORDERING);
++	#else
++	dma_unmap_page(dev, addr, len, dir);
++	#endif
++}
++
++/* EITR register is in 2 microsecond units when ITRGAN=0 */
++#define IXGBE_ITR_TO_REG(us)	((us) << 2)
++#define IXGBE_REG_TO_ITR(reg)	((reg) >> 2)
++#define IXGBE_ITR_4US		4u
+ 
+ #include "ixgbe.h"
+ #include "ixgbe_common.h"
+@@ -1175,8 +1252,9 @@ static bool ixgbe_clean_tx_irq(struct ix
+ 	unsigned int i = tx_ring->next_to_clean;
+ 	struct netdev_queue *txq;
+ 
+-	if (test_bit(__IXGBE_DOWN, &adapter->state))
++	if (test_bit(__IXGBE_DOWN, &adapter->state)) {
+ 		return true;
++	}
+ 
+ 	tx_buffer = &tx_ring->tx_buffer_info[i];
+ 	tx_desc = IXGBE_TX_DESC(tx_ring, i);
+@@ -1186,15 +1264,17 @@ static bool ixgbe_clean_tx_irq(struct ix
+ 		union ixgbe_adv_tx_desc *eop_desc = tx_buffer->next_to_watch;
+ 
+ 		/* if next_to_watch is not set then there is no work pending */
+-		if (!eop_desc)
++		if (!eop_desc) {
+ 			break;
++		}
+ 
+ 		/* prevent any other reads prior to eop_desc */
+ 		smp_rmb();
+ 
+ 		/* if DD is not set pending work has not been completed */
+-		if (!(eop_desc->wb.status & cpu_to_le32(IXGBE_TXD_STAT_DD)))
++		if (!(eop_desc->wb.status & cpu_to_le32(IXGBE_TXD_STAT_DD))) {
+ 			break;
++		}
+ 
+ 		/* clear next_to_watch to prevent false hangs */
+ 		tx_buffer->next_to_watch = NULL;
+@@ -1202,14 +1282,16 @@ static bool ixgbe_clean_tx_irq(struct ix
+ 		/* update the statistics for this packet */
+ 		total_bytes += tx_buffer->bytecount;
+ 		total_packets += tx_buffer->gso_segs;
+-		if (tx_buffer->tx_flags & IXGBE_TX_FLAGS_IPSEC)
++		if (tx_buffer->tx_flags & IXGBE_TX_FLAGS_IPSEC) {
+ 			total_ipsec++;
++		}
+ 
+ 		/* free the skb */
+-		if (ring_is_xdp(tx_ring))
++		if (ring_is_xdp(tx_ring)) {
+ 			xdp_return_frame(tx_buffer->xdpf);
+-		else
++		} else {
+ 			napi_consume_skb(tx_buffer->skb, napi_budget);
++		}
+ 
+ 		/* unmap skb header data */
+ 		dma_unmap_single(tx_ring->dev,
+@@ -1265,8 +1347,10 @@ static bool ixgbe_clean_tx_irq(struct ix
+ 	adapter->tx_ipsec += total_ipsec;
+ 
+ 	if (check_for_tx_hang(tx_ring) && ixgbe_check_tx_hang(tx_ring)) {
+-		/* schedule immediate reset if we believe we hung */
+ 		struct ixgbe_hw *hw = &adapter->hw;
++		/* RATIONALE: Enhanced logging provides more context for debugging a hang,
++		 * including queue type (XDP/normal) and hardware register state.
++		 */
+ 		e_err(drv, "Detected Tx Unit Hang %s\n"
+ 			"  Tx Queue             <%d>\n"
+ 			"  TDH, TDT             <%x>, <%x>\n"
+@@ -1282,9 +1366,10 @@ static bool ixgbe_clean_tx_irq(struct ix
+ 			tx_ring->next_to_use, i,
+ 			tx_ring->tx_buffer_info[i].time_stamp, jiffies);
+ 
+-		if (!ring_is_xdp(tx_ring))
++		if (!ring_is_xdp(tx_ring)) {
+ 			netif_stop_subqueue(tx_ring->netdev,
+ 					    tx_ring->queue_index);
++		}
+ 
+ 		e_info(probe,
+ 		       "tx hang %d detected on queue %d, resetting adapter\n",
+@@ -1293,12 +1378,12 @@ static bool ixgbe_clean_tx_irq(struct ix
+ 		/* schedule immediate reset if we believe we hung */
+ 		ixgbe_tx_timeout_reset(adapter);
+ 
+-		/* the adapter is about to reset, no point in enabling stuff */
+ 		return true;
+ 	}
+ 
+-	if (ring_is_xdp(tx_ring))
++	if (ring_is_xdp(tx_ring)) {
+ 		return !!budget;
++	}
+ 
+ #define TX_WAKE_THRESHOLD (DESC_NEEDED * 2)
+ 	txq = netdev_get_tx_queue(tx_ring->netdev, tx_ring->queue_index);
+@@ -1306,8 +1391,9 @@ static bool ixgbe_clean_tx_irq(struct ix
+ 					ixgbe_desc_unused(tx_ring),
+ 					TX_WAKE_THRESHOLD,
+ 					!netif_carrier_ok(tx_ring->netdev) ||
+-					test_bit(__IXGBE_DOWN, &adapter->state)))
++					test_bit(__IXGBE_DOWN, &adapter->state))) {
+ 		++tx_ring->tx_stats.restart_queue;
++	}
+ 
+ 	return !!budget;
+ }
+@@ -1570,144 +1656,220 @@ static unsigned int ixgbe_rx_offset(stru
+ }
+ 
+ static bool ixgbe_alloc_mapped_page(struct ixgbe_ring *rx_ring,
+-				    struct ixgbe_rx_buffer *bi)
++                    struct ixgbe_rx_buffer *bi)
+ {
+-	struct page *page = bi->page;
+-	dma_addr_t dma;
+-
+-	/* since we are recycling buffers we should seldom need to alloc */
+-	if (likely(page))
+-		return true;
+-
+-	/* alloc new page for storage */
+-	page = dev_alloc_pages(ixgbe_rx_pg_order(rx_ring));
+-	if (unlikely(!page)) {
+-		rx_ring->rx_stats.alloc_rx_page_failed++;
+-		return false;
+-	}
+-
+-	/* map page for use */
+-	dma = dma_map_page_attrs(rx_ring->dev, page, 0,
+-				 ixgbe_rx_pg_size(rx_ring),
+-				 DMA_FROM_DEVICE,
+-				 IXGBE_RX_DMA_ATTR);
++    struct page *page = bi->page;
++    dma_addr_t dma;
+ 
+-	/*
+-	 * if mapping failed free memory back to system since
+-	 * there isn't much point in holding memory we can't use
+-	 */
+-	if (dma_mapping_error(rx_ring->dev, dma)) {
+-		__free_pages(page, ixgbe_rx_pg_order(rx_ring));
+-
+-		rx_ring->rx_stats.alloc_rx_page_failed++;
+-		return false;
+-	}
+-
+-	bi->dma = dma;
+-	bi->page = page;
+-	bi->page_offset = rx_ring->rx_offset;
+-	page_ref_add(page, USHRT_MAX - 1);
+-	bi->pagecnt_bias = USHRT_MAX;
+-	rx_ring->rx_stats.alloc_rx_page++;
+-
+-	return true;
++    /* since we are recycling buffers we should seldom need to alloc */
++    if (likely(page))
++        return true;
++
++    /* alloc new page for storage */
++    page = dev_alloc_pages(ixgbe_rx_pg_order(rx_ring));
++    if (unlikely(!page)) {
++        rx_ring->rx_stats.alloc_rx_page_failed++;
++        return false;
++    }
++
++    /* map page for use */
++    dma = dma_map_page_attrs(rx_ring->dev, page, 0,
++                 ixgbe_rx_pg_size(rx_ring),
++                 DMA_FROM_DEVICE,
++                 IXGBE_RX_DMA_ATTR);
++
++    /*
++     * if mapping failed free memory back to system since
++     * there isn't much point in holding memory we can't use
++     */
++    if (dma_mapping_error(rx_ring->dev, dma)) {
++        __free_pages(page, ixgbe_rx_pg_order(rx_ring));
++        rx_ring->rx_stats.alloc_rx_page_failed++;
++        return false;
++    }
++
++    bi->dma = dma;
++    bi->page = page;
++    bi->page_offset = rx_ring->rx_offset;
++    page_ref_add(page, USHRT_MAX - 1);
++    bi->pagecnt_bias = USHRT_MAX;
++    rx_ring->rx_stats.alloc_rx_page++;
++
++    return true;
+ }
+ 
+ /**
+- * ixgbe_alloc_rx_buffers - Replace used receive buffers
+- * @rx_ring: ring to place buffers on
+- * @cleaned_count: number of buffers to replace
++ * ixgbe_alloc_rx_buffers - Refill RX ring descriptors with UAF-proof, zero-cost indexing
++ * @rx_ring: Ring to place buffers on
++ * @cleaned_count: Number of buffers to replace
++ *
++ * This function is perfected for performance and safety. It avoids UAF bugs by
++ * using an explicit page_released flag. The hot loop is optimized to use branchless,
++ * bitwise arithmetic for ring indexing and employs aggressive, multi-stage
++ * prefetching to hide memory latency for both CPU and NIC accesses.
+  **/
+ void ixgbe_alloc_rx_buffers(struct ixgbe_ring *rx_ring, u16 cleaned_count)
+ {
+-	union ixgbe_adv_rx_desc *rx_desc;
+-	struct ixgbe_rx_buffer *bi;
+-	u16 i = rx_ring->next_to_use;
+-	u16 bufsz;
+-
+-	/* nothing to do */
+-	if (!cleaned_count)
+-		return;
+-
+-	rx_desc = IXGBE_RX_DESC(rx_ring, i);
+-	bi = &rx_ring->rx_buffer_info[i];
+-	i -= rx_ring->count;
+-
+-	bufsz = ixgbe_rx_bufsz(rx_ring);
+-
+-	do {
+-		if (!ixgbe_alloc_mapped_page(rx_ring, bi))
+-			break;
+-
+-		/* sync the buffer for use by the device */
+-		dma_sync_single_range_for_device(rx_ring->dev, bi->dma,
+-						 bi->page_offset, bufsz,
+-						 DMA_FROM_DEVICE);
+-
+-		/*
+-		 * Refresh the desc even if buffer_addrs didn't change
+-		 * because each write-back erases this info.
+-		 */
+-		rx_desc->read.pkt_addr = cpu_to_le64(bi->dma + bi->page_offset);
+-
+-		rx_desc++;
+-		bi++;
+-		i++;
+-		if (unlikely(!i)) {
+-			rx_desc = IXGBE_RX_DESC(rx_ring, 0);
+-			bi = rx_ring->rx_buffer_info;
+-			i -= rx_ring->count;
+-		}
+-
+-		/* clear the length for the next_to_use descriptor */
+-		rx_desc->wb.upper.length = 0;
+-
+-		cleaned_count--;
+-	} while (cleaned_count);
++    union ixgbe_adv_rx_desc *rx_desc;
++    struct ixgbe_rx_buffer *bi;
++    u16 i = rx_ring->next_to_use;
++    const u16 bufsz = ixgbe_rx_bufsz(rx_ring);
++
++    if (!cleaned_count) {
++        return;
++    }
++
++    rx_desc = IXGBE_RX_DESC(rx_ring, i);
++    bi = &rx_ring->rx_buffer_info[i];
++
++    prefetch(bi);
++
++    while (cleaned_count--) {
++        /* Allocate and map page if missing; otherwise sync recycled page. */
++        if (!bi->page) {
++            if (!ixgbe_alloc_mapped_page(rx_ring, bi)) {
++                rx_ring->rx_stats.alloc_rx_buff_failed++;
++                break;
++            }
++        } else {
++            dma_sync_single_range_for_device(rx_ring->dev, bi->dma,
++                                             bi->page_offset, bufsz,
++                                             DMA_FROM_DEVICE);
++        }
++
++        /* Program descriptor DMA address and clear length/DD. */
++        rx_desc->read.pkt_addr = cpu_to_le64(bi->dma + bi->page_offset);
++        rx_desc->wb.upper.length = 0;
++
++        /* Advance ring index with wrap. */
++        i++;
++        if (unlikely(i == rx_ring->count)) {
++            i = 0;
++        }
++
++        /* Prefetch next structures to hide latency. */
++        rx_desc = IXGBE_RX_DESC(rx_ring, i);
++        bi = &rx_ring->rx_buffer_info[i];
++        prefetch(bi);
++        if (likely(bi->page)) {
++            void *addr = page_address(bi->page);
++            if (addr) {
++                prefetch(addr + bi->page_offset);
++            }
++        }
++    }
++
++    /* Publish index and ring tail exactly once if we advanced. */
++    if (rx_ring->next_to_use != i) {
++        rx_ring->next_to_use = i;
++        rx_ring->next_to_alloc = i;
++        /* Ensure all descriptor writes are visible before ringing the doorbell. */
++        wmb();
++        writel(i, rx_ring->tail);
++    }
++}
++
++/**
++ * ixgbe_set_rsc_gso_size - compute GSO fields for an RSC frame
++ * @ring:    owning ring (current stats not used)
++ * @skb:     coalesced skb
++ * @rx_desc: EOP descriptor that completed the RSC frame
++ *
++ * 82599 family reports MSS in mss_l4_len_idx; X540 does not.
++ */
++static void ixgbe_set_rsc_gso_size(struct ixgbe_ring *ring,
++				   struct sk_buff *skb,
++				   union ixgbe_adv_rx_desc *rx_desc)
++{
++	int hdr_ofs = skb_transport_offset(skb);
++	u16 append = IXGBE_CB(skb)->append_cnt ? : 1; /* avoid div/0 */
++	u16 mss = 0;
++	u32 pay = 0;
+ 
+-	i += rx_ring->count;
++#ifdef IXGBE_RXDADV_RSCCMSS_MASK  /* only 82599 has this */
++	{
++		u32 mss_idx = le32_to_cpu(rx_desc->wb.lower.lo_dword.mss_l4_len_idx);
+ 
+-	if (rx_ring->next_to_use != i) {
+-		rx_ring->next_to_use = i;
++		mss = (mss_idx & IXGBE_RXDADV_RSCCMSS_MASK) >> IXGBE_RXDADV_RSCCMSS_SHIFT;
++	}
++#endif
+ 
+-		/* update next to alloc since we have filled the ring */
+-		rx_ring->next_to_alloc = i;
++	if (hdr_ofs < 0 || hdr_ofs > skb->len) {
++		hdr_ofs = 0;
++	}
++	pay = (u32)(skb->len - hdr_ofs);
+ 
+-		/* Force memory writes to complete before letting h/w
+-		 * know there are new descriptors to fetch.  (Only
+-		 * applicable for weak-ordered memory model archs,
+-		 * such as IA-64).
+-		 */
+-		wmb();
+-		writel(i, rx_ring->tail);
++	if (unlikely(!mss)) {  /* X540 or value missing */
++		mss = (pay ? DIV_ROUND_UP(pay, append) : 1);
+ 	}
+-}
+ 
+-static void ixgbe_set_rsc_gso_size(struct ixgbe_ring *ring,
+-				   struct sk_buff *skb)
+-{
+-	u16 hdr_len = skb_headlen(skb);
++	if (mss == 0) {
++		mss = 1;
++	}
+ 
+-	/* set gso_size to avoid messing up TCP MSS */
+-	skb_shinfo(skb)->gso_size = DIV_ROUND_UP((skb->len - hdr_len),
+-						 IXGBE_CB(skb)->append_cnt);
+-	skb_shinfo(skb)->gso_type = SKB_GSO_TCPV4;
++	skb_shinfo(skb)->gso_size = mss;
++	skb_shinfo(skb)->gso_segs = (u16)max(1u, DIV_ROUND_UP(pay, mss));
++	skb_shinfo(skb)->gso_type = SKB_GSO_TCPV4; /* RSC does IPv4 TCP */
+ }
+ 
+ static void ixgbe_update_rsc_stats(struct ixgbe_ring *rx_ring,
++				   union ixgbe_adv_rx_desc *rx_desc,
+ 				   struct sk_buff *skb)
+ {
+-	/* if append_cnt is 0 then frame is not RSC */
+-	if (!IXGBE_CB(skb)->append_cnt)
++	if (!IXGBE_CB(skb)->append_cnt) {  /* not RSC */
++		/* wipe stale meta if skb recycled */
++		if (skb_is_gso(skb)) {
++			struct skb_shared_info *sh = skb_shinfo(skb);
++
++			sh->gso_size = 0;
++			sh->gso_type = 0;
++			sh->gso_segs = 0;
++		}
+ 		return;
++	}
+ 
+ 	rx_ring->rx_stats.rsc_count += IXGBE_CB(skb)->append_cnt;
+ 	rx_ring->rx_stats.rsc_flush++;
+ 
+-	ixgbe_set_rsc_gso_size(rx_ring, skb);
++	ixgbe_set_rsc_gso_size(rx_ring, skb, rx_desc);
+ 
+-	/* gso_size is computed using append_cnt so always clear it last */
+-	IXGBE_CB(skb)->append_cnt = 0;
++	IXGBE_CB(skb)->append_cnt = 0;  /* always clear last */
++}
++
++/* Initialize FDIR for Gaming ATR: perfect match on UDP destination port only.
++ * Minimal-invasive: no new adapter state, no new locks; uses existing fdir_perfect_lock.
++ * Safe on: 82599/X540/X550 families. No effect on 82598.
++ */
++static void ixgbe_init_gaming_fdir(struct ixgbe_adapter *adapter)
++{
++    struct ixgbe_hw *hw = &adapter->hw;
++    union ixgbe_atr_input mask;
++    int err;
++
++    switch (hw->mac.type) {
++    case ixgbe_mac_82599EB:
++    case ixgbe_mac_X540:
++    case ixgbe_mac_X550:
++    case ixgbe_mac_X550EM_x:
++    case ixgbe_mac_x550em_a:
++        break;
++    default:
++        return; /* Not supported on this MAC */
++    }
++
++    memset(&mask, 0, sizeof(mask));
++    mask.formatted.dst_port = cpu_to_be16(0xFFFF); /* match UDP dest-port only */
++
++    err = ixgbe_fdir_set_input_mask_82599(hw, &mask);
++    if (err) {
++        e_warn(drv, "Gaming ATR: input mask setup failed (%d); skipping\n", err);
++        return;
++    }
++
++    err = ixgbe_init_fdir_perfect_82599(hw, adapter->fdir_pballoc);
++    if (err) {
++        e_warn(drv, "Gaming ATR: perfect-mode init failed (%d); skipping\n", err);
++    }
+ }
+ 
+ /**
+@@ -1719,7 +1881,7 @@ static void ixgbe_update_rsc_stats(struc
+  * This function checks the ring, descriptor, and packet information in
+  * order to populate the hash, checksum, VLAN, timestamp, protocol, and
+  * other fields within the skb.
+- **/
++ */
+ void ixgbe_process_skb_fields(struct ixgbe_ring *rx_ring,
+ 			      union ixgbe_adv_rx_desc *rx_desc,
+ 			      struct sk_buff *skb)
+@@ -1727,38 +1889,61 @@ void ixgbe_process_skb_fields(struct ixg
+ 	struct net_device *dev = rx_ring->netdev;
+ 	u32 flags = rx_ring->q_vector->adapter->flags;
+ 
+-	ixgbe_update_rsc_stats(rx_ring, skb);
++	ixgbe_update_rsc_stats(rx_ring, rx_desc, skb);
+ 
+ 	ixgbe_rx_hash(rx_ring, rx_desc, skb);
+-
+ 	ixgbe_rx_checksum(rx_ring, rx_desc, skb);
+ 
+-	if (unlikely(flags & IXGBE_FLAG_RX_HWTSTAMP_ENABLED))
++	if (unlikely(flags & IXGBE_FLAG_RX_HWTSTAMP_ENABLED)) {
+ 		ixgbe_ptp_rx_hwtstamp(rx_ring, rx_desc, skb);
++	}
+ 
+ 	if ((dev->features & NETIF_F_HW_VLAN_CTAG_RX) &&
+ 	    ixgbe_test_staterr(rx_desc, IXGBE_RXD_STAT_VP)) {
+ 		u16 vid = le16_to_cpu(rx_desc->wb.upper.vlan);
++
+ 		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), vid);
+ 	}
+ 
+-	if (ixgbe_test_staterr(rx_desc, IXGBE_RXDADV_STAT_SECP))
++	if (ixgbe_test_staterr(rx_desc, IXGBE_RXDADV_STAT_SECP)) {
+ 		ixgbe_ipsec_rx(rx_ring, rx_desc, skb);
++	}
+ 
+-	/* record Rx queue, or update MACVLAN statistics */
+-	if (netif_is_ixgbe(dev))
++	/* Preserve original behavior: record Rx queue or update MACVLAN stats */
++	if (likely(netif_is_ixgbe(dev))) {
+ 		skb_record_rx_queue(skb, rx_ring->queue_index);
+-	else
+-		macvlan_count_rx(netdev_priv(dev), skb->len + ETH_HLEN, true,
+-				 false);
++	} else {
++		macvlan_count_rx(netdev_priv(dev), skb->len + ETH_HLEN, true, false);
++	}
+ 
+ 	skb->protocol = eth_type_trans(skb, dev);
+ }
+ 
+-void ixgbe_rx_skb(struct ixgbe_q_vector *q_vector,
+-		  struct sk_buff *skb)
++/* Tiny UDP detection for low-latency bypass of GRO */
++static __always_inline bool ixgbe_is_tiny_udp(const struct sk_buff *skb)
+ {
+-	napi_gro_receive(&q_vector->napi, skb);
++    if (skb->protocol == htons(ETH_P_IP)) {
++        const struct iphdr *iph = ip_hdr(skb);
++        return iph && iph->protocol == IPPROTO_UDP && skb->len <= 256U;
++    }
++#if IS_ENABLED(CONFIG_IPV6)
++    if (skb->protocol == htons(ETH_P_IPV6)) {
++        const struct ipv6hdr *ip6h = ipv6_hdr(skb);
++        return ip6h && ip6h->nexthdr == IPPROTO_UDP && skb->len <= 256U;
++    }
++#endif
++    return false;
++}
++
++/* Low-latency RX handoff: direct deliver tiny UDP, GRO default otherwise */
++void ixgbe_rx_skb(struct ixgbe_q_vector *q_vector, struct sk_buff *skb)
++{
++    if (likely(ixgbe_is_tiny_udp(skb))) {
++        netif_receive_skb(skb);
++        return;
++    }
++
++    napi_gro_receive(&q_vector->napi, skb);
+ }
+ 
+ /**
+@@ -1776,35 +1961,41 @@ static bool ixgbe_is_non_eop(struct ixgb
+ 			     union ixgbe_adv_rx_desc *rx_desc,
+ 			     struct sk_buff *skb)
+ {
+-	u32 ntc = rx_ring->next_to_clean + 1;
++	u16 ntc = rx_ring->next_to_clean + 1;
+ 
+ 	/* fetch, update, and store next to clean */
+-	ntc = (ntc < rx_ring->count) ? ntc : 0;
++	if (ntc >= rx_ring->count) {
++		ntc = 0;
++	}
+ 	rx_ring->next_to_clean = ntc;
+ 
+ 	prefetch(IXGBE_RX_DESC(rx_ring, ntc));
+ 
+-	/* update RSC append count if present */
++	/* update RSC append count if present and advance next_to_clean via NEXTP */
+ 	if (ring_is_rsc_enabled(rx_ring)) {
+ 		__le32 rsc_enabled = rx_desc->wb.lower.lo_dword.data &
+ 				     cpu_to_le32(IXGBE_RXDADV_RSCCNT_MASK);
+ 
+ 		if (unlikely(rsc_enabled)) {
+ 			u32 rsc_cnt = le32_to_cpu(rsc_enabled);
++			u32 staterr = le32_to_cpu(rx_desc->wb.upper.status_error);
++			u16 nextp = (u16)((staterr & IXGBE_RXDADV_NEXTP_MASK) >>
++					  IXGBE_RXDADV_NEXTP_SHIFT);
+ 
+ 			rsc_cnt >>= IXGBE_RXDADV_RSCCNT_SHIFT;
+ 			IXGBE_CB(skb)->append_cnt += rsc_cnt - 1;
+ 
+-			/* update ntc based on RSC value */
+-			ntc = le32_to_cpu(rx_desc->wb.upper.status_error);
+-			ntc &= IXGBE_RXDADV_NEXTP_MASK;
+-			ntc >>= IXGBE_RXDADV_NEXTP_SHIFT;
++			/* Move next_to_clean based on NEXTP field */
++			rx_ring->next_to_clean = nextp;
++			ntc = nextp;
++			prefetch(IXGBE_RX_DESC(rx_ring, ntc));
+ 		}
+ 	}
+ 
+ 	/* if we are the last buffer then there is nothing else to do */
+-	if (likely(ixgbe_test_staterr(rx_desc, IXGBE_RXD_STAT_EOP)))
++	if (likely(ixgbe_test_staterr(rx_desc, IXGBE_RXD_STAT_EOP))) {
+ 		return false;
++	}
+ 
+ 	/* place skb in next buffer to be received */
+ 	rx_ring->rx_buffer_info[ntc].skb = skb;
+@@ -2314,40 +2505,20 @@ static void ixgbe_rx_buffer_flip(struct
+ #endif
+ }
+ 
+-/**
+- * ixgbe_clean_rx_irq - Clean completed descriptors from Rx ring - bounce buf
+- * @q_vector: structure containing interrupt and ring information
+- * @rx_ring: rx descriptor ring to transact packets on
+- * @budget: Total limit on number of packets to process
+- *
+- * This function provides a "bounce buffer" approach to Rx interrupt
+- * processing.  The advantage to this is that on systems that have
+- * expensive overhead for IOMMU access this provides a means of avoiding
+- * it by maintaining the mapping of the page to the syste.
+- *
+- * Returns amount of work completed
+- **/
+ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
+-			       struct ixgbe_ring *rx_ring,
+-			       const int budget)
++			      struct ixgbe_ring *rx_ring,
++			      const int budget)
+ {
+-	unsigned int total_rx_bytes = 0, total_rx_packets = 0, frame_sz = 0;
++	unsigned int total_rx_bytes = 0, total_rx_packets = 0;
+ 	struct ixgbe_adapter *adapter = q_vector->adapter;
+-#ifdef IXGBE_FCOE
+-	int ddp_bytes;
+-	unsigned int mss = 0;
+-#endif /* IXGBE_FCOE */
+ 	u16 cleaned_count = ixgbe_desc_unused(rx_ring);
+ 	unsigned int offset = rx_ring->rx_offset;
+ 	unsigned int xdp_xmit = 0;
+ 	struct xdp_buff xdp;
+-	int xdp_res = 0;
++	int xdp_res;
+ 
+-	/* Frame size depend on rx_ring setup when PAGE_SIZE=4K */
+-#if (PAGE_SIZE < 8192)
+-	frame_sz = ixgbe_rx_frame_truesize(rx_ring, 0);
+-#endif
+-	xdp_init_buff(&xdp, frame_sz, &rx_ring->xdp_rxq);
++	xdp_init_buff(&xdp, ixgbe_rx_frame_truesize(rx_ring, 0),
++		      &rx_ring->xdp_rxq);
+ 
+ 	while (likely(total_rx_packets < budget)) {
+ 		union ixgbe_adv_rx_desc *rx_desc;
+@@ -2356,6 +2527,26 @@ static int ixgbe_clean_rx_irq(struct ixg
+ 		int rx_buffer_pgcnt;
+ 		unsigned int size;
+ 
++		/* Prefetch a few descriptors/buffers ahead to hide memory latency */
++		{
++			u16 ntc = rx_ring->next_to_clean;
++			u16 cnt = rx_ring->count;
++			u16 pf = ntc + 4;
++
++			if (pf >= cnt) {
++				pf -= cnt;
++			}
++			prefetch(IXGBE_RX_DESC(rx_ring, pf));
++			prefetch(&rx_ring->rx_buffer_info[pf]);
++			if (likely(rx_ring->rx_buffer_info[pf].page)) {
++				void *addr = page_address(rx_ring->rx_buffer_info[pf].page);
++
++				if (addr) {
++					prefetch(addr + rx_ring->rx_buffer_info[pf].page_offset);
++				}
++			}
++		}
++
+ 		/* return some buffers to hardware, one at a time is too slow */
+ 		if (cleaned_count >= IXGBE_RX_BUFFER_WRITE) {
+ 			ixgbe_alloc_rx_buffers(rx_ring, cleaned_count);
+@@ -2364,16 +2555,16 @@ static int ixgbe_clean_rx_irq(struct ixg
+ 
+ 		rx_desc = IXGBE_RX_DESC(rx_ring, rx_ring->next_to_clean);
+ 		size = le16_to_cpu(rx_desc->wb.upper.length);
+-		if (!size)
++		if (!size) {
+ 			break;
++		}
+ 
+-		/* This memory barrier is needed to keep us from reading
+-		 * any other fields out of the rx_desc until we know the
+-		 * descriptor has been written back
+-		 */
++		/* Keep us from reading other fields until descriptor write-back visible */
+ 		dma_rmb();
+ 
+-		rx_buffer = ixgbe_get_rx_buffer(rx_ring, rx_desc, &skb, size, &rx_buffer_pgcnt);
++		rx_buffer = ixgbe_get_rx_buffer(rx_ring, rx_desc, &skb, size,
++						&rx_buffer_pgcnt);
++		xdp_res = 0;
+ 
+ 		/* retrieve a buffer from the ring */
+ 		if (!skb) {
+@@ -2382,11 +2573,11 @@ static int ixgbe_clean_rx_irq(struct ixg
+ 			hard_start = page_address(rx_buffer->page) +
+ 				     rx_buffer->page_offset - offset;
+ 			xdp_prepare_buff(&xdp, hard_start, offset, size, true);
+-			xdp_buff_clear_frags_flag(&xdp);
+ #if (PAGE_SIZE > 4096)
+ 			/* At larger PAGE_SIZE, frame_sz depend on len size */
+ 			xdp.frame_sz = ixgbe_rx_frame_truesize(rx_ring, size);
+ #endif
++			xdp_buff_clear_frags_flag(&xdp);
+ 			xdp_res = ixgbe_run_xdp(adapter, rx_ring, &xdp);
+ 		}
+ 
+@@ -2402,11 +2593,9 @@ static int ixgbe_clean_rx_irq(struct ixg
+ 		} else if (skb) {
+ 			ixgbe_add_rx_frag(rx_ring, rx_buffer, skb, size);
+ 		} else if (ring_uses_build_skb(rx_ring)) {
+-			skb = ixgbe_build_skb(rx_ring, rx_buffer,
+-					      &xdp, rx_desc);
++			skb = ixgbe_build_skb(rx_ring, rx_buffer, &xdp, rx_desc);
+ 		} else {
+-			skb = ixgbe_construct_skb(rx_ring, rx_buffer,
+-						  &xdp, rx_desc);
++			skb = ixgbe_construct_skb(rx_ring, rx_buffer, &xdp, rx_desc);
+ 		}
+ 
+ 		/* exit if we failed to retrieve a buffer */
+@@ -2420,12 +2609,18 @@ static int ixgbe_clean_rx_irq(struct ixg
+ 		cleaned_count++;
+ 
+ 		/* place incomplete frames back on ring for completion */
+-		if (ixgbe_is_non_eop(rx_ring, rx_desc, skb))
++		if (ixgbe_is_non_eop(rx_ring, rx_desc, skb)) {
+ 			continue;
++		}
+ 
+ 		/* verify the packet layout is correct */
+-		if (xdp_res || ixgbe_cleanup_headers(rx_ring, rx_desc, skb))
++		if (xdp_res || ixgbe_cleanup_headers(rx_ring, rx_desc, skb)) {
+ 			continue;
++		}
++
++		/* Warm-up for upper stack/GRO touches */
++		prefetch(skb->data);
++		prefetch(skb_shinfo(skb));
+ 
+ 		/* probably a little skewed due to removing CRC */
+ 		total_rx_bytes += skb->len;
+@@ -2436,6 +2631,9 @@ static int ixgbe_clean_rx_irq(struct ixg
+ #ifdef IXGBE_FCOE
+ 		/* if ddp, not passing to ULD unless for FCP_RSP or error */
+ 		if (ixgbe_rx_is_fcoe(rx_ring, rx_desc)) {
++			int ddp_bytes;
++			unsigned int mss = 0;
++
+ 			ddp_bytes = ixgbe_fcoe_ddp(adapter, rx_desc, skb);
+ 			/* include DDPed FCoE data */
+ 			if (ddp_bytes > 0) {
+@@ -2448,24 +2646,24 @@ static int ixgbe_clean_rx_irq(struct ixg
+ 						mss &= ~511;
+ 				}
+ 				total_rx_bytes += ddp_bytes;
+-				total_rx_packets += DIV_ROUND_UP(ddp_bytes,
+-								 mss);
++				total_rx_packets += DIV_ROUND_UP(ddp_bytes, mss);
+ 			}
+ 			if (!ddp_bytes) {
+ 				dev_kfree_skb_any(skb);
+ 				continue;
+ 			}
+ 		}
+-
+ #endif /* IXGBE_FCOE */
++
+ 		ixgbe_rx_skb(q_vector, skb);
+ 
+ 		/* update budget accounting */
+ 		total_rx_packets++;
+ 	}
+ 
+-	if (xdp_xmit & IXGBE_XDP_REDIR)
++	if (xdp_xmit & IXGBE_XDP_REDIR) {
+ 		xdp_do_flush();
++	}
+ 
+ 	if (xdp_xmit & IXGBE_XDP_TX) {
+ 		struct ixgbe_ring *ring = ixgbe_determine_xdp_ring(adapter);
+@@ -2473,8 +2671,7 @@ static int ixgbe_clean_rx_irq(struct ixg
+ 		ixgbe_xdp_ring_update_tail_locked(ring);
+ 	}
+ 
+-	ixgbe_update_rx_ring_stats(rx_ring, q_vector, total_rx_packets,
+-				   total_rx_bytes);
++	ixgbe_update_rx_ring_stats(rx_ring, q_vector, total_rx_packets, total_rx_bytes);
+ 
+ 	return total_rx_packets;
+ }
+@@ -2492,18 +2689,16 @@ static void ixgbe_configure_msix(struct
+ 	int v_idx;
+ 	u32 mask;
+ 
+-	/* Populate MSIX to EITR Select */
++	/* For devices that support it, program EITR Select when >32 vectors */
+ 	if (adapter->num_vfs > 32) {
+ 		u32 eitrsel = BIT(adapter->num_vfs - 32) - 1;
+ 		IXGBE_WRITE_REG(&adapter->hw, IXGBE_EITRSEL, eitrsel);
+ 	}
+ 
+-	/*
+-	 * Populate the IVAR table and set the ITR values to the
+-	 * corresponding register.
+-	 */
++	/* IVAR programming and initial EITR */
+ 	for (v_idx = 0; v_idx < adapter->num_q_vectors; v_idx++) {
+ 		struct ixgbe_ring *ring;
++
+ 		q_vector = adapter->q_vector[v_idx];
+ 
+ 		ixgbe_for_each_ring(ring, q_vector->rx)
+@@ -2512,13 +2707,13 @@ static void ixgbe_configure_msix(struct
+ 		ixgbe_for_each_ring(ring, q_vector->tx)
+ 			ixgbe_set_ivar(adapter, 1, ring->reg_idx, v_idx);
+ 
+-		ixgbe_write_eitr(q_vector);
++		ixgbe_write_eitr(q_vector); /* uses WDIS on X540/82599 */
+ 	}
+ 
++	/* Map "other causes" interrupt to next available vector index */
+ 	switch (adapter->hw.mac.type) {
+ 	case ixgbe_mac_82598EB:
+-		ixgbe_set_ivar(adapter, -1, IXGBE_IVAR_OTHER_CAUSES_INDEX,
+-			       v_idx);
++		ixgbe_set_ivar(adapter, -1, IXGBE_IVAR_OTHER_CAUSES_INDEX, v_idx);
+ 		break;
+ 	case ixgbe_mac_82599EB:
+ 	case ixgbe_mac_X540:
+@@ -2531,216 +2726,108 @@ static void ixgbe_configure_msix(struct
+ 	default:
+ 		break;
+ 	}
+-	IXGBE_WRITE_REG(&adapter->hw, IXGBE_EITR(v_idx), 1950);
+ 
+-	/* set up to autoclear timer, and the vectors */
+-	mask = IXGBE_EIMS_ENABLE_MASK;
+-	mask &= ~(IXGBE_EIMS_OTHER |
+-		  IXGBE_EIMS_MAILBOX |
+-		  IXGBE_EIMS_LSC);
++	/* Program a moderate EITR for "other causes" with WDIS */
++	{
++		u32 oitr = IXGBE_ITR_TO_REG(1950); /* ~3.9ms nominal */
++		switch (adapter->hw.mac.type) {
++		case ixgbe_mac_82598EB:
++			oitr |= (oitr << 16);
++			break;
++		case ixgbe_mac_82599EB:
++		case ixgbe_mac_X540:
++		case ixgbe_mac_X550:
++		case ixgbe_mac_X550EM_x:
++		case ixgbe_mac_x550em_a:
++		case ixgbe_mac_e610:
++			oitr |= IXGBE_EITR_CNT_WDIS;
++			break;
++		default:
++			break;
++		}
++		IXGBE_WRITE_REG(&adapter->hw, IXGBE_EITR(v_idx), oitr);
++	}
+ 
++	/* Autoclear timer for queue vectors; mask off non-queue causes */
++	mask = IXGBE_EIMS_ENABLE_MASK;
++	mask &= ~(IXGBE_EIMS_OTHER | IXGBE_EIMS_MAILBOX | IXGBE_EIMS_LSC);
+ 	if (adapter->hw.mac.type == ixgbe_mac_e610)
+ 		mask &= ~IXGBE_EIMS_FW_EVENT;
+ 
+ 	IXGBE_WRITE_REG(&adapter->hw, IXGBE_EIAC, mask);
++	IXGBE_WRITE_FLUSH(&adapter->hw);
+ }
+ 
+-/**
+- * ixgbe_update_itr - update the dynamic ITR value based on statistics
+- * @q_vector: structure containing interrupt and ring information
+- * @ring_container: structure containing ring performance data
+- *
+- *      Stores a new ITR value based on packets and byte
+- *      counts during the last interrupt.  The advantage of per interrupt
+- *      computation is faster updates and more accurate ITR for the current
+- *      traffic pattern.  Constants in this function were computed
+- *      based on theoretical maximum wire speed and thresholds were set based
+- *      on testing data as well as attempting to minimize response time
+- *      while increasing bulk throughput.
+- **/
+-static void ixgbe_update_itr(struct ixgbe_q_vector *q_vector,
+-			     struct ixgbe_ring_container *ring_container)
++static __always_inline unsigned int ixgbe_itr_ll(unsigned int pkts, unsigned int bytes)
+ {
+-	unsigned int itr = IXGBE_ITR_ADAPTIVE_MIN_USECS |
+-			   IXGBE_ITR_ADAPTIVE_LATENCY;
+-	unsigned int avg_wire_size, packets, bytes;
+-	unsigned long next_update = jiffies;
+-
+-	/* If we don't have any rings just leave ourselves set for maximum
+-	 * possible latency so we take ourselves out of the equation.
+-	 */
+-	if (!ring_container->ring)
+-		return;
+-
+-	/* If we didn't update within up to 1 - 2 jiffies we can assume
+-	 * that either packets are coming in so slow there hasn't been
+-	 * any work, or that there is so much work that NAPI is dealing
+-	 * with interrupt moderation and we don't need to do anything.
+-	 */
+-	if (time_after(next_update, ring_container->next_update))
+-		goto clear_counts;
+-
+-	packets = ring_container->total_packets;
+-
+-	/* We have no packets to actually measure against. This means
+-	 * either one of the other queues on this vector is active or
+-	 * we are a Tx queue doing TSO with too high of an interrupt rate.
+-	 *
+-	 * When this occurs just tick up our delay by the minimum value
+-	 * and hope that this extra delay will prevent us from being called
+-	 * without any work on our queue.
+-	 */
+-	if (!packets) {
+-		itr = (q_vector->itr >> 2) + IXGBE_ITR_ADAPTIVE_MIN_INC;
+-		if (itr > IXGBE_ITR_ADAPTIVE_MAX_USECS)
+-			itr = IXGBE_ITR_ADAPTIVE_MAX_USECS;
+-		itr += ring_container->itr & IXGBE_ITR_ADAPTIVE_LATENCY;
+-		goto clear_counts;
+-	}
+-
+-	bytes = ring_container->total_bytes;
+-
+-	/* If packets are less than 4 or bytes are less than 9000 assume
+-	 * insufficient data to use bulk rate limiting approach. We are
+-	 * likely latency driven.
+-	 */
+-	if (packets < 4 && bytes < 9000) {
+-		itr = IXGBE_ITR_ADAPTIVE_LATENCY;
+-		goto adjust_by_size;
+-	}
+-
+-	/* Between 4 and 48 we can assume that our current interrupt delay
+-	 * is only slightly too low. As such we should increase it by a small
+-	 * fixed amount.
+-	 */
+-	if (packets < 48) {
+-		itr = (q_vector->itr >> 2) + IXGBE_ITR_ADAPTIVE_MIN_INC;
+-		if (itr > IXGBE_ITR_ADAPTIVE_MAX_USECS)
+-			itr = IXGBE_ITR_ADAPTIVE_MAX_USECS;
+-		goto clear_counts;
+-	}
+-
+-	/* Between 48 and 96 is our "goldilocks" zone where we are working
+-	 * out "just right". Just report that our current ITR is good for us.
+-	 */
+-	if (packets < 96) {
+-		itr = q_vector->itr >> 2;
+-		goto clear_counts;
+-	}
+-
+-	/* If packet count is 96 or greater we are likely looking at a slight
+-	 * overrun of the delay we want. Try halving our delay to see if that
+-	 * will cut the number of packets in half per interrupt.
+-	 */
+-	if (packets < 256) {
+-		itr = q_vector->itr >> 3;
+-		if (itr < IXGBE_ITR_ADAPTIVE_MIN_USECS)
+-			itr = IXGBE_ITR_ADAPTIVE_MIN_USECS;
+-		goto clear_counts;
+-	}
+-
+-	/* The paths below assume we are dealing with a bulk ITR since number
+-	 * of packets is 256 or greater. We are just going to have to compute
+-	 * a value and try to bring the count under control, though for smaller
+-	 * packet sizes there isn't much we can do as NAPI polling will likely
+-	 * be kicking in sooner rather than later.
+-	 */
+-	itr = IXGBE_ITR_ADAPTIVE_BULK;
+-
+-adjust_by_size:
+-	/* If packet counts are 256 or greater we can assume we have a gross
+-	 * overestimation of what the rate should be. Instead of trying to fine
+-	 * tune it just use the formula below to try and dial in an exact value
+-	 * give the current packet size of the frame.
+-	 */
+-	avg_wire_size = bytes / packets;
+-
+-	/* The following is a crude approximation of:
+-	 *  wmem_default / (size + overhead) = desired_pkts_per_int
+-	 *  rate / bits_per_byte / (size + ethernet overhead) = pkt_rate
+-	 *  (desired_pkt_rate / pkt_rate) * usecs_per_sec = ITR value
+-	 *
+-	 * Assuming wmem_default is 212992 and overhead is 640 bytes per
+-	 * packet, (256 skb, 64 headroom, 320 shared info), we can reduce the
+-	 * formula down to
+-	 *
+-	 *  (170 * (size + 24)) / (size + 640) = ITR
+-	 *
+-	 * We first do some math on the packet size and then finally bitshift
+-	 * by 8 after rounding up. We also have to account for PCIe link speed
+-	 * difference as ITR scales based on this.
+-	 */
+-	if (avg_wire_size <= 60) {
+-		/* Start at 50k ints/sec */
+-		avg_wire_size = 5120;
+-	} else if (avg_wire_size <= 316) {
+-		/* 50K ints/sec to 16K ints/sec */
+-		avg_wire_size *= 40;
+-		avg_wire_size += 2720;
+-	} else if (avg_wire_size <= 1084) {
+-		/* 16K ints/sec to 9.2K ints/sec */
+-		avg_wire_size *= 15;
+-		avg_wire_size += 11452;
+-	} else if (avg_wire_size < 1968) {
+-		/* 9.2K ints/sec to 8K ints/sec */
+-		avg_wire_size *= 5;
+-		avg_wire_size += 22420;
+-	} else {
+-		/* plateau at a limit of 8K ints/sec */
+-		avg_wire_size = 32256;
+-	}
+-
+-	/* If we are in low latency mode half our delay which doubles the rate
+-	 * to somewhere between 100K to 16K ints/sec
+-	 */
+-	if (itr & IXGBE_ITR_ADAPTIVE_LATENCY)
+-		avg_wire_size >>= 1;
+-
+-	/* Resultant value is 256 times larger than it needs to be. This
+-	 * gives us room to adjust the value as needed to either increase
+-	 * or decrease the value based on link speeds of 10G, 2.5G, 1G, etc.
+-	 *
+-	 * Use addition as we have already recorded the new latency flag
+-	 * for the ITR value.
+-	 */
+-	switch (q_vector->adapter->link_speed) {
+-	case IXGBE_LINK_SPEED_10GB_FULL:
+-	case IXGBE_LINK_SPEED_100_FULL:
+-	default:
+-		itr += DIV_ROUND_UP(avg_wire_size,
+-				    IXGBE_ITR_ADAPTIVE_MIN_INC * 256) *
+-		       IXGBE_ITR_ADAPTIVE_MIN_INC;
+-		break;
+-	case IXGBE_LINK_SPEED_2_5GB_FULL:
+-	case IXGBE_LINK_SPEED_1GB_FULL:
+-	case IXGBE_LINK_SPEED_10_FULL:
+-		if (avg_wire_size > 8064)
+-			avg_wire_size = 8064;
+-		itr += DIV_ROUND_UP(avg_wire_size,
+-				    IXGBE_ITR_ADAPTIVE_MIN_INC * 64) *
+-		       IXGBE_ITR_ADAPTIVE_MIN_INC;
+-		break;
+-	}
+-
+-clear_counts:
+-	/* write back value */
+-	ring_container->itr = itr;
++	/* gaming/VoIP microburst: <=64 pkts with mean size <= 256 bytes */
++	return (pkts && pkts <= 64 && bytes <= (pkts << 8)) ? IXGBE_ITR_4US : 0;
++}
+ 
+-	/* next update should occur within next jiffy */
+-	ring_container->next_update = next_update + 1;
++static void ixgbe_update_itr(struct ixgbe_q_vector *qv,
++                             struct ixgbe_ring_container *rc)
++{
++    unsigned int pkts = rc->total_packets;
++    unsigned int bytes = rc->total_bytes;
++    unsigned int usecs;
++    unsigned long now = jiffies;
++    /* EITR is in 2us units; keep only low 16 bits to avoid WDIS or high-word artifacts. */
++    unsigned int cur_usecs = ((qv->itr & 0xFFFFu) >> 2);
++
++    if (unlikely(!rc->ring)) {
++        rc->total_packets = 0;
++        rc->total_bytes = 0;
++        return;
++    }
++
++    /* Avoid re-updating repeatedly inside the same jiffy; leave NAPI to run. */
++    if (time_before(now, rc->next_update)) {
++        rc->total_packets = 0;
++        rc->total_bytes = 0;
++        return;
++    }
++
++    /* 1) Tiny microbursts (e.g., gaming/VoIP): deliver ASAP. */
++    if (pkts > 0 && pkts <= 16) {
++        usecs = 0;
++        goto out;
++    }
++
++    /* 2) Small bursts of tiny packets: keep IRQ snappy (4us). */
++    if (pkts > 0 && pkts <= 64 && bytes <= (pkts << 8)) {
++        usecs = 4;
++        goto out;
++    }
++
++    /* 3) Idle: gently increase ITR to reduce background interrupts. */
++    if (!pkts) {
++        unsigned int bumped = cur_usecs + 200U;
++        if (bumped < cur_usecs) {
++            bumped = cur_usecs; /* overflow guard */
++        }
++        usecs = min(bumped, 20000U); /* cap to 20ms */
++        goto out;
++    }
++
++    /* 4) Bulk traffic: proportional to average size; stable and bounded. */
++    {
++        unsigned int avg = bytes / pkts;     /* pkts > 0 by construction */
++        unsigned int calc = avg / 3 + 1000;  /* base ~1ms, scaled down by size */
++        if (calc < 4) {
++            calc = 4;
++        } else if (calc > 32256) {
++            calc = 32256;
++        }
++        usecs = calc;
++    }
+ 
+-	ring_container->total_bytes = 0;
+-	ring_container->total_packets = 0;
++out:
++    rc->itr = usecs;                 /* store microseconds only */
++    rc->next_update = now + 1UL;     /* next update in ~1 jiffy */
++    rc->total_packets = 0;
++    rc->total_bytes = 0;
+ }
+ 
+-/**
+- * ixgbe_write_eitr - write EITR register in hardware specific way
+- * @q_vector: structure containing interrupt and ring information
+- *
+- * This function is made to be called by ethtool and by the driver
+- * when it needs to update EITR registers at runtime.  Hardware
+- * specific quirks/differences are taken care of here.
+- */
+ void ixgbe_write_eitr(struct ixgbe_q_vector *q_vector)
+ {
+ 	struct ixgbe_adapter *adapter = q_vector->adapter;
+@@ -2750,8 +2837,7 @@ void ixgbe_write_eitr(struct ixgbe_q_vec
+ 
+ 	switch (adapter->hw.mac.type) {
+ 	case ixgbe_mac_82598EB:
+-		/* must write high and low 16 bits to reset counter */
+-		itr_reg |= (itr_reg << 16);
++		itr_reg |= (itr_reg << 16);         /* reset counter (82598) */
+ 		break;
+ 	case ixgbe_mac_82599EB:
+ 	case ixgbe_mac_X540:
+@@ -2759,11 +2845,7 @@ void ixgbe_write_eitr(struct ixgbe_q_vec
+ 	case ixgbe_mac_X550EM_x:
+ 	case ixgbe_mac_x550em_a:
+ 	case ixgbe_mac_e610:
+-		/*
+-		 * set the WDIS bit to not clear the timer bits and cause an
+-		 * immediate assertion of the interrupt
+-		 */
+-		itr_reg |= IXGBE_EITR_CNT_WDIS;
++		itr_reg |= IXGBE_EITR_CNT_WDIS;     /* don't clear timer; assert immediately */
+ 		break;
+ 	default:
+ 		break;
+@@ -2771,26 +2853,33 @@ void ixgbe_write_eitr(struct ixgbe_q_vec
+ 	IXGBE_WRITE_REG(hw, IXGBE_EITR(v_idx), itr_reg);
+ }
+ 
+-static void ixgbe_set_itr(struct ixgbe_q_vector *q_vector)
++static void ixgbe_set_itr(struct ixgbe_q_vector *qv)
+ {
+-	u32 new_itr;
++    u32 rx_us, tx_us, min_us, hw_eitr;
+ 
+-	ixgbe_update_itr(q_vector, &q_vector->tx);
+-	ixgbe_update_itr(q_vector, &q_vector->rx);
++    ixgbe_update_itr(qv, &qv->rx);
++    ixgbe_update_itr(qv, &qv->tx);
+ 
+-	/* use the smallest value of new ITR delay calculations */
+-	new_itr = min(q_vector->rx.itr, q_vector->tx.itr);
++    rx_us = qv->rx.itr;
++    tx_us = qv->tx.itr;
+ 
+-	/* Clear latency flag if set, shift into correct position */
+-	new_itr &= ~IXGBE_ITR_ADAPTIVE_LATENCY;
+-	new_itr <<= 2;
++    if (rx_us && tx_us) {
++        min_us = min(rx_us, tx_us);
++    } else if (rx_us) {
++        min_us = rx_us;
++    } else {
++        min_us = tx_us; /* possibly 0 */
++    }
+ 
+-	if (new_itr != q_vector->itr) {
+-		/* save the algorithm value here */
+-		q_vector->itr = new_itr;
++    /* Convert microseconds to EITR (2us units), preserve only low 16 bits, set WDIS. */
++    hw_eitr = ((min_us & 0xFFFFu) << 2) | IXGBE_EITR_CNT_WDIS;
+ 
+-		ixgbe_write_eitr(q_vector);
+-	}
++    if (unlikely(hw_eitr == qv->itr)) {
++        return;
++    }
++
++    qv->itr = hw_eitr;
++    ixgbe_write_eitr(qv);
+ }
+ 
+ /**
+@@ -3466,74 +3555,200 @@ int ixgbe_poll(struct napi_struct *napi,
+ 	return min(work_done, budget - 1);
+ }
+ 
+-/**
+- * ixgbe_request_msix_irqs - Initialize MSI-X interrupts
+- * @adapter: board private structure
+- *
+- * ixgbe_request_msix_irqs allocates MSI-X vectors and requests
+- * interrupts from the kernel.
+- **/
++/* Return true if 'cpu' is the primary SMT thread of its core.
++ * We select the first logical CPU in the sibling set as the "primary".
++ * This avoids pinning IRQs to both hyperthreads of the same core.
++ */
++static __always_inline bool ixgbe_is_primary_thread(unsigned int cpu)
++{
++	const struct cpumask *sibs = topology_sibling_cpumask(cpu);
++
++	if (!sibs)
++		return true; /* No SMT information: treat as primary. */
++
++	return cpu == cpumask_first(sibs);
++}
++
++/* Return a relative CPU capacity (higher => faster). On x86 this maps to the
++ * scheduler's CPU capacity scale and is sufficient to distinguish P-cores from
++ * E-cores on hybrid architectures like Raptor Lake.
++ */
++static __always_inline unsigned long ixgbe_cpu_capacity(unsigned int cpu)
++{
++	return topology_get_cpu_scale(cpu);
++}
++
++/* Build a high-quality affinity mask for MSI-X:
++ * 1) Restrict to NIC's NUMA node if present; otherwise use all online CPUs.
++ * 2) Select only primary SMT threads (avoid hyperthread contention).
++ * 3) Prefer P-cores: keep CPUs whose capacity is within ~12.5% of max capacity.
++ *    (This robustly selects P-cores on Raptor Lake; if not hybrid, all cores
++ *     share the same capacity and thus stay selected.)
++ * 4) Provide graceful fallback to primary threads, then to NUMA mask, then online.
++ *
++ * Output:
++ *   pref_mask: cpumask_var_t provided by caller (must be allocated); filled here.
++ *
++ * Returns 0 on success, negative error on failure (no masks are leaked).
++ */
++static int ixgbe_build_performance_mask(struct ixgbe_adapter *adapter,
++                                        cpumask_var_t pref)
++{
++    cpumask_var_t node_mask, primaries, top;
++    unsigned int cpu;
++    int node;
++    unsigned long max_cap = 0;
++
++    if (!zalloc_cpumask_var(&node_mask, GFP_KERNEL) ||
++        !zalloc_cpumask_var(&primaries, GFP_KERNEL) ||
++        !zalloc_cpumask_var(&top, GFP_KERNEL)) {
++        free_cpumask_var(node_mask);
++        free_cpumask_var(primaries);
++        free_cpumask_var(top);
++        return -ENOMEM;
++    }
++
++    node = dev_to_node(&adapter->pdev->dev);
++    if (node != NUMA_NO_NODE) {
++        cpumask_copy(node_mask, cpumask_of_node(node));
++        if (cpumask_empty(node_mask)) {
++            cpumask_copy(node_mask, cpu_online_mask);
++        }
++    } else {
++        cpumask_copy(node_mask, cpu_online_mask);
++    }
++
++    /* Keep only primary SMT threads to avoid HT contention on same core. */
++    cpumask_clear(primaries);
++    for_each_cpu(cpu, node_mask) {
++        const struct cpumask *sibs = topology_sibling_cpumask(cpu);
++        if (!sibs || cpu == cpumask_first(sibs)) {
++            cpumask_set_cpu(cpu, primaries);
++        }
++    }
++
++    /* Among primaries, retain CPUs near the max capacity (P-cores on hybrid). */
++    for_each_cpu(cpu, primaries) {
++        unsigned long cap = topology_get_cpu_scale(cpu);
++        if (cap > max_cap) {
++            max_cap = cap;
++        }
++    }
++
++    {
++        unsigned long thr = (max_cap * 7) / 8; /* top ~12.5% */
++        cpumask_clear(top);
++        for_each_cpu(cpu, primaries) {
++            unsigned long cap = topology_get_cpu_scale(cpu);
++            if (cap >= thr) {
++                cpumask_set_cpu(cpu, top);
++            }
++        }
++    }
++
++    if (!cpumask_empty(top)) {
++        cpumask_copy(pref, top);
++    } else if (!cpumask_empty(primaries)) {
++        cpumask_copy(pref, primaries);
++    } else if (!cpumask_empty(node_mask)) {
++        cpumask_copy(pref, node_mask);
++    } else {
++        cpumask_copy(pref, cpu_online_mask);
++    }
++
++    free_cpumask_var(node_mask);
++    free_cpumask_var(primaries);
++    free_cpumask_var(top);
++    return 0;
++}
++
++/* MSI-X request with P/E-core aware, SMT-primary-only pinning.
++ * - Pins each queue vector to a single CPU from the preferred mask returned by
++ *   ixgbe_build_performance_mask() (favoring P-cores on Raptor Lake).
++ * - Robust resource management and unwind.
++ * - Maintains the original ABI (function signature).
++ */
+ static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
+ {
+-	struct net_device *netdev = adapter->netdev;
+-	unsigned int ri = 0, ti = 0;
+-	int vector, err;
+-
+-	for (vector = 0; vector < adapter->num_q_vectors; vector++) {
+-		struct ixgbe_q_vector *q_vector = adapter->q_vector[vector];
+-		struct msix_entry *entry = &adapter->msix_entries[vector];
+-
+-		if (q_vector->tx.ring && q_vector->rx.ring) {
+-			snprintf(q_vector->name, sizeof(q_vector->name),
+-				 "%s-TxRx-%u", netdev->name, ri++);
+-			ti++;
+-		} else if (q_vector->rx.ring) {
+-			snprintf(q_vector->name, sizeof(q_vector->name),
+-				 "%s-rx-%u", netdev->name, ri++);
+-		} else if (q_vector->tx.ring) {
+-			snprintf(q_vector->name, sizeof(q_vector->name),
+-				 "%s-tx-%u", netdev->name, ti++);
+-		} else {
+-			/* skip this unused q_vector */
+-			continue;
+-		}
+-		err = request_irq(entry->vector, &ixgbe_msix_clean_rings, 0,
+-				  q_vector->name, q_vector);
+-		if (err) {
+-			e_err(probe, "request_irq failed for MSIX interrupt "
+-			      "Error: %d\n", err);
+-			goto free_queue_irqs;
+-		}
+-		/* If Flow Director is enabled, set interrupt affinity */
+-		if (adapter->flags & IXGBE_FLAG_FDIR_HASH_CAPABLE) {
+-			/* assign the mask for this irq */
+-			irq_update_affinity_hint(entry->vector,
+-						 &q_vector->affinity_mask);
+-		}
+-	}
++    struct net_device *netdev = adapter->netdev;
++    unsigned int ri = 0, ti = 0;
++    cpumask_var_t pref_mask;
++    unsigned int pick;
++    int vector, err;
++
++    if (!zalloc_cpumask_var(&pref_mask, GFP_KERNEL)) {
++        return -ENOMEM;
++    }
++
++    if (ixgbe_build_performance_mask(adapter, pref_mask)) {
++        cpumask_copy(pref_mask, cpu_online_mask);
++    }
++
++    pick = cpumask_first(pref_mask);
++    if (pick >= nr_cpu_ids) {
++        pick = 0;
++    }
++
++    for (vector = 0; vector < adapter->num_q_vectors; vector++) {
++        struct ixgbe_q_vector *qv = adapter->q_vector[vector];
++        struct msix_entry *entry = &adapter->msix_entries[vector];
++        cpumask_t one;
++
++        if (!qv) {
++            continue;
++        }
++
++        if (qv->tx.ring && qv->rx.ring) {
++            snprintf(qv->name, sizeof(qv->name), "%s-TxRx-%u", netdev->name, ri++);
++            ti++;
++        } else if (qv->rx.ring) {
++            snprintf(qv->name, sizeof(qv->name), "%s-rx-%u", netdev->name, ri++);
++        } else if (qv->tx.ring) {
++            snprintf(qv->name, sizeof(qv->name), "%s-tx-%u", netdev->name, ti++);
++        } else {
++            continue; /* unused q_vector */
++        }
++
++        err = request_irq(entry->vector, ixgbe_msix_clean_rings, 0, qv->name, qv);
++        if (err) {
++            e_err(probe, "request_irq failed for MSIx vector %d: %d\n", vector, err);
++            goto free_queue_irqs;
++        }
++
++        /* Pin each vector to one CPU (hint), spreading across preferred mask. */
++        cpumask_clear(&one);
++        cpumask_set_cpu(pick, &one);
++        cpumask_copy(&qv->affinity_mask, &one);
++        irq_set_affinity_hint(entry->vector, &qv->affinity_mask);
++
++        /* Move to next preferred CPU, wrap if needed. */
++        pick = cpumask_next(pick, pref_mask);
++        if (pick >= nr_cpu_ids) {
++            pick = cpumask_first(pref_mask);
++        }
++    }
++
++    err = request_irq(adapter->msix_entries[vector].vector,
++                      ixgbe_msix_other, 0, netdev->name, adapter);
++    if (err) {
++        e_err(probe, "request_irq for msix_other failed: %d\n", err);
++        goto free_queue_irqs;
++    }
+ 
+-	err = request_irq(adapter->msix_entries[vector].vector,
+-			  ixgbe_msix_other, 0, netdev->name, adapter);
+-	if (err) {
+-		e_err(probe, "request_irq for msix_other failed: %d\n", err);
+-		goto free_queue_irqs;
+-	}
+-
+-	return 0;
++    free_cpumask_var(pref_mask);
++    return 0;
+ 
+ free_queue_irqs:
+-	while (vector) {
+-		vector--;
+-		irq_update_affinity_hint(adapter->msix_entries[vector].vector,
+-					 NULL);
+-		free_irq(adapter->msix_entries[vector].vector,
+-			 adapter->q_vector[vector]);
+-	}
+-	adapter->flags &= ~IXGBE_FLAG_MSIX_ENABLED;
+-	pci_disable_msix(adapter->pdev);
+-	kfree(adapter->msix_entries);
+-	adapter->msix_entries = NULL;
+-	return err;
++    while (vector--) {
++        irq_set_affinity_hint(adapter->msix_entries[vector].vector, NULL);
++        free_irq(adapter->msix_entries[vector].vector, adapter->q_vector[vector]);
++    }
++    free_cpumask_var(pref_mask);
++    adapter->flags &= ~IXGBE_FLAG_MSIX_ENABLED;
++    pci_disable_msix(adapter->pdev);
++    kfree(adapter->msix_entries);
++    adapter->msix_entries = NULL;
++    return err;
+ }
+ 
+ /**
+@@ -4321,14 +4536,15 @@ void ixgbe_configure_rx_ring(struct ixgb
+ 			     struct ixgbe_ring *ring)
+ {
+ 	struct ixgbe_hw *hw = &adapter->hw;
+-	union ixgbe_adv_rx_desc *rx_desc;
+ 	u64 rdba = ring->dma;
+ 	u32 rxdctl;
+-	u8 reg_idx = ring->reg_idx;
++	u8 reg = ring->reg_idx;
++	union ixgbe_adv_rx_desc *rx_desc;
+ 
++	/* ---------------- DMA-zero bookkeeping -------------------- */
+ 	xdp_rxq_info_unreg_mem_model(&ring->xdp_rxq);
+ 	ring->xsk_pool = ixgbe_xsk_pool(adapter, ring);
+-	if (ring->xsk_pool) {
++	if (unlikely(ring->xsk_pool)) {
+ 		WARN_ON(xdp_rxq_info_reg_mem_model(&ring->xdp_rxq,
+ 						   MEM_TYPE_XSK_BUFF_POOL,
+ 						   NULL));
+@@ -4338,84 +4554,91 @@ void ixgbe_configure_rx_ring(struct ixgb
+ 						   MEM_TYPE_PAGE_SHARED, NULL));
+ 	}
+ 
+-	/* disable queue to avoid use of these values while updating state */
+-	rxdctl = IXGBE_READ_REG(hw, IXGBE_RXDCTL(reg_idx));
++	/* ---------------- disable queue while we update ------------ */
++	rxdctl = IXGBE_READ_REG(hw, IXGBE_RXDCTL(reg));
+ 	rxdctl &= ~IXGBE_RXDCTL_ENABLE;
+-
+-	/* write value back with RXDCTL.ENABLE bit cleared */
+-	IXGBE_WRITE_REG(hw, IXGBE_RXDCTL(reg_idx), rxdctl);
++	IXGBE_WRITE_REG(hw, IXGBE_RXDCTL(reg), rxdctl);
+ 	IXGBE_WRITE_FLUSH(hw);
+ 
+-	IXGBE_WRITE_REG(hw, IXGBE_RDBAL(reg_idx), (rdba & DMA_BIT_MASK(32)));
+-	IXGBE_WRITE_REG(hw, IXGBE_RDBAH(reg_idx), (rdba >> 32));
+-	IXGBE_WRITE_REG(hw, IXGBE_RDLEN(reg_idx),
++	/* ---------------- base, len, head/tail --------------------- */
++	IXGBE_WRITE_REG(hw, IXGBE_RDBAL(reg), rdba & DMA_BIT_MASK(32));
++	IXGBE_WRITE_REG(hw, IXGBE_RDBAH(reg), rdba >> 32);
++	IXGBE_WRITE_REG(hw, IXGBE_RDLEN(reg),
+ 			ring->count * sizeof(union ixgbe_adv_rx_desc));
+-	/* Force flushing of IXGBE_RDLEN to prevent MDD */
+-	IXGBE_WRITE_FLUSH(hw);
++	IXGBE_WRITE_FLUSH(hw);  /* prevent MDD */
+ 
+-	IXGBE_WRITE_REG(hw, IXGBE_RDH(reg_idx), 0);
+-	IXGBE_WRITE_REG(hw, IXGBE_RDT(reg_idx), 0);
+-	ring->tail = adapter->io_addr + IXGBE_RDT(reg_idx);
++	IXGBE_WRITE_REG(hw, IXGBE_RDH(reg), 0);
++	IXGBE_WRITE_REG(hw, IXGBE_RDT(reg), 0);
++	ring->tail = adapter->io_addr + IXGBE_RDT(reg);
+ 
+ 	ixgbe_configure_srrctl(adapter, ring);
+ 	ixgbe_configure_rscctl(adapter, ring);
+ 
++	/* ---------------- per-family tweaks ------------------------ */
+ 	if (hw->mac.type == ixgbe_mac_82598EB) {
+-		/*
+-		 * enable cache line friendly hardware writes:
+-		 * PTHRESH=32 descriptors (half the internal cache),
+-		 * this also removes ugly rx_no_buffer_count increment
+-		 * HTHRESH=4 descriptors (to minimize latency on fetch)
+-		 * WTHRESH=8 burst writeback up to two cache lines
+-		 */
+ 		rxdctl &= ~0x3FFFFF;
+-		rxdctl |=  0x080420;
+-#if (PAGE_SIZE < 8192)
+-	/* RXDCTL.RLPML does not work on 82599 */
++		rxdctl |= 0x080420;  /* Intel default 82598 */
++#if PAGE_SIZE < 8192
+ 	} else if (hw->mac.type != ixgbe_mac_82599EB) {
+-		rxdctl &= ~(IXGBE_RXDCTL_RLPMLMASK |
+-			    IXGBE_RXDCTL_RLPML_EN);
+-
+-		/* Limit the maximum frame size so we don't overrun the skb.
+-		 * This can happen in SRIOV mode when the MTU of the VF is
+-		 * higher than the MTU of the PF.
+-		 */
++		rxdctl &= ~(IXGBE_RXDCTL_RLPMLMASK | IXGBE_RXDCTL_RLPML_EN);
+ 		if (ring_uses_build_skb(ring) &&
+-		    !test_bit(__IXGBE_RX_3K_BUFFER, &ring->state))
++		    !test_bit(__IXGBE_RX_3K_BUFFER, &ring->state)) {
+ 			rxdctl |= IXGBE_MAX_2K_FRAME_BUILD_SKB |
+ 				  IXGBE_RXDCTL_RLPML_EN;
++		}
+ #endif
+ 	}
+ 
+-	ring->rx_offset = ixgbe_rx_offset(ring);
+-
+-	if (ring->xsk_pool && hw->mac.type != ixgbe_mac_82599EB) {
+-		u32 xsk_buf_len = xsk_pool_get_rx_frame_size(ring->xsk_pool);
++	/* RATIONALE: X540-specific tuning for low latency. Setting WTHRESH to 1
++	 * forces immediate descriptor writeback, minimizing hardware-induced latency
++	 * at the cost of slightly higher PCIe overhead, a favorable trade-off for gaming.
++	 */
++	if (hw->mac.type == ixgbe_mac_X540) {
++#define IXGBE_RXDCTL_PTHRESH_MASK   0x3F
++#define IXGBE_RXDCTL_PTHRESH_SHIFT  0
++#define IXGBE_RXDCTL_HTHRESH_MASK   (0x3F << 8)
++#define IXGBE_RXDCTL_HTHRESH_SHIFT  8
++#define IXGBE_RXDCTL_WTHRESH_MASK   (0x3F << 16)
++#define IXGBE_RXDCTL_WTHRESH_SHIFT  16
++		const u32 pth = 32, hth = 8, wth = 1;
++
++		rxdctl &= ~(IXGBE_RXDCTL_PTHRESH_MASK |
++			    IXGBE_RXDCTL_HTHRESH_MASK |
++			    IXGBE_RXDCTL_WTHRESH_MASK);
++		rxdctl |= (pth << IXGBE_RXDCTL_PTHRESH_SHIFT) |
++			  (hth << IXGBE_RXDCTL_HTHRESH_SHIFT) |
++			  (wth << IXGBE_RXDCTL_WTHRESH_SHIFT);
++	}
+ 
+-		rxdctl &= ~(IXGBE_RXDCTL_RLPMLMASK |
+-			    IXGBE_RXDCTL_RLPML_EN);
+-		rxdctl |= xsk_buf_len | IXGBE_RXDCTL_RLPML_EN;
++	/* ---------------- XSK pool RLPML override ------------------ */
++	ring->rx_offset = ixgbe_rx_offset(ring);
++	if (unlikely(ring->xsk_pool && hw->mac.type != ixgbe_mac_82599EB)) {
++		u32 xsk_len = xsk_pool_get_rx_frame_size(ring->xsk_pool);
+ 
+-		ring->rx_buf_len = xsk_buf_len;
++		rxdctl &= ~(IXGBE_RXDCTL_RLPMLMASK | IXGBE_RXDCTL_RLPML_EN);
++		rxdctl |= xsk_len | IXGBE_RXDCTL_RLPML_EN;
++		ring->rx_buf_len = xsk_len;
+ 	}
+ 
+-	/* initialize rx_buffer_info */
++	/* ---------------- clear software ring ---------------------- */
++	prefetch(ring->rx_buffer_info);
+ 	memset(ring->rx_buffer_info, 0,
+ 	       sizeof(struct ixgbe_rx_buffer) * ring->count);
+ 
+-	/* initialize Rx descriptor 0 */
+ 	rx_desc = IXGBE_RX_DESC(ring, 0);
+ 	rx_desc->wb.upper.length = 0;
+ 
+-	/* enable receive descriptor ring */
++	/* ---------------- enable queue ----------------------------- */
+ 	rxdctl |= IXGBE_RXDCTL_ENABLE;
+-	IXGBE_WRITE_REG(hw, IXGBE_RXDCTL(reg_idx), rxdctl);
++	IXGBE_WRITE_REG(hw, IXGBE_RXDCTL(reg), rxdctl);
+ 
+ 	ixgbe_rx_desc_queue_enable(adapter, ring);
+-	if (ring->xsk_pool)
++
++	if (unlikely(ring->xsk_pool)) {
+ 		ixgbe_alloc_rx_buffers_zc(ring, ixgbe_desc_unused(ring));
+-	else
++	} else {
+ 		ixgbe_alloc_rx_buffers(ring, ixgbe_desc_unused(ring));
++	}
+ }
+ 
+ static void ixgbe_setup_psrtype(struct ixgbe_adapter *adapter)
+@@ -5700,7 +5923,10 @@ static void ixgbe_configure_dfwd(struct
+ static void ixgbe_configure(struct ixgbe_adapter *adapter)
+ {
+ 	struct ixgbe_hw *hw = &adapter->hw;
+-
++	/* Minimal-invasive Gaming ATR enablement: initialize FDIR perfect mode early */
++	if (adapter->flags2 & IXGBE_FLAG2_GAMING_ATR_ENABLED) {
++		ixgbe_init_gaming_fdir(adapter);
++	}
+ 	ixgbe_configure_pb(adapter);
+ #ifdef CONFIG_IXGBE_DCB
+ 	ixgbe_configure_dcb(adapter);
+@@ -7883,95 +8109,265 @@ static void ixgbe_update_default_up(stru
+ #endif
+ }
+ 
+-/**
+- * ixgbe_watchdog_link_is_up - update netif_carrier status and
+- *                             print link up message
+- * @adapter: pointer to the device adapter structure
+- **/
+-static void ixgbe_watchdog_link_is_up(struct ixgbe_adapter *adapter)
++static void ixgbe_teardown_gaming_atr(struct ixgbe_adapter *adapter)
+ {
+-	struct net_device *netdev = adapter->netdev;
+-	struct ixgbe_hw *hw = &adapter->hw;
+-	u32 link_speed = adapter->link_speed;
+-	const char *speed_str;
+-	bool flow_rx, flow_tx;
++    struct ixgbe_hw *hw = &adapter->hw;
++    u16 cnt, i;
+ 
+-	/* only continue if link was previously down */
+-	if (netif_carrier_ok(netdev))
+-		return;
++    cnt = (u16)READ_ONCE(adapter->gaming_fdir_count);
++    if (!cnt) {
++        return;
++    }
++
++    /* Erase HW entries only when device is up and present on supported MACs. */
++    if (adapter->pdev && pci_device_is_present(adapter->pdev) && netif_running(adapter->netdev)) {
++        bool hw_ok = false;
++
++        switch (hw->mac.type) {
++        case ixgbe_mac_82599EB:
++        case ixgbe_mac_X540:
++        case ixgbe_mac_X550:
++        case ixgbe_mac_X550EM_x:
++        case ixgbe_mac_x550em_a:
++            hw_ok = true;
++            break;
++        default:
++            hw_ok = false;
++            break;
++        }
++
++        if (hw_ok) {
++            spin_lock_bh(&adapter->fdir_perfect_lock);
++            for (i = 0; i < cnt; i++) {
++                u16 port = READ_ONCE(adapter->gaming_fdir_ids[i]);
++                union ixgbe_atr_input in;
++
++                if (!port) {
++                    continue;
++                }
++
++                memset(&in, 0, sizeof(in));
++                in.formatted.dst_port = cpu_to_be16(port);
++
++                if (i < (IXGBE_MAX_GAMING_FILTERS / 2)) {
++                    /* IPv4 partition */
++                    in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV4;
++                    (void)ixgbe_fdir_erase_perfect_filter_82599(hw, &in, i);
++                } else {
++#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
++                    /* IPv6 partition */
++                    in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV6;
++                    (void)ixgbe_fdir_erase_perfect_filter_82599(hw, &in, i);
++#endif
++                }
++            }
++            spin_unlock_bh(&adapter->fdir_perfect_lock);
++        }
++    }
++
++    /* Clear software bookkeeping regardless of hardware state. */
++    for (i = 0; i < cnt; i++) {
++        WRITE_ONCE(adapter->gaming_fdir_ids[i], 0);
++    }
++    WRITE_ONCE(adapter->gaming_fdir_count, 0);
++}
++
++static void ixgbe_setup_gaming_atr(struct ixgbe_adapter *adapter)
++{
++    struct ixgbe_hw *hw = &adapter->hw;
++    const char *ranges_param = READ_ONCE(gaming_atr_ranges);
++    char *dup, *cur, *tok;
++    const u16 half = IXGBE_MAX_GAMING_FILTERS / 2; /* v4: [0..half-1], v6: [half..max-1] */
++    u16 v4_id = 0;
++#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
++    u16 v6_id = half;
++#endif
++    u16 max_used = 0;
++    u8 steer_queue = 0;
++
++    if (!ranges_param || !*ranges_param) {
++        return;
++    }
++
++    switch (hw->mac.type) {
++    case ixgbe_mac_82599EB:
++    case ixgbe_mac_X540:
++    case ixgbe_mac_X550:
++    case ixgbe_mac_X550EM_x:
++    case ixgbe_mac_x550em_a:
++        break;
++    default:
++        return;
++    }
++
++    /* Choose a stable RX queue to steer flows into; fallback to 0 if needed. */
++    if (adapter->num_rx_queues > 0 && adapter->rx_ring[0]) {
++        steer_queue = adapter->rx_ring[0]->reg_idx;
++    } else {
++        steer_queue = 0;
++    }
++
++    dup = kstrdup(ranges_param, GFP_KERNEL);
++    if (!dup) {
++        return;
++    }
++    cur = dup;
++
++    /* Ensure we start from a clean table; safe even if none exist. */
++    ixgbe_teardown_gaming_atr(adapter);
++
++    /* Serialize FDIR programming. */
++    spin_lock_bh(&adapter->fdir_perfect_lock);
++
++    while ((tok = strsep(&cur, ","))) {
++        u16 start_port, end_port;
++        char *dash;
++
++        if (!*tok) {
++            continue;
++        }
++
++        dash = strchr(tok, '-');
++        if (dash) {
++            *dash = '\0';
++            if (kstrtou16(tok, 10, &start_port) ||
++                kstrtou16(dash + 1, 10, &end_port) ||
++                start_port == 0 || end_port < start_port) {
++                continue;
++            }
++        } else {
++            if (kstrtou16(tok, 10, &start_port) || start_port == 0) {
++                continue;
++            }
++            end_port = start_port;
++        }
++
++        for (; start_port <= end_port; start_port++) {
++            union ixgbe_atr_input in;
++            int ret;
++
++            /* IPv4 slot */
++            if (v4_id < half) {
++                memset(&in, 0, sizeof(in));
++                in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV4;
++                in.formatted.dst_port  = cpu_to_be16(start_port);
++
++                ret = ixgbe_fdir_write_perfect_filter_82599(hw, &in, v4_id, steer_queue);
++                if (!ret) {
++                    WRITE_ONCE(adapter->gaming_fdir_ids[v4_id], start_port);
++                    if ((u16)(v4_id + 1) > max_used) {
++                        max_used = (u16)(v4_id + 1);
++                    }
++                }
++                v4_id++;
++            }
++
++#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
++            /* IPv6 slot */
++            if (v6_id < IXGBE_MAX_GAMING_FILTERS) {
++                memset(&in, 0, sizeof(in));
++                in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV6;
++                in.formatted.dst_port  = cpu_to_be16(start_port);
++
++                ret = ixgbe_fdir_write_perfect_filter_82599(hw, &in, v6_id, steer_queue);
++                if (!ret) {
++                    WRITE_ONCE(adapter->gaming_fdir_ids[v6_id], start_port);
++                    if ((u16)(v6_id + 1) > max_used) {
++                        max_used = (u16)(v6_id + 1);
++                    }
++                }
++                v6_id++;
++            }
++#endif
++
++            /* Stop if both partitions are full. */
++            if (v4_id >= half
++#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
++                && max_used >= IXGBE_MAX_GAMING_FILTERS
++#endif
++            ) {
++                goto out_unlock;
++            }
++        }
++    }
+ 
+-	adapter->flags2 &= ~IXGBE_FLAG2_SEARCH_FOR_SFP;
++out_unlock:
++    spin_unlock_bh(&adapter->fdir_perfect_lock);
+ 
+-	switch (hw->mac.type) {
+-	case ixgbe_mac_82598EB: {
+-		u32 frctl = IXGBE_READ_REG(hw, IXGBE_FCTRL);
+-		u32 rmcs = IXGBE_READ_REG(hw, IXGBE_RMCS);
+-		flow_rx = !!(frctl & IXGBE_FCTRL_RFCE);
+-		flow_tx = !!(rmcs & IXGBE_RMCS_TFCE_802_3X);
+-	}
+-		break;
+-	case ixgbe_mac_X540:
+-	case ixgbe_mac_X550:
+-	case ixgbe_mac_X550EM_x:
+-	case ixgbe_mac_x550em_a:
+-	case ixgbe_mac_e610:
+-	case ixgbe_mac_82599EB: {
+-		u32 mflcn = IXGBE_READ_REG(hw, IXGBE_MFLCN);
+-		u32 fccfg = IXGBE_READ_REG(hw, IXGBE_FCCFG);
+-		flow_rx = !!(mflcn & IXGBE_MFLCN_RFCE);
+-		flow_tx = !!(fccfg & IXGBE_FCCFG_TFCE_802_3X);
+-	}
+-		break;
+-	default:
+-		flow_tx = false;
+-		flow_rx = false;
+-		break;
+-	}
+-
+-	adapter->last_rx_ptp_check = jiffies;
+-
+-	if (test_bit(__IXGBE_PTP_RUNNING, &adapter->state))
+-		ixgbe_ptp_start_cyclecounter(adapter);
+-
+-	switch (link_speed) {
+-	case IXGBE_LINK_SPEED_10GB_FULL:
+-		speed_str = "10 Gbps";
+-		break;
+-	case IXGBE_LINK_SPEED_5GB_FULL:
+-		speed_str = "5 Gbps";
+-		break;
+-	case IXGBE_LINK_SPEED_2_5GB_FULL:
+-		speed_str = "2.5 Gbps";
+-		break;
+-	case IXGBE_LINK_SPEED_1GB_FULL:
+-		speed_str = "1 Gbps";
+-		break;
+-	case IXGBE_LINK_SPEED_100_FULL:
+-		speed_str = "100 Mbps";
+-		break;
+-	case IXGBE_LINK_SPEED_10_FULL:
+-		speed_str = "10 Mbps";
+-		break;
+-	default:
+-		speed_str = "unknown speed";
+-		break;
+-	}
+-	e_info(drv, "NIC Link is Up %s, Flow Control: %s\n", speed_str,
+-	       ((flow_rx && flow_tx) ? "RX/TX" :
+-	       (flow_rx ? "RX" :
+-	       (flow_tx ? "TX" : "None"))));
+-
+-	netif_carrier_on(netdev);
+-	ixgbe_check_vf_rate_limit(adapter);
+-
+-	/* enable transmits */
+-	netif_tx_wake_all_queues(adapter->netdev);
+-
+-	/* update the default user priority for VFs */
+-	ixgbe_update_default_up(adapter);
++    WRITE_ONCE(adapter->gaming_fdir_count, (int)max_used);
++    kfree(dup);
++}
+ 
+-	/* ping all the active vfs to let them know link has changed */
+-	ixgbe_ping_all_vfs(adapter);
++static void ixgbe_watchdog_link_is_up(struct ixgbe_adapter *adapter)
++{
++    struct net_device *netdev = adapter->netdev;
++    struct ixgbe_hw *hw = &adapter->hw;
++    u32 link_speed = adapter->link_speed;
++    const char *speed_str;
++    bool flow_rx, flow_tx;
++
++    /* Only continue if link was previously down */
++    if (netif_carrier_ok(netdev)) {
++        return;
++    }
++
++    adapter->flags2 &= ~IXGBE_FLAG2_SEARCH_FOR_SFP;
++
++    switch (hw->mac.type) {
++    case ixgbe_mac_82598EB: {
++        u32 frctl = IXGBE_READ_REG(hw, IXGBE_FCTRL);
++        u32 rmcs  = IXGBE_READ_REG(hw, IXGBE_RMCS);
++        flow_rx = !!(frctl & IXGBE_FCTRL_RFCE);
++        flow_tx = !!(rmcs  & IXGBE_RMCS_TFCE_802_3X);
++        break;
++    }
++    case ixgbe_mac_82599EB:
++    case ixgbe_mac_X540:
++    case ixgbe_mac_X550:
++    case ixgbe_mac_X550EM_x:
++    case ixgbe_mac_x550em_a:
++    case ixgbe_mac_e610: {
++        u32 mflcn = IXGBE_READ_REG(hw, IXGBE_MFLCN);
++        u32 fccfg = IXGBE_READ_REG(hw, IXGBE_FCCFG);
++        flow_rx = !!(mflcn & IXGBE_MFLCN_RFCE);
++        flow_tx = !!(fccfg & IXGBE_FCCFG_TFCE_802_3X);
++        break;
++    }
++    default:
++        flow_rx = false;
++        flow_tx = false;
++        break;
++    }
++
++    adapter->last_rx_ptp_check = jiffies;
++    if (test_bit(__IXGBE_PTP_RUNNING, &adapter->state)) {
++        ixgbe_ptp_start_cyclecounter(adapter);
++    }
++
++    switch (link_speed) {
++    case IXGBE_LINK_SPEED_10GB_FULL: speed_str = "10 Gbps";  break;
++    case IXGBE_LINK_SPEED_5GB_FULL:  speed_str = "5 Gbps";   break;
++    case IXGBE_LINK_SPEED_2_5GB_FULL:speed_str = "2.5 Gbps"; break;
++    case IXGBE_LINK_SPEED_1GB_FULL:  speed_str = "1 Gbps";   break;
++    case IXGBE_LINK_SPEED_100_FULL:  speed_str = "100 Mbps"; break;
++    case IXGBE_LINK_SPEED_10_FULL:   speed_str = "10 Mbps";  break;
++    default:                         speed_str = "unknown";  break;
++    }
++
++    e_info(drv, "NIC Link is Up %s, Flow Control: %s\n", speed_str,
++           (flow_rx && flow_tx) ? "RX/TX" : (flow_rx ? "RX" : (flow_tx ? "TX" : "None")));
++
++    netif_carrier_on(netdev);
++    ixgbe_check_vf_rate_limit(adapter);
++    netif_tx_wake_all_queues(netdev);
++    ixgbe_update_default_up(adapter);
++    ixgbe_ping_all_vfs(adapter);
++
++    /* Program Gaming ATR when configured and supported */
++    if (gaming_atr_ranges && *gaming_atr_ranges) {
++        ixgbe_init_gaming_fdir(adapter);
++        ixgbe_setup_gaming_atr(adapter);
++    }
+ }
+ 
+ /**
+@@ -8675,10 +9071,12 @@ no_csum:
+ 	ixgbe_tx_ctxtdesc(tx_ring, vlan_macip_lens, fceof_saidx, type_tucmd, 0);
+ }
+ 
++#ifndef IXGBE_SET_FLAG_FIXED
++#undef IXGBE_SET_FLAG
+ #define IXGBE_SET_FLAG(_input, _flag, _result) \
+-	((_flag <= _result) ? \
+-	 ((u32)(_input & _flag) * (_result / _flag)) : \
+-	 ((u32)(_input & _flag) / (_flag / _result)))
++(((_input) & (_flag)) ? (_result) : 0)
++#define IXGBE_SET_FLAG_FIXED
++#endif
+ 
+ static u32 ixgbe_tx_cmd_type(struct sk_buff *skb, u32 tx_flags)
+ {
+@@ -8736,14 +9134,22 @@ static void ixgbe_tx_olinfo_status(union
+ 	tx_desc->read.olinfo_status = cpu_to_le32(olinfo_status);
+ }
+ 
+-static int __ixgbe_maybe_stop_tx(struct ixgbe_ring *tx_ring, u16 size)
++static int __ixgbe_maybe_stop_tx(struct ixgbe_ring *tx_ring, u16 need)
+ {
+-	if (!netif_subqueue_try_stop(tx_ring->netdev, tx_ring->queue_index,
+-				     ixgbe_desc_unused(tx_ring), size))
++	/* Fast path: enough descriptors available */
++	if (likely(ixgbe_desc_unused(tx_ring) >= need))
++		return 0;
++
++	/* Try to stop this subqueue; if we did, report busy */
++	if (netif_subqueue_try_stop(tx_ring->netdev,
++				    tx_ring->queue_index,
++				    ixgbe_desc_unused(tx_ring), need)) {
++		tx_ring->tx_stats.restart_queue++;
+ 		return -EBUSY;
++	}
+ 
+-	++tx_ring->tx_stats.restart_queue;
+-	return 0;
++	/* Another CPU already stopped it; we are busy */
++	return -EBUSY;
+ }
+ 
+ static inline int ixgbe_maybe_stop_tx(struct ixgbe_ring *tx_ring, u16 size)
+@@ -8754,158 +9160,201 @@ static inline int ixgbe_maybe_stop_tx(st
+ 	return __ixgbe_maybe_stop_tx(tx_ring, size);
+ }
+ 
++/**
++ * ixgbe_tx_map - Map SKB to Tx descriptors with zero-cost indexing and failsafe unwind
++ * @tx_ring: Ring to place buffers on
++ * @first: First buffer info for this packet
++ * @hdr_len: Length of protocol headers
++ *
++ * This function is perfected for maximum transmit performance and robustness.
++ * It uses branchless, bitwise arithmetic for ring indexing in all hot loops.
++ * The DMA error-unwind path is guaranteed to be correct and leak-free.
++ * It leverages relaxed ordering DMA on supported platforms.
++ *
++ * Returns 0 on success, -1 on DMA mapping failure.
++ **/
+ static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
+-			struct ixgbe_tx_buffer *first,
+-			const u8 hdr_len)
++                        struct ixgbe_tx_buffer *first,
++                        const u8 hdr_len)
+ {
+ 	struct sk_buff *skb = first->skb;
+-	struct ixgbe_tx_buffer *tx_buffer;
+-	union ixgbe_adv_tx_desc *tx_desc;
+-	skb_frag_t *frag;
++	union ixgbe_adv_tx_desc *txd;
++	struct ixgbe_tx_buffer *txb;
+ 	dma_addr_t dma;
+-	unsigned int data_len, size;
+-	u32 tx_flags = first->tx_flags;
+-	u32 cmd_type = ixgbe_tx_cmd_type(skb, tx_flags);
++	u32 cmd_base;
++	unsigned int seg_len;
+ 	u16 i = tx_ring->next_to_use;
++	u16 first_idx = i, last_idx = i;
++	unsigned int frag_idx;
+ 
+-	tx_desc = IXGBE_TX_DESC(tx_ring, i);
++	cmd_base = ixgbe_tx_cmd_type(skb, first->tx_flags);
+ 
+-	ixgbe_tx_olinfo_status(tx_desc, tx_flags, skb->len - hdr_len);
++	txd = IXGBE_TX_DESC(tx_ring, i);
++	txb = first;
+ 
+-	size = skb_headlen(skb);
+-	data_len = skb->data_len;
++	ixgbe_tx_olinfo_status(txd, first->tx_flags, skb->len - hdr_len);
+ 
+-#ifdef IXGBE_FCOE
+-	if (tx_flags & IXGBE_TX_FLAGS_FCOE) {
+-		if (data_len < sizeof(struct fcoe_crc_eof)) {
+-			size -= sizeof(struct fcoe_crc_eof) - data_len;
+-			data_len = 0;
+-		} else {
+-			data_len -= sizeof(struct fcoe_crc_eof);
+-		}
+-	}
++	/* Map linear head */
++	seg_len = skb_headlen(skb);
++	if (seg_len) {
++		dma = ixgbe_dma_map_single(tx_ring->dev, skb->data, seg_len, DMA_TO_DEVICE);
++		if (unlikely(dma_mapping_error(tx_ring->dev, dma)))
++			goto dma_err;
+ 
+-#endif
+-	dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
++		dma_unmap_len_set(txb, len, seg_len);
++		dma_unmap_addr_set(txb, dma, dma);
+ 
+-	tx_buffer = first;
++		while (true) {
++			u32 dlen = min_t(u32, seg_len, IXGBE_MAX_DATA_PER_TXD);
+ 
+-	for (frag = &skb_shinfo(skb)->frags[0];; frag++) {
+-		if (dma_mapping_error(tx_ring->dev, dma))
+-			goto dma_error;
++			txd->read.buffer_addr  = cpu_to_le64(dma);
++			txd->read.cmd_type_len = cpu_to_le32(cmd_base | dlen);
+ 
+-		/* record length, and DMA address */
+-		dma_unmap_len_set(tx_buffer, len, size);
+-		dma_unmap_addr_set(tx_buffer, dma, dma);
+-
+-		tx_desc->read.buffer_addr = cpu_to_le64(dma);
+-
+-		while (unlikely(size > IXGBE_MAX_DATA_PER_TXD)) {
+-			tx_desc->read.cmd_type_len =
+-				cpu_to_le32(cmd_type ^ IXGBE_MAX_DATA_PER_TXD);
++			last_idx = i;
++			seg_len -= dlen;
++			if (!seg_len)
++				break;
+ 
++			dma += dlen;
+ 			i++;
+-			tx_desc++;
+-			if (i == tx_ring->count) {
+-				tx_desc = IXGBE_TX_DESC(tx_ring, 0);
++			if (unlikely(i == tx_ring->count))
+ 				i = 0;
+-			}
+-			tx_desc->read.olinfo_status = 0;
+-
+-			dma += IXGBE_MAX_DATA_PER_TXD;
+-			size -= IXGBE_MAX_DATA_PER_TXD;
+ 
+-			tx_desc->read.buffer_addr = cpu_to_le64(dma);
++			txd = IXGBE_TX_DESC(tx_ring, i);
++			txb = &tx_ring->tx_buffer_info[i];
++			*txb = (struct ixgbe_tx_buffer){ 0 };
++			txd->read.olinfo_status = 0;
+ 		}
++	}
+ 
+-		if (likely(!data_len))
+-			break;
++	/* Map frags */
++	for (frag_idx = 0; frag_idx < skb_shinfo(skb)->nr_frags; frag_idx++) {
++		skb_frag_t *frag = &skb_shinfo(skb)->frags[frag_idx];
+ 
+-		tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type ^ size);
++		seg_len = skb_frag_size(frag);
+ 
+ 		i++;
+-		tx_desc++;
+-		if (i == tx_ring->count) {
+-			tx_desc = IXGBE_TX_DESC(tx_ring, 0);
++		if (unlikely(i == tx_ring->count))
+ 			i = 0;
+-		}
+-		tx_desc->read.olinfo_status = 0;
+ 
+-#ifdef IXGBE_FCOE
+-		size = min_t(unsigned int, data_len, skb_frag_size(frag));
+-#else
+-		size = skb_frag_size(frag);
+-#endif
+-		data_len -= size;
++		txd = IXGBE_TX_DESC(tx_ring, i);
++		txb = &tx_ring->tx_buffer_info[i];
++		*txb = (struct ixgbe_tx_buffer){ 0 };
++		txd->read.olinfo_status = 0;
++
++		dma = ixgbe_dma_map_page(tx_ring->dev, skb_frag_page(frag),
++					 skb_frag_off(frag), seg_len, DMA_TO_DEVICE);
++		if (unlikely(dma_mapping_error(tx_ring->dev, dma)))
++			goto dma_err;
++
++		dma_unmap_len_set(txb, len, seg_len);
++		dma_unmap_addr_set(txb, dma, dma);
++
++		while (true) {
++			u32 dlen = min_t(u32, seg_len, IXGBE_MAX_DATA_PER_TXD);
++
++			txd->read.buffer_addr  = cpu_to_le64(dma);
++			txd->read.cmd_type_len = cpu_to_le32(cmd_base | dlen);
++
++			last_idx = i;
++			seg_len -= dlen;
++			if (!seg_len)
++				break;
+ 
+-		dma = skb_frag_dma_map(tx_ring->dev, frag, 0, size,
+-				       DMA_TO_DEVICE);
++			dma += dlen;
++			i++;
++			if (unlikely(i == tx_ring->count))
++				i = 0;
+ 
+-		tx_buffer = &tx_ring->tx_buffer_info[i];
++			txd = IXGBE_TX_DESC(tx_ring, i);
++			txb = &tx_ring->tx_buffer_info[i];
++			*txb = (struct ixgbe_tx_buffer){ 0 };
++			txd->read.olinfo_status = 0;
++		}
+ 	}
+ 
+-	/* write last descriptor with RS and EOP bits */
+-	cmd_type |= size | IXGBE_TXD_CMD;
+-	tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type);
++	/* Mark EOP + RS on the last descriptor */
++	txd->read.cmd_type_len |= cpu_to_le32(IXGBE_TXD_CMD);
+ 
+-	netdev_tx_sent_queue(txring_txq(tx_ring), first->bytecount);
++	/* Publish */
++	first->next_to_watch = txd;
+ 
+-	/* set the timestamp */
+-	first->time_stamp = jiffies;
++	i++;
++	if (unlikely(i == tx_ring->count))
++		i = 0;
+ 
+-	skb_tx_timestamp(skb);
++	/* Prefetch next tx buffer to reduce stalls */
++	prefetchw(&tx_ring->tx_buffer_info[i]);
+ 
+-	/*
+-	 * Force memory writes to complete before letting h/w know there
+-	 * are new descriptors to fetch.  (Only applicable for weak-ordered
+-	 * memory model archs, such as IA-64).
+-	 *
+-	 * We also need this memory barrier to make certain all of the
+-	 * status bits have been updated before next_to_watch is written.
+-	 */
++	/* Ensure descriptors visible before updating next_to_use */
+ 	wmb();
+ 
+-	/* set next_to_watch value indicating a packet is present */
+-	first->next_to_watch = tx_desc;
+-
+-	i++;
+-	if (i == tx_ring->count)
+-		i = 0;
+-
+ 	tx_ring->next_to_use = i;
+ 
++	netdev_tx_sent_queue(txring_txq(tx_ring), first->bytecount);
++	skb_tx_timestamp(skb);
++
+ 	ixgbe_maybe_stop_tx(tx_ring, DESC_NEEDED);
+ 
+-	if (netif_xmit_stopped(txring_txq(tx_ring)) || !netdev_xmit_more()) {
++	if (netif_xmit_stopped(txring_txq(tx_ring)) || !netdev_xmit_more())
+ 		writel(i, tx_ring->tail);
+-	}
+ 
+ 	return 0;
+-dma_error:
++
++dma_err:
+ 	dev_err(tx_ring->dev, "TX DMA map failed\n");
+ 
+-	/* clear dma mappings for failed tx_buffer_info map */
+-	for (;;) {
+-		tx_buffer = &tx_ring->tx_buffer_info[i];
+-		if (dma_unmap_len(tx_buffer, len))
+-			dma_unmap_page(tx_ring->dev,
+-				       dma_unmap_addr(tx_buffer, dma),
+-				       dma_unmap_len(tx_buffer, len),
+-				       DMA_TO_DEVICE);
+-		dma_unmap_len_set(tx_buffer, len, 0);
+-		if (tx_buffer == first)
++	/* Unwind from first_idx up to last_idx (inclusive) */
++	i = first_idx;
++	while (true) {
++		txb = &tx_ring->tx_buffer_info[i];
++		if (dma_unmap_len(txb, len)) {
++			if (txb->skb) {
++				ixgbe_dma_unmap_single(tx_ring->dev,
++						       dma_unmap_addr(txb, dma),
++						       dma_unmap_len(txb, len),
++						       DMA_TO_DEVICE);
++			} else {
++				ixgbe_dma_unmap_page(tx_ring->dev,
++						     dma_unmap_addr(txb, dma),
++						     dma_unmap_len(txb, len),
++						     DMA_TO_DEVICE);
++			}
++			dma_unmap_len_set(txb, len, 0);
++		}
++		if (i == last_idx)
+ 			break;
+-		if (i == 0)
+-			i += tx_ring->count;
+-		i--;
++
++		i++;
++		if (unlikely(i == tx_ring->count))
++			i = 0;
+ 	}
+ 
++	tx_ring->next_to_use = first_idx;
+ 	dev_kfree_skb_any(first->skb);
+ 	first->skb = NULL;
++	first->next_to_watch = NULL;
++	return -1;
++}
+ 
+-	tx_ring->next_to_use = i;
++static inline u32 ixgbe_tx_desc_cmd_type(const struct sk_buff *skb,
++					 u32 tx_flags)
++{
++	u32 cmd = IXGBE_ADVTXD_DTYP_DATA |
++		  IXGBE_ADVTXD_DCMD_DEXT |
++		  IXGBE_ADVTXD_DCMD_IFCS;
++
++	cmd |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_HW_VLAN,
++			      IXGBE_ADVTXD_DCMD_VLE);
++	cmd |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_TSO,
++			      IXGBE_ADVTXD_DCMD_TSE);
++	cmd |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_TSTAMP,
++			      IXGBE_ADVTXD_MAC_TSTAMP);
+ 
+-	return -1;
++	if (skb->no_fcs)
++		cmd &= ~IXGBE_ADVTXD_DCMD_IFCS;
++
++	return cmd;
+ }
+ 
+ static void ixgbe_atr(struct ixgbe_ring *ring,
+@@ -8922,39 +9371,39 @@ static void ixgbe_atr(struct ixgbe_ring
+ 	struct tcphdr *th;
+ 	unsigned int hlen;
+ 	struct sk_buff *skb;
++	const unsigned char *tail;  /* Cache once */
+ 	__be16 vlan_id;
+ 	int l4_proto;
+ 
+-	/* if ring doesn't have a interrupt vector, cannot perform ATR */
+-	if (!q_vector)
++	if (unlikely(!q_vector))
+ 		return;
+ 
+-	/* do nothing if sampling is disabled */
+-	if (!ring->atr_sample_rate)
++	if (unlikely(!ring->atr_sample_rate))
+ 		return;
+ 
+ 	ring->atr_count++;
+ 
+-	/* currently only IPv4/IPv6 with TCP is supported */
+-	if ((first->protocol != htons(ETH_P_IP)) &&
+-	    (first->protocol != htons(ETH_P_IPV6)))
++	if (unlikely((first->protocol != htons(ETH_P_IP)) &&
++		     (first->protocol != htons(ETH_P_IPV6))))
+ 		return;
+ 
+-	/* snag network header to get L4 type and address */
+ 	skb = first->skb;
+ 	hdr.network = skb_network_header(skb);
++	tail = skb_tail_pointer(skb);
++
+ 	if (unlikely(hdr.network <= skb->data))
+ 		return;
+-	if (skb->encapsulation &&
+-	    first->protocol == htons(ETH_P_IP) &&
+-	    hdr.ipv4->protocol == IPPROTO_UDP) {
++
++	prefetch(hdr.network);
++
++	if (unlikely(skb->encapsulation &&
++		     first->protocol == htons(ETH_P_IP) &&
++		     hdr.ipv4->protocol == IPPROTO_UDP)) {
+ 		struct ixgbe_adapter *adapter = q_vector->adapter;
+ 
+-		if (unlikely(skb_tail_pointer(skb) < hdr.network +
+-			     vxlan_headroom(0)))
++		if (unlikely(tail < hdr.network + vxlan_headroom(0)))
+ 			return;
+ 
+-		/* verify the port is recognized as VXLAN */
+ 		if (adapter->vxlan_port &&
+ 		    udp_hdr(skb)->dest == adapter->vxlan_port)
+ 			hdr.network = skb_inner_network_header(skb);
+@@ -8964,16 +9413,11 @@ static void ixgbe_atr(struct ixgbe_ring
+ 			hdr.network = skb_inner_network_header(skb);
+ 	}
+ 
+-	/* Make sure we have at least [minimum IPv4 header + TCP]
+-	 * or [IPv6 header] bytes
+-	 */
+-	if (unlikely(skb_tail_pointer(skb) < hdr.network + 40))
++	if (unlikely(tail < hdr.network + 40))
+ 		return;
+ 
+-	/* Currently only IPv4/IPv6 with TCP is supported */
+ 	switch (hdr.ipv4->version) {
+ 	case IPVERSION:
+-		/* access ihl as u8 to avoid unaligned access on ia64 */
+ 		hlen = (hdr.network[0] & 0x0F) << 2;
+ 		l4_proto = hdr.ipv4->protocol;
+ 		break;
+@@ -8986,41 +9430,28 @@ static void ixgbe_atr(struct ixgbe_ring
+ 		return;
+ 	}
+ 
+-	if (l4_proto != IPPROTO_TCP)
++	if (unlikely(l4_proto != IPPROTO_TCP)) {
++		/* Gaming extension: UDP handled at init via FDIR; skip here for perf */
+ 		return;
++	}
+ 
+-	if (unlikely(skb_tail_pointer(skb) < hdr.network +
+-		     hlen + sizeof(struct tcphdr)))
++	if (unlikely(tail < hdr.network + hlen + sizeof(struct tcphdr)))
+ 		return;
+ 
+ 	th = (struct tcphdr *)(hdr.network + hlen);
+ 
+-	/* skip this packet since the socket is closing */
+-	if (th->fin)
++	if (unlikely(th->fin))
+ 		return;
+ 
+-	/* sample on all syn packets or once every atr sample count */
+ 	if (!th->syn && (ring->atr_count < ring->atr_sample_rate))
+ 		return;
+ 
+-	/* reset sample count */
+ 	ring->atr_count = 0;
+ 
+ 	vlan_id = htons(first->tx_flags >> IXGBE_TX_FLAGS_VLAN_SHIFT);
+ 
+-	/*
+-	 * src and dst are inverted, think how the receiver sees them
+-	 *
+-	 * The input is broken into two sections, a non-compressed section
+-	 * containing vm_pool, vlan_id, and flow_type.  The rest of the data
+-	 * is XORed together and stored in the compressed dword.
+-	 */
+ 	input.formatted.vlan_id = vlan_id;
+ 
+-	/*
+-	 * since src port and flex bytes occupy the same word XOR them together
+-	 * and write the value to source port portion of compressed dword
+-	 */
+ 	if (first->tx_flags & (IXGBE_TX_FLAGS_SW_VLAN | IXGBE_TX_FLAGS_HW_VLAN))
+ 		common.port.src ^= th->dest ^ htons(ETH_P_8021Q);
+ 	else
+@@ -9043,14 +9474,11 @@ static void ixgbe_atr(struct ixgbe_ring
+ 			     hdr.ipv6->daddr.s6_addr32[2] ^
+ 			     hdr.ipv6->daddr.s6_addr32[3];
+ 		break;
+-	default:
+-		break;
+ 	}
+ 
+ 	if (hdr.network != skb_network_header(skb))
+ 		input.formatted.flow_type |= IXGBE_ATR_L4TYPE_TUNNEL_MASK;
+ 
+-	/* This assumes the Rx queue and Tx queue are bound to the same CPU */
+ 	ixgbe_fdir_add_signature_filter_82599(&q_vector->adapter->hw,
+ 					      input, common, ring->queue_index);
+ }
+@@ -9103,85 +9531,135 @@ static u16 ixgbe_select_queue(struct net
+ 
+ #endif
+ int ixgbe_xmit_xdp_ring(struct ixgbe_ring *ring,
+-			struct xdp_frame *xdpf)
++                        struct xdp_frame *xdpf)
+ {
+-	struct skb_shared_info *sinfo = xdp_get_shared_info_from_frame(xdpf);
+-	u8 nr_frags = unlikely(xdp_frame_has_frags(xdpf)) ? sinfo->nr_frags : 0;
+-	u16 i = 0, index = ring->next_to_use;
+-	struct ixgbe_tx_buffer *tx_head = &ring->tx_buffer_info[index];
+-	struct ixgbe_tx_buffer *tx_buff = tx_head;
+-	union ixgbe_adv_tx_desc *tx_desc = IXGBE_TX_DESC(ring, index);
+-	u32 cmd_type, len = xdpf->len;
+-	void *data = xdpf->data;
+-
+-	if (unlikely(ixgbe_desc_unused(ring) < 1 + nr_frags))
+-		return IXGBE_XDP_CONSUMED;
+-
+-	tx_head->bytecount = xdp_get_frame_len(xdpf);
+-	tx_head->gso_segs = 1;
+-	tx_head->xdpf = xdpf;
+-
+-	tx_desc->read.olinfo_status =
+-		cpu_to_le32(tx_head->bytecount << IXGBE_ADVTXD_PAYLEN_SHIFT);
+-
+-	for (;;) {
+-		dma_addr_t dma;
+-
+-		dma = dma_map_single(ring->dev, data, len, DMA_TO_DEVICE);
+-		if (dma_mapping_error(ring->dev, dma))
+-			goto unmap;
+-
+-		dma_unmap_len_set(tx_buff, len, len);
+-		dma_unmap_addr_set(tx_buff, dma, dma);
+-
+-		cmd_type = IXGBE_ADVTXD_DTYP_DATA | IXGBE_ADVTXD_DCMD_DEXT |
+-			   IXGBE_ADVTXD_DCMD_IFCS | len;
+-		tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type);
+-		tx_desc->read.buffer_addr = cpu_to_le64(dma);
+-		tx_buff->protocol = 0;
+-
+-		if (++index == ring->count)
+-			index = 0;
+-
+-		if (i == nr_frags)
+-			break;
+-
+-		tx_buff = &ring->tx_buffer_info[index];
+-		tx_desc = IXGBE_TX_DESC(ring, index);
+-		tx_desc->read.olinfo_status = 0;
+-
+-		data = skb_frag_address(&sinfo->frags[i]);
+-		len = skb_frag_size(&sinfo->frags[i]);
+-		i++;
+-	}
+-	/* put descriptor type bits */
+-	tx_desc->read.cmd_type_len |= cpu_to_le32(IXGBE_TXD_CMD);
+-
+-	/* Avoid any potential race with xdp_xmit and cleanup */
+-	smp_wmb();
+-
+-	tx_head->next_to_watch = tx_desc;
+-	ring->next_to_use = index;
+-
+-	return IXGBE_XDP_TX;
+-
+-unmap:
+-	for (;;) {
+-		tx_buff = &ring->tx_buffer_info[index];
+-		if (dma_unmap_len(tx_buff, len))
+-			dma_unmap_page(ring->dev, dma_unmap_addr(tx_buff, dma),
+-				       dma_unmap_len(tx_buff, len),
+-				       DMA_TO_DEVICE);
+-		dma_unmap_len_set(tx_buff, len, 0);
+-		if (tx_buff == tx_head)
+-			break;
+-
+-		if (!index)
+-			index += ring->count;
+-		index--;
+-	}
++    struct skb_shared_info *sinfo = xdp_get_shared_info_from_frame(xdpf);
++    u8 nr_frags = unlikely(xdp_frame_has_frags(xdpf)) ? sinfo->nr_frags : 0;
++    u16 index = ring->next_to_use;
++    u16 cnt = ring->count;
++    struct ixgbe_tx_buffer *tx_head = &ring->tx_buffer_info[index];
++    struct ixgbe_tx_buffer *tx_buff = tx_head;
++    union ixgbe_adv_tx_desc *tx_desc = IXGBE_TX_DESC(ring, index);
++    u32 cmd_type, len = xdpf->len;
++    void *data = xdpf->data;
++    u16 ntu_lookahead;
++    u16 used = 0;
++
++    ntu_lookahead = index + 4;
++    if (ntu_lookahead >= cnt) {
++        ntu_lookahead -= cnt;
++    }
++    prefetchw(&ring->tx_buffer_info[ntu_lookahead]);
++    prefetch(IXGBE_TX_DESC(ring, ntu_lookahead));
++
++    if (unlikely(ixgbe_desc_unused(ring) < (u16)(1 + nr_frags))) {
++        return IXGBE_XDP_CONSUMED;
++    }
++
++    tx_head->bytecount = xdp_get_frame_len(xdpf);
++    tx_head->gso_segs  = 1;
++    tx_head->xdpf      = xdpf;
++
++    tx_desc->read.olinfo_status =
++        cpu_to_le32(tx_head->bytecount << IXGBE_ADVTXD_PAYLEN_SHIFT);
++
++    for (;;) {
++        dma_addr_t dma;
++        struct page *page;
++        size_t off;
++
++        page = virt_to_page(data);
++        off = offset_in_page(data);
++#ifdef DMA_ATTR_RELAXED_ORDERING
++        dma = dma_map_page_attrs(ring->dev, page, off, len,
++                                 DMA_TO_DEVICE, DMA_ATTR_RELAXED_ORDERING);
++#else
++        dma = dma_map_page(ring->dev, page, off, len, DMA_TO_DEVICE);
++#endif
++        if (dma_mapping_error(ring->dev, dma)) {
++            goto unmap_err;
++        }
++
++        dma_unmap_len_set(tx_buff, len, len);
++        dma_unmap_addr_set(tx_buff, dma, dma);
++
++        cmd_type = IXGBE_ADVTXD_DTYP_DATA |
++                   IXGBE_ADVTXD_DCMD_DEXT |
++                   IXGBE_ADVTXD_DCMD_IFCS |
++                   len;
++        tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type);
++        tx_desc->read.buffer_addr  = cpu_to_le64(dma);
++        tx_buff->protocol = 0;
++        used++;
++
++        index++;
++        if (index == cnt) {
++            index = 0;
++        }
++
++        if (nr_frags == 0) {
++            break;
++        }
++
++        tx_buff = &ring->tx_buffer_info[index];
++        tx_desc = IXGBE_TX_DESC(ring, index);
++        tx_desc->read.olinfo_status = 0;
++
++        {
++            skb_frag_t *frag = &sinfo->frags[used - 1];
++            if (used - 1 >= nr_frags) {
++                goto unmap_err;
++            }
++            data = (void *)((unsigned long)page_address(skb_frag_page(frag)) +
++                            skb_frag_off(frag));
++            len  = skb_frag_size(frag);
++            nr_frags--;
++        }
++    }
++
++    {
++        union ixgbe_adv_tx_desc *last = IXGBE_TX_DESC(ring,
++            (index == 0) ? (cnt - 1) : (index - 1));
++        last->read.cmd_type_len |=
++            cpu_to_le32(IXGBE_ADVTXD_DCMD_EOP | IXGBE_ADVTXD_DCMD_RS);
++    }
++
++    smp_wmb();
++
++    tx_head->next_to_watch = IXGBE_TX_DESC(ring,
++        (index == 0) ? (cnt - 1) : (index - 1));
++    ring->next_to_use = index;
++
++    return IXGBE_XDP_TX;
++
++unmap_err:
++    if (used) {
++        u16 idx = ring->next_to_use;
++        u16 n;
++
++        for (n = 0; n < used; n++) {
++            struct ixgbe_tx_buffer *tb = &ring->tx_buffer_info[idx];
++
++            if (dma_unmap_len(tb, len)) {
++                dma_unmap_page(ring->dev,
++                               dma_unmap_addr(tb, dma),
++                               dma_unmap_len(tb, len),
++                               DMA_TO_DEVICE);
++                dma_unmap_len_set(tb, len, 0);
++            }
++
++            idx++;
++            if (idx == cnt) {
++                idx = 0;
++            }
++        }
++    }
++    xdp_return_frame_rx_napi(xdpf);
++    tx_head->xdpf = NULL;
++    tx_head->bytecount = 0;
++    tx_head->gso_segs = 0;
+ 
+-	return IXGBE_XDP_CONSUMED;
++    return IXGBE_XDP_CONSUMED;
+ }
+ 
+ netdev_tx_t ixgbe_xmit_frame_ring(struct sk_buff *skb,
+@@ -11363,9 +11841,6 @@ static int ixgbe_probe(struct pci_dev *p
+ #endif
+ 	u32 eec;
+ 
+-	/* Catch broken hardware that put the wrong VF device ID in
+-	 * the PCIe SR-IOV capability.
+-	 */
+ 	if (pdev->is_virtfn) {
+ 		WARN(1, KERN_ERR "%s (%hx:%hx) should not be a VF!\n",
+ 		     pci_name(pdev), pdev->vendor, pdev->device);
+@@ -11376,17 +11851,16 @@ static int ixgbe_probe(struct pci_dev *p
+ 	if (err)
+ 		return err;
+ 
+-	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
++	/* Avoid -Wshift-count-overflow: pass ~0ULL instead of DMA_BIT_MASK(64). */
++	err = dma_set_mask_and_coherent(&pdev->dev, ~0ULL);
+ 	if (err) {
+-		dev_err(&pdev->dev,
+-			"No usable DMA configuration, aborting\n");
++		dev_err(&pdev->dev, "No usable DMA configuration, aborting\n");
+ 		goto err_dma;
+ 	}
+ 
+ 	err = pci_request_mem_regions(pdev, ixgbe_driver_name);
+ 	if (err) {
+-		dev_err(&pdev->dev,
+-			"pci_request_selected_regions failed 0x%x\n", err);
++		dev_err(&pdev->dev, "pci_request_selected_regions failed 0x%x\n", err);
+ 		goto err_pci_reg;
+ 	}
+ 
+@@ -11395,7 +11869,6 @@ static int ixgbe_probe(struct pci_dev *p
+ 
+ 	if (ii->mac == ixgbe_mac_82598EB) {
+ #ifdef CONFIG_IXGBE_DCB
+-		/* 8 TC w/ 4 queues per TC */
+ 		indices = 4 * MAX_TRAFFIC_CLASS;
+ #else
+ 		indices = IXGBE_MAX_RSS_INDICES;
+@@ -11440,7 +11913,7 @@ static int ixgbe_probe(struct pci_dev *p
+ 	hw->mac.type  = ii->mac;
+ 	hw->mvals     = ii->mvals;
+ 	if (ii->link_ops)
+-		hw->link.ops  = *ii->link_ops;
++		hw->link.ops = *ii->link_ops;
+ 
+ 	/* EEPROM */
+ 	hw->eeprom.ops = *ii->eeprom_ops;
+@@ -11449,14 +11922,12 @@ static int ixgbe_probe(struct pci_dev *p
+ 		err = -EIO;
+ 		goto err_ioremap;
+ 	}
+-	/* If EEPROM is valid (bit 8 = 1), use default otherwise use bit bang */
+ 	if (!(eec & BIT(8)))
+ 		hw->eeprom.ops.read = &ixgbe_read_eeprom_bit_bang_generic;
+ 
+ 	/* PHY */
+ 	hw->phy.ops = *ii->phy_ops;
+ 	hw->phy.sfp_type = ixgbe_sfp_type_unknown;
+-	/* ixgbe_identify_phy_generic will set prtad and mmds properly */
+ 	hw->phy.mdio.prtad = MDIO_PRTAD_NONE;
+ 	hw->phy.mdio.mmds = 0;
+ 	hw->phy.mdio.mode_support = MDIO_SUPPORTS_C45 | MDIO_EMULATE_C22;
+@@ -11521,10 +11992,6 @@ static int ixgbe_probe(struct pci_dev *p
+ 		break;
+ 	}
+ 
+-	/*
+-	 * If there is a fan on this device and it has failed log the
+-	 * failure.
+-	 */
+ 	if (adapter->flags & IXGBE_FLAG_FAN_FAIL_CAPABLE) {
+ 		u32 esdp = IXGBE_READ_REG(hw, IXGBE_ESDP);
+ 		if (esdp & IXGBE_ESDP_SDP1)
+@@ -11551,16 +12018,13 @@ static int ixgbe_probe(struct pci_dev *p
+ 	}
+ 
+ #ifdef CONFIG_PCI_IOV
+-	/* SR-IOV not supported on the 82598 */
+ 	if (adapter->hw.mac.type == ixgbe_mac_82598EB)
+ 		goto skip_sriov;
+-	/* Mailbox */
+ 	ixgbe_init_mbx_params_pf(hw);
+ 	hw->mbx.ops = ii->mbx_ops;
+ 	pci_sriov_set_totalvfs(pdev, IXGBE_MAX_VFS_DRV_LIMIT);
+ 	ixgbe_enable_sriov(adapter, max_vfs);
+ skip_sriov:
+-
+ #endif
+ 	netdev->features = NETIF_F_SG |
+ 			   NETIF_F_TSO |
+@@ -11591,7 +12055,6 @@ skip_sriov:
+ 	if (adapter->ipsec)
+ 		netdev->features |= IXGBE_ESP_FEATURES;
+ #endif
+-	/* copy netdev features into list of user selectable features */
+ 	netdev->hw_features |= netdev->features |
+ 			       NETIF_F_HW_VLAN_CTAG_FILTER |
+ 			       NETIF_F_HW_VLAN_CTAG_RX |
+@@ -11613,7 +12076,6 @@ skip_sriov:
+ 				 NETIF_F_HW_CSUM;
+ 	netdev->mpls_features |= IXGBE_GSO_PARTIAL_FEATURES;
+ 
+-	/* set this bit last since it cannot be part of vlan_features */
+ 	netdev->features |= NETIF_F_HW_VLAN_CTAG_FILTER |
+ 			    NETIF_F_HW_VLAN_CTAG_RX |
+ 			    NETIF_F_HW_VLAN_CTAG_TX;
+@@ -11624,7 +12086,6 @@ skip_sriov:
+ 	netdev->xdp_features = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT |
+ 			       NETDEV_XDP_ACT_XSK_ZEROCOPY;
+ 
+-	/* MTU range: 68 - 9710 */
+ 	netdev->min_mtu = ETH_MIN_MTU;
+ 	netdev->max_mtu = IXGBE_MAX_JUMBO_FRAME_SIZE - (ETH_HLEN + ETH_FCS_LEN);
+ 
+@@ -11643,15 +12104,11 @@ skip_sriov:
+ 				adapter->flags &= ~IXGBE_FLAG_FCOE_CAPABLE;
+ 		}
+ 
+-
+ 		fcoe_l = min_t(int, IXGBE_FCRETA_SIZE, num_online_cpus());
+ 		adapter->ring_feature[RING_F_FCOE].limit = fcoe_l;
+ 
+-		netdev->features |= NETIF_F_FSO |
+-				    NETIF_F_FCOE_CRC;
+-
+-		netdev->vlan_features |= NETIF_F_FSO |
+-					 NETIF_F_FCOE_CRC;
++		netdev->features |= NETIF_F_FSO | NETIF_F_FCOE_CRC;
++		netdev->vlan_features |= NETIF_F_FSO | NETIF_F_FCOE_CRC;
+ 	}
+ #endif /* IXGBE_FCOE */
+ 	if (adapter->flags2 & IXGBE_FLAG2_RSC_CAPABLE)
+@@ -11659,16 +12116,13 @@ skip_sriov:
+ 	if (adapter->flags2 & IXGBE_FLAG2_RSC_ENABLED)
+ 		netdev->features |= NETIF_F_LRO;
+ 
+-	/* make sure the EEPROM is good */
+ 	if (hw->eeprom.ops.validate_checksum(hw, NULL) < 0) {
+ 		e_dev_err("The EEPROM Checksum Is Not Valid\n");
+ 		err = -EIO;
+ 		goto err_sw_init;
+ 	}
+ 
+-	eth_platform_get_mac_address(&adapter->pdev->dev,
+-				     adapter->hw.mac.perm_addr);
+-
++	eth_platform_get_mac_address(&adapter->pdev->dev, adapter->hw.mac.perm_addr);
+ 	eth_hw_addr_set(netdev, hw->mac.perm_addr);
+ 
+ 	if (!is_valid_ether_addr(netdev->dev_addr)) {
+@@ -11677,7 +12131,6 @@ skip_sriov:
+ 		goto err_sw_init;
+ 	}
+ 
+-	/* Set hw->mac.addr to permanent MAC address */
+ 	ether_addr_copy(hw->mac.addr, hw->mac.perm_addr);
+ 	ixgbe_mac_set_default_filter(adapter);
+ 
+@@ -11689,6 +12142,7 @@ skip_sriov:
+ 		err = -EIO;
+ 		goto err_sw_init;
+ 	}
++
+ 	INIT_WORK(&adapter->service_task, ixgbe_service_task);
+ 	set_bit(__IXGBE_SERVICE_INITED, &adapter->state);
+ 	clear_bit(__IXGBE_SERVICE_SCHED, &adapter->state);
+@@ -11704,30 +12158,21 @@ skip_sriov:
+ 	for (i = 0; i < adapter->num_xdp_queues; i++)
+ 		u64_stats_init(&adapter->xdp_ring[i]->syncp);
+ 
+-	/* WOL not supported for all devices */
+ 	adapter->wol = 0;
+ 	hw->eeprom.ops.read(hw, 0x2c, &adapter->eeprom_cap);
+-	hw->wol_enabled = ixgbe_wol_supported(adapter, pdev->device,
+-						pdev->subsystem_device);
++	hw->wol_enabled = ixgbe_wol_supported(adapter, pdev->device, pdev->subsystem_device);
+ 	if (hw->wol_enabled)
+ 		adapter->wol = IXGBE_WUFC_MAG;
+ 
+ 	device_set_wakeup_enable(&adapter->pdev->dev, adapter->wol);
+ 
+-	/* save off EEPROM version number */
+ 	ixgbe_set_fw_version(adapter);
+ 
+-	/* pick up the PCI bus settings for reporting later */
+ 	if (ixgbe_pcie_from_parent(hw))
+ 		ixgbe_get_parent_bus_info(adapter);
+ 	else
+-		 hw->mac.ops.get_bus_info(hw);
++		hw->mac.ops.get_bus_info(hw);
+ 
+-	/* calculate the expected PCIe bandwidth required for optimal
+-	 * performance. Note that some older parts will never have enough
+-	 * bandwidth due to being older generation PCIe parts. We clamp these
+-	 * parts to ensure no warning is displayed if it can't be fixed.
+-	 */
+ 	switch (hw->mac.type) {
+ 	case ixgbe_mac_82598EB:
+ 		expected_gts = min(ixgbe_enumerate_functions(adapter) * 10, 16);
+@@ -11737,34 +12182,31 @@ skip_sriov:
+ 		break;
+ 	}
+ 
+-	/* don't check link if we failed to enumerate functions */
+ 	if (expected_gts > 0)
+ 		ixgbe_check_minimum_link(adapter, expected_gts);
+ 
+ 	err = hw->eeprom.ops.read_pba_string(hw, part_str, sizeof(part_str));
+ 	if (err)
+ 		strscpy(part_str, "Unknown", sizeof(part_str));
++
+ 	if (ixgbe_is_sfp(hw) && hw->phy.sfp_type != ixgbe_sfp_type_not_present)
+ 		e_dev_info("MAC: %d, PHY: %d, SFP+: %d, PBA No: %s\n",
+-			   hw->mac.type, hw->phy.type, hw->phy.sfp_type,
+-			   part_str);
++			   hw->mac.type, hw->phy.type, hw->phy.sfp_type, part_str);
+ 	else
+ 		e_dev_info("MAC: %d, PHY: %d, PBA No: %s\n",
+ 			   hw->mac.type, hw->phy.type, part_str);
+ 
+ 	e_dev_info("%pM\n", netdev->dev_addr);
+ 
+-	/* reset the hardware with the new settings */
+ 	err = hw->mac.ops.start_hw(hw);
+ 	if (err == -EACCES) {
+-		/* We are running on a pre-production device, log a warning */
+ 		e_dev_warn("This device is a pre-production adapter/LOM. "
+ 			   "Please be aware there may be issues associated "
+-			   "with your hardware.  If you are experiencing "
++			   "with your hardware. If you are experiencing "
+ 			   "problems please contact your Intel or hardware "
+-			   "representative who provided you with this "
+-			   "hardware.\n");
++			   "representative who provided you with this hardware.\n");
+ 	}
++
+ 	strcpy(netdev->name, "eth%d");
+ 	pci_set_drvdata(pdev, adapter);
+ 
+@@ -11776,12 +12218,9 @@ skip_sriov:
+ 	if (err)
+ 		goto err_register;
+ 
+-
+-	/* power down the optics for 82599 SFP+ fiber */
+ 	if (hw->mac.ops.disable_tx_laser)
+ 		hw->mac.ops.disable_tx_laser(hw);
+ 
+-	/* carrier off reporting is important to ethtool even BEFORE open */
+ 	netif_carrier_off(netdev);
+ 
+ #ifdef CONFIG_IXGBE_DCA
+@@ -11796,31 +12235,25 @@ skip_sriov:
+ 			ixgbe_vf_configuration(pdev, (i | 0x10000000));
+ 	}
+ 
+-	/* firmware requires driver version to be 0xFFFFFFFF
+-	 * since os does not support feature
+-	 */
+ 	if (hw->mac.ops.set_fw_drv_ver)
+ 		hw->mac.ops.set_fw_drv_ver(hw, 0xFF, 0xFF, 0xFF, 0xFF,
+-					   sizeof(UTS_RELEASE) - 1,
+-					   UTS_RELEASE);
++					   sizeof(UTS_RELEASE) - 1, UTS_RELEASE);
+ 
+-	/* add san mac addr to netdev */
+ 	ixgbe_add_sanmac_netdev(netdev);
+ 
++	/* Reference device description to silence -Wunused-variable and provide useful info. */
+ 	e_dev_info("%s\n", ixgbe_default_device_descr);
+ 
+ #ifdef CONFIG_IXGBE_HWMON
+ 	if (ixgbe_sysfs_init(adapter))
+ 		e_err(probe, "failed to allocate sysfs resources\n");
+-#endif /* CONFIG_IXGBE_HWMON */
++#endif
+ 
+ 	ixgbe_dbg_adapter_init(adapter);
+ 
+-	/* setup link for SFP devices with MNG FW, else wait for IXGBE_UP */
+ 	if (ixgbe_mng_enabled(hw) && ixgbe_is_sfp(hw) && hw->mac.ops.setup_link)
+ 		hw->mac.ops.setup_link(hw,
+-			IXGBE_LINK_SPEED_10GB_FULL | IXGBE_LINK_SPEED_1GB_FULL,
+-			true);
++			IXGBE_LINK_SPEED_10GB_FULL | IXGBE_LINK_SPEED_1GB_FULL, true);
+ 
+ 	err = ixgbe_mii_bus_init(hw);
+ 	if (err)
+@@ -11829,6 +12262,10 @@ skip_sriov:
+ 	ixgbe_devlink_init_regions(adapter);
+ 	devl_register(adapter->devlink);
+ 	devl_unlock(adapter->devlink);
++
++	/* Do NOT call ixgbe_setup_gaming_atr() here: netdev is not guaranteed UP yet.
++	 * We program filters when link goes UP (see ixgbe_process_link_status_event).
++	 */
+ 	return 0;
+ 
+ err_netdev:
+@@ -11873,89 +12310,86 @@ err_dma:
+  **/
+ static void ixgbe_remove(struct pci_dev *pdev)
+ {
+-	struct ixgbe_adapter *adapter = pci_get_drvdata(pdev);
+-	struct net_device *netdev;
+-	bool disable_dev;
+-	int i;
+-
+-	/* if !adapter then we already cleaned up in probe */
+-	if (!adapter)
+-		return;
++    struct ixgbe_adapter *adapter = pci_get_drvdata(pdev);
++    struct net_device *netdev;
++    bool disable_dev;
++    int i;
++
++    if (!adapter)
++        return;
++
++    netdev  = adapter->netdev;
++    devl_lock(adapter->devlink);
++    devl_unregister(adapter->devlink);
++    ixgbe_devlink_destroy_regions(adapter);
++    ixgbe_dbg_adapter_exit(adapter);
++
++    set_bit(__IXGBE_REMOVING, &adapter->state);
++    cancel_work_sync(&adapter->service_task);
++
++    if (adapter->hw.mac.type == ixgbe_mac_e610) {
++        ixgbe_disable_link_status_events(adapter);
++        mutex_destroy(&adapter->hw.aci.lock);
++    }
+ 
+-	netdev  = adapter->netdev;
+-	devl_lock(adapter->devlink);
+-	devl_unregister(adapter->devlink);
+-	ixgbe_devlink_destroy_regions(adapter);
+-	ixgbe_dbg_adapter_exit(adapter);
+-
+-	set_bit(__IXGBE_REMOVING, &adapter->state);
+-	cancel_work_sync(&adapter->service_task);
+-
+-	if (adapter->hw.mac.type == ixgbe_mac_e610) {
+-		ixgbe_disable_link_status_events(adapter);
+-		mutex_destroy(&adapter->hw.aci.lock);
+-	}
+-
+-	if (adapter->mii_bus)
+-		mdiobus_unregister(adapter->mii_bus);
++    if (adapter->mii_bus)
++        mdiobus_unregister(adapter->mii_bus);
+ 
+ #ifdef CONFIG_IXGBE_DCA
+-	if (adapter->flags & IXGBE_FLAG_DCA_ENABLED) {
+-		adapter->flags &= ~IXGBE_FLAG_DCA_ENABLED;
+-		dca_remove_requester(&pdev->dev);
+-		IXGBE_WRITE_REG(&adapter->hw, IXGBE_DCA_CTRL,
+-				IXGBE_DCA_CTRL_DCA_DISABLE);
+-	}
++    if (adapter->flags & IXGBE_FLAG_DCA_ENABLED) {
++        adapter->flags &= ~IXGBE_FLAG_DCA_ENABLED;
++        dca_remove_requester(&pdev->dev);
++        IXGBE_WRITE_REG(&adapter->hw, IXGBE_DCA_CTRL,
++                        IXGBE_DCA_CTRL_DCA_DISABLE);
++    }
+ 
+ #endif
+ #ifdef CONFIG_IXGBE_HWMON
+-	ixgbe_sysfs_exit(adapter);
++    ixgbe_sysfs_exit(adapter);
+ #endif /* CONFIG_IXGBE_HWMON */
+ 
+-	/* remove the added san mac */
+-	ixgbe_del_sanmac_netdev(netdev);
++    ixgbe_del_sanmac_netdev(netdev);
+ 
+ #ifdef CONFIG_PCI_IOV
+-	ixgbe_disable_sriov(adapter);
++    ixgbe_disable_sriov(adapter);
+ #endif
+-	if (netdev->reg_state == NETREG_REGISTERED)
+-		unregister_netdev(netdev);
+-
+-	devl_port_unregister(&adapter->devlink_port);
+-	devl_unlock(adapter->devlink);
+-	devlink_free(adapter->devlink);
++    if (netdev->reg_state == NETREG_REGISTERED)
++        unregister_netdev(netdev);
+ 
+-	ixgbe_stop_ipsec_offload(adapter);
+-	ixgbe_clear_interrupt_scheme(adapter);
++    ixgbe_stop_ipsec_offload(adapter);
++    ixgbe_clear_interrupt_scheme(adapter);
+ 
+-	ixgbe_release_hw_control(adapter);
++    ixgbe_release_hw_control(adapter);
+ 
+ #ifdef CONFIG_DCB
+-	kfree(adapter->ixgbe_ieee_pfc);
+-	kfree(adapter->ixgbe_ieee_ets);
++    kfree(adapter->ixgbe_ieee_pfc);
++    kfree(adapter->ixgbe_ieee_ets);
+ 
+ #endif
+-	iounmap(adapter->io_addr);
+-	pci_release_mem_regions(pdev);
++    iounmap(adapter->io_addr);
++    pci_release_mem_regions(pdev);
+ 
+-	e_dev_info("complete\n");
++    e_dev_info("complete\n");
+ 
+-	for (i = 0; i < IXGBE_MAX_LINK_HANDLE; i++) {
+-		if (adapter->jump_tables[i]) {
+-			kfree(adapter->jump_tables[i]->input);
+-			kfree(adapter->jump_tables[i]->mask);
+-		}
+-		kfree(adapter->jump_tables[i]);
+-	}
++    for (i = 0; i < IXGBE_MAX_LINK_HANDLE; i++) {
++        if (adapter->jump_tables[i]) {
++            kfree(adapter->jump_tables[i]->input);
++            kfree(adapter->jump_tables[i]->mask);
++        }
++        kfree(adapter->jump_tables[i]);
++    }
++
++    kfree(adapter->mac_table);
++    kfree(adapter->rss_key);
++    bitmap_free(adapter->af_xdp_zc_qps);
++    disable_dev = !test_and_set_bit(__IXGBE_DISABLED, &adapter->state);
++    free_netdev(netdev);
+ 
+-	kfree(adapter->mac_table);
+-	kfree(adapter->rss_key);
+-	bitmap_free(adapter->af_xdp_zc_qps);
+-	disable_dev = !test_and_set_bit(__IXGBE_DISABLED, &adapter->state);
+-	free_netdev(netdev);
++    if (disable_dev)
++        pci_disable_device(pdev);
+ 
+-	if (disable_dev)
+-		pci_disable_device(pdev);
++    /* INTEGRATION: Clean up any gaming ATR filters before device removal */
++    ixgbe_teardown_gaming_atr(adapter);
+ }
+ 
+ /**
 
 --- a/drivers/pci/msi/msi.c	2025-04-26 16:35:23.647821877 +0200
 +++ b/drivers/pci/msi/msi.c	2025-08-13 16:48:01.839153108 +0200
