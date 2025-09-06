@@ -1846,67 +1846,57 @@ static void ixgbe_init_gaming_fdir(struct ixgbe_adapter *adapter)
     struct net_device *netdev = adapter->netdev;
     union ixgbe_atr_input mask;
     int err;
+    bool supported = false;
 
-    /* Only if admin opted in via module param (non-empty) */
-    if (!gaming_atr_ranges || !*gaming_atr_ranges) {
-        return;
-    }
-
-    /* Only supported on these MACs */
     switch (hw->mac.type) {
     case ixgbe_mac_82599EB:
     case ixgbe_mac_X540:
     case ixgbe_mac_X550:
     case ixgbe_mac_X550EM_x:
     case ixgbe_mac_x550em_a:
+        supported = true;
         break;
     default:
+        supported = false;
+        break;
+    }
+    if (!supported)
         return;
-    }
 
-    /* Respect ntuple feature: if off, do not force-enable FDIR. */
-    if (!(netdev->features & NETIF_F_NTUPLE)) {
-        static bool warned;
-        if (!warned) {
-            e_info(drv, "Gaming ATR: ntuple is off; enable via 'ethtool -K %s ntuple on' to activate Flow Director\n",
-                   netdev->name);
-            warned = true;
-        }
+    if (!netdev || !(netdev->features & NETIF_F_NTUPLE))
         return;
-    }
-
-    memset(&mask, 0, sizeof(mask));
-    /* Only UDP destination port shall be significant for matching. */
-    mask.formatted.dst_port = cpu_to_be16(0xFFFF);
-
-    /* Order: on some parts, mask must be written before init; however if the
-     * device reports busy, retry after init. We perform a best-effort sequence:
-     * - Try to program mask first.
-     * - If -EIO (busy/disabled), initialize FDIR perfect mode and retry once.
-     */
-    err = ixgbe_fdir_set_input_mask_82599(hw, &mask);
-    if (err == -EIO || err == -EBUSY) {
-        int err2;
-
-        err2 = ixgbe_init_fdir_perfect_82599(hw, adapter->fdir_pballoc);
-        if (!err2) {
-            err = ixgbe_fdir_set_input_mask_82599(hw, &mask);
-        } else {
-            e_warn(drv, "Gaming ATR: FDIR init failed (%d); skipping\n", err2);
-            return;
-        }
-    }
-
-    if (err) {
-        /* Don’t spam the log; give a concise hint and return. */
-        e_warn(drv, "Gaming ATR: input mask setup failed (%d); ensure ntuple is enabled and device is quiescent\n", err);
+    if (!gaming_atr_ranges || !*gaming_atr_ranges)
         return;
-    }
 
-    /* Ensure perfect-mode tables are initialized. */
+    /* Force perfect mode; disable signature mode path. */
+    adapter->flags &= ~IXGBE_FLAG_FDIR_HASH_CAPABLE;
+    adapter->flags |= IXGBE_FLAG_FDIR_PERFECT_CAPABLE;
+
+    /* Init perfect mode tables first. */
     err = ixgbe_init_fdir_perfect_82599(hw, adapter->fdir_pballoc);
     if (err) {
-        e_warn(drv, "Gaming ATR: perfect-mode init failed (%d); skipping\n", err);
+        e_warn(drv, "Gaming ATR: perfect-mode init failed (%d)\n", err);
+        return;
+    }
+
+    /* Program input mask: UDPv4 + destination port significant.
+     * Keeping only UDP L4 + DPORT as significant makes this suitable for
+     * wildcarded gaming traffic where src IP/port varies.
+     */
+    memset(&mask, 0, sizeof(mask));
+    mask.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV4;
+    mask.formatted.dst_port  = cpu_to_be16(0xFFFF);
+
+    err = ixgbe_fdir_set_input_mask_82599(hw, &mask);
+    if (err == -EIO || err == -EBUSY) {
+        /* Re-init and retry once if busy. */
+        int err2 = ixgbe_init_fdir_perfect_82599(hw, adapter->fdir_pballoc);
+        if (!err2)
+            err = ixgbe_fdir_set_input_mask_82599(hw, &mask);
+    }
+    if (err) {
+        e_warn(drv, "Gaming ATR: input mask setup failed (%d)\n", err);
+        return;
     }
 }
 
@@ -5943,10 +5933,10 @@ static void ixgbe_configure_dfwd(struct ixgbe_adapter *adapter)
 static void ixgbe_configure(struct ixgbe_adapter *adapter)
 {
 	struct ixgbe_hw *hw = &adapter->hw;
-	/* Minimal-invasive Gaming ATR enablement: initialize FDIR perfect mode early */
-	if (adapter->flags2 & IXGBE_FLAG2_GAMING_ATR_ENABLED) {
+	/* Initialize Gaming ATR FDIR (perfect mode + mask) if requested and supported. */
+	if (gaming_atr_ranges && *gaming_atr_ranges)
 		ixgbe_init_gaming_fdir(adapter);
-	}
+
 	ixgbe_configure_pb(adapter);
 #ifdef CONFIG_IXGBE_DCB
 	ixgbe_configure_dcb(adapter);
@@ -8192,145 +8182,6 @@ static void ixgbe_teardown_gaming_atr(struct ixgbe_adapter *adapter)
     WRITE_ONCE(adapter->gaming_fdir_count, 0);
 }
 
-static void ixgbe_setup_gaming_atr(struct ixgbe_adapter *adapter)
-{
-    struct ixgbe_hw *hw = &adapter->hw;
-    struct net_device *netdev = adapter->netdev;
-    const char *ranges_param = READ_ONCE(gaming_atr_ranges);
-    char *dup, *cur, *tok;
-    const u16 half = IXGBE_MAX_GAMING_FILTERS / 2; /* v4: [0..half-1], v6: [half..max-1] */
-    u16 v4_id = 0;
-#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
-    u16 v6_id = half;
-#endif
-    u16 max_used = 0;
-    u8 steer_queue = 0;
-
-    if (!ranges_param || !*ranges_param) {
-        return;
-    }
-
-    /* Only supported on these MACs */
-    switch (hw->mac.type) {
-    case ixgbe_mac_82599EB:
-    case ixgbe_mac_X540:
-    case ixgbe_mac_X550:
-    case ixgbe_mac_X550EM_x:
-    case ixgbe_mac_x550em_a:
-        break;
-    default:
-        return;
-    }
-
-    /* Respect ntuple: if off, don’t try to program filters; hint once. */
-    if (!(netdev->features & NETIF_F_NTUPLE)) {
-        static bool hinted;
-        if (!hinted) {
-            e_info(drv, "Gaming ATR: ntuple is off; enable via 'ethtool -K %s ntuple on' to activate Flow Director filters\n",
-                   netdev->name);
-            hinted = true;
-        }
-        return;
-    }
-
-    /* Choose a stable RX queue to steer flows; fallback to 0 if needed. */
-    if (adapter->num_rx_queues > 0 && adapter->rx_ring[0]) {
-        steer_queue = adapter->rx_ring[0]->reg_idx;
-    } else {
-        steer_queue = 0;
-    }
-
-    dup = kstrdup(ranges_param, GFP_KERNEL);
-    if (!dup) {
-        return;
-    }
-    cur = dup;
-
-    /* Ensure we start from a clean table; safe even if none exist. */
-    ixgbe_teardown_gaming_atr(adapter);
-
-    /* Serialize FDIR programming. */
-    spin_lock_bh(&adapter->fdir_perfect_lock);
-
-    while ((tok = strsep(&cur, ","))) {
-        u16 start_port, end_port;
-        char *dash;
-
-        if (!*tok) {
-            continue;
-        }
-
-        dash = strchr(tok, '-');
-        if (dash) {
-            *dash = '\0';
-            if (kstrtou16(tok, 10, &start_port) ||
-                kstrtou16(dash + 1, 10, &end_port) ||
-                start_port == 0 || end_port < start_port) {
-                continue;
-            }
-        } else {
-            if (kstrtou16(tok, 10, &start_port) || start_port == 0) {
-                continue;
-            }
-            end_port = start_port;
-        }
-
-        for (; start_port <= end_port; start_port++) {
-            union ixgbe_atr_input in;
-            int ret;
-
-            /* IPv4 slot */
-            if (v4_id < half) {
-                memset(&in, 0, sizeof(in));
-                in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV4;
-                in.formatted.dst_port  = cpu_to_be16(start_port);
-
-                ret = ixgbe_fdir_write_perfect_filter_82599(hw, &in, v4_id, steer_queue);
-                if (!ret) {
-                    WRITE_ONCE(adapter->gaming_fdir_ids[v4_id], start_port);
-                    if ((u16)(v4_id + 1) > max_used) {
-                        max_used = (u16)(v4_id + 1);
-                    }
-                }
-                v4_id++;
-            }
-
-#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
-            /* IPv6 slot */
-            if (v6_id < IXGBE_MAX_GAMING_FILTERS) {
-                memset(&in, 0, sizeof(in));
-                in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV6;
-                in.formatted.dst_port  = cpu_to_be16(start_port);
-
-                ret = ixgbe_fdir_write_perfect_filter_82599(hw, &in, v6_id, steer_queue);
-                if (!ret) {
-                    WRITE_ONCE(adapter->gaming_fdir_ids[v6_id], start_port);
-                    if ((u16)(v6_id + 1) > max_used) {
-                        max_used = (u16)(v6_id + 1);
-                    }
-                }
-                v6_id++;
-            }
-#endif
-
-            /* Stop if both partitions are full (v4-only builds will stop when v4 is full). */
-            if (v4_id >= half
-#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
-                && max_used >= IXGBE_MAX_GAMING_FILTERS
-#endif
-            ) {
-                goto out_unlock;
-            }
-        }
-    }
-
-out_unlock:
-    spin_unlock_bh(&adapter->fdir_perfect_lock);
-
-    WRITE_ONCE(adapter->gaming_fdir_count, (int)max_used);
-    kfree(dup);
-}
-
 static void ixgbe_watchdog_link_is_up(struct ixgbe_adapter *adapter)
 {
     struct net_device *netdev = adapter->netdev;
@@ -8390,16 +8241,176 @@ static void ixgbe_watchdog_link_is_up(struct ixgbe_adapter *adapter)
     e_info(drv, "NIC Link is Up %s, Flow Control: %s\n", speed_str,
            (flow_rx && flow_tx) ? "RX/TX" : (flow_rx ? "RX" : (flow_tx ? "TX" : "None")));
 
+    /* Publish carrier before enabling traffic. */
     netif_carrier_on(netdev);
     ixgbe_check_vf_rate_limit(adapter);
-    netif_tx_wake_all_queues(netdev);
-    ixgbe_update_default_up(adapter);
-    ixgbe_ping_all_vfs(adapter);
 
-    /* Program Gaming ATR filters when configured and ntuple is enabled. */
-    if (gaming_atr_ranges && *gaming_atr_ranges) {
-        ixgbe_setup_gaming_atr(adapter);
-    }
+    /* Enable transmits. */
+    netif_tx_wake_all_queues(netdev);
+
+    /* Update default user priority for VFs on link-up. */
+    ixgbe_update_default_up(adapter);
+
+    /* ----------------------------------------------------------------
+     * Gaming ATR automatic rule programming (no admin intervention):
+     * - Uses module parameter 'gaming_atr_ranges' directly.
+     * - Automatically enables Flow Director perfect-mode path and mask
+     *   if needed (best effort) and programs perfect rules for UDPv4
+     *   destination ports in the ranges.
+     * - Steers to a stable RX queue (queue 0 by default).
+     * - Idempotent across link bounces: we always reprogram the same
+     *   reserved soft_ids to avoid table growth.
+     * ---------------------------------------------------------------- */
+    do {
+        const char *ranges_param = READ_ONCE(gaming_atr_ranges);
+        bool supported = false;
+
+        if (!ranges_param || !*ranges_param) {
+            break; /* Nothing to program */
+        }
+
+        switch (hw->mac.type) {
+        case ixgbe_mac_82599EB:
+        case ixgbe_mac_X540:
+        case ixgbe_mac_X550:
+        case ixgbe_mac_X550EM_x:
+        case ixgbe_mac_x550em_a:
+            supported = true;
+            break;
+        default:
+            supported = false;
+            break;
+        }
+        if (!supported) {
+            break; /* Not supported on this MAC */
+        }
+
+        /* Best-effort: ensure FDIR is in perfect mode and has a mask suitable
+         * for UDPv4 destination-port matching. Doing this here may fail with
+         * -EIO if the block is busy; we retry once after initializing perfect.
+         * This path is safe and idempotent and avoids requiring admin action.
+         */
+        {
+            int err;
+            union ixgbe_atr_input mask;
+
+            /* Force perfect-capable path; keep signature off for gaming. */
+            adapter->flags &= ~IXGBE_FLAG_FDIR_HASH_CAPABLE;
+            adapter->flags |= IXGBE_FLAG_FDIR_PERFECT_CAPABLE;
+
+            /* Initialize perfect mode tables (safe if already done). */
+            err = ixgbe_init_fdir_perfect_82599(hw, adapter->fdir_pballoc);
+            if (!err) {
+                memset(&mask, 0, sizeof(mask));
+                /* Match UDPv4 L4 type + destination port only. */
+                mask.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV4;
+                mask.formatted.dst_port  = cpu_to_be16(0xFFFF);
+
+                err = ixgbe_fdir_set_input_mask_82599(hw, &mask);
+                if (err == -EIO || err == -EBUSY) {
+                    /* Retry once after re-init if busy. */
+                    if (!ixgbe_init_fdir_perfect_82599(hw, adapter->fdir_pballoc))
+                        err = ixgbe_fdir_set_input_mask_82599(hw, &mask);
+                }
+                /* If mask programming ultimately fails we still try to program
+                 * rules below; they may take effect after the next successful
+                 * mask update (e.g., after a reset).
+                 */
+            }
+        }
+
+        /* Pick a stable RX queue to steer to. Default to queue 0. */
+        {
+            char *dup, *cur, *tok;
+            u8 steer_q = 0;
+            const u16 max_v4 = 64;      /* soft_ids [0..63] reserved for IPv4 */
+#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
+            const u16 v6_base = 64;     /* soft_ids [64..127] reserved for IPv6 */
+            const u16 max_v6  = 128;
+#endif
+            u16 sid_v4 = 0;
+#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
+            u16 sid_v6 = v6_base;
+#endif
+
+            if (adapter->num_rx_queues > 0 && adapter->rx_ring[0]) {
+                steer_q = adapter->rx_ring[0]->reg_idx;
+            } else {
+                steer_q = 0;
+            }
+
+            dup = kstrdup(ranges_param, GFP_KERNEL);
+            if (!dup) {
+                break; /* out of memory: skip this link-up programming */
+            }
+            cur = dup;
+
+            /* Serialize perfect filter programming. */
+            spin_lock_bh(&adapter->fdir_perfect_lock);
+
+            while ((tok = strsep(&cur, ",")) != NULL) {
+                u16 start_port, end_port;
+                char *dash;
+
+                if (!*tok)
+                    continue;
+
+                dash = strchr(tok, '-');
+                if (dash) {
+                    *dash = '\0';
+                    if (kstrtou16(tok, 10, &start_port) ||
+                        kstrtou16(dash + 1, 10, &end_port) ||
+                        start_port == 0 || end_port < start_port) {
+                        continue;
+                    }
+                } else {
+                    if (kstrtou16(tok, 10, &start_port) || start_port == 0) {
+                        continue;
+                    }
+                    end_port = start_port;
+                }
+
+                for (; start_port <= end_port; start_port++) {
+                    union ixgbe_atr_input in;
+
+                    if (sid_v4 < max_v4) {
+                        int ret;
+                        memset(&in, 0, sizeof(in));
+                        in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV4;
+                        in.formatted.dst_port  = cpu_to_be16(start_port);
+                        ret = ixgbe_fdir_write_perfect_filter_82599(hw, &in, sid_v4, steer_q);
+                        (void)ret; /* ignore duplicate/err; continue */
+                        sid_v4++;
+                    }
+#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
+                    if (sid_v6 < max_v6) {
+                        int ret;
+                        memset(&in, 0, sizeof(in));
+                        in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV6;
+                        in.formatted.dst_port  = cpu_to_be16(start_port);
+                        ret = ixgbe_fdir_write_perfect_filter_82599(hw, &in, sid_v6, steer_q);
+                        (void)ret;
+                        sid_v6++;
+                    }
+#endif
+                    if (sid_v4 >= max_v4
+#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
+                        && sid_v6 >= max_v6
+#endif
+                    ) {
+                        goto done_programming;
+                    }
+                }
+            }
+
+done_programming:
+            spin_unlock_bh(&adapter->fdir_perfect_lock);
+            kfree(dup);
+        }
+    } while (0);
+
+    /* Notify VFs about link change. */
+    ixgbe_ping_all_vfs(adapter);
 }
 
 /**
