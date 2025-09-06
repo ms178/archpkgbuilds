@@ -1747,7 +1747,7 @@ void ixgbe_alloc_rx_buffers(struct ixgbe_ring *rx_ring, u16 cleaned_count)
             i = 0;
         }
 
-        /* Prefetch next structures to hide latency. */
+        /* Prefetch next structures to hide memory latency. */
         rx_desc = IXGBE_RX_DESC(rx_ring, i);
         bi = &rx_ring->rx_buffer_info[i];
         prefetch(bi);
@@ -1843,9 +1843,16 @@ static void ixgbe_update_rsc_stats(struct ixgbe_ring *rx_ring,
 static void ixgbe_init_gaming_fdir(struct ixgbe_adapter *adapter)
 {
     struct ixgbe_hw *hw = &adapter->hw;
+    struct net_device *netdev = adapter->netdev;
     union ixgbe_atr_input mask;
     int err;
 
+    /* Only if admin opted in via module param (non-empty) */
+    if (!gaming_atr_ranges || !*gaming_atr_ranges) {
+        return;
+    }
+
+    /* Only supported on these MACs */
     switch (hw->mac.type) {
     case ixgbe_mac_82599EB:
     case ixgbe_mac_X540:
@@ -1854,18 +1861,49 @@ static void ixgbe_init_gaming_fdir(struct ixgbe_adapter *adapter)
     case ixgbe_mac_x550em_a:
         break;
     default:
-        return; /* Not supported on this MAC */
-    }
-
-    memset(&mask, 0, sizeof(mask));
-    mask.formatted.dst_port = cpu_to_be16(0xFFFF); /* match UDP dest-port only */
-
-    err = ixgbe_fdir_set_input_mask_82599(hw, &mask);
-    if (err) {
-        e_warn(drv, "Gaming ATR: input mask setup failed (%d); skipping\n", err);
         return;
     }
 
+    /* Respect ntuple feature: if off, do not force-enable FDIR. */
+    if (!(netdev->features & NETIF_F_NTUPLE)) {
+        static bool warned;
+        if (!warned) {
+            e_info(drv, "Gaming ATR: ntuple is off; enable via 'ethtool -K %s ntuple on' to activate Flow Director\n",
+                   netdev->name);
+            warned = true;
+        }
+        return;
+    }
+
+    memset(&mask, 0, sizeof(mask));
+    /* Only UDP destination port shall be significant for matching. */
+    mask.formatted.dst_port = cpu_to_be16(0xFFFF);
+
+    /* Order: on some parts, mask must be written before init; however if the
+     * device reports busy, retry after init. We perform a best-effort sequence:
+     * - Try to program mask first.
+     * - If -EIO (busy/disabled), initialize FDIR perfect mode and retry once.
+     */
+    err = ixgbe_fdir_set_input_mask_82599(hw, &mask);
+    if (err == -EIO || err == -EBUSY) {
+        int err2;
+
+        err2 = ixgbe_init_fdir_perfect_82599(hw, adapter->fdir_pballoc);
+        if (!err2) {
+            err = ixgbe_fdir_set_input_mask_82599(hw, &mask);
+        } else {
+            e_warn(drv, "Gaming ATR: FDIR init failed (%d); skipping\n", err2);
+            return;
+        }
+    }
+
+    if (err) {
+        /* Don’t spam the log; give a concise hint and return. */
+        e_warn(drv, "Gaming ATR: input mask setup failed (%d); ensure ntuple is enabled and device is quiescent\n", err);
+        return;
+    }
+
+    /* Ensure perfect-mode tables are initialized. */
     err = ixgbe_init_fdir_perfect_82599(hw, adapter->fdir_pballoc);
     if (err) {
         e_warn(drv, "Gaming ATR: perfect-mode init failed (%d); skipping\n", err);
@@ -2771,7 +2809,7 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *qv,
     unsigned int bytes = rc->total_bytes;
     unsigned int usecs;
     unsigned long now = jiffies;
-    /* EITR is in 2us units; keep only low 16 bits to avoid WDIS or high-word artifacts. */
+    /* EITR is in 2us units; we mask the low 16 bits to keep just value bits. */
     unsigned int cur_usecs = ((qv->itr & 0xFFFFu) >> 2);
 
     if (unlikely(!rc->ring)) {
@@ -2780,39 +2818,38 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *qv,
         return;
     }
 
-    /* Avoid re-updating repeatedly inside the same jiffy; leave NAPI to run. */
     if (time_before(now, rc->next_update)) {
         rc->total_packets = 0;
         rc->total_bytes = 0;
         return;
     }
 
-    /* 1) Tiny microbursts (e.g., gaming/VoIP): deliver ASAP. */
+    /* 1) Tiny microbursts: deliver ASAP */
     if (pkts > 0 && pkts <= 16) {
         usecs = 0;
         goto out;
     }
 
-    /* 2) Small bursts of tiny packets: keep IRQ snappy (4us). */
+    /* 2) Small bursts of small packets: 4us interrupt delay */
     if (pkts > 0 && pkts <= 64 && bytes <= (pkts << 8)) {
         usecs = 4;
         goto out;
     }
 
-    /* 3) Idle: gently increase ITR to reduce background interrupts. */
+    /* 3) Idle: gently increase interrupt delay to reduce background interrupts */
     if (!pkts) {
         unsigned int bumped = cur_usecs + 200U;
         if (bumped < cur_usecs) {
             bumped = cur_usecs; /* overflow guard */
         }
-        usecs = min(bumped, 20000U); /* cap to 20ms */
+        usecs = min(bumped, 20000U);
         goto out;
     }
 
-    /* 4) Bulk traffic: proportional to average size; stable and bounded. */
+    /* 4) Bulk traffic: proportional to average size; stable and bounded */
     {
         unsigned int avg = bytes / pkts;     /* pkts > 0 by construction */
-        unsigned int calc = avg / 3 + 1000;  /* base ~1ms, scaled down by size */
+        unsigned int calc = avg / 3 + 1000;  /* base ~1ms, scaled by size */
         if (calc < 4) {
             calc = 4;
         } else if (calc > 32256) {
@@ -2871,7 +2908,7 @@ static void ixgbe_set_itr(struct ixgbe_q_vector *qv)
         min_us = tx_us; /* possibly 0 */
     }
 
-    /* Convert microseconds to EITR (2us units), preserve only low 16 bits, set WDIS. */
+    /* Convert microseconds to EITR (2us units); set WDIS to avoid timer re-arm stalls. */
     hw_eitr = ((min_us & 0xFFFFu) << 2) | IXGBE_EITR_CNT_WDIS;
 
     if (unlikely(hw_eitr == qv->itr)) {
@@ -3578,19 +3615,7 @@ static __always_inline unsigned long ixgbe_cpu_capacity(unsigned int cpu)
 	return topology_get_cpu_scale(cpu);
 }
 
-/* Build a high-quality affinity mask for MSI-X:
- * 1) Restrict to NIC's NUMA node if present; otherwise use all online CPUs.
- * 2) Select only primary SMT threads (avoid hyperthread contention).
- * 3) Prefer P-cores: keep CPUs whose capacity is within ~12.5% of max capacity.
- *    (This robustly selects P-cores on Raptor Lake; if not hybrid, all cores
- *     share the same capacity and thus stay selected.)
- * 4) Provide graceful fallback to primary threads, then to NUMA mask, then online.
- *
- * Output:
- *   pref_mask: cpumask_var_t provided by caller (must be allocated); filled here.
- *
- * Returns 0 on success, negative error on failure (no masks are leaked).
- */
+/* Build preferred CPU mask: NUMA-local ∩ primary SMT ∩ top-capacity CPUs (P-cores) */
 static int ixgbe_build_performance_mask(struct ixgbe_adapter *adapter,
                                         cpumask_var_t pref)
 {
@@ -3618,7 +3643,7 @@ static int ixgbe_build_performance_mask(struct ixgbe_adapter *adapter,
         cpumask_copy(node_mask, cpu_online_mask);
     }
 
-    /* Keep only primary SMT threads to avoid HT contention on same core. */
+    /* Keep only primary SMT threads to avoid HT contention on the same core. */
     cpumask_clear(primaries);
     for_each_cpu(cpu, node_mask) {
         const struct cpumask *sibs = topology_sibling_cpumask(cpu);
@@ -3662,12 +3687,7 @@ static int ixgbe_build_performance_mask(struct ixgbe_adapter *adapter,
     return 0;
 }
 
-/* MSI-X request with P/E-core aware, SMT-primary-only pinning.
- * - Pins each queue vector to a single CPU from the preferred mask returned by
- *   ixgbe_build_performance_mask() (favoring P-cores on Raptor Lake).
- * - Robust resource management and unwind.
- * - Maintains the original ABI (function signature).
- */
+/* Request MSI-X vectors and set per-vector affinity hints to preferred CPUs */
 static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
 {
     struct net_device *netdev = adapter->netdev;
@@ -8175,6 +8195,7 @@ static void ixgbe_teardown_gaming_atr(struct ixgbe_adapter *adapter)
 static void ixgbe_setup_gaming_atr(struct ixgbe_adapter *adapter)
 {
     struct ixgbe_hw *hw = &adapter->hw;
+    struct net_device *netdev = adapter->netdev;
     const char *ranges_param = READ_ONCE(gaming_atr_ranges);
     char *dup, *cur, *tok;
     const u16 half = IXGBE_MAX_GAMING_FILTERS / 2; /* v4: [0..half-1], v6: [half..max-1] */
@@ -8189,6 +8210,7 @@ static void ixgbe_setup_gaming_atr(struct ixgbe_adapter *adapter)
         return;
     }
 
+    /* Only supported on these MACs */
     switch (hw->mac.type) {
     case ixgbe_mac_82599EB:
     case ixgbe_mac_X540:
@@ -8200,7 +8222,18 @@ static void ixgbe_setup_gaming_atr(struct ixgbe_adapter *adapter)
         return;
     }
 
-    /* Choose a stable RX queue to steer flows into; fallback to 0 if needed. */
+    /* Respect ntuple: if off, don’t try to program filters; hint once. */
+    if (!(netdev->features & NETIF_F_NTUPLE)) {
+        static bool hinted;
+        if (!hinted) {
+            e_info(drv, "Gaming ATR: ntuple is off; enable via 'ethtool -K %s ntuple on' to activate Flow Director filters\n",
+                   netdev->name);
+            hinted = true;
+        }
+        return;
+    }
+
+    /* Choose a stable RX queue to steer flows; fallback to 0 if needed. */
     if (adapter->num_rx_queues > 0 && adapter->rx_ring[0]) {
         steer_queue = adapter->rx_ring[0]->reg_idx;
     } else {
@@ -8280,7 +8313,7 @@ static void ixgbe_setup_gaming_atr(struct ixgbe_adapter *adapter)
             }
 #endif
 
-            /* Stop if both partitions are full. */
+            /* Stop if both partitions are full (v4-only builds will stop when v4 is full). */
             if (v4_id >= half
 #ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
                 && max_used >= IXGBE_MAX_GAMING_FILTERS
@@ -8363,9 +8396,8 @@ static void ixgbe_watchdog_link_is_up(struct ixgbe_adapter *adapter)
     ixgbe_update_default_up(adapter);
     ixgbe_ping_all_vfs(adapter);
 
-    /* Program Gaming ATR when configured and supported */
+    /* Program Gaming ATR filters when configured and ntuple is enabled. */
     if (gaming_atr_ranges && *gaming_atr_ranges) {
-        ixgbe_init_gaming_fdir(adapter);
         ixgbe_setup_gaming_atr(adapter);
     }
 }
