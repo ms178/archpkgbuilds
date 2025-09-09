@@ -224,6 +224,8 @@ static void msi_domain_free_descs(struct device *dev, struct msi_ctrl *ctrl)
  * @domid:	Id of the domain to operate on
  * @first:	Index to start freeing from (inclusive)
  * @last:	Last index to be freed (inclusive)
+ *
+ * Note: Caller must hold the MSI descriptor mutex (msi_lock_descs()).
  */
 void msi_domain_free_msi_descs_range(struct device *dev, unsigned int domid,
 				     unsigned int first, unsigned int last)
@@ -454,7 +456,8 @@ struct msi_desc *msi_next_desc(struct device *dev, unsigned int domid,
 
 	lockdep_assert_held(&md->mutex);
 
-	if (md->__iter_idx >= (unsigned long)MSI_MAX_INDEX)
+	/* Use the same sentinel as msi_find_desc() to terminate iteration */
+	if (md->__iter_idx == MSI_XA_MAX_INDEX)
 		return NULL;
 
 	md->__iter_idx++;
@@ -1210,7 +1213,7 @@ static bool msi_check_reservation_mode(struct irq_domain *domain,
 {
 	struct msi_desc *desc;
 
-	switch(domain->bus_token) {
+	switch (domain->bus_token) {
 	case DOMAIN_BUS_PCI_MSI:
 	case DOMAIN_BUS_PCI_DEVICE_MSI:
 	case DOMAIN_BUS_PCI_DEVICE_MSIX:
@@ -1229,15 +1232,18 @@ static bool msi_check_reservation_mode(struct irq_domain *domain,
 	/*
 	 * Checking the first MSI descriptor is sufficient. MSIX supports
 	 * masking and MSI does so when the can_mask attribute is set.
+	 * If there is no descriptor yet, reservation mode cannot be safely used.
 	 */
 	desc = msi_first_desc(dev, MSI_DESC_ALL);
+	if (!desc)
+		return false;
 	return desc->pci.msi_attrib.is_msix || desc->pci.msi_attrib.can_mask;
 }
 
 static int msi_handle_pci_fail(struct irq_domain *domain, struct msi_desc *desc,
 			       int allocated)
 {
-	switch(domain->bus_token) {
+	switch (domain->bus_token) {
 	case DOMAIN_BUS_PCI_MSI:
 	case DOMAIN_BUS_PCI_DEVICE_MSI:
 	case DOMAIN_BUS_PCI_DEVICE_MSIX:
@@ -1279,9 +1285,9 @@ static int msi_init_virq(struct irq_domain *domain, int virq, unsigned int vflag
 		    irqd_affinity_is_managed(irqd) &&
 		    !cpumask_intersects(irq_data_get_affinity_mask(irqd),
 					cpu_online_mask)) {
-			    irqd_set_managed_shutdown(irqd);
-			    return 0;
-		    }
+			irqd_set_managed_shutdown(irqd);
+			return 0;
+		}
 	}
 
 	if (!(vflags & VIRQ_ACTIVATE))
@@ -1347,7 +1353,6 @@ __msi_domain_alloc_irqs(struct device *dev,
 		vflags |= VIRQ_CAN_RESERVE;
 
 	xa_for_each_range(xa, idx, desc, ctrl->first, ctrl->last) {
-		irq_hw_number_t old_hwirq;
 		int i, virq, nvec;
 
 		if (unlikely(!msi_desc_match(desc, MSI_DESC_NOTASSOCIATED)))
@@ -1362,14 +1367,11 @@ __msi_domain_alloc_irqs(struct device *dev,
 			ops->prepare_desc(domain, &arg, desc);
 
 		/*
-		 * Default hwirq assignment:
-		 * If provider uses the default get_hwirq() (reads arg->hwirq) and
-		 * prepare_desc() did not assign a specific value, set arg.hwirq to
-		 * the descriptor index to ensure unique mappings.
+		 * Default hwirq assignment only if the provider uses the default
+		 * get_hwirq() and did not specify a hardware IRQ in arg:
+		 * treat arg.hwirq == 0 as "unspecified".
 		 */
-		old_hwirq = arg.hwirq;
-		if (ops->get_hwirq == msi_domain_ops_default.get_hwirq &&
-		    arg.hwirq == old_hwirq)
+		if (ops->get_hwirq == msi_domain_ops_default.get_hwirq && arg.hwirq == 0)
 			arg.hwirq = (irq_hw_number_t)idx;
 
 		ops->set_desc(&arg, desc);
@@ -1424,7 +1426,7 @@ __msi_domain_alloc_irqs(struct device *dev,
 		/*
 		 * PERFORMANCE: Install per-vector affinity hints, if provided.
 		 * Non-binding; helps policy/irqbalance keep MSI-X vectors spread as
-		 * intended to reduce contention with game threads.
+		 * intended to reduce contention with latency-sensitive threads.
 		 */
 		if (desc->affinity) {
 			for (i = 0; i < nvec; i++) {
@@ -1446,7 +1448,6 @@ __msi_domain_alloc_irqs(struct device *dev,
 
 	return 0;
 }
-
 
 static int msi_domain_alloc_simple_msi_descs(struct device *dev,
 					     struct msi_domain_info *info,
@@ -1515,7 +1516,8 @@ int msi_domain_alloc_irqs_range_locked(struct device *dev, unsigned int domid,
 		.domid	= domid,
 		.first	= first,
 		.last	= last,
-		.nirqs	= last + 1 - first,
+		/* Avoid unsigned underflow on invalid ranges; validation will fail later */
+		.nirqs	= (last >= first) ? (last - first + 1) : 0,
 	};
 
 	return msi_domain_alloc_locked(dev, &ctrl);
@@ -1534,7 +1536,6 @@ int msi_domain_alloc_irqs_range_locked(struct device *dev, unsigned int domid,
 int msi_domain_alloc_irqs_range(struct device *dev, unsigned int domid,
 				unsigned int first, unsigned int last)
 {
-
 	guard(msi_descs_lock)(dev);
 	return msi_domain_alloc_irqs_range_locked(dev, domid, first, last);
 }
@@ -1783,7 +1784,7 @@ void msi_domain_free_irqs_range(struct device *dev, unsigned int domid,
 	guard(msi_descs_lock)(dev);
 	msi_domain_free_irqs_range_locked(dev, domid, first, last);
 }
-EXPORT_SYMBOL_GPL(msi_domain_free_irqs_all);
+EXPORT_SYMBOL_GPL(msi_domain_free_irqs_range);
 
 /**
  * msi_domain_free_irqs_all_locked - Free all interrupts from a MSI interrupt domain
