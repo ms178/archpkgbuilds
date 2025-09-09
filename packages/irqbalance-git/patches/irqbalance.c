@@ -20,6 +20,7 @@
  * Boston, MA 02110-1301 USA
  */
 #include "config.h"
+
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,7 +59,7 @@
 #include "thermal.h"
 
 /* -------------------------------------------------------------------------- */
-/* Global state (maintain ABI expectations)                                   */
+/* Global state (keep ABI expectations)                                       */
 /* -------------------------------------------------------------------------- */
 
 volatile int keep_going = 1;
@@ -83,7 +84,7 @@ char *polscript = NULL;
 long HZ;
 
 int sleep_interval = 60;
-static int user_min_interval = 60; /* True user-requested minimum (-t); preserved across adaptation */
+static int user_min_interval = 60; /* True user-requested minimum (-t), preserved across adaptation */
 int last_interval;
 
 GMainLoop *main_loop;
@@ -98,12 +99,12 @@ char *banned_cpumask_from_ui = NULL;
 #endif
 
 /* -------------------------------------------------------------------------- */
-/* Adaptive interval policy                                                   */
+/* Adaptive interval policy (typed, readable, testable)                       */
 /* -------------------------------------------------------------------------- */
 
 static inline unsigned adaptive_interval_from_diff(uint64_t diff)
 {
-	/* High IRQ churn => shorter rescan interval */
+	/* High IRQ churn => shorter rescan interval (policy is conservative). */
 	if (diff > 10000U) {
 		return 10U;
 	}
@@ -239,7 +240,7 @@ static void parse_command_line(int argc, char **argv)
 			one_shot_mode = 1;
 			break;
 		case 's':
-			/* Note: We intentionally keep the argv-owned pointer here;
+			/* We intentionally keep the argv-owned pointer;
 			 * it's stable for process lifetime. */
 			pidfile = optarg;
 			break;
@@ -276,7 +277,7 @@ static void parse_command_line(int argc, char **argv)
 #else /* ! HAVE_GETOPT_LONG */
 static void parse_command_line(int argc, char **argv)
 {
-	/* Compat parser for minimal builds */
+	/* Minimal compat parser */
 	if (argc > 1 && strstr(argv[1], "--debug")) {
 		debug_mode = 1;
 		foreground_mode = 1;
@@ -299,9 +300,9 @@ static void parse_command_line(int argc, char **argv)
 /* -------------------------------------------------------------------------- */
 
 /*
- * This builds our object tree.  The hierarchy is typically:
+ * Build object tree:
  * - numa_nodes at top
- * - cpu packages, cache domains, cpu cores below, adjusted for memory topology
+ * - cpu packages, cache domains, cpu cores below; adjusted for memory topology
  * Object workload is the sum of workloads below it.
  */
 static void build_object_tree(void)
@@ -410,6 +411,7 @@ gboolean scan(gpointer data __attribute__((unused)))
 	static uint64_t irq_diffs[1024] = {0};
 	static int cached_count = 0;
 	static uint64_t last_cycle = 0;
+	int new_interval = sleep_interval; /* default: stay unchanged unless adaptation computes new */
 
 	if (log_mask & TO_CONSOLE) {
 		log(TO_CONSOLE, LOG_INFO, "\n\n\n-----------------------------------------------------------------------------\n");
@@ -497,14 +499,15 @@ gboolean scan(gpointer data __attribute__((unused)))
 	}
 
 	/* Adaptive interval with proper clamping to the true user minimum */
-	unsigned adaptive = adaptive_interval_from_diff(max_diff);
-	int new_interval = (int)adaptive;
-	if (new_interval < user_min_interval) {
-		new_interval = user_min_interval;
-	}
-
-	if (new_interval < 1) {
-		new_interval = 1; /* safety clamp */
+	{
+		unsigned adaptive = adaptive_interval_from_diff(max_diff);
+		new_interval = (int)adaptive;
+		if (new_interval < user_min_interval) {
+			new_interval = user_min_interval;
+		}
+		if (new_interval < 1) {
+			new_interval = 1; /* safety clamp */
+		}
 	}
 
 out:
