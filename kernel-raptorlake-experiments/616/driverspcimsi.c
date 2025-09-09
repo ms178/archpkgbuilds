@@ -13,6 +13,7 @@
 #include <linux/export.h>
 #include <linux/irq.h>
 #include <linux/irqdomain.h>
+#include <linux/io.h>
 
 #include "../pci.h"
 #include "msi.h"
@@ -135,34 +136,72 @@ void pci_msi_update_mask(struct msi_desc *desc, u32 clear, u32 set)
 /**
  * pci_msi_mask_irq - Generic IRQ chip callback to mask PCI/MSI interrupts
  * @data:	pointer to irqdata associated to that interrupt
+ *
+ * Defensive shift bound check added (debug aid, zero-cost in steady state).
  */
 void pci_msi_mask_irq(struct irq_data *data)
 {
 	struct msi_desc *desc = irq_data_get_msi_desc(data);
+	unsigned int shift;
 
 	prefetchw(desc);
-	__pci_msi_mask_desc(desc, BIT(data->irq - desc->irq));
+	if (WARN_ON_ONCE(!desc))
+		return;
+
+	if (WARN_ON_ONCE(data->irq < desc->irq))
+		return;
+
+	shift = (unsigned int)(data->irq - desc->irq);
+	if (WARN_ON_ONCE(shift >= 32))
+		return;
+
+	__pci_msi_mask_desc(desc, BIT(shift));
 }
 EXPORT_SYMBOL_GPL(pci_msi_mask_irq);
 
 /**
  * pci_msi_unmask_irq - Generic IRQ chip callback to unmask PCI/MSI interrupts
  * @data:	pointer to irqdata associated to that interrupt
+ *
+ * Defensive shift bound check added (debug aid, zero-cost in steady state).
  */
 void pci_msi_unmask_irq(struct irq_data *data)
 {
 	struct msi_desc *desc = irq_data_get_msi_desc(data);
+	unsigned int shift;
 
 	prefetchw(desc);
-	__pci_msi_unmask_desc(desc, BIT(data->irq - desc->irq));
+	if (WARN_ON_ONCE(!desc))
+		return;
+
+	if (WARN_ON_ONCE(data->irq < desc->irq))
+		return;
+
+	shift = (unsigned int)(data->irq - desc->irq);
+	if (WARN_ON_ONCE(shift >= 32))
+		return;
+
+	__pci_msi_unmask_desc(desc, BIT(shift));
 }
 EXPORT_SYMBOL_GPL(pci_msi_unmask_irq);
 
+/*
+ * Robust against non-D0/disconnected devices: read cached message when
+ * touching hardware is unsafe. Mirrors write-side logic in __pci_write_msi_msg().
+ */
 void __pci_read_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
 {
 	struct pci_dev *dev = msi_desc_to_pci_dev(entry);
 
-	BUG_ON(dev->current_state != PCI_D0);
+	if (WARN_ON_ONCE(!entry))
+		return;
+
+	/* If device is not in D0 or is disconnected, return cached message */
+	if (unlikely(dev->current_state != PCI_D0 || pci_dev_is_disconnected(dev))) {
+		*msg = entry->msg;
+		return;
+	}
+
 	prefetchw(msg);
 
 	if (entry->pci.msi_attrib.is_msix) {
@@ -178,11 +217,9 @@ void __pci_read_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
 		int pos = dev->msi_cap;
 		u16 data;
 
-		pci_read_config_dword(dev, pos + PCI_MSI_ADDRESS_LO,
-				      &msg->address_lo);
+		pci_read_config_dword(dev, pos + PCI_MSI_ADDRESS_LO, &msg->address_lo);
 		if (entry->pci.msi_attrib.is_64) {
-			pci_read_config_dword(dev, pos + PCI_MSI_ADDRESS_HI,
-					      &msg->address_hi);
+			pci_read_config_dword(dev, pos + PCI_MSI_ADDRESS_HI, &msg->address_hi);
 			pci_read_config_word(dev, pos + PCI_MSI_DATA_64, &data);
 		} else {
 			msg->address_hi = 0;
@@ -206,7 +243,7 @@ static inline void pci_write_msg_msi(struct pci_dev *dev, struct msi_desc *desc,
 
 	pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_LO, msg->address_lo);
 	if (desc->pci.msi_attrib.is_64) {
-		pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_HI,  msg->address_hi);
+		pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_HI, msg->address_hi);
 		pci_write_config_word(dev, pos + PCI_MSI_DATA_64, msg->data);
 	} else {
 		pci_write_config_word(dev, pos + PCI_MSI_DATA_32, msg->data);
@@ -223,6 +260,7 @@ static inline void pci_write_msg_msix(struct msi_desc *desc, struct msi_msg *msg
 
 	if (desc->pci.msi_attrib.is_virtual)
 		return;
+
 	/*
 	 * The specification mandates that the entry is masked
 	 * when the message is modified:
@@ -249,8 +287,11 @@ void __pci_write_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
 {
 	struct pci_dev *dev = msi_desc_to_pci_dev(entry);
 
+	if (WARN_ON_ONCE(!entry))
+		return;
+
 	if (dev->current_state != PCI_D0 || pci_dev_is_disconnected(dev)) {
-		/* Don't touch the hardware now */
+		/* Don't touch the hardware now; still update cached message */
 	} else if (entry->pci.msi_attrib.is_msix) {
 		pci_write_msg_msix(entry, msg);
 	} else {
@@ -266,6 +307,9 @@ void __pci_write_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
 void pci_write_msi_msg(unsigned int irq, struct msi_msg *msg)
 {
 	struct msi_desc *entry = irq_get_msi_desc(irq);
+
+	if (WARN_ON_ONCE(!entry))
+		return;
 
 	__pci_write_msi_msg(entry, msg);
 }
@@ -354,6 +398,10 @@ static int __msi_capability_init(struct pci_dev *dev, int nvec, struct irq_affin
 
 	/* All MSIs are unmasked by default; mask them all */
 	entry = msi_first_desc(&dev->dev, MSI_DESC_ALL);
+	if (WARN_ON_ONCE(!entry)) {
+		pci_free_msi_irqs(dev);
+		return -ENODEV;
+	}
 	pci_msi_mask(entry, msi_multi_mask(entry));
 	/*
 	 * Copy the MSI descriptor for the error path because
@@ -521,6 +569,8 @@ void __pci_restore_msi_state(struct pci_dev *dev)
 		return;
 
 	entry = irq_get_msi_desc(dev->irq);
+	if (WARN_ON_ONCE(!entry))
+		return;
 
 	pci_intx_for_msi(dev, 0);
 	pci_msi_set_enable(dev, 0);
@@ -548,11 +598,15 @@ void pci_msi_shutdown(struct pci_dev *dev)
 
 	/* Return the device with MSI unmasked as initial states */
 	desc = msi_first_desc(&dev->dev, MSI_DESC_ALL);
-	if (!WARN_ON_ONCE(!desc))
+	if (desc) {
 		pci_msi_unmask(desc, msi_multi_mask(desc));
+		/* Restore dev->irq to its default pin-assertion IRQ */
+		dev->irq = desc->pci.msi_attrib.default_irq;
+	} else {
+		WARN_ON_ONCE(1);
+		/* Fallback: keep dev->irq as-is */
+	}
 
-	/* Restore dev->irq to its default pin-assertion IRQ */
-	dev->irq = desc->pci.msi_attrib.default_irq;
 	pcibios_alloc_irq(dev);
 }
 
@@ -568,25 +622,43 @@ static void pci_msix_clear_and_set_ctrl(struct pci_dev *dev, u16 clear, u16 set)
 	pci_write_config_word(dev, dev->msix_cap + PCI_MSIX_FLAGS, ctrl);
 }
 
+/*
+ * Hardened: Bounds/overflow safe MSI-X BAR mapping
+ * Ensures table_offset + table_len fits within the BAR and does not wrap.
+ */
 static void __iomem *msix_map_region(struct pci_dev *dev,
 				     unsigned int nr_entries)
 {
-	resource_size_t phys_addr;
+	resource_size_t start, phys_addr, bar_len, table_len;
 	u32 table_offset;
 	unsigned long flags;
 	u8 bir;
 
-	pci_read_config_dword(dev, dev->msix_cap + PCI_MSIX_TABLE,
-			      &table_offset);
+	pci_read_config_dword(dev, dev->msix_cap + PCI_MSIX_TABLE, &table_offset);
 	bir = (u8)(table_offset & PCI_MSIX_TABLE_BIR);
 	flags = pci_resource_flags(dev, bir);
 	if (!flags || (flags & IORESOURCE_UNSET))
 		return NULL;
 
 	table_offset &= PCI_MSIX_TABLE_OFFSET;
-	phys_addr = pci_resource_start(dev, bir) + table_offset;
+	bar_len = pci_resource_len(dev, bir);
+	if (!bar_len)
+		return NULL;
 
-	return ioremap(phys_addr, nr_entries * PCI_MSIX_ENTRY_SIZE);
+	/* Compute table length and validate: no overflow, fits within BAR */
+	table_len = (resource_size_t)nr_entries * PCI_MSIX_ENTRY_SIZE;
+	if (nr_entries == 0 || table_len / PCI_MSIX_ENTRY_SIZE != nr_entries)
+		return NULL; /* overflow */
+	if (table_offset > bar_len || bar_len - table_offset < table_len)
+		return NULL; /* out of range */
+
+	start = pci_resource_start(dev, bir);
+	if (!start)
+		return NULL;
+
+	phys_addr = start + table_offset;
+
+	return ioremap(phys_addr, table_len);
 }
 
 /**
@@ -614,7 +686,6 @@ void msix_prepare_msi_desc(struct pci_dev *dev, struct msi_desc *desc)
 	desc->pci.msi_attrib.is_64		= 1;
 	desc->pci.msi_attrib.default_irq	= dev->irq;
 	desc->pci.mask_base			= dev->msix_base;
-
 
 	if (!pci_msi_domain_supports(dev, MSI_FLAG_NO_MASK, DENY_LEGACY) &&
 	    !desc->pci.msi_attrib.is_virtual) {
@@ -976,6 +1047,10 @@ int pci_msix_write_tph_tag(struct pci_dev *pdev, unsigned int index, u16 tag)
 
 	if (!pdev->msix_enabled)
 		return -ENXIO;
+
+	/* Ensure the tag fits the field width */
+	if (tag > FIELD_MAX(PCI_MSIX_ENTRY_CTRL_ST))
+		return -EINVAL;
 
 	virq = msi_get_virq(&pdev->dev, index);
 	if (!virq)
