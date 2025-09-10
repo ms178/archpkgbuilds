@@ -1947,7 +1947,7 @@ void ixgbe_process_skb_fields(struct ixgbe_ring *rx_ring,
 	skb->protocol = eth_type_trans(skb, dev);
 }
 
-/* Tiny UDP detection for low-latency bypass of GRO */
+/* Detect tiny UDP frames for direct, low-latency delivery (bypass GRO). */
 static __always_inline bool ixgbe_is_tiny_udp(const struct sk_buff *skb)
 {
     if (skb->protocol == htons(ETH_P_IP)) {
@@ -1963,7 +1963,7 @@ static __always_inline bool ixgbe_is_tiny_udp(const struct sk_buff *skb)
     return false;
 }
 
-/* Low-latency RX handoff: direct deliver tiny UDP, GRO default otherwise */
+/* Low-latency receive handoff: direct deliver tiny UDP, default GRO otherwise. */
 void ixgbe_rx_skb(struct ixgbe_q_vector *q_vector, struct sk_buff *skb)
 {
     if (likely(ixgbe_is_tiny_udp(skb))) {
@@ -2799,7 +2799,7 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *qv,
     unsigned int bytes = rc->total_bytes;
     unsigned int usecs;
     unsigned long now = jiffies;
-    /* EITR is in 2us units; we mask the low 16 bits to keep just value bits. */
+    /* EITR register: low 16 bits hold 2us units; mask & >>2 to get microseconds. */
     unsigned int cur_usecs = ((qv->itr & 0xFFFFu) >> 2);
 
     if (unlikely(!rc->ring)) {
@@ -2808,38 +2808,38 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *qv,
         return;
     }
 
+    /* Avoid over-updating inside same jiffy; leave NAPI to run. */
     if (time_before(now, rc->next_update)) {
         rc->total_packets = 0;
         rc->total_bytes = 0;
         return;
     }
 
-    /* 1) Tiny microbursts: deliver ASAP */
+    /* 1) Tiny microbursts: immediate interrupt for minimum latency. */
     if (pkts > 0 && pkts <= 16) {
         usecs = 0;
         goto out;
     }
 
-    /* 2) Small bursts of small packets: 4us interrupt delay */
-    if (pkts > 0 && pkts <= 64 && bytes <= (pkts << 8)) {
+    /* 2) Small bursts of tiny packets: very low ITR (4us). */
+    if (pkts > 0 && pkts <= 64 && bytes <= (pkts << 8)) { /* mean <= 256 bytes */
         usecs = 4;
         goto out;
     }
 
-    /* 3) Idle: gently increase interrupt delay to reduce background interrupts */
+    /* 3) Idle: gently increase interrupt delay to reduce background interrupts. */
     if (!pkts) {
         unsigned int bumped = cur_usecs + 200U;
-        if (bumped < cur_usecs) {
-            bumped = cur_usecs; /* overflow guard */
-        }
-        usecs = min(bumped, 20000U);
+        if (bumped < cur_usecs) /* overflow guard */
+            bumped = cur_usecs;
+        usecs = min(bumped, 20000U); /* cap to 20ms */
         goto out;
     }
 
-    /* 4) Bulk traffic: proportional to average size; stable and bounded */
+    /* 4) Bulk traffic: proportional to average size; stable and bounded. */
     {
-        unsigned int avg = bytes / pkts;     /* pkts > 0 by construction */
-        unsigned int calc = avg / 3 + 1000;  /* base ~1ms, scaled by size */
+        unsigned int avg = bytes / pkts;    /* pkts > 0 by construction */
+        unsigned int calc = avg / 3 + 1000; /* base ~1ms, reduced for small frames */
         if (calc < 4) {
             calc = 4;
         } else if (calc > 32256) {
@@ -2850,7 +2850,7 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *qv,
 
 out:
     rc->itr = usecs;                 /* store microseconds only */
-    rc->next_update = now + 1UL;     /* next update in ~1 jiffy */
+    rc->next_update = now + 1UL;     /* next update after ~1 jiffy */
     rc->total_packets = 0;
     rc->total_bytes = 0;
 }
@@ -2895,15 +2895,14 @@ static void ixgbe_set_itr(struct ixgbe_q_vector *qv)
     } else if (rx_us) {
         min_us = rx_us;
     } else {
-        min_us = tx_us; /* possibly 0 */
+        min_us = tx_us; /* could be 0 - immediate interrupts */
     }
 
-    /* Convert microseconds to EITR (2us units); set WDIS to avoid timer re-arm stalls. */
+    /* Convert microseconds to EITR (2us units), keep low 16 bits, set WDIS. */
     hw_eitr = ((min_us & 0xFFFFu) << 2) | IXGBE_EITR_CNT_WDIS;
 
-    if (unlikely(hw_eitr == qv->itr)) {
+    if (unlikely(hw_eitr == qv->itr))
         return;
-    }
 
     qv->itr = hw_eitr;
     ixgbe_write_eitr(qv);
@@ -3605,7 +3604,7 @@ static __always_inline unsigned long ixgbe_cpu_capacity(unsigned int cpu)
 	return topology_get_cpu_scale(cpu);
 }
 
-/* Build preferred CPU mask: NUMA-local ∩ primary SMT ∩ top-capacity CPUs (P-cores) */
+/* Build preferred CPU mask: NUMA-local ∩ primary SMT ∩ top-capacity CPUs (P-cores). */
 static int ixgbe_build_performance_mask(struct ixgbe_adapter *adapter,
                                         cpumask_var_t pref)
 {
@@ -3626,50 +3625,45 @@ static int ixgbe_build_performance_mask(struct ixgbe_adapter *adapter,
     node = dev_to_node(&adapter->pdev->dev);
     if (node != NUMA_NO_NODE) {
         cpumask_copy(node_mask, cpumask_of_node(node));
-        if (cpumask_empty(node_mask)) {
+        if (cpumask_empty(node_mask))
             cpumask_copy(node_mask, cpu_online_mask);
-        }
     } else {
         cpumask_copy(node_mask, cpu_online_mask);
     }
 
-    /* Keep only primary SMT threads to avoid HT contention on the same core. */
+    /* Keep only primary SMT threads to avoid hyperthread contention. */
     cpumask_clear(primaries);
     for_each_cpu(cpu, node_mask) {
         const struct cpumask *sibs = topology_sibling_cpumask(cpu);
-        if (!sibs || cpu == cpumask_first(sibs)) {
+        if (!sibs || cpu == cpumask_first(sibs))
             cpumask_set_cpu(cpu, primaries);
-        }
     }
 
-    /* Among primaries, retain CPUs near the max capacity (P-cores on hybrid). */
+    /* Compute max capacity and keep CPUs within ~12.5% of it (P-cores). */
     for_each_cpu(cpu, primaries) {
         unsigned long cap = topology_get_cpu_scale(cpu);
-        if (cap > max_cap) {
+        if (cap > max_cap)
             max_cap = cap;
-        }
     }
 
     {
-        unsigned long thr = (max_cap * 7) / 8; /* top ~12.5% */
+        unsigned long thr = (max_cap * 7) / 8;
         cpumask_clear(top);
         for_each_cpu(cpu, primaries) {
             unsigned long cap = topology_get_cpu_scale(cpu);
-            if (cap >= thr) {
+            if (cap >= thr)
                 cpumask_set_cpu(cpu, top);
-            }
         }
     }
 
-    if (!cpumask_empty(top)) {
+    if (!cpumask_empty(top))
         cpumask_copy(pref, top);
-    } else if (!cpumask_empty(primaries)) {
+    else if (!cpumask_empty(primaries))
         cpumask_copy(pref, primaries);
-    } else if (!cpumask_empty(node_mask)) {
+    else if (!cpumask_empty(node_mask))
         cpumask_copy(pref, node_mask);
-    } else {
+    else
         cpumask_copy(pref, cpu_online_mask);
-    }
 
     free_cpumask_var(node_mask);
     free_cpumask_var(primaries);
@@ -3677,7 +3671,7 @@ static int ixgbe_build_performance_mask(struct ixgbe_adapter *adapter,
     return 0;
 }
 
-/* Request MSI-X vectors and set per-vector affinity hints to preferred CPUs */
+/* Request MSI-X IRQs and set per-vector affinity hints to preferred CPUs. */
 static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
 {
     struct net_device *netdev = adapter->netdev;
@@ -3686,27 +3680,23 @@ static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
     unsigned int pick;
     int vector, err;
 
-    if (!zalloc_cpumask_var(&pref_mask, GFP_KERNEL)) {
+    if (!zalloc_cpumask_var(&pref_mask, GFP_KERNEL))
         return -ENOMEM;
-    }
 
-    if (ixgbe_build_performance_mask(adapter, pref_mask)) {
+    if (ixgbe_build_performance_mask(adapter, pref_mask))
         cpumask_copy(pref_mask, cpu_online_mask);
-    }
 
     pick = cpumask_first(pref_mask);
-    if (pick >= nr_cpu_ids) {
+    if (pick >= nr_cpu_ids)
         pick = 0;
-    }
 
     for (vector = 0; vector < adapter->num_q_vectors; vector++) {
         struct ixgbe_q_vector *qv = adapter->q_vector[vector];
         struct msix_entry *entry = &adapter->msix_entries[vector];
         cpumask_t one;
 
-        if (!qv) {
+        if (!qv)
             continue;
-        }
 
         if (qv->tx.ring && qv->rx.ring) {
             snprintf(qv->name, sizeof(qv->name), "%s-TxRx-%u", netdev->name, ri++);
@@ -3733,9 +3723,8 @@ static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
 
         /* Move to next preferred CPU, wrap if needed. */
         pick = cpumask_next(pick, pref_mask);
-        if (pick >= nr_cpu_ids) {
+        if (pick >= nr_cpu_ids)
             pick = cpumask_first(pref_mask);
-        }
     }
 
     err = request_irq(adapter->msix_entries[vector].vector,
@@ -9177,22 +9166,23 @@ static void ixgbe_tx_olinfo_status(union ixgbe_adv_tx_desc *tx_desc,
 	tx_desc->read.olinfo_status = cpu_to_le32(olinfo_status);
 }
 
-static int __ixgbe_maybe_stop_tx(struct ixgbe_ring *tx_ring, u16 need)
+static int __ixgbe_maybe_stop_tx(struct ixgbe_ring *tx_ring, u16 needed)
 {
-	/* Fast path: enough descriptors available */
-	if (likely(ixgbe_desc_unused(tx_ring) >= need))
-		return 0;
+    unsigned int free = ixgbe_desc_unused(tx_ring);
 
-	/* Try to stop this subqueue; if we did, report busy */
-	if (netif_subqueue_try_stop(tx_ring->netdev,
-				    tx_ring->queue_index,
-				    ixgbe_desc_unused(tx_ring), need)) {
-		tx_ring->tx_stats.restart_queue++;
-		return -EBUSY;
-	}
+    if (likely(free >= needed))
+        return 0;
 
-	/* Another CPU already stopped it; we are busy */
-	return -EBUSY;
+    /* Try to stop; if we fail to stop (another CPU raced), tell caller busy */
+    if (unlikely(!netif_subqueue_try_stop(tx_ring->netdev,
+                                          tx_ring->queue_index,
+                                          free, needed)))
+        return -EBUSY;
+
+    tx_ring->tx_stats.restart_queue++;
+    /* Make sure the stop is visible before the next wakeup */
+    smp_mb();
+    return 0;
 }
 
 static inline int ixgbe_maybe_stop_tx(struct ixgbe_ring *tx_ring, u16 size)
@@ -9220,164 +9210,173 @@ static int ixgbe_tx_map(struct ixgbe_ring *tx_ring,
                         struct ixgbe_tx_buffer *first,
                         const u8 hdr_len)
 {
-	struct sk_buff *skb = first->skb;
-	union ixgbe_adv_tx_desc *txd;
-	struct ixgbe_tx_buffer *txb;
-	dma_addr_t dma;
-	u32 cmd_base;
-	unsigned int seg_len;
-	u16 i = tx_ring->next_to_use;
-	u16 first_idx = i, last_idx = i;
-	unsigned int frag_idx;
+    struct sk_buff *skb = first->skb;
+    union ixgbe_adv_tx_desc *txd;
+    struct ixgbe_tx_buffer *txb;
+    dma_addr_t dma;
+    u32 cmd_base;
+    unsigned int seg_len;
+    u16 i = tx_ring->next_to_use;
+    u16 first_idx = i;
+    u16 last_idx = i;
+    unsigned int frag_idx;
 
-	cmd_base = ixgbe_tx_cmd_type(skb, first->tx_flags);
+    /* Base command flags for all data descriptors */
+    cmd_base = ixgbe_tx_cmd_type(skb, first->tx_flags);
 
-	txd = IXGBE_TX_DESC(tx_ring, i);
-	txb = first;
+    txd = IXGBE_TX_DESC(tx_ring, i);
+    txb = first;
 
-	ixgbe_tx_olinfo_status(txd, first->tx_flags, skb->len - hdr_len);
+    /* Write payload length once on the first descriptor's olinfo */
+    ixgbe_tx_olinfo_status(txd, first->tx_flags, skb->len - hdr_len);
 
-	/* Map linear head */
-	seg_len = skb_headlen(skb);
-	if (seg_len) {
-		dma = ixgbe_dma_map_single(tx_ring->dev, skb->data, seg_len, DMA_TO_DEVICE);
-		if (unlikely(dma_mapping_error(tx_ring->dev, dma)))
-			goto dma_err;
+    /* Linear head */
+    seg_len = skb_headlen(skb);
+    if (seg_len) {
+        dma = dma_map_single(tx_ring->dev, skb->data, seg_len, DMA_TO_DEVICE);
+        if (unlikely(dma_mapping_error(tx_ring->dev, dma)))
+            goto dma_err;
 
-		dma_unmap_len_set(txb, len, seg_len);
-		dma_unmap_addr_set(txb, dma, dma);
+        dma_unmap_len_set(txb, len, seg_len);
+        dma_unmap_addr_set(txb, dma, dma);
 
-		while (true) {
-			u32 dlen = min_t(u32, seg_len, IXGBE_MAX_DATA_PER_TXD);
+        for (;;) {
+            u32 dlen = min_t(u32, seg_len, IXGBE_MAX_DATA_PER_TXD);
 
-			txd->read.buffer_addr  = cpu_to_le64(dma);
-			txd->read.cmd_type_len = cpu_to_le32(cmd_base | dlen);
+            txd->read.buffer_addr  = cpu_to_le64(dma);
+            txd->read.cmd_type_len = cpu_to_le32(cmd_base | dlen);
 
-			last_idx = i;
-			seg_len -= dlen;
-			if (!seg_len)
-				break;
+            last_idx = i;
+            seg_len -= dlen;
+            if (!seg_len)
+                break;
 
-			dma += dlen;
-			i++;
-			if (unlikely(i == tx_ring->count))
-				i = 0;
+            dma += dlen;
+            i++;
+            if (unlikely(i == tx_ring->count))
+                i = 0;
 
-			txd = IXGBE_TX_DESC(tx_ring, i);
-			txb = &tx_ring->tx_buffer_info[i];
-			*txb = (struct ixgbe_tx_buffer){ 0 };
-			txd->read.olinfo_status = 0;
-		}
-	}
+            txd = IXGBE_TX_DESC(tx_ring, i);
+            txb = &tx_ring->tx_buffer_info[i];
+            /* Clear fields we own on the fly */
+            dma_unmap_len_set(txb, len, 0);
+            dma_unmap_addr_set(txb, dma, 0);
+            txd->read.olinfo_status = 0;
+        }
+    }
 
-	/* Map frags */
-	for (frag_idx = 0; frag_idx < skb_shinfo(skb)->nr_frags; frag_idx++) {
-		skb_frag_t *frag = &skb_shinfo(skb)->frags[frag_idx];
+    /* Fragments */
+    for (frag_idx = 0; frag_idx < skb_shinfo(skb)->nr_frags; frag_idx++) {
+        const skb_frag_t *frag = &skb_shinfo(skb)->frags[frag_idx];
 
-		seg_len = skb_frag_size(frag);
+        seg_len = skb_frag_size(frag);
 
-		i++;
-		if (unlikely(i == tx_ring->count))
-			i = 0;
+        i++;
+        if (unlikely(i == tx_ring->count))
+            i = 0;
 
-		txd = IXGBE_TX_DESC(tx_ring, i);
-		txb = &tx_ring->tx_buffer_info[i];
-		*txb = (struct ixgbe_tx_buffer){ 0 };
-		txd->read.olinfo_status = 0;
+        txd = IXGBE_TX_DESC(tx_ring, i);
+        txb = &tx_ring->tx_buffer_info[i];
+        dma_unmap_len_set(txb, len, 0);
+        dma_unmap_addr_set(txb, dma, 0);
+        txd->read.olinfo_status = 0;
 
-		dma = ixgbe_dma_map_page(tx_ring->dev, skb_frag_page(frag),
-					 skb_frag_off(frag), seg_len, DMA_TO_DEVICE);
-		if (unlikely(dma_mapping_error(tx_ring->dev, dma)))
-			goto dma_err;
+        dma = skb_frag_dma_map(tx_ring->dev, frag, 0, seg_len, DMA_TO_DEVICE);
+        if (unlikely(dma_mapping_error(tx_ring->dev, dma)))
+            goto dma_err;
 
-		dma_unmap_len_set(txb, len, seg_len);
-		dma_unmap_addr_set(txb, dma, dma);
+        dma_unmap_len_set(txb, len, seg_len);
+        dma_unmap_addr_set(txb, dma, dma);
 
-		while (true) {
-			u32 dlen = min_t(u32, seg_len, IXGBE_MAX_DATA_PER_TXD);
+        for (;;) {
+            u32 dlen = min_t(u32, seg_len, IXGBE_MAX_DATA_PER_TXD);
 
-			txd->read.buffer_addr  = cpu_to_le64(dma);
-			txd->read.cmd_type_len = cpu_to_le32(cmd_base | dlen);
+            txd->read.buffer_addr  = cpu_to_le64(dma);
+            txd->read.cmd_type_len = cpu_to_le32(cmd_base | dlen);
 
-			last_idx = i;
-			seg_len -= dlen;
-			if (!seg_len)
-				break;
+            last_idx = i;
+            seg_len -= dlen;
+            if (!seg_len)
+                break;
 
-			dma += dlen;
-			i++;
-			if (unlikely(i == tx_ring->count))
-				i = 0;
+            dma += dlen;
+            i++;
+            if (unlikely(i == tx_ring->count))
+                i = 0;
 
-			txd = IXGBE_TX_DESC(tx_ring, i);
-			txb = &tx_ring->tx_buffer_info[i];
-			*txb = (struct ixgbe_tx_buffer){ 0 };
-			txd->read.olinfo_status = 0;
-		}
-	}
+            txd = IXGBE_TX_DESC(tx_ring, i);
+            txb = &tx_ring->tx_buffer_info[i];
+            dma_unmap_len_set(txb, len, 0);
+            dma_unmap_addr_set(txb, dma, 0);
+            txd->read.olinfo_status = 0;
+        }
+    }
 
-	/* Mark EOP + RS on the last descriptor */
-	txd->read.cmd_type_len |= cpu_to_le32(IXGBE_TXD_CMD);
+    /* Mark last descriptor: EOP + RS, and set next_to_watch */
+    {
+        union ixgbe_adv_tx_desc *last = IXGBE_TX_DESC(tx_ring, last_idx);
+        last->read.cmd_type_len |= cpu_to_le32(IXGBE_ADVTXD_DCMD_EOP |
+                                               IXGBE_ADVTXD_DCMD_RS);
+        first->next_to_watch = last;
+    }
 
-	/* Publish */
-	first->next_to_watch = txd;
+    /* Bookkeeping */
+    netdev_tx_sent_queue(txring_txq(tx_ring), first->bytecount);
+    first->time_stamp = jiffies; /* critical for hang watchdog */
+    skb_tx_timestamp(skb);
 
-	i++;
-	if (unlikely(i == tx_ring->count))
-		i = 0;
+    /* Advance next_to_use to the slot after the last descriptor */
+    i++;
+    if (unlikely(i == tx_ring->count))
+        i = 0;
 
-	/* Prefetch next tx buffer to reduce stalls */
-	prefetchw(&tx_ring->tx_buffer_info[i]);
+    /* Ensure descriptors visible to HW */
+    wmb();
+    tx_ring->next_to_use = i;
 
-	/* Ensure descriptors visible before updating next_to_use */
-	wmb();
+    /* Doorbell unless batching */
+    if (netif_xmit_stopped(txring_txq(tx_ring)) || !netdev_xmit_more())
+        writel(i, tx_ring->tail);
 
-	tx_ring->next_to_use = i;
+    /* Proactively stop if we are near depletion */
+    ixgbe_maybe_stop_tx(tx_ring, DESC_NEEDED);
 
-	netdev_tx_sent_queue(txring_txq(tx_ring), first->bytecount);
-	skb_tx_timestamp(skb);
-
-	ixgbe_maybe_stop_tx(tx_ring, DESC_NEEDED);
-
-	if (netif_xmit_stopped(txring_txq(tx_ring)) || !netdev_xmit_more())
-		writel(i, tx_ring->tail);
-
-	return 0;
+    return 0;
 
 dma_err:
-	dev_err(tx_ring->dev, "TX DMA map failed\n");
+    /* Unwind DMA mappings from first_idx to last_idx inclusive */
+    i = first_idx;
+    for (;;) {
+        struct ixgbe_tx_buffer *tb = &tx_ring->tx_buffer_info[i];
 
-	/* Unwind from first_idx up to last_idx (inclusive) */
-	i = first_idx;
-	while (true) {
-		txb = &tx_ring->tx_buffer_info[i];
-		if (dma_unmap_len(txb, len)) {
-			if (txb->skb) {
-				ixgbe_dma_unmap_single(tx_ring->dev,
-						       dma_unmap_addr(txb, dma),
-						       dma_unmap_len(txb, len),
-						       DMA_TO_DEVICE);
-			} else {
-				ixgbe_dma_unmap_page(tx_ring->dev,
-						     dma_unmap_addr(txb, dma),
-						     dma_unmap_len(txb, len),
-						     DMA_TO_DEVICE);
-			}
-			dma_unmap_len_set(txb, len, 0);
-		}
-		if (i == last_idx)
-			break;
+        if (dma_unmap_len(tb, len)) {
+            if (tb == first) {
+                dma_unmap_single(tx_ring->dev,
+                                 dma_unmap_addr(tb, dma),
+                                 dma_unmap_len(tb, len),
+                                 DMA_TO_DEVICE);
+            } else {
+                dma_unmap_page(tx_ring->dev,
+                               dma_unmap_addr(tb, dma),
+                               dma_unmap_len(tb, len),
+                               DMA_TO_DEVICE);
+            }
+            dma_unmap_len_set(tb, len, 0);
+        }
 
-		i++;
-		if (unlikely(i == tx_ring->count))
-			i = 0;
-	}
+        if (i == last_idx)
+            break;
 
-	tx_ring->next_to_use = first_idx;
-	dev_kfree_skb_any(first->skb);
-	first->skb = NULL;
-	first->next_to_watch = NULL;
-	return -1;
+        i++;
+        if (i == tx_ring->count)
+            i = 0;
+    }
+
+    dev_kfree_skb_any(first->skb);
+    first->skb = NULL;
+    first->next_to_watch = NULL;
+
+    return -1;
 }
 
 static inline u32 ixgbe_tx_desc_cmd_type(const struct sk_buff *skb,
