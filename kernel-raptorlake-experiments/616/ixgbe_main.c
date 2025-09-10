@@ -3620,46 +3620,52 @@ static int ixgbe_build_eco_mask(struct ixgbe_adapter *adapter, cpumask_var_t eco
 
 	/* NUMA-local, intersect with online */
 	node = dev_to_node(&adapter->pdev->dev);
-	if (node != NUMA_NO_NODE)
+	if (node != NUMA_NO_NODE) {
 		cpumask_copy(node_mask, cpumask_of_node(node));
-	else
+	} else {
 		cpumask_copy(node_mask, cpu_possible_mask);
+	}
 	cpumask_and(node_mask, node_mask, cpu_online_mask);
-	if (cpumask_empty(node_mask))
+	if (cpumask_empty(node_mask)) {
 		cpumask_copy(node_mask, cpu_online_mask);
+	}
 
-	/* Keep only primary SMT threads */
+	/* Keep only primary SMT threads to avoid double-pinning to a core. */
 	cpumask_clear(primaries);
 	for_each_cpu(cpu, node_mask) {
 		const struct cpumask *sibs = topology_sibling_cpumask(cpu);
-		if (!sibs || cpu == cpumask_first(sibs))
+		if (!sibs || cpu == cpumask_first(sibs)) {
 			cpumask_set_cpu(cpu, primaries);
+		}
 	}
 
-	/* Compute max capacity among primaries */
+	/* Compute max capacity among primaries (e.g., P-cores vs E-cores). */
 	for_each_cpu(cpu, primaries) {
-		unsigned long cap = topology_get_cpu_scale(cpu);
-		if (cap > max_cap)
+		unsigned long cap = ixgbe_cpu_capacity(cpu);
+		if (cap > max_cap) {
 			max_cap = cap;
+		}
 	}
 
-	/* Select CPUs with capacity <= 3/4 max as E-cores (low capacity) */
+	/* Select CPUs with capacity <= 3/4 max as likely E-cores (lower capacity). */
 	cpumask_clear(eco);
 	if (max_cap) {
 		thr = (max_cap * 3) / 4;
 		for_each_cpu(cpu, primaries) {
-			unsigned long cap = topology_get_cpu_scale(cpu);
-			if (cap <= thr)
+			unsigned long cap = ixgbe_cpu_capacity(cpu);
+			if (cap <= thr) {
 				cpumask_set_cpu(cpu, eco);
+			}
 		}
 	}
 
-	/* Fallbacks */
+	/* Fallbacks for degenerate cases. */
 	if (cpumask_empty(eco)) {
-		if (!cpumask_empty(primaries))
+		if (!cpumask_empty(primaries)) {
 			cpumask_copy(eco, primaries);
-		else
+		} else {
 			cpumask_copy(eco, node_mask);
+		}
 	}
 
 	free_cpumask_var(node_mask);
@@ -3678,29 +3684,34 @@ static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
 	unsigned int ri = 0, ti = 0;
 	int vector, err;
 
-	if (!zalloc_cpumask_var(&eco_mask, GFP_KERNEL))
+	if (!zalloc_cpumask_var(&eco_mask, GFP_KERNEL)) {
 		return -ENOMEM;
+	}
 
-	/* Build E-core friendly hint mask; fallback to online mask if needed */
-	if (ixgbe_build_eco_mask(adapter, eco_mask))
+	/* Build E-core friendly NUMA-local mask; fallback to online CPUs if needed. */
+	if (ixgbe_build_eco_mask(adapter, eco_mask)) {
 		cpumask_copy(eco_mask, cpu_online_mask);
+	}
 
-	/* Queue vectors */
+	/* Request per-queue vectors and set persistent affinity hints. */
 	for (vector = 0; vector < adapter->num_q_vectors; vector++) {
 		struct ixgbe_q_vector *qv = adapter->q_vector[vector];
 		struct msix_entry *entry = &adapter->msix_entries[vector];
 
-		if (!qv)
+		if (!qv) {
 			continue;
+		}
 
-		if (qv->tx.ring && qv->rx.ring)
+		/* Name the IRQ based on rings present; skip unused q_vector. */
+		if (qv->tx.ring && qv->rx.ring) {
 			snprintf(qv->name, sizeof(qv->name), "%s-TxRx-%u", netdev->name, ri++);
-		else if (qv->rx.ring)
+		} else if (qv->rx.ring) {
 			snprintf(qv->name, sizeof(qv->name), "%s-rx-%u", netdev->name, ri++);
-		else if (qv->tx.ring)
+		} else if (qv->tx.ring) {
 			snprintf(qv->name, sizeof(qv->name), "%s-tx-%u", netdev->name, ti++);
-		else
-			continue;
+		} else {
+			continue; /* unused q_vector */
+		}
 
 		err = request_irq(entry->vector, ixgbe_msix_clean_rings, 0, qv->name, qv);
 		if (err) {
@@ -3708,34 +3719,39 @@ static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
 			goto free_queue_irqs;
 		}
 
-		/* Provide a broad E-core hint. Do NOT hard-pin to one CPU. */
+		/* Install a broad E-core hint via a persistent mask on qv. */
 		cpumask_copy(&qv->affinity_mask, eco_mask);
-		irq_set_affinity_hint(entry->vector, &qv->affinity_mask);
+		irq_update_affinity_hint(entry->vector, &qv->affinity_mask);
 	}
 
-	/* "Other causes" vector (the entry after the last queue vector) */
+	/* Request the "other causes" vector AFTER queue vectors.
+	 * We do NOT set an affinity hint here (no persistent per-adapter mask for it).
+	 */
 	err = request_irq(adapter->msix_entries[vector].vector,
 			  ixgbe_msix_other, 0, netdev->name, adapter);
 	if (err) {
 		e_err(probe, "request_irq for msix_other failed: %d\n", err);
 		goto free_queue_irqs;
 	}
-	/* Hint "other" vector to E-cores as well (low rate, but consistent policy) */
-	irq_set_affinity_hint(adapter->msix_entries[vector].vector, eco_mask);
 
 	free_cpumask_var(eco_mask);
 	return 0;
 
 free_queue_irqs:
+	/* Unwind only the queue vectors requested so far (indices [0..vector-1]). */
 	while (vector--) {
-		irq_set_affinity_hint(adapter->msix_entries[vector].vector, NULL);
-		free_irq(adapter->msix_entries[vector].vector, adapter->q_vector[vector]);
+		struct ixgbe_q_vector *qv = adapter->q_vector[vector];
+
+		if (!qv) {
+			continue;
+		}
+
+		/* Clear any installed hint prior to freeing the IRQ. */
+		irq_update_affinity_hint(adapter->msix_entries[vector].vector, NULL);
+		free_irq(adapter->msix_entries[vector].vector, qv);
 	}
+
 	free_cpumask_var(eco_mask);
-	adapter->flags &= ~IXGBE_FLAG_MSIX_ENABLED;
-	pci_disable_msix(adapter->pdev);
-	kfree(adapter->msix_entries);
-	adapter->msix_entries = NULL;
 	return err;
 }
 
@@ -3853,23 +3869,27 @@ static void ixgbe_free_irq(struct ixgbe_adapter *adapter)
 		return;
 	}
 
-	if (!adapter->msix_entries)
+	if (!adapter->msix_entries) {
 		return;
+	}
 
 	for (vector = 0; vector < adapter->num_q_vectors; vector++) {
 		struct ixgbe_q_vector *q_vector = adapter->q_vector[vector];
 		struct msix_entry *entry = &adapter->msix_entries[vector];
 
-		/* free only the irqs that were actually requested */
-		if (!q_vector->rx.ring && !q_vector->tx.ring)
+		/* Free only the IRQs that were actually requested. */
+		if (!q_vector || (!q_vector->rx.ring && !q_vector->tx.ring)) {
 			continue;
+		}
 
-		/* clear the affinity_mask in the IRQ descriptor */
+		/* Clear the affinity hint in the IRQ descriptor before freeing. */
 		irq_update_affinity_hint(entry->vector, NULL);
 
 		free_irq(entry->vector, q_vector);
 	}
 
+	/* Be robust: clear any hint for the "other" vector (harmless if none was set). */
+	irq_update_affinity_hint(adapter->msix_entries[vector].vector, NULL);
 	free_irq(adapter->msix_entries[vector].vector, adapter);
 }
 
