@@ -1,3 +1,424 @@
+--- a/kernel/irq/msi.c	2025-04-26 16:35:23.647821877 +0200
++++ b/kernel/irq/msi.c	2025-08-13 16:48:01.839153108 +0200
+@@ -9,6 +9,7 @@
+  * PCI compatible and non PCI compatible devices.
+  */
+ #include <linux/device.h>
++#include <linux/interrupt.h>
+ #include <linux/irq.h>
+ #include <linux/irqdomain.h>
+ #include <linux/msi.h>
+@@ -164,7 +165,7 @@ int msi_domain_insert_msi_desc(struct de
+ 	return msi_insert_desc(dev, desc, domid, init_desc->msi_index);
+ }
+ 
+-static bool msi_desc_match(struct msi_desc *desc, enum msi_desc_filter filter)
++static __always_inline bool msi_desc_match(struct msi_desc *desc, enum msi_desc_filter filter)
+ {
+ 	switch (filter) {
+ 	case MSI_DESC_ALL:
+@@ -223,6 +224,8 @@ static void msi_domain_free_descs(struct
+  * @domid:	Id of the domain to operate on
+  * @first:	Index to start freeing from (inclusive)
+  * @last:	Last index to be freed (inclusive)
++ *
++ * Note: Caller must hold the MSI descriptor mutex (msi_lock_descs()).
+  */
+ void msi_domain_free_msi_descs_range(struct device *dev, unsigned int domid,
+ 				     unsigned int first, unsigned int last)
+@@ -373,12 +376,31 @@ static struct msi_desc *msi_find_desc(st
+ 				      enum msi_desc_filter filter)
+ {
+ 	struct xarray *xa = &md->__domains[domid].store;
++	unsigned long idx = md->__iter_idx;
+ 	struct msi_desc *desc;
+ 
+-	xa_for_each_start(xa, md->__iter_idx, desc, md->__iter_idx) {
+-		if (msi_desc_match(desc, filter))
++	/* End of iteration is marked by this specific index value. */
++	if (unlikely(idx == MSI_XA_MAX_INDEX)) {
++		return NULL;
++	}
++
++	/*
++	 * Use xa_find in a loop. It starts searching at 'idx' (inclusive).
++	 * On each subsequent iteration, it updates 'idx' to the next candidate
++	 * index, efficiently skipping holes.
++	 */
++	for (desc = xa_find(xa, &idx, MSI_XA_MAX_INDEX, XA_PRESENT);
++	     desc;
++	     desc = xa_find_after(xa, &idx, MSI_XA_MAX_INDEX, XA_PRESENT)) {
++
++		if (msi_desc_match(desc, filter)) {
++			/* Found a match. Store the current index for the next call. */
++			md->__iter_idx = idx;
+ 			return desc;
++		}
+ 	}
++
++	/* No more entries found; invalidate the iterator for future calls. */
+ 	md->__iter_idx = MSI_XA_MAX_INDEX;
+ 	return NULL;
+ }
+@@ -434,7 +456,8 @@ struct msi_desc *msi_next_desc(struct de
+ 
+ 	lockdep_assert_held(&md->mutex);
+ 
+-	if (md->__iter_idx >= (unsigned long)MSI_MAX_INDEX)
++	/* Use the same sentinel as msi_find_desc() to terminate iteration */
++	if (md->__iter_idx == MSI_XA_MAX_INDEX)
+ 		return NULL;
+ 
+ 	md->__iter_idx++;
+@@ -450,36 +473,44 @@ EXPORT_SYMBOL_GPL(msi_next_desc);
+  *
+  * Return: The Linux interrupt number on success (> 0), 0 if not found
+  */
+-unsigned int msi_domain_get_virq(struct device *dev, unsigned int domid, unsigned int index)
++unsigned int __attribute__((hot))
++msi_domain_get_virq(struct device *dev, unsigned int domid, unsigned int index)
+ {
+ 	struct msi_desc *desc;
+-	bool pcimsi = false;
+ 	struct xarray *xa;
++	bool pcimsi = false;
+ 
++	/* Fast reject */
+ 	if (!dev->msi.data)
+ 		return 0;
+ 
++	/* Bounds and domain sanity */
+ 	if (WARN_ON_ONCE(index > MSI_MAX_INDEX || domid >= MSI_MAX_DEVICE_IRQDOMAINS))
+ 		return 0;
+ 
+-	/* This check is only valid for the PCI default MSI domain */
++	/*
++	 * Only the PCI default MSI domain uses the single-descriptor,
++	 * multi-vector (base + index) mapping.
++	 */
+ 	if (dev_is_pci(dev) && domid == MSI_DEFAULT_DOMAIN)
+ 		pcimsi = to_pci_dev(dev)->msi_enabled;
+ 
+ 	guard(msi_descs_lock)(dev);
++
+ 	xa = &dev->msi.data->__domains[domid].store;
++
++	/* MSI-X and non-PCI-MSI: 1:1 mapping at the requested index */
+ 	desc = xa_load(xa, pcimsi ? 0 : index);
+ 	if (desc && desc->irq) {
+-		/*
+-		 * PCI-MSI has only one descriptor for multiple interrupts.
+-		 * PCI-MSIX and platform MSI use a descriptor per
+-		 * interrupt.
+-		 */
+ 		if (!pcimsi)
+ 			return desc->irq;
++
++		/* PCI-MSI: single descriptor, multiple vectors */
+ 		if (index < desc->nvec_used)
+ 			return desc->irq + index;
+ 	}
++
++	/* Not found or not associated */
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(msi_domain_get_virq);
+@@ -661,8 +692,9 @@ static void msi_check_level(struct irq_d
+  *
+  * Return: IRQ_SET_MASK_* result code
+  */
+-int msi_domain_set_affinity(struct irq_data *irq_data,
+-			    const struct cpumask *mask, bool force)
++int __attribute__((hot))
++msi_domain_set_affinity(struct irq_data *irq_data,
++			const struct cpumask *mask, bool force)
+ {
+ 	struct irq_data *parent = irq_data->parent_data;
+ 	struct msi_msg msg[2] = { [1] = { }, };
+@@ -678,8 +710,9 @@ int msi_domain_set_affinity(struct irq_d
+ 	return ret;
+ }
+ 
+-static int msi_domain_activate(struct irq_domain *domain,
+-			       struct irq_data *irq_data, bool early)
++static int __attribute__((hot))
++msi_domain_activate(struct irq_domain *domain,
++		    struct irq_data *irq_data, bool early)
+ {
+ 	struct msi_msg msg[2] = { [1] = { }, };
+ 
+@@ -689,12 +722,11 @@ static int msi_domain_activate(struct ir
+ 	return 0;
+ }
+ 
+-static void msi_domain_deactivate(struct irq_domain *domain,
+-				  struct irq_data *irq_data)
++static void __attribute__((hot))
++msi_domain_deactivate(struct irq_domain *domain, struct irq_data *irq_data)
+ {
+-	struct msi_msg msg[2];
++	struct msi_msg msg[2] = { { 0 }, { 0 } };
+ 
+-	memset(msg, 0, sizeof(msg));
+ 	irq_chip_write_msi_msg(irq_data, msg);
+ }
+ 
+@@ -792,7 +824,7 @@ static irq_hw_number_t msi_domain_ops_ge
+ static int msi_domain_ops_prepare(struct irq_domain *domain, struct device *dev,
+ 				  int nvec, msi_alloc_info_t *arg)
+ {
+-	memset(arg, 0, sizeof(*arg));
++	*arg = (msi_alloc_info_t){ 0 };
+ 	return 0;
+ }
+ 
+@@ -1181,7 +1213,7 @@ static bool msi_check_reservation_mode(s
+ {
+ 	struct msi_desc *desc;
+ 
+-	switch(domain->bus_token) {
++	switch (domain->bus_token) {
+ 	case DOMAIN_BUS_PCI_MSI:
+ 	case DOMAIN_BUS_PCI_DEVICE_MSI:
+ 	case DOMAIN_BUS_PCI_DEVICE_MSIX:
+@@ -1200,15 +1232,18 @@ static bool msi_check_reservation_mode(s
+ 	/*
+ 	 * Checking the first MSI descriptor is sufficient. MSIX supports
+ 	 * masking and MSI does so when the can_mask attribute is set.
++	 * If there is no descriptor yet, reservation mode cannot be safely used.
+ 	 */
+ 	desc = msi_first_desc(dev, MSI_DESC_ALL);
++	if (!desc)
++		return false;
+ 	return desc->pci.msi_attrib.is_msix || desc->pci.msi_attrib.can_mask;
+ }
+ 
+ static int msi_handle_pci_fail(struct irq_domain *domain, struct msi_desc *desc,
+ 			       int allocated)
+ {
+-	switch(domain->bus_token) {
++	switch (domain->bus_token) {
+ 	case DOMAIN_BUS_PCI_MSI:
+ 	case DOMAIN_BUS_PCI_DEVICE_MSI:
+ 	case DOMAIN_BUS_PCI_DEVICE_MSIX:
+@@ -1250,9 +1285,9 @@ static int msi_init_virq(struct irq_doma
+ 		    irqd_affinity_is_managed(irqd) &&
+ 		    !cpumask_intersects(irq_data_get_affinity_mask(irqd),
+ 					cpu_online_mask)) {
+-			    irqd_set_managed_shutdown(irqd);
+-			    return 0;
+-		    }
++			irqd_set_managed_shutdown(irqd);
++			return 0;
++		}
+ 	}
+ 
+ 	if (!(vflags & VIRQ_ACTIVATE))
+@@ -1288,70 +1323,129 @@ static int populate_alloc_info(struct ir
+ 	return 0;
+ }
+ 
+-static int __msi_domain_alloc_irqs(struct device *dev, struct irq_domain *domain,
+-				   struct msi_ctrl *ctrl)
++static int __attribute__((hot))
++__msi_domain_alloc_irqs(struct device *dev,
++			struct irq_domain *domain,
++			struct msi_ctrl *ctrl)
+ {
+ 	struct xarray *xa = &dev->msi.data->__domains[ctrl->domid].store;
+ 	struct msi_domain_info *info = domain->host_data;
+ 	struct msi_domain_ops *ops = info->ops;
+-	unsigned int vflags = 0, allocated = 0;
+-	msi_alloc_info_t arg = { };
++	unsigned int vflags = 0;
++	unsigned int allocated_vectors = 0;
++	unsigned int allocated_descs = 0;
++	msi_alloc_info_t arg = (msi_alloc_info_t){ 0 };
+ 	struct msi_desc *desc;
+ 	unsigned long idx;
+-	int i, ret, virq;
++	int ret;
+ 
+ 	ret = populate_alloc_info(domain, dev, ctrl->nirqs, &arg);
+ 	if (ret)
+ 		return ret;
+ 
+-	/*
+-	 * This flag is set by the PCI layer as we need to activate
+-	 * the MSI entries before the PCI layer enables MSI in the
+-	 * card. Otherwise the card latches a random msi message.
+-	 */
++	if (!ctrl->nirqs)
++		return 0;
++
+ 	if (info->flags & MSI_FLAG_ACTIVATE_EARLY)
+ 		vflags |= VIRQ_ACTIVATE;
+ 
+-	/*
+-	 * Interrupt can use a reserved vector and will not occupy
+-	 * a real device vector until the interrupt is requested.
+-	 */
+ 	if (msi_check_reservation_mode(domain, info, dev))
+ 		vflags |= VIRQ_CAN_RESERVE;
+ 
+ 	xa_for_each_range(xa, idx, desc, ctrl->first, ctrl->last) {
+-		if (!msi_desc_match(desc, MSI_DESC_NOTASSOCIATED))
++		int i, virq, nvec;
++
++		if (unlikely(!msi_desc_match(desc, MSI_DESC_NOTASSOCIATED)))
+ 			continue;
+ 
+-		/* This should return -ECONFUSED... */
+-		if (WARN_ON_ONCE(allocated >= ctrl->nirqs))
++		/* Guard against exceeding requested vector count */
++		if (WARN_ON_ONCE(allocated_vectors >= ctrl->nirqs))
+ 			return -EINVAL;
+ 
++		/* Allow provider hook to prepare alloc info (including custom hwirq) */
+ 		if (ops->prepare_desc)
+ 			ops->prepare_desc(domain, &arg, desc);
+ 
++		/*
++		 * Default hwirq assignment only if the provider uses the default
++		 * get_hwirq() and did not specify a hardware IRQ in arg:
++		 * treat arg.hwirq == 0 as "unspecified".
++		 */
++		if (ops->get_hwirq == msi_domain_ops_default.get_hwirq && arg.hwirq == 0)
++			arg.hwirq = (irq_hw_number_t)idx;
++
+ 		ops->set_desc(&arg, desc);
+ 
+-		virq = __irq_domain_alloc_irqs(domain, -1, desc->nvec_used,
++		nvec = desc->nvec_used;
++
++		/* Allocation-phase: __irq_domain_alloc_irqs() can fail (before any init) */
++		virq = __irq_domain_alloc_irqs(domain, -1, nvec,
+ 					       dev_to_node(dev), &arg, false,
+ 					       desc->affinity);
+ 		if (virq < 0)
+-			return msi_handle_pci_fail(domain, desc, allocated);
++			return msi_handle_pci_fail(domain, desc, allocated_descs);
+ 
+-		for (i = 0; i < desc->nvec_used; i++) {
++		/* Initialize each allocated IRQ and associate it with desc */
++		for (i = 0; i < nvec; i++) {
+ 			irq_set_msi_desc_off(virq, i, desc);
+ 			irq_debugfs_copy_devname(virq + i, dev);
+ 			ret = msi_init_virq(domain, virq + i, vflags);
+-			if (ret)
++			if (ret) {
++				/* Roll back initialization and allocation for this descriptor */
++				while (--i >= 0) {
++					struct irq_data *irqd =
++						irq_domain_get_irq_data(domain, virq + i);
++					if (irqd && irqd_is_activated(irqd))
++						irq_domain_deactivate_irq(irqd);
++				}
++				irq_domain_free_irqs(virq, nvec);
++				desc->irq = 0;
+ 				return ret;
++			}
+ 		}
++
++		/* Optional sysfs per-descriptor exposure */
+ 		if (info->flags & MSI_FLAG_DEV_SYSFS) {
+ 			ret = msi_sysfs_populate_desc(dev, desc);
+-			if (ret)
++			if (ret) {
++				/* Roll back sysfs and IRQs */
++				msi_sysfs_remove_desc(dev, desc);
++				for (i = 0; i < nvec; i++) {
++					struct irq_data *irqd =
++						irq_domain_get_irq_data(domain, virq + i);
++					if (irqd && irqd_is_activated(irqd))
++						irq_domain_deactivate_irq(irqd);
++				}
++				irq_domain_free_irqs(virq, nvec);
++				desc->irq = 0;
+ 				return ret;
++			}
++		}
++
++#ifdef CONFIG_SMP
++		/*
++		 * PERFORMANCE: Install per-vector affinity hints, if provided.
++		 * Non-binding; helps policy/irqbalance keep MSI-X vectors spread as
++		 * intended to reduce contention with latency-sensitive threads.
++		 */
++		if (desc->affinity) {
++			for (i = 0; i < nvec; i++) {
++				const struct cpumask *mask = &desc->affinity[i].mask;
++
++				if (mask)
++					irq_set_affinity_hint(virq + i, mask);
++			}
+ 		}
+-		allocated++;
++#endif
++
++		allocated_vectors += (unsigned int)nvec;
++		allocated_descs++;
++
++		/* Stop once the request is satisfied */
++		if (allocated_vectors >= ctrl->nirqs)
++			break;
+ 	}
++
+ 	return 0;
+ }
+ 
+@@ -1422,7 +1516,8 @@ int msi_domain_alloc_irqs_range_locked(s
+ 		.domid	= domid,
+ 		.first	= first,
+ 		.last	= last,
+-		.nirqs	= last + 1 - first,
++		/* Avoid unsigned underflow on invalid ranges; validation will fail later */
++		.nirqs	= (last >= first) ? (last - first + 1) : 0,
+ 	};
+ 
+ 	return msi_domain_alloc_locked(dev, &ctrl);
+@@ -1441,7 +1536,6 @@ int msi_domain_alloc_irqs_range_locked(s
+ int msi_domain_alloc_irqs_range(struct device *dev, unsigned int domid,
+ 				unsigned int first, unsigned int last)
+ {
+-
+ 	guard(msi_descs_lock)(dev);
+ 	return msi_domain_alloc_irqs_range_locked(dev, domid, first, last);
+ }
+@@ -1608,16 +1702,21 @@ static void __msi_domain_free_irqs(struc
+ 		if (!msi_desc_match(desc, MSI_DESC_ASSOCIATED))
+ 			continue;
+ 
+-		/* Make sure all interrupts are deactivated */
++		/* Deactivate and free all vectors; clear affinity hints first */
+ 		for (i = 0; i < desc->nvec_used; i++) {
++#ifdef CONFIG_SMP
++			irq_set_affinity_hint(desc->irq + i, NULL);
++#endif
+ 			irqd = irq_domain_get_irq_data(domain, desc->irq + i);
+ 			if (irqd && irqd_is_activated(irqd))
+ 				irq_domain_deactivate_irq(irqd);
+ 		}
+ 
+ 		irq_domain_free_irqs(desc->irq, desc->nvec_used);
++
+ 		if (info->flags & MSI_FLAG_DEV_SYSFS)
+ 			msi_sysfs_remove_desc(dev, desc);
++
+ 		desc->irq = 0;
+ 	}
+ }
+@@ -1685,7 +1784,7 @@ void msi_domain_free_irqs_range(struct d
+ 	guard(msi_descs_lock)(dev);
+ 	msi_domain_free_irqs_range_locked(dev, domid, first, last);
+ }
+-EXPORT_SYMBOL_GPL(msi_domain_free_irqs_all);
++EXPORT_SYMBOL_GPL(msi_domain_free_irqs_range);
+ 
+ /**
+  * msi_domain_free_irqs_all_locked - Free all interrupts from a MSI interrupt domain
+
+
 --- a/include/linux/sched.h
 +++ b/include/linux/sched.h
 @@ -686,6 +686,9 @@ struct sched_dl_entity {
@@ -1380,15 +1801,15 @@
 -		rx_ring->rx_stats.alloc_rx_page_failed++;
 -		return false;
 -	}
--
++    struct page *page = bi->page;
++    dma_addr_t dma;
+ 
 -	/* map page for use */
 -	dma = dma_map_page_attrs(rx_ring->dev, page, 0,
 -				 ixgbe_rx_pg_size(rx_ring),
 -				 DMA_FROM_DEVICE,
 -				 IXGBE_RX_DMA_ATTR);
-+    struct page *page = bi->page;
-+    dma_addr_t dma;
- 
+-
 -	/*
 -	 * if mapping failed free memory back to system since
 -	 * there isn't much point in holding memory we can't use
@@ -1650,12 +2071,12 @@
  
 -	ixgbe_set_rsc_gso_size(rx_ring, skb);
 +	ixgbe_set_rsc_gso_size(rx_ring, skb, rx_desc);
++
++	IXGBE_CB(skb)->append_cnt = 0;  /* always clear last */
++}
  
 -	/* gso_size is computed using append_cnt so always clear it last */
 -	IXGBE_CB(skb)->append_cnt = 0;
-+	IXGBE_CB(skb)->append_cnt = 0;  /* always clear last */
-+}
-+
 +/* Initialize FDIR for Gaming ATR: perfect match on UDP destination port only.
 + * Minimal-invasive: no new adapter state, no new locks; uses existing fdir_perfect_lock.
 + * Safe on: 82599/X540/X550 families. No effect on 82598.
@@ -1775,7 +2196,7 @@
  
 -void ixgbe_rx_skb(struct ixgbe_q_vector *q_vector,
 -		  struct sk_buff *skb)
-+/* Tiny UDP detection for low-latency bypass of GRO */
++/* Detect tiny UDP frames for direct, low-latency delivery (bypass GRO). */
 +static __always_inline bool ixgbe_is_tiny_udp(const struct sk_buff *skb)
  {
 -	napi_gro_receive(&q_vector->napi, skb);
@@ -1792,7 +2213,7 @@
 +    return false;
 +}
 +
-+/* Low-latency RX handoff: direct deliver tiny UDP, GRO default otherwise */
++/* Low-latency receive handoff: direct deliver tiny UDP, default GRO otherwise. */
 +void ixgbe_rx_skb(struct ixgbe_q_vector *q_vector, struct sk_buff *skb)
 +{
 +    if (likely(ixgbe_is_tiny_udp(skb))) {
@@ -2323,7 +2744,7 @@
 +    unsigned int bytes = rc->total_bytes;
 +    unsigned int usecs;
 +    unsigned long now = jiffies;
-+    /* EITR is in 2us units; we mask the low 16 bits to keep just value bits. */
++    /* EITR register: low 16 bits hold 2us units; mask & >>2 to get microseconds. */
 +    unsigned int cur_usecs = ((qv->itr & 0xFFFFu) >> 2);
 +
 +    if (unlikely(!rc->ring)) {
@@ -2332,38 +2753,38 @@
 +        return;
 +    }
 +
++    /* Avoid over-updating inside same jiffy; leave NAPI to run. */
 +    if (time_before(now, rc->next_update)) {
 +        rc->total_packets = 0;
 +        rc->total_bytes = 0;
 +        return;
 +    }
 +
-+    /* 1) Tiny microbursts: deliver ASAP */
++    /* 1) Tiny microbursts: immediate interrupt for minimum latency. */
 +    if (pkts > 0 && pkts <= 16) {
 +        usecs = 0;
 +        goto out;
 +    }
 +
-+    /* 2) Small bursts of small packets: 4us interrupt delay */
-+    if (pkts > 0 && pkts <= 64 && bytes <= (pkts << 8)) {
++    /* 2) Small bursts of tiny packets: very low ITR (4us). */
++    if (pkts > 0 && pkts <= 64 && bytes <= (pkts << 8)) { /* mean <= 256 bytes */
 +        usecs = 4;
 +        goto out;
 +    }
 +
-+    /* 3) Idle: gently increase interrupt delay to reduce background interrupts */
++    /* 3) Idle: gently increase interrupt delay to reduce background interrupts. */
 +    if (!pkts) {
 +        unsigned int bumped = cur_usecs + 200U;
-+        if (bumped < cur_usecs) {
-+            bumped = cur_usecs; /* overflow guard */
-+        }
-+        usecs = min(bumped, 20000U);
++        if (bumped < cur_usecs) /* overflow guard */
++            bumped = cur_usecs;
++        usecs = min(bumped, 20000U); /* cap to 20ms */
 +        goto out;
 +    }
 +
-+    /* 4) Bulk traffic: proportional to average size; stable and bounded */
++    /* 4) Bulk traffic: proportional to average size; stable and bounded. */
 +    {
-+        unsigned int avg = bytes / pkts;     /* pkts > 0 by construction */
-+        unsigned int calc = avg / 3 + 1000;  /* base ~1ms, scaled by size */
++        unsigned int avg = bytes / pkts;    /* pkts > 0 by construction */
++        unsigned int calc = avg / 3 + 1000; /* base ~1ms, reduced for small frames */
 +        if (calc < 4) {
 +            calc = 4;
 +        } else if (calc > 32256) {
@@ -2376,7 +2797,7 @@
 -	ring_container->total_packets = 0;
 +out:
 +    rc->itr = usecs;                 /* store microseconds only */
-+    rc->next_update = now + 1UL;     /* next update in ~1 jiffy */
++    rc->next_update = now + 1UL;     /* next update after ~1 jiffy */
 +    rc->total_packets = 0;
 +    rc->total_bytes = 0;
  }
@@ -2415,7 +2836,7 @@
  		break;
  	default:
  		break;
-@@ -2771,26 +2880,33 @@ void ixgbe_write_eitr(struct ixgbe_q_vec
+@@ -2771,26 +2880,32 @@ void ixgbe_write_eitr(struct ixgbe_q_vec
  	IXGBE_WRITE_REG(hw, IXGBE_EITR(v_idx), itr_reg);
  }
  
@@ -2443,27 +2864,26 @@
 +    } else if (rx_us) {
 +        min_us = rx_us;
 +    } else {
-+        min_us = tx_us; /* possibly 0 */
++        min_us = tx_us; /* could be 0 - immediate interrupts */
 +    }
  
 -	if (new_itr != q_vector->itr) {
 -		/* save the algorithm value here */
 -		q_vector->itr = new_itr;
-+    /* Convert microseconds to EITR (2us units); set WDIS to avoid timer re-arm stalls. */
++    /* Convert microseconds to EITR (2us units), keep low 16 bits, set WDIS. */
 +    hw_eitr = ((min_us & 0xFFFFu) << 2) | IXGBE_EITR_CNT_WDIS;
  
 -		ixgbe_write_eitr(q_vector);
 -	}
-+    if (unlikely(hw_eitr == qv->itr)) {
++    if (unlikely(hw_eitr == qv->itr))
 +        return;
-+    }
 +
 +    qv->itr = hw_eitr;
 +    ixgbe_write_eitr(qv);
  }
  
  /**
-@@ -3466,74 +3582,183 @@ int ixgbe_poll(struct napi_struct *napi,
+@@ -3466,74 +3581,173 @@ int ixgbe_poll(struct napi_struct *napi,
  	return min(work_done, budget - 1);
  }
  
@@ -2497,7 +2917,7 @@
 +	return topology_get_cpu_scale(cpu);
 +}
 +
-+/* Build preferred CPU mask: NUMA-local ∩ primary SMT ∩ top-capacity CPUs (P-cores) */
++/* Build preferred CPU mask: NUMA-local ∩ primary SMT ∩ top-capacity CPUs (P-cores). */
 +static int ixgbe_build_performance_mask(struct ixgbe_adapter *adapter,
 +                                        cpumask_var_t pref)
 +{
@@ -2518,50 +2938,45 @@
 +    node = dev_to_node(&adapter->pdev->dev);
 +    if (node != NUMA_NO_NODE) {
 +        cpumask_copy(node_mask, cpumask_of_node(node));
-+        if (cpumask_empty(node_mask)) {
++        if (cpumask_empty(node_mask))
 +            cpumask_copy(node_mask, cpu_online_mask);
-+        }
 +    } else {
 +        cpumask_copy(node_mask, cpu_online_mask);
 +    }
 +
-+    /* Keep only primary SMT threads to avoid HT contention on the same core. */
++    /* Keep only primary SMT threads to avoid hyperthread contention. */
 +    cpumask_clear(primaries);
 +    for_each_cpu(cpu, node_mask) {
 +        const struct cpumask *sibs = topology_sibling_cpumask(cpu);
-+        if (!sibs || cpu == cpumask_first(sibs)) {
++        if (!sibs || cpu == cpumask_first(sibs))
 +            cpumask_set_cpu(cpu, primaries);
-+        }
 +    }
 +
-+    /* Among primaries, retain CPUs near the max capacity (P-cores on hybrid). */
++    /* Compute max capacity and keep CPUs within ~12.5% of it (P-cores). */
 +    for_each_cpu(cpu, primaries) {
 +        unsigned long cap = topology_get_cpu_scale(cpu);
-+        if (cap > max_cap) {
++        if (cap > max_cap)
 +            max_cap = cap;
-+        }
 +    }
 +
 +    {
-+        unsigned long thr = (max_cap * 7) / 8; /* top ~12.5% */
++        unsigned long thr = (max_cap * 7) / 8;
 +        cpumask_clear(top);
 +        for_each_cpu(cpu, primaries) {
 +            unsigned long cap = topology_get_cpu_scale(cpu);
-+            if (cap >= thr) {
++            if (cap >= thr)
 +                cpumask_set_cpu(cpu, top);
-+            }
 +        }
 +    }
 +
-+    if (!cpumask_empty(top)) {
++    if (!cpumask_empty(top))
 +        cpumask_copy(pref, top);
-+    } else if (!cpumask_empty(primaries)) {
++    else if (!cpumask_empty(primaries))
 +        cpumask_copy(pref, primaries);
-+    } else if (!cpumask_empty(node_mask)) {
++    else if (!cpumask_empty(node_mask))
 +        cpumask_copy(pref, node_mask);
-+    } else {
++    else
 +        cpumask_copy(pref, cpu_online_mask);
-+    }
 +
 +    free_cpumask_var(node_mask);
 +    free_cpumask_var(primaries);
@@ -2569,7 +2984,7 @@
 +    return 0;
 +}
 +
-+/* Request MSI-X vectors and set per-vector affinity hints to preferred CPUs */
++/* Request MSI-X IRQs and set per-vector affinity hints to preferred CPUs. */
  static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
  {
 -	struct net_device *netdev = adapter->netdev;
@@ -2579,7 +2994,66 @@
 -	for (vector = 0; vector < adapter->num_q_vectors; vector++) {
 -		struct ixgbe_q_vector *q_vector = adapter->q_vector[vector];
 -		struct msix_entry *entry = &adapter->msix_entries[vector];
--
++    struct net_device *netdev = adapter->netdev;
++    unsigned int ri = 0, ti = 0;
++    cpumask_var_t pref_mask;
++    unsigned int pick;
++    int vector, err;
++
++    if (!zalloc_cpumask_var(&pref_mask, GFP_KERNEL))
++        return -ENOMEM;
++
++    if (ixgbe_build_performance_mask(adapter, pref_mask))
++        cpumask_copy(pref_mask, cpu_online_mask);
++
++    pick = cpumask_first(pref_mask);
++    if (pick >= nr_cpu_ids)
++        pick = 0;
++
++    for (vector = 0; vector < adapter->num_q_vectors; vector++) {
++        struct ixgbe_q_vector *qv = adapter->q_vector[vector];
++        struct msix_entry *entry = &adapter->msix_entries[vector];
++        cpumask_t one;
++
++        if (!qv)
++            continue;
++
++        if (qv->tx.ring && qv->rx.ring) {
++            snprintf(qv->name, sizeof(qv->name), "%s-TxRx-%u", netdev->name, ri++);
++            ti++;
++        } else if (qv->rx.ring) {
++            snprintf(qv->name, sizeof(qv->name), "%s-rx-%u", netdev->name, ri++);
++        } else if (qv->tx.ring) {
++            snprintf(qv->name, sizeof(qv->name), "%s-tx-%u", netdev->name, ti++);
++        } else {
++            continue; /* unused q_vector */
++        }
++
++        err = request_irq(entry->vector, ixgbe_msix_clean_rings, 0, qv->name, qv);
++        if (err) {
++            e_err(probe, "request_irq failed for MSIx vector %d: %d\n", vector, err);
++            goto free_queue_irqs;
++        }
++
++        /* Pin each vector to one CPU (hint), spreading across preferred mask. */
++        cpumask_clear(&one);
++        cpumask_set_cpu(pick, &one);
++        cpumask_copy(&qv->affinity_mask, &one);
++        irq_set_affinity_hint(entry->vector, &qv->affinity_mask);
++
++        /* Move to next preferred CPU, wrap if needed. */
++        pick = cpumask_next(pick, pref_mask);
++        if (pick >= nr_cpu_ids)
++            pick = cpumask_first(pref_mask);
++    }
++
++    err = request_irq(adapter->msix_entries[vector].vector,
++                      ixgbe_msix_other, 0, netdev->name, adapter);
++    if (err) {
++        e_err(probe, "request_irq for msix_other failed: %d\n", err);
++        goto free_queue_irqs;
++    }
+ 
 -		if (q_vector->tx.ring && q_vector->rx.ring) {
 -			snprintf(q_vector->name, sizeof(q_vector->name),
 -				 "%s-TxRx-%u", netdev->name, ri++);
@@ -2608,71 +3082,7 @@
 -						 &q_vector->affinity_mask);
 -		}
 -	}
-+    struct net_device *netdev = adapter->netdev;
-+    unsigned int ri = 0, ti = 0;
-+    cpumask_var_t pref_mask;
-+    unsigned int pick;
-+    int vector, err;
-+
-+    if (!zalloc_cpumask_var(&pref_mask, GFP_KERNEL)) {
-+        return -ENOMEM;
-+    }
-+
-+    if (ixgbe_build_performance_mask(adapter, pref_mask)) {
-+        cpumask_copy(pref_mask, cpu_online_mask);
-+    }
-+
-+    pick = cpumask_first(pref_mask);
-+    if (pick >= nr_cpu_ids) {
-+        pick = 0;
-+    }
-+
-+    for (vector = 0; vector < adapter->num_q_vectors; vector++) {
-+        struct ixgbe_q_vector *qv = adapter->q_vector[vector];
-+        struct msix_entry *entry = &adapter->msix_entries[vector];
-+        cpumask_t one;
-+
-+        if (!qv) {
-+            continue;
-+        }
-+
-+        if (qv->tx.ring && qv->rx.ring) {
-+            snprintf(qv->name, sizeof(qv->name), "%s-TxRx-%u", netdev->name, ri++);
-+            ti++;
-+        } else if (qv->rx.ring) {
-+            snprintf(qv->name, sizeof(qv->name), "%s-rx-%u", netdev->name, ri++);
-+        } else if (qv->tx.ring) {
-+            snprintf(qv->name, sizeof(qv->name), "%s-tx-%u", netdev->name, ti++);
-+        } else {
-+            continue; /* unused q_vector */
-+        }
-+
-+        err = request_irq(entry->vector, ixgbe_msix_clean_rings, 0, qv->name, qv);
-+        if (err) {
-+            e_err(probe, "request_irq failed for MSIx vector %d: %d\n", vector, err);
-+            goto free_queue_irqs;
-+        }
-+
-+        /* Pin each vector to one CPU (hint), spreading across preferred mask. */
-+        cpumask_clear(&one);
-+        cpumask_set_cpu(pick, &one);
-+        cpumask_copy(&qv->affinity_mask, &one);
-+        irq_set_affinity_hint(entry->vector, &qv->affinity_mask);
-+
-+        /* Move to next preferred CPU, wrap if needed. */
-+        pick = cpumask_next(pick, pref_mask);
-+        if (pick >= nr_cpu_ids) {
-+            pick = cpumask_first(pref_mask);
-+        }
-+    }
-+
-+    err = request_irq(adapter->msix_entries[vector].vector,
-+                      ixgbe_msix_other, 0, netdev->name, adapter);
-+    if (err) {
-+        e_err(probe, "request_irq for msix_other failed: %d\n", err);
-+        goto free_queue_irqs;
-+    }
- 
+-
 -	err = request_irq(adapter->msix_entries[vector].vector,
 -			  ixgbe_msix_other, 0, netdev->name, adapter);
 -	if (err) {
@@ -2710,7 +3120,7 @@
  }
  
  /**
-@@ -4321,14 +4546,15 @@ void ixgbe_configure_rx_ring(struct ixgb
+@@ -4321,14 +4535,15 @@ void ixgbe_configure_rx_ring(struct ixgb
  			     struct ixgbe_ring *ring)
  {
  	struct ixgbe_hw *hw = &adapter->hw;
@@ -2729,7 +3139,7 @@
  		WARN_ON(xdp_rxq_info_reg_mem_model(&ring->xdp_rxq,
  						   MEM_TYPE_XSK_BUFF_POOL,
  						   NULL));
-@@ -4338,84 +4564,91 @@ void ixgbe_configure_rx_ring(struct ixgb
+@@ -4338,84 +4553,91 @@ void ixgbe_configure_rx_ring(struct ixgb
  						   MEM_TYPE_PAGE_SHARED, NULL));
  	}
  
@@ -2866,7 +3276,7 @@
  }
  
  static void ixgbe_setup_psrtype(struct ixgbe_adapter *adapter)
-@@ -5700,6 +5933,9 @@ static void ixgbe_configure_dfwd(struct
+@@ -5700,6 +5922,9 @@ static void ixgbe_configure_dfwd(struct
  static void ixgbe_configure(struct ixgbe_adapter *adapter)
  {
  	struct ixgbe_hw *hw = &adapter->hw;
@@ -2876,7 +3286,7 @@
  
  	ixgbe_configure_pb(adapter);
  #ifdef CONFIG_IXGBE_DCB
-@@ -7883,95 +8119,298 @@ static void ixgbe_update_default_up(stru
+@@ -7883,95 +8108,298 @@ static void ixgbe_update_default_up(stru
  #endif
  }
  
@@ -3260,7 +3670,7 @@
  }
  
  /**
-@@ -8675,10 +9114,12 @@ no_csum:
+@@ -8675,10 +9103,12 @@ no_csum:
  	ixgbe_tx_ctxtdesc(tx_ring, vlan_macip_lens, fceof_saidx, type_tucmd, 0);
  }
  
@@ -3276,35 +3686,37 @@
  
  static u32 ixgbe_tx_cmd_type(struct sk_buff *skb, u32 tx_flags)
  {
-@@ -8736,14 +9177,22 @@ static void ixgbe_tx_olinfo_status(union
+@@ -8736,14 +9166,23 @@ static void ixgbe_tx_olinfo_status(union
  	tx_desc->read.olinfo_status = cpu_to_le32(olinfo_status);
  }
  
 -static int __ixgbe_maybe_stop_tx(struct ixgbe_ring *tx_ring, u16 size)
-+static int __ixgbe_maybe_stop_tx(struct ixgbe_ring *tx_ring, u16 need)
++static int __ixgbe_maybe_stop_tx(struct ixgbe_ring *tx_ring, u16 needed)
  {
 -	if (!netif_subqueue_try_stop(tx_ring->netdev, tx_ring->queue_index,
 -				     ixgbe_desc_unused(tx_ring), size))
-+	/* Fast path: enough descriptors available */
-+	if (likely(ixgbe_desc_unused(tx_ring) >= need))
-+		return 0;
-+
-+	/* Try to stop this subqueue; if we did, report busy */
-+	if (netif_subqueue_try_stop(tx_ring->netdev,
-+				    tx_ring->queue_index,
-+				    ixgbe_desc_unused(tx_ring), need)) {
-+		tx_ring->tx_stats.restart_queue++;
- 		return -EBUSY;
-+	}
+-		return -EBUSY;
++    unsigned int free = ixgbe_desc_unused(tx_ring);
  
 -	++tx_ring->tx_stats.restart_queue;
 -	return 0;
-+	/* Another CPU already stopped it; we are busy */
-+	return -EBUSY;
++    if (likely(free >= needed))
++        return 0;
++
++    /* Try to stop; if we fail to stop (another CPU raced), tell caller busy */
++    if (unlikely(!netif_subqueue_try_stop(tx_ring->netdev,
++                                          tx_ring->queue_index,
++                                          free, needed)))
++        return -EBUSY;
++
++    tx_ring->tx_stats.restart_queue++;
++    /* Make sure the stop is visible before the next wakeup */
++    smp_mb();
++    return 0;
  }
  
  static inline int ixgbe_maybe_stop_tx(struct ixgbe_ring *tx_ring, u16 size)
-@@ -8754,158 +9203,201 @@ static inline int ixgbe_maybe_stop_tx(st
+@@ -8754,158 +9193,210 @@ static inline int ixgbe_maybe_stop_tx(st
  	return __ixgbe_maybe_stop_tx(tx_ring, size);
  }
  
@@ -3327,33 +3739,23 @@
 +                        struct ixgbe_tx_buffer *first,
 +                        const u8 hdr_len)
  {
- 	struct sk_buff *skb = first->skb;
+-	struct sk_buff *skb = first->skb;
 -	struct ixgbe_tx_buffer *tx_buffer;
 -	union ixgbe_adv_tx_desc *tx_desc;
 -	skb_frag_t *frag;
-+	union ixgbe_adv_tx_desc *txd;
-+	struct ixgbe_tx_buffer *txb;
- 	dma_addr_t dma;
+-	dma_addr_t dma;
 -	unsigned int data_len, size;
 -	u32 tx_flags = first->tx_flags;
 -	u32 cmd_type = ixgbe_tx_cmd_type(skb, tx_flags);
-+	u32 cmd_base;
-+	unsigned int seg_len;
- 	u16 i = tx_ring->next_to_use;
-+	u16 first_idx = i, last_idx = i;
-+	unsigned int frag_idx;
- 
+-	u16 i = tx_ring->next_to_use;
+-
 -	tx_desc = IXGBE_TX_DESC(tx_ring, i);
-+	cmd_base = ixgbe_tx_cmd_type(skb, first->tx_flags);
- 
+-
 -	ixgbe_tx_olinfo_status(tx_desc, tx_flags, skb->len - hdr_len);
-+	txd = IXGBE_TX_DESC(tx_ring, i);
-+	txb = first;
- 
+-
 -	size = skb_headlen(skb);
 -	data_len = skb->data_len;
-+	ixgbe_tx_olinfo_status(txd, first->tx_flags, skb->len - hdr_len);
- 
+-
 -#ifdef IXGBE_FCOE
 -	if (tx_flags & IXGBE_TX_FLAGS_FCOE) {
 -		if (data_len < sizeof(struct fcoe_crc_eof)) {
@@ -3363,28 +3765,16 @@
 -			data_len -= sizeof(struct fcoe_crc_eof);
 -		}
 -	}
-+	/* Map linear head */
-+	seg_len = skb_headlen(skb);
-+	if (seg_len) {
-+		dma = ixgbe_dma_map_single(tx_ring->dev, skb->data, seg_len, DMA_TO_DEVICE);
-+		if (unlikely(dma_mapping_error(tx_ring->dev, dma)))
-+			goto dma_err;
- 
+-
 -#endif
 -	dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
-+		dma_unmap_len_set(txb, len, seg_len);
-+		dma_unmap_addr_set(txb, dma, dma);
- 
+-
 -	tx_buffer = first;
-+		while (true) {
-+			u32 dlen = min_t(u32, seg_len, IXGBE_MAX_DATA_PER_TXD);
- 
+-
 -	for (frag = &skb_shinfo(skb)->frags[0];; frag++) {
 -		if (dma_mapping_error(tx_ring->dev, dma))
 -			goto dma_error;
-+			txd->read.buffer_addr  = cpu_to_le64(dma);
-+			txd->read.cmd_type_len = cpu_to_le32(cmd_base | dlen);
- 
+-
 -		/* record length, and DMA address */
 -		dma_unmap_len_set(tx_buffer, len, size);
 -		dma_unmap_addr_set(tx_buffer, dma, dma);
@@ -3394,115 +3784,58 @@
 -		while (unlikely(size > IXGBE_MAX_DATA_PER_TXD)) {
 -			tx_desc->read.cmd_type_len =
 -				cpu_to_le32(cmd_type ^ IXGBE_MAX_DATA_PER_TXD);
-+			last_idx = i;
-+			seg_len -= dlen;
-+			if (!seg_len)
-+				break;
- 
-+			dma += dlen;
- 			i++;
+-
+-			i++;
 -			tx_desc++;
 -			if (i == tx_ring->count) {
 -				tx_desc = IXGBE_TX_DESC(tx_ring, 0);
-+			if (unlikely(i == tx_ring->count))
- 				i = 0;
+-				i = 0;
 -			}
 -			tx_desc->read.olinfo_status = 0;
 -
 -			dma += IXGBE_MAX_DATA_PER_TXD;
 -			size -= IXGBE_MAX_DATA_PER_TXD;
- 
+-
 -			tx_desc->read.buffer_addr = cpu_to_le64(dma);
-+			txd = IXGBE_TX_DESC(tx_ring, i);
-+			txb = &tx_ring->tx_buffer_info[i];
-+			*txb = (struct ixgbe_tx_buffer){ 0 };
-+			txd->read.olinfo_status = 0;
- 		}
-+	}
- 
+-		}
+-
 -		if (likely(!data_len))
 -			break;
-+	/* Map frags */
-+	for (frag_idx = 0; frag_idx < skb_shinfo(skb)->nr_frags; frag_idx++) {
-+		skb_frag_t *frag = &skb_shinfo(skb)->frags[frag_idx];
- 
+-
 -		tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type ^ size);
-+		seg_len = skb_frag_size(frag);
- 
- 		i++;
+-
+-		i++;
 -		tx_desc++;
 -		if (i == tx_ring->count) {
 -			tx_desc = IXGBE_TX_DESC(tx_ring, 0);
-+		if (unlikely(i == tx_ring->count))
- 			i = 0;
+-			i = 0;
 -		}
 -		tx_desc->read.olinfo_status = 0;
- 
+-
 -#ifdef IXGBE_FCOE
 -		size = min_t(unsigned int, data_len, skb_frag_size(frag));
 -#else
 -		size = skb_frag_size(frag);
 -#endif
 -		data_len -= size;
-+		txd = IXGBE_TX_DESC(tx_ring, i);
-+		txb = &tx_ring->tx_buffer_info[i];
-+		*txb = (struct ixgbe_tx_buffer){ 0 };
-+		txd->read.olinfo_status = 0;
-+
-+		dma = ixgbe_dma_map_page(tx_ring->dev, skb_frag_page(frag),
-+					 skb_frag_off(frag), seg_len, DMA_TO_DEVICE);
-+		if (unlikely(dma_mapping_error(tx_ring->dev, dma)))
-+			goto dma_err;
-+
-+		dma_unmap_len_set(txb, len, seg_len);
-+		dma_unmap_addr_set(txb, dma, dma);
-+
-+		while (true) {
-+			u32 dlen = min_t(u32, seg_len, IXGBE_MAX_DATA_PER_TXD);
-+
-+			txd->read.buffer_addr  = cpu_to_le64(dma);
-+			txd->read.cmd_type_len = cpu_to_le32(cmd_base | dlen);
-+
-+			last_idx = i;
-+			seg_len -= dlen;
-+			if (!seg_len)
-+				break;
- 
+-
 -		dma = skb_frag_dma_map(tx_ring->dev, frag, 0, size,
 -				       DMA_TO_DEVICE);
-+			dma += dlen;
-+			i++;
-+			if (unlikely(i == tx_ring->count))
-+				i = 0;
- 
+-
 -		tx_buffer = &tx_ring->tx_buffer_info[i];
-+			txd = IXGBE_TX_DESC(tx_ring, i);
-+			txb = &tx_ring->tx_buffer_info[i];
-+			*txb = (struct ixgbe_tx_buffer){ 0 };
-+			txd->read.olinfo_status = 0;
-+		}
- 	}
- 
+-	}
+-
 -	/* write last descriptor with RS and EOP bits */
 -	cmd_type |= size | IXGBE_TXD_CMD;
 -	tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type);
-+	/* Mark EOP + RS on the last descriptor */
-+	txd->read.cmd_type_len |= cpu_to_le32(IXGBE_TXD_CMD);
- 
+-
 -	netdev_tx_sent_queue(txring_txq(tx_ring), first->bytecount);
-+	/* Publish */
-+	first->next_to_watch = txd;
- 
+-
 -	/* set the timestamp */
 -	first->time_stamp = jiffies;
-+	i++;
-+	if (unlikely(i == tx_ring->count))
-+		i = 0;
- 
+-
 -	skb_tx_timestamp(skb);
-+	/* Prefetch next tx buffer to reduce stalls */
-+	prefetchw(&tx_ring->tx_buffer_info[i]);
- 
+-
 -	/*
 -	 * Force memory writes to complete before letting h/w know there
 -	 * are new descriptors to fetch.  (Only applicable for weak-ordered
@@ -3511,9 +3844,8 @@
 -	 * We also need this memory barrier to make certain all of the
 -	 * status bits have been updated before next_to_watch is written.
 -	 */
-+	/* Ensure descriptors visible before updating next_to_use */
- 	wmb();
- 
+-	wmb();
+-
 -	/* set next_to_watch value indicating a packet is present */
 -	first->next_to_watch = tx_desc;
 -
@@ -3521,71 +3853,178 @@
 -	if (i == tx_ring->count)
 -		i = 0;
 -
- 	tx_ring->next_to_use = i;
- 
-+	netdev_tx_sent_queue(txring_txq(tx_ring), first->bytecount);
-+	skb_tx_timestamp(skb);
+-	tx_ring->next_to_use = i;
+-
+-	ixgbe_maybe_stop_tx(tx_ring, DESC_NEEDED);
++    struct sk_buff *skb = first->skb;
++    union ixgbe_adv_tx_desc *txd;
++    struct ixgbe_tx_buffer *txb;
++    dma_addr_t dma;
++    u32 cmd_base;
++    unsigned int seg_len;
++    u16 i = tx_ring->next_to_use;
++    u16 first_idx = i;
++    u16 last_idx = i;
++    unsigned int frag_idx;
 +
- 	ixgbe_maybe_stop_tx(tx_ring, DESC_NEEDED);
- 
--	if (netif_xmit_stopped(txring_txq(tx_ring)) || !netdev_xmit_more()) {
-+	if (netif_xmit_stopped(txring_txq(tx_ring)) || !netdev_xmit_more())
- 		writel(i, tx_ring->tail);
--	}
- 
- 	return 0;
--dma_error:
++    /* Base command flags for all data descriptors */
++    cmd_base = ixgbe_tx_cmd_type(skb, first->tx_flags);
++
++    txd = IXGBE_TX_DESC(tx_ring, i);
++    txb = first;
++
++    /* Write payload length once on the first descriptor's olinfo */
++    ixgbe_tx_olinfo_status(txd, first->tx_flags, skb->len - hdr_len);
++
++    /* Linear head */
++    seg_len = skb_headlen(skb);
++    if (seg_len) {
++        dma = dma_map_single(tx_ring->dev, skb->data, seg_len, DMA_TO_DEVICE);
++        if (unlikely(dma_mapping_error(tx_ring->dev, dma)))
++            goto dma_err;
++
++        dma_unmap_len_set(txb, len, seg_len);
++        dma_unmap_addr_set(txb, dma, dma);
++
++        for (;;) {
++            u32 dlen = min_t(u32, seg_len, IXGBE_MAX_DATA_PER_TXD);
++
++            txd->read.buffer_addr  = cpu_to_le64(dma);
++            txd->read.cmd_type_len = cpu_to_le32(cmd_base | dlen);
++
++            last_idx = i;
++            seg_len -= dlen;
++            if (!seg_len)
++                break;
++
++            dma += dlen;
++            i++;
++            if (unlikely(i == tx_ring->count))
++                i = 0;
++
++            txd = IXGBE_TX_DESC(tx_ring, i);
++            txb = &tx_ring->tx_buffer_info[i];
++            /* Clear fields we own on the fly */
++            dma_unmap_len_set(txb, len, 0);
++            dma_unmap_addr_set(txb, dma, 0);
++            txd->read.olinfo_status = 0;
++        }
++    }
++
++    /* Fragments */
++    for (frag_idx = 0; frag_idx < skb_shinfo(skb)->nr_frags; frag_idx++) {
++        const skb_frag_t *frag = &skb_shinfo(skb)->frags[frag_idx];
++
++        seg_len = skb_frag_size(frag);
++
++        i++;
++        if (unlikely(i == tx_ring->count))
++            i = 0;
++
++        txd = IXGBE_TX_DESC(tx_ring, i);
++        txb = &tx_ring->tx_buffer_info[i];
++        dma_unmap_len_set(txb, len, 0);
++        dma_unmap_addr_set(txb, dma, 0);
++        txd->read.olinfo_status = 0;
++
++        dma = skb_frag_dma_map(tx_ring->dev, frag, 0, seg_len, DMA_TO_DEVICE);
++        if (unlikely(dma_mapping_error(tx_ring->dev, dma)))
++            goto dma_err;
++
++        dma_unmap_len_set(txb, len, seg_len);
++        dma_unmap_addr_set(txb, dma, dma);
++
++        for (;;) {
++            u32 dlen = min_t(u32, seg_len, IXGBE_MAX_DATA_PER_TXD);
++
++            txd->read.buffer_addr  = cpu_to_le64(dma);
++            txd->read.cmd_type_len = cpu_to_le32(cmd_base | dlen);
++
++            last_idx = i;
++            seg_len -= dlen;
++            if (!seg_len)
++                break;
++
++            dma += dlen;
++            i++;
++            if (unlikely(i == tx_ring->count))
++                i = 0;
++
++            txd = IXGBE_TX_DESC(tx_ring, i);
++            txb = &tx_ring->tx_buffer_info[i];
++            dma_unmap_len_set(txb, len, 0);
++            dma_unmap_addr_set(txb, dma, 0);
++            txd->read.olinfo_status = 0;
++        }
++    }
++
++    /* Mark last descriptor: EOP + RS, and set next_to_watch */
++    {
++        union ixgbe_adv_tx_desc *last = IXGBE_TX_DESC(tx_ring, last_idx);
++        last->read.cmd_type_len |= cpu_to_le32(IXGBE_ADVTXD_DCMD_EOP |
++                                               IXGBE_ADVTXD_DCMD_RS);
++        first->next_to_watch = last;
++    }
++
++    /* Bookkeeping */
++    netdev_tx_sent_queue(txring_txq(tx_ring), first->bytecount);
++    first->time_stamp = jiffies; /* critical for hang watchdog */
++    skb_tx_timestamp(skb);
++
++    /* Advance next_to_use to the slot after the last descriptor */
++    i++;
++    if (unlikely(i == tx_ring->count))
++        i = 0;
++
++    /* Ensure descriptors visible to HW */
++    wmb();
++    tx_ring->next_to_use = i;
++
++    /* Doorbell unless batching */
++    if (netif_xmit_stopped(txring_txq(tx_ring)) || !netdev_xmit_more())
++        writel(i, tx_ring->tail);
++
++    /* Proactively stop if we are near depletion */
++    ixgbe_maybe_stop_tx(tx_ring, DESC_NEEDED);
++
++    return 0;
 +
 +dma_err:
- 	dev_err(tx_ring->dev, "TX DMA map failed\n");
- 
--	/* clear dma mappings for failed tx_buffer_info map */
--	for (;;) {
--		tx_buffer = &tx_ring->tx_buffer_info[i];
--		if (dma_unmap_len(tx_buffer, len))
--			dma_unmap_page(tx_ring->dev,
--				       dma_unmap_addr(tx_buffer, dma),
--				       dma_unmap_len(tx_buffer, len),
--				       DMA_TO_DEVICE);
--		dma_unmap_len_set(tx_buffer, len, 0);
--		if (tx_buffer == first)
-+	/* Unwind from first_idx up to last_idx (inclusive) */
-+	i = first_idx;
-+	while (true) {
-+		txb = &tx_ring->tx_buffer_info[i];
-+		if (dma_unmap_len(txb, len)) {
-+			if (txb->skb) {
-+				ixgbe_dma_unmap_single(tx_ring->dev,
-+						       dma_unmap_addr(txb, dma),
-+						       dma_unmap_len(txb, len),
-+						       DMA_TO_DEVICE);
-+			} else {
-+				ixgbe_dma_unmap_page(tx_ring->dev,
-+						     dma_unmap_addr(txb, dma),
-+						     dma_unmap_len(txb, len),
-+						     DMA_TO_DEVICE);
-+			}
-+			dma_unmap_len_set(txb, len, 0);
-+		}
-+		if (i == last_idx)
- 			break;
--		if (i == 0)
--			i += tx_ring->count;
--		i--;
++    /* Unwind DMA mappings from first_idx to last_idx inclusive */
++    i = first_idx;
++    for (;;) {
++        struct ixgbe_tx_buffer *tb = &tx_ring->tx_buffer_info[i];
 +
-+		i++;
-+		if (unlikely(i == tx_ring->count))
-+			i = 0;
- 	}
- 
-+	tx_ring->next_to_use = first_idx;
- 	dev_kfree_skb_any(first->skb);
- 	first->skb = NULL;
-+	first->next_to_watch = NULL;
-+	return -1;
++        if (dma_unmap_len(tb, len)) {
++            if (tb == first) {
++                dma_unmap_single(tx_ring->dev,
++                                 dma_unmap_addr(tb, dma),
++                                 dma_unmap_len(tb, len),
++                                 DMA_TO_DEVICE);
++            } else {
++                dma_unmap_page(tx_ring->dev,
++                               dma_unmap_addr(tb, dma),
++                               dma_unmap_len(tb, len),
++                               DMA_TO_DEVICE);
++            }
++            dma_unmap_len_set(tb, len, 0);
++        }
++
++        if (i == last_idx)
++            break;
++
++        i++;
++        if (i == tx_ring->count)
++            i = 0;
++    }
++
++    dev_kfree_skb_any(first->skb);
++    first->skb = NULL;
++    first->next_to_watch = NULL;
++
++    return -1;
 +}
- 
--	tx_ring->next_to_use = i;
++
 +static inline u32 ixgbe_tx_desc_cmd_type(const struct sk_buff *skb,
 +					 u32 tx_flags)
 +{
@@ -3600,15 +4039,43 @@
 +	cmd |= IXGBE_SET_FLAG(tx_flags, IXGBE_TX_FLAGS_TSTAMP,
 +			      IXGBE_ADVTXD_MAC_TSTAMP);
  
--	return -1;
+-	if (netif_xmit_stopped(txring_txq(tx_ring)) || !netdev_xmit_more()) {
+-		writel(i, tx_ring->tail);
+-	}
+-
+-	return 0;
+-dma_error:
+-	dev_err(tx_ring->dev, "TX DMA map failed\n");
+-
+-	/* clear dma mappings for failed tx_buffer_info map */
+-	for (;;) {
+-		tx_buffer = &tx_ring->tx_buffer_info[i];
+-		if (dma_unmap_len(tx_buffer, len))
+-			dma_unmap_page(tx_ring->dev,
+-				       dma_unmap_addr(tx_buffer, dma),
+-				       dma_unmap_len(tx_buffer, len),
+-				       DMA_TO_DEVICE);
+-		dma_unmap_len_set(tx_buffer, len, 0);
+-		if (tx_buffer == first)
+-			break;
+-		if (i == 0)
+-			i += tx_ring->count;
+-		i--;
+-	}
 +	if (skb->no_fcs)
 +		cmd &= ~IXGBE_ADVTXD_DCMD_IFCS;
-+
+ 
+-	dev_kfree_skb_any(first->skb);
+-	first->skb = NULL;
+-
+-	tx_ring->next_to_use = i;
+-
+-	return -1;
 +	return cmd;
  }
  
  static void ixgbe_atr(struct ixgbe_ring *ring,
-@@ -8922,39 +9414,39 @@ static void ixgbe_atr(struct ixgbe_ring
+@@ -8922,39 +9413,39 @@ static void ixgbe_atr(struct ixgbe_ring
  	struct tcphdr *th;
  	unsigned int hlen;
  	struct sk_buff *skb;
@@ -3662,7 +4129,7 @@
  		if (adapter->vxlan_port &&
  		    udp_hdr(skb)->dest == adapter->vxlan_port)
  			hdr.network = skb_inner_network_header(skb);
-@@ -8964,16 +9456,11 @@ static void ixgbe_atr(struct ixgbe_ring
+@@ -8964,16 +9455,11 @@ static void ixgbe_atr(struct ixgbe_ring
  			hdr.network = skb_inner_network_header(skb);
  	}
  
@@ -3680,7 +4147,7 @@
  		hlen = (hdr.network[0] & 0x0F) << 2;
  		l4_proto = hdr.ipv4->protocol;
  		break;
-@@ -8986,41 +9473,28 @@ static void ixgbe_atr(struct ixgbe_ring
+@@ -8986,41 +9472,28 @@ static void ixgbe_atr(struct ixgbe_ring
  		return;
  	}
  
@@ -3727,7 +4194,7 @@
  	if (first->tx_flags & (IXGBE_TX_FLAGS_SW_VLAN | IXGBE_TX_FLAGS_HW_VLAN))
  		common.port.src ^= th->dest ^ htons(ETH_P_8021Q);
  	else
-@@ -9043,14 +9517,11 @@ static void ixgbe_atr(struct ixgbe_ring
+@@ -9043,14 +9516,11 @@ static void ixgbe_atr(struct ixgbe_ring
  			     hdr.ipv6->daddr.s6_addr32[2] ^
  			     hdr.ipv6->daddr.s6_addr32[3];
  		break;
@@ -3742,7 +4209,7 @@
  	ixgbe_fdir_add_signature_filter_82599(&q_vector->adapter->hw,
  					      input, common, ring->queue_index);
  }
-@@ -9103,85 +9574,135 @@ static u16 ixgbe_select_queue(struct net
+@@ -9103,85 +9573,135 @@ static u16 ixgbe_select_queue(struct net
  
  #endif
  int ixgbe_xmit_xdp_ring(struct ixgbe_ring *ring,
@@ -3955,7 +4422,7 @@
  }
  
  netdev_tx_t ixgbe_xmit_frame_ring(struct sk_buff *skb,
-@@ -11363,9 +11884,6 @@ static int ixgbe_probe(struct pci_dev *p
+@@ -11363,9 +11883,6 @@ static int ixgbe_probe(struct pci_dev *p
  #endif
  	u32 eec;
  
@@ -3965,7 +4432,7 @@
  	if (pdev->is_virtfn) {
  		WARN(1, KERN_ERR "%s (%hx:%hx) should not be a VF!\n",
  		     pci_name(pdev), pdev->vendor, pdev->device);
-@@ -11376,17 +11894,16 @@ static int ixgbe_probe(struct pci_dev *p
+@@ -11376,17 +11893,16 @@ static int ixgbe_probe(struct pci_dev *p
  	if (err)
  		return err;
  
@@ -3987,7 +4454,7 @@
  		goto err_pci_reg;
  	}
  
-@@ -11395,7 +11912,6 @@ static int ixgbe_probe(struct pci_dev *p
+@@ -11395,7 +11911,6 @@ static int ixgbe_probe(struct pci_dev *p
  
  	if (ii->mac == ixgbe_mac_82598EB) {
  #ifdef CONFIG_IXGBE_DCB
@@ -3995,7 +4462,7 @@
  		indices = 4 * MAX_TRAFFIC_CLASS;
  #else
  		indices = IXGBE_MAX_RSS_INDICES;
-@@ -11440,7 +11956,7 @@ static int ixgbe_probe(struct pci_dev *p
+@@ -11440,7 +11955,7 @@ static int ixgbe_probe(struct pci_dev *p
  	hw->mac.type  = ii->mac;
  	hw->mvals     = ii->mvals;
  	if (ii->link_ops)
@@ -4004,7 +4471,7 @@
  
  	/* EEPROM */
  	hw->eeprom.ops = *ii->eeprom_ops;
-@@ -11449,14 +11965,12 @@ static int ixgbe_probe(struct pci_dev *p
+@@ -11449,14 +11964,12 @@ static int ixgbe_probe(struct pci_dev *p
  		err = -EIO;
  		goto err_ioremap;
  	}
@@ -4019,7 +4486,7 @@
  	hw->phy.mdio.prtad = MDIO_PRTAD_NONE;
  	hw->phy.mdio.mmds = 0;
  	hw->phy.mdio.mode_support = MDIO_SUPPORTS_C45 | MDIO_EMULATE_C22;
-@@ -11521,10 +12035,6 @@ static int ixgbe_probe(struct pci_dev *p
+@@ -11521,10 +12034,6 @@ static int ixgbe_probe(struct pci_dev *p
  		break;
  	}
  
@@ -4030,7 +4497,7 @@
  	if (adapter->flags & IXGBE_FLAG_FAN_FAIL_CAPABLE) {
  		u32 esdp = IXGBE_READ_REG(hw, IXGBE_ESDP);
  		if (esdp & IXGBE_ESDP_SDP1)
-@@ -11551,16 +12061,13 @@ static int ixgbe_probe(struct pci_dev *p
+@@ -11551,16 +12060,13 @@ static int ixgbe_probe(struct pci_dev *p
  	}
  
  #ifdef CONFIG_PCI_IOV
@@ -4047,7 +4514,7 @@
  #endif
  	netdev->features = NETIF_F_SG |
  			   NETIF_F_TSO |
-@@ -11591,7 +12098,6 @@ skip_sriov:
+@@ -11591,7 +12097,6 @@ skip_sriov:
  	if (adapter->ipsec)
  		netdev->features |= IXGBE_ESP_FEATURES;
  #endif
@@ -4055,7 +4522,7 @@
  	netdev->hw_features |= netdev->features |
  			       NETIF_F_HW_VLAN_CTAG_FILTER |
  			       NETIF_F_HW_VLAN_CTAG_RX |
-@@ -11613,7 +12119,6 @@ skip_sriov:
+@@ -11613,7 +12118,6 @@ skip_sriov:
  				 NETIF_F_HW_CSUM;
  	netdev->mpls_features |= IXGBE_GSO_PARTIAL_FEATURES;
  
@@ -4063,7 +4530,7 @@
  	netdev->features |= NETIF_F_HW_VLAN_CTAG_FILTER |
  			    NETIF_F_HW_VLAN_CTAG_RX |
  			    NETIF_F_HW_VLAN_CTAG_TX;
-@@ -11624,7 +12129,6 @@ skip_sriov:
+@@ -11624,7 +12128,6 @@ skip_sriov:
  	netdev->xdp_features = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT |
  			       NETDEV_XDP_ACT_XSK_ZEROCOPY;
  
@@ -4071,7 +4538,7 @@
  	netdev->min_mtu = ETH_MIN_MTU;
  	netdev->max_mtu = IXGBE_MAX_JUMBO_FRAME_SIZE - (ETH_HLEN + ETH_FCS_LEN);
  
-@@ -11643,15 +12147,11 @@ skip_sriov:
+@@ -11643,15 +12146,11 @@ skip_sriov:
  				adapter->flags &= ~IXGBE_FLAG_FCOE_CAPABLE;
  		}
  
@@ -4089,7 +4556,7 @@
  	}
  #endif /* IXGBE_FCOE */
  	if (adapter->flags2 & IXGBE_FLAG2_RSC_CAPABLE)
-@@ -11659,16 +12159,13 @@ skip_sriov:
+@@ -11659,16 +12158,13 @@ skip_sriov:
  	if (adapter->flags2 & IXGBE_FLAG2_RSC_ENABLED)
  		netdev->features |= NETIF_F_LRO;
  
@@ -4107,7 +4574,7 @@
  	eth_hw_addr_set(netdev, hw->mac.perm_addr);
  
  	if (!is_valid_ether_addr(netdev->dev_addr)) {
-@@ -11677,7 +12174,6 @@ skip_sriov:
+@@ -11677,7 +12173,6 @@ skip_sriov:
  		goto err_sw_init;
  	}
  
@@ -4115,7 +4582,7 @@
  	ether_addr_copy(hw->mac.addr, hw->mac.perm_addr);
  	ixgbe_mac_set_default_filter(adapter);
  
-@@ -11689,6 +12185,7 @@ skip_sriov:
+@@ -11689,6 +12184,7 @@ skip_sriov:
  		err = -EIO;
  		goto err_sw_init;
  	}
@@ -4123,7 +4590,7 @@
  	INIT_WORK(&adapter->service_task, ixgbe_service_task);
  	set_bit(__IXGBE_SERVICE_INITED, &adapter->state);
  	clear_bit(__IXGBE_SERVICE_SCHED, &adapter->state);
-@@ -11704,30 +12201,21 @@ skip_sriov:
+@@ -11704,30 +12200,21 @@ skip_sriov:
  	for (i = 0; i < adapter->num_xdp_queues; i++)
  		u64_stats_init(&adapter->xdp_ring[i]->syncp);
  
@@ -4156,7 +4623,7 @@
  	switch (hw->mac.type) {
  	case ixgbe_mac_82598EB:
  		expected_gts = min(ixgbe_enumerate_functions(adapter) * 10, 16);
-@@ -11737,34 +12225,31 @@ skip_sriov:
+@@ -11737,34 +12224,31 @@ skip_sriov:
  		break;
  	}
  
@@ -4196,7 +4663,7 @@
  	strcpy(netdev->name, "eth%d");
  	pci_set_drvdata(pdev, adapter);
  
-@@ -11776,12 +12261,9 @@ skip_sriov:
+@@ -11776,12 +12260,9 @@ skip_sriov:
  	if (err)
  		goto err_register;
  
@@ -4209,7 +4676,7 @@
  	netif_carrier_off(netdev);
  
  #ifdef CONFIG_IXGBE_DCA
-@@ -11796,31 +12278,25 @@ skip_sriov:
+@@ -11796,31 +12277,25 @@ skip_sriov:
  			ixgbe_vf_configuration(pdev, (i | 0x10000000));
  	}
  
@@ -4245,7 +4712,7 @@
  
  	err = ixgbe_mii_bus_init(hw);
  	if (err)
-@@ -11829,6 +12305,10 @@ skip_sriov:
+@@ -11829,6 +12304,10 @@ skip_sriov:
  	ixgbe_devlink_init_regions(adapter);
  	devl_register(adapter->devlink);
  	devl_unlock(adapter->devlink);
@@ -4256,7 +4723,7 @@
  	return 0;
  
  err_netdev:
-@@ -11873,89 +12353,86 @@ err_dma:
+@@ -11873,89 +12352,86 @@ err_dma:
   **/
  static void ixgbe_remove(struct pci_dev *pdev)
  {
@@ -4268,6 +4735,12 @@
 -	/* if !adapter then we already cleaned up in probe */
 -	if (!adapter)
 -		return;
+-
+-	netdev  = adapter->netdev;
+-	devl_lock(adapter->devlink);
+-	devl_unregister(adapter->devlink);
+-	ixgbe_devlink_destroy_regions(adapter);
+-	ixgbe_dbg_adapter_exit(adapter);
 +    struct ixgbe_adapter *adapter = pci_get_drvdata(pdev);
 +    struct net_device *netdev;
 +    bool disable_dev;
@@ -4290,12 +4763,6 @@
 +        mutex_destroy(&adapter->hw.aci.lock);
 +    }
  
--	netdev  = adapter->netdev;
--	devl_lock(adapter->devlink);
--	devl_unregister(adapter->devlink);
--	ixgbe_devlink_destroy_regions(adapter);
--	ixgbe_dbg_adapter_exit(adapter);
--
 -	set_bit(__IXGBE_REMOVING, &adapter->state);
 -	cancel_work_sync(&adapter->service_task);
 -
@@ -4339,18 +4806,18 @@
  #endif
 -	if (netdev->reg_state == NETREG_REGISTERED)
 -		unregister_netdev(netdev);
--
--	devl_port_unregister(&adapter->devlink_port);
--	devl_unlock(adapter->devlink);
--	devlink_free(adapter->devlink);
 +    if (netdev->reg_state == NETREG_REGISTERED)
 +        unregister_netdev(netdev);
  
--	ixgbe_stop_ipsec_offload(adapter);
--	ixgbe_clear_interrupt_scheme(adapter);
+-	devl_port_unregister(&adapter->devlink_port);
+-	devl_unlock(adapter->devlink);
+-	devlink_free(adapter->devlink);
 +    ixgbe_stop_ipsec_offload(adapter);
 +    ixgbe_clear_interrupt_scheme(adapter);
  
+-	ixgbe_stop_ipsec_offload(adapter);
+-	ixgbe_clear_interrupt_scheme(adapter);
+-
 -	ixgbe_release_hw_control(adapter);
 +    ixgbe_release_hw_control(adapter);
  
@@ -4408,7 +4875,7 @@
 
 --- a/drivers/pci/msi/msi.c	2025-04-26 16:35:23.647821877 +0200
 +++ b/drivers/pci/msi/msi.c	2025-08-13 16:48:01.839153108 +0200
-@@ -7,6 +7,8 @@
+@@ -7,10 +7,13 @@
   * Copyright (C) 2016 Christoph Hellwig.
   */
  #include <linux/bitfield.h>
@@ -4417,7 +4884,12 @@
  #include <linux/err.h>
  #include <linux/export.h>
  #include <linux/irq.h>
-@@ -115,15 +117,18 @@ void pci_msi_update_mask(struct msi_desc
+ #include <linux/irqdomain.h>
++#include <linux/io.h>
+ 
+ #include "../pci.h"
+ #include "msi.h"
+@@ -115,47 +118,91 @@ void pci_msi_update_mask(struct msi_desc
  {
  	raw_spinlock_t *lock = &to_pci_dev(desc->dev)->msi_lock;
  	unsigned long flags;
@@ -4440,31 +4912,97 @@
  	raw_spin_unlock_irqrestore(lock, flags);
  }
  
-@@ -135,6 +140,7 @@ void pci_msi_mask_irq(struct irq_data *d
+ /**
+  * pci_msi_mask_irq - Generic IRQ chip callback to mask PCI/MSI interrupts
+  * @data:	pointer to irqdata associated to that interrupt
++ *
++ * Defensive shift bound check added (debug aid, zero-cost in steady state).
+  */
+ void pci_msi_mask_irq(struct irq_data *data)
  {
  	struct msi_desc *desc = irq_data_get_msi_desc(data);
- 
++	unsigned int shift;
++
 +	prefetchw(desc);
- 	__pci_msi_mask_desc(desc, BIT(data->irq - desc->irq));
++	if (WARN_ON_ONCE(!desc))
++		return;
++
++	if (WARN_ON_ONCE(data->irq < desc->irq))
++		return;
++
++	shift = (unsigned int)(data->irq - desc->irq);
++	if (WARN_ON_ONCE(shift >= 32))
++		return;
+ 
+-	__pci_msi_mask_desc(desc, BIT(data->irq - desc->irq));
++	__pci_msi_mask_desc(desc, BIT(shift));
  }
  EXPORT_SYMBOL_GPL(pci_msi_mask_irq);
-@@ -147,6 +153,7 @@ void pci_msi_unmask_irq(struct irq_data
+ 
+ /**
+  * pci_msi_unmask_irq - Generic IRQ chip callback to unmask PCI/MSI interrupts
+  * @data:	pointer to irqdata associated to that interrupt
++ *
++ * Defensive shift bound check added (debug aid, zero-cost in steady state).
+  */
+ void pci_msi_unmask_irq(struct irq_data *data)
  {
  	struct msi_desc *desc = irq_data_get_msi_desc(data);
- 
++	unsigned int shift;
++
 +	prefetchw(desc);
- 	__pci_msi_unmask_desc(desc, BIT(data->irq - desc->irq));
++	if (WARN_ON_ONCE(!desc))
++		return;
++
++	if (WARN_ON_ONCE(data->irq < desc->irq))
++		return;
++
++	shift = (unsigned int)(data->irq - desc->irq);
++	if (WARN_ON_ONCE(shift >= 32))
++		return;
+ 
+-	__pci_msi_unmask_desc(desc, BIT(data->irq - desc->irq));
++	__pci_msi_unmask_desc(desc, BIT(shift));
  }
  EXPORT_SYMBOL_GPL(pci_msi_unmask_irq);
-@@ -156,6 +163,7 @@ void __pci_read_msi_msg(struct msi_desc
+ 
++/*
++ * Robust against non-D0/disconnected devices: read cached message when
++ * touching hardware is unsafe. Mirrors write-side logic in __pci_write_msi_msg().
++ */
+ void __pci_read_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
+ {
  	struct pci_dev *dev = msi_desc_to_pci_dev(entry);
  
- 	BUG_ON(dev->current_state != PCI_D0);
+-	BUG_ON(dev->current_state != PCI_D0);
++	if (WARN_ON_ONCE(!entry))
++		return;
++
++	/* If device is not in D0 or is disconnected, return cached message */
++	if (unlikely(dev->current_state != PCI_D0 || pci_dev_is_disconnected(dev))) {
++		*msg = entry->msg;
++		return;
++	}
++
 +	prefetchw(msg);
  
  	if (entry->pci.msi_attrib.is_msix) {
  		void __iomem *base = pci_msix_desc_addr(entry);
-@@ -188,12 +196,13 @@ static inline void pci_write_msg_msi(str
+@@ -170,11 +217,9 @@ void __pci_read_msi_msg(struct msi_desc
+ 		int pos = dev->msi_cap;
+ 		u16 data;
+ 
+-		pci_read_config_dword(dev, pos + PCI_MSI_ADDRESS_LO,
+-				      &msg->address_lo);
++		pci_read_config_dword(dev, pos + PCI_MSI_ADDRESS_LO, &msg->address_lo);
+ 		if (entry->pci.msi_attrib.is_64) {
+-			pci_read_config_dword(dev, pos + PCI_MSI_ADDRESS_HI,
+-					      &msg->address_hi);
++			pci_read_config_dword(dev, pos + PCI_MSI_ADDRESS_HI, &msg->address_hi);
+ 			pci_read_config_word(dev, pos + PCI_MSI_DATA_64, &data);
+ 		} else {
+ 			msg->address_hi = 0;
+@@ -188,16 +233,17 @@ static inline void pci_write_msg_msi(str
  				     struct msi_msg *msg)
  {
  	int pos = dev->msi_cap;
@@ -4482,7 +5020,43 @@
  
  	pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_LO, msg->address_lo);
  	if (desc->pci.msi_attrib.is_64) {
-@@ -273,13 +282,13 @@ static void pci_intx_for_msi(struct pci_
+-		pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_HI,  msg->address_hi);
++		pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_HI, msg->address_hi);
+ 		pci_write_config_word(dev, pos + PCI_MSI_DATA_64, msg->data);
+ 	} else {
+ 		pci_write_config_word(dev, pos + PCI_MSI_DATA_32, msg->data);
+@@ -214,6 +260,7 @@ static inline void pci_write_msg_msix(st
+ 
+ 	if (desc->pci.msi_attrib.is_virtual)
+ 		return;
++
+ 	/*
+ 	 * The specification mandates that the entry is masked
+ 	 * when the message is modified:
+@@ -240,8 +287,11 @@ void __pci_write_msi_msg(struct msi_desc
+ {
+ 	struct pci_dev *dev = msi_desc_to_pci_dev(entry);
+ 
++	if (WARN_ON_ONCE(!entry))
++		return;
++
+ 	if (dev->current_state != PCI_D0 || pci_dev_is_disconnected(dev)) {
+-		/* Don't touch the hardware now */
++		/* Don't touch the hardware now; still update cached message */
+ 	} else if (entry->pci.msi_attrib.is_msix) {
+ 		pci_write_msg_msix(entry, msg);
+ 	} else {
+@@ -258,6 +308,9 @@ void pci_write_msi_msg(unsigned int irq,
+ {
+ 	struct msi_desc *entry = irq_get_msi_desc(irq);
+ 
++	if (WARN_ON_ONCE(!entry))
++		return;
++
+ 	__pci_write_msi_msg(entry, msg);
+ }
+ EXPORT_SYMBOL_GPL(pci_write_msi_msg);
+@@ -273,13 +326,13 @@ static void pci_intx_for_msi(struct pci_
  
  static void pci_msi_set_enable(struct pci_dev *dev, int enable)
  {
@@ -4501,7 +5075,18 @@
  }
  
  static int msi_setup_msi_desc(struct pci_dev *dev, int nvec,
-@@ -488,7 +497,7 @@ int pci_msi_vec_count(struct pci_dev *de
+@@ -345,6 +398,10 @@ static int __msi_capability_init(struct
+ 
+ 	/* All MSIs are unmasked by default; mask them all */
+ 	entry = msi_first_desc(&dev->dev, MSI_DESC_ALL);
++	if (WARN_ON_ONCE(!entry)) {
++		pci_free_msi_irqs(dev);
++		return -ENODEV;
++	}
+ 	pci_msi_mask(entry, msi_multi_mask(entry));
+ 	/*
+ 	 * Copy the MSI descriptor for the error path because
+@@ -488,7 +545,7 @@ int pci_msi_vec_count(struct pci_dev *de
  		return -EINVAL;
  
  	pci_read_config_word(dev, dev->msi_cap + PCI_MSI_FLAGS, &msgctl);
@@ -4510,7 +5095,92 @@
  
  	return ret;
  }
-@@ -768,23 +777,57 @@ out_disable:
+@@ -512,6 +569,8 @@ void __pci_restore_msi_state(struct pci_
+ 		return;
+ 
+ 	entry = irq_get_msi_desc(dev->irq);
++	if (WARN_ON_ONCE(!entry))
++		return;
+ 
+ 	pci_intx_for_msi(dev, 0);
+ 	pci_msi_set_enable(dev, 0);
+@@ -539,11 +598,15 @@ void pci_msi_shutdown(struct pci_dev *de
+ 
+ 	/* Return the device with MSI unmasked as initial states */
+ 	desc = msi_first_desc(&dev->dev, MSI_DESC_ALL);
+-	if (!WARN_ON_ONCE(!desc))
++	if (desc) {
+ 		pci_msi_unmask(desc, msi_multi_mask(desc));
++		/* Restore dev->irq to its default pin-assertion IRQ */
++		dev->irq = desc->pci.msi_attrib.default_irq;
++	} else {
++		WARN_ON_ONCE(1);
++		/* Fallback: keep dev->irq as-is */
++	}
+ 
+-	/* Restore dev->irq to its default pin-assertion IRQ */
+-	dev->irq = desc->pci.msi_attrib.default_irq;
+ 	pcibios_alloc_irq(dev);
+ }
+ 
+@@ -559,25 +622,43 @@ static void pci_msix_clear_and_set_ctrl(
+ 	pci_write_config_word(dev, dev->msix_cap + PCI_MSIX_FLAGS, ctrl);
+ }
+ 
++/*
++ * Hardened: Bounds/overflow safe MSI-X BAR mapping
++ * Ensures table_offset + table_len fits within the BAR and does not wrap.
++ */
+ static void __iomem *msix_map_region(struct pci_dev *dev,
+ 				     unsigned int nr_entries)
+ {
+-	resource_size_t phys_addr;
++	resource_size_t start, phys_addr, bar_len, table_len;
+ 	u32 table_offset;
+ 	unsigned long flags;
+ 	u8 bir;
+ 
+-	pci_read_config_dword(dev, dev->msix_cap + PCI_MSIX_TABLE,
+-			      &table_offset);
++	pci_read_config_dword(dev, dev->msix_cap + PCI_MSIX_TABLE, &table_offset);
+ 	bir = (u8)(table_offset & PCI_MSIX_TABLE_BIR);
+ 	flags = pci_resource_flags(dev, bir);
+ 	if (!flags || (flags & IORESOURCE_UNSET))
+ 		return NULL;
+ 
+ 	table_offset &= PCI_MSIX_TABLE_OFFSET;
+-	phys_addr = pci_resource_start(dev, bir) + table_offset;
++	bar_len = pci_resource_len(dev, bir);
++	if (!bar_len)
++		return NULL;
++
++	/* Compute table length and validate: no overflow, fits within BAR */
++	table_len = (resource_size_t)nr_entries * PCI_MSIX_ENTRY_SIZE;
++	if (nr_entries == 0 || table_len / PCI_MSIX_ENTRY_SIZE != nr_entries)
++		return NULL; /* overflow */
++	if (table_offset > bar_len || bar_len - table_offset < table_len)
++		return NULL; /* out of range */
++
++	start = pci_resource_start(dev, bir);
++	if (!start)
++		return NULL;
++
++	phys_addr = start + table_offset;
+ 
+-	return ioremap(phys_addr, nr_entries * PCI_MSIX_ENTRY_SIZE);
++	return ioremap(phys_addr, table_len);
+ }
+ 
+ /**
+@@ -606,7 +687,6 @@ void msix_prepare_msi_desc(struct pci_de
+ 	desc->pci.msi_attrib.default_irq	= dev->irq;
+ 	desc->pci.mask_base			= dev->msix_base;
+ 
+-
+ 	if (!pci_msi_domain_supports(dev, MSI_FLAG_NO_MASK, DENY_LEGACY) &&
+ 	    !desc->pci.msi_attrib.is_virtual) {
+ 		void __iomem *addr = pci_msix_desc_addr(desc);
+@@ -768,23 +848,57 @@ out_disable:
  static bool pci_msix_validate_entries(struct pci_dev *dev, struct msix_entry *entries, int nvec)
  {
  	bool nogap;
@@ -4538,7 +5208,7 @@
  			return false;
 +		if (entries[i].entry > max_idx)
 +			max_idx = entries[i].entry;
-+	}
+ 	}
 +
 +	/* Bitmap fast path to detect duplicates */
 +	bits = (size_t)max_idx + 1U;
@@ -4569,13 +5239,25 @@
 +				bitmap_free(bm);
 +			return false;
 +		}
- 	}
++	}
 +
 +	if (bm != stack_bm)
 +		bitmap_free(bm);
  	return true;
  }
  
+@@ -934,6 +1048,10 @@ int pci_msix_write_tph_tag(struct pci_de
+ 	if (!pdev->msix_enabled)
+ 		return -ENXIO;
+ 
++	/* Ensure the tag fits the field width */
++	if (tag > FIELD_MAX(PCI_MSIX_ENTRY_CTRL_ST))
++		return -EINVAL;
++
+ 	virq = msi_get_virq(&pdev->dev, index);
+ 	if (!virq)
+ 		return -ENXIO;
+
 
 --- a/drivers/pci/irq.c	2025-04-26 16:32:43.874535346 +0200
 +++ b/drivers/pci/irq.c	2025-04-26 16:32:30.423017727 +0200
