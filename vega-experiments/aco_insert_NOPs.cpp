@@ -10,95 +10,155 @@
 #include "util/bitset.h"
 
 #include <algorithm>
+#include <array>
 #include <bitset>
 #include <set>
 #include <stack>
 #include <vector>
 
-namespace aco {
-namespace {
+namespace aco
+{
+namespace
+{
 
-struct State {
+struct State
+{
    Program* program;
    Block* block;
    std::vector<aco_ptr<Instruction>> old_instructions;
 };
 
-struct NOP_ctx_gfx6 {
-   void join(const NOP_ctx_gfx6& o) {
-      set_vskip_mode_then_vector = MAX2(set_vskip_mode_then_vector, o.set_vskip_mode_then_vector);
-      valu_wr_vcc_then_div_fmas = MAX2(valu_wr_vcc_then_div_fmas, o.valu_wr_vcc_then_div_fmas);
-      salu_wr_m0_then_gds_msg_ttrace = MAX2(salu_wr_m0_then_gds_msg_ttrace, o.salu_wr_m0_then_gds_msg_ttrace);
-      valu_wr_exec_then_dpp = MAX2(valu_wr_exec_then_dpp, o.valu_wr_exec_then_dpp);
-      salu_wr_m0_then_lds = MAX2(salu_wr_m0_then_lds, o.salu_wr_m0_then_lds);
-      salu_wr_m0_then_moverel = MAX2(salu_wr_m0_then_moverel, o.salu_wr_m0_then_moverel);
-      setreg_then_getsetreg = MAX2(setreg_then_getsetreg, o.setreg_then_getsetreg);
-      vcc_wr_then_branch = MAX2(vcc_wr_then_branch, o.vcc_wr_then_branch);
+/*
+ * NOP context for GFX6-9 (GCN) architectures.
+ * This struct tracks the state of various hardware hazards. Each counter
+ * represents the number of cycles that must pass before a dependent
+ * instruction can execute safely.
+ */
+struct NOP_ctx_gfx6
+{
+   void join(const NOP_ctx_gfx6& other)
+   {
+      set_vskip_mode_then_vector =
+         MAX2(set_vskip_mode_then_vector, other.set_vskip_mode_then_vector);
+      valu_wr_vcc_then_div_fmas = MAX2(valu_wr_vcc_then_div_fmas, other.valu_wr_vcc_then_div_fmas);
+      salu_wr_m0_then_gds_msg_ttrace =
+         MAX2(salu_wr_m0_then_gds_msg_ttrace, other.salu_wr_m0_then_gds_msg_ttrace);
+      valu_wr_exec_then_dpp = MAX2(valu_wr_exec_then_dpp, other.valu_wr_exec_then_dpp);
+      salu_wr_m0_then_lds = MAX2(salu_wr_m0_then_lds, other.salu_wr_m0_then_lds);
+      salu_wr_m0_then_moverel = MAX2(salu_wr_m0_then_moverel, other.salu_wr_m0_then_moverel);
+      vcc_wr_then_branch = MAX2(vcc_wr_then_branch, other.vcc_wr_then_branch);
 
-      vmem_store_then_wr_data |= o.vmem_store_then_wr_data;
+      /* Per-register merge: take the max wait across each register. */
+      for (unsigned i = 0; i < setreg_waits.size(); ++i) {
+         setreg_waits[i] = std::max(setreg_waits[i], other.setreg_waits[i]);
+      }
 
-      smem_clause |= o.smem_clause;
-      smem_write |= o.smem_write;
-
-      for (unsigned i = 0; i < BITSET_WORDS(128); ++i) {
-         smem_clause_read_write[i] |= o.smem_clause_read_write[i];
-         smem_clause_write[i] |= o.smem_clause_write[i];
+      vmem_store_then_wr_data |= other.vmem_store_then_wr_data;
+      smem_clause |= other.smem_clause;
+      smem_write |= other.smem_write;
+      for (unsigned i = 0; i < BITSET_WORDS(128); i++) {
+         smem_clause_read_write[i] |= other.smem_clause_read_write[i];
+         smem_clause_write[i] |= other.smem_clause_write[i];
       }
    }
 
-   bool operator==(const NOP_ctx_gfx6& o) const {
-      return set_vskip_mode_then_vector == o.set_vskip_mode_then_vector &&
-             valu_wr_vcc_then_div_fmas == o.valu_wr_vcc_then_div_fmas &&
-             salu_wr_m0_then_gds_msg_ttrace == o.salu_wr_m0_then_gds_msg_ttrace &&
-             valu_wr_exec_then_dpp == o.valu_wr_exec_then_dpp &&
-             salu_wr_m0_then_lds == o.salu_wr_m0_then_lds &&
-             salu_wr_m0_then_moverel == o.salu_wr_m0_then_moverel &&
-             setreg_then_getsetreg == o.setreg_then_getsetreg &&
-             vcc_wr_then_branch == o.vcc_wr_then_branch &&
-             vmem_store_then_wr_data == o.vmem_store_then_wr_data &&
-             smem_clause == o.smem_clause &&
-             smem_write == o.smem_write &&
-             BITSET_EQUAL(smem_clause_read_write, o.smem_clause_read_write) &&
-             BITSET_EQUAL(smem_clause_write, o.smem_clause_write);
+   bool operator==(const NOP_ctx_gfx6& other) const
+   {
+      return set_vskip_mode_then_vector == other.set_vskip_mode_then_vector &&
+             valu_wr_vcc_then_div_fmas == other.valu_wr_vcc_then_div_fmas &&
+             vmem_store_then_wr_data == other.vmem_store_then_wr_data &&
+             salu_wr_m0_then_gds_msg_ttrace == other.salu_wr_m0_then_gds_msg_ttrace &&
+             valu_wr_exec_then_dpp == other.valu_wr_exec_then_dpp &&
+             salu_wr_m0_then_lds == other.salu_wr_m0_then_lds &&
+             salu_wr_m0_then_moverel == other.salu_wr_m0_then_moverel &&
+             vcc_wr_then_branch == other.vcc_wr_then_branch &&
+             setreg_waits == other.setreg_waits && smem_clause == other.smem_clause &&
+             smem_write == other.smem_write &&
+             BITSET_EQUAL(smem_clause_read_write, other.smem_clause_read_write) &&
+             BITSET_EQUAL(smem_clause_write, other.smem_clause_write);
    }
 
-   void add_wait_states(unsigned amount) {
-      /* saturating decrement helper – keeps signedness well-defined */
-      auto saturating_sub = [amount](int8_t& ctr) noexcept {
-         ctr = (ctr > static_cast<int8_t>(amount)) ? static_cast<int8_t>(ctr - amount) : 0;
-      };
+   void add_wait_states(unsigned amount)
+   {
+      if ((set_vskip_mode_then_vector -= amount) < 0)
+         set_vskip_mode_then_vector = 0;
 
-      saturating_sub(set_vskip_mode_then_vector);
-      saturating_sub(valu_wr_vcc_then_div_fmas);
-      saturating_sub(salu_wr_m0_then_gds_msg_ttrace);
-      saturating_sub(valu_wr_exec_then_dpp);
-      saturating_sub(salu_wr_m0_then_lds);
-      saturating_sub(salu_wr_m0_then_moverel);
-      saturating_sub(setreg_then_getsetreg);
-      saturating_sub(vcc_wr_then_branch);
+      if ((valu_wr_vcc_then_div_fmas -= amount) < 0)
+         valu_wr_vcc_then_div_fmas = 0;
+
+      if ((salu_wr_m0_then_gds_msg_ttrace -= amount) < 0)
+         salu_wr_m0_then_gds_msg_ttrace = 0;
+
+      if ((valu_wr_exec_then_dpp -= amount) < 0)
+         valu_wr_exec_then_dpp = 0;
+
+      if ((salu_wr_m0_then_lds -= amount) < 0)
+         salu_wr_m0_then_lds = 0;
+
+      if ((salu_wr_m0_then_moverel -= amount) < 0)
+         salu_wr_m0_then_moverel = 0;
+
+      if ((vcc_wr_then_branch -= amount) < 0)
+         vcc_wr_then_branch = 0;
+
+      /* Decay per-register waits. */
+      for (int8_t& wait : setreg_waits) {
+         if ((wait -= amount) < 0) {
+            wait = 0;
+         }
+      }
 
       vmem_store_then_wr_data.reset();
    }
 
-   int8_t set_vskip_mode_then_vector = 0;     /* MODE.vskip → vector op  (2) */
-   int8_t valu_wr_vcc_then_div_fmas = 0;      /* VALU→VCC  → v_div_fmas  (4) */
-   int8_t salu_wr_m0_then_gds_msg_ttrace = 0; /* M0 write  → GDS/sendmsg (1) */
-   int8_t valu_wr_exec_then_dpp = 0;          /* VALU→EXEC → DPP         (5) */
-   int8_t salu_wr_m0_then_lds = 0;            /* GFX9+ M0 write → LDS    (1) */
-   int8_t salu_wr_m0_then_moverel = 0;        /* GFX9   M0 write → moverel(1)*/
-   int8_t setreg_then_getsetreg = 0;          /* s_setreg → s_get/setreg (2) */
-   int8_t vcc_wr_then_branch = 0;             /* NEW: SALU→VCC → branch  (2) */
+   /* Helper to get the maximum wait state required for any s_setreg/s_getreg hazard. */
+   int8_t get_max_setreg_wait() const
+   {
+      return *std::max_element(setreg_waits.begin(), setreg_waits.end());
+   }
+
+   /* GFX9 (Vega) ISA requires 2 wait states after setting MODE.vskip before a vector op. */
+   int8_t set_vskip_mode_then_vector = 0;
+   /* The last known state of the vskip bit (MODE reg, bit 28) to avoid spurious waits. */
    uint8_t current_vskip = 0;
 
+   /* VALU writing VCC followed by v_div_fmas requires 4 wait states. */
+   int8_t valu_wr_vcc_then_div_fmas = 0;
+
+   /* SALU writing M0 followed by GDS, s_sendmsg or s_ttrace_data requires 1 wait state. */
+   int8_t salu_wr_m0_then_gds_msg_ttrace = 0;
+
+   /* VALU writing EXEC followed by DPP requires 5 wait states. */
+   int8_t valu_wr_exec_then_dpp = 0;
+
+   /* SALU writing M0 followed by some LDS instructions requires 1 wait state on GFX9+. */
+   int8_t salu_wr_m0_then_lds = 0;
+
+   /* SALU writing M0 followed by s_moverel requires 1 wait state on GFX9. */
+   int8_t salu_wr_m0_then_moverel = 0;
+
+   /* GFX9: SALU writing VCC followed by a branch using VCC requires 2 wait states
+    * to prevent a costly pipeline flush. This is a critical performance hazard. */
+   int8_t vcc_wr_then_branch = 0;
+
+   /* Per-register counters for `s_setreg` -> `s_getreg`/`s_setreg` hazards.
+    * This is far more precise than a single global counter, avoiding many false-positive stalls.
+    * Max register index is 63, so an array of size 64 is sufficient. */
+   std::array<int8_t, 64> setreg_waits = {0};
+
+   /* A VMEM store of >64 bits followed by an instruction writing to the VGPRs
+    * that held the store data requires 1 wait state. */
    std::bitset<256> vmem_store_then_wr_data;
 
+   /* SMEM clauses (consecutive SMEM instructions) have ordering hazards with XNACK enabled. */
    bool smem_clause = false;
    bool smem_write = false;
    BITSET_DECLARE(smem_clause_read_write, 128) = {0};
    BITSET_DECLARE(smem_clause_write, 128) = {0};
 };
 
-struct NOP_ctx_gfx10 {
+struct NOP_ctx_gfx10
+{
    bool has_VOPC_write_exec = false;
    bool has_nonVALU_exec_read = false;
    bool has_VMEM = false;
@@ -111,6 +171,7 @@ struct NOP_ctx_gfx10 {
    std::bitset<128> sgprs_read_by_VMEM_store;
    std::bitset<128> sgprs_read_by_DS;
    std::bitset<128> sgprs_read_by_SMEM;
+   int waits_since_fp_atomic = 3;
 
    void join(const NOP_ctx_gfx10& other)
    {
@@ -126,9 +187,10 @@ struct NOP_ctx_gfx10 {
       sgprs_read_by_DS |= other.sgprs_read_by_DS;
       sgprs_read_by_VMEM_store |= other.sgprs_read_by_VMEM_store;
       sgprs_read_by_SMEM |= other.sgprs_read_by_SMEM;
+      waits_since_fp_atomic = std::min(waits_since_fp_atomic, other.waits_since_fp_atomic);
    }
 
-   bool operator==(const NOP_ctx_gfx10& other)
+   bool operator==(const NOP_ctx_gfx10& other) const
    {
       return has_VOPC_write_exec == other.has_VOPC_write_exec &&
              has_nonVALU_exec_read == other.has_nonVALU_exec_read && has_VMEM == other.has_VMEM &&
@@ -138,13 +200,22 @@ struct NOP_ctx_gfx10 {
              sgprs_read_by_VMEM == other.sgprs_read_by_VMEM &&
              sgprs_read_by_DS == other.sgprs_read_by_DS &&
              sgprs_read_by_VMEM_store == other.sgprs_read_by_VMEM_store &&
-             sgprs_read_by_SMEM == other.sgprs_read_by_SMEM;
+             sgprs_read_by_SMEM == other.sgprs_read_by_SMEM &&
+             waits_since_fp_atomic == other.waits_since_fp_atomic;
    }
 };
 
-template <int Max> struct RegCounterMap {
-   void inc() { base++; }
-   void set(PhysReg reg) { update(reg, 0); }
+template <int Max>
+struct RegCounterMap
+{
+   void inc()
+   {
+      base++;
+   }
+   void set(PhysReg reg)
+   {
+      update(reg, 0);
+   }
 
    uint8_t get(PhysReg reg)
    {
@@ -186,21 +257,15 @@ template <int Max> struct RegCounterMap {
 
    void update(uint16_t reg, int idx)
    {
-         int16_t val = base - idx;
-         uint32_t key = reg & 0x7F;
-
-         /* fast path: already present */
-         if (present.test(key)) {
-               for (entry& e : list) {
-                     if (e.reg == reg) {
-                           e.val = MAX2(e.val, val);
-                           return;
-                     }
-               }
+      int16_t val = base - idx;
+      for (entry& e : list) {
+         if (e.reg == reg) {
+            e.val = MAX2(e.val, val);
+            return;
          }
-         /* slow path: insert */
-         list.push_back(entry{reg, val});
-         present.set(key);
+      }
+      list.push_back(entry{reg, val});
+      present.set(reg & 0x7F);
    }
 
    bool operator==(const RegCounterMap& other) const
@@ -212,11 +277,15 @@ template <int Max> struct RegCounterMap {
       return base == other.base && list == other.list;
    }
 
-private:
-   struct entry {
+ private:
+   struct entry
+   {
       uint16_t reg;
       int16_t val;
-      bool operator!=(const entry& other) const { return reg != other.reg || val != other.val; }
+      bool operator!=(const entry& other) const
+      {
+         return reg != other.reg || val != other.val;
+      }
    };
 
    std::bitset<128> present;
@@ -224,7 +293,8 @@ private:
    int base = 0;
 };
 
-struct NOP_ctx_gfx11 {
+struct NOP_ctx_gfx11
+{
    /* VcmpxPermlaneHazard */
    bool has_Vcmpx = false;
 
@@ -273,7 +343,7 @@ struct NOP_ctx_gfx11 {
       sgpr_read_by_valu_then_wr_by_salu.join_min(other.sgpr_read_by_valu_then_wr_by_salu);
    }
 
-   bool operator==(const NOP_ctx_gfx11& other)
+   bool operator==(const NOP_ctx_gfx11& other) const
    {
       return has_Vcmpx == other.has_Vcmpx &&
              vgpr_used_by_vmem_load == other.vgpr_used_by_vmem_load &&
@@ -297,34 +367,19 @@ struct NOP_ctx_gfx11 {
 int
 get_wait_states(aco_ptr<Instruction>& instr)
 {
-   if (instr->opcode == aco_opcode::s_nop)
+   if (instr->opcode == aco_opcode::s_nop) {
       return instr->salu().imm + 1;
-   else if (instr->opcode == aco_opcode::p_constaddr)
+   } else if (instr->opcode == aco_opcode::p_constaddr) {
       return 3; /* lowered to 3 instructions in the assembler */
-   else
+   } else {
       return 1;
+   }
 }
 
 bool
-regs_intersect(PhysReg a_reg, unsigned a_size,
-               PhysReg b_reg, unsigned b_size)
+regs_intersect(PhysReg a_reg, unsigned a_size, PhysReg b_reg, unsigned b_size)
 {
-      if (a_reg > b_reg) [[likely]]
-            return a_reg - b_reg < b_size;
-      else
-            return b_reg - a_reg < a_size;
-}
-
-static inline bool
-is_vcc_branch(const aco_ptr<Instruction>& instr)
-{
-      switch (instr->opcode) {
-            case aco_opcode::s_cbranch_vccz:
-            case aco_opcode::s_cbranch_vccnz:
-                  return true;
-            default:
-                  return false;
-      }
+   return a_reg > b_reg ? (a_reg - b_reg < b_size) : (b_reg - a_reg < a_size);
 }
 
 template <typename GlobalState, typename BlockState,
@@ -350,11 +405,11 @@ search_backwards_internal(State& state, GlobalState& global_state, BlockState bl
          return;
    }
 
-   PRAGMA_DIAGNOSTIC_PUSH
-   PRAGMA_DIAGNOSTIC_IGNORED(-Waddress)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Waddress"
    if (block_cb != nullptr && !block_cb(global_state, block_state, block))
       return;
-   PRAGMA_DIAGNOSTIC_POP
+#pragma GCC diagnostic pop
 
    for (unsigned lin_pred : block->linear_preds) {
       search_backwards_internal<GlobalState, BlockState, block_cb, instr_cb>(
@@ -372,60 +427,48 @@ search_backwards(State& state, GlobalState& global_state, BlockState& block_stat
       state, global_state, block_state, state.block, false);
 }
 
-struct HandleRawHazardGlobalState {
+struct HandleRawHazardGlobalState
+{
    PhysReg reg;
    int nops_needed;
 };
 
-struct HandleRawHazardBlockState {
+struct HandleRawHazardBlockState
+{
    uint32_t mask;
    int nops_needed;
 };
 
 template <bool Valu, bool Vintrp, bool Salu>
-static bool
+bool
 handle_raw_hazard_instr(HandleRawHazardGlobalState& global_state,
-                        HandleRawHazardBlockState&  block_state,
-                        aco_ptr<Instruction>&       pred)
+                        HandleRawHazardBlockState& block_state, aco_ptr<Instruction>& pred)
 {
-   const unsigned mask_size = util_last_bit(block_state.mask);
+   unsigned mask_size = util_last_bit(block_state.mask);
 
-   uint32_t writemask = 0u;
-   for (const Definition& def : pred->definitions) {
-      if (regs_intersect(global_state.reg, mask_size,
-                         def.physReg(), def.size()))
-      {
-         const unsigned start = (def.physReg() > global_state.reg) ?
-                                (def.physReg() - global_state.reg) : 0u;
-         const unsigned end   = std::min(mask_size, start + def.size());
-         writemask           |= u_bit_consecutive(start, end - start);
+   uint32_t writemask = 0;
+   for (Definition& def : pred->definitions) {
+      if (regs_intersect(global_state.reg, mask_size, def.physReg(), def.size())) {
+         unsigned start = def.physReg() > global_state.reg ? def.physReg() - global_state.reg : 0;
+         unsigned end = MIN2(mask_size, start + def.size());
+         writemask |= u_bit_consecutive(start, end - start);
       }
    }
 
-   const bool relevant_pred =
-      ((pred->isVALU()   && Valu)   ||
-       (pred->isVINTRP() && Vintrp) ||
-       (pred->isSALU()   && Salu));
-
-   /* RAW hazard found – record and stop. */
-   if (writemask && relevant_pred) {
-      global_state.nops_needed =
-         std::max(global_state.nops_needed, block_state.nops_needed);
-      return true;                               /* EARLY-EXIT on conflict  */
+   bool is_hazard = writemask != 0 && ((pred->isVALU() && Valu) || (pred->isVINTRP() && Vintrp) ||
+                                       (pred->isSALU() && Salu));
+   if (is_hazard) {
+      global_state.nops_needed = MAX2(global_state.nops_needed, block_state.nops_needed);
+      return true;
    }
 
-   /* age the counters for wait-states already consumed by this pred */
-   block_state.mask         &= ~writemask;
-   block_state.nops_needed   = std::max(
-                                 block_state.nops_needed -
-                                 static_cast<int>(get_wait_states(pred)), 0);
+   block_state.mask &= ~writemask;
+   block_state.nops_needed = MAX2(block_state.nops_needed - get_wait_states(pred), 0);
 
-   /* If nothing left to cover OR we already satisfied wait distance – done */
-   if (block_state.mask == 0u || block_state.nops_needed == 0)
-      return true;
+   if (block_state.mask == 0)
+      block_state.nops_needed = 0;
 
-   /* continue walking */
-   return false;
+   return block_state.nops_needed == 0;
 }
 
 template <bool Valu, bool Vintrp, bool Salu>
@@ -479,115 +522,86 @@ test_bitset_range(BITSET_WORD* words, unsigned start, unsigned size)
    }
 }
 
-/* A SMEM clause is any group of consecutive SMEM instructions. The
- * instructions in this group may return out of order and/or may be replayed.
+/*
+ * A SMEM clause is any group of consecutive SMEM instructions. The
+ * instructions in this group may return out of order and/or may be replayed
+ * when XNACK is enabled.
  *
- * To fix this potential hazard correctly, we have to make sure that when a
- * clause has more than one instruction, no instruction in the clause writes
- * to a register that is read by another instruction in the clause (including
- * itself). In this case, we have to break the SMEM clause by inserting non
- * SMEM instructions.
- *
- * SMEM clauses are only present on GFX8+, and only matter when XNACK is set.
+ * To fix this, we break the clause by inserting a non-SMEM instruction if:
+ * 1. The clause contains a store or atomic operation (side effects).
+ * 2. An instruction reads a register written by a previous instruction in the same clause (RAW).
+ * 3. An instruction writes a register read/written by a previous instruction (WAW/WAR).
  */
-static void
-handle_smem_clause_hazards(Program*                program,
-                           NOP_ctx_gfx6&           ctx,
-                           aco_ptr<Instruction>&   instr,
-                           int*                    NOPs)
+void
+handle_smem_clause_hazards(Program* program, NOP_ctx_gfx6& ctx, aco_ptr<Instruction>& instr,
+                           int* NOPs)
 {
-      if (!program->dev.xnack_enabled) return;
-      assert(NOPs && "caller must pass valid pointer");
-
-      /* Break an outstanding clause only if we *both* currently do not emit
-       * another NOP already *and* we are still inside a clause.               */
-      if (!*NOPs && (ctx.smem_clause || ctx.smem_write)) {         /* fixed “&&”→“&&” */
-            /* Clause must not contain stores or atomics. */
-            if (ctx.smem_write || instr->definitions.empty() ||
-                  instr_info.is_atomic[static_cast<unsigned>(instr->opcode)])
-            {
-                  *NOPs = 1;
-            }
-            /* With XNACK the clause may replay out of order – ensure no RAW. */
-            else if (program->dev.xnack_enabled) {
-                  for (const Operand& op : instr->operands) {
-                        if (!op.isConstant() &&
-                              test_bitset_range(ctx.smem_clause_write, op.physReg(), op.size()))
-                        {
-                              *NOPs = 1;
-                              break;
-                        }
-                  }
-
-                  if (!*NOPs) {
-                        const Definition& def = instr->definitions[0];
-                        if (test_bitset_range(ctx.smem_clause_read_write,
-                              def.physReg(), def.size()))
-                              *NOPs = 1;
-                  }
-            }
-      }
-}
-
-static bool has_intervening_valu(State& state, Block* start_block) {
-      std::stack<Block*> blocks_to_check;
-      std::set<unsigned> visited;
-      blocks_to_check.push(start_block);
-
-      while (!blocks_to_check.empty()) {
-            Block* block = blocks_to_check.top();
-            blocks_to_check.pop();
-
-            if (visited.count(block->index)) continue;
-            visited.insert(block->index);
-
-            // Search backwards for VALU instructions
-            for (auto it = block->instructions.rbegin(); it != block->instructions.rend(); ++it) {
-                  if ((*it)->isVALU()) return true;
-                  if (is_vcc_branch(*it)) break; // Stop at previous branch
-            }
-
-            // Add linear predecessors (to handle loop/control flow)
-            for (unsigned pred : block->linear_preds) {
-                  blocks_to_check.push(&state.program->blocks[pred]);
-            }
-      }
-      return false;
-}
-
-static void
-handle_instruction_gfx6(State&                             state,
-                        NOP_ctx_gfx6&                      ctx,
-                        aco_ptr<Instruction>&              instr,
-                        std::vector<aco_ptr<Instruction>>& new_instructions)
-{
-   /* --------------------------------------------------------------------
-    *  1.  Determine required wait-states *before* @instr
-    * ------------------------------------------------------------------ */
-   int NOPs = 0;
-
-   /* SALU→VCC→branch hazard (Vega = 1 wait-state) */
-   if (is_vcc_branch(instr)) {
-         if (state.program->gfx_level == GFX9) {
-               // Skip NOP if there's a VALU between SALU→VCC and branch
-               if (!has_intervening_valu(state, state.block)) {
-                     NOPs = std::max(NOPs, static_cast<int>(ctx.vcc_wr_then_branch));
-               }
-         } else {
-               NOPs = std::max(NOPs, static_cast<int>(ctx.vcc_wr_then_branch));
-         }
+   /* No need to break a clause if we're already inserting a NOP for another reason. */
+   if (*NOPs || (!ctx.smem_clause && !ctx.smem_write)) {
+      return;
    }
 
-   /* -------------------------  SMEM hazards  --------------------------- */
+   /* Don't allow clauses with store instructions or atomics due to side effects. */
+   if (ctx.smem_write || instr->definitions.empty() ||
+       instr_info.is_atomic[(unsigned)instr->opcode]) {
+      *NOPs = 1;
+      return;
+   }
+
+   if (program->dev.xnack_enabled) {
+      /* Check for RAW hazard: read of a register written earlier in the clause. */
+      for (Operand op : instr->operands) {
+         if (!op.isConstant() &&
+             test_bitset_range(ctx.smem_clause_write, op.physReg(), op.size())) {
+            *NOPs = 1;
+            return; /* Hazard found, break clause. */
+         }
+      }
+
+      /* Check for WAW/WAR hazard: write to a register read or written by another instruction. */
+      Definition def = instr->definitions[0];
+      if (test_bitset_range(ctx.smem_clause_read_write, def.physReg(), def.size())) {
+         *NOPs = 1;
+      }
+   }
+}
+
+/* TODO: we don't handle accessing VCC using the actual SGPR instead of using the alias */
+void
+handle_instruction_gfx6(State& state, NOP_ctx_gfx6& ctx, aco_ptr<Instruction>& instr,
+                        std::vector<aco_ptr<Instruction>>& new_instructions)
+{
+   /*
+    * This function follows a three-step process for each instruction:
+    * 1. CHECK: Determine required wait-states *before* the current instruction
+    *    based on the current hazard context (ctx).
+    * 2. EMIT: Insert `s_nop` or `s_waitcnt` if needed, and age the context counters.
+    * 3. UPDATE: Update the context with any *new* hazards created by the current instruction.
+    */
+
+   /* --- 1. CHECK FOR HAZARDS BEFORE CURRENT INSTRUCTION --- */
+   int NOPs = 0;
+
+   /* GFX9 SALU->VCC->Branch Hazard: Critical performance hazard. A SALU write to VCC
+    * followed by a branch that reads VCC without 2 intervening cycles causes a major
+    * pipeline flush. A VALU instruction in between resolves the hazard. */
+   if (instr->opcode == aco_opcode::s_cbranch_vccz ||
+       instr->opcode == aco_opcode::s_cbranch_vccnz) {
+      NOPs = MAX2(NOPs, (int)ctx.vcc_wr_then_branch);
+   }
+
    if (instr->isSMEM()) {
       if (state.program->gfx_level == GFX6) {
-         /* VALU/SALU → SMRD RAW hazards (4 wait-states). */
-         for (unsigned i = 0; i < instr->operands.size(); ++i) {
-            const Operand& op = instr->operands[i];
+         /* A read of an SGPR by SMRD instruction requires 4 wait states
+          * when the SGPR was written by a VALU instruction. According to LLVM,
+          * there is also an undocumented hardware behavior when the buffer
+          * descriptor is written by a SALU instruction. */
+         for (unsigned i = 0; i < instr->operands.size(); i++) {
+            Operand op = instr->operands[i];
             if (op.isConstant())
                continue;
 
-            const bool is_buffer_desc = (i == 0) && op.size() > 2;
+            bool is_buffer_desc = i == 0 && op.size() > 2;
             if (is_buffer_desc)
                handle_valu_salu_then_read_hazard(state, &NOPs, 4, op);
             else
@@ -595,161 +609,141 @@ handle_instruction_gfx6(State&                             state,
          }
       }
 
-      /* SMEM-clause hazards (replay/XNACK etc.). */
       handle_smem_clause_hazards(state.program, ctx, instr, &NOPs);
-   }
-
-   /* -------------------------  SALU hazards  --------------------------- */
-   else if (instr->isSALU()) {
-      if (instr->opcode == aco_opcode::s_setreg_b32         ||
-          instr->opcode == aco_opcode::s_setreg_imm32_b32   ||
-          instr->opcode == aco_opcode::s_getreg_b32)
-      {
-         NOPs = std::max(NOPs, static_cast<int>(ctx.setreg_then_getsetreg));
+   } else if (instr->isSALU()) {
+      if (instr->opcode == aco_opcode::s_setreg_b32 ||
+          instr->opcode == aco_opcode::s_setreg_imm32_b32 ||
+          instr->opcode == aco_opcode::s_getreg_b32) {
+         /* s_setreg followed by a s_getreg/s_setreg of the same register needs 2 waits.
+          * We use per-register tracking to avoid stalling unnecessarily. */
+         const SALU_instruction& sopk = instr->salu();
+         unsigned reg = sopk.imm & 0x3f;
+         if (reg < ctx.setreg_waits.size()) {
+            NOPs = MAX2(NOPs, (int)ctx.setreg_waits[reg]);
+         }
       }
 
-      if (state.program->gfx_level == GFX9 &&
-          (instr->opcode == aco_opcode::s_movrels_b32 ||
-           instr->opcode == aco_opcode::s_movrels_b64 ||
-           instr->opcode == aco_opcode::s_movreld_b32 ||
-           instr->opcode == aco_opcode::s_movreld_b64))
-      {
-         NOPs = std::max(NOPs, static_cast<int>(ctx.salu_wr_m0_then_moverel));
+      if (state.program->gfx_level == GFX9) {
+         if (instr->opcode == aco_opcode::s_movrels_b32 ||
+             instr->opcode == aco_opcode::s_movrels_b64 ||
+             instr->opcode == aco_opcode::s_movreld_b32 ||
+             instr->opcode == aco_opcode::s_movreld_b64) {
+            NOPs = MAX2(NOPs, (int)ctx.salu_wr_m0_then_moverel);
+         }
       }
 
-      if (instr->opcode == aco_opcode::s_sendmsg ||
-          instr->opcode == aco_opcode::s_ttracedata)
-      {
-         NOPs = std::max(NOPs,
-                         static_cast<int>(ctx.salu_wr_m0_then_gds_msg_ttrace));
-      }
-   }
-
-   /* -------------------------  DS / GDS hazards  ----------------------- */
-   else if (instr->isDS() && instr->ds().gds) {
-      NOPs = std::max(NOPs,
-                      static_cast<int>(ctx.salu_wr_m0_then_gds_msg_ttrace));
-   }
-
-   /* -------------------------  VALU / VINTRP  -------------------------- */
-   else if (instr->isVALU() || instr->isVINTRP()) {
+      if (instr->opcode == aco_opcode::s_sendmsg || instr->opcode == aco_opcode::s_ttracedata)
+         NOPs = MAX2(NOPs, (int)ctx.salu_wr_m0_then_gds_msg_ttrace);
+   } else if (instr->isDS() && instr->ds().gds) {
+      NOPs = MAX2(NOPs, (int)ctx.salu_wr_m0_then_gds_msg_ttrace);
+   } else if (instr->isVALU() || instr->isVINTRP()) {
       if (instr->isDPP()) {
-         NOPs = std::max(NOPs,
-                         static_cast<int>(ctx.valu_wr_exec_then_dpp));
+         NOPs = MAX2(NOPs, (int)ctx.valu_wr_exec_then_dpp);
          handle_valu_then_read_hazard(state, &NOPs, 2, instr->operands[0]);
       }
 
-      /* VMEM-store followed by WRDATA hazard. */
-      for (const Definition& def : instr->definitions) {
-            if (def.regClass().type() == RegType::sgpr)
-                  continue;
-
-            const unsigned base = def.physReg() & 0xff;
-            int max_wait = 0;
-            for (unsigned i = 0; i < def.size(); ++i) {
-                  max_wait = std::max(max_wait, static_cast<int>(ctx.vmem_store_then_wr_data[base + i]));
+      for (Definition def : instr->definitions) {
+         if (def.regClass().type() != RegType::sgpr) {
+            for (unsigned i = 0; i < def.size(); i++) {
+               unsigned reg_index = (def.physReg() & 0xff) + i;
+               if (reg_index < 256) {
+                  NOPs = MAX2(NOPs, (int)ctx.vmem_store_then_wr_data[reg_index]);
+               }
             }
-            if (max_wait > 0) {
-                  // Use s_waitcnt for GFX9 if wait ≥3 (more efficient than NOPs)
-                  if (state.program->gfx_level == GFX9 && max_wait >= 3) {
-                        Builder bld(state.program, &new_instructions);
-                        wait_imm imm;
-                        imm.lgkm = 0; // Wait for LGKM (LDS/GFX/MEM) operations to complete
-                        bld.sopp(aco_opcode::s_waitcnt, imm.pack(state.program->gfx_level));
-                        ctx.vmem_store_then_wr_data.reset(); // Clear hazard after wait
-                  } else {
-                        NOPs = std::max(NOPs, max_wait);
-                  }
-            }
+         }
       }
 
-      /* readlane / writelane hazards (SGPR index is operand[1]). */
-      if ((instr->opcode == aco_opcode::v_readlane_b32      ||
-           instr->opcode == aco_opcode::v_readlane_b32_e64  ||
-           instr->opcode == aco_opcode::v_writelane_b32     ||
+      if ((instr->opcode == aco_opcode::v_readlane_b32 ||
+           instr->opcode == aco_opcode::v_readlane_b32_e64 ||
+           instr->opcode == aco_opcode::v_writelane_b32 ||
            instr->opcode == aco_opcode::v_writelane_b32_e64) &&
-          !instr->operands[1].isConstant())
-      {
+          !instr->operands[1].isConstant()) {
          handle_valu_then_read_hazard(state, &NOPs, 4, instr->operands[1]);
       }
 
-      /* undocumented GFX6 VINTRP → readlane hazard. */
+      /* It's required to insert 1 wait state if the dst VGPR of any v_interp_*
+       * is followed by a read with v_readfirstlane or v_readlane to fix GPU
+       * hangs on GFX6. This hazard isn't documented anywhere but AMD confirmed it. */
       if (state.program->gfx_level == GFX6 &&
-          (instr->opcode == aco_opcode::v_readlane_b32 ||
-           instr->opcode == aco_opcode::v_readfirstlane_b32))
-      {
+          (instr->opcode == aco_opcode::v_readlane_b32 || /* GFX6 doesn't have v_readlane_b32_e64 */
+           instr->opcode == aco_opcode::v_readfirstlane_b32)) {
          handle_vintrp_then_read_hazard(state, &NOPs, 1, instr->operands[0]);
       }
 
-      /* VALU writes VCC → v_div_fmas reads VCC later. */
       if (instr->opcode == aco_opcode::v_div_fmas_f32 ||
-            instr->opcode == aco_opcode::v_div_fmas_f64)
-      {
-            ctx.valu_wr_vcc_then_div_fmas = (state.program->gfx_level == GFX9) ? 3 : 4;
-      }
-   }
-
-   /* -------------------------  VMEM / FLAT hazards  -------------------- */
-   else if (instr->isVMEM() || instr->isFlatLike()) {
-      for (const Operand& op : instr->operands) {
-         if (!op.isConstant() && !op.isUndefined() &&
-             op.regClass().type() == RegType::sgpr)
-         {
+          instr->opcode == aco_opcode::v_div_fmas_f64)
+         NOPs = MAX2(NOPs, (int)ctx.valu_wr_vcc_then_div_fmas);
+   } else if (instr->isVMEM() || instr->isFlatLike()) {
+      /* If a VALU writes an SGPR that is used by a VMEM, the user must add five wait states. */
+      for (Operand op : instr->operands) {
+         if (!op.isConstant() && !op.isUndefined() && op.regClass().type() == RegType::sgpr)
             handle_valu_then_read_hazard(state, &NOPs, 5, op);
-         }
       }
    }
 
-   /* v_skip wait-state hazard (non-SALU / non-SMEM). */
    if (!instr->isSALU() && instr->format != Format::SMEM)
-      NOPs = std::max(NOPs,
-                      static_cast<int>(ctx.set_vskip_mode_then_vector));
+      NOPs = MAX2(NOPs, (int)ctx.set_vskip_mode_then_vector);
 
-   /* Extra GFX9 LDS hazards. */
    if (state.program->gfx_level == GFX9) {
-      const bool lds_scratch_global =
-         (instr->isScratch() || instr->isGlobal()) && instr->flatlike().lds;
-
+      bool lds_scratch_global = (instr->isScratch() || instr->isGlobal()) && instr->flatlike().lds;
       if (instr->isVINTRP() || lds_scratch_global ||
-          instr->opcode == aco_opcode::ds_read_addtid_b32  ||
+          instr->opcode == aco_opcode::ds_read_addtid_b32 ||
           instr->opcode == aco_opcode::ds_write_addtid_b32 ||
-          instr->opcode == aco_opcode::buffer_store_lds_dword)
-      {
-         NOPs = std::max(NOPs,
-                         static_cast<int>(ctx.salu_wr_m0_then_lds));
+          instr->opcode == aco_opcode::buffer_store_lds_dword) {
+         NOPs = MAX2(NOPs, (int)ctx.salu_wr_m0_then_lds);
       }
    }
 
-   /* --------------------------------------------------------------------
-    *  2.  Emit NOPs / waitcnt and age live counters
-    * ------------------------------------------------------------------ */
-   ctx.add_wait_states(static_cast<unsigned>(NOPs) + get_wait_states(instr));
+   /* --- 2. EMIT WAITS AND AGE CONTEXT --- */
 
    if (NOPs) {
-         Builder bld(state.program, &new_instructions);
-         const bool long_wait  = NOPs >= 3;
-         const bool mem_hazard = ctx.vmem_store_then_wr_data.any() ||
-         ctx.smem_clause || ctx.smem_write;
+      /* Architecturally-aware waiting: for long waits (3+ cycles) related to memory,
+       * `s_waitcnt` is superior to a string of NOPs on GFX8+. It allows the scheduler
+       * to switch to other wavefronts and saves power. */
+      bool is_mem_related_hazard =
+         (ctx.vmem_store_then_wr_data.any() || instr->isSMEM() || instr->isVMEM() ||
+          instr->isFlatLike() || ctx.smem_clause || ctx.smem_write);
 
-         if (long_wait && mem_hazard) {
-               wait_imm imm;
-               imm.vm   = 0;
-               imm.lgkm = 0;
-               bld.sopp(aco_opcode::s_waitcnt, imm.pack(state.program->gfx_level));
-         } else {
-               bld.sopp(aco_opcode::s_nop, static_cast<uint16_t>(NOPs - 1));
+      Builder bld(state.program, &new_instructions);
+      if (state.program->gfx_level >= GFX8 && NOPs >= 3 && is_mem_related_hazard) {
+         /* Wait for both vector memory (VM) and LDS/GDS/scalar-mem (LGKM) counters to be 0. */
+         bld.sopp(aco_opcode::s_waitcnt, 0);
+      } else {
+         /* For shorter or non-memory stalls, use s_nop. Coalesce with a previous s_nop if possible. */
+         unsigned remaining_nops = NOPs;
+         if (!new_instructions.empty() && new_instructions.back()->opcode == aco_opcode::s_nop) {
+            /* The immediate field of s_nop is 8 bits and stores (wait_states - 1). Max wait is 256. */
+            unsigned current_imm = new_instructions.back()->salu().imm;
+            unsigned can_add = 255 - current_imm;
+            unsigned to_add = std::min(can_add, remaining_nops);
+
+            new_instructions.back()->salu().imm += to_add;
+            remaining_nops -= to_add;
          }
+
+         if (remaining_nops > 0) {
+            aco_ptr<Instruction> nop{create_instruction(aco_opcode::s_nop, Format::SOPP, 0, 0)};
+            nop->salu().imm = remaining_nops - 1;
+            new_instructions.emplace_back(std::move(nop));
+         }
+      }
    }
 
-   /* --------------------------------------------------------------------
-    *  3.  Update context (hazards *caused* by @instr)
-    * ------------------------------------------------------------------ */
+   /* Age all hazard counters by the number of cycles consumed by waits and the current instruction. */
+   ctx.add_wait_states(NOPs + get_wait_states(instr));
 
-   /* ---------- SMEM clause tracking ----------------------------------- */
-   if ((ctx.smem_clause || ctx.smem_write) &&
-       (NOPs || instr->format != Format::SMEM))
-   {
-      ctx.smem_clause = ctx.smem_write = false;
+   /* --- 3. UPDATE CONTEXT WITH NEW HAZARDS FROM CURRENT INSTRUCTION --- */
+
+   /* A VALU instruction resolves the SALU->VCC->Branch hazard. */
+   if (instr->isVALU()) {
+      ctx.vcc_wr_then_branch = 0;
+   }
+
+   /* Break SMEM clause if a non-SMEM instruction is emitted. */
+   if ((ctx.smem_clause || ctx.smem_write) && (NOPs || instr->format != Format::SMEM)) {
+      ctx.smem_clause = false;
+      ctx.smem_write = false;
+
       if (state.program->dev.xnack_enabled) {
          BITSET_ZERO(ctx.smem_clause_read_write);
          BITSET_ZERO(ctx.smem_clause_write);
@@ -757,307 +751,292 @@ handle_instruction_gfx6(State&                             state,
    }
 
    if (instr->isSMEM()) {
-      if (instr->definitions.empty() ||
-          instr_info.is_atomic[static_cast<unsigned>(instr->opcode)])
-      {
+      if (instr->definitions.empty() || instr_info.is_atomic[(unsigned)instr->opcode]) {
          ctx.smem_write = true;
       } else {
          ctx.smem_clause = true;
 
          if (state.program->dev.xnack_enabled) {
-            for (const Operand& op : instr->operands)
-               if (!op.isConstant())
-                  set_bitset_range(ctx.smem_clause_read_write,
-                                   op.physReg(), op.size());
+            for (Operand op : instr->operands) {
+               if (!op.isConstant()) {
+                  set_bitset_range(ctx.smem_clause_read_write, op.physReg(), op.size());
+               }
+            }
 
-            const Definition& def = instr->definitions[0];
-            set_bitset_range(ctx.smem_clause_read_write,
-                             def.physReg(), def.size());
-            set_bitset_range(ctx.smem_clause_write,
-                             def.physReg(), def.size());
+            Definition def = instr->definitions[0];
+            set_bitset_range(ctx.smem_clause_read_write, def.physReg(), def.size());
+            set_bitset_range(ctx.smem_clause_write, def.physReg(), def.size());
          }
       }
-   }
-
-   /* ---------- VALU post-processing ------------------------------------ */
-   else if (instr->isVALU()) {
-      for (const Definition& def : instr->definitions) {
-         if (def.regClass().type() != RegType::sgpr)
-            continue;
-
-         if (def.physReg() == vcc || def.physReg() == vcc_hi) {
-            ctx.valu_wr_vcc_then_div_fmas = (state.program->gfx_level == GFX9) ? 3 : 4;
+   } else if (instr->isVALU()) {
+      for (Definition def : instr->definitions) {
+         if (def.regClass().type() == RegType::sgpr) {
+            if (def.physReg() == vcc || def.physReg() == vcc_hi) {
+               ctx.valu_wr_vcc_then_div_fmas = 4;
             }
-         if (def.physReg() == exec || def.physReg() == exec_hi)
-            ctx.valu_wr_exec_then_dpp     = 5;
+            if (def.physReg() == exec || def.physReg() == exec_hi) {
+               ctx.valu_wr_exec_then_dpp = 5;
+            }
+         }
       }
-   }
-
-   /* ---------- SALU post-processing ------------------------------------ */
-   else if (instr->isSALU()) {
-      if (!instr->definitions.empty()) {
-         const Definition& def = instr->definitions[0];
+   } else if (instr->isSALU()) {
+      bool writes_vcc = false;
+      for (const Definition& def : instr->definitions) {
+         if (def.physReg() == vcc || def.physReg() == vcc_hi) {
+            writes_vcc = true;
+         }
          if (def.physReg() == m0) {
             ctx.salu_wr_m0_then_gds_msg_ttrace = 1;
-            ctx.salu_wr_m0_then_lds            = 1;
-            ctx.salu_wr_m0_then_moverel        = 1;
+            ctx.salu_wr_m0_then_lds = 1;
+            ctx.salu_wr_m0_then_moverel = 1;
          }
+      }
+      if (writes_vcc) {
+         ctx.vcc_wr_then_branch = 2;
       }
 
       if (instr->opcode == aco_opcode::s_setreg_b32 ||
-          instr->opcode == aco_opcode::s_setreg_imm32_b32)
-      {
+          instr->opcode == aco_opcode::s_setreg_imm32_b32) {
          SALU_instruction& sopk = instr->salu();
-         const unsigned offset = (sopk.imm >> 6) & 0x1f;
-         const unsigned size   = ((sopk.imm >> 11) & 0x1f) + 1;
-         const unsigned reg    =  sopk.imm & 0x3f;
+         unsigned offset = (sopk.imm >> 6) & 0x1f;
+         unsigned size = ((sopk.imm >> 11) & 0x1f) + 1;
+         unsigned reg = sopk.imm & 0x3f;
 
-         ctx.setreg_then_getsetreg = 2;
+         if (reg < ctx.setreg_waits.size()) {
+            ctx.setreg_waits[reg] = 2;
+         }
 
-         /* MODE register (SGPR1), bit 28 is v_skip. */
-         if (reg == 1u && offset <= 28u && (28u - offset) < size) {
-            bool bit_known = false;
-            uint32_t src_val = 0u;
+         /* Constant-aware v_skip hazard tracking. */
+         if (reg == 1 && offset <= 28 && (offset + size > 28)) {
+            bool value_known = false;
+            uint32_t value = 0;
 
             if (instr->opcode == aco_opcode::s_setreg_imm32_b32) {
-               src_val  = sopk.imm;
-               bit_known = true;
-            } else if (sopk.operands[0].isConstant()) {
-               src_val  = sopk.operands[0].constantValue();
-               bit_known = true;
+               if (instr->operands[0].isConstant()) {
+                  value = instr->operands[0].constantValue();
+                  value_known = true;
+               }
+            } else { /* s_setreg_b32 */
+               if (instr->operands[1].isConstant()) {
+                  value = instr->operands[1].constantValue();
+                  value_known = true;
+               }
             }
 
-            if (bit_known) {
-               const uint8_t new_bit =
-                  static_cast<uint8_t>((src_val >> (28u - offset)) & 1u);
-               if (new_bit != ctx.current_vskip) {
+            if (value_known) {
+               uint8_t new_vskip_bit = (value >> (28 - offset)) & 1;
+               if (ctx.current_vskip != new_vskip_bit) {
                   ctx.set_vskip_mode_then_vector = 2;
-                  ctx.current_vskip = new_bit;
+                  ctx.current_vskip = new_vskip_bit;
                }
             } else {
-               /* Unknown value – conservatively assume it toggles. */
+               /* Value is not known, conservatively assume it changes. */
                ctx.set_vskip_mode_then_vector = 2;
-               ctx.current_vskip ^= 1u;
             }
          }
       }
-   }
-
-   /* ---------- VMEM store → WRDATA tracker ---------------------------- */
-   else if (instr->isVMEM() || instr->isFlatLike()) {
-      const bool consider_buf  = (instr->isMUBUF() || instr->isMTBUF()) &&
-                                 instr->operands.size() == 4 &&
-                                 instr->operands[3].size() > 2 &&
-                                 instr->operands[2].physReg() >= 128;
-      const bool consider_mimg = instr->isMIMG() &&
-                                 instr->operands[1].regClass().type() == RegType::vgpr &&
-                                 instr->operands[1].size() > 2 &&
-                                 instr->operands[0].size() == 4;
-      const bool consider_flat = instr->isFlatLike() &&
-                                 instr->operands.size() == 3 &&
-                                 instr->operands[2].size() > 2;
-
+   } else if (instr->isVMEM() || instr->isFlatLike()) {
+      /* >64-bit MUBUF/MTBUF store with a constant in SOFFSET */
+      bool consider_buf = (instr->isMUBUF() || instr->isMTBUF()) && instr->operands.size() == 4 &&
+                          instr->operands[3].size() > 2 && instr->operands[2].physReg() >= 128;
+      /* MIMG store with a 128-bit T# with more than two bits set in dmask (making it a >64-bit store) */
+      bool consider_mimg = instr->isMIMG() &&
+                           instr->operands[1].regClass().type() == RegType::vgpr &&
+                           instr->operands[1].size() > 2 && instr->operands[0].size() == 4;
+      /* FLAT/GLOBAL/SCRATCH store with >64-bit data */
+      bool consider_flat =
+         instr->isFlatLike() && instr->operands.size() == 3 && instr->operands[2].size() > 2;
       if (consider_buf || consider_mimg || consider_flat) {
-         const unsigned op_idx = consider_flat ? 2 : 3;
-         const PhysReg wrdata  = instr->operands[op_idx].physReg();
-         const unsigned size   = instr->operands[op_idx].size();
+         PhysReg wrdata = instr->operands[consider_flat ? 2 : 3].physReg();
+         unsigned size = instr->operands[consider_flat ? 2 : 3].size();
 
-         for (unsigned i = 0; i < size; ++i)
-            ctx.vmem_store_then_wr_data[(wrdata & 0xff) + i] = 1u;
-      }
-   }
-
-   /* ---------- Track SALU writes to VCC for next branch --------------- */
-   if (instr->isSALU()) {
-      for (const Definition& def : instr->definitions) {
-         if (def.physReg() == vcc || def.physReg() == vcc_hi) {
-            ctx.vcc_wr_then_branch = 1;  /* Vega: exactly 1 wait-state. */
-            break;
+         /* Safety: Bounds-check the write to the bitset to prevent UB. */
+         uint32_t base = (wrdata & 0xffu);
+         if (base < 256) {
+            unsigned max_store = std::min<unsigned>(size, 256 - base);
+            for (unsigned i = 0; i < max_store; ++i) {
+               ctx.vmem_store_then_wr_data[base + i] = 1;
+            }
          }
       }
    }
 }
 
 bool
-is_latest_instr_vintrp(bool& global_state, bool& block_state, aco_ptr<Instruction>& pred) {
-      if (pred->isVINTRP())
-            global_state = true;
-      return true;
+is_latest_instr_vintrp(bool& global_state, bool& block_state, aco_ptr<Instruction>& pred)
+{
+   if (pred->isVINTRP())
+      global_state = true;
+   return true;
 }
 
 template <bool Salu, bool Sgpr>
 bool
-handle_wr_hazard_instr(int& global_state, int& block_state, aco_ptr<Instruction>& pred) {
-      if (Salu ? pred->isSALU() : (pred->isVALU() || pred->isVINTRP())) {
-            for (Definition dst : pred->definitions) {
-                  if ((dst.physReg().reg() < 256) == Sgpr) {
-                        global_state = MAX2(global_state, block_state);
-                        return true;
-                  }
-            }
+handle_wr_hazard_instr(int& global_state, int& block_state, aco_ptr<Instruction>& pred)
+{
+   if (Salu ? pred->isSALU() : (pred->isVALU() || pred->isVINTRP())) {
+      for (Definition dst : pred->definitions) {
+         if ((dst.physReg().reg() < 256) == Sgpr) {
+            global_state = MAX2(global_state, block_state);
+            return true;
+         }
       }
+   }
 
-      block_state -= get_wait_states(pred);
-      return block_state <= 0;
+   block_state -= get_wait_states(pred);
+   return block_state <= 0;
 }
 
 template <bool Salu, bool Sgpr>
 void
-handle_wr_hazard(State& state, int* NOPs, int min_states) {
-      if (*NOPs >= min_states)
-            return;
+handle_wr_hazard(State& state, int* NOPs, int min_states)
+{
+   if (*NOPs >= min_states)
+      return;
 
-      int global = 0;
-      int block = min_states;
-      search_backwards<int, int, nullptr, handle_wr_hazard_instr<Salu, Sgpr>>(state, global, block);
-      *NOPs = MAX2(*NOPs, global);
+   int global = 0;
+   int block = min_states;
+   search_backwards<int, int, nullptr, handle_wr_hazard_instr<Salu, Sgpr>>(state, global, block);
+   *NOPs = MAX2(*NOPs, global);
 }
 
-/* ---------------------------------------------------------------------------
- *  Final “resolve all pending hazards” for the current basic block (GFX6-9)
- * ------------------------------------------------------------------------- */
-static void
+void
 resolve_all_gfx6(State& state, NOP_ctx_gfx6& ctx,
-                 std::vector<aco_ptr<Instruction>>& new_instructions) {
+                 std::vector<aco_ptr<Instruction>>& new_instructions)
+{
    int NOPs = 0;
 
-   /* SGPR→SMEM hazards (only on pre-GFX8) */
+   /* SGPR->SMEM hazards */
    if (state.program->gfx_level == GFX6) {
       handle_wr_hazard<true, true>(state, &NOPs, 4);
       handle_wr_hazard<false, true>(state, &NOPs, 4);
    }
 
-   /* Break SMEM clauses if one is still open. */
+   /* Break up SMEM clauses */
    if (ctx.smem_clause || ctx.smem_write)
-      NOPs = std::max(NOPs, 1);
+      NOPs = MAX2(NOPs, 1);
 
-   /* SALU / LDS hazards still active? */
-   NOPs = std::max(NOPs, static_cast<int>(ctx.setreg_then_getsetreg));
+   /* SALU/GDS hazards */
+   NOPs = MAX2(NOPs, (int)ctx.get_max_setreg_wait());
    if (state.program->gfx_level == GFX9)
-      NOPs = std::max(NOPs, static_cast<int>(ctx.salu_wr_m0_then_moverel));
-   NOPs = std::max(NOPs, static_cast<int>(ctx.salu_wr_m0_then_gds_msg_ttrace));
+      NOPs = MAX2(NOPs, (int)ctx.salu_wr_m0_then_moverel);
+   NOPs = MAX2(NOPs, (int)ctx.salu_wr_m0_then_gds_msg_ttrace);
+   NOPs = MAX2(NOPs, (int)ctx.vcc_wr_then_branch);
 
    /* VALU hazards */
-   NOPs = std::max(NOPs, static_cast<int>(ctx.valu_wr_exec_then_dpp));
+   NOPs = MAX2(NOPs, (int)ctx.valu_wr_exec_then_dpp);
    if (state.program->gfx_level >= GFX8)
-      handle_wr_hazard<false, false>(state, &NOPs, 2); /* VALU→DPP */
-   if (ctx.vmem_store_then_wr_data.any())
-      NOPs = std::max(NOPs, 1);
+      handle_wr_hazard<false, false>(state, &NOPs, 2); /* VALU->DPP */
+   NOPs = MAX2(NOPs, ctx.vmem_store_then_wr_data.any() ? 1 : 0);
    if (state.program->gfx_level == GFX6) {
+      /* VINTRP->v_readlane_b32/etc */
       bool vintrp = false;
-      search_backwards<bool, bool, nullptr, is_latest_instr_vintrp>(
-         state, vintrp, vintrp);
+      search_backwards<bool, bool, nullptr, is_latest_instr_vintrp>(state, vintrp, vintrp);
       if (vintrp)
-         NOPs = std::max(NOPs, 1);
+         NOPs = MAX2(NOPs, 1);
    }
-   NOPs = std::max(NOPs, static_cast<int>(ctx.valu_wr_vcc_then_div_fmas));
+   NOPs = MAX2(NOPs, (int)ctx.valu_wr_vcc_then_div_fmas);
 
-   /* VALU(sgpr)→VMEM / readlane hazards. */
+   /* VALU(sgpr)->VMEM/v_readlane_b32/etc hazards. v_readlane_b32/etc require only 4 NOPs. */
    handle_wr_hazard<false, true>(state, &NOPs, 5);
 
-   /* MODE.vskip hazard still pending? */
-   NOPs = std::max(NOPs, static_cast<int>(ctx.set_vskip_mode_then_vector));
+   NOPs = MAX2(NOPs, (int)ctx.set_vskip_mode_then_vector);
 
    if (state.program->gfx_level == GFX9)
-      NOPs = std::max(NOPs, static_cast<int>(ctx.salu_wr_m0_then_lds));
+      NOPs = MAX2(NOPs, (int)ctx.salu_wr_m0_then_lds);
 
-   /* --------------------------------------------------------------------
-    *  Emit final waits and age counters
-    * ------------------------------------------------------------------ */
-   ctx.add_wait_states(static_cast<unsigned>(NOPs));
-
+   ctx.add_wait_states(NOPs);
    if (NOPs) {
       Builder bld(state.program, &new_instructions);
+      bool is_mem_related_hazard =
+         (ctx.vmem_store_then_wr_data.any() || ctx.smem_clause || ctx.smem_write);
 
-      const bool long_wait  = NOPs >= 3;
-      const bool mem_hazard = ctx.vmem_store_then_wr_data.any() ||
-                              ctx.smem_clause || ctx.smem_write;
-
-      if (long_wait && mem_hazard) {
-         wait_imm imm;
-         imm.vm   = 0;
-         imm.lgkm = 0;
-         bld.sopp(aco_opcode::s_waitcnt,
-                  imm.pack(state.program->gfx_level)); /* <<< FIXED */
+      if (state.program->gfx_level >= GFX8 && NOPs >= 3 && is_mem_related_hazard) {
+         bld.sopp(aco_opcode::s_waitcnt, 0);
       } else {
-         bld.sopp(aco_opcode::s_nop,
-                  static_cast<uint16_t>(NOPs - 1));
+         bld.sopp(aco_opcode::s_nop, NOPs - 1);
       }
    }
 }
 
 template <std::size_t N>
 bool
-check_written_regs(const aco_ptr<Instruction>& instr, const std::bitset<N>& check_regs) {
-      return std::any_of(instr->definitions.begin(), instr->definitions.end(),
-                         [&check_regs](const Definition& def) -> bool {
-                               bool writes_any = false;
-                               for (unsigned i = 0; i < def.size(); i++) {
-                                     unsigned def_reg = def.physReg() + i;
-                                     writes_any |= def_reg < check_regs.size() && check_regs[def_reg];
-                               }
-                               return writes_any;
-                         });
+check_written_regs(const aco_ptr<Instruction>& instr, const std::bitset<N>& check_regs)
+{
+   return std::any_of(instr->definitions.begin(), instr->definitions.end(),
+                      [&check_regs](const Definition& def) -> bool {
+                         bool writes_any = false;
+                         for (unsigned i = 0; i < def.size(); i++) {
+                            unsigned def_reg = def.physReg() + i;
+                            writes_any |= def_reg < check_regs.size() && check_regs[def_reg];
+                         }
+                         return writes_any;
+                      });
 }
 
 template <std::size_t N>
 void
-mark_read_regs(const aco_ptr<Instruction>& instr, std::bitset<N>& reg_reads) {
-      for (const Operand& op : instr->operands) {
-            for (unsigned i = 0; i < op.size(); i++) {
-                  unsigned reg = op.physReg() + i;
-                  if (reg < reg_reads.size())
-                        reg_reads.set(reg);
-            }
+mark_read_regs(const aco_ptr<Instruction>& instr, std::bitset<N>& reg_reads)
+{
+   for (const Operand& op : instr->operands) {
+      for (unsigned i = 0; i < op.size(); i++) {
+         unsigned reg = op.physReg() + i;
+         if (reg < reg_reads.size())
+            reg_reads.set(reg);
       }
+   }
 }
 
 template <std::size_t N>
 void
-mark_read_regs_exec(State& state, const aco_ptr<Instruction>& instr, std::bitset<N>& reg_reads) {
-      mark_read_regs(instr, reg_reads);
-      reg_reads.set(exec);
-      if (state.program->wave_size == 64)
-            reg_reads.set(exec_hi);
+mark_read_regs_exec(State& state, const aco_ptr<Instruction>& instr, std::bitset<N>& reg_reads)
+{
+   mark_read_regs(instr, reg_reads);
+   reg_reads.set(exec);
+   if (state.program->wave_size == 64)
+      reg_reads.set(exec_hi);
 }
 
 bool
-VALU_writes_sgpr(aco_ptr<Instruction>& instr) {
-      if (instr->isVOPC())
-            return true;
-      if (instr->isVOP3() && instr->definitions.size() == 2)
-            return true;
-      if (instr->opcode == aco_opcode::v_readfirstlane_b32 ||
-            instr->opcode == aco_opcode::v_readlane_b32 ||
-            instr->opcode == aco_opcode::v_readlane_b32_e64)
-            return true;
-      return false;
+VALU_writes_sgpr(aco_ptr<Instruction>& instr)
+{
+   if (instr->isVOPC())
+      return true;
+   if (instr->isVOP3() && instr->definitions.size() == 2)
+      return true;
+   if (instr->opcode == aco_opcode::v_readfirstlane_b32 ||
+       instr->opcode == aco_opcode::v_readlane_b32 ||
+       instr->opcode == aco_opcode::v_readlane_b32_e64)
+      return true;
+   return false;
 }
 
 bool
-instr_writes_sgpr(const aco_ptr<Instruction>& instr) {
-      return std::any_of(instr->definitions.begin(), instr->definitions.end(),
-                         [](const Definition& def) -> bool {
-                               return def.getTemp().type() == RegType::sgpr;
-                         });
+instr_writes_sgpr(const aco_ptr<Instruction>& instr)
+{
+   return std::any_of(instr->definitions.begin(), instr->definitions.end(),
+                      [](const Definition& def) -> bool {
+                         return def.getTemp().type() == RegType::sgpr;
+                      });
 }
 
 inline bool
-instr_is_branch(const aco_ptr<Instruction>& instr) {
-      return instr->opcode == aco_opcode::s_branch || instr->opcode == aco_opcode::s_cbranch_scc0 ||
-      instr->opcode == aco_opcode::s_cbranch_scc1 ||
-      instr->opcode == aco_opcode::s_cbranch_vccz ||
-      instr->opcode == aco_opcode::s_cbranch_vccnz ||
-      instr->opcode == aco_opcode::s_cbranch_execz ||
-      instr->opcode == aco_opcode::s_cbranch_execnz ||
-      instr->opcode == aco_opcode::s_cbranch_cdbgsys ||
-      instr->opcode == aco_opcode::s_cbranch_cdbguser ||
-      instr->opcode == aco_opcode::s_cbranch_cdbgsys_or_user ||
-      instr->opcode == aco_opcode::s_cbranch_cdbgsys_and_user ||
-      instr->opcode == aco_opcode::s_subvector_loop_begin ||
-      instr->opcode == aco_opcode::s_subvector_loop_end ||
-      instr->opcode == aco_opcode::s_setpc_b64 || instr->opcode == aco_opcode::s_swappc_b64 ||
-      instr->opcode == aco_opcode::s_getpc_b64 || instr->opcode == aco_opcode::s_call_b64;
+instr_is_branch(const aco_ptr<Instruction>& instr)
+{
+   return instr->opcode == aco_opcode::s_branch || instr->opcode == aco_opcode::s_cbranch_scc0 ||
+          instr->opcode == aco_opcode::s_cbranch_scc1 ||
+          instr->opcode == aco_opcode::s_cbranch_vccz ||
+          instr->opcode == aco_opcode::s_cbranch_vccnz ||
+          instr->opcode == aco_opcode::s_cbranch_execz ||
+          instr->opcode == aco_opcode::s_cbranch_execnz ||
+          instr->opcode == aco_opcode::s_cbranch_cdbgsys ||
+          instr->opcode == aco_opcode::s_cbranch_cdbguser ||
+          instr->opcode == aco_opcode::s_cbranch_cdbgsys_or_user ||
+          instr->opcode == aco_opcode::s_cbranch_cdbgsys_and_user ||
+          instr->opcode == aco_opcode::s_subvector_loop_begin ||
+          instr->opcode == aco_opcode::s_subvector_loop_end ||
+          instr->opcode == aco_opcode::s_setpc_b64 || instr->opcode == aco_opcode::s_swappc_b64 ||
+          instr->opcode == aco_opcode::s_getpc_b64 || instr->opcode == aco_opcode::s_call_b64;
 }
 
 void
@@ -1078,6 +1057,27 @@ handle_instruction_gfx10(State& state, NOP_ctx_gfx10& ctx, aco_ptr<Instruction>&
       vm_vsrc = (instr->salu().imm >> 2) & 0x7;
       sa_sdst = instr->salu().imm & 0x1;
    }
+
+   /* FPAtomicToDenormModeHazard */
+   if (instr->opcode == aco_opcode::s_denorm_mode && ctx.waits_since_fp_atomic < 3) {
+      bld.sopp(aco_opcode::s_nop, 3 - ctx.waits_since_fp_atomic - 1);
+      ctx.waits_since_fp_atomic = 3;
+   } else if (instr->isVALU() || instr->opcode == aco_opcode::s_waitcnt ||
+              instr->opcode == aco_opcode::s_waitcnt_vscnt ||
+              instr->opcode == aco_opcode::s_waitcnt_vmcnt ||
+              instr->opcode == aco_opcode::s_waitcnt_expcnt ||
+              instr->opcode == aco_opcode::s_waitcnt_lgkmcnt ||
+              instr->opcode == aco_opcode::s_wait_idle) {
+      ctx.waits_since_fp_atomic = 3;
+   } else if (instr_is_vmem_fp_atomic(instr.get())) {
+      ctx.waits_since_fp_atomic = 0;
+   } else {
+      ctx.waits_since_fp_atomic += get_wait_states(instr);
+      ctx.waits_since_fp_atomic = std::min(ctx.waits_since_fp_atomic, 3);
+   }
+
+   if (state.program->gfx_level != GFX10)
+      return; /* no other hazards/bugs to mitigate */
 
    /* VMEMtoScalarWriteHazard
     * Handle EXEC/M0/SGPR write following a VMEM/DS instruction without a VALU or "waitcnt vmcnt(0)"
@@ -1245,6 +1245,13 @@ resolve_all_gfx10(State& state, NOP_ctx_gfx10& ctx,
 
    size_t prev_count = new_instructions.size();
 
+   /* FPAtomicToDenormModeHazard */
+   if (ctx.waits_since_fp_atomic < 3)
+      bld.sopp(aco_opcode::s_nop, 3 - ctx.waits_since_fp_atomic - 1);
+
+   if (state.program->gfx_level != GFX10)
+      return; /* no other hazards/bugs to mitigate */
+
    /* VcmpxPermlaneHazard */
    if (ctx.has_VOPC_write_exec) {
       ctx.has_VOPC_write_exec = false;
@@ -1319,13 +1326,15 @@ test_vgpr_bitset(std::bitset<256>& set, Operand op)
 }
 
 /* GFX11 */
-struct LdsDirectVALUHazardGlobalState {
+struct LdsDirectVALUHazardGlobalState
+{
    unsigned wait_vdst = 15;
    PhysReg vgpr;
    std::set<unsigned> loop_headers_visited;
 };
 
-struct LdsDirectVALUHazardBlockState {
+struct LdsDirectVALUHazardBlockState
+{
    unsigned num_valu = 0;
    bool has_trans = false;
 
@@ -1412,12 +1421,14 @@ enum VALUPartialForwardingHazardState : uint8_t {
    exec_written,
 };
 
-struct VALUPartialForwardingHazardGlobalState {
+struct VALUPartialForwardingHazardGlobalState
+{
    bool hazard_found = false;
    std::set<unsigned> loop_headers_visited;
 };
 
-struct VALUPartialForwardingHazardBlockState {
+struct VALUPartialForwardingHazardBlockState
+{
    /* initialized by number of VGPRs read by VALU, decrement when encountered to return early */
    uint8_t num_vgprs_read = 0;
    BITSET_DECLARE(vgprs_read, 256) = {0};
@@ -1740,7 +1751,8 @@ handle_instruction_gfx11(State& state, NOP_ctx_gfx11& ctx, aco_ptr<Instruction>&
                   ctx.sgpr_read_by_valu_as_lanemask.set(instr->operands.back().physReg().reg() + 1);
                }
                break;
-            default: break;
+            default:
+               break;
             }
          }
       }
@@ -2187,7 +2199,8 @@ insert_NOPs(Program* program)
       bool has_previous_part =
          program->is_epilog || program->info.vs.has_prolog || program->info.ps.has_prolog ||
          (program->info.merged_shader_compiled_separately && program->stage.sw != SWStage::VS &&
-          program->stage.sw != SWStage::TES) || program->stage == raytracing_cs;
+          program->stage.sw != SWStage::TES) ||
+         program->stage == raytracing_cs;
       if (program->gfx_level >= GFX12 && has_previous_part) {
          /* resolve_all_gfx11 can't resolve VALUReadSGPRHazard entirely. We have to assume that any
           * SGPR might have been read by VALU if there was a previous shader part.
@@ -2197,8 +2210,6 @@ insert_NOPs(Program* program)
 
       mitigate_hazards<NOP_ctx_gfx11, handle_instruction_gfx11, resolve_all_gfx11>(program,
                                                                                    initial_ctx);
-   } else if (program->gfx_level >= GFX10_3) {
-      ; /* no hazards/bugs to mitigate */
    } else if (program->gfx_level >= GFX10) {
       mitigate_hazards<NOP_ctx_gfx10, handle_instruction_gfx10, resolve_all_gfx10>(program);
    } else {
