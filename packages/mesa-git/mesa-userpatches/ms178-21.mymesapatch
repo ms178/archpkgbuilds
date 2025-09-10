@@ -1,0 +1,384 @@
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -1085,9 +1085,26 @@ radv_write_data(struct radv_cmd_buffer *
+ static void
+ radv_emit_clear_data(struct radv_cmd_buffer *cmd_buffer, unsigned engine_sel, uint64_t va, unsigned size)
+ {
+-   uint32_t *zeroes = alloca(size);
+-   memset(zeroes, 0, size);
+-   radv_write_data(cmd_buffer, engine_sel, va, size / 4, zeroes, false);
++   /* 256-byte static zero buffer; resides in .rodata; avoids alloca and stack probes. */
++   static const uint32_t zeros[64] = {0};
++
++   /* All call sites use 4-byte multiples. Keep an assert and also a runtime guard. */
++   assert(size > 0 && (size % 4) == 0);
++
++   if (size <= sizeof(zeros)) {
++      /* Fast path: single write for tiny clears (typical: 8–256 bytes). */
++      radv_write_data(cmd_buffer, engine_sel, va, size / 4, zeros, false);
++      return;
++   }
++
++   /* Rare path: clear larger regions safely in chunks to avoid stack allocations. */
++   unsigned remaining = size;
++   while (remaining) {
++      const unsigned chunk = remaining > sizeof(zeros) ? sizeof(zeros) : remaining;
++      radv_write_data(cmd_buffer, engine_sel, va, chunk / 4, zeros, false);
++      va += chunk;
++      remaining -= chunk;
++   }
+ }
+ 
+ static void
+@@ -1320,26 +1337,36 @@ bool
+ radv_cmd_buffer_upload_alloc_aligned(struct radv_cmd_buffer *cmd_buffer, unsigned size, unsigned alignment,
+                                      unsigned *out_offset, void **ptr)
+ {
++   /* All uploads must be 4-byte aligned. */
+    assert(size % 4 == 0);
+ 
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+    const struct radeon_info *gpu_info = &pdev->info;
+ 
+-   /* Align to the scalar cache line size if it results in this allocation
+-    * being placed in less of them.
+-    */
+    unsigned offset = cmd_buffer->upload.offset;
+-   unsigned line_size = gpu_info->gfx_level >= GFX10 ? 64 : 32;
+-   unsigned gap = align(offset, line_size) - offset;
+-   if ((size & (line_size - 1)) > gap)
+-      offset = align(offset, line_size);
+ 
+-   if (alignment)
+-      offset = align(offset, alignment);
++   /* For GFX9 (Vega), the scalar cache line size is 32 bytes.
++    * We always align to at least this size to ensure that shader fetches
++    * of descriptors or constants do not suffer from cache-line splits.
++    * The requested 'alignment' is respected if it is larger.
++    */
++   const unsigned line_size = gpu_info->gfx_level >= GFX10 ? 64 : 32;
++
++   /* Determine the required alignment. Use the larger of the requested
++    * alignment and the hardware's cache line size. This can be done
++    * branchlessly.
++    */
++   unsigned final_alignment = alignment > line_size ? alignment : line_size;
++
++   /* Align the offset. The align() macro is typically branchless. */
++   offset = align(offset, final_alignment);
++
+    if (offset + size > cmd_buffer->upload.size) {
+-      if (!radv_cmd_buffer_resize_upload_buf(cmd_buffer, size))
++      if (!radv_cmd_buffer_resize_upload_buf(cmd_buffer, size)) {
+          return false;
++      }
++      /* After resizing, the new offset is always 0, which is already aligned. */
+       offset = 0;
+    }
+ 
+@@ -2550,13 +2577,21 @@ radv_emit_binning_state(struct radv_cmd_
+ static void
+ radv_emit_shader_prefetch(struct radv_cmd_buffer *cmd_buffer, struct radv_shader *shader)
+ {
+-   uint64_t va;
+-
+    if (!shader)
+       return;
+ 
+-   va = radv_shader_get_va(shader);
++   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
++   struct radv_cmd_stream *cs = cmd_buffer->cs;
++
++   /* Invariant: Never prefetch a VA unless its BO is in the IB's validation list.
++    * Otherwise, the CP DMA might touch an unmapped VA, leading to gfx ring timeout.
++    * Adding the buffer is idempotent and cheap for already-added BOs.
++    */
++   radv_cs_add_buffer(device->ws, cs->b, shader->bo);
+ 
++   const uint64_t va = radv_shader_get_va(shader);
++
++   /* Prefetch shader code into L2. This is a hint; it doesn't alter state. */
+    radv_cp_dma_prefetch(cmd_buffer, va, shader->code_size);
+ }
+ 
+@@ -3826,6 +3861,11 @@ radv_emit_graphics_shaders(struct radv_c
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+ 
++   /* Warm L2 for first-stage graphics (VS/VBO/MS) as early as possible.
++    * Safe due to BO validation inside radv_emit_shader_prefetch().
++    */
++   radv_emit_graphics_prefetch(cmd_buffer, true);
++
+    radv_foreach_stage (s, cmd_buffer->state.active_stages & RADV_GRAPHICS_STAGE_BITS) {
+       switch (s) {
+       case MESA_SHADER_VERTEX:
+@@ -5596,46 +5636,36 @@ radv_emit_guardband_state(struct radv_cm
+    const bool draw_lines =
+       radv_vgt_outprim_is_line(vgt_outprim_type) || radv_polygon_mode_is_line(d->vk.rs.polygon_mode);
+    struct radv_cmd_stream *cs = cmd_buffer->cs;
+-   int i;
+-   float guardband_x = INFINITY, guardband_y = INFINITY;
+-   float discard_x = 1.0f, discard_y = 1.0f;
+-   const float max_range = 32767.0f;
+ 
+    if (!d->vk.vp.viewport_count)
+       return;
+ 
+-   for (i = 0; i < d->vk.vp.viewport_count; i++) {
+-      float scale_x = fabsf(d->vp_xform[i].scale[0]);
+-      float scale_y = fabsf(d->vp_xform[i].scale[1]);
+-      const float translate_x = fabsf(d->vp_xform[i].translate[0]);
+-      const float translate_y = fabsf(d->vp_xform[i].translate[1]);
+-
+-      if (scale_x < 0.5)
+-         scale_x = 0.5;
+-      if (scale_y < 0.5)
+-         scale_y = 0.5;
+-
+-      guardband_x = MIN2(guardband_x, (max_range - translate_x) / scale_x);
+-      guardband_y = MIN2(guardband_y, (max_range - translate_y) / scale_y);
+-
+-      if (draw_points || draw_lines) {
+-         /* When rendering wide points or lines, we need to be more conservative about when to
+-          * discard them entirely. */
+-         float pixels;
+-
+-         if (draw_points) {
+-            pixels = 8191.875f;
+-         } else {
+-            pixels = d->vk.rs.line.width;
+-         }
++   const float max_range = 32767.0f;
++   float guardband_x = INFINITY, guardband_y = INFINITY;
++   float discard_x = 1.0f, discard_y = 1.0f;
+ 
+-         /* Add half the point size / line width. */
+-         discard_x += pixels / (2.0 * scale_x);
+-         discard_y += pixels / (2.0 * scale_y);
+-
+-         /* Discard primitives that would lie entirely outside the clip region. */
+-         discard_x = MIN2(discard_x, guardband_x);
+-         discard_y = MIN2(discard_y, guardband_y);
++   const bool wide = draw_points || draw_lines;
++   const float pixels = draw_points ? 8191.875f : d->vk.rs.line.width;
++   const float halfpix = pixels * 0.5f;
++
++   for (unsigned i = 0; i < d->vk.vp.viewport_count; i++) {
++      float sx = fabsf(d->vp_xform[i].scale[0]);
++      float sy = fabsf(d->vp_xform[i].scale[1]);
++      sx = fmaxf(sx, 0.5f);
++      sy = fmaxf(sy, 0.5f);
++
++      const float tx = fabsf(d->vp_xform[i].translate[0]);
++      const float ty = fabsf(d->vp_xform[i].translate[1]);
++
++      const float gbx = (max_range - tx) / sx;
++      const float gby = (max_range - ty) / sy;
++
++      guardband_x = fminf(guardband_x, gbx);
++      guardband_y = fminf(guardband_y, gby);
++
++      if (wide) {
++         discard_x = fminf(discard_x + (halfpix / sx), guardband_x);
++         discard_y = fminf(discard_y + (halfpix / sy), guardband_y);
+       }
+    }
+ 
+@@ -6676,16 +6706,34 @@ struct radv_prim_vertex_count {
+ static inline unsigned
+ radv_prims_for_vertices(struct radv_prim_vertex_count *info, unsigned num)
+ {
+-   if (num == 0)
++   if (num < info->min) {
+       return 0;
++   }
+ 
+-   if (info->incr == 0)
++   /* This check also implicitly handles info->incr == 0, preventing division by zero. */
++   if (info->incr == 0) {
+       return 0;
++   }
+ 
+-   if (num < info->min)
+-      return 0;
++   const unsigned n = num - info->min;
+ 
+-   return 1 + ((num - info->min) / info->incr);
++   switch (info->incr) {
++   case 1:
++      return 1 + n;
++   case 2:
++      return 1 + (n >> 1);
++   case 3:
++      /* Fast unsigned division by 3: (n * 0xAAAAAAAB) >> 33 */
++      return 1 + (unsigned)(((uint64_t)n * 0xAAAAAAABull) >> 33);
++   case 4:
++      return 1 + (n >> 2);
++   case 6:
++      /* Fast unsigned division by 6: (n * 0x2AAAAAAB) >> 33 */
++      return 1 + (unsigned)(((uint64_t)n * 0x2AAAAAABull) >> 33);
++   default:
++      /* Fallback for uncommon divisors. */
++      return 1 + (n / info->incr);
++   }
+ }
+ 
+ static const struct radv_prim_vertex_count prim_size_table[] = {
+@@ -7093,29 +7141,57 @@ radv_src_access_flush(struct radv_cmd_bu
+                       VkAccessFlags3KHR src3_flags, const struct radv_image *image,
+                       const VkImageSubresourceRange *range)
+ {
+-   const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
++   (void)src3_flags; /* API parameter; not needed here. Keep ABI stable. */
+ 
++   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
++
++   /* Expand stage-dependent access flags per Vulkan spec so we operate
++    * on a fully expanded source access set.
++    */
+    src_flags = vk_expand_src_access_flags2(src_stages, src_flags);
+ 
+-   bool has_CB_meta = true, has_DB_meta = true;
+-   bool image_is_coherent = image ? radv_image_is_l2_coherent(device, image, range) : false;
++   /* Tracking flags for metadata support on the given image. */
++   bool has_CB_meta = true;
++   bool has_DB_meta = true;
++
++   /* Determine whether the resource (image or buffer) is L2-coherent.
++    * - For images: query per-image coherence (format/usage/layout family).
++    * - For buffers (image == NULL): use the GPU capability/heuristic to
++    *   decide if buffer L2 flushes can be skipped.
++    */
++   const bool resource_is_coherent =
++      image ? radv_image_is_l2_coherent(device, image, range)
++            : can_skip_buffer_l2_flushes(device);
++
+    enum radv_cmd_flush_bits flush_bits = 0;
+ 
++   /* If we have an image, determine if CB/DB metadata paths are enabled. */
+    if (image) {
+       if (!radv_image_has_CB_metadata(image))
+          has_CB_meta = false;
++      /* HTILE enabled => DB/HTILE metadata exists on this mip. */
+       if (!radv_htile_enabled(image, range ? range->baseMipLevel : 0))
+          has_DB_meta = false;
+    }
+ 
+-   if (src_flags & VK_ACCESS_2_COMMAND_PREPROCESS_WRITE_BIT_EXT)
++   /* Command preprocess writes (e.g., DGC/NGG meta):
++    * Conservative L2 invalidate to ensure command streams are visible.
++    * This path is rare and correctness-sensitive.
++    */
++   if (src_flags & VK_ACCESS_2_COMMAND_PREPROCESS_WRITE_BIT_EXT) {
+       flush_bits |= RADV_CMD_FLAG_INV_L2;
++   }
++
++   /* SSBO and Acceleration Structure writes:
++    * Ensure visibility for consumers. If the write is to an IMAGE via meta operations
++    * (no STORAGE usage), flush the appropriate block (CB/DB) too.
++    * For buffers on parts with coherent L2, avoid heavy L2 invalidations.
++    */
++   if (src_flags & (VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
++                    VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)) {
+ 
+-   if (src_flags & (VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)) {
+-      /* since the STORAGE bit isn't set we know that this is a meta operation.
+-       * on the dst flush side we skip CB/DB flushes without the STORAGE bit, so
+-       * set it here. */
+       if (image && !(image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
++         /* These writes likely went through CB/DB or other non-storage image paths. */
+          if (vk_format_is_depth_or_stencil(image->vk.format)) {
+             flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_DB;
+          } else {
+@@ -7123,37 +7199,69 @@ radv_src_access_flush(struct radv_cmd_bu
+          }
+       }
+ 
+-      if (!image_is_coherent)
++      /* Only touch L2 if the resource isn't L2-coherent. Buffers on GFX9+ often are coherent. */
++      if (!resource_is_coherent) {
++         /* Invalidate L2 on source side for generic shader/AS writes to discard stale clean lines
++          * and synchronize with units that may have bypassed L2 (e.g., SDMA or non-coherent paths).
++          * Destination side will handle its own client cache invalidations (e.g., VCACHE/SCACHE).
++          */
+          flush_bits |= RADV_CMD_FLAG_INV_L2;
++      }
+    }
+ 
+-   if (src_flags &
+-       (VK_ACCESS_2_TRANSFORM_FEEDBACK_WRITE_BIT_EXT | VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT)) {
+-      if (!image_is_coherent)
++   /* Transform feedback writes and counters are buffer writes.
++    * If not L2-coherent, publish results by writing back dirty L2 lines. */
++   if (src_flags & (VK_ACCESS_2_TRANSFORM_FEEDBACK_WRITE_BIT_EXT |
++                    VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT)) {
++      if (!resource_is_coherent) {
+          flush_bits |= RADV_CMD_FLAG_WB_L2;
++      }
+    }
+ 
++   /* Color attachment writes:
++    * - Always flush+invalidate CB to force data out of RB caches.
++    * - If the image is not L2-coherent, write back dirty L2 lines to VRAM
++    *   (publishes results without thrashing clean data).
++    * - Invalidate CB metadata (DCC) when present.
++    */
+    if (src_flags & VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT) {
+       flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB;
+-      if (!image_is_coherent)
+-         flush_bits |= RADV_CMD_FLAG_INV_L2;
++
++      if (!resource_is_coherent)
++         flush_bits |= RADV_CMD_FLAG_WB_L2;
++
+       if (has_CB_meta)
+          flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB_META;
+    }
+ 
++   /* Depth/stencil attachment writes:
++    * - Always flush+invalidate DB to force data out of DB caches.
++    * - If the image is not L2-coherent, write back dirty L2 lines to VRAM.
++    * - Invalidate DB metadata (HTILE) when enabled.
++    */
+    if (src_flags & VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT) {
+       flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_DB;
+-      if (!image_is_coherent)
+-         flush_bits |= RADV_CMD_FLAG_INV_L2;
++
++      if (!resource_is_coherent)
++         flush_bits |= RADV_CMD_FLAG_WB_L2;
++
+       if (has_DB_meta)
+          flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_DB_META;
+    }
+ 
++   /* Transfer writes (copies/blits/clears):
++    * - Conservative: flush both CB and DB (some transfer paths use either).
++    * - If the resource is not L2-coherent, invalidate L2 on the source side,
++    *   because SDMA or other paths may bypass L2, leaving stale clean lines.
++    * - Invalidate metadata as needed.
++    */
+    if (src_flags & VK_ACCESS_2_TRANSFER_WRITE_BIT) {
+-      flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB | RADV_CMD_FLAG_FLUSH_AND_INV_DB;
++      flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB |
++                    RADV_CMD_FLAG_FLUSH_AND_INV_DB;
+ 
+-      if (!image_is_coherent)
++      if (!resource_is_coherent)
+          flush_bits |= RADV_CMD_FLAG_INV_L2;
++
+       if (has_CB_meta)
+          flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB_META;
+       if (has_DB_meta)
+@@ -7912,6 +8020,9 @@ radv_emit_compute_pipeline(struct radv_c
+    if (pipeline == cmd_buffer->state.emitted_compute_pipeline)
+       return;
+ 
++   /* Warm L2 for CS before programming. Safe due to BO validation in prefetch. */
++   radv_emit_compute_prefetch(cmd_buffer);
++
+    radeon_check_space(device->ws, cs->b, pdev->info.gfx_level >= GFX10 ? 25 : 22);
+ 
+    if (pipeline->base.type == RADV_PIPELINE_COMPUTE) {
