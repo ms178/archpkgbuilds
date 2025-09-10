@@ -2815,17 +2815,17 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *qv,
         return;
     }
 
-    /* 1) Tiny microbursts: immediate interrupt for minimum latency. */
-    if (pkts > 0 && pkts <= 16) {
-        usecs = 0;
-        goto out;
-    }
+    /* 1) Tiny microbursts: low ITR for latency, but not 0 */
+	if (pkts > 0 && pkts <= 16) {
+		usecs = 16; /* was 0; safer minimum */
+		goto out;
+	}
 
-    /* 2) Small bursts of tiny packets: very low ITR (4us). */
-    if (pkts > 0 && pkts <= 64 && bytes <= (pkts << 8)) { /* mean <= 256 bytes */
-        usecs = 4;
-        goto out;
-    }
+	/* 2) Small bursts of tiny packets: very low ITR (4us) */
+	if (pkts > 0 && pkts <= 64 && bytes <= (pkts << 8)) {
+		usecs = 8; /* was 4; slightly less aggressive */
+		goto out;
+	}
 
     /* 3) Idle: gently increase interrupt delay to reduce background interrupts. */
     if (!pkts) {
@@ -3604,150 +3604,139 @@ static __always_inline unsigned long ixgbe_cpu_capacity(unsigned int cpu)
 	return topology_get_cpu_scale(cpu);
 }
 
-/* Build preferred CPU mask: NUMA-local ∩ primary SMT ∩ top-capacity CPUs (P-cores). */
-static int ixgbe_build_performance_mask(struct ixgbe_adapter *adapter,
-                                        cpumask_var_t pref)
+static int ixgbe_build_eco_mask(struct ixgbe_adapter *adapter, cpumask_var_t eco)
 {
-    cpumask_var_t node_mask, primaries, top;
-    unsigned int cpu;
-    int node;
-    unsigned long max_cap = 0;
+	cpumask_var_t node_mask, primaries;
+	int node;
+	unsigned int cpu;
+	unsigned long max_cap = 0, thr;
 
-    if (!zalloc_cpumask_var(&node_mask, GFP_KERNEL) ||
-        !zalloc_cpumask_var(&primaries, GFP_KERNEL) ||
-        !zalloc_cpumask_var(&top, GFP_KERNEL)) {
-        free_cpumask_var(node_mask);
-        free_cpumask_var(primaries);
-        free_cpumask_var(top);
-        return -ENOMEM;
-    }
+	if (!zalloc_cpumask_var(&node_mask, GFP_KERNEL) ||
+	    !zalloc_cpumask_var(&primaries, GFP_KERNEL)) {
+		free_cpumask_var(node_mask);
+		free_cpumask_var(primaries);
+		return -ENOMEM;
+	}
 
-    node = dev_to_node(&adapter->pdev->dev);
-    if (node != NUMA_NO_NODE) {
-        cpumask_copy(node_mask, cpumask_of_node(node));
-        if (cpumask_empty(node_mask))
-            cpumask_copy(node_mask, cpu_online_mask);
-    } else {
-        cpumask_copy(node_mask, cpu_online_mask);
-    }
+	/* NUMA-local, intersect with online */
+	node = dev_to_node(&adapter->pdev->dev);
+	if (node != NUMA_NO_NODE)
+		cpumask_copy(node_mask, cpumask_of_node(node));
+	else
+		cpumask_copy(node_mask, cpu_possible_mask);
+	cpumask_and(node_mask, node_mask, cpu_online_mask);
+	if (cpumask_empty(node_mask))
+		cpumask_copy(node_mask, cpu_online_mask);
 
-    /* Keep only primary SMT threads to avoid hyperthread contention. */
-    cpumask_clear(primaries);
-    for_each_cpu(cpu, node_mask) {
-        const struct cpumask *sibs = topology_sibling_cpumask(cpu);
-        if (!sibs || cpu == cpumask_first(sibs))
-            cpumask_set_cpu(cpu, primaries);
-    }
+	/* Keep only primary SMT threads */
+	cpumask_clear(primaries);
+	for_each_cpu(cpu, node_mask) {
+		const struct cpumask *sibs = topology_sibling_cpumask(cpu);
+		if (!sibs || cpu == cpumask_first(sibs))
+			cpumask_set_cpu(cpu, primaries);
+	}
 
-    /* Compute max capacity and keep CPUs within ~12.5% of it (P-cores). */
-    for_each_cpu(cpu, primaries) {
-        unsigned long cap = topology_get_cpu_scale(cpu);
-        if (cap > max_cap)
-            max_cap = cap;
-    }
+	/* Compute max capacity among primaries */
+	for_each_cpu(cpu, primaries) {
+		unsigned long cap = topology_get_cpu_scale(cpu);
+		if (cap > max_cap)
+			max_cap = cap;
+	}
 
-    {
-        unsigned long thr = (max_cap * 7) / 8;
-        cpumask_clear(top);
-        for_each_cpu(cpu, primaries) {
-            unsigned long cap = topology_get_cpu_scale(cpu);
-            if (cap >= thr)
-                cpumask_set_cpu(cpu, top);
-        }
-    }
+	/* Select CPUs with capacity <= 3/4 max as E-cores (low capacity) */
+	cpumask_clear(eco);
+	if (max_cap) {
+		thr = (max_cap * 3) / 4;
+		for_each_cpu(cpu, primaries) {
+			unsigned long cap = topology_get_cpu_scale(cpu);
+			if (cap <= thr)
+				cpumask_set_cpu(cpu, eco);
+		}
+	}
 
-    if (!cpumask_empty(top))
-        cpumask_copy(pref, top);
-    else if (!cpumask_empty(primaries))
-        cpumask_copy(pref, primaries);
-    else if (!cpumask_empty(node_mask))
-        cpumask_copy(pref, node_mask);
-    else
-        cpumask_copy(pref, cpu_online_mask);
+	/* Fallbacks */
+	if (cpumask_empty(eco)) {
+		if (!cpumask_empty(primaries))
+			cpumask_copy(eco, primaries);
+		else
+			cpumask_copy(eco, node_mask);
+	}
 
-    free_cpumask_var(node_mask);
-    free_cpumask_var(primaries);
-    free_cpumask_var(top);
-    return 0;
+	free_cpumask_var(node_mask);
+	free_cpumask_var(primaries);
+	return 0;
 }
 
-/* Request MSI-X IRQs and set per-vector affinity hints to preferred CPUs. */
+/* E-core friendly MSI-X request with broad affinity hints that cooperate with irqbalance.
+ * We provide a NUMA-local E-core mask as a hint for each vector. irqbalance then distributes
+ * interrupts within this set, honoring your BANNED_CPULIST and any policy.
+ */
 static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
 {
-    struct net_device *netdev = adapter->netdev;
-    unsigned int ri = 0, ti = 0;
-    cpumask_var_t pref_mask;
-    unsigned int pick;
-    int vector, err;
+	struct net_device *netdev = adapter->netdev;
+	cpumask_var_t eco_mask;
+	unsigned int ri = 0, ti = 0;
+	int vector, err;
 
-    if (!zalloc_cpumask_var(&pref_mask, GFP_KERNEL))
-        return -ENOMEM;
+	if (!zalloc_cpumask_var(&eco_mask, GFP_KERNEL))
+		return -ENOMEM;
 
-    if (ixgbe_build_performance_mask(adapter, pref_mask))
-        cpumask_copy(pref_mask, cpu_online_mask);
+	/* Build E-core friendly hint mask; fallback to online mask if needed */
+	if (ixgbe_build_eco_mask(adapter, eco_mask))
+		cpumask_copy(eco_mask, cpu_online_mask);
 
-    pick = cpumask_first(pref_mask);
-    if (pick >= nr_cpu_ids)
-        pick = 0;
+	/* Queue vectors */
+	for (vector = 0; vector < adapter->num_q_vectors; vector++) {
+		struct ixgbe_q_vector *qv = adapter->q_vector[vector];
+		struct msix_entry *entry = &adapter->msix_entries[vector];
 
-    for (vector = 0; vector < adapter->num_q_vectors; vector++) {
-        struct ixgbe_q_vector *qv = adapter->q_vector[vector];
-        struct msix_entry *entry = &adapter->msix_entries[vector];
-        cpumask_t one;
+		if (!qv)
+			continue;
 
-        if (!qv)
-            continue;
+		if (qv->tx.ring && qv->rx.ring)
+			snprintf(qv->name, sizeof(qv->name), "%s-TxRx-%u", netdev->name, ri++);
+		else if (qv->rx.ring)
+			snprintf(qv->name, sizeof(qv->name), "%s-rx-%u", netdev->name, ri++);
+		else if (qv->tx.ring)
+			snprintf(qv->name, sizeof(qv->name), "%s-tx-%u", netdev->name, ti++);
+		else
+			continue;
 
-        if (qv->tx.ring && qv->rx.ring) {
-            snprintf(qv->name, sizeof(qv->name), "%s-TxRx-%u", netdev->name, ri++);
-            ti++;
-        } else if (qv->rx.ring) {
-            snprintf(qv->name, sizeof(qv->name), "%s-rx-%u", netdev->name, ri++);
-        } else if (qv->tx.ring) {
-            snprintf(qv->name, sizeof(qv->name), "%s-tx-%u", netdev->name, ti++);
-        } else {
-            continue; /* unused q_vector */
-        }
+		err = request_irq(entry->vector, ixgbe_msix_clean_rings, 0, qv->name, qv);
+		if (err) {
+			e_err(probe, "request_irq failed for MSIx vector %d: %d\n", vector, err);
+			goto free_queue_irqs;
+		}
 
-        err = request_irq(entry->vector, ixgbe_msix_clean_rings, 0, qv->name, qv);
-        if (err) {
-            e_err(probe, "request_irq failed for MSIx vector %d: %d\n", vector, err);
-            goto free_queue_irqs;
-        }
+		/* Provide a broad E-core hint. Do NOT hard-pin to one CPU. */
+		cpumask_copy(&qv->affinity_mask, eco_mask);
+		irq_set_affinity_hint(entry->vector, &qv->affinity_mask);
+	}
 
-        /* Pin each vector to one CPU (hint), spreading across preferred mask. */
-        cpumask_clear(&one);
-        cpumask_set_cpu(pick, &one);
-        cpumask_copy(&qv->affinity_mask, &one);
-        irq_set_affinity_hint(entry->vector, &qv->affinity_mask);
+	/* "Other causes" vector (the entry after the last queue vector) */
+	err = request_irq(adapter->msix_entries[vector].vector,
+			  ixgbe_msix_other, 0, netdev->name, adapter);
+	if (err) {
+		e_err(probe, "request_irq for msix_other failed: %d\n", err);
+		goto free_queue_irqs;
+	}
+	/* Hint "other" vector to E-cores as well (low rate, but consistent policy) */
+	irq_set_affinity_hint(adapter->msix_entries[vector].vector, eco_mask);
 
-        /* Move to next preferred CPU, wrap if needed. */
-        pick = cpumask_next(pick, pref_mask);
-        if (pick >= nr_cpu_ids)
-            pick = cpumask_first(pref_mask);
-    }
-
-    err = request_irq(adapter->msix_entries[vector].vector,
-                      ixgbe_msix_other, 0, netdev->name, adapter);
-    if (err) {
-        e_err(probe, "request_irq for msix_other failed: %d\n", err);
-        goto free_queue_irqs;
-    }
-
-    free_cpumask_var(pref_mask);
-    return 0;
+	free_cpumask_var(eco_mask);
+	return 0;
 
 free_queue_irqs:
-    while (vector--) {
-        irq_set_affinity_hint(adapter->msix_entries[vector].vector, NULL);
-        free_irq(adapter->msix_entries[vector].vector, adapter->q_vector[vector]);
-    }
-    free_cpumask_var(pref_mask);
-    adapter->flags &= ~IXGBE_FLAG_MSIX_ENABLED;
-    pci_disable_msix(adapter->pdev);
-    kfree(adapter->msix_entries);
-    adapter->msix_entries = NULL;
-    return err;
+	while (vector--) {
+		irq_set_affinity_hint(adapter->msix_entries[vector].vector, NULL);
+		free_irq(adapter->msix_entries[vector].vector, adapter->q_vector[vector]);
+	}
+	free_cpumask_var(eco_mask);
+	adapter->flags &= ~IXGBE_FLAG_MSIX_ENABLED;
+	pci_disable_msix(adapter->pdev);
+	kfree(adapter->msix_entries);
+	adapter->msix_entries = NULL;
+	return err;
 }
 
 /**
