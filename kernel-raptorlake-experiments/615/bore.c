@@ -707,127 +707,171 @@ DEFINE_PER_CPU(struct bore_penalty_cache, bore_penalty_cache);
 
 void update_burst_penalty(struct sched_entity *se)
 {
-	struct rq  *rq    = rq_of(cfs_rq_of(se));
-	struct bore_penalty_cache *cache = this_cpu_ptr(&bore_penalty_cache);
-	u64 burst_local = READ_ONCE(se->burst_time);
-	u8  current_gen = (u8)atomic_read(&bore_penalty_gen);
-	u32 new_pen = 0;
+    struct rq *rq;
+    struct cfs_rq *cfs_rq;
+    struct bore_penalty_cache *cache;
+    u64 burst_time;
+    u32 new_penalty;
+    u8 current_gen;
+    enum x86_topology_cpu_type ctype;
 
-	lockdep_assert_rq_held(rq);
+    /* Fast path: skip non-task entities */
+    if (unlikely(!entity_is_task(se))) {
+        return;
+    }
 
-	/* Fast path: test same se/cpu/gen and same greed bucket conditions */
-	if (likely(cache->last_se == se &&
-		  cache->last_cpu == rq->cpu &&
-		  cache->gen == current_gen)) {
+    cfs_rq = cfs_rq_of(se);
+    rq = rq_of(cfs_rq);
 
-		if (burst_local == cache->last_burst_time) {
-			/* Perfect hit: nothing changed */
-			se->curr_burst_penalty = cache->last_penalty;
-			goto have_curr;
-		}
+    lockdep_assert_rq_held(rq);
 
-		/* Bucket-level hit checks */
-		{
-			u16 greed_q8_now = log2_u64_q24_8(burst_local);
-#ifdef CONFIG_X86
-			if (static_branch_unlikely(&bore_itd_key)) {
-				/* ITD-aware fast hit: skip MSR if cached class still valid */
-				struct bore_itd_state *st = this_cpu_ptr(&bore_itd_state);
-				u64 now = local_clock();
-				u64 last = READ_ONCE(st->last_sample_ns);
-				u64 gap  = READ_ONCE(sched_burst_itd_sample_ns);
-				u8  st_valid = READ_ONCE(st->last_valid);
-				u8  st_class = READ_ONCE(st->last_class);
+    /*
+     * Access cache with preemption already disabled by rq->lock.
+     * No need for additional local_irq_save().
+     */
+    cache = this_cpu_ptr(&bore_penalty_cache);
+    burst_time = READ_ONCE(se->burst_time);
+    current_gen = (u8)atomic_read(&bore_penalty_gen);
+    ctype = bore_get_rq_cpu_type(rq);
 
-				if (likely(greed_q8_now == cache->last_greed_q8 &&
-					   st_valid &&
-					   last && (now - last) < gap &&
-					   cache->last_itd_valid &&
-					   st_class == cache->last_itd_classid)) {
-					se->curr_burst_penalty = cache->last_penalty;
-					goto have_curr;
-				}
-			} else
-#endif
-			{
-				if (likely(greed_q8_now == cache->last_greed_q8)) {
-					se->curr_burst_penalty = cache->last_penalty;
-					goto have_curr;
-				}
-			}
-		}
-	}
+    /*
+     * Cache hit conditions:
+     * 1. Same scheduling entity
+     * 2. Same CPU (migration check)
+     * 3. Same generation (tunable parameters unchanged)
+     * 4. Same burst_time or same logarithmic bucket
+     */
+    if (likely(cache->last_se == se &&
+               cache->last_cpu == rq->cpu &&
+               cache->gen == current_gen)) {
 
-	/* Miss: recompute */
-	{
-		enum x86_topology_cpu_type ctype = bore_get_rq_cpu_type(rq);
-		new_pen = __calc_burst_penalty(burst_local, ctype);
+        /* Perfect hit: exact same burst_time */
+        if (burst_time == cache->last_burst_time) {
+            se->curr_burst_penalty = cache->last_penalty;
+            cache->hit_count++;
+            goto update_aggregate;
+        }
+
+        /* Bucket hit: same logarithmic penalty region */
+        {
+            u16 greed_q8_now = (u16)log2_u64_q24_8(burst_time);
 
 #ifdef CONFIG_X86
-		if (static_branch_unlikely(&bore_itd_key)) {
-			/* Bias with ITD/HFI classification. Preemption is disabled. */
-			bool is_pcore = per_cpu(bore_penalty, rq->cpu).itd_pri > 0;
-			u8 classid;
+            if (static_branch_unlikely(&bore_itd_key)) {
+                /*
+                 * ITD-aware cache: check if classification unchanged
+                 * within sampling window
+                 */
+                struct bore_itd_state *itd_st = this_cpu_ptr(&bore_itd_state);
+                u64 now = local_clock();
+                u64 last_sample = READ_ONCE(itd_st->last_sample_ns);
+                u64 sample_gap = READ_ONCE(sched_burst_itd_sample_ns);
 
-			bore_itd_lazy_enable_this_cpu();
-			if (bore_itd_read_class(&classid)) {
-				new_pen = bore_itd_bias_penalty_fast(new_pen, classid, is_pcore);
-				cache->last_itd_classid = classid;
-				cache->last_itd_valid   = 1;
-			} else {
-				cache->last_itd_valid   = 0;
-			}
-		}
-#endif
+                if (likely(greed_q8_now == cache->last_greed_q8 &&
+                          cache->last_itd_valid &&
+                          last_sample &&
+                          (now - last_sample) < sample_gap &&
+                          READ_ONCE(itd_st->last_valid) &&
+                          READ_ONCE(itd_st->last_class) == cache->last_itd_classid)) {
+                    se->curr_burst_penalty = cache->last_penalty;
+                    cache->hit_count++;
+                    goto update_aggregate;
+                }
+            } else
+#endif /* CONFIG_X86 */
+            {
+                /* Non-ITD bucket hit */
+                if (likely(greed_q8_now == cache->last_greed_q8)) {
+                    se->curr_burst_penalty = cache->last_penalty;
+                    cache->hit_count++;
+                    goto update_aggregate;
+                }
+            }
 
-		/* Update cache */
-		cache->last_se         = se;
-		cache->last_burst_time = burst_local;
-		cache->last_penalty    = new_pen;
-		cache->last_cpu        = rq->cpu;
-		cache->gen             = current_gen;
-		cache->last_greed_q8   = log2_u64_q24_8(burst_local);
-		cache->last_ctype      = (u8)bore_get_rq_cpu_type(rq);
-		cache->last_pcore      = (per_cpu(bore_penalty, rq->cpu).itd_pri > 0);
+            /* Update for next comparison */
+            cache->last_greed_q8 = greed_q8_now;
+        }
+    }
 
-		se->curr_burst_penalty = new_pen;
-		cache->miss_count++;
-	}
+    /*
+     * Cache miss: recalculate penalty
+     * This is the expensive path we try to avoid
+     */
+    cache->miss_count++;
 
-have_curr:
-	/* Compute aggregate penalty and avoid re-scoring when provably unchanged. */
-	{
-		u32 old_bp = se->burst_penalty;
-		u32 agg_bp = max(se->prev_burst_penalty, se->curr_burst_penalty);
+    new_penalty = __calc_burst_penalty(burst_time, ctype);
 
-		if (unlikely(agg_bp != old_bp)) {
-			se->burst_penalty = agg_bp;
-			update_burst_score(se);
-		} else {
 #ifdef CONFIG_X86
-			if (!static_branch_unlikely(&bore_core_aware_key)) {
-				/* No core-aware extras → score can't change without bp change. */
-				cache->hit_count++;
-				return;
-			} else {
-				/* Core-aware extras: ensure same cpu/type/pcore as last time. */
-				u8 cur_ctype = (u8)bore_get_rq_cpu_type(rq);
-				u8 cur_pcore = (per_cpu(bore_penalty, rq->cpu).itd_pri > 0);
-				if (cache->last_cpu == rq->cpu &&
-				    cache->last_ctype == cur_ctype &&
-				    cache->last_pcore == cur_pcore) {
-					cache->hit_count++;
-					return;
-				}
-				/* Fallback: rescore due to environment change. */
-				update_burst_score(se);
-			}
-#else
-			cache->hit_count++;
-			return;
-#endif
-		}
-	}
+    if (static_branch_unlikely(&bore_itd_key)) {
+        /*
+         * Apply ITD biasing if available
+         * Lazy-init happens here if needed
+         */
+        bool is_pcore = per_cpu(bore_penalty, rq->cpu).itd_pri > 0;
+        u8 classid;
+
+        bore_itd_lazy_enable_this_cpu();
+
+        if (bore_itd_read_class(&classid)) {
+            new_penalty = bore_itd_bias_penalty_fast(new_penalty,
+                                                     classid,
+                                                     is_pcore);
+            cache->last_itd_classid = classid;
+            cache->last_itd_valid = 1;
+        } else {
+            cache->last_itd_valid = 0;
+        }
+    }
+#endif /* CONFIG_X86 */
+
+    /* Update cache entry with memory barrier for coherency */
+    cache->last_se = se;
+    cache->last_burst_time = burst_time;
+    cache->last_penalty = new_penalty;
+    cache->last_cpu = rq->cpu;
+    cache->gen = current_gen;
+    cache->last_ctype = (u8)ctype;
+    cache->last_pcore = (per_cpu(bore_penalty, rq->cpu).itd_pri > 0);
+
+    /* Ensure cache updates are visible before proceeding */
+    smp_wmb();
+
+    se->curr_burst_penalty = new_penalty;
+
+update_aggregate:
+    /*
+     * Update aggregate penalty and trigger reweight if needed
+     * This is the common path for both hits and misses
+     */
+    {
+        u32 old_penalty = se->burst_penalty;
+        u32 new_aggregate = max(se->prev_burst_penalty,
+                               se->curr_burst_penalty);
+
+        if (unlikely(new_aggregate != old_penalty)) {
+            se->burst_penalty = new_aggregate;
+            update_burst_score(se);
+        } else if (static_branch_unlikely(&bore_core_aware_key)) {
+            /*
+             * Core-aware mode: check if environment changed
+             * even if penalty unchanged
+             */
+            u8 cur_ctype = (u8)bore_get_rq_cpu_type(rq);
+            u8 cur_pcore = (per_cpu(bore_penalty, rq->cpu).itd_pri > 0);
+
+            if (cache->last_cpu != rq->cpu ||
+                cache->last_ctype != cur_ctype ||
+                cache->last_pcore != cur_pcore) {
+                /* Environment changed: rescore */
+                update_burst_score(se);
+
+                /* Update cache environment */
+                cache->last_cpu = rq->cpu;
+                cache->last_ctype = cur_ctype;
+                cache->last_pcore = cur_pcore;
+            }
+        }
+    }
 }
 EXPORT_SYMBOL_GPL(update_burst_penalty);
 
@@ -988,42 +1032,120 @@ EXPORT_SYMBOL_GPL(restart_burst);
 
 void restart_burst_rescale_deadline(struct sched_entity *se)
 {
-	struct task_struct *p;
-	u8 old_eff_prio, new_eff_prio;
-	s64 vruntime_remaining;
-	struct rq *rq = rq_of(cfs_rq_of(se));
+    struct task_struct *p;
+    struct rq *rq;
+    struct cfs_rq *cfs_rq;
+    u8 old_eff_prio, new_eff_prio;
+    s64 vruntime_remaining;
+    s64 new_deadline;
+    u64 weight_remaining;
+    enum x86_topology_cpu_type ctype;
 
-	if (unlikely(!entity_is_task(se))) {
-		return;
-	}
+    /* Fast path: skip non-task entities */
+    if (unlikely(!entity_is_task(se))) {
+        return;
+    }
 
-	lockdep_assert_rq_held(rq);
+    cfs_rq = cfs_rq_of(se);
+    rq = rq_of(cfs_rq);
 
-	p = task_of(se);
-	old_eff_prio        = effective_prio(p);
-	vruntime_remaining  = se->deadline - se->vruntime;
+    lockdep_assert_rq_held(rq);
 
-	revolve_burst_penalty_state(se, bore_get_rq_cpu_type(rq));
-	se->burst_penalty = se->prev_burst_penalty;
-	update_burst_score(se);
+    p = task_of(se);
+    old_eff_prio = effective_prio(p);
 
-	new_eff_prio = effective_prio(p);
-	if (old_eff_prio > new_eff_prio) { /* only rescale if priority improved */
-		u64 abs_vrem  = bore_abs64(vruntime_remaining);
-		u64 weight_u  = __unscale_slice(abs_vrem, old_eff_prio);
-		u64 vruntime_scaled_new;
+    /* Update burst state with proper core type awareness */
+    ctype = bore_get_rq_cpu_type(rq);
+    revolve_burst_penalty_state(se, ctype);
+    se->burst_penalty = se->prev_burst_penalty;
+    update_burst_score(se);
 
-		/* Clamp to avoid extreme jumps under pathological conditions. */
-		abs_vrem = min_t(u64, abs_vrem, (u64)BORE_MAX_VRUNTIME_CLAMP);
+    new_eff_prio = effective_prio(p);
 
-		vruntime_scaled_new = __scale_slice(weight_u, new_eff_prio);
+    /* Fast path: no priority change, no rescaling needed */
+    if (likely(old_eff_prio == new_eff_prio)) {
+        return;
+    }
 
-		if (vruntime_remaining < 0) {
-			se->deadline = se->vruntime - (s64)vruntime_scaled_new;
-		} else {
-			se->deadline = se->vruntime + (s64)vruntime_scaled_new;
-		}
-	}
+    /* Only rescale if priority improved (lower numeric value) */
+    if (old_eff_prio <= new_eff_prio) {
+        return;
+    }
+
+    /*
+     * Calculate remaining time in weight-invariant units.
+     * This preserves fairness across priority changes.
+     */
+    vruntime_remaining = se->deadline - se->vruntime;
+
+    /*
+     * Handle three cases:
+     * 1. Already expired (vruntime_remaining <= 0): keep expired
+     * 2. Far future deadline: clamp to prevent overflow
+     * 3. Normal case: rescale proportionally
+     */
+    if (vruntime_remaining <= 0) {
+        /*
+         * Task already exceeded deadline. Preserve the overrun
+         * amount but scale it to new priority to maintain
+         * relative punishment.
+         */
+        u64 overrun = (u64)(-vruntime_remaining);
+
+        /* Prevent extreme overruns from causing issues */
+        overrun = min_t(u64, overrun, BORE_MAX_VRUNTIME_CLAMP);
+
+        /* Scale overrun to new priority (less punishment for higher priority) */
+        weight_remaining = __unscale_slice(overrun, old_eff_prio);
+        overrun = __scale_slice(weight_remaining, new_eff_prio);
+
+        /* Ensure we don't underflow */
+        if (overrun > (u64)(se->vruntime - S64_MIN)) {
+            new_deadline = se->vruntime;  /* Clamp at current vruntime */
+        } else {
+            new_deadline = se->vruntime - (s64)overrun;
+        }
+    } else {
+        /* Future deadline case: rescale remaining time */
+        u64 remaining = (u64)vruntime_remaining;
+
+        /* Clamp to prevent arithmetic overflow in scaling functions */
+        remaining = min_t(u64, remaining, BORE_MAX_VRUNTIME_CLAMP);
+
+        /* Convert to weight-invariant units and back */
+        weight_remaining = __unscale_slice(remaining, old_eff_prio);
+        remaining = __scale_slice(weight_remaining, new_eff_prio);
+
+        /* Check for overflow before addition */
+        if (remaining > (u64)(S64_MAX - se->vruntime)) {
+            new_deadline = S64_MAX;  /* Clamp at maximum */
+        } else {
+            new_deadline = se->vruntime + (s64)remaining;
+        }
+    }
+
+    /*
+     * Final invariant check: EEVDF requires deadline >= vruntime
+     * This should never trigger with correct math above, but
+     * we include it as a safety net.
+     */
+    if (unlikely(new_deadline < se->vruntime)) {
+        if (IS_ENABLED(CONFIG_SCHED_DEBUG)) {
+            /* Development build: warn and fix */
+            WARN_ONCE(1, "BORE: deadline corruption prevented: "
+                     "old_d=%lld new_d=%lld vr=%lld old_p=%u new_p=%u\n",
+                     se->deadline, new_deadline, se->vruntime,
+                     old_eff_prio, new_eff_prio);
+        }
+        /*
+         * Set deadline exactly at vruntime, making task immediately
+         * eligible but not ahead of others. This is the safest
+         * recovery that maintains EEVDF invariants.
+         */
+        new_deadline = se->vruntime;
+    }
+
+    se->deadline = new_deadline;
 }
 EXPORT_SYMBOL_GPL(restart_burst_rescale_deadline);
 
