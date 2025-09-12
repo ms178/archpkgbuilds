@@ -9,7 +9,6 @@
  * PCI compatible and non PCI compatible devices.
  */
 #include <linux/device.h>
-#include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/irqdomain.h>
 #include <linux/msi.h>
@@ -165,7 +164,7 @@ int msi_domain_insert_msi_desc(struct device *dev, unsigned int domid,
 	return msi_insert_desc(dev, desc, domid, init_desc->msi_index);
 }
 
-static __always_inline bool msi_desc_match(struct msi_desc *desc, enum msi_desc_filter filter)
+static bool msi_desc_match(struct msi_desc *desc, enum msi_desc_filter filter)
 {
 	switch (filter) {
 	case MSI_DESC_ALL:
@@ -224,8 +223,6 @@ static void msi_domain_free_descs(struct device *dev, struct msi_ctrl *ctrl)
  * @domid:	Id of the domain to operate on
  * @first:	Index to start freeing from (inclusive)
  * @last:	Last index to be freed (inclusive)
- *
- * Note: Caller must hold the MSI descriptor mutex (msi_lock_descs()).
  */
 void msi_domain_free_msi_descs_range(struct device *dev, unsigned int domid,
 				     unsigned int first, unsigned int last)
@@ -274,8 +271,18 @@ fail:
 	return ret;
 }
 
+static inline void __msi_zero_msg(struct msi_msg *msg)
+{
+	memset(msg, 0, sizeof(*msg));
+}
+
 void __get_cached_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
 {
+	/* Defensive: avoid NULL deref if misused */
+	if (WARN_ON_ONCE(!entry)) {
+		__msi_zero_msg(msg);
+		return;
+	}
 	*msg = entry->msg;
 }
 
@@ -283,6 +290,11 @@ void get_cached_msi_msg(unsigned int irq, struct msi_msg *msg)
 {
 	struct msi_desc *entry = irq_get_msi_desc(irq);
 
+	/* Defensive: avoid NULL deref if IRQ has no MSI desc (or stale) */
+	if (WARN_ON_ONCE(!entry)) {
+		__msi_zero_msg(msg);
+		return;
+	}
 	__get_cached_msi_msg(entry, msg);
 }
 EXPORT_SYMBOL_GPL(get_cached_msi_msg);
@@ -376,31 +388,12 @@ static struct msi_desc *msi_find_desc(struct msi_device_data *md, unsigned int d
 				      enum msi_desc_filter filter)
 {
 	struct xarray *xa = &md->__domains[domid].store;
-	unsigned long idx = md->__iter_idx;
 	struct msi_desc *desc;
 
-	/* End of iteration is marked by this specific index value. */
-	if (unlikely(idx == MSI_XA_MAX_INDEX)) {
-		return NULL;
-	}
-
-	/*
-	 * Use xa_find in a loop. It starts searching at 'idx' (inclusive).
-	 * On each subsequent iteration, it updates 'idx' to the next candidate
-	 * index, efficiently skipping holes.
-	 */
-	for (desc = xa_find(xa, &idx, MSI_XA_MAX_INDEX, XA_PRESENT);
-	     desc;
-	     desc = xa_find_after(xa, &idx, MSI_XA_MAX_INDEX, XA_PRESENT)) {
-
-		if (msi_desc_match(desc, filter)) {
-			/* Found a match. Store the current index for the next call. */
-			md->__iter_idx = idx;
+	xa_for_each_start(xa, md->__iter_idx, desc, md->__iter_idx) {
+		if (msi_desc_match(desc, filter))
 			return desc;
-		}
 	}
-
-	/* No more entries found; invalidate the iterator for future calls. */
 	md->__iter_idx = MSI_XA_MAX_INDEX;
 	return NULL;
 }
@@ -456,7 +449,6 @@ struct msi_desc *msi_next_desc(struct device *dev, unsigned int domid,
 
 	lockdep_assert_held(&md->mutex);
 
-	/* Use the same sentinel as msi_find_desc() to terminate iteration */
 	if (md->__iter_idx == MSI_XA_MAX_INDEX)
 		return NULL;
 
@@ -473,33 +465,26 @@ EXPORT_SYMBOL_GPL(msi_next_desc);
  *
  * Return: The Linux interrupt number on success (> 0), 0 if not found
  */
-unsigned int __attribute__((hot))
-msi_domain_get_virq(struct device *dev, unsigned int domid, unsigned int index)
+unsigned int msi_domain_get_virq(struct device *dev, unsigned int domid, unsigned int index)
 {
 	struct msi_desc *desc;
 	struct xarray *xa;
 	bool pcimsi = false;
 
-	/* Fast reject */
 	if (!dev->msi.data)
 		return 0;
 
-	/* Bounds and domain sanity */
 	if (WARN_ON_ONCE(index > MSI_MAX_INDEX || domid >= MSI_MAX_DEVICE_IRQDOMAINS))
 		return 0;
 
-	/*
-	 * Only the PCI default MSI domain uses the single-descriptor,
-	 * multi-vector (base + index) mapping.
-	 */
+	guard(msi_descs_lock)(dev);
+
+	/* Only the PCI default MSI domain uses single-desc multi-vector mapping */
 	if (dev_is_pci(dev) && domid == MSI_DEFAULT_DOMAIN)
 		pcimsi = to_pci_dev(dev)->msi_enabled;
 
-	guard(msi_descs_lock)(dev);
-
 	xa = &dev->msi.data->__domains[domid].store;
 
-	/* MSI-X and non-PCI-MSI: 1:1 mapping at the requested index */
 	desc = xa_load(xa, pcimsi ? 0 : index);
 	if (desc && desc->irq) {
 		if (!pcimsi)
@@ -509,8 +494,6 @@ msi_domain_get_virq(struct device *dev, unsigned int domid, unsigned int index)
 		if (index < desc->nvec_used)
 			return desc->irq + index;
 	}
-
-	/* Not found or not associated */
 	return 0;
 }
 EXPORT_SYMBOL_GPL(msi_domain_get_virq);
@@ -692,9 +675,8 @@ static void msi_check_level(struct irq_domain *domain, struct msi_msg *msg)
  *
  * Return: IRQ_SET_MASK_* result code
  */
-int __attribute__((hot))
-msi_domain_set_affinity(struct irq_data *irq_data,
-			const struct cpumask *mask, bool force)
+int msi_domain_set_affinity(struct irq_data *irq_data,
+			    const struct cpumask *mask, bool force)
 {
 	struct irq_data *parent = irq_data->parent_data;
 	struct msi_msg msg[2] = { [1] = { }, };
@@ -710,9 +692,8 @@ msi_domain_set_affinity(struct irq_data *irq_data,
 	return ret;
 }
 
-static int __attribute__((hot))
-msi_domain_activate(struct irq_domain *domain,
-		    struct irq_data *irq_data, bool early)
+static int msi_domain_activate(struct irq_domain *domain,
+			       struct irq_data *irq_data, bool early)
 {
 	struct msi_msg msg[2] = { [1] = { }, };
 
@@ -722,8 +703,8 @@ msi_domain_activate(struct irq_domain *domain,
 	return 0;
 }
 
-static void __attribute__((hot))
-msi_domain_deactivate(struct irq_domain *domain, struct irq_data *irq_data)
+static void msi_domain_deactivate(struct irq_domain *domain,
+				  struct irq_data *irq_data)
 {
 	struct msi_msg msg[2] = { { 0 }, { 0 } };
 
@@ -824,7 +805,7 @@ static irq_hw_number_t msi_domain_ops_get_hwirq(struct msi_domain_info *info,
 static int msi_domain_ops_prepare(struct irq_domain *domain, struct device *dev,
 				  int nvec, msi_alloc_info_t *arg)
 {
-	*arg = (msi_alloc_info_t){ 0 };
+	memset(arg, 0, sizeof(*arg));
 	return 0;
 }
 
@@ -889,7 +870,10 @@ static void msi_domain_update_chip_ops(struct msi_domain_info *info)
 {
 	struct irq_chip *chip = info->chip;
 
+	/* Mandatory callbacks: mask/unmask and MSI message programming */
 	BUG_ON(!chip || !chip->irq_mask || !chip->irq_unmask);
+	BUG_ON(!chip->irq_write_msi_msg);
+
 	if (!chip->irq_set_affinity && !(info->flags & MSI_FLAG_NO_AFFINITY))
 		chip->irq_set_affinity = msi_domain_set_affinity;
 }
@@ -1213,7 +1197,7 @@ static bool msi_check_reservation_mode(struct irq_domain *domain,
 {
 	struct msi_desc *desc;
 
-	switch (domain->bus_token) {
+	switch(domain->bus_token) {
 	case DOMAIN_BUS_PCI_MSI:
 	case DOMAIN_BUS_PCI_DEVICE_MSI:
 	case DOMAIN_BUS_PCI_DEVICE_MSIX:
@@ -1232,18 +1216,15 @@ static bool msi_check_reservation_mode(struct irq_domain *domain,
 	/*
 	 * Checking the first MSI descriptor is sufficient. MSIX supports
 	 * masking and MSI does so when the can_mask attribute is set.
-	 * If there is no descriptor yet, reservation mode cannot be safely used.
 	 */
 	desc = msi_first_desc(dev, MSI_DESC_ALL);
-	if (!desc)
-		return false;
 	return desc->pci.msi_attrib.is_msix || desc->pci.msi_attrib.can_mask;
 }
 
 static int msi_handle_pci_fail(struct irq_domain *domain, struct msi_desc *desc,
 			       int allocated)
 {
-	switch (domain->bus_token) {
+	switch(domain->bus_token) {
 	case DOMAIN_BUS_PCI_MSI:
 	case DOMAIN_BUS_PCI_DEVICE_MSI:
 	case DOMAIN_BUS_PCI_DEVICE_MSIX:
@@ -1285,9 +1266,9 @@ static int msi_init_virq(struct irq_domain *domain, int virq, unsigned int vflag
 		    irqd_affinity_is_managed(irqd) &&
 		    !cpumask_intersects(irq_data_get_affinity_mask(irqd),
 					cpu_online_mask)) {
-			irqd_set_managed_shutdown(irqd);
-			return 0;
-		}
+			    irqd_set_managed_shutdown(irqd);
+			    return 0;
+		    }
 	}
 
 	if (!(vflags & VIRQ_ACTIVATE))
@@ -1323,28 +1304,21 @@ static int populate_alloc_info(struct irq_domain *domain, struct device *dev,
 	return 0;
 }
 
-static int __attribute__((hot))
-__msi_domain_alloc_irqs(struct device *dev,
-			struct irq_domain *domain,
-			struct msi_ctrl *ctrl)
+static int __msi_domain_alloc_irqs(struct device *dev, struct irq_domain *domain,
+				   struct msi_ctrl *ctrl)
 {
 	struct xarray *xa = &dev->msi.data->__domains[ctrl->domid].store;
 	struct msi_domain_info *info = domain->host_data;
 	struct msi_domain_ops *ops = info->ops;
-	unsigned int vflags = 0;
-	unsigned int allocated_vectors = 0;
-	unsigned int allocated_descs = 0;
-	msi_alloc_info_t arg = (msi_alloc_info_t){ 0 };
+	unsigned int vflags = 0, allocated = 0;
+	msi_alloc_info_t arg = { };
 	struct msi_desc *desc;
 	unsigned long idx;
-	int ret;
+	int i, ret, virq;
 
 	ret = populate_alloc_info(domain, dev, ctrl->nirqs, &arg);
 	if (ret)
 		return ret;
-
-	if (!ctrl->nirqs)
-		return 0;
 
 	if (info->flags & MSI_FLAG_ACTIVATE_EARLY)
 		vflags |= VIRQ_ACTIVATE;
@@ -1353,99 +1327,46 @@ __msi_domain_alloc_irqs(struct device *dev,
 		vflags |= VIRQ_CAN_RESERVE;
 
 	xa_for_each_range(xa, idx, desc, ctrl->first, ctrl->last) {
-		int i, virq, nvec;
-
-		if (unlikely(!msi_desc_match(desc, MSI_DESC_NOTASSOCIATED)))
+		if (!msi_desc_match(desc, MSI_DESC_NOTASSOCIATED))
 			continue;
 
-		/* Guard against exceeding requested vector count */
-		if (WARN_ON_ONCE(allocated_vectors >= ctrl->nirqs))
+		if (WARN_ON_ONCE(allocated >= ctrl->nirqs))
 			return -EINVAL;
 
-		/* Allow provider hook to prepare alloc info (including custom hwirq) */
 		if (ops->prepare_desc)
 			ops->prepare_desc(domain, &arg, desc);
 
-		/*
-		 * Default hwirq assignment only if the provider uses the default
-		 * get_hwirq() and did not specify a hardware IRQ in arg:
-		 * treat arg.hwirq == 0 as "unspecified".
-		 */
-		if (ops->get_hwirq == msi_domain_ops_default.get_hwirq && arg.hwirq == 0)
-			arg.hwirq = (irq_hw_number_t)idx;
-
 		ops->set_desc(&arg, desc);
 
-		nvec = desc->nvec_used;
-
-		/* Allocation-phase: __irq_domain_alloc_irqs() can fail (before any init) */
-		virq = __irq_domain_alloc_irqs(domain, -1, nvec,
+		virq = __irq_domain_alloc_irqs(domain, -1, desc->nvec_used,
 					       dev_to_node(dev), &arg, false,
 					       desc->affinity);
 		if (virq < 0)
-			return msi_handle_pci_fail(domain, desc, allocated_descs);
+			return msi_handle_pci_fail(domain, desc, allocated);
 
-		/* Initialize each allocated IRQ and associate it with desc */
-		for (i = 0; i < nvec; i++) {
+		for (i = 0; i < desc->nvec_used; i++) {
 			irq_set_msi_desc_off(virq, i, desc);
 			irq_debugfs_copy_devname(virq + i, dev);
 			ret = msi_init_virq(domain, virq + i, vflags);
-			if (ret) {
-				/* Roll back initialization and allocation for this descriptor */
-				while (--i >= 0) {
-					struct irq_data *irqd =
-						irq_domain_get_irq_data(domain, virq + i);
-					if (irqd && irqd_is_activated(irqd))
-						irq_domain_deactivate_irq(irqd);
-				}
-				irq_domain_free_irqs(virq, nvec);
-				desc->irq = 0;
-				return ret;
-			}
+			if (ret)
+				return ret; /* caller frees on error */
 		}
 
-		/* Optional sysfs per-descriptor exposure */
 		if (info->flags & MSI_FLAG_DEV_SYSFS) {
 			ret = msi_sysfs_populate_desc(dev, desc);
-			if (ret) {
-				/* Roll back sysfs and IRQs */
-				msi_sysfs_remove_desc(dev, desc);
-				for (i = 0; i < nvec; i++) {
-					struct irq_data *irqd =
-						irq_domain_get_irq_data(domain, virq + i);
-					if (irqd && irqd_is_activated(irqd))
-						irq_domain_deactivate_irq(irqd);
-				}
-				irq_domain_free_irqs(virq, nvec);
-				desc->irq = 0;
-				return ret;
-			}
+			if (ret)
+				return ret; /* caller frees on error */
 		}
 
 #ifdef CONFIG_SMP
-		/*
-		 * PERFORMANCE: Install per-vector affinity hints, if provided.
-		 * Non-binding; helps policy/irqbalance keep MSI-X vectors spread as
-		 * intended to reduce contention with latency-sensitive threads.
-		 */
+		/* Non-binding affinity hints for IRQ balancer; cleared on free */
 		if (desc->affinity) {
-			for (i = 0; i < nvec; i++) {
-				const struct cpumask *mask = &desc->affinity[i].mask;
-
-				if (mask)
-					irq_set_affinity_hint(virq + i, mask);
-			}
+			for (i = 0; i < desc->nvec_used; i++)
+				irq_set_affinity_hint(virq + i, &desc->affinity[i].mask);
 		}
 #endif
-
-		allocated_vectors += (unsigned int)nvec;
-		allocated_descs++;
-
-		/* Stop once the request is satisfied */
-		if (allocated_vectors >= ctrl->nirqs)
-			break;
+		allocated++;
 	}
-
 	return 0;
 }
 
@@ -1516,8 +1437,7 @@ int msi_domain_alloc_irqs_range_locked(struct device *dev, unsigned int domid,
 		.domid	= domid,
 		.first	= first,
 		.last	= last,
-		/* Avoid unsigned underflow on invalid ranges; validation will fail later */
-		.nirqs	= (last >= first) ? (last - first + 1) : 0,
+		.nirqs	= last + 1 - first,
 	};
 
 	return msi_domain_alloc_locked(dev, &ctrl);
@@ -1536,6 +1456,7 @@ int msi_domain_alloc_irqs_range_locked(struct device *dev, unsigned int domid,
 int msi_domain_alloc_irqs_range(struct device *dev, unsigned int domid,
 				unsigned int first, unsigned int last)
 {
+
 	guard(msi_descs_lock)(dev);
 	return msi_domain_alloc_irqs_range_locked(dev, domid, first, last);
 }
@@ -1784,7 +1705,7 @@ void msi_domain_free_irqs_range(struct device *dev, unsigned int domid,
 	guard(msi_descs_lock)(dev);
 	msi_domain_free_irqs_range_locked(dev, domid, first, last);
 }
-EXPORT_SYMBOL_GPL(msi_domain_free_irqs_range);
+EXPORT_SYMBOL_GPL(msi_domain_free_irqs_all);
 
 /**
  * msi_domain_free_irqs_all_locked - Free all interrupts from a MSI interrupt domain
