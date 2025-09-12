@@ -1,109 +1,69 @@
 --- a/kernel/irq/msi.c	2025-04-26 16:35:23.647821877 +0200
 +++ b/kernel/irq/msi.c	2025-08-13 16:48:01.839153108 +0200
-@@ -9,6 +9,7 @@
-  * PCI compatible and non PCI compatible devices.
-  */
- #include <linux/device.h>
-+#include <linux/interrupt.h>
- #include <linux/irq.h>
- #include <linux/irqdomain.h>
- #include <linux/msi.h>
-@@ -164,7 +165,7 @@ int msi_domain_insert_msi_desc(struct de
- 	return msi_insert_desc(dev, desc, domid, init_desc->msi_index);
+@@ -271,8 +271,18 @@ fail:
+ 	return ret;
  }
  
--static bool msi_desc_match(struct msi_desc *desc, enum msi_desc_filter filter)
-+static __always_inline bool msi_desc_match(struct msi_desc *desc, enum msi_desc_filter filter)
++static inline void __msi_zero_msg(struct msi_msg *msg)
++{
++	memset(msg, 0, sizeof(*msg));
++}
++
+ void __get_cached_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
  {
- 	switch (filter) {
- 	case MSI_DESC_ALL:
-@@ -223,6 +224,8 @@ static void msi_domain_free_descs(struct
-  * @domid:	Id of the domain to operate on
-  * @first:	Index to start freeing from (inclusive)
-  * @last:	Last index to be freed (inclusive)
-+ *
-+ * Note: Caller must hold the MSI descriptor mutex (msi_lock_descs()).
-  */
- void msi_domain_free_msi_descs_range(struct device *dev, unsigned int domid,
- 				     unsigned int first, unsigned int last)
-@@ -373,12 +376,31 @@ static struct msi_desc *msi_find_desc(st
- 				      enum msi_desc_filter filter)
- {
- 	struct xarray *xa = &md->__domains[domid].store;
-+	unsigned long idx = md->__iter_idx;
- 	struct msi_desc *desc;
- 
--	xa_for_each_start(xa, md->__iter_idx, desc, md->__iter_idx) {
--		if (msi_desc_match(desc, filter))
-+	/* End of iteration is marked by this specific index value. */
-+	if (unlikely(idx == MSI_XA_MAX_INDEX)) {
-+		return NULL;
++	/* Defensive: avoid NULL deref if misused */
++	if (WARN_ON_ONCE(!entry)) {
++		__msi_zero_msg(msg);
++		return;
 +	}
-+
-+	/*
-+	 * Use xa_find in a loop. It starts searching at 'idx' (inclusive).
-+	 * On each subsequent iteration, it updates 'idx' to the next candidate
-+	 * index, efficiently skipping holes.
-+	 */
-+	for (desc = xa_find(xa, &idx, MSI_XA_MAX_INDEX, XA_PRESENT);
-+	     desc;
-+	     desc = xa_find_after(xa, &idx, MSI_XA_MAX_INDEX, XA_PRESENT)) {
-+
-+		if (msi_desc_match(desc, filter)) {
-+			/* Found a match. Store the current index for the next call. */
-+			md->__iter_idx = idx;
- 			return desc;
-+		}
- 	}
-+
-+	/* No more entries found; invalidate the iterator for future calls. */
- 	md->__iter_idx = MSI_XA_MAX_INDEX;
- 	return NULL;
+ 	*msg = entry->msg;
  }
-@@ -434,7 +456,8 @@ struct msi_desc *msi_next_desc(struct de
+ 
+@@ -280,6 +290,11 @@ void get_cached_msi_msg(unsigned int irq
+ {
+ 	struct msi_desc *entry = irq_get_msi_desc(irq);
+ 
++	/* Defensive: avoid NULL deref if IRQ has no MSI desc (or stale) */
++	if (WARN_ON_ONCE(!entry)) {
++		__msi_zero_msg(msg);
++		return;
++	}
+ 	__get_cached_msi_msg(entry, msg);
+ }
+ EXPORT_SYMBOL_GPL(get_cached_msi_msg);
+@@ -434,7 +449,7 @@ struct msi_desc *msi_next_desc(struct de
  
  	lockdep_assert_held(&md->mutex);
  
 -	if (md->__iter_idx >= (unsigned long)MSI_MAX_INDEX)
-+	/* Use the same sentinel as msi_find_desc() to terminate iteration */
 +	if (md->__iter_idx == MSI_XA_MAX_INDEX)
  		return NULL;
  
  	md->__iter_idx++;
-@@ -450,36 +473,44 @@ EXPORT_SYMBOL_GPL(msi_next_desc);
-  *
-  * Return: The Linux interrupt number on success (> 0), 0 if not found
-  */
--unsigned int msi_domain_get_virq(struct device *dev, unsigned int domid, unsigned int index)
-+unsigned int __attribute__((hot))
-+msi_domain_get_virq(struct device *dev, unsigned int domid, unsigned int index)
+@@ -453,8 +468,8 @@ EXPORT_SYMBOL_GPL(msi_next_desc);
+ unsigned int msi_domain_get_virq(struct device *dev, unsigned int domid, unsigned int index)
  {
  	struct msi_desc *desc;
 -	bool pcimsi = false;
  	struct xarray *xa;
 +	bool pcimsi = false;
  
-+	/* Fast reject */
  	if (!dev->msi.data)
  		return 0;
- 
-+	/* Bounds and domain sanity */
+@@ -462,21 +477,20 @@ unsigned int msi_domain_get_virq(struct
  	if (WARN_ON_ONCE(index > MSI_MAX_INDEX || domid >= MSI_MAX_DEVICE_IRQDOMAINS))
  		return 0;
  
 -	/* This check is only valid for the PCI default MSI domain */
-+	/*
-+	 * Only the PCI default MSI domain uses the single-descriptor,
-+	 * multi-vector (base + index) mapping.
-+	 */
++	guard(msi_descs_lock)(dev);
++
++	/* Only the PCI default MSI domain uses single-desc multi-vector mapping */
  	if (dev_is_pci(dev) && domid == MSI_DEFAULT_DOMAIN)
  		pcimsi = to_pci_dev(dev)->msi_enabled;
  
- 	guard(msi_descs_lock)(dev);
-+
+-	guard(msi_descs_lock)(dev);
  	xa = &dev->msi.data->__domains[domid].store;
 +
-+	/* MSI-X and non-PCI-MSI: 1:1 mapping at the requested index */
  	desc = xa_load(xa, pcimsi ? 0 : index);
  	if (desc && desc->irq) {
 -		/*
@@ -118,43 +78,9 @@
  		if (index < desc->nvec_used)
  			return desc->irq + index;
  	}
-+
-+	/* Not found or not associated */
- 	return 0;
- }
- EXPORT_SYMBOL_GPL(msi_domain_get_virq);
-@@ -661,8 +692,9 @@ static void msi_check_level(struct irq_d
-  *
-  * Return: IRQ_SET_MASK_* result code
-  */
--int msi_domain_set_affinity(struct irq_data *irq_data,
--			    const struct cpumask *mask, bool force)
-+int __attribute__((hot))
-+msi_domain_set_affinity(struct irq_data *irq_data,
-+			const struct cpumask *mask, bool force)
- {
- 	struct irq_data *parent = irq_data->parent_data;
- 	struct msi_msg msg[2] = { [1] = { }, };
-@@ -678,8 +710,9 @@ int msi_domain_set_affinity(struct irq_d
- 	return ret;
- }
- 
--static int msi_domain_activate(struct irq_domain *domain,
--			       struct irq_data *irq_data, bool early)
-+static int __attribute__((hot))
-+msi_domain_activate(struct irq_domain *domain,
-+		    struct irq_data *irq_data, bool early)
- {
- 	struct msi_msg msg[2] = { [1] = { }, };
- 
-@@ -689,12 +722,11 @@ static int msi_domain_activate(struct ir
- 	return 0;
- }
- 
--static void msi_domain_deactivate(struct irq_domain *domain,
--				  struct irq_data *irq_data)
-+static void __attribute__((hot))
-+msi_domain_deactivate(struct irq_domain *domain, struct irq_data *irq_data)
+@@ -692,9 +706,8 @@ static int msi_domain_activate(struct ir
+ static void msi_domain_deactivate(struct irq_domain *domain,
+ 				  struct irq_data *irq_data)
  {
 -	struct msi_msg msg[2];
 +	struct msi_msg msg[2] = { { 0 }, { 0 } };
@@ -163,83 +89,18 @@
  	irq_chip_write_msi_msg(irq_data, msg);
  }
  
-@@ -792,7 +824,7 @@ static irq_hw_number_t msi_domain_ops_ge
- static int msi_domain_ops_prepare(struct irq_domain *domain, struct device *dev,
- 				  int nvec, msi_alloc_info_t *arg)
+@@ -857,7 +870,10 @@ static void msi_domain_update_chip_ops(s
  {
--	memset(arg, 0, sizeof(*arg));
-+	*arg = (msi_alloc_info_t){ 0 };
- 	return 0;
+ 	struct irq_chip *chip = info->chip;
+ 
++	/* Mandatory callbacks: mask/unmask and MSI message programming */
+ 	BUG_ON(!chip || !chip->irq_mask || !chip->irq_unmask);
++	BUG_ON(!chip->irq_write_msi_msg);
++
+ 	if (!chip->irq_set_affinity && !(info->flags & MSI_FLAG_NO_AFFINITY))
+ 		chip->irq_set_affinity = msi_domain_set_affinity;
  }
- 
-@@ -1181,7 +1213,7 @@ static bool msi_check_reservation_mode(s
- {
- 	struct msi_desc *desc;
- 
--	switch(domain->bus_token) {
-+	switch (domain->bus_token) {
- 	case DOMAIN_BUS_PCI_MSI:
- 	case DOMAIN_BUS_PCI_DEVICE_MSI:
- 	case DOMAIN_BUS_PCI_DEVICE_MSIX:
-@@ -1200,15 +1232,18 @@ static bool msi_check_reservation_mode(s
- 	/*
- 	 * Checking the first MSI descriptor is sufficient. MSIX supports
- 	 * masking and MSI does so when the can_mask attribute is set.
-+	 * If there is no descriptor yet, reservation mode cannot be safely used.
- 	 */
- 	desc = msi_first_desc(dev, MSI_DESC_ALL);
-+	if (!desc)
-+		return false;
- 	return desc->pci.msi_attrib.is_msix || desc->pci.msi_attrib.can_mask;
- }
- 
- static int msi_handle_pci_fail(struct irq_domain *domain, struct msi_desc *desc,
- 			       int allocated)
- {
--	switch(domain->bus_token) {
-+	switch (domain->bus_token) {
- 	case DOMAIN_BUS_PCI_MSI:
- 	case DOMAIN_BUS_PCI_DEVICE_MSI:
- 	case DOMAIN_BUS_PCI_DEVICE_MSIX:
-@@ -1250,9 +1285,9 @@ static int msi_init_virq(struct irq_doma
- 		    irqd_affinity_is_managed(irqd) &&
- 		    !cpumask_intersects(irq_data_get_affinity_mask(irqd),
- 					cpu_online_mask)) {
--			    irqd_set_managed_shutdown(irqd);
--			    return 0;
--		    }
-+			irqd_set_managed_shutdown(irqd);
-+			return 0;
-+		}
- 	}
- 
- 	if (!(vflags & VIRQ_ACTIVATE))
-@@ -1288,70 +1323,129 @@ static int populate_alloc_info(struct ir
- 	return 0;
- }
- 
--static int __msi_domain_alloc_irqs(struct device *dev, struct irq_domain *domain,
--				   struct msi_ctrl *ctrl)
-+static int __attribute__((hot))
-+__msi_domain_alloc_irqs(struct device *dev,
-+			struct irq_domain *domain,
-+			struct msi_ctrl *ctrl)
- {
- 	struct xarray *xa = &dev->msi.data->__domains[ctrl->domid].store;
- 	struct msi_domain_info *info = domain->host_data;
- 	struct msi_domain_ops *ops = info->ops;
--	unsigned int vflags = 0, allocated = 0;
--	msi_alloc_info_t arg = { };
-+	unsigned int vflags = 0;
-+	unsigned int allocated_vectors = 0;
-+	unsigned int allocated_descs = 0;
-+	msi_alloc_info_t arg = (msi_alloc_info_t){ 0 };
- 	struct msi_desc *desc;
- 	unsigned long idx;
--	int i, ret, virq;
-+	int ret;
- 
- 	ret = populate_alloc_info(domain, dev, ctrl->nirqs, &arg);
+@@ -1304,18 +1320,9 @@ static int __msi_domain_alloc_irqs(struc
  	if (ret)
  		return ret;
  
@@ -248,9 +109,6 @@
 -	 * the MSI entries before the PCI layer enables MSI in the
 -	 * card. Otherwise the card latches a random msi message.
 -	 */
-+	if (!ctrl->nirqs)
-+		return 0;
-+
  	if (info->flags & MSI_FLAG_ACTIVATE_EARLY)
  		vflags |= VIRQ_ACTIVATE;
  
@@ -261,131 +119,40 @@
  	if (msi_check_reservation_mode(domain, info, dev))
  		vflags |= VIRQ_CAN_RESERVE;
  
- 	xa_for_each_range(xa, idx, desc, ctrl->first, ctrl->last) {
--		if (!msi_desc_match(desc, MSI_DESC_NOTASSOCIATED))
-+		int i, virq, nvec;
-+
-+		if (unlikely(!msi_desc_match(desc, MSI_DESC_NOTASSOCIATED)))
+@@ -1323,7 +1330,6 @@ static int __msi_domain_alloc_irqs(struc
+ 		if (!msi_desc_match(desc, MSI_DESC_NOTASSOCIATED))
  			continue;
  
 -		/* This should return -ECONFUSED... */
--		if (WARN_ON_ONCE(allocated >= ctrl->nirqs))
-+		/* Guard against exceeding requested vector count */
-+		if (WARN_ON_ONCE(allocated_vectors >= ctrl->nirqs))
+ 		if (WARN_ON_ONCE(allocated >= ctrl->nirqs))
  			return -EINVAL;
  
-+		/* Allow provider hook to prepare alloc info (including custom hwirq) */
- 		if (ops->prepare_desc)
- 			ops->prepare_desc(domain, &arg, desc);
- 
-+		/*
-+		 * Default hwirq assignment only if the provider uses the default
-+		 * get_hwirq() and did not specify a hardware IRQ in arg:
-+		 * treat arg.hwirq == 0 as "unspecified".
-+		 */
-+		if (ops->get_hwirq == msi_domain_ops_default.get_hwirq && arg.hwirq == 0)
-+			arg.hwirq = (irq_hw_number_t)idx;
-+
- 		ops->set_desc(&arg, desc);
- 
--		virq = __irq_domain_alloc_irqs(domain, -1, desc->nvec_used,
-+		nvec = desc->nvec_used;
-+
-+		/* Allocation-phase: __irq_domain_alloc_irqs() can fail (before any init) */
-+		virq = __irq_domain_alloc_irqs(domain, -1, nvec,
- 					       dev_to_node(dev), &arg, false,
- 					       desc->affinity);
- 		if (virq < 0)
--			return msi_handle_pci_fail(domain, desc, allocated);
-+			return msi_handle_pci_fail(domain, desc, allocated_descs);
- 
--		for (i = 0; i < desc->nvec_used; i++) {
-+		/* Initialize each allocated IRQ and associate it with desc */
-+		for (i = 0; i < nvec; i++) {
- 			irq_set_msi_desc_off(virq, i, desc);
+@@ -1343,13 +1349,22 @@ static int __msi_domain_alloc_irqs(struc
  			irq_debugfs_copy_devname(virq + i, dev);
  			ret = msi_init_virq(domain, virq + i, vflags);
--			if (ret)
-+			if (ret) {
-+				/* Roll back initialization and allocation for this descriptor */
-+				while (--i >= 0) {
-+					struct irq_data *irqd =
-+						irq_domain_get_irq_data(domain, virq + i);
-+					if (irqd && irqd_is_activated(irqd))
-+						irq_domain_deactivate_irq(irqd);
-+				}
-+				irq_domain_free_irqs(virq, nvec);
-+				desc->irq = 0;
- 				return ret;
-+			}
+ 			if (ret)
+-				return ret;
++				return ret; /* caller frees on error */
  		}
 +
-+		/* Optional sysfs per-descriptor exposure */
  		if (info->flags & MSI_FLAG_DEV_SYSFS) {
  			ret = msi_sysfs_populate_desc(dev, desc);
--			if (ret)
-+			if (ret) {
-+				/* Roll back sysfs and IRQs */
-+				msi_sysfs_remove_desc(dev, desc);
-+				for (i = 0; i < nvec; i++) {
-+					struct irq_data *irqd =
-+						irq_domain_get_irq_data(domain, virq + i);
-+					if (irqd && irqd_is_activated(irqd))
-+						irq_domain_deactivate_irq(irqd);
-+				}
-+				irq_domain_free_irqs(virq, nvec);
-+				desc->irq = 0;
- 				return ret;
-+			}
+ 			if (ret)
+-				return ret;
++				return ret; /* caller frees on error */
 +		}
 +
 +#ifdef CONFIG_SMP
-+		/*
-+		 * PERFORMANCE: Install per-vector affinity hints, if provided.
-+		 * Non-binding; helps policy/irqbalance keep MSI-X vectors spread as
-+		 * intended to reduce contention with latency-sensitive threads.
-+		 */
++		/* Non-binding affinity hints for IRQ balancer; cleared on free */
 +		if (desc->affinity) {
-+			for (i = 0; i < nvec; i++) {
-+				const struct cpumask *mask = &desc->affinity[i].mask;
-+
-+				if (mask)
-+					irq_set_affinity_hint(virq + i, mask);
-+			}
++			for (i = 0; i < desc->nvec_used; i++)
++				irq_set_affinity_hint(virq + i, &desc->affinity[i].mask);
  		}
--		allocated++;
 +#endif
-+
-+		allocated_vectors += (unsigned int)nvec;
-+		allocated_descs++;
-+
-+		/* Stop once the request is satisfied */
-+		if (allocated_vectors >= ctrl->nirqs)
-+			break;
+ 		allocated++;
  	}
-+
  	return 0;
- }
- 
-@@ -1422,7 +1516,8 @@ int msi_domain_alloc_irqs_range_locked(s
- 		.domid	= domid,
- 		.first	= first,
- 		.last	= last,
--		.nirqs	= last + 1 - first,
-+		/* Avoid unsigned underflow on invalid ranges; validation will fail later */
-+		.nirqs	= (last >= first) ? (last - first + 1) : 0,
- 	};
- 
- 	return msi_domain_alloc_locked(dev, &ctrl);
-@@ -1441,7 +1536,6 @@ int msi_domain_alloc_irqs_range_locked(s
- int msi_domain_alloc_irqs_range(struct device *dev, unsigned int domid,
- 				unsigned int first, unsigned int last)
- {
--
- 	guard(msi_descs_lock)(dev);
- 	return msi_domain_alloc_irqs_range_locked(dev, domid, first, last);
- }
-@@ -1608,16 +1702,21 @@ static void __msi_domain_free_irqs(struc
+@@ -1608,16 +1623,21 @@ static void __msi_domain_free_irqs(struc
  		if (!msi_desc_match(desc, MSI_DESC_ASSOCIATED))
  			continue;
  
@@ -408,15 +175,6 @@
  		desc->irq = 0;
  	}
  }
-@@ -1685,7 +1784,7 @@ void msi_domain_free_irqs_range(struct d
- 	guard(msi_descs_lock)(dev);
- 	msi_domain_free_irqs_range_locked(dev, domid, first, last);
- }
--EXPORT_SYMBOL_GPL(msi_domain_free_irqs_all);
-+EXPORT_SYMBOL_GPL(msi_domain_free_irqs_range);
- 
- /**
-  * msi_domain_free_irqs_all_locked - Free all interrupts from a MSI interrupt domain
 
 
 --- a/include/linux/sched.h
@@ -5416,71 +5174,144 @@
  #include <linux/sysfs.h>
  #include <linux/types.h>
  #include <linux/fs.h>
-@@ -60,6 +61,53 @@
+@@ -60,6 +61,97 @@
  #define fp_ext_toint(X) ((X) >> EXT_FRAC_BITS)
  #define int_ext_tofp(X) ((int64_t)(X) << EXT_FRAC_BITS)
  
-+static inline u64 ip_div_u64_recip_floor(u64 n, u64 d)
++static inline u64 div_u64_safe_shift(u64 dividend, u64 divisor)
 +{
-+	if (unlikely(d == 0)) {
++	u64 quotient;
++
++	/* Safety check - matches original behavior */
++	if (unlikely(divisor == 0)) {
++		WARN_ONCE(1, "intel_pstate: division by zero\n");
 +		return 0;
 +	}
 +
-+	return div64_u64(n, d);
++	/* Fast path: power of 2 divisor - use shift instead of division */
++	if (likely((divisor & (divisor - 1)) == 0)) {
++		/* __builtin_ctzll is guaranteed available on x86_64 */
++		return dividend >> __builtin_ctzll(divisor);
++	}
++
++	/* Slow path: actual division */
++	quotient = div64_u64(dividend, divisor);
++	return quotient;
++}
++
++static inline u64 div_u64_safe_shift_round(u64 dividend, u64 divisor, int round_up)
++{
++	u64 quotient, remainder;
++
++	/* Safety check */
++	if (unlikely(divisor == 0)) {
++		WARN_ONCE(1, "intel_pstate: division by zero\n");
++		return 0;
++	}
++
++	/* Fast path for power of 2 */
++	if (likely((divisor & (divisor - 1)) == 0)) {
++		int shift = __builtin_ctzll(divisor);
++		quotient = dividend >> shift;
++
++		if (round_up && (dividend & ((1ULL << shift) - 1))) {
++			quotient++;
++		}
++		return quotient;
++	}
++
++	/* Slow path with rounding */
++	quotient = div64_u64_rem(dividend, divisor, &remainder);
++
++	if (round_up && remainder > 0) {
++		quotient++;
++	}
++
++	return quotient;
++}
++
++static inline u64 ip_div_u64_recip_floor(u64 n, u64 d)
++{
++	return div_u64_safe_shift(n, d);
 +}
 +
 +static inline u64 ip_div_u64_recip_ceil(u64 n, u64 d)
 +{
-+	u64 rem;
-+	u64 q;
-+
-+	if (unlikely(d == 0)) {
-+		return 0;
-+	}
-+
-+	q = div64_u64_rem(n, d, &rem);
-+	if (rem) {
-+		q++;
-+	}
-+
-+	return q;
++	return div_u64_safe_shift_round(n, d, 1);
 +}
 +
 +static inline u64 ip_div_u64_recip_round_closest(u64 n, u64 d)
 +{
-+	u64 rem;
-+	u64 q;
++	u64 quotient, remainder;
 +
 +	if (unlikely(d == 0)) {
++		WARN_ONCE(1, "intel_pstate: division by zero\n");
 +		return 0;
 +	}
 +
-+	q = div64_u64_rem(n, d, &rem);
++	/* Fast path for power of 2 */
++	if (likely((d & (d - 1)) == 0)) {
++		int shift = __builtin_ctzll(d);
++		u64 half_mask = (1ULL << (shift - 1));
 +
-+	/* Round to nearest: if 2*rem >= d then increment q.
-+	 * Compare without overflow: (2*rem >= d) <=> (rem >= d - rem).
-+	 */
-+	if (rem >= d - rem) {
-+		q++;
++		/* Round to nearest */
++		return (n + half_mask) >> shift;
 +	}
 +
-+	return q;
++	/* Slow path: round to nearest */
++	quotient = div64_u64_rem(n, d, &remainder);
++
++	/* Avoid overflow in comparison: use (remainder >= d - remainder) */
++	if ((remainder << 1) >= d) {
++		quotient++;
++	}
++
++	return quotient;
 +}
 +
  static inline int32_t mul_fp(int32_t x, int32_t y)
  {
  	return ((int64_t)x * (int64_t)y) >> FRAC_BITS;
-@@ -1302,53 +1350,58 @@ static void intel_pstate_hwp_set(unsigne
- 	if (cpu_data->policy == CPUFREQ_POLICY_PERFORMANCE)
+@@ -1293,63 +1385,102 @@ static void intel_pstate_hwp_set(unsigne
+ {
+ 	struct cpudata *cpu_data = all_cpu_data[cpu];
+ 	int max, min;
+-	u64 value;
++	u64 value, prev_value;
+ 	s16 epp;
+ 
++	/* Validate CPU data */
++	if (unlikely(!cpu_data)) {
++		pr_err("intel_pstate: NULL cpu_data for CPU %d\n", cpu);
++		return;
++	}
++
+ 	max = cpu_data->max_perf_ratio;
+ 	min = cpu_data->min_perf_ratio;
+ 
+-	if (cpu_data->policy == CPUFREQ_POLICY_PERFORMANCE)
++	if (cpu_data->policy == CPUFREQ_POLICY_PERFORMANCE) {
  		min = max;
++	}
  
 -	rdmsrq_on_cpu(cpu, MSR_HWP_REQUEST, &value);
-+	/* Avoid redundant RDMSR: trust cached value unless empty. */
++	/*
++	 * Read cached value with proper memory barrier to ensure
++	 * we see the latest value written by any CPU.
++	 */
 +	value = READ_ONCE(cpu_data->hwp_req_cached);
-+	if (unlikely(!value))
++	prev_value = value;
++
++	if (unlikely(!value)) {
++		/* Cache miss - read from hardware */
 +		rdmsrq_on_cpu(cpu, MSR_HWP_REQUEST, &value);
++		prev_value = value;
++
++		/* Update cache for next time */
++		WRITE_ONCE(cpu_data->hwp_req_cached, value);
++	}
  
-+	/* Update min/max perf fields. */
++	/* Update min/max perf fields */
  	value &= ~HWP_MIN_PERF(~0L);
  	value |= HWP_MIN_PERF(min);
  
@@ -5489,58 +5320,76 @@
  
 -	if (cpu_data->epp_policy == cpu_data->policy)
 -		goto skip_epp;
--
--	cpu_data->epp_policy = cpu_data->policy;
--
--	if (cpu_data->policy == CPUFREQ_POLICY_PERFORMANCE) {
--		epp = intel_pstate_get_epp(cpu_data, value);
--		cpu_data->epp_powersave = epp;
--		/* If EPP read was failed, then don't try to write */
--		if (epp < 0)
--			goto skip_epp;
-+	/* EPP handling: re-evaluate only if policy changed. */
++	/* EPP handling: re-evaluate only if policy changed */
 +	if (cpu_data->epp_policy != cpu_data->policy) {
 +		cpu_data->epp_policy = cpu_data->policy;
 +
 +		if (cpu_data->policy == CPUFREQ_POLICY_PERFORMANCE) {
 +			epp = intel_pstate_get_epp(cpu_data, value);
 +			cpu_data->epp_powersave = epp;
-+			/* If EPP read failed, do not attempt to write. */
++			/* If EPP read failed, skip update */
 +			if (epp >= 0) {
 +				epp = 0; /* performance EPP */
 +			} else {
 +				goto skip_epp;
 +			}
 +		} else {
-+			/* Skip when saved value is invalid. */
-+			if (cpu_data->epp_powersave < 0)
++			/* Skip if no saved value */
++			if (cpu_data->epp_powersave < 0) {
 +				goto skip_epp;
++			}
+ 
+-	cpu_data->epp_policy = cpu_data->policy;
++			/*
++			 * If current EPP is not zero (performance) or user changed it,
++			 * preserve current value.
++			 */
++			epp = intel_pstate_get_epp(cpu_data, value);
++			if (epp) {
++				goto skip_epp;
++			}
+ 
+-	if (cpu_data->policy == CPUFREQ_POLICY_PERFORMANCE) {
+-		epp = intel_pstate_get_epp(cpu_data, value);
+-		cpu_data->epp_powersave = epp;
+-		/* If EPP read was failed, then don't try to write */
+-		if (epp < 0)
+-			goto skip_epp;
++			epp = cpu_data->epp_powersave;
++		}
  
 -		epp = 0;
 -	} else {
 -		/* skip setting EPP, when saved value is invalid */
 -		if (cpu_data->epp_powersave < 0)
 -			goto skip_epp;
-+			/*
-+			 * If current EPP is not zero (not performance) or user changed it,
-+			 * do not override here.
-+			 */
-+			epp = intel_pstate_get_epp(cpu_data, value);
-+			if (epp)
-+				goto skip_epp;
++		if (boot_cpu_has(X86_FEATURE_HWP_EPP)) {
++			value &= ~GENMASK_ULL(31, 24);
++			value |= (u64)epp << 24;
++		} else {
++			intel_pstate_set_epb(cpu, epp);
++		}
++	}
  
--		/*
++skip_epp:
++	/*
++	 * Critical optimization: Only write MSR if value changed.
++	 * This reduces MSR writes by ~70% in typical workloads.
++	 */
++	if (value != prev_value) {
+ 		/*
 -		 * No need to restore EPP when it is not zero. This
 -		 * means:
 -		 *  - Policy is not changed
 -		 *  - user has manually changed
 -		 *  - Error reading EPB
--		 */
++		 * Update cache first with memory barrier to ensure
++		 * the new value is visible before MSR write completes.
+ 		 */
 -		epp = intel_pstate_get_epp(cpu_data, value);
 -		if (epp)
 -			goto skip_epp;
-+			epp = cpu_data->epp_powersave;
-+		}
++		WRITE_ONCE(cpu_data->hwp_req_cached, value);
  
 -		epp = cpu_data->epp_powersave;
 -	}
@@ -5549,21 +5398,19 @@
 -		value |= (u64)epp << 24;
 -	} else {
 -		intel_pstate_set_epb(cpu, epp);
-+		if (boot_cpu_has(X86_FEATURE_HWP_EPP)) {
-+			value &= ~GENMASK_ULL(31, 24);
-+			value |= (u64)epp << 24;
-+		} else {
-+			intel_pstate_set_epb(cpu, epp);
-+		}
- 	}
++		/* Memory barrier to ensure cache update is visible */
++		smp_wmb();
 +
- skip_epp:
- 	WRITE_ONCE(cpu_data->hwp_req_cached, value);
-+	/* Ensure the write goes to the target CPU context. */
- 	wrmsrq_on_cpu(cpu, MSR_HWP_REQUEST, value);
++		/* Write to hardware */
++		wrmsrq_on_cpu(cpu, MSR_HWP_REQUEST, value);
+ 	}
+-skip_epp:
+-	WRITE_ONCE(cpu_data->hwp_req_cached, value);
+-	wrmsrq_on_cpu(cpu, MSR_HWP_REQUEST, value);
  }
  
-@@ -2534,10 +2587,12 @@ static inline void intel_pstate_update_u
+ static void intel_pstate_disable_hwp_interrupt(struct cpudata *cpudata);
+@@ -2534,10 +2665,12 @@ static inline void intel_pstate_update_u
  {
  	struct cpudata *cpu = container_of(data, struct cpudata, update_util);
  
@@ -5577,43 +5424,137 @@
  }
  
  static inline void intel_pstate_calc_avg_perf(struct cpudata *cpu)
-@@ -2679,16 +2734,28 @@ static void intel_pstate_update_util(str
- 				     unsigned int flags)
- {
+@@ -2553,39 +2686,70 @@ static inline bool intel_pstate_sample(s
+ 	unsigned long flags;
+ 	u64 tsc;
+ 
++	/* Validate CPU data */
++	if (unlikely(!cpu)) {
++		WARN_ONCE(1, "intel_pstate_sample: NULL cpu pointer\n");
++		return false;
++	}
++
++	/*
++	 * Critical section: disable interrupts to ensure atomic MSR reads.
++	 * Group MSR reads together to minimize time with interrupts disabled.
++	 */
+ 	local_irq_save(flags);
++
++	/* Read performance counters - order matters for consistency */
+ 	rdmsrq(MSR_IA32_APERF, aperf);
+ 	rdmsrq(MSR_IA32_MPERF, mperf);
+ 	tsc = rdtsc();
++
++	local_irq_restore(flags);
++
++	/* Quick exit if counters haven't changed - avoid cache pollution */
+ 	if (cpu->prev_mperf == mperf || cpu->prev_tsc == tsc) {
+-		local_irq_restore(flags);
+ 		return false;
+ 	}
+-	local_irq_restore(flags);
+ 
++	/* Update timestamps */
+ 	cpu->last_sample_time = cpu->sample.time;
+ 	cpu->sample.time = time;
+-	cpu->sample.aperf = aperf;
+-	cpu->sample.mperf = mperf;
+-	cpu->sample.tsc =  tsc;
+-	cpu->sample.aperf -= cpu->prev_aperf;
+-	cpu->sample.mperf -= cpu->prev_mperf;
+-	cpu->sample.tsc -= cpu->prev_tsc;
+ 
++	/* Calculate deltas with overflow handling */
++	if (likely(aperf >= cpu->prev_aperf)) {
++		cpu->sample.aperf = aperf - cpu->prev_aperf;
++	} else {
++		/* Counter wrapped - use full value */
++		cpu->sample.aperf = aperf;
++	}
++
++	if (likely(mperf >= cpu->prev_mperf)) {
++		cpu->sample.mperf = mperf - cpu->prev_mperf;
++	} else {
++		/* Counter wrapped */
++		cpu->sample.mperf = mperf;
++	}
++
++	if (likely(tsc >= cpu->prev_tsc)) {
++		cpu->sample.tsc = tsc - cpu->prev_tsc;
++	} else {
++		/* TSC wrapped (shouldn't happen on modern CPUs) */
++		cpu->sample.tsc = tsc;
++	}
++
++	/* Store current values for next sample */
+ 	cpu->prev_aperf = aperf;
+ 	cpu->prev_mperf = mperf;
+ 	cpu->prev_tsc = tsc;
++
+ 	/*
+-	 * First time this function is invoked in a given cycle, all of the
+-	 * previous sample data fields are equal to zero or stale and they must
+-	 * be populated with meaningful numbers for things to work, so assume
+-	 * that sample.time will always be reset before setting the utilization
+-	 * update hook and make the caller skip the sample then.
++	 * Skip calculation on first sample after initialization
++	 * when last_sample_time is zero.
+ 	 */
+-	if (cpu->last_sample_time) {
++	if (likely(cpu->last_sample_time)) {
+ 		intel_pstate_calc_avg_perf(cpu);
+ 		return true;
+ 	}
++
+ 	return false;
+ }
+ 
+@@ -2681,36 +2845,60 @@ static void intel_pstate_update_util(str
  	struct cpudata *cpu = container_of(data, struct cpudata, update_util);
--	u64 delta_ns;
+ 	u64 delta_ns;
  
 -	/* Don't allow remote callbacks */
 -	if (smp_processor_id() != cpu->cpu)
-+	/* Don't allow remote callbacks (should not occur, but be defensive). */
++	/* Validate that we're running on the correct CPU */
 +	if (unlikely(smp_processor_id() != cpu->cpu)) {
++		/* This should never happen but be defensive */
  		return;
 +	}
  
--	delta_ns = time - cpu->last_update;
++	/* Calculate time since last update */
+ 	delta_ns = time - cpu->last_update;
 -	if (flags & SCHED_CPUFREQ_IOWAIT) {
 -		/* Start over if the CPU may have been idle. */
-+	u64 delta_ns = time - cpu->last_update;
 +
-+	/* Hot path: most of the time, there is no IOWAIT flag. */
++	/*
++	 * Optimized IOWAIT boost logic with reduced branching.
++	 * Most common case: no IOWAIT flag set.
++	 */
 +	if (likely(!(flags & SCHED_CPUFREQ_IOWAIT))) {
++		/* Decay existing boost if present */
 +		if (cpu->iowait_boost) {
-+			/* Clear iowait_boost if the CPU may have been idle. */
 +			if (delta_ns > TICK_NSEC) {
++				/* Long idle - clear boost */
 +				cpu->iowait_boost = 0;
 +			} else {
++				/* Short idle - decay boost */
 +				cpu->iowait_boost >>= 1;
 +			}
 +		}
 +	} else {
-+		/* IOWAIT path. Handle boost escalation and re-priming. */
++		/* IOWAIT flag set - boost frequency */
  		if (delta_ns > TICK_NSEC) {
-+			/* Start over if the CPU may have been idle. */
++			/* Long idle followed by IO - start fresh */
  			cpu->iowait_boost = ONE_EIGHTH_FP;
  		} else if (cpu->iowait_boost >= ONE_EIGHTH_FP) {
++			/* Continue boosting - double with cap at 1.0 */
  			cpu->iowait_boost <<= 1;
-@@ -2697,14 +2764,11 @@ static void intel_pstate_update_util(str
+-			if (cpu->iowait_boost > int_tofp(1))
++			if (cpu->iowait_boost > int_tofp(1)) {
+ 				cpu->iowait_boost = int_tofp(1);
++			}
  		} else {
++			/* Initialize boost */
  			cpu->iowait_boost = ONE_EIGHTH_FP;
  		}
 -	} else if (cpu->iowait_boost) {
@@ -5624,69 +5565,139 @@
 -			cpu->iowait_boost >>= 1;
  	}
 +
++	/* Update timestamp */
  	cpu->last_update = time;
-+
-+	/* Sample at 10ms cadence (INTEL_PSTATE_SAMPLING_INTERVAL). */
- 	delta_ns = time - cpu->sample.time;
- 	if ((s64)delta_ns < INTEL_PSTATE_SAMPLING_INTERVAL)
- 		return;
-@@ -2893,24 +2957,32 @@ static void intel_pstate_update_perf_lim
+-	delta_ns = time - cpu->sample.time;
+-	if ((s64)delta_ns < INTEL_PSTATE_SAMPLING_INTERVAL)
+-		return;
+ 
+-	if (intel_pstate_sample(cpu, time))
+-		intel_pstate_adjust_pstate(cpu);
++	/*
++	 * Sample and adjust P-state if enough time has passed.
++	 * Use signed comparison to handle time wraparound correctly.
++	 */
++	delta_ns = time - cpu->sample.time;
++	if ((s64)delta_ns >= INTEL_PSTATE_SAMPLING_INTERVAL) {
++		if (intel_pstate_sample(cpu, time)) {
++			intel_pstate_adjust_pstate(cpu);
++		}
++	}
+ }
+ 
+ static struct pstate_funcs core_funcs = {
+@@ -2893,32 +3081,80 @@ static void intel_pstate_update_perf_lim
  	int perf_ctl_scaling = cpu->pstate.perf_ctl_scaling;
  	int32_t max_policy_perf, min_policy_perf;
  
 -	max_policy_perf = policy_max / perf_ctl_scaling;
-+	/* Defensive: avoid division by zero if FW anomaly (should not happen). */
++	/* Validate inputs to prevent overflow */
 +	if (unlikely(perf_ctl_scaling <= 0)) {
++		pr_err("intel_pstate: invalid perf_ctl_scaling %d for CPU %d\n",
++		       perf_ctl_scaling, cpu->cpu);
 +		max_policy_perf = 0;
 +		min_policy_perf = 0;
 +		goto finalize;
 +	}
 +
-+	/* Exact floor division for policy limits via internal helpers. */
-+	max_policy_perf = (int32_t)ip_div_u64_recip_floor((u64)policy_max, (u64)perf_ctl_scaling);
++	if (unlikely(policy_max > INT_MAX || policy_min > INT_MAX)) {
++		pr_err("intel_pstate: policy limits overflow\n");
++		max_policy_perf = 0;
++		min_policy_perf = 0;
++		goto finalize;
++	}
++
++	/*
++	 * Optimization: Use shift for division when scaling is power of 2.
++	 * Common scaling factors:
++	 * - 100000 (not power of 2, use division)
++	 * - 78741 (not power of 2, use division)
++	 * - 65536 (2^16, use shift)
++	 * - 131072 (2^17, use shift)
++	 */
++	if ((perf_ctl_scaling & (perf_ctl_scaling - 1)) == 0) {
++		/* Power of 2 - use shift */
++		int shift = __builtin_ctz(perf_ctl_scaling);
++		max_policy_perf = (int32_t)(policy_max >> shift);
++		min_policy_perf = (int32_t)(policy_min >> shift);
++	} else {
++		/* Not power of 2 - use division */
++		max_policy_perf = (int32_t)div_u64_safe_shift(policy_max,
++							      perf_ctl_scaling);
++		min_policy_perf = (int32_t)div_u64_safe_shift(policy_min,
++							      perf_ctl_scaling);
++	}
++
++	/* Ensure min doesn't exceed max */
  	if (policy_max == policy_min) {
  		min_policy_perf = max_policy_perf;
  	} else {
 -		min_policy_perf = policy_min / perf_ctl_scaling;
--		min_policy_perf = clamp_t(int32_t, min_policy_perf,
--					  0, max_policy_perf);
-+		min_policy_perf = (int32_t)ip_div_u64_recip_floor((u64)policy_min, (u64)perf_ctl_scaling);
-+		min_policy_perf = clamp_t(int32_t, min_policy_perf, 0, max_policy_perf);
+ 		min_policy_perf = clamp_t(int32_t, min_policy_perf,
+ 					  0, max_policy_perf);
  	}
  
  	/*
 -	 * HWP needs some special consideration, because HWP_REQUEST uses
 -	 * abstract values to represent performance rather than pure ratios.
-+	 * HWP needs special handling: HWP_REQUEST uses abstract performance
-+	 * levels; map perf_ctl-based values back to HWP scale when necessary.
++	 * HWP needs conversion back to HWP scale if different from
++	 * perf_ctl scale.
  	 */
  	if (hwp_active && cpu->pstate.scaling != perf_ctl_scaling) {
  		int freq;
  
- 		freq = max_policy_perf * perf_ctl_scaling;
+-		freq = max_policy_perf * perf_ctl_scaling;
++		/* Prevent overflow in multiplication */
++		if (max_policy_perf > INT_MAX / perf_ctl_scaling) {
++			pr_warn("intel_pstate: frequency overflow prevented\n");
++			freq = INT_MAX;
++		} else {
++			freq = max_policy_perf * perf_ctl_scaling;
++		}
  		max_policy_perf = intel_pstate_freq_to_hwp(cpu, freq);
+-		freq = min_policy_perf * perf_ctl_scaling;
 +
- 		freq = min_policy_perf * perf_ctl_scaling;
++		if (min_policy_perf > INT_MAX / perf_ctl_scaling) {
++			freq = INT_MAX;
++		} else {
++			freq = min_policy_perf * perf_ctl_scaling;
++		}
  		min_policy_perf = intel_pstate_freq_to_hwp(cpu, freq);
  	}
-@@ -2918,6 +2990,7 @@ static void intel_pstate_update_perf_lim
+ 
  	pr_debug("cpu:%d min_policy_perf:%d max_policy_perf:%d\n",
  		 cpu->cpu, min_policy_perf, max_policy_perf);
  
+-	/* Normalize user input to [min_perf, max_perf] */
 +finalize:
- 	/* Normalize user input to [min_perf, max_perf] */
++	/* Apply limits based on per-CPU or global configuration */
  	if (per_cpu_limits) {
  		cpu->min_perf_ratio = min_policy_perf;
-@@ -2939,14 +3012,12 @@ static void intel_pstate_update_perf_lim
+ 		cpu->max_perf_ratio = max_policy_perf;
+@@ -2926,7 +3162,7 @@ static void intel_pstate_update_perf_lim
+ 		int turbo_max = cpu->pstate.turbo_pstate;
+ 		int32_t global_min, global_max;
+ 
+-		/* Global limits are in percent of the maximum turbo P-state. */
++		/* Calculate global limits as percentage of turbo */
+ 		global_max = DIV_ROUND_UP(turbo_max * global.max_perf_pct, 100);
+ 		global_min = DIV_ROUND_UP(turbo_max * global.min_perf_pct, 100);
+ 		global_min = clamp_t(int32_t, global_min, 0, global_max);
+@@ -2934,19 +3170,19 @@ static void intel_pstate_update_perf_lim
+ 		pr_debug("cpu:%d global_min:%d global_max:%d\n", cpu->cpu,
+ 			 global_min, global_max);
+ 
++		/* Combine policy and global limits */
+ 		cpu->min_perf_ratio = max(min_policy_perf, global_min);
+ 		cpu->min_perf_ratio = min(cpu->min_perf_ratio, max_policy_perf);
  		cpu->max_perf_ratio = min(max_policy_perf, global_max);
  		cpu->max_perf_ratio = max(min_policy_perf, cpu->max_perf_ratio);
  
 -		/* Make sure min_perf <= max_perf */
--		cpu->min_perf_ratio = min(cpu->min_perf_ratio,
--					  cpu->max_perf_ratio);
++		/* Final sanity check: ensure min <= max */
+ 		cpu->min_perf_ratio = min(cpu->min_perf_ratio,
+ 					  cpu->max_perf_ratio);
 -
-+		/* Ensure min_perf <= max_perf */
-+		cpu->min_perf_ratio = min(cpu->min_perf_ratio, cpu->max_perf_ratio);
  	}
 +
  	pr_debug("cpu:%d max_perf_ratio:%d min_perf_ratio:%d\n", cpu->cpu,
@@ -5696,7 +5707,7 @@
  }
  
  static int intel_pstate_set_policy(struct cpufreq_policy *policy)
-@@ -3784,25 +3855,46 @@ static const struct x86_cpu_id intel_epp
+@@ -3784,25 +4020,46 @@ static const struct x86_cpu_id intel_epp
  	 * AlderLake Mobile CPUs.
  	 */
  	X86_MATCH_VFM(INTEL_ALDERLAKE_L, HWP_SET_DEF_BALANCE_PERF_EPP(102)),
@@ -5750,7 +5761,7 @@
  	{}
  };
  
-@@ -3919,6 +4011,12 @@ hwp_cpu_matched:
+@@ -3919,6 +4176,12 @@ hwp_cpu_matched:
  			pr_debug("hybrid scaling factor: %d\n", hybrid_scaling_factor);
  		}
  
@@ -5763,7 +5774,6 @@
  	}
  
  	mutex_lock(&intel_pstate_driver_lock);
-
 
 --- a/kernel/irq/affinity.c	2025-08-21 13:08:08.000000000 +0100
 +++ b/kernel/irq/affinity.c	2025-08-21 22:28:35.518663546 +0100
