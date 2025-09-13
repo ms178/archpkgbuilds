@@ -429,12 +429,13 @@ void drm_buddy_fini(struct drm_buddy *mm)
 {
 	u64 root_size, size, start;
 	unsigned int order;
+	const unsigned int chunk_shift = ilog2(mm->chunk_size);
 	int i;
 
 	size = mm->size;
 
 	for (i = 0; i < mm->n_roots; ++i) {
-		order = ilog2(size) - ilog2(mm->chunk_size);
+		order = ilog2(size) - chunk_shift;
 		start = drm_buddy_block_offset(mm->roots[i]);
 		__force_merge(mm, start, start + size, order);
 
@@ -459,31 +460,78 @@ static int split_block(struct drm_buddy *mm,
 		       struct drm_buddy_block *block)
 {
 	unsigned int block_order = drm_buddy_block_order(block) - 1;
-	u64 offset = drm_buddy_block_offset(block);
+	const u64 left_off = drm_buddy_block_offset(block);
+	const u64 right_off = left_off + (mm->chunk_size << block_order);
+	struct drm_buddy_block *left, *right;
+	void *objs[2];
+	int n;
 
 	BUG_ON(!drm_buddy_block_is_free(block));
 	BUG_ON(!drm_buddy_block_order(block));
 
-	block->left = drm_block_alloc(mm, block, block_order, offset);
-	if (!block->left)
-		return -ENOMEM;
+	/* Fast path: bulk allocate both children in one call. */
+	n = kmem_cache_alloc_bulk(slab_blocks, GFP_KERNEL, 2, objs);
+	if (likely(n == 2)) {
+		left = objs[0];
+		right = objs[1];
 
-	block->right = drm_block_alloc(mm, block, block_order,
-				       offset + (mm->chunk_size << block_order));
-	if (!block->right) {
-		drm_block_free(mm, block->left);
-		return -ENOMEM;
+		/* Preserve original zalloc semantics: fully zero the objects. */
+		memset(left, 0, sizeof(*left));
+		memset(right, 0, sizeof(*right));
+
+		left->header = left_off | block_order;
+		right->header = right_off | block_order;
+
+		left->parent = block;
+		right->parent = block;
+
+		RB_CLEAR_NODE(&left->rb);
+		RB_CLEAR_NODE(&right->rb);
+
+		BUG_ON(left->header & DRM_BUDDY_HEADER_UNUSED);
+		BUG_ON(right->header & DRM_BUDDY_HEADER_UNUSED);
+	} else {
+		/* Fallback to the original, safe per-object zalloc path. */
+		if (n == 1)
+			kmem_cache_free(slab_blocks, objs[0]);
+
+		left = kmem_cache_zalloc(slab_blocks, GFP_KERNEL);
+		if (unlikely(!left))
+			return -ENOMEM;
+
+		right = kmem_cache_zalloc(slab_blocks, GFP_KERNEL);
+		if (unlikely(!right)) {
+			kmem_cache_free(slab_blocks, left);
+			return -ENOMEM;
+		}
+
+		left->header = left_off | block_order;
+		right->header = right_off | block_order;
+
+		left->parent = block;
+		right->parent = block;
+
+		RB_CLEAR_NODE(&left->rb);
+		RB_CLEAR_NODE(&right->rb);
+
+		BUG_ON(left->header & DRM_BUDDY_HEADER_UNUSED);
+		BUG_ON(right->header & DRM_BUDDY_HEADER_UNUSED);
 	}
 
+	/* Wire children into the parent. */
+	block->left = left;
+	block->right = right;
+
+	/* Inherit clear state from parent if applicable. */
 	if (drm_buddy_block_is_clear(block)) {
-		mark_cleared(block->left);
-		mark_cleared(block->right);
+		mark_cleared(left);
+		mark_cleared(right);
 		clear_reset(block);
 	}
 
-	mark_free(mm, block->left);
-	mark_free(mm, block->right);
-
+	/* Children are now free; parent becomes split and leaves the free tree. */
+	mark_free(mm, left);
+	mark_free(mm, right);
 	mark_split(mm, block);
 
 	return 0;
@@ -647,11 +695,11 @@ __alloc_range_bias(struct drm_buddy *mm,
 {
 	u64 req_size = mm->chunk_size << order;
 	struct drm_buddy_block *block;
-	struct drm_buddy_block *buddy;
 	LIST_HEAD(dfs);
 	int err;
 	int i;
 
+	/* Make end inclusive for overlaps() comparisons below. */
 	end = end - 1;
 
 	for (i = 0; i < mm->n_roots; ++i)
@@ -681,6 +729,7 @@ __alloc_range_bias(struct drm_buddy *mm,
 		if (drm_buddy_block_is_allocated(block))
 			continue;
 
+		/* If partially overlapping, ensure alignment feasibility. */
 		if (block_start < start || block_end > end) {
 			u64 adjusted_start = max(block_start, start);
 			u64 adjusted_end = min(block_end, end);
@@ -693,21 +742,19 @@ __alloc_range_bias(struct drm_buddy *mm,
 		if (!fallback && block_incompatible(block, flags))
 			continue;
 
+		/* Exact fit within range and correct order? Take it if free. */
 		if (contains(start, end, block_start, block_end) &&
 		    order == drm_buddy_block_order(block)) {
-			/*
-			 * Find the free block within the range.
-			 */
 			if (drm_buddy_block_is_free(block))
 				return block;
-
 			continue;
 		}
 
+		/* Descend. */
 		if (!drm_buddy_block_is_split(block)) {
 			err = split_block(mm, block);
 			if (unlikely(err))
-				goto err_undo;
+				return ERR_PTR(err);
 		}
 
 		list_add(&block->right->tmp_link, &dfs);
@@ -715,19 +762,6 @@ __alloc_range_bias(struct drm_buddy *mm,
 	} while (1);
 
 	return ERR_PTR(-ENOSPC);
-
-err_undo:
-	/*
-	 * We really don't want to leave around a bunch of split blocks, since
-	 * bigger is better, so make sure we merge everything back before we
-	 * free the allocated blocks.
-	 */
-	buddy = __get_buddy(block);
-	if (buddy &&
-	    (drm_buddy_block_is_free(block) &&
-	     drm_buddy_block_is_free(buddy)))
-		__drm_buddy_free(mm, block, false);
-	return ERR_PTR(err);
 }
 
 static struct drm_buddy_block *
@@ -791,18 +825,25 @@ alloc_from_freetree(struct drm_buddy *mm,
 	struct rb_root *root;
 	enum free_tree tree;
 	unsigned int tmp;
-	int err;
 
 	tree = __get_tree_for_flags(flags);
 
 	if (flags & DRM_BUDDY_TOPDOWN_ALLOCATION) {
-		block = get_maxblock(mm, order, tree);
-		if (block)
-			/* Store the obtained block order */
-			tmp = drm_buddy_block_order(block);
+		/* Prefer an exact-order block at the highest address first. */
+		root = __get_root(mm, order, tree);
+		if (!rbtree_is_empty(root)) {
+			block = rbtree_last_entry(root);
+			if (block)
+				tmp = order;
+		}
+		/* Fallback: pick max-offset block across all higher orders. */
+		if (!block) {
+			block = get_maxblock(mm, order, tree);
+			if (block)
+				tmp = drm_buddy_block_order(block);
+		}
 	} else {
 		for (tmp = order; tmp <= mm->max_order; ++tmp) {
-			/* Get RB tree root for this order and tree */
 			root = __get_root(mm, tmp, tree);
 			if (!rbtree_is_empty(root)) {
 				block = rbtree_last_entry(root);
@@ -813,7 +854,7 @@ alloc_from_freetree(struct drm_buddy *mm,
 	}
 
 	if (!block) {
-		/* Try allocating from the other tree */
+		/* Try allocating from the other tree. */
 		tree = (tree == CLEAR_TREE) ? DIRTY_TREE : CLEAR_TREE;
 
 		for (tmp = order; tmp <= mm->max_order; ++tmp) {
@@ -832,19 +873,15 @@ alloc_from_freetree(struct drm_buddy *mm,
 	BUG_ON(!drm_buddy_block_is_free(block));
 
 	while (tmp != order) {
-		err = split_block(mm, block);
+		int err = split_block(mm, block);
 		if (unlikely(err))
-			goto err_undo;
+			return ERR_PTR(err);
 
+		/* Always bias to the right child for higher addresses. */
 		block = block->right;
 		tmp--;
 	}
 	return block;
-
-err_undo:
-	if (tmp != order)
-		__drm_buddy_free(mm, block, false);
-	return ERR_PTR(err);
 }
 
 static int __alloc_range(struct drm_buddy *mm,
@@ -854,7 +891,6 @@ static int __alloc_range(struct drm_buddy *mm,
 			 u64 *total_allocated_on_err)
 {
 	struct drm_buddy_block *block;
-	struct drm_buddy_block *buddy;
 	u64 total_allocated = 0;
 	LIST_HEAD(allocated);
 	u64 end;
@@ -887,11 +923,12 @@ static int __alloc_range(struct drm_buddy *mm,
 
 		if (contains(start, end, block_start, block_end)) {
 			if (drm_buddy_block_is_free(block)) {
+				const u64 bsz = drm_buddy_block_size(mm, block);
 				mark_allocated(mm, block);
-				total_allocated += drm_buddy_block_size(mm, block);
-				mm->avail -= drm_buddy_block_size(mm, block);
+				total_allocated += bsz;
+				mm->avail -= bsz;
 				if (drm_buddy_block_is_clear(block))
-					mm->clear_avail -= drm_buddy_block_size(mm, block);
+					mm->clear_avail -= bsz;
 				list_add_tail(&block->link, &allocated);
 				continue;
 			} else if (!mm->clear_avail) {
@@ -903,7 +940,7 @@ static int __alloc_range(struct drm_buddy *mm,
 		if (!drm_buddy_block_is_split(block)) {
 			err = split_block(mm, block);
 			if (unlikely(err))
-				goto err_undo;
+				goto err_free;
 		}
 
 		list_add(&block->right->tmp_link, dfs);
@@ -916,20 +953,7 @@ static int __alloc_range(struct drm_buddy *mm,
 	}
 
 	list_splice_tail(&allocated, blocks);
-
 	return 0;
-
-err_undo:
-	/*
-	 * We really don't want to leave around a bunch of split blocks, since
-	 * bigger is better, so make sure we merge everything back before we
-	 * free the allocated blocks.
-	 */
-	buddy = __get_buddy(block);
-	if (buddy &&
-	    (drm_buddy_block_is_free(block) &&
-	     drm_buddy_block_is_free(buddy)))
-		__drm_buddy_free(mm, block, false);
 
 err_free:
 	if (err == -ENOSPC && total_allocated_on_err) {
@@ -938,7 +962,6 @@ err_free:
 	} else {
 		drm_buddy_free_list_internal(mm, &allocated);
 	}
-
 	return err;
 }
 
@@ -968,11 +991,12 @@ static int __alloc_contig_try_harder(struct drm_buddy *mm,
 	LIST_HEAD(blocks_lhs);
 	unsigned long pages;
 	unsigned int order;
+	const unsigned int chunk_shift = ilog2(mm->chunk_size);
 	u64 modify_size;
 	int err;
 
 	modify_size = rounddown_pow_of_two(size);
-	pages = modify_size >> ilog2(mm->chunk_size);
+	pages = modify_size >> chunk_shift;
 	order = fls(pages) - 1;
 	if (order == 0)
 		return -ENOSPC;
@@ -987,8 +1011,8 @@ static int __alloc_contig_try_harder(struct drm_buddy *mm,
 		for_each_rb_entry_reverse(block, root, rb) {
 			/* Allocate blocks traversing RHS */
 			rhs_offset = drm_buddy_block_offset(block);
-			err =  __drm_buddy_alloc_range(mm, rhs_offset, size,
-						       &filled, blocks);
+			err = __drm_buddy_alloc_range(mm, rhs_offset, size,
+						      &filled, blocks);
 			if (!err || err != -ENOSPC)
 				return err;
 
@@ -998,8 +1022,8 @@ static int __alloc_contig_try_harder(struct drm_buddy *mm,
 
 			/* Allocate blocks traversing LHS */
 			lhs_offset = drm_buddy_block_offset(block) - lhs_size;
-			err =  __drm_buddy_alloc_range(mm, lhs_offset, lhs_size,
-						       NULL, &blocks_lhs);
+			err = __drm_buddy_alloc_range(mm, lhs_offset, lhs_size,
+						      NULL, &blocks_lhs);
 			if (!err) {
 				list_splice(&blocks_lhs, blocks);
 				return 0;
@@ -1153,6 +1177,7 @@ int drm_buddy_alloc_blocks(struct drm_buddy *mm,
 	unsigned int min_order, order;
 	LIST_HEAD(allocated);
 	unsigned long pages;
+	const unsigned int chunk_shift = ilog2(mm->chunk_size);
 	int err;
 
 	if (size < mm->chunk_size)
@@ -1184,7 +1209,7 @@ int drm_buddy_alloc_blocks(struct drm_buddy *mm,
 	original_size = size;
 	original_min_size = min_block_size;
 
-	/* Roundup the size to power of 2 */
+	/* Roundup the size to power of 2 for contiguous requests */
 	if (flags & DRM_BUDDY_CONTIGUOUS_ALLOCATION) {
 		size = roundup_pow_of_two(size);
 		min_block_size = size;
@@ -1193,12 +1218,13 @@ int drm_buddy_alloc_blocks(struct drm_buddy *mm,
 		size = round_up(size, min_block_size);
 	}
 
-	pages = size >> ilog2(mm->chunk_size);
+	pages = size >> chunk_shift;
 	order = fls(pages) - 1;
-	min_order = ilog2(min_block_size) - ilog2(mm->chunk_size);
+	min_order = ilog2(min_block_size) - chunk_shift;
 
 	do {
-		order = min(order, (unsigned int)fls(pages) - 1);
+		unsigned int hi = fls(pages) - 1;
+		order = min(order, hi);
 		BUG_ON(order > mm->max_order);
 		BUG_ON(order < min_order);
 
@@ -1239,20 +1265,22 @@ int drm_buddy_alloc_blocks(struct drm_buddy *mm,
 			}
 		} while (1);
 
-		mark_allocated(mm, block);
-		mm->avail -= drm_buddy_block_size(mm, block);
-		if (drm_buddy_block_is_clear(block))
-			mm->clear_avail -= drm_buddy_block_size(mm, block);
-		kmemleak_update_trace(block);
-		list_add_tail(&block->link, &allocated);
-
-		pages -= BIT(order);
+		{
+			const u64 bsz = mm->chunk_size << order;
+			mark_allocated(mm, block);
+			mm->avail -= bsz;
+			if (drm_buddy_block_is_clear(block))
+				mm->clear_avail -= bsz;
+			kmemleak_update_trace(block);
+			list_add_tail(&block->link, &allocated);
+			pages -= BIT(order);
+		}
 
 		if (!pages)
 			break;
 	} while (1);
 
-	/* Trim the allocated block to the required size */
+	/* Trim the allocated block(s) to the required size */
 	if (!(flags & DRM_BUDDY_TRIM_DISABLE) &&
 	    original_size != size) {
 		struct list_head *trim_list;
