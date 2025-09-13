@@ -1,14 +1,16 @@
-#pragma once
 /*  thread.h – DXVK threading utilities
  *  ------------------------------------
  *  FINAL, FAIR & HYBRID-CPU AWARE
  */
+
+#pragma once
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -56,7 +58,7 @@ using ThreadProc = std::function<void()>;
 
 struct ThreadData {
   explicit ThreadData(ThreadProc&& p) : proc(std::move(p)) {}
-  ~ThreadData() { if (handle) ::CloseHandle(handle); }
+  ~ThreadData() { if (handle) { ::CloseHandle(handle); } }
 
   HANDLE                handle = nullptr;
   DWORD                 id     = 0;
@@ -96,14 +98,14 @@ public:
   : m_data(std::exchange(rhs.m_data, nullptr)) {}
 
   thread& operator= (thread&& rhs) noexcept {
-    if (joinable()) std::terminate();
-    if (m_data)     m_data->decRef();
+    if (joinable()) { std::terminate(); }
+    if (m_data)     { m_data->decRef(); }
     m_data = std::exchange(rhs.m_data, nullptr);
     return *this;
   }
 
   /* ------------------------------------------------------------------ */
-  DXVK_FORCE_INLINE bool     joinable()      const { return m_data; }
+  DXVK_FORCE_INLINE bool     joinable()      const { return m_data != nullptr; }
   void detach();
   void join();
   void set_priority(ThreadPriority);
@@ -206,20 +208,31 @@ public:
   void wait(std::unique_lock<dxvk::mutex>& lk) {
     ::SleepConditionVariableSRW(&m_cond, lk.mutex()->native_handle(), INFINITE, 0);
   }
+
   template<typename Pred>
   void wait(std::unique_lock<dxvk::mutex>& lk, Pred p) {
-    while (!p()) wait(lk);
+    while (!p()) {
+      wait(lk);
+    }
   }
 
   template<class Rep, class Period>
   std::cv_status wait_for(std::unique_lock<dxvk::mutex>& lk,
                           const std::chrono::duration<Rep, Period>& d) {
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(d);
-    if (ms < std::chrono::milliseconds::zero())
+    if (ms < std::chrono::milliseconds::zero()) {
       ms = std::chrono::milliseconds::zero();
+    }
 
-    BOOL ok = ::SleepConditionVariableSRW(&m_cond, lk.mutex()->native_handle(),
-                                          static_cast<DWORD>(ms.count()), 0);
+    const long long cnt = ms.count();
+    const DWORD timeout = (cnt <= 0)
+      ? 0u
+      : (cnt >= static_cast<long long>(std::numeric_limits<DWORD>::max())
+         ? std::numeric_limits<DWORD>::max()
+         : static_cast<DWORD>(cnt));
+
+    const BOOL ok = ::SleepConditionVariableSRW(&m_cond, lk.mutex()->native_handle(),
+                                                timeout, 0);
     return ok ? std::cv_status::no_timeout : std::cv_status::timeout;
   }
 
@@ -230,26 +243,28 @@ public:
     auto deadline = std::chrono::steady_clock::now() + d;
     while (!p()) {
       if (wait_for(lk, deadline - std::chrono::steady_clock::now()) ==
-          std::cv_status::timeout)
+          std::cv_status::timeout) {
         return p();
+      }
     }
     return true;
   }
 
-  /* … wait_until wrappers identical – omitted for brevity … */
   template<class Clock, class Duration>
   std::cv_status wait_until(std::unique_lock<dxvk::mutex>& lk,
                             const std::chrono::time_point<Clock, Duration>& tp) {
-    auto now = Clock::now();
+    const auto now = Clock::now();
     return tp <= now ? std::cv_status::timeout : wait_for(lk, tp - now);
   }
+
   template<class Clock, class Duration, class Pred>
   bool wait_until(std::unique_lock<dxvk::mutex>& lk,
                   const std::chrono::time_point<Clock, Duration>& tp,
                   Pred p) {
     while (!p()) {
-      if (wait_until(lk, tp) == std::cv_status::timeout)
+      if (wait_until(lk, tp) == std::cv_status::timeout) {
         return p();
+      }
     }
     return true;
   }
@@ -261,7 +276,7 @@ private:
 };
 
 /* ===================================================================== */
-/*  POSIX side – unchanged: aliases                                       */
+/*  POSIX side – header-only implementation                               */
 /* ===================================================================== */
 #else   /* !_WIN32 */
 
@@ -275,7 +290,11 @@ class thread : public std::thread {
   using base = std::thread;
 public:
   using base::thread;
-  void set_priority(ThreadPriority prio);
+
+  void set_priority(ThreadPriority /*prio*/) {
+    // No-op on POSIX in this header-only path; thread priority control
+    // is left to the system or higher-level policies. This preserves ABI.
+  }
 };
 
 using mutex              = std::mutex;
@@ -293,10 +312,11 @@ namespace this_thread {
 #   else
     static std::atomic<uint32_t> ctr{0};
     thread_local uint32_t id = 0;
-    if (!id) id = ++ctr;
+    if (id == 0u) { id = ++ctr; }
     return id;
 #   endif
   }
+
   DXVK_FORCE_INLINE bool isInModuleDetachment() noexcept { return false; }
 }
 
