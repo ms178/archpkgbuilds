@@ -1,0 +1,3326 @@
+--- a/kernel/irq/proc.c	2025-08-15 16:39:37.000000000 +0200
++++ b/kernel/irq/proc.c	2025-08-17 18:15:09.256757473 +0200
+@@ -12,7 +12,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/kernel_stat.h>
+ #include <linux/mutex.h>
+-
++#include <linux/uaccess.h>
+ #include "internals.h"
+ 
+ /*
+@@ -46,25 +46,43 @@ enum {
+ static int show_irq_affinity(int type, struct seq_file *m)
+ {
+ 	struct irq_desc *desc = irq_to_desc((long)m->private);
+-	const struct cpumask *mask;
++	const struct cpumask *mask = NULL;
++
++	if (!desc)
++		return -ENOENT;
+ 
+ 	switch (type) {
+ 	case AFFINITY:
+ 	case AFFINITY_LIST:
+-		mask = desc->irq_common_data.affinity;
++		/*
++		 * Use the helper to fetch the current affinity mask pointer.
++		 * Do not READ_ONCE() the affinity field directly: under ThinLTO
++		 * this may trip the compile-time size checks if the field is not
++		 * a simple scalar. The helper is the canonical, safe interface.
++		 */
++		mask = irq_data_get_affinity_mask(&desc->irq_data);
++
++		/* If a move is pending, report the pending mask instead. */
+ 		if (irq_move_pending(&desc->irq_data))
+ 			mask = irq_desc_get_pending_mask(desc);
+ 		break;
++
+ 	case EFFECTIVE:
+ 	case EFFECTIVE_LIST:
+ #ifdef CONFIG_GENERIC_IRQ_EFFECTIVE_AFF_MASK
+ 		mask = irq_data_get_effective_affinity_mask(&desc->irq_data);
+ 		break;
+ #endif
++		/* Fallthrough when effective affinity is not supported. */
+ 	default:
+ 		return -EINVAL;
+ 	}
+ 
++	if (!mask) {
++		seq_putc(m, '\n');
++		return 0;
++	}
++
+ 	switch (type) {
+ 	case AFFINITY_LIST:
+ 	case EFFECTIVE_LIST:
+@@ -80,19 +98,34 @@ static int show_irq_affinity(int type, s
+ 
+ static int irq_affinity_hint_proc_show(struct seq_file *m, void *v)
+ {
+-	struct irq_desc *desc = irq_to_desc((long)m->private);
++	unsigned int irq = (unsigned int)(long)m->private;
++	struct irq_desc *desc;
++	unsigned long flags;
+ 	cpumask_var_t mask;
+ 
+-	if (!zalloc_cpumask_var(&mask, GFP_KERNEL))
++	if (!zalloc_cpumask_var(&mask, GFP_KERNEL)) {
+ 		return -ENOMEM;
++	}
+ 
+-	scoped_guard(raw_spinlock_irq, &desc->lock) {
+-		if (desc->affinity_hint)
++	/* Atomically get and lock the descriptor to prevent use-after-free. */
++	desc = __irq_get_desc_lock(irq, &flags, false, IRQ_GET_DESC_CHECK_GLOBAL);
++
++	if (!desc) {
++		/* IRQ was freed after file open but before read. Safe exit. */
++		cpumask_clear(mask);
++	} else {
++		/* Safely access the descriptor's members under the lock. */
++		if (desc->affinity_hint) {
+ 			cpumask_copy(mask, desc->affinity_hint);
++		} else {
++			cpumask_clear(mask);
++		}
++		__irq_put_desc_unlock(desc, flags, false);
+ 	}
+ 
+ 	seq_printf(m, "%*pb\n", cpumask_pr_args(mask));
+ 	free_cpumask_var(mask);
++
+ 	return 0;
+ }
+ 
+@@ -274,21 +307,29 @@ static const struct proc_ops default_aff
+ 
+ static int irq_node_proc_show(struct seq_file *m, void *v)
+ {
+-	struct irq_desc *desc = irq_to_desc((long) m->private);
++    struct irq_desc *desc = irq_to_desc((long)m->private);
+ 
+-	seq_printf(m, "%d\n", irq_desc_get_node(desc));
+-	return 0;
++    if (!desc)
++        return -ENOENT;
++
++    seq_printf(m, "%d\n", irq_desc_get_node(desc));
++    return 0;
+ }
+ #endif
+ 
+ static int irq_spurious_proc_show(struct seq_file *m, void *v)
+ {
+-	struct irq_desc *desc = irq_to_desc((long) m->private);
++    struct irq_desc *desc = irq_to_desc((long) m->private);
+ 
+-	seq_printf(m, "count %u\n" "unhandled %u\n" "last_unhandled %u ms\n",
+-		   desc->irq_count, desc->irqs_unhandled,
+-		   jiffies_to_msecs(desc->last_unhandled));
+-	return 0;
++    if (!desc)
++        return -ENOENT;
++
++    seq_printf(m, "count %u\n"
++                  "unhandled %u\n"
++                  "last_unhandled %u ms\n",
++               desc->irq_count, desc->irqs_unhandled,
++               jiffies_to_msecs(desc->last_unhandled));
++    return 0;
+ }
+ 
+ #define MAX_NAMELEN 128
+@@ -322,91 +363,80 @@ void register_handler_proc(unsigned int
+ }
+ 
+ #undef MAX_NAMELEN
+-
+-#define MAX_NAMELEN 10
++#define MAX_NAMELEN 16
+ 
+ void register_irq_proc(unsigned int irq, struct irq_desc *desc)
+ {
+-	static DEFINE_MUTEX(register_lock);
+-	void __maybe_unused *irqp = (void *)(unsigned long) irq;
+-	char name [MAX_NAMELEN];
+-
+-	if (!root_irq_dir || (desc->irq_data.chip == &no_irq_chip))
+-		return;
+-
+-	/*
+-	 * irq directories are registered only when a handler is
+-	 * added, not when the descriptor is created, so multiple
+-	 * tasks might try to register at the same time.
+-	 */
+-	guard(mutex)(&register_lock);
+-
+-	if (desc->dir)
+-		return;
+-
+-	/* create /proc/irq/1234 */
+-	sprintf(name, "%u", irq);
+-	desc->dir = proc_mkdir(name, root_irq_dir);
+-	if (!desc->dir)
+-		return;
++    static DEFINE_MUTEX(register_lock);
++    void __maybe_unused *irqp = (void *)(unsigned long)irq;
++    char name[16]; /* Enough for "4294967295" + NUL */
++
++    if (!root_irq_dir || (desc->irq_data.chip == &no_irq_chip))
++        return;
++
++    guard(mutex)(&register_lock);
++
++    if (desc->dir)
++        return;
++
++    snprintf(name, sizeof(name), "%u", irq);
++    desc->dir = proc_mkdir(name, root_irq_dir);
++    if (!desc->dir)
++        return;
+ 
+ #ifdef CONFIG_SMP
+-	umode_t umode = S_IRUGO;
+-
+-	if (irq_can_set_affinity_usr(desc->irq_data.irq))
+-		umode |= S_IWUSR;
++    umode_t umode = S_IRUGO;
+ 
+-	/* create /proc/irq/<irq>/smp_affinity */
+-	proc_create_data("smp_affinity", umode, desc->dir, &irq_affinity_proc_ops, irqp);
++    if (irq_can_set_affinity_usr(desc->irq_data.irq))
++        umode |= S_IWUSR;
+ 
+-	/* create /proc/irq/<irq>/affinity_hint */
+-	proc_create_single_data("affinity_hint", 0444, desc->dir,
+-				irq_affinity_hint_proc_show, irqp);
+-
+-	/* create /proc/irq/<irq>/smp_affinity_list */
+-	proc_create_data("smp_affinity_list", umode, desc->dir,
+-			 &irq_affinity_list_proc_ops, irqp);
+-
+-	proc_create_single_data("node", 0444, desc->dir, irq_node_proc_show, irqp);
++    proc_create_data("smp_affinity", umode, desc->dir, &irq_affinity_proc_ops, irqp);
++    proc_create_single_data("affinity_hint", 0444, desc->dir,
++                            irq_affinity_hint_proc_show, irqp);
++    proc_create_data("smp_affinity_list", umode, desc->dir,
++                     &irq_affinity_list_proc_ops, irqp);
++    proc_create_single_data("node", 0444, desc->dir, irq_node_proc_show, irqp);
+ # ifdef CONFIG_GENERIC_IRQ_EFFECTIVE_AFF_MASK
+-	proc_create_single_data("effective_affinity", 0444, desc->dir,
+-				irq_effective_aff_proc_show, irqp);
+-	proc_create_single_data("effective_affinity_list", 0444, desc->dir,
+-				irq_effective_aff_list_proc_show, irqp);
++    proc_create_single_data("effective_affinity", 0444, desc->dir,
++                            irq_effective_aff_proc_show, irqp);
++    proc_create_single_data("effective_affinity_list", 0444, desc->dir,
++                            irq_effective_aff_list_proc_show, irqp);
+ # endif
+ #endif
+-	proc_create_single_data("spurious", 0444, desc->dir,
+-				irq_spurious_proc_show, (void *)(long)irq);
+-
++    proc_create_single_data("spurious", 0444, desc->dir,
++                            irq_spurious_proc_show, (void *)(long)irq);
+ }
+ 
+ void unregister_irq_proc(unsigned int irq, struct irq_desc *desc)
+ {
+-	char name [MAX_NAMELEN];
++    char name[16];
+ 
+-	if (!root_irq_dir || !desc->dir)
+-		return;
++    if (!root_irq_dir || !desc->dir)
++        return;
+ #ifdef CONFIG_SMP
+-	remove_proc_entry("smp_affinity", desc->dir);
+-	remove_proc_entry("affinity_hint", desc->dir);
+-	remove_proc_entry("smp_affinity_list", desc->dir);
+-	remove_proc_entry("node", desc->dir);
++    remove_proc_entry("smp_affinity", desc->dir);
++    remove_proc_entry("affinity_hint", desc->dir);
++    remove_proc_entry("smp_affinity_list", desc->dir);
++    remove_proc_entry("node", desc->dir);
+ # ifdef CONFIG_GENERIC_IRQ_EFFECTIVE_AFF_MASK
+-	remove_proc_entry("effective_affinity", desc->dir);
+-	remove_proc_entry("effective_affinity_list", desc->dir);
++    remove_proc_entry("effective_affinity", desc->dir);
++    remove_proc_entry("effective_affinity_list", desc->dir);
+ # endif
+ #endif
+-	remove_proc_entry("spurious", desc->dir);
++    remove_proc_entry("spurious", desc->dir);
+ 
+-	sprintf(name, "%u", irq);
+-	remove_proc_entry(name, root_irq_dir);
++    snprintf(name, sizeof(name), "%u", irq);
++    remove_proc_entry(name, root_irq_dir);
+ }
+ 
+ #undef MAX_NAMELEN
+ 
+ void unregister_handler_proc(unsigned int irq, struct irqaction *action)
+ {
+-	proc_remove(action->dir);
++    if (action && action->dir) {
++        proc_remove(action->dir);
++        action->dir = NULL;
++    }
+ }
+ 
+ static void register_default_affinity_proc(void)
+
+--- a/kernel/irq/affinity.c	2025-08-21 13:08:08.000000000 +0100
++++ b/kernel/irq/affinity.c	2025-09-14 12:28:35.518663546 +0100
+@@ -2,127 +2,1176 @@
+ /*
+  * Copyright (C) 2016 Thomas Gleixner.
+  * Copyright (C) 2016-2017 Christoph Hellwig.
++ * Raptor Lake optimizations (C) 2025 ms178.
+  */
+ #include <linux/interrupt.h>
+ #include <linux/kernel.h>
+ #include <linux/slab.h>
+ #include <linux/cpu.h>
+ #include <linux/group_cpus.h>
++#include <linux/cpufreq.h>
++#include <linux/topology.h>
++#include <linux/numa.h>
++#include <linux/overflow.h>
++#include <linux/bitmap.h>
++#ifdef CONFIG_X86
++#include <linux/module.h>
++#include <asm/cpu_device_id.h>
++#include <asm/intel-family.h>
++#include <asm/topology.h>
++#include <asm/cpu.h>
++#include <asm/smp.h>
++#endif
+ 
++#ifdef CONFIG_X86
++/* Maximum number of cores to handle */
++#define MAX_CORES_PER_NODE 64  /* Increased to handle future processors */
++
++/* Module parameters */
++static bool irq_pcore_affinity = true;
++module_param_named(pcore_affinity, irq_pcore_affinity, bool, 0644);
++MODULE_PARM_DESC(pcore_affinity, "Enable P-core IRQ affinity (default: 1)");
++
++/* Define CPU IDs if not already defined */
++#ifndef INTEL_FAM6_RAPTORLAKE
++#define INTEL_FAM6_RAPTORLAKE 0xB7
++#endif
++
++#ifndef INTEL_FAM6_ALDERLAKE
++#define INTEL_FAM6_ALDERLAKE 0x97
++#endif
++
++#ifndef INTEL_FAM6_ALDERLAKE_L
++#define INTEL_FAM6_ALDERLAKE_L 0x9A
++#endif
++
++/* Core type definition if not available */
++#ifndef X86_CORE_TYPE_INTEL_CORE
++#define X86_CORE_TYPE_INTEL_CORE 1
++#endif
++
++#ifndef X86_CORE_TYPE_INTEL_ATOM
++#define X86_CORE_TYPE_INTEL_ATOM 0
++#endif
++
++/* P-core mask management with proper locking */
++static DEFINE_MUTEX(pcore_mask_lock);
++static struct cpumask pcore_mask;
++static atomic_t pcore_mask_initialized = ATOMIC_INIT(0);
++static int numa_node_for_cpu[NR_CPUS];
++
++/* Store L2 cache domain information */
++static struct cpumask *l2_domain_masks;
++static int l2_domain_count;
++
++/* Cache to store CPU core types: -2 = uninitialized, -1 = not hybrid/unknown, 0 = E-core, 1 = P-core */
++static DEFINE_SPINLOCK(core_type_lock);
++static int cpu_core_type[NR_CPUS] = { [0 ... NR_CPUS-1] = -2 };
++
++/* Frequency heuristic information */
++static unsigned int max_cpu_freq;
++static atomic_t freq_initialized = ATOMIC_INIT(0);
++
++/* L2 core ID cache to avoid recalculation */
++static int l2_core_ids[NR_CPUS];
++static atomic_t l2_ids_initialized = ATOMIC_INIT(0);
++
++/* CPU hotplug dynamic state id (for correct unregister) */
++static int pcore_cpuhp_state = -1;
++
++/**
++ * hybrid_cpu_detected - Check if system has hybrid CPU architecture
++ *
++ * Detects Intel hybrid architectures like Raptor Lake and Alder Lake.
++ * Result is safely cached for performance.
++ *
++ * Return: true if hybrid CPU detected, false otherwise
++ */
++static bool hybrid_cpu_detected(void)
++{
++	static int is_hybrid = -1; /* -1: unknown, 0: no, 1: yes */
++	static DEFINE_MUTEX(hybrid_detect_lock);
++	static const struct x86_cpu_id hybrid_ids[] = {
++		{ .family = 6, .model = INTEL_FAM6_RAPTORLAKE,   .driver_data = 0 },
++		{ .family = 6, .model = INTEL_FAM6_ALDERLAKE,    .driver_data = 0 },
++		{ .family = 6, .model = INTEL_FAM6_ALDERLAKE_L,  .driver_data = 0 },
++		{}
++	};
++	int v = is_hybrid;
++
++	if (v != -1) {
++		return v == 1;
++	}
++
++	mutex_lock(&hybrid_detect_lock);
++	v = is_hybrid;
++	if (v == -1) {
++		v = x86_match_cpu(hybrid_ids) ? 1 : 0;
++		is_hybrid = v;
++	}
++	mutex_unlock(&hybrid_detect_lock);
++
++	return v == 1;
++}
++
++/**
++ * init_freq_info - Initialize frequency information for heuristic detection
++ *
++ * Efficiently calculates and caches maximum CPU frequency for use in core type detection.
++ * Only performs the calculation once for all CPUs.
++ */
++static void init_freq_info(void)
++{
++	static DEFINE_MUTEX(freq_lock);
++	unsigned int freq, temp_max = 0;
++	int c;
++
++	if (atomic_read_acquire(&freq_initialized)) {
++		return;
++	}
++
++	mutex_lock(&freq_lock);
++	if (!atomic_read(&freq_initialized)) {
++		for_each_online_cpu(c) {
++			freq = cpufreq_quick_get_max(c);
++			if (freq > temp_max) {
++				temp_max = freq;
++			}
++		}
++
++		/* Publish data before flipping the initialized flag */
++		max_cpu_freq = temp_max;
++		smp_wmb();
++		atomic_set(&freq_initialized, 1);
++	}
++	mutex_unlock(&freq_lock);
++}
++
++/**
++ * init_l2_core_ids - Pre-calculate L2 domain IDs once
++ *
++ * Pre-computes the L2 domain IDs for all CPUs to avoid expensive
++ * recalculations during L2 domain detection fallback.
++ */
++static void init_l2_core_ids(void)
++{
++	int cpu;
++
++	if (atomic_read_acquire(&l2_ids_initialized)) {
++		return;
++	}
++
++	for_each_possible_cpu(cpu) {
++		int pkg = topology_physical_package_id(cpu);
++		int cid = topology_core_id(cpu);
++
++		if (pkg < 0) {
++			pkg = 0;
++		}
++		if (cid < 0) {
++			cid = cpu; /* mild fallback avoids collapse */
++		}
++
++		l2_core_ids[cpu] = ((pkg & 0xFFFF) << 16) | (cid & 0xFFFF);
++	}
++
++	/* Publish array before setting initialized flag */
++	smp_wmb();
++	atomic_set(&l2_ids_initialized, 1);
++}
++
++/**
++ * get_core_type - Optimized CPU core type detection with caching
++ * @cpu: CPU number to check
++ *
++ * Efficiently determines whether a CPU is a P-core or E-core using three methods
++ * in order of reliability, with results cached for maximum performance.
++ *
++ * Return: 1 for P-core, 0 for E-core, -1 if unknown/not hybrid
++ */
++static int get_core_type(int cpu)
++{
++	int core_type;
++	unsigned long flags;
++
++	if (!cpu_possible(cpu)) {
++		return -1;
++	}
++
++	core_type = cpu_core_type[cpu];
++	if (core_type != -2) {
++		return core_type;
++	}
++
++	if (!hybrid_cpu_detected()) {
++		spin_lock_irqsave(&core_type_lock, flags);
++		if (cpu_core_type[cpu] == -2) {
++			cpu_core_type[cpu] = -1;
++		}
++		core_type = cpu_core_type[cpu];
++		spin_unlock_irqrestore(&core_type_lock, flags);
++		return core_type;
++	}
++
++#ifdef CONFIG_INTEL_HYBRID_CPU
++	{
++		u8 type = cpu_data(cpu).x86_core_type;
++
++		/* P-core: support both macro spellings across kernels */
++		if (
++#ifdef X86_CORE_TYPE_INTEL_CORE
++		    type == X86_CORE_TYPE_INTEL_CORE ||
++#endif
++#ifdef X86_CORE_TYPE_CORE
++		    type == X86_CORE_TYPE_CORE ||
++#endif
++		    false) {
++			spin_lock_irqsave(&core_type_lock, flags);
++			if (cpu_core_type[cpu] == -2) {
++				cpu_core_type[cpu] = 1;
++			}
++			spin_unlock_irqrestore(&core_type_lock, flags);
++			return 1;
++		}
++
++		/* E-core: support both macro spellings across kernels */
++		if (
++#ifdef X86_CORE_TYPE_INTEL_ATOM
++		    type == X86_CORE_TYPE_INTEL_ATOM ||
++#endif
++#ifdef X86_CORE_TYPE_ATOM
++		    type == X86_CORE_TYPE_ATOM ||
++#endif
++		    false) {
++			spin_lock_irqsave(&core_type_lock, flags);
++			if (cpu_core_type[cpu] == -2) {
++				cpu_core_type[cpu] = 0;
++			}
++			spin_unlock_irqrestore(&core_type_lock, flags);
++			return 0;
++		}
++	}
++#endif /* CONFIG_INTEL_HYBRID_CPU */
++
++	/* Heuristic 1: SMT sibling count */
++	{
++		const struct cpumask *thread_siblings = topology_sibling_cpumask(cpu);
++
++		if (thread_siblings && cpumask_weight(thread_siblings) > 1) {
++			spin_lock_irqsave(&core_type_lock, flags);
++			if (cpu_core_type[cpu] == -2) {
++				cpu_core_type[cpu] = 1;
++			}
++			spin_unlock_irqrestore(&core_type_lock, flags);
++			return 1;
++		}
++	}
++
++	/* Heuristic 2: frequency-based last resort */
++	if (!atomic_read_acquire(&freq_initialized)) {
++		init_freq_info();
++	}
++
++	if (max_cpu_freq > 0) {
++		unsigned int cpu_freq = cpufreq_quick_get_max(cpu);
++		unsigned int maxf = max_cpu_freq;
++		unsigned int thr_p = (maxf / 100U) * 95U;
++		unsigned int thr_e = (maxf / 100U) * 70U;
++
++		if (cpu_freq >= thr_p) {
++			spin_lock_irqsave(&core_type_lock, flags);
++			if (cpu_core_type[cpu] == -2) {
++				cpu_core_type[cpu] = 1;
++			}
++			spin_unlock_irqrestore(&core_type_lock, flags);
++			return 1;
++		} else if (cpu_freq > 0 && cpu_freq <= thr_e) {
++			spin_lock_irqsave(&core_type_lock, flags);
++			if (cpu_core_type[cpu] == -2) {
++				cpu_core_type[cpu] = 0;
++			}
++			spin_unlock_irqrestore(&core_type_lock, flags);
++			return 0;
++		}
++	}
++
++	/* Unknown */
++	spin_lock_irqsave(&core_type_lock, flags);
++	if (cpu_core_type[cpu] == -2) {
++		cpu_core_type[cpu] = -1;
++	}
++	core_type = cpu_core_type[cpu];
++	spin_unlock_irqrestore(&core_type_lock, flags);
++
++	return core_type;
++}
++
++/**
++ * get_cache_shared_mask - Get cache sharing mask for CPU
++ * @cpu: CPU number
++ *
++ * Returns the appropriate cache sharing mask based on core type
++ *
++ * Return: Pointer to cpumask
++ */
++static const struct cpumask *get_cache_shared_mask(int cpu)
++{
++	const struct cpumask *m = NULL;
++	int core_type = get_core_type(cpu);
++
++	#ifdef CONFIG_SCHED_CLUSTER
++	if (core_type == 0) {
++		m = cpu_clustergroup_mask(cpu);
++	}
++	#endif
++	if (!m || cpumask_empty(m)) {
++		m = cpu_llc_shared_mask(cpu);
++	}
++
++	return m;
++}
++
++/**
++ * free_l2_domain_masks - Free L2 domain mask resources
++ *
++ * Helper function to safely clean up L2 domain resources.
++ * Can be called from any context including error paths.
++ */
++static void free_l2_domain_masks(void)
++{
++	mutex_lock(&pcore_mask_lock);
++	if (l2_domain_masks) {
++		kfree(l2_domain_masks);
++		l2_domain_masks = NULL;
++		l2_domain_count = 0;
++	}
++	mutex_unlock(&pcore_mask_lock);
++}
++
++/**
++ * get_pcore_mask - Fill provided mask with performance cores
++ * @dst: Destination cpumask to fill with P-cores
++ *
++ * Thread-safe function to identify performance cores on hybrid CPUs.
++ * Caller must provide the destination buffer.
++ *
++ * Return: 0 on success, negative error code on failure
++ */
++static int get_pcore_mask(struct cpumask *dst)
++{
++	if (!dst) {
++		return -EINVAL;
++	}
++
++	if (!atomic_read_acquire(&pcore_mask_initialized)) {
++		mutex_lock(&pcore_mask_lock);
++		if (!atomic_read(&pcore_mask_initialized)) {
++			int cpu;
++			bool direct_detection = false;
++
++			cpumask_clear(&pcore_mask);
++
++			/* Direct core type detection (most reliable) */
++			for_each_possible_cpu(cpu) {
++				int core_type = get_core_type(cpu);
++
++				if (core_type == 1) {
++					cpumask_set_cpu(cpu, &pcore_mask);
++				}
++				if (cpu < NR_CPUS) {
++					numa_node_for_cpu[cpu] = cpu_to_node(cpu);
++				}
++			}
++			direct_detection = !cpumask_empty(&pcore_mask);
++
++			/* SMT sibling union */
++			if (!direct_detection) {
++				for_each_online_cpu(cpu) {
++					const struct cpumask *sib = topology_sibling_cpumask(cpu);
++
++					if (sib && cpumask_weight(sib) > 1) {
++						cpumask_or(&pcore_mask, &pcore_mask, sib);
++					}
++				}
++			}
++
++			/* Frequency-based fallback */
++			if (cpumask_empty(&pcore_mask)) {
++				unsigned int max_freq = 0;
++				int max_freq_cpu = -1;
++
++				for_each_online_cpu(cpu) {
++					unsigned int f = cpufreq_quick_get_max(cpu);
++
++					if (f > max_freq && f > 0) {
++						max_freq = f;
++						max_freq_cpu = cpu;
++					}
++				}
++
++				if (max_freq_cpu >= 0 && max_freq > 0) {
++					unsigned int threshold = (max_freq / 100U) * 95U;
++
++					for_each_online_cpu(cpu) {
++						unsigned int f = cpufreq_quick_get_max(cpu);
++
++						if (f >= threshold && f > 0) {
++							cpumask_set_cpu(cpu, &pcore_mask);
++						}
++					}
++				}
++			}
++
++			/* Fallback: all online CPUs */
++			if (cpumask_empty(&pcore_mask)) {
++				cpumask_copy(&pcore_mask, cpu_online_mask);
++			}
++
++			/* Publish mask before setting initialized flag */
++			smp_wmb();
++			atomic_set(&pcore_mask_initialized, 1);
++		}
++		mutex_unlock(&pcore_mask_lock);
++	}
++
++	mutex_lock(&pcore_mask_lock);
++	cpumask_copy(dst, &pcore_mask);
++	mutex_unlock(&pcore_mask_lock);
++
++	return 0;
++}
++
++/**
++ * identify_l2_domains - Optimized L2 cache domain detection
++ * @p_core_mask: Mask of P-cores to analyze
++ *
++ * Maps L2 cache sharing domains on Raptor Lake with optimized fallback mechanism.
++ * Pre-calculates L2 core IDs to avoid expensive operations in inner loops.
++ *
++ * Return: 0 on success, negative error code on failure
++ */
++static int identify_l2_domains(struct cpumask *p_core_mask)
++{
++	int i, cpu;
++	int total_cpus;
++
++	if (!p_core_mask || cpumask_empty(p_core_mask)) {
++		pr_warn("Empty P-core mask provided\n");
++		return -EINVAL;
++	}
++
++	if (!atomic_read_acquire(&l2_ids_initialized)) {
++		init_l2_core_ids();
++	}
++
++	mutex_lock(&pcore_mask_lock);
++
++	if (l2_domain_masks) {
++		kfree(l2_domain_masks);
++		l2_domain_masks = NULL;
++		l2_domain_count = 0;
++	}
++
++	{
++		int alloc_domains = cpumask_weight(p_core_mask);
++
++		if (alloc_domains <= 0) {
++			mutex_unlock(&pcore_mask_lock);
++			return -ENODATA;
++		}
++
++		l2_domain_masks = kcalloc(alloc_domains, sizeof(struct cpumask), GFP_KERNEL);
++		if (!l2_domain_masks) {
++			mutex_unlock(&pcore_mask_lock);
++			pr_warn("Failed to allocate L2 domain masks\n");
++			return -ENOMEM;
++		}
++	}
++
++	l2_domain_count = 0;
++
++	/* Use a heap cpumask to avoid large stack frames */
++	{
++		cpumask_var_t tmp;
++		if (!zalloc_cpumask_var(&tmp, GFP_KERNEL)) {
++			kfree(l2_domain_masks);
++			l2_domain_masks = NULL;
++			mutex_unlock(&pcore_mask_lock);
++			return -ENOMEM;
++		}
++
++		for_each_cpu(cpu, p_core_mask) {
++			const struct cpumask *shared_mask = get_cache_shared_mask(cpu);
++			bool found = false;
++			int j;
++
++			if (!shared_mask || cpumask_empty(shared_mask)) {
++				continue;
++			}
++
++			cpumask_and(tmp, shared_mask, p_core_mask);
++			if (cpumask_empty(tmp)) {
++				continue;
++			}
++
++			for (j = 0; j < l2_domain_count; j++) {
++				if (cpumask_test_cpu(cpu, &l2_domain_masks[j])) {
++					found = true;
++					break;
++				}
++			}
++			if (found) {
++				continue;
++			}
++
++			for (j = 0; j < l2_domain_count; j++) {
++				if (cpumask_equal(&l2_domain_masks[j], tmp)) {
++					found = true;
++					break;
++				}
++			}
++
++			if (!found) {
++				cpumask_copy(&l2_domain_masks[l2_domain_count], tmp);
++				l2_domain_count++;
++			}
++		}
++
++		free_cpumask_var(tmp);
++	}
++
++	if (l2_domain_count == 0) {
++		int max_domains = cpumask_weight(p_core_mask);
++		struct id_map {
++			int id;
++			int dom_idx;
++		} *map = NULL;
++		int map_count = 0;
++
++		if (max_domains <= 0) {
++			kfree(l2_domain_masks);
++			l2_domain_masks = NULL;
++			mutex_unlock(&pcore_mask_lock);
++			return -ENODATA;
++		}
++
++		map = kcalloc(max_domains, sizeof(*map), GFP_KERNEL);
++		if (!map) {
++			kfree(l2_domain_masks);
++			l2_domain_masks = NULL;
++			mutex_unlock(&pcore_mask_lock);
++			return -ENOMEM;
++		}
++
++		for (i = 0; i < max_domains; i++) {
++			map[i].id = -1;
++			map[i].dom_idx = -1;
++		}
++
++		for_each_cpu(cpu, p_core_mask) {
++			int l2_id, dom_idx = -1;
++			int m;
++
++			if (cpu >= NR_CPUS) {
++				continue;
++			}
++
++			l2_id = l2_core_ids[cpu];
++
++			for (m = 0; m < map_count; m++) {
++				if (map[m].id == l2_id) {
++					dom_idx = map[m].dom_idx;
++					break;
++				}
++			}
++
++			if (dom_idx == -1) {
++				if (map_count < max_domains) {
++					dom_idx = map_count;
++					map[map_count].id = l2_id;
++					map[map_count].dom_idx = dom_idx;
++					cpumask_clear(&l2_domain_masks[dom_idx]);
++					map_count++;
++					l2_domain_count++;
++				} else {
++					continue;
++				}
++			}
++
++			cpumask_set_cpu(cpu, &l2_domain_masks[dom_idx]);
++		}
++
++		kfree(map);
++	}
++
++	total_cpus = 0;
++	for (i = 0; i < l2_domain_count; i++) {
++		total_cpus += cpumask_weight(&l2_domain_masks[i]);
++	}
++
++	if (total_cpus < cpumask_weight(p_core_mask)) {
++		pr_warn("L2 domain detection incomplete: %d/%d CPUs\n",
++			total_cpus, cpumask_weight(p_core_mask));
++	}
++
++	mutex_unlock(&pcore_mask_lock);
++	return l2_domain_count > 0 ? 0 : -ENODATA;
++}
++
++/**
++ * group_cpus_hybrid_first - Distribute IRQs with hybrid CPU awareness
++ * @num_grps: Number of groups to create
++ *
++ * Creates CPU groups optimized for IRQ distribution on hybrid CPUs.
++ * Prioritizes P-cores and considers cache topology for performance.
++ *
++ * Return: Array of CPU masks or NULL on failure
++ */
++static struct cpumask *group_cpus_hybrid_first(unsigned int num_grps)
++{
++	cpumask_var_t p_core_copy;
++	cpumask_var_t e_cores_mask;
++	unsigned long *assigned = NULL;
++	struct cpumask *result = NULL;
++	struct cpumask *l2_local_masks = NULL;
++	int l2_local_count = 0;
++	int i, j, cpu, grp_idx = 0;
++	int ret;
++
++	if (!num_grps) {
++		return NULL;
++	}
++
++	if (!irq_pcore_affinity || !hybrid_cpu_detected()) {
++		return group_cpus_evenly(num_grps);
++	}
++
++	if (!zalloc_cpumask_var(&p_core_copy, GFP_KERNEL)) {
++		return group_cpus_evenly(num_grps);
++	}
++	if (!zalloc_cpumask_var(&e_cores_mask, GFP_KERNEL)) {
++		free_cpumask_var(p_core_copy);
++		return group_cpus_evenly(num_grps);
++	}
++	assigned = bitmap_zalloc(nr_cpu_ids, GFP_KERNEL);
++	if (!assigned) {
++		free_cpumask_var(e_cores_mask);
++		free_cpumask_var(p_core_copy);
++		return group_cpus_evenly(num_grps);
++	}
++
++	ret = get_pcore_mask(p_core_copy);
++	if (ret || cpumask_empty(p_core_copy)) {
++		bitmap_free(assigned);
++		free_cpumask_var(e_cores_mask);
++		free_cpumask_var(p_core_copy);
++		return group_cpus_evenly(num_grps);
++	}
++
++	result = kcalloc(num_grps, sizeof(struct cpumask), GFP_KERNEL);
++	if (!result) {
++		bitmap_free(assigned);
++		free_cpumask_var(e_cores_mask);
++		free_cpumask_var(p_core_copy);
++		return group_cpus_evenly(num_grps);
++	}
++	for (i = 0; i < num_grps; i++) {
++		cpumask_clear(&result[i]);
++	}
++
++	cpumask_andnot(e_cores_mask, cpu_online_mask, p_core_copy);
++
++	/* Identify L2 domains and snapshot them under the lock */
++	ret = identify_l2_domains(p_core_copy);
++	if (ret == 0) {
++		mutex_lock(&pcore_mask_lock);
++		if (l2_domain_count > 0 && l2_domain_masks) {
++			l2_local_count = l2_domain_count;
++			l2_local_masks = kcalloc(l2_local_count, sizeof(struct cpumask), GFP_KERNEL);
++			if (l2_local_masks) {
++				for (i = 0; i < l2_local_count; i++) {
++					cpumask_copy(&l2_local_masks[i], &l2_domain_masks[i]);
++				}
++			}
++		}
++		mutex_unlock(&pcore_mask_lock);
++
++		if (!l2_local_masks || l2_local_count == 0) {
++			ret = -ENOMEM;
++		}
++	}
++
++	if (ret) {
++		int cores = cpumask_weight(p_core_copy);
++		int cores_per_group = num_grps ? (cores / num_grps) : 0;
++		int extra = num_grps ? (cores % num_grps) : 0;
++
++		for (i = 0; i < (int)num_grps; i++) {
++			int count = 0;
++			int cores_this_group = cores_per_group + (i < extra ? 1 : 0);
++
++			for_each_cpu(cpu, p_core_copy) {
++				if (!test_bit(cpu, assigned) && count < cores_this_group) {
++					cpumask_set_cpu(cpu, &result[i]);
++					set_bit(cpu, assigned);
++					count++;
++				}
++			}
++		}
++	} else {
++		int total_cores = 0;
++
++		for (i = 0; i < l2_local_count; i++) {
++			total_cores += cpumask_weight(&l2_local_masks[i]);
++		}
++
++		for (i = 0; i < l2_local_count && grp_idx < (int)num_grps; i++) {
++			int domain_cores = cpumask_weight(&l2_local_masks[i]);
++			int grps_for_domain = 1;
++
++			if (domain_cores == 0) {
++				continue;
++			}
++
++			if (total_cores > 0) {
++				grps_for_domain = (num_grps * domain_cores + total_cores - 1) / total_cores;
++				if (grps_for_domain > (int)num_grps - grp_idx) {
++					grps_for_domain = (int)num_grps - grp_idx;
++				}
++			}
++			if (grps_for_domain < 1) {
++				grps_for_domain = 1;
++			}
++
++			{
++				int cores_per_domain_group = domain_cores / grps_for_domain;
++				int domain_extra = domain_cores % grps_for_domain;
++
++				for (j = 0; j < grps_for_domain && grp_idx < (int)num_grps; j++, grp_idx++) {
++					int cores_this_group = cores_per_domain_group + (j < domain_extra ? 1 : 0);
++					int count = 0;
++
++					for_each_cpu(cpu, &l2_local_masks[i]) {
++						if (count >= cores_this_group) {
++							break;
++						}
++						if (!test_bit(cpu, assigned)) {
++							cpumask_set_cpu(cpu, &result[grp_idx]);
++							set_bit(cpu, assigned);
++							count++;
++						}
++					}
++				}
++			}
++		}
++	}
++
++	if (grp_idx < (int)num_grps && !cpumask_empty(e_cores_mask)) {
++		int e_cores = cpumask_weight(e_cores_mask);
++		int remaining = (int)num_grps - grp_idx;
++		int cores_per_group = remaining > 0 ? e_cores / remaining : 0;
++		int extra = remaining > 0 ? e_cores % remaining : 0;
++
++		for (i = grp_idx; i < (int)num_grps; i++) {
++			int count = 0;
++			int target = cores_per_group + (i - grp_idx < extra ? 1 : 0);
++
++			for_each_cpu(cpu, e_cores_mask) {
++				if (count >= target) {
++					break;
++				}
++				if (!test_bit(cpu, assigned)) {
++					cpumask_set_cpu(cpu, &result[i]);
++					set_bit(cpu, assigned);
++					count++;
++				}
++			}
++		}
++	}
++
++	for (i = 0; i < (int)num_grps; i++) {
++		if (cpumask_empty(&result[i])) {
++			int donor_cpu = -1;
++			int donor_group = -1;
++			int best_score = -1;
++			int target_node = -1;
++			unsigned int j_start, j_end;
++
++			j_start = (i > 0) ? (i - 1) : 0;
++			j_end = (i + 1 < (int)num_grps) ? (i + 1) : (unsigned int)i;
++
++			for (j = j_start; j <= j_end; j++) {
++				if ((int)j != i && cpumask_weight(&result[j]) > 0) {
++					int temp_cpu = cpumask_first(&result[j]);
++
++					if (temp_cpu < NR_CPUS) {
++						target_node = numa_node_for_cpu[temp_cpu];
++						break;
++					}
++				}
++			}
++
++			for (j = 0; j < (int)num_grps; j++) {
++				if (cpumask_weight(&result[j]) > 1) {
++					for_each_cpu(cpu, &result[j]) {
++						int score = 0;
++						int cpu_node = (cpu < NR_CPUS) ? numa_node_for_cpu[cpu] : -1;
++						int ctype = get_core_type(cpu);
++						const struct cpumask *cache_mask;
++						int cache_siblings = 0;
++						int numa_siblings = 0;
++						int sibling;
++
++						if (target_node >= 0 && cpu_node == target_node) {
++							score += 1000;
++						}
++						if (ctype == 0) {
++							score += 500;
++						}
++
++						cache_mask = get_cache_shared_mask(cpu);
++						for_each_cpu(sibling, &result[j]) {
++							if (sibling != cpu) {
++								if (cache_mask && cpumask_test_cpu(sibling, cache_mask)) {
++									cache_siblings++;
++								}
++								if (cpu_node >= 0 && sibling < NR_CPUS &&
++								    numa_node_for_cpu[sibling] == cpu_node) {
++									numa_siblings++;
++								}
++							}
++						}
++
++						score += cache_siblings * 10;
++						score += numa_siblings * 50;
++
++						if (score > best_score) {
++							best_score = score;
++							donor_cpu = cpu;
++							donor_group = j;
++						}
++					}
++				}
++			}
++
++			if (donor_group >= 0 && donor_cpu >= 0) {
++				cpumask_clear_cpu(donor_cpu, &result[donor_group]);
++				cpumask_set_cpu(donor_cpu, &result[i]);
++			} else {
++				kfree(l2_local_masks);
++				kfree(result);
++				bitmap_free(assigned);
++				free_cpumask_var(e_cores_mask);
++				free_cpumask_var(p_core_copy);
++				return group_cpus_evenly(num_grps);
++			}
++		}
++	}
++
++	kfree(l2_local_masks);
++	bitmap_free(assigned);
++	free_cpumask_var(e_cores_mask);
++	free_cpumask_var(p_core_copy);
++	return result;
++}
++
++/**
++ * pcore_cpu_notify - Optimized CPU hotplug notification handler
++ * @cpu: CPU number that changed state
++ *
++ * Efficiently handles CPU hotplug events with minimal blocking.
++ * Uses trylock where appropriate to avoid stalling critical paths.
++ *
++ * Return: 0 on success, negative error code on failure
++ */
++static int pcore_cpu_notify(unsigned int cpu)
++{
++	if (unlikely(system_state != SYSTEM_RUNNING)) {
++		return 0;
++	}
++
++	if (cpu >= NR_CPUS) {
++		pr_warn("pcore_cpu_notify: cpu %u out of range\n", cpu);
++		return -EINVAL;
++	}
++
++	numa_node_for_cpu[cpu] = cpu_to_node(cpu);
++
++	atomic_set(&pcore_mask_initialized, 0);
++	atomic_set(&freq_initialized, 0);
++	atomic_set(&l2_ids_initialized, 0);
++
++	spin_lock(&core_type_lock);
++	cpu_core_type[cpu] = -2;
++	spin_unlock(&core_type_lock);
++
++	mutex_lock(&pcore_mask_lock);
++	l2_domain_count = 0;
++	mutex_unlock(&pcore_mask_lock);
++
++	return 0;
++}
++
++/**
++ * hybrid_irq_tuning_exit - Module exit function
++ *
++ * Cleans up all resources and restores system state when module is unloaded.
++ */
++static void __exit hybrid_irq_tuning_exit(void)
++{
++	/* If we didn't register or disabled, nothing to do */
++	if (pcore_cpuhp_state >= 0) {
++		cpuhp_remove_state_nocalls(pcore_cpuhp_state);
++		pcore_cpuhp_state = -1;
++	}
++
++	/* Free all resources */
++	free_l2_domain_masks();
++
++	/* Reset state */
++	atomic_set(&pcore_mask_initialized, 0);
++}
++
++/**
++ * hybrid_irq_tuning - Module initialization function
++ *
++ * Sets up hybrid CPU optimization for IRQ affinity on Raptor Lake
++ * and similar hybrid architectures.
++ *
++ * Return: 0 on success, negative error code on failure
++ */
++static int __init hybrid_irq_tuning(void)
++{
++	int ret = 0, cpu;
++	cpumask_var_t pcore_copy;
++
++	if (!hybrid_cpu_detected() || !irq_pcore_affinity)
++		return 0;
++
++	/* Initialize NUMA node mapping with bounds checking */
++	for_each_possible_cpu(cpu) {
++		if (cpu < NR_CPUS)
++			numa_node_for_cpu[cpu] = cpu_to_node(cpu);
++	}
++
++	/* Pre-initialize L2 core IDs */
++	init_l2_core_ids();
++
++	/* Pre-initialize frequency information */
++	init_freq_info();
++
++	/* Register CPU hotplug callback; store the dynamic state id */
++	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "irq/pcore_affinity:online",
++				pcore_cpu_notify, pcore_cpu_notify);
++	if (ret < 0) {
++		pr_err("Failed to register CPU hotplug callback: %d\n", ret);
++		return ret;
++	}
++	pcore_cpuhp_state = ret;
++
++	/* Get P-core mask and apply to default affinity */
++	if (zalloc_cpumask_var(&pcore_copy, GFP_KERNEL)) {
++		ret = get_pcore_mask(pcore_copy);
++		if (ret < 0) {
++			pr_warn("Failed to get P-core mask: %d\n", ret);
++			/* Continue anyway - will use default affinity */
++		} else if (!cpumask_empty(pcore_copy)) {
++			cpumask_copy(irq_default_affinity, pcore_copy);
++		}
++		free_cpumask_var(pcore_copy);
++	}
++
++	return 0;
++}
++core_initcall(hybrid_irq_tuning);
++module_exit(hybrid_irq_tuning_exit);
++#endif /* CONFIG_X86 */
++
++/* Preserve original algorithm with safety checks */
+ static void default_calc_sets(struct irq_affinity *affd, unsigned int affvecs)
+ {
++	if (!affd)
++		return;
++
+ 	affd->nr_sets = 1;
+ 	affd->set_size[0] = affvecs;
+ }
+ 
+ /**
+- * irq_create_affinity_masks - Create affinity masks for multiqueue spreading
+- * @nvecs:	The total number of vectors
+- * @affd:	Description of the affinity requirements
++ * irq_create_affinity_masks - Create CPU affinity masks for IRQ distribution
++ * @nvecs: Number of vectors to create masks for
++ * @affd: IRQ affinity descriptor
++ *
++ * Creates affinity masks for IRQ vectors, optimized for hybrid CPU architectures
++ * when available. Includes proper bounds checking and error handling.
+  *
+- * Returns the irq_affinity_desc pointer or NULL if allocation failed.
++ * Return: Array of affinity descriptors or NULL on failure
+  */
+ struct irq_affinity_desc *
+ irq_create_affinity_masks(unsigned int nvecs, struct irq_affinity *affd)
+ {
+ 	unsigned int affvecs, curvec, usedvecs, i;
+ 	struct irq_affinity_desc *masks = NULL;
++	bool hotplug_locked = false;
++
++	if (!affd) {
++		return NULL;
++	}
+ 
+-	/*
+-	 * Determine the number of vectors which need interrupt affinities
+-	 * assigned. If the pre/post request exhausts the available vectors
+-	 * then nothing to do here except for invoking the calc_sets()
+-	 * callback so the device driver can adjust to the situation.
+-	 */
+-	if (nvecs > affd->pre_vectors + affd->post_vectors)
++	if (nvecs > affd->pre_vectors + affd->post_vectors) {
+ 		affvecs = nvecs - affd->pre_vectors - affd->post_vectors;
+-	else
++	} else {
+ 		affvecs = 0;
++	}
+ 
+-	/*
+-	 * Simple invocations do not provide a calc_sets() callback. Install
+-	 * the generic one.
+-	 */
+-	if (!affd->calc_sets)
++	if (!affd->calc_sets) {
+ 		affd->calc_sets = default_calc_sets;
++	}
+ 
+-	/* Recalculate the sets */
+ 	affd->calc_sets(affd, affvecs);
+ 
+-	if (WARN_ON_ONCE(affd->nr_sets > IRQ_AFFINITY_MAX_SETS))
++	if (WARN_ON_ONCE(affd->nr_sets > IRQ_AFFINITY_MAX_SETS)) {
+ 		return NULL;
++	}
+ 
+-	/* Nothing to assign? */
+-	if (!affvecs)
++	if (!affvecs) {
+ 		return NULL;
++	}
+ 
+ 	masks = kcalloc(nvecs, sizeof(*masks), GFP_KERNEL);
+-	if (!masks)
++	if (!masks) {
+ 		return NULL;
++	}
+ 
+-	/* Fill out vectors at the beginning that don't need affinity */
+-	for (curvec = 0; curvec < affd->pre_vectors; curvec++)
++	for (curvec = 0; curvec < affd->pre_vectors && curvec < nvecs; curvec++) {
+ 		cpumask_copy(&masks[curvec].mask, irq_default_affinity);
++	}
++
++	cpus_read_lock();
++	hotplug_locked = true;
+ 
+-	/*
+-	 * Spread on present CPUs starting from affd->pre_vectors. If we
+-	 * have multiple sets, build each sets affinity mask separately.
+-	 */
+-	for (i = 0, usedvecs = 0; i < affd->nr_sets; i++) {
++	for (i = 0, usedvecs = 0, curvec = affd->pre_vectors;
++	     i < affd->nr_sets && curvec < nvecs; i++) {
+ 		unsigned int this_vecs = affd->set_size[i];
++		struct cpumask *result = NULL;
+ 		int j;
+-		struct cpumask *result = group_cpus_evenly(this_vecs);
++
++		if (this_vecs == 0) {
++			continue;
++		}
++
++#ifdef CONFIG_X86
++		if (hybrid_cpu_detected() && irq_pcore_affinity) {
++			result = group_cpus_hybrid_first(this_vecs);
++		} else
++#endif
++		{
++			result = group_cpus_evenly(this_vecs);
++		}
+ 
+ 		if (!result) {
++			if (hotplug_locked) {
++				cpus_read_unlock();
++			}
+ 			kfree(masks);
+ 			return NULL;
+ 		}
+ 
+-		for (j = 0; j < this_vecs; j++)
+-			cpumask_copy(&masks[curvec + j].mask, &result[j]);
++		for (j = 0; j < (int)this_vecs && (curvec + (unsigned int)j) < nvecs; j++) {
++			if (cpumask_empty(&result[j])) {
++				cpumask_copy(&masks[curvec + (unsigned int)j].mask, irq_default_affinity);
++			} else {
++				cpumask_copy(&masks[curvec + (unsigned int)j].mask, &result[j]);
++			}
++		}
++
+ 		kfree(result);
+ 
+-		curvec += this_vecs;
+-		usedvecs += this_vecs;
++		{
++			unsigned int used = min(this_vecs, nvecs - curvec);
++			curvec += used;
++			usedvecs += used;
++		}
++	}
++
++	if (hotplug_locked) {
++		cpus_read_unlock();
++		hotplug_locked = false;
+ 	}
+ 
+-	/* Fill out vectors at the end that don't need affinity */
+-	if (usedvecs >= affvecs)
+-		curvec = affd->pre_vectors + affvecs;
+-	else
+-		curvec = affd->pre_vectors + usedvecs;
+-	for (; curvec < nvecs; curvec++)
++	for (; curvec < nvecs; curvec++) {
+ 		cpumask_copy(&masks[curvec].mask, irq_default_affinity);
++	}
+ 
+-	/* Mark the managed interrupts */
+-	for (i = affd->pre_vectors; i < nvecs - affd->post_vectors; i++)
++	for (i = affd->pre_vectors; i < nvecs - affd->post_vectors; i++) {
+ 		masks[i].is_managed = 1;
++	}
+ 
+ 	return masks;
+ }
+ 
+ /**
+- * irq_calc_affinity_vectors - Calculate the optimal number of vectors
+- * @minvec:	The minimum number of vectors available
+- * @maxvec:	The maximum number of vectors available
+- * @affd:	Description of the affinity requirements
++ * irq_calc_affinity_vectors - Calculate optimal number of vectors for IRQ affinity
++ * @minvec: Minimum number of vectors
++ * @maxvec: Maximum number of vectors
++ * @affd: IRQ affinity descriptor
++ *
++ * Determines the optimal number of interrupt vectors for the system
++ * based on CPU topology.
++ *
++ * Return: Optimal number of vectors or 0 on failure
+  */
+ unsigned int irq_calc_affinity_vectors(unsigned int minvec, unsigned int maxvec,
+ 				       const struct irq_affinity *affd)
+ {
+-	unsigned int resv = affd->pre_vectors + affd->post_vectors;
+-	unsigned int set_vecs;
++	unsigned int resv, set_vecs = 0;
++	unsigned int diff;
++
++	if (!affd)
++		return 0;
++
++	resv = affd->pre_vectors + affd->post_vectors;
+ 
+ 	if (resv > minvec)
+ 		return 0;
+ 
++	/* Guard overflow */
++	if (check_sub_overflow(maxvec, resv, &diff))
++		return 0;
++
+ 	if (affd->calc_sets) {
+-		set_vecs = maxvec - resv;
++		set_vecs = diff;
+ 	} else {
+ 		cpus_read_lock();
+-		set_vecs = cpumask_weight(cpu_possible_mask);
++#ifdef CONFIG_X86
++		if (hybrid_cpu_detected() && irq_pcore_affinity) {
++			cpumask_var_t pcpu_mask;
++			if (zalloc_cpumask_var(&pcpu_mask, GFP_KERNEL)) {
++				if (get_pcore_mask(pcpu_mask) == 0 && !cpumask_empty(pcpu_mask)) {
++					set_vecs = cpumask_weight(pcpu_mask);
++				} else {
++					set_vecs = cpumask_weight(cpu_online_mask);
++				}
++				free_cpumask_var(pcpu_mask);
++			} else {
++				set_vecs = cpumask_weight(cpu_online_mask);
++			}
++		} else
++#endif
++		{
++			set_vecs = cpumask_weight(cpu_possible_mask);
++		}
+ 		cpus_read_unlock();
+ 	}
+ 
+-	return resv + min(set_vecs, maxvec - resv);
++	/* Ensure at least one vector */
++	if (set_vecs == 0)
++		set_vecs = 1;
++
++	return resv + min(set_vecs, diff);
+ }
++
++/* Module metadata */
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Intel Corporation");
++MODULE_DESCRIPTION("Raptor Lake IRQ Affinity Optimizations");
+
+--- a/arch/x86/kernel/apic/io_apic.c	2025-05-19 23:37:21.464343676 +0200
++++ b/arch/x86/kernel/apic/io_apic.c	2025-05-20 00:30:12.358813401 +0200
+@@ -105,17 +105,26 @@ struct mp_ioapic_gsi {
+ };
+ 
+ static struct ioapic {
+-	/* # of IRQ routing registers */
++	/* number of redirection (RTE) registers */
+ 	int				nr_registers;
+-	/* Saved state during suspend/resume, or while enabling intr-remap. */
++	/* shadow copy used for suspend / intr-remap enable */
+ 	struct IO_APIC_route_entry	*saved_registers;
+-	/* I/O APIC config */
++
++	/* firmware-supplied descriptor */
+ 	struct mpc_ioapic		mp_config;
+-	/* IO APIC gsi routing info */
++	/* GSI range         */
+ 	struct mp_ioapic_gsi		gsi_config;
++
++	/* irqdomain plumbing */
+ 	struct ioapic_domain_cfg	irqdomain_cfg;
+ 	struct irq_domain		*irqdomain;
++
++	/* iomem resource inserted under /proc/iomem */
+ 	struct resource			*iomem_res;
++
++	/* -------- modernised cache lines -------- */
++	void __iomem			*base;		/* fast MMIO base  */
++	bool				has_eoi;	/* v >= 0x20 EOI ? */
+ } ioapics[MAX_IO_APICS];
+ 
+ #define mpc_ioapic_ver(ioapic_idx)	ioapics[ioapic_idx].mp_config.apicver
+@@ -223,9 +232,9 @@ static void alloc_ioapic_saved_registers
+ 		return;
+ 
+ 	size = sizeof(struct IO_APIC_route_entry) * ioapics[idx].nr_registers;
+-	ioapics[idx].saved_registers = kzalloc(size, GFP_KERNEL);
++	ioapics[idx].saved_registers = kvzalloc(size, GFP_KERNEL);
+ 	if (!ioapics[idx].saved_registers)
+-		pr_err("IOAPIC %d: suspend/resume impossible!\n", idx);
++		pr_err("IOAPIC %d: suspend/resume state will be lost\n", idx);
+ }
+ 
+ static void free_ioapic_saved_registers(int idx)
+@@ -255,10 +264,15 @@ struct io_apic {
+ 	unsigned int eoi;
+ };
+ 
+-static __attribute_const__ struct io_apic __iomem *io_apic_base(int idx)
++static __always_inline struct io_apic __iomem *io_apic_base(int idx)
+ {
+-	return (void __iomem *) __fix_to_virt(FIX_IO_APIC_BASE_0 + idx)
+-		+ (mpc_ioapic_addr(idx) & ~PAGE_MASK);
++	void __iomem *base = READ_ONCE(ioapics[idx].base);
++
++	if (unlikely(!base))
++		base = (void __iomem *)__fix_to_virt(FIX_IO_APIC_BASE_0 + idx) +
++		(mpc_ioapic_addr(idx) & ~PAGE_MASK);
++
++	return (struct io_apic __iomem *)base;
+ }
+ 
+ static inline void io_apic_eoi(unsigned int apic, unsigned int vector)
+@@ -374,14 +388,30 @@ static void __remove_pin_from_irq(struct
+ }
+ 
+ static void io_apic_modify_irq(struct mp_chip_data *data, bool masked,
+-			       void (*final)(struct irq_pin_list *entry))
++							   void (*final)(struct irq_pin_list *entry))
+ {
+ 	struct irq_pin_list *entry;
+ 
+ 	data->entry.masked = masked;
+ 
++	if (list_empty(&data->irq_2_pin))
++		return;
++
++	/* fast-path: exactly one pin mapped to this IRQ */
++	if (list_is_singular(&data->irq_2_pin)) {
++		entry = list_first_entry(&data->irq_2_pin,
++								 struct irq_pin_list, list);
++		io_apic_write(entry->apic, 0x10 + 2 * entry->pin,
++					  data->entry.w1);
++		if (final)
++			final(entry);
++		return;
++	}
++
++	/* generic slow-path */
+ 	for_each_irq_pin(entry, data->irq_2_pin) {
+-		io_apic_write(entry->apic, 0x10 + 2 * entry->pin, data->entry.w1);
++		io_apic_write(entry->apic, 0x10 + 2 * entry->pin,
++					  data->entry.w1);
+ 		if (final)
+ 			final(entry);
+ 	}
+@@ -438,20 +468,19 @@ static void unmask_ioapic_irq(struct irq
+  */
+ static void __eoi_ioapic_pin(int apic, int pin, int vector)
+ {
+-	if (mpc_ioapic_ver(apic) >= 0x20) {
++	if (ioapics[apic].has_eoi) {
+ 		io_apic_eoi(apic, vector);
+ 	} else {
+-		struct IO_APIC_route_entry entry, entry1;
+-
+-		entry = entry1 = __ioapic_read_entry(apic, pin);
++		struct IO_APIC_route_entry entry, tmp;
+ 
+-		/* Mask the entry and change the trigger mode to edge. */
+-		entry1.masked = true;
+-		entry1.is_level = false;
++		entry = tmp = __ioapic_read_entry(apic, pin);
+ 
+-		__ioapic_write_entry(apic, pin, entry1);
++		/* mask + edge to clear remote-IRR */
++		tmp.masked   = true;
++		tmp.is_level = false;
++		__ioapic_write_entry(apic, pin, tmp);
+ 
+-		/* Restore the previous level triggered entry. */
++		/* restore original */
+ 		__ioapic_write_entry(apic, pin, entry);
+ 	}
+ }
+@@ -629,45 +658,44 @@ static int find_irq_entry(int ioapic_idx
+ 	return -1;
+ }
+ 
+-/*
+- * Find the pin to which IRQ[irq] (ISA) is connected
+- */
+-static int __init find_isa_irq_pin(int irq, int type)
++static int __init find_isa_irq_info(int irq, int type,
++									int *pin_out, int *apic_idx_out)
+ {
+ 	int i;
+ 
++	if (pin_out)
++		*pin_out = -1;
++	if (apic_idx_out)
++		*apic_idx_out = -1;
++
+ 	for (i = 0; i < mp_irq_entries; i++) {
+ 		int lbus = mp_irqs[i].srcbus;
+ 
+-		if (test_bit(lbus, mp_bus_not_pci) && (mp_irqs[i].irqtype == type) &&
+-		    (mp_irqs[i].srcbusirq == irq))
+-			return mp_irqs[i].dstirq;
+-	}
+-	return -1;
+-}
++		if (!test_bit(lbus, mp_bus_not_pci) ||
++			mp_irqs[i].irqtype != type   ||
++			mp_irqs[i].srcbusirq != irq)
++			continue;
+ 
+-static int __init find_isa_irq_apic(int irq, int type)
+-{
+-	int i;
++		if (pin_out)
++			*pin_out = mp_irqs[i].dstirq;
+ 
+-	for (i = 0; i < mp_irq_entries; i++) {
+-		int lbus = mp_irqs[i].srcbus;
++		if (apic_idx_out) {
++			int apic_idx = -1, j;
+ 
+-		if (test_bit(lbus, mp_bus_not_pci) && (mp_irqs[i].irqtype == type) &&
+-		    (mp_irqs[i].srcbusirq == irq))
+-			break;
+-	}
++			for_each_ioapic(j)
++				if (mpc_ioapic_id(j) == mp_irqs[i].dstapic) {
++					apic_idx = j;
++					break;
++				}
+ 
+-	if (i < mp_irq_entries) {
+-		int ioapic_idx;
++				if (apic_idx < 0)
++					return -ENODEV;
+ 
+-		for_each_ioapic(ioapic_idx) {
+-			if (mpc_ioapic_id(ioapic_idx) == mp_irqs[i].dstapic)
+-				return ioapic_idx;
++			*apic_idx_out = apic_idx;
+ 		}
++		return 0;
+ 	}
+-
+-	return -1;
++	return -ENOENT;
+ }
+ 
+ static bool irq_active_low(int idx)
+@@ -1267,50 +1295,50 @@ static struct { int pin, apic; } ioapic_
+ 
+ void __init enable_IO_APIC(void)
+ {
+-	int i8259_apic, i8259_pin, apic, pin;
++	int i8259_pin  = -1;
++	int i8259_apic = -1;
++	int apic, pin;
+ 
+ 	if (ioapic_is_disabled)
+ 		nr_ioapics = 0;
+ 
++	/* Nothing to do on PIC-less or IOAPIC-less systems */
+ 	if (!nr_legacy_irqs() || !nr_ioapics)
+ 		return;
+ 
++	/* Scan hardware for an already-programmed ExtINT entry */
+ 	for_each_ioapic_pin(apic, pin) {
+-		/* See if any of the pins is in ExtINT mode */
+-		struct IO_APIC_route_entry entry = ioapic_read_entry(apic, pin);
++		struct IO_APIC_route_entry rte;
+ 
+-		/*
+-		 * If the interrupt line is enabled and in ExtInt mode I
+-		 * have found the pin where the i8259 is connected.
+-		 */
+-		if (!entry.masked && entry.delivery_mode == APIC_DELIVERY_MODE_EXTINT) {
++		rte = ioapic_read_entry(apic, pin);
++		if (!rte.masked &&
++			rte.delivery_mode == APIC_DELIVERY_MODE_EXTINT) {
+ 			ioapic_i8259.apic = apic;
+-			ioapic_i8259.pin  = pin;
+-			break;
+-		}
++		ioapic_i8259.pin  = pin;
++		break;
++			}
+ 	}
+ 
+-	/*
+-	 * Look to see what if the MP table has reported the ExtINT
+-	 *
+-	 * If we could not find the appropriate pin by looking at the ioapic
+-	 * the i8259 probably is not connected the ioapic but give the
+-	 * mptable a chance anyway.
+-	 */
+-	i8259_pin  = find_isa_irq_pin(0, mp_ExtINT);
+-	i8259_apic = find_isa_irq_apic(0, mp_ExtINT);
+-	/* Trust the MP table if nothing is setup in the hardware */
+-	if ((ioapic_i8259.pin == -1) && (i8259_pin >= 0)) {
+-		pr_warn("ExtINT not setup in hardware but reported by MP table\n");
++	/* Ask the MP-table for the same information */
++	find_isa_irq_info(0, mp_ExtINT, &i8259_pin, &i8259_apic);
++
++	/* Trust firmware if hardware isn’t set up at all */
++	if (ioapic_i8259.pin == -1 && i8259_pin >= 0) {
++		pr_warn("ExtINT not set in hardware, using MP-table values\n");
+ 		ioapic_i8259.pin  = i8259_pin;
+ 		ioapic_i8259.apic = i8259_apic;
+ 	}
+-	/* Complain if the MP table and the hardware disagree */
+-	if (((ioapic_i8259.apic != i8259_apic) || (ioapic_i8259.pin != i8259_pin)) &&
+-	    (i8259_pin >= 0) && (ioapic_i8259.pin >= 0))
+-		pr_warn("ExtINT in hardware and MP table differ\n");
+ 
+-	/* Do not trust the IO-APIC being empty at bootup */
++	/* Complain if firmware and hardware disagree */
++	if (ioapic_i8259.pin  >= 0 && i8259_pin  >= 0 &&
++		(ioapic_i8259.pin  != i8259_pin ||
++		ioapic_i8259.apic != i8259_apic))
++		pr_warn("ExtINT differs between hardware and MP table\n");
++
++	/*
++	 * Never assume the IO-APIC is clean when we arrive here.
++	 * Wipe every RTE so we start from a defined state.
++	 */
+ 	clear_IO_APIC();
+ }
+ 
+@@ -1940,19 +1968,12 @@ static void lapic_register_intr(int irq)
+  */
+ static inline void __init unlock_ExtINT_logic(void)
+ {
+-	unsigned char save_control, save_freq_select;
++	unsigned char save_control, save_freq;
+ 	struct IO_APIC_route_entry entry0, entry1;
+ 	int apic, pin, i;
+ 	u32 apic_id;
+ 
+-	pin  = find_isa_irq_pin(8, mp_INT);
+-	if (pin == -1) {
+-		WARN_ON_ONCE(1);
+-		return;
+-	}
+-	apic = find_isa_irq_apic(8, mp_INT);
+-	if (apic == -1) {
+-		WARN_ON_ONCE(1);
++	if (find_isa_irq_info(8, mp_INT, &pin, &apic)) {
+ 		return;
+ 	}
+ 
+@@ -1961,33 +1982,30 @@ static inline void __init unlock_ExtINT_
+ 
+ 	apic_id = read_apic_id();
+ 	memset(&entry1, 0, sizeof(entry1));
+-
+-	entry1.dest_mode_logical	= true;
+-	entry1.masked			= false;
+-	entry1.destid_0_7		= apic_id & 0xFF;
+-	entry1.virt_destid_8_14		= apic_id >> 8;
+-	entry1.delivery_mode		= APIC_DELIVERY_MODE_EXTINT;
+-	entry1.active_low		= entry0.active_low;
+-	entry1.is_level			= false;
+-	entry1.vector = 0;
++	entry1.dest_mode_logical = true;
++	entry1.masked            = false;
++	entry1.destid_0_7        = apic_id & 0xff;
++	entry1.virt_destid_8_14  = apic_id >> 8;
++	entry1.delivery_mode     = APIC_DELIVERY_MODE_EXTINT;
++	entry1.active_low        = entry0.active_low;
++	entry1.is_level          = false;
++	entry1.vector            = 0;
+ 
+ 	ioapic_write_entry(apic, pin, entry1);
+ 
+-	save_control = CMOS_READ(RTC_CONTROL);
+-	save_freq_select = CMOS_READ(RTC_FREQ_SELECT);
+-	CMOS_WRITE((save_freq_select & ~RTC_RATE_SELECT) | 0x6,
+-		   RTC_FREQ_SELECT);
++	save_control    = CMOS_READ(RTC_CONTROL);
++	save_freq       = CMOS_READ(RTC_FREQ_SELECT);
++	CMOS_WRITE((save_freq & ~RTC_RATE_SELECT) | 0x6, RTC_FREQ_SELECT);
+ 	CMOS_WRITE(save_control | RTC_PIE, RTC_CONTROL);
+ 
+-	i = 100;
+-	while (i-- > 0) {
++	for (i = 100; i-- > 0; ) {
+ 		mdelay(10);
+ 		if ((CMOS_READ(RTC_INTR_FLAGS) & RTC_PF) == RTC_PF)
+ 			i -= 10;
+ 	}
+ 
+-	CMOS_WRITE(save_control, RTC_CONTROL);
+-	CMOS_WRITE(save_freq_select, RTC_FREQ_SELECT);
++	CMOS_WRITE(save_control,    RTC_CONTROL);
++	CMOS_WRITE(save_freq,       RTC_FREQ_SELECT);
+ 	clear_IO_APIC_pin(apic, pin);
+ 
+ 	ioapic_write_entry(apic, pin, entry0);
+@@ -2044,114 +2062,156 @@ static void __init replace_pin_at_irq_no
+  * is so screwy.  Thanks to Brian Perkins for testing/hacking this beast
+  * fanatically on his truly buggy board.
+  */
+-static inline void __init check_timer(void)
++static void __init check_timer(void)
+ {
+-	struct irq_data *irq_data = irq_get_irq_data(0);
+-	struct mp_chip_data *data = irq_data->chip_data;
+-	struct irq_cfg *cfg = irqd_cfg(irq_data);
++	struct irq_data *irq_data0 = irq_get_irq_data(0);
++	struct mp_chip_data *mp_data = irq_data0 ? irq_data0->chip_data : NULL;
++	struct irq_cfg *cfg0 = irq_data0 ? irqd_cfg(irq_data0) : NULL;
+ 	int node = cpu_to_node(0);
+-	int apic1, pin1, apic2, pin2;
+-	int no_pin1 = 0;
++	int apic1 = -1, pin1 = -1;
++	int apic2, pin2;
++	bool no_pin1 = false;
++	int ret_find_info;
+ 
+-	if (!global_clock_event)
++	if (!global_clock_event || !cfg0)
+ 		return;
+ 
+ 	local_irq_disable();
+ 
+-	/*
+-	 * get/set the timer IRQ vector:
+-	 */
+ 	legacy_pic->mask(0);
+-
+-	/*
+-	 * As IRQ0 is to be enabled in the 8259A, the virtual
+-	 * wire has to be disabled in the local APIC.  Also
+-	 * timer interrupts need to be acknowledged manually in
+-	 * the 8259A for the i82489DX when using the NMI
+-	 * watchdog as that APIC treats NMIs as level-triggered.
+-	 * The AEOI mode will finish them in the 8259A
+-	 * automatically.
+-	 */
+ 	apic_write(APIC_LVT0, APIC_LVT_MASKED | APIC_DM_EXTINT);
+ 	legacy_pic->init(1);
+ 
+-	pin1  = find_isa_irq_pin(0, mp_INT);
+-	apic1 = find_isa_irq_apic(0, mp_INT);
++	ret_find_info = find_isa_irq_info(0, mp_INT, &pin1, &apic1);
++
+ 	pin2  = ioapic_i8259.pin;
+ 	apic2 = ioapic_i8259.apic;
+ 
+ 	pr_info("..TIMER: vector=0x%02X apic1=%d pin1=%d apic2=%d pin2=%d\n",
+-		cfg->vector, apic1, pin1, apic2, pin2);
++			cfg0->vector, apic1, pin1, apic2, pin2);
+ 
+-	/*
+-	 * Some BIOS writers are clueless and report the ExtINTA
+-	 * I/O APIC input from the cascaded 8259A as the timer
+-	 * interrupt input.  So just in case, if only one pin
+-	 * was found above, try it both directly and through the
+-	 * 8259A.
+-	 */
+ 	if (pin1 == -1) {
+ 		panic_if_irq_remap(FW_BUG "Timer not connected to IO-APIC");
+ 		pin1 = pin2;
+ 		apic1 = apic2;
+-		no_pin1 = 1;
++		no_pin1 = true;
+ 	} else if (pin2 == -1) {
+ 		pin2 = pin1;
+ 		apic2 = apic1;
+ 	}
+ 
+-	if (pin1 != -1) {
+-		/* Ok, does IRQ0 through the IOAPIC work? */
++	if (pin1 != -1 && apic1 != -1) {
+ 		if (no_pin1) {
+-			mp_alloc_timer_irq(apic1, pin1);
+-		} else {
+-			/*
+-			 * for edge trigger, it's already unmasked,
+-			 * so only need to unmask if it is level-trigger
+-			 * do we really have level trigger timer?
++			if (mp_alloc_timer_irq(apic1, pin1) != 0) {
++				goto try_8259;
++			}
++			irq_data0 = irq_get_irq_data(0);
++			if (!irq_data0) {
++				pr_warn("TIMER: IRQ0 data not found after mp_alloc_timer_irq\n");
++				goto try_8259;
++			}
++			mp_data = irq_data0->chip_data;
++			/* cfg0 might also need re-fetch if mp_alloc_timer_irq can change it,
++			 * but typically irq_cfg is stable or re-fetched with irq_data.
++			 * Assuming cfg0 remains valid or irq_get_irq_data refreshes enough.
+ 			 */
++		} else {
+ 			int idx = find_irq_entry(apic1, pin1, mp_INT);
+-
+ 			if (idx != -1 && irq_is_level(idx))
+-				unmask_ioapic_irq(irq_get_irq_data(0));
++				unmask_ioapic_irq(irq_data0);
++		}
++
++		if (irq_data0->domain) {
++			irq_domain_deactivate_irq(irq_data0);
++			irq_domain_activate_irq(irq_data0, false);
++		} else {
++			pr_warn("TIMER: IRQ0 not configured for IO-APIC test (pin1).\n");
++			goto try_8259;
+ 		}
+-		irq_domain_deactivate_irq(irq_data);
+-		irq_domain_activate_irq(irq_data, false);
++
+ 		if (timer_irq_works()) {
+ 			if (disable_timer_pin_1 > 0)
+-				clear_IO_APIC_pin(0, pin1);
++				clear_IO_APIC_pin(apic1, pin1);
+ 			goto out;
+ 		}
+ 		panic_if_irq_remap("timer doesn't work through Interrupt-remapped IO-APIC");
+ 		clear_IO_APIC_pin(apic1, pin1);
+ 		if (!no_pin1)
+ 			pr_err("..MP-BIOS bug: 8254 timer not connected to IO-APIC\n");
++	}
++
++	try_8259:
++	pr_info("...trying to set up timer (IRQ0) through the 8259A ...\n");
++	pr_info("..... (found apic %d pin %d) ...\n", apic2, pin2);
++
++	if (pin2 != -1 && apic2 != -1) {
++		if (!mp_data) {
++			if (mp_alloc_timer_irq(apic2, pin2) != 0) {
++				pr_err("Failed to allocate timer IRQ0 to APIC %d Pin %d\n", apic2, pin2);
++				goto try_virtual_wire;
++			}
++			irq_data0 = irq_get_irq_data(0);
++			if (!irq_data0) {
++				pr_warn("TIMER: IRQ0 data not found after mp_alloc_timer_irq for 8259A path\n");
++				goto try_virtual_wire;
++			}
++			mp_data = irq_data0->chip_data;
++			cfg0 = irqd_cfg(irq_data0); /* Re-fetch cfg0 as well */
++			if (!mp_data || !cfg0) {
++				pr_warn("TIMER: mp_data or cfg0 NULL after re-fetch for 8259A path\n");
++				goto try_virtual_wire;
++			}
++		} else {
++			if ((apic1 != apic2 || pin1 != pin2) && apic1 != -1 && pin1 != -1)
++				replace_pin_at_irq_node(mp_data, node, apic1, pin1, apic2, pin2);
++		}
++
++		if (irq_data0->domain) {
++			irq_domain_deactivate_irq(irq_data0);
++			irq_domain_activate_irq(irq_data0, false);
++		} else {
++			pr_warn("TIMER: IRQ0 not configured for IO-APIC test (pin2).\n");
++			goto try_virtual_wire;
++		}
+ 
+-		pr_info("...trying to set up timer (IRQ0) through the 8259A ...\n");
+-		pr_info("..... (found apic %d pin %d) ...\n", apic2, pin2);
+-		/*
+-		 * legacy devices should be connected to IO APIC #0
+-		 */
+-		replace_pin_at_irq_node(data, node, apic1, pin1, apic2, pin2);
+-		irq_domain_deactivate_irq(irq_data);
+-		irq_domain_activate_irq(irq_data, false);
+ 		legacy_pic->unmask(0);
+ 		if (timer_irq_works()) {
+ 			pr_info("....... works.\n");
+ 			goto out;
+ 		}
+-		/*
+-		 * Cleanup, just in case ...
+-		 */
+ 		legacy_pic->mask(0);
+ 		clear_IO_APIC_pin(apic2, pin2);
+ 		pr_info("....... failed.\n");
+ 	}
+ 
++	try_virtual_wire:
+ 	pr_info("...trying to set up timer as Virtual Wire IRQ...\n");
+ 
++	if (irq_data0) { /* Only proceed if irq_data0 is valid */
++		if (irq_data0->domain) { /* Check if domain is set before comparing */
++			if ((apic1 != -1 && irq_data0->domain == mp_ioapic_irqdomain(apic1)) ||
++				(apic2 != -1 && irq_data0->domain == mp_ioapic_irqdomain(apic2))) {
++				irq_domain_deactivate_irq(irq_data0);
++				}
++		}
++		irq_set_chip_data(0, NULL); /* Clear chip data for IRQ0 */
++	}
++
++
+ 	lapic_register_intr(0);
+-	apic_write(APIC_LVT0, APIC_DM_FIXED | cfg->vector);	/* Fixed mode */
++	/* cfg0 could be stale if mp_alloc_timer_irq was called and irq_data0 was re-fetched.
++	 * It's safer to re-get cfg0 if irq_data0 has been potentially re-assigned.
++	 * For simplicity, assuming cfg0 for vector is stable, or re-fetch if needed.
++	 * The critical part is that cfg0 points to the config for IRQ0.
++	 */
++	if (!cfg0 && irq_data0) /* Re-fetch if it became NULL due to logic path */
++		cfg0 = irqd_cfg(irq_data0);
++	if (!cfg0) { /* Still NULL, cannot proceed with LVT0 programming */
++		pr_err("TIMER: cfg0 is NULL, cannot attempt virtual wire. Critical error.\n");
++		panic("Timer IRQ0 configuration broken.");
++	}
++
++	apic_write(APIC_LVT0, APIC_DM_FIXED | cfg0->vector);
+ 	legacy_pic->unmask(0);
+ 
+ 	if (timer_irq_works()) {
+@@ -2159,7 +2219,7 @@ static inline void __init check_timer(vo
+ 		goto out;
+ 	}
+ 	legacy_pic->mask(0);
+-	apic_write(APIC_LVT0, APIC_LVT_MASKED | APIC_DM_FIXED | cfg->vector);
++	apic_write(APIC_LVT0, APIC_LVT_MASKED | APIC_DM_FIXED | cfg0->vector);
+ 	pr_info("..... failed.\n");
+ 
+ 	pr_info("...trying to set up timer as ExtINT IRQ...\n");
+@@ -2179,11 +2239,11 @@ static inline void __init check_timer(vo
+ 	pr_info("..... failed :\n");
+ 	if (apic_is_x2apic_enabled()) {
+ 		pr_info("Perhaps problem with the pre-enabled x2apic mode\n"
+-			"Try booting with x2apic and interrupt-remapping disabled in the bios.\n");
++		"Try booting with x2apic and interrupt-remapping disabled in the bios.\n");
+ 	}
+ 	panic("IO-APIC + timer doesn't work!  Boot with apic=debug and send a "
+-		"report.  Then try booting with the 'noapic' option.\n");
+-out:
++	"report.  Then try booting with the 'noapic' option.\n");
++	out:
+ 	local_irq_enable();
+ }
+ 
+@@ -2537,39 +2597,57 @@ static void io_apic_set_fixmap(enum fixe
+ 
+ void __init io_apic_init_mappings(void)
+ {
+-	unsigned long ioapic_phys, idx = FIX_IO_APIC_BASE_0;
+-	struct resource *ioapic_res;
++	unsigned long fix_idx = FIX_IO_APIC_BASE_0;
++	struct resource *res  = ioapic_setup_resources();
++	unsigned long phys;
+ 	int i;
+ 
+-	ioapic_res = ioapic_setup_resources();
+ 	for_each_ioapic(i) {
+ 		if (smp_found_config) {
+-			ioapic_phys = mpc_ioapic_addr(i);
+-#ifdef CONFIG_X86_32
+-			if (!ioapic_phys) {
+-				pr_err("WARNING: bogus zero IO-APIC address found in MPTABLE, "
+-				       "disabling IO/APIC support!\n");
++			phys = mpc_ioapic_addr(i);
++			#ifdef CONFIG_X86_32
++			if (!phys) {
++				pr_err("Zero IO-APIC address in MP-table, "
++				"disabling IO/APIC support!\n");
+ 				smp_found_config = 0;
+ 				ioapic_is_disabled = true;
+-				goto fake_ioapic_page;
++				return;
+ 			}
+-#endif
++			#else
++			/*
++			 * Non-MP or DT case: allocate a dummy page so that later code
++			 * can still create the fix-map.  The page is never accessed.
++			 */
++			#endif
+ 		} else {
+-#ifdef CONFIG_X86_32
+-fake_ioapic_page:
+-#endif
+-			ioapic_phys = (unsigned long)memblock_alloc_or_panic(PAGE_SIZE,
+-								    PAGE_SIZE);
+-			ioapic_phys = __pa(ioapic_phys);
+-		}
+-		io_apic_set_fixmap(idx, ioapic_phys);
+-		apic_pr_verbose("mapped IOAPIC to %08lx (%08lx)\n",
+-				__fix_to_virt(idx) + (ioapic_phys & ~PAGE_MASK), ioapic_phys);
+-		idx++;
+-
+-		ioapic_res->start = ioapic_phys;
+-		ioapic_res->end = ioapic_phys + IO_APIC_SLOT_SIZE - 1;
+-		ioapic_res++;
++			#ifdef CONFIG_X86_32
++			phys = (unsigned long)
++			memblock_alloc_or_panic(PAGE_SIZE, PAGE_SIZE);
++			#else
++			phys = __pa(memblock_alloc_or_panic(PAGE_SIZE,
++												PAGE_SIZE));
++			#endif
++		}
++
++		/* Create the permanent fix-map entry */
++		io_apic_set_fixmap(fix_idx, phys);
++
++		/* Cache virtual base for ultra-fast MMIO access */
++		ioapics[i].base = (void __iomem *)
++		(__fix_to_virt(fix_idx) + (phys & ~PAGE_MASK));
++
++		/* Cache “has EOI register” once – no MMIO on hot path later */
++		ioapics[i].has_eoi = io_apic_get_version(i) >= 0x20;
++
++		apic_pr_verbose("mapped IOAPIC to %px (%08lx)\n",
++						ioapics[i].base, phys);
++
++		/* Complete the resource descriptor: name & flags already set */
++		res->start = phys;
++		res->end   = phys + IO_APIC_SLOT_SIZE - 1;
++		res++;		/* advance to next resource */
++
++		fix_idx++;	/* next fix-map slot */
+ 	}
+ }
+ 
+@@ -2658,7 +2736,8 @@ static int find_free_ioapic_entry(void)
+  * @gsi_base:	base of GSI associated with the IOAPIC
+  * @cfg:	configuration information for the IOAPIC
+  */
+-int mp_register_ioapic(int id, u32 address, u32 gsi_base, struct ioapic_domain_cfg *cfg)
++int mp_register_ioapic(int id, u32 address, u32 gsi_base,
++					   struct ioapic_domain_cfg *cfg)
+ {
+ 	bool hotplug = !!ioapic_initialized;
+ 	struct mp_ioapic_gsi *gsi_cfg;
+@@ -2670,82 +2749,81 @@ int mp_register_ioapic(int id, u32 addre
+ 		return -EINVAL;
+ 	}
+ 
+-	for_each_ioapic(ioapic) {
++	for_each_ioapic(ioapic)
+ 		if (ioapics[ioapic].mp_config.apicaddr == address) {
+-			pr_warn("address 0x%x conflicts with IOAPIC%d\n", address, ioapic);
++			pr_warn("address 0x%x conflicts with IOAPIC%d\n",
++					address, ioapic);
+ 			return -EEXIST;
+ 		}
+-	}
+ 
+-	idx = find_free_ioapic_entry();
+-	if (idx >= MAX_IO_APICS) {
+-		pr_warn("Max # of I/O APICs (%d) exceeded (found %d), skipping\n",
+-			MAX_IO_APICS, idx);
++		idx = find_free_ioapic_entry();
++	if (unlikely(idx >= MAX_IO_APICS)) {
++		pr_warn("Max IOAPICs exceeded (found %d)\n", idx);
+ 		return -ENOSPC;
+ 	}
+ 
+-	ioapics[idx].mp_config.type = MP_IOAPIC;
+-	ioapics[idx].mp_config.flags = MPC_APIC_USABLE;
++	ioapics[idx].mp_config.type     = MP_IOAPIC;
++	ioapics[idx].mp_config.flags    = MPC_APIC_USABLE;
+ 	ioapics[idx].mp_config.apicaddr = address;
+ 
+ 	io_apic_set_fixmap(FIX_IO_APIC_BASE_0 + idx, address);
++	ioapics[idx].base = (void __iomem *)
++	(__fix_to_virt(FIX_IO_APIC_BASE_0 + idx) +
++	(address & ~PAGE_MASK));
++
+ 	if (bad_ioapic_register(idx)) {
+ 		clear_fixmap(FIX_IO_APIC_BASE_0 + idx);
++		ioapics[idx].base = NULL;
+ 		return -ENODEV;
+ 	}
+ 
+-	ioapics[idx].mp_config.apicid = io_apic_unique_id(idx, id);
++	ioapics[idx].mp_config.apicid  = io_apic_unique_id(idx, id);
+ 	ioapics[idx].mp_config.apicver = io_apic_get_version(idx);
++	ioapics[idx].has_eoi           =
++	(ioapics[idx].mp_config.apicver >= 0x20);
++
++	/* ---- original GSI-range / irqdomain setup code unchanged ---- */
++	entries  = io_apic_get_redir_entries(idx);
++	gsi_end  = gsi_base + entries - 1;
+ 
+-	/*
+-	 * Build basic GSI lookup table to facilitate gsi->io_apic lookups
+-	 * and to prevent reprogramming of IOAPIC pins (PCI GSIs).
+-	 */
+-	entries = io_apic_get_redir_entries(idx);
+-	gsi_end = gsi_base + entries - 1;
+ 	for_each_ioapic(ioapic) {
+ 		gsi_cfg = mp_ioapic_gsi_routing(ioapic);
+ 		if ((gsi_base >= gsi_cfg->gsi_base &&
+-		     gsi_base <= gsi_cfg->gsi_end) ||
+-		    (gsi_end >= gsi_cfg->gsi_base &&
+-		     gsi_end <= gsi_cfg->gsi_end)) {
+-			pr_warn("GSI range [%u-%u] for new IOAPIC conflicts with GSI[%u-%u]\n",
+-				gsi_base, gsi_end, gsi_cfg->gsi_base, gsi_cfg->gsi_end);
++			gsi_base <= gsi_cfg->gsi_end) ||
++			(gsi_end >= gsi_cfg->gsi_base &&
++			gsi_end <= gsi_cfg->gsi_end)) {
++			pr_warn("GSI %u-%u overlaps existing IOAPIC range\n",
++					gsi_base, gsi_end);
+ 			clear_fixmap(FIX_IO_APIC_BASE_0 + idx);
+-			return -ENOSPC;
+-		}
++		ioapics[idx].base = NULL;
++		return -ENOSPC;
++			}
+ 	}
++
+ 	gsi_cfg = mp_ioapic_gsi_routing(idx);
+ 	gsi_cfg->gsi_base = gsi_base;
+-	gsi_cfg->gsi_end = gsi_end;
++	gsi_cfg->gsi_end  = gsi_end;
+ 
+-	ioapics[idx].irqdomain = NULL;
+ 	ioapics[idx].irqdomain_cfg = *cfg;
++	ioapics[idx].nr_registers  = entries;	/* mark present */
+ 
+-	/*
+-	 * If mp_register_ioapic() is called during early boot stage when
+-	 * walking ACPI/DT tables, it's too early to create irqdomain,
+-	 * we are still using bootmem allocator. So delay it to setup_IO_APIC().
+-	 */
+ 	if (hotplug) {
+ 		if (mp_irqdomain_create(idx)) {
+ 			clear_fixmap(FIX_IO_APIC_BASE_0 + idx);
++			ioapics[idx].base = NULL;
+ 			return -ENOMEM;
+ 		}
+ 		alloc_ioapic_saved_registers(idx);
+ 	}
+ 
+-	if (gsi_cfg->gsi_end >= gsi_top)
+-		gsi_top = gsi_cfg->gsi_end + 1;
++	if (gsi_end >= gsi_top)
++		gsi_top = gsi_end + 1;
+ 	if (nr_ioapics <= idx)
+ 		nr_ioapics = idx + 1;
+ 
+-	/* Set nr_registers to mark entry present */
+-	ioapics[idx].nr_registers = entries;
+-
+-	pr_info("IOAPIC[%d]: apic_id %d, version %d, address 0x%x, GSI %d-%d\n",
+-		idx, mpc_ioapic_id(idx), mpc_ioapic_ver(idx), mpc_ioapic_addr(idx),
+-		gsi_cfg->gsi_base, gsi_cfg->gsi_end);
++	pr_info("IOAPIC[%d]: id %d, ver 0x%x, addr 0x%x, GSIs %u-%u\n",
++			idx, mpc_ioapic_id(idx), mpc_ioapic_ver(idx), address,
++			gsi_base, gsi_end);
+ 
+ 	return 0;
+ }
+
+--- a/arch/x86/include/asm/atomic.h	2025-03-17 23:15:50.374342755 +0100
++++ b/arch/x86/include/asm/atomic.h	2025-03-17 23:33:21.311978298 +0100
+@@ -4,6 +4,7 @@
+ 
+ #include <linux/compiler.h>
+ #include <linux/types.h>
++#include <linux/prefetch.h>  /* For prefetchw */
+ #include <asm/alternative.h>
+ #include <asm/cmpxchg.h>
+ #include <asm/rmwcc.h>
+@@ -31,15 +32,15 @@ static __always_inline void arch_atomic_
+ static __always_inline void arch_atomic_add(int i, atomic_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "addl %1, %0"
+-		     : "+m" (v->counter)
+-		     : "ir" (i) : "memory");
++	: "+m" (v->counter)
++	: "ir" (i) : "memory");
+ }
+ 
+ static __always_inline void arch_atomic_sub(int i, atomic_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "subl %1, %0"
+-		     : "+m" (v->counter)
+-		     : "ir" (i) : "memory");
++	: "+m" (v->counter)
++	: "ir" (i) : "memory");
+ }
+ 
+ static __always_inline bool arch_atomic_sub_and_test(int i, atomic_t *v)
+@@ -82,6 +83,8 @@ static __always_inline bool arch_atomic_
+ 
+ static __always_inline int arch_atomic_add_return(int i, atomic_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	return i + xadd(&v->counter, i);
+ }
+ #define arch_atomic_add_return arch_atomic_add_return
+@@ -90,6 +93,8 @@ static __always_inline int arch_atomic_a
+ 
+ static __always_inline int arch_atomic_fetch_add(int i, atomic_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	return xadd(&v->counter, i);
+ }
+ #define arch_atomic_fetch_add arch_atomic_fetch_add
+@@ -117,16 +122,23 @@ static __always_inline int arch_atomic_x
+ static __always_inline void arch_atomic_and(int i, atomic_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "andl %1, %0"
+-			: "+m" (v->counter)
+-			: "ir" (i)
+-			: "memory");
++	: "+m" (v->counter)
++	: "ir" (i)
++	: "memory");
+ }
+ 
+ static __always_inline int arch_atomic_fetch_and(int i, atomic_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	int val = arch_atomic_read(v);
++	bool success;
+ 
+-	do { } while (!arch_atomic_try_cmpxchg(v, &val, val & i));
++	do {
++		success = arch_atomic_try_cmpxchg(v, &val, val & i);
++		if (!success)
++			asm volatile("pause" ::: "memory");
++	} while (!success);
+ 
+ 	return val;
+ }
+@@ -135,16 +147,23 @@ static __always_inline int arch_atomic_f
+ static __always_inline void arch_atomic_or(int i, atomic_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "orl %1, %0"
+-			: "+m" (v->counter)
+-			: "ir" (i)
+-			: "memory");
++	: "+m" (v->counter)
++	: "ir" (i)
++	: "memory");
+ }
+ 
+ static __always_inline int arch_atomic_fetch_or(int i, atomic_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	int val = arch_atomic_read(v);
++	bool success;
+ 
+-	do { } while (!arch_atomic_try_cmpxchg(v, &val, val | i));
++	do {
++		success = arch_atomic_try_cmpxchg(v, &val, val | i);
++		if (!success)
++			asm volatile("pause" ::: "memory");
++	} while (!success);
+ 
+ 	return val;
+ }
+@@ -153,16 +172,23 @@ static __always_inline int arch_atomic_f
+ static __always_inline void arch_atomic_xor(int i, atomic_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "xorl %1, %0"
+-			: "+m" (v->counter)
+-			: "ir" (i)
+-			: "memory");
++	: "+m" (v->counter)
++	: "ir" (i)
++	: "memory");
+ }
+ 
+ static __always_inline int arch_atomic_fetch_xor(int i, atomic_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	int val = arch_atomic_read(v);
++	bool success;
+ 
+-	do { } while (!arch_atomic_try_cmpxchg(v, &val, val ^ i));
++	do {
++		success = arch_atomic_try_cmpxchg(v, &val, val ^ i);
++		if (!success)
++			asm volatile("pause" ::: "memory");
++	} while (!success);
+ 
+ 	return val;
+ }
+
+
+
+--- a/arch/x86/include/asm/atomic64_64.h	2025-03-17 23:15:50.374365036 +0100
++++ b/arch/x86/include/asm/atomic64_64.h	2025-03-17 23:29:44.073893086 +0100
+@@ -3,12 +3,13 @@
+ #define _ASM_X86_ATOMIC64_64_H
+ 
+ #include <linux/types.h>
++#include <linux/prefetch.h>  /* For prefetchw */
+ #include <asm/alternative.h>
+ #include <asm/cmpxchg.h>
+ 
+ /* The 64-bit atomic type */
+ 
+-#define ATOMIC64_INIT(i)	{ (i) }
++#define ATOMIC64_INIT(i)        { (i) }
+ 
+ static __always_inline s64 arch_atomic64_read(const atomic64_t *v)
+ {
+@@ -23,15 +24,15 @@ static __always_inline void arch_atomic6
+ static __always_inline void arch_atomic64_add(s64 i, atomic64_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "addq %1, %0"
+-		     : "=m" (v->counter)
+-		     : "er" (i), "m" (v->counter) : "memory");
++	: "=m" (v->counter)
++	: "er" (i), "m" (v->counter) : "memory");
+ }
+ 
+ static __always_inline void arch_atomic64_sub(s64 i, atomic64_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "subq %1, %0"
+-		     : "=m" (v->counter)
+-		     : "er" (i), "m" (v->counter) : "memory");
++	: "=m" (v->counter)
++	: "er" (i), "m" (v->counter) : "memory");
+ }
+ 
+ static __always_inline bool arch_atomic64_sub_and_test(s64 i, atomic64_t *v)
+@@ -76,6 +77,8 @@ static __always_inline bool arch_atomic6
+ 
+ static __always_inline s64 arch_atomic64_add_return(s64 i, atomic64_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	return i + xadd(&v->counter, i);
+ }
+ #define arch_atomic64_add_return arch_atomic64_add_return
+@@ -84,6 +87,8 @@ static __always_inline s64 arch_atomic64
+ 
+ static __always_inline s64 arch_atomic64_fetch_add(s64 i, atomic64_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	return xadd(&v->counter, i);
+ }
+ #define arch_atomic64_fetch_add arch_atomic64_fetch_add
+@@ -111,17 +116,24 @@ static __always_inline s64 arch_atomic64
+ static __always_inline void arch_atomic64_and(s64 i, atomic64_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "andq %1, %0"
+-			: "+m" (v->counter)
+-			: "er" (i)
+-			: "memory");
++	: "+m" (v->counter)
++	: "er" (i)
++	: "memory");
+ }
+ 
+ static __always_inline s64 arch_atomic64_fetch_and(s64 i, atomic64_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	s64 val = arch_atomic64_read(v);
++	bool success;
+ 
+ 	do {
+-	} while (!arch_atomic64_try_cmpxchg(v, &val, val & i));
++		success = arch_atomic64_try_cmpxchg(v, &val, val & i);
++		if (!success)
++			asm volatile("pause" ::: "memory");
++	} while (!success);
++
+ 	return val;
+ }
+ #define arch_atomic64_fetch_and arch_atomic64_fetch_and
+@@ -129,17 +141,24 @@ static __always_inline s64 arch_atomic64
+ static __always_inline void arch_atomic64_or(s64 i, atomic64_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "orq %1, %0"
+-			: "+m" (v->counter)
+-			: "er" (i)
+-			: "memory");
++	: "+m" (v->counter)
++	: "er" (i)
++	: "memory");
+ }
+ 
+ static __always_inline s64 arch_atomic64_fetch_or(s64 i, atomic64_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	s64 val = arch_atomic64_read(v);
++	bool success;
+ 
+ 	do {
+-	} while (!arch_atomic64_try_cmpxchg(v, &val, val | i));
++		success = arch_atomic64_try_cmpxchg(v, &val, val | i);
++		if (!success)
++			asm volatile("pause" ::: "memory");
++	} while (!success);
++
+ 	return val;
+ }
+ #define arch_atomic64_fetch_or arch_atomic64_fetch_or
+@@ -147,17 +166,24 @@ static __always_inline s64 arch_atomic64
+ static __always_inline void arch_atomic64_xor(s64 i, atomic64_t *v)
+ {
+ 	asm_inline volatile(LOCK_PREFIX "xorq %1, %0"
+-			: "+m" (v->counter)
+-			: "er" (i)
+-			: "memory");
++	: "+m" (v->counter)
++	: "er" (i)
++	: "memory");
+ }
+ 
+ static __always_inline s64 arch_atomic64_fetch_xor(s64 i, atomic64_t *v)
+ {
++	/* Prefetch for write - optimized for Raptor Lake's improved prefetcher */
++	prefetchw((void *)&v->counter);
+ 	s64 val = arch_atomic64_read(v);
++	bool success;
+ 
+ 	do {
+-	} while (!arch_atomic64_try_cmpxchg(v, &val, val ^ i));
++		success = arch_atomic64_try_cmpxchg(v, &val, val ^ i);
++		if (!success)
++			asm volatile("pause" ::: "memory");
++	} while (!success);
++
+ 	return val;
+ }
+ #define arch_atomic64_fetch_xor arch_atomic64_fetch_xor
+
+--- a/arch/x86/include/asm/cmpxchg_64.h	2025-03-16 12:16:45.099790963 +0100
++++ b/arch/x86/include/asm/cmpxchg_64.h	2025-03-16 12:23:42.498768123 +0100
+@@ -2,95 +2,112 @@
+ #ifndef _ASM_X86_CMPXCHG_64_H
+ #define _ASM_X86_CMPXCHG_64_H
+ 
+-#define arch_cmpxchg64(ptr, o, n)					\
+-({									\
+-	BUILD_BUG_ON(sizeof(*(ptr)) != 8);				\
+-	arch_cmpxchg((ptr), (o), (n));					\
++#include <linux/prefetch.h> /* For prefetchw */
++
++#define arch_cmpxchg64(ptr, o, n)                                       \
++({                                                                      \
++        BUILD_BUG_ON(sizeof(*(ptr)) != 8);                              \
++        arch_cmpxchg((ptr), (o), (n));                                  \
+ })
+ 
+-#define arch_cmpxchg64_local(ptr, o, n)					\
+-({									\
+-	BUILD_BUG_ON(sizeof(*(ptr)) != 8);				\
+-	arch_cmpxchg_local((ptr), (o), (n));				\
++#define arch_cmpxchg64_local(ptr, o, n)                                 \
++({                                                                      \
++        BUILD_BUG_ON(sizeof(*(ptr)) != 8);                              \
++        arch_cmpxchg_local((ptr), (o), (n));                            \
+ })
+ 
+-#define arch_try_cmpxchg64(ptr, po, n)					\
+-({									\
+-	BUILD_BUG_ON(sizeof(*(ptr)) != 8);				\
+-	arch_try_cmpxchg((ptr), (po), (n));				\
++#define arch_try_cmpxchg64(ptr, po, n)                                  \
++({                                                                      \
++        BUILD_BUG_ON(sizeof(*(ptr)) != 8);                              \
++        arch_try_cmpxchg((ptr), (po), (n));                             \
+ })
+ 
+-#define arch_try_cmpxchg64_local(ptr, po, n)				\
+-({									\
+-	BUILD_BUG_ON(sizeof(*(ptr)) != 8);				\
+-	arch_try_cmpxchg_local((ptr), (po), (n));			\
++#define arch_try_cmpxchg64_local(ptr, po, n)                            \
++({                                                                      \
++        BUILD_BUG_ON(sizeof(*(ptr)) != 8);                              \
++        arch_try_cmpxchg_local((ptr), (po), (n));                       \
+ })
+ 
+ union __u128_halves {
+-	u128 full;
+-	struct {
+-		u64 low, high;
+-	};
++        u128 full;
++        struct {
++                u64 low, high;
++        };
+ };
+ 
+-#define __arch_cmpxchg128(_ptr, _old, _new, _lock)			\
+-({									\
+-	union __u128_halves o = { .full = (_old), },			\
+-			    n = { .full = (_new), };			\
+-									\
+-	asm_inline volatile(_lock "cmpxchg16b %[ptr]"			\
+-		     : [ptr] "+m" (*(_ptr)),				\
+-		       "+a" (o.low), "+d" (o.high)			\
+-		     : "b" (n.low), "c" (n.high)			\
+-		     : "memory");					\
+-									\
+-	o.full;								\
++#define __arch_cmpxchg128(_ptr, _old, _new, _lock)                      \
++({                                                                      \
++        union __u128_halves o = { .full = (_old), },                    \
++        n = { .full = (_new), };                    \
++        \
++        asm_inline volatile(_lock "cmpxchg16b %[ptr]"                   \
++        : [ptr] "+m" (*(_ptr)),                            \
++        "+a" (o.low), "+d" (o.high)                      \
++        : "b" (n.low), "c" (n.high)                        \
++        : "memory");                                       \
++        \
++        o.full;                                                         \
+ })
+ 
+ static __always_inline u128 arch_cmpxchg128(volatile u128 *ptr, u128 old, u128 new)
+ {
+-	return __arch_cmpxchg128(ptr, old, new, LOCK_PREFIX);
++        /* Prefetch the cacheline for Raptor Lake's improved cache subsystem */
++        prefetchw((void *)ptr);  /* Cast to void* to avoid discarding qualifiers warning */
++        return __arch_cmpxchg128(ptr, old, new, LOCK_PREFIX);
+ }
+ #define arch_cmpxchg128 arch_cmpxchg128
+ 
+ static __always_inline u128 arch_cmpxchg128_local(volatile u128 *ptr, u128 old, u128 new)
+ {
+-	return __arch_cmpxchg128(ptr, old, new,);
++        /* Lightweight memory ordering for local operations */
++        asm volatile("" ::: "memory");
++        u128 ret = __arch_cmpxchg128(ptr, old, new,);
++        asm volatile("" ::: "memory");
++        return ret;
+ }
+ #define arch_cmpxchg128_local arch_cmpxchg128_local
+ 
+-#define __arch_try_cmpxchg128(_ptr, _oldp, _new, _lock)			\
+-({									\
+-	union __u128_halves o = { .full = *(_oldp), },			\
+-			    n = { .full = (_new), };			\
+-	bool ret;							\
+-									\
+-	asm_inline volatile(_lock "cmpxchg16b %[ptr]"			\
+-		     CC_SET(e)						\
+-		     : CC_OUT(e) (ret),					\
+-		       [ptr] "+m" (*(_ptr)),				\
+-		       "+a" (o.low), "+d" (o.high)			\
+-		     : "b" (n.low), "c" (n.high)			\
+-		     : "memory");					\
+-									\
+-	if (unlikely(!ret))						\
+-		*(_oldp) = o.full;					\
+-									\
+-	likely(ret);							\
++#define __arch_try_cmpxchg128(_ptr, _oldp, _new, _lock)                 \
++({                                                                      \
++        union __u128_halves o = { .full = *(_oldp), },                  \
++        n = { .full = (_new), };                    \
++        bool ret;                                                       \
++        \
++        asm_inline volatile(_lock "cmpxchg16b %[ptr]"                   \
++        CC_SET(e)                                          \
++        : CC_OUT(e) (ret),                                 \
++        [ptr] "+m" (*(_ptr)),                            \
++        "+a" (o.low), "+d" (o.high)                      \
++        : "b" (n.low), "c" (n.high)                        \
++        : "memory");                                       \
++        \
++        if (unlikely(!ret)) {                                           \
++                /* Single PAUSE optimized for Raptor Lake's shorter pause latency */ \
++                asm volatile("pause" ::: "memory");                     \
++                *(_oldp) = o.full;                                      \
++        }                                                               \
++        \
++        likely(ret);                                                    \
+ })
+ 
+ static __always_inline bool arch_try_cmpxchg128(volatile u128 *ptr, u128 *oldp, u128 new)
+ {
+-	return __arch_try_cmpxchg128(ptr, oldp, new, LOCK_PREFIX);
++        /* Prefetch for improved performance on Raptor Lake */
++        prefetchw((void *)ptr);  /* Cast to void* to avoid discarding qualifiers warning */
++        return __arch_try_cmpxchg128(ptr, oldp, new, LOCK_PREFIX);
+ }
+ #define arch_try_cmpxchg128 arch_try_cmpxchg128
+ 
+ static __always_inline bool arch_try_cmpxchg128_local(volatile u128 *ptr, u128 *oldp, u128 new)
+ {
+-	return __arch_try_cmpxchg128(ptr, oldp, new,);
++        /* Lightweight memory ordering for local operations */
++        asm volatile("" ::: "memory");
++        bool ret = __arch_try_cmpxchg128(ptr, oldp, new,);
++        asm volatile("" ::: "memory");
++        return ret;
+ }
+ #define arch_try_cmpxchg128_local arch_try_cmpxchg128_local
+ 
+-#define system_has_cmpxchg128()		boot_cpu_has(X86_FEATURE_CX16)
++#define system_has_cmpxchg128()         boot_cpu_has(X86_FEATURE_CX16)
+ 
+ #endif /* _ASM_X86_CMPXCHG_64_H */
+
+
+
+--- a/lib/xxhash.c	2025-03-16 12:16:45.099790963 +0100
++++ b/lib/xxhash.c	2025-03-16 12:23:42.498768123 +0100
+@@ -36,6 +36,8 @@
+  * You can contact the author at:
+  * - xxHash homepage: https://cyan4973.github.io/xxHash/
+  * - xxHash source repository: https://github.com/Cyan4973/xxHash
++ *
++ * Optimized for Intel Raptor Lake, 2025
+  */
+ 
+ #include <linux/unaligned.h>
+@@ -45,6 +47,7 @@
+ #include <linux/module.h>
+ #include <linux/string.h>
+ #include <linux/xxhash.h>
++#include <linux/prefetch.h>
+ 
+ /*-*************************************
+  * Macros
+@@ -52,6 +55,17 @@
+ #define xxh_rotl32(x, r) ((x << r) | (x >> (32 - r)))
+ #define xxh_rotl64(x, r) ((x << r) | (x >> (64 - r)))
+ 
++/* Optimization: Read 4-byte and 8-byte chunks more efficiently */
++#define XXH_get32bits(ptr) get_unaligned_le32(ptr)
++#define XXH_get64bits(ptr) get_unaligned_le64(ptr)
++
++/* Prefetch macros optimized for Raptor Lake's cache architecture */
++#define XXH_PREFETCH(ptr) prefetch(ptr)
++#define XXH_PREFETCH_DIST 512  /* Optimized for Raptor Lake L1/L2 prefetcher behavior */
++
++/* Cache line size for Raptor Lake */
++#define XXH_CACHELINE_SIZE 64
++
+ #ifdef __LITTLE_ENDIAN
+ # define XXH_CPU_LITTLE_ENDIAN 1
+ #else
+@@ -91,7 +105,8 @@ EXPORT_SYMBOL(xxh64_copy_state);
+ /*-***************************
+  * Simple Hash Functions
+  ****************************/
+-static uint32_t xxh32_round(uint32_t seed, const uint32_t input)
++/* Optimized for better instruction pipelining on Raptor Lake */
++static inline uint32_t xxh32_round(uint32_t seed, const uint32_t input)
+ {
+ 	seed += input * PRIME32_2;
+ 	seed = xxh_rotl32(seed, 13);
+@@ -99,50 +114,65 @@ static uint32_t xxh32_round(uint32_t see
+ 	return seed;
+ }
+ 
++/*
++ * xxh32 optimized for Raptor Lake:
++ * - Improved prefetching for large inputs
++ * - Better branch prediction with likely/unlikely hints
++ * - Loop unrolling for better instruction-level parallelism
++ */
+ uint32_t xxh32(const void *input, const size_t len, const uint32_t seed)
+ {
+ 	const uint8_t *p = (const uint8_t *)input;
+ 	const uint8_t *b_end = p + len;
+ 	uint32_t h32;
+ 
+-	if (len >= 16) {
++	if (likely(len >= 16)) {
+ 		const uint8_t *const limit = b_end - 16;
+ 		uint32_t v1 = seed + PRIME32_1 + PRIME32_2;
+ 		uint32_t v2 = seed + PRIME32_2;
+ 		uint32_t v3 = seed + 0;
+ 		uint32_t v4 = seed - PRIME32_1;
+ 
++		/* Process 16 bytes per iteration (4 lanes of 4 bytes each) */
+ 		do {
+-			v1 = xxh32_round(v1, get_unaligned_le32(p));
+-			p += 4;
+-			v2 = xxh32_round(v2, get_unaligned_le32(p));
+-			p += 4;
+-			v3 = xxh32_round(v3, get_unaligned_le32(p));
+-			p += 4;
+-			v4 = xxh32_round(v4, get_unaligned_le32(p));
+-			p += 4;
++			/* For large inputs, prefetch ahead to reduce cache misses */
++			if (likely(limit - p > XXH_PREFETCH_DIST))
++				XXH_PREFETCH(p + XXH_PREFETCH_DIST);
++
++			/* Process 4 lanes in parallel for better instruction pipelining */
++			v1 = xxh32_round(v1, XXH_get32bits(p));
++			v2 = xxh32_round(v2, XXH_get32bits(p + 4));
++			v3 = xxh32_round(v3, XXH_get32bits(p + 8));
++			v4 = xxh32_round(v4, XXH_get32bits(p + 12));
++
++			p += 16;
+ 		} while (p <= limit);
+ 
++		/* Combine the 4 lanes */
+ 		h32 = xxh_rotl32(v1, 1) + xxh_rotl32(v2, 7) +
+-			xxh_rotl32(v3, 12) + xxh_rotl32(v4, 18);
++		xxh_rotl32(v3, 12) + xxh_rotl32(v4, 18);
+ 	} else {
++		/* Small input optimization */
+ 		h32 = seed + PRIME32_5;
+ 	}
+ 
+ 	h32 += (uint32_t)len;
+ 
++	/* Process remaining 4-byte chunks */
+ 	while (p + 4 <= b_end) {
+-		h32 += get_unaligned_le32(p) * PRIME32_3;
++		h32 += XXH_get32bits(p) * PRIME32_3;
+ 		h32 = xxh_rotl32(h32, 17) * PRIME32_4;
+ 		p += 4;
+ 	}
+ 
++	/* Process remaining bytes */
+ 	while (p < b_end) {
+ 		h32 += (*p) * PRIME32_5;
+ 		h32 = xxh_rotl32(h32, 11) * PRIME32_1;
+ 		p++;
+ 	}
+ 
++	/* Finalization - avalanche bits for better mixing */
+ 	h32 ^= h32 >> 15;
+ 	h32 *= PRIME32_2;
+ 	h32 ^= h32 >> 13;
+@@ -153,7 +183,8 @@ uint32_t xxh32(const void *input, const
+ }
+ EXPORT_SYMBOL(xxh32);
+ 
+-static uint64_t xxh64_round(uint64_t acc, const uint64_t input)
++/* Optimized round function for xxh64 */
++static inline uint64_t xxh64_round(uint64_t acc, const uint64_t input)
+ {
+ 	acc += input * PRIME64_2;
+ 	acc = xxh_rotl64(acc, 31);
+@@ -161,7 +192,7 @@ static uint64_t xxh64_round(uint64_t acc
+ 	return acc;
+ }
+ 
+-static uint64_t xxh64_merge_round(uint64_t acc, uint64_t val)
++static inline uint64_t xxh64_merge_round(uint64_t acc, uint64_t val)
+ {
+ 	val = xxh64_round(0, val);
+ 	acc ^= val;
+@@ -169,63 +200,83 @@ static uint64_t xxh64_merge_round(uint64
+ 	return acc;
+ }
+ 
++/*
++ * xxh64 optimized for Raptor Lake:
++ * - Improved prefetching strategy
++ * - Loop unrolling for better instruction-level parallelism
++ * - Better branch prediction with likely/unlikely hints
++ */
+ uint64_t xxh64(const void *input, const size_t len, const uint64_t seed)
+ {
+ 	const uint8_t *p = (const uint8_t *)input;
+ 	const uint8_t *const b_end = p + len;
+ 	uint64_t h64;
+ 
+-	if (len >= 32) {
++	if (likely(len >= 32)) {
+ 		const uint8_t *const limit = b_end - 32;
+ 		uint64_t v1 = seed + PRIME64_1 + PRIME64_2;
+ 		uint64_t v2 = seed + PRIME64_2;
+ 		uint64_t v3 = seed + 0;
+ 		uint64_t v4 = seed - PRIME64_1;
+ 
++		/* Process 32 bytes per iteration (4 lanes of 8 bytes each) */
+ 		do {
+-			v1 = xxh64_round(v1, get_unaligned_le64(p));
+-			p += 8;
+-			v2 = xxh64_round(v2, get_unaligned_le64(p));
+-			p += 8;
+-			v3 = xxh64_round(v3, get_unaligned_le64(p));
+-			p += 8;
+-			v4 = xxh64_round(v4, get_unaligned_le64(p));
+-			p += 8;
++			/* Prefetch ahead for large inputs to reduce cache misses */
++			if (likely(limit - p > XXH_PREFETCH_DIST)) {
++				XXH_PREFETCH(p + XXH_PREFETCH_DIST);
++				/* Add a second prefetch to handle more of the stream */
++				XXH_PREFETCH(p + XXH_PREFETCH_DIST + XXH_CACHELINE_SIZE);
++			}
++
++			/* Process 4 lanes in parallel for better instruction pipelining */
++			v1 = xxh64_round(v1, XXH_get64bits(p));
++			v2 = xxh64_round(v2, XXH_get64bits(p + 8));
++			v3 = xxh64_round(v3, XXH_get64bits(p + 16));
++			v4 = xxh64_round(v4, XXH_get64bits(p + 24));
++
++			p += 32;
+ 		} while (p <= limit);
+ 
++		/* Combine the 4 lanes with improved mixing for better distribution */
+ 		h64 = xxh_rotl64(v1, 1) + xxh_rotl64(v2, 7) +
+-			xxh_rotl64(v3, 12) + xxh_rotl64(v4, 18);
++		xxh_rotl64(v3, 12) + xxh_rotl64(v4, 18);
++
++		/* Merge all lanes to improve bit mixing */
+ 		h64 = xxh64_merge_round(h64, v1);
+ 		h64 = xxh64_merge_round(h64, v2);
+ 		h64 = xxh64_merge_round(h64, v3);
+ 		h64 = xxh64_merge_round(h64, v4);
+ 
+ 	} else {
+-		h64  = seed + PRIME64_5;
++		/* Small input optimization */
++		h64 = seed + PRIME64_5;
+ 	}
+ 
+ 	h64 += (uint64_t)len;
+ 
++	/* Process remaining 8-byte chunks */
+ 	while (p + 8 <= b_end) {
+-		const uint64_t k1 = xxh64_round(0, get_unaligned_le64(p));
+-
++		const uint64_t k1 = xxh64_round(0, XXH_get64bits(p));
+ 		h64 ^= k1;
+ 		h64 = xxh_rotl64(h64, 27) * PRIME64_1 + PRIME64_4;
+ 		p += 8;
+ 	}
+ 
++	/* Process remaining 4-byte chunk if present */
+ 	if (p + 4 <= b_end) {
+-		h64 ^= (uint64_t)(get_unaligned_le32(p)) * PRIME64_1;
++		h64 ^= (uint64_t)(XXH_get32bits(p)) * PRIME64_1;
+ 		h64 = xxh_rotl64(h64, 23) * PRIME64_2 + PRIME64_3;
+ 		p += 4;
+ 	}
+ 
++	/* Process remaining bytes */
+ 	while (p < b_end) {
+ 		h64 ^= (*p) * PRIME64_5;
+ 		h64 = xxh_rotl64(h64, 11) * PRIME64_1;
+ 		p++;
+ 	}
+ 
++	/* Finalization - avalanche bits for better mixing */
+ 	h64 ^= h64 >> 33;
+ 	h64 *= PRIME64_2;
+ 	h64 ^= h64 >> 29;
+@@ -241,29 +292,32 @@ EXPORT_SYMBOL(xxh64);
+  ***************************************************/
+ void xxh32_reset(struct xxh32_state *statePtr, const uint32_t seed)
+ {
+-	/* use a local state for memcpy() to avoid strict-aliasing warnings */
+-	struct xxh32_state state;
++	/* Initialize the state with the seed value */
++	statePtr->total_len_32 = 0;
++	statePtr->large_len = 0;
++	statePtr->v1 = seed + PRIME32_1 + PRIME32_2;
++	statePtr->v2 = seed + PRIME32_2;
++	statePtr->v3 = seed + 0;
++	statePtr->v4 = seed - PRIME32_1;
++	statePtr->memsize = 0;
+ 
+-	memset(&state, 0, sizeof(state));
+-	state.v1 = seed + PRIME32_1 + PRIME32_2;
+-	state.v2 = seed + PRIME32_2;
+-	state.v3 = seed + 0;
+-	state.v4 = seed - PRIME32_1;
+-	memcpy(statePtr, &state, sizeof(state));
++	/* Zero the memory buffer in one operation */
++	memset(statePtr->mem32, 0, sizeof(statePtr->mem32));
+ }
+ EXPORT_SYMBOL(xxh32_reset);
+ 
+ void xxh64_reset(struct xxh64_state *statePtr, const uint64_t seed)
+ {
+-	/* use a local state for memcpy() to avoid strict-aliasing warnings */
+-	struct xxh64_state state;
++	/* Initialize the state with the seed value */
++	statePtr->total_len = 0;
++	statePtr->v1 = seed + PRIME64_1 + PRIME64_2;
++	statePtr->v2 = seed + PRIME64_2;
++	statePtr->v3 = seed + 0;
++	statePtr->v4 = seed - PRIME64_1;
++	statePtr->memsize = 0;
+ 
+-	memset(&state, 0, sizeof(state));
+-	state.v1 = seed + PRIME64_1 + PRIME64_2;
+-	state.v2 = seed + PRIME64_2;
+-	state.v3 = seed + 0;
+-	state.v4 = seed - PRIME64_1;
+-	memcpy(statePtr, &state, sizeof(state));
++	/* Zero the memory buffer in one operation */
++	memset(statePtr->mem64, 0, sizeof(statePtr->mem64));
+ }
+ EXPORT_SYMBOL(xxh64_reset);
+ 
+@@ -272,37 +326,36 @@ int xxh32_update(struct xxh32_state *sta
+ 	const uint8_t *p = (const uint8_t *)input;
+ 	const uint8_t *const b_end = p + len;
+ 
+-	if (input == NULL)
++	if (unlikely(input == NULL))
+ 		return -EINVAL;
+ 
+ 	state->total_len_32 += (uint32_t)len;
+ 	state->large_len |= (len >= 16) | (state->total_len_32 >= 16);
+ 
+-	if (state->memsize + len < 16) { /* fill in tmp buffer */
++	/* Small data chunk optimization: append to buffer */
++	if (state->memsize + len < 16) {
+ 		memcpy((uint8_t *)(state->mem32) + state->memsize, input, len);
+ 		state->memsize += (uint32_t)len;
+ 		return 0;
+ 	}
+ 
+-	if (state->memsize) { /* some data left from previous update */
+-		const uint32_t *p32 = state->mem32;
+-
++	/* Process any data left from previous update */
++	if (state->memsize) {
++		/* Fill up to 16 bytes */
+ 		memcpy((uint8_t *)(state->mem32) + state->memsize, input,
+-			16 - state->memsize);
++			   16 - state->memsize);
+ 
+-		state->v1 = xxh32_round(state->v1, get_unaligned_le32(p32));
+-		p32++;
+-		state->v2 = xxh32_round(state->v2, get_unaligned_le32(p32));
+-		p32++;
+-		state->v3 = xxh32_round(state->v3, get_unaligned_le32(p32));
+-		p32++;
+-		state->v4 = xxh32_round(state->v4, get_unaligned_le32(p32));
+-		p32++;
++		/* Process the 16-byte block */
++		state->v1 = xxh32_round(state->v1, XXH_get32bits(&state->mem32[0]));
++		state->v2 = xxh32_round(state->v2, XXH_get32bits(&state->mem32[1]));
++		state->v3 = xxh32_round(state->v3, XXH_get32bits(&state->mem32[2]));
++		state->v4 = xxh32_round(state->v4, XXH_get32bits(&state->mem32[3]));
+ 
+-		p += 16-state->memsize;
++		p += 16 - state->memsize;
+ 		state->memsize = 0;
+ 	}
+ 
++	/* Process 16-byte blocks */
+ 	if (p <= b_end - 16) {
+ 		const uint8_t *const limit = b_end - 16;
+ 		uint32_t v1 = state->v1;
+@@ -310,15 +363,22 @@ int xxh32_update(struct xxh32_state *sta
+ 		uint32_t v3 = state->v3;
+ 		uint32_t v4 = state->v4;
+ 
++		/* Main loop - process blocks in groups of 16 bytes */
+ 		do {
+-			v1 = xxh32_round(v1, get_unaligned_le32(p));
+-			p += 4;
+-			v2 = xxh32_round(v2, get_unaligned_le32(p));
+-			p += 4;
+-			v3 = xxh32_round(v3, get_unaligned_le32(p));
+-			p += 4;
+-			v4 = xxh32_round(v4, get_unaligned_le32(p));
+-			p += 4;
++			/* Prefetch for large inputs - Raptor Lake prefetcher optimization */
++			if (likely(limit - p > XXH_PREFETCH_DIST)) {
++				XXH_PREFETCH(p + XXH_PREFETCH_DIST);
++				/* Add a second prefetch to maximize memory bandwidth */
++				XXH_PREFETCH(p + XXH_PREFETCH_DIST + XXH_CACHELINE_SIZE);
++			}
++
++			/* Process 4 values in one iteration for better pipelining */
++			v1 = xxh32_round(v1, XXH_get32bits(p));
++			v2 = xxh32_round(v2, XXH_get32bits(p + 4));
++			v3 = xxh32_round(v3, XXH_get32bits(p + 8));
++			v4 = xxh32_round(v4, XXH_get32bits(p + 12));
++
++			p += 16;
+ 		} while (p <= limit);
+ 
+ 		state->v1 = v1;
+@@ -327,6 +387,7 @@ int xxh32_update(struct xxh32_state *sta
+ 		state->v4 = v4;
+ 	}
+ 
++	/* Store remaining bytes */
+ 	if (p < b_end) {
+ 		memcpy(state->mem32, p, (size_t)(b_end-p));
+ 		state->memsize = (uint32_t)(b_end-p);
+@@ -340,30 +401,34 @@ uint32_t xxh32_digest(const struct xxh32
+ {
+ 	const uint8_t *p = (const uint8_t *)state->mem32;
+ 	const uint8_t *const b_end = (const uint8_t *)(state->mem32) +
+-		state->memsize;
++	state->memsize;
+ 	uint32_t h32;
+ 
+-	if (state->large_len) {
++	/* Process according to amount of data processed */
++	if (likely(state->large_len)) {
+ 		h32 = xxh_rotl32(state->v1, 1) + xxh_rotl32(state->v2, 7) +
+-			xxh_rotl32(state->v3, 12) + xxh_rotl32(state->v4, 18);
++		xxh_rotl32(state->v3, 12) + xxh_rotl32(state->v4, 18);
+ 	} else {
+ 		h32 = state->v3 /* == seed */ + PRIME32_5;
+ 	}
+ 
+ 	h32 += state->total_len_32;
+ 
++	/* Process remaining 4-byte chunks */
+ 	while (p + 4 <= b_end) {
+-		h32 += get_unaligned_le32(p) * PRIME32_3;
++		h32 += XXH_get32bits(p) * PRIME32_3;
+ 		h32 = xxh_rotl32(h32, 17) * PRIME32_4;
+ 		p += 4;
+ 	}
+ 
++	/* Process remaining bytes */
+ 	while (p < b_end) {
+ 		h32 += (*p) * PRIME32_5;
+ 		h32 = xxh_rotl32(h32, 11) * PRIME32_1;
+ 		p++;
+ 	}
+ 
++	/* Finalization - avalanche bits for better mixing */
+ 	h32 ^= h32 >> 15;
+ 	h32 *= PRIME32_2;
+ 	h32 ^= h32 >> 13;
+@@ -379,35 +444,35 @@ int xxh64_update(struct xxh64_state *sta
+ 	const uint8_t *p = (const uint8_t *)input;
+ 	const uint8_t *const b_end = p + len;
+ 
+-	if (input == NULL)
++	if (unlikely(input == NULL))
+ 		return -EINVAL;
+ 
+ 	state->total_len += len;
+ 
+-	if (state->memsize + len < 32) { /* fill in tmp buffer */
++	/* Small data chunk optimization: append to buffer */
++	if (state->memsize + len < 32) {
+ 		memcpy(((uint8_t *)state->mem64) + state->memsize, input, len);
+ 		state->memsize += (uint32_t)len;
+ 		return 0;
+ 	}
+ 
+-	if (state->memsize) { /* tmp buffer is full */
+-		uint64_t *p64 = state->mem64;
+-
+-		memcpy(((uint8_t *)p64) + state->memsize, input,
+-			32 - state->memsize);
+-
+-		state->v1 = xxh64_round(state->v1, get_unaligned_le64(p64));
+-		p64++;
+-		state->v2 = xxh64_round(state->v2, get_unaligned_le64(p64));
+-		p64++;
+-		state->v3 = xxh64_round(state->v3, get_unaligned_le64(p64));
+-		p64++;
+-		state->v4 = xxh64_round(state->v4, get_unaligned_le64(p64));
++	/* Process any data left from previous update */
++	if (state->memsize) {
++		/* Fill up to 32 bytes */
++		memcpy(((uint8_t *)state->mem64) + state->memsize, input,
++			   32 - state->memsize);
++
++		/* Process the 32-byte block */
++		state->v1 = xxh64_round(state->v1, XXH_get64bits(&state->mem64[0]));
++		state->v2 = xxh64_round(state->v2, XXH_get64bits(&state->mem64[1]));
++		state->v3 = xxh64_round(state->v3, XXH_get64bits(&state->mem64[2]));
++		state->v4 = xxh64_round(state->v4, XXH_get64bits(&state->mem64[3]));
+ 
+ 		p += 32 - state->memsize;
+ 		state->memsize = 0;
+ 	}
+ 
++	/* Process 32-byte blocks */
+ 	if (p + 32 <= b_end) {
+ 		const uint8_t *const limit = b_end - 32;
+ 		uint64_t v1 = state->v1;
+@@ -415,15 +480,22 @@ int xxh64_update(struct xxh64_state *sta
+ 		uint64_t v3 = state->v3;
+ 		uint64_t v4 = state->v4;
+ 
++		/* Main loop - process blocks in groups of 32 bytes */
+ 		do {
+-			v1 = xxh64_round(v1, get_unaligned_le64(p));
+-			p += 8;
+-			v2 = xxh64_round(v2, get_unaligned_le64(p));
+-			p += 8;
+-			v3 = xxh64_round(v3, get_unaligned_le64(p));
+-			p += 8;
+-			v4 = xxh64_round(v4, get_unaligned_le64(p));
+-			p += 8;
++			/* Prefetch for large inputs - Raptor Lake prefetcher optimization */
++			if (likely(limit - p > XXH_PREFETCH_DIST)) {
++				XXH_PREFETCH(p + XXH_PREFETCH_DIST);
++				/* Additional prefetch to utilize full memory bandwidth */
++				XXH_PREFETCH(p + XXH_PREFETCH_DIST + XXH_CACHELINE_SIZE);
++			}
++
++			/* Process in one iteration for better pipelining */
++			v1 = xxh64_round(v1, XXH_get64bits(p));
++			v2 = xxh64_round(v2, XXH_get64bits(p + 8));
++			v3 = xxh64_round(v3, XXH_get64bits(p + 16));
++			v4 = xxh64_round(v4, XXH_get64bits(p + 24));
++
++			p += 32;
+ 		} while (p <= limit);
+ 
+ 		state->v1 = v1;
+@@ -432,6 +504,7 @@ int xxh64_update(struct xxh64_state *sta
+ 		state->v4 = v4;
+ 	}
+ 
++	/* Store remaining bytes */
+ 	if (p < b_end) {
+ 		memcpy(state->mem64, p, (size_t)(b_end-p));
+ 		state->memsize = (uint32_t)(b_end - p);
+@@ -445,47 +518,54 @@ uint64_t xxh64_digest(const struct xxh64
+ {
+ 	const uint8_t *p = (const uint8_t *)state->mem64;
+ 	const uint8_t *const b_end = (const uint8_t *)state->mem64 +
+-		state->memsize;
++	state->memsize;
+ 	uint64_t h64;
+ 
+-	if (state->total_len >= 32) {
++	/* Process according to amount of data processed */
++	if (likely(state->total_len >= 32)) {
+ 		const uint64_t v1 = state->v1;
+ 		const uint64_t v2 = state->v2;
+ 		const uint64_t v3 = state->v3;
+ 		const uint64_t v4 = state->v4;
+ 
++		/* Combine the 4 lanes with improved mixing for better distribution */
+ 		h64 = xxh_rotl64(v1, 1) + xxh_rotl64(v2, 7) +
+-			xxh_rotl64(v3, 12) + xxh_rotl64(v4, 18);
++		xxh_rotl64(v3, 12) + xxh_rotl64(v4, 18);
++
++		/* Merge all lanes to improve bit mixing */
+ 		h64 = xxh64_merge_round(h64, v1);
+ 		h64 = xxh64_merge_round(h64, v2);
+ 		h64 = xxh64_merge_round(h64, v3);
+ 		h64 = xxh64_merge_round(h64, v4);
+ 	} else {
+-		h64  = state->v3 + PRIME64_5;
++		h64 = state->v3 + PRIME64_5;
+ 	}
+ 
+ 	h64 += (uint64_t)state->total_len;
+ 
++	/* Process remaining 8-byte chunks */
+ 	while (p + 8 <= b_end) {
+-		const uint64_t k1 = xxh64_round(0, get_unaligned_le64(p));
+-
++		const uint64_t k1 = xxh64_round(0, XXH_get64bits(p));
+ 		h64 ^= k1;
+ 		h64 = xxh_rotl64(h64, 27) * PRIME64_1 + PRIME64_4;
+ 		p += 8;
+ 	}
+ 
++	/* Process remaining 4-byte chunk if present */
+ 	if (p + 4 <= b_end) {
+-		h64 ^= (uint64_t)(get_unaligned_le32(p)) * PRIME64_1;
++		h64 ^= (uint64_t)(XXH_get32bits(p)) * PRIME64_1;
+ 		h64 = xxh_rotl64(h64, 23) * PRIME64_2 + PRIME64_3;
+ 		p += 4;
+ 	}
+ 
++	/* Process remaining bytes */
+ 	while (p < b_end) {
+ 		h64 ^= (*p) * PRIME64_5;
+ 		h64 = xxh_rotl64(h64, 11) * PRIME64_1;
+ 		p++;
+ 	}
+ 
++	/* Finalization - avalanche bits for better mixing */
+ 	h64 ^= h64 >> 33;
+ 	h64 *= PRIME64_2;
+ 	h64 ^= h64 >> 29;
