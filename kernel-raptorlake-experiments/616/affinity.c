@@ -10,6 +10,7 @@
 #include <linux/cpu.h>
 #include <linux/group_cpus.h>
 #include <linux/cpufreq.h>
+#include <linux/sched/topology.h>
 #include <linux/topology.h>
 #include <linux/numa.h>
 #include <linux/overflow.h>
@@ -53,6 +54,57 @@ MODULE_PARM_DESC(pcore_affinity, "Enable P-core IRQ affinity (default: 1)");
 #ifndef X86_CORE_TYPE_INTEL_ATOM
 #define X86_CORE_TYPE_INTEL_ATOM 0
 #endif
+
+/* Gaming-focused controls */
+static bool gaming_mode = true;
+module_param(gaming_mode, bool, 0644);
+MODULE_PARM_DESC(gaming_mode, "Favor low variance: pack small vector sets onto few P-core SMT domains (default: true)");
+
+static unsigned int smallvec_threshold = 16;
+module_param(smallvec_threshold, uint, 0644);
+MODULE_PARM_DESC(smallvec_threshold, "Vectors <= this are 'small' and tightly packed in gaming_mode (default: 16)");
+
+static unsigned int smallvec_pack_domains = 2;
+module_param(smallvec_pack_domains, uint, 0644);
+MODULE_PARM_DESC(smallvec_pack_domains, "Max P-core SMT domains for small vector sets in gaming_mode (default: 2)");
+
+static unsigned int pcore_spread_width = 3;
+module_param(pcore_spread_width, uint, 0644);
+MODULE_PARM_DESC(pcore_spread_width, "Max P-core SMT domains to spread across for larger vector sets (default: 3)");
+
+/* Anchor policy for balanced-mode mitigation:
+ * true  -> bias domains that include CPU0 to keep a domain hot
+ * false -> penalize CPU0 domains (useful when you pin away from CPU0)
+ */
+static bool anchor_prefer_cpu0 = true;
+module_param(anchor_prefer_cpu0, bool, 0644);
+MODULE_PARM_DESC(anchor_prefer_cpu0,
+				 "Bias selection toward domains containing CPU0 to keep a domain 'hot' in balanced mode (default: true)");
+
+/* Optional default-affinity override: 0=no change (default), 1=P-cores, 2=E-cores */
+static unsigned int default_affinity_mode;
+module_param(default_affinity_mode, uint, 0644);
+MODULE_PARM_DESC(default_affinity_mode,
+				 "Default IRQ affinity override: 0=no change (default), 1=P-cores, 2=E-cores");
+
+/* Hybrid integration policy */
+static int irq_hybrid_policy = 1;
+/* 0 = spillover after P budget, 1 = capacity-aware (recommended), 2 = budgeted E share */
+module_param_named(hybrid_policy, irq_hybrid_policy, int, 0644);
+MODULE_PARM_DESC(hybrid_policy,
+				 "Hybrid IRQ E-core policy: 0=spillover-after-P-budget, 1=capacity-aware (default), 2=budgeted-E-share");
+
+/* Vectors per P-core (SMT) domain before we consider E-cores */
+static unsigned int pcore_budget_per_domain = 2;
+module_param(pcore_budget_per_domain, uint, 0644);
+MODULE_PARM_DESC(pcore_budget_per_domain,
+				 "Vectors per P-core (SMT) domain before spilling to E-cores (default: 2)");
+
+/* When using policy 2 (budgeted share), percentage of overflow vectors going to E-cores */
+static unsigned int ecore_share_pct = 25;
+module_param(ecore_share_pct, uint, 0644);
+MODULE_PARM_DESC(ecore_share_pct,
+				 "E-core share percentage of overflow vectors (policy=2); default: 25");
 
 /* P-core mask management with proper locking */
 static DEFINE_MUTEX(pcore_mask_lock);
@@ -307,31 +359,6 @@ static int get_core_type(int cpu)
 }
 
 /**
- * get_cache_shared_mask - Get cache sharing mask for CPU
- * @cpu: CPU number
- *
- * Returns the appropriate cache sharing mask based on core type
- *
- * Return: Pointer to cpumask
- */
-static const struct cpumask *get_cache_shared_mask(int cpu)
-{
-	const struct cpumask *m = NULL;
-	int core_type = get_core_type(cpu);
-
-	#ifdef CONFIG_SCHED_CLUSTER
-	if (core_type == 0) {
-		m = cpu_clustergroup_mask(cpu);
-	}
-	#endif
-	if (!m || cpumask_empty(m)) {
-		m = cpu_llc_shared_mask(cpu);
-	}
-
-	return m;
-}
-
-/**
  * free_l2_domain_masks - Free L2 domain mask resources
  *
  * Helper function to safely clean up L2 domain resources.
@@ -442,190 +469,104 @@ static int get_pcore_mask(struct cpumask *dst)
 }
 
 /**
- * identify_l2_domains - Optimized L2 cache domain detection
- * @p_core_mask: Mask of P-cores to analyze
+ * identify_l2_domains - Build per-core (SMT) domains for P-cores
+ * @p_core_mask: Mask of P-cores to analyze (required, non-empty)
  *
- * Maps L2 cache sharing domains on Raptor Lake with optimized fallback mechanism.
- * Pre-calculates L2 core IDs to avoid expensive operations in inner loops.
+ * Builds unique per-core domains using the SMT sibling mask intersected with
+ * the P-core mask. This prevents collapsing all P-cores into a single LLC
+ * domain and provides stable, cache-friendly grouping.
  *
  * Return: 0 on success, negative error code on failure
+ *
+ * Caller should hold cpus_read_lock for a stable topology view.
  */
 static int identify_l2_domains(struct cpumask *p_core_mask)
 {
-	int i, cpu;
-	int total_cpus;
+    int cpu, j;
+    int max_domains;
+    cpumask_var_t dom;
 
-	if (!p_core_mask || cpumask_empty(p_core_mask)) {
-		pr_warn("Empty P-core mask provided\n");
-		return -EINVAL;
-	}
+    if (!p_core_mask || cpumask_empty(p_core_mask)) {
+        pr_warn("identify_l2_domains: Empty P-core mask provided\n");
+        return -EINVAL;
+    }
 
-	if (!atomic_read_acquire(&l2_ids_initialized)) {
-		init_l2_core_ids();
-	}
+    max_domains = cpumask_weight(p_core_mask);
+    if (max_domains <= 0)
+        return -ENODATA;
 
-	mutex_lock(&pcore_mask_lock);
+    if (!zalloc_cpumask_var(&dom, GFP_KERNEL))
+        return -ENOMEM;
 
-	if (l2_domain_masks) {
-		kfree(l2_domain_masks);
-		l2_domain_masks = NULL;
-		l2_domain_count = 0;
-	}
+    mutex_lock(&pcore_mask_lock);
 
-	{
-		int alloc_domains = cpumask_weight(p_core_mask);
+    if (l2_domain_masks) {
+        kfree(l2_domain_masks);
+        l2_domain_masks = NULL;
+        l2_domain_count = 0;
+    }
 
-		if (alloc_domains <= 0) {
-			mutex_unlock(&pcore_mask_lock);
-			return -ENODATA;
-		}
+    l2_domain_masks = kcalloc(max_domains, sizeof(struct cpumask), GFP_KERNEL);
+    if (!l2_domain_masks) {
+        mutex_unlock(&pcore_mask_lock);
+        free_cpumask_var(dom);
+        return -ENOMEM;
+    }
 
-		l2_domain_masks = kcalloc(alloc_domains, sizeof(struct cpumask), GFP_KERNEL);
-		if (!l2_domain_masks) {
-			mutex_unlock(&pcore_mask_lock);
-			pr_warn("Failed to allocate L2 domain masks\n");
-			return -ENOMEM;
-		}
-	}
+    l2_domain_count = 0;
 
-	l2_domain_count = 0;
+    for_each_cpu(cpu, p_core_mask) {
+        const struct cpumask *sib = topology_sibling_cpumask(cpu);
+        bool exists = false;
 
-	/* Use a heap cpumask to avoid large stack frames */
-	{
-		cpumask_var_t tmp;
-		if (!zalloc_cpumask_var(&tmp, GFP_KERNEL)) {
-			kfree(l2_domain_masks);
-			l2_domain_masks = NULL;
-			mutex_unlock(&pcore_mask_lock);
-			return -ENOMEM;
-		}
+        if (sib && !cpumask_empty(sib)) {
+            cpumask_and(dom, sib, p_core_mask);
+        } else {
+            cpumask_clear(dom);
+            cpumask_set_cpu(cpu, dom);
+        }
 
-		for_each_cpu(cpu, p_core_mask) {
-			const struct cpumask *shared_mask = get_cache_shared_mask(cpu);
-			bool found = false;
-			int j;
+        if (cpumask_empty(dom))
+            continue;
 
-			if (!shared_mask || cpumask_empty(shared_mask)) {
-				continue;
-			}
+        for (j = 0; j < l2_domain_count; j++) {
+            if (cpumask_equal(&l2_domain_masks[j], dom)) {
+                exists = true;
+                break;
+            }
+        }
+        if (exists)
+            continue;
 
-			cpumask_and(tmp, shared_mask, p_core_mask);
-			if (cpumask_empty(tmp)) {
-				continue;
-			}
+        if (l2_domain_count < max_domains)
+            cpumask_copy(&l2_domain_masks[l2_domain_count++], dom);
+        else
+            break;
+    }
 
-			for (j = 0; j < l2_domain_count; j++) {
-				if (cpumask_test_cpu(cpu, &l2_domain_masks[j])) {
-					found = true;
-					break;
-				}
-			}
-			if (found) {
-				continue;
-			}
-
-			for (j = 0; j < l2_domain_count; j++) {
-				if (cpumask_equal(&l2_domain_masks[j], tmp)) {
-					found = true;
-					break;
-				}
-			}
-
-			if (!found) {
-				cpumask_copy(&l2_domain_masks[l2_domain_count], tmp);
-				l2_domain_count++;
-			}
-		}
-
-		free_cpumask_var(tmp);
-	}
-
-	if (l2_domain_count == 0) {
-		int max_domains = cpumask_weight(p_core_mask);
-		struct id_map {
-			int id;
-			int dom_idx;
-		} *map = NULL;
-		int map_count = 0;
-
-		if (max_domains <= 0) {
-			kfree(l2_domain_masks);
-			l2_domain_masks = NULL;
-			mutex_unlock(&pcore_mask_lock);
-			return -ENODATA;
-		}
-
-		map = kcalloc(max_domains, sizeof(*map), GFP_KERNEL);
-		if (!map) {
-			kfree(l2_domain_masks);
-			l2_domain_masks = NULL;
-			mutex_unlock(&pcore_mask_lock);
-			return -ENOMEM;
-		}
-
-		for (i = 0; i < max_domains; i++) {
-			map[i].id = -1;
-			map[i].dom_idx = -1;
-		}
-
-		for_each_cpu(cpu, p_core_mask) {
-			int l2_id, dom_idx = -1;
-			int m;
-
-			if (cpu >= NR_CPUS) {
-				continue;
-			}
-
-			l2_id = l2_core_ids[cpu];
-
-			for (m = 0; m < map_count; m++) {
-				if (map[m].id == l2_id) {
-					dom_idx = map[m].dom_idx;
-					break;
-				}
-			}
-
-			if (dom_idx == -1) {
-				if (map_count < max_domains) {
-					dom_idx = map_count;
-					map[map_count].id = l2_id;
-					map[map_count].dom_idx = dom_idx;
-					cpumask_clear(&l2_domain_masks[dom_idx]);
-					map_count++;
-					l2_domain_count++;
-				} else {
-					continue;
-				}
-			}
-
-			cpumask_set_cpu(cpu, &l2_domain_masks[dom_idx]);
-		}
-
-		kfree(map);
-	}
-
-	total_cpus = 0;
-	for (i = 0; i < l2_domain_count; i++) {
-		total_cpus += cpumask_weight(&l2_domain_masks[i]);
-	}
-
-	if (total_cpus < cpumask_weight(p_core_mask)) {
-		pr_warn("L2 domain detection incomplete: %d/%d CPUs\n",
-			total_cpus, cpumask_weight(p_core_mask));
-	}
-
-	mutex_unlock(&pcore_mask_lock);
-	return l2_domain_count > 0 ? 0 : -ENODATA;
+    mutex_unlock(&pcore_mask_lock);
+    free_cpumask_var(dom);
+    return l2_domain_count > 0 ? 0 : -ENODATA;
 }
 
 /**
- * group_cpus_hybrid_first - Distribute IRQs with hybrid CPU awareness
- * @num_grps: Number of groups to create
+ * group_cpus_hybrid_first - Hybrid IRQ distribution optimized for balanced and gaming
+ * @num_grps: Number of groups to create (>0)
  *
- * Creates CPU groups optimized for IRQ distribution on hybrid CPUs.
- * Prioritizes P-cores and considers cache topology for performance.
+ * Strategy:
+ * - For small vector counts: pack onto a minimal number of high-capacity P-core
+ *   SMT domains (keep a domain hot to reduce wake/ramp latency in balanced mode).
+ * - For larger vector counts: limit spread across P-core domains to a configurable
+ *   width, reusing domains before expanding (leave other P-cores clean).
+ * - E-cores: used only after a configurable P budget is exhausted (spillover).
  *
- * Return: Array of CPU masks or NULL on failure
+ * Safety:
+ * - Filters P-core mask to online CPUs.
+ * - Snapshots P SMT domains under lock; operates on a private copy (no UAF).
+ * - Robust fallbacks to group_cpus_evenly() if anything becomes inconsistent.
+ * - No internal default-affinity fill; we either generate a valid plan or fall back.
+ *
+ * Caller should hold cpus_read_lock for a stable topology view.
  */
 static struct cpumask *group_cpus_hybrid_first(unsigned int num_grps)
 {
@@ -638,17 +579,15 @@ static struct cpumask *group_cpus_hybrid_first(unsigned int num_grps)
 	int i, j, cpu, grp_idx = 0;
 	int ret;
 
-	if (!num_grps) {
+	if (!num_grps)
 		return NULL;
-	}
 
-	if (!irq_pcore_affinity || !hybrid_cpu_detected()) {
+	/* If hybrid-aware path disabled or not hybrid, use vanilla */
+	if (!irq_pcore_affinity || !hybrid_cpu_detected())
 		return group_cpus_evenly(num_grps);
-	}
 
-	if (!zalloc_cpumask_var(&p_core_copy, GFP_KERNEL)) {
+	if (!zalloc_cpumask_var(&p_core_copy, GFP_KERNEL))
 		return group_cpus_evenly(num_grps);
-	}
 	if (!zalloc_cpumask_var(&e_cores_mask, GFP_KERNEL)) {
 		free_cpumask_var(p_core_copy);
 		return group_cpus_evenly(num_grps);
@@ -660,6 +599,7 @@ static struct cpumask *group_cpus_hybrid_first(unsigned int num_grps)
 		return group_cpus_evenly(num_grps);
 	}
 
+	/* Compute P-core set; bail to even if empty/failed */
 	ret = get_pcore_mask(p_core_copy);
 	if (ret || cpumask_empty(p_core_copy)) {
 		bitmap_free(assigned);
@@ -668,6 +608,9 @@ static struct cpumask *group_cpus_hybrid_first(unsigned int num_grps)
 		return group_cpus_evenly(num_grps);
 	}
 
+	/* Only operate on online CPUs */
+	cpumask_and(p_core_copy, p_core_copy, cpu_online_mask);
+
 	result = kcalloc(num_grps, sizeof(struct cpumask), GFP_KERNEL);
 	if (!result) {
 		bitmap_free(assigned);
@@ -675,13 +618,13 @@ static struct cpumask *group_cpus_hybrid_first(unsigned int num_grps)
 		free_cpumask_var(p_core_copy);
 		return group_cpus_evenly(num_grps);
 	}
-	for (i = 0; i < num_grps; i++) {
+	for (i = 0; i < (int)num_grps; i++)
 		cpumask_clear(&result[i]);
-	}
 
+	/* E-cores = online - P-cores */
 	cpumask_andnot(e_cores_mask, cpu_online_mask, p_core_copy);
 
-	/* Identify L2 domains and snapshot them under the lock */
+	/* Build per-core SMT domains for P-cores and snapshot them */
 	ret = identify_l2_domains(p_core_copy);
 	if (ret == 0) {
 		mutex_lock(&pcore_mask_lock);
@@ -689,190 +632,153 @@ static struct cpumask *group_cpus_hybrid_first(unsigned int num_grps)
 			l2_local_count = l2_domain_count;
 			l2_local_masks = kcalloc(l2_local_count, sizeof(struct cpumask), GFP_KERNEL);
 			if (l2_local_masks) {
-				for (i = 0; i < l2_local_count; i++) {
+				for (i = 0; i < l2_local_count; i++)
 					cpumask_copy(&l2_local_masks[i], &l2_domain_masks[i]);
-				}
 			}
 		}
 		mutex_unlock(&pcore_mask_lock);
 
-		if (!l2_local_masks || l2_local_count == 0) {
+		if (!l2_local_masks || l2_local_count == 0)
 			ret = -ENOMEM;
-		}
 	}
 
-	if (ret) {
-		int cores = cpumask_weight(p_core_copy);
-		int cores_per_group = num_grps ? (cores / num_grps) : 0;
-		int extra = num_grps ? (cores % num_grps) : 0;
+	/* Determine domain limit (packing vs limited spread) and place groups */
+	{
+		unsigned int p_grps = 0, e_grps = 0;
+		unsigned int limit;
 
-		for (i = 0; i < (int)num_grps; i++) {
-			int count = 0;
-			int cores_this_group = cores_per_group + (i < extra ? 1 : 0);
-
-			for_each_cpu(cpu, p_core_copy) {
-				if (!test_bit(cpu, assigned) && count < cores_this_group) {
-					cpumask_set_cpu(cpu, &result[i]);
-					set_bit(cpu, assigned);
-					count++;
-				}
-			}
+		if (ret) {
+			/* No domain data; fallback to vanilla */
+			goto fallback_evenly;
 		}
-	} else {
-		int total_cores = 0;
+
+		if (num_grps <= smallvec_threshold)
+			limit = smallvec_pack_domains;
+		else
+			limit = pcore_spread_width;
+
+		if (limit == 0 || limit > (unsigned int)l2_local_count)
+			limit = (unsigned int)l2_local_count;
+
+		/* P budget across selected domains */
+		{
+			unsigned int budget = pcore_budget_per_domain ? (pcore_budget_per_domain * limit) : limit;
+			if (budget < 1)
+				budget = limit;
+			p_grps = min_t(unsigned int, num_grps, budget);
+			e_grps = num_grps - p_grps;
+		}
+
+		/* Score domains: prefer higher capacity; optional CPU0 bias */
+		struct {
+			int idx;
+			s64 score;
+		} *ds = NULL;
+
+		ds = kcalloc(l2_local_count, sizeof(*ds), GFP_KERNEL);
+		if (!ds)
+			goto fallback_evenly;
 
 		for (i = 0; i < l2_local_count; i++) {
-			total_cores += cpumask_weight(&l2_local_masks[i]);
+			u64 cap = 0;
+			for_each_cpu(cpu, &l2_local_masks[i])
+				cap += (u64)arch_scale_cpu_capacity(cpu);
+
+			if (cpumask_test_cpu(0, &l2_local_masks[i]))
+				ds[i].score = anchor_prefer_cpu0 ? (s64)cap + 1000000000LL : (s64)cap - 1000000000LL;
+			else
+				ds[i].score = (s64)cap;
+			ds[i].idx = i;
 		}
 
-		for (i = 0; i < l2_local_count && grp_idx < (int)num_grps; i++) {
-			int domain_cores = cpumask_weight(&l2_local_masks[i]);
-			int grps_for_domain = 1;
-
-			if (domain_cores == 0) {
-				continue;
-			}
-
-			if (total_cores > 0) {
-				grps_for_domain = (num_grps * domain_cores + total_cores - 1) / total_cores;
-				if (grps_for_domain > (int)num_grps - grp_idx) {
-					grps_for_domain = (int)num_grps - grp_idx;
-				}
-			}
-			if (grps_for_domain < 1) {
-				grps_for_domain = 1;
-			}
-
-			{
-				int cores_per_domain_group = domain_cores / grps_for_domain;
-				int domain_extra = domain_cores % grps_for_domain;
-
-				for (j = 0; j < grps_for_domain && grp_idx < (int)num_grps; j++, grp_idx++) {
-					int cores_this_group = cores_per_domain_group + (j < domain_extra ? 1 : 0);
-					int count = 0;
-
-					for_each_cpu(cpu, &l2_local_masks[i]) {
-						if (count >= cores_this_group) {
-							break;
-						}
-						if (!test_bit(cpu, assigned)) {
-							cpumask_set_cpu(cpu, &result[grp_idx]);
-							set_bit(cpu, assigned);
-							count++;
-						}
-					}
-				}
+		/* Partial selection: top 'limit' domains */
+		for (i = 0; i < (int)limit; i++) {
+			int maxk = i;
+			for (j = i + 1; j < l2_local_count; j++)
+				if (ds[j].score > ds[maxk].score)
+					maxk = j;
+			if (maxk != i) {
+				typeof(*ds) tmp = ds[i];
+				ds[i] = ds[maxk];
+				ds[maxk] = tmp;
 			}
 		}
-	}
 
-	if (grp_idx < (int)num_grps && !cpumask_empty(e_cores_mask)) {
-		int e_cores = cpumask_weight(e_cores_mask);
-		int remaining = (int)num_grps - grp_idx;
-		int cores_per_group = remaining > 0 ? e_cores / remaining : 0;
-		int extra = remaining > 0 ? e_cores % remaining : 0;
+		/* Place P-groups round-robin across selected top domains */
+		{
+			unsigned int placed = 0;
+			for (i = 0; i < (int)p_grps && grp_idx < (int)num_grps; i++) {
+				int dom_idx = ds[i % (int)limit].idx;
+				bool placed_one = false;
 
-		for (i = grp_idx; i < (int)num_grps; i++) {
-			int count = 0;
-			int target = cores_per_group + (i - grp_idx < extra ? 1 : 0);
-
-			for_each_cpu(cpu, e_cores_mask) {
-				if (count >= target) {
-					break;
-				}
-				if (!test_bit(cpu, assigned)) {
-					cpumask_set_cpu(cpu, &result[i]);
-					set_bit(cpu, assigned);
-					count++;
-				}
-			}
-		}
-	}
-
-	for (i = 0; i < (int)num_grps; i++) {
-		if (cpumask_empty(&result[i])) {
-			int donor_cpu = -1;
-			int donor_group = -1;
-			int best_score = -1;
-			int target_node = -1;
-			unsigned int j_start, j_end;
-
-			j_start = (i > 0) ? (i - 1) : 0;
-			j_end = (i + 1 < (int)num_grps) ? (i + 1) : (unsigned int)i;
-
-			for (j = j_start; j <= j_end; j++) {
-				if ((int)j != i && cpumask_weight(&result[j]) > 0) {
-					int temp_cpu = cpumask_first(&result[j]);
-
-					if (temp_cpu < NR_CPUS) {
-						target_node = numa_node_for_cpu[temp_cpu];
+				for_each_cpu(cpu, &l2_local_masks[dom_idx]) {
+					if (!test_and_set_bit(cpu, assigned)) {
+						cpumask_set_cpu(cpu, &result[grp_idx++]);
+						placed++;
+						placed_one = true;
 						break;
 					}
 				}
-			}
-
-			for (j = 0; j < (int)num_grps; j++) {
-				if (cpumask_weight(&result[j]) > 1) {
-					for_each_cpu(cpu, &result[j]) {
-						int score = 0;
-						int cpu_node = (cpu < NR_CPUS) ? numa_node_for_cpu[cpu] : -1;
-						int ctype = get_core_type(cpu);
-						const struct cpumask *cache_mask;
-						int cache_siblings = 0;
-						int numa_siblings = 0;
-						int sibling;
-
-						if (target_node >= 0 && cpu_node == target_node) {
-							score += 1000;
-						}
-						if (ctype == 0) {
-							score += 500;
-						}
-
-						cache_mask = get_cache_shared_mask(cpu);
-						for_each_cpu(sibling, &result[j]) {
-							if (sibling != cpu) {
-								if (cache_mask && cpumask_test_cpu(sibling, cache_mask)) {
-									cache_siblings++;
-								}
-								if (cpu_node >= 0 && sibling < NR_CPUS &&
-								    numa_node_for_cpu[sibling] == cpu_node) {
-									numa_siblings++;
-								}
-							}
-						}
-
-						score += cache_siblings * 10;
-						score += numa_siblings * 50;
-
-						if (score > best_score) {
-							best_score = score;
-							donor_cpu = cpu;
-							donor_group = j;
+				/* If domain is full, fall back to any free P-core */
+				if (!placed_one) {
+					for_each_cpu(cpu, p_core_copy) {
+						if (!test_and_set_bit(cpu, assigned)) {
+							cpumask_set_cpu(cpu, &result[grp_idx++]);
+							placed++;
+							break;
 						}
 					}
 				}
 			}
+			if (placed < p_grps) {
+				kfree(ds);
+				goto fallback_evenly;
+			}
+		}
 
-			if (donor_group >= 0 && donor_cpu >= 0) {
-				cpumask_clear_cpu(donor_cpu, &result[donor_group]);
-				cpumask_set_cpu(donor_cpu, &result[i]);
-			} else {
-				kfree(l2_local_masks);
-				kfree(result);
-				bitmap_free(assigned);
-				free_cpumask_var(e_cores_mask);
-				free_cpumask_var(p_core_copy);
-				return group_cpus_evenly(num_grps);
+		kfree(ds);
+
+		/* Evenly place spillover groups to E-cores, clamped by E-core count */
+		if (e_grps > 0 && !cpumask_empty(e_cores_mask)) {
+			int e_count = cpumask_weight(e_cores_mask);
+			int groups_to_place = (int)e_grps;
+
+			if (groups_to_place > e_count)
+				groups_to_place = e_count;
+
+			if (groups_to_place > 0) {
+				int per_group = e_count / groups_to_place;
+				int extra = e_count % groups_to_place;
+				int g = 0;
+
+				for_each_cpu(cpu, e_cores_mask) {
+					if (grp_idx + g >= (int)num_grps)
+						break;
+					cpumask_set_cpu(cpu, &result[grp_idx + g]);
+					if (cpumask_weight(&result[grp_idx + g]) >= (per_group + (g < extra ? 1 : 0)))
+						g++;
+					if (g >= groups_to_place)
+						break;
+				}
+				grp_idx += groups_to_place;
 			}
 		}
 	}
 
+	/* Success path */
 	kfree(l2_local_masks);
 	bitmap_free(assigned);
 	free_cpumask_var(e_cores_mask);
 	free_cpumask_var(p_core_copy);
 	return result;
+
+fallback_evenly:
+	kfree(l2_local_masks);
+	kfree(result);
+	bitmap_free(assigned);
+	free_cpumask_var(e_cores_mask);
+	free_cpumask_var(p_core_copy);
+	return group_cpus_evenly(num_grps);
 }
 
 /**
@@ -943,24 +849,19 @@ static void __exit hybrid_irq_tuning_exit(void)
 static int __init hybrid_irq_tuning(void)
 {
 	int ret = 0, cpu;
-	cpumask_var_t pcore_copy;
+	cpumask_var_t pcore_copy, ecore_mask;
 
 	if (!hybrid_cpu_detected() || !irq_pcore_affinity)
 		return 0;
 
-	/* Initialize NUMA node mapping with bounds checking */
 	for_each_possible_cpu(cpu) {
 		if (cpu < NR_CPUS)
 			numa_node_for_cpu[cpu] = cpu_to_node(cpu);
 	}
 
-	/* Pre-initialize L2 core IDs */
 	init_l2_core_ids();
-
-	/* Pre-initialize frequency information */
 	init_freq_info();
 
-	/* Register CPU hotplug callback; store the dynamic state id */
 	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "irq/pcore_affinity:online",
 				pcore_cpu_notify, pcore_cpu_notify);
 	if (ret < 0) {
@@ -969,15 +870,25 @@ static int __init hybrid_irq_tuning(void)
 	}
 	pcore_cpuhp_state = ret;
 
-	/* Get P-core mask and apply to default affinity */
-	if (zalloc_cpumask_var(&pcore_copy, GFP_KERNEL)) {
-		ret = get_pcore_mask(pcore_copy);
-		if (ret < 0) {
-			pr_warn("Failed to get P-core mask: %d\n", ret);
-			/* Continue anyway - will use default affinity */
-		} else if (!cpumask_empty(pcore_copy)) {
-			cpumask_copy(irq_default_affinity, pcore_copy);
+	/* Optional default affinity override */
+	if (default_affinity_mode &&
+	    zalloc_cpumask_var(&pcore_copy, GFP_KERNEL) &&
+	    zalloc_cpumask_var(&ecore_mask, GFP_KERNEL)) {
+
+		if (get_pcore_mask(pcore_copy) == 0 && !cpumask_empty(pcore_copy)) {
+			cpumask_and(pcore_copy, pcore_copy, cpu_online_mask);
+			cpumask_andnot(ecore_mask, cpu_online_mask, pcore_copy);
+
+			if (default_affinity_mode == 1) {
+				cpumask_copy(irq_default_affinity, pcore_copy);
+				pr_info("IRQ default affinity set to P-cores\n");
+			} else if (default_affinity_mode == 2 && !cpumask_empty(ecore_mask)) {
+				cpumask_copy(irq_default_affinity, ecore_mask);
+				pr_info("IRQ default affinity set to E-cores\n");
+			}
 		}
+
+		free_cpumask_var(ecore_mask);
 		free_cpumask_var(pcore_copy);
 	}
 
@@ -1116,59 +1027,38 @@ irq_create_affinity_masks(unsigned int nvecs, struct irq_affinity *affd)
  * @maxvec: Maximum number of vectors
  * @affd: IRQ affinity descriptor
  *
- * Determines the optimal number of interrupt vectors for the system
- * based on CPU topology.
- *
- * Return: Optimal number of vectors or 0 on failure
+ * Do not restrict vectors to P-cores; allow drivers (e.g., NICs) to use full parallelism
+ * across online CPUs where appropriate. This restores expected vector counts and avoids
+ * raising CPU utilization due to queue under-allocation.
  */
 unsigned int irq_calc_affinity_vectors(unsigned int minvec, unsigned int maxvec,
-				       const struct irq_affinity *affd)
+                                       const struct irq_affinity *affd)
 {
-	unsigned int resv, set_vecs = 0;
-	unsigned int diff;
+    unsigned int resv, set_vecs = 0;
+    unsigned int diff;
 
-	if (!affd)
-		return 0;
+    if (!affd)
+        return 0;
 
-	resv = affd->pre_vectors + affd->post_vectors;
+    resv = affd->pre_vectors + affd->post_vectors;
+    if (resv > minvec)
+        return 0;
 
-	if (resv > minvec)
-		return 0;
+    if (check_sub_overflow(maxvec, resv, &diff))
+        return 0;
 
-	/* Guard overflow */
-	if (check_sub_overflow(maxvec, resv, &diff))
-		return 0;
+    if (affd->calc_sets) {
+        set_vecs = diff;
+    } else {
+        cpus_read_lock();
+        set_vecs = cpumask_weight(cpu_online_mask);
+        cpus_read_unlock();
+    }
 
-	if (affd->calc_sets) {
-		set_vecs = diff;
-	} else {
-		cpus_read_lock();
-#ifdef CONFIG_X86
-		if (hybrid_cpu_detected() && irq_pcore_affinity) {
-			cpumask_var_t pcpu_mask;
-			if (zalloc_cpumask_var(&pcpu_mask, GFP_KERNEL)) {
-				if (get_pcore_mask(pcpu_mask) == 0 && !cpumask_empty(pcpu_mask)) {
-					set_vecs = cpumask_weight(pcpu_mask);
-				} else {
-					set_vecs = cpumask_weight(cpu_online_mask);
-				}
-				free_cpumask_var(pcpu_mask);
-			} else {
-				set_vecs = cpumask_weight(cpu_online_mask);
-			}
-		} else
-#endif
-		{
-			set_vecs = cpumask_weight(cpu_possible_mask);
-		}
-		cpus_read_unlock();
-	}
+    if (set_vecs == 0)
+        set_vecs = 1;
 
-	/* Ensure at least one vector */
-	if (set_vecs == 0)
-		set_vecs = 1;
-
-	return resv + min(set_vecs, diff);
+    return resv + min(set_vecs, diff);
 }
 
 /* Module metadata */

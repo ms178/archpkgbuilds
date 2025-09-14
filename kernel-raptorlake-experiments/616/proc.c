@@ -12,7 +12,7 @@
 #include <linux/interrupt.h>
 #include <linux/kernel_stat.h>
 #include <linux/mutex.h>
-#include <linux/uaccess.h>
+
 #include "internals.h"
 
 /*
@@ -45,88 +45,71 @@ enum {
 
 static int show_irq_affinity(int type, struct seq_file *m)
 {
-	struct irq_desc *desc = irq_to_desc((long)m->private);
-	const struct cpumask *mask = NULL;
+    unsigned int irq = (unsigned int)(unsigned long)m->private;
+    struct irq_desc *desc = irq_to_desc(irq);
+    const struct cpumask *mask = NULL;
 
-	if (!desc)
-		return -ENOENT;
+    if (!desc)
+        return -ENOENT;
 
-	switch (type) {
-	case AFFINITY:
-	case AFFINITY_LIST:
-		/*
-		 * Use the helper to fetch the current affinity mask pointer.
-		 * Do not READ_ONCE() the affinity field directly: under ThinLTO
-		 * this may trip the compile-time size checks if the field is not
-		 * a simple scalar. The helper is the canonical, safe interface.
-		 */
-		mask = irq_data_get_affinity_mask(&desc->irq_data);
+    switch (type) {
+    case AFFINITY:
+    case AFFINITY_LIST:
+        mask = irq_data_get_affinity_mask(&desc->irq_data);
+        if (irq_move_pending(&desc->irq_data))
+            mask = irq_desc_get_pending_mask(desc);
+        break;
 
-		/* If a move is pending, report the pending mask instead. */
-		if (irq_move_pending(&desc->irq_data))
-			mask = irq_desc_get_pending_mask(desc);
-		break;
-
-	case EFFECTIVE:
-	case EFFECTIVE_LIST:
+    case EFFECTIVE:
+    case EFFECTIVE_LIST:
 #ifdef CONFIG_GENERIC_IRQ_EFFECTIVE_AFF_MASK
-		mask = irq_data_get_effective_affinity_mask(&desc->irq_data);
-		break;
+        mask = irq_data_get_effective_affinity_mask(&desc->irq_data);
+        break;
+#else
+        return -EINVAL;
 #endif
-		/* Fallthrough when effective affinity is not supported. */
-	default:
-		return -EINVAL;
-	}
+    default:
+        return -EINVAL;
+    }
 
-	if (!mask) {
-		seq_putc(m, '\n');
-		return 0;
-	}
+    if (!mask) {
+        seq_putc(m, '\n');
+        return 0;
+    }
 
-	switch (type) {
-	case AFFINITY_LIST:
-	case EFFECTIVE_LIST:
-		seq_printf(m, "%*pbl\n", cpumask_pr_args(mask));
-		break;
-	case AFFINITY:
-	case EFFECTIVE:
-		seq_printf(m, "%*pb\n", cpumask_pr_args(mask));
-		break;
-	}
-	return 0;
+    switch (type) {
+    case AFFINITY_LIST:
+    case EFFECTIVE_LIST:
+        seq_printf(m, "%*pbl\n", cpumask_pr_args(mask));
+        break;
+    case AFFINITY:
+    case EFFECTIVE:
+        seq_printf(m, "%*pb\n", cpumask_pr_args(mask));
+        break;
+    }
+    return 0;
 }
 
 static int irq_affinity_hint_proc_show(struct seq_file *m, void *v)
 {
-	unsigned int irq = (unsigned int)(long)m->private;
-	struct irq_desc *desc;
-	unsigned long flags;
-	cpumask_var_t mask;
+    unsigned int irq = (unsigned int)(unsigned long)m->private;
+    struct irq_desc *desc = irq_to_desc(irq);
+    const struct cpumask *hint;
 
-	if (!zalloc_cpumask_var(&mask, GFP_KERNEL)) {
-		return -ENOMEM;
-	}
+    if (!desc) {
+        seq_putc(m, '\n');
+        return 0;
+    }
 
-	/* Atomically get and lock the descriptor to prevent use-after-free. */
-	desc = __irq_get_desc_lock(irq, &flags, false, IRQ_GET_DESC_CHECK_GLOBAL);
+    /* Lockless snapshot of the pointer; drivers must keep it valid while IRQ lives. */
+    hint = READ_ONCE(desc->affinity_hint);
+    if (!hint) {
+        seq_putc(m, '\n');
+        return 0;
+    }
 
-	if (!desc) {
-		/* IRQ was freed after file open but before read. Safe exit. */
-		cpumask_clear(mask);
-	} else {
-		/* Safely access the descriptor's members under the lock. */
-		if (desc->affinity_hint) {
-			cpumask_copy(mask, desc->affinity_hint);
-		} else {
-			cpumask_clear(mask);
-		}
-		__irq_put_desc_unlock(desc, flags, false);
-	}
-
-	seq_printf(m, "%*pb\n", cpumask_pr_args(mask));
-	free_cpumask_var(mask);
-
-	return 0;
+    seq_printf(m, "%*pb\n", cpumask_pr_args(hint));
+    return 0;
 }
 
 int no_irq_affinity;
@@ -307,29 +290,21 @@ static const struct proc_ops default_affinity_proc_ops = {
 
 static int irq_node_proc_show(struct seq_file *m, void *v)
 {
-    struct irq_desc *desc = irq_to_desc((long)m->private);
+	struct irq_desc *desc = irq_to_desc((long) m->private);
 
-    if (!desc)
-        return -ENOENT;
-
-    seq_printf(m, "%d\n", irq_desc_get_node(desc));
-    return 0;
+	seq_printf(m, "%d\n", irq_desc_get_node(desc));
+	return 0;
 }
 #endif
 
 static int irq_spurious_proc_show(struct seq_file *m, void *v)
 {
-    struct irq_desc *desc = irq_to_desc((long) m->private);
+	struct irq_desc *desc = irq_to_desc((long) m->private);
 
-    if (!desc)
-        return -ENOENT;
-
-    seq_printf(m, "count %u\n"
-                  "unhandled %u\n"
-                  "last_unhandled %u ms\n",
-               desc->irq_count, desc->irqs_unhandled,
-               jiffies_to_msecs(desc->last_unhandled));
-    return 0;
+	seq_printf(m, "count %u\n" "unhandled %u\n" "last_unhandled %u ms\n",
+		   desc->irq_count, desc->irqs_unhandled,
+		   jiffies_to_msecs(desc->last_unhandled));
+	return 0;
 }
 
 #define MAX_NAMELEN 128
@@ -363,80 +338,91 @@ void register_handler_proc(unsigned int irq, struct irqaction *action)
 }
 
 #undef MAX_NAMELEN
-#define MAX_NAMELEN 16
+
+#define MAX_NAMELEN 10
 
 void register_irq_proc(unsigned int irq, struct irq_desc *desc)
 {
-    static DEFINE_MUTEX(register_lock);
-    void __maybe_unused *irqp = (void *)(unsigned long)irq;
-    char name[16]; /* Enough for "4294967295" + NUL */
+	static DEFINE_MUTEX(register_lock);
+	void __maybe_unused *irqp = (void *)(unsigned long) irq;
+	char name [MAX_NAMELEN];
 
-    if (!root_irq_dir || (desc->irq_data.chip == &no_irq_chip))
-        return;
+	if (!root_irq_dir || (desc->irq_data.chip == &no_irq_chip))
+		return;
 
-    guard(mutex)(&register_lock);
+	/*
+	 * irq directories are registered only when a handler is
+	 * added, not when the descriptor is created, so multiple
+	 * tasks might try to register at the same time.
+	 */
+	guard(mutex)(&register_lock);
 
-    if (desc->dir)
-        return;
+	if (desc->dir)
+		return;
 
-    snprintf(name, sizeof(name), "%u", irq);
-    desc->dir = proc_mkdir(name, root_irq_dir);
-    if (!desc->dir)
-        return;
+	/* create /proc/irq/1234 */
+	sprintf(name, "%u", irq);
+	desc->dir = proc_mkdir(name, root_irq_dir);
+	if (!desc->dir)
+		return;
 
 #ifdef CONFIG_SMP
-    umode_t umode = S_IRUGO;
+	umode_t umode = S_IRUGO;
 
-    if (irq_can_set_affinity_usr(desc->irq_data.irq))
-        umode |= S_IWUSR;
+	if (irq_can_set_affinity_usr(desc->irq_data.irq))
+		umode |= S_IWUSR;
 
-    proc_create_data("smp_affinity", umode, desc->dir, &irq_affinity_proc_ops, irqp);
-    proc_create_single_data("affinity_hint", 0444, desc->dir,
-                            irq_affinity_hint_proc_show, irqp);
-    proc_create_data("smp_affinity_list", umode, desc->dir,
-                     &irq_affinity_list_proc_ops, irqp);
-    proc_create_single_data("node", 0444, desc->dir, irq_node_proc_show, irqp);
+	/* create /proc/irq/<irq>/smp_affinity */
+	proc_create_data("smp_affinity", umode, desc->dir, &irq_affinity_proc_ops, irqp);
+
+	/* create /proc/irq/<irq>/affinity_hint */
+	proc_create_single_data("affinity_hint", 0444, desc->dir,
+				irq_affinity_hint_proc_show, irqp);
+
+	/* create /proc/irq/<irq>/smp_affinity_list */
+	proc_create_data("smp_affinity_list", umode, desc->dir,
+			 &irq_affinity_list_proc_ops, irqp);
+
+	proc_create_single_data("node", 0444, desc->dir, irq_node_proc_show, irqp);
 # ifdef CONFIG_GENERIC_IRQ_EFFECTIVE_AFF_MASK
-    proc_create_single_data("effective_affinity", 0444, desc->dir,
-                            irq_effective_aff_proc_show, irqp);
-    proc_create_single_data("effective_affinity_list", 0444, desc->dir,
-                            irq_effective_aff_list_proc_show, irqp);
+	proc_create_single_data("effective_affinity", 0444, desc->dir,
+				irq_effective_aff_proc_show, irqp);
+	proc_create_single_data("effective_affinity_list", 0444, desc->dir,
+				irq_effective_aff_list_proc_show, irqp);
 # endif
 #endif
-    proc_create_single_data("spurious", 0444, desc->dir,
-                            irq_spurious_proc_show, (void *)(long)irq);
+	proc_create_single_data("spurious", 0444, desc->dir,
+				irq_spurious_proc_show, (void *)(long)irq);
+
 }
 
 void unregister_irq_proc(unsigned int irq, struct irq_desc *desc)
 {
-    char name[16];
+	char name [MAX_NAMELEN];
 
-    if (!root_irq_dir || !desc->dir)
-        return;
+	if (!root_irq_dir || !desc->dir)
+		return;
 #ifdef CONFIG_SMP
-    remove_proc_entry("smp_affinity", desc->dir);
-    remove_proc_entry("affinity_hint", desc->dir);
-    remove_proc_entry("smp_affinity_list", desc->dir);
-    remove_proc_entry("node", desc->dir);
+	remove_proc_entry("smp_affinity", desc->dir);
+	remove_proc_entry("affinity_hint", desc->dir);
+	remove_proc_entry("smp_affinity_list", desc->dir);
+	remove_proc_entry("node", desc->dir);
 # ifdef CONFIG_GENERIC_IRQ_EFFECTIVE_AFF_MASK
-    remove_proc_entry("effective_affinity", desc->dir);
-    remove_proc_entry("effective_affinity_list", desc->dir);
+	remove_proc_entry("effective_affinity", desc->dir);
+	remove_proc_entry("effective_affinity_list", desc->dir);
 # endif
 #endif
-    remove_proc_entry("spurious", desc->dir);
+	remove_proc_entry("spurious", desc->dir);
 
-    snprintf(name, sizeof(name), "%u", irq);
-    remove_proc_entry(name, root_irq_dir);
+	sprintf(name, "%u", irq);
+	remove_proc_entry(name, root_irq_dir);
 }
 
 #undef MAX_NAMELEN
 
 void unregister_handler_proc(unsigned int irq, struct irqaction *action)
 {
-    if (action && action->dir) {
-        proc_remove(action->dir);
-        action->dir = NULL;
-    }
+	proc_remove(action->dir);
 }
 
 static void register_default_affinity_proc(void)
