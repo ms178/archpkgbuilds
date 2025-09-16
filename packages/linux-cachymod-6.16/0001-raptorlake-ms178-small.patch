@@ -1,3 +1,682 @@
+--- a/drivers/cpufreq/intel_pstate.c	2025-04-13 11:40:05.273247310 +0200
++++ b/drivers/cpufreq/intel_pstate.c	2025-09-16 15:51:11.133723810 +0200
+@@ -9,6 +9,7 @@
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
+ #include <linux/kernel.h>
++#include <linux/log2.h>
+ #include <linux/kernel_stat.h>
+ #include <linux/module.h>
+ #include <linux/ktime.h>
+@@ -20,6 +21,7 @@
+ #include <linux/list.h>
+ #include <linux/cpu.h>
+ #include <linux/cpufreq.h>
++#include <linux/math64.h>
+ #include <linux/sysfs.h>
+ #include <linux/types.h>
+ #include <linux/fs.h>
+@@ -60,6 +62,95 @@
+ #define fp_ext_toint(X) ((X) >> EXT_FRAC_BITS)
+ #define int_ext_tofp(X) ((int64_t)(X) << EXT_FRAC_BITS)
+ 
++static inline u64 div_u64_safe_shift(u64 dividend, u64 divisor)
++{
++	u64 quotient;
++
++	/* Safety check - matches original behavior */
++	if (unlikely(divisor == 0)) {
++		WARN_ONCE(1, "intel_pstate: division by zero\n");
++		return 0;
++	}
++
++	/* Fast path: power of 2 divisor - use shift instead of division */
++	if (likely((divisor & (divisor - 1)) == 0)) {
++		/* __builtin_ctzll is guaranteed available on x86_64 */
++		return dividend >> __builtin_ctzll(divisor);
++	}
++
++	/* Slow path: actual division */
++	quotient = div64_u64(dividend, divisor);
++	return quotient;
++}
++
++static inline u64 div_u64_safe_shift_round(u64 dividend, u64 divisor, int round_up)
++{
++	u64 quotient, remainder;
++
++	/* Safety check */
++	if (unlikely(divisor == 0)) {
++		WARN_ONCE(1, "intel_pstate: division by zero\n");
++		return 0;
++	}
++
++	/* Fast path for power of 2 */
++	if (likely((divisor & (divisor - 1)) == 0)) {
++		int shift = __builtin_ctzll(divisor);
++		quotient = dividend >> shift;
++
++		if (round_up && (dividend & ((1ULL << shift) - 1))) {
++			quotient++;
++		}
++		return quotient;
++	}
++
++	/* Slow path with rounding */
++	quotient = div64_u64_rem(dividend, divisor, &remainder);
++
++	if (round_up && remainder > 0) {
++		quotient++;
++	}
++
++	return quotient;
++}
++
++static inline u64 ip_div_u64_recip_floor(u64 n, u64 d)
++{
++	return div_u64_safe_shift(n, d);
++}
++
++static inline u64 ip_div_u64_recip_ceil(u64 n, u64 d)
++{
++	return div_u64_safe_shift_round(n, d, 1);
++}
++
++static inline u64 ip_div_u64_recip_round_closest(u64 n, u64 d)
++{
++	u64 q, r;
++
++	if (unlikely(!d)) {
++		WARN_ONCE(1, "intel_pstate: division by zero\n");
++		return 0;
++	}
++
++	if (is_power_of_2(d)) {
++		int shift = __ffs64(d); /* 0..63 */
++
++		if (shift == 0)
++			return n; /* d == 1: exact */
++
++		/* Avoid (1ULL << (shift-1)) overflow and n + add overflow */
++		q = n >> shift;
++		r = n & (d - 1);
++		return q + (r >= (d >> 1)); /* ties up */
++	}
++
++	q = div64_u64_rem(n, d, &r);
++	if (r >= d - r)
++		q++;
++	return q;
++}
++
+ static inline int32_t mul_fp(int32_t x, int32_t y)
+ {
+ 	return ((int64_t)x * (int64_t)y) >> FRAC_BITS;
+@@ -215,6 +306,8 @@ struct global_params {
+  *			preference/bias
+  * @epp_cached:		Cached HWP energy-performance preference value
+  * @hwp_req_cached:	Cached value of the last HWP Request MSR
++ * @hwp_cache_valid:    True if hwp_req_cached holds an authoritative image
++ * @hwp_lock:           Serializes read-modify-write access to HWP_REQUEST MSR
+  * @hwp_cap_cached:	Cached value of the last HWP Capabilities MSR
+  * @last_io_update:	Last time when IO wake flag was set
+  * @capacity_perf:	Highest perf used for scale invariance
+@@ -233,6 +326,22 @@ struct cpudata {
+ 	struct update_util_data update_util;
+ 	bool   update_util_set;
+ 
++	/*
++	 * This lock serializes the entire read-modify-write sequence for the
++	 * HWP_REQUEST MSR to prevent lost updates between this driver and
++	 * other kernel components (e.g., thermal management). It must be a
++	 * raw_spinlock_t as it can be taken in interrupt context.
++	 */
++	raw_spinlock_t hwp_lock;
++	/*
++	 * This flag tracks if hwp_req_cached holds a valid, authoritative
++	 * image of the MSR's state. It is initialized to false and set to
++	 * true only after the first successful RDMSR.
++	 */
++	bool hwp_cache_valid;
++	/* Authoritative software cache of the HWP_REQUEST MSR value. */
++	u64 hwp_req_cached;
++
+ 	struct pstate_data pstate;
+ 	struct vid_data vid;
+ 
+@@ -254,7 +363,6 @@ struct cpudata {
+ 	s16 epp_policy;
+ 	s16 epp_default;
+ 	s16 epp_cached;
+-	u64 hwp_req_cached;
+ 	u64 hwp_cap_cached;
+ 	u64 last_io_update;
+ 	unsigned int capacity_perf;
+@@ -265,7 +373,7 @@ struct cpudata {
+ 	bool pd_registered;
+ #endif
+ 	struct delayed_work hwp_notify_work;
+-};
++} ____cacheline_aligned; /* Ensure this per-cpu data avoids false sharing */
+ 
+ static struct cpudata **all_cpu_data;
+ 
+@@ -1292,64 +1400,114 @@ unlock:
+ static void intel_pstate_hwp_set(unsigned int cpu)
+ {
+ 	struct cpudata *cpu_data = all_cpu_data[cpu];
++	unsigned long flags;
+ 	int max, min;
+-	u64 value;
++	u64 value, prev_value;
+ 	s16 epp;
+ 
++	/* Validate CPU data pointer. */
++	if (unlikely(!cpu_data)) {
++		pr_err("intel_pstate: NULL cpu_data for CPU %u\n", cpu);
++		return;
++	}
++
+ 	max = cpu_data->max_perf_ratio;
+ 	min = cpu_data->min_perf_ratio;
+ 
+-	if (cpu_data->policy == CPUFREQ_POLICY_PERFORMANCE)
++	/* In 'performance' policy, clamp minimum performance to maximum. */
++	if (cpu_data->policy == CPUFREQ_POLICY_PERFORMANCE) {
+ 		min = max;
++	}
+ 
+-	rdmsrq_on_cpu(cpu, MSR_HWP_REQUEST, &value);
++	/*
++	 * Serialize the entire MSR read-modify-write so independent writers
++	 * never lose each other's field updates. This lock is per-target-CPU,
++	 * so contention is minimal, and it is safe in atomic contexts.
++	 */
++	raw_spin_lock_irqsave(&cpu_data->hwp_lock, flags);
+ 
+-	value &= ~HWP_MIN_PERF(~0L);
+-	value |= HWP_MIN_PERF(min);
++	/*
++	 * Initialize authoritative cached image once from hardware to avoid
++	 * stale baselines. After that, we operate from the cache and keep it
++	 * coherent with the hardware.
++	 */
++	if (unlikely(!cpu_data->hwp_cache_valid)) {
++		rdmsrq_on_cpu(cpu, MSR_HWP_REQUEST, &cpu_data->hwp_req_cached);
++		cpu_data->hwp_cache_valid = true;
++	}
+ 
+-	value &= ~HWP_MAX_PERF(~0L);
+-	value |= HWP_MAX_PERF(max);
++	value = cpu_data->hwp_req_cached;
++	prev_value = value;
+ 
+-	if (cpu_data->epp_policy == cpu_data->policy)
+-		goto skip_epp;
++	/* Update HWP min/max perf fields using 64-bit masks. */
++	value &= ~HWP_MIN_PERF(~0ULL);
++	value |= HWP_MIN_PERF((u64)min);
+ 
+-	cpu_data->epp_policy = cpu_data->policy;
++	value &= ~HWP_MAX_PERF(~0ULL);
++	value |= HWP_MAX_PERF((u64)max);
+ 
+-	if (cpu_data->policy == CPUFREQ_POLICY_PERFORMANCE) {
+-		epp = intel_pstate_get_epp(cpu_data, value);
+-		cpu_data->epp_powersave = epp;
+-		/* If EPP read was failed, then don't try to write */
+-		if (epp < 0)
+-			goto skip_epp;
++	/*
++	 * EPP handling:
++	 * - Only adjust when the policy actually changes.
++	 * - In 'performance' policy, force EPP to 0 after saving the current
++	 *   value to epp_powersave if available.
++	 * - When leaving 'performance', restore saved EPP only if current EPP
++	 *   is zero (meaning we had forced it) and the saved value is valid.
++	 * - If HWP_EPP is unavailable, write EPB instead.
++	 */
++	if (cpu_data->epp_policy != cpu_data->policy) {
++		cpu_data->epp_policy = cpu_data->policy;
+ 
+-		epp = 0;
+-	} else {
+-		/* skip setting EPP, when saved value is invalid */
+-		if (cpu_data->epp_powersave < 0)
+-			goto skip_epp;
++		if (cpu_data->policy == CPUFREQ_POLICY_PERFORMANCE) {
++			/* Save current powersave EPP, then force performance EPP=0. */
++			epp = intel_pstate_get_epp(cpu_data, value);
++			cpu_data->epp_powersave = epp;
++
++			/* If reading EPP failed, don't try to write it. */
++			if (epp >= 0) {
++				epp = 0;
++			} else {
++				goto skip_epp;
++			}
++		} else {
++			/* Restore only if we have a valid saved value. */
++			if (cpu_data->epp_powersave < 0) {
++				goto skip_epp;
++			}
+ 
+-		/*
+-		 * No need to restore EPP when it is not zero. This
+-		 * means:
+-		 *  - Policy is not changed
+-		 *  - user has manually changed
+-		 *  - Error reading EPB
+-		 */
+-		epp = intel_pstate_get_epp(cpu_data, value);
+-		if (epp)
+-			goto skip_epp;
++			/*
++			 * Preserve user/firmware overrides: if current EPP is
++			 * non-zero (i.e., not 'performance'), do not overwrite it.
++			 */
++			epp = intel_pstate_get_epp(cpu_data, value);
++			if (epp) {
++				goto skip_epp;
++			}
+ 
+-		epp = cpu_data->epp_powersave;
+-	}
+-	if (boot_cpu_has(X86_FEATURE_HWP_EPP)) {
+-		value &= ~GENMASK_ULL(31, 24);
+-		value |= (u64)epp << 24;
+-	} else {
+-		intel_pstate_set_epb(cpu, epp);
++			epp = cpu_data->epp_powersave;
++		}
++
++		if (boot_cpu_has(X86_FEATURE_HWP_EPP)) {
++			/* Program EPP in HWP_REQUEST[31:24]. Cast to u8 to avoid sign issues. */
++			value &= ~GENMASK_ULL(31, 24);
++			value |= (u64)(u8)epp << 24;
++		} else {
++			/* No HWP_EPP support: set EPB instead. */
++			intel_pstate_set_epb(cpu, epp);
++		}
+ 	}
++
+ skip_epp:
+-	WRITE_ONCE(cpu_data->hwp_req_cached, value);
+-	wrmsrq_on_cpu(cpu, MSR_HWP_REQUEST, value);
++	/*
++	 * Commit to hardware only if something actually changed. Keep the cache
++	 * authoritative and in sync with the hardware image.
++	 */
++	if (value != prev_value) {
++		wrmsrq_on_cpu(cpu, MSR_HWP_REQUEST, value);
++		cpu_data->hwp_req_cached = value;
++	}
++
++	raw_spin_unlock_irqrestore(&cpu_data->hwp_lock, flags);
+ }
+ 
+ static void intel_pstate_disable_hwp_interrupt(struct cpudata *cpudata);
+@@ -2534,10 +2692,12 @@ static inline void intel_pstate_update_u
+ {
+ 	struct cpudata *cpu = container_of(data, struct cpudata, update_util);
+ 
++	/* Accumulate flags; no atomic needed, per-CPU execution assumed. */
+ 	cpu->sched_flags |= flags;
+ 
+-	if (smp_processor_id() == cpu->cpu)
++	if (likely(smp_processor_id() == cpu->cpu)) {
+ 		intel_pstate_update_util_hwp_local(cpu, time);
++	}
+ }
+ 
+ static inline void intel_pstate_calc_avg_perf(struct cpudata *cpu)
+@@ -2549,43 +2709,61 @@ static inline void intel_pstate_calc_avg
+ 
+ static inline bool intel_pstate_sample(struct cpudata *cpu, u64 time)
+ {
+-	u64 aperf, mperf;
++	u64 aperf, mperf, tsc;
+ 	unsigned long flags;
+-	u64 tsc;
+ 
++	/* Hard guard: never proceed with a NULL cpudata pointer. */
++	if (unlikely(!cpu)) {
++		WARN_ONCE(1, "intel_pstate_sample: NULL cpu pointer\n");
++		return false;
++	}
++
++	/*
++	 * Read APERF/MPERF/TSC with interrupts disabled to avoid torn samples.
++	 * Keep the IRQ-off window short: just the 3 reads.
++	 */
+ 	local_irq_save(flags);
+ 	rdmsrq(MSR_IA32_APERF, aperf);
+ 	rdmsrq(MSR_IA32_MPERF, mperf);
+ 	tsc = rdtsc();
+-	if (cpu->prev_mperf == mperf || cpu->prev_tsc == tsc) {
+-		local_irq_restore(flags);
+-		return false;
+-	}
+ 	local_irq_restore(flags);
+ 
++	/* Advance timestamps for this sampling window. */
+ 	cpu->last_sample_time = cpu->sample.time;
+ 	cpu->sample.time = time;
+-	cpu->sample.aperf = aperf;
+-	cpu->sample.mperf = mperf;
+-	cpu->sample.tsc =  tsc;
+-	cpu->sample.aperf -= cpu->prev_aperf;
+-	cpu->sample.mperf -= cpu->prev_mperf;
+-	cpu->sample.tsc -= cpu->prev_tsc;
+ 
++	/*
++	 * Unsigned subtraction naturally handles 64-bit wraparound for
++	 * APERF/MPERF/TSC. No branches, no special cases needed.
++	 */
++	cpu->sample.aperf = aperf - cpu->prev_aperf;
++	cpu->sample.mperf = mperf - cpu->prev_mperf;
++	cpu->sample.tsc   = tsc   - cpu->prev_tsc;
++
++	/* Publish current readings for the next interval unconditionally. */
+ 	cpu->prev_aperf = aperf;
+ 	cpu->prev_mperf = mperf;
+-	cpu->prev_tsc = tsc;
++	cpu->prev_tsc   = tsc;
++
+ 	/*
+-	 * First time this function is invoked in a given cycle, all of the
+-	 * previous sample data fields are equal to zero or stale and they must
+-	 * be populated with meaningful numbers for things to work, so assume
+-	 * that sample.time will always be reset before setting the utilization
+-	 * update hook and make the caller skip the sample then.
++	 * If either MPERF or TSC did not advance, there is no meaningful
++	 * interval to compute. This also filters out the very first call
++	 * when prev_* are zero on some platforms.
+ 	 */
+-	if (cpu->last_sample_time) {
++	if (unlikely(!cpu->sample.mperf || !cpu->sample.tsc)) {
++		return false;
++	}
++
++	/*
++	 * On the first valid interval after initialization (when
++	 * last_sample_time is zero), we have deltas but no prior averaged
++	 * state to update; skip just once.
++	 */
++	if (likely(cpu->last_sample_time)) {
+ 		intel_pstate_calc_avg_perf(cpu);
+ 		return true;
+ 	}
++
+ 	return false;
+ }
+ 
+@@ -2681,36 +2859,60 @@ static void intel_pstate_update_util(str
+ 	struct cpudata *cpu = container_of(data, struct cpudata, update_util);
+ 	u64 delta_ns;
+ 
+-	/* Don't allow remote callbacks */
+-	if (smp_processor_id() != cpu->cpu)
++	/* Validate that we're running on the correct CPU */
++	if (unlikely(smp_processor_id() != cpu->cpu)) {
++		/* This should never happen but be defensive */
+ 		return;
++	}
+ 
++	/* Calculate time since last update */
+ 	delta_ns = time - cpu->last_update;
+-	if (flags & SCHED_CPUFREQ_IOWAIT) {
+-		/* Start over if the CPU may have been idle. */
++
++	/*
++	 * Optimized IOWAIT boost logic with reduced branching.
++	 * Most common case: no IOWAIT flag set.
++	 */
++	if (likely(!(flags & SCHED_CPUFREQ_IOWAIT))) {
++		/* Decay existing boost if present */
++		if (cpu->iowait_boost) {
++			if (delta_ns > TICK_NSEC) {
++				/* Long idle - clear boost */
++				cpu->iowait_boost = 0;
++			} else {
++				/* Short idle - decay boost */
++				cpu->iowait_boost >>= 1;
++			}
++		}
++	} else {
++		/* IOWAIT flag set - boost frequency */
+ 		if (delta_ns > TICK_NSEC) {
++			/* Long idle followed by IO - start fresh */
+ 			cpu->iowait_boost = ONE_EIGHTH_FP;
+ 		} else if (cpu->iowait_boost >= ONE_EIGHTH_FP) {
++			/* Continue boosting - double with cap at 1.0 */
+ 			cpu->iowait_boost <<= 1;
+-			if (cpu->iowait_boost > int_tofp(1))
++			if (cpu->iowait_boost > int_tofp(1)) {
+ 				cpu->iowait_boost = int_tofp(1);
++			}
+ 		} else {
++			/* Initialize boost */
+ 			cpu->iowait_boost = ONE_EIGHTH_FP;
+ 		}
+-	} else if (cpu->iowait_boost) {
+-		/* Clear iowait_boost if the CPU may have been idle. */
+-		if (delta_ns > TICK_NSEC)
+-			cpu->iowait_boost = 0;
+-		else
+-			cpu->iowait_boost >>= 1;
+ 	}
++
++	/* Update timestamp */
+ 	cpu->last_update = time;
+-	delta_ns = time - cpu->sample.time;
+-	if ((s64)delta_ns < INTEL_PSTATE_SAMPLING_INTERVAL)
+-		return;
+ 
+-	if (intel_pstate_sample(cpu, time))
+-		intel_pstate_adjust_pstate(cpu);
++	/*
++	 * Sample and adjust P-state if enough time has passed.
++	 * Use signed comparison to handle time wraparound correctly.
++	 */
++	delta_ns = time - cpu->sample.time;
++	if ((s64)delta_ns >= INTEL_PSTATE_SAMPLING_INTERVAL) {
++		if (intel_pstate_sample(cpu, time)) {
++			intel_pstate_adjust_pstate(cpu);
++		}
++	}
+ }
+ 
+ static struct pstate_funcs core_funcs = {
+@@ -2895,32 +3097,80 @@ static void intel_pstate_update_perf_lim
+ 	int perf_ctl_scaling = cpu->pstate.perf_ctl_scaling;
+ 	int32_t max_policy_perf, min_policy_perf;
+ 
+-	max_policy_perf = policy_max / perf_ctl_scaling;
++	/* Validate inputs to prevent overflow */
++	if (unlikely(perf_ctl_scaling <= 0)) {
++		pr_err("intel_pstate: invalid perf_ctl_scaling %d for CPU %d\n",
++		       perf_ctl_scaling, cpu->cpu);
++		max_policy_perf = 0;
++		min_policy_perf = 0;
++		goto finalize;
++	}
++
++	if (unlikely(policy_max > INT_MAX || policy_min > INT_MAX)) {
++		pr_err("intel_pstate: policy limits overflow\n");
++		max_policy_perf = 0;
++		min_policy_perf = 0;
++		goto finalize;
++	}
++
++	/*
++	 * Optimization: Use shift for division when scaling is power of 2.
++	 * Common scaling factors:
++	 * - 100000 (not power of 2, use division)
++	 * - 78741 (not power of 2, use division)
++	 * - 65536 (2^16, use shift)
++	 * - 131072 (2^17, use shift)
++	 */
++	if ((perf_ctl_scaling & (perf_ctl_scaling - 1)) == 0) {
++		/* Power of 2 - use shift */
++		int shift = __builtin_ctz(perf_ctl_scaling);
++		max_policy_perf = (int32_t)(policy_max >> shift);
++		min_policy_perf = (int32_t)(policy_min >> shift);
++	} else {
++		/* Not power of 2 - use division */
++		max_policy_perf = (int32_t)div_u64_safe_shift(policy_max,
++							      perf_ctl_scaling);
++		min_policy_perf = (int32_t)div_u64_safe_shift(policy_min,
++							      perf_ctl_scaling);
++	}
++
++	/* Ensure min doesn't exceed max */
+ 	if (policy_max == policy_min) {
+ 		min_policy_perf = max_policy_perf;
+ 	} else {
+-		min_policy_perf = policy_min / perf_ctl_scaling;
+ 		min_policy_perf = clamp_t(int32_t, min_policy_perf,
+ 					  0, max_policy_perf);
+ 	}
+ 
+ 	/*
+-	 * HWP needs some special consideration, because HWP_REQUEST uses
+-	 * abstract values to represent performance rather than pure ratios.
++	 * HWP needs conversion back to HWP scale if different from
++	 * perf_ctl scale.
+ 	 */
+ 	if (hwp_active && cpu->pstate.scaling != perf_ctl_scaling) {
+ 		int freq;
+ 
+-		freq = max_policy_perf * perf_ctl_scaling;
++		/* Prevent overflow in multiplication */
++		if (max_policy_perf > INT_MAX / perf_ctl_scaling) {
++			pr_warn("intel_pstate: frequency overflow prevented\n");
++			freq = INT_MAX;
++		} else {
++			freq = max_policy_perf * perf_ctl_scaling;
++		}
+ 		max_policy_perf = intel_pstate_freq_to_hwp(cpu, freq);
+-		freq = min_policy_perf * perf_ctl_scaling;
++
++		if (min_policy_perf > INT_MAX / perf_ctl_scaling) {
++			freq = INT_MAX;
++		} else {
++			freq = min_policy_perf * perf_ctl_scaling;
++		}
+ 		min_policy_perf = intel_pstate_freq_to_hwp(cpu, freq);
+ 	}
+ 
+ 	pr_debug("cpu:%d min_policy_perf:%d max_policy_perf:%d\n",
+ 		 cpu->cpu, min_policy_perf, max_policy_perf);
+ 
+-	/* Normalize user input to [min_perf, max_perf] */
++finalize:
++	/* Apply limits based on per-CPU or global configuration */
+ 	if (per_cpu_limits) {
+ 		cpu->min_perf_ratio = min_policy_perf;
+ 		cpu->max_perf_ratio = max_policy_perf;
+@@ -2928,7 +3178,7 @@ static void intel_pstate_update_perf_lim
+ 		int turbo_max = cpu->pstate.turbo_pstate;
+ 		int32_t global_min, global_max;
+ 
+-		/* Global limits are in percent of the maximum turbo P-state. */
++		/* Calculate global limits as percentage of turbo */
+ 		global_max = DIV_ROUND_UP(turbo_max * global.max_perf_pct, 100);
+ 		global_min = DIV_ROUND_UP(turbo_max * global.min_perf_pct, 100);
+ 		global_min = clamp_t(int32_t, global_min, 0, global_max);
+@@ -2936,19 +3186,19 @@ static void intel_pstate_update_perf_lim
+ 		pr_debug("cpu:%d global_min:%d global_max:%d\n", cpu->cpu,
+ 			 global_min, global_max);
+ 
++		/* Combine policy and global limits */
+ 		cpu->min_perf_ratio = max(min_policy_perf, global_min);
+ 		cpu->min_perf_ratio = min(cpu->min_perf_ratio, max_policy_perf);
+ 		cpu->max_perf_ratio = min(max_policy_perf, global_max);
+ 		cpu->max_perf_ratio = max(min_policy_perf, cpu->max_perf_ratio);
+ 
+-		/* Make sure min_perf <= max_perf */
++		/* Final sanity check: ensure min <= max */
+ 		cpu->min_perf_ratio = min(cpu->min_perf_ratio,
+ 					  cpu->max_perf_ratio);
+-
+ 	}
++
+ 	pr_debug("cpu:%d max_perf_ratio:%d min_perf_ratio:%d\n", cpu->cpu,
+-		 cpu->max_perf_ratio,
+-		 cpu->min_perf_ratio);
++		 cpu->max_perf_ratio, cpu->min_perf_ratio);
+ }
+ 
+ static int intel_pstate_set_policy(struct cpufreq_policy *policy)
+@@ -3786,25 +4036,46 @@ static const struct x86_cpu_id intel_epp
+ 	 * AlderLake Mobile CPUs.
+ 	 */
+ 	X86_MATCH_VFM(INTEL_ALDERLAKE_L, HWP_SET_DEF_BALANCE_PERF_EPP(102)),
++
+ 	X86_MATCH_VFM(INTEL_SAPPHIRERAPIDS_X, HWP_SET_DEF_BALANCE_PERF_EPP(32)),
+ 	X86_MATCH_VFM(INTEL_EMERALDRAPIDS_X, HWP_SET_DEF_BALANCE_PERF_EPP(32)),
+ 	X86_MATCH_VFM(INTEL_GRANITERAPIDS_X, HWP_SET_DEF_BALANCE_PERF_EPP(32)),
+ 	X86_MATCH_VFM(INTEL_GRANITERAPIDS_D, HWP_SET_DEF_BALANCE_PERF_EPP(32)),
++
++	/* Platform guidance: balanced gaming/desktop tuning. */
+ 	X86_MATCH_VFM(INTEL_METEORLAKE_L, HWP_SET_EPP_VALUES(HWP_EPP_POWERSAVE,
+ 		      179, 64, 16)),
+ 	X86_MATCH_VFM(INTEL_ARROWLAKE, HWP_SET_EPP_VALUES(HWP_EPP_POWERSAVE,
+ 		      179, 64, 16)),
++
++	/* New: Raptor Lake defaults tuned for gaming responsiveness. */
++	X86_MATCH_VFM(INTEL_RAPTORLAKE,   HWP_SET_EPP_VALUES(HWP_EPP_POWERSAVE, 179, 64, 0)),
++	X86_MATCH_VFM(INTEL_RAPTORLAKE_P, HWP_SET_EPP_VALUES(HWP_EPP_POWERSAVE, 179, 64, 0)),
++	X86_MATCH_VFM(INTEL_RAPTORLAKE_S, HWP_SET_EPP_VALUES(HWP_EPP_POWERSAVE, 179, 64, 0)),
++
+ 	{}
+ };
+ 
+ static const struct x86_cpu_id intel_hybrid_scaling_factor[] = {
+-	X86_MATCH_VFM(INTEL_ALDERLAKE, HYBRID_SCALING_FACTOR_ADL),
+-	X86_MATCH_VFM(INTEL_ALDERLAKE_L, HYBRID_SCALING_FACTOR_ADL),
+-	X86_MATCH_VFM(INTEL_RAPTORLAKE, HYBRID_SCALING_FACTOR_ADL),
+-	X86_MATCH_VFM(INTEL_RAPTORLAKE_P, HYBRID_SCALING_FACTOR_ADL),
+-	X86_MATCH_VFM(INTEL_RAPTORLAKE_S, HYBRID_SCALING_FACTOR_ADL),
+-	X86_MATCH_VFM(INTEL_METEORLAKE_L, HYBRID_SCALING_FACTOR_MTL),
+-	X86_MATCH_VFM(INTEL_LUNARLAKE_M, HYBRID_SCALING_FACTOR_LNL),
++	X86_MATCH_VFM(INTEL_ALDERLAKE,     HYBRID_SCALING_FACTOR_ADL), /* 78741 */
++	X86_MATCH_VFM(INTEL_ALDERLAKE_L,   HYBRID_SCALING_FACTOR_ADL),
++
++	/* Raptor Lake: use 80000 for improved perf-to-frequency mapping. */
++	X86_MATCH_VFM(INTEL_RAPTORLAKE,    HYBRID_SCALING_FACTOR_MTL), /* 80000 */
++	X86_MATCH_VFM(INTEL_RAPTORLAKE_P,  HYBRID_SCALING_FACTOR_MTL),
++	X86_MATCH_VFM(INTEL_RAPTORLAKE_S,  HYBRID_SCALING_FACTOR_MTL),
++
++	X86_MATCH_VFM(INTEL_METEORLAKE_L,  HYBRID_SCALING_FACTOR_MTL), /* 80000 */
++	X86_MATCH_VFM(INTEL_LUNARLAKE_M,   HYBRID_SCALING_FACTOR_LNL), /* 86957 */
++
++	{}
++};
++
++/* Raptor Lake family match for minor tuning at init time. */
++static const struct x86_cpu_id raptorlake_ids[] __initconst = {
++	X86_MATCH_VFM(INTEL_RAPTORLAKE,   1),
++	X86_MATCH_VFM(INTEL_RAPTORLAKE_P, 1),
++	X86_MATCH_VFM(INTEL_RAPTORLAKE_S, 1),
+ 	{}
+ };
+ 
+@@ -3921,6 +4192,12 @@ hwp_cpu_matched:
+ 			pr_debug("hybrid scaling factor: %d\n", hybrid_scaling_factor);
+ 		}
+ 
++		/* Raptor Lake gaming-friendly iowait boost hold time. */
++		if (x86_match_cpu(raptorlake_ids)) {
++			hwp_boost_hold_time_ns = 5 * NSEC_PER_MSEC;
++			pr_debug("Raptor Lake: set HWP boost hold time to %d ns\n",
++				 hwp_boost_hold_time_ns);
++		}
+ 	}
+ 
+ 	mutex_lock(&intel_pstate_driver_lock);
+
 --- a/kernel/irq/proc.c	2025-08-15 16:39:37.000000000 +0200
 +++ b/kernel/irq/proc.c	2025-08-17 18:15:09.256757473 +0200
 @@ -45,55 +45,71 @@ enum {
