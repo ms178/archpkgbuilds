@@ -1486,7 +1486,6 @@ static void intel_pstate_hwp_set(unsigned int cpu)
 
 	raw_spin_lock_irqsave(&cpu_data->hwp_lock, flags);
 
-	/* Initialize cache from hardware only if safe; otherwise proceed from current image. */
 	if (unlikely(!cpu_data->hwp_cache_valid)) {
 		u64 hwv;
 		if (!rdmsrq_on_cpu_if_safe(cpu, MSR_HWP_REQUEST, &hwv)) {
@@ -1498,19 +1497,21 @@ static void intel_pstate_hwp_set(unsigned int cpu)
 	value = cpu_data->hwp_req_cached;
 	prev_value = value;
 
-	/* Update HWP min/max perf fields using 64-bit masks. */
-	value &= ~HWP_MIN_PERF(~0ULL);
-	value |= HWP_MIN_PERF((u64)min);
+	/* Update min/max only if changed. */
+	if (((value & HWP_MIN_PERF(~0ULL)) != HWP_MIN_PERF((u64)min))) {
+		value &= ~HWP_MIN_PERF(~0ULL);
+		value |= HWP_MIN_PERF((u64)min);
+	}
+	if (((value & HWP_MAX_PERF(~0ULL)) != HWP_MAX_PERF((u64)max))) {
+		value &= ~HWP_MAX_PERF(~0ULL);
+		value |= HWP_MAX_PERF((u64)max);
+	}
 
-	value &= ~HWP_MAX_PERF(~0ULL);
-	value |= HWP_MAX_PERF((u64)max);
-
-	/* EPP changes only when policy flips; preserve user overrides. */
+	/* EPP changes only on policy flips; preserve user overrides. */
 	if (cpu_data->epp_policy != cpu_data->policy) {
 		cpu_data->epp_policy = cpu_data->policy;
 
 		if (cpu_data->policy == CPUFREQ_POLICY_PERFORMANCE) {
-			/* Save current powersave EPP, then force EPP=0. */
 			epp = intel_pstate_get_epp(cpu_data, value);
 			cpu_data->epp_powersave = epp;
 			if (epp >= 0)
@@ -1518,7 +1519,6 @@ static void intel_pstate_hwp_set(unsigned int cpu)
 			else
 				goto skip_epp;
 		} else {
-			/* Restore saved EPP if valid and current is zero (forced previously). */
 			if (cpu_data->epp_powersave < 0)
 				goto skip_epp;
 
@@ -1533,7 +1533,6 @@ static void intel_pstate_hwp_set(unsigned int cpu)
 			value &= ~GENMASK_ULL(31, 24);
 			value |= (u64)(u8)epp << 24;
 		} else {
-			/* EPB path: independent of HWP_REQUEST cache. */
 			intel_pstate_set_epb(cpu, epp);
 		}
 	}
@@ -1548,7 +1547,6 @@ skip_epp:
 
 	raw_spin_unlock_irqrestore(&cpu_data->hwp_lock, flags);
 
-	/* Remote write only if cache wasn't superseded by another writer. */
 	if (do_write && READ_ONCE(cpu_data->hwp_req_cached) == write_val)
 		(void)wrmsrq_on_cpu_if_safe(cpu, MSR_HWP_REQUEST, write_val);
 }
@@ -3556,14 +3554,19 @@ static void intel_cpufreq_hwp_update(struct cpudata *cpu, u32 min, u32 max,
 	prev = cpu->hwp_req_cached;
 	value = prev;
 
-	value &= ~HWP_MIN_PERF(~0ULL);
-	value |= HWP_MIN_PERF((u64)min);
-
-	value &= ~HWP_MAX_PERF(~0ULL);
-	value |= HWP_MAX_PERF((u64)max);
-
-	value &= ~HWP_DESIRED_PERF(~0ULL);
-	value |= HWP_DESIRED_PERF((u64)desired);
+	/* Only modify fields that actually change; avoids meaningless toggles. */
+	if (((prev & HWP_MIN_PERF(~0ULL)) != HWP_MIN_PERF((u64)min))) {
+		value &= ~HWP_MIN_PERF(~0ULL);
+		value |= HWP_MIN_PERF((u64)min);
+	}
+	if (((prev & HWP_MAX_PERF(~0ULL)) != HWP_MAX_PERF((u64)max))) {
+		value &= ~HWP_MAX_PERF(~0ULL);
+		value |= HWP_MAX_PERF((u64)max);
+	}
+	if (((prev & HWP_DESIRED_PERF(~0ULL)) != HWP_DESIRED_PERF((u64)desired))) {
+		value &= ~HWP_DESIRED_PERF(~0ULL);
+		value |= HWP_DESIRED_PERF((u64)desired);
+	}
 
 	if (value != prev) {
 		cpu->hwp_req_cached = value;
@@ -3573,6 +3576,7 @@ static void intel_cpufreq_hwp_update(struct cpudata *cpu, u32 min, u32 max,
 
 	raw_spin_unlock_irqrestore(&cpu->hwp_lock, flags);
 
+	/* Local write for fast-switch or same-CPU; else safe remote write. */
 	if (do_write && READ_ONCE(cpu->hwp_req_cached) == write_val) {
 		if (fast_switch || cpu->cpu == smp_processor_id())
 			wrmsrq(MSR_HWP_REQUEST, write_val);
