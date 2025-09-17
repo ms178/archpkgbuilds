@@ -1681,7 +1681,7 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          while (instr->operands.size() > ops.size())
             instr->operands.pop_back();
 
-         if (ops.size() == 1) {
+         if (ops.size() == 1 && !ops[0].isUndefined()) {
             instr->opcode = aco_opcode::p_parallelcopy;
             if (ops[0].isTemp())
                ctx.info[instr->definitions[0].tempId()].set_temp(ops[0].getTemp());
@@ -3876,6 +3876,30 @@ combine_vop3p(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 
    VALU_instruction* vop3p = &instr->valu();
 
+   /* New optimization from patch: Propagate clamp through a multiply-by-zero FMA */
+   if (instr->opcode == aco_opcode::v_pk_fma_f16 && vop3p->clamp &&
+       instr->operands[2].isConstant() && instr->operands[2].constantValue() == 0 &&
+       !vop3p->opsel_lo[1] && !vop3p->opsel_hi[1]) {
+
+      Instruction* op_instr = ctx.info[instr->operands[0].tempId()].parent_instr;
+      const aco_alu_opcode_info& opcode_info = instr_info.alu_opcode_infos[(int)op_instr->opcode];
+      aco_type op_type = opcode_info.def_types[0];
+      if (op_instr->isVOP3P() && op_type.num_components == 2 &&
+          op_type.base_type == aco_base_type_float && op_type.bit_size == 16 &&
+          opcode_info.output_modifiers) {
+         op_instr->valu().clamp = true;
+         propagate_swizzles(&op_instr->valu(), vop3p->opsel_lo[0], vop3p->opsel_hi[0]);
+         instr->definitions[0].swapTemp(op_instr->definitions[0]);
+         ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
+         ctx.info[op_instr->definitions[0].tempId()].parent_instr = op_instr;
+         ctx.uses[op_instr->definitions[0].tempId()]++;
+         instr.reset(create_instruction(aco_opcode::p_parallelcopy, Format::PSEUDO, 1, 1));
+         instr->operands[0] = Operand(op_instr->definitions[0].getTemp());
+         instr->definitions[0].setTemp(op_instr->definitions[0].getTemp());
+         return;
+      }
+   }
+
    /*
     * === Pass 1: Clamp Propagation ===
     * Folds `clamp(mul(X, 1.0))` into `clamp(X)`. The mul by 1.0 becomes a p_parallelcopy.
@@ -3959,26 +3983,29 @@ combine_vop3p(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 
    Instruction* mul_instr = nullptr;
    unsigned add_op_idx = 0;
+   uint32_t uses = UINT32_MAX;
 
    for (unsigned i = 0; i < 2; i++) {
-      if (!instr->operands[i].isTemp() || ctx.uses[instr->operands[i].tempId()] != 1) {
+      Instruction* op_instr = follow_operand(ctx, instr->operands[i]);
+      if (!op_instr ||
+          (is_fadd && op_instr->opcode != aco_opcode::v_pk_mul_f16) ||
+          (is_uadd && op_instr->opcode != aco_opcode::v_pk_mul_lo_u16))
          continue;
-      }
 
-      Instruction* candidate = follow_operand(ctx, instr->operands[i], true);
-      if (!candidate || !candidate->isVOP3P() || candidate->valu().clamp || (is_fadd && candidate->valu().omod)) {
+      /* no clamp allowed between mul and add - check moved earlier from patch */
+      if (op_instr->valu().clamp)
          continue;
-      }
 
-      bool mul_ok = (is_fadd && candidate->opcode == aco_opcode::v_pk_mul_f16 && !candidate->definitions[0].isPrecise()) ||
-                    (is_uadd && candidate->opcode == aco_opcode::v_pk_mul_lo_u16);
-      if (!mul_ok) {
+      if (is_fadd && op_instr->valu().omod)
          continue;
-      }
 
-      mul_instr = candidate;
+      Operand op[3] = {op_instr->operands[0], op_instr->operands[1], instr->operands[1 - i]};
+      if (ctx.uses[instr->operands[i].tempId()] >= uses || !check_vop3_operands(ctx, 3, op))
+         continue;
+
+      mul_instr = op_instr;
       add_op_idx = 1 - i;
-      break;
+      uses = ctx.uses[instr->operands[i].tempId()];
    }
 
    if (!mul_instr) {
@@ -4021,7 +4048,6 @@ combine_vop3p(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 
    /*
     * === Pass 4: FMA to DOT2 Fusion (Vega Performance Win) ===
-    * Fuses `v_pk_fma_f16(A, B, 0)` into `v_dot2_f32_f16(A, B, 0)`.
     */
    if (ctx.program->gfx_level == GFX9 && instr->opcode == aco_opcode::v_pk_fma_f16 &&
        instr->operands[2].isConstant() && instr->operands[2].constantValue() == 0 &&
@@ -4438,7 +4464,8 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
                         (mad32 && !legacy && !mad_mix && ctx.program->dev.has_fast_fma32) ||
                         (mad_mix && ctx.program->dev.fused_mad_mix);
          bool has_mad = mad_mix ? !ctx.program->dev.fused_mad_mix
-                                : ((mad32 && ctx.program->gfx_level < GFX10_3) ||
+                                : ((mad32 && ctx.program->gfx_level < GFX10_3 &&
+                                     ctx.program->family != CHIP_GFX940) ||
                                    (mad16 && ctx.program->gfx_level <= GFX9));
          bool can_use_fma = has_fma && (!(info.parent_instr->definitions[0].isPrecise() ||
                                           instr->definitions[0].isPrecise()) ||
