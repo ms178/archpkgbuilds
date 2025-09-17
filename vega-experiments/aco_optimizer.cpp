@@ -4844,8 +4844,9 @@ rematerialize_constants(opt_ctx& ctx)
       }
    }
 
-   /* For Vega, be more aggressive if VGPR pressure is high. */
-   constexpr unsigned vgpr_threshold = 64;
+   /* For Vega, be more aggressive if VGPR pressure is high.
+    * Use int16_t to match the type of max_reg_demand.vgpr */
+   constexpr int16_t vgpr_threshold = 64;
 
    for (Block& block : ctx.program->blocks) {
       if (block.logical_idom == -1)
@@ -4856,10 +4857,13 @@ rematerialize_constants(opt_ctx& ctx)
 
       ctx.instructions.reserve(block.instructions.size());
 
+      /* Ensure VGPR demand is non-negative before comparison (defensive programming) */
+      const int16_t vgpr_demand = std::max<int16_t>(0, ctx.program->max_reg_demand.vgpr);
+
       unsigned dynamic_threshold =
-         (ctx.program->gfx_level == GFX9 && ctx.program->max_reg_demand.vgpr > vgpr_threshold) ? 2u : 1u;
+         (ctx.program->gfx_level == GFX9 && vgpr_demand > vgpr_threshold) ? 2u : 1u;
       bool remat_enabled =
-         (ctx.program->max_reg_demand.vgpr < vgpr_threshold) || (constants.size() > dynamic_threshold);
+         (vgpr_demand < vgpr_threshold) || (constants.size() > dynamic_threshold);
 
       for (aco_ptr<Instruction>& instr : block.instructions) {
          if (!instr)
