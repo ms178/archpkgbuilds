@@ -48,10 +48,12 @@ with_mesa_debug = get_option('buildtype') == 'debug'
 with_mesa_ndebug = get_option('b_ndebug') == 'true' or (get_option('buildtype') == 'release' and get_option('b_ndebug') == 'if-release')
 
 # We need to set -fmacro-prefix-map properly for driver CL reproducability.
-relative_dir = fs.relative_to(meson.global_source_root(), meson.global_build_root())
+relative_dir = fs.relative_to(meson.project_source_root(), meson.project_build_root())
 
 cl_args = [
   '-fmacro-prefix-map=@0@/='.format(relative_dir),
+  '-fmacro-prefix-map=@0@/='.format(meson.project_source_root()),
+  '-fmacro-prefix-map=@0@/='.format(meson.project_build_root()),
 
   # Set the OpenCL standard to CL 2.0, enabling everything at a frontend.
   # Drivers may not actually support everything but that's ok.
@@ -112,6 +114,7 @@ if with_tools.contains('all')
     'nir',
     'nouveau',
     'panfrost',
+    'zink',
   ]
 endif
 
@@ -339,11 +342,9 @@ with_any_broadcom = [
   with_broadcom_vk,
 ].contains(true)
 
-intel_vk_can_rt = host_machine.cpu_family() == 'x86_64' or \
-                  host_machine.cpu_family() == 'aarch64'
 with_intel_vk_rt = get_option('intel-rt') \
    .disable_auto_if(not with_intel_vk) \
-   .disable_if(not intel_vk_can_rt, \
+   .disable_if(sizeof_pointer != '8', \
                error_message: 'Intel Ray Tracing requires 64-bit architectures') \
   .allowed()
 
@@ -634,50 +635,32 @@ if with_gallium_d3d12 and not _with_gallium_d3d12_video.disabled()
   pre_args += '-DHAVE_GALLIUM_D3D12_VIDEO'
 endif
 
-_vdpau_drivers = [
-  with_gallium_d3d12_video,
-  with_gallium_nouveau,
-  with_gallium_r600,
-  with_gallium_radeonsi,
-  with_gallium_virgl,
-]
-
-vdpau = get_option('gallium-vdpau') \
-  .require(system_has_kms_drm, error_message : 'VDPAU state tracker can only be build on unix-like OSes.') \
-  .require(with_platform_x11, error_message : 'VDPAU state tracker requires X11 support.') \
-  .require(_vdpau_drivers.contains(true), error_message : 'VDPAU state tracker requires at least one of the following gallium drivers: r600, radeonsi, nouveau, d3d12 (with option gallium-d3d12-video, virgl).')
-
-dep_vdpau = dependency('vdpau', version : '>= 1.5', required : vdpau)
-if dep_vdpau.found()
-  dep_vdpau = dep_vdpau.partial_dependency(compile_args : true)
-  pre_args += '-DHAVE_ST_VDPAU'
-endif
-with_gallium_vdpau = dep_vdpau.found()
-
-vdpau_drivers_path = get_option('vdpau-libs-path')
-if vdpau_drivers_path == ''
-  vdpau_drivers_path = join_paths(get_option('libdir'), 'vdpau')
-endif
+with_bvh = with_amd_vk or with_intel_vk or with_swrast_vk or with_freedreno_vk
+_glslang_preamble_version = '12.2'
 
 # GLSL has interesting version output and Meson doesn't parse it correctly as of
 # Meson 1.4.0
 prog_glslang = find_program(
   'glslangValidator',
   native : true,
-  required: with_vulkan_overlay_layer or with_aco_tests or with_amd_vk or with_intel_vk or with_swrast_vk or with_freedreno_vk
+  required : with_vulkan_overlay_layer or with_aco_tests or with_bvh
 )
 
 if prog_glslang.found()
+  _glslang_version = run_command(prog_glslang, ['--version'], check : false).stdout().split(':')[2]
   # Check if glslang has depfile support. Support was added in 11.3.0, but
   # Windows path support was broken until 11.9.0.
   #
   # It is intentional to check the build machine, since we need to ensure that
   # glslang will output valid paths on the build platform
   _glslang_check = build_machine.system() == 'windows' ? '>= 11.9.0' : '>= 11.3.0'
-  if run_command(prog_glslang, ['--version'], check : false).stdout().split(':')[2].version_compare(_glslang_check)
+  if _glslang_version.version_compare(_glslang_check)
     glslang_depfile = ['--depfile', '@DEPFILE@']
   else
     glslang_depfile = []
+  endif
+  if with_bvh and _glslang_version.version_compare('< ' + _glslang_preamble_version)
+    error('glslang >= ' + _glslang_preamble_version + ' is required.')
   endif
   if run_command(prog_glslang, [ '--quiet', '--version' ], check : false).returncode() == 0
     glslang_quiet = ['--quiet']
@@ -845,7 +828,7 @@ with_driver_using_cl = [
   with_gallium_iris, with_intel_vk,
   with_gallium_asahi, with_asahi_vk,
   with_gallium_panfrost, with_panfrost_vk,
-  with_nouveau_vk,
+  with_nouveau_vk, with_imagination_vk,
 ].contains(true)
 
 if get_option('mesa-clc') == 'system'
@@ -911,10 +894,6 @@ with_libbacktrace = get_option('android-libbacktrace') \
   .disable_auto_if(not with_platform_android) \
   .allowed()
 
-if with_libbacktrace
-  cpp_args += '-DWITH_LIBBACKTRACE'
-endif
-
 if with_platform_android
   dep_android_ui = null_dep
   dep_android_mapper4 = null_dep
@@ -925,7 +904,8 @@ if with_platform_android
       dependency('log'),
       dependency('sync'),
     ]
-    if with_libbacktrace
+    if with_libbacktrace and get_option('platform-sdk-version') < 34
+      cpp_args += '-DWITH_LIBBACKTRACE'
       dep_android += dependency('backtrace')
     endif
     if get_option('platform-sdk-version') >= 26
@@ -1054,6 +1034,22 @@ endforeach
 if cc.has_function_attribute('visibility:hidden')
   pre_args += '-DHAVE_FUNC_ATTRIBUTE_VISIBILITY'
 endif
+
+_no_sanitize_flags = []
+if get_option('b_sanitize').split(',').contains('address')
+  _no_sanitize_flags += ['address']
+endif
+if get_option('b_sanitize').split(',').contains('undefined')
+  _no_sanitize_flags += ['vptr']
+endif
+foreach flag: _no_sanitize_flags
+  if cc.compiles('__attribute__((no_sanitize("@0@"))) int foo(void) { return 0; }'.format(flag),
+                 name : 'no_sanitize(@0@)'.format(flag),
+                 werror: true)
+    pre_args += '-DHAVE_FUNC_ATTRIBUTE_NO_SANITIZE_@0@'.format(flag.to_upper())
+  endif
+endforeach
+
 if cc.compiles('__uint128_t foo(void) { return 0; }',
                name : '__uint128_t')
   pre_args += '-DHAVE_UINT128'
@@ -1073,13 +1069,13 @@ elif host_machine.system() == 'sunos'
   pre_args += '-D__EXTENSIONS__'
 elif host_machine.system() == 'windows'
   pre_args += [
-    '-D_WINDOWS', '-D_WIN32_WINNT=0x0A00', '-DWINVER=0x0A00',
-    '-DPIPE_SUBSYSTEM_WINDOWS_USER',
-    '-D_USE_MATH_DEFINES',  # XXX: scons didn't use this for mingw
+    '-D_WIN32_WINNT=0x0A00',
+    '-DWINVER=0x0A00',
   ]
   if cc.get_argument_syntax() == 'msvc'
     pre_args += [
-      '-DVC_EXTRALEAN',
+      '-D_USE_MATH_DEFINES',
+      '-D_CRT_NONSTDC_NO_DEPRECATE',
       '-D_CRT_SECURE_NO_WARNINGS',
       '-D_CRT_SECURE_NO_DEPRECATE',
       '-D_SCL_SECURE_NO_WARNINGS',
@@ -1122,7 +1118,6 @@ if cc.get_argument_syntax() == 'msvc'
     '/wd4351',  # new behavior: elements of array 'array' will be default initialized
     '/wd4756',  # overflow in constant arithmetic
     '/wd4800',  # forcing value to bool 'true' or 'false' (performance warning)
-    '/wd4996',  # disabled deprecated POSIX name warnings
     '/wd4291',  # no matching operator delete found
     '/wd4146',  # unary minus operator applied to unsigned type, result still unsigned
     '/wd4200',  # nonstandard extension used: zero-sized array in struct/union
@@ -1148,6 +1143,7 @@ else
     '-Werror=int-conversion',
     '-Wimplicit-fallthrough',
     '-Wmisleading-indentation',
+    '-Wno-error=maybe-uninitialized',
     '-Wno-missing-field-initializers',
     '-Wno-format-truncation',
     '-Wno-nonnull-compare',
@@ -1164,6 +1160,7 @@ else
     '-Werror=return-type',
     '-Werror=empty-body',
     '-Wmisleading-indentation',
+    '-Wno-error=maybe-uninitialized',
     '-Wno-non-virtual-dtor',
     '-Wno-missing-field-initializers',
     '-Wno-format-truncation',
@@ -1509,7 +1506,7 @@ if cc.links('int main() { return 0; }', args : '-Wl,-Bsymbolic', name : 'Bsymbol
   ld_args_bsymbolic += '-Wl,-Bsymbolic'
 endif
 with_ld_version_script = false
-if cc.links('int main() { return 0; }',
+if host_machine.system() != 'windows' and cc.links('int main() { return 0; }',
             args : '-Wl,--version-script=@0@'.format(
               join_paths(meson.current_source_dir(), 'build-support/conftest.map')),
             name : 'version-script')
@@ -1566,7 +1563,6 @@ if host_machine.system() == 'windows' or with_platform_android
   dep_display_info = null_dep
 else
   dep_display_info = dependency('libdisplay-info', version : '>= 0.1.1',
-                                fallback : ['libdisplay-info', 'di_dep'],
                                 required : get_option('display-info'))
   if dep_display_info.found()
     pre_args += '-DHAVE_LIBDISPLAY_INFO'
@@ -1685,20 +1681,6 @@ endif
 
 allow_fallback_for_libdrm = get_option('allow-fallback-for').contains('libdrm')
 
-# Then get each libdrm module
-foreach d : _libdrm_checks
-  if d[1]
-    set_variable(
-      'dep_libdrm_' + d[0],
-      dependency(
-        'libdrm_' + d[0],
-        version : '>=' + _drm_ver,
-        allow_fallback: allow_fallback_for_libdrm,
-      )
-    )
-  endif
-endforeach
-
 with_gallium_drisw_kms = false
 if system_has_kms_drm
   dep_libdrm = dependency(
@@ -1717,6 +1699,20 @@ if dep_libdrm.found()
     with_gallium_drisw_kms = true
   endif
 endif
+
+# Then get each libdrm module
+foreach d : _libdrm_checks
+  if d[1]
+    set_variable(
+      'dep_libdrm_' + d[0],
+      dependency(
+        'libdrm_' + d[0],
+        version : '>=' + _drm_ver,
+        allow_fallback: allow_fallback_for_libdrm,
+      )
+    )
+  endif
+endforeach
 
 dep_libudev = dependency('libudev', required : false)
 if dep_libudev.found()
@@ -1765,6 +1761,7 @@ _shared_llvm = get_option('shared-llvm') \
 
 dep_llvm = dependency(
   'llvm',
+  method : host_machine.system() == 'windows' ? 'auto' : 'config-tool',
   version : _llvm_version,
   modules : llvm_modules,
   optional_modules : llvm_optional_modules,
@@ -1921,7 +1918,7 @@ endif
 # AddressSanitizer's leak reports need all the symbols to be present at exit to
 # decode well, which runs afoul of our dlopen()/dlclose()ing of the DRI drivers.
 # Set a flag so we can skip the dlclose for asan builds.
-if ['address', 'address,undefined'].contains(get_option('b_sanitize'))
+if get_option('b_sanitize').split(',').contains('address')
   asan_c_args = ['-DBUILT_WITH_ASAN=1']
 else
   asan_c_args = ['-DBUILT_WITH_ASAN=0']
@@ -2085,8 +2082,7 @@ if with_platform_x11
     # needed for GL sharing extension
     dep_x11 = dependency('x11', version : dep_xlib_version)
   endif
-  if (with_any_vk or with_glx == 'dri' or with_egl or
-       (with_gallium_vdpau or with_gallium_va))
+  if (with_any_vk or with_glx == 'dri' or with_egl or with_gallium_va)
     dep_xcb = dependency('xcb')
     dep_xcb_keysyms = dependency('xcb-keysyms', required : false)
     with_xcb_keysyms = dep_xcb_keysyms.found()
@@ -2123,7 +2119,7 @@ if with_platform_x11
   if (with_egl or
       with_dri or
       with_any_vk or
-      with_gallium_vdpau)
+      with_any_vk)
     dep_xcb_xfixes = dependency('xcb-xfixes')
   endif
   if with_any_vk
@@ -2186,7 +2182,6 @@ endif
 
 with_teflon = get_option('teflon')
 if with_teflon and with_tests
-  dep_xtensor = dependency('xtensor')
   dep_flatbuffers = dependency('flatbuffers')
   prog_flatc = find_program('flatc')
 endif
@@ -2246,11 +2241,18 @@ endif
 
 pkg = import('pkgconfig')
 
-if host_machine.system() == 'windows'
+if host_machine.system() == 'windows' and cc.get_argument_syntax() == 'msvc'
   prog_dumpbin = find_program('dumpbin', required : false)
   with_symbols_check = prog_dumpbin.found() and with_tests
   if with_symbols_check
     symbols_check_args = ['--dumpbin', prog_dumpbin.full_path()]
+  endif
+elif host_machine.system() == 'windows' and cc.get_argument_syntax() != 'msvc'
+  # mingw
+  prog_gendef = find_program('gendef', required : false)
+  with_symbols_check = prog_gendef.found() and with_tests
+  if with_symbols_check
+    symbols_check_args = ['--gendef', prog_gendef.full_path()]
   endif
 else
   prog_nm = find_program('nm')
@@ -2358,9 +2360,6 @@ summary(vulkan_summary, section: 'Vulkan', bool_yn: true, list_sep: ' ')
 
 video_summary = {'Codecs': _codecs.length() != 0 ? _codecs : false}
 video_apis = []
-if with_gallium_vdpau
-  video_apis += 'vdpau'
-endif
 if with_gallium_va
   video_apis += 'va'
 endif
@@ -2385,9 +2384,6 @@ if with_gallium
   gallium_summary += {'Platforms': _platforms}
 
   gallium_frontends = ['mesa']
-  if with_gallium_vdpau
-    gallium_frontends += 'vdpau'
-  endif
   if with_gallium_va
     gallium_frontends += 'va'
   endif

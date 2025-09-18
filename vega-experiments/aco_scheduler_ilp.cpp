@@ -10,23 +10,15 @@
 #include "util/macros.h"
 
 #include <limits>
-
-/*
- * This pass implements a simple forward list-scheduler which works on a small
- * partial DAG of 16 nodes at any time. Only ALU instructions are scheduled
- * entirely freely. Memory load instructions must be kept in-order and any other
- * instruction must not be re-scheduled at all.
- *
- * The main goal of this scheduler is to create more memory clauses, schedule
- * memory loads early, and to improve ALU instruction level parallelism.
- */
+#include <algorithm>
+#include <cassert>
 
 namespace aco {
 namespace {
 
 constexpr unsigned num_nodes = 16;
 using mask_t = uint16_t;
-static_assert(std::numeric_limits<mask_t>::digits >= num_nodes);
+static_assert(std::numeric_limits<mask_t>::digits >= num_nodes, "mask_t too small for DAG nodes");
 
 struct VOPDInfo {
    VOPDInfo() : can_be_opx(0), is_dst_odd(0), src_banks(0), has_literal(0), is_commutative(0) {}
@@ -41,15 +33,15 @@ struct VOPDInfo {
 };
 
 struct InstrInfo {
-   Instruction* instr;
-   int16_t wait_cycles;          /* estimated remaining cycles until instruction can be issued. */
-   mask_t dependency_mask;       /* bitmask of nodes which have to be scheduled before this node. */
-   mask_t write_for_read_mask;   /* bitmask of nodes in the DAG that have a RaW dependency. */
-   uint8_t next_non_reorderable; /* index of next non-reorderable instruction node after this one. */
+   Instruction* instr = nullptr;
+   int16_t wait_cycles = 0;         /* estimated remaining cycles until instruction can be issued. */
+   mask_t dependency_mask = 0;      /* bitmask of nodes which have to be scheduled before this node. */
+   mask_t write_for_read_mask = 0;  /* bitmask of nodes in the DAG that have a RaW dependency. */
+   uint8_t next_non_reorderable = UINT8_MAX; /* index of next non-reorderable instruction node after this one. */
 };
 
 struct RegisterInfo {
-   mask_t read_mask; /* bitmask of nodes which have to be scheduled before the next write. */
+   mask_t read_mask = 0; /* bitmask of nodes which have to be scheduled before the next write. */
    uint16_t latency : 11; /* estimated outstanding latency of last register write outside the DAG. */
    uint16_t direct_dependency : 4;     /* node that has to be scheduled before any other access. */
    uint16_t has_direct_dependency : 1; /* whether there is an unscheduled direct dependency. */
@@ -59,14 +51,14 @@ struct SchedILPContext {
    Program* program;
    bool is_vopd = false;
    InstrInfo nodes[num_nodes];
-   RegisterInfo regs[512];
+   RegisterInfo regs[512] = {};
    BITSET_DECLARE(reg_has_latency, 512) = { 0 };
    mask_t non_reorder_mask = 0; /* bitmask of instruction nodes which should not be reordered. */
    mask_t active_mask = 0;      /* bitmask of valid instruction nodes. */
    uint8_t next_non_reorderable = UINT8_MAX; /* index of next node which should not be reordered. */
    uint8_t last_non_reorderable = UINT8_MAX; /* index of last node which should not be reordered. */
-   bool potential_partial_clause; /* indicates that last_non_reorderable is the last instruction in
-                                     the DAG, meaning the clause might continue outside of it. */
+   bool potential_partial_clause = false; /* indicates that last_non_reorderable is the last instruction in
+                                             the DAG, meaning the clause might continue outside of it. */
 
    /* VOPD scheduler: */
    VOPDInfo vopd[num_nodes];
@@ -355,72 +347,37 @@ can_use_vopd(const SchedILPContext& ctx, unsigned idx)
    return compat;
 }
 
-static inline unsigned
-ctz32(mask_t v) noexcept
-{
-      return static_cast<unsigned>(__builtin_ctz(static_cast<unsigned>(v)));
-}
-
 Instruction_cycle_info
-get_cycle_info_with_mem_latency(const SchedILPContext& ctx,
-                                const Instruction* const instr)
+get_cycle_info_with_mem_latency(const SchedILPContext& ctx, const Instruction* const instr)
 {
-      /* Start with the architecture-agnostic pipe information. */
-      Instruction_cycle_info cycle_info = get_cycle_info(*ctx.program, *instr);
+   Instruction_cycle_info cycle_info = get_cycle_info(*ctx.program, *instr);
 
-      const amd_gfx_level gfx = ctx.program->gfx_level;
+   /* Based on get_wait_counter_info in aco_statistics.cpp; tuned for GFX9 as a slight bias. */
+   const bool is_gfx9 = ctx.program->gfx_level == GFX9;
 
-      /* ------------------------------------------------------------------ *
-       * Dedicated latency table for GFX9 (Vega)                            *
-       * ------------------------------------------------------------------ */
-      if (gfx == GFX9) {
-            if (instr->isVMEM() || instr->isFlatLike()) {
-                  cycle_info.latency = 140;                       /* L2 hit          */
-            } else if (instr->isSMEM()) {
-                  if (instr->operands.empty()) {
-                        cycle_info.latency = 1;                      /* s_load_*_imm    */
-                  } else if (instr->operands[0].size() == 2) {    /* 64-bit address  */
-                        cycle_info.latency = 18;                     /* cached constant */
-                  } else {
-                        /* “Likely cached” heuristic – protect every index access. */
-                        const bool cached_const =
-                        instr->operands.size() >= 2 && instr->operands[1].isConstant() &&
-                        (instr->operands.size() < 3 ||
-                        (instr->operands.size() >= 3 && instr->operands[2].isConstant()));
-                        cycle_info.latency = cached_const ? 18 : 120;
-                  }
-            } else if (instr->isLDSDIR()) {
-                  cycle_info.latency = 9;
-            } else if (instr->isDS()) {
-                  cycle_info.latency = 14;
-            }
-            return cycle_info;                                /* Early exit      */
+   if (instr->isVMEM() || instr->isFlatLike()) {
+      cycle_info.latency = is_gfx9 ? 380 : 320;
+   } else if (instr->isSMEM()) {
+      if (instr->operands.empty()) {
+         cycle_info.latency = 1;
+      } else {
+         const bool op0_is_16 = instr->operands[0].size() == 2;
+         const bool op1_const = instr->operands.size() > 1 && instr->operands[1].isConstant();
+         const bool op2_const = instr->operands.size() < 3 || (instr->operands.size() > 2 && instr->operands[2].isConstant());
+         if (op0_is_16 || (op1_const && op2_const)) {
+            /* Likely cached. */
+            cycle_info.latency = is_gfx9 ? 24 : 30;
+         } else {
+            cycle_info.latency = is_gfx9 ? 160 : 200;
+         }
       }
+   } else if (instr->isLDSDIR()) {
+      cycle_info.latency = is_gfx9 ? 11 : 13;
+   } else if (instr->isDS()) {
+      cycle_info.latency = is_gfx9 ? 22 : 20;
+   }
 
-      /* ------------------------------------------------------------------ *
-       * Default RDNA(+) latency model – unchanged                          *
-       * ------------------------------------------------------------------ */
-      if (instr->isVMEM() || instr->isFlatLike()) {
-            cycle_info.latency = 320;
-      } else if (instr->isSMEM()) {
-            if (instr->operands.empty()) {
-                  cycle_info.latency = 1;
-            } else if (instr->operands[0].size() == 2) {
-                  cycle_info.latency = 30;
-            } else {
-                  const bool cached_const =
-                  instr->operands.size() >= 2 && instr->operands[1].isConstant() &&
-                  (instr->operands.size() < 3 ||
-                  (instr->operands.size() >= 3 && instr->operands[2].isConstant()));
-                  cycle_info.latency = cached_const ? 30 : 200;
-            }
-      } else if (instr->isLDSDIR()) {
-            cycle_info.latency = 13;
-      } else if (instr->isDS()) {
-            cycle_info.latency = 20;
-      }
-
-      return cycle_info;
+   return cycle_info;
 }
 
 bool
@@ -443,6 +400,9 @@ add_entry(SchedILPContext& ctx, Instruction* const instr, const uint32_t idx)
    entry.instr = instr;
    entry.wait_cycles = 0;
    entry.write_for_read_mask = 0;
+   entry.dependency_mask = 0;
+   entry.next_non_reorderable = UINT8_MAX;
+
    const mask_t mask = BITFIELD_BIT(idx);
    bool reorder = can_reorder(instr);
    ctx.active_mask |= mask;
@@ -461,22 +421,27 @@ add_entry(SchedILPContext& ctx, Instruction* const instr, const uint32_t idx)
       assert(op.isFixed());
       unsigned reg = op.physReg();
       if (reg >= max_sgpr && reg != scc && reg < min_vgpr) {
+         /* Don't reorder if we touch POPS_EXITING_WAVE_ID (control dep) */
          reorder &= reg != pops_exiting_wave_id;
          continue;
       }
 
       for (unsigned i = 0; i < op.size(); i++) {
-         RegisterInfo& reg_info = ctx.regs[reg + i];
+         unsigned r = reg + i;
+         if (r >= 512)
+            continue; /* Defensive guard; should not happen with valid RA. */
+
+         RegisterInfo& reg_info = ctx.regs[r];
 
          /* Add register reads. */
          reg_info.read_mask |= mask;
 
          if (reg_info.has_direct_dependency) {
             /* A previous dependency is still part of the DAG. */
-            ctx.nodes[ctx.regs[reg].direct_dependency].write_for_read_mask |= mask;
+            ctx.nodes[ctx.regs[r].direct_dependency].write_for_read_mask |= mask;
             entry.dependency_mask |= BITFIELD_BIT(reg_info.direct_dependency);
-         } else if (BITSET_TEST(ctx.reg_has_latency, reg + i)) {
-            entry.wait_cycles = MAX2(entry.wait_cycles, reg_info.latency);
+         } else if (BITSET_TEST(ctx.reg_has_latency, r)) {
+            entry.wait_cycles = MAX2(entry.wait_cycles, (int)reg_info.latency);
          }
       }
    }
@@ -504,7 +469,11 @@ add_entry(SchedILPContext& ctx, Instruction* const instr, const uint32_t idx)
    mask_t write_dep_mask = 0;
    for (const Definition& def : instr->definitions) {
       for (unsigned i = 0; i < def.size(); i++) {
-         RegisterInfo& reg_info = ctx.regs[def.physReg().reg() + i];
+         unsigned r = def.physReg().reg() + i;
+         if (r >= 512)
+            continue; /* Defensive guard; should not happen with valid RA. */
+
+         RegisterInfo& reg_info = ctx.regs[r];
 
          /* Add all previous register reads and writes to the dependencies. */
          write_dep_mask |= reg_info.read_mask;
@@ -512,7 +481,7 @@ add_entry(SchedILPContext& ctx, Instruction* const instr, const uint32_t idx)
 
          /* This register write is a direct dependency for all following reads. */
          reg_info.has_direct_dependency = 1;
-         reg_info.direct_dependency = idx;
+         reg_info.direct_dependency = idx & 0xF;
       }
    }
 
@@ -530,7 +499,7 @@ add_entry(SchedILPContext& ctx, Instruction* const instr, const uint32_t idx)
 
       /* Just don't reorder these at all. */
       if (!is_memory_instr(instr) || instr->definitions.empty() ||
-          get_sync_info(instr).semantics & semantic_volatile || ctx.is_vopd) {
+          (get_sync_info(instr).semantics & semantic_volatile) || ctx.is_vopd) {
          /* Add all previous instructions as dependencies. */
          entry.dependency_mask = ctx.active_mask & ~ctx.non_reorder_mask;
       }
@@ -593,7 +562,10 @@ remove_entry(SchedILPContext& ctx, const Instruction* const instr, const uint32_
          continue;
 
       for (unsigned i = 0; i < op.size(); i++) {
-         RegisterInfo& reg_info = ctx.regs[reg + i];
+         unsigned r = reg + i;
+         if (r >= 512)
+            continue;
+         RegisterInfo& reg_info = ctx.regs[r];
          reg_info.read_mask &= mask;
       }
    }
@@ -608,24 +580,26 @@ remove_entry(SchedILPContext& ctx, const Instruction* const instr, const uint32_
 
    for (const Definition& def : instr->definitions) {
       for (unsigned i = 0; i < def.size(); i++) {
-         unsigned reg = def.physReg().reg() + i;
-         ctx.regs[reg].read_mask &= mask;
-         if (ctx.regs[reg].has_direct_dependency && ctx.regs[reg].direct_dependency == idx) {
-            ctx.regs[reg].has_direct_dependency = false;
+         unsigned r = def.physReg().reg() + i;
+         if (r >= 512)
+            continue;
+         ctx.regs[r].read_mask &= mask;
+         if (ctx.regs[r].has_direct_dependency && ctx.regs[r].direct_dependency == idx) {
+            ctx.regs[r].has_direct_dependency = false;
             if (!ctx.is_vopd) {
-               BITSET_SET(ctx.reg_has_latency, reg);
-               ctx.regs[reg].latency = latency;
+               BITSET_SET(ctx.reg_has_latency, r);
+               ctx.regs[r].latency = (latency > 0) ? (uint16_t)latency : 0;
             }
          }
       }
    }
 
    for (unsigned i = 0; i < num_nodes; i++) {
-      ctx.nodes[i].dependency_mask &= mask;
-      ctx.nodes[i].wait_cycles -= stall;
-      if (ctx.nodes[idx].write_for_read_mask & BITFIELD_BIT(i) && !ctx.is_vopd) {
-         ctx.nodes[i].wait_cycles = MAX2(ctx.nodes[i].wait_cycles, latency);
-      }
+     ctx.nodes[i].dependency_mask &= mask;
+     ctx.nodes[i].wait_cycles -= stall;
+     if ((ctx.nodes[idx].write_for_read_mask & BITFIELD_BIT(i)) && !ctx.is_vopd) {
+        ctx.nodes[i].wait_cycles = MAX2(ctx.nodes[i].wait_cycles, (int16_t)latency);
+     }
    }
 
    if (ctx.next_non_reorderable == idx) {
@@ -681,104 +655,52 @@ collect_clause_dependencies(const SchedILPContext& ctx, const uint8_t next, mask
 unsigned
 select_instruction_ilp(const SchedILPContext& ctx)
 {
-      /* ------------------------------------------------------------- *
-       * 1.  Determine the mask of candidates we are allowed to pick   *
-       * ------------------------------------------------------------- */
-      mask_t mask = ctx.active_mask;
+   mask_t mask = ctx.active_mask;
 
-      if (ctx.next_non_reorderable != UINT8_MAX) {
-            /* If we are inside a memory clause try to keep it alive. */
-            if (ctx.prev_info.instr &&
-                  ctx.nodes[ctx.next_non_reorderable].dependency_mask == 0 &&
-                  should_form_clause(ctx.prev_info.instr,
-                                     ctx.nodes[ctx.next_non_reorderable].instr)) {
-                  return ctx.next_non_reorderable;
-                                     }
-                                     mask = collect_clause_dependencies(ctx, ctx.next_non_reorderable, 0);
+   /* First, continue the currently open clause.
+    * Otherwise collect all dependencies of the next non-reorderable instruction(s).
+    * These make up the list of possible candidates.
+    */
+   if (ctx.next_non_reorderable != UINT8_MAX) {
+      if (ctx.prev_info.instr && ctx.nodes[ctx.next_non_reorderable].dependency_mask == 0 &&
+          should_form_clause(ctx.prev_info.instr, ctx.nodes[ctx.next_non_reorderable].instr))
+         return ctx.next_non_reorderable;
+      mask = collect_clause_dependencies(ctx, ctx.next_non_reorderable, 0);
+   }
+
+   /* VINTRP(gfx6-10.3) can be handled like alu, but switching between VINTRP and other
+    * alu has a cost. So if the previous instr was VINTRP, try to keep selecting VINTRP.
+    */
+   bool prefer_vintrp = ctx.prev_info.instr && ctx.prev_info.instr->isVINTRP();
+
+   /* Select the instruction with lowest wait_cycles of all candidates. */
+   unsigned idx = (unsigned)-1;
+   bool idx_vintrp = false;
+   int32_t wait_cycles = INT32_MAX;
+   u_foreach_bit (i, mask) {
+      const InstrInfo& candidate = ctx.nodes[i];
+
+      /* Check if the candidate has pending dependencies. */
+      if (candidate.dependency_mask)
+         continue;
+
+      bool is_vintrp = prefer_vintrp && candidate.instr->isVINTRP();
+
+      if (idx == (unsigned)-1 || (is_vintrp && !idx_vintrp) ||
+          (is_vintrp == idx_vintrp && candidate.wait_cycles < wait_cycles)) {
+         idx = i;
+         idx_vintrp = is_vintrp;
+         wait_cycles = candidate.wait_cycles;
       }
+   }
 
-      /* Early out if only the barrier-like instruction is available. */
-      if (mask == 0) {
-            assert(ctx.next_non_reorderable != UINT8_MAX);
-            return ctx.next_non_reorderable;
-      }
+   if (idx != (unsigned)-1)
+      return idx;
 
-      /* ------------------------------------------------------------- *
-       * 2.  Strategy flags                                             *
-       * ------------------------------------------------------------- */
-      const bool prefer_vintrp = ctx.prev_info.instr && ctx.prev_info.instr->isVINTRP();
-      const bool prev_is_vmem  = ctx.prev_info.instr && ctx.prev_info.instr->isVMEM();
-
-      /* ------------------------------------------------------------- *
-       * 3.  Vega VMEM-clause continuation heuristic                    *
-       * ------------------------------------------------------------- */
-      if (ctx.program->gfx_level == GFX9 && prev_is_vmem) {
-            mask_t vm_scan = mask;
-            while (vm_scan) {
-                  const unsigned i = ctz32(vm_scan);
-                  vm_scan &= vm_scan - 1;                   /* clear bit */
-
-                  const InstrInfo& cand = ctx.nodes[i];
-                  if (cand.dependency_mask)
-                        continue;                             /* not ready      */
-
-                        if (cand.instr->isVMEM() && cand.wait_cycles < 80) {
-                              return i;                             /* extend clause  */
-                        }
-            }
-      }
-
-      /* ------------------------------------------------------------- *
-       * 4.  General ready-list scan                                    *
-       * ------------------------------------------------------------- */
-      unsigned best_idx          = UINT32_MAX;
-      bool     best_is_vintrp    = false;
-      bool     best_is_salu      = false;
-      int32_t  best_wait_cycles  = INT32_MAX;
-
-      mask_t scan = mask;
-      while (scan) {
-            const unsigned i = ctz32(scan);
-            scan &= scan - 1;
-
-            const InstrInfo& cand = ctx.nodes[i];
-            if (cand.dependency_mask)
-                  continue;
-
-            const Instruction* inst     = cand.instr;
-            const bool cand_is_vintrp   = prefer_vintrp && inst->isVINTRP();
-            const bool cand_is_salu     = inst->isSALU();
-            const int32_t wait_cycles   = cand.wait_cycles;
-
-            bool take = false;
-            if (best_idx == UINT32_MAX) {
-                  take = true;                                     /* first ready node  */
-            } else if (cand_is_vintrp != best_is_vintrp) {
-                  take = cand_is_vintrp;                           /* VINTRP priority   */
-            } else if (!best_is_salu && cand_is_salu &&
-                  best_wait_cycles >= 8) {                 /* SALU latency hide */
-                        take = true;
-                  } else if (wait_cycles < best_wait_cycles) {        /* shortest stall    */
-                        take = true;
-                  }
-
-                  if (take) {
-                        best_idx          = i;
-                        best_is_vintrp    = cand_is_vintrp;
-                        best_is_salu      = cand_is_salu;
-                        best_wait_cycles  = wait_cycles;
-                  }
-      }
-
-      /* There must always be at least one ready candidate. */
-      if (best_idx != UINT32_MAX)
-            return best_idx;
-
-      /* Fallback – only triggered if logic above proves none ready, which is
-       * impossible unless caller violated invariants; still keep the original
-       * behaviour to avoid UB in release builds. */
-      assert(ctx.next_non_reorderable != UINT8_MAX);
-      return ctx.next_non_reorderable;
+   /* Select the next non-reorderable instruction. (it must have no dependencies) */
+   assert(ctx.next_non_reorderable != UINT8_MAX);
+   assert(ctx.nodes[ctx.next_non_reorderable].dependency_mask == 0);
+   return ctx.next_non_reorderable;
 }
 
 bool
@@ -828,46 +750,36 @@ compare_nodes_vopd(const SchedILPContext& ctx, int num_vopd_odd_minus_even, unsi
 unsigned
 select_instruction_vopd(const SchedILPContext& ctx, unsigned* vopd_compat)
 {
-      *vopd_compat = 0;
+   *vopd_compat = 0;
 
-      mask_t mask = ctx.active_mask;
-      if (ctx.next_non_reorderable != UINT8_MAX)
-            mask = ctx.nodes[ctx.next_non_reorderable].dependency_mask;
+   mask_t mask = ctx.active_mask;
+   if (ctx.next_non_reorderable != UINT8_MAX)
+      mask = ctx.nodes[ctx.next_non_reorderable].dependency_mask;
 
-      if (mask == 0)
-            return ctx.next_non_reorderable;            /* only the barrier is ready */
+   if (mask == 0)
+      return ctx.next_non_reorderable;
 
-            /* Track the odd/even dst balance to improve future pairing chances. */
-            const int odd_minus_even =
-            static_cast<int>(util_bitcount(ctx.vopd_odd_mask  & mask)) -
-            static_cast<int>(util_bitcount(ctx.vopd_even_mask & mask));
+   int num_vopd_odd_minus_even =
+      (int)util_bitcount(ctx.vopd_odd_mask & mask) - (int)util_bitcount(ctx.vopd_even_mask & mask);
 
-      unsigned cur = UINT32_MAX;
+   unsigned cur = (unsigned)-1;
+   u_foreach_bit (i, mask) {
+      const InstrInfo& candidate = ctx.nodes[i];
 
-      mask_t scan = mask;
-      while (scan) {
-            const unsigned i = ctz32(scan);
-            scan &= scan - 1;
+      /* Check if the candidate has pending dependencies. */
+      if (candidate.dependency_mask)
+         continue;
 
-            const InstrInfo& cand = ctx.nodes[i];
-            if (cand.dependency_mask)
-                  continue;                                 /* not ready */
-
-                  if (cur == UINT32_MAX) {
-                        cur          = i;
-                        *vopd_compat = can_use_vopd(ctx, i);
-                        continue;
-                  }
-
-                  unsigned tmp_compat = *vopd_compat;
-            if (compare_nodes_vopd(ctx, odd_minus_even, &tmp_compat, cur, i)) {
-                  cur          = i;
-                  *vopd_compat = tmp_compat;
-            }
+      if (cur == (unsigned)-1) {
+         cur = i;
+         *vopd_compat = can_use_vopd(ctx, i);
+      } else if (compare_nodes_vopd(ctx, num_vopd_odd_minus_even, vopd_compat, cur, i)) {
+         cur = i;
       }
+   }
 
-      assert(cur != UINT32_MAX);                      /* at least one node ready */
-      return cur;
+   assert(cur != (unsigned)-1);
+   return cur;
 }
 
 void
@@ -875,8 +787,9 @@ get_vopd_opcode_operands(const SchedILPContext& ctx, Instruction* instr, const V
                          bool swap, aco_opcode* op, unsigned* num_operands, Operand* operands)
 {
    *op = info.op;
-   *num_operands += instr->operands.size();
+   const unsigned copy_count = instr->operands.size();
    std::copy(instr->operands.begin(), instr->operands.end(), operands);
+   *num_operands += copy_count;
 
    if (instr->opcode == aco_opcode::v_bfrev_b32) {
       operands[0] = Operand::get_const(ctx.program->gfx_level,
@@ -932,7 +845,7 @@ create_vopd_instruction(const SchedILPContext& ctx, unsigned idx, unsigned compa
 
    aco_opcode x_op, y_op;
    unsigned num_operands = 0;
-   Operand operands[6];
+   Operand operands[6]; /* VOP2 + VOP2 at most */
    get_vopd_opcode_operands(ctx, x, x_info, swap_x, &x_op, &num_operands, operands);
    get_vopd_opcode_operands(ctx, y, y_info, swap_y, &y_op, &num_operands, operands + num_operands);
 
@@ -950,6 +863,7 @@ void
 do_schedule(SchedILPContext& ctx, It& insert_it, It& remove_it, It instructions_begin,
             It instructions_end)
 {
+   /* Prime the DAG with up to num_nodes instructions */
    for (unsigned i = 0; i < num_nodes; i++) {
       if (remove_it == instructions_end)
          break;
@@ -966,7 +880,9 @@ do_schedule(SchedILPContext& ctx, It& insert_it, It& remove_it, It instructions_
       Instruction* next_instr = ctx.nodes[next_idx].instr;
 
       if (vopd_compat) {
-         std::prev(insert_it)->reset(create_vopd_instruction(ctx, next_idx, vopd_compat));
+         /* Replace the previously emitted instruction with a fused VOPD */
+         auto prev_it = std::prev(insert_it);
+         prev_it->reset(create_vopd_instruction(ctx, next_idx, vopd_compat));
          ctx.prev_info.instr = NULL;
       } else {
          (insert_it++)->reset(next_instr);
@@ -996,10 +912,13 @@ schedule_ilp(Program* program)
    for (Block& block : program->blocks) {
       if (block.instructions.empty())
          continue;
+
       auto it = block.instructions.begin();
       auto insert_it = block.instructions.begin();
       do_schedule(ctx, insert_it, it, block.instructions.begin(), block.instructions.end());
       block.instructions.resize(insert_it - block.instructions.begin());
+
+      /* Reset latency tracking at block ends/branches to avoid leaking inter-block timing */
       if (block.linear_succs.empty() || block.instructions.back()->opcode == aco_opcode::s_branch)
          BITSET_ZERO(ctx.reg_has_latency);
    }
@@ -1015,6 +934,9 @@ schedule_vopd(Program* program)
    ctx.is_vopd = true;
 
    for (Block& block : program->blocks) {
+      if (block.instructions.empty())
+         continue;
+
       auto it = block.instructions.rbegin();
       auto insert_it = block.instructions.rbegin();
       do_schedule(ctx, insert_it, it, block.instructions.rbegin(), block.instructions.rend());
