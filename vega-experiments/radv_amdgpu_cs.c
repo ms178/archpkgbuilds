@@ -63,16 +63,34 @@
 #define RADV_HOT
 #endif
 
-/* Maximum allowed total number of submitted IBs. */
+/* Thresholds/tuning knobs. */
 #define RADV_MAX_IBS_PER_SUBMIT 192
-
-/* Configuration for the Robin Hood hash table for buffer lookups.
- * Must be a power of two. 1024 provides a good balance, avoiding
- * excessive memory usage while being large enough for complex scenes
- * to avoid collisions.
- */
 #define BUFFER_HASH_TABLE_SIZE 1024
 #define VIRTUAL_BUFFER_HASH_TABLE_SIZE 1024
+/* Use original O(N^2) BO dedup for small total lists (cheaper than building a set). */
+#define RADV_SMALL_BO_DEDUP_THRESHOLD 512u
+/* Only use AVX2 non-temporal streaming for big copies where it pays. */
+#define RADV_NT_STREAM_THRESHOLD_BYTES 32768u /* 32 KiB */
+
+/* Thread-local AVX2 feature probe cached per thread. */
+static RADV_ALWAYS_INLINE bool
+radv_cpu_supports_avx2_cached(void)
+{
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__GNUC__) || defined(__clang__)
+   static _Thread_local int cached = -1;
+   if (cached < 0) {
+      __builtin_cpu_init();
+      cached = __builtin_cpu_supports("avx2") ? 1 : 0;
+   }
+   return cached != 0;
+#else
+   return false;
+#endif
+#else
+   return false;
+#endif
+}
 
 struct radv_amdgpu_ib {
    struct radeon_winsys_bo *bo; /* NULL when not owned by the current CS object */
@@ -184,18 +202,13 @@ radeon_emit(struct radeon_cmdbuf *cs, uint32_t value)
 }
 
 /*
- * OPTIMIZATION 4: AVX2-Accelerated Memory Copy with Non-Temporal Stores
+ * OPTIMIZATION 4: AVX2-Accelerated Memory Copy with Non-Temporal Stores (tuned)
  *
- * For emitting arrays of commands, standard `memcpy` can be a bottleneck.
- * This implementation leverages AVX2 SIMD instructions on compatible x86-64 CPUs
- * to significantly increase memory copy throughput for larger arrays.
- *
- * - We call __builtin_cpu_init/__builtin_cpu_supports to avoid illegal instruction faults
- *   and to be strictly correct across compilers.
- * - A threshold (>=1 KiB) ensures we only use NT stores when it matters and to avoid
- *   hurting small copies.
- * - We align destination to 32B for _mm256_stream_si256. Unaligned loads are fine.
- * - SFENCE guarantees ordering/visibility of non-temporal writes.
+ * - Thread-local feature check (no repeated __builtin_cpu_init).
+ * - Large threshold (>= 32 KiB) so we only use NT for big streaming copies.
+ * - No manual prefetching; modern Intel prefetchers handle linear streams well.
+ * - Align destination to 32B for _mm256_stream_si256; unaligned loads are fine.
+ * - SFENCE only if we actually streamed at least one vector.
  */
 static void RADV_HOT
 radeon_emit_array(struct radeon_cmdbuf *cs, const uint32_t *restrict values, unsigned count)
@@ -205,23 +218,14 @@ radeon_emit_array(struct radeon_cmdbuf *cs, const uint32_t *restrict values, uns
    const unsigned original_count = count;
 
 #if defined(__x86_64__) || defined(_M_X64)
-   /* Only consider AVX2 path for sufficiently large copies. */
    const size_t bytes = (size_t)count * 4u;
-   const size_t stream_threshold = 1024u; /* 1 KiB */
 
-   bool avx2_supported = false;
-#if defined(__GNUC__) || defined(__clang__)
-   if (bytes >= stream_threshold) {
-      __builtin_cpu_init();
-      avx2_supported = __builtin_cpu_supports("avx2");
-   }
-#endif
-
-   if (likely(avx2_supported)) {
+   if (likely(bytes >= RADV_NT_STREAM_THRESHOLD_BYTES && radv_cpu_supports_avx2_cached())) {
       /* Align destination to 32B for streaming stores. */
       uintptr_t dst_u = (uintptr_t)dst;
       unsigned misalign = (unsigned)(dst_u & 31u);
       unsigned pre_dwords = misalign ? (unsigned)((32u - misalign) >> 2) : 0u;
+
       if (pre_dwords) {
          if (pre_dwords > count) {
             pre_dwords = count;
@@ -233,26 +237,15 @@ radeon_emit_array(struct radeon_cmdbuf *cs, const uint32_t *restrict values, uns
       }
 
       size_t vec_count = count / 8u; /* 8 dwords per 256-bit vector */
-      const __m256i *src_vec = (const __m256i *)values;
-      __m256i *dst_vec = (__m256i *)dst;
-
-      /* Prefetch source data ahead to reduce stalls. */
-      const char *pf = (const char *)values;
-      _mm_prefetch(pf + 64, _MM_HINT_NTA);
-      _mm_prefetch(pf + 128, _MM_HINT_NTA);
-
-      for (size_t i = 0; i < vec_count; ++i) {
-         if ((i & 0xF) == 0) {
-            const char *p = (const char *)(values + (i * 8u));
-            _mm_prefetch(p + 256, _MM_HINT_NTA);
-            _mm_prefetch(p + 512, _MM_HINT_NTA);
+      if (vec_count) {
+         const __m256i *src_vec = (const __m256i *)values;
+         __m256i *dst_vec = (__m256i *)dst;
+         for (size_t i = 0; i < vec_count; ++i) {
+            __m256i v = _mm256_loadu_si256(&src_vec[i]);
+            _mm256_stream_si256(&dst_vec[i], v);
          }
-         __m256i v = _mm256_loadu_si256(&src_vec[i]);
-         _mm256_stream_si256(&dst_vec[i], v);
+         _mm_sfence(); /* Ensure visibility/order for NT stores. */
       }
-
-      /* Ensure visibility/order of NT stores before copying the tail / updating cdw. */
-      _mm_sfence();
 
       const unsigned processed = (unsigned)(vec_count * 8u);
       if (processed < count) {
@@ -371,16 +364,13 @@ radv_amdgpu_cs_destroy(struct radeon_cmdbuf *rcs)
    free(cs->virtual_buffers);
    free(cs->virtual_buffer_hash_table);
    free(cs->handles);
-   free(cs->buffer_hash_table); /* Free our new hash table */
+   free(cs->buffer_hash_table);
    free(cs);
 }
 
 static void
 radv_amdgpu_init_cs(struct radv_amdgpu_cs *cs, enum amd_ip_type ip_type)
 {
-   /* Initialize the Robin Hood hash table. `calloc` zeroes the memory,
-    * which is critical for our empty-slot detection (`!entry->bo_handle`).
-    */
    cs->buffer_hash_table = calloc(BUFFER_HASH_TABLE_SIZE, sizeof(struct radv_buffer_hash_entry));
    if (unlikely(!cs->buffer_hash_table)) {
       cs->status = VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -549,7 +539,6 @@ radv_amdgpu_cs_grow(struct radeon_cmdbuf *_cs, size_t min_size)
 {
    struct radv_amdgpu_cs *cs = radv_amdgpu_cs(_cs);
 
-   /* Status check is almost always true, but critical for correctness. */
    if (unlikely(cs->status != VK_SUCCESS)) {
       cs->base.cdw = 0;
       return;
@@ -560,10 +549,9 @@ radv_amdgpu_cs_grow(struct radeon_cmdbuf *_cs, size_t min_size)
    cs->ws->base.cs_finalize(_cs);
 
    uint64_t ib_size = MAX2(min_size * 4 + 16, cs->base.max_dw * 4 * 2);
-
    ib_size = align(MIN2(ib_size, ~C_3F2_IB_SIZE), ib_alignment);
 
-   VkResult result = radv_amdgpu_cs_bo_create(cs, ib_size);
+   VkResult result = radv_amdgpu_cs_bo_create(cs, (uint32_t)ib_size);
 
    if (result != VK_SUCCESS) {
       cs->base.cdw = 0;
@@ -576,8 +564,6 @@ radv_amdgpu_cs_grow(struct radeon_cmdbuf *_cs, size_t min_size)
    if (!cs->ib_mapped) {
       cs->ws->base.buffer_destroy(&cs->ws->base, cs->ib_buffer);
       cs->base.cdw = 0;
-
-      /* VK_ERROR_MEMORY_MAP_FAILED is not valid for vkEndCommandBuffer. */
       cs->status = VK_ERROR_OUT_OF_DEVICE_MEMORY;
       radv_amdgpu_restore_last_ib(cs);
       return;
@@ -597,7 +583,7 @@ radv_amdgpu_cs_grow(struct radeon_cmdbuf *_cs, size_t min_size)
    cs->base.buf = (uint32_t *)cs->ib_mapped;
    cs->base.cdw = 0;
    cs->base.reserved_dw = 0;
-   cs->base.max_dw = ib_size / 4 - 4;
+   cs->base.max_dw = (uint32_t)(ib_size / 4u - 4u);
 }
 
 static void
@@ -610,33 +596,24 @@ radv_amdgpu_winsys_cs_pad(struct radeon_cmdbuf *_cs, unsigned leave_dw_space)
 
    if (ip_type == AMD_IP_GFX || ip_type == AMD_IP_COMPUTE) {
       if (unaligned_dw) {
-         const int remaining = pad_dw_mask + 1 - unaligned_dw;
+         const int remaining = pad_dw_mask + 1 - (int)unaligned_dw;
 
-         /* Only pad by 1 dword with the type-2 NOP if necessary. */
          if (remaining == 1 && cs->ws->info.gfx_ib_pad_with_type2) {
             radeon_emit_unchecked(&cs->base, PKT2_NOP_PAD);
          } else {
-            /* Pad with a single NOP packet to minimize CP overhead because NOP is a variable-sized
-             * packet. The size of the packet body after the header is always count + 1.
-             * If count == -1, there is no packet body. NOP is the only packet that can have
-             * count == -1, which is the definition of PKT3_NOP_PAD (count == 0x3fff means -1).
-             */
             radeon_emit_unchecked(&cs->base, PKT3(PKT3_NOP, remaining - 2, 0));
-            cs->base.cdw += remaining - 1;
+            cs->base.cdw += (unsigned)(remaining - 1);
          }
       } else if (cs->base.cdw == 0 && leave_dw_space == 0) {
-         /* Emit a NOP packet to avoid submitting a completely empty IB. */
          const int remaining = pad_dw_mask + 1;
          radeon_emit_unchecked(&cs->base, PKT3(PKT3_NOP, remaining - 2, 0));
-         cs->base.cdw += remaining - 1;
+         cs->base.cdw += (unsigned)(remaining - 1);
       }
    } else {
-      /* Don't pad on VCN encode/unified as no NOPs */
       if (ip_type == AMDGPU_HW_IP_VCN_ENC) {
          return;
       }
 
-      /* Don't add padding to 0 length UVD due to kernel */
       if (ip_type == AMDGPU_HW_IP_UVD && cs->base.cdw == 0) {
          return;
       }
@@ -661,7 +638,6 @@ radv_amdgpu_cs_finalize(struct radeon_cmdbuf *_cs)
    if (cs->use_ib) {
       const uint32_t nop_packet = get_nop_packet(cs);
 
-      /* Pad with NOPs but leave 4 dwords for INDIRECT_BUFFER. */
       radv_amdgpu_winsys_cs_pad(_cs, 4);
 
       radeon_emit_unchecked(&cs->base, nop_packet);
@@ -675,13 +651,10 @@ radv_amdgpu_cs_finalize(struct radeon_cmdbuf *_cs)
       radv_amdgpu_winsys_cs_pad(_cs, 0);
    }
 
-   /* Append the current (last) IB to the array of IB buffers. */
    radv_amdgpu_cs_add_ib_buffer(cs, cs->ib_buffer, cs->ib_buffer->va,
                                 cs->use_ib ? G_3F2_IB_SIZE(*cs->ib_size_ptr) : cs->base.cdw);
 
-   /* Prevent freeing this BO twice. */
    cs->ib_buffer = NULL;
-
    cs->chained_to = NULL;
 
    assert(cs->base.cdw <= cs->base.max_dw + 4);
@@ -697,7 +670,6 @@ radv_amdgpu_cs_reset(struct radeon_cmdbuf *_cs)
    cs->base.reserved_dw = 0;
    cs->status = VK_SUCCESS;
 
-   /* Clear the Robin Hood hash table for reuse. */
    if (likely(cs->buffer_hash_table)) {
       memset(cs->buffer_hash_table, 0, sizeof(struct radv_buffer_hash_entry) * BUFFER_HASH_TABLE_SIZE);
    }
@@ -710,7 +682,6 @@ radv_amdgpu_cs_reset(struct radeon_cmdbuf *_cs)
    cs->num_buffers = 0;
    cs->num_virtual_buffers = 0;
 
-   /* When the CS is finalized and IBs are not allowed, use last IB. */
    assert(cs->ib_buffer || cs->num_ib_buffers);
    if (!cs->ib_buffer) {
       radv_amdgpu_restore_last_ib(cs);
@@ -757,19 +728,9 @@ radv_amdgpu_cs_unchain(struct radeon_cmdbuf *cs)
 static bool
 radv_amdgpu_cs_chain(struct radeon_cmdbuf *cs, struct radeon_cmdbuf *next_cs, bool pre_ena)
 {
-   /* Chains together two CS (command stream) objects by editing
-    * the end of the first CS to add a command that jumps to the
-    * second CS.
-    *
-    * After this, it is enough to submit the first CS to the GPU
-    * and not necessary to submit the second CS because it is already
-    * executed by the first.
-    */
-
    struct radv_amdgpu_cs *acs = radv_amdgpu_cs(cs);
    struct radv_amdgpu_cs *next_acs = radv_amdgpu_cs(next_cs);
 
-   /* Only some HW IP types have packets that we can use for chaining. */
    if (!acs->use_ib) {
       return false;
    }
@@ -786,23 +747,7 @@ radv_amdgpu_cs_chain(struct radeon_cmdbuf *cs, struct radeon_cmdbuf *next_cs, bo
    return true;
 }
 
-/*
- * OPTIMIZATION 1: High-Performance Robin Hood Hashing for Buffer Lookups
- *
- * This section replaces the original naive hash table with a cache-friendly
- * and collision-resistant Robin Hood hashing implementation.
- *
- * - `radv_hash_bo`: A high-quality integer hash function (Murmur3 finalizer)
- *   to ensure good key distribution and minimize primary collisions.
- * - `radv_amdgpu_cs_find_buffer`: The lookup function. It uses Robin Hood
- *   probing, which keeps elements close to their ideal location, resulting in
- *   excellent cache performance and bounded worst-case lookups.
- * - `radv_amdgpu_cs_insert_buffer`: The insertion function. It implements the
- *   "stealing from the rich" strategy to maintain the small probe distance.
- *
- * This change dramatically reduces CPU overhead in `cs_add_buffer`, a hot path,
- * improving frame time consistency in resource-heavy games.
- */
+/* Hashing and table ops. */
 static RADV_ALWAYS_INLINE __attribute__((const)) uint32_t
 radv_hash_bo(uint32_t bo_handle)
 {
@@ -818,11 +763,7 @@ radv_hash_bo(uint32_t bo_handle)
 static int
 radv_amdgpu_cs_find_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle)
 {
-   /* The hash table should always be allocated, but a graceful failure is safe. */
    if (unlikely(!cs->buffer_hash_table)) {
-      /* Fallback to a simple linear scan if hash table allocation failed.
-       * This preserves correctness at the cost of performance in a rare error case.
-       */
       for (unsigned i = 0; i < cs->num_buffers; ++i) {
          if (cs->handles[i].bo_handle == bo_handle) {
             return (int)i;
@@ -839,28 +780,22 @@ radv_amdgpu_cs_find_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle)
       uint32_t pos = (hash + dist) & mask;
       struct radv_buffer_hash_entry *entry = &cs->buffer_hash_table[pos];
 
-      /* Fast-path: exact match before extra work. */
       if (entry->bo_handle == bo_handle) {
          return entry->index;
       }
 
-      /* Empty slot => not present. */
       if (entry->bo_handle == 0) {
          return -1;
       }
 
-      /* Calculate the probe distance of the entry currently in the slot. */
       uint32_t entry_hash = radv_hash_bo(entry->bo_handle);
       uint32_t entry_dist = (pos - (entry_hash & mask) + BUFFER_HASH_TABLE_SIZE) & mask;
 
-      /* Robin Hood property: if our distance is greater, it wouldn't be here. */
       if (dist > entry_dist) {
          return -1;
       }
 
       dist++;
-
-      /* Safeguard against a full table loop. */
       if (unlikely(dist >= BUFFER_HASH_TABLE_SIZE)) {
          return -1;
       }
@@ -871,7 +806,7 @@ static void
 radv_amdgpu_cs_insert_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle, int index)
 {
    if (unlikely(!cs->buffer_hash_table)) {
-      return; /* Do not insert if table allocation failed. */
+      return;
    }
 
    const uint32_t mask = BUFFER_HASH_TABLE_SIZE - 1;
@@ -884,42 +819,31 @@ radv_amdgpu_cs_insert_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle, int 
       uint32_t pos = (hash + dist) & mask;
       struct radv_buffer_hash_entry *entry = &cs->buffer_hash_table[pos];
 
-      /* Found an empty slot, insert here and we're done. */
       if (entry->bo_handle == 0) {
          *entry = new_entry;
          return;
       }
 
-      /* Already present? Insertion shouldn't happen, but be robust. */
       if (entry->bo_handle == bo_handle) {
          entry->index = index;
          return;
       }
 
-      /* Calculate the probe distance of the existing entry. */
       uint32_t entry_hash = radv_hash_bo(entry->bo_handle);
       uint32_t entry_dist = (pos - (entry_hash & mask) + BUFFER_HASH_TABLE_SIZE) & mask;
 
-      /* If our new entry is "richer" (further from its ideal slot) than the
-       * existing entry, swap them. We now try to insert the old entry.
-       */
       if (dist > entry_dist) {
          struct radv_buffer_hash_entry tmp = *entry;
          *entry = new_entry;
          new_entry = tmp;
 
-         /* We are now trying to insert the swapped-out element. Update our
-          * state to reflect this element's properties.
-          */
          dist = entry_dist;
          hash = entry_hash;
       }
 
       dist++;
-
-      /* If we loop through the entire table, it's full. Signal OOM to caller. */
       if (unlikely(dist >= BUFFER_HASH_TABLE_SIZE)) {
-         cs->status = VK_ERROR_OUT_OF_HOST_MEMORY; /* Signal table is full. */
+         cs->status = VK_ERROR_OUT_OF_HOST_MEMORY;
          return;
       }
    }
@@ -928,12 +852,10 @@ radv_amdgpu_cs_insert_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle, int 
 static void
 radv_amdgpu_cs_add_buffer_internal(struct radv_amdgpu_cs *cs, uint32_t bo, uint8_t priority)
 {
-   /* The find operation is now significantly faster. */
    if (radv_amdgpu_cs_find_buffer(cs, bo) != -1) {
       return;
    }
 
-   /* Growing the handles array is rare and thus marked as unlikely. */
    if (unlikely(cs->num_buffers == cs->max_num_buffers)) {
       unsigned new_count = MAX2(1, cs->max_num_buffers * 2);
       struct drm_amdgpu_bo_list_entry *new_entries =
@@ -951,7 +873,6 @@ radv_amdgpu_cs_add_buffer_internal(struct radv_amdgpu_cs *cs, uint32_t bo, uint8
    cs->handles[new_index].bo_handle = bo;
    cs->handles[new_index].bo_priority = priority;
 
-   /* Insert the new buffer into our high-performance hash table. */
    radv_amdgpu_cs_insert_buffer(cs, bo, new_index);
 
    cs->num_buffers++;
@@ -1009,11 +930,6 @@ radv_amdgpu_cs_add_virtual_buffer(struct radeon_cmdbuf *_cs, struct radeon_winsy
 
 /*
  * OPTIMIZATION 5: Profile-Guided Branch Prediction
- *
- * This function is on a very hot path. The branches within are highly predictable.
- * - `cs->status` is almost never an error.
- * - `bo->base.is_virtual` is a workload-dependent branch. No hint is applied
- *   without specific profiling data, letting the CPU's dynamic predictor work.
  */
 static void
 radv_amdgpu_cs_add_buffer(struct radeon_cmdbuf *_cs, struct radeon_winsys_bo *_bo)
@@ -1021,9 +937,6 @@ radv_amdgpu_cs_add_buffer(struct radeon_cmdbuf *_cs, struct radeon_winsys_bo *_b
    struct radv_amdgpu_cs *cs = radv_amdgpu_cs(_cs);
    struct radv_amdgpu_winsys_bo *bo = radv_amdgpu_winsys_bo(_bo);
 
-   /* This check is almost always true. Marked as `unlikely` to optimize for
-    * the success path, preventing pipeline stalls on a misprediction.
-    */
    if (unlikely(cs->status != VK_SUCCESS)) {
       return;
    }
@@ -1064,7 +977,6 @@ radv_amdgpu_cs_execute_secondary(struct radeon_cmdbuf *_parent, struct radeon_cm
 
       parent->base.reserved_dw = MAX2(parent->base.reserved_dw, parent->base.cdw + 4);
 
-      /* Not setting the CHAIN bit will launch an IB2. */
       radeon_emit(&parent->base, PKT3(PKT3_INDIRECT_BUFFER, 2, 0));
       radeon_emit(&parent->base, child->ib.ib_mc_address);
       radeon_emit(&parent->base, child->ib.ib_mc_address >> 32);
@@ -1072,13 +984,11 @@ radv_amdgpu_cs_execute_secondary(struct radeon_cmdbuf *_parent, struct radeon_cm
    } else {
       assert(parent->use_ib == child->use_ib);
 
-      /* Grow the current CS and copy the contents of the secondary CS. */
       for (unsigned i = 0; i < child->num_ib_buffers; i++) {
          struct radv_amdgpu_ib *ib = &child->ib_buffers[i];
          uint32_t cdw = ib->cdw;
          uint8_t *mapped;
 
-         /* Do not copy the original chain link for IBs. */
          if (child->use_ib) {
             cdw -= 4;
          }
@@ -1097,7 +1007,6 @@ radv_amdgpu_cs_execute_secondary(struct radeon_cmdbuf *_parent, struct radeon_cm
             return;
          }
 
-         /* Use our optimized array copy function instead of memcpy. */
          radeon_emit_array(&parent->base, (uint32_t *)mapped, cdw);
       }
    }
@@ -1136,13 +1045,11 @@ radv_amdgpu_cs_chain_dgc_ib(struct radeon_cmdbuf *_cs, uint64_t va, uint32_t cdw
    assert(cs->ws->info.gfx_level >= GFX8);
 
    if (cs->hw_ip == AMD_IP_GFX) {
-      /* Use IB2 for executing DGC CS on GFX. */
       cs->ws->base.cs_execute_ib(_cs, NULL, va, cdw, predicate);
    } else {
       assert(va && va % cs->ws->info.ip[cs->hw_ip].ib_alignment == 0);
       assert(cdw <= ~C_3F2_IB_SIZE);
 
-      /* Emit a WRITE_DATA packet to patch the DGC CS. */
       const uint32_t chain_data[] = {
          PKT3(PKT3_INDIRECT_BUFFER, 2, 0),
          0,
@@ -1156,11 +1063,9 @@ radv_amdgpu_cs_chain_dgc_ib(struct radeon_cmdbuf *_cs, uint64_t va, uint32_t cdw
       radeon_emit(&cs->base, trailer_va >> 32);
       radeon_emit_array(&cs->base, chain_data, ARRAY_SIZE(chain_data));
 
-      /* Keep pointers for patching later. */
       uint64_t *ib_va_ptr = (uint64_t *)(cs->base.buf + cs->base.cdw - 3);
       uint32_t *ib_size_ptr = cs->base.buf + cs->base.cdw - 1;
 
-      /* Writeback L2 because CP isn't coherent with L2 on GFX6-8. */
       if (cs->ws->info.gfx_level == GFX8) {
          radeon_emit(&cs->base, PKT3(PKT3_ACQUIRE_MEM, 5, false) | PKT3_SHADER_TYPE_S(1));
          radeon_emit(&cs->base, S_0301F0_TC_WB_ACTION_ENA(1) | S_0301F0_TC_NC_ACTION_ENA(1));
@@ -1171,16 +1076,13 @@ radv_amdgpu_cs_chain_dgc_ib(struct radeon_cmdbuf *_cs, uint64_t va, uint32_t cdw
          radeon_emit(&cs->base, 0x0000000A);
       }
 
-      /* Finalize the current CS. */
       cs->ws->base.cs_finalize(_cs);
 
-      /* Chain the current CS to the DGC CS. */
       _cs->buf[_cs->cdw - 4] = PKT3(PKT3_INDIRECT_BUFFER, 2, 0);
       _cs->buf[_cs->cdw - 3] = va;
       _cs->buf[_cs->cdw - 2] = va >> 32;
       _cs->buf[_cs->cdw - 1] = S_3F2_CHAIN(1) | S_3F2_VALID(1) | cdw;
 
-      /* Allocate a new CS BO with initial size. */
       const uint64_t ib_size = radv_amdgpu_cs_get_initial_size(cs->ws, cs->hw_ip);
 
       VkResult result = radv_amdgpu_cs_bo_create(cs, (uint32_t)ib_size);
@@ -1199,7 +1101,6 @@ radv_amdgpu_cs_chain_dgc_ib(struct radeon_cmdbuf *_cs, uint64_t va, uint32_t cdw
 
       cs->ws->base.cs_add_buffer(&cs->base, cs->ib_buffer);
 
-      /* Chain back the trailer (DGC CS) to the newly created one. */
       *ib_va_ptr = radv_amdgpu_winsys_bo(cs->ib_buffer)->base.va;
       cs->ib_size_ptr = ib_size_ptr;
 
@@ -1339,7 +1240,6 @@ radv_next_pow2_u32(uint32_t v)
 static bool
 radv_bo_set_init(struct radv_bo_set *set, uint32_t expected_elems)
 {
-   /* Use 50% load factor target to keep probe lengths tiny. */
    uint64_t want = (uint64_t)expected_elems * 2u;
    if (want < 8u) {
       want = 8u;
@@ -1452,9 +1352,8 @@ radv_amdgpu_get_bo_list(struct radv_amdgpu_winsys *ws, struct radeon_cmdbuf **cs
 
    if (ws->debug_all_bos) {
       handles = malloc(sizeof(handles[0]) * ws->global_bo_list.count);
-      if (!handles) {
+      if (!handles)
          return VK_ERROR_OUT_OF_HOST_MEMORY;
-      }
 
       num_handles = radv_amdgpu_copy_global_bo_list(ws, handles);
       *rhandles = handles;
@@ -1464,14 +1363,12 @@ radv_amdgpu_get_bo_list(struct radv_amdgpu_winsys *ws, struct radeon_cmdbuf **cs
               !radv_amdgpu_cs(cs_array[0])->num_virtual_buffers && !radv_amdgpu_cs(cs_array[0])->chained_to &&
               !ws->global_bo_list.count) {
       struct radv_amdgpu_cs *cs = (struct radv_amdgpu_cs *)cs_array[0];
-      if (cs->num_buffers == 0) {
+      if (cs->num_buffers == 0)
          return VK_SUCCESS;
-      }
 
       handles = malloc(sizeof(handles[0]) * cs->num_buffers);
-      if (!handles) {
+      if (!handles)
          return VK_ERROR_OUT_OF_HOST_MEMORY;
-      }
 
       memcpy(handles, cs->handles, sizeof(handles[0]) * cs->num_buffers);
       *rhandles = handles;
@@ -1484,54 +1381,61 @@ radv_amdgpu_get_bo_list(struct radv_amdgpu_winsys *ws, struct radeon_cmdbuf **cs
       total_buffer_count += radv_amdgpu_count_cs_array_bo(continue_preamble_array, num_continue_preambles);
       total_buffer_count += radv_amdgpu_count_cs_array_bo(postamble_array, num_postambles);
 
-      if (total_buffer_count == 0) {
+      if (total_buffer_count == 0)
          return VK_SUCCESS;
-      }
 
       handles = malloc(sizeof(handles[0]) * total_buffer_count);
-      if (!handles) {
+      if (!handles)
          return VK_ERROR_OUT_OF_HOST_MEMORY;
-      }
 
-      struct radv_bo_set present;
-      if (!radv_bo_set_init(&present, total_buffer_count)) {
-         free(handles);
-         return VK_ERROR_OUT_OF_HOST_MEMORY;
-      }
+      /* Heuristic: for small lists, the original O(N^2) dedup is cheaper. */
+      if (total_buffer_count <= RADV_SMALL_BO_DEDUP_THRESHOLD) {
+         num_handles = radv_amdgpu_copy_global_bo_list(ws, handles);
+         num_handles = radv_amdgpu_add_cs_array_to_bo_list(cs_array, count, handles, num_handles);
+         num_handles =
+            radv_amdgpu_add_cs_array_to_bo_list(initial_preamble_array, num_initial_preambles, handles, num_handles);
+         num_handles =
+            radv_amdgpu_add_cs_array_to_bo_list(continue_preamble_array, num_continue_preambles, handles, num_handles);
+         num_handles = radv_amdgpu_add_cs_array_to_bo_list(postamble_array, num_postambles, handles, num_handles);
+      } else {
+         struct radv_bo_set present;
+         if (!radv_bo_set_init(&present, total_buffer_count)) {
+            free(handles);
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+         }
 
-      /* Insert the global BO list first. */
-      for (uint32_t i = 0; i < ws->global_bo_list.count; i++) {
-         uint32_t h = ws->global_bo_list.bos[i]->bo_handle;
-         if (radv_bo_set_insert(&present, h)) {
-            handles[num_handles].bo_handle = h;
-            handles[num_handles].bo_priority = ws->global_bo_list.bos[i]->priority;
-            ++num_handles;
+         for (uint32_t i = 0; i < ws->global_bo_list.count; i++) {
+            uint32_t h = ws->global_bo_list.bos[i]->bo_handle;
+            if (radv_bo_set_insert(&present, h)) {
+               handles[num_handles].bo_handle = h;
+               handles[num_handles].bo_priority = ws->global_bo_list.bos[i]->priority;
+               ++num_handles;
+            }
          }
-      }
 
-      /* Append preambles, main CS array, and postambles with dedup. */
-      for (unsigned i = 0; i < num_initial_preambles; ++i) {
-         for (struct radv_amdgpu_cs *cs = radv_amdgpu_cs(initial_preamble_array[i]); cs; cs = cs->chained_to) {
-            radv_append_cs_bos_dedup(cs, handles, &num_handles, &present);
+         for (unsigned i = 0; i < num_initial_preambles; ++i) {
+            for (struct radv_amdgpu_cs *cs = radv_amdgpu_cs(initial_preamble_array[i]); cs; cs = cs->chained_to) {
+               radv_append_cs_bos_dedup(cs, handles, &num_handles, &present);
+            }
          }
-      }
-      for (unsigned i = 0; i < count; ++i) {
-         for (struct radv_amdgpu_cs *cs = radv_amdgpu_cs(cs_array[i]); cs; cs = cs->chained_to) {
-            radv_append_cs_bos_dedup(cs, handles, &num_handles, &present);
+         for (unsigned i = 0; i < count; ++i) {
+            for (struct radv_amdgpu_cs *cs = radv_amdgpu_cs(cs_array[i]); cs; cs = cs->chained_to) {
+               radv_append_cs_bos_dedup(cs, handles, &num_handles, &present);
+            }
          }
-      }
-      for (unsigned i = 0; i < num_continue_preambles; ++i) {
-         for (struct radv_amdgpu_cs *cs = radv_amdgpu_cs(continue_preamble_array[i]); cs; cs = cs->chained_to) {
-            radv_append_cs_bos_dedup(cs, handles, &num_handles, &present);
+         for (unsigned i = 0; i < num_continue_preambles; ++i) {
+            for (struct radv_amdgpu_cs *cs = radv_amdgpu_cs(continue_preamble_array[i]); cs; cs = cs->chained_to) {
+               radv_append_cs_bos_dedup(cs, handles, &num_handles, &present);
+            }
          }
-      }
-      for (unsigned i = 0; i < num_postambles; ++i) {
-         for (struct radv_amdgpu_cs *cs = radv_amdgpu_cs(postamble_array[i]); cs; cs = cs->chained_to) {
-            radv_append_cs_bos_dedup(cs, handles, &num_handles, &present);
+         for (unsigned i = 0; i < num_postambles; ++i) {
+            for (struct radv_amdgpu_cs *cs = radv_amdgpu_cs(postamble_array[i]); cs; cs = cs->chained_to) {
+               radv_append_cs_bos_dedup(cs, handles, &num_handles, &present);
+            }
          }
-      }
 
-      radv_bo_set_destroy(&present);
+         radv_bo_set_destroy(&present);
+      }
    }
 
    *rhandles = handles;
@@ -1585,7 +1489,6 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
 {
    VkResult result;
 
-   /* Last CS is "the gang leader", its IP type determines which fence to signal. */
    struct radv_amdgpu_cs *last_cs = radv_amdgpu_cs(cs_array[cs_count - 1]);
    struct radv_amdgpu_winsys *ws = last_cs->ws;
 
@@ -1603,11 +1506,9 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
    result = radv_amdgpu_get_bo_list(ws, &cs_array[0], cs_count, initial_preamble_cs, initial_preamble_count,
                                     continue_preamble_cs, continue_preamble_count, postamble_cs, postamble_count,
                                     &num_handles, &handles);
-   if (result != VK_SUCCESS) {
+   if (result != VK_SUCCESS)
       goto fail;
-   }
 
-   /* Configure the CS request. */
    const uint32_t *max_ib_per_ip = ws->info.max_submitted_ibs;
    struct radv_amdgpu_cs_request request = {
       .ip_type = last_cs->hw_ip,
@@ -1616,7 +1517,7 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
       .handles = handles,
       .num_handles = num_handles,
       .ibs = ibs,
-      .number_of_ibs = 0, /* set below */
+      .number_of_ibs = 0,
    };
 
    for (unsigned cs_idx = 0, cs_ib_idx = 0; cs_idx < cs_count;) {
@@ -1626,9 +1527,7 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
       unsigned num_submitted_ibs = 0;
       unsigned ibs_per_ip[AMD_NUM_IP_TYPES] = {0};
 
-      /* Copy preambles to the submission. */
       for (unsigned i = 0; i < preamble_count; ++i) {
-         /* Assume that the full preamble fits into 1 IB. */
          struct radv_amdgpu_cs *cs = radv_amdgpu_cs(preambles[i]);
          struct radv_amdgpu_cs_ib_info ib;
 
@@ -1644,32 +1543,21 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
          struct radv_amdgpu_cs_ib_info ib;
 
          if (cs_ib_idx == 0) {
-            /* Make sure the whole CS fits into the same submission. */
             unsigned cs_num_ib = radv_amdgpu_get_num_ibs_per_cs(cs);
-            if (i + cs_num_ib > ib_per_submit || ibs_per_ip[cs->hw_ip] + cs_num_ib > max_ib_per_ip[cs->hw_ip]) {
+            if (i + cs_num_ib > ib_per_submit || ibs_per_ip[cs->hw_ip] + cs_num_ib > max_ib_per_ip[cs->hw_ip])
                break;
-            }
 
             if (cs->hw_ip != request.ip_type) {
-               /* Found a "follower" CS in a gang submission.
-                * Make sure to submit this together with its "leader", the next CS.
-                * We rely on the caller to order each "follower" before its "leader."
-                */
                assert(cs_idx != cs_count - 1);
                struct radv_amdgpu_cs *next_cs = radv_amdgpu_cs(cs_array[cs_idx + 1]);
                assert(next_cs->hw_ip == request.ip_type);
                unsigned next_cs_num_ib = radv_amdgpu_get_num_ibs_per_cs(next_cs);
                if (i + cs_num_ib + next_cs_num_ib > ib_per_submit ||
-                   ibs_per_ip[next_cs->hw_ip] + next_cs_num_ib > max_ib_per_ip[next_cs->hw_ip]) {
+                   ibs_per_ip[next_cs->hw_ip] + next_cs_num_ib > max_ib_per_ip[next_cs->hw_ip])
                   break;
-               }
             }
          }
 
-         /* When IBs are used, we only need to submit the main IB of this CS, because everything
-          * else is chained to the first IB. Otherwise we must submit all IBs in the ib_buffers
-          * array.
-          */
          if (cs->use_ib) {
             ib = radv_amdgpu_cs_ib_to_info(cs, cs->ib_buffers[0]);
             cs_idx++;
@@ -1683,9 +1571,8 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
             }
          }
 
-         if (uses_shadow_regs && ib.ip_type == AMDGPU_HW_IP_GFX) {
+         if (uses_shadow_regs && ib.ip_type == AMDGPU_HW_IP_GFX)
             ib.flags |= AMDGPU_IB_FLAG_PREEMPT;
-         }
 
          assert(num_submitted_ibs < ib_array_size);
          ibs[num_submitted_ibs++] = ib;
@@ -1694,9 +1581,7 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
 
       assert(num_submitted_ibs > preamble_count);
 
-      /* Copy postambles to the submission. */
       for (unsigned i = 0; i < postamble_count; ++i) {
-         /* Assume that the full postamble fits into 1 IB. */
          struct radv_amdgpu_cs *cs = radv_amdgpu_cs(postamble_cs[i]);
          struct radv_amdgpu_cs_ib_info ib;
 
@@ -1707,19 +1592,16 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
          ibs_per_ip[cs->hw_ip]++;
       }
 
-      /* Submit the CS. */
       request.number_of_ibs = num_submitted_ibs;
       result = radv_amdgpu_cs_submit(ctx, &request, sem_info);
-      if (result != VK_SUCCESS) {
+      if (result != VK_SUCCESS)
          goto fail;
-      }
    }
 
    free(request.handles);
 
-   if (result != VK_SUCCESS) {
+   if (result != VK_SUCCESS)
       goto fail;
-   }
 
    radv_assign_last_submit(ctx, &request);
 
@@ -1762,10 +1644,6 @@ radv_amdgpu_cs_submit_zero(struct radv_amdgpu_ctx *ctx, enum amd_ip_type ip_type
          ret = ac_drm_cs_syncobj_export_sync_file2(
             ctx->ws->dev, sem_info->wait.syncobj[i + sem_info->wait.syncobj_count], sem_info->wait.points[i], 0, &fd2);
          if (ret < 0) {
-            /* This works around a kernel bug where the fence isn't copied if it is already
-             * signalled. Since it is already signalled it is totally fine to not wait on it.
-             *
-             * kernel patch: https://patchwork.freedesktop.org/patch/465583/ */
             uint64_t point;
             ret = ac_drm_cs_syncobj_query2(ctx->ws->dev, &sem_info->wait.syncobj[i + sem_info->wait.syncobj_count],
                                            &point, 1, 0);
@@ -2221,9 +2099,6 @@ radv_amdgpu_ctx_set_pstate(struct radeon_winsys_ctx *rwctx, enum radeon_ctx_psta
       return r;
    }
 
-   /* Do not try to set a new pstate when the current one is already what we want. Otherwise, the
-    * kernel might return -EBUSY if we have multiple AMDGPU contexts in flight.
-    */
    if (current_pstate == new_pstate)
       return 0;
 
@@ -2359,12 +2234,6 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
       chunks[i].length_dw = sizeof(struct drm_amdgpu_cs_chunk_fence) / 4;
       chunks[i].chunk_data = (uint64_t)(uintptr_t)&chunk_data[i];
 
-      /* Need to reserve 4 QWORD for user fence:
-       *   QWORD[0]: completed fence
-       *   QWORD[1]: preempted fence
-       *   QWORD[2]: reset fence
-       *   QWORD[3]: preempted then reset
-       */
       uint32_t offset = (request->ip_type * MAX_RINGS_PER_TYPE + request->ring) * 4u;
       ac_drm_cs_chunk_fence_info_to_data(radv_amdgpu_winsys_bo(ctx->fence_bo)->bo_handle, offset, &chunk_data[i]);
    }
@@ -2415,15 +2284,10 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
    chunks[num_chunks].chunk_data = (uintptr_t)&bo_list_in;
    num_chunks++;
 
-   /* The kernel returns -ENOMEM with many parallel processes using GDS such as test suites quite
-    * often, but it eventually succeeds after enough attempts. This happens frequently with dEQP
-    * using NGG streamout.
-    */
    uint64_t abs_timeout_ns = os_time_get_absolute_timeout(1000000000ull); /* 1s */
 
    r = 0;
    do {
-      /* Wait 1 ms and try again. */
       if (r == -ENOMEM)
          os_time_sleep(1000);
 
