@@ -2910,6 +2910,17 @@ static int dm_oem_i2c_hw_init(struct amdgpu_device *adev)
 	return 0;
 }
 
+static void dm_oem_i2c_hw_fini(struct amdgpu_device *adev)
+{
+	struct amdgpu_display_manager *dm = &adev->dm;
+
+	if (dm->oem_i2c) {
+		i2c_del_adapter(&dm->oem_i2c->base);
+		kfree(dm->oem_i2c);
+		dm->oem_i2c = NULL;
+	}
+}
+
 /**
  * dm_hw_init() - Initialize DC device
  * @ip_block: Pointer to the amdgpu_ip_block for this hw instance.
@@ -2960,7 +2971,7 @@ static int dm_hw_fini(struct amdgpu_ip_block *ip_block)
 {
 	struct amdgpu_device *adev = ip_block->adev;
 
-	kfree(adev->dm.oem_i2c);
+	dm_oem_i2c_hw_fini(adev);
 
 	amdgpu_dm_hpd_fini(adev);
 
@@ -3073,16 +3084,55 @@ static int dm_cache_state(struct amdgpu_device *adev)
 	return adev->dm.cached_state ? 0 : r;
 }
 
-static int dm_prepare_suspend(struct amdgpu_ip_block *ip_block)
+static void dm_destroy_cached_state(struct amdgpu_device *adev)
 {
-	struct amdgpu_device *adev = ip_block->adev;
+	struct amdgpu_display_manager *dm = &adev->dm;
+	struct drm_device *ddev = adev_to_drm(adev);
+	struct dm_plane_state *dm_new_plane_state;
+	struct drm_plane_state *new_plane_state;
+	struct dm_crtc_state *dm_new_crtc_state;
+	struct drm_crtc_state *new_crtc_state;
+	struct drm_plane *plane;
+	struct drm_crtc *crtc;
+	int i;
 
-	if (amdgpu_in_reset(adev))
-		return 0;
+	if (!dm->cached_state)
+		return;
 
-	WARN_ON(adev->dm.cached_state);
+	/* Force mode set in atomic commit */
+	for_each_new_crtc_in_state(dm->cached_state, crtc, new_crtc_state, i) {
+		new_crtc_state->active_changed = true;
+		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
+		reset_freesync_config_for_crtc(dm_new_crtc_state);
+	}
 
-	return dm_cache_state(adev);
+	/*
+	 * atomic_check is expected to create the dc states. We need to release
+	 * them here, since they were duplicated as part of the suspend
+	 * procedure.
+	 */
+	for_each_new_crtc_in_state(dm->cached_state, crtc, new_crtc_state, i) {
+		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
+		if (dm_new_crtc_state->stream) {
+			WARN_ON(kref_read(&dm_new_crtc_state->stream->refcount) > 1);
+			dc_stream_release(dm_new_crtc_state->stream);
+			dm_new_crtc_state->stream = NULL;
+		}
+		dm_new_crtc_state->base.color_mgmt_changed = true;
+	}
+
+	for_each_new_plane_in_state(dm->cached_state, plane, new_plane_state, i) {
+		dm_new_plane_state = to_dm_plane_state(new_plane_state);
+		if (dm_new_plane_state->dc_state) {
+			WARN_ON(kref_read(&dm_new_plane_state->dc_state->refcount) > 1);
+			dc_plane_state_release(dm_new_plane_state->dc_state);
+			dm_new_plane_state->dc_state = NULL;
+		}
+	}
+
+	drm_atomic_helper_resume(ddev, dm->cached_state);
+
+	dm->cached_state = NULL;
 }
 
 static int dm_suspend(struct amdgpu_ip_block *ip_block)
@@ -3306,12 +3356,6 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
 	struct amdgpu_dm_connector *aconnector;
 	struct drm_connector *connector;
 	struct drm_connector_list_iter iter;
-	struct drm_crtc *crtc;
-	struct drm_crtc_state *new_crtc_state;
-	struct dm_crtc_state *dm_new_crtc_state;
-	struct drm_plane *plane;
-	struct drm_plane_state *new_plane_state;
-	struct dm_plane_state *dm_new_plane_state;
 	struct dm_atomic_state *dm_state = to_dm_atomic_state(dm->atomic_obj.state);
 	enum dc_connection_type new_connection_type = dc_connection_none;
 	struct dc_state *dc_state;
@@ -3470,40 +3514,7 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
 	}
 	drm_connector_list_iter_end(&iter);
 
-	/* Force mode set in atomic commit */
-	for_each_new_crtc_in_state(dm->cached_state, crtc, new_crtc_state, i) {
-		new_crtc_state->active_changed = true;
-		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
-		reset_freesync_config_for_crtc(dm_new_crtc_state);
-	}
-
-	/*
-	 * atomic_check is expected to create the dc states. We need to release
-	 * them here, since they were duplicated as part of the suspend
-	 * procedure.
-	 */
-	for_each_new_crtc_in_state(dm->cached_state, crtc, new_crtc_state, i) {
-		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
-		if (dm_new_crtc_state->stream) {
-			WARN_ON(kref_read(&dm_new_crtc_state->stream->refcount) > 1);
-			dc_stream_release(dm_new_crtc_state->stream);
-			dm_new_crtc_state->stream = NULL;
-		}
-		dm_new_crtc_state->base.color_mgmt_changed = true;
-	}
-
-	for_each_new_plane_in_state(dm->cached_state, plane, new_plane_state, i) {
-		dm_new_plane_state = to_dm_plane_state(new_plane_state);
-		if (dm_new_plane_state->dc_state) {
-			WARN_ON(kref_read(&dm_new_plane_state->dc_state->refcount) > 1);
-			dc_plane_state_release(dm_new_plane_state->dc_state);
-			dm_new_plane_state->dc_state = NULL;
-		}
-	}
-
-	drm_atomic_helper_resume(ddev, dm->cached_state);
-
-	dm->cached_state = NULL;
+	dm_destroy_cached_state(adev);
 
 	/* Do mst topology probing after resuming cached state*/
 	drm_connector_list_iter_begin(ddev, &iter);
@@ -3549,7 +3560,6 @@ static const struct amd_ip_funcs amdgpu_dm_funcs = {
 	.early_fini = amdgpu_dm_early_fini,
 	.hw_init = dm_hw_init,
 	.hw_fini = dm_hw_fini,
-	.prepare_suspend = dm_prepare_suspend,
 	.suspend = dm_suspend,
 	.resume = dm_resume,
 	.is_idle = dm_is_idle,
@@ -8679,7 +8689,16 @@ static int amdgpu_dm_encoder_init(struct drm_device *dev,
 static void manage_dm_interrupts(struct amdgpu_device *adev,
 				 struct amdgpu_crtc *acrtc,
 				 struct dm_crtc_state *acrtc_state)
-{
+{	/*
+	 * We cannot be sure that the frontend index maps to the same
+	 * backend index - some even map to more than one.
+	 * So we have to go through the CRTC to find the right IRQ.
+	 */
+	int irq_type = amdgpu_display_crtc_idx_to_irq_type(
+			adev,
+			acrtc->crtc_id);
+	struct drm_device *dev = adev_to_drm(adev);
+
 	struct drm_vblank_crtc_config config = {0};
 	struct dc_crtc_timing *timing;
 	int offdelay;
@@ -8732,7 +8751,35 @@ static void manage_dm_interrupts(struct amdgpu_device *adev,
 
 		drm_crtc_vblank_on_config(&acrtc->base,
 					  &config);
+		/* Allow RX6xxx, RX7700, RX7800 GPUs to call amdgpu_irq_get.*/
+		switch (amdgpu_ip_version(adev, DCE_HWIP, 0)) {
+		case IP_VERSION(3, 0, 0):
+		case IP_VERSION(3, 0, 2):
+		case IP_VERSION(3, 0, 3):
+		case IP_VERSION(3, 2, 0):
+			if (amdgpu_irq_get(adev, &adev->pageflip_irq, irq_type))
+				drm_err(dev, "DM_IRQ: Cannot get pageflip irq!\n");
+#if defined(CONFIG_DRM_AMD_SECURE_DISPLAY)
+			if (amdgpu_irq_get(adev, &adev->vline0_irq, irq_type))
+				drm_err(dev, "DM_IRQ: Cannot get vline0 irq!\n");
+#endif
+		}
+
 	} else {
+		/* Allow RX6xxx, RX7700, RX7800 GPUs to call amdgpu_irq_put.*/
+		switch (amdgpu_ip_version(adev, DCE_HWIP, 0)) {
+		case IP_VERSION(3, 0, 0):
+		case IP_VERSION(3, 0, 2):
+		case IP_VERSION(3, 0, 3):
+		case IP_VERSION(3, 2, 0):
+#if defined(CONFIG_DRM_AMD_SECURE_DISPLAY)
+			if (amdgpu_irq_put(adev, &adev->vline0_irq, irq_type))
+				drm_err(dev, "DM_IRQ: Cannot put vline0 irq!\n");
+#endif
+			if (amdgpu_irq_put(adev, &adev->pageflip_irq, irq_type))
+				drm_err(dev, "DM_IRQ: Cannot put pageflip irq!\n");
+		}
+
 		drm_crtc_vblank_off(&acrtc->base);
 	}
 }
