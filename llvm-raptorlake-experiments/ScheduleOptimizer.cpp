@@ -1,23 +1,7 @@
 //===- ScheduleOptimizer.cpp - Calculate an optimized schedule ------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-//===----------------------------------------------------------------------===//
-//
-// This file implements the Polly schedule optimizer.
-//
-// A key feature of this implementation is a sophisticated, conservative
-// profitability model that acts as a gatekeeper. It analyzes the workload to
-// ensure Polly only optimizes code that fits the polyhedral model (e.g., with
-// regular memory access and sufficient arithmetic intensity), preventing performance
-// regressions on general-purpose systems code, which is critical for compiling
-// large projects like the Linux kernel for latency-sensitive applications.
-//
-// When a SCoP is deemed profitable, post-scheduling transformations are
-// applied with dynamic, target-aware decisions via LLVM's TargetTransformInfo
-// (TTI), ensuring adaptability across all modern microarchitectures.
 //
 //===----------------------------------------------------------------------===//
 
@@ -31,12 +15,16 @@
 #include "polly/ScopInfo.h"
 #include "polly/Support/ISLOStream.h"
 #include "polly/Support/ISLTools.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Sequence.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MathExtras.h"
 #include "isl/options.h"
@@ -55,7 +43,7 @@ class Module;
 #define DEBUG_TYPE "polly-opt-isl"
 
 //===----------------------------------------------------------------------===//
-// Command-line options (with generic defaults; optimizer uses TTI for intelligence)
+// Command-line options
 //===----------------------------------------------------------------------===//
 
 static cl::opt<std::string>
@@ -85,8 +73,8 @@ static cl::opt<std::string>
 
 static cl::opt<int>
     ScheduleComputeOut("polly-schedule-computeout",
-                       cl::desc("Bound the scheduler by maximal amount"
-                                "of computational steps. "),
+                       cl::desc("Bound the scheduler by maximal amount "
+                                "of computational steps."),
                        cl::Hidden, cl::init(300000), cl::ZeroOrMore,
                        cl::cat(PollyCategory));
 
@@ -113,8 +101,8 @@ static cl::opt<bool> FirstLevelTiling("polly-tiling",
 
 static cl::opt<int> FirstLevelDefaultTileSize(
     "polly-default-tile-size",
-    cl::desc("The default tile size (if not enough were provided by"
-             " --polly-tile-sizes)"),
+    cl::desc("The default tile size (if not enough were provided by "
+             "--polly-tile-sizes)"),
     cl::Hidden, cl::init(32), cl::cat(PollyCategory));
 
 static cl::list<int>
@@ -130,8 +118,8 @@ static cl::opt<bool>
 
 static cl::opt<int> SecondLevelDefaultTileSize(
     "polly-2nd-level-default-tile-size",
-    cl::desc("The default 2nd-level tile size (if not enough were provided by"
-             " --polly-2nd-level-tile-sizes)"),
+    cl::desc("The default 2nd-level tile size (if not enough were provided by "
+             "--polly-2nd-level-tile-sizes)"),
     cl::Hidden, cl::init(16), cl::cat(PollyCategory));
 
 static cl::list<int>
@@ -147,8 +135,8 @@ static cl::opt<bool> RegisterTiling("polly-register-tiling",
 
 static cl::opt<int> RegisterDefaultTileSize(
     "polly-register-tiling-default-tile-size",
-    cl::desc("The default register tile size (if not enough were provided by"
-             " --polly-register-tile-sizes)"),
+    cl::desc("The default register tile size (if not enough were provided by "
+             "--polly-register-tile-sizes)"),
     cl::Hidden, cl::init(4), cl::cat(PollyCategory));
 
 static cl::list<int>
@@ -214,7 +202,7 @@ STATISTIC(MatMulOpts,
 STATISTIC(NumVectorizedBands, "Number of bands marked for vectorization");
 
 namespace {
-// Additional parameters to guide the schedule optimizer.
+
 struct OptimizerAdditionalInfoTy {
   Scop *S;
   const llvm::TargetTransformInfo *TTI;
@@ -225,11 +213,6 @@ struct OptimizerAdditionalInfoTy {
   bool &DepsChanged;
 };
 
-//===----------------------------------------------------------------------===//
-// ScheduleTreeOptimizer - A set of post-scheduling transformations.
-//===----------------------------------------------------------------------===//
-
-// Forward-declarations for helper functions.
 static bool isSimpleInnermostBand(const isl::schedule_node &Node);
 
 class ScheduleTreeOptimizer final {
@@ -253,7 +236,7 @@ private:
   static isl::schedule_node applyPrevectBandOpt(isl::schedule_node Node, const OptimizerAdditionalInfoTy *OAI);
 };
 
-// A schedule rewriter to insert target-aware SIMD markers.
+// SIMD marks for innermost simple bands.
 struct InsertSimdMarkers final : ScheduleNodeRewriter<InsertSimdMarkers> {
   const TargetTransformInfo *TTI;
   InsertSimdMarkers(const TargetTransformInfo *TTI) : TTI(TTI) {}
@@ -261,27 +244,20 @@ struct InsertSimdMarkers final : ScheduleNodeRewriter<InsertSimdMarkers> {
   isl::schedule_node visitBand(isl::schedule_node_band Band) {
     isl::schedule_node Node = visitChildren(Band);
     if (!Node.isa<isl::schedule_node_band>()) {
-        return Node;
+      return Node;
     }
-
     isl::schedule_node_band BandNode = Node.as<isl::schedule_node_band>();
-
     if (!isSimpleInnermostBand(BandNode)) {
       return BandNode;
     }
-
-    isl::schedule_node_band ModifiedBand = BandNode;
     if (TTI) {
-      unsigned RegBitWidth = TTI->getLoadStoreVecRegBitWidth(0);
-      if (RegBitWidth > 0) {
-        unsigned Alignment = llvm::divideCeil(RegBitWidth, 8);
-        std::string OptStr = "{ align[" + std::to_string(Alignment) + "] }";
-        isl::union_set AlignOpts = isl::union_set(ModifiedBand.ctx(), OptStr);
-        ModifiedBand = ModifiedBand.set_ast_build_options(AlignOpts);
+      unsigned RegBits = TTI->getLoadStoreVecRegBitWidth(0);
+      if (RegBits == 0) {
+        return BandNode;
       }
     }
     NumVectorizedBands++;
-    return ModifiedBand.insert_mark(isl::id::alloc(Band.ctx(), "SIMD", nullptr));
+    return BandNode.insert_mark(isl::id::alloc(Band.ctx(), "SIMD", nullptr));
   }
 };
 
@@ -309,25 +285,22 @@ isl::schedule_node ScheduleTreeOptimizer::prevectSchedBand(
 
   auto Space = isl::manage(isl_schedule_node_band_get_space(Node.get()));
   unsigned ScheduleDimensions = unsignedFromIslSize(Space.dim(isl::dim::set));
-  assert(DimToVectorize < ScheduleDimensions);
+  assert(DimToVectorize < ScheduleDimensions && "DimToVectorize out of range");
 
   if (DimToVectorize > 0) {
-    Node = isl::manage(
-        isl_schedule_node_band_split(Node.release(), DimToVectorize));
+    Node = isl::manage(isl_schedule_node_band_split(Node.release(), DimToVectorize));
     Node = Node.child(0);
   }
   if (DimToVectorize < ScheduleDimensions - 1) {
     Node = isl::manage(isl_schedule_node_band_split(Node.release(), 1));
   }
+
   Space = isl::manage(isl_schedule_node_band_get_space(Node.get()));
   auto Sizes = isl::multi_val::zero(Space);
   Sizes = Sizes.set_val(0, isl::val(Node.ctx(), VectorWidth));
-  Node =
-      isl::manage(isl_schedule_node_band_tile(Node.release(), Sizes.release()));
+  Node = isl::manage(isl_schedule_node_band_tile(Node.release(), Sizes.release()));
   Node = isolateFullPartialTiles(Node, VectorWidth);
   Node = Node.child(0);
-  Node = Node.as<isl::schedule_node_band>().set_ast_build_options(
-      isl::union_set(Node.ctx(), "{ unroll[x]: 1 = 0 }"));
   Node = isl::manage(isl_schedule_node_band_sink(Node.release()));
   Node = InsertSimdMarkers(TTI).visit(Node);
 
@@ -340,25 +313,20 @@ static bool isSimpleInnermostBand(const isl::schedule_node &Node) {
   assert(isl_schedule_node_n_children(Node.get()) == 1);
 
   auto ChildType = isl_schedule_node_get_type(Node.child(0).get());
-
   if (ChildType == isl_schedule_node_leaf) {
     return true;
   }
-
   if (ChildType != isl_schedule_node_sequence) {
     return false;
   }
 
   auto Sequence = Node.child(0);
-
-  for (int c = 0, nc = isl_schedule_node_n_children(Sequence.get()); c < nc;
-       ++c) {
+  for (int c = 0, nc = isl_schedule_node_n_children(Sequence.get()); c < nc; ++c) {
     auto Child = Sequence.child(c);
     if (isl_schedule_node_get_type(Child.get()) != isl_schedule_node_filter) {
       return false;
     }
-    if (isl_schedule_node_get_type(Child.child(0).get()) !=
-        isl_schedule_node_leaf) {
+    if (isl_schedule_node_get_type(Child.child(0).get()) != isl_schedule_node_leaf) {
       return false;
     }
   }
@@ -396,15 +364,73 @@ bool ScheduleTreeOptimizer::isPMOptimizableBandNode(isl::schedule_node Node) {
   return Node.child(0).isa<isl::schedule_node_leaf>();
 }
 
-// Heuristic to get dominant element bytes from SCoP.
-static unsigned getDominantElementTypeBytes(Scop &S) {
-    // A more advanced implementation would analyze ScopStmts to find
-    // the most frequent memory access type size. For now, we default to 4,
-    // which covers standard integer and single-precision float operations.
-    return 4;
+// Distinct arrays touched.
+static unsigned countDistinctArrays(const Scop &S) {
+  SmallPtrSet<const ScopArrayInfo *, 16> Arrays;
+  for (const ScopStmt &Stmt : S) {
+    for (const MemoryAccess *MA : Stmt) {
+      Arrays.insert(MA->getScopArrayInfo());
+    }
+  }
+  return Arrays.size();
 }
 
-// Derives a cache-aware tile size from TTI.
+// Dominant element type size, cached per Scop.
+static unsigned getDominantElementTypeBytes(Scop &S) {
+  static thread_local DenseMap<const Scop *, unsigned> Cache;
+  if (auto It = Cache.find(&S); It != Cache.end()) {
+    return It->second;
+  }
+
+  const DataLayout &DL = S.getFunction().getParent()->getDataLayout();
+  DenseMap<unsigned, unsigned> Freq;
+
+  for (const ScopStmt &Stmt : S) {
+    for (const MemoryAccess *MA : Stmt) {
+      Type *Ty = MA->getElementType();
+      if (!Ty || !Ty->isSized()) {
+        continue;
+      }
+      unsigned Bytes = static_cast<unsigned>(DL.getTypeStoreSize(Ty));
+      if (!Bytes) {
+        continue;
+      }
+      Freq[Bytes] = Freq.lookup(Bytes) + 1;
+    }
+  }
+
+  unsigned BestBytes = 4, BestCount = 0;
+  for (const auto &KV : Freq) {
+    unsigned B = KV.first, C = KV.second;
+    if (C > BestCount || (C == BestCount && B < BestBytes)) {
+      BestCount = C;
+      BestBytes = B;
+    }
+  }
+  if (BestBytes == 0) {
+    BestBytes = 4;
+  }
+  Cache[&S] = BestBytes;
+  return BestBytes;
+}
+
+// Compute lanes from vector register bitwidth.
+static int getVectorLanes(const TargetTransformInfo *TTI, unsigned ElemBytes) {
+  if (!TTI || ElemBytes == 0) {
+    return 1;
+  }
+  unsigned RegBits = TTI->getLoadStoreVecRegBitWidth(0);
+  if (RegBits == 0) {
+    return 1;
+  }
+  unsigned ElemBits = ElemBytes * 8U;
+  if (ElemBits == 0) {
+    return 1;
+  }
+  return std::max(1, static_cast<int>(RegBits / ElemBits));
+}
+
+// Baseline cache-aware default tile size.
 static int getCacheAwareTileSize(const TargetTransformInfo *TTI,
                                  TargetTransformInfo::CacheLevel Level,
                                  int DefaultSize, unsigned ElemBytes) {
@@ -415,45 +441,99 @@ static int getCacheAwareTileSize(const TargetTransformInfo *TTI,
   if (!MaybeCacheSize || *MaybeCacheSize == 0) {
     return DefaultSize;
   }
-
-  // Target 80% of the cache size to leave room for other data.
-  double Effective = 0.8 * static_cast<double>(*MaybeCacheSize) / ElemBytes;
-  double TileDouble = std::sqrt(Effective);
-  // Clamp to a reasonable range and round up to the next power of two.
+  double Effective = 0.8 * static_cast<double>(*MaybeCacheSize) / static_cast<double>(ElemBytes);
+  double TileDouble = std::sqrt(std::max(1.0, Effective));
   int Tile = std::clamp(static_cast<int>(TileDouble), 16, 256);
-  return llvm::PowerOf2Ceil(static_cast<unsigned>(Tile));
+  return static_cast<int>(llvm::PowerOf2Ceil(static_cast<unsigned>(Tile)));
 }
+
+// Smarter tile size factoring in arrays and vector lanes.
+static int getSmartTileSize(const TargetTransformInfo *TTI,
+                            TargetTransformInfo::CacheLevel Level,
+                            int DefaultSize, unsigned ElemBytes,
+                            unsigned NumArrays, int VecLanes) {
+  if (!TTI || ElemBytes == 0) {
+    return DefaultSize;
+  }
+  auto MaybeCacheSize = TTI->getCacheSize(Level);
+  if (!MaybeCacheSize || *MaybeCacheSize == 0) {
+    return DefaultSize;
+  }
+  unsigned Arrays = std::max(1u, NumArrays);
+  double Effective = 0.7 * static_cast<double>(*MaybeCacheSize) /
+                     (static_cast<double>(ElemBytes) * static_cast<double>(Arrays));
+  double TileDouble = std::sqrt(std::max(1.0, Effective));
+  int Tile = std::clamp(static_cast<int>(TileDouble), 16, 256);
+  int Pow2 = static_cast<int>(llvm::PowerOf2Ceil(static_cast<unsigned>(Tile)));
+  int Lanes = std::max(1, VecLanes);
+  int Aligned = std::max(Lanes, (Pow2 / Lanes) * Lanes);
+  return Aligned;
+}
+
+// Scoped guard for ISL scheduler options.
+struct ScopedIslScheduleOptionsGuard {
+  isl_ctx *Ctx;
+  int OldMaxConst = 0;
+  int OldMaxCoeff = 0;
+  bool Enabled = false;
+
+  ScopedIslScheduleOptionsGuard(isl_ctx *Ctx, int NewMaxConst, int NewMaxCoeff)
+      : Ctx(Ctx) {
+    if (!Ctx) {
+      return;
+    }
+    OldMaxConst = isl_options_get_schedule_max_constant_term(Ctx);
+    OldMaxCoeff = isl_options_get_schedule_max_coefficient(Ctx);
+    bool Change = false;
+    if (NewMaxConst >= 0 && (OldMaxConst < 0 || NewMaxConst < OldMaxConst)) {
+      isl_options_set_schedule_max_constant_term(Ctx, NewMaxConst);
+      Change = true;
+    }
+    if (NewMaxCoeff >= 0 && (OldMaxCoeff < 0 || NewMaxCoeff < OldMaxCoeff)) {
+      isl_options_set_schedule_max_coefficient(Ctx, NewMaxCoeff);
+      Change = true;
+    }
+    Enabled = Change;
+  }
+
+  ~ScopedIslScheduleOptionsGuard() {
+    if (!Ctx || !Enabled) {
+      return;
+    }
+    isl_options_set_schedule_max_constant_term(Ctx, OldMaxConst);
+    isl_options_set_schedule_max_coefficient(Ctx, OldMaxCoeff);
+  }
+};
 
 __isl_give isl::schedule_node
 ScheduleTreeOptimizer::applyTileBandOpt(isl::schedule_node Node, const OptimizerAdditionalInfoTy *OAI) {
   unsigned ElemBytes = getDominantElementTypeBytes(*OAI->S);
+  unsigned NumArrays = countDistinctArrays(*OAI->S);
+  int VecLanes = getVectorLanes(OAI->TTI, ElemBytes);
 
-  if (FirstLevelTiling) {
-    int TileSize = getCacheAwareTileSize(OAI->TTI, TargetTransformInfo::CacheLevel::L1D,
-                                         FirstLevelDefaultTileSize, ElemBytes);
+  if (FirstLevelTiling.getValue()) {
+    int DefaultT = FirstLevelDefaultTileSize.getValue();
+    int TileSize = getSmartTileSize(OAI->TTI, TargetTransformInfo::CacheLevel::L1D,
+                                    DefaultT, ElemBytes, NumArrays, VecLanes);
     Node = tileNode(Node, "1st level tiling", FirstLevelTileSizes, TileSize);
     FirstLevelTileOpts++;
   }
 
-  if (SecondLevelTiling) {
-    int TileSize = getCacheAwareTileSize(OAI->TTI, TargetTransformInfo::CacheLevel::L2D,
-                                         SecondLevelDefaultTileSize, ElemBytes);
-    Node = tileNode(Node, "2nd level tiling", SecondLevelTileSizes, TileSize);
+  if (SecondLevelTiling.getValue()) {
+    int DefaultT2 = SecondLevelDefaultTileSize.getValue();
+    int TileSize2 = getSmartTileSize(OAI->TTI, TargetTransformInfo::CacheLevel::L2D,
+                                     DefaultT2, ElemBytes, NumArrays, VecLanes);
+    Node = tileNode(Node, "2nd level tiling", SecondLevelTileSizes, TileSize2);
     SecondLevelTileOpts++;
   }
 
-  if (RegisterTiling) {
-    int RegTileSize = RegisterDefaultTileSize;
-    if (OAI->TTI) {
-      // CORRECTED: The API for getUnrollingPreferences requires a Loop*,
-      // ScalarEvolution&, the preferences struct, and an ORE*. As we are in a
-      // general context not specific to one loop, we pass nullptr for the
-      // optional parameters to query the target's default preferences.
-      TargetTransformInfo::UnrollingPreferences UnrollPrefs;
-      OAI->TTI->getUnrollingPreferences(nullptr, *OAI->S->getSE(), UnrollPrefs,
-                                        nullptr);
-      if (UnrollPrefs.Count > 0) {
-        RegTileSize = UnrollPrefs.Count;
+  if (RegisterTiling.getValue()) {
+    int RegTileSize = RegisterDefaultTileSize.getValue();
+    if (OAI->TTI && ElemBytes > 0) {
+      unsigned RegBitWidth = OAI->TTI->getLoadStoreVecRegBitWidth(0);
+      if (RegBitWidth > 0) {
+        int Lanes = std::max(1, static_cast<int>(RegBitWidth / (ElemBytes * 8U)));
+        RegTileSize = std::max(RegTileSize, Lanes);
       }
     }
     Node = applyRegisterTiling(Node, RegisterTileSizes, RegTileSize);
@@ -465,19 +545,19 @@ ScheduleTreeOptimizer::applyTileBandOpt(isl::schedule_node Node, const Optimizer
 isl::schedule_node
 ScheduleTreeOptimizer::applyPrevectBandOpt(isl::schedule_node Node, const OptimizerAdditionalInfoTy *OAI) {
   auto Space = isl::manage(isl_schedule_node_band_get_space(Node.get()));
-  int Dims = unsignedFromIslSize(Space.dim(isl::dim::set));
+  int Dims = static_cast<int>(unsignedFromIslSize(Space.dim(isl::dim::set)));
   unsigned ElemBytes = getDominantElementTypeBytes(*OAI->S);
 
   for (int i = Dims - 1; i >= 0; i--) {
     if (Node.as<isl::schedule_node_band>().member_get_coincident(i)) {
-      int VecWidth = PrevectorWidth;
-      if (OAI->TTI) {
+      int VecWidth = std::max(1, PrevectorWidth.getValue());
+      if (OAI->TTI && ElemBytes > 0) {
         unsigned RegBitWidth = OAI->TTI->getLoadStoreVecRegBitWidth(0);
-        if (RegBitWidth > 0 && ElemBytes > 0) {
-          VecWidth = RegBitWidth / (ElemBytes * 8);
+        if (RegBitWidth > 0) {
+          VecWidth = std::max(1, static_cast<int>(RegBitWidth / (ElemBytes * 8U)));
         }
       }
-      Node = prevectSchedBand(Node, i, std::max(1, VecWidth), OAI->TTI);
+      Node = prevectSchedBand(Node, static_cast<unsigned>(i), VecWidth, OAI->TTI);
       break;
     }
   }
@@ -535,19 +615,19 @@ isl::schedule_node ScheduleTreeOptimizer::optimizeScheduleNode(
 }
 
 static unsigned countParallelBands(const isl::schedule &Schedule) {
-    unsigned Count = 0;
-    if (isl::schedule_node Root = Schedule.get_root(); !Root.is_null()) {
-      Root.foreach_descendant_top_down(
-          [&](const isl::schedule_node &node) -> isl::boolean {
-            if (node.isa<isl::schedule_node_band>()) {
-                if (node.as<isl::schedule_node_band>().get_permutable()) {
-                    Count++;
-                }
+  unsigned Count = 0;
+  if (isl::schedule_node Root = Schedule.get_root(); !Root.is_null()) {
+    Root.foreach_descendant_top_down(
+        [&](const isl::schedule_node &node) -> isl::boolean {
+          if (node.isa<isl::schedule_node_band>()) {
+            if (node.as<isl::schedule_node_band>().get_permutable()) {
+              Count++;
             }
-            return isl::boolean(true); // Continue traversal
-          });
-    }
-    return Count;
+          }
+          return isl::boolean(true);
+        });
+  }
+  return Count;
 }
 
 bool ScheduleTreeOptimizer::isProfitableSchedule(Scop &S,
@@ -557,37 +637,56 @@ bool ScheduleTreeOptimizer::isProfitableSchedule(Scop &S,
 
   unsigned NewParallelBands = countParallelBands(NewSchedule);
   unsigned OldParallelBands = countParallelBands(OldSchedule);
-
   if (NewParallelBands > OldParallelBands) {
     return true;
   }
-
   return !OldSchedule.get_map().is_equal(NewSchedule.get_map());
 }
 
-// A gatekeeper function to prevent Polly from optimizing code that is unlikely
-// to benefit, which is common in systems and gaming code.
+// Profitability gate with compute/memory balance.
 static bool isProfitableToOptimize(Scop &S) {
   const unsigned MinProfitableLoopDepth = 2;
   const unsigned MaxIrregularAccesses = 2;
-  const unsigned MinFPInstructions = 1;
 
   if (S.getMaxLoopDepth() < MinProfitableLoopDepth) {
     POLLY_DEBUG(dbgs() << "Skipping SCoP: Not enough loop depth\n");
+    ScopsRejected++;
     return false;
   }
 
   unsigned IrregularAccessCount = 0;
-  unsigned FPInstructionCount = 0;
+  unsigned ComputeOps = 0;
+  unsigned MemOps = 0;
+
   for (const ScopStmt &Stmt : S) {
     for (const MemoryAccess *MA : Stmt) {
       if (!MA->isAffine()) {
         IrregularAccessCount++;
       }
+      MemOps++;
     }
     for (const Instruction *I : Stmt.getInstructions()) {
-      if (I->getType()->isFloatingPointTy()) {
-        FPInstructionCount++;
+      if (const auto *BO = dyn_cast<BinaryOperator>(I)) {
+        switch (BO->getOpcode()) {
+        case Instruction::Add:
+        case Instruction::Sub:
+        case Instruction::Mul:
+        case Instruction::Shl:
+        case Instruction::AShr:
+        case Instruction::LShr:
+        case Instruction::And:
+        case Instruction::Or:
+        case Instruction::Xor:
+        case Instruction::FAdd:
+        case Instruction::FSub:
+        case Instruction::FMul:
+        case Instruction::FDiv:
+        case Instruction::FRem:
+          ComputeOps++;
+          break;
+        default:
+          break;
+        }
       }
     }
   }
@@ -598,10 +697,19 @@ static bool isProfitableToOptimize(Scop &S) {
     return false;
   }
 
-  if (FPInstructionCount < MinFPInstructions) {
-    POLLY_DEBUG(dbgs() << "Skipping SCoP: Not enough floating point instructions\n");
+  if (ComputeOps == 0) {
+    POLLY_DEBUG(dbgs() << "Skipping SCoP: Not enough compute\n");
     ScopsRejected++;
     return false;
+  }
+
+  if (MemOps > 0) {
+    double Ratio = static_cast<double>(ComputeOps) / static_cast<double>(MemOps);
+    if (Ratio < 0.25) {
+      POLLY_DEBUG(dbgs() << "Skipping SCoP: Low compute per memory access\n");
+      ScopsRejected++;
+      return false;
+    }
   }
 
   return true;
@@ -652,29 +760,28 @@ static void walkScheduleTreeForStatistics(isl::schedule Schedule, int Version) {
       Root.get(),
       [](__isl_keep isl_schedule_node *nodeptr, void *user) -> isl_bool {
         isl::schedule_node Node = isl::manage_copy(nodeptr);
-        int Version = *static_cast<int *>(user);
+        int Ver = *static_cast<int *>(user);
 
         switch (isl_schedule_node_get_type(Node.get())) {
         case isl_schedule_node_band: {
-          NumBands[Version]++;
-          if (isl_schedule_node_band_get_permutable(Node.get()) ==
-              isl_bool_true) {
-            NumPermutable[Version]++;
+          NumBands[Ver]++;
+          if (isl_schedule_node_band_get_permutable(Node.get()) == isl_bool_true) {
+            NumPermutable[Ver]++;
           }
           int CountMembers = isl_schedule_node_band_n_member(Node.get());
-          NumBandMembers[Version] += CountMembers;
+          NumBandMembers[Ver] += CountMembers;
           for (int i = 0; i < CountMembers; i += 1) {
             if (Node.as<isl::schedule_node_band>().member_get_coincident(i)) {
-              NumCoincident[Version]++;
+              NumCoincident[Ver]++;
             }
           }
           break;
         }
         case isl_schedule_node_filter:
-          NumFilters[Version]++;
+          NumFilters[Ver]++;
           break;
         case isl_schedule_node_extension:
-          NumExtension[Version]++;
+          NumExtension[Ver]++;
           break;
         default:
           break;
@@ -736,13 +843,27 @@ isl::schedule computeSchedule(Scop &S, const Dependences &D) {
   isl_ctx *Ctx = S.getIslCtx().get();
   auto OnErrorStatus = isl_options_get_on_error(Ctx);
   isl_options_set_on_error(Ctx, ISL_ON_ERROR_CONTINUE);
+
+  int NewMaxConst = MaxConstantTerm;
+  int NewMaxCoeff = MaxCoefficient;
+  if (S.getSize() > 50 || S.getMaxLoopDepth() > 3) {
+    if (NewMaxConst > 0) {
+      NewMaxConst = std::max(10, NewMaxConst / 2);
+    }
+    if (NewMaxCoeff > 0) {
+      NewMaxCoeff = std::max(10, NewMaxCoeff / 2);
+    }
+  }
+
   {
-    IslMaxOperationsGuard MaxOpGuard(Ctx, ScheduleComputeOut);
+    ScopedIslScheduleOptionsGuard OptGuard(Ctx, NewMaxConst, NewMaxCoeff);
+    IslMaxOperationsGuard MaxOpGuard(Ctx, ScheduleComputeOut.getValue());
     Result = SC.compute_schedule();
     if (MaxOpGuard.hasQuotaExceeded()) {
       POLLY_DEBUG(dbgs() << "Scheduler calculation exceeds ISL quota\n");
     }
   }
+
   isl_options_set_on_error(Ctx, OnErrorStatus);
   return Result;
 }
@@ -767,7 +888,7 @@ void runIslScheduleOptimizer(
   POLLY_DEBUG(printSchedule(dbgs(), Schedule, "Original schedule tree"));
 
   bool HasUserTransformation = false;
-  if (PragmaBasedOpts) {
+  if (PragmaBasedOpts.getValue()) {
     isl::schedule ManuallyTransformed =
         applyManualTransformations(&S, Schedule, GetDeps(Dependences::AL_Statement), ORE);
     if (ManuallyTransformed.is_null()) {
@@ -792,7 +913,7 @@ void runIslScheduleOptimizer(
     return;
   }
 
-  if (!EnableReschedule) {
+  if (!EnableReschedule.getValue()) {
     POLLY_DEBUG(dbgs() << "Skipping rescheduling due to command line option\n");
   } else if (HasUserTransformation) {
     POLLY_DEBUG(dbgs() << "Skipping rescheduling due to manual transformation\n");
@@ -808,16 +929,22 @@ void runIslScheduleOptimizer(
   }
   walkScheduleTreeForStatistics(Schedule, 1);
 
-  if (GreedyFusion) {
+  if (GreedyFusion.getValue()) {
+    isl::schedule BeforeGF = Schedule;
     isl::union_map Validity = D.getDependences(
         Dependences::TYPE_RAW | Dependences::TYPE_WAR | Dependences::TYPE_WAW);
     Schedule = applyGreedyFusion(Schedule, Validity);
     assert(!Schedule.is_null() && "Greedy fusion should not fail");
+    unsigned BeforeBands = countParallelBands(BeforeGF);
+    unsigned AfterBands = countParallelBands(Schedule);
+    if (AfterBands < BeforeBands && Schedule.get_map().is_equal(BeforeGF.get_map())) {
+      Schedule = BeforeGF;
+    }
   }
 
   const OptimizerAdditionalInfoTy OAI = {
-      &S, TTI, &D, !HasUserTransformation && PMBasedOpts,
-      !HasUserTransformation && EnablePostopts,
+      &S, TTI, &D, !HasUserTransformation && PMBasedOpts.getValue(),
+      !HasUserTransformation && EnablePostopts.getValue(),
       PollyVectorizerChoice != VECTORIZER_NONE, DepsChanged};
   if (OAI.PatternOpts || OAI.Postopts || OAI.Prevect) {
     Schedule = ScheduleTreeOptimizer::optimizeSchedule(Schedule, &OAI);
@@ -838,7 +965,7 @@ void runIslScheduleOptimizer(
   S.setScheduleTree(Schedule);
   S.markAsOptimized();
 
-  if (OptimizedScops) {
+  if (OptimizedScops.getValue()) {
     errs() << S;
   }
 }
@@ -881,6 +1008,7 @@ void IslScheduleOptimizerWrapperPass::getAnalysisUsage(AnalysisUsage &AU) const 
   AU.addPreserved<DependenceInfo>();
   AU.addPreserved<OptimizationRemarkEmitterWrapperPass>();
 }
+
 } // namespace
 
 Pass *polly::createIslScheduleOptimizerWrapperPass() {
@@ -943,6 +1071,7 @@ IslScheduleOptimizerPrinterPass::run(Scop &S, ScopAnalysisManager &SAM,
 //===----------------------------------------------------------------------===//
 
 namespace {
+
 class IslScheduleOptimizerPrinterLegacyPass final : public ScopPass {
 public:
   static char ID;
@@ -972,6 +1101,7 @@ private:
 };
 
 char IslScheduleOptimizerPrinterLegacyPass::ID = 0;
+
 } // namespace
 
 Pass *polly::createIslScheduleOptimizerPrinterLegacyPass(raw_ostream &OS) {
