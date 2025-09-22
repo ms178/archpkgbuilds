@@ -1,3 +1,9 @@
+/*
+ * Copyright © 2018 Valve Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "aco_builder.h"
 #include "aco_ir.h"
 
@@ -7,6 +13,7 @@
 #include <vector>
 #include <cstring>
 #include <cassert>
+#include <unordered_map>
 
 #define SMEM_WINDOW_SIZE    (256 - ctx.occupancy_factor * 16)
 #define VMEM_WINDOW_SIZE    (1024 - ctx.occupancy_factor * 64)
@@ -20,6 +27,14 @@
 #define VMEM_CLAUSE_MAX_GRAB_DIST       (ctx.occupancy_factor * 2)
 #define VMEM_STORE_CLAUSE_MAX_GRAB_DIST (ctx.occupancy_factor * 4)
 #define POS_EXP_MAX_MOVES         512
+
+#if defined(__clang__) || defined(__GNUC__)
+#define ACO_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define ACO_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define ACO_LIKELY(x)   (x)
+#define ACO_UNLIKELY(x) (x)
+#endif
 
 namespace aco {
 
@@ -143,6 +158,9 @@ struct sched_ctx {
    MoveState mv;
    bool schedule_pos_exports = true;
    unsigned schedule_pos_export_div = 1;
+
+   /* Per-block hazard cache keyed by Instruction*. */
+   std::unordered_map<const Instruction*, struct CachedHazard> hazard_cache;
 };
 
 /* This scheduler is a simple bottom-up pass based on ideas from
@@ -527,6 +545,23 @@ get_sync_info_with_hack(const Instruction* instr)
    return sync;
 }
 
+/* New: central predicate to bail early on unreorderable instructions. */
+bool
+is_reorderable(const Instruction* instr)
+{
+   return instr->opcode != aco_opcode::s_memtime && instr->opcode != aco_opcode::s_memrealtime &&
+          instr->opcode != aco_opcode::s_setprio && instr->opcode != aco_opcode::s_getreg_b32 &&
+          instr->opcode != aco_opcode::p_shader_cycles_hi_lo_hi &&
+          instr->opcode != aco_opcode::p_init_scratch &&
+          instr->opcode != aco_opcode::p_jump_to_epilog &&
+          instr->opcode != aco_opcode::s_sendmsg_rtn_b32 &&
+          instr->opcode != aco_opcode::s_sendmsg_rtn_b64 &&
+          instr->opcode != aco_opcode::p_end_with_regs && instr->opcode != aco_opcode::s_nop &&
+          instr->opcode != aco_opcode::s_sleep && instr->opcode != aco_opcode::s_trap &&
+          instr->opcode != aco_opcode::p_call && instr->opcode != aco_opcode::p_logical_start &&
+          instr->opcode != aco_opcode::p_logical_end;
+}
+
 struct memory_event_set {
    bool has_control_barrier;
 
@@ -684,19 +719,6 @@ perform_hazard_query(hazard_query* query, Instruction* instr, bool upwards)
    if (instr->isEXP() || instr->opcode == aco_opcode::p_dual_src_export_gfx11)
       return hazard_fail_export;
 
-   /* don't move non-reorderable instructions */
-   if (instr->opcode == aco_opcode::s_memtime || instr->opcode == aco_opcode::s_memrealtime ||
-       instr->opcode == aco_opcode::s_setprio || instr->opcode == aco_opcode::s_getreg_b32 ||
-       instr->opcode == aco_opcode::p_shader_cycles_hi_lo_hi ||
-       instr->opcode == aco_opcode::p_init_scratch ||
-       instr->opcode == aco_opcode::p_jump_to_epilog ||
-       instr->opcode == aco_opcode::s_sendmsg_rtn_b32 ||
-       instr->opcode == aco_opcode::s_sendmsg_rtn_b64 ||
-       instr->opcode == aco_opcode::p_end_with_regs || instr->opcode == aco_opcode::s_nop ||
-       instr->opcode == aco_opcode::s_sleep || instr->opcode == aco_opcode::s_trap ||
-       instr->opcode == aco_opcode::p_call)
-      return hazard_fail_unreorderable;
-
    /* Fast-path: side-effect-free ALU/VINTRP don't participate in memory/barrier hazards.
     * Keep after exec/export/non-reorderable checks to maintain correctness.
     */
@@ -768,6 +790,121 @@ perform_hazard_query(hazard_query* query, Instruction* instr, bool upwards)
    return hazard_success;
 }
 
+/* Fast predicate matching the ALU fast path in perform_hazard_query(). */
+static inline bool is_alu_nohazard(const Instruction* instr)
+{
+   return !instr->isVMEM() && !instr->isFlatLike() && !instr->isSMEM() &&
+          !instr->accessesLDS() && !instr->isEXP() &&
+          instr->opcode != aco_opcode::p_barrier;
+}
+
+/* Cached hazard data for a single instruction. */
+struct CachedHazard {
+   memory_event_set events;
+   memory_sync_info sync;
+};
+
+static inline HazardResult
+perform_hazard_query_cached(hazard_query* query,
+                            Instruction* instr,
+                            bool upwards,
+                            const memory_event_set& instr_set,
+                            const memory_sync_info& sync)
+{
+   /* don't schedule discards downwards */
+   if (!upwards && instr->opcode == aco_opcode::p_exit_early_if_not)
+      return hazard_fail_unreorderable;
+
+   /* POPS ordered section and export placement constraints */
+   if (upwards) {
+      if (instr->opcode == aco_opcode::p_pops_gfx9_add_exiting_wave_id ||
+          is_wait_export_ready(query->gfx_level, instr)) {
+         return hazard_fail_unreorderable;
+      }
+   } else {
+      if (instr->opcode == aco_opcode::p_pops_gfx9_ordered_section_done) {
+         return hazard_fail_unreorderable;
+      }
+   }
+
+   if (query->uses_exec || query->writes_exec) {
+      for (const Definition& def : instr->definitions) {
+         if (def.isFixed() && def.physReg() == exec)
+            return hazard_fail_exec;
+      }
+   }
+   if (query->writes_exec && needs_exec_mask(instr))
+      return hazard_fail_exec;
+
+   if (instr->isEXP() || instr->opcode == aco_opcode::p_dual_src_export_gfx11)
+      return hazard_fail_export;
+
+   /* Fast-path: side-effect-free ALU/VINTRP have no hazards. */
+   if (ACO_LIKELY(is_alu_nohazard(instr)))
+      return hazard_success;
+
+   const memory_event_set* first = &instr_set;
+   const memory_event_set* second = &query->mem_events;
+   if (upwards)
+      std::swap(first, second);
+
+   if ((first->has_control_barrier || first->access_atomic) && second->bar_acquire)
+      return hazard_fail_barrier;
+   if (((first->access_acquire || first->bar_acquire) && second->bar_classes) ||
+       ((first->access_acquire | first->bar_acquire) &
+        (second->access_relaxed | second->access_atomic)))
+      return hazard_fail_barrier;
+
+   if (first->bar_release && (second->has_control_barrier || second->access_atomic))
+      return hazard_fail_barrier;
+   if ((first->bar_classes && (second->bar_release || second->access_release)) ||
+       ((first->access_relaxed | first->access_atomic) &
+        (second->bar_release | second->access_release)))
+      return hazard_fail_barrier;
+
+   if (first->bar_classes && second->bar_classes)
+      return hazard_fail_barrier;
+
+   const unsigned control_classes =
+      storage_buffer | storage_image | storage_shared | storage_task_payload;
+   if (first->has_control_barrier &&
+       ((second->access_atomic | second->access_relaxed) & control_classes))
+      return hazard_fail_barrier;
+
+   unsigned aliasing_storage =
+      instr->isSMEM() ? query->aliasing_storage_smem : query->aliasing_storage;
+   if ((sync.storage & aliasing_storage) && !(sync.semantics & semantic_can_reorder)) {
+      unsigned intersect = sync.storage & aliasing_storage;
+      if (intersect & storage_shared)
+         return hazard_fail_reorder_ds;
+      return hazard_fail_reorder_vmem_smem;
+   }
+
+   if ((instr->opcode == aco_opcode::p_spill || instr->opcode == aco_opcode::p_reload) &&
+       query->contains_spill)
+      return hazard_fail_spill;
+
+   if (instr->opcode == aco_opcode::s_sendmsg && query->contains_sendmsg)
+      return hazard_fail_reorder_sendmsg;
+
+   return hazard_success;
+}
+
+static inline HazardResult
+hazard_query_cached(sched_ctx& ctx, hazard_query* query, Instruction* instr, bool upwards)
+{
+   /* Fast ALU path: common case, no cache lookup needed. */
+   if (ACO_LIKELY(is_alu_nohazard(instr)))
+      return hazard_success;
+
+   auto it = ctx.hazard_cache.find(instr);
+   if (ACO_LIKELY(it != ctx.hazard_cache.end()))
+      return perform_hazard_query_cached(query, instr, upwards, it->second.events, it->second.sync);
+
+   /* Fallback if not cached (should seldom happen): use original path. */
+   return perform_hazard_query(query, instr, upwards);
+}
+
 unsigned
 get_likely_cost(Instruction* instr)
 {
@@ -804,6 +941,12 @@ schedule_SMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
    int max_moves = SMEM_MAX_MOVES;
    int16_t k = 0;
 
+   /* GFX9: modest increase to help place ALU under SMEM latency safely. */
+   if (ctx.gfx_level <= GFX9) {
+      window_size = window_size + window_size / 4;  /* +25% */
+      max_moves   = max_moves   + max_moves / 8;    /* +12.5% */
+   }
+
    /* don't move s_memtime/s_memrealtime */
    if (current->opcode == aco_opcode::s_memtime || current->opcode == aco_opcode::s_memrealtime ||
        current->opcode == aco_opcode::s_sendmsg_rtn_b32 ||
@@ -829,8 +972,8 @@ schedule_SMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
       if (can_stall_prev_smem && ctx.last_SMEM_stall >= 0)
          break;
 
-      /* break when encountering another MEM instruction, logical_start or barriers */
-      if (candidate->opcode == aco_opcode::p_logical_start)
+      /* break when encountering another MEM instruction, or unreorderable */
+      if (!is_reorderable(candidate.get()))
          break;
       /* only move VMEM instructions below descriptor loads. be more aggressive at higher num_waves
        * to help create more vmem clauses */
@@ -845,7 +988,7 @@ schedule_SMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
 
       bool can_move_down = true;
 
-      HazardResult haz = perform_hazard_query(&hq, candidate.get(), false);
+      HazardResult haz = hazard_query_cached(ctx, &hq, candidate.get(), false);
       if (haz == hazard_fail_reorder_ds || haz == hazard_fail_spill ||
           haz == hazard_fail_reorder_sendmsg || haz == hazard_fail_barrier ||
           haz == hazard_fail_export)
@@ -886,7 +1029,7 @@ schedule_SMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
       assert(candidate_idx < (int)block->instructions.size());
       aco_ptr<Instruction>& candidate = block->instructions[candidate_idx];
 
-      if (candidate->opcode == aco_opcode::p_logical_end)
+      if (!is_reorderable(candidate.get()))
          break;
 
       /* check if candidate depends on current */
@@ -896,7 +1039,7 @@ schedule_SMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
          break;
 
       if (found_dependency) {
-         HazardResult haz = perform_hazard_query(&hq, candidate.get(), true);
+         HazardResult haz = hazard_query_cached(ctx, &hq, candidate.get(), true);
          if (haz == hazard_fail_reorder_ds || haz == hazard_fail_spill ||
              haz == hazard_fail_reorder_sendmsg || haz == hazard_fail_barrier ||
              haz == hazard_fail_export)
@@ -950,9 +1093,7 @@ schedule_VMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
    bool only_clauses = false;
    int16_t k = 0;
 
-   /* GFX9 (Vega): slightly increase window to improve clause formation and latency hiding.
-    * Safety preserved by hazard checks and register pressure limits.
-    */
+   /* GFX9 (Vega): increase window to improve clause formation and latency hiding. */
    if (ctx.gfx_level <= GFX9) {
       window_size = window_size + window_size / 2;            /* x1.5 */
       max_moves   = max_moves   + max_moves / 4;              /* x1.25 */
@@ -976,8 +1117,8 @@ schedule_VMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
       aco_ptr<Instruction>& candidate = block->instructions[candidate_idx];
       bool is_vmem = candidate->isVMEM() || candidate->isFlatLike();
 
-      /* Break when encountering another VMEM instruction, logical_start or barriers. */
-      if (candidate->opcode == aco_opcode::p_logical_start)
+      /* Break when encountering another VMEM instruction, unreorderable, or barriers. */
+      if (!is_reorderable(candidate.get()))
          break;
 
       if (should_form_clause(current, candidate.get())) {
@@ -987,7 +1128,7 @@ schedule_VMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
          if (grab_dist >= clause_max_grab_dist + k)
             break;
 
-         if (perform_hazard_query(&clause_hq, candidate.get(), false) == hazard_success)
+         if (hazard_query_cached(ctx, &clause_hq, candidate.get(), false) == hazard_success)
             ctx.mv.downwards_move_clause(cursor);
 
          /* We move the entire clause at once.
@@ -1005,7 +1146,7 @@ schedule_VMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
       /* If current depends on candidate, add additional dependencies and continue. */
       bool can_move_down = !only_clauses && (!is_vmem || candidate->definitions.empty());
 
-      HazardResult haz = perform_hazard_query(&indep_hq, candidate.get(), false);
+      HazardResult haz = hazard_query_cached(ctx, &indep_hq, candidate.get(), false);
       if (haz == hazard_fail_reorder_ds || haz == hazard_fail_spill ||
           haz == hazard_fail_reorder_sendmsg || haz == hazard_fail_barrier ||
           haz == hazard_fail_export)
@@ -1051,13 +1192,13 @@ schedule_VMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
       aco_ptr<Instruction>& candidate = block->instructions[candidate_idx];
       bool is_vmem = candidate->isVMEM() || candidate->isFlatLike();
 
-      if (candidate->opcode == aco_opcode::p_logical_end)
+      if (!is_reorderable(candidate.get()))
          break;
 
       /* check if candidate depends on current */
       bool is_dependency = false;
       if (found_dependency) {
-         HazardResult haz = perform_hazard_query(&indep_hq, candidate.get(), true);
+         HazardResult haz = hazard_query_cached(ctx, &indep_hq, candidate.get(), true);
          if (haz == hazard_fail_reorder_ds || haz == hazard_fail_spill ||
              haz == hazard_fail_reorder_vmem_smem || haz == hazard_fail_reorder_sendmsg ||
              haz == hazard_fail_barrier || haz == hazard_fail_export)
@@ -1082,10 +1223,12 @@ schedule_VMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
       }
 
       if (is_dependency || !found_dependency) {
-         if (found_dependency)
+         if (found_dependency) {
             add_to_hazard_query(&indep_hq, candidate.get());
-         else
-            k++;
+         } else {
+            /* Weighted budget before first dependency: don't burn budget on wide vector ops. */
+            k += get_likely_cost(candidate.get());
+         }
          ctx.mv.upwards_skip(up_cursor);
          continue;
       }
@@ -1120,7 +1263,7 @@ schedule_LDS(sched_ctx& ctx, Block* block, Instruction* current, int idx)
    for (int i = 0; k < max_moves && i < window_size; i++) {
       aco_ptr<Instruction>& candidate = block->instructions[cursor.source_idx];
       bool is_mem = candidate->isVMEM() || candidate->isFlatLike() || candidate->isSMEM();
-      if (candidate->opcode == aco_opcode::p_logical_start || is_mem)
+      if (!is_reorderable(candidate.get()) || is_mem)
          break;
 
       if (candidate->isDS() || candidate->isLDSDIR()) {
@@ -1129,7 +1272,7 @@ schedule_LDS(sched_ctx& ctx, Block* block, Instruction* current, int idx)
          continue;
       }
 
-      if (perform_hazard_query(&hq, candidate.get(), false) != hazard_success ||
+      if (hazard_query_cached(ctx, &hq, candidate.get(), false) != hazard_success ||
           ctx.mv.downwards_move(cursor) != move_success)
          break;
 
@@ -1144,7 +1287,7 @@ schedule_LDS(sched_ctx& ctx, Block* block, Instruction* current, int idx)
    for (; k < max_moves && i < window_size; i++) {
       aco_ptr<Instruction>& candidate = block->instructions[up_cursor.source_idx];
       bool is_mem = candidate->isVMEM() || candidate->isFlatLike() || candidate->isSMEM();
-      if (candidate->opcode == aco_opcode::p_logical_end || is_mem)
+      if (!is_reorderable(candidate.get()) || is_mem)
          break;
 
       /* check if candidate depends on current */
@@ -1164,10 +1307,10 @@ schedule_LDS(sched_ctx& ctx, Block* block, Instruction* current, int idx)
    for (; found_dependency && k < max_moves && i < window_size; i++) {
       aco_ptr<Instruction>& candidate = block->instructions[up_cursor.source_idx];
       bool is_mem = candidate->isVMEM() || candidate->isFlatLike() || candidate->isSMEM();
-      if (candidate->opcode == aco_opcode::p_logical_end || is_mem)
+      if (!is_reorderable(candidate.get()) || is_mem)
          break;
 
-      HazardResult haz = perform_hazard_query(&hq, candidate.get(), true);
+      HazardResult haz = hazard_query_cached(ctx, &hq, candidate.get(), true);
       if (haz == hazard_fail_exec || haz == hazard_fail_unreorderable)
          break;
 
@@ -1199,12 +1342,12 @@ schedule_position_export(sched_ctx& ctx, Block* block, Instruction* current, int
       assert(candidate_idx >= 0);
       aco_ptr<Instruction>& candidate = block->instructions[candidate_idx];
 
-      if (candidate->opcode == aco_opcode::p_logical_start)
+      if (!is_reorderable(candidate.get()))
          break;
       if (candidate->isVMEM() || candidate->isSMEM() || candidate->isFlatLike())
          break;
 
-      HazardResult haz = perform_hazard_query(&hq, candidate.get(), false);
+      HazardResult haz = hazard_query_cached(ctx, &hq, candidate.get(), false);
       if (haz == hazard_fail_exec || haz == hazard_fail_unreorderable)
          break;
 
@@ -1242,11 +1385,11 @@ schedule_VMEM_store(sched_ctx& ctx, Block* block, Instruction* current, int idx)
 
    for (int16_t k = 0; k < VMEM_STORE_CLAUSE_MAX_GRAB_DIST;) {
       aco_ptr<Instruction>& candidate = block->instructions[cursor.source_idx];
-      if (candidate->opcode == aco_opcode::p_logical_start)
+      if (!is_reorderable(candidate.get()))
          break;
 
       if (should_form_clause(current, candidate.get())) {
-         if (perform_hazard_query(&hq, candidate.get(), false) == hazard_success)
+         if (hazard_query_cached(ctx, &hq, candidate.get(), false) == hazard_success)
             ctx.mv.downwards_move_clause(cursor);
          break;
       }
@@ -1267,6 +1410,20 @@ schedule_block(sched_ctx& ctx, Program* program, Block* block)
    ctx.last_VMEM_store_idx = INT_MIN;
    ctx.last_SMEM_stall = INT16_MIN;
    ctx.mv.block = block;
+
+   /* Precompute per-instruction hazard cache for this block. */
+   ctx.hazard_cache.clear();
+   ctx.hazard_cache.reserve(block->instructions.size());
+   for (const aco_ptr<Instruction>& ip : block->instructions) {
+      Instruction* instr = ip.get();
+      CachedHazard ch{};
+      ch.sync = get_sync_info_with_hack(instr);
+      memory_event_set ev{};
+      memset(&ev, 0, sizeof(ev));
+      add_memory_event(program, &ev, instr, &ch.sync);
+      ch.events = ev;
+      ctx.hazard_cache.emplace(instr, ch);
+   }
 
    /* go through all instructions and find memory loads */
    for (unsigned idx = 0; idx < block->instructions.size(); idx++) {
@@ -1333,12 +1490,12 @@ schedule_program(Program* program)
 
    const int wave_factor = program->gfx_level >= GFX10 ? 2 : 1;
    const int wave_minimum = std::max<int>(program->min_waves, 4 * wave_factor);
-   const float reg_file_multiple = program->dev.physical_vgprs / (256.0 * wave_factor);
+   const float reg_file_multiple = program->dev.physical_vgprs / (256.0f * wave_factor);
 
    /* If we already have less waves than the minimum, don't reduce them further.
     * Otherwise, sacrifice some waves and use more VGPRs, in order to improve scheduling.
     */
-   int vgpr_demand = std::max<int>(24, demand.vgpr) + 12 * reg_file_multiple;
+   int vgpr_demand = std::max<int>(24, demand.vgpr) + static_cast<int>(12 * reg_file_multiple);
    int target_waves = std::max(wave_minimum, program->dev.physical_vgprs / vgpr_demand);
    target_waves = max_suitable_waves(program, std::min<int>(program->num_waves, target_waves));
    assert(target_waves >= program->min_waves);
