@@ -1,12 +1,12 @@
 pkgname=coreutils-git
-pkgver=9.8.r235795a8e3
+pkgver=9.8.r52ef53e5b0
 pkgrel=1
 pkgdesc="Basic file, shell and text manipulation utilities of the GNU operating system"
 arch=('i686' 'x86_64')
 url="https://www.gnu.org/software/coreutils/coreutils.html"
 license=('GPL3')
 depends=('glibc' 'gmp' 'libcap' 'openssl')
-makedepends=('git' 'gettext' 'gperf' 'gzip' 'perl' 'rsync' 'tar' 'texinfo' 'llvm')
+makedepends=('git' 'gettext' 'gperf' 'gzip' 'perl' 'rsync' 'tar' 'texinfo' 'llvm>=16' 'llvm-bolt' 'mold')
 options=(!strip)
 provides=('coreutils')
 conflicts=('coreutils')
@@ -14,132 +14,270 @@ source=("git+https://github.com/coreutils/coreutils.git")
 sha256sums=('SKIP')
 
 pkgver() {
-  cd "coreutils"
+  cd coreutils
   git describe --long --tags | sed -E 's/^v//; s/([^-]+)-g/r\1/; s/-/./g'
 }
 
 cleanup_profiles() {
   rm -f "$srcdir"/*.profraw
-  rm -rf "$srcdir/bolt_profile"
-  rm -rf "$srcdir/bolt_opt"
+  rm -rf "$srcdir/bolt_profile" "$srcdir/bolt_opt" "$srcdir/bolt_instrumented"
+  rm -rf "$srcdir/pgo" "$srcdir/pgo_bin"
 }
 
 prepare() {
-  cd "coreutils"
+  cd coreutils
   cleanup_profiles
-  mkdir -p "$srcdir/bolt_opt" "$srcdir/bolt_profile"
+  mkdir -p "$srcdir/bolt_opt" "$srcdir/bolt_profile" "$srcdir/bolt_instrumented" "$srcdir/pgo" "$srcdir/pgo_bin"
 
-  # Initialize submodules without fetching yet
+  # Fast mirror for gnulib
   git submodule init
-
-  # Override gnulib URL to use GitHub mirror (FAST!)
   git config submodule.gnulib.url "https://github.com/coreutils/gnulib.git"
-
-  # Fetch gnulib from GitHub (optionally shallow for speed)
   git submodule update --depth=1
 
-  # Bootstrap now uses pre-cloned gnulib — no waiting!
+  # Skip maintainer-only check which may fail with mirror submodule commits
+  printf 'local-checks-to-skip = public-submodule-commit\n' > Makefile.cfg
+
   ./bootstrap
 }
 
 build() {
+  shopt -s nullglob
+
   export CC=gcc
   export CXX=g++
 
   local _pkgdir="$srcdir/coreutils"
   cd "$_pkgdir"
 
-  local CFLAGS_ORIG="$CFLAGS"
-  local CXXFLAGS_ORIG="$CXXFLAGS"
-  local LDFLAGS_ORIG="$LDFLAGS"
+  # Preserve user flags verbatim; do not reduce or strip LTO or any tuning flags.
+  local USER_CFLAGS="$CFLAGS"
+  local USER_CXXFLAGS="$CXXFLAGS"
+  local USER_LDFLAGS="$LDFLAGS"
 
-  # Stage 1: Instrumented build for PGO
-  CFLAGS+=" -g3 -fno-omit-frame-pointer -fprofile-generate"
-  CXXFLAGS+=" -g3 -fno-omit-frame-pointer -fprofile-generate"
-  LDFLAGS+=" -g3 -fno-omit-frame-pointer -fprofile-generate -lgcov"
+  # Always prefer mold (append without removing user's choices)
+  local LDFLAGS_MOLD="$USER_LDFLAGS -fuse-ld=mold"
 
-  ./configure --disable-gcc-warnings --prefix="/usr" --libexecdir="/usr/lib" --with-openssl --enable-no-install-program="groups,hostname,kill,uptime"
-  make
-  make check || true
+  # PGO: use path-based profiles to a dedicated dir (robust, no GCOV_PREFIX needed)
+  local PGO_DIR="$srcdir/pgo"
+  local CFLAGS_GEN="$USER_CFLAGS -fprofile-generate=$PGO_DIR"
+  local CXXFLAGS_GEN="$USER_CXXFLAGS -fprofile-generate=$PGO_DIR"
+  local LDFLAGS_GEN="$LDFLAGS_MOLD"
 
-  # Stage 2: Build with PGO data
-  CFLAGS="$CFLAGS_ORIG -fprofile-use -fprofile-correction -fno-reorder-blocks-and-partition"
-  CXXFLAGS="$CXXFLAGS_ORIG -fprofile-use -fprofile-correction -fno-reorder-blocks-and-partition"
-  LDFLAGS="$LDFLAGS_ORIG -fprofile-use -fprofile-correction -lgcov -Wl,--emit-relocs"
+  # PGO-use: keep user's flags, add profile-use + correction and relocs for BOLT
+  local CFLAGS_USE="$USER_CFLAGS -fprofile-use=$PGO_DIR -fprofile-correction -fno-reorder-blocks-and-partition"
+  local CXXFLAGS_USE="$USER_CXXFLAGS -fprofile-use=$PGO_DIR -fprofile-correction -fno-reorder-blocks-and-partition"
+  local LDFLAGS_USE="$LDFLAGS_MOLD -Wl,--emit-relocs"
 
-  ./configure --disable-gcc-warnings --prefix="/usr" --libexecdir="/usr/lib" --with-openssl --enable-no-install-program="groups,hostname,kill,uptime"
-  make
+  # We do NOT re-run configure between stages; this avoids configure failures under -fprofile-use.
+  env CFLAGS="$USER_CFLAGS" CXXFLAGS="$USER_CXXFLAGS" LDFLAGS="$LDFLAGS_MOLD" \
+    ./configure \
+      --disable-gcc-warnings \
+      --prefix="/usr" \
+      --libexecdir="/usr/lib" \
+      --with-openssl \
+      --enable-no-install-program="groups,hostname,kill,uptime"
 
-  # Stage 3: BOLT Instrumentation
-  echo "Starting BOLT instrumentation..."
-  mkdir -p "$srcdir/bolt_instrumented"
-  local binary_dir="src"  # Directory where binaries are built
+  # A broad, always-built set to guarantee presence; extended set to maximize BOLT coverage.
+  local -a binary_list=(
+    # Always-present core utilities
+    cat chgrp chmod chown cp csplit cut date dd df dir dircolors dirname du echo env expand false head id install join ln ls
+    mkdir mktemp mv nice nl nohup nproc od paste pr printf ptx pwd readlink realpath rm rmdir seq shred shuf sleep sort split
+    stat stty sum sync tac tail tee test timeout touch tr true truncate tsort tty uname unexpand uniq unlink uptime users wc whoami yes
+    # Crypto and misc sums (often present)
+    b2sum base32 base64 basenc cksum md5sum sha1sum sha224sum sha256sum sha384sum sha512sum
+    # utmp-based (may or may not be present; harmless if missing)
+    pinky users who
+  )
 
-  for binary in who users pinky df b2sum base64 base32 basenc cksum comm csplit cut date du expand fmt fold join md5sum nl od paste pr printf ptx sha1sum sha224sum sha256sum sha384sum sha512sum shred shuf sort stat sum tee unexpand wc; do
-    if [[ -f "$binary_dir/$binary" ]]; then
-      llvm-bolt "$binary_dir/$binary" -o "$srcdir/bolt_instrumented/$binary" --instrument --instrumentation-file="$srcdir/bolt_profile/$(basename $binary).fdata" || {
-        echo "Failed to instrument $binary"
-        continue
-      }
-    else
-      echo "Binary $binary not found in $binary_dir"
-    fi
-  done
+  local binary_dir="src"
 
-  # Replace original binaries with instrumented ones temporarily
-  echo "Replacing original binaries with instrumented binaries for profiling..."
-  for binary in "$srcdir/bolt_instrumented"/*; do
-    install -Dm755 "$binary" "$binary_dir/$(basename "$binary")"
-  done
+  exercise_binaries() {
+    local dir="$1"
+    pushd "$dir" >/dev/null
+    local T; T="$(mktemp -d)"
+    printf "a\nb\n" > "$T/a"
+    printf "a\nc\n" > "$T/b"
+    printf "1\n2\n3\n" > "$T/nums"
+    printf "hello world\n" > "$T/in"
+    printf "b\na\n" > "$T/sortin"
 
-  # Run Instrumented Binaries via `make check` to Generate Profiling Data
-  echo "Running instrumented binaries via make check to generate profiling data..."
-  make check || true
+    [[ -x ./true     ]] && ./true || true
+    [[ -x ./false    ]] && ./false || true
+    [[ -x ./echo     ]] && ./echo ok >/dev/null || true
+    [[ -x ./printf   ]] && ./printf "%s\n" "hello" >/dev/null || true
+    [[ -x ./cat      ]] && ./cat "$T/in" >/dev/null || true
+    [[ -x ./tr       ]] && printf "aaabbb" | ./tr a b >/dev/null || true
+    [[ -x ./cut      ]] && printf "a:b\n" | ./cut -d: -f1 >/dev/null || true
+    [[ -x ./sort     ]] && printf "b\na\n" | ./sort >/dev/null || true
+    [[ -x ./uniq     ]] && printf "a\na\nb\n" | ./uniq >/dev/null || true
+    [[ -x ./join     ]] && ./join "$T/a" "$T/b" >/dev/null || true
+    [[ -x ./paste    ]] && ./paste "$T/a" "$T/b" >/dev/null || true
+    [[ -x ./comm     ]] && ./comm -12 "$T/a" "$T/b" >/dev/null || true
+    [[ -x ./wc       ]] && printf "one two\n" | ./wc -w >/dev/null || true
+    [[ -x ./head     ]] && ./head -n1 "$T/a" >/dev/null || true
+    [[ -x ./tail     ]] && ./tail -n1 "$T/a" >/dev/null || true
+    [[ -x ./split    ]] && ./split -b 1 "$T/in" "$T/s" >/dev/null || true
+    [[ -x ./csplit   ]] && ./csplit -s -f "$T/x" "$T/in" '/world/' >/dev/null || true
+    [[ -x ./fold     ]] && printf "abcdefghijk\n" | ./fold -w 5 >/dev/null || true
+    [[ -x ./fmt      ]] && printf "a b c d e f g h i j\n" | ./fmt -w 10 >/dev/null || true
+    [[ -x ./expand   ]] && printf "\tX\n" | ./expand >/dev/null || true
+    [[ -x ./unexpand ]] && printf " \tX\n" | ./unexpand >/dev/null || true
+    [[ -x ./od       ]] && printf "abc" | ./od -An -tx1 >/dev/null || true
+    [[ -x ./ptx      ]] && printf "a a\n" | ./ptx >/dev/null || true
+    [[ -x ./stat     ]] && ./stat . >/dev/null || true
+    [[ -x ./df       ]] && ./df -P . >/dev/null || true
+    [[ -x ./du       ]] && ./du -s . >/dev/null || true
+    [[ -x ./date     ]] && ./date -R >/dev/null || true
+    [[ -x ./nproc    ]] && ./nproc >/dev/null || true
+    [[ -x ./id       ]] && ./id >/dev/null || true
+    [[ -x ./basename ]] && ./basename "$T/in" >/dev/null || true
+    [[ -x ./dirname  ]] && ./dirname "$T/in" >/dev/null || true
+    [[ -x ./realpath ]] && ./realpath . >/dev/null || true
+    [[ -x ./readlink ]] && ./readlink -f . >/dev/null || true
+    [[ -x ./sha256sum ]] && printf "" | ./sha256sum >/dev/null || true
+    [[ -x ./sha1sum  ]] && printf "" | ./sha1sum >/dev/null || true
+    [[ -x ./sha512sum ]] && printf "" | ./sha512sum >/dev/null || true
+    [[ -x ./md5sum   ]] && printf "" | ./md5sum >/dev/null || true
+    [[ -x ./cksum    ]] && printf "" | ./cksum >/dev/null || true
+    [[ -x ./base64   ]] && printf "" | ./base64 >/dev/null || true
+    [[ -x ./base32   ]] && printf "" | ./base32 >/dev/null || true
+    [[ -x ./basenc   ]] && printf "" | ./basenc --base64 >/dev/null || true
+    [[ -x ./b2sum    ]] && printf "" | ./b2sum >/dev/null || true
+    [[ -x ./tee      ]] && printf "hello\n" | ./tee >/dev/null >/dev/null || true
+    [[ -x ./shuf     ]] && printf "1\n2\n3\n" | ./shuf -n2 >/dev/null || true
+    [[ -x ./seq      ]] && ./seq 1 3 >/dev/null || true
+    [[ -x ./sleep    ]] && ./sleep 0.01 || true
+    [[ -x ./who      ]] && ./who >/dev/null 2>&1 || true
+    [[ -x ./users    ]] && ./users >/dev/null 2>&1 || true
+    [[ -x ./pinky    ]] && ./pinky >/dev/null 2>&1 || true
 
-  # Restore binaries to their original state by re-compiling
-  echo "Restoring original binaries by rebuilding the project..."
+    rm -rf "$T"
+    popd >/dev/null
+  }
+
+  # STAGE 1: PGO instrumentation build (keep user's flags, add -fprofile-generate)
+  echo ">>> STAGE 1: Building with PGO instrumentation..."
   make clean
-  ./bootstrap
-  ./configure --disable-gcc-warnings --prefix="/usr" --libexecdir="/usr/lib" --with-openssl --enable-no-install-program="groups,hostname,kill,uptime"
-  make
+  make -j"$(nproc)" V=1 CFLAGS="$CFLAGS_GEN" CXXFLAGS="$CXXFLAGS_GEN" LDFLAGS="$LDFLAGS_GEN"
 
-  # Stage 4: Optimize Binaries with Profiling Data
-  echo "Optimizing binaries with BOLT profiling data..."
-  mkdir -p "$srcdir/bolt_opt"
-  for binary in who users pinky df b2sum base64 base32 basenc cksum comm csplit cut date du expand fmt fold join md5sum nl od paste pr printf ptx sha1sum sha224sum sha256sum sha384sum sha512sum shred shuf sort stat sum tee unexpand wc; do
-    if [[ -f "$binary_dir/$binary" && -f "$srcdir/bolt_profile/$binary.fdata" ]]; then
-      llvm-bolt "$binary_dir/$binary" \
-        -o "$srcdir/bolt_opt/$binary" \
-        --data="$srcdir/bolt_profile/$binary.fdata" \
-        --dyno-stats --cu-processing-batch-size=64 --eliminate-unreachable --frame-opt=all --icf=all --jump-tables=aggressive --min-branch-clusters --stoke --sctc-mode=always --plt=all --hot-data --hot-text --frame-opt-rm-stores --peepholes=all --x86-strip-redundant-address-size --indirect-call-promotion=all --reg-reassign --use-aggr-reg-reassign --reorder-blocks=ext-tsp --reorder-functions=cdsort --split-all-cold --split-eh --split-functions --split-strategy=cdsplit
-    else
-      echo "No profiling data for $binary, skipping optimization."
+  mkdir -p "$PGO_DIR"
+  echo ">>> Exercising binaries to generate PGO profiles..."
+  exercise_binaries "$binary_dir"
+
+  # STAGE 2: Rebuild with PGO data (no configure; keep user's flags + add -fprofile-use and relocs)
+  echo ">>> STAGE 2: Rebuilding with PGO data..."
+  make clean
+  make -j"$(nproc)" V=1 CFLAGS="$CFLAGS_USE" CXXFLAGS="$CXXFLAGS_USE" LDFLAGS="$LDFLAGS_USE"
+
+  # Preserve PGO-optimized binaries for BOLT (robust under set -e)
+  echo ">>> Preserving PGO-optimized binaries for BOLT..."
+  local preserved_count=0
+  mkdir -p "$srcdir/pgo_bin"
+  for bin in "${binary_list[@]}"; do
+    if [[ -x "$binary_dir/$bin" ]]; then
+      install -Dm755 "$binary_dir/$bin" "$srcdir/pgo_bin/$bin" || true
+      if [[ -x "$srcdir/pgo_bin/$bin" ]]; then
+        preserved_count=$((preserved_count + 1))
+      fi
     fi
   done
+  if (( preserved_count == 0 )); then
+    echo ">>> FATAL: No PGO binaries preserved; aborting." >&2
+    return 1
+  fi
+
+  # STAGE 3: BOLT instrumentation + fdata collection
+  if command -v llvm-bolt >/dev/null 2>&1; then
+    echo ">>> STAGE 3: Instrumenting with BOLT and generating .fdata..."
+    mkdir -p "$srcdir/bolt_instrumented" "$srcdir/bolt_profile"
+    chmod -R u+w "$srcdir/bolt_profile" 2>/dev/null || true
+
+    for bin in "${binary_list[@]}"; do
+      if [[ -f "$srcdir/pgo_bin/$bin" ]]; then
+        local fdata="$srcdir/bolt_profile/$bin.fdata"
+        llvm-bolt "$srcdir/pgo_bin/$bin" \
+          -o "$srcdir/bolt_instrumented/$bin" \
+          --instrument \
+          --instrumentation-file="$fdata" && {
+            : > "$fdata"
+            chmod u+w "$fdata" 2>/dev/null || true
+            install -Dm755 "$srcdir/bolt_instrumented/$bin" "$binary_dir/$bin"
+          }
+      fi
+    done
+
+    echo ">>> Exercising instrumented binaries to produce .fdata..."
+    exercise_binaries "$binary_dir"
+
+    echo ">>> STAGE 4: Optimizing with BOLT .fdata..."
+    mkdir -p "$srcdir/bolt_opt"
+    local bolt_success=0
+    for bin in "${binary_list[@]}"; do
+      local in="$srcdir/pgo_bin/$bin"
+      local out="$srcdir/bolt_opt/$bin"
+      local data="$srcdir/bolt_profile/$bin.fdata"
+      if [[ -f "$in" && -s "$data" ]]; then
+        llvm-bolt "$in" \
+          -o "$out" \
+          --data="$data" \
+          --dyno-stats \
+          --cu-processing-batch-size=64 \
+          --eliminate-unreachable \
+          --frame-opt=all \
+          --icf=all \
+          --jump-tables=aggressive \
+          --min-branch-clusters \
+          --stoke \
+          --sctc-mode=always \
+          --plt=all \
+          --hot-data \
+          --hot-text \
+          --frame-opt-rm-stores \
+          --peepholes=all \
+          --x86-strip-redundant-address-size \
+          --indirect-call-promotion=all \
+          --reg-reassign \
+          --use-aggr-reg-reassign \
+          --reorder-blocks=ext-tsp \
+          --reorder-functions=cdsort \
+          --split-all-cold \
+          --split-eh \
+          --split-functions \
+          --split-strategy=cdsplit && bolt_success=$((bolt_success + 1)) || true
+      fi
+    done
+    echo ">>> BOLT optimized ${bolt_success} binaries."
+  else
+    echo ">>> WARNING: llvm-bolt not found; skipping BOLT stages." >&2
+  fi
 }
 
 package() {
-  cd "coreutils"
+  cd coreutils
 
-  # Install optimized binaries
-  echo "Installing optimized binaries..."
-  for binary in who users pinky df b2sum base64 base32 basenc cksum comm csplit cut date du expand fmt fold join md5sum nl od paste pr printf ptx sha1sum sha224sum sha256sum sha384sum sha512sum shred shuf sort stat sum tee unexpand wc; do
-    if [[ -f "$srcdir/bolt_opt/$binary" ]]; then
-      install -Dm755 "$srcdir/bolt_opt/$binary" "$pkgdir/usr/bin/$binary"
-    elif [[ -f "src/$binary" ]]; then
-      install -Dm755 "src/$binary" "$pkgdir/usr/bin/$binary"
+  # Install everything
+  make DESTDIR="$pkgdir" install
+
+  # Overlay optimized binaries; prefer BOLT+PGO, then PGO-only
+  local bin_dir="$pkgdir/usr/bin"
+  mkdir -p "$bin_dir"
+  local -a overlay_list=(
+    cat chgrp chmod chown cp csplit cut date dd df dir dircolors dirname du echo env expand false head id install join ln ls
+    mkdir mktemp mv nice nl nohup nproc od paste pr printf ptx pwd readlink realpath rm rmdir seq shred shuf sleep sort split
+    stat stty sum sync tac tail tee test timeout touch tr true truncate tsort tty uname unexpand uniq unlink uptime users wc whoami yes
+    b2sum base32 base64 basenc cksum md5sum sha1sum sha224sum sha256sum sha384sum sha512sum
+    pinky users who
+  )
+  for bin in "${overlay_list[@]}"; do
+    if [[ -f "$srcdir/bolt_opt/$bin" ]]; then
+      install -Dm755 "$srcdir/bolt_opt/$bin" "$bin_dir/$bin"
+    elif [[ -f "$srcdir/pgo_bin/$bin" ]]; then
+      install -Dm755 "$srcdir/pgo_bin/$bin" "$bin_dir/$bin"
     fi
   done
 
-  # Install the rest normally
-  make DESTDIR="$pkgdir" install
-
-  # Use llvm-strip only on recognized file formats
-  find "$pkgdir" -type f KATEX_INLINE_OPEN -name '*.so*' -o -name '*.a' -o -executable KATEX_INLINE_CLOSE -print0 | while IFS= read -r -d '' file; do
-    if llvm-strip --strip-unneeded "$file" 2>/dev/null || llvm-strip --strip-all "$file" 2>/dev/null; then
-      echo "Stripped: $file"
-    else
-      echo "Skipping: $file (not a valid object file)" >&2
-    fi
+  # Strip only libraries/archives; keep executables intact for BOLT gains
+  find "$pkgdir" -type f KATEX_INLINE_OPEN -name '*.so*' -o -name '*.a' KATEX_INLINE_CLOSE -print0 | while IFS= read -r -d '' f; do
+    llvm-strip --strip-unneeded "$f" 2>/dev/null || true
   done
 }
