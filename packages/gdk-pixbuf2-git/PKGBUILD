@@ -3,7 +3,7 @@
 # Contributor: Ionut Biru <ibiru@archlinux.org>
 
 pkgname=gdk-pixbuf2-git
-pkgver=2.42.8+12+g5c516d02d
+pkgver=2.44.2
 pkgrel=1
 pkgdesc="An image loading library"
 arch=(x86_64)
@@ -12,12 +12,13 @@ license=(LGPL2.1)
 provides=(gdk-pixbuf2 "gdk-pixbuf2=$pkgver-$pkgrel" libgdk_pixbuf-2.0.so=0-64)
 conflicts=(gdk-pixbuf2)
 depends=(glib2 libpng libtiff libjpeg libx11 shared-mime-info gobject-introspection)
-makedepends=(gobject-introspection git meson)
+makedepends=(gobject-introspection git meson ninja clang llvm llvm-bolt pkgconf)
 install=gdk-pixbuf2.install
 source=("git+https://gitlab.gnome.org/GNOME/gdk-pixbuf.git"
         gdk-pixbuf-query-loaders.hook)
 sha256sums=('SKIP'
             'SKIP')
+options=(!strip)
 
 pkgver() {
   cd gdk-pixbuf
@@ -29,29 +30,349 @@ prepare() {
 }
 
 build() {
-  arch-meson gdk-pixbuf build \
-    -D docs=false \
-    -D man=false \
-    -D b_ndebug=true \
-    -D b_pie=false \
-    -D c_std=gnu2x \
-    -D cpp_std=gnu++2a \
-    -D b_lto=true \
-    --buildtype=release \
-    --wrap-mode=nofallback \
+  shopt -s nullglob
+
+  local projdir="$srcdir/gdk-pixbuf"
+  local b_gen="build-pgo-gen"
+  local b_use="build-pgo-use"
+
+  # LLVM/Clang toolchain
+  export CC=clang
+  export CXX=clang++
+  export AR=llvm-ar
+  export NM=llvm-nm
+  export RANLIB=llvm-ranlib
+  export STRIP=llvm-strip
+
+  # Preserve user's flags; ensure LLVM linker and remove conflicting -fuse-ld settings
+  local USER_CFLAGS="${CFLAGS}"
+  local USER_CXXFLAGS="${CXXFLAGS}"
+  local USER_LDFLAGS="${LDFLAGS}"
+
+  local LDFLAGS_LL="${USER_LDFLAGS//-fuse-ld=lld/}"
+  LDFLAGS_LL="${LDFLAGS_LL//-fuse-ld=mold/}"
+  LDFLAGS_LL="${LDFLAGS_LL//-fuse-ld=gold/}"
+  LDFLAGS_LL="${LDFLAGS_LL//-fuse-ld=bfd/}"
+  # Strip non-standard --lto-* linker toggles that break lld while keeping -flto in compile flags
+  LDFLAGS_LL="$(printf '%s' "$LDFLAGS_LL" | sed -E 's/(^| )-Wl,--lto-[^ ]+//g')"
+  LDFLAGS_LL+=" -fuse-ld=lld"
+
+  # Clang IR-level PGO (instr gen/use)
+  local PGO_DIR="$srcdir/pgo"
+  mkdir -p "$PGO_DIR" "$srcdir/bolt_profile" "$srcdir/bolt_instrumented/bin" "$srcdir/bolt_instrumented/lib" "$srcdir/bolt_opt/bin" "$srcdir/bolt_opt/lib" "$srcdir/pgo_bin" "$srcdir/pgo_lib" "$srcdir/training"
+  local PROFDATA="$PGO_DIR/merged.profdata"
+
+  local CFLAGS_GEN="$USER_CFLAGS -fprofile-instr-generate"
+  local CXXFLAGS_GEN="$USER_CXXFLAGS -fprofile-instr-generate"
+  local LDFLAGS_GEN="$LDFLAGS_LL -fprofile-instr-generate"
+
+  local CFLAGS_USE="$USER_CFLAGS -fprofile-instr-use=$PROFDATA -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled"
+  local CXXFLAGS_USE="$USER_CXXFLAGS -fprofile-instr-use=$PROFDATA -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled"
+  local LDFLAGS_USE="$LDFLAGS_LL -Wl,--emit-relocs"
+
+  # Meson options (requested)
+  local meson_opts=(
+    -D documentation=false
+    -D man=false
+    -D gif=disabled
+    -D android=disabled
+    -D builtin_loaders=all
+    -D glycin=enabled
+    -D others=enabled
+    -D introspection=enabled
+    -D jpeg=disabled
+    -D png=disabled
+    -D thumbnailer=disabled
+    -D tiff=disabled
+    -D b_ndebug=true
+    -D b_pie=false
+    -D c_std=gnu2x
+    -D cpp_std=gnu++2a
+    -D b_lto=true
+    --buildtype=release
+    --wrap-mode=nofallback
     -D installed_tests=false
-  ninja $NINJAFLAGS -C build
+  )
+
+  # Comprehensive training workload used for PGO & BOLT
+  training_workload() {
+    # Args: <bindir> <libdir> <moduledir> [profraw_pattern]
+    local bindir="$1" libdir="$2" moduledir="$3" profpat="${4:-}"
+
+    local T; T="$(mktemp -d -p "$srcdir/training")"
+    local mc="$T/modules.cache"
+    export GDK_PIXBUF_MODULEDIR="$moduledir"
+    export GDK_PIXBUF_MODULE_FILE="$mc"
+    export LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH+:$LD_LIBRARY_PATH}"
+
+    # Sample images to exercise built-in loaders (PNM/XPM/XBM)
+    cat >"$T/red.ppm" <<'PPM'
+P3
+4 4
+255
+255 0 0  255 0 0  255 0 0  255 0 0
+255 0 0  0 255 0  0 0 255  255 255 0
+255 0 0  0 0 255  0 255 0  0 255 255
+255 0 0  255 255 0  0 255 255  255 255 255
+PPM
+    cat >"$T/ck.xbm" <<'XBM'
+#define ck_width 8
+#define ck_height 8
+static unsigned char ck_bits[] = { 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa };
+XBM
+    cat >"$T/tiny.xpm" <<'XPM'
+/* XPM */
+static char * tiny_xpm[] = {
+"2 2 3 1",
+"a c #ff0000","b c #00ff00","c c #0000ff",
+"ab","ca"};
+XPM
+
+    local ql="$bindir/gdk-pixbuf-query-loaders"
+    local px="$bindir/gdk-pixbuf-pixdata"
+
+    # Warm module cache and tool code paths
+    [[ -x "$ql" ]] && { ${profpat:+LLVM_PROFILE_FILE="$profpat"} "$ql" >/dev/null 2>&1 || true; }
+    [[ -x "$ql" ]] && { ${profpat:+LLVM_PROFILE_FILE="$profpat"} "$ql" >/dev/null 2>&1 || true; }
+
+    # Convert images via pixdata tool (hits decode paths through CLI)
+    [[ -x "$px" ]] && { ${profpat:+LLVM_PROFILE_FILE="$profpat"} "$px" "$T/tiny.xpm" --output "$T/out1.c" >/dev/null 2>&1 || true; }
+    [[ -x "$px" ]] && { ${profpat:+LLVM_PROFILE_FILE="$profpat"} "$px" "$T/ck.xbm"  --output "$T/out2.c" >/dev/null 2>&1 || true; }
+    [[ -x "$px" ]] && { ${profpat:+LLVM_PROFILE_FILE="$profpat"} "$px" "$T/red.ppm" --output "$T/out3.c" >/dev/null 2>&1 || true; }
+
+    # Build a small harness that exercises core lib APIs and streaming loaders
+    local harness="$srcdir/training/harness"
+    if [[ ! -x "$harness" ]]; then
+      cat >"$T/harness.c" <<'C_EOF'
+#include <string.h>
+#include <glib.h>
+#include <gio/gio.h>
+#include <gdk-pixbuf/gdk-pixbuf.h>
+static void exercise_stream_loader(void) {
+  const char *ppm = "P3\n2 2\n255\n255 0 0  0 255 0\n0 0 255  255 255 0\n";
+  GdkPixbufLoader *ldr = gdk_pixbuf_loader_new();
+  gdk_pixbuf_loader_write(ldr, (const guchar*)ppm, strlen(ppm), NULL);
+  gdk_pixbuf_loader_close(ldr, NULL);
+  GdkPixbuf *pb = gdk_pixbuf_loader_get_pixbuf(ldr);
+  if (pb) g_object_ref(pb);
+  if (pb) g_object_unref(pb);
+  g_object_unref(ldr);
+}
+int main(void) {
+  GdkPixbuf *a = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, 64, 64);
+  GdkPixbuf *b = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, 32, 32);
+  gdk_pixbuf_fill(a, 0xff0000ff);
+  gdk_pixbuf_fill(b, 0x00ff00ff);
+  GdkPixbuf *c = gdk_pixbuf_scale_simple(a, 32, 32, GDK_INTERP_BILINEAR);
+  gdk_pixbuf_composite(b, a, 16,16,32,32,16,16,1.0,1.0, GDK_INTERP_NEAREST,128);
+  GdkPixbuf *r = gdk_pixbuf_rotate_simple(a, GDK_PIXBUF_ROTATE_COUNTERCLOCKWISE);
+  GdkPixbuf *f = gdk_pixbuf_flip(a, FALSE);
+  guchar *p = gdk_pixbuf_get_pixels(a);
+  int rs = gdk_pixbuf_get_rowstride(a);
+  int h = gdk_pixbuf_get_height(a);
+  for (int y=0;y<h;y++) p[y*rs] ^= 0x1;
+  if (f) g_object_unref(f);
+  if (r) g_object_unref(r);
+  if (c) g_object_unref(c);
+  if (b) g_object_unref(b);
+  if (a) g_object_unref(a);
+  exercise_stream_loader();
+  return 0;
+}
+C_EOF
+      # Compile harness against headers; prefer source tree headers, link to built lib via -L and rpath
+      local cflags="$(pkg-config --cflags gdk-pixbuf-2.0 glib-2.0 gobject-2.0 gio-2.0 2>/dev/null || true)"
+      local libs="$(pkg-config --libs   gdk-pixbuf-2.0 glib-2.0 gobject-2.0 gio-2.0 2>/dev/null || true)"
+      clang $USER_CFLAGS -I"$projdir/gdk-pixbuf" $cflags \
+        -o "$harness" "$T/harness.c" \
+        $USER_LDFLAGS -fuse-ld=lld -L"$libdir" -Wl,-rpath,"$libdir" -lgdk_pixbuf-2.0 $libs >/dev/null 2>&1 || true
+    fi
+    if [[ -x "$harness" ]]; then
+      for i in 1 2 3; do
+        ${profpat:+LLVM_PROFILE_FILE="$profpat"} "$harness" >/dev/null 2>&1 || true
+      done
+    fi
+
+    rm -rf "$T"
+  }
+
+  # ----------------------------------------
+  # STAGE 1: Instrumented build (Clang PGO)
+  # ----------------------------------------
+  LLVM_PROFILE_FILE="$PGO_DIR/%p-%m.profraw" \
+  CFLAGS="$CFLAGS_GEN" CXXFLAGS="$CXXFLAGS_GEN" LDFLAGS="$LDFLAGS_GEN" \
+  arch-meson "$projdir" "$b_gen" "${meson_opts[@]}"
+
+  ninja -C "$b_gen" ${NINJAFLAGS:+$NINJAFLAGS}
+
+  # Locate outputs in instrumented build
+  local gen_bindir gen_lib_real gen_libdir gen_moddir
+  gen_bindir="$(dirname "$(readlink -f "$(find "$b_gen" -type f -perm -u+x -name 'gdk-pixbuf-query-loaders' -print -quit)")")"
+  [[ -z "$gen_bindir" ]] && gen_bindir="$(dirname "$(readlink -f "$(find "$b_gen" -type f -perm -u+x -name 'gdk-pixbuf-pixdata' -print -quit)")")"
+  gen_lib_real="$(readlink -f "$(find "$b_gen" -type f -name 'libgdk_pixbuf-2.0.so*' -print -quit)")"
+  gen_libdir="$(dirname "$gen_lib_real")"
+  gen_moddir="$(find "$b_gen" -type d -name loaders -print -quit)"
+  gen_moddir="${gen_moddir:-$gen_libdir}"
+
+  # Generate .profraw by comprehensive workload
+  if [[ -n "$gen_bindir" && -n "$gen_libdir" ]]; then
+    training_workload "$gen_bindir" "$gen_libdir" "$gen_moddir" "$PGO_DIR/%p-%m.profraw"
+  fi
+
+  # Merge profiles to .profdata
+  if compgen -G "$PGO_DIR/*.profraw" >/dev/null; then
+    llvm-profdata merge -use-md5 -output="$PROFDATA" "$PGO_DIR"/*.profraw
+  else
+    echo ">>> WARNING: No .profraw files found; proceeding without merged profile." >&2
+  fi
+
+  # ----------------------------------------
+  # STAGE 2: PGO-optimized build (Clang PGO-Use)
+  # ----------------------------------------
+  CFLAGS="$USER_CFLAGS" CXXFLAGS="$USER_CXXFLAGS" LDFLAGS="$LDFLAGS_USE" \
+  arch-meson "$projdir" "$b_use" "${meson_opts[@]}"
+
+  if [[ -f "$PROFDATA" ]]; then
+    meson configure "$b_use" \
+      -Dc_args="$CFLAGS_USE" \
+      -Dcpp_args="$CXXFLAGS_USE" \
+      -Dc_link_args="$LDFLAGS_USE" \
+      -Dcpp_link_args="$LDFLAGS_USE"
+  fi
+
+  ninja -C "$b_use" ${NINJAFLAGS:+$NINJAFLAGS}
+
+  # Preserve PGO-optimized artifacts for BOLT
+  local use_q use_p use_lib_real use_lib_dir use_mod_dir
+  use_q="$(readlink -f "$(find "$b_use" -type f -perm -u+x -name 'gdk-pixbuf-query-loaders' -print -quit)")"
+  use_p="$(readlink -f "$(find "$b_use" -type f -perm -u+x -name 'gdk-pixbuf-pixdata' -print -quit)")"
+  use_lib_real="$(readlink -f "$(find "$b_use" -type f -name 'libgdk_pixbuf-2.0.so*' -print -quit)")"
+  use_lib_dir="$(dirname "$use_lib_real")"
+  use_mod_dir="$(find "$b_use" -type d -name loaders -print -quit)"
+  use_mod_dir="${use_mod_dir:-$use_lib_dir}"
+
+  [[ -n "$use_q" ]] && install -Dm755 "$use_q" "$srcdir/pgo_bin/gdk-pixbuf-query-loaders"
+  [[ -n "$use_p" ]] && install -Dm755 "$use_p" "$srcdir/pgo_bin/gdk-pixbuf-pixdata"
+  if [[ -n "$use_lib_real" ]]; then
+    install -Dm755 "$use_lib_real" "$srcdir/pgo_lib/$(basename "$use_lib_real")"
+  fi
+
+  # ----------------------------------------
+  # STAGE 3: BOLT instrumentation and profile
+  # ----------------------------------------
+  if command -v llvm-bolt >/dev/null 2>&1; then
+    local inst_bin_dir="$srcdir/bolt_instrumented/bin"
+    local inst_lib_dir="$srcdir/bolt_instrumented/lib"
+
+    # Instrument library (best-effort)
+    if [[ -n "$use_lib_real" && -f "$srcdir/pgo_lib/$(basename "$use_lib_real")" ]]; then
+      local fdata_lib="$srcdir/bolt_profile/libgdk_pixbuf-2.0.fdata"
+      llvm-bolt "$srcdir/pgo_lib/$(basename "$use_lib_real")" \
+        -o "$inst_lib_dir/$(basename "$use_lib_real")" \
+        --instrument \
+        --instrumentation-file="$fdata_lib" || true
+      : > "$fdata_lib"; chmod u+w "$fdata_lib" 2>/dev/null || true
+    fi
+
+    # Instrument tools
+    if [[ -x "$srcdir/pgo_bin/gdk-pixbuf-query-loaders" ]]; then
+      local fdata_q="$srcdir/bolt_profile/gdk-pixbuf-query-loaders.fdata"
+      llvm-bolt "$srcdir/pgo_bin/gdk-pixbuf-query-loaders" \
+        -o "$inst_bin_dir/gdk-pixbuf-query-loaders" \
+        --instrument \
+        --instrumentation-file="$fdata_q" || true
+      : > "$fdata_q"; chmod u+w "$fdata_q" 2>/dev/null || true
+    fi
+    if [[ -x "$srcdir/pgo_bin/gdk-pixbuf-pixdata" ]]; then
+      local fdata_p="$srcdir/bolt_profile/gdk-pixbuf-pixdata.fdata"
+      llvm-bolt "$srcdir/pgo_bin/gdk-pixbuf-pixdata" \
+        -o "$inst_bin_dir/gdk-pixbuf-pixdata" \
+        --instrument \
+        --instrumentation-file="$fdata_p" || true
+      : > "$fdata_p"; chmod u+w "$fdata_p" 2>/dev/null || true
+    fi
+
+    # Run workload against instrumented binaries/libs
+    local run_bindir="$inst_bin_dir"
+    [[ -x "$run_bindir/gdk-pixbuf-query-loaders" ]] || run_bindir="$(dirname "$use_q")"
+    local run_libdir="$inst_lib_dir"
+    [[ -f "$run_libdir/$(basename "$use_lib_real")" ]] || run_libdir="$use_lib_dir"
+    local run_moddir="$use_mod_dir"
+    [[ -d "$run_moddir" ]] || run_moddir="$run_libdir"
+
+    training_workload "$run_bindir" "$run_libdir" "$run_moddir"
+
+    # ----------------------------------------
+    # STAGE 4: BOLT optimization
+    # ----------------------------------------
+    mkdir -p "$srcdir/bolt_opt"
+
+    # Optimize library
+    if [[ -s "$srcdir/bolt_profile/libgdk_pixbuf-2.0.fdata" && -f "$srcdir/pgo_lib/$(basename "$use_lib_real")" ]]; then
+      llvm-bolt "$srcdir/pgo_lib/$(basename "$use_lib_real")" \
+        -o "$srcdir/bolt_opt/lib/$(basename "$use_lib_real")" \
+        --data="$srcdir/bolt_profile/libgdk_pixbuf-2.0.fdata" \
+        --dyno-stats --cu-processing-batch-size=64 --eliminate-unreachable --frame-opt=all --icf=all \
+        --jump-tables=aggressive --min-branch-clusters --stoke --sctc-mode=always --plt=all --hot-data --hot-text \
+        --frame-opt-rm-stores --peepholes=all --x86-strip-redundant-address-size --indirect-call-promotion=all \
+        --reg-reassign --use-aggr-reg-reassign --reorder-blocks=ext-tsp --reorder-functions=cdsort \
+        --split-all-cold --split-eh --split-functions --split-strategy=cdsplit || true
+    fi
+
+    # Optimize tools
+    if [[ -s "$srcdir/bolt_profile/gdk-pixbuf-query-loaders.fdata" && -x "$srcdir/pgo_bin/gdk-pixbuf-query-loaders" ]]; then
+      llvm-bolt "$srcdir/pgo_bin/gdk-pixbuf-query-loaders" \
+        -o "$srcdir/bolt_opt/bin/gdk-pixbuf-query-loaders" \
+        --data="$srcdir/bolt_profile/gdk-pixbuf-query-loaders.fdata" \
+        --dyno-stats --cu-processing-batch-size=64 --eliminate-unreachable --frame-opt=all --icf=all \
+        --jump-tables=aggressive --min-branch-clusters --stoke --sctc-mode=always --plt=all --hot-data --hot-text \
+        --frame-opt-rm-stores --peepholes=all --x86-strip-redundant-address-size --indirect-call-promotion=all \
+        --reg-reassign --use-aggr-reg-reassign --reorder-blocks=ext-tsp --reorder-functions=cdsort \
+        --split-all-cold --split-eh --split-functions --split-strategy=cdsplit || true
+    fi
+    if [[ -s "$srcdir/bolt_profile/gdk-pixbuf-pixdata.fdata" && -x "$srcdir/pgo_bin/gdk-pixbuf-pixdata" ]]; then
+      llvm-bolt "$srcdir/pgo_bin/gdk-pixbuf-pixdata" \
+        -o "$srcdir/bolt_opt/bin/gdk-pixbuf-pixdata" \
+        --data="$srcdir/bolt_profile/gdk-pixbuf-pixdata.fdata" \
+        --dyno-stats --cu-processing-batch-size=64 --eliminate-unreachable --frame-opt=all --icf=all \
+        --jump-tables=aggressive --min-branch-clusters --stoke --sctc-mode=always --plt=all --hot-data --hot-text \
+        --frame-opt-rm-stores --peepholes=all --x86-strip-redundant-address-size --indirect-call-promotion=all \
+        --reg-reassign --use-aggr-reg-reassign --reorder-blocks=ext-tsp --reorder-functions=cdsort \
+        --split-all-cold --split-eh --split-functions --split-strategy=cdsplit || true
+    fi
+  else
+    echo ">>> WARNING: llvm-bolt not found; skipping BOLT stages." >&2
+  fi
 }
 
 #check() {
-#  cd build
-  # pixbuf-randomly-modified fails randomly
+#  cd build-pgo-use
 #  meson test -t 3 || :
 #}
 
 package() {
-  DESTDIR="$pkgdir" meson install -C build
-  install -Dt "$pkgdir/usr/share/libalpm/hooks" -m644 *.hook
-}
+  DESTDIR="$pkgdir" meson install -C build-pgo-use
 
-# vim:set ts=2 sw=2 et:
+  # Overlay BOLT-optimized or PGO-only tools
+  install -Dm755 -t "$pkgdir/usr/bin" "$srcdir/bolt_opt/bin/"* 2>/dev/null || true
+  for t in gdk-pixbuf-query-loaders gdk-pixbuf-pixdata; do
+    if [[ ! -f "$pkgdir/usr/bin/$t" && -f "$srcdir/pgo_bin/$t" ]]; then
+      install -Dm755 "$srcdir/pgo_bin/$t" "$pkgdir/usr/bin/$t"
+    fi
+  done
+
+  # Overlay library (prefer BOLT; else PGO)
+  local inst_lib_real
+  inst_lib_real="$(readlink -f "$(find "$pkgdir/usr/lib" -maxdepth 1 -type f -name 'libgdk_pixbuf-2.0.so*' | sort -V | tail -n1)")"
+  if [[ -n "$inst_lib_real" ]]; then
+    local base="$(basename "$inst_lib_real")"
+    if [[ -f "$srcdir/bolt_opt/lib/$base" ]]; then
+      install -Dm755 "$srcdir/bolt_opt/lib/$base" "$pkgdir/usr/lib/$base"
+    elif [[ -f "$srcdir/pgo_lib/$base" ]]; then
+      install -Dm755 "$srcdir/pgo_lib/$base" "$pkgdir/usr/lib/$base"
+    fi
+  fi
+
+  # Pacman hook
+  install -Dt "$pkgdir/usr/share/libalpm/hooks" -m644 gdk-pixbuf-query-loaders.hook
+}
