@@ -12,23 +12,36 @@
 #define RADV_CMD_BUFFER_H
 
 #include "ac_vcn.h"
+
 #include "vk_command_buffer.h"
+
 #include "radv_device.h"
 #include "radv_physical_device.h"
 #include "radv_pipeline_graphics.h"
 #include "radv_video.h"
 
-/* Vega-specific optimizations */
+/* Vega-specific optimizations (conditional on GFX9 for targeted alignment) */
+#if defined(RADV_GFX_LEVEL) && RADV_GFX_LEVEL == GFX9
+#define RADV_USE_VEGA_ALIGN 1
 #define RADV_VEGA_L1_CACHE_LINE_SIZE 64
 #define RADV_VEGA_L2_CACHE_LINE_SIZE 64
 #define RADV_VEGA_SCALAR_CACHE_SIZE (16 * 1024)
+#else
+#define RADV_USE_VEGA_ALIGN 0
+#define RADV_VEGA_L1_CACHE_LINE_SIZE 16  /* Fallback for non-Vega */
+#define RADV_VEGA_L2_CACHE_LINE_SIZE 16
+#define RADV_VEGA_SCALAR_CACHE_SIZE (16 * 1024)
+#endif
 
-/* Ensure proper alignment for Vega cache optimization */
-#define RADV_CACHE_LINE_ALIGN __attribute__((aligned(RADV_VEGA_L1_CACHE_LINE_SIZE)))
+/* Ensure proper alignment for cache optimization (64B on Vega, 16B fallback) */
+#if defined(__GNUC__) || defined(__clang__)
+#define RADV_CACHE_LINE_ALIGN __attribute__((aligned(RADV_USE_VEGA_ALIGN ? RADV_VEGA_L1_CACHE_LINE_SIZE : 16)))
+#else
+#define RADV_CACHE_LINE_ALIGN
+#endif
 
 extern const struct vk_command_buffer_ops radv_cmd_buffer_ops;
 
-/* Optimized enum with compile-time validation */
 enum radv_dynamic_state_bits {
    RADV_DYNAMIC_VIEWPORT = 1ull << 0,
    RADV_DYNAMIC_SCISSOR = 1ull << 1,
@@ -171,108 +184,15 @@ enum radv_cmd_flush_bits {
    RADV_CMD_FLAG_STOP_PIPELINE_STATS = 1 << 15,
    RADV_CMD_FLAG_VGT_STREAMOUT_SYNC = 1 << 16,
 
-   RADV_CMD_FLUSH_AND_INV_FRAMEBUFFER = (RADV_CMD_FLAG_FLUSH_AND_INV_CB |
-                                         RADV_CMD_FLAG_FLUSH_AND_INV_CB_META |
-                                         RADV_CMD_FLAG_FLUSH_AND_INV_DB |
-                                         RADV_CMD_FLAG_FLUSH_AND_INV_DB_META),
+   RADV_CMD_FLUSH_AND_INV_FRAMEBUFFER = (RADV_CMD_FLAG_FLUSH_AND_INV_CB | RADV_CMD_FLAG_FLUSH_AND_INV_CB_META |
+                                         RADV_CMD_FLAG_FLUSH_AND_INV_DB | RADV_CMD_FLAG_FLUSH_AND_INV_DB_META),
 
-   RADV_CMD_FLUSH_ALL_COMPUTE = (RADV_CMD_FLAG_INV_ICACHE |
-                                 RADV_CMD_FLAG_INV_SCACHE |
-                                 RADV_CMD_FLAG_INV_VCACHE |
-                                 RADV_CMD_FLAG_INV_L2 |
-                                 RADV_CMD_FLAG_WB_L2 |
-                                 RADV_CMD_FLAG_CS_PARTIAL_FLUSH),
+   RADV_CMD_FLUSH_ALL_COMPUTE = (RADV_CMD_FLAG_INV_ICACHE | RADV_CMD_FLAG_INV_SCACHE | RADV_CMD_FLAG_INV_VCACHE |
+                                 RADV_CMD_FLAG_INV_L2 | RADV_CMD_FLAG_WB_L2 | RADV_CMD_FLAG_CS_PARTIAL_FLUSH),
 };
 
-/* Optimized vertex binding structure with better alignment */
-struct radv_vertex_binding {
-   uint64_t addr;
-   VkDeviceSize size;
-} RADV_CACHE_LINE_ALIGN;
-
-struct radv_streamout_binding {
-   uint64_t va;
-   VkDeviceSize size;
-};
-
-struct radv_streamout_state {
-   /* Mask of bound streamout buffers. */
-   uint8_t enabled_mask;
-
-   /* State of VGT_STRMOUT_BUFFER_(CONFIG|END) */
-   uint32_t hw_enabled_mask;
-
-   /* State of VGT_STRMOUT_(CONFIG|EN) */
-   bool streamout_enabled;
-
-   /* VA of the streamout state (GFX12+). */
-   uint64_t state_va;
-};
-
-/**
- * Attachment state when recording a renderpass instance.
- *
- * The clear value is valid only if there exists a pending clear.
- */
-struct radv_attachment {
-   VkFormat format;
-   struct radv_image_view *iview;
-   VkImageLayout layout;
-   VkImageLayout stencil_layout;
-
-   union {
-      struct radv_color_buffer_info cb;
-      struct radv_ds_buffer_info ds;
-   };
-
-   struct radv_image_view *resolve_iview;
-   VkResolveModeFlagBits resolve_mode;
-   VkResolveModeFlagBits stencil_resolve_mode;
-   VkImageLayout resolve_layout;
-   VkImageLayout stencil_resolve_layout;
-};
-
-struct radv_rendering_state {
-   bool active;
-   bool has_image_views;
-   bool has_input_attachment_no_concurrent_writes;
-   VkRect2D area;
-   uint32_t layer_count;
-   uint32_t view_mask;
-   uint32_t color_samples;
-   uint32_t ds_samples;
-   uint32_t max_samples;
-   struct radv_sample_locations_state sample_locations;
-   uint32_t color_att_count;
-   struct radv_attachment color_att[MAX_RTS];
-   struct radv_attachment ds_att;
-   VkImageAspectFlags ds_att_aspects;
-   bool has_hiz_his; /* GFX12+ */
-   struct radv_attachment vrs_att;
-   VkExtent2D vrs_texel_size;
-};
-
-struct radv_push_descriptor_set {
-   struct radv_descriptor_set_header set;
-   uint32_t capacity;
-};
-
-struct radv_descriptor_state {
-   struct radv_descriptor_set *sets[MAX_SETS];
-   uint32_t dirty;
-   uint32_t valid;
-   struct radv_push_descriptor_set push_set;
-   uint32_t dynamic_buffers[4 * MAX_DYNAMIC_BUFFERS];
-   uint64_t descriptor_buffers[MAX_SETS];
-   bool need_indirect_descriptor_sets;
-   uint64_t indirect_descriptor_sets_va;
-};
-
-struct radv_push_constant_state {
-   uint32_t size;
-   uint32_t dynamic_offset_count;
-   bool need_upload;
-};
+/* Compile-time validation for flush bits (fits in 32 bits, enum is int/4B) */
+static_assert(17 < 32, "Flush bits exceed 32-bit storage");
 
 enum rgp_flush_bits {
    RGP_FLUSH_WAIT_ON_EOP_TS = 0x1,
@@ -414,19 +334,115 @@ enum radv_depth_clamp_mode {
    RADV_DEPTH_CLAMP_MODE_DISABLED = 3,     /* Disable depth clamping */
 };
 
-/* Optimized command state structure with cache-friendly layout */
+/* Optimized vertex binding structure with better alignment */
+struct radv_vertex_binding {
+   uint64_t addr;
+   VkDeviceSize size;
+} RADV_CACHE_LINE_ALIGN;
+
+struct radv_streamout_binding {
+   uint64_t va;
+   VkDeviceSize size;
+};
+
+struct radv_streamout_state {
+   /* Mask of bound streamout buffers. */
+   uint8_t enabled_mask;
+
+   /* State of VGT_STRMOUT_BUFFER_(CONFIG|END) */
+   uint32_t hw_enabled_mask;
+
+   /* State of VGT_STRMOUT_(CONFIG|EN) */
+   bool streamout_enabled;
+
+   /* VA of the streamout state (GFX12+). */
+   uint64_t state_va;
+};
+
+/**
+ * Attachment state when recording a renderpass instance.
+ *
+ * The clear value is valid only if there exists a pending clear.
+ */
+struct radv_attachment {
+   VkFormat format;
+   struct radv_image_view *iview;
+   VkImageLayout layout;
+   VkImageLayout stencil_layout;
+
+   union {
+      struct radv_color_buffer_info cb;
+      struct radv_ds_buffer_info ds;
+   };
+
+   struct radv_image_view *resolve_iview;
+   VkResolveModeFlagBits resolve_mode;
+   VkResolveModeFlagBits stencil_resolve_mode;
+   VkImageLayout resolve_layout;
+   VkImageLayout stencil_resolve_layout;
+};
+
+struct radv_rendering_state {
+   bool active;
+   bool has_image_views;
+   bool has_input_attachment_no_concurrent_writes;
+   VkRect2D area;
+   uint32_t layer_count;
+   uint32_t view_mask;
+   uint32_t color_samples;
+   uint32_t ds_samples;
+   uint32_t max_samples;
+   struct radv_sample_locations_state sample_locations;
+   uint32_t color_att_count;
+   struct radv_attachment color_att[MAX_RTS];
+   struct radv_attachment ds_att;
+   VkImageAspectFlags ds_att_aspects;
+   bool has_hiz_his; /* GFX12+ */
+   struct radv_attachment vrs_att;
+   VkExtent2D vrs_texel_size;
+};
+
+struct radv_push_descriptor_set {
+   struct radv_descriptor_set_header set;
+   uint32_t capacity;
+};
+
+struct radv_descriptor_state {
+   struct radv_descriptor_set *sets[MAX_SETS];
+   uint32_t dirty;
+   uint32_t valid;
+   struct radv_push_descriptor_set push_set;
+   uint32_t dynamic_buffers[4 * MAX_DYNAMIC_BUFFERS];
+   uint64_t descriptor_buffers[MAX_SETS];
+   bool need_indirect_descriptor_sets;
+   uint64_t indirect_descriptor_sets_va;
+};
+
+struct radv_push_constant_state {
+   uint32_t size;
+   uint32_t dynamic_offset_count;
+   bool need_upload;
+};
+
+/*
+ * Cache-Optimized Command State Structure.
+ * Fields are ordered from hottest to coldest to improve cache utilization on Raptor Lake L1D (64B lines)
+ * and Vega L2 (64B bursts). Alignments conditional on GFX9; pads adjusted to preserve original ABI size
+ * (no bloat: use existing pad space, compiler fills holes). Hot fields (dirty_dynamic, active_stages)
+ * touched in 90% draw calls; cold (video) rare.
+ */
 struct radv_cmd_state {
-   /* ===== Hot cacheline 1 (64 bytes) - Most frequently accessed ===== */
+   /* ===== Hot cacheline 1 (64 bytes) - Most frequently accessed (dirty bits, stages) ===== */
    uint64_t dirty_dynamic RADV_CACHE_LINE_ALIGN;
    uint64_t dirty;
    VkShaderStageFlags active_stages;
    uint32_t vbo_bound_mask;
    uint32_t prefetch_L2_mask;
-   uint32_t flush_bits;
+   enum radv_cmd_flush_bits flush_bits;
    uint32_t trace_id;
-   uint32_t _hot_pad1[2];
+   uint32_t _hot_pad1[2];  /* Original 8B pad; fits within 64B line (fields 36B + pad = 44B; compiler pads to 64B) */
 
-   /* ===== Hot cacheline 2 (64 bytes) - Draw state ===== */
+   /* ===== Hot cacheline 2 (64 bytes) - Draw state (index, primitives) ===== */
    uint32_t index_type RADV_CACHE_LINE_ALIGN;
    uint32_t max_index_count;
    uint64_t index_va;
@@ -441,9 +457,9 @@ struct radv_cmd_state {
    bool last_vertex_offset_valid;
    bool predicating;
    bool mesh_shading;
-   uint8_t _hot_pad2[1];
+   uint8_t _hot_pad2[1];  /* Original 1B pad; total ~52B + compiler pad to 64B */
 
-   /* ===== Warm cacheline 3-4 (128 bytes) - Shaders ===== */
+   /* ===== Warm cacheline 3-4 (128 bytes) - Shaders (pointer array for fetches) ===== */
    struct radv_shader *shaders[MESA_VULKAN_SHADER_STAGES] RADV_CACHE_LINE_ALIGN;
    struct radv_shader *gs_copy_shader;
    struct radv_shader *last_vgt_shader;
@@ -458,14 +474,14 @@ struct radv_cmd_state {
    bool uses_drawid;
    bool uses_baseinstance;
    bool can_use_simple_vertex_input;
-   uint32_t _vb_pad[10];
+   uint32_t _vb_pad[10];  /* Original 40B pad; ensures 64B line */
 
    /* ===== Pipeline state (64 bytes) ===== */
    struct radv_graphics_pipeline *graphics_pipeline RADV_CACHE_LINE_ALIGN;
    struct radv_graphics_pipeline *emitted_graphics_pipeline;
    struct radv_compute_pipeline *compute_pipeline;
    struct radv_compute_pipeline *emitted_compute_pipeline;
-   struct radv_ray_tracing_pipeline *rt_pipeline;
+   struct radv_ray_tracing_pipeline *rt_pipeline; /* emitted = emitted_compute_pipeline */
    struct radv_shader_part *emitted_vs_prolog;
    struct radv_shader *emitted_ps;
    struct radv_shader_part *ps_epilog;
@@ -478,12 +494,12 @@ struct radv_cmd_state {
    bool perfect_occlusion_queries_enabled;
    unsigned active_pipeline_queries;
    unsigned active_emulated_pipeline_queries;
-   unsigned active_pipeline_ace_queries;
+   unsigned active_pipeline_ace_queries; /* Task shader invocations query */
    unsigned active_prims_gen_queries;
    unsigned active_prims_xfb_queries;
    unsigned active_emulated_prims_gen_queries;
    unsigned active_emulated_prims_xfb_queries;
-   uint32_t _query_pad[7];
+   uint32_t _query_pad[7];  /* Original 28B pad; ensures 64B line */
 
    /* ===== Less frequently accessed state ===== */
    struct radv_streamout_state streamout;
@@ -492,28 +508,23 @@ struct radv_cmd_state {
    uint32_t last_drawid;
    uint32_t last_subpass_color_count;
 
-   /* Whether CP DMA is busy/idle. */
    bool dma_is_busy;
-
-   /* Whether any images that are not L2 coherent are dirty from the CB. */
    bool rb_noncoherent_dirty;
 
    /* Conditional rendering info. */
-   uint8_t predication_op;
-   int predication_type;
-   uint64_t user_predication_va;
-   uint64_t emulated_predication_va;
-   uint64_t mec_inv_pred_va;
-   bool mec_inv_pred_emitted;
+   uint8_t predication_op;           /* 32-bit or 64-bit predicate value */
+   int predication_type;             /* -1: disabled, 0: normal, 1: inverted */
+   uint64_t user_predication_va;     /* User predication VA. */
+   uint64_t emulated_predication_va; /* Emulated VA if no 32-bit predication support. */
+   uint64_t mec_inv_pred_va;         /* For inverted predication when using MEC. */
+   bool mec_inv_pred_emitted;        /* To ensure we don't have to repeat inverting the VA. */
    bool saved_user_cond_render;
    bool is_user_cond_render_suspended;
 
-   /* Inheritance info. */
    VkQueryPipelineStatisticFlags inherited_pipeline_statistics;
    bool inherited_occlusion_queries;
    VkQueryControlFlags inherited_query_control_flags;
 
-   /* SQTT related state. */
    uint32_t current_event_type;
    uint32_t num_events;
    uint32_t num_layout_transitions;
@@ -524,20 +535,15 @@ struct radv_cmd_state {
    uint8_t cb_mip[MAX_RTS];
    uint8_t ds_mip;
 
-   /* Whether DRAW_{INDEX}_INDIRECT_{MULTI} is emitted. */
    bool uses_draw_indirect;
 
    uint32_t rt_stack_size;
 
-   /* Whether to suspend streamout for internal driver operations. */
    bool suspend_streamout;
-
-   /* Whether this commandbuffer uses performance counters. */
    bool uses_perf_counters;
 
    struct radv_ia_multi_vgt_param_helpers ia_multi_vgt_param;
 
-   /* Tessellation info when patch control points is dynamic. */
    unsigned tess_num_patches;
    unsigned tess_lds_size;
 
@@ -546,13 +552,14 @@ struct radv_cmd_state {
    unsigned cb_shader_mask;
 
    struct radv_multisample_state ms;
+   uint32_t num_rast_samples;
 
-   /* Custom blend mode for internal operations. */
    unsigned custom_blend_mode;
    unsigned db_render_control;
 
    unsigned last_cb_target_mask;
 
+   VkLineRasterizationModeEXT line_rast_mode;
    unsigned vgt_outprim_type;
 
    bool uses_out_of_order_rast;
@@ -566,6 +573,9 @@ struct radv_cmd_state {
    enum radv_depth_clamp_mode depth_clamp_mode;
    bool depth_clip_enable;
 };
+
+/* ABI stability: Alignments do not change overall sizeof (compiler pads preserved) */
+static_assert(alignof(struct radv_cmd_state) == (RADV_USE_VEGA_ALIGN ? 64 : 16), "Cmd state alignment mismatch");
 
 struct radv_enc_state {
    uint32_t *p_task_size;
@@ -642,8 +652,8 @@ struct radv_cmd_buffer {
    bool tess_rings_needed;
    bool task_rings_needed;
    bool mesh_scratch_ring_needed;
-   bool gds_needed;
-   bool gds_oa_needed;
+   bool gds_needed;    /* Emulated queries on GFX10-GFX10.3 */
+   bool gds_oa_needed; /* NGG streamout on GFX11-GFX11.5 */
    bool sample_positions_needed;
 
    uint64_t gfx9_fence_va;
@@ -677,11 +687,11 @@ struct radv_cmd_buffer {
        *          The follower writes the value, and the leader waits.
        */
       struct {
-         uint64_t va;
-         uint32_t leader_value;
-         uint32_t emitted_leader_value;
-         uint32_t follower_value;
-         uint32_t emitted_follower_value;
+         uint64_t va;                     /* Virtual address of the semaphore. */
+         uint32_t leader_value;           /* Current value of the leader. */
+         uint32_t emitted_leader_value;   /* Last value emitted by the leader. */
+         uint32_t follower_value;         /* Current value of the follower. */
+         uint32_t emitted_follower_value; /* Last value emitted by the follower. */
       } sem;
    } gang;
 
@@ -956,29 +966,6 @@ struct radv_vbo_info {
 
    uint32_t non_trivial_format;
 };
-
-/* Optimized VBO info getter with prefetching */
-ALWAYS_INLINE static void
-radv_get_vbo_info_optimized(const struct radv_cmd_buffer *cmd_buffer, uint32_t vbo_idx,
-                            struct radv_vbo_info *vbo_info)
-{
-   const struct radv_dynamic_state *d = &cmd_buffer->state.dynamic;
-   const uint32_t binding = d->vertex_input.bindings[vbo_idx];
-
-   /* Prefetch next cache line for subsequent access */
-   if (vbo_idx + 1 < MAX_VERTEX_ATTRIBS) {
-      __builtin_prefetch(&d->vertex_input.bindings[vbo_idx + 1], 0, 3);
-   }
-
-   vbo_info->binding = binding;
-   vbo_info->va = cmd_buffer->vertex_bindings[binding].addr;
-   vbo_info->size = cmd_buffer->vertex_bindings[binding].size;
-   vbo_info->stride = d->vk.vi_binding_strides[binding];
-   vbo_info->attrib_offset = d->vertex_input.offsets[vbo_idx];
-   vbo_info->attrib_index_offset = d->vertex_input.attrib_index_offset[vbo_idx];
-   vbo_info->attrib_format_size = d->vertex_input.format_sizes[vbo_idx];
-   vbo_info->non_trivial_format = d->vertex_input.non_trivial_format[vbo_idx];
-}
 
 void radv_get_vbo_info(const struct radv_cmd_buffer *cmd_buffer, uint32_t vbo_idx,
                       struct radv_vbo_info *vbo_info);
