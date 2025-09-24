@@ -655,7 +655,7 @@ static struct ruvd_h265 get_h265_msg(struct ruvd_decoder *dec, struct pipe_video
    result.curr_poc = pic->CurrPicOrderCntVal;
 
    for (i = 0; i < 16; i++) {
-      for (j = 0; (pic->ref[j] != NULL) && (j < 16); j++) {
+      for (j = 0; (j < 16) && (pic->ref[j] != NULL); j++) {
          if (dec->render_pic_list[i] == pic->ref[j])
             break;
          if (j == 15)
@@ -1441,14 +1441,8 @@ void si_uvd_set_dt_surfaces(struct ruvd_msg *msg, struct radeon_surf *luma,
       msg->body.decode.dt_luma_top_offset = texture_offset(luma, 0, type);
       if (chroma)
          msg->body.decode.dt_chroma_top_offset = texture_offset(chroma, 0, type);
-      if (msg->body.decode.dt_field_mode) {
-         msg->body.decode.dt_luma_bottom_offset = texture_offset(luma, 1, type);
-         if (chroma)
-            msg->body.decode.dt_chroma_bottom_offset = texture_offset(chroma, 1, type);
-      } else {
-         msg->body.decode.dt_luma_bottom_offset = msg->body.decode.dt_luma_top_offset;
-         msg->body.decode.dt_chroma_bottom_offset = msg->body.decode.dt_chroma_top_offset;
-      }
+      msg->body.decode.dt_luma_bottom_offset = msg->body.decode.dt_luma_top_offset;
+      msg->body.decode.dt_chroma_bottom_offset = msg->body.decode.dt_chroma_top_offset;
 
       if (chroma) {
          assert(luma->u.legacy.bankw == chroma->u.legacy.bankw);
@@ -1466,13 +1460,8 @@ void si_uvd_set_dt_surfaces(struct ruvd_msg *msg, struct radeon_surf *luma,
       msg->body.decode.dt_wa_chroma_bottom_offset = luma->u.gfx9.swizzle_mode;
       msg->body.decode.dt_luma_top_offset = texture_offset(luma, 0, type);
       msg->body.decode.dt_chroma_top_offset = texture_offset(chroma, 0, type);
-      if (msg->body.decode.dt_field_mode) {
-         msg->body.decode.dt_luma_bottom_offset = texture_offset(luma, 1, type);
-         msg->body.decode.dt_chroma_bottom_offset = texture_offset(chroma, 1, type);
-      } else {
-         msg->body.decode.dt_luma_bottom_offset = msg->body.decode.dt_luma_top_offset;
-         msg->body.decode.dt_chroma_bottom_offset = msg->body.decode.dt_chroma_top_offset;
-      }
+      msg->body.decode.dt_luma_bottom_offset = msg->body.decode.dt_luma_top_offset;
+      msg->body.decode.dt_chroma_bottom_offset = msg->body.decode.dt_chroma_top_offset;
       msg->body.decode.dt_surf_tile_config = 0;
       break;
    }
