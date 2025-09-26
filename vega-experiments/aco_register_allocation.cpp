@@ -339,18 +339,31 @@ public:
       return res;
    }
 
-   /* Returns true if any of the bytes in the given range are allocated or blocked */
    bool test(PhysReg start, unsigned num_bytes) const
    {
-      for (PhysReg i = start; i.reg_b < start.reg_b + num_bytes; i = PhysReg(i + 1)) {
-         assert(i <= 511);
-         if (regs[i] & 0x0FFFFFFF)
+      unsigned start_b = start.reg_b;
+      unsigned end_b = start_b + num_bytes;
+      unsigned first_dw = start_b >> 2;
+      unsigned last_dw_excl = (end_b + 3) >> 2; // ceil(end_b/4)
+
+      for (unsigned dw = first_dw; dw < last_dw_excl; ++dw) {
+         PhysReg dwr{dw};
+         const uint32_t val = regs[dwr];
+         if (val & 0x0FFFFFFF) // full-slot used or blocked (except the subdword sentinel)
             return true;
-         if (regs[i] == 0xF0000000) {
-            auto it = subdword_regs.find(i);
+
+         if (val == 0xF0000000) {
+            auto it = subdword_regs.find(dw);
             assert(it != subdword_regs.end());
-            for (unsigned j = i.byte(); i * 4 + j < start.reg_b + num_bytes && j < 4; j++) {
-               if (it->second[j])
+            const auto& sub = it->second;
+
+            const unsigned dw_lo_b = dw << 2;
+            const unsigned lo = (dw == first_dw) ? (start_b - dw_lo_b) : 0;
+            const unsigned hi_b = std::min(end_b, dw_lo_b + 4);
+            const unsigned hi = hi_b - dw_lo_b;
+
+            for (unsigned j = lo; j < hi; ++j) {
+               if (sub[j])
                   return true;
             }
          }
@@ -445,17 +458,29 @@ private:
 
    void fill_subdword(PhysReg start, unsigned num_bytes, uint32_t val)
    {
-      fill(start, DIV_ROUND_UP(num_bytes, 4), 0xF0000000);
-      for (PhysReg i = start; i.reg_b < start.reg_b + num_bytes; i = PhysReg(i + 1)) {
-         /* emplace or get */
-         std::array<uint32_t, 4>& sub =
-            subdword_regs.emplace(i, std::array<uint32_t, 4>{0, 0, 0, 0}).first->second;
-         for (unsigned j = i.byte(); i * 4 + j < start.reg_b + num_bytes && j < 4; j++)
+      unsigned start_b = start.reg_b;
+      unsigned end_b = start_b + num_bytes;
+      unsigned first_dw = start_b >> 2;
+      unsigned last_dw_excl = (end_b + 3) >> 2; // ceil(end_b/4)
+
+      // Mark owning dwords with subdword sentinel
+      fill(PhysReg{first_dw}, last_dw_excl - first_dw, 0xF0000000);
+
+      for (unsigned dw = first_dw; dw < last_dw_excl; ++dw) {
+         auto& sub =
+            subdword_regs.emplace(dw, std::array<uint32_t, 4>{0, 0, 0, 0}).first->second;
+
+         const unsigned dw_lo_b = dw << 2;
+         const unsigned lo = (dw == first_dw) ? (start_b - dw_lo_b) : 0;
+         const unsigned hi_b = std::min(end_b, dw_lo_b + 4);
+         const unsigned hi = hi_b - dw_lo_b;
+
+         for (unsigned j = lo; j < hi; ++j)
             sub[j] = val;
 
          if (sub == std::array<uint32_t, 4>{0, 0, 0, 0}) {
-            subdword_regs.erase(i);
-            regs[i] = 0;
+            subdword_regs.erase(dw);
+            regs[PhysReg{dw}] = 0;
          }
       }
    }
