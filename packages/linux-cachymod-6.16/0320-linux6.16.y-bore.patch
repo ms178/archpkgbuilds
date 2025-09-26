@@ -1080,7 +1080,7 @@ index 47972f34ea..a7c69cfbcf 100644
 
 --- a/kernel/sched/bore.c	2025-06-01 23:36:18.232869234 +0200
 +++ b/kernel/sched/bore.c	2025-08-15 11:34:05.354450555 +0200
-@@ -1,449 +1,1967 @@
+@@ -1,449 +1,2018 @@
 +// SPDX-License-Identifier: GPL-2.0
  /*
 - *  Burst-Oriented Response Enhancer (BORE) CPU Scheduler
@@ -1251,7 +1251,14 @@ index 47972f34ea..a7c69cfbcf 100644
 -		se->burst_penalty = se->prev_burst_penalty +
 -		(se->curr_burst_penalty - se->prev_burst_penalty) / se->burst_count;
 -	update_burst_score(se);
-+
+-}
+ 
+-static inline u32 binary_smooth(u32 new, u32 old, u8 dumper) {
+-	s32 increment = new - old;
+-	return (0 <= increment)?
+-		old + ( increment / dumper):
+-		old - (-increment / dumper);
+-}
 +/* Forward declarations */
 +void update_burst_penalty(struct sched_entity *se);
 +void update_curr_bore(u64 delta_exec, struct sched_entity *se);
@@ -1349,7 +1356,12 @@ index 47972f34ea..a7c69cfbcf 100644
 +	[3] = 100,  /* Class 3 (critical): Evict from E-core */
 +	[4 ... ITD_MAX_CLASSES - 1] = 0,
 +};
-+
+ 
+-static void __restart_burst(struct sched_entity *se) {
+-	se->prev_burst_penalty = binary_smooth(
+-		se->curr_burst_penalty, se->prev_burst_penalty, se->burst_count);
+-	se->burst_time = 0;
+-	se->curr_burst_penalty = 0;
 +/* Per-CPU ITD/HFI sampling state – cache-line aligned to kill false sharing */
 +struct bore_itd_state {
 +	u64 last_sample_ns;
@@ -1375,7 +1387,12 @@ index 47972f34ea..a7c69cfbcf 100644
 +	struct bore_itd_state *st;
 +
 +	lockdep_assert_preemption_disabled();
-+
+ 
+-	u8 smoothness = sched_burst_smoothness;
+-	if (se->burst_count < smoothness)
+-		se->burst_count++;
+-	else if (unlikely(se->burst_count > smoothness))
+-		se->burst_count = smoothness;
 +	st = this_cpu_ptr(&bore_itd_state);
 +
 +	if (READ_ONCE(st->inited)) {
@@ -1464,35 +1481,32 @@ index 47972f34ea..a7c69cfbcf 100644
 +                                                      u8  classid,
 +                                                      bool is_pcore)
 +{
-+    if (classid >= ITD_MAX_CLASSES) {
++    if (classid >= ITD_MAX_CLASSES || base_penalty == 0U) {
 +        return base_penalty;
 +    }
 +
-+    u32 bias_pct = is_pcore
++    u32 pct = is_pcore
 +        ? READ_ONCE(sched_burst_itd_bias_pcore_pct[classid])
 +        : READ_ONCE(sched_burst_itd_bias_ecore_pct[classid]);
-+    bias_pct = clamp_t(u32, bias_pct, 0, 100);
++    u32 cap = clamp_t(u32, READ_ONCE(sched_burst_itd_cap_pct), 0U, 100U);
 +
-+    if (!bias_pct) {
++    pct = clamp_t(u32, pct, 0U, 100U);
++    if (!pct || !cap) {
 +        return base_penalty;
 +    }
 +
-+    u32 prod = base_penalty * bias_pct;
-+    u32 cap_pct = clamp_t(u32, READ_ONCE(sched_burst_itd_cap_pct), 0, 100);
-+    u32 cap_prod = base_penalty * cap_pct;
++    /* min(cap, pct) * base / 100 */
++    u32 eff_pct = (pct < cap) ? pct : cap;
++    u32 adj = (base_penalty * eff_pct) / 100U;
 +
-+    u32 adj = prod / 100;
-+    u32 cap = cap_prod / 100;
-+    adj = (adj > cap) ? cap : adj;
-+
-+    /* Branchless conditional return */
-+    u32 res_pcore = (adj > base_penalty) ? 0U : (base_penalty - adj);
-+    u32 res_ecore = base_penalty + adj;
-+
-+    /* Overflow safe for ecore */
-+    res_ecore = (res_ecore < base_penalty) ? U32_MAX : res_ecore;
-+
-+    return is_pcore ? res_pcore : res_ecore;
++    if (is_pcore) {
++        /* Reduce penalty on P-core; saturating subtract. */
++        return (adj >= base_penalty) ? 0U : (base_penalty - adj);
++    } else {
++        /* Increase penalty on E-core; saturating add. */
++        u32 res = base_penalty + adj;
++        return (res < base_penalty) ? U32_MAX : res;
++    }
 +}
 +#endif /* CONFIG_X86 */
 +
@@ -1552,11 +1566,10 @@ index 47972f34ea..a7c69cfbcf 100644
 +	return TOPO_CPU_TYPE_UNKNOWN;
  }
  
--static inline u32 binary_smooth(u32 new, u32 old, u8 dumper) {
--	s32 increment = new - old;
--	return (0 <= increment)?
--		old + ( increment / dumper):
--		old - (-increment / dumper);
+-inline void restart_burst(struct sched_entity *se) {
+-	__restart_burst(se);
+-	se->burst_penalty = se->prev_burst_penalty;
+-	update_burst_score(se);
 +static void __init bore_build_lookup_tables(void)
 +{
 +	int base, score, prio;
@@ -1617,11 +1630,18 @@ index 47972f34ea..a7c69cfbcf 100644
 +	return false;
  }
  
--static void __restart_burst(struct sched_entity *se) {
--	se->prev_burst_penalty = binary_smooth(
--		se->curr_burst_penalty, se->prev_burst_penalty, se->burst_count);
--	se->burst_time = 0;
--	se->curr_burst_penalty = 0;
+-void restart_burst_rescale_deadline(struct sched_entity *se) {
+-	s64 vscaled, wremain, vremain = se->deadline - se->vruntime;
+-	struct task_struct *p = task_of(se);
+-	u8 prev_prio = effective_prio(p);
+-	restart_burst(se);
+-	u8 new_prio = effective_prio(p);
+-	if (prev_prio > new_prio) {
+-		wremain = __unscale_slice(abs(vremain), prev_prio);
+-		vscaled = __scale_slice(wremain, new_prio);
+-		if (unlikely(vremain < 0))
+-			vscaled = -vscaled;
+-		se->deadline = se->vruntime + vscaled;
 +static bool __init is_intel_hybrid(void)
 +{
 +#ifdef CONFIG_X86_64
@@ -1637,103 +1657,91 @@ index 47972f34ea..a7c69cfbcf 100644
 +static bool bore_cpu_types_detected;
 +static void bore_enable_key_workfn(struct work_struct *w);
 +static DECLARE_WORK(bore_enable_key_work, bore_enable_key_workfn);
- 
--	u8 smoothness = sched_burst_smoothness;
--	if (se->burst_count < smoothness)
--		se->burst_count++;
--	else if (unlikely(se->burst_count > smoothness))
--		se->burst_count = smoothness;
++
 +static inline void bore_bump_penalty_gen(void)
 +{
 +	atomic_inc(&bore_penalty_gen);
- }
- 
--inline void restart_burst(struct sched_entity *se) {
--	__restart_burst(se);
--	se->burst_penalty = se->prev_burst_penalty;
--	update_burst_score(se);
++}
++
 +static inline const struct bore_penalty_param *bore_get_param(void)
 +{
-+	struct bore_penalty_param *pp;
-+	s16 itd_now;
-+	u8  g_now;
++    struct bore_penalty_param *pp;
++    s16 itd_now;
++    u8  g_now;
 +
-+	lockdep_assert_preemption_disabled();
++    /* Required: callers must hold preempt disabled (lockdep checks it). */
++    lockdep_assert_preemption_disabled();
 +
-+	pp      = this_cpu_ptr(&bore_penalty);
-+	itd_now = arch_asym_cpu_priority(smp_processor_id());
-+	g_now   = (u8)atomic_read(&bore_penalty_gen);
++    pp      = this_cpu_ptr(&bore_penalty);
++    itd_now = arch_asym_cpu_priority(smp_processor_id());
++    g_now   = (u8)atomic_read(&bore_penalty_gen);
 +
-+	if (unlikely(pp->gen != g_now || pp->itd_pri != itd_now)) {
-+		bore_build_penalty_param_for_cpu(smp_processor_id());
-+	}
++    /* Rebuild per-CPU params if generation or asym priority changed. */
++    if (unlikely(pp->gen != g_now || pp->itd_pri != itd_now)) {
++        bore_build_penalty_param_for_cpu(smp_processor_id());
++    }
 +
-+	return pp;
- }
- 
--void restart_burst_rescale_deadline(struct sched_entity *se) {
--	s64 vscaled, wremain, vremain = se->deadline - se->vruntime;
--	struct task_struct *p = task_of(se);
--	u8 prev_prio = effective_prio(p);
--	restart_burst(se);
--	u8 new_prio = effective_prio(p);
--	if (prev_prio > new_prio) {
--		wremain = __unscale_slice(abs(vremain), prev_prio);
--		vscaled = __scale_slice(wremain, new_prio);
--		if (unlikely(vremain < 0))
--			vscaled = -vscaled;
--		se->deadline = se->vruntime + vscaled;
++    return pp;
++}
++
 +static void bore_build_penalty_param_for_cpu(int cpu)
 +{
-+	struct bore_penalty_param *pp = &per_cpu(bore_penalty, cpu);
-+	enum x86_topology_cpu_type ct = per_cpu(bore_cpu_type, cpu);
-+	u32 scale  = READ_ONCE(sched_burst_penalty_scale);
-+	u8  offset = READ_ONCE(sched_burst_penalty_offset);
-+	s16 itd_pr = arch_asym_cpu_priority(cpu);
++    struct bore_penalty_param *pp = &per_cpu(bore_penalty, cpu);
++    enum x86_topology_cpu_type ct = per_cpu(bore_cpu_type, cpu);
++    u32 scale  = READ_ONCE(sched_burst_penalty_scale);
++    u8  offset = READ_ONCE(sched_burst_penalty_offset);
++    s16 itd_pr = arch_asym_cpu_priority(cpu);
 +
-+	if (READ_ONCE(sched_burst_core_aware_penalty) &&
-+	    static_branch_unlikely(&bore_core_aware_key)) {
-+		u32 base = READ_ONCE(sched_burst_penalty_scale);
++    /* Core-aware scaling (topology-based) */
++    if (READ_ONCE(sched_burst_core_aware_penalty) &&
++        static_branch_unlikely(&bore_core_aware_key)) {
++        u32 base = READ_ONCE(sched_burst_penalty_scale);
 +
-+		if (ct == TOPO_CPU_TYPE_EFFICIENCY) {
-+			u32 pct = clamp_t(u32,
-+					  READ_ONCE(sched_burst_penalty_ecore_scale_pct),
-+					  0U, 200U);
-+			scale = div_u64((u64)base * pct, 100);
-+			if (pct > 100) {
-+				u8 adj = min_t(u8, MAX_ECORE_OFFSET_ADJUST,
-+					       (pct - 100) / ECORE_OFFSET_ADJ_DIV);
-+				offset = max_t(u8, MIN_EFFECTIVE_OFFSET, offset - adj);
-+			}
-+		} else if (ct == TOPO_CPU_TYPE_PERFORMANCE) {
-+			u32 pct = clamp_t(u32,
-+					  READ_ONCE(sched_burst_penalty_pcore_scale_pct),
-+					  0U, 200U);
-+			scale = div_u64((u64)base * pct, 100);
-+		}
-+	}
++        if (ct == TOPO_CPU_TYPE_EFFICIENCY) {
++            u32 pct = clamp_t(u32,
++                              READ_ONCE(sched_burst_penalty_ecore_scale_pct),
++                              0U, 200U);
++            scale = div_u64((u64)base * pct, 100U);
++            if (pct > 100U) {
++                u8 adj = min_t(u8, MAX_ECORE_OFFSET_ADJUST,
++                               (u8)((pct - 100U) / ECORE_OFFSET_ADJ_DIV));
++                offset = max_t(u8, MIN_EFFECTIVE_OFFSET, (u8)(offset - adj));
++            }
++        } else if (ct == TOPO_CPU_TYPE_PERFORMANCE) {
++            u32 pct = clamp_t(u32,
++                              READ_ONCE(sched_burst_penalty_pcore_scale_pct),
++                              0U, 200U);
++            scale = div_u64((u64)base * pct, 100U);
++        }
++    }
 +
-+	/* ITD aggressiveness scaling */
-+	if (itd_pr > 0) {
-+		u64 pr_norm             = min_t(u64, 1024, (u64)itd_pr);
-+		u64 reduction_factor    = (1024 - pr_norm) * (1024 - pr_norm);
-+		u32 reduction_permille  = div_u64(reduction_factor, 1049);
-+		u32 aggressiveness      = clamp_t(u32,
-+						  BORE_DEF_ITD_AGGRESSIVENESS_PCT, 0U, 100U);
-+		u32 scale_reduction     =
-+			div_u64((u64)scale * reduction_permille * aggressiveness,
-+				100000);
-+		scale = max_t(u32, scale / 4, scale - scale_reduction);
-+	}
++    /*
++     * Aggressiveness shaping by asym priority (topology signal).
++     * This is not HFI/ITD; keep it always-on when available.
++     */
++    if (itd_pr > 0) {
++        u64 pr_norm             = min_t(u64, 1024U, (u64)itd_pr);
++        u64 reduction_factor    = (1024U - pr_norm) * (1024U - pr_norm);
++        u32 reduction_permille  = div_u64(reduction_factor, 1049U);
++        u32 aggressiveness      = clamp_t(u32,
++                                          BORE_DEF_ITD_AGGRESSIVENESS_PCT, 0U, 100U);
++        u32 scale_reduction     =
++            div_u64((u64)scale * reduction_permille * aggressiveness, 100000U);
++        scale = max_t(u32, scale / 4U, scale - scale_reduction);
++    }
 +
-+	pp->scale         = scale;
-+	pp->offset        = offset;
-+	pp->itd_pri       = itd_pr;
-+	pp->sat_thresh_q8 = !scale ? U32_MAX :
-+		div_u64(((u64)MAX_BURST_PENALTY << 16) + scale - 1, scale);
++    pp->scale         = scale;
++    pp->offset        = offset;
++    pp->itd_pri       = itd_pr;
++    pp->sat_thresh_q8 = !scale ? U32_MAX :
++        div_u64(((u64)MAX_BURST_PENALTY << 16) + scale - 1, scale);
 +
-+	smp_wmb(); /* ensure fully initialised before gen */
-+	pp->gen = (u8)atomic_read(&bore_penalty_gen);
++    /*
++     * Make sure the structure is fully initialised before publishing the gen.
++     * Readers check (gen,itd_pri) together under preempt disabled.
++     */
++    smp_wmb();
++    pp->gen = (u8)atomic_read(&bore_penalty_gen);
 +}
 +
 +static void bore_enable_key_workfn(struct work_struct *w)
@@ -1886,39 +1894,66 @@ index 47972f34ea..a7c69cfbcf 100644
 +calc_burst_penalty(u64 burst_time)
 +{
 +    const struct bore_penalty_param *pp;
-+    u32 log_val;
 +    u32 offset_q8;
-+    u32 delta_q8;
 +
 +    if (unlikely(!burst_time)) {
-+        return 0;
++        return 0U;
 +    }
 +
++    /* Preemption must be disabled by caller (bore_get_param asserts it). */
 +    pp = bore_get_param();
 +
-+    {
-+        u32 lz = __builtin_clzll(burst_time);
-+        u32 exp = 63u - lz;
-+        u64 norm = burst_time << lz;
-+        u64 frac = norm << 1;
-+        u32 index = (u32)(frac >> 56);
-+
-+        log_val = (exp << 8) | log2_lookup[index];
-+    }
++    /*
++     * Compute exponent (integer part of log2) first.
++     * Use it to derive guaranteed early-outs without touching LUT.
++     */
++    u32 lz  = __builtin_clzll(burst_time);
++    u32 exp = 63U - lz;
 +
 +    offset_q8 = (u32)pp->offset << 8;
-+    if (log_val <= offset_q8) {
-+        return 0;
++
++    /* Early zero: even with fractional=255, log_val <= offset → penalty 0. */
++    if (likely(((exp << 8) + 255U) <= offset_q8)) {
++        return 0U;
 +    }
 +
-+    delta_q8 = log_val - offset_q8;
-+
-+    if (unlikely(delta_q8 >= pp->sat_thresh_q8)) {
-+        return MAX_BURST_PENALTY;
++    /*
++     * Early saturate: if with fractional=0 we already exceed saturation
++     * threshold, the result is guaranteed MAX. Avoid 32-bit overflow by
++     * doing the sum in 64-bit. Skip when sat_thresh_q8 is U32_MAX (scale==0).
++     */
++    if (pp->sat_thresh_q8 != U32_MAX) {
++        u64 threshold_q8 = (u64)offset_q8 + (u64)pp->sat_thresh_q8;
++        u64 exp_q8       = (u64)exp << 8;
++        if (unlikely(exp_q8 >= threshold_q8)) {
++            return MAX_BURST_PENALTY;
++        }
 +    }
 +
-+    return min_t(u32, MAX_BURST_PENALTY,
-+                 (u32)(((u64)delta_q8 * pp->scale) >> 16));
++    /* Fractional part lookup only if we couldn't early-out. */
++    {
++        u64 norm  = burst_time << lz;   /* normalise MSB to bit 63 */
++        u64 frac  = norm << 1;          /* ensure next 8 bits are the index */
++        u32 index = (u32)(frac >> 56);  /* top 8 fraction bits: 0..255 */
++
++        u32 log_val = (exp << 8) | log2_lookup[index];
++
++        if (log_val <= offset_q8) {
++            return 0U;
++        }
++
++        {
++            u32 delta_q8 = log_val - offset_q8;
++
++            if (unlikely(delta_q8 >= pp->sat_thresh_q8)) {
++                return MAX_BURST_PENALTY;
++            }
++
++            /* Q8.16 scaling with saturation to MAX_BURST_PENALTY */
++            u32 pen = (u32)(((u64)delta_q8 * pp->scale) >> 16);
++            return (pen > MAX_BURST_PENALTY) ? MAX_BURST_PENALTY : pen;
++        }
++    }
 +}
 +
 +static __always_inline u64 __scale_slice(u64 d, u8 pr)
@@ -1961,10 +1996,8 @@ index 47972f34ea..a7c69cfbcf 100644
 +{
 +    struct cfs_rq *cfs_rq;
 +    struct rq *rq;
-+    struct bore_penalty_cache *cache;
 +    u64 burst_time;
 +    u32 penalty;
-+    u8 gen_snapshot;
 +
 +    if (unlikely(!entity_is_task(se))) {
 +        return;
@@ -1974,58 +2007,79 @@ index 47972f34ea..a7c69cfbcf 100644
 +    if (unlikely(!cfs_rq)) {
 +        return;
 +    }
-+
 +    rq = rq_of(cfs_rq);
-+    cache = this_cpu_ptr(&bore_penalty_cache);
 +
++    /* Helpful prefetches; avoid per-CPU here (no smp_processor_id). */
 +    __builtin_prefetch(&se->burst_time, 0, 3);
 +    __builtin_prefetch(&se->burst_penalty, 1, 2);
-+    __builtin_prefetch(cache, 0, 3);
 +
 +    burst_time = READ_ONCE(se->burst_time);
-+    gen_snapshot = (u8)atomic_read(&bore_penalty_gen);
 +
-+    if (likely(cache->last_se == se &&
-+               cache->last_burst_time == burst_time &&
-+               cache->last_cpu == rq->cpu &&
-+               cache->gen == gen_snapshot)) {
-+        penalty = cache->last_penalty;
-+        cache->hit_count++;
-+    } else {
-+        penalty = calc_burst_penalty(burst_time);
++    /* Stable rq->cpu value for the cache key. */
++    {
++        u8 gen_snapshot;
++        int rq_cpu = READ_ONCE(rq->cpu);
++
++        /*
++         * Critical region: per-CPU cache, parameter lookup, ITD sampling.
++         * All of these functions assert preemption disabled.
++         */
++        preempt_disable();
++        {
++            struct bore_penalty_cache *cache = this_cpu_ptr(&bore_penalty_cache);
++            gen_snapshot = (u8)atomic_read(&bore_penalty_gen);
++
++            if (likely(cache->last_se == se &&
++                       cache->last_burst_time == burst_time &&
++                       cache->last_cpu == rq_cpu &&
++                       cache->gen == gen_snapshot)) {
++                penalty = cache->last_penalty;
++                if (IS_ENABLED(CONFIG_SCHED_DEBUG)) {
++                    cache->hit_count++;
++                }
++            } else {
++                /* Recompute penalty and apply optional ITD bias. */
++                penalty = calc_burst_penalty(burst_time);
++
 +#ifdef CONFIG_X86
-+        if (static_branch_unlikely(&bore_itd_key)) {
-+            u8 classid;
-+            enum x86_topology_cpu_type ctype = TOPO_CPU_TYPE_UNKNOWN;
-+            bool is_pcore = false;
++                if (static_branch_unlikely(&bore_itd_key)) {
++                    u8 classid;
++                    enum x86_topology_cpu_type ctype = TOPO_CPU_TYPE_UNKNOWN;
++                    bool is_pcore = false;
 +
-+            if (static_branch_unlikely(&bore_core_aware_key)) {
-+                ctype = per_cpu(bore_cpu_type, rq->cpu);
-+                is_pcore = (ctype == TOPO_CPU_TYPE_PERFORMANCE);
-+            }
++                    if (static_branch_unlikely(&bore_core_aware_key)) {
++                        ctype = per_cpu(bore_cpu_type, rq_cpu);
++                        is_pcore = (ctype == TOPO_CPU_TYPE_PERFORMANCE);
++                    }
 +
-+            preempt_disable();
-+            bore_itd_lazy_enable_this_cpu();
-+            if (bore_itd_read_class(&classid)) {
-+                penalty = bore_itd_bias_penalty_fast(penalty, classid, is_pcore);
-+            }
-+            preempt_enable();
-+        }
++                    /* Per-CPU HFI/ITD enable + sampled class (preempt must be off). */
++                    bore_itd_lazy_enable_this_cpu();
++                    if (bore_itd_read_class(&classid)) {
++                        penalty = bore_itd_bias_penalty_fast(penalty, classid, is_pcore);
++                    }
++                }
 +#endif
-+        cache->last_se = se;
-+        cache->last_burst_time = burst_time;
-+        cache->last_penalty = penalty;
-+        cache->last_cpu = rq->cpu;
-+        cache->gen = gen_snapshot;
-+        cache->miss_count++;
++                /* Update cache entries (all per-CPU, still preemption-off). */
++                cache->last_se         = se;
++                cache->last_burst_time = burst_time;
++                cache->last_penalty    = penalty;
++                cache->last_cpu        = rq_cpu;
++                cache->gen             = gen_snapshot;
++                if (IS_ENABLED(CONFIG_SCHED_DEBUG)) {
++                    cache->miss_count++;
++                }
++            }
++        }
++        preempt_enable();
 +    }
 +
++    /* Write current penalty and update aggregate/score only on change. */
 +    se->curr_burst_penalty = penalty;
 +
 +    {
-+        u32 old_agg = se->burst_penalty;
-+        u32 new_agg = (se->prev_burst_penalty > penalty) ?
-+                      se->prev_burst_penalty : penalty;
++        u32 old_agg = READ_ONCE(se->burst_penalty);
++        u32 new_agg = (se->prev_burst_penalty > penalty)
++                        ? se->prev_burst_penalty : penalty;
 +
 +        if (unlikely(new_agg != old_agg)) {
 +            se->burst_penalty = new_agg;
@@ -2061,54 +2115,53 @@ index 47972f34ea..a7c69cfbcf 100644
 +{
 +    u8 shift_up;
 +    u8 shift_down;
-+    u8 shift;
-+    s32 delta;
 +
 +    if (new_val == old_val) {
 +        return old_val;
 +    }
 +
-+    delta = (s32)new_val - (s32)old_val;
-+
++    /*
++     * Keep original behavior: core-aware smoothing is engaged when the
++     * topology static key is on; otherwise use global smoothing knobs.
++     * This avoids surprising behavior shifts for gaming workloads.
++     */
 +    if (static_branch_unlikely(&bore_core_aware_key)) {
 +        if (ctype == TOPO_CPU_TYPE_PERFORMANCE) {
-+            shift_up = READ_ONCE(sched_burst_smoothness_long_p);
++            shift_up   = READ_ONCE(sched_burst_smoothness_long_p);
 +            shift_down = READ_ONCE(sched_burst_smoothness_short_p);
 +        } else if (ctype == TOPO_CPU_TYPE_EFFICIENCY) {
-+            shift_up = READ_ONCE(sched_burst_smoothness_long_e);
++            shift_up   = READ_ONCE(sched_burst_smoothness_long_e);
 +            shift_down = READ_ONCE(sched_burst_smoothness_short_e);
 +        } else {
-+            shift_up = READ_ONCE(sched_burst_smoothness_long);
++            shift_up   = READ_ONCE(sched_burst_smoothness_long);
 +            shift_down = READ_ONCE(sched_burst_smoothness_short);
 +        }
 +    } else {
-+        shift_up = READ_ONCE(sched_burst_smoothness_long);
++        shift_up   = READ_ONCE(sched_burst_smoothness_long);
 +        shift_down = READ_ONCE(sched_burst_smoothness_short);
 +    }
 +
-+    shift = (delta > 0) ? shift_up : shift_down;
-+    shift = min_t(u8, shift, 31);
++    shift_up   = min_t(u8, shift_up, 31);
++    shift_down = min_t(u8, shift_down, 31);
 +
 +    {
-+        u32 magnitude = (delta > 0) ? (u32)delta : (u32)(-delta);
++        s32 delta     = (s32)new_val - (s32)old_val;
++        bool up       = (delta > 0);
++        u8  shift     = up ? shift_up : shift_down;
++        u32 magnitude = up ? (u32)delta : (u32)(-delta);
 +        u32 adjustment = magnitude >> shift;
 +
-+        if (delta > 0) {
++        if (up) {
++            /* Saturating add */
 +            u32 sum = old_val + adjustment;
-+
-+            if (sum < old_val) {
-+                return MAX_BURST_PENALTY;
-+            }
-+            if (sum > MAX_BURST_PENALTY) {
++            if (sum < old_val || sum > MAX_BURST_PENALTY) {
 +                return MAX_BURST_PENALTY;
 +            }
 +            return sum;
++        } else {
++            /* Non-negative result */
++            return (adjustment >= old_val) ? 0U : (old_val - adjustment);
 +        }
-+
-+        if (adjustment >= old_val) {
-+            return 0;
-+        }
-+        return old_val - adjustment;
 +    }
 +}
 +
@@ -2247,8 +2300,6 @@ index 47972f34ea..a7c69cfbcf 100644
 +void restart_burst(struct sched_entity *se)
 +{
 +	struct rq *rq = rq_of(cfs_rq_of(se));
-+
-+	lockdep_assert_rq_held(rq);
  
 -static void update_burst_cache(struct sched_burst_cache *bc,
 -	struct task_struct *p, u32 cnt, u32 sum, u64 now) {
@@ -2256,6 +2307,8 @@ index 47972f34ea..a7c69cfbcf 100644
 -	bc->value = max(avg, p->se.burst_penalty);
 -	bc->count = cnt;
 -	bc->timestamp = now;
++	lockdep_assert_rq_held(rq);
++
 +	revolve_burst_penalty_state(se, bore_get_rq_cpu_type(rq));
 +	se->burst_penalty = se->prev_burst_penalty;
 +	update_burst_score(se);
@@ -2413,19 +2466,15 @@ index 47972f34ea..a7c69cfbcf 100644
 +{
 +	u64 stamp = READ_ONCE(bc->timestamp);
 +	u32 life  = READ_ONCE(sched_burst_cache_lifetime);
- 
--	if (clone_flags & CLONE_PARENT)
--		parent = parent->real_parent;
++
 +	if (now_ns <= stamp) {
 +		return false;
 +	}
 +	return (now_ns - stamp) > life;
 +}
  
--	bc = &parent->se.child_burst;
--	guard(spinlock)(&bc->lock);
--	if (burst_cache_expired(bc, now))
--		update_child_burst_direct(parent, now);
+-	if (clone_flags & CLONE_PARENT)
+-		parent = parent->real_parent;
 +#ifndef for_each_child_locked
 +#define for_each_child_locked(parent, child) \
 +	list_for_each_entry(child, &(parent)->children, sibling)
@@ -2441,18 +2490,17 @@ index 47972f34ea..a7c69cfbcf 100644
 +	bc->timestamp = now_ns;
 +}
  
--	return bc->value;
+-	bc = &parent->se.child_burst;
+-	guard(spinlock)(&bc->lock);
+-	if (burst_cache_expired(bc, now))
+-		update_child_burst_direct(parent, now);
 +static inline u32 count_children_upto2_locked(struct list_head *head)
 +{
 +	struct list_head *next = head->next;
 +	return (next != head) + (next->next != head);
- }
++}
  
--static void update_child_burst_topological(
--	struct task_struct *p, u64 now, u32 depth, u32 *acnt, u32 *asum) {
--	u32 cnt = 0, dcnt = 0, sum = 0;
--	struct task_struct *child, *dec;
--	struct sched_burst_cache *bc __maybe_unused;
+-	return bc->value;
 +static void __update_child_burst_direct_locked(struct task_struct *p, u64 now_ns)
 +{
 +	u32 count = 0, sum_penalties = 0;
@@ -2470,18 +2518,13 @@ index 47972f34ea..a7c69cfbcf 100644
 +		}
 +	}
 +	update_burst_cache_locked(&p->se.child_burst, p, count, sum_penalties, now_ns);
-+}
+ }
  
--	for_each_child(p, child) {
--		dec = child;
--		while ((dcnt = count_entries_upto2(&dec->children)) == 1)
--			dec = list_first_entry(&dec->children, struct task_struct, sibling);
--		
--		if (!dcnt || !depth) {
--			if (!task_is_bore_eligible(dec)) continue;
--			cnt++;
--			sum += dec->se.burst_penalty;
--			continue;
+-static void update_child_burst_topological(
+-	struct task_struct *p, u64 now, u32 depth, u32 *acnt, u32 *asum) {
+-	u32 cnt = 0, dcnt = 0, sum = 0;
+-	struct task_struct *child, *dec;
+-	struct sched_burst_cache *bc __maybe_unused;
 +static void __update_child_burst_topological_locked(struct task_struct *p, u64 now_ns,
 +						    u32 recursion_depth,
 +						    u32 *accumulated_count, u32 *accumulated_sum)
@@ -2500,6 +2543,26 @@ index 47972f34ea..a7c69cfbcf 100644
 +		while (count_children_upto2_locked(&effective_descendant->children) == 1) {
 +			effective_descendant = list_first_entry(&effective_descendant->children,
 +								struct task_struct, sibling);
++		}
+ 
+-	for_each_child(p, child) {
+-		dec = child;
+-		while ((dcnt = count_entries_upto2(&dec->children)) == 1)
+-			dec = list_first_entry(&dec->children, struct task_struct, sibling);
+-		
+-		if (!dcnt || !depth) {
+-			if (!task_is_bore_eligible(dec)) continue;
+-			cnt++;
+-			sum += dec->se.burst_penalty;
++		nkids = count_children_upto2_locked(&effective_descendant->children);
++		if (recursion_depth == 0 || !nkids) {
++			if (task_is_bore_eligible(effective_descendant)) {
++				current_level_direct_children_count++;
++				current_level_sum_of_penalties =
++					min_t(u32, UINT_MAX, current_level_sum_of_penalties +
++					      READ_ONCE(effective_descendant->se.burst_penalty));
++			}
+ 			continue;
  		}
 -		bc = &dec->se.child_burst;
 -		spin_lock(&bc->lock);
@@ -2509,20 +2572,6 @@ index 47972f34ea..a7c69cfbcf 100644
 -			if (sched_burst_cache_stop_count <= cnt) {
 -				spin_unlock(&bc->lock);
 -				break;
-+
-+		nkids = count_children_upto2_locked(&effective_descendant->children);
-+		if (recursion_depth == 0 || !nkids) {
-+			if (task_is_bore_eligible(effective_descendant)) {
-+				current_level_direct_children_count++;
-+				current_level_sum_of_penalties =
-+					min_t(u32, UINT_MAX, current_level_sum_of_penalties +
-+					      READ_ONCE(effective_descendant->se.burst_penalty));
- 			}
--			spin_unlock(&bc->lock);
- 			continue;
- 		}
--		update_child_burst_topological(dec, now, depth - 1, &cnt, &sum);
--		spin_unlock(&bc->lock);
 +
 +		{
 +			struct sched_burst_cache *desc_cache = &effective_descendant->se.child_burst;
@@ -2545,8 +2594,12 @@ index 47972f34ea..a7c69cfbcf 100644
 +									recursion_depth - 1,
 +									&current_level_direct_children_count,
 +									&current_level_sum_of_penalties);
-+			}
-+		}
+ 			}
+-			spin_unlock(&bc->lock);
+-			continue;
+ 		}
+-		update_child_burst_topological(dec, now, depth - 1, &cnt, &sum);
+-		spin_unlock(&bc->lock);
 +
 +		if (READ_ONCE(sched_burst_cache_stop_count) > 0 &&
 +		    current_level_direct_children_count >= READ_ONCE(sched_burst_cache_stop_count)) {
@@ -3100,8 +3153,12 @@ index 47972f34ea..a7c69cfbcf 100644
 +		.proc_handler = bore_u8_sysctl_gen_handler,
 +		.extra1       = SYSCTL_ZERO,
 +		.extra2       = SYSCTL_ONE,
-+	},
-+	{
+ 	},
+ 	{
+-		.procname	= "sched_deadline_boost_mask",
+-		.data		= &sched_deadline_boost_mask,
+-		.maxlen		= sizeof(uint),
+-		.mode		= 0644,
 +		.procname     = "sched_burst_core_aware_smoothing",
 +		.data         = &sched_burst_core_aware_smoothing,
 +		.maxlen       = sizeof(u8),
@@ -3191,12 +3248,8 @@ index 47972f34ea..a7c69cfbcf 100644
 +		.proc_handler = proc_douintvec_minmax,
 +		.extra1       = SYSCTL_ZERO,
 +		.extra2       = (void *)&bore_sysctl_val_100_max,
- 	},
- 	{
--		.procname	= "sched_deadline_boost_mask",
--		.data		= &sched_deadline_boost_mask,
--		.maxlen		= sizeof(uint),
--		.mode		= 0644,
++	},
++	{
 +		.procname     = "sched_burst_itd_bias_pcore_pct_c0",
 +		.data         = &sched_burst_itd_bias_pcore_pct[0],
 +		.maxlen       = sizeof(u32),
@@ -3383,3 +3436,135 @@ index 47972f34ea..a7c69cfbcf 100644
 +late_initcall_sync(bore_sysctl_init_func);
 +#endif
 +#endif /* CONFIG_SCHED_BORE */
+
+--- a/kernel/sched/fair.c	2025-09-26 20:56:07.644750062 +0200
++++ b/kernel/sched/fair.c	2025-09-26 21:55:31.453162308 +0200
+@@ -309,7 +309,7 @@ static u64 __calc_delta(u64 delta_exec,
+ 	__update_inv_weight(lw);
+ 
+ 	if (unlikely(fact_hi)) {
+-		fs = fls(fact_hi);
++		fs = __builtin_clz(fact_hi);
+ 		shift -= fs;
+ 		fact >>= fs;
+ 	}
+@@ -318,7 +318,7 @@ static u64 __calc_delta(u64 delta_exec,
+ 
+ 	fact_hi = (u32)(fact >> 32);
+ 	if (fact_hi) {
+-		fs = fls(fact_hi);
++		fs = __builtin_clz(fact_hi);
+ 		shift -= fs;
+ 		fact >>= fs;
+ 	}
+@@ -777,7 +775,7 @@ static int vruntime_eligible(struct cfs_
+ 		load += weight;
+ 	}
+ 
+-	return avg >= (s64)(vruntime - cfs_rq->min_vruntime) * load;
++	return __builtin_expect(avg >= (s64)(vruntime - cfs_rq->min_vruntime) * load, 1);
+ }
+ 
+ int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se)
+@@ -9236,28 +9234,44 @@ select_task_rq_fair(struct task_struct *
+  */
+ static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
+ {
+-	struct sched_entity *se = &p->se;
+-
+-	if (!task_on_rq_migrating(p)) {
+-		remove_entity_load_avg(se);
+-
+-		/*
+-		 * Here, the task's PELT values have been updated according to
+-		 * the current rq's clock. But if that clock hasn't been
+-		 * updated in a while, a substantial idle time will be missed,
+-		 * leading to an inflation after wake-up on the new rq.
+-		 *
+-		 * Estimate the missing time from the cfs_rq last_update_time
+-		 * and update sched_avg to improve the PELT continuity after
+-		 * migration.
+-		 */
+-		migrate_se_pelt_lag(se);
+-	}
++    struct sched_entity *se = &p->se;
++    struct cfs_rq *cfs_rq = cfs_rq_of(se);
+ 
+-	/* Tell new CPU we are migrated */
+-	se->avg.last_update_time = 0;
++    /*
++     * Load tracking: migrate_load_avg() needs to know the correct cfs_rq
++     * for detach/attach, but since we're called before set_task_cpu()
++     * p->pi_lock is held so cfs_rq_of() is stable.
++     */
++    if (task_on_rq_queued(p)) {
++        update_load_avg(cfs_rq, se, UPDATE_TG | DO_DETACH);
++        detach_entity_load_avg(cfs_rq, se);
++    } else {
++        remove_entity_load_avg(se);
++    }
++
++    /* Tell new CPU we are migrated */
++    se->avg.last_update_time = 0;
++
++    /* We have migrated, no longer update this cfs_rq */
++    se->avg.util_avg = 0;
++    se->avg.util_sum = 0;
++    se->avg.runnable_avg = 0;
++    se->avg.runnable_sum = 0;
++    se->avg.load_avg = 0;
++    se->avg.load_sum = 0;
++
++    /* Update hierarchy to new CPU's structures */
++    if (task_group(p) != &root_task_group) {
++        se->cfs_rq = task_group(p)->cfs_rq[new_cpu];
++        se->parent = task_group(p)->se[new_cpu];
++        se->depth = se->parent->depth + 1;
++    } else {
++        se->cfs_rq = &cpu_rq(new_cpu)->cfs;
++        se->parent = NULL;
++        se->depth = 0;
++    }
+ 
+-	update_scan_period(p, new_cpu);
++    update_scan_period(p, new_cpu);
+ }
+ 
+ static void task_dead_fair(struct task_struct *p)
+@@ -14156,11 +14170,27 @@ static void switched_from_fair(struct rq
+ 
+ static void switched_to_fair(struct rq *rq, struct task_struct *p)
+ {
++	struct sched_entity *se = &p->se;
++	struct cfs_rq *cfs_rq = &rq->cfs;
++	struct task_group *tg = task_group(p);
++
++	/* Always set hierarchy for safety, in case garbage from other class */
++	if (tg == &root_task_group) {
++		se->cfs_rq = cfs_rq;
++		se->parent = NULL;
++		se->depth = 0;
++	} else {
++		se->cfs_rq = tg->cfs_rq[rq->cpu];
++		se->parent = tg->se[rq->cpu];
++		se->depth = se->parent->depth + 1;
++	}
++
+ 	WARN_ON_ONCE(p->se.sched_delayed);
+ 
+ #ifdef CONFIG_SCHED_BORE
+ 	reset_task_bore(p);
+ #endif // CONFIG_SCHED_BORE
++
+ 	attach_task_cfs_rq(p);
+ 
+ 	set_task_max_allowed_capacity(p);
+@@ -14171,7 +14201,7 @@ static void switched_to_fair(struct rq *
+ 		 * kick off the schedule if running, otherwise just see
+ 		 * if we can still preempt the current task.
+ 		 */
+-		if (task_current_donor(rq, p))
++		if (task_current(rq, p))
+ 			resched_curr(rq);
+ 		else
+ 			wakeup_preempt(rq, p, 0);
