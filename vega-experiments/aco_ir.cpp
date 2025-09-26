@@ -172,7 +172,10 @@ init_program(Program* program, Stage stage, const struct aco_shader_info* info,
    }
 
    if (program->stage == raytracing_cs) {
-      program->dev.vgpr_limit = util_align_npot(128, program->dev.vgpr_alloc_granule);
+         unsigned vgpr_limit = util_align_npot(128, program->dev.vgpr_alloc_granule);
+         unsigned min_waves = program->dev.physical_vgprs / vgpr_limit;
+         vgpr_limit = program->dev.physical_vgprs / min_waves;
+         program->dev.vgpr_limit = util_round_down_npot(vgpr_limit, program->dev.vgpr_alloc_granule);
    }
 
    program->dev.scratch_alloc_granule = gfx_level >= GFX11 ? 256 : 1024;
