@@ -309,7 +309,7 @@ static u64 __calc_delta(u64 delta_exec, unsigned long weight, struct load_weight
 	__update_inv_weight(lw);
 
 	if (unlikely(fact_hi)) {
-		fs = fls(fact_hi);
+		fs = __builtin_clz(fact_hi);
 		shift -= fs;
 		fact >>= fs;
 	}
@@ -318,7 +318,7 @@ static u64 __calc_delta(u64 delta_exec, unsigned long weight, struct load_weight
 
 	fact_hi = (u32)(fact >> 32);
 	if (fact_hi) {
-		fs = fls(fact_hi);
+		fs = __builtin_clz(fact_hi);
 		shift -= fs;
 		fact >>= fs;
 	}
@@ -775,7 +775,7 @@ static int vruntime_eligible(struct cfs_rq *cfs_rq, u64 vruntime)
 		load += weight;
 	}
 
-	return avg >= (s64)(vruntime - cfs_rq->min_vruntime) * load;
+	return __builtin_expect(avg >= (s64)(vruntime - cfs_rq->min_vruntime) * load, 1);
 }
 
 int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se)
