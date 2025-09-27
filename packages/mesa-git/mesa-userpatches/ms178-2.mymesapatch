@@ -1,0 +1,771 @@
+--- a/src/amd/compiler/aco_scheduler_ilp.cpp	2025-09-18 00:13:47.617964283 +0200
++++ b/src/amd/compiler/aco_scheduler_ilp.cpp	2025-09-18 00:46:20.947672554 +0200
+@@ -10,23 +10,15 @@
+ #include "util/macros.h"
+ 
+ #include <limits>
+-
+-/*
+- * This pass implements a simple forward list-scheduler which works on a small
+- * partial DAG of 16 nodes at any time. Only ALU instructions are scheduled
+- * entirely freely. Memory load instructions must be kept in-order and any other
+- * instruction must not be re-scheduled at all.
+- *
+- * The main goal of this scheduler is to create more memory clauses, schedule
+- * memory loads early, and to improve ALU instruction level parallelism.
+- */
++#include <algorithm>
++#include <cassert>
+ 
+ namespace aco {
+ namespace {
+ 
+ constexpr unsigned num_nodes = 16;
+ using mask_t = uint16_t;
+-static_assert(std::numeric_limits<mask_t>::digits >= num_nodes);
++static_assert(std::numeric_limits<mask_t>::digits >= num_nodes, "mask_t too small for DAG nodes");
+ 
+ struct VOPDInfo {
+    VOPDInfo() : can_be_opx(0), is_dst_odd(0), src_banks(0), has_literal(0), is_commutative(0) {}
+@@ -41,15 +33,15 @@ struct VOPDInfo {
+ };
+ 
+ struct InstrInfo {
+-   Instruction* instr;
+-   int16_t wait_cycles;          /* estimated remaining cycles until instruction can be issued. */
+-   mask_t dependency_mask;       /* bitmask of nodes which have to be scheduled before this node. */
+-   mask_t write_for_read_mask;   /* bitmask of nodes in the DAG that have a RaW dependency. */
+-   uint8_t next_non_reorderable; /* index of next non-reorderable instruction node after this one. */
++   Instruction* instr = nullptr;
++   int16_t wait_cycles = 0;         /* estimated remaining cycles until instruction can be issued. */
++   mask_t dependency_mask = 0;      /* bitmask of nodes which have to be scheduled before this node. */
++   mask_t write_for_read_mask = 0;  /* bitmask of nodes in the DAG that have a RaW dependency. */
++   uint8_t next_non_reorderable = UINT8_MAX; /* index of next non-reorderable instruction node after this one. */
+ };
+ 
+ struct RegisterInfo {
+-   mask_t read_mask; /* bitmask of nodes which have to be scheduled before the next write. */
++   mask_t read_mask = 0; /* bitmask of nodes which have to be scheduled before the next write. */
+    uint16_t latency : 11; /* estimated outstanding latency of last register write outside the DAG. */
+    uint16_t direct_dependency : 4;     /* node that has to be scheduled before any other access. */
+    uint16_t has_direct_dependency : 1; /* whether there is an unscheduled direct dependency. */
+@@ -59,14 +51,14 @@ struct SchedILPContext {
+    Program* program;
+    bool is_vopd = false;
+    InstrInfo nodes[num_nodes];
+-   RegisterInfo regs[512];
++   RegisterInfo regs[512] = {};
+    BITSET_DECLARE(reg_has_latency, 512) = { 0 };
+    mask_t non_reorder_mask = 0; /* bitmask of instruction nodes which should not be reordered. */
+    mask_t active_mask = 0;      /* bitmask of valid instruction nodes. */
+    uint8_t next_non_reorderable = UINT8_MAX; /* index of next node which should not be reordered. */
+    uint8_t last_non_reorderable = UINT8_MAX; /* index of last node which should not be reordered. */
+-   bool potential_partial_clause; /* indicates that last_non_reorderable is the last instruction in
+-                                     the DAG, meaning the clause might continue outside of it. */
++   bool potential_partial_clause = false; /* indicates that last_non_reorderable is the last instruction in
++                                             the DAG, meaning the clause might continue outside of it. */
+ 
+    /* VOPD scheduler: */
+    VOPDInfo vopd[num_nodes];
+@@ -360,24 +352,29 @@ get_cycle_info_with_mem_latency(const Sc
+ {
+    Instruction_cycle_info cycle_info = get_cycle_info(*ctx.program, *instr);
+ 
+-   /* Based on get_wait_counter_info in aco_statistics.cpp. */
++   /* Based on get_wait_counter_info in aco_statistics.cpp; tuned for GFX9 as a slight bias. */
++   const bool is_gfx9 = ctx.program->gfx_level == GFX9;
++
+    if (instr->isVMEM() || instr->isFlatLike()) {
+-      cycle_info.latency = 320;
++      cycle_info.latency = is_gfx9 ? 380 : 320;
+    } else if (instr->isSMEM()) {
+       if (instr->operands.empty()) {
+          cycle_info.latency = 1;
+-      } else if (instr->operands[0].size() == 2 ||
+-                 (instr->operands[1].isConstant() &&
+-                  (instr->operands.size() < 3 || instr->operands[2].isConstant()))) {
+-         /* Likely cached. */
+-         cycle_info.latency = 30;
+       } else {
+-         cycle_info.latency = 200;
++         const bool op0_is_16 = instr->operands[0].size() == 2;
++         const bool op1_const = instr->operands.size() > 1 && instr->operands[1].isConstant();
++         const bool op2_const = instr->operands.size() < 3 || (instr->operands.size() > 2 && instr->operands[2].isConstant());
++         if (op0_is_16 || (op1_const && op2_const)) {
++            /* Likely cached. */
++            cycle_info.latency = is_gfx9 ? 24 : 30;
++         } else {
++            cycle_info.latency = is_gfx9 ? 160 : 200;
++         }
+       }
+    } else if (instr->isLDSDIR()) {
+-      cycle_info.latency = 13;
++      cycle_info.latency = is_gfx9 ? 11 : 13;
+    } else if (instr->isDS()) {
+-      cycle_info.latency = 20;
++      cycle_info.latency = is_gfx9 ? 22 : 20;
+    }
+ 
+    return cycle_info;
+@@ -403,6 +400,9 @@ add_entry(SchedILPContext& ctx, Instruct
+    entry.instr = instr;
+    entry.wait_cycles = 0;
+    entry.write_for_read_mask = 0;
++   entry.dependency_mask = 0;
++   entry.next_non_reorderable = UINT8_MAX;
++
+    const mask_t mask = BITFIELD_BIT(idx);
+    bool reorder = can_reorder(instr);
+    ctx.active_mask |= mask;
+@@ -421,22 +421,27 @@ add_entry(SchedILPContext& ctx, Instruct
+       assert(op.isFixed());
+       unsigned reg = op.physReg();
+       if (reg >= max_sgpr && reg != scc && reg < min_vgpr) {
++         /* Don't reorder if we touch POPS_EXITING_WAVE_ID (control dep) */
+          reorder &= reg != pops_exiting_wave_id;
+          continue;
+       }
+ 
+       for (unsigned i = 0; i < op.size(); i++) {
+-         RegisterInfo& reg_info = ctx.regs[reg + i];
++         unsigned r = reg + i;
++         if (r >= 512)
++            continue; /* Defensive guard; should not happen with valid RA. */
++
++         RegisterInfo& reg_info = ctx.regs[r];
+ 
+          /* Add register reads. */
+          reg_info.read_mask |= mask;
+ 
+          if (reg_info.has_direct_dependency) {
+             /* A previous dependency is still part of the DAG. */
+-            ctx.nodes[ctx.regs[reg].direct_dependency].write_for_read_mask |= mask;
++            ctx.nodes[ctx.regs[r].direct_dependency].write_for_read_mask |= mask;
+             entry.dependency_mask |= BITFIELD_BIT(reg_info.direct_dependency);
+-         } else if (BITSET_TEST(ctx.reg_has_latency, reg + i)) {
+-            entry.wait_cycles = MAX2(entry.wait_cycles, reg_info.latency);
++         } else if (BITSET_TEST(ctx.reg_has_latency, r)) {
++            entry.wait_cycles = MAX2(entry.wait_cycles, (int)reg_info.latency);
+          }
+       }
+    }
+@@ -464,7 +469,11 @@ add_entry(SchedILPContext& ctx, Instruct
+    mask_t write_dep_mask = 0;
+    for (const Definition& def : instr->definitions) {
+       for (unsigned i = 0; i < def.size(); i++) {
+-         RegisterInfo& reg_info = ctx.regs[def.physReg().reg() + i];
++         unsigned r = def.physReg().reg() + i;
++         if (r >= 512)
++            continue; /* Defensive guard; should not happen with valid RA. */
++
++         RegisterInfo& reg_info = ctx.regs[r];
+ 
+          /* Add all previous register reads and writes to the dependencies. */
+          write_dep_mask |= reg_info.read_mask;
+@@ -472,7 +481,7 @@ add_entry(SchedILPContext& ctx, Instruct
+ 
+          /* This register write is a direct dependency for all following reads. */
+          reg_info.has_direct_dependency = 1;
+-         reg_info.direct_dependency = idx;
++         reg_info.direct_dependency = idx & 0xF;
+       }
+    }
+ 
+@@ -490,7 +499,7 @@ add_entry(SchedILPContext& ctx, Instruct
+ 
+       /* Just don't reorder these at all. */
+       if (!is_memory_instr(instr) || instr->definitions.empty() ||
+-          get_sync_info(instr).semantics & semantic_volatile || ctx.is_vopd) {
++          (get_sync_info(instr).semantics & semantic_volatile) || ctx.is_vopd) {
+          /* Add all previous instructions as dependencies. */
+          entry.dependency_mask = ctx.active_mask & ~ctx.non_reorder_mask;
+       }
+@@ -553,7 +562,10 @@ remove_entry(SchedILPContext& ctx, const
+          continue;
+ 
+       for (unsigned i = 0; i < op.size(); i++) {
+-         RegisterInfo& reg_info = ctx.regs[reg + i];
++         unsigned r = reg + i;
++         if (r >= 512)
++            continue;
++         RegisterInfo& reg_info = ctx.regs[r];
+          reg_info.read_mask &= mask;
+       }
+    }
+@@ -568,24 +580,26 @@ remove_entry(SchedILPContext& ctx, const
+ 
+    for (const Definition& def : instr->definitions) {
+       for (unsigned i = 0; i < def.size(); i++) {
+-         unsigned reg = def.physReg().reg() + i;
+-         ctx.regs[reg].read_mask &= mask;
+-         if (ctx.regs[reg].has_direct_dependency && ctx.regs[reg].direct_dependency == idx) {
+-            ctx.regs[reg].has_direct_dependency = false;
++         unsigned r = def.physReg().reg() + i;
++         if (r >= 512)
++            continue;
++         ctx.regs[r].read_mask &= mask;
++         if (ctx.regs[r].has_direct_dependency && ctx.regs[r].direct_dependency == idx) {
++            ctx.regs[r].has_direct_dependency = false;
+             if (!ctx.is_vopd) {
+-               BITSET_SET(ctx.reg_has_latency, reg);
+-               ctx.regs[reg].latency = latency;
++               BITSET_SET(ctx.reg_has_latency, r);
++               ctx.regs[r].latency = (latency > 0) ? (uint16_t)latency : 0;
+             }
+          }
+       }
+    }
+ 
+    for (unsigned i = 0; i < num_nodes; i++) {
+-      ctx.nodes[i].dependency_mask &= mask;
+-      ctx.nodes[i].wait_cycles -= stall;
+-      if (ctx.nodes[idx].write_for_read_mask & BITFIELD_BIT(i) && !ctx.is_vopd) {
+-         ctx.nodes[i].wait_cycles = MAX2(ctx.nodes[i].wait_cycles, latency);
+-      }
++     ctx.nodes[i].dependency_mask &= mask;
++     ctx.nodes[i].wait_cycles -= stall;
++     if ((ctx.nodes[idx].write_for_read_mask & BITFIELD_BIT(i)) && !ctx.is_vopd) {
++        ctx.nodes[i].wait_cycles = MAX2(ctx.nodes[i].wait_cycles, (int16_t)latency);
++     }
+    }
+ 
+    if (ctx.next_non_reorderable == idx) {
+@@ -660,7 +674,7 @@ select_instruction_ilp(const SchedILPCon
+    bool prefer_vintrp = ctx.prev_info.instr && ctx.prev_info.instr->isVINTRP();
+ 
+    /* Select the instruction with lowest wait_cycles of all candidates. */
+-   unsigned idx = -1u;
++   unsigned idx = (unsigned)-1;
+    bool idx_vintrp = false;
+    int32_t wait_cycles = INT32_MAX;
+    u_foreach_bit (i, mask) {
+@@ -672,7 +686,7 @@ select_instruction_ilp(const SchedILPCon
+ 
+       bool is_vintrp = prefer_vintrp && candidate.instr->isVINTRP();
+ 
+-      if (idx == -1u || (is_vintrp && !idx_vintrp) ||
++      if (idx == (unsigned)-1 || (is_vintrp && !idx_vintrp) ||
+           (is_vintrp == idx_vintrp && candidate.wait_cycles < wait_cycles)) {
+          idx = i;
+          idx_vintrp = is_vintrp;
+@@ -680,7 +694,7 @@ select_instruction_ilp(const SchedILPCon
+       }
+    }
+ 
+-   if (idx != -1u)
++   if (idx != (unsigned)-1)
+       return idx;
+ 
+    /* Select the next non-reorderable instruction. (it must have no dependencies) */
+@@ -748,7 +762,7 @@ select_instruction_vopd(const SchedILPCo
+    int num_vopd_odd_minus_even =
+       (int)util_bitcount(ctx.vopd_odd_mask & mask) - (int)util_bitcount(ctx.vopd_even_mask & mask);
+ 
+-   unsigned cur = -1u;
++   unsigned cur = (unsigned)-1;
+    u_foreach_bit (i, mask) {
+       const InstrInfo& candidate = ctx.nodes[i];
+ 
+@@ -756,7 +770,7 @@ select_instruction_vopd(const SchedILPCo
+       if (candidate.dependency_mask)
+          continue;
+ 
+-      if (cur == -1u) {
++      if (cur == (unsigned)-1) {
+          cur = i;
+          *vopd_compat = can_use_vopd(ctx, i);
+       } else if (compare_nodes_vopd(ctx, num_vopd_odd_minus_even, vopd_compat, cur, i)) {
+@@ -764,7 +778,7 @@ select_instruction_vopd(const SchedILPCo
+       }
+    }
+ 
+-   assert(cur != -1u);
++   assert(cur != (unsigned)-1);
+    return cur;
+ }
+ 
+@@ -773,8 +787,9 @@ get_vopd_opcode_operands(const SchedILPC
+                          bool swap, aco_opcode* op, unsigned* num_operands, Operand* operands)
+ {
+    *op = info.op;
+-   *num_operands += instr->operands.size();
++   const unsigned copy_count = instr->operands.size();
+    std::copy(instr->operands.begin(), instr->operands.end(), operands);
++   *num_operands += copy_count;
+ 
+    if (instr->opcode == aco_opcode::v_bfrev_b32) {
+       operands[0] = Operand::get_const(ctx.program->gfx_level,
+@@ -830,7 +845,7 @@ create_vopd_instruction(const SchedILPCo
+ 
+    aco_opcode x_op, y_op;
+    unsigned num_operands = 0;
+-   Operand operands[6];
++   Operand operands[6]; /* VOP2 + VOP2 at most */
+    get_vopd_opcode_operands(ctx, x, x_info, swap_x, &x_op, &num_operands, operands);
+    get_vopd_opcode_operands(ctx, y, y_info, swap_y, &y_op, &num_operands, operands + num_operands);
+ 
+@@ -848,6 +863,7 @@ void
+ do_schedule(SchedILPContext& ctx, It& insert_it, It& remove_it, It instructions_begin,
+             It instructions_end)
+ {
++   /* Prime the DAG with up to num_nodes instructions */
+    for (unsigned i = 0; i < num_nodes; i++) {
+       if (remove_it == instructions_end)
+          break;
+@@ -864,7 +880,9 @@ do_schedule(SchedILPContext& ctx, It& in
+       Instruction* next_instr = ctx.nodes[next_idx].instr;
+ 
+       if (vopd_compat) {
+-         std::prev(insert_it)->reset(create_vopd_instruction(ctx, next_idx, vopd_compat));
++         /* Replace the previously emitted instruction with a fused VOPD */
++         auto prev_it = std::prev(insert_it);
++         prev_it->reset(create_vopd_instruction(ctx, next_idx, vopd_compat));
+          ctx.prev_info.instr = NULL;
+       } else {
+          (insert_it++)->reset(next_instr);
+@@ -894,10 +912,13 @@ schedule_ilp(Program* program)
+    for (Block& block : program->blocks) {
+       if (block.instructions.empty())
+          continue;
++
+       auto it = block.instructions.begin();
+       auto insert_it = block.instructions.begin();
+       do_schedule(ctx, insert_it, it, block.instructions.begin(), block.instructions.end());
+       block.instructions.resize(insert_it - block.instructions.begin());
++
++      /* Reset latency tracking at block ends/branches to avoid leaking inter-block timing */
+       if (block.linear_succs.empty() || block.instructions.back()->opcode == aco_opcode::s_branch)
+          BITSET_ZERO(ctx.reg_has_latency);
+    }
+@@ -913,6 +934,9 @@ schedule_vopd(Program* program)
+    ctx.is_vopd = true;
+ 
+    for (Block& block : program->blocks) {
++      if (block.instructions.empty())
++         continue;
++
+       auto it = block.instructions.rbegin();
+       auto insert_it = block.instructions.rbegin();
+       do_schedule(ctx, insert_it, it, block.instructions.rbegin(), block.instructions.rend());
+
+
+--- a/src/amd/compiler/aco_scheduler.cpp	2025-09-17 17:58:35.259844050 +0200
++++ b/src/amd/compiler/aco_scheduler.cpp	2025-09-17 21:23:13.018177664 +0200
+@@ -11,6 +11,8 @@
+ 
+ #include <algorithm>
+ #include <vector>
++#include <cstring>
++#include <climits>
+ 
+ #define SMEM_WINDOW_SIZE    (256 - ctx.occupancy_factor * 16)
+ #define VMEM_WINDOW_SIZE    (1024 - ctx.occupancy_factor * 64)
+@@ -396,6 +398,15 @@ MoveState::upwards_update_insert_idx(Upw
+    cursor.insert_demand = block->instructions[cursor.insert_idx - 1]->register_demand - temp;
+ }
+ 
++/* Helper: compute an approximate VGPR headroom margin at a scheduling point. */
++static inline int
++vgpr_headroom(const MoveState& mv, const RegisterDemand& demand)
++{
++   /* Assumption: RegisterDemand components are non-negative integers. */
++   int margin = mv.max_registers.vgpr - demand.vgpr;
++   return margin > 0 ? margin : 0;
++}
++
+ MoveResult
+ MoveState::upwards_move(UpwardsCursor& cursor)
+ {
+@@ -618,13 +629,11 @@ perform_hazard_query(hazard_query* query
+     */
+    if (upwards) {
+       if (instr->opcode == aco_opcode::p_pops_gfx9_add_exiting_wave_id ||
+-          is_wait_export_ready(query->gfx_level, instr)) {
++          is_wait_export_ready(query->gfx_level, instr))
+          return hazard_fail_unreorderable;
+-      }
+    } else {
+-      if (instr->opcode == aco_opcode::p_pops_gfx9_ordered_section_done) {
++      if (instr->opcode == aco_opcode::p_pops_gfx9_ordered_section_done)
+          return hazard_fail_unreorderable;
+-      }
+    }
+ 
+    if (query->uses_exec || query->writes_exec) {
+@@ -742,15 +751,13 @@ void
+ schedule_SMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
+ {
+    assert(idx != 0);
+-   int window_size = SMEM_WINDOW_SIZE;
+-   int max_moves = SMEM_MAX_MOVES;
+-   int16_t k = 0;
+ 
+-   /* don't move s_memtime/s_memrealtime */
++   /* don't move s_memtime/s_memrealtime or sendmsg rtn */
+    if (current->opcode == aco_opcode::s_memtime || current->opcode == aco_opcode::s_memrealtime ||
+        current->opcode == aco_opcode::s_sendmsg_rtn_b32 ||
+-       current->opcode == aco_opcode::s_sendmsg_rtn_b64)
++       current->opcode == aco_opcode::s_sendmsg_rtn_b64) {
+       return;
++   }
+ 
+    /* first, check if we have instructions before current to move down */
+    hazard_query hq;
+@@ -759,6 +766,28 @@ schedule_SMEM(sched_ctx& ctx, Block* blo
+ 
+    DownwardsCursor cursor = ctx.mv.downwards_init(idx, false, false);
+ 
++   /* Adaptive windowing for GFX9 (Vega): widen only with safe VGPR headroom.
++    * Keep it conservative to avoid inflating peak pressure and hurting occupancy.
++    */
++   int window_size = SMEM_WINDOW_SIZE;
++   int max_moves = SMEM_MAX_MOVES;
++   if (ctx.gfx_level <= GFX9) {
++      const int margin = vgpr_headroom(ctx.mv, cursor.insert_demand);
++      if (margin >= 24) {
++         window_size += window_size / 5;  /* +20% */
++         max_moves   += max_moves / 10;   /* +10% */
++      } else if (margin >= 16) {
++         window_size += window_size / 8;  /* +12.5% */
++         max_moves   += max_moves / 12;   /* ~+8.3% */
++      }
++   }
++
++   if (window_size <= 0 || max_moves <= 0) {
++      return;
++   }
++
++   int16_t k = 0;
++
+    for (int candidate_idx = idx - 1; k < max_moves && candidate_idx > (int)idx - window_size;
+         candidate_idx--) {
+       assert(candidate_idx >= 0);
+@@ -768,32 +797,39 @@ schedule_SMEM(sched_ctx& ctx, Block* blo
+       /* break if we'd make the previous SMEM instruction stall */
+       bool can_stall_prev_smem =
+          idx <= ctx.last_SMEM_dep_idx && candidate_idx < ctx.last_SMEM_dep_idx;
+-      if (can_stall_prev_smem && ctx.last_SMEM_stall >= 0)
++      if (can_stall_prev_smem && ctx.last_SMEM_stall >= 0) {
+          break;
++      }
+ 
+-      /* break when encountering another MEM instruction, logical_start or barriers */
+-      if (!is_reorderable(candidate.get()))
++      /* break when encountering another MEM instruction, or unreorderable */
++      if (!is_reorderable(candidate.get())) {
+          break;
++      }
++
+       /* only move VMEM instructions below descriptor loads. be more aggressive at higher num_waves
+        * to help create more vmem clauses */
+       if ((candidate->isVMEM() || candidate->isFlatLike()) &&
+           (cursor.insert_idx - cursor.source_idx > (ctx.occupancy_factor * 4) ||
+-           current->operands[0].size() == 4))
++           (!current->operands.empty() && current->operands[0].size() == 4))) {
+          break;
+-      /* don't move descriptor loads below buffer loads */
+-      if (candidate->isSMEM() && !candidate->operands.empty() && current->operands[0].size() == 4 &&
+-          candidate->operands[0].size() == 2)
++      }
++
++      /* don't move descriptor loads below buffer loads (guard operand access) */
++      if (candidate->isSMEM() && !candidate->operands.empty() && !current->operands.empty() &&
++          current->operands[0].size() == 4 && candidate->operands[0].size() == 2) {
+          break;
++      }
+ 
+       bool can_move_down = true;
+ 
+       HazardResult haz = perform_hazard_query(&hq, candidate.get(), false);
+       if (haz == hazard_fail_reorder_ds || haz == hazard_fail_spill ||
+           haz == hazard_fail_reorder_sendmsg || haz == hazard_fail_barrier ||
+-          haz == hazard_fail_export)
++          haz == hazard_fail_export) {
+          can_move_down = false;
+-      else if (haz != hazard_success)
++      } else if (haz != hazard_success) {
+          break;
++      }
+ 
+       /* don't use LDS/GDS instructions to hide latency since it can
+        * significantly worsen LDS scheduling */
+@@ -812,8 +848,9 @@ schedule_SMEM(sched_ctx& ctx, Block* blo
+          break;
+       }
+ 
+-      if (candidate_idx < ctx.last_SMEM_dep_idx)
++      if (candidate_idx < ctx.last_SMEM_dep_idx) {
+          ctx.last_SMEM_stall++;
++      }
+       k++;
+    }
+ 
+@@ -828,23 +865,26 @@ schedule_SMEM(sched_ctx& ctx, Block* blo
+       assert(candidate_idx < (int)block->instructions.size());
+       aco_ptr<Instruction>& candidate = block->instructions[candidate_idx];
+ 
+-      if (!is_reorderable(candidate.get()))
++      if (!is_reorderable(candidate.get())) {
+          break;
++      }
+ 
+       /* check if candidate depends on current */
+       bool is_dependency = !found_dependency && !ctx.mv.upwards_check_deps(up_cursor);
+       /* no need to steal from following VMEM instructions */
+-      if (is_dependency && (candidate->isVMEM() || candidate->isFlatLike()))
++      if (is_dependency && (candidate->isVMEM() || candidate->isFlatLike())) {
+          break;
++      }
+ 
+       if (found_dependency) {
+          HazardResult haz = perform_hazard_query(&hq, candidate.get(), true);
+          if (haz == hazard_fail_reorder_ds || haz == hazard_fail_spill ||
+              haz == hazard_fail_reorder_sendmsg || haz == hazard_fail_barrier ||
+-             haz == hazard_fail_export)
++             haz == hazard_fail_export) {
+             is_dependency = true;
+-         else if (haz != hazard_success)
++         } else if (haz != hazard_success) {
+             break;
++         }
+       }
+ 
+       if (is_dependency) {
+@@ -856,10 +896,11 @@ schedule_SMEM(sched_ctx& ctx, Block* blo
+       }
+ 
+       if (is_dependency || !found_dependency) {
+-         if (found_dependency)
++         if (found_dependency) {
+             add_to_hazard_query(&hq, candidate.get());
+-         else
++         } else {
+             k++;
++         }
+          ctx.mv.upwards_skip(up_cursor);
+          continue;
+       }
+@@ -867,8 +908,9 @@ schedule_SMEM(sched_ctx& ctx, Block* blo
+       MoveResult res = ctx.mv.upwards_move(up_cursor);
+       if (res == move_fail_ssa || res == move_fail_rar) {
+          /* no need to steal from following VMEM instructions */
+-         if (res == move_fail_ssa && (candidate->isVMEM() || candidate->isFlatLike()))
++         if (res == move_fail_ssa && (candidate->isVMEM() || candidate->isFlatLike())) {
+             break;
++         }
+          add_to_hazard_query(&hq, candidate.get());
+          ctx.mv.upwards_skip(up_cursor);
+          continue;
+@@ -886,11 +928,6 @@ void
+ schedule_VMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
+ {
+    assert(idx != 0);
+-   int window_size = VMEM_WINDOW_SIZE;
+-   int max_moves = VMEM_MAX_MOVES;
+-   int clause_max_grab_dist = VMEM_CLAUSE_MAX_GRAB_DIST;
+-   bool only_clauses = false;
+-   int16_t k = 0;
+ 
+    /* first, check if we have instructions before current to move down */
+    hazard_query indep_hq;
+@@ -901,6 +938,33 @@ schedule_VMEM(sched_ctx& ctx, Block* blo
+ 
+    DownwardsCursor cursor = ctx.mv.downwards_init(idx, true, true);
+ 
++   /* Adaptive knobs for GFX9: widen windows and clause grabs only with headroom. */
++   int window_size = VMEM_WINDOW_SIZE;
++   int max_moves = VMEM_MAX_MOVES;
++   int clause_max_grab_dist = VMEM_CLAUSE_MAX_GRAB_DIST;
++   if (ctx.gfx_level <= GFX9) {
++      const int margin = vgpr_headroom(ctx.mv, cursor.insert_demand);
++      if (margin >= 24) {
++         window_size += window_size / 4;    /* +25% */
++         max_moves   += max_moves / 8;      /* +12.5% */
++         int extra = std::min<int>(4 + margin / 8, int(ctx.occupancy_factor) * 2);
++         clause_max_grab_dist += extra;
++      } else if (margin >= 16) {
++         window_size += window_size / 6;    /* ~+16.6% */
++         max_moves   += max_moves / 10;     /* +10% */
++         int extra = std::min<int>(2 + margin / 12, int(ctx.occupancy_factor));
++         clause_max_grab_dist += extra;
++      }
++   }
++
++   if (window_size <= 0 || max_moves <= 0) {
++   /* Nothing to do if adaptive knobs collapsed the window. */
++      return;
++   }
++
++   bool only_clauses = false;
++   int16_t k = 0;
++
+    for (int candidate_idx = idx - 1; k < max_moves && candidate_idx > (int)idx - window_size;
+         candidate_idx--) {
+       assert(candidate_idx == cursor.source_idx);
+@@ -908,19 +972,22 @@ schedule_VMEM(sched_ctx& ctx, Block* blo
+       aco_ptr<Instruction>& candidate = block->instructions[candidate_idx];
+       bool is_vmem = candidate->isVMEM() || candidate->isFlatLike();
+ 
+-      /* Break when encountering another VMEM instruction, logical_start or barriers. */
+-      if (!is_reorderable(candidate.get()))
++      /* Break when encountering another VMEM instruction, unreorderable, or barriers. */
++      if (!is_reorderable(candidate.get())) {
+          break;
++      }
+ 
+       if (should_form_clause(current, candidate.get())) {
+-         /* We can't easily tell how much this will decrease the def-to-use
+-          * distances, so just use how far it will be moved as a heuristic. */
++         /* We can't easily tell how much this will decrease the def-to-use distances,
++          * so just use how far it will be moved as a heuristic. */
+          int grab_dist = cursor.insert_idx_clause - candidate_idx;
+-         if (grab_dist >= clause_max_grab_dist + k)
++         if (grab_dist >= clause_max_grab_dist + k) {
+             break;
++         }
+ 
+-         if (perform_hazard_query(&clause_hq, candidate.get(), false) == hazard_success)
++         if (perform_hazard_query(&clause_hq, candidate.get(), false) == hazard_success) {
+             ctx.mv.downwards_move_clause(cursor);
++         }
+ 
+          /* We move the entire clause at once.
+           * Break as any earlier instructions have already been checked.
+@@ -931,8 +998,9 @@ schedule_VMEM(sched_ctx& ctx, Block* blo
+       /* Break if we'd make the previous SMEM instruction stall. */
+       bool can_stall_prev_smem =
+          idx <= ctx.last_SMEM_dep_idx && candidate_idx < ctx.last_SMEM_dep_idx;
+-      if (can_stall_prev_smem && ctx.last_SMEM_stall >= 0)
++      if (can_stall_prev_smem && ctx.last_SMEM_stall >= 0) {
+          break;
++      }
+ 
+       /* If current depends on candidate, add additional dependencies and continue. */
+       bool can_move_down = !only_clauses && (!is_vmem || candidate->definitions.empty());
+@@ -940,10 +1008,11 @@ schedule_VMEM(sched_ctx& ctx, Block* blo
+       HazardResult haz = perform_hazard_query(&indep_hq, candidate.get(), false);
+       if (haz == hazard_fail_reorder_ds || haz == hazard_fail_spill ||
+           haz == hazard_fail_reorder_sendmsg || haz == hazard_fail_barrier ||
+-          haz == hazard_fail_export)
++          haz == hazard_fail_export) {
+          can_move_down = false;
+-      else if (haz != hazard_success)
++      } else if (haz != hazard_success) {
+          break;
++      }
+ 
+       if (!can_move_down) {
+          add_to_hazard_query(&indep_hq, candidate.get());
+@@ -967,8 +1036,9 @@ schedule_VMEM(sched_ctx& ctx, Block* blo
+       }
+       k++;
+ 
+-      if (candidate_idx < ctx.last_SMEM_dep_idx)
++      if (candidate_idx < ctx.last_SMEM_dep_idx) {
+          ctx.last_SMEM_stall++;
++      }
+    }
+ 
+    /* find the first instruction depending on current or find another VMEM */
+@@ -983,8 +1053,9 @@ schedule_VMEM(sched_ctx& ctx, Block* blo
+       aco_ptr<Instruction>& candidate = block->instructions[candidate_idx];
+       bool is_vmem = candidate->isVMEM() || candidate->isFlatLike();
+ 
+-      if (!is_reorderable(candidate.get()))
++      if (!is_reorderable(candidate.get())) {
+          break;
++      }
+ 
+       /* check if candidate depends on current */
+       bool is_dependency = false;
+@@ -992,10 +1063,11 @@ schedule_VMEM(sched_ctx& ctx, Block* blo
+          HazardResult haz = perform_hazard_query(&indep_hq, candidate.get(), true);
+          if (haz == hazard_fail_reorder_ds || haz == hazard_fail_spill ||
+              haz == hazard_fail_reorder_vmem_smem || haz == hazard_fail_reorder_sendmsg ||
+-             haz == hazard_fail_barrier || haz == hazard_fail_export)
++             haz == hazard_fail_barrier || haz == hazard_fail_export) {
+             is_dependency = true;
+-         else if (haz != hazard_success)
++         } else if (haz != hazard_success) {
+             break;
++         }
+       }
+ 
+       is_dependency |= !found_dependency && !ctx.mv.upwards_check_deps(up_cursor);
+@@ -1008,16 +1080,18 @@ schedule_VMEM(sched_ctx& ctx, Block* blo
+       } else if (is_vmem) {
+          /* don't move up dependencies of other VMEM instructions */
+          for (const Definition& def : candidate->definitions) {
+-            if (def.isTemp())
++            if (def.isTemp()) {
+                ctx.mv.depends_on[def.tempId()] = true;
++            }
+          }
+       }
+ 
+       if (is_dependency || !found_dependency) {
+-         if (found_dependency)
++         if (found_dependency) {
+             add_to_hazard_query(&indep_hq, candidate.get());
+-         else
++         } else {
+             k++;
++         }
+          ctx.mv.upwards_skip(up_cursor);
+          continue;
+       }
+@@ -1164,8 +1238,9 @@ schedule_VMEM_store(sched_ctx& ctx, Bloc
+    int max_distance = ctx.last_VMEM_store_idx + VMEM_STORE_CLAUSE_MAX_GRAB_DIST;
+    ctx.last_VMEM_store_idx = idx;
+ 
+-   if (max_distance < idx)
++   if (max_distance < idx) {
+       return;
++   }
+ 
+    hazard_query hq;
+    init_hazard_query(ctx, &hq);
+@@ -1173,18 +1248,25 @@ schedule_VMEM_store(sched_ctx& ctx, Bloc
+    DownwardsCursor cursor = ctx.mv.downwards_init(idx, true, true);
+ 
+    for (int16_t k = 0; k < VMEM_STORE_CLAUSE_MAX_GRAB_DIST;) {
++      if (cursor.source_idx < 0) {
++         break;
++      }
++
+       aco_ptr<Instruction>& candidate = block->instructions[cursor.source_idx];
+-      if (!is_reorderable(candidate.get()))
++      if (!is_reorderable(candidate.get())) {
+          break;
++      }
+ 
+       if (should_form_clause(current, candidate.get())) {
+-         if (perform_hazard_query(&hq, candidate.get(), false) == hazard_success)
++         if (perform_hazard_query(&hq, candidate.get(), false) == hazard_success) {
+             ctx.mv.downwards_move_clause(cursor);
++         }
+          break;
+       }
+ 
+-      if (candidate->isVMEM() || candidate->isFlatLike())
++      if (candidate->isVMEM() || candidate->isFlatLike()) {
+          break;
++      }
+ 
+       add_to_hazard_query(&hq, candidate.get());
+       ctx.mv.downwards_skip(cursor);
+@@ -1265,12 +1347,12 @@ schedule_program(Program* program)
+ 
+    const int wave_factor = program->gfx_level >= GFX10 ? 2 : 1;
+    const int wave_minimum = std::max<int>(program->min_waves, 4 * wave_factor);
+-   const float reg_file_multiple = program->dev.physical_vgprs / (256.0 * wave_factor);
++   const float reg_file_multiple = program->dev.physical_vgprs / (256.0f * wave_factor);
+ 
+    /* If we already have less waves than the minimum, don't reduce them further.
+     * Otherwise, sacrifice some waves and use more VGPRs, in order to improve scheduling.
+     */
+-   int vgpr_demand = std::max<int>(24, demand.vgpr) + 12 * reg_file_multiple;
++   int vgpr_demand = std::max<int>(24, demand.vgpr) + static_cast<int>(12 * reg_file_multiple);
+    int target_waves = std::max(wave_minimum, program->dev.physical_vgprs / vgpr_demand);
+    target_waves = max_suitable_waves(program, std::min<int>(program->num_waves, target_waves));
+    assert(target_waves >= program->min_waves);
