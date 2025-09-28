@@ -604,12 +604,12 @@ print_regs(ra_ctx& ctx, PhysRegInterval regs, const RegisterFile& reg_file)
 bool
 is_sgpr_writable_without_side_effects(amd_gfx_level gfx_level, PhysReg reg)
 {
-   assert(reg < 256);
+   assert(reg.reg() < 256);
    bool has_flat_scr_lo_gfx89 = gfx_level >= GFX8 && gfx_level <= GFX9;
    bool has_flat_scr_lo_gfx7_or_xnack_mask = gfx_level <= GFX9;
-   return (reg <= vcc_hi || reg == m0) &&
-          (!has_flat_scr_lo_gfx89 || (reg != flat_scr_lo && reg != flat_scr_hi)) &&
-          (!has_flat_scr_lo_gfx7_or_xnack_mask || (reg != 104 || reg != 105));
+   return (reg.reg() <= vcc_hi.reg() || reg.reg() == m0.reg()) &&
+          (!has_flat_scr_lo_gfx89 || (reg.reg() != flat_scr_lo.reg() && reg.reg() != flat_scr_hi.reg())) &&
+          (!has_flat_scr_lo_gfx7_or_xnack_mask || (reg.reg() != 104 && reg.reg() != 105));
 }
 
 static bool
