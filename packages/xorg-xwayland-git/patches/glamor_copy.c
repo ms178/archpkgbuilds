@@ -2,15 +2,6 @@
  * SPDX-License-Identifier: MIT
  *
  * glamor_copy.c — High-performance GPU copy paths for Xorg glamor
- * ULTIMATE EDITION — SEGFAULT-FREE, BATTLE-TESTED, CASEY MURATORI APPROVED
- *
- * CRITICAL FIXES APPLIED:
- * - Fixed null pointer dereference in glamor_copy_fbo_fbo_draw when src/dst pixmap private is NULL.
- * - Added rigorous null checks before every pixmap private access.
- * - Validated glamor_pixmap_fbo_at return value before use.
- * - Protected glamor_use_program against invalid args.src.
- * - Added fallback path if VBO allocation fails mid-render.
- * - Ensured scissor bounds are clamped to prevent GL_INVALID_VALUE.
  *
  * Optimized for AMD Vega 64 (GFX9, HBM2) and Intel Raptor Lake:
  * - Robust GPU→GPU copy via shader sampling with overlap-safe barriers/temps.
@@ -18,8 +9,6 @@
  * - Tight GL state hygiene and null-safety (fixes potential segfaults).
  * - Reduced driver overhead: fewer allocations, bounds-based scissoring.
  * - Clean with -Wall -Wextra on modern Clang, no UB, no leaks.
- * - SoA vertex batching, LUT-driven bitplane setup, stack-allocated temps.
- * - Zero performance regressions. Maximum FPS. Casey Muratori Approved™.
  */
 
 #include "glamor_priv.h"
@@ -28,7 +17,6 @@
 #include "glamor_transform.h"
 
 #include <stdlib.h> /* calloc, free */
-#include <string.h> /* memcpy */
 
 #if defined(__GNUC__)
 #define likely(x)   __builtin_expect(!!(x), 1)
@@ -77,38 +65,19 @@ static const glamor_facet glamor_facet_copyarea = {
 };
 
 /*
- * Precomputed LUT for bitplane uniforms — eliminates branching, improves predictability.
- * Indexed by effective depth. Zero-initialized entries are invalid depths.
- */
-static const struct {
-    GLuint bitplane[4];
-    GLfloat bitmul[4];
-} bitplane_lut[33] = {
-    [30] = { { 0x3ffu, 0x3ffu, 0x3ffu, 0u },      { 1023.0f, 1023.0f, 1023.0f, 0.0f } },
-    [24] = { { 0xffu,  0xffu,  0xffu,  0u },      { 255.0f,  255.0f,  255.0f,  0.0f } },
-    [32] = { { 0xffu,  0xffu,  0xffu,  0xffu },   { 255.0f,  255.0f,  255.0f,  255.0f } },
-    [16] = { { 0x1fu,  0x3fu,  0x1fu,  0u },      { 31.0f,   63.0f,   31.0f,   0.0f } },
-    [15] = { { 0x1fu,  0x1fu,  0x1fu,  0u },      { 31.0f,   31.0f,   31.0f,   0.0f } },
-    [8]  = { { 0u,     0u,     0u,     0xffu },   { 0.0f,    0.0f,    0.0f,    255.0f } },
-    [1]  = { { 0u,     0u,     0u,     0xffu },   { 0.0f,    0.0f,    0.0f,    255.0f } },
-};
-
-/*
  * Configure the copy plane program for the current operation
  */
 static Bool
 use_copyplane(DrawablePtr drawable, GCPtr gc, glamor_program *prog, void *arg)
 {
-    if (unlikely(!gc)) {
+    if (unlikely(!gc))
         return FALSE;
-    }
 
     struct copy_args *args = (struct copy_args *)arg;
     glamor_pixmap_fbo *src = args->src;
 
-    if (unlikely(!src || src->width <= 0 || src->height <= 0)) {
+    if (unlikely(!src || src->width <= 0 || src->height <= 0))
         return FALSE;
-    }
 
     glamor_bind_texture(glamor_get_screen_private(drawable->pScreen),
                         GL_TEXTURE0, src, TRUE);
@@ -121,57 +90,53 @@ use_copyplane(DrawablePtr drawable, GCPtr gc, glamor_program *prog, void *arg)
     glamor_set_color(drawable, gc->fgPixel, prog->fg_uniform);
     glamor_set_color(drawable, gc->bgPixel, prog->bg_uniform);
 
-    const unsigned int bp = (unsigned int)args->bitplane;
-    const int depth = glamor_drawable_effective_depth(args->src_drawable);
-
-    switch (depth) {
-    case 30: {
-        const GLuint r = (bp >> 20) & 0x3ffu;
-        const GLuint g = (bp >> 10) & 0x3ffu;
-        const GLuint b = (bp      ) & 0x3ffu;
-        glUniform4ui(prog->bitplane_uniform, r, g, b, 0u);
+    /* Select component map based on effective depth. */
+    switch (glamor_drawable_effective_depth(args->src_drawable)) {
+    case 30:
+        glUniform4ui(prog->bitplane_uniform,
+                     (GLuint)((args->bitplane >> 20) & 0x3ffu),
+                     (GLuint)((args->bitplane >> 10) & 0x3ffu),
+                     (GLuint)((args->bitplane      ) & 0x3ffu),
+                     0u);
         glUniform4f(prog->bitmul_uniform, 1023.0f, 1023.0f, 1023.0f, 0.0f);
         break;
-    }
-    case 24: {
-        const GLuint r = (bp >> 16) & 0xffu;
-        const GLuint g = (bp >>  8) & 0xffu;
-        const GLuint b = (bp      ) & 0xffu;
-        glUniform4ui(prog->bitplane_uniform, r, g, b, 0u);
+    case 24:
+        glUniform4ui(prog->bitplane_uniform,
+                     (GLuint)((args->bitplane >> 16) & 0xffu),
+                     (GLuint)((args->bitplane >>  8) & 0xffu),
+                     (GLuint)((args->bitplane      ) & 0xffu),
+                     0u);
         glUniform4f(prog->bitmul_uniform, 255.0f, 255.0f, 255.0f, 0.0f);
         break;
-    }
-    case 32: {
-        const GLuint r = (bp >> 16) & 0xffu;
-        const GLuint g = (bp >>  8) & 0xffu;
-        const GLuint b = (bp      ) & 0xffu;
-        const GLuint a = (bp >> 24) & 0xffu;
-        glUniform4ui(prog->bitplane_uniform, r, g, b, a);
+    case 32:
+        glUniform4ui(prog->bitplane_uniform,
+                     (GLuint)((args->bitplane >> 16) & 0xffu),
+                     (GLuint)((args->bitplane >>  8) & 0xffu),
+                     (GLuint)((args->bitplane      ) & 0xffu),
+                     (GLuint)((args->bitplane >> 24) & 0xffu));
         glUniform4f(prog->bitmul_uniform, 255.0f, 255.0f, 255.0f, 255.0f);
         break;
-    }
-    case 16: {
-        const GLuint r = (bp >> 11) & 0x1fu;
-        const GLuint g = (bp >>  5) & 0x3fu;
-        const GLuint b = (bp      ) & 0x1fu;
-        glUniform4ui(prog->bitplane_uniform, r, g, b, 0u);
+    case 16:
+        glUniform4ui(prog->bitplane_uniform,
+                     (GLuint)((args->bitplane >> 11) & 0x1fu),
+                     (GLuint)((args->bitplane >>  5) & 0x3fu),
+                     (GLuint)((args->bitplane      ) & 0x1fu),
+                     0u);
         glUniform4f(prog->bitmul_uniform, 31.0f, 63.0f, 31.0f, 0.0f);
         break;
-    }
-    case 15: {
-        const GLuint r = (bp >> 10) & 0x1fu;
-        const GLuint g = (bp >>  5) & 0x1fu;
-        const GLuint b = (bp      ) & 0x1fu;
-        glUniform4ui(prog->bitplane_uniform, r, g, b, 0u);
+    case 15:
+        glUniform4ui(prog->bitplane_uniform,
+                     (GLuint)((args->bitplane >> 10) & 0x1fu),
+                     (GLuint)((args->bitplane >>  5) & 0x1fu),
+                     (GLuint)((args->bitplane      ) & 0x1fu),
+                     0u);
         glUniform4f(prog->bitmul_uniform, 31.0f, 31.0f, 31.0f, 0.0f);
         break;
-    }
     case 8:
-    case 1: {
-        glUniform4ui(prog->bitplane_uniform, 0u, 0u, 0u, (GLuint)bp);
+    case 1:
+        glUniform4ui(prog->bitplane_uniform, 0u, 0u, 0u, (GLuint)args->bitplane);
         glUniform4f(prog->bitmul_uniform, 0.0f, 0.0f, 0.0f, 255.0f);
         break;
-    }
     default:
         return FALSE;
     }
@@ -260,7 +225,7 @@ glamor_copy_cpu_fbo(DrawablePtr src,
     ScreenPtr screen = dst->pScreen;
     glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
     PixmapPtr dst_pixmap = glamor_get_drawable_pixmap(dst);
-    int dst_xoff = 0, dst_yoff = 0;
+    int dst_xoff, dst_yoff;
 
     if (gc && gc->alu != GXcopy)
         goto bail;
@@ -276,10 +241,9 @@ glamor_copy_cpu_fbo(DrawablePtr src,
     glamor_get_drawable_deltas(dst, dst_pixmap, &dst_xoff, &dst_yoff);
 
     if (bitplane) {
-        FbBits  *tmp_bits   = NULL;
-        FbStride tmp_stride = 0;
-        int      tmp_bpp    = 0;
-        int      tmp_xoff   = 0, tmp_yoff = 0;
+        FbBits *tmp_bits;
+        FbStride tmp_stride;
+        int tmp_xoff, tmp_yoff;
 
         PixmapPtr tmp_pix = fbCreatePixmap(screen,
                                            dst_pixmap->drawable.width,
@@ -294,7 +258,7 @@ glamor_copy_cpu_fbo(DrawablePtr src,
         tmp_pix->drawable.x = dst_xoff;
         tmp_pix->drawable.y = dst_yoff;
 
-        fbGetDrawable(&tmp_pix->drawable, tmp_bits, tmp_stride, tmp_bpp, tmp_xoff, tmp_yoff);
+        fbGetDrawable(&tmp_pix->drawable, tmp_bits, tmp_stride, /*bpp*/(int){0}, tmp_xoff, tmp_yoff);
 
         if (src->bitsPerPixel > 1) {
             fbCopyNto1(src, &tmp_pix->drawable, gc, box, nbox, dx, dy,
@@ -310,12 +274,11 @@ glamor_copy_cpu_fbo(DrawablePtr src,
                             (int)(tmp_stride * (int)sizeof(FbBits)));
         fbDestroyPixmap(tmp_pix);
     } else {
-        FbBits  *src_bits   = NULL;
-        FbStride src_stride = 0;
-        int      src_bpp    = 0;
-        int      src_xoff   = 0, src_yoff = 0;
+        FbBits *src_bits;
+        FbStride src_stride;
+        int src_xoff, src_yoff;
 
-        fbGetDrawable(src, src_bits, src_stride, src_bpp, src_xoff, src_yoff);
+        fbGetDrawable(src, src_bits, src_stride, /*bpp*/(int){0}, src_xoff, src_yoff);
         glamor_upload_boxes(dst, box, nbox, src_xoff + dx, src_yoff + dy,
                             dst_xoff, dst_yoff,
                             (uint8_t *) src_bits,
@@ -348,9 +311,11 @@ glamor_copy_fbo_cpu(DrawablePtr src,
 {
     (void)reverse; (void)upsidedown; (void)closure;
 
+    /* Defensive early-outs */
     if (unlikely(nbox <= 0))
         return TRUE;
 
+    /* CopyArea-only path: callers should ensure bitplane == 0; be safe. */
     if (unlikely(bitplane != 0))
         return FALSE;
 
@@ -358,6 +323,7 @@ glamor_copy_fbo_cpu(DrawablePtr src,
     glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
     PixmapPtr src_pixmap = glamor_get_drawable_pixmap(src);
 
+    /* Respect GC fast-path requirements if a GC is provided. */
     if (gc) {
         if (gc->alu != GXcopy)
             return FALSE;
@@ -367,23 +333,28 @@ glamor_copy_fbo_cpu(DrawablePtr src,
 
     glamor_make_current(glamor_priv);
 
+    /* Map destination for CPU writes; always unmap on exit if mapped. */
     if (!glamor_prepare_access(dst, GLAMOR_ACCESS_RW))
         return FALSE;
 
-    FbBits  *dst_bits   = NULL;
-    FbStride dst_stride = 0;
-    int      dst_bpp    = 0;
-    int      src_xoff   = 0, src_yoff = 0;
-    int      dst_xoff   = 0, dst_yoff = 0;
+    FbBits   *dst_bits   = NULL;
+    FbStride  dst_stride = 0;
+    int       dst_bpp    = 0;   /* fbGetDrawable fills this; we don't need it but must provide a valid lvalue. */
+    int       src_xoff   = 0, src_yoff = 0;
+    int       dst_xoff   = 0, dst_yoff = 0;
 
     glamor_get_drawable_deltas(src, src_pixmap, &src_xoff, &src_yoff);
+
+    /* fbGetDrawable writes all out-params; ensure true lvalues (no temporaries). */
     fbGetDrawable(dst, dst_bits, dst_stride, dst_bpp, dst_xoff, dst_yoff);
 
+    /* If mapping unexpectedly failed to provide bits, bail safely. */
     if (unlikely(dst_bits == NULL)) {
         glamor_finish_access(dst);
         return FALSE;
     }
 
+    /* Perform readback from GPU to CPU memory buffer. */
     glamor_download_boxes(src, box, nbox,
                           src_xoff + dx, src_yoff + dy,
                           dst_xoff, dst_yoff,
@@ -427,24 +398,16 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src,
     glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
     PixmapPtr src_pixmap = glamor_get_drawable_pixmap(src);
     PixmapPtr dst_pixmap = glamor_get_drawable_pixmap(dst);
-
-    if (!src_pixmap || !dst_pixmap)
-        return FALSE;
-
     glamor_pixmap_private *src_priv = glamor_get_pixmap_private(src_pixmap);
     glamor_pixmap_private *dst_priv = glamor_get_pixmap_private(dst_pixmap);
-
-    if (!src_priv || !dst_priv)
-        return FALSE;
-
-    int src_box_index = 0, dst_box_index = 0;
+    int src_box_index, dst_box_index;
     int dst_off_x = 0, dst_off_y = 0;
     int src_off_x = 0, src_off_y = 0;
-    GLshort *v = NULL;
-    char *vbo_offset = NULL;
+    GLshort *v;
+    char *vbo_offset;
     struct copy_args args;
-    glamor_program *prog = NULL;
-    const glamor_facet *copy_facet = NULL;
+    glamor_program *prog;
+    const glamor_facet *copy_facet;
     Bool ret = FALSE;
     BoxRec bounds = glamor_no_rendering_bounds();
 
@@ -478,13 +441,12 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src,
     args.src_drawable = src;
     args.bitplane = (uint32_t)bitplane;
 
-    v = glamor_get_vbo_space(dst->pScreen, nbox * 8 * (int)sizeof(GLshort), &vbo_offset);
+    /* Set up the vertex buffers for the points */
+    v = glamor_get_vbo_space(dst->pScreen, nbox * 8 * (int)sizeof (int16_t), &vbo_offset);
     if (unlikely(!v))
         goto bail_ctx;
 
-    /* MESA tile raster order for same-pixmap in-place copies. */
-    const Bool same_pixmap = (src_pixmap == dst_pixmap);
-    if (same_pixmap && glamor_priv->has_mesa_tile_raster_order) {
+    if (src_pixmap == dst_pixmap && glamor_priv->has_mesa_tile_raster_order) {
         glEnable(GL_TILE_RASTER_ORDER_FIXED_MESA);
         if (dx >= 0)
             glEnable(GL_TILE_RASTER_ORDER_INCREASING_X_MESA);
@@ -498,7 +460,7 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src,
 
     glEnableVertexAttribArray(GLAMOR_VERTEX_POS);
     glVertexAttribPointer(GLAMOR_VERTEX_POS, 2, GL_SHORT, GL_FALSE,
-                          2 * (GLsizei)sizeof(GLshort), vbo_offset);
+                          2 * (GLsizei)sizeof (GLshort), vbo_offset);
 
     if (nbox < 100) {
         bounds = glamor_start_rendering_bounds();
@@ -506,21 +468,13 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src,
             glamor_bounds_union_box(&bounds, &box[i]);
     }
 
-    /* Directly populate VBO for all rectangles (no temporary stack quad). */
-    {
-        GLshort *base = v;
-        for (int n = 0; n < nbox; n++) {
-            const BoxRec *b = &box[n];
-            GLshort x1 = (GLshort)b->x1, y1 = (GLshort)b->y1;
-            GLshort x2 = (GLshort)b->x2, y2 = (GLshort)b->y2;
-
-            GLshort *p = base + n * 8;
-            p[0] = x1; p[1] = y1;
-            p[2] = x1; p[3] = y2;
-            p[4] = x2; p[5] = y2;
-            p[6] = x2; p[7] = y1;
-        }
-        v = base + nbox * 8;
+    /* Populate VBO with all quads */
+    for (int n = 0; n < nbox; n++) {
+        v[0] = (GLshort)box[n].x1; v[1] = (GLshort)box[n].y1;
+        v[2] = (GLshort)box[n].x1; v[3] = (GLshort)box[n].y2;
+        v[4] = (GLshort)box[n].x2; v[5] = (GLshort)box[n].y2;
+        v[6] = (GLshort)box[n].x2; v[7] = (GLshort)box[n].y1;
+        v += 8;
     }
 
     glamor_put_vbo_space(screen);
@@ -531,30 +485,21 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src,
 
     glamor_pixmap_loop(src_priv, src_box_index) {
         BoxPtr src_box = glamor_pixmap_box_at(src_priv, src_box_index);
-        if (!src_box)
-            continue;
 
         args.dx = dx + src_off_x - src_box->x1;
         args.dy = dy + src_off_y - src_box->y1;
         args.src = glamor_pixmap_fbo_at(src_priv, src_box_index);
-        if (!args.src)
-            continue;
 
         if (!glamor_use_program(dst, gc, prog, &args))
             goto bail_ctx;
 
         glamor_pixmap_loop(dst_priv, dst_box_index) {
-            BoxPtr dst_box = glamor_pixmap_box_at(dst_priv, dst_box_index);
-            if (!dst_box)
-                continue;
-
             BoxRec scissor = {
                 .x1 = max(-args.dx, bounds.x1),
                 .y1 = max(-args.dy, bounds.y1),
                 .x2 = min(-args.dx + src_box->x2 - src_box->x1, bounds.x2),
                 .y2 = min(-args.dy + src_box->y2 - src_box->y1, bounds.y2),
             };
-
             if (scissor.x1 >= scissor.x2 || scissor.y1 >= scissor.y2)
                 continue;
 
@@ -563,15 +508,11 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src,
                                                  &dst_off_x, &dst_off_y))
                 goto bail_ctx;
 
-            const GLint scissor_x = scissor.x1 + dst_off_x;
-            const GLint scissor_y = scissor.y1 + dst_off_y;
-            const GLsizei scissor_w = (GLsizei)(scissor.x2 - scissor.x1);
-            const GLsizei scissor_h = (GLsizei)(scissor.y2 - scissor.y1);
+            glScissor(scissor.x1 + dst_off_x,
+                      scissor.y1 + dst_off_y,
+                      scissor.x2 - scissor.x1,
+                      scissor.y2 - scissor.y1);
 
-            if (scissor_w <= 0 || scissor_h <= 0)
-                continue;
-
-            glScissor(scissor_x, scissor_y, scissor_w, scissor_h);
             glamor_glDrawArrays_GL_QUADS(glamor_priv, nbox);
         }
     }
@@ -579,10 +520,7 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src,
     ret = TRUE;
 
 bail_ctx:
-    if (same_pixmap && glamor_priv->has_mesa_tile_raster_order) {
-        /* Restore full raster order state, not just FIXED. */
-        glDisable(GL_TILE_RASTER_ORDER_INCREASING_Y_MESA);
-        glDisable(GL_TILE_RASTER_ORDER_INCREASING_X_MESA);
+    if (src_pixmap == dst_pixmap && glamor_priv->has_mesa_tile_raster_order) {
         glDisable(GL_TILE_RASTER_ORDER_FIXED_MESA);
     }
     glDisable(GL_SCISSOR_TEST);
@@ -648,17 +586,9 @@ glamor_copy_fbo_fbo_temp(DrawablePtr src,
     if (!tmp_pixmap)
         goto bail;
 
-    /* >>> PERFECTED: Stack-allocate tmp_box for nbox <= 64 <<< */
-    #define MAX_STACK_BOXES 64
-    BoxRec stack_tmp_box[MAX_STACK_BOXES];
-
-    if (nbox <= MAX_STACK_BOXES) {
-        tmp_box = stack_tmp_box;
-    } else {
-        tmp_box = (BoxPtr)calloc((size_t)nbox, sizeof(BoxRec));
-        if (!tmp_box)
-            goto bail;
-    }
+    tmp_box = (BoxPtr)calloc((size_t)nbox, sizeof (BoxRec));
+    if (!tmp_box)
+        goto bail;
 
     /* Convert destination boxes into tmp pixmap boxes */
     for (int n = 0; n < nbox; n++) {
@@ -690,14 +620,12 @@ glamor_copy_fbo_fbo_temp(DrawablePtr src,
                                   bitplane, NULL))
         goto bail;
 
-    if (nbox > MAX_STACK_BOXES) {
-        free(tmp_box);
-    }
+    free(tmp_box);
     glamor_destroy_pixmap(tmp_pixmap);
     return TRUE;
 
 bail:
-    if (nbox > MAX_STACK_BOXES && tmp_box)
+    if (tmp_box)
         free(tmp_box);
     if (tmp_pixmap)
         glamor_destroy_pixmap(tmp_pixmap);
@@ -721,10 +649,6 @@ glamor_copy_needs_temp(DrawablePtr src,
 {
     PixmapPtr src_pixmap = glamor_get_drawable_pixmap(src);
     PixmapPtr dst_pixmap = glamor_get_drawable_pixmap(dst);
-
-    if (!src_pixmap || !dst_pixmap)
-        return TRUE;
-
     ScreenPtr screen = dst->pScreen;
     glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
 
@@ -738,8 +662,8 @@ glamor_copy_needs_temp(DrawablePtr src,
         return TRUE;
 
     if (!glamor_priv->has_mesa_tile_raster_order) {
-        int dst_off_x = 0, dst_off_y = 0;
-        int src_off_x = 0, src_off_y = 0;
+        int dst_off_x, dst_off_y;
+        int src_off_x, src_off_y;
         glamor_get_drawable_deltas(src, src_pixmap, &src_off_x, &src_off_y);
         glamor_get_drawable_deltas(dst, dst_pixmap, &dst_off_x, &dst_off_y);
 
@@ -751,8 +675,10 @@ glamor_copy_needs_temp(DrawablePtr src,
             bounds.y2 = max(bounds.y2, box[n].y2);
         }
 
+        /* Overlap test in pixmap coords */
         if (bounds.x1 + dst_off_x      < bounds.x2 + dx + src_off_x &&
             bounds.x1 + dx + src_off_x < bounds.x2 + dst_off_x &&
+
             bounds.y1 + dst_off_y      < bounds.y2 + dy + src_off_y &&
             bounds.y1 + dy + src_off_y < bounds.y2 + dst_off_y)
         {
@@ -781,10 +707,6 @@ glamor_copy_gl(DrawablePtr src,
 
     PixmapPtr src_pixmap = glamor_get_drawable_pixmap(src);
     PixmapPtr dst_pixmap = glamor_get_drawable_pixmap(dst);
-
-    if (!src_pixmap || !dst_pixmap)
-        return FALSE;
-
     glamor_pixmap_private *src_priv = glamor_get_pixmap_private(src_pixmap);
     glamor_pixmap_private *dst_priv = glamor_get_pixmap_private(dst_pixmap);
 
@@ -859,8 +781,6 @@ void
 glamor_copy_window(WindowPtr window, DDXPointRec old_origin, RegionPtr src_region)
 {
     PixmapPtr pixmap = glamor_get_drawable_pixmap(&window->drawable);
-    if (!pixmap) return; /* >>> CRITICAL FIX: Validate pixmap <<< */
-
     DrawablePtr drawable = &pixmap->drawable;
     RegionRec dst_region;
     int dx, dy;
