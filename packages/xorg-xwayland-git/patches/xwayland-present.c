@@ -47,6 +47,19 @@
 
 #define XWL_PRESENT_CAPS PresentCapabilityAsync | PresentCapabilityAsyncMayTear
 
+#if defined(__GNUC__) || defined(__clang__)
+#define LIKELY(x)   __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define LIKELY(x)   (x)
+#define UNLIKELY(x) (x)
+#endif
+
+static inline Bool
+xorg_list_is_linked(const struct xorg_list *node)
+{
+    return node->next != node;
+}
 
 /*
  * When not flipping let Present copy with 60fps.
@@ -99,64 +112,20 @@ xwl_present_event_from_id(WindowPtr present_window, uint64_t event_id)
 {
     present_window_priv_ptr window_priv;
     struct xwl_present_event *event;
-    struct xorg_list *node, *next;
 
-    /* Fast path: NULL window (common during teardown) */
-    if (__builtin_expect(!present_window, 0))
+    if (!present_window)
         return NULL;
 
     window_priv = present_get_window_priv(present_window, TRUE);
-    if (__builtin_expect(!window_priv, 0))
+    if (!window_priv)
         return NULL;
 
-    /* Fast path: Empty list (common during init/teardown) */
-    if (__builtin_expect(xorg_list_is_empty(&window_priv->vblank), 0))
+    if (xorg_list_is_empty(&window_priv->vblank))
         return NULL;
 
-    /*
-     * Manual iteration with prefetch hints.
-     *
-     * Prefetch strategy (Raptor Lake specific):
-     * - Prefetch next node 1 iteration ahead (conservative for 64B cache lines)
-     * - Prefetch distance tuned for ~200-cycle DRAM latency
-     * - Software prefetch better than hardware for linked lists (stride detection fails)
-     *
-     * Vega 64 benefit:
-     * - Reduced L3 thrashing → more L3 available for GPU driver allocations
-     * - Measured 8% reduction in L3 misses via `perf stat -e LLC-load-misses`
-     */
-    node = window_priv->vblank.next;
-    while (node != &window_priv->vblank) {
-        event = container_of(node, struct xwl_present_event, vblank.window_list);
-        next = node->next;
-
-        /* Prefetch next event (read-only, high temporal locality) */
-        if (__builtin_expect(next != &window_priv->vblank, 1))
-            __builtin_prefetch(container_of(next, struct xwl_present_event, vblank.window_list),
-                             0,  /* read-only */
-                             3); /* high temporal locality (T0 hint for Raptor Lake) */
-
-        /* Hot path: Event found early (80% of lookups per profiling) */
-        if (__builtin_expect(event->vblank.event_id == event_id, 1))
+    xorg_list_for_each_entry(event, &window_priv->vblank, vblank.window_list) {
+        if (event->vblank.event_id == event_id)
             return event;
-
-        /*
-         * FIXED: Correct early termination logic.
-         *
-         * Original bug: `event_id + 50000` wraps on overflow, causing missed events.
-         *
-         * Correct approach: Event IDs are monotonically increasing and events are
-         * inserted in order. If we encounter an ID *greater* than the target, the
-         * target doesn't exist (it would've been earlier in the list).
-         *
-         * Safety: Handles wraparound correctly (difference comparison, not addition).
-         */
-        if (event->vblank.event_id > event_id) {
-            /* Passed the target ID → not in list (events sorted by ID) */
-            return NULL;
-        }
-
-        node = next;
     }
 
     return NULL;
@@ -243,83 +212,60 @@ xwl_present_reset_timer(struct xwl_present_window *xwl_present_window)
     Bool need_timer;
 
     /* Fast path: NULL check (common during teardown) */
-    if (__builtin_expect(!xwl_present_window, 0))
+    if (UNLIKELY(!xwl_present_window))
         return;
 
     /*
-     * Fast path: Check if ANY events pending (cheaper than individual list checks).
-     *
-     * Inline the critical check to avoid function call overhead (xwl_present_has_pending_events
-     * is not inlined by compiler due to complexity).
-     *
-     * Ordering: Check flip_pending first (most common in gaming workloads).
+     * Fast path: Check if ANY events pending. Inlined for performance.
+     * The most common state in a running game is waiting on a flip.
      */
     present_vblank_ptr flip_pending = xwl_present_get_pending_flip(xwl_present_window);
     need_timer = (flip_pending && flip_pending->sync_flip) ||
                  !xorg_list_is_empty(&xwl_present_window->wait_list) ||
                  !xorg_list_is_empty(&xwl_present_window->blocked_queue);
 
-    if (__builtin_expect(!need_timer, 0)) {
-        /* No pending events: Free timer (if exists) and return */
-        if (xwl_present_window->frame_timer) {
+    if (LIKELY(!need_timer)) {
+        /* No pending events: Free timer (if it exists) and return */
+        if (xwl_present_window->frame_timer)
             xwl_present_free_timer(xwl_present_window);
-        }
         return;
     }
 
-    /*
-     * Events pending: Determine correct timeout.
-     *
-     * Logic unchanged from original, but reorganized for better branch prediction.
-     */
+    /* Events are pending, so a timer is needed. Determine the correct timeout. */
     xwl_window = xwl_window_from_window(xwl_present_window->window);
 
-    /* Determine timeout based on flip state (logic from original) */
     if (xwl_window && xwl_window->frame_callback &&
-        !xorg_list_is_empty(&xwl_present_window->frame_callback_list))
-        timeout = TIMER_LEN_FLIP;  /* 1000ms - waiting for compositor */
+        xorg_list_is_linked(&xwl_present_window->frame_callback_list))
+        timeout = TIMER_LEN_FLIP;  /* 1000ms - waiting for compositor frame callback */
     else
-        timeout = TIMER_LEN_COPY;  /* 17ms - ~60fps fallback */
+        timeout = TIMER_LEN_COPY;  /* 17ms - ~60fps fallback for copy operations */
 
     /*
-     * Safety timeout: If timer armed for >1 second, fire immediately.
-     *
-     * This handles Wayland compositor hangs (e.g., surface not visible).
-     * Unchanged from original (line 147).
+     * Safety net: If the timer has been armed for too long (e.g., compositor
+     * is not sending frame callbacks), fire it manually to prevent a stall.
      */
     if (xwl_present_window->timer_armed) {
         now = GetTimeInMillis();
-
         if ((int)(now - xwl_present_window->timer_armed) > 1000) {
-            /* Force timer callback NOW (bypass TimerSet) */
-            xwl_present_timer_callback(xwl_present_window->frame_timer, now,
-                                       xwl_present_window);
+            xwl_present_timer_callback(xwl_present_window->frame_timer, now, xwl_present_window);
             return;
         }
 
         /*
-         * OPTIMIZATION CORE: Skip TimerSet if timeout unchanged.
-         *
-         * Prevents redundant timerfd_settime() syscalls (300ns each).
-         * Measured 95% reduction in syscall rate (200-500/sec → 5/sec).
-         *
-         * Original code had this check (lines 154-158) but missed frame_timer NULL case.
+         * OPTIMIZATION CORE: If the timer is already running with the correct
+         * timeout, do nothing. This prevents a redundant timerfd_settime() syscall.
          */
-        if (xwl_present_window->frame_timer &&
-            xwl_present_window->timer_timeout == timeout) {
-            /* Timer already running with correct timeout - SKIP SYSCALL */
+        if (xwl_present_window->frame_timer && xwl_present_window->timer_timeout == timeout) {
             return;
         }
     } else {
-        /* First arm: Record timestamp */
+        /* First time arming the timer for this cycle */
         xwl_present_window->timer_armed = GetTimeInMillis();
     }
 
     /*
-     * Update timer (only reached if timeout changed or first arm).
-     *
-     * TimerSet internally calls timerfd_settime() - unavoidable syscall,
-     * but now called 20× less frequently.
+     * Update timer: This path is only reached if the timer is new, or its
+     * timeout value needs to change. This is where the syscall happens.
      */
     xwl_present_window->timer_timeout = timeout;
     xwl_present_window->frame_timer = TimerSet(xwl_present_window->frame_timer,
@@ -572,7 +518,6 @@ xwl_present_update_window_crtc(present_window_priv_ptr window_priv, RRCrtcPtr cr
     window_priv->crtc = crtc;
 }
 
-
 void
 xwl_present_cleanup(WindowPtr window)
 {
@@ -583,7 +528,10 @@ xwl_present_cleanup(WindowPtr window)
     if (!xwl_present_window)
         return;
 
-    xorg_list_del(&xwl_present_window->frame_callback_list);
+    /* Safely unlink from the compositor's frame callback list */
+    if (xorg_list_is_linked(&xwl_present_window->frame_callback_list))
+        xorg_list_del(&xwl_present_window->frame_callback_list);
+    xorg_list_init(&xwl_present_window->frame_callback_list);
 
     if (xwl_present_window->sync_callback) {
         wl_callback_destroy(xwl_present_window->sync_callback);
@@ -591,16 +539,17 @@ xwl_present_cleanup(WindowPtr window)
     }
 
     if (window_priv) {
-        /* Clear remaining events */
-        xorg_list_for_each_entry_safe(event, tmp, &window_priv->vblank, vblank.window_list)
+        xorg_list_for_each_entry_safe(event, tmp, &window_priv->vblank, vblank.window_list) {
             xwl_present_free_event(event);
+        }
     }
 
-    /* Clear timer */
     xwl_present_free_timer(xwl_present_window);
-    TimerFree(xwl_present_window->unredirect_timer);
+    if (xwl_present_window->unredirect_timer) {
+        TimerFree(xwl_present_window->unredirect_timer);
+        xwl_present_window->unredirect_timer = NULL;
+    }
 
-    /* Remove from privates so we don't try to access it later */
     dixSetPrivate(&window->devPrivates,
                   &xwl_present_window_private_key,
                   NULL);
@@ -611,9 +560,9 @@ xwl_present_cleanup(WindowPtr window)
 static void
 xwl_present_buffer_release(void *data)
 {
-    struct xwl_present_window *xwl_present_window;
     struct xwl_present_event *event = data;
     present_vblank_ptr vblank;
+    struct xwl_present_window *xwl_present_window = NULL;
 
     if (!event)
         return;
@@ -622,21 +571,32 @@ xwl_present_buffer_release(void *data)
 
 #if defined(XWL_HAS_GLAMOR) && defined(DRI3)
     if (vblank->release_syncobj) {
-        /* transfer implicit fence to release syncobj */
         int fence_fd = xwl_glamor_dmabuf_export_sync_file(vblank->pixmap);
         vblank->release_syncobj->import_fence(vblank->release_syncobj,
                                               vblank->release_point,
                                               fence_fd);
     } else
 #endif /* defined(XWL_HAS_GLAMOR) && defined(DRI3) */
+    {
         present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
+    }
 
-    xwl_present_window = xwl_present_window_priv(vblank->window);
+    if (vblank->window)
+        xwl_present_window = xwl_present_window_priv(vblank->window);
+
+    /* If the window went away (teardown), just free the event safely. */
+    if (!xwl_present_window) {
+        xwl_present_free_event(event);
+        return;
+    }
+
     if (xwl_present_window->flip_active == vblank ||
         xwl_present_get_pending_flip(xwl_present_window) == vblank)
+    {
         xwl_present_release_pixmap(event);
-    else
+    } else {
         xwl_present_free_event(event);
+    }
 }
 
 static void
@@ -668,12 +628,20 @@ xwl_present_timer_callback(OsTimerPtr timer,
                            CARD32 time,
                            void *arg)
 {
+    (void)timer;
+    (void)time;
+
     struct xwl_present_window *xwl_present_window = arg;
 
-    /* If we were expecting a frame callback for this window, it didn't arrive
-     * in a second. Stop listening to it to avoid double-bumping the MSC
-     */
-    xorg_list_del(&xwl_present_window->frame_callback_list);
+    if (UNLIKELY(!xwl_present_window ||
+                 xwl_present_window_priv(xwl_present_window->window) != xwl_present_window)) {
+        return 0;
+    }
+
+    /* Safely remove from the compositor's list, if linked */
+    if (xorg_list_is_linked(&xwl_present_window->frame_callback_list))
+        xorg_list_del(&xwl_present_window->frame_callback_list);
+    xorg_list_init(&xwl_present_window->frame_callback_list);
 
     xwl_present_msc_bump(xwl_present_window);
     xwl_present_reset_timer(xwl_present_window);
@@ -684,26 +652,47 @@ xwl_present_timer_callback(OsTimerPtr timer,
 void
 xwl_present_frame_callback(struct xwl_present_window *xwl_present_window)
 {
-    xorg_list_del(&xwl_present_window->frame_callback_list);
+    if (UNLIKELY(!xwl_present_window))
+        return;
+
+    /* Safely unlink our node from the compositor's frame-callback list */
+    if (xorg_list_is_linked(&xwl_present_window->frame_callback_list))
+        xorg_list_del(&xwl_present_window->frame_callback_list);
+    xorg_list_init(&xwl_present_window->frame_callback_list);
 
     xwl_present_msc_bump(xwl_present_window);
 
-    /* we do not need the timer anymore for this frame,
-     * reset it for potentially the next one
-     */
+    /* Reset timer for potentially the next frame */
     xwl_present_reset_timer(xwl_present_window);
 }
 
 static void
 xwl_present_sync_callback(void *data,
-               struct wl_callback *callback,
-               uint32_t time)
+                          struct wl_callback *callback,
+                          uint32_t time)
 {
-    present_vblank_ptr vblank = data;
-    struct xwl_present_window *xwl_present_window = xwl_present_window_get_priv(vblank->window);
+    (void)time;
 
-    wl_callback_destroy(xwl_present_window->sync_callback);
-    xwl_present_window->sync_callback = NULL;
+    present_vblank_ptr vblank = data;
+    struct xwl_present_window *xwl_present_window = NULL;
+
+    if (!vblank) {
+        wl_callback_destroy(callback);
+        return;
+    }
+
+    WindowPtr window = vblank->window;
+    if (window)
+        xwl_present_window = xwl_present_window_priv(window);
+
+    if (!xwl_present_window) {
+        wl_callback_destroy(callback);
+        return;
+    }
+
+    if (xwl_present_window->sync_callback == callback)
+        xwl_present_window->sync_callback = NULL;
+    wl_callback_destroy(callback);
 
     xwl_present_flip_notify_vblank(vblank, xwl_present_window->ust, xwl_present_window->msc);
 }
@@ -719,12 +708,12 @@ xwl_present_get_crtc(present_screen_priv_ptr screen_priv,
     struct xwl_present_window *xwl_present_window = xwl_present_window_get_priv(present_window);
     rrScrPrivPtr rr_private;
 
-    if (xwl_present_window == NULL)
+    if (xwl_present_window == NULL || present_window == NULL)
         return NULL;
 
     rr_private = rrGetScrPriv(present_window->drawable.pScreen);
 
-    if (rr_private->numCrtcs == 0)
+    if (!rr_private || rr_private->numCrtcs == 0)
         return NULL;
 
     return rr_private->crtcs[0];
@@ -1170,7 +1159,6 @@ xwl_present_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
     if (!notify_only && event && !event->copy_executed &&
         xwl_present_window->blocking_event &&
         xwl_present_window->blocking_event != event->vblank.event_id) {
-        /* an earlier request is blocking execution */
         xorg_list_append(&event->blocked, &xwl_present_window->blocked_queue);
         return;
     }
@@ -1179,7 +1167,6 @@ retry:
     if (present_execute_wait(vblank, crtc_msc) ||
         xwl_present_wait_acquire_fence_avail(xwl_screen, vblank)) {
         if (!notify_only && event)
-            /* block execution of subsequent requests until this request is ready */
             xwl_present_window->blocking_event = event->vblank.event_id;
         return;
     }
@@ -1188,25 +1175,6 @@ retry:
         DebugPresent(("\tr %" PRIu64 " %p (pending %p)\n",
                       vblank->event_id, vblank, flip_pending));
         xorg_list_append(&vblank->event_queue, &xwl_present_window->flip_queue);
-
-        /* Prevent flip queue from growing unbounded */
-        int queue_length = 0;
-        present_vblank_ptr temp_vblank;
-        xorg_list_for_each_entry(temp_vblank, &xwl_present_window->flip_queue, event_queue) {
-            queue_length++;
-            /* Early termination for performance */
-            if (queue_length > 32) break;
-        }
-
-        if (queue_length > 16) {  /* Reasonable limit */
-            present_vblank_ptr oldest_vblank = xorg_list_first_entry(
-                &xwl_present_window->flip_queue, present_vblank_rec, event_queue);
-            if (oldest_vblank && oldest_vblank != flip_pending && oldest_vblank != vblank) {
-                xorg_list_del(&oldest_vblank->event_queue);
-                present_vblank_scrap(oldest_vblank);
-                xwl_present_re_execute(oldest_vblank);
-            }
-        }
         return;
     }
 
@@ -1217,24 +1185,25 @@ retry:
         int ret;
 
         if (vblank->flip) {
-            RegionPtr damage;
+            RegionPtr damage = NULL;
+            Bool damage_owned = FALSE;
 
             DebugPresent(("\tf %" PRIu64 " %p %" PRIu64 ": %08" PRIx32 " -> %08" PRIx32 "\n",
                           vblank->event_id, vblank, crtc_msc,
                           vblank->pixmap ? vblank->pixmap->drawable.id : 0,
                           vblank->window ? vblank->window->drawable.id : 0));
 
-            /* Set update region as damaged */
             if (vblank->update) {
                 damage = RegionDuplicate(vblank->update);
                 if (damage) {
-                    /* Translate update region to screen space */
                     assert(vblank->x_off == 0 && vblank->y_off == 0);
                     RegionTranslate(damage, window->drawable.x, window->drawable.y);
                     RegionIntersect(damage, damage, &window->clipList);
+                    damage_owned = TRUE;
                 }
             } else {
-                damage = RegionDuplicate(&window->clipList);
+                damage = (RegionPtr)&window->clipList;
+                damage_owned = FALSE;
             }
 
             if (damage && xwl_present_flip(vblank, damage)) {
@@ -1242,7 +1211,6 @@ retry:
                 struct xwl_window *xwl_window = xwl_window_from_window(window);
                 PixmapPtr old_pixmap = screen->GetWindowPixmap(window);
 
-                /* Replace window pixmap with flip pixmap */
 #ifdef COMPOSITE
                 if (old_pixmap && vblank->pixmap) {
                     vblank->pixmap->screen_x = old_pixmap->screen_x;
@@ -1261,38 +1229,31 @@ retry:
                 if (old_pixmap)
                     dixDestroyPixmap(old_pixmap, old_pixmap->drawable.id);
 
-                /* Report damage, let damage_report ignore it though */
                 if (xwl_screen) {
                     xwl_screen->ignore_damage = TRUE;
                     DamageDamageRegion(&vblank->window->drawable, damage);
                     xwl_screen->ignore_damage = FALSE;
                 }
-                RegionDestroy(damage);
 
-                /* Clear damage region, to ensure damage_report is called before
-                 * any drawing to the window
-                 */
+                if (damage_owned)
+                    RegionDestroy(damage);
+
                 if (xwl_window) {
                     xwl_window_buffer_add_damage_region(xwl_window);
                     RegionEmpty(xwl_window_get_damage_region(xwl_window));
                     xorg_list_del(&xwl_window->link_damage);
                 }
 
-                /* Put pending flip at the flip queue head */
                 xorg_list_add(&vblank->event_queue, &xwl_present_window->flip_queue);
-
-                /* Realign timer */
                 xwl_present_reset_timer(xwl_present_window);
-
                 xwl_present_flush_blocked(xwl_present_window, crtc_msc);
                 return;
             }
 
-            if (damage)
+            if (damage && damage_owned)
                 RegionDestroy(damage);
 
             vblank->flip = FALSE;
-            /* re-execute, falling through to copy */
             goto retry;
         }
 
@@ -1309,7 +1270,6 @@ retry:
         present_execute_copy(vblank, crtc_msc);
         assert(!vblank->queued);
 
-        /* Set the copy_executed field, so this will fall through to present_execute_post next time */
         if (event)
             event->copy_executed = TRUE;
 
@@ -1455,10 +1415,13 @@ xwl_present_pixmap(WindowPtr window,
 void
 xwl_present_unrealize_window(struct xwl_present_window *xwl_present_window)
 {
-    /* The pending frame callback may never be called, so drop it and shorten
-     * the frame timer interval.
-     */
-    xorg_list_del(&xwl_present_window->frame_callback_list);
+    if (UNLIKELY(!xwl_present_window))
+        return;
+
+    /* Drop pending frame callback link safely */
+    if (xorg_list_is_linked(&xwl_present_window->frame_callback_list))
+        xorg_list_del(&xwl_present_window->frame_callback_list);
+    xorg_list_init(&xwl_present_window->frame_callback_list);
 
     /* Make sure the timer callback doesn't get called */
     xwl_present_window->timer_armed = 0;

@@ -943,8 +943,8 @@ glamor_put_image(DrawablePtr drawable, GCPtr gc, int depth,
                  int x, int y, int w, int h,
                  int leftPad, int format, char *bits)
 {
-    /* CRITICAL FIX: NULL check at public API */
-    if (!drawable || !bits || w <= 0 || h <= 0)
+    /* CRITICAL FIX: NULL check at public API. Also check for no-op. */
+    if (unlikely(!drawable || !gc || !bits || w <= 0 || h <= 0))
         return;
 
     switch (format) {
@@ -1124,8 +1124,8 @@ glamor_get_image(DrawablePtr drawable,
                  unsigned long plane_mask,
                  char *dst)
 {
-    /* CRITICAL FIX: NULL check at public API */
-    if (!drawable || !dst || w <= 0 || h <= 0)
+    /* CRITICAL FIX: NULL check at public API. Also check for no-op. */
+    if (unlikely(!drawable || !dst || w <= 0 || h <= 0))
         return;
 
     if (glamor_get_image_zpixmap_gl(drawable, x, y, w, h, format,

@@ -550,68 +550,48 @@ xwl_glamor_wait_fence(struct xwl_screen *xwl_screen, int fence_fd)
     EGLint attribs[3];
     EGLSyncKHR sync;
 
-    /* Early exit: Invalid FD */
-    if (UNLIKELY(fence_fd < 0))
+    if (fence_fd < 0)
         return;
 
-    /* NULL-safe validation (close FD on all failure paths) */
-    if (UNLIKELY(!xwl_screen)) {
+    if (!xwl_screen) {
         close(fence_fd);
         return;
     }
 
-    if (UNLIKELY(!xwl_screen->glamor_ctx)) {
+    if (!xwl_screen->glamor_ctx) {
         close(fence_fd);
         return;
     }
 
-    /* Ensure our EGL context is current */
     xwl_glamor_egl_make_current(xwl_screen);
 
-    /* Check extension availability */
-    if (UNLIKELY(!egl_native_fence_sync_available(xwl_screen->egl_display))) {
+    if (!egl_native_fence_sync_available(xwl_screen->egl_display)) {
         close(fence_fd);
         return;
     }
 
-    /* Create sync object from FD (EGL takes ownership of FD on success) */
     attribs[0] = EGL_SYNC_NATIVE_FENCE_FD_ANDROID;
-    attribs[1] = fence_fd;  /* Note: EGLint may truncate on 64-bit; validated above */
+    attribs[1] = fence_fd;  /* EGL takes ownership on success */
     attribs[2] = EGL_NONE;
 
     sync = p_eglCreateSyncKHR(xwl_screen->egl_display,
                               EGL_SYNC_NATIVE_FENCE_ANDROID, attribs);
 
-    if (UNLIKELY(sync == EGL_NO_SYNC_KHR)) {
-        /*
-         * Creation failed: EGL did NOT take ownership of fence_fd.
-         * We must close it to avoid leak.
-         */
+    if (sync == EGL_NO_SYNC_KHR) {
         ErrorF("xwayland-glamor: eglCreateSyncKHR(wait) failed (error 0x%04x)\n",
                eglGetError());
         close(fence_fd);
         return;
     }
 
-    /*
-     * Insert GPU-side wait: All subsequent GL commands will wait for fence.
-     * This is asynchronous (returns immediately); GPU waits internally.
-     */
-    EGLBoolean wait_result = p_eglWaitSyncKHR(xwl_screen->egl_display, sync, 0);
-    if (UNLIKELY(wait_result != EGL_TRUE)) {
+    /* GPU-side wait; returns immediately on CPU. */
+    if (p_eglWaitSyncKHR(xwl_screen->egl_display, sync, 0) != EGL_TRUE) {
         ErrorF("xwayland-glamor: eglWaitSyncKHR failed (error 0x%04x)\n",
                eglGetError());
     }
 
-    /* Destroy sync object (EGL closes fence_fd internally) */
     p_eglDestroySyncKHR(xwl_screen->egl_display, sync);
 
-    /*
-     * CRITICAL: Memory barrier to ensure CPU sees GPU writes after fence.
-     * On Vega 64, GPU writes may not be visible to CPU without explicit fence.
-     * glMemoryBarrier with ALL_BARRIER_BITS is overkill but safest.
-     */
-    glMemoryBarrier(GL_ALL_BARRIER_BITS);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

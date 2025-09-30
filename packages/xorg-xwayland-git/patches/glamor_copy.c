@@ -1384,11 +1384,11 @@ glamor_copy(DrawablePtr src, DrawablePtr dst, GCPtr gc,
             Pixel bitplane, void *closure)
 {
     /* CRITICAL FIX: Validate ALL inputs at public API boundary */
-    if (!src || !dst || !box || nbox <= 0)
+    if (unlikely(!src || !dst || !box || nbox <= 0))
         return;
 
     ScreenPtr screen = dst->pScreen;
-    if (!screen)
+    if (unlikely(!screen))
         return;
 
     glamor_screen_private *priv = glamor_get_screen_private(screen);
@@ -1411,7 +1411,7 @@ glamor_copy_area(DrawablePtr src, DrawablePtr dst, GCPtr gc,
                  int dstx, int dsty)
 {
     /* CRITICAL FIX: NULL check */
-    if (!src || !dst || !gc)
+    if (unlikely(!src || !dst || !gc))
         return NULL;
 
     return miDoCopy(src, dst, gc,
@@ -1425,7 +1425,7 @@ glamor_copy_plane(DrawablePtr src, DrawablePtr dst, GCPtr gc,
                   int dstx, int dsty, unsigned long bitplane)
 {
     /* CRITICAL FIX: NULL check */
-    if (!src || !dst || !gc)
+    if (unlikely(!src || !dst || !gc))
         return NULL;
 
     if ((bitplane & FbFullMask(glamor_drawable_effective_depth(src))) == 0) {
@@ -1442,11 +1442,11 @@ void
 glamor_copy_window(WindowPtr window, DDXPointRec old_origin, RegionPtr src_region)
 {
     /* CRITICAL FIX: NULL check */
-    if (!window || !src_region)
+    if (unlikely(!window || !src_region))
         return;
 
     PixmapPtr pixmap = glamor_get_drawable_pixmap(&window->drawable);
-    if (!pixmap)
+    if (unlikely(!pixmap))
         return;
 
     DrawablePtr drawable = &pixmap->drawable;
