@@ -132,10 +132,39 @@ struct sched_ctx {
  * Instructions will only be moved if the register pressure won't exceed a certain bound.
  */
 
+/* Micro-opt: specialized move for single element. */
+template <typename It>
+static inline void
+move_one(It begin_it, size_t idx, size_t before)
+{
+   if (idx < before) {
+      auto first = std::next(begin_it, idx);
+      auto last  = std::next(begin_it, before - 1);
+      auto tmp   = std::move(*first);
+      std::move(std::next(first), std::next(first, (before - idx)), first);
+      *last = std::move(tmp);
+   } else if (idx > before) {
+      auto first = std::next(begin_it, before);
+      auto pos   = std::next(begin_it, idx);
+      auto tmp   = std::move(*pos);
+      std::move_backward(first, pos, std::next(pos));
+      *first = std::move(tmp);
+   }
+}
+
 template <typename T>
 void
 move_element(T begin_it, size_t idx, size_t before, int num = 1)
 {
+   if (idx == before || num <= 0) {
+      return;
+   }
+
+   if (num == 1) {
+      move_one(begin_it, idx, before);
+      return;
+   }
+
    if (idx < before) {
       auto begin = std::next(begin_it, idx);
       auto end = std::next(begin_it, before);
@@ -398,11 +427,12 @@ MoveState::upwards_update_insert_idx(UpwardsCursor& cursor)
    cursor.insert_demand = block->instructions[cursor.insert_idx - 1]->register_demand - temp;
 }
 
-/* Helper: compute an approximate VGPR headroom margin at a scheduling point. */
+/* Helper: compute an approximate VGPR headroom margin at a scheduling point.
+ * Returns non-negative margin (in VGPRs) relative to the current pressure cap.
+ */
 static inline int
 vgpr_headroom(const MoveState& mv, const RegisterDemand& demand)
 {
-   /* Assumption: RegisterDemand components are non-negative integers. */
    int margin = mv.max_registers.vgpr - demand.vgpr;
    return margin > 0 ? margin : 0;
 }
@@ -500,6 +530,36 @@ is_reorderable(const Instruction* instr)
           instr->opcode != aco_opcode::s_sleep && instr->opcode != aco_opcode::s_trap &&
           instr->opcode != aco_opcode::p_call && instr->opcode != aco_opcode::p_logical_start &&
           instr->opcode != aco_opcode::p_logical_end;
+}
+
+/* Strict ALU no-hazard fast-path:
+ * - not VMEM/SMEM/FLAT/DS
+ * - not EXPORT
+ * - not a barrier
+ * - not using/writing EXEC
+ */
+static inline bool
+writes_exec_instr(const Instruction* instr)
+{
+   for (const Definition& def : instr->definitions) {
+      if (def.isFixed() && def.physReg() == exec)
+         return true;
+   }
+   return false;
+}
+
+static inline bool
+is_alu_nohazard_fast(const Instruction* instr)
+{
+   if (instr->isVMEM() || instr->isFlatLike() || instr->isSMEM() ||
+       instr->accessesLDS() || instr->isEXP() ||
+       instr->opcode == aco_opcode::p_barrier)
+      return false;
+
+   if (needs_exec_mask(instr) || writes_exec_instr(instr))
+      return false;
+
+   return true;
 }
 
 struct memory_event_set {
@@ -629,11 +689,13 @@ perform_hazard_query(hazard_query* query, Instruction* instr, bool upwards)
     */
    if (upwards) {
       if (instr->opcode == aco_opcode::p_pops_gfx9_add_exiting_wave_id ||
-          is_wait_export_ready(query->gfx_level, instr))
+          is_wait_export_ready(query->gfx_level, instr)) {
          return hazard_fail_unreorderable;
+      }
    } else {
-      if (instr->opcode == aco_opcode::p_pops_gfx9_ordered_section_done)
+      if (instr->opcode == aco_opcode::p_pops_gfx9_ordered_section_done) {
          return hazard_fail_unreorderable;
+      }
    }
 
    if (query->uses_exec || query->writes_exec) {
@@ -752,8 +814,9 @@ schedule_SMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
 {
    assert(idx != 0);
 
-   /* don't move s_memtime/s_memrealtime or sendmsg rtn */
-   if (current->opcode == aco_opcode::s_memtime || current->opcode == aco_opcode::s_memrealtime ||
+   /* don't move s_memtime/s_memrealtime */
+   if (current->opcode == aco_opcode::s_memtime ||
+       current->opcode == aco_opcode::s_memrealtime ||
        current->opcode == aco_opcode::s_sendmsg_rtn_b32 ||
        current->opcode == aco_opcode::s_sendmsg_rtn_b64) {
       return;
@@ -767,10 +830,11 @@ schedule_SMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
    DownwardsCursor cursor = ctx.mv.downwards_init(idx, false, false);
 
    /* Adaptive windowing for GFX9 (Vega): widen only with safe VGPR headroom.
-    * Keep it conservative to avoid inflating peak pressure and hurting occupancy.
+    * Cache margin calculation to avoid redundant arithmetic.
     */
    int window_size = SMEM_WINDOW_SIZE;
    int max_moves = SMEM_MAX_MOVES;
+
    if (ctx.gfx_level <= GFX9) {
       const int margin = vgpr_headroom(ctx.mv, cursor.insert_demand);
       if (margin >= 24) {
@@ -788,7 +852,8 @@ schedule_SMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
 
    int16_t k = 0;
 
-   for (int candidate_idx = idx - 1; k < max_moves && candidate_idx > (int)idx - window_size;
+   for (int candidate_idx = idx - 1;
+        k < max_moves && candidate_idx > (int)idx - window_size;
         candidate_idx--) {
       assert(candidate_idx >= 0);
       assert(candidate_idx == cursor.source_idx);
@@ -801,28 +866,33 @@ schedule_SMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
          break;
       }
 
-      /* break when encountering another MEM instruction, or unreorderable */
+      /* break when encountering another MEM instruction, logical_start or barriers */
       if (!is_reorderable(candidate.get())) {
          break;
       }
 
-      /* only move VMEM instructions below descriptor loads. be more aggressive at higher num_waves
-       * to help create more vmem clauses */
+      /* only move VMEM instructions below descriptor loads. be more aggressive at higher
+       * num_waves to help create more vmem clauses */
       if ((candidate->isVMEM() || candidate->isFlatLike()) &&
           (cursor.insert_idx - cursor.source_idx > (ctx.occupancy_factor * 4) ||
            (!current->operands.empty() && current->operands[0].size() == 4))) {
          break;
       }
 
-      /* don't move descriptor loads below buffer loads (guard operand access) */
-      if (candidate->isSMEM() && !candidate->operands.empty() && !current->operands.empty() &&
-          current->operands[0].size() == 4 && candidate->operands[0].size() == 2) {
+      /* don't move descriptor loads below buffer loads */
+      if (candidate->isSMEM() && !candidate->operands.empty() &&
+          !current->operands.empty() && current->operands[0].size() == 4 &&
+          candidate->operands[0].size() == 2) {
          break;
       }
 
       bool can_move_down = true;
 
-      HazardResult haz = perform_hazard_query(&hq, candidate.get(), false);
+      HazardResult haz = hazard_success;
+      if (!is_alu_nohazard_fast(candidate.get())) {
+         haz = perform_hazard_query(&hq, candidate.get(), false);
+      }
+
       if (haz == hazard_fail_reorder_ds || haz == hazard_fail_spill ||
           haz == hazard_fail_reorder_sendmsg || haz == hazard_fail_barrier ||
           haz == hazard_fail_export) {
@@ -859,7 +929,8 @@ schedule_SMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
 
    bool found_dependency = false;
    /* second, check if we have instructions after current to move up */
-   for (int candidate_idx = idx + 1; k < max_moves && candidate_idx < (int)idx + window_size;
+   for (int candidate_idx = idx + 1;
+        k < max_moves && candidate_idx < (int)idx + window_size;
         candidate_idx++) {
       assert(candidate_idx == up_cursor.source_idx);
       assert(candidate_idx < (int)block->instructions.size());
@@ -877,7 +948,10 @@ schedule_SMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
       }
 
       if (found_dependency) {
-         HazardResult haz = perform_hazard_query(&hq, candidate.get(), true);
+         HazardResult haz = hazard_success;
+         if (!is_alu_nohazard_fast(candidate.get())) {
+            haz = perform_hazard_query(&hq, candidate.get(), true);
+         }
          if (haz == hazard_fail_reorder_ds || haz == hazard_fail_spill ||
              haz == hazard_fail_reorder_sendmsg || haz == hazard_fail_barrier ||
              haz == hazard_fail_export) {
@@ -928,6 +1002,11 @@ void
 schedule_VMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
 {
    assert(idx != 0);
+   int window_size = VMEM_WINDOW_SIZE;
+   int max_moves = VMEM_MAX_MOVES;
+   int clause_max_grab_dist = VMEM_CLAUSE_MAX_GRAB_DIST;
+   bool only_clauses = false;
+   int16_t k = 0;
 
    /* first, check if we have instructions before current to move down */
    hazard_query indep_hq;
@@ -938,54 +1017,51 @@ schedule_VMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
 
    DownwardsCursor cursor = ctx.mv.downwards_init(idx, true, true);
 
-   /* Adaptive knobs for GFX9: widen windows and clause grabs only with headroom. */
-   int window_size = VMEM_WINDOW_SIZE;
-   int max_moves = VMEM_MAX_MOVES;
-   int clause_max_grab_dist = VMEM_CLAUSE_MAX_GRAB_DIST;
+   /* Adaptive knobs for GFX9: widen windows and clause grabs only with headroom.
+    * Cache margin calculation to avoid redundant arithmetic.
+    */
    if (ctx.gfx_level <= GFX9) {
       const int margin = vgpr_headroom(ctx.mv, cursor.insert_demand);
       if (margin >= 24) {
-         window_size += window_size / 4;    /* +25% */
-         max_moves   += max_moves / 8;      /* +12.5% */
-         int extra = std::min<int>(4 + margin / 8, int(ctx.occupancy_factor) * 2);
+         window_size += window_size / 4;            /* +25% */
+         max_moves   += max_moves / 8;              /* +12.5% */
+         const int extra = std::min<int>(4 + margin / 8, int(ctx.occupancy_factor) * 2);
          clause_max_grab_dist += extra;
       } else if (margin >= 16) {
-         window_size += window_size / 6;    /* ~+16.6% */
-         max_moves   += max_moves / 10;     /* +10% */
-         int extra = std::min<int>(2 + margin / 12, int(ctx.occupancy_factor));
+         window_size += window_size / 6;            /* ~+16.6% */
+         max_moves   += max_moves / 10;             /* +10% */
+         const int extra = std::min<int>(2 + margin / 12, int(ctx.occupancy_factor));
          clause_max_grab_dist += extra;
       }
    }
 
    if (window_size <= 0 || max_moves <= 0) {
-   /* Nothing to do if adaptive knobs collapsed the window. */
       return;
    }
 
-   bool only_clauses = false;
-   int16_t k = 0;
-
-   for (int candidate_idx = idx - 1; k < max_moves && candidate_idx > (int)idx - window_size;
+   for (int candidate_idx = idx - 1;
+        k < max_moves && candidate_idx > (int)idx - window_size;
         candidate_idx--) {
       assert(candidate_idx == cursor.source_idx);
       assert(candidate_idx >= 0);
       aco_ptr<Instruction>& candidate = block->instructions[candidate_idx];
       bool is_vmem = candidate->isVMEM() || candidate->isFlatLike();
 
-      /* Break when encountering another VMEM instruction, unreorderable, or barriers. */
+      /* Break when encountering another VMEM instruction, logical_start or barriers. */
       if (!is_reorderable(candidate.get())) {
          break;
       }
 
       if (should_form_clause(current, candidate.get())) {
-         /* We can't easily tell how much this will decrease the def-to-use distances,
-          * so just use how far it will be moved as a heuristic. */
+         /* We can't easily tell how much this will decrease the def-to-use
+          * distances, so just use how far it will be moved as a heuristic. */
          int grab_dist = cursor.insert_idx_clause - candidate_idx;
          if (grab_dist >= clause_max_grab_dist + k) {
             break;
          }
 
-         if (perform_hazard_query(&clause_hq, candidate.get(), false) == hazard_success) {
+         HazardResult haz = perform_hazard_query(&clause_hq, candidate.get(), false);
+         if (haz == hazard_success) {
             ctx.mv.downwards_move_clause(cursor);
          }
 
@@ -1005,7 +1081,10 @@ schedule_VMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
       /* If current depends on candidate, add additional dependencies and continue. */
       bool can_move_down = !only_clauses && (!is_vmem || candidate->definitions.empty());
 
-      HazardResult haz = perform_hazard_query(&indep_hq, candidate.get(), false);
+      HazardResult haz = hazard_success;
+      if (!is_alu_nohazard_fast(candidate.get())) {
+         haz = perform_hazard_query(&indep_hq, candidate.get(), false);
+      }
       if (haz == hazard_fail_reorder_ds || haz == hazard_fail_spill ||
           haz == hazard_fail_reorder_sendmsg || haz == hazard_fail_barrier ||
           haz == hazard_fail_export) {
@@ -1046,7 +1125,8 @@ schedule_VMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
 
    bool found_dependency = false;
    /* second, check if we have instructions after current to move up */
-   for (int candidate_idx = idx + 1; k < max_moves && candidate_idx < (int)idx + window_size;
+   for (int candidate_idx = idx + 1;
+        k < max_moves && candidate_idx < (int)idx + window_size;
         candidate_idx++) {
       assert(candidate_idx == up_cursor.source_idx);
       assert(candidate_idx < (int)block->instructions.size());
@@ -1060,7 +1140,10 @@ schedule_VMEM(sched_ctx& ctx, Block* block, Instruction* current, int idx)
       /* check if candidate depends on current */
       bool is_dependency = false;
       if (found_dependency) {
-         HazardResult haz = perform_hazard_query(&indep_hq, candidate.get(), true);
+         HazardResult haz = hazard_success;
+         if (!is_alu_nohazard_fast(candidate.get())) {
+            haz = perform_hazard_query(&indep_hq, candidate.get(), true);
+         }
          if (haz == hazard_fail_reorder_ds || haz == hazard_fail_spill ||
              haz == hazard_fail_reorder_vmem_smem || haz == hazard_fail_reorder_sendmsg ||
              haz == hazard_fail_barrier || haz == hazard_fail_export) {
@@ -1135,8 +1218,12 @@ schedule_LDS(sched_ctx& ctx, Block* block, Instruction* current, int idx)
          continue;
       }
 
-      if (perform_hazard_query(&hq, candidate.get(), false) != hazard_success ||
-          ctx.mv.downwards_move(cursor) != move_success)
+      HazardResult haz = hazard_success;
+      if (!is_alu_nohazard_fast(candidate.get())) {
+         haz = perform_hazard_query(&hq, candidate.get(), false);
+      }
+
+      if (haz != hazard_success || ctx.mv.downwards_move(cursor) != move_success)
          break;
 
       k++;
@@ -1173,7 +1260,10 @@ schedule_LDS(sched_ctx& ctx, Block* block, Instruction* current, int idx)
       if (!is_reorderable(candidate.get()) || is_mem)
          break;
 
-      HazardResult haz = perform_hazard_query(&hq, candidate.get(), true);
+      HazardResult haz = hazard_success;
+      if (!is_alu_nohazard_fast(candidate.get())) {
+         haz = perform_hazard_query(&hq, candidate.get(), true);
+      }
       if (haz == hazard_fail_exec || haz == hazard_fail_unreorderable)
          break;
 
@@ -1238,9 +1328,8 @@ schedule_VMEM_store(sched_ctx& ctx, Block* block, Instruction* current, int idx)
    int max_distance = ctx.last_VMEM_store_idx + VMEM_STORE_CLAUSE_MAX_GRAB_DIST;
    ctx.last_VMEM_store_idx = idx;
 
-   if (max_distance < idx) {
+   if (max_distance < idx)
       return;
-   }
 
    hazard_query hq;
    init_hazard_query(ctx, &hq);
@@ -1248,25 +1337,22 @@ schedule_VMEM_store(sched_ctx& ctx, Block* block, Instruction* current, int idx)
    DownwardsCursor cursor = ctx.mv.downwards_init(idx, true, true);
 
    for (int16_t k = 0; k < VMEM_STORE_CLAUSE_MAX_GRAB_DIST;) {
-      if (cursor.source_idx < 0) {
+      if (cursor.source_idx < 0)
          break;
-      }
 
       aco_ptr<Instruction>& candidate = block->instructions[cursor.source_idx];
-      if (!is_reorderable(candidate.get())) {
+      if (!is_reorderable(candidate.get()))
          break;
-      }
 
       if (should_form_clause(current, candidate.get())) {
-         if (perform_hazard_query(&hq, candidate.get(), false) == hazard_success) {
+         HazardResult haz = perform_hazard_query(&hq, candidate.get(), false);
+         if (haz == hazard_success)
             ctx.mv.downwards_move_clause(cursor);
-         }
          break;
       }
 
-      if (candidate->isVMEM() || candidate->isFlatLike()) {
+      if (candidate->isVMEM() || candidate->isFlatLike())
          break;
-      }
 
       add_to_hazard_query(&hq, candidate.get());
       ctx.mv.downwards_skip(cursor);
