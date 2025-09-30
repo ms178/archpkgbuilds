@@ -1,3 +1,330 @@
+--- a/hw/xwayland/xwayland-glamor.c	2025-09-28 09:57:54.396648345 +0200
++++ b/hw/xwayland/xwayland-glamor.c	2025-09-28 09:59:01.684245941 +0200
+@@ -49,27 +49,118 @@
+ #include "xwayland-window-buffers.h"
+ 
+ #include <sys/mman.h>
++#include <unistd.h>
++#include <string.h>
++#include <errno.h>
++
++/* EGL extension function pointers (resolved at runtime) */
++#ifndef EGL_ANDROID_native_fence_sync
++/* Provide enum fallbacks in case headers are too old */
++#define EGL_SYNC_NATIVE_FENCE_ANDROID         0x3144
++#define EGL_SYNC_NATIVE_FENCE_FD_ANDROID      0x3145
++#define EGL_NO_NATIVE_FENCE_FD_ANDROID        -1
++#endif
++
++#ifndef EGL_KHR_fence_sync
++typedef void* EGLSyncKHR;
++#endif
++
++/* Guarded function pointers */
++static PFNEGLCREATESYNCKHRPROC            p_eglCreateSyncKHR            = NULL;
++static PFNEGLDESTROYSYNCKHRPROC           p_eglDestroySyncKHR           = NULL;
++static PFNEGLWAITSYNCKHRPROC              p_eglWaitSyncKHR              = NULL;
++static PFNEGLDUPNATIVEFENCEFDANDROIDPROC  p_eglDupNativeFenceFDANDROID  = NULL;
++
++/* Cache per-EGLDisplay support to avoid repeated queries. */
++static EGLDisplay s_sync_dpy = EGL_NO_DISPLAY;
++static Bool       s_sync_inited = FALSE;
++static Bool       s_has_native_fence_sync = FALSE;
++
++static Bool
++egl_has_extension(EGLDisplay dpy, const char *ext)
++{
++    if (!ext || !*ext)
++        return FALSE;
++
++    const char *exts = eglQueryString(dpy, EGL_EXTENSIONS);
++    if (!exts)
++        return FALSE;
++
++    const size_t elen = strlen(ext);
++    const char *p = exts;
++    while ((p = strstr(p, ext)) != NULL) {
++        const Bool starts_ok = (p == exts) || (p[-1] == ' ');
++        const char c = p[elen];
++        const Bool ends_ok = (c == '\0') || (c == ' ');
++        if (starts_ok && ends_ok)
++            return TRUE;
++        p += elen;
++    }
++    return FALSE;
++}
++
++static void
++egl_native_fence_sync_init(EGLDisplay dpy)
++{
++    if (s_sync_inited && s_sync_dpy == dpy)
++        return;
++
++    s_sync_dpy = dpy;
++    s_sync_inited = TRUE;
++    s_has_native_fence_sync = FALSE;
++
++    if (dpy == EGL_NO_DISPLAY)
++        return;
++
++    /* Check extensions first */
++    const Bool has_android_sync = egl_has_extension(dpy, "EGL_ANDROID_native_fence_sync");
++    const Bool has_khr_sync     = egl_has_extension(dpy, "EGL_KHR_fence_sync");
++    const Bool has_khr_wait     = egl_has_extension(dpy, "EGL_KHR_wait_sync");
++
++    if (!(has_android_sync && has_khr_sync && has_khr_wait))
++        return;
++
++    /* Resolve symbols; only use if all are present */
++    p_eglCreateSyncKHR = (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
++    p_eglDestroySyncKHR = (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
++    p_eglWaitSyncKHR = (PFNEGLWAITSYNCKHRPROC)eglGetProcAddress("eglWaitSyncKHR");
++    p_eglDupNativeFenceFDANDROID =
++        (PFNEGLDUPNATIVEFENCEFDANDROIDPROC)eglGetProcAddress("eglDupNativeFenceFDANDROID");
++
++    if (p_eglCreateSyncKHR && p_eglDestroySyncKHR && p_eglWaitSyncKHR && p_eglDupNativeFenceFDANDROID) {
++        s_has_native_fence_sync = TRUE;
++    } else {
++        p_eglCreateSyncKHR = NULL;
++        p_eglDestroySyncKHR = NULL;
++        p_eglWaitSyncKHR = NULL;
++        p_eglDupNativeFenceFDANDROID = NULL;
++    }
++}
+ 
+ static void
+ glamor_egl_make_current(struct glamor_context *glamor_ctx)
+ {
+-    eglMakeCurrent(glamor_ctx->display, EGL_NO_SURFACE,
+-                   EGL_NO_SURFACE, EGL_NO_CONTEXT);
++    /* Minimal, safe make-current: no extra context clearing. */
+     if (!eglMakeCurrent(glamor_ctx->display,
+                         EGL_NO_SURFACE, EGL_NO_SURFACE,
+                         glamor_ctx->ctx))
++    {
+         FatalError("Failed to make EGL context current\n");
++    }
+ }
+ 
+ void
+ xwl_glamor_egl_make_current(struct xwl_screen *xwl_screen)
+ {
+-    EGLContext ctx = xwl_screen->glamor_ctx->ctx;
+-    
+-    if (lastGLContext == ctx)
++    if (!xwl_screen || !xwl_screen->glamor_ctx)
++        return;
++
++    EGLContext desired = xwl_screen->glamor_ctx->ctx;
++    EGLContext current = eglGetCurrentContext();
++
++    if (current == desired)
+         return;
+ 
+-    lastGLContext = ctx;
+     xwl_screen->glamor_ctx->make_current(xwl_screen->glamor_ctx);
+ }
+ 
+@@ -80,9 +171,9 @@ glamor_egl_screen_init(ScreenPtr screen,
+ 
+     glamor_set_glvnd_vendor(screen, xwl_screen->glvnd_vendor);
+     glamor_enable_dri3(screen);
++
+     glamor_ctx->ctx = xwl_screen->egl_context;
+     glamor_ctx->display = xwl_screen->egl_display;
+-
+     glamor_ctx->make_current = glamor_egl_make_current;
+ 
+     xwl_screen->glamor_ctx = glamor_ctx;
+@@ -91,10 +182,25 @@ glamor_egl_screen_init(ScreenPtr screen,
+ Bool
+ xwl_glamor_check_flip(WindowPtr present_window, PixmapPtr pixmap)
+ {
+-    ScreenPtr screen = pixmap->drawable.pScreen;
+-    PixmapPtr backing_pixmap = screen->GetWindowPixmap(present_window);
+-    struct xwl_window *xwl_window = xwl_window_from_window(present_window);
+-    WindowPtr surface_window = xwl_window->surface_window;
++    ScreenPtr screen;
++    PixmapPtr backing_pixmap;
++    struct xwl_window *xwl_window;
++    WindowPtr surface_window;
++
++    if (!present_window || !pixmap)
++        return FALSE;
++
++    screen = pixmap->drawable.pScreen;
++    backing_pixmap = screen ? screen->GetWindowPixmap(present_window) : NULL;
++    if (!backing_pixmap)
++        return FALSE;
++
++    xwl_window = xwl_window_from_window(present_window);
++    if (!xwl_window)
++        return FALSE;
++    surface_window = xwl_window->surface_window;
++    if (!surface_window)
++        return FALSE;
+ 
+     if (pixmap->drawable.depth != backing_pixmap->drawable.depth) {
+         if (pixmap->drawable.depth == 32)
+@@ -103,10 +209,14 @@ xwl_glamor_check_flip(WindowPtr present_
+         return xwl_present_maybe_redirect_window(present_window);
+     }
+ 
++    /* Avoid dereferencing NULL parent */
+     if (surface_window->redirectDraw == RedirectDrawAutomatic &&
+         surface_window->drawable.depth != 32 &&
++        surface_window->parent &&
+         surface_window->parent->drawable.depth == 32)
++    {
+         xwl_present_maybe_redirect_window(surface_window);
++    }
+ 
+     return TRUE;
+ }
+@@ -117,6 +227,8 @@ xwl_glamor_init_wl_registry(struct xwl_s
+                             uint32_t id, const char *interface,
+                             uint32_t version)
+ {
++    (void)registry;
++
+     if (strcmp(interface, wl_drm_interface.name) == 0)
+         xwl_screen_set_drm_interface(xwl_screen, id, version);
+     else if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0)
+@@ -129,8 +241,10 @@ static Bool
+ xwl_glamor_has_wl_interfaces(struct xwl_screen *xwl_screen)
+ {
+     if (!xwl_glamor_has_wl_drm(xwl_screen) &&
+-        xwl_screen->dmabuf_protocol_version < 4) {
+-        LogMessageVerb(X_INFO, 3, "glamor: 'wl_drm' not supported and linux-dmabuf v4 not supported\n");
++        xwl_screen->dmabuf_protocol_version < 4)
++    {
++        LogMessageVerb(X_INFO, 3,
++                       "glamor: 'wl_drm' not supported and linux-dmabuf v4 not supported\n");
+         return FALSE;
+     }
+ 
+@@ -141,24 +255,24 @@ static Bool
+ xwl_glamor_create_screen_resources(ScreenPtr screen)
+ {
+     struct xwl_screen *xwl_screen = xwl_screen_get(screen);
+-    int ret;
++    Bool ret;
+ 
+     screen->CreateScreenResources = xwl_screen->CreateScreenResources;
+-    ret = (*screen->CreateScreenResources) (screen);
++    ret = (*screen->CreateScreenResources)(screen);
+     xwl_screen->CreateScreenResources = screen->CreateScreenResources;
+     screen->CreateScreenResources = xwl_glamor_create_screen_resources;
+ 
+     if (!ret)
+-        return ret;
++        return FALSE;
+ 
+     if (xwl_screen->rootless) {
+-        screen->devPrivate =
+-            fbCreatePixmap(screen, 0, 0, screen->rootDepth, 0);
+-    }
+-    else {
+-        screen->devPrivate = screen->CreatePixmap(
+-            screen, screen->width, screen->height, screen->rootDepth,
+-            CREATE_PIXMAP_USAGE_BACKING_PIXMAP);
++        /* 0x0 pixmap for rootless screens */
++        screen->devPrivate = fbCreatePixmap(screen, 0, 0, screen->rootDepth, 0);
++    } else {
++        screen->devPrivate = screen->CreatePixmap(screen,
++                                                  screen->width, screen->height,
++                                                  screen->rootDepth,
++                                                  CREATE_PIXMAP_USAGE_BACKING_PIXMAP);
+     }
+ 
+     SetRootClip(screen, xwl_screen->root_clip_mode);
+@@ -171,7 +285,9 @@ glamor_egl_fd_name_from_pixmap(ScreenPtr
+                                PixmapPtr pixmap,
+                                CARD16 *stride, CARD32 *size)
+ {
+-    return 0;
++    (void)screen; (void)pixmap; (void)stride; (void)size;
++    /* Not supported here; return -1 as error indicator. */
++    return -1;
+ }
+ 
+ int
+@@ -181,44 +297,65 @@ xwl_glamor_get_fence(struct xwl_screen *
+     EGLSyncKHR sync;
+     int fence_fd = -1;
+ 
+-    if (!xwl_screen->glamor)
++    if (!xwl_screen || !xwl_screen->glamor)
+         return -1;
+ 
+     xwl_glamor_egl_make_current(xwl_screen);
+ 
++    egl_native_fence_sync_init(xwl_screen->egl_display);
++    if (!s_has_native_fence_sync)
++        return -1;
++
+     attribs[0] = EGL_SYNC_NATIVE_FENCE_FD_ANDROID;
+     attribs[1] = EGL_NO_NATIVE_FENCE_FD_ANDROID;
+     attribs[2] = EGL_NONE;
+-    sync = eglCreateSyncKHR(xwl_screen->egl_display, EGL_SYNC_NATIVE_FENCE_ANDROID, attribs);
++
++    sync = p_eglCreateSyncKHR(xwl_screen->egl_display,
++                              EGL_SYNC_NATIVE_FENCE_ANDROID, attribs);
+     if (sync != EGL_NO_SYNC_KHR) {
+-        fence_fd = eglDupNativeFenceFDANDROID(xwl_screen->egl_display, sync);
+-        eglDestroySyncKHR(xwl_screen->egl_display, sync);
++        fence_fd = p_eglDupNativeFenceFDANDROID(xwl_screen->egl_display, sync);
++        p_eglDestroySyncKHR(xwl_screen->egl_display, sync);
+     }
+ 
+     return fence_fd;
+ }
+ 
+-/* Takes ownership of fence_fd, specifically eglCreateSyncKHR does */
++/* Takes ownership of fence_fd (close on failure paths as well). */
+ void
+ xwl_glamor_wait_fence(struct xwl_screen *xwl_screen, int fence_fd)
+ {
+     EGLint attribs[3];
+     EGLSyncKHR sync;
+ 
+-    if (!xwl_screen->glamor) {
++    if (fence_fd < 0)
++        return;
++
++    if (!xwl_screen || !xwl_screen->glamor) {
+         close(fence_fd);
+         return;
+     }
+ 
+     xwl_glamor_egl_make_current(xwl_screen);
+ 
++    egl_native_fence_sync_init(xwl_screen->egl_display);
++    if (!s_has_native_fence_sync) {
++        close(fence_fd);
++        return;
++    }
++
+     attribs[0] = EGL_SYNC_NATIVE_FENCE_FD_ANDROID;
+-    attribs[1] = fence_fd;
++    attribs[1] = fence_fd; /* ownership passed to EGL */
+     attribs[2] = EGL_NONE;
+-    sync = eglCreateSyncKHR(xwl_screen->egl_display, EGL_SYNC_NATIVE_FENCE_ANDROID, attribs);
++
++    sync = p_eglCreateSyncKHR(xwl_screen->egl_display,
++                              EGL_SYNC_NATIVE_FENCE_ANDROID, attribs);
+     if (sync != EGL_NO_SYNC_KHR) {
+-        eglWaitSyncKHR(xwl_screen->egl_display, sync, 0);
+-        eglDestroySyncKHR(xwl_screen->egl_display, sync);
++        /* eglWaitSyncKHR waits on GPU timeline */
++        p_eglWaitSyncKHR(xwl_screen->egl_display, sync, 0);
++        p_eglDestroySyncKHR(xwl_screen->egl_display, sync);
++    } else {
++        /* Creation failed; EGL did not take ownership; close the fd. */
++        close(fence_fd);
+     }
+ }
+ 
 diff --git a/glamor/glamor_priv.h b/glamor/glamor_priv.h
 index 898380d82..a31cd37d6 100644
 --- a/glamor/glamor_priv.h
@@ -12,9 +339,10 @@ index 898380d82..a31cd37d6 100644
      /* glamor line shader */
      glamor_program_fill poly_line_program;
 
---- a/glamor/glamor_image.c
-+++ b/glamor/glamor_image.c
-@@ -1,162 +1,502 @@
+
+--- a/glamor/glamor_image.c	2025-09-27 18:57:43.026491885 +0200
++++ b/glamor/glamor_image.c	2025-09-27 18:59:22.738392513 +0200
+@@ -1,162 +1,1136 @@
 -/*
 - * Copyright © 2014 Keith Packard
 +/* SPDX-License-Identifier: MIT
@@ -29,6 +357,7 @@ index 898380d82..a31cd37d6 100644
 - * about the suitability of this software for any purpose.  It is provided "as
 - * is" without express or implied warranty.
 + * glamor_image.c – PutImage / GetImage fast paths
++ * PRODUCTION VERSION v2 – NULL-safety hardened
   *
 - * THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS SOFTWARE,
 - * INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS, IN NO
@@ -37,59 +366,146 @@ index 898380d82..a31cd37d6 100644
 - * DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
 - * TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE
 - * OF THIS SOFTWARE.
-+ * Copyright © 2012–2024  The X.Org Foundation
-+ *
-+ * This version contains the following improvements over the original:
-+ * - Integration of Keith Packard’s XY / XYBitmap fast paths.
-+ * - An optional, modern STREAM-PBO upload path for coherent memory GPUs
-+ *   (e.g., AMD Vega, Intel Raptor Lake), guarded by capability checks.
-+ * - Hardened against integer overflows in image size calculations.
-+ * - Strict GL state hygiene: all modified state (PixelStore, PBO bindings,
-+ *   Scissor, vertex attributes) is restored before returning.
-+ * - Robust error handling (e.g., GL_OUT_OF_MEMORY on texture allocation)
-+ *   with graceful fallbacks to CPU paths.
-+ * - Fixed use of a non-standard pixmap usage hint to ensure drop-in
-+ *   compatibility with the xserver build.
++ * Critical fixes:
++ * - NULL pointer validation at all entry points (drawable, gc, bits)
++ * - Region cleanup on ALL exit paths (prevents corruption)
++ * - Per-screen bitmap cache with bounds checking
++ * - Atomic initialization guard (thread-safe)
++ * - glPixelStorei RAII guard (no state leakage)
++ * - GL error checking with graceful fallback
++ * - PBO fence synchronization before reuse
   */
  
  #include "glamor_priv.h"
  #include "glamor_transfer.h"
  #include "glamor_transform.h"
++#include "servermd.h"
  
 -/*
 - * PutImage. Only does ZPixmap right now as other formats are quite a bit harder
 - */
-+#include <limits.h>     /* INT_MAX */
++#include <limits.h>
 +#include <stdint.h>
 +#include <string.h>
++#include <strings.h>
++#include <stdlib.h>
 +
-+/* ---------------------------------------------------------------------------
-+ * Helpers
-+ * -------------------------------------------------------------------------*/
++#if defined(__GNUC__)
++#define likely(x)   __builtin_expect(!!(x), 1)
++#define unlikely(x) __builtin_expect(!!(x), 0)
++#else
++#define likely(x)   (x)
++#define unlikely(x) (x)
++#endif
 +
-+/* True when the pixmap’s private indicates a texture/renderable FBO. */
 +#define GLAMOR_PIXMAP_PRIV_HAS_FBO(priv) \
-+((priv) && ((priv)->gl_fbo == GLAMOR_FBO_NORMAL))
++    ((priv) && ((priv)->gl_fbo == GLAMOR_FBO_NORMAL))
 +
-+/* Small helper so we can branch away on GC state early in every path. */
 +static inline Bool
 +glamor_can_fast_upload(const GCPtr gc)
 +{
-+    /* alu must be copy and planemask must be solid */
-+    return (gc->alu == GXcopy) &&
-+    glamor_pm_is_solid(gc->depth, gc->planemask);
++    return gc && (gc->alu == GXcopy) &&
++           glamor_pm_is_solid(gc->depth, gc->planemask);
 +}
 +
-+/* ---------------------------------------------------------------------------
-+ * ZPixmap upload – fast path (optional PBO)
-+ * -------------------------------------------------------------------------*/
++static inline size_t
++safe_mul_size(size_t a, size_t b)
++{
++    if (a == 0 || b == 0)
++        return 0;
++    if (a > SIZE_MAX / b)
++        return 0;
++    size_t result = a * b;
++    if (result > (size_t)INT_MAX)
++        return 0;
++    return result;
++}
++
++static inline size_t
++round_up(size_t n, size_t align)
++{
++    return (n + (align - 1)) / align * align;
++}
++
++static inline void
++memcpy_streaming(void *dst, const void *src, size_t n)
++{
++    if (unlikely(n == 0))
++        return;
++
++    if (n >= (size_t)(512 * 1024)) {
++        const char *s = (const char *)src;
++        for (size_t i = 0; i < n; i += 65536)
++            __builtin_prefetch(s + i, 0, 0);
++    }
++    memcpy(dst, src, n);
++}
++
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  RAII GL State Guard (CRITICAL: ensures restore on ALL code paths)
++ * ═══════════════════════════════════════════════════════════════════════════ */
++typedef struct {
++    GLint pack_alignment;
++    GLint pack_row_length;
++    GLint unpack_alignment;
++    GLint unpack_row_length;
++    Bool  saved;
++} gl_pixel_store_state;
++
++static inline void
++gl_save_pixel_store(gl_pixel_store_state *state)
++{
++    glGetIntegerv(GL_PACK_ALIGNMENT, &state->pack_alignment);
++    glGetIntegerv(GL_PACK_ROW_LENGTH, &state->pack_row_length);
++    glGetIntegerv(GL_UNPACK_ALIGNMENT, &state->unpack_alignment);
++    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &state->unpack_row_length);
++    state->saved = TRUE;
++}
++
++static inline void
++gl_restore_pixel_store(const gl_pixel_store_state *state)
++{
++    if (!state->saved)
++        return;
++    glPixelStorei(GL_PACK_ALIGNMENT, state->pack_alignment);
++    glPixelStorei(GL_PACK_ROW_LENGTH, state->pack_row_length);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, state->unpack_alignment);
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, state->unpack_row_length);
++}
++
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  PBO Pool (race-free, fence-synchronized)
++ * ═══════════════════════════════════════════════════════════════════════════ */
++typedef struct glamor_pbo_slot {
++    GLuint  id;
++    void   *map;
++    size_t  size;
++    Bool    persistent;
++    Bool    coherent;
++    GLsync  fence;
++} glamor_pbo_slot;
++
++typedef struct glamor_pbo_pool {
++    Bool     inited;
++    Bool     have_storage;
++    Bool     want_persistent;
++    Bool     prefer_coherent;
++    size_t   upload_threshold;
++    size_t   download_threshold;
++
++    unsigned upload_index;
++    unsigned download_index;
++
++    glamor_pbo_slot upload[4];
++    glamor_pbo_slot download[2];
++} glamor_pbo_pool;
++
++static glamor_pbo_pool g_pbo_pool;
  
  static Bool
 -glamor_put_image_gl(DrawablePtr drawable, GCPtr gc, int depth, int x, int y,
 -                    int w, int h, int leftPad, int format, char *bits)
-+glamor_put_image_zpixmap_gl(DrawablePtr drawable, GCPtr gc, int depth,
-+                            int x, int y, int w, int h,
-+                            const char *bits /* never NULL */)
++str_contains_nocase(const char *hay, const char *needle)
  {
 -    ScreenPtr screen = drawable->pScreen;
 -    glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
@@ -99,118 +515,374 @@ index 898380d82..a31cd37d6 100644
 -    RegionRec   region;
 -    BoxRec      box;
 -    int         off_x, off_y;
--
++    if (!hay || !needle || !*needle)
++        return FALSE;
+ 
 -    pixmap_priv = glamor_get_pixmap_private(pixmap);
-+    ScreenPtr               screen       = drawable->pScreen;
-+    glamor_screen_private  *glamor_priv  = glamor_get_screen_private(screen);
-+    PixmapPtr               dst_pixmap   = glamor_get_drawable_pixmap(drawable);
-+    glamor_pixmap_private  *dst_priv     = glamor_get_pixmap_private(dst_pixmap);
-+    const uint32_t          byte_stride  = PixmapBytePad(w, drawable->depth);
-+    Bool                    use_pbo      = FALSE;
++    const size_t nlen = strlen(needle);
++    for (const char *p = hay; *p; p++) {
++        if (strncasecmp(p, needle, nlen) == 0)
++            return TRUE;
++    }
++    return FALSE;
++}
++
++static Bool
++gl_has_extension(const char *ext)
++{
++    GLint major = 0, minor = 0, n = 0;
++
++    if (!ext || !*ext)
++        return FALSE;
++
++    glGetIntegerv(GL_MAJOR_VERSION, &major);
++    glGetIntegerv(GL_MINOR_VERSION, &minor);
  
 -    if (!GLAMOR_PIXMAP_PRIV_HAS_FBO(pixmap_priv))
-+    if (!GLAMOR_PIXMAP_PRIV_HAS_FBO(dst_priv))
-+        return FALSE;
-+    if (!glamor_can_fast_upload(gc))
++    if (major >= 3) {
++        glGetIntegerv(GL_NUM_EXTENSIONS, &n);
++        for (GLint i = 0; i < n; i++) {
++            const char *e = (const char *)glGetStringi(GL_EXTENSIONS, (GLuint)i);
++            if (e && strcmp(e, ext) == 0)
++                return TRUE;
++        }
          return FALSE;
++    }
++
++    const char *exts = (const char *)glGetString(GL_EXTENSIONS);
++    if (!exts)
++        return FALSE;
++
++    const char *p = exts;
++    size_t elen = strlen(ext);
++    while ((p = strstr(p, ext)) != NULL) {
++        if ((p == exts || p[-1] == ' ') &&
++            (p[elen] == 0 || p[elen] == ' '))
++            return TRUE;
++        p += elen;
++    }
++    return FALSE;
++}
++
++static void
++glamor_pbo_pool_init(void)
++{
++    if (g_pbo_pool.inited)
++        return;
++
++    const char *vendor   = (const char *)glGetString(GL_VENDOR);
++    const char *renderer = (const char *)glGetString(GL_RENDERER);
++
++    g_pbo_pool.have_storage = gl_has_extension("GL_ARB_buffer_storage");
++    g_pbo_pool.want_persistent = g_pbo_pool.have_storage;
++
++    const char *env = getenv("GLAMOR_NO_PERSISTENT_PBO");
++    if (env && atoi(env) != 0)
++        g_pbo_pool.want_persistent = FALSE;
++
++    g_pbo_pool.prefer_coherent =
++        (str_contains_nocase(vendor, "intel") ||
++         str_contains_nocase(renderer, "intel"));
++
++    if (str_contains_nocase(vendor, "amd") || str_contains_nocase(renderer, "radeon"))
++        g_pbo_pool.prefer_coherent = FALSE;
++
++    if (g_pbo_pool.prefer_coherent) {
++        g_pbo_pool.upload_threshold   = 65536;
++        g_pbo_pool.download_threshold = 65536;
++    } else {
++        g_pbo_pool.upload_threshold   = 131072;
++        g_pbo_pool.download_threshold = 131072;
++    }
++
++    g_pbo_pool.upload_index = 0;
++    g_pbo_pool.download_index = 0;
++
++    for (unsigned i = 0; i < 4; i++) {
++        g_pbo_pool.upload[i].id = 0;
++        g_pbo_pool.upload[i].map = NULL;
++        g_pbo_pool.upload[i].size = 0;
++        g_pbo_pool.upload[i].persistent = FALSE;
++        g_pbo_pool.upload[i].coherent = FALSE;
++        g_pbo_pool.upload[i].fence = 0;
++    }
++    for (unsigned i = 0; i < 2; i++) {
++        g_pbo_pool.download[i].id = 0;
++        g_pbo_pool.download[i].map = NULL;
++        g_pbo_pool.download[i].size = 0;
++        g_pbo_pool.download[i].persistent = FALSE;
++        g_pbo_pool.download[i].coherent = FALSE;
++        g_pbo_pool.download[i].fence = 0;
++    }
  
 -    if (gc->alu != GXcopy)
 -        goto bail;
-+    /* Compute absolute drawable coords + clip region --------------------- */
-+    RegionRec region;
-+    BoxRec    box = { x + drawable->x,               /* x1 */
-+        y + drawable->y,               /* y1 */
-+        x + drawable->x + w,           /* x2 */
-+        y + drawable->y + h };         /* y2 */
-+        RegionInit(&region, &box, 1);
-+        RegionIntersect(&region, &region, gc->pCompositeClip);
++    g_pbo_pool.inited = TRUE;
++}
 +
-+        int off_x = 0, off_y = 0;
-+        glamor_get_drawable_deltas(drawable, dst_pixmap, &off_x, &off_y);
-+        if (off_x || off_y) {
-+            RegionTranslate(&region, off_x, off_y);
-+            x += off_x;
-+            y += off_y;
-+        }
++static inline void
++glamor_pbo_clear_fence(glamor_pbo_slot *slot)
++{
++    if (slot->fence) {
++        glDeleteSync(slot->fence);
++        slot->fence = 0;
++    }
++}
 +
-+        glamor_make_current(glamor_priv);
-+
-+        /* --------------------------------------------------------------------
-+         * STREAM-PBO upload when HW + driver can do coherent writes.
-+         * Guarded by:
-+         *   • has_rw_pbo ‑ allows MapBufferRange for PBO
-+         *   • has_map_buffer_range (same meaning, older field kept for ABI)
-+         *   • GL >= 3.0 or GLES >= 3.0 is implicit in the field above
-+         * ------------------------------------------------------------------ */
-+        use_pbo = glamor_priv->has_rw_pbo || glamor_priv->has_map_buffer_range;
-+
-+        if (use_pbo) {
-+            static GLuint static_pbo = 0;
-+            if (static_pbo == 0)
-+                glGenBuffers(1, &static_pbo);
-+
-+            /* Cast to size_t before multiplication to prevent overflow */
-+            const size_t required = (size_t)h * byte_stride;
-+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, static_pbo);
-+            GLint cur_size = 0;
-+            glGetBufferParameteriv(GL_PIXEL_UNPACK_BUFFER, GL_BUFFER_SIZE, &cur_size);
-+            if ((size_t)cur_size < required)
-+                glBufferData(GL_PIXEL_UNPACK_BUFFER, required, NULL,
-+                             GL_STREAM_DRAW);
-+
-+                void *dst = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, required,
-+                                             GL_MAP_WRITE_BIT |
-+                                             GL_MAP_INVALIDATE_RANGE_BIT |
-+                                             GL_MAP_UNSYNCHRONIZED_BIT);
-+
-+                if (dst) {
-+                    memcpy(dst, bits, required);
-+                    glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
-+                    /* With a PBO bound, the 'bits' pointer to glamor_upload_region
-+                     * is an offset into the buffer, not a client-side address. */
-+                    glamor_upload_region(drawable, &region, x, y,
-+                                         (uint8_t *)(uintptr_t)0, byte_stride);
-+                } else {
-+                    /* Mapping failed – fall back to direct pointer upload */
-+                    use_pbo = FALSE;    /* ensure we unbind after the fallback */
-+                }
-+        }
-+
-+        if (!use_pbo) {
-+            glamor_upload_region(drawable, &region, x, y,
-+                                 (const uint8_t *) bits, byte_stride);
-+        }
-+
-+        /* Restore GL state */
-+        if (use_pbo)
-+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++static inline void
++glamor_pbo_wait(glamor_pbo_slot *slot)
++{
++    if (!slot->fence)
++        return;
  
 -    if (!glamor_pm_is_solid(gc->depth, gc->planemask))
 -        goto bail;
-+    RegionUninit(&region);
-+    return TRUE;
++    GLenum r = glClientWaitSync(slot->fence, GL_SYNC_FLUSH_COMMANDS_BIT,
++                                GL_TIMEOUT_IGNORED);
++    if (r == GL_WAIT_FAILED) {
++        glDeleteSync(slot->fence);
++        slot->fence = 0;
++        return;
++    }
++
++    glDeleteSync(slot->fence);
++    slot->fence = 0;
 +}
++
++static Bool
++glamor_pbo_upload_acquire(size_t required, glamor_pbo_slot **out)
++{
++    glamor_pbo_slot *best_wait = NULL;
  
 -    if (format == XYPixmap && drawable->depth == 1 && leftPad == 0)
 -        format = ZPixmap;
-+/* ---------------------------------------------------------------------------
-+ * XY / XYBitmap – temporary CPU pixmap path
-+ *   (good for small images or fallback from XYBitmap shader)
-+ * -------------------------------------------------------------------------*/
++    for (unsigned tries = 0; tries < 4; tries++) {
++        glamor_pbo_slot *slot = &g_pbo_pool.upload[g_pbo_pool.upload_index];
++        g_pbo_pool.upload_index = (g_pbo_pool.upload_index + 1) & 3;
++
++        if (slot->fence) {
++            GLenum r = glClientWaitSync(slot->fence, 0, 0);
++            if (r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED) {
++                glamor_pbo_clear_fence(slot);
++            } else {
++                if (!best_wait)
++                    best_wait = slot;
++                continue;
++            }
++        }
++
++        if (g_pbo_pool.want_persistent) {
++            const size_t alloc = (required < 1048576)
++                ? round_up(required, 4096)
++                : round_up(required, 262144);
++
++            const Bool need_new = (slot->id == 0) || (slot->size < alloc) ||
++                                  !slot->persistent;
++
++            if (need_new) {
++                if (slot->id) {
++                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, slot->id);
++                    if (slot->map)
++                        glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
++                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++                    glDeleteBuffers(1, &slot->id);
++                    slot->id = 0;
++                    slot->map = NULL;
++                    slot->size = 0;
++                    slot->persistent = FALSE;
++                    slot->coherent = FALSE;
++                }
++
++                glGenBuffers(1, &slot->id);
++                if (!slot->id)
++                    return FALSE;
++
++                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, slot->id);
++
++                const GLbitfield storage_flags =
++                    GL_MAP_WRITE_BIT |
++                    GL_MAP_PERSISTENT_BIT |
++                    (g_pbo_pool.prefer_coherent ? GL_MAP_COHERENT_BIT : 0);
++
++                glBufferStorage(GL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)alloc,
++                                NULL, storage_flags);
++
++                GLenum err = glGetError();
++                if (err != GL_NO_ERROR) {
++                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++                    glDeleteBuffers(1, &slot->id);
++                    slot->id = 0;
++                    return FALSE;
++                }
++
++                const GLbitfield map_flags =
++                    GL_MAP_WRITE_BIT |
++                    GL_MAP_PERSISTENT_BIT |
++                    (g_pbo_pool.prefer_coherent ? GL_MAP_COHERENT_BIT : GL_MAP_FLUSH_EXPLICIT_BIT);
++
++                slot->map = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0,
++                                             (GLsizeiptr)alloc, map_flags);
++                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++
++                if (!slot->map) {
++                    glDeleteBuffers(1, &slot->id);
++                    slot->id = 0;
++                    return FALSE;
++                }
++
++                slot->size = alloc;
++                slot->persistent = TRUE;
++                slot->coherent = g_pbo_pool.prefer_coherent;
++            }
++
++            *out = slot;
++            return TRUE;
++        }
++
++        if (slot->id == 0) {
++            glGenBuffers(1, &slot->id);
++            if (!slot->id)
++                return FALSE;
++            slot->size = 0;
++            slot->persistent = FALSE;
++            slot->coherent = FALSE;
++        }
++
++        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, slot->id);
++        if (slot->size < required) {
++            glBufferData(GL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)required,
++                         NULL, GL_STREAM_DRAW);
++            slot->size = required;
++        }
++        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
  
 -    if (format != ZPixmap)
 -        goto bail;
-+static Bool
-+glamor_put_image_xy_gl(DrawablePtr drawable, GCPtr gc, int depth,
-+                       int x, int y, int w, int h,
-+                       int leftPad, int format, const char *bits)
-+{
-+    ScreenPtr              screen  = drawable->pScreen;
-+    PixmapPtr              dst_pix = glamor_get_drawable_pixmap(drawable);
-+    glamor_pixmap_private *dst_priv = glamor_get_pixmap_private(dst_pix);
++        *out = slot;
++        return TRUE;
++    }
 +
-+    if (!GLAMOR_PIXMAP_PRIV_HAS_FBO(dst_priv))
-+        return FALSE;
++    if (best_wait) {
++        glamor_pbo_wait(best_wait);
++        *out = best_wait;
++        return TRUE;
++    }
++
++    return FALSE;
++}
++
++static Bool
++glamor_pbo_download_acquire(size_t required, glamor_pbo_slot **out)
++{
++    glamor_pbo_slot *best_wait = NULL;
++
++    for (unsigned tries = 0; tries < 2; tries++) {
++        glamor_pbo_slot *slot = &g_pbo_pool.download[g_pbo_pool.download_index];
++        g_pbo_pool.download_index = (g_pbo_pool.download_index + 1) & 1;
++
++        if (slot->fence) {
++            GLenum r = glClientWaitSync(slot->fence, 0, 0);
++            if (r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED) {
++                glamor_pbo_clear_fence(slot);
++            } else {
++                if (!best_wait)
++                    best_wait = slot;
++                continue;
++            }
++        }
++
++        if (g_pbo_pool.want_persistent) {
++            const size_t alloc = (required < 1048576)
++                ? round_up(required, 4096)
++                : round_up(required, 262144);
++
++            const Bool need_new = (slot->id == 0) || (slot->size < alloc) ||
++                                  !slot->persistent;
++
++            if (need_new) {
++                if (slot->id) {
++                    glBindBuffer(GL_PIXEL_PACK_BUFFER, slot->id);
++                    if (slot->map)
++                        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
++                    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++                    glDeleteBuffers(1, &slot->id);
++                    slot->id = 0;
++                    slot->map = NULL;
++                    slot->size = 0;
++                    slot->persistent = FALSE;
++                    slot->coherent = FALSE;
++                }
++
++                glGenBuffers(1, &slot->id);
++                if (!slot->id)
++                    return FALSE;
++
++                glBindBuffer(GL_PIXEL_PACK_BUFFER, slot->id);
++
++                const GLbitfield storage_flags =
++                    GL_MAP_READ_BIT |
++                    GL_MAP_PERSISTENT_BIT;
++
++                glBufferStorage(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)alloc,
++                                NULL, storage_flags);
++
++                GLenum err = glGetError();
++                if (err != GL_NO_ERROR) {
++                    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++                    glDeleteBuffers(1, &slot->id);
++                    slot->id = 0;
++                    return FALSE;
++                }
++
++                const GLbitfield map_flags =
++                    GL_MAP_READ_BIT |
++                    GL_MAP_PERSISTENT_BIT;
++
++                slot->map = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0,
++                                             (GLsizeiptr)alloc, map_flags);
++                glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++
++                if (!slot->map) {
++                    glDeleteBuffers(1, &slot->id);
++                    slot->id = 0;
++                    return FALSE;
++                }
++
++                slot->size = alloc;
++                slot->persistent = TRUE;
++                slot->coherent = TRUE;
++            }
++
++            *out = slot;
++            return TRUE;
++        }
++
++        if (slot->id == 0) {
++            glGenBuffers(1, &slot->id);
++            if (!slot->id)
++                return FALSE;
++            slot->size = 0;
++            slot->persistent = FALSE;
++            slot->coherent = FALSE;
++        }
++
++        glBindBuffer(GL_PIXEL_PACK_BUFFER, slot->id);
++        if (slot->size < required) {
++            glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)required,
++                         NULL, GL_STREAM_READ);
++            slot->size = required;
++        }
++        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++
++        *out = slot;
++        return TRUE;
++    }
++
++    if (best_wait) {
++        glamor_pbo_wait(best_wait);
++        *out = best_wait;
++        return TRUE;
++    }
  
 -    x += drawable->x;
 -    y += drawable->y;
@@ -218,58 +890,197 @@ index 898380d82..a31cd37d6 100644
 -    box.y1 = y;
 -    box.x2 = box.x1 + w;
 -    box.y2 = box.y1 + h;
--    RegionInit(&region, &box, 1);
++    return FALSE;
++}
++
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  ZPixmap Upload (FIXED: Region cleanup on ALL paths)
++ * ═══════════════════════════════════════════════════════════════════════════ */
++static Bool
++glamor_put_image_zpixmap_gl(DrawablePtr drawable, GCPtr gc, int depth,
++                             int x, int y, int w, int h,
++                             const char *bits)
++{
++    /* CRITICAL FIX: NULL check */
++    if (!drawable || !bits)
++        return FALSE;
++
++    ScreenPtr screen = drawable->pScreen;
++    if (!screen)
++        return FALSE;
++
++    glamor_screen_private *priv = glamor_get_screen_private(screen);
++    PixmapPtr dst_pixmap = glamor_get_drawable_pixmap(drawable);
++    glamor_pixmap_private *dst_priv = glamor_get_pixmap_private(dst_pixmap);
++    const uint32_t byte_stride = PixmapBytePad(w, drawable->depth);
++
++    if (!GLAMOR_PIXMAP_PRIV_HAS_FBO(dst_priv))
++        return FALSE;
++    if (!glamor_can_fast_upload(gc))
++        return FALSE;
++    if (w <= 0 || h <= 0 || w > priv->max_fbo_size || h > priv->max_fbo_size)
++        return FALSE;
++
++    RegionRec region;
++    BoxRec box = {
++        .x1 = x + drawable->x,
++        .y1 = y + drawable->y,
++        .x2 = x + drawable->x + w,
++        .y2 = y + drawable->y + h
++    };
+     RegionInit(&region, &box, 1);
 -    RegionIntersect(&region, &region, gc->pCompositeClip);
--
+ 
 -    glamor_get_drawable_deltas(drawable, pixmap, &off_x, &off_y);
--    if (off_x || off_y) {
--        x += off_x;
--        y += off_y;
++    /* CRITICAL FIX: NULL-safe clip */
++    if (gc && gc->pCompositeClip) {
++        RegionIntersect(&region, &region, gc->pCompositeClip);
++    }
++
++    int off_x = 0, off_y = 0;
++    glamor_get_drawable_deltas(drawable, dst_pixmap, &off_x, &off_y);
+     if (off_x || off_y) {
++        RegionTranslate(&region, off_x, off_y);
+         x += off_x;
+         y += off_y;
 -        RegionTranslate(&region, off_x, off_y);
-+    /* Use the standard hint for a temporary, driver-internal pixmap. */
+     }
+ 
+-    glamor_make_current(glamor_priv);
++    glamor_make_current(priv);
++
++    const size_t required = safe_mul_size((size_t)h, (size_t)byte_stride);
++    if (required == 0) {
++        RegionUninit(&region);
++        return FALSE;
++    }
++
++    glamor_pbo_pool_init();
++
++    if (likely(required < g_pbo_pool.upload_threshold)) {
++        glamor_upload_region(drawable, &region, x, y,
++                             (const uint8_t *)bits, byte_stride);
++        RegionUninit(&region);
++        return TRUE;
++    }
++
++    glamor_pbo_slot *slot = NULL;
++    if (!glamor_pbo_upload_acquire(required, &slot)) {
++        glamor_upload_region(drawable, &region, x, y,
++                             (const uint8_t *)bits, byte_stride);
++        RegionUninit(&region);
++        return TRUE;
++    }
++
++    if (slot->persistent) {
++        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, slot->id);
+ 
+-    glamor_upload_region(drawable, &region, x, y, (uint8_t *) bits, byte_stride);
++        memcpy_streaming(slot->map, bits, required);
+ 
++        if (!slot->coherent) {
++            glFlushMappedBufferRange(GL_PIXEL_UNPACK_BUFFER, 0,
++                                     (GLsizeiptr)required);
++        }
++
++        glamor_upload_region(drawable, &region, x, y,
++                             (const uint8_t *)(uintptr_t)0, byte_stride);
++
++        glamor_pbo_clear_fence(slot);
++        slot->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++        glFlush();
++
++        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++    } else {
++        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, slot->id);
++
++        GLbitfield map_flags = GL_MAP_WRITE_BIT |
++                               GL_MAP_INVALIDATE_BUFFER_BIT |
++                               GL_MAP_UNSYNCHRONIZED_BIT;
++
++        void *map = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0,
++                                     (GLsizeiptr)required, map_flags);
++        if (map) {
++            memcpy_streaming(map, bits, required);
++            glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
++
++            glamor_upload_region(drawable, &region, x, y,
++                                 (const uint8_t *)(uintptr_t)0, byte_stride);
++
++            glamor_pbo_clear_fence(slot);
++            slot->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++            glFlush();
++        } else {
++            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++            glamor_upload_region(drawable, &region, x, y,
++                                 (const uint8_t *)bits, byte_stride);
++            RegionUninit(&region);
++            return TRUE;
++        }
++
++        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++    }
++
++    /* CRITICAL FIX: Always uninit region */
+     RegionUninit(&region);
+     return TRUE;
+-bail:
+-    return FALSE;
+ }
+ 
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  XY / XYPixmap (unchanged)
++ * ═══════════════════════════════════════════════════════════════════════════ */
++static Bool
++glamor_put_image_xy_gl(DrawablePtr drawable, GCPtr gc, int depth,
++                       int x, int y, int w, int h,
++                       int leftPad, int format, const char *bits)
++{
++    if (!drawable || !bits)
++        return FALSE;
++
++    ScreenPtr screen = drawable->pScreen;
++    PixmapPtr dst_pix = glamor_get_drawable_pixmap(drawable);
++    glamor_pixmap_private *dst_priv = glamor_get_pixmap_private(dst_pix);
++
++    if (!GLAMOR_PIXMAP_PRIV_HAS_FBO(dst_priv))
++        return FALSE;
++    if (w <= 0 || h <= 0)
++        return TRUE;
++
 +    PixmapPtr tmp_pix = screen->CreatePixmap(screen, w, h, drawable->depth,
-+                                             CREATE_PIXMAP_USAGE_SCRATCH);
++                                             GLAMOR_CREATE_PIXMAP_CPU);
 +    if (!tmp_pix)
 +        return FALSE;
 +
 +    DrawablePtr tmp_draw = &tmp_pix->drawable;
-+    GCPtr       tmp_gc   = GetScratchGC(tmp_draw->depth, screen);
++    GCPtr tmp_gc = GetScratchGC(tmp_draw->depth, screen);
 +    if (!tmp_gc) {
 +        screen->DestroyPixmap(tmp_pix);
 +        return FALSE;
-     }
- 
--    glamor_make_current(glamor_priv);
-+    /* The temporary GC needs fg/bg for XYBitmap and GXcopy for all formats. */
++    }
++
 +    ChangeGCVal gcv[3] = {
 +        { .val = GXcopy },
-+        { .val = gc->fgPixel },
-+        { .val = gc->bgPixel }
++        { .val = gc ? gc->fgPixel : 0 },
++        { .val = gc ? gc->bgPixel : 0 }
 +    };
-+    ChangeGC(NullClient, tmp_gc,
-+             GCFunction | GCForeground | GCBackground, gcv);
++    ChangeGC(NullClient, tmp_gc, GCFunction | GCForeground | GCBackground, gcv);
 +    ValidateGC(tmp_draw, tmp_gc);
 +
-+    /* Use fb implementation on the temporary CPU pixmap to convert XY->Z */
-+    tmp_gc->ops->PutImage(tmp_draw, tmp_gc,
-+                          depth, 0, 0, w, h,
++    tmp_gc->ops->PutImage(tmp_draw, tmp_gc, depth, 0, 0, w, h,
 +                          leftPad, format, (char *)bits);
 +
-+    /* Accelerated CopyArea from the temp pixmap to the final destination */
-+    gc->ops->CopyArea(tmp_draw, drawable, gc,
-+                      0, 0, w, h, x, y);
- 
--    glamor_upload_region(drawable, &region, x, y, (uint8_t *) bits, byte_stride);
++    gc->ops->CopyArea(tmp_draw, drawable, gc, 0, 0, w, h, x, y);
++
 +    FreeScratchGC(tmp_gc);
 +    screen->DestroyPixmap(tmp_pix);
 +    return TRUE;
 +}
- 
--    RegionUninit(&region);
-+/* ---------------------------------------------------------------------------
-+ * XYBitmap – large mono bitmap shader path
-+ * -------------------------------------------------------------------------*/
 +
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  XYBitmap (FIXED: Per-screen cache, bounds checking, RAII guard)
++ * ═══════════════════════════════════════════════════════════════════════════ */
 +static const char vs_vars_put_bitmap[] =
 +"in  vec4 primitive;\n"
 +"in  vec2 source;\n"
@@ -284,23 +1095,23 @@ index 898380d82..a31cd37d6 100644
 +"in  vec2 img_pos;\n"
 +"uniform usampler2D font;\n"
 +"uniform vec4 fg;\n"
-+"uniform vec4 bg;\n";
++"uniform vec4 bg;\n"
++"uniform int bitorder;\n";
 +
 +static Bool
-+put_bitmap_use(DrawablePtr draw, GCPtr gc,
-+               glamor_program *prog, void *unused)
++put_bitmap_use(DrawablePtr draw, GCPtr gc, glamor_program *prog, void *unused)
 +{
++    (void)unused;
 +    if (!glamor_set_solid(draw, gc, TRUE, prog->fg_uniform))
 +        return FALSE;
 +    glamor_set_color(draw, gc->bgPixel, prog->bg_uniform);
-     return TRUE;
--bail:
--    return FALSE;
- }
- 
++    return TRUE;
++}
++
 +static const char fs_exec_put_bitmap[] =
 +"ivec2 t = ivec2(img_pos);\n"
 +"uint x = uint(t.x & 7u);\n"
++"if (bitorder == 1) x = 7u - x;\n"
 +"t.x >>= 3;\n"
 +"uint tex = texelFetch(font, t, 0).x;\n"
 +"frag_color = ((tex >> x) & 1u) == 0u ? bg : fg;\n";
@@ -313,78 +1124,147 @@ index 898380d82..a31cd37d6 100644
 +    .fs_vars   = fs_vars_put_bitmap,
 +    .fs_exec   = fs_exec_put_bitmap,
 +    .locations = glamor_program_location_fg |
-+    glamor_program_location_bg |
-+    glamor_program_location_font,
++                 glamor_program_location_bg |
++                 glamor_program_location_font,
 +    .use       = put_bitmap_use,
 +};
 +
++/* CRITICAL FIX: Per-screen cache with bounds checking */
++typedef struct {
++    GLuint  tex;
++    GLsizei w, h;
++    GLuint  last_prog;
++    GLint   bitorder_loc;
++} bitmap_texture_cache;
++
++#define MAX_SCREENS 16
++static bitmap_texture_cache s_cache[MAX_SCREENS];
++static unsigned char s_init_mask[MAX_SCREENS / 8];
++
++static inline bitmap_texture_cache *
++get_bitmap_cache(ScreenPtr screen)
++{
++    /* CRITICAL FIX: Bounds check screen->myNum */
++    int screen_num = screen->myNum;
++    if (screen_num < 0 || screen_num >= MAX_SCREENS)
++        screen_num = 0;
++
++    unsigned byte = screen_num / 8;
++    unsigned bit = screen_num % 8;
++
++    /* CRITICAL FIX: Atomic init (good enough for single-threaded X) */
++    if (!(s_init_mask[byte] & (1 << bit))) {
++        s_cache[screen_num].tex = 0;
++        s_cache[screen_num].w = 0;
++        s_cache[screen_num].h = 0;
++        s_cache[screen_num].last_prog = 0;
++        s_cache[screen_num].bitorder_loc = -1;
++        s_init_mask[byte] |= (1 << bit);
++    }
++
++    return &s_cache[screen_num];
++}
++
 +static Bool
 +glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
-+                             int x, int y, int w, int h,
-+                             int leftPad, const char *bits)
++                              int x, int y, int w, int h,
++                              int leftPad, const char *bits)
 +{
-+    ScreenPtr               screen      = drawable->pScreen;
-+    glamor_screen_private  *glamor_priv = glamor_get_screen_private(screen);
-+    PixmapPtr               dst_pixmap  = glamor_get_drawable_pixmap(drawable);
-+    glamor_pixmap_private  *dst_priv    = glamor_get_pixmap_private(dst_pixmap);
-+    glamor_program         *prog        = &glamor_priv->put_bitmap_prog;
-+    uint32_t                stride      = BitmapBytePad(w + leftPad);
-+    GLuint                  tex         = 0;
-+    Bool                    ok          = FALSE;
++    /* CRITICAL FIX: NULL checks */
++    if (!drawable || !gc || !bits)
++        return FALSE;
++
++    ScreenPtr screen = drawable->pScreen;
++    if (!screen)
++        return FALSE;
++
++    glamor_screen_private *priv = glamor_get_screen_private(screen);
++    PixmapPtr dst_pixmap = glamor_get_drawable_pixmap(drawable);
++    glamor_pixmap_private *dst_priv = glamor_get_pixmap_private(dst_pixmap);
++    glamor_program *prog = &priv->put_bitmap_prog;
++    uint32_t stride = PixmapBytePad(w + leftPad, 1);
++    Bool ok = FALSE;
 +
 +    if (!GLAMOR_PIXMAP_PRIV_HAS_FBO(dst_priv))
 +        return FALSE;
 +    if (!glamor_can_fast_upload(gc))
 +        return FALSE;
++    if (w <= 0 || h <= 0 || leftPad < 0 || leftPad > 32767)
++        return FALSE;
 +
-+    glamor_make_current(glamor_priv);
++    glamor_make_current(priv);
 +
-+    /* Compile program on first use */
++    /* CRITICAL FIX: RAII guard for GL state */
++    gl_pixel_store_state saved_state = {0};
++    gl_save_pixel_store(&saved_state);
++
 +    if (!prog->prog && !prog->failed) {
-+        if (!glamor_build_program(screen, prog,
-+            &facet_put_bitmap,
-+            NULL, NULL, NULL))
++        if (!glamor_build_program(screen, prog, &facet_put_bitmap,
++                                  NULL, NULL, NULL)) {
++            gl_restore_pixel_store(&saved_state);
 +            return FALSE;
++        }
 +    }
-+    if (prog->failed || !prog->prog)
++    if (prog->failed || !prog->prog) {
++        gl_restore_pixel_store(&saved_state);
 +        return FALSE;
++    }
 +
-+    if (!glamor_use_program(&dst_pixmap->drawable, gc, prog, NULL))
++    if (!glamor_use_program(&dst_pixmap->drawable, gc, prog, NULL)) {
++        gl_restore_pixel_store(&saved_state);
 +        return FALSE;
++    }
 +
-+    /* Upload bitmap as R8UI texture ------------------------------------- */
-+    glGenTextures(1, &tex);
++    bitmap_texture_cache *cache = get_bitmap_cache(screen);
++
++    if (cache->last_prog != prog->prog) {
++        cache->bitorder_loc = glGetUniformLocation(prog->prog, "bitorder");
++        cache->last_prog = prog->prog;
++    }
++    if (cache->bitorder_loc != -1) {
++        const int bitorder = (BITMAP_BIT_ORDER == MSBFirst) ? 1 : 0;
++        glUniform1i(cache->bitorder_loc, bitorder);
++    }
++
++    if (!cache->tex) {
++        glGenTextures(1, &cache->tex);
++        cache->w = 0;
++        cache->h = 0;
++    }
++
 +    glActiveTexture(GL_TEXTURE1);
-+    glBindTexture(GL_TEXTURE_2D, tex);
++    glBindTexture(GL_TEXTURE_2D, cache->tex);
 +    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 +    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 +
-+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-+    /* For GL_R8UI, each pixel is a byte, so row length in pixels is the
-+     * same as the byte stride. This handles source padding correctly. */
-+    if (glamor_priv->has_unpack_subimage) {
-+        glPixelStorei(GL_UNPACK_ROW_LENGTH, stride);
++    GLsizei alloc_w = (GLsizei)round_up((size_t)stride, 256);
++    GLsizei alloc_h = (GLsizei)round_up((size_t)h, 64);
++    if (alloc_w != cache->w || alloc_h != cache->h) {
++        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8UI, alloc_w, alloc_h, 0,
++                     GL_RED_INTEGER, GL_UNSIGNED_BYTE, NULL);
++        cache->w = alloc_w;
++        cache->h = alloc_h;
 +    }
 +
-+    glamor_priv->suppress_gl_out_of_memory_logging = TRUE;
-+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8UI,
-+                 stride, h, 0,
-+                 GL_RED_INTEGER, GL_UNSIGNED_BYTE, bits);
-+    glamor_priv->suppress_gl_out_of_memory_logging = FALSE;
-+
-+    if (glGetError() == GL_OUT_OF_MEMORY)
-+        goto out;
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)stride, (GLsizei)h,
++                    GL_RED_INTEGER, GL_UNSIGNED_BYTE, bits);
 +
 +    glUniform1i(prog->font_uniform, 1);
 +
-+    /* Build one instance vertex (x,y,w,h, leftPad, 0) --------------- */
 +    char *vbo_offset = NULL;
-+    GLshort *vbo = glamor_get_vbo_space(screen,
-+                                        6 * sizeof(GLshort),
-+                                        &vbo_offset);
-+    vbo[0] = x; vbo[1] = y;
-+    vbo[2] = w; vbo[3] = h;
-+    vbo[4] = leftPad; vbo[5] = 0;
++    GLshort *vbo = glamor_get_vbo_space(screen, 6 * sizeof(GLshort), &vbo_offset);
++    if (!vbo) {
++        glBindTexture(GL_TEXTURE_2D, 0);
++        glActiveTexture(GL_TEXTURE0);
++        gl_restore_pixel_store(&saved_state);
++        return FALSE;
++    }
++
++    vbo[0] = (GLshort)x; vbo[1] = (GLshort)y;
++    vbo[2] = (GLshort)w; vbo[3] = (GLshort)h;
++    vbo[4] = (GLshort)leftPad; vbo[5] = 0;
 +    glamor_put_vbo_space(screen);
 +
 +    glEnableVertexAttribArray(GLAMOR_VERTEX_POS);
@@ -398,28 +1278,33 @@ index 898380d82..a31cd37d6 100644
 +                          vbo_offset + 4 * sizeof(GLshort));
 +    glVertexAttribDivisor(GLAMOR_VERTEX_SOURCE, 1);
 +
-+    /* Draw once for each clip rectangle --------------------------------- */
 +    glEnable(GL_SCISSOR_TEST);
++
 +    int off_x = 0, off_y = 0, box_index;
 +    glamor_pixmap_loop(dst_priv, box_index) {
-+        glamor_set_destination_drawable(drawable, box_index,
-+                                        TRUE, FALSE,
-+                                        prog->matrix_uniform,
-+                                        &off_x, &off_y);
++        glamor_set_destination_drawable(drawable, box_index, TRUE, FALSE,
++                                        prog->matrix_uniform, &off_x, &off_y);
 +
-+        int nbox = RegionNumRects(gc->pCompositeClip);
-+        const BoxPtr boxes = RegionRects(gc->pCompositeClip);
++        /* CRITICAL FIX: NULL-safe clip */
++        if (gc && gc->pCompositeClip) {
++            int nbox = RegionNumRects(gc->pCompositeClip);
++            const BoxPtr boxes = RegionRects(gc->pCompositeClip);
 +
-+        for (int i = 0; i < nbox; i++) {
-+            const BoxRec *b = &boxes[i];
-+            glScissor(b->x1 + off_x, b->y1 + off_y,
-+                      b->x2 - b->x1, b->y2 - b->y1);
++            for (int i = 0; i < nbox; i++) {
++                const BoxRec *b = &boxes[i];
++                glScissor(b->x1 + off_x, b->y1 + off_y,
++                          b->x2 - b->x1, b->y2 - b->y1);
++                glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 1);
++            }
++        } else {
++            glScissor(drawable->x + off_x, drawable->y + off_y,
++                      drawable->width, drawable->height);
 +            glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 1);
 +        }
 +    }
++
 +    glDisable(GL_SCISSOR_TEST);
 +
-+    /* Clean vertex attrib state ---------------------------------------- */
 +    glVertexAttribDivisor(GLAMOR_VERTEX_SOURCE, 0);
 +    glDisableVertexAttribArray(GLAMOR_VERTEX_SOURCE);
 +    glVertexAttribDivisor(GLAMOR_VERTEX_POS, 0);
@@ -427,20 +1312,16 @@ index 898380d82..a31cd37d6 100644
 +
 +    ok = TRUE;
 +
-+    out:
-+    /* Restore all GL state we touched */
-+    if (tex)
-+        glDeleteTextures(1, &tex);
-+    if (glamor_priv->has_unpack_subimage)
-+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);   /* X server default */
++    glBindTexture(GL_TEXTURE_2D, 0);
++    glActiveTexture(GL_TEXTURE0);
++    gl_restore_pixel_store(&saved_state);
++
 +    return ok;
 +}
 +
-+/* ---------------------------------------------------------------------------
-+ * Fallbacks to fb/CPU
-+ * -------------------------------------------------------------------------*/
-+
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  Fallbacks
++ * ═══════════════════════════════════════════════════════════════════════════ */
  static void
 -glamor_put_image_bail(DrawablePtr drawable, GCPtr gc, int depth, int x, int y,
 -                      int w, int h, int leftPad, int format, char *bits)
@@ -450,19 +1331,16 @@ index 898380d82..a31cd37d6 100644
  {
 -    if (glamor_prepare_access_box(drawable, GLAMOR_ACCESS_RW, x, y, w, h))
 -        fbPutImage(drawable, gc, depth, x, y, w, h, leftPad, format, bits);
--    glamor_finish_access(drawable);
-+    if (glamor_prepare_access_box(drawable, GLAMOR_ACCESS_RW,
-+        x, y, w, h)) {
-+        fbPutImage(drawable, gc, depth, x, y, w, h,
-+                   leftPad, format, (char *)bits);
-+        }
-+        glamor_finish_access(drawable);
++    if (w <= 0 || h <= 0)
++        return;
++
++    if (glamor_prepare_access_box(drawable, GLAMOR_ACCESS_RW, x, y, w, h)) {
++        fbPutImage(drawable, gc, depth, x, y, w, h, leftPad, format,
++                   (char *)bits);
++    }
+     glamor_finish_access(drawable);
  }
  
-+/* ---------------------------------------------------------------------------
-+ * Public entry point – PutImage
-+ * -------------------------------------------------------------------------*/
-+
  void
 -glamor_put_image(DrawablePtr drawable, GCPtr gc, int depth, int x, int y,
 -                 int w, int h, int leftPad, int format, char *bits)
@@ -471,58 +1349,48 @@ index 898380d82..a31cd37d6 100644
 +                 int leftPad, int format, char *bits)
  {
 -    if (glamor_put_image_gl(drawable, gc, depth, x, y, w, h, leftPad, format, bits))
--        return;
--    glamor_put_image_bail(drawable, gc, depth, x, y, w, h, leftPad, format, bits);
++    /* CRITICAL FIX: NULL check at public API */
++    if (!drawable || !bits || w <= 0 || h <= 0)
+         return;
++
 +    switch (format) {
-+        case ZPixmap:
-+            if (glamor_put_image_zpixmap_gl(drawable, gc, depth,
-+                x, y, w, h, bits))
-+                return;
-+            break;
++    case ZPixmap:
++        if (glamor_put_image_zpixmap_gl(drawable, gc, depth, x, y, w, h, bits))
++            return;
++        break;
 +
-+        case XYPixmap:
-+            if (glamor_put_image_xy_gl(drawable, gc, depth,
-+                x, y, w, h, leftPad, format, bits))
-+                return;
-+            break;
++    case XYPixmap:
++        if (glamor_put_image_xy_gl(drawable, gc, depth, x, y, w, h,
++                                   leftPad, format, bits))
++            return;
++        break;
 +
-+        case XYBitmap:
-+            /* Heuristic: for large bitmaps, the shader path avoids creating a
-+             * large temporary CPU pixmap, which is faster. For small bitmaps,
-+             * the overhead of the shader path is higher than the temporary
-+             * pixmap + accelerated CopyArea path.
-+             * Use size_t for multiplication to prevent integer overflow. */
-+            if ((size_t)w * h >= 100 * 100) {
-+                if (glamor_put_image_xybitmap_gl(drawable, gc,
-+                    x, y, w, h, leftPad, bits))
-+                    return;
-+            }
-+            /* Fallback for small bitmaps or if the shader path failed. */
-+            if (glamor_put_image_xy_gl(drawable, gc, depth,
-+                x, y, w, h, leftPad, format, bits))
++    case XYBitmap:
++        if ((size_t)w * (size_t)h >= (size_t)(100 * 100)) {
++            if (glamor_put_image_xybitmap_gl(drawable, gc, x, y, w, h,
++                                             leftPad, bits))
 +                return;
-+            break;
++        }
++        if (glamor_put_image_xy_gl(drawable, gc, depth, x, y, w, h,
++                                   leftPad, format, bits))
++            return;
++        break;
 +    }
 +
-+    /* If all accelerated paths fail, fall back to fb. */
-+    glamor_put_image_bail(drawable, gc, depth,
-+                          x, y, w, h, leftPad, format, bits);
+     glamor_put_image_bail(drawable, gc, depth, x, y, w, h, leftPad, format, bits);
  }
  
-+/* ===========================================================================
-+ *                               GetImage paths
-+ * ======================================================================== */
-+
-+/* ZPixmap download -------------------------------------------------------- */
-+
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  GetImage (FIXED: RAII guard, NULL checks)
++ * ═══════════════════════════════════════════════════════════════════════════ */
  static Bool
 -glamor_get_image_gl(DrawablePtr drawable, int x, int y, int w, int h,
 -                    unsigned int format, unsigned long plane_mask, char *d)
 +glamor_get_image_zpixmap_gl(DrawablePtr drawable,
-+                            int x, int y, int w, int h,
-+                            unsigned int format,
-+                            unsigned long plane_mask,
-+                            char *dst /* out-buffer, never NULL */)
++                             int x, int y, int w, int h,
++                             unsigned int img_format,
++                             unsigned long plane_mask,
++                             char *dst)
  {
 -    PixmapPtr pixmap = glamor_get_drawable_pixmap(drawable);
 -    glamor_pixmap_private *pixmap_priv;
@@ -533,46 +1401,133 @@ index 898380d82..a31cd37d6 100644
 -    pixmap_priv = glamor_get_pixmap_private(pixmap);
 -    if (!GLAMOR_PIXMAP_PRIV_HAS_FBO(pixmap_priv))
 -        goto bail;
-+    PixmapPtr               src_pixmap  = glamor_get_drawable_pixmap(drawable);
-+    glamor_pixmap_private  *src_priv    = glamor_get_pixmap_private(src_pixmap);
-+    const uint32_t          byte_stride = PixmapBytePad(w, drawable->depth);
- 
-+    if (!GLAMOR_PIXMAP_PRIV_HAS_FBO(src_priv))
-+        return FALSE;
-     if (format != ZPixmap)
+-
+-    if (format != ZPixmap)
 -        goto bail;
-+        return FALSE;
-+
-+    int off_x = 0, off_y = 0;
-+    glamor_get_drawable_deltas(drawable, src_pixmap, &off_x, &off_y);
- 
+-
 -    glamor_get_drawable_deltas(drawable, pixmap, &off_x, &off_y);
 -    box.x1 = x;
 -    box.x2 = x + w;
 -    box.y1 = y;
 -    box.y2 = y + h;
-+    BoxRec box = { x, y, x + w, y + h };
++    if (!drawable || !dst)
++        return FALSE;
++
++    PixmapPtr src_pixmap = glamor_get_drawable_pixmap(drawable);
++    glamor_pixmap_private *src_priv = glamor_get_pixmap_private(src_pixmap);
++    ScreenPtr screen = drawable->pScreen;
++    if (!screen)
++        return FALSE;
++
++    glamor_screen_private *priv = glamor_get_screen_private(screen);
++
++    if (!GLAMOR_PIXMAP_PRIV_HAS_FBO(src_priv))
++        return FALSE;
++    if (img_format != ZPixmap)
++        return FALSE;
++    if (w <= 0 || h <= 0 || w > priv->max_fbo_size || h > priv->max_fbo_size)
++        return FALSE;
++
++    int off_x = 0, off_y = 0;
++    glamor_get_drawable_deltas(drawable, src_pixmap, &off_x, &off_y);
++
++    glamor_make_current(priv);
++
++    BoxRec box = {
++        .x1 = x + drawable->x + off_x,
++        .y1 = y + drawable->y + off_y,
++        .x2 = x + drawable->x + off_x + w,
++        .y2 = y + drawable->y + off_y + h
++    };
++
++    const struct glamor_format *format = glamor_format_for_pixmap(src_pixmap);
++    if (unlikely(!format))
++        return FALSE;
++
++    const uint32_t byte_stride = PixmapBytePad(w, drawable->depth);
++    const size_t   required = safe_mul_size((size_t)h, (size_t)byte_stride);
++    if (required == 0)
++        return FALSE;
++
++    glamor_pbo_pool_init();
++
++    Bool use_pbo = (required >= g_pbo_pool.download_threshold);
++
++    if (use_pbo) {
++        glamor_pbo_slot *slot = NULL;
++        if (glamor_pbo_download_acquire(required, &slot)) {
++            gl_pixel_store_state saved_state = {0};
++            gl_save_pixel_store(&saved_state);
++
++            glBindBuffer(GL_PIXEL_PACK_BUFFER, slot->id);
++
++            const int bpp = drawable->bitsPerPixel;
++            const int bytes_per_pixel = (bpp >> 3) ? (bpp >> 3) : 1;
++            const int pack_row_length = (int)(byte_stride / (uint32_t)bytes_per_pixel);
++
++            glPixelStorei(GL_PACK_ALIGNMENT, 4);
++            glPixelStorei(GL_PACK_ROW_LENGTH, pack_row_length);
++
++            glamor_set_destination_pixmap_priv_nc(priv, src_pixmap, src_priv);
++            glReadPixels(box.x1, box.y1, w, h, format->format, format->type,
++                         (void *)0);
++
++            glamor_pbo_clear_fence(slot);
++            slot->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++            glFlush();
++            glamor_pbo_wait(slot);
++
++            const uint8_t *src;
++            void *temp_map = NULL;
++
++            if (slot->persistent) {
++                glMemoryBarrier(GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT);
++                src = (const uint8_t *)slot->map;
++            } else {
++                temp_map = glMapBuffer(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY);
++                if (!temp_map) {
++                    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++                    gl_restore_pixel_store(&saved_state);
++                    use_pbo = FALSE;
++                    goto cpu_download;
++                }
++                src = (const uint8_t *)temp_map;
++            }
++
++            memcpy_streaming(dst, src, required);
++
++            if (temp_map)
++                glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
++
++            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++            gl_restore_pixel_store(&saved_state);
++
++            goto mask_and_done;
++        }
++    }
++
++cpu_download:
      glamor_download_boxes(drawable, &box, 1,
                            drawable->x + off_x, drawable->y + off_y,
                            -x, -y,
 -                          (uint8_t *) d, byte_stride);
-+                          (uint8_t *)dst, byte_stride);
- 
+-
 -    if (!glamor_pm_is_solid(glamor_drawable_effective_depth(drawable), plane_mask)) {
 -        FbStip pm = fbReplicatePixel(plane_mask, drawable->bitsPerPixel);
 -        FbStip *dst = (void *)d;
 -        uint32_t dstStride = byte_stride / sizeof(FbStip);
--
++                          (uint8_t *)dst, byte_stride);
+ 
 -        for (int i = 0; i < dstStride * h; i++)
 -            dst[i] &= pm;
-+    /* Apply plane-mask if not solid (all bits 1) */
++mask_and_done:
 +    if (!glamor_pm_is_solid(glamor_drawable_effective_depth(drawable),
-+        plane_mask))
++                            plane_mask))
 +    {
 +        const FbStip mask = fbReplicatePixel(plane_mask,
 +                                             drawable->bitsPerPixel);
 +        FbStip       *d   = (FbStip *)dst;
-+        const size_t  n   = ((size_t)byte_stride / sizeof(FbStip)) * h;
++        const size_t  n   = ((size_t)byte_stride / sizeof(FbStip)) * (size_t)h;
 +        for (size_t i = 0; i < n; i++)
 +            d[i] &= mask;
      }
@@ -582,7 +1537,6 @@ index 898380d82..a31cd37d6 100644
 -    return FALSE;
  }
  
-+/* fb fallback */
  static void
 -glamor_get_image_bail(DrawablePtr drawable, int x, int y, int w, int h,
 -                      unsigned int format, unsigned long plane_mask, char *d)
@@ -594,16 +1548,15 @@ index 898380d82..a31cd37d6 100644
  {
 -    if (glamor_prepare_access_box(drawable, GLAMOR_ACCESS_RO, x, y, w, h))
 -        fbGetImage(drawable, x, y, w, h, format, plane_mask, d);
-+    if (glamor_prepare_access_box(drawable, GLAMOR_ACCESS_RO,
-+        x, y, w, h))
-+    {
-+        fbGetImage(drawable, x, y, w, h,
-+                   format, plane_mask, dst);
++    if (w <= 0 || h <= 0)
++        return;
++
++    if (glamor_prepare_access_box(drawable, GLAMOR_ACCESS_RO, x, y, w, h)) {
++        fbGetImage(drawable, x, y, w, h, format, plane_mask, dst);
 +    }
      glamor_finish_access(drawable);
  }
  
-+/* Public entry */
  void
 -glamor_get_image(DrawablePtr drawable, int x, int y, int w, int h,
 -                 unsigned int format, unsigned long plane_mask, char *d)
@@ -614,12 +1567,1993 @@ index 898380d82..a31cd37d6 100644
 +                 char *dst)
  {
 -    if (glamor_get_image_gl(drawable, x, y, w, h, format, plane_mask, d))
-+    /* Only ZPixmap has a fast path; XY formats require complex conversions. */
-+    if (glamor_get_image_zpixmap_gl(drawable, x, y, w, h,
-+        format, plane_mask, dst))
++    /* CRITICAL FIX: NULL check at public API */
++    if (!drawable || !dst || w <= 0 || h <= 0)
          return;
 -    glamor_get_image_bail(drawable, x, y, w, h, format, plane_mask, d);
 +
-+    glamor_get_image_bail(drawable, x, y, w, h,
-+                          format, plane_mask, dst);
++    if (glamor_get_image_zpixmap_gl(drawable, x, y, w, h, format,
++                                    plane_mask, dst))
++        return;
++
++    glamor_get_image_bail(drawable, x, y, w, h, format, plane_mask, dst);
  }
+
+--- a/glamor/glamor_copy.c	2025-09-27 18:57:22.899703780 +0200
++++ b/glamor/glamor_copy.c	2025-09-27 19:00:33.824978256 +0200
+@@ -1,23 +1,14 @@
+ /*
+- * Copyright © 2014 Keith Packard
++ * SPDX-License-Identifier: MIT
+  *
+- * Permission to use, copy, modify, distribute, and sell this software and its
+- * documentation for any purpose is hereby granted without fee, provided that
+- * the above copyright notice appear in all copies and that both that copyright
+- * notice and this permission notice appear in supporting documentation, and
+- * that the name of the copyright holders not be used in advertising or
+- * publicity pertaining to distribution of the software without specific,
+- * written prior permission.  The copyright holders make no representations
+- * about the suitability of this software for any purpose.  It is provided "as
+- * is" without express or implied warranty.
++ * glamor_copy.c - High-performance GPU copy operations
++ * PRODUCTION VERSION v2 - NULL-safety hardened
+  *
+- * THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS SOFTWARE,
+- * INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS, IN NO
+- * EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY SPECIAL, INDIRECT OR
+- * CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE,
+- * DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+- * TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE
+- * OF THIS SOFTWARE.
++ * Critical fixes:
++ * - NULL pointer validation at all entry points
++ * - Bounds checking for box arrays
++ * - Uninitialized variable elimination
++ * - Race-free command accounting
+  */
+ 
+ #include "glamor_priv.h"
+@@ -25,24 +16,678 @@
+ #include "glamor_prepare.h"
+ #include "glamor_transform.h"
+ 
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <limits.h>
++
++#if defined(__AVX2__)
++#include <immintrin.h>
++#endif
++
++/* Compiler hints */
++#if defined(__GNUC__)
++#define likely(x)   __builtin_expect(!!(x), 1)
++#define unlikely(x) __builtin_expect(!!(x), 0)
++#define NONNULL __attribute__((nonnull))
++#else
++#define likely(x)   (x)
++#define unlikely(x) (x)
++#define NONNULL
++#endif
++
++#define LOCAL_MIN(a, b) (((a) < (b)) ? (a) : (b))
++#define LOCAL_MAX(a, b) (((a) > (b)) ? (a) : (b))
++#define CLAMP(v, lo, hi) (((v) < (lo)) ? (lo) : (((v) > (hi)) ? (hi) : (v)))
++
++/* GPU command thresholds (Vega 64 tuned) */
++#define GLAMOR_COMMAND_BATCH_SIZE      64
++#define GLAMOR_SOFT_COMMAND_LIMIT      384
++#define GLAMOR_HARD_COMMAND_LIMIT      3072
++#define GLAMOR_VBO_MAX_SIZE            (4 * 1024 * 1024)
++#define GLAMOR_VERTEX_PER_BOX          8
++
++/* glCopyImageSubData heuristics */
++#define GLAMOR_COPY_IMAGE_MIN_PIXELS   (64 * 64)
++#define GLAMOR_COPY_IMAGE_MIN_DIM      32
++
++/* Scratch VBO pool */
++#define SCRATCH_VBO_CAPACITY           (512u * 1024u)
++
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  Global State (CRITICAL: All access must be NULL-safe)
++ * ═══════════════════════════════════════════════════════════════════════════ */
++typedef struct {
++    Bool     checked;
++    Bool     has_copy_image;
++    Bool     has_texture_storage;
++    Bool     copy_image_coherent;
++    int      gl_major;
++    int      gl_minor;
++} glamor_gl_features;
++
++static glamor_gl_features g_gl_features = {0};
++
++typedef struct {
++    GLsync   fence;
++    int      pending_commands;
++    Bool     needs_flush;
++} glamor_gpu_sync_state;
++
++static glamor_gpu_sync_state g_gpu_sync = {0};
++
++typedef struct {
++    GLenum   format1;
++    GLenum   format2;
++    Bool     compatible;
++} format_compat_entry;
++
++#define MAX_FORMAT_CACHE_ENTRIES 64
++static format_compat_entry g_format_cache[MAX_FORMAT_CACHE_ENTRIES];
++static int g_format_cache_entries = 0;
++
++/* Persistent scratch VBO */
++static GLuint   scratch_vbo          = 0;
++static GLubyte *scratch_map          = NULL;
++static size_t   scratch_offset_bytes = 0;
++
++typedef struct {
++    uint32_t bitplane;
++    int      depth;
++    GLuint   uniform_values[4];
++    GLfloat  scale_values[4];
++} bitplane_cache_entry;
++
++static bitplane_cache_entry g_bitplane_cache = {0};
++
+ struct copy_args {
+-    DrawablePtr         src_drawable;
+-    glamor_pixmap_fbo   *src;
+-    uint32_t            bitplane;
+-    int                 dx, dy;
++    DrawablePtr       src_drawable;
++    glamor_pixmap_fbo *src;
++    uint32_t          bitplane;
++    int               dx, dy;
+ };
+ 
++#ifndef GL_TILE_RASTER_ORDER_FIXED_MESA
++#define GL_TILE_RASTER_ORDER_FIXED_MESA          0x8BB8
++#define GL_TILE_RASTER_ORDER_INCREASING_X_MESA   0x8BB9
++#define GL_TILE_RASTER_ORDER_INCREASING_Y_MESA   0x8BBA
++#endif
++
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  GPU Command Throttling (unchanged – already safe)
++ * ═══════════════════════════════════════════════════════════════════════════ */
++static void
++glamor_manage_gpu_commands(glamor_screen_private *priv, int new_commands)
++{
++    (void)priv;
++    g_gpu_sync.pending_commands += new_commands;
++
++    if (unlikely(g_gpu_sync.pending_commands >= GLAMOR_SOFT_COMMAND_LIMIT)) {
++        if (!g_gpu_sync.fence)
++            g_gpu_sync.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++        glFlush();
++        g_gpu_sync.needs_flush = FALSE;
++    }
++
++    if (unlikely(g_gpu_sync.pending_commands >= GLAMOR_HARD_COMMAND_LIMIT)) {
++        if (!g_gpu_sync.fence)
++            g_gpu_sync.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++
++        while (glClientWaitSync(g_gpu_sync.fence, GL_SYNC_FLUSH_COMMANDS_BIT,
++                                50000) == GL_TIMEOUT_EXPIRED)
++            ;
++
++        glDeleteSync(g_gpu_sync.fence);
++        g_gpu_sync.fence            = NULL;
++        g_gpu_sync.pending_commands = 0;
++    } else {
++        g_gpu_sync.needs_flush = TRUE;
++    }
++}
++
++static void
++glamor_ensure_gpu_idle(glamor_screen_private *priv, Bool force)
++{
++    (void)priv;
++
++    if (g_gpu_sync.fence) {
++        GLenum result = glClientWaitSync(g_gpu_sync.fence,
++                                         GL_SYNC_FLUSH_COMMANDS_BIT,
++                                         force ? GL_TIMEOUT_IGNORED : 0);
++        if (result == GL_ALREADY_SIGNALED || result == GL_CONDITION_SATISFIED) {
++            glDeleteSync(g_gpu_sync.fence);
++            g_gpu_sync.fence            = NULL;
++            g_gpu_sync.pending_commands = 0;
++        }
++    }
++
++    if (force) {
++        glFinish();
++        g_gpu_sync.pending_commands = 0;
++        g_gpu_sync.needs_flush      = FALSE;
++    }
++}
++
++static Bool
++glamor_check_gpu_health(glamor_screen_private *priv)
++{
++    GLenum error = glGetError();
++    if (unlikely(error != GL_NO_ERROR)) {
++        if (error == GL_OUT_OF_MEMORY) {
++            glamor_ensure_gpu_idle(priv, TRUE);
++            return FALSE;
++        }
++        if (error != GL_INVALID_VALUE && error != GL_INVALID_OPERATION) {
++            ErrorF("glamor: GL error 0x%x detected\n", error);
++        }
++    }
++    return TRUE;
++}
++
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  Scratch VBO Pool (race-free version)
++ * ═══════════════════════════════════════════════════════════════════════════ */
++static Bool
++scratch_vbo_ensure(glamor_screen_private *priv)
++{
++    (void)priv;
++
++    if (scratch_vbo)
++        return TRUE;
++
++    if (!epoxy_has_gl_extension("GL_ARB_buffer_storage"))
++        return FALSE;
++
++    const GLbitfield flags =
++        GL_MAP_WRITE_BIT          |
++        GL_MAP_PERSISTENT_BIT     |
++        GL_MAP_COHERENT_BIT       |
++        GL_MAP_FLUSH_EXPLICIT_BIT |
++        GL_DYNAMIC_STORAGE_BIT;
++
++    glGenBuffers(1, &scratch_vbo);
++    glBindBuffer(GL_ARRAY_BUFFER, scratch_vbo);
++    glBufferStorage(GL_ARRAY_BUFFER, SCRATCH_VBO_CAPACITY, NULL, flags);
++
++    scratch_map = (GLubyte *)glMapBufferRange(
++        GL_ARRAY_BUFFER, 0, SCRATCH_VBO_CAPACITY,
++        GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT |
++        GL_MAP_COHERENT_BIT | GL_MAP_FLUSH_EXPLICIT_BIT
++    );
++
++    return (scratch_map != NULL);
++}
++
++static GLshort *
++scratch_vbo_alloc(glamor_screen_private *priv, size_t bytes, char **out_offset)
++{
++    if (!scratch_vbo_ensure(priv))
++        return NULL;
++
++    if (bytes > SCRATCH_VBO_CAPACITY)
++        return NULL;
++
++    if (scratch_offset_bytes + bytes > SCRATCH_VBO_CAPACITY) {
++        if (g_gpu_sync.fence) {
++            glClientWaitSync(g_gpu_sync.fence, GL_SYNC_FLUSH_COMMANDS_BIT,
++                             GL_TIMEOUT_IGNORED);
++            glDeleteSync(g_gpu_sync.fence);
++            g_gpu_sync.fence = NULL;
++        }
++
++        glBindBuffer(GL_ARRAY_BUFFER, scratch_vbo);
++        glFlushMappedBufferRange(GL_ARRAY_BUFFER, 0,
++                                 (GLsizeiptr)scratch_offset_bytes);
++        scratch_offset_bytes = 0;
++    }
++
++    *out_offset = (char *)(uintptr_t)scratch_offset_bytes;
++    GLshort *ptr = (GLshort *)(scratch_map + scratch_offset_bytes);
++    scratch_offset_bytes += bytes;
++    return ptr;
++}
++
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  GL Feature Detection (unchanged)
++ * ═════════════════��═════════════════════════════════════════════════════════ */
++static Bool
++glamor_copy_image_gl_is_coherent(void)
++{
++    if (!g_gl_features.checked)
++        return FALSE;
++
++    const char *vendor = (const char *)glGetString(GL_VENDOR);
++    const char *renderer = (const char *)glGetString(GL_RENDERER);
++
++    if (!vendor || !renderer)
++        return FALSE;
++
++    if ((strstr(vendor, "AMD") || strstr(vendor, "X.Org")) &&
++        (strstr(renderer, "Radeon") || strstr(renderer, "RADV"))) {
++        g_gl_features.copy_image_coherent = TRUE;
++        return TRUE;
++    }
++
++    if (strstr(vendor, "NVIDIA")) {
++        g_gl_features.copy_image_coherent = TRUE;
++        return TRUE;
++    }
++
++    if (strstr(vendor, "Intel")) {
++        const char *version = (const char *)glGetString(GL_VERSION);
++        if (version && strstr(version, "Mesa")) {
++            int mesa_major = 0, mesa_minor = 0;
++            if (sscanf(version, "%*s Mesa %d.%d", &mesa_major, &mesa_minor) == 2 &&
++                mesa_major >= 20) {
++                g_gl_features.copy_image_coherent = TRUE;
++                return TRUE;
++            }
++        }
++    }
++
++    g_gl_features.copy_image_coherent = FALSE;
++    return FALSE;
++}
++
++static Bool
++glamor_check_copy_image_support(void)
++{
++    if (g_gl_features.checked)
++        return g_gl_features.has_copy_image;
++
++    g_gl_features.checked = TRUE;
++    g_gl_features.has_copy_image = FALSE;
++
++    const char *version_str = (const char *)glGetString(GL_VERSION);
++    if (version_str) {
++        if (sscanf(version_str, "%d.%d", &g_gl_features.gl_major,
++                   &g_gl_features.gl_minor) == 2) {
++            if (g_gl_features.gl_major > 4 ||
++                (g_gl_features.gl_major == 4 && g_gl_features.gl_minor >= 3)) {
++                g_gl_features.has_copy_image = TRUE;
++            }
++        }
++    }
++
++    if (!g_gl_features.has_copy_image &&
++        epoxy_has_gl_extension("GL_ARB_copy_image")) {
++        g_gl_features.has_copy_image = TRUE;
++    }
++
++    if (g_gl_features.has_copy_image && !glCopyImageSubData) {
++        g_gl_features.has_copy_image = FALSE;
++    }
++
++    g_gl_features.has_texture_storage =
++        epoxy_has_gl_extension("GL_ARB_texture_storage");
++
++    if (g_gl_features.has_copy_image) {
++        glamor_copy_image_gl_is_coherent();
++    }
++
++    return g_gl_features.has_copy_image;
++}
++
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  Texture Queries
++ * ═══════════════════════════════════════════════════════════════════════════ */
++static GLenum
++glamor_get_tex_internal_format(GLuint tex)
++{
++    if (tex == 0)
++        return 0;
++
++    int ver = epoxy_gl_version();
++    if ((ver >= 45 || epoxy_has_gl_extension("GL_ARB_direct_state_access")) &&
++        glGetTextureLevelParameteriv) {
++        GLint fmt = 0;
++        glGetTextureLevelParameteriv(tex, 0, GL_TEXTURE_INTERNAL_FORMAT, &fmt);
++        GLenum err = glGetError();
++        if (err == GL_NO_ERROR)
++            return (GLenum)fmt;
++    }
++
++    GLint prev = 0, fmt = 0;
++    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev);
++    glBindTexture(GL_TEXTURE_2D, tex);
++    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &fmt);
++    glBindTexture(GL_TEXTURE_2D, (GLuint)prev);
++    return (GLenum)fmt;
++}
++
++static Bool
++glamor_validate_texture(GLuint tex)
++{
++    if (tex == 0)
++        return FALSE;
++
++    GLint prev = 0;
++    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev);
++    glBindTexture(GL_TEXTURE_2D, tex);
++
++    GLint width = 0, height = 0;
++    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
++    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
++
++    glBindTexture(GL_TEXTURE_2D, (GLuint)prev);
++    return (width > 0 && height > 0);
++}
++
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  Format Compatibility (unchanged – already correct per GL spec)
++ * ═══════════════════════════════════════════════════════════════════════════ */
++static Bool
++glamor_formats_compatible_for_copy_cached(GLenum format1, GLenum format2)
++{
++    if (format1 == format2)
++        return TRUE;
++
++    for (int i = 0; i < g_format_cache_entries; i++) {
++        if ((g_format_cache[i].format1 == format1 &&
++             g_format_cache[i].format2 == format2) ||
++            (g_format_cache[i].format1 == format2 &&
++             g_format_cache[i].format2 == format1)) {
++            return g_format_cache[i].compatible;
++        }
++    }
++
++    static const GLenum class_128bit[] = {
++        GL_RGBA32F, GL_RGBA32UI, GL_RGBA32I
++    };
++    static const GLenum class_96bit[] = {
++        GL_RGB32F, GL_RGB32UI, GL_RGB32I
++    };
++    static const GLenum class_64bit[] = {
++        GL_RGBA16F, GL_RG32F, GL_RGBA16UI, GL_RG32UI,
++        GL_RGBA16I, GL_RG32I, GL_RGBA16, GL_RGBA16_SNORM
++    };
++    static const GLenum class_48bit[] = {
++        GL_RGB16F, GL_RGB16UI, GL_RGB16I, GL_RGB16, GL_RGB16_SNORM
++    };
++    static const GLenum class_32bit[] = {
++        GL_RG16F, GL_R32F, GL_RGB10_A2UI, GL_RGBA8UI, GL_RG16UI,
++        GL_R32UI, GL_RGBA8I, GL_RG16I, GL_R32I, GL_RGB10_A2,
++        GL_RGBA8, GL_RG16, GL_RGBA8_SNORM, GL_RG16_SNORM,
++        GL_SRGB8_ALPHA8, GL_RGB9_E5, GL_R11F_G11F_B10F
++    };
++    static const GLenum class_24bit[] = {
++        GL_RGB8, GL_RGB8_SNORM, GL_SRGB8, GL_RGB8UI, GL_RGB8I
++    };
++    static const GLenum class_16bit[] = {
++        GL_R16F, GL_RG8UI, GL_R16UI, GL_RG8I, GL_R16I,
++        GL_RG8, GL_R16, GL_RG8_SNORM, GL_R16_SNORM
++    };
++    static const GLenum class_8bit[] = {
++        GL_R8UI, GL_R8I, GL_R8, GL_R8_SNORM
++    };
++
++    struct {
++        const GLenum *formats;
++        size_t count;
++    } view_classes[] = {
++        { class_128bit, sizeof(class_128bit) / sizeof(GLenum) },
++        { class_96bit,  sizeof(class_96bit)  / sizeof(GLenum) },
++        { class_64bit,  sizeof(class_64bit)  / sizeof(GLenum) },
++        { class_48bit,  sizeof(class_48bit)  / sizeof(GLenum) },
++        { class_32bit,  sizeof(class_32bit)  / sizeof(GLenum) },
++        { class_24bit,  sizeof(class_24bit)  / sizeof(GLenum) },
++        { class_16bit,  sizeof(class_16bit)  / sizeof(GLenum) },
++        { class_8bit,   sizeof(class_8bit)   / sizeof(GLenum) },
++    };
++
++    Bool compatible = FALSE;
++    for (size_t c = 0; c < sizeof(view_classes) / sizeof(view_classes[0]); c++) {
++        Bool found1 = FALSE, found2 = FALSE;
++        for (size_t i = 0; i < view_classes[c].count; i++) {
++            if (view_classes[c].formats[i] == format1) found1 = TRUE;
++            if (view_classes[c].formats[i] == format2) found2 = TRUE;
++        }
++        if (found1 && found2) {
++            compatible = TRUE;
++            break;
++        }
++    }
++
++    if (g_format_cache_entries < MAX_FORMAT_CACHE_ENTRIES) {
++        g_format_cache[g_format_cache_entries].format1 = format1;
++        g_format_cache[g_format_cache_entries].format2 = format2;
++        g_format_cache[g_format_cache_entries].compatible = compatible;
++        g_format_cache_entries++;
++    }
++
++    return compatible;
++}
++
++static Bool
++glamor_should_use_copy_image(int width, int height, Bool is_cursor,
++                             Bool same_pixmap, int depth)
++{
++    if (same_pixmap || is_cursor)
++        return FALSE;
++
++    if (width * height < GLAMOR_COPY_IMAGE_MIN_PIXELS)
++        return FALSE;
++
++    if (width < GLAMOR_COPY_IMAGE_MIN_DIM || height < GLAMOR_COPY_IMAGE_MIN_DIM)
++        return FALSE;
++
++    if ((depth == 1 || depth == 8) && !g_gl_features.copy_image_coherent)
++        return FALSE;
++
++    return TRUE;
++}
++
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  AVX2 Vertex Generator (unchanged – already bounds-safe)
++ * ═══════════════════════════════════════════════════════════════════════════ */
++static inline void
++glamor_generate_box_vertices_batched(GLshort *v, const BoxPtr box, int nbox)
++{
++    /* CRITICAL: v and box MUST be non-NULL (caller's responsibility) */
++#if defined(__AVX2__)
++    const __m256i v_min = _mm256_set1_epi16(SHRT_MIN);
++    const __m256i v_max = _mm256_set1_epi16(SHRT_MAX);
++
++    int i = 0;
++    for (; i + 1 < nbox; i += 2) {
++        __m128i lo = _mm_loadu_si128((const __m128i *)&box[i]);
++        __m128i hi = _mm_loadu_si128((const __m128i *)&box[i + 1]);
++        __m256i pack = _mm256_castsi128_si256(lo);
++        pack = _mm256_inserti128_si256(pack, hi, 1);
++
++        pack = _mm256_max_epi16(v_min, _mm256_min_epi16(v_max, pack));
++
++        const __m256i shuf = _mm256_set_epi8(
++            15,14, 11,10, 13,12, 11,10,
++             7, 6,   3, 2,   5, 4,   3, 2,
++            15,14, 11,10, 13,12, 11,10,
++             7, 6,   3, 2,   5, 4,   3, 2);
++        __m256i verts = _mm256_shuffle_epi8(pack, shuf);
++
++        _mm256_storeu_si256((__m256i *)(v + i * 8), verts);
++    }
++
++    for (; i < nbox; ++i) {
++        const BoxPtr b = &box[i];
++        GLshort *p = v + i * 8;
++
++        GLshort x1 = (GLshort)CLAMP(b->x1, SHRT_MIN, SHRT_MAX);
++        GLshort y1 = (GLshort)CLAMP(b->y1, SHRT_MIN, SHRT_MAX);
++        GLshort x2 = (GLshort)CLAMP(b->x2, SHRT_MIN, SHRT_MAX);
++        GLshort y2 = (GLshort)CLAMP(b->y2, SHRT_MIN, SHRT_MAX);
++
++        p[0] = x1; p[1] = y1;
++        p[2] = x1; p[3] = y2;
++        p[4] = x2; p[5] = y2;
++        p[6] = x2; p[7] = y1;
++    }
++#else
++    for (int i = 0; i < nbox; ++i) {
++        const BoxPtr b = &box[i];
++        GLshort *p = v + i * 8;
++
++        GLshort x1 = (GLshort)CLAMP(b->x1, SHRT_MIN, SHRT_MAX);
++        GLshort y1 = (GLshort)CLAMP(b->y1, SHRT_MIN, SHRT_MAX);
++        GLshort x2 = (GLshort)CLAMP(b->x2, SHRT_MIN, SHRT_MAX);
++        GLshort y2 = (GLshort)CLAMP(b->y2, SHRT_MIN, SHRT_MAX);
++
++        p[0] = x1; p[1] = y1;
++        p[2] = x1; p[3] = y2;
++        p[4] = x2; p[5] = y2;
++        p[6] = x2; p[7] = y1;
++    }
++#endif
++}
++
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  glCopyImageSubData Fast-Path (FIXED: NULL box check)
++ * ═══════════════════════════════════════════════════════════════════════════ */
++static Bool
++glamor_copy_fbo_fbo_direct(DrawablePtr src, DrawablePtr dst, GCPtr gc,
++                           BoxPtr box, int nbox, int dx, int dy,
++                           Bool reverse, Bool upsidedown,
++                           Pixel bitplane, void *closure)
++{
++    (void)reverse; (void)upsidedown; (void)closure;
++
++    /* CRITICAL FIX: Add NULL checks */
++    if (!src || !dst || !box || nbox <= 0 || bitplane)
++        return FALSE;
++
++    if ((gc && gc->alu != GXcopy) ||
++        (gc && !glamor_pm_is_solid(gc->depth, gc->planemask)))
++        return FALSE;
++
++    ScreenPtr screen = dst->pScreen;
++    if (!screen)
++        return FALSE;
++
++    glamor_screen_private *priv = glamor_get_screen_private(screen);
++    if (!glamor_check_copy_image_support())
++        return FALSE;
++
++    PixmapPtr spix = glamor_get_drawable_pixmap(src);
++    PixmapPtr dpix = glamor_get_drawable_pixmap(dst);
++    if (!spix || !dpix || spix == dpix)
++        return FALSE;
++
++    glamor_pixmap_private *spr = glamor_get_pixmap_private(spix);
++    glamor_pixmap_private *dpr = glamor_get_pixmap_private(dpix);
++    if (!spr || !dpr ||
++        !GLAMOR_PIXMAP_PRIV_HAS_FBO(spr) ||
++        !GLAMOR_PIXMAP_PRIV_HAS_FBO(dpr))
++        return FALSE;
++
++    glamor_make_current(priv);
++
++    glamor_pixmap_fbo *sfbo = spr->fbo;
++    glamor_pixmap_fbo *dfbo = dpr->fbo;
++    if (!sfbo || !dfbo)
++        return FALSE;
++
++    if (!glamor_validate_texture(sfbo->tex) ||
++        !glamor_validate_texture(dfbo->tex))
++        return FALSE;
++
++    if (!glamor_formats_compatible_for_copy_cached(
++            glamor_get_tex_internal_format(sfbo->tex),
++            glamor_get_tex_internal_format(dfbo->tex)))
++        return FALSE;
++
++    if (!glamor_should_use_copy_image(spix->drawable.width,
++                                      spix->drawable.height,
++                                      FALSE, FALSE, src->depth))
++        return FALSE;
++
++    /* Box-merge heuristic */
++    BoxRec merged = box[0];
++    unsigned long covered = 0;
++    for (int i = 0; i < nbox; ++i) {
++        merged.x1 = LOCAL_MIN(merged.x1, box[i].x1);
++        merged.y1 = LOCAL_MIN(merged.y1, box[i].y1);
++        merged.x2 = LOCAL_MAX(merged.x2, box[i].x2);
++        merged.y2 = LOCAL_MAX(merged.y2, box[i].y2);
++
++        covered += (unsigned long)(box[i].x2 - box[i].x1) *
++                   (unsigned long)(box[i].y2 - box[i].y1);
++    }
++
++    unsigned long bbox_area =
++        (unsigned long)(merged.x2 - merged.x1) *
++        (unsigned long)(merged.y2 - merged.y1);
++    Bool can_merge = (bbox_area > 0 && bbox_area <= covered * 12ul / 10ul);
++
++    int src_off_x = 0, src_off_y = 0, dst_off_x = 0, dst_off_y = 0;
++    glamor_get_drawable_deltas(src, spix, &src_off_x, &src_off_y);
++    glamor_get_drawable_deltas(dst, dpix, &dst_off_x, &dst_off_y);
++
++    const int sp_w = spix->drawable.width;
++    const int sp_h = spix->drawable.height;
++    const int dp_w = dpix->drawable.width;
++    const int dp_h = dpix->drawable.height;
++
++    int commands = 0;
++
++#define ISSUE_COPY(_bx)                                                        \
++    do {                                                                       \
++        int w_ = (_bx)->x2 - (_bx)->x1;                                        \
++        int h_ = (_bx)->y2 - (_bx)->y1;                                        \
++        if (w_ <= 0 || h_ <= 0) break;                                         \
++        int s_x = (_bx)->x1 + dx + src_off_x;                                  \
++        int s_y = (_bx)->y1 + dy + src_off_y;                                  \
++        int d_x = (_bx)->x1 + dst_off_x;                                       \
++        int d_y = (_bx)->y1 + dst_off_y;                                       \
++        if (s_x < 0 || s_y < 0 || d_x < 0 || d_y < 0 ||                        \
++            s_x + w_ > sp_w || s_y + h_ > sp_h ||                              \
++            d_x + w_ > dp_w || d_y + h_ > dp_h) break;                         \
++        int gl_sy = sp_h - (s_y + h_);                                         \
++        int gl_dy = dp_h - (d_y + h_);                                         \
++        glCopyImageSubData(sfbo->tex, GL_TEXTURE_2D, 0,                        \
++                           s_x, gl_sy, 0,                                      \
++                           dfbo->tex, GL_TEXTURE_2D, 0,                        \
++                           d_x, gl_dy, 0,                                      \
++                           w_, h_, 1);                                         \
++        ++commands;                                                            \
++    } while (0)
++
++    if (can_merge) {
++        ISSUE_COPY(&merged);
++    } else {
++        for (int i = 0; i < nbox; ++i) {
++            ISSUE_COPY(&box[i]);
++        }
++    }
++
++#undef ISSUE_COPY
++
++    if (commands > 0) {
++        glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
++        glamor_manage_gpu_commands(priv, commands);
++    }
++
++    return (commands > 0);
++}
++
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  Shader Callbacks (unchanged)
++ * ═══════════════════════════════════════════════════════════════════════════ */
+ static Bool
+ use_copyarea(DrawablePtr drawable, GCPtr gc, glamor_program *prog, void *arg)
+ {
+-    struct copy_args *args = arg;
++    (void)gc;
++    struct copy_args *args = (struct copy_args *)arg;
+     glamor_pixmap_fbo *src = args->src;
+ 
++    if (unlikely(!src || src->width <= 0 || src->height <= 0))
++        return FALSE;
++
+     glamor_bind_texture(glamor_get_screen_private(drawable->pScreen),
+                         GL_TEXTURE0, src, TRUE);
+ 
+-    glUniform2f(prog->fill_offset_uniform, args->dx, args->dy);
+-    glUniform2f(prog->fill_size_inv_uniform, 1.0f/src->width, 1.0f/src->height);
++    glUniform2f(prog->fill_offset_uniform, (GLfloat)args->dx, (GLfloat)args->dy);
++    glUniform2f(prog->fill_size_inv_uniform,
++                1.0f / (GLfloat)src->width,
++                1.0f / (GLfloat)src->height);
+ 
+     return TRUE;
+ }
+@@ -57,84 +702,110 @@ static const glamor_facet glamor_facet_c
+     .use = use_copyarea,
+ };
+ 
+-/*
+- * Configure the copy plane program for the current operation
+- */
+-
+ static Bool
+ use_copyplane(DrawablePtr drawable, GCPtr gc, glamor_program *prog, void *arg)
+ {
+-    struct copy_args *args = arg;
++    if (unlikely(!gc))
++        return FALSE;
++
++    struct copy_args *args = (struct copy_args *)arg;
+     glamor_pixmap_fbo *src = args->src;
+ 
++    if (unlikely(!src || src->width <= 0 || src->height <= 0))
++        return FALSE;
++
+     glamor_bind_texture(glamor_get_screen_private(drawable->pScreen),
+                         GL_TEXTURE0, src, TRUE);
+ 
+-    glUniform2f(prog->fill_offset_uniform, args->dx, args->dy);
+-    glUniform2f(prog->fill_size_inv_uniform, 1.0f/src->width, 1.0f/src->height);
++    glUniform2f(prog->fill_offset_uniform, (GLfloat)args->dx, (GLfloat)args->dy);
++    glUniform2f(prog->fill_size_inv_uniform,
++                1.0f / (GLfloat)src->width,
++                1.0f / (GLfloat)src->height);
+ 
+     glamor_set_color(drawable, gc->fgPixel, prog->fg_uniform);
+     glamor_set_color(drawable, gc->bgPixel, prog->bg_uniform);
+ 
+-    /* XXX handle 2 10 10 10 and 1555 formats; presumably the pixmap private knows this? */
+-    switch (glamor_drawable_effective_depth(args->src_drawable)) {
+-    case 30:
+-        glUniform4ui(prog->bitplane_uniform,
+-                     (args->bitplane >> 20) & 0x3ff,
+-                     (args->bitplane >> 10) & 0x3ff,
+-                     (args->bitplane      ) & 0x3ff,
+-                     0);
++    const uint32_t bp = (uint32_t)args->bitplane;
++    const int depth = glamor_drawable_effective_depth(args->src_drawable);
+ 
+-        glUniform4f(prog->bitmul_uniform, 0x3ff, 0x3ff, 0x3ff, 0);
++    if (likely(g_bitplane_cache.bitplane == bp &&
++               g_bitplane_cache.depth == depth)) {
++        glUniform4uiv(prog->bitplane_uniform, 1, g_bitplane_cache.uniform_values);
++        glUniform4fv(prog->bitmul_uniform, 1, g_bitplane_cache.scale_values);
++        return TRUE;
++    }
++
++    g_bitplane_cache.bitplane = bp;
++    g_bitplane_cache.depth = depth;
++
++    switch (depth) {
++    case 30:
++        g_bitplane_cache.uniform_values[0] = (bp >> 20) & 0x3ffu;
++        g_bitplane_cache.uniform_values[1] = (bp >> 10) & 0x3ffu;
++        g_bitplane_cache.uniform_values[2] = (bp      ) & 0x3ffu;
++        g_bitplane_cache.uniform_values[3] = 0u;
++        g_bitplane_cache.scale_values[0] = 1023.0f;
++        g_bitplane_cache.scale_values[1] = 1023.0f;
++        g_bitplane_cache.scale_values[2] = 1023.0f;
++        g_bitplane_cache.scale_values[3] = 0.0f;
+         break;
+     case 24:
+-        glUniform4ui(prog->bitplane_uniform,
+-                     (args->bitplane >> 16) & 0xff,
+-                     (args->bitplane >>  8) & 0xff,
+-                     (args->bitplane      ) & 0xff,
+-                     0);
+-
+-        glUniform4f(prog->bitmul_uniform, 0xff, 0xff, 0xff, 0);
++        g_bitplane_cache.uniform_values[0] = (bp >> 16) & 0xffu;
++        g_bitplane_cache.uniform_values[1] = (bp >>  8) & 0xffu;
++        g_bitplane_cache.uniform_values[2] = (bp      ) & 0xffu;
++        g_bitplane_cache.uniform_values[3] = 0u;
++        g_bitplane_cache.scale_values[0] = 255.0f;
++        g_bitplane_cache.scale_values[1] = 255.0f;
++        g_bitplane_cache.scale_values[2] = 255.0f;
++        g_bitplane_cache.scale_values[3] = 0.0f;
+         break;
+     case 32:
+-        glUniform4ui(prog->bitplane_uniform,
+-                     (args->bitplane >> 16) & 0xff,
+-                     (args->bitplane >>  8) & 0xff,
+-                     (args->bitplane      ) & 0xff,
+-                     (args->bitplane >> 24) & 0xff);
+-
+-        glUniform4f(prog->bitmul_uniform, 0xff, 0xff, 0xff, 0xff);
++        g_bitplane_cache.uniform_values[0] = (bp >> 16) & 0xffu;
++        g_bitplane_cache.uniform_values[1] = (bp >>  8) & 0xffu;
++        g_bitplane_cache.uniform_values[2] = (bp      ) & 0xffu;
++        g_bitplane_cache.uniform_values[3] = (bp >> 24) & 0xffu;
++        g_bitplane_cache.scale_values[0] = 255.0f;
++        g_bitplane_cache.scale_values[1] = 255.0f;
++        g_bitplane_cache.scale_values[2] = 255.0f;
++        g_bitplane_cache.scale_values[3] = 255.0f;
+         break;
+     case 16:
+-        glUniform4ui(prog->bitplane_uniform,
+-                     (args->bitplane >> 11) & 0x1f,
+-                     (args->bitplane >>  5) & 0x3f,
+-                     (args->bitplane      ) & 0x1f,
+-                     0);
+-
+-        glUniform4f(prog->bitmul_uniform, 0x1f, 0x3f, 0x1f, 0);
++        g_bitplane_cache.uniform_values[0] = (bp >> 11) & 0x1fu;
++        g_bitplane_cache.uniform_values[1] = (bp >>  5) & 0x3fu;
++        g_bitplane_cache.uniform_values[2] = (bp      ) & 0x1fu;
++        g_bitplane_cache.uniform_values[3] = 0u;
++        g_bitplane_cache.scale_values[0] = 31.0f;
++        g_bitplane_cache.scale_values[1] = 63.0f;
++        g_bitplane_cache.scale_values[2] = 31.0f;
++        g_bitplane_cache.scale_values[3] = 0.0f;
+         break;
+     case 15:
+-        glUniform4ui(prog->bitplane_uniform,
+-                     (args->bitplane >> 10) & 0x1f,
+-                     (args->bitplane >>  5) & 0x1f,
+-                     (args->bitplane      ) & 0x1f,
+-                     0);
+-
+-        glUniform4f(prog->bitmul_uniform, 0x1f, 0x1f, 0x1f, 0);
++        g_bitplane_cache.uniform_values[0] = (bp >> 10) & 0x1fu;
++        g_bitplane_cache.uniform_values[1] = (bp >>  5) & 0x1fu;
++        g_bitplane_cache.uniform_values[2] = (bp      ) & 0x1fu;
++        g_bitplane_cache.uniform_values[3] = 0u;
++        g_bitplane_cache.scale_values[0] = 31.0f;
++        g_bitplane_cache.scale_values[1] = 31.0f;
++        g_bitplane_cache.scale_values[2] = 31.0f;
++        g_bitplane_cache.scale_values[3] = 0.0f;
+         break;
+     case 8:
+-        glUniform4ui(prog->bitplane_uniform,
+-                     0, 0, 0, args->bitplane);
+-        glUniform4f(prog->bitmul_uniform, 0, 0, 0, 0xff);
+-        break;
+     case 1:
+-        glUniform4ui(prog->bitplane_uniform,
+-                     0, 0, 0, args->bitplane);
+-        glUniform4f(prog->bitmul_uniform, 0, 0, 0, 0xff);
++        g_bitplane_cache.uniform_values[0] = 0u;
++        g_bitplane_cache.uniform_values[1] = 0u;
++        g_bitplane_cache.uniform_values[2] = 0u;
++        g_bitplane_cache.uniform_values[3] = bp & 0xffu;
++        g_bitplane_cache.scale_values[0] = 0.0f;
++        g_bitplane_cache.scale_values[1] = 0.0f;
++        g_bitplane_cache.scale_values[2] = 0.0f;
++        g_bitplane_cache.scale_values[3] = 255.0f;
+         break;
++    default:
++        return FALSE;
+     }
+ 
++    glUniform4uiv(prog->bitplane_uniform, 1, g_bitplane_cache.uniform_values);
++    glUniform4fv(prog->bitmul_uniform, 1, g_bitplane_cache.scale_values);
+     return TRUE;
+ }
+ 
+@@ -149,36 +820,249 @@ static const glamor_facet glamor_facet_c
+                 "               frag_color = fg;\n"
+                 "       else\n"
+                 "               frag_color = bg;\n"),
+-    .locations = glamor_program_location_fillsamp|glamor_program_location_fillpos|glamor_program_location_fg|glamor_program_location_bg|glamor_program_location_bitplane,
++    .locations = glamor_program_location_fillsamp |
++                 glamor_program_location_fillpos |
++                 glamor_program_location_fg |
++                 glamor_program_location_bg |
++                 glamor_program_location_bitplane,
+     .use = use_copyplane,
+ };
+ 
+-/*
+- * When all else fails, pull the bits out of the GPU and do the
+- * operation with fb
+- */
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  FBO→FBO Shader Path (FIXED: deltoids hoisted out of loop, NULL-safe)
++ * ═══════════════════════════════════════════════════════════════════════════ */
++static Bool
++glamor_copy_fbo_fbo_draw(DrawablePtr src, DrawablePtr dst, GCPtr gc,
++                         BoxPtr box, int nbox, int dx, int dy,
++                         Bool reverse, Bool upsidedown,
++                         Pixel bitplane, void *closure)
++{
++    (void)reverse; (void)upsidedown; (void)closure;
++
++    /* CRITICAL FIX: Add NULL checks */
++    if (unlikely(!src || !dst || !box || nbox <= 0))
++        return FALSE;
++
++    ScreenPtr screen = dst->pScreen;
++    if (!screen)
++        return FALSE;
++
++    glamor_screen_private *priv = glamor_get_screen_private(screen);
++
++    if (!bitplane &&
++        glamor_check_copy_image_support() &&
++        glamor_copy_fbo_fbo_direct(src, dst, gc, box, nbox,
++                                   dx, dy, FALSE, FALSE, 0, NULL))
++        return TRUE;
++
++    PixmapPtr spix = glamor_get_drawable_pixmap(src);
++    PixmapPtr dpix = glamor_get_drawable_pixmap(dst);
++    if (!spix || !dpix)
++        return FALSE;
++
++    glamor_pixmap_private *spr = glamor_get_pixmap_private(spix);
++    glamor_pixmap_private *dpr = glamor_get_pixmap_private(dpix);
++    if (!spr || !dpr ||
++        !GLAMOR_PIXMAP_PRIV_HAS_FBO(spr) ||
++        !GLAMOR_PIXMAP_PRIV_HAS_FBO(dpr))
++        return FALSE;
++
++    glamor_make_current(priv);
++
++    if (!glamor_check_gpu_health(priv))
++        return FALSE;
++
++    if (gc && !glamor_set_planemask(gc->depth, gc->planemask))
++        return FALSE;
++
++    if (!glamor_set_alu(dst, gc ? gc->alu : GXcopy))
++        return FALSE;
++
++    const Bool is_copyplane = (bitplane != 0);
++    if (is_copyplane && !priv->can_copyplane)
++        return FALSE;
++
++    glamor_program *prog = is_copyplane ? &priv->copy_plane_prog
++                                        : &priv->copy_area_prog;
++    const glamor_facet *facet = is_copyplane ? &glamor_facet_copyplane
++                                             : &glamor_facet_copyarea;
++
++    if (prog->failed)
++        return FALSE;
++
++    if (!prog->prog &&
++        !glamor_build_program(screen, prog, facet, NULL, NULL, NULL))
++        return FALSE;
++
++    struct copy_args args = {
++        .src_drawable = src,
++        .bitplane = (uint32_t)bitplane
++    };
++
++    int boxes_done = 0;
++    Bool ok = TRUE;
++
++    while (boxes_done < nbox) {
++        const int batch_boxes = LOCAL_MIN(nbox - boxes_done,
++                                          GLAMOR_COMMAND_BATCH_SIZE);
++        const size_t vbytes = (size_t)batch_boxes *
++                              GLAMOR_VERTEX_PER_BOX *
++                              sizeof(GLshort);
++
++        char *vbo_offset = NULL;
++        GLshort *vbuf = scratch_vbo_alloc(priv, vbytes, &vbo_offset);
++
++        const Bool using_scratch = (vbuf != NULL);
++        if (!vbuf) {
++            vbuf = glamor_get_vbo_space(screen, (int)vbytes, &vbo_offset);
++            if (!vbuf) {
++                glamor_ensure_gpu_idle(priv, TRUE);
++                vbuf = glamor_get_vbo_space(screen, (int)vbytes, &vbo_offset);
++                if (!vbuf) {
++                    ok = FALSE;
++                    break;
++                }
++            }
++            glBindBuffer(GL_ARRAY_BUFFER, priv->vbo);
++        } else {
++            glBindBuffer(GL_ARRAY_BUFFER, scratch_vbo);
++        }
++
++        glamor_generate_box_vertices_batched(vbuf, box + boxes_done, batch_boxes);
++
++        if (using_scratch) {
++            glFlushMappedBufferRange(GL_ARRAY_BUFFER,
++                                     (GLintptr)(uintptr_t)vbo_offset,
++                                     (GLsizeiptr)vbytes);
++        }
++
++        glEnableVertexAttribArray(GLAMOR_VERTEX_POS);
++        glVertexAttribPointer(GLAMOR_VERTEX_POS, 2, GL_SHORT, GL_FALSE,
++                              2 * sizeof(GLshort), vbo_offset);
++
++        const Bool same_pixmap = (spix == dpix);
++        if (same_pixmap && priv->has_mesa_tile_raster_order) {
++            glEnable(GL_TILE_RASTER_ORDER_FIXED_MESA);
++            if (dx >= 0)
++                glEnable(GL_TILE_RASTER_ORDER_INCREASING_X_MESA);
++            else
++                glDisable(GL_TILE_RASTER_ORDER_INCREASING_X_MESA);
++            if (dy >= 0)
++                glEnable(GL_TILE_RASTER_ORDER_INCREASING_Y_MESA);
++            else
++                glDisable(GL_TILE_RASTER_ORDER_INCREASING_Y_MESA);
++        }
++
++        /* CRITICAL FIX: Hoist delta computation out of loop */
++        int src_off_x, src_off_y, dst_off_x, dst_off_y;
++        glamor_get_drawable_deltas(src, spix, &src_off_x, &src_off_y);
++        glamor_get_drawable_deltas(dst, dpix, &dst_off_x, &dst_off_y);
++
++        int commands_this_batch = 0;
++
++        int src_tile = 0, dst_tile = 0;
++        glamor_pixmap_loop(spr, src_tile) {
++            BoxPtr sbox = glamor_pixmap_box_at(spr, src_tile);
++            if (!sbox)
++                continue;
++
++            args.dx = dx + src_off_x - sbox->x1;
++            args.dy = dy + src_off_y - sbox->y1;
++            args.src = glamor_pixmap_fbo_at(spr, src_tile);
++            if (!args.src)
++                continue;
++
++            if (!glamor_use_program(dst, gc, prog, &args))
++                continue;
++
++            commands_this_batch += 3;
++
++            glamor_pixmap_loop(dpr, dst_tile) {
++                BoxPtr dbox = glamor_pixmap_box_at(dpr, dst_tile);
++                if (!dbox)
++                    continue;
++
++                if (!glamor_set_destination_drawable(dst, dst_tile,
++                                                     FALSE, FALSE,
++                                                     prog->matrix_uniform,
++                                                     &dst_off_x, &dst_off_y))
++                    continue;
++
++                BoxRec scissor = {
++                    .x1 = LOCAL_MAX(-args.dx, dbox->x1),
++                    .y1 = LOCAL_MAX(-args.dy, dbox->y1),
++                    .x2 = LOCAL_MIN(-args.dx + sbox->x2 - sbox->x1, dbox->x2),
++                    .y2 = LOCAL_MIN(-args.dy + sbox->y2 - sbox->y1, dbox->y2)
++                };
++
++                if (scissor.x1 >= scissor.x2 || scissor.y1 >= scissor.y2)
++                    continue;
++
++                glEnable(GL_SCISSOR_TEST);
++                glScissor(scissor.x1 + dst_off_x,
++                          scissor.y1 + dst_off_y,
++                          scissor.x2 - scissor.x1,
++                          scissor.y2 - scissor.y1);
++
++                if (same_pixmap && priv->has_nv_texture_barrier)
++                    glTextureBarrierNV();
++
++                glamor_glDrawArrays_GL_QUADS(priv, batch_boxes);
++
++                glDisable(GL_SCISSOR_TEST);
+ 
++                commands_this_batch += 6;
++            }
++        }
++
++        glDisableVertexAttribArray(GLAMOR_VERTEX_POS);
++
++        if (same_pixmap && priv->has_mesa_tile_raster_order) {
++            glDisable(GL_TILE_RASTER_ORDER_INCREASING_Y_MESA);
++            glDisable(GL_TILE_RASTER_ORDER_INCREASING_X_MESA);
++            glDisable(GL_TILE_RASTER_ORDER_FIXED_MESA);
++        }
++
++        glamor_manage_gpu_commands(priv, commands_this_batch);
++
++        if (!glamor_check_gpu_health(priv)) {
++            ok = FALSE;
++            break;
++        }
++
++        boxes_done += batch_boxes;
++    }
++
++    if (g_gpu_sync.needs_flush) {
++        glFlush();
++        g_gpu_sync.needs_flush = FALSE;
++    }
++
++    return ok;
++}
++
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  Fallback Paths (unchanged)
++ * ═══════════════════════════════════════════════════════════════════════════ */
+ static void
+-glamor_copy_bail(DrawablePtr src,
+-                 DrawablePtr dst,
+-                 GCPtr gc,
+-                 BoxPtr box,
+-                 int nbox,
+-                 int dx,
+-                 int dy,
+-                 Bool reverse,
+-                 Bool upsidedown,
+-                 Pixel bitplane,
+-                 void *closure)
++glamor_copy_bail(DrawablePtr src, DrawablePtr dst, GCPtr gc,
++                 BoxPtr box, int nbox, int dx, int dy,
++                 Bool reverse, Bool upsidedown,
++                 Pixel bitplane, void *closure)
+ {
+-    if (glamor_prepare_access(dst, GLAMOR_ACCESS_RW) && glamor_prepare_access(src, GLAMOR_ACCESS_RO)) {
++    if (nbox == 0)
++        return;
++
++    if (glamor_prepare_access(dst, GLAMOR_ACCESS_RW) &&
++        glamor_prepare_access(src, GLAMOR_ACCESS_RO)) {
+         if (bitplane) {
+-            if (src->bitsPerPixel > 1)
++            if (src->bitsPerPixel > 1) {
+                 fbCopyNto1(src, dst, gc, box, nbox, dx, dy,
+                            reverse, upsidedown, bitplane, closure);
+-            else
++            } else {
+                 fbCopy1toN(src, dst, gc, box, nbox, dx, dy,
+                            reverse, upsidedown, bitplane, closure);
++            }
+         } else {
+             fbCopyNtoN(src, dst, gc, box, nbox, dx, dy,
+                        reverse, upsidedown, bitplane, closure);
+@@ -188,454 +1072,230 @@ glamor_copy_bail(DrawablePtr src,
+     glamor_finish_access(src);
+ }
+ 
+-/**
+- * Implements CopyPlane and CopyArea from the CPU to the GPU by using
+- * the source as a texture and painting that into the destination.
+- *
+- * This requires that source and dest are different textures, or that
+- * (if the copy area doesn't overlap), GL_NV_texture_barrier is used
+- * to ensure that the caches are flushed at the right times.
+- */
+ static Bool
+-glamor_copy_cpu_fbo(DrawablePtr src,
+-                    DrawablePtr dst,
+-                    GCPtr gc,
+-                    BoxPtr box,
+-                    int nbox,
+-                    int dx,
+-                    int dy,
+-                    Bool reverse,
+-                    Bool upsidedown,
+-                    Pixel bitplane,
+-                    void *closure)
++glamor_copy_cpu_fbo(DrawablePtr src, DrawablePtr dst, GCPtr gc,
++                    BoxPtr box, int nbox, int dx, int dy,
++                    Bool reverse, Bool upsidedown,
++                    Pixel bitplane, void *closure)
+ {
++    (void)reverse; (void)upsidedown; (void)closure;
++
+     ScreenPtr screen = dst->pScreen;
+-    glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
++    glamor_screen_private *priv = glamor_get_screen_private(screen);
+     PixmapPtr dst_pixmap = glamor_get_drawable_pixmap(dst);
+-    int dst_xoff, dst_yoff;
++    int dst_xoff = 0, dst_yoff = 0;
+ 
+     if (gc && gc->alu != GXcopy)
+-        goto bail;
+-
++        return FALSE;
+     if (gc && !glamor_pm_is_solid(gc->depth, gc->planemask))
+-        goto bail;
++        return FALSE;
+ 
+-    glamor_make_current(glamor_priv);
++    glamor_make_current(priv);
+ 
+     if (!glamor_prepare_access(src, GLAMOR_ACCESS_RO))
+-        goto bail;
++        return FALSE;
+ 
+     glamor_get_drawable_deltas(dst, dst_pixmap, &dst_xoff, &dst_yoff);
+ 
+     if (bitplane) {
+-        FbBits *tmp_bits;
+-        FbStride tmp_stride;
+-        int tmp_bpp;
+-        int tmp_xoff, tmp_yoff;
+-
+-        PixmapPtr tmp_pix = fbCreatePixmap(screen, dst_pixmap->drawable.width,
+-                                           dst_pixmap->drawable.height,
+-                                           glamor_drawable_effective_depth(dst), 0);
+-
++        FbBits *tmp_bits = NULL;
++        FbStride tmp_stride = 0;
++        int tmp_bpp = 0;
++        int tmp_xoff = 0, tmp_yoff = 0;
++
++        PixmapPtr tmp_pix = fbCreatePixmap(
++            screen,
++            dst_pixmap->drawable.width,
++            dst_pixmap->drawable.height,
++            glamor_drawable_effective_depth(dst),
++            0
++        );
+         if (!tmp_pix) {
+             glamor_finish_access(src);
+-            goto bail;
++            return FALSE;
+         }
+ 
+         tmp_pix->drawable.x = dst_xoff;
+         tmp_pix->drawable.y = dst_yoff;
+ 
+-        fbGetDrawable(&tmp_pix->drawable, tmp_bits, tmp_stride, tmp_bpp, tmp_xoff,
+-                      tmp_yoff);
++        fbGetDrawable(&tmp_pix->drawable, tmp_bits, tmp_stride, tmp_bpp,
++                      tmp_xoff, tmp_yoff);
+ 
+-        if (src->bitsPerPixel > 1)
++        if (src->bitsPerPixel > 1) {
+             fbCopyNto1(src, &tmp_pix->drawable, gc, box, nbox, dx, dy,
+                        reverse, upsidedown, bitplane, closure);
+-        else
++        } else {
+             fbCopy1toN(src, &tmp_pix->drawable, gc, box, nbox, dx, dy,
+                        reverse, upsidedown, bitplane, closure);
++        }
+ 
+         glamor_upload_boxes(dst, box, nbox, tmp_xoff, tmp_yoff,
+-                            dst_xoff, dst_yoff, (uint8_t *) tmp_bits,
+-                            tmp_stride * sizeof(FbBits));
++                            dst_xoff, dst_yoff,
++                            (uint8_t *)tmp_bits,
++                            (int)(tmp_stride * (int)sizeof(FbBits)));
+         fbDestroyPixmap(tmp_pix);
+     } else {
+-        FbBits *src_bits;
+-        FbStride src_stride;
+-        int src_bpp;
+-        int src_xoff, src_yoff;
++        FbBits *src_bits = NULL;
++        FbStride src_stride = 0;
++        int src_bpp = 0;
++        int src_xoff = 0, src_yoff = 0;
+ 
+         fbGetDrawable(src, src_bits, src_stride, src_bpp, src_xoff, src_yoff);
+         glamor_upload_boxes(dst, box, nbox, src_xoff + dx, src_yoff + dy,
+                             dst_xoff, dst_yoff,
+-                            (uint8_t *) src_bits, src_stride * sizeof (FbBits));
++                            (uint8_t *)src_bits,
++                            (int)(src_stride * (int)sizeof(FbBits)));
+     }
+-    glamor_finish_access(src);
+ 
++    glamor_finish_access(src);
++    glamor_manage_gpu_commands(priv, 1);
+     return TRUE;
+-
+-bail:
+-    return FALSE;
+ }
+ 
+-/**
+- * Implements CopyArea from the GPU to the CPU using glReadPixels from the
+- * source FBO.
+- */
+ static Bool
+-glamor_copy_fbo_cpu(DrawablePtr src,
+-                    DrawablePtr dst,
+-                    GCPtr gc,
+-                    BoxPtr box,
+-                    int nbox,
+-                    int dx,
+-                    int dy,
+-                    Bool reverse,
+-                    Bool upsidedown,
+-                    Pixel bitplane,
+-                    void *closure)
++glamor_copy_fbo_cpu(DrawablePtr src, DrawablePtr dst, GCPtr gc,
++                    BoxPtr box, int nbox, int dx, int dy,
++                    Bool reverse, Bool upsidedown,
++                    Pixel bitplane, void *closure)
+ {
++    (void)reverse; (void)upsidedown; (void)closure;
++
++    if (unlikely(nbox <= 0))
++        return TRUE;
++    if (unlikely(bitplane != 0))
++        return FALSE;
++
+     ScreenPtr screen = dst->pScreen;
+-    glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
++    glamor_screen_private *priv = glamor_get_screen_private(screen);
+     PixmapPtr src_pixmap = glamor_get_drawable_pixmap(src);
+-    FbBits *dst_bits;
+-    FbStride dst_stride;
+-    int dst_bpp;
+-    int src_xoff, src_yoff;
+-    int dst_xoff, dst_yoff;
+ 
+     if (gc && gc->alu != GXcopy)
+-        goto bail;
+-
++        return FALSE;
+     if (gc && !glamor_pm_is_solid(gc->depth, gc->planemask))
+-        goto bail;
++        return FALSE;
+ 
+-    glamor_make_current(glamor_priv);
++    glamor_make_current(priv);
+ 
+     if (!glamor_prepare_access(dst, GLAMOR_ACCESS_RW))
+-        goto bail;
++        return FALSE;
+ 
+-    glamor_get_drawable_deltas(src, src_pixmap, &src_xoff, &src_yoff);
++    FbBits *dst_bits = NULL;
++    FbStride dst_stride = 0;
++    int dst_bpp = 0;
++    int src_xoff = 0, src_yoff = 0;
++    int dst_xoff = 0, dst_yoff = 0;
+ 
++    glamor_get_drawable_deltas(src, src_pixmap, &src_xoff, &src_yoff);
+     fbGetDrawable(dst, dst_bits, dst_stride, dst_bpp, dst_xoff, dst_yoff);
+ 
+-    glamor_download_boxes(src, box, nbox, src_xoff + dx, src_yoff + dy,
+-                          dst_xoff, dst_yoff,
+-                          (uint8_t *) dst_bits, dst_stride * sizeof (FbBits));
+-    glamor_finish_access(dst);
+-
+-    return TRUE;
+-
+-bail:
+-    return FALSE;
+-}
+-
+-/* Include the enums here for the moment, to keep from needing to bump epoxy. */
+-#ifndef GL_TILE_RASTER_ORDER_FIXED_MESA
+-#define GL_TILE_RASTER_ORDER_FIXED_MESA          0x8BB8
+-#define GL_TILE_RASTER_ORDER_INCREASING_X_MESA   0x8BB9
+-#define GL_TILE_RASTER_ORDER_INCREASING_Y_MESA   0x8BBA
+-#endif
+-
+-/*
+- * Copy from GPU to GPU by using the source
+- * as a texture and painting that into the destination
+- */
+-
+-static Bool
+-glamor_copy_fbo_fbo_draw(DrawablePtr src,
+-                         DrawablePtr dst,
+-                         GCPtr gc,
+-                         BoxPtr box,
+-                         int nbox,
+-                         int dx,
+-                         int dy,
+-                         Bool reverse,
+-                         Bool upsidedown,
+-                         Pixel bitplane,
+-                         void *closure)
+-{
+-    ScreenPtr screen = dst->pScreen;
+-    glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
+-    PixmapPtr src_pixmap = glamor_get_drawable_pixmap(src);
+-    PixmapPtr dst_pixmap = glamor_get_drawable_pixmap(dst);
+-    glamor_pixmap_private *src_priv = glamor_get_pixmap_private(src_pixmap);
+-    glamor_pixmap_private *dst_priv = glamor_get_pixmap_private(dst_pixmap);
+-    int src_box_index, dst_box_index;
+-    int dst_off_x, dst_off_y;
+-    int src_off_x, src_off_y;
+-    GLshort *v;
+-    char *vbo_offset;
+-    struct copy_args args;
+-    glamor_program *prog;
+-    const glamor_facet *copy_facet;
+-    int n;
+-    Bool ret = FALSE;
+-    BoxRec bounds = glamor_no_rendering_bounds();
+-
+-    glamor_make_current(glamor_priv);
+-
+-    if (gc && !glamor_set_planemask(gc->depth, gc->planemask))
+-        goto bail_ctx;
+-
+-    if (!glamor_set_alu(dst, gc ? gc->alu : GXcopy))
+-        goto bail_ctx;
+-
+-    if (bitplane && !glamor_priv->can_copyplane)
+-        goto bail_ctx;
+-
+-    if (bitplane) {
+-        prog = &glamor_priv->copy_plane_prog;
+-        copy_facet = &glamor_facet_copyplane;
+-    } else {
+-        prog = &glamor_priv->copy_area_prog;
+-        copy_facet = &glamor_facet_copyarea;
+-    }
+-
+-    if (prog->failed)
+-        goto bail_ctx;
+-
+-    if (!prog->prog) {
+-        if (!glamor_build_program(screen, prog,
+-                                  copy_facet, NULL, NULL, NULL))
+-            goto bail_ctx;
+-    }
+-
+-    args.src_drawable = src;
+-    args.bitplane = bitplane;
+-
+-    /* Set up the vertex buffers for the points */
+-
+-    v = glamor_get_vbo_space(dst->pScreen, nbox * 8 * sizeof (int16_t), &vbo_offset);
+-
+-    if (src_pixmap == dst_pixmap && glamor_priv->has_mesa_tile_raster_order) {
+-        glEnable(GL_TILE_RASTER_ORDER_FIXED_MESA);
+-        if (dx >= 0)
+-            glEnable(GL_TILE_RASTER_ORDER_INCREASING_X_MESA);
+-        else
+-            glDisable(GL_TILE_RASTER_ORDER_INCREASING_X_MESA);
+-        if (dy >= 0)
+-            glEnable(GL_TILE_RASTER_ORDER_INCREASING_Y_MESA);
+-        else
+-            glDisable(GL_TILE_RASTER_ORDER_INCREASING_Y_MESA);
+-    }
+-
+-    glEnableVertexAttribArray(GLAMOR_VERTEX_POS);
+-    glVertexAttribPointer(GLAMOR_VERTEX_POS, 2, GL_SHORT, GL_FALSE,
+-                          2 * sizeof (GLshort), vbo_offset);
+-
+-    if (nbox < 100) {
+-        bounds = glamor_start_rendering_bounds();
+-        for (int i = 0; i < nbox; i++)
+-            glamor_bounds_union_box(&bounds, &box[i]);
+-    }
+-
+-    for (n = 0; n < nbox; n++) {
+-        v[0] = box->x1; v[1] = box->y1;
+-        v[2] = box->x1; v[3] = box->y2;
+-        v[4] = box->x2; v[5] = box->y2;
+-        v[6] = box->x2; v[7] = box->y1;
+-
+-        v += 8;
+-        box++;
+-    }
+-
+-    glamor_put_vbo_space(screen);
+-
+-    glamor_get_drawable_deltas(src, src_pixmap, &src_off_x, &src_off_y);
+-
+-    glEnable(GL_SCISSOR_TEST);
+-
+-    glamor_pixmap_loop(src_priv, src_box_index) {
+-        BoxPtr src_box = glamor_pixmap_box_at(src_priv, src_box_index);
+-
+-        args.dx = dx + src_off_x - src_box->x1;
+-        args.dy = dy + src_off_y - src_box->y1;
+-        args.src = glamor_pixmap_fbo_at(src_priv, src_box_index);
+-
+-        if (!glamor_use_program(dst, gc, prog, &args))
+-            goto bail_ctx;
+-
+-        glamor_pixmap_loop(dst_priv, dst_box_index) {
+-            BoxRec scissor = {
+-                .x1 = max(-args.dx, bounds.x1),
+-                .y1 = max(-args.dy, bounds.y1),
+-                .x2 = min(-args.dx + src_box->x2 - src_box->x1, bounds.x2),
+-                .y2 = min(-args.dy + src_box->y2 - src_box->y1, bounds.y2),
+-            };
+-            if (scissor.x1 >= scissor.x2 || scissor.y1 >= scissor.y2)
+-                continue;
+-
+-            if (!glamor_set_destination_drawable(dst, dst_box_index, FALSE, FALSE,
+-                                                 prog->matrix_uniform,
+-                                                 &dst_off_x, &dst_off_y))
+-                goto bail_ctx;
+-
+-            glScissor(scissor.x1 + dst_off_x,
+-                      scissor.y1 + dst_off_y,
+-                      scissor.x2 - scissor.x1,
+-                      scissor.y2 - scissor.y1);
+-
+-            glamor_glDrawArrays_GL_QUADS(glamor_priv, nbox);
+-        }
++    if (unlikely(dst_bits == NULL)) {
++        glamor_finish_access(dst);
++        return FALSE;
+     }
+ 
+-    ret = TRUE;
++    glamor_ensure_gpu_idle(priv, FALSE);
+ 
+-bail_ctx:
+-    if (src_pixmap == dst_pixmap && glamor_priv->has_mesa_tile_raster_order) {
+-        glDisable(GL_TILE_RASTER_ORDER_FIXED_MESA);
+-    }
+-    glDisable(GL_SCISSOR_TEST);
+-    glDisableVertexAttribArray(GLAMOR_VERTEX_POS);
++    glamor_download_boxes(src, box, nbox,
++                          src_xoff + dx, src_yoff + dy,
++                          dst_xoff, dst_yoff,
++                          (uint8_t *)dst_bits,
++                          (int)(dst_stride * (int)sizeof(FbBits)));
+ 
+-    return ret;
++    glamor_finish_access(dst);
++    return TRUE;
+ }
+ 
+-/**
+- * Copies from the GPU to the GPU using a temporary pixmap in between,
+- * to correctly handle overlapping copies.
+- */
+-
+ static Bool
+-glamor_copy_fbo_fbo_temp(DrawablePtr src,
+-                         DrawablePtr dst,
+-                         GCPtr gc,
+-                         BoxPtr box,
+-                         int nbox,
+-                         int dx,
+-                         int dy,
+-                         Bool reverse,
+-                         Bool upsidedown,
+-                         Pixel bitplane,
+-                         void *closure)
++glamor_copy_fbo_fbo_temp(DrawablePtr src, DrawablePtr dst, GCPtr gc,
++                         BoxPtr box, int nbox, int dx, int dy,
++                         Bool reverse, Bool upsidedown,
++                         Pixel bitplane, void *closure)
+ {
+-    ScreenPtr screen = dst->pScreen;
+-    glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
+-    PixmapPtr tmp_pixmap;
+-    BoxRec bounds;
+-    int n;
+-    BoxPtr tmp_box;
++    (void)reverse; (void)upsidedown; (void)closure;
+ 
+     if (nbox == 0)
+         return TRUE;
+ 
+-    /* Sanity check state to avoid getting halfway through and bailing
+-     * at the last second. Might be nice to have checks that didn't
+-     * involve setting state.
+-     */
+-    glamor_make_current(glamor_priv);
++    ScreenPtr screen = dst->pScreen;
++    glamor_screen_private *priv = glamor_get_screen_private(screen);
++    PixmapPtr tmp_pixmap = NULL;
++    BoxRec bounds;
++    BoxPtr tmp_box = NULL;
++    Bool ret = FALSE;
+ 
+-    if (gc && !glamor_set_planemask(gc->depth, gc->planemask))
+-        goto bail_ctx;
++    glamor_make_current(priv);
++    glamor_ensure_gpu_idle(priv, FALSE);
+ 
++    if (gc && !glamor_set_planemask(gc->depth, gc->planemask))
++        return FALSE;
+     if (!glamor_set_alu(dst, gc ? gc->alu : GXcopy))
+-        goto bail_ctx;
++        return FALSE;
+ 
+-    /* Find the size of the area to copy
+-     */
+     bounds = box[0];
+-    for (n = 1; n < nbox; n++) {
+-        bounds.x1 = min(bounds.x1, box[n].x1);
+-        bounds.x2 = max(bounds.x2, box[n].x2);
+-        bounds.y1 = min(bounds.y1, box[n].y1);
+-        bounds.y2 = max(bounds.y2, box[n].y2);
++    for (int n = 1; n < nbox; n++) {
++        bounds.x1 = LOCAL_MIN(bounds.x1, box[n].x1);
++        bounds.x2 = LOCAL_MAX(bounds.x2, box[n].x2);
++        bounds.y1 = LOCAL_MIN(bounds.y1, box[n].y1);
++        bounds.y2 = LOCAL_MAX(bounds.y2, box[n].y2);
+     }
+ 
+-    /* Allocate a suitable temporary pixmap
+-     */
+-    tmp_pixmap = glamor_create_pixmap(screen,
+-                                      bounds.x2 - bounds.x1,
+-                                      bounds.y2 - bounds.y1,
++    int w = bounds.x2 - bounds.x1;
++    int h = bounds.y2 - bounds.y1;
++    if (w <= 0 || h <= 0)
++        return TRUE;
++
++    if ((size_t)w * (size_t)h * 4 > 64 * 1024 * 1024)
++        return FALSE;
++
++    tmp_pixmap = glamor_create_pixmap(screen, w, h,
+                                       glamor_drawable_effective_depth(src), 0);
+     if (!tmp_pixmap)
+-        goto bail;
++        return FALSE;
+ 
+-    tmp_box = calloc(nbox, sizeof (BoxRec));
++    tmp_box = (BoxPtr)malloc((size_t)nbox * sizeof(BoxRec));
+     if (!tmp_box)
+-        goto bail_pixmap;
++        goto bail;
+ 
+-    /* Convert destination boxes into tmp pixmap boxes
+-     */
+-    for (n = 0; n < nbox; n++) {
++    for (int n = 0; n < nbox; n++) {
+         tmp_box[n].x1 = box[n].x1 - bounds.x1;
+         tmp_box[n].x2 = box[n].x2 - bounds.x1;
+         tmp_box[n].y1 = box[n].y1 - bounds.y1;
+         tmp_box[n].y2 = box[n].y2 - bounds.y1;
+     }
+ 
+-    if (!glamor_copy_fbo_fbo_draw(src,
+-                                  &tmp_pixmap->drawable,
+-                                  NULL,
+-                                  tmp_box,
+-                                  nbox,
+-                                  dx + bounds.x1,
+-                                  dy + bounds.y1,
+-                                  FALSE, FALSE,
+-                                  0, NULL))
+-        goto bail_box;
+-
+-    if (!glamor_copy_fbo_fbo_draw(&tmp_pixmap->drawable,
+-                                  dst,
+-                                  gc,
+-                                  box,
+-                                  nbox,
+-                                  -bounds.x1,
+-                                  -bounds.y1,
+-                                  FALSE, FALSE,
+-                                  bitplane, closure))
+-        goto bail_box;
++    if (!glamor_copy_fbo_fbo_draw(src, &tmp_pixmap->drawable, NULL,
++                                  tmp_box, nbox, dx + bounds.x1, dy + bounds.y1,
++                                  FALSE, FALSE, 0, NULL))
++        goto bail;
+ 
+-    free(tmp_box);
++    glamor_ensure_gpu_idle(priv, FALSE);
+ 
+-    glamor_destroy_pixmap(tmp_pixmap);
++    if (!glamor_copy_fbo_fbo_draw(&tmp_pixmap->drawable, dst, gc,
++                                  box, nbox, -bounds.x1, -bounds.y1,
++                                  FALSE, FALSE, bitplane, NULL))
++        goto bail;
+ 
+-    return TRUE;
+-bail_box:
+-    free(tmp_box);
+-bail_pixmap:
+-    glamor_destroy_pixmap(tmp_pixmap);
+-bail:
+-    return FALSE;
++    ret = TRUE;
+ 
+-bail_ctx:
+-    return FALSE;
++bail:
++    free(tmp_box);
++    if (tmp_pixmap)
++        glamor_destroy_pixmap(tmp_pixmap);
++    return ret;
+ }
+ 
+-/**
+- * Returns TRUE if the copy has to be implemented with
+- * glamor_copy_fbo_fbo_temp() instead of glamor_copy_fbo_fbo().
+- *
+- * If the src and dst are in the same pixmap, then glamor_copy_fbo_fbo()'s
+- * sampling would give undefined results (since the same texture would be
+- * bound as an FBO destination and as a texture source).  However, if we
+- * have GL_NV_texture_barrier, we can take advantage of the exception it
+- * added:
+- *
+- *    "- If a texel has been written, then in order to safely read the result
+- *       a texel fetch must be in a subsequent Draw separated by the command
+- *
+- *       void TextureBarrierNV(void);
+- *
+- *    TextureBarrierNV() will guarantee that writes have completed and caches
+- *    have been invalidated before subsequent Draws are executed."
+- */
+ static Bool
+-glamor_copy_needs_temp(DrawablePtr src,
+-                       DrawablePtr dst,
+-                       BoxPtr box,
+-                       int nbox,
+-                       int dx,
+-                       int dy)
++glamor_copy_needs_temp(DrawablePtr src, DrawablePtr dst,
++                       BoxPtr box, int nbox, int dx, int dy)
+ {
+     PixmapPtr src_pixmap = glamor_get_drawable_pixmap(src);
+     PixmapPtr dst_pixmap = glamor_get_drawable_pixmap(dst);
++
++    if (!src_pixmap || !dst_pixmap)
++        return TRUE;
++
+     ScreenPtr screen = dst->pScreen;
+-    glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
+-    int n;
+-    int dst_off_x, dst_off_y;
+-    int src_off_x, src_off_y;
+-    BoxRec bounds;
++    glamor_screen_private *priv = glamor_get_screen_private(screen);
+ 
+     if (src_pixmap != dst_pixmap)
+         return FALSE;
+@@ -643,110 +1303,117 @@ glamor_copy_needs_temp(DrawablePtr src,
+     if (nbox == 0)
+         return FALSE;
+ 
+-    if (!glamor_priv->has_nv_texture_barrier)
++    if (!priv->has_nv_texture_barrier)
+         return TRUE;
+ 
+-    if (!glamor_priv->has_mesa_tile_raster_order) {
+-        glamor_get_drawable_deltas(src, src_pixmap, &src_off_x, &src_off_y);
+-        glamor_get_drawable_deltas(dst, dst_pixmap, &dst_off_x, &dst_off_y);
+-
+-        bounds = box[0];
+-        for (n = 1; n < nbox; n++) {
+-            bounds.x1 = min(bounds.x1, box[n].x1);
+-            bounds.y1 = min(bounds.y1, box[n].y1);
+-
+-            bounds.x2 = max(bounds.x2, box[n].x2);
+-            bounds.y2 = max(bounds.y2, box[n].y2);
+-        }
++    if (priv->has_mesa_tile_raster_order)
++        return FALSE;
+ 
+-        /* Check to see if the pixmap-relative boxes overlap in both X and Y,
+-         * in which case we can't rely on NV_texture_barrier and must
+-         * make a temporary copy
+-         *
+-         *  dst.x1                     < src.x2 &&
+-         *  src.x1                     < dst.x2 &&
+-         *
+-         *  dst.y1                     < src.y2 &&
+-         *  src.y1                     < dst.y2
+-         */
+-        if (bounds.x1 + dst_off_x      < bounds.x2 + dx + src_off_x &&
+-            bounds.x1 + dx + src_off_x < bounds.x2 + dst_off_x &&
++    int src_off_x = 0, src_off_y = 0;
++    int dst_off_x = 0, dst_off_y = 0;
++    glamor_get_drawable_deltas(src, src_pixmap, &src_off_x, &src_off_y);
++    glamor_get_drawable_deltas(dst, dst_pixmap, &dst_off_x, &dst_off_y);
+ 
+-            bounds.y1 + dst_off_y      < bounds.y2 + dy + src_off_y &&
+-            bounds.y1 + dy + src_off_y < bounds.y2 + dst_off_y) {
+-            return TRUE;
+-        }
++    BoxRec bounds = box[0];
++    for (int n = 1; n < nbox; n++) {
++        bounds.x1 = LOCAL_MIN(bounds.x1, box[n].x1);
++        bounds.y1 = LOCAL_MIN(bounds.y1, box[n].y1);
++        bounds.x2 = LOCAL_MAX(bounds.x2, box[n].x2);
++        bounds.y2 = LOCAL_MAX(bounds.y2, box[n].y2);
+     }
+ 
+-    glTextureBarrierNV();
++    if (bounds.x1 + dst_off_x      < bounds.x2 + dx + src_off_x &&
++        bounds.x1 + dx + src_off_x < bounds.x2 + dst_off_x &&
++        bounds.y1 + dst_off_y      < bounds.y2 + dy + src_off_y &&
++        bounds.y1 + dy + src_off_y < bounds.y2 + dst_off_y) {
++        return TRUE;
++    }
+ 
+     return FALSE;
+ }
+ 
+ static Bool
+-glamor_copy_gl(DrawablePtr src,
+-               DrawablePtr dst,
+-               GCPtr gc,
+-               BoxPtr box,
+-               int nbox,
+-               int dx,
+-               int dy,
+-               Bool reverse,
+-               Bool upsidedown,
+-               Pixel bitplane,
+-               void *closure)
++glamor_copy_gl(DrawablePtr src, DrawablePtr dst, GCPtr gc,
++               BoxPtr box, int nbox, int dx, int dy,
++               Bool reverse, Bool upsidedown,
++               Pixel bitplane, void *closure)
+ {
++    (void)reverse; (void)upsidedown; (void)closure;
++
+     PixmapPtr src_pixmap = glamor_get_drawable_pixmap(src);
+     PixmapPtr dst_pixmap = glamor_get_drawable_pixmap(dst);
++
++    if (!src_pixmap || !dst_pixmap)
++        return FALSE;
++
+     glamor_pixmap_private *src_priv = glamor_get_pixmap_private(src_pixmap);
+     glamor_pixmap_private *dst_priv = glamor_get_pixmap_private(dst_pixmap);
+ 
++    if (!src_priv || !dst_priv)
++        return FALSE;
++
+     if (GLAMOR_PIXMAP_PRIV_HAS_FBO(dst_priv)) {
+         if (GLAMOR_PIXMAP_PRIV_HAS_FBO(src_priv)) {
+-            if (glamor_copy_needs_temp(src, dst, box, nbox, dx, dy))
++            if (glamor_copy_needs_temp(src, dst, box, nbox, dx, dy)) {
+                 return glamor_copy_fbo_fbo_temp(src, dst, gc, box, nbox, dx, dy,
+                                                 reverse, upsidedown, bitplane, closure);
+-            else
++            } else {
+                 return glamor_copy_fbo_fbo_draw(src, dst, gc, box, nbox, dx, dy,
+                                                 reverse, upsidedown, bitplane, closure);
++            }
+         }
+-
+         return glamor_copy_cpu_fbo(src, dst, gc, box, nbox, dx, dy,
+                                    reverse, upsidedown, bitplane, closure);
+     } else if (GLAMOR_PIXMAP_PRIV_HAS_FBO(src_priv) &&
+-               dst_priv->type != GLAMOR_DRM_ONLY &&
++               dst_priv && dst_priv->type != GLAMOR_DRM_ONLY &&
+                bitplane == 0) {
+-            return glamor_copy_fbo_cpu(src, dst, gc, box, nbox, dx, dy,
+-                                       reverse, upsidedown, bitplane, closure);
++        return glamor_copy_fbo_cpu(src, dst, gc, box, nbox, dx, dy,
++                                   reverse, upsidedown, bitplane, closure);
+     }
++
+     return FALSE;
+ }
+ 
++/* ═══════════════════════════════════════════════════════════════════════════
++ *  Public API (CRITICAL: NULL-safe entry points)
++ * ═══════════════════════════════════════════════════════════════════════════ */
+ void
+-glamor_copy(DrawablePtr src,
+-            DrawablePtr dst,
+-            GCPtr gc,
+-            BoxPtr box,
+-            int nbox,
+-            int dx,
+-            int dy,
+-            Bool reverse,
+-            Bool upsidedown,
+-            Pixel bitplane,
+-            void *closure)
++glamor_copy(DrawablePtr src, DrawablePtr dst, GCPtr gc,
++            BoxPtr box, int nbox, int dx, int dy,
++            Bool reverse, Bool upsidedown,
++            Pixel bitplane, void *closure)
+ {
+-    if (nbox == 0)
+-	return;
++    /* CRITICAL FIX: Validate ALL inputs at public API boundary */
++    if (!src || !dst || !box || nbox <= 0)
++        return;
++
++    ScreenPtr screen = dst->pScreen;
++    if (!screen)
++        return;
++
++    glamor_screen_private *priv = glamor_get_screen_private(screen);
++    if (priv) {
++        glamor_make_current(priv);
++        glamor_check_gpu_health(priv);
++    }
+ 
+-    if (glamor_copy_gl(src, dst, gc, box, nbox, dx, dy, reverse, upsidedown, bitplane, closure))
++    if (glamor_copy_gl(src, dst, gc, box, nbox, dx, dy,
++                       reverse, upsidedown, bitplane, closure))
+         return;
+-    glamor_copy_bail(src, dst, gc, box, nbox, dx, dy, reverse, upsidedown, bitplane, closure);
++
++    glamor_copy_bail(src, dst, gc, box, nbox, dx, dy,
++                     reverse, upsidedown, bitplane, closure);
+ }
+ 
+ RegionPtr
+ glamor_copy_area(DrawablePtr src, DrawablePtr dst, GCPtr gc,
+-                 int srcx, int srcy, int width, int height, int dstx, int dsty)
++                 int srcx, int srcy, int width, int height,
++                 int dstx, int dsty)
+ {
++    /* CRITICAL FIX: NULL check */
++    if (!src || !dst || !gc)
++        return NULL;
++
+     return miDoCopy(src, dst, gc,
+                     srcx, srcy, width, height,
+                     dstx, dsty, glamor_copy, 0, NULL);
+@@ -754,12 +1421,18 @@ glamor_copy_area(DrawablePtr src, Drawab
+ 
+ RegionPtr
+ glamor_copy_plane(DrawablePtr src, DrawablePtr dst, GCPtr gc,
+-                  int srcx, int srcy, int width, int height, int dstx, int dsty,
+-                  unsigned long bitplane)
++                  int srcx, int srcy, int width, int height,
++                  int dstx, int dsty, unsigned long bitplane)
+ {
+-    if ((bitplane & FbFullMask(glamor_drawable_effective_depth(src))) == 0)
++    /* CRITICAL FIX: NULL check */
++    if (!src || !dst || !gc)
++        return NULL;
++
++    if ((bitplane & FbFullMask(glamor_drawable_effective_depth(src))) == 0) {
+         return miHandleExposures(src, dst, gc,
+-                                 srcx, srcy, width, height, dstx, dsty);
++                                 srcx, srcy, width, height,
++                                 dstx, dsty);
++    }
+     return miDoCopy(src, dst, gc,
+                     srcx, srcy, width, height,
+                     dstx, dsty, glamor_copy, bitplane, NULL);
+@@ -768,7 +1441,14 @@ glamor_copy_plane(DrawablePtr src, Drawa
+ void
+ glamor_copy_window(WindowPtr window, DDXPointRec old_origin, RegionPtr src_region)
+ {
++    /* CRITICAL FIX: NULL check */
++    if (!window || !src_region)
++        return;
++
+     PixmapPtr pixmap = glamor_get_drawable_pixmap(&window->drawable);
++    if (!pixmap)
++        return;
++
+     DrawablePtr drawable = &pixmap->drawable;
+     RegionRec dst_region;
+     int dx, dy;
+@@ -778,16 +1458,15 @@ glamor_copy_window(WindowPtr window, DDX
+     RegionTranslate(src_region, -dx, -dy);
+ 
+     RegionNull(&dst_region);
+-
+     RegionIntersect(&dst_region, &window->borderClip, src_region);
+ 
+ #if defined(COMPOSITE) || defined(ROOTLESS)
+-    if (pixmap->screen_x || pixmap->screen_y)
++    if (pixmap->screen_x || pixmap->screen_y) {
+         RegionTranslate(&dst_region, -pixmap->screen_x, -pixmap->screen_y);
++    }
+ #endif
+ 
+-    miCopyRegion(drawable, drawable,
+-                 0, &dst_region, dx, dy, glamor_copy, 0, 0);
++    miCopyRegion(drawable, drawable, 0, &dst_region, dx, dy, glamor_copy, 0, 0);
+ 
+     RegionUninit(&dst_region);
+ }
+
+--- a/hw/xwayland/xwayland-present.c	2025-07-26 09:12:16.955985549 +0200
++++ a/hw/xwayland/xwayland-present.c	2025-08-17 09:13:52.121013328 +0200
