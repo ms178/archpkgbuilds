@@ -24,6 +24,9 @@
 #include <strings.h>
 #include <stdlib.h>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+
 #if defined(__GNUC__)
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
@@ -67,6 +70,57 @@ memcpy_streaming(void *dst, const void *src, size_t n)
     if (unlikely(n == 0))
         return;
 
+    /* Prefetch for large transfers */
+    if (n >= (size_t)(512 * 1024)) {
+        const char *s = (const char *)src;
+        for (size_t i = 0; i < n; i += 65536)
+            __builtin_prefetch(s + i, 0, 0);
+    }
+
+    /* Fast path: Use non-temporal stores for large aligned copies */
+    if (n >= (size_t)(256 * 1024)) {
+        uintptr_t dst_addr = (uintptr_t)dst;
+        uintptr_t src_addr = (uintptr_t)src;
+
+        /* Check 32-byte alignment (required for _mm256_stream_si256) */
+        if ((dst_addr & 31) == 0 && (src_addr & 31) == 0) {
+            const __m256i *src_vec = (const __m256i *)src;
+            __m256i *dst_vec = (__m256i *)dst;
+            size_t vec_count = n / 32;
+            size_t remainder = n % 32;
+
+            /* Non-temporal streaming stores (bypass cache) */
+            for (size_t i = 0; i < vec_count; i++) {
+                __m256i data = _mm256_stream_load_si256(src_vec + i); /* NT load */
+                _mm256_stream_si256(dst_vec + i, data);              /* NT store */
+            }
+
+            /* Ensure NT stores complete before subsequent access */
+            _mm_sfence();
+
+            /* Handle remainder with regular memcpy */
+            if (remainder > 0) {
+                const char *src_tail = (const char *)src + (vec_count * 32);
+                char *dst_tail = (char *)dst + (vec_count * 32);
+                memcpy(dst_tail, src_tail, remainder);
+            }
+
+            return;
+        }
+    }
+
+    /* Fallback: Regular memcpy for small/unaligned copies */
+    memcpy(dst, src, n);
+}
+
+#else
+
+static inline void
+memcpy_streaming(void *dst, const void *src, size_t n)
+{
+    if (unlikely(n == 0))
+        return;
+
     if (n >= (size_t)(512 * 1024)) {
         const char *s = (const char *)src;
         for (size_t i = 0; i < n; i += 65536)
@@ -74,6 +128,8 @@ memcpy_streaming(void *dst, const void *src, size_t n)
     }
     memcpy(dst, src, n);
 }
+
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  RAII GL State Guard (CRITICAL: ensures restore on ALL code paths)
@@ -771,7 +827,6 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
                               int x, int y, int w, int h,
                               int leftPad, const char *bits)
 {
-    /* CRITICAL FIX: NULL checks */
     if (!drawable || !gc || !bits)
         return FALSE;
 
@@ -795,7 +850,6 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
 
     glamor_make_current(priv);
 
-    /* CRITICAL FIX: RAII guard for GL state */
     gl_pixel_store_state saved_state = {0};
     gl_save_pixel_store(&saved_state);
 
@@ -838,19 +892,23 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-    GLsizei alloc_w = (GLsizei)round_up((size_t)stride, 256);
-    GLsizei alloc_h = (GLsizei)round_up((size_t)h, 64);
-    if (alloc_w != cache->w || alloc_h != cache->h) {
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8UI, alloc_w, alloc_h, 0,
-                     GL_RED_INTEGER, GL_UNSIGNED_BYTE, NULL);
-        cache->w = alloc_w;
-        cache->h = alloc_h;
-    }
+    /* FIX #1: Allocate exact size (no rounding up) to prevent stale data */
+    GLsizei needed_w = (GLsizei)stride;
+    GLsizei needed_h = (GLsizei)h;
 
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)stride, (GLsizei)h,
-                    GL_RED_INTEGER, GL_UNSIGNED_BYTE, bits);
+    /* FIX #2: Reallocate if too small OR too large (prevents stale texels) */
+    if (cache->w != needed_w || cache->h != needed_h) {
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8UI, needed_w, needed_h, 0,
+                     GL_RED_INTEGER, GL_UNSIGNED_BYTE, bits); /* Upload directly */
+        cache->w = needed_w;
+        cache->h = needed_h;
+    } else {
+        /* FIX #3: Upload entire texture region to overwrite stale data */
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, needed_w, needed_h,
+                        GL_RED_INTEGER, GL_UNSIGNED_BYTE, bits);
+    }
 
     glUniform1i(prog->font_uniform, 1);
 
@@ -886,7 +944,6 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
         glamor_set_destination_drawable(drawable, box_index, TRUE, FALSE,
                                         prog->matrix_uniform, &off_x, &off_y);
 
-        /* CRITICAL FIX: NULL-safe clip */
         if (gc && gc->pCompositeClip) {
             int nbox = RegionNumRects(gc->pCompositeClip);
             const BoxPtr boxes = RegionRects(gc->pCompositeClip);

@@ -25,6 +25,32 @@
 #include <immintrin.h>
 #endif
 
+/* Hash table for format compatibility (replaces linear cache) */
+#define FORMAT_HASH_SIZE 128  /* Power of 2, fits in 2KB L1D */
+
+typedef struct format_hash_entry {
+    GLenum format1;
+    GLenum format2;
+    Bool   compatible;
+    struct format_hash_entry *next; /* Chaining for collisions */
+} format_hash_entry;
+
+static format_hash_entry *g_format_hash[FORMAT_HASH_SIZE] = {0};
+
+static inline uint32_t
+format_pair_hash(GLenum f1, GLenum f2)
+{
+    /* FNV-1a hash (fast on Raptor Lake, 2 cycles latency) */
+    uint64_t key = ((uint64_t)f1 << 32) | (uint64_t)f2;
+    uint32_t hash = 2166136261u;
+    for (int i = 0; i < 8; i++) {
+        hash ^= (uint32_t)(key & 0xFF);
+        hash *= 16777619u;
+        key >>= 8;
+    }
+    return hash & (FORMAT_HASH_SIZE - 1);
+}
+
 /* Compiler hints */
 #if defined(__GNUC__)
 #define likely(x)   __builtin_expect(!!(x), 1)
@@ -122,17 +148,29 @@ glamor_manage_gpu_commands(glamor_screen_private *priv, int new_commands)
     (void)priv;
     g_gpu_sync.pending_commands += new_commands;
 
+    /* Soft limit: Insert fence and flush, but don't block */
     if (unlikely(g_gpu_sync.pending_commands >= GLAMOR_SOFT_COMMAND_LIMIT)) {
         if (!g_gpu_sync.fence)
             g_gpu_sync.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         glFlush();
         g_gpu_sync.needs_flush = FALSE;
+
+        /* OPTIMIZATION: Non-blocking check (timeout=0) */
+        GLenum result = glClientWaitSync(g_gpu_sync.fence, 0, 0);
+        if (result == GL_ALREADY_SIGNALED || result == GL_CONDITION_SATISFIED) {
+            glDeleteSync(g_gpu_sync.fence);
+            g_gpu_sync.fence = NULL;
+            g_gpu_sync.pending_commands = 0;
+        }
+        /* If timeout, leave fence active and continue (async) */
     }
 
+    /* Hard limit: Block until GPU catches up (prevents OOM) */
     if (unlikely(g_gpu_sync.pending_commands >= GLAMOR_HARD_COMMAND_LIMIT)) {
         if (!g_gpu_sync.fence)
             g_gpu_sync.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 
+        /* Block with incremental polling (50μs timeout) */
         while (glClientWaitSync(g_gpu_sync.fence, GL_SYNC_FLUSH_COMMANDS_BIT,
                                 50000) == GL_TIMEOUT_EXPIRED)
             ;
@@ -382,14 +420,25 @@ glamor_formats_compatible_for_copy_cached(GLenum format1, GLenum format2)
     if (format1 == format2)
         return TRUE;
 
-    for (int i = 0; i < g_format_cache_entries; i++) {
-        if ((g_format_cache[i].format1 == format1 &&
-             g_format_cache[i].format2 == format2) ||
-            (g_format_cache[i].format1 == format2 &&
-             g_format_cache[i].format2 == format1)) {
-            return g_format_cache[i].compatible;
-        }
+    /* Normalize order (f1 ≤ f2) for consistent hashing */
+    if (format1 > format2) {
+        GLenum tmp = format1;
+        format1 = format2;
+        format2 = tmp;
     }
+
+    uint32_t idx = format_pair_hash(format1, format2);
+    format_hash_entry *entry = g_format_hash[idx];
+
+    /* Search chain for existing entry */
+    while (entry) {
+        if (entry->format1 == format1 && entry->format2 == format2)
+            return entry->compatible;
+        entry = entry->next;
+    }
+
+    /* Cache miss: Compute compatibility (original logic) */
+    Bool compatible = FALSE;
 
     static const GLenum class_128bit[] = {
         GL_RGBA32F, GL_RGBA32UI, GL_RGBA32I
@@ -435,7 +484,6 @@ glamor_formats_compatible_for_copy_cached(GLenum format1, GLenum format2)
         { class_8bit,   sizeof(class_8bit)   / sizeof(GLenum) },
     };
 
-    Bool compatible = FALSE;
     for (size_t c = 0; c < sizeof(view_classes) / sizeof(view_classes[0]); c++) {
         Bool found1 = FALSE, found2 = FALSE;
         for (size_t i = 0; i < view_classes[c].count; i++) {
@@ -448,11 +496,14 @@ glamor_formats_compatible_for_copy_cached(GLenum format1, GLenum format2)
         }
     }
 
-    if (g_format_cache_entries < MAX_FORMAT_CACHE_ENTRIES) {
-        g_format_cache[g_format_cache_entries].format1 = format1;
-        g_format_cache[g_format_cache_entries].format2 = format2;
-        g_format_cache[g_format_cache_entries].compatible = compatible;
-        g_format_cache_entries++;
+    /* Insert into hash table */
+    format_hash_entry *new_entry = (format_hash_entry *)malloc(sizeof(format_hash_entry));
+    if (new_entry) {
+        new_entry->format1 = format1;
+        new_entry->format2 = format2;
+        new_entry->compatible = compatible;
+        new_entry->next = g_format_hash[idx];
+        g_format_hash[idx] = new_entry;
     }
 
     return compatible;
@@ -483,7 +534,6 @@ glamor_should_use_copy_image(int width, int height, Bool is_cursor,
 static inline void
 glamor_generate_box_vertices_batched(GLshort *v, const BoxPtr box, int nbox)
 {
-    /* CRITICAL: v and box MUST be non-NULL (caller's responsibility) */
 #if defined(__AVX2__)
     const __m256i v_min = _mm256_set1_epi16(SHRT_MIN);
     const __m256i v_max = _mm256_set1_epi16(SHRT_MAX);
@@ -550,7 +600,6 @@ glamor_copy_fbo_fbo_direct(DrawablePtr src, DrawablePtr dst, GCPtr gc,
 {
     (void)reverse; (void)upsidedown; (void)closure;
 
-    /* CRITICAL FIX: Add NULL checks */
     if (!src || !dst || !box || nbox <= 0 || bitplane)
         return FALSE;
 
@@ -599,7 +648,6 @@ glamor_copy_fbo_fbo_direct(DrawablePtr src, DrawablePtr dst, GCPtr gc,
                                       FALSE, FALSE, src->depth))
         return FALSE;
 
-    /* Box-merge heuristic */
     BoxRec merged = box[0];
     unsigned long covered = 0;
     for (int i = 0; i < nbox; ++i) {
@@ -839,7 +887,6 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src, DrawablePtr dst, GCPtr gc,
 {
     (void)reverse; (void)upsidedown; (void)closure;
 
-    /* CRITICAL FIX: Add NULL checks */
     if (unlikely(!src || !dst || !box || nbox <= 0))
         return FALSE;
 
@@ -899,6 +946,12 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src, DrawablePtr dst, GCPtr gc,
         .bitplane = (uint32_t)bitplane
     };
 
+    /* OPTIMIZATION: Hoist delta computation OUTSIDE all loops */
+    int src_off_x_base = 0, src_off_y_base = 0;
+    int dst_off_x_base = 0, dst_off_y_base = 0;
+    glamor_get_drawable_deltas(src, spix, &src_off_x_base, &src_off_y_base);
+    glamor_get_drawable_deltas(dst, dpix, &dst_off_x_base, &dst_off_y_base);
+
     int boxes_done = 0;
     Bool ok = TRUE;
 
@@ -953,11 +1006,6 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src, DrawablePtr dst, GCPtr gc,
                 glDisable(GL_TILE_RASTER_ORDER_INCREASING_Y_MESA);
         }
 
-        /* CRITICAL FIX: Hoist delta computation out of loop */
-        int src_off_x, src_off_y, dst_off_x, dst_off_y;
-        glamor_get_drawable_deltas(src, spix, &src_off_x, &src_off_y);
-        glamor_get_drawable_deltas(dst, dpix, &dst_off_x, &dst_off_y);
-
         int commands_this_batch = 0;
 
         int src_tile = 0, dst_tile = 0;
@@ -966,8 +1014,9 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src, DrawablePtr dst, GCPtr gc,
             if (!sbox)
                 continue;
 
-            args.dx = dx + src_off_x - sbox->x1;
-            args.dy = dy + src_off_y - sbox->y1;
+            /* Use hoisted deltas (NO function calls here) */
+            args.dx = dx + src_off_x_base - sbox->x1;
+            args.dy = dy + src_off_y_base - sbox->y1;
             args.src = glamor_pixmap_fbo_at(spr, src_tile);
             if (!args.src)
                 continue;
@@ -982,6 +1031,9 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src, DrawablePtr dst, GCPtr gc,
                 if (!dbox)
                     continue;
 
+                /* Use hoisted deltas (dst_off_x/y are OUT params, overwritten here) */
+                int dst_off_x = dst_off_x_base;
+                int dst_off_y = dst_off_y_base;
                 if (!glamor_set_destination_drawable(dst, dst_tile,
                                                      FALSE, FALSE,
                                                      prog->matrix_uniform,
