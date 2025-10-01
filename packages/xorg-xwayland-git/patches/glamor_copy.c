@@ -895,6 +895,8 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src, DrawablePtr dst, GCPtr gc,
         return FALSE;
 
     glamor_screen_private *priv = glamor_get_screen_private(screen);
+    if (!priv)
+        return FALSE;
 
     if (!bitplane &&
         glamor_check_copy_image_support() &&
@@ -946,7 +948,7 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src, DrawablePtr dst, GCPtr gc,
         .bitplane = (uint32_t)bitplane
     };
 
-    /* OPTIMIZATION: Hoist delta computation OUTSIDE all loops */
+    /* Hoist delta computation outside loops (correctness, not optimization) */
     int src_off_x_base = 0, src_off_y_base = 0;
     int dst_off_x_base = 0, dst_off_y_base = 0;
     glamor_get_drawable_deltas(src, spix, &src_off_x_base, &src_off_y_base);
@@ -955,12 +957,20 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src, DrawablePtr dst, GCPtr gc,
     int boxes_done = 0;
     Bool ok = TRUE;
 
+    /* Use original batch size (no optimization) */
+    const int batch_size = GLAMOR_COMMAND_BATCH_SIZE;
+
     while (boxes_done < nbox) {
-        const int batch_boxes = LOCAL_MIN(nbox - boxes_done,
-                                          GLAMOR_COMMAND_BATCH_SIZE);
+        const int batch_boxes = LOCAL_MIN(nbox - boxes_done, batch_size);
         const size_t vbytes = (size_t)batch_boxes *
                               GLAMOR_VERTEX_PER_BOX *
                               sizeof(GLshort);
+
+        /* Safety check */
+        if (vbytes > GLAMOR_VBO_MAX_SIZE || vbytes == 0) {
+            ok = FALSE;
+            break;
+        }
 
         char *vbo_offset = NULL;
         GLshort *vbuf = scratch_vbo_alloc(priv, vbytes, &vbo_offset);
@@ -1014,7 +1024,6 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src, DrawablePtr dst, GCPtr gc,
             if (!sbox)
                 continue;
 
-            /* Use hoisted deltas (NO function calls here) */
             args.dx = dx + src_off_x_base - sbox->x1;
             args.dy = dy + src_off_y_base - sbox->y1;
             args.src = glamor_pixmap_fbo_at(spr, src_tile);
@@ -1031,7 +1040,6 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src, DrawablePtr dst, GCPtr gc,
                 if (!dbox)
                     continue;
 
-                /* Use hoisted deltas (dst_off_x/y are OUT params, overwritten here) */
                 int dst_off_x = dst_off_x_base;
                 int dst_off_y = dst_off_y_base;
                 if (!glamor_set_destination_drawable(dst, dst_tile,
