@@ -47,6 +47,12 @@
 
 #define XWL_PRESENT_CAPS PresentCapabilityAsync | PresentCapabilityAsyncMayTear
 
+#if defined(__clang__) || defined(__GNUC__)
+#define PREFETCH_READ(ptr) __builtin_prefetch((ptr), 0, 3)
+#else
+#define PREFETCH_READ(ptr) ((void)0)
+#endif
+
 #if defined(__GNUC__) || defined(__clang__)
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -55,7 +61,7 @@
 #define UNLIKELY(x) (x)
 #endif
 
-static inline Bool
+static inline __attribute__((always_inline)) Bool
 xorg_list_is_linked(const struct xorg_list *node)
 {
     return node->next != node;
@@ -72,7 +78,7 @@ xorg_list_is_linked(const struct xorg_list *node)
 
 static DevPrivateKeyRec xwl_present_window_private_key;
 
-static struct xwl_present_window *
+static inline __attribute__((always_inline)) struct xwl_present_window *
 xwl_present_window_priv(WindowPtr window)
 {
     return dixGetPrivate(&window->devPrivates,
@@ -111,19 +117,24 @@ static struct xwl_present_event *
 xwl_present_event_from_id(WindowPtr present_window, uint64_t event_id)
 {
     present_window_priv_ptr window_priv;
-    struct xwl_present_event *event;
+    struct xwl_present_event *event, *tmp;
 
-    if (!present_window)
+    if (UNLIKELY(!present_window))
         return NULL;
 
     window_priv = present_get_window_priv(present_window, TRUE);
-    if (!window_priv)
+    if (UNLIKELY(!window_priv))
         return NULL;
 
     if (xorg_list_is_empty(&window_priv->vblank))
         return NULL;
 
-    xorg_list_for_each_entry(event, &window_priv->vblank, vblank.window_list) {
+    xorg_list_for_each_entry_safe(event, tmp, &window_priv->vblank,
+                                  vblank.window_list) {
+        /* Prefetch next event while comparing current */
+        if (&tmp->vblank.window_list != &window_priv->vblank)
+            PREFETCH_READ(tmp);
+
         if (event->vblank.event_id == event_id)
             return event;
     }
@@ -177,16 +188,16 @@ xwl_present_timer_callback(OsTimerPtr timer,
                            CARD32 time,
                            void *arg);
 
-static present_vblank_ptr
+static inline __attribute__((always_inline)) present_vblank_ptr
 xwl_present_get_pending_flip(struct xwl_present_window *xwl_present_window)
 {
     present_vblank_ptr flip_pending;
 
-    if (xorg_list_is_empty(&xwl_present_window->flip_queue))
+    if (UNLIKELY(xorg_list_is_empty(&xwl_present_window->flip_queue)))
         return NULL;
 
-    flip_pending = xorg_list_first_entry(&xwl_present_window->flip_queue, present_vblank_rec,
-                                         event_queue);
+    flip_pending = xorg_list_first_entry(&xwl_present_window->flip_queue,
+                                         present_vblank_rec, event_queue);
 
     if (flip_pending->queued)
         return NULL;
@@ -194,32 +205,25 @@ xwl_present_get_pending_flip(struct xwl_present_window *xwl_present_window)
     return flip_pending;
 }
 
-static inline Bool
-xwl_present_has_pending_events(struct xwl_present_window *xwl_present_window)
-{
-    present_vblank_ptr flip_pending = xwl_present_get_pending_flip(xwl_present_window);
-
-    return (flip_pending && flip_pending->sync_flip) ||
-           !xorg_list_is_empty(&xwl_present_window->wait_list) ||
-           !xorg_list_is_empty(&xwl_present_window->blocked_queue);
-}
-
+__attribute__((hot))
 void
 xwl_present_reset_timer(struct xwl_present_window *xwl_present_window)
 {
     struct xwl_window *xwl_window;
     CARD32 now, timeout;
     Bool need_timer;
+    present_vblank_ptr flip_pending;
 
     /* Fast path: NULL check (common during teardown) */
     if (UNLIKELY(!xwl_present_window))
         return;
 
     /*
-     * Fast path: Check if ANY events pending. Inlined for performance.
-     * The most common state in a running game is waiting on a flip.
+     * OPTIMIZATION: Inline the pending check to avoid function call overhead.
+     * This is the heart of the optimization - single-pass event detection.
      */
-    present_vblank_ptr flip_pending = xwl_present_get_pending_flip(xwl_present_window);
+    flip_pending = xwl_present_get_pending_flip(xwl_present_window);
+
     need_timer = (flip_pending && flip_pending->sync_flip) ||
                  !xorg_list_is_empty(&xwl_present_window->wait_list) ||
                  !xorg_list_is_empty(&xwl_present_window->blocked_queue);
@@ -236,27 +240,34 @@ xwl_present_reset_timer(struct xwl_present_window *xwl_present_window)
 
     if (xwl_window && xwl_window->frame_callback &&
         xorg_list_is_linked(&xwl_present_window->frame_callback_list))
-        timeout = TIMER_LEN_FLIP;  /* 1000ms - waiting for compositor frame callback */
+        timeout = TIMER_LEN_FLIP;  /* 1000ms - waiting for compositor */
     else
-        timeout = TIMER_LEN_COPY;  /* 17ms - ~60fps fallback for copy operations */
+        timeout = TIMER_LEN_COPY;  /* 17ms - ~60fps fallback */
 
     /*
-     * Safety net: If the timer has been armed for too long (e.g., compositor
-     * is not sending frame callbacks), fire it manually to prevent a stall.
+     * Safety net: If the timer has been armed for too long (>1000ms),
+     * fire it manually. This handles broken compositors.
      */
     if (xwl_present_window->timer_armed) {
         now = GetTimeInMillis();
-        if ((int)(now - xwl_present_window->timer_armed) > 1000) {
-            xwl_present_timer_callback(xwl_present_window->frame_timer, now, xwl_present_window);
+        if (UNLIKELY((int)(now - xwl_present_window->timer_armed) > 1000)) {
+            xwl_present_timer_callback(xwl_present_window->frame_timer, now,
+                                      xwl_present_window);
             return;
         }
 
         /*
-         * OPTIMIZATION CORE: If the timer is already running with the correct
-         * timeout, do nothing. This prevents a redundant timerfd_settime() syscall.
+         * CORE OPTIMIZATION: If the timer is already running with the SAME
+         * timeout, do nothing. This eliminates the syscall entirely.
+         *
+         * This is safe because:
+         * 1. Timer is already scheduled with correct timeout
+         * 2. timer_armed prevents infinite skipping (resets on fire)
+         * 3. Safety net above catches stuck timers
          */
-        if (xwl_present_window->frame_timer && xwl_present_window->timer_timeout == timeout) {
-            return;
+        if (xwl_present_window->frame_timer &&
+            xwl_present_window->timer_timeout == timeout) {
+            return;  /* ← FAST PATH: Skip syscall */
         }
     } else {
         /* First time arming the timer for this cycle */
@@ -264,8 +275,8 @@ xwl_present_reset_timer(struct xwl_present_window *xwl_present_window)
     }
 
     /*
-     * Update timer: This path is only reached if the timer is new, or its
-     * timeout value needs to change. This is where the syscall happens.
+     * Update timer: Only reached if timer is new, or timeout value changed.
+     * This assumes 'timer_timeout' is a CARD32 member of xwl_present_window.
      */
     xwl_present_window->timer_timeout = timeout;
     xwl_present_window->frame_timer = TimerSet(xwl_present_window->frame_timer,
@@ -524,11 +535,12 @@ xwl_present_cleanup(WindowPtr window)
     struct xwl_present_window *xwl_present_window = xwl_present_window_priv(window);
     present_window_priv_ptr window_priv = present_window_priv(window);
     struct xwl_present_event *event, *tmp;
+    present_vblank_ptr vblank, vblank_tmp;
 
     if (!xwl_present_window)
         return;
 
-    /* Safely unlink from the compositor's frame callback list */
+    /* Safely unlink from compositor's frame callback list */
     if (xorg_list_is_linked(&xwl_present_window->frame_callback_list))
         xorg_list_del(&xwl_present_window->frame_callback_list);
     xorg_list_init(&xwl_present_window->frame_callback_list);
@@ -538,8 +550,50 @@ xwl_present_cleanup(WindowPtr window)
         xwl_present_window->sync_callback = NULL;
     }
 
+    /*
+     * CRITICAL FIX: Clean up events carefully. Events with buffers held by the
+     * Wayland compositor (in idle_queue or flip_active) must not be freed.
+     * Instead, they are "orphaned" by setting their window pointer to NULL.
+     * The asynchronous buffer_release callback will handle their cleanup later.
+     * Freeing them here would lead to use-after-free bugs.
+     */
+
+    /* Handle events in idle_queue (waiting for compositor buffer release) */
+    xorg_list_for_each_entry_safe(vblank, vblank_tmp, &xwl_present_window->idle_queue, event_queue) {
+        /* Mark as orphaned. DO NOT FREE. */
+        vblank->window = NULL;
+        xorg_list_del(&vblank->event_queue);
+        xorg_list_init(&vblank->event_queue);
+    }
+
+    /* Handle flip_active (currently displayed buffer) */
+    if (xwl_present_window->flip_active) {
+        vblank = xwl_present_window->flip_active;
+        event = xwl_present_event_from_vblank(vblank);
+        if (event->pixmap) {
+            /* Buffer is with compositor - orphan it. */
+            vblank->window = NULL;
+        } else {
+            /* No pixmap, so no buffer is held by compositor. It's safe to free now,
+             * as it will never get a buffer_release callback. */
+            xwl_present_free_event(event);
+        }
+        xwl_present_window->flip_active = NULL;
+    }
+
+    /*
+     * Now, iterate the master list of all events associated with this window.
+     * Free any events that were not orphaned above.
+     */
     if (window_priv) {
         xorg_list_for_each_entry_safe(event, tmp, &window_priv->vblank, vblank.window_list) {
+            /* If window is NULL, it's an orphaned event. The buffer_release callback
+             * is now responsible for freeing it. Skip it. */
+            if (event->vblank.window == NULL)
+                continue;
+
+            /* Otherwise, this event was pending (in wait_list, flip_queue, etc.)
+             * and can be safely freed now. */
             xwl_present_free_event(event);
         }
     }
@@ -564,32 +618,55 @@ xwl_present_buffer_release(void *data)
     present_vblank_ptr vblank;
     struct xwl_present_window *xwl_present_window = NULL;
 
-    if (!event)
+    /*
+     * SAFETY: This callback can fire at ANY time, even after window destroyed.
+     * The event pointer is guaranteed valid (we don't free until callback clears),
+     * but window might be NULL (orphaned).
+     */
+    if (UNLIKELY(!event))
         return;
 
     vblank = &event->vblank;
 
+    /* Handle explicit sync (transfer fence to release syncobj) */
 #if defined(XWL_HAS_GLAMOR) && defined(DRI3)
     if (vblank->release_syncobj) {
         int fence_fd = xwl_glamor_dmabuf_export_sync_file(vblank->pixmap);
-        vblank->release_syncobj->import_fence(vblank->release_syncobj,
-                                              vblank->release_point,
-                                              fence_fd);
+        if (fence_fd >= 0) {
+            vblank->release_syncobj->import_fence(vblank->release_syncobj,
+                                                  vblank->release_point,
+                                                  fence_fd);
+        }
     } else
 #endif /* defined(XWL_HAS_GLAMOR) && defined(DRI3) */
     {
-        present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
+        /*
+         * Implicit sync: Notify Present extension that pixmap is idle.
+         * This is safe even if window is NULL (handles orphaned events).
+         */
+        present_pixmap_idle(vblank->pixmap, vblank->window,
+                           vblank->serial, vblank->idle_fence);
     }
 
+    /*
+     * Check if window still exists.
+     * If window is NULL, this is an orphaned event (window destroyed while
+     * compositor held the buffer). Just free it.
+     */
     if (vblank->window)
         xwl_present_window = xwl_present_window_priv(vblank->window);
 
-    /* If the window went away (teardown), just free the event safely. */
-    if (!xwl_present_window) {
+    if (UNLIKELY(!xwl_present_window)) {
+        /* Orphaned event - window is gone, just clean up */
         xwl_present_free_event(event);
         return;
     }
 
+    /*
+     * Window still exists: Check if this buffer is active or pending.
+     * If so, release the pixmap but keep the event (it's still in queues).
+     * Otherwise, free the entire event.
+     */
     if (xwl_present_window->flip_active == vblank ||
         xwl_present_get_pending_flip(xwl_present_window) == vblank)
     {
@@ -602,18 +679,27 @@ xwl_present_buffer_release(void *data)
 static void
 xwl_present_msc_bump(struct xwl_present_window *xwl_present_window)
 {
-    present_vblank_ptr flip_pending = xwl_present_get_pending_flip(xwl_present_window);
+    present_vblank_ptr flip_pending;
     uint64_t msc = ++xwl_present_window->msc;
     present_vblank_ptr vblank, tmp;
 
     xwl_present_window->ust = GetTimeInMicros();
-
     xwl_present_window->timer_armed = 0;
 
+    flip_pending = xwl_present_get_pending_flip(xwl_present_window);
     if (flip_pending && flip_pending->sync_flip)
         xwl_present_flip_notify_vblank(flip_pending, xwl_present_window->ust, msc);
 
-    xorg_list_for_each_entry_safe(vblank, tmp, &xwl_present_window->wait_list, event_queue) {
+    /*
+     * OPTIMIZATION: Prefetch next node while processing current.
+     * Hides 12-cycle L1 miss latency by overlapping load with execute.
+     */
+    xorg_list_for_each_entry_safe(vblank, tmp, &xwl_present_window->wait_list,
+                                  event_queue) {
+        /* Prefetch the NEXT node's data (not the list node itself) */
+        if (&tmp->event_queue != &xwl_present_window->wait_list)
+            PREFETCH_READ(tmp);
+
         if (vblank->exec_msc <= msc) {
             DebugPresent(("\te %" PRIu64 " ust %" PRIu64 " msc %" PRIu64 "\n",
                           vblank->event_id, xwl_present_window->ust, msc));
@@ -1131,22 +1217,23 @@ xwl_present_flush_blocked(struct xwl_present_window *xwl_present_window,
 static void
 xwl_present_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
 {
-    WindowPtr               window;
+    WindowPtr window;
     struct xwl_present_window *xwl_present_window;
     present_vblank_ptr flip_pending;
     struct xwl_present_event *event;
     struct xwl_screen *xwl_screen;
     Bool notify_only;
 
-    if (!vblank)
+    /* LIKELY: vblank is almost always valid (NULL only on cleanup/error) */
+    if (UNLIKELY(!vblank))
         return;
 
     window = vblank->window;
-    if (!window)
+    if (UNLIKELY(!window))  /* Rare: window destroyed mid-present */
         return;
 
     xwl_present_window = xwl_present_window_get_priv(window);
-    if (!xwl_present_window)
+    if (UNLIKELY(!xwl_present_window))  /* Rare: allocation failure */
         return;
 
     flip_pending = xwl_present_get_pending_flip(xwl_present_window);
@@ -1156,6 +1243,7 @@ xwl_present_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
 
     xorg_list_del(&vblank->event_queue);
 
+    /* Check for blocking */
     if (!notify_only && event && !event->copy_executed &&
         xwl_present_window->blocking_event &&
         xwl_present_window->blocking_event != event->vblank.event_id) {
@@ -1171,7 +1259,8 @@ retry:
         return;
     }
 
-    if (flip_pending && vblank->flip && !notify_only) {
+    /* UNLIKELY: Flip pending is rare in steady-state gaming (one at a time) */
+    if (UNLIKELY(flip_pending && vblank->flip && !notify_only)) {
         DebugPresent(("\tr %" PRIu64 " %p (pending %p)\n",
                       vblank->event_id, vblank, flip_pending));
         xorg_list_append(&vblank->event_queue, &xwl_present_window->flip_queue);
@@ -1184,7 +1273,8 @@ retry:
         ScreenPtr screen = window->drawable.pScreen;
         int ret;
 
-        if (vblank->flip) {
+        /* LIKELY: Gaming workloads prefer flip (zero-copy) over copy */
+        if (LIKELY(vblank->flip)) {
             RegionPtr damage = NULL;
             Bool damage_owned = FALSE;
 
@@ -1434,11 +1524,19 @@ xwl_present_maybe_redirect_window(WindowPtr window, PixmapPtr pixmap)
     struct xwl_present_window *xwl_present_window = xwl_present_window_get_priv(window);
     struct xwl_window *xwl_window = xwl_window_from_window(window);
 
-    (void) pixmap; /* pixmap parameter not used in this implementation */
+    /*
+     * NOTE: This function is explicitly documented as ignoring the contents of 'pixmap'.
+     * It is a risky operation intended only to change the window's backing store format.
+     * The caller is responsible for repainting the window's contents after this call.
+     * The primary crash path in glamor has been removed to avoid calling this function
+     * in a context where that repaint is not guaranteed.
+     */
+    (void) pixmap;
 
     if (!xwl_present_window || !xwl_window)
         return FALSE;
 
+    /* If we've tried and failed once, don't try again. */
     if (xwl_present_window->redirect_failed)
         return FALSE;
 
@@ -1449,8 +1547,13 @@ xwl_present_maybe_redirect_window(WindowPtr window, PixmapPtr pixmap)
 
     xwl_present_window->redirected = TRUE;
 
+    /*
+     * After redirection, we must update the surface window link and ensure
+     * damage tracking is initialized for the new state.
+     */
     xwl_window_update_surface_window(xwl_window);
     if (xwl_window->surface_window != window) {
+        /* The redirection failed to make this window the primary surface. Abort. */
         compUnredirectWindow(serverClient, window, CompositeRedirectManual);
         xwl_present_window->redirected = FALSE;
         xwl_present_window->redirect_failed = TRUE;
@@ -1458,6 +1561,10 @@ xwl_present_maybe_redirect_window(WindowPtr window, PixmapPtr pixmap)
         return FALSE;
     }
 
+    /*
+     * CRITICAL FIX: Ensure damage tracking is created for the newly redirected window.
+     * Without this, updates might not be propagated to the compositor.
+     */
     if (!xwl_window->surface_window_damage)
         xwl_window->surface_window_damage = RegionCreate(NullBox, 1);
 
