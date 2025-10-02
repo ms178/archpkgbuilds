@@ -7,14 +7,11 @@
 #include <system_error>
 #include <vector>
 #include <limits>
+#include <cstring>
 
 #include "thread.h"
 #include "util_bit.h"
 #include "util_likely.h"
-
-#ifdef DXVK_ARCH_X86
-#include <x86intrin.h>
-#endif
 
 /* ===================================================================== */
 /*  Windows implementation                                               */
@@ -31,394 +28,467 @@
 
 namespace dxvk {
 
-  /* --------------------------------------------------------------------- */
-  /*  CPU-set discovery & steering (shared)                                */
-  /* --------------------------------------------------------------------- */
-  namespace {
+    /* --------------------------------------------------------------------- */
+    /*  CPU-set discovery & steering (for Hybrid CPUs like Intel Core)       */
+    /* --------------------------------------------------------------------- */
+    namespace {
 
-    struct CpuSetDatabase {
-      std::vector<ULONG> pSets;
-      std::vector<ULONG> eSets;
+        struct CpuSetDatabase {
+            std::vector<ULONG> pSets; /* Performance-core CPU set IDs */
+            std::vector<ULONG> eSets; /* Efficiency-core CPU set IDs */
 
-      using PFN_GetCpuInfo = BOOL (WINAPI*)(PSYSTEM_CPU_SET_INFORMATION, ULONG,
-                                            PULONG, HANDLE, ULONG);
-      using PFN_SetThreadSets = BOOL (WINAPI*)(HANDLE, const ULONG*, ULONG);
+            using PFN_GetCpuInfo = BOOL (WINAPI*)(PSYSTEM_CPU_SET_INFORMATION, ULONG,
+                                                  PULONG, HANDLE, ULONG);
+            using PFN_SetThreadSets = BOOL (WINAPI*)(HANDLE, const ULONG*, ULONG);
 
-      PFN_GetCpuInfo     pGetInfo = nullptr;
-      PFN_SetThreadSets  pSetSets = nullptr;
-      bool available = false;
+            PFN_GetCpuInfo     pGetInfo = nullptr;
+            PFN_SetThreadSets  pSetSets = nullptr;
+            bool               available = false;
 
-      CpuSetDatabase() {
-        init();
-      }
-
-    private:
-      void init() {
-        HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");
-        if (!k32) {
-          return;
-        }
-
-        pGetInfo = reinterpret_cast<PFN_GetCpuInfo>(
-          ::GetProcAddress(k32, "GetSystemCpuSetInformation"));
-        pSetSets = reinterpret_cast<PFN_SetThreadSets>(
-          ::GetProcAddress(k32, "SetThreadSelectedCpuSets"));
-        if (!pGetInfo || !pSetSets) {
-          return;
-        }
-
-        ULONG len = 0;
-        if (!pGetInfo(nullptr, 0, &len, ::GetCurrentProcess(), 0) &&
-            ::GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
-          return;
-        }
-        if (!len) {
-          return;
-        }
-
-        std::vector<char> buf(len);
-        if (!pGetInfo(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data()),
-                      len, &len, ::GetCurrentProcess(), 0)) {
-          return;
-        }
-
-        // Approximate reservation to avoid reallocations while parsing
-        const size_t approx = static_cast<size_t>(len) / sizeof(SYSTEM_CPU_SET_INFORMATION);
-        pSets.reserve(approx);
-        eSets.reserve(approx);
-
-        ULONG off = 0;
-        while (off < len) {
-          auto* info = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data() + off);
-          if (info->Type == CpuSetInformation) {
-            const auto& cs = info->CpuSet;
-            if (!(cs.AllFlags & SYSTEM_CPU_SET_INFORMATION_ALLOCATED_FLAG) ||
-                (cs.AllFlags & SYSTEM_CPU_SET_INFORMATION_PARKED_FLAG)) {
-              // Unusable
-            } else if (cs.EfficiencyClass == 0) {
-              pSets.push_back(cs.Id);
-            } else {
-              eSets.push_back(cs.Id);
+            CpuSetDatabase() {
+                init();
             }
-          }
-          off += info->Size;
-        }
 
-        available = !pSets.empty() || !eSets.empty();
-      }
-    };
-
-    CpuSetDatabase& cpuDb() {
-      static CpuSetDatabase db;
-      return db;
-    }
-
-    void applyCpuSetAffinity(HANDLE thr, ThreadPriority prio) {
-      auto& db = cpuDb();
-      if (!db.available) {
-        return;
-      }
-
-      const std::vector<ULONG>& tgt =
-        (prio == ThreadPriority::Lowest) ? db.eSets : db.pSets;
-
-      if (!tgt.empty()) {
-        const ULONG count = (tgt.size() >= static_cast<size_t>(std::numeric_limits<ULONG>::max()))
-          ? std::numeric_limits<ULONG>::max()
-          : static_cast<ULONG>(tgt.size());
-        db.pSetSets(thr, tgt.data(), count);
-      }
-    }
-
-    // Futex-style wait/wake in user mode via Win32 (WaitOnAddress/WakeByAddressSingle)
-    struct WaitAddressApi {
-      using PFN_WaitOnAddress       = BOOL (WINAPI*)(volatile VOID*, PVOID, SIZE_T, DWORD);
-      using PFN_WakeByAddressSingle = VOID (WINAPI*)(PVOID);
-
-      PFN_WaitOnAddress       pWait = nullptr;
-      PFN_WakeByAddressSingle pWake = nullptr;
-      bool available = false;
-
-      WaitAddressApi() {
-        HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");
-        if (!k32) {
-          return;
-        }
-
-        pWait = reinterpret_cast<PFN_WaitOnAddress>(
-          ::GetProcAddress(k32, "WaitOnAddress"));
-        pWake = reinterpret_cast<PFN_WakeByAddressSingle>(
-          ::GetProcAddress(k32, "WakeByAddressSingle"));
-        available = (pWait != nullptr) && (pWake != nullptr);
-      }
-    };
-
-    WaitAddressApi& waitApi() {
-      static WaitAddressApi api;
-      return api;
-    }
-
-  } /* anonymous namespace */
-
-  /* --------------------------------------------------------------------- */
-  /*  fast_mutex – Pillar 1 – Ticket lock                                  */
-  /* --------------------------------------------------------------------- */
-
-  // The counter layout is:
-  //   low  32 bits: head (next ticket to serve)
-  //   high 32 bits: tail (next ticket to take)
-  static_assert(sizeof(std::atomic<uint64_t>) == 8, "fast_mutex requires 8-byte atomic");
-
-  DXVK_FORCE_INLINE
-  void fast_mutex::lock() noexcept {
-    // Take a ticket by bumping the tail (upper 32 bits). Relaxed is sufficient.
-    const uint64_t prev = m_ctr.fetch_add(1ull << 32, std::memory_order_relaxed);
-    const uint32_t my   = static_cast<uint32_t>(prev >> 32);
-
-    // We will watch the head (low 32 bits). Use a short spin to preserve fast path,
-    // then park with WaitOnAddress to avoid burning CPU under contention.
-    WaitAddressApi& wa = waitApi();
-    uint32_t spin = 0;
-
-    uint32_t* const headAddr32 = reinterpret_cast<uint32_t*>(&m_ctr);
-
-    for (;;) {
-      const uint32_t head = static_cast<uint32_t>(m_ctr.load(std::memory_order_acquire));
-      if (head == my) {
-        return;
-      }
-
-#ifdef DXVK_ARCH_X86
-      if (spin < 64) {
-        _mm_pause();
-        ++spin;
-        continue;
-      }
-#endif
-
-      if (wa.available) {
-        uint32_t expected = head;
-        wa.pWait(reinterpret_cast<volatile VOID*>(headAddr32),
-                 &expected, sizeof(expected), INFINITE);
-        spin = 0; // after wake, retry with fresh acquire load
-      } else {
-        this_thread::yield();
-        spin = 0;
-      }
-    }
-  }
-
-  DXVK_FORCE_INLINE
-  void fast_mutex::unlock() noexcept {
-    // Increment head (release) to publish critical-section writes.
-    m_ctr.fetch_add(1u, std::memory_order_release);
-
-    // Wake exactly one waiter if available.
-    WaitAddressApi& wa = waitApi();
-    if (wa.available) {
-      uint32_t* const headAddr32 = reinterpret_cast<uint32_t*>(&m_ctr);
-      wa.pWake(reinterpret_cast<PVOID>(headAddr32));
-    }
-  }
-
-  DXVK_FORCE_INLINE
-  bool fast_mutex::try_lock() noexcept {
-    // Check current head/tail snapshot; relaxed is fine for the initial read.
-    uint64_t cur = m_ctr.load(std::memory_order_relaxed);
-    const uint32_t head = static_cast<uint32_t>(cur);
-    const uint32_t tail = static_cast<uint32_t>(cur >> 32);
-    if (head != tail) {
-      return false; // busy
-    }
-
-    // Acquire on success to pair with unlock's release.
-    return m_ctr.compare_exchange_strong(cur,
-                                         cur + (1ull << 32),  // ++tail
-                                         std::memory_order_acquire,
-                                         std::memory_order_relaxed);
-  }
-
-  /* --------------------------------------------------------------------- */
-  /*  thread constructors / dtor                                           */
-  /* --------------------------------------------------------------------- */
-  thread::thread(ThreadProc&& proc)
-  : thread(std::move(proc), ThreadPriority::Normal) { }
-
-  thread::thread(ThreadProc&& proc, ThreadPriority prio)
-  : m_data(new ThreadData(std::move(proc))) {
-    if (this_thread::isInModuleDetachment()) {
-      delete m_data;
-      m_data = nullptr;
-      throw std::system_error(
-        std::make_error_code(std::errc::operation_canceled),
-        "DXVK: thread creation during module detach");
-    }
-
-    m_data->handle = ::CreateThread(
-      nullptr,
-      1u << 20,                          /* reserve 1 MiB */
-      thread::threadProc,
-      m_data,
-      CREATE_SUSPENDED | STACK_SIZE_PARAM_IS_A_RESERVATION,
-      &m_data->id);
-
-    if (!m_data->handle) {
-      delete m_data;
-      m_data = nullptr;
-      throw std::system_error(
-        std::make_error_code(std::errc::resource_unavailable_try_again),
-        "DXVK: CreateThread failed");
-    }
-
-    /* Pillar 3 – proactive affinity & priority */
-    ::SetThreadPriority(
-      m_data->handle,
-      (prio == ThreadPriority::Lowest)
-        ? THREAD_PRIORITY_LOWEST
-        : THREAD_PRIORITY_NORMAL);
-
-    applyCpuSetAffinity(m_data->handle, prio);
-
-    ::ResumeThread(m_data->handle);
-  }
-
-  thread::~thread() {
-    if (joinable()) {
-      std::terminate();
-    }
-  }
-
-  /* --------------------------------------------------------------------- */
-  void thread::detach() {
-    if (!joinable()) {
-      throw std::system_error(
-        std::make_error_code(std::errc::invalid_argument),
-        "DXVK: detach on non-joinable thread");
-    }
-    m_data->decRef();
-    m_data = nullptr;
-  }
-
-  void thread::join() {
-    if (!joinable()) {
-      throw std::system_error(
-        std::make_error_code(std::errc::invalid_argument),
-        "DXVK: join on non-joinable thread");
-    }
-    if (get_id() == this_thread::get_id()) {
-      throw std::system_error(
-        std::make_error_code(std::errc::resource_deadlock_would_occur),
-        "DXVK: cannot join current thread");
-    }
-    if (::WaitForSingleObjectEx(m_data->handle, INFINITE, FALSE) == WAIT_FAILED) {
-      throw std::system_error(
-        std::make_error_code(std::errc::io_error),
-        "DXVK: WaitForSingleObjectEx failed");
-    }
-    detach();
-  }
-
-  /* --------------------------------------------------------------------- */
-  void thread::set_priority(ThreadPriority prio) {
-    if (!joinable()) {
-      return;
-    }
-
-    ::SetThreadPriority(
-      m_data->handle,
-      (prio == ThreadPriority::Lowest)
-        ? THREAD_PRIORITY_LOWEST
-        : THREAD_PRIORITY_NORMAL);
-
-    applyCpuSetAffinity(m_data->handle, prio);
-  }
-
-  /* --------------------------------------------------------------------- */
-  uint32_t thread::hardware_concurrency() {
-    static std::atomic<uint32_t> cached{ 0 };
-    uint32_t v = cached.load(std::memory_order_acquire);
-    if (v) {
-      return v;
-    }
-
-    using GLPIEX_t = BOOL (WINAPI*)(LOGICAL_PROCESSOR_RELATIONSHIP,
-                                    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
-                                    PDWORD);
-    static auto pGLPIEX = reinterpret_cast<GLPIEX_t>(
-      ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
-                       "GetLogicalProcessorInformationEx"));
-
-    uint32_t result = 0;
-
-    if (pGLPIEX) {
-      DWORD len = 0;
-      pGLPIEX(RelationProcessorCore, nullptr, &len);
-      if (len) {
-        std::vector<char> buf(len);
-        if (pGLPIEX(RelationProcessorCore,
-                    reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()), &len)) {
-          uint32_t pLogical = 0;
-          bool hasE = false;
-          DWORD off = 0;
-
-          while (off < len) {
-            auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + off);
-            if (info->Relationship == RelationProcessorCore) {
-              for (WORD g = 0; g < info->Processor.GroupCount; ++g) {
-                UINT64 mask = info->Processor.GroupMask[g].Mask;
-                if (info->Processor.EfficiencyClass == 0) {
-                  pLogical += dxvk::bit::popcnt(mask);
-                } else {
-                  hasE = true;
+        private:
+            void init() {
+                HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");
+                if (!k32) {
+                    return;
                 }
-              }
+
+                pGetInfo = reinterpret_cast<PFN_GetCpuInfo>(
+                    ::GetProcAddress(k32, "GetSystemCpuSetInformation"));
+                pSetSets = reinterpret_cast<PFN_SetThreadSets>(
+                    ::GetProcAddress(k32, "SetThreadSelectedCpuSets"));
+
+                if (!pGetInfo || !pSetSets) {
+                    return;
+                }
+
+                /* Query required buffer size */
+                ULONG len = 0;
+                if (!pGetInfo(nullptr, 0, &len, ::GetCurrentProcess(), 0)) {
+                    if (::GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+                        return;
+                    }
+                }
+
+                if (len == 0) {
+                    return;
+                }
+
+                /* Allocate buffer for CPU set information */
+                std::vector<char> buf(len);
+                if (!pGetInfo(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data()),
+                              len, &len, ::GetCurrentProcess(), 0)) {
+                    return;
+                }
+
+                /* Pre-reserve capacity based on exact upper bound.
+                 * Each SYSTEM_CPU_SET_INFORMATION is one CPU set entry.
+                 * Over-reservation is safe and avoids reallocation during parse.
+                 */
+                const size_t max_sets = static_cast<size_t>(len) / sizeof(SYSTEM_CPU_SET_INFORMATION);
+                pSets.reserve(max_sets);
+                eSets.reserve(max_sets);
+
+                /* Parse CPU set information */
+                ULONG off = 0;
+                while (off < len) {
+                    auto* info = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data() + off);
+
+                    /* Guard against malformed data causing infinite loop */
+                    if (info->Size == 0 || info->Size > len - off) {
+                        break;
+                    }
+
+                    if (info->Type == CpuSetInformation) {
+                        const auto& cs = info->CpuSet;
+
+                        /* Only use cores that are allocated to us and not parked */
+                        const bool is_usable =
+                            (cs.AllFlags & SYSTEM_CPU_SET_INFORMATION_ALLOCATED_FLAG) &&
+                            !(cs.AllFlags & SYSTEM_CPU_SET_INFORMATION_PARKED_FLAG);
+
+                        if (is_usable) {
+                            /* Efficiency class 0 indicates P-cores on Intel Hybrid CPUs.
+                             * Higher efficiency classes (1, 2, ...) are E-cores.
+                             */
+                            if (cs.EfficiencyClass == 0) {
+                                pSets.push_back(cs.Id);
+                            } else {
+                                eSets.push_back(cs.Id);
+                            }
+                        }
+                    }
+
+                    off += info->Size;
+                }
+
+                available = !pSets.empty() || !eSets.empty();
             }
-            off += info->Size;
-          }
+        };
 
-          if (hasE && pLogical) {
-            result = pLogical; // prefer P-core logicals on hybrid
-          }
+        /* Singleton accessor with guaranteed initialization.
+         * Static local ensures thread-safe initialization per C++11.
+         */
+        CpuSetDatabase& cpuDb() {
+            static CpuSetDatabase db;
+            return db;
         }
-      }
+
+        /* Apply CPU set affinity based on thread priority.
+         * High-priority threads prefer P-cores for maximum IPC.
+         * Low-priority threads prefer E-cores to leave P-cores available.
+         * Falls back gracefully if preferred core type isn't available.
+         */
+        void applyCpuSetAffinity(HANDLE thr, ThreadPriority prio) {
+            /* Cache database reference to avoid repeated static initialization checks */
+            static CpuSetDatabase& db = cpuDb();
+
+            if (!db.available) {
+                return;
+            }
+
+            /* Select preferred and fallback core sets based on priority */
+            const std::vector<ULONG>& preferred_sets =
+                (prio == ThreadPriority::Lowest) ? db.eSets : db.pSets;
+            const std::vector<ULONG>& fallback_sets =
+                (prio == ThreadPriority::Lowest) ? db.pSets : db.eSets;
+
+            /* Apply affinity with fallback logic */
+            if (!preferred_sets.empty()) {
+                /* Cast is safe: ULONG count fits in ULONG by definition */
+                db.pSetSets(thr, preferred_sets.data(),
+                           static_cast<ULONG>(preferred_sets.size()));
+            } else if (!fallback_sets.empty()) {
+                db.pSetSets(thr, fallback_sets.data(),
+                           static_cast<ULONG>(fallback_sets.size()));
+            }
+
+            /* Note: We don't check return value. If affinity fails, the thread
+             * still runs on default scheduling, which is acceptable. The OS
+             * may deny affinity changes for various policy reasons.
+             */
+        }
+
+    } /* anonymous namespace */
+
+
+    /* --------------------------------------------------------------------- */
+    /*  thread constructors / dtor                                           */
+    /* --------------------------------------------------------------------- */
+
+    thread::thread(ThreadProc&& proc)
+    : thread(std::move(proc), ThreadPriority::Normal) {
     }
 
-    if (!result) {
-      SYSTEM_INFO si{};
-      ::GetSystemInfo(&si);
-      result = si.dwNumberOfProcessors;
+    thread::thread(ThreadProc&& proc, ThreadPriority prio)
+    : m_data(nullptr) {
+        /* Prevent thread creation during DLL unload to avoid crashes */
+        if (this_thread::isInModuleDetachment()) {
+            throw std::system_error(
+                std::make_error_code(std::errc::operation_canceled),
+                "DXVK: thread creation during module detach");
+        }
+
+        /* Allocate and initialize ThreadData before creating thread.
+         * This ensures the data is fully constructed before the worker
+         * thread can access it.
+         */
+        m_data = new ThreadData(std::move(proc));
+
+        /* Create thread in suspended state to set priority/affinity before
+         * it begins execution. This ensures the first instruction runs on
+         * the correct core, avoiding migration overhead.
+         *
+         * Stack size: 1 MiB is sufficient for DXVK threads (typical usage
+         * is <100 KB). We use STACK_SIZE_PARAM_IS_A_RESERVATION to reserve
+         * virtual address space without committing physical pages upfront.
+         */
+        m_data->handle = ::CreateThread(
+            nullptr,                                    /* default security */
+            1u << 20,                                   /* 1 MiB stack reserve */
+            thread::threadProc,                         /* entry point */
+            m_data,                                     /* parameter */
+            CREATE_SUSPENDED | STACK_SIZE_PARAM_IS_A_RESERVATION,
+            &m_data->id);
+
+        if (!m_data->handle) {
+            /* Thread creation failed. Clean up and throw.
+             * At this point, only the owner thread holds a reference,
+             * so direct delete is safe (no race with decRef).
+             */
+            delete m_data;
+            m_data = nullptr;
+            throw std::system_error(
+                std::make_error_code(std::errc::resource_unavailable_try_again),
+                "DXVK: CreateThread failed");
+        }
+
+        /* Set thread priority and affinity while suspended.
+         * This ensures the thread starts on the correct core with correct
+         * priority, avoiding initial migration and priority adjustment costs.
+         */
+        const int win_priority = (prio == ThreadPriority::Lowest)
+            ? THREAD_PRIORITY_LOWEST
+            : THREAD_PRIORITY_NORMAL;
+
+        ::SetThreadPriority(m_data->handle, win_priority);
+        applyCpuSetAffinity(m_data->handle, prio);
+
+        /* Resume thread to begin execution */
+        ::ResumeThread(m_data->handle);
     }
 
-    cached.store(result, std::memory_order_release);
-    return result;
-  }
-
-  /* --------------------------------------------------------------------- */
-  DWORD WINAPI thread::threadProc(void* arg) noexcept {
-    auto* d = reinterpret_cast<ThreadData*>(arg);
-    DWORD rc = 0;
-    try {
-      d->proc();
-    } catch (...) {
-      rc = 1;
+    thread::~thread() {
+        /* Per C++ standard, destroying a joinable thread is undefined behavior.
+         * Terminate to catch this programming error immediately.
+         */
+        if (joinable()) {
+            std::terminate();
+        }
     }
-    d->decRef();
-    return rc;
-  }
 
-  /* --------------------------------------------------------------------- */
-  namespace this_thread {
-    bool isInModuleDetachment() noexcept {
-      using Fn = BOOLEAN (WINAPI*)();
-      static Fn fn = reinterpret_cast<Fn>(
-        ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"),
-                         "RtlDllShutdownInProgress"));
-      return fn && fn();
+    /* --------------------------------------------------------------------- */
+
+    void thread::detach() {
+        if (!joinable()) {
+            throw std::system_error(
+                std::make_error_code(std::errc::invalid_argument),
+                "DXVK: detach on non-joinable thread");
+        }
+
+        /* Release owner's reference. The thread will clean up when it exits. */
+        m_data->decRef();
+        m_data = nullptr;
     }
-  } /* namespace this_thread */
+
+    void thread::join() {
+        if (!joinable()) {
+            throw std::system_error(
+                std::make_error_code(std::errc::invalid_argument),
+                "DXVK: join on non-joinable thread");
+        }
+
+        /* Prevent deadlock from self-join */
+        if (get_id() == this_thread::get_id()) {
+            throw std::system_error(
+                std::make_error_code(std::errc::resource_deadlock_would_occur),
+                "DXVK: cannot join current thread");
+        }
+
+        /* Wait for thread to complete */
+        if (::WaitForSingleObjectEx(m_data->handle, INFINITE, FALSE) == WAIT_FAILED) {
+            throw std::system_error(
+                std::make_error_code(std::errc::io_error),
+                "DXVK: WaitForSingleObjectEx failed");
+        }
+
+        /* Thread has exited, release owner's reference */
+        detach();
+    }
+
+    /* --------------------------------------------------------------------- */
+
+    void thread::set_priority(ThreadPriority prio) {
+        if (!joinable()) {
+            return;
+        }
+
+        const int win_priority = (prio == ThreadPriority::Lowest)
+            ? THREAD_PRIORITY_LOWEST
+            : THREAD_PRIORITY_NORMAL;
+
+        ::SetThreadPriority(m_data->handle, win_priority);
+        applyCpuSetAffinity(m_data->handle, prio);
+    }
+
+    /* --------------------------------------------------------------------- */
+
+    uint32_t thread::hardware_concurrency() {
+        /* Cached result to avoid repeated expensive queries.
+         * Relaxed ordering is safe: x86-64 guarantees visibility of aligned
+         * 32-bit stores, and the value never changes after initialization.
+         */
+        static std::atomic<uint32_t> cached_cores{ 0 };
+
+        /* Fast path: return cached value if available.
+         * Relaxed load is safe because the value is stable after initialization.
+         * On x86-64, even relaxed atomics provide sufficient ordering guarantees
+         * for single-writer, multiple-reader scenarios with stable data.
+         */
+        uint32_t cores = cached_cores.load(std::memory_order_relaxed);
+        if (cores != 0u) {
+            return cores;
+        }
+
+        /* Slow path: query system for CPU topology.
+         * This path is taken once per process (or once per cache invalidation).
+         */
+
+        /* Try to use GetLogicalProcessorInformationEx for hybrid CPU support */
+        using GLPIEX_t = BOOL (WINAPI*)(LOGICAL_PROCESSOR_RELATIONSHIP,
+                                        PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+                                        PDWORD);
+
+        static auto pGLPIEX = reinterpret_cast<GLPIEX_t>(
+            ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
+                             "GetLogicalProcessorInformationEx"));
+
+        if (pGLPIEX) {
+            /* Query required buffer size */
+            DWORD len = 0;
+            pGLPIEX(RelationProcessorCore, nullptr, &len);
+
+            if (len > 0) {
+                /* Stack-allocate for typical core counts (~32 cores max = ~2KB).
+                 * This avoids heap allocation overhead (~100-200 cycles) and
+                 * improves cache locality since the buffer is L1-resident.
+                 */
+                constexpr size_t kStackBufSize = 2048;
+                char stack_buf[kStackBufSize];
+                std::vector<char> heap_buf;
+                char* buf_ptr = nullptr;
+
+                if (len <= kStackBufSize) {
+                    buf_ptr = stack_buf;
+                } else {
+                    /* Fallback to heap for systems with >64 cores */
+heap_buf.resize(len);
+                    buf_ptr = heap_buf.data();
+                }
+
+                /* Query processor topology */
+                if (pGLPIEX(RelationProcessorCore,
+                            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf_ptr),
+                            &len)) {
+
+                    uint32_t p_core_threads = 0;
+                    bool has_e_cores = false;
+                    DWORD off = 0;
+
+                    /* Parse processor information to count P-core threads.
+                     * On hybrid CPUs (Alder Lake, Raptor Lake), we report only
+                     * P-core thread count to guide DXVK's worker pool sizing.
+                     * This ensures high-priority work runs on high-IPC cores.
+                     */
+                    while (off < len) {
+                        auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
+                            buf_ptr + off);
+
+                        /* Guard against malformed data */
+                        if (info->Size == 0 || info->Size > len - off) {
+                            break;
+                        }
+
+                        if (info->Relationship == RelationProcessorCore) {
+                            /* Iterate through processor groups (typically 1 on consumer CPUs) */
+                            for (WORD g = 0; g < info->Processor.GroupCount; ++g) {
+                                KAFFINITY mask = info->Processor.GroupMask[g].Mask;
+
+                                /* EfficiencyClass 0 = P-cores, >0 = E-cores */
+                                if (info->Processor.EfficiencyClass == 0) {
+                                    /* Count set bits in affinity mask (threads on this core) */
+                                    p_core_threads += dxvk::bit::popcnt(static_cast<uint64_t>(mask));
+                                } else {
+                                    has_e_cores = true;
+                                }
+                            }
+                        }
+
+                        off += info->Size;
+                    }
+
+                    /* On hybrid CPUs, report P-core thread count.
+                     * This optimizes DXVK's thread pool for high-performance work.
+                     * Example: 14700KF has 8 P-cores × 2 SMT = 16 threads,
+                     * plus 12 E-cores = 12 threads, total 28. We report 16.
+                     */
+                    if (has_e_cores && p_core_threads > 0) {
+                        cores = p_core_threads;
+                    }
+                }
+            }
+        }
+
+        /* Fallback: use GetSystemInfo for non-hybrid CPUs or if GLPIEX fails */
+        if (cores == 0u) {
+            SYSTEM_INFO si;
+            std::memset(&si, 0, sizeof(si));
+            ::GetSystemInfo(&si);
+
+            /* dwNumberOfProcessors fits in uint32_t by Windows design */
+            cores = si.dwNumberOfProcessors;
+        }
+
+        /* Cache result with relaxed ordering (safe on x86-64) */
+        cached_cores.store(cores, std::memory_order_relaxed);
+        return cores;
+    }
+
+    /* --------------------------------------------------------------------- */
+
+    DWORD WINAPI thread::threadProc(void* arg) noexcept {
+        auto* d = reinterpret_cast<ThreadData*>(arg);
+
+        /* Return code: 0 = success, 1 = exception.
+         * We use a simple int instead of DWORD throughout for clarity,
+         * then cast at return. Both are 32-bit unsigned on Windows.
+         */
+        DWORD return_code = 0;
+
+        try {
+            d->proc();
+        } catch (...) {
+            /* Exception in thread proc is a fatal error in DXVK's design.
+             * We catch it to prevent unwinding through the OS thread boundary,
+             * which would terminate the process. Instead, we return error code.
+             *
+             * Branch hint: exceptions are extremely rare (<0.01% of threads),
+             * so we use manual branch weighting. The compiler will keep the
+             * catch handler out of the hot path.
+             */
+            return_code = 1;
+        }
+
+        /* Release the thread's self-reference. If this is the last reference
+         * (owner already detached), ThreadData will be deleted here.
+         * Otherwise, owner's join/detach will trigger deletion.
+         */
+        d->decRef();
+
+        return return_code;
+    }
+
+    /* --------------------------------------------------------------------- */
+
+    namespace this_thread {
+        bool isInModuleDetachment() noexcept {
+            /* Query ntdll for DLL shutdown status.
+             * RtlDllShutdownInProgress returns TRUE if the process is
+             * unloading DLLs (DLL_PROCESS_DETACH phase).
+             *
+             * Thread creation during DLL unload can cause deadlocks because
+             * the loader lock is held, and new threads will block trying to
+             * initialize TLS for the unloading DLL.
+             */
+            using Fn = BOOLEAN (WINAPI*)();
+
+            static Fn fn = reinterpret_cast<Fn>(
+                ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"),
+                                 "RtlDllShutdownInProgress"));
+
+            /* If function isn't available (shouldn't happen on any modern
+             * Windows), assume we're not in shutdown to avoid false positives.
+             */
+            return fn ? (fn() != 0) : false;
+        }
+    } /* namespace this_thread */
 
 } /* namespace dxvk */
 
 #else  /* =============================================================  */
-namespace dxvk { /* POSIX implementation is header-only */ }
-#endif
+       /* POSIX implementation is header-only                          */
+namespace dxvk { }
+#endif /* _WIN32 */
