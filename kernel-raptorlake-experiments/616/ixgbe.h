@@ -608,10 +608,26 @@ struct ixgbe_mac_addr {
 
 #define IXGBE_PRIMARY_ABORT_LIMIT	5
 
+/* Gaming ATR definitions */
+#define IXGBE_MAX_GAMING_FILTERS 32
+#define IXGBE_GAMING_IPV4_BASE   0
+#define IXGBE_GAMING_IPV6_BASE   16
+#define IXGBE_GAMING_IPV4_MAX    16
+#define IXGBE_GAMING_IPV6_MAX    16
+
+struct ixgbe_gaming_filter {
+	u16 port;
+	u16 soft_id;
+	u8  ip_version;
+	bool active;
+};
+
 /* board specific private data structure */
 struct ixgbe_adapter {
+	/* ═══════ Active VLANs ═══════ */
 	unsigned long active_vlans[BITS_TO_LONGS(VLAN_N_VID)];
-	/* OS defined structs */
+
+	/* ═══════ OS and Device Structures ═══════ */
 	struct net_device *netdev;
 	struct bpf_prog *xdp_prog;
 	struct pci_dev *pdev;
@@ -622,11 +638,10 @@ struct ixgbe_adapter {
 	struct devlink_region *sram_region;
 	struct devlink_region *devcaps_region;
 
+	/* ═══════ Adapter State ═══════ */
 	unsigned long state;
 
-	/* Some features need tri-state capability,
-	 * thus the additional *_CAPABLE flags.
-	 */
+	/* ═══════ Feature Flags (Tri-state: CAPABLE + ENABLED) ═══════ */
 	u32 flags;
 #define IXGBE_FLAG_MSI_ENABLED			BIT(1)
 #define IXGBE_FLAG_MSIX_ENABLED			BIT(3)
@@ -653,6 +668,7 @@ struct ixgbe_adapter {
 #define IXGBE_FLAG_RX_HWTSTAMP_IN_REGISTER	BIT(26)
 #define IXGBE_FLAG_DCB_CAPABLE			BIT(27)
 
+	/* ═══════ Extended Feature Flags ═══════ */
 	u32 flags2;
 #define IXGBE_FLAG2_RSC_CAPABLE			BIT(0)
 #define IXGBE_FLAG2_RSC_ENABLED			BIT(1)
@@ -678,39 +694,42 @@ struct ixgbe_adapter {
 #define IXGBE_FLAG2_MOD_POWER_UNSUPPORTED	BIT(22)
 #define IXGBE_FLAG2_API_MISMATCH		BIT(23)
 #define IXGBE_FLAG2_FW_ROLLBACK			BIT(24)
-#define IXGBE_FLAG2_GAMING_ATR_ENABLED	BIT(25)
+#define IXGBE_FLAG2_GAMING_ATR_ENABLED		BIT(25)
 
-	/* Tx fast path data */
+	/* ═══════ TX Fast Path Data ═══════ */
 	int num_tx_queues;
 	u16 tx_itr_setting;
 	u16 tx_work_limit;
 	u64 tx_ipsec;
 
-	/* Rx fast path data */
+	/* ═══════ RX Fast Path Data ═══════ */
 	int num_rx_queues;
 	u16 rx_itr_setting;
 	u64 rx_ipsec;
 
-	/* Port number used to identify VXLAN traffic */
+	/* ═══════ Encapsulation Port Tracking ═══════ */
 	__be16 vxlan_port;
 	__be16 geneve_port;
 
-	/* XDP */
+	/* ═══════ XDP Queues ═══════ */
 	int num_xdp_queues;
 	struct ixgbe_ring *xdp_ring[IXGBE_MAX_XDP_QS];
-	unsigned long *af_xdp_zc_qps; /* tracks AF_XDP ZC enabled rings */
+	unsigned long *af_xdp_zc_qps; /* Bitmap: tracks AF_XDP zero-copy rings */
 
-	/* TX */
+	/* ═══════ TX Rings (cacheline aligned) ═══════ */
 	struct ixgbe_ring *tx_ring[MAX_TX_QUEUES] ____cacheline_aligned_in_smp;
 
+	/* ═══════ TX Statistics ═══════ */
 	u64 restart_queue;
 	u64 lsc_int;
 	u32 tx_timeout_count;
 
-	/* RX */
+	/* ═══════ RX Rings ═══════ */
 	struct ixgbe_ring *rx_ring[MAX_RX_QUEUES];
 	int num_rx_pools;		/* == num_rx_queues in 82598 */
 	int num_rx_queues_per_pool;	/* 1 if 82598, can be many if 82599 */
+
+	/* ═══════ RX Statistics ═══════ */
 	u64 hw_csum_rx_error;
 	u64 hw_rx_no_dma_resources;
 	u64 rsc_total_count;
@@ -720,9 +739,10 @@ struct ixgbe_adapter {
 	u32 alloc_rx_page_failed;
 	u32 alloc_rx_buff_failed;
 
+	/* ═══════ Queue Vectors (MSI-X) ═══════ */
 	struct ixgbe_q_vector *q_vector[MAX_Q_VECTORS];
 
-	/* DCB parameters */
+	/* ═══════ DCB (Data Center Bridging) Parameters ═══════ */
 	struct ieee_pfc *ixgbe_ieee_pfc;
 	struct ieee_ets *ixgbe_ieee_ets;
 	struct ixgbe_dcb_config dcb_cfg;
@@ -732,57 +752,71 @@ struct ixgbe_adapter {
 	u8 dcbx_cap;
 	enum ixgbe_fc_mode last_lfc_mode;
 
-	int num_q_vectors;	/* current number of q_vectors for device */
-	int max_q_vectors;	/* true count of q_vectors for device */
+	/* ═══════ Interrupt Configuration ═══════ */
+	int num_q_vectors;	/* Current number of q_vectors for device */
+	int max_q_vectors;	/* True count of q_vectors for device */
 	struct ixgbe_ring_feature ring_feature[RING_F_ARRAY_SIZE];
 	struct msix_entry *msix_entries;
 
+	/* ═══════ Self-Test Support ═══════ */
 	u32 test_icr;
 	struct ixgbe_ring test_tx_ring;
 	struct ixgbe_ring test_rx_ring;
 
-	/* structs defined in ixgbe_hw.h */
+	/* ═══════ Hardware and Statistics ═══════ */
 	struct ixgbe_hw hw;
 	u16 msg_enable;
 	struct ixgbe_hw_stats stats;
 
+	/* ═══════ Ring Counts ═══════ */
 	u64 tx_busy;
 	unsigned int tx_ring_count;
 	unsigned int xdp_ring_count;
 	unsigned int rx_ring_count;
 
+	/* ═══════ Link State ═══════ */
 	u32 link_speed;
 	bool link_up;
 	unsigned long sfp_poll_time;
 	unsigned long link_check_timeout;
 
+	/* ═══════ Service Task (Watchdog) ═══════ */
 	struct timer_list service_timer;
 	struct work_struct service_task;
 
+	/* ═══════ Flow Director (FDIR) ═══════ */
 	struct hlist_head fdir_filter_list;
-	unsigned long fdir_overflow; /* number of times ATR was backed off */
+	unsigned long fdir_overflow; /* Number of times ATR was backed off */
 	union ixgbe_atr_input fdir_mask;
 	int fdir_filter_count;
 	u32 fdir_pballoc;
 	u32 atr_sample_rate;
 	spinlock_t fdir_perfect_lock;
 
+	/* ═══════ Firmware and Management ═══════ */
 	bool fw_emp_reset_disabled;
 
 #ifdef IXGBE_FCOE
+	/* ═══════ FCoE Offload ═══════ */
 	struct ixgbe_fcoe fcoe;
 #endif /* IXGBE_FCOE */
+
+	/* ═══════ I/O Mapping and WoL ═══════ */
 	u8 __iomem *io_addr; /* Mainly for iounmap use */
 	u32 wol;
 
+	/* ═══════ Bridge Mode ═══════ */
 	u16 bridge_mode;
 
+	/* ═══════ EEPROM Identification ═══════ */
 	char eeprom_id[NVM_VER_SIZE];
 	u16 eeprom_cap;
 
+	/* ═══════ Interrupt Event Tracking ═══════ */
 	u32 interrupt_event;
 	u32 led_reg;
 
+	/* ═══════ PTP (Precision Time Protocol) ═══════ */
 	struct ptp_clock *ptp_clock;
 	struct ptp_clock_info ptp_caps;
 	struct work_struct ptp_tx_work;
@@ -801,7 +835,7 @@ struct ixgbe_adapter {
 	u32 rx_hwtstamp_cleared;
 	void (*ptp_setup_sdp)(struct ixgbe_adapter *);
 
-	/* SR-IOV */
+	/* ═══════ SR-IOV (Single Root I/O Virtualization) ═══════ */
 	DECLARE_BITMAP(active_vfs, IXGBE_MAX_VF_FUNCTIONS);
 	unsigned int num_vfs;
 	struct vf_data_storage *vfinfo;
@@ -809,45 +843,122 @@ struct ixgbe_adapter {
 	struct vf_macvlans vf_mvs;
 	struct vf_macvlans *mv_list;
 
+	/* ═══════ Timers and Counters ═══════ */
 	u32 timer_event_accumulator;
 	u32 vferr_refcount;
+
+	/* ═══════ MAC Address Table ═══════ */
 	struct ixgbe_mac_addr *mac_table;
+
+	/* ═══════ Sysfs and Kobject ═══════ */
 	struct kobject *info_kobj;
+
+	/* ═══════ Link Status Event Mask ═══════ */
 	u16 lse_mask;
+
 #ifdef CONFIG_IXGBE_HWMON
+	/* ═══════ Hardware Monitoring (Temperature Sensors) ═══════ */
 	struct hwmon_buff *ixgbe_hwmon_buff;
 #endif /* CONFIG_IXGBE_HWMON */
-#ifdef CONFIG_DEBUG_FS
-	struct dentry *ixgbe_dbg_adapter;
-#endif /*CONFIG_DEBUG_FS*/
 
+#ifdef CONFIG_DEBUG_FS
+	/* ═══════ Debugfs Support ═══════ */
+	struct dentry *ixgbe_dbg_adapter;
+#endif /* CONFIG_DEBUG_FS */
+
+	/* ═══════ DCB Default UP ═══════ */
 	u8 default_up;
-	/* Bitmask indicating in use pools */
+
+	/* ═══════ L2 Forwarding Offload ═══════ */
 	DECLARE_BITMAP(fwd_bitmask, IXGBE_MAX_MACVLANS + 1);
 
+	/* ═══════ Jump Tables (Advanced Filtering) ═══════ */
 #define IXGBE_MAX_LINK_HANDLE 10
 	struct ixgbe_jump_table *jump_tables[IXGBE_MAX_LINK_HANDLE];
 	unsigned long tables;
 
-/* maximum number of RETA entries among all devices supported by ixgbe
- * driver: currently it's x550 device in non-SRIOV mode
- */
+	/* ═══════ RSS (Receive Side Scaling) Indirection Table ═══════ */
+	/* Maximum RETA entries among all devices: x550 in non-SRIOV mode */
 #define IXGBE_MAX_RETA_ENTRIES 512
 	u8 rss_indir_tbl[IXGBE_MAX_RETA_ENTRIES];
 
-#define IXGBE_RSS_KEY_SIZE     40  /* size of RSS Hash Key in bytes */
+	/* ═══════ RSS Hash Key ═══════ */
+#define IXGBE_RSS_KEY_SIZE 40  /* Size of RSS Hash Key in bytes */
 	u32 *rss_key;
 
 #ifdef CONFIG_IXGBE_IPSEC
+	/* ═══════ IPsec Offload ═══════ */
 	struct ixgbe_ipsec *ipsec;
 #endif /* CONFIG_IXGBE_IPSEC */
+
+	/* ═══════ VF Spinlock ═══════ */
 	spinlock_t vfs_lock;
 
-	/* Gaming ATR feature state */
+	/* ═══════════════════════════════════════════════════════════════
+	 * Gaming ATR (Adaptive Transmit Rate) - Low-Latency UDP Filtering
+	 * ═══════════════════════════════════════════════════════════════
+	 *
+	 * Provides automatic Flow Director filtering for gaming UDP traffic
+	 * (CS:GO, Valorant, etc.) to reduce latency and jitter.
+	 *
+	 * Features:
+	 * - Reserves 32 of 128 FDIR entries (16 IPv4 + 16 IPv6)
+	 * - Automatic programming on link-up
+	 * - Thread-safe with dedicated spinlock
+	 * - Debugfs observability at /sys/kernel/debug/ixgbe/.../gaming_atr
+	 *
+	 * Configuration:
+	 * - Module param: gaming_atr_ranges="27015-27050,7777-7999"
+	 * - Requires: gaming_mode=1 for ultra-low ITR
+	 * - Hardware: 82599/X540/X550 families only
+	 * ═══════════════════════════════════════════════════════════════ */
+
+	/**
+	 * @gaming_fdir_lock: Protects gaming_filters array and count
+	 *
+	 * Must be held (spin_lock_bh) when:
+	 * - Programming/erasing FDIR filters
+	 * - Reading/writing gaming_filters array
+	 * - Modifying gaming_filter_count or gaming_atr_enabled
+	 *
+	 * Initialized by: ixgbe_gaming_atr_init() called from ixgbe_probe()
+	 */
 	spinlock_t gaming_fdir_lock;
-#define IXGBE_MAX_GAMING_FILTERS 128
-	u16 gaming_fdir_ids[IXGBE_MAX_GAMING_FILTERS];
-	int gaming_fdir_count;
+
+	/**
+	 * @gaming_filters: Array tracking active gaming FDIR filters
+	 *
+	 * Each entry contains:
+	 * - port: UDP destination port (host byte order)
+	 * - soft_id: Hardware FDIR soft_id (0-15 for IPv4, 16-31 for IPv6)
+	 * - ip_version: 4 or 6
+	 * - active: True if currently programmed in hardware
+	 *
+	 * Layout:
+	 * - Entries 0-15: IPv4 filters (soft_id 0-15)
+	 * - Entries 16-31: IPv6 filters (soft_id 16-31)
+	 *
+	 * Protected by: gaming_fdir_lock
+	 */
+	struct ixgbe_gaming_filter gaming_filters[IXGBE_MAX_GAMING_FILTERS];
+
+	/**
+	 * @gaming_filter_count: Number of active gaming filters
+	 *
+	 * Range: 0 to IXGBE_MAX_GAMING_FILTERS (32)
+	 * Updated when filters are added/removed
+	 * Protected by: gaming_fdir_lock
+	 */
+	u16 gaming_filter_count;
+
+	/**
+	 * @gaming_atr_enabled: True if gaming filters are active
+	 *
+	 * Set to true after successful programming on link-up
+	 * Set to false after clearing on link-down or error
+	 * Protected by: gaming_fdir_lock
+	 */
+	bool gaming_atr_enabled;
 };
 
 struct ixgbe_netdevice_priv {
