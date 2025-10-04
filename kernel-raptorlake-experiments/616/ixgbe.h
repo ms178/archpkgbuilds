@@ -609,11 +609,11 @@ struct ixgbe_mac_addr {
 #define IXGBE_PRIMARY_ABORT_LIMIT	5
 
 /* Gaming ATR definitions */
-#define IXGBE_MAX_GAMING_FILTERS 32
+#define IXGBE_MAX_GAMING_FILTERS 64
 #define IXGBE_GAMING_IPV4_BASE   0
-#define IXGBE_GAMING_IPV6_BASE   16
-#define IXGBE_GAMING_IPV4_MAX    16
-#define IXGBE_GAMING_IPV6_MAX    16
+#define IXGBE_GAMING_IPV6_BASE   32
+#define IXGBE_GAMING_IPV4_MAX    32
+#define IXGBE_GAMING_IPV6_MAX    32
 
 struct ixgbe_gaming_filter {
 	u16 port;

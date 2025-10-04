@@ -2813,21 +2813,15 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *qv,
 	unsigned int avg_wire_size;
 	unsigned long next_update = jiffies;
 
-	/* Exit early if no ring present */
 	if (unlikely(!rc->ring))
 		goto clear_counts;
 
-	/* Rate-limit updates to ~1 jiffy intervals to let NAPI batch work */
 	if (time_after(next_update, rc->next_update))
 		goto clear_counts;
 
-	/* ═══════ GAMING MODE: Ultra-Low Latency ═══════ */
 	if (gaming_mode) {
-		/* Idle: gently increase ITR to reduce wasted interrupts */
 		if (!packets) {
-			/* Current ITR in adaptive units (8μs granularity) */
 			unsigned int cur = rc->itr & ~IXGBE_ITR_ADAPTIVE_LATENCY;
-			/* Increase by 2 units = 16μs increment */
 			itr_new = min_t(unsigned int, cur + 2,
 					IXGBE_ITR_ADAPTIVE_MAX_USECS);
 			itr_new |= (rc->itr & IXGBE_ITR_ADAPTIVE_LATENCY);
@@ -2836,44 +2830,31 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *qv,
 
 		avg_wire_size = bytes / packets;
 
-		/* Gaming-typical small packets: ultra-low ITR */
 		if (avg_wire_size <= 256) {
-			/* Microburst ≤16 packets: 8μs (rc->itr = 1 in adaptive units) */
 			if (packets <= 16) {
-				itr_new = 1; /* 1 * 8μs = 8μs */
+				itr_new = 1;
+			} else if (packets <= 64) {
+				itr_new = 2;
+			} else {
+				itr_new = 4;
 			}
-			/* Small burst ≤64 packets: 16μs */
-			else if (packets <= 64) {
-				itr_new = 2; /* 2 * 8μs = 16μs */
-			}
-			/* Larger burst: 32μs */
-			else {
-				itr_new = 4; /* 4 * 8μs = 32μs */
-			}
-			/* Set latency flag for gaming traffic */
 			itr_new |= IXGBE_ITR_ADAPTIVE_LATENCY;
 			goto out;
 		}
 
-		/* Medium packets (257-1024B): moderate ITR */
 		if (avg_wire_size <= 1024) {
-			itr_new = 20; /* 20 * 8μs = 160μs */
+			itr_new = 20;
 			goto out;
 		}
 
-		/* Bulk traffic: efficient batching, cap at max */
 		itr_new = min_t(unsigned int,
 				(avg_wire_size >> 3) + 20,
 				IXGBE_ITR_ADAPTIVE_MAX_USECS);
 		goto out;
 	}
 
-	/* ═══════ STANDARD MODE: Adaptive Algorithm ═══════ */
-
-	/* Start with minimum latency-optimized ITR */
 	itr_new = IXGBE_ITR_ADAPTIVE_MIN_USECS | IXGBE_ITR_ADAPTIVE_LATENCY;
 
-	/* No packets: gently increase ITR to reduce overhead */
 	if (!packets) {
 		itr_new = (qv->itr >> 2) + IXGBE_ITR_ADAPTIVE_MIN_INC;
 		if (itr_new > IXGBE_ITR_ADAPTIVE_MAX_USECS)
@@ -2882,13 +2863,11 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *qv,
 		goto out;
 	}
 
-	/* Very low traffic (few packets or bytes): latency mode */
 	if (packets < 4 && bytes < 9000) {
 		itr_new = IXGBE_ITR_ADAPTIVE_LATENCY;
 		goto adjust_by_size;
 	}
 
-	/* Small burst (4-47 pkts): gentle increase */
 	if (packets < 48) {
 		itr_new = (qv->itr >> 2) + IXGBE_ITR_ADAPTIVE_MIN_INC;
 		if (itr_new > IXGBE_ITR_ADAPTIVE_MAX_USECS)
@@ -2896,13 +2875,11 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *qv,
 		goto out;
 	}
 
-	/* Goldilocks zone (48-95 pkts): current ITR is optimal */
 	if (packets < 96) {
 		itr_new = qv->itr >> 2;
 		goto out;
 	}
 
-	/* Moderate overrun (96-255 pkts): halve ITR for more batching */
 	if (packets < 256) {
 		itr_new = qv->itr >> 3;
 		if (itr_new < IXGBE_ITR_ADAPTIVE_MIN_USECS)
@@ -2910,18 +2887,13 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *qv,
 		goto out;
 	}
 
-	/* Heavy load (≥256 pkts): compute ITR from packet size */
 	itr_new = IXGBE_ITR_ADAPTIVE_BULK;
 
 adjust_by_size:
 	avg_wire_size = bytes / packets;
 
-	/* Compute ITR based on average packet size with overhead
-	 * Formula derived from 212992B wmem_default, 640B overhead:
-	 * ITR = (170 * (size + 24)) / (size + 640)
-	 */
 	if (avg_wire_size <= 60) {
-		avg_wire_size = 5120; /* Target 50K int/sec */
+		avg_wire_size = 5120;
 	} else if (avg_wire_size <= 316) {
 		avg_wire_size = avg_wire_size * 40 + 2720;
 	} else if (avg_wire_size <= 1084) {
@@ -2929,14 +2901,12 @@ adjust_by_size:
 	} else if (avg_wire_size < 1968) {
 		avg_wire_size = avg_wire_size * 5 + 22420;
 	} else {
-		avg_wire_size = 32256; /* Cap at 8K int/sec */
+		avg_wire_size = 32256;
 	}
 
-	/* Halve for latency mode (double interrupt rate) */
 	if (itr_new & IXGBE_ITR_ADAPTIVE_LATENCY)
 		avg_wire_size >>= 1;
 
-	/* Scale by link speed (10G vs 1G require different batching) */
 	switch (qv->adapter->link_speed) {
 	case IXGBE_LINK_SPEED_10GB_FULL:
 	case IXGBE_LINK_SPEED_100_FULL:
@@ -2957,14 +2927,10 @@ adjust_by_size:
 	}
 
 out:
-	/* Store new ITR in adaptive units (8μs granularity) */
-	rc->itr = itr_new & 0xFF; /* Clamp to u8 range */
-
-	/* Schedule next update after ~1 jiffy */
+	rc->itr = itr_new & 0xFF;
 	rc->next_update = next_update + 1;
 
 clear_counts:
-	/* Always clear statistics for next interval */
 	rc->total_bytes = 0;
 	rc->total_packets = 0;
 }
@@ -3709,7 +3675,7 @@ static __always_inline bool ixgbe_is_primary_thread(unsigned int cpu)
 	const struct cpumask *sibs = topology_sibling_cpumask(cpu);
 
 	if (!sibs)
-		return true; /* No SMT info: treat as primary */
+		return true;
 
 	return cpu == cpumask_first(sibs);
 }
@@ -3731,56 +3697,43 @@ static int ixgbe_build_pcore_mask(struct ixgbe_adapter *adapter,
 	unsigned long max_cap = 0, threshold;
 	int node;
 
-	/* Allocate temporary CPU masks */
-	if (!zalloc_cpumask_var(&node_cpus, GFP_KERNEL)) {
+	if (!zalloc_cpumask_var(&node_cpus, GFP_KERNEL))
 		return -ENOMEM;
-	}
 	if (!zalloc_cpumask_var(&primaries, GFP_KERNEL)) {
 		free_cpumask_var(node_cpus);
 		return -ENOMEM;
 	}
 
-	/* Step 1: Get NUMA-local online CPUs for locality */
 	node = dev_to_node(&adapter->pdev->dev);
-	if (node != NUMA_NO_NODE) {
+	if (node != NUMA_NO_NODE)
 		cpumask_and(node_cpus, cpumask_of_node(node), cpu_online_mask);
-	} else {
+	else
 		cpumask_copy(node_cpus, cpu_online_mask);
-	}
 
-	/* Fallback: use all online if NUMA node is empty */
 	if (cpumask_empty(node_cpus))
 		cpumask_copy(node_cpus, cpu_online_mask);
 
-	/* Step 2: Keep only primary SMT threads to avoid double-pinning */
 	cpumask_clear(primaries);
 	for_each_cpu(cpu, node_cpus) {
 		if (ixgbe_is_primary_thread(cpu))
 			cpumask_set_cpu(cpu, primaries);
 	}
 
-	/* Step 3: Find maximum CPU capacity (P-cores on Raptor Lake) */
 	for_each_cpu(cpu, primaries) {
 		unsigned long cap = ixgbe_cpu_capacity(cpu);
 		if (cap > max_cap)
 			max_cap = cap;
 	}
 
-	/* Step 4: Select high-capacity CPUs (≥90% of max)
-	 * Raptor Lake: P-cores ~1024, E-cores ~350-450, threshold ~922
-	 * Uniform: All cores same capacity, all selected
-	 */
 	cpumask_clear(pcore_mask);
 	if (max_cap > 0) {
-		threshold = (max_cap * 9) / 10; /* 90% threshold */
+		threshold = (max_cap * 9) / 10;
 		for_each_cpu(cpu, primaries) {
-			unsigned long cap = ixgbe_cpu_capacity(cpu);
-			if (cap >= threshold)
+			if (ixgbe_cpu_capacity(cpu) >= threshold)
 				cpumask_set_cpu(cpu, pcore_mask);
 		}
 	}
 
-	/* Fallback: if selection failed, use all primaries */
 	if (cpumask_empty(pcore_mask)) {
 		if (!cpumask_empty(primaries))
 			cpumask_copy(pcore_mask, primaries);
@@ -3800,19 +3753,14 @@ static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
 	unsigned int ri = 0, ti = 0;
 	int vector, err;
 
-	/* Allocate temporary P-core mask */
 	if (!zalloc_cpumask_var(&pcore_mask, GFP_KERNEL))
 		return -ENOMEM;
 
-	/* Build P-core mask for Raptor Lake/hybrid systems
-	 * Falls back to all online CPUs on uniform systems or if detection fails
-	 */
 	if (ixgbe_build_pcore_mask(adapter, pcore_mask)) {
 		e_dev_warn("Failed to build P-core mask; using all online CPUs for IRQ affinity\n");
 		cpumask_copy(pcore_mask, cpu_online_mask);
 	}
 
-	/* Request per-queue vectors with P-core affinity hints */
 	for (vector = 0; vector < adapter->num_q_vectors; vector++) {
 		struct ixgbe_q_vector *qv = adapter->q_vector[vector];
 		struct msix_entry *entry = &adapter->msix_entries[vector];
@@ -3820,7 +3768,6 @@ static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
 		if (!qv)
 			continue;
 
-		/* Name IRQ based on ring configuration; skip if unused */
 		if (qv->tx.ring && qv->rx.ring) {
 			snprintf(qv->name, sizeof(qv->name),
 				 "%s-TxRx-%u", netdev->name, ri++);
@@ -3832,10 +3779,9 @@ static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
 			snprintf(qv->name, sizeof(qv->name),
 				 "%s-tx-%u", netdev->name, ti++);
 		} else {
-			continue; /* Unused q_vector; skip IRQ request */
+			continue;
 		}
 
-		/* Request IRQ for this queue vector */
 		err = request_irq(entry->vector, &ixgbe_msix_clean_rings, 0,
 				  qv->name, qv);
 		if (err) {
@@ -3848,7 +3794,6 @@ static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
 		irq_update_affinity_hint(entry->vector, &qv->affinity_mask);
 	}
 
-	/* Request "other causes" vector (no affinity hint; let kernel decide) */
 	err = request_irq(adapter->msix_entries[vector].vector,
 			  ixgbe_msix_other, 0, netdev->name, adapter);
 	if (err) {
@@ -3860,21 +3805,13 @@ static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
 	return 0;
 
 free_queue_irqs:
-	/* Unwind: free IRQs and clear affinity hints for requested vectors
-	 * Iterate through all vectors [0..vector-1] that were successfully requested
-	 */
 	while (vector--) {
 		struct ixgbe_q_vector *qv = adapter->q_vector[vector];
 		struct msix_entry *entry = &adapter->msix_entries[vector];
 
-		if (!qv)
+		if (!qv || (!qv->rx.ring && !qv->tx.ring))
 			continue;
 
-		/* Only free if we actually requested it (has rings) */
-		if (!qv->rx.ring && !qv->tx.ring)
-			continue;
-
-		/* Clear affinity hint before freeing IRQ (kernel requirement) */
 		irq_update_affinity_hint(entry->vector, NULL);
 		free_irq(entry->vector, qv);
 	}
@@ -8327,7 +8264,6 @@ static void ixgbe_update_default_up(struct ixgbe_adapter *adapter)
 static int ixgbe_gaming_atr_program_filters(struct ixgbe_adapter *adapter)
 {
 	struct ixgbe_hw *hw = &adapter->hw;
-	/* Each port generates two rules (v4/v6), so we can parse up to MAX/2 ports. */
 	u16 parsed_ports[IXGBE_MAX_GAMING_FILTERS / 2];
 	int num_ports, i, ret;
 	u8 ipv4_count = 0, ipv6_count = 0;
@@ -8335,7 +8271,6 @@ static int ixgbe_gaming_atr_program_filters(struct ixgbe_adapter *adapter)
 	bool hw_supported = false;
 	u8 queue;
 
-	/* Step 1: Verify hardware support. */
 	switch (hw->mac.type) {
 	case ixgbe_mac_82599EB:
 	case ixgbe_mac_X540:
@@ -8348,42 +8283,27 @@ static int ixgbe_gaming_atr_program_filters(struct ixgbe_adapter *adapter)
 		return -EOPNOTSUPP;
 	}
 
-	if (!hw_supported || !gaming_atr_ranges || !*gaming_atr_ranges) {
+	if (!hw_supported || !gaming_atr_ranges || !*gaming_atr_ranges)
 		return 0;
-	}
 
-	/* Step 2: Parse user-provided port list. */
 	num_ports = ixgbe_parse_gaming_ports(gaming_atr_ranges, parsed_ports,
 					     ARRAY_SIZE(parsed_ports));
-	if (num_ports < 0) {
+	if (num_ports <= 0)
 		return num_ports;
-	}
-	if (num_ports == 0) {
-		return 0; /* Nothing to do */
-	}
 
 	e_dev_info("Gaming ATR: Parsed %d unique port(s) for IPv4/IPv6 rules\n", num_ports);
 
-	/* Step 3: Ensure a clean state by removing all old filters first.
-	 * This function follows the safe locking pattern.
-	 */
 	ixgbe_gaming_atr_clear_filters(adapter);
 
-	/* Step 4: Initialize FDIR hardware block.
-	 * CRITICAL: No spinlock is held here, as this function can sleep.
-	 */
 	ret = ixgbe_init_fdir_perfect_82599(hw, adapter->fdir_pballoc);
 	if (ret) {
 		e_dev_err("Gaming ATR: FDIR perfect mode init failed (err=%d)\n", ret);
 		return ret;
 	}
 
-	/* Step 5: Program the FDIR input mask.
-	 * CRITICAL: No spinlock is held here.
-	 */
 	memset(&mask, 0, sizeof(mask));
-	mask.formatted.flow_type = 0xFF; /* Match on the full flow type field. */
-	mask.formatted.dst_port  = cpu_to_be16(0xFFFF); /* Match on the full port. */
+	mask.formatted.flow_type = 0xFF;
+	mask.formatted.dst_port  = cpu_to_be16(0xFFFF);
 
 	ret = ixgbe_fdir_set_input_mask_82599(hw, &mask);
 	if (ret) {
@@ -8391,24 +8311,19 @@ static int ixgbe_gaming_atr_program_filters(struct ixgbe_adapter *adapter)
 		return ret;
 	}
 
-	/* Step 6: Determine the target RX queue. */
 	queue = 0;
-	if (adapter->num_rx_queues > 0 && adapter->rx_ring[0]) {
+	if (adapter->num_rx_queues > 0 && adapter->rx_ring[0])
 		queue = adapter->rx_ring[0]->reg_idx;
-	}
 
-	/* Step 7: Program new filters into hardware. */
 	do {
 		struct ixgbe_gaming_filter new_filters[IXGBE_MAX_GAMING_FILTERS];
 		u16 new_count = 0;
 
 		memset(new_filters, 0, sizeof(new_filters));
 
-		/* CRITICAL: No spinlock is held during this loop. */
 		for (i = 0; i < num_ports; i++) {
 			u16 port = parsed_ports[i];
 
-			/* Program IPv4 filter */
 			if (ipv4_count < IXGBE_GAMING_IPV4_MAX) {
 				u16 soft_id = IXGBE_GAMING_IPV4_BASE + ipv4_count;
 
@@ -8431,7 +8346,6 @@ static int ixgbe_gaming_atr_program_filters(struct ixgbe_adapter *adapter)
 				}
 			}
 
-			/* Program IPv6 filter */
 			if (ipv6_count < IXGBE_GAMING_IPV6_MAX) {
 				u16 soft_id = IXGBE_GAMING_IPV6_BASE + ipv6_count;
 
@@ -8455,9 +8369,6 @@ static int ixgbe_gaming_atr_program_filters(struct ixgbe_adapter *adapter)
 			}
 		}
 
-		/* Step 8: Atomically update software state.
-		 * CRITICAL: The spinlock is held *only* for this fast, non-sleeping update.
-		 */
 		spin_lock_bh(&adapter->gaming_fdir_lock);
 		memcpy(adapter->gaming_filters, new_filters, sizeof(new_filters));
 		adapter->gaming_filter_count = new_count;
@@ -8541,167 +8452,9 @@ static void ixgbe_watchdog_link_is_up(struct ixgbe_adapter *adapter)
     /* Update default user priority for VFs on link-up. */
     ixgbe_update_default_up(adapter);
 
-    /* ----------------------------------------------------------------
-     * Gaming ATR automatic rule programming (no admin intervention):
-     * - Uses module parameter 'gaming_atr_ranges' directly.
-     * - Automatically enables Flow Director perfect-mode path and mask
-     *   if needed (best effort) and programs perfect rules for UDPv4
-     *   destination ports in the ranges.
-     * - Steers to a stable RX queue (queue 0 by default).
-     * - Idempotent across link bounces: we always reprogram the same
-     *   reserved soft_ids to avoid table growth.
-     * ---------------------------------------------------------------- */
-    do {
-        const char *ranges_param = READ_ONCE(gaming_atr_ranges);
-        bool supported = false;
-
-        if (!ranges_param || !*ranges_param) {
-            break; /* Nothing to program */
-        }
-
-        switch (hw->mac.type) {
-        case ixgbe_mac_82599EB:
-        case ixgbe_mac_X540:
-        case ixgbe_mac_X550:
-        case ixgbe_mac_X550EM_x:
-        case ixgbe_mac_x550em_a:
-            supported = true;
-            break;
-        default:
-            supported = false;
-            break;
-        }
-        if (!supported) {
-            break; /* Not supported on this MAC */
-        }
-
-        /* Best-effort: ensure FDIR is in perfect mode and has a mask suitable
-         * for UDPv4 destination-port matching. Doing this here may fail with
-         * -EIO if the block is busy; we retry once after initializing perfect.
-         * This path is safe and idempotent and avoids requiring admin action.
-         */
-        {
-            int err;
-            union ixgbe_atr_input mask;
-
-            /* Force perfect-capable path; keep signature off for gaming. */
-            adapter->flags &= ~IXGBE_FLAG_FDIR_HASH_CAPABLE;
-            adapter->flags |= IXGBE_FLAG_FDIR_PERFECT_CAPABLE;
-
-            /* Initialize perfect mode tables (safe if already done). */
-            err = ixgbe_init_fdir_perfect_82599(hw, adapter->fdir_pballoc);
-            if (!err) {
-                memset(&mask, 0, sizeof(mask));
-                /* Match UDPv4 L4 type + destination port only. */
-                mask.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV4;
-                mask.formatted.dst_port  = cpu_to_be16(0xFFFF);
-
-                err = ixgbe_fdir_set_input_mask_82599(hw, &mask);
-                if (err == -EIO || err == -EBUSY) {
-                    /* Retry once after re-init if busy. */
-                    if (!ixgbe_init_fdir_perfect_82599(hw, adapter->fdir_pballoc))
-                        err = ixgbe_fdir_set_input_mask_82599(hw, &mask);
-                }
-                /* If mask programming ultimately fails we still try to program
-                 * rules below; they may take effect after the next successful
-                 * mask update (e.g., after a reset).
-                 */
-            }
-        }
-
-        /* Pick a stable RX queue to steer to. Default to queue 0. */
-        {
-            char *dup, *cur, *tok;
-            u8 steer_q = 0;
-            const u16 max_v4 = 64;      /* soft_ids [0..63] reserved for IPv4 */
-#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
-            const u16 v6_base = 64;     /* soft_ids [64..127] reserved for IPv6 */
-            const u16 max_v6  = 128;
-#endif
-            u16 sid_v4 = 0;
-#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
-            u16 sid_v6 = v6_base;
-#endif
-
-            if (adapter->num_rx_queues > 0 && adapter->rx_ring[0]) {
-                steer_q = adapter->rx_ring[0]->reg_idx;
-            } else {
-                steer_q = 0;
-            }
-
-            dup = kstrdup(ranges_param, GFP_KERNEL);
-            if (!dup) {
-                break; /* out of memory: skip this link-up programming */
-            }
-            cur = dup;
-
-            /* Serialize perfect filter programming. */
-            spin_lock_bh(&adapter->fdir_perfect_lock);
-
-            while ((tok = strsep(&cur, ",")) != NULL) {
-                u16 start_port, end_port;
-                char *dash;
-
-                if (!*tok)
-                    continue;
-
-                dash = strchr(tok, '-');
-                if (dash) {
-                    *dash = '\0';
-                    if (kstrtou16(tok, 10, &start_port) ||
-                        kstrtou16(dash + 1, 10, &end_port) ||
-                        start_port == 0 || end_port < start_port) {
-                        continue;
-                    }
-                } else {
-                    if (kstrtou16(tok, 10, &start_port) || start_port == 0) {
-                        continue;
-                    }
-                    end_port = start_port;
-                }
-
-                for (; start_port <= end_port; start_port++) {
-                    union ixgbe_atr_input in;
-
-                    if (sid_v4 < max_v4) {
-                        int ret;
-                        memset(&in, 0, sizeof(in));
-                        in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV4;
-                        in.formatted.dst_port  = cpu_to_be16(start_port);
-                        ret = ixgbe_fdir_write_perfect_filter_82599(hw, &in, sid_v4, steer_q);
-                        (void)ret; /* ignore duplicate/err; continue */
-                        sid_v4++;
-                    }
-#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
-                    if (sid_v6 < max_v6) {
-                        int ret;
-                        memset(&in, 0, sizeof(in));
-                        in.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV6;
-                        in.formatted.dst_port  = cpu_to_be16(start_port);
-                        ret = ixgbe_fdir_write_perfect_filter_82599(hw, &in, sid_v6, steer_q);
-                        (void)ret;
-                        sid_v6++;
-                    }
-#endif
-                    if (sid_v4 >= max_v4
-#ifdef IXGBE_ATR_FLOW_TYPE_UDPV6
-                        && sid_v6 >= max_v6
-#endif
-                    ) {
-                        goto done_programming;
-                    }
-                }
-            }
-
-done_programming:
-            spin_unlock_bh(&adapter->fdir_perfect_lock);
-            kfree(dup);
-        }
-    } while (0);
-
-	/* Program Gaming ATR filters if enabled */
-	if (gaming_atr_ranges && *gaming_atr_ranges)
-		ixgbe_gaming_atr_program_filters(adapter);
+    /* Program Gaming ATR filters if enabled and supported. */
+    if (gaming_atr_ranges && *gaming_atr_ranges)
+        ixgbe_gaming_atr_program_filters(adapter);
 
     /* Notify VFs about link change. */
     ixgbe_ping_all_vfs(adapter);
@@ -12258,18 +12011,15 @@ static int ixgbe_parse_gaming_ports(const char *ranges, u16 *ports, int max_port
 	int count = 0;
 	int i, j;
 
-	if (!ranges || !*ranges) {
+	if (!ranges || !*ranges)
 		return 0;
-	}
 
-	if (!ports || max_ports <= 0) {
+	if (!ports || max_ports <= 0)
 		return -EINVAL;
-	}
 
 	dup = kstrdup(ranges, GFP_KERNEL);
-	if (!dup) {
+	if (!dup)
 		return -ENOMEM;
-	}
 
 	cur = dup;
 
@@ -12277,22 +12027,20 @@ static int ixgbe_parse_gaming_ports(const char *ranges, u16 *ports, int max_port
 		u16 start_port, end_port;
 		char *dash;
 
-		if (!*tok) {
+		strim(tok);
+		if (!*tok)
 			continue;
-		}
 
 		dash = strchr(tok, '-');
 		if (dash) {
 			*dash = '\0';
 			if (kstrtou16(tok, 10, &start_port) ||
 			    kstrtou16(dash + 1, 10, &end_port) ||
-			    start_port == 0 || end_port < start_port) {
+			    start_port == 0 || end_port < start_port)
 				continue;
-			}
 		} else {
-			if (kstrtou16(tok, 10, &start_port) || start_port == 0) {
+			if (kstrtou16(tok, 10, &start_port) || start_port == 0)
 				continue;
-			}
 			end_port = start_port;
 		}
 
@@ -12305,9 +12053,6 @@ static int ixgbe_parse_gaming_ports(const char *ranges, u16 *ports, int max_port
 				goto out_of_space;
 			}
 
-			/* A simple linear scan for duplicates is efficient enough for
-			 * the small number of ports expected.
-			 */
 			for (i = 0; i < count; i++) {
 				if (ports[i] == start_port) {
 					duplicate = true;
@@ -12315,21 +12060,18 @@ static int ixgbe_parse_gaming_ports(const char *ranges, u16 *ports, int max_port
 				}
 			}
 
-			if (!duplicate) {
+			if (!duplicate)
 				ports[count++] = start_port;
-			}
 		}
 	}
 
 out_of_space:
 	kfree(dup);
 
-	/* Sort ports for deterministic hardware programming and easier debugging */
 	for (i = 0; i < count - 1; i++) {
 		for (j = i + 1; j < count; j++) {
-			if (ports[i] > ports[j]) {
+			if (ports[i] > ports[j])
 				swap(ports[i], ports[j]);
-			}
 		}
 	}
 
