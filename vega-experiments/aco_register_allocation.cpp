@@ -1099,7 +1099,7 @@ get_reg_simple(ra_ctx& ctx, const RegisterFile& reg_file, DefInfo info)
    uint32_t stride = DIV_ROUND_UP(info.stride, 4);
    RegClass rc = info.rc;
 
-   // Try larger stride recursively (unchanged logic)
+   // Try larger stride recursively
    if (stride < size && !rc.is_subdword()) {
       DefInfo new_info = info;
       new_info.stride = info.stride * 2;
@@ -1111,25 +1111,20 @@ get_reg_simple(ra_ctx& ctx, const RegisterFile& reg_file, DefInfo info)
 
    PhysRegIterator& rr_it = rc.type() == RegType::vgpr ? ctx.rr_vgpr_it : ctx.rr_sgpr_it;
 
-   // Fast path: stride == 1 and not subdword: O(N) sliding window
+   // Fast path: stride=1, non-subdword → O(N) sliding window
    if (stride == 1 && !rc.is_subdword()) {
-      // Prefer scanning from the RR cursor first to improve round-robin placement
-      auto scan_once = [&](unsigned start_idx, unsigned end_idx) -> std::optional<PhysReg> {
-         const unsigned lo = bounds.lo().reg();
+      auto scan_range = [&](unsigned start_dw, unsigned end_dw) -> std::optional<PhysReg> {
          const uint32_t* regs = reg_file.regs.data();
          unsigned run = 0;
+         const unsigned base = (rc.type() == RegType::vgpr) ? 256 : 0;
 
-         for (unsigned i = start_idx; i < end_idx; ++i) {
-            const unsigned phys = i; // dword index
-            // reg is free if unallocated and not WAR-hinted
-            const bool free_dword = (regs[256 * (rc.type() == RegType::vgpr ? 1u : 0u) + (phys - (rc.type() == RegType::vgpr ? 256u : 0u))] == 0) && !ctx.war_hint[PhysReg{phys}];
-            if (LIKELY(free_dword)) {
-               ++run;
-               if (run == size) {
-                  const unsigned start = i + 1 - size;
-                  PhysReg found{start};
+         for (unsigned i = start_dw; i < end_dw; ++i) {
+            const uint32_t val = regs[i];
+            const bool is_free = (val == 0) && !ctx.war_hint[PhysReg{i}];
+            if (LIKELY(is_free)) {
+               if (++run == size) {
+                  PhysReg found{i + 1 - size};
                   adjust_max_used_regs(ctx, rc, found);
-                  // Update round-robin iterator to just after this window (within bounds)
                   PhysRegIterator new_rr{PhysReg{found + size}};
                   if (new_rr < bounds.end())
                      rr_it = new_rr;
@@ -1142,21 +1137,19 @@ get_reg_simple(ra_ctx& ctx, const RegisterFile& reg_file, DefInfo info)
          return {};
       };
 
-      unsigned lo_idx = bounds.lo().reg();
-      unsigned hi_idx = bounds.hi().reg();
+      const unsigned lo = bounds.lo().reg();
+      const unsigned hi = bounds.hi().reg();
+      const unsigned rr = (rr_it != bounds.begin() && bounds.contains(rr_it.reg)) ? rr_it.reg.reg() : lo;
 
-      // Round-robin split
-      if (rr_it != bounds.begin() && bounds.contains(rr_it.reg)) {
-         unsigned rr_idx = rr_it.reg.reg();
-         if (auto res = scan_once(rr_idx, hi_idx)) return res;
-         if (auto res = scan_once(lo_idx, rr_idx)) return res;
+      // Scan from RR cursor first (better hit rate), then wrap
+      if (rr > lo) {
+         if (auto res = scan_range(rr, hi)) return res;
+         if (auto res = scan_range(lo, rr)) return res;
       } else {
-         if (auto res = scan_once(lo_idx, hi_idx)) return res;
+         if (auto res = scan_range(lo, hi)) return res;
       }
-
-      // If no window, fall through to subdword path and SDWA/opsel considerations below
    } else {
-      // Original O(N×W) path retained for subdword or stride > 1
+      // Original path for stride > 1 or subdword
       auto is_free = [&](PhysReg reg_index)
       { return reg_file[reg_index] == 0 && !ctx.war_hint[reg_index]; };
 
@@ -1174,7 +1167,7 @@ get_reg_simple(ra_ctx& ctx, const RegisterFile& reg_file, DefInfo info)
       }
    }
 
-   // Late: use upper bytes of a register if needed (unchanged)
+   // Subdword fallback (unchanged)
    if (rc.is_subdword()) {
       for (const auto& entry : reg_file.subdword_regs) {
          const uint32_t key = entry.first;
@@ -1205,7 +1198,7 @@ ACO_HOT std::vector<unsigned>
 find_vars(ra_ctx& ctx, const RegisterFile& reg_file, const PhysRegInterval reg_interval)
 {
    std::vector<unsigned> vars;
-   vars.reserve(reg_interval.size); // upper bound-ish
+   vars.reserve(reg_interval.size);
 
    unsigned j = reg_interval.lo().reg();
    const unsigned end = reg_interval.hi().reg();
@@ -1213,10 +1206,16 @@ find_vars(ra_ctx& ctx, const RegisterFile& reg_file, const PhysRegInterval reg_i
    while (j < end) {
       PhysReg pj{j};
 
-      if (reg_file.is_blocked(pj)) { ++j; continue; }
+      if (reg_file.is_blocked(pj)) {
+         ++j;
+         continue;
+      }
 
       const uint32_t val = reg_file.regs[pj];
-      if (val == 0) { ++j; continue; }
+      if (val == 0) {
+         ++j;
+         continue;
+      }
 
       if (val == 0xF0000000) {
          auto it = reg_file.subdword_regs.find(pj);
@@ -1234,7 +1233,8 @@ find_vars(ra_ctx& ctx, const RegisterFile& reg_file, const PhysRegInterval reg_i
       const unsigned id = val;
       if (vars.empty() || id != vars.back())
          vars.emplace_back(id);
-      // Jump ahead by the variable size (dwords)
+
+      // Jump ahead by variable size (dwords)
       j += ctx.assignments[id].rc.size();
    }
 
