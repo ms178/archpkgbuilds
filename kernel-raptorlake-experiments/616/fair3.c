@@ -309,7 +309,7 @@ static u64 __calc_delta(u64 delta_exec, unsigned long weight, struct load_weight
 	__update_inv_weight(lw);
 
 	if (unlikely(fact_hi)) {
-		fs = __builtin_clz(fact_hi);
+		fs = fls(fact_hi);
 		shift -= fs;
 		fact >>= fs;
 	}
@@ -318,7 +318,7 @@ static u64 __calc_delta(u64 delta_exec, unsigned long weight, struct load_weight
 
 	fact_hi = (u32)(fact >> 32);
 	if (fact_hi) {
-		fs = __builtin_clz(fact_hi);
+		fs = fls(fact_hi);
 		shift -= fs;
 		fact >>= fs;
 	}
@@ -736,6 +736,8 @@ static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	s64 vlag, limit;
 
+	WARN_ON_ONCE(!se->on_rq);
+
 	vlag = avg_vruntime(cfs_rq) - se->vruntime;
 	limit = calc_delta_fair(max_t(u64, 2*se->slice, TICK_NSEC), se);
 #ifdef CONFIG_SCHED_BORE
@@ -775,7 +777,7 @@ static int vruntime_eligible(struct cfs_rq *cfs_rq, u64 vruntime)
 		load += weight;
 	}
 
-	return __builtin_expect(avg >= (s64)(vruntime - cfs_rq->min_vruntime) * load, 1);
+	return likely(avg >= (s64)(vruntime - cfs_rq->min_vruntime) * load);
 }
 
 int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se)
@@ -5844,9 +5846,16 @@ static void clear_delayed(struct sched_entity *se)
 
 static inline void finish_delayed_dequeue_entity(struct sched_entity *se)
 {
-	clear_delayed(se);
-	if (sched_feat(DELAY_ZERO) && se->vlag > 0)
+	/*
+	 * A delayed entity is being permanently dequeued, so we just need to
+	 * clear its state flag. We must not call clear_delayed() here, as that
+	 * would incorrectly increment h_nr_runnable, assuming the task is
+	 * becoming runnable again.
+	 */
+	se->sched_delayed = 0;
+	if (sched_feat(DELAY_ZERO) && se->vlag > 0) {
 		se->vlag = 0;
+	}
 
 	if (entity_is_task(se)) {
 		struct task_struct *p = task_of(se);
@@ -7468,7 +7477,6 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
 {
 	bool was_sched_idle = sched_idle_rq(rq);
 	bool task_sleep = flags & DEQUEUE_SLEEP;
-	bool task_delayed = flags & DEQUEUE_DELAYED;
 	struct task_struct *p = NULL;
 	int h_nr_idle = 0;
 	int h_nr_queued = 0;
@@ -7480,7 +7488,7 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
 		p = task_of(se);
 		h_nr_queued = 1;
 		h_nr_idle = task_has_idle_policy(p);
-		if (task_sleep || task_delayed || !se->sched_delayed)
+		if (!se->sched_delayed)
 			h_nr_runnable = 1;
 	}
 
