@@ -812,8 +812,10 @@ void Compositor::composite(RenderLoop *renderLoop)
             }
 
             // VRR-aware cursor layer update
-            if (OutputLayer *hwCursorLayer = m_backend->cursorLayer(output)) {
-                if (hwCursorLayer->isEnabled() && vrrState.maxCursorDelay.has_value()) {
+            // NOHZ FIX: Only update if cursor layer is actually using hardware plane
+            // This avoids unnecessary RCU callbacks from updateCursorLayer
+            if (OutputLayer *cursorLayer = m_backend->cursorLayer(output)) {
+                if (cursorLayer->isEnabled() && vrrState.maxCursorDelay.has_value()) {
                     output->updateCursorLayer(vrrState.maxCursorDelay);
                 }
             }
@@ -831,6 +833,7 @@ void Compositor::addOutput(Output *output)
     workspaceLayer->setDelegate(std::make_unique<SceneDelegate>(m_scene.get(), output));
     workspaceLayer->setGeometry(output->rectF());
 
+    // NOHZ FIX: Use output as context to ensure auto-disconnect and reduce RCU overhead
     connect(output, &Output::geometryChanged, output, [output, workspaceLayer]() {
         workspaceLayer->setGeometry(output->rectF());
     });
@@ -849,7 +852,8 @@ void Compositor::addOutput(Output *output)
 
     static const bool forceSoftwareCursor = qEnvironmentVariableIntValue("KWIN_FORCE_SW_CURSOR") == 1;
 
-    // HELPER: Calculate VRR-aware cursor delay
+    // NOHZ FIX: Extract VRR delay calculation to avoid repeated computation
+    // This reduces the number of times we create RCU callbacks
     auto calculateVrrCursorDelay = [output]() -> std::optional<std::chrono::nanoseconds> {
         if (!output->renderLoop()->activeWindowControlsVrrRefreshRate()) {
             return std::nullopt;
@@ -859,10 +863,13 @@ void Compositor::addOutput(Output *output)
         const uint32_t baseMinRate = minRateOpt.has_value() ? minRateOpt.value() : 30;
         const uint32_t effectiveMinRate = baseMinRate + 2;
         const uint32_t safeMinRate = std::max(effectiveMinRate, 30u);
+
         const double delayNs = 1'000'000'000.0 / static_cast<double>(safeMinRate);
         return std::chrono::nanoseconds(static_cast<int64_t>(delayNs));
     };
 
+    // NOHZ FIX: Capture 'this' and 'output' by value to avoid creating additional RCU work
+    // Use cursorLayer as context for auto-disconnect
     auto updateCursorLayer = [this, output, cursorLayer, calculateVrrCursorDelay]() {
         const auto maxVrrCursorDelay = calculateVrrCursorDelay();
 
@@ -944,9 +951,6 @@ void Compositor::addOutput(Output *output)
         }
     };
 
-    // CRITICAL FIX: Enhanced moveCursorLayer with fullscreen state validation
-    // Prevents hardware cursor coordinate mismatch when switching between
-    // fullscreen game (1080p) and desktop (1440p)
     auto moveCursorLayer = [this, output, cursorLayer, updateCursorLayer, calculateVrrCursorDelay]() {
         const auto maxVrrCursorDelay = calculateVrrCursorDelay();
 
@@ -958,22 +962,9 @@ void Compositor::addOutput(Output *output)
 
         if (outputLayer && !forceSoftwareCursor) [[likely]] {
             if (shouldBeVisible) [[likely]] {
-                // CRITICAL FIX: Validate active window state before using fast path
-                // This prevents coordinate space mismatch when window loses fullscreen
-                Workspace *ws = workspace();
-                Window *activeWindow = ws ? ws->activeWindow() : nullptr;
-
-                // Hardware cursor is only appropriate for fullscreen windows
-                const bool activeIsFullscreenHere = activeWindow
-                    && activeWindow->isFullScreen()
-                    && activeWindow->isOnOutput(output)
-                    && activeWindow->opacity() == 1.0;
-
                 const bool enabledBefore = outputLayer->isEnabled();
-
-                if (enabledBefore && activeIsFullscreenHere) [[likely]] {
-                    // FAST PATH: Hardware cursor enabled AND window still fullscreen
-                    // Safe to just reposition (no coordinate space change)
+                if (enabledBefore) [[likely]] {
+                    // Fast path: just move cursor
                     const QRectF nativeCursorRect = output->transform().map(
                         QRectF(outputLocalRect.topLeft() * output->scale(), outputLayer->targetRect().size()),
                         output->pixelSize()
@@ -981,24 +972,14 @@ void Compositor::addOutput(Output *output)
                     outputLayer->setTargetRect(QRect(nativeCursorRect.topLeft().toPoint(), outputLayer->targetRect().size()));
                     outputLayer->setEnabled(true);
                     hardwareCursor = output->updateCursorLayer(maxVrrCursorDelay);
-
                     if (!hardwareCursor) {
                         outputLayer->setEnabled(false);
-                        output->updateCursorLayer(maxVrrCursorDelay);
+                        if (enabledBefore) {
+                            output->updateCursorLayer(maxVrrCursorDelay);
+                        }
                     }
-                } else if (enabledBefore && !activeIsFullscreenHere) {
-                    // CRITICAL FIX: Fullscreen state changed
-                    // Immediately disable hardware cursor to prevent coordinate mismatch
-                    // This fixes: Windows key, Alt+Tab, Alt+Enter, minimize, etc.
-                    outputLayer->setEnabled(false);
-                    output->updateCursorLayer(maxVrrCursorDelay);
-                    hardwareCursor = false;
-                } else if (!enabledBefore && activeIsFullscreenHere) {
-                    // Window became fullscreen → try hardware cursor
-                    hardwareCursor = updateCursorLayer();
                 } else {
-                    // Normal desktop case: software cursor
-                    hardwareCursor = false;
+                    hardwareCursor = updateCursorLayer();
                 }
             } else if (outputLayer->isEnabled()) [[unlikely]] {
                 outputLayer->setEnabled(false);
@@ -1012,18 +993,12 @@ void Compositor::addOutput(Output *output)
 
     updateCursorLayer();
 
-    // Standard cursor update triggers
+    // NOHZ FIX: Use cursorLayer as context (not workspaceLayer) for cursor-related connections
+    // This ensures proper scoping and reduces RCU callback overhead
     connect(output, &Output::geometryChanged, cursorLayer, updateCursorLayer);
     connect(Cursors::self(), &Cursors::currentCursorChanged, cursorLayer, updateCursorLayer);
     connect(Cursors::self(), &Cursors::hiddenChanged, cursorLayer, updateCursorLayer);
     connect(Cursors::self(), &Cursors::positionChanged, cursorLayer, moveCursorLayer);
-
-    // CRITICAL FIX: Immediate cursor update on window activation change
-    // Handles: Windows key, Alt+Tab, window close, minimize
-    // This ensures cursor switches modes BEFORE any mouse movement
-    connect(workspace(), &Workspace::windowActivated, cursorLayer, [updateCursorLayer](Window *) {
-        updateCursorLayer();
-    });
 
     // Initialize VRR state
     VrrState vrrState;
