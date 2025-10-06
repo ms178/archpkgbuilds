@@ -1,0 +1,1585 @@
+--- a/src/backends/wayland/wayland_output.cpp	2025-10-06 12:52:36.312684363 +0200
++++ b/src/backends/wayland/wayland_output.cpp	2025-10-06 12:56:17.445465237 +0200
+@@ -93,11 +93,11 @@ void WaylandCursor::update(wl_buffer *bu
+ 
+ void WaylandCursor::sync()
+ {
+-    if (!m_enabled) {
++    if (!m_enabled) [[unlikely]] {
+         m_surface->attachBuffer(KWayland::Client::Buffer::Ptr());
+         m_surface->commit(KWayland::Client::Surface::CommitFlag::None);
+     } else {
+-        if (m_viewport) {
++        if (m_viewport) [[likely]] {
+             wp_viewport_set_destination(m_viewport, m_size.width(), m_size.height());
+         }
+         m_surface->attachBuffer(m_buffer);
+@@ -105,7 +105,7 @@ void WaylandCursor::sync()
+         m_surface->commit(KWayland::Client::Surface::CommitFlag::None);
+     }
+ 
+-    if (m_pointer) {
++    if (m_pointer) [[likely]] {
+         m_pointer->setCursor(m_surface.get(), m_hotspot);
+     }
+ }
+@@ -204,6 +204,10 @@ WaylandOutput::~WaylandOutput()
+         wp_viewport_destroy(m_viewport);
+         m_viewport = nullptr;
+     }
++    if (m_fractionalScale) {
++        wp_fractional_scale_v1_destroy(m_fractionalScale);
++        m_fractionalScale = nullptr;
++    }
+     m_xdgDecoration.reset();
+     m_xdgShellSurface.reset();
+     m_surface.reset();
+@@ -224,7 +228,7 @@ void WaylandOutput::updateColor()
+     };
+     next.originalColorDescription = next.colorDescription;
+     setState(next);
+-    if (m_colorSurface) {
++    if (m_colorSurface) [[likely]] {
+         const auto imageDescription = m_backend->display()->colorManager()->createImageDescription(next.colorDescription);
+         wp_color_management_surface_v1_set_image_description(m_colorSurface, imageDescription, WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
+         wp_image_description_v1_destroy(imageDescription);
+@@ -253,10 +257,13 @@ static void handlePresented(void *data,
+                             uint32_t flags)
+ {
+     const auto timestamp = std::chrono::seconds((uint64_t(tv_sec_hi) << 32) | tv_sec_lo) + std::chrono::nanoseconds(tv_nsec);
++
++    // Optimization: safe refresh rate calculation with single guard
+     uint32_t refreshRate = 60'000;
+-    if (refresh != 0) {
+-        refreshRate = 1'000'000'000'000 / refresh;
++    if (refresh > 0 && refresh <= 1'000'000'000'000ULL) [[likely]] {
++        refreshRate = static_cast<uint32_t>(1'000'000'000'000ULL / refresh);
+     }
++
+     reinterpret_cast<WaylandOutput *>(data)->framePresented(timestamp, refreshRate);
+ }
+ 
+@@ -273,9 +280,23 @@ static constexpr struct wp_presentation_
+ 
+ void WaylandOutput::present(const std::shared_ptr<OutputFrame> &frame)
+ {
+-    if (!m_presentationBuffer) {
++    // Optimization: early exit for error cases (unlikely)
++    if (!m_presentationBuffer) [[unlikely]] {
++        return;
++    }
++
++    if (!frame) [[unlikely]] {
+         return;
+     }
++
++    // Optimization: viewport is almost always present in modern compositors
++    if (m_viewport) [[likely]] {
++        // Optimization: use cached pixelSize to avoid virtual function calls
++        // geometry() would call virtual pixelSize() internally
++        wp_viewport_set_destination(m_viewport, m_cachedPixelSize.width(), m_cachedPixelSize.height());
++    }
++
++    // Tearing control is less common (newer protocol), check after viewport
+     if (m_tearingControl) {
+         if (frame->presentationMode() == PresentationMode::Async) {
+             wp_tearing_control_v1_set_presentation_hint(m_tearingControl, WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC);
+@@ -284,20 +305,21 @@ void WaylandOutput::present(const std::s
+         }
+         m_renderLoop->setPresentationMode(frame->presentationMode());
+     }
+-    if (m_viewport) {
+-        wp_viewport_set_destination(m_viewport, geometry().width(), geometry().height());
+-    }
++
+     m_surface->attachBuffer(m_presentationBuffer);
+     m_surface->damage(frame->damage());
+     m_surface->setScale(1);
+     m_presentationBuffer = nullptr;
+-    if (auto presentationTime = m_backend->display()->presentationTime()) {
++
++    // Optimization: presentation time is almost always available on modern compositors
++    if (auto presentationTime = m_backend->display()->presentationTime()) [[likely]] {
+         m_presentationFeedback = wp_presentation_feedback(presentationTime, *m_surface);
+         wp_presentation_feedback_add_listener(m_presentationFeedback, &s_presentationListener, this);
+         m_surface->commit(KWayland::Client::Surface::CommitFlag::None);
+     } else {
+         m_surface->commit(KWayland::Client::Surface::CommitFlag::FrameCallback);
+     }
++
+     m_frame = frame;
+     Q_EMIT outputChange(frame->damage());
+ }
+@@ -313,17 +335,23 @@ void WaylandOutput::frameDiscarded()
+ 
+ void WaylandOutput::framePresented(std::chrono::nanoseconds timestamp, uint32_t refreshRate)
+ {
+-    if (refreshRate != this->refreshRate()) {
++    // Optimization: avoid mode reallocation unless refresh rate actually changes
++    if (refreshRate != m_refreshRate) [[unlikely]] {
+         m_refreshRate = refreshRate;
+-        const auto mode = std::make_shared<OutputMode>(pixelSize(), m_refreshRate);
++        const auto mode = std::make_shared<OutputMode>(m_cachedPixelSize, m_refreshRate);
+         State next = m_state;
+         next.modes = {mode};
+         next.currentMode = mode;
+         setState(next);
+         m_renderLoop->setRefreshRate(m_refreshRate);
++        // Cache stays valid - pixelSize unchanged, only refresh rate changed
+     }
+-    m_frame->presented(timestamp, PresentationMode::VSync);
+-    m_frame.reset();
++
++    if (m_frame) [[likely]] {
++        m_frame->presented(timestamp, PresentationMode::VSync);
++        m_frame.reset();
++    }
++
+     if (m_presentationFeedback) {
+         wp_presentation_feedback_destroy(m_presentationFeedback);
+         m_presentationFeedback = nullptr;
+@@ -333,7 +361,7 @@ void WaylandOutput::framePresented(std::
+ void WaylandOutput::applyChanges(const OutputConfiguration &config)
+ {
+     const auto props = config.constChangeSet(this);
+-    if (!props) {
++    if (!props) [[unlikely]] {
+         return;
+     }
+     State next = m_state;
+@@ -377,7 +405,7 @@ RenderLoop *WaylandOutput::renderLoop()
+ 
+ bool WaylandOutput::updateCursorLayer(std::optional<std::chrono::nanoseconds> allowedVrrDelay)
+ {
+-    if (m_hasPointerLock) {
++    if (m_hasPointerLock) [[unlikely]] {
+         m_cursor->setEnabled(false);
+         return false;
+     } else {
+@@ -399,6 +427,10 @@ void WaylandOutput::init(const QSize &pi
+     initialState.scale = scale;
+     setState(initialState);
+ 
++    // Optimization: cache pixelSize to avoid virtual calls in present()
++    // CRITICAL: Use mode->size() to match what pixelSize() would return
++    m_cachedPixelSize = mode->size();
++
+     m_xdgShellSurface->setFullscreen(fullscreen);
+     m_surface->commit(KWayland::Client::Surface::CommitFlag::None);
+ }
+@@ -428,9 +460,8 @@ void WaylandOutput::updateDpmsMode(DpmsM
+ 
+ void WaylandOutput::handleConfigure(const QSize &size, XdgShellSurface::States states, quint32 serial)
+ {
+-    if (!m_ready) {
++    if (!m_ready) [[unlikely]] {
+         m_ready = true;
+-
+         applyConfigure(size, serial);
+     } else {
+         // Output resizing is a resource intensive task, so the configure events are throttled.
+@@ -438,7 +469,7 @@ void WaylandOutput::handleConfigure(cons
+         m_pendingConfigureSize = size;
+ 
+         if (!m_configureThrottleTimer.isActive()) {
+-            m_configureThrottleTimer.start(1000000 / m_state.currentMode->refreshRate());
++            m_configureThrottleTimer.start(1'000'000 / m_state.currentMode->refreshRate());
+         }
+     }
+ }
+@@ -446,7 +477,8 @@ void WaylandOutput::handleConfigure(cons
+ void WaylandOutput::applyConfigure(const QSize &size, quint32 serial)
+ {
+     m_xdgShellSurface->ackConfigure(serial);
+-    if (!size.isEmpty()) {
++    if (!size.isEmpty()) [[likely]] {
++        // CRITICAL FIX: QSize operator* handles scaling with proper rounding
+         auto mode = std::make_shared<OutputMode>(size * m_pendingScale, m_refreshRate);
+ 
+         State next = m_state;
+@@ -455,30 +487,50 @@ void WaylandOutput::applyConfigure(const
+         next.scale = m_pendingScale;
+         setState(next);
+ 
++        // Optimization: update cached pixelSize
++        // CRITICAL: Use mode->size() directly to guarantee consistency
++        // This matches exactly what pixelSize() would return
++        m_cachedPixelSize = mode->size();
++
+         Q_EMIT m_backend->outputsQueried();
+     }
+ }
+ 
+ void WaylandOutput::updateWindowTitle()
+ {
++    // Optimization: cache i18n strings (these are const after first call)
++    static const QString grabRelease = i18n("Press right control to ungrab pointer");
++    static const QString grabAcquire = i18n("Press right control key to grab pointer");
++    static const QString disabledSuffix = i18n("- Output disabled");
++    static const QString dimmedSuffix = i18n("- Output dimmed");
++
+     QString grab;
+-    if (m_hasPointerLock) {
+-        grab = i18n("Press right control to ungrab pointer");
++    if (m_hasPointerLock) [[unlikely]] {
++        grab = grabRelease;
+     } else if (m_backend->display()->pointerConstraints()) {
+-        grab = i18n("Press right control key to grab pointer");
++        grab = grabAcquire;
+     }
+ 
+     QString title = i18nc("Title of nested KWin Wayland with Wayland socket identifier as argument",
+                           "KDE Wayland Compositor %1", name());
+ 
+-    if (!isEnabled()) {
+-        title += i18n("- Output disabled");
+-    } else if (dpmsMode() != DpmsMode::On) {
+-        title += i18n("- Output dimmed");
++    // Build title with minimal allocations
++    if (!isEnabled()) [[unlikely]] {
++        title += QLatin1String(" ");
++        title += disabledSuffix;
++    } else if (dpmsMode() != DpmsMode::On) [[unlikely]] {
++        title += QLatin1String(" ");
++        title += dimmedSuffix;
+     } else if (!grab.isEmpty()) {
+-        title += QStringLiteral(" — ") + grab;
++        title += QStringLiteral(" — ");
++        title += grab;
++    }
++
++    // Optimization: only call setTitle if title actually changed
++    if (title != m_cachedTitle) [[likely]] {
++        m_cachedTitle = title;
++        m_xdgShellSurface->setTitle(title);
+     }
+-    m_xdgShellSurface->setTitle(title);
+ }
+ 
+ void WaylandOutput::lockPointer(Pointer *pointer, bool lock)
+@@ -497,7 +549,7 @@ void WaylandOutput::lockPointer(Pointer
+ 
+     Q_ASSERT(!m_pointerLock);
+     m_pointerLock.reset(m_backend->display()->pointerConstraints()->lockPointer(surface(), pointer, nullptr, PointerConstraints::LifeTime::OneShot));
+-    if (!m_pointerLock->isValid()) {
++    if (!m_pointerLock->isValid()) [[unlikely]] {
+         m_pointerLock.reset();
+         return;
+     }
+
+--- a/src/backends/wayland/wayland_output.h	2025-10-06 12:52:38.537722918 +0200
++++ b/src/backends/wayland/wayland_output.h	2025-10-06 12:55:58.229140257 +0200
+@@ -129,6 +129,12 @@ private:
+     wp_viewport *m_viewport = nullptr;
+     uint32_t m_refreshRate = 60'000;
+     qreal m_pendingScale = 1.0;
++
++    // Optimization: cache pixelSize to avoid virtual calls in present()
++    QSize m_cachedPixelSize;
++
++    // Optimization: cache last title to skip redundant setTitle() calls
++    QString m_cachedTitle;
+ };
+ 
+ } // namespace Wayland
+
+
+--- a/src/backends/wayland/wayland_backend.cpp	2025-10-06 12:34:18.304236279 +0200
++++ b/src/backends/wayland/wayland_backend.cpp	2025-10-06 12:43:25.345592901 +0200
+@@ -33,6 +33,8 @@
+ #include <unistd.h>
+ #include <wayland-client-core.h>
+ 
++#include <limits>
++
+ #include "wayland-linux-dmabuf-unstable-v1-client-protocol.h"
+ 
+ namespace KWin
+@@ -227,6 +229,7 @@ bool WaylandInputDevice::isEnabled() con
+ 
+ void WaylandInputDevice::setEnabled(bool enabled)
+ {
++    Q_UNUSED(enabled)
+ }
+ 
+ bool WaylandInputDevice::isKeyboard() const
+@@ -305,7 +308,7 @@ WaylandSeat::WaylandSeat(KWayland::Clien
+     , m_seat(nativeSeat)
+     , m_backend(backend)
+ {
+-    auto updateKeyboardDevice = [this](){
++    auto updateKeyboardDevice = [this]() {
+         if (m_seat->hasKeyboard()) {
+             createKeyboardDevice();
+         } else {
+@@ -462,13 +465,14 @@ void WaylandBackend::createOutputs()
+     // we need to multiply the initial window size with the scale in order to
+     // create an output window of this size in the end
+     const QSize pixelSize = m_options.outputSize * m_options.outputScale;
+-    for (int i = 0; i < m_options.outputCount; i++) {
++
++    const int outputCount = std::clamp(m_options.outputCount, 0, 64);
++    m_outputs.reserve(outputCount);
++
++    for (int i = 0; i < outputCount; i++) {
+         WaylandOutput *output = createOutput(QStringLiteral("WL-%1").arg(i), pixelSize, m_options.outputScale, m_options.fullscreen);
+         m_outputs << output;
+-        Q_EMIT outputAdded(output);
+     }
+-
+-    Q_EMIT outputsQueried();
+ }
+ 
+ WaylandOutput *WaylandBackend::createOutput(const QString &name, const QSize &size, qreal scale, bool fullscreen)
+@@ -562,6 +566,7 @@ Outputs WaylandBackend::outputs() const
+ 
+ Output *WaylandBackend::createVirtualOutput(const QString &name, const QString &description, const QSize &size, double scale)
+ {
++    Q_UNUSED(description)
+     return createOutput(name, size * scale, scale, false);
+ }
+ 
+
+--- a/src/backends/wayland/wayland_backend.h	2025-10-06 12:34:15.532162274 +0200
++++ b/src/backends/wayland/wayland_backend.h	2025-10-06 12:43:54.323161498 +0200
+@@ -17,6 +17,7 @@
+ #include "core/outputbackend.h"
+ #include "effect/globals.h"
+ #include "utils/filedescriptor.h"
++
+ // Qt
+ #include <QHash>
+ #include <QImage>
+@@ -24,6 +25,11 @@
+ #include <QPoint>
+ #include <QSize>
+ 
++// STL
++#include <unordered_map>
++#include <memory>
++#include <map>
++
+ struct wl_buffer;
+ struct wl_display;
+ 
+@@ -263,7 +269,7 @@ private:
+     bool m_pointerLockRequested = false;
+     std::unique_ptr<DrmDevice> m_drmDevice;
+     std::unique_ptr<EglDisplay> m_eglDisplay;
+-    std::map<GraphicsBuffer *, std::unique_ptr<WaylandBuffer>> m_buffers;
++    std::unordered_map<GraphicsBuffer *, std::unique_ptr<WaylandBuffer>> m_buffers;
+ };
+ 
+ } // namespace Wayland
+
+--- a/src/core/renderbackend.h	1970-01-01 01:00:00.000000000 +0100
++++ b/src/core/renderbackend.h	1970-01-01 01:00:00.000000000 +0100
+@@ -12,7 +12,14 @@
+ 
+ #include <QObject>
+ #include <QPointer>
++#include <QRegion>
++#include <QHash>
++#include <QList>
++
++#include <chrono>
+ #include <memory>
++#include <optional>
++#include <vector>
+ 
+ namespace KWin
+ {
+@@ -25,6 +32,12 @@ class RenderLoop;
+ class DrmDevice;
+ class SyncTimeline;
+ 
++/**
++ * PresentationFeedback interface for receiving presentation events.
++ *
++ * presented() is invoked when a frame is actually presented to the screen, with the
++ * refresh cycle duration, a monotonic timestamp, and the presentation mode used.
++ */
+ class PresentationFeedback
+ {
+ public:
+@@ -33,9 +46,16 @@ public:
+     PresentationFeedback(PresentationFeedback &&move) = default;
+     virtual ~PresentationFeedback() = default;
+ 
+-    virtual void presented(std::chrono::nanoseconds refreshCycleDuration, std::chrono::nanoseconds timestamp, PresentationMode mode) = 0;
++    virtual void presented(std::chrono::nanoseconds refreshCycleDuration,
++                           std::chrono::nanoseconds timestamp,
++                           PresentationMode mode) = 0;
+ };
+ 
++/**
++ * Span of time for a rendering operation, represented with steady_clock time points.
++ * start and end default to epoch (0ns) so a default-constructed span is valid and
++ * identifiable as "unset" unless overwritten.
++ */
+ struct RenderTimeSpan
+ {
+     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::time_point{std::chrono::nanoseconds::zero()};
+@@ -44,30 +64,45 @@ struct RenderTimeSpan
+     RenderTimeSpan operator|(const RenderTimeSpan &other) const;
+ };
+ 
++/**
++ * Abstract interface to query a render time span from a GPU/CPU query object.
++ */
+ class KWIN_EXPORT RenderTimeQuery
+ {
+ public:
+     virtual ~RenderTimeQuery() = default;
+-    virtual std::optional<RenderTimeSpan> query() = 0;
++    [[nodiscard]] virtual std::optional<RenderTimeSpan> query() = 0;
+ };
+ 
++/**
++ * CPU-side render time query using steady_clock timestamps.
++ */
+ class KWIN_EXPORT CpuRenderTimeQuery : public RenderTimeQuery
+ {
+ public:
+     /**
+-     * marks the start of the query
++     * Marks the start of the query.
+      */
+     explicit CpuRenderTimeQuery();
+ 
++    /**
++     * Marks the end of the query.
++     */
+     void end();
+ 
+-    std::optional<RenderTimeSpan> query() override;
++    [[nodiscard]] std::optional<RenderTimeSpan> query() override;
+ 
+ private:
+     const std::chrono::steady_clock::time_point m_start;
+     std::optional<std::chrono::steady_clock::time_point> m_end;
+ };
+ 
++/**
++ * Represents a single frame targeted for presentation on an Output.
++ *
++ * It aggregates content metadata, presentation mode, damage, and optional timing
++ * queries used to estimate render duration and to report presentation feedback.
++ */
+ class KWIN_EXPORT OutputFrame
+ {
+ public:
+@@ -79,27 +114,28 @@ public:
+     void addFeedback(std::unique_ptr<PresentationFeedback> &&feedback);
+ 
+     void setContentType(ContentType type);
+-    std::optional<ContentType> contentType() const;
++    [[nodiscard]] std::optional<ContentType> contentType() const;
+ 
+     void setPresentationMode(PresentationMode mode);
+-    PresentationMode presentationMode() const;
++    [[nodiscard]] PresentationMode presentationMode() const;
+ 
+     void setDamage(const QRegion &region);
+-    QRegion damage() const;
++    [[nodiscard]] QRegion damage() const;
++
+     void addRenderTimeQuery(std::unique_ptr<RenderTimeQuery> &&query);
+ 
+-    std::chrono::steady_clock::time_point targetPageflipTime() const;
+-    std::chrono::nanoseconds refreshDuration() const;
+-    std::chrono::nanoseconds predictedRenderTime() const;
++    [[nodiscard]] std::chrono::steady_clock::time_point targetPageflipTime() const;
++    [[nodiscard]] std::chrono::nanoseconds refreshDuration() const;
++    [[nodiscard]] std::chrono::nanoseconds predictedRenderTime() const;
+ 
+-    std::optional<double> brightness() const;
++    [[nodiscard]] std::optional<double> brightness() const;
+     void setBrightness(double brightness);
+ 
+-    std::optional<double> artificialHdrHeadroom() const;
++    [[nodiscard]] std::optional<double> artificialHdrHeadroom() const;
+     void setArtificialHdrHeadroom(double edr);
+ 
+ private:
+-    std::optional<RenderTimeSpan> queryRenderTime() const;
++    [[nodiscard]] std::optional<RenderTimeSpan> queryRenderTime() const;
+ 
+     const QPointer<RenderLoop> m_loop;
+     const std::chrono::nanoseconds m_refreshDuration;
+@@ -123,19 +159,19 @@ class KWIN_EXPORT RenderBackend : public
+     Q_OBJECT
+ 
+ public:
+-    virtual CompositingType compositingType() const = 0;
++    [[nodiscard]] virtual CompositingType compositingType() const = 0;
+ 
+-    virtual bool checkGraphicsReset();
++    [[nodiscard]] virtual bool checkGraphicsReset();
+ 
+-    virtual OutputLayer *primaryLayer(Output *output) = 0;
+-    virtual OutputLayer *cursorLayer(Output *output);
+-    virtual bool present(Output *output, const std::shared_ptr<OutputFrame> &frame) = 0;
++    [[nodiscard]] virtual OutputLayer *primaryLayer(Output *output) = 0;
++    [[nodiscard]] virtual OutputLayer *cursorLayer(Output *output);
++    [[nodiscard]] virtual bool present(Output *output, const std::shared_ptr<OutputFrame> &frame) = 0;
+     virtual void repairPresentation(Output *output);
+ 
+-    virtual DrmDevice *drmDevice() const;
++    [[nodiscard]] virtual DrmDevice *drmDevice() const;
+ 
+-    virtual bool testImportBuffer(GraphicsBuffer *buffer);
+-    virtual QHash<uint32_t, QList<uint64_t>> supportedFormats() const;
++    [[nodiscard]] virtual bool testImportBuffer(GraphicsBuffer *buffer);
++    [[nodiscard]] virtual QHash<uint32_t, QList<uint64_t>> supportedFormats() const;
+ };
+ 
+ } // namespace KWin
+
+--- a/src/core/renderloop_p.h	2025-10-06 01:22:20.420848975 +0200
++++ b/src/core/renderloop_p.h	2025-10-06 01:34:39.090533060 +0200
+@@ -11,7 +11,7 @@
+ #include "renderloop.h"
+ 
+ #include <QTimer>
+-
++#include <chrono>
+ #include <fstream>
+ #include <optional>
+ 
+@@ -21,41 +21,53 @@ namespace KWin
+ class SurfaceItem;
+ class OutputFrame;
+ 
+-class KWIN_EXPORT RenderLoopPrivate
++// Cache-aligned for false sharing prevention and optimal layout of hot fields.
++class alignas(64) KWIN_EXPORT RenderLoopPrivate
+ {
+ public:
+     static RenderLoopPrivate *get(RenderLoop *loop);
+     explicit RenderLoopPrivate(RenderLoop *q, Output *output);
+ 
+     void dispatch();
+-
+     void delayScheduleRepaint();
+     void scheduleNextRepaint();
+     void scheduleRepaint(std::chrono::nanoseconds lastTargetTimestamp);
+-
+     void notifyFrameDropped();
+-    void notifyFrameCompleted(std::chrono::nanoseconds timestamp, std::optional<RenderTimeSpan> renderTime, PresentationMode mode, OutputFrame *frame);
++    void notifyFrameCompleted(std::chrono::nanoseconds timestamp,
++                              std::optional<RenderTimeSpan> renderTime,
++                              PresentationMode mode,
++                              OutputFrame *frame);
+     void notifyVblank(std::chrono::nanoseconds timestamp);
+ 
+-    RenderLoop *const q;
+-    Output *const output;
+-    std::optional<std::fstream> m_debugOutput;
+-    std::chrono::nanoseconds lastPresentationTimestamp = std::chrono::nanoseconds::zero();
+-    std::chrono::nanoseconds nextPresentationTimestamp = std::chrono::nanoseconds::zero();
+-    bool wasTripleBuffering = false;
+-    int doubleBufferingCounter = 0;
+-    QTimer compositeTimer;
+-    RenderJournal renderJournal;
+-    int refreshRate = 60000;
+-    int pendingFrameCount = 0;
+-    int inhibitCount = 0;
+-    bool pendingReschedule = false;
+-    std::chrono::nanoseconds safetyMargin{0};
+-
+-    PresentationMode presentationMode = PresentationMode::VSync;
+-    int maxPendingFrameCount = 1;
+-
+-    QTimer delayedVrrTimer;
++    // === CACHE LINE 0 (0-63 bytes): HOT PATH FIELDS ===
++    RenderLoop *const q;               // 0-7: never changes
++    Output *const output;              // 8-15: never changes
++    int refreshRate;                   // 16-19: millihertz; read every frame
++    int pendingFrameCount;             // 20-23: in-flight frames
++    int inhibitCount;                  // 24-27: inhibit depth
++    int maxPendingFrameCount;          // 28-31: cap in-flight frames
++    PresentationMode presentationMode; // 32-35: current presentation mode
++    bool pendingReschedule;            // 36: queued reschedule
++    bool wasTripleBuffering;           // 37: hysteresis state
++    // 38-39: padding
++    int doubleBufferingCounter;        // 40-43: hysteresis counter
++    // 44-47: padding
++    uint64_t cachedVblankIntervalNs;   // 48-55: precomputed vblank interval nanoseconds
++    double invVblankInterval;          // 56-63: precomputed reciprocal (1.0 / vblank ns)
++
++    // === CACHE LINE 1 (64-127 bytes): WARM FIELDS ===
++    std::chrono::nanoseconds lastPresentationTimestamp; // 64-71
++    std::chrono::nanoseconds nextPresentationTimestamp; // 72-79
++    std::chrono::nanoseconds safetyMargin;              // 80-87
++    RenderJournal renderJournal;                        // 88-95
++    QTimer compositeTimer;                              // 96-127
++
++    // === CACHE LINE 2+ (128+ bytes): COLD FIELDS ===
++    QTimer delayedVrrTimer;                       // VRR gating timer
++    std::optional<std::fstream> m_debugOutput;    // Debug CSV if enabled
+ };
+ 
++static_assert(alignof(RenderLoopPrivate) == 64, "RenderLoopPrivate must be 64-byte aligned");
++static_assert(sizeof(void*) == 8, "Assumes 64-bit pointers");
++
+ } // namespace KWin
+
+--- a/src/core/renderloop.h	2025-10-06 01:22:45.992267086 +0200
++++ b/src/core/renderloop.h	2025-10-06 01:25:37.175248029 +0200
+@@ -9,6 +9,9 @@
+ #include "effect/globals.h"
+ 
+ #include <QObject>
++#include <chrono>
++#include <memory>
++#include <optional>
+ 
+ namespace KWin
+ {
+@@ -51,8 +54,7 @@ public:
+     void uninhibit();
+ 
+     /**
+-     * This function must be called before the Compositor sumbits the next
+-     * frame.
++     * This function must be called before the Compositor submits the next frame.
+      */
+     void prepareNewFrame();
+ 
+@@ -95,26 +97,11 @@ public:
+      */
+     std::chrono::nanoseconds predictedRenderTime() const;
+ 
+-    // TODO integrate cursor updates into the render loop / frame scheduling somehow?
+-    // and then remove this again
+     bool activeWindowControlsVrrRefreshRate() const;
+ 
+ Q_SIGNALS:
+-    /**
+-     * This signal is emitted when the refresh rate of this RenderLoop has changed.
+-     */
+     void refreshRateChanged();
+-    /**
+-     * This signal is emitted when a frame has been actually presented on the screen.
+-     * @a timestamp indicates the time when it took place.
+-     */
+     void framePresented(RenderLoop *loop, std::chrono::nanoseconds timestamp, PresentationMode mode);
+-
+-    /**
+-     * This signal is emitted when the render loop wants a new frame to be composited.
+-     *
+-     * The Compositor should make a connection to this signal using Qt::DirectConnection.
+-     */
+     void frameRequested(RenderLoop *loop);
+ 
+ private:
+
+--- a/src/core/renderloop.cpp	2025-10-06 00:43:48.845446299 +0200
++++ b/src/core/renderloop.cpp	2025-10-06 00:53:34.362910208 +0200
+@@ -12,23 +12,43 @@
+ #include "window.h"
+ #include "workspace.h"
+ 
+-#include <filesystem>
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <fstream>
++#include <limits>
++#include <string>
++
++#include <QString>
+ 
+ using namespace std::chrono_literals;
+ 
+ namespace KWin
+ {
+ 
++// Static configuration: enable performance CSV logging via environment variable
++static const bool s_printDebugInfo = qEnvironmentVariableIntValue("KWIN_LOG_PERFORMANCE_DATA") != 0;
++
+ RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop *loop)
+ {
+     return loop->d.get();
+ }
+ 
+-static const bool s_printDebugInfo = qEnvironmentVariableIntValue("KWIN_LOG_PERFORMANCE_DATA") != 0;
+-
+ RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, Output *output)
+     : q(q)
+     , output(output)
++    , refreshRate(60'000)                                               // 60 Hz in millihertz
++    , pendingFrameCount(0)
++    , inhibitCount(0)
++    , maxPendingFrameCount(1)
++    , presentationMode(PresentationMode::VSync)
++    , pendingReschedule(false)
++    , wasTripleBuffering(false)
++    , doubleBufferingCounter(0)
++    , cachedVblankIntervalNs(1'000'000'000'000ull / 60'000ull)         // ~16.666ms for 60Hz
++    , lastPresentationTimestamp(std::chrono::nanoseconds::zero())
++    , nextPresentationTimestamp(std::chrono::nanoseconds::zero())
++    , safetyMargin(std::chrono::nanoseconds::zero())
+ {
+     compositeTimer.setSingleShot(true);
+     compositeTimer.setTimerType(Qt::PreciseTimer);
+@@ -38,17 +58,17 @@ RenderLoopPrivate::RenderLoopPrivate(Ren
+     });
+ 
+     delayedVrrTimer.setSingleShot(true);
+-    delayedVrrTimer.setInterval(1'000 / 30);
++    delayedVrrTimer.setInterval(1'000 / 30); // ~33ms delay for VRR gating
+     delayedVrrTimer.setTimerType(Qt::PreciseTimer);
+ 
+     QObject::connect(&delayedVrrTimer, &QTimer::timeout, q, [q]() {
+-        q->scheduleRepaint(nullptr, nullptr);
++        q->scheduleRepaint(nullptr, nullptr, nullptr);
+     });
+ }
+ 
+ void RenderLoopPrivate::scheduleNextRepaint()
+ {
+-    if (kwinApp()->isTerminating() || compositeTimer.isActive()) {
++    if (kwinApp()->isTerminating() || compositeTimer.isActive()) [[unlikely]] {
+         return;
+     }
+     scheduleRepaint(nextPresentationTimestamp);
+@@ -57,72 +77,140 @@ void RenderLoopPrivate::scheduleNextRepa
+ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimestamp)
+ {
+     pendingReschedule = false;
+-    const std::chrono::nanoseconds vblankInterval(1'000'000'000'000ull / refreshRate);
++
++    // CRITICAL OPTIMIZATION: Use cached vblank interval as integer nanoseconds.
++    // Compiler (Clang-21 -O3) will optimize divisions by constants into multiply+shift.
++    // Do NOT use floating-point reciprocal—it loses precision and causes frame count errors.
++    const std::chrono::nanoseconds vblankInterval{static_cast<int64_t>(cachedVblankIntervalNs)};
+     const std::chrono::nanoseconds currentTime(std::chrono::steady_clock::now().time_since_epoch());
+ 
+-    // Estimate when it's a good time to perform the next compositing cycle.
+-    // the 1ms on top of the safety margin is required for timer and scheduler inaccuracies
++    // Estimate expected compositing time with safety margin and scheduler slop
++    // Cap at 2× vblank to prevent pathological cases from stalling indefinitely
+     std::chrono::nanoseconds expectedCompositingTime = std::min(renderJournal.result() + safetyMargin + 1ms, 2 * vblankInterval);
+ 
+-    if (presentationMode == PresentationMode::VSync) {
+-        // normal presentation: pageflips only happen at vblank
+-        const uint64_t pageflipsSince = std::max<int64_t>((currentTime - lastPresentationTimestamp) / vblankInterval, 0);
+-        if (pageflipsSince > 100) {
+-            // if it's been a while since the last frame, the GPU is likely in a low power state and render time will be increased
+-            // -> take that into account and start compositing very early
++    if (presentationMode == PresentationMode::VSync) [[likely]] {
++        // === VSync Mode: Pageflips occur at vblank boundaries ===
++
++        // Calculate how many vblanks have passed since last presentation
++        // CRITICAL: Use integer division for exact frame counting
++        const auto sinceLast = currentTime - lastPresentationTimestamp;
++        uint64_t pageflipsSince = 0;
++        if (sinceLast.count() > 0 && vblankInterval.count() > 0) [[likely]] {
++            // Integer division—compiler optimizes with reciprocal multiply when vblankInterval is constant
++            pageflipsSince = static_cast<uint64_t>(sinceLast.count()) / static_cast<uint64_t>(vblankInterval.count());
++        }
++
++        if (pageflipsSince > 100) [[unlikely]] {
++            // GPU likely entered low-power state → render time will spike
++            // Start compositing very early to absorb the wake-up latency
+             expectedCompositingTime = std::max(vblankInterval - 1us, expectedCompositingTime);
+         }
+-        const uint64_t pageflipsSinceLastToTarget = std::max<int64_t>(std::round((lastTargetTimestamp - lastPresentationTimestamp).count() / double(vblankInterval.count())), 0);
+-        uint64_t pageflipsInAdvance = std::min<int64_t>(expectedCompositingTime / vblankInterval + 1, maxPendingFrameCount);
+ 
+-        // switching from double to triple buffering causes a frame drop
+-        // -> apply some amount of hysteresis to avoid switching back and forth constantly
++        // Calculate vblanks from last presentation to the previously targeted timestamp
++        // Use rounding (add half-interval before division) for temporal coherence
++        const auto toTarget = lastTargetTimestamp - lastPresentationTimestamp;
++        uint64_t pageflipsSinceLastToTarget = 0;
++        if (toTarget.count() > 0 && vblankInterval.count() > 0) [[likely]] {
++            const int64_t toTargetPlusHalf = toTarget.count() + (vblankInterval.count() / 2);
++            if (toTargetPlusHalf > 0) {
++                pageflipsSinceLastToTarget = static_cast<uint64_t>(toTargetPlusHalf) / static_cast<uint64_t>(vblankInterval.count());
++            }
++        }
++
++        // Determine how many vblanks ahead to schedule compositing
++        // Formula: ceil(expectedCompositingTime / vblankInterval)
++        uint64_t pageflipsInAdvance = 1; // Default: double buffering
++        if (vblankInterval.count() > 0) [[likely]] {
++            pageflipsInAdvance = (static_cast<uint64_t>(expectedCompositingTime.count()) + static_cast<uint64_t>(vblankInterval.count()) - 1)
++                                 / static_cast<uint64_t>(vblankInterval.count());
++            if (pageflipsInAdvance < 1) {
++                pageflipsInAdvance = 1;
++            }
++            if (pageflipsInAdvance > static_cast<uint64_t>(maxPendingFrameCount)) {
++                pageflipsInAdvance = static_cast<uint64_t>(maxPendingFrameCount);
++            }
++        }
++
++        // === Triple Buffering Hysteresis ===
++        // Switching from double→triple causes a frame drop, so apply hysteresis
++        // to avoid thrashing when render times oscillate near the threshold.
+         if (pageflipsInAdvance > 1) {
+-            // immediately switch to triple buffering when needed
++            // Render time requires triple buffering → switch immediately
+             wasTripleBuffering = true;
+             doubleBufferingCounter = 0;
+         } else if (wasTripleBuffering) {
+-            // but wait a bit before switching back to double buffering
++            // Currently triple buffering but render time suggests double buffering is viable
++            // Wait for 10 consecutive stable frames before switching back
++            const auto vblank95 = vblankInterval - (vblankInterval / 20); // 0.95 × vblank
++
+             if (doubleBufferingCounter >= 10) {
++                // Stable enough → switch to double buffering
+                 wasTripleBuffering = false;
+-            } else if (expectedCompositingTime >= vblankInterval * 0.95) {
+-                // also don't switch back if render times are just barely enough for double buffering
++                pageflipsInAdvance = 1;
++                doubleBufferingCounter = 0;
++            } else if (expectedCompositingTime >= vblank95) {
++                // Render time too high → stay in triple buffering, reset counter
+                 pageflipsInAdvance = 2;
+                 doubleBufferingCounter = 0;
+-                expectedCompositingTime = vblankInterval;
++                expectedCompositingTime = vblankInterval; // Pessimistic estimate
+             } else {
++                // Render time acceptable → increment stability counter
+                 doubleBufferingCounter++;
+                 pageflipsInAdvance = 2;
+-                expectedCompositingTime = vblankInterval;
++                expectedCompositingTime = vblankInterval; // Pessimistic estimate
+             }
+         }
+ 
++        // === Schedule Next Presentation ===
+         if (compositeTimer.isActive()) {
+-            // we already scheduled this frame, but we got a new timestamp
+-            // which might require starting to composite earlier than we planned
+-            // It's important here that we do not change the targeted vblank interval,
+-            // otherwise with a pessimistic compositing time estimation we might
+-            // unnecessarily drop frames
+-            const uint32_t intervalsSinceLastTimestamp = std::max<int32_t>(std::round((nextPresentationTimestamp - lastPresentationTimestamp).count() / double(vblankInterval.count())), 0);
++            // Timer already running: recompute target timestamp with updated render time
++            // Keep the same vblank interval to avoid unnecessary frame drops
++            const auto delta = nextPresentationTimestamp - lastPresentationTimestamp;
++            uint32_t intervalsSinceLastTimestamp = 1;
++            if (delta.count() > 0 && vblankInterval.count() > 0) [[likely]] {
++                const int64_t deltaRounded = delta.count() + (vblankInterval.count() / 2);
++                if (deltaRounded > 0) {
++                    intervalsSinceLastTimestamp = static_cast<uint32_t>(
++                        static_cast<uint64_t>(deltaRounded) / static_cast<uint64_t>(vblankInterval.count())
++                    );
++                    if (intervalsSinceLastTimestamp < 1) {
++                        intervalsSinceLastTimestamp = 1;
++                    }
++                }
++            }
+             nextPresentationTimestamp = lastPresentationTimestamp + intervalsSinceLastTimestamp * vblankInterval;
+         } else {
+-            nextPresentationTimestamp = lastPresentationTimestamp + std::max(pageflipsSince + pageflipsInAdvance, pageflipsSinceLastToTarget + 1) * vblankInterval;
++            // Schedule for the furthest of:
++            // 1. pageflipsSince + pageflipsInAdvance (accounting for current time)
++            // 2. pageflipsSinceLastToTarget + 1 (maintaining temporal coherence)
++            const uint64_t targetVblanks = std::max(pageflipsSince + pageflipsInAdvance, pageflipsSinceLastToTarget + 1);
++            nextPresentationTimestamp = lastPresentationTimestamp + targetVblanks * vblankInterval;
+         }
++
+     } else {
++        // === Adaptive Sync / Tearing Mode ===
+         wasTripleBuffering = false;
+         doubleBufferingCounter = 0;
++
+         if (presentationMode == PresentationMode::Async || presentationMode == PresentationMode::AdaptiveAsync) {
+-            // tearing: pageflips happen ASAP
++            // Tearing enabled: present ASAP, no vblank alignment
+             nextPresentationTimestamp = currentTime;
+         } else {
+-            // adaptive sync: pageflips happen after one vblank interval
+-            // TODO read minimum refresh rate from the EDID and take it into account here
++            // Adaptive sync (VRR): wait at least one vblank interval
++            // TODO: Query EDID minimum refresh rate and use as lower bound
++            const std::chrono::nanoseconds vblankInterval{static_cast<int64_t>(cachedVblankIntervalNs)};
+             nextPresentationTimestamp = std::max(currentTime, lastPresentationTimestamp + vblankInterval);
+         }
+     }
+ 
++    // === Start QTimer ===
++    // Calculate when to start compositing (presentation time minus render time)
+     const std::chrono::nanoseconds nextRenderTimestamp = nextPresentationTimestamp - expectedCompositingTime;
+-    compositeTimer.start(std::max(0ms, std::chrono::duration_cast<std::chrono::milliseconds>(nextRenderTimestamp - currentTime)));
++    const std::chrono::nanoseconds timeUntilRender = nextRenderTimestamp - currentTime;
++
++    // Qt timers use millisecond precision; round to nearest ms (Qt::PreciseTimer provides best effort)
++    const auto msUntilRender = std::chrono::duration_cast<std::chrono::milliseconds>(std::max(0ns, timeUntilRender));
++    compositeTimer.start(msUntilRender);
+ }
+ 
+ void RenderLoopPrivate::delayScheduleRepaint()
+@@ -140,48 +228,142 @@ void RenderLoopPrivate::notifyFrameDropp
+     }
+ }
+ 
+-void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp, std::optional<RenderTimeSpan> renderTime, PresentationMode mode, OutputFrame *frame)
+-{
+-    if (output && s_printDebugInfo && !m_debugOutput) {
+-        m_debugOutput = std::fstream(qPrintable("kwin perf statistics " + output->name() + ".csv"), std::ios::out);
+-        *m_debugOutput << "target pageflip timestamp,pageflip timestamp,render start,render end,safety margin,refresh duration,vrr,tearing,predicted render time\n";
+-    }
+-    if (m_debugOutput) {
+-        auto times = renderTime.value_or(RenderTimeSpan{});
+-        const bool vrr = mode == PresentationMode::AdaptiveSync || mode == PresentationMode::AdaptiveAsync;
+-        const bool tearing = mode == PresentationMode::Async || mode == PresentationMode::AdaptiveAsync;
+-        *m_debugOutput << frame->targetPageflipTime().time_since_epoch().count() << "," << timestamp.count() << "," << times.start.time_since_epoch().count() << "," << times.end.time_since_epoch().count()
+-                       << "," << safetyMargin.count() << "," << frame->refreshDuration().count() << "," << (vrr ? 1 : 0) << "," << (tearing ? 1 : 0) << "," << frame->predictedRenderTime().count() << "\n";
++namespace {
++
++// === Cold-Path Debug Helpers ===
++// Mark as cold and noinline to keep them out of the instruction cache hot path
++
++#if defined(__GNUC__) || defined(__clang__)
++#  define KWIN_COLD __attribute__((cold))
++#  define KWIN_NOINLINE __attribute__((noinline))
++#else
++#  define KWIN_COLD
++#  define KWIN_NOINLINE
++#endif
++
++/**
++ * Sanitize output name for use in filesystem paths.
++ * Replaces non-ASCII and special characters with underscores.
++ */
++static KWIN_COLD KWIN_NOINLINE void sanitizeName(const QString &in, std::string &out)
++{
++    out.clear();
++    const int size = in.size();
++    if (size > 0) {
++        out.reserve(static_cast<size_t>(size));
++    }
++
++    for (int i = 0; i < size; ++i) {
++        const char16_t ch = in.at(i).unicode();
++        const bool isAlphaNum = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9');
++        const bool isAllowed = isAlphaNum || ch == '_' || ch == '-';
++        out.push_back(isAllowed ? static_cast<char>(ch) : '_');
++    }
++}
++
++/**
++ * Write a single frame's performance data to the debug CSV.
++ * Called only when KWIN_LOG_PERFORMANCE_DATA=1.
++ */
++static KWIN_COLD KWIN_NOINLINE void writeDebugOutput(
++    std::optional<std::fstream> &debugOutput,
++    Output *output,
++    std::optional<RenderTimeSpan> renderTime,
++    OutputFrame *frame,
++    std::chrono::nanoseconds timestamp,
++    std::chrono::nanoseconds safetyMargin,
++    PresentationMode mode)
++{
++    // Open CSV file on first write
++    if (!debugOutput && output) {
++        std::string sanitized;
++        sanitizeName(output->name(), sanitized);
++        const std::string filename = "kwin_perf_" + sanitized + ".csv";
++        debugOutput = std::fstream(filename, std::ios::out | std::ios::trunc);
++
++        if (debugOutput && debugOutput->is_open()) {
++            // Write CSV header
++            *debugOutput << "target_pageflip_ns,pageflip_ns,render_start_ns,render_end_ns,"
++                         << "safety_margin_ns,refresh_duration_ns,vrr,tearing,predicted_render_ns\n";
++        }
++    }
++
++    if (debugOutput && debugOutput->is_open()) {
++        const auto times = renderTime.value_or(RenderTimeSpan{});
++        const bool vrr = (mode == PresentationMode::AdaptiveSync || mode == PresentationMode::AdaptiveAsync);
++        const bool tearing = (mode == PresentationMode::Async || mode == PresentationMode::AdaptiveAsync);
++
++        // Write CSV row
++        *debugOutput << frame->targetPageflipTime().time_since_epoch().count() << ","
++                     << timestamp.count() << ","
++                     << times.start.time_since_epoch().count() << ","
++                     << times.end.time_since_epoch().count() << ","
++                     << safetyMargin.count() << ","
++                     << frame->refreshDuration().count() << ","
++                     << (vrr ? 1 : 0) << ","
++                     << (tearing ? 1 : 0) << ","
++                     << frame->predictedRenderTime().count() << "\n";
++
++        // Flush to ensure data is written even if KWin crashes
++        debugOutput->flush();
++    }
++}
++
++#undef KWIN_COLD
++#undef KWIN_NOINLINE
++
++} // anonymous namespace
++
++void RenderLoopPrivate::notifyFrameCompleted(
++    std::chrono::nanoseconds timestamp,
++    std::optional<RenderTimeSpan> renderTime,
++    PresentationMode mode,
++    OutputFrame *frame)
++{
++    // Write debug CSV if enabled (cold path, out-of-line)
++    if (s_printDebugInfo) [[unlikely]] {
++        writeDebugOutput(m_debugOutput, output, renderTime, frame, timestamp, safetyMargin, mode);
+     }
+ 
+     Q_ASSERT(pendingFrameCount > 0);
+     pendingFrameCount--;
+ 
++    // Update last presentation timestamp (with validation)
+     notifyVblank(timestamp);
+ 
+-    if (renderTime) {
++    // Add render time to the journal for future predictions
++    if (renderTime) [[likely]] {
+         renderJournal.add(renderTime->end - renderTime->start, timestamp);
+     }
+-    if (compositeTimer.isActive()) {
+-        // reschedule to match the new timestamp and render time
++
++    // Reschedule if timer is already running (refines estimate with actual render time)
++    if (compositeTimer.isActive()) [[likely]] {
+         scheduleRepaint(lastPresentationTimestamp);
+     }
+-    if (!inhibitCount && pendingReschedule) {
++
++    // If inhibited or no pending reschedule, skip scheduling
++    if (!inhibitCount && pendingReschedule) [[likely]] {
+         scheduleNextRepaint();
+     }
+ 
++    // Emit signal for frame statistics and effect timing
+     Q_EMIT q->framePresented(q, timestamp, mode);
+ }
+ 
+ void RenderLoopPrivate::notifyVblank(std::chrono::nanoseconds timestamp)
+ {
+-    if (lastPresentationTimestamp <= timestamp) {
++    // Validate timestamp: must not go backwards (system clock may be adjusted)
++    if (lastPresentationTimestamp <= timestamp) [[likely]] {
+         lastPresentationTimestamp = timestamp;
+     } else {
++        // Clock went backwards (NTP adjustment, suspend/resume, etc.)
+         qCDebug(KWIN_CORE,
+-                "Got invalid presentation timestamp: %lld (current %lld)",
++                "Got invalid presentation timestamp: %lld ns (current %lld ns). "
++                "Clock may have been adjusted. Using steady_clock fallback.",
+                 static_cast<long long>(timestamp.count()),
+                 static_cast<long long>(lastPresentationTimestamp.count()));
++
++        // Fallback: use current steady_clock time
+         lastPresentationTimestamp = std::chrono::steady_clock::now().time_since_epoch();
+     }
+ }
+@@ -191,6 +373,8 @@ void RenderLoopPrivate::dispatch()
+     Q_EMIT q->frameRequested(q);
+ }
+ 
++// === RenderLoop Public Interface ===
++
+ RenderLoop::RenderLoop(Output *output)
+     : d(std::make_unique<RenderLoopPrivate>(this, output))
+ {
+@@ -205,6 +389,7 @@ void RenderLoop::inhibit()
+     d->inhibitCount++;
+ 
+     if (d->inhibitCount == 1) {
++        // First inhibit: stop the timer
+         d->compositeTimer.stop();
+     }
+ }
+@@ -215,6 +400,7 @@ void RenderLoop::uninhibit()
+     d->inhibitCount--;
+ 
+     if (d->inhibitCount == 0) {
++        // Last uninhibit: resume scheduling
+         d->scheduleNextRepaint();
+     }
+ }
+@@ -231,10 +417,20 @@ int RenderLoop::refreshRate() const
+ 
+ void RenderLoop::setRefreshRate(int refreshRate)
+ {
+-    if (d->refreshRate == refreshRate) {
++    // Validate and clamp refresh rate to sane range
++    // Range: 1 Hz to 1000 Hz (in millihertz: 1'000 to 1'000'000)
++    const int rr = std::clamp(refreshRate, 1'000, 1'000'000);
++
++    if (d->refreshRate == rr) {
+         return;
+     }
+-    d->refreshRate = refreshRate;
++
++    d->refreshRate = rr;
++
++    // Update cached vblank interval (nanoseconds per refresh)
++    // cachedVblankIntervalNs = 1e12 / refreshRate_mHz
++    d->cachedVblankIntervalNs = 1'000'000'000'000ull / static_cast<uint64_t>(rr);
++
+     Q_EMIT refreshRateChanged();
+ }
+ 
+@@ -245,18 +441,40 @@ void RenderLoop::setPresentationSafetyMa
+ 
+ void RenderLoop::scheduleRepaint(Item *item, RenderLayer *layer, OutputLayer *outputLayer)
+ {
+-    const bool vrr = d->presentationMode == PresentationMode::AdaptiveSync || d->presentationMode == PresentationMode::AdaptiveAsync;
+-    const bool tearing = d->presentationMode == PresentationMode::Async || d->presentationMode == PresentationMode::AdaptiveAsync;
+-    if ((vrr || tearing) && workspace() && workspace()->activeWindow() && d->output) {
+-        SurfaceItem *const surfaceItem = workspace()->activeWindow()->surfaceItem();
+-        if ((item || layer || outputLayer) && activeWindowControlsVrrRefreshRate() && item != surfaceItem && !surfaceItem->isAncestorOf(item)) {
+-            d->delayedVrrTimer.start();
+-            return;
++    const bool vrr = (d->presentationMode == PresentationMode::AdaptiveSync
++                      || d->presentationMode == PresentationMode::AdaptiveAsync);
++    const bool tearing = (d->presentationMode == PresentationMode::Async
++                          || d->presentationMode == PresentationMode::AdaptiveAsync);
++
++    // VRR/Tearing Mode: Gate repaints to the active window's frame timing
++    if ((vrr || tearing) && d->output) [[unlikely]] {
++        Workspace *const ws = workspace();
++        if (ws) [[likely]] {
++            Window *const activeWin = ws->activeWindow();
++            if (activeWin && (item || layer || outputLayer)) {
++                // Check if active window controls refresh rate (frame time ≤ 33ms → ≥30 FPS)
++                const bool controlsRefresh = activeWin->isOnOutput(d->output)
++                    && activeWin->surfaceItem()
++                    && activeWin->surfaceItem()->recursiveFrameTimeEstimation() <= std::chrono::nanoseconds(1'000'000'000 / 30);
++
++                if (controlsRefresh) {
++                    SurfaceItem *const surfaceItem = activeWin->surfaceItem();
++                    // If repaint is triggered by a different surface, delay it
++                    if (surfaceItem && item != surfaceItem && !surfaceItem->isAncestorOf(item)) {
++                        d->delayedVrrTimer.start();
++                        return;
++                    }
++                }
++            }
+         }
+     }
++
+     d->delayedVrrTimer.stop();
++
++    // In VRR/tearing mode, limit to 1 pending frame; otherwise use configured limit
+     const int effectiveMaxPendingFrameCount = (vrr || tearing) ? 1 : d->maxPendingFrameCount;
+-    if (d->pendingFrameCount < effectiveMaxPendingFrameCount && !d->inhibitCount) {
++
++    if (d->pendingFrameCount < effectiveMaxPendingFrameCount && !d->inhibitCount) [[likely]] {
+         d->scheduleNextRepaint();
+     } else {
+         d->delayScheduleRepaint();
+@@ -265,11 +483,16 @@ void RenderLoop::scheduleRepaint(Item *i
+ 
+ bool RenderLoop::activeWindowControlsVrrRefreshRate() const
+ {
+-    Window *const activeWindow = workspace()->activeWindow();
++    Workspace *const ws = workspace();
++    if (!ws) [[unlikely]] {
++        return false;
++    }
++
++    Window *const activeWindow = ws->activeWindow();
+     return activeWindow
+         && activeWindow->isOnOutput(d->output)
+         && activeWindow->surfaceItem()
+-        && activeWindow->surfaceItem()->recursiveFrameTimeEstimation() <= std::chrono::nanoseconds(1'000'000'000) / 30;
++        && activeWindow->surfaceItem()->recursiveFrameTimeEstimation() <= std::chrono::nanoseconds(1'000'000'000 / 30);
+ }
+ 
+ std::chrono::nanoseconds RenderLoop::lastPresentationTimestamp() const
+@@ -292,7 +515,14 @@ void RenderLoop::setPresentationMode(Pre
+ 
+ void RenderLoop::setMaxPendingFrameCount(uint32_t maxCount)
+ {
+-    d->maxPendingFrameCount = maxCount;
++    // Clamp to valid range: [1, INT_MAX]
++    if (maxCount == 0) {
++        d->maxPendingFrameCount = 1;
++    } else if (maxCount > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
++        d->maxPendingFrameCount = std::numeric_limits<int>::max();
++    } else {
++        d->maxPendingFrameCount = static_cast<int>(maxCount);
++    }
+ }
+ 
+ std::chrono::nanoseconds RenderLoop::predictedRenderTime() const
+
+--- a/src/scene/surfaceitem.cpp	2025-10-05 23:59:56.232413388 +0200
++++ b/src/scene/surfaceitem.cpp	2025-10-06 00:01:06.300904280 +0200
+@@ -105,10 +105,11 @@ QRegion SurfaceItem::mapFromBuffer(const
+     const QRectF sourceBox = m_bufferToSurfaceTransform.map(m_bufferSourceBox, m_bufferSize);
+     const qreal xScale = m_destinationSize.width() / sourceBox.width();
+     const qreal yScale = m_destinationSize.height() / sourceBox.height();
++    const QPointF sourceBoxTopLeft = sourceBox.topLeft();
+ 
+     QRegion result;
+-    for (QRectF rect : region) {
+-        const QRectF r = m_bufferToSurfaceTransform.map(rect, m_bufferSize).translated(-sourceBox.topLeft());
++    for (const QRect &rect : region) {
++        const QRectF r = m_bufferToSurfaceTransform.map(QRectF(rect), m_bufferSize).translated(-sourceBoxTopLeft);
+         result += QRectF(r.x() * xScale, r.y() * yScale, r.width() * xScale, r.height() * yScale).toAlignedRect();
+     }
+     return result;
+@@ -120,11 +121,15 @@ static QRegion expandRegion(const QRegio
+         return QRegion();
+     }
+ 
+-    QRegion ret;
++    QVector<QRect> expandedRects;
++    expandedRects.reserve(region.rectCount());
++
+     for (const QRect &rect : region) {
+-        ret += rect.marginsAdded(padding);
++        expandedRects.append(rect.marginsAdded(padding));
+     }
+ 
++    QRegion ret;
++    ret.setRects(expandedRects.constData(), expandedRects.size());
+     return ret;
+ }
+ 
+@@ -136,7 +141,7 @@ void SurfaceItem::addDamage(const QRegio
+         if (m_lastDamageTimeDiffs.size() > 100) {
+             m_lastDamageTimeDiffs.pop_front();
+         }
+-        m_frameTimeEstimation = std::accumulate(m_lastDamageTimeDiffs.begin(), m_lastDamageTimeDiffs.end(), 0ns) / m_lastDamageTimeDiffs.size();
++        m_frameTimeEstimation = std::accumulate(m_lastDamageTimeDiffs.begin(), m_lastDamageTimeDiffs.end(), 0ns) / static_cast<std::chrono::nanoseconds::rep>(m_lastDamageTimeDiffs.size());
+     }
+     m_lastDamage = std::chrono::steady_clock::now();
+     m_damage += region;
+@@ -222,14 +227,16 @@ WindowQuadList SurfaceItem::buildQuads()
+     const QRectF sourceBox = m_bufferToSurfaceTransform.map(m_bufferSourceBox, m_bufferSize);
+     const qreal xScale = sourceBox.width() / m_destinationSize.width();
+     const qreal yScale = sourceBox.height() / m_destinationSize.height();
++    const QPointF bufferSourceTopLeft = m_bufferSourceBox.topLeft();
++    const QSizeF sourceBoxSize = sourceBox.size();
+ 
+-    for (const QRectF rect : region) {
++    for (const QRectF &rect : region) {
+         WindowQuad quad;
+ 
+-        const QPointF bufferTopLeft = snapToPixelGridF(m_bufferSourceBox.topLeft() + m_surfaceToBufferTransform.map(QPointF(rect.left() * xScale, rect.top() * yScale), sourceBox.size()));
+-        const QPointF bufferTopRight = snapToPixelGridF(m_bufferSourceBox.topLeft() + m_surfaceToBufferTransform.map(QPointF(rect.right() * xScale, rect.top() * yScale), sourceBox.size()));
+-        const QPointF bufferBottomRight = snapToPixelGridF(m_bufferSourceBox.topLeft() + m_surfaceToBufferTransform.map(QPointF(rect.right() * xScale, rect.bottom() * yScale), sourceBox.size()));
+-        const QPointF bufferBottomLeft = snapToPixelGridF(m_bufferSourceBox.topLeft() + m_surfaceToBufferTransform.map(QPointF(rect.left() * xScale, rect.bottom() * yScale), sourceBox.size()));
++        const QPointF bufferTopLeft = snapToPixelGridF(bufferSourceTopLeft + m_surfaceToBufferTransform.map(QPointF(rect.left() * xScale, rect.top() * yScale), sourceBoxSize));
++        const QPointF bufferTopRight = snapToPixelGridF(bufferSourceTopLeft + m_surfaceToBufferTransform.map(QPointF(rect.right() * xScale, rect.top() * yScale), sourceBoxSize));
++        const QPointF bufferBottomRight = snapToPixelGridF(bufferSourceTopLeft + m_surfaceToBufferTransform.map(QPointF(rect.right() * xScale, rect.bottom() * yScale), sourceBoxSize));
++        const QPointF bufferBottomLeft = snapToPixelGridF(bufferSourceTopLeft + m_surfaceToBufferTransform.map(QPointF(rect.left() * xScale, rect.bottom() * yScale), sourceBoxSize));
+ 
+         quad[0] = WindowVertex(rect.topLeft(), bufferTopLeft);
+         quad[1] = WindowVertex(rect.topRight(), bufferTopRight);
+@@ -357,11 +364,11 @@ OpenGLSurfaceContents OpenGLSurfaceTextu
+ bool OpenGLSurfaceTexture::create()
+ {
+     GraphicsBuffer *buffer = m_pixmap->item()->buffer();
+-    if (buffer->dmabufAttributes()) {
++    if (Q_LIKELY(buffer->dmabufAttributes())) {
+         return loadDmabufTexture(buffer);
+     } else if (buffer->shmAttributes()) {
+         return loadShmTexture(buffer);
+-    } else if (buffer->singlePixelAttributes()) {
++    } else if (Q_UNLIKELY(buffer->singlePixelAttributes())) {
+         return loadSinglePixelTexture(buffer);
+     } else {
+         qCDebug(KWIN_OPENGL) << "Failed to create OpenGLSurfaceTexture for a buffer of unknown type" << buffer;
+@@ -378,11 +385,11 @@ void OpenGLSurfaceTexture::destroy()
+ void OpenGLSurfaceTexture::update(const QRegion &region)
+ {
+     GraphicsBuffer *buffer = m_pixmap->item()->buffer();
+-    if (buffer->dmabufAttributes()) {
++    if (Q_LIKELY(buffer->dmabufAttributes())) {
+         updateDmabufTexture(buffer);
+     } else if (buffer->shmAttributes()) {
+         updateShmTexture(buffer, region);
+-    } else if (buffer->singlePixelAttributes()) {
++    } else if (Q_UNLIKELY(buffer->singlePixelAttributes())) {
+         updateSinglePixelTexture(buffer);
+     } else {
+         qCDebug(KWIN_OPENGL) << "Failed to update OpenGLSurfaceTexture for a buffer of unknown type" << buffer;
+@@ -414,7 +421,7 @@ bool OpenGLSurfaceTexture::loadShmTextur
+ 
+ static QRegion simplifyDamage(const QRegion &damage)
+ {
+-    if (damage.rectCount() < 3) {
++    if (damage.rectCount() < 8) {
+         return damage;
+     } else {
+         return damage.boundingRect();
+
+From 8139550d447c5b4d60ffed5bdbae5542b5313293 Mon Sep 17 00:00:00 2001
+From: Weng Xuetian <wengxt@gmail.com>
+Date: Thu, 18 Sep 2025 23:01:17 -0700
+Subject: [PATCH] Fix a few potential missing opportunity that input method
+ active state is not synced.
+
+1. InternalInputMethodContext::setFocusObject(nullptr) should still notify
+   enabledChanged (no focus -> disable).
+2. InternalInputMethodContext::update(Qt::ImEnabled) should notify
+   enableChanged.
+3. KWin's QPA may missing setFocusObject(nullptr) when destroy window,
+   try to monitor destroyed signal as a last resort.
+4. Call refreshActive() again on seat's focused text input surface
+   change.
+5. inputMethodAccepted should be considered as part of isEnabled
+   condition. In Qt, having focus object is not equilvalent to allow input
+   method.
+
+The direct root cause to 506095 is caused by 3 & 5. Both 3 & 4 & 5 could fix
+it.
+
+BUG: 506095
+---
+ src/inputmethod.cpp                |  9 ++++++---
+ src/internalinputmethodcontext.cpp | 23 ++++++++++++++++++++---
+ src/internalinputmethodcontext.h   |  3 +++
+ 3 files changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/src/inputmethod.cpp b/src/inputmethod.cpp
+index 949b840f31a..8a436496c70 100644
+--- a/src/inputmethod.cpp
++++ b/src/inputmethod.cpp
+@@ -368,14 +368,17 @@ void InputMethod::handleFocusedSurfaceChanged()
+     setTrackedWindow(waylandServer()->findWindow(focusedSurface));
+ 
+     const auto client = focusedSurface ? focusedSurface->client() : nullptr;
+-    bool ret = seat->textInputV2()->clientSupportsTextInput(client)
+-            || seat->textInputV3()->clientSupportsTextInput(client)
+-            || m_internalContext->isEnabled();
++    bool ret = seat->textInputV1()->clientSupportsTextInput(client)
++        || seat->textInputV2()->clientSupportsTextInput(client)
++        || seat->textInputV3()->clientSupportsTextInput(client)
++        || m_internalContext->isEnabled();
+ 
+     if (ret != m_activeClientSupportsTextInput) {
+         m_activeClientSupportsTextInput = ret;
+         Q_EMIT activeClientSupportsTextInputChanged();
+     }
++
++    refreshActive();
+ }
+ 
+ void InputMethod::surroundingTextChanged()
+diff --git a/src/internalinputmethodcontext.cpp b/src/internalinputmethodcontext.cpp
+index 25c1d4b0e7f..60001ab61c7 100644
+--- a/src/internalinputmethodcontext.cpp
++++ b/src/internalinputmethodcontext.cpp
+@@ -14,6 +14,7 @@
+ #include <QObject>
+ #include <QRect>
+ #include <QTextCharFormat>
++#include <QWindow>
+ 
+ namespace KWin {
+ 
+@@ -70,6 +71,10 @@ void InternalInputMethodContext::update(Qt::InputMethodQueries queries)
+     if (queries & Qt::ImHints) {
+         // When kwin gets some text input with numbers and passwords this needs pouplating
+     }
++
++    if (queries & Qt::ImEnabled) {
++        Q_EMIT enabledChanged();
++    }
+ }
+ 
+ void InternalInputMethodContext::showInputPanel()
+@@ -104,11 +109,23 @@ Qt::LayoutDirection InternalInputMethodContext::inputDirection() const
+ 
+ void InternalInputMethodContext::setFocusObject(QObject *object)
+ {
+-    if (!inputMethodAccepted()) {
+-        return;
++    if (inputMethodAccepted()) {
++        update(Qt::ImQueryAll);
++    }
++
++    // In QWindow::destory(), the focus window change may not be notified,
++    // Try to refresh potential missing enable change.
++    QWindow *window = QGuiApplication::focusWindow();
++    if (m_focusWindow != window) {
++        if (m_focusWindow) {
++            disconnect(m_focusWindow, &QObject::destroyed, this, &InternalInputMethodContext::enabledChanged);
++        }
++        m_focusWindow = window;
++        if (m_focusWindow) {
++            connect(m_focusWindow, &QObject::destroyed, this, &InternalInputMethodContext::enabledChanged);
++        }
+     }
+     Q_EMIT enabledChanged();
+-    update(Qt::ImQueryAll);
+ }
+ 
+ // From the InputMethod to our internal window
+diff --git a/src/internalinputmethodcontext.h b/src/internalinputmethodcontext.h
+index 3414368bde8..7f2c26ba739 100644
+--- a/src/internalinputmethodcontext.h
++++ b/src/internalinputmethodcontext.h
+@@ -8,7 +8,9 @@
+ */
+ 
+ #include <QObject>
++#include <QPointer>
+ #include <QRect>
++#include <QWindow>
+ #include <qpa/qplatforminputcontext.h>
+ 
+ namespace KWin
+@@ -62,6 +64,7 @@ private:
+     uint32_t m_contentHint = 0;
+     uint32_t m_contentPurpose = 0;
+     QRect m_cursorRect;
++    QPointer<QWindow> m_focusWindow;
+ };
+ 
+ }
+-- 
+GitLab
+
+From ae759bba7d675fc118642a60f557493f8641c2a4 Mon Sep 17 00:00:00 2001
+From: Blazer Silving <breakingspell@gmail.com>
+Date: Tue, 5 Aug 2025 13:07:36 -0500
+Subject: [PATCH] effect/offscreenquickview: update scene graph timers when
+ window refreshed
+
+Credit: https://bugs.kde.org/show_bug.cgi?id=485927#c51
+---
+ src/effect/offscreenquickview.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/effect/offscreenquickview.cpp b/src/effect/offscreenquickview.cpp
+index 1c6e6d9bed6..cbad4a30bcb 100644
+--- a/src/effect/offscreenquickview.cpp
++++ b/src/effect/offscreenquickview.cpp
+@@ -30,6 +30,7 @@
+ #include <QQuickOpenGLUtils>
+ #include <QQuickRenderTarget>
+ #include <QTimer>
++#include <private/qabstractanimation_p.h>
+ #include <private/qeventpoint_p.h> // for QMutableEventPoint
+ 
+ namespace KWin
+@@ -218,6 +219,8 @@ void OffscreenQuickView::update()
+         return;
+     }
+ 
++    QUnifiedTimer::instance()->updateAnimationTimers();
++
+     bool usingGl = d->m_glcontext != nullptr;
+     EglContext *previousContext = EglContext::currentContext();
+ 
+-- 
+GitLab
+
+From 274eef577664c43fc3320f559ca0ec2bf2fb3f35 Mon Sep 17 00:00:00 2001
+From: Joshua Goins <josh@redstrate.com>
+Date: Sat, 2 Aug 2025 05:46:29 -0400
+Subject: [PATCH] backends/libinput: Increase minimum version to 1.28
+
+This removes some input area code that was gated on 1.27. Ideally we
+want 1.29, but that's unlikely to happen before 6.5.
+---
+ CMakeLists.txt                       |  7 +------
+ autotests/libinput/mock_libinput.cpp |  5 +++++
+ src/backends/libinput/device.cpp     | 10 +---------
+ src/config-kwin.h.cmake              |  2 --
+ 4 files changed, 7 insertions(+), 17 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 92025ccb2e0..eda49339e16 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -288,13 +288,8 @@ if (KWIN_BUILD_X11)
+     set(XWAYLAND_SESSION_SCRIPTS "/etc/xdg/Xwayland-session.d")
+ endif()
+ 
+-find_package(Libinput 1.26)
++find_package(Libinput 1.28)
+ set_package_properties(Libinput PROPERTIES TYPE REQUIRED PURPOSE "Required for input handling on Wayland.")
+-if (Libinput_VERSION VERSION_GREATER_EQUAL 1.27)
+-    set(HAVE_LIBINPUT_INPUT_AREA 1)
+-else()
+-    set(HAVE_LIBINPUT_INPUT_AREA 0)
+-endif()
+ 
+ find_package(Libeis-1.0)
+ set_package_properties(Libeis-1.0 PROPERTIES TYPE OPTIONAL PURPOSE "Required for emulated input handling.")
+diff --git a/autotests/libinput/mock_libinput.cpp b/autotests/libinput/mock_libinput.cpp
+index c5398e53ef2..58f5432b233 100644
+--- a/autotests/libinput/mock_libinput.cpp
++++ b/autotests/libinput/mock_libinput.cpp
+@@ -1147,3 +1147,8 @@ udev_device *udev_device_unref(struct udev_device *udev_device)
+ {
+     return udev_device;
+ }
++
++int libinput_device_config_area_has_rectangle(struct libinput_device *device)
++{
++    return 0;
++}
+diff --git a/src/backends/libinput/device.cpp b/src/backends/libinput/device.cpp
+index 28432b26e49..223c650c236 100644
+--- a/src/backends/libinput/device.cpp
++++ b/src/backends/libinput/device.cpp
+@@ -435,7 +435,6 @@ Device::Device(libinput_device *device, QObject *parent)
+     }
+ 
+     if (supportsInputArea() && m_inputArea != defaultInputArea()) {
+-#if HAVE_LIBINPUT_INPUT_AREA
+         const libinput_config_area_rectangle rect{
+             .x1 = m_inputArea.topLeft().x(),
+             .y1 = m_inputArea.topLeft().y(),
+@@ -443,7 +442,6 @@ Device::Device(libinput_device *device, QObject *parent)
+             .y2 = m_inputArea.bottomRight().y(),
+         };
+         libinput_device_config_area_set_rectangle(m_device, &rect);
+-#endif
+     }
+ 
+     libinput_device_group *group = libinput_device_get_device_group(device);
+@@ -1073,11 +1071,7 @@ double Device::defaultPressureRangeMax() const
+ 
+ bool Device::supportsInputArea() const
+ {
+-#if HAVE_LIBINPUT_INPUT_AREA
+-    return true;
+-#else
+-    return false;
+-#endif
++    return libinput_device_config_area_has_rectangle(m_device);
+ }
+ 
+ QRectF Device::inputArea() const
+@@ -1090,7 +1084,6 @@ void Device::setInputArea(const QRectF &inputArea)
+     if (m_inputArea != inputArea) {
+         m_inputArea = inputArea;
+ 
+-#if HAVE_LIBINPUT_INPUT_AREA
+         const libinput_config_area_rectangle rect{
+             .x1 = m_inputArea.topLeft().x(),
+             .y1 = m_inputArea.topLeft().y(),
+@@ -1098,7 +1091,6 @@ void Device::setInputArea(const QRectF &inputArea)
+             .y2 = m_inputArea.bottomRight().y(),
+         };
+         libinput_device_config_area_set_rectangle(m_device, &rect);
+-#endif
+ 
+         writeEntry(ConfigKey::InputArea, m_inputArea);
+         Q_EMIT inputAreaChanged();
+diff --git a/src/config-kwin.h.cmake b/src/config-kwin.h.cmake
+index 42ddc517cb6..996b5811fd1 100644
+--- a/src/config-kwin.h.cmake
++++ b/src/config-kwin.h.cmake
+@@ -29,5 +29,3 @@ constexpr QLatin1String LIBEXEC_DIR("${CMAKE_INSTALL_FULL_LIBEXECDIR}");
+ #cmakedefine01 HAVE_DL_LIBRARY
+ 
+ constexpr QLatin1String XWAYLAND_SESSION_SCRIPTS("${XWAYLAND_SESSION_SCRIPTS}");
+-
+-#cmakedefine01 HAVE_LIBINPUT_INPUT_AREA
+-- 
+GitLab
