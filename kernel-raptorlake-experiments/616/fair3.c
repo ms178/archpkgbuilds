@@ -7525,6 +7525,7 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
 	bool was_sched_idle = sched_idle_rq(rq);
 	bool task_sleep = flags & DEQUEUE_SLEEP;
 	struct task_struct *p = NULL;
+	struct sched_entity *initial_se = se;  /* Track initial entity */
 	int h_nr_idle = 0;
 	int h_nr_queued = 0;
 	int h_nr_runnable = 0;
@@ -7533,7 +7534,6 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
 
 	/*
 	 * Precompute hierarchy counters from initial entity.
-	 * These remain constant throughout hierarchy traversal.
 	 */
 	if (entity_is_task(se)) {
 		p = task_of(se);
@@ -7544,45 +7544,60 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
 	}
 
 	/*
-	 * First loop: Dequeue entities bottom-up until we hit a stopping
-	 * condition (throttle, delay, or non-empty parent).
+	 * First loop: Dequeue entities bottom-up until stopping condition.
 	 */
 	for_each_sched_entity(se) {
+		int se_flags = flags;
+
 		cfs_rq = cfs_rq_of(se);
 
 		/*
-		 * Attempt dequeue. Returns false if delay-dequeue triggered.
+		 * CRITICAL FIX: If this entity (except initial) already has
+		 * sched_delayed=1 from a previous delay-dequeue, we MUST
+		 * pass DEQUEUE_DELAYED flag to dequeue_entity() to avoid:
+		 *     WARN_ON_ONCE(delay && se->sched_delayed)
+		 *
+		 * This can happen when:
+		 * 1. Parent group was delay-dequeued earlier → parent->sched_delayed=1
+		 * 2. Now we're dequeueing a child from that group
+		 * 3. Traversal reaches parent with sched_delayed=1
+		 * 4. Without this check, we'd pass DEQUEUE_SLEEP only → WARN_ON
+		 *
+		 * Performance: Branch predictor handles this well (rare case).
+		 * Cost: 1 load + 1 test + 1 conditional OR = ~3 cycles.
 		 */
-		if (!dequeue_entity(cfs_rq, se, flags)) {
+		if (se != initial_se && se->sched_delayed)
+			se_flags |= DEQUEUE_DELAYED;
+
+		/*
+		 * Attempt dequeue. Returns false if NEW delay-dequeue triggered.
+		 */
+		if (!dequeue_entity(cfs_rq, se, se_flags)) {
 			/*
-			 * Delay-dequeue only valid for leaf task entity.
-			 * If we fail here for a group entity, it's a bug.
+			 * Delay-dequeue only happens for initial entity on first call.
+			 * If we're here on a parent entity, something is wrong.
 			 */
 			if (p && &p->se == se)
 				return -1;
 
 			/*
-			 * Non-task entity failed to dequeue (shouldn't happen
-			 * outside delay-dequeue). Treat as completion.
+			 * Unexpected: non-task entity returned false.
+			 * Treat as completion (shouldn't happen in correct code).
 			 */
 			slice = cfs_rq_min_slice(cfs_rq);
 			break;
 		}
 
 		/*
-		 * CRITICAL FIX: Clear leaf-only flags after FIRST successful
-		 * dequeue. Parent group entities in the hierarchy never have
-		 * sched_delayed set, so passing DEQUEUE_DELAYED to them
-		 * triggers WARN_ON_ONCE in dequeue_entity() and can cause
-		 * finish_delayed_dequeue_entity() to be called on group
-		 * entities, corrupting scheduler state.
+		 * Clear leaf-only flags after FIRST successful dequeue.
+		 * DEQUEUE_DELAYED/SPECIAL only apply to initial entity,
+		 * never to parent group entities (unless they were already
+		 * delayed, which we handle via se->sched_delayed check above).
 		 *
-		 * We clear flags unconditionally on first iteration because:
-		 * 1. If leaf is a task: flags may have DEQUEUE_DELAYED/SPECIAL
-		 * 2. If leaf is a group: flags won't have these (but clear is harmless)
-		 * 3. On second+ iteration: flags are always clean
+		 * We clear unconditionally on every iteration (idempotent),
+		 * which is simpler than tracking "first iteration" flag.
 		 *
-		 * Performance: Bitwise AND is 1 cycle, branch-free.
+		 * Performance: Bitwise AND is 1 cycle, no branch.
 		 */
 		flags &= ~(DEQUEUE_DELAYED | DEQUEUE_SPECIAL);
 
@@ -7597,14 +7612,13 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
 			h_nr_idle = h_nr_queued;
 
 		/*
-		 * Stop if throttled. Return 0 to indicate incomplete dequeue.
+		 * Stop if throttled.
 		 */
 		if (cfs_rq_throttled(cfs_rq))
 			return 0;
 
 		/*
 		 * Stop if parent has other children (weight > 0 after our dequeue).
-		 * Set next_buddy to bias future picks toward this cfs_rq.
 		 */
 		if (cfs_rq->load.weight) {
 			slice = cfs_rq_min_slice(cfs_rq);
@@ -7622,30 +7636,20 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
 	}
 
 	/*
-	 * Second loop: Update remaining ancestors' statistics without
-	 * dequeueing them (they have other children).
+	 * Second loop: Update remaining ancestors' statistics.
 	 */
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
 
-		/*
-		 * Propagate load/utilization changes up the hierarchy.
-		 */
 		update_load_avg(cfs_rq, se, UPDATE_TG);
 		se_update_runnable(se);
 		update_cfs_group(se);
 
-		/*
-		 * Propagate slice information for next scheduling decision.
-		 */
 		se->slice = slice;
 		if (se != cfs_rq->curr)
 			min_vruntime_cb_propagate(&se->run_node, NULL);
 		slice = cfs_rq_min_slice(cfs_rq);
 
-		/*
-		 * Update hierarchy counters.
-		 */
 		cfs_rq->h_nr_runnable -= h_nr_runnable;
 		cfs_rq->h_nr_queued -= h_nr_queued;
 		cfs_rq->h_nr_idle -= h_nr_idle;
@@ -7658,13 +7662,12 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
 	}
 
 	/*
-	 * Update global runqueue counter at root level.
+	 * Update global runqueue counter.
 	 */
 	sub_nr_running(rq, h_nr_queued);
 
 	/*
-	 * Check if runqueue transitioned to idle state.
-	 * If so, trigger immediate load balancing.
+	 * Trigger immediate balancing if transitioned to idle.
 	 */
 	if (unlikely(!was_sched_idle && sched_idle_rq(rq)))
 		rq->next_balance = jiffies;
