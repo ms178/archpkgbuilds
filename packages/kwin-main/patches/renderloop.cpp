@@ -21,6 +21,10 @@
 
 #include <QString>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 using namespace std::chrono_literals;
 
 namespace KWin
@@ -78,100 +82,97 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
 {
     pendingReschedule = false;
 
-    // CRITICAL OPTIMIZATION: Use cached vblank interval as integer nanoseconds.
-    // Compiler (Clang-21 -O3) will optimize divisions by constants into multiply+shift.
-    // Do NOT use floating-point reciprocal—it loses precision and causes frame count errors.
+    // Early exit if refresh rate is invalid (defensive; setRefreshRate clamps to [1000, 1000000])
+    if (cachedVblankIntervalNs == 0) [[unlikely]] {
+        qCWarning(KWIN_CORE) << "Invalid vblank interval; skipping scheduleRepaint";
+        return;
+    }
+
+    // Hoist invariant to enable compiler optimization (division by constant → multiply+shift)
     const std::chrono::nanoseconds vblankInterval{static_cast<int64_t>(cachedVblankIntervalNs)};
+    const int64_t vblankNs = vblankInterval.count(); // Cache for repeated use
+
     const std::chrono::nanoseconds currentTime(std::chrono::steady_clock::now().time_since_epoch());
 
     // Estimate expected compositing time with safety margin and scheduler slop
-    // Cap at 2× vblank to prevent pathological cases from stalling indefinitely
-    std::chrono::nanoseconds expectedCompositingTime = std::min(renderJournal.result() + safetyMargin + 1ms, 2 * vblankInterval);
+    // Cap at 2× vblank to prevent pathological cases
+    std::chrono::nanoseconds expectedCompositingTime = std::min(
+        renderJournal.result() + safetyMargin + 1ms,
+        2 * vblankInterval
+    );
 
     if (presentationMode == PresentationMode::VSync) [[likely]] {
         // === VSync Mode: Pageflips occur at vblank boundaries ===
 
-        // Calculate how many vblanks have passed since last presentation
-        // CRITICAL: Use integer division for exact frame counting
+        // Calculate vblanks since last presentation (integer division optimized by compiler)
         const auto sinceLast = currentTime - lastPresentationTimestamp;
         uint64_t pageflipsSince = 0;
-        if (sinceLast.count() > 0 && vblankInterval.count() > 0) [[likely]] {
-            // Integer division—compiler optimizes with reciprocal multiply when vblankInterval is constant
-            pageflipsSince = static_cast<uint64_t>(sinceLast.count()) / static_cast<uint64_t>(vblankInterval.count());
+        if (sinceLast.count() > 0) [[likely]] {
+            pageflipsSince = static_cast<uint64_t>(sinceLast.count()) / static_cast<uint64_t>(vblankNs);
         }
 
         if (pageflipsSince > 100) [[unlikely]] {
-            // GPU likely entered low-power state → render time will spike
-            // Start compositing very early to absorb the wake-up latency
+            // GPU wake from low-power: expect high latency
             expectedCompositingTime = std::max(vblankInterval - 1us, expectedCompositingTime);
         }
 
-        // Calculate vblanks from last presentation to the previously targeted timestamp
-        // Use rounding (add half-interval before division) for temporal coherence
+        // Vblanks from last presentation to target (with rounding)
         const auto toTarget = lastTargetTimestamp - lastPresentationTimestamp;
         uint64_t pageflipsSinceLastToTarget = 0;
-        if (toTarget.count() > 0 && vblankInterval.count() > 0) [[likely]] {
-            const int64_t toTargetPlusHalf = toTarget.count() + (vblankInterval.count() / 2);
+        if (toTarget.count() > 0) [[likely]] {
+            const int64_t toTargetPlusHalf = toTarget.count() + (vblankNs / 2);
             if (toTargetPlusHalf > 0) {
-                pageflipsSinceLastToTarget = static_cast<uint64_t>(toTargetPlusHalf) / static_cast<uint64_t>(vblankInterval.count());
+                pageflipsSinceLastToTarget = static_cast<uint64_t>(toTargetPlusHalf) / static_cast<uint64_t>(vblankNs);
             }
         }
 
-        // Determine how many vblanks ahead to schedule compositing
-        // Formula: ceil(expectedCompositingTime / vblankInterval)
-        uint64_t pageflipsInAdvance = 1; // Default: double buffering
-        if (vblankInterval.count() > 0) [[likely]] {
-            pageflipsInAdvance = (static_cast<uint64_t>(expectedCompositingTime.count()) + static_cast<uint64_t>(vblankInterval.count()) - 1)
-                                 / static_cast<uint64_t>(vblankInterval.count());
-            if (pageflipsInAdvance < 1) {
-                pageflipsInAdvance = 1;
-            }
-            if (pageflipsInAdvance > static_cast<uint64_t>(maxPendingFrameCount)) {
-                pageflipsInAdvance = static_cast<uint64_t>(maxPendingFrameCount);
-            }
+        // Determine pageflips in advance: ceil(expectedCompositingTime / vblankInterval)
+        uint64_t pageflipsInAdvance = (static_cast<uint64_t>(expectedCompositingTime.count()) + static_cast<uint64_t>(vblankNs) - 1)
+                                       / static_cast<uint64_t>(vblankNs);
+        if (pageflipsInAdvance < 1) {
+            pageflipsInAdvance = 1;
+        }
+        if (pageflipsInAdvance > static_cast<uint64_t>(maxPendingFrameCount)) {
+            pageflipsInAdvance = static_cast<uint64_t>(maxPendingFrameCount);
         }
 
-        // === Triple Buffering Hysteresis ===
-        // Switching from double→triple causes a frame drop, so apply hysteresis
-        // to avoid thrashing when render times oscillate near the threshold.
+        // === Triple Buffering Hysteresis (optimized branching) ===
         if (pageflipsInAdvance > 1) {
-            // Render time requires triple buffering → switch immediately
+            // Render time requires triple buffering
             wasTripleBuffering = true;
             doubleBufferingCounter = 0;
         } else if (wasTripleBuffering) {
-            // Currently triple buffering but render time suggests double buffering is viable
-            // Wait for 10 consecutive stable frames before switching back
-            const auto vblank95 = vblankInterval - (vblankInterval / 20); // 0.95 × vblank
+            // Currently triple buffering; check if we can switch back
+            const auto vblank95 = vblankInterval - (vblankInterval / 20);
+
+            // Branchless counter update (reduces mispredicts)
+            const bool renderTooHigh = (expectedCompositingTime >= vblank95);
+            doubleBufferingCounter = renderTooHigh ? static_cast<int16_t>(0) : static_cast<int16_t>(doubleBufferingCounter + 1);
 
             if (doubleBufferingCounter >= 10) {
-                // Stable enough → switch to double buffering
+                // Stable: switch to double buffering
                 wasTripleBuffering = false;
                 pageflipsInAdvance = 1;
                 doubleBufferingCounter = 0;
-            } else if (expectedCompositingTime >= vblank95) {
-                // Render time too high → stay in triple buffering, reset counter
-                pageflipsInAdvance = 2;
-                doubleBufferingCounter = 0;
-                expectedCompositingTime = vblankInterval; // Pessimistic estimate
             } else {
-                // Render time acceptable → increment stability counter
-                doubleBufferingCounter++;
+                // Stay in triple buffering
                 pageflipsInAdvance = 2;
-                expectedCompositingTime = vblankInterval; // Pessimistic estimate
+                if (renderTooHigh) {
+                    expectedCompositingTime = vblankInterval;
+                }
             }
         }
 
         // === Schedule Next Presentation ===
         if (compositeTimer.isActive()) {
-            // Timer already running: recompute target timestamp with updated render time
-            // Keep the same vblank interval to avoid unnecessary frame drops
+            // Timer already running: recompute target with updated render time
             const auto delta = nextPresentationTimestamp - lastPresentationTimestamp;
             uint32_t intervalsSinceLastTimestamp = 1;
-            if (delta.count() > 0 && vblankInterval.count() > 0) [[likely]] {
-                const int64_t deltaRounded = delta.count() + (vblankInterval.count() / 2);
+            if (delta.count() > 0) [[likely]] {
+                const int64_t deltaRounded = delta.count() + (vblankNs / 2);
                 if (deltaRounded > 0) {
                     intervalsSinceLastTimestamp = static_cast<uint32_t>(
-                        static_cast<uint64_t>(deltaRounded) / static_cast<uint64_t>(vblankInterval.count())
+                        static_cast<uint64_t>(deltaRounded) / static_cast<uint64_t>(vblankNs)
                     );
                     if (intervalsSinceLastTimestamp < 1) {
                         intervalsSinceLastTimestamp = 1;
@@ -180,9 +181,7 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
             }
             nextPresentationTimestamp = lastPresentationTimestamp + intervalsSinceLastTimestamp * vblankInterval;
         } else {
-            // Schedule for the furthest of:
-            // 1. pageflipsSince + pageflipsInAdvance (accounting for current time)
-            // 2. pageflipsSinceLastToTarget + 1 (maintaining temporal coherence)
+            // Schedule for max(pageflipsSince + pageflipsInAdvance, pageflipsSinceLastToTarget + 1)
             const uint64_t targetVblanks = std::max(pageflipsSince + pageflipsInAdvance, pageflipsSinceLastToTarget + 1);
             nextPresentationTimestamp = lastPresentationTimestamp + targetVblanks * vblankInterval;
         }
@@ -193,22 +192,15 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
         doubleBufferingCounter = 0;
 
         if (presentationMode == PresentationMode::Async || presentationMode == PresentationMode::AdaptiveAsync) {
-            // Tearing enabled: present ASAP, no vblank alignment
             nextPresentationTimestamp = currentTime;
         } else {
-            // Adaptive sync (VRR): wait at least one vblank interval
-            // TODO: Query EDID minimum refresh rate and use as lower bound
-            const std::chrono::nanoseconds vblankInterval{static_cast<int64_t>(cachedVblankIntervalNs)};
             nextPresentationTimestamp = std::max(currentTime, lastPresentationTimestamp + vblankInterval);
         }
     }
 
     // === Start QTimer ===
-    // Calculate when to start compositing (presentation time minus render time)
     const std::chrono::nanoseconds nextRenderTimestamp = nextPresentationTimestamp - expectedCompositingTime;
     const std::chrono::nanoseconds timeUntilRender = nextRenderTimestamp - currentTime;
-
-    // Qt timers use millisecond precision; round to nearest ms (Qt::PreciseTimer provides best effort)
     const auto msUntilRender = std::chrono::duration_cast<std::chrono::milliseconds>(std::max(0ns, timeUntilRender));
     compositeTimer.start(msUntilRender);
 }
@@ -253,7 +245,56 @@ static KWIN_COLD KWIN_NOINLINE void sanitizeName(const QString &in, std::string 
         out.reserve(static_cast<size_t>(size));
     }
 
-    for (int i = 0; i < size; ++i) {
+    int i = 0;
+
+#if defined(__x86_64__) || defined(_M_X64)
+    // AVX2 path: process 16 UTF-16 chars (32 bytes) per iteration
+    if (size >= 16 && __builtin_cpu_supports("avx2")) {
+        const __m256i lowerA = _mm256_set1_epi16('a');
+        const __m256i upperZ = _mm256_set1_epi16('z');
+        const __m256i lowerAlpha = _mm256_set1_epi16('A');
+        const __m256i upperAlpha = _mm256_set1_epi16('Z');
+        const __m256i lower0 = _mm256_set1_epi16('0');
+        const __m256i upper9 = _mm256_set1_epi16('9');
+        const __m256i underscore = _mm256_set1_epi16('_');
+        const __m256i dash = _mm256_set1_epi16('-');
+        const __m256i replaceChar = _mm256_set1_epi16('_');
+
+        for (; i + 15 < size; i += 16) {
+            // Load 16 UTF-16 chars (unaligned OK for AVX2)
+            __m256i chars = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(in.data() + i));
+
+            // Check ranges: a-z, A-Z, 0-9
+            __m256i isLowerAlpha = _mm256_and_si256(_mm256_cmpgt_epi16(chars, _mm256_sub_epi16(lowerA, _mm256_set1_epi16(1))),
+                                                     _mm256_cmpgt_epi16(_mm256_add_epi16(upperZ, _mm256_set1_epi16(1)), chars));
+            __m256i isUpperAlpha = _mm256_and_si256(_mm256_cmpgt_epi16(chars, _mm256_sub_epi16(lowerAlpha, _mm256_set1_epi16(1))),
+                                                     _mm256_cmpgt_epi16(_mm256_add_epi16(upperAlpha, _mm256_set1_epi16(1)), chars));
+            __m256i isDigit = _mm256_and_si256(_mm256_cmpgt_epi16(chars, _mm256_sub_epi16(lower0, _mm256_set1_epi16(1))),
+                                                _mm256_cmpgt_epi16(_mm256_add_epi16(upper9, _mm256_set1_epi16(1)), chars));
+            __m256i isUnderscore = _mm256_cmpeq_epi16(chars, underscore);
+            __m256i isDash = _mm256_cmpeq_epi16(chars, dash);
+
+            __m256i isAllowed = _mm256_or_si256(_mm256_or_si256(_mm256_or_si256(isLowerAlpha, isUpperAlpha), _mm256_or_si256(isDigit, isUnderscore)), isDash);
+
+            // Replace disallowed chars with '_'
+            __m256i result = _mm256_blendv_epi8(replaceChar, chars, isAllowed);
+
+            // Narrow UTF-16 → UTF-8 (for ASCII subset, just take low byte)
+            // Pack 16-bit → 8-bit using packus (saturate to 0-255)
+            __m128i lo = _mm256_castsi256_si128(result);
+            __m128i hi = _mm256_extracti128_si256(result, 1);
+            __m128i packed = _mm_packus_epi16(lo, hi);
+
+            // Store 16 bytes
+            char temp[16];
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(temp), packed);
+            out.append(temp, 16);
+        }
+    }
+#endif
+
+    // Scalar fallback for remainder
+    for (; i < size; ++i) {
         const char16_t ch = in.at(i).unicode();
         const bool isAlphaNum = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9');
         const bool isAllowed = isAlphaNum || ch == '_' || ch == '-';
@@ -483,16 +524,27 @@ void RenderLoop::scheduleRepaint(Item *item, RenderLayer *layer, OutputLayer *ou
 
 bool RenderLoop::activeWindowControlsVrrRefreshRate() const
 {
-    Workspace *const ws = workspace();
-    if (!ws) [[unlikely]] {
-        return false;
+    // Cache for 1 vblank to avoid repeated lookups
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    const auto vblankInterval = std::chrono::nanoseconds{static_cast<int64_t>(d->cachedVblankIntervalNs)};
+
+    if (now - d->vrrCacheTimestamp < vblankInterval) [[likely]] {
+        return d->cachedVrrControl;
     }
 
-    Window *const activeWindow = ws->activeWindow();
-    return activeWindow
-        && activeWindow->isOnOutput(d->output)
-        && activeWindow->surfaceItem()
-        && activeWindow->surfaceItem()->recursiveFrameTimeEstimation() <= std::chrono::nanoseconds(1'000'000'000 / 30);
+    Workspace *const ws = workspace();
+    bool result = false;
+    if (ws) [[likely]] {
+        Window *const activeWindow = ws->activeWindow();
+        result = activeWindow
+            && activeWindow->isOnOutput(d->output)
+            && activeWindow->surfaceItem()
+            && activeWindow->surfaceItem()->recursiveFrameTimeEstimation() <= std::chrono::nanoseconds(1'000'000'000 / 30);
+    }
+
+    d->cachedVrrControl = result;
+    d->vrrCacheTimestamp = now;
+    return result;
 }
 
 std::chrono::nanoseconds RenderLoop::lastPresentationTimestamp() const

@@ -14,6 +14,7 @@
 #include <chrono>
 #include <fstream>
 #include <optional>
+#include <cstdint>
 
 namespace KWin
 {
@@ -21,7 +22,8 @@ namespace KWin
 class SurfaceItem;
 class OutputFrame;
 
-// Cache-aligned for false sharing prevention and optimal layout of hot fields.
+// Cache-aligned for false sharing prevention.
+// Field order optimized for Raptor Lake 64-byte cache lines.
 class alignas(64) KWIN_EXPORT RenderLoopPrivate
 {
 public:
@@ -39,35 +41,37 @@ public:
                               OutputFrame *frame);
     void notifyVblank(std::chrono::nanoseconds timestamp);
 
-    // === CACHE LINE 0 (0-63 bytes): HOT PATH FIELDS ===
-    RenderLoop *const q;               // 0-7: never changes
-    Output *const output;              // 8-15: never changes
-    int refreshRate;                   // 16-19: millihertz; read every frame
-    int pendingFrameCount;             // 20-23: in-flight frames
-    int inhibitCount;                  // 24-27: inhibit depth
-    int maxPendingFrameCount;          // 28-31: cap in-flight frames
-    PresentationMode presentationMode; // 32-35: current presentation mode
-    bool pendingReschedule;            // 36: queued reschedule
-    bool wasTripleBuffering;           // 37: hysteresis state
-    // 38-39: padding
-    int doubleBufferingCounter;        // 40-43: hysteresis counter
-    // 44-47: padding
-    uint64_t cachedVblankIntervalNs;   // 48-55: precomputed vblank interval nanoseconds
-    double invVblankInterval;          // 56-63: precomputed reciprocal (1.0 / vblank ns)
+    // === CACHE LINE 0 (0-63 bytes): HOT READ/WRITE FIELDS ===
+    RenderLoop *const q;                            // 0-7: const after construction
+    Output *const output;                           // 8-15: const after construction
+    int refreshRate;                                // 16-19: read every scheduleRepaint
+    int pendingFrameCount;                          // 20-23: read/write every frame
+    int inhibitCount;                               // 24-27: checked every scheduleRepaint
+    int maxPendingFrameCount;                       // 28-31: compared every scheduleRepaint
+    PresentationMode presentationMode;              // 32-35: checked every scheduleRepaint
+    bool pendingReschedule;                         // 36: toggled frequently
+    bool wasTripleBuffering;                        // 37: hysteresis state
+    int16_t doubleBufferingCounter;                 // 38-39: hysteresis counter (narrowed from int)
+    uint32_t padding0_;                             // 40-43: explicit padding for alignment
+    uint64_t cachedVblankIntervalNs;                // 44-51: read every scheduleRepaint
+    std::chrono::nanoseconds lastPresentationTimestamp; // 52-59: read/write every frame
+    // 60-63: natural struct padding
 
     // === CACHE LINE 1 (64-127 bytes): WARM FIELDS ===
-    std::chrono::nanoseconds lastPresentationTimestamp; // 64-71
-    std::chrono::nanoseconds nextPresentationTimestamp; // 72-79
-    std::chrono::nanoseconds safetyMargin;              // 80-87
-    RenderJournal renderJournal;                        // 88-95
-    QTimer compositeTimer;                              // 96-127
+    mutable bool cachedVrrControl;
+    mutable std::chrono::nanoseconds vrrCacheTimestamp;
+    std::chrono::nanoseconds nextPresentationTimestamp; // 64-71: written every scheduleRepaint
+    std::chrono::nanoseconds safetyMargin;              // 72-79: read every scheduleRepaint
+    RenderJournal renderJournal;                        // 80-...: updated every notifyFrameCompleted
 
     // === CACHE LINE 2+ (128+ bytes): COLD FIELDS ===
-    QTimer delayedVrrTimer;                       // VRR gating timer
-    std::optional<std::fstream> m_debugOutput;    // Debug CSV if enabled
+    QTimer compositeTimer;                          // Accessed during schedule/timeout only
+    QTimer delayedVrrTimer;                         // Accessed only in VRR gating (rare)
+    std::optional<std::fstream> m_debugOutput;      // Debug only (cold)
 };
 
 static_assert(alignof(RenderLoopPrivate) == 64, "RenderLoopPrivate must be 64-byte aligned");
 static_assert(sizeof(void*) == 8, "Assumes 64-bit pointers");
+static_assert(sizeof(std::chrono::nanoseconds) == 8, "Assumes nanoseconds is int64_t");
 
 } // namespace KWin
