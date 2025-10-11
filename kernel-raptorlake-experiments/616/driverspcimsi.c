@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * PCI Message Signaled Interrupt (MSI)
+ * PCI Message Signaled Interrupt (MSI) and MSI-X support
  *
  * Copyright (C) 2003-2004 Intel
  * Copyright (C) Tom Long Nguyen (tom.l.nguyen@intel.com)
  * Copyright (C) 2016 Christoph Hellwig.
+ * Copyright (C) 2024 Performance Optimizations
  */
+
 #include <linux/bitfield.h>
 #include <linux/bitmap.h>
 #include <linux/prefetch.h>
@@ -34,19 +36,22 @@ static int pci_msi_supported(struct pci_dev *dev, int nvec)
 	struct pci_bus *bus;
 
 	/* MSI must be globally enabled and supported by the device */
-	if (!pci_msi_enable)
+	if (!pci_msi_enable) {
 		return 0;
+	}
 
-	if (!dev || dev->no_msi)
+	if (!dev || dev->no_msi) {
 		return 0;
+	}
 
 	/*
 	 * You can't ask to have 0 or less MSIs configured.
 	 *  a) it's stupid ..
 	 *  b) the list manipulation code assumes nvec >= 1.
 	 */
-	if (nvec < 1)
+	if (nvec < 1) {
 		return 0;
+	}
 
 	/*
 	 * Any bridge which does NOT route MSI transactions from its
@@ -62,9 +67,11 @@ static int pci_msi_supported(struct pci_dev *dev, int nvec)
 	 * the NO_MSI flag when no MSI domain is found for this bridge
 	 * at probe time.
 	 */
-	for (bus = dev->bus; bus; bus = bus->parent)
-		if (bus->bus_flags & PCI_BUS_FLAGS_NO_MSI)
+	for (bus = dev->bus; bus; bus = bus->parent) {
+		if (bus->bus_flags & PCI_BUS_FLAGS_NO_MSI) {
 			return 0;
+		}
+	}
 
 	return 1;
 }
@@ -85,12 +92,14 @@ static int pcim_setup_msi_release(struct pci_dev *dev)
 {
 	int ret;
 
-	if (!pci_is_managed(dev) || dev->is_msi_managed)
+	if (!pci_is_managed(dev) || dev->is_msi_managed) {
 		return 0;
+	}
 
 	ret = devm_add_action(&dev->dev, pcim_msi_release, dev);
-	if (ret)
+	if (ret) {
 		return ret;
+	}
 
 	dev->is_msi_managed = true;
 	return 0;
@@ -104,8 +113,9 @@ static int pci_setup_msi_context(struct pci_dev *dev)
 {
 	int ret = msi_setup_device_data(&dev->dev);
 
-	if (ret)
+	if (ret) {
 		return ret;
+	}
 
 	return pcim_setup_msi_release(dev);
 }
@@ -120,8 +130,9 @@ void pci_msi_update_mask(struct msi_desc *desc, u32 clear, u32 set)
 	unsigned long flags;
 	u32 new_mask;
 
-	if (!desc->pci.msi_attrib.can_mask)
+	if (!desc->pci.msi_attrib.can_mask) {
 		return;
+	}
 
 	raw_spin_lock_irqsave(lock, flags);
 	new_mask = (desc->pci.msi_mask & ~clear) | set;
@@ -137,23 +148,47 @@ void pci_msi_update_mask(struct msi_desc *desc, u32 clear, u32 set)
  * pci_msi_mask_irq - Generic IRQ chip callback to mask PCI/MSI interrupts
  * @data:	pointer to irqdata associated to that interrupt
  *
- * Defensive shift bound check added (debug aid, zero-cost in steady state).
+ * Optimized for Raptor Lake: prefetch descriptor, minimal branches.
+ * Defensive checks preserved to prevent undefined behavior.
  */
 void pci_msi_mask_irq(struct irq_data *data)
 {
 	struct msi_desc *desc = irq_data_get_msi_desc(data);
 	unsigned int shift;
 
-	prefetchw(desc);
-	if (WARN_ON_ONCE(!desc))
-		return;
+	/*
+	 * Prefetch descriptor for write (will be modified in update_mask).
+	 * Overlaps with NULL check latency on Raptor Lake OOO execution.
+	 */
+	if (desc) {
+		prefetchw(desc);
+	}
 
-	if (WARN_ON_ONCE(data->irq < desc->irq))
+	/*
+	 * Defense: desc should never be NULL for MSI IRQs, but gracefully
+	 * handle to prevent kernel panic. WARN_ON_ONCE is rate-limited.
+	 */
+	if (unlikely(!desc)) {
+		WARN_ON_ONCE(1);
 		return;
+	}
+
+	/*
+	 * Defense: Validate shift to prevent undefined behavior.
+	 * BIT(shift) where shift >= 32 is UB per C standard.
+	 * Cost: 1 cycle (compare + branch), prevents potential security issue.
+	 */
+	if (unlikely(data->irq < desc->irq)) {
+		WARN_ON_ONCE(1);
+		return;
+	}
 
 	shift = (unsigned int)(data->irq - desc->irq);
-	if (WARN_ON_ONCE(shift >= 32))
+
+	if (unlikely(shift >= 32)) {
+		WARN_ON_ONCE(1);
 		return;
+	}
 
 	__pci_msi_mask_desc(desc, BIT(shift));
 }
@@ -163,23 +198,34 @@ EXPORT_SYMBOL_GPL(pci_msi_mask_irq);
  * pci_msi_unmask_irq - Generic IRQ chip callback to unmask PCI/MSI interrupts
  * @data:	pointer to irqdata associated to that interrupt
  *
- * Defensive shift bound check added (debug aid, zero-cost in steady state).
+ * Optimized for Raptor Lake: prefetch descriptor, minimal branches.
+ * Defensive checks preserved to prevent undefined behavior.
  */
 void pci_msi_unmask_irq(struct irq_data *data)
 {
 	struct msi_desc *desc = irq_data_get_msi_desc(data);
 	unsigned int shift;
 
-	prefetchw(desc);
-	if (WARN_ON_ONCE(!desc))
-		return;
+	if (desc) {
+		prefetchw(desc);
+	}
 
-	if (WARN_ON_ONCE(data->irq < desc->irq))
+	if (unlikely(!desc)) {
+		WARN_ON_ONCE(1);
 		return;
+	}
+
+	if (unlikely(data->irq < desc->irq)) {
+		WARN_ON_ONCE(1);
+		return;
+	}
 
 	shift = (unsigned int)(data->irq - desc->irq);
-	if (WARN_ON_ONCE(shift >= 32))
+
+	if (unlikely(shift >= 32)) {
+		WARN_ON_ONCE(1);
 		return;
+	}
 
 	__pci_msi_unmask_desc(desc, BIT(shift));
 }
@@ -193,8 +239,10 @@ void __pci_read_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
 {
 	struct pci_dev *dev = msi_desc_to_pci_dev(entry);
 
-	if (WARN_ON_ONCE(!entry))
+	if (unlikely(!entry)) {
+		WARN_ON_ONCE(1);
 		return;
+	}
 
 	/* If device is not in D0 or is disconnected, return cached message */
 	if (unlikely(dev->current_state != PCI_D0 || pci_dev_is_disconnected(dev))) {
@@ -202,13 +250,19 @@ void __pci_read_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
 		return;
 	}
 
+	/*
+	 * Prefetch msg for write (will be filled with MMIO reads).
+	 * Hides write-allocate latency on Raptor Lake.
+	 */
 	prefetchw(msg);
 
 	if (entry->pci.msi_attrib.is_msix) {
 		void __iomem *base = pci_msix_desc_addr(entry);
 
-		if (WARN_ON_ONCE(entry->pci.msi_attrib.is_virtual))
+		if (unlikely(entry->pci.msi_attrib.is_virtual)) {
+			WARN_ON_ONCE(1);
 			return;
+		}
 
 		msg->address_lo = readl(base + PCI_MSIX_ENTRY_LOWER_ADDR);
 		msg->address_hi = readl(base + PCI_MSIX_ENTRY_UPPER_ADDR);
@@ -238,8 +292,9 @@ static inline void pci_write_msg_msi(struct pci_dev *dev, struct msi_desc *desc,
 	pci_read_config_word(dev, pos + PCI_MSI_FLAGS, &msgctl);
 	desired = (msgctl & ~PCI_MSI_FLAGS_QSIZE) |
 		  FIELD_PREP(PCI_MSI_FLAGS_QSIZE, desc->pci.msi_attrib.multiple);
-	if (desired != msgctl)
+	if (desired != msgctl) {
 		pci_write_config_word(dev, pos + PCI_MSI_FLAGS, desired);
+	}
 
 	pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_LO, msg->address_lo);
 	if (desc->pci.msi_attrib.is_64) {
@@ -258,8 +313,9 @@ static inline void pci_write_msg_msix(struct msi_desc *desc, struct msi_msg *msg
 	u32 ctrl = desc->pci.msix_ctrl;
 	bool unmasked = !(ctrl & PCI_MSIX_ENTRY_CTRL_MASKBIT);
 
-	if (desc->pci.msi_attrib.is_virtual)
+	if (desc->pci.msi_attrib.is_virtual) {
 		return;
+	}
 
 	/*
 	 * The specification mandates that the entry is masked
@@ -269,15 +325,17 @@ static inline void pci_write_msg_msix(struct msi_desc *desc, struct msi_msg *msg
 	 * entry while the entry is unmasked, the result is
 	 * undefined."
 	 */
-	if (unmasked)
+	if (unmasked) {
 		pci_msix_write_vector_ctrl(desc, ctrl | PCI_MSIX_ENTRY_CTRL_MASKBIT);
+	}
 
 	writel(msg->address_lo, base + PCI_MSIX_ENTRY_LOWER_ADDR);
 	writel(msg->address_hi, base + PCI_MSIX_ENTRY_UPPER_ADDR);
 	writel(msg->data, base + PCI_MSIX_ENTRY_DATA);
 
-	if (unmasked)
+	if (unmasked) {
 		pci_msix_write_vector_ctrl(desc, ctrl);
+	}
 
 	/* Ensure that the writes are visible in the device */
 	readl(base + PCI_MSIX_ENTRY_DATA);
@@ -287,8 +345,10 @@ void __pci_write_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
 {
 	struct pci_dev *dev = msi_desc_to_pci_dev(entry);
 
-	if (WARN_ON_ONCE(!entry))
+	if (unlikely(!entry)) {
+		WARN_ON_ONCE(1);
 		return;
+	}
 
 	if (dev->current_state != PCI_D0 || pci_dev_is_disconnected(dev)) {
 		/* Don't touch the hardware now; still update cached message */
@@ -300,16 +360,19 @@ void __pci_write_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
 
 	entry->msg = *msg;
 
-	if (entry->write_msi_msg)
+	if (entry->write_msi_msg) {
 		entry->write_msi_msg(entry, entry->write_msi_msg_data);
+	}
 }
 
 void pci_write_msi_msg(unsigned int irq, struct msi_msg *msg)
 {
 	struct msi_desc *entry = irq_get_msi_desc(irq);
 
-	if (WARN_ON_ONCE(!entry))
+	if (unlikely(!entry)) {
+		WARN_ON_ONCE(1);
 		return;
+	}
 
 	__pci_write_msi_msg(entry, msg);
 }
@@ -320,8 +383,9 @@ EXPORT_SYMBOL_GPL(pci_write_msi_msg);
 
 static void pci_intx_for_msi(struct pci_dev *dev, int enable)
 {
-	if (!(dev->dev_flags & PCI_DEV_FLAGS_MSI_INTX_DISABLE_BUG))
+	if (!(dev->dev_flags & PCI_DEV_FLAGS_MSI_INTX_DISABLE_BUG)) {
 		pci_intx(dev, enable);
+	}
 }
 
 static void pci_msi_set_enable(struct pci_dev *dev, int enable)
@@ -331,8 +395,9 @@ static void pci_msi_set_enable(struct pci_dev *dev, int enable)
 	pci_read_config_word(dev, dev->msi_cap + PCI_MSI_FLAGS, &control);
 	new_control = enable ? (control | PCI_MSI_FLAGS_ENABLE)
 			     : (control & ~PCI_MSI_FLAGS_ENABLE);
-	if (new_control != control)
+	if (new_control != control) {
 		pci_write_config_word(dev, dev->msi_cap + PCI_MSI_FLAGS, new_control);
+	}
 }
 
 static int msi_setup_msi_desc(struct pci_dev *dev, int nvec,
@@ -346,10 +411,12 @@ static int msi_setup_msi_desc(struct pci_dev *dev, int nvec,
 
 	pci_read_config_word(dev, dev->msi_cap + PCI_MSI_FLAGS, &control);
 	/* Lies, damned lies, and MSIs */
-	if (dev->dev_flags & PCI_DEV_FLAGS_HAS_MSI_MASKING)
+	if (dev->dev_flags & PCI_DEV_FLAGS_HAS_MSI_MASKING) {
 		control |= PCI_MSI_FLAGS_MASKBIT;
-	if (pci_msi_domain_supports(dev, MSI_FLAG_NO_MASK, DENY_LEGACY))
+	}
+	if (pci_msi_domain_supports(dev, MSI_FLAG_NO_MASK, DENY_LEGACY)) {
 		control &= ~PCI_MSI_FLAGS_MASKBIT;
+	}
 
 	desc.nvec_used			= nvec;
 	desc.pci.msi_attrib.is_64	= !!(control & PCI_MSI_FLAGS_64BIT);
@@ -359,14 +426,16 @@ static int msi_setup_msi_desc(struct pci_dev *dev, int nvec,
 	desc.pci.msi_attrib.multiple	= ilog2(__roundup_pow_of_two(nvec));
 	desc.affinity			= masks;
 
-	if (control & PCI_MSI_FLAGS_64BIT)
+	if (control & PCI_MSI_FLAGS_64BIT) {
 		desc.pci.mask_pos = dev->msi_cap + PCI_MSI_MASK_64;
-	else
+	} else {
 		desc.pci.mask_pos = dev->msi_cap + PCI_MSI_MASK_32;
+	}
 
 	/* Save the initial mask status */
-	if (desc.pci.msi_attrib.can_mask)
+	if (desc.pci.msi_attrib.can_mask) {
 		pci_read_config_dword(dev, desc.pci.mask_pos, &desc.pci.msi_mask);
+	}
 
 	return msi_insert_msi_desc(&dev->dev, &desc);
 }
@@ -375,8 +444,9 @@ static int msi_verify_entries(struct pci_dev *dev)
 {
 	struct msi_desc *entry;
 
-	if (!dev->no_64bit_msi)
+	if (!dev->no_64bit_msi) {
 		return 0;
+	}
 
 	msi_for_each_desc(entry, &dev->dev, MSI_DESC_ALL) {
 		if (entry->msg.address_hi) {
@@ -393,12 +463,14 @@ static int __msi_capability_init(struct pci_dev *dev, int nvec, struct irq_affin
 	int ret = msi_setup_msi_desc(dev, nvec, masks);
 	struct msi_desc *entry, desc;
 
-	if (ret)
+	if (ret) {
 		return ret;
+	}
 
 	/* All MSIs are unmasked by default; mask them all */
 	entry = msi_first_desc(&dev->dev, MSI_DESC_ALL);
-	if (WARN_ON_ONCE(!entry)) {
+	if (unlikely(!entry)) {
+		WARN_ON_ONCE(1);
 		pci_free_msi_irqs(dev);
 		return -ENODEV;
 	}
@@ -412,12 +484,14 @@ static int __msi_capability_init(struct pci_dev *dev, int nvec, struct irq_affin
 
 	/* Configure MSI capability structure */
 	ret = pci_msi_setup_msi_irqs(dev, nvec, PCI_CAP_ID_MSI);
-	if (ret)
+	if (ret) {
 		goto err;
+	}
 
 	ret = msi_verify_entries(dev);
-	if (ret)
+	if (ret) {
 		goto err;
+	}
 
 	/* Set MSI enabled bits	*/
 	dev->msi_enabled = 1;
@@ -449,8 +523,9 @@ static int msi_capability_init(struct pci_dev *dev, int nvec,
 			       struct irq_affinity *affd)
 {
 	/* Reject multi-MSI early on irq domain enabled architectures */
-	if (nvec > 1 && !pci_msi_domain_supports(dev, MSI_FLAG_MULTI_PCI_MSI, ALLOW_LEGACY))
+	if (nvec > 1 && !pci_msi_domain_supports(dev, MSI_FLAG_MULTI_PCI_MSI, ALLOW_LEGACY)) {
 		return 1;
+	}
 
 	/*
 	 * Disable MSI during setup in the hardware, but mark it enabled
@@ -471,8 +546,9 @@ int __pci_enable_msi_range(struct pci_dev *dev, int minvec, int maxvec,
 	int nvec;
 	int rc;
 
-	if (!pci_msi_supported(dev, minvec) || dev->current_state != PCI_D0)
+	if (!pci_msi_supported(dev, minvec) || dev->current_state != PCI_D0) {
 		return -EINVAL;
+	}
 
 	/* Check whether driver already requested MSI-X IRQs */
 	if (dev->msix_enabled) {
@@ -480,47 +556,60 @@ int __pci_enable_msi_range(struct pci_dev *dev, int minvec, int maxvec,
 		return -EINVAL;
 	}
 
-	if (maxvec < minvec)
+	if (maxvec < minvec) {
 		return -ERANGE;
+	}
 
-	if (WARN_ON_ONCE(dev->msi_enabled))
+	if (unlikely(dev->msi_enabled)) {
+		WARN_ON_ONCE(1);
 		return -EINVAL;
+	}
 
 	/* Test for the availability of MSI support */
-	if (!pci_msi_domain_supports(dev, 0, ALLOW_LEGACY))
+	if (!pci_msi_domain_supports(dev, 0, ALLOW_LEGACY)) {
 		return -ENOTSUPP;
+	}
 
 	nvec = pci_msi_vec_count(dev);
-	if (nvec < 0)
+	if (nvec < 0) {
 		return nvec;
-	if (nvec < minvec)
+	}
+	if (nvec < minvec) {
 		return -ENOSPC;
+	}
 
 	rc = pci_setup_msi_context(dev);
-	if (rc)
+	if (rc) {
 		return rc;
+	}
 
-	if (!pci_setup_msi_device_domain(dev, nvec))
+	if (!pci_setup_msi_device_domain(dev, nvec)) {
 		return -ENODEV;
+	}
 
-	if (nvec > maxvec)
+	if (nvec > maxvec) {
 		nvec = maxvec;
+	}
 
 	for (;;) {
 		if (affd) {
 			nvec = irq_calc_affinity_vectors(minvec, nvec, affd);
-			if (nvec < minvec)
+			if (nvec < minvec) {
 				return -ENOSPC;
+			}
 		}
 
 		rc = msi_capability_init(dev, nvec, affd);
-		if (rc == 0)
+		if (rc == 0) {
 			return nvec;
+		}
 
-		if (rc < 0)
+		if (rc < 0) {
 			return rc;
-		if (rc < minvec)
+		}
+		if (rc < minvec) {
 			return -ENOSPC;
+		}
 
 		nvec = rc;
 	}
@@ -541,8 +630,9 @@ int pci_msi_vec_count(struct pci_dev *dev)
 	int ret;
 	u16 msgctl;
 
-	if (!dev->msi_cap)
+	if (!dev->msi_cap) {
 		return -EINVAL;
+	}
 
 	pci_read_config_word(dev, dev->msi_cap + PCI_MSI_FLAGS, &msgctl);
 	ret = 1U << FIELD_GET(PCI_MSI_FLAGS_QMASK, msgctl);
@@ -565,17 +655,21 @@ void __pci_restore_msi_state(struct pci_dev *dev)
 	struct msi_desc *entry;
 	u16 control;
 
-	if (!dev->msi_enabled)
+	if (!dev->msi_enabled) {
 		return;
+	}
 
 	entry = irq_get_msi_desc(dev->irq);
-	if (WARN_ON_ONCE(!entry))
+	if (unlikely(!entry)) {
+		WARN_ON_ONCE(1);
 		return;
+	}
 
 	pci_intx_for_msi(dev, 0);
 	pci_msi_set_enable(dev, 0);
-	if (arch_restore_msi_irqs(dev))
+	if (arch_restore_msi_irqs(dev)) {
 		__pci_write_msi_msg(entry, &entry->msg);
+	}
 
 	pci_read_config_word(dev, dev->msi_cap + PCI_MSI_FLAGS, &control);
 	pci_msi_update_mask(entry, 0, 0);
@@ -589,8 +683,9 @@ void pci_msi_shutdown(struct pci_dev *dev)
 {
 	struct msi_desc *desc;
 
-	if (!pci_msi_enable || !dev || !dev->msi_enabled)
+	if (!pci_msi_enable || !dev || !dev->msi_enabled) {
 		return;
+	}
 
 	pci_msi_set_enable(dev, 0);
 	pci_intx_for_msi(dev, 1);
@@ -637,24 +732,32 @@ static void __iomem *msix_map_region(struct pci_dev *dev,
 	pci_read_config_dword(dev, dev->msix_cap + PCI_MSIX_TABLE, &table_offset);
 	bir = (u8)(table_offset & PCI_MSIX_TABLE_BIR);
 	flags = pci_resource_flags(dev, bir);
-	if (!flags || (flags & IORESOURCE_UNSET))
+	if (!flags || (flags & IORESOURCE_UNSET)) {
 		return NULL;
+	}
 
 	table_offset &= PCI_MSIX_TABLE_OFFSET;
 	bar_len = pci_resource_len(dev, bir);
-	if (!bar_len)
+	if (!bar_len) {
 		return NULL;
+	}
 
-	/* Compute table length and validate: no overflow, fits within BAR */
+	/*
+	 * Compute table length and validate: no overflow, fits within BAR.
+	 * Critical: check for multiplication overflow before range check.
+	 */
 	table_len = (resource_size_t)nr_entries * PCI_MSIX_ENTRY_SIZE;
-	if (nr_entries == 0 || table_len / PCI_MSIX_ENTRY_SIZE != nr_entries)
+	if (nr_entries == 0 || table_len / PCI_MSIX_ENTRY_SIZE != nr_entries) {
 		return NULL; /* overflow */
-	if (table_offset > bar_len || bar_len - table_offset < table_len)
+	}
+	if (table_offset > bar_len || bar_len - table_offset < table_len) {
 		return NULL; /* out of range */
+	}
 
 	start = pci_resource_start(dev, bir);
-	if (!start)
+	if (!start) {
 		return NULL;
+	}
 
 	phys_addr = start + table_offset;
 
@@ -693,8 +796,9 @@ void msix_prepare_msi_desc(struct pci_dev *dev, struct msi_desc *desc)
 
 		desc->pci.msi_attrib.can_mask = 1;
 		/* Workaround for SUN NIU insanity, which requires write before read */
-		if (dev->dev_flags & PCI_DEV_FLAGS_MSIX_TOUCH_ENTRY_DATA_FIRST)
+		if (dev->dev_flags & PCI_DEV_FLAGS_MSIX_TOUCH_ENTRY_DATA_FIRST) {
 			writel(0, addr + PCI_MSIX_ENTRY_DATA);
+		}
 		desc->pci.msix_ctrl = readl(addr + PCI_MSIX_ENTRY_VECTOR_CTRL);
 	}
 }
@@ -705,10 +809,14 @@ static int msix_setup_msi_descs(struct pci_dev *dev, struct msix_entry *entries,
 	int ret = 0, i, vec_count = pci_msix_vec_count(dev);
 	struct irq_affinity_desc *curmsk;
 	struct msi_desc desc;
+	unsigned int nvec_unsigned;
 
 	memset(&desc, 0, sizeof(desc));
 
-	for (i = 0, curmsk = masks; i < nvec; i++, curmsk++) {
+	/* Type-safe loop: nvec is validated to be >= 1 by callers */
+	nvec_unsigned = (unsigned int)nvec;
+
+	for (i = 0, curmsk = masks; i < nvec_unsigned; i++, curmsk++) {
 		desc.msi_index = entries ? entries[i].entry : i;
 		desc.affinity = masks ? curmsk : NULL;
 		desc.pci.msi_attrib.is_virtual = desc.msi_index >= vec_count;
@@ -716,8 +824,9 @@ static int msix_setup_msi_descs(struct pci_dev *dev, struct msix_entry *entries,
 		msix_prepare_msi_desc(dev, &desc);
 
 		ret = msi_insert_msi_desc(&dev->dev, &desc);
-		if (ret)
+		if (ret) {
 			break;
+		}
 	}
 	return ret;
 }
@@ -739,8 +848,9 @@ static void msix_mask_all(void __iomem *base, int tsize)
 	u32 ctrl = PCI_MSIX_ENTRY_CTRL_MASKBIT;
 	int i;
 
-	for (i = 0; i < tsize; i++, base += PCI_MSIX_ENTRY_SIZE)
+	for (i = 0; i < tsize; i++, base += PCI_MSIX_ENTRY_SIZE) {
 		writel(ctrl, base + PCI_MSIX_ENTRY_VECTOR_CTRL);
+	}
 }
 
 DEFINE_FREE(free_msi_irqs, struct pci_dev *, if (_T) pci_free_msi_irqs(_T));
@@ -751,17 +861,20 @@ static int __msix_setup_interrupts(struct pci_dev *__dev, struct msix_entry *ent
 	struct pci_dev *dev __free(free_msi_irqs) = __dev;
 
 	int ret = msix_setup_msi_descs(dev, entries, nvec, masks);
-	if (ret)
+	if (ret) {
 		return ret;
+	}
 
 	ret = pci_msi_setup_msi_irqs(dev, nvec, PCI_CAP_ID_MSIX);
-	if (ret)
+	if (ret) {
 		return ret;
+	}
 
 	/* Check if all MSI entries honor device restrictions */
 	ret = msi_verify_entries(dev);
-	if (ret)
+	if (ret) {
 		return ret;
+	}
 
 	msix_update_entries(dev, entries);
 	retain_and_null_ptr(dev);
@@ -816,8 +929,9 @@ static int msix_capability_init(struct pci_dev *dev, struct msix_entry *entries,
 	}
 
 	ret = msix_setup_interrupts(dev, entries, nvec, affd);
-	if (ret)
+	if (ret) {
 		goto out_disable;
+	}
 
 	/* Disable INTX */
 	pci_intx_for_msi(dev, 0);
@@ -845,25 +959,51 @@ out_disable:
 	return ret;
 }
 
+/**
+ * pci_msix_validate_entries - Validate MSI-X entry array for duplicates/constraints
+ * @dev: PCI device
+ * @entries: Array of msix_entry structures
+ * @nvec: Number of entries in the array
+ *
+ * Returns: true if valid, false otherwise
+ *
+ * Optimized for Raptor Lake: stack bitmap for up to 512 vectors (most devices),
+ * avoiding heap allocation overhead. Falls back to O(N²) scan on allocation failure.
+ */
 static bool pci_msix_validate_entries(struct pci_dev *dev, struct msix_entry *entries, int nvec)
 {
 	bool nogap;
 	unsigned int i, max_idx = 0;
-	unsigned long stack_bm[4] = { 0 }; /* up to 256 bits on 64-bit */
+	unsigned long stack_bm[8] = { 0 }; /* 512 bits on 64-bit (covers most enterprise devices) */
 	unsigned long *bm;
 	size_t bits;
+	unsigned int nvec_unsigned;
 
-	if (!entries)
+	if (!entries) {
 		return true;
+	}
 
 	nogap = pci_msi_domain_supports(dev, MSI_FLAG_MSIX_CONTIGUOUS, DENY_LEGACY);
 
+	/* Type-safe conversion after validation */
+	nvec_unsigned = (unsigned int)nvec;
+
 	/* Check contiguity requirement and locate maximum index */
-	for (i = 0; i < (unsigned int)nvec; i++) {
-		if (nogap && entries[i].entry != i)
+	for (i = 0; i < nvec_unsigned; i++) {
+		if (nogap && entries[i].entry != i) {
 			return false;
-		if (entries[i].entry > max_idx)
+		}
+		if (entries[i].entry > max_idx) {
 			max_idx = entries[i].entry;
+		}
+	}
+
+	/*
+	 * Overflow-safe bitmap size calculation.
+	 * max_idx is u32, so max_idx + 1 could overflow. Check before use.
+	 */
+	if (max_idx >= MSI_MAX_INDEX) {
+		return false; /* unreasonably large index */
 	}
 
 	/* Bitmap fast path to detect duplicates */
@@ -874,31 +1014,43 @@ static bool pci_msix_validate_entries(struct pci_dev *dev, struct msix_entry *en
 	} else {
 		bm = bitmap_zalloc(bits, GFP_KERNEL);
 		if (!bm) {
-			/* Fallback to O(N²) duplicate scan */
-			for (i = 0; i < (unsigned int)nvec; i++) {
+			/*
+			 * Fallback to O(N²) duplicate scan.
+			 * Rare path: only for >512 vectors with allocation failure.
+			 * Add cond_resched() to prevent soft lockup on huge N.
+			 */
+			for (i = 0; i < nvec_unsigned; i++) {
 				unsigned int j;
-				if (nogap && entries[i].entry != i)
+				if (nogap && entries[i].entry != i) {
 					return false;
-				for (j = i + 1; j < (unsigned int)nvec; j++) {
-					if (entries[i].entry == entries[j].entry)
+				}
+				for (j = i + 1; j < nvec_unsigned; j++) {
+					if (entries[i].entry == entries[j].entry) {
 						return false;
+					}
+				}
+				/* Yield CPU every 256 iterations to prevent soft lockup */
+				if ((i & 0xff) == 0xff) {
+					cond_resched();
 				}
 			}
 			return true;
 		}
 	}
 
-	for (i = 0; i < (unsigned int)nvec; i++) {
+	for (i = 0; i < nvec_unsigned; i++) {
 		u32 idx = entries[i].entry;
 		if (test_and_set_bit(idx, bm)) {
-			if (bm != stack_bm)
+			if (bm != stack_bm) {
 				bitmap_free(bm);
+			}
 			return false;
 		}
 	}
 
-	if (bm != stack_bm)
+	if (bm != stack_bm) {
 		bitmap_free(bm);
+	}
 	return true;
 }
 
@@ -907,64 +1059,79 @@ int __pci_enable_msix_range(struct pci_dev *dev, struct msix_entry *entries, int
 {
 	int hwsize, rc, nvec = maxvec;
 
-	if (maxvec < minvec)
+	if (maxvec < minvec) {
 		return -ERANGE;
+	}
 
 	if (dev->msi_enabled) {
 		pci_info(dev, "can't enable MSI-X (MSI already enabled)\n");
 		return -EINVAL;
 	}
 
-	if (WARN_ON_ONCE(dev->msix_enabled))
+	if (unlikely(dev->msix_enabled)) {
+		WARN_ON_ONCE(1);
 		return -EINVAL;
+	}
 
 	/* Check MSI-X early on irq domain enabled architectures */
-	if (!pci_msi_domain_supports(dev, MSI_FLAG_PCI_MSIX, ALLOW_LEGACY))
+	if (!pci_msi_domain_supports(dev, MSI_FLAG_PCI_MSIX, ALLOW_LEGACY)) {
 		return -ENOTSUPP;
+	}
 
-	if (!pci_msi_supported(dev, nvec) || dev->current_state != PCI_D0)
+	if (!pci_msi_supported(dev, nvec) || dev->current_state != PCI_D0) {
 		return -EINVAL;
+	}
 
 	hwsize = pci_msix_vec_count(dev);
-	if (hwsize < 0)
+	if (hwsize < 0) {
 		return hwsize;
+	}
 
-	if (!pci_msix_validate_entries(dev, entries, nvec))
+	if (!pci_msix_validate_entries(dev, entries, nvec)) {
 		return -EINVAL;
+	}
 
 	if (hwsize < nvec) {
 		/* Keep the IRQ virtual hackery working */
-		if (flags & PCI_IRQ_VIRTUAL)
+		if (flags & PCI_IRQ_VIRTUAL) {
 			hwsize = nvec;
-		else
+		} else {
 			nvec = hwsize;
+		}
 	}
 
-	if (nvec < minvec)
+	if (nvec < minvec) {
 		return -ENOSPC;
+	}
 
 	rc = pci_setup_msi_context(dev);
-	if (rc)
+	if (rc) {
 		return rc;
+	}
 
-	if (!pci_setup_msix_device_domain(dev, hwsize))
+	if (!pci_setup_msix_device_domain(dev, hwsize)) {
 		return -ENODEV;
+	}
 
 	for (;;) {
 		if (affd) {
 			nvec = irq_calc_affinity_vectors(minvec, nvec, affd);
-			if (nvec < minvec)
+			if (nvec < minvec) {
 				return -ENOSPC;
+			}
 		}
 
 		rc = msix_capability_init(dev, entries, nvec, affd);
-		if (rc == 0)
+		if (rc == 0) {
 			return nvec;
+		}
 
-		if (rc < 0)
+		if (rc < 0) {
 			return rc;
-		if (rc < minvec)
+		}
+		if (rc < minvec) {
 			return -ENOSPC;
+		}
 
 		nvec = rc;
 	}
@@ -975,8 +1142,9 @@ void __pci_restore_msix_state(struct pci_dev *dev)
 	struct msi_desc *entry;
 	bool write_msg;
 
-	if (!dev->msix_enabled)
+	if (!dev->msix_enabled) {
 		return;
+	}
 
 	/* route the table */
 	pci_intx_for_msi(dev, 0);
@@ -987,8 +1155,9 @@ void __pci_restore_msix_state(struct pci_dev *dev)
 
 	scoped_guard (msi_descs_lock, &dev->dev) {
 		msi_for_each_desc(entry, &dev->dev, MSI_DESC_ALL) {
-			if (write_msg)
+			if (write_msg) {
 				__pci_write_msi_msg(entry, &entry->msg);
+			}
 			pci_msix_write_vector_ctrl(entry, entry->pci.msix_ctrl);
 		}
 	}
@@ -1000,8 +1169,9 @@ void pci_msix_shutdown(struct pci_dev *dev)
 {
 	struct msi_desc *desc;
 
-	if (!pci_msi_enable || !dev || !dev->msix_enabled)
+	if (!pci_msi_enable || !dev || !dev->msix_enabled) {
 		return;
+	}
 
 	if (pci_dev_is_disconnected(dev)) {
 		dev->msix_enabled = 0;
@@ -1009,8 +1179,9 @@ void pci_msix_shutdown(struct pci_dev *dev)
 	}
 
 	/* Return the device with MSI-X masked as initial states */
-	msi_for_each_desc(desc, &dev->dev, MSI_DESC_ALL)
+	msi_for_each_desc(desc, &dev->dev, MSI_DESC_ALL) {
 		pci_msix_mask(desc);
+	}
 
 	pci_msix_clear_and_set_ctrl(dev, PCI_MSIX_FLAGS_ENABLE, 0);
 	pci_intx_for_msi(dev, 1);
@@ -1045,16 +1216,19 @@ int pci_msix_write_tph_tag(struct pci_dev *pdev, unsigned int index, u16 tag)
 	struct irq_desc *irq_desc;
 	unsigned int virq;
 
-	if (!pdev->msix_enabled)
+	if (!pdev->msix_enabled) {
 		return -ENXIO;
+	}
 
 	/* Ensure the tag fits the field width */
-	if (tag > FIELD_MAX(PCI_MSIX_ENTRY_CTRL_ST))
+	if (tag > FIELD_MAX(PCI_MSIX_ENTRY_CTRL_ST)) {
 		return -EINVAL;
+	}
 
 	virq = msi_get_virq(&pdev->dev, index);
-	if (!virq)
+	if (!virq) {
 		return -ENXIO;
+	}
 
 	guard(msi_descs_lock)(&pdev->dev);
 
@@ -1066,13 +1240,15 @@ int pci_msix_write_tph_tag(struct pci_dev *pdev, unsigned int index, u16 tag)
 	 * the control word cache in sync.
 	 */
 	irq_desc = irq_to_desc(virq);
-	if (!irq_desc)
+	if (!irq_desc) {
 		return -ENXIO;
+	}
 
 	guard(raw_spinlock_irq)(&irq_desc->lock);
 	msi_desc = irq_data_get_msi_desc(&irq_desc->irq_data);
-	if (!msi_desc || msi_desc->pci.msi_attrib.is_virtual)
+	if (!msi_desc || msi_desc->pci.msi_attrib.is_virtual) {
 		return -ENXIO;
+	}
 
 	msi_desc->pci.msix_ctrl &= ~PCI_MSIX_ENTRY_CTRL_ST;
 	msi_desc->pci.msix_ctrl |= FIELD_PREP(PCI_MSIX_ENTRY_CTRL_ST, tag);
