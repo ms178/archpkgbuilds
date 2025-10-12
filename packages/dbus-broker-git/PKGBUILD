@@ -24,7 +24,8 @@ makedepends=(
   'clang'
   'lld'
   'llvm'
-  'procps-ng'
+  'procps-ng' # for pkill, used by the test suite
+  'bc'        # for PGO quality gate calculation
 )
 source=(
   "$pkgbase::git+https://github.com/bus1/dbus-broker"
@@ -58,41 +59,9 @@ prepare() {
 }
 
 build() {
-  # This helper function correctly formats shell flags into a Meson array string.
-  format_meson_flags() {
-    local flags_str=""
-    for flag in "$@"; do
-      flag_escaped="${flag//\'/\'\\\'\'}"
-      flags_str+="'$flag_escaped', "
-    done
-    echo "[${flags_str%, }]"
-  }
-
-  local meson_options=(
-    -D audit=true -D docs=false -D linux-4-17=true
-    -D system-console-users=gdm,sddm,lightdm,lxdm
-    --wrap-mode=forcefallback --buildtype=plain
-    --native-file=meson-native-flags.ini
-  )
-  mkdir -p "$srcdir/build-pgo1" "$srcdir/build-pgo2" "$srcdir/build-final" "$srcdir/bolt_opt"
-  mkdir -p "$srcdir/pgo_raw" "$srcdir/pgo_cs" "$srcdir/bolt_profiles"
-
-  # --- Stage 1: Standard PGO Instrumentation & Profiling (via Test Suite) ---
-  echo "--> Stage 1.1: Building with standard PGO instrumentation..."
-  local pgo_instr_flags="-fprofile-generate=${srcdir}/pgo_raw"
-  local cflags_array=$(format_meson_flags $CFLAGS $pgo_instr_flags)
-  local cxxflags_array=$(format_meson_flags $CXXFLAGS $pgo_instr_flags)
-  local ldflags_array=$(format_meson_flags $LDFLAGS $pgo_instr_flags)
-
+  # Statically define the clang toolchain in a native file. This is the correct
+  # Meson approach and avoids using environment variables.
   cat > meson-native-flags.ini <<EOF
-[built-in options]
-c_args = $cflags_array
-cpp_args = $cxxflags_array
-c_link_args = $ldflags_array
-cpp_link_args = $ldflags_array
-b_pie = 'false'
-b_ndebug = 'false'
-
 [binaries]
 c = 'clang'
 cpp = 'clang++'
@@ -101,7 +70,34 @@ nm = 'llvm-nm'
 ranlib = 'llvm-ranlib'
 EOF
 
-  arch-meson "$pkgbase" build-pgo1 "${meson_options[@]}"
+  # Base Meson options common across all build stages.
+  local meson_options_base=(
+    --native-file=meson-native-flags.ini
+    -D audit=true
+    -D docs=false
+    -D linux-4-17=true
+    -D system-console-users=gdm,sddm,lightdm,lxdm
+    --wrap-mode=forcefallback
+    --buildtype=plain
+  )
+
+  mkdir -p "$srcdir"/{build-pgo1,build-pgo2,build-final,bolt_opt}
+  mkdir -p "$srcdir"/{pgo_raw,pgo_cs,bolt_profiles}
+
+  # --- Stage 1: Standard PGO Instrumentation & Profiling ---
+  echo "--> Stage 1.1: Building with standard PGO instrumentation..."
+  local pgo_instr_cflags="$CFLAGS -fprofile-generate=${srcdir}/pgo_raw"
+  local pgo_instr_ldflags="$LDFLAGS -fprofile-generate=${srcdir}/pgo_raw"
+
+  arch-meson "$pkgbase" build-pgo1 \
+    "${meson_options_base[@]}" \
+    -Dc_args="$pgo_instr_cflags" \
+    -Dcpp_args="$pgo_instr_cflags" \
+    -Dc_link_args="$pgo_instr_ldflags" \
+    -Dcpp_link_args="$pgo_instr_ldflags" \
+    -Db_pie=false \
+    -Db_ndebug=false
+
   meson compile -C build-pgo1
 
   echo "--> Stage 1.2: Running test suite to generate standard PGO profile..."
@@ -113,29 +109,18 @@ EOF
 
   # --- Stage 2: Context-Sensitive PGO Instrumentation & Profiling ---
   echo "--> Stage 2.1: Building with CS-PGO instrumentation..."
-  local cs_pgo_instr_flags="-fprofile-use=${srcdir}/standard.profdata -fcs-profile-generate=${srcdir}/pgo_cs"
-  cflags_array=$(format_meson_flags $CFLAGS $cs_pgo_instr_flags)
-  cxxflags_array=$(format_meson_flags $CXXFLAGS $cs_pgo_instr_flags)
-  ldflags_array=$(format_meson_flags $LDFLAGS $cs_pgo_instr_flags)
+  local cs_pgo_instr_cflags="$CFLAGS -fprofile-use=${srcdir}/standard.profdata -fcs-profile-generate=${srcdir}/pgo_cs"
+  local cs_pgo_instr_ldflags="$LDFLAGS -fprofile-use=${srcdir}/standard.profdata -fcs-profile-generate=${srcdir}/pgo_cs"
 
-  cat > meson-native-flags.ini <<EOF
-[built-in options]
-c_args = $cflags_array
-cpp_args = $cxxflags_array
-c_link_args = $ldflags_array
-cpp_link_args = $ldflags_array
-b_pie = 'false'
-b_ndebug = 'false'
+  arch-meson "$pkgbase" build-pgo2 \
+    "${meson_options_base[@]}" \
+    -Dc_args="$cs_pgo_instr_cflags" \
+    -Dcpp_args="$cs_pgo_instr_cflags" \
+    -Dc_link_args="$cs_pgo_instr_ldflags" \
+    -Dcpp_link_args="$cs_pgo_instr_ldflags" \
+    -Db_pie=false \
+    -Db_ndebug=false
 
-[binaries]
-c = 'clang'
-cpp = 'clang++'
-ar = 'llvm-ar'
-nm = 'llvm-nm'
-ranlib = 'llvm-ranlib'
-EOF
-
-  arch-meson "$pkgbase" build-pgo2 "${meson_options[@]}"
   meson compile -C build-pgo2
 
   echo "--> Stage 2.2: Running test suite to generate CS-PGO profile..."
@@ -149,29 +134,27 @@ EOF
     cp "${srcdir}/standard.profdata" "${srcdir}/merged.profdata"
   fi
 
+  echo "--> Stage 2.3: Verifying PGO profile quality..."
+  local coverage; coverage=$(llvm-profdata show --detailed-summary "${srcdir}/merged.profdata" | grep "Instructions" | awk '{print $4}' | sed 's/%//')
+  if (($(echo "$coverage < 70.0" | bc -l))); then
+      echo "Error: Final PGO instruction coverage is ${coverage}%, which is below the 70% quality gate." >&2; exit 1
+  fi
+  echo "--> Final PGO coverage is ${coverage}%. Quality gate passed."
+
   # --- Stage 3: Final PGO-Optimized Build ---
   echo "--> Stage 3: Building final version with merged PGO optimizations..."
-  local cflags_pgo_use_array=$(format_meson_flags $CFLAGS "-fprofile-use=${srcdir}/merged.profdata")
-  local cxxflags_pgo_use_array=$(format_meson_flags $CXXFLAGS "-fprofile-use=${srcdir}/merged.profdata")
-  local ldflags_pgo_use_array=$(format_meson_flags $LDFLAGS "-fprofile-use=${srcdir}/merged.profdata" "-Wl,--emit-relocs")
+  local pgo_use_cflags="$CFLAGS -fprofile-use=${srcdir}/merged.profdata"
+  local pgo_use_ldflags="$LDFLAGS -fprofile-use=${srcdir}/merged.profdata -Wl,--emit-relocs"
 
-  cat > meson-native-flags.ini <<EOF
-[built-in options]
-c_args = $cflags_pgo_use_array
-cpp_args = $cxxflags_pgo_use_array
-c_link_args = $ldflags_pgo_use_array
-cpp_link_args = $ldflags_pgo_use_array
-b_pie = 'false'
-b_ndebug = 'true'
+  arch-meson "$pkgbase" build-final \
+    "${meson_options_base[@]}" \
+    -Dc_args="$pgo_use_cflags" \
+    -Dcpp_args="$pgo_use_cflags" \
+    -Dc_link_args="$pgo_use_ldflags" \
+    -Dcpp_link_args="$pgo_use_ldflags" \
+    -Db_pie=false \
+    -Db_ndebug=true
 
-[binaries]
-c = 'clang'
-cpp = 'clang++'
-ar = 'llvm-ar'
-nm = 'llvm-nm'
-ranlib = 'llvm-ranlib'
-EOF
-  arch-meson "$pkgbase" build-final "${meson_options[@]}"
   meson compile -C build-final
 
   # --- Stage 4: BOLT Instrumentation & Profiling ---
@@ -179,20 +162,20 @@ EOF
 
   echo "--> Stage 4.1: Instrumenting PGO-optimized binaries for BOLT..."
   for bin_path in "${binaries_to_bolt[@]}"; do
-      if [ -f "$bin_path" ]; then
-        cp "$bin_path" "${bin_path}.pgo"
-        llvm-bolt "${bin_path}.pgo" -instrument -o "$bin_path" --instrumentation-file="${srcdir}/bolt_profiles/prof.fdata" --instrumentation-file-append-pid
-      fi
+    if [ -f "$bin_path" ]; then
+      cp "$bin_path" "${bin_path}.pgo"
+      llvm-bolt "${bin_path}.pgo" -instrument -o "$bin_path" --instrumentation-file="${srcdir}/bolt_profiles/prof.fdata" --instrumentation-file-append-pid
+    fi
   done
 
   echo "--> Stage 4.2: Running test suite on instrumented binaries to generate BOLT profile..."
   DBUS_BROKER_TEST_BROKER="${srcdir}/build-final/src/dbus-broker" meson test -C build-final --verbose || echo "Warning: Some tests may have failed during BOLT profile generation. This is often non-fatal."
 
-  echo "--> Stage 4.3: Restoring original PGO-optimized binaries..."
+  echo "--> Stage 4.3: Restoring original PGO-optimized binaries before applying BOLT..."
   for bin_path in "${binaries_to_bolt[@]}"; do
-      if [ -f "${bin_path}.pgo" ]; then
-        mv "${bin_path}.pgo" "$bin_path"
-      fi
+    if [ -f "${bin_path}.pgo" ]; then
+      mv "${bin_path}.pgo" "$bin_path"
+    fi
   done
 
   if ! ls "${srcdir}/bolt_profiles"/prof.fdata* 1> /dev/null 2>&1; then
@@ -212,16 +195,21 @@ EOF
     "--split-eh" "--split-functions" "--use-gnu-stack" "--update-debug-sections"
   )
   for bin_name in dbus-broker dbus-broker-launch; do
-      local bin_path="${srcdir}/build-final/src/${bin_name}"
-      if [ -f "$bin_path" ]; then
-        echo "--> BOLT optimizing ${bin_name}"
-        if llvm-bolt "$bin_path" "${bolt_options[@]}" -o "${srcdir}/bolt_opt/${bin_name}" 2>&1 | tee "${srcdir}/bolt_${bin_name}.log"; then
+    local bin_path="${srcdir}/build-final/src/${bin_name}"
+    if [ -f "$bin_path" ]; then
+      echo "--> BOLT optimizing ${bin_name}"
+      if llvm-bolt "$bin_path" "${bolt_options[@]}" -o "${srcdir}/bolt_opt/${bin_name}" 2>&1 | tee "${srcdir}/bolt_${bin_name}.log"; then
+        if [ ${PIPESTATUS[0]} -eq 0 ]; then
           echo "--> ✓ BOLT SUCCESS: ${bin_name}"
         else
           echo "--> ✗ BOLT FAILED: ${bin_name}. Using PGO-optimized binary as fallback."
           cp "$bin_path" "${srcdir}/bolt_opt/${bin_name}"
         fi
+      else
+        echo "--> ✗ BOLT FAILED: ${bin_name}. Using PGO-optimized binary as fallback."
+        cp "$bin_path" "${srcdir}/bolt_opt/${bin_name}"
       fi
+    fi
   done
 
   cp -r "$srcdir/build-final" "$srcdir/build"
@@ -245,11 +233,12 @@ package_dbus-broker-git() {
   meson install -C build --destdir "$pkgdir" --no-rebuild
 
   for bin_name in dbus-broker dbus-broker-launch; do
-    if [ -f "${srcdir}/bolt_opt/${bin_name}" ]; then
+    local bolt_bin_path="${srcdir}/bolt_opt/${bin_name}"
+    if [ -f "$bolt_bin_path" ] && [ "$(stat -c%s "$bolt_bin_path")" -gt 10000 ]; then
       echo "--> Installing BOLT-optimized ${bin_name}"
-      install -Dm755 "${srcdir}/bolt_opt/${bin_name}" "$pkgdir/usr/bin/${bin_name}"
+      install -Dm755 "$bolt_bin_path" "$pkgdir/usr/bin/${bin_name}"
     else
-      echo "--> Using PGO-optimized ${bin_name}"
+      echo "--> BOLT optimization failed or produced an invalid binary for ${bin_name}. Using PGO-optimized version."
     fi
   done
   find "$pkgdir/usr/bin/" -type f -exec llvm-strip --strip-unneeded {} +
