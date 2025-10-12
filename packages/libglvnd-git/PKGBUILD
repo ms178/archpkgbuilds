@@ -1,15 +1,23 @@
-# Maintainer: Rafał Kozdrój <kozeid2@gmail.com>
-# Contributor: Felix Yan <felixonmars@archlinux.org>
-
 _pkgname=libglvnd
 pkgname=$_pkgname-git
-pkgver=1.5.0.r3.g1d270ce
+pkgver=1.7.0.12.g606f662
 pkgrel=1
-pkgdesc="The GL Vendor-Neutral Dispatch library"
+pkgdesc="The GL Vendor-Neutral Dispatch library (CS-PGO optimized)"
 arch=('x86_64')
 url="https://github.com/NVIDIA/libglvnd"
 license=('custom:BSD-like')
-makedepends=('libxext' 'libx11' 'xorgproto' 'python' 'meson' 'git')
+makedepends=(
+  'libxext'
+  'libx11'
+  'xorgproto'
+  'python'
+  'meson'
+  'git'
+  'clang'
+  'llvm'
+  'mesa-demos'  # for glxgears, glxinfo
+  'glmark2'     # for GL benchmarking
+)
 provides=('libgl' 'libegl' 'libgles' "$_pkgname=$pkgver")
 conflicts=("$_pkgname")
 source=("git+https://gitlab.freedesktop.org/glvnd/libglvnd.git"
@@ -19,28 +27,372 @@ sha512sums=('SKIP'
 
 pkgver() {
   cd $_pkgname
-  git describe --long --tags | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
+  git describe --long --tags | sed 's/^v//;s/-/./g'
+}
+
+# FAST and FOCUSED GL training using real GPU (Vega 64)
+_run_gl_training_workload() {
+  local build_dir="$1"
+  local workload_name="$2"
+
+  echo "==> Running FAST GL training on real hardware: $workload_name"
+
+  # Use our instrumented libraries
+  export LD_LIBRARY_PATH="${build_dir}/src/GLX:${build_dir}/src/EGL:${build_dir}/src/OpenGL:${build_dir}/src/GLdispatch:${build_dir}/src/GLESv1:${build_dir}/src/GLESv2:${LD_LIBRARY_PATH}"
+
+  # Force AMD GPU usage (not llvmpipe)
+  export GALLIUM_DRIVER=radeonsi
+  export MESA_LOADER_DRIVER_OVERRIDE=radeonsi
+
+  # Use real X display
+  if [ -z "$DISPLAY" ]; then
+    export DISPLAY=:0
+  fi
+
+  # Verify we're using hardware rendering
+  echo "  --> GPU: $(glxinfo 2>/dev/null | grep 'OpenGL renderer' | cut -d: -f2 | xargs)"
+
+  # Phase 1: GLX queries (dispatch-heavy, ~10 seconds)
+  echo "  --> Phase 1: GLX queries (10x glxinfo)..."
+  for i in {1..10}; do
+    timeout 3 glxinfo >/dev/null 2>&1 || true
+  done
+
+  # Phase 2: glmark2 quick test (~25 seconds)
+  echo "  --> Phase 2: glmark2 rendering stress..."
+  if command -v glmark2 &>/dev/null; then
+    # Run multiple scenarios in sequence
+    timeout 10 glmark2 --benchmark build --size 800x600 --run-forever 2>/dev/null || true
+    timeout 10 glmark2 --benchmark texture --size 800x600 --run-forever 2>/dev/null || true
+    timeout 10 glmark2 --benchmark shading --size 800x600 --run-forever 2>/dev/null || true
+  fi
+
+  # Phase 3: Custom GL dispatch test (~40 seconds)
+  echo "  --> Phase 3: Custom GL dispatch stress..."
+
+  cat > "${srcdir}/gl_fast_${workload_name}.c" <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <GL/gl.h>
+#include <GL/glx.h>
+#include <GL/glext.h>
+#include <X11/Xlib.h>
+
+void stress_dispatch(int iters) {
+    for (int i = 0; i < iters; i++) {
+        // Critical dispatch paths: string queries
+        glGetString(GL_VENDOR);
+        glGetString(GL_RENDERER);
+        glGetString(GL_VERSION);
+        glGetString(GL_EXTENSIONS);
+
+        // Integer queries
+        GLint params[8];
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &params[0]);
+        glGetIntegerv(GL_MAX_LIGHTS, &params[1]);
+        glGetIntegerv(GL_VIEWPORT, &params[2]);
+        glGetIntegerv(GL_MAX_TEXTURE_UNITS, &params[3]);
+
+        // Boolean queries
+        GLboolean bools[4];
+        glGetBooleanv(GL_DEPTH_TEST, &bools[0]);
+        glGetBooleanv(GL_BLEND, &bools[1]);
+
+        // State changes (heavy dispatch)
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        // Rendering
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        glBegin(GL_TRIANGLES);
+        glColor3f(1.0f, 0.0f, 0.0f);
+        glVertex3f(0.0f, 1.0f, 0.0f);
+        glColor3f(0.0f, 1.0f, 0.0f);
+        glVertex3f(-1.0f, -1.0f, 0.0f);
+        glColor3f(0.0f, 0.0f, 1.0f);
+        glVertex3f(1.0f, -1.0f, 0.0f);
+        glEnd();
+
+        // Matrix operations
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+        glRotatef((float)(i % 360), 0.0f, 0.0f, 1.0f);
+
+        // Texture operations
+        GLuint tex;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glDeleteTextures(1, &tex);
+
+        glFlush();
+        if (i % 200 == 0) glFinish();
+
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_BLEND);
+    }
+}
+
+int main() {
+    Display *dpy = XOpenDisplay(NULL);
+    if (!dpy) return 1;
+
+    int screen = DefaultScreen(dpy);
+    int attribs[] = { GLX_RGBA, GLX_DEPTH_SIZE, 24, GLX_DOUBLEBUFFER, None };
+
+    XVisualInfo *vi = glXChooseVisual(dpy, screen, attribs);
+    if (!vi) { XCloseDisplay(dpy); return 1; }
+
+    GLXContext ctx = glXCreateContext(dpy, vi, NULL, GL_TRUE);
+    if (!ctx) { XFree(vi); XCloseDisplay(dpy); return 1; }
+
+    Window root = RootWindow(dpy, screen);
+    Colormap cmap = XCreateColormap(dpy, root, vi->visual, AllocNone);
+
+    XSetWindowAttributes swa;
+    swa.colormap = cmap;
+    swa.event_mask = 0;
+
+    Window win = XCreateWindow(dpy, root, 0, 0, 640, 480, 0,
+                               vi->depth, InputOutput, vi->visual,
+                               CWColormap | CWEventMask, &swa);
+
+    XMapWindow(dpy, win);
+
+    if (!glXMakeCurrent(dpy, win, ctx)) {
+        glXDestroyContext(dpy, ctx);
+        XDestroyWindow(dpy, win);
+        XFreeColormap(dpy, cmap);
+        XFree(vi);
+        XCloseDisplay(dpy);
+        return 1;
+    }
+
+    // 1500 iterations of dispatch-heavy operations
+    stress_dispatch(1500);
+
+    // Extension queries (critical for libglvnd)
+    for (int i = 0; i < 100; i++) {
+        glXQueryExtensionsString(dpy, screen);
+        glXGetClientString(dpy, GLX_VENDOR);
+        glXGetClientString(dpy, GLX_VERSION);
+    }
+
+    glXMakeCurrent(dpy, None, NULL);
+    glXDestroyContext(dpy, ctx);
+    XDestroyWindow(dpy, win);
+    XFreeColormap(dpy, cmap);
+    XFree(vi);
+    XCloseDisplay(dpy);
+
+    return 0;
+}
+EOF
+
+  if gcc -o "${srcdir}/gl_fast_${workload_name}" \
+     "${srcdir}/gl_fast_${workload_name}.c" \
+     -lGL -lX11 \
+     -L"${build_dir}/src/GLX" \
+     -L"${build_dir}/src/OpenGL" \
+     -L"${build_dir}/src/GLdispatch" \
+     -Wl,-rpath,"${build_dir}/src/GLX:${build_dir}/src/OpenGL:${build_dir}/src/GLdispatch" \
+     2>/dev/null; then
+
+    echo "     Running 10 iterations..."
+    for i in {1..10}; do
+      timeout 5 "${srcdir}/gl_fast_${workload_name}" >/dev/null 2>&1 || true
+    done
+  else
+    echo "     Custom test compilation failed, skipping"
+  fi
+
+  # Phase 4: glxgears quick test (~15 seconds)
+  echo "  --> Phase 4: GLX rendering (5x glxgears)..."
+  if command -v glxgears &>/dev/null; then
+    for i in {1..5}; do
+      timeout 3 glxgears >/dev/null 2>&1 || true
+    done
+  fi
+
+  local profile_count=$(find "${srcdir}" -name "*.profraw" -type f 2>/dev/null | wc -l)
+  echo "  --> Complete! Generated $profile_count profile files"
 }
 
 build() {
-  arch-meson $_pkgname build \
-      -D b_ndebug=true \
-      -D b_pie=false \
-      -D asm=enabled \
-      -D c_std=gnu2x \
-      -D cpp_std=gnu++2a \
-      --buildtype=release \
-      --wrap-mode=nofallback \
-      -D gles1=false
+  export CC=clang
+  export CXX=clang++
+  export AR=llvm-ar
+  export NM=llvm-nm
+  export RANLIB=llvm-ranlib
 
-  ninja -C build
+  format_meson_flags() {
+    local flags_str=""
+    for flag in "$@"; do
+      flag_escaped="${flag//\'/\'\\\'\'}"
+      flags_str+="'$flag_escaped', "
+    done
+    echo "[${flags_str%, }]"
+  }
+
+  local meson_options=(
+    -D asm=enabled
+    -D c_std=gnu2x
+    -D cpp_std=gnu++2a
+    -D gles1=false
+    --buildtype=plain
+    --wrap-mode=nofallback
+    --native-file=meson-native-flags.ini
+  )
+
+  mkdir -p "$srcdir"/{pgo_raw,pgo_cs}
+
+  local pgo_instr_flags="-fno-omit-frame-pointer -mllvm -vp-counters-per-site=128 -mllvm -enable-value-profiling"
+
+  # === Stage 1: Standard PGO ===
+  echo "==> Stage 1.1: Building with standard PGO instrumentation..."
+
+  local cflags_array=$(format_meson_flags $CFLAGS "-fprofile-generate=${srcdir}/pgo_raw" $pgo_instr_flags)
+  local cxxflags_array=$(format_meson_flags $CXXFLAGS "-fprofile-generate=${srcdir}/pgo_raw" $pgo_instr_flags)
+  local ldflags_array=$(format_meson_flags $LDFLAGS "-fprofile-generate=${srcdir}/pgo_raw" "-fuse-ld=lld")
+
+  cat > meson-native-flags.ini <<EOF
+[built-in options]
+c_args = $cflags_array
+cpp_args = $cxxflags_array
+c_link_args = $ldflags_array
+cpp_link_args = $ldflags_array
+b_pie = 'false'
+b_ndebug = 'false'
+
+[binaries]
+c = 'clang'
+cpp = 'clang++'
+ar = 'llvm-ar'
+nm = 'llvm-nm'
+ranlib = 'llvm-ranlib'
+EOF
+
+  arch-meson $_pkgname build-pgo1 "${meson_options[@]}"
+  meson compile -C build-pgo1
+
+  echo "==> Stage 1.2: Running training for standard PGO..."
+  export LLVM_PROFILE_FILE="${srcdir}/pgo_raw/glvnd-%p-%m.profraw"
+
+  _run_gl_training_workload "${srcdir}/build-pgo1" "standard"
+
+  local raw_count=$(find "${srcdir}/pgo_raw" -name "*.profraw" 2>/dev/null | wc -l)
+  if [ "$raw_count" -eq 0 ]; then
+    echo "WARNING: No PGO profiles generated, building without PGO" >&2
+
+    cat > meson-native-flags.ini <<EOF
+[built-in options]
+b_pie = 'false'
+b_ndebug = 'true'
+
+[binaries]
+c = 'clang'
+cpp = 'clang++'
+ar = 'llvm-ar'
+nm = 'llvm-nm'
+ranlib = 'llvm-ranlib'
+EOF
+
+    arch-meson $_pkgname build "${meson_options[@]}"
+    meson compile -C build
+    return 0
+  fi
+
+  echo "==> Merging $raw_count standard PGO profiles..."
+  llvm-profdata merge -output="${srcdir}/standard.profdata" "${srcdir}/pgo_raw"/*.profraw
+
+  echo "==> Standard PGO profile statistics:"
+  llvm-profdata show --detailed-summary "${srcdir}/standard.profdata" 2>&1 | head -15
+
+  # === Stage 2: Context-Sensitive PGO ===
+  echo "==> Stage 2.1: Building with CS-PGO instrumentation..."
+
+  local cs_pgo_flags="-fprofile-use=${srcdir}/standard.profdata -fcs-profile-generate=${srcdir}/pgo_cs"
+  cflags_array=$(format_meson_flags $CFLAGS $cs_pgo_flags $pgo_instr_flags)
+  cxxflags_array=$(format_meson_flags $CXXFLAGS $cs_pgo_flags $pgo_instr_flags)
+  ldflags_array=$(format_meson_flags $LDFLAGS $cs_pgo_flags "-fuse-ld=lld")
+
+  cat > meson-native-flags.ini <<EOF
+[built-in options]
+c_args = $cflags_array
+cpp_args = $cxxflags_array
+c_link_args = $ldflags_array
+cpp_link_args = $ldflags_array
+b_pie = 'false'
+b_ndebug = 'false'
+
+[binaries]
+c = 'clang'
+cpp = 'clang++'
+ar = 'llvm-ar'
+nm = 'llvm-nm'
+ranlib = 'llvm-ranlib'
+EOF
+
+  arch-meson $_pkgname build-pgo2 "${meson_options[@]}"
+  meson compile -C build-pgo2
+
+  echo "==> Stage 2.2: Running training for CS-PGO..."
+  export LLVM_PROFILE_FILE="${srcdir}/pgo_cs/glvnd-%p-%m.cs.profraw"
+
+  _run_gl_training_workload "${srcdir}/build-pgo2" "cs"
+
+  local cs_count=$(find "${srcdir}/pgo_cs" -name "*.profraw" 2>/dev/null | wc -l)
+  if [ "$cs_count" -gt 0 ]; then
+    echo "==> Merging CS-PGO with standard PGO..."
+    llvm-profdata merge -output="${srcdir}/merged.profdata" \
+      "${srcdir}/pgo_cs"/*.profraw \
+      "${srcdir}/standard.profdata"
+  else
+    echo "==> No CS profiles, using standard PGO"
+    cp "${srcdir}/standard.profdata" "${srcdir}/merged.profdata"
+  fi
+
+  echo "==> Merged PGO profile statistics:"
+  llvm-profdata show --detailed-summary "${srcdir}/merged.profdata" 2>&1 | head -10
+
+  # === Stage 3: Final PGO-Optimized Build ===
+  echo "==> Stage 3: Building final PGO-optimized version..."
+
+  local cflags_pgo_use=$(format_meson_flags $CFLAGS "-fprofile-use=${srcdir}/merged.profdata" "-fprofile-sample-accurate")
+  local cxxflags_pgo_use=$(format_meson_flags $CXXFLAGS "-fprofile-use=${srcdir}/merged.profdata" "-fprofile-sample-accurate")
+  local ldflags_pgo_use=$(format_meson_flags $LDFLAGS "-fprofile-use=${srcdir}/merged.profdata" "-fuse-ld=lld")
+
+  cat > meson-native-flags.ini <<EOF
+[built-in options]
+c_args = $cflags_pgo_use
+cpp_args = $cxxflags_pgo_use
+c_link_args = $ldflags_pgo_use
+cpp_link_args = $ldflags_pgo_use
+b_pie = 'false'
+b_ndebug = 'true'
+
+[binaries]
+c = 'clang'
+cpp = 'clang++'
+ar = 'llvm-ar'
+nm = 'llvm-nm'
+ranlib = 'llvm-ranlib'
+EOF
+
+  arch-meson $_pkgname build "${meson_options[@]}"
+  meson compile -C build
+
+  echo "==> Build complete: CS-PGO optimized libglvnd"
 }
 
 package() {
-  # libglvnd needs mesa for indirect rendering
   depends=('libxext' 'mesa' 'opengl-driver')
 
-  DESTDIR="$pkgdir" ninja -C build install
-  
+  DESTDIR="$pkgdir" meson install -C build --no-rebuild
+
   install -Dm644 LICENSE "$pkgdir"/usr/share/licenses/$pkgname/LICENSE
 }
