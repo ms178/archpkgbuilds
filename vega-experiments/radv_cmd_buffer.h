@@ -414,7 +414,7 @@ struct radv_descriptor_state {
    struct radv_push_descriptor_set push_set;
    uint32_t dynamic_buffers[4 * MAX_DYNAMIC_BUFFERS];
    uint64_t descriptor_buffers[MAX_SETS];
-   bool need_indirect_descriptor_sets;
+   bool need_indirect_descriptors;
    uint64_t indirect_descriptor_sets_va;
 };
 
@@ -607,7 +607,7 @@ struct gfx12_reg {
 };
 
 struct radv_cmd_stream {
-   struct radeon_cmdbuf *b;
+   struct ac_cmdbuf *b;
 
    bool context_roll_without_scissor_emitted;
 
@@ -949,9 +949,6 @@ void radv_begin_conditional_rendering(struct radv_cmd_buffer *cmd_buffer, uint64
                                       bool draw_visible);
 
 void radv_end_conditional_rendering(struct radv_cmd_buffer *cmd_buffer);
-
-uint64_t radv_descriptor_get_va(const struct radv_descriptor_state *descriptors_state,
-                                unsigned set_idx);
 
 struct radv_vbo_info {
    uint64_t va;
