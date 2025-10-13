@@ -120,5 +120,5 @@ export _hugepage _HZ_ticks _ticktype _preempt _processor_opt
 export _buildtype _build_debug _include_bore
 
 # Build kernel lazy and lazy-headers packages
-time nice -n 15 makepkg -scf --cleanbuild --skipinteg || exit 1
+time nice -n 15 ionice -n 1 makepkg -scf --cleanbuild --skipinteg || exit 1
 
