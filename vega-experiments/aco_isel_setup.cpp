@@ -518,9 +518,6 @@ init_context(isel_context* ctx, nir_shader* shader)
       shader->options->divergence_analysis_options | nir_divergence_ignore_undef_if_phi_srcs;
    nir_divergence_analysis_impl(impl, static_cast<nir_divergence_options>(options));
 
-   /* Flag SMEM loads before NUW analysis (which checks ACCESS_SMEM_AMD). */
-   ac_nir_flag_smem_for_loads(shader, ctx->program->gfx_level, false, true);
-
    /* OPTIMIZATION #1: Fused pass to apply NUW to offsets + count calls.
     * This eliminates one full shader traversal, saving ~8-12% compile time.
     */
