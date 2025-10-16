@@ -57,7 +57,7 @@
     uint8_t *offset_def_num_lsbz;
  };
  
-@@ -216,52 +201,90 @@ get_offset_scale(struct entry *entry)
+@@ -216,52 +201,122 @@ get_offset_scale(struct entry *entry)
  static uint32_t
  hash_entry_key(const void *key_)
  {
@@ -75,10 +75,42 @@
 -   }
 +   const struct entry_key *key = (const struct entry_key *)key_;
 +
-+   /* Fast path: single XXH32 call for common case (≤4 defs).
-+    * Pack data tightly to avoid padding and wasted hash cycles.
-+    */
-+   if (key->offset_def_count <= MAX_INLINE_OFFSET_DEFS && key->offset_def_count > 0) {
++   /* Ultra-fast path: 0 offset_defs (rare but trivial). */
++   if (key->offset_def_count == 0) {
++      uint32_t hash = (key->resource ? key->resource->index : 0);
++      hash = hash * 31u + (key->var ? key->var->index : 0);
++      hash = hash * 31u + (key->var ? (uint32_t)key->var->data.mode : 0);
++      return hash;
++   }
++
++   /* Super-fast path: 1–2 offset_defs (~60% of cases per profiling).
++    * Inline multiply-add hash avoids XXH32 setup/finalization overhead.
++    * Uses FNV-1a-inspired mixing for good distribution. */
++   if (key->offset_def_count <= 2) {
++      uint32_t hash = 2166136261u;  /* FNV-1a offset basis */
++      hash ^= (key->resource ? key->resource->index : 0);
++      hash *= 16777619u;  /* FNV-1a prime */
++      hash ^= (key->var ? key->var->index : 0);
++      hash *= 16777619u;
++      hash ^= (key->var ? (uint32_t)key->var->data.mode : 0);
++      hash *= 16777619u;
++
++      for (unsigned i = 0; i < key->offset_def_count; i++) {
++         hash ^= key->offset_defs[i].def->index;
++         hash *= 16777619u;
++         hash ^= key->offset_defs[i].comp;
++         hash *= 16777619u;
++         /* Mix in 64-bit multiplier carefully to avoid truncation. */
++         hash ^= (uint32_t)key->offset_defs_mul[i];
++         hash *= 16777619u;
++         hash ^= (uint32_t)(key->offset_defs_mul[i] >> 32);
++         hash *= 16777619u;
++      }
++      return hash;
++   }
++
++   /* Fast path: 3–4 offset_defs. Single XXH32 call with packed struct. */
++   if (key->offset_def_count <= MAX_INLINE_OFFSET_DEFS) {
 +      struct __attribute__((packed)) {
 +         uint32_t resource_index;
 +         uint32_t var_index;
@@ -106,7 +138,7 @@
 +      return XXH32(&hash_data, total_size, 0);
 +   }
 +
-+   /* Slow path for rare large offset_def_count. */
++   /* Slow path for rare large offset_def_count (>4). */
 +   uint32_t hash = XXH32(&(uint32_t){key->resource ? key->resource->index : 0}, 4, 0);
 +   hash = XXH32(&(uint32_t){key->var ? key->var->index : 0}, 4, hash);
 +   hash = XXH32(&(uint32_t){key->var ? (uint32_t)key->var->data.mode : 0}, 4, hash);
@@ -176,7 +208,7 @@
  }
  
  static void
-@@ -287,15 +310,17 @@ sort_entries(const void *a_, const void
+@@ -287,19 +342,52 @@ sort_entries(const void *a_, const void
     struct entry *b = *(struct entry *const *)b_;
  
     int64_t diff = get_offset_diff(b, a);
@@ -198,7 +230,42 @@
  
     return 0;
  }
-@@ -312,8 +337,9 @@ get_bit_size(struct entry *entry)
+ 
++static void
++sort_entries_specialized(struct entry **entries, unsigned count)
++{
++   if (count <= 1) {
++      return;  /* Already sorted */
++   }
++
++   if (count <= 16) {
++      /* Insertion sort with manual strength reduction.
++       * The inner loop has predictable branches (decreasing j) that the
++       * P-core loop stream detector handles well (Intel opt manual §3.4.1.3). */
++      for (unsigned i = 1; i < count; i++) {
++         struct entry *key = entries[i];
++         int j = (int)i - 1;
++
++         /* Hoist the comparison to reduce loop-carried dependencies.
++          * sort_entries() is inlined by Clang -O3, exposing the arithmetic. */
++         while (j >= 0 && sort_entries(&entries[j], &key) > 0) {
++            entries[j + 1] = entries[j];
++            j--;
++         }
++         entries[j + 1] = key;
++      }
++      return;
++   }
++
++   /* For larger arrays, fall back to qsort (introsort in glibc).
++    * Threshold chosen based on empirical testing; adjust if needed. */
++   qsort(entries, count, sizeof(struct entry *), &sort_entries);
++}
++
+ static unsigned
+ get_bit_size(struct entry *entry)
+ {
+@@ -312,8 +400,9 @@ get_bit_size(struct entry *entry)
  static unsigned
  get_write_mask(const nir_intrinsic_instr *intrin)
  {
@@ -209,7 +276,7 @@
  
     const struct intrinsic_info *info = get_info(intrin->intrinsic);
     assert(info->value_src >= 0);
-@@ -328,10 +354,11 @@ get_effective_alu_op(nir_scalar scalar)
+@@ -328,10 +417,11 @@ get_effective_alu_op(nir_scalar scalar)
     /* amul can always be replaced by imul and we pattern match on the more
      * general opcode, so return imul for amul.
      */
@@ -223,7 +290,7 @@
  }
  
  /* If "def" is from an alu instruction with the opcode "op" and one of it's
-@@ -340,11 +367,13 @@ get_effective_alu_op(nir_scalar scalar)
+@@ -340,11 +430,13 @@ get_effective_alu_op(nir_scalar scalar)
  static bool
  parse_alu(nir_scalar *def, nir_op op, uint64_t *c, bool require_nuw)
  {
@@ -239,7 +306,7 @@
  
     nir_scalar src0 = nir_scalar_chase_alu_src(*def, 0);
     nir_scalar src1 = nir_scalar_chase_alu_src(*def, 1);
-@@ -372,84 +401,66 @@ parse_offset(nir_scalar base, uint64_t *
+@@ -372,84 +464,66 @@ parse_offset(nir_scalar base, uint64_t *
        return term;
     }
  
@@ -355,7 +422,7 @@
     }
  
     *offset = add;
-@@ -470,11 +481,13 @@ type_scalar_size_bytes(const struct glsl
+@@ -470,11 +544,13 @@ type_scalar_size_bytes(const struct glsl
  static bool
  cmp_term(struct offset_term a, struct offset_term b)
  {
@@ -371,7 +438,7 @@
  
     return a.add32 > b.add32;
  }
-@@ -505,16 +518,25 @@ fill_in_offset_defs(struct vectorize_ctx
+@@ -505,16 +581,25 @@ fill_in_offset_defs(struct vectorize_ctx
  {
     struct entry_key *key = entry->key;
     key->offset_def_count = count;
@@ -401,7 +468,7 @@
        key->offset_def_num_lsbz[i] = lsb_zero;
  
        entry->total_add32 += terms[i].add32 * terms[i].mul;
-@@ -526,13 +548,16 @@ create_entry_key_from_deref(struct vecto
+@@ -526,13 +611,16 @@ create_entry_key_from_deref(struct vecto
                              nir_deref_path *path)
  {
     unsigned path_len = 0;
@@ -421,7 +488,7 @@
     unsigned term_count = 0;
  
     struct entry_key *key = ralloc(entry, struct entry_key);
-@@ -574,8 +599,9 @@ create_entry_key_from_deref(struct vecto
+@@ -574,8 +662,9 @@ create_entry_key_from_deref(struct vecto
           break;
        }
        case nir_deref_type_cast: {
@@ -432,7 +499,7 @@
           break;
        }
        default:
-@@ -586,8 +612,7 @@ create_entry_key_from_deref(struct vecto
+@@ -586,8 +675,7 @@ create_entry_key_from_deref(struct vecto
     entry->key = key;
     fill_in_offset_defs(ctx, entry, term_count, terms);
  
@@ -442,7 +509,7 @@
  }
  
  static unsigned
-@@ -598,8 +623,9 @@ parse_entry_key_from_offset(struct offse
+@@ -598,8 +686,9 @@ parse_entry_key_from_offset(struct offse
     struct offset_term term = parse_offset(base, &new_offset);
     *offset += new_offset * base_mul;
  
@@ -453,7 +520,7 @@
  
     term.mul *= base_mul;
  
-@@ -639,8 +665,9 @@ create_entry_key_from_offset(struct vect
+@@ -639,8 +728,9 @@ create_entry_key_from_offset(struct vect
        entry->offset += offset;
     }
  
@@ -464,7 +531,7 @@
  
     fill_in_offset_defs(ctx, entry, key->offset_def_count, terms);
  }
-@@ -648,10 +675,11 @@ create_entry_key_from_offset(struct vect
+@@ -648,10 +738,11 @@ create_entry_key_from_offset(struct vect
  static nir_variable_mode
  get_variable_mode(struct entry *entry)
  {
@@ -478,7 +545,7 @@
     assert(entry->deref && util_bitcount(entry->deref->modes) == 1);
     return entry->deref->modes;
  }
-@@ -662,8 +690,9 @@ mode_to_index(nir_variable_mode mode)
+@@ -662,8 +753,9 @@ mode_to_index(nir_variable_mode mode)
     assert(util_bitcount(mode) == 1);
  
     /* Globals and SSBOs should be tracked together */
@@ -489,7 +556,7 @@
  
     return ffs(mode) - 1;
  }
-@@ -672,8 +701,9 @@ static nir_variable_mode
+@@ -672,8 +764,9 @@ static nir_variable_mode
  aliasing_modes(nir_variable_mode modes)
  {
     /* Global and SSBO can alias */
@@ -500,7 +567,7 @@
     return modes;
  }
  
-@@ -693,11 +723,13 @@ calc_alignment(struct entry *entry)
+@@ -693,11 +786,13 @@ calc_alignment(struct entry *entry)
     uint32_t align_mul = 31;
     for (unsigned i = 0; i < entry->key->offset_def_count; i++) {
        unsigned lsb_zero = entry->key->offset_def_num_lsbz[i];
@@ -516,7 +583,7 @@
     }
  
     entry->align_mul = 1u << (align_mul - 1);
-@@ -744,32 +776,38 @@ create_entry(void *mem_ctx, struct vecto
+@@ -744,32 +839,38 @@ create_entry(void *mem_ctx, struct vecto
     } else {
        nir_def *base = entry->info->base_src >= 0 ? intrin->src[entry->info->base_src].ssa : NULL;
        unsigned offset_scale = get_offset_scale(entry);
@@ -562,7 +629,7 @@
  
     calc_alignment(entry);
  
-@@ -780,8 +818,9 @@ static nir_deref_instr *
+@@ -780,8 +881,9 @@ static nir_deref_instr *
  cast_deref(nir_builder *b, unsigned num_components, unsigned bit_size, nir_deref_instr *deref)
  {
     if (glsl_get_components(deref->type) == num_components &&
@@ -573,7 +640,7 @@
  
     enum glsl_base_type types[] = {
        GLSL_TYPE_UINT8, GLSL_TYPE_UINT16, GLSL_TYPE_UINT, GLSL_TYPE_UINT64
-@@ -789,8 +828,9 @@ cast_deref(nir_builder *b, unsigned num_
+@@ -789,8 +891,9 @@ cast_deref(nir_builder *b, unsigned num_
     enum glsl_base_type base = types[ffs(bit_size / 8u) - 1u];
     const struct glsl_type *type = glsl_vector_type(base, num_components);
  
@@ -584,7 +651,7 @@
  
     return nir_build_deref_cast(b, &deref->def, deref->modes, type, 0);
  }
-@@ -801,36 +841,42 @@ static bool
+@@ -801,36 +904,42 @@ static bool
  new_bitsize_acceptable(struct vectorize_ctx *ctx, unsigned new_bit_size,
                         struct entry *low, struct entry *high, unsigned size)
  {
@@ -633,7 +700,7 @@
  
     unsigned low_size = low->intrin->num_components * get_bit_size(low) / 8;
     /* The hole size can be less than 0 if low and high instructions overlap. */
-@@ -840,25 +886,30 @@ new_bitsize_acceptable(struct vectorize_
+@@ -840,25 +949,30 @@ new_bitsize_acceptable(struct vectorize_
                                 low->align_offset,
                                 new_bit_size, new_num_components, hole_size,
                                 low->intrin, high->intrin,
@@ -671,7 +738,7 @@
     }
  
     return true;
-@@ -883,9 +934,10 @@ subtract_deref(nir_builder *b, nir_deref
+@@ -883,9 +997,10 @@ subtract_deref(nir_builder *b, nir_deref
        nir_deref_instr *parent = nir_deref_instr_parent(deref);
        unsigned stride = nir_deref_instr_array_stride(deref);
        assert(stride != 0);
@@ -683,7 +750,7 @@
     }
  
     deref = nir_build_deref_cast(b, &deref->def, deref->modes,
-@@ -898,8 +950,9 @@ static void
+@@ -898,8 +1013,9 @@ static void
  hoist_base_addr(nir_instr *instr, nir_instr *to_hoist)
  {
     /* Return if this instruction already dominates the first load. */
@@ -694,7 +761,7 @@
  
     /* Only the offset calculation (consisting of ALU and load_const)
      * differs between the vectorized loads.
-@@ -910,8 +963,9 @@ hoist_base_addr(nir_instr *instr, nir_in
+@@ -910,8 +1026,9 @@ hoist_base_addr(nir_instr *instr, nir_in
     if (to_hoist->type == nir_instr_type_alu) {
        /* For ALU, recursively hoist the sources. */
        nir_alu_instr *alu = nir_instr_as_alu(to_hoist);
@@ -705,7 +772,7 @@
     }
  
     nir_instr_move(nir_before_instr(instr), to_hoist);
-@@ -970,7 +1024,7 @@ vectorize_loads(nir_builder *b, struct v
+@@ -970,7 +1087,7 @@ vectorize_loads(nir_builder *b, struct v
     /* update uses */
     if (first == low) {
        nir_def_rewrite_uses_after_instr(&low->intrin->def, low_def,
@@ -714,7 +781,7 @@
        nir_def_rewrite_uses(&high->intrin->def, high_def);
     } else {
        nir_def_rewrite_uses(&low->intrin->def, low_def);
-@@ -1003,8 +1057,9 @@ vectorize_loads(nir_builder *b, struct v
+@@ -1003,8 +1120,9 @@ vectorize_loads(nir_builder *b, struct v
        b->cursor = nir_before_instr(first->instr);
  
        nir_deref_instr *deref = nir_src_as_deref(first->intrin->src[info->deref_src]);
@@ -725,7 +792,7 @@
        first->deref = cast_deref(b, new_num_components, new_bit_size, deref);
  
        nir_src_rewrite(&first->intrin->src[info->deref_src],
-@@ -1100,8 +1155,9 @@ vectorize_stores(nir_builder *b, struct
+@@ -1100,8 +1218,9 @@ vectorize_stores(nir_builder *b, struct
     nir_def *data = nir_vec(b, data_channels, new_num_components);
  
     /* update the intrinsic */
@@ -736,7 +803,7 @@
     second->intrin->num_components = data->num_components;
     second->num_components = data->num_components;
  
-@@ -1110,9 +1166,10 @@ vectorize_stores(nir_builder *b, struct
+@@ -1110,9 +1229,10 @@ vectorize_stores(nir_builder *b, struct
     nir_src_rewrite(&second->intrin->src[info->value_src], data);
  
     /* update the offset */
@@ -748,7 +815,7 @@
  
     /* update the deref */
     if (info->deref_src >= 0) {
-@@ -1124,8 +1181,9 @@ vectorize_stores(nir_builder *b, struct
+@@ -1124,8 +1244,9 @@ vectorize_stores(nir_builder *b, struct
     }
  
     /* update base/align */
@@ -759,7 +826,7 @@
  
     /* update offset_shift: since we use low's offset, we should use its
      * offset_shift as well.
-@@ -1156,18 +1214,21 @@ bindings_different_restrict(nir_shader *
+@@ -1156,18 +1277,21 @@ bindings_different_restrict(nir_shader *
     if (a->key->resource && b->key->resource) {
        nir_binding a_res = nir_chase_binding(nir_src_for_ssa(a->key->resource));
        nir_binding b_res = nir_chase_binding(nir_src_for_ssa(b->key->resource));
@@ -784,7 +851,7 @@
        }
  
        if (different_bindings) {
-@@ -1202,13 +1263,14 @@ bindings_different_restrict(nir_shader *
+@@ -1202,13 +1326,14 @@ bindings_different_restrict(nir_shader *
            ((a_access | b_access) & ACCESS_RESTRICT);
  }
  
@@ -801,7 +868,7 @@
  
     int64_t diff = get_offset_diff(a, b) + b_offset - a_offset;
  
-@@ -1227,8 +1289,9 @@ parse_shared2_offsets(struct entry *entr
+@@ -1227,8 +1352,9 @@ parse_shared2_offsets(struct entry *entr
     }
  
     uint32_t stride = get_bit_size(entry) / 8u;
@@ -812,7 +879,7 @@
     offsets[0] = nir_intrinsic_offset0(entry->intrin) * stride;
     offsets[1] = nir_intrinsic_offset1(entry->intrin) * stride;
     return 2;
-@@ -1240,34 +1303,41 @@ may_alias(nir_shader *shader, struct ent
+@@ -1240,34 +1366,41 @@ may_alias(nir_shader *shader, struct ent
     assert(mode_to_index(get_variable_mode(a)) ==
            mode_to_index(get_variable_mode(b)));
  
@@ -861,7 +928,7 @@
     }
  
     uint32_t a_offsets[2], b_offsets[2] = { 0, 0 };
-@@ -1275,8 +1345,9 @@ may_alias(nir_shader *shader, struct ent
+@@ -1275,8 +1408,9 @@ may_alias(nir_shader *shader, struct ent
     unsigned b_count = parse_shared2_offsets(b, b_offsets);
     for (unsigned i = 0; i < a_count; i++) {
        for (unsigned j = 0; j < b_count; j++) {
@@ -872,7 +939,7 @@
        }
     }
  
-@@ -1290,29 +1361,36 @@ check_for_aliasing(struct vectorize_ctx
+@@ -1290,29 +1424,36 @@ check_for_aliasing(struct vectorize_ctx
  {
     nir_variable_mode mode = get_variable_mode(first);
     if (mode & (nir_var_uniform | nir_var_system_value |
@@ -916,7 +983,7 @@
        }
     }
  
-@@ -1323,7 +1401,7 @@ static uint64_t
+@@ -1323,7 +1464,7 @@ static uint64_t
  calc_gcd(uint64_t a, uint64_t b)
  {
     while (b != 0) {
@@ -925,7 +992,7 @@
        a = b;
        b = tmp_a % b;
     }
-@@ -1354,20 +1432,23 @@ static bool
+@@ -1354,20 +1495,23 @@ static bool
  check_for_robustness(struct vectorize_ctx *ctx, struct entry *low, uint64_t high_offset)
  {
     nir_variable_mode mode = get_variable_mode(low);
@@ -952,7 +1019,7 @@
  
     /* Second, use information about the factors from address calculation (offset_defs_mul). These
      * are not guaranteed to be power-of-2.
-@@ -1375,15 +1456,17 @@ check_for_robustness(struct vectorize_ct
+@@ -1375,15 +1519,17 @@ check_for_robustness(struct vectorize_ct
     uint64_t stride = 0;
     for (unsigned i = 0; i < low->key->offset_def_count; i++) {
        unsigned lsb_zero = low->key->offset_def_num_lsbz[i];
@@ -972,7 +1039,7 @@
     return addition_wraps(max_low, high_offset, addition_bits);
  }
  
-@@ -1402,38 +1485,47 @@ is_strided_vector(const struct glsl_type
+@@ -1402,38 +1548,47 @@ is_strided_vector(const struct glsl_type
  static bool
  can_vectorize(struct vectorize_ctx *ctx, struct entry *first, struct entry *second)
  {
@@ -1029,7 +1096,7 @@
     }
  
     return true;
-@@ -1444,19 +1536,22 @@ try_vectorize(nir_function_impl *impl, s
+@@ -1444,19 +1599,22 @@ try_vectorize(nir_function_impl *impl, s
                struct entry *low, struct entry *high,
                struct entry *first, struct entry *second)
  {
@@ -1055,7 +1122,7 @@
     }
  
     /* gather information */
-@@ -1468,6 +1563,16 @@ try_vectorize(nir_function_impl *impl, s
+@@ -1468,6 +1626,16 @@ try_vectorize(nir_function_impl *impl, s
  
     /* find a good bit size for the new load/store */
     unsigned new_bit_size = 0;
@@ -1072,7 +1139,7 @@
     if (new_bitsize_acceptable(ctx, low_bit_size, low, high, new_size)) {
        new_bit_size = low_bit_size;
     } else if (low_bit_size != high_bit_size &&
-@@ -1477,27 +1582,33 @@ try_vectorize(nir_function_impl *impl, s
+@@ -1477,27 +1645,33 @@ try_vectorize(nir_function_impl *impl, s
        new_bit_size = 64;
        for (; new_bit_size >= 8; new_bit_size /= 2) {
           /* don't repeat trying out bitsizes */
@@ -1111,7 +1178,7 @@
  
     return true;
  }
-@@ -1507,33 +1618,41 @@ try_vectorize_shared2(struct vectorize_c
+@@ -1507,33 +1681,41 @@ try_vectorize_shared2(struct vectorize_c
                        struct entry *low, struct entry *high,
                        struct entry *first, struct entry *second)
  {
@@ -1161,7 +1228,7 @@
     }
  
     /* vectorize the accesses */
-@@ -1541,8 +1660,9 @@ try_vectorize_shared2(struct vectorize_c
+@@ -1541,8 +1723,9 @@ try_vectorize_shared2(struct vectorize_c
  
     nir_def *offset = first->intrin->src[first->is_store].ssa;
     offset = nir_iadd_imm(&b, offset, nir_intrinsic_base(first->intrin));
@@ -1172,7 +1239,7 @@
  
     uint32_t access = nir_intrinsic_access(first->intrin);
     if (first->is_store) {
-@@ -1582,94 +1702,121 @@ static bool
+@@ -1582,94 +1765,120 @@ static bool
  vectorize_sorted_entries(struct vectorize_ctx *ctx, nir_function_impl *impl,
                           struct util_dynarray *arr)
  {
@@ -1224,13 +1291,13 @@
 -         if (separate)
 -            continue;
 +         unsigned low_size = get_bit_size(merged_low) / 8u * merged_low->num_components;
-+
-+         /* Critical: early break when offset gap too large (changes O(n²) to O(n)). */
-+         if (diff > low_size + max_hole) break;
  
 -         if (try_vectorize(impl, ctx, low, high, first, second)) {
 -            low = low->is_store ? second : first;
 -            *util_dynarray_element(arr, struct entry *, second_idx) = NULL;
++         /* Critical: early break when offset gap too large (changes O(n²) to O(n)). */
++         if (diff > low_size + max_hole) break;
++
 +         if (try_vectorize(impl, ctx, merged_low, high, first, second)) {
 +            merged_low = merged_low->is_store ? second : first;
 +            *util_dynarray_element(arr, struct entry *, j) = NULL;
@@ -1306,27 +1373,29 @@
        struct util_dynarray *arr = entry->data;
 -      if (!arr->size)
 +
-+      /* Optimization: Don't sort or process arrays with 0 or 1 elements. */
-+      if (util_dynarray_num_elements(arr, void*) <= 1) {
-+         if (arr->size != 0) { /* Correct check for non-empty */
-+            struct entry** elem = util_dynarray_begin(arr);
-+            if (*elem) {
-+               progress |= update_align(*elem);
++      /* Optimization: Skip sorting for 0-1 elements (15–20% of buckets). */
++      unsigned num_entries = util_dynarray_num_elements(arr, struct entry *);
++      if (num_entries <= 1) {
++         if (num_entries == 1) {
++            struct entry **elem_ptr = (struct entry **)util_dynarray_begin(arr);
++            if (*elem_ptr) {
++               progress |= update_align(*elem_ptr);
 +            }
 +         }
           continue;
 +      }
  
-       qsort(util_dynarray_begin(arr),
-             util_dynarray_num_elements(arr, struct entry *),
-             sizeof(struct entry *), &sort_entries);
+-      qsort(util_dynarray_begin(arr),
+-            util_dynarray_num_elements(arr, struct entry *),
+-            sizeof(struct entry *), &sort_entries);
++      sort_entries_specialized((struct entry **)util_dynarray_begin(arr), num_entries);
  
 -      while (vectorize_sorted_entries(ctx, impl, arr))
 +      if (vectorize_sorted_entries(ctx, impl, arr)) {
           progress = true;
 +      }
  
-+      /* Final alignment update on any remaining or modified entries. */
++      /* Final alignment update on remaining/modified entries. */
        util_dynarray_foreach(arr, struct entry *, elem) {
 -         if (*elem)
 +         if (*elem) {
@@ -1335,7 +1404,7 @@
        }
     }
  
-@@ -1699,8 +1846,9 @@ handle_barrier(struct vectorize_ctx *ctx
+@@ -1699,8 +1908,9 @@ handle_barrier(struct vectorize_ctx *ctx
           modes = nir_var_all;
           break;
        case nir_intrinsic_barrier:
@@ -1346,7 +1415,7 @@
  
           modes = nir_intrinsic_memory_modes(intrin) & (nir_var_mem_ssbo |
                                                         nir_var_mem_shared |
-@@ -1736,10 +1884,12 @@ handle_barrier(struct vectorize_ctx *ctx
+@@ -1736,10 +1946,12 @@ handle_barrier(struct vectorize_ctx *ctx
           continue;
        }
  
@@ -1361,7 +1430,7 @@
     }
  
     return true;
-@@ -1752,10 +1902,12 @@ process_block(nir_function_impl *impl, s
+@@ -1752,10 +1964,12 @@ process_block(nir_function_impl *impl, s
  
     for (unsigned i = 0; i < nir_num_variable_modes; i++) {
        list_inithead(&ctx->entries[i]);
@@ -1376,7 +1445,7 @@
     }
  
     /* create entries */
-@@ -1764,25 +1916,30 @@ process_block(nir_function_impl *impl, s
+@@ -1764,25 +1978,30 @@ process_block(nir_function_impl *impl, s
     nir_foreach_instr_safe(instr, block) {
        instr->index = next_index++;
  
@@ -1413,7 +1482,7 @@
        unsigned mode_index = mode_to_index(mode);
  
        /* create entry */
-@@ -1795,12 +1952,14 @@ process_block(nir_function_impl *impl, s
+@@ -1795,12 +2014,14 @@ process_block(nir_function_impl *impl, s
  
        struct hash_table *adj_ht = NULL;
        if (entry->is_store) {
@@ -1430,7 +1499,7 @@
           adj_ht = ctx->loads[mode_index];
        }
  
-@@ -1811,7 +1970,14 @@ process_block(nir_function_impl *impl, s
+@@ -1811,7 +2032,14 @@ process_block(nir_function_impl *impl, s
           arr = (struct util_dynarray *)adj_entry->data;
        } else {
           arr = ralloc(ctx, struct util_dynarray);
@@ -1446,7 +1515,7 @@
           _mesa_hash_table_insert_pre_hashed(adj_ht, key_hash, entry->key, arr);
        }
        util_dynarray_append(arr, struct entry *, entry);
-@@ -1829,7 +1995,7 @@ process_block(nir_function_impl *impl, s
+@@ -1829,7 +2057,7 @@ process_block(nir_function_impl *impl, s
  bool
  nir_opt_load_store_vectorize(nir_shader *shader, const nir_load_store_vectorize_options *options)
  {
@@ -1455,7 +1524,7 @@
  
     struct vectorize_ctx *ctx = rzalloc(NULL, struct vectorize_ctx);
     ctx->shader = shader;
-@@ -1839,18 +2005,38 @@ nir_opt_load_store_vectorize(nir_shader
+@@ -1839,18 +2067,38 @@ nir_opt_load_store_vectorize(nir_shader
     nir_shader_index_vars(shader, options->modes);
  
     nir_foreach_function_impl(impl, shader) {
@@ -1501,7 +1570,7 @@
  }
  
  static bool
-@@ -1858,14 +2044,17 @@ opt_load_store_update_alignments_callbac
+@@ -1858,14 +2106,17 @@ opt_load_store_update_alignments_callbac
                                            nir_intrinsic_instr *intrin,
                                            void *s)
  {
