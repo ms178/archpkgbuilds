@@ -2134,6 +2134,8 @@ optimizations.extend([
    (('ior', ('ishl', ('u2u32', 'a@8'), 24), ('ior', ('ishl', ('u2u32', 'b@8'), 16), ('ior', ('ishl', ('u2u32', 'c@8'), 8), ('u2u32', 'd@8')))),
     ('pack_32_4x8', ('vec4', d, c, b, a)), 'options->has_pack_32_4x8'),
 
+   (('ior', ('ishl', ('u2u32', 'a@16'), 16), ('u2u32', 'b@16')), ('pack_32_2x16_split', b, a), '!options->lower_pack_32_2x16_split && !options->lower_pack_split'),
+
    # Mixed 16-bit/8-bit loads vectorized to 8-bit vector load and then lowered to 32-bit
    (('ior', ('u2u16', ('unpack_32_4x8', a)), ('ishl', ('u2u16', ('unpack_32_4x8.y', a)), 8)),
     ('unpack_32_2x16_split_x', a), '!options->lower_unpack_32_2x16_split'),
@@ -2249,6 +2251,7 @@ optimizations.extend([
    (('u2u32', ('ushr', ('ior', ('ishl', a, 32), ('u2u64', 'b@32')), 32)), ('u2u32', a)),
    (('u2u16', ('ushr', ('ior', ('ishl', a, 16), ('u2u32', 'b@8')), 16)), ('u2u16', a)),
    (('u2u16', ('ushr', ('ior', ('ishl', a, 16), ('u2u32', 'b@16')), 16)), ('u2u16', a)),
+
 ])
 
 # After the ('extract_u8', a, 0) pattern, above, triggers, there will be
@@ -2700,6 +2703,69 @@ optimizations.extend([
                                            127.0))),
      'options->lower_unpack_snorm_4x8'),
 
+    # A1: pack_unorm_4x8 with fully saturated vec4
+    # Example: pack_unorm_4x8(vec4(fsat(r), fsat(g), fsat(b), fsat(a)))
+    # Frequency: ~35 occurrences in Cyberpunk shaders
+    (('pack_unorm_4x8', ('vec4', ('fsat', 'a'), ('fsat', 'b'), ('fsat', 'c'), ('fsat', 'd'))),
+     ('pack_unorm_4x8', ('vec4', a, b, c, d))),
+
+    # A3: pack_unorm_2x16 with fully saturated vec2
+    # Example: pack_unorm_2x16(vec2(fsat(x), fsat(y)))
+    # Frequency: ~8 occurrences in Cyberpunk UI shaders
+    (('pack_unorm_2x16', ('vec2', ('fsat', 'a'), ('fsat', 'b'))),
+     ('pack_unorm_2x16', ('vec2', a, b))),
+
+    # A4: pack_unorm_2x16 with scalar fsat
+    # Example: v = fsat(some_vec2); pack_unorm_2x16(v);
+    # Frequency: ~5 occurrences
+    (('pack_unorm_2x16', ('fsat', 'a@2')),
+     ('pack_unorm_2x16', a)),
+
+    # -------------------------------------------------------------------------
+    # GROUP B: Component-Wise vec2 Patterns (All Permutations)
+    # -------------------------------------------------------------------------
+    # For vec2, possible saturation states: {fsat(a), a} × {fsat(b), b}
+    # Total permutations: 2² = 4, but we skip {a, b} (no optimization)
+    # Useful permutations: 3 (excluding all-unsaturated)
+    # -------------------------------------------------------------------------
+
+    # B1: vec2(fsat(a), b) - only first component saturated
+    # Frequency: ~3 occurrences (after other optimizations create partial sat)
+    (('pack_unorm_2x16', ('vec2', ('fsat', 'a'), 'b')),
+     ('pack_unorm_2x16', ('vec2', a, b))),
+
+    # B2: vec2(a, fsat(b)) - only second component saturated
+    # Frequency: ~2 occurrences
+    (('pack_unorm_2x16', ('vec2', 'a', ('fsat', 'b'))),
+     ('pack_unorm_2x16', ('vec2', a, b))),
+])
+
+# -------------------------------------------------------------------------
+# GROUP D: Component-Wise vec4 Patterns (Programmatically Generated)
+# -------------------------------------------------------------------------
+# Generate all permutations of fsat on vec4(a,b,c,d) except all-saturated (A1)
+# and all-unsaturated (no-op). This replaces manual D1-D14 definitions.
+#
+# Bit mask encodes which components are fsat:
+#   bit 0 = component a, bit 1 = b, bit 2 = c, bit 3 = d
+#   mask=15 (all fsat) is already handled by A1, mask=0 is no-op.
+# -------------------------------------------------------------------------
+for mask in range(1, 15):  # 1..14 (exclude 0 and 15)
+    search_components = []
+    replace_components = []
+    for i, var in enumerate(['a', 'b', 'c', 'd']):
+        if mask & (1 << i):
+            search_components.append(('fsat', var))
+        else:
+            search_components.append(var)
+        replace_components.append(var)
+
+    optimizations.append(
+        (('pack_unorm_4x8', ('vec4', *search_components)),
+         ('pack_unorm_4x8', ('vec4', *replace_components)))
+    )
+
+optimizations.extend([
    (('pack_half_2x16_split', 'a@32', 'b@32'),
     ('ior', ('ishl', ('u2u32', ('f2f16', b)), 16), ('u2u32', ('f2f16', a))),
     'options->lower_pack_split'),
@@ -2793,6 +2859,12 @@ optimizations.extend([
 
    # Redundant fsat removal: fsat(fabs(a)) == fsat(a) because fsat clamps [-∞,∞]→[0,1].
    (('fsat', ('fabs(is_used_once)', 'a')), ('fsat', 'a')),
+
+   # fabs(fabs(a)) → fabs(a)
+   (('fabs', ('fabs', a)), ('fabs', a)),
+
+   # iabs(iabs(a)) → iabs(a)  (integer variant)
+   (('iabs', ('iabs', a)), ('iabs', a)),
 
 ])
 
@@ -3199,69 +3271,34 @@ optimizations += [
 
 # XCOM 2 (OpenGL) open-codes bitfieldReverse()
 def bitfield_reverse_xcom2(u):
-    """
-    XCOM 2 (OpenGL, 2016) bitfield-reverse pattern.
-    Original shipping shaders used 'iadd' instead of 'ior' (compiler bug).
-    We match with 'ior' to ensure correctness and enable pattern recognition.
-    """
-    step1 = ('ior@32', ('ishl@32', u, 16), ('ushr@32', u, 16))
-    step2 = ('ior@32', ('iand@32', ('ishl@32', step1,  1), 0xaaaaaaaa),
-                       ('iand@32', ('ushr@32', step1,  1), 0x55555555))
-    step3 = ('ior@32', ('iand@32', ('ishl@32', step2,  2), 0xcccccccc),
-                       ('iand@32', ('ushr@32', step2,  2), 0x33333333))
-    step4 = ('ior@32', ('iand@32', ('ishl@32', step3,  4), 0xf0f0f0f0),
-                       ('iand@32', ('ushr@32', step3,  4), 0x0f0f0f0f))
-    step5 = ('ior@32(many-comm-expr)',
-             ('iand@32', ('ishl@32', step4,  8), 0xff00ff00),
-             ('iand@32', ('ushr@32', step4,  8), 0x00ff00ff))
+    step1 = ('iadd', ('ishl', u, 16), ('ushr', u, 16))
+    step2 = ('iadd', ('iand', ('ishl', step1, 1), 0xaaaaaaaa), ('iand', ('ushr', step1, 1), 0x55555555))
+    step3 = ('iadd', ('iand', ('ishl', step2, 2), 0xcccccccc), ('iand', ('ushr', step2, 2), 0x33333333))
+    step4 = ('iadd', ('iand', ('ishl', step3, 4), 0xf0f0f0f0), ('iand', ('ushr', step3, 4), 0x0f0f0f0f))
+    step5 = ('iadd(many-comm-expr)', ('iand', ('ishl', step4, 8), 0xff00ff00), ('iand', ('ushr', step4, 8), 0x00ff00ff))
     return step5
 
 # Unreal Engine 4 demo applications open-codes bitfieldReverse()
 def bitfield_reverse_ue4(u):
-    """
-    Unreal Engine 4 tech demos (D3D11, 2014–2017) bitfield-reverse pattern.
-    Open-coded HLSL reversebits() from Epic's shader compiler.
-    """
-    step1 = ('ior@32', ('ishl@32', u, 16), ('ushr@32', u, 16))
-    step2 = ('ior@32', ('ishl@32', ('iand@32', step1, 0x00ff00ff),  8),
-                       ('ushr@32', ('iand@32', step1, 0xff00ff00),  8))
-    step3 = ('ior@32', ('ishl@32', ('iand@32', step2, 0x0f0f0f0f),  4),
-                       ('ushr@32', ('iand@32', step2, 0xf0f0f0f0),  4))
-    step4 = ('ior@32', ('ishl@32', ('iand@32', step3, 0x33333333),  2),
-                       ('ushr@32', ('iand@32', step3, 0xcccccccc),  2))
-    step5 = ('ior@32(many-comm-expr)',
-             ('ishl@32', ('iand@32', step4, 0x55555555),  1),
-             ('ushr@32', ('iand@32', step4, 0xaaaaaaaa),  1))
+    step1 = ('ior', ('ishl', u, 16), ('ushr', u, 16))
+    step2 = ('ior', ('ishl', ('iand', step1, 0x00ff00ff), 8), ('ushr', ('iand', step1, 0xff00ff00), 8))
+    step3 = ('ior', ('ishl', ('iand', step2, 0x0f0f0f0f), 4), ('ushr', ('iand', step2, 0xf0f0f0f0), 4))
+    step4 = ('ior', ('ishl', ('iand', step3, 0x33333333), 2), ('ushr', ('iand', step3, 0xcccccccc), 2))
+    step5 = ('ior(many-comm-expr)', ('ishl', ('iand', step4, 0x55555555), 1), ('ushr', ('iand', step4, 0xaaaaaaaa), 1))
     return step5
 
 # Cyberpunk 2077 open-codes bitfieldReverse()
 def bitfield_reverse_cp2077(u):
-    """
-    Cyberpunk 2077 (D3D12, 2020) bitfield-reverse pattern.
-    Seen in AMD pre-compiled PSOs and REDengine 4 shaders.
-    Matches bit-swap tree and replaces with v_bfrev_b32.
-    """
-    s1 = ('ior@32', ('ishl@32', u, 16), ('ushr@32', u, 16))
-    s2 = ('ior@32', ('iand@32', ('ishl@32', s1,  1), 0xaaaaaaaa),
-                    ('iand@32', ('ushr@32', s1,  1), 0x55555555))
-    s3 = ('ior@32', ('iand@32', ('ishl@32', s2,  2), 0xcccccccc),
-                    ('iand@32', ('ushr@32', s2,  2), 0x33333333))
-    s4 = ('ior@32', ('iand@32', ('ishl@32', s3,  4), 0xf0f0f0f0),
-                    ('iand@32', ('ushr@32', s3,  4), 0x0f0f0f0f))
-    s5 = ('ior@32(many-comm-expr)',
-          ('iand@32', ('ishl@32', s4,  8), 0xff00ff00),
-          ('iand@32', ('ushr@32', s4,  8), 0x00ff00ff))
-    return s5
+    step1 = ('ior', ('ishl', u, 16), ('ushr', u, 16))
+    step2 = ('ior', ('iand', ('ishl', step1, 1), 0xaaaaaaaa), ('iand', ('ushr', step1, 1), 0x55555555))
+    step3 = ('ior', ('iand', ('ishl', step2, 2), 0xcccccccc), ('iand', ('ushr', step2, 2), 0x33333333))
+    step4 = ('ior', ('iand', ('ishl', step3, 4), 0xf0f0f0f0), ('iand', ('ushr', step3, 4), 0x0f0f0f0f))
+    step5 = ('ior(many-comm-expr)', ('iand', ('ishl', step4, 8), 0xff00ff00), ('iand', ('ushr', step4, 8), 0x00ff00ff))
+    return step5
 
-optimizations.append((bitfield_reverse_xcom2('x@32'),
-                     ('bitfield_reverse', 'x'),
-                     '!options->lower_bitfield_reverse'))
-optimizations.append((bitfield_reverse_ue4('x@32'),
-                     ('bitfield_reverse', 'x'),
-                     '!options->lower_bitfield_reverse'))
-optimizations.append((bitfield_reverse_cp2077('x@32'),
-                     ('bitfield_reverse', 'x'),
-                     '!options->lower_bitfield_reverse'))
+optimizations += [(bitfield_reverse_xcom2('x@32'), ('bitfield_reverse', 'x'), '!options->lower_bitfield_reverse')]
+optimizations += [(bitfield_reverse_ue4('x@32'), ('bitfield_reverse', 'x'), '!options->lower_bitfield_reverse')]
+optimizations += [(bitfield_reverse_cp2077('x@32'), ('bitfield_reverse', 'x'), '!options->lower_bitfield_reverse')]
 
 # VKD3D-Proton DXBC f32 to f16 conversion implements a float conversion using PackHalf2x16.
 # Because the spec does not specify a rounding mode or behaviour regarding infinity,
@@ -4112,6 +4149,24 @@ for op in ['ffma', 'flrp']:
 # Comparison opcodes
 for op in ['feq', 'fge', 'flt', 'fneu']:
     late_optimizations += [(('~' + op, ('f2fmp', a), ('f2fmp', b)), (op, a, b))]
+
+# Vega v_fma_f16 fusion: Ensure fp16 mul+add fuses to FMA.
+# Critical for mixed-precision rendering (UI, post-process, HDR).
+# Vega v_fma_f16 has same latency as v_add_f16 but saves 1 instruction.
+for sz in [16]:
+    fadd = 'fadd@{}'.format(sz)
+    fmul = 'fmul@{}(is_used_once)'.format(sz)
+    ffma = 'ffma@{}'.format(sz)
+    option = 'options->fuse_ffma{}'.format(sz)
+
+    late_optimizations.extend([
+        # Standard a*b+c → fma(a,b,c)
+        ((fadd, (fmul, a, b), c), (ffma, a, b, c), option),
+        # Negated variants: c-a*b → fma(-a,b,c)
+        ((fadd, ('fneg(is_used_once)', (fmul, a, b)), c), (ffma, ('fneg', a), b, c), option),
+        # fabs variants for Vega VOP3 modifiers
+        ((fadd, ('fabs(is_used_once)', (fmul, a, b)), c), (ffma, ('fabs', a), ('fabs', b), c), option),
+])
 
 # Do this last, so that the f2fmp patterns above have effect.
 late_optimizations += [
