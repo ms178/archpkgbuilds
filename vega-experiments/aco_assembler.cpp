@@ -37,7 +37,7 @@ struct asm_context {
    std::unordered_map<unsigned, constaddr_info> resumeaddrs;
    std::vector<struct aco_symbol>* symbols;
    uint32_t loop_header = -1u;
-   uint32_t loop_exit = 0u;
+   uint32_t loop_exit = -1u;
    const int16_t* opcode;
 
    asm_context(Program* program_, std::vector<struct aco_symbol>* symbols_)
@@ -1613,6 +1613,9 @@ chain_branches(asm_context& ctx, std::vector<uint32_t>& out, branch_info& branch
 void
 fix_branches(asm_context& ctx, std::vector<uint32_t>& out)
 {
+   const size_t max_iterations = 100;
+   size_t iteration_count = 0;
+
    bool repeat = false;
    do {
       repeat = false;
@@ -1620,7 +1623,13 @@ fix_branches(asm_context& ctx, std::vector<uint32_t>& out)
       if (ctx.gfx_level == GFX10)
          fix_branches_gfx10(ctx, out);
 
-      for (branch_info& branch : ctx.branches) {
+      const size_t original_branch_count = ctx.branches.size();
+
+      ctx.branches.reserve(original_branch_count * 3);
+
+      for (size_t i = 0; i < original_branch_count; ++i) {
+         branch_info& branch = ctx.branches[i];
+
          int offset = (int)ctx.program->blocks[branch.target].offset - branch.pos - 1;
          if (offset >= INT16_MIN && offset <= INT16_MAX) {
             out[branch.pos] &= 0xffff0000u;
@@ -1630,6 +1639,12 @@ fix_branches(asm_context& ctx, std::vector<uint32_t>& out)
             repeat = true;
             break;
          }
+      }
+
+      ++iteration_count;
+      if (iteration_count > max_iterations) {
+         aco_err(ctx.program, "Branch fixup failed to converge after %zu iterations (infinite loop detected)", max_iterations);
+         abort();
       }
    } while (repeat);
 }
@@ -1730,11 +1745,16 @@ emit_program(Program* program, std::vector<uint32_t>& code, std::vector<struct a
 
    size_t estimated_insn_count = 0;
    size_t loop_count = 0;
+   size_t branch_count = 0;
 
    for (const Block& block : program->blocks) {
       estimated_insn_count += block.instructions.size();
       if (block.kind & block_kind_loop_header)
          loop_count++;
+      for (const aco_ptr<Instruction>& instr : block.instructions) {
+         if (instr_info.classes[(int)instr->opcode] == instr_class::branch)
+            branch_count++;
+      }
    }
 
    const size_t base = (estimated_insn_count <= UINT32_MAX / 3)
@@ -1745,14 +1765,19 @@ emit_program(Program* program, std::vector<uint32_t>& code, std::vector<struct a
    const size_t modifier_overhead   = base / 20;
    const size_t nsa_overhead        = (base * 3) / 100;
    const size_t alignment_padding   = loop_count * 15u;
-   const size_t branch_chaining     = (estimated_insn_count / 100) * 50u;
+
+   const size_t cascade_depth = 3;
+   const size_t chains_per_branch = (1u << cascade_depth);
+   const size_t dwords_per_chain = 10u;
+   const size_t branch_chaining = (branch_count / 10) * chains_per_branch * dwords_per_chain;
+
    const size_t constant_dwords     = (program->constant_data.size() + 3u) / 4u;
    const size_t endpgm_padding      = append_endpgm ? 5u : 0u;
 
    const size_t total_estimate = base + literal_overhead + modifier_overhead + nsa_overhead +
                                   alignment_padding + branch_chaining + constant_dwords + endpgm_padding;
 
-   const size_t reserve_size = total_estimate + (total_estimate * 15u) / 100u;
+   const size_t reserve_size = total_estimate + (total_estimate * 20u) / 100u;
 
    code.reserve(reserve_size);
 
