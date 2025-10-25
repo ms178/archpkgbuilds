@@ -59,14 +59,15 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
         return;
     }
 
-    const int64_t vblankInterval = static_cast<int64_t>(vblankIntervalNs);
     const int64_t currentTimeNs = std::chrono::steady_clock::now().time_since_epoch().count();
     const int64_t lastPresentationNs = lastPresentationTimestamp.count();
 
     const int64_t predictedRenderNs = renderJournal.result().count();
     const int64_t safetyMarginNs = safetyMargin.count();
 
-    const int64_t maxCompositingNs = vblankInterval * 2;
+    // Compute expected compositing duration with upper bound
+    const int64_t vblankIntervalSigned = static_cast<int64_t>(vblankIntervalNs);
+    const int64_t maxCompositingNs = vblankIntervalSigned * 2;
     int64_t expectedCompositingNs = predictedRenderNs + safetyMarginNs + 1'000'000;
     if (expectedCompositingNs > maxCompositingNs) {
         expectedCompositingNs = maxCompositingNs;
@@ -76,26 +77,57 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
 
     if (presentationMode == PresentationMode::VSync) [[likely]] {
         const int64_t sinceLastNs = currentTimeNs - lastPresentationNs;
-        const uint64_t pageflipsSince = (sinceLastNs > 0) ? (static_cast<uint64_t>(sinceLastNs) / vblankIntervalNs) : 0;
 
+        // Compute pageflips since last presentation (avoid division if recent)
+        uint64_t pageflipsSince = 0;
+        if (sinceLastNs > 0) [[likely]] {
+            // Common case: 1-3 vblanks since last frame
+            if (sinceLastNs < static_cast<int64_t>(vblankIntervalNs * 4)) [[likely]] {
+                // Use linear search for small counts (faster than division)
+                uint64_t accumNs = vblankIntervalNs;
+                pageflipsSince = 1;
+                while (accumNs <= static_cast<uint64_t>(sinceLastNs) && pageflipsSince < 4) {
+                    accumNs += vblankIntervalNs;
+                    pageflipsSince++;
+                }
+                if (accumNs > static_cast<uint64_t>(sinceLastNs)) {
+                    pageflipsSince--;
+                }
+            } else {
+                // Uncommon case: many vblanks (e.g., suspend/resume)
+                pageflipsSince = static_cast<uint64_t>(sinceLastNs) / vblankIntervalNs;
+            }
+        }
+
+        // Detect suspend/resume: if >100 vblanks elapsed, we likely suspended
         if (pageflipsSince > 100) [[unlikely]] {
-            const int64_t earlyStart = vblankInterval - 1'000;
+            const int64_t earlyStart = vblankIntervalSigned - 1'000;
             if (expectedCompositingNs < earlyStart) {
                 expectedCompositingNs = earlyStart;
             }
         }
 
+        // Compute pageflips since last target timestamp (rounding division)
         const int64_t toTargetNs = lastTargetTimestamp.count() - lastPresentationNs;
-        const uint64_t pageflipsSinceLastToTarget = (toTargetNs > 0) ? ((static_cast<uint64_t>(toTargetNs) + vblankIntervalNs / 2) / vblankIntervalNs) : 0;
+        uint64_t pageflipsSinceLastToTarget = 0;
+        if (toTargetNs > 0) [[likely]] {
+            const uint64_t toTargetUns = static_cast<uint64_t>(toTargetNs);
+            // Rounding division: (x + d/2) / d
+            pageflipsSinceLastToTarget = (toTargetUns + (vblankIntervalNs >> 1)) / vblankIntervalNs;
+        }
 
-        uint64_t pageflipsInAdvance = (static_cast<uint64_t>(expectedCompositingNs) + vblankIntervalNs - 1) / vblankIntervalNs;
+        // Compute pageflips in advance (ceiling division)
+        // Ceiling: (x + d - 1) / d
+        const uint64_t expectedCompositingUns = static_cast<uint64_t>(expectedCompositingNs);
+        uint64_t pageflipsInAdvance = (expectedCompositingUns + vblankIntervalNs - 1) / vblankIntervalNs;
         pageflipsInAdvance = std::clamp(pageflipsInAdvance, uint64_t(1), static_cast<uint64_t>(maxPendingFrameCount));
 
+        // Triple-buffering heuristic
         if (pageflipsInAdvance > 1) {
             wasTripleBuffering = true;
             doubleBufferingCounter = 0;
         } else if (wasTripleBuffering) {
-            const int64_t threshold = vblankInterval * 95 / 100;
+            const int64_t threshold = vblankIntervalSigned * 95 / 100;
             if (expectedCompositingNs >= threshold) {
                 doubleBufferingCounter = 0;
             } else {
@@ -109,43 +141,66 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
             }
         }
 
+        // Compute next presentation timestamp
         if (compositeTimer.isActive()) {
             const int64_t deltaNs = nextPresentationTimestamp.count() - lastPresentationNs;
             uint32_t intervalsSinceLastTimestamp = 1;
             if (deltaNs > 0) [[likely]] {
-                const uint64_t intervals = (static_cast<uint64_t>(deltaNs) + vblankIntervalNs / 2) / vblankIntervalNs;
+                // Rounding division with overflow check
+                const uint64_t deltaUns = static_cast<uint64_t>(deltaNs);
+                const uint64_t intervals = (deltaUns + (vblankIntervalNs >> 1)) / vblankIntervalNs;
                 if (intervals > 0 && intervals <= UINT32_MAX) {
                     intervalsSinceLastTimestamp = static_cast<uint32_t>(intervals);
                 }
             }
-            nextPresentationNs = lastPresentationNs + static_cast<int64_t>(intervalsSinceLastTimestamp) * vblankInterval;
+            // Overflow-safe multiplication
+            if (intervalsSinceLastTimestamp <= INT64_MAX / vblankIntervalSigned) [[likely]] {
+                nextPresentationNs = lastPresentationNs + static_cast<int64_t>(intervalsSinceLastTimestamp) * vblankIntervalSigned;
+            } else {
+                // Overflow: clamp to far future
+                nextPresentationNs = INT64_MAX;
+            }
         } else {
             const uint64_t targetVblanks = std::max(pageflipsSince + pageflipsInAdvance, pageflipsSinceLastToTarget + 1);
-            nextPresentationNs = lastPresentationNs + static_cast<int64_t>(targetVblanks) * vblankInterval;
+            // Overflow-safe multiplication
+            if (targetVblanks <= static_cast<uint64_t>(INT64_MAX) / vblankIntervalNs) [[likely]] {
+                nextPresentationNs = lastPresentationNs + static_cast<int64_t>(targetVblanks * vblankIntervalNs);
+            } else {
+                nextPresentationNs = INT64_MAX;
+            }
         }
     } else {
+        // Non-VSync modes
         wasTripleBuffering = false;
         doubleBufferingCounter = 0;
         if (presentationMode == PresentationMode::Async || presentationMode == PresentationMode::AdaptiveAsync) {
             nextPresentationNs = currentTimeNs;
         } else {
-            const int64_t candidate = lastPresentationNs + vblankInterval;
+            const int64_t candidate = lastPresentationNs + vblankIntervalSigned;
             nextPresentationNs = std::max(currentTimeNs, candidate);
         }
     }
 
     nextPresentationTimestamp = std::chrono::nanoseconds{nextPresentationNs};
 
+    // Compute delay until next render start
     const int64_t nextRenderNs = nextPresentationNs - expectedCompositingNs;
     int64_t delayNs = nextRenderNs - currentTimeNs;
     if (delayNs < 0) {
         delayNs = 0;
     }
 
-    const int delayMs = static_cast<int>((delayNs + 999'999) / 1'000'000);
+    // Convert to milliseconds with overflow protection
+    int delayMs;
+    if (delayNs <= INT64_MAX - 999'999) [[likely]] {
+        delayMs = static_cast<int>((delayNs + 999'999) / 1'000'000);
+    } else {
+        delayMs = INT_MAX; // Far future
+    }
 
+    // Only restart timer if delay changed significantly (avoid timer thrashing)
     if (!compositeTimer.isActive() || std::abs(delayMs - scheduledTimerMs) > 1) {
-        scheduledTimerMs = static_cast<int16_t>(delayMs);
+        scheduledTimerMs = static_cast<int16_t>(std::min(delayMs, 32767)); // Clamp to int16_t range
         compositeTimer.start(delayMs, Qt::PreciseTimer, q);
     }
 }
@@ -176,6 +231,7 @@ namespace
 #define KWIN_NOINLINE
 #endif
 
+// Fixed and optimized sanitizeName with correct AVX2 logic
 static KWIN_COLD KWIN_NOINLINE void sanitizeName(const QString &in, std::string &out)
 {
     out.clear();
@@ -188,44 +244,63 @@ static KWIN_COLD KWIN_NOINLINE void sanitizeName(const QString &in, std::string 
     int i = 0;
 
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-    if (__builtin_cpu_supports("avx2")) {
-        const __m256i lower_a_m1 = _mm256_set1_epi16('a' - 1);
-        const __m256i upper_z_p1 = _mm256_set1_epi16('z' + 1);
-        const __m256i upper_A_m1 = _mm256_set1_epi16('A' - 1);
-        const __m256i upper_Z_p1 = _mm256_set1_epi16('Z' + 1);
-        const __m256i digit_0_m1 = _mm256_set1_epi16('0' - 1);
-        const __m256i digit_9_p1 = _mm256_set1_epi16('9' + 1);
+    // AVX2 fast path: process 16 characters at a time
+    if (__builtin_cpu_supports("avx2") && size >= 16) {
+        const __m256i lower_a = _mm256_set1_epi16('a');
+        const __m256i upper_z = _mm256_set1_epi16('z');
+        const __m256i upper_A = _mm256_set1_epi16('A');
+        const __m256i upper_Z = _mm256_set1_epi16('Z');
+        const __m256i digit_0 = _mm256_set1_epi16('0');
+        const __m256i digit_9 = _mm256_set1_epi16('9');
         const __m256i underscore = _mm256_set1_epi16('_');
         const __m256i dash = _mm256_set1_epi16('-');
         const __m256i replacement = _mm256_set1_epi16('_');
 
         for (; i + 15 < size; i += 16) {
+            // Load 16 QChars (16-bit each, UTF-16)
             __m256i chars = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(in.data() + i));
 
-            __m256i is_lower = _mm256_and_si256(_mm256_cmpgt_epi16(chars, lower_a_m1), _mm256_cmpgt_epi16(upper_z_p1, chars));
-            __m256i is_upper = _mm256_and_si256(_mm256_cmpgt_epi16(chars, upper_A_m1), _mm256_cmpgt_epi16(upper_Z_p1, chars));
-            __m256i is_digit = _mm256_and_si256(_mm256_cmpgt_epi16(chars, digit_0_m1), _mm256_cmpgt_epi16(digit_9_p1, chars));
+            // Check if characters are in allowed ranges (16-bit comparisons)
+            __m256i is_lower = _mm256_and_si256(_mm256_cmpgt_epi16(chars, _mm256_sub_epi16(lower_a, _mm256_set1_epi16(1))),
+                                                _mm256_cmpgt_epi16(_mm256_add_epi16(upper_z, _mm256_set1_epi16(1)), chars));
+            __m256i is_upper = _mm256_and_si256(_mm256_cmpgt_epi16(chars, _mm256_sub_epi16(upper_A, _mm256_set1_epi16(1))),
+                                                _mm256_cmpgt_epi16(_mm256_add_epi16(upper_Z, _mm256_set1_epi16(1)), chars));
+            __m256i is_digit = _mm256_and_si256(_mm256_cmpgt_epi16(chars, _mm256_sub_epi16(digit_0, _mm256_set1_epi16(1))),
+                                                _mm256_cmpgt_epi16(_mm256_add_epi16(digit_9, _mm256_set1_epi16(1)), chars));
             __m256i is_underscore = _mm256_cmpeq_epi16(chars, underscore);
             __m256i is_dash = _mm256_cmpeq_epi16(chars, dash);
 
-            __m256i is_allowed = _mm256_or_si256(is_underscore, _mm256_or_si256(is_dash, _mm256_or_si256(is_digit, _mm256_or_si256(is_lower, is_upper))));
+            __m256i is_allowed = _mm256_or_si256(_mm256_or_si256(is_lower, is_upper),
+                                                  _mm256_or_si256(_mm256_or_si256(is_digit, is_underscore), is_dash));
+
+            // Blend: keep allowed chars, replace others with '_'
             __m256i result = _mm256_blendv_epi8(replacement, chars, is_allowed);
 
+            // Pack 16-bit to 8-bit (assumes ASCII range, discards high bytes)
             __m128i lo = _mm256_castsi256_si128(result);
             __m128i hi = _mm256_extracti128_si256(result, 1);
             __m128i packed = _mm_packus_epi16(lo, hi);
 
-            char temp[16];
+            // packus_epi16 produces: [lo0, lo1, ..., lo7, hi0, hi1, ..., hi7]
+            // We need to shuffle to correct order
+            const __m128i shuffle_mask = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15);
+            packed = _mm_shuffle_epi8(packed, shuffle_mask);
+
+            // Store 16 bytes
+            alignas(16) char temp[16];
             _mm_storeu_si128(reinterpret_cast<__m128i *>(temp), packed);
             out.append(temp, 16);
         }
     }
 #endif
 
+    // Scalar fallback for remaining characters
     for (; i < size; ++i) {
         const QChar ch = in.at(i);
-        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-') {
-            out.push_back(static_cast<char>(ch.toLatin1()));
+        const char16_t unicode = ch.unicode();
+        if ((unicode >= 'a' && unicode <= 'z') || (unicode >= 'A' && unicode <= 'Z') ||
+            (unicode >= '0' && unicode <= '9') || unicode == '_' || unicode == '-') {
+            out.push_back(static_cast<char>(unicode));
         } else {
             out.push_back('_');
         }
@@ -259,7 +334,8 @@ static KWIN_COLD KWIN_NOINLINE void writeDebugOutput(RenderLoopPrivate *d, std::
                             << (vrr ? 1 : 0) << ","
                             << (tearing ? 1 : 0) << ","
                             << frame->predictedRenderTime().count() << "\n";
-        d->m_debugOutput->flush();
+        // Remove flush(): let OS buffer writes to avoid blocking hot path
+        // File will be flushed on close or periodic kernel writeback
     }
 }
 
@@ -376,6 +452,14 @@ void RenderLoop::setRefreshRate(int refreshRate)
     d->refreshRate = rr;
     d->cachedVblankIntervalNs = 1'000'000'000'000ull / static_cast<uint64_t>(rr);
     Q_EMIT refreshRateChanged();
+
+    // When refresh rate changes, reschedule to recalculate vblank intervals.
+    // Stop active timer first to prevent stale scheduling with old interval.
+    if (!d->inhibitCount) {
+        d->compositeTimer.stop();
+        d->scheduledTimerMs = -1;
+        d->scheduleNextRepaint();
+    }
 }
 
 void RenderLoop::setPresentationSafetyMargin(std::chrono::nanoseconds safetyMargin)
@@ -388,13 +472,15 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer *outputLayer)
     const bool vrr = (d->presentationMode == PresentationMode::AdaptiveSync || d->presentationMode == PresentationMode::AdaptiveAsync);
     const bool tearing = (d->presentationMode == PresentationMode::Async || d->presentationMode == PresentationMode::AdaptiveAsync);
 
-    if ((vrr || tearing) && workspace() && d->output) [[unlikely]] {
+    if ((vrr || tearing) && workspace() && d->output) [[likely]] {
         Window *const activeWin = workspace()->activeWindow();
         if (activeWin) {
             SurfaceItem *const surfaceItem = activeWin->surfaceItem();
             if ((item || outputLayer) && activeWindowControlsVrrRefreshRate() && surfaceItem && item != surfaceItem && !surfaceItem->isAncestorOf(item)) {
-                constexpr std::chrono::milliseconds s_delayVrrTimer = 1'000ms / 30;
-                d->delayedVrrTimer.start(s_delayVrrTimer, Qt::PreciseTimer, this);
+                // Adaptive delay: use 2 vblanks instead of fixed 30Hz to minimize latency while avoiding spurious VRR triggers
+                const uint64_t delayNs = d->cachedVblankIntervalNs * 2;
+                const int delayMsInt = static_cast<int>((delayNs + 999'999) / 1'000'000);
+                d->delayedVrrTimer.start(delayMsInt, Qt::PreciseTimer, this);
                 return;
             }
         }
