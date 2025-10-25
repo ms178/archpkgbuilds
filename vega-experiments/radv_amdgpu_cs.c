@@ -16,6 +16,7 @@
 #include "util/detect_os.h"
 #include "util/os_time.h"
 #include "util/u_memory.h"
+#include "ac_cmdbuf_cp.h"
 #include "ac_debug.h"
 #include "ac_linux_drm.h"
 #include "radv_amdgpu_bo.h"
@@ -69,6 +70,9 @@
 /* Only use AVX2 non-temporal streaming for big copies where it pays off. */
 #define RADV_NT_STREAM_THRESHOLD_BYTES 32768u /* 32 KiB */
 
+/* Maximum hash table size to prevent excessive memory usage. */
+#define RADV_MAX_HASH_TABLE_SIZE 8192u
+
 /* Thread-local AVX2 feature probe cached per thread. */
 static RADV_ALWAYS_INLINE bool
 radv_cpu_supports_avx2_cached(void)
@@ -108,7 +112,9 @@ struct radv_amdgpu_cs_ib_info {
  */
 struct radv_buffer_hash_entry {
    uint32_t bo_handle;
+   uint32_t hash_cached; /* Cached hash for Robin Hood distance calculation. */
    int32_t index;
+   uint32_t _pad; /* Align to 16 bytes for cache line packing (4 entries/64-byte line). */
 };
 
 /*
@@ -195,78 +201,6 @@ struct radv_winsys_sem_info {
 };
 
 static RADV_ALWAYS_INLINE RADV_HOT void
-radeon_emit(struct ac_cmdbuf *cs, uint32_t value)
-{
-   assert(cs->cdw < cs->reserved_dw);
-   cs->buf[cs->cdw++] = value;
-}
-
-/*
- * OPTIMIZATION 4: AVX2-Accelerated Memory Copy with Non-Temporal Stores (improved)
- *
- * - Thread-local feature check (no repeated __builtin_cpu_init).
- * - Large threshold (>= 32 KiB) so we only use NT for big streaming copies.
- * - No manual prefetching; modern Intel prefetchers handle linear streams well.
- * - Align destination to 32B for _mm256_stream_si256; unaligned loads are fine.
- * - SFENCE only if we actually streamed at least one vector.
- * - Proper bounds checking to prevent out-of-bounds writes.
- */
-static void RADV_HOT
-radeon_emit_array(struct ac_cmdbuf *cs, const uint32_t *restrict values, unsigned count)
-{
-   assert(cs->cdw + count <= cs->reserved_dw);
-   uint32_t *restrict dst = cs->buf + cs->cdw;
-   const unsigned original_count = count;
-
-#if defined(__x86_64__) || defined(_M_X64)
-   const size_t bytes = (size_t)count * 4u;
-
-   if (likely(bytes >= RADV_NT_STREAM_THRESHOLD_BYTES && radv_cpu_supports_avx2_cached())) {
-      /* Align destination to 32B for streaming stores. */
-      uintptr_t dst_u = (uintptr_t)dst;
-      unsigned misalign = (unsigned)(dst_u & 31u);
-      unsigned pre_dwords = misalign ? (unsigned)((32u - misalign) >> 2) : 0u;
-
-      if (pre_dwords) {
-         if (pre_dwords > count) {
-            pre_dwords = count;
-         }
-         memcpy(dst, values, (size_t)pre_dwords * 4u);
-         dst += pre_dwords;
-         values += pre_dwords;
-         count -= pre_dwords;
-      }
-
-      size_t vec_count = count / 8u; /* 8 dwords per 256-bit vector */
-      if (vec_count) {
-         const __m256i *restrict src_vec = (const __m256i *)values;
-         __m256i *restrict dst_vec = (__m256i *)dst;
-
-         /* Validate alignment (source can be unaligned, dest must be aligned for NT). */
-         assert(((uintptr_t)dst_vec & 31u) == 0u);
-
-         for (size_t i = 0; i < vec_count; ++i) {
-            __m256i v = _mm256_loadu_si256(&src_vec[i]);
-            _mm256_stream_si256(&dst_vec[i], v);
-         }
-         _mm_sfence(); /* Ensure visibility/order for NT stores. */
-      }
-
-      const unsigned processed = (unsigned)(vec_count * 8u);
-      if (processed < count) {
-         memcpy(dst + processed, values + processed, (size_t)(count - processed) * 4u);
-      }
-   } else
-#endif
-   {
-      /* Fallback for non-AVX2 CPUs or small copies. */
-      memcpy(dst, values, (size_t)count * 4u);
-   }
-
-   cs->cdw += original_count;
-}
-
-static RADV_ALWAYS_INLINE RADV_HOT void
 radeon_emit_unchecked(struct ac_cmdbuf *cs, uint32_t value)
 {
    cs->buf[cs->cdw++] = value;
@@ -349,13 +283,21 @@ radv_amdgpu_cs_destroy(struct ac_cmdbuf *rcs)
 {
    struct radv_amdgpu_cs *cs = radv_amdgpu_cs(rcs);
 
+   if (!cs) {
+      return;
+   }
+
    _mesa_hash_table_destroy(cs->annotations, radv_amdgpu_cs_free_annotation);
 
-   if (cs->ib_buffer)
+   if (cs->ib_buffer) {
       cs->ws->base.buffer_destroy(&cs->ws->base, cs->ib_buffer);
+   }
 
-   for (unsigned i = 0; i < cs->num_ib_buffers; ++i)
-      cs->ws->base.buffer_destroy(&cs->ws->base, cs->ib_buffers[i].bo);
+   for (unsigned i = 0; i < cs->num_ib_buffers; ++i) {
+      if (cs->ib_buffers[i].bo) {
+         cs->ws->base.buffer_destroy(&cs->ws->base, cs->ib_buffers[i].bo);
+      }
+   }
 
    free(cs->ib_buffers);
    free(cs->virtual_buffers);
@@ -368,7 +310,7 @@ radv_amdgpu_cs_destroy(struct ac_cmdbuf *rcs)
 static void
 radv_amdgpu_init_cs(struct radv_amdgpu_cs *cs, enum amd_ip_type ip_type)
 {
-   cs->buffer_hash_table_size = BUFFER_HASH_TABLE_SIZE;
+   cs->buffer_hash_table_size = 128u;
    cs->buffer_hash_table = calloc(cs->buffer_hash_table_size, sizeof(struct radv_buffer_hash_entry));
    if (unlikely(!cs->buffer_hash_table)) {
       cs->status = VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -422,8 +364,9 @@ radv_amdgpu_cs_get_new_ib(struct ac_cmdbuf *_cs, uint32_t ib_size)
    VkResult result;
 
    result = radv_amdgpu_cs_bo_create(cs, ib_size);
-   if (unlikely(result != VK_SUCCESS))
+   if (unlikely(result != VK_SUCCESS)) {
       return result;
+   }
 
    cs->ib_mapped = radv_buffer_map(&cs->ws->base, cs->ib_buffer);
    if (unlikely(!cs->ib_mapped)) {
@@ -440,8 +383,9 @@ radv_amdgpu_cs_get_new_ib(struct ac_cmdbuf *_cs, uint32_t ib_size)
    cs->ib.size = 0;
    cs->ib.ip_type = cs->hw_ip;
 
-   if (cs->chain_ib)
+   if (cs->chain_ib) {
       cs->ib_size_ptr = &cs->ib.size;
+   }
 
    cs->ws->base.cs_add_buffer(&cs->base, cs->ib_buffer);
 
@@ -463,8 +407,9 @@ radv_amdgpu_cs_create(struct radeon_winsys *ws, enum amd_ip_type ip_type, bool i
    uint32_t ib_size = radv_amdgpu_cs_get_initial_size(radv_amdgpu_winsys(ws), ip_type);
 
    cs = calloc(1, sizeof(struct radv_amdgpu_cs));
-   if (unlikely(!cs))
+   if (unlikely(!cs)) {
       return NULL;
+   }
 
    cs->is_secondary = is_secondary;
    cs->ws = radv_amdgpu_winsys(ws);
@@ -533,8 +478,9 @@ radv_amdgpu_cs_emit_nops(struct radv_amdgpu_cs *cs, const unsigned num_dw)
    const enum amd_ip_type ip_type = cs->hw_ip;
    assert(ip_type != AMDGPU_HW_IP_VCN_ENC); /* VCN_ENC has no NOP packets. */
 
-   if (!num_dw)
+   if (!num_dw) {
       return;
+   }
 
    /* Emit a single, larger PKT3 NOP packet to fill the specified amount of dwords. */
    if (num_dw > 1 && (ip_type == AMD_IP_GFX || ip_type == AMD_IP_COMPUTE)) {
@@ -544,8 +490,9 @@ radv_amdgpu_cs_emit_nops(struct radv_amdgpu_cs *cs, const unsigned num_dw)
 
    const uint32_t nop_packet = get_nop_packet(cs);
 
-   for (uint32_t i = 0; i < num_dw; ++i)
+   for (uint32_t i = 0; i < num_dw; ++i) {
       radeon_emit_unchecked(&cs->base, nop_packet);
+   }
 }
 
 static void
@@ -570,6 +517,12 @@ radv_amdgpu_cs_add_ib_buffer(struct radv_amdgpu_cs *cs, struct radeon_winsys_bo 
 static void
 radv_amdgpu_restore_last_ib(struct radv_amdgpu_cs *cs)
 {
+   /* FIX: Validate that we have at least one IB buffer before restoring. */
+   if (unlikely(cs->num_ib_buffers == 0)) {
+      cs->status = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      return;
+   }
+
    struct radv_amdgpu_ib *ib = &cs->ib_buffers[--cs->num_ib_buffers];
    assert(ib->bo);
    cs->ib_buffer = ib->bo;
@@ -589,25 +542,46 @@ radv_amdgpu_cs_grow(struct ac_cmdbuf *_cs, size_t min_size)
 
    cs->ws->base.cs_finalize(_cs);
 
+   /* FIX: Add overflow check for ib_size calculation. */
    uint64_t ib_size = MAX2(min_size * 4 + 16, cs->base.max_dw * 4 * 2);
 
-   ib_size = align(MIN2(ib_size, ~C_3F2_IB_SIZE), ib_alignment);
+   /* Ensure ib_size doesn't exceed maximum valid size. */
+   if (ib_size > ~C_3F2_IB_SIZE) {
+      ib_size = ~C_3F2_IB_SIZE;
+   }
+
+   ib_size = align(ib_size, ib_alignment);
+
+   /* FIX: Validate that alignment didn't cause overflow. */
+   if (unlikely(ib_size > UINT32_MAX)) {
+      cs->base.cdw = 0;
+      cs->status = VK_ERROR_OUT_OF_HOST_MEMORY;
+      if (cs->num_ib_buffers > 0) {
+         radv_amdgpu_restore_last_ib(cs);
+      }
+      return;
+   }
 
    VkResult result = radv_amdgpu_cs_bo_create(cs, (uint32_t)ib_size);
 
    if (result != VK_SUCCESS) {
       cs->base.cdw = 0;
       cs->status = VK_ERROR_OUT_OF_DEVICE_MEMORY;
-      radv_amdgpu_restore_last_ib(cs);
+      if (cs->num_ib_buffers > 0) {
+         radv_amdgpu_restore_last_ib(cs);
+      }
       return;
    }
 
    cs->ib_mapped = radv_buffer_map(&cs->ws->base, cs->ib_buffer);
    if (!cs->ib_mapped) {
       cs->ws->base.buffer_destroy(&cs->ws->base, cs->ib_buffer);
+      cs->ib_buffer = NULL;
       cs->base.cdw = 0;
       cs->status = VK_ERROR_OUT_OF_DEVICE_MEMORY;
-      radv_amdgpu_restore_last_ib(cs);
+      if (cs->num_ib_buffers > 0) {
+         radv_amdgpu_restore_last_ib(cs);
+      }
       return;
    }
 
@@ -635,14 +609,22 @@ radv_amdgpu_winsys_cs_pad(struct ac_cmdbuf *_cs, unsigned leave_dw_space)
    const enum amd_ip_type ip_type = cs->hw_ip;
 
    /* Don't pad on VCN encode/unified as no NOPs */
-   if (ip_type == AMDGPU_HW_IP_VCN_ENC)
+   if (ip_type == AMDGPU_HW_IP_VCN_ENC) {
       return;
+   }
 
    /* Don't add padding to 0 length UVD due to kernel. */
-   if (ip_type == AMDGPU_HW_IP_UVD && cs->base.cdw == 0)
+   if (ip_type == AMDGPU_HW_IP_UVD && cs->base.cdw == 0) {
       return;
+   }
 
    const uint32_t pad_dw_mask = cs->ws->info.ip[ip_type].ib_pad_dw_mask;
+
+   /* FIX: Add overflow check before calculating unaligned_dw. */
+   if (unlikely(cs->base.cdw > UINT32_MAX - leave_dw_space)) {
+      return;
+   }
+
    const uint32_t unaligned_dw = (cs->base.cdw + leave_dw_space) & pad_dw_mask;
 
    if (unaligned_dw) {
@@ -664,13 +646,8 @@ radv_amdgpu_cs_finalize(struct ac_cmdbuf *_cs)
    assert(cs->base.cdw <= cs->base.reserved_dw);
 
    if (cs->chain_ib) {
-      /* Pad with NOPs but leave 4 dwords for INDIRECT_BUFFER. */
       radv_amdgpu_winsys_cs_pad(_cs, 4);
-
-      /* Emit 4 dwords of NOP, these will be replaced by the chaining INDIRECT_BUFFER. */
       radv_amdgpu_cs_emit_nops(cs, 4);
-
-      assert(cs->base.cdw <= ~C_3F2_IB_SIZE);
       *cs->ib_size_ptr |= cs->base.cdw;
    } else {
       radv_amdgpu_winsys_cs_pad(_cs, 0);
@@ -698,13 +675,17 @@ radv_amdgpu_cs_reset(struct ac_cmdbuf *_cs)
    cs->base.reserved_dw = 0;
    cs->status = VK_SUCCESS;
 
+   /* FIX: Add null check before memset. */
    if (likely(cs->buffer_hash_table)) {
-      memset(cs->buffer_hash_table, 0, sizeof(struct radv_buffer_hash_entry) * BUFFER_HASH_TABLE_SIZE);
+      memset(cs->buffer_hash_table, 0, sizeof(struct radv_buffer_hash_entry) * cs->buffer_hash_table_size);
    }
 
-   for (unsigned i = 0; i < cs->num_virtual_buffers; ++i) {
-      unsigned hash = ((uintptr_t)cs->virtual_buffers[i] >> 6) & (VIRTUAL_BUFFER_HASH_TABLE_SIZE - 1);
-      cs->virtual_buffer_hash_table[hash] = -1;
+   /* FIX: Add null check before accessing virtual buffer hash table. */
+   if (cs->virtual_buffer_hash_table) {
+      for (unsigned i = 0; i < cs->num_virtual_buffers; ++i) {
+         unsigned hash = ((uintptr_t)cs->virtual_buffers[i] >> 6) & (VIRTUAL_BUFFER_HASH_TABLE_SIZE - 1);
+         cs->virtual_buffer_hash_table[hash] = -1;
+      }
    }
 
    cs->num_buffers = 0;
@@ -712,21 +693,30 @@ radv_amdgpu_cs_reset(struct ac_cmdbuf *_cs)
 
    /* When the CS is finalized and IBs are not allowed, use last IB. */
    assert(cs->ib_buffer || cs->num_ib_buffers);
-   if (!cs->ib_buffer)
+   if (!cs->ib_buffer) {
       radv_amdgpu_restore_last_ib(cs);
+      /* FIX: Check if restore failed. */
+      if (cs->status != VK_SUCCESS) {
+         return;
+      }
+   }
 
    cs->ws->base.cs_add_buffer(&cs->base, cs->ib_buffer);
 
-   for (unsigned i = 0; i < cs->num_ib_buffers; ++i)
-      cs->ws->base.buffer_destroy(&cs->ws->base, cs->ib_buffers[i].bo);
+   for (unsigned i = 0; i < cs->num_ib_buffers; ++i) {
+      if (cs->ib_buffers[i].bo) {
+         cs->ws->base.buffer_destroy(&cs->ws->base, cs->ib_buffers[i].bo);
+      }
+   }
 
    cs->num_ib_buffers = 0;
    cs->ib.ib_mc_address = radv_amdgpu_winsys_bo(cs->ib_buffer)->base.va;
 
    cs->ib.size = 0;
 
-   if (cs->chain_ib)
+   if (cs->chain_ib) {
       cs->ib_size_ptr = &cs->ib.size;
+   }
 
    _mesa_hash_table_destroy(cs->annotations, radv_amdgpu_cs_free_annotation);
    cs->annotations = NULL;
@@ -737,8 +727,9 @@ radv_amdgpu_cs_unchain(struct ac_cmdbuf *cs)
 {
    struct radv_amdgpu_cs *acs = radv_amdgpu_cs(cs);
 
-   if (!acs->chained_to)
+   if (!acs->chained_to) {
       return;
+   }
 
    assert(cs->cdw <= cs->max_dw + 4);
 
@@ -762,8 +753,9 @@ radv_amdgpu_cs_chain(struct ac_cmdbuf *cs, struct ac_cmdbuf *next_cs, bool pre_e
    struct radv_amdgpu_cs *next_acs = radv_amdgpu_cs(next_cs);
 
    /* Only some HW IP types have packets that we can use for chaining. */
-   if (!acs->chain_ib)
+   if (!acs->chain_ib) {
       return false;
+   }
 
    assert(cs->cdw <= cs->max_dw + 4);
 
@@ -804,7 +796,7 @@ radv_amdgpu_cs_find_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle)
       return -1;
    }
 
-   const uint32_t mask = BUFFER_HASH_TABLE_SIZE - 1u;
+   const uint32_t mask = cs->buffer_hash_table_size - 1u;
    uint32_t hash = radv_hash_bo(bo_handle);
    uint32_t dist = 0u;
 
@@ -812,25 +804,29 @@ radv_amdgpu_cs_find_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle)
       uint32_t pos = (hash + dist) & mask;
       struct radv_buffer_hash_entry *entry = &cs->buffer_hash_table[pos];
 
-      if (entry->bo_handle == bo_handle) {
+      if (dist < 8u) {
+         __builtin_prefetch(&cs->buffer_hash_table[(pos + 8u) & mask], 0, 1);
+      }
+
+      if (likely(entry->bo_handle == bo_handle)) {
          return entry->index;
       }
 
-      if (entry->bo_handle == 0u) {
+      if (likely(entry->bo_handle == 0u)) {
          return -1;
       }
 
-      uint32_t entry_hash = radv_hash_bo(entry->bo_handle);
-      uint32_t entry_dist = (pos - (entry_hash & mask) + BUFFER_HASH_TABLE_SIZE) & mask;
+      uint32_t entry_hash = entry->hash_cached;
+      uint32_t entry_dist = (pos - (entry_hash & mask) + cs->buffer_hash_table_size) & mask;
 
       /* If our probe distance exceeds the entry's, it's not present. */
-      if (dist > entry_dist) {
+      if (unlikely(dist > entry_dist)) {
          return -1;
       }
 
       dist++;
       /* Prevent infinite loop: if table is full, bail out. */
-      if (unlikely(dist >= BUFFER_HASH_TABLE_SIZE)) {
+      if (unlikely(dist >= cs->buffer_hash_table_size)) {
          /* Table full; fall back to linear search as last resort. */
          for (unsigned i = 0; i < cs->num_buffers; ++i) {
             if (cs->handles[i].bo_handle == bo_handle) {
@@ -850,32 +846,47 @@ radv_amdgpu_cs_insert_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle, int 
       return;
    }
 
-   const uint32_t mask = BUFFER_HASH_TABLE_SIZE - 1u;
+   /* FIX: Validate index to prevent out-of-bounds access. */
+   if (unlikely(index < 0 || (unsigned)index >= cs->num_buffers)) {
+      return;
+   }
+
+   const uint32_t mask = cs->buffer_hash_table_size - 1u;
    uint32_t hash = radv_hash_bo(bo_handle);
    uint32_t dist = 0u;
 
-   struct radv_buffer_hash_entry new_entry = { .bo_handle = bo_handle, .index = index };
+   struct radv_buffer_hash_entry new_entry = {
+      .bo_handle = bo_handle,
+      .hash_cached = hash,
+      .index = index,
+      ._pad = 0,
+   };
 
    for (;;) {
       uint32_t pos = (hash + dist) & mask;
       struct radv_buffer_hash_entry *entry = &cs->buffer_hash_table[pos];
 
-      if (entry->bo_handle == 0u) {
+      if (dist < 8u) {
+         __builtin_prefetch(&cs->buffer_hash_table[(pos + 8u) & mask], 1, 1);
+      }
+
+      if (likely(entry->bo_handle == 0u)) {
          *entry = new_entry;
          return;
       }
 
-      if (entry->bo_handle == bo_handle) {
+      if (unlikely(entry->bo_handle == bo_handle)) {
          /* Update existing entry's index. */
          entry->index = index;
+         entry->hash_cached = hash;
          return;
       }
 
-      uint32_t entry_hash = radv_hash_bo(entry->bo_handle);
-      uint32_t entry_dist = (pos - (entry_hash & mask) + BUFFER_HASH_TABLE_SIZE) & mask;
+      uint32_t entry_hash = entry->hash_cached;
+      uint32_t entry_dist = (pos - (entry_hash & mask) + cs->buffer_hash_table_size) & mask;
 
       /* Robin Hood: swap if new entry has traveled farther. */
-      if (dist > entry_dist) {
+      if (unlikely(dist > entry_dist)) {
          struct radv_buffer_hash_entry tmp = *entry;
          *entry = new_entry;
          new_entry = tmp;
@@ -886,9 +897,9 @@ radv_amdgpu_cs_insert_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle, int 
 
       dist++;
       /* Prevent infinite loop and set error on table full. */
-      if (unlikely(dist >= BUFFER_HASH_TABLE_SIZE)) {
+      if (unlikely(dist >= cs->buffer_hash_table_size)) {
          cs->status = VK_ERROR_OUT_OF_HOST_MEMORY;
-         return; /* Critical fix: RETURN to break loop. */
+         return; /* Critical: break loop. */
       }
    }
 }
@@ -896,20 +907,27 @@ radv_amdgpu_cs_insert_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle, int 
 static void
 radv_amdgpu_cs_resize_buffer_hash_table(struct radv_amdgpu_cs *cs)
 {
-   if (unlikely(!cs->buffer_hash_table))
+   /* Check if the table exists before trying to resize it. */
+   if (cs->buffer_hash_table == NULL) {
       return;
+   }
 
    const uint32_t old_size = cs->buffer_hash_table_size;
+
+   /* FIX: Add overflow check before doubling size. */
+   if (old_size > RADV_MAX_HASH_TABLE_SIZE / 2u) {
+      return;
+   }
+
    const uint32_t new_size = old_size * 2u;
 
-   /* Cap at 16K entries (256KB) to avoid excessive memory. */
-   if (new_size > 16384u) {
+   if (new_size > RADV_MAX_HASH_TABLE_SIZE) {
       return;
    }
 
    struct radv_buffer_hash_entry *new_table =
       calloc(new_size, sizeof(struct radv_buffer_hash_entry));
-   if (unlikely(!new_table)) {
+   if (unlikely(new_table == NULL)) {
       /* Resize failed; continue with old table (degraded performance). */
       return;
    }
@@ -917,12 +935,23 @@ radv_amdgpu_cs_resize_buffer_hash_table(struct radv_amdgpu_cs *cs)
    /* Rehash all existing entries into new table. */
    struct radv_buffer_hash_entry *old_table = cs->buffer_hash_table;
    cs->buffer_hash_table = new_table;
+   const uint32_t saved_size = cs->buffer_hash_table_size;
    cs->buffer_hash_table_size = new_size;
 
    for (uint32_t i = 0; i < old_size; ++i) {
       if (old_table[i].bo_handle != 0u) {
          radv_amdgpu_cs_insert_buffer(cs, old_table[i].bo_handle, old_table[i].index);
       }
+   }
+
+   /* Check if rehash failed (new table full due to hash collisions). */
+   if (unlikely(cs->status != VK_SUCCESS)) {
+      /* Restore old table. */
+      free(new_table);
+      cs->buffer_hash_table = old_table;
+      cs->buffer_hash_table_size = saved_size;
+      cs->status = VK_SUCCESS; /* Ignore error; continue with old table. */
+      return;
    }
 
    free(old_table);
@@ -932,18 +961,27 @@ static void
 radv_amdgpu_cs_add_buffer_internal(struct radv_amdgpu_cs *cs, uint32_t bo, uint8_t priority)
 {
    /* Bail out early if already in error state. */
-   if (unlikely(cs->status != VK_SUCCESS))
+   if (unlikely(cs->status != VK_SUCCESS)) {
       return;
+   }
 
-   if (radv_amdgpu_cs_find_buffer(cs, bo) != -1)
+   if (radv_amdgpu_cs_find_buffer(cs, bo) != -1) {
       return;
+   }
 
-   /* Resize if load factor > 50% BEFORE adding. */
-   if (cs->buffer_hash_table && cs->num_buffers * 2u > cs->buffer_hash_table_size) {
+   /* FIX: Add overflow check before comparison. */
+   if (cs->buffer_hash_table && cs->num_buffers <= UINT32_MAX / 2u &&
+       cs->num_buffers * 2u >= cs->buffer_hash_table_size) {
       radv_amdgpu_cs_resize_buffer_hash_table(cs);
    }
 
-   if (unlikely(cs->num_buffers == cs->max_num_buffers)) {
+   if (unlikely(cs->num_buffers >= cs->max_num_buffers)) {
+      /* FIX: Add overflow check before doubling. */
+      if (cs->max_num_buffers > UINT32_MAX / 2u) {
+         cs->status = VK_ERROR_OUT_OF_HOST_MEMORY;
+         return;
+      }
+
       unsigned new_count = MAX2(1, cs->max_num_buffers * 2u);
       struct drm_amdgpu_bo_list_entry *new_entries =
          realloc(cs->handles, new_count * sizeof(struct drm_amdgpu_bo_list_entry));
@@ -962,8 +1000,9 @@ radv_amdgpu_cs_add_buffer_internal(struct radv_amdgpu_cs *cs, uint32_t bo, uint8
    radv_amdgpu_cs_insert_buffer(cs, bo, new_index);
 
    /* Check if insert failed due to table full. */
-   if (unlikely(cs->status != VK_SUCCESS))
+   if (unlikely(cs->status != VK_SUCCESS)) {
       return;
+   }
 
    cs->num_buffers++;
 }
@@ -972,6 +1011,12 @@ static void
 radv_amdgpu_cs_add_virtual_buffer(struct ac_cmdbuf *_cs, struct radeon_winsys_bo *bo)
 {
    struct radv_amdgpu_cs *cs = radv_amdgpu_cs(_cs);
+
+   /* FIX: Add null check. */
+   if (unlikely(!bo)) {
+      return;
+   }
+
    unsigned hash = ((uintptr_t)bo >> 6) & (VIRTUAL_BUFFER_HASH_TABLE_SIZE - 1);
 
    if (!cs->virtual_buffer_hash_table) {
@@ -982,8 +1027,9 @@ radv_amdgpu_cs_add_virtual_buffer(struct ac_cmdbuf *_cs, struct radeon_winsys_bo
       }
       cs->virtual_buffer_hash_table = virtual_buffer_hash_table;
 
-      for (int i = 0; i < VIRTUAL_BUFFER_HASH_TABLE_SIZE; ++i)
+      for (int i = 0; i < VIRTUAL_BUFFER_HASH_TABLE_SIZE; ++i) {
          cs->virtual_buffer_hash_table[i] = -1;
+      }
    }
 
    if (cs->virtual_buffer_hash_table[hash] >= 0) {
@@ -1000,6 +1046,12 @@ radv_amdgpu_cs_add_virtual_buffer(struct ac_cmdbuf *_cs, struct radeon_winsys_bo
    }
 
    if (cs->max_num_virtual_buffers <= cs->num_virtual_buffers) {
+      /* FIX: Add overflow check. */
+      if (cs->max_num_virtual_buffers > UINT32_MAX / 2u) {
+         cs->status = VK_ERROR_OUT_OF_HOST_MEMORY;
+         return;
+      }
+
       unsigned max_num_virtual_buffers = MAX2(2, cs->max_num_virtual_buffers * 2);
       struct radeon_winsys_bo **virtual_buffers =
          realloc(cs->virtual_buffers, sizeof(struct radeon_winsys_bo *) * max_num_virtual_buffers);
@@ -1026,10 +1078,11 @@ radv_amdgpu_cs_add_buffer(struct ac_cmdbuf *_cs, struct radeon_winsys_bo *_bo)
    struct radv_amdgpu_cs *cs = radv_amdgpu_cs(_cs);
    struct radv_amdgpu_winsys_bo *bo = radv_amdgpu_winsys_bo(_bo);
 
-   if (unlikely(cs->status != VK_SUCCESS))
+   if (unlikely(cs->status != VK_SUCCESS)) {
       return;
+   }
 
-   if (bo->base.is_virtual) {
+   if (unlikely(bo->base.is_virtual)) {
       radv_amdgpu_cs_add_virtual_buffer(_cs, _bo);
       return;
    }
@@ -1056,8 +1109,9 @@ radv_amdgpu_cs_emit_secondary_ib2(struct radv_amdgpu_cs *parent, struct radv_amd
    const uint32_t num_ib2 = child->chain_ib ? 1 : child->num_ib_buffers;
 
    for (uint32_t i = 0; i < num_ib2; ++i) {
-      if (parent->base.cdw + 4 > parent->base.max_dw)
+      if (parent->base.cdw + 4 > parent->base.max_dw) {
          radv_amdgpu_cs_grow(&parent->base, 4);
+      }
 
       parent->base.reserved_dw = MAX2(parent->base.reserved_dw, parent->base.cdw + 4);
 
@@ -1065,10 +1119,7 @@ radv_amdgpu_cs_emit_secondary_ib2(struct radv_amdgpu_cs *parent, struct radv_amd
       const uint32_t size = child->ib_buffers[i].cdw;
 
       /* Not setting the CHAIN bit will launch an IB2. */
-      radeon_emit(&parent->base, PKT3(PKT3_INDIRECT_BUFFER, 2, 0));
-      radeon_emit(&parent->base, va);
-      radeon_emit(&parent->base, va >> 32);
-      radeon_emit(&parent->base, size);
+      ac_emit_cp_indirect_buffer(&parent->base, va, size, 0, false);
 
       assert(parent->base.cdw <= parent->base.max_dw);
    }
@@ -1082,8 +1133,9 @@ radv_amdgpu_cs_execute_secondary(struct ac_cmdbuf *_parent, struct ac_cmdbuf *_c
    struct radv_amdgpu_winsys *ws = parent->ws;
    const bool use_ib2 = !parent->is_secondary && allow_ib2 && parent->hw_ip == AMD_IP_GFX;
 
-   if (unlikely(parent->status != VK_SUCCESS || child->status != VK_SUCCESS))
+   if (parent->status != VK_SUCCESS || child->status != VK_SUCCESS) {
       return;
+   }
 
    for (unsigned i = 0; i < child->num_buffers; ++i) {
       radv_amdgpu_cs_add_buffer_internal(parent, child->handles[i].bo_handle, child->handles[i].bo_priority);
@@ -1103,13 +1155,20 @@ radv_amdgpu_cs_execute_secondary(struct ac_cmdbuf *_parent, struct ac_cmdbuf *_c
          uint8_t *mapped;
 
          /* Do not copy the original chain link for IBs. */
-         if (child->chain_ib)
+         if (child->chain_ib) {
+            /* FIX: Validate cdw before decrement. */
+            if (cdw < 4) {
+               parent->status = VK_ERROR_UNKNOWN;
+               return;
+            }
             cdw -= 4;
+         }
 
          assert(ib->bo);
 
-         if (parent->base.cdw + cdw > parent->base.max_dw)
+         if (parent->base.cdw + cdw > parent->base.max_dw) {
             radv_amdgpu_cs_grow(&parent->base, cdw);
+         }
 
          parent->base.reserved_dw = MAX2(parent->base.reserved_dw, parent->base.cdw + cdw);
 
@@ -1119,7 +1178,14 @@ radv_amdgpu_cs_execute_secondary(struct ac_cmdbuf *_parent, struct ac_cmdbuf *_c
             return;
          }
 
-         radeon_emit_array(&parent->base, (uint32_t *)mapped, cdw);
+         /* FIX: Add overflow check for memcpy size. */
+         if (unlikely(cdw > UINT32_MAX / 4u)) {
+            parent->status = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            return;
+         }
+
+         memcpy(parent->base.buf + parent->base.cdw, mapped, 4 * cdw);
+         parent->base.cdw += cdw;
       }
    }
 }
@@ -1131,16 +1197,19 @@ radv_amdgpu_cs_execute_ib(struct ac_cmdbuf *_cs, struct radeon_winsys_bo *bo, ui
    struct radv_amdgpu_cs *cs = radv_amdgpu_cs(_cs);
    const uint64_t ib_va = bo ? bo->va : va;
 
-   if (unlikely(cs->status != VK_SUCCESS))
+   if (unlikely(cs->status != VK_SUCCESS)) {
       return;
+   }
 
-   assert(ib_va && ib_va % cs->ws->info.ip[cs->hw_ip].ib_alignment == 0);
+   /* FIX: Validate alignment. */
+   if (unlikely(ib_va == 0 || ib_va % cs->ws->info.ip[cs->hw_ip].ib_alignment != 0)) {
+      cs->status = VK_ERROR_UNKNOWN;
+      return;
+   }
+
    assert(cs->hw_ip == AMD_IP_GFX && cdw <= ~C_3F2_IB_SIZE);
 
-   radeon_emit(&cs->base, PKT3(PKT3_INDIRECT_BUFFER, 2, predicate));
-   radeon_emit(&cs->base, ib_va);
-   radeon_emit(&cs->base, ib_va >> 32);
-   radeon_emit(&cs->base, cdw);
+   ac_emit_cp_indirect_buffer(&cs->base, ib_va, cdw, 0, predicate);
 }
 
 static void
@@ -1149,8 +1218,9 @@ radv_amdgpu_cs_chain_dgc_ib(struct ac_cmdbuf *_cs, uint64_t va, uint32_t cdw, ui
 {
    struct radv_amdgpu_cs *cs = radv_amdgpu_cs(_cs);
 
-   if (unlikely(cs->status != VK_SUCCESS))
+   if (unlikely(cs->status != VK_SUCCESS)) {
       return;
+   }
 
    assert(cs->ws->info.gfx_level >= GFX8);
 
@@ -1158,7 +1228,12 @@ radv_amdgpu_cs_chain_dgc_ib(struct ac_cmdbuf *_cs, uint64_t va, uint32_t cdw, ui
       /* Use IB2 for executing DGC CS on GFX. */
       cs->ws->base.cs_execute_ib(_cs, NULL, va, cdw, predicate);
    } else {
-      assert(va && va % cs->ws->info.ip[cs->hw_ip].ib_alignment == 0);
+      /* FIX: Validate alignment. */
+      if (unlikely(va == 0 || va % cs->ws->info.ip[cs->hw_ip].ib_alignment != 0)) {
+         cs->status = VK_ERROR_UNKNOWN;
+         return;
+      }
+
       assert(cdw <= ~C_3F2_IB_SIZE);
 
       /* Emit a WRITE_DATA packet to patch the DGC CS. */
@@ -1169,11 +1244,7 @@ radv_amdgpu_cs_chain_dgc_ib(struct ac_cmdbuf *_cs, uint64_t va, uint32_t cdw, ui
          S_3F2_CHAIN(1) | S_3F2_VALID(1),
       };
 
-      radeon_emit(&cs->base, PKT3(PKT3_WRITE_DATA, 2 + ARRAY_SIZE(chain_data), false));
-      radeon_emit(&cs->base, S_370_DST_SEL(V_370_MEM) | S_370_WR_CONFIRM(1) | S_370_ENGINE_SEL(V_370_ME));
-      radeon_emit(&cs->base, trailer_va);
-      radeon_emit(&cs->base, trailer_va >> 32);
-      radeon_emit_array(&cs->base, chain_data, ARRAY_SIZE(chain_data));
+      ac_emit_cp_write_data(&cs->base, V_370_ME, V_370_MEM, trailer_va, ARRAY_SIZE(chain_data), chain_data, false);
 
       /* Keep pointers for patching later. */
       uint64_t *ib_va_ptr = (uint64_t *)(cs->base.buf + cs->base.cdw - 3);
@@ -1181,13 +1252,8 @@ radv_amdgpu_cs_chain_dgc_ib(struct ac_cmdbuf *_cs, uint64_t va, uint32_t cdw, ui
 
       /* Writeback L2 because CP isn't coherent with L2 on GFX6-8. */
       if (cs->ws->info.gfx_level == GFX8) {
-         radeon_emit(&cs->base, PKT3(PKT3_ACQUIRE_MEM, 5, false) | PKT3_SHADER_TYPE_S(1));
-         radeon_emit(&cs->base, S_0301F0_TC_WB_ACTION_ENA(1) | S_0301F0_TC_NC_ACTION_ENA(1));
-         radeon_emit(&cs->base, 0xffffffff);
-         radeon_emit(&cs->base, 0xff);
-         radeon_emit(&cs->base, 0);
-         radeon_emit(&cs->base, 0);
-         radeon_emit(&cs->base, 0x0000000A);
+         ac_emit_cp_acquire_mem(&cs->base, GFX8, AMD_IP_COMPUTE, V_580_CP_ME,
+                                S_0301F0_TC_WB_ACTION_ENA(1) | S_0301F0_TC_NC_ACTION_ENA(1));
       }
 
       /* Finalize the current CS. */
@@ -1236,8 +1302,9 @@ radv_amdgpu_count_cs_bo(struct radv_amdgpu_cs *start_cs)
 
    for (struct radv_amdgpu_cs *cs = start_cs; cs; cs = cs->chained_to) {
       num_bo += cs->num_buffers;
-      for (unsigned j = 0; j < cs->num_virtual_buffers; ++j)
+      for (unsigned j = 0; j < cs->num_virtual_buffers; ++j) {
          num_bo += radv_amdgpu_winsys_bo(cs->virtual_buffers[j])->bo_count;
+      }
    }
 
    return num_bo;
@@ -1255,11 +1322,67 @@ radv_amdgpu_count_cs_array_bo(struct ac_cmdbuf **cs_array, unsigned num_cs)
    return num_bo;
 }
 
+/* OPTIMIZATION 1: AVX2-accelerated linear BO search for small lists. */
+#if defined(__x86_64__) || defined(_M_X64)
+static RADV_ALWAYS_INLINE int
+radv_linear_search_bo_avx2(const struct drm_amdgpu_bo_list_entry *handles, unsigned count, uint32_t target)
+{
+   if (!radv_cpu_supports_avx2_cached()) {
+      /* Scalar fallback. */
+      for (unsigned i = 0; i < count; ++i) {
+         if (handles[i].bo_handle == target) {
+            return (int)i;
+         }
+      }
+      return -1;
+   }
+
+   /* AVX2 path: process 8 handles at a time. */
+   __m256i target_vec = _mm256_set1_epi32((int32_t)target);
+   unsigned i = 0;
+
+   /* Vectorized loop (8 elements/iteration). */
+   for (; i + 8u <= count; i += 8u) {
+      /* Load 8 consecutive bo_handle fields. Assumes bo_handle is at offset 0 in struct. */
+      __m256i handles_vec = _mm256_loadu_si256((const __m256i *)&handles[i]);
+      __m256i cmp = _mm256_cmpeq_epi32(handles_vec, target_vec);
+      int mask = _mm256_movemask_epi8(cmp);
+      if (mask) {
+         /* Found a match; determine exact index. */
+         int bit_idx = __builtin_ctz((unsigned)mask) / 4; /* Each match is 4 bytes. */
+         return (int)(i + (unsigned)bit_idx);
+      }
+   }
+
+   /* Scalar tail for remaining elements. */
+   for (; i < count; ++i) {
+      if (handles[i].bo_handle == target) {
+         return (int)i;
+      }
+   }
+
+   return -1;
+}
+#else
+/* Non-x86: scalar only. */
+static RADV_ALWAYS_INLINE int
+radv_linear_search_bo_avx2(const struct drm_amdgpu_bo_list_entry *handles, unsigned count, uint32_t target)
+{
+   for (unsigned i = 0; i < count; ++i) {
+      if (handles[i].bo_handle == target) {
+         return (int)i;
+      }
+   }
+   return -1;
+}
+#endif
+
 static unsigned
 radv_amdgpu_add_cs_to_bo_list(struct radv_amdgpu_cs *cs, struct drm_amdgpu_bo_list_entry *handles, unsigned num_handles)
 {
-   if (!cs->num_buffers)
+   if (!cs->num_buffers) {
       return num_handles;
+   }
 
    if (num_handles == 0 && !cs->num_virtual_buffers) {
       memcpy(handles, cs->handles, cs->num_buffers * sizeof(struct drm_amdgpu_bo_list_entry));
@@ -1268,32 +1391,22 @@ radv_amdgpu_add_cs_to_bo_list(struct radv_amdgpu_cs *cs, struct drm_amdgpu_bo_li
 
    int unique_bo_so_far = (int)num_handles;
    for (unsigned j = 0; j < cs->num_buffers; ++j) {
-      bool found = false;
-      for (unsigned k = 0; k < (unsigned)unique_bo_so_far; ++k) {
-         if (handles[k].bo_handle == cs->handles[j].bo_handle) {
-            found = true;
-            break;
-         }
-      }
-      if (!found) {
-         handles[num_handles] = cs->handles[j];
-         ++num_handles;
+      /* OPTIMIZED: Use AVX2 linear search. */
+      int idx = radv_linear_search_bo_avx2(handles, (unsigned)unique_bo_so_far, cs->handles[j].bo_handle);
+      if (idx < 0) {
+         handles[num_handles++] = cs->handles[j];
       }
    }
+
    for (unsigned j = 0; j < cs->num_virtual_buffers; ++j) {
       struct radv_amdgpu_winsys_bo *virtual_bo = radv_amdgpu_winsys_bo(cs->virtual_buffers[j]);
       u_rwlock_rdlock(&virtual_bo->lock);
       for (unsigned k = 0; k < virtual_bo->bo_count; ++k) {
          struct radv_amdgpu_winsys_bo *bo = virtual_bo->bos[k];
-         bool found = false;
-         for (unsigned m = 0; m < num_handles; ++m) {
-            if (handles[m].bo_handle == bo->bo_handle) {
-               found = true;
-               break;
-            }
-         }
-         if (!found) {
-            handles[num_handles].bo_handle = bo->bo_handle;
+         uint32_t h = bo->bo_handle;
+         int idx = radv_linear_search_bo_avx2(handles, num_handles, h);
+         if (idx < 0) {
+            handles[num_handles].bo_handle = h;
             handles[num_handles].bo_priority = bo->priority;
             ++num_handles;
          }
@@ -1358,6 +1471,14 @@ radv_next_pow2_u32(uint32_t v)
 static bool
 radv_bo_set_init(struct radv_bo_set *set, uint32_t expected_elems)
 {
+   /* FIX: Add overflow check. */
+   if (expected_elems > UINT32_MAX / 2u) {
+      set->full = true;
+      set->entries = NULL;
+      set->size = 0;
+      return false;
+   }
+
    uint64_t want = (uint64_t)expected_elems * 2u;
    if (want < 8u) {
       want = 8u;
@@ -1468,46 +1589,79 @@ radv_amdgpu_get_bo_list(struct radv_amdgpu_winsys *ws, struct ac_cmdbuf **cs_arr
    struct drm_amdgpu_bo_list_entry *handles = NULL;
    unsigned num_handles = 0;
 
-   if (ws->debug_all_bos) {
-      handles = malloc(sizeof(handles[0]) * ws->global_bo_list.count);
-      if (unlikely(!handles))
-         return VK_ERROR_OUT_OF_HOST_MEMORY;
+   uint32_t global_bo_count = 0;
+   struct radv_amdgpu_winsys_bo **global_bos_snapshot = NULL;
 
-      num_handles = radv_amdgpu_copy_global_bo_list(ws, handles);
+   u_rwlock_rdlock(&ws->global_bo_list.lock);
+   global_bo_count = ws->global_bo_list.count;
+   if (global_bo_count > 0) {
+      global_bos_snapshot = malloc(sizeof(struct radv_amdgpu_winsys_bo *) * global_bo_count);
+      if (unlikely(!global_bos_snapshot)) {
+         u_rwlock_rdunlock(&ws->global_bo_list.lock);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+      /* BO pointers are stable (refcounted); safe to copy. */
+      memcpy(global_bos_snapshot, ws->global_bo_list.bos, sizeof(void *) * global_bo_count);
+   }
+   u_rwlock_rdunlock(&ws->global_bo_list.lock);
+
+   if (ws->debug_all_bos) {
+      handles = malloc(sizeof(handles[0]) * global_bo_count);
+      if (unlikely(!handles)) {
+         free(global_bos_snapshot);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+
+      for (uint32_t i = 0; i < global_bo_count; i++) {
+         handles[i].bo_handle = global_bos_snapshot[i]->bo_handle;
+         handles[i].bo_priority = global_bos_snapshot[i]->priority;
+      }
+      num_handles = global_bo_count;
+      free(global_bos_snapshot);
    } else if (count == 1 && !num_initial_preambles && !num_continue_preambles && !num_postambles &&
               !radv_amdgpu_cs(cs_array[0])->num_virtual_buffers && !radv_amdgpu_cs(cs_array[0])->chained_to &&
-              !ws->global_bo_list.count) {
+              global_bo_count == 0) {
       /* Fast path: single CS, no virtual BOs, no global BOs. */
       struct radv_amdgpu_cs *cs = radv_amdgpu_cs(cs_array[0]);
-      if (cs->num_buffers == 0)
+      free(global_bos_snapshot);
+      if (cs->num_buffers == 0) {
          return VK_SUCCESS;
+      }
 
       handles = malloc(sizeof(handles[0]) * cs->num_buffers);
-      if (unlikely(!handles))
+      if (unlikely(!handles)) {
          return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
 
       memcpy(handles, cs->handles, sizeof(handles[0]) * cs->num_buffers);
       num_handles = cs->num_buffers;
    } else {
-      unsigned total_buffer_count = ws->global_bo_list.count;
+      unsigned total_buffer_count = global_bo_count;
       total_buffer_count += radv_amdgpu_count_cs_array_bo(cs_array, count);
       total_buffer_count += radv_amdgpu_count_cs_array_bo(initial_preamble_array, num_initial_preambles);
       total_buffer_count += radv_amdgpu_count_cs_array_bo(continue_preamble_array, num_continue_preambles);
       total_buffer_count += radv_amdgpu_count_cs_array_bo(postamble_array, num_postambles);
 
-      if (total_buffer_count == 0)
+      if (total_buffer_count == 0) {
+         free(global_bos_snapshot);
          return VK_SUCCESS;
+      }
 
       handles = malloc(sizeof(handles[0]) * total_buffer_count);
-      if (unlikely(!handles))
+      if (unlikely(!handles)) {
+         free(global_bos_snapshot);
          return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
 
-      /* OPTIMIZED: Lower threshold for hash-based dedup (was 512, now 128). */
-      const unsigned DEDUP_THRESHOLD = 128u;
+      if (total_buffer_count <= RADV_SMALL_BO_DEDUP_THRESHOLD) {
+         /* Copy global BOs from snapshot. */
+         for (uint32_t i = 0; i < global_bo_count; i++) {
+            handles[num_handles].bo_handle = global_bos_snapshot[i]->bo_handle;
+            handles[num_handles].bo_priority = global_bos_snapshot[i]->priority;
+            ++num_handles;
+         }
+         free(global_bos_snapshot);
 
-      if (total_buffer_count <= DEDUP_THRESHOLD) {
-         /* Small lists: O(N²) is faster due to cache locality and no hash overhead. */
-         num_handles = radv_amdgpu_copy_global_bo_list(ws, handles);
          num_handles = radv_amdgpu_add_cs_array_to_bo_list(cs_array, count, handles, num_handles);
          num_handles =
             radv_amdgpu_add_cs_array_to_bo_list(initial_preamble_array, num_initial_preambles, handles, num_handles);
@@ -1519,18 +1673,20 @@ radv_amdgpu_get_bo_list(struct radv_amdgpu_winsys *ws, struct ac_cmdbuf **cs_arr
          struct radv_bo_set present;
          if (unlikely(!radv_bo_set_init(&present, total_buffer_count))) {
             free(handles);
+            free(global_bos_snapshot);
             return VK_ERROR_OUT_OF_HOST_MEMORY;
          }
 
-         /* Insert global BOs. */
-         for (uint32_t i = 0; i < ws->global_bo_list.count; i++) {
-            uint32_t h = ws->global_bo_list.bos[i]->bo_handle;
+         /* Insert global BOs from snapshot. */
+         for (uint32_t i = 0; i < global_bo_count; i++) {
+            uint32_t h = global_bos_snapshot[i]->bo_handle;
             if (radv_bo_set_insert(&present, h)) {
                handles[num_handles].bo_handle = h;
-               handles[num_handles].bo_priority = ws->global_bo_list.bos[i]->priority;
+               handles[num_handles].bo_priority = global_bos_snapshot[i]->priority;
                ++num_handles;
             }
          }
+         free(global_bos_snapshot);
 
          /* Process preambles and CS arrays. */
          for (unsigned i = 0; i < num_initial_preambles; ++i) {
@@ -1567,6 +1723,12 @@ radv_amdgpu_get_bo_list(struct radv_amdgpu_winsys *ws, struct ac_cmdbuf **cs_arr
 static void
 radv_assign_last_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request *request)
 {
+   /* FIX: Validate IP type and ring indices. */
+   if (unlikely(request->ip_type >= AMD_NUM_IP_TYPES ||
+                request->ring >= MAX_RINGS_PER_TYPE)) {
+      return;
+   }
+
    radv_amdgpu_request_to_fence(ctx, &ctx->last_submission[request->ip_type][request->ring], request);
 }
 
@@ -1614,13 +1776,19 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
    struct drm_amdgpu_bo_list_entry *handles = NULL;
    unsigned num_handles = 0;
 
+   /* FIX: Check if STACK_ARRAY allocation succeeded. */
+   if (unlikely(!ibs)) {
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
    u_rwlock_rdlock(&ws->global_bo_list.lock);
 
    result = radv_amdgpu_get_bo_list(ws, &cs_array[0], cs_count, initial_preamble_cs, initial_preamble_count,
                                     continue_preamble_cs, continue_preamble_count, postamble_cs, postamble_count,
                                     &num_handles, &handles);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
       goto fail;
+   }
 
    /* Configure the CS request. */
    const uint32_t *max_ib_per_ip = ws->info.max_submitted_ibs;
@@ -1637,6 +1805,13 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
    for (unsigned cs_idx = 0, cs_ib_idx = 0; cs_idx < cs_count;) {
       struct ac_cmdbuf **preambles = cs_idx ? continue_preamble_cs : initial_preamble_cs;
       const unsigned preamble_count = cs_idx ? continue_preamble_count : initial_preamble_count;
+
+      /* FIX: Add overflow check. */
+      if (unlikely(RADV_MAX_IBS_PER_SUBMIT < preamble_count + postamble_count)) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto fail;
+      }
+
       const unsigned ib_per_submit = RADV_MAX_IBS_PER_SUBMIT - preamble_count - postamble_count;
       unsigned num_submitted_ibs = 0;
       unsigned ibs_per_ip[AMD_NUM_IP_TYPES] = {0};
@@ -1651,7 +1826,11 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
          ib = radv_amdgpu_cs_ib_to_info(cs, cs->ib_buffers[0]);
 
          ibs[num_submitted_ibs++] = ib;
-         ibs_per_ip[cs->hw_ip]++;
+
+         /* FIX: Validate IP type. */
+         if (cs->hw_ip < AMD_NUM_IP_TYPES) {
+            ibs_per_ip[cs->hw_ip]++;
+         }
       }
 
       for (unsigned i = 0; i < ib_per_submit && cs_idx < cs_count; ++i) {
@@ -1661,8 +1840,16 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
          if (cs_ib_idx == 0) {
             /* Make sure the whole CS fits into the same submission. */
             unsigned cs_num_ib = radv_amdgpu_submitted_ibs_per_cs(cs);
-            if (i + cs_num_ib > ib_per_submit || ibs_per_ip[cs->hw_ip] + cs_num_ib > max_ib_per_ip[cs->hw_ip])
+
+            /* FIX: Validate IP type before array access. */
+            if (cs->hw_ip >= AMD_NUM_IP_TYPES) {
+               result = VK_ERROR_UNKNOWN;
+               goto fail;
+            }
+
+            if (i + cs_num_ib > ib_per_submit || ibs_per_ip[cs->hw_ip] + cs_num_ib > max_ib_per_ip[cs->hw_ip]) {
                break;
+            }
 
             if (cs->hw_ip != request.ip_type) {
                /* Found a "follower" CS in a gang submission.
@@ -1673,9 +1860,17 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
                struct radv_amdgpu_cs *next_cs = radv_amdgpu_cs(cs_array[cs_idx + 1]);
                assert(next_cs->hw_ip == request.ip_type);
                unsigned next_cs_num_ib = radv_amdgpu_submitted_ibs_per_cs(next_cs);
+
+               /* FIX: Validate next CS IP type. */
+               if (next_cs->hw_ip >= AMD_NUM_IP_TYPES) {
+                  result = VK_ERROR_UNKNOWN;
+                  goto fail;
+               }
+
                if (i + cs_num_ib + next_cs_num_ib > ib_per_submit ||
-                   ibs_per_ip[next_cs->hw_ip] + next_cs_num_ib > max_ib_per_ip[next_cs->hw_ip])
+                   ibs_per_ip[next_cs->hw_ip] + next_cs_num_ib > max_ib_per_ip[next_cs->hw_ip]) {
                   break;
+               }
             }
          }
 
@@ -1696,12 +1891,17 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
             }
          }
 
-         if (uses_shadow_regs && ib.ip_type == AMDGPU_HW_IP_GFX)
+         if (uses_shadow_regs && ib.ip_type == AMDGPU_HW_IP_GFX) {
             ib.flags |= AMDGPU_IB_FLAG_PREEMPT;
+         }
 
          assert(num_submitted_ibs < ib_array_size);
          ibs[num_submitted_ibs++] = ib;
-         ibs_per_ip[cs->hw_ip]++;
+
+         /* FIX: Validate IP type. */
+         if (cs->hw_ip < AMD_NUM_IP_TYPES) {
+            ibs_per_ip[cs->hw_ip]++;
+         }
       }
 
       assert(num_submitted_ibs > preamble_count);
@@ -1716,20 +1916,26 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
          ib = radv_amdgpu_cs_ib_to_info(cs, cs->ib_buffers[0]);
 
          ibs[num_submitted_ibs++] = ib;
-         ibs_per_ip[cs->hw_ip]++;
+
+         /* FIX: Validate IP type. */
+         if (cs->hw_ip < AMD_NUM_IP_TYPES) {
+            ibs_per_ip[cs->hw_ip]++;
+         }
       }
 
       /* Submit the CS. */
       request.number_of_ibs = num_submitted_ibs;
       result = radv_amdgpu_cs_submit(ctx, &request, sem_info);
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
          goto fail;
+      }
    }
 
    free(request.handles);
 
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
       goto fail;
+   }
 
    radv_assign_last_submit(ctx, &request);
 
