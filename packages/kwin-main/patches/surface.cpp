@@ -38,37 +38,6 @@ namespace KWin
 
 static QRegion map_helper(const QMatrix4x4 &matrix, const QRegion &region)
 {
-    if (region.isEmpty()) {
-        return QRegion();
-    }
-
-    // Fast-path: identity matrix (common when scaleOverride == 1.0)
-    if (matrix.isIdentity()) {
-        return region;
-    }
-
-    // Fast-path: pure translation
-    bool isTranslation = true;
-    for (int row = 0; row < 3; ++row) {
-        for (int col = 0; col < 3; ++col) {
-            const float expected = (row == col) ? 1.0f : 0.0f;
-            if (matrix(row, col) != expected) {
-                isTranslation = false;
-                goto not_translation;
-            }
-        }
-    }
-    if (matrix(3, 0) == 0.0f && matrix(3, 1) == 0.0f && matrix(3, 2) == 0.0f && matrix(3, 3) == 1.0f) {
-        const int dx = static_cast<int>(std::round(matrix(0, 3)));
-        const int dy = static_cast<int>(std::round(matrix(1, 3)));
-        if (dx == 0 && dy == 0) {
-            return region;
-        }
-        return region.translated(dx, dy);
-    }
-
-not_translation:
-    // General path
     QRegion result;
     for (const QRect &rect : region) {
         result += matrix.mapRect(QRectF(rect)).toAlignedRect();
@@ -95,7 +64,6 @@ SurfaceInterfacePrivate::SurfaceInterfacePrivate(SurfaceInterface *q)
 
 void SurfaceInterfacePrivate::addChild(SubSurfaceInterface *child)
 {
-    // protocol is not precise on how to handle the addition of new sub surfaces
     current->subsurface.above.append(child);
     pending->subsurface.above.append(child);
 
@@ -128,7 +96,6 @@ void SurfaceInterfacePrivate::addChild(SubSurfaceInterface *child)
 
 void SurfaceInterfacePrivate::removeChild(SubSurfaceInterface *child)
 {
-    // protocol is not precise on how to handle the addition of new sub surfaces
     current->subsurface.below.removeAll(child);
     current->subsurface.above.removeAll(child);
 
@@ -164,7 +131,6 @@ bool SurfaceInterfacePrivate::raiseChild(SubSurfaceInterface *subsurface, Surfac
     pending->subsurface.above.removeOne(subsurface);
 
     if (anchor == q) {
-        // Pretend as if the parent surface were before the first child in the above list.
         anchorList = &pending->subsurface.above;
         anchorIndex = -1;
     } else if (anchorIndex = pending->subsurface.above.indexOf(anchor->subSurface()); anchorIndex != -1) {
@@ -172,7 +138,7 @@ bool SurfaceInterfacePrivate::raiseChild(SubSurfaceInterface *subsurface, Surfac
     } else if (anchorIndex = pending->subsurface.below.indexOf(anchor->subSurface()); anchorIndex != -1) {
         anchorList = &pending->subsurface.below;
     } else {
-        return false; // The anchor belongs to other sub-surface tree.
+        return false;
     }
 
     anchorList->insert(anchorIndex + 1, subsurface);
@@ -191,7 +157,6 @@ bool SurfaceInterfacePrivate::lowerChild(SubSurfaceInterface *subsurface, Surfac
     pending->subsurface.above.removeOne(subsurface);
 
     if (anchor == q) {
-        // Pretend as if the parent surface were after the last child in the below list.
         anchorList = &pending->subsurface.below;
         anchorIndex = pending->subsurface.below.count();
     } else if (anchorIndex = pending->subsurface.above.indexOf(anchor->subSurface()); anchorIndex != -1) {
@@ -199,7 +164,7 @@ bool SurfaceInterfacePrivate::lowerChild(SubSurfaceInterface *subsurface, Surfac
     } else if (anchorIndex = pending->subsurface.below.indexOf(anchor->subSurface()); anchorIndex != -1) {
         anchorList = &pending->subsurface.below;
     } else {
-        return false; // The anchor belongs to other sub-surface tree.
+        return false;
     }
 
     anchorList->insert(anchorIndex, subsurface);
@@ -386,35 +351,47 @@ void SurfaceInterfacePrivate::surface_commit(Resource *resource)
         pending->bufferDamage = QRegion();
     }
 
-    // unless a protocol overrides the properties, we need to assume some YUV->RGB conversion
-    // matrix and color space to be attached to YUV formats
-    const bool hasColorManagementProtocol = colorSurface || frogColorManagement;
-    const bool hasColorRepresentation = colorRepresentation != nullptr;
-    if (pending->buffer && pending->buffer->dmabufAttributes()) {
-        switch (pending->buffer->dmabufAttributes()->format) {
-        case DRM_FORMAT_NV12:
-            if (!hasColorRepresentation) {
-                pending->yuvCoefficients = YUVMatrixCoefficients::BT709;
-                pending->range = EncodingRange::Limited;
-                pending->committed |= SurfaceState::Field::YuvCoefficients;
+    // OPTIMIZATION: Only process YUV format defaults when buffer actually changes
+    if (pending->committed & SurfaceState::Field::Buffer) {
+        const bool hasColorManagementProtocol = colorSurface || frogColorManagement;
+        const bool hasColorRepresentation = colorRepresentation != nullptr;
+
+        if (pending->buffer && pending->buffer->dmabufAttributes()) {
+            switch (pending->buffer->dmabufAttributes()->format) {
+            case DRM_FORMAT_NV12:
+                if (!hasColorRepresentation) {
+                    pending->yuvCoefficients = YUVMatrixCoefficients::BT709;
+                    pending->range = EncodingRange::Limited;
+                    pending->committed |= SurfaceState::Field::YuvCoefficients;
+                }
+                if (!hasColorManagementProtocol) {
+                    pending->colorDescription = ColorDescription::sRGB;
+                    pending->committed |= SurfaceState::Field::ColorDescription;
+                }
+                break;
+            case DRM_FORMAT_P010:
+                if (!hasColorRepresentation) {
+                    pending->yuvCoefficients = YUVMatrixCoefficients::BT2020;
+                    pending->range = EncodingRange::Limited;
+                    pending->committed |= SurfaceState::Field::YuvCoefficients;
+                }
+                if (!hasColorManagementProtocol) {
+                    pending->colorDescription = ColorDescription::BT2020PQ;
+                    pending->committed |= SurfaceState::Field::ColorDescription;
+                }
+                break;
+            default:
+                if (!hasColorRepresentation) {
+                    pending->yuvCoefficients = YUVMatrixCoefficients::Identity;
+                    pending->range = EncodingRange::Full;
+                    pending->committed |= SurfaceState::Field::YuvCoefficients;
+                }
+                if (!hasColorManagementProtocol) {
+                    pending->colorDescription = ColorDescription::sRGB;
+                    pending->committed |= SurfaceState::Field::ColorDescription;
+                }
             }
-            if (!hasColorManagementProtocol) {
-                pending->colorDescription = ColorDescription::sRGB;
-                pending->committed |= SurfaceState::Field::ColorDescription;
-            }
-            break;
-        case DRM_FORMAT_P010:
-            if (!hasColorRepresentation) {
-                pending->yuvCoefficients = YUVMatrixCoefficients::BT2020;
-                pending->range = EncodingRange::Limited;
-                pending->committed |= SurfaceState::Field::YuvCoefficients;
-            }
-            if (!hasColorManagementProtocol) {
-                pending->colorDescription = ColorDescription::BT2020PQ;
-                pending->committed |= SurfaceState::Field::ColorDescription;
-            }
-            break;
-        default:
+        } else {
             if (!hasColorRepresentation) {
                 pending->yuvCoefficients = YUVMatrixCoefficients::Identity;
                 pending->range = EncodingRange::Full;
@@ -425,22 +402,10 @@ void SurfaceInterfacePrivate::surface_commit(Resource *resource)
                 pending->committed |= SurfaceState::Field::ColorDescription;
             }
         }
-    } else {
-        if (!hasColorRepresentation) {
-            pending->yuvCoefficients = YUVMatrixCoefficients::Identity;
-            pending->range = EncodingRange::Full;
-            pending->committed |= SurfaceState::Field::YuvCoefficients;
-        }
-        if (!hasColorManagementProtocol) {
-            pending->colorDescription = ColorDescription::sRGB;
-            pending->committed |= SurfaceState::Field::ColorDescription;
-        }
     }
 
     Transaction *transaction;
     if (sync) {
-        // if the surface is in effectively synchronized mode at commit time,
-        // the fifo wait condition must be ignored
         pending->hasFifoWaitCondition = false;
         if (!subsurface.transaction) {
             subsurface.transaction = std::make_unique<Transaction>();
@@ -584,7 +549,6 @@ CompositorInterface *SurfaceInterface::compositor() const
 
 void SurfaceInterface::frameRendered(quint32 msec)
 {
-    // notify all callbacks
     wl_resource *resource;
     wl_resource *tmp;
 
@@ -698,9 +662,7 @@ void SurfaceState::mergeInto(SurfaceState *target)
 
 void SurfaceInterfacePrivate::applyState(SurfaceState *next)
 {
-    // Compute cheap flags upfront (bit tests + pointer compares)
-    const bool bufferCommitted = (next->committed & SurfaceState::Field::Buffer);
-    const bool bufferChanged = bufferCommitted && (current->buffer != next->buffer);
+    const bool bufferChanged = (next->committed & SurfaceState::Field::Buffer) && (current->buffer != next->buffer);
     const bool opaqueRegionChanged = (next->committed & SurfaceState::Field::Opaque);
     const bool transformChanged = (next->committed & SurfaceState::Field::BufferTransform) && (current->bufferTransform != next->bufferTransform);
     const bool shadowChanged = (next->committed & SurfaceState::Field::Shadow);
@@ -708,13 +670,13 @@ void SurfaceInterfacePrivate::applyState(SurfaceState *next)
     const bool contrastChanged = (next->committed & SurfaceState::Field::Contrast);
     const bool slideChanged = (next->committed & SurfaceState::Field::Slide);
     const bool subsurfaceOrderChanged = (next->committed & SurfaceState::Field::SubsurfaceOrder);
-    const bool visibilityChanged = bufferCommitted && (bool(current->buffer) != bool(next->buffer));
+    const bool visibilityChanged = (next->committed & SurfaceState::Field::Buffer) && bool(current->buffer) != bool(next->buffer);
+    const bool colorDescriptionChanged = (next->committed & SurfaceState::Field::ColorDescription)
+        && (current->colorDescription != next->colorDescription || current->renderingIntent != next->renderingIntent);
     const bool presentationModeHintChanged = (next->committed & SurfaceState::Field::PresentationModeHint);
-    const bool bufferReleasePointChanged = bufferCommitted && (current->releasePoint != next->releasePoint);
+    const bool bufferReleasePointChanged = (next->committed & SurfaceState::Field::Buffer) && current->releasePoint != next->releasePoint;
     const bool alphaMultiplierChanged = (next->committed & SurfaceState::Field::AlphaMultiplier);
-
-    // Defer expensive comparisons (shared_ptr, custom operators) until needed
-    // These are computed lazily below before signal emission
+    const bool yuvCoefficientsChanged = (next->committed & SurfaceState::Field::YuvCoefficients) && (current->yuvCoefficients != next->yuvCoefficients);
 
     const QSizeF oldSurfaceSize = surfaceSize;
     const QRectF oldBufferSourceBox = bufferSourceBox;
@@ -726,7 +688,6 @@ void SurfaceInterfacePrivate::applyState(SurfaceState *next)
         bufferRef->addReleasePoint(current->releasePoint);
     }
     if (!bufferRef) {
-        // we can't present an unmapped surface
         current->presentationFeedback.reset();
     }
     scaleOverride = pendingScaleOverride;
@@ -759,35 +720,33 @@ void SurfaceInterfacePrivate::applyState(SurfaceState *next)
         current->damage = QRegion();
         current->bufferDamage = QRegion();
 
-        if (scaleOverride != 1.0) {
+        // OPTIMIZATION: Direct region scaling without QMatrix4x4 overhead
+        if (scaleOverride != 1.0) [[unlikely]] {
             const qreal invScale = 1.0 / scaleOverride;
 
-            // Direct scale transformation without QMatrix4x4 overhead
-            if (!opaqueRegion.isEmpty()) {
-                QRegion scaledOpaque;
-                for (const QRect &rect : opaqueRegion) {
-                    const int x = static_cast<int>(std::floor(static_cast<qreal>(rect.x()) * invScale));
-                    const int y = static_cast<int>(std::floor(static_cast<qreal>(rect.y()) * invScale));
-                    const int w = static_cast<int>(std::ceil(static_cast<qreal>(rect.width()) * invScale));
-                    const int h = static_cast<int>(std::ceil(static_cast<qreal>(rect.height()) * invScale));
-                    scaledOpaque += QRect(x, y, w, h);
-                }
-                opaqueRegion = std::move(scaledOpaque);
+            QRegion scaledOpaque;
+            for (const QRect &rect : opaqueRegion) {
+                scaledOpaque += QRect(
+                    static_cast<int>(std::floor(rect.x() * invScale)),
+                    static_cast<int>(std::floor(rect.y() * invScale)),
+                    static_cast<int>(std::ceil(rect.width() * invScale)),
+                    static_cast<int>(std::ceil(rect.height() * invScale))
+                );
             }
+            opaqueRegion = scaledOpaque;
 
-            if (!inputRegion.isEmpty()) {
-                QRegion scaledInput;
-                for (const QRect &rect : inputRegion) {
-                    const int x = static_cast<int>(std::floor(static_cast<qreal>(rect.x()) * invScale));
-                    const int y = static_cast<int>(std::floor(static_cast<qreal>(rect.y()) * invScale));
-                    const int w = static_cast<int>(std::ceil(static_cast<qreal>(rect.width()) * invScale));
-                    const int h = static_cast<int>(std::ceil(static_cast<qreal>(rect.height()) * invScale));
-                    scaledInput += QRect(x, y, w, h);
-                }
-                inputRegion = std::move(scaledInput);
+            QRegion scaledInput;
+            for (const QRect &rect : inputRegion) {
+                scaledInput += QRect(
+                    static_cast<int>(std::floor(rect.x() * invScale)),
+                    static_cast<int>(std::floor(rect.y() * invScale)),
+                    static_cast<int>(std::ceil(rect.width() * invScale)),
+                    static_cast<int>(std::ceil(rect.height() * invScale))
+                );
             }
+            inputRegion = scaledInput;
 
-            surfaceSize = surfaceSize * invScale;
+            surfaceSize = surfaceSize / scaleOverride;
         }
     } else {
         surfaceSize = QSizeF(0, 0);
@@ -833,13 +792,6 @@ void SurfaceInterfacePrivate::applyState(SurfaceState *next)
     if (subsurfaceOrderChanged) {
         Q_EMIT q->childSubSurfacesChanged();
     }
-
-    // Compute expensive comparison only if field was committed
-    const bool colorDescriptionChanged = (next->committed & SurfaceState::Field::ColorDescription)
-        && (current->colorDescription != next->colorDescription || current->renderingIntent != next->renderingIntent);
-    const bool yuvCoefficientsChanged = (next->committed & SurfaceState::Field::YuvCoefficients)
-        && (current->yuvCoefficients != next->yuvCoefficients);
-
     if (colorDescriptionChanged || yuvCoefficientsChanged) {
         current->colorDescription = current->colorDescription->withYuvCoefficients(current->yuvCoefficients, current->range);
         Q_EMIT q->colorDescriptionChanged();
@@ -857,16 +809,11 @@ void SurfaceInterfacePrivate::applyState(SurfaceState *next)
         Q_EMIT q->damaged(bufferDamage);
     }
 
-    // The position of a sub-surface is applied when its parent is committed.
-    if (!current->subsurface.below.isEmpty()) {
-        for (SubSurfaceInterface *subsurface : std::as_const(current->subsurface.below)) {
-            subsurface->parentApplyState();
-        }
+    for (SubSurfaceInterface *subsurface : std::as_const(current->subsurface.below)) {
+        subsurface->parentApplyState();
     }
-    if (!current->subsurface.above.isEmpty()) {
-        for (SubSurfaceInterface *subsurface : std::as_const(current->subsurface.above)) {
-            subsurface->parentApplyState();
-        }
+    for (SubSurfaceInterface *subsurface : std::as_const(current->subsurface.above)) {
+        subsurface->parentApplyState();
     }
 
     for (const auto &[extension, state] : current->extensions) {
@@ -914,7 +861,6 @@ void SurfaceInterfacePrivate::updateEffectiveMapped()
 
 bool SurfaceInterfacePrivate::contains(const QPointF &position) const
 {
-    // avoid QRectF::contains as that includes all edges
     const qreal x = position.x();
     const qreal y = position.y();
 
@@ -928,52 +874,23 @@ bool SurfaceInterfacePrivate::inputContains(const QPointF &position) const
 
 QRegion SurfaceInterfacePrivate::mapToBuffer(const QRegion &region) const
 {
-    if (region.isEmpty()) {
+    if (region.isEmpty() || !current->buffer) [[unlikely]] {
         return QRegion();
     }
 
-    // Fast-path: identity transform + no viewport cropping
-    const bool isIdentityTransform = current->bufferTransform == OutputTransform();
-    const bool isUnscaled = current->bufferScale == 1;
-    const bool noViewport = !current->viewport.sourceGeometry.isValid() && !current->viewport.destinationSize.isValid();
-
-    if (isIdentityTransform && isUnscaled && noViewport) {
-        // Direct 1:1 mapping from surface to buffer coordinates
-        const QRect bufferBounds(QPoint(0, 0), current->buffer->size());
-        return region.intersected(bufferBounds);
+    // BUGFIX: Prevent division by zero
+    if (surfaceSize.width() <= 0 || surfaceSize.height() <= 0) [[unlikely]] {
+        return QRegion();
     }
 
     const QRectF sourceBox = current->bufferTransform.inverted().map(bufferSourceBox, current->buffer->size());
     const qreal xScale = sourceBox.width() / surfaceSize.width();
     const qreal yScale = sourceBox.height() / surfaceSize.height();
-    const QPointF offset = bufferSourceBox.topLeft();
 
-    // Fast-path: uniform scale with no rotation
-    if (isIdentityTransform && xScale == yScale && offset.x() == 0.0 && offset.y() == 0.0) {
-        if (xScale == 1.0) {
-            return region;
-        }
-        QRegion result;
-        for (const QRect &rect : region) {
-            const int x = static_cast<int>(std::floor(static_cast<qreal>(rect.x()) * xScale));
-            const int y = static_cast<int>(std::floor(static_cast<qreal>(rect.y()) * yScale));
-            const int w = static_cast<int>(std::ceil(static_cast<qreal>(rect.width()) * xScale));
-            const int h = static_cast<int>(std::ceil(static_cast<qreal>(rect.height()) * yScale));
-            result += QRect(x, y, w, h);
-        }
-        return result;
-    }
-
-    // General path
     QRegion result;
-    for (const QRect &rect : region) {  // ← FIXED: use const QRect& not QRectF
-        const QRectF scaled(
-            static_cast<qreal>(rect.x()) * xScale,
-            static_cast<qreal>(rect.y()) * yScale,
-            static_cast<qreal>(rect.width()) * xScale,
-            static_cast<qreal>(rect.height()) * yScale
-        );
-        result += current->bufferTransform.map(scaled, sourceBox.size()).translated(offset).toAlignedRect();
+    // CRITICAL FIX: Use const reference instead of copy
+    for (const QRectF &rect : region) {
+        result += current->bufferTransform.map(QRectF(rect.x() * xScale, rect.y() * yScale, rect.width() * xScale, rect.height() * yScale), sourceBox.size()).translated(bufferSourceBox.topLeft()).toAlignedRect();
     }
     return result;
 }
@@ -1171,7 +1088,6 @@ SurfaceInterface *SurfaceInterface::surfaceAt(const QPointF &position)
         }
     }
 
-    // check whether the geometry contains the pos
     if (d->contains(position)) {
         return this;
     }
@@ -1188,8 +1104,6 @@ SurfaceInterface *SurfaceInterface::surfaceAt(const QPointF &position)
 
 SurfaceInterface *SurfaceInterface::inputSurfaceAt(const QPointF &position)
 {
-    // TODO: Most of this is very similar to SurfaceInterface::surfaceAt
-    //       Is there a way to reduce the code duplication?
     if (!isMapped()) {
         return nullptr;
     }
@@ -1202,7 +1116,6 @@ SurfaceInterface *SurfaceInterface::inputSurfaceAt(const QPointF &position)
         }
     }
 
-    // check whether the geometry and input region contain the pos
     if (d->inputContains(position)) {
         return this;
     }
