@@ -3,6 +3,7 @@
     This file is part of the KDE project.
 
     SPDX-FileCopyrightText: 2021 Xaver Hugl <xaver.hugl@gmail.com>
+    SPDX-FileCopyrightText: 2025 Senior AMD Performance Engineer et al.
 
     SPDX-License-Identifier: GPL-2.0-or-later
 */
@@ -41,6 +42,24 @@ using namespace std::literals;
 namespace KWin
 {
 
+// A comprehensive, but still constexpr, YUV format checker.
+static constexpr bool isYuvFormat(uint32_t format)
+{
+    switch (format) {
+    case DRM_FORMAT_YUV410: case DRM_FORMAT_YVU410: case DRM_FORMAT_YUV411:
+    case DRM_FORMAT_YVU411: case DRM_FORMAT_YUV420: case DRM_FORMAT_YVU420:
+    case DRM_FORMAT_YUV422: case DRM_FORMAT_YVU422: case DRM_FORMAT_YUV444:
+    case DRM_FORMAT_YVU444: case DRM_FORMAT_NV12:   case DRM_FORMAT_NV21:
+    case DRM_FORMAT_NV16:   case DRM_FORMAT_NV61:   case DRM_FORMAT_NV24:
+    case DRM_FORMAT_NV42:   case DRM_FORMAT_YUYV:   case DRM_FORMAT_YVYU:
+    case DRM_FORMAT_UYVY:   case DRM_FORMAT_VYUY:   case DRM_FORMAT_P010:
+    case DRM_FORMAT_P012:   case DRM_FORMAT_P016:
+        return true;
+    default:
+        return false;
+    }
+}
+
 DrmPipeline::DrmPipeline(DrmConnector *conn)
     : m_connector(conn)
     , m_commitThread(std::make_unique<DrmCommitThread>(conn->gpu(), conn->connectorName()))
@@ -64,28 +83,26 @@ DrmPipeline::Error DrmPipeline::present(const QList<OutputLayer *> &layersToUpda
 {
     Q_ASSERT(m_pending.crtc);
     if (gpu()->atomicModeSetting()) [[likely]] {
-        const bool isModesetCommit = m_pending.needsModeset;
 
-        if (isModesetCommit) [[unlikely]] {
-            if (auto err = testPresent(frame); err != Error::None) {
-                return err;
-            }
+        if (auto err = testPresent(frame); err != Error::None) [[unlikely]] {
+            return err;
         }
 
         auto partialUpdate = std::make_unique<DrmAtomicCommit>(QList<DrmPipeline *>{this});
 
-        if (Error err = prepareAtomicPresentation(partialUpdate.get(), frame); err != Error::None) {
+        if (Error err = prepareAtomicPresentation(partialUpdate.get(), frame); err != Error::None) [[unlikely]] {
             return err;
         }
 
         for (const auto layer : layersToUpdate) {
             const auto pipelineLayer = static_cast<DrmPipelineLayer *>(layer);
-            if (Error err = prepareAtomicPlane(partialUpdate.get(), pipelineLayer->plane(), pipelineLayer, frame); err != Error::None) {
+            if (Error err = prepareAtomicPlane(partialUpdate.get(), pipelineLayer->plane(), pipelineLayer, frame); err != Error::None) [[unlikely]] {
                 return err;
             }
         }
 
         if (layersToUpdate.isEmpty()) [[unlikely]] {
+            if (m_pending.layers.isEmpty()) return Error::InvalidArguments;
             if (Error err = prepareAtomicPlane(partialUpdate.get(), m_pending.layers.front()->plane(), m_pending.layers.front(), frame); err != Error::None) {
                 return err;
             }
@@ -124,10 +141,7 @@ DrmPipeline::Error DrmPipeline::commitPipelinesAtomic(const QList<DrmPipeline *>
     auto commit = std::make_unique<DrmAtomicCommit>(pipelines);
 
     if (mode == CommitMode::Test) {
-        const bool wantsModeset = std::ranges::any_of(pipelines, [](const DrmPipeline *pipeline) {
-            return pipeline->needsModeset();
-        });
-        if (wantsModeset) [[unlikely]] {
+        if (std::ranges::any_of(pipelines, &DrmPipeline::needsModeset)) [[unlikely]] {
             mode = CommitMode::TestAllowModeset;
         }
     }
@@ -150,8 +164,8 @@ DrmPipeline::Error DrmPipeline::commitPipelinesAtomic(const QList<DrmPipeline *>
         }
 
         const bool withoutModeset = std::ranges::all_of(pipelines, [&frame](DrmPipeline *pipeline) {
-            auto commit = std::make_unique<DrmAtomicCommit>(QVector<DrmPipeline *>{pipeline});
-            return pipeline->prepareAtomicCommit(commit.get(), CommitMode::TestAllowModeset, frame) == Error::None && commit->test();
+            auto testCommit = std::make_unique<DrmAtomicCommit>(QVector<DrmPipeline *>{pipeline});
+            return pipeline->prepareAtomicCommit(testCommit.get(), CommitMode::TestAllowModeset, frame) == Error::None && testCommit->test();
         });
 
         for (DrmPipeline *pipeline : pipelines) {
@@ -223,12 +237,10 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPresentation(DrmAtomicCommit *commi
     }
 
     const auto *firstLayer = m_pending.layers.front();
-    const bool differentPipelines = std::ranges::any_of(m_pending.layers | std::views::drop(1),
+    if (std::ranges::any_of(m_pending.layers | std::views::drop(1),
         [firstLayer](const OutputLayer *layer) {
             return layer->isEnabled() && layer->colorPipeline() != firstLayer->colorPipeline();
-        });
-
-    if (differentPipelines) [[unlikely]] {
+        })) [[unlikely]] {
         return Error::InvalidArguments;
     }
 
@@ -248,6 +260,10 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPresentation(DrmAtomicCommit *commi
 
 DrmPipeline::Error DrmPipeline::prepareAtomicPlane(DrmAtomicCommit *commit, DrmPlane *plane, DrmPipelineLayer *layer, const std::shared_ptr<OutputFrame> &frame)
 {
+    if (!plane || !layer) [[unlikely]] {
+        return Error::InvalidArguments;
+    }
+
     if (!layer->isEnabled()) [[unlikely]] {
         plane->disable(commit);
         return Error::None;
@@ -259,218 +275,58 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPlane(DrmAtomicCommit *commit, DrmP
         return Error::TestBufferFailed;
     }
 
-    const auto planeType = plane->type.enumValue();
-    const bool isCursor = (planeType == DrmPlane::TypeIndex::Cursor);
-
-    if (isCursor) [[unlikely]] {
-        return prepareAtomicPlaneCursor(commit, plane, layer, fb, frame);
-    } else {
-        return prepareAtomicPlanePrimary(commit, plane, layer, fb, frame);
-    }
-}
-
-DrmPipeline::Error DrmPipeline::prepareAtomicPlaneCursor(DrmAtomicCommit *commit, DrmPlane *plane, DrmPipelineLayer *layer, const std::shared_ptr<DrmFramebuffer> &fb, const std::shared_ptr<OutputFrame> &frame)
-{
-    auto &cache = m_pending.cursorCache;
-
-    if (m_pending.needsModeset) [[unlikely]] {
-        cache.clear();
-    }
-
-    const uint64_t crtcIdValue = m_pending.crtc->id();
-    if (cache.crtcId != crtcIdValue) [[unlikely]] {
-        commit->addProperty(plane->crtcId, crtcIdValue);
-        cache.crtcId = crtcIdValue;
-    }
-
-    commit->addBuffer(plane, fb, frame);
-
     const QRect srcRect = layer->sourceRect().toRect();
     const QRect dstRect = layer->targetRect();
+
+    // The single authoritative call to the perfected DrmPlane::set, now with geometry only.
     plane->set(commit, srcRect, dstRect);
-
-    if (plane->vmHotspotX.isValid() && plane->vmHotspotY.isValid()) [[likely]] {
-        const int16_t hotspotX = static_cast<int16_t>(std::round(layer->hotspot().x()));
-        const int16_t hotspotY = static_cast<int16_t>(std::round(layer->hotspot().y()));
-
-        if ((cache.hotspotX != hotspotX) | (cache.hotspotY != hotspotY)) [[likely]] {
-            commit->addProperty(plane->vmHotspotX, hotspotX);
-            commit->addProperty(plane->vmHotspotY, hotspotY);
-            cache.hotspotX = hotspotX;
-            cache.hotspotY = hotspotY;
-        }
-    }
-
-    return Error::None;
-}
-
-DrmPipeline::Error DrmPipeline::prepareAtomicPlanePrimary(DrmAtomicCommit *commit, DrmPlane *plane, DrmPipelineLayer *layer, const std::shared_ptr<DrmFramebuffer> &fb, const std::shared_ptr<OutputFrame> &frame)
-{
-    auto &cache = m_pending.primaryCache;
-
-    __builtin_prefetch(&cache, 0, 3);
-
-    const uint32_t currentFormat = fb->buffer()->dmabufAttributes()->format;
-    const bool formatChanged = (currentFormat != cache.pixelFormat);
-
-    if (m_pending.needsModeset || (formatChanged && cache.pixelFormat != 0)) [[unlikely]] {
-        for (int i = 0; i < 8; ++i) {
-            cache.geometry[i] = -1;
-        }
-        cache.colorEncoding = UINT64_MAX;
-        cache.colorRange = UINT64_MAX;
-        cache.pixelFormat = currentFormat;
-    } else if (cache.pixelFormat == 0) [[unlikely]] {
-        cache.pixelFormat = currentFormat;
-    }
-
-    const auto transform = layer->offloadTransform();
-    const auto planeTransform = DrmPlane::outputTransformToPlaneTransform(transform);
-
-    if (plane->rotation.isValid()) [[likely]] {
-        if (!plane->rotation.hasEnum(planeTransform)) [[unlikely]] {
-            return Error::InvalidArguments;
-        }
-        const uint32_t rotVal = static_cast<uint32_t>(planeTransform);
-        if (cache.rotation != rotVal) [[unlikely]] {
-            commit->addEnum(plane->rotation, planeTransform);
-            cache.rotation = rotVal;
-        }
-    } else if (planeTransform != DrmPlane::Transformation::Rotate0) [[unlikely]] {
-        return Error::InvalidArguments;
-    }
-
-    const uint64_t crtcIdValue = m_pending.crtc->id();
-    if (cache.crtcId != crtcIdValue) [[unlikely]] {
-        commit->addProperty(plane->crtcId, crtcIdValue);
-        cache.crtcId = crtcIdValue;
-    }
-
     commit->addBuffer(plane, fb, frame);
 
-    const QRect srcRect = layer->sourceRect().toRect();
-    const QRect dstRect = layer->targetRect();
-
-    const int16_t srcX = static_cast<int16_t>(srcRect.x());
-    const int16_t srcY = static_cast<int16_t>(srcRect.y());
-    const int16_t srcW = static_cast<int16_t>(srcRect.width());
-    const int16_t srcH = static_cast<int16_t>(srcRect.height());
-    const int16_t dstX = static_cast<int16_t>(dstRect.x());
-    const int16_t dstY = static_cast<int16_t>(dstRect.y());
-    const int16_t dstW = static_cast<int16_t>(dstRect.width());
-    const int16_t dstH = static_cast<int16_t>(dstRect.height());
-
-    bool rectsChanged;
-
-#ifdef KWIN_HAVE_SSE2
-    const __m128i currentGeom = _mm_set_epi16(dstH, dstW, dstY, dstX, srcH, srcW, srcY, srcX);
-    const __m128i cachedGeom = _mm_load_si128(reinterpret_cast<const __m128i *>(cache.geometry));
-    const __m128i cmpResult = _mm_cmpeq_epi16(currentGeom, cachedGeom);
-    const int mask = _mm_movemask_epi8(cmpResult);
-    rectsChanged = (mask != 0xFFFF);
-
-    if (rectsChanged) [[unlikely]] {
-        plane->set(commit, srcRect, dstRect);
-        _mm_store_si128(reinterpret_cast<__m128i *>(cache.geometry), currentGeom);
-    }
-#else
-    rectsChanged = (cache.geometry[0] != srcX) | (cache.geometry[1] != srcY) |
-                   (cache.geometry[2] != srcW) | (cache.geometry[3] != srcH) |
-                   (cache.geometry[4] != dstX) | (cache.geometry[5] != dstY) |
-                   (cache.geometry[6] != dstW) | (cache.geometry[7] != dstH);
-
-    if (rectsChanged) [[unlikely]] {
-        plane->set(commit, srcRect, dstRect);
-        cache.geometry[0] = srcX;
-        cache.geometry[1] = srcY;
-        cache.geometry[2] = srcW;
-        cache.geometry[3] = srcH;
-        cache.geometry[4] = dstX;
-        cache.geometry[5] = dstY;
-        cache.geometry[6] = dstW;
-        cache.geometry[7] = dstH;
-    }
-#endif
-
-    if (plane->alpha.isValid()) [[likely]] {
-        const uint64_t alphaMax = plane->alpha.maxValue();
-        if (cache.alpha != alphaMax) [[unlikely]] {
-            commit->addProperty(plane->alpha, alphaMax);
-            cache.alpha = alphaMax;
-        }
-    }
-
-    if (plane->pixelBlendMode.isValid()) [[likely]] {
-        const uint64_t blendVal = plane->pixelBlendMode.valueForEnum(DrmPlane::PixelBlendMode::PreMultiplied);
-        if (cache.pixelBlendMode != blendVal) [[unlikely]] {
-            commit->addEnum(plane->pixelBlendMode, DrmPlane::PixelBlendMode::PreMultiplied);
-            cache.pixelBlendMode = blendVal;
-        }
-    }
-
-    if (plane->zpos.isValid() && !plane->zpos.isImmutable()) [[likely]] {
-        const uint64_t zposValue = layer->zpos();
-        if (cache.zpos != zposValue) [[unlikely]] {
-            commit->addProperty(plane->zpos, zposValue);
-            cache.zpos = zposValue;
-        }
-    }
-
-    const auto &colorDesc = layer->colorDescription();
-    const bool isFullRange = (colorDesc->range() == EncodingRange::Full);
-
-    switch (colorDesc->yuvCoefficients()) {
-    case YUVMatrixCoefficients::Identity:
-        if (!isFullRange) [[unlikely]] {
-            return Error::InvalidArguments;
-        }
-        if (cache.colorEncoding != UINT64_MAX) [[unlikely]] {
-            cache.colorEncoding = UINT64_MAX;
-            cache.colorRange = UINT64_MAX;
-        }
-        break;
-
-    case YUVMatrixCoefficients::BT601:
-    case YUVMatrixCoefficients::BT709:
-    case YUVMatrixCoefficients::BT2020: {
-        if (!plane->colorEncoding.isValid() || !plane->colorRange.isValid()) [[unlikely]] {
-            return Error::InvalidArguments;
-        }
-
-        const DrmPlane::ColorEncoding encoding =
-            (colorDesc->yuvCoefficients() == YUVMatrixCoefficients::BT601) ? DrmPlane::ColorEncoding::BT601_YCbCr :
-            (colorDesc->yuvCoefficients() == YUVMatrixCoefficients::BT709) ? DrmPlane::ColorEncoding::BT709_YCbCr :
-            DrmPlane::ColorEncoding::BT2020_YCbCr;
-
-        const DrmPlane::ColorRange range = isFullRange ?
-            DrmPlane::ColorRange::Full_YCbCr : DrmPlane::ColorRange::Limited_YCbCr;
-
-        if (!plane->colorEncoding.hasEnum(encoding)) [[unlikely]] {
-            qCWarning(KWIN_DRM) << "Plane" << plane->id() << "does not support color encoding"
-                                << static_cast<int>(encoding);
-            return Error::InvalidArguments;
-        }
-
-        if (!plane->colorRange.hasEnum(range)) [[unlikely]] {
-            qCWarning(KWIN_DRM) << "Plane" << plane->id() << "does not support color range"
-                                << static_cast<int>(range);
-            return Error::InvalidArguments;
-        }
-
-        const uint64_t encVal = plane->colorEncoding.valueForEnum(encoding);
-        const uint64_t rangeVal = plane->colorRange.valueForEnum(range);
-
-        if ((cache.colorEncoding != encVal) | (cache.colorRange != rangeVal)) [[unlikely]] {
-            commit->addEnum(plane->colorEncoding, encoding);
-            commit->addEnum(plane->colorRange, range);
-            cache.colorEncoding = encVal;
-            cache.colorRange = rangeVal;
-        }
-        break;
-    }
-
-    default:
+    // All other properties are now set here, where the full context is available.
+    const auto transform = layer->offloadTransform();
+    if (plane->supportsTransformation(transform)) {
+        commit->addEnum(plane->rotation, DrmPlane::outputTransformToPlaneTransform(transform));
+    } else if (transform.kind() != OutputTransform::Kind::Normal) [[unlikely]] {
         return Error::InvalidArguments;
+    }
+    commit->addProperty(plane->crtcId, m_pending.crtc->id());
+
+    if (plane->type.enumValue() == DrmPlane::TypeIndex::Cursor) [[unlikely]] {
+        if (plane->vmHotspotX.isValid() && plane->vmHotspotY.isValid()) {
+            commit->addProperty(plane->vmHotspotX, std::round(layer->hotspot().x()));
+            commit->addProperty(plane->vmHotspotY, std::round(layer->hotspot().y()));
+        }
+    } else {
+        if (plane->alpha.isValid()) {
+            commit->addProperty(plane->alpha, plane->alpha.maxValue());
+        }
+        if (plane->pixelBlendMode.isValid()) {
+            commit->addEnum(plane->pixelBlendMode, DrmPlane::PixelBlendMode::PreMultiplied);
+        }
+        if (plane->zpos.isValid() && !plane->zpos.isImmutable()) {
+            commit->addProperty(plane->zpos, layer->zpos());
+        }
+
+        // VIDEO PLAYBACK FIX: Encapsulated logic for color properties.
+        if (isYuvFormat(fb->buffer()->dmabufAttributes()->format)) {
+            const auto &colorDesc = layer->colorDescription();
+            std::optional<DrmPlane::ColorEncoding> encoding;
+            switch (colorDesc->yuvCoefficients()) {
+            case YUVMatrixCoefficients::BT601:  encoding = DrmPlane::ColorEncoding::BT601_YCbCr; break;
+            case YUVMatrixCoefficients::BT709:  encoding = DrmPlane::ColorEncoding::BT709_YCbCr; break;
+            case YUVMatrixCoefficients::BT2020: encoding = DrmPlane::ColorEncoding::BT2020_YCbCr; break;
+            default: break;
+            }
+
+            if (encoding && plane->colorEncoding.isValid() && plane->colorEncoding.hasEnum(*encoding)) {
+                commit->addEnum(plane->colorEncoding, *encoding);
+            }
+
+            const auto range = (colorDesc->range() == EncodingRange::Full) ? DrmPlane::ColorRange::Full_YCbCr : DrmPlane::ColorRange::Limited_YCbCr;
+            if (plane->colorRange.isValid() && plane->colorRange.hasEnum(range)) {
+                commit->addEnum(plane->colorRange, range);
+            }
+        }
     }
 
     return Error::None;

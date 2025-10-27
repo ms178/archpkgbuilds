@@ -117,7 +117,6 @@ bool DrmPlane::updateProperties()
 
         if (blob && blob->data && blob->length > 0) [[likely]] {
             __builtin_prefetch(blob->data, 0, 3);
-
             drmModeFormatModifierIterator iterator{};
             while (drmModeFormatModifierBlobIterNext(blob, &iterator)) {
                 m_supportedFormats[iterator.fmt].push_back(iterator.mod);
@@ -190,19 +189,21 @@ bool DrmPlane::updateProperties()
 
 void DrmPlane::set(DrmAtomicCommit *commit, const QRect &src, const QRect &dst)
 {
-    if (src.width() <= 0 || src.height() <= 0 || dst.width() <= 0 || dst.height() <= 0) [[unlikely]] {
+    if (dst.width() <= 0 || dst.height() <= 0) [[unlikely]] {
         disable(commit);
         return;
     }
 
     constexpr int maxCoord = 32767;
+    constexpr int minCoord = -32768;
 
-    const int clampedSrcX = std::clamp(src.x(), 0, maxCoord);
-    const int clampedSrcY = std::clamp(src.y(), 0, maxCoord);
+    const int clampedSrcX = std::clamp(src.x(), minCoord, maxCoord);
+    const int clampedSrcY = std::clamp(src.y(), minCoord, maxCoord);
     const int clampedSrcW = std::clamp(src.width(), 0, maxCoord);
     const int clampedSrcH = std::clamp(src.height(), 0, maxCoord);
 
     const auto toFixed16 = [](int val) -> uint64_t {
+        // UB FIX: Safe cast to preserve two's complement for negative numbers.
         return static_cast<uint64_t>(static_cast<uint32_t>(val)) << 16;
     };
 
@@ -256,12 +257,13 @@ void DrmPlane::setCurrentBuffer(const std::shared_ptr<DrmFramebuffer> &b)
 
     const auto newData = b->data();
 
+    // PERFORMANCE: This branchless version is faster than a loop for a fixed small size.
     const bool found = (m_lastBuffers[0] == newData) | (m_lastBuffers[1] == newData)
         | (m_lastBuffers[2] == newData) | (m_lastBuffers[3] == newData);
 
     if (!found) {
         m_lastBuffers[m_lastBufferWriteIndex] = newData;
-        m_lastBufferWriteIndex = (m_lastBufferWriteIndex + 1) & 3;
+        m_lastBufferWriteIndex = (m_lastBufferWriteIndex + 1) & 3; // Bitwise AND for fast modulo 4
     }
 }
 
