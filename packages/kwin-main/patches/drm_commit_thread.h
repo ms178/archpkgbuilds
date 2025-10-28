@@ -71,8 +71,8 @@ private:
     bool m_pageflipTimeoutDetected = false;
 
     alignas(64) mutable std::mutex m_mutex;
-    std::condition_variable m_commitPending;
-    std::condition_variable m_pong;
+    alignas(64) std::condition_variable m_commitPending;
+    alignas(64) std::condition_variable m_pong;
 };
 
 }

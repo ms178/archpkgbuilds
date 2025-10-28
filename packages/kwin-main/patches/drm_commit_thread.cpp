@@ -204,7 +204,9 @@ void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
         return;
     }
 
-    __builtin_prefetch(&m_commits[0], 0, 3);
+    if (!m_commits.empty()) {
+        __builtin_prefetch(&m_commits[0], 0, 3);
+    }
 
     if (m_commits.front()->areBuffersReadable()) [[likely]] {
         const auto firstNotReady = std::find_if(m_commits.begin() + 1, m_commits.end(), [pageflipTarget](const auto &commit) {
@@ -253,20 +255,38 @@ void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
         m_commits.erase(m_commits.begin());
     }
 
-    for (auto it = m_commits.begin() + 1; it != m_commits.end();) {
-        auto &commit = *it;
-        if (!commit || !commit->isReadyFor(pageflipTarget)) [[likely]] {
-            ++it;
+    if (m_commits.empty()) {
+        if (front) {
+            m_commits.push_back(std::move(front));
+        }
+        return;
+    }
+
+    std::vector<size_t> toErase;
+    toErase.reserve(m_commits.size());
+
+    for (size_t i = 0; i < m_commits.size(); ++i) {
+        auto &commit = m_commits[i];
+        if (!commit || !commit->isReadyFor(pageflipTarget)) {
             continue;
         }
+
         const auto &planes = commit->modifiedPlanes();
-        const bool skipping = std::any_of(m_commits.begin(), it, [&planes](const auto &other) {
-            return other && std::ranges::any_of(planes, [&other](DrmPlane *plane) {
-                       return other->modifiedPlanes().contains(plane);
-                   });
-        });
-        if (skipping) [[likely]] {
-            ++it;
+        bool skipping = false;
+        for (size_t j = 0; j < i; ++j) {
+            if (m_commits[j]) {
+                const auto &otherPlanes = m_commits[j]->modifiedPlanes();
+                const bool conflicts = std::ranges::any_of(planes, [&otherPlanes](DrmPlane *plane) {
+                    return otherPlanes.contains(plane);
+                });
+                if (conflicts) {
+                    skipping = true;
+                    break;
+                }
+            }
+        }
+
+        if (skipping) {
             continue;
         }
 
@@ -274,44 +294,56 @@ void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
         if (front) {
             duplicate = std::make_unique<DrmAtomicCommit>(*front);
             duplicate->merge(commit.get());
-            if (!duplicate->test()) [[likely]] {
+            if (!duplicate->test()) {
                 m_commitsToDelete.push_back(std::move(duplicate));
-                ++it;
                 continue;
             }
         } else {
-            if (!commit->test()) [[likely]] {
-                ++it;
+            if (!commit->test()) {
                 continue;
             }
             duplicate = std::make_unique<DrmAtomicCommit>(*commit);
         }
 
         bool success = true;
-        for (const auto &otherCommit : m_commits) {
-            if (otherCommit && otherCommit != commit) [[likely]] {
-                duplicate->merge(otherCommit.get());
-                if (!duplicate->test()) [[likely]] {
+        for (size_t j = 0; j < m_commits.size(); ++j) {
+            if (j != i && m_commits[j]) {
+                duplicate->merge(m_commits[j].get());
+                if (!duplicate->test()) {
                     success = false;
                     break;
                 }
             }
         }
+
         m_commitsToDelete.push_back(std::move(duplicate));
-        if (success) [[unlikely]] {
+
+        if (success) {
             if (front) {
                 front->merge(commit.get());
-                m_commitsToDelete.push_back(std::move(commit));
             } else {
                 front = std::make_unique<DrmAtomicCommit>(*commit);
-                m_commitsToDelete.push_back(std::move(commit));
             }
-            it = m_commits.erase(it);
-        } else {
-            ++it;
+            m_commitsToDelete.push_back(std::move(commit));
+            toErase.push_back(i);
         }
     }
-    if (front) [[unlikely]] {
+
+    if (!toErase.empty()) {
+        std::vector<std::unique_ptr<DrmAtomicCommit>> remaining;
+        remaining.reserve(m_commits.size() - toErase.size());
+        size_t eraseIdx = 0;
+        for (size_t i = 0; i < m_commits.size(); ++i) {
+            if (eraseIdx < toErase.size() && i == toErase[eraseIdx]) {
+                ++eraseIdx;
+            } else if (m_commits[i]) {
+                remaining.push_back(std::move(m_commits[i]));
+            }
+        }
+        m_commits = std::move(remaining);
+    }
+
+    if (front) {
         m_commits.insert(m_commits.begin(), std::move(front));
     }
 }
@@ -336,9 +368,10 @@ DrmCommitThread::~DrmCommitThread()
 
 void DrmCommitThread::addCommit(std::unique_ptr<DrmAtomicCommit> &&commit)
 {
-    std::unique_lock lock(m_mutex);
-    m_commits.push_back(std::move(commit));
     const auto now = std::chrono::steady_clock::now();
+
+    std::unique_lock lock(m_mutex);
+
     TimePoint newTarget;
     if (m_tearing) [[unlikely]] {
         newTarget = now;
@@ -347,8 +380,12 @@ void DrmCommitThread::addCommit(std::unique_ptr<DrmAtomicCommit> &&commit)
     } else {
         newTarget = estimateNextVblank(now);
     }
+
     m_targetPageflipTime = std::max(m_targetPageflipTime, newTarget);
-    m_commits.back()->setDeadline(m_targetPageflipTime - m_safetyMargin);
+    const auto deadline = m_targetPageflipTime - m_safetyMargin;
+    commit->setDeadline(deadline);
+
+    m_commits.push_back(std::move(commit));
     m_commitPending.notify_all();
 }
 
@@ -403,22 +440,25 @@ bool DrmCommitThread::pageflipsPending()
 
 TimePoint DrmCommitThread::estimateNextVblank(TimePoint now) const
 {
-    if (m_minVblankInterval.count() == 0 || m_vblankIntervalInv == 0.0) [[unlikely]] {
+    const int64_t minVblankNs = m_minVblankInterval.count();
+    if (minVblankNs <= 0) [[unlikely]] {
         return now + std::chrono::milliseconds(16);
     }
 
     const auto elapsed = now >= m_lastPageflip ? now - m_lastPageflip : std::chrono::nanoseconds::zero();
-    const auto elapsedNs = elapsed.count();
+    const int64_t elapsedNs = elapsed.count();
 
     if (elapsedNs < 0) [[unlikely]] {
         return m_lastPageflip + m_minVblankInterval;
     }
 
-    const double elapsedSeconds = static_cast<double>(elapsedNs) * 1e-9;
-    const uint64_t pageflipsSince = static_cast<uint64_t>(elapsedSeconds * m_vblankIntervalInv * 1e9);
+    const uint64_t elapsedU = static_cast<uint64_t>(elapsedNs);
+    const uint64_t minVblankU = static_cast<uint64_t>(minVblankNs);
+
+    const uint64_t pageflipsSince = elapsedU / minVblankU;
 
     constexpr uint64_t maxReasonablePageflips = 10000;
-    const uint64_t clampedPageflips = std::min(pageflipsSince, maxReasonablePageflips);
+    const uint64_t clampedPageflips = (pageflipsSince < maxReasonablePageflips) ? pageflipsSince : maxReasonablePageflips;
 
     return m_lastPageflip + m_minVblankInterval * (clampedPageflips + 1);
 }
