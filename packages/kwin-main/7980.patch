@@ -493,8 +493,8 @@
      bool m_pageflipTimeoutDetected = false;
 +
 +    alignas(64) mutable std::mutex m_mutex;
-+    std::condition_variable m_commitPending;
-+    std::condition_variable m_pong;
++    alignas(64) std::condition_variable m_commitPending;
++    alignas(64) std::condition_variable m_pong;
  };
  
  }
@@ -705,7 +705,7 @@
          }
          m_commits.clear();
          qCWarning(KWIN_DRM) << "atomic commit failed:" << strerror(errno);
-@@ -205,96 +200,105 @@ static std::unique_ptr<DrmAtomicCommit>
+@@ -205,108 +200,149 @@ static std::unique_ptr<DrmAtomicCommit>
  
  void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
  {
@@ -716,7 +716,9 @@
 -    // merge commits in the front that are already ready (regardless of which planes they modify)
 -    if (m_commits.front()->areBuffersReadable()) {
 +
-+    __builtin_prefetch(&m_commits[0], 0, 3);
++    if (!m_commits.empty()) {
++        __builtin_prefetch(&m_commits[0], 0, 3);
++    }
 +
 +    if (m_commits.front()->areBuffersReadable()) [[likely]] {
          const auto firstNotReady = std::find_if(m_commits.begin() + 1, m_commits.end(), [pageflipTarget](const auto &commit) {
@@ -776,29 +778,50 @@
          m_commits.erase(m_commits.begin());
      }
 -    // try to move commits that are ready to the front
-+
-     for (auto it = m_commits.begin() + 1; it != m_commits.end();) {
-         auto &commit = *it;
+-    for (auto it = m_commits.begin() + 1; it != m_commits.end();) {
+-        auto &commit = *it;
 -        if (!commit->isReadyFor(pageflipTarget)) {
 -            it++;
-+        if (!commit || !commit->isReadyFor(pageflipTarget)) [[likely]] {
-+            ++it;
++
++    if (m_commits.empty()) {
++        if (front) {
++            m_commits.push_back(std::move(front));
++        }
++        return;
++    }
++
++    std::vector<size_t> toErase;
++    toErase.reserve(m_commits.size());
++
++    for (size_t i = 0; i < m_commits.size(); ++i) {
++        auto &commit = m_commits[i];
++        if (!commit || !commit->isReadyFor(pageflipTarget)) {
              continue;
          }
 -        // commits that target the same plane(s) need to stay in the same order
++
          const auto &planes = commit->modifiedPlanes();
-         const bool skipping = std::any_of(m_commits.begin(), it, [&planes](const auto &other) {
+-        const bool skipping = std::any_of(m_commits.begin(), it, [&planes](const auto &other) {
 -            return std::ranges::any_of(planes, [&other](DrmPlane *plane) {
 -                return other->modifiedPlanes().contains(plane);
 -            });
-+            return other && std::ranges::any_of(planes, [&other](DrmPlane *plane) {
-+                       return other->modifiedPlanes().contains(plane);
-+                   });
-         });
--        if (skipping) {
+-        });
++        bool skipping = false;
++        for (size_t j = 0; j < i; ++j) {
++            if (m_commits[j]) {
++                const auto &otherPlanes = m_commits[j]->modifiedPlanes();
++                const bool conflicts = std::ranges::any_of(planes, [&otherPlanes](DrmPlane *plane) {
++                    return otherPlanes.contains(plane);
++                });
++                if (conflicts) {
++                    skipping = true;
++                    break;
++                }
++            }
++        }
++
+         if (skipping) {
 -            it++;
-+        if (skipping) [[likely]] {
-+            ++it;
              continue;
          }
 -        // find out if the modified commit order will actually work
@@ -807,57 +830,78 @@
          if (front) {
              duplicate = std::make_unique<DrmAtomicCommit>(*front);
              duplicate->merge(commit.get());
--            if (!duplicate->test()) {
-+            if (!duplicate->test()) [[likely]] {
+             if (!duplicate->test()) {
                  m_commitsToDelete.push_back(std::move(duplicate));
 -                it++;
-+                ++it;
                  continue;
              }
          } else {
--            if (!commit->test()) {
+             if (!commit->test()) {
 -                it++;
-+            if (!commit->test()) [[likely]] {
-+                ++it;
                  continue;
              }
              duplicate = std::make_unique<DrmAtomicCommit>(*commit);
          }
 +
          bool success = true;
-         for (const auto &otherCommit : m_commits) {
+-        for (const auto &otherCommit : m_commits) {
 -            if (otherCommit != commit) {
-+            if (otherCommit && otherCommit != commit) [[likely]] {
-                 duplicate->merge(otherCommit.get());
--                if (!duplicate->test()) {
-+                if (!duplicate->test()) [[likely]] {
+-                duplicate->merge(otherCommit.get());
++        for (size_t j = 0; j < m_commits.size(); ++j) {
++            if (j != i && m_commits[j]) {
++                duplicate->merge(m_commits[j].get());
+                 if (!duplicate->test()) {
                      success = false;
                      break;
                  }
              }
          }
++
          m_commitsToDelete.push_back(std::move(duplicate));
--        if (success) {
-+        if (success) [[unlikely]] {
++
+         if (success) {
              if (front) {
                  front->merge(commit.get());
-                 m_commitsToDelete.push_back(std::move(commit));
-@@ -304,10 +308,10 @@ void DrmCommitThread::optimizeCommits(Ti
+-                m_commitsToDelete.push_back(std::move(commit));
+             } else {
+                 front = std::make_unique<DrmAtomicCommit>(*commit);
+-                m_commitsToDelete.push_back(std::move(commit));
              }
-             it = m_commits.erase(it);
-         } else {
+-            it = m_commits.erase(it);
+-        } else {
 -            it++;
-+            ++it;
++            m_commitsToDelete.push_back(std::move(commit));
++            toErase.push_back(i);
          }
      }
--    if (front) {
-+    if (front) [[unlikely]] {
++
++    if (!toErase.empty()) {
++        std::vector<std::unique_ptr<DrmAtomicCommit>> remaining;
++        remaining.reserve(m_commits.size() - toErase.size());
++        size_t eraseIdx = 0;
++        for (size_t i = 0; i < m_commits.size(); ++i) {
++            if (eraseIdx < toErase.size() && i == toErase[eraseIdx]) {
++                ++eraseIdx;
++            } else if (m_commits[i]) {
++                remaining.push_back(std::move(m_commits[i]));
++            }
++        }
++        m_commits = std::move(remaining);
++    }
++
+     if (front) {
          m_commits.insert(m_commits.begin(), std::move(front));
      }
- }
-@@ -336,9 +340,9 @@ void DrmCommitThread::addCommit(std::uni
-     m_commits.push_back(std::move(commit));
+@@ -332,24 +368,30 @@ DrmCommitThread::~DrmCommitThread()
+ 
+ void DrmCommitThread::addCommit(std::unique_ptr<DrmAtomicCommit> &&commit)
+ {
+-    std::unique_lock lock(m_mutex);
+-    m_commits.push_back(std::move(commit));
      const auto now = std::chrono::steady_clock::now();
++
++    std::unique_lock lock(m_mutex);
++
      TimePoint newTarget;
 -    if (m_tearing) {
 +    if (m_tearing) [[unlikely]] {
@@ -867,7 +911,16 @@
          newTarget = now;
      } else {
          newTarget = estimateNextVblank(now);
-@@ -350,6 +354,7 @@ void DrmCommitThread::addCommit(std::uni
+     }
++
+     m_targetPageflipTime = std::max(m_targetPageflipTime, newTarget);
+-    m_commits.back()->setDeadline(m_targetPageflipTime - m_safetyMargin);
++    const auto deadline = m_targetPageflipTime - m_safetyMargin;
++    commit->setDeadline(deadline);
++
++    m_commits.push_back(std::move(commit));
+     m_commitPending.notify_all();
+ }
  
  void DrmCommitThread::setPendingCommit(std::unique_ptr<DrmLegacyCommit> &&commit)
  {
@@ -875,7 +928,7 @@
      m_committed = std::move(commit);
  }
  
-@@ -359,16 +364,17 @@ void DrmCommitThread::clearDroppedCommit
+@@ -359,16 +401,17 @@ void DrmCommitThread::clearDroppedCommit
      m_commitsToDelete.clear();
  }
  
@@ -898,7 +951,7 @@
      m_baseSafetyMargin = vblankTime + s_safetyMarginMinimum;
      m_safetyMargin = m_baseSafetyMargin + m_additionalSafetyMargin;
  }
-@@ -376,13 +382,14 @@ void DrmCommitThread::setModeInfo(uint32
+@@ -376,13 +419,14 @@ void DrmCommitThread::setModeInfo(uint32
  void DrmCommitThread::pageFlipped(std::chrono::nanoseconds timestamp)
  {
      std::unique_lock lock(m_mutex);
@@ -916,29 +969,32 @@
          m_targetPageflipTime = estimateNextVblank(std::chrono::steady_clock::now());
          m_commitPending.notify_all();
      }
-@@ -396,22 +403,38 @@ bool DrmCommitThread::pageflipsPending()
+@@ -396,22 +440,41 @@ bool DrmCommitThread::pageflipsPending()
  
  TimePoint DrmCommitThread::estimateNextVblank(TimePoint now) const
  {
 -    // the pageflip timestamp may be in the future
 -    const uint64_t pageflipsSince = now >= m_lastPageflip ? (now - m_lastPageflip) / m_minVblankInterval : 0;
 -    return m_lastPageflip + m_minVblankInterval * (pageflipsSince + 1);
-+    if (m_minVblankInterval.count() == 0 || m_vblankIntervalInv == 0.0) [[unlikely]] {
++    const int64_t minVblankNs = m_minVblankInterval.count();
++    if (minVblankNs <= 0) [[unlikely]] {
 +        return now + std::chrono::milliseconds(16);
 +    }
 +
 +    const auto elapsed = now >= m_lastPageflip ? now - m_lastPageflip : std::chrono::nanoseconds::zero();
-+    const auto elapsedNs = elapsed.count();
++    const int64_t elapsedNs = elapsed.count();
 +
 +    if (elapsedNs < 0) [[unlikely]] {
 +        return m_lastPageflip + m_minVblankInterval;
 +    }
 +
-+    const double elapsedSeconds = static_cast<double>(elapsedNs) * 1e-9;
-+    const uint64_t pageflipsSince = static_cast<uint64_t>(elapsedSeconds * m_vblankIntervalInv * 1e9);
++    const uint64_t elapsedU = static_cast<uint64_t>(elapsedNs);
++    const uint64_t minVblankU = static_cast<uint64_t>(minVblankNs);
++
++    const uint64_t pageflipsSince = elapsedU / minVblankU;
 +
 +    constexpr uint64_t maxReasonablePageflips = 10000;
-+    const uint64_t clampedPageflips = std::min(pageflipsSince, maxReasonablePageflips);
++    const uint64_t clampedPageflips = (pageflipsSince < maxReasonablePageflips) ? pageflipsSince : maxReasonablePageflips;
 +
 +    return m_lastPageflip + m_minVblankInterval * (clampedPageflips + 1);
  }
@@ -959,7 +1015,6 @@
  }
 +
  }
-
 
 --- a/src/backends/drm/drm_egl_layer_surface.h	2025-10-26 23:33:36.571412244 +0100
 +++ b/src/backends/drm/drm_egl_layer_surface.h	2025-10-26 23:47:51.015003254 +0100
@@ -2796,83 +2851,39 @@
      DrmOutput *m_output = nullptr;
      DrmConnector *m_connector = nullptr;
  
-@@ -147,8 +149,8 @@ private:
+@@ -147,27 +149,28 @@ private:
      struct State
      {
          DrmCrtc *crtc = nullptr;
 -        bool active = true; // whether or not the pipeline should be currently used
 -        bool enabled = true; // whether or not the pipeline needs a crtc
+-        bool needsModeset = false;
+-        bool needsModesetProperties = false;
+         std::shared_ptr<DrmConnectorMode> mode;
+-        uint32_t overscan = 0;
+-        Output::RgbRange rgbRange = Output::RgbRange::Automatic;
++        QList<DrmPipelineLayer *> layers;
+         PresentationMode presentationMode = PresentationMode::VSync;
+-        ColorPipeline crtcColorPipeline;
+-        DrmConnector::DrmContentType contentType = DrmConnector::DrmContentType::Graphics;
+ 
+-        std::shared_ptr<IccProfile> iccProfile;
 +        bool active = true;
 +        bool enabled = true;
-         bool needsModeset = false;
-         bool needsModesetProperties = false;
-         std::shared_ptr<DrmConnectorMode> mode;
-@@ -164,10 +166,71 @@ private:
++        bool needsModeset = false;
++        bool needsModesetProperties = false;
+         bool hdr = false;
+         bool wcg = false;
++
++        uint32_t overscan = 0;
          uint32_t maxBpc = 10;
  
-         QList<DrmPipelineLayer *> layers;
+-        QList<DrmPipelineLayer *> layers;
++        Output::RgbRange rgbRange = Output::RgbRange::Automatic;
++        DrmConnector::DrmContentType contentType = DrmConnector::DrmContentType::Graphics;
 +
-+        struct alignas(64) PrimaryPlaneCache {
-+            uint64_t crtcId = 0;
-+            uint64_t alpha = UINT64_MAX;
-+            uint64_t zpos = UINT64_MAX;
-+            uint64_t pixelBlendMode = UINT64_MAX;
-+            uint64_t colorEncoding = UINT64_MAX;
-+            uint64_t colorRange = UINT64_MAX;
-+
-+            uint32_t rotation = 0;
-+            uint32_t pixelFormat = 0;
-+
-+            alignas(16) int16_t geometry[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
-+
-+            uint32_t _pad[9] = {};
-+
-+            void clear() noexcept
-+            {
-+                crtcId = 0;
-+                alpha = UINT64_MAX;
-+                zpos = UINT64_MAX;
-+                pixelBlendMode = UINT64_MAX;
-+                colorEncoding = UINT64_MAX;
-+                colorRange = UINT64_MAX;
-+                rotation = 0;
-+                pixelFormat = 0;
-+                for (int i = 0; i < 8; ++i) {
-+                    geometry[i] = -1;
-+                }
-+                for (auto &p : _pad) {
-+                    p = 0;
-+                }
-+            }
-+        } primaryCache;
-+
-+        struct alignas(64) CursorPlaneCache {
-+            uint64_t crtcId = 0;
-+            int16_t hotspotX = -1;
-+            int16_t hotspotY = -1;
-+            uint32_t _pad[29] = {};
-+
-+            void clear() noexcept
-+            {
-+                crtcId = 0;
-+                hotspotX = -1;
-+                hotspotY = -1;
-+                for (auto &p : _pad) {
-+                    p = 0;
-+                }
-+            }
-+        } cursorCache;
-+
-+#ifndef Q_MOC_RUN
-+        static_assert(sizeof(PrimaryPlaneCache) == 128,
-+                      "PrimaryPlaneCache must be 128 bytes");
-+        static_assert(sizeof(CursorPlaneCache) == 128,
-+                      "CursorPlaneCache must be 128 bytes");
-+        static_assert(alignof(PrimaryPlaneCache) == 64,
-+                      "PrimaryPlaneCache must be 64-byte aligned");
-+        static_assert(alignof(CursorPlaneCache) == 64,
-+                      "CursorPlaneCache must be 64-byte aligned");
-+#endif
++        ColorPipeline crtcColorPipeline;
++        std::shared_ptr<IccProfile> iccProfile;
      };
 -    // the state that is to be tested next
 +
