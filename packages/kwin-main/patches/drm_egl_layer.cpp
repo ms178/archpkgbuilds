@@ -31,7 +31,7 @@ namespace KWin
 
 static constexpr EglGbmLayerSurface::BufferTarget targetFor(DrmGpu *gpu, DrmPlane::TypeIndex planeType) noexcept
 {
-    return (gpu->isVirtualMachine() && planeType == DrmPlane::TypeIndex::Cursor)
+    return ((!gpu->atomicModeSetting() || gpu->isVirtualMachine()) && planeType == DrmPlane::TypeIndex::Cursor)
         ? EglGbmLayerSurface::BufferTarget::Dumb
         : EglGbmLayerSurface::BufferTarget::Normal;
 }

@@ -39,9 +39,7 @@ public:
 
     bool isCrtcSupported(int pipeIndex) const;
 
-    // Format getters: Return by const-ref for zero-copy access
-    // Safe because members are stable after updateProperties()
-    const QHash<uint32_t, QList<uint64_t>> &implicitModifierOnlyFormats() const;
+    const QHash<uint32_t, QList<uint64_t>> &lowBandwidthFormats() const;
     const QHash<uint32_t, QList<uint64_t>> &formats() const;
     const QHash<uint32_t, QList<uint64_t>> &tearingFormats() const;
 
@@ -114,13 +112,11 @@ public:
 private:
     std::shared_ptr<DrmFramebuffer> m_current;
 
-    // Ring buffer for last 4 buffers (triple-buffering + 1 spare)
-    // Using fixed-size array avoids heap allocation and provides O(1) operations
     std::array<std::shared_ptr<DrmFramebufferData>, 4> m_lastBuffers;
     size_t m_lastBufferWriteIndex = 0;
 
     QHash<uint32_t, QList<uint64_t>> m_supportedFormats;
-    QHash<uint32_t, QList<uint64_t>> m_implicitModifierOnlyFormats;
+    QHash<uint32_t, QList<uint64_t>> m_lowBandwidthFormats;
     QHash<uint32_t, QList<uint64_t>> m_supportedTearingFormats;
     uint32_t m_possibleCrtcs = 0;
     QList<QSize> m_sizeHints;

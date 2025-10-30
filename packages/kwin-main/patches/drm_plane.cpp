@@ -17,6 +17,7 @@
 #include "drm_gpu.h"
 #include "drm_logging.h"
 #include "drm_pointer.h"
+#include "utils/drm_format_helper.h"
 
 #include <drm_fourcc.h>
 #include <algorithm>
@@ -139,11 +140,20 @@ bool DrmPlane::updateProperties()
         m_supportedFormats.insert(DRM_FORMAT_XRGB8888, {modifier});
     }
 
-    m_implicitModifierOnlyFormats.clear();
-    m_implicitModifierOnlyFormats.reserve(m_supportedFormats.size());
-    const QList<uint64_t> implicitOnly = {DRM_FORMAT_MOD_INVALID};
+    // Upstream change: Implement low bandwidth format selection with FormatInfo
+    m_lowBandwidthFormats.clear();
+    m_lowBandwidthFormats.reserve(m_supportedFormats.size());
     for (auto it = m_supportedFormats.constBegin(); it != m_supportedFormats.constEnd(); ++it) {
-        m_implicitModifierOnlyFormats.insert(it.key(), implicitOnly);
+        const auto info = FormatInfo::get(it.key());
+        if (info && info->bitsPerPixel <= 32) {
+            if (it.value().contains(DRM_FORMAT_MOD_INVALID)) {
+                // Mesa usually picks the modifier with lowest bandwidth requirements,
+                // so prefer implicit modifiers for low bandwidth if supported
+                m_lowBandwidthFormats.insert(it.key(), {DRM_FORMAT_MOD_INVALID});
+            } else {
+                m_lowBandwidthFormats.insert(it.key(), it.value());
+            }
+        }
     }
 
     m_sizeHints.clear();
@@ -223,9 +233,9 @@ bool DrmPlane::isCrtcSupported(int pipeIndex) const
     return (m_possibleCrtcs & (1 << pipeIndex));
 }
 
-const QHash<uint32_t, QList<uint64_t>> &DrmPlane::implicitModifierOnlyFormats() const
+const QHash<uint32_t, QList<uint64_t>> &DrmPlane::lowBandwidthFormats() const
 {
-    return m_implicitModifierOnlyFormats;
+    return m_lowBandwidthFormats;
 }
 
 const QHash<uint32_t, QList<uint64_t>> &DrmPlane::formats() const

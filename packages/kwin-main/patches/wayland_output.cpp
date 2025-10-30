@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <cmath>
 #include <climits>
+#include <ranges>
 
 namespace KWin
 {
@@ -131,6 +132,7 @@ WaylandOutput::WaylandOutput(const QString &name, WaylandBackend *backend)
     , m_cursor(std::make_unique<WaylandCursor>(backend))
 {
     m_renderLoop->setMaxPendingFrameCount(2);
+
     if (KWayland::Client::XdgDecorationManager *manager = m_backend->display()->xdgDecorationManager()) {
         m_xdgDecoration.reset(manager->getToplevelDecoration(m_xdgShellSurface.get()));
         m_xdgDecoration->setMode(KWayland::Client::XdgDecoration::Mode::ServerSide);
@@ -260,11 +262,11 @@ bool WaylandOutput::testPresentation(const std::shared_ptr<OutputFrame> &frame)
     if (!m_hasPointerLock) [[likely]] {
         return true;
     }
-    auto layers = Compositor::self()->backend()->compatibleOutputLayers(this);
-    for (OutputLayer *layer : layers) {
-        if (layer->type() == OutputLayerType::CursorOnly && layer->isEnabled()) {
-            return false;
-        }
+    auto cursorLayers = Compositor::self()->backend()->compatibleOutputLayers(this) | std::views::filter([](OutputLayer *layer) {
+        return layer->type() == OutputLayerType::CursorOnly;
+    });
+    if (std::ranges::any_of(cursorLayers, &OutputLayer::isEnabled)) {
+        return false;
     }
     return true;
 }
@@ -296,21 +298,14 @@ WaylandOutput::FrameData::~FrameData()
 
 bool WaylandOutput::present(const QList<OutputLayer *> &layersToUpdate, const std::shared_ptr<OutputFrame> &frame)
 {
-    bool hasCursor = false;
-    bool cursorEnabled = false;
-    for (OutputLayer *layer : layersToUpdate) {
-        if (layer->type() == OutputLayerType::CursorOnly) [[unlikely]] {
-            hasCursor = true;
-            cursorEnabled = layer->isEnabled();
-            if (m_hasPointerLock && cursorEnabled) {
-                return false;
-            }
-            break;
+    auto cursorLayers = layersToUpdate | std::views::filter([](OutputLayer *layer) {
+        return layer->type() == OutputLayerType::CursorOnly;
+    });
+    if (!cursorLayers.empty()) {
+        if (m_hasPointerLock && cursorLayers.front()->isEnabled()) {
+            return false;
         }
-    }
-
-    if (hasCursor) [[unlikely]] {
-        m_cursor->setEnabled(cursorEnabled);
+        m_cursor->setEnabled(cursorLayers.front()->isEnabled());
     }
 
     if (!m_mapped) [[unlikely]] {
@@ -379,6 +374,7 @@ void WaylandOutput::applyChanges(const OutputConfiguration &config)
     next.enabled = props->enabled.value_or(m_state.enabled);
     next.transform = props->transform.value_or(m_state.transform);
     next.position = props->pos.value_or(m_state.position);
+    // Upstream change: Scale intentionally ignored due to fractional scale protocol
     next.desiredModeSize = props->desiredModeSize.value_or(m_state.desiredModeSize);
     next.desiredModeRefreshRate = props->desiredModeRefreshRate.value_or(m_state.desiredModeRefreshRate);
     next.uuid = props->uuid.value_or(m_state.uuid);

@@ -261,7 +261,7 @@ QList<SurfaceItem *> WorkspaceScene::scanoutCandidates(ssize_t maxCount) const
     const auto overlayItems = m_overlayItem->childItems();
     const bool needsRendering = std::ranges::any_of(overlayItems, [this](Item *child) {
         return child->isVisible()
-            && !child->boundingRect().isEmpty()
+            && !child->boundingRect().isEmpty()  // Upstream change: Added empty rect check
             && painted_delegate->shouldRenderItem(child);
     });
     if (needsRendering) [[unlikely]] {
@@ -344,6 +344,7 @@ static bool findOverlayCandidates(SceneView *view, Item *item, ssize_t maxTotalC
     if (!item) [[unlikely]] {
         return true;
     }
+    // Upstream change: Added empty bounding rect check
     if (!item->isVisible() || item->boundingRect().isEmpty()) [[unlikely]] {
         return true;
     }
