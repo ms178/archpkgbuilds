@@ -11,6 +11,7 @@
 #ifndef RADV_CMD_BUFFER_H
 #define RADV_CMD_BUFFER_H
 
+#include "ac_cmdbuf.h"
 #include "ac_vcn.h"
 
 #include "vk_command_buffer.h"
@@ -367,6 +368,7 @@ struct radv_streamout_state {
 struct radv_attachment {
    VkFormat format;
    struct radv_image_view *iview;
+   VkRenderingAttachmentFlagsKHR flags;
    VkImageLayout layout;
    VkImageLayout stencil_layout;
 
@@ -385,7 +387,7 @@ struct radv_attachment {
 struct radv_rendering_state {
    bool active;
    bool has_image_views;
-   bool has_input_attachment_no_concurrent_writes;
+   bool has_input_attachment_concurrent_writes;
    VkRect2D area;
    uint32_t layer_count;
    uint32_t view_mask;
@@ -601,12 +603,6 @@ struct radv_cmd_buffer_upload {
    struct list_head list;
 };
 
-/* A pair of values for SET_*_REG_PAIRS. */
-struct gfx12_reg {
-   uint32_t reg_offset;
-   uint32_t reg_value;
-};
-
 struct radv_cmd_stream {
    struct ac_cmdbuf *b;
 
@@ -615,10 +611,7 @@ struct radv_cmd_stream {
    struct radv_tracked_regs tracked_regs;
    enum amd_ip_type hw_ip;
 
-   uint32_t num_buffered_sh_regs;
-   struct {
-      struct gfx12_reg buffered_sh_regs[256];
-   } gfx12;
+   struct ac_buffered_sh_regs buffered_sh_regs;
 };
 
 struct radv_cmd_buffer {
