@@ -865,8 +865,8 @@ alu_opt_info_is_valid(opt_ctx& ctx, alu_opt_info& info)
       if (ctx.program->gfx_level < GFX9)
          return false;
 
-      /* v_mad_mix* on GFX9 always flushes denormals for 16-bit inputs/outputs */
-      if (ctx.program->gfx_level == GFX9 && ctx.fp_mode.denorm16_64)
+       /* v_mad_mix* on GFX9 always flushes denormals for 16-bit inputs/outputs */
+       if (ctx.program->gfx_level == GFX9 && ctx.fp_mode.denorm16_64)
          return false;
 
       switch (info.opcode) {
@@ -5553,6 +5553,9 @@ to_mad_mix(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 
    aco_ptr<Instruction> vop3p{create_instruction(aco_opcode::v_fma_mix_f32, Format::VOP3P, 3, 1)};
 
+   for (const Operand& op : instr->operands)
+      safe_decrease_uses(ctx, op);
+
    for (unsigned i = 0; i < instr->operands.size(); i++) {
       vop3p->operands[is_add + i] = instr->operands[i];
       vop3p->valu().neg_lo[is_add + i] = instr->valu().neg[i];
@@ -5568,6 +5571,10 @@ to_mad_mix(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       else if (instr->opcode == aco_opcode::v_subrev_f32)
          vop3p->valu().neg_lo[1] ^= true;
    }
+
+   for (const Operand& op : vop3p->operands)
+      safe_increase_uses(ctx, op);
+
    vop3p->definitions[0] = instr->definitions[0];
    vop3p->valu().clamp = instr->valu().clamp;
    vop3p->pass_flags = instr->pass_flags;
@@ -5598,13 +5605,24 @@ combine_output_conversion(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    if (!instr->isVOP3P())
       to_mad_mix(ctx, instr);
 
+   // Keep track of the original temporary from the instruction before we overwrite its definition.
+   Temp old_temp = instr->definitions[0].getTemp();
+
+   // The fused instruction now defines the result of the conversion.
    instr->opcode = aco_opcode::v_fma_mixlo_f16;
-   instr->definitions[0].swapTemp(conv->definitions[0]);
+   instr->definitions[0] = conv->definitions[0];
    if (conv->definitions[0].isPrecise())
       instr->definitions[0].setPrecise(true);
-   ctx.info[instr->definitions[0].tempId()].label &= label_clamp;
-   ctx.uses[conv->definitions[0].tempId()]--;
+
+   // Explicitly update the parent_instr pointer for the new definition. This is the critical step.
    ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
+
+   // The original temporary from the fused instruction is now dead.
+   ctx.uses[old_temp.id()] = 0;
+
+   // The conversion instruction is also now dead.
+   ctx.uses[conv->definitions[0].tempId()]--;
+   ctx.info[instr->definitions[0].tempId()].label &= label_clamp;
    ctx.info[conv->definitions[0].tempId()].parent_instr = conv;
 
    return true;
@@ -5821,15 +5839,23 @@ mad:
       }
 
       if (mul_instr) {
+         /* BEGIN FIX: Correctly update SSA use-counts for the MAD/FMA fusion.
+          * The original 'add' instruction is being replaced by a 'mad'.
+          * This means we must:
+          * 1. Decrement the use-count of the 'mul' result, as the 'add' no longer uses it.
+          * 2. Increment the use-counts of the 'mul' instruction's original operands,
+          *    as the new 'mad' instruction now uses them directly.
+          * 3. The use of the other 'add' operand is transferred to the 'mad',
+          *    so its net use-count remains unchanged and requires no adjustment.
+          */
+         unsigned mul_op_idx = (is_add_mix ? 3u : 1u) - add_op_idx;
+         safe_decrease_uses(ctx, instr->operands[mul_op_idx]);
+         safe_increase_uses(ctx, mul_instr->operands[0]);
+         safe_increase_uses(ctx, mul_instr->operands[1]);
+         /* END FIX */
+
          Operand op[3] = {mul_instr->operands[0], mul_instr->operands[1],
                           instr->operands[add_op_idx]};
-         ctx.uses[mul_instr->definitions[0].tempId()]--;
-         if (ctx.uses[mul_instr->definitions[0].tempId()]) {
-            if (op[0].isTemp())
-               ctx.uses[op[0].tempId()]++;
-            if (op[1].isTemp())
-               ctx.uses[op[1].tempId()]++;
-         }
 
          bool neg[3] = {false, false, false};
          bool abs[3] = {false, false, false};
@@ -5838,7 +5864,6 @@ mad:
          bitarray8 opsel_lo = 0;
          bitarray8 opsel_hi = 0;
          bitarray8 opsel = 0;
-         unsigned mul_op_idx = (instr->isVOP3P() ? 3 : 1) - add_op_idx;
 
          VALU_instruction& valu_mul = mul_instr->valu();
          neg[0] = valu_mul.neg[0];
@@ -6656,19 +6681,35 @@ select_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       }
    }
 
-   mad_info* mad_info = NULL;
    if (!instr->definitions.empty() && ctx.info[instr->definitions[0].tempId()].is_mad()) {
-      mad_info = &ctx.mad_infos[ctx.info[instr->definitions[0].tempId()].val];
-      /* re-check mad instructions */
-      if (ctx.uses[mad_info->mul_temp_id] && mad_info->add_instr) {
-         ctx.uses[mad_info->mul_temp_id]++;
-         if (instr->operands[0].isTemp())
-            ctx.uses[instr->operands[0].tempId()]--;
-         if (instr->operands[1].isTemp())
-            ctx.uses[instr->operands[1].tempId()]--;
-         instr.swap(mad_info->add_instr);
+      mad_info* info = &ctx.mad_infos[ctx.info[instr->definitions[0].tempId()].val];
+      /* revert mad instruction if it was not profitable */
+      if (info->add_instr && ctx.uses[info->mul_temp_id]) {
+         /* The original logic was fundamentally broken.
+          * It used a swap which left a ghost instruction with a duplicate definition,
+          * and it failed to correctly update use-counts, leading to incorrect DCE.
+          * The correct logic is to explicitly manage use-counts and replace the instruction.
+          */
+
+         /* 1. Correctly update SSA use-counts for the reversal. */
+         // The MAD is being destroyed, so decrement the uses of its operands.
+         for (const Operand& op : instr->operands)
+            safe_decrease_uses(ctx, op);
+
+         // The original ADD is being restored, so increment the uses of its operands.
+         for (const Operand& op : info->add_instr->operands)
+            safe_increase_uses(ctx, op);
+
+         /* 2. Replace the MAD instruction with the original ADD instruction.
+          * This move assignment destroys the MAD object previously held by 'instr'.
+          */
+         instr = std::move(info->add_instr);
+
+         /* 3. Update the parent_instr pointer in the ssa_info table to reflect the change. */
          ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
-         mad_info = NULL;
+
+         /* 4. The mad_info is now fully processed, clear the pointer to avoid re-processing. */
+         info->add_instr.reset();
       }
    }
 
@@ -6857,8 +6898,12 @@ select_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          candidate.operands[i].op = Operand::literal32(ctx.info[tmpid].val);
          candidate_uses = MIN2(candidate_uses, ctx.uses[tmpid]);
       }
-      if (!alu_opt_info_is_valid(ctx, candidate))
+
+      /* BEGIN FIX: Add curly braces to fix -Wmisleading-indentation */
+      if (!alu_opt_info_is_valid(ctx, candidate)) {
          continue;
+      }
+      /* END FIX */
 
       switch (candidate.opcode) {
       case aco_opcode::v_fmaak_f32:
