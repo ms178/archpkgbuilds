@@ -5839,7 +5839,7 @@ mad:
       }
 
       if (mul_instr) {
-         /* BEGIN FIX: Correctly update SSA use-counts for the MAD/FMA fusion.
+         /* Correctly update SSA use-counts for the MAD/FMA fusion.
           * The original 'add' instruction is being replaced by a 'mad'.
           * This means we must:
           * 1. Decrement the use-count of the 'mul' result, as the 'add' no longer uses it.
@@ -5852,7 +5852,6 @@ mad:
          safe_decrease_uses(ctx, instr->operands[mul_op_idx]);
          safe_increase_uses(ctx, mul_instr->operands[0]);
          safe_increase_uses(ctx, mul_instr->operands[1]);
-         /* END FIX */
 
          Operand op[3] = {mul_instr->operands[0], mul_instr->operands[1],
                           instr->operands[add_op_idx]};
@@ -6899,11 +6898,9 @@ select_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          candidate_uses = MIN2(candidate_uses, ctx.uses[tmpid]);
       }
 
-      /* BEGIN FIX: Add curly braces to fix -Wmisleading-indentation */
       if (!alu_opt_info_is_valid(ctx, candidate)) {
          continue;
       }
-      /* END FIX */
 
       switch (candidate.opcode) {
       case aco_opcode::v_fmaak_f32:
