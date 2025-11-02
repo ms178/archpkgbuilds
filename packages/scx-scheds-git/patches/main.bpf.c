@@ -1055,7 +1055,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		 */
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
 				   enq_flags);
-	} else if (per_cpu_dsq || (pinned_slice_ns && is_pinned(p))) {
+	} else if (per_cpu_dsq) {
 		/*
 		 * UPSTREAM PATCH: Added condition for pinned tasks when
 		 * pinned_slice_ns is enabled.
@@ -2211,7 +2211,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 	 * Rationale: When pinned_slice_ns is set, we need per-CPU DSQs
 	 * for pinned tasks to enable vtime comparison during dispatch.
 	 */
-	if (per_cpu_dsq || pinned_slice_ns) {
+	if (per_cpu_dsq) {
 		err = init_per_cpu_dsqs();
 		if (err)
 			return err;
