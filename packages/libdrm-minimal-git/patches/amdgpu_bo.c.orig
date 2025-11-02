@@ -74,6 +74,9 @@ drm_public int amdgpu_bo_alloc(amdgpu_device_handle dev,
 	union drm_amdgpu_gem_create args;
 	int r;
 
+	if (!alloc_buffer || !buf_handle)
+		return -EINVAL;
+
 	memset(&args, 0, sizeof(args));
 	args.in.bo_size = alloc_buffer->alloc_size;
 	args.in.alignment = alloc_buffer->phys_alignment;
@@ -105,6 +108,9 @@ drm_public int amdgpu_bo_set_metadata(amdgpu_bo_handle bo,
 {
 	struct drm_amdgpu_gem_metadata args = {};
 
+	if (!info)
+		return -EINVAL;
+
 	args.handle = bo->handle;
 	args.op = AMDGPU_GEM_METADATA_OP_SET_METADATA;
 	args.data.flags = info->flags;
@@ -132,7 +138,7 @@ drm_public int amdgpu_bo_query_info(amdgpu_bo_handle bo,
 	int r;
 
 	/* Validate the BO passed in */
-	if (!bo->handle)
+	if (!bo->handle || !info)
 		return -EINVAL;
 
 	/* Query metadata. */
@@ -642,7 +648,7 @@ drm_public int amdgpu_bo_list_create(amdgpu_device_handle dev,
 	unsigned i;
 	int r;
 
-	if (!number_of_resources)
+	if (!number_of_resources || !resources)
 		return -EINVAL;
 
 	/* overflow check for multiplication */
