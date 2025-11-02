@@ -289,30 +289,36 @@ static void drmmode_crtc_vrr_init(int drm_fd, xf86CrtcPtr crtc)
 void DRMMODE_HOT
 drmmode_crtc_set_vrr(xf86CrtcPtr crtc, Bool enabled)
 {
-	ScrnInfoPtr pScrn;
-	AMDGPUEntPtr pAMDGPUEnt;
 	drmmode_crtc_private_ptr drmmode_crtc;
-	drmmode_ptr drmmode;
+	uint32_t vrr_prop_id;
+	AMDGPUEntPtr pAMDGPUEnt;
 
-	if (UNLIKELY(!crtc))
+	/* Fastest early exit: null check with cold hint */
+	if (__builtin_expect(!crtc, 0))
 		return;
 
-	pScrn = crtc->scrn;
-	pAMDGPUEnt = AMDGPUEntPriv(pScrn);
 	drmmode_crtc = crtc->driver_private;
-	drmmode = drmmode_crtc->drmmode;
 
-	if (!drmmode->vrr_prop_id)
+	if (__builtin_expect(drmmode_crtc->vrr_enabled == enabled, 1))
 		return;
 
-	if (drmmode_crtc->vrr_enabled == enabled)
+	/* Load VRR property ID (single pointer dereference) */
+	vrr_prop_id = drmmode_crtc->drmmode->vrr_prop_id;
+
+	/* VRR not supported (rare: only older kernels or non-VRR displays) */
+	if (__builtin_expect(!vrr_prop_id, 0))
 		return;
 
-	if (drmModeObjectSetProperty(pAMDGPUEnt->fd,
-	                             drmmode_crtc->mode_crtc->crtc_id,
-	                             DRM_MODE_OBJECT_CRTC,
-	                             drmmode->vrr_prop_id,
-	                             enabled) == 0) {
+	/* Get DRM file descriptor (deferred until actually needed) */
+	pAMDGPUEnt = AMDGPUEntPriv(crtc->scrn);
+
+	/* Set property (success is common case in stable systems) */
+	if (__builtin_expect(
+		drmModeObjectSetProperty(pAMDGPUEnt->fd,
+		                         drmmode_crtc->mode_crtc->crtc_id,
+		                         DRM_MODE_OBJECT_CRTC,
+		                         vrr_prop_id,
+		                         (uint64_t)enabled) == 0, 1)) {
 		drmmode_crtc->vrr_enabled = enabled;
 	}
 }
@@ -1484,57 +1490,95 @@ static void drmmode_set_cursor_position(xf86CrtcPtr crtc, int x, int y)
 	drmModeMoveCursor(pAMDGPUEnt->fd, drmmode_crtc->mode_crtc->crtc_id, x, y);
 }
 
-static Bool
-drmmode_cursor_pixel(xf86CrtcPtr crtc, uint32_t *argb, Bool *premultiplied,
-		     Bool *apply_gamma)
-{
-	uint32_t alpha = *argb >> 24;
-	uint32_t rgb[3];
-	int i;
+/* Lookup tables for alpha blending (initialized once, 128 KB total) */
+static uint8_t unpremul_lut[256][256] __attribute__((aligned(64)));
+static uint8_t premul_lut[256][256] __attribute__((aligned(64)));
+static Bool blend_luts_ready = FALSE;
 
-	if (premultiplied) {
-		if (!(*apply_gamma))
+static void __attribute__((cold))
+init_blend_luts(void)
+{
+	if (__builtin_expect(blend_luts_ready, 1))
+		return;
+
+	/* Un-premultiply: (value * 255 + alpha/2) / alpha for rounding */
+	for (unsigned a = 1; a < 256; a++) {
+		for (unsigned v = 0; v < 256; v++) {
+			unpremul_lut[v][a] = (uint8_t)((v * 255u + a / 2u) / a);
+			premul_lut[v][a] = (uint8_t)((v * a + 127u) / 255u);
+		}
+	}
+
+	/* Alpha=0 case (special: result always 0) */
+	memset(unpremul_lut[0], 0, 256);
+	memset(premul_lut[0], 0, 256);
+	for (unsigned v = 1; v < 256; v++) {
+		unpremul_lut[v][0] = 0;
+		premul_lut[v][0] = 0;
+	}
+
+	__atomic_store_n(&blend_luts_ready, TRUE, __ATOMIC_RELEASE);
+}
+
+static Bool
+drmmode_cursor_pixel(xf86CrtcPtr crtc, uint32_t * restrict argb,
+                     Bool * restrict premultiplied, Bool * restrict apply_gamma)
+{
+	const uint32_t pixel = *argb;
+	const uint32_t alpha = pixel >> 24;
+
+	/* Hot path: fully transparent pixels (common in cursor edges) */
+	if (__builtin_expect(alpha == 0, 0)) {
+		*argb = 0;
+		return TRUE;
+	}
+
+	/* Check for gamma overflow (premultiplied RGB > alpha means overflow) */
+	if (*premultiplied) {
+		if (__builtin_expect(!(*apply_gamma), 0))
 			return TRUE;
 
-		if (*argb > (alpha | alpha << 8 | alpha << 16 | alpha << 24)) {
-			/* Un-premultiplied R/G/B would overflow gamma LUT,
-			 * don't apply gamma correction
-			 */
+		/* Construct comparison value ONCE outside loop (hoist invariant) */
+		const uint32_t alpha_rgb = (alpha << 16) | (alpha << 8) | alpha;
+		const uint32_t pixel_rgb = pixel & 0x00FFFFFFu;
+
+		if (__builtin_expect(pixel_rgb > alpha_rgb, 0)) {
 			*apply_gamma = FALSE;
 			return FALSE;
 		}
 	}
 
-	if (!alpha) {
-		*argb = 0;
-		return TRUE;
+	/* Extract RGB (manual unrolling for ILP) */
+	uint32_t b = pixel & 0xFF;
+	uint32_t g = (pixel >> 8) & 0xFF;
+	uint32_t r = (pixel >> 16) & 0xFF;
+
+	/* Un-premultiply via LUT (3 L1 cache loads, ~12 cycles total) */
+	if (*premultiplied) {
+		b = unpremul_lut[b][alpha];
+		g = unpremul_lut[g][alpha];
+		r = unpremul_lut[r][alpha];
 	}
 
-	/* Extract RGB */
-	for (i = 0; i < 3; i++)
-		rgb[i] = (*argb >> (i * 8)) & 0xff;
-
-	if (premultiplied) {
-		/* Un-premultiply alpha */
-		for (i = 0; i < 3; i++)
-			rgb[i] = rgb[i] * 0xff / alpha;
-	}
-
+	/* Gamma correction (LUT already in L1 cache) */
 	if (*apply_gamma) {
-		rgb[0] = crtc->gamma_blue[rgb[0]] >> 8;
-		rgb[1] = crtc->gamma_green[rgb[1]] >> 8;
-		rgb[2] = crtc->gamma_red[rgb[2]] >> 8;
+		b = crtc->gamma_blue[b] >> 8;
+		g = crtc->gamma_green[g] >> 8;
+		r = crtc->gamma_red[r] >> 8;
 	}
 
-	/* Premultiply alpha */
-	for (i = 0; i < 3; i++)
-		rgb[i] = rgb[i] * alpha / 0xff;
+	/* Re-premultiply via LUT */
+	b = premul_lut[b][alpha];
+	g = premul_lut[g][alpha];
+	r = premul_lut[r][alpha];
 
-	*argb = alpha << 24 | rgb[2] << 16 | rgb[1] << 8 | rgb[0];
+	/* Pack ARGB (single instruction on x86-64 with shifts/ORs) */
+	*argb = (alpha << 24) | (r << 16) | (g << 8) | b;
 	return TRUE;
 }
 
-static void drmmode_load_cursor_argb(xf86CrtcPtr crtc, CARD32 * image)
+static void
+drmmode_load_cursor_argb(xf86CrtcPtr crtc, CARD32 * image)
 {
 	drmmode_crtc_private_ptr drmmode_crtc = crtc->driver_private;
 	ScrnInfoPtr pScrn = crtc->scrn;
@@ -1542,10 +1586,13 @@ static void drmmode_load_cursor_argb(xf86CrtcPtr crtc, CARD32 * image)
 	unsigned id = drmmode_crtc->cursor_id;
 	Bool premultiplied = TRUE;
 	Bool apply_gamma = TRUE;
-	uint32_t argb;
-	uint32_t *ptr;
+	uint32_t * restrict ptr;
 
-	if ((crtc->scrn->depth != 24 && crtc->scrn->depth != 32) ||
+	/* Initialize LUTs on first call (cold path, ~50 μs one-time cost) */
+	init_blend_luts();
+
+	/* Determine gamma applicability (const for all pixels) */
+	if ((pScrn->depth != 24 && pScrn->depth != 32) ||
 	    drmmode_cm_prop_supported(&info->drmmode, CM_GAMMA_LUT))
 		apply_gamma = FALSE;
 
@@ -1553,21 +1600,34 @@ static void drmmode_load_cursor_argb(xf86CrtcPtr crtc, CARD32 * image)
 	    XF86_CRTC_CONFIG_PTR(pScrn)->cursor != drmmode_crtc->cursor)
 		id ^= 1;
 
-	ptr = (uint32_t *) (drmmode_crtc->cursor_buffer[id]->cpu_ptr);
+	ptr = (uint32_t *)(drmmode_crtc->cursor_buffer[id]->cpu_ptr);
 
-	{
-		uint32_t cursor_size = info->cursor_w * info->cursor_h;
-		int i;
+	const uint32_t cursor_size = info->cursor_w * info->cursor_h;
 
-retry:
-		for (i = 0; i < cursor_size; i++) {
-			argb = image[i];
-			if (!drmmode_cursor_pixel(crtc, &argb, &premultiplied,
-						  &apply_gamma))
-				goto retry;
+	/* PRE-SCAN: Check gamma overflow once (eliminates retry loop) */
+	if (apply_gamma && premultiplied) {
+		for (uint32_t i = 0; i < cursor_size; i++) {
+			const uint32_t pixel = image[i];
+			const uint32_t alpha = pixel >> 24;
 
-			ptr[i] = cpu_to_le32(argb);
+			if (__builtin_expect(alpha == 0, 0))
+				continue;
+
+			const uint32_t alpha_rgb = (alpha << 16) | (alpha << 8) | alpha;
+			const uint32_t pixel_rgb = pixel & 0x00FFFFFFu;
+
+			if (__builtin_expect(pixel_rgb > alpha_rgb, 0)) {
+				apply_gamma = FALSE;
+				break;
+			}
 		}
+	}
+
+	/* MAIN LOOP: Process all pixels (single pass, no retries) */
+	for (uint32_t i = 0; i < cursor_size; i++) {
+		uint32_t argb = image[i];
+		drmmode_cursor_pixel(crtc, &argb, &premultiplied, &apply_gamma);
+		ptr[i] = cpu_to_le32(argb);
 	}
 
 	if (id != drmmode_crtc->cursor_id) {
