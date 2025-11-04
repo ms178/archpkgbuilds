@@ -865,8 +865,8 @@ alu_opt_info_is_valid(opt_ctx& ctx, alu_opt_info& info)
       if (ctx.program->gfx_level < GFX9)
          return false;
 
-      /* v_mad_mix* on GFX9 always flushes denormals for 16-bit inputs/outputs */
-      if (ctx.program->gfx_level == GFX9 && ctx.fp_mode.denorm16_64)
+      /* unfused v_mad_mix* always flushes 16/32-bit denormal inputs/outputs */
+      if (!ctx.program->dev.fused_mad_mix && ctx.fp_mode.denorm)
          return false;
 
       switch (info.opcode) {
@@ -880,8 +880,7 @@ alu_opt_info_is_valid(opt_ctx& ctx, alu_opt_info& info)
          info.operands[2].neg[0] = true;
          break;
       case aco_opcode::v_fma_f32:
-         // TODO remove precise, not clear why unfusing fma would be valid
-         if (!ctx.program->dev.fused_mad_mix && info.defs[0].isPrecise())
+         if (!ctx.program->dev.fused_mad_mix)
             return false;
          break;
       case aco_opcode::v_mad_f32:
@@ -4357,8 +4356,8 @@ can_use_mad_mix(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    if (ctx.program->gfx_level < GFX9)
       return false;
 
-   /* v_mad_mix* on GFX9 always flushes denormals for 16-bit inputs/outputs */
-   if (ctx.program->gfx_level == GFX9 && ctx.fp_mode.denorm16_64)
+   /* unfused v_mad_mix* always flushes 16/32-bit denormal inputs/outputs */
+   if (!ctx.program->dev.fused_mad_mix && ctx.fp_mode.denorm)
       return false;
 
    if (instr->valu().omod)
@@ -4370,7 +4369,7 @@ can_use_mad_mix(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    case aco_opcode::v_subrev_f32:
    case aco_opcode::v_mul_f32: return !instr->isSDWA() && !instr->isDPP();
    case aco_opcode::v_fma_f32:
-      return ctx.program->dev.fused_mad_mix || !instr->definitions[0].isPrecise();
+      return ctx.program->dev.fused_mad_mix;
    case aco_opcode::v_fma_mix_f32:
    case aco_opcode::v_fma_mixlo_f16: return true;
    default: return false;
