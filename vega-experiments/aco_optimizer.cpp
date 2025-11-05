@@ -865,8 +865,8 @@ alu_opt_info_is_valid(opt_ctx& ctx, alu_opt_info& info)
       if (ctx.program->gfx_level < GFX9)
          return false;
 
-       /* v_mad_mix* on GFX9 always flushes denormals for 16-bit inputs/outputs */
-       if (ctx.program->gfx_level == GFX9 && ctx.fp_mode.denorm16_64)
+      /* unfused v_mad_mix* always flushes 16/32-bit denormal inputs/outputs */
+      if (!ctx.program->dev.fused_mad_mix && ctx.fp_mode.denorm)
          return false;
 
       switch (info.opcode) {
@@ -880,8 +880,7 @@ alu_opt_info_is_valid(opt_ctx& ctx, alu_opt_info& info)
          info.operands[2].neg[0] = true;
          break;
       case aco_opcode::v_fma_f32:
-         // TODO remove precise, not clear why unfusing fma would be valid
-         if (!ctx.program->dev.fused_mad_mix && info.defs[0].isPrecise())
+         if (!ctx.program->dev.fused_mad_mix)
             return false;
          break;
       case aco_opcode::v_mad_f32:
@@ -2200,63 +2199,92 @@ build_bfe:
 static bool
 combine_pack_cvt_f16(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 {
-   if (instr->opcode != aco_opcode::v_pack_b32_f16 || ctx.program->gfx_level < GFX8) {
+   if (instr->opcode != aco_opcode::v_pack_b32_f16)
       return false;
-   }
+
+   if (ctx.program->gfx_level < GFX8)
+      return false;
+
+   /* Both operands must be temps */
+   if (instr->operands.size() != 2)
+      return false;
+
+   if (!instr->operands[0].isTemp() || !instr->operands[1].isTemp())
+      return false;
 
    Instruction* cvt[2] = {nullptr, nullptr};
-   for (unsigned i = 0; i < 2; i++) {
-      if (!instr->operands[i].isTemp()) {
-         return false;
-      }
 
+   for (unsigned i = 0; i < 2; i++) {
       const unsigned tid = instr->operands[i].tempId();
-      if (!is_valid_temp_id(ctx, tid)) {
+
+      if (!is_valid_temp_id(ctx, tid))
          return false;
-      }
 
       Instruction* cand = ctx.info[tid].parent_instr;
-      if (!cand || cand->opcode != aco_opcode::v_cvt_f16_f32 || cand->usesModifiers()) {
-         return false;
-      }
 
-      if (ctx.uses[tid] != 1) {
+      /* Must be v_cvt_f16_f32 */
+      if (!cand || cand->opcode != aco_opcode::v_cvt_f16_f32)
          return false;
-      }
+
+      /* Must not use modifiers */
+      if (cand->usesModifiers())
+         return false;
+
+      /* Must have exactly one use (this pack instruction) */
+      if (ctx.uses[tid] != 1)
+         return false;
+
+      /* Source must be valid temp */
+      if (!cand->operands[0].isTemp())
+         return false;
+
+      const unsigned src_id = cand->operands[0].tempId();
+      if (!is_valid_temp_id(ctx, src_id))
+         return false;
 
       cvt[i] = cand;
    }
 
-   if (!cvt[0] || !cvt[1]) {
+   if (!cvt[0] || !cvt[1])
       return false;
-   }
 
+   /* Build operands for v_cvt_pkrtz_f16_f32 */
    Operand ops[2] = {cvt[0]->operands[0], cvt[1]->operands[0]};
-   if (!check_vop3_operands(ctx, 2, ops)) {
+
+   if (!check_vop3_operands(ctx, 2, ops))
       return false;
-   }
 
-   /* ALL VALIDATIONS PASSED */
+   /* DCE the conversion instructions (this is the critical fix!) */
+   decrease_and_dce(ctx, instr->operands[0].getTemp());  // cvt[0] output
+   decrease_and_dce(ctx, instr->operands[1].getTemp());  // cvt[1] output
 
-   aco_ptr<Instruction> pkrtz{create_instruction(aco_opcode::v_cvt_pkrtz_f16_f32,
-                                                  Format::VOP3, 2, 1)};
+   /* Increment uses for the source operands (now used by pkrtz) */
+   if (ops[0].isTemp() && is_valid_temp_id(ctx, ops[0].tempId()))
+      ctx.uses[ops[0].tempId()]++;
+
+   if (ops[1].isTemp() && is_valid_temp_id(ctx, ops[1].tempId()))
+      ctx.uses[ops[1].tempId()]++;
+
+   /* Create v_cvt_pkrtz_f16_f32 instruction */
+   aco_ptr<Instruction> pkrtz{
+      create_instruction(aco_opcode::v_cvt_pkrtz_f16_f32, Format::VOP3, 2, 1)
+   };
+
    pkrtz->operands[0] = ops[0];
    pkrtz->operands[1] = ops[1];
    pkrtz->definitions[0] = instr->definitions[0];
    pkrtz->pass_flags = instr->pass_flags;
 
+   /* Copy modifiers from cvt instructions (if any) */
    pkrtz->valu().neg[0] = cvt[0]->valu().neg[0];
    pkrtz->valu().neg[1] = cvt[1]->valu().neg[0];
    pkrtz->valu().abs[0] = cvt[0]->valu().abs[0];
    pkrtz->valu().abs[1] = cvt[1]->valu().abs[0];
 
-   decrease_and_dce(ctx, instr->operands[0].getTemp());
-   decrease_and_dce(ctx, instr->operands[1].getTemp());
-   safe_increase_uses(ctx, ops[0]);
-   safe_increase_uses(ctx, ops[1]);
-
+   /* Replace instruction */
    instr = std::move(pkrtz);
 
+   /* Update metadata */
    const unsigned def_id = instr->definitions[0].tempId();
    if (is_valid_temp_id(ctx, def_id)) {
       ctx.info[def_id].parent_instr = instr.get();
@@ -5518,8 +5546,8 @@ can_use_mad_mix(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    if (ctx.program->gfx_level < GFX9)
       return false;
 
-   /* v_mad_mix* on GFX9 always flushes denormals for 16-bit inputs/outputs */
-   if (ctx.program->gfx_level == GFX9 && ctx.fp_mode.denorm16_64)
+   /* unfused v_mad_mix* always flushes 16/32-bit denormal inputs/outputs */
+   if (!ctx.program->dev.fused_mad_mix && ctx.fp_mode.denorm)
       return false;
 
    if (instr->valu().omod)
@@ -5531,7 +5559,7 @@ can_use_mad_mix(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    case aco_opcode::v_subrev_f32:
    case aco_opcode::v_mul_f32: return !instr->isSDWA() && !instr->isDPP();
    case aco_opcode::v_fma_f32:
-      return ctx.program->dev.fused_mad_mix || !instr->definitions[0].isPrecise();
+      return ctx.program->dev.fused_mad_mix;
    case aco_opcode::v_fma_mix_f32:
    case aco_opcode::v_fma_mixlo_f16: return true;
    default: return false;
@@ -5541,7 +5569,21 @@ can_use_mad_mix(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 void
 to_mad_mix(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 {
-   ctx.info[instr->definitions[0].tempId()].label &= label_f2f16 | label_clamp;
+   /* === FIX: Clear existing mad_info before transformation === */
+   const uint32_t def_id = instr->definitions[0].tempId();
+   if (is_valid_temp_id(ctx, def_id) && ctx.info[def_id].is_mad()) {
+      const unsigned mad_idx = ctx.info[def_id].val;
+      if (mad_idx < ctx.mad_infos.size()) {
+         mad_info* mi = &ctx.mad_infos[mad_idx];
+         if (mi->add_instr) {
+            for (const Operand& op : mi->add_instr->operands)
+               safe_decrease_uses(ctx, op);
+            mi->add_instr.reset();
+         }
+      }
+   }
+
+   ctx.info[def_id].label &= label_f2f16 | label_clamp;
 
    if (instr->opcode == aco_opcode::v_fma_f32) {
       instr->format = (Format)((uint32_t)withoutVOP3(instr->format) | (uint32_t)(Format::VOP3P));
@@ -5588,6 +5630,7 @@ combine_output_conversion(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    ssa_info& def_info = ctx.info[instr->definitions[0].tempId()];
    if (!def_info.is_f2f16())
       return false;
+
    Instruction* conv = def_info.mod_instr;
 
    if (!ctx.uses[conv->definitions[0].tempId()] || ctx.uses[instr->definitions[0].tempId()] != 1)
@@ -5605,25 +5648,27 @@ combine_output_conversion(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    if (!instr->isVOP3P())
       to_mad_mix(ctx, instr);
 
-   // Keep track of the original temporary from the instruction before we overwrite its definition.
-   Temp old_temp = instr->definitions[0].getTemp();
+   const uint32_t old_def_id = instr->definitions[0].tempId();
+   const uint32_t new_def_id = conv->definitions[0].tempId();
+   const bool conv_precise = conv->definitions[0].isPrecise();
 
-   // The fused instruction now defines the result of the conversion.
    instr->opcode = aco_opcode::v_fma_mixlo_f16;
-   instr->definitions[0] = conv->definitions[0];
-   if (conv->definitions[0].isPrecise())
+   instr->definitions[0].swapTemp(conv->definitions[0]);
+
+   if (conv_precise)
       instr->definitions[0].setPrecise(true);
 
-   // Explicitly update the parent_instr pointer for the new definition. This is the critical step.
-   ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
+   /* Update parent_instr */
+   ctx.info[new_def_id].parent_instr = instr.get();
+   ctx.info[old_def_id].parent_instr = conv;
 
-   // The original temporary from the fused instruction is now dead.
-   ctx.uses[old_temp.id()] = 0;
+   /* Update use counts */
+   ctx.uses[old_def_id] = 0;
+   ctx.uses[new_def_id]--;
 
-   // The conversion instruction is also now dead.
-   ctx.uses[conv->definitions[0].tempId()]--;
-   ctx.info[instr->definitions[0].tempId()].label &= label_clamp;
-   ctx.info[conv->definitions[0].tempId()].parent_instr = conv;
+   /* Preserve only clamp, clear all other labels from intermediate */
+   ctx.info[new_def_id].label &= label_clamp;
+   ctx.info[old_def_id].label = 0;
 
    return true;
 }
@@ -6392,39 +6437,80 @@ try_pack_operand_pair(const Operand& lo, const Operand& hi,
    return false;
 }
 
+static void
+clear_mad_info_referencing_instruction(opt_ctx& ctx, const Instruction* instr)
+{
+   if (!instr)
+      return;
+
+   /* Search through ALL mad_infos and clear any pointing to this instruction */
+   for (mad_info& mi : ctx.mad_infos) {
+      if (mi.add_instr.get() == instr) {
+         /* Decrement uses of ADD's operands */
+         for (const Operand& op : mi.add_instr->operands)
+            safe_decrease_uses(ctx, op);
+         mi.add_instr.reset();
+      }
+   }
+
+   /* Also clear mad label from any temp pointing to an affected mad_info */
+   for (unsigned i = 0; i < ctx.info.size(); i++) {
+      if (ctx.info[i].is_mad()) {
+         unsigned mad_idx = ctx.info[i].val;
+         if (mad_idx < ctx.mad_infos.size() && !ctx.mad_infos[mad_idx].add_instr) {
+            ctx.info[i].label &= ~label_mad;
+         }
+      }
+   }
+}
+
 static bool
 combine_adjacent_fp16_pair(opt_ctx& ctx, Block& block, unsigned idx,
                           aco_ptr<Instruction>& packed_out,
                           aco_ptr<Instruction>& split_out)
 {
-   if (idx + 1 >= block.instructions.size()) {
+   if (idx + 1 >= block.instructions.size())
       return false;
-   }
 
    aco_ptr<Instruction>& instr0 = block.instructions[idx];
    aco_ptr<Instruction>& instr1 = block.instructions[idx + 1];
 
-   if (!instr0 || !instr1) {
+   if (!instr0 || !instr1)
       return false;
-   }
 
    fp16_pair_info pair_info;
-   if (!check_fp16_pair_compatibility(ctx, instr0.get(), instr1.get(), pair_info)) {
+   if (!check_fp16_pair_compatibility(ctx, instr0.get(), instr1.get(), pair_info))
       return false;
-   }
 
    const unsigned def0_id = instr0->definitions[0].tempId();
    const unsigned def1_id = instr1->definitions[0].tempId();
 
    if (def0_id >= ctx.uses.size() || def1_id >= ctx.uses.size() ||
-       ctx.uses[def0_id] == 0 || ctx.uses[def1_id] == 0) {
+       ctx.uses[def0_id] == 0 || ctx.uses[def1_id] == 0)
       return false;
-   }
 
    const aco_opcode packed_opcode = get_packed_opcode(instr0->opcode);
-   if (packed_opcode == aco_opcode::num_opcodes) {
+   if (packed_opcode == aco_opcode::num_opcodes)
       return false;
-   }
+
+   /* Clear mad_info if present to prevent dangling pointers */
+   auto clear_mad_info = [&](unsigned temp_id) {
+      if (is_valid_temp_id(ctx, temp_id) && ctx.info[temp_id].is_mad()) {
+         const unsigned mad_idx = ctx.info[temp_id].val;
+         if (mad_idx < ctx.mad_infos.size()) {
+            mad_info* mi = &ctx.mad_infos[mad_idx];
+            if (mi->add_instr) {
+               for (const Operand& op : mi->add_instr->operands)
+                  safe_decrease_uses(ctx, op);
+               mi->add_instr.reset();
+            }
+         }
+         ctx.info[temp_id].label &= ~label_mad;
+      }
+   };
+
+   clear_mad_info(def0_id);
+   clear_mad_info(def1_id);
 
    const unsigned num_operands = instr0->operands.size();
    aco_ptr<Instruction> packed{
@@ -6435,9 +6521,8 @@ combine_adjacent_fp16_pair(opt_ctx& ctx, Block& block, unsigned idx,
       bool opsel_lo, opsel_hi;
 
       if (!try_pack_operand_pair(instr0->operands[i], instr1->operands[i],
-                                 packed_op, opsel_lo, opsel_hi)) {
+                                 packed_op, opsel_lo, opsel_hi))
          return false;
-      }
 
       packed->operands[i] = packed_op;
       packed->valu().opsel_lo[i] = opsel_lo;
@@ -6450,9 +6535,8 @@ combine_adjacent_fp16_pair(opt_ctx& ctx, Block& block, unsigned idx,
       packed->valu().neg_hi[i] = valu1.neg[i];
       packed->valu().abs[i] = valu0.abs[i];
 
-      if (pair_info.needs_neg_hi && i == 1) {
+      if (pair_info.needs_neg_hi && i == 1)
          packed->valu().neg_hi[i] = !packed->valu().neg_hi[i];
-      }
    }
 
    const RegClass packed_rc = RegClass::get(RegType::vgpr, 4);
@@ -6463,34 +6547,41 @@ combine_adjacent_fp16_pair(opt_ctx& ctx, Block& block, unsigned idx,
    packed->valu().omod = instr0->valu().omod;
 
    const unsigned packed_id = packed_tmp.id();
-   if (packed_id >= ctx.uses.size()) {
+   if (packed_id >= ctx.uses.size())
       ctx.uses.resize(packed_id + 1, 0);
-   }
-   if (packed_id >= ctx.info.size()) {
+   if (packed_id >= ctx.info.size())
       ctx.info.resize(packed_id + 1);
-   }
 
    aco_ptr<Instruction> split{
       create_instruction(aco_opcode::p_split_vector, Format::PSEUDO, 1, 2)};
    split->operands[0] = Operand(packed_tmp);
+
    split->definitions[0] = instr0->definitions[0];
    split->definitions[1] = instr1->definitions[0];
 
+   /* Decrement uses for original operands */
    for (const Operand& op : instr0->operands) {
       if (op.isTemp()) ctx.uses[op.tempId()]--;
    }
    for (const Operand& op : instr1->operands) {
       if (op.isTemp()) ctx.uses[op.tempId()]--;
    }
+
+   /* Increment uses for packed operands */
    for (const Operand& op : packed->operands) {
       if (op.isTemp()) ctx.uses[op.tempId()]++;
    }
 
    ctx.uses[packed_id]++;
 
+   /* Update parent_instr pointers */
    ctx.info[def0_id].parent_instr = split.get();
    ctx.info[def1_id].parent_instr = split.get();
    ctx.info[packed_id].parent_instr = packed.get();
+
+   /* Clear labels from temps (they're now from split, not original ops) */
+   ctx.info[def0_id].label = 0;
+   ctx.info[def1_id].label = 0;
 
    packed_out = std::move(packed);
    split_out = std::move(split);
@@ -7315,14 +7406,6 @@ optimize(Program* program)
 
    /* CUSTOM: Add FP16 packing pass */
    optimize_packed_fp16_math(ctx);
-   validate_opt_ctx(ctx);
-
-   /* CUSTOM: Re-combine after FP16 packing */
-   for (Block& block : program->blocks) {
-      ctx.fp_mode = block.fp_mode;
-      for (aco_ptr<Instruction>& instr : block.instructions)
-         combine_instruction(ctx, instr);
-   }
    validate_opt_ctx(ctx);
 
    /* 4. Top-Down DAG pass (backward) to select instructions (includes DCE) */
