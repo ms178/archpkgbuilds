@@ -683,14 +683,15 @@ handle_instruction_gfx6(State& state, NOP_ctx_gfx6& ctx, aco_ptr<Instruction>& i
    }
 
    if (state.program->gfx_level == GFX9) {
-      bool is_lds_hazard_op = (instr->isVINTRP() ||
-                               (instr->isScratch() || instr->isGlobal()) && instr->flatlike().lds ||
-                               instr->opcode == aco_opcode::ds_read_addtid_b32 ||
-                               instr->opcode == aco_opcode::ds_write_addtid_b32 ||
-                               instr->opcode == aco_opcode::buffer_store_lds_dword);
-      if (is_lds_hazard_op) {
-         NOPs = std::max(NOPs, static_cast<int>(ctx.salu_wr_m0_then_lds));
-      }
+         const bool is_lds_hazard_op =
+         (instr->isVINTRP() ||
+         ((instr->isScratch() || instr->isGlobal()) && instr->flatlike().lds) ||
+         instr->opcode == aco_opcode::ds_read_addtid_b32 ||
+         instr->opcode == aco_opcode::ds_write_addtid_b32 ||
+         instr->opcode == aco_opcode::buffer_store_lds_dword);
+         if (is_lds_hazard_op) {
+               NOPs = std::max(NOPs, static_cast<int>(ctx.salu_wr_m0_then_lds));
+         }
    }
 
    if (NOPs > 0) {

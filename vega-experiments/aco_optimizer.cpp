@@ -4088,12 +4088,21 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       break;
    }
    case aco_opcode::v_cndmask_b32:
-      if (instr->operands[0].constantEquals(0) && instr->operands[1].constantEquals(0x3f800000u))
-         ctx.info[instr->definitions[0].tempId()].set_b2f(instr->operands[2].getTemp());
-      else if (instr->operands[0].constantEquals(0) && instr->operands[1].constantEquals(1))
-         ctx.info[instr->definitions[0].tempId()].set_b2i(instr->operands[2].getTemp());
+   if (instr->operands[2].isTemp()) {
+      Temp cond_temp = instr->operands[2].getTemp();
+      const unsigned expected_bytes = ctx.program->wave_size == 64 ? 2u : 1u;
 
-      break;
+      if (cond_temp.type() == RegType::sgpr && cond_temp.bytes() == expected_bytes) {
+         if (instr->operands[0].constantEquals(0) &&
+             instr->operands[1].constantEquals(0x3f800000u)) {
+            ctx.info[instr->definitions[0].tempId()].set_b2f(cond_temp);
+         } else if (instr->operands[0].constantEquals(0) &&
+                    instr->operands[1].constantEquals(1)) {
+            ctx.info[instr->definitions[0].tempId()].set_b2i(cond_temp);
+         }
+      }
+   }
+   break;
    case aco_opcode::s_not_b32:
    case aco_opcode::s_not_b64:
       if (!instr->operands[0].isTemp()) {
@@ -5884,15 +5893,6 @@ mad:
       }
 
       if (mul_instr) {
-         /* Correctly update SSA use-counts for the MAD/FMA fusion.
-          * The original 'add' instruction is being replaced by a 'mad'.
-          * This means we must:
-          * 1. Decrement the use-count of the 'mul' result, as the 'add' no longer uses it.
-          * 2. Increment the use-counts of the 'mul' instruction's original operands,
-          *    as the new 'mad' instruction now uses them directly.
-          * 3. The use of the other 'add' operand is transferred to the 'mad',
-          *    so its net use-count remains unchanged and requires no adjustment.
-          */
          unsigned mul_op_idx = (is_add_mix ? 3u : 1u) - add_op_idx;
          safe_decrease_uses(ctx, instr->operands[mul_op_idx]);
          safe_increase_uses(ctx, mul_instr->operands[0]);
@@ -5999,24 +5999,50 @@ mad:
               !instr->definitions[0].isSZPreserve())) &&
             !instr->usesModifiers() && !ctx.fp_mode.must_flush_denorms32) {
       for (unsigned i = 0; i < 2; i++) {
-         if (instr->operands[i].isTemp() && ctx.info[instr->operands[i].tempId()].is_b2f() &&
-             ctx.uses[instr->operands[i].tempId()] == 1 && instr->operands[!i].isTemp() &&
-             instr->operands[!i].getTemp().type() == RegType::vgpr) {
-            ctx.uses[instr->operands[i].tempId()]--;
-            ctx.uses[ctx.info[instr->operands[i].tempId()].temp.id()]++;
+         if (!instr->operands[i].isTemp())
+            continue;
 
-            aco_ptr<Instruction> new_instr{
-               create_instruction(aco_opcode::v_cndmask_b32, Format::VOP2, 3, 1)};
-            new_instr->operands[0] = Operand::zero();
-            new_instr->operands[1] = instr->operands[!i];
-            new_instr->operands[2] = Operand(ctx.info[instr->operands[i].tempId()].temp);
-            new_instr->definitions[0] = instr->definitions[0];
-            new_instr->pass_flags = instr->pass_flags;
-            instr = std::move(new_instr);
-            ctx.info[instr->definitions[0].tempId()].label = 0;
-            ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
-            return;
+         const unsigned b2f_id = instr->operands[i].tempId();
+         if (!is_valid_temp_id(ctx, b2f_id) || !ctx.info[b2f_id].is_b2f() ||
+             ctx.uses[b2f_id] != 1)
+            continue;
+
+         if (!instr->operands[!i].isTemp() ||
+             instr->operands[!i].getTemp().type() != RegType::vgpr)
+            continue;
+
+         Temp bool_temp = ctx.info[b2f_id].temp;
+
+         const unsigned wave_bytes = ctx.program->wave_size == 64 ? 2u : 1u;
+         if (bool_temp.type() != RegType::sgpr || bool_temp.bytes() != wave_bytes) {
+            continue;
          }
+
+         Temp data_temp = instr->operands[!i].getTemp();
+         if (data_temp.type() != RegType::vgpr || data_temp.bytes() != 4) {
+            continue;
+         }
+
+         if (instr->definitions[0].bytes() != 4 ||
+             instr->definitions[0].regClass().type() != RegType::vgpr) {
+            continue;
+         }
+
+         ctx.uses[b2f_id]--;
+         ctx.uses[bool_temp.id()]++;
+
+         aco_ptr<Instruction> new_instr{
+            create_instruction(aco_opcode::v_cndmask_b32, Format::VOP2, 3, 1)};
+         new_instr->operands[0] = Operand::zero();
+         new_instr->operands[1] = Operand(data_temp);
+         new_instr->operands[2] = Operand(bool_temp);
+         new_instr->definitions[0] = instr->definitions[0];
+         new_instr->pass_flags = instr->pass_flags;
+
+         instr = std::move(new_instr);
+         ctx.info[instr->definitions[0].tempId()].label = 0;
+         ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
+         return;
       }
    }
    else if (instr->opcode == aco_opcode::v_pack_b32_f16) {
@@ -6437,33 +6463,6 @@ try_pack_operand_pair(const Operand& lo, const Operand& hi,
    return false;
 }
 
-static void
-clear_mad_info_referencing_instruction(opt_ctx& ctx, const Instruction* instr)
-{
-   if (!instr)
-      return;
-
-   /* Search through ALL mad_infos and clear any pointing to this instruction */
-   for (mad_info& mi : ctx.mad_infos) {
-      if (mi.add_instr.get() == instr) {
-         /* Decrement uses of ADD's operands */
-         for (const Operand& op : mi.add_instr->operands)
-            safe_decrease_uses(ctx, op);
-         mi.add_instr.reset();
-      }
-   }
-
-   /* Also clear mad label from any temp pointing to an affected mad_info */
-   for (unsigned i = 0; i < ctx.info.size(); i++) {
-      if (ctx.info[i].is_mad()) {
-         unsigned mad_idx = ctx.info[i].val;
-         if (mad_idx < ctx.mad_infos.size() && !ctx.mad_infos[mad_idx].add_instr) {
-            ctx.info[i].label &= ~label_mad;
-         }
-      }
-   }
-}
-
 static bool
 combine_adjacent_fp16_pair(opt_ctx& ctx, Block& block, unsigned idx,
                           aco_ptr<Instruction>& packed_out,
@@ -6486,43 +6485,60 @@ combine_adjacent_fp16_pair(opt_ctx& ctx, Block& block, unsigned idx,
    const unsigned def1_id = instr1->definitions[0].tempId();
 
    if (def0_id >= ctx.uses.size() || def1_id >= ctx.uses.size() ||
-       ctx.uses[def0_id] == 0 || ctx.uses[def1_id] == 0)
+       def0_id >= ctx.info.size() || def1_id >= ctx.info.size())
+      return false;
+
+   if (ctx.uses[def0_id] == 0 || ctx.uses[def1_id] == 0)
+      return false;
+
+   if (ctx.info[def0_id].parent_instr != instr0.get() ||
+       ctx.info[def1_id].parent_instr != instr1.get())
+      return false;
+
+   const Temp def0 = instr0->definitions[0].getTemp();
+   for (const Operand& op : instr1->operands) {
+      if (op.isTemp() && op.getTemp() == def0)
+         return false;
+   }
+
+   if ((is_valid_temp_id(ctx, def0_id) && ctx.info[def0_id].is_mad()) ||
+       (is_valid_temp_id(ctx, def1_id) && ctx.info[def1_id].is_mad()))
+      return false;
+
+   const uint64_t safe_labels = label_temp | label_constant | label_abs_fp16 |
+                                 label_neg_fp16 | label_canonicalized_fp16;
+   if ((ctx.info[def0_id].label & ~safe_labels) || (ctx.info[def1_id].label & ~safe_labels))
       return false;
 
    const aco_opcode packed_opcode = get_packed_opcode(instr0->opcode);
    if (packed_opcode == aco_opcode::num_opcodes)
       return false;
 
-   /* Clear mad_info if present to prevent dangling pointers */
-   auto clear_mad_info = [&](unsigned temp_id) {
-      if (is_valid_temp_id(ctx, temp_id) && ctx.info[temp_id].is_mad()) {
-         const unsigned mad_idx = ctx.info[temp_id].val;
-         if (mad_idx < ctx.mad_infos.size()) {
-            mad_info* mi = &ctx.mad_infos[mad_idx];
-            if (mi->add_instr) {
-               for (const Operand& op : mi->add_instr->operands)
-                  safe_decrease_uses(ctx, op);
-               mi->add_instr.reset();
-            }
-         }
-         ctx.info[temp_id].label &= ~label_mad;
-      }
-   };
-
-   clear_mad_info(def0_id);
-   clear_mad_info(def1_id);
-
    const unsigned num_operands = instr0->operands.size();
+   for (unsigned i = 0; i < num_operands; i++) {
+      Operand packed_op;
+      bool opsel_lo, opsel_hi;
+      if (!try_pack_operand_pair(instr0->operands[i], instr1->operands[i],
+                                 packed_op, opsel_lo, opsel_hi))
+         return false;
+
+      if (packed_op.isTemp()) {
+         Temp t = packed_op.getTemp();
+         if (t.type() != RegType::vgpr && t.type() != RegType::sgpr)
+            return false;
+      }
+   }
+
    aco_ptr<Instruction> packed{
       create_instruction(packed_opcode, Format::VOP3P, num_operands, 1)};
 
    for (unsigned i = 0; i < num_operands; i++) {
       Operand packed_op;
       bool opsel_lo, opsel_hi;
-
-      if (!try_pack_operand_pair(instr0->operands[i], instr1->operands[i],
-                                 packed_op, opsel_lo, opsel_hi))
-         return false;
+      bool success = try_pack_operand_pair(instr0->operands[i], instr1->operands[i],
+                                           packed_op, opsel_lo, opsel_hi);
+      assert(success);
+      (void)success;
 
       packed->operands[i] = packed_op;
       packed->valu().opsel_lo[i] = opsel_lo;
@@ -6542,9 +6558,9 @@ combine_adjacent_fp16_pair(opt_ctx& ctx, Block& block, unsigned idx,
    const RegClass packed_rc = RegClass::get(RegType::vgpr, 4);
    const Temp packed_tmp = ctx.program->allocateTmp(packed_rc);
    packed->definitions[0] = Definition(packed_tmp);
-
    packed->valu().clamp = instr0->valu().clamp;
    packed->valu().omod = instr0->valu().omod;
+   packed->pass_flags = instr0->pass_flags;
 
    const unsigned packed_id = packed_tmp.id();
    if (packed_id >= ctx.uses.size())
@@ -6555,32 +6571,25 @@ combine_adjacent_fp16_pair(opt_ctx& ctx, Block& block, unsigned idx,
    aco_ptr<Instruction> split{
       create_instruction(aco_opcode::p_split_vector, Format::PSEUDO, 1, 2)};
    split->operands[0] = Operand(packed_tmp);
-
    split->definitions[0] = instr0->definitions[0];
    split->definitions[1] = instr1->definitions[0];
 
-   /* Decrement uses for original operands */
-   for (const Operand& op : instr0->operands) {
-      if (op.isTemp()) ctx.uses[op.tempId()]--;
-   }
-   for (const Operand& op : instr1->operands) {
-      if (op.isTemp()) ctx.uses[op.tempId()]--;
-   }
+   for (const Operand& op : instr0->operands)
+      safe_decrease_uses(ctx, op);
+   for (const Operand& op : instr1->operands)
+      safe_decrease_uses(ctx, op);
+   for (const Operand& op : packed->operands)
+      safe_increase_uses(ctx, op);
 
-   /* Increment uses for packed operands */
-   for (const Operand& op : packed->operands) {
-      if (op.isTemp()) ctx.uses[op.tempId()]++;
-   }
+   ctx.uses[packed_id] = 1;
 
-   ctx.uses[packed_id]++;
-
-   /* Update parent_instr pointers */
-   ctx.info[def0_id].parent_instr = split.get();
-   ctx.info[def1_id].parent_instr = split.get();
    ctx.info[packed_id].parent_instr = packed.get();
+   ctx.info[packed_id].label = 0;
 
-   /* Clear labels from temps (they're now from split, not original ops) */
+   ctx.info[def0_id].parent_instr = split.get();
    ctx.info[def0_id].label = 0;
+
+   ctx.info[def1_id].parent_instr = split.get();
    ctx.info[def1_id].label = 0;
 
    packed_out = std::move(packed);
@@ -6598,7 +6607,32 @@ optimize_fp16_packing_in_block(opt_ctx& ctx, Block& block)
       aco_ptr<Instruction> packed;
       aco_ptr<Instruction> split;
 
+      if (!block.instructions[i] || !block.instructions[i + 1]) {
+         i++;
+         continue;
+      }
+
+      if (block.instructions[i]->pass_flags != block.instructions[i + 1]->pass_flags) {
+         i++;
+         continue;
+      }
+
       if (combine_adjacent_fp16_pair(ctx, block, i, packed, split)) {
+         if (!packed || !split) {
+            i++;
+            continue;
+         }
+
+         const unsigned expected_id0 = block.instructions[i]->definitions[0].tempId();
+         const unsigned expected_id1 = block.instructions[i + 1]->definitions[0].tempId();
+
+         if (split->definitions.size() != 2 ||
+             split->definitions[0].tempId() != expected_id0 ||
+             split->definitions[1].tempId() != expected_id1) {
+            i++;
+            continue;
+         }
+
          block.instructions[i] = std::move(packed);
          block.instructions[i + 1] = std::move(split);
          progress = true;
@@ -6614,9 +6648,12 @@ optimize_fp16_packing_in_block(opt_ctx& ctx, Block& block)
 static void
 optimize_packed_fp16_math(opt_ctx& ctx)
 {
+   if (ctx.program->gfx_level < GFX9)
+      return;
+
+   const unsigned max_iterations = 2;
    bool global_progress;
    unsigned iteration = 0;
-   const unsigned max_iterations = 2;
 
    do {
       global_progress = false;
@@ -6627,6 +6664,10 @@ optimize_packed_fp16_math(opt_ctx& ctx)
       }
       iteration++;
    } while (global_progress && iteration < max_iterations);
+
+   if (iteration > 0) {
+      ctx.uses = dead_code_analysis(ctx.program);
+   }
 }
 
 bool
@@ -6723,51 +6764,85 @@ select_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
             split_offset = offset;
          }
       }
+
       bool done = false;
-      Instruction* vec = ctx.info[instr->operands[0].tempId()].parent_instr;
-      if (num_used == 1 && vec->opcode == aco_opcode::p_create_vector &&
-          ctx.uses[instr->operands[0].tempId()] == 1) {
 
-         unsigned off = 0;
-         Operand op;
-         for (Operand& vec_op : vec->operands) {
-            if (off == split_offset) {
-               op = vec_op;
-               break;
-            }
-            off += vec_op.bytes();
-         }
-         if (off != instr->operands[0].bytes() && op.bytes() == instr->definitions[idx].bytes()) {
-            ctx.uses[instr->operands[0].tempId()]--;
+      /* Only optimize if exactly one output is used */
+      if (num_used == 1) {
+         Instruction* vec = ctx.info[instr->operands[0].tempId()].parent_instr;
+
+         if (vec->opcode == aco_opcode::p_create_vector &&
+             ctx.uses[instr->operands[0].tempId()] == 1) {
+
+            unsigned off = 0;
+            Operand op;
             for (Operand& vec_op : vec->operands) {
-               if (vec_op.isTemp())
-                  ctx.uses[vec_op.tempId()]--;
+               if (off == split_offset) {
+                  op = vec_op;
+                  break;
+               }
+               off += vec_op.bytes();
             }
-            if (op.isTemp())
-               ctx.uses[op.tempId()]++;
 
-            aco_ptr<Instruction> copy{
-               create_instruction(aco_opcode::p_parallelcopy, Format::PSEUDO, 1, 1)};
-            copy->operands[0] = op;
-            copy->definitions[0] = instr->definitions[idx];
-            instr = std::move(copy);
-            ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
+            /* Validate sizes match exactly */
+            if (off == instr->operands[0].bytes() && op.isTemp() &&
+                op.bytes() == instr->definitions[idx].bytes()) {
 
-            done = true;
+               /* Update use counts before transformation */
+               ctx.uses[instr->operands[0].tempId()]--;
+               for (Operand& vec_op : vec->operands) {
+                  if (vec_op.isTemp())
+                     ctx.uses[vec_op.tempId()]--;
+               }
+               if (op.isTemp())
+                  ctx.uses[op.tempId()]++;
+
+               /* Mark all unused definitions as dead to prevent validation errors */
+               for (unsigned i = 0; i < instr->definitions.size(); i++) {
+                  if (i != idx) {
+                     const unsigned unused_id = instr->definitions[i].tempId();
+                     if (is_valid_temp_id(ctx, unused_id)) {
+                        ctx.uses[unused_id] = 0;
+                        ctx.info[unused_id].label = 0;
+                     }
+                  }
+               }
+
+               aco_ptr<Instruction> copy{
+                  create_instruction(aco_opcode::p_parallelcopy, Format::PSEUDO, 1, 1)};
+               copy->operands[0] = op;
+               copy->definitions[0] = instr->definitions[idx];
+               instr = std::move(copy);
+               ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
+
+               done = true;
+            }
          }
-      }
 
-      if (!done && num_used == 1 &&
-          instr->operands[0].bytes() % instr->definitions[idx].bytes() == 0 &&
-          split_offset % instr->definitions[idx].bytes() == 0) {
-         aco_ptr<Instruction> extract{
-            create_instruction(aco_opcode::p_extract_vector, Format::PSEUDO, 2, 1)};
-         extract->operands[0] = instr->operands[0];
-         extract->operands[1] =
-            Operand::c32((uint32_t)split_offset / instr->definitions[idx].bytes());
-         extract->definitions[0] = instr->definitions[idx];
-         instr = std::move(extract);
-         ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
+         if (!done &&
+             instr->operands[0].bytes() % instr->definitions[idx].bytes() == 0 &&
+             split_offset % instr->definitions[idx].bytes() == 0) {
+
+            /* Mark all unused definitions as dead */
+            for (unsigned i = 0; i < instr->definitions.size(); i++) {
+               if (i != idx) {
+                  const unsigned unused_id = instr->definitions[i].tempId();
+                  if (is_valid_temp_id(ctx, unused_id)) {
+                     ctx.uses[unused_id] = 0;
+                     ctx.info[unused_id].label = 0;
+                  }
+               }
+            }
+
+            aco_ptr<Instruction> extract{
+               create_instruction(aco_opcode::p_extract_vector, Format::PSEUDO, 2, 1)};
+            extract->operands[0] = instr->operands[0];
+            extract->operands[1] =
+               Operand::c32((uint32_t)split_offset / instr->definitions[idx].bytes());
+            extract->definitions[0] = instr->definitions[idx];
+            instr = std::move(extract);
+            ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
+         }
       }
    }
 
@@ -6775,30 +6850,17 @@ select_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       mad_info* info = &ctx.mad_infos[ctx.info[instr->definitions[0].tempId()].val];
       /* revert mad instruction if it was not profitable */
       if (info->add_instr && ctx.uses[info->mul_temp_id]) {
-         /* The original logic was fundamentally broken.
-          * It used a swap which left a ghost instruction with a duplicate definition,
-          * and it failed to correctly update use-counts, leading to incorrect DCE.
-          * The correct logic is to explicitly manage use-counts and replace the instruction.
-          */
-
-         /* 1. Correctly update SSA use-counts for the reversal. */
-         // The MAD is being destroyed, so decrement the uses of its operands.
+         /* Correctly update SSA use-counts for the reversal */
          for (const Operand& op : instr->operands)
             safe_decrease_uses(ctx, op);
 
-         // The original ADD is being restored, so increment the uses of its operands.
          for (const Operand& op : info->add_instr->operands)
             safe_increase_uses(ctx, op);
 
-         /* 2. Replace the MAD instruction with the original ADD instruction.
-          * This move assignment destroys the MAD object previously held by 'instr'.
-          */
          instr = std::move(info->add_instr);
 
-         /* 3. Update the parent_instr pointer in the ssa_info table to reflect the change. */
          ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
 
-         /* 4. The mad_info is now fully processed, clear the pointer to avoid re-processing. */
          info->add_instr.reset();
       }
    }
@@ -7305,8 +7367,8 @@ validate_opt_ctx(opt_ctx& ctx)
       return;
 
    Program* program = ctx.program;
-
    bool is_valid = true;
+
    auto check = [&program, &is_valid](bool success, const char* msg,
                                       aco::Instruction* instr) -> void
    {
@@ -7317,7 +7379,7 @@ validate_opt_ctx(opt_ctx& ctx)
          u_memstream_open(&mem, &out, &outsize);
          FILE* const memf = u_memstream_get(&mem);
 
-         fprintf(memf, "Optimizer: %s: ", msg);
+         fprintf(memf, "Optimizer validation failed: %s: ", msg);
          aco_print_instr(program->gfx_level, instr, memf);
          u_memstream_close(&mem);
 
@@ -7332,12 +7394,37 @@ validate_opt_ctx(opt_ctx& ctx)
       for (aco_ptr<Instruction>& instr : block.instructions) {
          if (!instr)
             continue;
+
+         for (unsigned i = 0; i < instr->operands.size(); i++) {
+            const Operand& op = instr->operands[i];
+            if (!op.isTemp())
+               continue;
+
+            const unsigned op_id = op.tempId();
+
+            check(op_id < ctx.info.size(), "operand temp ID out of range", instr.get());
+            check(op_id < ctx.uses.size(), "operand temp ID out of uses range", instr.get());
+
+            if (op_id < ctx.info.size()) {
+               check(ctx.info[op_id].parent_instr != nullptr,
+                     "operand references undefined temp", instr.get());
+            }
+         }
+
          for (const Definition& def : instr->definitions) {
-            check(ctx.info[def.tempId()].parent_instr == instr.get(), "parent_instr incorrect",
-                  instr.get());
+            const unsigned def_id = def.tempId();
+
+            check(def_id < ctx.info.size(), "definition temp ID out of range", instr.get());
+            check(def_id < ctx.uses.size(), "definition temp ID out of uses range", instr.get());
+
+            if (def_id < ctx.info.size()) {
+               check(ctx.info[def_id].parent_instr == instr.get(),
+                     "parent_instr incorrect", instr.get());
+            }
          }
       }
    }
+
    if (!is_valid) {
       abort();
    }
