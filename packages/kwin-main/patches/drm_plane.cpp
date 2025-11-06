@@ -25,6 +25,11 @@
 #include <limits>
 #include <span>
 
+#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
+#include <emmintrin.h>
+#define KWIN_HAVE_SSE2 1
+#endif
+
 namespace KWin
 {
 
@@ -111,7 +116,7 @@ bool DrmPlane::updateProperties()
     m_possibleCrtcs = p->possible_crtcs;
 
     m_supportedFormats.clear();
-    m_supportedFormats.reserve(128);
+    m_supportedFormats.reserve(256);
 
     if (inFormats.isValid() && inFormats.immutableBlob() && gpu()->addFB2ModifiersSupported()) [[likely]] {
         drmModePropertyBlobPtr blob = inFormats.immutableBlob();
@@ -140,15 +145,12 @@ bool DrmPlane::updateProperties()
         m_supportedFormats.insert(DRM_FORMAT_XRGB8888, {modifier});
     }
 
-    // Upstream change: Implement low bandwidth format selection with FormatInfo
     m_lowBandwidthFormats.clear();
     m_lowBandwidthFormats.reserve(m_supportedFormats.size());
     for (auto it = m_supportedFormats.constBegin(); it != m_supportedFormats.constEnd(); ++it) {
         const auto info = FormatInfo::get(it.key());
         if (info && info->bitsPerPixel <= 32) {
             if (it.value().contains(DRM_FORMAT_MOD_INVALID)) {
-                // Mesa usually picks the modifier with lowest bandwidth requirements,
-                // so prefer implicit modifiers for low bandwidth if supported
                 m_lowBandwidthFormats.insert(it.key(), {DRM_FORMAT_MOD_INVALID});
             } else {
                 m_lowBandwidthFormats.insert(it.key(), it.value());
@@ -162,6 +164,7 @@ bool DrmPlane::updateProperties()
         constexpr size_t hintSize = sizeof(uint16_t) * 2;
 
         if (blob && blob->data && blob->length >= hintSize && (blob->length % hintSize) == 0) [[likely]] {
+            __builtin_prefetch(blob->data, 0, 1);
             const size_t hintCount = blob->length / hintSize;
             if (hintCount <= static_cast<size_t>(std::numeric_limits<int>::max())) {
                 m_sizeHints.reserve(static_cast<int>(hintCount));
@@ -182,7 +185,7 @@ bool DrmPlane::updateProperties()
     if (inFormatsForTearing.isValid() && inFormatsForTearing.immutableBlob() && gpu()->addFB2ModifiersSupported()) {
         drmModePropertyBlobPtr blob = inFormatsForTearing.immutableBlob();
         m_supportedTearingFormats.clear();
-        m_supportedTearingFormats.reserve(128);
+        m_supportedTearingFormats.reserve(256);
         if (blob && blob->data && blob->length > 0) [[likely]] {
             __builtin_prefetch(blob->data, 0, 3);
             drmModeFormatModifierIterator iterator{};
@@ -213,7 +216,6 @@ void DrmPlane::set(DrmAtomicCommit *commit, const QRect &src, const QRect &dst)
     const int clampedSrcH = std::clamp(src.height(), 0, maxCoord);
 
     const auto toFixed16 = [](int val) -> uint64_t {
-        // UB FIX: Safe cast to preserve two's complement for negative numbers.
         return static_cast<uint64_t>(static_cast<uint32_t>(val)) << 16;
     };
 
@@ -267,13 +269,30 @@ void DrmPlane::setCurrentBuffer(const std::shared_ptr<DrmFramebuffer> &b)
 
     const auto newData = b->data();
 
-    // PERFORMANCE: This branchless version is faster than a loop for a fixed small size.
+#if defined(KWIN_HAVE_SSE2)
+    alignas(16) intptr_t rawOld[4];
+    rawOld[0] = reinterpret_cast<intptr_t>(m_lastBuffers[0].get());
+    rawOld[1] = reinterpret_cast<intptr_t>(m_lastBuffers[1].get());
+    rawOld[2] = reinterpret_cast<intptr_t>(m_lastBuffers[2].get());
+    rawOld[3] = reinterpret_cast<intptr_t>(m_lastBuffers[3].get());
+
+    const intptr_t rawNew = reinterpret_cast<intptr_t>(newData.get());
+    const __m128i search = _mm_set1_epi64x(rawNew);
+    const __m128i buf01 = _mm_load_si128(reinterpret_cast<const __m128i *>(&rawOld[0]));
+    const __m128i buf23 = _mm_load_si128(reinterpret_cast<const __m128i *>(&rawOld[2]));
+    const __m128i cmp01 = _mm_cmpeq_epi64(search, buf01);
+    const __m128i cmp23 = _mm_cmpeq_epi64(search, buf23);
+    const __m128i cmpOr = _mm_or_si128(cmp01, cmp23);
+    const int mask = _mm_movemask_epi8(cmpOr);
+    const bool found = (mask != 0);
+#else
     const bool found = (m_lastBuffers[0] == newData) | (m_lastBuffers[1] == newData)
         | (m_lastBuffers[2] == newData) | (m_lastBuffers[3] == newData);
+#endif
 
     if (!found) {
         m_lastBuffers[m_lastBufferWriteIndex] = newData;
-        m_lastBufferWriteIndex = (m_lastBufferWriteIndex + 1) & 3; // Bitwise AND for fast modulo 4
+        m_lastBufferWriteIndex = (m_lastBufferWriteIndex + 1) & 3;
     }
 }
 
@@ -323,6 +342,6 @@ const QList<QSize> &DrmPlane::recommendedSizes() const
     return m_sizeHints;
 }
 
-} // namespace KWin
+}
 
 #include "moc_drm_plane.cpp"

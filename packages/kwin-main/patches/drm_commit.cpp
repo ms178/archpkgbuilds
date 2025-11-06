@@ -69,10 +69,6 @@ void DrmAtomicCommit::addProperty(const DrmProperty &prop, uint64_t value)
     }
 
 #ifndef NDEBUG
-    // In debug builds, validate that the value is within the property's legal range.
-    // This catches driver bugs or compositor logic errors early during development.
-    // In release builds, we trust the values and defer validation to the kernel's
-    // atomic-commit test phase, avoiding per-property overhead in the hot path.
     prop.checkValueInRange(value);
 #endif
 
@@ -93,16 +89,8 @@ void DrmAtomicCommit::addBuffer(DrmPlane *plane, const std::shared_ptr<DrmFrameb
 
     if (plane->inFenceFd.isValid() && buffer) [[likely]] {
         if (plane->gpu()->isNVidia()) [[unlikely]] {
-            // NVIDIA's proprietary driver (as of 550.x series) has known issues with
-            // IN_FENCE_FD on some GPU generations, causing atomic commits to fail with -EINVAL.
-            // Omitting the fence property prevents hard failures but may cause tearing or
-            // stutter in GPU-intensive workloads (e.g., Wine/Proton games with DXVK).
-            // AMD and Intel drivers handle IN_FENCE_FD correctly per DRM specification.
         } else {
             const int fenceFd = buffer->syncFd().get();
-            // The kernel interprets fenceFd = -1 as "no fence" (immediate signaling).
-            // Only add the property for valid, non-negative file descriptors to avoid
-            // unnecessary ioctl overhead. Zero is a valid fd (stdin), though unlikely here.
             if (fenceFd >= 0) [[likely]] {
                 addProperty(plane->inFenceFd, static_cast<uint64_t>(fenceFd));
             }
@@ -162,35 +150,24 @@ bool DrmAtomicCommit::commitModeset()
 
 bool DrmAtomicCommit::doCommit(uint32_t flags)
 {
-    // PERFORMANCE OPTIMIZATION: Use stack-allocated arrays for the common case to avoid
-    // heap allocator contention and TLB misses. Typical desktop scenarios involve 1–4 objects
-    // (planes, CRTCs, connectors) with 10–80 total properties, well within inline capacity.
-    //
-    // Headroom analysis (based on Vega 64 + typical KDE Plasma workload):
-    //   - Objects: 1 CRTC + 1 connector + 1–3 planes = 3–5 objects → 8 inline capacity OK
-    //   - Properties: ~15 plane props + ~10 CRTC props + ~5 connector props = ~30 total → 128 inline OK
-    //   - Pathological case (6 displays, all active): ~200 properties → falls back to heap gracefully
-    //
-    // QVarLengthArray automatically heap-allocates if exceeded, so this is safe for all cases.
-    // Stack usage: (8*4 + 8*4 + 128*4 + 128*8) bytes = 1,584 bytes (well within 2 MB default stack).
-
-    constexpr size_t inlineObjectCapacity = 8;
-    constexpr size_t inlinePropertyCapacity = 128;
+    constexpr size_t inlineObjectCapacity = 16;
+    constexpr size_t inlinePropertyCapacity = 256;
 
     QVarLengthArray<uint32_t, inlineObjectCapacity> objects;
     QVarLengthArray<uint32_t, inlineObjectCapacity> propertyCounts;
     QVarLengthArray<uint32_t, inlinePropertyCapacity> propertyIds;
     QVarLengthArray<uint64_t, inlinePropertyCapacity> values;
 
-    // Pre-reserve to the known size to avoid reallocation during population.
-    // Safe cast: m_properties.size() is bounded by hardware (max ~50 objects on any real system).
     const auto objectCount = std::min(m_properties.size(), static_cast<size_t>(INT_MAX));
     objects.reserve(static_cast<int>(objectCount));
     propertyCounts.reserve(static_cast<int>(objectCount));
 
-    // Single-pass population: eliminates the second iteration over m_properties that the
-    // original code required for pre-counting total properties. This improves I-cache locality
-    // (Raptor Lake: 32 KB L1-I per core) and reduces iterator setup overhead.
+#if defined(__x86_64__) || defined(_M_X64)
+    if (!m_properties.empty()) {
+        __builtin_prefetch(&(*m_properties.begin()), 0, 3);
+    }
+#endif
+
     for (const auto &[object, properties] : m_properties) {
         objects.push_back(object);
         propertyCounts.push_back(static_cast<uint32_t>(properties.size()));
@@ -215,8 +192,6 @@ bool DrmAtomicCommit::doCommit(uint32_t flags)
         return true;
     }
 
-    // IMPROVED DIAGNOSTICS: Include commit size in error message to aid debugging of
-    // "too many properties" or resource exhaustion issues in production.
     qCWarning(KWIN_DRM) << "Atomic commit failed: errno =" << errno << "(" << strerror(errno) << ");"
                         << "objects =" << objects.size() << ", properties =" << propertyIds.size();
     return false;
@@ -234,36 +209,28 @@ void DrmAtomicCommit::pageFlipped(std::chrono::nanoseconds timestamp)
         return;
     }
 
-    // PERFORMANCE OPTIMIZATION: Avoid heap allocation from std::set by using a stack-allocated
-    // array for the typical case of 1–4 unique output frames (primary plane + cursor + overlays).
-    //
-    // The original code used std::set<OutputFrame*> which:
-    //   1. Allocates a red-black tree node per insertion (heap overhead)
-    //   2. Has O(log n) insertion (unnecessary for n ≤ 8)
-    //   3. Performs in-order iteration automatically, but we need uniqueness, not sorting
-    //
-    // Our approach:
-    //   1. Collect all frames into a contiguous array (better cache locality)
-    //   2. Sort once (O(n log n) but with excellent data locality)
-    //   3. std::unique removes duplicates in O(n)
-    //   4. For n ≤ 8, this is faster than set operations due to zero heap allocation and
-    //      sequential memory access (Raptor Lake: 64-byte cache lines, 64-entry L1 dTLB)
+    const size_t frameCount = m_frames.size();
 
-    QVarLengthArray<OutputFrame *, 8> frames;
-    frames.reserve(static_cast<int>(std::min(m_frames.size(), static_cast<size_t>(8))));
-    for (const auto &[plane, frame] : m_frames) {
-        if (frame) {
-            frames.append(frame.get());
+    if (frameCount == 1) [[likely]] {
+        const auto &frame = m_frames.begin()->second;
+        if (frame) [[likely]] {
+            frame->presented(timestamp, m_mode);
         }
-    }
+    } else if (frameCount > 1) {
+        QVarLengthArray<OutputFrame *, 8> frames;
+        frames.reserve(static_cast<int>(std::min(frameCount, static_cast<size_t>(8))));
+        for (const auto &[plane, frame] : m_frames) {
+            if (frame) {
+                frames.append(frame.get());
+            }
+        }
 
-    if (!frames.isEmpty()) {
-        std::sort(frames.begin(), frames.end());
-        const auto last = std::unique(frames.begin(), frames.end());
-        // Iterate only up to 'last' (one past the last unique element).
-        // The range [last, frames.end()) contains moved-from/duplicate pointers; we ignore them.
-        for (auto it = frames.begin(); it != last; ++it) {
-            (*it)->presented(timestamp, m_mode);
+        if (!frames.isEmpty()) {
+            std::sort(frames.begin(), frames.end());
+            const auto last = std::unique(frames.begin(), frames.end());
+            for (auto it = frames.begin(); it != last; ++it) {
+                (*it)->presented(timestamp, m_mode);
+            }
         }
     }
 
@@ -303,18 +270,9 @@ const std::unordered_set<DrmPlane *> &DrmAtomicCommit::modifiedPlanes() const
 
 void DrmAtomicCommit::merge(DrmAtomicCommit *onTop)
 {
-    // PERFORMANCE OPTIMIZATION: Use try_emplace to avoid double map lookup.
-    //
-    // The original code: m_properties[obj][prop] = value
-    //   1. First lookup: m_properties[obj] (inserts empty map if obj not found)
-    //   2. Second lookup: result[prop] (inserts or assigns value)
-    //
-    // Optimized approach:
-    //   1. try_emplace(obj): returns iterator + bool, inserts only if missing (single lookup)
-    //   2. insert_or_assign(prop, value): single operation for inner map
-    //
-    // On Raptor Lake, this saves ~10–20 cycles per object (one hash computation + bucket walk).
-    // For typical merges (2–4 objects), this is a 40–80 cycle saving (~1.5% of merge() time).
+    if (!onTop) [[unlikely]] {
+        return;
+    }
 
     for (const auto &[obj, properties] : onTop->m_properties) {
         auto [it, inserted] = m_properties.try_emplace(obj);
@@ -421,6 +379,6 @@ void DrmLegacyCommit::pageFlipped(std::chrono::nanoseconds timestamp)
     m_pipeline->pageFlipped(timestamp);
 }
 
-} // namespace KWin
+}
 
 #include "moc_drm_commit.cpp"

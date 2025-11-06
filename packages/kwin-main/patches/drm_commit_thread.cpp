@@ -14,6 +14,7 @@
 #include "utils/realtime.h"
 
 #include <algorithm>
+#include <cmath>
 #include <ranges>
 #include <span>
 #include <thread>
@@ -204,9 +205,11 @@ void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
         return;
     }
 
+#if defined(__x86_64__) || defined(_M_X64)
     if (!m_commits.empty()) {
         __builtin_prefetch(&m_commits[0], 0, 3);
     }
+#endif
 
     if (m_commits.front()->areBuffersReadable()) [[likely]] {
         const auto firstNotReady = std::find_if(m_commits.begin() + 1, m_commits.end(), [pageflipTarget](const auto &commit) {
@@ -227,6 +230,13 @@ void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
     for (auto it = m_commits.begin(); it != m_commits.end();) {
         const auto startIt = it;
         auto &startCommit = *startIt;
+
+#if defined(__x86_64__) || defined(_M_X64)
+        if (startCommit) {
+            __builtin_prefetch(startCommit.get(), 0, 3);
+        }
+#endif
+
         const auto firstNotSamePlaneNotReady = std::find_if(startIt + 1, m_commits.end(), [&startCommit, pageflipTarget](const auto &commit) {
             return startCommit->modifiedPlanes() != commit->modifiedPlanes() || !commit->isReadyFor(pageflipTarget);
         });
@@ -440,25 +450,18 @@ bool DrmCommitThread::pageflipsPending()
 
 TimePoint DrmCommitThread::estimateNextVblank(TimePoint now) const
 {
-    const int64_t minVblankNs = m_minVblankInterval.count();
-    if (minVblankNs <= 0) [[unlikely]] {
+    if (m_minVblankInterval <= std::chrono::nanoseconds::zero()) [[unlikely]] {
         return now + std::chrono::milliseconds(16);
     }
 
     const auto elapsed = now >= m_lastPageflip ? now - m_lastPageflip : std::chrono::nanoseconds::zero();
-    const int64_t elapsedNs = elapsed.count();
 
-    if (elapsedNs < 0) [[unlikely]] {
-        return m_lastPageflip + m_minVblankInterval;
-    }
-
-    const uint64_t elapsedU = static_cast<uint64_t>(elapsedNs);
-    const uint64_t minVblankU = static_cast<uint64_t>(minVblankNs);
-
-    const uint64_t pageflipsSince = elapsedU / minVblankU;
+    const double elapsedSeconds = static_cast<double>(elapsed.count()) * 1e-9;
+    const double pageflipsFloat = elapsedSeconds * m_vblankIntervalInv;
+    const uint64_t pageflipsSince = pageflipsFloat >= 0.0 ? static_cast<uint64_t>(pageflipsFloat) : 0;
 
     constexpr uint64_t maxReasonablePageflips = 10000;
-    const uint64_t clampedPageflips = (pageflipsSince < maxReasonablePageflips) ? pageflipsSince : maxReasonablePageflips;
+    const uint64_t clampedPageflips = std::min(pageflipsSince, maxReasonablePageflips);
 
     return m_lastPageflip + m_minVblankInterval * (clampedPageflips + 1);
 }

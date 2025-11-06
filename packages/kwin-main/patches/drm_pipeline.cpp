@@ -32,28 +32,37 @@
 #include <drm_fourcc.h>
 #include <gbm.h>
 
-#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
-#include <emmintrin.h>
-#define KWIN_HAVE_SSE2 1
-#endif
-
 using namespace std::literals;
 
 namespace KWin
 {
 
-// A comprehensive, but still constexpr, YUV format checker.
-static constexpr bool isYuvFormat(uint32_t format)
+static constexpr bool isYuvFormat(uint32_t format) noexcept
 {
     switch (format) {
-    case DRM_FORMAT_YUV410: case DRM_FORMAT_YVU410: case DRM_FORMAT_YUV411:
-    case DRM_FORMAT_YVU411: case DRM_FORMAT_YUV420: case DRM_FORMAT_YVU420:
-    case DRM_FORMAT_YUV422: case DRM_FORMAT_YVU422: case DRM_FORMAT_YUV444:
-    case DRM_FORMAT_YVU444: case DRM_FORMAT_NV12:   case DRM_FORMAT_NV21:
-    case DRM_FORMAT_NV16:   case DRM_FORMAT_NV61:   case DRM_FORMAT_NV24:
-    case DRM_FORMAT_NV42:   case DRM_FORMAT_YUYV:   case DRM_FORMAT_YVYU:
-    case DRM_FORMAT_UYVY:   case DRM_FORMAT_VYUY:   case DRM_FORMAT_P010:
-    case DRM_FORMAT_P012:   case DRM_FORMAT_P016:
+    case DRM_FORMAT_YUV410:
+    case DRM_FORMAT_YVU410:
+    case DRM_FORMAT_YUV411:
+    case DRM_FORMAT_YVU411:
+    case DRM_FORMAT_YUV420:
+    case DRM_FORMAT_YVU420:
+    case DRM_FORMAT_YUV422:
+    case DRM_FORMAT_YVU422:
+    case DRM_FORMAT_YUV444:
+    case DRM_FORMAT_YVU444:
+    case DRM_FORMAT_NV12:
+    case DRM_FORMAT_NV21:
+    case DRM_FORMAT_NV16:
+    case DRM_FORMAT_NV61:
+    case DRM_FORMAT_NV24:
+    case DRM_FORMAT_NV42:
+    case DRM_FORMAT_YUYV:
+    case DRM_FORMAT_YVYU:
+    case DRM_FORMAT_UYVY:
+    case DRM_FORMAT_VYUY:
+    case DRM_FORMAT_P010:
+    case DRM_FORMAT_P012:
+    case DRM_FORMAT_P016:
         return true;
     default:
         return false;
@@ -102,7 +111,9 @@ DrmPipeline::Error DrmPipeline::present(const QList<OutputLayer *> &layersToUpda
         }
 
         if (layersToUpdate.isEmpty()) [[unlikely]] {
-            if (m_pending.layers.isEmpty()) return Error::InvalidArguments;
+            if (m_pending.layers.isEmpty()) {
+                return Error::InvalidArguments;
+            }
             if (Error err = prepareAtomicPlane(partialUpdate.get(), m_pending.layers.front()->plane(), m_pending.layers.front(), frame); err != Error::None) {
                 return err;
             }
@@ -278,20 +289,25 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPlane(DrmAtomicCommit *commit, DrmP
     const QRect srcRect = layer->sourceRect().toRect();
     const QRect dstRect = layer->targetRect();
 
-    // The single authoritative call to the perfected DrmPlane::set, now with geometry only.
     plane->set(commit, srcRect, dstRect);
     commit->addBuffer(plane, fb, frame);
 
-    // All other properties are now set here, where the full context is available.
     const auto transform = layer->offloadTransform();
-    if (plane->supportsTransformation(transform)) {
-        commit->addEnum(plane->rotation, DrmPlane::outputTransformToPlaneTransform(transform));
+    if (plane->rotation.isValid()) [[likely]] {
+        if (plane->supportsTransformation(transform)) [[likely]] {
+            commit->addEnum(plane->rotation, DrmPlane::outputTransformToPlaneTransform(transform));
+        } else if (transform.kind() != OutputTransform::Kind::Normal) [[unlikely]] {
+            return Error::InvalidArguments;
+        }
     } else if (transform.kind() != OutputTransform::Kind::Normal) [[unlikely]] {
         return Error::InvalidArguments;
     }
+
     commit->addProperty(plane->crtcId, m_pending.crtc->id());
 
-    if (plane->type.enumValue() == DrmPlane::TypeIndex::Cursor) [[unlikely]] {
+    const bool isCursor = (plane->type.enumValue() == DrmPlane::TypeIndex::Cursor);
+
+    if (isCursor) [[unlikely]] {
         if (plane->vmHotspotX.isValid() && plane->vmHotspotY.isValid()) {
             commit->addProperty(plane->vmHotspotX, std::round(layer->hotspot().x()));
             commit->addProperty(plane->vmHotspotY, std::round(layer->hotspot().y()));
@@ -307,24 +323,39 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPlane(DrmAtomicCommit *commit, DrmP
             commit->addProperty(plane->zpos, layer->zpos());
         }
 
-        // VIDEO PLAYBACK FIX: Encapsulated logic for color properties.
-        if (isYuvFormat(fb->buffer()->dmabufAttributes()->format)) {
-            const auto &colorDesc = layer->colorDescription();
-            std::optional<DrmPlane::ColorEncoding> encoding;
-            switch (colorDesc->yuvCoefficients()) {
-            case YUVMatrixCoefficients::BT601:  encoding = DrmPlane::ColorEncoding::BT601_YCbCr; break;
-            case YUVMatrixCoefficients::BT709:  encoding = DrmPlane::ColorEncoding::BT709_YCbCr; break;
-            case YUVMatrixCoefficients::BT2020: encoding = DrmPlane::ColorEncoding::BT2020_YCbCr; break;
-            default: break;
-            }
+        const auto buffer = fb->buffer();
+        if (buffer) [[likely]] {
+            const auto attrs = buffer->dmabufAttributes();
 
-            if (encoding && plane->colorEncoding.isValid() && plane->colorEncoding.hasEnum(*encoding)) {
-                commit->addEnum(plane->colorEncoding, *encoding);
-            }
+            if (attrs && isYuvFormat(attrs->format)) [[unlikely]] {
+                const auto &colorDesc = layer->colorDescription();
+                if (colorDesc) [[likely]] {
+                    std::optional<DrmPlane::ColorEncoding> encoding;
+                    switch (colorDesc->yuvCoefficients()) {
+                    case YUVMatrixCoefficients::BT601:
+                        encoding = DrmPlane::ColorEncoding::BT601_YCbCr;
+                        break;
+                    case YUVMatrixCoefficients::BT709:
+                        encoding = DrmPlane::ColorEncoding::BT709_YCbCr;
+                        break;
+                    case YUVMatrixCoefficients::BT2020:
+                        encoding = DrmPlane::ColorEncoding::BT2020_YCbCr;
+                        break;
+                    default:
+                        break;
+                    }
 
-            const auto range = (colorDesc->range() == EncodingRange::Full) ? DrmPlane::ColorRange::Full_YCbCr : DrmPlane::ColorRange::Limited_YCbCr;
-            if (plane->colorRange.isValid() && plane->colorRange.hasEnum(range)) {
-                commit->addEnum(plane->colorRange, range);
+                    if (encoding && plane->colorEncoding.isValid() && plane->colorEncoding.hasEnum(*encoding)) {
+                        commit->addEnum(plane->colorEncoding, *encoding);
+                    }
+
+                    const auto range = (colorDesc->range() == EncodingRange::Full)
+                        ? DrmPlane::ColorRange::Full_YCbCr
+                        : DrmPlane::ColorRange::Limited_YCbCr;
+                    if (plane->colorRange.isValid() && plane->colorRange.hasEnum(range)) {
+                        commit->addEnum(plane->colorRange, range);
+                    }
+                }
             }
         }
     }
