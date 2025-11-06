@@ -51,33 +51,29 @@ static QStringList splitPathList(const QString &input, const QChar delimiter)
         return {};
     }
 
-    QStringList ret;
-    ret.reserve(8); // Pre-allocate for a typical number of paths.
+    QStringList result;
+    result.reserve(8);
 
-    QString tmp;
-    const qsizetype divisor = std::max(qsizetype(1), input.count(delimiter) + 1);
-    tmp.reserve(input.size() / divisor);
+    QString current;
+    current.reserve(input.size() / 2);
 
-    const int len = input.size();
-    for (int i = 0; i < len; ++i) {
-        const QChar ch = input[i];
+    for (const QChar ch : input) {
         if (ch == delimiter) {
-            if (i > 0 && input[i - 1] == u'\\') {
-                // Handle escaped delimiter.
-                tmp[tmp.size() - 1] = delimiter;
-            } else if (!tmp.isEmpty()) {
-                ret.append(std::move(tmp)); // Move avoids deep copy.
-                tmp = QString(); // Reset the temporary string.
-                tmp.reserve(input.size() / divisor);
+            if (!current.isEmpty()) {
+                result.append(std::move(current));
+                current = QString();
+                current.reserve(input.size() / 2);
             }
         } else {
-            tmp.append(ch);
+            current.append(ch);
         }
     }
-    if (!tmp.isEmpty()) {
-        ret.append(std::move(tmp));
+
+    if (!current.isEmpty()) {
+        result.append(std::move(current));
     }
-    return ret;
+
+    return result;
 }
 
 DrmBackend::DrmBackend(Session *session, QObject *parent)
@@ -144,7 +140,6 @@ bool DrmBackend::initialize()
     }
     updateOutputs();
 
-    // Sort GPUs to select the best one as primary (e.g., the one with internal panels).
     if (m_explicitGpus.empty() && m_gpus.size() > 1) {
         std::ranges::sort(m_gpus, [](const auto &a, const auto &b) {
             const auto &outputsA = a->drmOutputs();
