@@ -121,14 +121,16 @@ void DrmAtomicCommit::setPresentationMode(PresentationMode mode)
 
 bool DrmAtomicCommit::test()
 {
-    const uint32_t flags = DRM_MODE_ATOMIC_TEST_ONLY;
+    uint32_t flags = DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_NONBLOCK;
+    if (isTearing()) {
+        flags |= DRM_MODE_PAGE_FLIP_ASYNC;
+    }
     return doCommit(flags);
 }
 
 bool DrmAtomicCommit::testAllowModeset()
 {
-    const uint32_t flags = DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_ALLOW_MODESET;
-    return doCommit(flags);
+    return doCommit(DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_ALLOW_MODESET);
 }
 
 bool DrmAtomicCommit::commit()
@@ -190,10 +192,8 @@ bool DrmAtomicCommit::doCommit(uint32_t flags)
         return true;
     }
 
-    if ((flags & DRM_MODE_ATOMIC_TEST_ONLY) == 0) [[likely]] {
-        qCWarning(KWIN_DRM) << "Atomic commit failed: errno =" << errno << "(" << strerror(errno) << ");"
-                            << "objects =" << objects.size() << ", properties =" << propertyIds.size();
-    }
+    qCWarning(KWIN_DRM) << "Atomic commit failed: errno =" << errno << "(" << strerror(errno) << ");"
+                        << "objects =" << objects.size() << ", properties =" << propertyIds.size();
     return false;
 }
 

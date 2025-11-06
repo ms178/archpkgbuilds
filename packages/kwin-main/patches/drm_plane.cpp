@@ -270,16 +270,16 @@ void DrmPlane::setCurrentBuffer(const std::shared_ptr<DrmFramebuffer> &b)
     const auto newData = b->data();
 
 #if defined(KWIN_HAVE_SSE2)
+    alignas(16) intptr_t rawOld[4];
+    rawOld[0] = reinterpret_cast<intptr_t>(m_lastBuffers[0].get());
+    rawOld[1] = reinterpret_cast<intptr_t>(m_lastBuffers[1].get());
+    rawOld[2] = reinterpret_cast<intptr_t>(m_lastBuffers[2].get());
+    rawOld[3] = reinterpret_cast<intptr_t>(m_lastBuffers[3].get());
+
     const intptr_t rawNew = reinterpret_cast<intptr_t>(newData.get());
     const __m128i search = _mm_set1_epi64x(rawNew);
-    const __m128i buf01 = _mm_set_epi64x(
-        reinterpret_cast<intptr_t>(m_lastBuffers[1].get()),
-        reinterpret_cast<intptr_t>(m_lastBuffers[0].get())
-    );
-    const __m128i buf23 = _mm_set_epi64x(
-        reinterpret_cast<intptr_t>(m_lastBuffers[3].get()),
-        reinterpret_cast<intptr_t>(m_lastBuffers[2].get())
-    );
+    const __m128i buf01 = _mm_load_si128(reinterpret_cast<const __m128i *>(&rawOld[0]));
+    const __m128i buf23 = _mm_load_si128(reinterpret_cast<const __m128i *>(&rawOld[2]));
     const __m128i cmp01 = _mm_cmpeq_epi64(search, buf01);
     const __m128i cmp23 = _mm_cmpeq_epi64(search, buf23);
     const __m128i cmpOr = _mm_or_si128(cmp01, cmp23);
