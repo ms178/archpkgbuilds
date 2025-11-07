@@ -8,16 +8,22 @@
 #include "options.h"
 #include "renderloop_p.h"
 #include "scene/surfaceitem.h"
+#include "scene/surfaceitem_wayland.h"
+#include "wayland/surface.h"
 #include "utils/common.h"
 #include "window.h"
 #include "workspace.h"
 
+#include <KSharedConfig>
+#include <KConfigGroup>
+
 #include <algorithm>
 #include <chrono>
 #include <climits>
-#include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <bit>
+#include <type_traits>
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -39,7 +45,133 @@ RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, Output *output)
     : q(q)
     , output(output)
     , cachedVblankIntervalNs(1'000'000'000'000ull / 60'000ull)
+    , vblankIntervalReciprocal(0)
+    , reciprocalShift(0)
 {
+    updateReciprocal();
+    initializeVrrCapabilities();
+}
+
+void RenderLoopPrivate::updateReciprocal()
+{
+    if (cachedVblankIntervalNs > 0 && cachedVblankIntervalNs < (1ull << 32)) {
+        const uint64_t shift = std::bit_width(cachedVblankIntervalNs) + 31;
+        vblankIntervalReciprocal = ((1ull << shift) + cachedVblankIntervalNs - 1) / cachedVblankIntervalNs;
+        reciprocalShift = static_cast<uint8_t>(shift);
+    } else {
+        vblankIntervalReciprocal = 0;
+        reciprocalShift = 0;
+    }
+}
+
+void RenderLoopPrivate::initializeVrrCapabilities()
+{
+    if (!output) {
+        return;
+    }
+
+    const auto capabilities = output->capabilities();
+    vrrCapable = capabilities.testFlag(Output::Capability::Vrr);
+
+    const auto config = KSharedConfig::openConfig(QStringLiteral("kwinrc"));
+    const auto vrrGroup = config->group(QStringLiteral("VRR"));
+
+    const QString policy = vrrGroup.readEntry("Policy", "Automatic");
+    if (policy == "Never") {
+        vrrEnabled = false;
+    } else if (policy == "Always") {
+        vrrMode = VrrMode::Always;
+        vrrEnabled = vrrCapable;
+    } else if (policy == "Automatic") {
+        vrrMode = VrrMode::Automatic;
+        vrrEnabled = vrrCapable;
+    } else {
+        vrrMode = VrrMode::Automatic;
+        vrrEnabled = vrrCapable;
+    }
+
+    if (vrrEnabled) {
+        qCInfo(KWIN_CORE) << "VRR enabled for output" << output->name() << "mode:" << policy;
+    }
+}
+
+bool RenderLoopPrivate::shouldEngageVrr() const
+{
+    if (!vrrEnabled || !vrrCapable) {
+        return false;
+    }
+
+    if (vrrMode == VrrMode::Always) {
+        return true;
+    }
+
+    Workspace *const ws = workspace();
+    if (!ws || !output) {
+        return false;
+    }
+
+    Window *const activeWindow = ws->activeWindow();
+    if (!activeWindow || !activeWindow->isOnOutput(output)) {
+        return false;
+    }
+
+    if (!activeWindow->isFullScreen()) {
+        return false;
+    }
+
+    SurfaceItem *const surfaceItem = activeWindow->surfaceItem();
+    if (!surfaceItem) {
+        return false;
+    }
+
+    auto *waylandItem = qobject_cast<SurfaceItemWayland *>(surfaceItem);
+    if (waylandItem) {
+        if (auto *surface = waylandItem->surface()) {
+            const auto hint = surface->presentationModeHint();
+            if (hint == PresentationModeHint::VSync) {
+                return false;
+            }
+            if (hint == PresentationModeHint::Async) {
+                return true;
+            }
+        }
+    }
+
+    return true;
+}
+
+PresentationMode RenderLoopPrivate::selectPresentationMode() const
+{
+    if (!shouldEngageVrr()) {
+        return PresentationMode::VSync;
+    }
+
+    Workspace *const ws = workspace();
+    if (!ws || !output) {
+        return PresentationMode::AdaptiveSync;
+    }
+
+    Window *const activeWindow = ws->activeWindow();
+    if (!activeWindow) {
+        return PresentationMode::AdaptiveSync;
+    }
+
+    SurfaceItem *const surfaceItem = activeWindow->surfaceItem();
+    if (!surfaceItem) {
+        return PresentationMode::AdaptiveSync;
+    }
+
+    auto *waylandItem = qobject_cast<SurfaceItemWayland *>(surfaceItem);
+    if (waylandItem) {
+        if (auto *surface = waylandItem->surface()) {
+            const auto hint = surface->presentationModeHint();
+            if (hint == PresentationModeHint::Async) {
+                return PresentationMode::AdaptiveAsync;
+            }
+        }
+    }
+
+    return PresentationMode::AdaptiveSync;
 }
 
 void RenderLoopPrivate::scheduleNextRepaint()
@@ -51,7 +183,7 @@ void RenderLoopPrivate::scheduleNextRepaint()
 }
 
 #if defined(__GNUC__) || defined(__clang__)
-__attribute__((hot))
+__attribute__((hot, target("avx2")))
 #endif
 void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimestamp)
 {
@@ -64,11 +196,9 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
 
     const int64_t currentTimeNs = std::chrono::steady_clock::now().time_since_epoch().count();
     const int64_t lastPresentationNs = lastPresentationTimestamp.count();
-
     const int64_t predictedRenderNs = renderJournal.result().count();
     const int64_t safetyMarginNs = safetyMargin.count();
 
-    // Compute expected compositing duration with upper bound (prevent excessive latency)
     const int64_t vblankIntervalSigned = static_cast<int64_t>(vblankIntervalNs);
     const int64_t maxCompositingNs = vblankIntervalSigned * 2;
     int64_t expectedCompositingNs = predictedRenderNs + safetyMarginNs + 1'000'000;
@@ -76,160 +206,110 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
         expectedCompositingNs = maxCompositingNs;
     }
 
+    const PresentationMode targetMode = selectPresentationMode();
+    if (targetMode != presentationMode) {
+        if (vrrStabilityCounter >= 3) {
+            presentationMode = targetMode;
+            vrrStabilityCounter = 0;
+            qCDebug(KWIN_CORE) << "Presentation mode changed to" << static_cast<int>(targetMode);
+        } else {
+            vrrStabilityCounter++;
+        }
+    } else {
+        vrrStabilityCounter = 0;
+    }
+
     int64_t nextPresentationNs;
 
     if (presentationMode == PresentationMode::VSync) [[likely]] {
         const int64_t sinceLastNs = currentTimeNs - lastPresentationNs;
-
-        // Compute pageflips since last presentation (avoid division if recent)
         uint64_t pageflipsSince = 0;
+
         if (sinceLastNs > 0) [[likely]] {
-            if (sinceLastNs < static_cast<int64_t>(vblankIntervalNs * 4)) [[likely]] {
-                uint64_t accumNs = vblankIntervalNs;
-                pageflipsSince = 1;
-                while (accumNs <= static_cast<uint64_t>(sinceLastNs) && pageflipsSince < 4) {
-                    accumNs += vblankIntervalNs;
-                    pageflipsSince++;
-                }
-                if (accumNs > static_cast<uint64_t>(sinceLastNs)) {
-                    pageflipsSince--;
-                }
+            if (vblankIntervalReciprocal > 0) {
+                pageflipsSince = static_cast<uint64_t>((static_cast<__uint128_t>(sinceLastNs) *
+                                                       vblankIntervalReciprocal) >> reciprocalShift);
             } else {
-                // Uncommon case: many vblanks (e.g., suspend/resume, screen locked)
                 pageflipsSince = static_cast<uint64_t>(sinceLastNs) / vblankIntervalNs;
             }
         }
 
-        // Detect suspend/resume: if >100 vblanks elapsed, adjust compositing budget
         if (pageflipsSince > 100) [[unlikely]] {
             const int64_t earlyStart = vblankIntervalSigned - 1'000;
-            if (expectedCompositingNs < earlyStart) {
-                expectedCompositingNs = earlyStart;
-            }
+            expectedCompositingNs = std::max(expectedCompositingNs, earlyStart);
         }
 
         const int64_t toTargetNs = lastTargetTimestamp.count() - lastPresentationNs;
-        uint64_t pageflipsSinceLastToTarget = 0;
+        uint64_t pageflipsToTarget = 0;
         if (toTargetNs > 0) [[likely]] {
-            const uint64_t toTargetUns = static_cast<uint64_t>(toTargetNs);
-
-            if (toTargetUns < vblankIntervalNs * 7 / 2) [[likely]] {  // 3.5 vblanks
-                const uint64_t half = vblankIntervalNs >> 1;
-                // Check boundaries: [0, 0.5v), [0.5v, 1.5v), [1.5v, 2.5v), [2.5v, 3.5v)
-                if (toTargetUns < half) {
-                    pageflipsSinceLastToTarget = 0;
-                } else if (toTargetUns < vblankIntervalNs + half) {
-                    pageflipsSinceLastToTarget = 1;
-                } else if (toTargetUns < 2 * vblankIntervalNs + half) {
-                    pageflipsSinceLastToTarget = 2;
-                } else {
-                    pageflipsSinceLastToTarget = 3;
-                }
+            if (vblankIntervalReciprocal > 0) {
+                pageflipsToTarget = static_cast<uint64_t>((static_cast<__uint128_t>(toTargetNs) *
+                                                          vblankIntervalReciprocal) >> reciprocalShift);
             } else {
-                // Slow path: rare (>3.5 vblanks), fallback to division
-                pageflipsSinceLastToTarget = (toTargetUns + (vblankIntervalNs >> 1)) / vblankIntervalNs;
+                pageflipsToTarget = static_cast<uint64_t>(toTargetNs) / vblankIntervalNs;
             }
         }
 
-        const uint64_t expectedCompositingUns = static_cast<uint64_t>(expectedCompositingNs);
-        uint64_t pageflipsInAdvance = 1;  // Minimum 1 vblank ahead
-
-        if (expectedCompositingUns >= vblankIntervalNs) [[unlikely]] {
-
-            uint64_t threshold = vblankIntervalNs;
-            while (threshold < expectedCompositingUns && pageflipsInAdvance < static_cast<uint64_t>(maxPendingFrameCount)) {
-                pageflipsInAdvance++;
-                threshold += vblankIntervalNs;
-            }
+        uint64_t pageflipsInAdvance = 1;
+        if (expectedCompositingNs > static_cast<int64_t>(vblankIntervalNs)) {
+            uint64_t required = (static_cast<uint64_t>(expectedCompositingNs) + vblankIntervalNs - 1) / vblankIntervalNs;
+            pageflipsInAdvance = required < static_cast<uint64_t>(maxPendingFrameCount) ? required : static_cast<uint64_t>(maxPendingFrameCount);
         }
-        // Defensive clamp (loop already limits, but explicit for safety)
-        pageflipsInAdvance = std::clamp(pageflipsInAdvance, uint64_t(1), static_cast<uint64_t>(maxPendingFrameCount));
 
-        // Triple-buffering heuristic: engage on high load, disengage with hysteresis
-        if (pageflipsInAdvance > 1) {
+        const bool highLoad = (expectedCompositingNs > vblankIntervalSigned * 9 / 10);
+        if (highLoad) {
             wasTripleBuffering = true;
             doubleBufferingCounter = 0;
-        } else if (wasTripleBuffering) {
-            // Hysteresis: only exit triple buffering if consistently under 95% budget for 10 frames
-            const int64_t threshold = vblankIntervalSigned * 95 / 100;
-            if (expectedCompositingNs >= threshold) {
-                doubleBufferingCounter = 0;
-            } else {
-                doubleBufferingCounter++;
+            if (pageflipsInAdvance < 2) {
+                pageflipsInAdvance = 2;
             }
-
+        } else if (wasTripleBuffering) {
+            doubleBufferingCounter = (expectedCompositingNs < vblankIntervalSigned * 8 / 10) ?
+                                    (doubleBufferingCounter + 1) : 0;
             if (doubleBufferingCounter >= 10) {
                 wasTripleBuffering = false;
-            } else {
+            } else if (pageflipsInAdvance < 2) {
                 pageflipsInAdvance = 2;
             }
         }
 
-        // Compute next presentation timestamp
         if (compositeTimer.isActive()) {
-            // Timer already running: maintain existing schedule, adjust for drift
-            const int64_t deltaNs = nextPresentationTimestamp.count() - lastPresentationNs;
-            uint32_t intervalsSinceLastTimestamp = 1;
-            if (deltaNs > 0) [[likely]] {
-                // Rounding division to nearest vblank interval
-                const uint64_t deltaUns = static_cast<uint64_t>(deltaNs);
-                const uint64_t intervals = (deltaUns + (vblankIntervalNs >> 1)) / vblankIntervalNs;
-                if (intervals > 0 && intervals <= UINT32_MAX) {
-                    intervalsSinceLastTimestamp = static_cast<uint32_t>(intervals);
-                }
-            }
-            // Overflow-safe multiplication: check before computing
-            if (intervalsSinceLastTimestamp <= INT64_MAX / vblankIntervalSigned) [[likely]] {
-                nextPresentationNs = lastPresentationNs + static_cast<int64_t>(intervalsSinceLastTimestamp) * vblankIntervalSigned;
-            } else {
-                nextPresentationNs = INT64_MAX;  // Far future (overflow)
-            }
+            const uint64_t intervals = static_cast<uint64_t>((nextPresentationTimestamp.count() - lastPresentationNs + vblankIntervalNs/2) / vblankIntervalNs);
+            const uint64_t clampedIntervals = intervals < 1000000 ? intervals : 1000000;
+            nextPresentationNs = lastPresentationNs + static_cast<int64_t>(clampedIntervals * vblankIntervalNs);
         } else {
-            // Fresh schedule: target furthest of (current + advance) or (lastTarget + 1)
-            const uint64_t targetVblanks = std::max(pageflipsSince + pageflipsInAdvance, pageflipsSinceLastToTarget + 1);
-
-            // Overflow-safe multiplication
-            if (targetVblanks <= static_cast<uint64_t>(INT64_MAX) / vblankIntervalNs) [[likely]] {
-                nextPresentationNs = lastPresentationNs + static_cast<int64_t>(targetVblanks * vblankIntervalNs);
-            } else {
-                nextPresentationNs = INT64_MAX;
-            }
+            const uint64_t targetVblanks = (pageflipsSince + pageflipsInAdvance) > (pageflipsToTarget + 1) ?
+                                          (pageflipsSince + pageflipsInAdvance) : (pageflipsToTarget + 1);
+            nextPresentationNs = lastPresentationNs + static_cast<int64_t>(targetVblanks * vblankIntervalNs);
         }
     } else {
-        // Non-VSync modes: Async, AdaptiveSync, AdaptiveAsync
         wasTripleBuffering = false;
         doubleBufferingCounter = 0;
 
         if (presentationMode == PresentationMode::Async || presentationMode == PresentationMode::AdaptiveAsync) {
-            // Immediate presentation (no vsync)
-            nextPresentationNs = currentTimeNs;
+            nextPresentationNs = currentTimeNs + expectedCompositingNs;
         } else {
-            // Mailbox mode: next vsync or later
-            const int64_t candidate = lastPresentationNs + vblankIntervalSigned;
-            nextPresentationNs = std::max(currentTimeNs, candidate);
+            const int64_t minIntervalNs = vblankIntervalSigned;
+            nextPresentationNs = currentTimeNs + expectedCompositingNs;
+
+            const int64_t sinceLastNs = currentTimeNs - lastPresentationNs;
+            if (sinceLastNs < minIntervalNs) {
+                nextPresentationNs = std::max(nextPresentationNs, lastPresentationNs + minIntervalNs);
+            }
         }
     }
 
+    const int64_t maxFutureNs = currentTimeNs + (static_cast<int64_t>(1) << 40);
+    nextPresentationNs = (nextPresentationNs < currentTimeNs) ? currentTimeNs :
+                        (nextPresentationNs > maxFutureNs) ? maxFutureNs : nextPresentationNs;
     nextPresentationTimestamp = std::chrono::nanoseconds{nextPresentationNs};
 
-    // Compute delay until compositor should start rendering
     const int64_t nextRenderNs = nextPresentationNs - expectedCompositingNs;
-    int64_t delayNs = nextRenderNs - currentTimeNs;
-    if (delayNs < 0) {
-        delayNs = 0;  // Already late, fire immediately
-    }
+    int64_t delayNs = (nextRenderNs > currentTimeNs) ? (nextRenderNs - currentTimeNs) : 0;
+    int delayMs = static_cast<int>((delayNs + 999'999) / 1'000'000);
+    delayMs = (delayMs < 0) ? 0 : (delayMs > 32767) ? 32767 : delayMs;
 
-    // Convert nanoseconds to milliseconds (ceiling to avoid early wakeup)
-    int delayMs;
-    if (delayNs <= INT64_MAX - 999'999) [[likely]] {
-        delayMs = static_cast<int>((delayNs + 999'999) / 1'000'000);
-    } else {
-        delayMs = INT_MAX;  // Far future
-    }
-
-    delayMs = std::min(delayMs, 32767);
-
-    if (!compositeTimer.isActive() || std::abs(delayMs - static_cast<int>(scheduledTimerMs)) > 1) {
+    if (!compositeTimer.isActive() || std::abs(delayMs - scheduledTimerMs) > 1) {
         scheduledTimerMs = static_cast<int16_t>(delayMs);
         compositeTimer.start(delayMs, Qt::PreciseTimer, q);
     }
@@ -272,64 +352,55 @@ static KWIN_COLD KWIN_NOINLINE void sanitizeName(const QString &in, std::string 
 
     int i = 0;
 
-#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-    // AVX2 fast path: process 16 QChars (UTF-16) at a time
-    if (__builtin_cpu_supports("avx2") && size >= 16) {
-        // Constants for allowed characters (a-z, A-Z, 0-9, _, -)
-        const __m256i lower_a = _mm256_set1_epi16(static_cast<int16_t>('a'));
-        const __m256i upper_z = _mm256_set1_epi16(static_cast<int16_t>('z'));
-        const __m256i upper_A = _mm256_set1_epi16(static_cast<int16_t>('A'));
-        const __m256i upper_Z = _mm256_set1_epi16(static_cast<int16_t>('Z'));
-        const __m256i digit_0 = _mm256_set1_epi16(static_cast<int16_t>('0'));
-        const __m256i digit_9 = _mm256_set1_epi16(static_cast<int16_t>('9'));
-        const __m256i underscore = _mm256_set1_epi16(static_cast<int16_t>('_'));
-        const __m256i dash = _mm256_set1_epi16(static_cast<int16_t>('-'));
-        const __m256i replacement = _mm256_set1_epi16(static_cast<int16_t>('_'));
+#if defined(__AVX2__) && (defined(__GNUC__) || defined(__clang__))
+    if (size >= 32) {
+        const __m256i lower_a = _mm256_set1_epi16('a' - 1);
+        const __m256i lower_z = _mm256_set1_epi16('z' + 1);
+        const __m256i upper_A = _mm256_set1_epi16('A' - 1);
+        const __m256i upper_Z = _mm256_set1_epi16('Z' + 1);
+        const __m256i digits_0 = _mm256_set1_epi16('0' - 1);
+        const __m256i digits_9 = _mm256_set1_epi16('9' + 1);
+        const __m256i underscore = _mm256_set1_epi16('_');
+        const __m256i dash = _mm256_set1_epi16('-');
+        const __m256i replacement = _mm256_set1_epi16('_');
 
         for (; i + 15 < size; i += 16) {
-            // Load 16 QChars (256 bits = 16 × 16-bit UTF-16 code units)
-            __m256i chars = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(in.data() + i));
+            __m256i chars = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(in.utf16() + i));
 
-            // Check if characters are in allowed ranges (16-bit signed comparisons)
-            // Range [a, z]: a-1 < c <= z
-            __m256i ge_a = _mm256_cmpgt_epi16(chars, _mm256_sub_epi16(lower_a, _mm256_set1_epi16(1)));
-            __m256i le_z = _mm256_cmpgt_epi16(_mm256_add_epi16(upper_z, _mm256_set1_epi16(1)), chars);
-            __m256i is_lower = _mm256_and_si256(ge_a, le_z);
-
-            // Range [A, Z]
-            __m256i ge_A = _mm256_cmpgt_epi16(chars, _mm256_sub_epi16(upper_A, _mm256_set1_epi16(1)));
-            __m256i le_Z = _mm256_cmpgt_epi16(_mm256_add_epi16(upper_Z, _mm256_set1_epi16(1)), chars);
-            __m256i is_upper = _mm256_and_si256(ge_A, le_Z);
-
-            // Range [0, 9]
-            __m256i ge_0 = _mm256_cmpgt_epi16(chars, _mm256_sub_epi16(digit_0, _mm256_set1_epi16(1)));
-            __m256i le_9 = _mm256_cmpgt_epi16(_mm256_add_epi16(digit_9, _mm256_set1_epi16(1)), chars);
-            __m256i is_digit = _mm256_and_si256(ge_0, le_9);
-
-            // Exact matches for _ and -
+            __m256i is_lower = _mm256_and_si256(
+                _mm256_cmpgt_epi16(chars, lower_a),
+                _mm256_cmpgt_epi16(lower_z, chars)
+            );
+            __m256i is_upper = _mm256_and_si256(
+                _mm256_cmpgt_epi16(chars, upper_A),
+                _mm256_cmpgt_epi16(upper_Z, chars)
+            );
+            __m256i is_digit = _mm256_and_si256(
+                _mm256_cmpgt_epi16(chars, digits_0),
+                _mm256_cmpgt_epi16(digits_9, chars)
+            );
             __m256i is_underscore = _mm256_cmpeq_epi16(chars, underscore);
             __m256i is_dash = _mm256_cmpeq_epi16(chars, dash);
 
-            // Combine all allowed conditions
-            __m256i is_allowed = _mm256_or_si256(_mm256_or_si256(is_lower, is_upper),
-                                                  _mm256_or_si256(_mm256_or_si256(is_digit, is_underscore), is_dash));
+            __m256i is_valid = _mm256_or_si256(
+                _mm256_or_si256(is_lower, is_upper),
+                _mm256_or_si256(
+                    _mm256_or_si256(is_digit, is_underscore),
+                    is_dash
+                )
+            );
 
-            // Blend: keep allowed chars, replace others with '_'
-            __m256i result = _mm256_blendv_epi8(replacement, chars, is_allowed);
+            __m256i result = _mm256_blendv_epi8(replacement, chars, is_valid);
 
-            // Pack 16-bit → 8-bit (discard high bytes, assumes ASCII range)
-            __m128i lo = _mm256_castsi256_si128(result);          // Lower 8 QChars
-            __m128i hi = _mm256_extracti128_si256(result, 1);     // Upper 8 QChars
-            __m128i packed = _mm_packus_epi16(lo, hi);
-
-            alignas(16) char temp[16];
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(temp), packed);
-            out.append(temp, 16);
+            alignas(32) char16_t temp[16];
+            _mm256_store_si256(reinterpret_cast<__m256i*>(temp), result);
+            for (int j = 0; j < 16; ++j) {
+                out.push_back(static_cast<char>(temp[j] & 0xFF));
+            }
         }
     }
 #endif
 
-    // Scalar fallback for remaining characters (or if no AVX2)
     for (; i < size; ++i) {
         const QChar ch = in.at(i);
         const char16_t unicode = ch.unicode();
@@ -377,7 +448,7 @@ static KWIN_COLD KWIN_NOINLINE void writeDebugOutput(RenderLoopPrivate *d, std::
 #undef KWIN_COLD
 #undef KWIN_NOINLINE
 
-} // anonymous namespace
+}
 
 void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp, std::optional<RenderTimeSpan> renderTime, PresentationMode mode, OutputFrame *frame)
 {
@@ -394,12 +465,10 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
         renderJournal.add(renderTime->end - renderTime->start, timestamp);
     }
 
-    // Re-schedule if timer was already active (drift correction)
     if (compositeTimer.isActive()) {
         scheduleRepaint(lastPresentationTimestamp);
     }
 
-    // Handle delayed reschedule requests (from damage events during inhibit)
     if (!inhibitCount && pendingReschedule) {
         scheduleNextRepaint();
     }
@@ -412,7 +481,6 @@ void RenderLoopPrivate::notifyVblank(std::chrono::nanoseconds timestamp)
     if (lastPresentationTimestamp <= timestamp) [[likely]] {
         lastPresentationTimestamp = timestamp;
     } else {
-        // Handle backwards-moving timestamps (buggy drivers, clock adjustments)
         qCDebug(KWIN_CORE,
                 "Got invalid presentation timestamp: %lld (current %lld)",
                 static_cast<long long>(timestamp.count()),
@@ -445,9 +513,7 @@ RenderLoop::RenderLoop(Output *output)
 {
 }
 
-RenderLoop::~RenderLoop()
-{
-}
+RenderLoop::~RenderLoop() = default;
 
 void RenderLoop::inhibit()
 {
@@ -485,15 +551,15 @@ int RenderLoop::refreshRate() const
 
 void RenderLoop::setRefreshRate(int refreshRate)
 {
-    const int rr = std::clamp(refreshRate, 1'000, 1'000'000);
+    const int rr = (refreshRate < 1000) ? 1000 : (refreshRate > 1000000) ? 1000000 : refreshRate;
     if (d->refreshRate == rr) {
         return;
     }
     d->refreshRate = rr;
     d->cachedVblankIntervalNs = 1'000'000'000'000ull / static_cast<uint64_t>(rr);
+    d->updateReciprocal();
     Q_EMIT refreshRateChanged();
 
-    // Refresh rate changed: invalidate existing schedule and recompute
     if (!d->inhibitCount) {
         d->compositeTimer.stop();
         d->scheduledTimerMs = -1;
@@ -526,7 +592,26 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer *outputLayer)
 
     d->delayedVrrTimer.stop();
 
-    const int effectiveMaxPendingFrameCount = (vrr || tearing) ? 1 : d->maxPendingFrameCount;
+    int effectiveMaxPendingFrameCount = d->maxPendingFrameCount;
+
+    if (vrr || tearing) {
+        if (workspace() && d->output) [[likely]] {
+            Window *const activeWin = workspace()->activeWindow();
+            if (activeWin && activeWin->isOnOutput(d->output)) {
+                SurfaceItem *const surfaceItem = activeWin->surfaceItem();
+                if (surfaceItem) {
+                    const auto detectedContentType = surfaceItem->contentType();
+                    effectiveMaxPendingFrameCount = (detectedContentType == ContentType::Video) ? 2 : 1;
+                } else {
+                    effectiveMaxPendingFrameCount = 1;
+                }
+            } else {
+                effectiveMaxPendingFrameCount = 1;
+            }
+        } else {
+            effectiveMaxPendingFrameCount = 1;
+        }
+    }
 
     if (d->pendingFrameCount < effectiveMaxPendingFrameCount && !d->inhibitCount) {
         d->scheduleNextRepaint();
@@ -546,11 +631,7 @@ bool RenderLoop::activeWindowControlsVrrRefreshRate() const
         return false;
     }
     SurfaceItem *const surfaceItem = activeWindow->surfaceItem();
-    if (!surfaceItem) {
-        return false;
-    }
-
-    return surfaceItem->recursiveFrameTimeEstimation() <= std::chrono::nanoseconds(1'000'000'000) / 30;
+    return surfaceItem && (surfaceItem->recursiveFrameTimeEstimation() <= 33ms);
 }
 
 std::chrono::nanoseconds RenderLoop::lastPresentationTimestamp() const
@@ -566,20 +647,14 @@ std::chrono::nanoseconds RenderLoop::nextPresentationTimestamp() const
 void RenderLoop::setPresentationMode(PresentationMode mode)
 {
     if (mode != d->presentationMode) {
-        qCDebug(KWIN_CORE) << "Changed presentation mode to" << mode;
+        qCDebug(KWIN_CORE) << "Changed presentation mode to" << static_cast<int>(mode);
+        d->presentationMode = mode;
     }
-    d->presentationMode = mode;
 }
 
 void RenderLoop::setMaxPendingFrameCount(uint32_t maxCount)
 {
-    if (maxCount == 0) {
-        d->maxPendingFrameCount = 1;
-    } else if (maxCount > static_cast<uint32_t>(INT_MAX)) {
-        d->maxPendingFrameCount = INT_MAX;
-    } else {
-        d->maxPendingFrameCount = static_cast<int>(maxCount);
-    }
+    d->maxPendingFrameCount = (maxCount == 0) ? 1 : (maxCount > static_cast<uint32_t>(INT_MAX)) ? INT_MAX : static_cast<int>(maxCount);
 }
 
 std::chrono::nanoseconds RenderLoop::predictedRenderTime() const
@@ -587,6 +662,6 @@ std::chrono::nanoseconds RenderLoop::predictedRenderTime() const
     return d->renderJournal.result();
 }
 
-} // namespace KWin
+}
 
 #include "moc_renderloop.cpp"
