@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <vector>
+#include <chrono>
 
 namespace KWin
 {
@@ -45,6 +46,7 @@ private:
     void optimizeCommits(TimePoint pageflipTarget);
     void submit();
     void handlePing();
+    void handleTimeout(std::unique_lock<std::mutex>& lock);
 
     DrmGpu *const m_gpu;
 
