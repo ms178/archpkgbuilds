@@ -30,34 +30,33 @@ public:
     uint64_t cachedVblankIntervalNs;
     uint64_t vblankIntervalReciprocal;
     uint64_t vblankIntervalReciprocal64;
-    RenderLoop *const q;
-    Output *const output;
-    std::chrono::nanoseconds safetyMargin{0};
-
-    PresentationMode presentationMode = PresentationMode::VSync;
-    int pendingFrameCount = 0;
-    int inhibitCount = 0;
-    int maxPendingFrameCount = 1;
-    int refreshRate = 60'000;
-    int16_t scheduledTimerMs = -1;
-    int16_t doubleBufferingCounter = 0;
     uint8_t reciprocalShift;
     uint8_t reciprocalShift64;
+    PresentationMode presentationMode = PresentationMode::VSync;
     uint8_t vrrStabilityCounter = 0;
     bool pendingReschedule = false;
     bool wasTripleBuffering = false;
+    int16_t scheduledTimerMs = -1;
+    int16_t doubleBufferingCounter = 0;
+    int pendingFrameCount = 0;
+    int maxPendingFrameCount = 1;
+    uint8_t padding0[8];
+
+    RenderLoop *const q;
+    Output *const output;
+    std::chrono::nanoseconds safetyMargin{0};
+    int refreshRate = 60'000;
     bool preparingNewFrame = false;
     bool vrrCapable = false;
     bool vrrEnabled = false;
-    uint8_t padding1[32];
-
     enum class VrrMode : uint8_t {
         Automatic,
         Always,
         Never
     };
     VrrMode vrrMode = VrrMode::Automatic;
-    uint8_t padding2[63];
+    int inhibitCount = 0;
+    uint8_t padding1[20];
 
     struct alignas(64) VrrContext {
         Window *cachedActiveWindow = nullptr;
@@ -69,12 +68,12 @@ public:
         bool cachedIsOnOutput = false;
         uint8_t padding[34];
     } vrrCtx;
+
     uint32_t vrrCtxGeneration = 0;
-    uint8_t padding3[60];
+    uint8_t padding2[60];
 
     alignas(64) QBasicTimer compositeTimer;
     QBasicTimer delayedVrrTimer;
-
     RenderJournal renderJournal;
     std::optional<std::fstream> m_debugOutput;
 

@@ -233,9 +233,7 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
 
     const PresentationMode targetMode = selectPresentationModeFromContext();
     if (targetMode != presentationMode) {
-        const bool switchingToVSync = (targetMode == PresentationMode::VSync);
-        const uint8_t threshold = switchingToVSync ? 3 : 8;
-
+        const uint8_t threshold = (targetMode == PresentationMode::VSync) ? 2 : 3;
         if (vrrStabilityCounter >= threshold) {
             presentationMode = targetMode;
             vrrStabilityCounter = 0;
@@ -244,9 +242,7 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
             vrrStabilityCounter++;
         }
     } else {
-        if (vrrStabilityCounter > 0) {
-            vrrStabilityCounter--;
-        }
+        vrrStabilityCounter = 0;
     }
 
     int64_t nextPresentationNs;
@@ -282,7 +278,7 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
             pageflipsInAdvance = required < static_cast<uint64_t>(maxPendingFrameCount) ? required : static_cast<uint64_t>(maxPendingFrameCount);
         }
 
-        const bool highLoad = (expectedCompositingNs > vblankIntervalSigned * 9 / 10);
+        const bool highLoad = (expectedCompositingNs > vblankIntervalSigned * 85 / 100);
         if (highLoad) {
             wasTripleBuffering = true;
             doubleBufferingCounter = 0;
@@ -290,9 +286,9 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
                 pageflipsInAdvance = 2;
             }
         } else if (wasTripleBuffering) {
-            doubleBufferingCounter = (expectedCompositingNs < vblankIntervalSigned * 8 / 10) ?
+            doubleBufferingCounter = (expectedCompositingNs < vblankIntervalSigned * 65 / 100) ?
                                     (doubleBufferingCounter + 1) : 0;
-            if (doubleBufferingCounter >= 10) {
+            if (doubleBufferingCounter >= 4) {
                 wasTripleBuffering = false;
             } else if (pageflipsInAdvance < 2) {
                 pageflipsInAdvance = 2;
@@ -333,7 +329,7 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
     int64_t delayNs = (nextRenderNs > currentTimeNs) ? (nextRenderNs - currentTimeNs) : 0;
     int delayMs = std::clamp(static_cast<int>((delayNs + 999'999) / 1'000'000), 0, 32767);
 
-    const int threshold = (delayMs < 10) ? 2 : 1;
+    const int threshold = (delayMs <= 8) ? 0 : ((delayMs < 16) ? 1 : 2);
     if (!compositeTimer.isActive() || std::abs(delayMs - scheduledTimerMs) > threshold) {
         scheduledTimerMs = static_cast<int16_t>(delayMs);
         compositeTimer.start(delayMs, Qt::PreciseTimer, q);
