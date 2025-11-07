@@ -238,8 +238,8 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPresentation(DrmAtomicCommit *commi
     }
 
     if (m_pending.crtc->vrrEnabled.isValid()) [[likely]] {
-        const bool shouldEnableVrr = (m_pending.presentationMode == PresentationMode::AdaptiveSync ||
-                                      m_pending.presentationMode == PresentationMode::AdaptiveAsync);
+        const bool shouldEnableVrr = (m_pending.presentationMode == PresentationMode::AdaptiveSync) |
+                                     (m_pending.presentationMode == PresentationMode::AdaptiveAsync);
         commit->setVrr(m_pending.crtc, shouldEnableVrr);
     }
 
@@ -248,14 +248,27 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPresentation(DrmAtomicCommit *commi
     }
 
     const auto *firstLayer = m_pending.layers.front();
-    if (std::ranges::any_of(m_pending.layers | std::views::drop(1),
-        [firstLayer](const OutputLayer *layer) {
-            return layer->isEnabled() && layer->colorPipeline() != firstLayer->colorPipeline();
-        })) [[unlikely]] {
-        return Error::InvalidArguments;
+    const auto &firstColorPipeline = firstLayer->colorPipeline();
+    const size_t layerCount = m_pending.layers.size();
+
+    for (size_t i = 1; i < layerCount; ++i) {
+        const auto *layer = m_pending.layers[i];
+
+        if (i + 1 < layerCount) [[likely]] {
+            __builtin_prefetch(m_pending.layers[i + 1], 0, 3);
+        }
+
+        if (!layer->isEnabled()) [[unlikely]] {
+            continue;
+        }
+
+        if (layer->colorPipeline() != firstColorPipeline) [[unlikely]] {
+            return Error::InvalidArguments;
+        }
     }
 
-    const ColorPipeline colorPipeline = firstLayer->colorPipeline().merged(m_pending.crtcColorPipeline);
+    const ColorPipeline colorPipeline = firstColorPipeline.merged(m_pending.crtcColorPipeline);
+
     if (!m_pending.crtc->postBlendingPipeline) [[unlikely]] {
         if (!colorPipeline.isIdentity()) {
             return Error::InvalidArguments;
@@ -286,6 +299,15 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPlane(DrmAtomicCommit *commit, DrmP
         return Error::TestBufferFailed;
     }
 
+    const bool isCursor = (plane->type.enumValue() == DrmPlane::TypeIndex::Cursor);
+    const bool hasVmHotspotX = plane->vmHotspotX.isValid();
+    const bool hasVmHotspotY = plane->vmHotspotY.isValid();
+    const bool hasAlpha = plane->alpha.isValid();
+    const bool hasBlendMode = plane->pixelBlendMode.isValid();
+    const bool hasZpos = plane->zpos.isValid() && !plane->zpos.isImmutable();
+    const bool hasColorEncoding = plane->colorEncoding.isValid();
+    const bool hasColorRange = plane->colorRange.isValid();
+
     const QRect srcRect = layer->sourceRect().toRect();
     const QRect dstRect = layer->targetRect();
 
@@ -293,70 +315,77 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPlane(DrmAtomicCommit *commit, DrmP
     commit->addBuffer(plane, fb, frame);
 
     const auto transform = layer->offloadTransform();
-    if (plane->rotation.isValid()) [[likely]] {
-        if (plane->supportsTransformation(transform)) [[likely]] {
-            commit->addEnum(plane->rotation, DrmPlane::outputTransformToPlaneTransform(transform));
-        } else if (transform.kind() != OutputTransform::Kind::Normal) [[unlikely]] {
+    const bool isNormalTransform = (transform.kind() == OutputTransform::Kind::Normal);
+
+    if (!isNormalTransform) [[unlikely]] {
+        if (!plane->rotation.isValid() || !plane->supportsTransformation(transform)) [[unlikely]] {
             return Error::InvalidArguments;
         }
-    } else if (transform.kind() != OutputTransform::Kind::Normal) [[unlikely]] {
-        return Error::InvalidArguments;
+        commit->addEnum(plane->rotation, DrmPlane::outputTransformToPlaneTransform(transform));
     }
 
     commit->addProperty(plane->crtcId, m_pending.crtc->id());
 
-    const bool isCursor = (plane->type.enumValue() == DrmPlane::TypeIndex::Cursor);
-
     if (isCursor) [[unlikely]] {
-        if (plane->vmHotspotX.isValid() && plane->vmHotspotY.isValid()) {
-            commit->addProperty(plane->vmHotspotX, std::round(layer->hotspot().x()));
-            commit->addProperty(plane->vmHotspotY, std::round(layer->hotspot().y()));
+        if (hasVmHotspotX & hasVmHotspotY) [[likely]] {
+            const auto hotspot = layer->hotspot();
+            commit->addProperty(plane->vmHotspotX, std::round(hotspot.x()));
+            commit->addProperty(plane->vmHotspotY, std::round(hotspot.y()));
         }
-    } else {
-        if (plane->alpha.isValid()) {
-            commit->addProperty(plane->alpha, plane->alpha.maxValue());
-        }
-        if (plane->pixelBlendMode.isValid()) {
-            commit->addEnum(plane->pixelBlendMode, DrmPlane::PixelBlendMode::PreMultiplied);
-        }
-        if (plane->zpos.isValid() && !plane->zpos.isImmutable()) {
-            commit->addProperty(plane->zpos, layer->zpos());
-        }
+        return Error::None;
+    }
 
-        const auto buffer = fb->buffer();
-        if (buffer) [[likely]] {
-            const auto attrs = buffer->dmabufAttributes();
+    if (hasAlpha) [[likely]] {
+        commit->addProperty(plane->alpha, plane->alpha.maxValue());
+    }
+    if (hasBlendMode) [[likely]] {
+        commit->addEnum(plane->pixelBlendMode, DrmPlane::PixelBlendMode::PreMultiplied);
+    }
+    if (hasZpos) [[likely]] {
+        commit->addProperty(plane->zpos, layer->zpos());
+    }
 
-            if (attrs && isYuvFormat(attrs->format)) [[unlikely]] {
-                const auto &colorDesc = layer->colorDescription();
-                if (colorDesc) [[likely]] {
-                    std::optional<DrmPlane::ColorEncoding> encoding;
-                    switch (colorDesc->yuvCoefficients()) {
-                    case YUVMatrixCoefficients::BT601:
-                        encoding = DrmPlane::ColorEncoding::BT601_YCbCr;
-                        break;
-                    case YUVMatrixCoefficients::BT709:
-                        encoding = DrmPlane::ColorEncoding::BT709_YCbCr;
-                        break;
-                    case YUVMatrixCoefficients::BT2020:
-                        encoding = DrmPlane::ColorEncoding::BT2020_YCbCr;
-                        break;
-                    default:
-                        break;
-                    }
+    const auto buffer = fb->buffer();
+    const auto attrs = buffer->dmabufAttributes();
 
-                    if (encoding && plane->colorEncoding.isValid() && plane->colorEncoding.hasEnum(*encoding)) {
-                        commit->addEnum(plane->colorEncoding, *encoding);
-                    }
+    if (!attrs) [[unlikely]] {
+        return Error::None;
+    }
 
-                    const auto range = (colorDesc->range() == EncodingRange::Full)
-                        ? DrmPlane::ColorRange::Full_YCbCr
-                        : DrmPlane::ColorRange::Limited_YCbCr;
-                    if (plane->colorRange.isValid() && plane->colorRange.hasEnum(range)) {
-                        commit->addEnum(plane->colorRange, range);
-                    }
-                }
+    const uint32_t format = attrs->format;
+    if (!isYuvFormat(format)) [[likely]] {
+        return Error::None;
+    }
+
+    const auto &colorDesc = layer->colorDescription();
+    if (!colorDesc) [[unlikely]] {
+        return Error::None;
+    }
+
+    if (hasColorEncoding) [[likely]] {
+        const auto coeffs = colorDesc->yuvCoefficients();
+
+        if (coeffs == YUVMatrixCoefficients::BT709) [[likely]] {
+            if (plane->colorEncoding.hasEnum(DrmPlane::ColorEncoding::BT709_YCbCr)) {
+                commit->addEnum(plane->colorEncoding, DrmPlane::ColorEncoding::BT709_YCbCr);
             }
+        } else if (coeffs == YUVMatrixCoefficients::BT601) {
+            if (plane->colorEncoding.hasEnum(DrmPlane::ColorEncoding::BT601_YCbCr)) {
+                commit->addEnum(plane->colorEncoding, DrmPlane::ColorEncoding::BT601_YCbCr);
+            }
+        } else if (coeffs == YUVMatrixCoefficients::BT2020) {
+            if (plane->colorEncoding.hasEnum(DrmPlane::ColorEncoding::BT2020_YCbCr)) {
+                commit->addEnum(plane->colorEncoding, DrmPlane::ColorEncoding::BT2020_YCbCr);
+            }
+        }
+    }
+
+    if (hasColorRange) [[likely]] {
+        const auto range = (colorDesc->range() == EncodingRange::Full)
+            ? DrmPlane::ColorRange::Full_YCbCr
+            : DrmPlane::ColorRange::Limited_YCbCr;
+        if (plane->colorRange.hasEnum(range)) {
+            commit->addEnum(plane->colorRange, range);
         }
     }
 

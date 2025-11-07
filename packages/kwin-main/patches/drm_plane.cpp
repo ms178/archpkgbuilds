@@ -27,7 +27,6 @@
 
 #if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
 #include <emmintrin.h>
-#define KWIN_HAVE_SSE2 1
 #endif
 
 namespace KWin
@@ -116,13 +115,21 @@ bool DrmPlane::updateProperties()
     m_possibleCrtcs = p->possible_crtcs;
 
     m_supportedFormats.clear();
-    m_supportedFormats.reserve(256);
 
     if (inFormats.isValid() && inFormats.immutableBlob() && gpu()->addFB2ModifiersSupported()) [[likely]] {
         drmModePropertyBlobPtr blob = inFormats.immutableBlob();
 
         if (blob && blob->data && blob->length > 0) [[likely]] {
+            m_supportedFormats.reserve(256);
+
             __builtin_prefetch(blob->data, 0, 3);
+            if (blob->length > 64) {
+                __builtin_prefetch(static_cast<const char*>(blob->data) + 64, 0, 3);
+            }
+            if (blob->length > 128) {
+                __builtin_prefetch(static_cast<const char*>(blob->data) + 128, 0, 3);
+            }
+
             drmModeFormatModifierIterator iterator{};
             while (drmModeFormatModifierBlobIterNext(blob, &iterator)) {
                 m_supportedFormats[iterator.fmt].push_back(iterator.mod);
@@ -131,9 +138,13 @@ bool DrmPlane::updateProperties()
             qCWarning(KWIN_DRM) << "IN_FORMATS blob is empty for plane" << id();
         }
     } else {
+        const uint32_t formatCount = p->count_formats;
+        m_supportedFormats.reserve(static_cast<int>(formatCount * 2));
+
         const bool isCursor = (type.enumValue() == TypeIndex::Cursor);
         const uint64_t modifier = isCursor ? DRM_FORMAT_MOD_LINEAR : DRM_FORMAT_MOD_INVALID;
-        for (uint32_t i = 0; i < p->count_formats; i++) {
+
+        for (uint32_t i = 0; i < formatCount; i++) {
             m_supportedFormats[p->formats[i]] = {modifier};
         }
     }
@@ -147,6 +158,7 @@ bool DrmPlane::updateProperties()
 
     m_lowBandwidthFormats.clear();
     m_lowBandwidthFormats.reserve(m_supportedFormats.size());
+
     for (auto it = m_supportedFormats.constBegin(); it != m_supportedFormats.constEnd(); ++it) {
         const auto info = FormatInfo::get(it.key());
         if (info && info->bitsPerPixel <= 32) {
@@ -164,10 +176,12 @@ bool DrmPlane::updateProperties()
         constexpr size_t hintSize = sizeof(uint16_t) * 2;
 
         if (blob && blob->data && blob->length >= hintSize && (blob->length % hintSize) == 0) [[likely]] {
-            __builtin_prefetch(blob->data, 0, 1);
             const size_t hintCount = blob->length / hintSize;
             if (hintCount <= static_cast<size_t>(std::numeric_limits<int>::max())) {
                 m_sizeHints.reserve(static_cast<int>(hintCount));
+
+                __builtin_prefetch(blob->data, 0, 3);
+
                 auto hints = std::span(reinterpret_cast<const uint16_t *>(blob->data), hintCount * 2);
                 for (size_t i = 0; i < hintCount; i++) {
                     m_sizeHints.append(QSize(hints[i * 2], hints[i * 2 + 1]));
@@ -186,8 +200,16 @@ bool DrmPlane::updateProperties()
         drmModePropertyBlobPtr blob = inFormatsForTearing.immutableBlob();
         m_supportedTearingFormats.clear();
         m_supportedTearingFormats.reserve(256);
+
         if (blob && blob->data && blob->length > 0) [[likely]] {
             __builtin_prefetch(blob->data, 0, 3);
+            if (blob->length > 64) {
+                __builtin_prefetch(static_cast<const char*>(blob->data) + 64, 0, 3);
+            }
+            if (blob->length > 128) {
+                __builtin_prefetch(static_cast<const char*>(blob->data) + 128, 0, 3);
+            }
+
             drmModeFormatModifierIterator iterator{};
             while (drmModeFormatModifierBlobIterNext(blob, &iterator)) {
                 m_supportedTearingFormats[iterator.fmt].push_back(iterator.mod);
@@ -202,11 +224,30 @@ bool DrmPlane::updateProperties()
 
 void DrmPlane::set(DrmAtomicCommit *commit, const QRect &src, const QRect &dst)
 {
-    if (dst.width() <= 0 || dst.height() <= 0) [[unlikely]] {
+    const bool needsDisable = (dst.width() <= 0) | (dst.height() <= 0);
+
+    if (needsDisable) [[unlikely]] {
         disable(commit);
         return;
     }
 
+#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
+    alignas(16) const int32_t srcValues[4] = {src.x(), src.y(), src.width(), src.height()};
+
+    const __m128i vals = _mm_load_si128(reinterpret_cast<const __m128i*>(srcValues));
+    const __m128i minVals = _mm_setr_epi32(-32768, -32768, 0, 0);
+    const __m128i maxVals = _mm_set1_epi32(32767);
+
+    const __m128i clamped = _mm_max_epi32(_mm_min_epi32(vals, maxVals), minVals);
+
+    alignas(16) int32_t clampedValues[4];
+    _mm_store_si128(reinterpret_cast<__m128i*>(clampedValues), clamped);
+
+    const int clampedSrcX = clampedValues[0];
+    const int clampedSrcY = clampedValues[1];
+    const int clampedSrcW = clampedValues[2];
+    const int clampedSrcH = clampedValues[3];
+#else
     constexpr int maxCoord = 32767;
     constexpr int minCoord = -32768;
 
@@ -214,15 +255,21 @@ void DrmPlane::set(DrmAtomicCommit *commit, const QRect &src, const QRect &dst)
     const int clampedSrcY = std::clamp(src.y(), minCoord, maxCoord);
     const int clampedSrcW = std::clamp(src.width(), 0, maxCoord);
     const int clampedSrcH = std::clamp(src.height(), 0, maxCoord);
+#endif
 
-    const auto toFixed16 = [](int val) -> uint64_t {
+    constexpr auto toFixed16 = [](int val) constexpr -> uint64_t {
         return static_cast<uint64_t>(static_cast<uint32_t>(val)) << 16;
     };
 
-    commit->addProperty(srcX, toFixed16(clampedSrcX));
-    commit->addProperty(srcY, toFixed16(clampedSrcY));
-    commit->addProperty(srcW, toFixed16(clampedSrcW));
-    commit->addProperty(srcH, toFixed16(clampedSrcH));
+    const uint64_t fixedSrcX = toFixed16(clampedSrcX);
+    const uint64_t fixedSrcY = toFixed16(clampedSrcY);
+    const uint64_t fixedSrcW = toFixed16(clampedSrcW);
+    const uint64_t fixedSrcH = toFixed16(clampedSrcH);
+
+    commit->addProperty(srcX, fixedSrcX);
+    commit->addProperty(srcY, fixedSrcY);
+    commit->addProperty(srcW, fixedSrcW);
+    commit->addProperty(srcH, fixedSrcH);
 
     commit->addProperty(crtcX, dst.x());
     commit->addProperty(crtcY, dst.y());
@@ -269,28 +316,10 @@ void DrmPlane::setCurrentBuffer(const std::shared_ptr<DrmFramebuffer> &b)
 
     const auto newData = b->data();
 
-#if defined(KWIN_HAVE_SSE2)
-    alignas(16) intptr_t rawOld[4];
-    rawOld[0] = reinterpret_cast<intptr_t>(m_lastBuffers[0].get());
-    rawOld[1] = reinterpret_cast<intptr_t>(m_lastBuffers[1].get());
-    rawOld[2] = reinterpret_cast<intptr_t>(m_lastBuffers[2].get());
-    rawOld[3] = reinterpret_cast<intptr_t>(m_lastBuffers[3].get());
-
-    const intptr_t rawNew = reinterpret_cast<intptr_t>(newData.get());
-    const __m128i search = _mm_set1_epi64x(rawNew);
-    const __m128i buf01 = _mm_load_si128(reinterpret_cast<const __m128i *>(&rawOld[0]));
-    const __m128i buf23 = _mm_load_si128(reinterpret_cast<const __m128i *>(&rawOld[2]));
-    const __m128i cmp01 = _mm_cmpeq_epi64(search, buf01);
-    const __m128i cmp23 = _mm_cmpeq_epi64(search, buf23);
-    const __m128i cmpOr = _mm_or_si128(cmp01, cmp23);
-    const int mask = _mm_movemask_epi8(cmpOr);
-    const bool found = (mask != 0);
-#else
     const bool found = (m_lastBuffers[0] == newData) | (m_lastBuffers[1] == newData)
         | (m_lastBuffers[2] == newData) | (m_lastBuffers[3] == newData);
-#endif
 
-    if (!found) {
+    if (!found) [[unlikely]] {
         m_lastBuffers[m_lastBufferWriteIndex] = newData;
         m_lastBufferWriteIndex = (m_lastBufferWriteIndex + 1) & 3;
     }
