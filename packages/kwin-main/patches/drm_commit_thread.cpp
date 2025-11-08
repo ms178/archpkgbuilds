@@ -191,9 +191,7 @@ void DrmCommitThread::submit()
         qCWarning(KWIN_DRM) << "atomic commit failed:" << strerror(errno);
     }
 
-    m_mutex.unlock();
     QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::ConnectionType::QueuedConnection);
-    m_mutex.lock();
 }
 
 static std::unique_ptr<DrmAtomicCommit> mergeCommits(std::span<const std::unique_ptr<DrmAtomicCommit>> commits)
