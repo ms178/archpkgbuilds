@@ -238,8 +238,18 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPresentation(DrmAtomicCommit *commi
     }
 
     if (m_pending.crtc->vrrEnabled.isValid()) [[likely]] {
-        const bool shouldEnableVrr = (m_pending.presentationMode == PresentationMode::AdaptiveSync) |
-                                     (m_pending.presentationMode == PresentationMode::AdaptiveAsync);
+        bool shouldEnableVrr = (m_pending.presentationMode == PresentationMode::AdaptiveSync) ||
+                             (m_pending.presentationMode == PresentationMode::AdaptiveAsync);
+
+        // FIX: If a modeset is pending, we are changing the fundamental parameters of the
+        // output. The current presentationMode might be stale and incompatible with the new
+        // mode (e.g., switching from 165Hz VRR to 60Hz non-VRR). Forcing VRR off during the
+        // modeset commit ensures a safe, baseline state is used. The RenderLoop will
+        // re-evaluate and enable VRR on a subsequent frame if the new mode supports it.
+        if (m_pending.needsModeset) {
+            shouldEnableVrr = false;
+        }
+
         commit->setVrr(m_pending.crtc, shouldEnableVrr);
     }
 
