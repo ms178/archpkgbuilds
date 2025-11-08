@@ -1,7 +1,5 @@
 /*
-    SPDX-FileCopyrightText: 2020 Vlad Zahorodnii <vlad.zahorodnii@kde.org>
-
-    SPDX-License-Identifier: GPL-2.0-or-later
+    SPDX-License-Identifier: LGPL-2.1-or-later OR LGPL-3.0-or-later OR LicenseRef-KDE-Accepted-LGPL
 */
 
 #pragma once
@@ -9,6 +7,7 @@
 #include "effect/globals.h"
 
 #include <QObject>
+#include <chrono>
 
 namespace KWin
 {
@@ -32,18 +31,18 @@ public:
     void prepareNewFrame();
     void newFramePrepared();
 
-    int refreshRate() const;
+    [[nodiscard]] int refreshRate() const;
     void setRefreshRate(int refreshRate);
     void setPresentationSafetyMargin(std::chrono::nanoseconds safetyMargin);
     void scheduleRepaint(Item *item = nullptr, OutputLayer *outputLayer = nullptr);
 
-    std::chrono::nanoseconds lastPresentationTimestamp() const;
-    std::chrono::nanoseconds nextPresentationTimestamp() const;
+    [[nodiscard]] std::chrono::nanoseconds lastPresentationTimestamp() const;
+    [[nodiscard]] std::chrono::nanoseconds nextPresentationTimestamp() const;
 
     void setPresentationMode(PresentationMode mode);
     void setMaxPendingFrameCount(uint32_t maxCount);
-    std::chrono::nanoseconds predictedRenderTime() const;
-    bool activeWindowControlsVrrRefreshRate() const;
+    [[nodiscard]] std::chrono::nanoseconds predictedRenderTime() const;
+    [[nodiscard]] bool activeWindowControlsVrrRefreshRate() const;
 
     void timerEvent(QTimerEvent *event) override;
 

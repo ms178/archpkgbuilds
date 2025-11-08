@@ -351,53 +351,77 @@ void SurfaceInterfacePrivate::surface_commit(Resource *resource)
         pending->bufferDamage = QRegion();
     }
 
-    // OPTIMIZATION: Only process YUV format defaults when buffer actually changes
-    if (pending->committed & SurfaceState::Field::Buffer) {
-        const bool hasColorManagementProtocol = colorSurface || frogColorManagement;
-        const bool hasColorRepresentation = colorRepresentation != nullptr;
+    const bool hasColorManagementProtocol = colorSurface || frogColorManagement;
+    const bool hasColorRepresentation = colorRepresentation != nullptr;
 
-        if (pending->buffer && pending->buffer->dmabufAttributes()) {
-            switch (pending->buffer->dmabufAttributes()->format) {
+    if (pending->buffer) [[likely]] {
+        const auto attrs = pending->buffer->dmabufAttributes();
+
+        if (attrs) [[likely]] {
+            std::shared_ptr<ColorDescription> targetColorDesc;
+            YUVMatrixCoefficients targetCoefficients;
+            EncodingRange targetRange;
+
+            switch (attrs->format) {
             case DRM_FORMAT_NV12:
-                if (!hasColorRepresentation) {
-                    pending->yuvCoefficients = YUVMatrixCoefficients::BT709;
-                    pending->range = EncodingRange::Limited;
-                    pending->committed |= SurfaceState::Field::YuvCoefficients;
-                }
-                if (!hasColorManagementProtocol) {
-                    pending->colorDescription = ColorDescription::sRGB;
-                    pending->committed |= SurfaceState::Field::ColorDescription;
-                }
+            case DRM_FORMAT_NV21:
+                targetCoefficients = YUVMatrixCoefficients::BT709;
+                targetRange = EncodingRange::Limited;
+                targetColorDesc = ColorDescription::sRGB;
                 break;
             case DRM_FORMAT_P010:
-                if (!hasColorRepresentation) {
-                    pending->yuvCoefficients = YUVMatrixCoefficients::BT2020;
-                    pending->range = EncodingRange::Limited;
-                    pending->committed |= SurfaceState::Field::YuvCoefficients;
-                }
-                if (!hasColorManagementProtocol) {
-                    pending->colorDescription = ColorDescription::BT2020PQ;
-                    pending->committed |= SurfaceState::Field::ColorDescription;
-                }
+            case DRM_FORMAT_P012:
+            case DRM_FORMAT_P016:
+                targetCoefficients = YUVMatrixCoefficients::BT2020;
+                targetRange = EncodingRange::Limited;
+                targetColorDesc = ColorDescription::BT2020PQ;
                 break;
             default:
-                if (!hasColorRepresentation) {
-                    pending->yuvCoefficients = YUVMatrixCoefficients::Identity;
-                    pending->range = EncodingRange::Full;
+                targetCoefficients = YUVMatrixCoefficients::Identity;
+                targetRange = EncodingRange::Full;
+                targetColorDesc = ColorDescription::sRGB;
+                break;
+            }
+
+            if (!hasColorRepresentation) {
+                if (pending->yuvCoefficients != targetCoefficients || pending->range != targetRange) {
+                    pending->yuvCoefficients = targetCoefficients;
+                    pending->range = targetRange;
                     pending->committed |= SurfaceState::Field::YuvCoefficients;
                 }
-                if (!hasColorManagementProtocol) {
-                    pending->colorDescription = ColorDescription::sRGB;
+            }
+
+            if (!hasColorManagementProtocol && targetColorDesc) {
+                if (pending->colorDescription != targetColorDesc) {
+                    pending->colorDescription = targetColorDesc;
                     pending->committed |= SurfaceState::Field::ColorDescription;
                 }
             }
         } else {
             if (!hasColorRepresentation) {
+                if (pending->yuvCoefficients != YUVMatrixCoefficients::Identity || pending->range != EncodingRange::Full) {
+                    pending->yuvCoefficients = YUVMatrixCoefficients::Identity;
+                    pending->range = EncodingRange::Full;
+                    pending->committed |= SurfaceState::Field::YuvCoefficients;
+                }
+            }
+            if (!hasColorManagementProtocol) {
+                if (pending->colorDescription != ColorDescription::sRGB) {
+                    pending->colorDescription = ColorDescription::sRGB;
+                    pending->committed |= SurfaceState::Field::ColorDescription;
+                }
+            }
+        }
+    } else {
+        if (!hasColorRepresentation) {
+            if (pending->yuvCoefficients != YUVMatrixCoefficients::Identity || pending->range != EncodingRange::Full) {
                 pending->yuvCoefficients = YUVMatrixCoefficients::Identity;
                 pending->range = EncodingRange::Full;
                 pending->committed |= SurfaceState::Field::YuvCoefficients;
             }
-            if (!hasColorManagementProtocol) {
+        }
+        if (!hasColorManagementProtocol) {
+            if (pending->colorDescription != ColorDescription::sRGB) {
                 pending->colorDescription = ColorDescription::sRGB;
                 pending->committed |= SurfaceState::Field::ColorDescription;
             }
@@ -876,7 +900,6 @@ QRegion SurfaceInterfacePrivate::mapToBuffer(const QRegion &region) const
         return QRegion();
     }
 
-    // BUGFIX: Prevent division by zero
     if (surfaceSize.width() <= 0 || surfaceSize.height() <= 0) [[unlikely]] {
         return QRegion();
     }
@@ -884,11 +907,13 @@ QRegion SurfaceInterfacePrivate::mapToBuffer(const QRegion &region) const
     const QRectF sourceBox = current->bufferTransform.inverted().map(bufferSourceBox, current->buffer->size());
     const qreal xScale = sourceBox.width() / surfaceSize.width();
     const qreal yScale = sourceBox.height() / surfaceSize.height();
+    const QPointF offset = bufferSourceBox.topLeft();
+    const QSizeF transformSize = sourceBox.size();
 
     QRegion result;
-    // CRITICAL FIX: Use const reference instead of copy
-    for (const QRectF &rect : region) {
-        result += current->bufferTransform.map(QRectF(rect.x() * xScale, rect.y() * yScale, rect.width() * xScale, rect.height() * yScale), sourceBox.size()).translated(bufferSourceBox.topLeft()).toAlignedRect();
+    for (const QRect &rect : region) {
+        const QRectF scaled(rect.x() * xScale, rect.y() * yScale, rect.width() * xScale, rect.height() * yScale);
+        result += current->bufferTransform.map(scaled, transformSize).translated(offset).toAlignedRect();
     }
     return result;
 }

@@ -426,7 +426,6 @@ static bool prepareDirectScanout(RenderView *view, Output *output, const std::sh
     const bool ret = layer->importScanoutBuffer(candidate->buffer(), frame);
     if (ret) {
         candidate->resetDamage();
-        // ensure the pixmap is updated when direct scanout ends
         candidate->destroyPixmap();
     }
     return ret;
@@ -440,13 +439,16 @@ static bool prepareRendering(RenderView *view, Output *output, uint32_t required
     const auto layer = view->layer();
     const auto outputLocalRect = view->viewport().translated(-output->geometryF().topLeft());
     const auto nativeRect = output->transform().map(scaledRect(outputLocalRect, output->scale()), output->pixelSize()).toRect();
+    const double reference = output->colorDescription()->referenceLuminance();
+    const double maxOutputLuminance = output->colorDescription()->maxHdrLuminance().value_or(reference);
+    const double usedMaxLuminance = std::min(view->desiredHdrHeadroom() * reference, maxOutputLuminance);
     layer->setSourceRect(QRect(QPoint(0, 0), nativeRect.size()));
     layer->setTargetRect(nativeRect);
     layer->setHotspot(output->transform().map(view->hotspot() * output->scale(), nativeRect.size()));
     layer->setEnabled(true);
     layer->setOffloadTransform(OutputTransform::Normal);
     layer->setBufferTransform(output->transform());
-    layer->setColor(output->layerBlendingColor(), RenderingIntent::AbsoluteColorimetricNoAdaptation, ColorPipeline{});
+    layer->setColor(output->layerBlendingColor()->withHdrMetadata(reference, usedMaxLuminance), RenderingIntent::AbsoluteColorimetricNoAdaptation, ColorPipeline{});
     layer->setRequiredAlphaBits(requiredAlphaBits);
     return layer->preparePresentationTest();
 }

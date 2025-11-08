@@ -37,12 +37,12 @@ public:
 
     void setModeInfo(uint32_t maximum, std::chrono::nanoseconds vblankTime);
     void pageFlipped(std::chrono::nanoseconds timestamp);
-    bool pageflipsPending();
-    std::chrono::nanoseconds safetyMargin() const;
+    [[nodiscard]] bool pageflipsPending();
+    [[nodiscard]] std::chrono::nanoseconds safetyMargin() const;
 
 private:
     void clearDroppedCommits();
-    TimePoint estimateNextVblank(TimePoint now) const;
+    [[nodiscard]] TimePoint estimateNextVblank(TimePoint now) const;
     void optimizeCommits(TimePoint pageflipTarget);
     void submit();
     void handlePing();
@@ -76,4 +76,4 @@ private:
     std::condition_variable m_pong;
 };
 
-}
+} // namespace KWin

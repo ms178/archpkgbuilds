@@ -12,12 +12,14 @@
 #include "core/output.h"
 #include "drm_object.h"
 
-#include <QMap>
+#include <QHash>
+#include <QList>
 #include <QPoint>
 #include <QSize>
+
 #include <array>
+#include <cstdint>
 #include <memory>
-#include <qobjectdefs.h>
 
 namespace KWin
 {
@@ -25,11 +27,14 @@ namespace KWin
 class DrmFramebuffer;
 class DrmFramebufferData;
 class DrmCrtc;
+class DrmAtomicCommit;
 
 class DrmPlane : public DrmObject
 {
     Q_GADGET
 public:
+    static constexpr std::size_t BufferHistoryDepth = 4;
+
     DrmPlane(DrmGpu *gpu, uint32_t planeId);
 
     bool init();
@@ -37,25 +42,26 @@ public:
     bool updateProperties() override;
     void disable(DrmAtomicCommit *commit) override;
 
-    bool isCrtcSupported(int pipeIndex) const;
-    const QHash<uint32_t, QList<uint64_t>> &lowBandwidthFormats() const;
-    const QHash<uint32_t, QList<uint64_t>> &formats() const;
-    const QHash<uint32_t, QList<uint64_t>> &tearingFormats() const;
-    bool supportsTransformation(OutputTransform transform) const;
+    [[nodiscard]] bool isCrtcSupported(int pipeIndex) const noexcept;
+    [[nodiscard]] const QHash<uint32_t, QList<uint64_t>> &lowBandwidthFormats() const noexcept;
+    [[nodiscard]] const QHash<uint32_t, QList<uint64_t>> &formats() const noexcept;
+    [[nodiscard]] const QHash<uint32_t, QList<uint64_t>> &tearingFormats() const noexcept;
+    [[nodiscard]] bool supportsTransformation(OutputTransform transform) const noexcept;
 
-    std::shared_ptr<DrmFramebuffer> currentBuffer() const;
-    void setCurrentBuffer(const std::shared_ptr<DrmFramebuffer> &b);
+    [[nodiscard]] std::shared_ptr<DrmFramebuffer> currentBuffer() const noexcept;
+    void setCurrentBuffer(const std::shared_ptr<DrmFramebuffer> &buffer);
     void releaseCurrentBuffer();
 
     void set(DrmAtomicCommit *commit, const QRect &src, const QRect &dst);
 
-    const QList<QSize> &recommendedSizes() const;
+    [[nodiscard]] const QList<QSize> &recommendedSizes() const noexcept;
 
     enum class TypeIndex : uint64_t {
         Overlay = 0,
         Primary = 1,
         Cursor = 2
     };
+
     enum class Transformation : uint32_t {
         Rotate0 = 1 << 0,
         Rotate90 = 1 << 1,
@@ -66,7 +72,9 @@ public:
     };
     Q_ENUM(Transformation)
     Q_DECLARE_FLAGS(Transformations, Transformation)
+
     static Transformations outputTransformToPlaneTransform(OutputTransform transform);
+
     enum class PixelBlendMode : uint64_t {
         None,
         PreMultiplied,
@@ -107,9 +115,13 @@ public:
     DrmProperty zpos;
 
 private:
+    void refreshSupportedFormats(drmModePropertyBlobPtr blob);
+    void refreshSupportedTearingFormats(drmModePropertyBlobPtr blob);
+    void refreshSizeHints(drmModePropertyBlobPtr blob);
+
     std::shared_ptr<DrmFramebuffer> m_current;
-    std::array<std::shared_ptr<DrmFramebufferData>, 4> m_lastBuffers;
-    size_t m_lastBufferWriteIndex = 0;
+    std::array<std::shared_ptr<DrmFramebufferData>, BufferHistoryDepth> m_lastBuffers{};
+    std::size_t m_lastBufferWriteIndex = 0;
 
     QHash<uint32_t, QList<uint64_t>> m_supportedFormats;
     QHash<uint32_t, QList<uint64_t>> m_lowBandwidthFormats;
@@ -118,6 +130,6 @@ private:
     QList<QSize> m_sizeHints;
 };
 
-}
+} // namespace KWin
 
 Q_DECLARE_OPERATORS_FOR_FLAGS(KWin::DrmPlane::Transformations)

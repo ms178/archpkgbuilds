@@ -25,7 +25,6 @@ SurfaceItemWayland::SurfaceItemWayland(SurfaceInterface *surface, Item *parent)
     : SurfaceItem(parent)
     , m_surface(surface)
 {
-    // Signal/slot connections (cold path, called once per surface)
     connect(surface, &SurfaceInterface::sizeChanged,
             this, &SurfaceItemWayland::handleSurfaceSizeChanged);
     connect(surface, &SurfaceInterface::bufferChanged,
@@ -65,7 +64,6 @@ SurfaceItemWayland::SurfaceItemWayland(SurfaceInterface *surface, Item *parent)
         setPosition(subsurface->position());
     }
 
-    // Initialize state from surface (called once, not performance-critical)
     handleChildSubSurfacesChanged();
     setDestinationSize(surface->size());
     setBufferTransform(surface->bufferTransform());
@@ -77,10 +75,7 @@ SurfaceItemWayland::SurfaceItemWayland(SurfaceInterface *surface, Item *parent)
     setPresentationHint(surface->presentationModeHint());
     setOpacity(surface->alphaMultiplier());
 
-    // FIFO fallback timer setup
-    // Default interval (20 Hz = 50ms) will be dynamically adjusted based on
-    // actual output refresh rate in handleFramePainted()
-    m_fifoFallbackTimer.setInterval(50);
+    m_fifoFallbackTimer.setInterval(m_cachedFifoFallbackMs);
     m_fifoFallbackTimer.setSingleShot(true);
     connect(&m_fifoFallbackTimer, &QTimer::timeout, this, &SurfaceItemWayland::handleFifoFallback);
 }
@@ -125,26 +120,30 @@ void SurfaceItemWayland::handleBufferTransformChanged()
 
 void SurfaceItemWayland::handleSurfaceCommitted()
 {
-    if (m_surface->hasFifoBarrier()) {
-        m_fifoFallbackTimer.start();
+    const bool hasBarrier = m_surface->hasFifoBarrier();
+
+    if (hasBarrier) [[unlikely]] {
+        m_lastCommitTime = std::chrono::steady_clock::now();
+        m_fifoFallbackTimer.start(m_cachedFifoFallbackMs);
     }
-    if (m_surface->hasFrameCallbacks() || m_surface->hasFifoBarrier() || m_surface->hasPresentationFeedback()) {
+
+    if (m_surface->hasFrameCallbacks() || hasBarrier || m_surface->hasPresentationFeedback()) [[likely]] {
         scheduleFrame();
     }
 }
 
 SurfaceItemWayland *SurfaceItemWayland::getOrCreateSubSurfaceItem(SubSurfaceInterface *child)
 {
-    auto &item = m_subsurfaces[child];
-    if (!item) [[unlikely]] {  // Branch hint: subsurfaces usually already exist after first commit
-        item = std::make_unique<SurfaceItemWayland>(child->surface(), this);
+    SurfaceItemWayland *&item = m_subsurfaces[child];
+    if (!item) [[unlikely]] {
+        item = new SurfaceItemWayland(child->surface(), this);
     }
-    return item.get();
+    return item;
 }
 
 void SurfaceItemWayland::handleChildSubSurfaceRemoved(SubSurfaceInterface *child)
 {
-    m_subsurfaces.erase(child);
+    delete m_subsurfaces.take(child);
 }
 
 void SurfaceItemWayland::handleChildSubSurfacesChanged()
@@ -152,16 +151,12 @@ void SurfaceItemWayland::handleChildSubSurfacesChanged()
     const auto &below = m_surface->below();
     const auto &above = m_surface->above();
 
-    // Z-order assignment for below subsurfaces (negative Z values)
-    // Example: 3 below items → Z values: -3, -2, -1
     const int belowCount = below.count();
     for (int i = 0; i < belowCount; ++i) {
         SurfaceItemWayland *subsurfaceItem = getOrCreateSubSurfaceItem(below[i]);
         subsurfaceItem->setZ(i - belowCount);
     }
 
-    // Z-order assignment for above subsurfaces (non-negative Z values)
-    // Example: 2 above items → Z values: 0, 1
     const int aboveCount = above.count();
     for (int i = 0; i < aboveCount; ++i) {
         SurfaceItemWayland *subsurfaceItem = getOrCreateSubSurfaceItem(above[i]);
@@ -181,7 +176,20 @@ void SurfaceItemWayland::handleSurfaceMappedChanged()
 
 ContentType SurfaceItemWayland::contentType() const
 {
-    return m_surface ? m_surface->contentType() : ContentType::None;
+    if (!m_surface) [[unlikely]] {
+        return ContentType::None;
+    }
+
+    const auto surfaceContentType = m_surface->contentType();
+    if (surfaceContentType != ContentType::None) [[unlikely]] {
+        return surfaceContentType;
+    }
+
+    if (m_consecutiveStableFrames >= 5 && m_estimatedContentRate >= 24 && m_estimatedContentRate <= 120) [[unlikely]] {
+        return ContentType::Video;
+    }
+
+    return ContentType::None;
 }
 
 void SurfaceItemWayland::setScanoutHint(DrmDevice *device, const QHash<uint32_t, QList<uint64_t>> &drmFormats)
@@ -191,7 +199,6 @@ void SurfaceItemWayland::setScanoutHint(DrmDevice *device, const QHash<uint32_t,
     }
 
     if (!device && m_scanoutFeedback.has_value()) {
-        // Device removed: clear scanout feedback
         m_surface->dmabufFeedbackV1()->setTranches({});
         m_scanoutFeedback.reset();
         return;
@@ -219,10 +226,8 @@ void SurfaceItemWayland::freeze()
         subsurface->disconnect(this);
     }
 
-    // Recursively freeze all subsurfaces (structured binding for clarity)
-    for (auto &[subsurface, subsurfaceItem] : m_subsurfaces) {
-        subsurfaceItem->freeze();
-    }
+    qDeleteAll(m_subsurfaces);
+    m_subsurfaces.clear();
 
     m_surface = nullptr;
 }
@@ -260,51 +265,78 @@ void SurfaceItemWayland::handleFramePainted(Output *output, OutputFrame *frame, 
     m_surface->frameRendered(timestamp.count());
 
     if (frame) [[likely]] {
-
         if (auto feedback = m_surface->presentationFeedback(output)) {
             frame->addFeedback(std::move(feedback));
         }
     }
 
-    m_surface->clearFifoBarrier();
+    const bool hadBarrier = m_surface->hasFifoBarrier();
+    if (hadBarrier) [[unlikely]] {
+        m_surface->clearFifoBarrier();
+        m_fifoFallbackTimer.stop();
+    }
 
-    if (m_fifoFallbackTimer.isActive() && output) [[likely]] {
+    if (!output) [[unlikely]] {
+        return;
+    }
 
-        const int currentRefreshRate = output->refreshRate(); // mHz (e.g., 60000 = 60.000 Hz)
+    const auto now = std::chrono::steady_clock::now();
+    m_lastPaintTime = now;
 
-        if (currentRefreshRate != m_lastRefreshRate) [[unlikely]] {
-            m_lastRefreshRate = currentRefreshRate;
+    const int currentRefreshRate = output->refreshRate();
 
-            if (currentRefreshRate > 0) [[likely]] {
-                // Calculate fallback duration: max(1.25× refresh, 30 Hz minimum)
-                // Use uint64_t to prevent overflow (max KWin refreshRate: ~1000000 mHz = 1000 Hz)
-                // 1 second = 1,000,000,000 ns; KWin uses mHz (1 Hz = 1000 mHz)
-                const uint64_t refreshNs = 1'000'000'000'000ULL / static_cast<uint64_t>(currentRefreshRate);
+    if (hadBarrier && m_lastCommitTime.time_since_epoch().count() > 0) [[unlikely]] {
+        const auto intervalNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_lastCommitTime).count();
 
-                // Fallback: 1.25× refresh interval (allows some slack for frame time variance)
-                // but never slower than 30 Hz (33,333,333 ns) to avoid unplayable framerates
-                const uint64_t fallbackMinNs = 33'333'333ULL;  // 30 Hz floor
-                const uint64_t fallbackNs = std::max((refreshNs * 5) / 4, fallbackMinNs);
+        if (intervalNs > 8'000'000 && intervalNs < 100'000'000) [[likely]] {
+            const int instantRate = static_cast<int>(1'000'000'000 / intervalNs);
 
-                // Convert to milliseconds (ceiling division to avoid premature timeout)
-                m_cachedFifoFallbackMs = static_cast<int>((fallbackNs + 999'999) / 1'000'000);
+            if (instantRate >= 24 && instantRate <= currentRefreshRate) [[likely]] {
+                if (m_estimatedContentRate == 0) [[unlikely]] {
+                    m_estimatedContentRate = instantRate;
+                    m_consecutiveStableFrames = 1;
+                } else {
+                    const int diff = std::abs(instantRate - m_estimatedContentRate);
+                    if (diff <= 2) [[likely]] {
+                        m_consecutiveStableFrames = std::min<uint16_t>(m_consecutiveStableFrames + 1, 100);
+                        m_estimatedContentRate = (m_estimatedContentRate * 5 + instantRate * 3) / 8;
+                    } else {
+                        m_consecutiveStableFrames = 0;
+                        m_estimatedContentRate = 0;
+                    }
+                }
             } else {
-                // Defensive: Invalid refresh rate (0 or negative)
-                // Fallback to 20 Hz (50ms) to ensure timer eventually fires
-                m_cachedFifoFallbackMs = 50;
+                m_consecutiveStableFrames = 0;
+                m_estimatedContentRate = 0;
             }
         }
+    }
 
-        // Fast path: Use cached value (hit 99.9% of the time)
-        // QTimer::start() with same interval is internally optimized (no-op if already scheduled)
-        m_fifoFallbackTimer.start(m_cachedFifoFallbackMs);
+    int effectiveRate = currentRefreshRate;
+    if (m_consecutiveStableFrames >= 3 && m_estimatedContentRate >= 30 && m_estimatedContentRate < currentRefreshRate - 5) [[unlikely]] {
+        effectiveRate = m_estimatedContentRate;
+    }
+
+    if (effectiveRate != m_lastRefreshRate || m_lastRefreshRate == 0) [[unlikely]] {
+        m_lastRefreshRate = effectiveRate;
+
+        const uint64_t refreshNs = 1'000'000'000'000ULL / static_cast<uint64_t>(effectiveRate);
+        constexpr uint64_t fallbackMinNs = 16'666'667ULL;
+        const uint64_t safetyMarginNs = std::max((refreshNs * 11) / 10, fallbackMinNs);
+        m_cachedFifoFallbackMs = static_cast<int>((safetyMarginNs + 999'999) / 1'000'000);
+
+        if (m_fifoFallbackTimer.isActive()) {
+            m_fifoFallbackTimer.setInterval(m_cachedFifoFallbackMs);
+        }
     }
 }
 
 void SurfaceItemWayland::handleFifoFallback()
 {
-    if (m_surface) [[likely]] {
+    if (m_surface && m_surface->hasFifoBarrier()) [[likely]] {
         m_surface->clearFifoBarrier();
+        m_consecutiveStableFrames = 0;
+        m_estimatedContentRate = 0;
     }
 }
 
@@ -323,18 +355,28 @@ void SurfaceItemXwayland::handleShapeChange()
     }
 
     const auto newShape = m_window->shapeRegion();
+    if (newShape.isEmpty()) [[unlikely]] {
+        if (m_previousBufferShape.isEmpty()) {
+            return;
+        }
+        scheduleRepaint(m_previousBufferShape);
+        m_previousBufferShape = QRegion();
+        discardQuads();
+        return;
+    }
+
     QRegion newBufferShape;
-    for (const auto &rect : newShape) {
+    for (const QRectF &rect : newShape) {
         newBufferShape |= rect.toAlignedRect();
     }
 
-    scheduleRepaint(newBufferShape.xored(m_previousBufferShape));
+    const QRegion damage = newBufferShape.xored(m_previousBufferShape);
+    if (!damage.isEmpty()) [[likely]] {
+        scheduleRepaint(damage);
+        discardQuads();
+    }
 
-    // Update cached shape for next delta computation
     m_previousBufferShape = newBufferShape;
-
-    // Discard cached quads (shape changed, so tessellation is invalid)
-    discardQuads();
 }
 
 QList<QRectF> SurfaceItemXwayland::shape() const
@@ -372,6 +414,6 @@ QRegion SurfaceItemXwayland::opaque() const
 }
 #endif
 
-} // namespace KWin
+}
 
 #include "moc_surfaceitem_wayland.cpp"

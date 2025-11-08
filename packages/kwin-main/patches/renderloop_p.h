@@ -1,4 +1,7 @@
 /*
+    KWin - the KDE window manager
+    This file is part of the KDE project.
+
     SPDX-FileCopyrightText: 2020 Vlad Zahorodnii <vlad.zahorodnii@kde.org>
 
     SPDX-License-Identifier: GPL-2.0-or-later
@@ -77,15 +80,15 @@ public:
     RenderJournal renderJournal;
     std::optional<std::fstream> m_debugOutput;
 
-    static RenderLoopPrivate *get(RenderLoop *loop);
+    [[nodiscard]] static RenderLoopPrivate *get(RenderLoop *loop) noexcept;
     explicit RenderLoopPrivate(RenderLoop *q, Output *output);
 
-    void updateReciprocal();
+    void updateReciprocal() noexcept;
     void initializeVrrCapabilities();
     void updateVrrContext();
-    PresentationMode selectPresentationModeFromContext() const;
+    [[nodiscard]] PresentationMode selectPresentationModeFromContext() const noexcept;
     void dispatch();
-    void delayScheduleRepaint();
+    void delayScheduleRepaint() noexcept;
     void scheduleNextRepaint();
     void scheduleRepaint(std::chrono::nanoseconds lastTargetTimestamp);
     void notifyFrameDropped();
@@ -95,4 +98,4 @@ public:
 
 static_assert(sizeof(RenderLoopPrivate::VrrContext) == 64, "VrrContext must be exactly one cache line");
 
-}
+} // namespace KWin
