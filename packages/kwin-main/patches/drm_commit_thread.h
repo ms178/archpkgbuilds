@@ -13,7 +13,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <vector>
-#include <chrono>
+#include <cstdint>
 
 namespace KWin
 {
@@ -25,12 +25,12 @@ class DrmLegacyCommit;
 
 using TimePoint = std::chrono::steady_clock::time_point;
 
-class DrmCommitThread final : public QObject
+class DrmCommitThread : public QObject
 {
     Q_OBJECT
 public:
     explicit DrmCommitThread(DrmGpu *gpu, const QString &name);
-    ~DrmCommitThread() override;
+    ~DrmCommitThread();
 
     void addCommit(std::unique_ptr<DrmAtomicCommit> &&commit);
     void setPendingCommit(std::unique_ptr<DrmLegacyCommit> &&commit);
@@ -46,14 +46,10 @@ private:
     void optimizeCommits(TimePoint pageflipTarget);
     void submit();
     void handlePing();
-    void handleTimeout(std::unique_lock<std::mutex>& lock);
 
     DrmGpu *const m_gpu;
-
     std::unique_ptr<DrmCommit> m_committed;
     std::vector<std::unique_ptr<DrmAtomicCommit>> m_commits;
-    std::vector<std::unique_ptr<DrmAtomicCommit>> m_commitsToDelete;
-
     std::unique_ptr<QThread> m_thread;
 
     TimePoint m_lastPageflip;
@@ -65,7 +61,10 @@ private:
     std::chrono::nanoseconds m_baseSafetyMargin{0};
     std::chrono::nanoseconds m_additionalSafetyMargin{std::chrono::milliseconds(1)};
 
-    double m_vblankIntervalInv = 0.0;
+    uint64_t m_vblankReciprocal = 0;
+    uint8_t m_vblankReciprocalShift = 0;
+
+    std::vector<std::unique_ptr<DrmAtomicCommit>> m_commitsToDelete;
 
     bool m_vrr = false;
     bool m_tearing = false;
@@ -74,7 +73,7 @@ private:
 
     alignas(64) mutable std::mutex m_mutex;
     alignas(64) std::condition_variable m_commitPending;
-    alignas(64) std::condition_variable m_pong;
+    std::condition_variable m_pong;
 };
 
 }

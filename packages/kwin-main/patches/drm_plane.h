@@ -38,11 +38,9 @@ public:
     void disable(DrmAtomicCommit *commit) override;
 
     bool isCrtcSupported(int pipeIndex) const;
-
     const QHash<uint32_t, QList<uint64_t>> &lowBandwidthFormats() const;
     const QHash<uint32_t, QList<uint64_t>> &formats() const;
     const QHash<uint32_t, QList<uint64_t>> &tearingFormats() const;
-
     bool supportsTransformation(OutputTransform transform) const;
 
     std::shared_ptr<DrmFramebuffer> currentBuffer() const;
@@ -69,7 +67,6 @@ public:
     Q_ENUM(Transformation)
     Q_DECLARE_FLAGS(Transformations, Transformation)
     static Transformations outputTransformToPlaneTransform(OutputTransform transform);
-
     enum class PixelBlendMode : uint64_t {
         None,
         PreMultiplied,
@@ -111,7 +108,6 @@ public:
 
 private:
     std::shared_ptr<DrmFramebuffer> m_current;
-
     std::array<std::shared_ptr<DrmFramebufferData>, 4> m_lastBuffers;
     size_t m_lastBufferWriteIndex = 0;
 

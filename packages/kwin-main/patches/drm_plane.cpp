@@ -4,7 +4,6 @@
 
     SPDX-FileCopyrightText: 2016 Roman Gilg <subdiff@gmail.com>
     SPDX-FileCopyrightText: 2022 Xaver Hugl <xaver.hugl@gmail.com>
-    SPDX-FileCopyrightText: 2025 Senior AMD Performance Engineer et al.
 
     SPDX-License-Identifier: GPL-2.0-or-later
 */
