@@ -116,7 +116,7 @@ bool DrmPlane::updateProperties()
     m_supportedTearingFormats.clear();
     m_sizeHints.clear();
 
-    if (inFormats.isValid() && gpu()->addFB2ModifiersSupported()) {
+    if (inFormats.isValid() && gpu()->addFB2ModifiersSupported()) [[likely]] {
         refreshSupportedFormats(inFormats.immutableBlob());
     } else {
         const uint32_t formatCount = plane->count_formats;
@@ -139,7 +139,7 @@ bool DrmPlane::updateProperties()
     m_lowBandwidthFormats.reserve(m_supportedFormats.size());
     for (auto it = m_supportedFormats.cbegin(); it != m_supportedFormats.cend(); ++it) {
         const auto formatInfo = FormatInfo::get(it.key());
-        if (formatInfo && formatInfo->bitsPerPixel <= 32) {
+        if (formatInfo && formatInfo->bitsPerPixel <= 32) [[likely]] {
             QList<uint64_t> modifiers = it.value();
             if (!modifiers.contains(DRM_FORMAT_MOD_INVALID)) {
                 modifiers.append(DRM_FORMAT_MOD_INVALID);
@@ -151,19 +151,19 @@ bool DrmPlane::updateProperties()
         }
     }
 
-    if (sizeHints.isValid()) {
+    if (sizeHints.isValid()) [[unlikely]] {
         refreshSizeHints(sizeHints.immutableBlob());
     }
 
-    if (m_sizeHints.isEmpty() && type.enumValue() == TypeIndex::Cursor) {
+    if (m_sizeHints.isEmpty() && type.enumValue() == TypeIndex::Cursor) [[likely]] {
         m_sizeHints.append(gpu()->cursorSize());
     }
 
-    if (inFormatsForTearing.isValid() && gpu()->addFB2ModifiersSupported()) {
+    if (inFormatsForTearing.isValid() && gpu()->addFB2ModifiersSupported()) [[unlikely]] {
         refreshSupportedTearingFormats(inFormatsForTearing.immutableBlob());
     }
 
-    if (m_supportedTearingFormats.isEmpty()) {
+    if (m_supportedTearingFormats.isEmpty()) [[likely]] {
         m_supportedTearingFormats = m_supportedFormats;
     }
 
@@ -172,7 +172,7 @@ bool DrmPlane::updateProperties()
 
 void DrmPlane::refreshSupportedFormats(drmModePropertyBlobPtr blob)
 {
-    if (!blob || !blob->data || blob->length == 0) {
+    if (!blob || !blob->data || blob->length == 0) [[unlikely]] {
         qCWarning(KWIN_DRM) << "IN_FORMATS blob missing for plane" << id();
         return;
     }
@@ -181,7 +181,7 @@ void DrmPlane::refreshSupportedFormats(drmModePropertyBlobPtr blob)
     drmModeFormatModifierIterator iterator{};
     while (drmModeFormatModifierBlobIterNext(blob, &iterator)) {
         auto &mods = m_supportedFormats[iterator.fmt];
-        if (!mods.contains(iterator.mod)) {
+        if (!mods.contains(iterator.mod)) [[likely]] {
             mods.append(iterator.mod);
         }
     }
@@ -189,7 +189,7 @@ void DrmPlane::refreshSupportedFormats(drmModePropertyBlobPtr blob)
 
 void DrmPlane::refreshSupportedTearingFormats(drmModePropertyBlobPtr blob)
 {
-    if (!blob || !blob->data || blob->length == 0) {
+    if (!blob || !blob->data || blob->length == 0) [[unlikely]] {
         return;
     }
 
@@ -197,7 +197,7 @@ void DrmPlane::refreshSupportedTearingFormats(drmModePropertyBlobPtr blob)
     drmModeFormatModifierIterator iterator{};
     while (drmModeFormatModifierBlobIterNext(blob, &iterator)) {
         auto &mods = m_supportedTearingFormats[iterator.fmt];
-        if (!mods.contains(iterator.mod)) {
+        if (!mods.contains(iterator.mod)) [[likely]] {
             mods.append(iterator.mod);
         }
     }
@@ -205,7 +205,7 @@ void DrmPlane::refreshSupportedTearingFormats(drmModePropertyBlobPtr blob)
 
 void DrmPlane::refreshSizeHints(drmModePropertyBlobPtr blob)
 {
-    if (!blob || !blob->data || blob->length < sizeof(uint16_t) * 2 || (blob->length % (sizeof(uint16_t) * 2)) != 0) {
+    if (!blob || !blob->data || blob->length < sizeof(uint16_t) * 2 || (blob->length % (sizeof(uint16_t) * 2)) != 0) [[unlikely]] {
         if (blob && blob->data && blob->length > 0) {
             qCWarning(KWIN_DRM) << "SIZE_HINTS blob has invalid length" << blob->length << "for plane" << id();
         }
@@ -213,14 +213,15 @@ void DrmPlane::refreshSizeHints(drmModePropertyBlobPtr blob)
     }
 
     const size_t hintCount = blob->length / (sizeof(uint16_t) * 2);
-    if (hintCount > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    if (hintCount > static_cast<size_t>(std::numeric_limits<int>::max())) [[unlikely]] {
         return;
     }
 
     auto hints = std::span(reinterpret_cast<const uint16_t *>(blob->data), hintCount * 2);
+    m_sizeHints.reserve(static_cast<int>(hintCount));
     for (size_t i = 0; i < hintCount; ++i) {
         const QSize size(hints[i * 2], hints[i * 2 + 1]);
-        if (!m_sizeHints.contains(size)) {
+        if (!m_sizeHints.contains(size)) [[likely]] {
             m_sizeHints.append(size);
         }
     }
@@ -229,7 +230,7 @@ void DrmPlane::refreshSizeHints(drmModePropertyBlobPtr blob)
 void DrmPlane::set(DrmAtomicCommit *commit, const QRect &src, const QRect &dst)
 {
     const bool needsDisable = (dst.width() <= 0) || (dst.height() <= 0);
-    if (needsDisable) {
+    if (needsDisable) [[unlikely]] {
         disable(commit);
         return;
     }
@@ -279,7 +280,7 @@ void DrmPlane::set(DrmAtomicCommit *commit, const QRect &src, const QRect &dst)
 
 bool DrmPlane::isCrtcSupported(int pipeIndex) const noexcept
 {
-    if (pipeIndex < 0 || pipeIndex >= static_cast<int>(sizeof(uint32_t) * 8)) {
+    if (pipeIndex < 0 || pipeIndex >= static_cast<int>(sizeof(uint32_t) * 8)) [[unlikely]] {
         return false;
     }
     return (m_possibleCrtcs & (1u << pipeIndex)) != 0u;
@@ -307,17 +308,17 @@ std::shared_ptr<DrmFramebuffer> DrmPlane::currentBuffer() const noexcept
 
 void DrmPlane::setCurrentBuffer(const std::shared_ptr<DrmFramebuffer> &buffer)
 {
-    if (m_current == buffer) {
+    if (m_current == buffer) [[likely]] {
         return;
     }
 
     m_current = buffer;
-    if (!buffer) {
+    if (!buffer) [[unlikely]] {
         return;
     }
 
     const auto data = buffer->data();
-    if (!data) {
+    if (!data) [[unlikely]] {
         return;
     }
 
@@ -329,7 +330,7 @@ void DrmPlane::setCurrentBuffer(const std::shared_ptr<DrmFramebuffer> &buffer)
         }
     }
 
-    if (!found) {
+    if (!found) [[likely]] {
         m_lastBuffers[m_lastBufferWriteIndex] = data;
         m_lastBufferWriteIndex = (m_lastBufferWriteIndex + 1) % BufferHistoryDepth;
     }
@@ -344,7 +345,7 @@ void DrmPlane::disable(DrmAtomicCommit *commit)
 
 void DrmPlane::releaseCurrentBuffer()
 {
-    if (m_current) {
+    if (m_current) [[likely]] {
         m_current->releaseBuffer();
     }
 }
@@ -382,6 +383,6 @@ const QList<QSize> &DrmPlane::recommendedSizes() const noexcept
     return m_sizeHints;
 }
 
-} // namespace KWin
+}
 
 #include "moc_drm_plane.cpp"
