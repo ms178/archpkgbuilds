@@ -1186,7 +1186,7 @@
 
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c	2025-04-10 14:44:49.000000000 +0200
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c	2025-10-04 08:44:25.287659188 +0200
-@@ -25,17 +25,27 @@
+@@ -25,17 +25,28 @@
   *          Alex Deucher
   *          Jerome Glisse
   */
@@ -1204,6 +1204,7 @@
 +#include <linux/log2.h>
 +#include <linux/cache.h>
 +#include <linux/preempt.h>
++#include <linux/sched/clock.h>
  
  #include <drm/amdgpu_drm.h>
  #include <drm/drm_drv.h>
@@ -1214,20 +1215,11 @@
  #include <drm/drm_syncobj.h>
  
  #include "amdgpu.h"
-@@ -45,42 +55,62 @@
- #include "amdgpu_xgmi.h"
- #include "amdgpu_vm.h"
- 
-+/* -------------------- Fence input fast-path -------------------- */
-+
- static int
- amdgpu_gem_add_input_fence(struct drm_file *filp,
- 			   uint64_t syncobj_handles_array,
+@@ -51,36 +62,53 @@ amdgpu_gem_add_input_fence(struct drm_fi
  			   uint32_t num_syncobj_handles)
  {
  	struct dma_fence *fence;
-+	/* Expand stack buffer to 64 entries (256 bytes, safe for kernel stack) */
-+	uint32_t syncobj_handles_stack[256];
++	uint32_t syncobj_handles_stack[64];
  	uint32_t *syncobj_handles;
 -	int ret, i;
 +	int ret = 0;
@@ -1245,11 +1237,11 @@
 +		return -EINVAL;
  
 -	for (i = 0; i < num_syncobj_handles; i++) {
-+	/* Use stack for up to 64 entries (covers 99% of real-world cases), heap only for extreme counts */
-+	if (num_syncobj_handles <= ARRAY_SIZE(syncobj_handles_stack)) {
-+		if (copy_from_user(syncobj_handles_stack,
++	/* Use stack for up to 64 entries, heap for extreme counts */
++	if (likely(num_syncobj_handles <= ARRAY_SIZE(syncobj_handles_stack))) {
++		if (unlikely(copy_from_user(syncobj_handles_stack,
 +				   u64_to_user_ptr(syncobj_handles_array),
-+				   num_syncobj_handles * sizeof(uint32_t)))
++				   num_syncobj_handles * sizeof(uint32_t))))
 +			return -EFAULT;
 +		syncobj_handles = syncobj_handles_stack;
 +	} else {
@@ -1268,8 +1260,9 @@
  		}
  
  		ret = drm_syncobj_find_fence(filp, syncobj_handles[i], 0, 0, &fence);
- 		if (ret)
+-		if (ret)
 -			goto free_memdup;
++		if (unlikely(ret))
 +			break;
  
 -		dma_fence_wait(fence, false);
@@ -1278,19 +1271,19 @@
  
 -		/* TODO: optimize async handling */
  		dma_fence_put(fence);
-+		if (ret)
++		if (unlikely(ret))
 +			break;
  	}
  
 -free_memdup:
 -	kfree(syncobj_handles);
-+	if (num_syncobj_handles > ARRAY_SIZE(syncobj_handles_stack))
++	if (unlikely(num_syncobj_handles > ARRAY_SIZE(syncobj_handles_stack)))
 +		kfree(syncobj_handles);
 +
  	return ret;
  }
  
-@@ -153,31 +183,321 @@ amdgpu_gem_update_bo_mapping(struct drm_
+@@ -153,31 +181,318 @@ amdgpu_gem_update_bo_mapping(struct drm_
  		drm_syncobj_add_point(syncobj, chain, last_update, point);
  }
  
@@ -1402,21 +1395,20 @@
 +	u64 bo_size;
 +	bool is_compute, is_vram, is_large_compute, is_small_compute;
 +	struct vega_pf_state *pcs;
-+	unsigned long now_j, delta_addr;
-+	u64 now_ns, delta_ns;
-+	int direction;
++	unsigned long now_j;
++	unsigned long delta_addr = 0;
++	u64 now_ns;
++	u64 delta_ns = 0;
++	int direction = 0;
 +
-+	/* Early validation */
 +	if (unlikely(!adev || !abo || !vmf || base_pages == 0))
 +		return base_pages;
 +
-+	/* BO characteristics */
 +	bo_size = abo->tbo.base.size;
 +	dom = abo->preferred_domains;
-+	is_vram = !!(dom & AMDGPU_GEM_DOMAIN_VRAM);
-+	is_compute = !!(abo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS);
++	is_vram = (dom & AMDGPU_GEM_DOMAIN_VRAM) != 0U;
++	is_compute = (abo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0U;
 +
-+	/* OPTIMIZATION V1: TLB-Aware Capping */
 +	vram_pct = amdgpu_vram_usage_pct_fast(adev);
 +
 +	if (is_vram) {
@@ -1429,117 +1421,122 @@
 +	cap = max(cap, PREFETCH_ABS_MIN_PAGES);
 +
 +	total_pages = (u32)min_t(u64, bo_size >> PAGE_SHIFT, U32_MAX);
-+	if (total_pages == 0)
-+		total_pages = 1;
++	if (total_pages == 0U)
++		total_pages = 1U;
 +
-+	/* OPTIMIZATION V4: Compute Workload Specialized Strategy */
 +	is_large_compute = is_compute && (bo_size >= VEGA_COMPUTE_LARGE_BO_THRESHOLD);
 +	is_small_compute = is_compute && (bo_size <= VEGA_COMPUTE_SMALL_BO_THRESHOLD);
 +
 +	if (is_large_compute) {
 +		want = base_pages * 2U;
 +	} else if (is_small_compute) {
-+		want = base_pages / 2U;
++		want = max(base_pages / 2U, PREFETCH_ABS_MIN_PAGES);
 +	} else {
-+		/* PERF OPT: Replace LUT with equivalent, dependency-free arithmetic. */
 +		u32 scale_pct = 120U - (vram_pct * 4U) / 5U;
-+		want = (base_pages * scale_pct) / 100U;
 +
++		want = (base_pages * scale_pct) / 100U;
 +		if (total_pages > 1U)
 +			want += ilog2(total_pages);
-+
 +		if (is_compute && vram_pct < 90U)
-+			want += want >> 2; /* +25% */
++			want += want >> 2;
 +	}
 +
-+	/* OPTIMIZATION V2 & V3: Streak and Burst Detection */
 +	pcs = this_cpu_ptr(&vega_pf_pc);
 +	now_j = jiffies;
-+	now_ns = ktime_get_ns();
++	now_ns = local_clock();
 +
 +	if (pcs->last_bo == (const void *)abo &&
 +	    pcs->last_vma == (const void *)vmf->vma &&
 +	    time_before(now_j, pcs->last_j + vega_pf_streak_window_jiffies)) {
-+		/* BUG FIX: Use kernel-standard U64_MAX. */
-+		if (likely(now_ns >= pcs->last_ns)) {
++
++		if (now_ns >= pcs->last_ns)
 +			delta_ns = now_ns - pcs->last_ns;
-+		} else {
-+			delta_ns = U64_MAX;
-+		}
 +
 +		if (vmf->address > pcs->last_addr) {
-+			direction = 1;  /* Forward */
++			direction = 1;
 +			delta_addr = vmf->address - pcs->last_addr;
 +		} else if (vmf->address < pcs->last_addr) {
-+			direction = 2;  /* Reverse */
-+			delta_addr = 0;
++			direction = 2;
++			delta_addr = pcs->last_addr - vmf->address;
 +		} else {
-+			direction = 0;  /* Same address */
++			direction = 0;
 +			delta_addr = 0;
 +		}
 +
 +		if (direction == 1) {
 +			unsigned long delta_pages = delta_addr >> PAGE_SHIFT;
 +
-+			if (delta_pages > 0 && delta_pages <= (want + 4)) {
-+				if (pcs->streak < 4)
++			if (delta_pages > 0UL &&
++			    delta_pages <= (unsigned long)(want + 4U)) {
++				u32 boost;
++
++				if (pcs->streak < 4U)
 +					pcs->streak++;
 +
 +				if (is_vram) {
 +					u32 new_seq = (u32)pcs->sequential_pages +
 +						      min_t(u32, delta_pages, 512U);
 +					pcs->sequential_pages = (u16)min(new_seq, 65535U);
++				} else {
++					pcs->sequential_pages = 0U;
 +				}
 +
-+				/* HBM2 burst boost (+50%) */
-+				if (delta_ns <= vega_pf_burst_ns) {
-+					u32 boost = want >> 1;
++				if (delta_ns && delta_ns <= vega_pf_burst_ns) {
++					boost = want >> 1;
 +					want = min_t(u32, want + boost, PREFETCH_BOOST_CAP);
 +				}
 +
-+				/* Streak boost (+50% per 2 levels) */
-+				if (pcs->streak > 0) {
-+					u32 boost = (want * pcs->streak) >> 1;
++				if (pcs->streak > 0U) {
++					boost = (want * pcs->streak) >> 1;
 +					want = min_t(u32, want + boost, PREFETCH_BOOST_CAP);
 +				}
 +
-+				if (is_vram && pcs->sequential_pages >= VEGA_LARGE_PAGE_HINT_THRESHOLD &&
-+					want < 512U && total_pages >= 512U) {
-+					want = 512U; /* Align to 2MB large page boundary */
-+				}
++				if (is_vram &&
++				    pcs->sequential_pages >= VEGA_LARGE_PAGE_HINT_THRESHOLD &&
++				    want < 512U && total_pages >= 512U)
++					want = 512U;
 +
-+				if (is_compute && delta_pages > 1 && delta_pages <= 1024) {
++				if (is_compute && delta_pages > 1UL && delta_pages <= 1024UL) {
 +					u32 stride = (u32)delta_pages;
++
 +					if (is_power_of_2(stride)) {
 +						if (pcs->last_stride == stride) {
-+							if (pcs->stride_repeat_count < 255)
++							if (pcs->stride_repeat_count < 255U)
 +								pcs->stride_repeat_count++;
-+							if (pcs->stride_repeat_count >= 3)
++							if (pcs->stride_repeat_count >= 3U)
 +								want = max(want, stride);
 +						} else {
 +							pcs->last_stride = stride;
-+							pcs->stride_repeat_count = 1;
++							pcs->stride_repeat_count = 1U;
 +						}
 +					} else {
-+						pcs->stride_repeat_count = 0;
++						pcs->last_stride = 0U;
++						pcs->stride_repeat_count = 0U;
 +					}
++				} else {
++					pcs->last_stride = 0U;
++					pcs->stride_repeat_count = 0U;
 +				}
 +			} else {
-+				pcs->streak = 0;
-+				if (is_vram)
-+					pcs->sequential_pages = 0;
-+				pcs->stride_repeat_count = 0;
++				pcs->streak = 0U;
++				pcs->sequential_pages = 0U;
++				pcs->last_stride = 0U;
++				pcs->stride_repeat_count = 0U;
 +			}
 +		} else {
-+			pcs->streak = 0;
-+			if (is_vram)
-+				pcs->sequential_pages = 0;
-+			pcs->stride_repeat_count = 0;
++			pcs->streak = 0U;
++			pcs->sequential_pages = 0U;
++			pcs->last_stride = 0U;
++			pcs->stride_repeat_count = 0U;
 +		}
++
 +		pcs->direction = (u8)direction;
 +	} else {
-+		/* Reset all state */
-+		memset(pcs, 0, sizeof(*pcs));
++		pcs->streak = 0U;
++		pcs->direction = 0U;
++		pcs->sequential_pages = 0U;
++		pcs->last_stride = 0U;
++		pcs->stride_repeat_count = 0U;
 +	}
 +
 +	pcs->last_bo = (const void *)abo;
@@ -1548,29 +1545,22 @@
 +	pcs->last_ns = now_ns;
 +	pcs->last_j = now_j;
 +
-+	/* PERF OPT: Use simple, readable branches for high-pressure clamping. */
-+	if (vram_pct >= 98U) {
++	if (vram_pct >= 98U)
 +		want = min(want, base_pages);
-+	} else if (vram_pct >= 95U) {
++	else if (vram_pct >= 95U)
 +		want = min(want, (want + base_pages) >> 1);
-+	}
 +
-+	/* PERF OPT: Aggressively align to HBM2-friendly boundaries by rounding down. */
-+	if (want >= 16U) {
-+		want &= ~15U; /* Align down to 16 pages (64KB) */
-+	} else if (want >= 4U) {
-+		want &= ~3U; /* Align down to 4 pages (16KB) */
-+	}
++	if (want >= 16U)
++		want &= ~15U;
++	else if (want >= 4U)
++		want &= ~3U;
 +
-+	/* Final clamping to absolute and BO-specific limits. */
-+	want = clamp(want, PREFETCH_ABS_MIN_PAGES, PREFETCH_ABS_MAX_PAGES);
++	want = clamp_t(u32, want, PREFETCH_ABS_MIN_PAGES, PREFETCH_ABS_MAX_PAGES);
 +	want = min(want, cap);
 +	want = min(want, total_pages);
 +
 +	return want;
 +}
-+
-+/* -------------------- Fault handler (with adaptive prefetch) -------------------- */
 +
  static vm_fault_t amdgpu_gem_fault(struct vm_fault *vmf)
  {
@@ -1615,7 +1605,7 @@
  	if (ret == VM_FAULT_RETRY && !(vmf->flags & FAULT_FLAG_RETRY_NOWAIT))
  		return ret;
  
-@@ -670,7 +990,7 @@ unsigned long amdgpu_gem_timeout(uint64_
+@@ -670,7 +985,7 @@ unsigned long amdgpu_gem_timeout(uint64_
  }
  
  int amdgpu_gem_wait_idle_ioctl(struct drm_device *dev, void *data,
@@ -1624,16 +1614,19 @@
  {
  	union drm_amdgpu_gem_wait_idle *args = data;
  	struct drm_gem_object *gobj;
-@@ -685,18 +1005,30 @@ int amdgpu_gem_wait_idle_ioctl(struct dr
+@@ -681,22 +996,28 @@ int amdgpu_gem_wait_idle_ioctl(struct dr
+ 	long ret;
+ 
+ 	gobj = drm_gem_object_lookup(filp, handle);
+-	if (!gobj)
++	if (unlikely(!gobj))
  		return -ENOENT;
  
  	robj = gem_to_amdgpu_bo(gobj);
 +
-+	/* Fast path: if already idle, avoid wait queue machinery.
-+	 * Clear out struct to prevent padding leak.
-+	 */
-+	if (dma_resv_test_signaled(robj->tbo.base.resv, DMA_RESV_USAGE_READ)) {
++	if (likely(dma_resv_test_signaled(robj->tbo.base.resv, DMA_RESV_USAGE_READ))) {
 +		memset(&args->out, 0, sizeof(args->out));
++		args->out.status = 0; /* idle */
 +		drm_gem_object_put(gobj);
 +		return 0;
 +	}
@@ -1644,10 +1637,7 @@
 -	/* ret == 0 means not signaled,
 -	 * ret > 0 means signaled
 -	 * ret < 0 means interrupted before timeout
-+	/* ret == 0 means timeout (not signaled, busy),
-+	 * ret > 0 means signaled (idle, returns remaining jiffies),
-+	 * ret < 0 means interrupted or error.
- 	 */
+-	 */
 -	if (ret >= 0) {
 -		memset(args, 0, sizeof(*args));
 -		args->out.status = (ret == 0);
@@ -1655,7 +1645,7 @@
 -		r = ret;
 +	if (likely(ret >= 0)) {
 +		memset(&args->out, 0, sizeof(args->out));
-+		args->out.status = (ret == 0) ? 1u : 0u; /* 1 = busy, 0 = idle */
++		args->out.status = (ret == 0) ? 1u : 0u; /* 1=busy, 0=idle */
 +		r = 0;
 +	} else {
 +		r = (int)ret;
@@ -1663,7 +1653,7 @@
  
  	drm_gem_object_put(gobj);
  	return r;
-@@ -746,7 +1078,7 @@ out:
+@@ -746,7 +1067,7 @@ out:
  }
  
  /**
@@ -1672,7 +1662,7 @@
   *
   * @adev: amdgpu_device pointer
   * @vm: vm to update
-@@ -757,7 +1089,8 @@ out:
+@@ -757,7 +1078,8 @@ out:
   * vital here, so they are not reported back to userspace.
   *
   * Returns resulting fence if freed BO(s) got cleared from the PT.
@@ -1682,7 +1672,7 @@
   */
  static struct dma_fence *
  amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
-@@ -765,11 +1098,11 @@ amdgpu_gem_va_update_vm(struct amdgpu_de
+@@ -765,11 +1087,11 @@ amdgpu_gem_va_update_vm(struct amdgpu_de
  			struct amdgpu_bo_va *bo_va,
  			uint32_t operation)
  {
@@ -1696,7 +1686,7 @@
  
  	r = amdgpu_vm_clear_freed(adev, vm, &fence);
  	if (r)
-@@ -784,11 +1117,18 @@ amdgpu_gem_va_update_vm(struct amdgpu_de
+@@ -784,11 +1106,18 @@ amdgpu_gem_va_update_vm(struct amdgpu_de
  
  	r = amdgpu_vm_update_pdes(adev, vm, false);
  
@@ -1716,7 +1706,7 @@
  }
  
  /**
-@@ -822,7 +1162,7 @@ uint64_t amdgpu_gem_va_map_flags(struct
+@@ -822,7 +1151,7 @@ uint64_t amdgpu_gem_va_map_flags(struct
  }
  
  int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
@@ -1725,7 +1715,7 @@
  {
  	const uint32_t valid_flags = AMDGPU_VM_DELAY_UPDATE |
  		AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE |
-@@ -845,39 +1185,30 @@ int amdgpu_gem_va_ioctl(struct drm_devic
+@@ -845,39 +1174,30 @@ int amdgpu_gem_va_ioctl(struct drm_devic
  	uint64_t vm_size;
  	int r = 0;
  
@@ -1776,7 +1766,7 @@
  	switch (args->operation) {
  	case AMDGPU_VA_OP_MAP:
  	case AMDGPU_VA_OP_UNMAP:
-@@ -885,8 +1216,6 @@ int amdgpu_gem_va_ioctl(struct drm_devic
+@@ -885,8 +1205,6 @@ int amdgpu_gem_va_ioctl(struct drm_devic
  	case AMDGPU_VA_OP_REPLACE:
  		break;
  	default:
@@ -1785,7 +1775,7 @@
  		return -EINVAL;
  	}
  
-@@ -953,7 +1282,6 @@ int amdgpu_gem_va_ioctl(struct drm_devic
+@@ -953,7 +1271,6 @@ int amdgpu_gem_va_ioctl(struct drm_devic
  	case AMDGPU_VA_OP_UNMAP:
  		r = amdgpu_vm_bo_unmap(adev, bo_va, args->va_address);
  		break;
@@ -1793,7 +1783,7 @@
  	case AMDGPU_VA_OP_CLEAR:
  		r = amdgpu_vm_bo_clear_mappings(adev, &fpriv->vm,
  						args->va_address,
-@@ -968,19 +1296,22 @@ int amdgpu_gem_va_ioctl(struct drm_devic
+@@ -968,19 +1285,22 @@ int amdgpu_gem_va_ioctl(struct drm_devic
  	default:
  		break;
  	}
@@ -1824,7 +1814,7 @@
  	}
  
  error:
-@@ -1071,6 +1402,9 @@ static int amdgpu_gem_align_pitch(struct
+@@ -1071,6 +1391,9 @@ static int amdgpu_gem_align_pitch(struct
  				  int cpp,
  				  bool tiled)
  {
@@ -1834,7 +1824,7 @@
  	int aligned = width;
  	int pitch_mask = 0;
  
-@@ -1085,6 +1419,8 @@ static int amdgpu_gem_align_pitch(struct
+@@ -1085,6 +1408,8 @@ static int amdgpu_gem_align_pitch(struct
  	case 4:
  		pitch_mask = 63;
  		break;
@@ -1843,7 +1833,7 @@
  	}
  
  	aligned += pitch_mask;
-@@ -1104,6 +1440,7 @@ int amdgpu_mode_dumb_create(struct drm_f
+@@ -1104,6 +1429,7 @@ int amdgpu_mode_dumb_create(struct drm_f
  		    AMDGPU_GEM_CREATE_CPU_GTT_USWC |
  		    AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS;
  	u32 domain;
@@ -1851,7 +1841,7 @@
  	int r;
  
  	/*
-@@ -1114,13 +1451,21 @@ int amdgpu_mode_dumb_create(struct drm_f
+@@ -1114,13 +1440,21 @@ int amdgpu_mode_dumb_create(struct drm_f
  	if (adev->mman.buffer_funcs_enabled)
  		flags |= AMDGPU_GEM_CREATE_VRAM_CLEARED;
  
@@ -1878,7 +1868,7 @@
  				     ttm_bo_type_device, NULL, &gobj, fpriv->xcp_id + 1);
  	if (r)
  		return -ENOMEM;
-@@ -1132,6 +1477,7 @@ int amdgpu_mode_dumb_create(struct drm_f
+@@ -1132,6 +1466,7 @@ int amdgpu_mode_dumb_create(struct drm_f
  		return r;
  
  	args->handle = handle;
