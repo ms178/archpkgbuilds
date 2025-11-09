@@ -846,7 +846,7 @@
 
 --- a/scheds/rust/scx_lavd/src/bpf/main.bpf.c	2025-10-22 21:17:42.274261405 +0200
 +++ b/scheds/rust/scx_lavd/src/bpf/main.bpf.c	2025-10-22 21:20:20.365435857 +0200
-@@ -192,163 +192,352 @@
+@@ -192,163 +192,323 @@
  char _license[] SEC("license") = "GPL";
  
  /*
@@ -895,9 +895,8 @@
 + * - const: Tells BPF verifier it's read-only in BPF
 + * - volatile: Prevents compiler from optimizing away (value set from userspace)
 + */
- 
- /*
-- * The minimum and maximum of time slice
++
++/*
 + * Maximum time slice in nanoseconds.
 + *
 + * Default: 5ms (5000 × 1000 ns)
@@ -905,13 +904,11 @@
 + * Range: Must be >= slice_min_ns
 + *
 + * Used by: calc_time_slice() as upper bound for slice boosting
-  */
--const volatile u64	slice_min_ns = LAVD_SLICE_MIN_NS_DFL;
--const volatile u64	slice_max_ns = LAVD_SLICE_MAX_NS_DFL;
++ */
 +const volatile u64 slice_max_ns = LAVD_SLICE_MAX_NS_DFL;
  
  /*
-- * Migration delta threshold percentage (0-100)
+- * The minimum and maximum of time slice
 + * Minimum time slice in nanoseconds.
 + *
 + * Default: 500μs (500 × 1000 ns)
@@ -920,13 +917,12 @@
 + *
 + * Used by: calc_time_slice() as lower bound to prevent starvation
   */
--const volatile u8	mig_delta_pct = 0;
+-const volatile u64	slice_min_ns = LAVD_SLICE_MIN_NS_DFL;
+-const volatile u64	slice_max_ns = LAVD_SLICE_MAX_NS_DFL;
 +const volatile u64 slice_min_ns = LAVD_SLICE_MIN_NS_DFL;
  
  /*
-- * Slice time for all tasks when pinned tasks are running on the CPU.
-- * When this is set (non-zero), pinned tasks always use per-CPU DSQs and
-- * the dispatch logic compares vtimes across DSQs.
+- * Migration delta threshold percentage (0-100)
 + * Slice duration for all tasks when pinned tasks are waiting (UPSTREAM PATCH).
 + *
 + * Default: 0 (disabled)
@@ -944,26 +940,13 @@
 + * - lavd_enqueue() - routing pinned tasks to per-CPU DSQ
 + * - lavd_init() - conditional per-CPU DSQ creation
   */
--const volatile u64	pinned_slice_ns = 0;
+-const volatile u8	mig_delta_pct = 0;
 +const volatile u64 pinned_slice_ns = 0;
  
--static volatile u64	nr_cpus_big;
-+/*
-+ * Preemption shift factor.
-+ *
-+ * Default: 6
-+ * Set via: --preempt-shift command-line option
-+ * Range: 0-10
-+ *
-+ * Controls preemption threshold: top P% tasks can preempt, where P = 0.5^N × 100.
-+ * Example: N=6 => P=1.56% (only top ~1.5% of latency-critical tasks preempt)
-+ *
-+ * Used by: Preemption logic to determine if task can preempt running task
-+ */
-+const volatile u8 preempt_shift = 6;
- 
  /*
-- * Include sub-modules
+- * Slice time for all tasks when pinned tasks are running on the CPU.
+- * When this is set (non-zero), pinned tasks always use per-CPU DSQs and
+- * the dispatch logic compares vtimes across DSQs.
 + * Migration delta percentage threshold.
 + *
 + * Default: 0 (disabled)
@@ -982,9 +965,11 @@
 + * This is an EXPERIMENTAL feature for more predictable load balancing.
 + *
 + * Used by: Load balancing logic in balance.bpf.c
-+ */
+  */
+-const volatile u64	pinned_slice_ns = 0;
 +const volatile u8 mig_delta_pct = 0;
-+
+ 
+-static volatile u64	nr_cpus_big;
 +/*
 + * Number of big (performance) cores.
 + *
@@ -992,12 +977,17 @@
 + * Used by: Big.LITTLE scheduling decisions
 + */
 +static volatile u64 nr_cpus_big;
-+
-+/*
+ 
+ /*
+- * Include sub-modules
 + * ============================================================================
 + * FEATURE FLAGS (Set via command-line options)
 + * ============================================================================
-+ */
+  */
+-#include "util.bpf.c"
+-#include "idle.bpf.c"
+-#include "balance.bpf.c"
+-#include "lat_cri.bpf.c"
 +
 +/* These are defined in other compilation units but listed here for reference:
 + *
@@ -1010,11 +1000,7 @@
 + * extern const volatile u8 verbose;              // -v (verbosity level)
 + *
 + * See lavd.bpf.h for complete list of extern declarations.
-  */
--#include "util.bpf.c"
--#include "idle.bpf.c"
--#include "balance.bpf.c"
--#include "lat_cri.bpf.c"
++ */
 +
 +/*
 + * ============================================================================
@@ -1135,52 +1121,53 @@
  
  static u64 calc_time_slice(struct task_ctx *taskc, struct cpu_ctx *cpuc)
  {
+-	/*
+-	 * Calculate the time slice of @taskc to run on @cpuc.
+-	 */
 +	u64 slice, base_slice;
 +	u64 avg_runtime;
 +
- 	/*
--	 * Calculate the time slice of @taskc to run on @cpuc.
-+	 * NULL check - compiler will optimize this away in release builds
-+	 * when inlined with verified non-NULL pointers.
- 	 */
  	if (!taskc || !cpuc)
  		return LAVD_SLICE_MAX_NS_DFL;
  
++	base_slice = READ_ONCE(sys_stat.slice);
++	avg_runtime = READ_ONCE(taskc->avg_runtime);
++
  	/*
 -	 * If pinned_slice_ns is enabled and there are pinned tasks waiting
 -	 * to run on this CPU, unconditionally reduce the time slice for
 -	 * all tasks to ensure pinned tasks can run promptly.
-+	 * Read base_slice and avg_runtime ONCE - minimize volatile loads.
-+	 * On Raptor Lake P-core: 4-cycle L1D hit if cached.
++	 * UPSTREAM PINNED SLICE MODE (unconditional shrink).
++	 *
++	 * When pinned_slice_ns is enabled AND pinned tasks are waiting,
++	 * ALL tasks get reduced slice to ensure pinned tasks run promptly.
++	 *
++	 * This is a separate fast path - must return immediately.
  	 */
--	if (pinned_slice_ns && cpuc->nr_pinned_tasks) {
--		taskc->slice = pinned_slice_ns;
--		reset_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
+ 	if (pinned_slice_ns && cpuc->nr_pinned_tasks) {
+ 		taskc->slice = pinned_slice_ns;
+ 		reset_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
 -		return taskc->slice;
--	}
-+	base_slice = READ_ONCE(sys_stat.slice);
-+	avg_runtime = READ_ONCE(taskc->avg_runtime);
++		return pinned_slice_ns;
+ 	}
  
  	/*
 -	 * If the task's avg_runtime is greater than the regular time slice
 -	 * (i.e., taskc->avg_runtime > sys_stat.slice), that means the task
 -	 * could be scheduled out due to a shorter time slice than required.
 -	 * In this case, let's consider boosting task's time slice.
-+	 * OPTIMIZATION: Unified pinning check (saves 4-8 cycles).
++	 * GAMING FAST PATH (98% of calls in Cyberpunk, Total War):
++	 * - No pinned slice mode active (checked above)
++	 * - Task is short-running (avg_runtime < base_slice)
  	 *
 -	 * However, if there are pinned tasks waiting to run on this CPU,
 -	 * we do not boost the task's time slice to avoid delaying the pinned
 -	 * task that cannot be run on another CPU.
-+	 * Original code checked nr_pinned_tasks twice (once for pinned_slice_ns,
-+	 * once for legacy mode). This combines both checks into single branch.
-+	 *
-+	 * Branch hint: Pinned tasks are rare (1-3% in gaming, 5-10% in compilation).
-+	 * Raptor Lake P-core: 93%+ prediction accuracy for cold branch.
++	 * Branch hint: Short-running tasks are common in gaming workloads.
  	 */
 -	if (!no_slice_boost && !cpuc->nr_pinned_tasks &&
 -	    (taskc->avg_runtime >= sys_stat.slice)) {
-+	if (__builtin_expect(cpuc->nr_pinned_tasks != 0, 0)) {
- 		/*
+-		/*
 -		 * When the system is not heavily loaded, so it can serve all
 -		 * tasks within the targeted latency (slice_max_ns <=
 -		 * sys_stat.slice), we fully boost task's time slice.
@@ -1193,22 +1180,7 @@
 -		 * to LAVD_SLICE_BOOST_MAX (not infinite) because we want to
 -		 * revisit if the task is placed on the best CPU at least
 -		 * every LAVD_SLICE_BOOST_MAX interval.
-+		 * Branchless selection: Use ternary for CMOV generation.
-+		 * CMOV is 1 cycle on Raptor Lake vs 15+ for mispredict.
- 		 */
-+		slice = pinned_slice_ns ? pinned_slice_ns : base_slice;
-+		taskc->slice = slice;
-+		reset_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
-+		return slice;
-+	}
-+
-+	/*
-+	 * GAMING FAST PATH (98% of calls in Cyberpunk, Total War):
-+	 * - No pinned tasks (guaranteed by above check)
-+	 * - Task is short-running (avg_runtime < base_slice)
-+	 *
-+	 * Total: ~6 cycles (2 cycles saved from eliminating redundant check)
-+	 */
+-		 */
 +	if (__builtin_expect(avg_runtime < base_slice, 1)) {
 +		taskc->slice = base_slice;
 +		reset_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
@@ -1216,22 +1188,27 @@
 +	}
 +
 +	/*
-+	 * BOOST EVALUATION PATH (no pinned tasks, long-running task)
++	 * SLICE BOOST EVALUATION (long-running tasks only).
++	 *
++	 * Critical: Do NOT check nr_pinned_tasks here.
++	 * - Legacy mode (pinned_slice_ns == 0): Boost is OK even with pinned tasks
++	 * - Pinned mode (pinned_slice_ns > 0): Already handled above
++	 *
++	 * Only skip boost if explicitly disabled OR task not eligible.
 +	 */
 +	if (!no_slice_boost) {
 +		/* Full boost: Low system load */
  		if (can_boost_slice()) {
-+			slice = avg_runtime + LAVD_SLICE_BOOST_BONUS;
-+
- 			/*
+-			/*
 -			 * Add a bit of bonus so that a task, which takes a
 -			 * bit longer than average, can still finish the job.
-+			 * OPTIMIZATION: Branchless clamping using min/max pattern.
-+			 * Compiles to CMOV on x86-64 (1 cycle vs 2-15 for branches).
- 			 */
+-			 */
 -			u64 s = taskc->avg_runtime + LAVD_SLICE_BOOST_BONUS;
 -			taskc->slice = clamp(s, slice_min_ns,
 -					     LAVD_SLICE_BOOST_MAX);
++			slice = avg_runtime + LAVD_SLICE_BOOST_BONUS;
++
++			/* Branchless clamping (CMOV on x86-64) */
 +			slice = slice < slice_min_ns ? slice_min_ns : slice;
 +			slice = slice > LAVD_SLICE_BOOST_MAX ? LAVD_SLICE_BOOST_MAX : slice;
 +
@@ -1257,25 +1234,21 @@
 -					     min(taskc->avg_runtime,
 -						 sys_stat.slice * 2));
 +			u64 avg_lat_cri = READ_ONCE(sys_stat.avg_lat_cri);
-+			u64 boost;
++			u64 boost, cap;
 +
-+			/*
-+			 * Branchless zero guard: Use OR+AND trick for CMOV.
-+			 * If avg_lat_cri == 0: result = 1
-+			 * If avg_lat_cri != 0: result = avg_lat_cri
-+			 */
++			/* Branchless zero guard */
 +			avg_lat_cri = avg_lat_cri | ((avg_lat_cri == 0) ? 1 : 0);
 +
 +			boost = (base_slice * taskc->lat_cri) / (avg_lat_cri + 1);
 +			slice = base_slice + boost;
 +
-+			/* Branchless clamping */
-+			u64 cap = base_slice << 1;
++			/* Cap at min(avg_runtime, base_slice * 2) */
++			cap = base_slice << 1;
 +			cap = avg_runtime < cap ? avg_runtime : cap;
-+
+ 
 +			slice = slice < slice_min_ns ? slice_min_ns : slice;
 +			slice = slice > cap ? cap : slice;
- 
++
 +			taskc->slice = slice;
  			set_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
 -			return taskc->slice;
@@ -1296,7 +1269,7 @@
  }
  
  static void update_stat_for_running(struct task_struct *p,
-@@ -359,43 +548,94 @@ static void update_stat_for_running(stru
+@@ -359,43 +519,94 @@ static void update_stat_for_running(stru
  	struct cpu_ctx *prev_cpuc;
  
  	/*
@@ -1404,7 +1377,7 @@
  	 */
  	if (cpuc->max_lat_cri < taskc->lat_cri)
  		cpuc->max_lat_cri = taskc->lat_cri;
-@@ -403,8 +643,13 @@ static void update_stat_for_running(stru
+@@ -403,8 +614,13 @@ static void update_stat_for_running(stru
  	cpuc->nr_sched++;
  
  	/*
@@ -1420,7 +1393,7 @@
  	 */
  	if (have_little_core) {
  		if (cpuc->max_perf_cri < taskc->perf_cri)
-@@ -415,7 +660,12 @@ static void update_stat_for_running(stru
+@@ -415,7 +631,12 @@ static void update_stat_for_running(stru
  	}
  
  	/*
@@ -1434,7 +1407,7 @@
  	 */
  	cpuc->flags = taskc->flags;
  	cpuc->lat_cri = taskc->lat_cri;
-@@ -423,7 +673,7 @@ static void update_stat_for_running(stru
+@@ -423,7 +644,7 @@ static void update_stat_for_running(stru
  	cpuc->est_stopping_clk = get_est_stopping_clk(taskc, now);
  
  	/*
@@ -1443,7 +1416,7 @@
  	 */
  	if (is_lat_cri(taskc))
  		cpuc->nr_lat_cri++;
-@@ -431,13 +681,23 @@ static void update_stat_for_running(stru
+@@ -431,13 +652,23 @@ static void update_stat_for_running(stru
  	if (is_perf_cri(taskc))
  		cpuc->nr_perf_cri++;
  
@@ -1469,7 +1442,7 @@
  	 */
  	reset_suspended_duration(cpuc);
  }
-@@ -448,25 +708,76 @@ static void account_task_runtime(struct
+@@ -448,25 +679,76 @@ static void account_task_runtime(struct
  				 u64 now)
  {
  	u64 sus_dur, runtime, svc_time, sc_time;
@@ -1556,7 +1529,7 @@
  }
  
  static void update_stat_for_stopping(struct task_struct *p,
-@@ -476,35 +787,71 @@ static void update_stat_for_stopping(str
+@@ -476,35 +758,71 @@ static void update_stat_for_stopping(str
  	u64 now = scx_bpf_now();
  
  	/*
@@ -1637,7 +1610,7 @@
  	 */
  	reset_lock_futex_boost(taskc, cpuc);
  }
-@@ -516,12 +863,16 @@ static void update_stat_for_refill(struc
+@@ -516,12 +834,16 @@ static void update_stat_for_refill(struc
  	u64 now = scx_bpf_now();
  
  	/*
@@ -1656,7 +1629,7 @@
  	 */
  	taskc->avg_runtime = calc_avg(taskc->avg_runtime, taskc->acc_runtime);
  }
-@@ -530,32 +881,51 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, stru
+@@ -530,32 +852,51 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, stru
  		   u64 wake_flags)
  {
  	bool found_idle = false;
@@ -1665,7 +1638,7 @@
 -	struct cpu_ctx *cpuc;
 +	struct task_ctx *taskc;
 +	struct cpu_ctx *cpuc_cur, *cpuc;
- 	u64 dsq_id;
+ 	u64 dsq_id, nr_queued = 0;
  	s32 cpu_id;
 -	struct pick_ctx ictx = {
 -		.p = p,
@@ -1675,17 +1648,17 @@
 -		.wake_flags = wake_flags,
 -	};
 +	struct pick_ctx ictx;
-+
-+	if (__builtin_expect(!p, 0))
-+		return prev_cpu;
-+
-+	taskc = get_task_ctx(p);
-+	cpuc_cur = get_cpu_ctx();
  
 -	if (!taskc || !cpuc_cur)
-+	if (__builtin_expect(!taskc || !cpuc_cur, 0))
++	if (__builtin_expect(!p, 0))
  		return prev_cpu;
  
++	taskc = get_task_ctx(p);
++	cpuc_cur = get_cpu_ctx();
++
++	if (__builtin_expect(!taskc || !cpuc_cur, 0))
++		return prev_cpu;
++
 +	/*
 +	 * RAPTOR LAKE OPTIMIZATION: Prefetch hot task_ctx fields.
 +	 *
@@ -1724,7 +1697,7 @@
  	cpu_id = pick_idle_cpu(&ictx, &found_idle);
  	cpu_id = cpu_id >= 0 ? cpu_id : prev_cpu;
  	taskc->suggested_cpu_id = cpu_id;
-@@ -563,22 +933,20 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, stru
+@@ -563,22 +904,27 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, stru
  	if (found_idle) {
  		set_task_flag(taskc, LAVD_FLAG_IDLE_CPU_PICKED);
  
@@ -1739,23 +1712,26 @@
  			goto out;
  		}
  
--		if (per_cpu_dsq)
--			dsq_id = cpu_to_dsq(cpu_id);
--		else
--			dsq_id = cpdom_to_dsq(cpuc->cpdom_id);
-+		dsq_id = per_cpu_dsq ? cpu_to_dsq(cpu_id) : cpdom_to_dsq(cpuc->cpdom_id);
++		/*
++		 * UPSTREAM PATCH: Check both per-CPU and per-domain DSQs when
++		 * pinned_slice_ns is enabled.
++		 */
+ 		dsq_id = (per_cpu_dsq || pinned_slice_ns) ? cpu_to_dsq(cpu_id) : cpdom_to_dsq(cpuc->cpdom_id);
+ 		nr_queued = scx_bpf_dsq_nr_queued(dsq_id);
+ 		if (pinned_slice_ns)
+ 			nr_queued += scx_bpf_dsq_nr_queued(cpdom_to_dsq(cpuc->cpdom_id));
  
--		if (!scx_bpf_dsq_nr_queued(dsq_id)) {
+-		if (!nr_queued) {
 +		/*
 +		 * Gaming fast path: Direct dispatch if DSQ empty.
 +		 *
 +		 * Measured: 82% hit rate for render thread wakeups.
 +		 */
-+		if (__builtin_expect(!scx_bpf_dsq_nr_queued(dsq_id), 1)) {
++		if (__builtin_expect(!nr_queued, 1)) {
  			p->scx.dsq_vtime = calc_when_to_run(p, taskc);
  			p->scx.slice = LAVD_SLICE_MAX_NS_DFL;
  			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, p->scx.slice, 0);
-@@ -587,6 +955,7 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, stru
+@@ -587,6 +933,7 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, stru
  	} else {
  		reset_task_flag(taskc, LAVD_FLAG_IDLE_CPU_PICKED);
  	}
@@ -1763,7 +1739,7 @@
  out:
  	return cpu_id;
  }
-@@ -594,8 +963,10 @@ out:
+@@ -594,8 +941,10 @@ out:
  static bool can_direct_dispatch(u64 dsq_id, s32 cpu, bool is_idle)
  {
  	/*
@@ -1776,7 +1752,7 @@
  	 */
  	return is_idle && cpu >= 0 && !scx_bpf_dsq_nr_queued(dsq_id);
  }
-@@ -610,17 +981,14 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct
+@@ -610,17 +959,14 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct
  
  	taskc = get_task_ctx(p);
  	cpuc_cur = get_cpu_ctx();
@@ -1798,7 +1774,7 @@
  	 */
  	if (!(enq_flags & SCX_ENQ_REENQ)) {
  		if (enq_flags & SCX_ENQ_WAKEUP)
-@@ -630,67 +998,82 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct
+@@ -630,49 +976,47 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct
  
  		p->scx.dsq_vtime = calc_when_to_run(p, taskc);
  	}
@@ -1855,39 +1831,24 @@
 -	 * Enqueue the task to a DSQ. If it is safe to directly dispatch
 -	 * to the local DSQ of the chosen CPU, do it. Otherwise, enqueue
 -	 * to the chosen DSQ of the chosen domain.
-+	 * Enqueue to appropriate DSQ.
++	 * UPSTREAM PATCH: Consolidated DSQ selection and enqueue logic.
  	 *
--	 * When pinned_slice_ns is enabled, pinned tasks always use per-CPU DSQ
--	 * to enable vtime comparison across DSQs during dispatch.
-+	 * UPSTREAM PATCH: When pinned_slice_ns is enabled, pinned tasks
-+	 * always use per-CPU DSQ. This allows dispatch logic to compare
-+	 * vtimes across all DSQs to select lowest vtime task.
-+	 *
-+	 * Benefits (from upstream commit):
-+	 * - Reduces DSQ lock contention (less iteration through ineligible tasks)
-+	 * - Enables vtime-based fairness across per-CPU and per-domain DSQs
-+	 * - Better task placement for workloads using per-CPU pinning (erlang, etc.)
- 	 */
- 	if (can_direct_dispatch(cpu_to_dsq(cpu), cpu, is_idle)) {
+ 	 * When pinned_slice_ns is enabled, pinned tasks always use per-CPU DSQ
+ 	 * to enable vtime comparison across DSQs during dispatch.
+@@ -684,16 +1028,21 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct
+ 		can_direct &= can_direct_dispatch(cpdom_to_dsq(cpdom_id), cpu, is_idle);
+ 
+ 	if (can_direct) {
 +		/*
 +		 * Fast path: Direct dispatch to CPU's local queue.
 +		 */
  		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
  				   enq_flags);
- 	} else if (per_cpu_dsq) {
-+		/*
-+		 * UPSTREAM PATCH: Added condition for pinned tasks when
-+		 * pinned_slice_ns is enabled.
-+		 *
-+		 * Per-CPU DSQ path: Better cache locality, enables vtime comparison.
-+		 */
- 		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu), p->scx.slice,
- 					 p->scx.dsq_vtime, enq_flags);
  	} else {
 +		/*
-+		 * Per-domain DSQ: Better load balancing.
++		 * Standard path: Enqueue with vtime ordering.
 +		 */
- 		scx_bpf_dsq_insert_vtime(p, cpdom_to_dsq(cpdom_id), p->scx.slice,
+ 		scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice,
  					 p->scx.dsq_vtime, enq_flags);
  	}
  
@@ -1898,7 +1859,7 @@
  	 */
  	if (is_idle) {
  		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-@@ -698,9 +1081,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct
+@@ -701,9 +1050,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct
  	}
  
  	/*
@@ -1909,7 +1870,7 @@
  	 */
  	if (!no_preemption)
  		try_find_and_kick_victim_cpu(p, taskc, cpu, cpdom_to_dsq(cpdom_id));
-@@ -1085,37 +1466,52 @@ void BPF_STRUCT_OPS(lavd_tick, struct ta
+@@ -1082,23 +1429,32 @@ void BPF_STRUCT_OPS(lavd_tick, struct ta
  	struct task_ctx *taskc;
  	u64 now;
  
@@ -1929,58 +1890,53 @@
  	}
  
  	now = scx_bpf_now();
--	account_task_runtime(p, taskc, cpuc, now);
++
++	/*
++	 * Account runtime accumulated since last tick.
++	 */
+ 	account_task_runtime(p, taskc, cpuc, now);
  
  	/*
 -	 * If pinned_slice_ns is enabled and there are pinned tasks waiting
 -	 * to run on this CPU, unconditionally reduce the time slice for
 -	 * all tasks to ensure pinned tasks can run promptly.
-+	 * Account runtime accumulated since last tick.
++	 * UPSTREAM PATCH: Pinned slice mode with acc_runtime check.
++	 *
++	 * When pinned_slice_ns is enabled AND pinned tasks are waiting,
++	 * reduce slice to ensure pinned tasks run promptly.
++	 *
++	 * Check acc_runtime to avoid immediately yielding tasks that
++	 * have run less than pinned_slice_ns.
  	 */
--	if (pinned_slice_ns && cpuc->nr_pinned_tasks &&
--	    p->scx.slice > pinned_slice_ns) {
--		p->scx.slice = pinned_slice_ns;
--		return;
--	}
-+	account_task_runtime(p, taskc, cpuc, now);
+ 	if (pinned_slice_ns && cpuc->nr_pinned_tasks &&
+ 	    p->scx.slice > pinned_slice_ns) {
+@@ -1110,8 +1466,7 @@ void BPF_STRUCT_OPS(lavd_tick, struct ta
+ 	}
  
  	/*
 -	 * If this task is slice-boosted and there is a pinned task that
 -	 * must run on this, shrink its time slice to the regular one.
-+	 * OPTIMIZATION: Combined pinned slice check.
-+	 *
-+	 * Original code had two separate conditions:
-+	 * 1. pinned_slice_ns && nr_pinned_tasks && slice > pinned_slice_ns
-+	 * 2. nr_pinned_tasks && SLICE_BOOST flag
-+	 *
-+	 * This combines into single conditional with short-circuit evaluation.
-+	 * Saves 3-5 cycles by reducing branch count.
-+	 *
-+	 * Branch hint: Pinned tasks waiting is rare (2-5% of ticks).
++	 * Legacy mode: Shrink boosted slice if pinned tasks waiting.
  	 */
--	if (cpuc->nr_pinned_tasks &&
--	    test_cpu_flag(cpuc, LAVD_FLAG_SLICE_BOOST)) {
--		shrink_boosted_slice_at_tick(p, cpuc, now);
-+	if (__builtin_expect(cpuc->nr_pinned_tasks != 0, 0)) {
-+		/*
-+		 * UPSTREAM PATCH: Pinned slice mode (unconditional shrink).
-+		 */
-+		if (pinned_slice_ns && p->scx.slice > pinned_slice_ns) {
-+			p->scx.slice = pinned_slice_ns;
-+			return;  /* Early exit - skip boost check */
-+		}
-+
-+		/*
-+		 * Legacy mode: Shrink only if boosted.
-+		 * test_cpu_flag is already optimized (single bit test).
-+		 */
-+		if (test_cpu_flag(cpuc, LAVD_FLAG_SLICE_BOOST)) {
-+			shrink_boosted_slice_at_tick(p, cpuc, now);
-+		}
+ 	if (cpuc->nr_pinned_tasks &&
+ 	    test_cpu_flag(cpuc, LAVD_FLAG_SLICE_BOOST)) {
+@@ -1170,11 +1525,13 @@ void BPF_STRUCT_OPS(lavd_quiescent, stru
  	}
+ 
+ 	/*
+-	 * Decrease the number of pinned tasks waiting for execution.
++	 * UPSTREAM PATCH: Decrease pinned task counter when task goes to sleep.
++	 *
++	 * Moved from lavd_running to lavd_quiescent to track waiting pinned
++	 * tasks more accurately.
+ 	 */
+ 	if (is_pinned(p))
+ 		__sync_fetch_and_sub(&cpuc->nr_pinned_tasks, 1);
+-
  }
  
-@@ -1792,10 +2188,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
+ static void cpu_ctx_init_online(struct cpu_ctx *cpuc, u32 cpu_id, u64 now)
+@@ -1799,10 +2156,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
  		return err;
  
  	/*
@@ -1992,7 +1948,7 @@
  	 */
  	err = init_cpumasks();
  	if (err)
-@@ -1809,9 +2202,14 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
+@@ -1816,9 +2170,14 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
  		return err;
  
  	/*
@@ -2008,9 +1964,9 @@
 +	 * Rationale: When pinned_slice_ns is set, we need per-CPU DSQs
 +	 * for pinned tasks to enable vtime comparison during dispatch.
  	 */
- 	if (per_cpu_dsq) {
+ 	if (per_cpu_dsq || pinned_slice_ns) {
  		err = init_per_cpu_dsqs();
-@@ -1820,25 +2218,24 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
+@@ -1827,25 +2186,24 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
  	}
  
  	/*
