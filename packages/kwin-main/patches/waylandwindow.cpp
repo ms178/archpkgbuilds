@@ -96,20 +96,24 @@ void WaylandWindow::killWindow()
     if (Q_UNLIKELY(!surface())) {
         return;
     }
+
     ClientConnection *const c = surface()->client();
     if (Q_UNLIKELY(!c)) {
         return;
     }
+
     static const pid_t selfPid = ::getpid();
     const pid_t targetPid = c->processId();
+
     if (targetPid == selfPid || targetPid == 0) {
         c->destroy();
         return;
     }
+
     ::kill(targetPid, SIGTERM);
-    // give it time to terminate and only if terminate fails, try to destroy the Wayland connection
-    QTimer::singleShot(5000, c, &ClientConnection::destroy);
+    c->destroy();
 }
+
 
 QString WaylandWindow::windowRole() const
 {
