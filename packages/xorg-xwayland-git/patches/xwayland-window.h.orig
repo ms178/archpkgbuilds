@@ -135,6 +135,7 @@ int xwl_config_notify(WindowPtr window,
                       int x, int y,
                       int width, int height, int bw,
                       WindowPtr sib);
+void xwl_reparent_window(WindowPtr window, WindowPtr prior_parent);
 void xwl_resize_window(WindowPtr window,
                        int x, int y,
                        unsigned int width, unsigned int height,

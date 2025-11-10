@@ -78,6 +78,7 @@ struct xwl_screen {
     XYToWindowProcPtr XYToWindow;
     SetWindowPixmapProcPtr SetWindowPixmap;
     ChangeWindowAttributesProcPtr ChangeWindowAttributes;
+    ReparentWindowProcPtr ReparentWindow;
     ResizeWindowProcPtr ResizeWindow;
     MoveWindowProcPtr MoveWindow;
     SourceValidateProcPtr SourceValidate;
