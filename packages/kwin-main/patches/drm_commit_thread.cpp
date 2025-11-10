@@ -21,6 +21,7 @@
 #include <iterator>
 #include <span>
 #include <thread>
+#include <time.h>
 
 using namespace std::chrono_literals;
 
@@ -29,10 +30,24 @@ namespace
 constexpr std::chrono::microseconds kVrrPollInterval{50};
 constexpr uint64_t kMaxPageflipSpan = 10000;
 constexpr std::chrono::milliseconds kDefaultFrameInterval{16};
+
+inline void preciseSleepUntil(const std::chrono::steady_clock::time_point &target)
+{
+    const auto dur = target.time_since_epoch();
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(dur).count();
+    struct timespec ts;
+    ts.tv_sec = static_cast<time_t>(ns / 1'000'000'000LL);
+    ts.tv_nsec = static_cast<long>(ns % 1'000'000'000LL);
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
+}
 }
 
 namespace KWin
 {
+
+static const std::chrono::microseconds s_safetyMarginMinimum{
+    environmentVariableIntValue("KWIN_DRM_OVERRIDE_SAFETY_MARGIN").value_or(1500)
+};
 
 DrmCommitThread::DrmCommitThread(DrmGpu *gpu, const QString &name)
     : m_gpu(gpu)
@@ -69,7 +84,7 @@ DrmCommitThread::DrmCommitThread(DrmGpu *gpu, const QString &name)
             }
 
             if (m_committed) {
-                if (timeout) {
+                if (timeout) [[unlikely]] {
                     m_ping = false;
                     lock.unlock();
                     QMetaObject::invokeMethod(this, &DrmCommitThread::handlePing, Qt::QueuedConnection);
@@ -105,7 +120,7 @@ DrmCommitThread::DrmCommitThread(DrmGpu *gpu, const QString &name)
             if (m_targetPageflipTime > now + m_safetyMargin) {
                 const auto sleepTarget = m_targetPageflipTime - m_safetyMargin;
                 lock.unlock();
-                std::this_thread::sleep_until(sleepTarget);
+                preciseSleepUntil(sleepTarget);
                 lock.lock();
                 if (m_commits.empty()) {
                     continue;
@@ -335,7 +350,7 @@ void DrmCommitThread::addCommit(std::unique_ptr<DrmAtomicCommit> &&commit)
     commit->setDeadline(m_targetPageflipTime - m_safetyMargin);
 
     m_commits.push_back(std::move(commit));
-    m_commitPending.notify_all();
+    m_commitPending.notify_one();
 }
 
 void DrmCommitThread::setPendingCommit(std::unique_ptr<DrmLegacyCommit> &&commit)
@@ -350,8 +365,6 @@ void DrmCommitThread::clearDroppedCommits()
     m_commitsToDelete.clear();
 }
 
-static const std::chrono::microseconds s_safetyMarginMinimum{environmentVariableIntValue("KWIN_DRM_OVERRIDE_SAFETY_MARGIN").value_or(1500)};
-
 void DrmCommitThread::setModeInfo(uint32_t maximum, std::chrono::nanoseconds vblankTime)
 {
     std::unique_lock<std::mutex> lock(m_mutex);
@@ -364,7 +377,7 @@ void DrmCommitThread::setModeInfo(uint32_t maximum, std::chrono::nanoseconds vbl
     m_minVblankInterval = std::chrono::nanoseconds(1'000'000'000'000ull / maximum);
 
     const uint64_t vblankNs = static_cast<uint64_t>(m_minVblankInterval.count());
-    if (vblankNs > 0 && vblankNs < (1ull << 31)) {
+    if (vblankNs > 0 && vblankNs < (1ull << 31)) [[likely]] {
         constexpr uint64_t shift = 63;
         m_vblankReciprocal = ((1ull << shift) + vblankNs - 1) / vblankNs;
         m_vblankReciprocalShift = static_cast<uint8_t>(shift);
@@ -384,8 +397,8 @@ void DrmCommitThread::pageFlipped(std::chrono::nanoseconds timestamp)
     std::unique_lock<std::mutex> lock(m_mutex);
 
     if (m_pageflipTimeoutDetected) [[unlikely]] {
-        qCCritical(KWIN_DRM, "Pageflip arrived %lums after the commit",
-                   std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_lastCommitTime).count());
+        qCCritical(KWIN_DRM, "Pageflip arrived %lldms after the commit",
+                   static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_lastCommitTime).count()));
         m_pageflipTimeoutDetected = false;
     }
 
@@ -394,7 +407,7 @@ void DrmCommitThread::pageFlipped(std::chrono::nanoseconds timestamp)
 
     if (!m_commits.empty()) {
         m_targetPageflipTime = estimateNextVblank(std::chrono::steady_clock::now());
-        m_commitPending.notify_all();
+        m_commitPending.notify_one();
     }
 }
 
