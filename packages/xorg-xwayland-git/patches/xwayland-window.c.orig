@@ -67,6 +67,7 @@
 #define FRACTIONAL_SCALE_DENOMINATOR 120
 
 static DevPrivateKeyRec xwl_window_private_key;
+static DevPrivateKeyRec xwl_wm_window_private_key;
 static DevPrivateKeyRec xwl_damage_private_key;
 static const char *xwl_surface_tag = "xwl-surface";
 
@@ -393,6 +394,7 @@ xwl_window_disable_viewport(struct xwl_window *xwl_window)
     xwl_window->viewport = NULL;
     xwl_window->viewport_scale_x = 1.0;
     xwl_window->viewport_scale_y = 1.0;
+    xwl_window_set_input_region(xwl_window, wInputShape(xwl_window->toplevel));
 }
 
 /* Enable the viewport for fractional scale support with Xwayland rootful.
@@ -429,6 +431,7 @@ xwl_window_enable_viewport_for_fractional_scale(struct xwl_window *xwl_window,
 
     xwl_window->viewport_scale_x = scale;
     xwl_window->viewport_scale_y = scale;
+    xwl_window_set_input_region(xwl_window, wInputShape(xwl_window->toplevel));
 }
 
 /* Enable the viewport for Xwayland rootful fullscreen, to match the XRandR
@@ -464,14 +467,39 @@ xwl_window_enable_viewport_for_output(struct xwl_window *xwl_window,
 
     xwl_window->viewport_scale_x = (float) width / xwl_output->width;
     xwl_window->viewport_scale_y = (float) height / xwl_output->height;
+    xwl_window_set_input_region(xwl_window, wInputShape(xwl_window->toplevel));
 }
 
 static Bool
 window_is_wm_window(WindowPtr window)
 {
     struct xwl_screen *xwl_screen = xwl_screen_get(window->drawable.pScreen);
+    Bool *is_wm_window;
 
-    return CLIENT_ID(window->drawable.id) == xwl_screen->wm_client_id;
+    if (CLIENT_ID(window->drawable.id) == xwl_screen->wm_client_id)
+        return TRUE;
+
+    is_wm_window = dixLookupPrivate(&window->devPrivates, &xwl_wm_window_private_key);
+    return *is_wm_window;
+}
+
+static WindowPtr
+get_single_input_output_child(WindowPtr window)
+{
+    WindowPtr iter, input_output_child = NULL;
+
+    for (iter = window->firstChild; iter; iter = iter->nextSib) {
+        if (iter->drawable.class != InputOutput)
+            continue;
+
+        /* We're looking for a single InputOutput child, bail if there are multiple */
+        if (input_output_child)
+            return NULL;
+
+        input_output_child = iter;
+    }
+
+    return input_output_child;
 }
 
 static WindowPtr
@@ -482,14 +510,10 @@ window_get_client_toplevel(WindowPtr window)
     /* If the toplevel window is owned by the window-manager, then the
      * actual client toplevel window has been reparented to some window-manager
      * decoration/wrapper windows. In that case recurse by checking the client
-     * of the first *and only* child of the decoration/wrapper window.
+     * of the only InputOutput child of the decoration/wrapper window.
      */
-    while (window_is_wm_window(window)) {
-        if (!window->firstChild || window->firstChild != window->lastChild)
-            return NULL; /* Should never happen, skip resolution emulation */
-
-        window = window->firstChild;
-    }
+    while (window && window_is_wm_window(window))
+        window = get_single_input_output_child(window);
 
     return window;
 }
@@ -1840,6 +1864,31 @@ xwl_config_notify(WindowPtr window,
 }
 
 void
+xwl_reparent_window(WindowPtr window, WindowPtr prior_parent)
+{
+    ScreenPtr screen = window->drawable.pScreen;
+    struct xwl_screen *xwl_screen = xwl_screen_get(screen);
+    WindowPtr parent = window->parent;
+    Bool *is_wm_window;
+
+    if (xwl_screen->ReparentWindow) {
+        screen->ReparentWindow = xwl_screen->ReparentWindow;
+        screen->ReparentWindow(window, prior_parent);
+        xwl_screen->ReparentWindow = screen->ReparentWindow;
+        screen->ReparentWindow = xwl_reparent_window;
+    }
+
+    if (!parent->parent ||
+        GetCurrentClient()->index != xwl_screen->wm_client_id)
+        return;
+
+    /* If the WM client reparents a window, mark the new parent as a WM window */
+    is_wm_window = dixLookupPrivate(&parent->devPrivates,
+                                    &xwl_wm_window_private_key);
+    *is_wm_window = TRUE;
+}
+
+void
 xwl_resize_window(WindowPtr window,
                   int x, int y,
                   unsigned int width, unsigned int height,
@@ -2037,12 +2086,20 @@ xwl_window_set_input_region(struct xwl_window *xwl_window,
     region = wl_compositor_create_region(xwl_window->xwl_screen->compositor);
     box = RegionRects(input_shape);
 
-    for (i = 0; i < RegionNumRects(input_shape); ++i, ++box) {
-        wl_region_add(region,
-                      box->x1,
-                      box->y1,
-                      box->x2 - box->x1,
-                      box->y2 - box->y1);
+    for (i = 0; i < RegionNumRects(input_shape); ++i) {
+        BoxRec b = box[i];
+
+        if (xwl_window->viewport_scale_x != 1.0f) {
+            b.x1 = floorf(b.x1 / xwl_window->viewport_scale_x);
+            b.x2 = ceilf(b.x2 / xwl_window->viewport_scale_x);
+        }
+
+        if (xwl_window->viewport_scale_y != 1.0f) {
+            b.y1 = floorf(b.y1 / xwl_window->viewport_scale_y);
+            b.y2 = ceilf(b.y2 / xwl_window->viewport_scale_y);
+        }
+
+        wl_region_add(region, b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1);
     }
 
     wl_surface_set_input_region(xwl_window->surface, region);
@@ -2053,6 +2110,10 @@ Bool
 xwl_window_init(void)
 {
     if (!dixRegisterPrivateKey(&xwl_window_private_key, PRIVATE_WINDOW, 0))
+        return FALSE;
+
+    if (!dixRegisterPrivateKey(&xwl_wm_window_private_key, PRIVATE_WINDOW,
+                               sizeof(Bool)))
         return FALSE;
 
     if (!dixRegisterPrivateKey(&xwl_damage_private_key, PRIVATE_WINDOW, 0))
