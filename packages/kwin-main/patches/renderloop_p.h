@@ -3,7 +3,6 @@
     This file is part of the KDE project.
 
     SPDX-FileCopyrightText: 2020 Vlad Zahorodnii <vlad.zahorodnii@kde.org>
-
     SPDX-License-Identifier: GPL-2.0-or-later
 */
 
@@ -15,9 +14,10 @@
 
 #include <QBasicTimer>
 
-#include <fstream>
-#include <optional>
 #include <cstdint>
+#include <fstream>
+#include <memory>
+#include <optional>
 
 namespace KWin
 {
@@ -26,15 +26,15 @@ class SurfaceItem;
 class OutputFrame;
 class Window;
 
-class alignas(64) KWIN_EXPORT RenderLoopPrivate {
+class KWIN_EXPORT RenderLoopPrivate {
 public:
     std::chrono::nanoseconds lastPresentationTimestamp{0};
     std::chrono::nanoseconds nextPresentationTimestamp{0};
     uint64_t cachedVblankIntervalNs;
-    uint64_t vblankIntervalReciprocal;
     uint64_t vblankIntervalReciprocal64;
-    uint8_t reciprocalShift;
+    uint64_t vblankIntervalReciprocal;
     uint8_t reciprocalShift64;
+    uint8_t reciprocalShift;
     PresentationMode presentationMode = PresentationMode::VSync;
     uint8_t vrrStabilityCounter = 0;
     bool pendingReschedule = false;
@@ -43,7 +43,6 @@ public:
     int16_t doubleBufferingCounter = 0;
     int pendingFrameCount = 0;
     int maxPendingFrameCount = 1;
-    uint8_t padding0[8];
 
     RenderLoop *const q;
     Output *const output;
@@ -59,25 +58,18 @@ public:
     };
     VrrMode vrrMode = VrrMode::Automatic;
     int inhibitCount = 0;
-    uint8_t padding1[20];
 
-    struct alignas(64) VrrContext {
-        Window *cachedActiveWindow = nullptr;
-        SurfaceItem *cachedSurfaceItem = nullptr;
-        PresentationModeHint cachedHint = PresentationModeHint::VSync;
-        ContentType cachedContentType = ContentType::None;
-        uint32_t generation = 0;
-        bool cachedIsFullScreen = false;
-        bool cachedIsOnOutput = false;
-        uint8_t padding[34];
-    } vrrCtx;
+    Window *cachedActiveWindow = nullptr;
+    SurfaceItem *cachedSurfaceItem = nullptr;
+    PresentationModeHint cachedHint = PresentationModeHint::VSync;
+    ContentType cachedContentType = ContentType::None;
+    bool cachedIsFullScreen = false;
+    bool cachedIsOnOutput = false;
 
-    uint32_t vrrCtxGeneration = 0;
-    uint8_t padding2[60];
-
-    alignas(64) QBasicTimer compositeTimer;
+    QBasicTimer compositeTimer;
     QBasicTimer delayedVrrTimer;
     RenderJournal renderJournal;
+
     std::optional<std::fstream> m_debugOutput;
 
     [[nodiscard]] static RenderLoopPrivate *get(RenderLoop *loop) noexcept;
@@ -85,7 +77,7 @@ public:
 
     void updateReciprocal() noexcept;
     void initializeVrrCapabilities();
-    void updateVrrContext();
+    void updateVrrContext() noexcept;
     [[nodiscard]] PresentationMode selectPresentationModeFromContext() const noexcept;
     void dispatch();
     void delayScheduleRepaint() noexcept;
@@ -95,7 +87,5 @@ public:
     void notifyFrameCompleted(std::chrono::nanoseconds timestamp, std::optional<RenderTimeSpan> renderTime, PresentationMode mode, OutputFrame *frame);
     void notifyVblank(std::chrono::nanoseconds timestamp);
 };
-
-static_assert(sizeof(RenderLoopPrivate::VrrContext) == 64, "VrrContext must be exactly one cache line");
 
 } // namespace KWin
