@@ -14,6 +14,8 @@
 
 #include <QBasicTimer>
 
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <fstream>
 #include <memory>
@@ -66,6 +68,14 @@ public:
     bool cachedIsFullScreen = false;
     bool cachedIsOnOutput = false;
 
+    PresentationModeHint lastObservedHint = PresentationModeHint::VSync;
+    PresentationMode lastStableMode = PresentationMode::VSync;
+    std::chrono::steady_clock::time_point lastModeSwitch{};
+    std::array<std::chrono::steady_clock::time_point, 8> modeSwitchHistory{};
+    uint8_t modeSwitchHistoryIndex = 0;
+    bool vrrOscillationLockout = false;
+    uint16_t stableModeFrameCount = 0;
+
     QBasicTimer compositeTimer;
     QBasicTimer delayedVrrTimer;
     RenderJournal renderJournal;
@@ -78,7 +88,10 @@ public:
     void updateReciprocal() noexcept;
     void initializeVrrCapabilities();
     void updateVrrContext() noexcept;
-    [[nodiscard]] PresentationMode selectPresentationModeFromContext() const noexcept;
+    [[nodiscard]] PresentationMode selectPresentationModeFromContext() noexcept;
+    [[nodiscard]] bool checkForPresentationHintChange() noexcept;
+    [[nodiscard]] bool detectVrrOscillation() noexcept;
+    void recordModeSwitch() noexcept;
     void dispatch();
     void delayScheduleRepaint() noexcept;
     void scheduleNextRepaint();
