@@ -1626,16 +1626,6 @@ try_vectorize(nir_function_impl *impl, struct vectorize_ctx *ctx,
 
    /* find a good bit size for the new load/store */
    unsigned new_bit_size = 0;
-   /* Integrated hardware heuristic: For shared memory (LDS), wider 64-bit
-    * accesses are often more efficient on GFX9+. We try this first.
-    */
-   if (get_variable_mode(low) == nir_var_mem_shared) {
-      if (new_bitsize_acceptable(ctx, 64, low, high, new_size)) {
-         new_bit_size = 64;
-         goto found_bitsize;
-      }
-   }
-
    if (new_bitsize_acceptable(ctx, low_bit_size, low, high, new_size)) {
       new_bit_size = low_bit_size;
    } else if (low_bit_size != high_bit_size &&
@@ -1658,8 +1648,6 @@ try_vectorize(nir_function_impl *impl, struct vectorize_ctx *ctx,
    } else {
       return false;
    }
-
-found_bitsize:
    unsigned new_num_components = new_size / new_bit_size;
 
    /* vectorize the loads/stores */
@@ -1718,15 +1706,15 @@ try_vectorize_shared2(struct vectorize_ctx *ctx,
       }
    }
 
-   /* vectorize the accesses */
-   nir_builder b = nir_builder_at(nir_after_instr(first->is_store ? second->instr : first->instr));
-
-   nir_def *offset = first->intrin->src[first->is_store].ssa;
-   offset = nir_iadd_imm(&b, offset, nir_intrinsic_base(first->intrin));
+   /* Take low as base address. */
+   nir_def *offset = low->intrin->src[first->is_store].ssa;
    if (first != low) {
-      offset = nir_iadd_imm(&b, offset, -(int)diff);
+      hoist_base_addr(&first->intrin->instr, offset->parent_instr);
    }
+   nir_builder b = nir_builder_at(nir_after_instr(first->is_store ? second->instr : first->instr));
+   offset = nir_iadd_imm(&b, offset, nir_intrinsic_base(low->intrin));
 
+   /* vectorize the accesses */
    uint32_t access = nir_intrinsic_access(first->intrin);
    if (first->is_store) {
       nir_def *low_val = low->intrin->src[low->info->value_src].ssa;
@@ -1765,83 +1753,75 @@ static bool
 vectorize_sorted_entries(struct vectorize_ctx *ctx, nir_function_impl *impl,
                          struct util_dynarray *arr)
 {
-   bool progress = false;
    unsigned num_entries = util_dynarray_num_elements(arr, struct entry *);
 
-   /* Main pass: compact in-place to avoid second traversal. */
-   unsigned write_idx = 0;
-   for (unsigned i = 0; i < num_entries; i++) {
-      struct entry *low = *util_dynarray_element(arr, struct entry *, i);
-      if (!low) continue;
-
-      struct entry *merged_low = low;
-
-      /* Prefetch next entries to hide latency (Raptor Lake hardware prefetcher
-       * works well sequentially, but manual hint helps irregular patterns).
-       */
-      if (i + 4 < num_entries) {
-         __builtin_prefetch(util_dynarray_element(arr, struct entry *, i + 4), 0, 1);
-      }
-
-      for (unsigned j = i + 1; j < num_entries; j++) {
-         struct entry *high = *util_dynarray_element(arr, struct entry *, j);
-         if (!high) continue;
-
-         struct entry *first = merged_low->index < high->index ? merged_low : high;
-         struct entry *second = merged_low->index < high->index ? high : merged_low;
-
-         uint64_t diff = get_offset_diff(merged_low, high);
-         unsigned max_hole = first->is_store ? 0 : 28;
-         unsigned low_size = get_bit_size(merged_low) / 8u * merged_low->num_components;
-
-         /* Critical: early break when offset gap too large (changes O(n²) to O(n)). */
-         if (diff > low_size + max_hole) break;
-
-         if (try_vectorize(impl, ctx, merged_low, high, first, second)) {
-            merged_low = merged_low->is_store ? second : first;
-            *util_dynarray_element(arr, struct entry *, j) = NULL;
-            progress = true;
-         }
-      }
-
-      *util_dynarray_element(arr, struct entry *, write_idx++) = merged_low;
-   }
-
-   arr->size = write_idx * sizeof(struct entry *);
-   num_entries = write_idx;
-
-   if (!ctx->options->has_shared2_amd) return progress;
-
-   /* Second pass for shared2_amd (after compaction, array is smaller/cache-friendlier). */
-   write_idx = 0;
-   for (unsigned i = 0; i < num_entries; i++) {
-      struct entry *low = *util_dynarray_element(arr, struct entry *, i);
-      if (!low || get_variable_mode(low) != nir_var_mem_shared) {
-         if (low) *util_dynarray_element(arr, struct entry *, write_idx++) = low;
+   bool progress = false;
+   for (unsigned first_idx = 0; first_idx < num_entries; first_idx++) {
+      struct entry *low = *util_dynarray_element(arr, struct entry *, first_idx);
+      if (!low) {
          continue;
       }
 
-      bool consumed = false;
-      for (unsigned j = i + 1; j < num_entries; j++) {
-         struct entry *high = *util_dynarray_element(arr, struct entry *, j);
-         if (!high || get_variable_mode(high) != nir_var_mem_shared) continue;
+      for (unsigned second_idx = first_idx + 1; second_idx < num_entries; second_idx++) {
+         struct entry *high = *util_dynarray_element(arr, struct entry *, second_idx);
+         if (!high) {
+            continue;
+         }
+
+         struct entry *first = low->index < high->index ? low : high;
+         struct entry *second = low->index < high->index ? high : low;
+
+         uint64_t diff = get_offset_diff(low, high);
+         /* Allow overfetching by 28 bytes, which can be rejected by the
+          * callback if needed.  Driver callbacks will likely want to
+          * restrict this to a smaller value, say 4 bytes (or none).
+          */
+         unsigned max_hole = first->is_store ? 0 : 28;
+         unsigned low_size = get_bit_size(low) / 8u * low->num_components;
+         bool separate = diff > max_hole + low_size;
+         if (separate) {
+            continue;
+         }
+
+         if (try_vectorize(impl, ctx, low, high, first, second)) {
+            low = low->is_store ? second : first;
+            *util_dynarray_element(arr, struct entry *, second_idx) = NULL;
+            progress = true;
+         }
+      }
+      *util_dynarray_element(arr, struct entry *, first_idx) = low;
+   }
+
+   if (!ctx->options->has_shared2_amd) {
+      return progress;
+   }
+
+   /* Do a second pass for backends which support load/store shared2. */
+   for (unsigned first_idx = 0; first_idx < num_entries; first_idx++) {
+      struct entry *low = *util_dynarray_element(arr, struct entry *, first_idx);
+      if (!low || get_variable_mode(low) != nir_var_mem_shared) {
+         continue;
+      }
+
+      for (unsigned second_idx = first_idx + 1; second_idx < num_entries; second_idx++) {
+         struct entry *high = *util_dynarray_element(arr, struct entry *, second_idx);
+         if (!high || get_variable_mode(high) != nir_var_mem_shared) {
+            continue;
+         }
 
          struct entry *first = low->index < high->index ? low : high;
          struct entry *second = low->index < high->index ? high : low;
          if (try_vectorize_shared2(ctx, low, high, first, second)) {
-            *util_dynarray_element(arr, struct entry *, j) = NULL;
-            consumed = true;
+            low = NULL;
+            *util_dynarray_element(arr, struct entry *, second_idx) = NULL;
             progress = true;
             break;
          }
       }
 
-      if (!consumed) {
-         *util_dynarray_element(arr, struct entry *, write_idx++) = low;
-      }
+      *util_dynarray_element(arr, struct entry *, first_idx) = low;
    }
 
-   arr->size = write_idx * sizeof(struct entry *);
    return progress;
 }
 
@@ -1855,26 +1835,17 @@ vectorize_entries(struct vectorize_ctx *ctx, nir_function_impl *impl, struct has
    bool progress = false;
    hash_table_foreach(ht, entry) {
       struct util_dynarray *arr = entry->data;
-
-      /* Optimization: Skip sorting for 0-1 elements (15–20% of buckets). */
-      unsigned num_entries = util_dynarray_num_elements(arr, struct entry *);
-      if (num_entries <= 1) {
-         if (num_entries == 1) {
-            struct entry **elem_ptr = (struct entry **)util_dynarray_begin(arr);
-            if (*elem_ptr) {
-               progress |= update_align(*elem_ptr);
-            }
-         }
+      if (!arr->size) {
          continue;
       }
 
-      sort_entries_specialized((struct entry **)util_dynarray_begin(arr), num_entries);
+      sort_entries_specialized((struct entry **)util_dynarray_begin(arr),
+                              util_dynarray_num_elements(arr, struct entry *));
 
-      if (vectorize_sorted_entries(ctx, impl, arr)) {
+      while (vectorize_sorted_entries(ctx, impl, arr)) {
          progress = true;
       }
 
-      /* Final alignment update on remaining/modified entries. */
       util_dynarray_foreach(arr, struct entry *, elem) {
          if (*elem) {
             progress |= update_align(*elem);
@@ -2032,17 +2003,10 @@ process_block(nir_function_impl *impl, struct vectorize_ctx *ctx, nir_block *blo
          arr = (struct util_dynarray *)adj_entry->data;
       } else {
          arr = ralloc(ctx, struct util_dynarray);
-         /* This is a manual initialization of util_dynarray to work around
-          * a `-Wstringop-overflow` warning in LTO builds. The original
-          * `util_dynarray_init` can cause a false positive. This is safe.
-          */
-         arr->data = NULL;
-         arr->size = 0;
-         arr->capacity = 0;
-         arr->mem_ctx = arr;
+         util_dynarray_init(arr, arr);
          _mesa_hash_table_insert_pre_hashed(adj_ht, key_hash, entry->key, arr);
       }
-      util_dynarray_append(arr, struct entry *, entry);
+      util_dynarray_append(arr, entry);
    }
 
    /* sort and combine entries */
@@ -2057,7 +2021,7 @@ process_block(nir_function_impl *impl, struct vectorize_ctx *ctx, nir_block *blo
 bool
 nir_opt_load_store_vectorize(nir_shader *shader, const nir_load_store_vectorize_options *options)
 {
-   bool overall_progress = false;
+   bool progress = false;
 
    struct vectorize_ctx *ctx = rzalloc(NULL, struct vectorize_ctx);
    ctx->shader = shader;
@@ -2071,34 +2035,16 @@ nir_opt_load_store_vectorize(nir_shader *shader, const nir_load_store_vectorize_
          nir_function_impl_index_vars(impl);
       }
 
-      bool impl_progress = false;
       nir_foreach_block(block, impl) {
-         impl_progress |= process_block(impl, ctx, block);
+         progress |= process_block(impl, ctx, block);
       }
 
-      if (impl_progress) {
-         overall_progress = true;
-
-         /*
-          * This is the corrected API call, adhering strictly to the signature
-          * from nir.h: nir_progress(bool, nir_function_impl *, nir_metadata).
-          *
-          * 1. `impl_progress`: The boolean flag indicating if changes were made.
-          * 2. `impl`: The pointer to the function implementation being processed.
-          * 3. `nir_metadata_control_flow`: The metadata to preserve because
-          *    this pass does not alter the control flow graph.
-          */
-         nir_progress(impl_progress, impl, nir_metadata_control_flow);
-      } else {
-         /* If no progress was made, we must still call nir_progress to indicate
-          * that all metadata is preserved and validation checks can pass.
-          */
-         nir_progress(impl_progress, impl, nir_metadata_all);
-      }
+      nir_progress(true, impl,
+                   nir_metadata_control_flow | nir_metadata_live_defs);
    }
 
    ralloc_free(ctx);
-   return overall_progress;
+   return progress;
 }
 
 static bool
