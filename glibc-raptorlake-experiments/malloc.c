@@ -909,7 +909,7 @@ libc_hidden_proto (__libc_mallopt)
 #define M_TRIM_THRESHOLD       -1
 
 #ifndef DEFAULT_TRIM_THRESHOLD
-#define DEFAULT_TRIM_THRESHOLD (512 * 1024)
+#define DEFAULT_TRIM_THRESHOLD (128 * 1024)
 #endif
 
 /*
@@ -942,7 +942,7 @@ libc_hidden_proto (__libc_mallopt)
 #define M_TOP_PAD              -2
 
 #ifndef DEFAULT_TOP_PAD
-#define DEFAULT_TOP_PAD        (256 * 1024)
+#define DEFAULT_TOP_PAD        (0)
 #endif
 
 /*
@@ -951,7 +951,7 @@ libc_hidden_proto (__libc_mallopt)
 */
 
 #ifndef DEFAULT_MMAP_THRESHOLD_MIN
-#define DEFAULT_MMAP_THRESHOLD_MIN (512 * 1024)
+#define DEFAULT_MMAP_THRESHOLD_MIN (128 * 1024)
 #endif
 
 #ifndef DEFAULT_MMAP_THRESHOLD_MAX
@@ -1337,19 +1337,22 @@ checked_request2size (size_t req)
   /* Reject sizes larger than PTRDIFF_MAX to preserve internal assumptions
      and avoid wraparound in later computations. */
   if (__glibc_unlikely (req > PTRDIFF_MAX))
-  {
-    return SIZE_MAX;
-  }
+    {
+      return SIZE_MAX;
+    }
 
   /* When using tagged memory, round the request up to the granule size so
      that user data and the following chunk header never overlap. The asm
      barrier prevents GCC from evaluating the code when mtag_enabled is false
      (workaround for GCC PR 99551). */
   if (__glibc_unlikely (mtag_enabled))
-  {
-    asm ("");
-    req = (req + (__MTAG_GRANULE_SIZE - 1)) & ~(size_t) (__MTAG_GRANULE_SIZE - 1);
-  }
+    {
+      asm ("");
+      /* Check for overflow before rounding */
+      if (req > SIZE_MAX - (__MTAG_GRANULE_SIZE - 1))
+        return SIZE_MAX;
+      req = (req + (__MTAG_GRANULE_SIZE - 1)) & ~(size_t) (__MTAG_GRANULE_SIZE - 1);
+    }
 
   /* Convert request to internal chunk size with alignment/min size enforcement. */
   return request2size (req);
@@ -1618,50 +1621,50 @@ static void
 unlink_chunk (mstate av, mchunkptr p)
 {
   if (chunksize (p) != prev_size (next_chunk (p)))
-  {
-    malloc_printerr ("corrupted size vs. prev_size");
-  }
+    {
+      malloc_printerr ("corrupted size vs. prev_size");
+    }
 
   mchunkptr fd = p->fd;
   mchunkptr bk = p->bk;
 
   if (__glibc_unlikely (fd->bk != p || bk->fd != p))
-  {
-    malloc_printerr ("corrupted double-linked list");
-  }
+    {
+      malloc_printerr ("corrupted double-linked list");
+    }
 
   fd->bk = bk;
   bk->fd = fd;
 
   /* Use chunksize() here to avoid status bits in chunksize_nomask(). */
   if (!in_smallbin_range (chunksize (p)) && p->fd_nextsize != NULL)
-  {
-    if (p->fd_nextsize->bk_nextsize != p
-        || p->bk_nextsize->fd_nextsize != p)
     {
-      malloc_printerr ("corrupted double-linked list (not small)");
-    }
+      if (p->fd_nextsize->bk_nextsize != p
+          || p->bk_nextsize->fd_nextsize != p)
+        {
+          malloc_printerr ("corrupted double-linked list (not small)");
+        }
 
-    if (fd->fd_nextsize == NULL)
-    {
-      if (p->fd_nextsize == p)
-      {
-        fd->fd_nextsize = fd->bk_nextsize = fd;
-      }
+      if (fd->fd_nextsize == NULL)
+        {
+          if (p->fd_nextsize == p)
+            {
+              fd->fd_nextsize = fd->bk_nextsize = fd;
+            }
+          else
+            {
+              fd->fd_nextsize = p->fd_nextsize;
+              fd->bk_nextsize = p->bk_nextsize;
+              p->fd_nextsize->bk_nextsize = fd;
+              p->bk_nextsize->fd_nextsize = fd;
+            }
+        }
       else
-      {
-        fd->fd_nextsize = p->fd_nextsize;
-        fd->bk_nextsize = p->bk_nextsize;
-        p->fd_nextsize->bk_nextsize = fd;
-        p->bk_nextsize->fd_nextsize = fd;
-      }
+        {
+          p->fd_nextsize->bk_nextsize = p->bk_nextsize;
+          p->bk_nextsize->fd_nextsize = p->fd_nextsize;
+        }
     }
-    else
-    {
-      p->fd_nextsize->bk_nextsize = p->bk_nextsize;
-      p->bk_nextsize->fd_nextsize = p->fd_nextsize;
-    }
-  }
 }
 
 /*
@@ -2420,14 +2423,30 @@ do_check_malloc_state (mstate av)
 static void *
 sysmalloc_mmap (INTERNAL_SIZE_T nb, size_t pagesize, int extra_flags)
 {
+  /* Defensive check: nb should already be validated but verify assumption */
+  if (__glibc_unlikely (nb > PTRDIFF_MAX))
+    return MAP_FAILED;
+
   size_t padding = MALLOC_ALIGNMENT - CHUNK_HDR_SZ;
-  size_t size = ALIGN_UP (nb + padding + SIZE_SZ, pagesize);
+  size_t size;
+
+  /* Check for overflow in size calculation */
+  if (__glibc_unlikely (__builtin_add_overflow (nb, padding, &size)) ||
+      __glibc_unlikely (__builtin_add_overflow (size, SIZE_SZ, &size)))
+    return MAP_FAILED;
+
+  size = ALIGN_UP (size, pagesize);
+
+  /* Final overflow check: if size wrapped to <= nb, we overflowed */
+  if (__glibc_unlikely (size <= nb))
+    return MAP_FAILED;
 
   char *mm = (char *) MMAP (NULL, size,
-			    mtag_mmap_flags | PROT_READ | PROT_WRITE,
-			    extra_flags);
+                            mtag_mmap_flags | PROT_READ | PROT_WRITE,
+                            extra_flags);
   if (mm == MAP_FAILED)
     return mm;
+
   if (extra_flags == 0)
     madvise_thp (mm, size);
 
@@ -2662,9 +2681,6 @@ sysmalloc (INTERNAL_SIZE_T nb, mstate av)
 	}
       else
 	size = ALIGN_UP (size, GLRO(dl_pagesize));
-
-      if (size < 512 * 1024)
-      size = 512 * 1024;
 
       /*
          Don't try to call MORECORE if argument is so big as to appear
@@ -3110,39 +3126,77 @@ tcache_key_initialize (void)
   if (__getrandom_nocancel_nostatus_direct (&tcache_key, sizeof (tcache_key),
                                             GRND_NONBLOCK)
       != sizeof (tcache_key))
-  {
-    /* If we could not obtain full random bytes, start from zero so that
-       the loop below will generate a suitable key using random_bits(). */
-    tcache_key = 0;
-  }
+    {
+      /* If we could not obtain full random bytes, start from zero so that
+         the loop below will generate a suitable key using random_bits(). */
+      tcache_key = 0;
+    }
 
   /* We need tcache_key to be non-zero, and we want a reasonable density of 1-bits
      to avoid frequent collisions with common memory patterns. */
-  int minimum_bits = __WORDSIZE / 4;
-  int maximum_bits = __WORDSIZE - minimum_bits;
+  const int minimum_bits = __WORDSIZE / 4;
+  const int maximum_bits = __WORDSIZE - minimum_bits;
 
   /* Avoid UB from labs(LONG_MIN) by using only unsigned and bitwise tests. */
   while (tcache_key == 0
          || stdc_count_ones (tcache_key) < minimum_bits
          || stdc_count_ones (tcache_key) > maximum_bits
          || (tcache_key & UINT32_C (0x00ffffff)) == tcache_key)
-  {
-    uintptr_t hi = (uintptr_t) random_bits ();
+    {
+      uintptr_t hi = (uintptr_t) random_bits ();
 #if __WORDSIZE == 64
-    uintptr_t lo = (uintptr_t) random_bits ();
-    tcache_key = (hi << 32) | lo;
+      uintptr_t lo = (uintptr_t) random_bits ();
+      tcache_key = (hi << 32) | lo;
 #else
-    tcache_key = hi;
+      tcache_key = hi;
 #endif
-  }
+    }
 }
 
 static __always_inline size_t
-large_csize2tidx(size_t nb)
+large_csize2tidx (size_t nb)
 {
-  size_t idx = TCACHE_SMALL_BINS
-	       + __builtin_clz (MAX_TCACHE_SMALL_SIZE)
-	       - __builtin_clz (nb);
+  /* Guard against undefined behavior in clz on zero. */
+  if (__glibc_unlikely (nb == 0))
+    {
+      return TCACHE_SMALL_BINS;
+    }
+
+  /* Use size-appropriate clz intrinsic to avoid truncation on 64-bit */
+#if SIZE_MAX == UINT64_MAX
+  unsigned int lz_ref = __builtin_clzl ((unsigned long) MAX_TCACHE_SMALL_SIZE);
+  unsigned int lz_nb  = __builtin_clzl ((unsigned long) nb);
+#else
+  unsigned int lz_ref = __builtin_clz ((unsigned int) MAX_TCACHE_SMALL_SIZE);
+  unsigned int lz_nb  = __builtin_clz ((unsigned int) nb);
+#endif
+
+  /* Check for overflow/underflow in subtraction */
+  size_t idx;
+  if (__glibc_unlikely (lz_nb > lz_ref))
+    {
+      /* nb is smaller than MAX_TCACHE_SMALL_SIZE, shouldn't happen for large bins */
+      idx = TCACHE_SMALL_BINS;
+    }
+  else
+    {
+      idx = TCACHE_SMALL_BINS + (size_t) (lz_ref - lz_nb);
+    }
+
+  /* Clamp to valid range for defense-in-depth. */
+  if (__glibc_unlikely (idx < TCACHE_SMALL_BINS))
+    {
+      idx = TCACHE_SMALL_BINS;
+    }
+  if (__glibc_unlikely (idx >= TCACHE_MAX_BINS))
+    {
+      idx = TCACHE_MAX_BINS - 1;
+    }
+
+#ifndef NDEBUG
+  assert (idx >= TCACHE_SMALL_BINS && idx < TCACHE_MAX_BINS);
+#endif
+
   return idx;
 }
 
@@ -3235,42 +3289,6 @@ tcache_put_large (mchunkptr chunk, size_t tc_idx)
 
   /* Insert the chunk into the determined position. */
   tcache_put_n (chunk, tc_idx, entry, mangled);
-}
-
-static __always_inline size_t
-large_csize2tidx (size_t nb)
-{
-  /* Guard against undefined behavior in clz on zero. */
-  if (__glibc_unlikely (nb == 0))
-  {
-    return TCACHE_SMALL_BINS;
-  }
-
-#if SIZE_MAX == UINT64_MAX
-  unsigned int lz_ref = __builtin_clzl ((unsigned long) MAX_TCACHE_SMALL_SIZE);
-  unsigned int lz_nb  = __builtin_clzl ((unsigned long) nb);
-#else
-  unsigned int lz_ref = __builtin_clz ((unsigned int) MAX_TCACHE_SMALL_SIZE);
-  unsigned int lz_nb  = __builtin_clz ((unsigned int) nb);
-#endif
-
-  size_t idx = TCACHE_SMALL_BINS + (size_t) (lz_ref - lz_nb);
-
-  /* Clamp to valid range for defense-in-depth. */
-  if (__glibc_unlikely (idx < TCACHE_SMALL_BINS))
-  {
-    idx = TCACHE_SMALL_BINS;
-  }
-  if (__glibc_unlikely (idx >= TCACHE_MAX_BINS))
-  {
-    idx = TCACHE_MAX_BINS - 1;
-  }
-
-#ifndef NDEBUG
-  assert (idx >= TCACHE_SMALL_BINS && idx < TCACHE_MAX_BINS);
-#endif
-
-  return idx;
 }
 
 static __always_inline void *
@@ -3366,28 +3384,28 @@ tcache_thread_shutdown (void)
   tcache_shutting_down = true;
 
   if (!tcache)
-  {
-    return;
-  }
+    {
+      return;
+    }
 
   /* Disable the tcache and prevent it from being reinitialized.  */
   tcache = NULL;
 
   /* Free all of the chunk entries back to the arena heap for coalescing.  */
   for (i = 0; i < TCACHE_MAX_BINS; ++i)
-  {
-    while (tcache_tmp->entries[i])
     {
-      tcache_entry *e = tcache_tmp->entries[i];
-      if (__glibc_unlikely (misaligned_mem (e)))
-      {
-        malloc_printerr ("tcache_thread_shutdown(): "
-                         "unaligned tcache chunk detected");
-      }
-      tcache_tmp->entries[i] = REVEAL_PTR (e->next);
-      __libc_free (e);
+      while (tcache_tmp->entries[i])
+        {
+          tcache_entry *e = tcache_tmp->entries[i];
+          if (__glibc_unlikely (misaligned_mem (e)))
+            {
+              malloc_printerr ("tcache_thread_shutdown(): "
+                               "unaligned tcache chunk detected");
+            }
+          tcache_tmp->entries[i] = REVEAL_PTR (e->next);
+          __libc_free (e);
+        }
     }
-  }
 
   /* Deallocate the tcache struct itself.  It was allocated via mmap.  */
   __munmap (tcache_tmp, sizeof (tcache_perthread_struct));
@@ -3399,18 +3417,18 @@ static void
 tcache_init (void)
 {
   if (tcache_shutting_down)
-  {
-    return;
-  }
+    {
+      return;
+    }
 
   /* Check minimum mmap chunk is larger than max tcache size.  This means
      mmap chunks with their different layout are never added to tcache.  */
   if (MAX_TCACHE_SMALL_SIZE >= GLRO (dl_pagesize) / 2)
-  {
-    malloc_printerr ("max tcache size too large");
-  }
+    {
+      malloc_printerr ("max tcache size too large");
+    }
 
-  size_t bytes = sizeof (tcache_perthread_struct);
+  const size_t bytes = sizeof (tcache_perthread_struct);
 
   /* Use a direct mmap call to acquire page-aligned memory for the tcache.
      This avoids recursion into malloc during initialization and is naturally
@@ -3418,14 +3436,16 @@ tcache_init (void)
   void *mem = MMAP (NULL, bytes, PROT_READ | PROT_WRITE, 0);
 
   if (mem != MAP_FAILED)
-  {
-    tcache = (tcache_perthread_struct *) mem;
-    /* Mapped memory is zeroed by the kernel. Initialize slot limits. */
-    for (int i = 0; i < TCACHE_MAX_BINS; i++)
     {
-      tcache->num_slots[i] = mp_.tcache_count;
+      tcache = (tcache_perthread_struct *) mem;
+      /* Mapped memory is zeroed by the kernel on Linux. Initialize slot limits.
+         On systems where mmap doesn't zero, we rely on the global tcache being
+         zero-initialized, which is safe for the first access. */
+      for (int i = 0; i < TCACHE_MAX_BINS; i++)
+        {
+          tcache->num_slots[i] = mp_.tcache_count;
+        }
     }
-  }
 }
 
 static void * __attribute_noinline__
@@ -3494,26 +3514,39 @@ void *
 __libc_malloc (size_t bytes)
 {
 #if USE_TCACHE
+  /* Fast validation before size conversion */
+  if (__glibc_unlikely (bytes > PTRDIFF_MAX))
+    {
+      __set_errno (ENOMEM);
+      return NULL;
+    }
+
   size_t nb = checked_request2size (bytes);
+  /* checked_request2size returns SIZE_MAX on overflow, double-check */
+  if (__glibc_unlikely (nb == SIZE_MAX))
+    {
+      __set_errno (ENOMEM);
+      return NULL;
+    }
 
   if (nb < mp_.tcache_max_bytes)
     {
       size_t tc_idx = csize2tidx (nb);
       if(__glibc_unlikely (tcache == NULL))
-	return tcache_malloc_init (bytes);
+        return tcache_malloc_init (bytes);
 
       if (__glibc_likely (tc_idx < TCACHE_SMALL_BINS))
         {
-	  if (tcache->entries[tc_idx] != NULL)
-	    return tag_new_usable (tcache_get (tc_idx));
-	}
+          if (tcache->entries[tc_idx] != NULL)
+            return tag_new_usable (tcache_get (tc_idx));
+        }
       else
         {
-	  tc_idx = large_csize2tidx (nb);
-	  void *victim = tcache_get_large (tc_idx, nb);
-	  if (victim != NULL)
-	    return tag_new_usable (victim);
-	}
+          tc_idx = large_csize2tidx (nb);
+          void *victim = tcache_get_large (tc_idx, nb);
+          if (victim != NULL)
+            return tag_new_usable (victim);
+        }
     }
 #endif
 
@@ -3549,7 +3582,7 @@ __libc_free (void *mem)
     return malloc_printerr_tail ("free(): invalid pointer");
   }
 
-#if USE_TCACHE
+  #if USE_TCACHE
   if (__glibc_likely (size < mp_.tcache_max_bytes && tcache != NULL))
   {
     /* Check to see if it's already in the tcache (double-free detection).  */
@@ -3577,8 +3610,8 @@ __libc_free (void *mem)
       if (__glibc_likely (tc_idx < TCACHE_MAX_BINS))
       {
         if (size >= MINSIZE
-            && !chunk_is_mmapped (p)
-            && __glibc_likely (tcache->num_slots[tc_idx] != 0))
+          && !chunk_is_mmapped (p)
+          && __glibc_likely (tcache->num_slots[tc_idx] != 0))
         {
           return tcache_put_large (p, tc_idx);
         }
@@ -3586,11 +3619,11 @@ __libc_free (void *mem)
       /* If the idx is out of range (should not happen), fall through to normal free. */
     }
   }
-#endif
+  #endif
 
   /* Check size >= MINSIZE and p + size does not overflow. */
   if (__glibc_unlikely (__builtin_add_overflow_p ((uintptr_t) p, size - MINSIZE,
-                                                  (uintptr_t) 0)))
+    (uintptr_t) 0)))
   {
     return malloc_printerr_tail ("free(): invalid size");
   }
@@ -4637,6 +4670,12 @@ _int_free_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size, int have_lock)
 {
   mfastbinptr *fb;             /* associated fastbin */
 
+  /* Validate inputs for defense-in-depth */
+  if (__glibc_unlikely (size < MINSIZE || size > av->system_mem))
+    {
+      malloc_printerr ("free(): invalid chunk size");
+    }
+
   /*
     If eligible, place chunk on a fastbin so it can be found
     and used quickly in malloc.
@@ -4646,121 +4685,121 @@ _int_free_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T size, int have_lock)
 
 #if TRIM_FASTBINS
       /*
-	If TRIM_FASTBINS set, don't place chunks
-	bordering top into fastbins
+        If TRIM_FASTBINS set, don't place chunks
+        bordering top into fastbins
       */
       && (chunk_at_offset(p, size) != av->top)
 #endif
-      ) {
+      )
+    {
+      if (__glibc_unlikely (
+            chunksize_nomask (chunk_at_offset(p, size)) <= CHUNK_HDR_SZ
+            || chunksize (chunk_at_offset(p, size)) >= av->system_mem))
+        {
+          bool fail = true;
+          /* We might not have a lock at this point and concurrent modifications
+             of system_mem might result in a false positive.  Redo the test after
+             getting the lock.  */
+          if (!have_lock)
+            {
+              __libc_lock_lock (av->mutex);
+              fail = (chunksize_nomask (chunk_at_offset (p, size)) <= CHUNK_HDR_SZ
+                      || chunksize (chunk_at_offset (p, size)) >= av->system_mem);
+              __libc_lock_unlock (av->mutex);
+            }
 
-    if (__glibc_unlikely (
-          chunksize_nomask (chunk_at_offset(p, size)) <= CHUNK_HDR_SZ
-          || chunksize (chunk_at_offset(p, size)) >= av->system_mem))
-      {
-	bool fail = true;
-	/* We might not have a lock at this point and concurrent modifications
-	   of system_mem might result in a false positive.  Redo the test after
-	   getting the lock.  */
-	if (!have_lock)
-	  {
-	    __libc_lock_lock (av->mutex);
-	    fail = (chunksize_nomask (chunk_at_offset (p, size)) <= CHUNK_HDR_SZ
-		    || chunksize (chunk_at_offset (p, size)) >= av->system_mem);
-	    __libc_lock_unlock (av->mutex);
-	  }
+          if (fail)
+            malloc_printerr ("free(): invalid next size (fast)");
+        }
 
-	if (fail)
-	  malloc_printerr ("free(): invalid next size (fast)");
-      }
+      free_perturb (chunk2mem(p), size - CHUNK_HDR_SZ);
 
-    free_perturb (chunk2mem(p), size - CHUNK_HDR_SZ);
+      atomic_store_relaxed (&av->have_fastchunks, true);
+      unsigned int idx = fastbin_index(size);
+      fb = &fastbin (av, idx);
 
-    atomic_store_relaxed (&av->have_fastchunks, true);
-    unsigned int idx = fastbin_index(size);
-    fb = &fastbin (av, idx);
+      /* Atomically link P to its fastbin: P->FD = *FB; *FB = P;  */
+      mchunkptr old = *fb, old2;
 
-    /* Atomically link P to its fastbin: P->FD = *FB; *FB = P;  */
-    mchunkptr old = *fb, old2;
+      if (SINGLE_THREAD_P)
+        {
+          /* Check that the top of the bin is not the record we are going to
+             add (i.e., double free).  */
+          if (__glibc_unlikely (old == p))
+            malloc_printerr ("double free or corruption (fasttop)");
+          p->fd = PROTECT_PTR (&p->fd, old);
+          *fb = p;
+        }
+      else
+        do
+          {
+            /* Check that the top of the bin is not the record we are going to
+               add (i.e., double free).  */
+            if (__glibc_unlikely (old == p))
+              malloc_printerr ("double free or corruption (fasttop)");
+            old2 = old;
+            p->fd = PROTECT_PTR (&p->fd, old);
+          }
+        while ((old = catomic_compare_and_exchange_val_rel (fb, p, old2))
+               != old2);
 
-    if (SINGLE_THREAD_P)
-      {
-	/* Check that the top of the bin is not the record we are going to
-	   add (i.e., double free).  */
-	if (__glibc_unlikely (old == p))
-	  malloc_printerr ("double free or corruption (fasttop)");
-	p->fd = PROTECT_PTR (&p->fd, old);
-	*fb = p;
-      }
-    else
-      do
-	{
-	  /* Check that the top of the bin is not the record we are going to
-	     add (i.e., double free).  */
-	  if (__glibc_unlikely (old == p))
-	    malloc_printerr ("double free or corruption (fasttop)");
-	  old2 = old;
-	  p->fd = PROTECT_PTR (&p->fd, old);
-	}
-      while ((old = catomic_compare_and_exchange_val_rel (fb, p, old2))
-	     != old2);
-
-    /* Check that size of fastbin chunk at the top is the same as
-       size of the chunk that we are adding.  We can dereference OLD
-       only if we have the lock, otherwise it might have already been
-       allocated again.  */
-    if (have_lock && old != NULL
-	&& __glibc_unlikely (fastbin_index (chunksize (old)) != idx))
-      malloc_printerr ("invalid fastbin entry (free)");
-  }
+      /* Check that size of fastbin chunk at the top is the same as
+         size of the chunk that we are adding.  We can dereference OLD
+         only if we have the lock, otherwise it might have already been
+         allocated again.  */
+      if (have_lock && old != NULL
+          && __glibc_unlikely (fastbin_index (chunksize (old)) != idx))
+        malloc_printerr ("invalid fastbin entry (free)");
+    }
 
   /*
     Consolidate other non-mmapped chunks as they arrive.
   */
 
-  else if (!chunk_is_mmapped(p)) {
+  else if (!chunk_is_mmapped(p))
+    {
+      /* Preserve errno in case block merging results in munmap.  */
+      int err = errno;
 
-    /* Preserve errno in case block merging results in munmap.  */
-    int err = errno;
+      /* If we're single-threaded, don't lock the arena.  */
+      if (SINGLE_THREAD_P)
+        have_lock = true;
 
-    /* If we're single-threaded, don't lock the arena.  */
-    if (SINGLE_THREAD_P)
-      have_lock = true;
+      if (!have_lock)
+        __libc_lock_lock (av->mutex);
 
-    if (!have_lock)
-      __libc_lock_lock (av->mutex);
+      _int_free_merge_chunk (av, p, size);
 
-    _int_free_merge_chunk (av, p, size);
+      if (!have_lock)
+        __libc_lock_unlock (av->mutex);
 
-    if (!have_lock)
-      __libc_lock_unlock (av->mutex);
-
-    __set_errno (err);
-  }
+      __set_errno (err);
+    }
   /*
     If the chunk was allocated via mmap, release via munmap().
   */
 
-  else {
+  else
+    {
+      /* Preserve errno in case munmap sets it.  */
+      int err = errno;
 
-    /* Preserve errno in case munmap sets it.  */
-    int err = errno;
+      /* See if the dynamic brk/mmap threshold needs adjusting.
+         Dumped fake mmapped chunks do not affect the threshold.  */
+      if (!mp_.no_dyn_threshold
+          && chunksize_nomask (p) > mp_.mmap_threshold
+          && chunksize_nomask (p) <= DEFAULT_MMAP_THRESHOLD_MAX)
+        {
+          mp_.mmap_threshold = chunksize (p);
+          mp_.trim_threshold = 2 * mp_.mmap_threshold;
+          LIBC_PROBE (memory_mallopt_free_dyn_thresholds, 2,
+                      mp_.mmap_threshold, mp_.trim_threshold);
+        }
 
-    /* See if the dynamic brk/mmap threshold needs adjusting.
-       Dumped fake mmapped chunks do not affect the threshold.  */
-    if (!mp_.no_dyn_threshold
-        && chunksize_nomask (p) > mp_.mmap_threshold
-        && chunksize_nomask (p) <= DEFAULT_MMAP_THRESHOLD_MAX)
-      {
-        mp_.mmap_threshold = chunksize (p);
-        mp_.trim_threshold = 2 * mp_.mmap_threshold;
-        LIBC_PROBE (memory_mallopt_free_dyn_thresholds, 2,
-		    mp_.mmap_threshold, mp_.trim_threshold);
-      }
+      munmap_chunk (p);
 
-    munmap_chunk (p);
-
-    __set_errno (err);
-  }
+      __set_errno (err);
+    }
 }
 
 /* Try to merge chunk P of SIZE bytes with its neighbors.  Put the
