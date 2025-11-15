@@ -230,30 +230,61 @@ scratch_vbo_ensure(glamor_screen_private *priv)
 {
     (void)priv;
 
-    if (scratch_vbo)
+    if (scratch_vbo && scratch_map)
         return TRUE;
 
     if (!epoxy_has_gl_extension("GL_ARB_buffer_storage"))
         return FALSE;
 
-    const GLbitfield flags =
-        GL_MAP_WRITE_BIT          |
-        GL_MAP_PERSISTENT_BIT     |
-        GL_MAP_COHERENT_BIT       |
-        GL_MAP_FLUSH_EXPLICIT_BIT |
-        GL_DYNAMIC_STORAGE_BIT;
+    /* Persistent, non-coherent mapping with explicit flush. */
+    const GLbitfield storage_flags =
+        GL_MAP_WRITE_BIT      |
+        GL_MAP_PERSISTENT_BIT |
+        GL_DYNAMIC_STORAGE_BIT |
+        GL_MAP_FLUSH_EXPLICIT_BIT;
 
-    glGenBuffers(1, &scratch_vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, scratch_vbo);
-    glBufferStorage(GL_ARRAY_BUFFER, SCRATCH_VBO_CAPACITY, NULL, flags);
+    GLuint vbo = 0;
+    glGenBuffers(1, &vbo);
+    if (!vbo)
+        return FALSE;
 
-    scratch_map = (GLubyte *)glMapBufferRange(
-        GL_ARRAY_BUFFER, 0, SCRATCH_VBO_CAPACITY,
-        GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT |
-        GL_MAP_COHERENT_BIT | GL_MAP_FLUSH_EXPLICIT_BIT
-    );
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferStorage(GL_ARRAY_BUFFER,
+                    (GLsizeiptr)SCRATCH_VBO_CAPACITY,
+                    NULL,
+                    storage_flags);
 
-    return (scratch_map != NULL);
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glDeleteBuffers(1, &vbo);
+        return FALSE;
+    }
+
+    const GLbitfield map_flags =
+        GL_MAP_WRITE_BIT      |
+        GL_MAP_PERSISTENT_BIT |
+        GL_MAP_FLUSH_EXPLICIT_BIT;
+
+    GLubyte *map = (GLubyte *)glMapBufferRange(GL_ARRAY_BUFFER,
+                                               0,
+                                               (GLsizeiptr)SCRATCH_VBO_CAPACITY,
+                                               map_flags);
+    err = glGetError();
+    if (!map || err != GL_NO_ERROR) {
+        if (map)
+            glUnmapBuffer(GL_ARRAY_BUFFER);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glDeleteBuffers(1, &vbo);
+        return FALSE;
+    }
+
+    scratch_vbo          = vbo;
+    scratch_map          = map;
+    scratch_offset_bytes = 0;
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    return TRUE;
 }
 
 static GLshort *
@@ -262,11 +293,13 @@ scratch_vbo_alloc(glamor_screen_private *priv, size_t bytes, char **out_offset)
     if (!scratch_vbo_ensure(priv))
         return NULL;
 
-    if (bytes > SCRATCH_VBO_CAPACITY)
+    if (bytes == 0 || bytes > SCRATCH_VBO_CAPACITY)
         return NULL;
 
+    /* If we would overflow the buffer, flush and wrap to start. */
     if (scratch_offset_bytes + bytes > SCRATCH_VBO_CAPACITY) {
         if (g_gpu_sync.fence) {
+            /* Ensure previous users of scratch_vbo are done. */
             glClientWaitSync(g_gpu_sync.fence, GL_SYNC_FLUSH_COMMANDS_BIT,
                              GL_TIMEOUT_IGNORED);
             glDeleteSync(g_gpu_sync.fence);
@@ -274,14 +307,17 @@ scratch_vbo_alloc(glamor_screen_private *priv, size_t bytes, char **out_offset)
         }
 
         glBindBuffer(GL_ARRAY_BUFFER, scratch_vbo);
-        glFlushMappedBufferRange(GL_ARRAY_BUFFER, 0,
+        glFlushMappedBufferRange(GL_ARRAY_BUFFER,
+                                 0,
                                  (GLsizeiptr)scratch_offset_bytes);
         scratch_offset_bytes = 0;
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
     }
 
     *out_offset = (char *)(uintptr_t)scratch_offset_bytes;
     GLshort *ptr = (GLshort *)(scratch_map + scratch_offset_bytes);
     scratch_offset_bytes += bytes;
+
     return ptr;
 }
 

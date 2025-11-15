@@ -141,30 +141,51 @@ memcpy_streaming(void *dst, const void *src, size_t n)
 typedef struct {
     GLint pack_alignment;
     GLint pack_row_length;
+    GLint pack_skip_pixels;
+    GLint pack_skip_rows;
+
     GLint unpack_alignment;
     GLint unpack_row_length;
+    GLint unpack_skip_pixels;
+    GLint unpack_skip_rows;
+
     Bool  saved;
 } gl_pixel_store_state;
 
 static inline void
 gl_save_pixel_store(gl_pixel_store_state *state)
 {
-    glGetIntegerv(GL_PACK_ALIGNMENT, &state->pack_alignment);
-    glGetIntegerv(GL_PACK_ROW_LENGTH, &state->pack_row_length);
-    glGetIntegerv(GL_UNPACK_ALIGNMENT, &state->unpack_alignment);
-    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &state->unpack_row_length);
+    if (!state)
+        return;
+
+    glGetIntegerv(GL_PACK_ALIGNMENT,      &state->pack_alignment);
+    glGetIntegerv(GL_PACK_ROW_LENGTH,     &state->pack_row_length);
+    glGetIntegerv(GL_PACK_SKIP_PIXELS,    &state->pack_skip_pixels);
+    glGetIntegerv(GL_PACK_SKIP_ROWS,      &state->pack_skip_rows);
+
+    glGetIntegerv(GL_UNPACK_ALIGNMENT,    &state->unpack_alignment);
+    glGetIntegerv(GL_UNPACK_ROW_LENGTH,   &state->unpack_row_length);
+    glGetIntegerv(GL_UNPACK_SKIP_PIXELS,  &state->unpack_skip_pixels);
+    glGetIntegerv(GL_UNPACK_SKIP_ROWS,    &state->unpack_skip_rows);
+
     state->saved = TRUE;
 }
 
 static inline void
 gl_restore_pixel_store(const gl_pixel_store_state *state)
 {
-    if (!state->saved)
+    if (!state || !state->saved)
         return;
-    glPixelStorei(GL_PACK_ALIGNMENT, state->pack_alignment);
-    glPixelStorei(GL_PACK_ROW_LENGTH, state->pack_row_length);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, state->unpack_alignment);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, state->unpack_row_length);
+
+    glPixelStorei(GL_PACK_ALIGNMENT,      state->pack_alignment);
+    glPixelStorei(GL_PACK_ROW_LENGTH,     state->pack_row_length);
+    glPixelStorei(GL_PACK_SKIP_PIXELS,    state->pack_skip_pixels);
+    glPixelStorei(GL_PACK_SKIP_ROWS,      state->pack_skip_rows);
+
+    glPixelStorei(GL_UNPACK_ALIGNMENT,    state->unpack_alignment);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH,   state->unpack_row_length);
+    glPixelStorei(GL_UNPACK_SKIP_PIXELS,  state->unpack_skip_pixels);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS,    state->unpack_skip_rows);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -564,50 +585,68 @@ glamor_pbo_download_acquire(size_t required, glamor_pbo_slot **out)
  * ═══════════════════════════════════════════════════════════════════ */
 static Bool
 glamor_put_image_zpixmap_gl(DrawablePtr drawable, GCPtr gc, int depth,
-                             int x, int y, int w, int h,
-                             const char *bits)
+                            int x, int y, int w, int h,
+                            const char *bits)
 {
-    if (!drawable || !bits || !drawable->pScreen)
+    (void)depth; /* depth is implied by drawable; keep for ABI */
+
+    glamor_screen_private *priv;
+    PixmapPtr dst_pixmap;
+    glamor_pixmap_private *dst_priv;
+    uint32_t byte_stride;
+    RegionRec region;
+    BoxRec box;
+    int off_x = 0, off_y = 0;
+    size_t transfer_size;
+
+    /* Basic parameter validation first, before dereferencing drawable. */
+    if (unlikely(!drawable || !bits || w <= 0 || h <= 0))
         return FALSE;
 
     ScreenPtr screen = drawable->pScreen;
-    glamor_screen_private *priv = glamor_get_screen_private(screen);
-    if (!priv)
+    if (unlikely(!screen))
         return FALSE;
 
-    PixmapPtr dst_pixmap = glamor_get_drawable_pixmap(drawable);
-    if (!dst_pixmap)
+    priv = glamor_get_screen_private(screen);
+    if (unlikely(!priv))
         return FALSE;
 
-    glamor_pixmap_private *dst_priv = glamor_get_pixmap_private(dst_pixmap);
-    const uint32_t byte_stride = PixmapBytePad(w, drawable->depth);
-
-    if (!GLAMOR_PIXMAP_PRIV_HAS_FBO(dst_priv))
-        return FALSE;
-    if (!glamor_can_fast_upload(gc))
-        return FALSE;
-    if (w <= 0 || h <= 0 || w > priv->max_fbo_size || h > priv->max_fbo_size)
+    dst_pixmap = glamor_get_drawable_pixmap(drawable);
+    if (unlikely(!dst_pixmap))
         return FALSE;
 
-    int off_x = 0, off_y = 0;
+    dst_priv = glamor_get_pixmap_private(dst_pixmap);
+    if (unlikely(!dst_priv || !GLAMOR_PIXMAP_PRIV_HAS_FBO(dst_priv)))
+        return FALSE;
+
+    if (unlikely(!glamor_can_fast_upload(gc)))
+        return FALSE;
+
+    byte_stride = PixmapBytePad(w, drawable->depth);
+
+    /* Xwayland's safe_mul_size: returns 0 on overflow or too large. */
+    transfer_size = safe_mul_size((size_t)h, (size_t)byte_stride);
+    if (unlikely(transfer_size == 0))
+        return FALSE;
+
+    /* Compute region in pixmap coordinates. */
     glamor_get_drawable_deltas(drawable, dst_pixmap, &off_x, &off_y);
 
-    BoxRec box = {
-        .x1 = x + off_x,
-        .y1 = y + off_y,
-        .x2 = x + off_x + w,
-        .y2 = y + off_y + h
-    };
+    box.x1 = x + off_x;
+    box.y1 = y + off_y;
+    box.x2 = box.x1 + w;
+    box.y2 = box.y1 + h;
 
+    /* Bounds check against destination pixmap. */
     if (box.x1 < 0 || box.y1 < 0 ||
         box.x2 > dst_pixmap->drawable.width ||
         box.y2 > dst_pixmap->drawable.height) {
         return FALSE;
     }
 
-    RegionRec region;
     RegionInit(&region, &box, 1);
 
+    /* Clip against GC composite clip, translated into pixmap coordinates. */
     if (gc && gc->pCompositeClip) {
         RegionRec clip_pixmap;
         RegionNull(&clip_pixmap);
@@ -622,104 +661,74 @@ glamor_put_image_zpixmap_gl(DrawablePtr drawable, GCPtr gc, int depth,
         return TRUE;
     }
 
-    BoxPtr extents = RegionExtents(&region);
-    if (!extents || extents->x1 < 0 || extents->y1 < 0 ||
-        extents->x2 > dst_pixmap->drawable.width ||
-        extents->y2 > dst_pixmap->drawable.height) {
-        RegionUninit(&region);
-        return FALSE;
-    }
-
     glamor_make_current(priv);
-
-    const size_t required = safe_mul_size((size_t)h, (size_t)byte_stride);
-    if (required == 0 || required > INT_MAX) {
-        RegionUninit(&region);
-        return FALSE;
-    }
-
     glamor_pbo_pool_init();
 
-    if (likely(required < g_pbo_pool.upload_threshold)) {
-        glamor_upload_region(drawable, &region, x, y,
-                             (const uint8_t *)bits, byte_stride);
-        RegionUninit(&region);
-        return TRUE;
-    }
+    /* PBO path for large transfers. */
+    if (transfer_size >= g_pbo_pool.upload_threshold) {
+        glamor_pbo_slot *slot = NULL;
 
-    glamor_pbo_slot *slot = NULL;
-    if (!glamor_pbo_upload_acquire(required, &slot)) {
-        glamor_upload_region(drawable, &region, x, y,
-                             (const uint8_t *)bits, byte_stride);
-        RegionUninit(&region);
-        return TRUE;
-    }
+        if (glamor_pbo_upload_acquire(transfer_size, &slot) && slot) {
+            GLint old_pbo = 0;
+            glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &old_pbo);
 
-    if (slot->persistent) {
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, slot->id);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, slot->id);
 
-        /* OPTIMIZATION: AVX2 streaming copy with memory barrier */
-        memcpy_streaming(slot->map, bits, required);
+            if (slot->persistent && slot->map) {
+                /* Persistent mapped PBO: AVX2 streaming memcpy into PBO. */
+                memcpy_streaming(slot->map, bits, transfer_size);
 
-        if (!slot->coherent) {
-            glFlushMappedBufferRange(GL_PIXEL_UNPACK_BUFFER, 0,
-                                     (GLsizeiptr)required);
-        }
+                if (!slot->coherent) {
+                    glFlushMappedBufferRange(GL_PIXEL_UNPACK_BUFFER,
+                                             0, (GLsizeiptr)transfer_size);
+                }
 
-        /* CRITICAL: Memory barrier for PBO data coherency */
-        glMemoryBarrier(GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT);
+                /* Ensure CPU writes are visible before GPU reads. */
+                glMemoryBarrier(GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT);
 
-        glamor_upload_region(drawable, &region, x, y,
-                             (const uint8_t *)(uintptr_t)0, byte_stride);
+                /* Upload from PBO (offset 0) into destination region. */
+                glamor_upload_region(drawable, &region, x, y,
+                                     (const uint8_t *)(uintptr_t)0, byte_stride);
+            } else {
+                /* Orphan/map/unmap path for non-persistent PBO. */
+                const GLbitfield map_flags =
+                    GL_MAP_WRITE_BIT |
+                    GL_MAP_INVALIDATE_BUFFER_BIT |
+                    GL_MAP_UNSYNCHRONIZED_BIT;
 
-        GLsync new_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-        if (new_fence) {
+                void *map = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER,
+                                             0, (GLsizeiptr)transfer_size,
+                                             map_flags);
+                if (map) {
+                    memcpy_streaming(map, bits, transfer_size);
+                    glMemoryBarrier(GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT);
+                    glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+
+                    glamor_upload_region(drawable, &region, x, y,
+                                         (const uint8_t *)(uintptr_t)0, byte_stride);
+                } else {
+                    /* Map failed: fall back to direct upload. */
+                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)old_pbo);
+                    glamor_upload_region(drawable, &region, x, y,
+                                         (const uint8_t *)bits, byte_stride);
+                    RegionUninit(&region);
+                    return TRUE;
+                }
+            }
+
+            /* Async: record a new fence for future reuse, no wait here. */
             glamor_pbo_clear_fence(slot);
-            slot->fence = new_fence;
-            glFlush();
-        } else {
-            glFinish();
-            glamor_pbo_clear_fence(slot);
-        }
+            slot->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-    } else {
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, slot->id);
-
-        GLbitfield map_flags = GL_MAP_WRITE_BIT |
-                               GL_MAP_INVALIDATE_BUFFER_BIT |
-                               GL_MAP_UNSYNCHRONIZED_BIT;
-
-        void *map = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0,
-                                     (GLsizeiptr)required, map_flags);
-        if (!map) {
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-            glamor_upload_region(drawable, &region, x, y,
-                                 (const uint8_t *)bits, byte_stride);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)old_pbo);
             RegionUninit(&region);
             return TRUE;
         }
-
-        memcpy_streaming(map, bits, required);
-        glMemoryBarrier(GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT);
-        glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
-
-        glamor_upload_region(drawable, &region, x, y,
-                             (const uint8_t *)(uintptr_t)0, byte_stride);
-
-        GLsync new_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-        if (new_fence) {
-            glamor_pbo_clear_fence(slot);
-            slot->fence = new_fence;
-            glFlush();
-        } else {
-            glFinish();
-            glamor_pbo_clear_fence(slot);
-        }
-
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
     }
 
+    /* Direct CPU→GPU upload path. */
+    glamor_upload_region(drawable, &region, x, y,
+                         (const uint8_t *)bits, byte_stride);
     RegionUninit(&region);
     return TRUE;
 }
@@ -863,8 +872,8 @@ get_bitmap_cache(ScreenPtr screen)
 
 static Bool
 glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
-                              int x, int y, int w, int h,
-                              int leftPad, const char *bits)
+                             int x, int y, int w, int h,
+                             int leftPad, const char *bits)
 {
     if (!drawable || !gc || !bits || !drawable->pScreen)
         return FALSE;
@@ -893,8 +902,6 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
     size_t required_bytes = (size_t)stride * (size_t)h;
     if (required_bytes > (size_t)INT_MAX)
         return FALSE;
-
-    Bool ok = FALSE;
 
     if (!GLAMOR_PIXMAP_PRIV_HAS_FBO(dst_priv))
         return FALSE;
@@ -937,20 +944,18 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
     GLsizei needed_h = (GLsizei)h;
 
     Bool has_tex_storage = epoxy_has_gl_extension("GL_ARB_texture_storage");
-    Bool has_invalidate = epoxy_has_gl_extension("GL_ARB_invalidate_subdata");
+    Bool has_invalidate  = epoxy_has_gl_extension("GL_ARB_invalidate_subdata");
 
     Bool texture_needs_realloc = FALSE;
 
     if (!cache->tex) {
         texture_needs_realloc = TRUE;
     } else if (cache->is_immutable) {
-        if (cache->w != needed_w || cache->h != needed_h) {
+        if (cache->w != needed_w || cache->h != needed_h)
             texture_needs_realloc = TRUE;
-        }
-    } else {
-        if (has_tex_storage) {
-            texture_needs_realloc = TRUE;
-        }
+    } else if (has_tex_storage) {
+        /* We prefer immutable storage when available. */
+        texture_needs_realloc = TRUE;
     }
 
     if (texture_needs_realloc) {
@@ -981,13 +986,13 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
 
         if (has_tex_storage) {
             glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8UI, needed_w, needed_h);
-
             GLenum err = glGetError();
             if (err == GL_NO_ERROR) {
                 cache->is_immutable = TRUE;
                 cache->w = needed_w;
                 cache->h = needed_h;
             } else {
+                /* Fallback to mutable storage. */
                 glBindTexture(GL_TEXTURE_2D, 0);
                 glDeleteTextures(1, &cache->tex);
                 cache->tex = 0;
@@ -1007,7 +1012,6 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
 
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_R8UI, needed_w, needed_h, 0,
                              GL_RED_INTEGER, GL_UNSIGNED_BYTE, NULL);
-
                 err = glGetError();
                 if (err != GL_NO_ERROR) {
                     glBindTexture(GL_TEXTURE_2D, 0);
@@ -1025,7 +1029,6 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
         } else {
             glTexImage2D(GL_TEXTURE_2D, 0, GL_R8UI, needed_w, needed_h, 0,
                          GL_RED_INTEGER, GL_UNSIGNED_BYTE, NULL);
-
             GLenum err = glGetError();
             if (err != GL_NO_ERROR) {
                 glBindTexture(GL_TEXTURE_2D, 0);
@@ -1042,16 +1045,15 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
         }
     } else {
         glBindTexture(GL_TEXTURE_2D, cache->tex);
-
-        if (cache->is_immutable && has_invalidate) {
+        if (cache->is_immutable && has_invalidate)
             glInvalidateTexImage(cache->tex, 0);
-        }
     }
 
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-    glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
-    glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+    /* Upload the bitmap. */
+    glPixelStorei(GL_UNPACK_ALIGNMENT,    1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH,   0);
+    glPixelStorei(GL_UNPACK_SKIP_PIXELS,  0);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS,    0);
 
     if (cache->is_immutable) {
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, needed_w, needed_h,
@@ -1081,8 +1083,11 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
 
     glUniform1i(prog->font_uniform, 1);
 
+    /* Build small VBO with primitive + source. */
     char *vbo_offset = NULL;
-    GLshort *vbo = glamor_get_vbo_space(screen, 6 * sizeof(GLshort), &vbo_offset);
+    GLshort *vbo = glamor_get_vbo_space(screen,
+                                        6 * (int)sizeof(GLshort),
+                                        &vbo_offset);
     if (!vbo) {
         glBindTexture(GL_TEXTURE_2D, 0);
         glActiveTexture(prev_active_tex);
@@ -1090,7 +1095,6 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
         return FALSE;
     }
 
-    /* FIXED: Direct cast without CLAMP (values already validated) */
     vbo[0] = (GLshort)x;
     vbo[1] = (GLshort)y;
     vbo[2] = (GLshort)w;
@@ -1101,17 +1105,18 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
 
     glEnableVertexAttribArray(GLAMOR_VERTEX_POS);
     glVertexAttribPointer(GLAMOR_VERTEX_POS, 4, GL_SHORT, GL_FALSE,
-                          6 * sizeof(GLshort), vbo_offset);
+                          6 * (GLsizei)sizeof(GLshort), vbo_offset);
     glVertexAttribDivisor(GLAMOR_VERTEX_POS, 1);
 
     glEnableVertexAttribArray(GLAMOR_VERTEX_SOURCE);
     glVertexAttribPointer(GLAMOR_VERTEX_SOURCE, 2, GL_SHORT, GL_FALSE,
-                          6 * sizeof(GLshort),
-                          vbo_offset + 4 * sizeof(GLshort));
+                          6 * (GLsizei)sizeof(GLshort),
+                          vbo_offset + 4 * (int)sizeof(GLshort));
     glVertexAttribDivisor(GLAMOR_VERTEX_SOURCE, 1);
 
     glEnable(GL_SCISSOR_TEST);
 
+    /* Now draw for each tile, clipping with GC's pCompositeClip if present. */
     int off_x = 0, off_y = 0;
     glamor_get_drawable_deltas(drawable, dst_pixmap, &off_x, &off_y);
 
@@ -1126,24 +1131,23 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
             continue;
 
         if (gc->pCompositeClip && RegionNotEmpty(gc->pCompositeClip)) {
-            int nbox = RegionNumRects(gc->pCompositeClip);
-            const BoxPtr boxes = RegionRects(gc->pCompositeClip);
+            int nclip = RegionNumRects(gc->pCompositeClip);
+            const BoxPtr clip_boxes = RegionRects(gc->pCompositeClip);
 
-            if (boxes && nbox > 0) {
-                for (int i = 0; i < nbox; i++) {
-                    const BoxRec *b = &boxes[i];
+            for (int i = 0; i < nclip; i++) {
+                const BoxRec *b = &clip_boxes[i];
 
-                    int sx = b->x1 + tile_off_x;
-                    int sy = b->y1 + tile_off_y;
-                    int sw = b->x2 - b->x1;
-                    int sh = b->y2 - b->y1;
+                int sx = b->x1 + tile_off_x;
+                int sy = b->y1 + tile_off_y;
+                int sw = b->x2 - b->x1;
+                int sh = b->y2 - b->y1;
 
-                    if (sw > 0 && sh > 0 && sx >= 0 && sy >= 0 &&
-                        sx + sw <= dst_pixmap->drawable.width &&
-                        sy + sh <= dst_pixmap->drawable.height) {
-                        glScissor(sx, sy, sw, sh);
-                        glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 1);
-                    }
+                if (sw > 0 && sh > 0 &&
+                    sx >= 0 && sy >= 0 &&
+                    sx + sw <= dst_pixmap->drawable.width &&
+                    sy + sh <= dst_pixmap->drawable.height) {
+                    glScissor(sx, sy, sw, sh);
+                    glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 1);
                 }
             }
         } else {
@@ -1166,13 +1170,11 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
     glVertexAttribDivisor(GLAMOR_VERTEX_POS, 0);
     glDisableVertexAttribArray(GLAMOR_VERTEX_POS);
 
-    ok = TRUE;
-
     glBindTexture(GL_TEXTURE_2D, 0);
     glActiveTexture(prev_active_tex);
     gl_restore_pixel_store(&saved_state);
 
-    return ok;
+    return TRUE;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
