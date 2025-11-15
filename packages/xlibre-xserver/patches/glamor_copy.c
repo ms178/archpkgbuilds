@@ -453,17 +453,25 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src,
     int n;
     Bool ret = FALSE;
     BoxRec bounds = glamor_no_rendering_bounds();
+    Bool use_bounds = (nbox < 100);
+
+    if (nbox <= 0) {
+        return TRUE;
+    }
 
     glamor_make_current(glamor_priv);
 
-    if (gc && !glamor_set_planemask(gc->depth, gc->planemask))
+    if (gc && !glamor_set_planemask(gc->depth, gc->planemask)) {
         goto bail_ctx;
+    }
 
-    if (!glamor_set_alu(dst, gc ? gc->alu : GXcopy))
+    if (!glamor_set_alu(dst, gc ? gc->alu : GXcopy)) {
         goto bail_ctx;
+    }
 
-    if (bitplane && !glamor_priv->can_copyplane)
+    if (bitplane && !glamor_priv->can_copyplane) {
         goto bail_ctx;
+    }
 
     if (bitplane) {
         prog = &glamor_priv->copy_plane_prog;
@@ -473,58 +481,62 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src,
         copy_facet = &glamor_facet_copyarea;
     }
 
-    if (prog->failed)
+    if (prog->failed) {
         goto bail_ctx;
+    }
 
     if (!prog->prog) {
-        if (!glamor_build_program(screen, prog,
-                                  copy_facet, NULL, NULL, NULL))
+        if (!glamor_build_program(screen, prog, copy_facet,
+                                  NULL, NULL, NULL)) {
             goto bail_ctx;
+        }
     }
 
     args.src_drawable = src;
     args.bitplane = bitplane;
 
-    /* Set up the vertex buffers for the points */
-    v = glamor_get_vbo_space(dst->pScreen, nbox * 8 * sizeof(int16_t), &vbo_offset);
+    /* Set up the vertex buffer for the destination boxes. */
+    v = glamor_get_vbo_space(dst->pScreen,
+                             (unsigned)(nbox * 8 * (int)sizeof(GLshort)),
+                             &vbo_offset);
+    if (!v) {
+        goto bail_ctx;
+    }
+
+    glamor_fill_vbo_from_boxes(v, box, nbox);
+    glamor_put_vbo_space(screen);
 
     if (src_pixmap == dst_pixmap && glamor_priv->has_mesa_tile_raster_order) {
         glEnable(GL_TILE_RASTER_ORDER_FIXED_MESA);
-        if (dx >= 0)
+        if (dx >= 0) {
             glEnable(GL_TILE_RASTER_ORDER_INCREASING_X_MESA);
-        else
+        } else {
             glDisable(GL_TILE_RASTER_ORDER_INCREASING_X_MESA);
-        if (dy >= 0)
+        }
+        if (dy >= 0) {
             glEnable(GL_TILE_RASTER_ORDER_INCREASING_Y_MESA);
-        else
+        } else {
             glDisable(GL_TILE_RASTER_ORDER_INCREASING_Y_MESA);
+        }
     }
 
     glEnableVertexAttribArray(GLAMOR_VERTEX_POS);
     glVertexAttribPointer(GLAMOR_VERTEX_POS, 2, GL_SHORT, GL_FALSE,
-                          2 * sizeof(GLshort), vbo_offset);
+                          2 * (GLsizei)sizeof(GLshort), vbo_offset);
 
-    if (nbox < 100) {
+    if (use_bounds) {
         bounds = glamor_start_rendering_bounds();
-        for (n = 0; n < nbox; n++)
+        for (n = 0; n < nbox; n++) {
             glamor_bounds_union_box(&bounds, &box[n]);
+        }
     }
-
-    for (n = 0; n < nbox; n++) {
-        v[0] = box[n].x1; v[1] = box[n].y1;
-        v[2] = box[n].x1; v[3] = box[n].y2;
-        v[4] = box[n].x2; v[5] = box[n].y2;
-        v[6] = box[n].x2; v[7] = box[n].y1;
-        v += 8;
-    }
-
-    glamor_put_vbo_space(screen);
 
     glamor_get_drawable_deltas(src, src_pixmap, &src_off_x, &src_off_y);
 
     glEnable(GL_SCISSOR_TEST);
 
     BUG_RETURN_VAL(!src_priv, FALSE);
+    BUG_RETURN_VAL(!dst_priv, FALSE);
 
     glamor_pixmap_loop(src_priv, src_box_index) {
         BoxPtr src_box = glamor_pixmap_box_at(src_priv, src_box_index);
@@ -533,97 +545,94 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src,
         args.dy = dy + src_off_y - src_box->y1;
         args.src = glamor_pixmap_fbo_at(src_priv, src_box_index);
 
-        if (!glamor_use_program(dst, gc, prog, &args))
+        if (!glamor_use_program(dst, gc, prog, &args)) {
             goto bail_ctx;
-
-        BUG_RETURN_VAL(!dst_priv, FALSE);
+        }
 
         glamor_pixmap_loop(dst_priv, dst_box_index) {
             BoxRec scissor = {
-                .x1 = max(-args.dx, bounds.x1),
-                .y1 = max(-args.dy, bounds.y1),
-                .x2 = min(-args.dx + src_box->x2 - src_box->x1, bounds.x2),
-                .y2 = min(-args.dy + src_box->y2 - src_box->y1, bounds.y2),
+                .x1 = max(-args.dx, use_bounds ? bounds.x1 : -INT16_MAX),
+                .y1 = max(-args.dy, use_bounds ? bounds.y1 : -INT16_MAX),
+                .x2 = min(-args.dx + src_box->x2 - src_box->x1,
+                          use_bounds ? bounds.x2 : INT16_MAX),
+                .y2 = min(-args.dy + src_box->y2 - src_box->y1,
+                          use_bounds ? bounds.y2 : INT16_MAX),
             };
-            if (scissor.x1 >= scissor.x2 || scissor.y1 >= scissor.y2)
+
+            if (scissor.x1 >= scissor.x2 || scissor.y1 >= scissor.y2) {
                 continue;
+            }
 
             if (!glamor_set_destination_drawable(dst, dst_box_index, FALSE, FALSE,
                                                  prog->matrix_uniform,
-                                                 &dst_off_x, &dst_off_y))
+                                                 &dst_off_x, &dst_off_y)) {
                 goto bail_ctx;
+            }
 
             glScissor(scissor.x1 + dst_off_x,
                       scissor.y1 + dst_off_y,
                       scissor.x2 - scissor.x1,
                       scissor.y2 - scissor.y1);
 
-            /*
-             * MAJOR OPTIMIZATION: For tiled (large) pixmaps, filter the box list
-             * to only draw boxes that actually intersect this destination tile.
-             * This dramatically reduces GPU vertex processing when damage is localized.
-             *
-             * Uses the official glamor_pixmap_priv_is_large() helper to detect tiling.
-             */
             if (glamor_pixmap_priv_is_large(dst_priv)) {
                 BoxPtr dst_tile_box = glamor_pixmap_box_at(dst_priv, dst_box_index);
                 BoxRec filtered_stack[128];
                 BoxPtr filtered_boxes;
                 int filtered_count = 0;
+                int i;
 
-                /* Stack allocation for common case, heap for pathological */
                 if (nbox <= 128) {
                     filtered_boxes = filtered_stack;
                 } else {
-                    filtered_boxes = malloc(nbox * sizeof(BoxRec));
+                    filtered_boxes = malloc((size_t)nbox * sizeof(BoxRec));
                     if (!filtered_boxes) {
-                        /* Malloc failed - fall back to unfiltered draw (safe, just slower) */
+                        /* Fall back to drawing all boxes. */
                         glamor_glDrawArrays_GL_QUADS(glamor_priv, nbox);
                         continue;
                     }
                 }
 
-                /* Filter: keep only boxes intersecting this destination tile */
-                for (n = 0; n < nbox; n++) {
-                    if (box[n].x1 < dst_tile_box->x2 && box[n].x2 > dst_tile_box->x1 &&
-                        box[n].y1 < dst_tile_box->y2 && box[n].y2 > dst_tile_box->y1) {
-                        filtered_boxes[filtered_count++] = box[n];
+                for (i = 0; i < nbox; i++) {
+                    if (box[i].x1 < dst_tile_box->x2 && box[i].x2 > dst_tile_box->x1 &&
+                        box[i].y1 < dst_tile_box->y2 && box[i].y2 > dst_tile_box->y1) {
+                        filtered_boxes[filtered_count++] = box[i];
                     }
                 }
 
                 if (filtered_count > 0) {
-                    /* Allocate and populate VBO for filtered subset only */
                     char *filtered_vbo_offset;
-                    GLshort *filtered_v = glamor_get_vbo_space(screen,
-                                                               filtered_count * 8 * sizeof(GLshort),
-                                                               &filtered_vbo_offset);
+                    GLshort *filtered_v =
+                        glamor_get_vbo_space(screen,
+                                             (unsigned)(filtered_count * 8 *
+                                                        (int)sizeof(GLshort)),
+                                             &filtered_vbo_offset);
+                    if (filtered_v) {
+                        glamor_fill_vbo_from_boxes(filtered_v,
+                                                   filtered_boxes,
+                                                   filtered_count);
+                        glamor_put_vbo_space(screen);
 
-                    for (n = 0; n < filtered_count; n++) {
-                        filtered_v[0] = filtered_boxes[n].x1;
-                        filtered_v[1] = filtered_boxes[n].y1;
-                        filtered_v[2] = filtered_boxes[n].x1;
-                        filtered_v[3] = filtered_boxes[n].y2;
-                        filtered_v[4] = filtered_boxes[n].x2;
-                        filtered_v[5] = filtered_boxes[n].y2;
-                        filtered_v[6] = filtered_boxes[n].x2;
-                        filtered_v[7] = filtered_boxes[n].y1;
-                        filtered_v += 8;
+                        glVertexAttribPointer(GLAMOR_VERTEX_POS, 2, GL_SHORT, GL_FALSE,
+                                              2 * (GLsizei)sizeof(GLshort),
+                                              filtered_vbo_offset);
+
+                        glamor_glDrawArrays_GL_QUADS(glamor_priv, filtered_count);
+
+                        /* Restore pointer to original VBO for next tile. */
+                        glVertexAttribPointer(GLAMOR_VERTEX_POS, 2, GL_SHORT, GL_FALSE,
+                                              2 * (GLsizei)sizeof(GLshort),
+                                              vbo_offset);
+                    } else {
+                        /* Allocation failed, fall back to unfiltered draw. */
+                        glamor_glDrawArrays_GL_QUADS(glamor_priv, nbox);
                     }
-
-                    glamor_put_vbo_space(screen);
-
-                    /* Update vertex attrib pointer to filtered VBO */
-                    glVertexAttribPointer(GLAMOR_VERTEX_POS, 2, GL_SHORT, GL_FALSE,
-                                          2 * sizeof(GLshort), filtered_vbo_offset);
-
-                    glamor_glDrawArrays_GL_QUADS(glamor_priv, filtered_count);
                 }
 
-                if (nbox > 128)
+                if (nbox > 128) {
                     free(filtered_boxes);
-
+                }
             } else {
-                /* Non-tiled pixmap: draw all boxes (original behavior) */
+                /* Non-tiled pixmap: draw all boxes. */
                 glamor_glDrawArrays_GL_QUADS(glamor_priv, nbox);
             }
         }
@@ -634,6 +643,8 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src,
 bail_ctx:
     if (src_pixmap == dst_pixmap && glamor_priv->has_mesa_tile_raster_order) {
         glDisable(GL_TILE_RASTER_ORDER_FIXED_MESA);
+        glDisable(GL_TILE_RASTER_ORDER_INCREASING_X_MESA);
+        glDisable(GL_TILE_RASTER_ORDER_INCREASING_Y_MESA);
     }
     glDisable(GL_SCISSOR_TEST);
     glDisableVertexAttribArray(GLAMOR_VERTEX_POS);

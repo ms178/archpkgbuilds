@@ -402,19 +402,35 @@ pbo_acquire_upload(image_state_t *s, size_t required, pbo_slot_t **out)
  * ======================================================================== */
 
 static Bool
-glamor_put_image_gl(DrawablePtr drawable, GCPtr gc, int depth, int x, int y,
-                    int w, int h, int leftPad, int format, char *bits)
+glamor_put_image_gl(DrawablePtr drawable, GCPtr gc, int depth,
+                    int x, int y, int w, int h,
+                    int leftPad, int format, char *bits)
 {
-    ScreenPtr screen = drawable->pScreen;
-    glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
-    PixmapPtr pixmap = glamor_get_drawable_pixmap(drawable);
+    ScreenPtr screen;
+    glamor_screen_private *glamor_priv;
+    PixmapPtr pixmap;
     glamor_pixmap_private *pixmap_priv;
     uint32_t byte_stride;
     RegionRec region;
     BoxRec box;
     int off_x, off_y;
+    size_t transfer_size;
+    image_state_t *img_state;
 
-    if (!glamor_priv || !pixmap || !bits) {
+    (void) depth; /* Part of ABI, not used here. */
+
+    if (!drawable || !gc || !bits || w <= 0 || h <= 0) {
+        return FALSE;
+    }
+
+    screen = drawable->pScreen;
+    glamor_priv = glamor_get_screen_private(screen);
+    if (!glamor_priv) {
+        return FALSE;
+    }
+
+    pixmap = glamor_get_drawable_pixmap(drawable);
+    if (!pixmap) {
         return FALSE;
     }
 
@@ -423,10 +439,15 @@ glamor_put_image_gl(DrawablePtr drawable, GCPtr gc, int depth, int x, int y,
         return FALSE;
     }
 
-    if (!gc || gc->alu != GXcopy || !glamor_pm_is_solid(gc->depth, gc->planemask)) {
+    if (gc->alu != GXcopy) {
         return FALSE;
     }
 
+    if (!glamor_pm_is_solid(gc->depth, gc->planemask)) {
+        return FALSE;
+    }
+
+    /* Normalize 1bpp XYPixmap with no leftPad to ZPixmap, like upstream. */
     if (format == XYPixmap && drawable->depth == 1 && leftPad == 0) {
         format = ZPixmap;
     }
@@ -435,90 +456,89 @@ glamor_put_image_gl(DrawablePtr drawable, GCPtr gc, int depth, int x, int y,
         return FALSE;
     }
 
-    byte_stride = PixmapBytePad(w, drawable->depth);
+    byte_stride = (uint32_t)PixmapBytePad(w, drawable->depth);
 
+    /* Destination region in drawable coordinates. */
     x += drawable->x;
     y += drawable->y;
+
     box.x1 = x;
     box.y1 = y;
     box.x2 = x + w;
     box.y2 = y + h;
 
     RegionInit(&region, &box, 1);
-
     if (gc->pCompositeClip) {
         RegionIntersect(&region, &region, gc->pCompositeClip);
     }
 
+    /* Translate region into underlying pixmap coordinates if needed. */
     glamor_get_drawable_deltas(drawable, pixmap, &off_x, &off_y);
     if (off_x || off_y) {
-        x += off_x;
-        y += off_y;
         RegionTranslate(&region, off_x, off_y);
     }
 
-    glamor_make_current(glamor_priv);
-
-    /* Calculate transfer size with overflow check */
-    size_t transfer_size;
-    if (!safe_mul_size((size_t)h, (size_t)byte_stride, &transfer_size) || transfer_size == 0) {
+    /* Compute total transfer size safely. */
+    if (!safe_mul_size((size_t)h, (size_t)byte_stride, &transfer_size) ||
+        transfer_size == 0) {
         RegionUninit(&region);
         return FALSE;
     }
 
-    /* Initialize state */
-    init_image_state(screen);
-    image_state_t *img_state = get_image_state(screen);
+    glamor_make_current(glamor_priv);
 
-    /* Try PBO path for large transfers */
+    /* Initialize and fetch per-screen image state. */
+    init_image_state(screen);
+    img_state = get_image_state(screen);
+
+    /* Try PBO path for large transfers if available. */
     if (img_state && transfer_size >= img_state->upload_threshold) {
         pbo_slot_t *slot = NULL;
 
-        if (pbo_acquire_upload(img_state, transfer_size, &slot)) {
+        if (pbo_acquire_upload(img_state, transfer_size, &slot) && slot) {
             GLint old_pbo = 0;
-            glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &old_pbo);
 
+            glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &old_pbo);
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, slot->id);
 
-            if (slot->persistent) {
-                /* Persistent path */
+            if (slot->persistent && slot->map) {
+                /* Persistent-mapped path: memcpy into mapped PBO. */
                 memcpy_stream(slot->map, bits, transfer_size);
 
                 if (!slot->coherent) {
-                    glFlushMappedBufferRange(GL_PIXEL_UNPACK_BUFFER, 0,
-                                            (GLsizeiptr)transfer_size);
+                    glFlushMappedBufferRange(GL_PIXEL_UNPACK_BUFFER,
+                                             0, (GLsizeiptr)transfer_size);
                 }
 
                 glamor_upload_region(drawable, &region, x, y,
-                                    (const uint8_t *)0, byte_stride);
-
-                pbo_wait_fence(slot);
-                slot->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-                glFlush();
+                                     (const uint8_t *)0, byte_stride);
             } else {
-                /* Orphaning path */
+                /* Orphan-and-map path. */
                 void *map = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0,
-                                            (GLsizeiptr)transfer_size,
-                                            GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+                                             (GLsizeiptr)transfer_size,
+                                             GL_MAP_WRITE_BIT |
+                                             GL_MAP_INVALIDATE_BUFFER_BIT);
                 if (map) {
                     memcpy_stream(map, bits, transfer_size);
                     glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
 
                     glamor_upload_region(drawable, &region, x, y,
-                                        (const uint8_t *)0, byte_stride);
-
-                    pbo_wait_fence(slot);
-                    slot->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-                    glFlush();
+                                         (const uint8_t *)0, byte_stride);
                 } else {
-                    /* Map failed - direct path */
+                    /* Map failed, fall back to direct upload. */
                     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)old_pbo);
                     glamor_upload_region(drawable, &region, x, y,
-                                        (const uint8_t *)bits, byte_stride);
+                                         (const uint8_t *)bits, byte_stride);
                     RegionUninit(&region);
                     return TRUE;
                 }
             }
+
+            /* Update fence to protect future reuse of this slot; do NOT wait here. */
+            if (slot->fence) {
+                glDeleteSync(slot->fence);
+            }
+            slot->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)old_pbo);
             RegionUninit(&region);
@@ -526,8 +546,9 @@ glamor_put_image_gl(DrawablePtr drawable, GCPtr gc, int depth, int x, int y,
         }
     }
 
-    /* Direct upload */
-    glamor_upload_region(drawable, &region, x, y, (const uint8_t *)bits, byte_stride);
+    /* Direct CPU→GPU upload path for small or PBO-unavailable cases. */
+    glamor_upload_region(drawable, &region, x, y,
+                         (const uint8_t *)bits, byte_stride);
     RegionUninit(&region);
     return TRUE;
 }
@@ -586,8 +607,8 @@ static const glamor_facet glamor_facet_xybitmap = {
 
 static Bool
 glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
-                              int x, int y, int w, int h,
-                              int leftPad, char *bits)
+                             int x, int y, int w, int h,
+                             int leftPad, char *bits)
 {
     ScreenPtr screen;
     glamor_screen_private *glamor_priv;
@@ -597,16 +618,30 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
     image_state_t *img_state;
     uint32_t stride;
     GLsizei stride_gl;
+    GLint old_active_tex = 0;
+    GLint old_tex_unit1 = 0;
+    GLshort *vbo;
+    char *vbo_offset;
+    int off_x, off_y, box_index;
 
     if (!drawable || !gc || !bits || w <= 0 || h <= 0 || leftPad < 0) {
         return FALSE;
     }
 
+    /* Only handle 1bpp XYBitmap under GXcopy with solid planemask. */
+    if (drawable->depth != 1 || gc->alu != GXcopy ||
+        !glamor_pm_is_solid(gc->depth, gc->planemask)) {
+        return FALSE;
+    }
+
     screen = drawable->pScreen;
     glamor_priv = glamor_get_screen_private(screen);
-    pixmap = glamor_get_drawable_pixmap(drawable);
+    if (!glamor_priv) {
+        return FALSE;
+    }
 
-    if (!glamor_priv || !pixmap) {
+    pixmap = glamor_get_drawable_pixmap(drawable);
+    if (!pixmap) {
         return FALSE;
     }
 
@@ -615,15 +650,11 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
         return FALSE;
     }
 
-    if (gc->alu != GXcopy || !glamor_pm_is_solid(gc->depth, gc->planemask)) {
-        return FALSE;
-    }
-
     glamor_make_current(glamor_priv);
 
     prog = &glamor_priv->put_bitmap_prog;
 
-    /* Build shader */
+    /* Build shader program lazily. */
     if (!prog->prog && !prog->failed) {
         if (!glamor_build_program(screen, prog, &glamor_facet_xybitmap,
                                   NULL, NULL, NULL)) {
@@ -639,14 +670,14 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
         return FALSE;
     }
 
-    /* Initialize state */
+    /* Initialize per-screen image state for bitmap texture. */
     init_image_state(screen);
     img_state = get_image_state(screen);
     if (!img_state) {
         return FALSE;
     }
 
-    /* Cache uniform location */
+    /* Cache the bitorder uniform location per-program. */
     if (img_state->last_bitmap_prog != prog->prog) {
         img_state->bitorder_uniform = glGetUniformLocation(prog->prog, "bitorder");
         img_state->last_bitmap_prog = prog->prog;
@@ -657,109 +688,133 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
         glUniform1i(img_state->bitorder_uniform, bitorder);
     }
 
-    /* Calculate stride */
-    stride = PixmapBytePad(w + leftPad, 1);
+    /* Compute stride of bitmap in bytes for (w + leftPad) bits. */
+    stride = (uint32_t)PixmapBytePad(w + leftPad, 1);
     if (stride > (uint32_t)INT32_MAX) {
         return FALSE;
     }
     stride_gl = (GLsizei)stride;
 
-    /* Create/resize texture */
+    /* Allocate/reuse bitmap texture. */
     if (!img_state->bitmap_tex) {
         glGenTextures(1, &img_state->bitmap_tex);
         img_state->bitmap_w = 0;
         img_state->bitmap_h = 0;
     }
 
-    GLint old_tex = 0;
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex);
-
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &old_active_tex);
     glActiveTexture(GL_TEXTURE1);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex_unit1);
+
     glBindTexture(GL_TEXTURE_2D, img_state->bitmap_tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-    GLsizei tex_w = (GLsizei)round_up_pow2(stride_gl, 256);
-    GLsizei tex_h = (GLsizei)round_up_pow2(h, 64);
+    {
+        GLsizei tex_w = (GLsizei)round_up_pow2((size_t)stride_gl, 256);
+        GLsizei tex_h = (GLsizei)round_up_pow2((size_t)h, 64);
 
-    if (tex_w != img_state->bitmap_w || tex_h != img_state->bitmap_h) {
-        GLint old_align;
-        glGetIntegerv(GL_UNPACK_ALIGNMENT, &old_align);
+        if (tex_w != img_state->bitmap_w || tex_h != img_state->bitmap_h) {
+            GLint old_align;
 
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8UI, tex_w, tex_h, 0,
-                     GL_RED_INTEGER, GL_UNSIGNED_BYTE, NULL);
+            glGetIntegerv(GL_UNPACK_ALIGNMENT, &old_align);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-        glPixelStorei(GL_UNPACK_ALIGNMENT, old_align);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_R8UI,
+                         tex_w, tex_h, 0,
+                         GL_RED_INTEGER, GL_UNSIGNED_BYTE, NULL);
 
-        if (glGetError() != GL_NO_ERROR) {
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, (GLuint)old_tex);
-            return FALSE;
+            glPixelStorei(GL_UNPACK_ALIGNMENT, old_align);
+
+            if (glGetError() != GL_NO_ERROR) {
+                glBindTexture(GL_TEXTURE_2D, (GLuint)old_tex_unit1);
+                glActiveTexture((GLenum)old_active_tex);
+                return FALSE;
+            }
+
+            img_state->bitmap_w = tex_w;
+            img_state->bitmap_h = tex_h;
         }
-
-        img_state->bitmap_w = tex_w;
-        img_state->bitmap_h = tex_h;
     }
 
-    /* Upload bitmap */
+    /* Upload bitmap contents into texture. */
     {
         GLint old_align;
-        glGetIntegerv(GL_UNPACK_ALIGNMENT, &old_align);
 
+        glGetIntegerv(GL_UNPACK_ALIGNMENT, &old_align);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, stride_gl, h,
+
+        glTexSubImage2D(GL_TEXTURE_2D, 0,
+                        0, 0, stride_gl, h,
                         GL_RED_INTEGER, GL_UNSIGNED_BYTE, bits);
 
         glPixelStorei(GL_UNPACK_ALIGNMENT, old_align);
     }
 
-    glUniform1i(prog->font_uniform, 1);
+    /* Bind 'font' sampler to texture unit 1. */
+    if (prog->font_uniform != -1) {
+        glUniform1i(prog->font_uniform, 1);
+    }
 
-    /* VBO */
-    char *vbo_offset;
-    GLshort *vbo = glamor_get_vbo_space(screen, 6 * sizeof(GLshort), &vbo_offset);
+    /* Allocate a tiny VBO for primitive + source coordinates. */
+    vbo = glamor_get_vbo_space(screen,
+                               (unsigned)(6 * sizeof(GLshort)),
+                               &vbo_offset);
     if (!vbo) {
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, (GLuint)old_tex);
+        glBindTexture(GL_TEXTURE_2D, (GLuint)old_tex_unit1);
+        glActiveTexture((GLenum)old_active_tex);
         return FALSE;
     }
 
-    vbo[0] = x;
-    vbo[1] = y;
-    vbo[2] = w;
-    vbo[3] = h;
-    vbo[4] = leftPad;
+    /* Coordinates in drawable space; transform handles pixmap delta. */
+    vbo[0] = (GLshort)x;
+    vbo[1] = (GLshort)y;
+    vbo[2] = (GLshort)w;
+    vbo[3] = (GLshort)h;
+    vbo[4] = (GLshort)leftPad;
     vbo[5] = 0;
 
     glamor_put_vbo_space(screen);
 
     glEnableVertexAttribArray(GLAMOR_VERTEX_POS);
     glVertexAttribPointer(GLAMOR_VERTEX_POS, 4, GL_SHORT, GL_FALSE,
-                          6 * sizeof(GLshort), vbo_offset);
+                          6 * (GLsizei)sizeof(GLshort), vbo_offset);
     glVertexAttribDivisor(GLAMOR_VERTEX_POS, 1);
 
     glEnableVertexAttribArray(GLAMOR_VERTEX_SOURCE);
     glVertexAttribPointer(GLAMOR_VERTEX_SOURCE, 2, GL_SHORT, GL_FALSE,
-                          6 * sizeof(GLshort),
-                          vbo_offset + 4 * sizeof(GLshort));
+                          6 * (GLsizei)sizeof(GLshort),
+                          vbo_offset + 4 * (int)sizeof(GLshort));
     glVertexAttribDivisor(GLAMOR_VERTEX_SOURCE, 1);
 
     glEnable(GL_SCISSOR_TEST);
 
-    /* Draw */
-    int off_x, off_y, box_index;
+    /* Draw per pixmap tile, respecting composite clip. */
     glamor_pixmap_loop(pixmap_priv, box_index) {
-        glamor_set_destination_drawable(drawable, box_index, TRUE, FALSE,
-                                        prog->matrix_uniform, &off_x, &off_y);
+        if (!glamor_set_destination_drawable(drawable, box_index,
+                                             TRUE, FALSE,
+                                             prog->matrix_uniform,
+                                             &off_x, &off_y)) {
+            glDisable(GL_SCISSOR_TEST);
+            glVertexAttribDivisor(GLAMOR_VERTEX_SOURCE, 0);
+            glDisableVertexAttribArray(GLAMOR_VERTEX_SOURCE);
+            glVertexAttribDivisor(GLAMOR_VERTEX_POS, 0);
+            glDisableVertexAttribArray(GLAMOR_VERTEX_POS);
+            glBindTexture(GL_TEXTURE_2D, (GLuint)old_tex_unit1);
+            glActiveTexture((GLenum)old_active_tex);
+            return FALSE;
+        }
 
         if (gc->pCompositeClip) {
-            int nbox = RegionNumRects(gc->pCompositeClip);
+            int i;
+            int nclip = RegionNumRects(gc->pCompositeClip);
             BoxPtr boxes = RegionRects(gc->pCompositeClip);
 
-            for (int i = 0; i < nbox; i++) {
-                glScissor(boxes[i].x1 + off_x, boxes[i].y1 + off_y,
-                          boxes[i].x2 - boxes[i].x1, boxes[i].y2 - boxes[i].y1);
+            for (i = 0; i < nclip; i++) {
+                glScissor(boxes[i].x1 + off_x,
+                          boxes[i].y1 + off_y,
+                          boxes[i].x2 - boxes[i].x1,
+                          boxes[i].y2 - boxes[i].y1);
                 glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 1);
             }
         } else {
@@ -770,13 +825,14 @@ glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
     }
 
     glDisable(GL_SCISSOR_TEST);
+
     glVertexAttribDivisor(GLAMOR_VERTEX_SOURCE, 0);
     glDisableVertexAttribArray(GLAMOR_VERTEX_SOURCE);
     glVertexAttribDivisor(GLAMOR_VERTEX_POS, 0);
     glDisableVertexAttribArray(GLAMOR_VERTEX_POS);
 
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, (GLuint)old_tex);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)old_tex_unit1);
+    glActiveTexture((GLenum)old_active_tex);
 
     return TRUE;
 }
