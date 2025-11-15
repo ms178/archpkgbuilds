@@ -14,7 +14,7 @@ index 898380d82..a31cd37d6 100644
  
 --- a/glamor/glamor_image.c	2025-11-01 18:57:43.026491885 +0200
 +++ b/glamor/glamor_image.c	2025-11-01 18:59:22.738392513 +0200
-@@ -18,16 +19,387 @@
+@@ -18,79 +19,885 @@
   * DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
   * TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE
   * OF THIS SOFTWARE.
@@ -48,6 +48,10 @@ index 898380d82..a31cd37d6 100644
 +#else
 +#define LIKELY(x)   (x)
 +#define UNLIKELY(x) (x)
++#endif
++
++#if defined(__AVX2__) && (defined(__GNUC__) || defined(__clang__))
++#include <immintrin.h>
 +#endif
 +
 +/* Compile-time assertions */
@@ -121,12 +125,50 @@ index 898380d82..a31cd37d6 100644
 +static inline void
 +memcpy_stream(void * restrict dst, const void * restrict src, size_t n)
 +{
-+    if (n >= (512 * 1024)) {
-+        const char *s = src;
++    if (n == 0) {
++        return;
++    }
++
++    /* Prefetch for large transfers to help HW prefetchers. */
++    if (n >= (size_t)(512 * 1024)) {
++        const char *s = (const char *)src;
 +        for (size_t i = 0; i < n; i += 65536) {
 +            __builtin_prefetch(s + i, 0, 0);
 +        }
 +    }
++
++#if defined(__AVX2__) && (defined(__GNUC__) || defined(__clang__))
++    /* Large, aligned copies: use AVX2 non-temporal stores. */
++    if (n >= (size_t)(256 * 1024)) {
++        uintptr_t dst_addr = (uintptr_t)dst;
++        uintptr_t src_addr = (uintptr_t)src;
++
++        /* 32-byte alignment required for stream stores. */
++        if (((dst_addr | src_addr) & 31u) == 0u) {
++            __m256i       *d = (__m256i *)dst;
++            const __m256i *s = (const __m256i *)src;
++            size_t vec_count = n / 32;
++            size_t remainder = n - vec_count * 32;
++
++            for (size_t i = 0; i < vec_count; i++) {
++                __m256i v = _mm256_loadu_si256(s + i);
++                _mm256_stream_si256(d + i, v);
++            }
++
++            /* Ensure all non-temporal stores are visible. */
++            _mm_sfence();
++
++            if (remainder) {
++                const char *src_tail = (const char *)src + vec_count * 32;
++                char       *dst_tail = (char *)dst + vec_count * 32;
++                memcpy(dst_tail, src_tail, remainder);
++            }
++            return;
++        }
++    }
++#endif
++
++    /* Fallback: normal memcpy (already highly optimized). */
 +    memcpy(dst, src, n);
 +}
 +
@@ -216,7 +258,7 @@ index 898380d82..a31cd37d6 100644
 +
 +    return FALSE;
 +}
-+
+ 
 +/* Initialize per-screen image state (idempotent) */
 +static void
 +init_image_state(ScreenPtr screen)
@@ -293,9 +335,14 @@ index 898380d82..a31cd37d6 100644
 +}
 +
 +/* Acquire upload PBO slot */
-+static Bool
+ static Bool
+-glamor_put_image_gl(DrawablePtr drawable, GCPtr gc, int depth, int x, int y,
+-                    int w, int h, int leftPad, int format, char *bits)
 +pbo_acquire_upload(image_state_t *s, size_t required, pbo_slot_t **out)
-+{
+ {
+-    ScreenPtr screen = drawable->pScreen;
+-    glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
+-    PixmapPtr pixmap = glamor_get_drawable_pixmap(drawable);
 +    pbo_slot_t *best_wait = NULL;
 +
 +    for (int tries = 0; tries < 4; tries++) {
@@ -402,43 +449,65 @@ index 898380d82..a31cd37d6 100644
 +/* ========================================================================
 + * ZPixmap PutImage
 + * ======================================================================== */
- 
- static Bool
- glamor_put_image_gl(DrawablePtr drawable, GCPtr gc, int depth, int x, int y,
-@@ -37,36 +409,46 @@ glamor_put_image_gl(DrawablePtr drawable
-     glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
-     PixmapPtr pixmap = glamor_get_drawable_pixmap(drawable);
++
++static Bool
++glamor_put_image_gl(DrawablePtr drawable, GCPtr gc, int depth,
++                    int x, int y, int w, int h,
++                    int leftPad, int format, char *bits)
++{
++    ScreenPtr screen;
++    glamor_screen_private *glamor_priv;
++    PixmapPtr pixmap;
      glamor_pixmap_private *pixmap_priv;
 -    uint32_t    byte_stride = PixmapBytePad(w, drawable->depth);
 -    RegionRec   region;
 -    BoxRec      box;
 -    int         off_x, off_y;
--
--    pixmap_priv = glamor_get_pixmap_private(pixmap);
 +    uint32_t byte_stride;
 +    RegionRec region;
 +    BoxRec box;
-+    int off_x, off_y;
++    int off_x = 0, off_y = 0;
++    size_t transfer_size;
++    image_state_t *img_state;
+ 
+-    pixmap_priv = glamor_get_pixmap_private(pixmap);
++    (void)depth; /* depth implied by drawable; keep for ABI */
  
 -    if (!GLAMOR_PIXMAP_PRIV_HAS_FBO(pixmap_priv))
-+    if (!glamor_priv || !pixmap || !bits) {
++    if (UNLIKELY(!drawable || !gc || !bits || w <= 0 || h <= 0)) {
          return FALSE;
 +    }
  
 -    if (gc->alu != GXcopy)
 -        goto bail;
-+    pixmap_priv = glamor_get_pixmap_private(pixmap);
-+    if (!pixmap_priv || !GLAMOR_PIXMAP_PRIV_HAS_FBO(pixmap_priv)) {
++    screen = drawable->pScreen;
++    glamor_priv = glamor_get_screen_private(screen);
++    if (UNLIKELY(!glamor_priv)) {
 +        return FALSE;
 +    }
  
 -    if (!glamor_pm_is_solid(gc->depth, gc->planemask))
 -        goto bail;
-+    if (!gc || gc->alu != GXcopy || !glamor_pm_is_solid(gc->depth, gc->planemask)) {
++    pixmap = glamor_get_drawable_pixmap(drawable);
++    if (UNLIKELY(!pixmap)) {
++        return FALSE;
++    }
++
++    pixmap_priv = glamor_get_pixmap_private(pixmap);
++    if (UNLIKELY(!pixmap_priv || !GLAMOR_PIXMAP_PRIV_HAS_FBO(pixmap_priv))) {
++        return FALSE;
++    }
++
++    if (gc->alu != GXcopy) {
++        return FALSE;
++    }
++
++    if (!glamor_pm_is_solid(gc->depth, gc->planemask)) {
 +        return FALSE;
 +    }
  
 -    if (format == XYPixmap && drawable->depth == 1 && leftPad == 0)
++    /* Normalize certain XYPixmap cases to ZPixmap, like upstream. */
 +    if (format == XYPixmap && drawable->depth == 1 && leftPad == 0) {
          format = ZPixmap;
 +    }
@@ -449,91 +518,117 @@ index 898380d82..a31cd37d6 100644
  
 -    if (format != ZPixmap)
 -        goto bail;
-+    byte_stride = PixmapBytePad(w, drawable->depth);
++    byte_stride = (uint32_t)PixmapBytePad(w, drawable->depth);
  
-     x += drawable->x;
-     y += drawable->y;
-     box.x1 = x;
-     box.y1 = y;
--    box.x2 = box.x1 + w;
--    box.y2 = box.y1 + h;
-+    box.x2 = x + w;
-+    box.y2 = y + h;
+-    x += drawable->x;
+-    y += drawable->y;
+-    box.x1 = x;
+-    box.y1 = y;
++    /* Compute region in pixmap coordinates. */
++    glamor_get_drawable_deltas(drawable, pixmap, &off_x, &off_y);
++
++    box.x1 = x + off_x;
++    box.y1 = y + off_y;
+     box.x2 = box.x1 + w;
+     box.y2 = box.y1 + h;
++
++    /* Basic bounds check against destination pixmap. */
++    if (box.x1 < 0 || box.y1 < 0 ||
++        box.x2 > pixmap->drawable.width ||
++        box.y2 > pixmap->drawable.height) {
++        return FALSE;
++    }
 +
      RegionInit(&region, &box, 1);
 -    RegionIntersect(&region, &region, gc->pCompositeClip);
-+
-+    if (gc->pCompositeClip) {
-+        RegionIntersect(&region, &region, gc->pCompositeClip);
-+    }
  
-     glamor_get_drawable_deltas(drawable, pixmap, &off_x, &off_y);
-     if (off_x || off_y) {
-@@ -77,20 +459,339 @@ glamor_put_image_gl(DrawablePtr drawable
+-    glamor_get_drawable_deltas(drawable, pixmap, &off_x, &off_y);
+-    if (off_x || off_y) {
+-        x += off_x;
+-        y += off_y;
+-        RegionTranslate(&region, off_x, off_y);
++    /* Apply GC composite clip (convert to pixmap coords). */
++    if (gc->pCompositeClip) {
++        RegionRec clip_pixmap;
++        RegionNull(&clip_pixmap);
++        RegionCopy(&clip_pixmap, gc->pCompositeClip);
++        RegionTranslate(&clip_pixmap, off_x, off_y);
++        RegionIntersect(&region, &region, &clip_pixmap);
++        RegionUninit(&clip_pixmap);
++    }
++
++    if (!RegionNotEmpty(&region)) {
++        RegionUninit(&region);
++        return TRUE;
++    }
++
++    /* Compute transfer size safely. */
++    if (!safe_mul_size((size_t)h, (size_t)byte_stride, &transfer_size) ||
++        transfer_size == 0) {
++        RegionUninit(&region);
++        return FALSE;
+     }
  
      glamor_make_current(glamor_priv);
  
 -    glamor_upload_region(drawable, &region, x, y, (uint8_t *) bits, byte_stride);
-+    /* Calculate transfer size with overflow check */
-+    size_t transfer_size;
-+    if (!safe_mul_size((size_t)h, (size_t)byte_stride, &transfer_size) || transfer_size == 0) {
-+        RegionUninit(&region);
-+        return FALSE;
-+    }
-+
-+    /* Initialize state */
++    /* Initialize per-screen image state & PBOs. */
 +    init_image_state(screen);
-+    image_state_t *img_state = get_image_state(screen);
++    img_state = get_image_state(screen);
 +
-+    /* Try PBO path for large transfers */
++    /* PBO path for large transfers. */
 +    if (img_state && transfer_size >= img_state->upload_threshold) {
 +        pbo_slot_t *slot = NULL;
 +
-+        if (pbo_acquire_upload(img_state, transfer_size, &slot)) {
++        if (pbo_acquire_upload(img_state, transfer_size, &slot) && slot) {
 +            GLint old_pbo = 0;
 +            glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &old_pbo);
 +
 +            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, slot->id);
 +
-+            if (slot->persistent) {
-+                /* Persistent path */
++            if (slot->persistent && slot->map) {
++                /* Persistent mapped PBO: AVX2 streaming memcpy into PBO. */
 +                memcpy_stream(slot->map, bits, transfer_size);
 +
 +                if (!slot->coherent) {
-+                    glFlushMappedBufferRange(GL_PIXEL_UNPACK_BUFFER, 0,
-+                                            (GLsizeiptr)transfer_size);
++                    glFlushMappedBufferRange(GL_PIXEL_UNPACK_BUFFER,
++                                             0, (GLsizeiptr)transfer_size);
 +                }
 +
-+                glamor_upload_region(drawable, &region, x, y,
-+                                    (const uint8_t *)0, byte_stride);
++                /* Ensure CPU writes are visible to GL. */
++                glMemoryBarrier(GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT);
 +
-+                pbo_wait_fence(slot);
-+                slot->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-+                glFlush();
++                glamor_upload_region(drawable, &region, x, y,
++                                     (const uint8_t *)(uintptr_t)0, byte_stride);
 +            } else {
-+                /* Orphaning path */
++                /* Orphan/map/unmap path (non-persistent PBO). */
++                GLbitfield map_flags = GL_MAP_WRITE_BIT |
++                                       GL_MAP_INVALIDATE_BUFFER_BIT |
++                                       GL_MAP_UNSYNCHRONIZED_BIT;
++
 +                void *map = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0,
-+                                            (GLsizeiptr)transfer_size,
-+                                            GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
++                                             (GLsizeiptr)transfer_size,
++                                             map_flags);
 +                if (map) {
 +                    memcpy_stream(map, bits, transfer_size);
++                    glMemoryBarrier(GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT);
 +                    glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
 +
 +                    glamor_upload_region(drawable, &region, x, y,
-+                                        (const uint8_t *)0, byte_stride);
-+
-+                    pbo_wait_fence(slot);
-+                    slot->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-+                    glFlush();
++                                         (const uint8_t *)(uintptr_t)0, byte_stride);
 +                } else {
-+                    /* Map failed - direct path */
++                    /* Map failed: fall back to direct upload. */
 +                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)old_pbo);
 +                    glamor_upload_region(drawable, &region, x, y,
-+                                        (const uint8_t *)bits, byte_stride);
++                                         (const uint8_t *)bits, byte_stride);
 +                    RegionUninit(&region);
 +                    return TRUE;
 +                }
 +            }
++
++            /* Async: record a new fence for future reuse, do not wait here. */
++            pbo_wait_fence(slot); /* Clears previous fence, if any. */
++            slot->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 +
 +            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)old_pbo);
 +            RegionUninit(&region);
@@ -541,8 +636,9 @@ index 898380d82..a31cd37d6 100644
 +        }
 +    }
  
-+    /* Direct upload */
-+    glamor_upload_region(drawable, &region, x, y, (const uint8_t *)bits, byte_stride);
++    /* Direct CPU→GPU upload path. */
++    glamor_upload_region(drawable, &region, x, y,
++                         (const uint8_t *)bits, byte_stride);
      RegionUninit(&region);
      return TRUE;
 -bail:
@@ -603,8 +699,8 @@ index 898380d82..a31cd37d6 100644
 +
 +static Bool
 +glamor_put_image_xybitmap_gl(DrawablePtr drawable, GCPtr gc,
-+                              int x, int y, int w, int h,
-+                              int leftPad, char *bits)
++                             int x, int y, int w, int h,
++                             int leftPad, char *bits)
 +{
 +    ScreenPtr screen;
 +    glamor_screen_private *glamor_priv;
@@ -614,16 +710,31 @@ index 898380d82..a31cd37d6 100644
 +    image_state_t *img_state;
 +    uint32_t stride;
 +    GLsizei stride_gl;
++    GLint old_active_tex = 0;
++    GLint old_tex_unit1 = 0;
++    GLshort *vbo;
++    char *vbo_offset;
++    int off_x, off_y, box_index;
 +
 +    if (!drawable || !gc || !bits || w <= 0 || h <= 0 || leftPad < 0) {
 +        return FALSE;
 +    }
 +
++    /* Only handle 1bpp XYBitmap under GXcopy with solid planemask. */
++    if (drawable->depth != 1 ||
++        gc->alu != GXcopy ||
++        !glamor_pm_is_solid(gc->depth, gc->planemask)) {
++        return FALSE;
++    }
++
 +    screen = drawable->pScreen;
 +    glamor_priv = glamor_get_screen_private(screen);
-+    pixmap = glamor_get_drawable_pixmap(drawable);
++    if (!glamor_priv) {
++        return FALSE;
++    }
 +
-+    if (!glamor_priv || !pixmap) {
++    pixmap = glamor_get_drawable_pixmap(drawable);
++    if (!pixmap) {
 +        return FALSE;
 +    }
 +
@@ -632,17 +743,14 @@ index 898380d82..a31cd37d6 100644
 +        return FALSE;
 +    }
 +
-+    if (gc->alu != GXcopy || !glamor_pm_is_solid(gc->depth, gc->planemask)) {
-+        return FALSE;
-+    }
-+
 +    glamor_make_current(glamor_priv);
 +
 +    prog = &glamor_priv->put_bitmap_prog;
 +
-+    /* Build shader */
++    /* Build shader program lazily. */
 +    if (!prog->prog && !prog->failed) {
-+        if (!glamor_build_program(screen, prog, &glamor_facet_xybitmap,
++        if (!glamor_build_program(screen, prog,
++                                  &glamor_facet_xybitmap,
 +                                  NULL, NULL, NULL)) {
 +            return FALSE;
 +        }
@@ -656,16 +764,17 @@ index 898380d82..a31cd37d6 100644
 +        return FALSE;
 +    }
 +
-+    /* Initialize state */
++    /* Initialize per-screen image state. */
 +    init_image_state(screen);
 +    img_state = get_image_state(screen);
 +    if (!img_state) {
 +        return FALSE;
 +    }
 +
-+    /* Cache uniform location */
++    /* Cache bitorder uniform location. */
 +    if (img_state->last_bitmap_prog != prog->prog) {
-+        img_state->bitorder_uniform = glGetUniformLocation(prog->prog, "bitorder");
++        img_state->bitorder_uniform =
++            glGetUniformLocation(prog->prog, "bitorder");
 +        img_state->last_bitmap_prog = prog->prog;
 +    }
 +
@@ -674,109 +783,121 @@ index 898380d82..a31cd37d6 100644
 +        glUniform1i(img_state->bitorder_uniform, bitorder);
 +    }
 +
-+    /* Calculate stride */
-+    stride = PixmapBytePad(w + leftPad, 1);
++    /* Compute stride in bytes for (w + leftPad) bits. */
++    stride = (uint32_t)PixmapBytePad(w + leftPad, 1);
 +    if (stride > (uint32_t)INT32_MAX) {
 +        return FALSE;
 +    }
 +    stride_gl = (GLsizei)stride;
 +
-+    /* Create/resize texture */
++    /* Ensure bitmap texture exists. */
 +    if (!img_state->bitmap_tex) {
 +        glGenTextures(1, &img_state->bitmap_tex);
 +        img_state->bitmap_w = 0;
 +        img_state->bitmap_h = 0;
 +    }
 +
-+    GLint old_tex = 0;
-+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex);
-+
++    glGetIntegerv(GL_ACTIVE_TEXTURE, &old_active_tex);
 +    glActiveTexture(GL_TEXTURE1);
++    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex_unit1);
++
 +    glBindTexture(GL_TEXTURE_2D, img_state->bitmap_tex);
 +    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 +    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 +
-+    GLsizei tex_w = (GLsizei)round_up_pow2(stride_gl, 256);
-+    GLsizei tex_h = (GLsizei)round_up_pow2(h, 64);
++    /* Round up texture size to reduce realloc churn and align to cache-friendly sizes. */
++    {
++        GLsizei tex_w = (GLsizei)round_up_pow2((size_t)stride_gl, 256);
++        GLsizei tex_h = (GLsizei)round_up_pow2((size_t)h, 64);
 +
-+    if (tex_w != img_state->bitmap_w || tex_h != img_state->bitmap_h) {
-+        GLint old_align;
-+        glGetIntegerv(GL_UNPACK_ALIGNMENT, &old_align);
++        if (tex_w != img_state->bitmap_w || tex_h != img_state->bitmap_h) {
++            GLint old_align;
++            glGetIntegerv(GL_UNPACK_ALIGNMENT, &old_align);
 +
-+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8UI, tex_w, tex_h, 0,
-+                     GL_RED_INTEGER, GL_UNSIGNED_BYTE, NULL);
++            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++            glTexImage2D(GL_TEXTURE_2D, 0, GL_R8UI,
++                         tex_w, tex_h, 0,
++                         GL_RED_INTEGER, GL_UNSIGNED_BYTE, NULL);
++            glPixelStorei(GL_UNPACK_ALIGNMENT, old_align);
 +
-+        glPixelStorei(GL_UNPACK_ALIGNMENT, old_align);
++            if (glGetError() != GL_NO_ERROR) {
++                glBindTexture(GL_TEXTURE_2D, (GLuint)old_tex_unit1);
++                glActiveTexture((GLenum)old_active_tex);
++                return FALSE;
++            }
 +
-+        if (glGetError() != GL_NO_ERROR) {
-+            glActiveTexture(GL_TEXTURE0);
-+            glBindTexture(GL_TEXTURE_2D, (GLuint)old_tex);
-+            return FALSE;
++            img_state->bitmap_w = tex_w;
++            img_state->bitmap_h = tex_h;
 +        }
-+
-+        img_state->bitmap_w = tex_w;
-+        img_state->bitmap_h = tex_h;
 +    }
 +
-+    /* Upload bitmap */
++    /* Upload bitmap bytes. */
 +    {
 +        GLint old_align;
 +        glGetIntegerv(GL_UNPACK_ALIGNMENT, &old_align);
 +
 +        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, stride_gl, h,
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
++                        stride_gl, h,
 +                        GL_RED_INTEGER, GL_UNSIGNED_BYTE, bits);
-+
 +        glPixelStorei(GL_UNPACK_ALIGNMENT, old_align);
 +    }
 +
-+    glUniform1i(prog->font_uniform, 1);
++    /* Bind 'font' sampler to texture unit 1. */
++    if (prog->font_uniform != -1) {
++        glUniform1i(prog->font_uniform, 1);
++    }
 +
-+    /* VBO */
-+    char *vbo_offset;
-+    GLshort *vbo = glamor_get_vbo_space(screen, 6 * sizeof(GLshort), &vbo_offset);
++    /* Build a 6-short VBO with primitive + source. */
++    vbo = glamor_get_vbo_space(screen,
++                               (unsigned)(6 * sizeof(GLshort)),
++                               &vbo_offset);
 +    if (!vbo) {
-+        glActiveTexture(GL_TEXTURE0);
-+        glBindTexture(GL_TEXTURE_2D, (GLuint)old_tex);
++        glBindTexture(GL_TEXTURE_2D, (GLuint)old_tex_unit1);
++        glActiveTexture((GLenum)old_active_tex);
 +        return FALSE;
 +    }
 +
-+    vbo[0] = x;
-+    vbo[1] = y;
-+    vbo[2] = w;
-+    vbo[3] = h;
-+    vbo[4] = leftPad;
++    vbo[0] = (GLshort)x;
++    vbo[1] = (GLshort)y;
++    vbo[2] = (GLshort)w;
++    vbo[3] = (GLshort)h;
++    vbo[4] = (GLshort)leftPad;
 +    vbo[5] = 0;
 +
 +    glamor_put_vbo_space(screen);
 +
 +    glEnableVertexAttribArray(GLAMOR_VERTEX_POS);
 +    glVertexAttribPointer(GLAMOR_VERTEX_POS, 4, GL_SHORT, GL_FALSE,
-+                          6 * sizeof(GLshort), vbo_offset);
++                          6 * (GLsizei)sizeof(GLshort), vbo_offset);
 +    glVertexAttribDivisor(GLAMOR_VERTEX_POS, 1);
 +
 +    glEnableVertexAttribArray(GLAMOR_VERTEX_SOURCE);
 +    glVertexAttribPointer(GLAMOR_VERTEX_SOURCE, 2, GL_SHORT, GL_FALSE,
-+                          6 * sizeof(GLshort),
-+                          vbo_offset + 4 * sizeof(GLshort));
++                          6 * (GLsizei)sizeof(GLshort),
++                          vbo_offset + 4 * (int)sizeof(GLshort));
 +    glVertexAttribDivisor(GLAMOR_VERTEX_SOURCE, 1);
 +
 +    glEnable(GL_SCISSOR_TEST);
 +
-+    /* Draw */
-+    int off_x, off_y, box_index;
 +    glamor_pixmap_loop(pixmap_priv, box_index) {
-+        glamor_set_destination_drawable(drawable, box_index, TRUE, FALSE,
-+                                        prog->matrix_uniform, &off_x, &off_y);
++        if (!glamor_set_destination_drawable(drawable, box_index,
++                                             TRUE, FALSE,
++                                             prog->matrix_uniform,
++                                             &off_x, &off_y)) {
++            continue;
++        }
 +
 +        if (gc->pCompositeClip) {
-+            int nbox = RegionNumRects(gc->pCompositeClip);
++            int i;
++            int nclip = RegionNumRects(gc->pCompositeClip);
 +            BoxPtr boxes = RegionRects(gc->pCompositeClip);
 +
-+            for (int i = 0; i < nbox; i++) {
-+                glScissor(boxes[i].x1 + off_x, boxes[i].y1 + off_y,
-+                          boxes[i].x2 - boxes[i].x1, boxes[i].y2 - boxes[i].y1);
++            for (i = 0; i < nclip; i++) {
++                glScissor(boxes[i].x1 + off_x,
++                          boxes[i].y1 + off_y,
++                          boxes[i].x2 - boxes[i].x1,
++                          boxes[i].y2 - boxes[i].y1);
 +                glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 1);
 +            }
 +        } else {
@@ -787,13 +908,14 @@ index 898380d82..a31cd37d6 100644
 +    }
 +
 +    glDisable(GL_SCISSOR_TEST);
++
 +    glVertexAttribDivisor(GLAMOR_VERTEX_SOURCE, 0);
 +    glDisableVertexAttribArray(GLAMOR_VERTEX_SOURCE);
 +    glVertexAttribDivisor(GLAMOR_VERTEX_POS, 0);
 +    glDisableVertexAttribArray(GLAMOR_VERTEX_POS);
 +
-+    glActiveTexture(GL_TEXTURE0);
-+    glBindTexture(GL_TEXTURE_2D, (GLuint)old_tex);
++    glBindTexture(GL_TEXTURE_2D, (GLuint)old_tex_unit1);
++    glActiveTexture((GLenum)old_active_tex);
 +
 +    return TRUE;
 +}
@@ -813,7 +935,7 @@ index 898380d82..a31cd37d6 100644
      glamor_finish_access(drawable);
  }
  
-@@ -98,58 +799,98 @@ void
+@@ -98,58 +905,99 @@ void
  glamor_put_image(DrawablePtr drawable, GCPtr gc, int depth, int x, int y,
                   int w, int h, int leftPad, int format, char *bits)
  {
@@ -856,7 +978,11 @@ index 898380d82..a31cd37d6 100644
 +    BoxRec box;
 +    int off_x, off_y;
 +
-+    if (!drawable || !d) {
++    if (!drawable || !d || w <= 0 || h <= 0) {
++        return FALSE;
++    }
++
++    if (format != ZPixmap) {
 +        return FALSE;
 +    }
 +
@@ -871,20 +997,17 @@ index 898380d82..a31cd37d6 100644
 +    if (!pixmap_priv || !GLAMOR_PIXMAP_PRIV_HAS_FBO(pixmap_priv)) {
 +        return FALSE;
 +    }
-+
-+    if (format != ZPixmap) {
-+        return FALSE;
-+    }
  
 -    if (format != ZPixmap)
 -        goto bail;
-+    byte_stride = PixmapBytePad(w, drawable->depth);
++    byte_stride = (uint32_t)PixmapBytePad(w, drawable->depth);
  
      glamor_get_drawable_deltas(drawable, pixmap, &off_x, &off_y);
 +
      box.x1 = x;
-     box.x2 = x + w;
+-    box.x2 = x + w;
      box.y1 = y;
++    box.x2 = x + w;
      box.y2 = y + h;
 +
      glamor_download_boxes(drawable, &box, 1,
@@ -893,8 +1016,10 @@ index 898380d82..a31cd37d6 100644
 -                          (uint8_t *) d, byte_stride);
 +                          (uint8_t *)d, byte_stride);
  
-+    /* Apply plane mask */
-     if (!glamor_pm_is_solid(glamor_drawable_effective_depth(drawable), plane_mask)) {
+-    if (!glamor_pm_is_solid(glamor_drawable_effective_depth(drawable), plane_mask)) {
++    /* Apply plane mask if it is not solid. */
++    if (!glamor_pm_is_solid(glamor_drawable_effective_depth(drawable),
++                            plane_mask)) {
          FbStip pm = fbReplicatePixel(plane_mask, drawable->bitsPerPixel);
 -        FbStip *dst = (void *)d;
 -        uint32_t dstStride = byte_stride / sizeof(FbStip);
@@ -928,17 +1053,17 @@ index 898380d82..a31cd37d6 100644
      glamor_finish_access(drawable);
  }
  
-@@ -157,7 +898,13 @@ void
+@@ -157,7 +1005,13 @@ void
  glamor_get_image(DrawablePtr drawable, int x, int y, int w, int h,
                   unsigned int format, unsigned long plane_mask, char *d)
  {
 -    if (glamor_get_image_gl(drawable, x, y, w, h, format, plane_mask, d))
 +    if (UNLIKELY(!drawable || !d || w <= 0 || h <= 0)) {
-+        return;
+         return;
 +    }
 +
 +    if (glamor_get_image_gl(drawable, x, y, w, h, format, plane_mask, d)) {
-         return;
++        return;
 +    }
 +
      glamor_get_image_bail(drawable, x, y, w, h, format, plane_mask, d);
@@ -946,14 +1071,6 @@ index 898380d82..a31cd37d6 100644
 
 --- a/glamor/glamor_copy.c	2025-11-01 18:57:22.899703780 +0200
 +++ b/glamor/glamor_copy.c	2025-11-01 19:00:33.824978256 +0200
-@@ -1,5 +1,6 @@
- /*
-- * Copyright © 2014 Keith Packard
-+ * Copyright © 2009 Intel Corporation
-+ * Copyright © 2015 Keith Packard
-  *
-  * Permission to use, copy, modify, distribute, and sell this software and its
-  * documentation for any purpose is hereby granted without fee, provided that
 @@ -18,19 +19,46 @@
   * DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
   * TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE
@@ -1399,123 +1516,240 @@ index 898380d82..a31cd37d6 100644
  
  static Bool
  glamor_copy_fbo_fbo_draw(DrawablePtr src,
-@@ -408,8 +486,7 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src
+@@ -375,17 +453,25 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src
+     int n;
+     Bool ret = FALSE;
+     BoxRec bounds = glamor_no_rendering_bounds();
++    Bool use_bounds = (nbox < 100);
++
++    if (nbox <= 0) {
++        return TRUE;
++    }
+ 
+     glamor_make_current(glamor_priv);
+ 
+-    if (gc && !glamor_set_planemask(gc->depth, gc->planemask))
++    if (gc && !glamor_set_planemask(gc->depth, gc->planemask)) {
+         goto bail_ctx;
++    }
+ 
+-    if (!glamor_set_alu(dst, gc ? gc->alu : GXcopy))
++    if (!glamor_set_alu(dst, gc ? gc->alu : GXcopy)) {
+         goto bail_ctx;
++    }
+ 
+-    if (bitplane && !glamor_priv->can_copyplane)
++    if (bitplane && !glamor_priv->can_copyplane) {
+         goto bail_ctx;
++    }
+ 
+     if (bitplane) {
+         prog = &glamor_priv->copy_plane_prog;
+@@ -395,61 +481,62 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src
+         copy_facet = &glamor_facet_copyarea;
+     }
+ 
+-    if (prog->failed)
++    if (prog->failed) {
+         goto bail_ctx;
++    }
+ 
+     if (!prog->prog) {
+-        if (!glamor_build_program(screen, prog,
+-                                  copy_facet, NULL, NULL, NULL))
++        if (!glamor_build_program(screen, prog, copy_facet,
++                                  NULL, NULL, NULL)) {
+             goto bail_ctx;
++        }
+     }
+ 
+     args.src_drawable = src;
      args.bitplane = bitplane;
  
-     /* Set up the vertex buffers for the points */
--
+-    /* Set up the vertex buffers for the points */
++    /* Set up the vertex buffer for the destination boxes. */
++    v = glamor_get_vbo_space(dst->pScreen,
++                             (unsigned)(nbox * 8 * (int)sizeof(GLshort)),
++                             &vbo_offset);
++    if (!v) {
++        goto bail_ctx;
++    }
+ 
 -    v = glamor_get_vbo_space(dst->pScreen, nbox * 8 * sizeof (int16_t), &vbo_offset);
-+    v = glamor_get_vbo_space(dst->pScreen, nbox * 8 * sizeof(int16_t), &vbo_offset);
++    glamor_fill_vbo_from_boxes(v, box, nbox);
++    glamor_put_vbo_space(screen);
  
      if (src_pixmap == dst_pixmap && glamor_priv->has_mesa_tile_raster_order) {
          glEnable(GL_TILE_RASTER_ORDER_FIXED_MESA);
-@@ -425,22 +502,20 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src
+-        if (dx >= 0)
++        if (dx >= 0) {
+             glEnable(GL_TILE_RASTER_ORDER_INCREASING_X_MESA);
+-        else
++        } else {
+             glDisable(GL_TILE_RASTER_ORDER_INCREASING_X_MESA);
+-        if (dy >= 0)
++        }
++        if (dy >= 0) {
+             glEnable(GL_TILE_RASTER_ORDER_INCREASING_Y_MESA);
+-        else
++        } else {
+             glDisable(GL_TILE_RASTER_ORDER_INCREASING_Y_MESA);
++        }
+     }
  
      glEnableVertexAttribArray(GLAMOR_VERTEX_POS);
      glVertexAttribPointer(GLAMOR_VERTEX_POS, 2, GL_SHORT, GL_FALSE,
 -                          2 * sizeof (GLshort), vbo_offset);
-+                          2 * sizeof(GLshort), vbo_offset);
++                          2 * (GLsizei)sizeof(GLshort), vbo_offset);
  
-     if (nbox < 100) {
+-    if (nbox < 100) {
++    if (use_bounds) {
          bounds = glamor_start_rendering_bounds();
 -        for (int i = 0; i < nbox; i++)
 -            glamor_bounds_union_box(&bounds, &box[i]);
-+        for (n = 0; n < nbox; n++)
-+            glamor_bounds_union_box(&bounds, &box[n]);
-     }
- 
-     for (n = 0; n < nbox; n++) {
+-    }
+-
+-    for (n = 0; n < nbox; n++) {
 -        v[0] = box->x1; v[1] = box->y1;
 -        v[2] = box->x1; v[3] = box->y2;
 -        v[4] = box->x2; v[5] = box->y2;
 -        v[6] = box->x2; v[7] = box->y1;
 -
-+        v[0] = box[n].x1; v[1] = box[n].y1;
-+        v[2] = box[n].x1; v[3] = box[n].y2;
-+        v[4] = box[n].x2; v[5] = box[n].y2;
-+        v[6] = box[n].x2; v[7] = box[n].y1;
-         v += 8;
+-        v += 8;
 -        box++;
++        for (n = 0; n < nbox; n++) {
++            glamor_bounds_union_box(&bounds, &box[n]);
++        }
      }
  
-     glamor_put_vbo_space(screen);
-@@ -483,7 +558,74 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src
+-    glamor_put_vbo_space(screen);
+-
+     glamor_get_drawable_deltas(src, src_pixmap, &src_off_x, &src_off_y);
+ 
+     glEnable(GL_SCISSOR_TEST);
+ 
+     BUG_RETURN_VAL(!src_priv, FALSE);
++    BUG_RETURN_VAL(!dst_priv, FALSE);
+ 
+     glamor_pixmap_loop(src_priv, src_box_index) {
+         BoxPtr src_box = glamor_pixmap_box_at(src_priv, src_box_index);
+@@ -458,32 +545,96 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src
+         args.dy = dy + src_off_y - src_box->y1;
+         args.src = glamor_pixmap_fbo_at(src_priv, src_box_index);
+ 
+-        if (!glamor_use_program(dst, gc, prog, &args))
++        if (!glamor_use_program(dst, gc, prog, &args)) {
+             goto bail_ctx;
+-
+-        BUG_RETURN_VAL(!dst_priv, FALSE);
++        }
+ 
+         glamor_pixmap_loop(dst_priv, dst_box_index) {
+             BoxRec scissor = {
+-                .x1 = max(-args.dx, bounds.x1),
+-                .y1 = max(-args.dy, bounds.y1),
+-                .x2 = min(-args.dx + src_box->x2 - src_box->x1, bounds.x2),
+-                .y2 = min(-args.dy + src_box->y2 - src_box->y1, bounds.y2),
++                .x1 = max(-args.dx, use_bounds ? bounds.x1 : -INT16_MAX),
++                .y1 = max(-args.dy, use_bounds ? bounds.y1 : -INT16_MAX),
++                .x2 = min(-args.dx + src_box->x2 - src_box->x1,
++                          use_bounds ? bounds.x2 : INT16_MAX),
++                .y2 = min(-args.dy + src_box->y2 - src_box->y1,
++                          use_bounds ? bounds.y2 : INT16_MAX),
+             };
+-            if (scissor.x1 >= scissor.x2 || scissor.y1 >= scissor.y2)
++
++            if (scissor.x1 >= scissor.x2 || scissor.y1 >= scissor.y2) {
+                 continue;
++            }
+ 
+             if (!glamor_set_destination_drawable(dst, dst_box_index, FALSE, FALSE,
+                                                  prog->matrix_uniform,
+-                                                 &dst_off_x, &dst_off_y))
++                                                 &dst_off_x, &dst_off_y)) {
+                 goto bail_ctx;
++            }
+ 
+             glScissor(scissor.x1 + dst_off_x,
+                       scissor.y1 + dst_off_y,
                        scissor.x2 - scissor.x1,
                        scissor.y2 - scissor.y1);
  
 -            glamor_glDrawArrays_GL_QUADS(glamor_priv, nbox);
-+            /*
-+             * MAJOR OPTIMIZATION: For tiled (large) pixmaps, filter the box list
-+             * to only draw boxes that actually intersect this destination tile.
-+             * This dramatically reduces GPU vertex processing when damage is localized.
-+             *
-+             * Uses the official glamor_pixmap_priv_is_large() helper to detect tiling.
-+             */
 +            if (glamor_pixmap_priv_is_large(dst_priv)) {
 +                BoxPtr dst_tile_box = glamor_pixmap_box_at(dst_priv, dst_box_index);
 +                BoxRec filtered_stack[128];
 +                BoxPtr filtered_boxes;
 +                int filtered_count = 0;
++                int i;
 +
-+                /* Stack allocation for common case, heap for pathological */
 +                if (nbox <= 128) {
 +                    filtered_boxes = filtered_stack;
 +                } else {
-+                    filtered_boxes = malloc(nbox * sizeof(BoxRec));
++                    filtered_boxes = malloc((size_t)nbox * sizeof(BoxRec));
 +                    if (!filtered_boxes) {
-+                        /* Malloc failed - fall back to unfiltered draw (safe, just slower) */
++                        /* Fall back to drawing all boxes. */
 +                        glamor_glDrawArrays_GL_QUADS(glamor_priv, nbox);
 +                        continue;
 +                    }
 +                }
 +
-+                /* Filter: keep only boxes intersecting this destination tile */
-+                for (n = 0; n < nbox; n++) {
-+                    if (box[n].x1 < dst_tile_box->x2 && box[n].x2 > dst_tile_box->x1 &&
-+                        box[n].y1 < dst_tile_box->y2 && box[n].y2 > dst_tile_box->y1) {
-+                        filtered_boxes[filtered_count++] = box[n];
++                for (i = 0; i < nbox; i++) {
++                    if (box[i].x1 < dst_tile_box->x2 && box[i].x2 > dst_tile_box->x1 &&
++                        box[i].y1 < dst_tile_box->y2 && box[i].y2 > dst_tile_box->y1) {
++                        filtered_boxes[filtered_count++] = box[i];
 +                    }
 +                }
 +
 +                if (filtered_count > 0) {
-+                    /* Allocate and populate VBO for filtered subset only */
 +                    char *filtered_vbo_offset;
-+                    GLshort *filtered_v = glamor_get_vbo_space(screen,
-+                                                               filtered_count * 8 * sizeof(GLshort),
-+                                                               &filtered_vbo_offset);
++                    GLshort *filtered_v =
++                        glamor_get_vbo_space(screen,
++                                             (unsigned)(filtered_count * 8 *
++                                                        (int)sizeof(GLshort)),
++                                             &filtered_vbo_offset);
++                    if (filtered_v) {
++                        glamor_fill_vbo_from_boxes(filtered_v,
++                                                   filtered_boxes,
++                                                   filtered_count);
++                        glamor_put_vbo_space(screen);
 +
-+                    for (n = 0; n < filtered_count; n++) {
-+                        filtered_v[0] = filtered_boxes[n].x1;
-+                        filtered_v[1] = filtered_boxes[n].y1;
-+                        filtered_v[2] = filtered_boxes[n].x1;
-+                        filtered_v[3] = filtered_boxes[n].y2;
-+                        filtered_v[4] = filtered_boxes[n].x2;
-+                        filtered_v[5] = filtered_boxes[n].y2;
-+                        filtered_v[6] = filtered_boxes[n].x2;
-+                        filtered_v[7] = filtered_boxes[n].y1;
-+                        filtered_v += 8;
++                        glVertexAttribPointer(GLAMOR_VERTEX_POS, 2, GL_SHORT, GL_FALSE,
++                                              2 * (GLsizei)sizeof(GLshort),
++                                              filtered_vbo_offset);
++
++                        glamor_glDrawArrays_GL_QUADS(glamor_priv, filtered_count);
++
++                        /* Restore pointer to original VBO for next tile. */
++                        glVertexAttribPointer(GLAMOR_VERTEX_POS, 2, GL_SHORT, GL_FALSE,
++                                              2 * (GLsizei)sizeof(GLshort),
++                                              vbo_offset);
++                    } else {
++                        /* Allocation failed, fall back to unfiltered draw. */
++                        glamor_glDrawArrays_GL_QUADS(glamor_priv, nbox);
 +                    }
-+
-+                    glamor_put_vbo_space(screen);
-+
-+                    /* Update vertex attrib pointer to filtered VBO */
-+                    glVertexAttribPointer(GLAMOR_VERTEX_POS, 2, GL_SHORT, GL_FALSE,
-+                                          2 * sizeof(GLshort), filtered_vbo_offset);
-+
-+                    glamor_glDrawArrays_GL_QUADS(glamor_priv, filtered_count);
 +                }
 +
-+                if (nbox > 128)
++                if (nbox > 128) {
 +                    free(filtered_boxes);
-+
++                }
 +            } else {
-+                /* Non-tiled pixmap: draw all boxes (original behavior) */
++                /* Non-tiled pixmap: draw all boxes. */
 +                glamor_glDrawArrays_GL_QUADS(glamor_priv, nbox);
 +            }
          }
      }
  
-@@ -499,11 +641,6 @@ bail_ctx:
+@@ -492,6 +643,8 @@ glamor_copy_fbo_fbo_draw(DrawablePtr src
+ bail_ctx:
+     if (src_pixmap == dst_pixmap && glamor_priv->has_mesa_tile_raster_order) {
+         glDisable(GL_TILE_RASTER_ORDER_FIXED_MESA);
++        glDisable(GL_TILE_RASTER_ORDER_INCREASING_X_MESA);
++        glDisable(GL_TILE_RASTER_ORDER_INCREASING_Y_MESA);
+     }
+     glDisable(GL_SCISSOR_TEST);
+     glDisableVertexAttribArray(GLAMOR_VERTEX_POS);
+@@ -499,11 +652,6 @@ bail_ctx:
      return ret;
  }
  
@@ -1527,7 +1761,7 @@ index 898380d82..a31cd37d6 100644
  static Bool
  glamor_copy_fbo_fbo_temp(DrawablePtr src,
                           DrawablePtr dst,
-@@ -522,15 +659,13 @@ glamor_copy_fbo_fbo_temp(DrawablePtr src
+@@ -522,15 +670,13 @@ glamor_copy_fbo_fbo_temp(DrawablePtr src
      PixmapPtr tmp_pixmap;
      BoxRec bounds;
      int n;
@@ -1545,7 +1779,7 @@ index 898380d82..a31cd37d6 100644
      glamor_make_current(glamor_priv);
  
      if (gc && !glamor_set_planemask(gc->depth, gc->planemask))
-@@ -539,18 +674,20 @@ glamor_copy_fbo_fbo_temp(DrawablePtr src
+@@ -539,18 +685,20 @@ glamor_copy_fbo_fbo_temp(DrawablePtr src
      if (!glamor_set_alu(dst, gc ? gc->alu : GXcopy))
          goto bail_ctx;
  
@@ -1574,7 +1808,7 @@ index 898380d82..a31cd37d6 100644
      tmp_pixmap = glamor_create_pixmap(screen,
                                        bounds.x2 - bounds.x1,
                                        bounds.y2 - bounds.y1,
-@@ -558,12 +695,15 @@ glamor_copy_fbo_fbo_temp(DrawablePtr src
+@@ -558,12 +706,15 @@ glamor_copy_fbo_fbo_temp(DrawablePtr src
      if (!tmp_pixmap)
          goto bail;
  
@@ -1595,7 +1829,7 @@ index 898380d82..a31cd37d6 100644
      for (n = 0; n < nbox; n++) {
          tmp_box[n].x1 = box[n].x1 - bounds.x1;
          tmp_box[n].x2 = box[n].x2 - bounds.x1;
-@@ -593,13 +733,16 @@ glamor_copy_fbo_fbo_temp(DrawablePtr src
+@@ -593,13 +744,16 @@ glamor_copy_fbo_fbo_temp(DrawablePtr src
                                    bitplane, closure))
          goto bail_box;
  
@@ -1614,7 +1848,7 @@ index 898380d82..a31cd37d6 100644
  bail_pixmap:
      glamor_destroy_pixmap(tmp_pixmap);
  bail:
-@@ -609,24 +752,6 @@ bail_ctx:
+@@ -609,24 +763,6 @@ bail_ctx:
      return FALSE;
  }
  
@@ -1639,7 +1873,7 @@ index 898380d82..a31cd37d6 100644
  static Bool
  glamor_copy_needs_temp(DrawablePtr src,
                         DrawablePtr dst,
-@@ -661,24 +786,13 @@ glamor_copy_needs_temp(DrawablePtr src,
+@@ -661,24 +797,13 @@ glamor_copy_needs_temp(DrawablePtr src,
          for (n = 1; n < nbox; n++) {
              bounds.x1 = min(bounds.x1, box[n].x1);
              bounds.y1 = min(bounds.y1, box[n].y1);
@@ -1665,7 +1899,7 @@ index 898380d82..a31cd37d6 100644
              bounds.y1 + dst_off_y      < bounds.y2 + dy + src_off_y &&
              bounds.y1 + dy + src_off_y < bounds.y2 + dst_off_y) {
              return TRUE;
-@@ -746,7 +860,7 @@ glamor_copy(DrawablePtr src,
+@@ -746,7 +871,7 @@ glamor_copy(DrawablePtr src,
              void *closure)
  {
      if (nbox == 0)
