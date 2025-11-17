@@ -41,9 +41,6 @@ use libbpf_rs::OpenObject;
 use libbpf_rs::PrintLevel;
 use libbpf_rs::ProgramInput;
 use libc::c_char;
-use log::debug;
-use log::info;
-use log::warn;
 use plain::Plain;
 use scx_arena::ArenaLib;
 use scx_stats::prelude::*;
@@ -66,8 +63,13 @@ use stats::SchedSamples;
 use stats::StatsReq;
 use stats::StatsRes;
 use stats::SysStats;
+use tracing::{debug, info, warn};
+use tracing_subscriber::filter::EnvFilter;
 
 const SCHEDULER_NAME: &str = "scx_lavd";
+
+const STATS_TIMEOUT: Duration = Duration::from_secs(1);
+const RINGBUF_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// scx_lavd: Latency-criticality Aware Virtual Deadline (LAVD) scheduler
 ///
@@ -76,6 +78,10 @@ const SCHEDULER_NAME: &str = "scx_lavd";
 /// See the more detailed overview of the LAVD design at main.bpf.c.
 #[derive(Debug, Parser)]
 struct Opts {
+    /// Deprecated, noop, use RUST_LOG or --log-level instead.
+    #[clap(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
+
     /// Automatically decide the scheduler's power mode (performance vs.
     /// powersave vs. balanced), CPU preference order, etc, based on system
     /// load. The options affecting the power mode and the use of core compaction
@@ -110,7 +116,7 @@ struct Opts {
 
     /// Run the scheduler in balanced mode aiming for sweetspot between power
     /// and performance. This option cannot be used with other conflicting
-    /// options (--autopilot, --autopower, --performance, --powersave,
+    /// options (--autopilot, --autopower, --performance, --balanced,
     /// --no-core-compaction) affecting the use of core compaction.
     #[clap(long = "balanced", action = clap::ArgAction::SetTrue)]
     balanced: bool,
@@ -217,14 +223,18 @@ struct Opts {
     #[clap(long)]
     monitor_sched_samples: Option<u64>,
 
-    /// Enable verbose output, including libbpf details. Specify multiple
-    /// times to increase verbosity.
-    #[clap(short = 'v', long, action = clap::ArgAction::Count)]
-    verbose: u8,
+    /// Specify the logging level. Accepts rust's envfilter syntax for modular
+    /// logging: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#example-syntax. Examples: ["info", "warn,tokio=info"]
+    #[clap(long, default_value = "info")]
+    log_level: String,
 
     /// Print scheduler version and exit.
     #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
     version: bool,
+
+    /// Optional run ID for tracking scheduler instances.
+    #[clap(long)]
+    run_id: Option<u64>,
 
     /// Show descriptions for statistics.
     #[clap(long)]
@@ -239,68 +249,73 @@ struct Opts {
 }
 
 impl Opts {
-    /// Check if autopilot mode can be enabled
-    ///
     #[inline(always)]
     const fn can_autopilot(&self) -> bool {
         !self.autopower
-        && !self.performance
-        && !self.powersave
-        && !self.balanced
-        && !self.no_core_compaction
+            && !self.performance
+            && !self.powersave
+            && !self.balanced
+            && !self.no_core_compaction
     }
 
-    /// Check if autopower mode can be enabled
     #[inline(always)]
     const fn can_autopower(&self) -> bool {
         !self.autopilot
-        && !self.performance
-        && !self.powersave
-        && !self.balanced
-        && !self.no_core_compaction
+            && !self.performance
+            && !self.powersave
+            && !self.balanced
+            && !self.no_core_compaction
     }
 
-    /// Check if performance mode can be enabled
     #[inline(always)]
     const fn can_performance(&self) -> bool {
         !self.autopilot && !self.autopower && !self.powersave && !self.balanced
     }
 
-    /// Check if balanced mode can be enabled
     #[inline(always)]
     const fn can_balanced(&self) -> bool {
         !self.autopilot
-        && !self.autopower
-        && !self.performance
-        && !self.powersave
-        && !self.no_core_compaction
+            && !self.autopower
+            && !self.performance
+            && !self.powersave
+            && !self.no_core_compaction
     }
 
-    /// Check if powersave mode can be enabled
     #[inline(always)]
     const fn can_powersave(&self) -> bool {
         !self.autopilot
-        && !self.autopower
-        && !self.performance
-        && !self.balanced
-        && !self.no_core_compaction
+            && !self.autopower
+            && !self.performance
+            && !self.balanced
+            && !self.no_core_compaction
     }
 
-    /// Process and validate options
-    ///
+    #[inline]
+    fn validate_slice_window(&self) -> bool {
+        if self.slice_min_us == 0 || self.slice_min_us > self.slice_max_us {
+            info!(
+                "slice-min-us ({}) must be > 0 and <= slice-max-us ({})",
+                self.slice_min_us, self.slice_max_us
+            );
+            return false;
+        }
+        true
+    }
+
     fn proc(&mut self) -> Option<&mut Self> {
-        // Enable autopilot if no other mode specified
+        if !self.validate_slice_window() {
+            return None;
+        }
+
         if !self.autopilot {
             self.autopilot = self.can_autopilot();
         }
 
-        // Validate autopilot mode
         if self.autopilot && !self.can_autopilot() {
             info!("Autopilot mode cannot be used with conflicting options.");
             return None;
         }
 
-        // Validate autopower mode
         if self.autopower {
             if !self.can_autopower() {
                 info!("Autopower mode cannot be used with conflicting options.");
@@ -309,7 +324,6 @@ impl Opts {
             info!("Autopower mode is enabled.");
         }
 
-        // Validate and configure performance mode
         if self.performance {
             if !self.can_performance() {
                 info!("Performance mode cannot be used with conflicting options.");
@@ -319,7 +333,6 @@ impl Opts {
             self.no_core_compaction = true;
         }
 
-        // Validate and configure powersave mode
         if self.powersave {
             if !self.can_powersave() {
                 info!("Powersave mode cannot be used with conflicting options.");
@@ -329,7 +342,6 @@ impl Opts {
             self.no_core_compaction = false;
         }
 
-        // Validate and configure balanced mode
         if self.balanced {
             if !self.can_balanced() {
                 info!("Balanced mode cannot be used with conflicting options.");
@@ -339,28 +351,25 @@ impl Opts {
             self.no_core_compaction = false;
         }
 
-        // Configure energy model usage
         if !EnergyModel::has_energy_model() || !self.cpu_pref_order.is_empty() {
             self.no_use_em = true;
             info!("Energy model won't be used for CPU preference order.");
         }
 
-        // Validate pinned slice configuration
         if let Some(pinned_slice) = self.pinned_slice_us {
             if pinned_slice < self.slice_min_us || pinned_slice > self.slice_max_us {
                 info!(
                     "pinned-slice-us ({}) must be between slice-min-us ({}) and slice-max-us ({})",
-                      pinned_slice, self.slice_min_us, self.slice_max_us
+                    pinned_slice, self.slice_min_us, self.slice_max_us
                 );
                 return None;
             }
             info!(
                 "Pinned task slice mode enabled ({} μs). Pinned tasks use per-CPU DSQs.",
-                  pinned_slice
+                pinned_slice
             );
         }
 
-        // Log autopilot status if enabled
         if self.autopilot {
             info!("Autopilot mode is enabled.");
         }
@@ -368,13 +377,11 @@ impl Opts {
         Some(self)
     }
 
-    /// Validate preempt shift range (0-10)
     #[inline]
     fn preempt_shift_range(s: &str) -> Result<u8, String> {
         number_range(s, 0, 10)
     }
 
-    /// Validate migration delta percentage (0-100)
     #[inline]
     fn mig_delta_pct_range(s: &str) -> Result<u8, String> {
         number_range(s, 0, 100)
@@ -384,10 +391,7 @@ impl Opts {
 unsafe impl Plain for msg_task_ctx {}
 
 impl msg_task_ctx {
-    /// Convert bytes to msg_task_ctx
-    ///
-    /// CRITICAL FIX: Use Result instead of panicking
-    /// SAFETY: Caller must ensure buffer is properly sized and aligned
+    #[inline]
     fn from_bytes(buf: &[u8]) -> Result<&msg_task_ctx> {
         plain::from_bytes(buf)
             .map_err(|e| anyhow::anyhow!("Failed to parse msg_task_ctx: {:?}", e))
@@ -395,10 +399,8 @@ impl msg_task_ctx {
 }
 
 impl introspec {
-    /// Create new introspec instance
-    ///
     #[inline]
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             cmd: LAVD_CMD_NOP,
             arg: 0,
@@ -406,22 +408,10 @@ impl introspec {
     }
 }
 
-/// Message sequence ID generator
-///
-/// OPTIMIZATION: Use atomic instead of unsafe static mutable
-/// - Thread-safe without explicit synchronization
-/// - Compiles to LOCK XADD on x86-64 (7 cycles)
-/// - Avoids UB from concurrent mutable access
-static MSG_SEQ_ID: AtomicU64 = AtomicU64::new(0);
+#[repr(align(64))]
+struct AlignedAtomicU64(AtomicU64);
 
-/// Global constants for pre-allocated durations
-///
-/// OPTIMIZATION: Avoid repeated Duration::from_* calls
-/// - Duration construction is not const-evaluable pre-1.82
-/// - Pre-computing saves ~5ns per timeout operation
-/// - Improves code clarity with named constants
-const STATS_TIMEOUT: Duration = Duration::from_secs(1);
-const RINGBUF_POLL_TIMEOUT: Duration = Duration::from_millis(100);
+static MSG_SEQ_ID: AlignedAtomicU64 = AlignedAtomicU64(AtomicU64::new(0));
 
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
@@ -445,16 +435,30 @@ impl<'a> Scheduler<'a> {
 
         try_set_rlimit_infinity();
 
-        // Open the BPF prog first for verification.
+        let debug_level = if opts.log_level.contains("trace") {
+            2
+        } else if opts.log_level.contains("debug") {
+            1
+        } else if opts.verbose > 1 {
+            2
+        } else if opts.verbose > 0 {
+            1
+        } else {
+            0
+        };
+
         let mut skel_builder = BpfSkelBuilder::default();
-        skel_builder.obj_builder.debug(opts.verbose > 0);
-        init_libbpf_logging(Some(PrintLevel::Debug));
+        skel_builder.obj_builder.debug(debug_level > 1);
+        let log_level = if debug_level > 0 {
+            Some(PrintLevel::Debug)
+        } else {
+            None
+        };
+        init_libbpf_logging(log_level);
 
         let open_opts = opts.libbpf.clone().into_bpf_open_opts();
         let mut skel = scx_ops_open!(skel_builder, open_object, lavd_ops, open_opts)?;
 
-        // Enable futex tracing using ftrace if available. If the ftrace is not
-        // available, use tracepoint, which is known to be slower than ftrace.
         if !opts.no_futex_boost {
             if !Self::attach_futex_ftraces(&mut skel)? {
                 info!("Failed to attach futex ftraces. Trying tracepoints.");
@@ -464,40 +468,23 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        // Initialize CPU topology with CLI arguments
         let order = CpuOrder::new(opts.topology.as_ref())?;
         Self::init_cpus(&mut skel, &order);
         Self::init_cpdoms(&mut skel, &order);
+        Self::init_globals(&mut skel, opts, &order, debug_level);
 
-        // Initialize skel according to @opts.
-        Self::init_globals(&mut skel, opts, &order);
-
-        /*
-         * UPSTREAM CHANGE: BPF arena initialization for task contexts.
-         *
-         * Rationale: New kernel versions use BPF arena instead of task-local
-         * storage for better memory efficiency. Arena allocation is ~15%
-         * faster on Raptor Lake and allows dynamic sizing.
-         *
-         * Order matters: Load must happen before arena setup, arena setup
-         * must happen before attach.
-         */
         let mut skel = scx_ops_load!(skel, lavd_ops, uei)?;
         let task_size = std::mem::size_of::<types::task_ctx>();
         let arenalib = ArenaLib::init(skel.object_mut(), task_size, *NR_CPU_IDS)?;
         arenalib.setup()?;
 
-        // Attach.
         let struct_ops = Some(scx_ops_attach!(skel, lavd_ops)?);
         let stats_server = StatsServer::new(stats::server_data(*NR_CPU_IDS as u64)).launch()?;
 
-        // Build a ring buffer for instrumentation
         let (intrspc_tx, intrspc_rx) = channel::bounded(65536);
         let rb_map = &mut skel.maps.introspec_msg;
         let mut builder = libbpf_rs::RingBufferBuilder::new();
-        builder.add(rb_map, move |data| {
-            Scheduler::relay_introspec(data, &intrspc_tx)
-        })?;
+        builder.add(rb_map, move |data| Scheduler::relay_introspec(data, &intrspc_tx))?;
         let rb_mgr = builder.build()?;
 
         Ok(Self {
@@ -525,7 +512,7 @@ impl<'a> Scheduler<'a> {
             ("futex_unlock_pi", &skel.progs.fexit_futex_unlock_pi),
         ];
 
-        if compat::tracer_available("function")? == false {
+        if !compat::tracer_available("function")? {
             info!("Ftrace is not enabled in the kernel.");
             return Ok(false);
         }
@@ -554,28 +541,23 @@ impl<'a> Scheduler<'a> {
         compat::cond_tracepoints_enable(tracepoints)
     }
 
-    /// Initialize CPU capacity and topology information
-    ///
     fn init_cpus(skel: &mut OpenBpfSkel, order: &CpuOrder) {
         debug!("{:#?}", order);
 
-        // Validate complexity early
         let nr_pco_states = order.perf_cpu_order.len() as u8;
         if nr_pco_states > LAVD_PCO_STATE_MAX as u8 {
             panic!(
                 "Generated performance vs. CPU order states ({}) exceed maximum ({})",
-                   nr_pco_states,
-                   LAVD_PCO_STATE_MAX
+                nr_pco_states, LAVD_PCO_STATE_MAX
             );
         }
 
         let rodata = skel
-        .maps
-        .rodata_data
-        .as_mut()
-        .expect("rodata not available");
+            .maps
+            .rodata_data
+            .as_mut()
+            .expect("rodata not available");
 
-        // Initialize CPU capacity and topology
         for cpu in order.cpuids.iter() {
             rodata.cpu_capacity[cpu.cpu_adx] = cpu.cpu_cap as u16;
             rodata.cpu_big[cpu.cpu_adx] = cpu.big_core as u8;
@@ -583,63 +565,50 @@ impl<'a> Scheduler<'a> {
             rodata.cpu_sibling[cpu.cpu_adx] = cpu.cpu_sibling as u32;
         }
 
-        // Initialize performance vs. CPU order table
         rodata.nr_pco_states = nr_pco_states;
 
-        // Process active performance states
         for (i, (_, pco)) in order.perf_cpu_order.iter().enumerate() {
-            let cpus_perf = pco.cpus_perf.borrow();
-            let cpus_ovflw = pco.cpus_ovflw.borrow();
-            let pco_nr_primary = cpus_perf.len();
-
-            rodata.pco_bounds[i] = pco.perf_cap as u32;
-            rodata.pco_nr_primary[i] = pco_nr_primary as u16;
-
-            for (j, &cpu_adx) in cpus_perf.iter().enumerate() {
-                rodata.pco_table[i][j] = cpu_adx as u16;
-            }
-
-            for (j, &cpu_adx) in cpus_ovflw.iter().enumerate() {
-                let k = j + pco_nr_primary;
-                rodata.pco_table[i][k] = cpu_adx as u16;
-            }
-
+            Self::init_pco_tuple(skel, i, pco);
             info!("{:#}", pco);
         }
 
-        // Fill remaining slots with last state (cold path)
         if let Some((_, last_pco)) = order.perf_cpu_order.last_key_value() {
-            let cpus_perf = last_pco.cpus_perf.borrow();
-            let cpus_ovflw = last_pco.cpus_ovflw.borrow();
-            let pco_nr_primary = cpus_perf.len();
-
             for i in nr_pco_states..LAVD_PCO_STATE_MAX as u8 {
-                let idx = i as usize;
-
-                rodata.pco_bounds[idx] = last_pco.perf_cap as u32;
-                rodata.pco_nr_primary[idx] = pco_nr_primary as u16;
-
-                for (j, &cpu_adx) in cpus_perf.iter().enumerate() {
-                    rodata.pco_table[idx][j] = cpu_adx as u16;
-                }
-
-                for (j, &cpu_adx) in cpus_ovflw.iter().enumerate() {
-                    let k = j + pco_nr_primary;
-                    rodata.pco_table[idx][k] = cpu_adx as u16;
-                }
+                Self::init_pco_tuple(skel, i as usize, last_pco);
             }
         }
     }
 
-    /// Initialize compute domain contexts
-    ///
+    #[inline]
+    fn init_pco_tuple(skel: &mut OpenBpfSkel, i: usize, pco: &PerfCpuOrder) {
+        let rodata = skel
+            .maps
+            .rodata_data
+            .as_mut()
+            .expect("rodata not available");
+        let cpus_perf = pco.cpus_perf.borrow();
+        let cpus_ovflw = pco.cpus_ovflw.borrow();
+        let pco_nr_primary = cpus_perf.len();
+
+        rodata.pco_bounds[i] = pco.perf_cap as u32;
+        rodata.pco_nr_primary[i] = pco_nr_primary as u16;
+
+        for (j, &cpu_adx) in cpus_perf.iter().enumerate() {
+            rodata.pco_table[i][j] = cpu_adx as u16;
+        }
+
+        for (j, &cpu_adx) in cpus_ovflw.iter().enumerate() {
+            let k = j + pco_nr_primary;
+            rodata.pco_table[i][k] = cpu_adx as u16;
+        }
+    }
+
     fn init_cpdoms(skel: &mut OpenBpfSkel, order: &CpuOrder) {
         let bss_data = skel.maps.bss_data.as_mut().expect("bss_data not available");
 
         for (k, v) in order.cpdom_map.iter() {
             let cpdom = &mut bss_data.cpdom_ctxs[v.cpdom_id];
 
-            // Basic domain identification
             cpdom.id = v.cpdom_id as u64;
             cpdom.alt_id = v.cpdom_alt_id.get() as u64;
             cpdom.numa_id = k.numa_adx as u8;
@@ -650,20 +619,17 @@ impl<'a> Scheduler<'a> {
             for &cpu_id in v.cpu_ids.iter() {
                 let word_idx = (cpu_id / 64) as usize;
                 let bit_idx = cpu_id % 64;
-
                 cpdom.__cpumask[word_idx] |= 1u64 << bit_idx;
             }
 
-            // Validate topology complexity (must fit in BPF arrays)
             let neighbor_count = v.neighbor_map.borrow().len();
             if neighbor_count > LAVD_CPDOM_MAX_DIST as usize {
                 panic!(
                     "Processor topology too complex: {} neighbor distances (max {})",
-                       neighbor_count, LAVD_CPDOM_MAX_DIST
+                    neighbor_count, LAVD_CPDOM_MAX_DIST
                 );
             }
 
-            // Build neighbor bitmasks for each distance level
             for (dist_idx, (_distance, neighbors)) in v.neighbor_map.borrow().iter().enumerate() {
                 let neighbor_list = neighbors.borrow();
                 let nr_neighbors = neighbor_list.len() as u8;
@@ -671,7 +637,7 @@ impl<'a> Scheduler<'a> {
                 if nr_neighbors > LAVD_CPDOM_MAX_NR as u8 {
                     panic!(
                         "Too many neighbor domains: {} (max {})",
-                           nr_neighbors, LAVD_CPDOM_MAX_NR
+                        nr_neighbors, LAVD_CPDOM_MAX_NR
                     );
                 }
 
@@ -686,34 +652,28 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    /// Initialize global BPF variables
-    ///
-    fn init_globals(skel: &mut OpenBpfSkel, opts: &Opts, order: &CpuOrder) {
+    fn init_globals(
+        skel: &mut OpenBpfSkel,
+        opts: &Opts,
+        order: &CpuOrder,
+        debug_level: u8,
+    ) {
         let bss_data = skel.maps.bss_data.as_mut().expect("bss_data not available");
         bss_data.no_preemption = opts.no_preemption;
         bss_data.no_core_compaction = opts.no_core_compaction;
         bss_data.no_freq_scaling = opts.no_freq_scaling;
         bss_data.is_powersave_mode = opts.powersave;
 
-        let rodata = skel.maps.rodata_data.as_mut().expect("rodata not available");
+        let rodata = skel
+            .maps
+            .rodata_data
+            .as_mut()
+            .expect("rodata not available");
         rodata.nr_llcs = order.nr_llcs as u64;
-
-        /*
-         * UPSTREAM CHANGE: nr_cpu_ids (u32) instead of __nr_cpu_ids (u64).
-         *
-         * Rationale: Kernel API uses u32 for CPU IDs. The leading underscores
-         * were a temporary workaround. u32 is sufficient (4 billion CPUs max)
-         * and reduces BPF memory footprint.
-         *
-         * Verified with pahole that struct layout remains compatible:
-         * - Padding adjusts automatically
-         * - No ABI breakage
-         */
         rodata.nr_cpu_ids = *NR_CPU_IDS as u32;
-
         rodata.is_smt_active = order.smt_enabled;
         rodata.is_autopilot_on = opts.autopilot;
-        rodata.verbose = opts.verbose;
+        rodata.verbose = debug_level;
         rodata.slice_max_ns = opts.slice_max_us * 1000;
         rodata.slice_min_ns = opts.slice_min_us * 1000;
         rodata.pinned_slice_ns = opts.pinned_slice_us.map(|v| v * 1000).unwrap_or(0);
@@ -723,13 +683,6 @@ impl<'a> Scheduler<'a> {
         rodata.no_wake_sync = opts.no_wake_sync;
         rodata.no_slice_boost = opts.no_slice_boost;
         rodata.per_cpu_dsq = opts.per_cpu_dsq;
-
-        /*
-         * UPSTREAM ADDITION: CPU bandwidth control flag.
-         *
-         * Rationale: Enables experimental cgroup cpu.max support for
-         * per-cgroup CPU quotas. See BPF side for implementation.
-         */
         rodata.enable_cpu_bw = opts.enable_cpu_bw;
 
         skel.struct_ops.lavd_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
@@ -738,73 +691,46 @@ impl<'a> Scheduler<'a> {
             | *compat::SCX_OPS_KEEP_BUILTIN_IDLE;
     }
 
-    /// Get next message sequence ID
-    ///
     #[inline(always)]
     fn get_msg_seq_id() -> u64 {
-        MSG_SEQ_ID.fetch_add(1, Ordering::Relaxed)
+        MSG_SEQ_ID.0.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Relay introspection data from BPF ring buffer to channel
-    ///
     fn relay_introspec(data: &[u8], intrspc_tx: &Sender<SchedSample>) -> i32 {
         let mt = match msg_task_ctx::from_bytes(data) {
             Ok(mt) => mt,
-            Err(e) => {
-                // Use static counter to avoid spamming logs
-                static PARSE_ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
-                let count = PARSE_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
-                if count % 1000 == 0 {
-                    warn!("Failed to parse msg_task_ctx (count: {}): {:?}", count, e);
-                }
-                return -1;
-            }
+            Err(e) => return Self::handle_parse_error(&e),
         };
-
-        let tx = &mt.taskc_x;
-        let tc = &mt.taskc;
 
         if mt.hdr.kind != LAVD_MSG_TASKC {
             return 0;
         }
 
+        let tx = &mt.taskc_x;
+        let tc = &mt.taskc;
         let mseq = Self::get_msg_seq_id();
 
         let tx_comm = unsafe {
             CStr::from_ptr(tx.comm.as_ptr() as *const c_char)
-            .to_string_lossy()
-            .into_owned()  // Convert to String for storage
+                .to_string_lossy()
+                .into_owned()
         };
 
         let waker_comm = unsafe {
             CStr::from_ptr(tc.waker_comm.as_ptr() as *const c_char)
-            .to_string_lossy()
-            .into_owned()
+                .to_string_lossy()
+                .into_owned()
         };
 
         let tx_stat = unsafe {
             CStr::from_ptr(tx.stat.as_ptr() as *const c_char)
-            .to_string_lossy()
-            .into_owned()
+                .to_string_lossy()
+                .into_owned()
         };
 
-        /*
-         * CRITICAL FIX: Use tc.pid instead of tx.pid.
-         *
-         * Rationale: In the BPF arena model, PID field moved from taskc_x
-         * to task_ctx. Using tx.pid would report incorrect PIDs (usually 0).
-         *
-         * Verified by examining BPF struct layout with pahole:
-         * struct task_ctx {
-         *     u32 pid;        // offset: 0
-         *     ...
-         * }
-         *
-         * This is critical for monitoring tools that filter by PID.
-         */
         match intrspc_tx.try_send(SchedSample {
             mseq,
-            pid: tc.pid,  // CRITICAL FIX: was tx.pid
+            pid: tc.pid,
             comm: tx_comm,
             stat: tx_stat,
             cpu_id: tc.cpu_id,
@@ -833,25 +759,41 @@ impl<'a> Scheduler<'a> {
             slice_used: tc.last_slice_used,
         }) {
             Ok(()) => 0,
-            Err(TrySendError::Full(_)) => {
-                static DROP_COUNT: AtomicU64 = AtomicU64::new(0);
-                let count = DROP_COUNT.fetch_add(1, Ordering::Relaxed);
-                if count % 10000 == 0 {
-                    warn!("Sample channel full, dropped {} samples", count);
-                }
-                0  // Return success to continue processing
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                // Channel closed - receiver dropped
-                -1
-            }
+            Err(TrySendError::Full(_)) => Self::handle_channel_full(),
+            Err(TrySendError::Disconnected(_)) => -1,
         }
     }
 
-    /// Prepare introspection state for BPF
-    #[inline(always)]
+    #[cold]
+    #[inline(never)]
+    fn handle_parse_error(e: &anyhow::Error) -> i32 {
+        static PARSE_ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+        let count = PARSE_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+        if count % 1000 == 0 {
+            warn!("Failed to parse msg_task_ctx (count: {}): {:?}", count, e);
+        }
+        -1
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn handle_channel_full() -> i32 {
+        static DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+        let count = DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+        if count % 10000 == 0 {
+            warn!("Sample channel full, dropped {} samples", count);
+        }
+        0
+    }
+
+    #[inline]
     fn prep_introspec(&mut self) {
-        let bss_data = self.skel.maps.bss_data.as_mut().expect("bss_data not available");
+        let bss_data = self
+            .skel
+            .maps
+            .bss_data
+            .as_mut()
+            .expect("bss_data not available");
         if !bss_data.is_monitored {
             bss_data.is_monitored = true;
         }
@@ -859,23 +801,13 @@ impl<'a> Scheduler<'a> {
         bss_data.intrspc.arg = self.intrspc.arg;
     }
 
-    /// Clean up introspection state
-    #[inline(always)]
+    #[inline]
     fn cleanup_introspec(&mut self) {
         if let Some(bss_data) = self.skel.maps.bss_data.as_mut() {
             bss_data.intrspc.cmd = LAVD_CMD_NOP;
         }
     }
 
-    /// Calculate percentage
-    ///
-    /// OPTIMIZATION: Use FMA instruction via mul_add
-    ///
-    /// Rationale: Raptor Lake has dedicated FMA units (1 cycle latency).
-    /// Traditional (x * 100.0) / y compiles to separate MUL + DIV.
-    /// x.mul_add(100.0, 0.0) / y compiles to single VFMADD instruction.
-    ///
-    /// Measured: ~2ns faster per call on 14700KF (relevant for stats path).
     #[inline(always)]
     fn get_pc(x: u64, y: u64) -> f64 {
         if y == 0 {
@@ -885,8 +817,6 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    /// Get power mode name
-    ///
     #[inline(always)]
     fn get_power_mode(power_mode: i32) -> &'static str {
         match power_mode as u32 {
@@ -897,15 +827,12 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    /// Process stats request and generate response
-    ///
     fn stats_req_to_res(&mut self, req: &StatsReq) -> Result<StatsRes> {
         Ok(match req {
             StatsReq::NewSampler(tid) => {
-                // CRITICAL FIX: Handle ring buffer errors instead of unwrap
                 self.rb_mgr
-                .consume()
-                .context("Failed to consume ring buffer")?;
+                    .consume()
+                    .context("Failed to consume ring buffer")?;
                 self.monitor_tid = Some(*tid);
                 StatsRes::Ack
             }
@@ -915,11 +842,11 @@ impl<'a> Scheduler<'a> {
                 }
 
                 let bss_data = self
-                .skel
-                .maps
-                .bss_data
-                .as_ref()
-                .expect("bss_data not available");
+                    .skel
+                    .maps
+                    .bss_data
+                    .as_ref()
+                    .expect("bss_data not available");
                 let st = &bss_data.sys_stat;
 
                 let mseq = Self::get_msg_seq_id();
@@ -939,8 +866,8 @@ impl<'a> Scheduler<'a> {
 
                 let power_mode = Self::get_power_mode(bss_data.power_mode);
                 let total_time = bss_data.performance_mode_ns
-                + bss_data.balanced_mode_ns
-                + bss_data.powersave_mode_ns;
+                    + bss_data.balanced_mode_ns
+                    + bss_data.powersave_mode_ns;
                 let pc_performance = Self::get_pc(bss_data.performance_mode_ns, total_time);
                 let pc_balanced = Self::get_pc(bss_data.balanced_mode_ns, total_time);
                 let pc_powersave = Self::get_pc(bss_data.powersave_mode_ns, total_time);
@@ -979,8 +906,8 @@ impl<'a> Scheduler<'a> {
                 std::thread::sleep(Duration::from_millis(*interval_ms));
 
                 self.rb_mgr
-                .poll(RINGBUF_POLL_TIMEOUT)
-                .context("Failed to poll ring buffer")?;
+                    .poll(RINGBUF_POLL_TIMEOUT)
+                    .context("Failed to poll ring buffer")?;
 
                 let mut samples = Vec::with_capacity(*nr_samples as usize);
                 samples.extend(self.intrspc_rx.try_iter());
@@ -992,8 +919,7 @@ impl<'a> Scheduler<'a> {
         })
     }
 
-    /// Stop monitoring mode
-    #[inline(always)]
+    #[inline]
     fn stop_monitoring(&mut self) {
         if let Some(bss_data) = self.skel.maps.bss_data.as_mut() {
             if bss_data.is_monitored {
@@ -1002,6 +928,7 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    #[inline]
     pub fn exited(&mut self) -> bool {
         uei_exited!(&self.skel, uei)
     }
@@ -1020,7 +947,7 @@ impl<'a> Scheduler<'a> {
             }),
             ..Default::default()
         };
-        let out = prog.test_run(input).unwrap();
+        let out = prog.test_run(input).map_err(|_| u32::MAX)?;
         if out.return_value != 0 {
             return Err(out.return_value);
         }
@@ -1031,41 +958,53 @@ impl<'a> Scheduler<'a> {
     fn update_power_profile(&mut self, prev_profile: PowerProfile) -> (bool, PowerProfile) {
         let profile = fetch_power_profile(false);
         if profile == prev_profile {
-            // If the profile is the same, skip updaring the profile for BPF.
             return (true, profile);
         }
 
-        let _ = match profile {
+        let set_result = match profile {
             PowerProfile::Performance => self.set_power_profile(LAVD_PM_PERFORMANCE),
             PowerProfile::Balanced { .. } => self.set_power_profile(LAVD_PM_BALANCED),
             PowerProfile::Powersave => self.set_power_profile(LAVD_PM_POWERSAVE),
             PowerProfile::Unknown => {
-                // We don't know how to handle an unknown energy profile,
-                // so we just give up updating the profile from now on.
                 return (false, profile);
             }
         };
 
-        info!("Set the scheduler's power profile to {profile} mode.");
-        (true, profile)
+        match set_result {
+            Ok(_) => {
+                info!("Set the scheduler's power profile to {profile} mode.");
+                (true, profile)
+            }
+            Err(code) => {
+                warn!(
+                    "Failed to update power profile to {profile:?} (ret={}). Disabling autopower.",
+                    code
+                );
+                (false, prev_profile)
+            }
+        }
     }
 
     fn run(&mut self, opts: &Opts, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         let (res_ch, req_ch) = self.stats_server.channels();
-        let mut autopower = opts.autopower;
+        let mut autopower_active = opts.autopower;
         let mut profile = PowerProfile::Unknown;
 
         if opts.performance {
-            let _ = self.set_power_profile(LAVD_PM_PERFORMANCE);
+            if let Err(e) = self.set_power_profile(LAVD_PM_PERFORMANCE) {
+                warn!("Failed to set initial performance profile: {}", e);
+            }
         } else if opts.powersave {
-            let _ = self.set_power_profile(LAVD_PM_POWERSAVE);
-        } else {
-            let _ = self.set_power_profile(LAVD_PM_BALANCED);
+            if let Err(e) = self.set_power_profile(LAVD_PM_POWERSAVE) {
+                warn!("Failed to set initial powersave profile: {}", e);
+            }
+        } else if let Err(e) = self.set_power_profile(LAVD_PM_BALANCED) {
+            warn!("Failed to set initial balanced profile: {}", e);
         }
 
-        while !shutdown.load(Ordering::Relaxed) && !self.exited() {
-            if autopower {
-                (autopower, profile) = self.update_power_profile(profile);
+        while !shutdown.load(Ordering::Acquire) && !self.exited() {
+            if autopower_active {
+                (autopower_active, profile) = self.update_power_profile(profile);
             }
 
             match req_ch.recv_timeout(STATS_TIMEOUT) {
@@ -1078,12 +1017,14 @@ impl<'a> Scheduler<'a> {
                 }
                 Err(e) => {
                     self.stop_monitoring();
-                    Err(e)?
+                    Err(e)?;
                 }
             }
             self.cleanup_introspec();
         }
-        self.rb_mgr.consume().unwrap();
+        self.rb_mgr
+            .consume()
+            .context("Failed to flush ring buffer before exit")?;
 
         let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)
@@ -1101,30 +1042,34 @@ impl Drop for Scheduler<'_> {
 }
 
 fn init_log(opts: &Opts) {
-    let llv = match opts.verbose {
-        0 => simplelog::LevelFilter::Info,
-        1 => simplelog::LevelFilter::Debug,
-        _ => simplelog::LevelFilter::Trace,
-    };
-    let mut lcfg = simplelog::ConfigBuilder::new();
-    lcfg.set_time_offset_to_local()
-        .expect("Failed to set local time offset")
-        .set_time_level(simplelog::LevelFilter::Error)
-        .set_location_level(simplelog::LevelFilter::Off)
-        .set_target_level(simplelog::LevelFilter::Off)
-        .set_thread_level(simplelog::LevelFilter::Off);
-    simplelog::TermLogger::init(
-        llv,
-        lcfg.build(),
-        simplelog::TerminalMode::Stderr,
-        simplelog::ColorChoice::Auto,
-    )
-    .unwrap();
+    let env_filter = EnvFilter::try_from_default_env()
+        .or_else(|_| match EnvFilter::try_new(&opts.log_level) {
+            Ok(filter) => Ok(filter),
+            Err(e) => {
+                eprintln!(
+                    "invalid log envvar: {}, using info, err is: {}",
+                    opts.log_level, e
+                );
+                EnvFilter::try_new("info")
+            }
+        })
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    match tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true)
+        .try_init()
+    {
+        Ok(()) => {}
+        Err(e) => eprintln!("failed to init logger: {}", e),
+    }
 }
 
-fn main() -> Result<()> {
-    let mut opts = Opts::parse();
-
+#[clap_main::clap_main]
+fn main(mut opts: Opts) -> Result<()> {
     if opts.version {
         println!(
             "scx_lavd {}",
@@ -1146,8 +1091,18 @@ fn main() -> Result<()> {
 
     init_log(&opts);
 
+    if opts.verbose > 0 {
+        warn!("Setting verbose via -v is deprecated and will be an error in future releases.");
+    }
+
+    if let Some(run_id) = opts.run_id {
+        info!("scx_lavd run_id: {}", run_id);
+    }
+
     if opts.monitor.is_none() && opts.monitor_sched_samples.is_none() {
-        opts.proc().unwrap();
+        if opts.proc().is_none() {
+            return Ok(());
+        }
         info!("{:#?}", opts);
     }
 
