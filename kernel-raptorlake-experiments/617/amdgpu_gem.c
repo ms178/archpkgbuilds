@@ -56,13 +56,19 @@
 #include "amdgpu_xgmi.h"
 #include "amdgpu_vm.h"
 
+/*
+ * amdgpu_gem_add_input_fence - Wait for input fences
+ *
+ * Optimized to use a larger stack buffer (128 entries) to cover most
+ * modern game submission batches without heap allocation.
+ */
 static int
 amdgpu_gem_add_input_fence(struct drm_file *filp,
 			   uint64_t syncobj_handles_array,
 			   uint32_t num_syncobj_handles)
 {
 	struct dma_fence *fence;
-	uint32_t syncobj_handles_stack[64];
+	uint32_t syncobj_handles_stack[128];
 	uint32_t *syncobj_handles;
 	int ret = 0;
 	uint32_t i;
@@ -74,7 +80,7 @@ amdgpu_gem_add_input_fence(struct drm_file *filp,
 	if (unlikely(num_syncobj_handles > 1024))
 		return -EINVAL;
 
-	/* Use stack for up to 64 entries, heap for extreme counts */
+	/* Use stack for up to 128 entries, heap for extreme counts */
 	if (likely(num_syncobj_handles <= ARRAY_SIZE(syncobj_handles_stack))) {
 		if (unlikely(copy_from_user(syncobj_handles_stack,
 				   u64_to_user_ptr(syncobj_handles_array),
@@ -89,12 +95,14 @@ amdgpu_gem_add_input_fence(struct drm_file *filp,
 	}
 
 	for (i = 0; i < num_syncobj_handles; i++) {
-		if (unlikely(!syncobj_handles[i])) {
+		uint32_t handle = syncobj_handles[i];
+
+		if (unlikely(!handle)) {
 			ret = -EINVAL;
 			break;
 		}
 
-		ret = drm_syncobj_find_fence(filp, syncobj_handles[i], 0, 0, &fence);
+		ret = drm_syncobj_find_fence(filp, handle, 0, 0, &fence);
 		if (unlikely(ret))
 			break;
 
@@ -183,9 +191,6 @@ amdgpu_gem_update_bo_mapping(struct drm_file *filp,
 
 /* ------------- Vega-aware adaptive fault prefetch (HBM2-tuned, TLB-aware) ------------- */
 
-/* Refresh cached reciprocal at most every ~4ms */
-#define VRAM_RECIP_REFRESH_JIFFIES (HZ / 250)
-
 /* Absolute safety caps for all ASICs */
 #define PREFETCH_ABS_MIN_PAGES 1u
 #define PREFETCH_ABS_MAX_PAGES 128u
@@ -222,7 +227,7 @@ MODULE_PARM_DESC(vega_pf_burst_ns, "HBM2-tuned burst threshold in ns (default 10
 /* PERF OPT: Consolidate per-cpu data to reduce access overhead. */
 struct vega_recip_cache {
 	u64 recip_q38;
-	unsigned long stamp;
+	const void *adev_key;
 };
 static DEFINE_PER_CPU(struct vega_recip_cache, vega_recip_cache_pc);
 
@@ -247,9 +252,7 @@ static u32 amdgpu_vram_usage_pct_fast(struct amdgpu_device *adev)
 {
 	struct ttm_resource_manager *mgr;
 	u64 used_bytes, vram_b;
-	u32 pct;
 	struct vega_recip_cache *p_cache;
-	unsigned long now_j;
 
 	if (unlikely(!adev))
 		return 0;
@@ -259,63 +262,57 @@ static u32 amdgpu_vram_usage_pct_fast(struct amdgpu_device *adev)
 		return 0;
 
 	used_bytes = ttm_resource_manager_usage(mgr);
-	now_j = jiffies;
-
-	/* Per-CPU data is only accessed by the current CPU; no preemption safety needed */
 	p_cache = this_cpu_ptr(&vega_recip_cache_pc);
 
-	if (unlikely(time_after(now_j, p_cache->stamp + VRAM_RECIP_REFRESH_JIFFIES) || p_cache->recip_q38 == 0)) {
-		/* Recompute reciprocal: (100 << 38) / vram_size for Q38 fixed-point percent */
+	/* Only recompute reciprocal if the device changed (rare/never) */
+	if (unlikely(p_cache->adev_key != adev)) {
 		vram_b = max_t(u64, adev->gmc.mc_vram_size, 1ULL);
+		/* (100 << 38) / vram_b */
 		p_cache->recip_q38 = div64_u64((100ULL << 38), vram_b);
-		p_cache->stamp = now_j;
+		p_cache->adev_key = adev;
 	}
 
 	/* Compute percentage: (used * recip) >> 38, clamped to [0, 100] */
-	pct = min_t(u32, mul_u64_u64_shr(used_bytes, p_cache->recip_q38, 38), 100U);
-	return pct;
+	return min_t(u32, mul_u64_u64_shr(used_bytes, p_cache->recip_q38, 38), 100U);
 }
 
 /* Compute optimal prefetch for Vega: TLB-aware, large-page hinting, HBM2-tuned,
  * compute-specialized, and alignment-optimized.
+ *
+ * Optimized: Branchless logic where possible, __fls replacement for ilog2,
+ * and division-free VRAM percent.
  */
 static unsigned int amdgpu_vega_optimal_prefetch(struct amdgpu_device *adev,
 						 struct amdgpu_bo *abo,
 						 struct vm_fault *vmf,
 						 unsigned int base_pages)
 {
-	u32 vram_pct, dom;
+	const u32 vram_pct = amdgpu_vram_usage_pct_fast(adev);
 	u32 want, total_pages, cap;
 	u64 bo_size;
 	bool is_compute, is_vram, is_large_compute, is_small_compute;
 	struct vega_pf_state *pcs;
 	unsigned long now_j;
-	unsigned long delta_addr = 0;
-	u64 now_ns;
-	u64 delta_ns = 0;
-	int direction = 0;
+	u64 now_ns, delta_ns;
+	long diff;
 
 	if (unlikely(!adev || !abo || !vmf || base_pages == 0))
 		return base_pages;
 
 	bo_size = abo->tbo.base.size;
-	dom = abo->preferred_domains;
-	is_vram = (dom & AMDGPU_GEM_DOMAIN_VRAM) != 0U;
-	is_compute = (abo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0U;
+	is_vram = (abo->preferred_domains & AMDGPU_GEM_DOMAIN_VRAM) != 0;
+	is_compute = (abo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0;
 
-	vram_pct = amdgpu_vram_usage_pct_fast(adev);
-
-	if (is_vram) {
-		cap = VEGA_TLB_AWARE_MAX_PAGES;
-		if (vram_pct >= 90U)
-			cap = 40U;
-	} else {
+	/* Cap Logic: Vega TLB is the bottleneck */
+	if (is_vram)
+		cap = (vram_pct >= 90U) ? 40U : VEGA_TLB_AWARE_MAX_PAGES;
+	else
 		cap = min(vega_pf_max_pages_gtt, 64U);
-	}
+
 	cap = max(cap, PREFETCH_ABS_MIN_PAGES);
 
 	total_pages = (u32)min_t(u64, bo_size >> PAGE_SHIFT, U32_MAX);
-	if (total_pages == 0U)
+	if (unlikely(total_pages == 0U))
 		total_pages = 1U;
 
 	is_large_compute = is_compute && (bo_size >= VEGA_COMPUTE_LARGE_BO_THRESHOLD);
@@ -327,10 +324,12 @@ static unsigned int amdgpu_vega_optimal_prefetch(struct amdgpu_device *adev,
 		want = max(base_pages / 2U, PREFETCH_ABS_MIN_PAGES);
 	} else {
 		u32 scale_pct = 120U - (vram_pct * 4U) / 5U;
-
 		want = (base_pages * scale_pct) / 100U;
+
+		/* Use __fls (Find Last Set) as faster log2 approx */
 		if (total_pages > 1U)
-			want += ilog2(total_pages);
+			want += __fls(total_pages);
+
 		if (is_compute && vram_pct < 90U)
 			want += want >> 2;
 	}
@@ -343,29 +342,18 @@ static unsigned int amdgpu_vega_optimal_prefetch(struct amdgpu_device *adev,
 	    pcs->last_vma == (const void *)vmf->vma &&
 	    time_before(now_j, pcs->last_j + vega_pf_streak_window_jiffies)) {
 
-		if (now_ns >= pcs->last_ns)
-			delta_ns = now_ns - pcs->last_ns;
+		delta_ns = (now_ns >= pcs->last_ns) ? (now_ns - pcs->last_ns) : 0;
+		diff = (long)(vmf->address - pcs->last_addr);
 
-		if (vmf->address > pcs->last_addr) {
-			direction = 1;
-			delta_addr = vmf->address - pcs->last_addr;
-		} else if (vmf->address < pcs->last_addr) {
-			direction = 2;
-			delta_addr = pcs->last_addr - vmf->address;
-		} else {
-			direction = 0;
-			delta_addr = 0;
-		}
+		if (diff != 0) {
+			/* Absolute delta in pages */
+			unsigned long delta_pages = (unsigned long)(diff > 0 ? diff : -diff) >> PAGE_SHIFT;
+			int direction = (diff > 0) ? 1 : 2;
 
-		if (direction == 1) {
-			unsigned long delta_pages = delta_addr >> PAGE_SHIFT;
-
-			if (delta_pages > 0UL &&
-			    delta_pages <= (unsigned long)(want + 4U)) {
+			if (direction == 1 && delta_pages > 0 && delta_pages <= (unsigned long)(want + 4U)) {
 				u32 boost;
 
-				if (pcs->streak < 4U)
-					pcs->streak++;
+				if (pcs->streak < 4U) pcs->streak++;
 
 				if (is_vram) {
 					u32 new_seq = (u32)pcs->sequential_pages +
@@ -390,10 +378,11 @@ static unsigned int amdgpu_vega_optimal_prefetch(struct amdgpu_device *adev,
 				    want < 512U && total_pages >= 512U)
 					want = 512U;
 
+				/* Compute Stride Detection */
 				if (is_compute && delta_pages > 1UL && delta_pages <= 1024UL) {
 					u32 stride = (u32)delta_pages;
-
-					if (is_power_of_2(stride)) {
+					/* Power of 2 check: (x & (x-1)) == 0 */
+					if ((stride & (stride - 1)) == 0) {
 						if (pcs->last_stride == stride) {
 							if (pcs->stride_repeat_count < 255U)
 								pcs->stride_repeat_count++;
@@ -417,15 +406,16 @@ static unsigned int amdgpu_vega_optimal_prefetch(struct amdgpu_device *adev,
 				pcs->last_stride = 0U;
 				pcs->stride_repeat_count = 0U;
 			}
+			pcs->direction = (u8)direction;
 		} else {
 			pcs->streak = 0U;
+			pcs->direction = 0U;
 			pcs->sequential_pages = 0U;
 			pcs->last_stride = 0U;
 			pcs->stride_repeat_count = 0U;
 		}
-
-		pcs->direction = (u8)direction;
 	} else {
+		/* Reset State */
 		pcs->streak = 0U;
 		pcs->direction = 0U;
 		pcs->sequential_pages = 0U;
@@ -439,15 +429,15 @@ static unsigned int amdgpu_vega_optimal_prefetch(struct amdgpu_device *adev,
 	pcs->last_ns = now_ns;
 	pcs->last_j = now_j;
 
+	/* Pressure Damping */
 	if (vram_pct >= 98U)
 		want = min(want, base_pages);
 	else if (vram_pct >= 95U)
 		want = min(want, (want + base_pages) >> 1);
 
-	if (want >= 16U)
-		want &= ~15U;
-	else if (want >= 4U)
-		want &= ~3U;
+	/* Alignment Optimization */
+	if (want >= 16U) want &= ~15U;
+	else if (want >= 4U) want &= ~3U;
 
 	want = clamp_t(u32, want, PREFETCH_ABS_MIN_PAGES, PREFETCH_ABS_MAX_PAGES);
 	want = min(want, cap);
@@ -619,17 +609,7 @@ static int amdgpu_gem_object_open(struct drm_gem_object *obj,
 
 	amdgpu_bo_unreserve(abo);
 
-	/* Validate and add eviction fence to DMABuf imports with dynamic
-	 * attachment in compute VMs. Re-validation will be done by
-	 * amdgpu_vm_validate. Fences are on the reservation shared with the
-	 * export, which is currently required to be validated and fenced
-	 * already by amdgpu_amdkfd_gpuvm_restore_process_bos.
-	 *
-	 * Nested locking below for the case that a GEM object is opened in
-	 * kfd_mem_export_dmabuf. Since the lock below is only taken for imports,
-	 * but not for export, this is a different lock class that cannot lead to
-	 * circular lock dependencies.
-	 */
+	/* Validate and add eviction fence to DMABuf imports */
 	if (!vm->is_compute_context || !vm->process_info)
 		return 0;
 	if (!drm_gem_is_imported(obj) ||
@@ -717,11 +697,6 @@ static int amdgpu_gem_object_mmap(struct drm_gem_object *obj, struct vm_area_str
 	if (bo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS)
 		return -EPERM;
 
-	/* Workaround for Thunk bug creating PROT_NONE,MAP_PRIVATE mappings
-	 * for debugger access to invisible VRAM. Should have used MAP_SHARED
-	 * instead. Clearing VM_MAYWRITE prevents the mapping from ever
-	 * becoming writable and makes is_cow_mapping(vm_flags) false.
-	 */
 	if (is_cow_mapping(vma->vm_flags) &&
 	    !(vma->vm_flags & VM_ACCESS_FLAGS))
 		vm_flags_clear(vma, VM_MAYWRITE);
@@ -962,22 +937,26 @@ int amdgpu_gem_mmap_ioctl(struct drm_device *dev, void *data,
  * @timeout_ns: timeout in ns
  *
  * Calculate the timeout in jiffies from an absolute timeout in ns.
+ * Optimized to avoid ktime_sub overhead and use direct arithmetic.
  */
 unsigned long amdgpu_gem_timeout(uint64_t timeout_ns)
 {
+	s64 remaining_ns;
 	unsigned long timeout_jiffies;
-	ktime_t timeout;
 
-	/* clamp timeout if it's to large */
+	/* clamp timeout if it's too large (or infinite/negative value) */
 	if (((int64_t)timeout_ns) < 0)
 		return MAX_SCHEDULE_TIMEOUT;
 
-	timeout = ktime_sub(ns_to_ktime(timeout_ns), ktime_get());
-	if (ktime_to_ns(timeout) < 0)
+	/* Direct calculation: timeout_ns (abs) - now */
+	remaining_ns = (s64)timeout_ns - ktime_get();
+	if (remaining_ns < 0)
 		return 0;
 
-	timeout_jiffies = nsecs_to_jiffies(ktime_to_ns(timeout));
-	/*  clamp timeout to avoid unsigned-> signed overflow */
+	/* Convert to jiffies using standard kernel helper */
+	timeout_jiffies = nsecs_to_jiffies(remaining_ns);
+
+	/* Clamp to avoid returning MAX_SCHEDULE_TIMEOUT (infinite) for finite timeouts */
 	if (timeout_jiffies > MAX_SCHEDULE_TIMEOUT)
 		return MAX_SCHEDULE_TIMEOUT - 1;
 
@@ -1066,21 +1045,6 @@ out:
 	return r;
 }
 
-/**
- * amdgpu_gem_va_update_vm - update the bo_va in its VM
- *
- * @adev: amdgpu_device pointer
- * @vm: vm to update
- * @bo_va: bo_va to update
- * @operation: map, unmap or clear
- *
- * Update the bo_va directly after setting its address. Errors are not
- * vital here, so they are not reported back to userspace.
- *
- * Returns resulting fence if freed BO(s) got cleared from the PT.
- * Returns NULL if no real fence was produced (common success case).
- * Returns a stub fence in case of error (for safety).
- */
 static struct dma_fence *
 amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
 			struct amdgpu_vm *vm,
@@ -1127,21 +1091,21 @@ error:
  * @flags: GEM UAPI flags
  *
  * Returns the GEM UAPI flags mapped into hardware for the ASIC.
+ * Optimized with ternary operators for branchless CMOV generation.
  */
 uint64_t amdgpu_gem_va_map_flags(struct amdgpu_device *adev, uint32_t flags)
 {
 	uint64_t pte_flag = 0;
 
-	if (flags & AMDGPU_VM_PAGE_EXECUTABLE)
-		pte_flag |= AMDGPU_PTE_EXECUTABLE;
-	if (flags & AMDGPU_VM_PAGE_READABLE)
-		pte_flag |= AMDGPU_PTE_READABLE;
-	if (flags & AMDGPU_VM_PAGE_WRITEABLE)
-		pte_flag |= AMDGPU_PTE_WRITEABLE;
+	/* Use ternary operators to allow compiler to generate CMOV/bitwise logic */
+	pte_flag |= (flags & AMDGPU_VM_PAGE_EXECUTABLE) ? AMDGPU_PTE_EXECUTABLE : 0;
+	pte_flag |= (flags & AMDGPU_VM_PAGE_READABLE) ? AMDGPU_PTE_READABLE : 0;
+	pte_flag |= (flags & AMDGPU_VM_PAGE_WRITEABLE) ? AMDGPU_PTE_WRITEABLE : 0;
+
 	if (flags & AMDGPU_VM_PAGE_PRT)
 		pte_flag |= AMDGPU_PTE_PRT_FLAG(adev);
-	if (flags & AMDGPU_VM_PAGE_NOALLOC)
-		pte_flag |= AMDGPU_PTE_NOALLOC;
+
+	pte_flag |= (flags & AMDGPU_VM_PAGE_NOALLOC) ? AMDGPU_PTE_NOALLOC : 0;
 
 	if (adev->gmc.gmc_funcs->map_mtype)
 		pte_flag |= amdgpu_gmc_map_mtype(adev,
@@ -1174,9 +1138,7 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 	uint64_t vm_size;
 	int r = 0;
 
-	/* Address validation: combine reserved-bottom and hole checks to reduce branches.
-	 * Keep masking and overflow check separate to maintain correct semantics.
-	 */
+	/* Address validation: combine reserved-bottom and hole checks */
 	if (unlikely(args->va_address < AMDGPU_VA_RESERVED_BOTTOM ||
 		     (args->va_address >= AMDGPU_GMC_HOLE_START &&
 		      args->va_address < AMDGPU_GMC_HOLE_END))) {
@@ -1185,19 +1147,16 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 
 	args->va_address &= AMDGPU_GMC_HOLE_MASK;
 
-	/* Now validate overflow with masked address */
 	vm_size = adev->vm_manager.max_pfn * AMDGPU_GPU_PAGE_SIZE;
 	vm_size -= AMDGPU_VA_RESERVED_TOP;
 	if (unlikely(args->map_size > vm_size - args->va_address)) {
 		return -EINVAL;
 	}
 
-	/* Flag validation: accept if matches either valid_flags or prt_flags */
 	if (unlikely((args->flags & ~valid_flags) && (args->flags & ~prt_flags))) {
 		return -EINVAL;
 	}
 
-	/* Operation validation */
 	switch (args->operation) {
 	case AMDGPU_VA_OP_MAP:
 	case AMDGPU_VA_OP_UNMAP:
