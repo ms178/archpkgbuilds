@@ -10,7 +10,6 @@
 #include "renderloop.h"
 #include <QBasicTimer>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <fstream>
@@ -21,65 +20,63 @@ namespace KWin
 class SurfaceItem;
 class OutputFrame;
 class Window;
+
+struct VrrHistoryEntry {
+    std::chrono::steady_clock::time_point timestamp{};
+};
+
 class KWIN_EXPORT RenderLoopPrivate {
 public:
+    RenderLoop *const q;
+    Output *const output;
     std::chrono::nanoseconds lastPresentationTimestamp{0};
     std::chrono::nanoseconds nextPresentationTimestamp{0};
+    std::chrono::nanoseconds safetyMargin{0};
     uint64_t cachedVblankIntervalNs;
     uint64_t vblankIntervalReciprocal64;
     uint64_t vblankIntervalReciprocal;
     uint64_t nsToMsReciprocal;
+    int64_t tripleBufferEnterThresholdNs;
+    int64_t tripleBufferExitThresholdNs;
+    int refreshRate = 60'000;
+    int pendingFrameCount = 0;
+    int maxPendingFrameCount = 1;
+    int inhibitCount = 0;
+    int16_t scheduledTimerMs = -1;
+    int16_t doubleBufferingCounter = 0;
+    uint16_t stableModeFrameCount = 0;
     uint8_t reciprocalShift64;
     uint8_t reciprocalShift;
     uint8_t nsToMsShift;
-    PresentationMode presentationMode = PresentationMode::VSync;
     uint8_t vrrStabilityCounter = 0;
-    bool pendingReschedule = false;
-    bool wasTripleBuffering = false;
-    int16_t scheduledTimerMs = -1;
-    int16_t doubleBufferingCounter = 0;
-    int pendingFrameCount = 0;
-    int maxPendingFrameCount = 1;
-    RenderLoop *const q;
-    Output *const output;
-    std::chrono::nanoseconds safetyMargin{0};
-    int refreshRate = 60'000;
+    uint8_t recentSwitchCount = 0;
+    uint8_t modeSwitchHistoryIndex = 0;
+    PresentationMode presentationMode = PresentationMode::VSync;
+    PresentationMode lastStableMode = PresentationMode::VSync;
     bool preparingNewFrame = false;
     bool vrrCapable = false;
     bool vrrEnabled = false;
+    bool pendingReschedule = false;
+    bool wasTripleBuffering = false;
+    bool vrrOscillationLockout = false;
     enum class VrrMode : uint8_t {
         Automatic,
         Always,
         Never
     };
     VrrMode vrrMode = VrrMode::Automatic;
-    int inhibitCount = 0;
-    std::atomic<Window *> cachedActiveWindow{nullptr};
-    std::atomic<SurfaceItem *> cachedSurfaceItem{nullptr};
-    std::atomic<PresentationModeHint> cachedHint{PresentationModeHint::VSync};
-    std::atomic<ContentType> cachedContentType{ContentType::None};
-    std::atomic<bool> cachedIsFullScreen{false};
-    std::atomic<bool> cachedIsOnOutput{false};
-    std::atomic<bool> vrrContextDirty{true};
-    PresentationModeHint lastObservedHint = PresentationModeHint::VSync;
-    PresentationMode lastStableMode = PresentationMode::VSync;
     std::chrono::steady_clock::time_point lastModeSwitch{};
-    std::array<std::chrono::steady_clock::time_point, 8> modeSwitchHistory{};
-    uint8_t modeSwitchHistoryIndex = 0;
-    bool vrrOscillationLockout = false;
-    uint16_t stableModeFrameCount = 0;
+    alignas(64) std::array<VrrHistoryEntry, 8> modeSwitchHistory{};
     QBasicTimer compositeTimer;
     QBasicTimer delayedVrrTimer;
     RenderJournal renderJournal;
     std::optional<std::fstream> m_debugOutput;
+
     [[nodiscard]] static RenderLoopPrivate *get(RenderLoop *loop) noexcept;
     explicit RenderLoopPrivate(RenderLoop *q, Output *output);
     void updateReciprocal() noexcept;
     void initializeVrrCapabilities();
-    void updateVrrContext() noexcept;
-    void invalidateVrrContext() noexcept;
-    [[nodiscard]] PresentationMode selectPresentationModeFromContext() noexcept;
-    [[nodiscard]] bool checkForPresentationHintChange() noexcept;
+    [[nodiscard]] PresentationMode selectPresentationMode(PresentationModeHint hint, bool isOnOutput, bool isFullScreen) noexcept;
     [[nodiscard]] bool detectVrrOscillation() noexcept;
     void recordModeSwitch() noexcept;
     void dispatch();
@@ -90,4 +87,4 @@ public:
     void notifyFrameCompleted(std::chrono::nanoseconds timestamp, std::optional<RenderTimeSpan> renderTime, PresentationMode mode, OutputFrame *frame);
     void notifyVblank(std::chrono::nanoseconds timestamp);
 };
-} // namespace KWin
+}

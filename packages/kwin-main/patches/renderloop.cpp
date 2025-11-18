@@ -63,12 +63,9 @@ RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop *loop) noexcept
 }
 
 RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, Output *output)
-    : cachedVblankIntervalNs(1'000'000'000'000ull / 60'000ull)
-    , vblankIntervalReciprocal64(0)
-    , vblankIntervalReciprocal(0)
-    , nsToMsReciprocal(0)
-    , q(q)
+    : q(q)
     , output(output)
+    , cachedVblankIntervalNs(1'000'000'000'000ull / 60'000ull)
 {
     updateReciprocal();
     initializeVrrCapabilities();
@@ -84,6 +81,8 @@ void RenderLoopPrivate::updateReciprocal() noexcept
         reciprocalShift64 = 0;
         nsToMsReciprocal = 0;
         nsToMsShift = 0;
+        tripleBufferEnterThresholdNs = 0;
+        tripleBufferExitThresholdNs = 0;
         return;
     }
     if (cachedVblankIntervalNs < (1ull << 32)) [[likely]] {
@@ -110,6 +109,9 @@ void RenderLoopPrivate::updateReciprocal() noexcept
     constexpr uint8_t nsToMsShiftVal = 52;
     nsToMsReciprocal = ((1ull << nsToMsShiftVal) + kNsPerMs - 1) / kNsPerMs;
     nsToMsShift = nsToMsShiftVal;
+
+    tripleBufferEnterThresholdNs = static_cast<int64_t>((cachedVblankIntervalNs * kTripleBufferEnterPct) / 100);
+    tripleBufferExitThresholdNs = static_cast<int64_t>((cachedVblankIntervalNs * kTripleBufferExitPct) / 100);
 }
 
 void RenderLoopPrivate::initializeVrrCapabilities()
@@ -138,103 +140,37 @@ void RenderLoopPrivate::initializeVrrCapabilities()
     }
 }
 
-void RenderLoopPrivate::invalidateVrrContext() noexcept
-{
-    vrrContextDirty.store(true, std::memory_order_release);
-}
-
-void RenderLoopPrivate::updateVrrContext() noexcept
-{
-    if (!vrrContextDirty.load(std::memory_order_acquire)) {
-        return;
-    }
-    cachedActiveWindow.store(nullptr, std::memory_order_relaxed);
-    cachedSurfaceItem.store(nullptr, std::memory_order_relaxed);
-    cachedHint.store(PresentationModeHint::VSync, std::memory_order_relaxed);
-    cachedContentType.store(ContentType::None, std::memory_order_relaxed);
-    cachedIsFullScreen.store(false, std::memory_order_relaxed);
-    cachedIsOnOutput.store(false, std::memory_order_relaxed);
-    if (!vrrEnabled || !vrrCapable) [[unlikely]] {
-        vrrContextDirty.store(false, std::memory_order_release);
-        return;
-    }
-    Workspace *const ws = workspace();
-    if (!ws || !output) [[unlikely]] {
-        vrrContextDirty.store(false, std::memory_order_release);
-        return;
-    }
-    Window *const activeWindow = ws->activeWindow();
-    if (!activeWindow) [[unlikely]] {
-        vrrContextDirty.store(false, std::memory_order_release);
-        return;
-    }
-    cachedActiveWindow.store(activeWindow, std::memory_order_relaxed);
-    const bool isOnOutput = activeWindow->isOnOutput(output);
-    cachedIsOnOutput.store(isOnOutput, std::memory_order_relaxed);
-    if (!isOnOutput) [[unlikely]] {
-        vrrContextDirty.store(false, std::memory_order_release);
-        return;
-    }
-    cachedIsFullScreen.store(activeWindow->isFullScreen(), std::memory_order_relaxed);
-    SurfaceItem *const surfaceItem = activeWindow->surfaceItem();
-    if (!surfaceItem) [[unlikely]] {
-        vrrContextDirty.store(false, std::memory_order_release);
-        return;
-    }
-    cachedSurfaceItem.store(surfaceItem, std::memory_order_relaxed);
-    cachedContentType.store(surfaceItem->contentType(), std::memory_order_relaxed);
-    if (auto *const waylandItem = qobject_cast<SurfaceItemWayland *>(surfaceItem)) {
-        if (auto *const surface = waylandItem->surface()) {
-            cachedHint.store(surface->presentationModeHint(), std::memory_order_relaxed);
-        }
-    }
-    vrrContextDirty.store(false, std::memory_order_release);
-}
-
-bool RenderLoopPrivate::checkForPresentationHintChange() noexcept
-{
-    if (!vrrEnabled || !vrrCapable) [[unlikely]] {
-        return false;
-    }
-    SurfaceItem *const surfaceItem = cachedSurfaceItem.load(std::memory_order_relaxed);
-    if (!surfaceItem) [[unlikely]] {
-        return false;
-    }
-    PresentationModeHint currentHint = PresentationModeHint::VSync;
-    if (auto *const waylandItem = qobject_cast<SurfaceItemWayland *>(surfaceItem)) {
-        if (auto *const surface = waylandItem->surface()) {
-            currentHint = surface->presentationModeHint();
-        }
-    }
-    if (currentHint != lastObservedHint) [[unlikely]] {
-        lastObservedHint = currentHint;
-        cachedHint.store(currentHint, std::memory_order_relaxed);
-        return true;
-    }
-    return false;
-}
-
 void RenderLoopPrivate::recordModeSwitch() noexcept
 {
     const auto now = std::chrono::steady_clock::now();
     lastModeSwitch = now;
-    modeSwitchHistory[modeSwitchHistoryIndex] = now;
+    const auto windowStart = now - kVrrOscillationWindow;
+    uint8_t activeCount = 0;
+    for (auto &entry : modeSwitchHistory) {
+        if (entry.timestamp > windowStart) {
+            ++activeCount;
+        }
+    }
+    modeSwitchHistory[modeSwitchHistoryIndex].timestamp = now;
     modeSwitchHistoryIndex = (modeSwitchHistoryIndex + 1) % static_cast<uint8_t>(modeSwitchHistory.size());
+    const uint8_t newActiveCount = (activeCount < modeSwitchHistory.size()) ? (activeCount + 1) : static_cast<uint8_t>(modeSwitchHistory.size());
+    recentSwitchCount = newActiveCount;
 }
 
 bool RenderLoopPrivate::detectVrrOscillation() noexcept
 {
     const auto now = std::chrono::steady_clock::now();
     const auto windowStart = now - kVrrOscillationWindow;
-    uint8_t recentSwitches = 0;
-    for (const auto &switchTime : modeSwitchHistory) {
-        if (switchTime > windowStart) {
-            ++recentSwitches;
+    uint8_t activeCount = 0;
+    for (const auto &entry : modeSwitchHistory) {
+        if (entry.timestamp > windowStart) {
+            ++activeCount;
         }
     }
-    if (recentSwitches >= kVrrOscillationThreshold) [[unlikely]] {
+    recentSwitchCount = activeCount;
+    if (activeCount >= kVrrOscillationThreshold) [[unlikely]] {
         if (!vrrOscillationLockout) {
-            qCInfo(KWIN_CORE) << "VRR oscillation detected (" << recentSwitches
+            qCInfo(KWIN_CORE) << "VRR oscillation detected (" << static_cast<int>(activeCount)
                               << " switches in" << kVrrOscillationWindow.count() << "ms), entering lockout mode";
             vrrOscillationLockout = true;
             stableModeFrameCount = 0;
@@ -245,13 +181,12 @@ bool RenderLoopPrivate::detectVrrOscillation() noexcept
     return false;
 }
 
-PresentationMode RenderLoopPrivate::selectPresentationModeFromContext() noexcept
+PresentationMode RenderLoopPrivate::selectPresentationMode(PresentationModeHint hint, bool isOnOutput, bool isFullScreen) noexcept
 {
     if (!vrrEnabled || !vrrCapable) [[unlikely]] {
         return PresentationMode::VSync;
     }
     if (vrrOscillationLockout) [[unlikely]] {
-        const PresentationModeHint hint = cachedHint.load(std::memory_order_relaxed);
         const PresentationMode targetMode = (vrrMode == VrrMode::Always && hint != PresentationModeHint::VSync)
             ? PresentationMode::AdaptiveSync
             : PresentationMode::VSync;
@@ -267,7 +202,6 @@ PresentationMode RenderLoopPrivate::selectPresentationModeFromContext() noexcept
         }
         return lastStableMode;
     }
-    const PresentationModeHint hint = cachedHint.load(std::memory_order_relaxed);
     if (vrrMode == VrrMode::Always) [[unlikely]] {
         if (hint == PresentationModeHint::Async) [[unlikely]] {
             return PresentationMode::AdaptiveAsync;
@@ -277,8 +211,6 @@ PresentationMode RenderLoopPrivate::selectPresentationModeFromContext() noexcept
         }
         return PresentationMode::VSync;
     }
-    const bool isOnOutput = cachedIsOnOutput.load(std::memory_order_relaxed);
-    const bool isFullScreen = cachedIsFullScreen.load(std::memory_order_relaxed);
     if (!isOnOutput || !isFullScreen) [[unlikely]] {
         return PresentationMode::VSync;
     }
@@ -346,8 +278,32 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
     const int64_t maxCompositeNs = vblankSigned * 2;
     const int64_t baseCompositeNs = predictedRenderNs + safetyNs + kPredictionSlackNs;
     int64_t expectedCompositeNs = std::clamp(baseCompositeNs, int64_t{0}, maxCompositeNs);
-    updateVrrContext();
-    const PresentationMode targetMode = selectPresentationModeFromContext();
+
+    PresentationModeHint currentHint = PresentationModeHint::VSync;
+    bool isOnOutput = false;
+    bool isFullScreen = false;
+    if (vrrEnabled && vrrCapable) [[unlikely]] {
+        Workspace *const ws = workspace();
+        if (ws && output) [[likely]] {
+            Window *const activeWindow = ws->activeWindow();
+            if (activeWindow) [[likely]] {
+                isOnOutput = activeWindow->isOnOutput(output);
+                if (isOnOutput) {
+                    isFullScreen = activeWindow->isFullScreen();
+                    SurfaceItem *const surfaceItem = activeWindow->surfaceItem();
+                    if (surfaceItem) [[likely]] {
+                        if (auto *const waylandItem = qobject_cast<SurfaceItemWayland *>(surfaceItem)) {
+                            if (auto *const surface = waylandItem->surface()) {
+                                currentHint = surface->presentationModeHint();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    const PresentationMode targetMode = selectPresentationMode(currentHint, isOnOutput, isFullScreen);
     if (targetMode != presentationMode) [[unlikely]] {
         const uint8_t threshold = (targetMode == PresentationMode::VSync)
             ? kVrrVsyncStabilityThreshold
@@ -387,7 +343,7 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
             const uint64_t maxPending = static_cast<uint64_t>(maxPendingFrameCount > 0 ? maxPendingFrameCount : 1);
             flipsInAdvance = std::min(std::max(need, uint64_t{1}), maxPending);
         }
-        const bool highLoad = (expectedCompositeNs * 100) > (vblankSigned * kTripleBufferEnterPct);
+        const bool highLoad = expectedCompositeNs > tripleBufferEnterThresholdNs;
         if (highLoad) [[unlikely]] {
             wasTripleBuffering = true;
             doubleBufferingCounter = 0;
@@ -395,7 +351,7 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
                 flipsInAdvance = 2;
             }
         } else if (wasTripleBuffering) [[unlikely]] {
-            if ((expectedCompositeNs * 100) < (vblankSigned * kTripleBufferExitPct)) {
+            if (expectedCompositeNs < tripleBufferExitThresholdNs) {
                 ++doubleBufferingCounter;
             } else {
                 doubleBufferingCounter = 0;
@@ -678,7 +634,6 @@ void RenderLoop::setPresentationSafetyMargin(std::chrono::nanoseconds safetyMarg
 
 void RenderLoop::scheduleRepaint(Item *item, OutputLayer *outputLayer)
 {
-    // CRITICAL FIX: Thread affinity check to prevent QBasicTimer assertion failure.
     if (thread() != QThread::currentThread()) {
         QMetaObject::invokeMethod(this, [this, item, outputLayer]() {
             scheduleRepaint(item, outputLayer);
@@ -686,12 +641,6 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer *outputLayer)
         return;
     }
 
-    d->invalidateVrrContext();
-    const bool hintChanged = d->checkForPresentationHintChange();
-    if (hintChanged) [[unlikely]] {
-        d->vrrStabilityCounter = 0;
-        qCDebug(KWIN_CORE) << "Presentation hint changed to" << static_cast<int>(d->cachedHint.load(std::memory_order_relaxed));
-    }
     const bool vrr =
         (d->presentationMode == PresentationMode::AdaptiveSync ||
          d->presentationMode == PresentationMode::AdaptiveAsync);
@@ -700,18 +649,23 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer *outputLayer)
          d->presentationMode == PresentationMode::AdaptiveAsync);
     const bool checkOwnership = (item || outputLayer) && (vrr || tearing);
     const bool activeControlsVrr = checkOwnership ? activeWindowControlsVrrRefreshRate() : false;
-    if ((vrr || tearing)) [[unlikely]] {
-        SurfaceItem *const cachedSurface = d->cachedSurfaceItem.load(std::memory_order_relaxed);
-        if (checkOwnership && activeControlsVrr && cachedSurface &&
-            item && item != cachedSurface && !cachedSurface->isAncestorOf(item)) [[unlikely]] {
-            if (d->pendingFrameCount > 0) {
-                const uint64_t delayNs = d->cachedVblankIntervalNs;
-                const int64_t delayMsInt64 = static_cast<int64_t>(
-                    (delayNs + (static_cast<uint64_t>(kNanosecondsPerMillisecond) - 1)) / static_cast<uint64_t>(kNanosecondsPerMillisecond)
-                );
-                if (delayMsInt64 > 0 && delayMsInt64 <= kMaxTimerDelayMs) [[likely]] {
-                    d->delayedVrrTimer.start(static_cast<int>(delayMsInt64), Qt::PreciseTimer, this);
-                    return;
+    if ((vrr || tearing) && checkOwnership && activeControlsVrr) [[unlikely]] {
+        Workspace *const ws = workspace();
+        if (ws && d->output) [[likely]] {
+            Window *const activeWindow = ws->activeWindow();
+            if (activeWindow && activeWindow->isOnOutput(d->output)) [[likely]] {
+                SurfaceItem *const surfaceItem = activeWindow->surfaceItem();
+                if (surfaceItem && item && item != surfaceItem && !surfaceItem->isAncestorOf(item)) [[unlikely]] {
+                    if (d->pendingFrameCount > 0) {
+                        const uint64_t delayNs = d->cachedVblankIntervalNs;
+                        const int64_t delayMsInt64 = static_cast<int64_t>(
+                            (delayNs + (static_cast<uint64_t>(kNanosecondsPerMillisecond) - 1)) / static_cast<uint64_t>(kNanosecondsPerMillisecond)
+                        );
+                        if (delayMsInt64 > 0 && delayMsInt64 <= kMaxTimerDelayMs) [[likely]] {
+                            d->delayedVrrTimer.start(static_cast<int>(delayMsInt64), Qt::PreciseTimer, this);
+                            return;
+                        }
+                    }
                 }
             }
         }
@@ -771,6 +725,6 @@ void RenderLoop::setMaxPendingFrameCount(uint32_t maxCount)
     return d->renderJournal.result();
 }
 
-} // namespace KWin
+}
 
 #include "moc_renderloop.cpp"
