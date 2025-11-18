@@ -13,8 +13,12 @@
 #include "utils/common.h"
 #include "window.h"
 #include "workspace.h"
+
 #include <KSharedConfig>
 #include <KConfigGroup>
+
+#include <QThread>
+
 #include <algorithm>
 #include <bit>
 #include <chrono>
@@ -26,7 +30,9 @@
 #include <fstream>
 #include <limits>
 #include <string>
+
 using namespace std::chrono_literals;
+
 namespace
 {
 constexpr int64_t kNanosecondsPerMillisecond = 1'000'000;
@@ -46,13 +52,16 @@ constexpr int kTripleBufferEnterPct = 82;
 constexpr int kTripleBufferExitPct = 70;
 constexpr int kTripleBufferExitFrames = 4;
 }
+
 namespace KWin
 {
 static const bool s_printDebugInfo = qEnvironmentVariableIntValue("KWIN_LOG_PERFORMANCE_DATA") != 0;
+
 RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop *loop) noexcept
 {
     return loop ? loop->d.get() : nullptr;
 }
+
 RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, Output *output)
     : cachedVblankIntervalNs(1'000'000'000'000ull / 60'000ull)
     , vblankIntervalReciprocal64(0)
@@ -65,6 +74,7 @@ RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, Output *output)
     initializeVrrCapabilities();
     lastModeSwitch = std::chrono::steady_clock::now();
 }
+
 void RenderLoopPrivate::updateReciprocal() noexcept
 {
     if (cachedVblankIntervalNs == 0) [[unlikely]] {
@@ -101,6 +111,7 @@ void RenderLoopPrivate::updateReciprocal() noexcept
     nsToMsReciprocal = ((1ull << nsToMsShiftVal) + kNsPerMs - 1) / kNsPerMs;
     nsToMsShift = nsToMsShiftVal;
 }
+
 void RenderLoopPrivate::initializeVrrCapabilities()
 {
     if (!output) [[unlikely]] {
@@ -126,10 +137,12 @@ void RenderLoopPrivate::initializeVrrCapabilities()
         qCInfo(KWIN_CORE) << "VRR enabled for output" << output->name() << "policy:" << trimmedPolicy;
     }
 }
+
 void RenderLoopPrivate::invalidateVrrContext() noexcept
 {
     vrrContextDirty.store(true, std::memory_order_release);
 }
+
 void RenderLoopPrivate::updateVrrContext() noexcept
 {
     if (!vrrContextDirty.load(std::memory_order_acquire)) {
@@ -177,6 +190,7 @@ void RenderLoopPrivate::updateVrrContext() noexcept
     }
     vrrContextDirty.store(false, std::memory_order_release);
 }
+
 bool RenderLoopPrivate::checkForPresentationHintChange() noexcept
 {
     if (!vrrEnabled || !vrrCapable) [[unlikely]] {
@@ -199,6 +213,7 @@ bool RenderLoopPrivate::checkForPresentationHintChange() noexcept
     }
     return false;
 }
+
 void RenderLoopPrivate::recordModeSwitch() noexcept
 {
     const auto now = std::chrono::steady_clock::now();
@@ -206,6 +221,7 @@ void RenderLoopPrivate::recordModeSwitch() noexcept
     modeSwitchHistory[modeSwitchHistoryIndex] = now;
     modeSwitchHistoryIndex = (modeSwitchHistoryIndex + 1) % static_cast<uint8_t>(modeSwitchHistory.size());
 }
+
 bool RenderLoopPrivate::detectVrrOscillation() noexcept
 {
     const auto now = std::chrono::steady_clock::now();
@@ -228,6 +244,7 @@ bool RenderLoopPrivate::detectVrrOscillation() noexcept
     }
     return false;
 }
+
 PresentationMode RenderLoopPrivate::selectPresentationModeFromContext() noexcept
 {
     if (!vrrEnabled || !vrrCapable) [[unlikely]] {
@@ -273,6 +290,7 @@ PresentationMode RenderLoopPrivate::selectPresentationModeFromContext() noexcept
     }
     return PresentationMode::AdaptiveSync;
 }
+
 void RenderLoopPrivate::scheduleNextRepaint()
 {
     if (Q_UNLIKELY(kwinApp()->isTerminating()) || compositeTimer.isActive() || preparingNewFrame) [[unlikely]] {
@@ -280,6 +298,7 @@ void RenderLoopPrivate::scheduleNextRepaint()
     }
     scheduleRepaint(nextPresentationTimestamp);
 }
+
 #if defined(__SIZEOF_INT128__)
 [[gnu::always_inline, gnu::hot]]
 static inline uint64_t fastDivideByVblank(uint64_t numerator,
@@ -304,8 +323,16 @@ static inline uint64_t fastDivideByVblank(uint64_t numerator,
     return result;
 }
 #endif
+
 void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimestamp)
 {
+    if (q->thread() != QThread::currentThread()) {
+        QMetaObject::invokeMethod(q, [this, lastTargetTimestamp]() {
+            scheduleRepaint(lastTargetTimestamp);
+        }, Qt::QueuedConnection);
+        return;
+    }
+
     pendingReschedule = false;
     const uint64_t vblankIntervalNs = cachedVblankIntervalNs;
     if (vblankIntervalNs == 0) [[unlikely]] {
@@ -460,10 +487,12 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
         compositeTimer.start(delayMs, Qt::PreciseTimer, q);
     }
 }
+
 void RenderLoopPrivate::delayScheduleRepaint() noexcept
 {
     pendingReschedule = true;
 }
+
 void RenderLoopPrivate::notifyFrameDropped()
 {
     Q_ASSERT(pendingFrameCount > 0);
@@ -472,6 +501,7 @@ void RenderLoopPrivate::notifyFrameDropped()
         scheduleNextRepaint();
     }
 }
+
 namespace
 {
 static void writeDebugOutput(RenderLoopPrivate *d,
@@ -524,6 +554,7 @@ static void writeDebugOutput(RenderLoopPrivate *d,
                         << frame->predictedRenderTime().count() << '\n';
 }
 }
+
 void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
                                              std::optional<RenderTimeSpan> renderTime,
                                              PresentationMode mode,
@@ -546,6 +577,7 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
     }
     Q_EMIT q->framePresented(q, timestamp, mode);
 }
+
 void RenderLoopPrivate::notifyVblank(std::chrono::nanoseconds timestamp)
 {
     if (lastPresentationTimestamp <= timestamp) [[likely]] {
@@ -558,6 +590,7 @@ void RenderLoopPrivate::notifyVblank(std::chrono::nanoseconds timestamp)
         lastPresentationTimestamp = std::chrono::steady_clock::now().time_since_epoch();
     }
 }
+
 void RenderLoop::timerEvent(QTimerEvent *event)
 {
     if (event->timerId() == d->compositeTimer.timerId()) [[likely]] {
@@ -571,15 +604,19 @@ void RenderLoop::timerEvent(QTimerEvent *event)
         QObject::timerEvent(event);
     }
 }
+
 void RenderLoopPrivate::dispatch()
 {
     Q_EMIT q->frameRequested(q);
 }
+
 RenderLoop::RenderLoop(Output *output)
     : d(std::make_unique<RenderLoopPrivate>(this, output))
 {
 }
+
 RenderLoop::~RenderLoop() = default;
+
 void RenderLoop::inhibit()
 {
     ++d->inhibitCount;
@@ -588,6 +625,7 @@ void RenderLoop::inhibit()
         d->scheduledTimerMs = -1;
     }
 }
+
 void RenderLoop::uninhibit()
 {
     Q_ASSERT(d->inhibitCount > 0);
@@ -596,20 +634,24 @@ void RenderLoop::uninhibit()
         d->scheduleNextRepaint();
     }
 }
+
 void RenderLoop::prepareNewFrame()
 {
     Q_ASSERT(!d->preparingNewFrame);
     ++d->pendingFrameCount;
     d->preparingNewFrame = true;
 }
+
 void RenderLoop::newFramePrepared()
 {
     d->preparingNewFrame = false;
 }
+
 [[nodiscard]] int RenderLoop::refreshRate() const
 {
     return d->refreshRate;
 }
+
 void RenderLoop::setRefreshRate(int refreshRate)
 {
     constexpr int kMinRefreshRate = 1'000;
@@ -628,12 +670,22 @@ void RenderLoop::setRefreshRate(int refreshRate)
         d->scheduleNextRepaint();
     }
 }
+
 void RenderLoop::setPresentationSafetyMargin(std::chrono::nanoseconds safetyMargin)
 {
     d->safetyMargin = std::max(safetyMargin, 0ns);
 }
+
 void RenderLoop::scheduleRepaint(Item *item, OutputLayer *outputLayer)
 {
+    // CRITICAL FIX: Thread affinity check to prevent QBasicTimer assertion failure.
+    if (thread() != QThread::currentThread()) {
+        QMetaObject::invokeMethod(this, [this, item, outputLayer]() {
+            scheduleRepaint(item, outputLayer);
+        }, Qt::QueuedConnection);
+        return;
+    }
+
     d->invalidateVrrContext();
     const bool hintChanged = d->checkForPresentationHintChange();
     if (hintChanged) [[unlikely]] {
@@ -676,6 +728,7 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer *outputLayer)
         d->delayScheduleRepaint();
     }
 }
+
 [[nodiscard]] bool RenderLoop::activeWindowControlsVrrRefreshRate() const
 {
     Workspace *const ws = workspace();
@@ -689,14 +742,17 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer *outputLayer)
     SurfaceItem *const surfaceItem = activeWindow->surfaceItem();
     return surfaceItem && (surfaceItem->recursiveFrameTimeEstimation() <= kVrrControlThreshold);
 }
+
 [[nodiscard]] std::chrono::nanoseconds RenderLoop::lastPresentationTimestamp() const
 {
     return d->lastPresentationTimestamp;
 }
+
 [[nodiscard]] std::chrono::nanoseconds RenderLoop::nextPresentationTimestamp() const
 {
     return d->nextPresentationTimestamp;
 }
+
 void RenderLoop::setPresentationMode(PresentationMode mode)
 {
     if (mode != d->presentationMode) [[unlikely]] {
@@ -704,13 +760,17 @@ void RenderLoop::setPresentationMode(PresentationMode mode)
         d->presentationMode = mode;
     }
 }
+
 void RenderLoop::setMaxPendingFrameCount(uint32_t maxCount)
 {
     d->maxPendingFrameCount = std::clamp(static_cast<int>(maxCount), 1, INT_MAX);
 }
+
 [[nodiscard]] std::chrono::nanoseconds RenderLoop::predictedRenderTime() const
 {
     return d->renderJournal.result();
 }
+
 } // namespace KWin
+
 #include "moc_renderloop.cpp"
