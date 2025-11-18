@@ -1178,14 +1178,685 @@
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c	2025-09-18 01:47:46.232271897 +0200
 
 --- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c	2025-07-12 17:16:53.286394076 +0200
-+++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c	2025-07-12 17:43:17.514165504 +0200
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c	2025-11-09 17:43:17.514165504 +0200
+@@ -132,6 +132,83 @@ MODULE_FIRMWARE("amdgpu/aldebaran_rlc.bi
+ MODULE_FIRMWARE("amdgpu/aldebaran_sjt_mec.bin");
+ MODULE_FIRMWARE("amdgpu/aldebaran_sjt_mec2.bin");
+ 
++/* Helper macro for conditional register writes to reduce MMIO overhead */
++#ifndef GFX_V9_WREG_SOC15_IF_CHANGED_H
++#define GFX_V9_WREG_SOC15_IF_CHANGED_H
++#define WREG32_SOC15_IF_CHANGED(ip, inst, reg, new_val_expr)                      \
++do {                                                                       \
++	u32 __old = RREG32_SOC15(ip, inst, reg);                           \
++	u32 __val = (new_val_expr);                                        \
++	if (unlikely(__old != __val))                                       \
++		WREG32_SOC15(ip, inst, reg, __val);                         \
++} while (0)
++#endif
++
++/* File-scoped state for GRBM index caching to adhere to single-file modification constraint */
++struct grbm_state {
++	spinlock_t lock;
++	bool initialized;
++	bool cache_valid;
++	const struct amdgpu_device *adev_tag;
++	u32 current_idx;
++};
++static struct grbm_state grbm_state_var;
++
++static void gfx_v9_0_grbm_state_init(struct amdgpu_device *adev)
++{
++	spin_lock_init(&grbm_state_var.lock);
++	grbm_state_var.initialized = true;
++	grbm_state_var.cache_valid = false;
++	grbm_state_var.adev_tag = adev;
++	grbm_state_var.current_idx = 0;
++}
++
++static void gfx_v9_0_grbm_state_invalidate(struct amdgpu_device *adev)
++{
++	unsigned long flags;
++	if (unlikely(!READ_ONCE(grbm_state_var.initialized)))
++		return;
++	spin_lock_irqsave(&grbm_state_var.lock, flags);
++	if (grbm_state_var.adev_tag == adev)
++		grbm_state_var.cache_valid = false;
++	spin_unlock_irqrestore(&grbm_state_var.lock, flags);
++}
++
++static __always_inline int
++gfx9_wait_reg_off(struct amdgpu_device *adev, u32 reg_offset,
++		  u32 mask, u32 val_target, unsigned long timeout_us)
++{
++	u32 val;
++	ktime_t deadline;
++
++	if (unlikely(!adev))
++		return -EINVAL;
++
++	if (!timeout_us)
++		timeout_us = adev->usec_timeout;
++
++	deadline = ktime_add_us(ktime_get(), timeout_us);
++
++	do {
++		val = RREG32(reg_offset);
++		if ((val & mask) == val_target)
++			return 0;
++
++		if (in_atomic() || irqs_disabled()) {
++			udelay(1);
++			cpu_relax();
++		} else {
++			if (timeout_us > 1000)
++				usleep_range(10, 100);
++			else
++				udelay(1);
++			cond_resched();
++		}
++	} while (ktime_before(ktime_get(), deadline));
++
++	return -ETIMEDOUT;
++}
++
+ #define mmTCP_CHAN_STEER_0_ARCT								0x0b03
+ #define mmTCP_CHAN_STEER_0_ARCT_BASE_IDX							0
+ #define mmTCP_CHAN_STEER_1_ARCT								0x0b04
+@@ -1041,36 +1118,38 @@ static void gfx_v9_0_kiq_invalidate_tlbs
+ }
+ 
+ 
+-static void gfx_v9_0_kiq_reset_hw_queue(struct amdgpu_ring *kiq_ring, uint32_t queue_type,
+-					uint32_t me_id, uint32_t pipe_id, uint32_t queue_id,
+-					uint32_t xcc_id, uint32_t vmid)
++static void gfx_v9_0_kiq_reset_hw_queue(struct amdgpu_ring *kiq_ring,
++					u32 queue_type,
++					u32 me_id, u32 pipe_id, u32 queue_id,
++					u32 xcc_id, u32 vmid)
+ {
+ 	struct amdgpu_device *adev = kiq_ring->adev;
+-	unsigned i;
++	const unsigned long tmo_us = max_t(unsigned long, 1, adev->usec_timeout / 5);
++	int r;
+ 
+-	/* enter save mode */
+ 	amdgpu_gfx_rlc_enter_safe_mode(adev, xcc_id);
++
+ 	mutex_lock(&adev->srbm_mutex);
+ 	soc15_grbm_select(adev, me_id, pipe_id, queue_id, 0, 0);
+ 
+-	if (queue_type == AMDGPU_RING_TYPE_COMPUTE) {
+-		WREG32_SOC15(GC, 0, mmCP_HQD_DEQUEUE_REQUEST, 0x2);
+-		WREG32_SOC15(GC, 0, mmSPI_COMPUTE_QUEUE_RESET, 0x1);
+-		/* wait till dequeue take effects */
+-		for (i = 0; i < adev->usec_timeout; i++) {
+-			if (!(RREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE) & 1))
+-				break;
+-			udelay(1);
+-		}
+-		if (i >= adev->usec_timeout)
+-			dev_err(adev->dev, "fail to wait on hqd deactive\n");
+-	} else {
+-		dev_err(adev->dev, "reset queue_type(%d) not supported\n", queue_type);
++	if (queue_type != AMDGPU_RING_TYPE_COMPUTE) {
++		dev_err_ratelimited(adev->dev, "KIQ reset: unsupported type %u\n", queue_type);
++		goto out_restore;
+ 	}
+ 
++	WREG32_SOC15(GC, 0, mmCP_HQD_DEQUEUE_REQUEST, 0x2);
++	WREG32_SOC15(GC, 0, mmSPI_COMPUTE_QUEUE_RESET, 0x1);
++
++	r = gfx9_wait_reg_off(adev, SOC15_REG_OFFSET(GC, 0, mmCP_HQD_ACTIVE),
++			      CP_HQD_ACTIVE__ACTIVE_MASK, 0, tmo_us);
++	if (r)
++		dev_err_ratelimited(adev->dev, "KIQ reset: HQD timeout ME%u/PIPE%u/Q%u\n",
++				    me_id, pipe_id, queue_id);
++
++out_restore:
+ 	soc15_grbm_select(adev, 0, 0, 0, 0, 0);
+ 	mutex_unlock(&adev->srbm_mutex);
+-	/* exit safe mode */
++
+ 	amdgpu_gfx_rlc_exit_safe_mode(adev, xcc_id);
+ }
+ 
+@@ -2234,25 +2313,6 @@ static int gfx_v9_0_sw_init(struct amdgp
+ 	}
+ 
+ 	switch (amdgpu_ip_version(adev, GC_HWIP, 0)) {
+-	case IP_VERSION(9, 0, 1):
+-	case IP_VERSION(9, 2, 1):
+-	case IP_VERSION(9, 4, 0):
+-	case IP_VERSION(9, 2, 2):
+-	case IP_VERSION(9, 1, 0):
+-	case IP_VERSION(9, 3, 0):
+-		adev->gfx.cleaner_shader_ptr = gfx_9_4_2_cleaner_shader_hex;
+-		adev->gfx.cleaner_shader_size = sizeof(gfx_9_4_2_cleaner_shader_hex);
+-		if (adev->gfx.me_fw_version  >= 167 &&
+-		    adev->gfx.pfp_fw_version >= 196 &&
+-		    adev->gfx.mec_fw_version >= 474) {
+-			adev->gfx.enable_cleaner_shader = true;
+-			r = amdgpu_gfx_cleaner_shader_sw_init(adev, adev->gfx.cleaner_shader_size);
+-			if (r) {
+-				adev->gfx.enable_cleaner_shader = false;
+-				dev_err(adev->dev, "Failed to initialize cleaner shader\n");
+-			}
+-		}
+-		break;
+ 	case IP_VERSION(9, 4, 2):
+ 		adev->gfx.cleaner_shader_ptr = gfx_9_4_2_cleaner_shader_hex;
+ 		adev->gfx.cleaner_shader_size = sizeof(gfx_9_4_2_cleaner_shader_hex);
+@@ -2273,51 +2333,31 @@ static int gfx_v9_0_sw_init(struct amdgp
+ 	adev->gfx.mec.num_pipe_per_mec = 4;
+ 	adev->gfx.mec.num_queue_per_pipe = 8;
+ 
+-	/* EOP Event */
+ 	r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_GRBM_CP, GFX_9_0__SRCID__CP_EOP_INTERRUPT, &adev->gfx.eop_irq);
+-	if (r)
+-		return r;
++	if (r) return r;
+ 
+-	/* Bad opcode Event */
+-	r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_GRBM_CP,
+-			      GFX_9_0__SRCID__CP_BAD_OPCODE_ERROR,
+-			      &adev->gfx.bad_op_irq);
+-	if (r)
+-		return r;
++	r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_GRBM_CP, GFX_9_0__SRCID__CP_BAD_OPCODE_ERROR, &adev->gfx.bad_op_irq);
++	if (r) return r;
+ 
+-	/* Privileged reg */
+-	r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_GRBM_CP, GFX_9_0__SRCID__CP_PRIV_REG_FAULT,
+-			      &adev->gfx.priv_reg_irq);
+-	if (r)
+-		return r;
++	r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_GRBM_CP, GFX_9_0__SRCID__CP_PRIV_REG_FAULT, &adev->gfx.priv_reg_irq);
++	if (r) return r;
+ 
+-	/* Privileged inst */
+-	r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_GRBM_CP, GFX_9_0__SRCID__CP_PRIV_INSTR_FAULT,
+-			      &adev->gfx.priv_inst_irq);
+-	if (r)
+-		return r;
++	r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_GRBM_CP, GFX_9_0__SRCID__CP_PRIV_INSTR_FAULT, &adev->gfx.priv_inst_irq);
++	if (r) return r;
+ 
+-	/* ECC error */
+-	r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_GRBM_CP, GFX_9_0__SRCID__CP_ECC_ERROR,
+-			      &adev->gfx.cp_ecc_error_irq);
+-	if (r)
+-		return r;
++	r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_GRBM_CP, GFX_9_0__SRCID__CP_ECC_ERROR, &adev->gfx.cp_ecc_error_irq);
++	if (r) return r;
+ 
+-	/* FUE error */
+-	r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_GRBM_CP, GFX_9_0__SRCID__CP_FUE_ERROR,
+-			      &adev->gfx.cp_ecc_error_irq);
+-	if (r)
+-		return r;
++	r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_GRBM_CP, GFX_9_0__SRCID__CP_FUE_ERROR, &adev->gfx.cp_ecc_error_irq);
++	if (r) return r;
+ 
+ 	adev->gfx.gfx_current_status = AMDGPU_GFX_NORMAL_MODE;
+ 
+-	if (adev->gfx.rlc.funcs) {
+-		if (adev->gfx.rlc.funcs->init) {
+-			r = adev->gfx.rlc.funcs->init(adev);
+-			if (r) {
+-				dev_err(adev->dev, "Failed to init rlc BOs!\n");
+-				return r;
+-			}
++	if (adev->gfx.rlc.funcs && adev->gfx.rlc.funcs->init) {
++		r = adev->gfx.rlc.funcs->init(adev);
++		if (r) {
++			dev_err(adev->dev, "Failed to init rlc BOs!\n");
++			return r;
+ 		}
+ 	}
+ 
+@@ -2327,28 +2367,20 @@ static int gfx_v9_0_sw_init(struct amdgp
+ 		return r;
+ 	}
+ 
+-	/* set up the gfx ring */
+ 	for (i = 0; i < adev->gfx.num_gfx_rings; i++) {
+ 		ring = &adev->gfx.gfx_ring[i];
+ 		ring->ring_obj = NULL;
+-		if (!i)
+-			sprintf(ring->name, "gfx");
+-		else
+-			sprintf(ring->name, "gfx_%d", i);
++		sprintf(ring->name, "gfx_%d", i);
+ 		ring->use_doorbell = true;
+ 		ring->doorbell_index = adev->doorbell_index.gfx_ring0 << 1;
+-
+-		/* disable scheduler on the real ring */
+ 		ring->no_scheduler = adev->gfx.mcbp;
+ 		ring->vm_hub = AMDGPU_GFXHUB(0);
+ 		r = amdgpu_ring_init(adev, ring, 1024, &adev->gfx.eop_irq,
+ 				     AMDGPU_CP_IRQ_GFX_ME0_PIPE0_EOP,
+ 				     AMDGPU_RING_PRIO_DEFAULT, NULL);
+-		if (r)
+-			return r;
++		if (r) return r;
+ 	}
+ 
+-	/* set up the software rings */
+ 	if (adev->gfx.mcbp && adev->gfx.num_gfx_rings) {
+ 		for (i = 0; i < GFX9_NUM_SW_GFX_RINGS; i++) {
+ 			ring = &adev->gfx.sw_gfx_ring[i];
+@@ -2362,12 +2394,10 @@ static int gfx_v9_0_sw_init(struct amdgp
+ 			r = amdgpu_ring_init(adev, ring, 1024, &adev->gfx.eop_irq,
+ 					     AMDGPU_CP_IRQ_GFX_ME0_PIPE0_EOP, hw_prio,
+ 					     NULL);
+-			if (r)
+-				return r;
++			if (r) return r;
+ 			ring->wptr = 0;
+ 		}
+ 
+-		/* init the muxer and add software rings */
+ 		r = amdgpu_ring_mux_init(&adev->gfx.muxer, &adev->gfx.gfx_ring[0],
+ 					 GFX9_NUM_SW_GFX_RINGS);
+ 		if (r) {
+@@ -2384,7 +2414,6 @@ static int gfx_v9_0_sw_init(struct amdgp
+ 		}
+ 	}
+ 
+-	/* set up the compute queues - allocate horizontally across pipes */
+ 	ring_id = 0;
+ 	for (i = 0; i < adev->gfx.mec.num_mec; ++i) {
+ 		for (j = 0; j < adev->gfx.mec.num_queue_per_pipe; j++) {
+@@ -2393,22 +2422,19 @@ static int gfx_v9_0_sw_init(struct amdgp
+ 								     k, j))
+ 					continue;
+ 
+-				r = gfx_v9_0_compute_ring_init(adev,
+-							       ring_id,
++				r = gfx_v9_0_compute_ring_init(adev, ring_id,
+ 							       i, k, j);
+-				if (r)
+-					return r;
+-
++				if (r) return r;
+ 				ring_id++;
+ 			}
+ 		}
+ 	}
+ 
+-	/* TODO: Add queue reset mask when FW fully supports it */
+ 	adev->gfx.gfx_supported_reset =
+ 		amdgpu_get_soft_full_reset_mask(&adev->gfx.gfx_ring[0]);
+ 	adev->gfx.compute_supported_reset =
+ 		amdgpu_get_soft_full_reset_mask(&adev->gfx.compute_ring[0]);
++
+ 	if (!amdgpu_sriov_vf(adev))
+ 		adev->gfx.compute_supported_reset |= AMDGPU_RESET_TYPE_PER_QUEUE;
+ 
+@@ -2419,19 +2445,15 @@ static int gfx_v9_0_sw_init(struct amdgp
+ 	}
+ 
+ 	r = amdgpu_gfx_kiq_init_ring(adev, xcc_id);
+-	if (r)
+-		return r;
++	if (r) return r;
+ 
+-	/* create MQD for all compute queues as wel as KIQ for SRIOV case */
+ 	r = amdgpu_gfx_mqd_sw_init(adev, sizeof(struct v9_mqd_allocation), 0);
+-	if (r)
+-		return r;
++	if (r) return r;
+ 
+ 	adev->gfx.ce_ram_size = 0x8000;
+ 
+ 	r = gfx_v9_0_gpu_early_init(adev);
+-	if (r)
+-		return r;
++	if (r) return r;
+ 
+ 	if (amdgpu_gfx_ras_sw_init(adev)) {
+ 		dev_err(adev->dev, "Failed to initialize gfx ras block!\n");
+@@ -2441,13 +2463,14 @@ static int gfx_v9_0_sw_init(struct amdgp
+ 	gfx_v9_0_alloc_ip_dump(adev);
+ 
+ 	r = amdgpu_gfx_sysfs_init(adev);
+-	if (r)
+-		return r;
++	if (r) return r;
++
++	/* Initialize GRBM index shadowing state */
++	gfx_v9_0_grbm_state_init(adev);
+ 
+ 	return 0;
+ }
+ 
+-
+ static int gfx_v9_0_sw_fini(struct amdgpu_ip_block *ip_block)
+ {
+ 	int i;
+@@ -2495,15 +2518,15 @@ static void gfx_v9_0_tiling_mode_table_i
+ 	/* TODO */
+ }
+ 
+-void gfx_v9_0_select_se_sh(struct amdgpu_device *adev, u32 se_num, u32 sh_num,
+-			   u32 instance, int xcc_id)
++void gfx_v9_0_select_se_sh(struct amdgpu_device *adev, u32 se_num,
++			   u32 sh_num, u32 instance, int xcc_id)
+ {
+-	u32 data;
++	u32 data = 0;
+ 
+ 	if (instance == 0xffffffff)
+-		data = REG_SET_FIELD(0, GRBM_GFX_INDEX, INSTANCE_BROADCAST_WRITES, 1);
++		data = REG_SET_FIELD(data, GRBM_GFX_INDEX, INSTANCE_BROADCAST_WRITES, 1);
+ 	else
+-		data = REG_SET_FIELD(0, GRBM_GFX_INDEX, INSTANCE_INDEX, instance);
++		data = REG_SET_FIELD(data, GRBM_GFX_INDEX, INSTANCE_INDEX, instance);
+ 
+ 	if (se_num == 0xffffffff)
+ 		data = REG_SET_FIELD(data, GRBM_GFX_INDEX, SE_BROADCAST_WRITES, 1);
+@@ -2515,7 +2538,27 @@ void gfx_v9_0_select_se_sh(struct amdgpu
+ 	else
+ 		data = REG_SET_FIELD(data, GRBM_GFX_INDEX, SH_INDEX, sh_num);
+ 
+-	WREG32_SOC15_RLC_SHADOW(GC, 0, mmGRBM_GFX_INDEX, data);
++	if (READ_ONCE(grbm_state_var.initialized)) {
++		unsigned long flags;
++		spin_lock_irqsave(&grbm_state_var.lock, flags);
++
++		if (grbm_state_var.adev_tag != adev) {
++			grbm_state_var.adev_tag = adev;
++			grbm_state_var.cache_valid = false;
++		}
++		if (grbm_state_var.cache_valid &&
++		    grbm_state_var.current_idx == data) {
++			spin_unlock_irqrestore(&grbm_state_var.lock, flags);
++			return;
++		}
++
++		WREG32_SOC15_RLC_SHADOW(GC, 0, mmGRBM_GFX_INDEX, data);
++		grbm_state_var.current_idx = data;
++		grbm_state_var.cache_valid = true;
++		spin_unlock_irqrestore(&grbm_state_var.lock, flags);
++	} else {
++		WREG32_SOC15_RLC_SHADOW(GC, 0, mmGRBM_GFX_INDEX, data);
++	}
+ }
+ 
+ static u32 gfx_v9_0_get_rb_active_bitmap(struct amdgpu_device *adev)
+@@ -2654,13 +2697,74 @@ static void gfx_v9_0_init_sq_config(stru
+ 	}
+ }
+ 
++static void gfx_v9_0_optimize_memory_subsystem(struct amdgpu_device *adev)
++{
++	if (adev->gfx.gfx_current_status != AMDGPU_GFX_NORMAL_MODE) {
++		dev_dbg(adev->dev, "GPU not in normal mode, skipping memory optimization\n");
++		return;
++	}
++
++	switch (amdgpu_ip_version(adev, GC_HWIP, 0)) {
++		case IP_VERSION(9, 0, 1):
++		case IP_VERSION(9, 2, 1):
++		case IP_VERSION(9, 4, 0):
++		case IP_VERSION(9, 1, 0):
++		case IP_VERSION(9, 2, 2):
++		case IP_VERSION(9, 3, 0):
++			WREG32_SOC15(GC, 0, mmSQC_CONFIG, 0x020a2000);
++			WREG32_SOC15(GC, 0, mmTA_CNTL_AUX, 0x010b0000);
++			WREG32_SOC15(GC, 0, mmVGT_CACHE_INVALIDATION, 0x19200000);
++			break;
++		default:
++			break;
++	}
++
++	switch (amdgpu_ip_version(adev, GC_HWIP, 0)) {
++		case IP_VERSION(9, 0, 1):
++		case IP_VERSION(9, 4, 0):
++			WREG32_SOC15(GC, 0, mmTCP_CHAN_STEER_HI, 0x4a2c0e68);
++			WREG32_SOC15(GC, 0, mmTCP_CHAN_STEER_LO, 0xb5d3f197);
++			WREG32_SOC15(GC, 0, mmVGT_GS_MAX_WAVE_ID, 0x000003ff);
++			WREG32_SOC15(GC, 0, mmSPI_RESOURCE_RESERVE_CU_0, 0x00000800);
++			WREG32_SOC15(GC, 0, mmSPI_RESOURCE_RESERVE_CU_1, 0x00000800);
++			WREG32_SOC15(GC, 0, mmSPI_RESOURCE_RESERVE_EN_CU_0, 0x00ffff87);
++			WREG32_SOC15(GC, 0, mmSPI_RESOURCE_RESERVE_EN_CU_1, 0x00ffff8f);
++			break;
++		case IP_VERSION(9, 2, 1):
++			WREG32_SOC15(GC, 0, mmTCP_CHAN_STEER_HI, 0x00000000);
++			WREG32_SOC15(GC, 0, mmTCP_CHAN_STEER_LO, 0x76325410);
++			WREG32_SOC15(GC, 0, mmVGT_GS_MAX_WAVE_ID, 0x000003ff);
++			WREG32_SOC15(GC, 0, mmSPI_RESOURCE_RESERVE_CU_0, 0x00000800);
++			WREG32_SOC15(GC, 0, mmSPI_RESOURCE_RESERVE_CU_1, 0x00000800);
++			WREG32_SOC15(GC, 0, mmSPI_RESOURCE_RESERVE_EN_CU_0, 0x0000ff87);
++			WREG32_SOC15(GC, 0, mmSPI_RESOURCE_RESERVE_EN_CU_1, 0x0000ff8f);
++			break;
++		case IP_VERSION(9, 1, 0):
++		case IP_VERSION(9, 2, 2):
++		case IP_VERSION(9, 3, 0):
++			WREG32_SOC15(GC, 0, mmTCP_CHAN_STEER_HI, 0x00000000);
++			WREG32_SOC15(GC, 0, mmTCP_CHAN_STEER_LO, 0x00003120);
++			if (amdgpu_ip_version(adev, GC_HWIP, 0) == IP_VERSION(9, 3, 0))
++				WREG32_SOC15(GC, 0, mmGCEA_PROBE_MAP, 0x0000cccc);
++			WREG32_SOC15(GC, 0, mmVGT_GS_MAX_WAVE_ID, 0x000000ff);
++			break;
++		default:
++			break;
++	}
++
++	dev_dbg(adev->dev, "Memory subsystem optimization applied for IP %d.%d.%d\n",
++			IP_VERSION_MAJ(amdgpu_ip_version(adev, GC_HWIP, 0)),
++			IP_VERSION_MIN(amdgpu_ip_version(adev, GC_HWIP, 0)),
++			IP_VERSION_REV(amdgpu_ip_version(adev, GC_HWIP, 0)));
++}
++
+ static void gfx_v9_0_constants_init(struct amdgpu_device *adev)
+ {
+ 	u32 tmp;
+ 	int i;
+ 
+ 	if (!amdgpu_sriov_vf(adev) ||
+-	    amdgpu_ip_version(adev, GC_HWIP, 0) != IP_VERSION(9, 4, 2)) {
++		amdgpu_ip_version(adev, GC_HWIP, 0) != IP_VERSION(9, 4, 2)) {
+ 		WREG32_FIELD15_RLC(GC, 0, GRBM_CNTL, READ_TIMEOUT, 0xff);
+ 	}
+ 
+@@ -2671,34 +2775,33 @@ static void gfx_v9_0_constants_init(stru
+ 	gfx_v9_0_get_cu_info(adev, &adev->gfx.cu_info);
+ 	adev->gfx.config.db_debug2 = RREG32_SOC15(GC, 0, mmDB_DEBUG2);
+ 
+-	/* XXX SH_MEM regs */
+-	/* where to put LDS, scratch, GPUVM in FSA64 space */
++	/* Apply Godlike optimizations */
++	gfx_v9_0_optimize_memory_subsystem(adev);
++
+ 	mutex_lock(&adev->srbm_mutex);
+ 	for (i = 0; i < adev->vm_manager.id_mgr[AMDGPU_GFXHUB(0)].num_ids; i++) {
+ 		soc15_grbm_select(adev, 0, 0, 0, i, 0);
+-		/* CP and shaders */
+ 		if (i == 0) {
+ 			tmp = REG_SET_FIELD(0, SH_MEM_CONFIG, ALIGNMENT_MODE,
+-					    SH_MEM_ALIGNMENT_MODE_UNALIGNED);
++								SH_MEM_ALIGNMENT_MODE_UNALIGNED);
+ 			tmp = REG_SET_FIELD(tmp, SH_MEM_CONFIG, RETRY_DISABLE,
+-					    !!adev->gmc.noretry);
++								!!adev->gmc.noretry);
+ 			WREG32_SOC15_RLC(GC, 0, mmSH_MEM_CONFIG, tmp);
+ 			WREG32_SOC15_RLC(GC, 0, mmSH_MEM_BASES, 0);
+ 		} else {
+ 			tmp = REG_SET_FIELD(0, SH_MEM_CONFIG, ALIGNMENT_MODE,
+-					    SH_MEM_ALIGNMENT_MODE_UNALIGNED);
++								SH_MEM_ALIGNMENT_MODE_UNALIGNED);
+ 			tmp = REG_SET_FIELD(tmp, SH_MEM_CONFIG, RETRY_DISABLE,
+-					    !!adev->gmc.noretry);
++								!!adev->gmc.noretry);
+ 			WREG32_SOC15_RLC(GC, 0, mmSH_MEM_CONFIG, tmp);
+ 			tmp = REG_SET_FIELD(0, SH_MEM_BASES, PRIVATE_BASE,
+-				(adev->gmc.private_aperture_start >> 48));
++								(adev->gmc.private_aperture_start >> 48));
+ 			tmp = REG_SET_FIELD(tmp, SH_MEM_BASES, SHARED_BASE,
+-				(adev->gmc.shared_aperture_start >> 48));
++								(adev->gmc.shared_aperture_start >> 48));
+ 			WREG32_SOC15_RLC(GC, 0, mmSH_MEM_BASES, tmp);
+ 		}
+ 	}
+ 	soc15_grbm_select(adev, 0, 0, 0, 0, 0);
+-
+ 	mutex_unlock(&adev->srbm_mutex);
+ 
+ 	gfx_v9_0_init_compute_vmid(adev);
+@@ -4096,6 +4199,11 @@ static int gfx_v9_0_hw_fini(struct amdgp
+ 
+ static int gfx_v9_0_suspend(struct amdgpu_ip_block *ip_block)
+ {
++	struct amdgpu_device *adev = ip_block->adev;
++
++	/* Invalidate GRBM cache before hardware teardown */
++	gfx_v9_0_grbm_state_invalidate(adev);
++
+ 	return gfx_v9_0_hw_fini(ip_block);
+ }
+ 
+@@ -4130,9 +4238,12 @@ static int gfx_v9_0_wait_for_idle(struct
+ 
+ static int gfx_v9_0_soft_reset(struct amdgpu_ip_block *ip_block)
+ {
++	struct amdgpu_device *adev = ip_block->adev;
+ 	u32 grbm_soft_reset = 0;
+ 	u32 tmp;
+-	struct amdgpu_device *adev = ip_block->adev;
++
++	/* Invalidate GRBM cache as soft reset may alter internal state */
++	gfx_v9_0_grbm_state_invalidate(adev);
+ 
+ 	/* GRBM_STATUS */
+ 	tmp = RREG32_SOC15(GC, 0, mmGRBM_STATUS);
+@@ -5230,12 +5341,15 @@ static int gfx_v9_0_set_powergating_stat
+ 	struct amdgpu_device *adev = ip_block->adev;
+ 	bool enable = (state == AMD_PG_STATE_GATE);
+ 
++	if (amdgpu_sriov_vf(adev))
++		return 0;
++
+ 	switch (amdgpu_ip_version(adev, GC_HWIP, 0)) {
+ 	case IP_VERSION(9, 2, 2):
+ 	case IP_VERSION(9, 1, 0):
+ 	case IP_VERSION(9, 3, 0):
+ 		if (!enable)
+-			amdgpu_gfx_off_ctrl_immediate(adev, false);
++			amdgpu_gfx_off_ctrl(adev, false);
+ 
+ 		if (adev->pg_flags & AMD_PG_SUPPORT_RLC_SMU_HS) {
+ 			gfx_v9_0_enable_sck_slow_down_on_power_up(adev, true);
+@@ -5257,10 +5371,25 @@ static int gfx_v9_0_set_powergating_stat
+ 		gfx_v9_0_update_gfx_mg_power_gating(adev, enable);
+ 
+ 		if (enable)
+-			amdgpu_gfx_off_ctrl_immediate(adev, true);
++			amdgpu_gfx_off_ctrl(adev, true);
++
++		/* Invalidate GRBM cache after any power state change */
++		gfx_v9_0_grbm_state_invalidate(adev);
+ 		break;
+ 	case IP_VERSION(9, 2, 1):
+-		amdgpu_gfx_off_ctrl_immediate(adev, enable);
++		amdgpu_gfx_off_ctrl(adev, enable);
++		break;
++	case IP_VERSION(9, 0, 1):
++	case IP_VERSION(9, 4, 0):
++		if (adev->pg_flags & (AMD_PG_SUPPORT_GFX_PG |
++				      AMD_PG_SUPPORT_GFX_SMG |
++				      AMD_PG_SUPPORT_GFX_DMG)) {
++			gfx_v9_0_update_gfx_cg_power_gating(adev, enable);
++			gfx_v9_0_update_gfx_mg_power_gating(adev, enable);
++
++			/* Invalidate GRBM cache after any power state change */
++			gfx_v9_0_grbm_state_invalidate(adev);
++		}
+ 		break;
+ 	default:
+ 		break;
+@@ -5539,45 +5668,47 @@ static void gfx_v9_0_ring_emit_ib_comput
+ 	amdgpu_ring_write(ring, control);
+ }
+ 
+-static void gfx_v9_0_ring_emit_fence(struct amdgpu_ring *ring, u64 addr,
+-				     u64 seq, unsigned flags)
++static void gfx_v9_0_ring_emit_fence(struct amdgpu_ring *ring,
++				     u64 addr, u64 seq, unsigned flags)
+ {
+-	bool write64bit = flags & AMDGPU_FENCE_FLAG_64BIT;
+-	bool int_sel = flags & AMDGPU_FENCE_FLAG_INT;
+-	bool writeback = flags & AMDGPU_FENCE_FLAG_TC_WB_ONLY;
+-	bool exec = flags & AMDGPU_FENCE_FLAG_EXEC;
+-	uint32_t dw2 = 0;
++	const bool write64 = flags & AMDGPU_FENCE_FLAG_64BIT;
++	const bool int_sel = flags & AMDGPU_FENCE_FLAG_INT;
++	const bool wb_only = flags & AMDGPU_FENCE_FLAG_TC_WB_ONLY;
++	const bool exec_tag = flags & AMDGPU_FENCE_FLAG_EXEC;
++	u32 event_dw1 = 0;
++
++	/* ALIGN: Qword for 64-bit, Dword for 32-bit */
++	if (write64)
++		BUG_ON(addr & 0x7);
++	else
++		BUG_ON(addr & 0x3);
+ 
+-	/* RELEASE_MEM - flush caches, send int */
+ 	amdgpu_ring_write(ring, PACKET3(PACKET3_RELEASE_MEM, 6));
+ 
+-	if (writeback) {
+-		dw2 = EOP_TC_NC_ACTION_EN;
++	if (wb_only) {
++		event_dw1 |= EOP_TC_NC_ACTION_EN | EOP_TC_WB_ACTION_EN;
+ 	} else {
+-		dw2 = EOP_TCL1_ACTION_EN | EOP_TC_ACTION_EN |
+-				EOP_TC_MD_ACTION_EN;
++		event_dw1 |= EOP_TCL1_ACTION_EN | EOP_TC_ACTION_EN | EOP_TC_WB_ACTION_EN;
++		/* Leave TC_MD off for fence writeback to plain memory */
+ 	}
+-	dw2 |= EOP_TC_WB_ACTION_EN | EVENT_TYPE(CACHE_FLUSH_AND_INV_TS_EVENT) |
+-				EVENT_INDEX(5);
+-	if (exec)
+-		dw2 |= EOP_EXEC;
+ 
+-	amdgpu_ring_write(ring, dw2);
+-	amdgpu_ring_write(ring, DATA_SEL(write64bit ? 2 : 1) | INT_SEL(int_sel ? 2 : 0));
++	event_dw1 |= EVENT_TYPE(CACHE_FLUSH_AND_INV_TS_EVENT) |
++		     EVENT_INDEX(5);
+ 
+-	/*
+-	 * the address should be Qword aligned if 64bit write, Dword
+-	 * aligned if only send 32bit data low (discard data high)
+-	 */
+-	if (write64bit)
+-		BUG_ON(addr & 0x7);
+-	else
+-		BUG_ON(addr & 0x3);
++	if (exec_tag)
++		event_dw1 |= EOP_EXEC;
++
++	amdgpu_ring_write(ring, event_dw1);
++	amdgpu_ring_write(ring, DATA_SEL(write64 ? 2 : 1) |
++				INT_SEL(int_sel ? 2 : 0));
+ 	amdgpu_ring_write(ring, lower_32_bits(addr));
+ 	amdgpu_ring_write(ring, upper_32_bits(addr));
+ 	amdgpu_ring_write(ring, lower_32_bits(seq));
+ 	amdgpu_ring_write(ring, upper_32_bits(seq));
+ 	amdgpu_ring_write(ring, 0);
++
++	if (!wb_only)
++		dma_wmb();
+ }
+ 
+ static void gfx_v9_0_ring_emit_pipeline_sync(struct amdgpu_ring *ring)
 
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c	2025-05-29 11:14:09.000000000 +0200
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c	2025-08-12 11:33:50.388339649 +0200
 
 
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c	2025-04-10 14:44:49.000000000 +0200
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c	2025-10-04 08:44:25.287659188 +0200
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c	2025-11-08 08:44:25.287659188 +0200
 @@ -25,17 +25,28 @@
   *          Alex Deucher
   *          Jerome Glisse
@@ -1215,11 +1886,23 @@
  #include <drm/drm_syncobj.h>
  
  #include "amdgpu.h"
-@@ -51,36 +62,53 @@ amdgpu_gem_add_input_fence(struct drm_fi
+@@ -45,42 +56,67 @@
+ #include "amdgpu_xgmi.h"
+ #include "amdgpu_vm.h"
+ 
++/*
++ * amdgpu_gem_add_input_fence - Wait for input fences
++ *
++ * Optimized to use a larger stack buffer (128 entries) to cover most
++ * modern game submission batches without heap allocation.
++ */
+ static int
+ amdgpu_gem_add_input_fence(struct drm_file *filp,
+ 			   uint64_t syncobj_handles_array,
  			   uint32_t num_syncobj_handles)
  {
  	struct dma_fence *fence;
-+	uint32_t syncobj_handles_stack[64];
++	uint32_t syncobj_handles_stack[128];
  	uint32_t *syncobj_handles;
 -	int ret, i;
 +	int ret = 0;
@@ -1235,9 +1918,8 @@
 +	/* Guard against overflow and unreasonable counts */
 +	if (unlikely(num_syncobj_handles > 1024))
 +		return -EINVAL;
- 
--	for (i = 0; i < num_syncobj_handles; i++) {
-+	/* Use stack for up to 64 entries, heap for extreme counts */
++
++	/* Use stack for up to 128 entries, heap for extreme counts */
 +	if (likely(num_syncobj_handles <= ARRAY_SIZE(syncobj_handles_stack))) {
 +		if (unlikely(copy_from_user(syncobj_handles_stack,
 +				   u64_to_user_ptr(syncobj_handles_array),
@@ -1251,17 +1933,20 @@
 +			return PTR_ERR(syncobj_handles);
 +	}
  
+ 	for (i = 0; i < num_syncobj_handles; i++) {
++		uint32_t handle = syncobj_handles[i];
+ 
 -		if (!syncobj_handles[i]) {
-+	for (i = 0; i < num_syncobj_handles; i++) {
-+		if (unlikely(!syncobj_handles[i])) {
++		if (unlikely(!handle)) {
  			ret = -EINVAL;
 -			goto free_memdup;
 +			break;
  		}
  
- 		ret = drm_syncobj_find_fence(filp, syncobj_handles[i], 0, 0, &fence);
+-		ret = drm_syncobj_find_fence(filp, syncobj_handles[i], 0, 0, &fence);
 -		if (ret)
 -			goto free_memdup;
++		ret = drm_syncobj_find_fence(filp, handle, 0, 0, &fence);
 +		if (unlikely(ret))
 +			break;
  
@@ -1283,14 +1968,11 @@
  	return ret;
  }
  
-@@ -153,31 +181,318 @@ amdgpu_gem_update_bo_mapping(struct drm_
+@@ -153,31 +189,300 @@ amdgpu_gem_update_bo_mapping(struct drm_
  		drm_syncobj_add_point(syncobj, chain, last_update, point);
  }
  
 +/* ------------- Vega-aware adaptive fault prefetch (HBM2-tuned, TLB-aware) ------------- */
-+
-+/* Refresh cached reciprocal at most every ~4ms */
-+#define VRAM_RECIP_REFRESH_JIFFIES (HZ / 250)
 +
 +/* Absolute safety caps for all ASICs */
 +#define PREFETCH_ABS_MIN_PAGES 1u
@@ -1328,7 +2010,7 @@
 +/* PERF OPT: Consolidate per-cpu data to reduce access overhead. */
 +struct vega_recip_cache {
 +	u64 recip_q38;
-+	unsigned long stamp;
++	const void *adev_key;
 +};
 +static DEFINE_PER_CPU(struct vega_recip_cache, vega_recip_cache_pc);
 +
@@ -1353,9 +2035,7 @@
 +{
 +	struct ttm_resource_manager *mgr;
 +	u64 used_bytes, vram_b;
-+	u32 pct;
 +	struct vega_recip_cache *p_cache;
-+	unsigned long now_j;
 +
 +	if (unlikely(!adev))
 +		return 0;
@@ -1365,63 +2045,57 @@
 +		return 0;
 +
 +	used_bytes = ttm_resource_manager_usage(mgr);
-+	now_j = jiffies;
-+
-+	/* Per-CPU data is only accessed by the current CPU; no preemption safety needed */
 +	p_cache = this_cpu_ptr(&vega_recip_cache_pc);
 +
-+	if (unlikely(time_after(now_j, p_cache->stamp + VRAM_RECIP_REFRESH_JIFFIES) || p_cache->recip_q38 == 0)) {
-+		/* Recompute reciprocal: (100 << 38) / vram_size for Q38 fixed-point percent */
++	/* Only recompute reciprocal if the device changed (rare/never) */
++	if (unlikely(p_cache->adev_key != adev)) {
 +		vram_b = max_t(u64, adev->gmc.mc_vram_size, 1ULL);
++		/* (100 << 38) / vram_b */
 +		p_cache->recip_q38 = div64_u64((100ULL << 38), vram_b);
-+		p_cache->stamp = now_j;
++		p_cache->adev_key = adev;
 +	}
 +
 +	/* Compute percentage: (used * recip) >> 38, clamped to [0, 100] */
-+	pct = min_t(u32, mul_u64_u64_shr(used_bytes, p_cache->recip_q38, 38), 100U);
-+	return pct;
++	return min_t(u32, mul_u64_u64_shr(used_bytes, p_cache->recip_q38, 38), 100U);
 +}
 +
 +/* Compute optimal prefetch for Vega: TLB-aware, large-page hinting, HBM2-tuned,
 + * compute-specialized, and alignment-optimized.
++ *
++ * Optimized: Branchless logic where possible, __fls replacement for ilog2,
++ * and division-free VRAM percent.
 + */
 +static unsigned int amdgpu_vega_optimal_prefetch(struct amdgpu_device *adev,
 +						 struct amdgpu_bo *abo,
 +						 struct vm_fault *vmf,
 +						 unsigned int base_pages)
 +{
-+	u32 vram_pct, dom;
++	const u32 vram_pct = amdgpu_vram_usage_pct_fast(adev);
 +	u32 want, total_pages, cap;
 +	u64 bo_size;
 +	bool is_compute, is_vram, is_large_compute, is_small_compute;
 +	struct vega_pf_state *pcs;
 +	unsigned long now_j;
-+	unsigned long delta_addr = 0;
-+	u64 now_ns;
-+	u64 delta_ns = 0;
-+	int direction = 0;
++	u64 now_ns, delta_ns;
++	long diff;
 +
 +	if (unlikely(!adev || !abo || !vmf || base_pages == 0))
 +		return base_pages;
 +
 +	bo_size = abo->tbo.base.size;
-+	dom = abo->preferred_domains;
-+	is_vram = (dom & AMDGPU_GEM_DOMAIN_VRAM) != 0U;
-+	is_compute = (abo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0U;
++	is_vram = (abo->preferred_domains & AMDGPU_GEM_DOMAIN_VRAM) != 0;
++	is_compute = (abo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0;
 +
-+	vram_pct = amdgpu_vram_usage_pct_fast(adev);
-+
-+	if (is_vram) {
-+		cap = VEGA_TLB_AWARE_MAX_PAGES;
-+		if (vram_pct >= 90U)
-+			cap = 40U;
-+	} else {
++	/* Cap Logic: Vega TLB is the bottleneck */
++	if (is_vram)
++		cap = (vram_pct >= 90U) ? 40U : VEGA_TLB_AWARE_MAX_PAGES;
++	else
 +		cap = min(vega_pf_max_pages_gtt, 64U);
-+	}
++
 +	cap = max(cap, PREFETCH_ABS_MIN_PAGES);
 +
 +	total_pages = (u32)min_t(u64, bo_size >> PAGE_SHIFT, U32_MAX);
-+	if (total_pages == 0U)
++	if (unlikely(total_pages == 0U))
 +		total_pages = 1U;
 +
 +	is_large_compute = is_compute && (bo_size >= VEGA_COMPUTE_LARGE_BO_THRESHOLD);
@@ -1433,10 +2107,12 @@
 +		want = max(base_pages / 2U, PREFETCH_ABS_MIN_PAGES);
 +	} else {
 +		u32 scale_pct = 120U - (vram_pct * 4U) / 5U;
-+
 +		want = (base_pages * scale_pct) / 100U;
++
++		/* Use __fls (Find Last Set) as faster log2 approx */
 +		if (total_pages > 1U)
-+			want += ilog2(total_pages);
++			want += __fls(total_pages);
++
 +		if (is_compute && vram_pct < 90U)
 +			want += want >> 2;
 +	}
@@ -1449,29 +2125,18 @@
 +	    pcs->last_vma == (const void *)vmf->vma &&
 +	    time_before(now_j, pcs->last_j + vega_pf_streak_window_jiffies)) {
 +
-+		if (now_ns >= pcs->last_ns)
-+			delta_ns = now_ns - pcs->last_ns;
++		delta_ns = (now_ns >= pcs->last_ns) ? (now_ns - pcs->last_ns) : 0;
++		diff = (long)(vmf->address - pcs->last_addr);
 +
-+		if (vmf->address > pcs->last_addr) {
-+			direction = 1;
-+			delta_addr = vmf->address - pcs->last_addr;
-+		} else if (vmf->address < pcs->last_addr) {
-+			direction = 2;
-+			delta_addr = pcs->last_addr - vmf->address;
-+		} else {
-+			direction = 0;
-+			delta_addr = 0;
-+		}
++		if (diff != 0) {
++			/* Absolute delta in pages */
++			unsigned long delta_pages = (unsigned long)(diff > 0 ? diff : -diff) >> PAGE_SHIFT;
++			int direction = (diff > 0) ? 1 : 2;
 +
-+		if (direction == 1) {
-+			unsigned long delta_pages = delta_addr >> PAGE_SHIFT;
-+
-+			if (delta_pages > 0UL &&
-+			    delta_pages <= (unsigned long)(want + 4U)) {
++			if (direction == 1 && delta_pages > 0 && delta_pages <= (unsigned long)(want + 4U)) {
 +				u32 boost;
 +
-+				if (pcs->streak < 4U)
-+					pcs->streak++;
++				if (pcs->streak < 4U) pcs->streak++;
 +
 +				if (is_vram) {
 +					u32 new_seq = (u32)pcs->sequential_pages +
@@ -1496,10 +2161,11 @@
 +				    want < 512U && total_pages >= 512U)
 +					want = 512U;
 +
++				/* Compute Stride Detection */
 +				if (is_compute && delta_pages > 1UL && delta_pages <= 1024UL) {
 +					u32 stride = (u32)delta_pages;
-+
-+					if (is_power_of_2(stride)) {
++					/* Power of 2 check: (x & (x-1)) == 0 */
++					if ((stride & (stride - 1)) == 0) {
 +						if (pcs->last_stride == stride) {
 +							if (pcs->stride_repeat_count < 255U)
 +								pcs->stride_repeat_count++;
@@ -1523,15 +2189,16 @@
 +				pcs->last_stride = 0U;
 +				pcs->stride_repeat_count = 0U;
 +			}
++			pcs->direction = (u8)direction;
 +		} else {
 +			pcs->streak = 0U;
++			pcs->direction = 0U;
 +			pcs->sequential_pages = 0U;
 +			pcs->last_stride = 0U;
 +			pcs->stride_repeat_count = 0U;
 +		}
-+
-+		pcs->direction = (u8)direction;
 +	} else {
++		/* Reset State */
 +		pcs->streak = 0U;
 +		pcs->direction = 0U;
 +		pcs->sequential_pages = 0U;
@@ -1545,15 +2212,15 @@
 +	pcs->last_ns = now_ns;
 +	pcs->last_j = now_j;
 +
++	/* Pressure Damping */
 +	if (vram_pct >= 98U)
 +		want = min(want, base_pages);
 +	else if (vram_pct >= 95U)
 +		want = min(want, (want + base_pages) >> 1);
 +
-+	if (want >= 16U)
-+		want &= ~15U;
-+	else if (want >= 4U)
-+		want &= ~3U;
++	/* Alignment Optimization */
++	if (want >= 16U) want &= ~15U;
++	else if (want >= 4U) want &= ~3U;
 +
 +	want = clamp_t(u32, want, PREFETCH_ABS_MIN_PAGES, PREFETCH_ABS_MAX_PAGES);
 +	want = min(want, cap);
@@ -1605,7 +2272,71 @@
  	if (ret == VM_FAULT_RETRY && !(vmf->flags & FAULT_FLAG_RETRY_NOWAIT))
  		return ret;
  
-@@ -670,7 +985,7 @@ unsigned long amdgpu_gem_timeout(uint64_
+@@ -304,17 +609,7 @@ static int amdgpu_gem_object_open(struct
+ 
+ 	amdgpu_bo_unreserve(abo);
+ 
+-	/* Validate and add eviction fence to DMABuf imports with dynamic
+-	 * attachment in compute VMs. Re-validation will be done by
+-	 * amdgpu_vm_validate. Fences are on the reservation shared with the
+-	 * export, which is currently required to be validated and fenced
+-	 * already by amdgpu_amdkfd_gpuvm_restore_process_bos.
+-	 *
+-	 * Nested locking below for the case that a GEM object is opened in
+-	 * kfd_mem_export_dmabuf. Since the lock below is only taken for imports,
+-	 * but not for export, this is a different lock class that cannot lead to
+-	 * circular lock dependencies.
+-	 */
++	/* Validate and add eviction fence to DMABuf imports */
+ 	if (!vm->is_compute_context || !vm->process_info)
+ 		return 0;
+ 	if (!drm_gem_is_imported(obj) ||
+@@ -402,11 +697,6 @@ static int amdgpu_gem_object_mmap(struct
+ 	if (bo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS)
+ 		return -EPERM;
+ 
+-	/* Workaround for Thunk bug creating PROT_NONE,MAP_PRIVATE mappings
+-	 * for debugger access to invisible VRAM. Should have used MAP_SHARED
+-	 * instead. Clearing VM_MAYWRITE prevents the mapping from ever
+-	 * becoming writable and makes is_cow_mapping(vm_flags) false.
+-	 */
+ 	if (is_cow_mapping(vma->vm_flags) &&
+ 	    !(vma->vm_flags & VM_ACCESS_FLAGS))
+ 		vm_flags_clear(vma, VM_MAYWRITE);
+@@ -647,22 +937,26 @@ int amdgpu_gem_mmap_ioctl(struct drm_dev
+  * @timeout_ns: timeout in ns
+  *
+  * Calculate the timeout in jiffies from an absolute timeout in ns.
++ * Optimized to avoid ktime_sub overhead and use direct arithmetic.
+  */
+ unsigned long amdgpu_gem_timeout(uint64_t timeout_ns)
+ {
++	s64 remaining_ns;
+ 	unsigned long timeout_jiffies;
+-	ktime_t timeout;
+ 
+-	/* clamp timeout if it's to large */
++	/* clamp timeout if it's too large (or infinite/negative value) */
+ 	if (((int64_t)timeout_ns) < 0)
+ 		return MAX_SCHEDULE_TIMEOUT;
+ 
+-	timeout = ktime_sub(ns_to_ktime(timeout_ns), ktime_get());
+-	if (ktime_to_ns(timeout) < 0)
++	/* Direct calculation: timeout_ns (abs) - now */
++	remaining_ns = (s64)timeout_ns - ktime_get();
++	if (remaining_ns < 0)
+ 		return 0;
+ 
+-	timeout_jiffies = nsecs_to_jiffies(ktime_to_ns(timeout));
+-	/*  clamp timeout to avoid unsigned-> signed overflow */
++	/* Convert to jiffies using standard kernel helper */
++	timeout_jiffies = nsecs_to_jiffies(remaining_ns);
++
++	/* Clamp to avoid returning MAX_SCHEDULE_TIMEOUT (infinite) for finite timeouts */
+ 	if (timeout_jiffies > MAX_SCHEDULE_TIMEOUT)
+ 		return MAX_SCHEDULE_TIMEOUT - 1;
+ 
+@@ -670,7 +964,7 @@ unsigned long amdgpu_gem_timeout(uint64_
  }
  
  int amdgpu_gem_wait_idle_ioctl(struct drm_device *dev, void *data,
@@ -1614,7 +2345,7 @@
  {
  	union drm_amdgpu_gem_wait_idle *args = data;
  	struct drm_gem_object *gobj;
-@@ -681,22 +996,28 @@ int amdgpu_gem_wait_idle_ioctl(struct dr
+@@ -681,22 +975,28 @@ int amdgpu_gem_wait_idle_ioctl(struct dr
  	long ret;
  
  	gobj = drm_gem_object_lookup(filp, handle);
@@ -1653,26 +2384,27 @@
  
  	drm_gem_object_put(gobj);
  	return r;
-@@ -746,7 +1067,7 @@ out:
+@@ -745,31 +1045,17 @@ out:
+ 	return r;
  }
  
- /**
+-/**
 - * amdgpu_gem_va_update_vm -update the bo_va in its VM
-+ * amdgpu_gem_va_update_vm - update the bo_va in its VM
-  *
-  * @adev: amdgpu_device pointer
-  * @vm: vm to update
-@@ -757,7 +1078,8 @@ out:
-  * vital here, so they are not reported back to userspace.
-  *
-  * Returns resulting fence if freed BO(s) got cleared from the PT.
+- *
+- * @adev: amdgpu_device pointer
+- * @vm: vm to update
+- * @bo_va: bo_va to update
+- * @operation: map, unmap or clear
+- *
+- * Update the bo_va directly after setting its address. Errors are not
+- * vital here, so they are not reported back to userspace.
+- *
+- * Returns resulting fence if freed BO(s) got cleared from the PT.
 - * otherwise stub fence in case of error.
-+ * Returns NULL if no real fence was produced (common success case).
-+ * Returns a stub fence in case of error (for safety).
-  */
+- */
  static struct dma_fence *
  amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
-@@ -765,11 +1087,11 @@ amdgpu_gem_va_update_vm(struct amdgpu_de
+ 			struct amdgpu_vm *vm,
  			struct amdgpu_bo_va *bo_va,
  			uint32_t operation)
  {
@@ -1686,7 +2418,7 @@
  
  	r = amdgpu_vm_clear_freed(adev, vm, &fence);
  	if (r)
-@@ -784,11 +1106,18 @@ amdgpu_gem_va_update_vm(struct amdgpu_de
+@@ -784,11 +1070,18 @@ amdgpu_gem_va_update_vm(struct amdgpu_de
  
  	r = amdgpu_vm_update_pdes(adev, vm, false);
  
@@ -1706,7 +2438,37 @@
  }
  
  /**
-@@ -822,7 +1151,7 @@ uint64_t amdgpu_gem_va_map_flags(struct
+@@ -798,21 +1091,21 @@ error:
+  * @flags: GEM UAPI flags
+  *
+  * Returns the GEM UAPI flags mapped into hardware for the ASIC.
++ * Optimized with ternary operators for branchless CMOV generation.
+  */
+ uint64_t amdgpu_gem_va_map_flags(struct amdgpu_device *adev, uint32_t flags)
+ {
+ 	uint64_t pte_flag = 0;
+ 
+-	if (flags & AMDGPU_VM_PAGE_EXECUTABLE)
+-		pte_flag |= AMDGPU_PTE_EXECUTABLE;
+-	if (flags & AMDGPU_VM_PAGE_READABLE)
+-		pte_flag |= AMDGPU_PTE_READABLE;
+-	if (flags & AMDGPU_VM_PAGE_WRITEABLE)
+-		pte_flag |= AMDGPU_PTE_WRITEABLE;
++	/* Use ternary operators to allow compiler to generate CMOV/bitwise logic */
++	pte_flag |= (flags & AMDGPU_VM_PAGE_EXECUTABLE) ? AMDGPU_PTE_EXECUTABLE : 0;
++	pte_flag |= (flags & AMDGPU_VM_PAGE_READABLE) ? AMDGPU_PTE_READABLE : 0;
++	pte_flag |= (flags & AMDGPU_VM_PAGE_WRITEABLE) ? AMDGPU_PTE_WRITEABLE : 0;
++
+ 	if (flags & AMDGPU_VM_PAGE_PRT)
+ 		pte_flag |= AMDGPU_PTE_PRT_FLAG(adev);
+-	if (flags & AMDGPU_VM_PAGE_NOALLOC)
+-		pte_flag |= AMDGPU_PTE_NOALLOC;
++
++	pte_flag |= (flags & AMDGPU_VM_PAGE_NOALLOC) ? AMDGPU_PTE_NOALLOC : 0;
+ 
+ 	if (adev->gmc.gmc_funcs->map_mtype)
+ 		pte_flag |= amdgpu_gmc_map_mtype(adev,
+@@ -822,7 +1115,7 @@ uint64_t amdgpu_gem_va_map_flags(struct
  }
  
  int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
@@ -1715,7 +2477,7 @@
  {
  	const uint32_t valid_flags = AMDGPU_VM_DELAY_UPDATE |
  		AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE |
-@@ -845,39 +1174,30 @@ int amdgpu_gem_va_ioctl(struct drm_devic
+@@ -845,19 +1138,10 @@ int amdgpu_gem_va_ioctl(struct drm_devic
  	uint64_t vm_size;
  	int r = 0;
  
@@ -1732,18 +2494,15 @@
 -			"va_address 0x%llx is in VA hole 0x%llx-0x%llx\n",
 -			args->va_address, AMDGPU_GMC_HOLE_START,
 -			AMDGPU_GMC_HOLE_END);
-+	/* Address validation: combine reserved-bottom and hole checks to reduce branches.
-+	 * Keep masking and overflow check separate to maintain correct semantics.
-+	 */
++	/* Address validation: combine reserved-bottom and hole checks */
 +	if (unlikely(args->va_address < AMDGPU_VA_RESERVED_BOTTOM ||
 +		     (args->va_address >= AMDGPU_GMC_HOLE_START &&
 +		      args->va_address < AMDGPU_GMC_HOLE_END))) {
  		return -EINVAL;
  	}
  
- 	args->va_address &= AMDGPU_GMC_HOLE_MASK;
+@@ -865,16 +1149,11 @@ int amdgpu_gem_va_ioctl(struct drm_devic
  
-+	/* Now validate overflow with masked address */
  	vm_size = adev->vm_manager.max_pfn * AMDGPU_GPU_PAGE_SIZE;
  	vm_size -= AMDGPU_VA_RESERVED_TOP;
 -	if (args->va_address + args->map_size > vm_size) {
@@ -1757,16 +2516,11 @@
 -	if ((args->flags & ~valid_flags) && (args->flags & ~prt_flags)) {
 -		dev_dbg(dev->dev, "invalid flags combination 0x%08X\n",
 -			args->flags);
-+	/* Flag validation: accept if matches either valid_flags or prt_flags */
 +	if (unlikely((args->flags & ~valid_flags) && (args->flags & ~prt_flags))) {
  		return -EINVAL;
  	}
  
-+	/* Operation validation */
- 	switch (args->operation) {
- 	case AMDGPU_VA_OP_MAP:
- 	case AMDGPU_VA_OP_UNMAP:
-@@ -885,8 +1205,6 @@ int amdgpu_gem_va_ioctl(struct drm_devic
+@@ -885,8 +1164,6 @@ int amdgpu_gem_va_ioctl(struct drm_devic
  	case AMDGPU_VA_OP_REPLACE:
  		break;
  	default:
@@ -1775,7 +2529,7 @@
  		return -EINVAL;
  	}
  
-@@ -953,7 +1271,6 @@ int amdgpu_gem_va_ioctl(struct drm_devic
+@@ -953,7 +1230,6 @@ int amdgpu_gem_va_ioctl(struct drm_devic
  	case AMDGPU_VA_OP_UNMAP:
  		r = amdgpu_vm_bo_unmap(adev, bo_va, args->va_address);
  		break;
@@ -1783,7 +2537,7 @@
  	case AMDGPU_VA_OP_CLEAR:
  		r = amdgpu_vm_bo_clear_mappings(adev, &fpriv->vm,
  						args->va_address,
-@@ -968,19 +1285,22 @@ int amdgpu_gem_va_ioctl(struct drm_devic
+@@ -968,19 +1244,22 @@ int amdgpu_gem_va_ioctl(struct drm_devic
  	default:
  		break;
  	}
@@ -1814,7 +2568,7 @@
  	}
  
  error:
-@@ -1071,6 +1391,9 @@ static int amdgpu_gem_align_pitch(struct
+@@ -1071,6 +1350,9 @@ static int amdgpu_gem_align_pitch(struct
  				  int cpp,
  				  bool tiled)
  {
@@ -1824,7 +2578,7 @@
  	int aligned = width;
  	int pitch_mask = 0;
  
-@@ -1085,6 +1408,8 @@ static int amdgpu_gem_align_pitch(struct
+@@ -1085,6 +1367,8 @@ static int amdgpu_gem_align_pitch(struct
  	case 4:
  		pitch_mask = 63;
  		break;
@@ -1833,7 +2587,7 @@
  	}
  
  	aligned += pitch_mask;
-@@ -1104,6 +1429,7 @@ int amdgpu_mode_dumb_create(struct drm_f
+@@ -1104,6 +1388,7 @@ int amdgpu_mode_dumb_create(struct drm_f
  		    AMDGPU_GEM_CREATE_CPU_GTT_USWC |
  		    AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS;
  	u32 domain;
@@ -1841,7 +2595,7 @@
  	int r;
  
  	/*
-@@ -1114,13 +1440,21 @@ int amdgpu_mode_dumb_create(struct drm_f
+@@ -1114,13 +1399,21 @@ int amdgpu_mode_dumb_create(struct drm_f
  	if (adev->mman.buffer_funcs_enabled)
  		flags |= AMDGPU_GEM_CREATE_VRAM_CLEARED;
  
@@ -1868,7 +2622,7 @@
  				     ttm_bo_type_device, NULL, &gobj, fpriv->xcp_id + 1);
  	if (r)
  		return -ENOMEM;
-@@ -1132,6 +1466,7 @@ int amdgpu_mode_dumb_create(struct drm_f
+@@ -1132,6 +1425,7 @@ int amdgpu_mode_dumb_create(struct drm_f
  		return r;
  
  	args->handle = handle;
