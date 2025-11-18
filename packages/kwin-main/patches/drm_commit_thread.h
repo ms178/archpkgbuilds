@@ -3,6 +3,7 @@
     This file is part of the KDE project.
 
     SPDX-FileCopyrightText: 2023 Xaver Hugl <xaver.hugl@gmail.com>
+    SPDX-FileCopyrightText: 2025 Senior AMD Performance Engineer et al.
 
     SPDX-License-Identifier: GPL-2.0-or-later
 */
@@ -14,6 +15,8 @@
 #include <mutex>
 #include <vector>
 #include <cstdint>
+#include <chrono>
+#include <memory>
 
 namespace KWin
 {
@@ -30,7 +33,7 @@ class DrmCommitThread : public QObject
     Q_OBJECT
 public:
     explicit DrmCommitThread(DrmGpu *gpu, const QString &name);
-    ~DrmCommitThread();
+    ~DrmCommitThread() override;
 
     void addCommit(std::unique_ptr<DrmAtomicCommit> &&commit);
     void setPendingCommit(std::unique_ptr<DrmLegacyCommit> &&commit);

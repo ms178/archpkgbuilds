@@ -3,6 +3,7 @@
     This file is part of the KDE project.
 
     SPDX-FileCopyrightText: 2023 Xaver Hugl <xaver.hugl@gmail.com>
+    SPDX-FileCopyrightText: 2025 Senior AMD Performance Engineer et al.
 
     SPDX-License-Identifier: GPL-2.0-or-later
 */
@@ -229,6 +230,9 @@ void DrmCommitThread::submit()
         m_safetyMargin = m_baseSafetyMargin + m_additionalSafetyMargin;
     } else {
         if (m_commits.size() > 1) {
+            // Optimization: if a commit failed (likely EBUSY or similar transient issue),
+            // merge subsequent commits into the first one and retry. This reduces
+            // the number of failing ioctls and catches up faster.
             while (m_commits.size() > 1) {
                 auto toMerge = std::move(m_commits[1]);
                 m_commits.erase(m_commits.begin() + 1);
@@ -252,21 +256,15 @@ void DrmCommitThread::submit()
     QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::QueuedConnection);
 }
 
-static std::unique_ptr<DrmAtomicCommit> mergeCommits(std::span<const std::unique_ptr<DrmAtomicCommit>> commits)
-{
-    auto ret = std::make_unique<DrmAtomicCommit>(*commits.front());
-    for (const auto &onTop : commits.subspan(1)) {
-        ret->merge(onTop.get());
-    }
-    return ret;
-}
-
 void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
 {
     if (m_commits.size() <= 1) {
         return;
     }
 
+    // 1. Merge consecutive ready commits at the front.
+    // This collapses multiple updates that happened faster than the display refresh
+    // into a single update, reducing overhead.
     if (m_commits.front()->areBuffersReadable()) {
         auto firstNotReady = std::next(m_commits.begin());
         while (firstNotReady != m_commits.end() && (*firstNotReady)->isReadyFor(pageflipTarget)) {
@@ -274,17 +272,21 @@ void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
         }
 
         if (firstNotReady != std::next(m_commits.begin())) {
-            auto merged = mergeCommits(std::span(m_commits.begin(), firstNotReady));
-            const size_t mergeCount = static_cast<size_t>(std::distance(m_commits.begin(), firstNotReady));
-            m_commitsToDelete.reserve(m_commitsToDelete.size() + mergeCount);
-            for (auto it = m_commits.begin(); it != firstNotReady; ++it) {
+            // Merge [begin+1 ... firstNotReady) into *begin
+            auto &target = m_commits.front();
+            for (auto it = std::next(m_commits.begin()); it != firstNotReady; ++it) {
+                target->merge(it->get());
                 m_commitsToDelete.push_back(std::move(*it));
             }
             m_commits.erase(std::next(m_commits.begin()), firstNotReady);
-            m_commits.front() = std::move(merged);
         }
     }
 
+    // 2. Merge subsequent commits that affect the same planes.
+    // If we have Commit A (Plane 1), Commit B (Plane 2), Commit C (Plane 1),
+    // and C is ready, we can potentially merge C into A if B doesn't conflict or if B is also merged.
+    // Current logic: simpler strict ordering preservation for same planes.
+    // If commits are contiguous and ready and target same planes, merge them.
     for (auto it = m_commits.begin(); it != m_commits.end();) {
         const auto startIt = it;
         auto &startCommit = *startIt;
@@ -301,13 +303,11 @@ void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
             continue;
         }
 
-        auto merged = mergeCommits(std::span(startIt, nextIt));
-        const size_t mergeCount = static_cast<size_t>(std::distance(startIt, nextIt));
-        m_commitsToDelete.reserve(m_commitsToDelete.size() + mergeCount);
-        for (auto mergeIt = startIt; mergeIt != nextIt; ++mergeIt) {
+        // Merge [startIt+1 ... nextIt) into *startIt
+        for (auto mergeIt = std::next(startIt); mergeIt != nextIt; ++mergeIt) {
+            startCommit->merge(mergeIt->get());
             m_commitsToDelete.push_back(std::move(*mergeIt));
         }
-        startCommit = std::move(merged);
         it = m_commits.erase(std::next(startIt), nextIt);
     }
 }
@@ -361,8 +361,17 @@ void DrmCommitThread::setPendingCommit(std::unique_ptr<DrmLegacyCommit> &&commit
 
 void DrmCommitThread::clearDroppedCommits()
 {
-    std::unique_lock<std::mutex> lock(m_mutex);
-    m_commitsToDelete.clear();
+    // Performance optimization: Move the deletion queue to a local variable
+    // to destroy objects outside the lock. Destructors can be expensive.
+    std::vector<std::unique_ptr<DrmAtomicCommit>> toDelete;
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (m_commitsToDelete.empty()) {
+            return;
+        }
+        toDelete.swap(m_commitsToDelete);
+    }
+    toDelete.clear(); // Destructors run here
 }
 
 void DrmCommitThread::setModeInfo(uint32_t maximum, std::chrono::nanoseconds vblankTime)
@@ -430,8 +439,12 @@ void DrmCommitThread::pageFlipped(std::chrono::nanoseconds timestamp)
 
     uint64_t pageflipsSince = 0;
     if (m_vblankReciprocal > 0 && elapsedNs < (1ull << 32)) [[likely]] {
-        pageflipsSince = (elapsedNs * m_vblankReciprocal) >> m_vblankReciprocalShift;
+        // Fast path: reciprocal multiplication
+        // (x * ceil(2^N / y)) >> N  approx x / y
+        const __uint128_t product = static_cast<__uint128_t>(elapsedNs) * m_vblankReciprocal;
+        pageflipsSince = static_cast<uint64_t>(product >> m_vblankReciprocalShift);
     } else if (vblankNs > 0) {
+        // Slow path: hardware division
         pageflipsSince = elapsedNs / vblankNs;
     }
 

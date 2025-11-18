@@ -88,8 +88,8 @@ void DrmAtomicCommit::addBuffer(DrmPlane *plane, const std::shared_ptr<DrmFrameb
     m_frames[plane] = frame;
 
     if (plane->inFenceFd.isValid() && buffer) [[likely]] {
-        if (plane->gpu()->isNVidia()) [[unlikely]] {
-        } else {
+        // NVIDIA driver workaround: IN_FENCE_FD causes atomic commit failures on some versions.
+        if (!plane->gpu()->isNVidia()) [[likely]] {
             const int fenceFd = buffer->syncFd().get();
             if (fenceFd >= 0) [[likely]] {
                 addProperty(plane->inFenceFd, static_cast<uint64_t>(fenceFd));
@@ -150,6 +150,8 @@ bool DrmAtomicCommit::commitModeset()
 
 bool DrmAtomicCommit::doCommit(uint32_t flags)
 {
+    // Optimized using QVarLengthArray to avoid heap allocations on the hot path.
+    // Typical commits have < 16 objects and < 256 properties.
     constexpr size_t inlineObjectCapacity = 16;
     constexpr size_t inlinePropertyCapacity = 256;
 
@@ -158,15 +160,10 @@ bool DrmAtomicCommit::doCommit(uint32_t flags)
     QVarLengthArray<uint32_t, inlinePropertyCapacity> propertyIds;
     QVarLengthArray<uint64_t, inlinePropertyCapacity> values;
 
+    // Reserve exact size to prevent reallocations during iteration
     const auto objectCount = std::min(m_properties.size(), static_cast<size_t>(INT_MAX));
     objects.reserve(static_cast<int>(objectCount));
     propertyCounts.reserve(static_cast<int>(objectCount));
-
-#if defined(__x86_64__) || defined(_M_X64)
-    if (!m_properties.empty()) {
-        __builtin_prefetch(&(*m_properties.begin()), 0, 3);
-    }
-#endif
 
     for (const auto &[object, properties] : m_properties) {
         objects.push_back(object);
@@ -217,8 +214,10 @@ void DrmAtomicCommit::pageFlipped(std::chrono::nanoseconds timestamp)
             frame->presented(timestamp, m_mode);
         }
     } else if (frameCount > 1) {
+        // Use stack allocation for typical frame counts
         QVarLengthArray<OutputFrame *, 8> frames;
         frames.reserve(static_cast<int>(std::min(frameCount, static_cast<size_t>(8))));
+
         for (const auto &[plane, frame] : m_frames) {
             if (frame) {
                 frames.append(frame.get());
