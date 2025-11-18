@@ -10,7 +10,7 @@
 #include <scx/bpf_arena_common.bpf.h>
 
 /*
- * common macros
+ * Common macros
  */
 #define U64_MAX		((u64)~0ULL)
 #define S64_MAX		((s64)(U64_MAX >> 1))
@@ -28,7 +28,7 @@
 #define dsq_type(dsq_id)		(((dsq_id) & LAVD_DSQ_TYPE_MASK) >> LAVD_DSQ_TYPE_SHFT)
 
 /*
- * common constants
+ * Common constants
  */
 enum consts_internal {
 	CLOCK_BOOTTIME			= 7,
@@ -88,6 +88,7 @@ enum consts_flags {
 	LAVD_FLAG_ON_LITTLE		= (0x1 << 7),
 	LAVD_FLAG_SLICE_BOOST		= (0x1 << 8),
 	LAVD_FLAG_IDLE_CPU_PICKED	= (0x1 << 9),
+    LAVD_FLAG_PINNED_COUNTED    = (0x1 << 10), /* Logic fix: Track accounting in flags */
 };
 
 /* Compile-time layout validation */
@@ -95,49 +96,50 @@ _Static_assert(LAVD_CPU_ID_MAX % 64 == 0, "cpumask must align to u64 array");
 
 /*
  * Compute domain context
- *
- * CACHE LAYOUT (Raptor Lake optimized for 64-byte lines):
- * Bytes 0-63:   HOT - Load balancing fields (accessed during migration)
- * Bytes 64-127: WARM - Topology fields (neighbor iteration)
- * Bytes 128+:   COLD - CPU membership bitmap (infrequent access)
+ * Optimized for Raptor Lake cache lines (64 bytes).
  */
 struct cpdom_ctx {
-	/* CACHE LINE 0 (bytes 0-63): HOT - Load balancing */
-	u32	sc_load;			/* [0] scaled load (DSQ len × util) */
-	u32	nr_queued_task;			/* [4] queued task count */
-	u32	cur_util_sum;			/* [8] current interval util sum */
-	u32	avg_util_sum;			/* [12] average util sum */
-	u32	cap_sum_active_cpus;		/* [16] active CPU capacity sum */
-	u32	dsq_consume_lat;		/* [20] DSQ contention metric (ns) */
-	u16	nr_active_cpus;			/* [24] active CPU count */
-	u16	nr_cpus;			/* [26] total CPUs in domain */
-	u16	nr_acpus_temp;			/* [28] temp for active CPU recomputation */
-	u8	is_big;				/* [30] big core domain? */
-	u8	is_valid;			/* [31] valid domain? */
-	u8	is_stealer;			/* [32] should steal from others? */
-	u8	is_stealee;			/* [33] can be stolen from? */
-	u8	numa_id;			/* [34] NUMA node ID */
-	u8	llc_id;				/* [35] LLC domain ID */
-	u32	cap_sum_temp;			/* [36] temp for capacity sum */
-	u32	__pad0;				/* [40] align to 8 bytes */
-	u32	__pad1;				/* [44] align to 8 bytes */
-	u64	id;				/* [48] domain ID */
-	u64	alt_id;				/* [56] alternative domain (P↔E) */
+	/* CACHE LINE 0 (0-63): Hot Load Balancing Fields */
+	u32	sc_load;
+	u32	nr_queued_task;
+	u32	cur_util_sum;
+	u32	avg_util_sum;
+	u32	cap_sum_active_cpus;
+	u32	dsq_consume_lat;
+	u16	nr_active_cpus;
+	u16	nr_cpus;
+	u16	nr_acpus_temp;
+	u8	is_big;
+	u8	is_valid;
+	u8	is_stealer;
+	u8	is_stealee;
+	u8	numa_id;
+	u8	llc_id;
+	u32	cap_sum_temp;
+	u32	__pad0;
+	u32	__pad1;
+	u64	id;
+	u64	alt_id;
 
-	/* CACHE LINE 1 (bytes 64-127): WARM - Topology */
-	u8	nr_neighbors[LAVD_CPDOM_MAX_DIST]; /* [64] neighbor counts (3 bytes for DIST=3) */
-	u8	__pad2[5];			     /* [67] align to u64 */
-	u64	neighbor_bits[LAVD_CPDOM_MAX_DIST]; /* [72] neighbor bitmasks (24 bytes) */
-	u8	__pad3[32];			     /* [96] pad to 128 bytes */
+	/* CACHE LINE 1 (64-127): Topology & Neighbors */
+	u8	nr_neighbors[LAVD_CPDOM_MAX_DIST];
+	u8	__pad2[5];
+	u8	neighbor_ids[LAVD_CPDOM_MAX_DIST * LAVD_CPDOM_MAX_NR];
 
-	/* CACHE LINE 2+ (bytes 128+): COLD - CPU membership bitmap */
-	u64	__cpumask[LAVD_CPU_ID_MAX/64]	     /* [128] */ __attribute__((aligned(64)));
+	/* CACHE LINE 2+ (128+): Cold CPU Mask */
+	u64	__cpumask[LAVD_CPU_ID_MAX/64] __attribute__((aligned(64)));
 } __attribute__((aligned(CACHELINE_SIZE)));
+
+#define get_neighbor_id(cpdomc, d, i) ((cpdomc)->neighbor_ids[((d) * LAVD_CPDOM_MAX_NR) + (i)])
 
 extern struct cpdom_ctx		cpdom_ctxs[LAVD_CPDOM_MAX_NR];
 extern struct bpf_cpumask	cpdom_cpumask[LAVD_CPDOM_MAX_NR];
 extern int			nr_cpdoms;
 
+/*
+ * Task context typedef.
+ * We rely on intf.h for the struct definition to avoid redefinition errors.
+ */
 typedef struct task_ctx __arena task_ctx;
 
 u64 get_task_ctx_internal(struct task_struct *p);
@@ -149,79 +151,67 @@ struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p);
 
 /*
  * CPU context
- *
- * CACHE LAYOUT (Raptor Lake optimized for i7-14700KF, profiled on gaming + compilation):
- * Bytes 0-63:   NUCLEAR HOT - Preemption check fields (every dispatch/tick)
- * Bytes 64-127: HOT - Runtime accounting (every tick, 250 Hz)
- * Bytes 128-191: WARM - Metrics (aggregated per interval)
- * Bytes 192-255: COLD - Statistics (monitoring only, <5% access rate)
- * Bytes 256+:   COLD - Temporary cpumasks (rare, during migrations)
- *
- * ACCESS PATTERN (measured via perf probe on Cyberpunk 2077 + make -j32):
- * - running_clk, est_stopping_clk, flags: 100% hit rate (preemption check)
- * - lat_cri, nr_pinned_tasks: 95% hit rate (slice calculation)
- * - tot_svc_time, cur_util: 80% hit rate (tick accounting)
- * - Statistics (nr_preempt, etc.): <5% hit rate (monitoring)
+ * Optimized layout: Nuclear hot fields in first cache line.
  */
 struct cpu_ctx {
-	/* CACHE LINE 0 (bytes 0-63): NUCLEAR HOT - Preemption */
-	volatile u64	running_clk;		/* [0] when current task started running */
-	volatile u64	est_stopping_clk;	/* [8] estimated stop time (vdeadline) */
-	volatile u64	flags;			/* [16] cached task flags (LAVD_FLAG_*) */
-	volatile u32	nr_pinned_tasks;	/* [24] pinned tasks waiting on this CPU */
-	volatile u16	lat_cri;		/* [28] latency criticality of current task */
-	u16		cpu_id;			/* [30] CPU identifier */
-	u16		capacity;		/* [32] CPU capacity (1024-based, freq-invariant) */
-	u8		is_online;		/* [34] is CPU online? */
-	u8		big_core;		/* [35] P-core=1, E-core=0 */
-	u8		turbo_core;		/* [36] turbo boost capable? */
-	u8		llc_id;			/* [37] LLC domain ID */
-	u8		cpdom_id;		/* [38] compute domain ID */
-	u8		cpdom_alt_id;		/* [39] alternative domain (P↔E migration target) */
-	u8		cpdom_poll_pos;		/* [40] DSQ polling position (round-robin index) */
-	u8		__pad0[3];		/* [41] align s32 */
-	volatile s32	futex_op;		/* [44] futex operation (V1 protocol) */
-	u8		__pad1[16];		/* [48] complete cache line to 64 bytes */
+	/* CACHE LINE 0 (0-63): NUCLEAR HOT - Preemption & State */
+	volatile u64	running_clk;
+	volatile u64	est_stopping_clk;
+	volatile u64	flags;
+	volatile u32	nr_pinned_tasks;
+	volatile u16	lat_cri;
+	u16		cpu_id;
+	u16		capacity;
+	u8		is_online;
+	u8		big_core;
+	u8		turbo_core;
+	u8		llc_id;
+	u8		cpdom_id;
+	u8		cpdom_alt_id;
+	u8		cpdom_poll_pos;
+	u8		__pad0[3];
+	volatile s32	futex_op;
+	u8		__pad1[16];
 
-	/* CACHE LINE 1 (bytes 64-127): HOT - Accounting */
-	volatile u64	idle_start_clk;		/* [64] when CPU became idle (0 if busy) */
-	volatile u64	tot_svc_time;		/* [72] total service time (weighted by nice) */
-	volatile u64	tot_sc_time;		/* [80] total scaled time (capacity-invariant) */
-	volatile u64	cpu_release_clk;	/* [88] when preempted by higher sched class */
-	volatile u64	idle_total;		/* [96] cumulative idle time */
-	volatile u32	cur_util;		/* [104] current interval utilization (0-1024) */
-	volatile u32	avg_util;		/* [108] exponential moving average util */
-	volatile u32	cur_sc_util;		/* [112] current scaled util (capacity-invariant) */
-	volatile u32	avg_sc_util;		/* [116] average scaled util */
-	u32		cpuperf_cur;		/* [120] current CPU performance target (cpufreq) */
-	u32		__pad2;			/* [124] align to 128 bytes */
+	/* CACHE LINE 1 (64-127): HOT - Accounting */
+	volatile u64	idle_start_clk;
+	volatile u64	tot_svc_time;
+	volatile u64	tot_sc_time;
+	volatile u64	cpu_release_clk;
+	volatile u64	idle_total;
+	volatile u32	cur_util;
+	volatile u32	avg_util;
+	volatile u32	cur_sc_util;
+	volatile u32	avg_sc_util;
+	u32		cpuperf_cur;
+	u32		__pad2;
 
-	/* CACHE LINE 2 (bytes 128-191): WARM - Metrics */
-	volatile u64	sum_lat_cri;		/* [128] sum of latency criticality (for averaging) */
-	volatile u64	sum_perf_cri;		/* [136] sum of performance criticality */
-	volatile u32	max_lat_cri;		/* [144] maximum latency criticality in interval */
-	volatile u32	nr_sched;		/* [148] number of context switches */
-	volatile u32	min_perf_cri;		/* [152] minimum performance criticality */
-	volatile u32	max_perf_cri;		/* [156] maximum performance criticality */
-	u64		online_clk;		/* [160] timestamp when CPU came online */
-	u64		offline_clk;		/* [168] timestamp when CPU went offline */
-	u8		__pad3[16];		/* [176] pad to 192 bytes */
+	/* CACHE LINE 2 (128-191): WARM - Metrics */
+	volatile u64	sum_lat_cri;
+	volatile u64	sum_perf_cri;
+	volatile u32	max_lat_cri;
+	volatile u32	nr_sched;
+	volatile u32	min_perf_cri;
+	volatile u32	max_perf_cri;
+	u64		online_clk;
+	u64		offline_clk;
+	u8		__pad3[16];
 
-	/* CACHE LINE 3 (bytes 192-255): COLD - Statistics (64-byte aligned to prevent false sharing) */
-	volatile u32	nr_preempt		/* [192] preemption count */ __attribute__((aligned(64)));
-	volatile u32	nr_x_migration;		/* [196] cross-domain migration count */
-	volatile u32	nr_perf_cri;		/* [200] performance-critical task count */
-	volatile u32	nr_lat_cri;		/* [204] latency-critical task count */
-	u8		__pad4[48];		/* [208] pad to 256 bytes */
+	/* CACHE LINE 3 (192-255): COLD - Statistics */
+	volatile u32	nr_preempt	__attribute__((aligned(64)));
+	volatile u32	nr_x_migration;
+	volatile u32	nr_perf_cri;
+	volatile u32	nr_lat_cri;
+	u8		__pad4[48];
 
-	/* CACHE LINE 4+ (bytes 256+): COLD - Temporary cpumasks (64-byte aligned) */
-	struct bpf_cpumask __kptr *tmp_a_mask	/* [256] active set */ __attribute__((aligned(64)));
-	struct bpf_cpumask __kptr *tmp_o_mask;	/* overflow set */
-	struct bpf_cpumask __kptr *tmp_l_mask;	/* online cpumask */
-	struct bpf_cpumask __kptr *tmp_i_mask;	/* idle cpumask */
-	struct bpf_cpumask __kptr *tmp_t_mask;	/* temporary 1 */
-	struct bpf_cpumask __kptr *tmp_t2_mask;	/* temporary 2 */
-	struct bpf_cpumask __kptr *tmp_t3_mask;	/* temporary 3 */
+	/* CACHE LINE 4+ (256+): COLD - Temporary cpumasks */
+	struct bpf_cpumask __kptr *tmp_a_mask	__attribute__((aligned(64)));
+	struct bpf_cpumask __kptr *tmp_o_mask;
+	struct bpf_cpumask __kptr *tmp_l_mask;
+	struct bpf_cpumask __kptr *tmp_i_mask;
+	struct bpf_cpumask __kptr *tmp_t_mask;
+	struct bpf_cpumask __kptr *tmp_t2_mask;
+	struct bpf_cpumask __kptr *tmp_t3_mask;
 } __attribute__((aligned(CACHELINE_SIZE)));
 
 extern const volatile u64	nr_llcs;
@@ -251,7 +241,7 @@ extern const volatile u8	verbose;
 					##__VA_ARGS__);			\
 })
 
-/* Branch prediction hints (Raptor Lake mispredict cost: ~20 cycles) */
+/* Branch prediction hints */
 #ifndef likely
 #define likely(x)	__builtin_expect(!!(x), 1)
 #endif
@@ -260,7 +250,7 @@ extern const volatile u8	verbose;
 #define unlikely(x)	__builtin_expect(!!(x), 0)
 #endif
 
-/* Arithmetic helpers - prevent double evaluation, optimized for Raptor Lake */
+/* Arithmetic helpers */
 #ifndef min
 #define min(X, Y) ({				\
 	__auto_type __x = (X);			\
@@ -289,7 +279,7 @@ extern const volatile u8	verbose;
 u64 calc_avg(u64 old_val, u64 new_val);
 u64 calc_asym_avg(u64 old_val, u64 new_val);
 
-/* Atomic helpers for 32-bit fields (prevent torn reads on concurrent RMW) */
+/* Atomic helpers using C11 builtins for better codegen */
 static __always_inline u32 atomic_read_u32(const volatile u32 *ptr)
 {
 	return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
@@ -305,15 +295,20 @@ static __always_inline void atomic_inc_u32(volatile u32 *ptr)
 	__atomic_add_fetch(ptr, 1U, __ATOMIC_RELAXED);
 }
 
+static __always_inline void atomic_dec_u32(volatile u32 *ptr)
+{
+	__atomic_sub_fetch(ptr, 1U, __ATOMIC_RELAXED);
+}
+
 static __always_inline void atomic_add_u32(volatile u32 *ptr, u32 val)
 {
 	__atomic_add_fetch(ptr, val, __ATOMIC_RELAXED);
 }
 
-/* Drop-in replacements for critical accesses (expand in .bpf.c files) */
-#define READ_NR_PINNED(cpuc)	atomic_read_u32(&(cpuc)->nr_pinned_tasks)
-#define INC_NR_SCHED(cpuc)	atomic_inc_u32(&(cpuc)->nr_sched)
-#define INC_STAT(cpuc, field)	atomic_inc_u32(&(cpuc)->field)
+static __always_inline void atomic_sub_u32(volatile u32 *ptr, u32 val)
+{
+	__atomic_sub_fetch(ptr, val, __ATOMIC_RELAXED);
+}
 
 /* Bitmask helpers */
 static __always_inline int cpumask_next_set_bit(u64 *cpumask)
@@ -336,7 +331,7 @@ extern volatile u64		performance_mode_ns;
 extern volatile u64		balanced_mode_ns;
 extern volatile u64		powersave_mode_ns;
 
-/* Helpers from util.bpf.c for querying CPU/task state */
+/* Helpers from util.bpf.c */
 extern const volatile bool	per_cpu_dsq;
 extern const volatile u64	pinned_slice_ns;
 

@@ -643,11 +643,11 @@ impl<'a> Scheduler<'a> {
 
                 cpdom.nr_neighbors[dist_idx] = nr_neighbors;
 
-                let mut neighbor_bits = 0u64;
-                for &neighbor_id in neighbor_list.iter() {
-                    neighbor_bits |= 1u64 << neighbor_id;
+                // Flatten neighbor IDs into the array
+                for (i, &neighbor_id) in neighbor_list.iter().enumerate() {
+                    let idx = (dist_idx * LAVD_CPDOM_MAX_NR as usize) + i;
+                    cpdom.neighbor_ids[idx] = neighbor_id as u8;
                 }
-                cpdom.neighbor_bits[dist_idx] = neighbor_bits;
             }
         }
     }
