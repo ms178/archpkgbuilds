@@ -3,9 +3,6 @@
 // Copyright (c) 2024 Valve Corporation.
 // Author: Changwoo Min <changwoo@igalia.com>
 
-// This software may be used and distributed according to the terms of the
-// GNU General Public License version 2.
-
 mod bpf_skel;
 pub use bpf_skel::*;
 pub mod bpf_intf;
@@ -47,6 +44,7 @@ use scx_stats::prelude::*;
 use scx_utils::autopower::{fetch_power_profile, PowerProfile};
 use scx_utils::build_id;
 use scx_utils::compat;
+use scx_utils::ksym_exists;
 use scx_utils::libbpf_clap_opts::LibbpfOpts;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
@@ -71,179 +69,95 @@ const SCHEDULER_NAME: &str = "scx_lavd";
 const STATS_TIMEOUT: Duration = Duration::from_secs(1);
 const RINGBUF_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// scx_lavd: Latency-criticality Aware Virtual Deadline (LAVD) scheduler
-///
-/// The rust part is minimal. It processes command line options and logs out
-/// scheduling statistics. The BPF part makes all the scheduling decisions.
-/// See the more detailed overview of the LAVD design at main.bpf.c.
 #[derive(Debug, Parser)]
 struct Opts {
-    /// Deprecated, noop, use RUST_LOG or --log-level instead.
     #[clap(short = 'v', long, action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Automatically decide the scheduler's power mode (performance vs.
-    /// powersave vs. balanced), CPU preference order, etc, based on system
-    /// load. The options affecting the power mode and the use of core compaction
-    /// (--autopower, --performance, --powersave, --balanced,
-    /// --no-core-compaction) cannot be used with this option. When no option
-    /// is specified, this is a default mode.
     #[clap(long = "autopilot", action = clap::ArgAction::SetTrue)]
     autopilot: bool,
 
-    /// Automatically decide the scheduler's power mode (performance vs.
-    /// powersave vs. balanced) based on the system's active power profile.
-    /// The scheduler's power mode decides the CPU preference order and the use
-    /// of core compaction, so the options affecting these (--autopilot,
-    /// --performance, --powersave, --balanced, --no-core-compaction) cannot
-    /// be used with this option.
     #[clap(long = "autopower", action = clap::ArgAction::SetTrue)]
     autopower: bool,
 
-    /// Run the scheduler in performance mode to get maximum performance.
-    /// This option cannot be used with other conflicting options (--autopilot,
-    /// --autopower, --balanced, --powersave, --no-core-compaction)
-    /// affecting the use of core compaction.
     #[clap(long = "performance", action = clap::ArgAction::SetTrue)]
     performance: bool,
 
-    /// Run the scheduler in powersave mode to minimize power consumption.
-    /// This option cannot be used with other conflicting options (--autopilot,
-    /// --autopower, --performance, --balanced, --no-core-compaction)
-    /// affecting the use of core compaction.
     #[clap(long = "powersave", action = clap::ArgAction::SetTrue)]
     powersave: bool,
 
-    /// Run the scheduler in balanced mode aiming for sweetspot between power
-    /// and performance. This option cannot be used with other conflicting
-    /// options (--autopilot, --autopower, --performance, --balanced,
-    /// --no-core-compaction) affecting the use of core compaction.
     #[clap(long = "balanced", action = clap::ArgAction::SetTrue)]
     balanced: bool,
 
-    /// Maximum scheduling slice duration in microseconds.
     #[clap(long = "slice-max-us", default_value = "5000")]
     slice_max_us: u64,
 
-    /// Minimum scheduling slice duration in microseconds.
     #[clap(long = "slice-min-us", default_value = "500")]
     slice_min_us: u64,
 
-    /// Migration delta threshold percentage (0-100). When set to a non-zero value,
-    /// uses average utilization for threshold calculation instead of current
-    /// utilization, and the threshold is calculated as: avg_load * (mig-delta-pct / 100).
-    /// Additionally, disables force task stealing in the consume path, relying only
-    /// on the is_stealer/is_stealee thresholds for more predictable load balancing.
-    /// Default is 0 (disabled, uses dynamic threshold based on load with both
-    /// probabilistic and force task stealing enabled). This is an experimental feature.
     #[clap(long = "mig-delta-pct", default_value = "0", value_parser=Opts::mig_delta_pct_range)]
     mig_delta_pct: u8,
 
-    /// Slice duration in microseconds to use for all tasks when pinned tasks
-    /// are running on a CPU. Must be between slice-min-us and slice-max-us.
-    /// When this option is enabled, pinned tasks are always enqueued to per-CPU DSQs
-    /// and the dispatch logic compares vtimes across all DSQs to select the lowest
-    /// vtime task. This helps improve responsiveness for pinned tasks.
     #[clap(long = "pinned-slice-us")]
     pinned_slice_us: Option<u64>,
 
-    /// Limit the ratio of preemption to the roughly top P% of latency-critical
-    /// tasks. When N is given as an argument, P is 0.5^N * 100. The default
-    /// value is 6, which limits the preemption for the top 1.56% of
-    /// latency-critical tasks.
     #[clap(long = "preempt-shift", default_value = "6", value_parser=Opts::preempt_shift_range)]
     preempt_shift: u8,
 
-    /// List of CPUs in preferred order (e.g., "0-3,7,6,5,4"). The scheduler
-    /// uses the CPU preference mode only when the core compaction is enabled
-    /// (i.e., balanced or powersave mode is specified as an option or chosen
-    /// in the autopilot or autopower mode). When "--cpu-pref-order" is given,
-    /// it implies "--no-use-em".
     #[clap(long = "cpu-pref-order", default_value = "")]
     cpu_pref_order: String,
 
-    /// Do not use the energy model in making CPU preference order decisions.
     #[clap(long = "no-use-em", action = clap::ArgAction::SetTrue)]
     no_use_em: bool,
 
-    /// Do not boost futex holders.
     #[clap(long = "no-futex-boost", action = clap::ArgAction::SetTrue)]
     no_futex_boost: bool,
 
-    /// Disable preemption.
     #[clap(long = "no-preemption", action = clap::ArgAction::SetTrue)]
     no_preemption: bool,
 
-    /// Disable an optimization for synchronous wake-up.
     #[clap(long = "no-wake-sync", action = clap::ArgAction::SetTrue)]
     no_wake_sync: bool,
 
-    /// Disable dynamic slice boost for long-running tasks.
     #[clap(long = "no-slice-boost", action = clap::ArgAction::SetTrue)]
     no_slice_boost: bool,
 
-    /// Enables DSQs per CPU, this enables task queuing and dispatching
-    /// from CPU specific DSQs. This generally increases L1/L2 cache
-    /// locality for tasks and lowers lock contention compared to shared DSQs,
-    /// but at the cost of higher load balancing complexity. This is a
-    /// highly experimental feature.
     #[clap(long = "per-cpu-dsq", action = clap::ArgAction::SetTrue)]
     per_cpu_dsq: bool,
 
-    /// Enable CPU bandwidth control using cpu.max in cgroup v2.
-    /// This is a highly experimental feature.
     #[clap(long = "enable-cpu-bw", action = clap::ArgAction::SetTrue)]
     enable_cpu_bw: bool,
 
-    /// Disable core compaction so the scheduler uses all the online CPUs.
-    /// The core compaction attempts to minimize the number of actively used
-    /// CPUs for unaffinitized tasks, respecting the CPU preference order.
-    /// Normally, the core compaction is enabled by the power mode (i.e.,
-    /// balanced or powersave mode is specified as an option or chosen in
-    /// the autopilot or autopower mode). This option cannot be used with the
-    /// other options that control the core compaction (--autopilot,
-    /// --autopower, --performance, --balanced, --powersave).
     #[clap(long = "no-core-compaction", action = clap::ArgAction::SetTrue)]
     no_core_compaction: bool,
 
-    /// Disable controlling the CPU frequency.
     #[clap(long = "no-freq-scaling", action = clap::ArgAction::SetTrue)]
     no_freq_scaling: bool,
 
-    /// Enable stats monitoring with the specified interval.
     #[clap(long)]
     stats: Option<f64>,
 
-    /// Run in stats monitoring mode with the specified interval. Scheduler is not launched.
     #[clap(long)]
     monitor: Option<f64>,
 
-    /// Run in monitoring mode. Show the specified number of scheduling
-    /// samples every second.
     #[clap(long)]
     monitor_sched_samples: Option<u64>,
 
-    /// Specify the logging level. Accepts rust's envfilter syntax for modular
-    /// logging: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#example-syntax. Examples: ["info", "warn,tokio=info"]
     #[clap(long, default_value = "info")]
     log_level: String,
 
-    /// Print scheduler version and exit.
     #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
     version: bool,
 
-    /// Optional run ID for tracking scheduler instances.
     #[clap(long)]
     run_id: Option<u64>,
 
-    /// Show descriptions for statistics.
     #[clap(long)]
     help_stats: bool,
 
     #[clap(flatten, next_help_heading = "Libbpf Options")]
     pub libbpf: LibbpfOpts,
 
-    /// Topology configuration options
     #[clap(flatten)]
     topology: Option<TopologyArgs>,
 }
@@ -643,7 +557,6 @@ impl<'a> Scheduler<'a> {
 
                 cpdom.nr_neighbors[dist_idx] = nr_neighbors;
 
-                // Flatten neighbor IDs into the array
                 for (i, &neighbor_id) in neighbor_list.iter().enumerate() {
                     let idx = (dist_idx * LAVD_CPDOM_MAX_NR as usize) + i;
                     cpdom.neighbor_ids[idx] = neighbor_id as u8;
@@ -685,6 +598,11 @@ impl<'a> Scheduler<'a> {
         rodata.per_cpu_dsq = opts.per_cpu_dsq;
         rodata.enable_cpu_bw = opts.enable_cpu_bw;
 
+        if !ksym_exists("scx_group_set_bandwidth").unwrap() {
+            skel.struct_ops.lavd_ops_mut().cgroup_set_bandwidth = std::ptr::null_mut();
+            warn!("Kernel does not support ops.cgroup_set_bandwidth(), so disable it.");
+        }
+
         skel.struct_ops.lavd_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
             | *compat::SCX_OPS_ENQ_LAST
             | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
@@ -707,7 +625,6 @@ impl<'a> Scheduler<'a> {
         }
 
         let tx = &mt.taskc_x;
-        let tc = &mt.taskc;
         let mseq = Self::get_msg_seq_id();
 
         let tx_comm = unsafe {
@@ -717,7 +634,7 @@ impl<'a> Scheduler<'a> {
         };
 
         let waker_comm = unsafe {
-            CStr::from_ptr(tc.waker_comm.as_ptr() as *const c_char)
+            CStr::from_ptr(tx.waker_comm.as_ptr() as *const c_char)
                 .to_string_lossy()
                 .into_owned()
         };
@@ -730,25 +647,25 @@ impl<'a> Scheduler<'a> {
 
         match intrspc_tx.try_send(SchedSample {
             mseq,
-            pid: tc.pid,
+            pid: tx.pid,
             comm: tx_comm,
             stat: tx_stat,
-            cpu_id: tc.cpu_id,
-            prev_cpu_id: tc.prev_cpu_id,
-            suggested_cpu_id: tc.suggested_cpu_id,
-            waker_pid: tc.waker_pid,
+            cpu_id: tx.cpu_id,
+            prev_cpu_id: tx.prev_cpu_id,
+            suggested_cpu_id: tx.suggested_cpu_id,
+            waker_pid: tx.waker_pid,
             waker_comm,
-            slice: tc.slice,
-            lat_cri: tc.lat_cri,
+            slice: tx.slice,
+            lat_cri: tx.lat_cri,
             avg_lat_cri: tx.avg_lat_cri,
             static_prio: tx.static_prio,
             rerunnable_interval: tx.rerunnable_interval,
-            resched_interval: tc.resched_interval,
-            run_freq: tc.run_freq,
-            avg_runtime: tc.avg_runtime,
-            wait_freq: tc.wait_freq,
-            wake_freq: tc.wake_freq,
-            perf_cri: tc.perf_cri,
+            resched_interval: tx.resched_interval,
+            run_freq: tx.run_freq,
+            avg_runtime: tx.avg_runtime,
+            wait_freq: tx.wait_freq,
+            wake_freq: tx.wake_freq,
+            perf_cri: tx.perf_cri,
             thr_perf_cri: tx.thr_perf_cri,
             cpuperf_cur: tx.cpuperf_cur,
             cpu_util: tx.cpu_util,
@@ -756,7 +673,7 @@ impl<'a> Scheduler<'a> {
             nr_active: tx.nr_active,
             dsq_id: tx.dsq_id,
             dsq_consume_lat: tx.dsq_consume_lat,
-            slice_used: tc.last_slice_used,
+            slice_used: tx.last_slice_used,
         }) {
             Ok(()) => 0,
             Err(TrySendError::Full(_)) => Self::handle_channel_full(),

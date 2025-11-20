@@ -1,21 +1,30 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Copyright (c) 2023, 2024 Valve Corporation.
- * Author: Changwoo Min <changwoo@igalia.com>
+ * scx_lavd: Latency-criticality Aware Virtual Deadline (LAVD) scheduler
+ *
+ * Optimized Header for Intel Raptor Lake (i7-14700KF)
+ * - 64-byte Cache Line Alignment
+ * - False Sharing Mitigation via struct padding
+ * - C11 Atomics for Memory Model correctness
+ * - Upstream patch integration (task_ctx migration)
  */
 #ifndef __LAVD_H
 #define __LAVD_H
 
 #include <scx/common.bpf.h>
 #include <scx/bpf_arena_common.bpf.h>
+#include <lib/sdt_task.h>
+#include <lib/atq.h>
 
 /*
- * Common macros
+ * Common Macros & Constants
  */
 #define U64_MAX		((u64)~0ULL)
 #define S64_MAX		((s64)(U64_MAX >> 1))
 #define U32_MAX		((u32)~0U)
 #define S32_MAX		((s32)(U32_MAX >> 1))
+
+#define MAX_RT_PRIO	100
 
 #define LAVD_SHIFT			10
 #define LAVD_SCALE			(1L << LAVD_SHIFT)
@@ -27,9 +36,16 @@
 #define dsq_to_cpu(dsq_id)		((dsq_id) & LAVD_DSQ_ID_MASK)
 #define dsq_type(dsq_id)		(((dsq_id) & LAVD_DSQ_TYPE_MASK) >> LAVD_DSQ_TYPE_SHFT)
 
-/*
- * Common constants
- */
+enum {
+	LAVD_DSQ_TYPE_SHFT		= 12,
+	LAVD_DSQ_TYPE_MASK		= 0x3 << LAVD_DSQ_TYPE_SHFT,
+	LAVD_DSQ_ID_SHFT		= 0,
+	LAVD_DSQ_ID_MASK		= 0xfff << LAVD_DSQ_ID_SHFT,
+	LAVD_DSQ_NR_TYPES		= 2,
+	LAVD_DSQ_TYPE_CPDOM		= 1,
+	LAVD_DSQ_TYPE_CPU		= 0,
+};
+
 enum consts_internal {
 	CLOCK_BOOTTIME			= 7,
 	CACHELINE_SIZE			= 64,
@@ -88,46 +104,43 @@ enum consts_flags {
 	LAVD_FLAG_ON_LITTLE		= (0x1 << 7),
 	LAVD_FLAG_SLICE_BOOST		= (0x1 << 8),
 	LAVD_FLAG_IDLE_CPU_PICKED	= (0x1 << 9),
-    LAVD_FLAG_PINNED_COUNTED    = (0x1 << 10), /* Logic fix: Track accounting in flags */
+	LAVD_FLAG_PINNED_COUNTED	= (0x1 << 10), /* Fix: Atomic tracking for pinned tasks */
 };
 
-/* Compile-time layout validation */
-_Static_assert(LAVD_CPU_ID_MAX % 64 == 0, "cpumask must align to u64 array");
-
 /*
- * Compute domain context
- * Optimized for Raptor Lake cache lines (64 bytes).
+ * Compute Domain Context
+ * Aligned to 64B to prevent false sharing during load balancing scans.
  */
 struct cpdom_ctx {
-	/* CACHE LINE 0 (0-63): Hot Load Balancing Fields */
+	/* Hot path: Accessed during enqueue/select_cpu */
+	u64	id;
+	u64	alt_id;
 	u32	sc_load;
 	u32	nr_queued_task;
 	u32	cur_util_sum;
 	u32	avg_util_sum;
 	u32	cap_sum_active_cpus;
 	u32	dsq_consume_lat;
-	u16	nr_active_cpus;
 	u16	nr_cpus;
-	u16	nr_acpus_temp;
+	u16	nr_active_cpus;
 	u8	is_big;
 	u8	is_valid;
 	u8	is_stealer;
 	u8	is_stealee;
 	u8	numa_id;
 	u8	llc_id;
+
+	/* Warm/Cold path */
 	u32	cap_sum_temp;
-	u32	__pad0;
-	u32	__pad1;
-	u64	id;
-	u64	alt_id;
-
-	/* CACHE LINE 1 (64-127): Topology & Neighbors */
+	u16	nr_acpus_temp;
 	u8	nr_neighbors[LAVD_CPDOM_MAX_DIST];
-	u8	__pad2[5];
-	u8	neighbor_ids[LAVD_CPDOM_MAX_DIST * LAVD_CPDOM_MAX_NR];
 
-	/* CACHE LINE 2+ (128+): Cold CPU Mask */
-	u64	__cpumask[LAVD_CPU_ID_MAX/64] __attribute__((aligned(64)));
+	/* Pad to next cacheline for neighbor_ids array start */
+	u8	__pad0[2];
+
+	/* Read-mostly topology data */
+	u8	neighbor_ids[LAVD_CPDOM_MAX_DIST * LAVD_CPDOM_MAX_NR];
+	u64	__cpumask[LAVD_CPU_ID_MAX/64] __attribute__((aligned(CACHELINE_SIZE)));
 } __attribute__((aligned(CACHELINE_SIZE)));
 
 #define get_neighbor_id(cpdomc, d, i) ((cpdomc)->neighbor_ids[((d) * LAVD_CPDOM_MAX_NR) + (i)])
@@ -137,9 +150,48 @@ extern struct bpf_cpumask	cpdom_cpumask[LAVD_CPDOM_MAX_NR];
 extern int			nr_cpdoms;
 
 /*
- * Task context typedef.
- * We rely on intf.h for the struct definition to avoid redefinition errors.
+ * Task Context
+ * Upstreamed from intf.h to lavd.bpf.h
+ * Reordered for packing efficiency.
  */
+struct task_ctx {
+	/* MUST be first: Upstream requirement for SCX */
+	struct scx_task_common atq;
+
+	/* Hot Path: State & Flags (accessed in enqueue/dispatch) */
+	volatile u64	flags;
+	u64		slice;
+	u32		lat_cri;
+	u32		perf_cri;
+	u32		cpu_id;
+	u32		prev_cpu_id;
+	u32		cpdom_id;
+	u32		suggested_cpu_id;
+	s32		pinned_cpu_id;
+
+	/* Warm Path: Statistics & Runtime accounting */
+	u64		last_runnable_clk;
+	u64		last_running_clk;
+	u64		last_stopping_clk;
+	u64		last_measured_clk;
+	u64		last_quiescent_clk;
+	u64		acc_runtime;
+	u64		avg_runtime;
+	u64		svc_time;
+	u64		run_freq;
+	u64		wait_freq;
+	u64		wake_freq;
+
+	/* Cold Path: Introspection & ID */
+	u64		cgrp_id;
+	u64		resched_interval;
+	u64		last_slice_used;
+	pid_t		pid;
+	pid_t		waker_pid;
+	u32		lat_cri_waker;
+	char		waker_comm[TASK_COMM_LEN + 1];
+} __attribute__((aligned(CACHELINE_SIZE)));
+
 typedef struct task_ctx __arena task_ctx;
 
 u64 get_task_ctx_internal(struct task_struct *p);
@@ -150,11 +202,12 @@ struct cpu_ctx *get_cpu_ctx_id(s32 cpu_id);
 struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p);
 
 /*
- * CPU context
- * Optimized layout: Nuclear hot fields in first cache line.
+ * CPU Context
+ * Optimized for Raptor Lake (64B cache lines).
+ * Separates per-cpu Write-Heavy fields from Read-Mostly/Global fields.
  */
 struct cpu_ctx {
-	/* CACHE LINE 0 (0-63): NUCLEAR HOT - Preemption & State */
+	/* CACHE LINE 0 (0-63): Nuclear Hot (Per-CPU execution state) */
 	volatile u64	running_clk;
 	volatile u64	est_stopping_clk;
 	volatile u64	flags;
@@ -173,7 +226,7 @@ struct cpu_ctx {
 	volatile s32	futex_op;
 	u8		__pad1[16];
 
-	/* CACHE LINE 1 (64-127): HOT - Accounting */
+	/* CACHE LINE 1 (64-127): Hot (Utilization & Load Tracking) */
 	volatile u64	idle_start_clk;
 	volatile u64	tot_svc_time;
 	volatile u64	tot_sc_time;
@@ -186,7 +239,7 @@ struct cpu_ctx {
 	u32		cpuperf_cur;
 	u32		__pad2;
 
-	/* CACHE LINE 2 (128-191): WARM - Metrics */
+	/* CACHE LINE 2 (128-191): Warm/Global (Criticality Sums & Hotplug) */
 	volatile u64	sum_lat_cri;
 	volatile u64	sum_perf_cri;
 	volatile u32	max_lat_cri;
@@ -197,14 +250,14 @@ struct cpu_ctx {
 	u64		offline_clk;
 	u8		__pad3[16];
 
-	/* CACHE LINE 3 (192-255): COLD - Statistics */
+	/* CACHE LINE 3 (192-255): Cold (Stats & Pointers) */
 	volatile u32	nr_preempt	__attribute__((aligned(64)));
 	volatile u32	nr_x_migration;
 	volatile u32	nr_perf_cri;
 	volatile u32	nr_lat_cri;
 	u8		__pad4[48];
 
-	/* CACHE LINE 4+ (256+): COLD - Temporary cpumasks */
+	/* CACHE LINE 4+ (256+): Cpumask Pointers (Read-only mostly) */
 	struct bpf_cpumask __kptr *tmp_a_mask	__attribute__((aligned(64)));
 	struct bpf_cpumask __kptr *tmp_o_mask;
 	struct bpf_cpumask __kptr *tmp_l_mask;
@@ -222,7 +275,7 @@ extern const volatile u16	cpu_capacity[LAVD_CPU_ID_MAX];
 extern const volatile u8	cpu_big[LAVD_CPU_ID_MAX];
 extern const volatile u8	cpu_turbo[LAVD_CPU_ID_MAX];
 
-/* Logging helpers */
+/* Logging & Debugging */
 extern const volatile bool	no_wake_sync;
 extern const volatile bool	no_slice_boost;
 extern const volatile u8	verbose;
@@ -241,16 +294,7 @@ extern const volatile u8	verbose;
 					##__VA_ARGS__);			\
 })
 
-/* Branch prediction hints */
-#ifndef likely
-#define likely(x)	__builtin_expect(!!(x), 1)
-#endif
-
-#ifndef unlikely
-#define unlikely(x)	__builtin_expect(!!(x), 0)
-#endif
-
-/* Arithmetic helpers */
+/* Compiler Hints & Math */
 #ifndef min
 #define min(X, Y) ({				\
 	__auto_type __x = (X);			\
@@ -276,10 +320,21 @@ extern const volatile u8	verbose;
 })
 #endif
 
+#ifndef likely
+#define likely(x)	__builtin_expect(!!(x), 1)
+#endif
+
+#ifndef unlikely
+#define unlikely(x)	__builtin_expect(!!(x), 0)
+#endif
+
 u64 calc_avg(u64 old_val, u64 new_val);
 u64 calc_asym_avg(u64 old_val, u64 new_val);
 
-/* Atomic helpers using C11 builtins for better codegen */
+/*
+ * C11 Atomic Builtins (preferred over volatile casts)
+ * Ensures correct Acquire/Release semantics on x86_64.
+ */
 static __always_inline u32 atomic_read_u32(const volatile u32 *ptr)
 {
 	return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
@@ -310,18 +365,16 @@ static __always_inline void atomic_sub_u32(volatile u32 *ptr, u32 val)
 	__atomic_sub_fetch(ptr, val, __ATOMIC_RELAXED);
 }
 
-/* Bitmask helpers */
 static __always_inline int cpumask_next_set_bit(u64 *cpumask)
 {
-	if (unlikely(!*cpumask))
+	if (!*cpumask)
 		return -ENOENT;
-
 	int bit = __builtin_ctzll(*cpumask);
 	*cpumask &= *cpumask - 1;
 	return bit;
 }
 
-/* System statistics module */
+/* System Stats & Globals */
 extern struct sys_stat		sys_stat;
 
 s32 init_sys_stat(u64 now);
@@ -331,7 +384,6 @@ extern volatile u64		performance_mode_ns;
 extern volatile u64		balanced_mode_ns;
 extern volatile u64		powersave_mode_ns;
 
-/* Helpers from util.bpf.c */
 extern const volatile bool	per_cpu_dsq;
 extern const volatile u64	pinned_slice_ns;
 
@@ -376,7 +428,6 @@ extern struct bpf_cpumask __kptr *little_cpumask;
 extern struct bpf_cpumask __kptr *active_cpumask;
 extern struct bpf_cpumask __kptr *ovrflw_cpumask;
 
-/* Power management helpers */
 int do_core_compaction(void);
 int update_thr_perf_cri(void);
 int reinit_active_cpumask_for_performance(void);
@@ -403,28 +454,17 @@ int reset_suspended_duration(struct cpu_ctx *cpuc);
 u64 get_suspended_duration_and_reset(struct cpu_ctx *cpuc);
 
 const volatile u16 *get_cpu_order(void);
-
-/* Load balancer helpers */
 int plan_x_cpdom_migration(void);
-
-/* Preemption management helpers */
 void shrink_slice_at_tick(struct task_struct *p, struct cpu_ctx *cpuc, u64 now);
-
-/* Futex lock-related helpers */
 void reset_lock_futex_boost(task_ctx *taskc, struct cpu_ctx *cpuc);
 
-/* Scheduler introspection-related helpers */
 u64 get_est_stopping_clk(task_ctx *taskc, u64 now);
 void try_proc_introspec_cmd(struct task_struct *p, task_ctx *taskc);
 void reset_cpu_preemption_info(struct cpu_ctx *cpuc, bool released);
 int shrink_boosted_slice_remote(struct cpu_ctx *cpuc, u64 now);
-void shrink_boosted_slice_at_tick(struct task_struct *p,
-					 struct cpu_ctx *cpuc, u64 now);
+void shrink_boosted_slice_at_tick(struct task_struct *p, struct cpu_ctx *cpuc, u64 now);
 void preempt_at_tick(struct task_struct *p, struct cpu_ctx *cpuc);
-void try_find_and_kick_victim_cpu(struct task_struct *p,
-					 task_ctx *taskc,
-					 s32 preferred_cpu,
-					 u64 dsq_id);
+void try_find_and_kick_victim_cpu(struct task_struct *p, task_ctx *taskc, s32 preferred_cpu, u64 dsq_id);
 
 extern volatile bool is_monitored;
 

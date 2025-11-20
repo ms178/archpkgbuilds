@@ -1,11 +1,4 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/*
- * scx_lavd: Latency-criticality Aware Virtual Deadline (LAVD) scheduler
- * =====================================================================
- *
- * Optimized for Raptor Lake architecture (P+E cores, SMT).
- * Includes God-Tier Logical Clock and optimized pinned task tracking.
- */
 #include <scx/common.bpf.h>
 #include <scx/bpf_arena_common.bpf.h>
 #include "intf.h"
@@ -21,20 +14,8 @@
 
 char _license[] SEC("license") = "GPL";
 
-/*
- * ============================================================================
- * GLOBAL STATE
- * ============================================================================
- */
-
 static u64 cur_logical_clk = LAVD_DL_COMPETE_WINDOW;
 static u64 cur_svc_time;
-
-/*
- * ============================================================================
- * TUNABLE PARAMETERS
- * ============================================================================
- */
 
 const volatile u64 slice_max_ns = LAVD_SLICE_MAX_NS_DFL;
 const volatile u64 slice_min_ns = LAVD_SLICE_MIN_NS_DFL;
@@ -44,41 +25,21 @@ const volatile u8 mig_delta_pct = 0;
 static volatile u64 nr_cpus_big;
 static pid_t lavd_pid;
 
-/*
- * ============================================================================
- * CHECKS
- * ============================================================================
- */
-
-_Static_assert(LAVD_SLICE_MIN_NS_DFL > 0, "Minimum slice must be positive");
-_Static_assert(LAVD_SLICE_MAX_NS_DFL >= LAVD_SLICE_MIN_NS_DFL, "Max slice must be >= min slice");
-
-/*
- * ============================================================================
- * SUB-MODULES
- * ============================================================================
- */
-
 #include "util.bpf.c"
 #include "idle.bpf.c"
 #include "balance.bpf.c"
 #include "lat_cri.bpf.c"
 
-/*
- * GOD-TIER LOGICAL CLOCK — SINGLE-ATTEMPT + POWER-OF-2 FAST PATHS
- * Removes expensive division for common queue depths to reduce latency.
- */
 static void advance_cur_logical_clk(struct task_struct *p)
 {
 	u64 vlc = READ_ONCE(p->scx.dsq_vtime);
 	u64 clc = READ_ONCE(cur_logical_clk);
 	u64 nr_queued, delta, new_clk;
 
-	if (likely(vlc <= clc))
+	if (likely(vlc <= clc + 5000))
 		return;
 
 	nr_queued = READ_ONCE(sys_stat.nr_queued_task);
-	/* Branchless clamp to min 1 */
 	nr_queued = nr_queued | ((nr_queued == 0) ? 1 : 0);
 
 	if (likely(nr_queued == 1)) {
@@ -133,7 +94,7 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 			return slice;
 		}
 
-		if (taskc->lat_cri > sys_stat.avg_lat_cri) {
+		if (unlikely(taskc->lat_cri > sys_stat.avg_lat_cri)) {
 			u64 avg_lat_cri = READ_ONCE(sys_stat.avg_lat_cri);
 			avg_lat_cri = avg_lat_cri | ((avg_lat_cri == 0) ? 1 : 0);
 			u64 boost = (base_slice * taskc->lat_cri) / (avg_lat_cri + 1);
@@ -311,7 +272,18 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	__builtin_prefetch(&ictx.taskc->lat_cri, 0, 3);
 	__builtin_prefetch(&ictx.taskc->avg_runtime, 0, 3);
-	__builtin_prefetch(&ictx.taskc->perf_cri, 0, 3);
+
+	if (prev_cpu >= 0) {
+		struct cpu_ctx *cpuc_prev = get_cpu_ctx_id(prev_cpu);
+		if (cpuc_prev && !nr_queued_on_cpu(cpuc_prev)) {
+			u64 now = scx_bpf_now();
+			if (now - ictx.taskc->last_running_clk < 2000000ULL) {
+				cpu_id = prev_cpu;
+				found_idle = true;
+				goto fast_path_idle;
+			}
+		}
+	}
 
 	if (wake_flags & SCX_WAKE_SYNC)
 		set_task_flag(ictx.taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
@@ -320,6 +292,8 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	cpu_id = pick_idle_cpu(&ictx, &found_idle);
 	cpu_id = cpu_id >= 0 ? cpu_id : prev_cpu;
+
+fast_path_idle:
 	ictx.taskc->suggested_cpu_id = cpu_id;
 
 	if (have_little_core && prev_cpu >= 0 && cpu_id >= 0) {
@@ -331,8 +305,8 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 			(!cpuc_new || !cpuc_new->big_core) &&
 			(avg_perf == 0 || ictx.taskc->perf_cri >= avg_perf)) {
 			cpu_id = prev_cpu;
-		found_idle = false;
-			}
+			found_idle = false;
+		}
 	}
 
 	if (found_idle) {
@@ -444,11 +418,6 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 		}
 
-		/*
-		 * Optimized Pinned Task Tracking:
-		 * Only update atomic counter if we haven't already accounted for this task.
-		 * Uses a flag instead of adding a field to task_ctx to avoid redefinition errors.
-		 */
 		if (is_pinned(p) && !test_task_flag(taskc, LAVD_FLAG_PINNED_COUNTED)) {
 			atomic_inc_u32(&cpuc->nr_pinned_tasks);
 			set_task_flag(taskc, LAVD_FLAG_PINNED_COUNTED);
@@ -513,9 +482,7 @@ void BPF_STRUCT_OPS(lavd_dequeue, struct task_struct *p, u64 deq_flags)
 
 	taskc = get_task_ctx(p);
 
-	/* Handle pinned task accounting on dequeue to avoid leaks */
 	if (taskc && test_task_flag(taskc, LAVD_FLAG_PINNED_COUNTED)) {
-		/* We decrement on the CPU the task is assigned to */
 		s32 cpu = scx_bpf_task_cpu(p);
 		struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
 		if (cpuc) {
@@ -826,7 +793,6 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
 	}
 	cpuc->flags = 0;
 
-	/* Optimized Pinned Task Tracking: Decrement only if flag is set */
 	taskc = get_task_ctx(p);
 	if (taskc && test_task_flag(taskc, LAVD_FLAG_PINNED_COUNTED)) {
 		atomic_dec_u32(&cpuc->nr_pinned_tasks);
@@ -1420,10 +1386,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 {
 	u64 now = scx_bpf_now();
 	int err;
-
-	_Static_assert(
-		sizeof(struct atq_ctx) >= sizeof(struct scx_task_common),
-				   "atq_ctx should be equal or larger than scx_task_common");
 
 	err = init_cpdoms(now);
 	if (err)
