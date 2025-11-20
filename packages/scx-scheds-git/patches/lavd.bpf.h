@@ -104,7 +104,7 @@ enum consts_flags {
 	LAVD_FLAG_ON_LITTLE		= (0x1 << 7),
 	LAVD_FLAG_SLICE_BOOST		= (0x1 << 8),
 	LAVD_FLAG_IDLE_CPU_PICKED	= (0x1 << 9),
-	LAVD_FLAG_PINNED_COUNTED	= (0x1 << 10), /* Fix: Atomic tracking for pinned tasks */
+	LAVD_FLAG_PINNED_COUNTED	= (0x1 << 10),
 };
 
 /*

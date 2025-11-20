@@ -275,7 +275,7 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	if (prev_cpu >= 0) {
 		struct cpu_ctx *cpuc_prev = get_cpu_ctx_id(prev_cpu);
-		if (cpuc_prev && !nr_queued_on_cpu(cpuc_prev)) {
+		if (cpuc_prev && cpuc_prev->is_online && cpuc_prev->idle_start_clk != 0) {
 			u64 now = scx_bpf_now();
 			if (now - ictx.taskc->last_running_clk < 2000000ULL) {
 				cpu_id = prev_cpu;
