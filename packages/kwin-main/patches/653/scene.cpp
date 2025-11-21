@@ -23,6 +23,10 @@
 namespace KWin
 {
 
+// Global thread-local storage for traversal stacks to avoid heap allocations per frame.
+// KWin main thread is the only one traversing, but thread_local is safe.
+static thread_local std::vector<Item *> s_traversalStack;
+
 RenderView::RenderView(Output *output, OutputLayer *layer)
     : m_output(output)
     , m_layer(layer)
@@ -51,18 +55,16 @@ void RenderView::setLayer(OutputLayer *layer)
 
 void RenderView::addRepaint(const QRegion &region)
 {
-    if (!m_layer) [[unlikely]] {
-        return;
+    if (m_layer) [[likely]] {
+        m_layer->addRepaint(region);
     }
-    m_layer->addRepaint(region);
 }
 
 void RenderView::scheduleRepaint(Item *item)
 {
-    if (!m_layer) [[unlikely]] {
-        return;
+    if (m_layer) [[likely]] {
+        m_layer->scheduleRepaint(item);
     }
-    m_layer->scheduleRepaint(item);
 }
 
 bool RenderView::canSkipMoveRepaint(Item *item)
@@ -134,7 +136,6 @@ void SceneView::paint(const RenderTarget &renderTarget, const QRegion &region)
     }
 
     QRegion globalRegion = region;
-    // In-place translation to minimize allocations if region is detached
     globalRegion.translate(m_viewport.topLeft().toPoint());
     m_scene->paint(renderTarget, globalRegion);
 }
@@ -200,7 +201,6 @@ void SceneView::removeUnderlay(RenderView *view)
 
 bool SceneView::shouldRenderItem(Item *item) const
 {
-    // Optimized loop: explicit return avoids lambda overhead
     for (RenderView *view : m_exclusiveViews) {
         if (view->shouldRenderItem(item)) [[unlikely]] {
             return false;
@@ -211,7 +211,6 @@ bool SceneView::shouldRenderItem(Item *item) const
 
 bool SceneView::shouldRenderHole(Item *item) const
 {
-    // Optimized loop
     for (RenderView *view : m_underlayViews) {
         if (view->shouldRenderItem(item)) [[likely]] {
             return true;
@@ -230,7 +229,6 @@ ItemView::ItemView(SceneView *parentView, Item *item, Output *output, OutputLaye
     , m_parentView(parentView)
     , m_item(item)
 {
-    // Safety check: parentView might be partially destructed in edge cases
     if (parentView && parentView->scene()) [[likely]] {
         parentView->scene()->addView(this);
     }
@@ -259,7 +257,6 @@ QPointF ItemView::hotspot() const
 
 QRectF ItemView::viewport() const
 {
-    // TODO make the viewport explicit instead?
     if (!m_item) [[unlikely]] {
         return QRectF();
     }
@@ -281,25 +278,21 @@ QRectF ItemView::calculateViewport(const QRectF &itemRect) const
     }
 
     const QSizeF bufferSize = scaledRect(snapped, viewScale).size();
-    QSize bestSize;
-    bool found = false;
+    const QSize *bestSize = nullptr;
     int64_t bestArea = std::numeric_limits<int64_t>::max();
 
-    // Optimized manual loop: avoids generic container overhead and allocations
-    // Using int64_t for area to prevent potential overflow with very large virtual desktops
     for (const QSize &size : recommendedSizes) {
         if (size.width() >= bufferSize.width() && size.height() >= bufferSize.height()) {
-            const int64_t area = static_cast<int64_t>(size.width()) * static_cast<int64_t>(size.height());
+            const int64_t area = static_cast<int64_t>(size.width()) * size.height();
             if (area < bestArea) {
                 bestArea = area;
-                bestSize = size;
-                found = true;
+                bestSize = &size;
             }
         }
     }
 
-    if (found) {
-        const QSizeF logicalSize = QSizeF(bestSize) / viewScale;
+    if (bestSize) {
+        const QSizeF logicalSize = QSizeF(*bestSize) / viewScale;
         return m_item->mapToView(QRectF(snapped.topLeft(), logicalSize), this);
     }
 
@@ -324,12 +317,10 @@ void ItemView::frame(OutputFrame *frame)
     if (!m_output || !m_item) [[unlikely]] {
         return;
     }
-    auto *renderLoop = m_output->renderLoop();
-    if (!renderLoop) [[unlikely]] {
-        return;
+    if (auto *renderLoop = m_output->renderLoop()) [[likely]] {
+        const auto frameTime = std::chrono::duration_cast<std::chrono::milliseconds>(renderLoop->lastPresentationTimestamp());
+        m_item->framePainted(this, m_output, frame, frameTime);
     }
-    const auto frameTime = std::chrono::duration_cast<std::chrono::milliseconds>(renderLoop->lastPresentationTimestamp());
-    m_item->framePainted(this, m_output, frame, frameTime);
 }
 
 void ItemView::prePaint()
@@ -341,7 +332,6 @@ QRegion ItemView::collectDamage()
     if (!m_item) [[unlikely]] {
         return QRegion();
     }
-    // FIXME this offset should really not be rounded
     QRegion damage = m_item->takeRepaints(this);
     damage.translate(-viewport().topLeft().toPoint());
     return damage;
@@ -394,8 +384,6 @@ void ItemView::setExclusive(bool enable)
 
     if (enable) {
         m_item->scheduleSceneRepaint(m_item->rect());
-        // also need to add all the Item's pending repaint regions to the scene,
-        // otherwise some required repaints may be missing
         m_parentView->addRepaint(m_item->takeRepaints(m_parentView));
         m_parentView->addExclusiveView(this);
         if (m_underlay) {
@@ -449,7 +437,6 @@ double ItemView::desiredHdrHeadroom() const
     const auto &color = m_item->colorDescription();
     const double refLuminance = color->referenceLuminance();
 
-    // Division safety check
     if (refLuminance <= 0.0) [[unlikely]] {
         return 1.0;
     }
@@ -472,7 +459,6 @@ ItemTreeView::~ItemTreeView()
 
 QRectF ItemTreeView::viewport() const
 {
-    // TODO make the viewport explicit instead?
     if (!m_item) [[unlikely]] {
         return QRectF();
     }
@@ -482,8 +468,6 @@ QRectF ItemTreeView::viewport() const
 QList<SurfaceItem *> ItemTreeView::scanoutCandidates(ssize_t maxCount) const
 {
     if (auto surfaceItem = dynamic_cast<SurfaceItem *>(m_item.get())) {
-        // Direct scanout only possible if no child items are visible
-        // to occlude or blend with the main surface surface.
         const auto &childItems = m_item->childItems();
         for (const Item *child : childItems) {
             if (child->isVisible()) {
@@ -495,11 +479,11 @@ QList<SurfaceItem *> ItemTreeView::scanoutCandidates(ssize_t maxCount) const
     return {};
 }
 
-// Iterative traversal helper to avoid recursion depth issues
+// Alloc-free iterative traversal using thread_local storage
 static void accumulateRepaints(Item *rootItem, ItemTreeView *view, QRegion *repaints)
 {
-    std::vector<Item *> stack;
-    stack.reserve(32); // Pre-allocate reasonable depth
+    std::vector<Item *> &stack = s_traversalStack;
+    stack.clear();
     stack.push_back(rootItem);
 
     while (!stack.empty()) {
@@ -522,7 +506,6 @@ QRegion ItemTreeView::collectDamage()
     }
     QRegion ret;
     accumulateRepaints(m_item, this, &ret);
-    // FIXME damage tracking for this layer still has some bugs, this effectively disables it
     ret = infiniteRegion();
     return ret;
 }
@@ -532,7 +515,6 @@ void ItemTreeView::paint(const RenderTarget &renderTarget, const QRegion &region
     if (!m_item) [[unlikely]] {
         return;
     }
-    // FIXME damage tracking for this layer still has some bugs, this effectively disables it
     const QRegion globalRegion = infiniteRegion();
     RenderViewport renderViewport(viewport(), m_output->scale(), renderTarget);
     auto renderer = m_item->scene()->renderer();
@@ -561,8 +543,6 @@ void ItemTreeView::setExclusive(bool enable)
 
     if (enable) {
         m_item->scheduleSceneRepaint(m_item->boundingRect());
-        // also need to add all the Item's pending repaint regions to the scene,
-        // otherwise some required repaints may be missing
         m_parentView->addRepaint(m_item->takeRepaints(m_parentView));
         m_parentView->addExclusiveView(this);
         if (m_underlay) {
@@ -574,11 +554,10 @@ void ItemTreeView::setExclusive(bool enable)
     }
 }
 
-// Iterative recursion replacement
 static bool recursiveNeedsRepaint(Item *rootItem, RenderView *view)
 {
-    std::vector<Item *> stack;
-    stack.reserve(32);
+    std::vector<Item *> &stack = s_traversalStack;
+    stack.clear();
     stack.push_back(rootItem);
 
     while (!stack.empty()) {
@@ -604,22 +583,18 @@ bool ItemTreeView::needsRepaint()
 
 bool ItemTreeView::isVisible() const
 {
-    // Item::isVisible isn't enough here, we only want to render the view
-    // if there's actual contents
     return m_item && m_item->hasVisibleContents();
 }
 
 bool ItemTreeView::canSkipMoveRepaint(Item *item)
 {
-    // this could be more generic, but it's all we need for now
     return m_layer && item == m_item;
 }
 
-// Iterative recursion replacement
 static double recursiveMaxHdrHeadroom(Item *rootItem)
 {
-    std::vector<Item *> stack;
-    stack.reserve(32);
+    std::vector<Item *> &stack = s_traversalStack;
+    stack.clear();
     stack.push_back(rootItem);
 
     double globalMaxHeadroom = 0.0;
@@ -681,20 +656,16 @@ void Scene::addRepaint(int x, int y, int width, int height)
 
 void Scene::addRepaint(const QRegion &region)
 {
-    // Optimize: Fail fast if regions are disjoint before doing expensive
-    // intersection/translation logic.
     for (RenderView *view : m_views) {
         const QRectF viewport = view->viewport();
         const QRect viewportRect = viewport.toAlignedRect();
 
-        // Fast path: bounding box intersection check (cheap)
+        // Optimized: Fast reject if region doesn't intersect viewport
         if (!region.intersects(viewportRect)) {
             continue;
         }
 
         QRegion dirtyRegion = region & viewportRect;
-        // FIXME damage in logical coordinates may cause issues here
-        // if the viewport is on a non-integer position!
         if (!dirtyRegion.isEmpty()) [[likely]] {
             dirtyRegion.translate(-viewport.topLeft().toPoint());
             view->addRepaint(dirtyRegion);
@@ -704,8 +675,6 @@ void Scene::addRepaint(const QRegion &region)
 
 void Scene::addRepaint(RenderView *view, const QRegion &region)
 {
-    // FIXME damage in logical coordinates may cause issues here
-    // if the viewport is on a non-integer position!
     QRegion localRegion = region;
     localRegion.translate(-view->viewport().topLeft().toPoint());
     view->addRepaint(localRegion);
