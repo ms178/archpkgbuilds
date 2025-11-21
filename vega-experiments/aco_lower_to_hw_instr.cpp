@@ -25,22 +25,6 @@ struct lower_context {
 
 /* Class for obtaining where s_sendmsg(MSG_ORDERED_PS_DONE) must be done in a Primitive Ordered
  * Pixel Shader on GFX9-10.3.
- *
- * MSG_ORDERED_PS_DONE must be sent once after the ordered section is done along all execution paths
- * from the POPS packer ID hardware register setting to s_endpgm. It is, however, also okay to send
- * it if the packer ID is not going to be set at all by the wave, so some conservativeness is fine.
- *
- * For simplicity, sending the message from top-level blocks as dominance and post-dominance
- * checking for any location in the shader is trivial in them. Also, for simplicity, sending it
- * regardless of whether the POPS packer ID hardware register has already potentially been set up.
- *
- * Note that there can be multiple interlock end instructions in the shader.
- * SPV_EXT_fragment_shader_interlock requires OpEndInvocationInterlockEXT to be executed exactly
- * once by the invocation. However, there may be, for instance, multiple ordered sections, and which
- * one will be executed may depend on divergent control flow (some lanes may execute one ordered
- * section, other lanes may execute another). MSG_ORDERED_PS_DONE, however, is sent via a scalar
- * instruction, so it must be ensured that the message is sent after the last ordered section in the
- * entire wave.
  */
 class gfx9_pops_done_msg_bounds {
 public:
@@ -48,15 +32,6 @@ public:
 
    explicit gfx9_pops_done_msg_bounds(const Program* const program)
    {
-      /* Find the top-level location after the last ordered section end pseudo-instruction in the
-       * program.
-       * Consider `p_pops_gfx9_overlapped_wave_wait_done` a boundary too - make sure the message
-       * isn't sent if any wait hasn't been fully completed yet (if a begin-end-begin situation
-       * occurs somehow, as the location of `p_pops_gfx9_ordered_section_done` is controlled by the
-       * application) for safety, assuming that waits are the only thing that need the packer
-       * hardware register to be set at some point during or before them, and it won't be set
-       * anymore after the last wait.
-       */
       int last_top_level_block_idx = -1;
       for (int block_idx = (int)program->blocks.size() - 1; block_idx >= 0; block_idx--) {
          const Block& block = program->blocks[block_idx];
@@ -69,9 +44,6 @@ public:
             if (opcode == aco_opcode::p_pops_gfx9_ordered_section_done ||
                 opcode == aco_opcode::p_pops_gfx9_overlapped_wave_wait_done) {
                end_block_idx_ = last_top_level_block_idx;
-               /* The same block if it's already a top-level block, or the beginning of the next
-                * top-level block.
-                */
                instr_after_end_idx_ = block_idx == end_block_idx_ ? instr_idx + 1 : 0;
                break;
             }
@@ -82,21 +54,9 @@ public:
       }
    }
 
-   /* If this is not -1, during the normal execution flow (not early exiting), MSG_ORDERED_PS_DONE
-    * must be sent in this block.
-    */
    int end_block_idx() const { return end_block_idx_; }
-
-   /* If end_block_idx() is an existing block, during the normal execution flow (not early exiting),
-    * MSG_ORDERED_PS_DONE must be sent before this instruction in the block end_block_idx().
-    * If this is out of the bounds of the instructions in the end block, it must be sent in the end
-    * of that block.
-    */
    size_t instr_after_end_idx() const { return instr_after_end_idx_; }
 
-   /* Whether an instruction doing early exit (such as discard) needs to send MSG_ORDERED_PS_DONE
-    * before actually ending the program.
-    */
    bool early_exit_needs_done_msg(const int block_idx, const size_t instr_idx) const
    {
       return block_idx <= end_block_idx_ &&
@@ -104,9 +64,6 @@ public:
    }
 
 private:
-   /* Initialize to an empty range for which "is inside" comparisons will be failing for any
-    * block.
-    */
    int end_block_idx_ = -1;
    size_t instr_after_end_idx_ = 0;
 };
@@ -194,7 +151,7 @@ copy_constant_sgpr(Builder& bld, Definition dst, uint64_t constant)
 }
 
 /* used by handle_operands() indirectly through Builder::copy */
-uint8_t int8_mul_table[512] = {
+const uint8_t int8_mul_table[512] = {
    0, 20,  1,  1,   1,  2,   1,  3,   1,  4,   1, 5,   1,  6,   1,  7,   1,  8,   1,  9,
    1, 10,  1,  11,  1,  12,  1,  13,  1,  14,  1, 15,  1,  16,  1,  17,  1,  18,  1,  19,
    1, 20,  1,  21,  1,  22,  1,  23,  1,  24,  1, 25,  1,  26,  1,  27,  1,  28,  1,  29,
@@ -1897,6 +1854,7 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
                Operand hi = other->second.op;
                do_pack_2x16(ctx, bld, Definition(copy_map[i].first, v1), lo, hi);
 
+               // Need to handle erase carefully since 'other' could be before or after 'i'
                size_t other_idx = std::distance(copy_map.begin(), other);
                if (other_idx > i) {
                   copy_map.erase(other);
@@ -2017,6 +1975,7 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
             for (unsigned j = 0; j < new_copy.bytes; j++)
                new_copy.uses[j] = original.uses[j + offset];
 
+            // Insert into map
             auto it = std::find_if(copy_map.begin(), copy_map.end(),
                                    [def](const std::pair<PhysReg, copy_operation>& entry) {
                                       return entry.first == def.physReg();
@@ -2100,6 +2059,7 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
          remaining.op = Operand(src, swap.def.regClass().resize(remaining.bytes));
          remaining.def = Definition(dst, swap.def.regClass().resize(remaining.bytes));
 
+         // Insert/Update
          auto it = std::find_if(copy_map.begin(), copy_map.end(),
                                 [dst](const std::pair<PhysReg, copy_operation>& entry) {
                                    return entry.first == dst;
@@ -2120,12 +2080,18 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
       do_swap(ctx, bld, swap, preserve_scc, pi);
 
       /* remove from map */
-      auto it = std::find_if(copy_map.begin(), copy_map.end(),
-                             [swap](const std::pair<PhysReg, copy_operation>& entry) {
-                                 return entry.first == swap.def.physReg();
-                             });
-      assert(it != copy_map.end());
-      copy_map.erase(it);
+      // Need to find index again because emplace_back might have invalidated it
+      // Actually we can just find 'swap.def.physReg()' again, or handle index carefully.
+      // Since we might have inserted, the indices might have shifted.
+      // Safest to linear search for the exact element we were processing.
+      {
+          auto it = std::find_if(copy_map.begin(), copy_map.end(),
+                                 [swap](const std::pair<PhysReg, copy_operation>& entry) {
+                                     return entry.first == swap.def.physReg();
+                                 });
+          assert(it != copy_map.end());
+          copy_map.erase(it);
+      }
 
       /* change the operand reg of the target's uses and split uses if needed */
       uint32_t bytes_left = u_bit_consecutive(0, swap.bytes);
@@ -2374,7 +2340,8 @@ lower_to_hw_instr(Program* program)
       Block* block = &program->blocks[block_idx];
       ctx.block = block;
       ctx.instructions.clear();
-      ctx.instructions.reserve(block->instructions.size());
+      // Heuristic: reserve 20% more than previous instruction count for expansions
+      ctx.instructions.reserve(block->instructions.size() + std::max<size_t>(16, block->instructions.size() / 5));
       Builder bld(program, &ctx.instructions);
 
       for (size_t instr_idx = 0; instr_idx < block->instructions.size(); instr_idx++) {
@@ -2392,7 +2359,24 @@ lower_to_hw_instr(Program* program)
             bld.sopp(aco_opcode::s_sendmsg, sendmsg_ordered_ps_done);
          }
 
-         aco_ptr<Instruction> mov;
+         /* Optimized dispatch: fast-path common formats (VALU/SALU) to avoid branching overhead.
+          * Pseudo instructions are handled in the PSEUDO/PSEUDO_BRANCH/PSEUDO_BARRIER/PSEUDO_REDUCTION cases.
+          * Important: isCall() must be handled separately to emit stack maintenance instructions.
+          */
+         if (instr->format != Format::PSEUDO && instr->format != Format::PSEUDO_BRANCH &&
+             instr->format != Format::PSEUDO_BARRIER && instr->format != Format::PSEUDO_REDUCTION &&
+             !instr->isCall()) {
+
+             if (instr->isMIMG() && instr->mimg().strict_wqm) {
+                lower_image_sample(&ctx, instr);
+                ctx.instructions.emplace_back(std::move(instr));
+             } else {
+                ctx.instructions.emplace_back(std::move(instr));
+             }
+             continue;
+         }
+
+         // Slow path for pseudo instructions
          if (instr->isPseudo() && instr->opcode != aco_opcode::p_unit_test &&
              instr->opcode != aco_opcode::p_debug_info) {
             Pseudo_instruction* pi = &instr->pseudo();
@@ -3076,9 +3060,6 @@ lower_to_hw_instr(Program* program)
             } else if (emit_s_barrier) {
                bld.sopp(aco_opcode::s_barrier);
             }
-         } else if (instr->isMIMG() && instr->mimg().strict_wqm) {
-            lower_image_sample(&ctx, instr);
-            ctx.instructions.emplace_back(std::move(instr));
          } else if (instr->isCall()) {
             unsigned extra_param_count = 2;
             PhysReg stack_reg = instr->operands[0].physReg();
