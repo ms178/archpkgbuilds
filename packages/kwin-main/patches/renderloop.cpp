@@ -20,12 +20,13 @@
 #include <QThread>
 
 #include <algorithm>
-#include <bit>
+#include <cctype>
 #include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -36,14 +37,13 @@ using namespace std::chrono_literals;
 namespace
 {
 constexpr int64_t kNanosecondsPerMillisecond = 1'000'000;
-constexpr int64_t kPredictionSlackNs = 1'000'000;
-constexpr int64_t kEarlyStartSlackNs = 1'000;
+constexpr int64_t kPredictionSlackNs = 500'000;
 constexpr int64_t kMaxFutureLeadNs = static_cast<int64_t>(1) << 40;
 constexpr uint64_t kPageflipDriftThreshold = 100;
 constexpr uint64_t kIntervalsClamp = 1'000'000;
-constexpr uint8_t kVrrVsyncStabilityThreshold = 2;
-constexpr uint8_t kVrrAdaptiveStabilityThreshold = 8;
-constexpr uint16_t kVrrLockoutStableFrames = 120;
+constexpr uint8_t kVrrVsyncStabilityFrames = 90;
+constexpr uint8_t kVrrAdaptiveStabilityFrames = 90;
+constexpr uint16_t kVrrLockoutStableFrames = 180;
 constexpr auto kVrrControlThreshold = 33ms;
 constexpr auto kVrrOscillationWindow = 2000ms;
 constexpr uint8_t kVrrOscillationThreshold = 4;
@@ -51,6 +51,15 @@ constexpr int kMaxTimerDelayMs = std::numeric_limits<std::int16_t>::max();
 constexpr int kTripleBufferEnterPct = 82;
 constexpr int kTripleBufferExitPct = 70;
 constexpr int kTripleBufferExitFrames = 4;
+constexpr double kPredictionEmaAlpha = 0.12;
+constexpr double kPredictionClampMin = 0.5;
+constexpr double kPredictionClampMax = 1.8;
+constexpr int kMinVrrRefreshMhz = 48'000;
+constexpr int kMaxVrrRefreshMhz = 165'000;
+constexpr int kVrrTargetPercentile = 95;
+constexpr uint8_t kStarvationRecoveryFrames = 60;
+constexpr uint8_t kMaxConsecutiveErrors = 5;
+constexpr int kMaxErrorBackoffMs = 1000;
 }
 
 namespace KWin
@@ -65,114 +74,232 @@ RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop *loop) noexcept
 RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, Output *output)
     : q(q)
     , output(output)
+    , pendingFrameCount(0)
+    , inhibitCount(0)
+    , refreshRate(60'000)
     , cachedVblankIntervalNs(1'000'000'000'000ull / 60'000ull)
+    , vblankIntervalReciprocal64(0)
+    , maxPendingFrameCount(1)
+    , scheduledTimerMs(-1)
+    , doubleBufferingCounter(0)
+    , reciprocalShift64(0)
+    , preparingNewFrame(0)
+    , pendingReschedule(0)
+    , wasTripleBuffering(0)
+    , vrrOscillationLockout(0)
+    , vrrEnabled(0)
+    , vrrCapable(0)
+    , oscillationCheckCounter_(0)
+    , consecutiveErrorCount(0)
+    , vrrStabilityCounter(0)
+    , recentSwitchCount(0)
+    , modeSwitchHistoryIndex(0)
+    , vrrConnectionCount_(0)
+    , vrrMode(VrrMode::Automatic)
+    , presentationMode(PresentationMode::VSync)
+    , lastStableMode(PresentationMode::VSync)
+    , tripleBufferEnterThresholdNs(0)
+    , tripleBufferExitThresholdNs(0)
+    , vrrTargetIntervalNs(0)
+    , stableModeFrameCount(0)
+    , starvationRecoveryCounter(0)
+    , vrrStateDirty_(true)
+    , trackedWindow_(nullptr)
 {
     updateReciprocal();
     initializeVrrCapabilities();
     lastModeSwitch = std::chrono::steady_clock::now();
+    lastPresentationTimestamp = std::chrono::steady_clock::now().time_since_epoch();
+}
+
+RenderLoopPrivate::~RenderLoopPrivate()
+{
+    disconnectVrrSignals();
 }
 
 void RenderLoopPrivate::updateReciprocal() noexcept
 {
     if (cachedVblankIntervalNs == 0) [[unlikely]] {
-        vblankIntervalReciprocal = 0;
-        reciprocalShift = 0;
         vblankIntervalReciprocal64 = 0;
         reciprocalShift64 = 0;
-        nsToMsReciprocal = 0;
-        nsToMsShift = 0;
         tripleBufferEnterThresholdNs = 0;
         tripleBufferExitThresholdNs = 0;
+        vrrTargetIntervalNs = 0;
         return;
     }
+
     if (cachedVblankIntervalNs < (1ull << 32)) [[likely]] {
         constexpr uint8_t shift64 = 63;
-        vblankIntervalReciprocal64 = ((1ull << shift64) + cachedVblankIntervalNs - 1) / cachedVblankIntervalNs;
+        const __uint128_t numerator = static_cast<__uint128_t>(1) << shift64;
+        const __uint128_t result = (numerator + cachedVblankIntervalNs - 1) / cachedVblankIntervalNs;
+        vblankIntervalReciprocal64 = static_cast<uint64_t>(result);
         reciprocalShift64 = shift64;
-        const unsigned int clzResult = __builtin_clzll(cachedVblankIntervalNs);
-        const uint8_t shift = static_cast<uint8_t>(64 - clzResult + 31);
-        if (shift < 64) [[likely]] {
-            const uint64_t numerator = 1ull << shift;
-            vblankIntervalReciprocal = (numerator + cachedVblankIntervalNs - 1) / cachedVblankIntervalNs;
-            reciprocalShift = shift;
-        } else {
-            vblankIntervalReciprocal = 0;
-            reciprocalShift = 0;
-        }
     } else {
-        vblankIntervalReciprocal = 0;
-        reciprocalShift = 0;
         vblankIntervalReciprocal64 = 0;
         reciprocalShift64 = 0;
     }
-    constexpr uint64_t kNsPerMs = 1'000'000;
-    constexpr uint8_t nsToMsShiftVal = 52;
-    nsToMsReciprocal = ((1ull << nsToMsShiftVal) + kNsPerMs - 1) / kNsPerMs;
-    nsToMsShift = nsToMsShiftVal;
 
     tripleBufferEnterThresholdNs = static_cast<int64_t>((cachedVblankIntervalNs * kTripleBufferEnterPct) / 100);
     tripleBufferExitThresholdNs = static_cast<int64_t>((cachedVblankIntervalNs * kTripleBufferExitPct) / 100);
+
+    const uint64_t maxRefreshIntervalNs = 1'000'000'000'000ull / kMinVrrRefreshMhz;
+    const uint64_t minRefreshIntervalNs = 1'000'000'000'000ull / kMaxVrrRefreshMhz;
+    const uint64_t targetIntervalNs = minRefreshIntervalNs +
+        ((maxRefreshIntervalNs - minRefreshIntervalNs) * (100 - kVrrTargetPercentile)) / 100;
+    vrrTargetIntervalNs = std::max(targetIntervalNs, cachedVblankIntervalNs);
 }
 
 void RenderLoopPrivate::initializeVrrCapabilities()
 {
     if (!output) [[unlikely]] {
+        vrrCapable = 0;
+        vrrEnabled = 0;
         return;
     }
     const auto capabilities = output->capabilities();
-    vrrCapable = capabilities.testFlag(Output::Capability::Vrr);
+    vrrCapable = capabilities.testFlag(Output::Capability::Vrr) ? 1 : 0;
+
     const auto config = KSharedConfig::openConfig(QStringLiteral("kwinrc"));
     const auto vrrGroup = config->group(QStringLiteral("VRR"));
     const QString policy = vrrGroup.readEntry(QStringLiteral("Policy"), QStringLiteral("Automatic"));
-    const QString trimmedPolicy = policy.trimmed();
-    if (trimmedPolicy.compare(QStringLiteral("Never"), Qt::CaseInsensitive) == 0) {
+
+    if (policy.compare(QStringLiteral("Never"), Qt::CaseInsensitive) == 0) {
         vrrMode = VrrMode::Never;
-        vrrEnabled = false;
-    } else if (trimmedPolicy.compare(QStringLiteral("Always"), Qt::CaseInsensitive) == 0) {
+        vrrEnabled = 0;
+    } else if (policy.compare(QStringLiteral("Always"), Qt::CaseInsensitive) == 0) {
         vrrMode = VrrMode::Always;
         vrrEnabled = vrrCapable;
     } else {
         vrrMode = VrrMode::Automatic;
         vrrEnabled = vrrCapable;
     }
+
     if (vrrEnabled) {
-        qCInfo(KWIN_CORE) << "VRR enabled for output" << output->name() << "policy:" << trimmedPolicy;
+        qCInfo(KWIN_CORE) << "VRR enabled for output" << output->name() << "policy:" << policy;
     }
+}
+
+void RenderLoopPrivate::connectVrrSignals(Window *window)
+{
+    if (!window || !vrrEnabled) {
+        return;
+    }
+    if (trackedWindow_ == window) {
+        return;
+    }
+    disconnectVrrSignals();
+
+    vrrConnectionCount_ = 0;
+    auto addConnection = [this](QMetaObject::Connection &&conn) {
+        if (vrrConnectionCount_ < vrrConnections_.size()) {
+            vrrConnections_[vrrConnectionCount_++] = std::move(conn);
+        }
+    };
+
+    addConnection(QObject::connect(window, &QObject::destroyed, q, [this]() {
+        trackedWindow_ = nullptr;
+        disconnectVrrSignals();
+    }));
+
+    trackedWindow_ = window;
+
+    addConnection(QObject::connect(window, &Window::fullScreenChanged, q, [this]() {
+        invalidateVrrState();
+    }));
+    addConnection(QObject::connect(window, &Window::outputChanged, q, [this]() {
+        invalidateVrrState();
+    }));
+
+    if (SurfaceItem *surf = window->surfaceItem()) {
+        if (auto *waylandSurf = qobject_cast<SurfaceItemWayland *>(surf)) {
+            if (auto *surface = waylandSurf->surface()) {
+                addConnection(QObject::connect(surface, &SurfaceInterface::presentationModeHintChanged, q, [this]() {
+                    invalidateVrrState();
+                }));
+            }
+        }
+    }
+}
+
+void RenderLoopPrivate::disconnectVrrSignals() noexcept
+{
+    for (uint8_t i = 0; i < vrrConnectionCount_; ++i) {
+        QObject::disconnect(vrrConnections_[i]);
+    }
+    vrrConnectionCount_ = 0;
+    trackedWindow_ = nullptr;
+}
+
+void RenderLoopPrivate::invalidateVrrState() noexcept
+{
+    vrrStateDirty_ = true;
+}
+
+void RenderLoopPrivate::updateVrrState() noexcept
+{
+    if (!vrrStateDirty_) {
+        return;
+    }
+
+    VrrStateCache::State newState{};
+
+    if (vrrEnabled && vrrCapable) [[unlikely]] {
+        Workspace *const ws = workspace();
+        if (ws && output) [[likely]] {
+            Window *const activeWindow = ws->activeWindow();
+
+            if (activeWindow) [[likely]] {
+                connectVrrSignals(activeWindow);
+                newState.isOnOutput = activeWindow->isOnOutput(output) ? 1 : 0;
+
+                if (newState.isOnOutput) {
+                    newState.isFullScreen = activeWindow->isFullScreen() ? 1 : 0;
+                    SurfaceItem *const surfaceItem = activeWindow->surfaceItem();
+
+                    if (surfaceItem) [[likely]] {
+                        if (auto *const waylandItem = qobject_cast<SurfaceItemWayland *>(surfaceItem)) {
+                            if (auto *const surface = waylandItem->surface()) {
+                                newState.hint = static_cast<uint8_t>(surface->presentationModeHint()) & 0x3;
+                                newState.valid = 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    vrrStateCache_.setState(newState);
+    vrrStateDirty_ = false;
 }
 
 void RenderLoopPrivate::recordModeSwitch() noexcept
 {
     const auto now = std::chrono::steady_clock::now();
     lastModeSwitch = now;
-    const auto windowStart = now - kVrrOscillationWindow;
-    uint8_t activeCount = 0;
-    for (auto &entry : modeSwitchHistory) {
-        if (entry.timestamp > windowStart) {
-            ++activeCount;
-        }
-    }
+
     modeSwitchHistory[modeSwitchHistoryIndex].timestamp = now;
-    modeSwitchHistoryIndex = (modeSwitchHistoryIndex + 1) % static_cast<uint8_t>(modeSwitchHistory.size());
-    const uint8_t newActiveCount = (activeCount < modeSwitchHistory.size()) ? (activeCount + 1) : static_cast<uint8_t>(modeSwitchHistory.size());
-    recentSwitchCount = newActiveCount;
+    modeSwitchHistoryIndex = (modeSwitchHistoryIndex + 1) & 7;
 }
 
 bool RenderLoopPrivate::detectVrrOscillation() noexcept
 {
     const auto now = std::chrono::steady_clock::now();
     const auto windowStart = now - kVrrOscillationWindow;
+
     uint8_t activeCount = 0;
     for (const auto &entry : modeSwitchHistory) {
-        if (entry.timestamp > windowStart) {
+        if (entry.timestamp.time_since_epoch().count() > 0 && entry.timestamp > windowStart) {
             ++activeCount;
         }
     }
     recentSwitchCount = activeCount;
+
     if (activeCount >= kVrrOscillationThreshold) [[unlikely]] {
         if (!vrrOscillationLockout) {
             qCInfo(KWIN_CORE) << "VRR oscillation detected (" << static_cast<int>(activeCount)
                               << " switches in" << kVrrOscillationWindow.count() << "ms), entering lockout mode";
-            vrrOscillationLockout = true;
+            vrrOscillationLockout = 1;
             stableModeFrameCount = 0;
             lastStableMode = PresentationMode::VSync;
             return true;
@@ -181,19 +308,28 @@ bool RenderLoopPrivate::detectVrrOscillation() noexcept
     return false;
 }
 
-PresentationMode RenderLoopPrivate::selectPresentationMode(PresentationModeHint hint, bool isOnOutput, bool isFullScreen) noexcept
+PresentationMode RenderLoopPrivate::selectPresentationMode() noexcept
 {
-    if (!vrrEnabled || !vrrCapable) [[unlikely]] {
+    if (!vrrEnabled || !vrrCapable) [[likely]] {
         return PresentationMode::VSync;
     }
+
+    const VrrStateCache::State state = vrrStateCache_.getState();
+    if (!state.valid) [[unlikely]] {
+        return PresentationMode::VSync;
+    }
+
+    const auto hint = static_cast<PresentationModeHint>(state.hint);
+
     if (vrrOscillationLockout) [[unlikely]] {
         const PresentationMode targetMode = (vrrMode == VrrMode::Always && hint != PresentationModeHint::VSync)
             ? PresentationMode::AdaptiveSync
             : PresentationMode::VSync;
+
         if (presentationMode == targetMode) {
             ++stableModeFrameCount;
             if (stableModeFrameCount >= kVrrLockoutStableFrames) {
-                vrrOscillationLockout = false;
+                vrrOscillationLockout = 0;
                 stableModeFrameCount = 0;
                 qCInfo(KWIN_CORE) << "VRR lockout released after" << kVrrLockoutStableFrames << "stable frames";
             }
@@ -202,6 +338,7 @@ PresentationMode RenderLoopPrivate::selectPresentationMode(PresentationModeHint 
         }
         return lastStableMode;
     }
+
     if (vrrMode == VrrMode::Always) [[unlikely]] {
         if (hint == PresentationModeHint::Async) [[unlikely]] {
             return PresentationMode::AdaptiveAsync;
@@ -211,7 +348,8 @@ PresentationMode RenderLoopPrivate::selectPresentationMode(PresentationModeHint 
         }
         return PresentationMode::VSync;
     }
-    if (!isOnOutput || !isFullScreen) [[unlikely]] {
+
+    if (!state.isOnOutput || !state.isFullScreen) [[unlikely]] {
         return PresentationMode::VSync;
     }
     if (hint == PresentationModeHint::VSync) [[likely]] {
@@ -223,15 +361,33 @@ PresentationMode RenderLoopPrivate::selectPresentationMode(PresentationModeHint 
     return PresentationMode::AdaptiveSync;
 }
 
-void RenderLoopPrivate::scheduleNextRepaint()
+void RenderLoopPrivate::updateFramePrediction(std::chrono::nanoseconds measured) noexcept
 {
-    if (Q_UNLIKELY(kwinApp()->isTerminating()) || compositeTimer.isActive() || preparingNewFrame) [[unlikely]] {
+    if (measured.count() <= 0) [[unlikely]] {
         return;
     }
-    scheduleRepaint(nextPresentationTimestamp);
+    const double measuredNs = static_cast<double>(measured.count());
+    const double currentPredictionNs = static_cast<double>(framePrediction.count());
+
+    const double newPredictionNs = currentPredictionNs * (1.0 - kPredictionEmaAlpha) + measuredNs * kPredictionEmaAlpha;
+    const double vblankNs = static_cast<double>(cachedVblankIntervalNs);
+    double clampedNs = newPredictionNs;
+    clampedNs = std::max(clampedNs, vblankNs * kPredictionClampMin);
+    clampedNs = std::min(clampedNs, vblankNs * kPredictionClampMax);
+
+    framePrediction = std::chrono::nanoseconds(static_cast<int64_t>(clampedNs));
 }
 
-#if defined(__SIZEOF_INT128__)
+void RenderLoopPrivate::scheduleNextRepaint()
+{
+    const bool shouldSchedule = !kwinApp()->isTerminating() &&
+                                 !compositeTimer.isActive() &&
+                                 !preparingNewFrame;
+    if (__builtin_expect(shouldSchedule, 1)) [[likely]] {
+        scheduleRepaint(nextPresentationTimestamp);
+    }
+}
+
 [[gnu::always_inline, gnu::hot]]
 static inline uint64_t fastDivideByVblank(uint64_t numerator,
                                           uint64_t reciprocal64,
@@ -240,21 +396,6 @@ static inline uint64_t fastDivideByVblank(uint64_t numerator,
     const __uint128_t product = static_cast<__uint128_t>(numerator) * reciprocal64;
     return static_cast<uint64_t>(product >> shift64);
 }
-#else
-[[gnu::always_inline, gnu::hot]]
-static inline uint64_t fastDivideByVblank(uint64_t numerator,
-                                          uint64_t reciprocal64,
-                                          uint8_t shift64) noexcept
-{
-    if (reciprocal64 == 0) [[unlikely]] {
-        return 0;
-    }
-    const uint64_t high = (numerator >> 32) * reciprocal64;
-    const uint64_t low = (numerator & 0xFFFFFFFFu) * reciprocal64;
-    const uint64_t result = (high >> (shift64 - 32)) + (low >> shift64);
-    return result;
-}
-#endif
 
 void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimestamp)
 {
@@ -265,55 +406,54 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
         return;
     }
 
-    pendingReschedule = false;
+    pendingReschedule = 0;
     const uint64_t vblankIntervalNs = cachedVblankIntervalNs;
     if (vblankIntervalNs == 0) [[unlikely]] {
         return;
     }
+
     const int64_t nowNs = std::chrono::steady_clock::now().time_since_epoch().count();
-    const int64_t lastPresNs = lastPresentationTimestamp.count();
-    const int64_t predictedRenderNs = renderJournal.result().count();
+    int64_t lastPresNs = lastPresentationTimestamp.count();
+
+    if (lastPresNs <= 0 || (nowNs - lastPresNs) > 5'000'000'000ll) [[unlikely]] {
+        lastPresNs = nowNs;
+        lastPresentationTimestamp = std::chrono::nanoseconds(nowNs);
+    }
+
+    const int64_t predictedRenderNs = (framePrediction.count() > 0)
+        ? framePrediction.count()
+        : renderJournal.result().count();
+
     const int64_t safetyNs = safetyMargin.count();
     const int64_t vblankSigned = static_cast<int64_t>(vblankIntervalNs);
     const int64_t maxCompositeNs = vblankSigned * 2;
     const int64_t baseCompositeNs = predictedRenderNs + safetyNs + kPredictionSlackNs;
-    int64_t expectedCompositeNs = std::clamp(baseCompositeNs, int64_t{0}, maxCompositeNs);
+    int64_t expectedCompositeNs = baseCompositeNs;
+    expectedCompositeNs = std::max(expectedCompositeNs, int64_t{0});
+    expectedCompositeNs = std::min(expectedCompositeNs, maxCompositeNs);
 
-    PresentationModeHint currentHint = PresentationModeHint::VSync;
-    bool isOnOutput = false;
-    bool isFullScreen = false;
-    if (vrrEnabled && vrrCapable) [[unlikely]] {
-        Workspace *const ws = workspace();
-        if (ws && output) [[likely]] {
-            Window *const activeWindow = ws->activeWindow();
-            if (activeWindow) [[likely]] {
-                isOnOutput = activeWindow->isOnOutput(output);
-                if (isOnOutput) {
-                    isFullScreen = activeWindow->isFullScreen();
-                    SurfaceItem *const surfaceItem = activeWindow->surfaceItem();
-                    if (surfaceItem) [[likely]] {
-                        if (auto *const waylandItem = qobject_cast<SurfaceItemWayland *>(surfaceItem)) {
-                            if (auto *const surface = waylandItem->surface()) {
-                                currentHint = surface->presentationModeHint();
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    updateVrrState();
+    const PresentationMode targetMode = selectPresentationMode();
+
+    const bool shouldCheckOscillation = (++oscillationCheckCounter_ >= 8);
+    if (shouldCheckOscillation) {
+        oscillationCheckCounter_ = 0;
     }
 
-    const PresentationMode targetMode = selectPresentationMode(currentHint, isOnOutput, isFullScreen);
     if (targetMode != presentationMode) [[unlikely]] {
         const uint8_t threshold = (targetMode == PresentationMode::VSync)
-            ? kVrrVsyncStabilityThreshold
-            : kVrrAdaptiveStabilityThreshold;
+            ? kVrrVsyncStabilityFrames
+            : kVrrAdaptiveStabilityFrames;
+
         if (vrrStabilityCounter >= threshold) {
             presentationMode = targetMode;
             lastStableMode = targetMode;
             vrrStabilityCounter = 0;
+            starvationRecoveryCounter = 0;
             recordModeSwitch();
-            detectVrrOscillation();
+            if (shouldCheckOscillation) {
+                detectVrrOscillation();
+            }
             qCDebug(KWIN_CORE) << "Presentation mode changed to" << static_cast<int>(targetMode);
         } else {
             ++vrrStabilityCounter;
@@ -321,31 +461,37 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
     } else {
         vrrStabilityCounter = 0;
     }
+
     int64_t nextPresNs;
+
     if (presentationMode == PresentationMode::VSync) [[likely]] {
         const int64_t sinceLastNs = nowNs - lastPresNs;
         uint64_t flipsSince = 0;
+
         if (sinceLastNs > 0 && vblankIntervalReciprocal64 != 0) [[likely]] {
             flipsSince = fastDivideByVblank(static_cast<uint64_t>(sinceLastNs),
                                             vblankIntervalReciprocal64,
                                             reciprocalShift64);
         }
+
         const bool driftDetected = flipsSince > kPageflipDriftThreshold;
         if (driftDetected) [[unlikely]] {
-            const int64_t earlyStart = vblankSigned - kEarlyStartSlackNs;
+            const int64_t earlyStart = vblankSigned - 1'000;
             if (expectedCompositeNs < earlyStart) {
                 expectedCompositeNs = earlyStart;
             }
         }
+
         uint64_t flipsInAdvance = 1;
         if (expectedCompositeNs > vblankSigned) [[unlikely]] {
             const uint64_t need = (static_cast<uint64_t>(expectedCompositeNs) + vblankIntervalNs - 1) / vblankIntervalNs;
             const uint64_t maxPending = static_cast<uint64_t>(maxPendingFrameCount > 0 ? maxPendingFrameCount : 1);
             flipsInAdvance = std::min(std::max(need, uint64_t{1}), maxPending);
         }
+
         const bool highLoad = expectedCompositeNs > tripleBufferEnterThresholdNs;
         if (highLoad) [[unlikely]] {
-            wasTripleBuffering = true;
+            wasTripleBuffering = 1;
             doubleBufferingCounter = 0;
             if (flipsInAdvance < 2) {
                 flipsInAdvance = 2;
@@ -356,19 +502,22 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
             } else {
                 doubleBufferingCounter = 0;
             }
+
             if (doubleBufferingCounter >= kTripleBufferExitFrames) {
-                wasTripleBuffering = false;
+                wasTripleBuffering = 0;
             } else if (flipsInAdvance < 2) {
                 flipsInAdvance = 2;
             }
         }
+
         uint64_t flipsTarget;
-        if (compositeTimer.isActive() && nextPresentationTimestamp.count() > 0) [[unlikely]] {
+        if (__builtin_expect(compositeTimer.isActive(), 0) && nextPresentationTimestamp.count() > 0) [[unlikely]] {
             const int64_t deltaNs = nextPresentationTimestamp.count() - lastPresNs;
             if (deltaNs > 0) {
                 const uint64_t num = static_cast<uint64_t>(deltaNs) + vblankIntervalNs / 2;
-                const uint64_t intervals = std::clamp(num / vblankIntervalNs, uint64_t{1}, kIntervalsClamp);
-                flipsTarget = intervals;
+                const uint64_t intervals = num / vblankIntervalNs;
+                flipsTarget = std::max(intervals, uint64_t{1});
+                flipsTarget = std::min(flipsTarget, kIntervalsClamp);
             } else {
                 flipsTarget = 1;
             }
@@ -376,35 +525,45 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
             const int64_t toTargetNs = lastTargetTimestamp.count() - lastPresNs;
             uint64_t flipsToTarget = 0;
             if (toTargetNs > 0 && vblankIntervalReciprocal64 != 0) [[likely]] {
-                flipsToTarget = fastDivideByVblank(static_cast<uint64_t>(toTargetNs),
-                                                   vblankIntervalReciprocal64,
-                                                   reciprocalShift64);
+                const uint64_t offset = vblankIntervalNs / 2;
+                const uint64_t numeratorSafe = (static_cast<uint64_t>(toTargetNs) < (UINT64_MAX - offset))
+                    ? static_cast<uint64_t>(toTargetNs) + offset
+                    : UINT64_MAX;
+                flipsToTarget = fastDivideByVblank(numeratorSafe, vblankIntervalReciprocal64, reciprocalShift64);
             }
             flipsTarget = std::max(flipsSince + flipsInAdvance, flipsToTarget + 1);
         }
-        if (__builtin_mul_overflow(flipsTarget, vblankIntervalNs, &nextPresNs)) [[unlikely]] {
+
+        uint64_t tempResult;
+        if (__builtin_mul_overflow(flipsTarget, vblankIntervalNs, &tempResult)) [[unlikely]] {
             nextPresNs = std::numeric_limits<int64_t>::max() - lastPresNs;
+        } else {
+            nextPresNs = static_cast<int64_t>(tempResult);
         }
+
         if (__builtin_add_overflow(lastPresNs, nextPresNs, &nextPresNs)) [[unlikely]] {
             nextPresNs = std::numeric_limits<int64_t>::max();
         }
+
     } else {
-        wasTripleBuffering = false;
+        wasTripleBuffering = 0;
         doubleBufferingCounter = 0;
+
         if (presentationMode == PresentationMode::Async || presentationMode == PresentationMode::AdaptiveAsync) [[unlikely]] {
             if (__builtin_add_overflow(nowNs, expectedCompositeNs, &nextPresNs)) [[unlikely]] {
                 nextPresNs = std::numeric_limits<int64_t>::max();
             }
         } else {
-            const int64_t minIntervalNs = vblankSigned;
+            const int64_t targetIntervalNs = static_cast<int64_t>(vrrTargetIntervalNs);
             int64_t tentativeNs;
             if (__builtin_add_overflow(nowNs, expectedCompositeNs, &tentativeNs)) [[unlikely]] {
                 tentativeNs = std::numeric_limits<int64_t>::max();
             }
+
             const int64_t sinceLastNs = nowNs - lastPresNs;
-            if (sinceLastNs < minIntervalNs) [[likely]] {
+            if (sinceLastNs < targetIntervalNs) [[likely]] {
                 int64_t minNext;
-                if (__builtin_add_overflow(lastPresNs, minIntervalNs, &minNext)) [[unlikely]] {
+                if (__builtin_add_overflow(lastPresNs, targetIntervalNs, &minNext)) [[unlikely]] {
                     minNext = std::numeric_limits<int64_t>::max();
                 }
                 nextPresNs = std::max(tentativeNs, minNext);
@@ -413,48 +572,74 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
             }
         }
     }
+
     const int64_t clampLower = nowNs;
     int64_t clampUpper;
     if (__builtin_add_overflow(nowNs, kMaxFutureLeadNs, &clampUpper)) [[unlikely]] {
         clampUpper = std::numeric_limits<int64_t>::max();
     }
-    nextPresNs = std::clamp(nextPresNs, clampLower, clampUpper);
+    nextPresNs = std::max(nextPresNs, clampLower);
+    nextPresNs = std::min(nextPresNs, clampUpper);
+
     nextPresentationTimestamp = std::chrono::nanoseconds{nextPresNs};
+
     int64_t nextRenderNs;
     if (__builtin_sub_overflow(nextPresNs, expectedCompositeNs, &nextRenderNs)) [[unlikely]] {
         nextRenderNs = 0;
     }
+
     int64_t delayNs = nextRenderNs - nowNs;
     if (delayNs < 0) {
         delayNs = 0;
     }
+
+    if (__builtin_expect(compositeTimer.isActive(), 1)) [[likely]] {
+        const int64_t currentTargetNs = scheduledRenderTimestamp.count();
+        const int64_t diff = std::abs(currentTargetNs - nextRenderNs);
+        if (diff < 100'000) [[likely]] {
+            return;
+        }
+    }
+
     const uint64_t delayNsU64 = static_cast<uint64_t>(delayNs);
-    int64_t delayMs64;
-    if (nsToMsReciprocal != 0) [[likely]] {
-        delayMs64 = static_cast<int64_t>((delayNsU64 * nsToMsReciprocal) >> nsToMsShift);
-    } else {
-        delayMs64 = (delayNs + (kNanosecondsPerMillisecond - 1)) / kNanosecondsPerMillisecond;
-    }
-    const int delayMs = static_cast<int>(std::clamp(delayMs64, int64_t{0}, static_cast<int64_t>(kMaxTimerDelayMs)));
-    const int threshold = (delayMs <= 8) ? 0 : ((delayMs < 16) ? 1 : 2);
-    const int delta = (scheduledTimerMs >= 0) ? std::abs(delayMs - scheduledTimerMs) : delayMs;
-    if (!compositeTimer.isActive() || delta > threshold) [[likely]] {
-        scheduledTimerMs = static_cast<int16_t>(delayMs);
-        compositeTimer.start(delayMs, Qt::PreciseTimer, q);
-    }
+    const uint64_t safeAdd = (delayNsU64 <= UINT64_MAX - kNanosecondsPerMillisecond)
+        ? delayNsU64 + kNanosecondsPerMillisecond - 1
+        : UINT64_MAX;
+    const int64_t delayMs64 = static_cast<int64_t>(safeAdd / kNanosecondsPerMillisecond);
+    const int delayMs = static_cast<int>(std::min(delayMs64, static_cast<int64_t>(kMaxTimerDelayMs)));
+
+    scheduledRenderTimestamp = std::chrono::nanoseconds{nextRenderNs};
+    scheduledTimerMs = static_cast<int16_t>(delayMs);
+    compositeTimer.start(delayMs, Qt::PreciseTimer, q);
 }
 
 void RenderLoopPrivate::delayScheduleRepaint() noexcept
 {
-    pendingReschedule = true;
+    pendingReschedule = 1;
 }
 
 void RenderLoopPrivate::notifyFrameDropped()
 {
     Q_ASSERT(pendingFrameCount > 0);
     --pendingFrameCount;
+
+    if (consecutiveErrorCount < 255) {
+        ++consecutiveErrorCount;
+    }
+
     if (!inhibitCount && pendingReschedule) [[likely]] {
-        scheduleNextRepaint();
+        if (consecutiveErrorCount > kMaxConsecutiveErrors) {
+            const int exponent = std::min<int>(consecutiveErrorCount - kMaxConsecutiveErrors, 10);
+            int delay = 2 << exponent;
+            delay = std::min(delay, kMaxErrorBackoffMs);
+
+            const int minDelay = static_cast<int>(cachedVblankIntervalNs / kNanosecondsPerMillisecond);
+            delay = std::max(delay, minDelay);
+
+            compositeTimer.start(delay, Qt::PreciseTimer, q);
+        } else {
+            scheduleNextRepaint();
+        }
     }
 }
 
@@ -466,48 +651,32 @@ static void writeDebugOutput(RenderLoopPrivate *d,
                              std::chrono::nanoseconds timestamp,
                              PresentationMode mode)
 {
-    if (!d->output || !d->m_debugOutput) {
-        if (!d->output) {
-            return;
-        }
-        const QString name = d->output->name();
-        std::string sanitizedName;
-        sanitizedName.reserve(static_cast<size_t>(name.size()));
-        for (const QChar ch : name) {
-            const char16_t unicode = ch.unicode();
-            if ((unicode >= u'a' && unicode <= u'z') ||
-                (unicode >= u'A' && unicode <= u'Z') ||
-                (unicode >= u'0' && unicode <= u'9') ||
-                unicode == u'_' || unicode == u'-') {
-                sanitizedName.push_back(static_cast<char>(unicode & 0xFF));
-            } else {
-                sanitizedName.push_back('_');
-            }
-        }
-        const std::string filename = "kwin_perf_" + sanitizedName + ".csv";
-        d->m_debugOutput = std::fstream(filename, std::ios::out | std::ios::trunc);
+    if (!d->m_debugOutput) {
+        if (!d->output) return;
+
+        std::string sanitizedName = d->output->name().toStdString();
+        std::replace_if(sanitizedName.begin(), sanitizedName.end(), [](char c){
+            return !std::isalnum(static_cast<unsigned char>(c));
+        }, '_');
+
+        d->m_debugOutput = std::fstream("kwin_perf_" + sanitizedName + ".csv", std::ios::out | std::ios::trunc);
         if (d->m_debugOutput && d->m_debugOutput->is_open()) {
-            *(d->m_debugOutput)
-                << "target_pageflip_ns,pageflip_ns,render_start_ns,render_end_ns,"
-                << "safety_margin_ns,refresh_duration_ns,vrr,tearing,predicted_render_ns\n"
-                << std::flush;
+            *(d->m_debugOutput) << "target_flip,flip,start,end,margin,duration,vrr,pred_render\n";
         }
     }
-    if (!d->m_debugOutput || !d->m_debugOutput->is_open()) {
-        return;
+
+    if (d->m_debugOutput && d->m_debugOutput->is_open()) {
+        const RenderTimeSpan times = renderTime.value_or(RenderTimeSpan{});
+        const bool vrr = (mode == PresentationMode::AdaptiveSync || mode == PresentationMode::AdaptiveAsync);
+        *(d->m_debugOutput) << frame->targetPageflipTime().time_since_epoch().count() << ','
+                            << timestamp.count() << ','
+                            << times.start.time_since_epoch().count() << ','
+                            << times.end.time_since_epoch().count() << ','
+                            << d->safetyMargin.count() << ','
+                            << frame->refreshDuration().count() << ','
+                            << vrr << ','
+                            << frame->predictedRenderTime().count() << '\n';
     }
-    const RenderTimeSpan times = renderTime.value_or(RenderTimeSpan{});
-    const bool vrr = (mode == PresentationMode::AdaptiveSync || mode == PresentationMode::AdaptiveAsync);
-    const bool tearing = (mode == PresentationMode::Async || mode == PresentationMode::AdaptiveAsync);
-    *(d->m_debugOutput) << frame->targetPageflipTime().time_since_epoch().count() << ','
-                        << timestamp.count() << ','
-                        << times.start.time_since_epoch().count() << ','
-                        << times.end.time_since_epoch().count() << ','
-                        << d->safetyMargin.count() << ','
-                        << frame->refreshDuration().count() << ','
-                        << (vrr ? 1 : 0) << ','
-                        << (tearing ? 1 : 0) << ','
-                        << frame->predictedRenderTime().count() << '\n';
 }
 }
 
@@ -516,21 +685,40 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
                                              PresentationMode mode,
                                              OutputFrame *frame)
 {
+    consecutiveErrorCount = 0;
+
     if (s_printDebugInfo) [[unlikely]] {
         writeDebugOutput(this, renderTime, frame, timestamp, mode);
     }
+
     Q_ASSERT(pendingFrameCount > 0);
     --pendingFrameCount;
     notifyVblank(timestamp);
+
     if (renderTime) [[likely]] {
-        renderJournal.add(renderTime->end - renderTime->start, timestamp);
+        const auto duration = renderTime->end - renderTime->start;
+        renderJournal.add(duration, timestamp);
+        updateFramePrediction(duration);
+
+        if (presentationMode != PresentationMode::VSync) {
+            const int64_t frameTimeNs = duration.count();
+            const int64_t vblankNs = static_cast<int64_t>(cachedVblankIntervalNs);
+            if (frameTimeNs > vblankNs && starvationRecoveryCounter < kStarvationRecoveryFrames) {
+                ++starvationRecoveryCounter;
+            } else if (frameTimeNs <= vblankNs && starvationRecoveryCounter > 0) {
+                --starvationRecoveryCounter;
+            }
+        }
     }
-    if (compositeTimer.isActive()) [[unlikely]] {
+
+    if (__builtin_expect(compositeTimer.isActive(), 0)) [[unlikely]] {
         scheduleRepaint(lastPresentationTimestamp);
     }
+
     if (!inhibitCount && pendingReschedule) [[likely]] {
         scheduleNextRepaint();
     }
+
     Q_EMIT q->framePresented(q, timestamp, mode);
 }
 
@@ -539,10 +727,6 @@ void RenderLoopPrivate::notifyVblank(std::chrono::nanoseconds timestamp)
     if (lastPresentationTimestamp <= timestamp) [[likely]] {
         lastPresentationTimestamp = timestamp;
     } else {
-        qCDebug(KWIN_CORE,
-                "Got invalid presentation timestamp: %lld (current %lld)",
-                static_cast<long long>(timestamp.count()),
-                static_cast<long long>(lastPresentationTimestamp.count()));
         lastPresentationTimestamp = std::chrono::steady_clock::now().time_since_epoch();
     }
 }
@@ -595,12 +779,12 @@ void RenderLoop::prepareNewFrame()
 {
     Q_ASSERT(!d->preparingNewFrame);
     ++d->pendingFrameCount;
-    d->preparingNewFrame = true;
+    d->preparingNewFrame = 1;
 }
 
 void RenderLoop::newFramePrepared()
 {
-    d->preparingNewFrame = false;
+    d->preparingNewFrame = 0;
 }
 
 [[nodiscard]] int RenderLoop::refreshRate() const
@@ -612,7 +796,10 @@ void RenderLoop::setRefreshRate(int refreshRate)
 {
     constexpr int kMinRefreshRate = 1'000;
     constexpr int kMaxRefreshRate = 1'000'000;
-    const int rr = std::clamp(refreshRate, kMinRefreshRate, kMaxRefreshRate);
+    int rr = refreshRate;
+    rr = std::max(rr, kMinRefreshRate);
+    rr = std::min(rr, kMaxRefreshRate);
+
     if (d->refreshRate == rr) [[unlikely]] {
         return;
     }
@@ -620,6 +807,7 @@ void RenderLoop::setRefreshRate(int refreshRate)
     d->cachedVblankIntervalNs = 1'000'000'000'000ull / static_cast<uint64_t>(rr);
     d->updateReciprocal();
     Q_EMIT refreshRateChanged();
+
     if (!d->inhibitCount) [[likely]] {
         d->compositeTimer.stop();
         d->scheduledTimerMs = -1;
@@ -641,42 +829,37 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer *outputLayer)
         return;
     }
 
-    const bool vrr =
-        (d->presentationMode == PresentationMode::AdaptiveSync ||
-         d->presentationMode == PresentationMode::AdaptiveAsync);
-    const bool tearing =
-        (d->presentationMode == PresentationMode::Async ||
-         d->presentationMode == PresentationMode::AdaptiveAsync);
-    const bool checkOwnership = (item || outputLayer) && (vrr || tearing);
-    const bool activeControlsVrr = checkOwnership ? activeWindowControlsVrrRefreshRate() : false;
-    if ((vrr || tearing) && checkOwnership && activeControlsVrr) [[unlikely]] {
-        Workspace *const ws = workspace();
-        if (ws && d->output) [[likely]] {
-            Window *const activeWindow = ws->activeWindow();
-            if (activeWindow && activeWindow->isOnOutput(d->output)) [[likely]] {
-                SurfaceItem *const surfaceItem = activeWindow->surfaceItem();
-                if (surfaceItem && item && item != surfaceItem && !surfaceItem->isAncestorOf(item)) [[unlikely]] {
-                    if (d->pendingFrameCount > 0) {
-                        const uint64_t delayNs = d->cachedVblankIntervalNs;
-                        const int64_t delayMsInt64 = static_cast<int64_t>(
-                            (delayNs + (static_cast<uint64_t>(kNanosecondsPerMillisecond) - 1)) / static_cast<uint64_t>(kNanosecondsPerMillisecond)
-                        );
-                        if (delayMsInt64 > 0 && delayMsInt64 <= kMaxTimerDelayMs) [[likely]] {
-                            d->delayedVrrTimer.start(static_cast<int>(delayMsInt64), Qt::PreciseTimer, this);
-                            return;
-                        }
-                    }
-                }
-            }
+    d->invalidateVrrState();
+
+    const bool vrrOrTearing = (d->presentationMode != PresentationMode::VSync);
+
+    if (vrrOrTearing && (item || outputLayer)) [[unlikely]] {
+        if (activeWindowControlsVrrRefreshRate()) {
+             Workspace *const ws = workspace();
+             if (ws && d->output) {
+                 Window *const active = ws->activeWindow();
+                 if (active && active->isOnOutput(d->output)) {
+                     SurfaceItem *surface = active->surfaceItem();
+                     if (item && surface && item != surface && !surface->isAncestorOf(item)) {
+                         if (d->pendingFrameCount > 0) {
+                             const int delayMs = 1000 / (d->refreshRate / 1000);
+                             d->delayedVrrTimer.start(delayMs, Qt::PreciseTimer, this);
+                             return;
+                         }
+                     }
+                 }
+             }
         }
     }
+
     d->delayedVrrTimer.stop();
-    int effectiveMaxPendingFrameCount = d->maxPendingFrameCount;
-    if (vrr || tearing) [[unlikely]] {
-        effectiveMaxPendingFrameCount = 1;
+
+    int effectiveMax = d->maxPendingFrameCount;
+    if (vrrOrTearing) {
+        effectiveMax = (d->starvationRecoveryCounter >= kStarvationRecoveryFrames) ? 2 : 1;
     }
-    effectiveMaxPendingFrameCount = std::max(effectiveMaxPendingFrameCount, 1);
-    if (d->pendingFrameCount < effectiveMaxPendingFrameCount && !d->inhibitCount) [[likely]] {
+
+    if (d->pendingFrameCount < effectiveMax && !d->inhibitCount) [[likely]] {
         d->scheduleNextRepaint();
     } else {
         d->delayScheduleRepaint();
@@ -686,15 +869,15 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer *outputLayer)
 [[nodiscard]] bool RenderLoop::activeWindowControlsVrrRefreshRate() const
 {
     Workspace *const ws = workspace();
-    if (!ws) [[unlikely]] {
+    if (!ws) return false;
+
+    Window *const active = ws->activeWindow();
+    if (!active || !d->output || !active->isOnOutput(d->output)) {
         return false;
     }
-    Window *const activeWindow = ws->activeWindow();
-    if (!activeWindow || !d->output || !activeWindow->isOnOutput(d->output)) [[unlikely]] {
-        return false;
-    }
-    SurfaceItem *const surfaceItem = activeWindow->surfaceItem();
-    return surfaceItem && (surfaceItem->recursiveFrameTimeEstimation() <= kVrrControlThreshold);
+
+    SurfaceItem *const surface = active->surfaceItem();
+    return surface && (surface->recursiveFrameTimeEstimation() <= kVrrControlThreshold);
 }
 
 [[nodiscard]] std::chrono::nanoseconds RenderLoop::lastPresentationTimestamp() const
@@ -717,7 +900,9 @@ void RenderLoop::setPresentationMode(PresentationMode mode)
 
 void RenderLoop::setMaxPendingFrameCount(uint32_t maxCount)
 {
-    d->maxPendingFrameCount = std::clamp(static_cast<int>(maxCount), 1, INT_MAX);
+    const int clamped = static_cast<int>(maxCount);
+    d->maxPendingFrameCount = std::max(clamped, 1);
+    d->maxPendingFrameCount = std::min(d->maxPendingFrameCount, 3);
 }
 
 [[nodiscard]] std::chrono::nanoseconds RenderLoop::predictedRenderTime() const
@@ -725,6 +910,6 @@ void RenderLoop::setMaxPendingFrameCount(uint32_t maxCount)
     return d->renderJournal.result();
 }
 
-}
+} // namespace KWin
 
 #include "moc_renderloop.cpp"
