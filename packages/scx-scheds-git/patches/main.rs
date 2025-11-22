@@ -500,8 +500,10 @@ impl<'a> Scheduler<'a> {
             .rodata_data
             .as_mut()
             .expect("rodata not available");
-        let cpus_perf = pco.cpus_perf.borrow();
-        let cpus_ovflw = pco.cpus_ovflw.borrow();
+
+        // Direct access instead of borrow()
+        let cpus_perf = &pco.cpus_perf;
+        let cpus_ovflw = &pco.cpus_ovflw;
         let pco_nr_primary = cpus_perf.len();
 
         rodata.pco_bounds[i] = pco.perf_cap as u32;
@@ -524,7 +526,8 @@ impl<'a> Scheduler<'a> {
             let cpdom = &mut bss_data.cpdom_ctxs[v.cpdom_id];
 
             cpdom.id = v.cpdom_id as u64;
-            cpdom.alt_id = v.cpdom_alt_id.get() as u64;
+            // Direct access, no get()
+            cpdom.alt_id = v.cpdom_alt_id as u64;
             cpdom.numa_id = k.numa_adx as u8;
             cpdom.llc_id = k.llc_adx as u8;
             cpdom.is_big = k.is_big as u8;
@@ -536,7 +539,8 @@ impl<'a> Scheduler<'a> {
                 cpdom.__cpumask[word_idx] |= 1u64 << bit_idx;
             }
 
-            let neighbor_count = v.neighbor_map.borrow().len();
+            // Direct access, no borrow()
+            let neighbor_count = v.neighbor_map.len();
             if neighbor_count > LAVD_CPDOM_MAX_DIST as usize {
                 panic!(
                     "Processor topology too complex: {} neighbor distances (max {})",
@@ -544,9 +548,8 @@ impl<'a> Scheduler<'a> {
                 );
             }
 
-            for (dist_idx, (_distance, neighbors)) in v.neighbor_map.borrow().iter().enumerate() {
-                let neighbor_list = neighbors.borrow();
-                let nr_neighbors = neighbor_list.len() as u8;
+            for (dist_idx, (_distance, neighbors)) in v.neighbor_map.iter().enumerate() {
+                let nr_neighbors = neighbors.len() as u8;
 
                 if nr_neighbors > LAVD_CPDOM_MAX_NR as u8 {
                     panic!(
@@ -557,7 +560,8 @@ impl<'a> Scheduler<'a> {
 
                 cpdom.nr_neighbors[dist_idx] = nr_neighbors;
 
-                for (i, &neighbor_id) in neighbor_list.iter().enumerate() {
+                // Flatten neighbor IDs into the array
+                for (i, &neighbor_id) in neighbors.iter().enumerate() {
                     let idx = (dist_idx * LAVD_CPDOM_MAX_NR as usize) + i;
                     cpdom.neighbor_ids[idx] = neighbor_id as u8;
                 }
@@ -625,6 +629,9 @@ impl<'a> Scheduler<'a> {
         }
 
         let tx = &mt.taskc_x;
+        // taskc is removed from msg_task_ctx as per patch
+        // All fields are now in taskc_x (tx)
+
         let mseq = Self::get_msg_seq_id();
 
         let tx_comm = unsafe {
