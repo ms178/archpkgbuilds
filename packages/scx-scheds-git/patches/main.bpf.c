@@ -1,4 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * scx_lavd: Latency-criticality Aware Virtual Deadline Scheduler
+ * Optimized for Intel Raptor Lake (i7-14700KF)
+ *
+ * Changelog:
+ * - Fixed: Speedometer 3.1 regression via Tiered Saturation.
+ * - Fixed: "unused function" warning by integrating stealing logic.
+ * - Fixed: "invalid DSQ ID" and API errors.
+ */
+
 #include <scx/common.bpf.h>
 #include <scx/bpf_arena_common.bpf.h>
 #include "intf.h"
@@ -14,6 +24,7 @@
 
 char _license[] SEC("license") = "GPL";
 
+/* Globals */
 static u64 cur_logical_clk = LAVD_DL_COMPETE_WINDOW;
 static u64 cur_svc_time;
 
@@ -25,10 +36,53 @@ const volatile u8 mig_delta_pct = 0;
 static volatile u64 nr_cpus_big;
 static pid_t lavd_pid;
 
+/* Include sub-modules */
 #include "util.bpf.c"
 #include "idle.bpf.c"
 #include "balance.bpf.c"
 #include "lat_cri.bpf.c"
+
+/*
+ * Optimized Consumption Helper
+ * 1. Tries local/shared DSQs.
+ * 2. If empty, tries cross-domain WORK STEALING (via balance.bpf.c logic).
+ * 3. Respects topology flags.
+ */
+static __always_inline bool consume_task_optimized(u64 cpu_dsq_id, u64 cpdom_dsq_id)
+{
+	/* 1. Check Local DSQ (Highest Locality) */
+	if (use_per_cpu_dsq()) {
+		if (scx_bpf_dsq_move_to_local(cpu_dsq_id))
+			return true;
+	}
+
+	/* 2. Check Compute Domain DSQ */
+	if (use_cpdom_dsq()) {
+		if (scx_bpf_dsq_move_to_local(cpdom_dsq_id))
+			return true;
+	}
+
+	/* 3. Work Stealing (Last Resort) */
+	struct cpdom_ctx *cpdomc;
+	u64 cpdom_id = dsq_to_cpdom(cpdom_dsq_id);
+
+	cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
+	if (!cpdomc) return false;
+
+	/* Probabilistic Stealing */
+	if (nr_cpdoms > 1 && READ_ONCE(cpdomc->is_stealer)) {
+		if (try_to_steal_task(cpdomc))
+			return true;
+	}
+
+	/* Force Stealing (if configured) */
+	if (nr_cpdoms > 1 && mig_delta_pct == 0) {
+		if (force_to_steal_task(cpdomc))
+			return true;
+	}
+
+	return false;
+}
 
 static void advance_cur_logical_clk(struct task_struct *p)
 {
@@ -44,13 +98,13 @@ static void advance_cur_logical_clk(struct task_struct *p)
 
 	if (likely(nr_queued == 1)) {
 		delta = vlc - clc;
-	} else if (nr_queued == 2) {
+	} else if (nr_queued <= 2) {
 		delta = (vlc - clc) >> 1;
-	} else if (nr_queued == 4) {
+	} else if (nr_queued <= 4) {
 		delta = (vlc - clc) >> 2;
-	} else if (nr_queued == 8) {
+	} else if (nr_queued <= 8) {
 		delta = (vlc - clc) >> 3;
-	} else if (nr_queued == 16) {
+	} else if (nr_queued <= 16) {
 		delta = (vlc - clc) >> 4;
 	} else {
 		delta = (vlc - clc) / nr_queued;
@@ -67,7 +121,7 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 	u64 slice, base_slice;
 	u64 avg_runtime;
 
-	if (!taskc || !cpuc)
+	if (unlikely(!taskc || !cpuc))
 		return LAVD_SLICE_MAX_NS_DFL;
 
 	base_slice = READ_ONCE(sys_stat.slice);
@@ -98,9 +152,11 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 			u64 avg_lat_cri = READ_ONCE(sys_stat.avg_lat_cri);
 			avg_lat_cri = avg_lat_cri | ((avg_lat_cri == 0) ? 1 : 0);
 			u64 boost = (base_slice * taskc->lat_cri) / (avg_lat_cri + 1);
+
 			slice = base_slice + boost;
 			u64 cap = base_slice << 1;
-			cap = avg_runtime < cap ? avg_runtime : cap;
+			cap = (avg_runtime < cap) ? avg_runtime : cap;
+
 			slice = clamp(slice, slice_min_ns, cap);
 			taskc->slice = slice;
 			set_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
@@ -136,8 +192,7 @@ static void update_stat_for_running(struct task_struct *p,
 	taskc->prev_cpu_id = taskc->cpu_id;
 	taskc->cpu_id = cpuc->cpu_id;
 
-	reset_task_flag(taskc, LAVD_FLAG_IS_WAKEUP);
-	reset_task_flag(taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
+	reset_task_flag(taskc, LAVD_FLAG_IS_WAKEUP | LAVD_FLAG_IS_SYNC_WAKEUP);
 
 	taskc->last_running_clk = now;
 	taskc->last_measured_clk = now;
@@ -267,7 +322,7 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 	bool found_idle = false;
 	s32 cpu_id;
 
-	if (!ictx.taskc || !ictx.cpuc_cur)
+	if (unlikely(!ictx.taskc || !ictx.cpuc_cur))
 		return prev_cpu;
 
 	__builtin_prefetch(&ictx.taskc->lat_cri, 0, 3);
@@ -277,7 +332,7 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		struct cpu_ctx *cpuc_prev = get_cpu_ctx_id(prev_cpu);
 		if (cpuc_prev && cpuc_prev->is_online && cpuc_prev->idle_start_clk != 0) {
 			u64 now = scx_bpf_now();
-			if (now - ictx.taskc->last_running_clk < 2000000ULL) {
+			if (now - ictx.taskc->last_stopping_clk < 1500000ULL) {
 				cpu_id = prev_cpu;
 				found_idle = true;
 				goto fast_path_idle;
@@ -329,7 +384,7 @@ fast_path_idle:
 	} else {
 		reset_task_flag(ictx.taskc, LAVD_FLAG_IDLE_CPU_PICKED);
 	}
-	out:
+out:
 	return cpu_id;
 }
 
@@ -366,7 +421,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 
 	taskc = get_task_ctx(p);
 	cpuc_cur = get_cpu_ctx();
-	if (!taskc || !cpuc_cur) {
+	if (unlikely(!taskc || !cpuc_cur)) {
 		scx_bpf_error("Failed to lookup contexts in enqueue");
 		return;
 	}
@@ -404,53 +459,50 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	cpuc = get_cpu_ctx_id(cpu);
-	if (!cpuc) {
-		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
-		return;
+	if (unlikely(!cpuc)) {
+		cpu = cpuc_cur->cpu_id;
+		cpuc = cpuc_cur;
 	}
 	taskc->suggested_cpu_id = cpu;
 	taskc->cpdom_id = cpuc->cpdom_id;
 
 	if (enable_cpu_bw && (p->pid != lavd_pid) &&
 		(cgroup_throttled(p, taskc, true) == -EAGAIN)) {
-		debugln("Task %s[pid%d/cgid%llu] is throttled.",
-				p->comm, p->pid, taskc->cgrp_id);
 		return;
-		}
+	}
 
-		if (is_pinned(p) && !test_task_flag(taskc, LAVD_FLAG_PINNED_COUNTED)) {
-			atomic_inc_u32(&cpuc->nr_pinned_tasks);
-			set_task_flag(taskc, LAVD_FLAG_PINNED_COUNTED);
-		}
+	if (is_pinned(p) && !test_task_flag(taskc, LAVD_FLAG_PINNED_COUNTED)) {
+		atomic_inc_u32(&cpuc->nr_pinned_tasks);
+		set_task_flag(taskc, LAVD_FLAG_PINNED_COUNTED);
+	}
 
-		if (is_idle && !nr_queued_on_cpu(cpuc)) {
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
-							   enq_flags);
-		} else {
-			dsq_id = get_target_dsq_id(p, cpuc);
-			scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice,
-									 p->scx.dsq_vtime, enq_flags);
-		}
+	if (is_idle && !nr_queued_on_cpu(cpuc)) {
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
+						   enq_flags);
+	} else {
+		dsq_id = get_target_dsq_id(p, cpuc);
+		scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice,
+								 p->scx.dsq_vtime, enq_flags);
+	}
 
-		if (is_idle) {
-			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-			return;
-		}
+	if (is_idle) {
+		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		return;
+	}
 
-		if (!no_preemption)
-			try_find_and_kick_victim_cpu(p, taskc, cpu, cpdom_to_dsq(cpuc->cpdom_id));
+	if (!no_preemption)
+		try_find_and_kick_victim_cpu(p, taskc, cpu, cpdom_to_dsq(cpuc->cpdom_id));
 }
 
 static int enqueue_cb(struct task_struct __arg_trusted *p)
 {
-	struct cpu_ctx *cpuc, *cpuc_cur;
+	struct cpu_ctx *cpuc;
 	task_ctx *taskc;
 	u64 dsq_id;
 	s32 cpu;
 
 	taskc = get_task_ctx(p);
-	cpuc_cur = get_cpu_ctx();
-	if (!taskc || !cpuc_cur) {
+	if (!taskc) {
 		scx_bpf_error("Failed to lookup a task context: %d", p->pid);
 		return 0;
 	}
@@ -514,7 +566,7 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	int ret;
 
 	cpuc = get_cpu_ctx_id(cpu);
-	if (!cpuc) {
+	if (unlikely(!cpuc)) {
 		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
 		return;
 	}
@@ -537,7 +589,7 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 
 	active = active_cpumask;
 	ovrflw = ovrflw_cpumask;
-	if (!active || !ovrflw) {
+	if (unlikely(!active || !ovrflw)) {
 		scx_bpf_error("Failed to prepare cpumasks.");
 		goto unlock_out;
 	}
@@ -545,41 +597,47 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	if (bpf_cpumask_test_cpu(cpu, cast_mask(active)) ||
 		bpf_cpumask_test_cpu(cpu, cast_mask(ovrflw))) {
 		bpf_rcu_read_unlock();
-	goto consume_out;
+		goto consume_out;
+	}
+
+	if (use_per_cpu_dsq() && scx_bpf_dsq_nr_queued(cpu_dsq_id)) {
+		bpf_cpumask_set_cpu(cpu, ovrflw);
+		bpf_rcu_read_unlock();
+		goto consume_out;
+	}
+
+	if (prev) {
+		if (is_pinned(prev)) {
+			bpf_cpumask_set_cpu(cpu, ovrflw);
+			bpf_rcu_read_unlock();
+			goto consume_out;
+		} else if (is_migration_disabled(prev)) {
+			bpf_rcu_read_unlock();
+			goto consume_out;
 		}
 
-		if (use_per_cpu_dsq() && scx_bpf_dsq_nr_queued(cpu_dsq_id)) {
+		taskc_prev = get_task_ctx(prev);
+		if (taskc_prev &&
+			test_task_flag(taskc_prev, LAVD_FLAG_IS_AFFINITIZED) &&
+			bpf_cpumask_test_cpu(cpu, prev->cpus_ptr) &&
+			!bpf_cpumask_intersects(cast_mask(active), prev->cpus_ptr) &&
+			!bpf_cpumask_intersects(cast_mask(ovrflw), prev->cpus_ptr)) {
 			bpf_cpumask_set_cpu(cpu, ovrflw);
 			bpf_rcu_read_unlock();
 			goto consume_out;
 		}
+	}
 
-		if (prev) {
-			if (is_pinned(prev)) {
-				bpf_cpumask_set_cpu(cpu, ovrflw);
-				bpf_rcu_read_unlock();
-				goto consume_out;
-			} else if (is_migration_disabled(prev)) {
-				bpf_rcu_read_unlock();
-				goto consume_out;
-			}
+	if (!use_cpdom_dsq())
+		goto unlock_out;
 
-			taskc_prev = get_task_ctx(prev);
-			if (taskc_prev &&
-				test_task_flag(taskc_prev, LAVD_FLAG_IS_AFFINITIZED) &&
-				bpf_cpumask_test_cpu(cpu, prev->cpus_ptr) &&
-				!bpf_cpumask_intersects(cast_mask(active), prev->cpus_ptr) &&
-				!bpf_cpumask_intersects(cast_mask(ovrflw), prev->cpus_ptr)) {
-				bpf_cpumask_set_cpu(cpu, ovrflw);
-			bpf_rcu_read_unlock();
-			goto consume_out;
-				}
-		}
+	/* TIERED SATURATION LOGIC */
+	u64 q_depth = scx_bpf_dsq_nr_queued(cpdom_dsq_id);
+	u64 nr_cpus = nr_cpus_onln ? nr_cpus_onln : 1;
+	bool is_saturated = q_depth > nr_cpus;
+	bool is_emergency = q_depth > (nr_cpus << 1);
 
-		if (!use_cpdom_dsq())
-			goto unlock_out;
-
-	if (!scx_bpf_dsq_nr_queued(cpdom_dsq_id))
+	if (!q_depth)
 		goto unlock_out;
 
 	bpf_for_each(scx_dsq, p, cpdom_dsq_id, 0) {
@@ -614,39 +672,59 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 		}
 
 		taskc = get_task_ctx(p);
-		if (taskc &&
-			(!test_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED) ||
-			bpf_cpumask_intersects(cast_mask(active), p->cpus_ptr) ||
-			bpf_cpumask_intersects(cast_mask(ovrflw), p->cpus_ptr))) {
-			bpf_task_release(p);
-		continue;
-			}
 
-			new_cpu = find_cpu_in(p->cpus_ptr, cpuc);
-			if (new_cpu >= 0) {
-				if (new_cpu == cpu) {
-					bpf_cpumask_set_cpu(new_cpu, ovrflw);
-					bpf_task_release(p);
-					try_consume = true;
-					break;
-				} else if (!bpf_cpumask_test_and_set_cpu(new_cpu, ovrflw))
-					scx_bpf_kick_cpu(new_cpu, SCX_KICK_IDLE);
+		bool should_skip = true;
+
+		if (taskc) {
+			bool affinity_match = test_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
+			bool mask_match = bpf_cpumask_intersects(cast_mask(active), p->cpus_ptr) ||
+							  bpf_cpumask_intersects(cast_mask(ovrflw), p->cpus_ptr);
+
+			if (affinity_match && !mask_match)
+				should_skip = false;
+
+			if (is_emergency) {
+				should_skip = false;
+			} else if (is_saturated) {
+				if (cpuc->big_core) {
+					should_skip = false;
+				} else {
+					if (taskc->perf_cri <= READ_ONCE(sys_stat.avg_perf_cri))
+						should_skip = false;
+				}
 			}
+		}
+
+		if (should_skip) {
 			bpf_task_release(p);
+			continue;
+		}
+
+		new_cpu = find_cpu_in(p->cpus_ptr, cpuc);
+		if (new_cpu >= 0) {
+			if (new_cpu == cpu) {
+				bpf_cpumask_set_cpu(new_cpu, ovrflw);
+				bpf_task_release(p);
+				try_consume = true;
+				break;
+			} else if (!bpf_cpumask_test_and_set_cpu(new_cpu, ovrflw))
+				scx_bpf_kick_cpu(new_cpu, SCX_KICK_IDLE);
+		}
+		bpf_task_release(p);
 	}
 
-	unlock_out:
+unlock_out:
 	bpf_rcu_read_unlock();
 
 	if (!try_consume)
 		return;
 
-	consume_out:
-	if (consume_task(cpu_dsq_id, cpdom_dsq_id))
+consume_out:
+	if (consume_task_optimized(cpu_dsq_id, cpdom_dsq_id))
 		return;
 
 	if (prev && prev->scx.flags & SCX_TASK_QUEUED) {
-		consume_prev:
+consume_prev:
 		taskc_prev = taskc_prev ?: get_task_ctx(prev);
 		if (taskc_prev) {
 			update_stat_for_refill(prev, taskc_prev, cpuc);
@@ -661,6 +739,7 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 				reset_lock_futex_boost(taskc_prev, cpuc);
 
 			cpuc->flags = taskc_prev->flags;
+			scx_bpf_dsq_insert(prev, SCX_DSQ_LOCAL, prev->scx.slice, 0);
 		}
 	}
 }

@@ -2,11 +2,11 @@
 //
 // Copyright (c) 2025 Valve Corporation.
 // Author: Changwoo Min <changwoo@igalia.com>
+// Optimized for Intel Raptor Lake (i7-14700KF)
 
 use anyhow::Result;
 use combinations::Combinations;
 use scx_utils::CoreType;
-use scx_utils::Cpumask;
 use scx_utils::EnergyModel;
 use scx_utils::PerfDomain;
 use scx_utils::PerfState;
@@ -22,27 +22,23 @@ use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
 pub struct CpuId {
+    // Hot fields first for cache locality during sorting/iteration
+    pub cpu_adx: usize,
+    pub cpu_sibling: usize,
+    pub cpu_cap: usize,
     pub numa_adx: usize,
     pub pd_adx: usize,
     pub llc_adx: usize,
-    pub llc_rdx: usize,
     pub llc_kernel_id: usize,
-    pub core_rdx: usize,
-    pub cpu_rdx: usize,
-    pub cpu_adx: usize,
     pub smt_level: usize,
-    pub cache_size: usize,
-    pub cpu_cap: usize,
     pub big_core: bool,
     pub turbo_core: bool,
-    pub cpu_sibling: usize,
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
 pub struct ComputeDomainId {
     pub numa_adx: usize,
     pub llc_adx: usize,
-    pub llc_rdx: usize,
     pub llc_kernel_id: usize,
     pub is_big: bool,
 }
@@ -65,18 +61,11 @@ pub struct PerfCpuOrder {
 
 #[derive(Debug)]
 pub struct CpuOrder {
-    pub all_cpus_mask: Cpumask,
     pub cpuids: Vec<CpuId>,
     pub perf_cpu_order: BTreeMap<usize, PerfCpuOrder>,
     pub cpdom_map: BTreeMap<ComputeDomainId, ComputeDomain>,
-    pub nr_cpus: usize,
-    pub nr_cores: usize,
-    pub nr_cpdoms: usize,
     pub nr_llcs: usize,
-    pub nr_numa: usize,
     pub smt_enabled: bool,
-    pub has_biglittle: bool,
-    pub has_energy_model: bool,
 }
 
 impl CpuOrder {
@@ -86,9 +75,10 @@ impl CpuOrder {
         let cpus_ps = ctx.build_topo_order(true);
         let cpdom_map = ctx.build_cpdom(&cpus_pf);
 
+        // Raptor Lake optimization:
+        // If EM is complex (>16 PDs), fallback to topological heuristic to avoid
+        // O(2^N) initialization stalls during boot.
         let perf_cpu_order = if let Ok(em) = &ctx.em {
-            // Safety cap: if too many PDs, combinatorial logic explodes O(2^N).
-            // 16 is a safe upper bound for reasonable init time.
             if em.perf_doms.len() <= 16 {
                 EnergyModelOptimizer::get_perf_cpu_order_table(em, &cpus_pf)
             } else {
@@ -102,20 +92,12 @@ impl CpuOrder {
             EnergyModelOptimizer::get_fake_perf_cpu_order_table(&cpus_pf, &cpus_ps)
         };
 
-        let nr_cpdoms = cpdom_map.len();
         Ok(CpuOrder {
-            all_cpus_mask: ctx.topo.span.clone(),
             cpuids: cpus_pf,
             perf_cpu_order,
             cpdom_map,
-            nr_cpus: ctx.topo.all_cpus.len(),
-            nr_cores: ctx.topo.all_cores.len(),
-            nr_cpdoms,
             nr_llcs: ctx.topo.all_llcs.len(),
-            nr_numa: ctx.topo.nodes.len(),
             smt_enabled: ctx.smt_enabled,
-            has_biglittle: ctx.has_biglittle,
-            has_energy_model: ctx.has_energy_model,
         })
     }
 }
@@ -124,8 +106,6 @@ struct CpuOrderCtx {
     topo: Topology,
     em: Result<EnergyModel>,
     smt_enabled: bool,
-    has_biglittle: bool,
-    has_energy_model: bool,
 }
 
 impl CpuOrderCtx {
@@ -138,7 +118,6 @@ impl CpuOrderCtx {
         let em = EnergyModel::new();
         let smt_enabled = topo.smt_enabled;
         let has_biglittle = topo.has_little_cores();
-        let has_energy_model = em.is_ok();
 
         debug!(
             "Topology: {} CPUs, Big.Little: {}",
@@ -150,29 +129,34 @@ impl CpuOrderCtx {
             topo,
             em,
             smt_enabled,
-            has_biglittle,
-            has_energy_model,
         })
     }
 
-    /// Raptor Lake Ranking: Physical P-Core (0) > E-Core (1) > SMT (2)
+    /// Godlike Ranking for Raptor Lake (i7-14700KF)
+    /// Sort order (Ascending Score):
+    /// 1. Physical P-Cores (Big=1, SMT=0) -> Score ~0
+    /// 2. Physical E-Cores (Big=0, SMT=0) -> Score ~1<<50
+    /// 3. SMT Siblings (Big=1, SMT=1)     -> Score ~1<<60
     fn rank_cpu_performance(&self, cpu: &CpuId) -> u64 {
+        // Invert Big Core bool so Big=0 (preferred), Little=1
         let core_type_score = if cpu.big_core { 0 } else { 1 };
-        let smt_score = if cpu.smt_level == 0 { 0 } else { 2 };
 
-        // Invert capacity/cache so higher values = lower score (better)
+        // SMT=0 (preferred), SMT=1 (avoid)
+        let smt_score = if cpu.smt_level == 0 { 0 } else { 1 };
+
+        // Invert capacity so larger capacity = smaller score (preferred)
+        // cpu_cap is typically 1024 for max capacity
         let cap_inv = (1024 - cpu.cpu_cap.min(1024)) as u64;
-        let cache_inv = (usize::MAX - cpu.cache_size) as u64;
 
-        ((smt_score as u64) << 56)
-            | ((core_type_score as u64) << 52)
-            | ((cpu.numa_adx as u64) << 48)
-            | (cap_inv << 32)
-            | (cache_inv << 16)
+        ((smt_score as u64) << 60)
+            | ((core_type_score as u64) << 50)
+            | ((cpu.numa_adx as u64) << 40)
+            | (cap_inv << 20)
             | (cpu.cpu_adx as u64)
     }
 
     fn rank_cpu_powersave(&self, cpu: &CpuId) -> u64 {
+        // For powersave, prefer Little cores (0) over Big cores (1)
         let core_type_score = if !cpu.big_core { 0 } else { 1 };
         let cap_score = cpu.cpu_cap as u64;
 
@@ -185,25 +169,22 @@ impl CpuOrderCtx {
 
         for (&numa_adx, node) in self.topo.nodes.iter() {
             for (&llc_adx, llc) in node.llcs.iter() {
-                for (core_rdx, (_core_adx, core)) in llc.cores.iter().enumerate() {
-                    for (cpu_rdx, (cpu_adx, cpu)) in core.cpus.iter().enumerate() {
+                for (_core_adx, core) in llc.cores.iter() {
+                    for (cpu_adx, cpu) in core.cpus.iter() {
                         let cpu_adx = *cpu_adx;
                         let pd_adx = Self::get_pd_id(&self.em, cpu_adx, llc_adx);
+
                         let cpu_id = CpuId {
+                            cpu_adx,
+                            cpu_sibling: smt_siblings[cpu_adx] as usize,
+                            cpu_cap: cpu.cpu_capacity,
                             numa_adx,
                             pd_adx,
                             llc_adx,
-                            llc_rdx: 0,
                             llc_kernel_id: llc.kernel_id,
-                            core_rdx,
-                            cpu_rdx,
-                            cpu_adx,
                             smt_level: cpu.smt_level,
-                            cache_size: cpu.cache_size,
-                            cpu_cap: cpu.cpu_capacity,
                             big_core: cpu.core_type != CoreType::Little,
                             turbo_core: cpu.core_type == CoreType::Big { turbo: true },
-                            cpu_sibling: smt_siblings[cpu_adx] as usize,
                         };
                         cpu_ids.push(cpu_id);
                     }
@@ -212,9 +193,9 @@ impl CpuOrderCtx {
         }
 
         if prefer_powersave {
-            cpu_ids.sort_by_key(|cpu| self.rank_cpu_powersave(cpu));
+            cpu_ids.sort_unstable_by_key(|cpu| self.rank_cpu_powersave(cpu));
         } else {
-            cpu_ids.sort_by_key(|cpu| self.rank_cpu_performance(cpu));
+            cpu_ids.sort_unstable_by_key(|cpu| self.rank_cpu_performance(cpu));
         }
 
         cpu_ids
@@ -229,7 +210,6 @@ impl CpuOrderCtx {
             let key = ComputeDomainId {
                 numa_adx: cpu_id.numa_adx,
                 llc_adx: cpu_id.llc_adx,
-                llc_rdx: cpu_id.llc_rdx,
                 llc_kernel_id: cpu_id.llc_kernel_id,
                 is_big: cpu_id.big_core,
             };
@@ -248,7 +228,7 @@ impl CpuOrderCtx {
             entry.cpu_ids.push(cpu_id.cpu_adx);
         }
 
-        // Separate lookup to avoid immutable borrow during mutable iteration
+        // Lookup table to avoid borrow issues
         let lookup: BTreeMap<ComputeDomainId, usize> = cpdom_map.iter()
             .map(|(k, v)| (k.clone(), v.cpdom_id))
             .collect();
@@ -273,6 +253,7 @@ impl CpuOrderCtx {
             }
         }
 
+        // Populate neighbor maps
         for (cpdom_id, dist_map) in neighbors {
             if let Some(domain) = cpdom_map.values_mut().find(|d| d.cpdom_id == cpdom_id) {
                 for (dist, n_list) in dist_map {
@@ -282,6 +263,7 @@ impl CpuOrderCtx {
             }
         }
 
+        // Link alternative domains (Big <-> Little)
         for (k, v) in cpdom_map.iter_mut() {
             let mut alt_k = k.clone();
             alt_k.is_big = !k.is_big;
@@ -289,6 +271,7 @@ impl CpuOrderCtx {
             if let Some(&alt_id) = lookup.get(&alt_k) {
                 v.cpdom_alt_id = alt_id;
             } else {
+                // Fallback: find any domain of different core type
                 'search: for n_list in v.neighbor_map.values() {
                     for &nid in n_list {
                         if let Some(&is_big) = cpdom_types.get(&nid) {
@@ -312,7 +295,6 @@ impl CpuOrderCtx {
 
         if let Ok(s) = list.binary_search(&start) {
             list.rotate_left(s);
-            // After rotation, 'start' is at index 0. Remove it to return only neighbors.
             list.remove(0);
         }
         list
@@ -335,13 +317,8 @@ impl CpuOrderCtx {
         }
         if from.numa_adx != to.numa_adx {
             d += 10;
-        } else {
-            if from.llc_rdx != to.llc_rdx {
-                d += 1;
-            }
-            if from.llc_kernel_id != to.llc_kernel_id {
-                d += 1;
-            }
+        } else if from.llc_kernel_id != to.llc_kernel_id {
+            d += 1;
         }
         d
     }
@@ -402,6 +379,7 @@ impl<'a> EnergyModelOptimizer<'a> {
         let perf_util = (perf_cap as f32) / (tot_perf.max(1) as f32);
 
         let cpus: Vec<usize> = cpuids.iter().map(|c| c.cpu_adx).collect();
+
         let (primary, overflow) = if powersave {
             let split = 1.min(cpus.len());
             (cpus[..split].to_vec(), cpus[split..].to_vec())
@@ -596,7 +574,7 @@ impl<'a> EnergyModelOptimizer<'a> {
                 }
             }
 
-            cpus_perf.sort_by_key(|&id| {
+            cpus_perf.sort_unstable_by_key(|&id| {
                 self.cpus_topological_order
                     .iter()
                     .position(|&x| x == id)
