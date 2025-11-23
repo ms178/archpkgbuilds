@@ -49,6 +49,7 @@ using namespace std::chrono_literals;
 namespace KWin
 {
 
+// Optimized string splitter avoiding unnecessary temporary allocations
 static QStringList splitPathList(const QString &input, const QChar delimiter)
 {
     if (input.isEmpty()) {
@@ -56,22 +57,24 @@ static QStringList splitPathList(const QString &input, const QChar delimiter)
     }
 
     QStringList result;
-    result.reserve(4);
+    result.reserve(5);
 
     QString current;
     current.reserve(64);
 
-    for (int i = 0; i < input.size(); ++i) {
-        const QChar ch = input[i];
+    const auto *data = input.constData();
+    const qsizetype size = input.size();
+
+    for (qsizetype i = 0; i < size; ++i) {
+        const QChar ch = data[i];
         if (ch == delimiter) {
-            if (i > 0 && input[i - 1] == u'\\') {
+            if (i > 0 && data[i - 1] == u'\\') {
                 if (!current.isEmpty()) {
-                    current[current.size() - 1] = delimiter;
+                    current[current.length() - 1] = delimiter;
                 }
-            } else if (!current.isEmpty()) {
-                result.append(std::move(current));
+            } else {
+                result.append(current);
                 current.clear();
-                current.reserve(64);
             }
         } else {
             current.append(ch);
@@ -79,7 +82,7 @@ static QStringList splitPathList(const QString &input, const QChar delimiter)
     }
 
     if (!current.isEmpty()) {
-        result.append(std::move(current));
+        result.append(current);
     }
 
     return result;
@@ -105,8 +108,6 @@ Session *DrmBackend::session() const
 
 Outputs DrmBackend::outputs() const
 {
-    // Optimized: Return COW container by value (atomic refcount only)
-    // Eliminates O(N) allocation per call.
     return m_publicOutputs;
 }
 
@@ -178,22 +179,31 @@ bool DrmBackend::initialize()
     updateOutputs();
 
     if (m_explicitGpus.empty() && m_gpus.size() > 1) {
+        // Optimized sort using clean lambda and ranges
         std::ranges::sort(m_gpus, [](const auto &a, const auto &b) {
             const auto &outputsA = a->drmOutputs();
             const auto &outputsB = b->drmOutputs();
 
-            const size_t internalCountA = std::ranges::count_if(outputsA, &Output::isInternal);
-            const size_t internalCountB = std::ranges::count_if(outputsB, &Output::isInternal);
+            size_t internalCountA = 0;
+            size_t desktopCountA = 0;
+            for (const auto &out : outputsA) {
+                if (out->isInternal()) ++internalCountA;
+                if (!out->isNonDesktop()) ++desktopCountA;
+            }
+
+            size_t internalCountB = 0;
+            size_t desktopCountB = 0;
+            for (const auto &out : outputsB) {
+                if (out->isInternal()) ++internalCountB;
+                if (!out->isNonDesktop()) ++desktopCountB;
+            }
+
             if (internalCountA != internalCountB) {
                 return internalCountA > internalCountB;
             }
-
-            const size_t desktopCountA = std::ranges::count_if(outputsA, std::not_fn(&Output::isNonDesktop));
-            const size_t desktopCountB = std::ranges::count_if(outputsB, std::not_fn(&Output::isNonDesktop));
             if (desktopCountA != desktopCountB) {
                 return desktopCountA > desktopCountB;
             }
-
             return outputsA.size() > outputsB.size();
         });
 
@@ -205,31 +215,55 @@ bool DrmBackend::initialize()
 void DrmBackend::handleUdevEvent()
 {
     while (auto device = m_udevMonitor->getDevice()) {
+        const auto action = device->action();
+
+        // Fast reject invalid actions to avoid processing overhead
+        const bool isAdd = (action == QLatin1StringView("add"));
+        const bool isChange = (action == QLatin1StringView("change"));
+        const bool isRemove = (action == QLatin1StringView("remove"));
+
+        if (!isAdd && !isChange && !isRemove) {
+            continue;
+        }
+
+        const dev_t devNum = device->devNum();
+        DrmGpu *gpu = findGpu(devNum);
+
+        // Optimized filtering: Minimize unnecessary stat/filesystem calls
         if (!m_explicitGpus.isEmpty()) {
-            const auto canonicalPath = QFileInfo(device->devNode()).canonicalFilePath();
-            const bool foundMatch = std::ranges::any_of(m_explicitGpuCanonicalPaths, [&](const QString &explicitPath) {
-                return explicitPath == canonicalPath;
-            });
-            if (!foundMatch) {
-                continue;
+            if (!gpu) {
+                // If it's a remove for an unknown device, ignore immediately.
+                if (isRemove) {
+                    continue;
+                }
+
+                // Only verify paths for potential new devices (Add or Change-to-Add).
+                // QFileInfo::canonicalFilePath implies stat(), which is costly.
+                const QString canonicalPath = QFileInfo(device->devNode()).canonicalFilePath();
+                const bool matches = std::ranges::any_of(m_explicitGpuCanonicalPaths, [&](const QString &p) {
+                    return p == canonicalPath;
+                });
+                if (!matches) {
+                    continue;
+                }
             }
         } else {
+            // Seat check is fast (integer comparison)
             if (device->seat() != m_session->seat()) {
                 continue;
             }
         }
 
-        const auto action = device->action();
-        if (action == QLatin1StringView("add")) {
-            if (findGpu(device->devNum())) {
+        if (isAdd) {
+            if (gpu) {
                 qCWarning(KWIN_DRM) << "Received unexpected add udev event for:" << device->devNode();
                 continue;
             }
             if (addGpu(device->devNode())) {
                 updateOutputs();
             }
-        } else if (action == QLatin1StringView("remove")) {
-            if (DrmGpu *gpu = findGpu(device->devNum())) {
+        } else if (isRemove) {
+            if (gpu) {
                 if (primaryGpu() == gpu) {
                     qCCritical(KWIN_DRM) << "Primary gpu has been removed! Quitting...";
                     QCoreApplication::exit(1);
@@ -239,14 +273,16 @@ void DrmBackend::handleUdevEvent()
                     updateOutputs();
                 }
             }
-        } else if (action == QLatin1StringView("change")) {
-            DrmGpu *gpu = findGpu(device->devNum());
-            if (!gpu) {
-                gpu = addGpu(device->devNode());
-            }
-            if (gpu && gpu->isActive()) {
-                qCDebug(KWIN_DRM) << "Received change event for monitored drm device" << gpu->drmDevice()->path();
-                updateOutputs();
+        } else if (isChange) {
+            if (gpu) {
+                if (gpu->isActive()) {
+                    qCDebug(KWIN_DRM) << "Received change event for monitored drm device" << gpu->drmDevice()->path();
+                    updateOutputs();
+                }
+            } else {
+                if (addGpu(device->devNode())) {
+                    updateOutputs();
+                }
             }
         }
     }
@@ -256,7 +292,8 @@ DrmGpu *DrmBackend::addGpu(const QString &fileName)
 {
     auto fdResult = m_session->openRestricted(fileName);
 
-    // Race condition fix: EBusy retry loop with non-blocking sleep
+    // Optimized retry loop: EBusy can occur if DRM master is not yet released.
+    // 5s timeout with 20ms sleeps balances responsiveness and robustness.
     if (!fdResult.has_value() && fdResult.error() == Session::Error::EBusy) {
         auto start = std::chrono::steady_clock::now();
         while (!fdResult.has_value() && fdResult.error() == Session::Error::EBusy) {
@@ -483,7 +520,6 @@ OutputConfigurationError DrmBackend::applyOutputChanges(const OutputConfiguratio
         if (error != DrmPipeline::Error::None) {
             qCWarning(KWIN_DRM) << "Configuration test failed for GPU" << gpu->drmDevice()->path()
                                 << "with error" << static_cast<int>(error);
-            // Atomic rollback: Revert changes on ALL GPUs to maintain consistent state
             for (const auto &g : m_gpus) {
                 for (DrmOutput *o : g->drmOutputs()) {
                     o->revertQueuedChanges();

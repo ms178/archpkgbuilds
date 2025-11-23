@@ -24,8 +24,17 @@ namespace KWin
 {
 
 // Global thread-local storage for traversal stacks to avoid heap allocations per frame.
-// KWin main thread is the only one traversing, but thread_local is safe.
+// Using a persistent vector with reserved capacity prevents reallocation churn.
 static thread_local std::vector<Item *> s_traversalStack;
+
+static std::vector<Item *> &getTraversalStack()
+{
+    if (s_traversalStack.capacity() < 256) {
+        s_traversalStack.reserve(256);
+    }
+    s_traversalStack.clear();
+    return s_traversalStack;
+}
 
 RenderView::RenderView(Output *output, OutputLayer *layer)
     : m_output(output)
@@ -482,8 +491,7 @@ QList<SurfaceItem *> ItemTreeView::scanoutCandidates(ssize_t maxCount) const
 // Alloc-free iterative traversal using thread_local storage
 static void accumulateRepaints(Item *rootItem, ItemTreeView *view, QRegion *repaints)
 {
-    std::vector<Item *> &stack = s_traversalStack;
-    stack.clear();
+    std::vector<Item *> &stack = getTraversalStack();
     stack.push_back(rootItem);
 
     while (!stack.empty()) {
@@ -493,6 +501,7 @@ static void accumulateRepaints(Item *rootItem, ItemTreeView *view, QRegion *repa
         *repaints += item->takeRepaints(view);
 
         const auto &childItems = item->childItems();
+        // Reverse iteration preserves processing order when pushing to stack
         for (auto it = childItems.rbegin(); it != childItems.rend(); ++it) {
             stack.push_back(*it);
         }
@@ -554,10 +563,10 @@ void ItemTreeView::setExclusive(bool enable)
     }
 }
 
+// Iterative implementation using persistent stack to avoid recursion overhead
 static bool recursiveNeedsRepaint(Item *rootItem, RenderView *view)
 {
-    std::vector<Item *> &stack = s_traversalStack;
-    stack.clear();
+    std::vector<Item *> &stack = getTraversalStack();
     stack.push_back(rootItem);
 
     while (!stack.empty()) {
@@ -591,10 +600,10 @@ bool ItemTreeView::canSkipMoveRepaint(Item *item)
     return m_layer && item == m_item;
 }
 
+// Iterative implementation using persistent stack
 static double recursiveMaxHdrHeadroom(Item *rootItem)
 {
-    std::vector<Item *> &stack = s_traversalStack;
-    stack.clear();
+    std::vector<Item *> &stack = getTraversalStack();
     stack.push_back(rootItem);
 
     double globalMaxHeadroom = 0.0;
@@ -660,7 +669,6 @@ void Scene::addRepaint(const QRegion &region)
         const QRectF viewport = view->viewport();
         const QRect viewportRect = viewport.toAlignedRect();
 
-        // Optimized: Fast reject if region doesn't intersect viewport
         if (!region.intersects(viewportRect)) {
             continue;
         }
