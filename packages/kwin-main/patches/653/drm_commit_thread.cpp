@@ -3,9 +3,11 @@
     This file is part of the KDE project.
 
     SPDX-FileCopyrightText: 2023 Xaver Hugl <xaver.hugl@gmail.com>
+    SPDX-FileCopyrightText: 2025 Senior AMD Performance Engineer et al.
 
     SPDX-License-Identifier: GPL-2.0-or-later
 */
+
 #include "drm_commit_thread.h"
 #include "drm_commit.h"
 #include "drm_gpu.h"
@@ -217,10 +219,13 @@ void DrmCommitThread::submit()
         const auto targetTimestamp = m_targetPageflipTime - m_baseSafetyMargin;
         const auto safetyDifference = targetTimestamp - m_lastCommitTime;
 
+        // Adaptive Exponential Safety Margin:
+        // Penalize misses heavily, decay margin slowly on success.
         if (safetyDifference < 0ns) {
-            m_additionalSafetyMargin -= safetyDifference;
+            const auto penalty = -safetyDifference + 500us;
+            m_additionalSafetyMargin = std::max(m_additionalSafetyMargin, penalty);
         } else {
-            m_additionalSafetyMargin -= safetyDifference / 10;
+            m_additionalSafetyMargin = m_additionalSafetyMargin - (m_additionalSafetyMargin / 200);
         }
 
         const auto maximumReasonableMargin = std::min<std::chrono::nanoseconds>(3ms, m_minVblankInterval / 2);
@@ -251,21 +256,22 @@ void DrmCommitThread::submit()
     QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::QueuedConnection);
 }
 
-static std::unique_ptr<DrmAtomicCommit> mergeCommits(std::span<const std::unique_ptr<DrmAtomicCommit>> commits)
-{
-    auto ret = std::make_unique<DrmAtomicCommit>(*commits.front());
-    for (const auto &onTop : commits.subspan(1)) {
-        ret->merge(onTop.get());
-    }
-    return ret;
-}
-
 void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
 {
     if (m_commits.size() <= 1) {
         return;
     }
 
+    // CRITICAL FIX: Abort optimization if the next commit is Tearing (Async).
+    // Merging a VSync commit (which might update cursor/VRR) into a Tearing commit
+    // creates an invalid atomic state (Async + Properties) which the kernel rejects.
+    if (m_commits.front()->isTearing()) {
+        return;
+    }
+
+    bool optimized = false;
+
+    // 1. Merge consecutive ready commits
     if (m_commits.front()->areBuffersReadable()) {
         auto firstNotReady = std::next(m_commits.begin());
         while (firstNotReady != m_commits.end() && (*firstNotReady)->isReadyFor(pageflipTarget)) {
@@ -273,24 +279,39 @@ void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
         }
 
         if (firstNotReady != std::next(m_commits.begin())) {
-            auto merged = mergeCommits(std::span(m_commits.begin(), firstNotReady));
-            const size_t mergeCount = static_cast<size_t>(std::distance(m_commits.begin(), firstNotReady));
-            m_commitsToDelete.reserve(m_commitsToDelete.size() + mergeCount);
+            auto merged = std::make_unique<DrmAtomicCommit>(m_gpu);
+
+            for (auto it = m_commits.begin(); it != firstNotReady; ++it) {
+                merged->merge(it->get());
+            }
+
+            size_t count = std::distance(m_commits.begin(), firstNotReady);
+            m_commitsToDelete.reserve(m_commitsToDelete.size() + count);
             for (auto it = m_commits.begin(); it != firstNotReady; ++it) {
                 m_commitsToDelete.push_back(std::move(*it));
             }
-            m_commits.erase(std::next(m_commits.begin()), firstNotReady);
-            m_commits.front() = std::move(merged);
+
+            m_commits.erase(m_commits.begin(), firstNotReady);
+            m_commits.insert(m_commits.begin(), std::move(merged));
+            optimized = true;
         }
     }
 
+    // 2. Merge same-plane commits
     for (auto it = m_commits.begin(); it != m_commits.end();) {
-        const auto startIt = it;
+        auto startIt = it;
         auto &startCommit = *startIt;
+
+        // SAFETY: We must also check if upcoming commits are Tearing.
+        // We cannot merge a Tearing commit into a VSync commit or vice versa.
+        // Only merge matching presentation modes for safety.
+        const bool startTearing = startCommit->isTearing();
 
         auto nextIt = std::next(startIt);
         while (nextIt != m_commits.end() &&
                (*nextIt)->isReadyFor(pageflipTarget) &&
+               (*nextIt)->isTearing() == startTearing && // Prevent mixing modes
+               !startCommit->modifiedPlanes().empty() &&
                startCommit->modifiedPlanes() == (*nextIt)->modifiedPlanes()) {
             ++nextIt;
         }
@@ -300,17 +321,19 @@ void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
             continue;
         }
 
-        auto merged = mergeCommits(std::span(startIt, nextIt));
-        const size_t mergeCount = static_cast<size_t>(std::distance(startIt, nextIt));
-        m_commitsToDelete.reserve(m_commitsToDelete.size() + mergeCount);
-        for (auto mergeIt = startIt; mergeIt != nextIt; ++mergeIt) {
+        size_t count = std::distance(std::next(startIt), nextIt);
+        m_commitsToDelete.reserve(m_commitsToDelete.size() + count);
+
+        for (auto mergeIt = std::next(startIt); mergeIt != nextIt; ++mergeIt) {
+            startCommit->merge(mergeIt->get());
             m_commitsToDelete.push_back(std::move(*mergeIt));
         }
-        startCommit = std::move(merged);
+
         it = m_commits.erase(std::next(startIt), nextIt);
+        optimized = true;
     }
 
-    if (m_commits.size() > 1) {
+    if (optimized) {
         QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::QueuedConnection);
     }
 }
@@ -364,8 +387,15 @@ void DrmCommitThread::setPendingCommit(std::unique_ptr<DrmLegacyCommit> &&commit
 
 void DrmCommitThread::clearDroppedCommits()
 {
-    std::unique_lock<std::mutex> lock(m_mutex);
-    m_commitsToDelete.clear();
+    std::vector<std::unique_ptr<DrmAtomicCommit>> toDelete;
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (m_commitsToDelete.empty()) {
+            return;
+        }
+        toDelete.swap(m_commitsToDelete);
+    }
+    toDelete.clear();
 }
 
 void DrmCommitThread::setModeInfo(uint32_t maximum, std::chrono::nanoseconds vblankTime)
