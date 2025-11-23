@@ -1,3 +1,307 @@
+--- a/src/opengl/eglcontext.cpp	2025-11-23 20:22:47.972966419 +0100
++++ b/src/opengl/eglcontext.cpp	2025-11-23 20:23:41.976490953 +0100
+@@ -29,6 +29,7 @@ namespace KWin
+ {
+ 
+ EglContext *EglContext::s_currentContext = nullptr;
++static EGLSurface s_currentSurface = EGL_NO_SURFACE;
+ 
+ std::unique_ptr<EglContext> EglContext::create(EglDisplay *display, EGLConfig config, ::EGLContext sharedContext)
+ {
+@@ -36,10 +37,15 @@ std::unique_ptr<EglContext> EglContext::
+     if (!handle) {
+         return nullptr;
+     }
++    // Initial makeCurrent to verify context validity and setup initial state
+     if (!eglMakeCurrent(display->handle(), EGL_NO_SURFACE, EGL_NO_SURFACE, handle)) {
+         eglDestroyContext(display->handle(), handle);
+         return nullptr;
+     }
++
++    // Update global state tracker since we just forced a bind
++    s_currentSurface = EGL_NO_SURFACE;
++
+     auto ret = std::make_unique<EglContext>(display, config, handle);
+     s_currentContext = ret.get();
+     if (!ret->checkSupported()) {
+@@ -52,17 +58,20 @@ static QSet<QByteArray> getExtensions(Eg
+ {
+     QSet<QByteArray> ret;
+     if (!context->isOpenGLES() && context->hasVersion(Version(3, 0))) {
+-        int count;
++        int count = 0;
+         glGetIntegerv(GL_NUM_EXTENSIONS, &count);
+-
++        ret.reserve(count);
+         for (int i = 0; i < count; i++) {
+             const char *name = (const char *)glGetStringi(GL_EXTENSIONS, i);
+-            ret.insert(name);
++            if (name) ret.insert(QByteArray::fromRawData(name, qstrlen(name)));
+         }
+     } else {
+-        const QByteArray extensions = (const char *)glGetString(GL_EXTENSIONS);
+-        QList<QByteArray> extensionsList = extensions.split(' ');
+-        ret = {extensionsList.constBegin(), extensionsList.constEnd()};
++        const char *extStr = (const char *)glGetString(GL_EXTENSIONS);
++        if (extStr) {
++            const QByteArray extensions = QByteArray::fromRawData(extStr, qstrlen(extStr));
++            QList<QByteArray> extensionsList = extensions.split(' ');
++            ret = {extensionsList.constBegin(), extensionsList.constEnd()};
++        }
+     }
+     return ret;
+ }
+@@ -170,16 +179,34 @@ bool EglContext::makeCurrent()
+ 
+ bool EglContext::makeCurrent(EGLSurface surface)
+ {
++    // Fast path: if we are already current with the same surface, return immediately.
++    // This reduces syscalls and driver overhead significantly in the render loop.
++    if (s_currentContext == this && s_currentSurface == surface) {
++        return true;
++    }
++
+     if (QOpenGLContext *context = QOpenGLContext::currentContext()) {
+         // Workaround to tell Qt that no QOpenGLContext is current
+         context->doneCurrent();
+     }
+-    const bool ret = eglMakeCurrent(m_display->handle(), surface, surface, m_handle) == EGL_TRUE;
++
++    bool ret = eglMakeCurrent(m_display->handle(), surface, surface, m_handle) == EGL_TRUE;
++
++    // Retry logic for EGL_BAD_ACCESS:
++    // If the context is locked/stuck (common with threading or fast surface switching),
++    // explicitly unbind everything and try again.
++    if (!ret && eglGetError() == EGL_BAD_ACCESS) {
++        eglMakeCurrent(m_display->handle(), EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++        ret = eglMakeCurrent(m_display->handle(), surface, surface, m_handle) == EGL_TRUE;
++    }
++
+     if (ret) {
+         s_currentContext = this;
++        s_currentSurface = surface;
+     } else {
+-        // QOpenGLContext::doneCurrent unset the context, we need to mirror that here!
++        // Ensure state tracker is reset on failure
+         s_currentContext = nullptr;
++        s_currentSurface = EGL_NO_SURFACE;
+         qCWarning(KWIN_OPENGL, "Could not make egl context current! %s", qPrintable(getEglErrorString()));
+     }
+     return ret;
+@@ -189,6 +216,7 @@ void EglContext::doneCurrent() const
+ {
+     eglMakeCurrent(m_display->handle(), EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+     s_currentContext = nullptr;
++    s_currentSurface = EGL_NO_SURFACE;
+ }
+ 
+ EglDisplay *EglContext::displayObject() const
+@@ -227,6 +255,9 @@ static inline bool shouldUseOpenGLES()
+     const bool haveResetOnVideoMemoryPurge = display->hasExtension(QByteArrayLiteral("EGL_NV_robustness_video_memory_purge"));
+ 
+     std::vector<std::unique_ptr<AbstractOpenGLContextAttributeBuilder>> candidates;
++    // Reserve to avoid reallocations during initialization
++    candidates.reserve(6);
++
+     if (shouldUseOpenGLES()) {
+         if (haveCreateContext && haveRobustness && haveContextPriority && haveResetOnVideoMemoryPurge) {
+             auto glesRobustPriority = std::make_unique<EglOpenGLESContextAttributeBuilder>();
+@@ -336,8 +367,6 @@ bool EglContext::checkTimerQuerySupport(
+         return false;
+     }
+     if (m_isOpenglES) {
+-        // 3.0 is required so query functions can be used without "EXT" suffix.
+-        // Timer queries are still not part of the core OpenGL ES specification.
+         return openglVersion() >= Version(3, 0) && hasOpenglExtension("GL_EXT_disjoint_timer_query");
+     } else {
+         return openglVersion() >= Version(3, 3) || hasOpenglExtension("GL_ARB_timer_query");
+@@ -386,9 +415,8 @@ bool EglContext::isOpenGLES() const
+ 
+ bool EglContext::hasOpenglExtension(QByteArrayView name) const
+ {
+-    return std::any_of(m_extensions.cbegin(), m_extensions.cend(), [name](const auto &string) {
+-        return string == name;
+-    });
++    // Fast path for checking extensions using the set
++    return m_extensions.contains(QByteArray(name.data(), name.size()));
+ }
+ 
+ bool EglContext::isSoftwareRenderer() const
+@@ -487,8 +515,6 @@ bool EglContext::checkSupported() const
+     if (!supportsGLSL || !supportsNonPowerOfTwoTextures || !supports3DTextures || !supportsFBOs || !supportsUnpack) {
+         return false;
+     }
+-    // some old hardware only supports very limited shaders. To prevent the shaders KWin uses later on from not working,
+-    // test a reasonably complex one here and bail out early if it doesn't work
+     auto shader = m_shaderManager->shader(ShaderTrait::MapTexture | ShaderTrait::TransformColorspace | ShaderTrait::AdjustSaturation | ShaderTrait::Modulate);
+     return shader->isValid();
+ }
+@@ -528,13 +554,11 @@ void EglContext::glResolveFunctions(cons
+         }
+     }
+     if (robustContext && haveArbRobustness) {
+-        // See https://www.opengl.org/registry/specs/ARB/robustness.txt
+         m_glGetGraphicsResetStatus = (glGetGraphicsResetStatus_func)resolveFunction("glGetGraphicsResetStatusARB");
+         m_glReadnPixels = (glReadnPixels_func)resolveFunction("glReadnPixelsARB");
+         m_glGetnTexImage = (glGetnTexImage_func)resolveFunction("glGetnTexImageARB");
+         m_glGetnUniformfv = (glGetnUniformfv_func)resolveFunction("glGetnUniformfvARB");
+     } else if (robustContext && haveExtRobustness) {
+-        // See https://www.khronos.org/registry/gles/extensions/EXT/EXT_robustness.txt
+         m_glGetGraphicsResetStatus = (glGetGraphicsResetStatus_func)resolveFunction("glGetGraphicsResetStatusEXT");
+         m_glReadnPixels = (glReadnPixels_func)resolveFunction("glReadnPixelsEXT");
+         m_glGetnUniformfv = (glGetnUniformfv_func)resolveFunction("glGetnUniformfvEXT");
+@@ -550,17 +574,13 @@ void EglContext::initDebugOutput()
+     }
+ 
+     if (!have_ARB_debug) {
+-        // if we don't have ARB debug, but only KHR debug we need to verify whether the context is a debug context
+-        // it should work without as well, but empirical tests show: no it doesn't
+         if (isOpenGLES()) {
+             if (!hasVersion(Version(3, 2))) {
+-                // empirical data shows extension doesn't work
+                 return;
+             }
+         } else if (!hasVersion(Version(3, 0))) {
+             return;
+         }
+-        // can only be queried with either OpenGL >= 3.0 or OpenGL ES of at least 3.1
+         GLint value = 0;
+         glGetIntegerv(GL_CONTEXT_FLAGS, &value);
+         if (!(value & GL_CONTEXT_FLAG_DEBUG_BIT)) {
+@@ -568,7 +588,6 @@ void EglContext::initDebugOutput()
+         }
+     }
+ 
+-    // Set the callback function
+     auto callback = [](GLenum source, GLenum type, GLuint id,
+                        GLenum severity, GLsizei length,
+                        const GLchar *message,
+@@ -595,20 +614,16 @@ void EglContext::initDebugOutput()
+ 
+     glDebugMessageCallback(callback, nullptr);
+ 
+-    // This state exists only in GL_KHR_debug
+     if (have_KHR_debug) {
+         glEnable(GL_DEBUG_OUTPUT);
+     }
+ 
+     if (qEnvironmentVariableIntValue("KWIN_GL_DEBUG")) {
+-        // Enable all debug messages
+         glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, nullptr, GL_TRUE);
+-        // Insert a test message
+         const QByteArray message = QByteArrayLiteral("OpenGL debug output initialized");
+         glDebugMessageInsert(GL_DEBUG_SOURCE_APPLICATION, GL_DEBUG_TYPE_OTHER, 0,
+                              GL_DEBUG_SEVERITY_LOW, message.length(), message.constData());
+     } else {
+-        // Only enable error messages
+         glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_ERROR, GL_DONT_CARE, 0, nullptr, GL_TRUE);
+         glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_UNDEFINED_BEHAVIOR, GL_DONT_CARE, 0, nullptr, GL_TRUE);
+     }
+
+
+--- a/src/backends/drm/drm_egl_backend.cpp	2025-11-23 19:25:04.048479475 +0100
++++ b/src/backends/drm/drm_egl_backend.cpp	2025-11-23 20:24:17.989507737 +0100
+@@ -110,19 +110,35 @@ std::shared_ptr<EglContext> EglGbmBacken
+     if (gpu == m_backend->primaryGpu()) {
+         return m_context;
+     }
+-    auto display = gpu->eglDisplay();
++
++    EglDisplay *display = gpu->eglDisplay();
+     if (!display) {
+         display = createEglDisplay(gpu);
+         if (!display) {
+             return nullptr;
+         }
+     }
+-    auto &context = m_contexts[display];
+-    if (const auto c = context.lock()) {
+-        return c;
++
++    // Efficient map access: iterator avoids double lookup
++    auto it = m_contexts.find(display);
++    if (it != m_contexts.end()) {
++        if (auto c = it->second.lock()) {
++            return c;
++        }
++    }
++
++    // Create new context
++    auto ret = std::shared_ptr<EglContext>(EglContext::create(display, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT));
++
++    // Update map with new weak pointer
++    if (ret) {
++        if (it != m_contexts.end()) {
++            it->second = ret;
++        } else {
++            m_contexts.emplace(display, ret);
++        }
+     }
+-    const auto ret = std::shared_ptr<EglContext>(EglContext::create(display, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT));
+-    context = ret;
++
+     return ret;
+ }
+ 
+--- a/src/opengl/eglbackend.cpp	2025-11-23 19:27:59.043097143 +0100
++++ b/src/opengl/eglbackend.cpp	2025-11-23 19:44:49.152102280 +0100
+@@ -72,7 +72,6 @@ bool EglBackend::checkGraphicsReset()
+     QElapsedTimer timer;
+     timer.start();
+ 
+-    // Wait until the reset is completed or max one second
+     while (timer.elapsed() < 10000 && context->checkGraphicsResetStatus() != GL_NO_ERROR) {
+         usleep(50);
+     }
+@@ -237,12 +236,9 @@ void EglBackend::initWayland()
+ 
+ void EglBackend::initClientExtensions()
+ {
+-    // Get the list of client extensions
+     const char *clientExtensionsCString = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+     const QByteArray clientExtensionsString = QByteArray::fromRawData(clientExtensionsCString, qstrlen(clientExtensionsCString));
+     if (clientExtensionsString.isEmpty()) {
+-        // If eglQueryString() returned NULL, the implementation doesn't support
+-        // EGL_EXT_client_extensions. Expect an EGL_BAD_DISPLAY error.
+         EGLint error = eglGetError();
+         if (error != EGL_SUCCESS) {
+             qCWarning(KWIN_OPENGL) << "Error during eglQueryString " << getEglErrorString(error);
+@@ -287,7 +283,7 @@ EGLImageKHR EglBackend::importBufferAsIm
+     Q_ASSERT(buffer->dmabufAttributes());
+     EGLImageKHR image = importDmaBufAsImage(*buffer->dmabufAttributes(), plane, format, size);
+     if (image != EGL_NO_IMAGE_KHR) {
+-        m_importedBuffers[key] = image;
++        m_importedBuffers.insert(key, image);
+         connect(buffer, &QObject::destroyed, this, [this, key]() {
+             m_display->destroyImage(m_importedBuffers.take(key));
+         });
+@@ -300,7 +296,7 @@ EGLImageKHR EglBackend::importBufferAsIm
+ 
+ EGLImageKHR EglBackend::importBufferAsImage(GraphicsBuffer *buffer)
+ {
+-    auto key = std::pair(buffer, 0);
++    std::pair key(buffer, 0);
+     auto it = m_importedBuffers.constFind(key);
+     if (Q_LIKELY(it != m_importedBuffers.constEnd())) {
+         return *it;
+@@ -309,7 +305,7 @@ EGLImageKHR EglBackend::importBufferAsIm
+     Q_ASSERT(buffer->dmabufAttributes());
+     EGLImageKHR image = importDmaBufAsImage(*buffer->dmabufAttributes());
+     if (image != EGL_NO_IMAGE_KHR) {
+-        m_importedBuffers[key] = image;
++        m_importedBuffers.insert(key, image);
+         connect(buffer, &QObject::destroyed, this, [this, key]() {
+             m_display->destroyImage(m_importedBuffers.take(key));
+         });
+@@ -341,7 +337,6 @@ bool EglBackend::testImportBuffer(Graphi
+     if (auto it = nonExternalOnly.find(buffer->dmabufAttributes()->format); it != nonExternalOnly.end() && it->contains(buffer->dmabufAttributes()->modifier)) {
+         return importBufferAsImage(buffer) != EGL_NO_IMAGE_KHR;
+     }
+-    // external_only buffers aren't used as a single EGLImage, import them separately
+     const auto info = FormatInfo::get(buffer->dmabufAttributes()->format);
+     if (!info || !info->yuvConversion()) {
+         return false;
+
 --- a/src/backends/drm/drm_gpu.h	2025-11-22 19:45:58.299690811 +0100
 +++ b/src/backends/drm/drm_gpu.h	2025-11-22 19:56:13.713090099 +0100
 @@ -23,6 +23,8 @@
@@ -1665,7 +1969,7 @@
  
 --- a/src/scene/scene.cpp	2025-11-11 11:58:57.151756432 +0100
 +++ b/src/scene/scene.cpp	2025-11-11 12:08:13.016172467 +0100
-@@ -15,9 +15,18 @@
+@@ -15,9 +15,27 @@
  #include "scene/itemrenderer.h"
  #include "scene/surfaceitem.h"
  
@@ -1678,13 +1982,22 @@
  {
  
 +// Global thread-local storage for traversal stacks to avoid heap allocations per frame.
-+// KWin main thread is the only one traversing, but thread_local is safe.
++// Using a persistent vector with reserved capacity prevents reallocation churn.
 +static thread_local std::vector<Item *> s_traversalStack;
++
++static std::vector<Item *> &getTraversalStack()
++{
++    if (s_traversalStack.capacity() < 256) {
++        s_traversalStack.reserve(256);
++    }
++    s_traversalStack.clear();
++    return s_traversalStack;
++}
 +
  RenderView::RenderView(Output *output, OutputLayer *layer)
      : m_output(output)
      , m_layer(layer)
-@@ -46,18 +55,16 @@ void RenderView::setLayer(OutputLayer *l
+@@ -46,18 +64,16 @@ void RenderView::setLayer(OutputLayer *l
  
  void RenderView::addRepaint(const QRegion &region)
  {
@@ -1707,7 +2020,7 @@
  }
  
  bool RenderView::canSkipMoveRepaint(Item *item)
-@@ -123,9 +130,14 @@ void SceneView::postPaint()
+@@ -123,9 +139,14 @@ void SceneView::postPaint()
  
  void SceneView::paint(const RenderTarget &renderTarget, const QRegion &region)
  {
@@ -1725,7 +2038,7 @@
  }
  
  double SceneView::desiredHdrHeadroom() const
-@@ -189,16 +201,22 @@ void SceneView::removeUnderlay(RenderVie
+@@ -189,16 +210,22 @@ void SceneView::removeUnderlay(RenderVie
  
  bool SceneView::shouldRenderItem(Item *item) const
  {
@@ -1754,7 +2067,7 @@
  }
  
  Scene *SceneView::scene() const
-@@ -211,33 +229,35 @@ ItemView::ItemView(SceneView *parentView
+@@ -211,33 +238,35 @@ ItemView::ItemView(SceneView *parentView
      , m_parentView(parentView)
      , m_item(item)
  {
@@ -1801,7 +2114,7 @@
          return QRectF();
      }
      return calculateViewport(m_item->rect());
-@@ -245,42 +265,62 @@ QRectF ItemView::viewport() const
+@@ -245,42 +274,62 @@ QRectF ItemView::viewport() const
  
  QRectF ItemView::calculateViewport(const QRectF &itemRect) const
  {
@@ -1882,7 +2195,7 @@
  }
  
  void ItemView::prePaint()
-@@ -289,8 +329,12 @@ void ItemView::prePaint()
+@@ -289,8 +338,12 @@ void ItemView::prePaint()
  
  QRegion ItemView::collectDamage()
  {
@@ -1897,7 +2210,7 @@
  }
  
  void ItemView::postPaint()
-@@ -299,7 +343,18 @@ void ItemView::postPaint()
+@@ -299,7 +352,18 @@ void ItemView::postPaint()
  
  void ItemView::paint(const RenderTarget &renderTarget, const QRegion &region)
  {
@@ -1917,7 +2230,7 @@
      RenderViewport renderViewport(viewport(), m_output->scale(), renderTarget);
      auto renderer = m_item->scene()->renderer();
      renderer->beginFrame(renderTarget, renderViewport);
-@@ -322,10 +377,13 @@ void ItemView::setExclusive(bool enable)
+@@ -322,10 +386,13 @@ void ItemView::setExclusive(bool enable)
          return;
      }
      m_exclusive = enable;
@@ -1933,7 +2246,7 @@
          m_parentView->addRepaint(m_item->takeRepaints(m_parentView));
          m_parentView->addExclusiveView(this);
          if (m_underlay) {
-@@ -343,7 +401,7 @@ void ItemView::setUnderlay(bool underlay
+@@ -343,7 +410,7 @@ void ItemView::setUnderlay(bool underlay
          return;
      }
      m_underlay = underlay;
@@ -1942,7 +2255,7 @@
          return;
      }
      if (m_underlay) {
-@@ -351,12 +409,14 @@ void ItemView::setUnderlay(bool underlay
+@@ -351,12 +418,14 @@ void ItemView::setUnderlay(bool underlay
      } else {
          m_parentView->removeUnderlay(this);
      }
@@ -1959,7 +2272,7 @@
  }
  
  bool ItemView::canSkipMoveRepaint(Item *item)
-@@ -371,9 +431,18 @@ Item *ItemView::item() const
+@@ -371,9 +440,18 @@ Item *ItemView::item() const
  
  double ItemView::desiredHdrHeadroom() const
  {
@@ -1980,7 +2293,7 @@
  }
  
  ItemTreeView::ItemTreeView(SceneView *parentView, Item *item, Output *output, OutputLayer *layer)
-@@ -390,8 +459,7 @@ ItemTreeView::~ItemTreeView()
+@@ -390,8 +468,7 @@ ItemTreeView::~ItemTreeView()
  
  QRectF ItemTreeView::viewport() const
  {
@@ -1990,7 +2303,7 @@
          return QRectF();
      }
      return calculateViewport(m_item->boundingRect());
-@@ -399,40 +467,54 @@ QRectF ItemTreeView::viewport() const
+@@ -399,40 +476,54 @@ QRectF ItemTreeView::viewport() const
  
  QList<SurfaceItem *> ItemTreeView::scanoutCandidates(ssize_t maxCount) const
  {
@@ -2018,14 +2331,12 @@
 +static void accumulateRepaints(Item *rootItem, ItemTreeView *view, QRegion *repaints)
  {
 -    *repaints += item->takeRepaints(view);
--
++    std::vector<Item *> &stack = getTraversalStack();
++    stack.push_back(rootItem);
+ 
 -    const auto childItems = item->childItems();
 -    for (Item *childItem : childItems) {
 -        accumulateRepaints(childItem, view, repaints);
-+    std::vector<Item *> &stack = s_traversalStack;
-+    stack.clear();
-+    stack.push_back(rootItem);
-+
 +    while (!stack.empty()) {
 +        Item *item = stack.back();
 +        stack.pop_back();
@@ -2033,6 +2344,7 @@
 +        *repaints += item->takeRepaints(view);
 +
 +        const auto &childItems = item->childItems();
++        // Reverse iteration preserves processing order when pushing to stack
 +        for (auto it = childItems.rbegin(); it != childItems.rend(); ++it) {
 +            stack.push_back(*it);
 +        }
@@ -2060,7 +2372,7 @@
      const QRegion globalRegion = infiniteRegion();
      RenderViewport renderViewport(viewport(), m_output->scale(), renderTarget);
      auto renderer = m_item->scene()->renderer();
-@@ -445,7 +527,7 @@ void ItemTreeView::paint(const RenderTar
+@@ -445,7 +536,7 @@ void ItemTreeView::paint(const RenderTar
  
  bool ItemTreeView::shouldRenderItem(Item *item) const
  {
@@ -2069,7 +2381,7 @@
  }
  
  void ItemTreeView::setExclusive(bool enable)
-@@ -454,10 +536,13 @@ void ItemTreeView::setExclusive(bool ena
+@@ -454,10 +545,13 @@ void ItemTreeView::setExclusive(bool ena
          return;
      }
      m_exclusive = enable;
@@ -2085,17 +2397,17 @@
          m_parentView->addRepaint(m_item->takeRepaints(m_parentView));
          m_parentView->addExclusiveView(this);
          if (m_underlay) {
-@@ -469,49 +554,79 @@ void ItemTreeView::setExclusive(bool ena
+@@ -469,49 +563,79 @@ void ItemTreeView::setExclusive(bool ena
      }
  }
  
 -static bool recursiveNeedsRepaint(Item *item, RenderView *view)
++// Iterative implementation using persistent stack to avoid recursion overhead
 +static bool recursiveNeedsRepaint(Item *rootItem, RenderView *view)
  {
 -    if (item->hasRepaints(view)) {
 -        return true;
-+    std::vector<Item *> &stack = s_traversalStack;
-+    stack.clear();
++    std::vector<Item *> &stack = getTraversalStack();
 +    stack.push_back(rootItem);
 +
 +    while (!stack.empty()) {
@@ -2139,6 +2451,7 @@
  }
  
 -static double recursiveMaxHdrHeadroom(Item *item)
++// Iterative implementation using persistent stack
 +static double recursiveMaxHdrHeadroom(Item *rootItem)
  {
 -    const auto &color = item->colorDescription();
@@ -2147,8 +2460,7 @@
 -    const auto children = item->childItems();
 -    for (Item *child : children) {
 -        headroom = std::max(headroom, recursiveMaxHdrHeadroom(child));
-+    std::vector<Item *> &stack = s_traversalStack;
-+    stack.clear();
++    std::vector<Item *> &stack = getTraversalStack();
 +    stack.push_back(rootItem);
 +
 +    double globalMaxHeadroom = 0.0;
@@ -2185,7 +2497,7 @@
      return recursiveMaxHdrHeadroom(m_item);
  }
  
-@@ -531,7 +646,7 @@ ItemRenderer *Scene::renderer() const
+@@ -531,7 +655,7 @@ ItemRenderer *Scene::renderer() const
  
  void Scene::addRepaintFull()
  {
@@ -2194,7 +2506,7 @@
  }
  
  void Scene::addRepaint(int x, int y, int width, int height)
-@@ -541,13 +656,18 @@ void Scene::addRepaint(int x, int y, int
+@@ -541,13 +665,17 @@ void Scene::addRepaint(int x, int y, int
  
  void Scene::addRepaint(const QRegion &region)
  {
@@ -2208,7 +2520,6 @@
 -        if (!dirtyRegion.isEmpty()) {
 +        const QRect viewportRect = viewport.toAlignedRect();
 +
-+        // Optimized: Fast reject if region doesn't intersect viewport
 +        if (!region.intersects(viewportRect)) {
 +            continue;
 +        }
@@ -2219,7 +2530,7 @@
              view->addRepaint(dirtyRegion);
          }
      }
-@@ -555,9 +675,9 @@ void Scene::addRepaint(const QRegion &re
+@@ -555,9 +683,9 @@ void Scene::addRepaint(const QRegion &re
  
  void Scene::addRepaint(RenderView *view, const QRegion &region)
  {
@@ -2232,7 +2543,7 @@
  }
  
  QRegion Scene::damage() const
-@@ -605,7 +725,7 @@ void Scene::frame(SceneView *view, Outpu
+@@ -605,7 +733,7 @@ void Scene::frame(SceneView *view, Outpu
  
  double Scene::desiredHdrHeadroom() const
  {
@@ -5526,8 +5837,11 @@
  #include <gbm.h>
  #include <libdrm/drm_mode.h>
  #include <xf86drm.h>
-@@ -51,33 +51,49 @@ namespace KWin
+@@ -49,35 +49,54 @@ using namespace std::chrono_literals;
+ namespace KWin
+ {
  
++// Optimized string splitter avoiding unnecessary temporary allocations
  static QStringList splitPathList(const QString &input, const QChar delimiter)
  {
 -    QStringList ret;
@@ -5544,22 +5858,24 @@
 +    }
 +
 +    QStringList result;
-+    result.reserve(4);
++    result.reserve(5);
 +
 +    QString current;
 +    current.reserve(64);
 +
-+    for (int i = 0; i < input.size(); ++i) {
-+        const QChar ch = input[i];
++    const auto *data = input.constData();
++    const qsizetype size = input.size();
++
++    for (qsizetype i = 0; i < size; ++i) {
++        const QChar ch = data[i];
 +        if (ch == delimiter) {
-+            if (i > 0 && input[i - 1] == u'\\') {
++            if (i > 0 && data[i - 1] == u'\\') {
 +                if (!current.isEmpty()) {
-+                    current[current.size() - 1] = delimiter;
++                    current[current.length() - 1] = delimiter;
 +                }
-+            } else if (!current.isEmpty()) {
-+                result.append(std::move(current));
++            } else {
++                result.append(current);
 +                current.clear();
-+                current.reserve(64);
              }
          } else {
 -            tmp.append(input[i]);
@@ -5570,7 +5886,7 @@
 -        ret.append(tmp);
 +
 +    if (!current.isEmpty()) {
-+        result.append(std::move(current));
++        result.append(current);
      }
 -    return ret;
 +
@@ -5592,13 +5908,11 @@
  }
  
  DrmBackend::~DrmBackend() = default;
-@@ -89,7 +105,18 @@ Session *DrmBackend::session() const
+@@ -89,7 +108,16 @@ Session *DrmBackend::session() const
  
  Outputs DrmBackend::outputs() const
  {
 -    return m_outputs;
-+    // Optimized: Return COW container by value (atomic refcount only)
-+    // Eliminates O(N) allocation per call.
 +    return m_publicOutputs;
 +}
 +
@@ -5612,7 +5926,7 @@
  }
  
  bool DrmBackend::initialize()
-@@ -102,14 +129,10 @@ bool DrmBackend::initialize()
+@@ -102,14 +130,10 @@ bool DrmBackend::initialize()
      connect(m_session, &Session::deviceResumed, this, [this](dev_t deviceId) {
          if (const auto gpu = findGpu(deviceId); gpu && !gpu->isActive()) {
              gpu->setActive(true);
@@ -5627,7 +5941,7 @@
          for (const auto &gpu : m_gpus) {
              if (gpu->atomicModeSetting()) {
                  continue;
-@@ -122,7 +145,12 @@ bool DrmBackend::initialize()
+@@ -122,7 +146,12 @@ bool DrmBackend::initialize()
      });
  
      if (!m_explicitGpus.isEmpty()) {
@@ -5640,7 +5954,7 @@
              addGpu(fileName);
          }
      } else {
-@@ -139,11 +167,9 @@ bool DrmBackend::initialize()
+@@ -139,11 +168,9 @@ bool DrmBackend::initialize()
          return false;
      }
  
@@ -5653,7 +5967,7 @@
              m_socketNotifier = std::make_unique<QSocketNotifier>(fd, QSocketNotifier::Read);
              connect(m_socketNotifier.get(), &QSocketNotifier::activated, this, &DrmBackend::handleUdevEvent);
              m_udevMonitor->enable();
-@@ -152,19 +178,25 @@ bool DrmBackend::initialize()
+@@ -152,19 +179,34 @@ bool DrmBackend::initialize()
      updateOutputs();
  
      if (m_explicitGpus.empty() && m_gpus.size() > 1) {
@@ -5667,77 +5981,130 @@
 -            const size_t desktopOutputs2 = std::ranges::count_if(gpu2->drmOutputs(), std::not_fn(&Output::isNonDesktop));
 -            if (desktopOutputs1 != desktopOutputs2) {
 -                return desktopOutputs1 > desktopOutputs2;
++        // Optimized sort using clean lambda and ranges
 +        std::ranges::sort(m_gpus, [](const auto &a, const auto &b) {
 +            const auto &outputsA = a->drmOutputs();
 +            const auto &outputsB = b->drmOutputs();
 +
-+            const size_t internalCountA = std::ranges::count_if(outputsA, &Output::isInternal);
-+            const size_t internalCountB = std::ranges::count_if(outputsB, &Output::isInternal);
-+            if (internalCountA != internalCountB) {
-+                return internalCountA > internalCountB;
++            size_t internalCountA = 0;
++            size_t desktopCountA = 0;
++            for (const auto &out : outputsA) {
++                if (out->isInternal()) ++internalCountA;
++                if (!out->isNonDesktop()) ++desktopCountA;
++            }
++
++            size_t internalCountB = 0;
++            size_t desktopCountB = 0;
++            for (const auto &out : outputsB) {
++                if (out->isInternal()) ++internalCountB;
++                if (!out->isNonDesktop()) ++desktopCountB;
              }
 -            return gpu1->drmOutputs().size() > gpu2->drmOutputs().size();
 +
-+            const size_t desktopCountA = std::ranges::count_if(outputsA, std::not_fn(&Output::isNonDesktop));
-+            const size_t desktopCountB = std::ranges::count_if(outputsB, std::not_fn(&Output::isNonDesktop));
++            if (internalCountA != internalCountB) {
++                return internalCountA > internalCountB;
++            }
 +            if (desktopCountA != desktopCountB) {
 +                return desktopCountA > desktopCountB;
 +            }
-+
 +            return outputsA.size() > outputsB.size();
          });
 +
          qCDebug(KWIN_DRM) << "chose" << m_gpus.front()->drmDevice()->path() << "as the primary GPU";
      }
      return true;
-@@ -173,11 +205,10 @@ bool DrmBackend::initialize()
+@@ -173,23 +215,46 @@ bool DrmBackend::initialize()
  void DrmBackend::handleUdevEvent()
  {
      while (auto device = m_udevMonitor->getDevice()) {
 -        // Ignore the device seat if the KWIN_DRM_DEVICES envvar is set.
++        const auto action = device->action();
++
++        // Fast reject invalid actions to avoid processing overhead
++        const bool isAdd = (action == QLatin1StringView("add"));
++        const bool isChange = (action == QLatin1StringView("change"));
++        const bool isRemove = (action == QLatin1StringView("remove"));
++
++        if (!isAdd && !isChange && !isRemove) {
++            continue;
++        }
++
++        const dev_t devNum = device->devNum();
++        DrmGpu *gpu = findGpu(devNum);
++
++        // Optimized filtering: Minimize unnecessary stat/filesystem calls
          if (!m_explicitGpus.isEmpty()) {
-             const auto canonicalPath = QFileInfo(device->devNode()).canonicalFilePath();
+-            const auto canonicalPath = QFileInfo(device->devNode()).canonicalFilePath();
 -            const bool foundMatch = std::ranges::any_of(m_explicitGpus, [&canonicalPath](const QString &explicitPath) {
 -                return QFileInfo(explicitPath).canonicalFilePath() == canonicalPath;
-+            const bool foundMatch = std::ranges::any_of(m_explicitGpuCanonicalPaths, [&](const QString &explicitPath) {
-+                return explicitPath == canonicalPath;
-             });
-             if (!foundMatch) {
+-            });
+-            if (!foundMatch) {
+-                continue;
++            if (!gpu) {
++                // If it's a remove for an unknown device, ignore immediately.
++                if (isRemove) {
++                    continue;
++                }
++
++                // Only verify paths for potential new devices (Add or Change-to-Add).
++                // QFileInfo::canonicalFilePath implies stat(), which is costly.
++                const QString canonicalPath = QFileInfo(device->devNode()).canonicalFilePath();
++                const bool matches = std::ranges::any_of(m_explicitGpuCanonicalPaths, [&](const QString &p) {
++                    return p == canonicalPath;
++                });
++                if (!matches) {
++                    continue;
++                }
+             }
+         } else {
++            // Seat check is fast (integer comparison)
+             if (device->seat() != m_session->seat()) {
                  continue;
-@@ -188,18 +219,17 @@ void DrmBackend::handleUdevEvent()
              }
          }
  
 -        if (device->action() == QLatin1StringView("add")) {
 -            DrmGpu *gpu = findGpu(device->devNum());
--            if (gpu) {
-+        const auto action = device->action();
-+        if (action == QLatin1StringView("add")) {
-+            if (findGpu(device->devNum())) {
++        if (isAdd) {
+             if (gpu) {
                  qCWarning(KWIN_DRM) << "Received unexpected add udev event for:" << device->devNode();
                  continue;
-             }
+@@ -197,8 +262,7 @@ void DrmBackend::handleUdevEvent()
              if (addGpu(device->devNode())) {
                  updateOutputs();
              }
 -        } else if (device->action() == QLatin1StringView("remove")) {
 -            DrmGpu *gpu = findGpu(device->devNum());
--            if (gpu) {
-+        } else if (action == QLatin1StringView("remove")) {
-+            if (DrmGpu *gpu = findGpu(device->devNum())) {
++        } else if (isRemove) {
+             if (gpu) {
                  if (primaryGpu() == gpu) {
                      qCCritical(KWIN_DRM) << "Primary gpu has been removed! Quitting...";
-                     QCoreApplication::exit(1);
-@@ -209,7 +239,7 @@ void DrmBackend::handleUdevEvent()
+@@ -209,14 +273,16 @@ void DrmBackend::handleUdevEvent()
                      updateOutputs();
                  }
              }
 -        } else if (device->action() == QLatin1StringView("change")) {
-+        } else if (action == QLatin1StringView("change")) {
-             DrmGpu *gpu = findGpu(device->devNum());
-             if (!gpu) {
-                 gpu = addGpu(device->devNode());
-@@ -224,36 +254,43 @@ void DrmBackend::handleUdevEvent()
+-            DrmGpu *gpu = findGpu(device->devNum());
+-            if (!gpu) {
+-                gpu = addGpu(device->devNode());
+-            }
+-            if (gpu && gpu->isActive()) {
+-                qCDebug(KWIN_DRM) << "Received change event for monitored drm device" << gpu->drmDevice()->path();
+-                updateOutputs();
++        } else if (isChange) {
++            if (gpu) {
++                if (gpu->isActive()) {
++                    qCDebug(KWIN_DRM) << "Received change event for monitored drm device" << gpu->drmDevice()->path();
++                    updateOutputs();
++                }
++            } else {
++                if (addGpu(device->devNode())) {
++                    updateOutputs();
++                }
+             }
+         }
+     }
+@@ -224,36 +290,44 @@ void DrmBackend::handleUdevEvent()
  
  DrmGpu *DrmBackend::addGpu(const QString &fileName)
  {
@@ -5752,7 +6119,8 @@
 -        fd = m_session->openRestricted(fileName);
 +    auto fdResult = m_session->openRestricted(fileName);
 +
-+    // Race condition fix: EBusy retry loop with non-blocking sleep
++    // Optimized retry loop: EBusy can occur if DRM master is not yet released.
++    // 5s timeout with 20ms sleeps balances responsiveness and robustness.
 +    if (!fdResult.has_value() && fdResult.error() == Session::Error::EBusy) {
 +        auto start = std::chrono::steady_clock::now();
 +        while (!fdResult.has_value() && fdResult.error() == Session::Error::EBusy) {
@@ -5799,7 +6167,7 @@
      connect(gpu, &DrmGpu::outputAdded, this, &DrmBackend::addOutput);
      connect(gpu, &DrmGpu::outputRemoved, this, &DrmBackend::removeOutput);
      if (m_renderBackend) {
-@@ -265,9 +302,6 @@ DrmGpu *DrmBackend::addGpu(const QString
+@@ -265,9 +339,6 @@ DrmGpu *DrmBackend::addGpu(const QString
  
  static QString earlyIdentifier(Output *output)
  {
@@ -5809,7 +6177,7 @@
      if (output->edid().isValid()) {
          if (!output->edid().identifier().isEmpty()) {
              return output->edid().identifier();
-@@ -284,19 +318,19 @@ void DrmBackend::addOutput(DrmAbstractOu
+@@ -284,19 +355,19 @@ void DrmBackend::addOutput(DrmAbstractOu
      const bool allOff = std::ranges::all_of(m_outputs, [](Output *output) {
          return !output->isEnabled() || output->dpmsMode() != Output::DpmsMode::On;
      });
@@ -5839,7 +6207,7 @@
      Q_EMIT outputAdded(o);
  }
  
-@@ -312,32 +346,41 @@ void DrmBackend::removeOutput(DrmAbstrac
+@@ -312,32 +383,41 @@ void DrmBackend::removeOutput(DrmAbstrac
          });
      }
      m_outputs.removeOne(o);
@@ -5888,7 +6256,7 @@
  }
  
  std::unique_ptr<InputBackend> DrmBackend::createInputBackend()
-@@ -357,7 +400,7 @@ std::unique_ptr<EglBackend> DrmBackend::
+@@ -357,7 +437,7 @@ std::unique_ptr<EglBackend> DrmBackend::
  
  QList<CompositingType> DrmBackend::supportedCompositors() const
  {
@@ -5897,7 +6265,7 @@
  }
  
  QString DrmBackend::supportInformation() const
-@@ -365,10 +408,9 @@ QString DrmBackend::supportInformation()
+@@ -365,10 +445,9 @@ QString DrmBackend::supportInformation()
      QString supportInfo;
      QDebug s(&supportInfo);
      s.nospace();
@@ -5911,7 +6279,7 @@
      }
      return supportInfo;
  }
-@@ -414,58 +456,68 @@ size_t DrmBackend::gpuCount() const
+@@ -414,58 +493,67 @@ size_t DrmBackend::gpuCount() const
  
  OutputConfigurationError DrmBackend::applyOutputChanges(const OutputConfiguration &config)
  {
@@ -5953,7 +6321,6 @@
 -                output->revertQueuedChanges();
 +            qCWarning(KWIN_DRM) << "Configuration test failed for GPU" << gpu->drmDevice()->path()
 +                                << "with error" << static_cast<int>(error);
-+            // Atomic rollback: Revert changes on ALL GPUs to maintain consistent state
 +            for (const auto &g : m_gpus) {
 +                for (DrmOutput *o : g->drmOutputs()) {
 +                    o->revertQueuedChanges();
@@ -5997,7 +6364,7 @@
      return OutputConfigurationError::None;
  }
  
-@@ -506,8 +558,9 @@ const std::vector<std::unique_ptr<DrmGpu
+@@ -506,8 +594,9 @@ const std::vector<std::unique_ptr<DrmGpu
  
  EglDisplay *DrmBackend::sceneEglDisplayObject() const
  {
