@@ -135,6 +135,17 @@ static bool consume_dsq(struct cpdom_ctx *cpdomc, u64 dsq_id)
 	return ret;
 }
 
+static __always_inline int mask_pop_lsb(u64 *mask)
+{
+	u64 val = *mask;
+
+	if (!val)
+		return -1;
+
+	*mask = val & (val - 1);
+	return __builtin_ctzll(val);
+}
+
 u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 {
 	u64 pick_dsq_id = -ENOENT;
@@ -151,18 +162,25 @@ u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 	}
 
 	if (is_per_cpu_dsq_migratable()) {
-		int pick_cpu = -ENOENT, cpu, i, j, k;
+		s32 pick_cpu = -ENOENT;
+		s32 word;
+		s32 iter;
 
-		bpf_for(i, 0, LAVD_CPU_ID_MAX/64) {
-			u64 cpumask = cpdomc->__cpumask[i];
-			bpf_for(k, 0, 64) {
+		bpf_for(word, 0, LAVD_CPU_ID_MAX / 64) {
+			u64 mask = cpdomc->__cpumask[word];
+
+			bpf_for(iter, 0, 64) {
+				int bit = mask_pop_lsb(&mask);
 				s32 queued;
-				j = cpumask_next_set_bit(&cpumask);
-				if (j < 0)
+				s32 cpu;
+
+				if (bit < 0)
 					break;
-				cpu = (i * 64) + j;
+
+				cpu = (word * 64) + bit;
 				if (cpu >= nr_cpu_ids)
 					break;
+
 				queued = scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu));
 				if (queued > highest_queued) {
 					highest_queued = queued;
@@ -171,7 +189,7 @@ u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 			}
 		}
 
-		if (pick_cpu != -ENOENT)
+		if (pick_cpu >= 0)
 			pick_dsq_id = cpu_to_dsq(pick_cpu);
 	}
 
@@ -183,36 +201,34 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 	struct cpdom_ctx *cpdomc_pick;
 	s64 nr_nbr, cpdom_id;
 
-	if (!cpdomc->nr_active_cpus)
+	if (!cpdomc || !cpdomc->nr_active_cpus)
 		return false;
 
 	if (!prob_x_out_of_y(1, cpdomc->nr_active_cpus * LAVD_CPDOM_MIG_PROB_FT))
 		return false;
 
-	for (int i = 0; i < LAVD_CPDOM_MAX_DIST; i++) {
-		nr_nbr = min(cpdomc->nr_neighbors[i], LAVD_CPDOM_MAX_NR);
-		if (nr_nbr == 0)
+	for (int dist = 0; dist < LAVD_CPDOM_MAX_DIST; dist++) {
+		nr_nbr = min(cpdomc->nr_neighbors[dist], LAVD_CPDOM_MAX_NR);
+		if (!nr_nbr)
 			break;
 
-		for (int j = 0; j < LAVD_CPDOM_MAX_NR; j++) {
+		for (int idx = 0; idx < nr_nbr; idx++) {
 			u64 dsq_id;
-			if (j >= nr_nbr)
-				break;
 
-			cpdom_id = get_neighbor_id(cpdomc, i, j);
+			cpdom_id = get_neighbor_id(cpdomc, dist, idx);
 			if (cpdom_id < 0)
 				continue;
 
 			cpdomc_pick = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
-			if (!cpdomc_pick) {
-				scx_bpf_error("Failed to lookup cpdom_ctx for %llu", cpdom_id);
+			if (!cpdomc_pick)
 				return false;
-			}
 
 			if (!READ_ONCE(cpdomc_pick->is_stealee) || !cpdomc_pick->is_valid)
 				continue;
 
 			dsq_id = pick_most_loaded_dsq(cpdomc_pick);
+			if ((s64)dsq_id < 0)
+				continue;
 
 			if (consume_dsq(cpdomc_pick, dsq_id)) {
 				WRITE_ONCE(cpdomc_pick->is_stealee, false);
@@ -233,30 +249,28 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 	struct cpdom_ctx *cpdomc_pick;
 	s64 nr_nbr, cpdom_id;
 
-	for (int i = 0; i < LAVD_CPDOM_MAX_DIST; i++) {
-		nr_nbr = min(cpdomc->nr_neighbors[i], LAVD_CPDOM_MAX_NR);
-		if (nr_nbr == 0)
+	if (!cpdomc)
+		return false;
+
+	for (int dist = 0; dist < LAVD_CPDOM_MAX_DIST; dist++) {
+		nr_nbr = min(cpdomc->nr_neighbors[dist], LAVD_CPDOM_MAX_NR);
+		if (!nr_nbr)
 			break;
 
-		for (int j = 0; j < LAVD_CPDOM_MAX_NR; j++) {
+		for (int idx = 0; idx < nr_nbr; idx++) {
 			u64 dsq_id;
-			if (j >= nr_nbr)
-				break;
 
-			cpdom_id = get_neighbor_id(cpdomc, i, j);
+			cpdom_id = get_neighbor_id(cpdomc, dist, idx);
 			if (cpdom_id < 0)
 				continue;
 
 			cpdomc_pick = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
-			if (!cpdomc_pick) {
-				scx_bpf_error("Failed to lookup cpdom_ctx for %llu", cpdom_id);
-				return false;
-			}
-
-			if (!cpdomc_pick->is_valid)
+			if (!cpdomc_pick || !cpdomc_pick->is_valid)
 				continue;
 
 			dsq_id = pick_most_loaded_dsq(cpdomc_pick);
+			if ((s64)dsq_id < 0)
+				continue;
 
 			if (consume_dsq(cpdomc_pick, dsq_id))
 				return true;

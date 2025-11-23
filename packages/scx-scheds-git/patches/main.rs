@@ -100,11 +100,6 @@ struct Opts {
 
     /// Slice duration in microseconds to use for all tasks when pinned tasks
     /// are running on a CPU. Must be between slice-min-us and slice-max-us.
-    /// When this option is enabled, pinned tasks are always enqueued to per-CPU DSQs
-    /// and the dispatch logic compares vtimes across all DSQs to select the lowest
-    /// vtime task. This helps improve responsiveness for pinned tasks. By default,
-    /// this option is on with a default value of 5000 (5 msec). To turn off the option,
-    /// explicitly set the value to 0.
     #[clap(long = "pinned-slice-us", default_value = "5000")]
     pinned_slice_us: Option<u64>,
 
@@ -277,11 +272,9 @@ impl Opts {
             info!("Energy model won't be used for CPU preference order.");
         }
 
-        // Upstream Patch Logic:
         if let Some(pinned_slice) = self.pinned_slice_us {
             if pinned_slice == 0 {
                 info!("Pinned task slice mode is disabled. Pinned tasks will use per-domain DSQs.");
-                // Explicitly set to None to signal disablement to BPF
                 self.pinned_slice_us = None;
             } else if pinned_slice < self.slice_min_us || pinned_slice > self.slice_max_us {
                 info!(
@@ -491,10 +484,6 @@ impl<'a> Scheduler<'a> {
             rodata.cpu_big[cid] = cpu.big_core as u8;
             rodata.cpu_turbo[cid] = cpu.turbo_core as u8;
             rodata.cpu_sibling[cid] = cpu.cpu_sibling as u32;
-
-            // Clean initialization without L2 map hack (which is broken in BPF side currently)
-            // Relying on core type and topology sorting from cpu_order.rs is sufficient
-            // for the high-level placement logic on Raptor Lake.
         }
 
         rodata.nr_pco_states = nr_pco_states;
@@ -607,7 +596,6 @@ impl<'a> Scheduler<'a> {
         rodata.verbose = debug_level;
         rodata.slice_max_ns = opts.slice_max_us * 1000;
         rodata.slice_min_ns = opts.slice_min_us * 1000;
-        // Correctly handle 0 (disable) vs valid value
         rodata.pinned_slice_ns = opts.pinned_slice_us.map(|v| v * 1000).unwrap_or(0);
         rodata.preempt_shift = opts.preempt_shift;
         rodata.mig_delta_pct = opts.mig_delta_pct;
