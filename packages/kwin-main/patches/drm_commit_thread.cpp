@@ -219,10 +219,13 @@ void DrmCommitThread::submit()
         const auto targetTimestamp = m_targetPageflipTime - m_baseSafetyMargin;
         const auto safetyDifference = targetTimestamp - m_lastCommitTime;
 
+        // Adaptive Exponential Safety Margin:
+        // Penalize misses heavily, decay margin slowly on success.
         if (safetyDifference < 0ns) {
-            m_additionalSafetyMargin -= safetyDifference;
+            const auto penalty = -safetyDifference + 500us;
+            m_additionalSafetyMargin = std::max(m_additionalSafetyMargin, penalty);
         } else {
-            m_additionalSafetyMargin -= safetyDifference / 10;
+            m_additionalSafetyMargin = m_additionalSafetyMargin - (m_additionalSafetyMargin / 200);
         }
 
         const auto maximumReasonableMargin = std::min<std::chrono::nanoseconds>(3ms, m_minVblankInterval / 2);
@@ -230,9 +233,6 @@ void DrmCommitThread::submit()
         m_safetyMargin = m_baseSafetyMargin + m_additionalSafetyMargin;
     } else {
         if (m_commits.size() > 1) {
-            // Optimization: if a commit failed (likely EBUSY or similar transient issue),
-            // merge subsequent commits into the first one and retry. This reduces
-            // the number of failing ioctls and catches up faster.
             while (m_commits.size() > 1) {
                 auto toMerge = std::move(m_commits[1]);
                 m_commits.erase(m_commits.begin() + 1);
@@ -262,9 +262,16 @@ void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
         return;
     }
 
-    // 1. Merge consecutive ready commits at the front.
-    // This collapses multiple updates that happened faster than the display refresh
-    // into a single update, reducing overhead.
+    // CRITICAL FIX: Abort optimization if the next commit is Tearing (Async).
+    // Merging a VSync commit (which might update cursor/VRR) into a Tearing commit
+    // creates an invalid atomic state (Async + Properties) which the kernel rejects.
+    if (m_commits.front()->isTearing()) {
+        return;
+    }
+
+    bool optimized = false;
+
+    // 1. Merge consecutive ready commits
     if (m_commits.front()->areBuffersReadable()) {
         auto firstNotReady = std::next(m_commits.begin());
         while (firstNotReady != m_commits.end() && (*firstNotReady)->isReadyFor(pageflipTarget)) {
@@ -272,28 +279,39 @@ void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
         }
 
         if (firstNotReady != std::next(m_commits.begin())) {
-            // Merge [begin+1 ... firstNotReady) into *begin
-            auto &target = m_commits.front();
-            for (auto it = std::next(m_commits.begin()); it != firstNotReady; ++it) {
-                target->merge(it->get());
+            auto merged = std::make_unique<DrmAtomicCommit>(m_gpu);
+
+            for (auto it = m_commits.begin(); it != firstNotReady; ++it) {
+                merged->merge(it->get());
+            }
+
+            size_t count = std::distance(m_commits.begin(), firstNotReady);
+            m_commitsToDelete.reserve(m_commitsToDelete.size() + count);
+            for (auto it = m_commits.begin(); it != firstNotReady; ++it) {
                 m_commitsToDelete.push_back(std::move(*it));
             }
-            m_commits.erase(std::next(m_commits.begin()), firstNotReady);
+
+            m_commits.erase(m_commits.begin(), firstNotReady);
+            m_commits.insert(m_commits.begin(), std::move(merged));
+            optimized = true;
         }
     }
 
-    // 2. Merge subsequent commits that affect the same planes.
-    // If we have Commit A (Plane 1), Commit B (Plane 2), Commit C (Plane 1),
-    // and C is ready, we can potentially merge C into A if B doesn't conflict or if B is also merged.
-    // Current logic: simpler strict ordering preservation for same planes.
-    // If commits are contiguous and ready and target same planes, merge them.
+    // 2. Merge same-plane commits
     for (auto it = m_commits.begin(); it != m_commits.end();) {
-        const auto startIt = it;
+        auto startIt = it;
         auto &startCommit = *startIt;
+
+        // SAFETY: We must also check if upcoming commits are Tearing.
+        // We cannot merge a Tearing commit into a VSync commit or vice versa.
+        // Only merge matching presentation modes for safety.
+        const bool startTearing = startCommit->isTearing();
 
         auto nextIt = std::next(startIt);
         while (nextIt != m_commits.end() &&
                (*nextIt)->isReadyFor(pageflipTarget) &&
+               (*nextIt)->isTearing() == startTearing && // Prevent mixing modes
+               !startCommit->modifiedPlanes().empty() &&
                startCommit->modifiedPlanes() == (*nextIt)->modifiedPlanes()) {
             ++nextIt;
         }
@@ -303,12 +321,20 @@ void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
             continue;
         }
 
-        // Merge [startIt+1 ... nextIt) into *startIt
+        size_t count = std::distance(std::next(startIt), nextIt);
+        m_commitsToDelete.reserve(m_commitsToDelete.size() + count);
+
         for (auto mergeIt = std::next(startIt); mergeIt != nextIt; ++mergeIt) {
             startCommit->merge(mergeIt->get());
             m_commitsToDelete.push_back(std::move(*mergeIt));
         }
+
         it = m_commits.erase(std::next(startIt), nextIt);
+        optimized = true;
+    }
+
+    if (optimized) {
+        QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::QueuedConnection);
     }
 }
 
@@ -361,8 +387,6 @@ void DrmCommitThread::setPendingCommit(std::unique_ptr<DrmLegacyCommit> &&commit
 
 void DrmCommitThread::clearDroppedCommits()
 {
-    // Performance optimization: Move the deletion queue to a local variable
-    // to destroy objects outside the lock. Destructors can be expensive.
     std::vector<std::unique_ptr<DrmAtomicCommit>> toDelete;
     {
         std::unique_lock<std::mutex> lock(m_mutex);
@@ -371,7 +395,7 @@ void DrmCommitThread::clearDroppedCommits()
         }
         toDelete.swap(m_commitsToDelete);
     }
-    toDelete.clear(); // Destructors run here
+    toDelete.clear();
 }
 
 void DrmCommitThread::setModeInfo(uint32_t maximum, std::chrono::nanoseconds vblankTime)
@@ -439,12 +463,9 @@ void DrmCommitThread::pageFlipped(std::chrono::nanoseconds timestamp)
 
     uint64_t pageflipsSince = 0;
     if (m_vblankReciprocal > 0 && elapsedNs < (1ull << 32)) [[likely]] {
-        // Fast path: reciprocal multiplication
-        // (x * ceil(2^N / y)) >> N  approx x / y
         const __uint128_t product = static_cast<__uint128_t>(elapsedNs) * m_vblankReciprocal;
         pageflipsSince = static_cast<uint64_t>(product >> m_vblankReciprocalShift);
     } else if (vblankNs > 0) {
-        // Slow path: hardware division
         pageflipsSince = elapsedNs / vblankNs;
     }
 

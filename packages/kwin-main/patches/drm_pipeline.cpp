@@ -129,6 +129,8 @@ DrmPipeline::Error DrmPipeline::present(const QList<OutputLayer *> &layersToUpda
     }
 
     bool updatedAnyLayer = false;
+    int layerCount = 0;
+
     for (const auto layer : layersToUpdate) {
         if (!layer) [[unlikely]] {
             continue;
@@ -139,6 +141,13 @@ DrmPipeline::Error DrmPipeline::present(const QList<OutputLayer *> &layersToUpda
             return err;
         }
         updatedAnyLayer = true;
+        layerCount++;
+    }
+
+    // CRITICAL FIX: Multi-plane async flips are widely unsupported.
+    // If we update >1 plane (e.g., Primary + Cursor) during an Async flip, fallback to VSync.
+    if (partialUpdate->isTearing() && layerCount > 1) {
+        partialUpdate->setPresentationMode(PresentationMode::VSync);
     }
 
     if (!updatedAnyLayer) [[unlikely]] {
@@ -288,26 +297,36 @@ DrmPipeline::Error DrmPipeline::prepareAtomicCommit(DrmAtomicCommit *commit, Com
     return Error::None;
 }
 
-DrmPipeline::Error DrmPipeline::prepareAtomicPresentation(DrmAtomicCommit *commit, const std::shared_ptr<OutputFrame> &)
+DrmPipeline::Error DrmPipeline::prepareAtomicPresentation(DrmAtomicCommit *commit,
+                                                          const std::shared_ptr<OutputFrame> &)
 {
     if (!commit || !m_pending.crtc) [[unlikely]] {
         return Error::InvalidArguments;
     }
 
+    const bool isAsync = (m_pending.presentationMode == PresentationMode::Async) ||
+                         (m_pending.presentationMode == PresentationMode::AdaptiveAsync);
+
     commit->setPresentationMode(m_pending.presentationMode);
 
-    if (m_connector->contentType.isValid()) [[likely]] {
+    if (m_connector->contentType.isValid()) {
         commit->addEnum(m_connector->contentType, m_pending.contentType);
     }
 
-    if (m_pending.crtc->vrrEnabled.isValid()) [[likely]] {
-        bool shouldEnableVrr = (m_pending.presentationMode == PresentationMode::AdaptiveSync)
-            || (m_pending.presentationMode == PresentationMode::AdaptiveAsync);
+    if (m_pending.crtc->vrrEnabled.isValid()) {
+        bool shouldEnableVrr =
+            (m_pending.presentationMode == PresentationMode::AdaptiveSync) ||
+            (m_pending.presentationMode == PresentationMode::AdaptiveAsync);
 
-        if (m_pending.needsModeset) [[unlikely]] {
+        if (m_pending.needsModeset) {
             shouldEnableVrr = false;
         }
-        commit->setVrr(m_pending.crtc, shouldEnableVrr);
+
+        // CRITICAL FIX: Do not include VRR properties in Async/Tearing commits.
+        // Updating CRTC properties while requesting async flip causes EINVAL.
+        if (!isAsync) {
+            commit->setVrr(m_pending.crtc, shouldEnableVrr);
+        }
     }
 
     if (m_pending.layers.isEmpty()) [[unlikely]] {
@@ -315,12 +334,17 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPresentation(DrmAtomicCommit *commi
     }
 
     DrmPipelineLayer *referenceLayer = nullptr;
+    int enabledCount = 0;
     for (DrmPipelineLayer *layer : m_pending.layers) {
         if (!layer) [[unlikely]] {
             return Error::InvalidArguments;
         }
-        if (!referenceLayer && layer->isEnabled()) [[likely]] {
+        if (layer->isEnabled()) {
             referenceLayer = layer;
+            ++enabledCount;
+            if (enabledCount > 1) {
+                break;
+            }
         }
     }
 
@@ -329,8 +353,23 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPresentation(DrmAtomicCommit *commi
     }
 
     const ColorPipeline &referencePipeline = referenceLayer->colorPipeline();
+
+    if (enabledCount == 1) {
+        const ColorPipeline mergedPipeline = referencePipeline.merged(m_pending.crtcColorPipeline);
+        if (!m_pending.crtc->postBlendingPipeline) {
+            if (!mergedPipeline.isIdentity()) [[unlikely]] {
+                return Error::InvalidArguments;
+            }
+        } else {
+            if (!m_pending.crtc->postBlendingPipeline->matchPipeline(commit, mergedPipeline)) [[unlikely]] {
+                return Error::InvalidArguments;
+            }
+        }
+        return Error::None;
+    }
+
     for (DrmPipelineLayer *layer : m_pending.layers) {
-        if (!layer || !layer->isEnabled()) [[unlikely]] {
+        if (!layer->isEnabled()) {
             continue;
         }
         if (layer->colorPipeline() != referencePipeline) [[unlikely]] {
@@ -339,8 +378,8 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPresentation(DrmAtomicCommit *commi
     }
 
     const ColorPipeline mergedPipeline = referencePipeline.merged(m_pending.crtcColorPipeline);
-    if (!m_pending.crtc->postBlendingPipeline) [[unlikely]] {
-        if (!mergedPipeline.isIdentity()) {
+    if (!m_pending.crtc->postBlendingPipeline) {
+        if (!mergedPipeline.isIdentity()) [[unlikely]] {
             return Error::InvalidArguments;
         }
     } else {
@@ -361,7 +400,7 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPlane(DrmAtomicCommit *commit,
         return Error::InvalidArguments;
     }
 
-    if (!layer->isEnabled()) [[unlikely]] {
+    if (!layer->isEnabled()) {
         plane->disable(commit);
         return Error::None;
     }
@@ -374,8 +413,8 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPlane(DrmAtomicCommit *commit,
 
     const QRect sourceRect = layer->sourceRect().toRect();
     const QRect targetRect = layer->targetRect();
-
-    if (sourceRect.width() <= 0 || sourceRect.height() <= 0 || targetRect.width() <= 0 || targetRect.height() <= 0) [[unlikely]] {
+    if (sourceRect.width() <= 0 || sourceRect.height() <= 0 ||
+        targetRect.width() <= 0 || targetRect.height() <= 0) [[unlikely]] {
         qCWarning(KWIN_DRM) << "Invalid plane geometry: src=" << sourceRect << "dst=" << targetRect;
         return Error::InvalidArguments;
     }
@@ -385,76 +424,68 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPlane(DrmAtomicCommit *commit,
     commit->addProperty(plane->crtcId, m_pending.crtc->id());
 
     const bool isCursor = (plane->type.enumValue() == DrmPlane::TypeIndex::Cursor);
-    if (isCursor) [[unlikely]] {
-        if (plane->vmHotspotX.isValid() && plane->vmHotspotY.isValid()) [[likely]] {
+    if (isCursor) {
+        if (plane->vmHotspotX.isValid() && plane->vmHotspotY.isValid()) {
             const QPointF hotspot = layer->hotspot();
             const int64_t hotX = std::lround(hotspot.x());
             const int64_t hotY = std::lround(hotspot.y());
-
             if (hotX < 0 || hotY < 0 || hotX > 32767 || hotY > 32767) [[unlikely]] {
                 qCWarning(KWIN_DRM) << "Cursor hotspot out of range:" << hotspot;
                 return Error::InvalidArguments;
             }
-
             commit->addProperty(plane->vmHotspotX, static_cast<uint64_t>(hotX));
             commit->addProperty(plane->vmHotspotY, static_cast<uint64_t>(hotY));
         }
         return Error::None;
     }
 
-    if (plane->rotation.isValid()) [[likely]] {
+    if (plane->rotation.isValid()) {
         const OutputTransform transform = layer->offloadTransform();
         if (!plane->supportsTransformation(transform)) [[unlikely]] {
             return Error::InvalidArguments;
         }
-        if (transform.kind() != OutputTransform::Kind::Normal) [[unlikely]] {
+        if (transform.kind() != OutputTransform::Kind::Normal) {
             commit->addEnum(plane->rotation, DrmPlane::outputTransformToPlaneTransform(transform));
         }
     }
 
-    if (plane->alpha.isValid()) [[likely]] {
+    if (plane->alpha.isValid()) {
         commit->addProperty(plane->alpha, plane->alpha.maxValue());
     }
-    if (plane->pixelBlendMode.isValid()) [[likely]] {
-        if (plane->pixelBlendMode.hasEnum(DrmPlane::PixelBlendMode::PreMultiplied)) [[likely]] {
-            commit->addEnum(plane->pixelBlendMode, DrmPlane::PixelBlendMode::PreMultiplied);
-        }
+    if (plane->pixelBlendMode.isValid() && plane->pixelBlendMode.hasEnum(DrmPlane::PixelBlendMode::PreMultiplied)) {
+        commit->addEnum(plane->pixelBlendMode, DrmPlane::PixelBlendMode::PreMultiplied);
     }
-    if (plane->zpos.isValid() && !plane->zpos.isImmutable()) [[likely]] {
+    if (plane->zpos.isValid() && !plane->zpos.isImmutable()) {
         commit->addProperty(plane->zpos, layer->zpos());
     }
 
     const auto buffer = fb->buffer();
     const auto *attrs = buffer ? buffer->dmabufAttributes() : nullptr;
-    if (!attrs) [[unlikely]] {
-        return Error::None;
-    }
-
-    if (!isYuvFormat(attrs->format)) [[likely]] {
+    if (!attrs || !isYuvFormat(attrs->format)) {
         return Error::None;
     }
 
     const auto colorDesc = layer->colorDescription();
-    if (!colorDesc) [[unlikely]] {
+    if (!colorDesc) {
         return Error::None;
     }
 
-    if (plane->colorEncoding.isValid()) [[likely]] {
+    if (plane->colorEncoding.isValid()) {
         const auto matrix = colorDesc->yuvCoefficients();
-        if (matrix == YUVMatrixCoefficients::BT709 && plane->colorEncoding.hasEnum(DrmPlane::ColorEncoding::BT709_YCbCr)) [[likely]] {
+        if (matrix == YUVMatrixCoefficients::BT709 && plane->colorEncoding.hasEnum(DrmPlane::ColorEncoding::BT709_YCbCr)) {
             commit->addEnum(plane->colorEncoding, DrmPlane::ColorEncoding::BT709_YCbCr);
         } else if (matrix == YUVMatrixCoefficients::BT601 && plane->colorEncoding.hasEnum(DrmPlane::ColorEncoding::BT601_YCbCr)) {
             commit->addEnum(plane->colorEncoding, DrmPlane::ColorEncoding::BT601_YCbCr);
-        } else if (matrix == YUVMatrixCoefficients::BT2020 && plane->colorEncoding.hasEnum(DrmPlane::ColorEncoding::BT2020_YCbCr)) [[unlikely]] {
+        } else if (matrix == YUVMatrixCoefficients::BT2020 && plane->colorEncoding.hasEnum(DrmPlane::ColorEncoding::BT2020_YCbCr)) {
             commit->addEnum(plane->colorEncoding, DrmPlane::ColorEncoding::BT2020_YCbCr);
         }
     }
 
-    if (plane->colorRange.isValid()) [[likely]] {
+    if (plane->colorRange.isValid()) {
         const auto range = (colorDesc->range() == EncodingRange::Full)
             ? DrmPlane::ColorRange::Full_YCbCr
             : DrmPlane::ColorRange::Limited_YCbCr;
-        if (plane->colorRange.hasEnum(range)) [[likely]] {
+        if (plane->colorRange.hasEnum(range)) {
             commit->addEnum(plane->colorRange, range);
         }
     }
@@ -608,9 +639,14 @@ bool DrmPipeline::presentAsync(OutputLayer *layer, std::optional<std::chrono::na
         return setCursorLegacy(drmLayer);
     }
 
-    if (DrmPipeline::commitPipelinesAtomic({this}, CommitMode::Test, nullptr, {}) != Error::None) [[unlikely]] {
-        qCDebug(KWIN_DRM) << "presentAsync: atomic test failed, aborting";
-        return false;
+    const bool isCursor =
+        (plane->type.isValid() && plane->type.enumValue() == DrmPlane::TypeIndex::Cursor);
+
+    if (!isCursor) {
+        if (DrmPipeline::commitPipelinesAtomic({this}, CommitMode::Test, nullptr, {}) != Error::None) [[unlikely]] {
+            qCDebug(KWIN_DRM) << "presentAsync: atomic test failed, aborting";
+            return false;
+        }
     }
 
     auto partialUpdate = std::make_unique<DrmAtomicCommit>(QList<DrmPipeline *>{this});
@@ -618,6 +654,7 @@ bool DrmPipeline::presentAsync(OutputLayer *layer, std::optional<std::chrono::na
         qCDebug(KWIN_DRM) << "presentAsync: plane preparation failed";
         return false;
     }
+
     partialUpdate->setAllowedVrrDelay(allowedVrrDelay);
     m_commitThread->addCommit(std::move(partialUpdate));
     return true;
