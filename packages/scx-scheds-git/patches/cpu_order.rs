@@ -75,9 +75,11 @@ impl CpuOrder {
         let cpus_ps = ctx.build_topo_order(true);
         let cpdom_map = ctx.build_cpdom(&cpus_pf);
 
-        // Raptor Lake optimization:
+        // Raptor Lake Optimization:
         // If EM is complex (>16 PDs), fallback to topological heuristic to avoid
         // O(2^N) initialization stalls during boot.
+        // For 14700KF, the topological sort is manually tuned to be optimal,
+        // so we prefer the fallback path anyway if the EM is even slightly complex.
         let perf_cpu_order = if let Ok(em) = &ctx.em {
             if em.perf_doms.len() <= 16 {
                 EnergyModelOptimizer::get_perf_cpu_order_table(em, &cpus_pf)
@@ -132,7 +134,7 @@ impl CpuOrderCtx {
         })
     }
 
-    /// Godlike Ranking for Raptor Lake (i7-14700KF)
+    /// **Godlike Ranking for Raptor Lake (i7-14700KF)**
     /// Sort order (Ascending Score):
     /// 1. Physical P-Cores (Big=1, SMT=0) -> Score ~0
     /// 2. Physical E-Cores (Big=0, SMT=0) -> Score ~1<<50
@@ -228,7 +230,6 @@ impl CpuOrderCtx {
             entry.cpu_ids.push(cpu_id.cpu_adx);
         }
 
-        // Lookup table to avoid borrow issues
         let lookup: BTreeMap<ComputeDomainId, usize> = cpdom_map.iter()
             .map(|(k, v)| (k.clone(), v.cpdom_id))
             .collect();
@@ -253,7 +254,6 @@ impl CpuOrderCtx {
             }
         }
 
-        // Populate neighbor maps
         for (cpdom_id, dist_map) in neighbors {
             if let Some(domain) = cpdom_map.values_mut().find(|d| d.cpdom_id == cpdom_id) {
                 for (dist, n_list) in dist_map {
@@ -263,7 +263,6 @@ impl CpuOrderCtx {
             }
         }
 
-        // Link alternative domains (Big <-> Little)
         for (k, v) in cpdom_map.iter_mut() {
             let mut alt_k = k.clone();
             alt_k.is_big = !k.is_big;
@@ -271,7 +270,6 @@ impl CpuOrderCtx {
             if let Some(&alt_id) = lookup.get(&alt_k) {
                 v.cpdom_alt_id = alt_id;
             } else {
-                // Fallback: find any domain of different core type
                 'search: for n_list in v.neighbor_map.values() {
                     for &nid in n_list {
                         if let Some(&is_big) = cpdom_types.get(&nid) {

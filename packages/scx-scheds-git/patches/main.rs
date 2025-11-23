@@ -98,7 +98,14 @@ struct Opts {
     #[clap(long = "mig-delta-pct", default_value = "0", value_parser=Opts::mig_delta_pct_range)]
     mig_delta_pct: u8,
 
-    #[clap(long = "pinned-slice-us")]
+    /// Slice duration in microseconds to use for all tasks when pinned tasks
+    /// are running on a CPU. Must be between slice-min-us and slice-max-us.
+    /// When this option is enabled, pinned tasks are always enqueued to per-CPU DSQs
+    /// and the dispatch logic compares vtimes across all DSQs to select the lowest
+    /// vtime task. This helps improve responsiveness for pinned tasks. By default,
+    /// this option is on with a default value of 5000 (5 msec). To turn off the option,
+    /// explicitly set the value to 0.
+    #[clap(long = "pinned-slice-us", default_value = "5000")]
     pinned_slice_us: Option<u64>,
 
     #[clap(long = "preempt-shift", default_value = "6", value_parser=Opts::preempt_shift_range)]
@@ -270,18 +277,24 @@ impl Opts {
             info!("Energy model won't be used for CPU preference order.");
         }
 
+        // Upstream Patch Logic:
         if let Some(pinned_slice) = self.pinned_slice_us {
-            if pinned_slice < self.slice_min_us || pinned_slice > self.slice_max_us {
+            if pinned_slice == 0 {
+                info!("Pinned task slice mode is disabled. Pinned tasks will use per-domain DSQs.");
+                // Explicitly set to None to signal disablement to BPF
+                self.pinned_slice_us = None;
+            } else if pinned_slice < self.slice_min_us || pinned_slice > self.slice_max_us {
                 info!(
                     "pinned-slice-us ({}) must be between slice-min-us ({}) and slice-max-us ({})",
                     pinned_slice, self.slice_min_us, self.slice_max_us
                 );
                 return None;
+            } else {
+                info!(
+                    "Pinned task slice mode is enabled ({} μs). Pinned tasks use per-CPU DSQs.",
+                    pinned_slice
+                );
             }
-            info!(
-                "Pinned task slice mode enabled ({} μs). Pinned tasks use per-CPU DSQs.",
-                pinned_slice
-            );
         }
 
         if self.autopilot {
@@ -473,10 +486,15 @@ impl<'a> Scheduler<'a> {
             .expect("rodata not available");
 
         for cpu in order.cpuids.iter() {
-            rodata.cpu_capacity[cpu.cpu_adx] = cpu.cpu_cap as u16;
-            rodata.cpu_big[cpu.cpu_adx] = cpu.big_core as u8;
-            rodata.cpu_turbo[cpu.cpu_adx] = cpu.turbo_core as u8;
-            rodata.cpu_sibling[cpu.cpu_adx] = cpu.cpu_sibling as u32;
+            let cid = cpu.cpu_adx;
+            rodata.cpu_capacity[cid] = cpu.cpu_cap as u16;
+            rodata.cpu_big[cid] = cpu.big_core as u8;
+            rodata.cpu_turbo[cid] = cpu.turbo_core as u8;
+            rodata.cpu_sibling[cid] = cpu.cpu_sibling as u32;
+
+            // Clean initialization without L2 map hack (which is broken in BPF side currently)
+            // Relying on core type and topology sorting from cpu_order.rs is sufficient
+            // for the high-level placement logic on Raptor Lake.
         }
 
         rodata.nr_pco_states = nr_pco_states;
@@ -501,7 +519,6 @@ impl<'a> Scheduler<'a> {
             .as_mut()
             .expect("rodata not available");
 
-        // Direct access instead of borrow()
         let cpus_perf = &pco.cpus_perf;
         let cpus_ovflw = &pco.cpus_ovflw;
         let pco_nr_primary = cpus_perf.len();
@@ -526,7 +543,6 @@ impl<'a> Scheduler<'a> {
             let cpdom = &mut bss_data.cpdom_ctxs[v.cpdom_id];
 
             cpdom.id = v.cpdom_id as u64;
-            // Direct access, no get()
             cpdom.alt_id = v.cpdom_alt_id as u64;
             cpdom.numa_id = k.numa_adx as u8;
             cpdom.llc_id = k.llc_adx as u8;
@@ -539,7 +555,6 @@ impl<'a> Scheduler<'a> {
                 cpdom.__cpumask[word_idx] |= 1u64 << bit_idx;
             }
 
-            // Direct access, no borrow()
             let neighbor_count = v.neighbor_map.len();
             if neighbor_count > LAVD_CPDOM_MAX_DIST as usize {
                 panic!(
@@ -560,7 +575,6 @@ impl<'a> Scheduler<'a> {
 
                 cpdom.nr_neighbors[dist_idx] = nr_neighbors;
 
-                // Flatten neighbor IDs into the array
                 for (i, &neighbor_id) in neighbors.iter().enumerate() {
                     let idx = (dist_idx * LAVD_CPDOM_MAX_NR as usize) + i;
                     cpdom.neighbor_ids[idx] = neighbor_id as u8;
@@ -593,6 +607,7 @@ impl<'a> Scheduler<'a> {
         rodata.verbose = debug_level;
         rodata.slice_max_ns = opts.slice_max_us * 1000;
         rodata.slice_min_ns = opts.slice_min_us * 1000;
+        // Correctly handle 0 (disable) vs valid value
         rodata.pinned_slice_ns = opts.pinned_slice_us.map(|v| v * 1000).unwrap_or(0);
         rodata.preempt_shift = opts.preempt_shift;
         rodata.mig_delta_pct = opts.mig_delta_pct;
@@ -629,9 +644,6 @@ impl<'a> Scheduler<'a> {
         }
 
         let tx = &mt.taskc_x;
-        // taskc is removed from msg_task_ctx as per patch
-        // All fields are now in taskc_x (tx)
-
         let mseq = Self::get_msg_seq_id();
 
         let tx_comm = unsafe {
