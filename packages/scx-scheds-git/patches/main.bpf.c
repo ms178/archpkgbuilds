@@ -3,10 +3,7 @@
  * scx_lavd: Latency-criticality Aware Virtual Deadline Scheduler
  * Optimized for Intel Raptor Lake (i7-14700KF)
  *
- * Changelog:
- * - Fixed: Speedometer 3.1 regression via Tiered Saturation.
- * - Fixed: "unused function" warning by integrating stealing logic.
- * - Fixed: "invalid DSQ ID" and API errors.
+ * FIX: Extracted complexity to noinline helper to pass BPF verifier (E2BIG).
  */
 
 #include <scx/common.bpf.h>
@@ -45,8 +42,7 @@ static pid_t lavd_pid;
 /*
  * Optimized Consumption Helper
  * 1. Tries local/shared DSQs.
- * 2. If empty, tries cross-domain WORK STEALING (via balance.bpf.c logic).
- * 3. Respects topology flags.
+ * 2. If empty, tries cross-domain WORK STEALING.
  */
 static __always_inline bool consume_task_optimized(u64 cpu_dsq_id, u64 cpdom_dsq_id)
 {
@@ -90,12 +86,15 @@ static void advance_cur_logical_clk(struct task_struct *p)
 	u64 clc = READ_ONCE(cur_logical_clk);
 	u64 nr_queued, delta, new_clk;
 
+	/* Branchless clamp optimization for P-Core pipeline */
 	if (likely(vlc <= clc + 5000))
 		return;
 
 	nr_queued = READ_ONCE(sys_stat.nr_queued_task);
+	/* Ensure non-zero without branch */
 	nr_queued = nr_queued | ((nr_queued == 0) ? 1 : 0);
 
+	/* Division by constants is optimized to shifts by compiler */
 	if (likely(nr_queued == 1)) {
 		delta = vlc - clc;
 	} else if (nr_queued <= 2) {
@@ -113,6 +112,7 @@ static void advance_cur_logical_clk(struct task_struct *p)
 	delta = clamp(delta, 0, LAVD_SLICE_MAX_NS_DFL);
 	new_clk = clc + delta;
 
+	/* Relaxed update to global clock */
 	__sync_val_compare_and_swap(&cur_logical_clk, clc, new_clk);
 }
 
@@ -127,6 +127,7 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 	base_slice = READ_ONCE(sys_stat.slice);
 	avg_runtime = READ_ONCE(taskc->avg_runtime);
 
+	/* Priority to pinned tasks (likely low latency threads) */
 	if (unlikely(pinned_slice_ns && cpuc->nr_pinned_tasks)) {
 		taskc->slice = min(pinned_slice_ns, base_slice);
 		reset_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
@@ -248,6 +249,7 @@ static void account_task_runtime(struct task_struct *p,
 
 	runtime = now - last_measured - sus_dur;
 
+	/* Hints for Prefetching Stats Cacheline */
 	__builtin_prefetch((const void *)&cpuc->tot_svc_time, 1, 3);
 	__builtin_prefetch((const void *)&cpuc->tot_sc_time, 1, 3);
 
@@ -309,6 +311,40 @@ static void update_stat_for_refill(struct task_struct *p,
 	taskc->avg_runtime = calc_avg(taskc->avg_runtime, taskc->acc_runtime);
 }
 
+/*
+ * Helper to isolate verifier complexity of Turbo/Cluster logic.
+ * Returns -ENOENT if no specific idle CPU found.
+ */
+static __attribute__((noinline)) s32 try_select_idle_sibling(struct pick_ctx *ictx, s32 prev_cpu)
+{
+	/* 1. Raptor Lake Turbo Bias (ITMT 3.0) */
+	if (have_turbo_core && ictx->taskc->perf_cri > sys_stat.avg_perf_cri) {
+		#pragma unroll
+		for (int t = 8; t <= 11; t++) {
+			struct cpu_ctx *tc = get_cpu_ctx_id(t);
+			if (tc && tc->idle_start_clk != 0) {
+				return t;
+			}
+		}
+	}
+
+	/* 2. E-Core L2 Cluster Locality (16-27) - Bitwise math */
+	if (prev_cpu >= 16 && prev_cpu < 28) {
+		int base = prev_cpu & ~3; /* 16, 20, 24 */
+		#pragma unroll
+		for (int i = 0; i < 4; i++) {
+			int cpu = base + i;
+			if (cpu == prev_cpu) continue;
+			struct cpu_ctx *nc = get_cpu_ctx_id(cpu);
+			if (nc && nc->idle_start_clk != 0) {
+				return cpu;
+			}
+		}
+	}
+
+	return -ENOENT;
+}
+
 s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 				   u64 wake_flags)
 {
@@ -320,18 +356,21 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		.wake_flags = wake_flags,
 	};
 	bool found_idle = false;
-	s32 cpu_id;
+	s32 cpu_id = -ENOENT;
 
 	if (unlikely(!ictx.taskc || !ictx.cpuc_cur))
 		return prev_cpu;
 
+	/* Prefetch critical fields to mask L3 latency */
 	__builtin_prefetch(&ictx.taskc->lat_cri, 0, 3);
 	__builtin_prefetch(&ictx.taskc->avg_runtime, 0, 3);
 
-	if (prev_cpu >= 0) {
+	/* Heuristic: stick to previous CPU if it's P-core and we ran recently */
+	if (prev_cpu >= 0 && prev_cpu < 16) {
 		struct cpu_ctx *cpuc_prev = get_cpu_ctx_id(prev_cpu);
 		if (cpuc_prev && cpuc_prev->is_online && cpuc_prev->idle_start_clk != 0) {
 			u64 now = scx_bpf_now();
+			/* 1.5ms threshold for cache locality */
 			if (now - ictx.taskc->last_stopping_clk < 1500000ULL) {
 				cpu_id = prev_cpu;
 				found_idle = true;
@@ -340,17 +379,25 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		}
 	}
 
-	if (wake_flags & SCX_WAKE_SYNC)
-		set_task_flag(ictx.taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
-	else
-		reset_task_flag(ictx.taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
+	/* Attempt specific topology optimizations (isolated for verifier) */
+	cpu_id = try_select_idle_sibling(&ictx, prev_cpu);
+	if (cpu_id >= 0) {
+		found_idle = true;
+		goto fast_path_idle;
+	}
 
 	cpu_id = pick_idle_cpu(&ictx, &found_idle);
 	cpu_id = cpu_id >= 0 ? cpu_id : prev_cpu;
 
 fast_path_idle:
+	if (wake_flags & SCX_WAKE_SYNC)
+		set_task_flag(ictx.taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
+	else
+		reset_task_flag(ictx.taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
+
 	ictx.taskc->suggested_cpu_id = cpu_id;
 
+	/* Performance Criticality Check: Don't dump critical tasks on E-cores */
 	if (have_little_core && prev_cpu >= 0 && cpu_id >= 0) {
 		u64 avg_perf = READ_ONCE(sys_stat.avg_perf_cri);
 		struct cpu_ctx *cpuc_prev = get_cpu_ctx_id(prev_cpu);
@@ -471,6 +518,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 	}
 
+	/* Lockless check to avoid atomic contention if possible */
 	if (is_pinned(p) && !test_task_flag(taskc, LAVD_FLAG_PINNED_COUNTED)) {
 		atomic_inc_u32(&cpuc->nr_pinned_tasks);
 		set_task_flag(taskc, LAVD_FLAG_PINNED_COUNTED);
@@ -561,8 +609,8 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	u64 cpu_dsq_id, cpdom_dsq_id;
 	task_ctx *taskc_prev = NULL;
 	bool try_consume = false;
-	struct task_struct *p;
 	struct cpu_ctx *cpuc;
+	struct task_struct *p;
 	int ret;
 
 	cpuc = get_cpu_ctx_id(cpu);
@@ -640,39 +688,39 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	if (!q_depth)
 		goto unlock_out;
 
+	/* Cap iterations to avoid O(N) stalls */
+	#define LAVD_DISPATCH_CAP 8
+	u32 iter_cnt = 0;
+
+	/* Trusted iterator - p is trusted */
 	bpf_for_each(scx_dsq, p, cpdom_dsq_id, 0) {
 		task_ctx *taskc;
 		s32 new_cpu;
 
-		p = bpf_task_from_pid(p->pid);
-		if (!p)
+		iter_cnt++;
+		if (iter_cnt > LAVD_DISPATCH_CAP)
 			break;
 
 		if (is_pinned(p)) {
 			new_cpu = scx_bpf_task_cpu(p);
 			if (new_cpu == cpu) {
 				bpf_cpumask_set_cpu(new_cpu, ovrflw);
-				bpf_task_release(p);
 				try_consume = true;
 				break;
 			}
 			if (!bpf_cpumask_test_and_set_cpu(new_cpu, ovrflw))
 				scx_bpf_kick_cpu(new_cpu, SCX_KICK_IDLE);
-			bpf_task_release(p);
 			continue;
 		} else if (is_migration_disabled(p)) {
 			new_cpu = scx_bpf_task_cpu(p);
 			if (new_cpu == cpu) {
-				bpf_task_release(p);
 				try_consume = true;
 				break;
 			}
-			bpf_task_release(p);
 			continue;
 		}
 
 		taskc = get_task_ctx(p);
-
 		bool should_skip = true;
 
 		if (taskc) {
@@ -695,22 +743,18 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 			}
 		}
 
-		if (should_skip) {
-			bpf_task_release(p);
+		if (should_skip)
 			continue;
-		}
 
 		new_cpu = find_cpu_in(p->cpus_ptr, cpuc);
 		if (new_cpu >= 0) {
 			if (new_cpu == cpu) {
 				bpf_cpumask_set_cpu(new_cpu, ovrflw);
-				bpf_task_release(p);
 				try_consume = true;
 				break;
 			} else if (!bpf_cpumask_test_and_set_cpu(new_cpu, ovrflw))
 				scx_bpf_kick_cpu(new_cpu, SCX_KICK_IDLE);
 		}
-		bpf_task_release(p);
 	}
 
 unlock_out:

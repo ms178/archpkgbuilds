@@ -6,7 +6,6 @@
  * - 64-byte Cache Line Alignment
  * - False Sharing Mitigation via struct padding
  * - C11 Atomics for Memory Model correctness
- * - Upstream patch integration (task_ctx migration)
  */
 #ifndef __LAVD_H
 #define __LAVD_H
@@ -35,6 +34,9 @@
 #define dsq_to_cpdom(dsq_id)		((dsq_id) & LAVD_DSQ_ID_MASK)
 #define dsq_to_cpu(dsq_id)		((dsq_id) & LAVD_DSQ_ID_MASK)
 #define dsq_type(dsq_id)		(((dsq_id) & LAVD_DSQ_TYPE_MASK) >> LAVD_DSQ_TYPE_SHFT)
+
+#define time_delta(after, before) \
+	((after) >= (before) ? (after) - (before) : 0)
 
 enum {
 	LAVD_DSQ_TYPE_SHFT		= 12,
@@ -151,7 +153,6 @@ extern int			nr_cpdoms;
 
 /*
  * Task Context
- * Upstreamed from intf.h to lavd.bpf.h
  * Reordered for packing efficiency.
  */
 struct task_ctx {
@@ -202,16 +203,17 @@ struct cpu_ctx *get_cpu_ctx_id(s32 cpu_id);
 struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p);
 
 /*
- * CPU Context
- * Optimized for Raptor Lake (64B cache lines).
- * Separates per-cpu Write-Heavy fields from Read-Mostly/Global fields.
+ * CPU Context - Godlike Optimization for Raptor Lake SMT
  */
 struct cpu_ctx {
-	/* CACHE LINE 0 (0-63): Nuclear Hot (Per-CPU execution state) */
+	/* CACHE LINE 0 (0-63): Local Execution State (Owner Write/Read) */
 	volatile u64	running_clk;
 	volatile u64	est_stopping_clk;
+	volatile u64	idle_start_clk;
 	volatile u64	flags;
-	volatile u32	nr_pinned_tasks;
+	volatile u32	cur_util;
+	volatile u32	avg_util;
+	u32		cpuperf_cur;
 	volatile u16	lat_cri;
 	u16		cpu_id;
 	u16		capacity;
@@ -223,42 +225,37 @@ struct cpu_ctx {
 	u8		cpdom_alt_id;
 	u8		cpdom_poll_pos;
 	u8		__pad0[3];
-	volatile s32	futex_op;
-	u8		__pad1[16];
 
-	/* CACHE LINE 1 (64-127): Hot (Utilization & Load Tracking) */
-	volatile u64	idle_start_clk;
+	/* CACHE LINE 1 (64-127): Remote Inbound State (Remote Write) */
+	volatile u32	nr_pinned_tasks; /* ATOMIC HOTSPOT */
+	volatile s32	futex_op;
+	u8		__pad1[56];
+
+	/* CACHE LINE 2 (128-191): Load Tracking & Stats (Shared Read/Write) */
 	volatile u64	tot_svc_time;
 	volatile u64	tot_sc_time;
 	volatile u64	cpu_release_clk;
 	volatile u64	idle_total;
-	volatile u32	cur_util;
-	volatile u32	avg_util;
 	volatile u32	cur_sc_util;
 	volatile u32	avg_sc_util;
-	u32		cpuperf_cur;
-	u32		__pad2;
-
-	/* CACHE LINE 2 (128-191): Warm/Global (Criticality Sums & Hotplug) */
 	volatile u64	sum_lat_cri;
 	volatile u64	sum_perf_cri;
+
+	/* CACHE LINE 3 (192-255): Stats Cold */
 	volatile u32	max_lat_cri;
 	volatile u32	nr_sched;
 	volatile u32	min_perf_cri;
 	volatile u32	max_perf_cri;
 	u64		online_clk;
 	u64		offline_clk;
-	u8		__pad3[16];
-
-	/* CACHE LINE 3 (192-255): Cold (Stats & Pointers) */
-	volatile u32	nr_preempt	__attribute__((aligned(64)));
+	volatile u32	nr_preempt;
 	volatile u32	nr_x_migration;
 	volatile u32	nr_perf_cri;
 	volatile u32	nr_lat_cri;
-	u8		__pad4[48];
+	u8		__pad3[16];
 
-	/* CACHE LINE 4+ (256+): Cpumask Pointers (Read-only mostly) */
-	struct bpf_cpumask __kptr *tmp_a_mask	__attribute__((aligned(64)));
+	/* CACHE LINE 4+ (256+): Pointers (Read-Only) */
+	struct bpf_cpumask __kptr *tmp_a_mask __attribute__((aligned(64)));
 	struct bpf_cpumask __kptr *tmp_o_mask;
 	struct bpf_cpumask __kptr *tmp_l_mask;
 	struct bpf_cpumask __kptr *tmp_i_mask;
@@ -332,8 +329,7 @@ u64 calc_avg(u64 old_val, u64 new_val);
 u64 calc_asym_avg(u64 old_val, u64 new_val);
 
 /*
- * C11 Atomic Builtins (preferred over volatile casts)
- * Ensures correct Acquire/Release semantics on x86_64.
+ * C11 Atomic Builtins
  */
 static __always_inline u32 atomic_read_u32(const volatile u32 *ptr)
 {
@@ -416,13 +412,6 @@ static __always_inline bool use_per_cpu_dsq(void)
 
 static __always_inline  bool is_per_cpu_dsq_migratable(void)
 {
-	/*
-	 * When per_cpu-dsq is on, all tasks go to the per-CPU DSQ.
-	 * So a task on a per-CPU DSQ can be migrated to another CPU.
-	 * However, when pinned_slice_ns is on but per_cpu-dsq is not,
-	 * only pinned tasks go to the per-CPU DSQ.
-	 * Hence, tasks in a per-CPU DSQ are not migratable.
-	 */
 	return per_cpu_dsq;
 }
 
