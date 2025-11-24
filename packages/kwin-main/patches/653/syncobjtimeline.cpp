@@ -145,6 +145,9 @@ void SyncReleasePoint::addReleaseFence(const FileDescriptor &fd)
     }
 }
 
+// NOTE: timeline() and timelinePoint() are implemented inline in the header for performance.
+// Do not define them here.
+
 SyncTimeline::SyncTimeline(int drmFd, uint32_t handle)
     : m_drmFd(drmFd)
     , m_handle(handle)
