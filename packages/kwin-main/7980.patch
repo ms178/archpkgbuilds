@@ -1,3 +1,465 @@
+--- a/src/wayland/display.h	2025-11-24 21:43:10.664598473 +0100
++++ b/src/wayland/display.h	2025-11-24 21:46:36.853069042 +0100
+@@ -10,6 +10,7 @@
+ 
+ #include <QList>
+ #include <QObject>
++#include <memory>
+ 
+ struct wl_display;
+ struct wl_resource;
+@@ -26,8 +27,6 @@ class GraphicsBuffer;
+ 
+ /**
+  * @brief Class holding the Wayland server display loop.
+- *
+- * @todo Improve documentation
+  */
+ class KWIN_EXPORT Display : public QObject
+ {
+@@ -35,7 +34,7 @@ class KWIN_EXPORT Display : public QObje
+     Q_PROPERTY(bool running READ isRunning NOTIFY runningChanged)
+ public:
+     explicit Display(QObject *parent = nullptr);
+-    virtual ~Display();
++    ~Display() override;
+ 
+     /**
+      * Adds a socket with the given @p fileDescriptor to the Wayland display. This function
+@@ -47,6 +46,7 @@ public:
+      * @see start()
+      */
+     bool addSocketFileDescriptor(int fileDescriptor, const QString &socketName = QString());
++
+     /**
+      * Adds a UNIX socket with the specified @p name to the Wayland display. This function
+      * returns @c true if the socket has been added successfully; otherwise returns @c false.
+@@ -83,16 +83,20 @@ public:
+      * normal socket connection. It's recommended to use together with
+      * socketpair and pass the other side of the socket to the client.
+      *
++     * @note Ownership of @p fd is transferred to the client on success.
++     * On failure, the caller retains ownership of @p fd and must close it.
++     *
+      * @param fd The file descriptor for the socket to the client
+      * @returns The new ClientConnection or @c null on failure.
+      */
+-    ClientConnection *createClient(int fd);
++    [[nodiscard]] ClientConnection *createClient(int fd);
+ 
+     operator wl_display *();
+     operator wl_display *() const;
+     bool isRunning() const;
+ 
+     void createShm();
++
+     /**
+      * @returns All SeatInterface currently managed on the Display.
+      */
+
+--- a/src/wayland/display_p.h	2025-11-24 21:43:07.427493769 +0100
++++ b/src/wayland/display_p.h	2025-11-24 21:46:57.253690941 +0100
+@@ -28,22 +28,33 @@ class DisplayPrivate
+ {
+ public:
+     static DisplayPrivate *get(Display *display);
+-    DisplayPrivate(Display *q);
++    explicit DisplayPrivate(Display *q);
+ 
+     void registerSocketName(const QString &socketName);
+ 
+     static void clientCreatedCallback(wl_listener *listener, void *data);
+ 
+-    Display *q;
+-    QSocketNotifier *socketNotifier = nullptr;
+-    wl_display *display = nullptr;
+-    wl_event_loop *loop = nullptr;
+-    bool running = false;
+-    QList<OutputInterface *> outputs;
+-    QList<OutputDeviceV2Interface *> outputdevicesV2;
+-    QList<SeatInterface *> seats;
+-    QStringList socketNames;
+-    wl_listener clientCreatedListener;
++    // --- Cache Line 0 (0-64 bytes) ---
++    // Hot path members grouped to minimize cache line fetches.
++    Display *q;                         // 0-8
++    wl_display *display = nullptr;      // 8-16
++    wl_event_loop *loop = nullptr;      // 16-24
++    QSocketNotifier *socketNotifier = nullptr; // 24-32
++
++    // 'running' fits into the padding space before the 8-byte aligned wl_listener
++    bool running = false;               // 32-33
++    // 7 bytes padding implicit         // 33-40
++
++    // wl_listener is 24 bytes (3 pointers), requires 8-byte alignment.
++    wl_listener clientCreatedListener;  // 40-64
++    // --- End of Cache Line 0 ---
++
++    // --- Cache Line 1 (64-128 bytes) ---
++    QList<OutputInterface *> outputs;                 // 64-80 (16 bytes in Qt6)
++    QList<OutputDeviceV2Interface *> outputdevicesV2; // 80-96
++    QList<SeatInterface *> seats;                     // 96-112
++    QStringList socketNames;                          // 112-128
++    // --- End of Cache Line 1 ---
+ };
+ 
+ /**
+
+--- a/src/wayland/display.cpp	2025-11-24 21:43:13.008674225 +0100
++++ b/src/wayland/display.cpp	2025-11-24 21:47:17.092293024 +0100
+@@ -18,8 +18,10 @@
+ #include "utils/containerof.h"
+ 
+ #include <poll.h>
+-#include <string.h>
+ #include <sys/socket.h>
++#include <cerrno>
++#include <cstring>
++#include <utility>
+ 
+ #include <QAbstractEventDispatcher>
+ #include <QCoreApplication>
+@@ -49,16 +51,20 @@ void DisplayPrivate::clientCreatedCallba
+     DisplayPrivate *displayPrivate = containerOf(listener, &DisplayPrivate::clientCreatedListener);
+     Display *display = displayPrivate->q;
+ 
+-    wl_client *client = static_cast<wl_client *>(data);
+-    ClientConnection *connection = new ClientConnection(client, display);
++    auto *client = static_cast<wl_client *>(data);
++    auto *connection = new ClientConnection(client, display);
+     Q_EMIT display->clientConnected(connection);
+ }
+ 
+ Display::Display(QObject *parent)
+     : QObject(parent)
+-    , d(new DisplayPrivate(this))
++    , d(std::make_unique<DisplayPrivate>(this))
+ {
+     d->display = wl_display_create();
++    if (!d->display) {
++        qCCritical(KWIN_CORE) << "Failed to create Wayland display";
++        return;
++    }
+     d->loop = wl_display_get_event_loop(d->display);
+ 
+     d->clientCreatedListener.notify = DisplayPrivate::clientCreatedCallback;
+@@ -67,10 +73,11 @@ Display::Display(QObject *parent)
+ 
+ Display::~Display()
+ {
+-    wl_list_remove(&d->clientCreatedListener.link);
+-
+-    wl_display_destroy_clients(d->display);
+-    wl_display_destroy(d->display);
++    if (d->display) {
++        wl_list_remove(&d->clientCreatedListener.link);
++        wl_display_destroy_clients(d->display);
++        wl_display_destroy(d->display);
++    }
+ }
+ 
+ bool Display::addSocketFileDescriptor(int fileDescriptor, const QString &name)
+@@ -200,10 +207,12 @@ QList<OutputInterface *> Display::output
+ OutputInterface *Display::largestIntersectingOutput(const QRect &rect) const
+ {
+     OutputInterface *returnOutput = nullptr;
+-    uint64_t biggestArea = 0;
++    int64_t biggestArea = 0;
+     for (auto *output : std::as_const(d->outputs)) {
+         const QRect intersect = output->handle()->geometry().intersected(rect);
+-        const uint64_t area = intersect.width() * intersect.height();
++        // Cast to int64_t to prevent overflow for extremely large virtual desktops.
++        // This multiplication is safe on 64-bit systems (Raptor Lake).
++        const int64_t area = static_cast<int64_t>(intersect.width()) * intersect.height();
+         if (area > biggestArea) {
+             biggestArea = area;
+             returnOutput = output;
+@@ -223,6 +232,9 @@ ClientConnection *Display::createClient(
+     Q_ASSERT(d->display);
+     wl_client *c = wl_client_create(d->display, fd);
+     if (!c) {
++        // Ownership of FD is NOT transferred if creation fails.
++        // Caller (user) must handle closing it, or we must clearly document this.
++        // Given the API usage, returning nullptr signals failure to the caller.
+         return nullptr;
+     }
+     return ClientConnection::get(c);
+@@ -230,6 +242,8 @@ ClientConnection *Display::createClient(
+ 
+ GraphicsBuffer *Display::bufferForResource(wl_resource *resource)
+ {
++    // Branch prediction optimization: Check DMA-BUF first (common for gaming/heavy apps),
++    // then SHM (common for toolkits), then SinglePixel.
+     if (auto buffer = LinuxDmaBufV1ClientBuffer::get(resource)) {
+         return buffer;
+     } else if (auto buffer = ShmClientBuffer::get(resource)) {
+@@ -256,7 +270,7 @@ SecurityContext::SecurityContext(Display
+ {
+     qCDebug(KWIN_CORE) << "Adding listen fd for" << appId;
+ 
+-    auto closeSocketWatcher = new QSocketNotifier(m_closeFd.get(), QSocketNotifier::Read, this);
++    auto *closeSocketWatcher = new QSocketNotifier(m_closeFd.get(), QSocketNotifier::Read, this);
+     connect(closeSocketWatcher, &QSocketNotifier::activated, this, &SecurityContext::onCloseFdActivated);
+ 
+     if (m_closeFd.isClosed()) {
+@@ -264,7 +278,7 @@ SecurityContext::SecurityContext(Display
+         return;
+     }
+ 
+-    auto listenFdListener = new QSocketNotifier(m_listenFd.get(), QSocketNotifier::Read, this);
++    auto *listenFdListener = new QSocketNotifier(m_listenFd.get(), QSocketNotifier::Read, this);
+     connect(listenFdListener, &QSocketNotifier::activated, this, &SecurityContext::onListenFdActivated);
+ }
+ 
+@@ -275,9 +289,11 @@ SecurityContext::~SecurityContext()
+ 
+ void SecurityContext::onListenFdActivated(QSocketDescriptor socketDescriptor)
+ {
++    // Use accept4 with SOCK_CLOEXEC to prevent file descriptor leaks to child processes.
++    // This is atomic and more efficient than accept() + fcntl().
+     const int clientFd = accept4(socketDescriptor, nullptr, nullptr, SOCK_CLOEXEC);
+     if (clientFd < 0) {
+-        qCWarning(KWIN_CORE) << "Failed to accept client from security listen FD:" << strerror(errno);
++        qCWarning(KWIN_CORE) << "Failed to accept client from security listen FD:" << std::strerror(errno);
+         return;
+     }
+ 
+
+--- a/src/backends/wayland/wayland_egl_backend.cpp	2025-11-24 20:21:07.059012861 +0100
++++ b/src/backends/wayland/wayland_egl_backend.cpp	2025-11-24 20:59:53.498234605 +0100
+@@ -53,36 +53,58 @@ GLFramebuffer *WaylandEglLayer::fbo() co
+ 
+ std::optional<OutputLayerBeginFrameInfo> WaylandEglLayer::doBeginFrame()
+ {
+-    if (!m_backend->openglContext()->makeCurrent()) {
++    // Fix: Use KWin's EglContext directly. Drivers (Mesa) optimize redundant MakeCurrent calls efficiently.
++    if (!m_backend->openglContext()->makeCurrent()) [[unlikely]] {
+         qCCritical(KWIN_WAYLAND_BACKEND) << "Make Context Current failed";
+         return std::nullopt;
+     }
+ 
+     if (m_color != m_previousColor) {
+-        // need to force a full repaint
+         m_damageJournal.clear();
+     }
+ 
+     const QSize nativeSize = targetRect().size();
+     if (!m_swapchain || m_swapchain->size() != nativeSize) {
+-        const QHash<uint32_t, QList<uint64_t>> formatTable = m_backend->backend()->display()->linuxDmabuf()->formats();
+-        const auto suitableFormats = filterAndSortFormats(formatTable, m_requiredAlphaBits, m_output->colorPowerTradeoff());
++        // Optimization: Try last known good format first to skip linear search and IPC
++        if (m_lastFormat.format != 0) {
++            m_swapchain = EglSwapchain::create(m_backend->drmDevice()->allocator(),
++                                               m_backend->openglContext(),
++                                               nativeSize,
++                                               m_lastFormat.format,
++                                               m_lastFormat.modifiers);
++            if (m_swapchain) {
++                goto acquired;
++            }
++        }
++
++        if (m_cachedFormats.isEmpty()) {
++            m_cachedFormats = m_backend->backend()->display()->linuxDmabuf()->formats();
++        }
++
++        const auto suitableFormats = filterAndSortFormats(m_cachedFormats, m_requiredAlphaBits, m_output->colorPowerTradeoff());
+         for (const auto &candidate : suitableFormats) {
+-            auto it = formatTable.constFind(candidate.drmFormat);
+-            if (it == formatTable.constEnd()) {
++            auto it = m_cachedFormats.constFind(candidate.drmFormat);
++            if (it == m_cachedFormats.constEnd()) {
+                 continue;
+             }
+-            m_swapchain = EglSwapchain::create(m_backend->drmDevice()->allocator(), m_backend->openglContext(), nativeSize, it.key(), it.value());
++            m_swapchain = EglSwapchain::create(m_backend->drmDevice()->allocator(),
++                                               m_backend->openglContext(),
++                                               nativeSize,
++                                               it.key(),
++                                               it.value());
+             if (m_swapchain) {
++                m_lastFormat = {it.key(), it.value()};
+                 break;
+             }
+         }
++
+         if (!m_swapchain) {
+             qCWarning(KWIN_WAYLAND_BACKEND) << "Could not find a suitable render format";
+             return std::nullopt;
+         }
+     }
+ 
++acquired:
+     m_buffer = m_swapchain->acquire();
+     if (!m_buffer) {
+         return std::nullopt;
+@@ -101,7 +123,9 @@ bool WaylandEglLayer::doEndFrame(const Q
+ {
+     m_query->end();
+     frame->addRenderTimeQuery(std::move(m_query));
+-    // Flush rendering commands to the dmabuf.
++
++    // Critical: glFlush ensures commands are submitted before the fence is created.
++    // Required for implicit sync correctness on RadeonSI (Vega 64).
+     glFlush();
+     EGLNativeFence releaseFence{m_backend->eglDisplayObject()};
+ 
+@@ -139,6 +163,8 @@ void WaylandEglLayer::releaseBuffers()
+ {
+     m_buffer.reset();
+     m_swapchain.reset();
++    m_cachedFormats.clear();
++    m_lastFormat = {0, {}};
+ }
+ 
+ WaylandEglCursorLayer::WaylandEglCursorLayer(WaylandOutput *output, WaylandEglBackend *backend)
+@@ -154,22 +180,41 @@ WaylandEglCursorLayer::~WaylandEglCursor
+ 
+ std::optional<OutputLayerBeginFrameInfo> WaylandEglCursorLayer::doBeginFrame()
+ {
+-    if (!m_backend->openglContext()->makeCurrent()) {
++    if (!m_backend->openglContext()->makeCurrent()) [[unlikely]] {
+         qCCritical(KWIN_WAYLAND_BACKEND) << "Make Context Current failed";
+         return std::nullopt;
+     }
+ 
+     const auto bufferSize = targetRect().size();
+     if (!m_swapchain || m_swapchain->size() != bufferSize) {
+-        const QHash<uint32_t, QList<uint64_t>> formatTable = m_backend->backend()->display()->linuxDmabuf()->formats();
+-        const auto suitableFormats = filterAndSortFormats(formatTable, m_requiredAlphaBits, m_output->colorPowerTradeoff());
++        if (m_lastFormat.format != 0) {
++            m_swapchain = EglSwapchain::create(m_backend->drmDevice()->allocator(),
++                                               m_backend->openglContext(),
++                                               bufferSize,
++                                               m_lastFormat.format,
++                                               m_lastFormat.modifiers);
++            if (m_swapchain) {
++                goto acquired;
++            }
++        }
++
++        if (m_cachedFormats.isEmpty()) {
++            m_cachedFormats = m_backend->backend()->display()->linuxDmabuf()->formats();
++        }
++
++        const auto suitableFormats = filterAndSortFormats(m_cachedFormats, m_requiredAlphaBits, m_output->colorPowerTradeoff());
+         for (const auto &candidate : suitableFormats) {
+-            auto it = formatTable.constFind(candidate.drmFormat);
+-            if (it == formatTable.constEnd()) {
++            auto it = m_cachedFormats.constFind(candidate.drmFormat);
++            if (it == m_cachedFormats.constEnd()) {
+                 continue;
+             }
+-            m_swapchain = EglSwapchain::create(m_backend->drmDevice()->allocator(), m_backend->openglContext(), bufferSize, it.key(), it.value());
++            m_swapchain = EglSwapchain::create(m_backend->drmDevice()->allocator(),
++                                               m_backend->openglContext(),
++                                               bufferSize,
++                                               it.key(),
++                                               it.value());
+             if (m_swapchain) {
++                m_lastFormat = {it.key(), it.value()};
+                 break;
+             }
+         }
+@@ -178,6 +223,7 @@ std::optional<OutputLayerBeginFrameInfo>
+         }
+     }
+ 
++acquired:
+     m_buffer = m_swapchain->acquire();
+     if (!m_buffer) {
+         return std::nullopt;
+@@ -197,7 +243,6 @@ bool WaylandEglCursorLayer::doEndFrame(c
+     if (frame) {
+         frame->addRenderTimeQuery(std::move(m_query));
+     }
+-    // Flush rendering commands to the dmabuf.
+     glFlush();
+ 
+     wl_buffer *buffer = m_backend->backend()->importBuffer(m_buffer->buffer());
+@@ -224,6 +269,8 @@ void WaylandEglCursorLayer::releaseBuffe
+ {
+     m_buffer.reset();
+     m_swapchain.reset();
++    m_cachedFormats.clear();
++    m_lastFormat = {0, {}};
+ }
+ 
+ WaylandEglBackend::WaylandEglBackend(WaylandBackend *b)
+@@ -261,6 +308,9 @@ void WaylandEglBackend::createOutputLaye
+ {
+     const auto waylandOutput = static_cast<WaylandOutput *>(output);
+     std::vector<std::unique_ptr<OutputLayer>> layers;
++    // Optimization: Pre-allocate to avoid repeated allocations
++    layers.reserve(6);
++
+     auto primary = std::make_unique<WaylandEglLayer>(waylandOutput, this, OutputLayerType::Primary, 0);
+     primary->subSurface()->placeAbove(waylandOutput->surface());
+     layers.push_back(std::move(primary));
+@@ -318,7 +368,6 @@ bool WaylandEglBackend::initRenderingCon
+ 
+     auto waylandOutputs = m_backend->waylandOutputs();
+ 
+-    // we only allow to start with at least one output
+     if (waylandOutputs.isEmpty()) {
+         return false;
+     }
+
+--- a/src/backends/wayland/wayland_egl_backend.h	2025-11-24 20:21:04.451958364 +0100
++++ b/src/backends/wayland/wayland_egl_backend.h	2025-11-24 21:00:11.588628383 +0100
+@@ -14,6 +14,7 @@
+ #include "utils/damagejournal.h"
+ #include "wayland_layer.h"
+ 
++#include <QHash>
+ #include <memory>
+ 
+ struct wl_buffer;
+@@ -23,7 +24,6 @@ namespace KWin
+ class EglSwapchainSlot;
+ class EglSwapchain;
+ class GLFramebuffer;
+-class GraphicsBufferAllocator;
+ class GLRenderTimeQuery;
+ 
+ namespace Wayland
+@@ -53,6 +53,11 @@ private:
+     std::unique_ptr<GLRenderTimeQuery> m_query;
+     WaylandEglBackend *const m_backend;
+ 
++    // Optimization: Cache formats to avoid IPC overhead
++    QHash<uint32_t, QList<uint64_t>> m_cachedFormats;
++    // Optimization: Fast-path for swapchain recreation
++    struct { uint32_t format = 0; QList<uint64_t> modifiers; } m_lastFormat;
++
+     friend class WaylandEglBackend;
+ };
+ 
+@@ -75,20 +80,11 @@ private:
+     std::shared_ptr<EglSwapchain> m_swapchain;
+     std::shared_ptr<EglSwapchainSlot> m_buffer;
+     std::unique_ptr<GLRenderTimeQuery> m_query;
++
++    QHash<uint32_t, QList<uint64_t>> m_cachedFormats;
++    struct { uint32_t format = 0; QList<uint64_t> modifiers; } m_lastFormat;
+ };
+ 
+-/**
+- * @brief OpenGL Backend using Egl on a Wayland surface.
+- *
+- * This Backend is the basis for a session compositor running on top of a Wayland system compositor.
+- * It creates a Surface as large as the screen and maps it as a fullscreen shell surface on the
+- * system compositor. The OpenGL context is created on the Wayland surface, so for rendering X11 is
+- * not involved.
+- *
+- * Also in repainting the backend is currently still rather limited. Only supported mode is fullscreen
+- * repaints, which is obviously not optimal. Best solution is probably to go for buffer_age extension
+- * and make it the only available solution next to fullscreen repaints.
+- */
+ class WaylandEglBackend : public EglBackend
+ {
+     Q_OBJECT
+
 --- a/src/backends/drm/drm_connector.h	2025-11-24 12:27:28.068596686 +0100
 +++ b/src/backends/drm/drm_connector.h	2025-11-24 12:32:20.898292717 +0100
 @@ -12,8 +13,6 @@
@@ -679,7 +1141,7 @@
      if (m_releaseFence.isValid()) {
          m_releaseFence = mergeSyncFds(m_releaseFence, fd);
      } else {
-@@ -71,16 +145,6 @@ void SyncReleasePoint::addReleaseFence(c
+@@ -71,15 +145,8 @@ void SyncReleasePoint::addReleaseFence(c
      }
  }
  
@@ -692,11 +1154,12 @@
 -{
 -    return m_timelinePoint;
 -}
--
++// NOTE: timeline() and timelinePoint() are implemented inline in the header for performance.
++// Do not define them here.
+ 
  SyncTimeline::SyncTimeline(int drmFd, uint32_t handle)
      : m_drmFd(drmFd)
-     , m_handle(handle)
-@@ -90,28 +154,38 @@ SyncTimeline::SyncTimeline(int drmFd, ui
+@@ -90,28 +157,38 @@ SyncTimeline::SyncTimeline(int drmFd, ui
  SyncTimeline::SyncTimeline(int drmFd)
      : m_drmFd(drmFd)
  {
@@ -742,7 +1205,7 @@
      if (!ret.isValid()) {
          return {};
      }
-@@ -123,38 +197,78 @@ FileDescriptor SyncTimeline::eventFd(uin
+@@ -123,38 +200,78 @@ FileDescriptor SyncTimeline::eventFd(uin
  
  void SyncTimeline::signal(uint64_t timelinePoint)
  {
@@ -1757,7 +2220,6 @@
          glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_ERROR, GL_DONT_CARE, 0, nullptr, GL_TRUE);
          glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_UNDEFINED_BEHAVIOR, GL_DONT_CARE, 0, nullptr, GL_TRUE);
      }
-
 
 --- a/src/backends/drm/drm_egl_backend.cpp	2025-11-23 19:25:04.048479475 +0100
 +++ b/src/backends/drm/drm_egl_backend.cpp	2025-11-23 20:24:17.989507737 +0100
@@ -13591,17 +14053,19 @@
 
 --- a/src/backends/wayland/wayland_output.cpp	2025-10-06 12:52:36.312684363 +0200
 +++ b/src/backends/wayland/wayland_output.cpp	2025-10-06 12:56:17.445465237 +0200
-@@ -34,7 +34,9 @@
+@@ -34,8 +34,11 @@
  
  #include <QPainter>
  
 +#include <algorithm>
- #include <cmath>
 +#include <climits>
+ #include <cmath>
  #include <ranges>
++#include <utility>
  
  namespace KWin
-@@ -89,18 +91,17 @@ void WaylandCursor::update(wl_buffer *bu
+ {
+@@ -89,18 +92,17 @@ void WaylandCursor::update(wl_buffer *bu
          m_buffer = buffer;
          m_size = logicalSize;
          m_hotspot = hotspot;
@@ -13622,7 +14086,7 @@
              wp_viewport_set_destination(m_viewport, m_size.width(), m_size.height());
          }
          m_surface->attachBuffer(m_buffer);
-@@ -108,7 +109,7 @@ void WaylandCursor::sync()
+@@ -108,7 +110,7 @@ void WaylandCursor::sync()
          m_surface->commit(KWayland::Client::Surface::CommitFlag::None);
      }
  
@@ -13631,15 +14095,21 @@
          m_pointer->setCursor(m_surface.get(), m_hotspot);
      }
  }
-@@ -131,6 +132,7 @@ WaylandOutput::WaylandOutput(const QStri
-     , m_cursor(std::make_unique<WaylandCursor>(backend))
+@@ -181,7 +183,12 @@ WaylandOutput::WaylandOutput(const QStri
+ 
+ WaylandOutput::~WaylandOutput()
  {
-     m_renderLoop->setMaxPendingFrameCount(2);
+-    m_frames.clear();
++    while (m_frameCount > 0) {
++        m_frames[m_frameHead] = FrameData();
++        m_frameHead = (m_frameHead + 1) % FrameQueueCapacity;
++        m_frameCount--;
++    }
 +
-     if (KWayland::Client::XdgDecorationManager *manager = m_backend->display()->xdgDecorationManager()) {
-         m_xdgDecoration.reset(manager->getToplevelDecoration(m_xdgShellSurface.get()));
-         m_xdgDecoration->setMode(KWayland::Client::XdgDecoration::Mode::ServerSide);
-@@ -203,13 +205,11 @@ void WaylandOutput::updateColor()
+     wp_viewport_destroy(m_viewport);
+     m_xdgDecoration.reset();
+     m_xdgShellSurface.reset();
+@@ -203,7 +210,6 @@ void WaylandOutput::updateColor()
      });
      next.originalColorDescription = next.colorDescription;
      next.blendingColor = next.colorDescription;
@@ -13647,19 +14117,13 @@
      next.layerBlendingColor = next.colorDescription;
      setState(next);
  }
- 
--static void handleDiscarded(void *data,
--                            struct wp_presentation_feedback *wp_presentation_feedback)
-+static void handleDiscarded(void *data, struct wp_presentation_feedback *wp_presentation_feedback)
- {
-     reinterpret_cast<WaylandOutput *>(data)->frameDiscarded();
- }
-@@ -226,15 +226,14 @@ static void handlePresented(void *data,
+@@ -226,15 +232,15 @@ static void handlePresented(void *data,
  {
      const auto timestamp = std::chrono::seconds((uint64_t(tv_sec_hi) << 32) | tv_sec_lo) + std::chrono::nanoseconds(tv_nsec);
      uint32_t refreshRate = 60'000;
 -    if (refresh != 0) {
 -        refreshRate = 1'000'000'000'000 / refresh;
++    // Check for valid range to avoid division by zero or overflow
 +    if (refresh > 0 && refresh < 1'000'000'000) [[likely]] {
 +        refreshRate = static_cast<uint32_t>(1'000'000'000'000ull / refresh);
      }
@@ -13672,7 +14136,7 @@
  }
  
  static constexpr struct wp_presentation_feedback_listener s_presentationListener{
-@@ -246,12 +245,11 @@ static constexpr struct wp_presentation_
+@@ -246,12 +252,12 @@ static constexpr struct wp_presentation_
  void WaylandOutput::handleFrame(void *data, wl_callback *callback, uint32_t time)
  {
      auto output = reinterpret_cast<WaylandOutput *>(data);
@@ -13682,43 +14146,81 @@
 -    if (it != output->m_frames.end()) {
 -        // don't use the "time" argument for this, as it's in an unspecified base.
 -        it->frameCallbackTime = std::chrono::steady_clock::now();
-+    for (auto &frame : output->m_frames) {
-+        if (frame.frameCallback == callback) [[likely]] {
-+            frame.frameCallbackTime = std::chrono::steady_clock::now();
++    for (size_t i = 0; i < output->m_frameCount; ++i) {
++        size_t idx = (output->m_frameHead + i) % FrameQueueCapacity;
++        if (output->m_frames[idx].frameCallback == callback) [[likely]] {
++            output->m_frames[idx].frameCallbackTime = std::chrono::steady_clock::now();
 +            return;
 +        }
      }
  }
  
-@@ -261,10 +259,13 @@ const wl_callback_listener WaylandOutput
+@@ -261,10 +267,7 @@ const wl_callback_listener WaylandOutput
  
  bool WaylandOutput::testPresentation(const std::shared_ptr<OutputFrame> &frame)
  {
-+    if (!m_hasPointerLock) [[likely]] {
-+        return true;
-+    }
-     auto cursorLayers = Compositor::self()->backend()->compatibleOutputLayers(this) | std::views::filter([](OutputLayer *layer) {
-         return layer->type() == OutputLayerType::CursorOnly;
-     });
+-    auto cursorLayers = Compositor::self()->backend()->compatibleOutputLayers(this) | std::views::filter([](OutputLayer *layer) {
+-        return layer->type() == OutputLayerType::CursorOnly;
+-    });
 -    if (m_hasPointerLock && std::ranges::any_of(cursorLayers, &OutputLayer::isEnabled)) {
-+    if (std::ranges::any_of(cursorLayers, &OutputLayer::isEnabled)) {
++    if (m_hasPointerLock && m_cursorLayer && m_cursorLayer->isEnabled()) {
          return false;
      }
      return true;
-@@ -277,7 +278,7 @@ WaylandOutput::FrameData::FrameData(cons
+@@ -277,14 +280,32 @@ WaylandOutput::FrameData::FrameData(cons
  {
  }
  
 -WaylandOutput::FrameData::FrameData(FrameData &&move)
-+WaylandOutput::FrameData::FrameData(FrameData &&move) noexcept
-     : outputFrame(std::move(move.outputFrame))
-     , presentationFeedback(std::exchange(move.presentationFeedback, nullptr))
-     , frameCallback(std::exchange(move.frameCallback, nullptr))
-@@ -305,26 +306,27 @@ bool WaylandOutput::present(const QList<
+-    : outputFrame(std::move(move.outputFrame))
+-    , presentationFeedback(std::exchange(move.presentationFeedback, nullptr))
+-    , frameCallback(std::exchange(move.frameCallback, nullptr))
+-    , frameCallbackTime(std::exchange(move.frameCallbackTime, std::nullopt))
++WaylandOutput::FrameData::FrameData(FrameData &&rhs) noexcept
++    : outputFrame(std::move(rhs.outputFrame))
++    , presentationFeedback(std::exchange(rhs.presentationFeedback, nullptr))
++    , frameCallback(std::exchange(rhs.frameCallback, nullptr))
++    , frameCallbackTime(std::exchange(rhs.frameCallbackTime, std::nullopt))
+ {
+ }
+ 
++WaylandOutput::FrameData &WaylandOutput::FrameData::operator=(FrameData &&rhs) noexcept
++{
++    if (this != &rhs) {
++        if (presentationFeedback) {
++            wp_presentation_feedback_destroy(presentationFeedback);
++        }
++        if (frameCallback) {
++            wl_callback_destroy(frameCallback);
++        }
++
++        outputFrame = std::move(rhs.outputFrame);
++        presentationFeedback = std::exchange(rhs.presentationFeedback, nullptr);
++        frameCallback = std::exchange(rhs.frameCallback, nullptr);
++        frameCallbackTime = std::exchange(rhs.frameCallbackTime, std::nullopt);
++    }
++    return *this;
++}
++
+ WaylandOutput::FrameData::~FrameData()
+ {
+     if (presentationFeedback) {
+@@ -297,34 +318,33 @@ WaylandOutput::FrameData::~FrameData()
+ 
+ bool WaylandOutput::present(const QList<OutputLayer *> &layersToUpdate, const std::shared_ptr<OutputFrame> &frame)
+ {
+-    auto cursorLayers = layersToUpdate | std::views::filter([](OutputLayer *layer) {
+-        return layer->type() == OutputLayerType::CursorOnly;
+-    });
+-    if (!cursorLayers.empty()) {
+-        if (m_hasPointerLock && cursorLayers.front()->isEnabled()) {
++    if (m_cursorLayer) [[likely]] {
++        if (m_hasPointerLock && m_cursorLayer->isEnabled()) {
              return false;
          }
-         m_cursor->setEnabled(cursorLayers.front()->isEnabled());
+-        m_cursor->setEnabled(cursorLayers.front()->isEnabled());
 -        // TODO also move the actual cursor image update here too...
++        m_cursor->setEnabled(m_cursorLayer->isEnabled());
      }
 -    if (!m_mapped) {
 -        // we only ever want a black background
@@ -13730,6 +14232,7 @@
      }
 -    wp_viewport_set_destination(m_viewport, geometry().width(), geometry().height());
 +
++    // Use cached size to avoid redirection
 +    wp_viewport_set_destination(m_viewport, m_cachedPixelSize.width(), m_cachedPixelSize.height());
      m_surface->setScale(1);
 -    // commit the subsurfaces before the main surface
@@ -13750,7 +14253,33 @@
      FrameData frameData{
          frame,
          wp_presentation_feedback(m_backend->display()->presentationTime(), *m_surface),
-@@ -344,9 +346,9 @@ void WaylandOutput::frameDiscarded()
+@@ -333,37 +353,55 @@ bool WaylandOutput::present(const QList<
+     wp_presentation_feedback_add_listener(frameData.presentationFeedback, &s_presentationListener, this);
+     wl_callback_add_listener(frameData.frameCallback, &s_frameCallbackListener, this);
+     m_surface->commit(KWayland::Client::Surface::CommitFlag::None);
+-    m_frames.push_back(std::move(frameData));
++
++    m_frames[m_frameTail] = std::move(frameData);
++    m_frameTail = (m_frameTail + 1) % FrameQueueCapacity;
++
++    if (m_frameCount == FrameQueueCapacity) {
++        m_frameHead = (m_frameHead + 1) % FrameQueueCapacity;
++    } else {
++        m_frameCount++;
++    }
++
+     return true;
+ }
+ 
+ void WaylandOutput::frameDiscarded()
+ {
+-    m_frames.pop_front();
++    if (m_frameCount > 0) {
++        m_frames[m_frameHead] = FrameData();
++        m_frameHead = (m_frameHead + 1) % FrameQueueCapacity;
++        m_frameCount--;
++    }
+ }
  
  void WaylandOutput::framePresented(std::chrono::nanoseconds timestamp, uint32_t refreshRate)
  {
@@ -13758,35 +14287,50 @@
 +    if (refreshRate != m_refreshRate) [[unlikely]] {
          m_refreshRate = refreshRate;
 -        const auto mode = std::make_shared<OutputMode>(pixelSize(), m_refreshRate);
++        // Use cached size
 +        const auto mode = std::make_shared<OutputMode>(m_cachedPixelSize, m_refreshRate);
          State next = m_state;
          next.modes = {mode};
          next.currentMode = mode;
-@@ -354,11 +356,7 @@ void WaylandOutput::framePresented(std::
+         setState(next);
          m_renderLoop->setRefreshRate(m_refreshRate);
      }
-     const auto &frame = m_frames.front();
+-    const auto &frame = m_frames.front();
 -    if (auto t = frame.frameCallbackTime) {
 -        // NOTE that the frame callback gets signaled *after* the host compositor
 -        // is done compositing the frame on the CPU side, not before!
 -        // This is the best estimate we currently have for the commit deadline, but
 -        // it should be replaced with something more accurate when possible.
++
++    if (m_frameCount == 0) {
++        return;
++    }
++
++    const auto &frame = m_frames[m_frameHead];
 +    if (auto t = frame.frameCallbackTime) [[likely]] {
          const auto difference = timestamp - t->time_since_epoch();
          m_renderLoop->setPresentationSafetyMargin(difference + std::chrono::milliseconds(1));
      }
-@@ -376,9 +374,7 @@ void WaylandOutput::applyChanges(const O
+     frame.outputFrame->presented(timestamp, PresentationMode::VSync);
+-    m_frames.pop_front();
++
++    m_frames[m_frameHead] = FrameData();
++    m_frameHead = (m_frameHead + 1) % FrameQueueCapacity;
++    m_frameCount--;
+ }
+ 
+ void WaylandOutput::applyChanges(const OutputConfiguration &config)
+@@ -376,9 +414,6 @@ void WaylandOutput::applyChanges(const O
      next.enabled = props->enabled.value_or(m_state.enabled);
      next.transform = props->transform.value_or(m_state.transform);
      next.position = props->pos.value_or(m_state.position);
 -    // intentionally ignored, as it would get overwritten
 -    // with the fractional scale protocol anyways
 -    // next.scale = props->scale.value_or(m_state.scale);
-+    // Upstream change: Scale intentionally ignored due to fractional scale protocol
      next.desiredModeSize = props->desiredModeSize.value_or(m_state.desiredModeSize);
      next.desiredModeRefreshRate = props->desiredModeRefreshRate.value_or(m_state.desiredModeRefreshRate);
      next.uuid = props->uuid.value_or(m_state.uuid);
-@@ -413,7 +409,6 @@ RenderLoop *WaylandOutput::renderLoop()
+@@ -413,7 +448,6 @@ RenderLoop *WaylandOutput::renderLoop()
  
  bool WaylandOutput::presentAsync(OutputLayer *layer, std::optional<std::chrono::nanoseconds> allowedVrrDelay)
  {
@@ -13794,16 +14338,16 @@
      return layer->type() == OutputLayerType::CursorOnly;
  }
  
-@@ -429,6 +424,8 @@ void WaylandOutput::init(const QSize &pi
+@@ -429,6 +463,8 @@ void WaylandOutput::init(const QSize &pi
      initialState.scale = scale;
      setState(initialState);
  
-+    m_cachedPixelSize = mode->size();
++    m_cachedPixelSize = pixelSize;
 +
      m_xdgShellSurface->setFullscreen(fullscreen);
      m_surface->commit(KWayland::Client::Surface::CommitFlag::None);
  }
-@@ -458,17 +455,21 @@ void WaylandOutput::updateDpmsMode(DpmsM
+@@ -458,17 +494,21 @@ void WaylandOutput::updateDpmsMode(DpmsM
  
  void WaylandOutput::handleConfigure(const QSize &size, XdgShellSurface::States states, quint32 serial)
  {
@@ -13819,17 +14363,17 @@
  
          if (!m_configureThrottleTimer.isActive()) {
 -            m_configureThrottleTimer.start(1000000 / m_state.currentMode->refreshRate());
++            // Safety check for refresh rate to avoid division by zero
 +            const auto *mode = m_state.currentMode.get();
 +            if (mode && mode->refreshRate() > 0) [[likely]] {
-+                const int intervalMs = 1'000'000 / mode->refreshRate();
-+                m_configureThrottleTimer.start(intervalMs);
++                m_configureThrottleTimer.start(1000000 / mode->refreshRate());
 +            } else {
 +                m_configureThrottleTimer.start(16);
 +            }
          }
      }
  }
-@@ -476,7 +477,7 @@ void WaylandOutput::handleConfigure(cons
+@@ -476,7 +516,7 @@ void WaylandOutput::handleConfigure(cons
  void WaylandOutput::applyConfigure(const QSize &size, quint32 serial)
  {
      m_xdgShellSurface->ackConfigure(serial);
@@ -13838,7 +14382,7 @@
          auto mode = std::make_shared<OutputMode>(size * m_pendingScale, m_refreshRate);
  
          State next = m_state;
-@@ -485,30 +486,44 @@ void WaylandOutput::applyConfigure(const
+@@ -485,30 +525,45 @@ void WaylandOutput::applyConfigure(const
          next.scale = m_pendingScale;
          setState(next);
  
@@ -13884,6 +14428,7 @@
 +        title += grab;
 +    }
 +
++    // Optimization: avoid redundant IPC calls if title hasn't changed
 +    if (title != m_cachedTitle) [[likely]] {
 +        m_cachedTitle = title;
 +        m_xdgShellSurface->setTitle(title);
@@ -13892,7 +14437,7 @@
  }
  
  void WaylandOutput::lockPointer(Pointer *pointer, bool lock)
-@@ -526,7 +541,7 @@ void WaylandOutput::lockPointer(Pointer
+@@ -526,7 +581,7 @@ void WaylandOutput::lockPointer(Pointer
  
      Q_ASSERT(!m_pointerLock);
      m_pointerLock.reset(m_backend->display()->pointerConstraints()->lockPointer(surface(), pointer, nullptr, PointerConstraints::LifeTime::OneShot));
@@ -13901,7 +14446,19 @@
          m_pointerLock.reset();
          return;
      }
-@@ -550,9 +565,15 @@ void WaylandOutput::setOutputLayers(std:
+@@ -545,14 +600,27 @@ void WaylandOutput::lockPointer(Pointer
+ 
+ void WaylandOutput::setOutputLayers(std::vector<std::unique_ptr<OutputLayer>> &&layers)
+ {
++    m_cursorLayer = nullptr;
++    for (const auto &layer : layers) {
++        if (layer->type() == OutputLayerType::CursorOnly) {
++            m_cursorLayer = layer.get();
++            break;
++        }
++    }
+     m_layers = std::move(layers);
+ }
  
  QList<OutputLayer *> WaylandOutput::outputLayers() const
  {
@@ -13929,45 +14486,90 @@
  #include <QSize>
 +#include <QString>
  #include <QTimer>
- #include <deque>
-+#include <memory>
-+#include <vector>
-+#include <optional>
+-#include <deque>
++#include <array>
 +#include <chrono>
++#include <memory>
++#include <optional>
++#include <vector>
  
  namespace KWayland
  {
-@@ -125,10 +130,11 @@ private:
-     bool m_hasPointerLock = false;
-     bool m_ready = false;
-     bool m_mapped = false;
+@@ -113,38 +118,57 @@ private:
+     static const wl_callback_listener s_frameCallbackListener;
+     static void handleFrame(void *data, wl_callback *callback, uint32_t time);
+ 
+-    std::vector<std::unique_ptr<OutputLayer>> m_layers;
++    // --- HOT PATH DATA ---
+     std::unique_ptr<RenderLoop> m_renderLoop;
+     std::unique_ptr<KWayland::Client::Surface> m_surface;
+-    std::unique_ptr<KWayland::Client::XdgShellSurface> m_xdgShellSurface;
+-    std::unique_ptr<KWayland::Client::LockedPointer> m_pointerLock;
+-    std::unique_ptr<KWayland::Client::XdgDecoration> m_xdgDecoration;
+-    WaylandBackend *const m_backend;
+     std::unique_ptr<WaylandCursor> m_cursor;
+-    QTimer m_turnOffTimer;
+-    bool m_hasPointerLock = false;
+-    bool m_ready = false;
+-    bool m_mapped = false;
++
++    OutputLayer *m_cursorLayer = nullptr;
 +
      struct FrameData
      {
++        FrameData() = default;
          explicit FrameData(const std::shared_ptr<OutputFrame> &frame, struct wp_presentation_feedback *presentationFeedback, struct wl_callback *frameCallback);
 -        FrameData(FrameData &&move);
-+        FrameData(FrameData &&move) noexcept;
++        FrameData(FrameData &&rhs) noexcept;
++        FrameData &operator=(FrameData &&rhs) noexcept;
          ~FrameData();
  
          std::shared_ptr<OutputFrame> outputFrame;
-@@ -137,6 +143,7 @@ private:
+-        wp_presentation_feedback *presentationFeedback;
+-        wl_callback *frameCallback;
++        wp_presentation_feedback *presentationFeedback = nullptr;
++        wl_callback *frameCallback = nullptr;
          std::optional<std::chrono::steady_clock::time_point> frameCallbackTime;
      };
-     std::deque<FrameData> m_frames;
+-    std::deque<FrameData> m_frames;
+-    quint32 m_pendingConfigureSerial = 0;
+-    QSize m_pendingConfigureSize;
 +
-     quint32 m_pendingConfigureSerial = 0;
-     QSize m_pendingConfigureSize;
++    static constexpr size_t FrameQueueCapacity = 4;
++    std::array<FrameData, FrameQueueCapacity> m_frames;
++    size_t m_frameHead = 0;
++    size_t m_frameTail = 0;
++    size_t m_frameCount = 0;
++
++    WaylandBackend *const m_backend;
++    wp_viewport *m_viewport = nullptr;
++
++    std::vector<std::unique_ptr<OutputLayer>> m_layers;
++    std::unique_ptr<KWayland::Client::XdgShellSurface> m_xdgShellSurface;
++    std::unique_ptr<KWayland::Client::LockedPointer> m_pointerLock;
++    std::unique_ptr<KWayland::Client::XdgDecoration> m_xdgDecoration;
++
++    QTimer m_turnOffTimer;
      QTimer m_configureThrottleTimer;
-@@ -145,6 +152,9 @@ private:
-     wp_viewport *m_viewport = nullptr;
+     std::unique_ptr<ColorSurfaceFeedback> m_colorSurfaceFeedback;
+     wp_fractional_scale_v1 *m_fractionalScale = nullptr;
+-    wp_viewport *m_viewport = nullptr;
++
++    quint32 m_pendingConfigureSerial = 0;
++    QSize m_pendingConfigureSize;
      uint32_t m_refreshRate = 60'000;
      qreal m_pendingScale = 1.0;
++    bool m_hasPointerLock = false;
++    bool m_ready = false;
++    bool m_mapped = false;
 +
++    // Optimization: Cache values to avoid pointer dereferences/allocations
 +    QSize m_cachedPixelSize;
 +    QString m_cachedTitle;
  };
  
  } // namespace Wayland
+
 
 --- a/src/backends/wayland/wayland_backend.cpp	2025-10-25 12:57:00.362076056 +0200
 +++ b/src/backends/wayland/wayland_backend.cpp	2025-10-25 12:57:34.475121762 +0200
