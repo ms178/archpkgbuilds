@@ -37,13 +37,11 @@ std::unique_ptr<EglContext> EglContext::create(EglDisplay *display, EGLConfig co
     if (!handle) {
         return nullptr;
     }
-    // Initial makeCurrent to verify context validity and setup initial state
     if (!eglMakeCurrent(display->handle(), EGL_NO_SURFACE, EGL_NO_SURFACE, handle)) {
         eglDestroyContext(display->handle(), handle);
         return nullptr;
     }
 
-    // Update global state tracker since we just forced a bind
     s_currentSurface = EGL_NO_SURFACE;
 
     auto ret = std::make_unique<EglContext>(display, config, handle);
@@ -63,7 +61,9 @@ static QSet<QByteArray> getExtensions(EglContext *context)
         ret.reserve(count);
         for (int i = 0; i < count; i++) {
             const char *name = (const char *)glGetStringi(GL_EXTENSIONS, i);
-            if (name) ret.insert(QByteArray::fromRawData(name, qstrlen(name)));
+            if (name) {
+                ret.insert(QByteArray::fromRawData(name, qstrlen(name)));
+            }
         }
     } else {
         const char *extStr = (const char *)glGetString(GL_EXTENSIONS);
@@ -151,8 +151,6 @@ EglContext::EglContext(EglDisplay *display, EGLConfig config, ::EGLContext conte
             m_streamingBuffer->setPersistent();
         }
     }
-    // It is not legal to not have a vertex array object bound in a core context
-    // to make code handling old and new OpenGL versions easier, bind a dummy vao that's used for everything
     if (!isOpenGLES() && hasOpenglExtension(QByteArrayLiteral("GL_ARB_vertex_array_object"))) {
         glGenVertexArrays(1, &m_vao);
         glBindVertexArray(m_vao);
@@ -179,32 +177,25 @@ bool EglContext::makeCurrent()
 
 bool EglContext::makeCurrent(EGLSurface surface)
 {
-    // Fast path: if we are already current with the same surface, return immediately.
-    // This reduces syscalls and driver overhead significantly in the render loop.
-    if (s_currentContext == this && s_currentSurface == surface) {
+    if (s_currentContext == this && s_currentSurface == surface) [[likely]] {
         return true;
     }
 
     if (QOpenGLContext *context = QOpenGLContext::currentContext()) {
-        // Workaround to tell Qt that no QOpenGLContext is current
         context->doneCurrent();
     }
 
     bool ret = eglMakeCurrent(m_display->handle(), surface, surface, m_handle) == EGL_TRUE;
 
-    // Retry logic for EGL_BAD_ACCESS:
-    // If the context is locked/stuck (common with threading or fast surface switching),
-    // explicitly unbind everything and try again.
-    if (!ret && eglGetError() == EGL_BAD_ACCESS) {
+    if (!ret && eglGetError() == EGL_BAD_ACCESS) [[unlikely]] {
         eglMakeCurrent(m_display->handle(), EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         ret = eglMakeCurrent(m_display->handle(), surface, surface, m_handle) == EGL_TRUE;
     }
 
-    if (ret) {
+    if (ret) [[likely]] {
         s_currentContext = this;
         s_currentSurface = surface;
     } else {
-        // Ensure state tracker is reset on failure
         s_currentContext = nullptr;
         s_currentSurface = EGL_NO_SURFACE;
         qCWarning(KWIN_OPENGL, "Could not make egl context current! %s", qPrintable(getEglErrorString()));
@@ -255,8 +246,7 @@ static inline bool shouldUseOpenGLES()
     const bool haveResetOnVideoMemoryPurge = display->hasExtension(QByteArrayLiteral("EGL_NV_robustness_video_memory_purge"));
 
     std::vector<std::unique_ptr<AbstractOpenGLContextAttributeBuilder>> candidates;
-    // Reserve to avoid reallocations during initialization
-    candidates.reserve(6);
+    candidates.reserve(12);
 
     if (shouldUseOpenGLES()) {
         if (haveCreateContext && haveRobustness && haveContextPriority && haveResetOnVideoMemoryPurge) {
@@ -415,7 +405,6 @@ bool EglContext::isOpenGLES() const
 
 bool EglContext::hasOpenglExtension(QByteArrayView name) const
 {
-    // Fast path for checking extensions using the set
     return m_extensions.contains(QByteArray(name.data(), name.size()));
 }
 

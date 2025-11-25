@@ -1,12 +1,12 @@
 /*
     SPDX-FileCopyrightText: 2024 Xaver Hugl <xaver.hugl@gmail.com>
-    SPDX-FileCopyrightText: 2025 Senior AMD Performance Engineer et al.
 
     SPDX-License-Identifier: GPL-2.0-or-later
 */
 #include "syncobjtimeline.h"
 
 #include <cerrno>
+#include <cstring>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <xf86drm.h>
@@ -29,28 +29,27 @@ struct sync_merge_data
 namespace KWin
 {
 
-// Thread-local scratch syncobj to avoid malloc/syscall overhead in hot paths (moveInto).
-// Optimizes CPU usage by reusing a single kernel handle per thread per device.
-struct ThreadLocalScratch {
-    int fd = -1;
-    uint32_t handle = 0;
+namespace
+{
 
-    ~ThreadLocalScratch() {
-        if (handle && fd != -1) {
+struct alignas(8) ThreadLocalScratch
+{
+    uint32_t handle = 0;
+    int fd = -1;
+
+    ~ThreadLocalScratch()
+    {
+        if (handle != 0 && fd >= 0) {
             drmSyncobjDestroy(fd, handle);
         }
     }
 
-    // Returns a valid handle or 0 on failure.
-    // Automatically recreates the handle if the drmFd changes (e.g. context switch).
-    uint32_t get(int drmFd) {
-        // Fast path: same device, valid handle
-        if (fd == drmFd && handle != 0) {
+    uint32_t get(int drmFd) noexcept
+    {
+        if (handle != 0 && fd == drmFd) [[likely]] {
             return handle;
         }
-
-        // Slow path: initialization or device change
-        if (handle && fd != -1) {
+        if (handle != 0 && fd >= 0) {
             drmSyncobjDestroy(fd, handle);
             handle = 0;
         }
@@ -62,7 +61,34 @@ struct ThreadLocalScratch {
     }
 };
 
-static thread_local ThreadLocalScratch s_scratch;
+static_assert(sizeof(ThreadLocalScratch) == 8, "ThreadLocalScratch size mismatch");
+
+thread_local ThreadLocalScratch s_scratch;
+
+constexpr char s_mergeName[] = "KWin merge";
+constexpr int s_maxIoctlRetries = 8;
+
+FileDescriptor mergeSyncFds(const FileDescriptor &fd1, const FileDescriptor &fd2)
+{
+    struct sync_merge_data data = {};
+    static_assert(sizeof(s_mergeName) <= sizeof(data.name), "merge name too long");
+    std::memcpy(data.name, s_mergeName, sizeof(s_mergeName));
+    data.fd2 = fd2.get();
+    data.fence = -1;
+
+    int ret;
+    int retries = 0;
+    do {
+        ret = ioctl(fd1.get(), SYNC_IOC_MERGE, &data);
+    } while (ret == -1 && (errno == EINTR || errno == EAGAIN) && ++retries < s_maxIoctlRetries);
+
+    if (ret < 0) [[unlikely]] {
+        return FileDescriptor{};
+    }
+    return FileDescriptor(data.fence);
+}
+
+}
 
 SyncReleasePoint::SyncReleasePoint(std::shared_ptr<SyncTimeline> timeline, uint64_t timelinePoint)
     : m_timeline(std::move(timeline))
@@ -72,8 +98,7 @@ SyncReleasePoint::SyncReleasePoint(std::shared_ptr<SyncTimeline> timeline, uint6
 
 SyncReleasePoint::~SyncReleasePoint()
 {
-    // Check m_timeline to handle moved-from state
-    if (m_timeline) {
+    if (m_timeline) [[likely]] {
         if (m_releaseFence.isValid()) {
             m_timeline->moveInto(m_timelinePoint, m_releaseFence);
         } else {
@@ -91,51 +116,24 @@ SyncReleasePoint::SyncReleasePoint(SyncReleasePoint &&other) noexcept
 
 SyncReleasePoint &SyncReleasePoint::operator=(SyncReleasePoint &&other) noexcept
 {
-    if (this == &other) {
-        return *this;
-    }
-    // Perform cleanup/signal of the currently held resource before overwriting
-    if (m_timeline) {
-        if (m_releaseFence.isValid()) {
-            m_timeline->moveInto(m_timelinePoint, m_releaseFence);
-        } else {
-            m_timeline->signal(m_timelinePoint);
+    if (this != &other) [[likely]] {
+        if (m_timeline) {
+            if (m_releaseFence.isValid()) {
+                m_timeline->moveInto(m_timelinePoint, m_releaseFence);
+            } else {
+                m_timeline->signal(m_timelinePoint);
+            }
         }
+        m_timeline = std::move(other.m_timeline);
+        m_timelinePoint = other.m_timelinePoint;
+        m_releaseFence = std::move(other.m_releaseFence);
     }
-    m_timeline = std::move(other.m_timeline);
-    m_timelinePoint = other.m_timelinePoint;
-    m_releaseFence = std::move(other.m_releaseFence);
     return *this;
-}
-
-static FileDescriptor mergeSyncFds(const FileDescriptor &fd1, const FileDescriptor &fd2)
-{
-    // Strictly zero-initialize to avoid kernel rejection or UB from padding
-    struct sync_merge_data data = {};
-
-    // Safe name copy
-    const char name[] = "KWin merge";
-    for (size_t i = 0; i < sizeof(data.name) && i < sizeof(name); ++i) {
-        data.name[i] = name[i];
-    }
-
-    data.fd2 = fd2.get();
-    data.fence = -1;
-
-    int ret;
-    do {
-        ret = ioctl(fd1.get(), SYNC_IOC_MERGE, &data);
-    } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
-
-    if (ret < 0) {
-        return FileDescriptor{};
-    }
-    return FileDescriptor(data.fence);
 }
 
 void SyncReleasePoint::addReleaseFence(const FileDescriptor &fd)
 {
-    if (!fd.isValid()) {
+    if (!fd.isValid()) [[unlikely]] {
         return;
     }
     if (m_releaseFence.isValid()) {
@@ -144,9 +142,6 @@ void SyncReleasePoint::addReleaseFence(const FileDescriptor &fd)
         m_releaseFence = fd.duplicate();
     }
 }
-
-// NOTE: timeline() and timelinePoint() are implemented inline in the header for performance.
-// Do not define them here.
 
 SyncTimeline::SyncTimeline(int drmFd, uint32_t handle)
     : m_drmFd(drmFd)
@@ -162,10 +157,15 @@ SyncTimeline::SyncTimeline(int drmFd)
     }
 }
 
+SyncTimeline::~SyncTimeline()
+{
+    if (m_handle != 0) {
+        drmSyncobjDestroy(m_drmFd, m_handle);
+    }
+}
+
 const FileDescriptor &SyncTimeline::fileDescriptor()
 {
-    // Lazy initialization. Note: this getter is not thread-safe without external synchronization,
-    // but fits KWin's typical single-thread-owner usage for timeline setup.
     if (!m_fileDescriptor.isValid() && m_handle != 0) {
         int fd = -1;
         if (drmSyncobjHandleToFD(m_drmFd, m_handle, &fd) == 0) {
@@ -175,24 +175,16 @@ const FileDescriptor &SyncTimeline::fileDescriptor()
     return m_fileDescriptor;
 }
 
-SyncTimeline::~SyncTimeline()
-{
-    if (m_handle != 0) {
-        drmSyncobjDestroy(m_drmFd, m_handle);
-    }
-}
-
 FileDescriptor SyncTimeline::eventFd(uint64_t timelinePoint) const
 {
-    if (m_handle == 0) {
+    if (m_handle == 0) [[unlikely]] {
         return {};
     }
-    // EFD_NONBLOCK is crucial for integration with modern event loops (epoll)
     FileDescriptor ret{eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)};
-    if (!ret.isValid()) {
+    if (!ret.isValid()) [[unlikely]] {
         return {};
     }
-    if (drmSyncobjEventfd(m_drmFd, m_handle, timelinePoint, ret.get(), 0) != 0) {
+    if (drmSyncobjEventfd(m_drmFd, m_handle, timelinePoint, ret.get(), 0) != 0) [[unlikely]] {
         return {};
     }
     return ret;
@@ -200,59 +192,50 @@ FileDescriptor SyncTimeline::eventFd(uint64_t timelinePoint) const
 
 void SyncTimeline::signal(uint64_t timelinePoint)
 {
-    if (m_handle != 0) {
+    if (m_handle != 0) [[likely]] {
         drmSyncobjTimelineSignal(m_drmFd, &m_handle, &timelinePoint, 1);
     }
 }
 
 void SyncTimeline::moveInto(uint64_t timelinePoint, const FileDescriptor &fd)
 {
-    if (m_handle == 0) {
+    if (m_handle == 0) [[unlikely]] {
         return;
     }
-    if (!fd.isValid()) {
-        // If fence is invalid, signal immediately to unblock waiters
+    if (!fd.isValid()) [[unlikely]] {
         signal(timelinePoint);
         return;
     }
 
-    // Optimization: Use thread-local scratch syncobj to avoid Create/Destroy syscalls.
-    // Reducing 4 ioctls to ~2 per frame per layer.
     uint32_t tempHandle = s_scratch.get(m_drmFd);
     bool success = false;
 
-    if (tempHandle != 0) {
-        // Import fence into point 0 of temp syncobj (replaces any existing state)
-        if (drmSyncobjImportSyncFile(m_drmFd, tempHandle, fd.get()) == 0) {
-            // Transfer from temp(0) to this(timelinePoint)
-            if (drmSyncobjTransfer(m_drmFd, m_handle, timelinePoint, tempHandle, 0, 0) == 0) {
+    if (tempHandle != 0) [[likely]] {
+        if (drmSyncobjImportSyncFile(m_drmFd, tempHandle, fd.get()) == 0) [[likely]] {
+            if (drmSyncobjTransfer(m_drmFd, m_handle, timelinePoint, tempHandle, 0, 0) == 0) [[likely]] {
                 success = true;
             }
         }
     }
 
-    // Robustness: Always ensure the point is signaled to prevent GPU hangs
-    // even if the kernel transfer failed (e.g., OOM).
-    if (!success) {
+    if (!success) [[unlikely]] {
         signal(timelinePoint);
     }
 }
 
 FileDescriptor SyncTimeline::exportSyncFile(uint64_t timelinePoint)
 {
-    if (m_handle == 0) {
+    if (m_handle == 0) [[unlikely]] {
         return {};
     }
 
-    // Reuse scratch handle here as well
     uint32_t tempHandle = s_scratch.get(m_drmFd);
-    if (tempHandle == 0) {
+    if (tempHandle == 0) [[unlikely]] {
         return {};
     }
 
     int syncFileFd = -1;
-    // Transfer from this(timelinePoint) to temp(0)
-    if (drmSyncobjTransfer(m_drmFd, tempHandle, 0, m_handle, timelinePoint, 0) == 0) {
+    if (drmSyncobjTransfer(m_drmFd, tempHandle, 0, m_handle, timelinePoint, 0) == 0) [[likely]] {
         drmSyncobjExportSyncFile(m_drmFd, tempHandle, &syncFileFd);
     }
 
@@ -261,10 +244,9 @@ FileDescriptor SyncTimeline::exportSyncFile(uint64_t timelinePoint)
 
 bool SyncTimeline::isMaterialized(uint64_t timelinePoint)
 {
-    if (m_handle == 0) {
+    if (m_handle == 0) [[unlikely]] {
         return false;
     }
-    // Check status with timeout 0
     return drmSyncobjTimelineWait(m_drmFd,
                                   &m_handle,
                                   &timelinePoint,
@@ -274,4 +256,4 @@ bool SyncTimeline::isMaterialized(uint64_t timelinePoint)
                                   nullptr) == 0;
 }
 
-} // namespace KWin
+}
