@@ -16,11 +16,14 @@
 #include <QMetaObject>
 
 #include <array>
+#include <bit>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <type_traits>
 
 namespace KWin
 {
@@ -32,37 +35,63 @@ class Window;
 class VrrStateCache
 {
 public:
-    union State {
-        struct {
-            uint8_t hint : 2;
-            uint8_t isOnOutput : 1;
-            uint8_t isFullScreen : 1;
-            uint8_t valid : 1;
-            uint8_t reserved : 3;
-        };
-        uint8_t raw;
+    struct State {
+        uint8_t hint : 2;
+        uint8_t isOnOutput : 1;
+        uint8_t isFullScreen : 1;
+        uint8_t valid : 1;
+        uint8_t reserved : 3;
+
         constexpr State() noexcept
-            : raw(0)
+            : hint(0)
+            , isOnOutput(0)
+            , isFullScreen(0)
+            , valid(0)
+            , reserved(0)
         {
         }
-    };
-    static_assert(sizeof(State) == 1);
 
-    void setState(State newState) noexcept
+        [[nodiscard]] constexpr uint8_t toRaw() const noexcept
+        {
+            return std::bit_cast<uint8_t>(*this);
+        }
+
+        [[nodiscard]] static constexpr State fromRaw(uint8_t raw) noexcept
+        {
+            return std::bit_cast<State>(raw);
+        }
+    };
+
+    static_assert(sizeof(State) == 1, "State must be exactly 1 byte");
+    static_assert(std::is_trivially_copyable_v<State>,
+                  "State must be trivially copyable for bit_cast");
+
+    constexpr void setState(State newState) noexcept
     {
-        m_state = newState.raw;
+        m_state = newState.toRaw();
     }
 
-    [[nodiscard]] State getState() const noexcept
+    [[nodiscard]] constexpr State getState() const noexcept
     {
-        State s;
-        s.raw = m_state;
-        return s;
+        return State::fromRaw(m_state);
+    }
+
+    [[nodiscard]] constexpr uint8_t raw() const noexcept
+    {
+        return m_state;
+    }
+
+    constexpr void setRaw(uint8_t value) noexcept
+    {
+        m_state = value;
     }
 
 private:
     uint8_t m_state{0};
 };
+
+static_assert(sizeof(std::chrono::nanoseconds) == 8,
+              "std::chrono::nanoseconds must be 8 bytes for layout assumptions");
 
 class alignas(64) KWIN_EXPORT RenderLoopPrivate
 {
@@ -161,9 +190,18 @@ public:
     void notifyVblank(std::chrono::nanoseconds timestamp);
 };
 
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+#endif
+
 static_assert(offsetof(RenderLoopPrivate, vblankIntervalReciprocal64) == 64,
               "Cache line boundary at 64 bytes");
 static_assert(offsetof(RenderLoopPrivate, modeSwitchBitmap) % 64 == 0,
               "modeSwitchBitmap must be cache-line aligned");
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 }

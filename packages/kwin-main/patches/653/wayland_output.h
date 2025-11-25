@@ -11,10 +11,12 @@
 #include "core/output.h"
 
 #include <KWayland/Client/xdgshell.h>
+
 #include <QObject>
 #include <QSize>
 #include <QString>
 #include <QTimer>
+
 #include <array>
 #include <chrono>
 #include <memory>
@@ -33,23 +35,25 @@ class XdgDecoration;
 }
 
 struct wl_buffer;
-struct wp_presentation_feedback;
-struct wp_tearing_control_v1;
+struct wl_callback;
+struct wl_callback_listener;
 struct wp_color_management_surface_v1;
 struct wp_fractional_scale_v1;
 struct wp_fractional_scale_v1_listener;
+struct wp_presentation_feedback;
+struct wp_tearing_control_v1;
 struct wp_viewport;
-struct wl_callback;
-struct wl_callback_listener;
 
 namespace KWin
 {
+
 class OutputFrame;
 
 namespace Wayland
 {
-class WaylandBackend;
+
 class ColorSurfaceFeedback;
+class WaylandBackend;
 
 class WaylandCursor
 {
@@ -78,6 +82,7 @@ private:
 class WaylandOutput : public Output
 {
     Q_OBJECT
+
 public:
     WaylandOutput(const QString &name, WaylandBackend *backend);
     ~WaylandOutput() override;
@@ -97,7 +102,8 @@ public:
     void updateDpmsMode(DpmsMode dpmsMode);
 
     bool testPresentation(const std::shared_ptr<OutputFrame> &frame) override;
-    bool present(const QList<OutputLayer *> &layersToUpdate, const std::shared_ptr<OutputFrame> &frame) override;
+    bool present(const QList<OutputLayer *> &layersToUpdate,
+                 const std::shared_ptr<OutputFrame> &frame) override;
 
     void frameDiscarded();
     void framePresented(std::chrono::nanoseconds timestamp, uint32_t refreshRate);
@@ -108,17 +114,20 @@ public:
     QList<OutputLayer *> outputLayers() const;
 
 private:
-    void handleConfigure(const QSize &size, KWayland::Client::XdgShellSurface::States states, quint32 serial);
+    void handleConfigure(const QSize &size,
+                         KWayland::Client::XdgShellSurface::States states,
+                         quint32 serial);
     void updateWindowTitle();
     void applyConfigure(const QSize &size, quint32 serial);
     void updateColor();
 
     static const wp_fractional_scale_v1_listener s_fractionalScaleListener;
-    static void handleFractionalScaleChanged(void *data, struct wp_fractional_scale_v1 *wp_fractional_scale_v1, uint32_t scale120);
+    static void handleFractionalScaleChanged(void *data,
+                                             struct wp_fractional_scale_v1 *wp_fractional_scale_v1,
+                                             uint32_t scale120);
     static const wl_callback_listener s_frameCallbackListener;
     static void handleFrame(void *data, wl_callback *callback, uint32_t time);
 
-    // --- HOT PATH DATA ---
     std::unique_ptr<RenderLoop> m_renderLoop;
     std::unique_ptr<KWayland::Client::Surface> m_surface;
     std::unique_ptr<WaylandCursor> m_cursor;
@@ -128,10 +137,15 @@ private:
     struct FrameData
     {
         FrameData() = default;
-        explicit FrameData(const std::shared_ptr<OutputFrame> &frame, struct wp_presentation_feedback *presentationFeedback, struct wl_callback *frameCallback);
+        explicit FrameData(const std::shared_ptr<OutputFrame> &frame,
+                           struct wp_presentation_feedback *presentationFeedback,
+                           struct wl_callback *frameCallback);
         FrameData(FrameData &&rhs) noexcept;
         FrameData &operator=(FrameData &&rhs) noexcept;
         ~FrameData();
+
+        FrameData(const FrameData &) = delete;
+        FrameData &operator=(const FrameData &) = delete;
 
         std::shared_ptr<OutputFrame> outputFrame;
         wp_presentation_feedback *presentationFeedback = nullptr;
@@ -166,10 +180,9 @@ private:
     bool m_ready = false;
     bool m_mapped = false;
 
-    // Optimization: Cache values to avoid pointer dereferences/allocations
     QSize m_cachedPixelSize;
     QString m_cachedTitle;
 };
 
-} // namespace Wayland
-} // namespace KWin
+}
+}
