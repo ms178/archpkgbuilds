@@ -910,18 +910,22 @@
 
 --- a/src/core/syncobjtimeline.h	2025-11-24 00:07:02.730634680 +0100
 +++ b/src/core/syncobjtimeline.h	2025-11-24 00:16:04.925383798 +0100
-@@ -16,27 +17,45 @@ namespace KWin
+@@ -7,35 +7,34 @@
+ #include "kwin_export.h"
+ #include "utils/filedescriptor.h"
+ 
++#include <cstdint>
+ #include <memory>
+-#include <stdint.h>
+ 
+ namespace KWin
+ {
+ 
  class SyncTimeline;
  
- /**
+-/**
 - * A helper to signal the release point when it goes out of scope
-+ * A helper to signal the release point when it goes out of scope.
-+ * It is movable but not copyable to ensure a single release point owner.
-+ *
-+ * Cache optimization:
-+ * - Layout aligned to 32 bytes (half cache line) on 64-bit systems.
-+ * - Hot getters inlined for zero-overhead access.
-  */
+- */
  class KWIN_EXPORT SyncReleasePoint
  {
  public:
@@ -931,49 +935,40 @@
  
 -    SyncTimeline *timeline() const;
 -    uint64_t timelinePoint() const;
-+    // Disable copying to prevent double-signaling or fence duplication logic errors
 +    SyncReleasePoint(const SyncReleasePoint &) = delete;
 +    SyncReleasePoint &operator=(const SyncReleasePoint &) = delete;
 +
-+    // Enable move semantics for efficient transfer between scopes
 +    SyncReleasePoint(SyncReleasePoint &&other) noexcept;
 +    SyncReleasePoint &operator=(SyncReleasePoint &&other) noexcept;
 +
-+    [[nodiscard]] SyncTimeline *timeline() const;
-+    [[nodiscard]] uint64_t timelinePoint() const;
++    [[nodiscard]] SyncTimeline *timeline() const noexcept;
++    [[nodiscard]] uint64_t timelinePoint() const noexcept;
  
-     /**
-      * Adds the fence of a graphics job that this release point should wait for
+-    /**
+-     * Adds the fence of a graphics job that this release point should wait for
 -     * before the timeline point is signaled
-+     * before the timeline point is signaled.
-      */
+-     */
      void addReleaseFence(const FileDescriptor &fd);
  
  private:
 -    const std::shared_ptr<SyncTimeline> m_timeline;
 -    const uint64_t m_timelinePoint;
-+    // Members ordered for optimal packing (64-bit alignment)
-+    // std::shared_ptr is 16 bytes (2 pointers)
 +    std::shared_ptr<SyncTimeline> m_timeline;
-+    // 8 bytes
 +    uint64_t m_timelinePoint;
-+    // FileDescriptor is typically 4-8 bytes (int wrapper)
      FileDescriptor m_releaseFence;
-+    // Padding ~4 bytes. Total size ~32 bytes.
  };
  
- class KWIN_EXPORT SyncTimeline
-@@ -46,20 +65,37 @@ public:
+@@ -46,20 +45,31 @@ public:
      explicit SyncTimeline(int drmFd);
      ~SyncTimeline();
  
+-    /**
+-     * @returns an event fd that gets signalled when the timeline point gets signalled
+-     */
+-    FileDescriptor eventFd(uint64_t timelinePoint) const;
 +    SyncTimeline(const SyncTimeline &) = delete;
 +    SyncTimeline &operator=(const SyncTimeline &) = delete;
 +
-     /**
-      * @returns an event fd that gets signalled when the timeline point gets signalled
-      */
--    FileDescriptor eventFd(uint64_t timelinePoint) const;
 +    [[nodiscard]] FileDescriptor eventFd(uint64_t timelinePoint) const;
  
      const FileDescriptor &fileDescriptor();
@@ -985,56 +980,61 @@
 +    [[nodiscard]] bool isMaterialized(uint64_t timelinePoint);
  
  private:
-+    // Hot members accessed in signal/moveInto
-     const int32_t m_drmFd;
+-    const int32_t m_drmFd;
++    const int m_drmFd;
      uint32_t m_handle = 0;
-+    // Cold member, lazily initialized
      FileDescriptor m_fileDescriptor;
  };
 +
-+// Inline implementations for hot paths
-+inline SyncTimeline *SyncReleasePoint::timeline() const
++inline SyncTimeline *SyncReleasePoint::timeline() const noexcept
 +{
 +    return m_timeline.get();
- }
++}
 +
-+inline uint64_t SyncReleasePoint::timelinePoint() const
++inline uint64_t SyncReleasePoint::timelinePoint() const noexcept
 +{
 +    return m_timelinePoint;
 +}
 +
-+} // namespace KWin
+ }
 
 --- a/src/core/syncobjtimeline.cpp	2025-11-24 00:06:57.961478752 +0100
 +++ b/src/core/syncobjtimeline.cpp	2025-11-24 00:16:24.694851220 +0100
-@@ -28,42 +29,115 @@ struct sync_merge_data
+@@ -6,6 +6,7 @@
+ #include "syncobjtimeline.h"
+ 
+ #include <cerrno>
++#include <cstring>
+ #include <sys/eventfd.h>
+ #include <sys/ioctl.h>
+ #include <xf86drm.h>
+@@ -28,42 +29,113 @@ struct sync_merge_data
  namespace KWin
  {
  
 -SyncReleasePoint::SyncReleasePoint(const std::shared_ptr<SyncTimeline> &timeline, uint64_t timelinePoint)
 -    : m_timeline(timeline)
-+// Thread-local scratch syncobj to avoid malloc/syscall overhead in hot paths (moveInto).
-+// Optimizes CPU usage by reusing a single kernel handle per thread per device.
-+struct ThreadLocalScratch {
-+    int fd = -1;
-+    uint32_t handle = 0;
++namespace
++{
 +
-+    ~ThreadLocalScratch() {
-+        if (handle && fd != -1) {
++struct alignas(8) ThreadLocalScratch
++{
++    uint32_t handle = 0;
++    int fd = -1;
++
++    ~ThreadLocalScratch()
++    {
++        if (handle != 0 && fd >= 0) {
 +            drmSyncobjDestroy(fd, handle);
 +        }
 +    }
 +
-+    // Returns a valid handle or 0 on failure.
-+    // Automatically recreates the handle if the drmFd changes (e.g. context switch).
-+    uint32_t get(int drmFd) {
-+        // Fast path: same device, valid handle
-+        if (fd == drmFd && handle != 0) {
++    uint32_t get(int drmFd) noexcept
++    {
++        if (handle != 0 && fd == drmFd) [[likely]] {
 +            return handle;
 +        }
-+
-+        // Slow path: initialization or device change
-+        if (handle && fd != -1) {
++        if (handle != 0 && fd >= 0) {
 +            drmSyncobjDestroy(fd, handle);
 +            handle = 0;
 +        }
@@ -1046,7 +1046,34 @@
 +    }
 +};
 +
-+static thread_local ThreadLocalScratch s_scratch;
++static_assert(sizeof(ThreadLocalScratch) == 8, "ThreadLocalScratch size mismatch");
++
++thread_local ThreadLocalScratch s_scratch;
++
++constexpr char s_mergeName[] = "KWin merge";
++constexpr int s_maxIoctlRetries = 8;
++
++FileDescriptor mergeSyncFds(const FileDescriptor &fd1, const FileDescriptor &fd2)
++{
++    struct sync_merge_data data = {};
++    static_assert(sizeof(s_mergeName) <= sizeof(data.name), "merge name too long");
++    std::memcpy(data.name, s_mergeName, sizeof(s_mergeName));
++    data.fd2 = fd2.get();
++    data.fence = -1;
++
++    int ret;
++    int retries = 0;
++    do {
++        ret = ioctl(fd1.get(), SYNC_IOC_MERGE, &data);
++    } while (ret == -1 && (errno == EINTR || errno == EAGAIN) && ++retries < s_maxIoctlRetries);
++
++    if (ret < 0) [[unlikely]] {
++        return FileDescriptor{};
++    }
++    return FileDescriptor(data.fence);
++}
++
++}
 +
 +SyncReleasePoint::SyncReleasePoint(std::shared_ptr<SyncTimeline> timeline, uint64_t timelinePoint)
 +    : m_timeline(std::move(timeline))
@@ -1060,43 +1087,20 @@
 -        m_timeline->moveInto(m_timelinePoint, m_releaseFence);
 -    } else {
 -        m_timeline->signal(m_timelinePoint);
-+    // Check m_timeline to handle moved-from state
-+    if (m_timeline) {
++    if (m_timeline) [[likely]] {
 +        if (m_releaseFence.isValid()) {
 +            m_timeline->moveInto(m_timelinePoint, m_releaseFence);
 +        } else {
 +            m_timeline->signal(m_timelinePoint);
 +        }
-+    }
-+}
-+
+     }
+ }
+ 
+-static FileDescriptor mergeSyncFds(const FileDescriptor &fd1, const FileDescriptor &fd2)
 +SyncReleasePoint::SyncReleasePoint(SyncReleasePoint &&other) noexcept
 +    : m_timeline(std::move(other.m_timeline))
 +    , m_timelinePoint(other.m_timelinePoint)
 +    , m_releaseFence(std::move(other.m_releaseFence))
-+{
-+}
-+
-+SyncReleasePoint &SyncReleasePoint::operator=(SyncReleasePoint &&other) noexcept
-+{
-+    if (this == &other) {
-+        return *this;
-     }
-+    // Perform cleanup/signal of the currently held resource before overwriting
-+    if (m_timeline) {
-+        if (m_releaseFence.isValid()) {
-+            m_timeline->moveInto(m_timelinePoint, m_releaseFence);
-+        } else {
-+            m_timeline->signal(m_timelinePoint);
-+        }
-+    }
-+    m_timeline = std::move(other.m_timeline);
-+    m_timelinePoint = other.m_timelinePoint;
-+    m_releaseFence = std::move(other.m_releaseFence);
-+    return *this;
- }
- 
- static FileDescriptor mergeSyncFds(const FileDescriptor &fd1, const FileDescriptor &fd2)
  {
 -    struct sync_merge_data data
 -    {
@@ -1105,43 +1109,41 @@
 -        .fence = -1,
 -    };
 -    int err = -1;
-+    // Strictly zero-initialize to avoid kernel rejection or UB from padding
-+    struct sync_merge_data data = {};
-+
-+    // Safe name copy
-+    const char name[] = "KWin merge";
-+    for (size_t i = 0; i < sizeof(data.name) && i < sizeof(name); ++i) {
-+        data.name[i] = name[i];
-+    }
-+
-+    data.fd2 = fd2.get();
-+    data.fence = -1;
-+
-+    int ret;
-     do {
+-    do {
 -        err = ioctl(fd1.get(), SYNC_IOC_MERGE, &data);
 -    } while (err == -1 && (errno == EINTR || errno == EAGAIN));
 -    if (err < 0) {
-+        ret = ioctl(fd1.get(), SYNC_IOC_MERGE, &data);
-+    } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
-+
-+    if (ret < 0) {
-         return FileDescriptor{};
+-        return FileDescriptor{};
 -    } else {
 -        return FileDescriptor(data.fence);
++}
++
++SyncReleasePoint &SyncReleasePoint::operator=(SyncReleasePoint &&other) noexcept
++{
++    if (this != &other) [[likely]] {
++        if (m_timeline) {
++            if (m_releaseFence.isValid()) {
++                m_timeline->moveInto(m_timelinePoint, m_releaseFence);
++            } else {
++                m_timeline->signal(m_timelinePoint);
++            }
++        }
++        m_timeline = std::move(other.m_timeline);
++        m_timelinePoint = other.m_timelinePoint;
++        m_releaseFence = std::move(other.m_releaseFence);
      }
-+    return FileDescriptor(data.fence);
++    return *this;
  }
  
  void SyncReleasePoint::addReleaseFence(const FileDescriptor &fd)
  {
-+    if (!fd.isValid()) {
++    if (!fd.isValid()) [[unlikely]] {
 +        return;
 +    }
      if (m_releaseFence.isValid()) {
          m_releaseFence = mergeSyncFds(m_releaseFence, fd);
      } else {
-@@ -71,15 +145,8 @@ void SyncReleasePoint::addReleaseFence(c
+@@ -71,16 +143,6 @@ void SyncReleasePoint::addReleaseFence(c
      }
  }
  
@@ -1154,12 +1156,11 @@
 -{
 -    return m_timelinePoint;
 -}
-+// NOTE: timeline() and timelinePoint() are implemented inline in the header for performance.
-+// Do not define them here.
- 
+-
  SyncTimeline::SyncTimeline(int drmFd, uint32_t handle)
      : m_drmFd(drmFd)
-@@ -90,28 +157,38 @@ SyncTimeline::SyncTimeline(int drmFd, ui
+     , m_handle(handle)
+@@ -90,32 +152,39 @@ SyncTimeline::SyncTimeline(int drmFd, ui
  SyncTimeline::SyncTimeline(int drmFd)
      : m_drmFd(drmFd)
  {
@@ -1169,48 +1170,55 @@
 +    }
  }
  
- const FileDescriptor &SyncTimeline::fileDescriptor()
+-const FileDescriptor &SyncTimeline::fileDescriptor()
++SyncTimeline::~SyncTimeline()
  {
 -    if (!m_fileDescriptor.isValid()) {
-+    // Lazy initialization. Note: this getter is not thread-safe without external synchronization,
-+    // but fits KWin's typical single-thread-owner usage for timeline setup.
-+    if (!m_fileDescriptor.isValid() && m_handle != 0) {
-         int fd = -1;
+-        int fd = -1;
 -        drmSyncobjHandleToFD(m_drmFd, m_handle, &fd);
 -        m_fileDescriptor = FileDescriptor(fd);
++    if (m_handle != 0) {
++        drmSyncobjDestroy(m_drmFd, m_handle);
+     }
+-
+-    return m_fileDescriptor;
+ }
+ 
+-SyncTimeline::~SyncTimeline()
++const FileDescriptor &SyncTimeline::fileDescriptor()
+ {
+-    drmSyncobjDestroy(m_drmFd, m_handle);
++    if (!m_fileDescriptor.isValid() && m_handle != 0) {
++        int fd = -1;
 +        if (drmSyncobjHandleToFD(m_drmFd, m_handle, &fd) == 0) {
 +            m_fileDescriptor = FileDescriptor(fd);
 +        }
-     }
--
-     return m_fileDescriptor;
- }
- 
- SyncTimeline::~SyncTimeline()
- {
--    drmSyncobjDestroy(m_drmFd, m_handle);
-+    if (m_handle != 0) {
-+        drmSyncobjDestroy(m_drmFd, m_handle);
 +    }
++    return m_fileDescriptor;
  }
  
  FileDescriptor SyncTimeline::eventFd(uint64_t timelinePoint) const
  {
 -    FileDescriptor ret{eventfd(0, EFD_CLOEXEC)};
-+    if (m_handle == 0) {
+-    if (!ret.isValid()) {
++    if (m_handle == 0) [[unlikely]] {
 +        return {};
 +    }
-+    // EFD_NONBLOCK is crucial for integration with modern event loops (epoll)
 +    FileDescriptor ret{eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)};
-     if (!ret.isValid()) {
++    if (!ret.isValid()) [[unlikely]] {
          return {};
      }
-@@ -123,38 +200,78 @@ FileDescriptor SyncTimeline::eventFd(uin
+-    if (drmSyncobjEventfd(m_drmFd, m_handle, timelinePoint, ret.get(), 0) != 0) {
++    if (drmSyncobjEventfd(m_drmFd, m_handle, timelinePoint, ret.get(), 0) != 0) [[unlikely]] {
+         return {};
+     }
+     return ret;
+@@ -123,38 +192,68 @@ FileDescriptor SyncTimeline::eventFd(uin
  
  void SyncTimeline::signal(uint64_t timelinePoint)
  {
 -    drmSyncobjTimelineSignal(m_drmFd, &m_handle, &timelinePoint, 1);
-+    if (m_handle != 0) {
++    if (m_handle != 0) [[likely]] {
 +        drmSyncobjTimelineSignal(m_drmFd, &m_handle, &timelinePoint, 1);
 +    }
  }
@@ -1222,33 +1230,26 @@
 -    drmSyncobjImportSyncFile(m_drmFd, tempHandle, fd.get());
 -    drmSyncobjTransfer(m_drmFd, m_handle, timelinePoint, tempHandle, 0, 0);
 -    drmSyncobjDestroy(m_drmFd, tempHandle);
-+    if (m_handle == 0) {
++    if (m_handle == 0) [[unlikely]] {
 +        return;
 +    }
-+    if (!fd.isValid()) {
-+        // If fence is invalid, signal immediately to unblock waiters
++    if (!fd.isValid()) [[unlikely]] {
 +        signal(timelinePoint);
 +        return;
 +    }
 +
-+    // Optimization: Use thread-local scratch syncobj to avoid Create/Destroy syscalls.
-+    // Reducing 4 ioctls to ~2 per frame per layer.
 +    uint32_t tempHandle = s_scratch.get(m_drmFd);
 +    bool success = false;
 +
-+    if (tempHandle != 0) {
-+        // Import fence into point 0 of temp syncobj (replaces any existing state)
-+        if (drmSyncobjImportSyncFile(m_drmFd, tempHandle, fd.get()) == 0) {
-+            // Transfer from temp(0) to this(timelinePoint)
-+            if (drmSyncobjTransfer(m_drmFd, m_handle, timelinePoint, tempHandle, 0, 0) == 0) {
++    if (tempHandle != 0) [[likely]] {
++        if (drmSyncobjImportSyncFile(m_drmFd, tempHandle, fd.get()) == 0) [[likely]] {
++            if (drmSyncobjTransfer(m_drmFd, m_handle, timelinePoint, tempHandle, 0, 0) == 0) [[likely]] {
 +                success = true;
 +            }
 +        }
 +    }
 +
-+    // Robustness: Always ensure the point is signaled to prevent GPU hangs
-+    // even if the kernel transfer failed (e.g., OOM).
-+    if (!success) {
++    if (!success) [[unlikely]] {
 +        signal(timelinePoint);
 +    }
  }
@@ -1256,13 +1257,12 @@
  FileDescriptor SyncTimeline::exportSyncFile(uint64_t timelinePoint)
  {
 -    uint32_t tempHandle = 0;
-+    if (m_handle == 0) {
++    if (m_handle == 0) [[unlikely]] {
 +        return {};
 +    }
 +
-+    // Reuse scratch handle here as well
 +    uint32_t tempHandle = s_scratch.get(m_drmFd);
-+    if (tempHandle == 0) {
++    if (tempHandle == 0) [[unlikely]] {
 +        return {};
 +    }
 +
@@ -1271,8 +1271,7 @@
 -    drmSyncobjTransfer(m_drmFd, tempHandle, 0, m_handle, timelinePoint, 0);
 -    drmSyncobjExportSyncFile(m_drmFd, tempHandle, &syncFileFd);
 -    drmSyncobjDestroy(m_drmFd, tempHandle);
-+    // Transfer from this(timelinePoint) to temp(0)
-+    if (drmSyncobjTransfer(m_drmFd, tempHandle, 0, m_handle, timelinePoint, 0) == 0) {
++    if (drmSyncobjTransfer(m_drmFd, tempHandle, 0, m_handle, timelinePoint, 0) == 0) [[likely]] {
 +        drmSyncobjExportSyncFile(m_drmFd, tempHandle, &syncFileFd);
 +    }
 +
@@ -1289,11 +1288,9 @@
 -                                   DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE,
 -                                   nullptr)
 -            == 0);
--}
-+    if (m_handle == 0) {
++    if (m_handle == 0) [[unlikely]] {
 +        return false;
 +    }
-+    // Check status with timeout 0
 +    return drmSyncobjTimelineWait(m_drmFd,
 +                                  &m_handle,
 +                                  &timelinePoint,
@@ -1303,7 +1300,7 @@
 +                                  nullptr) == 0;
  }
 +
-+} // namespace KWin
+ }
 
 --- a/src/core/output.h	2025-11-23 23:47:51.700072115 +0100
 +++ b/src/core/output.h	2025-11-23 23:56:56.138509318 +0100
@@ -2031,23 +2028,17 @@
  
  std::unique_ptr<EglContext> EglContext::create(EglDisplay *display, EGLConfig config, ::EGLContext sharedContext)
  {
-@@ -36,10 +37,15 @@ std::unique_ptr<EglContext> EglContext::
-     if (!handle) {
-         return nullptr;
-     }
-+    // Initial makeCurrent to verify context validity and setup initial state
-     if (!eglMakeCurrent(display->handle(), EGL_NO_SURFACE, EGL_NO_SURFACE, handle)) {
+@@ -40,6 +41,9 @@ std::unique_ptr<EglContext> EglContext::
          eglDestroyContext(display->handle(), handle);
          return nullptr;
      }
 +
-+    // Update global state tracker since we just forced a bind
 +    s_currentSurface = EGL_NO_SURFACE;
 +
      auto ret = std::make_unique<EglContext>(display, config, handle);
      s_currentContext = ret.get();
      if (!ret->checkSupported()) {
-@@ -52,17 +58,20 @@ static QSet<QByteArray> getExtensions(Eg
+@@ -52,17 +56,22 @@ static QSet<QByteArray> getExtensions(Eg
  {
      QSet<QByteArray> ret;
      if (!context->isOpenGLES() && context->hasVersion(Version(3, 0))) {
@@ -2059,7 +2050,9 @@
          for (int i = 0; i < count; i++) {
              const char *name = (const char *)glGetStringi(GL_EXTENSIONS, i);
 -            ret.insert(name);
-+            if (name) ret.insert(QByteArray::fromRawData(name, qstrlen(name)));
++            if (name) {
++                ret.insert(QByteArray::fromRawData(name, qstrlen(name)));
++            }
          }
      } else {
 -        const QByteArray extensions = (const char *)glGetString(GL_EXTENSIONS);
@@ -2074,44 +2067,48 @@
      }
      return ret;
  }
-@@ -170,16 +179,34 @@ bool EglContext::makeCurrent()
+@@ -142,8 +151,6 @@ EglContext::EglContext(EglDisplay *displ
+             m_streamingBuffer->setPersistent();
+         }
+     }
+-    // It is not legal to not have a vertex array object bound in a core context
+-    // to make code handling old and new OpenGL versions easier, bind a dummy vao that's used for everything
+     if (!isOpenGLES() && hasOpenglExtension(QByteArrayLiteral("GL_ARB_vertex_array_object"))) {
+         glGenVertexArrays(1, &m_vao);
+         glBindVertexArray(m_vao);
+@@ -170,16 +177,27 @@ bool EglContext::makeCurrent()
  
  bool EglContext::makeCurrent(EGLSurface surface)
  {
-+    // Fast path: if we are already current with the same surface, return immediately.
-+    // This reduces syscalls and driver overhead significantly in the render loop.
-+    if (s_currentContext == this && s_currentSurface == surface) {
++    if (s_currentContext == this && s_currentSurface == surface) [[likely]] {
 +        return true;
 +    }
 +
      if (QOpenGLContext *context = QOpenGLContext::currentContext()) {
-         // Workaround to tell Qt that no QOpenGLContext is current
+-        // Workaround to tell Qt that no QOpenGLContext is current
          context->doneCurrent();
      }
 -    const bool ret = eglMakeCurrent(m_display->handle(), surface, surface, m_handle) == EGL_TRUE;
+-    if (ret) {
 +
 +    bool ret = eglMakeCurrent(m_display->handle(), surface, surface, m_handle) == EGL_TRUE;
 +
-+    // Retry logic for EGL_BAD_ACCESS:
-+    // If the context is locked/stuck (common with threading or fast surface switching),
-+    // explicitly unbind everything and try again.
-+    if (!ret && eglGetError() == EGL_BAD_ACCESS) {
++    if (!ret && eglGetError() == EGL_BAD_ACCESS) [[unlikely]] {
 +        eglMakeCurrent(m_display->handle(), EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 +        ret = eglMakeCurrent(m_display->handle(), surface, surface, m_handle) == EGL_TRUE;
 +    }
 +
-     if (ret) {
++    if (ret) [[likely]] {
          s_currentContext = this;
 +        s_currentSurface = surface;
      } else {
 -        // QOpenGLContext::doneCurrent unset the context, we need to mirror that here!
-+        // Ensure state tracker is reset on failure
          s_currentContext = nullptr;
 +        s_currentSurface = EGL_NO_SURFACE;
          qCWarning(KWIN_OPENGL, "Could not make egl context current! %s", qPrintable(getEglErrorString()));
      }
      return ret;
-@@ -189,6 +216,7 @@ void EglContext::doneCurrent() const
+@@ -189,6 +207,7 @@ void EglContext::doneCurrent() const
  {
      eglMakeCurrent(m_display->handle(), EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
      s_currentContext = nullptr;
@@ -2119,17 +2116,16 @@
  }
  
  EglDisplay *EglContext::displayObject() const
-@@ -227,6 +255,9 @@ static inline bool shouldUseOpenGLES()
+@@ -227,6 +246,8 @@ static inline bool shouldUseOpenGLES()
      const bool haveResetOnVideoMemoryPurge = display->hasExtension(QByteArrayLiteral("EGL_NV_robustness_video_memory_purge"));
  
      std::vector<std::unique_ptr<AbstractOpenGLContextAttributeBuilder>> candidates;
-+    // Reserve to avoid reallocations during initialization
-+    candidates.reserve(6);
++    candidates.reserve(12);
 +
      if (shouldUseOpenGLES()) {
          if (haveCreateContext && haveRobustness && haveContextPriority && haveResetOnVideoMemoryPurge) {
              auto glesRobustPriority = std::make_unique<EglOpenGLESContextAttributeBuilder>();
-@@ -336,8 +367,6 @@ bool EglContext::checkTimerQuerySupport(
+@@ -336,8 +357,6 @@ bool EglContext::checkTimerQuerySupport(
          return false;
      }
      if (m_isOpenglES) {
@@ -2138,19 +2134,18 @@
          return openglVersion() >= Version(3, 0) && hasOpenglExtension("GL_EXT_disjoint_timer_query");
      } else {
          return openglVersion() >= Version(3, 3) || hasOpenglExtension("GL_ARB_timer_query");
-@@ -386,9 +415,8 @@ bool EglContext::isOpenGLES() const
+@@ -386,9 +405,7 @@ bool EglContext::isOpenGLES() const
  
  bool EglContext::hasOpenglExtension(QByteArrayView name) const
  {
 -    return std::any_of(m_extensions.cbegin(), m_extensions.cend(), [name](const auto &string) {
 -        return string == name;
 -    });
-+    // Fast path for checking extensions using the set
 +    return m_extensions.contains(QByteArray(name.data(), name.size()));
  }
  
  bool EglContext::isSoftwareRenderer() const
-@@ -487,8 +515,6 @@ bool EglContext::checkSupported() const
+@@ -487,8 +504,6 @@ bool EglContext::checkSupported() const
      if (!supportsGLSL || !supportsNonPowerOfTwoTextures || !supports3DTextures || !supportsFBOs || !supportsUnpack) {
          return false;
      }
@@ -2159,7 +2154,7 @@
      auto shader = m_shaderManager->shader(ShaderTrait::MapTexture | ShaderTrait::TransformColorspace | ShaderTrait::AdjustSaturation | ShaderTrait::Modulate);
      return shader->isValid();
  }
-@@ -528,13 +554,11 @@ void EglContext::glResolveFunctions(cons
+@@ -528,13 +543,11 @@ void EglContext::glResolveFunctions(cons
          }
      }
      if (robustContext && haveArbRobustness) {
@@ -2173,7 +2168,7 @@
          m_glGetGraphicsResetStatus = (glGetGraphicsResetStatus_func)resolveFunction("glGetGraphicsResetStatusEXT");
          m_glReadnPixels = (glReadnPixels_func)resolveFunction("glReadnPixelsEXT");
          m_glGetnUniformfv = (glGetnUniformfv_func)resolveFunction("glGetnUniformfvEXT");
-@@ -550,17 +574,13 @@ void EglContext::initDebugOutput()
+@@ -550,17 +563,13 @@ void EglContext::initDebugOutput()
      }
  
      if (!have_ARB_debug) {
@@ -2191,7 +2186,7 @@
          GLint value = 0;
          glGetIntegerv(GL_CONTEXT_FLAGS, &value);
          if (!(value & GL_CONTEXT_FLAG_DEBUG_BIT)) {
-@@ -568,7 +588,6 @@ void EglContext::initDebugOutput()
+@@ -568,7 +577,6 @@ void EglContext::initDebugOutput()
          }
      }
  
@@ -2199,7 +2194,7 @@
      auto callback = [](GLenum source, GLenum type, GLuint id,
                         GLenum severity, GLsizei length,
                         const GLchar *message,
-@@ -595,20 +614,16 @@ void EglContext::initDebugOutput()
+@@ -595,20 +603,16 @@ void EglContext::initDebugOutput()
  
      glDebugMessageCallback(callback, nullptr);
  
@@ -5720,15 +5715,20 @@
 
 --- a/src/backends/drm/drm_commit_thread.h	2025-10-27 00:14:17.013394552 +0100
 +++ b/src/backends/drm/drm_commit_thread.h	2025-10-27 00:15:21.742689990 +0100
-@@ -13,6 +13,7 @@
+@@ -10,7 +10,12 @@
+ 
+ #include <QObject>
+ #include <QThread>
++
++#include <atomic>
++#include <chrono>
  #include <condition_variable>
++#include <cstdint>
++#include <memory>
  #include <mutex>
  #include <vector>
-+#include <cstdint>
  
- namespace KWin
- {
-@@ -29,23 +30,19 @@ class DrmCommitThread : public QObject
+@@ -29,46 +34,50 @@ class DrmCommitThread : public QObject
      Q_OBJECT
  public:
      explicit DrmCommitThread(DrmGpu *gpu, const QString &name);
@@ -5754,60 +5754,67 @@
 -    TimePoint estimateNextVblank(TimePoint now) const;
 +    [[nodiscard]] TimePoint estimateNextVblank(TimePoint now) const;
      void optimizeCommits(TimePoint pageflipTarget);
++    bool tryMergeCommits(TimePoint pageflipTarget);
      void submit();
      void handlePing();
-@@ -54,21 +51,29 @@ private:
+ 
++    alignas(64) mutable std::mutex m_mutex;
++
++    alignas(64) std::condition_variable m_commitPending;
++    std::condition_variable m_pong;
++
++    alignas(64) TimePoint m_lastPageflip{};
++    TimePoint m_targetPageflipTime{};
++    TimePoint m_lastCommitTime{};
++    std::chrono::nanoseconds m_minVblankInterval{std::chrono::nanoseconds::zero()};
++    std::chrono::nanoseconds m_safetyMargin{std::chrono::nanoseconds::zero()};
++
++    alignas(64) std::chrono::nanoseconds m_baseSafetyMargin{std::chrono::nanoseconds::zero()};
++    std::chrono::nanoseconds m_additionalSafetyMargin{std::chrono::milliseconds{1}};
++    uint64_t m_vblankReciprocal{0};
++    uint8_t m_vblankReciprocalShift{0};
++
++    alignas(64) std::atomic<bool> m_vrr{false};
++    std::atomic<bool> m_tearing{false};
++    std::atomic<bool> m_ping{false};
++    std::atomic<bool> m_pageflipTimeoutDetected{false};
++
+     DrmGpu *const m_gpu;
      std::unique_ptr<DrmCommit> m_committed;
      std::vector<std::unique_ptr<DrmAtomicCommit>> m_commits;
-     std::unique_ptr<QThread> m_thread;
+-    std::unique_ptr<QThread> m_thread;
 -    std::mutex m_mutex;
 -    std::condition_variable m_commitPending;
 -    std::condition_variable m_pong;
-+
-     TimePoint m_lastPageflip;
-     TimePoint m_targetPageflipTime;
-     TimePoint m_lastCommitTime;
+-    TimePoint m_lastPageflip;
+-    TimePoint m_targetPageflipTime;
+-    TimePoint m_lastCommitTime;
 -    std::chrono::nanoseconds m_minVblankInterval;
-+
-+    std::chrono::nanoseconds m_minVblankInterval{0};
-+    std::chrono::nanoseconds m_safetyMargin{0};
-+    std::chrono::nanoseconds m_baseSafetyMargin{0};
-+    std::chrono::nanoseconds m_additionalSafetyMargin{std::chrono::milliseconds(1)};
-+
-+    uint64_t m_vblankReciprocal = 0;
-+    uint8_t m_vblankReciprocalShift = 0;
-+
      std::vector<std::unique_ptr<DrmAtomicCommit>> m_commitsToDelete;
-+
-     bool m_vrr = false;
-     bool m_tearing = false;
+-    bool m_vrr = false;
+-    bool m_tearing = false;
 -    std::chrono::nanoseconds m_safetyMargin{0};
 -    std::chrono::nanoseconds m_baseSafetyMargin{0};
 -    std::chrono::nanoseconds m_additionalSafetyMargin = std::chrono::milliseconds(1);
-     bool m_ping = false;
-     bool m_pageflipTimeoutDetected = false;
-+
-+    alignas(64) mutable std::mutex m_mutex;
-+    alignas(64) std::condition_variable m_commitPending;
-+    std::condition_variable m_pong;
+-    bool m_ping = false;
+-    bool m_pageflipTimeoutDetected = false;
++    std::unique_ptr<QThread> m_thread;
  };
  
--}
-+} // namespace KWin
+ }
 
 --- a/src/backends/drm/drm_commit_thread.cpp	2025-10-26 23:12:38.884074365 +0100
 +++ b/src/backends/drm/drm_commit_thread.cpp	2025-10-26 23:14:43.884816636 +0100
-@@ -13,15 +15,41 @@
+@@ -13,15 +14,60 @@
  #include "utils/envvar.h"
  #include "utils/realtime.h"
  
 -#include <ranges>
+-#include <span>
 +#include <algorithm>
-+#include <bit>
 +#include <cerrno>
++#include <chrono>
 +#include <cstring>
-+#include <iterator>
- #include <span>
  #include <thread>
 +#include <time.h>
  
@@ -5815,45 +5822,67 @@
  
 +namespace
 +{
++
 +constexpr std::chrono::microseconds kVrrPollInterval{50};
 +constexpr uint64_t kMaxPageflipSpan = 10000;
 +constexpr std::chrono::milliseconds kDefaultFrameInterval{16};
++constexpr size_t kInitialCommitCapacity = 16;
++constexpr size_t kInitialDeleteCapacity = 64;
 +
-+inline void preciseSleepUntil(const std::chrono::steady_clock::time_point &target)
++[[gnu::always_inline]]
++inline void preciseSleepUntil(const std::chrono::steady_clock::time_point &target) noexcept
 +{
 +    const auto dur = target.time_since_epoch();
 +    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(dur).count();
++    if (ns <= 0) [[unlikely]] {
++        return;
++    }
 +    struct timespec ts;
 +    ts.tv_sec = static_cast<time_t>(ns / 1'000'000'000LL);
 +    ts.tv_nsec = static_cast<long>(ns % 1'000'000'000LL);
 +    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
 +}
++
++[[nodiscard, gnu::always_inline]]
++inline std::chrono::nanoseconds clampNs(std::chrono::nanoseconds val,
++                                        std::chrono::nanoseconds lo,
++                                        std::chrono::nanoseconds hi) noexcept
++{
++    if (val < lo) {
++        return lo;
++    }
++    if (val > hi) {
++        return hi;
++    }
++    return val;
++}
++
 +}
 +
  namespace KWin
  {
  
 +static const std::chrono::microseconds s_safetyMarginMinimum{
-+    environmentVariableIntValue("KWIN_DRM_OVERRIDE_SAFETY_MARGIN").value_or(1500)
-+};
++    environmentVariableIntValue("KWIN_DRM_OVERRIDE_SAFETY_MARGIN").value_or(1500)};
 +
  DrmCommitThread::DrmCommitThread(DrmGpu *gpu, const QString &name)
      : m_gpu(gpu)
      , m_targetPageflipTime(std::chrono::steady_clock::now())
-@@ -30,29 +58,43 @@ DrmCommitThread::DrmCommitThread(DrmGpu
+@@ -30,31 +76,46 @@ DrmCommitThread::DrmCommitThread(DrmGpu
          return;
      }
  
-+    m_commits.reserve(32);
-+    m_commitsToDelete.reserve(128);
++    m_commits.reserve(kInitialCommitCapacity);
++    m_commitsToDelete.reserve(kInitialDeleteCapacity);
 +
      m_thread.reset(QThread::create([this]() {
          const auto thread = QThread::currentThread();
          gainRealTime();
 -        while (true) {
+-            if (thread->isInterruptionRequested()) {
 +
 +        for (;;) {
-             if (thread->isInterruptionRequested()) {
++            if (thread->isInterruptionRequested()) [[unlikely]] {
                  return;
              }
 -            std::unique_lock lock(m_mutex);
@@ -5868,7 +5897,7 @@
 +                m_commitPending.wait(lock, [this, thread] {
 +                    return thread->isInterruptionRequested() || m_committed || !m_commits.empty();
 +                });
-+                if (thread->isInterruptionRequested()) {
++                if (thread->isInterruptionRequested()) [[unlikely]] {
 +                    return;
 +                }
              }
@@ -5877,30 +5906,36 @@
 -                if (timeout) {
 -                    // if the main thread just hung for a while, the pageflip will be processed after the wait
 -                    // but not if it's a real pageflip timeout
-+                if (timeout) [[unlikely]] {
-                     m_ping = false;
+-                    m_ping = false;
 -                    QMetaObject::invokeMethod(this, &DrmCommitThread::handlePing, Qt::ConnectionType::QueuedConnection);
+-                    while (!m_ping) {
++                if (timeout) [[unlikely]] {
++                    m_ping.store(false, std::memory_order_release);
 +                    lock.unlock();
 +                    QMetaObject::invokeMethod(this, &DrmCommitThread::handlePing, Qt::QueuedConnection);
 +                    lock.lock();
 +
-                     while (!m_ping) {
++                    while (!m_ping.load(std::memory_order_acquire)) {
                          m_pong.wait(lock);
                      }
 +
                      if (m_committed) {
-                         qCCritical(KWIN_DRM, "Pageflip timed out! This is a bug in the %s kernel driver", qPrintable(m_gpu->driverName()));
+-                        qCCritical(KWIN_DRM, "Pageflip timed out! This is a bug in the %s kernel driver", qPrintable(m_gpu->driverName()));
++                        qCCritical(KWIN_DRM, "Pageflip timed out! This is a bug in the %s kernel driver",
++                                   qPrintable(m_gpu->driverName()));
                          if (m_gpu->isAmdgpu()) {
-@@ -62,117 +104,135 @@ DrmCommitThread::DrmCommitThread(DrmGpu
+                             qCCritical(KWIN_DRM, "Please report this at https://gitlab.freedesktop.org/drm/amd/-/issues");
+                         } else if (m_gpu->isNVidia()) {
+@@ -62,117 +123,173 @@ DrmCommitThread::DrmCommitThread(DrmGpu
                          } else if (m_gpu->isI915()) {
                              qCCritical(KWIN_DRM, "Please report this at https://gitlab.freedesktop.org/drm/i915/kernel/-/issues");
                          }
 -                        qCCritical(KWIN_DRM, "With the output of 'sudo dmesg' and 'journalctl --user-unit plasma-kwin_wayland --boot 0'");
-+                        qCCritical(KWIN_DRM, "Include 'sudo dmesg' and 'journalctl --user-unit plasma-kwin_wayland --boot 0'");
-                         m_pageflipTimeoutDetected = true;
-                     } else {
+-                        m_pageflipTimeoutDetected = true;
+-                    } else {
 -                        qCWarning(KWIN_DRM, "The main thread was hanging temporarily!");
-+                        qCWarning(KWIN_DRM, "The main thread was hanging temporarily.");
++                        qCCritical(KWIN_DRM, "Include 'sudo dmesg' and 'journalctl --user-unit plasma-kwin_wayland --boot 0'");
++                        m_pageflipTimeoutDetected.store(true, std::memory_order_release);
                      }
 -                } else {
 -                    // the commit would fail with EBUSY, wait until the pageflip is done
@@ -5913,11 +5948,13 @@
              }
 +
              const auto now = std::chrono::steady_clock::now();
-             if (m_targetPageflipTime > now + m_safetyMargin) {
-+                const auto sleepTarget = m_targetPageflipTime - m_safetyMargin;
+-            if (m_targetPageflipTime > now + m_safetyMargin) {
++            const auto wakeTarget = m_targetPageflipTime - m_safetyMargin;
++
++            if (wakeTarget > now) {
                  lock.unlock();
 -                std::this_thread::sleep_until(m_targetPageflipTime - m_safetyMargin);
-+                preciseSleepUntil(sleepTarget);
++                preciseSleepUntil(wakeTarget);
                  lock.lock();
 -                // the main thread might've modified the list
                  if (m_commits.empty()) {
@@ -5926,18 +5963,14 @@
              }
 +
              optimizeCommits(m_targetPageflipTime);
-+            if (m_commits.empty()) [[unlikely]] {
-+                continue;
-+            }
-+
-             if (!m_commits.front()->isReadyFor(m_targetPageflipTime)) {
+-            if (!m_commits.front()->isReadyFor(m_targetPageflipTime)) {
 -                // no commit is ready yet, reschedule
 -                if (m_vrr || m_tearing) {
 -                    m_targetPageflipTime += 50us;
 -                } else {
 -                    m_targetPageflipTime += m_minVblankInterval;
 -                }
-+                m_targetPageflipTime += (m_vrr || m_tearing) ? kVrrPollInterval : m_minVblankInterval;
++            if (m_commits.empty()) [[unlikely]] {
                  continue;
              }
 -            if (m_commits.front()->allowedVrrDelay() && m_vrr) {
@@ -5952,20 +5985,39 @@
 -                });
 -                const std::chrono::nanoseconds lowestDelay = *std::ranges::min_element(delays);
 +
-+            const auto frontDelay = m_commits.front()->allowedVrrDelay();
-+            if (frontDelay && m_vrr) {
++            DrmAtomicCommit *frontCommit = m_commits.front().get();
++            if (!frontCommit) [[unlikely]] {
++                m_commits.erase(m_commits.begin());
++                continue;
++            }
++
++            if (!frontCommit->isReadyFor(m_targetPageflipTime)) {
++                const bool vrrOrTearing = m_vrr.load(std::memory_order_acquire) ||
++                                          m_tearing.load(std::memory_order_acquire);
++                m_targetPageflipTime += vrrOrTearing ? kVrrPollInterval : m_minVblankInterval;
++                continue;
++            }
++
++            const auto frontDelay = frontCommit->allowedVrrDelay();
++            if (frontDelay && m_vrr.load(std::memory_order_acquire)) {
 +                std::chrono::nanoseconds lowestDelay = *frontDelay;
 +                bool allDelay = true;
 +
-+                for (auto it = std::next(m_commits.begin()); it != m_commits.end(); ++it) {
-+                    if (const auto delay = (*it)->allowedVrrDelay()) {
-+                        lowestDelay = std::min(lowestDelay, *delay);
++                const size_t commitCount = m_commits.size();
++                for (size_t i = 1; i < commitCount; ++i) {
++                    const auto delay = m_commits[i]->allowedVrrDelay();
++                    if (delay) {
++                        if (*delay < lowestDelay) {
++                            lowestDelay = *delay;
++                        }
 +                    } else {
 +                        allDelay = false;
 +                    }
 +                }
 +
-+                lowestDelay = std::max(lowestDelay, 0ns);
++                if (lowestDelay < 0ns) {
++                    lowestDelay = 0ns;
++                }
                  const auto delayedTarget = m_lastPageflip + lowestDelay;
 +
                  if (allDelay) {
@@ -5978,42 +6030,45 @@
 -                    bool timeout = true;
 -                    while (std::chrono::steady_clock::now() < delayedTarget && timeout && m_commits.front()->allowedVrrDelay().has_value()) {
 -                        timeout = m_commitPending.wait_for(lock, 50us) == std::cv_status::timeout;
-+                    bool waitTimedOut = true;
-+                    while (waitTimedOut) {
-+                        if (std::chrono::steady_clock::now() >= delayedTarget) {
-+                            break;
-+                        }
-+                        waitTimedOut = (m_commitPending.wait_for(lock, kVrrPollInterval) == std::cv_status::timeout);
-+                        if (!waitTimedOut) {
++                    auto loopNow = std::chrono::steady_clock::now();
++                    while (loopNow < delayedTarget) {
++                        const auto waitResult = m_commitPending.wait_for(lock, kVrrPollInterval);
++                        if (waitResult == std::cv_status::no_timeout) {
 +                            break;
 +                        }
                          if (m_commits.empty()) {
                              break;
                          }
                          optimizeCommits(delayedTarget);
-+                        if (m_commits.empty() || !m_commits.front()->allowedVrrDelay().has_value()) {
++                        if (m_commits.empty()) {
 +                            break;
 +                        }
++                        if (!m_commits.front()->allowedVrrDelay().has_value()) {
++                            break;
++                        }
++                        loopNow = std::chrono::steady_clock::now();
                      }
 -                    if (!timeout) {
 -                        // some new commit was added, process that
-+                    if (!waitTimedOut || m_commits.empty()) {
++                    if (m_commits.empty() || loopNow < delayedTarget) {
                          continue;
                      }
                  }
--                if (m_commits.empty()) {
 +
-+                if (m_commits.empty() || !m_commits.front()->allowedVrrDelay().has_value()) {
+                 if (m_commits.empty()) {
                      continue;
                  }
++                if (!m_commits.front()->allowedVrrDelay().has_value()) {
++                    continue;
++                }
              }
 +
              submit();
          }
      }));
 +
-+    if (!m_thread) {
-+        qCCritical(KWIN_DRM) << "Failed to create DRM commit thread. Atomic commits cannot proceed.";
++    if (!m_thread) [[unlikely]] {
++        qCCritical(KWIN_DRM) << "Failed to create DRM commit thread";
 +        return;
 +    }
 +
@@ -6029,12 +6084,30 @@
 +    }
 +
      DrmAtomicCommit *commit = m_commits.front().get();
++    if (!commit) [[unlikely]] {
++        m_commits.erase(m_commits.begin());
++        return;
++    }
++
++    if (!commit->test()) [[unlikely]] {
++        qCWarning(KWIN_DRM) << "Commit test failed before submission, errno:" << errno << strerror(errno);
++        m_commitsToDelete.push_back(std::move(m_commits.front()));
++        m_commits.erase(m_commits.begin());
++        QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::QueuedConnection);
++        return;
++    }
++
      const auto vrr = commit->isVrr();
      const bool success = commit->commit();
+-    if (success) {
+-        m_vrr = vrr.value_or(m_vrr);
+-        m_tearing = commit->isTearing();
 +
-     if (success) {
-         m_vrr = vrr.value_or(m_vrr);
-         m_tearing = commit->isTearing();
++    if (success) [[likely]] {
++        if (vrr.has_value()) {
++            m_vrr.store(*vrr, std::memory_order_release);
++        }
++        m_tearing.store(commit->isTearing(), std::memory_order_release);
          m_committed = std::move(m_commits.front());
          m_commits.erase(m_commits.begin());
  
@@ -6051,29 +6124,37 @@
 -            // required difference to make sure that it doesn't happen again
 -            m_additionalSafetyMargin -= safetyDifference;
 +
-+        // Adaptive Exponential Safety Margin:
-+        // Penalize misses heavily, decay margin slowly on success.
 +        if (safetyDifference < 0ns) {
 +            const auto penalty = -safetyDifference + 500us;
-+            m_additionalSafetyMargin = std::max(m_additionalSafetyMargin, penalty);
++            if (penalty > m_additionalSafetyMargin) {
++                m_additionalSafetyMargin = penalty;
++            }
          } else {
 -            // we were done earlier than desired. This isn't problematic, but
 -            // we want to keep latency at a minimum, so slowly reduce the safety margin
 -            m_additionalSafetyMargin -= safetyDifference / 10;
 +            m_additionalSafetyMargin = m_additionalSafetyMargin - (m_additionalSafetyMargin / 200);
          }
+-        const auto maximumReasonableMargin = std::min<std::chrono::nanoseconds>(3ms, m_minVblankInterval / 2);
+-        m_additionalSafetyMargin = std::clamp(m_additionalSafetyMargin, 0ns, maximumReasonableMargin);
 +
-         const auto maximumReasonableMargin = std::min<std::chrono::nanoseconds>(3ms, m_minVblankInterval / 2);
-         m_additionalSafetyMargin = std::clamp(m_additionalSafetyMargin, 0ns, maximumReasonableMargin);
++        const auto halfVblank = m_minVblankInterval / 2;
++        const auto maximumReasonableMargin = (3ms < halfVblank) ? 3ms : halfVblank;
++        m_additionalSafetyMargin = clampNs(m_additionalSafetyMargin, 0ns, maximumReasonableMargin);
          m_safetyMargin = m_baseSafetyMargin + m_additionalSafetyMargin;
      } else {
++        const int savedErrno = errno;
++        qCWarning(KWIN_DRM) << "Atomic commit failed: errno =" << savedErrno
++                           << "(" << strerror(savedErrno) << ")"
++                           << "; tearing =" << commit->isTearing();
++
          if (m_commits.size() > 1) {
 -            // the failure may have been because of the reordering of commits
 -            // -> collapse all commits into one and try again with an already tested state
              while (m_commits.size() > 1) {
                  auto toMerge = std::move(m_commits[1]);
                  m_commits.erase(m_commits.begin() + 1);
-@@ -180,27 +240,20 @@ void DrmCommitThread::submit()
+@@ -180,27 +297,69 @@ void DrmCommitThread::submit()
                  m_commitsToDelete.push_back(std::move(toMerge));
              }
              if (commit->test()) {
@@ -6085,44 +6166,86 @@
 -        for (auto &commit : m_commits) {
 -            m_commitsToDelete.push_back(std::move(commit));
 +
-+        m_commitsToDelete.reserve(m_commitsToDelete.size() + m_commits.size());
++        const size_t totalToDelete = m_commitsToDelete.size() + m_commits.size();
++        if (m_commitsToDelete.capacity() < totalToDelete) {
++            m_commitsToDelete.reserve(totalToDelete);
++        }
 +        for (auto &c : m_commits) {
-+            m_commitsToDelete.push_back(std::move(c));
++            if (c) {
++                m_commitsToDelete.push_back(std::move(c));
++            }
          }
          m_commits.clear();
 -        qCWarning(KWIN_DRM) << "atomic commit failed:" << strerror(errno);
-+        qCWarning(KWIN_DRM) << "Atomic commit failed:" << strerror(errno);
      }
 -    QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::ConnectionType::QueuedConnection);
--}
- 
--static std::unique_ptr<DrmAtomicCommit> mergeCommits(std::span<const std::unique_ptr<DrmAtomicCommit>> commits)
--{
--    auto ret = std::make_unique<DrmAtomicCommit>(*commits.front());
--    for (const auto &onTop : commits.subspan(1)) {
--        ret->merge(onTop.get());
--    }
--    return ret;
++
 +    QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::QueuedConnection);
  }
  
+-static std::unique_ptr<DrmAtomicCommit> mergeCommits(std::span<const std::unique_ptr<DrmAtomicCommit>> commits)
++bool DrmCommitThread::tryMergeCommits(TimePoint pageflipTarget)
+ {
+-    auto ret = std::make_unique<DrmAtomicCommit>(*commits.front());
+-    for (const auto &onTop : commits.subspan(1)) {
+-        ret->merge(onTop.get());
++    if (m_commits.size() < 2) {
++        return false;
+     }
+-    return ret;
++
++    auto firstNotReady = std::next(m_commits.begin());
++    while (firstNotReady != m_commits.end()) {
++        if (!(*firstNotReady)->isReadyFor(pageflipTarget)) {
++            break;
++        }
++        if ((*firstNotReady)->isTearing()) {
++            break;
++        }
++        ++firstNotReady;
++    }
++
++    if (firstNotReady == std::next(m_commits.begin())) {
++        return false;
++    }
++
++    auto baseCommit = std::move(m_commits.front());
++    const size_t mergeCount = static_cast<size_t>(std::distance(std::next(m_commits.begin()), firstNotReady));
++
++    if (m_commitsToDelete.capacity() < m_commitsToDelete.size() + mergeCount) {
++        m_commitsToDelete.reserve(m_commitsToDelete.size() + mergeCount);
++    }
++
++    for (auto it = std::next(m_commits.begin()); it != firstNotReady; ++it) {
++        baseCommit->merge(it->get());
++        m_commitsToDelete.push_back(std::move(*it));
++    }
++
++    if (!baseCommit->test()) [[unlikely]] {
++        qCDebug(KWIN_DRM) << "Merged commit test failed, reverting optimization";
++        m_commitsToDelete.push_back(std::move(baseCommit));
++        m_commits.erase(m_commits.begin(), firstNotReady);
++        return false;
++    }
++
++    m_commits.erase(m_commits.begin(), firstNotReady);
++    m_commits.insert(m_commits.begin(), std::move(baseCommit));
++    return true;
+ }
+ 
  void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
-@@ -208,107 +261,80 @@ void DrmCommitThread::optimizeCommits(Ti
+@@ -208,107 +367,74 @@ void DrmCommitThread::optimizeCommits(Ti
      if (m_commits.size() <= 1) {
          return;
      }
 -    // merge commits in the front that are already ready (regardless of which planes they modify)
 +
-+    // CRITICAL FIX: Abort optimization if the next commit is Tearing (Async).
-+    // Merging a VSync commit (which might update cursor/VRR) into a Tearing commit
-+    // creates an invalid atomic state (Async + Properties) which the kernel rejects.
 +    if (m_commits.front()->isTearing()) {
 +        return;
 +    }
 +
 +    bool optimized = false;
 +
-+    // 1. Merge consecutive ready commits
      if (m_commits.front()->areBuffersReadable()) {
 -        const auto firstNotReady = std::find_if(m_commits.begin() + 1, m_commits.end(), [pageflipTarget](const auto &commit) {
 -            return !commit->isReadyFor(pageflipTarget);
@@ -6132,36 +6255,15 @@
 -            std::move(m_commits.begin(), firstNotReady, std::back_inserter(m_commitsToDelete));
 -            m_commits.erase(m_commits.begin() + 1, firstNotReady);
 -            m_commits.front() = std::move(merged);
-+        auto firstNotReady = std::next(m_commits.begin());
-+        while (firstNotReady != m_commits.end() && (*firstNotReady)->isReadyFor(pageflipTarget)) {
-+            ++firstNotReady;
-+        }
-+
-+        if (firstNotReady != std::next(m_commits.begin())) {
-+            auto merged = std::make_unique<DrmAtomicCommit>(m_gpu);
-+
-+            for (auto it = m_commits.begin(); it != firstNotReady; ++it) {
-+                merged->merge(it->get());
-+            }
-+
-+            size_t count = std::distance(m_commits.begin(), firstNotReady);
-+            m_commitsToDelete.reserve(m_commitsToDelete.size() + count);
-+            for (auto it = m_commits.begin(); it != firstNotReady; ++it) {
-+                m_commitsToDelete.push_back(std::move(*it));
-+            }
-+
-+            m_commits.erase(m_commits.begin(), firstNotReady);
-+            m_commits.insert(m_commits.begin(), std::move(merged));
++        if (tryMergeCommits(pageflipTarget)) {
 +            optimized = true;
          }
      }
 -    // merge commits that are ready and modify the same drm planes
 +
-+    // 2. Merge same-plane commits
      for (auto it = m_commits.begin(); it != m_commits.end();) {
 -        const auto startIt = it;
-+        auto startIt = it;
-         auto &startCommit = *startIt;
+-        auto &startCommit = *startIt;
 -        const auto firstNotSamePlaneNotReady = std::find_if(startIt + 1, m_commits.end(), [&startCommit, pageflipTarget](const auto &commit) {
 -            return startCommit->modifiedPlanes() != commit->modifiedPlanes() || !commit->isReadyFor(pageflipTarget);
 -        });
@@ -6191,20 +6293,9 @@
 -        auto &commit = *it;
 -        if (!commit->isReadyFor(pageflipTarget)) {
 -            it++;
--            continue;
-+
-+        // SAFETY: We must also check if upcoming commits are Tearing.
-+        // We cannot merge a Tearing commit into a VSync commit or vice versa.
-+        // Only merge matching presentation modes for safety.
-+        const bool startTearing = startCommit->isTearing();
-+
-+        auto nextIt = std::next(startIt);
-+        while (nextIt != m_commits.end() &&
-+               (*nextIt)->isReadyFor(pageflipTarget) &&
-+               (*nextIt)->isTearing() == startTearing && // Prevent mixing modes
-+               !startCommit->modifiedPlanes().empty() &&
-+               startCommit->modifiedPlanes() == (*nextIt)->modifiedPlanes()) {
-+            ++nextIt;
++        if (!(*it)) [[unlikely]] {
++            it = m_commits.erase(it);
+             continue;
          }
 -        // commits that target the same plane(s) need to stay in the same order
 -        const auto &planes = commit->modifiedPlanes();
@@ -6216,7 +6307,11 @@
 -        if (skipping) {
 -            it++;
 +
-+        if (nextIt == std::next(startIt)) {
++        auto &startCommit = *it;
++        const bool startTearing = startCommit->isTearing();
++        const auto &startPlanes = startCommit->modifiedPlanes();
++
++        if (startPlanes.empty()) {
 +            ++it;
              continue;
          }
@@ -6229,12 +6324,19 @@
 -                m_commitsToDelete.push_back(std::move(duplicate));
 -                it++;
 -                continue;
--            }
++
++        auto nextIt = std::next(it);
++        while (nextIt != m_commits.end()) {
++            if (!(*nextIt)) [[unlikely]] {
++                break;
+             }
 -        } else {
 -            if (!commit->test()) {
 -                it++;
 -                continue;
--            }
++            if (!(*nextIt)->isReadyFor(pageflipTarget)) {
++                break;
+             }
 -            duplicate = std::make_unique<DrmAtomicCommit>(*commit);
 -        }
 -        bool success = true;
@@ -6245,8 +6347,24 @@
 -                    success = false;
 -                    break;
 -                }
--            }
--        }
++            if ((*nextIt)->isTearing() != startTearing) {
++                break;
++            }
++            if (startPlanes != (*nextIt)->modifiedPlanes()) {
++                break;
+             }
++            ++nextIt;
++        }
++
++        if (nextIt == std::next(it)) {
++            ++it;
++            continue;
++        }
++
++        const size_t count = static_cast<size_t>(std::distance(std::next(it), nextIt));
++        if (m_commitsToDelete.capacity() < m_commitsToDelete.size() + count) {
++            m_commitsToDelete.reserve(m_commitsToDelete.size() + count);
+         }
 -        m_commitsToDelete.push_back(std::move(duplicate));
 -        if (success) {
 -            if (front) {
@@ -6255,20 +6373,18 @@
 -            } else {
 -                front = std::make_unique<DrmAtomicCommit>(*commit);
 -                m_commitsToDelete.push_back(std::move(commit));
--            }
++
++        for (auto mergeIt = std::next(it); mergeIt != nextIt; ++mergeIt) {
++            if (*mergeIt) {
++                startCommit->merge(mergeIt->get());
++                m_commitsToDelete.push_back(std::move(*mergeIt));
+             }
 -            it = m_commits.erase(it);
 -        } else {
 -            it++;
-+
-+        size_t count = std::distance(std::next(startIt), nextIt);
-+        m_commitsToDelete.reserve(m_commitsToDelete.size() + count);
-+
-+        for (auto mergeIt = std::next(startIt); mergeIt != nextIt; ++mergeIt) {
-+            startCommit->merge(mergeIt->get());
-+            m_commitsToDelete.push_back(std::move(*mergeIt));
          }
 +
-+        it = m_commits.erase(std::next(startIt), nextIt);
++        it = m_commits.erase(std::next(it), nextIt);
 +        optimized = true;
      }
 -    if (front) {
@@ -6279,7 +6395,7 @@
      }
  }
  
-@@ -316,7 +342,7 @@ DrmCommitThread::~DrmCommitThread()
+@@ -316,10 +442,10 @@ DrmCommitThread::~DrmCommitThread()
  {
      if (m_thread) {
          {
@@ -6287,32 +6403,54 @@
 +            std::unique_lock<std::mutex> lock(m_mutex);
              m_thread->requestInterruption();
              m_commitPending.notify_all();
-             m_ping = true;
-@@ -332,10 +358,11 @@ DrmCommitThread::~DrmCommitThread()
+-            m_ping = true;
++            m_ping.store(true, std::memory_order_release);
+             m_pong.notify_all();
+         }
+         m_thread->wait();
+@@ -332,86 +458,158 @@ DrmCommitThread::~DrmCommitThread()
  
  void DrmCommitThread::addCommit(std::unique_ptr<DrmAtomicCommit> &&commit)
  {
 -    std::unique_lock lock(m_mutex);
 -    m_commits.push_back(std::move(commit));
++    if (!commit) [[unlikely]] {
++        return;
++    }
++
 +    std::unique_lock<std::mutex> lock(m_mutex);
 +
      const auto now = std::chrono::steady_clock::now();
      TimePoint newTarget;
+-    if (m_tearing) {
 +
-     if (m_tearing) {
++    const bool isTearing = m_tearing.load(std::memory_order_acquire);
++    const bool isVrr = m_vrr.load(std::memory_order_acquire);
++
++    if (isTearing) {
          newTarget = now;
-     } else if (m_vrr && now >= m_lastPageflip + m_minVblankInterval) {
-@@ -343,75 +370,121 @@ void DrmCommitThread::addCommit(std::uni
+-    } else if (m_vrr && now >= m_lastPageflip + m_minVblankInterval) {
++    } else if (isVrr && now >= m_lastPageflip + m_minVblankInterval) {
+         newTarget = now;
      } else {
          newTarget = estimateNextVblank(now);
      }
-+
-+    newTarget = std::max(newTarget, now);
-     m_targetPageflipTime = std::max(m_targetPageflipTime, newTarget);
+-    m_targetPageflipTime = std::max(m_targetPageflipTime, newTarget);
 -    m_commits.back()->setDeadline(m_targetPageflipTime - m_safetyMargin);
 -    m_commitPending.notify_all();
++
++    if (newTarget < now) {
++        newTarget = now;
++    }
++    if (m_targetPageflipTime < newTarget) {
++        m_targetPageflipTime = newTarget;
++    }
++
 +    commit->setDeadline(m_targetPageflipTime - m_safetyMargin);
 +
++    if (m_commits.size() == m_commits.capacity()) [[unlikely]] {
++        m_commits.reserve(m_commits.capacity() * 2);
++    }
 +    m_commits.push_back(std::move(commit));
 +    m_commitPending.notify_one();
  }
@@ -6333,7 +6471,9 @@
 +        if (m_commitsToDelete.empty()) {
 +            return;
 +        }
-+        toDelete.swap(m_commitsToDelete);
++        toDelete = std::move(m_commitsToDelete);
++        m_commitsToDelete.clear();
++        m_commitsToDelete.reserve(kInitialDeleteCapacity);
 +    }
 +    toDelete.clear();
  }
@@ -6345,30 +6485,32 @@
  void DrmCommitThread::setModeInfo(uint32_t maximum, std::chrono::nanoseconds vblankTime)
  {
 -    std::unique_lock lock(m_mutex);
+-    m_minVblankInterval = std::chrono::nanoseconds(1'000'000'000'000ull / maximum);
+-    // the kernel rejects commits that happen during vblank
+-    // the 1.5ms on top of that was chosen experimentally, for the time it takes to commit + scheduling inaccuracies
 +    std::unique_lock<std::mutex> lock(m_mutex);
 +
 +    if (maximum == 0) [[unlikely]] {
 +        qCWarning(KWIN_DRM) << "Invalid maximum refresh rate: 0, using 60Hz fallback";
-+        maximum = 60;
++        maximum = 60000;
 +    }
 +
-     m_minVblankInterval = std::chrono::nanoseconds(1'000'000'000'000ull / maximum);
--    // the kernel rejects commits that happen during vblank
--    // the 1.5ms on top of that was chosen experimentally, for the time it takes to commit + scheduling inaccuracies
++    m_minVblankInterval = std::chrono::nanoseconds(1'000'000'000'000ULL / maximum);
 +
 +    const uint64_t vblankNs = static_cast<uint64_t>(m_minVblankInterval.count());
-+    if (vblankNs > 0 && vblankNs < (1ull << 31)) [[likely]] {
-+        constexpr uint64_t shift = 63;
-+        m_vblankReciprocal = ((1ull << shift) + vblankNs - 1) / vblankNs;
-+        m_vblankReciprocalShift = static_cast<uint8_t>(shift);
++    if (vblankNs > 0 && vblankNs < (1ULL << 31)) [[likely]] {
++        constexpr uint8_t shift = 63;
++        m_vblankReciprocal = ((1ULL << shift) + vblankNs - 1) / vblankNs;
++        m_vblankReciprocalShift = shift;
 +    } else {
 +        m_vblankReciprocal = 0;
 +        m_vblankReciprocalShift = 0;
 +    }
 +
      m_baseSafetyMargin = vblankTime + s_safetyMarginMinimum;
-+    const auto maximumReasonableMargin = std::min<std::chrono::nanoseconds>(3ms, m_minVblankInterval / 2);
-+    m_additionalSafetyMargin = std::clamp(m_additionalSafetyMargin, 0ns, maximumReasonableMargin);
++    const auto halfVblank = m_minVblankInterval / 2;
++    const auto maximumReasonableMargin = (3ms < halfVblank) ? 3ms : halfVblank;
++    m_additionalSafetyMargin = clampNs(m_additionalSafetyMargin, 0ns, maximumReasonableMargin);
      m_safetyMargin = m_baseSafetyMargin + m_additionalSafetyMargin;
  }
  
@@ -6377,12 +6519,14 @@
 -    std::unique_lock lock(m_mutex);
 -    if (m_pageflipTimeoutDetected) {
 -        qCCritical(KWIN_DRM, "Pageflip arrived after all, %lums after the commit", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_lastCommitTime).count());
+-        m_pageflipTimeoutDetected = false;
 +    std::unique_lock<std::mutex> lock(m_mutex);
 +
-+    if (m_pageflipTimeoutDetected) [[unlikely]] {
-+        qCCritical(KWIN_DRM, "Pageflip arrived %lldms after the commit",
-+                   static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_lastCommitTime).count()));
-         m_pageflipTimeoutDetected = false;
++    if (m_pageflipTimeoutDetected.load(std::memory_order_acquire)) [[unlikely]] {
++        const auto elapsed = std::chrono::steady_clock::now() - m_lastCommitTime;
++        const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
++        qCCritical(KWIN_DRM, "Pageflip arrived %lldms after the commit", static_cast<long long>(elapsedMs));
++        m_pageflipTimeoutDetected.store(false, std::memory_order_release);
      }
 +
      m_lastPageflip = TimePoint(timestamp);
@@ -6395,8 +6539,7 @@
      }
  }
  
--bool DrmCommitThread::pageflipsPending()
-+[[nodiscard]] bool DrmCommitThread::pageflipsPending()
+ bool DrmCommitThread::pageflipsPending()
  {
 -    std::unique_lock lock(m_mutex);
 -    return !m_commits.empty() || m_committed;
@@ -6404,35 +6547,38 @@
 +    return !m_commits.empty() || static_cast<bool>(m_committed);
  }
  
--TimePoint DrmCommitThread::estimateNextVblank(TimePoint now) const
-+[[nodiscard]] TimePoint DrmCommitThread::estimateNextVblank(TimePoint now) const
+ TimePoint DrmCommitThread::estimateNextVblank(TimePoint now) const
  {
 -    // the pageflip timestamp may be in the future
 -    const uint64_t pageflipsSince = now >= m_lastPageflip ? (now - m_lastPageflip) / m_minVblankInterval : 0;
--    return m_lastPageflip + m_minVblankInterval * (pageflipsSince + 1);
 +    if (m_minVblankInterval <= std::chrono::nanoseconds::zero()) [[unlikely]] {
 +        return now + kDefaultFrameInterval;
 +    }
 +
-+    const auto elapsed = now >= m_lastPageflip ? (now - m_lastPageflip) : 0ns;
-+
++    const auto elapsed = (now >= m_lastPageflip) ? (now - m_lastPageflip) : std::chrono::nanoseconds::zero();
 +    const uint64_t elapsedNs = static_cast<uint64_t>(elapsed.count());
 +    const uint64_t vblankNs = static_cast<uint64_t>(m_minVblankInterval.count());
 +
++    if (vblankNs == 0) [[unlikely]] {
++        return now + kDefaultFrameInterval;
++    }
++
 +    uint64_t pageflipsSince = 0;
-+    if (m_vblankReciprocal > 0 && elapsedNs < (1ull << 32)) [[likely]] {
++    if (m_vblankReciprocal > 0 && elapsedNs < (1ULL << 32)) [[likely]] {
 +        const __uint128_t product = static_cast<__uint128_t>(elapsedNs) * m_vblankReciprocal;
 +        pageflipsSince = static_cast<uint64_t>(product >> m_vblankReciprocalShift);
-+    } else if (vblankNs > 0) {
++    } else {
 +        pageflipsSince = elapsedNs / vblankNs;
 +    }
 +
-+    const uint64_t clampedPageflips = std::min(pageflipsSince, kMaxPageflipSpan);
-+    return m_lastPageflip + m_minVblankInterval * (clampedPageflips + 1);
++    if (pageflipsSince > kMaxPageflipSpan) {
++        pageflipsSince = kMaxPageflipSpan;
++    }
++
+     return m_lastPageflip + m_minVblankInterval * (pageflipsSince + 1);
  }
  
--std::chrono::nanoseconds DrmCommitThread::safetyMargin() const
-+[[nodiscard]] std::chrono::nanoseconds DrmCommitThread::safetyMargin() const
+ std::chrono::nanoseconds DrmCommitThread::safetyMargin() const
  {
 +    std::unique_lock<std::mutex> lock(m_mutex);
      return m_safetyMargin;
@@ -6443,13 +6589,13 @@
 -    // this will process the pageflip and call pageFlipped if there is one
      m_gpu->dispatchEvents();
 -    std::unique_lock lock(m_mutex);
+-    m_ping = true;
 +    std::unique_lock<std::mutex> lock(m_mutex);
-     m_ping = true;
++    m_ping.store(true, std::memory_order_release);
      m_pong.notify_one();
  }
--}
 +
-+} // namespace KWin
+ }
 
 --- a/src/backends/drm/drm_egl_layer_surface.h	2025-10-26 23:33:36.571412244 +0100
 +++ b/src/backends/drm/drm_egl_layer_surface.h	2025-10-26 23:47:51.015003254 +0100
@@ -8949,9 +9095,10 @@
  
      void pageFlipped(std::chrono::nanoseconds timestamp);
 -    bool modesetPresentPending() const;
-+    [[nodiscard]] bool modesetPresentPending() const noexcept;
-     void resetModesetPresentPending();
+-    void resetModesetPresentPending();
 -    DrmCommitThread *commitThread() const;
++    [[nodiscard]] bool modesetPresentPending() const noexcept;
++    void resetModesetPresentPending() noexcept;
 +    [[nodiscard]] DrmCommitThread *commitThread() const noexcept;
  
      void setOutput(DrmOutput *output);
@@ -8987,39 +9134,30 @@
  
      void setCrtc(DrmCrtc *crtc);
      void setMode(const std::shared_ptr<DrmConnectorMode> &mode);
-@@ -114,30 +119,34 @@ public:
+@@ -114,15 +119,15 @@ public:
          CommitModeset
      };
      Q_ENUM(CommitMode)
--    static Error commitPipelines(const QList<DrmPipeline *> &pipelines, CommitMode mode, const QList<DrmObject *> &unusedObjects = {});
 +
-+static Error commitPipelines(const QList<DrmPipeline *> &pipelines, CommitMode mode,
-+                                 const QList<DrmObject *> &unusedObjects = {});
+     static Error commitPipelines(const QList<DrmPipeline *> &pipelines, CommitMode mode, const QList<DrmObject *> &unusedObjects = {});
  
  private:
 -    bool isBufferForDirectScanout() const;
 -    uint32_t calculateUnderscan();
 -    static Error errnoToError();
 -    std::shared_ptr<DrmBlob> createHdrMetadata(TransferFunction::Type transferFunction) const;
--
--    // legacy only
--    Error presentLegacy(const QList<OutputLayer *> &layersToUpdate, const std::shared_ptr<OutputFrame> &frame);
--    Error legacyModeset();
--    Error setLegacyGamma();
--    Error applyPendingChangesLegacy();
 +    [[nodiscard]] bool isBufferForDirectScanout() const;
-+    [[nodiscard]] uint32_t calculateUnderscan();
-+    [[nodiscard]] static Error errnoToError();
++    [[nodiscard]] uint32_t calculateUnderscan() noexcept;
++    [[nodiscard]] static Error errnoToError() noexcept;
 +    [[nodiscard]] std::shared_ptr<DrmBlob> createHdrMetadata(TransferFunction::Type transferFunction) const;
-+
-+    [[nodiscard]] Error presentLegacy(const QList<OutputLayer *> &layersToUpdate, const std::shared_ptr<OutputFrame> &frame);
-+    [[nodiscard]] Error legacyModeset();
-+    [[nodiscard]] Error setLegacyGamma();
-+    [[nodiscard]] Error applyPendingChangesLegacy();
+ 
+-    // legacy only
+     Error presentLegacy(const QList<OutputLayer *> &layersToUpdate, const std::shared_ptr<OutputFrame> &frame);
+     Error legacyModeset();
+     Error setLegacyGamma();
+@@ -130,14 +135,16 @@ private:
      bool setCursorLegacy(DrmPipelineLayer *layer);
--    static Error commitPipelinesLegacy(const QList<DrmPipeline *> &pipelines, CommitMode mode, const QList<DrmObject *> &unusedObjects);
-+    static Error commitPipelinesLegacy(const QList<DrmPipeline *> &pipelines, CommitMode mode,
-+                                       const QList<DrmObject *> &unusedObjects);
+     static Error commitPipelinesLegacy(const QList<DrmPipeline *> &pipelines, CommitMode mode, const QList<DrmObject *> &unusedObjects);
  
 -    // atomic modesetting only
 -    Error prepareAtomicCommit(DrmAtomicCommit *commit, CommitMode mode, const std::shared_ptr<OutputFrame> &frame);
@@ -9039,7 +9177,7 @@
      DrmOutput *m_output = nullptr;
      DrmConnector *m_connector = nullptr;
  
-@@ -147,30 +156,31 @@ private:
+@@ -147,27 +154,28 @@ private:
      struct State
      {
          DrmCrtc *crtc = nullptr;
@@ -9080,21 +9218,10 @@
      State m_next;
  
      std::unique_ptr<DrmCommitThread> m_commitThread;
- };
- 
--}
-+} // namespace KWin
 
 --- a/src/backends/drm/drm_pipeline.cpp	2025-10-25 17:17:51.329553569 +0200
 +++ b/src/backends/drm/drm_pipeline.cpp	2025-10-25 17:32:08.749443710 +0200
-@@ -3,14 +3,13 @@
-     This file is part of the KDE project.
- 
-     SPDX-FileCopyrightText: 2021 Xaver Hugl <xaver.hugl@gmail.com>
-+    SPDX-FileCopyrightText: 2025 Senior AMD Performance Engineer et al.
- 
-     SPDX-License-Identifier: GPL-2.0-or-later
- */
+@@ -9,8 +9,6 @@
  
  #include "drm_pipeline.h"
  
@@ -9103,7 +9230,7 @@
  #include "core/iccprofile.h"
  #include "core/session.h"
  #include "drm_backend.h"
-@@ -24,79 +23,159 @@
+@@ -24,79 +22,179 @@
  #include "drm_layer.h"
  #include "drm_logging.h"
  #include "drm_output.h"
@@ -9127,7 +9254,9 @@
  
 +namespace
 +{
-+[[nodiscard]] constexpr bool isYuvFormat(uint32_t format) noexcept
++
++[[nodiscard, gnu::const]]
++constexpr bool isYuvFormat(uint32_t format) noexcept
 +{
 +    switch (format) {
 +    case DRM_FORMAT_YUV410:
@@ -9159,19 +9288,32 @@
 +    }
 +}
 +
++[[nodiscard, gnu::const]]
++constexpr bool isAsyncMode(PresentationMode mode) noexcept
++{
++    return mode == PresentationMode::Async || mode == PresentationMode::AdaptiveAsync;
++}
++
++[[nodiscard, gnu::const]]
++constexpr bool isAdaptiveMode(PresentationMode mode) noexcept
++{
++    return mode == PresentationMode::AdaptiveSync || mode == PresentationMode::AdaptiveAsync;
++}
++
 +const auto s_forceScalingMode = []() -> std::optional<DrmConnector::ScalingMode> {
 +    const auto env = qEnvironmentVariable("KWIN_DRM_FORCE_SCALING_MODE");
-+    if (env == "NONE") {
++    if (env == QLatin1String("NONE")) {
 +        return DrmConnector::ScalingMode::None;
-+    } else if (env == "FULL") {
++    } else if (env == QLatin1String("FULL")) {
 +        return DrmConnector::ScalingMode::Full;
-+    } else if (env == "CENTER") {
++    } else if (env == QLatin1String("CENTER")) {
 +        return DrmConnector::ScalingMode::Center;
-+    } else if (env == "FULL_ASPECT") {
++    } else if (env == QLatin1String("FULL_ASPECT")) {
 +        return DrmConnector::ScalingMode::Full_Aspect;
 +    }
 +    return std::nullopt;
 +}();
++
 +}
 +
  DrmPipeline::DrmPipeline(DrmConnector *conn)
@@ -9197,7 +9339,8 @@
          return Error::None;
      }
 -    // test the full state with all planes, to take pending commits into account
-     return DrmPipeline::commitPipelinesAtomic({this}, CommitMode::Test, frame, {});
+-    return DrmPipeline::commitPipelinesAtomic({this}, CommitMode::Test, frame, {});
++    return commitPipelinesAtomic({this}, CommitMode::Test, frame, {});
  }
  
  DrmPipeline::Error DrmPipeline::present(const QList<OutputLayer *> &layersToUpdate, const std::shared_ptr<OutputFrame> &frame)
@@ -9218,29 +9361,32 @@
 +        return Error::InvalidArguments;
 +    }
 +
-+    if (Error err = testPresent(frame); err != Error::None) [[unlikely]] {
++    if (const Error err = testPresent(frame); err != Error::None) [[unlikely]] {
 +        qCWarning(KWIN_DRM) << "Test present failed, error:" << static_cast<int>(err);
 +        return err;
 +    }
 +
 +    auto partialUpdate = std::make_unique<DrmAtomicCommit>(QList<DrmPipeline *>{this});
-+    if (Error err = prepareAtomicPresentation(partialUpdate.get(), frame); err != Error::None) [[unlikely]] {
++    if (const Error err = prepareAtomicPresentation(partialUpdate.get(), frame); err != Error::None) [[unlikely]] {
 +        qCWarning(KWIN_DRM) << "prepareAtomicPresentation failed:" << static_cast<int>(err);
 +        return err;
 +    }
 +
-+    bool updatedAnyLayer = false;
 +    int layerCount = 0;
-+
-+    for (const auto layer : layersToUpdate) {
++    for (OutputLayer *layer : layersToUpdate) {
 +        if (!layer) [[unlikely]] {
 +            continue;
++        }
++        auto *pipelineLayer = static_cast<DrmPipelineLayer *>(layer);
++        DrmPlane *plane = pipelineLayer->plane();
++        if (!plane) [[unlikely]] {
++            qCWarning(KWIN_DRM) << "Layer has no plane";
++            return Error::InvalidArguments;
          }
 -        // only give the actual state update to the commit thread, so that it can potentially reorder the commits
 -        auto partialUpdate = std::make_unique<DrmAtomicCommit>(QList<DrmPipeline *>{this});
 -        if (Error err = prepareAtomicPresentation(partialUpdate.get(), frame); err != Error::None) {
-+        auto *pipelineLayer = static_cast<DrmPipelineLayer *>(layer);
-+        if (Error err = prepareAtomicPlane(partialUpdate.get(), pipelineLayer->plane(), pipelineLayer, frame); err != Error::None) [[unlikely]] {
++        if (const Error err = prepareAtomicPlane(partialUpdate.get(), plane, pipelineLayer, frame); err != Error::None) [[unlikely]] {
 +            qCWarning(KWIN_DRM) << "prepareAtomicPlane failed for layer:" << static_cast<int>(err);
              return err;
          }
@@ -9249,17 +9395,14 @@
 -            if (Error err = prepareAtomicPlane(partialUpdate.get(), pipelineLayer->plane(), pipelineLayer, frame); err != Error::None) {
 -                return err;
 -            }
-+        updatedAnyLayer = true;
-+        layerCount++;
++        ++layerCount;
 +    }
 +
-+    // CRITICAL FIX: Multi-plane async flips are widely unsupported.
-+    // If we update >1 plane (e.g., Primary + Cursor) during an Async flip, fallback to VSync.
 +    if (partialUpdate->isTearing() && layerCount > 1) {
 +        partialUpdate->setPresentationMode(PresentationMode::VSync);
 +    }
 +
-+    if (!updatedAnyLayer) [[unlikely]] {
++    if (layerCount == 0) [[unlikely]] {
 +        if (m_pending.layers.isEmpty()) {
 +            qCWarning(KWIN_DRM) << "No layers to present";
 +            return Error::InvalidArguments;
@@ -9270,21 +9413,15 @@
 -            if (Error err = prepareAtomicPlane(partialUpdate.get(), m_pending.layers.front()->plane(), m_pending.layers.front(), frame); err != Error::None) {
 -                return err;
 -            }
-+        auto *fallbackLayer = m_pending.layers.front();
-+        if (!fallbackLayer) {
++        DrmPipelineLayer *fallbackLayer = m_pending.layers.constFirst();
++        if (!fallbackLayer) [[unlikely]] {
 +            qCWarning(KWIN_DRM) << "Fallback layer is null";
 +            return Error::InvalidArguments;
-+        }
-+        if (Error err = prepareAtomicPlane(partialUpdate.get(), fallbackLayer->plane(), fallbackLayer, frame); err != Error::None) {
-+            qCWarning(KWIN_DRM) << "Fallback layer preparation failed:" << static_cast<int>(err);
-+            return err;
          }
 -        if (m_pending.needsModesetProperties && !prepareAtomicModeset(partialUpdate.get())) {
-+    }
-+
-+    if (m_pending.needsModesetProperties) [[unlikely]] {
-+        if (!prepareAtomicModeset(partialUpdate.get())) {
-+            qCWarning(KWIN_DRM) << "prepareAtomicModeset failed";
++        DrmPlane *fallbackPlane = fallbackLayer->plane();
++        if (!fallbackPlane) [[unlikely]] {
++            qCWarning(KWIN_DRM) << "Fallback plane is null";
              return Error::InvalidArguments;
          }
 -        m_next.needsModesetProperties = m_pending.needsModesetProperties = false;
@@ -9292,7 +9429,18 @@
 -        return Error::None;
 -    } else {
 -        return presentLegacy(layersToUpdate, frame);
++        if (const Error err = prepareAtomicPlane(partialUpdate.get(), fallbackPlane, fallbackLayer, frame); err != Error::None) [[unlikely]] {
++            qCWarning(KWIN_DRM) << "Fallback layer preparation failed:" << static_cast<int>(err);
++            return err;
++        }
      }
++
++    if (m_pending.needsModesetProperties) [[unlikely]] {
++        if (!prepareAtomicModeset(partialUpdate.get())) {
++            qCWarning(KWIN_DRM) << "prepareAtomicModeset failed";
++            return Error::InvalidArguments;
++        }
++    }
 +
 +    m_next.needsModesetProperties = m_pending.needsModesetProperties = false;
 +    m_commitThread->addCommit(std::move(partialUpdate));
@@ -9300,12 +9448,12 @@
  }
  
  void DrmPipeline::maybeModeset(const std::shared_ptr<OutputFrame> &frame)
-@@ -108,44 +187,58 @@ void DrmPipeline::maybeModeset(const std
+@@ -108,44 +206,62 @@ void DrmPipeline::maybeModeset(const std
  DrmPipeline::Error DrmPipeline::commitPipelines(const QList<DrmPipeline *> &pipelines, CommitMode mode, const QList<DrmObject *> &unusedObjects)
  {
      Q_ASSERT(!pipelines.isEmpty());
 -    if (pipelines[0]->gpu()->atomicModeSetting()) {
-+    if (pipelines.front()->gpu()->atomicModeSetting()) [[likely]] {
++    if (pipelines.constFirst()->gpu()->atomicModeSetting()) [[likely]] {
          return commitPipelinesAtomic(pipelines, mode, nullptr, unusedObjects);
 -    } else {
 -        return commitPipelinesLegacy(pipelines, mode, unusedObjects);
@@ -9329,10 +9477,13 @@
 -        if (wantsModeset) {
 +
 +    if (mode == CommitMode::Test) [[likely]] {
-+        const bool anyModeset = std::any_of(pipelines.cbegin(), pipelines.cend(),
-+                                            [](const DrmPipeline *pipeline) {
-+                                                return pipeline->needsModeset();
-+                                            });
++        bool anyModeset = false;
++        for (const DrmPipeline *pipeline : pipelines) {
++            if (pipeline->needsModeset()) {
++                anyModeset = true;
++                break;
++            }
++        }
 +        if (anyModeset) [[unlikely]] {
              mode = CommitMode::TestAllowModeset;
          }
@@ -9340,7 +9491,7 @@
 +
      for (DrmPipeline *pipeline : pipelines) {
 -        if (Error err = pipeline->prepareAtomicCommit(commit.get(), mode, frame); err != Error::None) {
-+        if (Error err = pipeline->prepareAtomicCommit(commit.get(), mode, frame); err != Error::None) [[unlikely]] {
++        if (const Error err = pipeline->prepareAtomicCommit(commit.get(), mode, frame); err != Error::None) [[unlikely]] {
 +            qCWarning(KWIN_DRM) << "prepareAtomicCommit failed for pipeline:" << static_cast<int>(err);
              return err;
          }
@@ -9369,7 +9520,8 @@
 +        bool withoutModeset = true;
 +        for (DrmPipeline *pipeline : pipelines) {
 +            auto testCommit = std::make_unique<DrmAtomicCommit>(QList<DrmPipeline *>{pipeline});
-+            if (pipeline->prepareAtomicCommit(testCommit.get(), CommitMode::TestAllowModeset, frame) != Error::None || !testCommit->test()) {
++            const bool prepareOk = pipeline->prepareAtomicCommit(testCommit.get(), CommitMode::TestAllowModeset, frame) == Error::None;
++            if (!prepareOk || !testCommit->test()) {
 +                withoutModeset = false;
 +                break;
 +            }
@@ -9378,7 +9530,7 @@
          for (DrmPipeline *pipeline : pipelines) {
              pipeline->m_pending.needsModeset = !withoutModeset;
              pipeline->m_pending.needsModesetProperties = true;
-@@ -153,22 +246,19 @@ DrmPipeline::Error DrmPipeline::commitPi
+@@ -153,43 +269,52 @@ DrmPipeline::Error DrmPipeline::commitPi
          return Error::None;
      }
      case CommitMode::CommitModeset: {
@@ -9406,7 +9558,12 @@
              return errnoToError();
          }
          return Error::None;
-@@ -180,16 +270,23 @@ DrmPipeline::Error DrmPipeline::commitPi
+     }
+-    default:
+-        Q_UNREACHABLE();
+     }
++    Q_UNREACHABLE();
+ }
  
  DrmPipeline::Error DrmPipeline::prepareAtomicCommit(DrmAtomicCommit *commit, CommitMode mode, const std::shared_ptr<OutputFrame> &frame)
  {
@@ -9417,7 +9574,7 @@
 +    }
 +
 +    if (activePending()) [[likely]] {
-+        if (Error err = prepareAtomicPresentation(commit, frame); err != Error::None) [[unlikely]] {
++        if (const Error err = prepareAtomicPresentation(commit, frame); err != Error::None) [[unlikely]] {
              return err;
          }
 -        for (const auto &layer : m_pending.layers) {
@@ -9426,51 +9583,44 @@
 +            if (!layer) [[unlikely]] {
 +                return Error::InvalidArguments;
 +            }
-+            if (Error err = prepareAtomicPlane(commit, layer->plane(), layer, frame); err != Error::None) [[unlikely]] {
++            DrmPlane *plane = layer->plane();
++            if (!plane) [[unlikely]] {
++                return Error::InvalidArguments;
++            }
++            if (const Error err = prepareAtomicPlane(commit, plane, layer, frame); err != Error::None) [[unlikely]] {
                  return err;
              }
          }
 -        if (mode == CommitMode::TestAllowModeset || mode == CommitMode::CommitModeset || m_pending.needsModesetProperties) {
-+        if (mode != CommitMode::Test && (mode == CommitMode::CommitModeset || m_pending.needsModesetProperties)) [[unlikely]] {
++        const bool needsModesetCommit = (mode != CommitMode::Test) &&
++                                        (mode == CommitMode::CommitModeset || m_pending.needsModesetProperties);
++        if (needsModesetCommit) [[unlikely]] {
              if (!prepareAtomicModeset(commit)) {
                  return Error::InvalidArguments;
              }
-@@ -200,30 +297,93 @@ DrmPipeline::Error DrmPipeline::prepareA
+@@ -200,30 +325,66 @@ DrmPipeline::Error DrmPipeline::prepareA
      return Error::None;
  }
  
 -DrmPipeline::Error DrmPipeline::prepareAtomicPresentation(DrmAtomicCommit *commit, const std::shared_ptr<OutputFrame> &frame)
-+DrmPipeline::Error DrmPipeline::prepareAtomicPresentation(DrmAtomicCommit *commit,
-+                                                          const std::shared_ptr<OutputFrame> &)
++DrmPipeline::Error DrmPipeline::prepareAtomicPresentation(DrmAtomicCommit *commit, const std::shared_ptr<OutputFrame> &)
  {
 +    if (!commit || !m_pending.crtc) [[unlikely]] {
 +        return Error::InvalidArguments;
 +    }
 +
-+    const bool isAsync = (m_pending.presentationMode == PresentationMode::Async) ||
-+                         (m_pending.presentationMode == PresentationMode::AdaptiveAsync);
-+
++    const bool isAsync = isAsyncMode(m_pending.presentationMode);
      commit->setPresentationMode(m_pending.presentationMode);
 +
      if (m_connector->contentType.isValid()) {
          commit->addEnum(m_connector->contentType, m_pending.contentType);
      }
  
-     if (m_pending.crtc->vrrEnabled.isValid()) {
+-    if (m_pending.crtc->vrrEnabled.isValid()) {
 -        commit->setVrr(m_pending.crtc, m_pending.presentationMode == PresentationMode::AdaptiveSync || m_pending.presentationMode == PresentationMode::AdaptiveAsync);
-+        bool shouldEnableVrr =
-+            (m_pending.presentationMode == PresentationMode::AdaptiveSync) ||
-+            (m_pending.presentationMode == PresentationMode::AdaptiveAsync);
-+
-+        if (m_pending.needsModeset) {
-+            shouldEnableVrr = false;
-+        }
-+
-+        // CRITICAL FIX: Do not include VRR properties in Async/Tearing commits.
-+        // Updating CRTC properties while requesting async flip causes EINVAL.
-+        if (!isAsync) {
-+            commit->setVrr(m_pending.crtc, shouldEnableVrr);
-+        }
++    if (m_pending.crtc->vrrEnabled.isValid() && !isAsync) {
++        const bool shouldEnableVrr = isAdaptiveMode(m_pending.presentationMode) && !m_pending.needsModeset;
++        commit->setVrr(m_pending.crtc, shouldEnableVrr);
      }
  
 -    const bool differentPipelines = std::ranges::any_of(m_pending.layers | std::views::drop(1), [&](OutputLayer *layer) {
@@ -9485,49 +9635,36 @@
 +
 +    DrmPipelineLayer *referenceLayer = nullptr;
 +    int enabledCount = 0;
-+    for (DrmPipelineLayer *layer : m_pending.layers) {
++    bool pipelinesMatch = true;
++    const ColorPipeline *firstPipeline = nullptr;
++
++    for (DrmPipelineLayer *layer : std::as_const(m_pending.layers)) {
 +        if (!layer) [[unlikely]] {
 +            return Error::InvalidArguments;
 +        }
-+        if (layer->isEnabled()) {
++        if (!layer->isEnabled()) {
++            continue;
++        }
++        if (!referenceLayer) {
 +            referenceLayer = layer;
-+            ++enabledCount;
-+            if (enabledCount > 1) {
-+                break;
++            firstPipeline = &layer->colorPipeline();
++        } else if (pipelinesMatch && firstPipeline) {
++            if (layer->colorPipeline() != *firstPipeline) {
++                pipelinesMatch = false;
 +            }
 +        }
++        ++enabledCount;
 +    }
 +
 +    if (!referenceLayer) [[unlikely]] {
 +        return Error::InvalidArguments;
 +    }
 +
-+    const ColorPipeline &referencePipeline = referenceLayer->colorPipeline();
-+
-+    if (enabledCount == 1) {
-+        const ColorPipeline mergedPipeline = referencePipeline.merged(m_pending.crtcColorPipeline);
-+        if (!m_pending.crtc->postBlendingPipeline) {
-+            if (!mergedPipeline.isIdentity()) [[unlikely]] {
-+                return Error::InvalidArguments;
-+            }
-+        } else {
-+            if (!m_pending.crtc->postBlendingPipeline->matchPipeline(commit, mergedPipeline)) [[unlikely]] {
-+                return Error::InvalidArguments;
-+            }
-+        }
-+        return Error::None;
++    if (enabledCount > 1 && !pipelinesMatch) [[unlikely]] {
++        return Error::InvalidArguments;
 +    }
 +
-+    for (DrmPipelineLayer *layer : m_pending.layers) {
-+        if (!layer->isEnabled()) {
-+            continue;
-+        }
-+        if (layer->colorPipeline() != referencePipeline) [[unlikely]] {
-+            return Error::InvalidArguments;
-+        }
-+    }
-+
-+    const ColorPipeline mergedPipeline = referencePipeline.merged(m_pending.crtcColorPipeline);
++    const ColorPipeline mergedPipeline = referenceLayer->colorPipeline().merged(m_pending.crtcColorPipeline);
      if (!m_pending.crtc->postBlendingPipeline) {
 -        if (!colorPipeline.isIdentity()) {
 +        if (!mergedPipeline.isIdentity()) [[unlikely]] {
@@ -9539,7 +9676,7 @@
              return Error::InvalidArguments;
          }
      }
-@@ -231,152 +391,187 @@ DrmPipeline::Error DrmPipeline::prepareA
+@@ -231,181 +392,284 @@ DrmPipeline::Error DrmPipeline::prepareA
      return Error::None;
  }
  
@@ -9568,52 +9705,89 @@
 -    const auto fb = layer->currentBuffer();
 -    if (!fb) {
 +
++    const bool isCursor = plane->type.isValid() && plane->type.enumValue() == DrmPlane::TypeIndex::Cursor;
++    if (isCursor) {
++        return prepareAtomicPlaneCursor(commit, plane, layer, fb, frame);
++    }
++    return prepareAtomicPlanePrimary(commit, plane, layer, fb, frame);
++}
++
++DrmPipeline::Error DrmPipeline::prepareAtomicPlaneCursor(DrmAtomicCommit *commit,
++                                                         DrmPlane *plane,
++                                                         DrmPipelineLayer *layer,
++                                                         const std::shared_ptr<DrmFramebuffer> &fb,
++                                                         const std::shared_ptr<OutputFrame> &frame)
++{
++    if (!commit || !plane || !layer || !fb || !m_pending.crtc) [[unlikely]] {
+         return Error::InvalidArguments;
+     }
+-    const auto transform = layer->offloadTransform();
+-    const auto planeTransform = DrmPlane::outputTransformToPlaneTransform(transform);
+-    if (plane->rotation.isValid()) {
+-        if (!plane->rotation.hasEnum(planeTransform)) {
+-            return Error::InvalidArguments;
+-        }
+-        commit->addEnum(plane->rotation, planeTransform);
+-    } else if (planeTransform != DrmPlane::Transformation::Rotate0) {
++
++    const QRect sourceRect = layer->sourceRect().toRect();
++    const QRect targetRect = layer->targetRect();
++    if (sourceRect.width() <= 0 || sourceRect.height() <= 0 ||
++        targetRect.width() <= 0 || targetRect.height() <= 0) [[unlikely]] {
++        qCWarning(KWIN_DRM) << "Invalid cursor geometry: src=" << sourceRect << "dst=" << targetRect;
+         return Error::InvalidArguments;
+     }
+-    commit->addProperty(plane->crtcId, m_pending.crtc->id());
++
++    plane->set(commit, sourceRect, targetRect);
+     commit->addBuffer(plane, fb, frame);
+-    plane->set(commit, layer->sourceRect().toRect(), layer->targetRect());
++    commit->addProperty(plane->crtcId, m_pending.crtc->id());
++
+     if (plane->vmHotspotX.isValid() && plane->vmHotspotY.isValid()) {
+-        commit->addProperty(plane->vmHotspotX, std::round(layer->hotspot().x()));
+-        commit->addProperty(plane->vmHotspotY, std::round(layer->hotspot().y()));
++        const QPointF hotspot = layer->hotspot();
++        const double hx = hotspot.x();
++        const double hy = hotspot.y();
++        if (hx >= 0.0 && hy >= 0.0 && hx <= 32767.0 && hy <= 32767.0) [[likely]] {
++            commit->addProperty(plane->vmHotspotX, static_cast<uint64_t>(std::lround(hx)));
++            commit->addProperty(plane->vmHotspotY, static_cast<uint64_t>(std::lround(hy)));
++        } else {
++            qCWarning(KWIN_DRM) << "Cursor hotspot out of range:" << hotspot;
++        }
++    }
++
++    return Error::None;
++}
++
++DrmPipeline::Error DrmPipeline::prepareAtomicPlanePrimary(DrmAtomicCommit *commit,
++                                                          DrmPlane *plane,
++                                                          DrmPipelineLayer *layer,
++                                                          const std::shared_ptr<DrmFramebuffer> &fb,
++                                                          const std::shared_ptr<OutputFrame> &frame)
++{
++    if (!commit || !plane || !layer || !fb || !m_pending.crtc) [[unlikely]] {
++        return Error::InvalidArguments;
++    }
++
 +    const QRect sourceRect = layer->sourceRect().toRect();
 +    const QRect targetRect = layer->targetRect();
 +    if (sourceRect.width() <= 0 || sourceRect.height() <= 0 ||
 +        targetRect.width() <= 0 || targetRect.height() <= 0) [[unlikely]] {
 +        qCWarning(KWIN_DRM) << "Invalid plane geometry: src=" << sourceRect << "dst=" << targetRect;
-         return Error::InvalidArguments;
-     }
--    const auto transform = layer->offloadTransform();
--    const auto planeTransform = DrmPlane::outputTransformToPlaneTransform(transform);
++        return Error::InvalidArguments;
++    }
 +
 +    plane->set(commit, sourceRect, targetRect);
 +    commit->addBuffer(plane, fb, frame);
 +    commit->addProperty(plane->crtcId, m_pending.crtc->id());
 +
-+    const bool isCursor = (plane->type.enumValue() == DrmPlane::TypeIndex::Cursor);
-+    if (isCursor) {
-+        if (plane->vmHotspotX.isValid() && plane->vmHotspotY.isValid()) {
-+            const QPointF hotspot = layer->hotspot();
-+            const int64_t hotX = std::lround(hotspot.x());
-+            const int64_t hotY = std::lround(hotspot.y());
-+            if (hotX < 0 || hotY < 0 || hotX > 32767 || hotY > 32767) [[unlikely]] {
-+                qCWarning(KWIN_DRM) << "Cursor hotspot out of range:" << hotspot;
-+                return Error::InvalidArguments;
-+            }
-+            commit->addProperty(plane->vmHotspotX, static_cast<uint64_t>(hotX));
-+            commit->addProperty(plane->vmHotspotY, static_cast<uint64_t>(hotY));
-+        }
-+        return Error::None;
-+    }
-+
-     if (plane->rotation.isValid()) {
--        if (!plane->rotation.hasEnum(planeTransform)) {
++    if (plane->rotation.isValid()) {
 +        const OutputTransform transform = layer->offloadTransform();
 +        if (!plane->supportsTransformation(transform)) [[unlikely]] {
-             return Error::InvalidArguments;
-         }
--        commit->addEnum(plane->rotation, planeTransform);
--    } else if (planeTransform != DrmPlane::Transformation::Rotate0) {
--        return Error::InvalidArguments;
--    }
--    commit->addProperty(plane->crtcId, m_pending.crtc->id());
--    commit->addBuffer(plane, fb, frame);
--    plane->set(commit, layer->sourceRect().toRect(), layer->targetRect());
--    if (plane->vmHotspotX.isValid() && plane->vmHotspotY.isValid()) {
--        commit->addProperty(plane->vmHotspotX, std::round(layer->hotspot().x()));
--        commit->addProperty(plane->vmHotspotY, std::round(layer->hotspot().y()));
++            return Error::InvalidArguments;
++        }
 +        if (transform.kind() != OutputTransform::Kind::Normal) {
 +            commit->addEnum(plane->rotation, DrmPlane::outputTransformToPlaneTransform(transform));
 +        }
@@ -9623,9 +9797,11 @@
          commit->addProperty(plane->alpha, plane->alpha.maxValue());
      }
 -    if (plane->pixelBlendMode.isValid()) {
++
 +    if (plane->pixelBlendMode.isValid() && plane->pixelBlendMode.hasEnum(DrmPlane::PixelBlendMode::PreMultiplied)) {
          commit->addEnum(plane->pixelBlendMode, DrmPlane::PixelBlendMode::PreMultiplied);
      }
++
      if (plane->zpos.isValid() && !plane->zpos.isImmutable()) {
          commit->addProperty(plane->zpos, layer->zpos());
      }
@@ -9651,7 +9827,11 @@
 -        if (!plane->colorEncoding.isValid() || !plane->colorRange.isValid()) {
 -            return Error::InvalidArguments;
 +    const auto buffer = fb->buffer();
-+    const auto *attrs = buffer ? buffer->dmabufAttributes() : nullptr;
++    if (!buffer) {
++        return Error::None;
++    }
++
++    const auto *attrs = buffer->dmabufAttributes();
 +    if (!attrs || !isYuvFormat(attrs->format)) {
 +        return Error::None;
 +    }
@@ -9704,13 +9884,21 @@
 -        m_pending.crtc->disable(commit);
 -        for (const auto layer : m_pending.layers) {
 -            if (DrmPlane *plane = layer->plane()) {
--                plane->disable(commit);
--            }
--        }
++
 +    if (!m_pending.crtc) [[unlikely]] {
 +        return;
++    }
++
++    m_pending.crtc->disable(commit);
++    for (DrmPipelineLayer *layer : std::as_const(m_pending.layers)) {
++        if (layer) [[likely]] {
++            DrmPlane *plane = layer->plane();
++            if (plane) [[likely]] {
+                 plane->disable(commit);
+             }
+         }
      }
--}
+ }
  
 -static const auto s_forceScalingMode = []() -> std::optional<DrmConnector::ScalingMode> {
 -    const auto env = qEnvironmentVariable("KWIN_DRM_FORCE_SCALING_MODE");
@@ -9724,15 +9912,9 @@
 -        return DrmConnector::ScalingMode::Full_Aspect;
 -    } else {
 -        return std::nullopt;
-+    m_pending.crtc->disable(commit);
-+    for (DrmPipelineLayer *layer : std::as_const(m_pending.layers)) {
-+        if (layer && layer->plane()) [[likely]] {
-+            layer->plane()->disable(commit);
-+        }
-     }
+-    }
 -}();
-+}
- 
+-
  bool DrmPipeline::prepareAtomicModeset(DrmAtomicCommit *commit)
  {
 +    if (!commit || !m_pending.crtc || !m_pending.mode) [[unlikely]] {
@@ -9746,6 +9928,7 @@
          commit->addEnum(m_connector->broadcastRGB, DrmConnector::rgbRangeToBroadcastRgb(m_pending.rgbRange));
      }
 -    if (m_connector->linkStatus.isValid()) {
++
 +    if (m_connector->linkStatus.isValid()) [[likely]] {
          commit->addEnum(m_connector->linkStatus, DrmConnector::LinkStatus::Good);
      }
@@ -9757,7 +9940,7 @@
 +    } else if (m_connector->underscan.isValid()) [[likely]] {
          const uint32_t hborder = calculateUnderscan();
 -        commit->addEnum(m_connector->underscan, m_pending.overscan != 0 ? DrmConnector::UnderscanOptions::On : DrmConnector::UnderscanOptions::Off);
-+        const auto underscanMode = m_pending.overscan != 0
++        const auto underscanMode = (m_pending.overscan != 0)
 +            ? DrmConnector::UnderscanOptions::On
 +            : DrmConnector::UnderscanOptions::Off;
 +        commit->addEnum(m_connector->underscan, underscanMode);
@@ -9768,9 +9951,11 @@
 -        commit->addProperty(m_connector->maxBpc, std::clamp<uint32_t>(m_pending.maxBpc, m_connector->maxBpc.minValue(), m_connector->maxBpc.maxValue()));
 +
 +    if (m_connector->maxBpc.isValid()) [[likely]] {
-+        const uint32_t clampedBpc = std::clamp<uint32_t>(m_pending.maxBpc,
-+                                                         m_connector->maxBpc.minValue(),
-+                                                         m_connector->maxBpc.maxValue());
++        const uint64_t minBpc = m_connector->maxBpc.minValue();
++        const uint64_t maxBpc = m_connector->maxBpc.maxValue();
++        uint64_t clampedBpc = m_pending.maxBpc;
++        clampedBpc = (clampedBpc < minBpc) ? minBpc : clampedBpc;
++        clampedBpc = (clampedBpc > maxBpc) ? maxBpc : clampedBpc;
 +        commit->addProperty(m_connector->maxBpc, clampedBpc);
      }
 -    if (m_connector->hdrMetadata.isValid()) {
@@ -9784,9 +9969,12 @@
          return false;
      }
 -    if (m_pending.wcg) {
+-        if (!m_connector->colorspace.isValid() || !m_connector->colorspace.hasEnum(DrmConnector::Colorspace::BT2020_RGB)) {
 +
 +    if (m_pending.wcg) [[unlikely]] {
-         if (!m_connector->colorspace.isValid() || !m_connector->colorspace.hasEnum(DrmConnector::Colorspace::BT2020_RGB)) {
++        const bool hasColorspace = m_connector->colorspace.isValid() &&
++                                   m_connector->colorspace.hasEnum(DrmConnector::Colorspace::BT2020_RGB);
++        if (!hasColorspace) {
              return false;
          }
          commit->addEnum(m_connector->colorspace, DrmConnector::Colorspace::BT2020_RGB);
@@ -9805,13 +9993,20 @@
                  commit->addEnum(m_connector->scalingMode, DrmConnector::ScalingMode::None);
              }
 -        } else if (m_connector->isInternal() && m_connector->scalingMode.hasEnum(DrmConnector::ScalingMode::Full_Aspect) && (m_pending.mode->flags() & OutputMode::Flag::Generated)) {
-+        } else if (m_connector->isInternal()
-+                   && m_connector->scalingMode.hasEnum(DrmConnector::ScalingMode::Full_Aspect)
-+                   && (m_pending.mode->flags() & OutputMode::Flag::Generated)) [[unlikely]] {
-             commit->addEnum(m_connector->scalingMode, DrmConnector::ScalingMode::Full_Aspect);
-         } else if (m_connector->scalingMode.hasEnum(DrmConnector::ScalingMode::None)) {
-             commit->addEnum(m_connector->scalingMode, DrmConnector::ScalingMode::None);
-@@ -385,7 +580,8 @@ bool DrmPipeline::prepareAtomicModeset(D
+-            commit->addEnum(m_connector->scalingMode, DrmConnector::ScalingMode::Full_Aspect);
+-        } else if (m_connector->scalingMode.hasEnum(DrmConnector::ScalingMode::None)) {
+-            commit->addEnum(m_connector->scalingMode, DrmConnector::ScalingMode::None);
++        } else {
++            const bool useFullAspect = m_connector->isInternal() &&
++                                       m_connector->scalingMode.hasEnum(DrmConnector::ScalingMode::Full_Aspect) &&
++                                       (m_pending.mode->flags() & OutputMode::Flag::Generated);
++            if (useFullAspect) [[unlikely]] {
++                commit->addEnum(m_connector->scalingMode, DrmConnector::ScalingMode::Full_Aspect);
++            } else if (m_connector->scalingMode.hasEnum(DrmConnector::ScalingMode::None)) {
++                commit->addEnum(m_connector->scalingMode, DrmConnector::ScalingMode::None);
++            }
+         }
+     }
  
      commit->addProperty(m_pending.crtc->active, 1);
      commit->addBlob(m_pending.crtc->modeId, m_pending.mode->blob());
@@ -9821,37 +10016,57 @@
          commit->addProperty(m_pending.crtc->degammaLut, 0);
      }
  
-@@ -394,13 +590,18 @@ bool DrmPipeline::prepareAtomicModeset(D
+     return true;
+ }
  
- uint32_t DrmPipeline::calculateUnderscan()
+-uint32_t DrmPipeline::calculateUnderscan()
++uint32_t DrmPipeline::calculateUnderscan() noexcept
  {
 -    const auto size = m_pending.mode->size();
-+    if (!m_pending.mode) [[unlikely]] {
-+        return 0;
-+    }
-+    const QSize size = m_pending.mode->size();
-+    if (size.height() <= 0) [[unlikely]] {
-+        return 0;
-+    }
-     const float aspectRatio = size.width() / static_cast<float>(size.height());
+-    const float aspectRatio = size.width() / static_cast<float>(size.height());
 -    uint32_t hborder = m_pending.overscan * aspectRatio;
 -    if (hborder > 128) {
 -        // overscan only goes from 0-100 so we cut off the 101-128 value range of underscan_vborder
 -        hborder = 128;
 -        m_pending.overscan = 128 / aspectRatio;
-+    uint32_t hborder = static_cast<uint32_t>(std::lround(m_pending.overscan * aspectRatio));
-+    if (hborder > 128u) [[unlikely]] {
-+        hborder = 128u;
-+        m_pending.overscan = static_cast<uint32_t>(128 / aspectRatio);
++    if (!m_pending.mode) [[unlikely]] {
++        return 0;
      }
-     return hborder;
+-    return hborder;
++
++    const QSize size = m_pending.mode->size();
++    const int height = size.height();
++    if (height <= 0) [[unlikely]] {
++        return 0;
++    }
++
++    const int width = size.width();
++    const float aspectRatio = static_cast<float>(width) / static_cast<float>(height);
++    float hborderF = static_cast<float>(m_pending.overscan) * aspectRatio;
++
++    if (hborderF > 128.0f) [[unlikely]] {
++        hborderF = 128.0f;
++        m_pending.overscan = static_cast<uint32_t>(std::lround(128.0f / aspectRatio));
++    }
++
++    return static_cast<uint32_t>(std::lround(hborderF));
  }
-@@ -423,61 +624,82 @@ DrmPipeline::Error DrmPipeline::errnoToE
+ 
+-DrmPipeline::Error DrmPipeline::errnoToError()
++DrmPipeline::Error DrmPipeline::errnoToError() noexcept
+ {
+     switch (errno) {
+     case EINVAL:
+@@ -423,61 +687,87 @@ DrmPipeline::Error DrmPipeline::errnoToE
  
  bool DrmPipeline::presentAsync(OutputLayer *layer, std::optional<std::chrono::nanoseconds> allowedVrrDelay)
  {
 -    if (needsModeset() || !m_pending.crtc || !m_pending.active) {
 +    if (!layer || needsModeset() || !m_pending.crtc || !m_pending.active) [[unlikely]] {
++        return false;
++    }
++
++    if (gpu()->isVmwgfx()) [[unlikely]] {
          return false;
      }
 -    // We need to make sure that on vmwgfx software cursor is selected
@@ -9859,7 +10074,8 @@
 -    // the cursor is missing.
 -    if (gpu()->isVmwgfx()) {
 +
-+    if (gpu()->isVmwgfx()) [[unlikely]] {
++    auto *drmLayer = static_cast<DrmPipelineLayer *>(layer);
++    if (!drmLayer) [[unlikely]] {
          return false;
      }
 -    const auto drmLayer = static_cast<DrmPipelineLayer *>(layer);
@@ -9867,18 +10083,14 @@
 -        // test the full state, to take pending commits into account
 -        if (DrmPipeline::commitPipelinesAtomic({this}, CommitMode::Test, nullptr, {}) != Error::None) {
 +
-+    auto *drmLayer = static_cast<DrmPipelineLayer *>(layer);
-+    DrmPlane *plane = drmLayer ? drmLayer->plane() : nullptr;
-+
++    DrmPlane *plane = drmLayer->plane();
 +    if (!plane) [[unlikely]] {
 +        return setCursorLegacy(drmLayer);
 +    }
 +
-+    const bool isCursor =
-+        (plane->type.isValid() && plane->type.enumValue() == DrmPlane::TypeIndex::Cursor);
-+
++    const bool isCursor = plane->type.isValid() && plane->type.enumValue() == DrmPlane::TypeIndex::Cursor;
 +    if (!isCursor) {
-+        if (DrmPipeline::commitPipelinesAtomic({this}, CommitMode::Test, nullptr, {}) != Error::None) [[unlikely]] {
++        if (commitPipelinesAtomic({this}, CommitMode::Test, nullptr, {}) != Error::None) [[unlikely]] {
 +            qCDebug(KWIN_DRM) << "presentAsync: atomic test failed, aborting";
              return false;
          }
@@ -9918,7 +10130,8 @@
 +    }
 +
 +    if (m_output) [[likely]] {
-+        if (auto *loop = m_output->renderLoop()) {
++        RenderLoop *loop = m_output->renderLoop();
++        if (loop) [[likely]] {
 +            loop->setPresentationSafetyMargin(m_commitThread->safetyMargin());
 +            if (m_pending.mode) {
 +                loop->setRefreshRate(m_pending.mode->refreshRate());
@@ -9945,9 +10158,12 @@
  void DrmPipeline::pageFlipped(std::chrono::nanoseconds timestamp)
  {
 -    RenderLoopPrivate::get(m_output->renderLoop())->notifyVblank(timestamp);
-+    if (m_output && m_output->renderLoop()) [[likely]] {
-+        RenderLoopPrivate::get(m_output->renderLoop())->notifyVblank(timestamp);
-+        m_output->renderLoop()->setPresentationSafetyMargin(m_commitThread->safetyMargin());
++    if (m_output) [[likely]] {
++        RenderLoop *loop = m_output->renderLoop();
++        if (loop) [[likely]] {
++            RenderLoopPrivate::get(loop)->notifyVblank(timestamp);
++            loop->setPresentationSafetyMargin(m_commitThread->safetyMargin());
++        }
 +    }
      m_commitThread->pageFlipped(timestamp);
 -    // the commit thread adjusts the safety margin on every commit
@@ -9957,13 +10173,13 @@
          gpu()->maybeModeset(nullptr, nullptr);
      }
  }
-@@ -485,22 +707,24 @@ void DrmPipeline::pageFlipped(std::chron
+@@ -485,22 +775,24 @@ void DrmPipeline::pageFlipped(std::chron
  void DrmPipeline::setOutput(DrmOutput *output)
  {
      m_output = output;
 -    for (const auto layer : m_pending.layers) {
 -        layer->setOutput(output);
-+    for (DrmPipelineLayer *layer : m_pending.layers) {
++    for (DrmPipelineLayer *layer : std::as_const(m_pending.layers)) {
 +        if (layer) [[likely]] {
 +            layer->setOutput(output);
 +        }
@@ -9987,7 +10203,7 @@
  {
      return m_pending.crtc && m_pending.mode && m_pending.active;
  }
-@@ -510,12 +734,12 @@ void DrmPipeline::revertPendingChanges()
+@@ -510,37 +802,37 @@ void DrmPipeline::revertPendingChanges()
      m_pending = m_next;
  }
  
@@ -10002,7 +10218,10 @@
  {
      return m_modesetPresentPending;
  }
-@@ -525,22 +749,22 @@ void DrmPipeline::resetModesetPresentPen
+ 
+-void DrmPipeline::resetModesetPresentPending()
++void DrmPipeline::resetModesetPresentPending() noexcept
+ {
      m_modesetPresentPending = false;
  }
  
@@ -10029,7 +10248,7 @@
  {
      return m_pending.enabled;
  }
-@@ -550,27 +774,27 @@ QList<DrmPipelineLayer *> DrmPipeline::l
+@@ -550,27 +842,27 @@ QList<DrmPipelineLayer *> DrmPipeline::l
      return m_pending.layers;
  }
  
@@ -10062,7 +10281,7 @@
  {
      return m_pending.iccProfile;
  }
-@@ -583,6 +807,9 @@ void DrmPipeline::setCrtc(DrmCrtc *crtc)
+@@ -583,6 +875,9 @@ void DrmPipeline::setCrtc(DrmCrtc *crtc)
  void DrmPipeline::setMode(const std::shared_ptr<DrmConnectorMode> &mode)
  {
      m_pending.mode = mode;
@@ -10072,20 +10291,20 @@
  }
  
  void DrmPipeline::setActive(bool active)
-@@ -598,8 +825,10 @@ void DrmPipeline::setEnable(bool enable)
+@@ -598,8 +893,10 @@ void DrmPipeline::setEnable(bool enable)
  void DrmPipeline::setLayers(const QList<DrmPipelineLayer *> &layers)
  {
      m_pending.layers = layers;
 -    for (const auto layer : layers) {
 -        layer->setOutput(m_output);
-+    for (DrmPipelineLayer *layer : m_pending.layers) {
++    for (DrmPipelineLayer *layer : std::as_const(m_pending.layers)) {
 +        if (layer) [[likely]] {
 +            layer->setOutput(m_output);
 +        }
      }
  }
  
-@@ -650,54 +879,52 @@ void DrmPipeline::setIccProfile(const st
+@@ -650,54 +947,60 @@ void DrmPipeline::setIccProfile(const st
  
  std::shared_ptr<DrmBlob> DrmPipeline::createHdrMetadata(TransferFunction::Type transferFunction) const
  {
@@ -10095,6 +10314,7 @@
          return nullptr;
      }
 -    if (!m_connector->edid()->supportsPQ()) {
++
 +    const auto edid = m_connector->edid();
 +    if (!edid || !edid->supportsPQ()) [[unlikely]] {
          return nullptr;
@@ -10109,12 +10329,19 @@
 -    const auto to16Bit = [](float value) {
 -        return uint16_t(std::round(value / 0.00002));
 +
-+    auto to16Bit = [](float value) -> uint16_t {
-+        return static_cast<uint16_t>(std::lround(value / 0.00002f));
++    auto to16Bit = [](float value) noexcept -> uint16_t {
++        const float scaled = value / 0.00002f;
++        const float clamped = (scaled < 0.0f) ? 0.0f : ((scaled > 65535.0f) ? 65535.0f : scaled);
++        return static_cast<uint16_t>(std::lround(clamped));
      };
 +
-+    const auto desiredMax = edid->desiredMaxFrameAverageLuminance().value_or(0.0f);
-+    const auto desiredMin = edid->desiredMinLuminance();
++    const float desiredMax = edid->desiredMaxFrameAverageLuminance().value_or(0.0f);
++    const float desiredMin = edid->desiredMinLuminance();
++
++    const uint16_t maxLum = static_cast<uint16_t>(std::lround((desiredMax < 0.0f) ? 0.0f : ((desiredMax > 65535.0f) ? 65535.0f : desiredMax)));
++    const float minScaled = desiredMin * 10000.0f;
++    const uint16_t minLum = static_cast<uint16_t>(std::lround((minScaled < 0.0f) ? 0.0f : ((minScaled > 65535.0f) ? 65535.0f : minScaled)));
++
      hdr_output_metadata data{
          .metadata_type = 0,
          .hdmi_metadata_type1 = hdr_metadata_infoframe{
@@ -10126,7 +10353,7 @@
 -            // - 4-7: reserved
 -            .eotf = uint8_t(2),
 -            // there's only one type. 1-7 are reserved for future use
-+            .eotf = static_cast<uint8_t>(2),
++            .eotf = 2,
              .metadata_type = 0,
 -            // in 0.00002 nits
              .display_primaries = {
@@ -10142,10 +10369,10 @@
 -            // in nits
 -            .max_cll = uint16_t(std::round(m_connector->edid()->desiredMaxFrameAverageLuminance().value_or(0))),
 -            .max_fall = uint16_t(std::round(m_connector->edid()->desiredMaxFrameAverageLuminance().value_or(0))),
-+            .max_display_mastering_luminance = static_cast<uint16_t>(std::lround(desiredMax)),
-+            .min_display_mastering_luminance = static_cast<uint16_t>(std::lround(desiredMin * 10000.0f)),
-+            .max_cll = static_cast<uint16_t>(std::lround(desiredMax)),
-+            .max_fall = static_cast<uint16_t>(std::lround(desiredMax)),
++            .max_display_mastering_luminance = maxLum,
++            .min_display_mastering_luminance = minLum,
++            .max_cll = maxLum,
++            .max_fall = maxLum,
          },
      };
 +
@@ -10443,7 +10670,7 @@
  
  namespace KWin
  {
-@@ -24,11 +27,14 @@ namespace KWin
+@@ -24,37 +27,41 @@ namespace KWin
  class DrmFramebuffer;
  class DrmFramebufferData;
  class DrmCrtc;
@@ -10453,12 +10680,13 @@
  {
      Q_GADGET
  public:
+-    DrmPlane(DrmGpu *gpu, uint32_t planeId);
 +    static constexpr std::size_t BufferHistoryDepth = 4;
 +
-     DrmPlane(DrmGpu *gpu, uint32_t planeId);
++    explicit DrmPlane(DrmGpu *gpu, uint32_t planeId);
  
      bool init();
-@@ -36,25 +42,26 @@ public:
+ 
      bool updateProperties() override;
      void disable(DrmAtomicCommit *commit) override;
  
@@ -10497,8 +10725,9 @@
      };
      Q_ENUM(Transformation)
      Q_DECLARE_FLAGS(Transformations, Transformation)
+-    static Transformations outputTransformToPlaneTransform(OutputTransform transform);
 +
-     static Transformations outputTransformToPlaneTransform(OutputTransform transform);
++    [[nodiscard]] static Transformations outputTransformToPlaneTransform(OutputTransform transform) noexcept;
 +
      enum class PixelBlendMode : uint64_t {
          None,
@@ -10513,23 +10742,15 @@
 +
      std::shared_ptr<DrmFramebuffer> m_current;
 -    QList<std::shared_ptr<DrmFramebufferData>> m_lastBuffers;
-+    std::array<std::shared_ptr<DrmFramebufferData>, BufferHistoryDepth> m_lastBuffers{};
++    std::array<DrmFramebufferData *, BufferHistoryDepth> m_lastBuffers{};
 +    std::size_t m_lastBufferWriteIndex = 0;
  
      QHash<uint32_t, QList<uint64_t>> m_supportedFormats;
      QHash<uint32_t, QList<uint64_t>> m_lowBandwidthFormats;
-@@ -116,6 +130,6 @@ private:
-     QList<QSize> m_sizeHints;
- };
- 
--}
-+} // namespace KWin
- 
- Q_DECLARE_OPERATORS_FOR_FLAGS(KWin::DrmPlane::Transformations)
 
 --- a/src/backends/drm/drm_plane.cpp	2025-10-25 12:37:30.415082082 +0200
 +++ b/src/backends/drm/drm_plane.cpp	2025-10-25 16:21:55.654339086 +0200
-@@ -18,20 +17,22 @@
+@@ -18,20 +17,40 @@
  #include "drm_pointer.h"
  #include "utils/drm_format_helper.h"
  
@@ -10547,6 +10768,24 @@
  namespace KWin
  {
  
++namespace
++{
++
++[[gnu::always_inline, gnu::const]]
++inline constexpr uint64_t toFixed16(int value) noexcept
++{
++    return static_cast<uint64_t>(static_cast<uint32_t>(value)) << 16;
++}
++
++[[gnu::always_inline, gnu::const]]
++inline constexpr int clampCoord(int v, int lo, int hi) noexcept
++{
++    const int tLo = v < lo ? lo : v;
++    return tLo > hi ? hi : tLo;
++}
++
++}
++
  DrmPlane::DrmPlane(DrmGpu *gpu, uint32_t planeId)
      : DrmObject(gpu, planeId, DRM_MODE_OBJECT_PLANE)
 -    , type(this, QByteArrayLiteral("type"), {
@@ -10559,7 +10798,7 @@
      , srcX(this, QByteArrayLiteral("SRC_X"))
      , srcY(this, QByteArrayLiteral("SRC_Y"))
      , srcW(this, QByteArrayLiteral("SRC_W"))
-@@ -42,30 +43,18 @@ DrmPlane::DrmPlane(DrmGpu *gpu, uint32_t
+@@ -42,30 +61,18 @@ DrmPlane::DrmPlane(DrmGpu *gpu, uint32_t
      , crtcH(this, QByteArrayLiteral("CRTC_H"))
      , fbId(this, QByteArrayLiteral("FB_ID"))
      , crtcId(this, QByteArrayLiteral("CRTC_ID"))
@@ -10600,7 +10839,7 @@
      , vmHotspotX(this, QByteArrayLiteral("HOTSPOT_X"))
      , vmHotspotY(this, QByteArrayLiteral("HOTSPOT_Y"))
      , inFenceFd(this, QByteArrayLiteral("IN_FENCE_FD"))
-@@ -82,12 +71,14 @@ bool DrmPlane::init()
+@@ -82,12 +89,14 @@ bool DrmPlane::init()
  
  bool DrmPlane::updateProperties()
  {
@@ -10617,13 +10856,18 @@
      type.update(props);
      srcX.update(props);
      srcY.update(props);
-@@ -113,118 +104,250 @@ bool DrmPlane::updateProperties()
+@@ -112,119 +121,262 @@ bool DrmPlane::updateProperties()
+     inFormatsForTearing.update(props);
      zpos.update(props);
  
-     if (!type.isValid() || !srcX.isValid() || !srcY.isValid() || !srcW.isValid() || !srcH.isValid()
+-    if (!type.isValid() || !srcX.isValid() || !srcY.isValid() || !srcW.isValid() || !srcH.isValid()
 -        || !crtcX.isValid() || !crtcY.isValid() || !crtcW.isValid() || !crtcH.isValid() || !fbId.isValid()) {
 -        qCWarning(KWIN_DRM) << "Failed to update the basic plane properties";
-+        || !crtcX.isValid() || !crtcY.isValid() || !crtcW.isValid() || !crtcH.isValid() || !fbId.isValid()) [[unlikely]] {
++    const bool basicPropsValid = type.isValid() && srcX.isValid() && srcY.isValid() &&
++                                  srcW.isValid() && srcH.isValid() && crtcX.isValid() &&
++                                  crtcY.isValid() && crtcW.isValid() && crtcH.isValid() &&
++                                  fbId.isValid();
++    if (!basicPropsValid) [[unlikely]] {
 +        qCWarning(KWIN_DRM) << "Failed to update the basic plane properties for plane" << id();
          return false;
      }
@@ -10682,13 +10926,20 @@
 +        const auto formatInfo = FormatInfo::get(it.key());
 +        if (formatInfo && formatInfo->bitsPerPixel <= 32) [[likely]] {
 +            QList<uint64_t> modifiers = it.value();
-+            if (!modifiers.contains(DRM_FORMAT_MOD_INVALID)) {
++            bool hasInvalid = false;
++            for (const uint64_t mod : modifiers) {
++                if (mod == DRM_FORMAT_MOD_INVALID) {
++                    hasInvalid = true;
++                    break;
++                }
++            }
++            if (!hasInvalid) {
 +                modifiers.append(DRM_FORMAT_MOD_INVALID);
 +            }
 +            std::sort(modifiers.begin(), modifiers.end());
 +            const auto newEnd = std::unique(modifiers.begin(), modifiers.end());
 +            modifiers.erase(newEnd, modifiers.end());
-+            m_lowBandwidthFormats.insert(it.key(), modifiers);
++            m_lowBandwidthFormats.insert(it.key(), std::move(modifiers));
          }
      }
  
@@ -10746,7 +10997,14 @@
 +    drmModeFormatModifierIterator iterator{};
 +    while (drmModeFormatModifierBlobIterNext(blob, &iterator)) {
 +        auto &mods = m_supportedFormats[iterator.fmt];
-+        if (!mods.contains(iterator.mod)) [[likely]] {
++        bool found = false;
++        for (const uint64_t m : mods) {
++            if (m == iterator.mod) {
++                found = true;
++                break;
++            }
++        }
++        if (!found) [[likely]] {
 +            mods.append(iterator.mod);
 +        }
 +    }
@@ -10762,7 +11020,14 @@
 +    drmModeFormatModifierIterator iterator{};
 +    while (drmModeFormatModifierBlobIterNext(blob, &iterator)) {
 +        auto &mods = m_supportedTearingFormats[iterator.fmt];
-+        if (!mods.contains(iterator.mod)) [[likely]] {
++        bool found = false;
++        for (const uint64_t m : mods) {
++            if (m == iterator.mod) {
++                found = true;
++                break;
++            }
++        }
++        if (!found) [[likely]] {
 +            mods.append(iterator.mod);
 +        }
 +    }
@@ -10770,7 +11035,9 @@
 +
 +void DrmPlane::refreshSizeHints(drmModePropertyBlobPtr blob)
 +{
-+    if (!blob || !blob->data || blob->length < sizeof(uint16_t) * 2 || (blob->length % (sizeof(uint16_t) * 2)) != 0) [[unlikely]] {
++    const bool invalidBlob = !blob || !blob->data || blob->length < sizeof(uint16_t) * 2 ||
++                             (blob->length % (sizeof(uint16_t) * 2)) != 0;
++    if (invalidBlob) [[unlikely]] {
 +        if (blob && blob->data && blob->length > 0) {
 +            qCWarning(KWIN_DRM) << "SIZE_HINTS blob has invalid length" << blob->length << "for plane" << id();
 +        }
@@ -10786,7 +11053,14 @@
 +    m_sizeHints.reserve(static_cast<int>(hintCount));
 +    for (size_t i = 0; i < hintCount; ++i) {
 +        const QSize size(hints[i * 2], hints[i * 2 + 1]);
-+        if (!m_sizeHints.contains(size)) [[likely]] {
++        bool found = false;
++        for (const QSize &existing : m_sizeHints) {
++            if (existing == size) {
++                found = true;
++                break;
++            }
++        }
++        if (!found) [[likely]] {
 +            m_sizeHints.append(size);
 +        }
 +    }
@@ -10799,80 +11073,55 @@
 -    commit->addProperty(srcY, src.y() << 16);
 -    commit->addProperty(srcW, src.width() << 16);
 -    commit->addProperty(srcH, src.height() << 16);
-+    if (!commit) {
-+        return;
-+    }
-+
-+    const int dstW = dst.width();
-+    const int dstH = dst.height();
-+    if (dstW <= 0 || dstH <= 0) [[unlikely]] {
++    const bool needsDisable = (dst.width() <= 0) || (dst.height() <= 0);
++    if (needsDisable) [[unlikely]] {
 +        disable(commit);
 +        return;
 +    }
 +
-+    // Clamp to KMS coordinate range; avoid UB or out-of-range values.
-+    constexpr int maxCoord = 32767;
-+    constexpr int minCoord = -32768;
++    constexpr int kMaxCoord = 32767;
++    constexpr int kMinCoord = -32768;
 +
-+    int srcXVal = src.x();
-+    int srcYVal = src.y();
-+    int srcWVal = src.width();
-+    int srcHVal = src.height();
++    int clampedSrcX, clampedSrcY, clampedSrcW, clampedSrcH;
 +
-+    if (srcWVal <= 0 || srcHVal <= 0) [[unlikely]] {
-+        disable(commit);
-+        return;
-+    }
++#if defined(__SSE4_1__)
++    alignas(16) const int32_t srcValues[4] = {src.x(), src.y(), src.width(), src.height()};
++    const __m128i vals = _mm_load_si128(reinterpret_cast<const __m128i *>(srcValues));
++    const __m128i minVals = _mm_setr_epi32(kMinCoord, kMinCoord, 0, 0);
++    const __m128i maxVals = _mm_set1_epi32(kMaxCoord);
++    const __m128i clamped = _mm_max_epi32(_mm_min_epi32(vals, maxVals), minVals);
++    alignas(16) int32_t clampedValues[4];
++    _mm_store_si128(reinterpret_cast<__m128i *>(clampedValues), clamped);
++    clampedSrcX = clampedValues[0];
++    clampedSrcY = clampedValues[1];
++    clampedSrcW = clampedValues[2];
++    clampedSrcH = clampedValues[3];
++#else
++    clampedSrcX = clampCoord(src.x(), kMinCoord, kMaxCoord);
++    clampedSrcY = clampCoord(src.y(), kMinCoord, kMaxCoord);
++    clampedSrcW = clampCoord(src.width(), 0, kMaxCoord);
++    clampedSrcH = clampCoord(src.height(), 0, kMaxCoord);
++#endif
 +
-+    if (srcXVal < minCoord) {
-+        srcXVal = minCoord;
-+    } else if (srcXVal > maxCoord) {
-+        srcXVal = maxCoord;
-+    }
-+
-+    if (srcYVal < minCoord) {
-+        srcYVal = minCoord;
-+    } else if (srcYVal > maxCoord) {
-+        srcYVal = maxCoord;
-+    }
-+
-+    if (srcWVal < 0) {
-+        srcWVal = 0;
-+    } else if (srcWVal > maxCoord) {
-+        srcWVal = maxCoord;
-+    }
-+
-+    if (srcHVal < 0) {
-+        srcHVal = 0;
-+    } else if (srcHVal > maxCoord) {
-+        srcHVal = maxCoord;
-+    }
-+
-+    const auto toFixed16 = [](int value) noexcept -> uint64_t {
-+        return static_cast<uint64_t>(static_cast<uint32_t>(value) << 16);
-+    };
-+
-+    commit->addProperty(srcX, toFixed16(srcXVal));
-+    commit->addProperty(srcY, toFixed16(srcYVal));
-+    commit->addProperty(srcW, toFixed16(srcWVal));
-+    commit->addProperty(srcH, toFixed16(srcHVal));
++    commit->addProperty(srcX, toFixed16(clampedSrcX));
++    commit->addProperty(srcY, toFixed16(clampedSrcY));
++    commit->addProperty(srcW, toFixed16(clampedSrcW));
++    commit->addProperty(srcH, toFixed16(clampedSrcH));
 +
      commit->addProperty(crtcX, dst.x());
      commit->addProperty(crtcY, dst.y());
--    commit->addProperty(crtcW, dst.width());
--    commit->addProperty(crtcH, dst.height());
-+    commit->addProperty(crtcW, dstW);
-+    commit->addProperty(crtcH, dstH);
+     commit->addProperty(crtcW, dst.width());
+     commit->addProperty(crtcH, dst.height());
  }
  
 -bool DrmPlane::isCrtcSupported(int pipeIndex) const
 +bool DrmPlane::isCrtcSupported(int pipeIndex) const noexcept
  {
 -    return (m_possibleCrtcs & (1 << pipeIndex));
-+    if (pipeIndex < 0 || pipeIndex >= static_cast<int>(sizeof(uint32_t) * 8)) [[unlikely]] {
++    if (pipeIndex < 0 || pipeIndex >= 32) [[unlikely]] {
 +        return false;
 +    }
-+    return (m_possibleCrtcs & (1u << pipeIndex)) != 0u;
++    return (m_possibleCrtcs & (1u << static_cast<unsigned>(pipeIndex))) != 0u;
  }
  
 -QHash<uint32_t, QList<uint64_t>> DrmPlane::lowBandwidthFormats() const
@@ -10903,7 +11152,7 @@
 +void DrmPlane::setCurrentBuffer(const std::shared_ptr<DrmFramebuffer> &buffer)
  {
 -    if (m_current == b) {
-+    if (m_current == buffer) [[likely]] {
++    if (m_current.get() == buffer.get()) [[likely]] {
          return;
      }
  
@@ -10921,21 +11170,22 @@
 +        return;
 +    }
 +
++    DrmFramebufferData *rawPtr = data.get();
 +    bool found = false;
-+    for (const auto &cached : m_lastBuffers) {
-+        if (cached == data) {
++    for (std::size_t i = 0; i < BufferHistoryDepth; ++i) {
++        if (m_lastBuffers[i] == rawPtr) {
 +            found = true;
 +            break;
 +        }
 +    }
 +
 +    if (!found) [[likely]] {
-+        m_lastBuffers[m_lastBufferWriteIndex] = data;
++        m_lastBuffers[m_lastBufferWriteIndex] = rawPtr;
 +        m_lastBufferWriteIndex = (m_lastBufferWriteIndex + 1) % BufferHistoryDepth;
      }
  }
  
-@@ -232,18 +355,18 @@ void DrmPlane::disable(DrmAtomicCommit *
+@@ -232,18 +384,18 @@ void DrmPlane::disable(DrmAtomicCommit *
  {
      commit->addProperty(crtcId, 0);
      commit->addBuffer(this, nullptr, nullptr);
@@ -10950,13 +11200,14 @@
      }
  }
  
- DrmPlane::Transformations DrmPlane::outputTransformToPlaneTransform(OutputTransform transform)
+-DrmPlane::Transformations DrmPlane::outputTransformToPlaneTransform(OutputTransform transform)
++DrmPlane::Transformations DrmPlane::outputTransformToPlaneTransform(OutputTransform transform) noexcept
  {
 -    // note that drm transformations are counter clockwise
      switch (transform.kind()) {
      case OutputTransform::Kind::Normal:
          return Transformation::Rotate0;
-@@ -265,15 +388,16 @@ DrmPlane::Transformations DrmPlane::outp
+@@ -265,15 +417,16 @@ DrmPlane::Transformations DrmPlane::outp
      Q_UNREACHABLE();
  }
  
@@ -15002,55 +15253,34 @@
 
 --- a/src/core/renderloop_p.h	2025-10-06 01:22:20.420848975 +0200
 +++ b/src/core/renderloop_p.h	2025-10-24 01:34:39.090533060 +0200
-@@ -1,62 +1,152 @@
- /*
-+    KWin - the KDE window manager
-+    This file is part of the KDE project.
-     SPDX-FileCopyrightText: 2020 Vlad Zahorodnii <vlad.zahorodnii@kde.org>
--
-     SPDX-License-Identifier: GPL-2.0-or-later
- */
--
- #pragma once
--
- #include "renderbackend.h"
- #include "renderjournal.h"
+@@ -11,8 +13,13 @@
  #include "renderloop.h"
--
+ 
  #include <QBasicTimer>
--
 +#include <QMetaObject>
+ 
 +#include <array>
 +#include <chrono>
 +#include <cstdint>
-+#include <cstring>
  #include <fstream>
 +#include <memory>
  #include <optional>
  
  namespace KWin
- {
--
+@@ -20,43 +27,143 @@ namespace KWin
+ 
  class SurfaceItem;
  class OutputFrame;
 +class Window;
  
 -class KWIN_EXPORT RenderLoopPrivate
--{
--public:
++class VrrStateCache
+ {
+ public:
 -    static RenderLoopPrivate *get(RenderLoop *loop);
 -    explicit RenderLoopPrivate(RenderLoop *q, Output *output);
 -
 -    void dispatch();
-+struct VrrHistoryEntry {
-+    std::chrono::steady_clock::time_point timestamp{};
-+};
- 
--    void delayScheduleRepaint();
--    void scheduleNextRepaint();
--    void scheduleRepaint(std::chrono::nanoseconds lastTargetTimestamp);
-+class VrrStateCache {
-+public:
 +    union State {
 +        struct {
 +            uint8_t hint : 2;
@@ -15060,20 +15290,29 @@
 +            uint8_t reserved : 3;
 +        };
 +        uint8_t raw;
-+        constexpr State() noexcept : raw(0) {}
++        constexpr State() noexcept
++            : raw(0)
++        {
++        }
 +    };
 +    static_assert(sizeof(State) == 1);
 +
-+    void setState(State newState) noexcept {
++    void setState(State newState) noexcept
++    {
 +        m_state = newState.raw;
 +    }
 +
-+    [[nodiscard]] State getState() const noexcept {
++    [[nodiscard]] State getState() const noexcept
++    {
 +        State s;
 +        s.raw = m_state;
 +        return s;
 +    }
  
+-    void delayScheduleRepaint();
+-    void scheduleNextRepaint();
+-    void scheduleRepaint(std::chrono::nanoseconds lastTargetTimestamp);
+-
 -    void notifyFrameDropped();
 -    void notifyFrameCompleted(std::chrono::nanoseconds timestamp, std::optional<RenderTimeSpan> renderTime, PresentationMode mode, OutputFrame *frame);
 -    void notifyVblank(std::chrono::nanoseconds timestamp);
@@ -15081,7 +15320,8 @@
 +    uint8_t m_state{0};
 +};
  
-+class alignas(64) KWIN_EXPORT RenderLoopPrivate {
++class alignas(64) KWIN_EXPORT RenderLoopPrivate
++{
 +public:
      RenderLoop *const q;
      Output *const output;
@@ -15125,10 +15365,13 @@
 +    uint8_t consecutiveErrorCount;
 +    uint8_t vrrStabilityCounter;
 +    uint8_t recentSwitchCount;
-+    uint8_t modeSwitchHistoryIndex;
 +    uint8_t vrrConnectionCount_;
 +
-+    enum class VrrMode : uint8_t { Automatic, Always, Never };
++    enum class VrrMode : uint8_t {
++        Automatic,
++        Always,
++        Never
++    };
 +    VrrMode vrrMode;
 +
 +    PresentationMode presentationMode;
@@ -15144,6 +15387,7 @@
 -    PresentationMode presentationMode = PresentationMode::VSync;
 -    int maxPendingFrameCount = 1;
 +    std::chrono::steady_clock::time_point lastModeSwitch{};
++    std::chrono::steady_clock::time_point oldestSwitchTime{};
 +
 +    VrrStateCache vrrStateCache_{};
 +    bool vrrStateDirty_;
@@ -15155,7 +15399,7 @@
 +    Window *trackedWindow_;
 +    std::array<QMetaObject::Connection, 4> vrrConnections_{};
 +
-+    alignas(64) std::array<VrrHistoryEntry, 8> modeSwitchHistory{};
++    alignas(64) uint64_t modeSwitchBitmap{0};
 +
 +    [[nodiscard]] static RenderLoopPrivate *get(RenderLoop *loop) noexcept;
 +    explicit RenderLoopPrivate(RenderLoop *q, Output *output);
@@ -15179,39 +15423,42 @@
 +    void scheduleRepaint(std::chrono::nanoseconds lastTargetTimestamp);
 +
 +    void notifyFrameDropped();
-+    void notifyFrameCompleted(std::chrono::nanoseconds timestamp, std::optional<RenderTimeSpan> renderTime, PresentationMode mode, OutputFrame *frame);
++    void notifyFrameCompleted(std::chrono::nanoseconds timestamp,
++                              std::optional<RenderTimeSpan> renderTime,
++                              PresentationMode mode,
++                              OutputFrame *frame);
 +    void notifyVblank(std::chrono::nanoseconds timestamp);
  };
  
-+static_assert(offsetof(RenderLoopPrivate, vblankIntervalReciprocal64) == 64, "Cache line 0 boundary must be at 64 bytes");
-+static_assert(offsetof(RenderLoopPrivate, modeSwitchHistory) % 64 == 0, "History must be cache-line aligned");
+-} // namespace KWin
++static_assert(offsetof(RenderLoopPrivate, vblankIntervalReciprocal64) == 64,
++              "Cache line boundary at 64 bytes");
++static_assert(offsetof(RenderLoopPrivate, modeSwitchBitmap) % 64 == 0,
++              "modeSwitchBitmap must be cache-line aligned");
 +
- } // namespace KWin
++}
 
 --- a/src/core/renderloop.h	2025-10-06 01:22:45.992267086 +0200
 +++ b/src/core/renderloop.h	2025-10-06 01:25:37.175248029 +0200
-@@ -1,32 +1,20 @@
+@@ -1,14 +1,14 @@
  /*
--    SPDX-FileCopyrightText: 2020 Vlad Zahorodnii <vlad.zahorodnii@kde.org>
+     SPDX-FileCopyrightText: 2020 Vlad Zahorodnii <vlad.zahorodnii@kde.org>
 -
 -    SPDX-License-Identifier: GPL-2.0-or-later
 +    SPDX-License-Identifier: LGPL-2.1-or-later OR LGPL-3.0-or-later OR LicenseRef-KDE-Accepted-LGPL
  */
 -
  #pragma once
--
+ 
  #include "effect/globals.h"
--
+ 
  #include <QObject>
 +#include <chrono>
 +#include <memory>
  
  namespace KWin
  {
--
- class RenderLoopPrivate;
- class SurfaceItem;
- class Item;
+@@ -19,14 +19,6 @@ class Item;
  class Output;
  class OutputLayer;
  
@@ -15226,7 +15473,7 @@
  class KWIN_EXPORT RenderLoop : public QObject
  {
      Q_OBJECT
-@@ -35,98 +23,35 @@ public:
+@@ -35,93 +27,31 @@ public:
      explicit RenderLoop(Output *output);
      ~RenderLoop() override;
  
@@ -15325,101 +15572,174 @@
      void frameRequested(RenderLoop *loop);
  
  private:
-     std::unique_ptr<RenderLoopPrivate> d;
+@@ -129,4 +59,4 @@ private:
      friend class RenderLoopPrivate;
  };
--
- } // namespace KWin
+ 
+-} // namespace KWin
++}
 
---- a/src/core/renderloop.cpp	2025-10-06 00:43:48.845446299 +0200
-+++ b/src/core/renderloop.cpp	2025-10-06 00:53:34.362910208 +0200
-@@ -1,158 +1,721 @@
- /*
-+    KWin - the KDE window manager
-+    This file is part of the KDE project.
-     SPDX-FileCopyrightText: 2020 Vlad Zahorodnii <vlad.zahorodnii@kde.org>
--
-     SPDX-License-Identifier: GPL-2.0-or-later
- */
--
- #include "renderloop.h"
+--- a/src/core/renderloop.cpp	2025-11-06 00:43:48.845446299 +0200
++++ b/src/core/renderloop.cpp	2025-11-25 00:53:34.362910208 +0200
+@@ -8,151 +11,704 @@
  #include "options.h"
  #include "renderloop_p.h"
  #include "scene/surfaceitem.h"
 +#include "scene/surfaceitem_wayland.h"
-+#include "wayland/surface.h"
  #include "utils/common.h"
++#include "wayland/surface.h"
  #include "window.h"
  #include "workspace.h"
  
-+#include <KSharedConfig>
+-#include <filesystem>
 +#include <KConfigGroup>
++#include <KSharedConfig>
 +
 +#include <QThread>
 +
 +#include <algorithm>
-+#include <cctype>
 +#include <chrono>
-+#include <climits>
-+#include <cmath>
 +#include <cstdint>
-+#include <cstdlib>
 +#include <cstring>
- #include <filesystem>
 +#include <fstream>
 +#include <limits>
 +#include <string>
  
  using namespace std::chrono_literals;
  
+-namespace KWin
 +namespace
 +{
-+constexpr int64_t kNanosecondsPerMillisecond = 1'000'000;
-+constexpr int64_t kPredictionSlackNs = 500'000;
-+constexpr int64_t kMaxFutureLeadNs = static_cast<int64_t>(1) << 40;
-+constexpr uint64_t kPageflipDriftThreshold = 100;
-+constexpr uint64_t kIntervalsClamp = 1'000'000;
-+constexpr uint8_t kVrrVsyncStabilityFrames = 90;
-+constexpr uint8_t kVrrAdaptiveStabilityFrames = 90;
-+constexpr uint16_t kVrrLockoutStableFrames = 180;
-+constexpr auto kVrrControlThreshold = 33ms;
-+constexpr auto kVrrOscillationWindow = 2000ms;
-+constexpr uint8_t kVrrOscillationThreshold = 4;
-+constexpr int kMaxTimerDelayMs = std::numeric_limits<std::int16_t>::max();
-+constexpr int kTripleBufferEnterPct = 82;
-+constexpr int kTripleBufferExitPct = 70;
-+constexpr int kTripleBufferExitFrames = 4;
-+constexpr double kPredictionEmaAlpha = 0.12;
-+constexpr double kPredictionClampMin = 0.5;
-+constexpr double kPredictionClampMax = 1.8;
++
++constexpr int64_t kNsPerMs = 1'000'000;
++constexpr int64_t kNsPerSecond = 1'000'000'000;
++constexpr int64_t kPredictionSlackNs = 200'000;
++constexpr int64_t kMaxFutureLeadNs = int64_t{1} << 34;
++constexpr uint64_t kPageflipDriftThreshold = 32;
++constexpr uint64_t kIntervalsClamp = 50'000;
++
++constexpr uint8_t kVrrVsyncStabilityFrames = 6;
++constexpr uint8_t kVrrAdaptiveStabilityFrames = 3;
++constexpr uint16_t kVrrLockoutStableFrames = 20;
++constexpr auto kVrrControlThreshold = 25ms;
++constexpr auto kVrrOscillationWindow = 250ms;
++constexpr uint8_t kVrrOscillationThreshold = 8;
++
++constexpr int kMaxTimerDelayMs = 16000;
++constexpr int kTripleBufferEnterPct = 78;
++constexpr int kTripleBufferExitPct = 60;
++constexpr int kTripleBufferExitFrames = 2;
++
 +constexpr int kMinVrrRefreshMhz = 48'000;
 +constexpr int kMaxVrrRefreshMhz = 165'000;
-+constexpr int kVrrTargetPercentile = 95;
-+constexpr uint8_t kStarvationRecoveryFrames = 60;
-+constexpr uint8_t kMaxConsecutiveErrors = 5;
-+constexpr int kMaxErrorBackoffMs = 1000;
++constexpr int kVrrTargetPercentile = 98;
++
++constexpr uint16_t kStarvationRecoveryFrames = 16;
++constexpr uint8_t kMaxConsecutiveErrors = 2;
++constexpr int kMaxErrorBackoffMs = 250;
++
++constexpr int64_t kTimerRescheduleThresholdNs = 80'000;
++
++[[gnu::always_inline, gnu::const]]
++inline constexpr int64_t branchlessAbs(int64_t v) noexcept
++{
++    const int64_t mask = v >> 63;
++    return (v ^ mask) - mask;
 +}
 +
- namespace KWin
++[[gnu::always_inline, gnu::const]]
++inline constexpr int64_t branchlessMax(int64_t a, int64_t b) noexcept
++{
++    const int64_t diff = a - b;
++    const int64_t mask = diff >> 63;
++    return a - (diff & mask);
++}
++
++[[gnu::always_inline, gnu::const]]
++inline constexpr int64_t branchlessMin(int64_t a, int64_t b) noexcept
++{
++    const int64_t diff = b - a;
++    const int64_t mask = diff >> 63;
++    return a + (diff & mask);
++}
++
++[[gnu::always_inline, gnu::const]]
++inline constexpr int64_t branchlessClamp(int64_t v, int64_t lo, int64_t hi) noexcept
++{
++    const int64_t tLo = branchlessMax(v, lo);
++    return branchlessMin(tLo, hi);
++}
++
++[[gnu::always_inline, gnu::const]]
++inline constexpr uint64_t branchlessMaxU(uint64_t a, uint64_t b) noexcept
++{
++    return (a > b) ? a : b;
++}
++
++[[gnu::always_inline, gnu::const]]
++inline constexpr uint64_t branchlessMinU(uint64_t a, uint64_t b) noexcept
  {
-+static const bool s_printDebugInfo = qEnvironmentVariableIntValue("KWIN_LOG_PERFORMANCE_DATA") != 0;
++    return (a < b) ? a : b;
++}
  
 -RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop *loop)
-+RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop *loop) noexcept
++[[gnu::always_inline, gnu::const]]
++inline constexpr uint64_t branchlessClampU(uint64_t v, uint64_t lo, uint64_t hi) noexcept
  {
 -    return loop->d.get();
-+    return loop ? loop->d.get() : nullptr;
++    const uint64_t tLo = branchlessMaxU(v, lo);
++    return branchlessMinU(tLo, hi);
  }
  
 -static const bool s_printDebugInfo = qEnvironmentVariableIntValue("KWIN_LOG_PERFORMANCE_DATA") != 0;
--
++[[gnu::always_inline, gnu::hot, gnu::const]]
++inline uint64_t fastDiv64(uint64_t n, uint64_t recip, uint8_t shift) noexcept
++{
++#if defined(__BMI2__) && defined(__x86_64__)
++    uint64_t hi, lo;
++    __asm__ __volatile__("mulxq %3, %0, %1"
++                         : "=r"(lo), "=r"(hi)
++                         : "d"(n), "r"(recip)
++                         :);
++    if (__builtin_constant_p(shift)) {
++        if (shift == 63) {
++            return (hi << 1) | (lo >> 63);
++        } else if (shift >= 64) {
++            return hi >> (shift - 64);
++        } else {
++            return (hi << (64 - shift)) | (lo >> shift);
++        }
++    }
++    const uint8_t lowShift = shift & 63;
++    const uint8_t highShift = 64 - lowShift;
++    const bool useHigh = shift >= 64;
++    const uint64_t lowResult = (hi << highShift) | (lo >> lowShift);
++    const uint64_t highResult = hi >> (shift - 64 * useHigh);
++    return useHigh ? highResult : lowResult;
++#else
++    return static_cast<uint64_t>((static_cast<__uint128_t>(n) * recip) >> shift);
++#endif
++}
++
++}
++
++namespace KWin
++{
++
++static const bool s_debugEnabled = qEnvironmentVariableIntValue("KWIN_LOG_PERFORMANCE_DATA") != 0;
++
++RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop *loop) noexcept
++{
++    return loop ? loop->d.get() : nullptr;
++}
+ 
  RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, Output *output)
      : q(q)
      , output(output)
 +    , pendingFrameCount(0)
 +    , inhibitCount(0)
 +    , refreshRate(60'000)
-+    , cachedVblankIntervalNs(1'000'000'000'000ull / 60'000ull)
++    , cachedVblankIntervalNs(1'000'000'000'000ULL / 60'000ULL)
 +    , vblankIntervalReciprocal64(0)
 +    , maxPendingFrameCount(1)
 +    , scheduledTimerMs(-1)
@@ -15435,7 +15755,6 @@
 +    , consecutiveErrorCount(0)
 +    , vrrStabilityCounter(0)
 +    , recentSwitchCount(0)
-+    , modeSwitchHistoryIndex(0)
 +    , vrrConnectionCount_(0)
 +    , vrrMode(VrrMode::Automatic)
 +    , presentationMode(PresentationMode::VSync)
@@ -15450,8 +15769,9 @@
 +{
 +    updateReciprocal();
 +    initializeVrrCapabilities();
-+    lastModeSwitch = std::chrono::steady_clock::now();
-+    lastPresentationTimestamp = std::chrono::steady_clock::now().time_since_epoch();
++    const auto now = std::chrono::steady_clock::now();
++    lastModeSwitch = now;
++    lastPresentationTimestamp = now.time_since_epoch();
 +}
 +
 +RenderLoopPrivate::~RenderLoopPrivate()
@@ -15461,7 +15781,8 @@
 +
 +void RenderLoopPrivate::updateReciprocal() noexcept
 +{
-+    if (cachedVblankIntervalNs == 0) [[unlikely]] {
++    const uint64_t interval = cachedVblankIntervalNs;
++    if (__builtin_expect(interval == 0, 0)) {
 +        vblankIntervalReciprocal64 = 0;
 +        reciprocalShift64 = 0;
 +        tripleBufferEnterThresholdNs = 0;
@@ -15470,103 +15791,94 @@
 +        return;
 +    }
 +
-+    if (cachedVblankIntervalNs < (1ull << 32)) [[likely]] {
-+        constexpr uint8_t shift64 = 63;
-+        const __uint128_t numerator = static_cast<__uint128_t>(1) << shift64;
-+        const __uint128_t result = (numerator + cachedVblankIntervalNs - 1) / cachedVblankIntervalNs;
-+        vblankIntervalReciprocal64 = static_cast<uint64_t>(result);
-+        reciprocalShift64 = shift64;
-+    } else {
-+        vblankIntervalReciprocal64 = 0;
-+        reciprocalShift64 = 0;
-+    }
++    constexpr uint8_t shift = 63;
++    const __uint128_t num = __uint128_t{1} << shift;
++    vblankIntervalReciprocal64 = static_cast<uint64_t>((num + interval - 1) / interval);
++    reciprocalShift64 = shift;
 +
-+    tripleBufferEnterThresholdNs = static_cast<int64_t>((cachedVblankIntervalNs * kTripleBufferEnterPct) / 100);
-+    tripleBufferExitThresholdNs = static_cast<int64_t>((cachedVblankIntervalNs * kTripleBufferExitPct) / 100);
++    tripleBufferEnterThresholdNs = static_cast<int64_t>((interval * kTripleBufferEnterPct) / 100);
++    tripleBufferExitThresholdNs = static_cast<int64_t>((interval * kTripleBufferExitPct) / 100);
 +
-+    const uint64_t maxRefreshIntervalNs = 1'000'000'000'000ull / kMinVrrRefreshMhz;
-+    const uint64_t minRefreshIntervalNs = 1'000'000'000'000ull / kMaxVrrRefreshMhz;
-+    const uint64_t targetIntervalNs = minRefreshIntervalNs +
-+        ((maxRefreshIntervalNs - minRefreshIntervalNs) * (100 - kVrrTargetPercentile)) / 100;
-+    vrrTargetIntervalNs = std::max(targetIntervalNs, cachedVblankIntervalNs);
++    const uint64_t maxIntervalNs = 1'000'000'000'000ULL / kMinVrrRefreshMhz;
++    const uint64_t minIntervalNs = 1'000'000'000'000ULL / kMaxVrrRefreshMhz;
++    const uint64_t range = maxIntervalNs - minIntervalNs;
++    const uint64_t targetNs = minIntervalNs + (range * (100 - kVrrTargetPercentile)) / 100;
++    vrrTargetIntervalNs = branchlessMaxU(targetNs, interval);
 +}
 +
 +void RenderLoopPrivate::initializeVrrCapabilities()
 +{
-+    if (!output) [[unlikely]] {
++    if (__builtin_expect(!output, 0)) {
 +        vrrCapable = 0;
 +        vrrEnabled = 0;
 +        return;
 +    }
-+    const auto capabilities = output->capabilities();
-+    vrrCapable = capabilities.testFlag(Output::Capability::Vrr) ? 1 : 0;
++
++    vrrCapable = output->capabilities().testFlag(Output::Capability::Vrr) ? 1 : 0;
 +
 +    const auto config = KSharedConfig::openConfig(QStringLiteral("kwinrc"));
-+    const auto vrrGroup = config->group(QStringLiteral("VRR"));
-+    const QString policy = vrrGroup.readEntry(QStringLiteral("Policy"), QStringLiteral("Automatic"));
++    const auto group = config->group(QStringLiteral("VRR"));
++    const QString policy = group.readEntry(QStringLiteral("Policy"), QStringLiteral("Automatic"));
 +
-+    if (policy.compare(QStringLiteral("Never"), Qt::CaseInsensitive) == 0) {
++    if (policy.compare(QLatin1String("Never"), Qt::CaseInsensitive) == 0) {
 +        vrrMode = VrrMode::Never;
 +        vrrEnabled = 0;
-+    } else if (policy.compare(QStringLiteral("Always"), Qt::CaseInsensitive) == 0) {
++    } else if (policy.compare(QLatin1String("Always"), Qt::CaseInsensitive) == 0) {
 +        vrrMode = VrrMode::Always;
 +        vrrEnabled = vrrCapable;
 +    } else {
 +        vrrMode = VrrMode::Automatic;
 +        vrrEnabled = vrrCapable;
 +    }
-+
-+    if (vrrEnabled) {
-+        qCInfo(KWIN_CORE) << "VRR enabled for output" << output->name() << "policy:" << policy;
-+    }
 +}
 +
 +void RenderLoopPrivate::connectVrrSignals(Window *window)
- {
-+    if (!window || !vrrEnabled) {
++{
++    if (!window || !vrrEnabled || trackedWindow_ == window) {
 +        return;
 +    }
-+    if (trackedWindow_ == window) {
-+        return;
-+    }
-+    disconnectVrrSignals();
 +
++    disconnectVrrSignals();
++    trackedWindow_ = window;
 +    vrrConnectionCount_ = 0;
-+    auto addConnection = [this](QMetaObject::Connection &&conn) {
-+        if (vrrConnectionCount_ < vrrConnections_.size()) {
-+            vrrConnections_[vrrConnectionCount_++] = std::move(conn);
++
++    auto store = [this](QMetaObject::Connection c) {
++        if (vrrConnectionCount_ < 4) {
++            vrrConnections_[vrrConnectionCount_++] = c;
 +        }
 +    };
 +
-+    addConnection(QObject::connect(window, &QObject::destroyed, q, [this]() {
++    store(QObject::connect(window, &QObject::destroyed, q, [this]() {
 +        trackedWindow_ = nullptr;
 +        disconnectVrrSignals();
 +    }));
 +
-+    trackedWindow_ = window;
-+
-+    addConnection(QObject::connect(window, &Window::fullScreenChanged, q, [this]() {
-+        invalidateVrrState();
-+    }));
-+    addConnection(QObject::connect(window, &Window::outputChanged, q, [this]() {
-+        invalidateVrrState();
++    store(QObject::connect(window, &Window::fullScreenChanged, q, [this]() {
++        vrrStateDirty_ = true;
 +    }));
 +
-+    if (SurfaceItem *surf = window->surfaceItem()) {
-+        if (auto *waylandSurf = qobject_cast<SurfaceItemWayland *>(surf)) {
-+            if (auto *surface = waylandSurf->surface()) {
-+                addConnection(QObject::connect(surface, &SurfaceInterface::presentationModeHintChanged, q, [this]() {
-+                    invalidateVrrState();
++    store(QObject::connect(window, &Window::outputChanged, q, [this]() {
++        vrrStateDirty_ = true;
++    }));
++
++    SurfaceItem *surf = window->surfaceItem();
++    if (surf) {
++        auto *wayland = qobject_cast<SurfaceItemWayland *>(surf);
++        if (wayland) {
++            auto *surface = wayland->surface();
++            if (surface) {
++                store(QObject::connect(surface, &SurfaceInterface::presentationModeHintChanged, q, [this]() {
++                    vrrStateDirty_ = true;
 +                }));
 +            }
 +        }
 +    }
- }
- 
--void RenderLoopPrivate::scheduleNextRepaint()
++}
++
 +void RenderLoopPrivate::disconnectVrrSignals() noexcept
 +{
-+    for (uint8_t i = 0; i < vrrConnectionCount_; ++i) {
++    const uint8_t count = vrrConnectionCount_;
++    for (uint8_t i = 0; i < count; ++i) {
 +        QObject::disconnect(vrrConnections_[i]);
 +    }
 +    vrrConnectionCount_ = 0;
@@ -15574,39 +15886,36 @@
 +}
 +
 +void RenderLoopPrivate::invalidateVrrState() noexcept
- {
--    if (kwinApp()->isTerminating() || compositeTimer.isActive() || preparingNewFrame) {
++{
 +    vrrStateDirty_ = true;
 +}
 +
 +void RenderLoopPrivate::updateVrrState() noexcept
 +{
 +    if (!vrrStateDirty_) {
-         return;
-     }
--    scheduleRepaint(nextPresentationTimestamp);
++        return;
++    }
++    vrrStateDirty_ = false;
 +
-+    VrrStateCache::State newState{};
-+
-+    if (vrrEnabled && vrrCapable) [[unlikely]] {
-+        Workspace *const ws = workspace();
-+        if (ws && output) [[likely]] {
-+            Window *const activeWindow = ws->activeWindow();
-+
-+            if (activeWindow) [[likely]] {
-+                connectVrrSignals(activeWindow);
-+                newState.isOnOutput = activeWindow->isOnOutput(output) ? 1 : 0;
-+
-+                if (newState.isOnOutput) {
-+                    newState.isFullScreen = activeWindow->isFullScreen() ? 1 : 0;
-+                    SurfaceItem *const surfaceItem = activeWindow->surfaceItem();
-+
-+                    if (surfaceItem) [[likely]] {
-+                        if (auto *const waylandItem = qobject_cast<SurfaceItemWayland *>(surfaceItem)) {
-+                            if (auto *const surface = waylandItem->surface()) {
-+                                newState.hint = static_cast<uint8_t>(surface->presentationModeHint()) & 0x3;
-+                                newState.valid = 1;
-+                            }
++    VrrStateCache::State state{};
++    const bool canVrr = static_cast<bool>(vrrEnabled) && static_cast<bool>(vrrCapable);
++    if (canVrr) {
++        Workspace *ws = workspace();
++        Window *active = ws ? ws->activeWindow() : nullptr;
++        if (active && output) {
++            connectVrrSignals(active);
++            const bool onOutput = active->isOnOutput(output);
++            state.isOnOutput = onOutput ? 1 : 0;
++            if (onOutput) {
++                state.isFullScreen = active->isFullScreen() ? 1 : 0;
++                SurfaceItem *surf = active->surfaceItem();
++                if (surf) {
++                    auto *wayland = qobject_cast<SurfaceItemWayland *>(surf);
++                    if (wayland) {
++                        auto *surface = wayland->surface();
++                        if (surface) {
++                            state.hint = static_cast<uint8_t>(surface->presentationModeHint()) & 0x3;
++                            state.valid = 1;
 +                        }
 +                    }
 +                }
@@ -15614,135 +15923,122 @@
 +        }
 +    }
 +
-+    vrrStateCache_.setState(newState);
-+    vrrStateDirty_ = false;
++    vrrStateCache_.setState(state);
 +}
 +
 +void RenderLoopPrivate::recordModeSwitch() noexcept
 +{
 +    const auto now = std::chrono::steady_clock::now();
 +    lastModeSwitch = now;
++    modeSwitchBitmap = (modeSwitchBitmap << 1) | 1;
 +
-+    modeSwitchHistory[modeSwitchHistoryIndex].timestamp = now;
-+    modeSwitchHistoryIndex = (modeSwitchHistoryIndex + 1) & 7;
++    if (oldestSwitchTime.time_since_epoch().count() == 0) {
++        oldestSwitchTime = now;
++    }
 +}
 +
 +bool RenderLoopPrivate::detectVrrOscillation() noexcept
 +{
 +    const auto now = std::chrono::steady_clock::now();
-+    const auto windowStart = now - kVrrOscillationWindow;
++    const auto cutoff = now - kVrrOscillationWindow;
 +
-+    uint8_t activeCount = 0;
-+    for (const auto &entry : modeSwitchHistory) {
-+        if (entry.timestamp.time_since_epoch().count() > 0 && entry.timestamp > windowStart) {
-+            ++activeCount;
++    if (oldestSwitchTime < cutoff) {
++        const auto elapsed = now - oldestSwitchTime;
++        const auto windowCount = elapsed / kVrrOscillationWindow;
++        const uint64_t shifts = static_cast<uint64_t>(windowCount);
++        if (shifts >= 64) {
++            modeSwitchBitmap = 0;
++            oldestSwitchTime = {};
++        } else {
++            modeSwitchBitmap >>= shifts;
++            oldestSwitchTime = cutoff;
 +        }
 +    }
-+    recentSwitchCount = activeCount;
 +
-+    if (activeCount >= kVrrOscillationThreshold) [[unlikely]] {
-+        if (!vrrOscillationLockout) {
-+            qCInfo(KWIN_CORE) << "VRR oscillation detected (" << static_cast<int>(activeCount)
-+                              << " switches in" << kVrrOscillationWindow.count() << "ms), entering lockout mode";
-+            vrrOscillationLockout = 1;
-+            stableModeFrameCount = 0;
-+            lastStableMode = PresentationMode::VSync;
-+            return true;
-+        }
++    const auto count = static_cast<uint8_t>(__builtin_popcountll(modeSwitchBitmap));
++    recentSwitchCount = count;
++
++    if (__builtin_expect(count >= kVrrOscillationThreshold && !vrrOscillationLockout, 0)) {
++        vrrOscillationLockout = 1;
++        stableModeFrameCount = 0;
++        lastStableMode = presentationMode;
++        return true;
 +    }
 +    return false;
 +}
 +
 +PresentationMode RenderLoopPrivate::selectPresentationMode() noexcept
 +{
-+    if (!vrrEnabled || !vrrCapable) [[likely]] {
++    const bool canVrr = static_cast<bool>(vrrEnabled) && static_cast<bool>(vrrCapable);
++    if (__builtin_expect(!canVrr, 0)) {
 +        return PresentationMode::VSync;
 +    }
 +
-+    const VrrStateCache::State state = vrrStateCache_.getState();
-+    if (!state.valid) [[unlikely]] {
++    const auto state = vrrStateCache_.getState();
++    if (__builtin_expect(!state.valid, 0)) {
 +        return PresentationMode::VSync;
 +    }
 +
 +    const auto hint = static_cast<PresentationModeHint>(state.hint);
 +
-+    if (vrrOscillationLockout) [[unlikely]] {
-+        const PresentationMode targetMode = (vrrMode == VrrMode::Always && hint != PresentationModeHint::VSync)
-+            ? PresentationMode::AdaptiveSync
-+            : PresentationMode::VSync;
-+
-+        if (presentationMode == targetMode) {
-+            ++stableModeFrameCount;
-+            if (stableModeFrameCount >= kVrrLockoutStableFrames) {
-+                vrrOscillationLockout = 0;
-+                stableModeFrameCount = 0;
-+                qCInfo(KWIN_CORE) << "VRR lockout released after" << kVrrLockoutStableFrames << "stable frames";
-+            }
-+        } else {
++    if (__builtin_expect(vrrOscillationLockout, 0)) {
++        const bool wantsAdaptive = (vrrMode == VrrMode::Always) && (hint != PresentationModeHint::VSync);
++        const auto target = wantsAdaptive ? PresentationMode::AdaptiveSync : PresentationMode::VSync;
++        stableModeFrameCount = (presentationMode == target) ? stableModeFrameCount + 1 : 0;
++        if (stableModeFrameCount >= kVrrLockoutStableFrames) {
++            vrrOscillationLockout = 0;
 +            stableModeFrameCount = 0;
 +        }
 +        return lastStableMode;
 +    }
 +
-+    if (vrrMode == VrrMode::Always) [[unlikely]] {
-+        if (hint == PresentationModeHint::Async) [[unlikely]] {
++    if (vrrMode == VrrMode::Always) {
++        if (hint == PresentationModeHint::Async) {
 +            return PresentationMode::AdaptiveAsync;
 +        }
-+        if (hint != PresentationModeHint::VSync) [[likely]] {
-+            return PresentationMode::AdaptiveSync;
-+        }
++        return (hint != PresentationModeHint::VSync) ? PresentationMode::AdaptiveSync : PresentationMode::VSync;
++    }
++
++    if (__builtin_expect(!state.isOnOutput || !state.isFullScreen, 0)) {
 +        return PresentationMode::VSync;
 +    }
 +
-+    if (!state.isOnOutput || !state.isFullScreen) [[unlikely]] {
-+        return PresentationMode::VSync;
-+    }
-+    if (hint == PresentationModeHint::VSync) [[likely]] {
-+        return PresentationMode::VSync;
-+    }
-+    if (hint == PresentationModeHint::Async) [[unlikely]] {
++    if (hint == PresentationModeHint::Async) {
 +        return PresentationMode::AdaptiveAsync;
++    }
++    if (hint == PresentationModeHint::VSync) {
++        return PresentationMode::VSync;
 +    }
 +    return PresentationMode::AdaptiveSync;
 +}
 +
 +void RenderLoopPrivate::updateFramePrediction(std::chrono::nanoseconds measured) noexcept
-+{
-+    if (measured.count() <= 0) [[unlikely]] {
+ {
++    const int64_t m = measured.count();
++    if (__builtin_expect(m <= 0, 0)) {
 +        return;
 +    }
-+    const double measuredNs = static_cast<double>(measured.count());
-+    const double currentPredictionNs = static_cast<double>(framePrediction.count());
 +
-+    const double newPredictionNs = currentPredictionNs * (1.0 - kPredictionEmaAlpha) + measuredNs * kPredictionEmaAlpha;
-+    const double vblankNs = static_cast<double>(cachedVblankIntervalNs);
-+    double clampedNs = newPredictionNs;
-+    clampedNs = std::max(clampedNs, vblankNs * kPredictionClampMin);
-+    clampedNs = std::min(clampedNs, vblankNs * kPredictionClampMax);
-+
-+    framePrediction = std::chrono::nanoseconds(static_cast<int64_t>(clampedNs));
-+}
-+
-+void RenderLoopPrivate::scheduleNextRepaint()
-+{
-+    const bool shouldSchedule = !kwinApp()->isTerminating() &&
-+                                 !compositeTimer.isActive() &&
-+                                 !preparingNewFrame;
-+    if (__builtin_expect(shouldSchedule, 1)) [[likely]] {
-+        scheduleRepaint(nextPresentationTimestamp);
-+    }
-+}
-+
-+[[gnu::always_inline, gnu::hot]]
-+static inline uint64_t fastDivideByVblank(uint64_t numerator,
-+                                          uint64_t reciprocal64,
-+                                          uint8_t shift64) noexcept
-+{
-+    const __uint128_t product = static_cast<__uint128_t>(numerator) * reciprocal64;
-+    return static_cast<uint64_t>(product >> shift64);
++    const int64_t cur = framePrediction.count();
++    const int64_t updated = (cur * 192 + m * 64) >> 8;
++    const int64_t vblank = static_cast<int64_t>(cachedVblankIntervalNs);
++    const int64_t lo = vblank >> 2;
++    const int64_t hi = vblank + (vblank >> 1);
++    framePrediction = std::chrono::nanoseconds{branchlessClamp(updated, lo, hi)};
  }
  
- void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimestamp)
+ void RenderLoopPrivate::scheduleNextRepaint()
+ {
+-    if (kwinApp()->isTerminating() || compositeTimer.isActive() || preparingNewFrame) {
++    const bool blocked = kwinApp()->isTerminating() || compositeTimer.isActive() || preparingNewFrame;
++    if (__builtin_expect(blocked, 0)) {
+         return;
+     }
+     scheduleRepaint(nextPresentationTimestamp);
+ }
+ 
+-void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimestamp)
++void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTarget)
  {
 -    pendingReschedule = false;
 -    const std::chrono::nanoseconds vblankInterval(1'000'000'000'000ull / refreshRate);
@@ -15768,98 +16064,80 @@
 -        if (pageflipsInAdvance > 1) {
 -            // immediately switch to triple buffering when needed
 -            wasTripleBuffering = true;
-+    if (q->thread() != QThread::currentThread()) {
-+        QMetaObject::invokeMethod(q, [this, lastTargetTimestamp]() {
-+            scheduleRepaint(lastTargetTimestamp);
++    if (__builtin_expect(q->thread() != QThread::currentThread(), 0)) {
++        QMetaObject::invokeMethod(q, [this, lastTarget]() {
++            scheduleRepaint(lastTarget);
 +        }, Qt::QueuedConnection);
 +        return;
 +    }
 +
 +    pendingReschedule = 0;
-+    const uint64_t vblankIntervalNs = cachedVblankIntervalNs;
-+    if (vblankIntervalNs == 0) [[unlikely]] {
++
++    const uint64_t vblankNs = cachedVblankIntervalNs;
++    if (__builtin_expect(vblankNs == 0, 0)) {
 +        return;
 +    }
 +
 +    const int64_t nowNs = std::chrono::steady_clock::now().time_since_epoch().count();
 +    int64_t lastPresNs = lastPresentationTimestamp.count();
 +
-+    if (lastPresNs <= 0 || (nowNs - lastPresNs) > 5'000'000'000ll) [[unlikely]] {
++    const bool staleTime = (lastPresNs <= 0) || ((nowNs - lastPresNs) > 3 * kNsPerSecond);
++    if (__builtin_expect(staleTime, 0)) {
 +        lastPresNs = nowNs;
-+        lastPresentationTimestamp = std::chrono::nanoseconds(nowNs);
++        lastPresentationTimestamp = std::chrono::nanoseconds{nowNs};
 +    }
 +
-+    const int64_t predictedRenderNs = (framePrediction.count() > 0)
-+        ? framePrediction.count()
-+        : renderJournal.result().count();
-+
-+    const int64_t safetyNs = safetyMargin.count();
-+    const int64_t vblankSigned = static_cast<int64_t>(vblankIntervalNs);
-+    const int64_t maxCompositeNs = vblankSigned * 2;
-+    const int64_t baseCompositeNs = predictedRenderNs + safetyNs + kPredictionSlackNs;
-+    int64_t expectedCompositeNs = baseCompositeNs;
-+    expectedCompositeNs = std::max(expectedCompositeNs, int64_t{0});
-+    expectedCompositeNs = std::min(expectedCompositeNs, maxCompositeNs);
++    const int64_t predNs = framePrediction.count() > 0 ? framePrediction.count() : renderJournal.result().count();
++    const int64_t vblankSigned = static_cast<int64_t>(vblankNs);
++    const int64_t rawComposite = predNs + safetyMargin.count() + kPredictionSlackNs;
++    const int64_t compositeNs = branchlessClamp(rawComposite, int64_t{0}, vblankSigned << 1);
 +
 +    updateVrrState();
 +    const PresentationMode targetMode = selectPresentationMode();
 +
-+    const bool shouldCheckOscillation = (++oscillationCheckCounter_ >= 8);
-+    if (shouldCheckOscillation) {
-+        oscillationCheckCounter_ = 0;
-+    }
-+
-+    if (targetMode != presentationMode) [[unlikely]] {
-+        const uint8_t threshold = (targetMode == PresentationMode::VSync)
-+            ? kVrrVsyncStabilityFrames
-+            : kVrrAdaptiveStabilityFrames;
-+
-+        if (vrrStabilityCounter >= threshold) {
++    if (__builtin_expect(targetMode != presentationMode, 0)) {
++        const uint8_t thresh = (targetMode == PresentationMode::VSync) ? kVrrVsyncStabilityFrames : kVrrAdaptiveStabilityFrames;
++        ++vrrStabilityCounter;
++        if (vrrStabilityCounter >= thresh) {
 +            presentationMode = targetMode;
 +            lastStableMode = targetMode;
 +            vrrStabilityCounter = 0;
 +            starvationRecoveryCounter = 0;
 +            recordModeSwitch();
-+            if (shouldCheckOscillation) {
++            oscillationCheckCounter_ = (oscillationCheckCounter_ + 1) & 15;
++            if (oscillationCheckCounter_ == 0) {
 +                detectVrrOscillation();
 +            }
-+            qCDebug(KWIN_CORE) << "Presentation mode changed to" << static_cast<int>(targetMode);
-+        } else {
-+            ++vrrStabilityCounter;
 +        }
 +    } else {
 +        vrrStabilityCounter = 0;
 +    }
 +
 +    int64_t nextPresNs;
++    const bool isVSync = presentationMode == PresentationMode::VSync;
 +
-+    if (presentationMode == PresentationMode::VSync) [[likely]] {
++    if (__builtin_expect(isVSync, 0)) {
 +        const int64_t sinceLastNs = nowNs - lastPresNs;
 +        uint64_t flipsSince = 0;
-+
-+        if (sinceLastNs > 0 && vblankIntervalReciprocal64 != 0) [[likely]] {
-+            flipsSince = fastDivideByVblank(static_cast<uint64_t>(sinceLastNs),
-+                                            vblankIntervalReciprocal64,
-+                                            reciprocalShift64);
++        if (sinceLastNs > 0 && vblankIntervalReciprocal64 != 0) {
++            flipsSince = fastDiv64(static_cast<uint64_t>(sinceLastNs), vblankIntervalReciprocal64, reciprocalShift64);
 +        }
 +
-+        const bool driftDetected = flipsSince > kPageflipDriftThreshold;
-+        if (driftDetected) [[unlikely]] {
-+            const int64_t earlyStart = vblankSigned - 1'000;
-+            if (expectedCompositeNs < earlyStart) {
-+                expectedCompositeNs = earlyStart;
-+            }
++        const int64_t earlyStart = vblankSigned - 500;
++        const bool drifted = flipsSince > kPageflipDriftThreshold;
++        const int64_t adjCompositeNs = drifted ? branchlessMax(compositeNs, earlyStart) : compositeNs;
++
++        uint64_t flipsAhead = 1;
++        if (__builtin_expect(adjCompositeNs > vblankSigned, 0)) {
++            const uint64_t need = (static_cast<uint64_t>(adjCompositeNs) + vblankNs - 1) / vblankNs;
++            const uint64_t maxFlips = static_cast<uint64_t>(branchlessMax(maxPendingFrameCount, 1));
++            flipsAhead = branchlessClampU(need, 1, maxFlips);
 +        }
 +
-+        uint64_t flipsInAdvance = 1;
-+        if (expectedCompositeNs > vblankSigned) [[unlikely]] {
-+            const uint64_t need = (static_cast<uint64_t>(expectedCompositeNs) + vblankIntervalNs - 1) / vblankIntervalNs;
-+            const uint64_t maxPending = static_cast<uint64_t>(maxPendingFrameCount > 0 ? maxPendingFrameCount : 1);
-+            flipsInAdvance = std::min(std::max(need, uint64_t{1}), maxPending);
-+        }
++        const bool highLoad = adjCompositeNs > tripleBufferEnterThresholdNs;
++        const bool lowLoad = adjCompositeNs < tripleBufferExitThresholdNs;
 +
-+        const bool highLoad = expectedCompositeNs > tripleBufferEnterThresholdNs;
-+        if (highLoad) [[unlikely]] {
++        if (__builtin_expect(highLoad, 0)) {
 +            wasTripleBuffering = 1;
              doubleBufferingCounter = 0;
 -        } else if (wasTripleBuffering) {
@@ -15869,49 +16147,21 @@
 -            } else if (expectedCompositingTime >= vblankInterval * 0.95) {
 -                // also don't switch back if render times are just barely enough for double buffering
 -                pageflipsInAdvance = 2;
-+            if (flipsInAdvance < 2) {
-+                flipsInAdvance = 2;
-+            }
-+        } else if (wasTripleBuffering) [[unlikely]] {
-+            if (expectedCompositeNs < tripleBufferExitThresholdNs) {
-+                ++doubleBufferingCounter;
-+            } else {
-                 doubleBufferingCounter = 0;
+-                doubleBufferingCounter = 0;
 -                expectedCompositingTime = vblankInterval;
-+            }
-+
-+            if (doubleBufferingCounter >= kTripleBufferExitFrames) {
-+                wasTripleBuffering = 0;
-+            } else if (flipsInAdvance < 2) {
-+                flipsInAdvance = 2;
-+            }
-+        }
-+
-+        uint64_t flipsTarget;
-+        if (__builtin_expect(compositeTimer.isActive(), 0) && nextPresentationTimestamp.count() > 0) [[unlikely]] {
-+            const int64_t deltaNs = nextPresentationTimestamp.count() - lastPresNs;
-+            if (deltaNs > 0) {
-+                const uint64_t num = static_cast<uint64_t>(deltaNs) + vblankIntervalNs / 2;
-+                const uint64_t intervals = num / vblankIntervalNs;
-+                flipsTarget = std::max(intervals, uint64_t{1});
-+                flipsTarget = std::min(flipsTarget, kIntervalsClamp);
-             } else {
+-            } else {
 -                doubleBufferingCounter++;
 -                pageflipsInAdvance = 2;
 -                expectedCompositingTime = vblankInterval;
-+                flipsTarget = 1;
++            flipsAhead = branchlessMaxU(flipsAhead, 2);
++        } else if (__builtin_expect(wasTripleBuffering, 0)) {
++            doubleBufferingCounter = lowLoad ? doubleBufferingCounter + 1 : 0;
++            if (doubleBufferingCounter >= kTripleBufferExitFrames) {
++                wasTripleBuffering = 0;
 +            }
-+        } else {
-+            const int64_t toTargetNs = lastTargetTimestamp.count() - lastPresNs;
-+            uint64_t flipsToTarget = 0;
-+            if (toTargetNs > 0 && vblankIntervalReciprocal64 != 0) [[likely]] {
-+                const uint64_t offset = vblankIntervalNs / 2;
-+                const uint64_t numeratorSafe = (static_cast<uint64_t>(toTargetNs) < (UINT64_MAX - offset))
-+                    ? static_cast<uint64_t>(toTargetNs) + offset
-+                    : UINT64_MAX;
-+                flipsToTarget = fastDivideByVblank(numeratorSafe, vblankIntervalReciprocal64, reciprocalShift64);
++            if (wasTripleBuffering) {
++                flipsAhead = branchlessMaxU(flipsAhead, 2);
              }
-+            flipsTarget = std::max(flipsSince + flipsInAdvance, flipsToTarget + 1);
          }
  
 -        if (compositeTimer.isActive()) {
@@ -15922,18 +16172,29 @@
 -            // unnecessarily drop frames
 -            const uint32_t intervalsSinceLastTimestamp = std::max<int32_t>(std::round((nextPresentationTimestamp - lastPresentationTimestamp).count() / double(vblankInterval.count())), 0);
 -            nextPresentationTimestamp = lastPresentationTimestamp + intervalsSinceLastTimestamp * vblankInterval;
-+        uint64_t tempResult;
-+        if (__builtin_mul_overflow(flipsTarget, vblankIntervalNs, &tempResult)) [[unlikely]] {
-+            nextPresNs = std::numeric_limits<int64_t>::max() - lastPresNs;
++        uint64_t flipsTarget;
++        const bool hasScheduled = compositeTimer.isActive() && (nextPresentationTimestamp.count() > 0);
++
++        if (__builtin_expect(hasScheduled, 0)) {
++            const int64_t delta = nextPresentationTimestamp.count() - lastPresNs;
++            const uint64_t intervals = (delta > 0) ? (static_cast<uint64_t>(delta) + (vblankNs >> 1)) / vblankNs : 1;
++            flipsTarget = branchlessClampU(intervals, 1, kIntervalsClamp);
          } else {
 -            nextPresentationTimestamp = lastPresentationTimestamp + std::max(pageflipsSince + pageflipsInAdvance, pageflipsSinceLastToTarget + 1) * vblankInterval;
-+            nextPresNs = static_cast<int64_t>(tempResult);
-         }
-+
-+        if (__builtin_add_overflow(lastPresNs, nextPresNs, &nextPresNs)) [[unlikely]] {
-+            nextPresNs = std::numeric_limits<int64_t>::max();
++            const int64_t toTargetNs = lastTarget.count() - lastPresNs;
++            uint64_t flipsToTarget = 0;
++            if (toTargetNs > 0 && vblankIntervalReciprocal64 != 0) {
++                const uint64_t adjusted = static_cast<uint64_t>(toTargetNs) + (vblankNs >> 1);
++                flipsToTarget = fastDiv64(adjusted, vblankIntervalReciprocal64, reciprocalShift64);
++            }
++            flipsTarget = branchlessMaxU(flipsSince + flipsAhead, flipsToTarget + 1);
 +        }
 +
++        if (__builtin_expect(flipsTarget > UINT64_MAX / vblankNs, 0)) {
++            nextPresNs = std::numeric_limits<int64_t>::max();
++        } else {
++            nextPresNs = lastPresNs + static_cast<int64_t>(flipsTarget * vblankNs);
+         }
      } else {
 -        wasTripleBuffering = false;
 +        wasTripleBuffering = 0;
@@ -15941,74 +16202,44 @@
 -        if (presentationMode == PresentationMode::Async || presentationMode == PresentationMode::AdaptiveAsync) {
 -            // tearing: pageflips happen ASAP
 -            nextPresentationTimestamp = currentTime;
-+
-+        if (presentationMode == PresentationMode::Async || presentationMode == PresentationMode::AdaptiveAsync) [[unlikely]] {
-+            if (__builtin_add_overflow(nowNs, expectedCompositeNs, &nextPresNs)) [[unlikely]] {
-+                nextPresNs = std::numeric_limits<int64_t>::max();
-+            }
++        const bool isAsync = (presentationMode == PresentationMode::Async) ||
++                             (presentationMode == PresentationMode::AdaptiveAsync);
++        if (__builtin_expect(isAsync, 0)) {
++            nextPresNs = nowNs + compositeNs;
          } else {
 -            // adaptive sync: pageflips happen after one vblank interval
 -            // TODO read minimum refresh rate from the EDID and take it into account here
 -            nextPresentationTimestamp = std::max(currentTime, lastPresentationTimestamp + vblankInterval);
-+            const int64_t targetIntervalNs = static_cast<int64_t>(vrrTargetIntervalNs);
-+            int64_t tentativeNs;
-+            if (__builtin_add_overflow(nowNs, expectedCompositeNs, &tentativeNs)) [[unlikely]] {
-+                tentativeNs = std::numeric_limits<int64_t>::max();
-+            }
-+
-+            const int64_t sinceLastNs = nowNs - lastPresNs;
-+            if (sinceLastNs < targetIntervalNs) [[likely]] {
-+                int64_t minNext;
-+                if (__builtin_add_overflow(lastPresNs, targetIntervalNs, &minNext)) [[unlikely]] {
-+                    minNext = std::numeric_limits<int64_t>::max();
-+                }
-+                nextPresNs = std::max(tentativeNs, minNext);
-+            } else {
-+                nextPresNs = tentativeNs;
-+            }
++            const int64_t targetInterval = static_cast<int64_t>(vrrTargetIntervalNs);
++            const int64_t sinceLast = nowNs - lastPresNs;
++            const int64_t tentative = nowNs + compositeNs;
++            const int64_t minNext = lastPresNs + targetInterval;
++            nextPresNs = (sinceLast < targetInterval) ? branchlessMax(tentative, minNext) : tentative;
 +        }
 +    }
 +
-+    const int64_t clampLower = nowNs;
-+    int64_t clampUpper;
-+    if (__builtin_add_overflow(nowNs, kMaxFutureLeadNs, &clampUpper)) [[unlikely]] {
-+        clampUpper = std::numeric_limits<int64_t>::max();
-+    }
-+    nextPresNs = std::max(nextPresNs, clampLower);
-+    nextPresNs = std::min(nextPresNs, clampUpper);
-+
++    nextPresNs = branchlessMax(nextPresNs, nowNs);
++    nextPresNs = branchlessMin(nextPresNs, nowNs + kMaxFutureLeadNs);
 +    nextPresentationTimestamp = std::chrono::nanoseconds{nextPresNs};
 +
-+    int64_t nextRenderNs;
-+    if (__builtin_sub_overflow(nextPresNs, expectedCompositeNs, &nextRenderNs)) [[unlikely]] {
-+        nextRenderNs = 0;
-+    }
++    const int64_t nextRenderNs = branchlessMax(nextPresNs - compositeNs, int64_t{0});
++    const int64_t delayNs = branchlessMax(nextRenderNs - nowNs, int64_t{0});
 +
-+    int64_t delayNs = nextRenderNs - nowNs;
-+    if (delayNs < 0) {
-+        delayNs = 0;
-+    }
-+
-+    if (__builtin_expect(compositeTimer.isActive(), 1)) [[likely]] {
-+        const int64_t currentTargetNs = scheduledRenderTimestamp.count();
-+        const int64_t diff = std::abs(currentTargetNs - nextRenderNs);
-+        if (diff < 100'000) [[likely]] {
++    if (compositeTimer.isActive()) {
++        const int64_t diff = scheduledRenderTimestamp.count() - nextRenderNs;
++        if (branchlessAbs(diff) < kTimerRescheduleThresholdNs) {
 +            return;
          }
      }
  
 -    const std::chrono::nanoseconds nextRenderTimestamp = nextPresentationTimestamp - expectedCompositingTime;
 -    compositeTimer.start(std::max(0ms, std::chrono::duration_cast<std::chrono::milliseconds>(nextRenderTimestamp - currentTime)), Qt::PreciseTimer, q);
-+    const uint64_t delayNsU64 = static_cast<uint64_t>(delayNs);
-+    const uint64_t safeAdd = (delayNsU64 <= UINT64_MAX - kNanosecondsPerMillisecond)
-+        ? delayNsU64 + kNanosecondsPerMillisecond - 1
-+        : UINT64_MAX;
-+    const int64_t delayMs64 = static_cast<int64_t>(safeAdd / kNanosecondsPerMillisecond);
-+    const int delayMs = static_cast<int>(std::min(delayMs64, static_cast<int64_t>(kMaxTimerDelayMs)));
++    const int64_t delayMs = (delayNs + kNsPerMs - 1) / kNsPerMs;
++    const int clampedMs = static_cast<int>(branchlessMin(delayMs, static_cast<int64_t>(kMaxTimerDelayMs)));
 +
 +    scheduledRenderTimestamp = std::chrono::nanoseconds{nextRenderNs};
-+    scheduledTimerMs = static_cast<int16_t>(delayMs);
-+    compositeTimer.start(delayMs, Qt::PreciseTimer, q);
++    scheduledTimerMs = static_cast<int16_t>(clampedMs);
++    compositeTimer.start(clampedMs, Qt::PreciseTimer, q);
  }
  
 -void RenderLoopPrivate::delayScheduleRepaint()
@@ -16023,22 +16254,18 @@
      Q_ASSERT(pendingFrameCount > 0);
 -    pendingFrameCount--;
 +    --pendingFrameCount;
++    ++consecutiveErrorCount;
  
 -    if (!inhibitCount && pendingReschedule) {
 -        scheduleNextRepaint();
-+    if (consecutiveErrorCount < 255) {
-+        ++consecutiveErrorCount;
-+    }
-+
-+    if (!inhibitCount && pendingReschedule) [[likely]] {
++    if (inhibitCount == 0 && pendingReschedule) {
 +        if (consecutiveErrorCount > kMaxConsecutiveErrors) {
-+            const int exponent = std::min<int>(consecutiveErrorCount - kMaxConsecutiveErrors, 10);
-+            int delay = 2 << exponent;
-+            delay = std::min(delay, kMaxErrorBackoffMs);
-+
-+            const int minDelay = static_cast<int>(cachedVblankIntervalNs / kNanosecondsPerMillisecond);
-+            delay = std::max(delay, minDelay);
-+
++            const int exp = consecutiveErrorCount - kMaxConsecutiveErrors;
++            const int capped = static_cast<int>(branchlessMin(static_cast<int64_t>(exp), int64_t{8}));
++            int delay = 1 << capped;
++            delay = static_cast<int>(branchlessMin(static_cast<int64_t>(delay), static_cast<int64_t>(kMaxErrorBackoffMs)));
++            const int minDelay = static_cast<int>(cachedVblankIntervalNs / kNsPerMs);
++            delay = static_cast<int>(branchlessMax(static_cast<int64_t>(delay), static_cast<int64_t>(minDelay)));
 +            compositeTimer.start(delay, Qt::PreciseTimer, q);
 +        } else {
 +            scheduleNextRepaint();
@@ -16059,41 +16286,44 @@
 -        const bool tearing = mode == PresentationMode::Async || mode == PresentationMode::AdaptiveAsync;
 -        *m_debugOutput << frame->targetPageflipTime().time_since_epoch().count() << "," << timestamp.count() << "," << times.start.time_since_epoch().count() << "," << times.end.time_since_epoch().count()
 -                       << "," << safetyMargin.count() << "," << frame->refreshDuration().count() << "," << (vrr ? 1 : 0) << "," << (tearing ? 1 : 0) << "," << frame->predictedRenderTime().count() << "\n";
-+static void writeDebugOutput(RenderLoopPrivate *d,
-+                             std::optional<RenderTimeSpan> renderTime,
-+                             OutputFrame *frame,
-+                             std::chrono::nanoseconds timestamp,
-+                             PresentationMode mode)
++
++void writeDebug(RenderLoopPrivate *d,
++                std::optional<RenderTimeSpan> rt,
++                OutputFrame *frame,
++                std::chrono::nanoseconds ts,
++                PresentationMode mode)
 +{
 +    if (!d->m_debugOutput) {
-+        if (!d->output) return;
-+
-+        std::string sanitizedName = d->output->name().toStdString();
-+        std::replace_if(sanitizedName.begin(), sanitizedName.end(), [](char c){
-+            return !std::isalnum(static_cast<unsigned char>(c));
-+        }, '_');
-+
-+        d->m_debugOutput = std::fstream("kwin_perf_" + sanitizedName + ".csv", std::ios::out | std::ios::trunc);
++        if (!d->output) {
++            return;
++        }
++        std::string name = d->output->name().toStdString();
++        for (char &c : name) {
++            c = std::isalnum(static_cast<unsigned char>(c)) ? c : '_';
++        }
++        d->m_debugOutput = std::fstream("kwin_perf_" + name + ".csv", std::ios::out | std::ios::trunc);
 +        if (d->m_debugOutput && d->m_debugOutput->is_open()) {
-+            *(d->m_debugOutput) << "target_flip,flip,start,end,margin,duration,vrr,pred_render\n";
++            *d->m_debugOutput << "target,flip,start,end,margin,dur,vrr,pred\n";
 +        }
      }
  
 -    Q_ASSERT(pendingFrameCount > 0);
 -    pendingFrameCount--;
 +    if (d->m_debugOutput && d->m_debugOutput->is_open()) {
-+        const RenderTimeSpan times = renderTime.value_or(RenderTimeSpan{});
-+        const bool vrr = (mode == PresentationMode::AdaptiveSync || mode == PresentationMode::AdaptiveAsync);
-+        *(d->m_debugOutput) << frame->targetPageflipTime().time_since_epoch().count() << ','
-+                            << timestamp.count() << ','
-+                            << times.start.time_since_epoch().count() << ','
-+                            << times.end.time_since_epoch().count() << ','
-+                            << d->safetyMargin.count() << ','
-+                            << frame->refreshDuration().count() << ','
-+                            << vrr << ','
-+                            << frame->predictedRenderTime().count() << '\n';
++        const auto times = rt.value_or(RenderTimeSpan{});
++        const bool vrr = (mode == PresentationMode::AdaptiveSync) ||
++                         (mode == PresentationMode::AdaptiveAsync);
++        *d->m_debugOutput << frame->targetPageflipTime().time_since_epoch().count() << ','
++                          << ts.count() << ','
++                          << times.start.time_since_epoch().count() << ','
++                          << times.end.time_since_epoch().count() << ','
++                          << d->safetyMargin.count() << ','
++                          << frame->refreshDuration().count() << ','
++                          << vrr << ','
++                          << frame->predictedRenderTime().count() << '\n';
 +    }
 +}
+ 
 +}
 +
 +void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
@@ -16103,27 +16333,27 @@
 +{
 +    consecutiveErrorCount = 0;
 +
-+    if (s_printDebugInfo) [[unlikely]] {
-+        writeDebugOutput(this, renderTime, frame, timestamp, mode);
++    if (__builtin_expect(s_debugEnabled, 0)) {
++        writeDebug(this, renderTime, frame, timestamp, mode);
 +    }
- 
++
 +    Q_ASSERT(pendingFrameCount > 0);
 +    --pendingFrameCount;
      notifyVblank(timestamp);
  
--    if (renderTime) {
+     if (renderTime) {
 -        renderJournal.add(renderTime->end - renderTime->start, timestamp);
-+    if (renderTime) [[likely]] {
-+        const auto duration = renderTime->end - renderTime->start;
-+        renderJournal.add(duration, timestamp);
-+        updateFramePrediction(duration);
++        const auto dur = renderTime->end - renderTime->start;
++        renderJournal.add(dur, timestamp);
++        updateFramePrediction(dur);
 +
 +        if (presentationMode != PresentationMode::VSync) {
-+            const int64_t frameTimeNs = duration.count();
++            const int64_t frameNs = dur.count();
 +            const int64_t vblankNs = static_cast<int64_t>(cachedVblankIntervalNs);
-+            if (frameTimeNs > vblankNs && starvationRecoveryCounter < kStarvationRecoveryFrames) {
-+                ++starvationRecoveryCounter;
-+            } else if (frameTimeNs <= vblankNs && starvationRecoveryCounter > 0) {
++            if (frameNs > vblankNs) {
++                const uint16_t next = starvationRecoveryCounter + 1;
++                starvationRecoveryCounter = static_cast<uint16_t>(branchlessMinU(next, kStarvationRecoveryFrames));
++            } else if (starvationRecoveryCounter > 0) {
 +                --starvationRecoveryCounter;
 +            }
 +        }
@@ -16131,44 +16361,47 @@
 -    if (compositeTimer.isActive()) {
 -        // reschedule to match the new timestamp and render time
 +
-+    if (__builtin_expect(compositeTimer.isActive(), 0)) [[unlikely]] {
++    if (__builtin_expect(compositeTimer.isActive(), 0)) {
          scheduleRepaint(lastPresentationTimestamp);
      }
 -    if (!inhibitCount && pendingReschedule) {
 +
-+    if (!inhibitCount && pendingReschedule) [[likely]] {
++    if (inhibitCount == 0 && pendingReschedule) {
          scheduleNextRepaint();
      }
  
-@@ -161,23 +724,20 @@ void RenderLoopPrivate::notifyFrameCompl
+@@ -161,23 +717,19 @@ void RenderLoopPrivate::notifyFrameCompl
  
  void RenderLoopPrivate::notifyVblank(std::chrono::nanoseconds timestamp)
  {
 -    if (lastPresentationTimestamp <= timestamp) {
-+    if (lastPresentationTimestamp <= timestamp) [[likely]] {
-         lastPresentationTimestamp = timestamp;
-     } else {
+-        lastPresentationTimestamp = timestamp;
+-    } else {
 -        qCDebug(KWIN_CORE,
 -                "Got invalid presentation timestamp: %lld (current %lld)",
 -                static_cast<long long>(timestamp.count()),
 -                static_cast<long long>(lastPresentationTimestamp.count()));
-         lastPresentationTimestamp = std::chrono::steady_clock::now().time_since_epoch();
-     }
+-        lastPresentationTimestamp = std::chrono::steady_clock::now().time_since_epoch();
+-    }
++    lastPresentationTimestamp = (timestamp >= lastPresentationTimestamp)
++        ? timestamp
++        : std::chrono::steady_clock::now().time_since_epoch();
  }
  
  void RenderLoop::timerEvent(QTimerEvent *event)
  {
 -    if (event->timerId() == d->compositeTimer.timerId()) {
-+    if (event->timerId() == d->compositeTimer.timerId()) [[likely]] {
++    const int id = event->timerId();
++    if (id == d->compositeTimer.timerId()) {
          d->compositeTimer.stop();
 +        d->scheduledTimerMs = -1;
          d->dispatch();
 -    } else if (event->timerId() == d->delayedVrrTimer.timerId()) {
-+    } else if (event->timerId() == d->delayedVrrTimer.timerId()) [[unlikely]] {
++    } else if (__builtin_expect(id == d->delayedVrrTimer.timerId(), 0)) {
          d->delayedVrrTimer.stop();
          scheduleRepaint(nullptr, nullptr);
      } else {
-@@ -195,24 +755,21 @@ RenderLoop::RenderLoop(Output *output)
+@@ -195,38 +747,34 @@ RenderLoop::RenderLoop(Output *output)
  {
  }
  
@@ -16181,8 +16414,8 @@
  {
 -    d->inhibitCount++;
 -
-+    ++d->inhibitCount;
-     if (d->inhibitCount == 1) {
+-    if (d->inhibitCount == 1) {
++    if (++d->inhibitCount == 1) {
          d->compositeTimer.stop();
 +        d->scheduledTimerMs = -1;
      }
@@ -16193,11 +16426,11 @@
      Q_ASSERT(d->inhibitCount > 0);
 -    d->inhibitCount--;
 -
-+    --d->inhibitCount;
-     if (d->inhibitCount == 0) {
+-    if (d->inhibitCount == 0) {
++    if (--d->inhibitCount == 0) {
          d->scheduleNextRepaint();
      }
-@@ -220,88 +777,135 @@ void RenderLoop::uninhibit()
+ }
  
  void RenderLoop::prepareNewFrame()
  {
@@ -16214,44 +16447,41 @@
 +    d->preparingNewFrame = 0;
  }
  
--int RenderLoop::refreshRate() const
-+[[nodiscard]] int RenderLoop::refreshRate() const
- {
+ int RenderLoop::refreshRate() const
+@@ -234,48 +782,85 @@ int RenderLoop::refreshRate() const
      return d->refreshRate;
  }
  
- void RenderLoop::setRefreshRate(int refreshRate)
+-void RenderLoop::setRefreshRate(int refreshRate)
++void RenderLoop::setRefreshRate(int rate)
  {
 -    if (d->refreshRate == refreshRate) {
-+    constexpr int kMinRefreshRate = 1'000;
-+    constexpr int kMaxRefreshRate = 1'000'000;
-+    int rr = refreshRate;
-+    rr = std::max(rr, kMinRefreshRate);
-+    rr = std::min(rr, kMaxRefreshRate);
-+
-+    if (d->refreshRate == rr) [[unlikely]] {
++    rate = static_cast<int>(branchlessClamp(rate, 1'000, 1'000'000));
++    if (d->refreshRate == rate) {
          return;
      }
 -    d->refreshRate = refreshRate;
-+    d->refreshRate = rr;
-+    d->cachedVblankIntervalNs = 1'000'000'000'000ull / static_cast<uint64_t>(rr);
++    d->refreshRate = rate;
++    d->cachedVblankIntervalNs = 1'000'000'000'000ULL / static_cast<uint64_t>(rate);
 +    d->updateReciprocal();
      Q_EMIT refreshRateChanged();
 +
-+    if (!d->inhibitCount) [[likely]] {
++    if (d->inhibitCount == 0) {
 +        d->compositeTimer.stop();
 +        d->scheduledTimerMs = -1;
 +        d->scheduleNextRepaint();
 +    }
  }
  
- void RenderLoop::setPresentationSafetyMargin(std::chrono::nanoseconds safetyMargin)
+-void RenderLoop::setPresentationSafetyMargin(std::chrono::nanoseconds safetyMargin)
++void RenderLoop::setPresentationSafetyMargin(std::chrono::nanoseconds margin)
  {
 -    d->safetyMargin = safetyMargin;
-+    d->safetyMargin = std::max(safetyMargin, 0ns);
++    d->safetyMargin = margin.count() > 0 ? margin : 0ns;
  }
  
- void RenderLoop::scheduleRepaint(Item *item, OutputLayer *outputLayer)
+-void RenderLoop::scheduleRepaint(Item *item, OutputLayer *outputLayer)
++void RenderLoop::scheduleRepaint(Item *item, OutputLayer *layer)
  {
 -    const bool vrr = d->presentationMode == PresentationMode::AdaptiveSync || d->presentationMode == PresentationMode::AdaptiveAsync;
 -    const bool tearing = d->presentationMode == PresentationMode::Async || d->presentationMode == PresentationMode::AdaptiveAsync;
@@ -16261,33 +16491,31 @@
 -            constexpr std::chrono::milliseconds s_delayVrrTimer = 1'000ms / 30;
 -            d->delayedVrrTimer.start(s_delayVrrTimer, Qt::PreciseTimer, this);
 -            return;
-+    if (thread() != QThread::currentThread()) {
-+        QMetaObject::invokeMethod(this, [this, item, outputLayer]() {
-+            scheduleRepaint(item, outputLayer);
++    if (__builtin_expect(thread() != QThread::currentThread(), 0)) {
++        QMetaObject::invokeMethod(this, [this, item, layer]() {
++            scheduleRepaint(item, layer);
 +        }, Qt::QueuedConnection);
 +        return;
 +    }
 +
-+    d->invalidateVrrState();
++    d->vrrStateDirty_ = true;
 +
-+    const bool vrrOrTearing = (d->presentationMode != PresentationMode::VSync);
++    const bool vrrActive = d->presentationMode != PresentationMode::VSync;
++    const bool hasTarget = item || layer;
 +
-+    if (vrrOrTearing && (item || outputLayer)) [[unlikely]] {
++    if (vrrActive && hasTarget) {
 +        if (activeWindowControlsVrrRefreshRate()) {
-+             Workspace *const ws = workspace();
-+             if (ws && d->output) {
-+                 Window *const active = ws->activeWindow();
-+                 if (active && active->isOnOutput(d->output)) {
-+                     SurfaceItem *surface = active->surfaceItem();
-+                     if (item && surface && item != surface && !surface->isAncestorOf(item)) {
-+                         if (d->pendingFrameCount > 0) {
-+                             const int delayMs = 1000 / (d->refreshRate / 1000);
-+                             d->delayedVrrTimer.start(delayMs, Qt::PreciseTimer, this);
-+                             return;
-+                         }
-+                     }
-+                 }
-+             }
++            Workspace *ws = workspace();
++            Window *active = ws ? ws->activeWindow() : nullptr;
++            if (active && d->output && active->isOnOutput(d->output)) {
++                SurfaceItem *surface = active->surfaceItem();
++                const bool isOther = item && surface && (item != surface) && !surface->isAncestorOf(item);
++                if (isOther && d->pendingFrameCount > 0) {
++                    const int delayMs = 1000 / (d->refreshRate / 1000);
++                    d->delayedVrrTimer.start(delayMs, Qt::PreciseTimer, this);
++                    return;
++                }
++            }
          }
      }
 +
@@ -16295,74 +16523,65 @@
 -    const int effectiveMaxPendingFrameCount = (vrr || tearing) ? 1 : d->maxPendingFrameCount;
 -    if (d->pendingFrameCount < effectiveMaxPendingFrameCount && !d->inhibitCount) {
 +
-+    int effectiveMax = d->maxPendingFrameCount;
-+    if (vrrOrTearing) {
-+        effectiveMax = (d->starvationRecoveryCounter >= kStarvationRecoveryFrames) ? 2 : 1;
++    int maxPending = d->maxPendingFrameCount;
++    if (vrrActive) {
++        maxPending = (d->starvationRecoveryCounter >= kStarvationRecoveryFrames) ? 2 : 1;
 +    }
 +
-+    if (d->pendingFrameCount < effectiveMax && !d->inhibitCount) [[likely]] {
++    if (d->pendingFrameCount < maxPending && d->inhibitCount == 0) {
          d->scheduleNextRepaint();
      } else {
-         d->delayScheduleRepaint();
+-        d->delayScheduleRepaint();
++        d->pendingReschedule = 1;
      }
  }
  
--bool RenderLoop::activeWindowControlsVrrRefreshRate() const
-+[[nodiscard]] bool RenderLoop::activeWindowControlsVrrRefreshRate() const
+ bool RenderLoop::activeWindowControlsVrrRefreshRate() const
  {
 -    Window *const activeWindow = workspace()->activeWindow();
 -    return activeWindow
 -        && activeWindow->isOnOutput(d->output)
 -        && activeWindow->surfaceItem()
 -        && activeWindow->surfaceItem()->recursiveFrameTimeEstimation() <= std::chrono::nanoseconds(1'000'000'000) / 30;
-+    Workspace *const ws = workspace();
-+    if (!ws) return false;
-+
-+    Window *const active = ws->activeWindow();
++    Workspace *ws = workspace();
++    if (!ws) {
++        return false;
++    }
++    Window *active = ws->activeWindow();
 +    if (!active || !d->output || !active->isOnOutput(d->output)) {
 +        return false;
 +    }
-+
-+    SurfaceItem *const surface = active->surfaceItem();
++    SurfaceItem *surface = active->surfaceItem();
 +    return surface && (surface->recursiveFrameTimeEstimation() <= kVrrControlThreshold);
  }
  
--std::chrono::nanoseconds RenderLoop::lastPresentationTimestamp() const
-+[[nodiscard]] std::chrono::nanoseconds RenderLoop::lastPresentationTimestamp() const
- {
-     return d->lastPresentationTimestamp;
- }
- 
--std::chrono::nanoseconds RenderLoop::nextPresentationTimestamp() const
-+[[nodiscard]] std::chrono::nanoseconds RenderLoop::nextPresentationTimestamp() const
- {
-     return d->nextPresentationTimestamp;
- }
+ std::chrono::nanoseconds RenderLoop::lastPresentationTimestamp() const
+@@ -290,15 +875,12 @@ std::chrono::nanoseconds RenderLoop::nex
  
  void RenderLoop::setPresentationMode(PresentationMode mode)
  {
 -    if (mode != d->presentationMode) {
 -        qCDebug(KWIN_CORE) << "Changed presentation mode to" << mode;
-+    if (mode != d->presentationMode) [[unlikely]] {
-+        qCDebug(KWIN_CORE) << "Changed presentation mode to" << static_cast<int>(mode);
-+        d->presentationMode = mode;
-     }
--    d->presentationMode = mode;
+-    }
+     d->presentationMode = mode;
  }
  
- void RenderLoop::setMaxPendingFrameCount(uint32_t maxCount)
+-void RenderLoop::setMaxPendingFrameCount(uint32_t maxCount)
++void RenderLoop::setMaxPendingFrameCount(uint32_t count)
  {
 -    d->maxPendingFrameCount = maxCount;
-+    const int clamped = static_cast<int>(maxCount);
-+    d->maxPendingFrameCount = std::max(clamped, 1);
-+    d->maxPendingFrameCount = std::min(d->maxPendingFrameCount, 3);
++    d->maxPendingFrameCount = static_cast<int>(branchlessClampU(count, 1, 3));
  }
  
--std::chrono::nanoseconds RenderLoop::predictedRenderTime() const
-+[[nodiscard]] std::chrono::nanoseconds RenderLoop::predictedRenderTime() const
- {
+ std::chrono::nanoseconds RenderLoop::predictedRenderTime() const
+@@ -306,6 +888,6 @@ std::chrono::nanoseconds RenderLoop::pre
      return d->renderJournal.result();
  }
+ 
+-} // namespace KWin
++}
+ 
+ #include "moc_renderloop.cpp"
 
 --- a/src/scene/surfaceitem.cpp	2025-10-05 23:59:56.232413388 +0200
 +++ b/src/scene/surfaceitem.cpp	2025-10-06 00:01:06.300904280 +0200
