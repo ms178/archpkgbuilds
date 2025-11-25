@@ -23,6 +23,9 @@
 
 using namespace std::chrono_literals;
 
+namespace KWin
+{
+
 namespace
 {
 
@@ -31,8 +34,8 @@ constexpr uint64_t kMaxPageflipSpan = 10000;
 constexpr std::chrono::milliseconds kDefaultFrameInterval{16};
 constexpr size_t kInitialCommitCapacity = 16;
 constexpr size_t kInitialDeleteCapacity = 64;
+constexpr int kMaxSubmitRetries = 3;
 
-[[gnu::always_inline]]
 inline void preciseSleepUntil(const std::chrono::steady_clock::time_point &target) noexcept
 {
     const auto dur = target.time_since_epoch();
@@ -46,7 +49,7 @@ inline void preciseSleepUntil(const std::chrono::steady_clock::time_point &targe
     clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
 }
 
-[[nodiscard, gnu::always_inline]]
+[[nodiscard]]
 inline std::chrono::nanoseconds clampNs(std::chrono::nanoseconds val,
                                         std::chrono::nanoseconds lo,
                                         std::chrono::nanoseconds hi) noexcept
@@ -61,9 +64,6 @@ inline std::chrono::nanoseconds clampNs(std::chrono::nanoseconds val,
 }
 
 }
-
-namespace KWin
-{
 
 static const std::chrono::microseconds s_safetyMarginMinimum{
     environmentVariableIntValue("KWIN_DRM_OVERRIDE_SAFETY_MARGIN").value_or(1500)};
@@ -248,11 +248,26 @@ void DrmCommitThread::submit()
     }
 
     if (!commit->test()) [[unlikely]] {
-        qCWarning(KWIN_DRM) << "Commit test failed before submission, errno:" << errno << strerror(errno);
-        m_commitsToDelete.push_back(std::move(m_commits.front()));
-        m_commits.erase(m_commits.begin());
-        QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::QueuedConnection);
-        return;
+        const int savedErrno = errno;
+        qCWarning(KWIN_DRM) << "Commit test failed before submission, errno:" << savedErrno << strerror(savedErrno);
+
+        for (int retry = 0; retry < kMaxSubmitRetries && m_commits.size() > 1; ++retry) {
+            auto toMerge = std::move(m_commits[1]);
+            m_commits.erase(m_commits.begin() + 1);
+            commit->merge(toMerge.get());
+            m_commitsToDelete.push_back(std::move(toMerge));
+
+            if (commit->test()) {
+                break;
+            }
+        }
+
+        if (!commit->test()) {
+            m_commitsToDelete.push_back(std::move(m_commits.front()));
+            m_commits.erase(m_commits.begin());
+            QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::QueuedConnection);
+            return;
+        }
     }
 
     const auto vrr = commit->isVrr();
@@ -288,19 +303,6 @@ void DrmCommitThread::submit()
         qCWarning(KWIN_DRM) << "Atomic commit failed: errno =" << savedErrno
                            << "(" << strerror(savedErrno) << ")"
                            << "; tearing =" << commit->isTearing();
-
-        if (m_commits.size() > 1) {
-            while (m_commits.size() > 1) {
-                auto toMerge = std::move(m_commits[1]);
-                m_commits.erase(m_commits.begin() + 1);
-                commit->merge(toMerge.get());
-                m_commitsToDelete.push_back(std::move(toMerge));
-            }
-            if (commit->test()) {
-                submit();
-                return;
-            }
-        }
 
         const size_t totalToDelete = m_commitsToDelete.size() + m_commits.size();
         if (m_commitsToDelete.capacity() < totalToDelete) {
