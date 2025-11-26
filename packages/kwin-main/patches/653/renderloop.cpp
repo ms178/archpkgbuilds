@@ -42,12 +42,13 @@ constexpr int64_t kMaxFutureLeadNs = int64_t{1} << 34;
 constexpr uint64_t kPageflipDriftThreshold = 32;
 constexpr uint64_t kIntervalsClamp = 50'000;
 
-constexpr uint8_t kVrrVsyncStabilityFrames = 6;
-constexpr uint8_t kVrrAdaptiveStabilityFrames = 3;
-constexpr uint16_t kVrrLockoutStableFrames = 20;
+constexpr uint16_t kVrrToVsyncStabilityFrames = 24;
+constexpr uint16_t kVsyncToVrrStabilityFrames = 12;
+constexpr uint16_t kMinModeDwellFrames = 60;
+constexpr uint16_t kOscillationCooldownFrames = 300;
 constexpr auto kVrrControlThreshold = 25ms;
-constexpr auto kVrrOscillationWindow = 250ms;
-constexpr uint8_t kVrrOscillationThreshold = 8;
+constexpr auto kOscillationWindow = 2000ms;
+constexpr uint8_t kOscillationThreshold = 4;
 
 constexpr int kMaxTimerDelayMs = 16000;
 constexpr int kTripleBufferEnterPct = 78;
@@ -56,7 +57,6 @@ constexpr int kTripleBufferExitFrames = 2;
 
 constexpr int kMinVrrRefreshMhz = 48'000;
 constexpr int kMaxVrrRefreshMhz = 165'000;
-constexpr int kVrrTargetPercentile = 98;
 
 constexpr uint16_t kStarvationRecoveryFrames = 16;
 constexpr uint8_t kMaxConsecutiveErrors = 2;
@@ -64,8 +64,7 @@ constexpr int kMaxErrorBackoffMs = 250;
 
 constexpr int64_t kTimerRescheduleThresholdNs = 80'000;
 
-static_assert(kVrrLockoutStableFrames < std::numeric_limits<uint16_t>::max(),
-              "kVrrLockoutStableFrames must fit in uint16_t with room for increment");
+constexpr int64_t kFrameTimeVarianceThreshold = 500'000;
 
 [[gnu::always_inline, gnu::const]]
 inline constexpr int64_t branchlessAbs(int64_t v) noexcept
@@ -175,19 +174,25 @@ RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, Output *output)
     , vrrOscillationLockout(0)
     , vrrEnabled(0)
     , vrrCapable(0)
-    , oscillationCheckCounter_(0)
     , consecutiveErrorCount(0)
-    , vrrStabilityCounter(0)
-    , recentSwitchCount(0)
     , vrrConnectionCount_(0)
     , vrrMode(VrrMode::Automatic)
     , presentationMode(PresentationMode::VSync)
     , lastStableMode(PresentationMode::VSync)
+    , pendingTargetMode_(PresentationMode::VSync)
     , tripleBufferEnterThresholdNs(0)
     , tripleBufferExitThresholdNs(0)
-    , vrrTargetIntervalNs(0)
+    , vrrMinIntervalNs(0)
+    , vrrMaxIntervalNs(0)
     , stableModeFrameCount(0)
     , starvationRecoveryCounter(0)
+    , modeDwellCounter_(0)
+    , pendingModeCounter_(0)
+    , oscillationCooldownCounter_(0)
+    , frameTimeVariance_(0)
+    , frameTimeMean_(0)
+    , modeSwitchHistoryHead_(0)
+    , modeSwitchHistoryCount_(0)
     , vrrStateDirty_(true)
     , trackedWindow_(nullptr)
 {
@@ -211,7 +216,8 @@ void RenderLoopPrivate::updateReciprocal() noexcept
         reciprocalShift64 = 0;
         tripleBufferEnterThresholdNs = 0;
         tripleBufferExitThresholdNs = 0;
-        vrrTargetIntervalNs = 0;
+        vrrMinIntervalNs = 0;
+        vrrMaxIntervalNs = 0;
         return;
     }
 
@@ -223,11 +229,8 @@ void RenderLoopPrivate::updateReciprocal() noexcept
     tripleBufferEnterThresholdNs = static_cast<int64_t>((interval * kTripleBufferEnterPct) / 100);
     tripleBufferExitThresholdNs = static_cast<int64_t>((interval * kTripleBufferExitPct) / 100);
 
-    constexpr uint64_t maxIntervalNs = 1'000'000'000'000ULL / kMinVrrRefreshMhz;
-    constexpr uint64_t minIntervalNs = 1'000'000'000'000ULL / kMaxVrrRefreshMhz;
-    constexpr uint64_t range = maxIntervalNs - minIntervalNs;
-    constexpr uint64_t targetNs = minIntervalNs + (range * (100 - kVrrTargetPercentile)) / 100;
-    vrrTargetIntervalNs = branchlessMaxU(targetNs, interval);
+    vrrMinIntervalNs = 1'000'000'000'000ULL / static_cast<uint64_t>(kMaxVrrRefreshMhz);
+    vrrMaxIntervalNs = 1'000'000'000'000ULL / static_cast<uint64_t>(kMinVrrRefreshMhz);
 }
 
 void RenderLoopPrivate::initializeVrrCapabilities()
@@ -354,40 +357,104 @@ void RenderLoopPrivate::recordModeSwitch() noexcept
 {
     const auto now = std::chrono::steady_clock::now();
     lastModeSwitch = now;
-    modeSwitchBitmap = (modeSwitchBitmap << 1) | 1;
+    modeDwellCounter_ = 0;
 
-    if (oldestSwitchTime.time_since_epoch().count() == 0) {
-        oldestSwitchTime = now;
+    modeSwitchHistory_[modeSwitchHistoryHead_] = now;
+    modeSwitchHistoryHead_ = (modeSwitchHistoryHead_ + 1) % kModeSwitchHistorySize;
+    if (modeSwitchHistoryCount_ < kModeSwitchHistorySize) {
+        ++modeSwitchHistoryCount_;
     }
 }
 
 bool RenderLoopPrivate::detectVrrOscillation() noexcept
 {
-    const auto now = std::chrono::steady_clock::now();
-    const auto cutoff = now - kVrrOscillationWindow;
+    if (modeSwitchHistoryCount_ < kOscillationThreshold) {
+        return false;
+    }
 
-    if (oldestSwitchTime < cutoff) {
-        const auto elapsed = now - oldestSwitchTime;
-        const auto windowCount = elapsed / kVrrOscillationWindow;
-        const auto shifts = static_cast<uint64_t>(windowCount);
-        if (shifts >= 64) {
-            modeSwitchBitmap = 0;
-            oldestSwitchTime = {};
-        } else {
-            modeSwitchBitmap >>= shifts;
-            oldestSwitchTime = cutoff;
+    const auto now = std::chrono::steady_clock::now();
+    const auto cutoff = now - kOscillationWindow;
+
+    uint8_t recentCount = 0;
+    for (uint8_t i = 0; i < modeSwitchHistoryCount_; ++i) {
+        const uint8_t idx = (modeSwitchHistoryHead_ + kModeSwitchHistorySize - 1 - i) % kModeSwitchHistorySize;
+        if (modeSwitchHistory_[idx] >= cutoff) {
+            ++recentCount;
         }
     }
 
-    const auto count = static_cast<uint8_t>(__builtin_popcountll(modeSwitchBitmap));
-    recentSwitchCount = count;
-
-    if (count >= kVrrOscillationThreshold && !vrrOscillationLockout) [[unlikely]] {
+    if (recentCount >= kOscillationThreshold) [[unlikely]] {
         vrrOscillationLockout = 1;
-        stableModeFrameCount = 0;
-        lastStableMode = presentationMode;
+        oscillationCooldownCounter_ = kOscillationCooldownFrames;
+        lastStableMode = PresentationMode::VSync;
+        presentationMode = PresentationMode::VSync;
+        pendingTargetMode_ = PresentationMode::VSync;
+        pendingModeCounter_ = 0;
         return true;
     }
+    return false;
+}
+
+void RenderLoopPrivate::updateFrameTimeStats(int64_t frameTimeNs) noexcept
+{
+    constexpr int64_t kAlpha = 32;
+    constexpr int64_t kAlphaComplement = 256 - kAlpha;
+
+    const int64_t delta = frameTimeNs - frameTimeMean_;
+    frameTimeMean_ = (frameTimeMean_ * kAlphaComplement + frameTimeNs * kAlpha) >> 8;
+
+    const int64_t absDelta = branchlessAbs(delta);
+    frameTimeVariance_ = (frameTimeVariance_ * kAlphaComplement + absDelta * kAlpha) >> 8;
+}
+
+bool RenderLoopPrivate::isFrameTimeStable() const noexcept
+{
+    return frameTimeVariance_ < kFrameTimeVarianceThreshold;
+}
+
+bool RenderLoopPrivate::shouldSwitchMode(PresentationMode target) noexcept
+{
+    if (target == presentationMode) {
+        pendingModeCounter_ = 0;
+        pendingTargetMode_ = presentationMode;
+        return false;
+    }
+
+    if (modeDwellCounter_ < kMinModeDwellFrames) {
+        return false;
+    }
+
+    if (oscillationCooldownCounter_ > 0) {
+        --oscillationCooldownCounter_;
+        if (oscillationCooldownCounter_ == 0) {
+            vrrOscillationLockout = 0;
+        }
+        return false;
+    }
+
+    if (vrrOscillationLockout) {
+        return false;
+    }
+
+    if (target == pendingTargetMode_) {
+        ++pendingModeCounter_;
+    } else {
+        pendingTargetMode_ = target;
+        pendingModeCounter_ = 1;
+    }
+
+    const bool toVsync = (target == PresentationMode::VSync);
+    const uint16_t threshold = toVsync ? kVrrToVsyncStabilityFrames : kVsyncToVrrStabilityFrames;
+
+    if (pendingModeCounter_ >= threshold) {
+        if (detectVrrOscillation()) {
+            return false;
+        }
+
+        pendingModeCounter_ = 0;
+        return true;
+    }
+
     return false;
 }
 
@@ -405,36 +472,32 @@ PresentationMode RenderLoopPrivate::selectPresentationMode() noexcept
 
     const auto hint = static_cast<PresentationModeHint>(state.hint);
 
-    if (vrrOscillationLockout) [[unlikely]] {
-        const bool wantsAdaptive = (vrrMode == VrrMode::Always) && (hint != PresentationModeHint::VSync);
-        const auto target = wantsAdaptive ? PresentationMode::AdaptiveSync : PresentationMode::VSync;
-        stableModeFrameCount = (presentationMode == target)
-            ? static_cast<uint16_t>(stableModeFrameCount + 1u)
-            : uint16_t{0};
-        if (stableModeFrameCount >= kVrrLockoutStableFrames) {
-            vrrOscillationLockout = 0;
-            stableModeFrameCount = 0;
-        }
-        return lastStableMode;
-    }
-
     if (vrrMode == VrrMode::Always) {
         if (hint == PresentationModeHint::Async) {
             return PresentationMode::AdaptiveAsync;
         }
-        return (hint != PresentationModeHint::VSync) ? PresentationMode::AdaptiveSync : PresentationMode::VSync;
+        if (hint != PresentationModeHint::VSync) {
+            return PresentationMode::AdaptiveSync;
+        }
+        return PresentationMode::VSync;
     }
 
     if (!state.isOnOutput || !state.isFullScreen) [[unlikely]] {
         return PresentationMode::VSync;
     }
 
-    if (hint == PresentationModeHint::Async) {
-        return PresentationMode::AdaptiveAsync;
-    }
     if (hint == PresentationModeHint::VSync) {
         return PresentationMode::VSync;
     }
+
+    if (isFrameTimeStable() && presentationMode == PresentationMode::VSync) {
+        return PresentationMode::VSync;
+    }
+
+    if (hint == PresentationModeHint::Async) {
+        return PresentationMode::AdaptiveAsync;
+    }
+
     return PresentationMode::AdaptiveSync;
 }
 
@@ -446,10 +509,10 @@ void RenderLoopPrivate::updateFramePrediction(std::chrono::nanoseconds measured)
     }
 
     const int64_t cur = framePrediction.count();
-    const int64_t updated = (cur * 192 + m * 64) >> 8;
+    const int64_t updated = (cur * 224 + m * 32) >> 8;
     const int64_t vblank = static_cast<int64_t>(cachedVblankIntervalNs);
-    const int64_t lo = vblank >> 2;
-    const int64_t hi = vblank + (vblank >> 1);
+    const int64_t lo = vblank >> 3;
+    const int64_t hi = vblank * 3;
     framePrediction = std::chrono::nanoseconds{branchlessClamp(updated, lo, hi)};
 }
 
@@ -490,27 +553,18 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTarget)
     const int64_t predNs = framePrediction.count() > 0 ? framePrediction.count() : renderJournal.result().count();
     const int64_t vblankSigned = static_cast<int64_t>(vblankNs);
     const int64_t rawComposite = predNs + safetyMargin.count() + kPredictionSlackNs;
-    const int64_t compositeNs = branchlessClamp(rawComposite, int64_t{0}, vblankSigned << 1);
+    const int64_t compositeNs = branchlessClamp(rawComposite, int64_t{0}, vblankSigned * 3);
 
     updateVrrState();
     const PresentationMode targetMode = selectPresentationMode();
 
-    if (targetMode != presentationMode) [[unlikely]] {
-        const uint8_t thresh = (targetMode == PresentationMode::VSync) ? kVrrVsyncStabilityFrames : kVrrAdaptiveStabilityFrames;
-        ++vrrStabilityCounter;
-        if (vrrStabilityCounter >= thresh) {
-            presentationMode = targetMode;
-            lastStableMode = targetMode;
-            vrrStabilityCounter = 0;
-            starvationRecoveryCounter = 0;
-            recordModeSwitch();
-            oscillationCheckCounter_ = (oscillationCheckCounter_ + 1) & 15;
-            if (oscillationCheckCounter_ == 0) {
-                (void)detectVrrOscillation();
-            }
-        }
-    } else {
-        vrrStabilityCounter = 0;
+    ++modeDwellCounter_;
+
+    if (shouldSwitchMode(targetMode)) {
+        presentationMode = targetMode;
+        lastStableMode = targetMode;
+        starvationRecoveryCounter = 0;
+        recordModeSwitch();
     }
 
     int64_t nextPresNs;
@@ -576,16 +630,23 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTarget)
     } else {
         wasTripleBuffering = 0;
         doubleBufferingCounter = 0;
+
         const bool isAsync = (presentationMode == PresentationMode::Async) ||
                              (presentationMode == PresentationMode::AdaptiveAsync);
+
+        const int64_t minIntervalNs = static_cast<int64_t>(vrrMinIntervalNs);
+        const int64_t sinceLast = nowNs - lastPresNs;
+
         if (isAsync) [[unlikely]] {
             nextPresNs = nowNs + compositeNs;
         } else {
-            const int64_t targetInterval = static_cast<int64_t>(vrrTargetIntervalNs);
-            const int64_t sinceLast = nowNs - lastPresNs;
             const int64_t tentative = nowNs + compositeNs;
-            const int64_t minNext = lastPresNs + targetInterval;
-            nextPresNs = (sinceLast < targetInterval) ? branchlessMax(tentative, minNext) : tentative;
+            if (sinceLast < minIntervalNs) {
+                const int64_t minNext = lastPresNs + minIntervalNs;
+                nextPresNs = branchlessMax(tentative, minNext);
+            } else {
+                nextPresNs = tentative;
+            }
         }
     }
 
@@ -657,7 +718,7 @@ void writeDebug(RenderLoopPrivate *d,
         }
         d->m_debugOutput = std::fstream("kwin_perf_" + name + ".csv", std::ios::out | std::ios::trunc);
         if (d->m_debugOutput && d->m_debugOutput->is_open()) {
-            *d->m_debugOutput << "target,flip,start,end,margin,dur,vrr,pred\n";
+            *d->m_debugOutput << "target,flip,start,end,margin,dur,vrr,pred,var\n";
         }
     }
 
@@ -672,7 +733,8 @@ void writeDebug(RenderLoopPrivate *d,
                           << d->safetyMargin.count() << ','
                           << frame->refreshDuration().count() << ','
                           << vrr << ','
-                          << frame->predictedRenderTime().count() << '\n';
+                          << frame->predictedRenderTime().count() << ','
+                          << d->frameTimeVariance_ << '\n';
     }
 }
 
@@ -698,8 +760,10 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
         renderJournal.add(dur, timestamp);
         updateFramePrediction(dur);
 
+        const int64_t frameNs = dur.count();
+        updateFrameTimeStats(frameNs);
+
         if (presentationMode != PresentationMode::VSync) {
-            const int64_t frameNs = dur.count();
             const int64_t vblankNs = static_cast<int64_t>(cachedVblankIntervalNs);
             if (frameNs > vblankNs) {
                 const auto next = static_cast<uint16_t>(branchlessMinU(

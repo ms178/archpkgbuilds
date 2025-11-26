@@ -123,10 +123,7 @@ public:
     uint8_t vrrCapable : 1;
     uint8_t : 2;
 
-    uint8_t oscillationCheckCounter_;
     uint8_t consecutiveErrorCount;
-    uint8_t vrrStabilityCounter;
-    uint8_t recentSwitchCount;
     uint8_t vrrConnectionCount_;
 
     enum class VrrMode : uint8_t {
@@ -138,16 +135,28 @@ public:
 
     PresentationMode presentationMode;
     PresentationMode lastStableMode;
+    PresentationMode pendingTargetMode_;
 
     int64_t tripleBufferEnterThresholdNs;
     int64_t tripleBufferExitThresholdNs;
-    uint64_t vrrTargetIntervalNs;
+    uint64_t vrrMinIntervalNs;
+    uint64_t vrrMaxIntervalNs;
 
     uint16_t stableModeFrameCount;
     uint16_t starvationRecoveryCounter;
+    uint16_t modeDwellCounter_;
+    uint16_t pendingModeCounter_;
+    uint16_t oscillationCooldownCounter_;
+
+    int64_t frameTimeVariance_;
+    int64_t frameTimeMean_;
 
     std::chrono::steady_clock::time_point lastModeSwitch{};
-    std::chrono::steady_clock::time_point oldestSwitchTime{};
+
+    static constexpr size_t kModeSwitchHistorySize = 8;
+    std::array<std::chrono::steady_clock::time_point, kModeSwitchHistorySize> modeSwitchHistory_{};
+    uint8_t modeSwitchHistoryHead_{0};
+    uint8_t modeSwitchHistoryCount_{0};
 
     VrrStateCache vrrStateCache_{};
     bool vrrStateDirty_;
@@ -159,7 +168,7 @@ public:
     Window *trackedWindow_;
     std::array<QMetaObject::Connection, 4> vrrConnections_{};
 
-    alignas(64) uint64_t modeSwitchBitmap{0};
+    alignas(64) uint64_t padding_[8];
 
     [[nodiscard]] static RenderLoopPrivate *get(RenderLoop *loop) noexcept;
     explicit RenderLoopPrivate(RenderLoop *q, Output *output);
@@ -173,9 +182,12 @@ public:
     void updateVrrState() noexcept;
 
     [[nodiscard]] PresentationMode selectPresentationMode() noexcept;
-    [[nodiscard]] bool detectVrrOscillation() noexcept;
+    [[nodiscard]] bool shouldSwitchMode(PresentationMode target) noexcept;
     void recordModeSwitch() noexcept;
+    [[nodiscard]] bool detectVrrOscillation() noexcept;
     void updateFramePrediction(std::chrono::nanoseconds measured) noexcept;
+    void updateFrameTimeStats(int64_t frameTimeNs) noexcept;
+    [[nodiscard]] bool isFrameTimeStable() const noexcept;
 
     void dispatch();
     void delayScheduleRepaint() noexcept;
@@ -197,8 +209,6 @@ public:
 
 static_assert(offsetof(RenderLoopPrivate, vblankIntervalReciprocal64) == 64,
               "Cache line boundary at 64 bytes");
-static_assert(offsetof(RenderLoopPrivate, modeSwitchBitmap) % 64 == 0,
-              "modeSwitchBitmap must be cache-line aligned");
 
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
