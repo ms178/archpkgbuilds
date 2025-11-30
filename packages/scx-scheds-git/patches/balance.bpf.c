@@ -181,7 +181,10 @@ u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 				if (cpu >= nr_cpu_ids)
 					break;
 
-				queued = scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu));
+				/* Upstream update: Include SCX_DSQ_LOCAL_ON tasks in queued count */
+				queued = scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)) +
+					 scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
+
 				if (queued > highest_queued) {
 					highest_queued = queued;
 					pick_cpu = cpu;

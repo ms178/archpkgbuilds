@@ -1016,8 +1016,8 @@ void BPF_STRUCT_OPS(lavd_cpu_offline, s32 cpu)
 
 	cpu_ctx_init_offline(cpuc, cpu, now);
 
-	__sync_fetch_and_sub(&nr_cpus_onln, 1);
-	__sync_fetch_and_sub(&total_capacity, cpuc->capacity);
+	__sync_fetch_and_add(&nr_cpus_onln, 1);
+	__sync_fetch_and_add(&total_capacity, cpuc->capacity);
 	update_autopilot_high_cap();
 	update_sys_stat();
 }
@@ -1140,6 +1140,12 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	else
 		reset_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
 	bpf_rcu_read_unlock();
+
+	/* Upstream update: Track ksoftirqd threads */
+	if (is_ksoftirqd(p))
+		set_task_flag(taskc, LAVD_FLAG_KSOFTIRQD);
+	else
+		reset_task_flag(taskc, LAVD_FLAG_KSOFTIRQD);
 
 	now = scx_bpf_now();
 	taskc->last_runnable_clk = now;

@@ -127,6 +127,12 @@ static bool is_kernel_worker(struct task_struct *p)
 	return !!(p->flags & (PF_WQ_WORKER | PF_IO_WORKER));
 }
 
+/* Upstream addition: needed for softirq tracking */
+static bool is_ksoftirqd(struct task_struct *p)
+{
+	return is_kernel_task(p) && !__builtin_memcmp(p->comm, "ksoftirqd/", 10);
+}
+
 static bool is_pinned(const struct task_struct *p)
 {
 	return p->nr_cpus_allowed == 1;
@@ -291,10 +297,13 @@ u32 cpu_to_dsq(u32 cpu)
 
 s32 nr_queued_on_cpu(struct cpu_ctx *cpuc)
 {
-	s32 nr_queued = 0;
+	s32 nr_queued;
+
+	/* Upstream update: Check local SCX DSQ first */
+	nr_queued = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cpu_id);
 
 	if (use_per_cpu_dsq())
-		nr_queued = scx_bpf_dsq_nr_queued(cpu_to_dsq(cpuc->cpu_id));
+		nr_queued += scx_bpf_dsq_nr_queued(cpu_to_dsq(cpuc->cpu_id));
 
 	if (use_cpdom_dsq())
 		nr_queued += scx_bpf_dsq_nr_queued(cpdom_to_dsq(cpuc->cpdom_id));
