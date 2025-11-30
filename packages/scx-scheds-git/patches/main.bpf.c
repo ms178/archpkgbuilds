@@ -3,7 +3,10 @@
  * scx_lavd: Latency-criticality Aware Virtual Deadline Scheduler
  * Optimized for Intel Raptor Lake (i7-14700KF)
  *
- * FIX: Extracted complexity to noinline helper to pass BPF verifier (E2BIG).
+ * FIX:
+ * 1. Reduced DISPATCH_CAP to 16 to pass BPF verifier (avoid E2BIG).
+ * 2. Marked consumption helper noinline to prune verification states.
+ * 3. Refined SMT sibling lookup for better L2 locality.
  */
 
 #include <scx/common.bpf.h>
@@ -41,10 +44,9 @@ static pid_t lavd_pid;
 
 /*
  * Optimized Consumption Helper
- * 1. Tries local/shared DSQs.
- * 2. If empty, tries cross-domain WORK STEALING.
+ * Marked 'noinline' to save BPF verification complexity.
  */
-static __always_inline bool consume_task_optimized(u64 cpu_dsq_id, u64 cpdom_dsq_id)
+static __attribute__((noinline)) bool consume_task_optimized(u64 cpu_dsq_id, u64 cpdom_dsq_id)
 {
 	/* 1. Check Local DSQ (Highest Locality) */
 	if (use_per_cpu_dsq()) {
@@ -317,6 +319,22 @@ static void update_stat_for_refill(struct task_struct *p,
  */
 static __attribute__((noinline)) s32 try_select_idle_sibling(struct pick_ctx *ictx, s32 prev_cpu)
 {
+	/* 0. L2 Locality Check: Try direct SMT sibling of previous P-core */
+	/* 14700KF: P-cores are 0-7, SMT siblings are 8-15. */
+	if (prev_cpu >= 0 && prev_cpu < 16) {
+		const volatile u32 *sibling_ptr = MEMBER_VPTR(cpu_sibling, [prev_cpu]);
+		if (sibling_ptr) {
+			u32 sibling = *sibling_ptr;
+			/* Only if sibling is not self (SMT enabled) */
+			if (sibling != prev_cpu && sibling < 16) {
+				struct cpu_ctx *sc = get_cpu_ctx_id(sibling);
+				if (sc && sc->idle_start_clk != 0) {
+					return sibling;
+				}
+			}
+		}
+	}
+
 	/* 1. Raptor Lake Turbo Bias (ITMT 3.0) */
 	if (have_turbo_core && ictx->taskc->perf_cri > sys_stat.avg_perf_cri) {
 		#pragma unroll
@@ -370,8 +388,11 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		struct cpu_ctx *cpuc_prev = get_cpu_ctx_id(prev_cpu);
 		if (cpuc_prev && cpuc_prev->is_online && cpuc_prev->idle_start_clk != 0) {
 			u64 now = scx_bpf_now();
-			/* 1.5ms threshold for cache locality */
-			if (now - ictx.taskc->last_stopping_clk < 1500000ULL) {
+			/*
+			 * Fix: 1.5ms is too aggressive for game render loops (often 2-4ms sleep).
+			 * Use 4ms (LAVD_SLICE_MAX_NS_DFL) to prevent L2 thrashing.
+			 */
+			if (now - ictx.taskc->last_stopping_clk < LAVD_SLICE_MAX_NS_DFL) {
 				cpu_id = prev_cpu;
 				found_idle = true;
 				goto fast_path_idle;
@@ -688,8 +709,13 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	if (!q_depth)
 		goto unlock_out;
 
-	/* Cap iterations to avoid O(N) stalls */
-	#define LAVD_DISPATCH_CAP 8
+	/*
+	 * FIX: Set cap to 16.
+	 * 8 (old local cap) -> Starves game threads.
+	 * 32 (header cap) -> E2BIG Verifier failure.
+	 * 16 -> Safe sweet spot for verification + finds hidden tasks.
+	 */
+	#define LAVD_DISPATCH_CAP_SAFE 16
 	u32 iter_cnt = 0;
 
 	/* Trusted iterator - p is trusted */
@@ -698,7 +724,7 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 		s32 new_cpu;
 
 		iter_cnt++;
-		if (iter_cnt > LAVD_DISPATCH_CAP)
+		if (iter_cnt > LAVD_DISPATCH_CAP_SAFE)
 			break;
 
 		if (is_pinned(p)) {
@@ -947,7 +973,7 @@ static void cpu_ctx_init_online(struct cpu_ctx *cpuc, u32 cpu_id, u64 now)
 	if (!cd_cpumask)
 		goto unlock_out;
 	bpf_cpumask_set_cpu(cpu_id, cd_cpumask);
-	unlock_out:
+unlock_out:
 	bpf_rcu_read_unlock();
 
 	cpuc->flags = 0;
@@ -970,7 +996,7 @@ static void cpu_ctx_init_offline(struct cpu_ctx *cpuc, u32 cpu_id, u64 now)
 	if (!cd_cpumask)
 		goto unlock_out;
 	bpf_cpumask_clear_cpu(cpu_id, cd_cpumask);
-	unlock_out:
+unlock_out:
 	bpf_rcu_read_unlock();
 
 	cpuc->flags = 0;
@@ -1141,7 +1167,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 		reset_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
 	bpf_rcu_read_unlock();
 
-	/* Upstream update: Track ksoftirqd threads */
 	if (is_ksoftirqd(p))
 		set_task_flag(taskc, LAVD_FLAG_KSOFTIRQD);
 	else
@@ -1158,6 +1183,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	taskc->cgrp_id = args->cgroup->kn->id;
 
 	set_on_core_type(taskc, p->cpus_ptr);
+
 	return 0;
 }
 
@@ -1244,7 +1270,7 @@ static int init_cpumasks(void)
 	err = calloc_cpumask(&little_cpumask);
 	if (err)
 		goto out;
-	out:
+out:
 	bpf_rcu_read_unlock();
 	return err;
 }
