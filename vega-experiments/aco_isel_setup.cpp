@@ -242,7 +242,7 @@ setup_nir(isel_context* ctx, nir_shader* nir)
 {
    nir_convert_to_lcssa(nir, true, false);
    if (nir_lower_phis_to_scalar(nir, ac_nir_lower_phis_to_scalar_cb, NULL)) {
-      nir_copy_prop(nir);
+      nir_opt_copy_prop(nir);
       nir_opt_dce(nir);
    }
 
@@ -367,7 +367,7 @@ assign_alu_regclass(isel_context* ctx, nir_alu_instr* alu_instr, RegClass* regcl
    const unsigned bitsize = alu_instr->def.bit_size;
 
    /* Packed 16-bit instructions have to be VGPR. */
-   if (num_components == 2 && aco_nir_op_supports_packed_math_16bit(alu_instr)) {
+   if (num_components == 2 && ac_nir_op_supports_packed_math_16bit(alu_instr)) {
       type = RegType::vgpr;
    } else {
       switch (alu_instr->op) {
