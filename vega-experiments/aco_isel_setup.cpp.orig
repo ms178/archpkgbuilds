@@ -234,7 +234,7 @@ setup_nir(isel_context* ctx, nir_shader* nir)
 {
    nir_convert_to_lcssa(nir, true, false);
    if (nir_lower_phis_to_scalar(nir, ac_nir_lower_phis_to_scalar_cb, NULL)) {
-      nir_copy_prop(nir);
+      nir_opt_copy_prop(nir);
       nir_opt_dce(nir);
    }
 
@@ -406,7 +406,7 @@ init_context(isel_context* ctx, nir_shader* shader)
 
                /* Packed 16-bit instructions have to be VGPR. */
                if (alu_instr->def.num_components == 2 &&
-                   aco_nir_op_supports_packed_math_16bit(alu_instr))
+                   ac_nir_op_supports_packed_math_16bit(alu_instr))
                   type = RegType::vgpr;
 
                switch (alu_instr->op) {
