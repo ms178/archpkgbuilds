@@ -12,6 +12,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 
 namespace KWin
 {
@@ -26,11 +27,14 @@ public:
     [[nodiscard]] std::chrono::nanoseconds result() const noexcept;
 
 private:
-    static constexpr std::size_t kHistorySize = 100;
+    static constexpr std::size_t kHistorySize = 64;
+    static constexpr std::size_t kHistoryMask = kHistorySize - 1;
 
-    std::array<double, kHistorySize> m_history{};
-    std::size_t m_count{0};
+    static_assert((kHistorySize & kHistoryMask) == 0, "kHistorySize must be power of 2");
+
+    alignas(64) std::array<double, kHistorySize> m_history{};
     std::size_t m_writeIndex{0};
+    std::size_t m_count{0};
     std::chrono::nanoseconds m_result{0};
 };
 

@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdint>
 
 namespace KWin
 {
@@ -19,12 +18,12 @@ RenderJournal::RenderJournal() = default;
 void RenderJournal::add(std::chrono::nanoseconds renderTime,
                         [[maybe_unused]] std::chrono::nanoseconds presentationTimestamp)
 {
-    const double renderTimeNs = static_cast<double>(renderTime.count());
+    const std::int64_t clampedNs = std::max(renderTime.count(), std::int64_t{0});
+    const double renderTimeNs = static_cast<double>(clampedNs);
 
     m_history[m_writeIndex] = renderTimeNs;
-    if (++m_writeIndex >= kHistorySize) {
-        m_writeIndex = 0;
-    }
+    m_writeIndex = (m_writeIndex + 1) & kHistoryMask;
+
     if (m_count < kHistorySize) {
         ++m_count;
     }
@@ -42,9 +41,9 @@ void RenderJournal::add(std::chrono::nanoseconds renderTime,
     const double invN = 1.0 / static_cast<double>(n);
     const double mean = sum * invN;
     const double variance = std::max(sumSq * invN - mean * mean, 0.0);
-    const double stdDev = std::sqrt(variance);
+    const double stddev = std::sqrt(variance);
 
-    m_result = std::chrono::nanoseconds{static_cast<std::int64_t>(std::round(mean + 3.0 * stdDev))};
+    m_result = std::chrono::nanoseconds{static_cast<std::int64_t>(std::round(mean + 3.0 * stddev))};
 }
 
 std::chrono::nanoseconds RenderJournal::result() const noexcept
