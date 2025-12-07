@@ -47,7 +47,7 @@ static once_flag init_once_flag = ONCE_FLAG_INIT;
 static void
 init_once()
 {
-   debug_flags = parse_debug_string(getenv("ACO_DEBUG"), aco_debug_options);
+   debug_flags = parse_debug_string(os_get_option("ACO_DEBUG"), aco_debug_options);
 
 #ifndef NDEBUG
    /* enable some flags by default on debug builds */
@@ -98,7 +98,7 @@ init_program(Program* program, Stage stage, const struct aco_shader_info* info,
          program->family = CHIP_NAVI31;
          break;
       case GFX11_5:
-         program->family = CHIP_GFX1150;
+         program->family = CHIP_STRIX1;
          break;
       case GFX12:
          program->family = CHIP_GFX1200;
@@ -137,7 +137,7 @@ init_program(Program* program, Stage stage, const struct aco_shader_info* info,
       program->dev.sgpr_alloc_granule = 128;
       program->dev.sgpr_limit = 108;
 
-      if (family == CHIP_NAVI31 || family == CHIP_NAVI32 || family == CHIP_GFX1151 ||
+      if (family == CHIP_NAVI31 || family == CHIP_NAVI32 || family == CHIP_STRIX_HALO ||
           gfx_level >= GFX12) {
          program->dev.physical_vgprs = program->wave_size == 32 ? 1536 : 768;
          program->dev.vgpr_alloc_granule = program->wave_size == 32 ? 24 : 12;
