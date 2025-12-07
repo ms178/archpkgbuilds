@@ -146,7 +146,8 @@ enum radv_cmd_dirty_bits {
    RADV_CMD_DIRTY_NGGC_SETTINGS = 1ull << 36,
    RADV_CMD_DIRTY_PS_EPILOG_SHADER = 1ull << 37,
    RADV_CMD_DIRTY_PS_EPILOG_STATE = 1ull << 38,
-   RADV_CMD_DIRTY_ALL = (1ull << 39) - 1,
+   RADV_CMD_DIRTY_FSR_SURFACE_STATE = 1ull << 39,
+   RADV_CMD_DIRTY_ALL = (1ull << 40) - 1,
 
    RADV_CMD_DIRTY_SHADER_QUERY = RADV_CMD_DIRTY_NGG_STATE | RADV_CMD_DIRTY_TASK_STATE,
 };
@@ -388,6 +389,7 @@ struct radv_rendering_state {
    bool active;
    bool has_image_views;
    bool has_input_attachment_concurrent_writes;
+   bool has_custom_resolves;
    VkRect2D area;
    uint32_t layer_count;
    uint32_t view_mask;
@@ -484,7 +486,8 @@ struct radv_cmd_state {
    struct radv_graphics_pipeline *emitted_graphics_pipeline;
    struct radv_compute_pipeline *compute_pipeline;
    struct radv_compute_pipeline *emitted_compute_pipeline;
-   struct radv_ray_tracing_pipeline *rt_pipeline; /* emitted = emitted_compute_pipeline */
+   struct radv_ray_tracing_pipeline *rt_pipeline;
+   struct radv_ray_tracing_pipeline *emitted_rt_pipeline;
    struct radv_shader_part *emitted_vs_prolog;
    struct radv_shader *emitted_ps;
    struct radv_shader_part *ps_epilog;
@@ -590,9 +593,10 @@ struct radv_enc_state {
    unsigned bits_output;
    unsigned bits_size;
    bool emulation_prevention;
-   bool is_even_frame;
    unsigned task_id;
    uint32_t *copy_start;
+   VkVideoEncodeRateControlModeFlagBitsKHR rate_control_mode;
+   uint32_t rate_control_num_layers;
 };
 
 struct radv_cmd_buffer_upload {
