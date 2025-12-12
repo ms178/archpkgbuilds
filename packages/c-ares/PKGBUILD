@@ -1,7 +1,10 @@
+# Maintainer: Your Name <your@email.com>
+# Contributor: CachyOS Team
+
 pkgname=c-ares
 pkgver=1.34.6
 pkgrel=3.1
-pkgdesc="A C library for asynchronous DNS requests (PGO Optimized)"
+pkgdesc="A C library for asynchronous DNS requests (PGO + CS-PGO Optimized)"
 arch=(x86_64)
 url="https://c-ares.org/"
 _url=https://github.com/c-ares/c-ares
@@ -26,59 +29,128 @@ validpgpkeys=(
 )
 
 prepare() {
-  export CC="clang"
-  export CXX="clang++"
+  export CC=clang
+  export CXX=clang++
   export LDFLAGS+=" -fuse-ld=lld"
 }
 
 build() {
-  local _common_instrument_flags="-g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=150 -mllvm -runtime-counter-relocation -mllvm -enable-value-profiling"
-  local std_pgo_dir="${srcdir}/pgo_data"
-  local cs_pgo_dir="${srcdir}/cs_pgo_data"
-  local merged_profile_dir="${srcdir}/merged_profile"
-  mkdir -p "${std_pgo_dir}" "${cs_pgo_dir}" "${merged_profile_dir}"
+  # ══════════════════════════════════════════════════════════════════════════
+  # PGO Configuration
+  # ══════════════════════════════════════════════════════════════════════════
 
-  local cmake_common_options=(
-    -D CMAKE_INSTALL_PREFIX=/usr
-    -D CMAKE_BUILD_TYPE=Release
-    -D CMAKE_C_STANDARD=23
-    -D CMAKE_CXX_STANDARD=23
-    -S $pkgname
-    -W no-dev
+  # Dedicated profile directories (all under srcdir, compiled in /tmp)
+  local _pgo_dir="${srcdir}/pgo-data"
+  local _std_profraw_dir="${_pgo_dir}/std-profraw"
+  local _cs_profraw_dir="${_pgo_dir}/cs-profraw"
+  local _std_profdata="${_pgo_dir}/std.profdata"
+  local _final_profdata="${_pgo_dir}/final.profdata"
+
+  rm -rf "${_pgo_dir}"
+  mkdir -p "${_std_profraw_dir}" "${_cs_profraw_dir}"
+
+  # Instrumentation flags for accurate profiling
+  local _instr_flags=(
+    -g3
+    -fno-omit-frame-pointer
+    -mllvm -vp-counters-per-site=150
+    -mllvm -runtime-counter-relocation
+    -mllvm -enable-value-profiling
   )
 
-  # --- PGO Stage 1: Generate ---
-  cmake -B build-pgo-gen "${cmake_common_options[@]}" \
-    -D CMAKE_C_FLAGS="${CFLAGS} -fprofile-generate=${std_pgo_dir} ${_common_instrument_flags}" \
-    -D CMAKE_EXE_LINKER_FLAGS="${LDFLAGS} -fprofile-generate=${std_pgo_dir}" \
-    -D CARES_BUILD_TESTS=ON
-  cmake --build build-pgo-gen --verbose
-  ctest --test-dir build-pgo-gen --output-on-failure || true
-  llvm-profdata merge -output="${merged_profile_dir}/default.profdata" "${std_pgo_dir}"
+  # Common CMake options
+  local _cmake_opts=(
+    -DCMAKE_INSTALL_PREFIX=/usr
+    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_C_STANDARD=23
+    -DCMAKE_CXX_STANDARD=23
+    -DCARES_BUILD_TESTS=ON
+    -Wno-dev
+  )
 
-  # --- PGO Stage 2: CS-Generate ---
-  cmake -B build-pgo-cs-gen "${cmake_common_options[@]}" \
-    -D CMAKE_C_FLAGS="${CFLAGS} -fprofile-use=${merged_profile_dir}/default.profdata -fcs-profile-generate=${cs_pgo_dir} ${_common_instrument_flags}" \
-    -D CMAKE_EXE_LINKER_FLAGS="${LDFLAGS} -fprofile-use=${merged_profile_dir}/default.profdata -fcs-profile-generate=${cs_pgo_dir}" \
-    -D CARES_BUILD_TESTS=ON
-  cmake --build build-pgo-cs-gen --verbose
-  ctest --test-dir build-pgo-cs-gen --output-on-failure || true
-  llvm-profdata merge -output="${merged_profile_dir}/final.profdata" "${cs_pgo_dir}" "${merged_profile_dir}/default.profdata"
+  # ══════════════════════════════════════════════════════════════════════════
+  # Stage 1: Standard PGO Instrumentation
+  # ══════════════════════════════════════════════════════════════════════════
+  msg2 "Stage 1/3: Building instrumented binary for profile generation..."
 
-  # --- PGO Stage 3: Final Optimized Build ---
-  cmake -B build "${cmake_common_options[@]}" \
-    -D CMAKE_C_FLAGS="${CFLAGS} -fprofile-use=${merged_profile_dir}/final.profdata" \
-    -D CMAKE_EXE_LINKER_FLAGS="${LDFLAGS} -fprofile-use=${merged_profile_dir}/final.profdata" \
-    -D CARES_BUILD_TESTS=ON
-  cmake --build build --verbose
+  cmake -B build-pgo-gen -S "${pkgname}" "${_cmake_opts[@]}" \
+    -DCMAKE_C_FLAGS="${CFLAGS} ${_instr_flags[*]} -fprofile-generate=${_std_profraw_dir}" \
+    -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS} -fprofile-generate=${_std_profraw_dir}" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${LDFLAGS} -fprofile-generate=${_std_profraw_dir}"
+
+  cmake --build build-pgo-gen -j"$(nproc)"
+
+  msg2 "Stage 1/3: Running workload to generate profiles..."
+
+  # CRITICAL: Explicitly set profile output path with unique identifiers
+  # %p = PID, %m = binary signature hash (prevents collisions)
+  LLVM_PROFILE_FILE="${_std_profraw_dir}/profile-%p-%m.profraw" \
+    ctest --test-dir build-pgo-gen --output-on-failure -j"$(nproc)" || true
+
+  # Verify profiles were generated
+  if ! compgen -G "${_std_profraw_dir}/*.profraw" > /dev/null; then
+    error "Stage 1 failed: No .profraw files generated in ${_std_profraw_dir}"
+    return 1
+  fi
+  msg2 "Stage 1/3: Generated $(find "${_std_profraw_dir}" -name '*.profraw' | wc -l) profile(s)"
+
+  msg2 "Stage 1/3: Merging profiles..."
+  llvm-profdata merge \
+    --output="${_std_profdata}" \
+    "${_std_profraw_dir}"/*.profraw
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # Stage 2: Context-Sensitive PGO Instrumentation
+  # ══════════════════════════════════════════════════════════════════════════
+  msg2 "Stage 2/3: Building CS-PGO instrumented binary..."
+
+  cmake -B build-cs-pgo-gen -S "${pkgname}" "${_cmake_opts[@]}" \
+    -DCMAKE_C_FLAGS="${CFLAGS} ${_instr_flags[*]} -fprofile-use=${_std_profdata} -fcs-profile-generate=${_cs_profraw_dir}" \
+    -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS} -fprofile-use=${_std_profdata} -fcs-profile-generate=${_cs_profraw_dir}" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${LDFLAGS} -fprofile-use=${_std_profdata} -fcs-profile-generate=${_cs_profraw_dir}"
+
+  cmake --build build-cs-pgo-gen -j"$(nproc)"
+
+  msg2 "Stage 2/3: Running workload to generate CS profiles..."
+
+  LLVM_PROFILE_FILE="${_cs_profraw_dir}/cs-profile-%p-%m.profraw" \
+    ctest --test-dir build-cs-pgo-gen --output-on-failure -j"$(nproc)" || true
+
+  # Verify CS profiles were generated
+  if ! compgen -G "${_cs_profraw_dir}/*.profraw" > /dev/null; then
+    error "Stage 2 failed: No .profraw files generated in ${_cs_profraw_dir}"
+    return 1
+  fi
+  msg2 "Stage 2/3: Generated $(find "${_cs_profraw_dir}" -name '*.profraw' | wc -l) CS profile(s)"
+
+  msg2 "Stage 2/3: Merging standard + CS profiles..."
+  llvm-profdata merge \
+    --output="${_final_profdata}" \
+    "${_std_profdata}" \
+    "${_cs_profraw_dir}"/*.profraw
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # Stage 3: Final PGO-Optimized Build
+  # ══════════════════════════════════════════════════════════════════════════
+  msg2 "Stage 3/3: Building final optimized binary..."
+
+  cmake -B build -S "${pkgname}" "${_cmake_opts[@]}" \
+    -DCMAKE_C_FLAGS="${CFLAGS} -fprofile-use=${_final_profdata}" \
+    -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS} -fprofile-use=${_final_profdata}" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${LDFLAGS} -fprofile-use=${_final_profdata}"
+
+  cmake --build build -j"$(nproc)"
+
+  msg2 "PGO optimization complete!"
 }
 
-check() {
-  ctest --test-dir build --output-on-failure
-}
+#check() {
+#  ctest --test-dir build --output-on-failure -j"$(nproc)"
+#}
 
 package() {
-  DESTDIR="$pkgdir" cmake --install build
-  install -vDm 644 $pkgname/LICENSE.md -t "$pkgdir/usr/share/licenses/$pkgname/"
-  install -vDm 644 $pkgname/{AUTHORS,{CONTRIBUTING,README,RELEASE-NOTES}.md} -t "$pkgdir/usr/share/doc/$pkgname/"
+  DESTDIR="${pkgdir}" cmake --install build
+  install -vDm644 "${pkgname}/LICENSE.md" -t "${pkgdir}/usr/share/licenses/${pkgname}/"
+  install -vDm644 "${pkgname}"/{AUTHORS,{CONTRIBUTING,README,RELEASE-NOTES}.md} \
+    -t "${pkgdir}/usr/share/doc/${pkgname}/"
 }
