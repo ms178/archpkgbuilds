@@ -117,6 +117,14 @@ MODULE_PARM_DESC(vega_pf_burst_ns,
 struct vega_recip_cache {
 	u64 recip_q38;
 	const void *adev_key;
+
+	/*
+	 * Cache VRAM usage percentage briefly to avoid pounding usage accounting
+	 * during page-fault storms. Per-CPU; safe under preempt_disable().
+	 */
+	unsigned long pct_last_j;
+	u32 pct_last;
+	u32 __pad;
 };
 
 static DEFINE_PER_CPU(struct vega_recip_cache, vega_recip_cache_pc);
@@ -186,7 +194,9 @@ static u32 amdgpu_vram_usage_pct_fast(struct amdgpu_device *adev)
 {
 	struct ttm_resource_manager *mgr;
 	u64 used_bytes;
+	u32 pct;
 	struct vega_recip_cache *cache;
+	unsigned long now_j, win_j;
 
 	if (unlikely(!adev))
 		return 0;
@@ -195,7 +205,7 @@ static u32 amdgpu_vram_usage_pct_fast(struct amdgpu_device *adev)
 	if (unlikely(!mgr))
 		return 0;
 
-	used_bytes = ttm_resource_manager_usage(mgr);
+	/* Must be called with preemption disabled (per original contract). */
 	cache = this_cpu_ptr(&vega_recip_cache_pc);
 
 	if (unlikely(cache->adev_key != adev)) {
@@ -203,9 +213,38 @@ static u32 amdgpu_vram_usage_pct_fast(struct amdgpu_device *adev)
 
 		cache->recip_q38 = div64_u64(100ULL << 38, vram_b);
 		cache->adev_key = adev;
+		cache->pct_last_j = 0;
+		cache->pct_last = 0;
 	}
 
-	return min_t(u32, mul_u64_u64_shr(used_bytes, cache->recip_q38, 38), 100U);
+	now_j = jiffies;
+
+	/*
+	 * Clamp caching window to avoid “oops I set it to seconds” problems.
+	 * We want milliseconds-ish for responsiveness.
+	 */
+	win_j = (unsigned long)vega_pf_streak_window_jiffies;
+	if (win_j == 0UL)
+		win_j = 1UL;
+	if (win_j > (unsigned long)(HZ / 20))
+		win_j = (unsigned long)(HZ / 20);
+
+	/*
+	 * When under high pressure, always refresh so damping reacts quickly.
+	 */
+	if (cache->pct_last < 90U &&
+	    cache->pct_last_j != 0UL &&
+	    time_before(now_j, cache->pct_last_j + win_j))
+		return cache->pct_last;
+
+	used_bytes = ttm_resource_manager_usage(mgr);
+	pct = min_t(u32,
+		    (u32)mul_u64_u64_shr(used_bytes, cache->recip_q38, 38),
+		    100U);
+
+	cache->pct_last = pct;
+	cache->pct_last_j = now_j;
+	return pct;
 }
 
 /* ============================================================================
@@ -322,6 +361,9 @@ amdgpu_gem_update_timeline_node(struct drm_file *filp,
 				struct drm_syncobj **syncobj,
 				struct dma_fence_chain **chain)
 {
+	*syncobj = NULL;
+	*chain = NULL;
+
 	if (!syncobj_handle)
 		return 0;
 
@@ -335,6 +377,7 @@ amdgpu_gem_update_timeline_node(struct drm_file *filp,
 	*chain = dma_fence_chain_alloc();
 	if (!*chain) {
 		drm_syncobj_put(*syncobj);
+		*syncobj = NULL;
 		return -ENOMEM;
 	}
 
@@ -404,15 +447,14 @@ amdgpu_vega_optimal_prefetch(struct amdgpu_device *adev,
 	struct vega_pf_state local_state;
 	struct vega_pf_state *pcs;
 	u32 vram_pct;
-	u32 want, total_pages, cap;
+	u32 want, total_pages, cap, cap_hw;
 	u64 bo_size;
 	bool is_compute, is_vram;
 	unsigned long now_j;
-	u64 now_ns, delta_ns;
-	long diff;
+	u64 now_ns;
 	bool state_valid;
 
-	if (unlikely(!adev || !abo || !vmf || base_pages == 0))
+	if (unlikely(!adev || !abo || !vmf || base_pages == 0U))
 		return base_pages;
 
 	bo_size = abo->tbo.base.size;
@@ -421,56 +463,68 @@ amdgpu_vega_optimal_prefetch(struct amdgpu_device *adev,
 
 	/*
 	 * Snapshot per-CPU state with preemption disabled.
-	 * Allows us to run complex stride logic with preemption enabled.
+	 * Keep tight: per-CPU reads + cached VRAM% helper only.
 	 */
 	preempt_disable();
 
 	vram_pct = amdgpu_vram_usage_pct_fast(adev);
 	pcs = this_cpu_ptr(&vega_pf_pc);
-
-	now_j = jiffies;
-	now_ns = local_clock();
-
-	/* Check if previous state is valid for this BO/VMA */
-	state_valid = (pcs->last_bo == (const void *)abo &&
-		       pcs->last_vma == (const void *)vmf->vma &&
-		       time_before(now_j,
-				   pcs->last_j + vega_pf_streak_window_jiffies));
-
-	if (state_valid)
-		local_state = *pcs;
-	else
-		memset(&local_state, 0, sizeof(local_state));
+	local_state = *pcs;
 
 	preempt_enable();
 
-	/* Cap based on VRAM pressure and TLB capacity */
-	if (is_vram)
-		cap = (vram_pct >= 90U) ? 40U : VEGA_TLB_AWARE_MAX_PAGES;
-	else
-		cap = min(vega_pf_max_pages_gtt, 64U);
+	now_j = jiffies;
+	now_ns = ktime_get_ns(); /* migration-safe global monotonic */
+
+	state_valid = (local_state.last_bo == (const void *)abo &&
+		       local_state.last_vma == (const void *)vmf->vma &&
+		       time_before(now_j,
+				   local_state.last_j +
+				   (unsigned long)vega_pf_streak_window_jiffies));
+
+	if (!state_valid) {
+		local_state.last_stride = 0U;
+		local_state.sequential_pages = 0U;
+		local_state.streak = 0U;
+		local_state.direction = 0U;
+		local_state.stride_repeat_count = 0U;
+	}
+
+	/*
+	 * Cap based on pressure + heuristic TLB sensitivity; also respect module
+	 * tunable vega_pf_max_pages_vram.
+	 */
+	if (is_vram) {
+		cap_hw = (vram_pct >= 90U) ? 40U : VEGA_TLB_AWARE_MAX_PAGES;
+		cap = min_t(u32, vega_pf_max_pages_vram, cap_hw);
+	} else {
+		cap = min_t(u32, vega_pf_max_pages_gtt, 64U);
+	}
 
 	cap = max(cap, PREFETCH_ABS_MIN_PAGES);
 
-	total_pages = (u32)min_t(u64, bo_size >> PAGE_SHIFT, U32_MAX);
+	total_pages = (u32)min_t(u64, bo_size >> PAGE_SHIFT, (u64)U32_MAX);
 	if (unlikely(total_pages == 0U))
 		total_pages = 1U;
 
-	/* Compute base want based on workload type */
+	/*
+	 * Under extreme VRAM pressure, later damping clamps to base_pages anyway.
+	 * Skip heavier heuristics to reduce fault CPU tail latency.
+	 */
+	if (unlikely(vram_pct >= 98U)) {
+		want = (u32)base_pages;
+		goto update_and_finalize;
+	}
+
 	if (is_compute && bo_size >= VEGA_COMPUTE_LARGE_BO_THRESHOLD) {
-		want = base_pages * 2U;
+		want = (u32)base_pages * 2U;
 	} else if (is_compute && bo_size <= VEGA_COMPUTE_SMALL_BO_THRESHOLD) {
-		want = max(base_pages / 2U, PREFETCH_ABS_MIN_PAGES);
+		want = max((u32)base_pages / 2U, PREFETCH_ABS_MIN_PAGES);
 	} else {
-		/*
-		 * Scale based on VRAM pressure:
-		 * Formula: scale = 120 - (vram_pct * 4 / 5)
-		 * Optimized: use fast_div5 to avoid division
-		 */
 		u32 pressure_adj = fast_div5(vram_pct << 2);
 		u32 scale_pct = 120U - pressure_adj;
 
-		want = fast_div100(base_pages * scale_pct);
+		want = fast_div100((u32)base_pages * scale_pct);
 
 		if (total_pages > 1U)
 			want += (u32)__fls(total_pages);
@@ -479,29 +533,24 @@ amdgpu_vega_optimal_prefetch(struct amdgpu_device *adev,
 			want += want >> 2;
 	}
 
-	/* Process streak state if valid */
 	if (state_valid) {
-		delta_ns = (now_ns >= local_state.last_ns) ?
-			   (now_ns - local_state.last_ns) : 0;
-		diff = (long)(vmf->address - local_state.last_addr);
+		unsigned long addr = vmf->address;
+		unsigned long last = local_state.last_addr;
 
-		if (diff != 0) {
-			unsigned long delta_pages;
-			int direction;
+		if (addr != last) {
+			unsigned long adiff = (addr > last) ? (addr - last) : (last - addr);
+			unsigned long delta_pages = adiff >> PAGE_SHIFT;
+			int direction = (addr > last) ? 1 : 2;
 
-			delta_pages = (unsigned long)((diff > 0) ? diff : -diff)
-				      >> PAGE_SHIFT;
-			direction = (diff > 0) ? 1 : 2;
-
-			/* Forward sequential access */
-			if (direction == 1 && delta_pages > 0 &&
+			if (direction == 1 && delta_pages > 0UL &&
 			    delta_pages <= (unsigned long)(want + 4U)) {
 				u32 boost;
+				u64 delta_ns = (now_ns >= local_state.last_ns) ?
+					       (now_ns - local_state.last_ns) : 0ULL;
 
 				if (local_state.streak < 4U)
 					local_state.streak++;
 
-				/* Track sequential pages for large page hints */
 				if (is_vram) {
 					u32 new_seq = (u32)local_state.sequential_pages +
 						      min_t(u32, (u32)delta_pages, 512U);
@@ -511,33 +560,26 @@ amdgpu_vega_optimal_prefetch(struct amdgpu_device *adev,
 					local_state.sequential_pages = 0U;
 				}
 
-				/* Burst boost: rapid sequential faults */
-				if (delta_ns && delta_ns <= vega_pf_burst_ns) {
+				if (delta_ns != 0ULL && delta_ns <= (u64)vega_pf_burst_ns) {
 					boost = want >> 1;
-					want = min_t(u32, want + boost,
-						     PREFETCH_BOOST_CAP);
+					want = min_t(u32, want + boost, PREFETCH_BOOST_CAP);
 				}
 
-				/* Streak boost */
-				if (local_state.streak > 0U) {
-					boost = (want * local_state.streak) >> 1;
-					want = min_t(u32, want + boost,
-						     PREFETCH_BOOST_CAP);
+				if (local_state.streak != 0U) {
+					boost = (want * (u32)local_state.streak) >> 1;
+					want = min_t(u32, want + boost, PREFETCH_BOOST_CAP);
 				}
 
-				/* Large page hint for sustained access */
 				if (is_vram &&
-				    local_state.sequential_pages >=
-				    VEGA_LARGE_PAGE_HINT_THRESHOLD &&
-				    want < 512U && total_pages >= 512U)
-					want = 512U;
+				    local_state.sequential_pages >= VEGA_LARGE_PAGE_HINT_THRESHOLD &&
+				    want < PREFETCH_ABS_MAX_PAGES &&
+				    total_pages >= PREFETCH_ABS_MAX_PAGES)
+					want = PREFETCH_ABS_MAX_PAGES;
 
-				/* Stride detection for compute */
-				if (is_compute && delta_pages > 1UL &&
-				    delta_pages <= 1024UL) {
+				if (is_compute && delta_pages > 1UL && delta_pages <= 1024UL) {
 					u32 stride = (u32)delta_pages;
 
-					if ((stride & (stride - 1)) == 0) {
+					if ((stride & (stride - 1U)) == 0U) {
 						if (local_state.last_stride == stride) {
 							if (local_state.stride_repeat_count < 255U)
 								local_state.stride_repeat_count++;
@@ -556,12 +598,12 @@ amdgpu_vega_optimal_prefetch(struct amdgpu_device *adev,
 					local_state.stride_repeat_count = 0U;
 				}
 			} else {
-				/* Reset on non-sequential access */
 				local_state.streak = 0U;
 				local_state.sequential_pages = 0U;
 				local_state.last_stride = 0U;
 				local_state.stride_repeat_count = 0U;
 			}
+
 			local_state.direction = (u8)direction;
 		} else {
 			local_state.streak = 0U;
@@ -572,7 +614,7 @@ amdgpu_vega_optimal_prefetch(struct amdgpu_device *adev,
 		}
 	}
 
-	/* Update per-CPU state */
+update_and_finalize:
 	local_state.last_bo = (const void *)abo;
 	local_state.last_vma = (const void *)vmf->vma;
 	local_state.last_addr = vmf->address;
@@ -583,24 +625,21 @@ amdgpu_vega_optimal_prefetch(struct amdgpu_device *adev,
 	*this_cpu_ptr(&vega_pf_pc) = local_state;
 	preempt_enable();
 
-	/* Pressure damping */
 	if (vram_pct >= 98U)
-		want = min(want, base_pages);
+		want = min(want, (u32)base_pages);
 	else if (vram_pct >= 95U)
-		want = min(want, (want + base_pages) >> 1);
+		want = min(want, (want + (u32)base_pages) >> 1);
 
-	/* Alignment for coalescing */
 	if (want >= 16U)
 		want &= ~15U;
 	else if (want >= 4U)
 		want &= ~3U;
 
-	/* Final clamping */
 	want = clamp_t(u32, want, PREFETCH_ABS_MIN_PAGES, PREFETCH_ABS_MAX_PAGES);
 	want = min(want, cap);
 	want = min(want, total_pages);
 
-	return want;
+	return (unsigned int)want;
 }
 
 /* ============================================================================
@@ -810,7 +849,7 @@ static void amdgpu_gem_object_close(struct drm_gem_object *obj,
 	struct dma_fence *fence = NULL;
 	struct amdgpu_bo_va *bo_va;
 	struct drm_exec exec;
-	long r;
+	long r = 0;
 
 	drm_exec_init(&exec, DRM_EXEC_IGNORE_DUPLICATES, 0);
 	drm_exec_until_all_locked(&exec) {
@@ -1099,21 +1138,18 @@ int amdgpu_gem_mmap_ioctl(struct drm_device *dev, void *data,
  */
 unsigned long amdgpu_gem_timeout(uint64_t timeout_ns)
 {
-	ktime_t timeout_kt, now_kt;
-	s64 remaining_ns;
+	u64 now_ns, remaining_ns;
 	unsigned long timeout_jiffies;
 
 	if (((int64_t)timeout_ns) < 0)
 		return MAX_SCHEDULE_TIMEOUT;
 
-	timeout_kt = ns_to_ktime(timeout_ns);
-	now_kt = ktime_get();
-
-	remaining_ns = ktime_to_ns(ktime_sub(timeout_kt, now_kt));
-	if (remaining_ns <= 0)
+	now_ns = ktime_get_ns();
+	if (timeout_ns <= now_ns)
 		return 0;
 
-	timeout_jiffies = nsecs_to_jiffies((u64)remaining_ns);
+	remaining_ns = timeout_ns - now_ns;
+	timeout_jiffies = nsecs_to_jiffies(remaining_ns);
 
 	if (timeout_jiffies >= MAX_SCHEDULE_TIMEOUT)
 		return MAX_SCHEDULE_TIMEOUT - 1;
@@ -1257,6 +1293,7 @@ error:
 uint64_t amdgpu_gem_va_map_flags(struct amdgpu_device *adev, uint32_t flags)
 {
 	uint64_t pte_flag = 0;
+	uint32_t mtype;
 
 	pte_flag |= (flags & AMDGPU_VM_PAGE_EXECUTABLE) ? AMDGPU_PTE_EXECUTABLE : 0;
 	pte_flag |= (flags & AMDGPU_VM_PAGE_READABLE) ? AMDGPU_PTE_READABLE : 0;
@@ -1266,9 +1303,9 @@ uint64_t amdgpu_gem_va_map_flags(struct amdgpu_device *adev, uint32_t flags)
 	if (flags & AMDGPU_VM_PAGE_PRT)
 		pte_flag |= AMDGPU_PTE_PRT_FLAG(adev);
 
-	if (adev->gmc.gmc_funcs->map_mtype)
-		pte_flag |= amdgpu_gmc_map_mtype(adev,
-						 flags & AMDGPU_VM_MTYPE_MASK);
+	mtype = flags & AMDGPU_VM_MTYPE_MASK;
+	if (mtype && adev->gmc.gmc_funcs->map_mtype)
+		pte_flag |= amdgpu_gmc_map_mtype(adev, mtype);
 
 	return pte_flag;
 }
@@ -1291,7 +1328,7 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 	struct amdgpu_bo_va *bo_va;
 	struct drm_syncobj *timeline_syncobj = NULL;
 	struct dma_fence_chain *timeline_chain = NULL;
-	struct dma_fence *fence;
+	struct dma_fence *fence = NULL;
 	struct drm_exec exec;
 	uint64_t va_flags;
 	uint64_t vm_size;
@@ -1299,21 +1336,18 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 
 	if (unlikely(args->va_address < AMDGPU_VA_RESERVED_BOTTOM ||
 		     (args->va_address >= AMDGPU_GMC_HOLE_START &&
-		      args->va_address < AMDGPU_GMC_HOLE_END))) {
+		      args->va_address < AMDGPU_GMC_HOLE_END)))
 		return -EINVAL;
-	}
 
 	args->va_address &= AMDGPU_GMC_HOLE_MASK;
 
 	vm_size = adev->vm_manager.max_pfn * AMDGPU_GPU_PAGE_SIZE;
 	vm_size -= AMDGPU_VA_RESERVED_TOP;
-	if (unlikely(args->map_size > vm_size - args->va_address)) {
+	if (unlikely(args->map_size > vm_size - args->va_address))
 		return -EINVAL;
-	}
 
-	if (unlikely((args->flags & ~valid_flags) && (args->flags & ~prt_flags))) {
+	if (unlikely((args->flags & ~valid_flags) && (args->flags & ~prt_flags)))
 		return -EINVAL;
-	}
 
 	switch (args->operation) {
 	case AMDGPU_VA_OP_MAP:
@@ -1328,7 +1362,7 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 	if ((args->operation != AMDGPU_VA_OP_CLEAR) &&
 	    !(args->flags & AMDGPU_VM_PAGE_PRT)) {
 		gobj = drm_gem_object_lookup(filp, args->handle);
-		if (gobj == NULL)
+		if (!gobj)
 			return -ENOENT;
 		abo = gem_to_amdgpu_bo(gobj);
 	} else {
@@ -1340,29 +1374,30 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 				       args->input_fence_syncobj_handles,
 				       args->num_syncobj_handles);
 	if (r)
-		goto error_put_gobj;
+		goto out_put_gobj;
 
 	drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT |
 		      DRM_EXEC_IGNORE_DUPLICATES, 0);
+
 	drm_exec_until_all_locked(&exec) {
 		if (gobj) {
 			r = drm_exec_lock_obj(&exec, gobj);
 			drm_exec_retry_on_contention(&exec);
 			if (unlikely(r))
-				goto error;
+				goto out_exec;
 		}
 
 		r = amdgpu_vm_lock_pd(&fpriv->vm, &exec, 2);
 		drm_exec_retry_on_contention(&exec);
 		if (unlikely(r))
-			goto error;
+			goto out_exec;
 	}
 
 	if (abo) {
 		bo_va = amdgpu_vm_bo_find(&fpriv->vm, abo);
 		if (!bo_va) {
 			r = -ENOENT;
-			goto error;
+			goto out_exec;
 		}
 	} else if (args->operation != AMDGPU_VA_OP_CLEAR) {
 		bo_va = fpriv->prt_va;
@@ -1376,7 +1411,7 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 					    &timeline_syncobj,
 					    &timeline_chain);
 	if (r)
-		goto error;
+		goto out_exec;
 
 	switch (args->operation) {
 	case AMDGPU_VA_OP_MAP:
@@ -1409,22 +1444,53 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 						args->operation);
 
 		if (timeline_syncobj) {
+			/*
+			 * Always pass a valid fence pointer to the helper and
+			 * always drop our reference afterwards. The timeline
+			 * update helpers will take their own references as
+			 * required.
+			 */
 			if (!fence)
 				fence = dma_fence_get_stub();
+
 			amdgpu_gem_update_bo_mapping(filp, bo_va,
 						     args->operation,
 						     args->vm_timeline_point,
-						     fence, timeline_syncobj,
+						     fence,
+						     timeline_syncobj,
 						     timeline_chain);
+
+			/*
+			 * drm_syncobj_add_point() is expected to consume the
+			 * chain object for point != 0.
+			 */
+			if (args->vm_timeline_point)
+				timeline_chain = NULL;
+
+			dma_fence_put(fence);
+			fence = NULL;
 		} else {
 			dma_fence_put(fence);
+			fence = NULL;
 		}
 	}
 
-error:
+out_exec:
+	if (fence)
+		dma_fence_put(fence);
+
+	if (timeline_syncobj)
+		drm_syncobj_put(timeline_syncobj);
+
+	if (timeline_chain)
+		dma_fence_put(&timeline_chain->base);
+
 	drm_exec_fini(&exec);
-error_put_gobj:
-	drm_gem_object_put(gobj);
+
+out_put_gobj:
+	if (gobj)
+		drm_gem_object_put(gobj);
+
 	return r;
 }
 
@@ -1505,31 +1571,42 @@ out:
 }
 
 static int amdgpu_gem_align_pitch(struct amdgpu_device *adev,
-				  int width,
-				  int cpp,
+				  u32 width,
+				  u32 cpp,
 				  bool tiled)
 {
-	int aligned = width;
-	int pitch_mask = 0;
+	u32 pitch_mask;
+	u32 aligned;
+	u64 pitch_bytes;
+
+	(void)adev;
+	(void)tiled;
 
 	switch (cpp) {
 	case 1:
-		pitch_mask = 255;
+		pitch_mask = 255U;
 		break;
 	case 2:
-		pitch_mask = 127;
+		pitch_mask = 127U;
 		break;
 	case 3:
 	case 4:
-		pitch_mask = 63;
+		pitch_mask = 63U;
 		break;
 	default:
-		break;
+		return -EINVAL;
 	}
 
-	aligned += pitch_mask;
-	aligned &= ~pitch_mask;
-	return aligned * cpp;
+	if (width > U32_MAX - pitch_mask)
+		return -EOVERFLOW;
+
+	aligned = (width + pitch_mask) & ~pitch_mask;
+
+	pitch_bytes = (u64)aligned * (u64)cpp;
+	if (pitch_bytes > (u64)U32_MAX)
+		return -EOVERFLOW;
+
+	return (int)pitch_bytes;
 }
 
 int amdgpu_mode_dumb_create(struct drm_file *file_priv,
@@ -1551,10 +1628,10 @@ int amdgpu_mode_dumb_create(struct drm_file *file_priv,
 		flags |= AMDGPU_GEM_CREATE_VRAM_CLEARED;
 
 	r = amdgpu_gem_align_pitch(adev, args->width,
-				     DIV_ROUND_UP(args->bpp, 8), 0);
+				  (u32)DIV_ROUND_UP(args->bpp, 8U), false);
 	if (r < 0)
 		return r;
-	args->pitch = r;
+	args->pitch = (u32)r;
 
 	if (check_mul_overflow((u64)args->pitch, (u64)args->height, &size))
 		return -EINVAL;
@@ -1564,9 +1641,10 @@ int amdgpu_mode_dumb_create(struct drm_file *file_priv,
 	domain = amdgpu_bo_get_preferred_domain(adev,
 				amdgpu_display_supported_domains(adev, flags));
 	r = amdgpu_gem_object_create(adev, size, 0, domain, flags,
-				     ttm_bo_type_device, NULL, &gobj, fpriv->xcp_id + 1);
+				     ttm_bo_type_device, NULL, &gobj,
+				     fpriv->xcp_id + 1);
 	if (r)
-		return -ENOMEM;
+		return r;
 
 	r = drm_gem_handle_create(file_priv, gobj, &handle);
 	drm_gem_object_put(gobj);
