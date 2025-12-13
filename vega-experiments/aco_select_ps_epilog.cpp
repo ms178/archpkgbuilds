@@ -345,12 +345,6 @@ export_fs_mrtz(isel_context* ctx, const struct aco_ps_epilog_info* info,
       }
    }
 
-   /* GFX6 (except OLAND and HAINAN) needs X mask bit set always. */
-   if (ctx->options->gfx_level == GFX6 &&
-       ctx->options->family != CHIP_OLAND &&
-       ctx->options->family != CHIP_HAINAN)
-      enabled_channels |= 0x1;
-
    bld.exp(aco_opcode::exp, values[0], values[1], values[2], values[3],
            enabled_channels, V_008DFC_SQ_EXP_MRTZ, compr);
 }
@@ -473,7 +467,7 @@ select_ps_epilog(Program* program, void* pinfo, ac_shader_config* config,
 
    program->config->float_mode = program->blocks[0].fp_mode.val;
 
-   append_logical_end(ctx.block);
+   append_logical_end(&ctx);
    ctx.block->kind |= block_kind_export_end;
    bld.reset(ctx.block);
    bld.sopp(aco_opcode::s_endpgm);
