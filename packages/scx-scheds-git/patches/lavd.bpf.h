@@ -3,9 +3,12 @@
  * scx_lavd: Latency-criticality Aware Virtual Deadline (LAVD) scheduler
  *
  * Optimized Header for Intel Raptor Lake (i7-14700KF)
- * - 64-byte Cache Line Alignment
+ * - 64-byte Cache Line Alignment for L1/L2 efficiency
  * - False Sharing Mitigation via struct padding
- * - C11 Atomics for Memory Model correctness
+ * - Aggressive timing for low-latency gaming/interactive workloads
+ *
+ * Copyright (c) 2023, 2024 Valve Corporation.
+ * Author: Changwoo Min <changwoo@igalia.com>
  */
 #ifndef __LAVD_H
 #define __LAVD_H
@@ -38,6 +41,18 @@
 #define time_delta(after, before) \
 	((after) >= (before) ? (after) - (before) : 0)
 
+/*
+ *  DSQ (dispatch queue) IDs are 64bit of the format:
+ *  Lower 63 bits are reserved by users
+ *
+ *   Bits: [63] [62 .. 14] [13 .. 12] [11 .. 0]
+ *         [ B] [    R   ] [    T   ] [   ID  ]
+ *
+ *    B: Sched_ext built-in ID bit, see include/linux/sched/ext.h
+ *    R: Reserved
+ *    T: Type of LAVD DSQ
+ *   ID: DSQ ID
+ */
 enum {
 	LAVD_DSQ_TYPE_SHFT		= 12,
 	LAVD_DSQ_TYPE_MASK		= 0x3 << LAVD_DSQ_TYPE_SHFT,
@@ -48,6 +63,14 @@ enum {
 	LAVD_DSQ_TYPE_CPU		= 0,
 };
 
+/*
+ * Common constants - Tuned for Intel Raptor Lake low-latency workloads
+ *
+ * Key tuning rationale:
+ * - LAVD_TARGETED_LATENCY_NS: 5ms vs upstream 10ms for snappier response
+ * - LAVD_SLICE_MAX_NS_DFL: 4ms vs 5ms reduces tail latencies on hybrid arch
+ * - LAVD_LC_FREQ_MAX: 400000 vs 100000 for finer granularity (2.5us vs 10us)
+ */
 enum consts_internal {
 	CLOCK_BOOTTIME			= 7,
 	CACHELINE_SIZE			= 64,
@@ -58,15 +81,26 @@ enum consts_internal {
 	LAVD_TIME_ONE_SEC		= (1000ULL * NSEC_PER_MSEC),
 	LAVD_MAX_RETRY			= 3,
 
-	LAVD_TARGETED_LATENCY_NS	= (10ULL * NSEC_PER_MSEC),
+	/*
+	 * TUNED: More aggressive latency target for gaming/interactive.
+	 */
+	LAVD_TARGETED_LATENCY_NS	= (5ULL * NSEC_PER_MSEC),
 	LAVD_SLICE_MIN_NS_DFL		= (500ULL * NSEC_PER_USEC),
-	LAVD_SLICE_MAX_NS_DFL		= (5ULL * NSEC_PER_MSEC),
+	/*
+	 * TUNED: Shorter max slice reduces tail latencies for interactive
+	 * workloads on P-core/E-core hybrid architectures.
+	 */
+	LAVD_SLICE_MAX_NS_DFL		= (4ULL * NSEC_PER_MSEC),
 	LAVD_SLICE_BOOST_BONUS		= LAVD_SLICE_MIN_NS_DFL,
 	LAVD_SLICE_BOOST_MAX		= (500ULL * NSEC_PER_MSEC),
 	LAVD_ACC_RUNTIME_MAX		= LAVD_SLICE_MAX_NS_DFL,
 	LAVD_DL_COMPETE_WINDOW		= (LAVD_SLICE_MAX_NS_DFL >> 16),
 
-	LAVD_LC_FREQ_MAX                = 400000,
+	/*
+	 * TUNED: Higher frequency tracking for more accurate latency
+	 * criticality. Enables 2.5us minimum interval vs upstream 10us.
+	 */
+	LAVD_LC_FREQ_MAX		= 400000,
 	LAVD_LC_RUNTIME_MAX		= LAVD_TIME_ONE_SEC,
 	LAVD_LC_WEIGHT_BOOST		= 128,
 	LAVD_LC_GREEDY_SHIFT		= 3,
@@ -106,43 +140,94 @@ enum consts_flags {
 	LAVD_FLAG_ON_LITTLE		= (0x1 << 7),
 	LAVD_FLAG_SLICE_BOOST		= (0x1 << 8),
 	LAVD_FLAG_IDLE_CPU_PICKED	= (0x1 << 9),
-	LAVD_FLAG_PINNED_COUNTED	= (0x1 << 10),
+	LAVD_FLAG_KSOFTIRQD		= (0x1 << 10),
 };
 
 /*
- * Compute Domain Context
- * Aligned to 64B to prevent false sharing during load balancing scans.
+ * Task context
+ *
+ * Cache line layout optimized for Intel Raptor Lake:
+ * - Line 0: SCX common (must be first per upstream requirement)
+ * - Line 1: Hot scheduling flags, slice, runtime stats
+ * - Line 2: Clock tracking, criticality, CPU IDs
+ * - Line 3: Cold introspection data
+ */
+struct task_ctx {
+	/* --- cacheline 0 boundary (0 bytes) --- */
+	/*
+	 * Do NOT change the position of atq. It should be at the beginning
+	 * of the task_ctx.
+	 */
+	struct scx_task_common atq __attribute__((aligned(CACHELINE_SIZE)));
+
+	/* --- cacheline 1 boundary (64 bytes) --- */
+	volatile u64	flags;		/* LAVD_FLAG_* */
+	u64	slice;			/* time slice */
+	u64	acc_runtime;		/* accumulated runtime from runnable to quiescent state */
+	u64	avg_runtime;		/* average runtime per schedule */
+	u64	svc_time;		/* total CPU time consumed for this task scaled by task's weight */
+	u64	wait_freq;		/* waiting frequency in a second */
+	u64	wake_freq;		/* waking-up frequency in a second */
+	u64	last_measured_clk;	/* last time when running time was measured */
+
+	/* --- cacheline 2 boundary (128 bytes) --- */
+	u64	last_runnable_clk;	/* last time when a task became runnable */
+	u64	last_running_clk;	/* last time when scheduled in */
+	u64	last_stopping_clk;	/* last time when scheduled out */
+	u64	run_freq;		/* scheduling frequency in a second */
+	u32	lat_cri;		/* final context-aware latency criticality */
+	u32	lat_cri_waker;		/* waker's latency criticality */
+	u32	perf_cri;		/* performance criticality of a task */
+	u32	cpdom_id;		/* chosen compute domain id at ops.enqueue() */
+	s32	pinned_cpu_id;		/* pinned CPU id. -ENOENT if not pinned or not runnable. */
+	u32	suggested_cpu_id;	/* suggested CPU ID at ops.enqueue() and ops.select_cpu() */
+	u32	prev_cpu_id;		/* where a task ran last time */
+	u32	cpu_id;			/* where a task is running now */
+
+	/* --- cacheline 3 boundary (192 bytes) --- */
+	u64	last_quiescent_clk;	/* last time when a task became asleep */
+	u64	last_sum_exec_clk;	/* last time when sum exec time was measured */
+	u64	cgrp_id;		/* cgroup id of this task */
+	u64	resched_interval;	/* reschedule interval in ns: [last running, this running] */
+	u64	last_slice_used;	/* time(ns) used in last scheduled interval: [last running, last stopping] */
+	pid_t	pid;			/* pid for this task */
+	pid_t	waker_pid;		/* last waker's PID */
+	char	waker_comm[TASK_COMM_LEN + 1]; /* last waker's comm */
+} __attribute__((aligned(CACHELINE_SIZE)));
+
+/*
+ * Compute domain context
+ * - system > numa node > llc domain > compute domain per core type (P or E)
+ *
+ * Layout: Read-only topology data in first cachelines, read-write load data
+ * isolated at 512-byte boundary to minimize cache line bouncing during
+ * load balancing operations.
  */
 struct cpdom_ctx {
-	/* Hot path: Accessed during enqueue/select_cpu */
-	u64	id;
-	u64	alt_id;
-	u32	sc_load;
-	u32	nr_queued_task;
-	u32	cur_util_sum;
-	u32	avg_util_sum;
-	u32	cap_sum_active_cpus;
-	u32	dsq_consume_lat;
-	u16	nr_cpus;
-	u16	nr_active_cpus;
-	u8	is_big;
-	u8	is_valid;
-	u8	is_stealer;
-	u8	is_stealee;
-	u8	numa_id;
-	u8	llc_id;
+	/* --- cacheline 0 boundary (0 bytes): read-only topology --- */
+	u64	id;				    /* id of this compute domain */
+	u64	alt_id;				    /* id of the closest compute domain of alternative type */
+	u8	numa_id;			    /* numa domain id */
+	u8	llc_id;				    /* llc domain id */
+	u8	is_big;				    /* is it a big core or little core? */
+	u8	is_valid;			    /* is this a valid compute domain? */
+	u8	nr_neighbors[LAVD_CPDOM_MAX_DIST];  /* number of neighbors per distance */
+	u64	__cpumask[LAVD_CPU_ID_MAX/64];	    /* cpumasks belongs to this compute domain */
+	u8	neighbor_ids[LAVD_CPDOM_MAX_DIST * LAVD_CPDOM_MAX_NR]; /* neighbor IDs per distance in circular distance order */
 
-	/* Warm/Cold path */
-	u32	cap_sum_temp;
-	u16	nr_acpus_temp;
-	u8	nr_neighbors[LAVD_CPDOM_MAX_DIST];
+	/* --- cacheline 8 boundary (512 bytes): read-write, read-mostly --- */
+	u8	is_stealer __attribute__((aligned(CACHELINE_SIZE))); /* this domain should steal tasks from others */
+	u8	is_stealee;			    /* stealer domain should steal tasks from this domain */
+	u16	nr_active_cpus;			    /* the number of active CPUs in this compute domain */
+	u16	nr_acpus_temp;			    /* temp for nr_active_cpus */
+	u32	sc_load;			    /* scaled load considering DSQ length and CPU utilization */
+	u32	nr_queued_task;			    /* the number of queued tasks in this domain */
+	u32	cur_util_sum;			    /* the sum of CPU utilization in the current interval */
+	u32	avg_util_sum;			    /* the sum of average CPU utilization */
+	u32	cap_sum_active_cpus;		    /* the sum of capacities of active CPUs in this domain */
+	u32	cap_sum_temp;			    /* temp for cap_sum_active_cpus */
+	u32	dsq_consume_lat;		    /* latency to consume from dsq, shows how contended the dsq is */
 
-	/* Pad to next cacheline for neighbor_ids array start */
-	u8	__pad0[2];
-
-	/* Read-mostly topology data */
-	u8	neighbor_ids[LAVD_CPDOM_MAX_DIST * LAVD_CPDOM_MAX_NR];
-	u64	__cpumask[LAVD_CPU_ID_MAX/64] __attribute__((aligned(CACHELINE_SIZE)));
 } __attribute__((aligned(CACHELINE_SIZE)));
 
 #define get_neighbor_id(cpdomc, d, i) ((cpdomc)->neighbor_ids[((d) * LAVD_CPDOM_MAX_NR) + (i)])
@@ -150,48 +235,6 @@ struct cpdom_ctx {
 extern struct cpdom_ctx		cpdom_ctxs[LAVD_CPDOM_MAX_NR];
 extern struct bpf_cpumask	cpdom_cpumask[LAVD_CPDOM_MAX_NR];
 extern int			nr_cpdoms;
-
-/*
- * Task Context
- * Reordered for packing efficiency.
- */
-struct task_ctx {
-	/* MUST be first: Upstream requirement for SCX */
-	struct scx_task_common atq;
-
-	/* Hot Path: State & Flags (accessed in enqueue/dispatch) */
-	volatile u64	flags;
-	u64		slice;
-	u32		lat_cri;
-	u32		perf_cri;
-	u32		cpu_id;
-	u32		prev_cpu_id;
-	u32		cpdom_id;
-	u32		suggested_cpu_id;
-	s32		pinned_cpu_id;
-
-	/* Warm Path: Statistics & Runtime accounting */
-	u64		last_runnable_clk;
-	u64		last_running_clk;
-	u64		last_stopping_clk;
-	u64		last_measured_clk;
-	u64		last_quiescent_clk;
-	u64		acc_runtime;
-	u64		avg_runtime;
-	u64		svc_time;
-	u64		run_freq;
-	u64		wait_freq;
-	u64		wake_freq;
-
-	/* Cold Path: Introspection & ID */
-	u64		cgrp_id;
-	u64		resched_interval;
-	u64		last_slice_used;
-	pid_t		pid;
-	pid_t		waker_pid;
-	u32		lat_cri_waker;
-	char		waker_comm[TASK_COMM_LEN + 1];
-} __attribute__((aligned(CACHELINE_SIZE)));
 
 typedef struct task_ctx __arena task_ctx;
 
@@ -203,62 +246,80 @@ struct cpu_ctx *get_cpu_ctx_id(s32 cpu_id);
 struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p);
 
 /*
- * CPU Context - Godlike Optimization for Raptor Lake SMT
+ * CPU context
+ *
+ * Optimized cache line layout for Intel Raptor Lake hybrid architecture:
+ * - Line 0: Hot preemption/scheduling state (flags, timing, criticality sums)
+ * - Line 1: Per-schedule counters, utilization, futex state
+ * - Line 2: Stolen time tracking, idle tracking, topology (read-mostly)
+ * - Line 3+: Temporary cpumask pointers (read-only after init)
+ *
+ * False sharing mitigation: Frequently updated fields grouped in lines 0-1,
+ * read-mostly/read-only fields isolated in later cache lines.
  */
 struct cpu_ctx {
-	/* CACHE LINE 0 (0-63): Local Execution State (Owner Write/Read) */
-	volatile u64	running_clk;
-	volatile u64	est_stopping_clk;
-	volatile u64	idle_start_clk;
-	volatile u64	flags;
-	volatile u32	cur_util;
-	volatile u32	avg_util;
-	u32		cpuperf_cur;
-	volatile u16	lat_cri;
-	u16		cpu_id;
-	u16		capacity;
-	u8		is_online;
-	u8		big_core;
-	u8		turbo_core;
-	u8		llc_id;
-	u8		cpdom_id;
-	u8		cpdom_alt_id;
-	u8		cpdom_poll_pos;
-	u8		__pad0[3];
+	/* --- cacheline 0 boundary (0 bytes): Hot scheduling state --- */
+	volatile u64	flags;		/* cached copy of task's flags */
+	volatile u64	tot_svc_time;	/* total service time on a CPU scaled by tasks' weights */
+	volatile u64	tot_sc_time;	/* total scaled CPU time, which is capacity and frequency invariant. */
+	volatile u64	est_stopping_clk; /* estimated stopping time */
+	volatile u64	running_clk;	/* when a task starts running */
+	volatile u16	lat_cri;	/* latency criticality */
+	volatile u32	max_lat_cri;	/* maximum latency criticality */
+	volatile u64	sum_lat_cri;	/* sum of latency criticality */
+	volatile u64	sum_perf_cri;	/* sum of performance criticality */
 
-	/* CACHE LINE 1 (64-127): Remote Inbound State (Remote Write) */
-	volatile u32	nr_pinned_tasks; /* ATOMIC HOTSPOT */
-	volatile s32	futex_op;
-	u8		__pad1[56];
+	/* --- cacheline 1 boundary (64 bytes): Per-schedule counters --- */
+	volatile u32	min_perf_cri;	/* minimum performance criticality */
+	volatile u32	max_perf_cri;	/* maximum performance criticality */
+	volatile u32	nr_sched;	/* number of schedules */
+	volatile u32	nr_preempt;	/* preemption count */
+	volatile u32	nr_x_migration;	/* cross-domain migration count */
+	volatile u32	nr_perf_cri;	/* performance critical task count */
+	volatile u32	nr_lat_cri;	/* latency critical task count */
+	volatile u32	nr_pinned_tasks; /* the number of pinned tasks waiting for running on this CPU */
+	volatile s32	futex_op;	/* futex op in futex V1 */
+	volatile u32	avg_util;	/* average of the CPU utilization */
+	volatile u32	cur_util;	/* CPU utilization of the current interval */
+	u32		cpuperf_cur;	/* CPU's current performance target */
+	volatile u32	avg_sc_util;	/* average of the scaled CPU utilization, which is capacity and frequency invariant. */
+	volatile u32	cur_sc_util;	/* the scaled CPU utilization of the current interval, which is capacity and frequency invariant. */
 
-	/* CACHE LINE 2 (128-191): Load Tracking & Stats (Shared Read/Write) */
-	volatile u64	tot_svc_time;
-	volatile u64	tot_sc_time;
-	volatile u64	cpu_release_clk;
-	volatile u64	idle_total;
-	volatile u32	cur_sc_util;
-	volatile u32	avg_sc_util;
-	volatile u64	sum_lat_cri;
-	volatile u64	sum_perf_cri;
+	volatile u64	cpu_release_clk; /* when the CPU is taken by higher-priority scheduler class */
 
-	/* CACHE LINE 3 (192-255): Stats Cold */
-	volatile u32	max_lat_cri;
-	volatile u32	nr_sched;
-	volatile u32	min_perf_cri;
-	volatile u32	max_perf_cri;
-	u64		online_clk;
-	u64		offline_clk;
-	volatile u32	nr_preempt;
-	volatile u32	nr_x_migration;
-	volatile u32	nr_perf_cri;
-	volatile u32	nr_lat_cri;
-	u8		__pad3[16];
+	/* --- cacheline 2 boundary (128 bytes): Stolen time + idle tracking --- */
+	volatile u32	avg_stolen_est;	/* Average of estimated steal/irq utilization of CPU */
+	volatile u32	cur_stolen_est;	/* Estimated irq/steal utilization of the current interval */
+	volatile u64	stolen_time_est; /* Estimated time stolen by steal/irq time on CPU */
 
-	/* CACHE LINE 4+ (256+): Pointers (Read-Only) */
-	struct bpf_cpumask __kptr *tmp_a_mask __attribute__((aligned(64)));
-	struct bpf_cpumask __kptr *tmp_o_mask;
-	struct bpf_cpumask __kptr *tmp_l_mask;
-	struct bpf_cpumask __kptr *tmp_i_mask;
+	/*
+	 * Idle tracking (read-mostly)
+	 */
+	volatile u64	idle_total;	/* total idle time so far */
+	volatile u64	idle_start_clk;	/* when the CPU becomes idle */
+	u64		online_clk;	/* when a CPU becomes online */
+	u64		offline_clk;	/* when a CPU becomes offline */
+
+	/*
+	 * Fields for core compaction (read-only after init)
+	 */
+	u16		cpu_id;		/* cpu id */
+	u16		capacity;	/* CPU capacity based on 1024 */
+	u8		big_core;	/* is it a big core? */
+	u8		turbo_core;	/* is it a turbo core? */
+	u8		llc_id;		/* llc domain id */
+	u8		cpdom_id;	/* compute domain id */
+	u8		cpdom_alt_id;	/* compute domain id of alternative type */
+	u8		is_online;	/* is this CPU online? */
+
+	/*
+	 * Temporary cpu masks (read-only pointers)
+	 */
+	struct bpf_cpumask __kptr *tmp_a_mask; /* for active set */
+	struct bpf_cpumask __kptr *tmp_o_mask; /* for overflow set */
+	/* --- cacheline 3 boundary (192 bytes) --- */
+	struct bpf_cpumask __kptr *tmp_l_mask; /* for online cpumask */
+	struct bpf_cpumask __kptr *tmp_i_mask; /* for idle cpumask */
 	struct bpf_cpumask __kptr *tmp_t_mask;
 	struct bpf_cpumask __kptr *tmp_t2_mask;
 	struct bpf_cpumask __kptr *tmp_t3_mask;
@@ -291,7 +352,12 @@ extern const volatile u8	verbose;
 					##__VA_ARGS__);			\
 })
 
-/* Compiler Hints & Math */
+/*
+ * Arithmetic helpers
+ *
+ * Using __auto_type for type safety - prevents silent truncation bugs
+ * and double-evaluation issues with simple macro expansion.
+ */
 #ifndef min
 #define min(X, Y) ({				\
 	__auto_type __x = (X);			\
@@ -328,49 +394,32 @@ extern const volatile u8	verbose;
 u64 calc_avg(u64 old_val, u64 new_val);
 u64 calc_asym_avg(u64 old_val, u64 new_val);
 
-/*
- * C11 Atomic Builtins
- */
-static __always_inline u32 atomic_read_u32(const volatile u32 *ptr)
-{
-	return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
-}
-
-static __always_inline void atomic_write_u32(volatile u32 *ptr, u32 val)
-{
-	__atomic_store_n(ptr, val, __ATOMIC_RELEASE);
-}
-
-static __always_inline void atomic_inc_u32(volatile u32 *ptr)
-{
-	__atomic_add_fetch(ptr, 1U, __ATOMIC_RELAXED);
-}
-
-static __always_inline void atomic_dec_u32(volatile u32 *ptr)
-{
-	__atomic_sub_fetch(ptr, 1U, __ATOMIC_RELAXED);
-}
-
-static __always_inline void atomic_add_u32(volatile u32 *ptr, u32 val)
-{
-	__atomic_add_fetch(ptr, val, __ATOMIC_RELAXED);
-}
-
-static __always_inline void atomic_sub_u32(volatile u32 *ptr, u32 val)
-{
-	__atomic_sub_fetch(ptr, val, __ATOMIC_RELAXED);
-}
-
+/* Bitmask helpers. */
 static __always_inline int cpumask_next_set_bit(u64 *cpumask)
 {
+	/*
+	 * Check the cpumask is not empty. ctzll(x) is only well-defined
+	 * for nonzero x; that's why we check for zero earlier to avoid
+	 * undefined behavior.
+	 */
 	if (!*cpumask)
 		return -ENOENT;
-	int bit = __builtin_ctzll(*cpumask);
+
+	/* Find the next set bit. */
+	int bit = ctzll(*cpumask);
+
+	/*
+	 * This is equivalent to finding and clearing the least significant set
+	 * bit.  The statement works because subtracting one from a nonzero bit
+	 * flips all bits from the lowest set bit (inclusive) to the rightmost
+	 * position; Then, The logic here ANDing it with the original value
+	 * clears the lowest set bit.
+	 */
 	*cpumask &= *cpumask - 1;
 	return bit;
 }
 
-/* System Stats & Globals */
+/* System statistics module. */
 extern struct sys_stat		sys_stat;
 
 s32 init_sys_stat(u64 now);
@@ -380,6 +429,7 @@ extern volatile u64		performance_mode_ns;
 extern volatile u64		balanced_mode_ns;
 extern volatile u64		powersave_mode_ns;
 
+/* Helpers from util.bpf.c for querying CPU/task state. */
 extern const volatile bool	per_cpu_dsq;
 extern const volatile u64	pinned_slice_ns;
 
@@ -410,8 +460,15 @@ static __always_inline bool use_per_cpu_dsq(void)
 	return unlikely(per_cpu_dsq || pinned_slice_ns);
 }
 
-static __always_inline  bool is_per_cpu_dsq_migratable(void)
+static __always_inline bool is_per_cpu_dsq_migratable(void)
 {
+	/*
+	 * When per_cpu-dsq is on, all tasks go to the per-CPU DSQ.
+	 * So a task on a per-CPU DSQ can be migrated to another CPU.
+	 * However, when pinned_slice_ns is on but per_cpu-dsq is not,
+	 * only pinned tasks go to the per-CPU DSQ.
+	 * Hence, tasks in a per-CPU DSQ are not migratable.
+	 */
 	return per_cpu_dsq;
 }
 
@@ -429,6 +486,7 @@ extern struct bpf_cpumask __kptr *little_cpumask;
 extern struct bpf_cpumask __kptr *active_cpumask;
 extern struct bpf_cpumask __kptr *ovrflw_cpumask;
 
+/* Power management helpers. */
 int do_core_compaction(void);
 int update_thr_perf_cri(void);
 int reinit_active_cpumask_for_performance(void);
@@ -455,17 +513,28 @@ int reset_suspended_duration(struct cpu_ctx *cpuc);
 u64 get_suspended_duration_and_reset(struct cpu_ctx *cpuc);
 
 const volatile u16 *get_cpu_order(void);
+
+/* Load balancer helpers. */
 int plan_x_cpdom_migration(void);
+
+/* Preemption management helpers. */
 void shrink_slice_at_tick(struct task_struct *p, struct cpu_ctx *cpuc, u64 now);
+
+/* Futex lock-related helpers. */
 void reset_lock_futex_boost(task_ctx *taskc, struct cpu_ctx *cpuc);
 
+/* Scheduler introspection-related helpers. */
 u64 get_est_stopping_clk(task_ctx *taskc, u64 now);
 void try_proc_introspec_cmd(struct task_struct *p, task_ctx *taskc);
 void reset_cpu_preemption_info(struct cpu_ctx *cpuc, bool released);
 int shrink_boosted_slice_remote(struct cpu_ctx *cpuc, u64 now);
-void shrink_boosted_slice_at_tick(struct task_struct *p, struct cpu_ctx *cpuc, u64 now);
+void shrink_boosted_slice_at_tick(struct task_struct *p,
+				  struct cpu_ctx *cpuc, u64 now);
 void preempt_at_tick(struct task_struct *p, struct cpu_ctx *cpuc);
-void try_find_and_kick_victim_cpu(struct task_struct *p, task_ctx *taskc, s32 preferred_cpu, u64 dsq_id);
+void try_find_and_kick_victim_cpu(struct task_struct *p,
+				  task_ctx *taskc,
+				  s32 preferred_cpu,
+				  u64 dsq_id);
 
 extern volatile bool is_monitored;
 

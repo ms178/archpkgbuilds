@@ -1,6 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  * System statistics collection for LAVD scheduler.
+ *
+ * Copyright (c) 2023, 2024 Valve Corporation.
+ * Author: Changwoo Min <changwoo@igalia.com>
  */
 
 #include <scx/common.bpf.h>
@@ -26,9 +29,11 @@ const volatile bool	__weak is_autopilot_on;
 int do_autopilot(void);
 u32 calc_avg32(u32 old_val, u32 new_val);
 u64 calc_avg(u64 old_val, u64 new_val);
-u64 calc_asym_avg(u64 old_val, u64 new_val);
 int update_power_mode_time(void);
 
+/*
+ * Timer for updating system-wide status periodically
+ */
 struct update_timer {
 	struct bpf_timer timer;
 };
@@ -78,9 +83,7 @@ static void init_sys_stat_ctx(struct sys_stat_ctx *c)
 
 	c->min_perf_cri = LAVD_SCALE;
 	c->now = scx_bpf_now();
-	c->duration = time_delta(c->now, last);
-	if (!c->duration)
-		c->duration = 1;
+	c->duration = time_delta(c->now, last) ?: 1;
 	WRITE_ONCE(sys_stat.last_update_clk, c->now);
 }
 
@@ -90,6 +93,9 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 	u64 cpdom_id, cpuc_tot_sc_time, compute;
 	int cpu;
 
+	/*
+	 * Collect statistics for each compute domain.
+	 */
 	bpf_for(cpdom_id, 0, nr_cpdoms) {
 		int i, j, k;
 
@@ -97,7 +103,7 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 			break;
 
 		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
-		if (!cpdomc) {
+		if (unlikely(!cpdomc)) {
 			scx_bpf_error("cpdom_ctx %llu missing", cpdom_id);
 			break;
 		}
@@ -109,7 +115,6 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		if (use_cpdom_dsq())
 			cpdomc->nr_queued_task = scx_bpf_dsq_nr_queued(cpdom_to_dsq(cpdom_id));
 
-		/* Upstream fix: Iterate CPUs unconditionally to count local DSQ load */
 		bpf_for(i, 0, LAVD_CPU_ID_MAX / 64) {
 			u64 cpumask = cpdomc->__cpumask[i];
 
@@ -132,27 +137,59 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		c->nr_queued_task += cpdomc->nr_queued_task;
 	}
 
+	/*
+	 * Collect statistics for each CPU (phase 1).
+	 *
+	 * Note that we divide the loop into phases 1 and 2 to lower the
+	 * verification burden and to avoid a verification error. Someday,
+	 * when the verifier gets smarter, we can merge phases 1 and 2
+	 * into one.
+	 */
 	bpf_for(cpu, 0, nr_cpu_ids) {
 		struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
 
-		if (!cpuc)
-			continue;
+		if (unlikely(!cpuc)) {
+			c->compute_total = 0;
+			break;
+		}
 
+		/*
+		 * When pinned tasks are waiting to run on this CPU
+		 * or a system is overloaded (so the slice cannot be boosted
+		 * or there are pending tasks to run), shrink the time slice
+		 * of slice-boosted tasks.
+		 */
 		if (cpuc->nr_pinned_tasks || !can_boost_slice() ||
 		    scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cpu_id))
 			shrink_boosted_slice_remote(cpuc, c->now);
 
+		/*
+		 * Accumulate cpus' loads.
+		 */
 		c->tot_svc_time += cpuc->tot_svc_time;
 		cpuc->tot_svc_time = 0;
 
+		/*
+		 * Update scaled CPU utilization,
+		 * which is capacity and frequency invariant.
+		 *
+		 * Note: We do NOT clear cpuc->tot_sc_time here; it's captured
+		 * and cleared in phase 2 to ensure correct per-CPU tsct_spike
+		 * accumulation.
+		 */
 		cpuc_tot_sc_time = cpuc->tot_sc_time;
-
-		if (c->duration)
-			cpuc->cur_sc_util = (cpuc_tot_sc_time << LAVD_SHIFT) / c->duration;
+		cpuc->cur_sc_util = (cpuc_tot_sc_time << LAVD_SHIFT) / c->duration;
 		cpuc->avg_sc_util = calc_avg(cpuc->avg_sc_util, cpuc->cur_sc_util);
 
+		/*
+		 * Accumulate cpus' scaled loads,
+		 * which is capacity and frequency invariant.
+		 */
 		c->tot_sc_time += cpuc_tot_sc_time;
 
+		/*
+		 * Accumulate statistics.
+		 */
 		if (cpuc->big_core) {
 			c->nr_big += cpuc->nr_sched;
 			c->nr_pc_on_big += cpuc->nr_perf_cri;
@@ -167,6 +204,13 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		c->nr_x_migration += cpuc->nr_x_migration;
 		cpuc->nr_x_migration = 0;
 
+		/*
+		 * Accumulate task's latency criticality information.
+		 *
+		 * While updating cpu->* is racy, the resulting impact on
+		 * accuracy should be small and very rare and thus should be
+		 * fine.
+		 */
 		c->sum_lat_cri += cpuc->sum_lat_cri;
 		cpuc->sum_lat_cri = 0;
 
@@ -181,14 +225,26 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		cpuc->max_lat_cri = 0;
 	}
 
+	/*
+	 * Collect statistics for each CPU (phase 2).
+	 */
 	bpf_for(cpu, 0, nr_cpu_ids) {
 		struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
 
-		if (!cpuc)
-			continue;
+		if (unlikely(!cpuc)) {
+			c->compute_total = 0;
+			break;
+		}
 
+		/*
+		 * Capture per-CPU tot_sc_time for this iteration.
+		 * This is the value we'll use for tsct_spike below.
+		 */
 		cpuc_tot_sc_time = cpuc->tot_sc_time;
 
+		/*
+		 * Accumulate task's performance criticality information.
+		 */
 		if (have_little_core) {
 			if (cpuc->min_perf_cri < c->min_perf_cri)
 				c->min_perf_cri = cpuc->min_perf_cri;
@@ -202,6 +258,10 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 			cpuc->sum_perf_cri = 0;
 		}
 
+		/*
+		 * If the CPU is in an idle state (i.e., idle_start_clk is
+		 * non-zero), accumulate the current idle period so far.
+		 */
 		for (int i = 0; i < LAVD_MAX_RETRY; i++) {
 			u64 old_clk = cpuc->idle_start_clk;
 
@@ -216,9 +276,12 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 			}
 		}
 
+		/*
+		 * Calculate per-CPU utilization.
+		 */
 		compute = time_delta(c->duration, cpuc->idle_total);
-		if (c->duration)
-			cpuc->cur_util = (compute << LAVD_SHIFT) / c->duration;
+
+		cpuc->cur_util = (compute << LAVD_SHIFT) / c->duration;
 		cpuc->avg_util = calc_asym_avg(cpuc->avg_util, cpuc->cur_util);
 
 		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
@@ -227,9 +290,28 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 			cpdomc->avg_util_sum += cpuc->avg_util;
 		}
 
+		/*
+		 * cpuc->cur_stolen_est is only an estimate of the time stolen by
+		 * irq/steal during execution times. We extrapolate that ratio to
+		 * the rest of CPU time as an approximation.
+		 *
+		 * Guard against divide-by-zero when compute is 0 (fully idle CPU).
+		 */
+		if (likely(compute > 0)) {
+			cpuc->cur_stolen_est = (cpuc->stolen_time_est << LAVD_SHIFT) / compute;
+			cpuc->avg_stolen_est = calc_asym_avg(cpuc->avg_stolen_est, cpuc->cur_stolen_est);
+		}
+		cpuc->stolen_time_est = 0;
+
+		/*
+		 * Accumulate system-wide idle time.
+		 */
 		c->idle_total += cpuc->idle_total;
 		cpuc->idle_total = 0;
 
+		/*
+		 * Track the scaled time when the utilization spikes happened.
+		 */
 		if (cpuc->cur_util > LAVD_CC_UTIL_SPIKE)
 			c->tsct_spike += cpuc_tot_sc_time;
 
@@ -242,10 +324,10 @@ static void calc_sys_stat(struct sys_stat_ctx *c)
 	static int cnt;
 	u64 avg_svc_time = 0, cur_sc_util, scu_spike;
 
-	c->duration_total = c->duration * (nr_cpus_onln ? nr_cpus_onln : 1);
-	if (!c->duration_total)
-		c->duration_total = 1;
-
+	/*
+	 * Calculate the CPU utilization.
+	 */
+	c->duration_total = c->duration * (nr_cpus_onln ?: 1);
 	c->compute_total = time_delta(c->duration_total, c->idle_total);
 	c->cur_util = (c->compute_total << LAVD_SHIFT) / c->duration_total;
 
@@ -253,10 +335,40 @@ static void calc_sys_stat(struct sys_stat_ctx *c)
 	if (cur_sc_util > c->cur_util)
 		cur_sc_util = min(sys_stat.avg_sc_util, c->cur_util);
 
+	/*
+	 * Suppose that a CPU can provide the compute capacity up to 100 and
+	 * task A running on the CPU A consumed the compute capacity 100.
+	 * Then the measured CPU utilization is of course 100%.
+	 *
+	 * However, what if task A is a CPU-bound, consuming a lot more CPU
+	 * cycles? In that case, if task A is scheduled on a more powerful
+	 * CPU B whose capacity is, say 200. Task A may consume 130 out of 200
+	 * on CPU B. In that case, the true capacity for task A should be 130,
+	 * not 100. This is what we want to measure at a given moment to
+	 * eventually calculate the required capacity.
+	 *
+	 * In other words, when a CPU is almost fully utilized (say 90%)
+	 * during a period, we may underestimate the utilization. For example,
+	 * when the measured CPU utilization is 100%, there is a possibility
+	 * that the actual utilization is actually higher, such as 130%.
+	 *
+	 * To handle such utilization spike cases, we give a 50% premium for
+	 * the scaled CPU time where the CPU is almost fully utilized. This
+	 * overestimates the scaled CPU utilization and required compute
+	 * capacity and finally allocates more active CPUs. The over-allocated
+	 * CPUs become the breathing room.
+	 */
 	scu_spike = (c->tsct_spike << (LAVD_SHIFT - 1)) / c->duration_total;
 	c->cur_sc_util = min(cur_sc_util + scu_spike, (u64)LAVD_SCALE);
 
+	/*
+	 * Update min/max/avg.
+	 */
 	if (!c->nr_sched || !c->compute_total) {
+		/*
+		 * When a system is completely idle, it is indeed possible
+		 * nothing scheduled for an interval.
+		 */
 		c->max_lat_cri = sys_stat.max_lat_cri;
 		c->avg_lat_cri = sys_stat.avg_lat_cri;
 
@@ -271,6 +383,9 @@ static void calc_sys_stat(struct sys_stat_ctx *c)
 			c->avg_perf_cri = c->sum_perf_cri / c->nr_sched;
 	}
 
+	/*
+	 * Update the CPU utilization to the next version.
+	 */
 	sys_stat.avg_util = calc_asym_avg(sys_stat.avg_util, c->cur_util);
 	sys_stat.avg_sc_util = calc_asym_avg(sys_stat.avg_sc_util, c->cur_sc_util);
 	sys_stat.max_lat_cri = calc_avg32(sys_stat.max_lat_cri, c->max_lat_cri);
@@ -289,6 +404,10 @@ static void calc_sys_stat(struct sys_stat_ctx *c)
 	sys_stat.avg_svc_time = calc_avg(sys_stat.avg_svc_time, avg_svc_time);
 	sys_stat.nr_queued_task = calc_avg(sys_stat.nr_queued_task, c->nr_queued_task);
 
+	/*
+	 * Half the statistics every minute so the statistics hold the
+	 * information on a few minutes.
+	 */
 	if (cnt++ == LAVD_SYS_STAT_DECAY_TIMES) {
 		cnt = 0;
 		sys_stat.nr_sched >>= 1;
@@ -319,16 +438,22 @@ static void calc_sys_stat(struct sys_stat_ctx *c)
 
 static void calc_sys_time_slice(void)
 {
-	u64 nr_q = sys_stat.nr_queued_task;
-	u64 nr_active = sys_stat.nr_active ? sys_stat.nr_active : 1;
-	u64 slice;
+	u64 nr_q, slice;
 
-	if (nr_q)
+	/*
+	 * Given the updated state, recalculate the time slice for the next
+	 * round. The time slice should be short enough to schedule all
+	 * runnable tasks at least once within a targeted latency using the
+	 * active CPUs.
+	 */
+	nr_q = sys_stat.nr_queued_task;
+	if (nr_q > 0) {
+		u64 nr_active = sys_stat.nr_active ?: 1;
 		slice = (LAVD_TARGETED_LATENCY_NS * nr_active) / nr_q;
-	else
+		slice = clamp(slice, slice_min_ns, slice_max_ns);
+	} else {
 		slice = slice_max_ns;
-
-	slice = clamp(slice, slice_min_ns, slice_max_ns);
+	}
 	sys_stat.slice = calc_avg(sys_stat.slice, slice);
 }
 
@@ -346,11 +471,21 @@ static int do_update_sys_stat(void)
 __weak
 int update_sys_stat(void)
 {
+	/*
+	 * Update system statistics.
+	 */
 	do_update_sys_stat();
 
+	/*
+	 * Change the power profile based on the statistics.
+	 */
 	if (is_autopilot_on)
 		do_autopilot();
 
+	/*
+	 * Perform core compaction for powersave and balance mode.
+	 * Or turn on all CPUs for performance mode.
+	 */
 	if (!no_core_compaction)
 		do_core_compaction();
 
@@ -359,9 +494,15 @@ int update_sys_stat(void)
 		reinit_active_cpumask_for_performance();
 	}
 
+	/*
+	 * Update time slice and performance criticality threshold.
+	 */
 	calc_sys_time_slice();
 	update_thr_perf_cri();
 
+	/*
+	 * Plan cross-domain task migration.
+	 */
 	if (nr_cpdoms > 1)
 		plan_x_cpdom_migration();
 
@@ -394,7 +535,7 @@ s32 init_sys_stat(u64 now)
 	int err;
 
 	sys_stat.last_update_clk = now;
-	sys_stat.nr_active = nr_cpus_onln ? nr_cpus_onln : 1;
+	sys_stat.nr_active = nr_cpus_onln ?: 1;
 	sys_stat.slice = slice_max_ns;
 	sys_stat.nr_active_cpdoms = 0;
 
