@@ -122,6 +122,28 @@ static void ixgbe_gaming_atr_clear_filters(struct ixgbe_adapter *adapter);
  * ═══════════════════════════════════════════════════════════════
  */
 
+/* Gaming ITR Constants - Safer minimums to prevent TX hangs */
+#define IXGBE_GAMING_ITR_MIN		8	/* 16µs minimum */
+#define IXGBE_GAMING_ITR_LOW		10	/* 20µs */
+#define IXGBE_GAMING_ITR_MED		14	/* 28µs */
+#define IXGBE_GAMING_ITR_HIGH		20	/* 40µs */
+
+/* Local definition to avoid header dependency issues if not present */
+#ifndef IXGBE_MAX_GAMING_FILTERS
+#define IXGBE_MAX_GAMING_FILTERS 64
+#define IXGBE_GAMING_IPV4_BASE   0
+#define IXGBE_GAMING_IPV6_BASE   32
+#define IXGBE_GAMING_IPV4_MAX    32
+#define IXGBE_GAMING_IPV6_MAX    32
+
+struct ixgbe_gaming_filter {
+	u16 port;
+	u16 soft_id;
+	u8  ip_version;
+	bool active;
+};
+#endif
+
 static __always_inline bool ixgbe_is_primary_thread(unsigned int cpu)
 {
 	const struct cpumask *sibs = topology_sibling_cpumask(cpu);
@@ -171,6 +193,7 @@ static int ixgbe_build_pcore_mask(struct ixgbe_adapter *adapter,
 
 	cpumask_clear(pcore_mask);
 	if (max_cap > 0) {
+		/* Select CPUs within 90% of max capacity to isolate P-cores */
 		threshold = (max_cap * 9) / 10;
 		for_each_cpu(cpu, primaries) {
 			if (ixgbe_cpu_capacity(cpu) >= threshold)
@@ -231,7 +254,6 @@ static int ixgbe_parse_gaming_ports(const char *ranges, u16 *ports, int max_port
 	return count;
 }
 
-/* Initialize the Gaming ATR lock and counters within the adapter struct */
 static void ixgbe_gaming_atr_init(struct ixgbe_adapter *adapter)
 {
 	spin_lock_init(&adapter->gaming_fdir_lock);
@@ -240,10 +262,10 @@ static void ixgbe_gaming_atr_init(struct ixgbe_adapter *adapter)
 	adapter->gaming_atr_enabled = false;
 }
 
-/* Clear filters from hardware and reset software state */
 static void ixgbe_gaming_atr_clear_filters(struct ixgbe_adapter *adapter)
 {
 	struct ixgbe_hw *hw = &adapter->hw;
+	/* Create a stack copy to avoid holding the lock during hardware access */
 	struct ixgbe_gaming_filter old_filters[IXGBE_MAX_GAMING_FILTERS];
 	u16 old_count;
 	int i;
@@ -259,7 +281,10 @@ static void ixgbe_gaming_atr_clear_filters(struct ixgbe_adapter *adapter)
 
 	if (!old_count) return;
 
-	/* Perform hardware writes without holding the spinlock */
+	/* Erase filters from hardware.
+	 * Note: We rely on the fact that we've cleared the SW state,
+	 * so race conditions on re-programming are minimized.
+	 */
 	for (i = 0; i < old_count; i++) {
 		struct ixgbe_gaming_filter *gf = &old_filters[i];
 		union ixgbe_atr_input input;
@@ -274,12 +299,10 @@ static void ixgbe_gaming_atr_clear_filters(struct ixgbe_adapter *adapter)
 		else
 			input.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV6;
 
-		/* Best effort erase */
 		ixgbe_fdir_erase_perfect_filter_82599(hw, &input, gf->soft_id);
 	}
 }
 
-/* Program filters into hardware based on module parameters */
 static int ixgbe_gaming_atr_program_filters(struct ixgbe_adapter *adapter)
 {
 	struct ixgbe_hw *hw = &adapter->hw;
@@ -289,40 +312,45 @@ static int ixgbe_gaming_atr_program_filters(struct ixgbe_adapter *adapter)
 	union ixgbe_atr_input mask;
 	u8 queue = 0;
 
-	/* Only supported on 82599 and newer */
 	if (hw->mac.type < ixgbe_mac_82599EB) return 0;
 	if (!gaming_atr_ranges || !*gaming_atr_ranges) return 0;
+
+	/* Check if already enabled to avoid double-programming */
+	spin_lock_bh(&adapter->gaming_fdir_lock);
+	if (adapter->gaming_atr_enabled) {
+		spin_unlock_bh(&adapter->gaming_fdir_lock);
+		return 0;
+	}
+	spin_unlock_bh(&adapter->gaming_fdir_lock);
 
 	num_ports = ixgbe_parse_gaming_ports(gaming_atr_ranges, parsed_ports,
 					     ARRAY_SIZE(parsed_ports));
 	if (num_ports <= 0) return num_ports;
 
-	/* Clear any existing filters first */
 	ixgbe_gaming_atr_clear_filters(adapter);
 
-	/* Force perfect filters mode */
 	adapter->flags &= ~IXGBE_FLAG_FDIR_HASH_CAPABLE;
 	adapter->flags |= IXGBE_FLAG_FDIR_PERFECT_CAPABLE;
 
 	ret = ixgbe_init_fdir_perfect_82599(hw, adapter->fdir_pballoc);
 	if (ret) return ret;
 
-	/* Set mask to check only UDP Destination Port */
 	memset(&mask, 0, sizeof(mask));
 	mask.formatted.flow_type = 0xFF;
 	mask.formatted.dst_port = cpu_to_be16(0xFFFF);
 	ret = ixgbe_fdir_set_input_mask_82599(hw, &mask);
 	if (ret) return ret;
 
-	/* Target Queue 0 (High Priority P-core affinity) */
 	if (adapter->rx_ring[0]) queue = adapter->rx_ring[0]->reg_idx;
 
+	/* HOLD LOCK during programming to ensure state consistency.
+	 * The latency of MMIO writes is acceptable to prevent races.
+	 */
 	spin_lock_bh(&adapter->gaming_fdir_lock);
 	for (i = 0; i < num_ports; i++) {
 		u16 port = parsed_ports[i];
 		union ixgbe_atr_input input;
 
-		/* Program IPv4 Filter */
 		if (ipv4_count < IXGBE_GAMING_IPV4_MAX) {
 			memset(&input, 0, sizeof(input));
 			input.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV4;
@@ -339,7 +367,6 @@ static int ixgbe_gaming_atr_program_filters(struct ixgbe_adapter *adapter)
 			}
 		}
 
-		/* Program IPv6 Filter */
 		if (ipv6_count < IXGBE_GAMING_IPV6_MAX) {
 			memset(&input, 0, sizeof(input));
 			input.formatted.flow_type = IXGBE_ATR_FLOW_TYPE_UDPV6;
@@ -2220,23 +2247,45 @@ void ixgbe_process_skb_fields(struct ixgbe_ring *rx_ring,
 /* Detect tiny UDP frames for direct, low-latency delivery */
 static __always_inline bool ixgbe_is_tiny_udp(const struct sk_buff *skb)
 {
+	/* Ethernet header is already pulled by eth_type_trans, so skb->data points to L3 */
+	const struct iphdr *iph;
+	const struct ipv6hdr *ip6h;
+
+	if (skb->len > 256)
+		return false;
+
 	if (skb->protocol == htons(ETH_P_IP)) {
-		const struct iphdr *iph = ip_hdr(skb);
-		return iph && iph->protocol == IPPROTO_UDP && skb->len <= 256U;
+		/* Basic bounds check for IPv4 header */
+		if (unlikely(skb->len < sizeof(struct iphdr)))
+			return false;
+
+		iph = (const struct iphdr *)skb->data;
+		return iph->protocol == IPPROTO_UDP;
 	}
+
 #if IS_ENABLED(CONFIG_IPV6)
 	if (skb->protocol == htons(ETH_P_IPV6)) {
-		const struct ipv6hdr *ip6h = ipv6_hdr(skb);
-		return ip6h && ip6h->nexthdr == IPPROTO_UDP && skb->len <= 256U;
+		/* Basic bounds check for IPv6 header */
+		if (unlikely(skb->len < sizeof(struct ipv6hdr)))
+			return false;
+
+		ip6h = (const struct ipv6hdr *)skb->data;
+		return ip6h->nexthdr == IPPROTO_UDP;
 	}
 #endif
+
 	return false;
 }
 
 void ixgbe_rx_skb(struct ixgbe_q_vector *q_vector,
 		  struct sk_buff *skb)
 {
-	if (likely(gaming_mode && ixgbe_is_tiny_udp(skb))) {
+	/*
+	 * For gaming workloads, bypass GRO for tiny UDP packets to
+	 * minimize latency. GRO adds overhead for small packets that
+	 * won't benefit from aggregation anyway.
+	 */
+	if (gaming_mode && ixgbe_is_tiny_udp(skb)) {
 		netif_receive_skb(skb);
 		return;
 	}
@@ -2837,14 +2886,7 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
 		int rx_buffer_pgcnt;
 		unsigned int size;
 
-		/* Optimistic prefetch for next descriptors */
-		{
-			u16 ntc = rx_ring->next_to_clean;
-			u16 pf = (ntc + 4) < rx_ring->count ? ntc + 4 : ntc + 4 - rx_ring->count;
-			prefetch(IXGBE_RX_DESC(rx_ring, pf));
-			prefetch(&rx_ring->rx_buffer_info[pf]);
-		}
-
+		/* Prefetch next descriptors */
 		if (cleaned_count >= IXGBE_RX_BUFFER_WRITE) {
 			ixgbe_alloc_rx_buffers(rx_ring, cleaned_count);
 			cleaned_count = 0;
@@ -2855,10 +2897,15 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
 		if (!size)
 			break;
 
+		/* This memory barrier is needed to keep us from reading
+		 * any other fields out of the rx_desc until we know the
+		 * descriptor has been written back
+		 */
 		dma_rmb();
 
 		rx_buffer = ixgbe_get_rx_buffer(rx_ring, rx_desc, &skb, size, &rx_buffer_pgcnt);
 
+		/* Retrieve a buffer from the ring */
 		if (!skb) {
 			unsigned char *hard_start;
 
@@ -2891,6 +2938,7 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
 						  &xdp, rx_desc);
 		}
 
+		/* Exit if we failed to retrieve a buffer */
 		if (!xdp_res && !skb) {
 			rx_ring->rx_stats.alloc_rx_buff_failed++;
 			rx_buffer->pagecnt_bias++;
@@ -2900,19 +2948,25 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
 		ixgbe_put_rx_buffer(rx_ring, rx_buffer, skb, rx_buffer_pgcnt);
 		cleaned_count++;
 
+		/* Place incomplete frames back on the ring for completion */
 		if (ixgbe_is_non_eop(rx_ring, rx_desc, skb))
 			continue;
 
+		/* Verify the packet layout is correct */
 		if (xdp_res || ixgbe_cleanup_headers(rx_ring, rx_desc, skb))
 			continue;
 
+		/* Probably a little skewed due to removing CRC */
 		total_rx_bytes += skb->len;
 
+		/* Populate skb fields */
 		ixgbe_process_skb_fields(rx_ring, rx_desc, skb);
 
 #ifdef IXGBE_FCOE
+		/* If we got a FCoE packet, do the DDP processing */
 		if (ixgbe_rx_is_fcoe(rx_ring, rx_desc)) {
 			ddp_bytes = ixgbe_fcoe_ddp(adapter, rx_desc, skb);
+			/* Include DDp bytes */
 			if (ddp_bytes > 0) {
 				if (!mss) {
 					mss = rx_ring->netdev->mtu -
@@ -2934,6 +2988,7 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
 #endif /* IXGBE_FCOE */
 		ixgbe_rx_skb(q_vector, skb);
 
+		/* Update budget accounting */
 		total_rx_packets++;
 	}
 
@@ -3048,33 +3103,43 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *q_vector,
 	packets = ring_container->total_packets;
 	bytes = ring_container->total_bytes;
 
-	if (gaming_mode) {
-		if (!packets) {
-			/* No traffic: Decay ITR slowly to stay responsive */
-			unsigned int cur = ring_container->itr & ~IXGBE_ITR_ADAPTIVE_LATENCY;
-			itr = min_t(unsigned int, cur + 2, IXGBE_ITR_ADAPTIVE_MAX_USECS);
-			itr |= (ring_container->itr & IXGBE_ITR_ADAPTIVE_LATENCY);
-			goto adjust_by_size; /* Skip standard logic */
-		}
-
+	if (gaming_mode && packets) {
+		/*
+		 * Gaming workload optimization: Use lower ITR for small
+		 * packets typical of gaming (voice chat, game state updates).
+		 * However, maintain a safe minimum to prevent TX hangs.
+		 */
 		avg_wire_size = bytes / packets;
 
-		/* Gaming workload detection: Small packets (<256 bytes) */
-		if (avg_wire_size <= 256) {
-			/* Aggressive low latency for gaming/VoIP */
-			if (packets <= 16)
-				itr = 1; /* ~2us */
-			else if (packets <= 64)
-				itr = 2; /* ~4us */
+		if (avg_wire_size <= 128) {
+			/* Very small packets - likely voice/gaming */
+			if (packets <= 8)
+				itr = IXGBE_GAMING_ITR_MIN;
+			else if (packets <= 32)
+				itr = IXGBE_GAMING_ITR_LOW;
+			else if (packets <= 96)
+				itr = IXGBE_GAMING_ITR_MED;
 			else
-				itr = 4; /* ~8us */
+				itr = IXGBE_GAMING_ITR_HIGH;
 
 			itr |= IXGBE_ITR_ADAPTIVE_LATENCY;
-			goto adjust_by_size;
+			goto set_itr;
+		} else if (avg_wire_size <= 256) {
+			/* Small packets - gaming with some overhead */
+			if (packets <= 16)
+				itr = IXGBE_GAMING_ITR_LOW;
+			else if (packets <= 64)
+				itr = IXGBE_GAMING_ITR_MED;
+			else
+				itr = IXGBE_GAMING_ITR_HIGH;
+
+			itr |= IXGBE_ITR_ADAPTIVE_LATENCY;
+			goto set_itr;
 		}
+		/* Fall through to standard algorithm for larger packets */
 	}
 
-	/* Standard ITR Algorithm Fallback */
+	/* Standard ITR algorithm for non-gaming or large packet workloads */
 	if (!packets) {
 		itr = (q_vector->itr >> 2) + IXGBE_ITR_ADAPTIVE_MIN_INC;
 		if (itr > IXGBE_ITR_ADAPTIVE_MAX_USECS)
@@ -3110,42 +3175,46 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *q_vector,
 	itr = IXGBE_ITR_ADAPTIVE_BULK;
 
 adjust_by_size:
-	/* Recalculate based on wire size if we didn't take the gaming path */
-	if (!gaming_mode || (bytes / (packets ? packets : 1)) > 256) {
-		avg_wire_size = bytes / (packets ? packets : 1);
-		if (avg_wire_size <= 60)
-			avg_wire_size = 5120;
-		else if (avg_wire_size <= 316)
-			avg_wire_size = avg_wire_size * 40 + 2720;
-		else if (avg_wire_size <= 1084)
-			avg_wire_size = avg_wire_size * 15 + 11452;
-		else if (avg_wire_size < 1968)
-			avg_wire_size = avg_wire_size * 5 + 22420;
-		else
-			avg_wire_size = 32256;
+	avg_wire_size = bytes / packets;
 
-		if (itr & IXGBE_ITR_ADAPTIVE_LATENCY)
-			avg_wire_size >>= 1;
+	/* Adjust ITR based on average packet size */
+	if (avg_wire_size <= 60)
+		avg_wire_size = 5120;
+	else if (avg_wire_size <= 316)
+		avg_wire_size = avg_wire_size * 40 + 2720;
+	else if (avg_wire_size <= 1084)
+		avg_wire_size = avg_wire_size * 15 + 11452;
+	else if (avg_wire_size < 1968)
+		avg_wire_size = avg_wire_size * 5 + 22420;
+	else
+		avg_wire_size = 32256;
 
-		switch (q_vector->adapter->link_speed) {
-		case IXGBE_LINK_SPEED_10GB_FULL:
-		case IXGBE_LINK_SPEED_100_FULL:
-		default:
-			itr += DIV_ROUND_UP(avg_wire_size,
-					    IXGBE_ITR_ADAPTIVE_MIN_INC * 256) *
-			       IXGBE_ITR_ADAPTIVE_MIN_INC;
-			break;
-		case IXGBE_LINK_SPEED_2_5GB_FULL:
-		case IXGBE_LINK_SPEED_1GB_FULL:
-		case IXGBE_LINK_SPEED_10_FULL:
-			if (avg_wire_size > 8064)
-				avg_wire_size = 8064;
-			itr += DIV_ROUND_UP(avg_wire_size,
-					    IXGBE_ITR_ADAPTIVE_MIN_INC * 64) *
-			       IXGBE_ITR_ADAPTIVE_MIN_INC;
-			break;
-		}
+	if (itr & IXGBE_ITR_ADAPTIVE_LATENCY)
+		avg_wire_size >>= 1;
+
+	switch (q_vector->adapter->link_speed) {
+	case IXGBE_LINK_SPEED_10GB_FULL:
+	case IXGBE_LINK_SPEED_100_FULL:
+	default:
+		itr += DIV_ROUND_UP(avg_wire_size,
+				    IXGBE_ITR_ADAPTIVE_MIN_INC * 256) *
+		       IXGBE_ITR_ADAPTIVE_MIN_INC;
+		break;
+	case IXGBE_LINK_SPEED_2_5GB_FULL:
+	case IXGBE_LINK_SPEED_1GB_FULL:
+	case IXGBE_LINK_SPEED_10_FULL:
+		if (avg_wire_size > 8064)
+			avg_wire_size = 8064;
+		itr += DIV_ROUND_UP(avg_wire_size,
+				    IXGBE_ITR_ADAPTIVE_MIN_INC * 64) *
+		       IXGBE_ITR_ADAPTIVE_MIN_INC;
+		break;
 	}
+
+set_itr:
+	/* Enforce safe minimum ITR to prevent TX hangs */
+	if ((itr & ~IXGBE_ITR_ADAPTIVE_LATENCY) < IXGBE_GAMING_ITR_MIN)
+		itr = IXGBE_GAMING_ITR_MIN | (itr & IXGBE_ITR_ADAPTIVE_LATENCY);
 
 clear_counts:
 	ring_container->itr = itr;
@@ -6142,7 +6211,9 @@ static void ixgbe_configure(struct ixgbe_adapter *adapter)
 {
 	struct ixgbe_hw *hw = &adapter->hw;
 
-	/* Raptor Lake Optimization: Program Gaming ATR FDIR filters */
+	/* Program Gaming ATR filters immediately if enabled.
+	 * This ensures they are active before traffic starts flowing.
+	 */
 	if (gaming_atr_ranges && *gaming_atr_ranges)
 		ixgbe_gaming_atr_program_filters(adapter);
 
@@ -6950,29 +7021,21 @@ void ixgbe_down(struct ixgbe_adapter *adapter)
 	struct ixgbe_hw *hw = &adapter->hw;
 	int i;
 
-	/* signal that we are down to the interrupt handler */
 	if (test_and_set_bit(__IXGBE_DOWN, &adapter->state))
-		return; /* do nothing if already down */
+		return;
 
-	/* Shut off incoming Tx traffic */
 	netif_tx_stop_all_queues(netdev);
-
-	/* call carrier off first to avoid false dev_watchdog timeouts */
 	netif_carrier_off(netdev);
 	netif_tx_disable(netdev);
 
-	/* Disable Rx */
 	ixgbe_disable_rx(adapter);
 
-	/* synchronize_rcu() needed for pending XDP buffers to drain */
 	if (adapter->xdp_ring[0])
 		synchronize_rcu();
 
 	ixgbe_irq_disable(adapter);
 
-	/* Raptor Lake Optimization: Clear Gaming ATR filters.
-	 * We do this after IRQ disable to avoid race conditions with the interrupt handler.
-	 */
+	/* Clear Gaming ATR filters here while IRQs are off */
 	ixgbe_gaming_atr_clear_filters(adapter);
 
 	ixgbe_napi_disable_all(adapter);
@@ -6984,24 +7047,17 @@ void ixgbe_down(struct ixgbe_adapter *adapter)
 	timer_delete_sync(&adapter->service_timer);
 
 	if (adapter->num_vfs) {
-		/* Clear EITR Select mapping */
 		IXGBE_WRITE_REG(&adapter->hw, IXGBE_EITRSEL, 0);
-
-		/* Mark all the VFs as inactive */
 		for (i = 0 ; i < adapter->num_vfs; i++)
 			adapter->vfinfo[i].clear_to_send = false;
-
-		/* update setting rx tx for all active vfs */
 		ixgbe_set_all_vfs(adapter);
 	}
 
-	/* disable transmits in the hardware now that interrupts are off */
 	ixgbe_disable_tx(adapter);
 
 	if (!pci_channel_offline(adapter->pdev))
 		ixgbe_reset(adapter);
 
-	/* power down the optics for 82599 SFP+ fiber */
 	if (hw->mac.ops.disable_tx_laser)
 		hw->mac.ops.disable_tx_laser(hw);
 
@@ -8343,7 +8399,6 @@ static void ixgbe_watchdog_link_is_up(struct ixgbe_adapter *adapter)
 	const char *speed_str;
 	bool flow_rx, flow_tx;
 
-	/* Only continue if link was previously down */
 	if (netif_carrier_ok(netdev))
 		return;
 
@@ -8414,19 +8469,8 @@ static void ixgbe_watchdog_link_is_up(struct ixgbe_adapter *adapter)
 	if (adapter->num_vfs && hw->mac.ops.enable_mdd)
 		hw->mac.ops.enable_mdd(hw);
 
-	/* enable transmits */
 	netif_tx_wake_all_queues(adapter->netdev);
-
-	/* update the default user priority for VFs */
 	ixgbe_update_default_up(adapter);
-
-	/* Raptor Lake Optimization: Program Gaming ATR filters now that HW is active.
-	 * This ensures high-priority UDP traffic is steered to P-cores immediately.
-	 */
-	if (gaming_atr_ranges && *gaming_atr_ranges)
-		ixgbe_gaming_atr_program_filters(adapter);
-
-	/* ping all the active vfs to let them know link has changed */
 	ixgbe_ping_all_vfs(adapter);
 }
 
@@ -11800,8 +11844,7 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	err = pci_enable_device_mem(pdev);
 	if (err) return err;
 
-	/* Raptor Lake Optimization: Use 64-bit DMA mask with ~0ULL to avoid shift warnings */
-	err = dma_set_mask_and_coherent(&pdev->dev, ~0ULL);
+	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	if (err) {
 		dev_err(&pdev->dev, "No usable DMA configuration, aborting\n");
 		goto err_dma;
@@ -11856,10 +11899,10 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		goto err_ioremap;
 	}
 
-	hw->mac.ops   = *ii->mac_ops;
-	hw->mac.type  = ii->mac;
-	hw->mvals     = ii->mvals;
-	if (ii->link_ops) hw->link.ops  = *ii->link_ops;
+	hw->mac.ops = *ii->mac_ops;
+	hw->mac.type = ii->mac;
+	hw->mvals = ii->mvals;
+	if (ii->link_ops) hw->link.ops = *ii->link_ops;
 
 	hw->eeprom.ops = *ii->eeprom_ops;
 	eec = IXGBE_READ_REG(hw, IXGBE_EEC(hw));
@@ -11880,14 +11923,15 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	hw->phy.mdio.mdio_write = ixgbe_mdio_write;
 
 	netdev->netdev_ops = &ixgbe_netdev_ops;
-	/* Initialize Gaming ATR subsystem */
-	ixgbe_gaming_atr_init(adapter);
 	ixgbe_set_ethtool_ops(netdev);
 	netdev->watchdog_timeo = 5 * HZ;
 	strscpy(netdev->name, pci_name(pdev), sizeof(netdev->name));
 
 	err = ixgbe_sw_init(adapter, ii);
 	if (err) goto err_sw_init;
+
+	/* Initialize Gaming ATR struct (software only) */
+	ixgbe_gaming_atr_init(adapter);
 
 	if (ixgbe_check_fw_error(adapter))
 		return ixgbe_recovery_probe(adapter);
@@ -12155,7 +12199,7 @@ err_sw_init:
 	if (hw->mac.type == ixgbe_mac_e610)
 		mutex_destroy(&adapter->hw.aci.lock);
 	ixgbe_disable_sriov(adapter);
-	ixgbe_gaming_atr_clear_filters(adapter); /* Clean up if partial init */
+	ixgbe_gaming_atr_clear_filters(adapter);
 	adapter->flags2 &= ~IXGBE_FLAG2_SEARCH_FOR_SFP;
 	iounmap(adapter->io_addr);
 	kfree(adapter->jump_tables[0]);
@@ -12224,7 +12268,6 @@ static void ixgbe_remove(struct pci_dev *pdev)
 #ifdef CONFIG_PCI_IOV
 	ixgbe_disable_sriov(adapter);
 #endif
-	/* Clean up Gaming ATR filters */
 	ixgbe_gaming_atr_clear_filters(adapter);
 
 	if (netdev->reg_state == NETREG_REGISTERED)
