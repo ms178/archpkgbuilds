@@ -3103,43 +3103,7 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *q_vector,
 	packets = ring_container->total_packets;
 	bytes = ring_container->total_bytes;
 
-	if (gaming_mode && packets) {
-		/*
-		 * Gaming workload optimization: Use lower ITR for small
-		 * packets typical of gaming (voice chat, game state updates).
-		 * However, maintain a safe minimum to prevent TX hangs.
-		 */
-		avg_wire_size = bytes / packets;
-
-		if (avg_wire_size <= 128) {
-			/* Very small packets - likely voice/gaming */
-			if (packets <= 8)
-				itr = IXGBE_GAMING_ITR_MIN;
-			else if (packets <= 32)
-				itr = IXGBE_GAMING_ITR_LOW;
-			else if (packets <= 96)
-				itr = IXGBE_GAMING_ITR_MED;
-			else
-				itr = IXGBE_GAMING_ITR_HIGH;
-
-			itr |= IXGBE_ITR_ADAPTIVE_LATENCY;
-			goto set_itr;
-		} else if (avg_wire_size <= 256) {
-			/* Small packets - gaming with some overhead */
-			if (packets <= 16)
-				itr = IXGBE_GAMING_ITR_LOW;
-			else if (packets <= 64)
-				itr = IXGBE_GAMING_ITR_MED;
-			else
-				itr = IXGBE_GAMING_ITR_HIGH;
-
-			itr |= IXGBE_ITR_ADAPTIVE_LATENCY;
-			goto set_itr;
-		}
-		/* Fall through to standard algorithm for larger packets */
-	}
-
-	/* Standard ITR algorithm for non-gaming or large packet workloads */
+	/* No traffic: gradually increase ITR */
 	if (!packets) {
 		itr = (q_vector->itr >> 2) + IXGBE_ITR_ADAPTIVE_MIN_INC;
 		if (itr > IXGBE_ITR_ADAPTIVE_MAX_USECS)
@@ -3148,6 +3112,34 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *q_vector,
 		goto clear_counts;
 	}
 
+	avg_wire_size = bytes / packets;
+
+	/*
+	 * Gaming mode: lower ITR for small packets, but never below safe floor
+	 */
+	if (gaming_mode && avg_wire_size <= 256) {
+		if (avg_wire_size <= 128) {
+			if (packets <= 8)
+				itr = IXGBE_GAMING_ITR_MIN;
+			else if (packets <= 32)
+				itr = IXGBE_GAMING_ITR_LOW;
+			else if (packets <= 96)
+				itr = IXGBE_GAMING_ITR_MED;
+			else
+				itr = IXGBE_GAMING_ITR_HIGH;
+		} else {
+			if (packets <= 16)
+				itr = IXGBE_GAMING_ITR_LOW;
+			else if (packets <= 64)
+				itr = IXGBE_GAMING_ITR_MED;
+			else
+				itr = IXGBE_GAMING_ITR_HIGH;
+		}
+		itr |= IXGBE_ITR_ADAPTIVE_LATENCY;
+		goto clear_counts;
+	}
+
+	/* Standard adaptive algorithm */
 	if (packets < 4 && bytes < 9000) {
 		itr = IXGBE_ITR_ADAPTIVE_LATENCY;
 		goto adjust_by_size;
@@ -3175,9 +3167,6 @@ static void ixgbe_update_itr(struct ixgbe_q_vector *q_vector,
 	itr = IXGBE_ITR_ADAPTIVE_BULK;
 
 adjust_by_size:
-	avg_wire_size = bytes / packets;
-
-	/* Adjust ITR based on average packet size */
 	if (avg_wire_size <= 60)
 		avg_wire_size = 5120;
 	else if (avg_wire_size <= 316)
@@ -3211,12 +3200,11 @@ adjust_by_size:
 		break;
 	}
 
-set_itr:
-	/* Enforce safe minimum ITR to prevent TX hangs */
-	if ((itr & ~IXGBE_ITR_ADAPTIVE_LATENCY) < IXGBE_GAMING_ITR_MIN)
-		itr = IXGBE_GAMING_ITR_MIN | (itr & IXGBE_ITR_ADAPTIVE_LATENCY);
-
 clear_counts:
+	if ((itr & ~IXGBE_ITR_ADAPTIVE_LATENCY) < IXGBE_GAMING_ITR_MIN)
+		itr = IXGBE_GAMING_ITR_MIN |
+		      (itr & IXGBE_ITR_ADAPTIVE_LATENCY);
+
 	ring_container->itr = itr;
 	ring_container->next_update = next_update + 1;
 	ring_container->total_bytes = 0;
@@ -6211,12 +6199,6 @@ static void ixgbe_configure(struct ixgbe_adapter *adapter)
 {
 	struct ixgbe_hw *hw = &adapter->hw;
 
-	/* Program Gaming ATR filters immediately if enabled.
-	 * This ensures they are active before traffic starts flowing.
-	 */
-	if (gaming_atr_ranges && *gaming_atr_ranges)
-		ixgbe_gaming_atr_program_filters(adapter);
-
 	ixgbe_configure_pb(adapter);
 #ifdef CONFIG_IXGBE_DCB
 	ixgbe_configure_dcb(adapter);
@@ -6253,6 +6235,9 @@ static void ixgbe_configure(struct ixgbe_adapter *adapter)
 	default:
 		break;
 	}
+
+	if (gaming_atr_ranges && *gaming_atr_ranges)
+		ixgbe_gaming_atr_program_filters(adapter);
 
 #ifdef CONFIG_IXGBE_DCA
 	if (adapter->flags & IXGBE_FLAG_DCA_CAPABLE)
