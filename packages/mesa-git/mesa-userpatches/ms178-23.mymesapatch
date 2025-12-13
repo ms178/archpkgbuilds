@@ -1,0 +1,764 @@
+--- a/src/amd/compiler/instruction_selection/aco_select_ps_prolog.cpp	2025-09-18 17:57:29.495738142 +0200
++++ b/src/amd/compiler/instruction_selection/aco_select_ps_prolog.cpp	2025-09-18 18:06:02.521322854 +0200
+@@ -18,11 +18,10 @@ emit_polygon_stipple(isel_context* ctx,
+    Builder bld(ctx->program, ctx->block);
+ 
+    /* Use the fixed-point gl_FragCoord input.
+-    * Since the stipple pattern is 32x32 and it repeats, just get 5 bits
+-    * per coordinate to get the repeating effect.
++    * The stipple pattern is 32x32 and repeats; take 5 LSBs from x and y.
+     */
+    Temp pos_fixed_pt = get_arg(ctx, ctx->args->pos_fixed_pt);
+-   Temp addr0 = bld.vop2(aco_opcode::v_and_b32, bld.def(v1), Operand::c32(0x1f), pos_fixed_pt);
++   Temp addr0 = bld.vop2(aco_opcode::v_and_b32, bld.def(v1), Operand::c32(0x1fu), pos_fixed_pt);
+    Temp addr1 = bld.vop3(aco_opcode::v_bfe_u32, bld.def(v1), pos_fixed_pt, Operand::c32(16u),
+                          Operand::c32(5u));
+ 
+@@ -32,12 +31,14 @@ emit_polygon_stipple(isel_context* ctx,
+    Temp desc = bld.smem(aco_opcode::s_load_dwordx4, bld.def(s4), list,
+                         Operand::c32(finfo->poly_stipple_buf_offset));
+ 
+-   /* The stipple pattern is 32x32, each row has 32 bits. */
+-   Temp offset = bld.vop2(aco_opcode::v_lshlrev_b32, bld.def(v1), Operand::c32(2), addr1);
++   /* 32 rows; each row has 32 bits (one bit per pixel). */
++   Temp offset = bld.vop2(aco_opcode::v_lshlrev_b32, bld.def(v1), Operand::c32(2u), addr1);
+    Temp row = bld.mubuf(aco_opcode::buffer_load_dword, bld.def(v1), desc, offset, Operand::c32(0u),
+                         0, true);
+    Temp bit = bld.vop3(aco_opcode::v_bfe_u32, bld.def(v1), row, addr0, Operand::c32(1u));
+    Temp cond = bld.vopc(aco_opcode::v_cmp_eq_u32, bld.def(bld.lm), Operand::zero(), bit);
++
++   /* Demote if bit == 0 (not covered). */
+    bld.pseudo(aco_opcode::p_demote_to_helper, cond);
+ 
+    ctx->block->kind |= block_kind_uses_discard;
+@@ -50,9 +51,8 @@ overwrite_interp_args(isel_context* ctx,
+    Builder bld(ctx->program, ctx->block);
+ 
+    if (finfo->bc_optimize_for_persp || finfo->bc_optimize_for_linear) {
+-      /* The shader should do: if (PRIM_MASK[31]) CENTROID = CENTER;
+-       * The hw doesn't compute CENTROID if the whole wave only
+-       * contains fully-covered quads.
++      /* Optimize centroid for fully-covered quads:
++       * if (PRIM_MASK[31]) CENTROID = CENTER;
+        */
+       Temp bc_optimize = get_arg(ctx, ctx->args->prim_mask);
+ 
+@@ -60,7 +60,7 @@ overwrite_interp_args(isel_context* ctx,
+       Temp cond =
+          bld.sopc(aco_opcode::s_bitcmp1_b32, bld.def(s1, scc), bc_optimize, Operand::c32(31u));
+ 
+-      /* scale 1bit scc to wave size bits used by v_cndmask */
++      /* scale 1bit scc to wave-size bits used by v_cndmask */
+       cond = bool_to_vector_condition(ctx, cond);
+ 
+       if (finfo->bc_optimize_for_persp) {
+@@ -112,21 +112,9 @@ overwrite_samplemask_arg(isel_context* c
+ {
+    Builder bld(ctx->program, ctx->block);
+ 
+-   /* Section 15.2.2 (Shader Inputs) of the OpenGL 4.5 (Core Profile) spec
+-    * says:
+-    *
+-    *    "When per-sample shading is active due to the use of a fragment
+-    *     input qualified by sample or due to the use of the gl_SampleID
+-    *     or gl_SamplePosition variables, only the bit for the current
+-    *     sample is set in gl_SampleMaskIn. When state specifies multiple
+-    *     fragment shader invocations for a given fragment, the sample
+-    *     mask for any single fragment shader invocation may specify a
+-    *     subset of the covered samples for the fragment. In this case,
+-    *     the bit corresponding to each covered sample will be set in
+-    *     exactly one fragment shader invocation."
+-    *
+-    * The samplemask loaded by hardware is always the coverage of the
+-    * entire pixel/fragment, so mask bits out based on the sample ID.
++   /* See OpenGL 4.5 (Core Profile) spec §15.2.2 Shader Inputs.
++    * When per-sample shading is active, gl_SampleMaskIn must only contain the
++    * bit for the current sample. The HW loads full-fragment coverage; mask it.
+     */
+    if (finfo->samplemask_log_ps_iter) {
+       Temp ancillary = get_arg(ctx, ctx->args->ancillary);
+@@ -135,6 +123,7 @@ overwrite_samplemask_arg(isel_context* c
+       Temp samplemask;
+ 
+       if (finfo->samplemask_log_ps_iter == 3) {
++         /* Just produce a single bit for the current sample, zero for helpers. */
+          Temp is_helper_invoc =
+             bld.pseudo(aco_opcode::p_is_helper, bld.def(bld.lm), Operand(exec, bld.lm));
+          ctx->program->needs_exact = true;
+@@ -147,11 +136,12 @@ overwrite_samplemask_arg(isel_context* c
+       } else {
+          /* samplemask &= ps_iter_mask << sample_id; */
+          uint32_t ps_iter_mask = ac_get_ps_iter_mask(1 << finfo->samplemask_log_ps_iter);
+-         Builder::Op mask = ctx->options->gfx_level >= GFX11
+-                               ? Operand::c32(ps_iter_mask)
+-                               : bld.copy(bld.def(v1), Operand::c32(ps_iter_mask));
++         Builder::Op mask_op = (ctx->options->gfx_level >= GFX11)
++                                  ? Operand::c32(ps_iter_mask)
++                                  : bld.copy(bld.def(v1), Operand::c32(ps_iter_mask));
+ 
+-         samplemask = bld.vop2_e64(aco_opcode::v_lshlrev_b32, bld.def(v1), sampleid, mask);
++         samplemask =
++            bld.vop2_e64(aco_opcode::v_lshlrev_b32, bld.def(v1), sampleid, mask_op);
+          samplemask = bld.vop2(aco_opcode::v_and_b32, bld.def(v1),
+                                get_arg(ctx, ctx->args->sample_coverage), samplemask);
+       }
+@@ -162,11 +152,13 @@ overwrite_samplemask_arg(isel_context* c
+          bld.pseudo(aco_opcode::p_is_helper, bld.def(bld.lm), Operand(exec, bld.lm));
+       ctx->program->needs_exact = true;
+ 
++      /* For helpers: 0; otherwise: 1. */
+       ctx->arg_temps[ctx->args->sample_coverage.arg_index] =
+          bld.vop2_e64(aco_opcode::v_cndmask_b32, bld.def(v1), Operand::c32(1u), Operand::c32(0u),
+                       is_helper_invoc);
+    }
+ }
++
+ void
+ overwrite_pos_xy_args(isel_context* ctx, const struct aco_ps_prolog_info* finfo)
+ {
+@@ -182,13 +174,13 @@ overwrite_pos_xy_args(isel_context* ctx,
+ 
+       Temp t;
+       if (i)
+-         t = bld.vop2(aco_opcode::v_lshrrev_b32, bld.def(v1), Operand::c32(16), pos_fixed_pt);
++         t = bld.vop2(aco_opcode::v_lshrrev_b32, bld.def(v1), Operand::c32(16u), pos_fixed_pt);
+       else
+-         t = bld.vop2(aco_opcode::v_and_b32, bld.def(v1), Operand::c32(0xffff), pos_fixed_pt);
++         t = bld.vop2(aco_opcode::v_and_b32, bld.def(v1), Operand::c32(0xffffu), pos_fixed_pt);
+ 
+       t = bld.vop1(aco_opcode::v_cvt_f32_u32, bld.def(v1), t);
+       if (!finfo->pixel_center_integer)
+-         t = bld.vop2(aco_opcode::v_add_f32, bld.def(v1), Operand::c32(0x3f000000 /*0.5*/), t);
++         t = bld.vop2(aco_opcode::v_add_f32, bld.def(v1), Operand::c32(0x3f000000 /* 0.5f */), t);
+ 
+       ctx->arg_temps[ctx->args->frag_pos[i].arg_index] = t;
+    }
+@@ -197,6 +189,8 @@ overwrite_pos_xy_args(isel_context* ctx,
+ void
+ passthrough_all_args(isel_context* ctx, std::vector<Operand>& regs)
+ {
++   regs.reserve(regs.size() + ctx->args->arg_count + 8);
++
+    struct ac_arg arg;
+    arg.used = true;
+ 
+@@ -210,14 +204,12 @@ get_interp_color(isel_context* ctx, int
+    Builder bld(ctx->program, ctx->block);
+ 
+    Temp dst = bld.tmp(v1);
+-
+    Temp prim_mask = get_arg(ctx, ctx->args->prim_mask);
+ 
+    if (interp_vgpr != -1) {
+-      /* interp args are all 2 vgprs */
++      /* Interp IJ args are 2 VGPRs; compute argument index accordingly. */
+       int arg_index = ctx->args->persp_sample.arg_index + interp_vgpr / 2;
+       Temp interp_ij = ctx->arg_temps[arg_index];
+-
+       emit_interp_instr(ctx, attr_index, comp, interp_ij, dst, prim_mask, false);
+    } else {
+       emit_interp_mov_instr(ctx, attr_index, comp, 0, dst, prim_mask, false);
+@@ -235,6 +227,7 @@ interpolate_color_args(isel_context* ctx
+ 
+    Builder bld(ctx->program, ctx->block);
+ 
++   /* Place interpolated colors after existing VGPR arguments. */
+    unsigned vgpr = 256 + ctx->args->num_vgprs_used;
+ 
+    if (finfo->color_two_side) {
+@@ -243,20 +236,19 @@ interpolate_color_args(isel_context* ctx
+          bld.vopc(aco_opcode::v_cmp_lt_f32, bld.def(bld.lm), Operand::zero(), face);
+ 
+       u_foreach_bit (i, finfo->colors_read) {
+-         unsigned color_index = i / 4;
+-         unsigned front_index = finfo->color_attr_index[color_index];
+-         int interp_vgpr = finfo->color_interp_vgpr_index[color_index];
++         const unsigned color_index = i / 4;
++         const unsigned front_index = finfo->color_attr_index[color_index];
++         const int interp_vgpr = finfo->color_interp_vgpr_index[color_index];
+ 
+          /* If BCOLOR0 is used, BCOLOR1 is at offset "num_inputs + 1",
+           * otherwise it's at offset "num_inputs".
+           */
+          unsigned back_index = finfo->num_interp_inputs;
+-         if (color_index == 1 && finfo->colors_read & 0xf)
++         if (color_index == 1 && (finfo->colors_read & 0xf))
+             back_index++;
+ 
+          Temp front = get_interp_color(ctx, interp_vgpr, front_index, i % 4);
+          Temp back = get_interp_color(ctx, interp_vgpr, back_index, i % 4);
+-
+          Temp color =
+             bld.vop2(aco_opcode::v_cndmask_b32, bld.def(v1), back, front, is_face_positive);
+ 
+@@ -264,11 +256,10 @@ interpolate_color_args(isel_context* ctx
+       }
+    } else {
+       u_foreach_bit (i, finfo->colors_read) {
+-         unsigned color_index = i / 4;
+-         unsigned attr_index = finfo->color_attr_index[color_index];
+-         int interp_vgpr = finfo->color_interp_vgpr_index[color_index];
++         const unsigned color_index = i / 4;
++         const unsigned attr_index = finfo->color_attr_index[color_index];
++         const int interp_vgpr = finfo->color_interp_vgpr_index[color_index];
+          Temp color = get_interp_color(ctx, interp_vgpr, attr_index, i % 4);
+-
+          regs.emplace_back(Operand(color, PhysReg{vgpr++}));
+       }
+    }
+@@ -298,8 +289,9 @@ select_ps_prolog(Program* program, void*
+    overwrite_pos_xy_args(&ctx, finfo);
+ 
+    std::vector<Operand> regs;
+-   passthrough_all_args(&ctx, regs);
++   regs.reserve(ctx.args->arg_count + 16);
+ 
++   passthrough_all_args(&ctx, regs);
+    interpolate_color_args(&ctx, finfo, regs);
+ 
+    program->config->float_mode = program->blocks[0].fp_mode.val;
+
+
+--- a/src/amd/compiler/instruction_selection/aco_select_ps_epilog.cpp	2025-09-18 17:57:31.823801887 +0200
++++ b/src/amd/compiler/instruction_selection/aco_select_ps_epilog.cpp	2025-09-18 18:04:59.932377291 +0200
+@@ -19,48 +19,53 @@ emit_clamp_alpha_test(isel_context* ctx,
+ {
+    Builder bld(ctx->program, ctx->block);
+ 
++   /* Clamp color outputs to [0,1] if requested. */
+    if (info->clamp_color) {
+       for (unsigned i = 0; i < 4; i++) {
+          if (colors[i].regClass() == v2b) {
+-            colors[i] = bld.vop3(aco_opcode::v_med3_f16, bld.def(v2b), Operand::c16(0u),
+-                                 Operand::c16(0x3c00), colors[i]);
++            /* half min/max: 0.0h, 1.0h (0x3c00) */
++            colors[i] = bld.vop3(aco_opcode::v_med3_f16, bld.def(v2b),
++                                 Operand::c16(0u), Operand::c16(0x3c00), colors[i]);
+          } else {
+             assert(colors[i].regClass() == v1);
+-            colors[i] = bld.vop3(aco_opcode::v_med3_f32, bld.def(v1), Operand::zero(),
+-                                 Operand::c32(0x3f800000u), colors[i]);
++            /* float min/max: 0.0f, 1.0f (0x3f800000) */
++            colors[i] = bld.vop3(aco_opcode::v_med3_f32, bld.def(v1),
++                                 Operand::zero(), Operand::c32(0x3f800000u), colors[i]);
+          }
+       }
+    }
+ 
++   /* alpha-to-one if requested */
+    if (info->alpha_to_one) {
+-      if (colors[3].regClass() == v2b)
+-         colors[3] = bld.copy(bld.def(v2b), Operand::c16(0x3c00));
+-      else
+-         colors[3] = bld.copy(bld.def(v1), Operand::c32(0x3f800000u));
++      if (colors[3].regClass() == v2b) {
++         colors[3] = bld.copy(bld.def(v2b), Operand::c16(0x3c00)); /* 1.0h */
++      } else {
++         colors[3] = bld.copy(bld.def(v1), Operand::c32(0x3f800000u)); /* 1.0f */
++      }
+    }
+ 
++   /* Alpha test (only MRT0). Discard if alpha test fails. */
+    if (color_index == 0 && info->alpha_func != COMPARE_FUNC_ALWAYS) {
+-      Operand cond = Operand::c32(-1u);
++      Operand cond = Operand::c32(~0u); /* default: always discard for COMPARE_FUNC_NEVER */
++
+       if (info->alpha_func != COMPARE_FUNC_NEVER) {
+          aco_opcode opcode = aco_opcode::num_opcodes;
+-
+          switch (info->alpha_func) {
+-         case COMPARE_FUNC_LESS: opcode = aco_opcode::v_cmp_ngt_f32; break;
+-         case COMPARE_FUNC_EQUAL: opcode = aco_opcode::v_cmp_neq_f32; break;
+-         case COMPARE_FUNC_LEQUAL: opcode = aco_opcode::v_cmp_nge_f32; break;
+-         case COMPARE_FUNC_GREATER: opcode = aco_opcode::v_cmp_nlt_f32; break;
++         case COMPARE_FUNC_LESS:     opcode = aco_opcode::v_cmp_ngt_f32; break;
++         case COMPARE_FUNC_EQUAL:    opcode = aco_opcode::v_cmp_neq_f32; break;
++         case COMPARE_FUNC_LEQUAL:   opcode = aco_opcode::v_cmp_nge_f32; break;
++         case COMPARE_FUNC_GREATER:  opcode = aco_opcode::v_cmp_nlt_f32; break;
+          case COMPARE_FUNC_NOTEQUAL: opcode = aco_opcode::v_cmp_nlg_f32; break;
+-         case COMPARE_FUNC_GEQUAL: opcode = aco_opcode::v_cmp_nle_f32; break;
++         case COMPARE_FUNC_GEQUAL:   opcode = aco_opcode::v_cmp_nle_f32; break;
+          default: UNREACHABLE("invalid alpha func");
+          }
+ 
+          Temp ref = get_arg(ctx, info->alpha_reference);
+-
+          Temp alpha = colors[3].regClass() == v2b
+                          ? bld.vop1(aco_opcode::v_cvt_f32_f16, bld.def(v1), colors[3])
+                          : colors[3];
+ 
+-         /* true if not pass */
++         /* cond is true if alpha test fails (i.e., not pass). */
+          cond = bld.vopc(opcode, bld.def(bld.lm), ref, alpha);
+       }
+ 
+@@ -85,48 +90,49 @@ bool
+ export_fs_mrt_color(isel_context* ctx, const struct aco_ps_epilog_info* info, Temp colors[4],
+                     unsigned slot, unsigned color_type, struct aco_export_mrt* mrt)
+ {
+-   unsigned col_format = (info->spi_shader_col_format >> (slot * 4)) & 0xf;
++   const unsigned col_format = (info->spi_shader_col_format >> (slot * 4)) & 0xf;
+ 
+    if (col_format == V_028714_SPI_SHADER_ZERO)
+       return false;
+ 
+    Builder bld(ctx->program, ctx->block);
+-   Operand values[4];
+-
+-   for (unsigned i = 0; i < 4; ++i) {
+-      values[i] = Operand(colors[i]);
+-   }
++   Operand values[4] = {Operand(colors[0]), Operand(colors[1]),
++                        Operand(colors[2]), Operand(colors[3])};
+ 
+    unsigned enabled_channels = 0;
+    aco_opcode compr_op = aco_opcode::num_opcodes;
+    bool compr = false;
+-   bool is_16bit = colors[0].regClass() == v2b;
++
++   const bool is_16bit = (colors[0].regClass() == v2b);
+    assert(is_16bit == (color_type != ACO_TYPE_ANY32));
+-   bool is_int8 = (info->color_is_int8 >> slot) & 1;
+-   bool is_int10 = (info->color_is_int10 >> slot) & 1;
+-   bool enable_mrt_output_nan_fixup = (ctx->options->enable_mrt_output_nan_fixup >> slot) & 1;
+-
+-   /* Replace NaN by zero (only 32-bit) to fix game bugs if requested. */
+-   if (enable_mrt_output_nan_fixup && !is_16bit &&
+-       (col_format == V_028714_SPI_SHADER_32_R || col_format == V_028714_SPI_SHADER_32_GR ||
+-        col_format == V_028714_SPI_SHADER_32_AR || col_format == V_028714_SPI_SHADER_32_ABGR ||
++
++   const bool is_int8 = (info->color_is_int8 >> slot) & 1;
++   const bool is_int10 = (info->color_is_int10 >> slot) & 1;
++   const bool enable_nan_fixup = (ctx->options->enable_mrt_output_nan_fixup >> slot) & 1;
++
++   /* Optional NaN->0 fixup for 32-bit sources (helps buggy content). */
++   if (enable_nan_fixup && !is_16bit &&
++       (col_format == V_028714_SPI_SHADER_32_R   ||
++        col_format == V_028714_SPI_SHADER_32_GR  ||
++        col_format == V_028714_SPI_SHADER_32_AR  ||
++        col_format == V_028714_SPI_SHADER_32_ABGR||
+         col_format == V_028714_SPI_SHADER_FP16_ABGR)) {
+       for (unsigned i = 0; i < 4; i++) {
+-         Temp is_not_nan =
+-            bld.vopc(aco_opcode::v_cmp_eq_f32, bld.def(bld.lm), values[i], values[i]);
+-         values[i] = bld.vop2(aco_opcode::v_cndmask_b32, bld.def(v1), Operand::zero(), values[i],
+-                              is_not_nan);
++         Temp is_not_nan = bld.vopc(aco_opcode::v_cmp_eq_f32, bld.def(bld.lm), values[i], values[i]);
++         values[i] = bld.vop2(aco_opcode::v_cndmask_b32, bld.def(v1),
++                              Operand::zero(), values[i], is_not_nan);
+       }
+    }
+ 
+    switch (col_format) {
+    case V_028714_SPI_SHADER_32_R:
+-      if (color_type == ACO_TYPE_FLOAT16)
++      if (color_type == ACO_TYPE_FLOAT16) {
+          values[0] = bld.vop1(aco_opcode::v_cvt_f32_f16, bld.def(v1), values[0]);
+-      else if (color_type == ACO_TYPE_INT16 || color_type == ACO_TYPE_UINT16)
+-         values[0] = Operand(
+-            convert_int(ctx, bld, values[0].getTemp(), 16, 32, color_type == ACO_TYPE_INT16));
+-      enabled_channels = 1;
++      } else if (color_type == ACO_TYPE_INT16 || color_type == ACO_TYPE_UINT16) {
++         values[0] = Operand(convert_int(ctx, bld, values[0].getTemp(), 16, 32,
++                                         color_type == ACO_TYPE_INT16));
++      }
++      enabled_channels = 0x1;
+       break;
+ 
+    case V_028714_SPI_SHADER_32_GR:
+@@ -134,81 +140,75 @@ export_fs_mrt_color(isel_context* ctx, c
+          for (unsigned i = 0; i < 2; i++)
+             values[i] = bld.vop1(aco_opcode::v_cvt_f32_f16, bld.def(v1), values[i]);
+       } else if (color_type == ACO_TYPE_INT16 || color_type == ACO_TYPE_UINT16) {
+-         for (unsigned i = 0; i < 2; i++)
+-            values[i] = Operand(
+-               convert_int(ctx, bld, values[i].getTemp(), 16, 32, color_type == ACO_TYPE_INT16));
++         for (unsigned i = 0; i < 2; i++) {
++            values[i] = Operand(convert_int(ctx, bld, values[i].getTemp(), 16, 32,
++                                            color_type == ACO_TYPE_INT16));
++         }
+       }
+       enabled_channels = 0x3;
+       break;
+ 
+    case V_028714_SPI_SHADER_32_AR:
+       if (color_type == ACO_TYPE_FLOAT16) {
+-         for (unsigned i = 0; i < 2; i++) {
+-            unsigned idx = i ? 3 : 0;
+-            values[idx] = bld.vop1(aco_opcode::v_cvt_f32_f16, bld.def(v1), values[idx]);
+-         }
++         /* Convert A and R (indices 3 and 0). */
++         values[0] = bld.vop1(aco_opcode::v_cvt_f32_f16, bld.def(v1), values[0]);
++         values[3] = bld.vop1(aco_opcode::v_cvt_f32_f16, bld.def(v1), values[3]);
+       } else if (color_type == ACO_TYPE_INT16 || color_type == ACO_TYPE_UINT16) {
+-         for (unsigned i = 0; i < 2; i++) {
+-            unsigned idx = i ? 3 : 0;
+-            values[idx] = Operand(
+-               convert_int(ctx, bld, values[idx].getTemp(), 16, 32, color_type == ACO_TYPE_INT16));
+-         }
++         values[0] = Operand(convert_int(ctx, bld, values[0].getTemp(), 16, 32,
++                                         color_type == ACO_TYPE_INT16));
++         values[3] = Operand(convert_int(ctx, bld, values[3].getTemp(), 16, 32,
++                                         color_type == ACO_TYPE_INT16));
+       }
+ 
+-      if (ctx->options->gfx_level >= GFX10) {
+-         /* Special case: on GFX10, the outputs are different for 32_AR */
++      if (ctx->program->gfx_level >= GFX10) {
++         /* Special case on GFX10: 32_AR outputs map like GR. */
+          enabled_channels = 0x3;
+-         values[1] = values[3];
+-         values[3] = Operand(v1);
++        values[1] = values[3];
++        values[3] = Operand(v1);
+       } else {
+-         enabled_channels = 0x9;
++        enabled_channels = 0x9;
+       }
+       break;
+ 
+    case V_028714_SPI_SHADER_FP16_ABGR:
+-      for (int i = 0; i < 2; i++) {
++      /* Pack FP32 to FP16 (if needed) into 2x 32-bit registers (XY, ZW). */
++      for (unsigned i = 0; i < 2; i++) {
+          if (is_16bit) {
+-            values[i] = bld.pseudo(aco_opcode::p_create_vector, bld.def(v1), values[i * 2],
+-                                   values[i * 2 + 1]);
+-         } else if (ctx->options->gfx_level == GFX8 || ctx->options->gfx_level == GFX9) {
+-            values[i] = bld.vop3(aco_opcode::v_cvt_pkrtz_f16_f32_e64, bld.def(v1), values[i * 2],
+-                                 values[i * 2 + 1]);
++            values[i] = bld.pseudo(aco_opcode::p_create_vector, bld.def(v1),
++                                   values[i * 2], values[i * 2 + 1]);
++         } else if (ctx->program->gfx_level == GFX8 || ctx->program->gfx_level == GFX9) {
++            values[i] = bld.vop3(aco_opcode::v_cvt_pkrtz_f16_f32_e64, bld.def(v1),
++                                 values[i * 2], values[i * 2 + 1]);
+          } else {
+-            values[i] = bld.vop2(aco_opcode::v_cvt_pkrtz_f16_f32, bld.def(v1), values[i * 2],
+-                                 values[i * 2 + 1]);
++            values[i] = bld.vop2(aco_opcode::v_cvt_pkrtz_f16_f32, bld.def(v1),
++                                 values[i * 2], values[i * 2 + 1]);
+          }
+       }
+       values[2] = Operand(v1);
+       values[3] = Operand(v1);
+-      enabled_channels = 0xf;
++      enabled_channels = 0xF;
+       compr = true;
+       break;
+ 
+    case V_028714_SPI_SHADER_UNORM16_ABGR:
+-      if (is_16bit && ctx->options->gfx_level >= GFX9) {
+-         compr_op = aco_opcode::v_cvt_pknorm_u16_f16;
+-      } else {
+-         compr_op = aco_opcode::v_cvt_pknorm_u16_f32;
+-      }
++      compr_op = (is_16bit && ctx->program->gfx_level >= GFX9)
++                    ? aco_opcode::v_cvt_pknorm_u16_f16
++                    : aco_opcode::v_cvt_pknorm_u16_f32;
+       break;
+ 
+    case V_028714_SPI_SHADER_SNORM16_ABGR:
+-      if (is_16bit && ctx->options->gfx_level >= GFX9) {
+-         compr_op = aco_opcode::v_cvt_pknorm_i16_f16;
+-      } else {
+-         compr_op = aco_opcode::v_cvt_pknorm_i16_f32;
+-      }
++      compr_op = (is_16bit && ctx->program->gfx_level >= GFX9)
++                    ? aco_opcode::v_cvt_pknorm_i16_f16
++                    : aco_opcode::v_cvt_pknorm_i16_f32;
+       break;
+ 
+-   case V_028714_SPI_SHADER_UINT16_ABGR:
++   case V_028714_SPI_SHADER_UINT16_ABGR: {
+       compr_op = aco_opcode::v_cvt_pk_u16_u32;
+       if (is_int8 || is_int10) {
+-         /* clamp */
+-         uint32_t max_rgb = is_int8 ? 255 : is_int10 ? 1023 : 0;
+-
++         /* Clamp unsigned integer outputs. */
++         const uint32_t max_rgb = is_int8 ? 255u : (is_int10 ? 1023u : 0u);
+          for (unsigned i = 0; i < 4; i++) {
+-            uint32_t max = i == 3 && is_int10 ? 3 : max_rgb;
+-
++            const uint32_t max = (i == 3 && is_int10) ? 3u : max_rgb;
+             values[i] = bld.vop2(aco_opcode::v_min_u32, bld.def(v1), Operand::c32(max), values[i]);
+          }
+       } else if (is_16bit) {
+@@ -218,20 +218,21 @@ export_fs_mrt_color(isel_context* ctx, c
+          }
+       }
+       break;
++   }
+ 
+-   case V_028714_SPI_SHADER_SINT16_ABGR:
++   case V_028714_SPI_SHADER_SINT16_ABGR: {
+       compr_op = aco_opcode::v_cvt_pk_i16_i32;
+       if (is_int8 || is_int10) {
+-         /* clamp */
+-         uint32_t max_rgb = is_int8 ? 127 : is_int10 ? 511 : 0;
+-         uint32_t min_rgb = is_int8 ? -128 : is_int10 ? -512 : 0;
+-
++         /* Clamp signed integer outputs. */
++         const int32_t max_rgb = is_int8 ? 127 : (is_int10 ? 511 : 0);
++         const int32_t min_rgb = is_int8 ? -128 : (is_int10 ? -512 : 0);
+          for (unsigned i = 0; i < 4; i++) {
+-            uint32_t max = i == 3 && is_int10 ? 1 : max_rgb;
+-            uint32_t min = i == 3 && is_int10 ? -2u : min_rgb;
+-
+-            values[i] = bld.vop2(aco_opcode::v_min_i32, bld.def(v1), Operand::c32(max), values[i]);
+-            values[i] = bld.vop2(aco_opcode::v_max_i32, bld.def(v1), Operand::c32(min), values[i]);
++            const int32_t max = (i == 3 && is_int10) ? 1 : max_rgb;
++            const int32_t min = (i == 3 && is_int10) ? -2 : min_rgb;
++            values[i] = bld.vop2(aco_opcode::v_min_i32, bld.def(v1),
++                                 Operand::c32((uint32_t)max), values[i]);
++            values[i] = bld.vop2(aco_opcode::v_max_i32, bld.def(v1),
++                                 Operand::c32((uint32_t)min), values[i]);
+          }
+       } else if (is_16bit) {
+          for (unsigned i = 0; i < 4; i++) {
+@@ -240,6 +241,7 @@ export_fs_mrt_color(isel_context* ctx, c
+          }
+       }
+       break;
++   }
+ 
+    case V_028714_SPI_SHADER_32_ABGR:
+       enabled_channels = 0xF;
+@@ -247,32 +249,34 @@ export_fs_mrt_color(isel_context* ctx, c
+          for (unsigned i = 0; i < 4; i++)
+             values[i] = bld.vop1(aco_opcode::v_cvt_f32_f16, bld.def(v1), values[i]);
+       } else if (color_type == ACO_TYPE_INT16 || color_type == ACO_TYPE_UINT16) {
+-         for (unsigned i = 0; i < 4; i++)
+-            values[i] = Operand(
+-               convert_int(ctx, bld, values[i].getTemp(), 16, 32, color_type == ACO_TYPE_INT16));
++         for (unsigned i = 0; i < 4; i++) {
++            values[i] = Operand(convert_int(ctx, bld, values[i].getTemp(), 16, 32,
++                                            color_type == ACO_TYPE_INT16));
++         }
+       }
+       break;
+ 
+    case V_028714_SPI_SHADER_ZERO:
+-   default: return false;
++   default:
++      return false;
+    }
+ 
++   /* If conversion opcode is set, pack pairs and mark COMPR (<= GFX10). */
+    if (compr_op != aco_opcode::num_opcodes) {
+       values[0] = bld.vop3(compr_op, bld.def(v1), values[0], values[1]);
+       values[1] = bld.vop3(compr_op, bld.def(v1), values[2], values[3]);
+       values[2] = Operand(v1);
+       values[3] = Operand(v1);
+-      enabled_channels = 0xf;
++      enabled_channels = 0xF;
+       compr = true;
+    } else if (!compr) {
+-      for (int i = 0; i < 4; i++)
+-         values[i] = enabled_channels & (1 << i) ? values[i] : Operand(v1);
++      /* Mark disabled channels as undefined. */
++      for (unsigned i = 0; i < 4; i++)
++         values[i] = (enabled_channels & (1u << i)) ? values[i] : Operand(v1);
+    }
+ 
+    if (ctx->program->gfx_level >= GFX11) {
+-      /* GFX11 doesn't use COMPR for exports, but the channel mask should be
+-       * 0x3 instead.
+-       */
++      /* GFX11: no COMPR flag; use chan mask 0x3 when packed. */
+       enabled_channels = compr ? 0x3 : enabled_channels;
+       compr = false;
+    }
+@@ -287,79 +291,77 @@ export_fs_mrt_color(isel_context* ctx, c
+ }
+ 
+ void
+-export_fs_mrtz(isel_context* ctx, const struct aco_ps_epilog_info* info, Temp depth, Temp stencil,
+-               Temp samplemask, Temp alpha)
++export_fs_mrtz(isel_context* ctx, const struct aco_ps_epilog_info* info,
++               Temp depth, Temp stencil, Temp samplemask, Temp alpha)
+ {
+    Builder bld(ctx->program, ctx->block);
+    unsigned enabled_channels = 0;
+    bool compr = false;
+-   Operand values[4];
+-
+-   for (unsigned i = 0; i < 4; ++i) {
+-      values[i] = Operand(v1);
+-   }
++   Operand values[4] = {Operand(v1), Operand(v1), Operand(v1), Operand(v1)};
+ 
+    const unsigned format =
+       ac_get_spi_shader_z_format(depth.id(), stencil.id(), samplemask.id(), alpha.id());
+    assert(format != V_028710_SPI_SHADER_ZERO);
+ 
+-   /* Both stencil and sample mask only need 16-bits. */
++   /* Stencil and samplemask packed (16-bit fields). */
+    if (format == V_028710_SPI_SHADER_UINT16_ABGR) {
+-      compr = ctx->program->gfx_level < GFX11; /* COMPR flag */
++      compr = ctx->program->gfx_level < GFX11;
+ 
+       if (stencil.id()) {
+          /* Stencil should be in X[23:16]. */
+-         values[0] = bld.vop2(aco_opcode::v_lshlrev_b32, bld.def(v1), Operand::c32(16u), stencil);
+-         enabled_channels |= ctx->program->gfx_level >= GFX11 ? 0x1 : 0x3;
++         values[0] = bld.vop2(aco_opcode::v_lshlrev_b32, bld.def(v1),
++                              Operand::c32(16u), stencil);
++         enabled_channels |= (ctx->program->gfx_level >= GFX11) ? 0x1 : 0x3;
+       }
+ 
+       if (samplemask.id()) {
+          /* SampleMask should be in Y[15:0]. */
+          values[1] = Operand(samplemask);
+-         enabled_channels |= ctx->program->gfx_level >= GFX11 ? 0x2 : 0xc;
++         enabled_channels |= (ctx->program->gfx_level >= GFX11) ? 0x2 : 0xC;
+       }
+    } else {
++      /* 32-bit depth/stencil/samplemask/alpha */
+       if (depth.id()) {
+          values[0] = Operand(depth);
+          enabled_channels |= 0x1;
+       }
+-
+       if (stencil.id()) {
+-         assert(format == V_028710_SPI_SHADER_32_GR || format == V_028710_SPI_SHADER_32_ABGR);
++         assert(format == V_028710_SPI_SHADER_32_GR ||
++                format == V_028710_SPI_SHADER_32_ABGR);
+          values[1] = Operand(stencil);
+          enabled_channels |= 0x2;
+       }
+-
+       if (samplemask.id()) {
+          assert(format == V_028710_SPI_SHADER_32_ABGR);
+          values[2] = Operand(samplemask);
+          enabled_channels |= 0x4;
+       }
+-
+       if (alpha.id()) {
+-         assert(format == V_028710_SPI_SHADER_32_AR || format == V_028710_SPI_SHADER_32_ABGR);
++         assert(format == V_028710_SPI_SHADER_32_AR ||
++                format == V_028710_SPI_SHADER_32_ABGR);
+          assert(ctx->program->gfx_level >= GFX11 || info->alpha_to_one);
+          values[3] = Operand(alpha);
+          enabled_channels |= 0x8;
+       }
+    }
+ 
+-   bld.exp(aco_opcode::exp, values[0], values[1], values[2], values[3], enabled_channels,
+-           V_008DFC_SQ_EXP_MRTZ, compr);
++   bld.exp(aco_opcode::exp, values[0], values[1], values[2], values[3],
++           enabled_channels, V_008DFC_SQ_EXP_MRTZ, compr);
+ }
+ 
+ void
+ create_fs_null_export(isel_context* ctx)
+ {
+    /* FS must always have exports.
+-    * So when there are none, we need to add a null export.
++    * If none present, add a null export (use MRT0 on GFX11+).
+     */
+-
+    Builder bld(ctx->program, ctx->block);
+-   /* GFX11 doesn't support NULL exports, and MRT0 should be exported instead. */
+-   unsigned dest = ctx->options->gfx_level >= GFX11 ? V_008DFC_SQ_EXP_MRT : V_008DFC_SQ_EXP_NULL;
++   const unsigned dest =
++      ctx->options->gfx_level >= GFX11 ? V_008DFC_SQ_EXP_MRT : V_008DFC_SQ_EXP_NULL;
++
+    bld.exp(aco_opcode::exp, Operand(v1), Operand(v1), Operand(v1), Operand(v1),
+-           /* enabled_mask */ 0, dest, /* compr */ false, /* done */ true, /* vm */ true);
++           /* enabled_mask */ 0, dest, /* compr */ false,
++           /* done */ true, /* vm */ true);
+ 
+    ctx->program->has_color_exports = true;
+ }
+@@ -382,7 +384,9 @@ select_ps_epilog(Program* program, void*
+ 
+    Builder bld(ctx.program, ctx.block);
+ 
+-   bool has_mrtz_alpha = einfo->alpha_to_coverage_via_mrtz && einfo->colors[0].used;
++   /* If alpha-to-coverage uses MRTZ alpha, we must capture MRT0 alpha before alpha_to_one. */
++   const bool has_mrtz_alpha =
++      einfo->alpha_to_coverage_via_mrtz && einfo->colors[0].used;
+    Temp mrtz_alpha;
+ 
+    Temp colors[MAX_DRAW_BUFFERS][4];
+@@ -391,28 +395,29 @@ select_ps_epilog(Program* program, void*
+          continue;
+ 
+       Temp color = get_arg(&ctx, einfo->colors[i]);
+-      unsigned col_type = (einfo->color_types >> (i * 2)) & 0x3;
++      const unsigned col_type = (einfo->color_types >> (i * 2)) & 0x3;
+ 
+       emit_split_vector(&ctx, color, col_type == ACO_TYPE_ANY32 ? 4 : 8);
+-      for (unsigned c = 0; c < 4; ++c) {
+-         colors[i][c] = emit_extract_vector(&ctx, color, c, col_type == ACO_TYPE_ANY32 ? v1 : v2b);
+-      }
++      for (unsigned c = 0; c < 4; ++c)
++         colors[i][c] = emit_extract_vector(&ctx, color, c,
++                                            col_type == ACO_TYPE_ANY32 ? v1 : v2b);
+ 
+-      /* Store MRTZ.a before applying alpha-to-one if enabled. */
++      /* Save MRT0 alpha for MRTZ before alpha_to_one. */
+       if (has_mrtz_alpha && i == 0)
+          mrtz_alpha = colors[0][3];
+ 
+       emit_clamp_alpha_test(&ctx, einfo, colors[i], i);
+    }
+ 
+-   bool has_mrtz_depth = einfo->depth.used && !einfo->kill_depth;
+-   bool has_mrtz_stencil = einfo->stencil.used && !einfo->kill_stencil;
+-   bool has_mrtz_samplemask = einfo->samplemask.used && !einfo->kill_samplemask;
+-   bool has_mrtz_export =
+-      has_mrtz_depth || has_mrtz_stencil || has_mrtz_samplemask || has_mrtz_alpha;
++   const bool has_mrtz_depth      = einfo->depth.used      && !einfo->kill_depth;
++   const bool has_mrtz_stencil    = einfo->stencil.used    && !einfo->kill_stencil;
++   const bool has_mrtz_samplemask = einfo->samplemask.used && !einfo->kill_samplemask;
++   const bool has_mrtz_export = has_mrtz_depth || has_mrtz_stencil ||
++                                has_mrtz_samplemask || has_mrtz_alpha;
++
+    if (has_mrtz_export) {
+-      Temp depth = has_mrtz_depth ? get_arg(&ctx, einfo->depth) : Temp();
+-      Temp stencil = has_mrtz_stencil ? get_arg(&ctx, einfo->stencil) : Temp();
++      Temp depth      = has_mrtz_depth      ? get_arg(&ctx, einfo->depth)      : Temp();
++      Temp stencil    = has_mrtz_stencil    ? get_arg(&ctx, einfo->stencil)    : Temp();
+       Temp samplemask = has_mrtz_samplemask ? get_arg(&ctx, einfo->samplemask) : Temp();
+ 
+       export_fs_mrtz(&ctx, einfo, depth, stencil, samplemask, mrtz_alpha);
+@@ -423,28 +428,28 @@ select_ps_epilog(Program* program, void*
+    unsigned mrt_num = 0;
+ 
+    if (einfo->writes_all_cbufs) {
+-      /* This will do nothing for color buffers with SPI_SHADER_COL_FORMAT=ZERO, so always
+-       * iterate over all 8.
++      /* Writes-all: replicate colors[0] across enabled CBs.
++       * The source color data format is slot 0's type; use that consistently.
+        */
++      const unsigned src_col_type = (einfo->color_types /*>> (0*2)*/ ) & 0x3;
++
+       for (unsigned i = 0; i < 8; i++) {
+          struct aco_export_mrt* mrt = &mrts[mrt_num];
+-         unsigned col_type = einfo->color_types & 0x3;
+ 
+-         if (export_fs_mrt_color(&ctx, einfo, colors[0], i, col_type, mrt))
++         if (export_fs_mrt_color(&ctx, einfo, colors[0], i, src_col_type, mrt))
+             mrt->target += mrt_num++;
+       }
+    } else {
+       for (unsigned i = 0; i < MAX_DRAW_BUFFERS; i++) {
+-         struct aco_export_mrt* mrt = &mrts[mrt_num];
+          const uint8_t cb_idx = einfo->color_map[i];
+-         unsigned col_type = (einfo->color_types >> (cb_idx * 2)) & 0x3;
+-
+          if (cb_idx == 0xff || !einfo->colors[cb_idx].used)
+             continue;
+ 
+-         if (export_fs_mrt_color(&ctx, einfo, colors[cb_idx], i, col_type, mrt)) {
++         struct aco_export_mrt* mrt = &mrts[mrt_num];
++         const unsigned col_type = (einfo->color_types >> (cb_idx * 2)) & 0x3;
++
++         if (export_fs_mrt_color(&ctx, einfo, colors[cb_idx], i, col_type, mrt))
+             mrt->target += mrt_num++;
+-         }
+       }
+    }
+ 
