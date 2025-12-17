@@ -287,26 +287,34 @@ private:
 
 struct NOP_ctx_gfx11
 {
+   /* VcmpxPermlaneHazard */
    bool has_Vcmpx = false;
 
+   /* LdsDirectVMEMHazard */
    std::bitset<256> vgpr_used_by_vmem_load;
    std::bitset<256> vgpr_used_by_vmem_sample;
    std::bitset<256> vgpr_used_by_vmem_bvh;
    std::bitset<256> vgpr_used_by_vmem_store;
    std::bitset<256> vgpr_used_by_ds;
 
+   /* VALUTransUseHazard */
    RegCounterMap<6> valu_since_wr_by_trans;
    RegCounterMap<2> trans_since_wr_by_trans;
 
+   /* VALUMaskWriteHazard */
    std::bitset<128> sgpr_read_by_valu_as_lanemask;
    std::bitset<128> sgpr_read_by_valu_as_lanemask_then_wr_by_salu;
    std::bitset<128> sgpr_read_by_valu_as_lanemask_then_wr_by_valu;
 
+   /* WMMAHazards */
    std::bitset<256> vgpr_written_by_wmma;
 
-   std::bitset<m0.reg() / 2> sgpr_read_by_valu;
+   /* VALUReadSGPRHazard */
+   std::bitset<m0.reg() / 2> sgpr_read_by_valu; /* SGPR pairs, excluding null, exec, m0 and scc */
    std::bitset<m0.reg()> sgpr_read_by_valu_then_wr_by_valu;
    RegCounterMap<11> sgpr_read_by_valu_then_wr_by_salu;
+   /* Force emitting a wait mitigating VALUReadSGPRHazard before the next ALU instruction. */
+   bool force_valu_read_sgpr_wait = false;
 
    void join(const NOP_ctx_gfx11& other)
    {
@@ -327,6 +335,7 @@ struct NOP_ctx_gfx11
       sgpr_read_by_valu |= other.sgpr_read_by_valu;
       sgpr_read_by_valu_then_wr_by_valu |= other.sgpr_read_by_valu_then_wr_by_valu;
       sgpr_read_by_valu_then_wr_by_salu.join_min(other.sgpr_read_by_valu_then_wr_by_salu);
+      force_valu_read_sgpr_wait |= other.force_valu_read_sgpr_wait;
    }
 
    bool operator==(const NOP_ctx_gfx11& other) const
@@ -346,7 +355,8 @@ struct NOP_ctx_gfx11
                 other.sgpr_read_by_valu_as_lanemask_then_wr_by_valu &&
              vgpr_written_by_wmma == other.vgpr_written_by_wmma &&
              sgpr_read_by_valu == other.sgpr_read_by_valu &&
-             sgpr_read_by_valu_then_wr_by_salu == other.sgpr_read_by_valu_then_wr_by_salu;
+             sgpr_read_by_valu_then_wr_by_salu == other.sgpr_read_by_valu_then_wr_by_salu &&
+             force_valu_read_sgpr_wait == other.force_valu_read_sgpr_wait;
    }
 };
 
@@ -683,15 +693,15 @@ handle_instruction_gfx6(State& state, NOP_ctx_gfx6& ctx, aco_ptr<Instruction>& i
    }
 
    if (state.program->gfx_level == GFX9) {
-         const bool is_lds_hazard_op =
+      const bool is_lds_hazard_op =
          (instr->isVINTRP() ||
-         ((instr->isScratch() || instr->isGlobal()) && instr->flatlike().lds) ||
-         instr->opcode == aco_opcode::ds_read_addtid_b32 ||
-         instr->opcode == aco_opcode::ds_write_addtid_b32 ||
-         instr->opcode == aco_opcode::buffer_store_lds_dword);
-         if (is_lds_hazard_op) {
-               NOPs = std::max(NOPs, static_cast<int>(ctx.salu_wr_m0_then_lds));
-         }
+          ((instr->isScratch() || instr->isGlobal()) && instr->flatlike().lds) ||
+          instr->opcode == aco_opcode::ds_read_addtid_b32 ||
+          instr->opcode == aco_opcode::ds_write_addtid_b32 ||
+          instr->opcode == aco_opcode::buffer_store_lds_dword);
+      if (is_lds_hazard_op) {
+         NOPs = std::max(NOPs, static_cast<int>(ctx.salu_wr_m0_then_lds));
+      }
    }
 
    if (NOPs > 0) {
@@ -799,10 +809,13 @@ handle_instruction_gfx6(State& state, NOP_ctx_gfx6& ctx, aco_ptr<Instruction>& i
             uint32_t value = 0;
 
             if (instr->opcode == aco_opcode::s_setreg_imm32_b32) {
+               /* For s_setreg_imm32_b32, the immediate value is complex to extract;
+                * be conservative and assume unknown. */
                value_known = false;
             } else {
-               if (instr->operands[1].isConstant()) {
-                  value = instr->operands[1].constantValue();
+               /* For s_setreg_b32, source is in operands[0] */
+               if (!instr->operands.empty() && instr->operands[0].isConstant()) {
+                  value = instr->operands[0].constantValue();
                   value_known = true;
                }
             }
@@ -1618,7 +1631,7 @@ handle_instruction_gfx11(State& state, NOP_ctx_gfx11& ctx, aco_ptr<Instruction>&
                unsigned reg = op.physReg() + i;
 
                /* s_waitcnt_depctr on sa_sdst */
-               if (ctx.sgpr_read_by_valu_as_lanemask_then_wr_by_salu[reg]) {
+               if (ctx.sgpr_read_by_valu_as_lanemask_then_wr_by_salu[reg] && wait.sa_sdst > 0) {
                   imm &= 0xfffe;
                   wait.sa_sdst = 0;
                }
@@ -1626,11 +1639,13 @@ handle_instruction_gfx11(State& state, NOP_ctx_gfx11& ctx, aco_ptr<Instruction>&
                /* s_waitcnt_depctr on va_sdst (if non-VCC SGPR) or va_vcc (if VCC SGPR) */
                if (ctx.sgpr_read_by_valu_as_lanemask_then_wr_by_valu[reg]) {
                   bool is_vcc = reg == vcc || reg == vcc_hi;
-                  imm &= is_vcc ? 0xfffd : 0xf1ff;
-                  if (is_vcc)
+                  if (is_vcc && wait.va_vcc > 0) {
+                     imm &= 0xfffd;
                      wait.va_vcc = 0;
-                  else
+                  } else if (!is_vcc && wait.va_sdst > 0) {
+                     imm &= 0xf1ff;
                      wait.va_sdst = 0;
+                  }
                }
             }
          }
@@ -1725,13 +1740,20 @@ handle_instruction_gfx11(State& state, NOP_ctx_gfx11& ctx, aco_ptr<Instruction>&
          unsigned expiry_count = instr->isSALU() ? 10 : 11;
          uint16_t imm = 0xffff;
 
+         if (ctx.force_valu_read_sgpr_wait) {
+            imm &= 0xfffe;
+            wait.sa_sdst = 0;
+            ctx.force_valu_read_sgpr_wait = false;
+         }
+
          for (Operand& op : instr->operands) {
             if (op.physReg() >= m0)
                continue;
 
             for (unsigned i = 0; i < op.size(); i++) {
                PhysReg reg = op.physReg().advance(i * 4);
-               if (ctx.sgpr_read_by_valu_then_wr_by_salu.get(reg) < expiry_count) {
+               if (ctx.sgpr_read_by_valu_then_wr_by_salu.get(reg) < expiry_count &&
+                   wait.sa_sdst > 0) {
                   imm &= 0xfffe;
                   wait.sa_sdst = 0;
                }
@@ -1741,11 +1763,13 @@ handle_instruction_gfx11(State& state, NOP_ctx_gfx11& ctx, aco_ptr<Instruction>&
                   /* s_wait_alu on va_sdst (if non-VCC SGPR) or va_vcc (if VCC SGPR) */
                   if (ctx.sgpr_read_by_valu_then_wr_by_valu[reg]) {
                      bool is_vcc = reg == vcc || reg == vcc_hi;
-                     imm &= is_vcc ? 0xfffd : 0xf1ff;
-                     if (is_vcc)
+                     if (is_vcc && wait.va_vcc > 0) {
+                        imm &= 0xfffd;
                         wait.va_vcc = 0;
-                     else
+                     } else if (!is_vcc && wait.va_sdst > 0) {
+                        imm &= 0xf1ff;
                         wait.va_sdst = 0;
+                     }
                   }
                }
             }
@@ -2168,6 +2192,15 @@ insert_NOPs(Program* program)
           * SGPR might have been read by VALU if there was a previous shader part.
           */
          initial_ctx.sgpr_read_by_valu.flip();
+         /* We cannot assume the s_setpc source has not been read by VALU in the preceding shader/
+          * shader part, and there are GPU hangs in the wild suggesting that the s_setpc source may
+          * be susceptible to VALUReadSGPRHazard. It is impossible for the previous part to mitigate
+          * this, and it is not always known which register the s_setpc source was in, so force a
+          * wait to be emitted at the start of this part.
+          *
+          * TODO: This hypothesis is not yet conclusively proven. More testing is needed.
+          */
+         initial_ctx.force_valu_read_sgpr_wait = true;
       }
 
       mitigate_hazards<NOP_ctx_gfx11, handle_instruction_gfx11, resolve_all_gfx11>(program,
