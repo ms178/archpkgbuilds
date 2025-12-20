@@ -78,6 +78,7 @@ struct amdgpu_bo_va {
 	bool				cleared;
 	bool				is_xgmi;
 	unsigned int			queue_refcount;
+	atomic_t			userq_va_mapped;
 };
 
 struct amdgpu_bo {
