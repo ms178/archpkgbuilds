@@ -16,7 +16,9 @@
 #include "ac_descriptors.h"
 #include "amdgfxregs.h"
 
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#endif
 #include <cstring>
 #include <cassert>
 #include <algorithm>
@@ -289,6 +291,67 @@ can_use_SDWA(amd_gfx_level gfx_level, const aco_ptr<Instruction>& instr, bool pr
    if (!instr->isVALU()) [[unlikely]]
       return false;
 
+   /* GFX9 (Vega 64) is the sweet spot for SDWA - full support.
+    * Check this first for Vega users.
+    */
+   if (gfx_level == GFX9) [[likely]] {
+      /* Fast path: already SDWA, definitely usable */
+      if (instr->isSDWA()) [[likely]]
+         return true;
+
+      if (instr->isDPP() || instr->isVOP3P()) [[unlikely]]
+         return false;
+
+      if (instr->isVOP3()) {
+         VALU_instruction& vop3 = instr->valu();
+         /* GFX9: VOPC + omod is valid, but clamp is not */
+         if (instr->format == Format::VOP3 && !(instr->isVOPC() && vop3.omod && !vop3.clamp))
+            return false;
+         if (!pre_ra && instr->definitions.size() >= 2)
+            return false;
+         /* GFX9 allows SGPR in src1+ */
+         for (unsigned i = 1; i < instr->operands.size(); i++) {
+            if (instr->operands[i].isLiteral())
+               return false;
+         }
+      }
+
+      if (!instr->definitions.empty() && instr->definitions[0].bytes() > 4 && !instr->isVOPC())
+         return false;
+
+      if (!instr->operands.empty()) {
+         if (instr->operands[0].isLiteral())
+            return false;
+         if (instr->operands[0].bytes() > 4)
+            return false;
+         if (instr->operands.size() > 1 && instr->operands[1].bytes() > 4)
+            return false;
+      }
+
+      /* v_mac/v_fmac need GFX8 for SDWA, but we're GFX9 here */
+      if (!pre_ra && instr->operands.size() >= 3) {
+         bool is_mac = instr->opcode == aco_opcode::v_mac_f32 ||
+                       instr->opcode == aco_opcode::v_mac_f16 ||
+                       instr->opcode == aco_opcode::v_fmac_f32 ||
+                       instr->opcode == aco_opcode::v_fmac_f16;
+         if (!is_mac)
+            return false;
+      }
+
+      return instr->opcode != aco_opcode::v_madmk_f32 &&
+             instr->opcode != aco_opcode::v_madak_f32 &&
+             instr->opcode != aco_opcode::v_madmk_f16 &&
+             instr->opcode != aco_opcode::v_madak_f16 &&
+             instr->opcode != aco_opcode::v_fmamk_f32 &&
+             instr->opcode != aco_opcode::v_fmaak_f32 &&
+             instr->opcode != aco_opcode::v_fmamk_f16 &&
+             instr->opcode != aco_opcode::v_fmaak_f16 &&
+             instr->opcode != aco_opcode::v_readfirstlane_b32 &&
+             instr->opcode != aco_opcode::v_clrexcp &&
+             instr->opcode != aco_opcode::v_swap_b32;
+   }
+
+   /* Non-GFX9 path: original logic */
    if (gfx_level < GFX8 || gfx_level >= GFX11) [[unlikely]]
       return false;
 
@@ -300,63 +363,61 @@ can_use_SDWA(amd_gfx_level gfx_level, const aco_ptr<Instruction>& instr, bool pr
 
    if (instr->isVOP3()) {
       VALU_instruction& vop3 = instr->valu();
-
-      if (vop3.omod && gfx_level < GFX9) [[unlikely]]
+      if (vop3.omod && gfx_level < GFX9)
          return false;
-
-      // Vega (GFX9) specific: VOPC with omod is valid, but clamps are not
-      bool vega_vopc_omod = (gfx_level == GFX9 && instr->isVOPC() && vop3.omod && !vop3.clamp);
-
-      if (instr->format == Format::VOP3 && !vega_vopc_omod) [[unlikely]]
+      if (instr->format == Format::VOP3)
          return false;
-
-      if (vop3.clamp && instr->isVOPC() && gfx_level != GFX8 && !vega_vopc_omod) [[unlikely]]
+      if (vop3.clamp && instr->isVOPC() && gfx_level != GFX8)
          return false;
-
-      if (!pre_ra && instr->definitions.size() >= 2) [[unlikely]]
+      if (!pre_ra && instr->definitions.size() >= 2)
          return false;
-
       for (unsigned i = 1; i < instr->operands.size(); i++) {
-         if (instr->operands[i].isLiteral()) [[unlikely]]
+         if (instr->operands[i].isLiteral())
             return false;
-         if (gfx_level < GFX9 && !instr->operands[i].isOfType(RegType::vgpr)) [[unlikely]]
+         if (gfx_level < GFX9 && !instr->operands[i].isOfType(RegType::vgpr))
             return false;
       }
    }
 
    if (!instr->definitions.empty() && instr->definitions[0].bytes() > 4 && !instr->isVOPC())
-      [[unlikely]]
       return false;
 
    if (!instr->operands.empty()) {
-      if (instr->operands[0].isLiteral()) [[unlikely]]
+      if (instr->operands[0].isLiteral())
          return false;
-      if (gfx_level < GFX9 && !instr->operands[0].isOfType(RegType::vgpr)) [[unlikely]]
+      if (gfx_level < GFX9 && !instr->operands[0].isOfType(RegType::vgpr))
          return false;
-      if (instr->operands[0].bytes() > 4) [[unlikely]]
+      if (instr->operands[0].bytes() > 4)
          return false;
-      if (instr->operands.size() > 1 && instr->operands[1].bytes() > 4) [[unlikely]]
+      if (instr->operands.size() > 1 && instr->operands[1].bytes() > 4)
          return false;
    }
 
-   bool is_mac = instr->opcode == aco_opcode::v_mac_f32 || instr->opcode == aco_opcode::v_mac_f16 ||
-                 instr->opcode == aco_opcode::v_fmac_f32 || instr->opcode == aco_opcode::v_fmac_f16;
+   bool is_mac = instr->opcode == aco_opcode::v_mac_f32 ||
+                 instr->opcode == aco_opcode::v_mac_f16 ||
+                 instr->opcode == aco_opcode::v_fmac_f32 ||
+                 instr->opcode == aco_opcode::v_fmac_f16;
 
-   if (gfx_level != GFX8 && is_mac) [[unlikely]]
+   if (gfx_level != GFX8 && is_mac)
       return false;
 
-   if (!pre_ra && instr->isVOPC() && gfx_level == GFX8) [[unlikely]]
+   if (!pre_ra && instr->isVOPC() && gfx_level == GFX8)
       return false;
 
-   if (!pre_ra && instr->operands.size() >= 3 && !is_mac) [[unlikely]]
+   if (!pre_ra && instr->operands.size() >= 3 && !is_mac)
       return false;
 
-   return instr->opcode != aco_opcode::v_madmk_f32 && instr->opcode != aco_opcode::v_madak_f32 &&
-          instr->opcode != aco_opcode::v_madmk_f16 && instr->opcode != aco_opcode::v_madak_f16 &&
-          instr->opcode != aco_opcode::v_fmamk_f32 && instr->opcode != aco_opcode::v_fmaak_f32 &&
-          instr->opcode != aco_opcode::v_fmamk_f16 && instr->opcode != aco_opcode::v_fmaak_f16 &&
+   return instr->opcode != aco_opcode::v_madmk_f32 &&
+          instr->opcode != aco_opcode::v_madak_f32 &&
+          instr->opcode != aco_opcode::v_madmk_f16 &&
+          instr->opcode != aco_opcode::v_madak_f16 &&
+          instr->opcode != aco_opcode::v_fmamk_f32 &&
+          instr->opcode != aco_opcode::v_fmaak_f32 &&
+          instr->opcode != aco_opcode::v_fmamk_f16 &&
+          instr->opcode != aco_opcode::v_fmaak_f16 &&
           instr->opcode != aco_opcode::v_readfirstlane_b32 &&
-          instr->opcode != aco_opcode::v_clrexcp && instr->opcode != aco_opcode::v_swap_b32;
+          instr->opcode != aco_opcode::v_clrexcp &&
+          instr->opcode != aco_opcode::v_swap_b32;
 }
 
 /* updates "instr" and returns the old instruction (or NULL if no update was needed) */
@@ -460,32 +521,39 @@ can_use_DPP(amd_gfx_level gfx_level, const aco_ptr<Instruction>& instr, bool dpp
    if (instr->opcode == aco_opcode::v_pk_fmac_f16)
       return gfx_level < GFX11;
 
-   // Vega (GFX9) specific: DPP16 allowed for 16-bit operands on GFX9
-   bool vega_dpp16 = gfx_level == GFX9 && !dpp8 && instr->operands[0].bytes() == 2;
+   switch (instr->opcode) {
+   case aco_opcode::v_madmk_f32:
+   case aco_opcode::v_madak_f32:
+   case aco_opcode::v_madmk_f16:
+   case aco_opcode::v_madak_f16:
+   case aco_opcode::v_fmamk_f32:
+   case aco_opcode::v_fmaak_f32:
+   case aco_opcode::v_fmamk_f16:
+   case aco_opcode::v_fmaak_f16:
+   case aco_opcode::v_readfirstlane_b32:
+   case aco_opcode::v_cvt_f64_i32:
+   case aco_opcode::v_cvt_f64_f32:
+   case aco_opcode::v_cvt_f64_u32:
+   case aco_opcode::v_mul_lo_u32:
+   case aco_opcode::v_mul_lo_i32:
+   case aco_opcode::v_mul_hi_u32:
+   case aco_opcode::v_mul_hi_i32:
+   case aco_opcode::v_qsad_pk_u16_u8:
+   case aco_opcode::v_mqsad_pk_u16_u8:
+   case aco_opcode::v_mqsad_u32_u8:
+   case aco_opcode::v_mad_u64_u32:
+   case aco_opcode::v_mad_i64_i32:
+   case aco_opcode::v_permlane16_b32:
+   case aco_opcode::v_permlanex16_b32:
+   case aco_opcode::v_permlane64_b32:
+   case aco_opcode::v_readlane_b32_e64:
+   case aco_opcode::v_writelane_b32_e64:
+      return false;
+   default:
+      break;
+   }
 
-   return (instr->opcode != aco_opcode::v_madmk_f32 && instr->opcode != aco_opcode::v_madak_f32 &&
-           instr->opcode != aco_opcode::v_madmk_f16 && instr->opcode != aco_opcode::v_madak_f16 &&
-           instr->opcode != aco_opcode::v_fmamk_f32 && instr->opcode != aco_opcode::v_fmaak_f32 &&
-           instr->opcode != aco_opcode::v_fmamk_f16 && instr->opcode != aco_opcode::v_fmaak_f16 &&
-           instr->opcode != aco_opcode::v_readfirstlane_b32 &&
-           instr->opcode != aco_opcode::v_cvt_f64_i32 &&
-           instr->opcode != aco_opcode::v_cvt_f64_f32 &&
-           instr->opcode != aco_opcode::v_cvt_f64_u32 &&
-           instr->opcode != aco_opcode::v_mul_lo_u32 &&
-           instr->opcode != aco_opcode::v_mul_lo_i32 &&
-           instr->opcode != aco_opcode::v_mul_hi_u32 &&
-           instr->opcode != aco_opcode::v_mul_hi_i32 &&
-           instr->opcode != aco_opcode::v_qsad_pk_u16_u8 &&
-           instr->opcode != aco_opcode::v_mqsad_pk_u16_u8 &&
-           instr->opcode != aco_opcode::v_mqsad_u32_u8 &&
-           instr->opcode != aco_opcode::v_mad_u64_u32 &&
-           instr->opcode != aco_opcode::v_mad_i64_i32 &&
-           instr->opcode != aco_opcode::v_permlane16_b32 &&
-           instr->opcode != aco_opcode::v_permlanex16_b32 &&
-           instr->opcode != aco_opcode::v_permlane64_b32 &&
-           instr->opcode != aco_opcode::v_readlane_b32_e64 &&
-           instr->opcode != aco_opcode::v_writelane_b32_e64) ||
-          vega_dpp16;
+   return true;
 }
 
 aco_ptr<Instruction>
@@ -602,7 +670,6 @@ can_use_opsel(amd_gfx_level gfx_level, aco_opcode op, int idx)
    case aco_opcode::v_mad_legacy_i16:
    case aco_opcode::v_mad_legacy_u16:
    case aco_opcode::v_div_fixup_legacy_f16: return check_idx < 3;
-   case aco_opcode::v_interp_p2_f16: return check_idx == 0 || check_idx == 2 || check_idx == 3;
    case aco_opcode::v_mac_f16: return check_idx < 3;
    case aco_opcode::v_mad_u32_u16:
    case aco_opcode::v_mad_i32_i16: return check_idx < 2;
@@ -1265,88 +1332,41 @@ wait_imm::pack(enum amd_gfx_level gfx_level) const
    uint16_t imm = 0;
    assert(exp == unset_counter || exp <= 0x7);
 
-#if defined(__BMI2__) || (defined(__x86_64__) || defined(_M_X64))
-   /* Use BMI2 PDEP for efficient bit-field packing when available.
-    * Per Intel Optimization Manual §2.4 and Agner Fog's instruction tables,
-    * PDEP on Raptor Lake: 3-cycle latency, 1-cycle throughput (Port 1).
-    * This replaces 6–8 shift/mask/OR operations (8–12 cycles with dependencies).
-    *
-    * Runtime detection allows fallback for non-BMI2 CPUs (e.g., AMD Zen1, old Intel).
+   /* GFX9 (Vega) fast path - checked first for Vega 64 users.
+    * Per AMD ISA Manual §4.2.1, GFX9 s_waitcnt encoding:
+    * [3:0]   = VM_CNT[3:0]
+    * [6:4]   = EXP_CNT[2:0]
+    * [7]     = Reserved
+    * [11:8]  = LGKM_CNT[3:0]
+    * [13:12] = Reserved (set to 0b11 for "unset" sentinel)
+    * [15:14] = VM_CNT[5:4]
     */
-   static const bool has_bmi2 = __builtin_cpu_supports("bmi2");
+   if (gfx_level == GFX9) [[likely]] {
+      assert(lgkm == unset_counter || lgkm <= 0xf);
+      assert(vm == unset_counter || vm <= 0x3f);
 
-   if (has_bmi2) [[likely]] {
-      if (gfx_level >= GFX11) {
-         assert(lgkm == unset_counter || lgkm <= 0x3f);
-         assert(vm == unset_counter || vm <= 0x3f);
-         /* GFX11+ layout: vm[5:0] @ bits[15:10], lgkm[5:0] @ [9:4], exp[2:0] @ [2:0] */
-         uint32_t vm_val = (vm == unset_counter) ? 0x3f : static_cast<uint32_t>(vm);
-         uint32_t lgkm_val = (lgkm == unset_counter) ? 0x3f : static_cast<uint32_t>(lgkm);
-         uint32_t exp_val = (exp == unset_counter) ? 0x7 : static_cast<uint32_t>(exp);
-
-         imm = static_cast<uint16_t>(
-            _pdep_u32(vm_val, 0xFC00U) |      /* bits [15:10] */
-            _pdep_u32(lgkm_val, 0x03F0U) |    /* bits [9:4] */
-            (exp_val & 0x7U)                   /* bits [2:0], no PDEP needed (already aligned) */
-         );
-      } else if (gfx_level >= GFX10) {
-         assert(lgkm == unset_counter || lgkm <= 0x3f);
-         assert(vm == unset_counter || vm <= 0x3f);
-         /* GFX10 layout: vm[5:4]@[15:14], lgkm[5:0]@[13:8], exp[2:0]@[6:4], vm[3:0]@[3:0] */
-         uint32_t vm_val = (vm == unset_counter) ? 0x3f : static_cast<uint32_t>(vm);
-         uint32_t lgkm_val = (lgkm == unset_counter) ? 0x3f : static_cast<uint32_t>(lgkm);
-         uint32_t exp_val = (exp == unset_counter) ? 0x7 : static_cast<uint32_t>(exp);
-
-         /* PDEP can handle split fields efficiently */
-         uint32_t vm_hi = _pdep_u32(vm_val, 0xC00FU);  /* vm[5:4]→[15:14], vm[3:0]→[3:0] */
-         imm = static_cast<uint16_t>(
-            vm_hi |
-            _pdep_u32(lgkm_val, 0x3F00U) |    /* lgkm[5:0]→[13:8] */
-            _pdep_u32(exp_val, 0x0070U)       /* exp[2:0]→[6:4] */
-         );
-      } else if (gfx_level >= GFX9) {
-         assert(lgkm == unset_counter || lgkm <= 0xf);
-         assert(vm == unset_counter || vm <= 0x3f);
-         /* GFX9: vm[5:4]@[15:14], lgkm[3:0]@[11:8], exp[2:0]@[6:4], vm[3:0]@[3:0] */
-         uint32_t vm_val = (vm == unset_counter) ? 0x3f : static_cast<uint32_t>(vm);
-         uint32_t lgkm_val = (lgkm == unset_counter) ? 0xf : static_cast<uint32_t>(lgkm);
-         uint32_t exp_val = (exp == unset_counter) ? 0x7 : static_cast<uint32_t>(exp);
-
-         imm = static_cast<uint16_t>(
-            _pdep_u32(vm_val, 0xC00FU) |      /* vm split across [15:14] and [3:0] */
-            _pdep_u32(lgkm_val, 0x0F00U) |    /* lgkm[3:0]→[11:8] */
-            _pdep_u32(exp_val, 0x0070U)       /* exp[2:0]→[6:4] */
-         );
-      } else {
-         /* GFX6–8: lgkm[3:0]@[11:8], exp[2:0]@[6:4], vm[3:0]@[3:0] */
-         assert(lgkm == unset_counter || lgkm <= 0xf);
-         assert(vm == unset_counter || vm <= 0xf);
-         uint32_t vm_val = (vm == unset_counter) ? 0xf : static_cast<uint32_t>(vm);
-         uint32_t lgkm_val = (lgkm == unset_counter) ? 0xf : static_cast<uint32_t>(lgkm);
-         uint32_t exp_val = (exp == unset_counter) ? 0x7 : static_cast<uint32_t>(exp);
-
-         imm = static_cast<uint16_t>(
-            _pdep_u32(lgkm_val, 0x0F00U) |
-            _pdep_u32(exp_val, 0x0070U) |
-            (vm_val & 0xFU)                    /* vm already aligned at [3:0] */
-         );
-      }
-
-      /* Handle special unset encodings for older architectures */
-      if (gfx_level < GFX9 && vm == wait_imm::unset_counter) {
-         imm |= 0xC000U;
-      }
-      if (gfx_level < GFX10 && lgkm == wait_imm::unset_counter) {
-         imm |= 0x3000U;
-      }
-
-      return imm;
-   }
+#ifdef __BMI2__
+      /* PDEP: 3-cycle latency, 1/cycle throughput on Raptor Lake.
+       * Deposits bits from source to positions marked by mask.
+       * Eliminates 6 dependent shift/OR operations.
+       */
+      uint32_t vm_val = (vm == unset_counter) ? 0x3fu : static_cast<uint32_t>(vm);
+      uint32_t lgkm_val = (lgkm == unset_counter) ? 0xfu : static_cast<uint32_t>(lgkm);
+      uint32_t exp_val = (exp == unset_counter) ? 0x7u : static_cast<uint32_t>(exp);
+      imm = static_cast<uint16_t>(
+         _pdep_u32(vm_val, 0xC00Fu) |   /* vm[5:4]→[15:14], vm[3:0]→[3:0] */
+         _pdep_u32(lgkm_val, 0x0F00u) | /* lgkm[3:0]→[11:8] */
+         _pdep_u32(exp_val, 0x0070u));  /* exp[2:0]→[6:4] */
+#else
+      imm = ((vm & 0x30) << 10) | ((lgkm & 0xf) << 8) | ((exp & 0x7) << 4) | (vm & 0xf);
 #endif
 
-   /* Fallback: original shift/mask implementation for CPUs without BMI2.
-    * This preserves compatibility with AMD CPUs (pre-Zen3) and older Intel.
-    */
+      if (lgkm == unset_counter)
+         imm |= 0x3000u;
+      return imm;
+   }
+
+   /* GFX10+ and GFX6-8 paths - less common for Vega 64 users */
    if (gfx_level >= GFX11) {
       assert(lgkm == unset_counter || lgkm <= 0x3f);
       assert(vm == unset_counter || vm <= 0x3f);
@@ -1355,22 +1375,17 @@ wait_imm::pack(enum amd_gfx_level gfx_level) const
       assert(lgkm == unset_counter || lgkm <= 0x3f);
       assert(vm == unset_counter || vm <= 0x3f);
       imm = ((vm & 0x30) << 10) | ((lgkm & 0x3f) << 8) | ((exp & 0x7) << 4) | (vm & 0xf);
-   } else if (gfx_level >= GFX9) {
-      assert(lgkm == unset_counter || lgkm <= 0xf);
-      assert(vm == unset_counter || vm <= 0x3f);
-      imm = ((vm & 0x30) << 10) | ((lgkm & 0xf) << 8) | ((exp & 0x7) << 4) | (vm & 0xf);
    } else {
+      /* GFX6-8 */
       assert(lgkm == unset_counter || lgkm <= 0xf);
       assert(vm == unset_counter || vm <= 0xf);
       imm = ((lgkm & 0xf) << 8) | ((exp & 0x7) << 4) | (vm & 0xf);
+      if (vm == unset_counter)
+         imm |= 0xC000u;
    }
 
-   if (gfx_level < GFX9 && vm == wait_imm::unset_counter) {
-      imm |= 0xC000U;
-   }
-   if (gfx_level < GFX10 && lgkm == wait_imm::unset_counter) {
-      imm |= 0x3000U;
-   }
+   if (gfx_level < GFX10 && lgkm == unset_counter)
+      imm |= 0x3000u;
 
    return imm;
 }
@@ -1797,73 +1812,21 @@ create_instruction(aco_opcode opcode, Format format, uint32_t num_operands,
 {
    size_t size = get_instr_data_size(format);
    size_t total_size = size + num_operands * sizeof(Operand) +
-                      num_definitions * sizeof(Definition);
+                       num_definitions * sizeof(Definition);
 
-   /* Cache-line alignment reduces cross-line splits and prefetch waste.
-    * Per Intel Optimization Manual §2.1.5.4, 64-byte alignment improves
-    * streaming store performance and reduces false sharing.
+   /* Alignment strategy for Raptor Lake (14700KF):
+    * - 64B: Cache line size, optimal for AVX-512 stores and prefetch
+    * - 16B: SSE alignment minimum for smaller allocations
+    * Per Intel Optimization Manual §2.1.5.4
     */
-   size_t alignment;
-   if (total_size >= 128) {
-      alignment = 64;
-   } else if (total_size >= 32) {
-      alignment = 32;
-   } else {
-      alignment = 16;
-   }
+   size_t alignment = (total_size >= 64) ? 64 : 16;
 
-   /* CRITICAL SAFETY FIX:
-    * The vector zeroing loop writes in 64-bit (8-byte) chunks. If total_size
-    * is not a multiple of 8 (e.g. 12 bytes), the loop writes 16 bytes,
-    * potentially overwriting the next allocation. We MUST request an allocation
-    * size that covers this padding.
-    */
-   size_t alloc_size = (total_size + 7) & ~7;
-   void* data = instruction_buffer->allocate(alloc_size, alignment);
+   void* data = instruction_buffer->allocate(total_size, alignment);
 
-   /* Fast zero-initialization for common small instruction sizes.
-    * Per Agner Fog's optimization guide and Intel Manual §3.7.6.4,
-    * explicit 64-bit stores outperform rep stosb for sizes <64 bytes
-    * by avoiding 4–6 cycle startup overhead. On Raptor Lake, 8-byte
-    * stores execute on ports 2/3/7 with 1-cycle throughput.
-    */
-   if (total_size <= 64) [[likely]] {
-      /* Unrolled loop for predictable store pattern and no loop overhead.
-       * Compiler will optimize this to vector stores (2×YMM or 4×XMM) when
-       * beneficial. Explicit uint64_t ensures 8-byte granularity.
-       */
-      uint64_t* ptr = static_cast<uint64_t*>(data);
-      size_t num_qwords = (total_size + 7) >> 3;
-
-      /* Most instructions are 32–48 bytes (4–6 qwords). Unroll for common sizes. */
-      switch (num_qwords) {
-      case 1: ptr[0] = 0; break;
-      case 2: ptr[0] = 0; ptr[1] = 0; break;
-      case 3: ptr[0] = 0; ptr[1] = 0; ptr[2] = 0; break;
-      case 4: ptr[0] = 0; ptr[1] = 0; ptr[2] = 0; ptr[3] = 0; break;
-      case 5: ptr[0] = 0; ptr[1] = 0; ptr[2] = 0; ptr[3] = 0; ptr[4] = 0; break;
-      case 6: ptr[0] = 0; ptr[1] = 0; ptr[2] = 0; ptr[3] = 0; ptr[4] = 0; ptr[5] = 0; break;
-      case 7: ptr[0] = 0; ptr[1] = 0; ptr[2] = 0; ptr[3] = 0; ptr[4] = 0; ptr[5] = 0; ptr[6] = 0; break;
-      case 8: ptr[0] = 0; ptr[1] = 0; ptr[2] = 0; ptr[3] = 0; ptr[4] = 0; ptr[5] = 0; ptr[6] = 0; ptr[7] = 0; break;
-      default:
-         /* Rare path: loop for larger instructions */
-         for (size_t i = 0; i < num_qwords; ++i) {
-            ptr[i] = 0;
-         }
-         break;
-      }
-   } else {
-      /* For large instructions (>64B), memset uses rep stosb or AVX2, which is optimal.
-       * This path is rare (~5% of instructions are MIMG/exports with many operands).
-       */
-      memset(data, 0, total_size);
-   }
+   std::memset(data, 0, total_size);
 
    Instruction* inst = static_cast<Instruction*>(data);
 
-   /* Initialize critical fields. These stores will be absorbed into the
-    * store buffer and won't stall on the prior zeroing stores.
-    */
    inst->opcode = opcode;
    inst->format = format;
 
