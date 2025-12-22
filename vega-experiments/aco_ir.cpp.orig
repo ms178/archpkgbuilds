@@ -7,6 +7,7 @@
 #include "aco_ir.h"
 
 #include "aco_builder.h"
+#include "aco_shader_info.h"
 
 #include "util/u_debug.h"
 
@@ -61,70 +62,33 @@ init()
 
 void
 init_program(Program* program, Stage stage, const struct aco_shader_info* info,
-             enum amd_gfx_level gfx_level, enum radeon_family family, bool wgp_mode,
-             ac_shader_config* config)
+             const aco_compiler_options* options, ac_shader_config* config)
 {
+   assert(options->family != CHIP_UNKNOWN);
    instruction_buffer = &program->m;
    program->stage = stage;
    program->config = config;
    program->info = *info;
-   program->gfx_level = gfx_level;
-   if (family == CHIP_UNKNOWN) {
-      switch (gfx_level) {
-      case GFX6: program->family = CHIP_TAHITI; break;
-      case GFX7: program->family = CHIP_BONAIRE; break;
-      case GFX8: program->family = CHIP_POLARIS10; break;
-      case GFX9: program->family = CHIP_VEGA10; break;
-      case GFX10: program->family = CHIP_NAVI10; break;
-      case GFX10_3: program->family = CHIP_NAVI21; break;
-      case GFX11: program->family = CHIP_NAVI31; break;
-      case GFX11_5: program->family = CHIP_STRIX1; break;
-      case GFX12: program->family = CHIP_GFX1200; break;
-      default: program->family = CHIP_UNKNOWN; break;
-      }
-   } else {
-      program->family = family;
-   }
+   program->gfx_level = options->gfx_level;
    program->wave_size = info->wave_size;
    program->lane_mask = program->wave_size == 32 ? s1 : s2;
 
    /* GFX6: There is 64KB LDS per CU, but a single workgroup can only use 32KB. */
-   program->dev.lds_limit = gfx_level >= GFX7 ? 65536 : 32768;
+   program->dev.lds_limit = program->gfx_level >= GFX7 ? 65536 : 32768;
+   program->dev.has_16bank_lds = options->cu_info->has_lds_bank_count_16;
 
-   /* apparently gfx702 also has 16-bank LDS but I can't find a family for that */
-   program->dev.has_16bank_lds = family == CHIP_KABINI || family == CHIP_STONEY;
+   program->dev.max_waves_per_simd = options->cu_info->max_waves_per_simd;
+   program->dev.simd_per_cu = options->cu_info->num_simd_per_compute_unit;
+   program->dev.physical_sgprs = options->cu_info->num_physical_sgprs_per_simd;
+   program->dev.sgpr_alloc_granule = options->cu_info->sgpr_alloc_granularity;
+   program->dev.sgpr_limit = options->cu_info->max_sgpr_alloc;
+   program->dev.physical_vgprs = options->cu_info->num_physical_wave64_vgprs_per_simd;
+   program->dev.vgpr_alloc_granule = options->cu_info->wave64_vgpr_alloc_granularity;
+   program->dev.vgpr_limit = options->cu_info->max_vgpr_alloc;
 
-   program->dev.vgpr_limit = 256;
-   program->dev.physical_vgprs = 256;
-   program->dev.vgpr_alloc_granule = 4;
-
-   if (gfx_level >= GFX10) {
-      program->dev.physical_sgprs = 128 * 20; /* enough for max waves */
-      program->dev.sgpr_alloc_granule = 128;
-      program->dev.sgpr_limit =
-         108; /* includes VCC, which can be treated as s[106-107] on GFX10+ */
-
-      if (family == CHIP_NAVI31 || family == CHIP_NAVI32 || family == CHIP_STRIX_HALO ||
-          gfx_level >= GFX12) {
-         program->dev.physical_vgprs = program->wave_size == 32 ? 1536 : 768;
-         program->dev.vgpr_alloc_granule = program->wave_size == 32 ? 24 : 12;
-      } else {
-         program->dev.physical_vgprs = program->wave_size == 32 ? 1024 : 512;
-         if (gfx_level >= GFX10_3)
-            program->dev.vgpr_alloc_granule = program->wave_size == 32 ? 16 : 8;
-         else
-            program->dev.vgpr_alloc_granule = program->wave_size == 32 ? 8 : 4;
-      }
-   } else if (program->gfx_level >= GFX8) {
-      program->dev.physical_sgprs = 800;
-      program->dev.sgpr_alloc_granule = 16;
-      program->dev.sgpr_limit = 102;
-      if (family == CHIP_TONGA || family == CHIP_ICELAND)
-         program->dev.sgpr_alloc_granule = 96; /* workaround hardware bug */
-   } else {
-      program->dev.physical_sgprs = 512;
-      program->dev.sgpr_alloc_granule = 8;
-      program->dev.sgpr_limit = 104;
+   if (program->wave_size == 32) {
+      program->dev.physical_vgprs *= 2;
+      program->dev.vgpr_alloc_granule *= 2;
    }
 
    if (program->stage == raytracing_cs) {
@@ -134,45 +98,22 @@ init_program(Program* program, Stage stage, const struct aco_shader_info* info,
       program->dev.vgpr_limit = util_round_down_npot(vgpr_limit, program->dev.vgpr_alloc_granule);
    }
 
-   program->dev.scratch_alloc_granule = gfx_level >= GFX11 ? 256 : 1024;
+   program->dev.scratch_alloc_granule = program->gfx_level >= GFX11 ? 256 : 1024;
 
-   program->dev.max_waves_per_simd = 10;
-   if (program->gfx_level >= GFX10_3)
-      program->dev.max_waves_per_simd = 16;
-   else if (program->gfx_level == GFX10)
-      program->dev.max_waves_per_simd = 20;
-   else if (program->family >= CHIP_POLARIS10 && program->family <= CHIP_VEGAM)
-      program->dev.max_waves_per_simd = 8;
+   /* XNACK replay can be used for demand paging and page migration.
+    * This is only relevant to GPGPU programming with unified shared memory.
+    */
+   program->dev.xnack_enabled = false;
 
-   program->dev.simd_per_cu = program->gfx_level >= GFX10 ? 2 : 4;
+   program->dev.sram_ecc_enabled = options->cu_info->has_sram_ecc_enabled;
+   program->dev.has_point_sample_accel = options->cu_info->has_point_sample_accel;
+   program->dev.has_gfx6_mrt_export_bug = options->cu_info->has_gfx6_mrt_export_bug;
 
-   switch (program->family) {
-   /* GFX8 APUs */
-   case CHIP_CARRIZO:
-   case CHIP_STONEY:
-   /* GFX9 APUS */
-   case CHIP_RAVEN:
-   case CHIP_RAVEN2:
-   case CHIP_RENOIR: program->dev.xnack_enabled = true; break;
-   default: break;
-   }
-
-   program->dev.sram_ecc_enabled = program->family == CHIP_VEGA20 ||
-                                   program->family == CHIP_MI100 || program->family == CHIP_MI200 ||
-                                   program->family == CHIP_GFX940;
-   /* apparently gfx702 also has fast v_fma_f32 but I can't find a family for that */
-   program->dev.has_fast_fma32 = program->gfx_level >= GFX9;
-   if (program->family == CHIP_TAHITI || program->family == CHIP_CARRIZO ||
-       program->family == CHIP_HAWAII)
-      program->dev.has_fast_fma32 = true;
+   program->dev.has_fast_fma32 = options->cu_info->has_fast_fma32;
    program->dev.has_mac_legacy32 = program->gfx_level <= GFX7 || program->gfx_level == GFX10;
    program->dev.has_fmac_legacy32 = program->gfx_level >= GFX10_3 && program->gfx_level < GFX12;
-
-   program->dev.fused_mad_mix = program->gfx_level >= GFX10;
-   if (program->family == CHIP_VEGA12 || program->family == CHIP_VEGA20 ||
-       program->family == CHIP_MI100 || program->family == CHIP_MI200 ||
-       program->family == CHIP_GFX940)
-      program->dev.fused_mad_mix = true;
+   program->dev.fused_mad_mix = options->cu_info->has_fma_mix;
+   program->dev.has_mad32 = options->cu_info->has_mad32;
 
    if (program->gfx_level >= GFX12) {
       program->dev.scratch_global_offset_min = -8388608;
@@ -221,7 +162,7 @@ init_program(Program* program, Stage stage, const struct aco_shader_info* info,
       program->dev.max_nsa_vgprs = 0;
    }
 
-   program->wgp_mode = wgp_mode;
+   program->wgp_mode = options->wgp_mode;
 
    program->progress = CompilationProgress::after_isel;
 
@@ -1530,7 +1471,7 @@ get_tied_defs(Instruction* instr)
 }
 
 uint8_t
-get_vmem_type(amd_gfx_level gfx_level, radeon_family family, Instruction* instr)
+get_vmem_type(Instruction* instr, bool has_point_sample_accel)
 {
    if (instr->opcode == aco_opcode::image_bvh_intersect_ray ||
        instr->opcode == aco_opcode::image_bvh64_intersect_ray ||
@@ -1541,10 +1482,10 @@ get_vmem_type(amd_gfx_level gfx_level, radeon_family family, Instruction* instr)
       return vmem_sampler;
    } else if (instr->isMIMG() && !instr->operands[1].isUndefined() &&
               instr->operands[1].regClass() == s4) {
-      bool point_sample_accel = gfx_level == GFX11_5 && family != CHIP_GFX1153 &&
-                                (instr->opcode == aco_opcode::image_sample ||
-                                 instr->opcode == aco_opcode::image_sample_l ||
-                                 instr->opcode == aco_opcode::image_sample_lz);
+      bool point_sample_accel =
+         has_point_sample_accel && (instr->opcode == aco_opcode::image_sample ||
+                                    instr->opcode == aco_opcode::image_sample_l ||
+                                    instr->opcode == aco_opcode::image_sample_lz);
       return vmem_sampler | (point_sample_accel ? vmem_nosampler : 0);
    } else if (instr->isVMEM() || instr->isScratch() || instr->isGlobal()) {
       return vmem_nosampler;
