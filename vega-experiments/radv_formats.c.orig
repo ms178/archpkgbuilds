@@ -651,11 +651,10 @@ radv_get_modifier_flags(struct radv_physical_device *pdev, VkFormat format, uint
        * do not support DCC image stores or when explicitly disabled.
        */
       if (!ac_modifier_supports_dcc_image_stores(pdev->info.gfx_level, modifier) ||
-          radv_is_atomic_format_supported(format) ||
-          (instance->drirc.debug.disable_dcc_stores && pdev->info.gfx_level < GFX12))
+          radv_is_atomic_format_supported(format) || radv_are_dcc_stores_disabled(pdev))
          features &= ~VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT;
 
-      if (instance->debug_flags & (RADV_DEBUG_NO_DCC | RADV_DEBUG_NO_DISPLAY_DCC))
+      if (radv_is_dcc_disabled(pdev) || instance->debug_flags & RADV_DEBUG_NO_DISPLAY_DCC)
          return 0;
    }
 
@@ -1060,6 +1059,9 @@ radv_get_image_format_properties(struct radv_physical_device *pdev, const VkPhys
    }
 
    if (info->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) {
+      if (!radv_sparse_enabled(pdev))
+         goto unsupported;
+
       /* Sparse resources with multi-planar formats are unsupported. */
       if (vk_format_get_plane_count(format) > 1)
          goto unsupported;
@@ -1070,8 +1072,10 @@ radv_get_image_format_properties(struct radv_physical_device *pdev, const VkPhys
    }
 
    if (info->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) {
-      /* Sparse textures are only supported on GFX8+. */
-      if (pdev->info.gfx_level < GFX8)
+      if (!radv_sparse_enabled(pdev))
+         goto unsupported;
+
+      if (info->type == VK_IMAGE_TYPE_3D && !pdev->info.has_sparse_image_3d)
          goto unsupported;
 
       if (vk_format_get_plane_count(format) > 1 || info->type == VK_IMAGE_TYPE_1D ||
@@ -1189,7 +1193,6 @@ radv_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
                                              VkImageFormatProperties2 *base_props)
 {
    VK_FROM_HANDLE(radv_physical_device, pdev, physicalDevice);
-   const struct radv_instance *instance = radv_physical_device_instance(pdev);
    const VkPhysicalDeviceExternalImageFormatInfo *external_info = NULL;
    VkExternalImageFormatProperties *external_props = NULL;
    struct VkAndroidHardwareBufferUsageANDROID *android_usage = NULL;
@@ -1296,10 +1299,9 @@ radv_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
          image_compression_props->imageCompressionFlags =
             pdev->use_hiz ? VK_IMAGE_COMPRESSION_DEFAULT_EXT : VK_IMAGE_COMPRESSION_DISABLED_EXT;
       } else {
-         image_compression_props->imageCompressionFlags =
-            ((instance->debug_flags & RADV_DEBUG_NO_DCC) || pdev->info.gfx_level < GFX8)
-               ? VK_IMAGE_COMPRESSION_DISABLED_EXT
-               : VK_IMAGE_COMPRESSION_DEFAULT_EXT;
+         image_compression_props->imageCompressionFlags = (radv_is_dcc_disabled(pdev) || pdev->info.gfx_level < GFX8)
+                                                             ? VK_IMAGE_COMPRESSION_DISABLED_EXT
+                                                             : VK_IMAGE_COMPRESSION_DEFAULT_EXT;
       }
    }
 
@@ -1310,7 +1312,7 @@ radv_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
          might_enable_compression |= pdev->use_hiz && (base_info->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
       } else {
          might_enable_compression |=
-            !(instance->debug_flags & RADV_DEBUG_NO_DCC) && (base_info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+            !radv_is_dcc_disabled(pdev) && (base_info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
       }
 
       /**
