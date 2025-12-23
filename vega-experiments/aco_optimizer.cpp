@@ -4219,38 +4219,52 @@ and_cb(opt_ctx& ctx, alu_opt_info& info)
 /* Validates that the shift instruction is '1 << x' */
 bool check_lshl_1_cb(opt_ctx& ctx, alu_opt_info& info)
 {
-   /* info corresponds to the producer instruction (s_lshl_b32) */
    uint64_t val = 0;
    return op_info_get_constant(ctx, info.operands[0], {aco_base_type_uint, 1, 32}, &val) &&
           val == 1;
 }
 
+/* Validates that SCC is dead, and removes the SCC definition from the info.
+ * Required for optimizations that replace SCC-defining instructions (s_or, s_andn2)
+ * with ones that preserve SCC (s_bitset).
+ */
+bool check_scc_dead_cb(opt_ctx& ctx, alu_opt_info& info)
+{
+   if (info.defs.size() < 2 || ctx.uses[info.defs[1].tempId()] != 0)
+      return false;
+
+   /* s_bitset does not write SCC, so we must remove the definition to remain valid */
+   info.defs.pop_back();
+   return true;
+}
+
+/* Combined callback for s_bitset optimizations */
+bool s_bitset_cb(opt_ctx& ctx, alu_opt_info& info)
+{
+   return check_lshl_1_cb(ctx, info) && check_scc_dead_cb(ctx, info);
+}
+
 /* Validates v_sub(max(a,b), min(a,b)) -> v_sad_u32(a, b, 0) */
 bool sad_pattern_cb(opt_ctx& ctx, alu_opt_info& info)
 {
-   /* Pattern match structure:
+   /* Pattern: v_sub(max(A, B), min(A, B))
     * info.operands[0] = A (from max)
     * info.operands[1] = B (from max)
-    * info.operands[2] = v_min_u32(A, B) (from v_sub's second operand)
+    * info.operands[2] = v_min_u32(A, B) (from v_sub)
     */
 
    if (!info.operands[2].op.isTemp())
       return false;
 
    Instruction* min_instr = ctx.info[info.operands[2].op.tempId()].parent_instr;
-
-   /* Strict opcode check */
    if (min_instr->opcode != aco_opcode::v_min_u32)
       return false;
 
-   /* Strict modifier check: v_sad_u32 treats inputs as unsigned integers.
-    * We cannot accept clamps or output modifiers on the 'min' instruction
-    * because 'sad' absorbs the whole instruction chain.
-    */
+   /* v_sad_u32 does not support input modifiers on the accumulator/min operand */
    if (min_instr->isVALU()) {
-       const VALU_instruction& valu = min_instr->valu();
-       if (valu.clamp || valu.omod || valu.neg[0] || valu.neg[1] || valu.abs[0] || valu.abs[1])
-           return false;
+      const VALU_instruction& valu = min_instr->valu();
+      if (valu.clamp || valu.omod || valu.neg[0] || valu.neg[1] || valu.abs[0] || valu.abs[1])
+         return false;
    }
 
    /* Verify operands match between MAX and MIN (commutative) */
@@ -4263,30 +4277,101 @@ bool sad_pattern_cb(opt_ctx& ctx, alu_opt_info& info)
    if (!match)
       return false;
 
-   /* v_sad_u32(a, b, c) = |a-b| + c. We want |a-b|, so set c = 0. */
+   /* Transform to v_sad_u32(A, B, 0) */
    info.operands[2].op = Operand::c32(0);
-
-   /* v_sad_u32 is VOP3, ensure we don't carry over invalid mods from v_sub */
    info.operands[2].neg[0] = false;
    info.operands[2].abs[0] = false;
+   return true;
+}
+
+/* Validates v_or(v_lshlrev(a, 32-k), v_lshrrev(b, k)) -> v_alignbit(a, b, k)
+ * Handles case where v_lshlrev (High bits) was matched at op_idx.
+ */
+bool funnel_shift_lshl_cb(opt_ctx& ctx, alu_opt_info& info)
+{
+   if (!info.operands[1].op.isTemp())
+      return false;
+
+   Instruction* low_instr = ctx.info[info.operands[1].op.tempId()].parent_instr;
+   if (low_instr->opcode != aco_opcode::v_lshrrev_b32 || low_instr->usesModifiers())
+      return false;
+
+   uint64_t lshl_const = 0;
+   uint64_t lshr_const = 0;
+
+   /* info.operands[2] is the shift amount from lshl (32-k) */
+   if (!op_info_get_constant(ctx, info.operands[2], {aco_base_type_uint, 1, 32}, &lshl_const))
+      return false;
+
+   /* Get lshr shift amount (k) */
+   Operand lshr_shift_op = low_instr->operands[0];
+   if (lshr_shift_op.isConstant())
+      lshr_const = lshr_shift_op.constantValue();
+   else if (lshr_shift_op.isTemp() && ctx.info[lshr_shift_op.tempId()].is_constant())
+      lshr_const = ctx.info[lshr_shift_op.tempId()].val;
+   else
+      return false;
+
+   if ((uint32_t)lshl_const + (uint32_t)lshr_const != 32)
+      return false;
+
+   /* Setup v_alignbit operands: src0=High(A), src1=Low(B), src2=Shift(k) */
+   /* src0 is already info.operands[0] (A) */
+   info.operands[1].op = low_instr->operands[1]; // Set B
+   info.operands[2].op = low_instr->operands[0]; // Set k
+
+   /* Optimization: Use v_alignbyte if byte-aligned */
+   if ((uint32_t)lshr_const % 8 == 0) {
+      info.opcode = aco_opcode::v_alignbyte_b32;
+      info.operands[2].op = Operand::c32((uint32_t)lshr_const / 8);
+   }
 
    return true;
 }
 
-/* Callback to check if SCC is dead (unused) for the instruction being optimized.
- * Required for optimizations that replace SCC-defining instructions (s_or, s_andn2)
- * with ones that preserve SCC (s_bitset).
+/* Validates v_or(v_lshlrev(a, 32-k), v_lshrrev(b, k)) -> v_alignbit(a, b, k)
+ * Handles case where v_lshrrev (Low bits) was matched at op_idx.
  */
-bool check_scc_dead_cb(opt_ctx& ctx, alu_opt_info& info)
+bool funnel_shift_lshr_cb(opt_ctx& ctx, alu_opt_info& info)
 {
-   /* definitions[0] is the result, definitions[1] is SCC */
-   return info.defs.size() >= 2 && ctx.uses[info.defs[1].tempId()] == 0;
-}
+   if (!info.operands[0].op.isTemp())
+      return false;
 
-/* Combined callback for lshl(1, x) check AND scc_dead check */
-bool s_bitset_cb(opt_ctx& ctx, alu_opt_info& info)
-{
-   return check_lshl_1_cb(ctx, info) && check_scc_dead_cb(ctx, info);
+   Instruction* high_instr = ctx.info[info.operands[0].op.tempId()].parent_instr;
+   if (high_instr->opcode != aco_opcode::v_lshlrev_b32 || high_instr->usesModifiers())
+      return false;
+
+   uint64_t lshl_const = 0;
+   uint64_t lshr_const = 0;
+
+   /* info.operands[2] is the shift amount from lshr (k) */
+   if (!op_info_get_constant(ctx, info.operands[2], {aco_base_type_uint, 1, 32}, &lshr_const))
+      return false;
+
+   /* Get lshl shift amount (32-k) */
+   Operand lshl_shift_op = high_instr->operands[0];
+   if (lshl_shift_op.isConstant())
+      lshl_const = lshl_shift_op.constantValue();
+   else if (lshl_shift_op.isTemp() && ctx.info[lshl_shift_op.tempId()].is_constant())
+      lshl_const = ctx.info[lshl_shift_op.tempId()].val;
+   else
+      return false;
+
+   if ((uint32_t)lshl_const + (uint32_t)lshr_const != 32)
+      return false;
+
+   /* Setup v_alignbit operands: src0=High(A), src1=Low(B), src2=Shift(k) */
+   info.operands[0].op = high_instr->operands[1]; // Set A
+   /* src1 is already info.operands[1] (B) */
+   /* src2 is already info.operands[2] (k) */
+
+   /* Optimization: Use v_alignbyte if byte-aligned */
+   if ((uint32_t)lshr_const % 8 == 0) {
+      info.opcode = aco_opcode::v_alignbyte_b32;
+      info.operands[2].op = Operand::c32((uint32_t)lshr_const / 8);
+   }
+
+   return true;
 }
 
 void
@@ -4539,6 +4624,10 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          add_opt(s_lshl_b32, v_lshl_or_b32, 0x3, "120", nullptr, true);
          add_opt(v_and_b32, v_and_or_b32, 0x3, "120", nullptr, true);
          add_opt(s_and_b32, v_and_or_b32, 0x3, "120", nullptr, true);
+
+         /* v_or(v_lshlrev(a, 32-k), v_lshrrev(b, k)) -> v_alignbit(a, b, k) (GFX9+) */
+         add_opt(v_lshlrev_b32, v_alignbit_b32, 0x3, "201", funnel_shift_lshl_cb, true);
+         add_opt(v_lshrrev_b32, v_alignbit_b32, 0x3, "021", funnel_shift_lshr_cb, true);
       }
    } else if (info.opcode == aco_opcode::v_xor_b32 && ctx.program->gfx_level >= GFX10) {
       add_opt(v_xor_b32, v_xor3_b32, 0x3, "012", nullptr, true);
@@ -4601,7 +4690,7 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    } else if (info.opcode == aco_opcode::v_sub_u32 && !info.clamp) {
       assert(ctx.program->gfx_level >= GFX9);
 
-      /* NEW: v_sub(max(a, b), min(a, b)) -> v_sad_u32(a, b, 0) (GFX9+) */
+      /* v_sub(max(a, b), min(a, b)) -> v_sad_u32(a, b, 0) (GFX9+) */
       add_opt(v_max_u32, v_sad_u32, 0x3, "012", sad_pattern_cb, true);
 
       /* v_sub_u32(0, v_cndmask_b32(0, 1, cond)) -> v_cndmask_b32(0, -1, cond) */
@@ -4645,6 +4734,12 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
                  and_cb<and_cb<shift_to_mad_cb<32>, neg_mul_to_i24_cb>, pop_def_cb>);
          add_opt(v_mul_u32_u24, v_mad_i32_i24, 0x2, "120", and_cb<neg_mul_to_i24_cb, pop_def_cb>);
          add_opt(s_mul_i32, v_mad_i32_i24, 0x2, "120", and_cb<neg_mul_to_i24_cb, pop_def_cb>);
+
+         /* v_sub_co(max(a, b), min(a, b)) -> v_sad_u32(a, b, 0) (GFX9+)
+          * Only if VCC output is dead. */
+         if (ctx.program->gfx_level >= GFX9)
+             add_opt(v_max_u32, v_sad_u32, 0x3, "012",
+                     and_cb<sad_pattern_cb, pop_def_cb>, true);
       }
    } else if ((info.opcode == aco_opcode::s_add_u32 ||
                (info.opcode == aco_opcode::s_add_i32 && !ctx.uses[info.defs[1].tempId()])) &&
@@ -4663,7 +4758,7 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    } else if (info.opcode == aco_opcode::s_and_b32) {
       add_opt(s_not_b32, s_andn2_b32, 0x3, "01");
    } else if (info.opcode == aco_opcode::s_andn2_b32) {
-      /* NEW: s_andn2(a, s_lshl(1, b)) -> s_bitset0_b32(a, b) (GFX9+)
+      /* s_andn2(a, s_lshl(1, b)) -> s_bitset0_b32(a, b) (GFX9+)
        * Valid only if SCC is unused, as s_bitset0 preserves SCC. */
       if (ctx.program->gfx_level >= GFX9)
          add_opt(s_lshl_b32, s_bitset0_b32, 0x3, "120", s_bitset_cb, true);
@@ -4672,7 +4767,7 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    } else if (info.opcode == aco_opcode::s_or_b32) {
       add_opt(s_not_b32, s_orn2_b32, 0x3, "01");
 
-      /* NEW: s_or(a, s_lshl(1, b)) -> s_bitset1_b32(a, b) (GFX9+)
+      /* s_or(a, s_lshl(1, b)) -> s_bitset1_b32(a, b) (GFX9+)
        * Valid only if SCC is unused, as s_bitset1 preserves SCC. */
       if (ctx.program->gfx_level >= GFX9)
          add_opt(s_lshl_b32, s_bitset1_b32, 0x3, "120", s_bitset_cb, true);
