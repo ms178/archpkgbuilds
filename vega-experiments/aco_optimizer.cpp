@@ -3414,7 +3414,6 @@ match_and_apply_patterns(opt_ctx& ctx, alu_opt_info& info,
 
    u_foreach_bit (i, total_mask) {
       const int idx = (int)i;
-
       auto it = indices.begin();
       for (; it != indices.end(); ++it) {
          if (better(idx, *it))
@@ -4217,6 +4216,79 @@ and_cb(opt_ctx& ctx, alu_opt_info& info)
    return func1(ctx, info) && func2(ctx, info);
 }
 
+/* Validates that the shift instruction is '1 << x' */
+bool check_lshl_1_cb(opt_ctx& ctx, alu_opt_info& info)
+{
+   /* info corresponds to the producer instruction (s_lshl_b32) */
+   uint64_t val = 0;
+   return op_info_get_constant(ctx, info.operands[0], {aco_base_type_uint, 1, 32}, &val) &&
+          val == 1;
+}
+
+/* Validates v_sub(max(a,b), min(a,b)) -> v_sad_u32(a, b, 0) */
+bool sad_pattern_cb(opt_ctx& ctx, alu_opt_info& info)
+{
+   /* Pattern match structure:
+    * info.operands[0] = A (from max)
+    * info.operands[1] = B (from max)
+    * info.operands[2] = v_min_u32(A, B) (from v_sub's second operand)
+    */
+
+   if (!info.operands[2].op.isTemp())
+      return false;
+
+   Instruction* min_instr = ctx.info[info.operands[2].op.tempId()].parent_instr;
+
+   /* Strict opcode check */
+   if (min_instr->opcode != aco_opcode::v_min_u32)
+      return false;
+
+   /* Strict modifier check: v_sad_u32 treats inputs as unsigned integers.
+    * We cannot accept clamps or output modifiers on the 'min' instruction
+    * because 'sad' absorbs the whole instruction chain.
+    */
+   if (min_instr->isVALU()) {
+       const VALU_instruction& valu = min_instr->valu();
+       if (valu.clamp || valu.omod || valu.neg[0] || valu.neg[1] || valu.abs[0] || valu.abs[1])
+           return false;
+   }
+
+   /* Verify operands match between MAX and MIN (commutative) */
+   Operand max_a = info.operands[0].op;
+   Operand max_b = info.operands[1].op;
+   Operand min_a = min_instr->operands[0];
+   Operand min_b = min_instr->operands[1];
+
+   bool match = (max_a == min_a && max_b == min_b) || (max_a == min_b && max_b == min_a);
+   if (!match)
+      return false;
+
+   /* v_sad_u32(a, b, c) = |a-b| + c. We want |a-b|, so set c = 0. */
+   info.operands[2].op = Operand::c32(0);
+
+   /* v_sad_u32 is VOP3, ensure we don't carry over invalid mods from v_sub */
+   info.operands[2].neg[0] = false;
+   info.operands[2].abs[0] = false;
+
+   return true;
+}
+
+/* Callback to check if SCC is dead (unused) for the instruction being optimized.
+ * Required for optimizations that replace SCC-defining instructions (s_or, s_andn2)
+ * with ones that preserve SCC (s_bitset).
+ */
+bool check_scc_dead_cb(opt_ctx& ctx, alu_opt_info& info)
+{
+   /* definitions[0] is the result, definitions[1] is SCC */
+   return info.defs.size() >= 2 && ctx.uses[info.defs[1].tempId()] == 0;
+}
+
+/* Combined callback for lshl(1, x) check AND scc_dead check */
+bool s_bitset_cb(opt_ctx& ctx, alu_opt_info& info)
+{
+   return check_lshl_1_cb(ctx, info) && check_scc_dead_cb(ctx, info);
+}
+
 void
 combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 {
@@ -4244,16 +4316,6 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    if (apply_output(ctx, instr))
       return;
 
-   /* TODO: There are still some peephole optimizations that could be done:
-    * - abs(a - b) -> s_absdiff_i32
-    * - various patterns for s_bitcmp{0,1}_b32 and s_bitset{0,1}_b32
-    * - patterns for v_alignbit_b32 and v_alignbyte_b32
-    * These aren't probably too interesting though.
-    * There are also patterns for v_cmp_class_f{16,32,64}. This is difficult but
-    * probably more useful than the previously mentioned optimizations.
-    * The various comparison optimizations also currently only work with 32-bit
-    * floats. */
-
    alu_opt_info info;
    if (!alu_opt_gather_info(ctx, instr.get(), info))
       return;
@@ -4274,7 +4336,7 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          add_opt(v_mul_f32, v_fma_f32, 0x3, "120", create_fma_cb);
          add_opt(s_mul_f32, v_fma_f32, 0x3, "120", create_fma_cb);
       }
-      if (ctx.program->gfx_level >= GFX9)
+      if (ctx.program->gfx_level >= GFX10_3)
          add_opt(v_mul_legacy_f32, v_fma_legacy_f32, 0x3, "120", create_fma_cb);
    } else if (info.opcode == aco_opcode::v_add_f16) {
       if (ctx.program->gfx_level < GFX9 && ctx.fp_mode.denorm16_64 == 0) {
@@ -4538,6 +4600,10 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       }
    } else if (info.opcode == aco_opcode::v_sub_u32 && !info.clamp) {
       assert(ctx.program->gfx_level >= GFX9);
+
+      /* NEW: v_sub(max(a, b), min(a, b)) -> v_sad_u32(a, b, 0) (GFX9+) */
+      add_opt(v_max_u32, v_sad_u32, 0x3, "012", sad_pattern_cb, true);
+
       /* v_sub_u32(0, v_cndmask_b32(0, 1, cond)) -> v_cndmask_b32(0, -1, cond) */
       add_opt(v_cndmask_b32, v_cndmask_b32, 0x2, "0312",
               and_cb<and_cb<and_cb<check_const_cb<0, 0>, remove_const_cb<1>>, remove_const_cb<0>>,
@@ -4596,10 +4662,21 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       add_opt(s_not_b32, v_bfi_b32, 0x3, "10", insert_const_cb<1, 0>, true);
    } else if (info.opcode == aco_opcode::s_and_b32) {
       add_opt(s_not_b32, s_andn2_b32, 0x3, "01");
+   } else if (info.opcode == aco_opcode::s_andn2_b32) {
+      /* NEW: s_andn2(a, s_lshl(1, b)) -> s_bitset0_b32(a, b) (GFX9+)
+       * Valid only if SCC is unused, as s_bitset0 preserves SCC. */
+      if (ctx.program->gfx_level >= GFX9)
+         add_opt(s_lshl_b32, s_bitset0_b32, 0x3, "120", s_bitset_cb, true);
    } else if (info.opcode == aco_opcode::s_and_b64) {
       add_opt(s_not_b64, s_andn2_b64, 0x3, "01");
    } else if (info.opcode == aco_opcode::s_or_b32) {
       add_opt(s_not_b32, s_orn2_b32, 0x3, "01");
+
+      /* NEW: s_or(a, s_lshl(1, b)) -> s_bitset1_b32(a, b) (GFX9+)
+       * Valid only if SCC is unused, as s_bitset1 preserves SCC. */
+      if (ctx.program->gfx_level >= GFX9)
+         add_opt(s_lshl_b32, s_bitset1_b32, 0x3, "120", s_bitset_cb, true);
+
    } else if (info.opcode == aco_opcode::s_or_b64) {
       add_opt(s_not_b64, s_orn2_b64, 0x3, "01");
    } else if (info.opcode == aco_opcode::s_xor_b32) {
@@ -4696,8 +4773,11 @@ rematerialize_constants(opt_ctx& ctx)
 
       void ensure_size(size_t n)
       {
-         if (entry.size() >= n)
-            return;
+         if (entry.size() >= n) {
+             // Zero initialize new elements if resize happens?
+             // std::vector handles initialization.
+             return;
+         }
          entry.resize(n);
          gen.resize(n, 0);
       }
@@ -4771,24 +4851,33 @@ rematerialize_constants(opt_ctx& ctx)
                if (!constants.contains(key))
                   continue;
 
-               remat_entry& e = constants.get(key);
+               /* Vital Fix: Do not hold reference 'e' across ensure_program/allocations. */
+               if (constants.get(key).block != block.index) {
+                  /* Copy by value to persist across potential vector resize */
+                  remat_entry entry = constants.get(key);
 
-               /* Rematerialize once per block. */
-               if (e.block != block.index) {
                   Builder bld(ctx.program, &ctx.instructions);
-                  Operand const_op = e.instr->operands[0];
-                  e.instr = bld.copy(bld.def(op.regClass()), const_op);
-                  e.block = block.index;
+                  Operand const_op = entry.instr->operands[0];
+                  Instruction* new_instr = bld.copy(bld.def(op.regClass()), const_op);
 
-                  /* Account for new temp ids created by Builder. */
+                  /* Account for new temp ids created by Builder.
+                   * This increases program->peekAllocationId(). */
                   ctx.uses.push_back(0);
                   ctx.info.push_back(ctx.info[op.tempId()]);
+
+                  /* Resize constants table to accommodate new temps if necessary.
+                   * This invalidates any pointers/references to 'entry' vector. */
                   constants.ensure_program(ctx.program);
 
-                  ctx.info[e.instr->definitions[0].tempId()].parent_instr = e.instr;
+                  /* Update table with new instruction for this block */
+                  constants.set(key, {new_instr, block.index});
+
+                  ctx.info[new_instr->definitions[0].tempId()].parent_instr = new_instr;
                }
 
-               Temp new_tmp = e.instr->definitions[0].getTemp();
+               /* Re-acquire reference/pointer after potential resize */
+               Instruction* current_instr = constants.get(key).instr;
+               Temp new_tmp = current_instr->definitions[0].getTemp();
                if (op.getTemp() != new_tmp) {
                   Temp old_tmp = op.getTemp();
                   ctx.uses[old_tmp.id()]--;
@@ -4945,12 +5034,16 @@ select_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
     */
    if (ctx.program->gfx_level >= GFX9 &&
        (instr->opcode == aco_opcode::s_cselect_b32) &&
-       instr->operands[2].isTemp() &&
-       !instr->operands[0].isConstant() && !instr->operands[1].isConstant()) {
+       instr->operands.size() == 3 &&
+       instr->operands[2].isTemp()) {
 
       Instruction* cmp = ctx.info[instr->operands[2].tempId()].parent_instr;
+      /* Check if the comparison matches the select operands perfectly.
+       * s_min/s_max are SOP2 and support literals just like s_cselect.
+       */
       if (cmp && cmp->isSOPC() && cmp->operands.size() == 2 &&
-          cmp->operands[0] == instr->operands[0] && cmp->operands[1] == instr->operands[1]) {
+          cmp->operands[0] == instr->operands[0] &&
+          cmp->operands[1] == instr->operands[1]) {
 
           aco_opcode new_op = aco_opcode::num_opcodes;
           switch(cmp->opcode) {
@@ -4963,8 +5056,9 @@ select_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 
           if (new_op != aco_opcode::num_opcodes) {
               instr->opcode = new_op;
-              // s_min/max are SOP2 like cselect, but take 2 ops instead of 3.
-              // Remove SCC operand.
+              /* s_min/s_max are SOP2 like cselect, but take 2 ops instead of 3.
+               * Remove SCC/Condition operand.
+               */
               instr->operands.pop_back();
           }
       }
