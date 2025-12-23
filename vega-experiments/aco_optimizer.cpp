@@ -3318,7 +3318,7 @@ can_match_op(opt_ctx& ctx, Operand op, uint32_t exec_id)
 
 bool
 match_and_apply_patterns(opt_ctx& ctx, alu_opt_info& info,
-                         const aco::small_vec<combine_instr_pattern, 8>& patterns)
+                         const aco::small_vec<combine_instr_pattern, 32>& patterns)
 {
    if (patterns.empty())
       return false;
@@ -3335,43 +3335,92 @@ match_and_apply_patterns(opt_ctx& ctx, alu_opt_info& info,
    if (!total_mask)
       return false;
 
-   /* Fast path: If only one operand matches, we don't need to sort.
-    * This covers the vast majority of cases, avoiding expensive sorts.
-    */
-   int single_op_idx = -1;
+   /* Fast path: single candidate operand. */
    if (util_bitcount(total_mask) == 1) {
-      single_op_idx = ffs(total_mask) - 1;
+      const unsigned op_idx = (unsigned)(ffs(total_mask) - 1);
+
+      Temp tmp = info.operands[op_idx].op.getTemp();
+      alu_opt_info op_instr;
+      if (!alu_opt_gather_info(ctx, ctx.info[tmp.id()].parent_instr, op_instr))
+         return false;
+
+      if (op_instr.clamp || op_instr.omod || op_instr.f32_to_f16)
+         return false;
+
+      aco_type type = instr_info.alu_opcode_infos[(int)info.opcode].op_types[op_idx];
+      if (!backpropagate_input_modifiers(ctx, op_instr, info.operands[op_idx], type))
+         return false;
+
+      for (const combine_instr_pattern& pattern : patterns) {
+         if (!(pattern.operand_mask & BITFIELD_BIT(op_idx)) || op_instr.opcode != pattern.src_opcode)
+            continue;
+
+         if (pattern.less_aggressive && ctx.uses[tmp.id()] > ctx.uses[info.defs[0].tempId()])
+            continue;
+
+         alu_opt_info new_info = info;
+
+         const unsigned rem = info.operands.size() - 1;
+         const unsigned op_count = rem + (unsigned)op_instr.operands.size();
+         new_info.operands.resize(op_count);
+
+         for (unsigned i = 0; i < op_count; i++) {
+            const unsigned src_idx = (unsigned)(pattern.swizzle[i] - '0');
+            if (src_idx < op_idx)
+               new_info.operands[i] = info.operands[src_idx];
+            else if (src_idx < rem)
+               new_info.operands[i] = info.operands[src_idx + 1];
+            else
+               new_info.operands[i] = op_instr.operands[src_idx - rem];
+         }
+
+         new_info.opcode = pattern.res_opcode;
+
+         if (op_instr.defs[0].isPrecise())
+            new_info.defs[0].setPrecise(true);
+
+         if (pattern.callback && !pattern.callback(ctx, new_info))
+            continue;
+
+         if (alu_opt_info_is_valid(ctx, new_info)) {
+            info = std::move(new_info);
+            return true;
+         }
+      }
+
+      return false;
    }
 
+   /* Multi-candidate path: small stable insertion sort instead of std::stable_sort().
+    * Avoids allocator traffic and reduces overhead for tiny N (<=4).
+    */
    aco::small_vec<int, 4> indices;
+   indices.reserve(util_bitcount(total_mask));
 
-   if (single_op_idx >= 0) {
-      indices.push_back(single_op_idx);
-   } else {
-      indices.reserve(util_bitcount(total_mask));
-      u_foreach_bit (i, total_mask)
-         indices.push_back(i);
+   auto better = [&](int a, int b) -> bool {
+      const Temp temp_a = info.operands[(unsigned)a].op.getTemp();
+      const Temp temp_b = info.operands[(unsigned)b].op.getTemp();
 
-      std::stable_sort(indices.begin(), indices.end(),
-                       [&](int a, int b)
-                       {
-                          Temp temp_a = info.operands[a].op.getTemp();
-                          Temp temp_b = info.operands[b].op.getTemp();
+      const uint16_t uses_a = ctx.uses[temp_a.id()];
+      const uint16_t uses_b = ctx.uses[temp_b.id()];
+      if (uses_a != uses_b)
+         return uses_a < uses_b;
 
-                          /* Less uses make it more likely/profitable to eliminate an instruction. */
-                          if (ctx.uses[temp_a.id()] != ctx.uses[temp_b.id()])
-                             return ctx.uses[temp_a.id()] < ctx.uses[temp_b.id()];
+      if (temp_a.type() != temp_b.type())
+         return temp_a.type() == RegType::vgpr;
 
-                          /* Prefer eliminating VALU instructions. */
-                          if (temp_a.type() != temp_b.type())
-                             return temp_a.type() == RegType::vgpr;
+      return temp_a.id() > temp_b.id();
+   };
 
-                          /* The id is a good approximation for instruction order,
-                           * prefer instructions closer to info to not increase register pressure
-                           * as much.
-                           */
-                          return temp_a.id() > temp_b.id();
-                       });
+   u_foreach_bit (i, total_mask) {
+      const int idx = (int)i;
+
+      auto it = indices.begin();
+      for (; it != indices.end(); ++it) {
+         if (better(idx, *it))
+            break;
+      }
+      indices.insert(it, idx);
    }
 
    for (unsigned op_idx : indices) {
@@ -3397,12 +3446,12 @@ match_and_apply_patterns(opt_ctx& ctx, alu_opt_info& info,
 
          alu_opt_info new_info = info;
 
-         unsigned rem = info.operands.size() - 1;
-         unsigned op_count = rem + op_instr.operands.size();
+         const unsigned rem = info.operands.size() - 1;
+         const unsigned op_count = rem + (unsigned)op_instr.operands.size();
          new_info.operands.resize(op_count);
-         assert(strlen(pattern.swizzle) == op_count);
+
          for (unsigned i = 0; i < op_count; i++) {
-            unsigned src_idx = pattern.swizzle[i] - '0';
+            const unsigned src_idx = (unsigned)(pattern.swizzle[i] - '0');
             if (src_idx < op_idx)
                new_info.operands[i] = info.operands[src_idx];
             else if (src_idx < rem)
@@ -3881,7 +3930,7 @@ apply_output(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    int temp_idx = -1;
    for (unsigned i = 0; i < instr->operands.size(); i++) {
       if (temp_idx < 0 && instr->operands[i].isTemp())
-         temp_idx = i;
+         temp_idx = (int)i;
       else if (instr->operands[i].isConstant())
          continue;
       else
@@ -3891,18 +3940,22 @@ apply_output(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    if (temp_idx < 0)
       return false;
 
-   unsigned tmpid = instr->operands[temp_idx].tempId();
+   const unsigned tmpid = instr->operands[(unsigned)temp_idx].tempId();
    Instruction* parent = ctx.info[tmpid].parent_instr;
-   if (ctx.uses[tmpid] != 1 || parent->definitions[0].tempId() != tmpid)
+   if (ctx.uses[tmpid] != 1 || !parent || parent->definitions[0].tempId() != tmpid)
       return false;
 
-   int64_t alt_idx = ctx.info[tmpid].is_combined() ? ctx.info[tmpid].val : -1;
-   aco::small_vec<Operand, 4> pre_opt_ops;
-   for (const Operand& op : parent->operands)
-      pre_opt_ops.push_back(op);
+   const int64_t alt_idx = ctx.info[tmpid].is_combined() ? (int64_t)ctx.info[tmpid].val : -1;
+
+   /* Snapshot only temp operands (including duplicates) for correct use accounting. */
+   aco::small_vec<Temp, 4> pre_opt_temps;
+   pre_opt_temps.reserve(parent->operands.size());
+   for (const Operand& op : parent->operands) {
+      if (op.isTemp())
+         pre_opt_temps.push_back(op.getTemp());
+   }
 
    Instruction* new_instr = apply_output_impl(ctx, instr, parent);
-
    if (new_instr == nullptr)
       return false;
 
@@ -3910,10 +3963,8 @@ apply_output(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       if (op.isTemp())
          ctx.uses[op.tempId()]++;
    }
-   for (const Operand& op : pre_opt_ops) {
-      if (op.isTemp())
-         decrease_and_dce(ctx, op.getTemp());
-   }
+   for (Temp t : pre_opt_temps)
+      decrease_and_dce(ctx, t);
 
    ctx.uses[tmpid] = 0;
    ctx.info[tmpid].parent_instr = nullptr;
@@ -3923,13 +3974,13 @@ apply_output(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 
    if (alt_idx >= 0) {
       Instruction* new_pre_combine =
-         apply_output_impl(ctx, instr, ctx.pre_combine_instrs[alt_idx].get());
+         apply_output_impl(ctx, instr, ctx.pre_combine_instrs[(size_t)alt_idx].get());
 
-      if (new_pre_combine != ctx.pre_combine_instrs[alt_idx].get())
-         ctx.pre_combine_instrs[alt_idx].reset(new_pre_combine);
+      if (new_pre_combine != ctx.pre_combine_instrs[(size_t)alt_idx].get())
+         ctx.pre_combine_instrs[(size_t)alt_idx].reset(new_pre_combine);
 
       if (new_pre_combine)
-         ctx.info[new_instr->definitions[0].tempId()].set_combined(alt_idx);
+         ctx.info[new_instr->definitions[0].tempId()].set_combined((uint32_t)alt_idx);
    }
 
    for (Definition& def : new_instr->definitions) {
@@ -4207,7 +4258,7 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    if (!alu_opt_gather_info(ctx, instr.get(), info))
       return;
 
-   aco::small_vec<combine_instr_pattern, 8> patterns;
+   aco::small_vec<combine_instr_pattern, 32> patterns;
 
 /* Variadic macro to make callback optional and to allow templates<a, b>. */
 #define add_opt(src_op, res_op, mask, swizzle, ...)                                                \
@@ -4223,7 +4274,7 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          add_opt(v_mul_f32, v_fma_f32, 0x3, "120", create_fma_cb);
          add_opt(s_mul_f32, v_fma_f32, 0x3, "120", create_fma_cb);
       }
-      if (ctx.program->gfx_level >= GFX10_3)
+      if (ctx.program->gfx_level >= GFX9)
          add_opt(v_mul_legacy_f32, v_fma_legacy_f32, 0x3, "120", create_fma_cb);
    } else if (info.opcode == aco_opcode::v_add_f16) {
       if (ctx.program->gfx_level < GFX9 && ctx.fp_mode.denorm16_64 == 0) {
@@ -4635,24 +4686,68 @@ remat_constants_instr(opt_ctx& ctx, aco::map<Temp, remat_entry>& constants, Inst
    }
 }
 
-/**
- * This pass implements a simple constant rematerialization.
- * As common subexpression elimination (CSE) might increase the live-ranges
- * of loaded constants over large distances, this pass splits the live-ranges
- * again by re-emitting constants in every basic block.
- */
 void
 rematerialize_constants(opt_ctx& ctx)
 {
-   aco::monotonic_buffer_resource memory(1024);
-   aco::map<Temp, remat_entry> constants(memory);
+   struct dense_remat_table {
+      std::vector<remat_entry> entry;
+      std::vector<uint32_t> gen;
+      uint32_t cur_gen = 1;
+
+      void ensure_size(size_t n)
+      {
+         if (entry.size() >= n)
+            return;
+         entry.resize(n);
+         gen.resize(n, 0);
+      }
+
+      void ensure_program(Program* program)
+      {
+         ensure_size((size_t)program->peekAllocationId());
+      }
+
+      void clear_scope()
+      {
+         cur_gen++;
+         /* Extremely unlikely, but make wrap safe and deterministic. */
+         if (cur_gen == 0) {
+            std::fill(gen.begin(), gen.end(), 0);
+            cur_gen = 1;
+         }
+      }
+
+      bool contains(Temp t) const
+      {
+         const uint32_t id = t.id();
+         return (size_t)id < gen.size() && gen[id] == cur_gen;
+      }
+
+      remat_entry& get(Temp t)
+      {
+         return entry[t.id()];
+      }
+
+      void set(Temp t, remat_entry e)
+      {
+         const uint32_t id = t.id();
+         ensure_size((size_t)id + 1u);
+         entry[id] = e;
+         gen[id] = cur_gen;
+      }
+   };
+
+   dense_remat_table constants;
+   constants.ensure_program(ctx.program);
 
    for (Block& block : ctx.program->blocks) {
       if (block.logical_idom == -1)
          continue;
 
       if (block.logical_idom == (int)block.index)
-         constants.clear();
+         constants.clear_scope();
+
+      constants.ensure_program(ctx.program);
 
       ctx.instructions.reserve(block.instructions.size());
 
@@ -4662,38 +4757,43 @@ rematerialize_constants(opt_ctx& ctx)
 
          if (is_constant(instr.get())) {
             Temp tmp = instr->definitions[0].getTemp();
-            constants[tmp] = {instr.get(), block.index};
+            constants.set(tmp, {instr.get(), block.index});
          } else if (!is_phi(instr)) {
             for (Operand& op : instr->operands) {
                if (!op.isTemp())
                   continue;
 
-               /* Optimization: fast-fail O(1) check before map lookup */
+               /* Fast-fail O(1) check before table lookup */
                if (!ctx.info[op.tempId()].is_constant())
                   continue;
 
-               auto it = constants.find(op.getTemp());
-               if (it == constants.end())
+               Temp key = op.getTemp();
+               if (!constants.contains(key))
                   continue;
 
-               /* Check if we already emitted the same constant in this block. */
-               if (it->second.block != block.index) {
-                  /* Rematerialize the constant. */
+               remat_entry& e = constants.get(key);
+
+               /* Rematerialize once per block. */
+               if (e.block != block.index) {
                   Builder bld(ctx.program, &ctx.instructions);
-                  Operand const_op = it->second.instr->operands[0];
-                  it->second.instr = bld.copy(bld.def(op.regClass()), const_op);
-                  it->second.block = block.index;
+                  Operand const_op = e.instr->operands[0];
+                  e.instr = bld.copy(bld.def(op.regClass()), const_op);
+                  e.block = block.index;
+
+                  /* Account for new temp ids created by Builder. */
                   ctx.uses.push_back(0);
                   ctx.info.push_back(ctx.info[op.tempId()]);
-                  ctx.info[it->second.instr->definitions[0].tempId()].parent_instr =
-                     it->second.instr;
+                  constants.ensure_program(ctx.program);
+
+                  ctx.info[e.instr->definitions[0].tempId()].parent_instr = e.instr;
                }
 
-               /* Use the rematerialized constant and update information about latest use. */
-               if (op.getTemp() != it->second.instr->definitions[0].getTemp()) {
-                  ctx.uses[op.tempId()]--;
-                  op.setTemp(it->second.instr->definitions[0].getTemp());
-                  ctx.uses[op.tempId()]++;
+               Temp new_tmp = e.instr->definitions[0].getTemp();
+               if (op.getTemp() != new_tmp) {
+                  Temp old_tmp = op.getTemp();
+                  ctx.uses[old_tmp.id()]--;
+                  op.setTemp(new_tmp);
+                  ctx.uses[new_tmp.id()]++;
                }
             }
          }
@@ -5564,6 +5664,17 @@ optimize(Program* program)
    ctx.program = program;
    ctx.info = std::vector<ssa_info>(program->peekAllocationId());
 
+   size_t total_instr = 0;
+   for (const Block& block : program->blocks)
+      total_instr += block.instructions.size();
+
+   /* Heuristic headroom: optimizer can create additional instructions/temps.
+    * Keep it conservative to avoid over-reserving in tiny shaders.
+    */
+   const size_t reserve_hint = total_instr / 4u + 16u;
+   ctx.pre_combine_instrs.reserve(reserve_hint);
+   ctx.replacement_instr.reserve(total_instr / 8u + 16u);
+
    /* 1. Bottom-Up DAG pass (forward) to label all ssa-defs */
    for (Block& block : program->blocks) {
       ctx.fp_mode = block.fp_mode;
@@ -5574,6 +5685,10 @@ optimize(Program* program)
    rename_loop_header_phis(ctx);
 
    ctx.uses = dead_code_analysis(program);
+
+   /* We will push_back into uses/info in later passes (e.g., add_lm_def_cb, remat). */
+   ctx.uses.reserve(ctx.uses.size() + reserve_hint);
+   ctx.info.reserve(ctx.info.size() + reserve_hint);
 
    validate_opt_ctx(ctx, false);
 
