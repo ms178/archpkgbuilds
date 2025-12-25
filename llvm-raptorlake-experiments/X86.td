@@ -1302,12 +1302,13 @@ def ProcessorFeatures {
   list<SubtargetFeature> ADLFeatures =
     !listconcat(TRMFeatures, ADLAdditionalFeatures);
 
-  // Raptor Lake: enable fast string ops + prefer 256-bit compute
+  // Raptor Lake: enable fast string ops + prefer 256-bit compute + fast VNNI
   list<SubtargetFeature> RLAdditionalFeatures = [FeatureERMSB, FeatureFSRM];
   list<SubtargetFeature> RLFeatures =
     !listconcat(ADLFeatures, RLAdditionalFeatures);
 
-  list<SubtargetFeature> RLAdditionalTuning = [TuningPrefer256Bit];
+  list<SubtargetFeature> RLAdditionalTuning = [TuningPrefer256Bit,
+                                               TuningFastDPWSSD];
   list<SubtargetFeature> RLTuning = !listconcat(ADLTuning, RLAdditionalTuning);
 
   // Gracemont
