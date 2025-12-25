@@ -1302,13 +1302,16 @@ def ProcessorFeatures {
   list<SubtargetFeature> ADLFeatures =
     !listconcat(TRMFeatures, ADLAdditionalFeatures);
 
-  // Raptor Lake: enable fast string ops + prefer 256-bit compute + fast VNNI
-  list<SubtargetFeature> RLAdditionalFeatures = [FeatureERMSB, FeatureFSRM];
+  // Raptor Lake
+  list<SubtargetFeature> RLAdditionalFeatures = [FeatureERMSB,
+                                                 FeatureFSRM];
   list<SubtargetFeature> RLFeatures =
     !listconcat(ADLFeatures, RLAdditionalFeatures);
 
   list<SubtargetFeature> RLAdditionalTuning = [TuningPrefer256Bit,
-                                               TuningFastDPWSSD];
+                                               TuningFastDPWSSD,
+                                               TuningFastMOVBE,
+                                               TuningSBBDepBreaking];
   list<SubtargetFeature> RLTuning = !listconcat(ADLTuning, RLAdditionalTuning);
 
   // Gracemont
@@ -1318,10 +1321,11 @@ def ProcessorFeatures {
                                       TuningFastVectorFSQRT,
                                       TuningFast15ByteNOP,
                                       TuningFastVariablePerLaneShuffle,
-                                      TuningPOPCNTFalseDeps,
                                       TuningInsertVZEROUPPER,
                                       TuningPrefer128Bit,
-                                      TuningNoDomainDelay];
+                                      TuningNoDomainDelay,
+                                      TuningFastMOVBE,
+                                      TuningFastDPWSSD];
 
   // Arrowlake
   list<SubtargetFeature> ARLAdditionalFeatures = [FeatureCMPCCXADD,
