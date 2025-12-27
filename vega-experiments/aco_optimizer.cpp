@@ -4216,161 +4216,277 @@ and_cb(opt_ctx& ctx, alu_opt_info& info)
    return func1(ctx, info) && func2(ctx, info);
 }
 
-/* Validates that the shift instruction is '1 << x' */
+/* =============================================================================
+ * Helper Callbacks for Peephole Optimizations
+ * ============================================================================= */
+
+/* Helper to safely compare operands accounting for constants and temps.
+ * Must be defined before any callback that uses it.
+ */
+static inline bool operands_equal(const Operand& a, const Operand& b)
+{
+   if (a.isTemp() && b.isTemp())
+      return a.tempId() == b.tempId();
+   if (a.isConstant() && b.isConstant())
+      return a.constantValue64() == b.constantValue64();
+   return false;
+}
+
+/* Validates that the constant operand is exactly 1 (for 1 << x optimization) */
 bool check_lshl_1_cb(opt_ctx& ctx, alu_opt_info& info)
 {
+   if (info.operands.empty())
+      return false;
    uint64_t val = 0;
    return op_info_get_constant(ctx, info.operands[0], {aco_base_type_uint, 1, 32}, &val) &&
           val == 1;
 }
 
-/* Validates that SCC is dead, and removes the SCC definition from the info.
- * Required for optimizations that replace SCC-defining instructions (s_or, s_andn2)
- * with ones that preserve SCC (s_bitset).
+/* Validates that the SCC definition is dead/unused.
+ * Essential when replacing SCC-writing instructions (s_or, s_andn2) with SCC-preserving ones (s_bitset).
  */
 bool check_scc_dead_cb(opt_ctx& ctx, alu_opt_info& info)
 {
-   if (info.defs.size() < 2 || ctx.uses[info.defs[1].tempId()] != 0)
+   if (info.defs.size() < 2)
       return false;
 
-   /* s_bitset does not write SCC, so we must remove the definition to remain valid */
+   const Definition& scc_def = info.defs[1];
+   if (scc_def.isTemp()) {
+      if (ctx.uses[scc_def.tempId()] != 0)
+         return false;
+   } else if (scc_def.isFixed() && scc_def.physReg() == scc) {
+      if (!scc_def.isKill())
+         return false;
+   } else {
+      return false;
+   }
+
    info.defs.pop_back();
    return true;
 }
 
-/* Combined callback for s_bitset optimizations */
+/* Combined check for s_bitset optimization */
 bool s_bitset_cb(opt_ctx& ctx, alu_opt_info& info)
 {
    return check_lshl_1_cb(ctx, info) && check_scc_dead_cb(ctx, info);
 }
 
+/* Validates s_and(a, 1 << b) -> s_bitcmp1_b32(a, b) */
+bool s_bitcmp1_cb(opt_ctx& ctx, alu_opt_info& info)
+{
+   if (info.defs.empty()) return false;
+   const Definition& dest_def = info.defs[0];
+
+   if (!dest_def.isTemp() || ctx.uses[dest_def.tempId()] != 0)
+      return false;
+
+   if (!check_lshl_1_cb(ctx, info))
+      return false;
+
+   if (info.defs.size() < 2) return false;
+   /* Move SCC from defs[1] to defs[0] (as bitcmp only outputs SCC) */
+   info.defs[0] = info.defs[1];
+   info.defs.pop_back();
+   return true;
+}
+
 /* Validates v_sub(max(a,b), min(a,b)) -> v_sad_u32(a, b, 0) */
 bool sad_pattern_cb(opt_ctx& ctx, alu_opt_info& info)
 {
-   /* Pattern: v_sub(max(A, B), min(A, B))
-    * info.operands[0] = A (from max)
-    * info.operands[1] = B (from max)
-    * info.operands[2] = v_min_u32(A, B) (from v_sub)
-    */
-
-   if (!info.operands[2].op.isTemp())
+   if (info.operands.size() < 3 || !info.operands[2].op.isTemp())
       return false;
 
-   Instruction* min_instr = ctx.info[info.operands[2].op.tempId()].parent_instr;
-   if (min_instr->opcode != aco_opcode::v_min_u32)
+   const uint32_t min_id = info.operands[2].op.tempId();
+   if (min_id >= ctx.info.size()) return false;
+
+   Instruction* min_instr = ctx.info[min_id].parent_instr;
+   if (!min_instr || min_instr->opcode != aco_opcode::v_min_u32)
       return false;
 
-   /* v_sad_u32 does not support input modifiers on the accumulator/min operand */
    if (min_instr->isVALU()) {
       const VALU_instruction& valu = min_instr->valu();
-      if (valu.clamp || valu.omod || valu.neg[0] || valu.neg[1] || valu.abs[0] || valu.abs[1])
-         return false;
+      if (valu.clamp || valu.omod) return false;
+      for (unsigned i = 0; i < min_instr->operands.size() && i < 3; i++)
+         if (valu.neg[i] || valu.abs[i]) return false;
    }
 
-   /* Verify operands match between MAX and MIN (commutative) */
-   Operand max_a = info.operands[0].op;
-   Operand max_b = info.operands[1].op;
-   Operand min_a = min_instr->operands[0];
-   Operand min_b = min_instr->operands[1];
+   /* Check modifiers on max instruction operands (now in info) */
+   for (unsigned i = 0; i < 2; i++)
+      if (info.operands[i].neg[0] || info.operands[i].abs[0]) return false;
 
-   bool match = (max_a == min_a && max_b == min_b) || (max_a == min_b && max_b == min_a);
-   if (!match)
+   const Operand& max_a = info.operands[0].op;
+   const Operand& max_b = info.operands[1].op;
+   const Operand& min_a = min_instr->operands[0];
+   const Operand& min_b = min_instr->operands[1];
+
+   bool match_direct = operands_equal(max_a, min_a) && operands_equal(max_b, min_b);
+   bool match_swapped = operands_equal(max_a, min_b) && operands_equal(max_b, min_a);
+
+   if (!match_direct && !match_swapped)
       return false;
 
-   /* Transform to v_sad_u32(A, B, 0) */
    info.operands[2].op = Operand::c32(0);
    info.operands[2].neg[0] = false;
    info.operands[2].abs[0] = false;
    return true;
 }
 
-/* Validates v_or(v_lshlrev(a, 32-k), v_lshrrev(b, k)) -> v_alignbit(a, b, k)
- * Handles case where v_lshlrev (High bits) was matched at op_idx.
- */
-bool funnel_shift_lshl_cb(opt_ctx& ctx, alu_opt_info& info)
+/* Validates s_sub(max(a,b), min(a,b)) -> s_absdiff(a,b) */
+bool scalar_sad_pattern_cb(opt_ctx& ctx, alu_opt_info& info)
 {
-   if (!info.operands[1].op.isTemp())
+   if (info.operands.size() < 3 || !info.operands[2].op.isTemp())
       return false;
 
-   Instruction* low_instr = ctx.info[info.operands[1].op.tempId()].parent_instr;
-   if (low_instr->opcode != aco_opcode::v_lshrrev_b32 || low_instr->usesModifiers())
+   const uint32_t min_id = info.operands[2].op.tempId();
+   if (min_id >= ctx.info.size()) return false;
+
+   Instruction* min_instr = ctx.info[min_id].parent_instr;
+   if (!min_instr) return false;
+
+   aco_opcode expected_min = (info.opcode == aco_opcode::s_max_i32) ? aco_opcode::s_min_i32 :
+                             (info.opcode == aco_opcode::s_max_u32) ? aco_opcode::s_min_u32 : aco_opcode::num_opcodes;
+
+   if (expected_min == aco_opcode::num_opcodes || min_instr->opcode != expected_min)
       return false;
 
-   uint64_t lshl_const = 0;
-   uint64_t lshr_const = 0;
+   const Operand& max_a = info.operands[0].op;
+   const Operand& max_b = info.operands[1].op;
+   const Operand& min_a = min_instr->operands[0];
+   const Operand& min_b = min_instr->operands[1];
 
-   /* info.operands[2] is the shift amount from lshl (32-k) */
-   if (!op_info_get_constant(ctx, info.operands[2], {aco_base_type_uint, 1, 32}, &lshl_const))
+   bool match_direct = operands_equal(max_a, min_a) && operands_equal(max_b, min_b);
+   bool match_swapped = operands_equal(max_a, min_b) && operands_equal(max_b, min_a);
+
+   if (!match_direct && !match_swapped)
       return false;
 
-   /* Get lshr shift amount (k) */
-   Operand lshr_shift_op = low_instr->operands[0];
-   if (lshr_shift_op.isConstant())
-      lshr_const = lshr_shift_op.constantValue();
-   else if (lshr_shift_op.isTemp() && ctx.info[lshr_shift_op.tempId()].is_constant())
-      lshr_const = ctx.info[lshr_shift_op.tempId()].val;
-   else
-      return false;
-
-   if ((uint32_t)lshl_const + (uint32_t)lshr_const != 32)
-      return false;
-
-   /* Setup v_alignbit operands: src0=High(A), src1=Low(B), src2=Shift(k) */
-   /* src0 is already info.operands[0] (A) */
-   info.operands[1].op = low_instr->operands[1]; // Set B
-   info.operands[2].op = low_instr->operands[0]; // Set k
-
-   /* Optimization: Use v_alignbyte if byte-aligned */
-   if ((uint32_t)lshr_const % 8 == 0) {
-      info.opcode = aco_opcode::v_alignbyte_b32;
-      info.operands[2].op = Operand::c32((uint32_t)lshr_const / 8);
+   if (info.defs.size() > 1) {
+      const Definition& scc_def = info.defs[1];
+      if (scc_def.isTemp() && ctx.uses[scc_def.tempId()] != 0)
+         return false;
    }
 
+   info.operands.pop_back();
    return true;
 }
 
-/* Validates v_or(v_lshlrev(a, 32-k), v_lshrrev(b, k)) -> v_alignbit(a, b, k)
- * Handles case where v_lshrrev (Low bits) was matched at op_idx.
- */
-bool funnel_shift_lshr_cb(opt_ctx& ctx, alu_opt_info& info)
+/* Validates v_or(v_lshlrev(a, 32-k), v_lshrrev(b, k)) -> v_alignbit(a, b, k) */
+bool funnel_shift_lshl_cb(opt_ctx& ctx, alu_opt_info& info)
 {
-   if (!info.operands[0].op.isTemp())
+   if (info.operands.size() < 3 || !info.operands[1].op.isTemp())
       return false;
 
-   Instruction* high_instr = ctx.info[info.operands[0].op.tempId()].parent_instr;
-   if (high_instr->opcode != aco_opcode::v_lshlrev_b32 || high_instr->usesModifiers())
+   const uint32_t low_id = info.operands[1].op.tempId();
+   if (low_id >= ctx.info.size()) return false;
+
+   Instruction* low_instr = ctx.info[low_id].parent_instr;
+   if (!low_instr || low_instr->opcode != aco_opcode::v_lshrrev_b32 ||
+       (low_instr->isVALU() && low_instr->valu().usesModifiers()))
       return false;
 
    uint64_t lshl_const = 0;
-   uint64_t lshr_const = 0;
+   if (!op_info_get_constant(ctx, info.operands[2], {aco_base_type_uint, 1, 32}, &lshl_const))
+      return false;
 
-   /* info.operands[2] is the shift amount from lshr (k) */
+   uint64_t lshr_const = 0;
+   const Operand& lshr_op = low_instr->operands[0];
+   if (lshr_op.isConstant()) {
+      lshr_const = lshr_op.constantValue();
+   } else if (lshr_op.isTemp()) {
+      const uint32_t shift_id = lshr_op.tempId();
+      if (shift_id < ctx.info.size() && ctx.info[shift_id].is_constant())
+         lshr_const = ctx.info[shift_id].val;
+      else return false;
+   } else return false;
+
+   if (((uint32_t)lshl_const + (uint32_t)lshr_const) != 32)
+      return false;
+   if (lshr_const == 0 || lshr_const > 31)
+      return false;
+
+   info.operands[1].op = low_instr->operands[1];
+   info.operands[1].neg[0] = false;
+   info.operands[1].abs[0] = false;
+
+   if ((lshr_const % 8) == 0 && ctx.program->gfx_level >= GFX8) {
+      info.opcode = aco_opcode::v_alignbyte_b32;
+      info.operands[2].op = Operand::c32((uint32_t)lshr_const / 8);
+   } else {
+      info.operands[2].op = Operand::c32((uint32_t)lshr_const);
+   }
+   info.operands[2].neg[0] = false;
+   info.operands[2].abs[0] = false;
+   return true;
+}
+
+/* Validates v_or(v_lshlrev(a, 32-k), v_lshrrev(b, k)) -> v_alignbit(a, b, k) */
+bool funnel_shift_lshr_cb(opt_ctx& ctx, alu_opt_info& info)
+{
+   if (info.operands.size() < 3 || !info.operands[0].op.isTemp())
+      return false;
+
+   const uint32_t high_id = info.operands[0].op.tempId();
+   if (high_id >= ctx.info.size()) return false;
+
+   Instruction* high_instr = ctx.info[high_id].parent_instr;
+   if (!high_instr || high_instr->opcode != aco_opcode::v_lshlrev_b32 ||
+       (high_instr->isVALU() && high_instr->valu().usesModifiers()))
+      return false;
+
+   uint64_t lshr_const = 0;
    if (!op_info_get_constant(ctx, info.operands[2], {aco_base_type_uint, 1, 32}, &lshr_const))
       return false;
 
-   /* Get lshl shift amount (32-k) */
-   Operand lshl_shift_op = high_instr->operands[0];
-   if (lshl_shift_op.isConstant())
-      lshl_const = lshl_shift_op.constantValue();
-   else if (lshl_shift_op.isTemp() && ctx.info[lshl_shift_op.tempId()].is_constant())
-      lshl_const = ctx.info[lshl_shift_op.tempId()].val;
-   else
+   uint64_t lshl_const = 0;
+   const Operand& lshl_op = high_instr->operands[0];
+   if (lshl_op.isConstant()) {
+      lshl_const = lshl_op.constantValue();
+   } else if (lshl_op.isTemp()) {
+      const uint32_t shift_id = lshl_op.tempId();
+      if (shift_id < ctx.info.size() && ctx.info[shift_id].is_constant())
+         lshl_const = ctx.info[shift_id].val;
+      else return false;
+   } else return false;
+
+   if (((uint32_t)lshl_const + (uint32_t)lshr_const) != 32)
+      return false;
+   if (lshr_const == 0 || lshr_const > 31)
       return false;
 
-   if ((uint32_t)lshl_const + (uint32_t)lshr_const != 32)
-      return false;
+   info.operands[0].op = high_instr->operands[1];
+   info.operands[0].neg[0] = false;
+   info.operands[0].abs[0] = false;
 
-   /* Setup v_alignbit operands: src0=High(A), src1=Low(B), src2=Shift(k) */
-   info.operands[0].op = high_instr->operands[1]; // Set A
-   /* src1 is already info.operands[1] (B) */
-   /* src2 is already info.operands[2] (k) */
-
-   /* Optimization: Use v_alignbyte if byte-aligned */
-   if ((uint32_t)lshr_const % 8 == 0) {
+   if ((lshr_const % 8) == 0 && ctx.program->gfx_level >= GFX8) {
       info.opcode = aco_opcode::v_alignbyte_b32;
       info.operands[2].op = Operand::c32((uint32_t)lshr_const / 8);
+   } else {
+      info.operands[2].op = Operand::c32((uint32_t)lshr_const);
    }
+   info.operands[2].neg[0] = false;
+   info.operands[2].abs[0] = false;
+   return true;
+}
 
+bool min_max_redundant_cb(opt_ctx& ctx, alu_opt_info& info)
+{
+   if (info.operands.size() < 2) return false;
+   if (!operands_equal(info.operands[0].op, info.operands[1].op)) return false;
+   if (info.operands[0].neg[0] != info.operands[1].neg[0] ||
+       info.operands[0].abs[0] != info.operands[1].abs[0])
+      return false;
+   info.opcode = aco_opcode::v_mov_b32;
+   info.operands.resize(1);
+   return true;
+}
+
+bool scalar_min_max_redundant_cb(opt_ctx& ctx, alu_opt_info& info)
+{
+   if (info.operands.size() < 2) return false;
+   if (!operands_equal(info.operands[0].op, info.operands[1].op)) return false;
+   info.opcode = aco_opcode::s_mov_b32;
+   info.operands.resize(1);
+   if (info.defs.size() > 1) info.defs.pop_back();
    return true;
 }
 
@@ -4381,14 +4497,13 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       return;
 
    for (const Definition& def : instr->definitions) {
+      if (!def.isTemp()) continue;
       ssa_info& info = ctx.info[def.tempId()];
       if (info.is_extract() && ctx.uses[def.tempId()] > 4)
          info.label &= ~label_extract;
    }
 
    if (instr->isVALU() || instr->isSALU()) {
-      /* Apply SDWA. Do this after label_instruction() so it can remove
-       * label_extract if not all instructions can take SDWA. */
       alu_propagate_temp_const(ctx, instr, true);
    }
 
@@ -4407,11 +4522,14 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 
    aco::small_vec<combine_instr_pattern, 32> patterns;
 
-/* Variadic macro to make callback optional and to allow templates<a, b>. */
-#define add_opt(src_op, res_op, mask, swizzle, ...)                                                \
-   patterns.push_back(                                                                             \
-      combine_instr_pattern{aco_opcode::src_op, aco_opcode::res_op, mask, swizzle, __VA_ARGS__})
+#define add_opt(src_op, res_op, mask, swizzle, ...)                                \
+   patterns.push_back(                                                             \
+      combine_instr_pattern{aco_opcode::src_op, aco_opcode::res_op, mask, swizzle, \
+                            __VA_ARGS__})
 
+   /* =========================================================================
+    * Floating-Point Add -> FMA/MAD Transformations
+    * ========================================================================= */
    if (info.opcode == aco_opcode::v_add_f32) {
       if (ctx.program->dev.has_mad32 && ctx.fp_mode.denorm32 == 0) {
          add_opt(v_mul_f32, v_mad_f32, 0x3, "120");
@@ -4423,6 +4541,7 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       }
       if (ctx.program->gfx_level >= GFX10_3)
          add_opt(v_mul_legacy_f32, v_fma_legacy_f32, 0x3, "120", create_fma_cb);
+
    } else if (info.opcode == aco_opcode::v_add_f16) {
       if (ctx.program->gfx_level < GFX9 && ctx.fp_mode.denorm16_64 == 0) {
          add_opt(v_mul_f16, v_mad_legacy_f16, 0x3, "120");
@@ -4430,7 +4549,6 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          add_opt(v_mul_f16, v_mad_f16, 0x3, "120");
          add_opt(v_pk_mul_f16, v_mad_f16, 0x3, "120");
       }
-
       if (ctx.program->gfx_level < GFX9) {
          add_opt(v_mul_f16, v_fma_legacy_f16, 0x3, "120", create_fma_cb);
       } else {
@@ -4438,18 +4556,27 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          add_opt(s_mul_f16, v_fma_f16, 0x3, "120", create_fma_cb);
          add_opt(v_pk_mul_f16, v_fma_f16, 0x3, "120", create_fma_cb);
       }
+
    } else if (info.opcode == aco_opcode::v_add_f64) {
       add_opt(v_mul_f64, v_fma_f64, 0x3, "120", create_fma_cb);
+
    } else if (info.opcode == aco_opcode::v_add_f64_e64) {
       add_opt(v_mul_f64_e64, v_fma_f64, 0x3, "120", create_fma_cb);
+
    } else if (info.opcode == aco_opcode::s_add_f32) {
       add_opt(s_mul_f32, s_fmac_f32, 0x3, "120", create_fma_cb);
+
    } else if (info.opcode == aco_opcode::s_add_f16) {
       add_opt(s_mul_f16, s_fmac_f16, 0x3, "120", create_fma_cb);
+
    } else if (info.opcode == aco_opcode::v_pk_add_f16) {
       add_opt(v_pk_mul_f16, v_pk_fma_f16, 0x3, "120", create_fma_cb);
       add_opt(v_mul_f16, v_pk_fma_f16, 0x3, "120", create_fma_cb);
       add_opt(s_mul_f16, v_pk_fma_f16, 0x3, "120", create_fma_cb);
+
+   /* =========================================================================
+    * Min/Max Chains -> Min3/Max3/Med3/MinMax
+    * ========================================================================= */
    } else if (info.opcode == aco_opcode::v_max_f32) {
       add_opt(v_max_f32, v_max3_f32, 0x3, "120", nullptr, true);
       add_opt(s_max_f32, v_max3_f32, 0x3, "120", nullptr, true);
@@ -4459,6 +4586,7 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       } else {
          add_opt(v_min_f32, v_med3_f32, 0x3, "012", create_med3_cb<false>, true);
       }
+
    } else if (info.opcode == aco_opcode::v_min_f32) {
       add_opt(v_min_f32, v_min3_f32, 0x3, "120", nullptr, true);
       add_opt(s_min_f32, v_min3_f32, 0x3, "120", nullptr, true);
@@ -4468,6 +4596,7 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       } else {
          add_opt(v_max_f32, v_med3_f32, 0x3, "012", create_med3_cb<true>, true);
       }
+
    } else if (info.opcode == aco_opcode::v_max_u32) {
       add_opt(v_max_u32, v_max3_u32, 0x3, "120", nullptr, true);
       add_opt(s_max_u32, v_max3_u32, 0x3, "120", nullptr, true);
@@ -4478,6 +4607,7 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          add_opt(v_min_u32, v_med3_u32, 0x3, "012", create_med3_cb<false>, true);
          add_opt(s_min_u32, v_med3_u32, 0x3, "012", create_med3_cb<false>, true);
       }
+
    } else if (info.opcode == aco_opcode::v_min_u32) {
       add_opt(v_min_u32, v_min3_u32, 0x3, "120", nullptr, true);
       add_opt(s_min_u32, v_min3_u32, 0x3, "120", nullptr, true);
@@ -4488,6 +4618,9 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          add_opt(v_max_u32, v_med3_u32, 0x3, "012", create_med3_cb<true>, true);
          add_opt(s_max_u32, v_med3_u32, 0x3, "012", create_med3_cb<true>, true);
       }
+      /* Redundant clamp elimination: v_min(a, v_max(a, b)) -> a */
+      add_opt(v_max_u32, v_mov_b32, 0x2, "0", min_max_redundant_cb, true);
+
    } else if (info.opcode == aco_opcode::v_max_i32) {
       add_opt(v_max_i32, v_max3_i32, 0x3, "120", nullptr, true);
       add_opt(s_max_i32, v_max3_i32, 0x3, "120", nullptr, true);
@@ -4498,6 +4631,7 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          add_opt(v_min_i32, v_med3_i32, 0x3, "012", create_med3_cb<false>, true);
          add_opt(s_min_i32, v_med3_i32, 0x3, "012", create_med3_cb<false>, true);
       }
+
    } else if (info.opcode == aco_opcode::v_min_i32) {
       add_opt(v_min_i32, v_min3_i32, 0x3, "120", nullptr, true);
       add_opt(s_min_i32, v_min3_i32, 0x3, "120", nullptr, true);
@@ -4508,6 +4642,9 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          add_opt(v_max_i32, v_med3_i32, 0x3, "012", create_med3_cb<true>, true);
          add_opt(s_max_i32, v_med3_i32, 0x3, "012", create_med3_cb<true>, true);
       }
+      add_opt(v_max_i32, v_mov_b32, 0x2, "0", min_max_redundant_cb, true);
+
+   /* F16/I16/U16 min/max chains - GFX9+ */
    } else if (info.opcode == aco_opcode::v_max_f16 && ctx.program->gfx_level >= GFX9) {
       add_opt(v_max_f16, v_max3_f16, 0x3, "120", nullptr, true);
       add_opt(s_max_f16, v_max3_f16, 0x3, "120", nullptr, true);
@@ -4517,6 +4654,7 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       } else {
          add_opt(v_min_f16, v_med3_f16, 0x3, "012", create_med3_cb<false>, true);
       }
+
    } else if (info.opcode == aco_opcode::v_min_f16 && ctx.program->gfx_level >= GFX9) {
       add_opt(v_min_f16, v_min3_f16, 0x3, "120", nullptr, true);
       add_opt(s_min_f16, v_min3_f16, 0x3, "120", nullptr, true);
@@ -4526,44 +4664,55 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       } else {
          add_opt(v_max_f16, v_med3_f16, 0x3, "012", create_med3_cb<true>, true);
       }
+
    } else if (info.opcode == aco_opcode::v_max_u16 && ctx.program->gfx_level >= GFX9) {
       add_opt(v_max_u16, v_max3_u16, 0x3, "120", nullptr, true);
       add_opt(v_min_u16, v_med3_u16, 0x3, "012", create_med3_cb<false>, true);
+
    } else if (info.opcode == aco_opcode::v_min_u16 && ctx.program->gfx_level >= GFX9) {
       add_opt(v_min_u16, v_min3_u16, 0x3, "120", nullptr, true);
       add_opt(v_max_u16, v_med3_u16, 0x3, "012", create_med3_cb<true>, true);
+
    } else if (info.opcode == aco_opcode::v_max_i16 && ctx.program->gfx_level >= GFX9) {
       add_opt(v_max_i16, v_max3_i16, 0x3, "120", nullptr, true);
       add_opt(v_min_i16, v_med3_i16, 0x3, "012", create_med3_cb<false>, true);
+
    } else if (info.opcode == aco_opcode::v_min_i16 && ctx.program->gfx_level >= GFX9) {
       add_opt(v_min_i16, v_min3_i16, 0x3, "120", nullptr, true);
       add_opt(v_max_i16, v_med3_i16, 0x3, "012", create_med3_cb<true>, true);
+
    } else if (info.opcode == aco_opcode::v_max_u16_e64) {
       add_opt(v_max_u16_e64, v_max3_u16, 0x3, "120", nullptr, true);
       add_opt(v_min_u16_e64, v_med3_u16, 0x3, "012", create_med3_cb<false>, true);
+
    } else if (info.opcode == aco_opcode::v_min_u16_e64) {
       add_opt(v_min_u16_e64, v_min3_u16, 0x3, "120", nullptr, true);
       add_opt(v_max_u16_e64, v_med3_u16, 0x3, "012", create_med3_cb<true>, true);
+
    } else if (info.opcode == aco_opcode::v_max_i16_e64) {
       add_opt(v_max_i16_e64, v_max3_i16, 0x3, "120", nullptr, true);
       add_opt(v_min_i16_e64, v_med3_i16, 0x3, "012", create_med3_cb<false>, true);
+
    } else if (info.opcode == aco_opcode::v_min_i16_e64) {
       add_opt(v_min_i16_e64, v_min3_i16, 0x3, "120", nullptr, true);
       add_opt(v_max_i16_e64, v_med3_i16, 0x3, "012", create_med3_cb<true>, true);
-   } else if (info.opcode == aco_opcode::v_mul_f32 || info.opcode == aco_opcode::v_mul_legacy_f32) {
-      bool legacy = info.opcode == aco_opcode::v_mul_legacy_f32;
 
-      if ((legacy ? !info.defs[0].isSZPreserve()
-                  : (!info.defs[0].isNaNPreserve() && !info.defs[0].isInfPreserve())) &&
-          !info.clamp && !info.omod && !ctx.fp_mode.must_flush_denorms32) {
-         /* v_mul_f32(a, v_cndmask_b32(0, 1.0, cond)) -> v_cndmask_b32(0, a, cond) */
+   /* =========================================================================
+    * Multiply Reassociation
+    * ========================================================================= */
+   } else if (info.opcode == aco_opcode::v_mul_f32 ||
+              info.opcode == aco_opcode::v_mul_legacy_f32) {
+      bool legacy = info.opcode == aco_opcode::v_mul_legacy_f32;
+      bool can_reassoc = legacy ? !info.defs[0].isSZPreserve()
+                                : (!info.defs[0].isNaNPreserve() &&
+                                   !info.defs[0].isInfPreserve());
+      if (can_reassoc && !info.clamp && !info.omod && !ctx.fp_mode.must_flush_denorms32) {
+         /* mul(cndmask(a, 1.0, c), b) -> cndmask(mul(a, b), b, c) */
          add_opt(v_cndmask_b32, v_cndmask_b32, 0x3, "1032",
                  and_cb<check_const_cb<0, 0>, remove_const_cb<0x3f800000>>, true);
-         /* v_mul_f32(a, v_cndmask_b32(1.0, 0, cond)) -> v_cndmask_b32(a, 0, cond) */
          add_opt(v_cndmask_b32, v_cndmask_b32, 0x3, "0231",
                  and_cb<check_const_cb<1, 0>, remove_const_cb<0x3f800000>>, true);
       }
-
       if (can_reassoc_omod(ctx, info, 32)) {
          if (legacy) {
             add_opt(v_mul_f32, v_mul_legacy_f32, 0x3, "120", reassoc_omod_cb<false>, true);
@@ -4575,29 +4724,41 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
             add_opt(s_mul_f32, v_mul_f32, 0x3, "120", reassoc_omod_cb<false>, true);
          }
       }
+
    } else if (info.opcode == aco_opcode::v_mul_f16 && can_reassoc_omod(ctx, info, 16)) {
       add_opt(v_mul_f16, v_mul_f16, 0x3, "120", reassoc_omod_cb<false>, true);
       add_opt(s_mul_f16, v_mul_f16, 0x3, "120", reassoc_omod_cb<false>, true);
+
    } else if (info.opcode == aco_opcode::v_mul_f64 && can_reassoc_omod(ctx, info, 64)) {
       add_opt(v_mul_f64, v_mul_f64, 0x3, "120", reassoc_omod_cb<false>, true);
+
    } else if (info.opcode == aco_opcode::v_mul_f64_e64 && can_reassoc_omod(ctx, info, 64)) {
       add_opt(v_mul_f64_e64, v_mul_f64_e64, 0x3, "120", reassoc_omod_cb<false>, true);
+
    } else if (info.opcode == aco_opcode::v_rcp_f32 && can_reassoc_omod(ctx, info, 32)) {
       add_opt(v_mul_f32, v_rcp_f32, 0x1, "01", reassoc_omod_cb<true>);
       add_opt(v_mul_legacy_f32, v_rcp_f32, 0x1, "01", reassoc_omod_cb<true>);
       add_opt(s_mul_f32, v_rcp_f32, 0x1, "01", reassoc_omod_cb<true>);
+
    } else if (info.opcode == aco_opcode::v_s_rcp_f32 && can_reassoc_omod(ctx, info, 32)) {
       add_opt(s_mul_f32, v_s_rcp_f32, 0x1, "01", reassoc_omod_cb<true>);
+
    } else if (info.opcode == aco_opcode::v_rcp_f16 && can_reassoc_omod(ctx, info, 16)) {
       add_opt(v_mul_f16, v_rcp_f16, 0x1, "01", reassoc_omod_cb<true>);
       add_opt(s_mul_f16, v_rcp_f16, 0x1, "01", reassoc_omod_cb<true>);
+
    } else if (info.opcode == aco_opcode::v_s_rcp_f16 && can_reassoc_omod(ctx, info, 16)) {
       add_opt(s_mul_f16, v_s_rcp_f16, 0x1, "01", reassoc_omod_cb<true>);
+
    } else if (info.opcode == aco_opcode::v_rcp_f64 && can_reassoc_omod(ctx, info, 64)) {
       if (ctx.program->gfx_level < GFX12)
          add_opt(v_mul_f64_e64, v_rcp_f64, 0x1, "01", reassoc_omod_cb<true>);
       else
          add_opt(v_mul_f64, v_rcp_f64, 0x1, "01", reassoc_omod_cb<true>);
+
+   /* =========================================================================
+    * Integer Add -> MAD Transformations
+    * ========================================================================= */
    } else if (info.opcode == aco_opcode::v_add_u16 && !info.clamp) {
       if (ctx.program->gfx_level < GFX9) {
          add_opt(v_mul_lo_u16, v_mad_legacy_u16, 0x3, "120");
@@ -4605,18 +4766,25 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          add_opt(v_mul_lo_u16, v_mad_u16, 0x3, "120");
          add_opt(v_pk_mul_lo_u16, v_mad_u16, 0x3, "120");
       }
+
    } else if (info.opcode == aco_opcode::v_add_u16_e64 && !info.clamp) {
       add_opt(v_mul_lo_u16_e64, v_mad_u16, 0x3, "120");
       add_opt(v_pk_mul_lo_u16, v_mad_u16, 0x3, "120");
+
    } else if (info.opcode == aco_opcode::v_pk_add_u16 && !info.clamp) {
       add_opt(v_pk_mul_lo_u16, v_pk_mad_u16, 0x3, "120");
       if (ctx.program->gfx_level < GFX10)
          add_opt(v_mul_lo_u16, v_pk_mad_u16, 0x3, "120");
       else
          add_opt(v_mul_lo_u16_e64, v_pk_mad_u16, 0x3, "120");
+
+   /* =========================================================================
+    * Bitwise OR Combining (GFX9+)
+    * ========================================================================= */
    } else if (info.opcode == aco_opcode::v_or_b32) {
       add_opt(v_not_b32, v_bfi_b32, 0x3, "10", insert_const_cb<2, UINT32_MAX>, true);
       add_opt(s_not_b32, v_bfi_b32, 0x3, "10", insert_const_cb<2, UINT32_MAX>, true);
+
       if (ctx.program->gfx_level >= GFX9) {
          add_opt(v_or_b32, v_or3_b32, 0x3, "012", nullptr, true);
          add_opt(s_or_b32, v_or3_b32, 0x3, "012", nullptr, true);
@@ -4625,21 +4793,27 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          add_opt(v_and_b32, v_and_or_b32, 0x3, "120", nullptr, true);
          add_opt(s_and_b32, v_and_or_b32, 0x3, "120", nullptr, true);
 
-         /* v_or(v_lshlrev(a, 32-k), v_lshrrev(b, k)) -> v_alignbit(a, b, k) (GFX9+) */
          add_opt(v_lshlrev_b32, v_alignbit_b32, 0x3, "201", funnel_shift_lshl_cb, true);
          add_opt(v_lshrrev_b32, v_alignbit_b32, 0x3, "021", funnel_shift_lshr_cb, true);
+         add_opt(s_lshl_b32, s_bitset1_b32, 0x1, "1", s_bitset_cb);
       }
+
    } else if (info.opcode == aco_opcode::v_xor_b32 && ctx.program->gfx_level >= GFX10) {
       add_opt(v_xor_b32, v_xor3_b32, 0x3, "012", nullptr, true);
       add_opt(s_xor_b32, v_xor3_b32, 0x3, "012", nullptr, true);
       add_opt(v_not_b32, v_xnor_b32, 0x3, "01", nullptr, true);
       add_opt(s_not_b32, v_xnor_b32, 0x3, "01", nullptr, true);
+
+   /* =========================================================================
+    * v_add_u32 Combining (GFX9+)
+    * ========================================================================= */
    } else if (info.opcode == aco_opcode::v_add_u32 && !info.clamp) {
       assert(ctx.program->gfx_level >= GFX9);
       add_opt(v_bcnt_u32_b32, v_bcnt_u32_b32, 0x3, "102", remove_const_cb<0>, true);
       add_opt(s_bcnt1_i32_b32, v_bcnt_u32_b32, 0x3, "10", nullptr, true);
       add_opt(v_mbcnt_lo_u32_b32, v_mbcnt_lo_u32_b32, 0x3, "102", remove_const_cb<0>, true);
-      add_opt(v_mbcnt_hi_u32_b32_e64, v_mbcnt_hi_u32_b32_e64, 0x3, "102", remove_const_cb<0>, true);
+      add_opt(v_mbcnt_hi_u32_b32_e64, v_mbcnt_hi_u32_b32_e64, 0x3, "102",
+              remove_const_cb<0>, true);
       add_opt(v_mad_u32_u16, v_mad_u32_u16, 0x3, "1203", remove_const_cb<0>, true);
       add_opt(v_mul_u32_u24, v_mad_u32_u24, 0x3, "120", nullptr, true);
       add_opt(v_mul_i32_i24, v_mad_i32_i24, 0x3, "120", nullptr, true);
@@ -4651,10 +4825,8 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       add_opt(v_lshlrev_b32, v_lshl_add_u32, 0x3, "210", nullptr, true);
       add_opt(s_lshl_b32, v_lshl_add_u32, 0x3, "120", nullptr, true);
       add_opt(s_mul_i32, v_mad_u32_u24, 0x3, "120", check_mul_u24_cb, true);
-      /* v_add_u32(a, v_cndmask_b32(0, 1, cond)) -> v_addc_co_u32(a, 0, cond) */
       add_opt(v_cndmask_b32, v_addc_co_u32, 0x3, "0132",
               and_cb<and_cb<check_const_cb<1, 0>, remove_const_cb<1>>, add_lm_def_cb>, true);
-      /* v_add_u32(a, v_cndmask_b32(1, 0, cond)) -> v_subb_co_u32(a, -1, cond) */
       add_opt(v_cndmask_b32, v_subb_co_u32, 0x3, "0321",
               and_cb<and_cb<remove_const_cb<1>, remove_const_cb<0>>,
                      and_cb<insert_const_cb<1, UINT32_MAX>, add_lm_def_cb>>,
@@ -4662,11 +4834,9 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    } else if ((info.opcode == aco_opcode::v_add_co_u32 ||
                info.opcode == aco_opcode::v_add_co_u32_e64) &&
               !info.clamp) {
-      /* v_add_co_u32(a, v_cndmask_b32(0, 1, cond)) -> v_addc_co_u32(a, 0, cond) */
       add_opt(v_cndmask_b32, v_addc_co_u32, 0x3, "0132",
               and_cb<check_const_cb<1, 0>, remove_const_cb<1>>);
       if (ctx.uses[info.defs[1].tempId()] == 0) {
-         /* v_add_co_u32(a, v_cndmask_b32(1, 0, cond)) -> v_subb_co_u32(a, -1, cond) */
          add_opt(
             v_cndmask_b32, v_subb_co_u32, 0x3, "0321",
             and_cb<and_cb<remove_const_cb<1>, remove_const_cb<0>>, insert_const_cb<1, UINT32_MAX>>);
@@ -4690,17 +4860,13 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    } else if (info.opcode == aco_opcode::v_sub_u32 && !info.clamp) {
       assert(ctx.program->gfx_level >= GFX9);
 
-      /* v_sub(max(a, b), min(a, b)) -> v_sad_u32(a, b, 0) (GFX9+) */
       add_opt(v_max_u32, v_sad_u32, 0x3, "012", sad_pattern_cb, true);
 
-      /* v_sub_u32(0, v_cndmask_b32(0, 1, cond)) -> v_cndmask_b32(0, -1, cond) */
       add_opt(v_cndmask_b32, v_cndmask_b32, 0x2, "0312",
               and_cb<and_cb<and_cb<check_const_cb<0, 0>, remove_const_cb<1>>, remove_const_cb<0>>,
                      insert_const_cb<1, UINT32_MAX>>);
-      /* v_sub_u32(a, v_cndmask_b32(0, 1, cond)) -> v_subb_co_u32(a, 0, cond) */
       add_opt(v_cndmask_b32, v_subb_co_u32, 0x2, "0132",
               and_cb<and_cb<check_const_cb<1, 0>, remove_const_cb<1>>, add_lm_def_cb>);
-      /* v_sub_u32(a, v_cndmask_b32(1, 0, cond)) -> v_addc_co_u32(a, -1, cond) */
       add_opt(v_cndmask_b32, v_addc_co_u32, 0x2, "0321",
               and_cb<and_cb<remove_const_cb<1>, remove_const_cb<0>>,
                      and_cb<insert_const_cb<1, UINT32_MAX>, add_lm_def_cb>>);
@@ -4710,21 +4876,19 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
               and_cb<shift_to_mad_cb<32>, neg_mul_to_i24_cb>);
       add_opt(v_mul_u32_u24, v_mad_i32_i24, 0x2, "120", neg_mul_to_i24_cb);
       add_opt(s_mul_i32, v_mad_i32_i24, 0x2, "120", neg_mul_to_i24_cb);
+
    } else if ((info.opcode == aco_opcode::v_sub_co_u32 ||
                info.opcode == aco_opcode::v_sub_co_u32_e64) &&
               !info.clamp) {
-      /* v_sub_co_u32(0, v_cndmask_b32(0, 1, cond)) -> v_cndmask_b32(0, -1, cond) */
       if (ctx.uses[info.defs[1].tempId()] == 0) {
          add_opt(
             v_cndmask_b32, v_cndmask_b32, 0x2, "0312",
             and_cb<and_cb<and_cb<check_const_cb<0, 0>, remove_const_cb<1>>, remove_const_cb<0>>,
                    and_cb<insert_const_cb<1, UINT32_MAX>, pop_def_cb>>);
       }
-      /* v_sub_co_u32(a, v_cndmask_b32(0, 1, cond)) -> v_subb_co_u32(a, 0, cond) */
       add_opt(v_cndmask_b32, v_subb_co_u32, 0x2, "0132",
               and_cb<check_const_cb<1, 0>, remove_const_cb<1>>);
       if (ctx.uses[info.defs[1].tempId()] == 0) {
-         /* v_sub_co_u32(a, v_cndmask_b32(1, 0, cond)) -> v_addc_co_u32(a, -1, cond) */
          add_opt(
             v_cndmask_b32, v_addc_co_u32, 0x2, "0321",
             and_cb<and_cb<remove_const_cb<1>, remove_const_cb<0>>, insert_const_cb<1, UINT32_MAX>>);
@@ -4735,8 +4899,6 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          add_opt(v_mul_u32_u24, v_mad_i32_i24, 0x2, "120", and_cb<neg_mul_to_i24_cb, pop_def_cb>);
          add_opt(s_mul_i32, v_mad_i32_i24, 0x2, "120", and_cb<neg_mul_to_i24_cb, pop_def_cb>);
 
-         /* v_sub_co(max(a, b), min(a, b)) -> v_sad_u32(a, b, 0) (GFX9+)
-          * Only if VCC output is dead. */
          if (ctx.program->gfx_level >= GFX9)
              add_opt(v_max_u32, v_sad_u32, 0x3, "012",
                      and_cb<sad_pattern_cb, pop_def_cb>, true);
@@ -4757,29 +4919,32 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       add_opt(s_not_b32, v_bfi_b32, 0x3, "10", insert_const_cb<1, 0>, true);
    } else if (info.opcode == aco_opcode::s_and_b32) {
       add_opt(s_not_b32, s_andn2_b32, 0x3, "01");
+      if (ctx.program->gfx_level >= GFX9)
+         add_opt(s_lshl_b32, s_bitcmp1_b32, 0x3, "120", s_bitcmp1_cb, true);
    } else if (info.opcode == aco_opcode::s_andn2_b32) {
-      /* s_andn2(a, s_lshl(1, b)) -> s_bitset0_b32(a, b) (GFX9+)
-       * Valid only if SCC is unused, as s_bitset0 preserves SCC. */
       if (ctx.program->gfx_level >= GFX9)
          add_opt(s_lshl_b32, s_bitset0_b32, 0x3, "120", s_bitset_cb, true);
    } else if (info.opcode == aco_opcode::s_and_b64) {
       add_opt(s_not_b64, s_andn2_b64, 0x3, "01");
    } else if (info.opcode == aco_opcode::s_or_b32) {
       add_opt(s_not_b32, s_orn2_b32, 0x3, "01");
-
-      /* s_or(a, s_lshl(1, b)) -> s_bitset1_b32(a, b) (GFX9+)
-       * Valid only if SCC is unused, as s_bitset1 preserves SCC. */
       if (ctx.program->gfx_level >= GFX9)
          add_opt(s_lshl_b32, s_bitset1_b32, 0x3, "120", s_bitset_cb, true);
-
    } else if (info.opcode == aco_opcode::s_or_b64) {
       add_opt(s_not_b64, s_orn2_b64, 0x3, "01");
    } else if (info.opcode == aco_opcode::s_xor_b32) {
       add_opt(s_not_b32, s_xnor_b32, 0x3, "01");
    } else if (info.opcode == aco_opcode::s_xor_b64) {
       add_opt(s_not_b64, s_xnor_b64, 0x3, "01");
+   } else if (info.opcode == aco_opcode::s_min_u32) {
+      add_opt(s_max_u32, s_mov_b32, 0x2, "001", scalar_min_max_redundant_cb, true);
+   } else if (info.opcode == aco_opcode::s_min_i32) {
+      add_opt(s_max_i32, s_mov_b32, 0x2, "001", scalar_min_max_redundant_cb, true);
    } else if ((info.opcode == aco_opcode::s_sub_u32 || info.opcode == aco_opcode::s_sub_i32) &&
               !ctx.uses[info.defs[1].tempId()]) {
+      if (ctx.program->gfx_level >= GFX9 && info.opcode == aco_opcode::s_sub_i32)
+         add_opt(s_max_i32, s_absdiff_i32, 0x3, "012", scalar_sad_pattern_cb, true);
+
       add_opt(s_bcnt1_i32_b32, s_bcnt0_i32_b32, 0x2, "10", remove_const_cb<32>);
       add_opt(s_bcnt1_i32_b64, s_bcnt0_i32_b64, 0x2, "10", remove_const_cb<64>);
    } else if (info.opcode == aco_opcode::s_bcnt1_i32_b32) {
