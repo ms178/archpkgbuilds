@@ -15,21 +15,20 @@
 #include <scx/bpf_arena_common.bpf.h>
 #include "intf.h"
 #include "lavd.bpf.h"
+#include "util.bpf.h"
 #include <errno.h>
 #include <stdbool.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <lib/cgroup.h>
-#include <lib/sdt_task.h>
-#include <lib/atq.h>
 
 char _license[] SEC("license") = "GPL";
 
 /*
  * Logical current clock
  */
-static u64 cur_logical_clk = LAVD_DL_COMPETE_WINDOW;
+u64 cur_logical_clk = LAVD_DL_COMPETE_WINDOW;
 
 /*
  * Current service time
@@ -58,14 +57,6 @@ static volatile u64 nr_cpus_big;
  * Scheduler's PID
  */
 static pid_t lavd_pid;
-
-/*
- * Include sub-modules
- */
-#include "util.bpf.c"
-#include "idle.bpf.c"
-#include "balance.bpf.c"
-#include "lat_cri.bpf.c"
 
 /*
  * Asymmetric smoothing shifts for runtime estimation.
@@ -120,42 +111,6 @@ static __always_inline void prefetch_cpu_hot(struct cpu_ctx *cpuc)
 {
 	if (cpuc)
 		__builtin_prefetch(cpuc, 0, 3);
-}
-
-/*
- * Consume a task from DSQs. Marked noinline to reduce code bloat
- * in the dispatch hot path.
- */
-static __attribute__((noinline)) bool consume_task(u64 cpu_dsq, u64 cpdom_dsq)
-{
-	if (use_per_cpu_dsq()) {
-		if (scx_bpf_dsq_move_to_local(cpu_dsq))
-			return true;
-	}
-
-	if (use_cpdom_dsq()) {
-		if (scx_bpf_dsq_move_to_local(cpdom_dsq))
-			return true;
-	}
-
-	if (nr_cpdoms > 1) {
-		struct cpdom_ctx *cpdomc;
-		u64 cpdom_id = dsq_to_cpdom(cpdom_dsq);
-
-		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
-		if (cpdomc) {
-			if (READ_ONCE(cpdomc->is_stealer)) {
-				if (try_to_steal_task(cpdomc))
-					return true;
-			}
-			if (mig_delta_pct == 0) {
-				if (force_to_steal_task(cpdomc))
-					return true;
-			}
-		}
-	}
-
-	return false;
 }
 
 static void advance_cur_logical_clk(struct task_struct *p)
@@ -217,8 +172,10 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 	if (likely(avg_runtime < base_slice)) {
 		if (have_turbo_core && cpuc->big_core &&
 		    taskc->perf_cri > READ_ONCE(sys_stat.avg_perf_cri)) {
+			u64 max_slice = READ_ONCE(slice_max_ns);
+
 			slice = base_slice + (base_slice >> 2);
-			slice = min(slice, (u64)LAVD_SLICE_MAX_NS_DFL);
+			slice = min(slice, max_slice);
 			taskc->slice = slice;
 			set_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
 			return slice;
@@ -921,7 +878,6 @@ consume_prev:
 				reset_lock_futex_boost(taskc_prev, cpuc);
 
 			cpuc->flags = taskc_prev->flags;
-			scx_bpf_dsq_insert(prev, SCX_DSQ_LOCAL, prev->scx.slice, 0);
 		}
 	}
 }
