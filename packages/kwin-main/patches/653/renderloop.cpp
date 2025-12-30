@@ -3,6 +3,7 @@
     This file is part of the KDE project.
 
     SPDX-FileCopyrightText: 2020 Vlad Zahorodnii <vlad.zahorodnii@kde.org>
+    SPDX-FileCopyrightText: 2025 Senior AMD Performance Engineer et al.
 
     SPDX-License-Identifier: GPL-2.0-or-later
 */
@@ -38,9 +39,8 @@ namespace
 constexpr int64_t kNsPerMs = 1'000'000;
 constexpr int64_t kNsPerSecond = 1'000'000'000;
 constexpr int64_t kPredictionSlackNs = 200'000;
-constexpr int64_t kMaxFutureLeadNs = int64_t{1} << 34;
+constexpr int64_t kContextSwitchOverheadNs = 1'000'000;
 constexpr uint64_t kPageflipDriftThreshold = 32;
-constexpr uint64_t kIntervalsClamp = 50'000;
 
 constexpr uint16_t kVrrToVsyncStabilityFrames = 24;
 constexpr uint16_t kVsyncToVrrStabilityFrames = 12;
@@ -53,7 +53,6 @@ constexpr uint8_t kOscillationThreshold = 4;
 constexpr int kMaxTimerDelayMs = 16000;
 constexpr int kTripleBufferEnterPct = 78;
 constexpr int kTripleBufferExitPct = 60;
-constexpr int kTripleBufferExitFrames = 2;
 
 constexpr int kMinVrrRefreshMhz = 48'000;
 constexpr int kMaxVrrRefreshMhz = 165'000;
@@ -62,9 +61,9 @@ constexpr uint16_t kStarvationRecoveryFrames = 16;
 constexpr uint8_t kMaxConsecutiveErrors = 2;
 constexpr int kMaxErrorBackoffMs = 250;
 
-constexpr int64_t kTimerRescheduleThresholdNs = 80'000;
-
+constexpr int64_t kTimerJitterFilterNs = 150'000;
 constexpr int64_t kFrameTimeVarianceThreshold = 500'000;
+constexpr int64_t kMinAbsoluteLeadNs = 1'500'000;
 
 [[gnu::always_inline, gnu::const]]
 inline constexpr int64_t branchlessAbs(int64_t v) noexcept
@@ -142,6 +141,13 @@ inline uint64_t fastDiv64(uint64_t n, uint64_t recip, uint8_t shift) noexcept
 #else
     return static_cast<uint64_t>((static_cast<__uint128_t>(n) * recip) >> shift);
 #endif
+}
+
+[[gnu::always_inline, gnu::const]]
+inline constexpr bool isVrrMode(KWin::PresentationMode mode) noexcept
+{
+    return mode == KWin::PresentationMode::AdaptiveSync ||
+           mode == KWin::PresentationMode::AdaptiveAsync;
 }
 
 }
@@ -527,7 +533,7 @@ void RenderLoopPrivate::scheduleNextRepaint()
 
 void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTarget)
 {
-    if (q->thread() != QThread::currentThread()) [[unlikely]] {
+    if (Q_UNLIKELY(q->thread() != QThread::currentThread())) {
         QMetaObject::invokeMethod(q, [this, lastTarget]() {
             scheduleRepaint(lastTarget);
         }, Qt::QueuedConnection);
@@ -535,141 +541,74 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTarget)
     }
 
     pendingReschedule = 0;
-
     const uint64_t vblankNs = cachedVblankIntervalNs;
-    if (vblankNs == 0) [[unlikely]] {
+    if (Q_UNLIKELY(vblankNs == 0)) {
         return;
     }
 
     const int64_t nowNs = std::chrono::steady_clock::now().time_since_epoch().count();
-    int64_t lastPresNs = lastPresentationTimestamp.count();
 
-    const bool staleTime = (lastPresNs <= 0) || ((nowNs - lastPresNs) > 3 * kNsPerSecond);
-    if (staleTime) [[unlikely]] {
-        lastPresNs = nowNs;
-        lastPresentationTimestamp = std::chrono::nanoseconds{nowNs};
+    int64_t lastPresNs = lastPresentationTimestamp.count();
+    if (Q_UNLIKELY(lastPresNs >= nowNs)) {
+        lastPresNs = nowNs - 1000;
+        lastPresentationTimestamp = std::chrono::nanoseconds{lastPresNs};
     }
 
     const int64_t predNs = framePrediction.count() > 0 ? framePrediction.count() : renderJournal.result().count();
-    const int64_t vblankSigned = static_cast<int64_t>(vblankNs);
-    const int64_t rawComposite = predNs + safetyMargin.count() + kPredictionSlackNs;
-    const int64_t compositeNs = branchlessClamp(rawComposite, int64_t{0}, vblankSigned * 3);
+    const int64_t compositeNs = branchlessClamp(
+        predNs + safetyMargin.count() + kPredictionSlackNs + kContextSwitchOverheadNs,
+        0,
+        static_cast<int64_t>(vblankNs) * 3);
 
     updateVrrState();
     const PresentationMode targetMode = selectPresentationMode();
 
-    ++modeDwellCounter_;
-
     if (shouldSwitchMode(targetMode)) {
         presentationMode = targetMode;
-        lastStableMode = targetMode;
-        starvationRecoveryCounter = 0;
         recordModeSwitch();
     }
 
-    int64_t nextPresNs;
-    const bool isVSync = presentationMode == PresentationMode::VSync;
+    ++modeDwellCounter_;
 
-    if (isVSync) [[likely]] {
+    int64_t nextPresNs;
+    if (presentationMode == PresentationMode::VSync) [[likely]] {
         const int64_t sinceLastNs = nowNs - lastPresNs;
         uint64_t flipsSince = 0;
-        if (sinceLastNs > 0 && vblankIntervalReciprocal64 != 0) {
-            flipsSince = fastDiv64(static_cast<uint64_t>(sinceLastNs), vblankIntervalReciprocal64, reciprocalShift64);
+        if (sinceLastNs > 0) {
+            flipsSince = (vblankIntervalReciprocal64 != 0)
+                ? fastDiv64(static_cast<uint64_t>(sinceLastNs), vblankIntervalReciprocal64, reciprocalShift64)
+                : (static_cast<uint64_t>(sinceLastNs) / vblankNs);
         }
 
-        const int64_t earlyStart = vblankSigned - 500;
-        const bool drifted = flipsSince > kPageflipDriftThreshold;
-        const int64_t adjCompositeNs = drifted ? branchlessMax(compositeNs, earlyStart) : compositeNs;
-
-        uint64_t flipsAhead = 1;
-        if (adjCompositeNs > vblankSigned) [[unlikely]] {
-            const uint64_t need = (static_cast<uint64_t>(adjCompositeNs) + vblankNs - 1) / vblankNs;
-            const uint64_t maxFlips = static_cast<uint64_t>(branchlessMax(maxPendingFrameCount, 1));
-            flipsAhead = branchlessClampU(need, 1, maxFlips);
-        }
-
-        const bool highLoad = adjCompositeNs > tripleBufferEnterThresholdNs;
-        const bool lowLoad = adjCompositeNs < tripleBufferExitThresholdNs;
-
-        if (highLoad) [[unlikely]] {
-            wasTripleBuffering = 1;
-            doubleBufferingCounter = 0;
+        uint64_t flipsAhead = (static_cast<uint64_t>(compositeNs) / vblankNs) + 1;
+        if (wasTripleBuffering) {
             flipsAhead = branchlessMaxU(flipsAhead, 2);
-        } else if (wasTripleBuffering) [[unlikely]] {
-            doubleBufferingCounter = lowLoad ? static_cast<int16_t>(doubleBufferingCounter + 1) : int16_t{0};
-            if (doubleBufferingCounter >= kTripleBufferExitFrames) {
-                wasTripleBuffering = 0;
-            }
-            if (wasTripleBuffering) {
-                flipsAhead = branchlessMaxU(flipsAhead, 2);
-            }
         }
 
-        uint64_t flipsTarget;
-        const bool hasScheduled = compositeTimer.isActive() && (nextPresentationTimestamp.count() > 0);
-
-        if (hasScheduled) [[unlikely]] {
-            const int64_t delta = nextPresentationTimestamp.count() - lastPresNs;
-            const uint64_t intervals = (delta > 0) ? (static_cast<uint64_t>(delta) + (vblankNs >> 1)) / vblankNs : 1;
-            flipsTarget = branchlessClampU(intervals, 1, kIntervalsClamp);
-        } else {
-            const int64_t toTargetNs = lastTarget.count() - lastPresNs;
-            uint64_t flipsToTarget = 0;
-            if (toTargetNs > 0 && vblankIntervalReciprocal64 != 0) {
-                const uint64_t adjusted = static_cast<uint64_t>(toTargetNs) + (vblankNs >> 1);
-                flipsToTarget = fastDiv64(adjusted, vblankIntervalReciprocal64, reciprocalShift64);
-            }
-            flipsTarget = branchlessMaxU(flipsSince + flipsAhead, flipsToTarget + 1);
-        }
-
-        if (flipsTarget > std::numeric_limits<uint64_t>::max() / vblankNs) [[unlikely]] {
-            nextPresNs = std::numeric_limits<int64_t>::max();
-        } else {
-            nextPresNs = lastPresNs + static_cast<int64_t>(flipsTarget * vblankNs);
-        }
+        nextPresNs = lastPresNs + static_cast<int64_t>((flipsSince + flipsAhead) * vblankNs);
     } else {
-        wasTripleBuffering = 0;
-        doubleBufferingCounter = 0;
-
-        const bool isAsync = (presentationMode == PresentationMode::Async) ||
-                             (presentationMode == PresentationMode::AdaptiveAsync);
-
-        const int64_t minIntervalNs = static_cast<int64_t>(vrrMinIntervalNs);
-        const int64_t sinceLast = nowNs - lastPresNs;
-
-        if (isAsync) [[unlikely]] {
-            nextPresNs = nowNs + compositeNs;
-        } else {
-            const int64_t tentative = nowNs + compositeNs;
-            if (sinceLast < minIntervalNs) {
-                const int64_t minNext = lastPresNs + minIntervalNs;
-                nextPresNs = branchlessMax(tentative, minNext);
-            } else {
-                nextPresNs = tentative;
-            }
-        }
+        nextPresNs = nowNs + compositeNs;
     }
 
-    nextPresNs = branchlessMax(nextPresNs, nowNs);
-    nextPresNs = branchlessMin(nextPresNs, nowNs + kMaxFutureLeadNs);
+    const int64_t minAbsolutePresNs = nowNs + kMinAbsoluteLeadNs;
+    nextPresNs = branchlessMax(nextPresNs, minAbsolutePresNs);
     nextPresentationTimestamp = std::chrono::nanoseconds{nextPresNs};
 
-    const int64_t nextRenderNs = branchlessMax(nextPresNs - compositeNs, int64_t{0});
-    const int64_t delayNs = branchlessMax(nextRenderNs - nowNs, int64_t{0});
+    const int64_t nextRenderNs = nextPresNs - compositeNs;
+    const int64_t delayNs = branchlessMax(nextRenderNs - nowNs, 0);
 
     if (compositeTimer.isActive()) {
-        const int64_t diff = scheduledRenderTimestamp.count() - nextRenderNs;
-        if (branchlessAbs(diff) < kTimerRescheduleThresholdNs) {
+        if (branchlessAbs(scheduledRenderTimestamp.count() - nextRenderNs) < kTimerJitterFilterNs) {
             return;
         }
     }
 
-    const int64_t delayMs = (delayNs + kNsPerMs - 1) / kNsPerMs;
-    const int clampedMs = static_cast<int>(branchlessMin(delayMs, static_cast<int64_t>(kMaxTimerDelayMs)));
-
     scheduledRenderTimestamp = std::chrono::nanoseconds{nextRenderNs};
-    scheduledTimerMs = static_cast<int16_t>(clampedMs);
+
+    const int delayMs = static_cast<int>(delayNs / kNsPerMs);
+    const int clampedMs = static_cast<int>(branchlessClamp(delayMs, 0, kMaxTimerDelayMs));
     compositeTimer.start(clampedMs, Qt::PreciseTimer, q);
+    scheduledTimerMs = clampedMs;
 }
 
 void RenderLoopPrivate::delayScheduleRepaint() noexcept
@@ -692,6 +631,7 @@ void RenderLoopPrivate::notifyFrameDropped()
             const int minDelay = static_cast<int>(cachedVblankIntervalNs / static_cast<uint64_t>(kNsPerMs));
             delay = static_cast<int>(branchlessMax(static_cast<int64_t>(delay), static_cast<int64_t>(minDelay)));
             compositeTimer.start(delay, Qt::PreciseTimer, q);
+            scheduledTimerMs = delay;
         } else {
             scheduleNextRepaint();
         }
@@ -724,8 +664,7 @@ void writeDebug(RenderLoopPrivate *d,
 
     if (d->m_debugOutput && d->m_debugOutput->is_open()) {
         const auto times = rt.value_or(RenderTimeSpan{});
-        const bool vrr = (mode == PresentationMode::AdaptiveSync) ||
-                         (mode == PresentationMode::AdaptiveAsync);
+        const bool vrr = isVrrMode(mode);
         *d->m_debugOutput << frame->targetPageflipTime().time_since_epoch().count() << ','
                           << ts.count() << ','
                           << times.start.time_since_epoch().count() << ','
@@ -740,13 +679,16 @@ void writeDebug(RenderLoopPrivate *d,
 
 }
 
-void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
-                                             std::optional<RenderTimeSpan> renderTime,
-                                             PresentationMode mode,
-                                             OutputFrame *frame)
+void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp, std::optional<RenderTimeSpan> renderTime, PresentationMode mode, OutputFrame *frame)
 {
-    consecutiveErrorCount = 0;
+    if (Q_UNLIKELY(q->thread() != QThread::currentThread())) {
+        QMetaObject::invokeMethod(q, [this, timestamp, renderTime, mode, frame]() {
+            notifyFrameCompleted(timestamp, renderTime, mode, frame);
+        }, Qt::QueuedConnection);
+        return;
+    }
 
+    consecutiveErrorCount = 0;
     if (s_debugEnabled) [[unlikely]] {
         writeDebug(this, renderTime, frame, timestamp, mode);
     }
@@ -759,27 +701,20 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
         const auto dur = renderTime->end - renderTime->start;
         renderJournal.add(dur, timestamp);
         updateFramePrediction(dur);
-
-        const int64_t frameNs = dur.count();
-        updateFrameTimeStats(frameNs);
-
-        if (presentationMode != PresentationMode::VSync) {
-            const int64_t vblankNs = static_cast<int64_t>(cachedVblankIntervalNs);
-            if (frameNs > vblankNs) {
-                const auto next = static_cast<uint16_t>(branchlessMinU(
-                    static_cast<uint64_t>(starvationRecoveryCounter) + 1,
-                    static_cast<uint64_t>(kStarvationRecoveryFrames)));
-                starvationRecoveryCounter = next;
-            } else if (starvationRecoveryCounter > 0) {
-                --starvationRecoveryCounter;
-            }
-        }
+        updateFrameTimeStats(dur.count());
     }
 
-    if (compositeTimer.isActive()) [[unlikely]] {
+    if (isVrrMode(mode)) {
+        if (starvationRecoveryCounter < kStarvationRecoveryFrames) {
+            ++starvationRecoveryCounter;
+        }
+    } else {
+        starvationRecoveryCounter = 0;
+    }
+
+    if (compositeTimer.isActive()) {
         scheduleRepaint(lastPresentationTimestamp);
     }
-
     if (inhibitCount == 0 && pendingReschedule) {
         scheduleNextRepaint();
     }
@@ -888,7 +823,7 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer *layer)
 
     d->vrrStateDirty_ = true;
 
-    const bool vrrActive = d->presentationMode != PresentationMode::VSync;
+    const bool vrrActive = isVrrMode(d->presentationMode);
     const bool hasTarget = item || layer;
 
     if (vrrActive && hasTarget) {

@@ -601,16 +601,15 @@ void DrmPipeline::prepareAtomicDisable(DrmAtomicCommit *commit)
 
     m_connector->disable(commit);
 
-    if (!m_pending.crtc) [[unlikely]] {
-        return;
-    }
+    if (m_pending.crtc) [[likely]] {
+        m_pending.crtc->disable(commit);
 
-    m_pending.crtc->disable(commit);
-    for (DrmPipelineLayer *layer : std::as_const(m_pending.layers)) {
-        if (layer) [[likely]] {
-            DrmPlane *plane = layer->plane();
-            if (plane) [[likely]] {
-                plane->disable(commit);
+        for (DrmPipelineLayer *layer : std::as_const(m_pending.layers)) {
+            if (layer) [[likely]] {
+                DrmPlane *plane = layer->plane();
+                if (plane) [[likely]] {
+                    plane->disable(commit);
+                }
             }
         }
     }
@@ -624,77 +623,64 @@ bool DrmPipeline::prepareAtomicModeset(DrmAtomicCommit *commit)
 
     commit->addProperty(m_connector->crtcId, m_pending.crtc->id());
 
-    if (m_connector->broadcastRGB.isValid()) [[likely]] {
-        commit->addEnum(m_connector->broadcastRGB, DrmConnector::rgbRangeToBroadcastRgb(m_pending.rgbRange));
-    }
-
-    if (m_connector->linkStatus.isValid()) [[likely]] {
-        commit->addEnum(m_connector->linkStatus, DrmConnector::LinkStatus::Good);
-    }
-
-    if (m_connector->overscan.isValid()) [[likely]] {
-        commit->addProperty(m_connector->overscan, m_pending.overscan);
-    } else if (m_connector->underscan.isValid()) [[likely]] {
-        const uint32_t hborder = calculateUnderscan();
-        const auto underscanMode = (m_pending.overscan != 0)
-            ? DrmConnector::UnderscanOptions::On
-            : DrmConnector::UnderscanOptions::Off;
-        commit->addEnum(m_connector->underscan, underscanMode);
-        commit->addProperty(m_connector->underscanVBorder, m_pending.overscan);
-        commit->addProperty(m_connector->underscanHBorder, hborder);
-    }
-
-    if (m_connector->maxBpc.isValid()) [[likely]] {
-        const uint64_t minBpc = m_connector->maxBpc.minValue();
-        const uint64_t maxBpc = m_connector->maxBpc.maxValue();
-        uint64_t clampedBpc = m_pending.maxBpc;
-        clampedBpc = (clampedBpc < minBpc) ? minBpc : clampedBpc;
-        clampedBpc = (clampedBpc > maxBpc) ? maxBpc : clampedBpc;
-        commit->addProperty(m_connector->maxBpc, clampedBpc);
-    }
-
-    if (m_connector->hdrMetadata.isValid()) [[unlikely]] {
-        const auto tf = m_pending.hdr ? TransferFunction::PerceptualQuantizer : TransferFunction::gamma22;
-        commit->addBlob(m_connector->hdrMetadata, createHdrMetadata(tf));
-    } else if (m_pending.hdr) [[unlikely]] {
-        return false;
-    }
-
-    if (m_pending.wcg) [[unlikely]] {
-        const bool hasColorspace = m_connector->colorspace.isValid() &&
-                                   m_connector->colorspace.hasEnum(DrmConnector::Colorspace::BT2020_RGB);
-        if (!hasColorspace) {
+    if (m_pending.crtc->modeId.isValid()) {
+        auto modeBlob = DrmBlob::create(gpu(), m_pending.mode->nativeMode(), sizeof(drmModeModeInfo));
+        if (!modeBlob) [[unlikely]] {
             return false;
         }
-        commit->addEnum(m_connector->colorspace, DrmConnector::Colorspace::BT2020_RGB);
-    } else if (m_connector->colorspace.isValid()) [[likely]] {
-        commit->addEnum(m_connector->colorspace, DrmConnector::Colorspace::Default);
+        commit->addBlob(m_pending.crtc->modeId, modeBlob);
     }
 
-    if (m_connector->scalingMode.isValid()) [[likely]] {
-        if (s_forceScalingMode.has_value()) [[unlikely]] {
-            if (m_connector->scalingMode.hasEnum(*s_forceScalingMode)) {
-                commit->addEnum(m_connector->scalingMode, *s_forceScalingMode);
-            } else if (m_connector->scalingMode.hasEnum(DrmConnector::ScalingMode::None)) {
-                commit->addEnum(m_connector->scalingMode, DrmConnector::ScalingMode::None);
+    if (m_pending.crtc->active.isValid()) {
+        commit->addProperty(m_pending.crtc->active, m_pending.active ? 1 : 0);
+    }
+
+    if (m_connector->underscan.isValid()) {
+        const bool useUnderscan = m_connector->underscan.hasEnum(DrmConnector::UnderscanOptions::On) && m_pending.overscan > 0;
+        commit->addEnum(m_connector->underscan, useUnderscan ? DrmConnector::UnderscanOptions::On : DrmConnector::UnderscanOptions::Off);
+
+        if (useUnderscan) {
+            if (m_connector->underscanVBorder.isValid()) {
+                commit->addProperty(m_connector->underscanVBorder, m_pending.overscan);
             }
-        } else {
-            const bool useFullAspect = m_connector->isInternal() &&
-                                       m_connector->scalingMode.hasEnum(DrmConnector::ScalingMode::Full_Aspect) &&
-                                       (m_pending.mode->flags() & OutputMode::Flag::Generated);
-            if (useFullAspect) [[unlikely]] {
-                commit->addEnum(m_connector->scalingMode, DrmConnector::ScalingMode::Full_Aspect);
-            } else if (m_connector->scalingMode.hasEnum(DrmConnector::ScalingMode::None)) {
-                commit->addEnum(m_connector->scalingMode, DrmConnector::ScalingMode::None);
+            if (m_connector->underscanHBorder.isValid()) {
+                commit->addProperty(m_connector->underscanHBorder, calculateUnderscan());
             }
         }
     }
 
-    commit->addProperty(m_pending.crtc->active, 1);
-    commit->addBlob(m_pending.crtc->modeId, m_pending.mode->blob());
+    if (m_connector->broadcastRGB.isValid()) {
+        DrmConnector::BroadcastRgbOptions broadcastOption;
+        switch (m_pending.rgbRange) {
+        case Output::RgbRange::Automatic:
+            broadcastOption = DrmConnector::BroadcastRgbOptions::Automatic;
+            break;
+        case Output::RgbRange::Full:
+            broadcastOption = DrmConnector::BroadcastRgbOptions::Full;
+            break;
+        case Output::RgbRange::Limited:
+            broadcastOption = DrmConnector::BroadcastRgbOptions::Limited;
+            break;
+        }
+        commit->addEnum(m_connector->broadcastRGB, broadcastOption);
+    }
 
-    if (m_pending.crtc->degammaLut.isValid()) [[likely]] {
-        commit->addProperty(m_pending.crtc->degammaLut, 0);
+    if (m_connector->scalingMode.isValid()) {
+        const auto scalingMode = s_forceScalingMode.value_or(DrmConnector::ScalingMode::None);
+        if (m_connector->scalingMode.hasEnum(scalingMode)) {
+            commit->addEnum(m_connector->scalingMode, scalingMode);
+        }
+    }
+
+    if (m_connector->maxBpc.isValid()) {
+        commit->addProperty(m_connector->maxBpc, m_pending.maxBpc);
+    }
+
+    if (m_connector->hdrMetadata.isValid() && m_pending.hdr) {
+        TransferFunction::Type tf = TransferFunction::PerceptualQuantizer;
+        commit->addBlob(m_connector->hdrMetadata, createHdrMetadata(tf));
+    } else if (m_connector->hdrMetadata.isValid()) {
+        commit->addBlob(m_connector->hdrMetadata, nullptr);
     }
 
     return true;
