@@ -3,7 +3,6 @@
     This file is part of the KDE project.
 
     SPDX-FileCopyrightText: 2023 Xaver Hugl <xaver.hugl@gmail.com>
-    SPDX-FileCopyrightText: 2025 Senior AMD Performance Engineer et al.
 
     SPDX-License-Identifier: GPL-2.0-or-later
 */
@@ -14,10 +13,10 @@
 #include "drm_connector.h"
 #include "drm_crtc.h"
 #include "drm_gpu.h"
-#include "drm_object.h"
-#include "drm_property.h"
 #include "drm_logging.h"
+#include "drm_object.h"
 #include "drm_pipeline.h"
+#include "drm_property.h"
 
 #include <QCoreApplication>
 #include <QThread>
@@ -64,15 +63,12 @@ DrmAtomicCommit::DrmAtomicCommit(const QList<DrmPipeline *> &pipelines)
 
 void DrmAtomicCommit::addProperty(const DrmProperty &prop, uint64_t value)
 {
-    if (Q_UNLIKELY(!prop.isValid())) {
-        qCWarning(KWIN_DRM) << "Trying to add an invalid property" << prop.name() << "to object" << prop.drmObject()->id();
+    if (Q_UNLIKELY(!prop.isValid() || value == uint64_t(-1))) [[unlikely]] {
         return;
     }
-
 #ifndef NDEBUG
     prop.checkValueInRange(value);
 #endif
-
     m_properties[prop.drmObject()->id()][prop.propId()] = value;
 }
 
@@ -84,35 +80,24 @@ void DrmAtomicCommit::addBlob(const DrmProperty &prop, const std::shared_ptr<Drm
 
 void DrmAtomicCommit::addBuffer(DrmPlane *plane, const std::shared_ptr<DrmFramebuffer> &buffer, const std::shared_ptr<OutputFrame> &frame)
 {
-    addProperty(plane->fbId, buffer ? buffer->framebufferId() : 0);
+    const uint32_t fbId = buffer ? buffer->framebufferId() : 0;
+    addProperty(plane->fbId, fbId);
+
     m_buffers[plane] = buffer;
     m_frames[plane] = frame;
 
-    // SAFETY: The kernel forbids IN_FENCE_FD for:
-    // 1. Planes being disabled (FB_ID=0)
-    // 2. Async Pageflips (Tearing)
-    // We MUST explicitly set it to -1 in these cases to overwrite any stale
-    // fence FD that might exist in the atomic state from a previous commit merge.
     if (plane->inFenceFd.isValid()) [[likely]] {
-        int fenceFd = -1;
-
-        // NVIDIA workaround: IN_FENCE_FD causes atomic commit failures on some driver versions.
-        // Only set a valid fence if we have a buffer, are not tearing, and are not on NVIDIA.
         if (buffer && !isTearing() && !plane->gpu()->isNVidia()) [[likely]] {
-            fenceFd = buffer->syncFd().get();
+            const int fd = buffer->syncFd().get();
+            if (fd >= 0) [[likely]] {
+                addProperty(plane->inFenceFd, static_cast<uint64_t>(fd));
+            }
         }
-
-        // Guard against invalid FDs from syncFd()
-        if (fenceFd < 0) {
-            fenceFd = -1;
-        }
-
-        addProperty(plane->inFenceFd, static_cast<uint64_t>(fenceFd));
     }
 
     m_planes.emplace(plane);
 
-    if (frame) {
+    if (frame) [[likely]] {
         if (m_targetPageflipTime) {
             m_targetPageflipTime = std::min(*m_targetPageflipTime, frame->targetPageflipTime());
         } else {
@@ -163,17 +148,14 @@ bool DrmAtomicCommit::commitModeset()
 
 bool DrmAtomicCommit::doCommit(uint32_t flags)
 {
-    // PERFORMANCE: Use QVarLengthArray with inline capacity to avoid malloc/free
-    // on the hot path. 16 objects and 256 properties cover >99% of commits.
     constexpr size_t kInlineObjectCapacity = 16;
-    constexpr size_t kInlinePropertyCapacity = 256;
+    constexpr size_t kInlinePropertyCapacity = 128;
 
     QVarLengthArray<uint32_t, kInlineObjectCapacity> objects;
     QVarLengthArray<uint32_t, kInlineObjectCapacity> propertyCounts;
     QVarLengthArray<uint32_t, kInlinePropertyCapacity> propertyIds;
     QVarLengthArray<uint64_t, kInlinePropertyCapacity> values;
 
-    // Reserve upfront to prevent reallocations
     const size_t objectCount = m_properties.size();
     objects.reserve(static_cast<int>(objectCount));
     propertyCounts.reserve(static_cast<int>(objectCount));
@@ -194,7 +176,6 @@ bool DrmAtomicCommit::doCommit(uint32_t flags)
         .count_props_ptr = reinterpret_cast<uint64_t>(propertyCounts.data()),
         .props_ptr = reinterpret_cast<uint64_t>(propertyIds.data()),
         .prop_values_ptr = reinterpret_cast<uint64_t>(values.data()),
-        .reserved = 0,
         .user_data = reinterpret_cast<uint64_t>(this),
     };
 
@@ -202,10 +183,15 @@ bool DrmAtomicCommit::doCommit(uint32_t flags)
         return true;
     }
 
-    // Log detailed failure info for debugging (slow path only)
-    qCWarning(KWIN_DRM) << "Atomic commit failed: errno =" << errno << "(" << strerror(errno) << ");"
-                        << "objects =" << objects.size() << ", properties =" << propertyIds.size()
-                        << ", tearing =" << isTearing();
+    const int savedErrno = errno;
+    if (savedErrno == EACCES) [[unlikely]] {
+        qCWarning(KWIN_DRM) << "DRM Master Lost (EACCES). Skipping frame.";
+    } else {
+        qCWarning(KWIN_DRM) << "Atomic commit failed: errno =" << savedErrno
+                           << "(" << std::strerror(savedErrno) << ");"
+                           << "Objects:" << objects.size() << "Props:" << propertyIds.size();
+    }
+
     return false;
 }
 
@@ -229,9 +215,8 @@ void DrmAtomicCommit::pageFlipped(std::chrono::nanoseconds timestamp)
             frame->presented(timestamp, m_mode);
         }
     } else if (frameCount > 1) {
-        // Use stack allocation for typical frame counts
         QVarLengthArray<OutputFrame *, 8> frames;
-        frames.reserve(static_cast<int>(std::min(frameCount, static_cast<size_t>(8))));
+        frames.reserve(static_cast<int>(std::min(frameCount, size_t{8})));
 
         for (const auto &[plane, frame] : m_frames) {
             if (frame) {
@@ -310,11 +295,8 @@ void DrmAtomicCommit::merge(DrmAtomicCommit *onTop)
         m_vrr = onTop->m_vrr;
     }
 
-    // Propagate presentation mode (e.g., ensure Async flag persists)
     m_mode = onTop->m_mode;
 
-    // Merge pipelines to ensure pageflip events are broadcast to all consumers.
-    // m_pipelines is now mutable in the header, so append is safe.
     for (DrmPipeline *pipeline : onTop->m_pipelines) {
         if (!m_pipelines.contains(pipeline)) {
             m_pipelines.append(pipeline);
@@ -375,9 +357,8 @@ bool DrmLegacyCommit::doModeset(DrmConnector *connector, DrmConnectorMode *mode)
     if (drmModeSetCrtc(gpu()->fd(), m_crtc->id(), m_buffer->framebufferId(), 0, 0, &connectorId, 1, mode->nativeMode()) == 0) {
         m_crtc->setCurrent(m_buffer);
         return true;
-    } else {
-        return false;
     }
+    return false;
 }
 
 bool DrmLegacyCommit::doPageflip(PresentationMode mode)
