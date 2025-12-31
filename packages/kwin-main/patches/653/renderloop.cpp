@@ -561,6 +561,14 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTarget)
         0,
         static_cast<int64_t>(vblankNs) * 3);
 
+    if (vrrEnabled && vrrCapable) [[likely]] {
+        Workspace *ws = workspace();
+        Window *active = ws ? ws->activeWindow() : nullptr;
+        if (active != trackedWindow_) [[unlikely]] {
+            vrrStateDirty_ = true;
+        }
+    }
+
     updateVrrState();
     const PresentationMode targetMode = selectPresentationMode();
 
@@ -833,8 +841,6 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer *layer)
         }, Qt::QueuedConnection);
         return;
     }
-
-    d->vrrStateDirty_ = true;
 
     const bool vrrActive = isVrrMode(d->presentationMode);
     const bool hasTarget = item || layer;
