@@ -603,7 +603,23 @@ void DrmCommitThread::pageFlipped(std::chrono::nanoseconds timestamp)
         m_pageflipTimeoutDetected.store(false, std::memory_order_release);
     }
 
-    m_lastPageflip = TimePoint(timestamp);
+    const auto steadyNowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch());
+
+    std::chrono::nanoseconds monoNowNs = timestamp;
+    timespec monoNowTs = {};
+    if (clock_gettime(CLOCK_MONOTONIC, &monoNowTs) == 0) {
+        monoNowNs = std::chrono::seconds(monoNowTs.tv_sec) + std::chrono::nanoseconds(monoNowTs.tv_nsec);
+    }
+
+    const auto offset = steadyNowNs - monoNowNs;
+    auto mapped = timestamp + offset;
+
+    if (mapped > steadyNowNs) [[unlikely]] {
+        mapped = steadyNowNs;
+    }
+
+    m_lastPageflip = TimePoint(std::chrono::duration_cast<TimePoint::duration>(mapped));
     m_committed.reset();
 
     if (!m_commits.empty()) {
