@@ -603,23 +603,54 @@ void DrmCommitThread::pageFlipped(std::chrono::nanoseconds timestamp)
         m_pageflipTimeoutDetected.store(false, std::memory_order_release);
     }
 
-    const auto steadyNowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch());
+    const int64_t steadyNowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 
-    std::chrono::nanoseconds monoNowNs = timestamp;
-    timespec monoNowTs = {};
-    if (clock_gettime(CLOCK_MONOTONIC, &monoNowTs) == 0) {
-        monoNowNs = std::chrono::seconds(monoNowTs.tv_sec) + std::chrono::nanoseconds(monoNowTs.tv_nsec);
+    struct OffsetCache {
+        int64_t offsetNs = 0;
+        uint32_t countdown = 0;
+        bool valid = false;
+    };
+    thread_local OffsetCache cache;
+
+    auto resyncOffset = [&]() {
+        timespec monoNowTs = {};
+        if (clock_gettime(CLOCK_MONOTONIC, &monoNowTs) != 0) {
+            return;
+        }
+        const int64_t monoNowNs =
+            (std::chrono::seconds(monoNowTs.tv_sec) + std::chrono::nanoseconds(monoNowTs.tv_nsec)).count();
+
+        const int64_t newOffset = steadyNowNs - monoNowNs;
+        if (!cache.valid) {
+            cache.offsetNs = newOffset;
+            cache.valid = true;
+        } else {
+            cache.offsetNs += (newOffset - cache.offsetNs) >> 3;
+        }
+    };
+
+    if (Q_UNLIKELY(!cache.valid || cache.countdown == 0)) {
+        resyncOffset();
+        cache.countdown = 1024;
+    } else {
+        --cache.countdown;
     }
 
-    const auto offset = steadyNowNs - monoNowNs;
-    auto mapped = timestamp + offset;
-
-    if (mapped > steadyNowNs) [[unlikely]] {
-        mapped = steadyNowNs;
+    int64_t mappedNs = 0;
+    if (Q_UNLIKELY(__builtin_add_overflow(timestamp.count(), cache.offsetNs, &mappedNs))) {
+        mappedNs = steadyNowNs;
     }
 
-    m_lastPageflip = TimePoint(std::chrono::duration_cast<TimePoint::duration>(mapped));
+    if (mappedNs > steadyNowNs) [[unlikely]] {
+        mappedNs = steadyNowNs;
+    } else if (mappedNs < 0) [[unlikely]] {
+        mappedNs = 0;
+    }
+
+    m_lastPageflip = TimePoint(std::chrono::duration_cast<TimePoint::duration>(
+        std::chrono::nanoseconds{mappedNs}));
+
     m_committed.reset();
 
     if (!m_commits.empty()) {

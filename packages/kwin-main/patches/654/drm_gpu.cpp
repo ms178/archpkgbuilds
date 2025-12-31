@@ -606,14 +606,19 @@ void DrmGpu::pageFlipHandler(int fd, unsigned int sequence, unsigned int sec, un
     auto *commit = static_cast<DrmCommit *>(user_data);
     DrmGpu *gpu = commit->gpu();
 
-    const bool defunct = std::erase_if(gpu->m_defunctCommits, [commit](const auto &defunct) {
-        return defunct.get() == commit;
-    }) != 0;
-    if (defunct) {
-        return;
+    if (!gpu->m_defunctCommits.empty()) [[unlikely]] {
+        auto &defunct = gpu->m_defunctCommits;
+        for (auto it = defunct.begin(), end = defunct.end(); it != end; ++it) {
+            if (it->get() == commit) {
+                defunct.erase(it);
+                return;
+            }
+        }
     }
 
-    // Normalize (sec,usec) defensively.
+    static const bool s_sanitizeTimestamps =
+        qEnvironmentVariableIntValue("KWIN_DRM_SANITIZE_PAGEFLIP_TIMESTAMPS") != 0;
+
     uint64_t s = sec;
     uint64_t us = usec;
     if (us >= 1'000'000ULL) [[unlikely]] {
@@ -629,35 +634,26 @@ void DrmGpu::pageFlipHandler(int fd, unsigned int sequence, unsigned int sec, un
                                      {static_cast<time_t>(s), static_cast<long>(us * 1000ULL)});
     }
 
-    // Reject obviously invalid timestamps and clamp "future" timestamps.
-    {
+    if (Q_UNLIKELY((s == 0 && us == 0) || timestamp <= std::chrono::nanoseconds::zero())) {
         timespec nowTs = {};
-        const bool haveNow = (clock_gettime(CLOCK_MONOTONIC, &nowTs) == 0);
-        const std::chrono::nanoseconds now = haveNow
-            ? (std::chrono::seconds(nowTs.tv_sec) + std::chrono::nanoseconds(nowTs.tv_nsec))
-            : std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch());
+        if (clock_gettime(CLOCK_MONOTONIC, &nowTs) == 0) {
+            timestamp = std::chrono::seconds(nowTs.tv_sec) + std::chrono::nanoseconds(nowTs.tv_nsec);
+        } else {
+            timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch());
+        }
+    } else if (Q_UNLIKELY(s_sanitizeTimestamps)) {
+        timespec nowTs = {};
+        if (clock_gettime(CLOCK_MONOTONIC, &nowTs) == 0) {
+            const std::chrono::nanoseconds now =
+                std::chrono::seconds(nowTs.tv_sec) + std::chrono::nanoseconds(nowTs.tv_nsec);
 
-        const bool clearlyInvalid = (s == 0 && us == 0) || (timestamp <= std::chrono::nanoseconds::zero());
-
-        constexpr std::chrono::nanoseconds kFutureEpsilon = std::chrono::milliseconds{5};
-        const bool tooFarFuture = (timestamp > now + kFutureEpsilon);
-
-        if (clearlyInvalid || tooFarFuture) [[unlikely]] {
-            static std::atomic<uint32_t> s_warningCounter{0};
-            const uint32_t count = s_warningCounter.fetch_add(1, std::memory_order_relaxed);
-            if (count < 10) {
-                qCDebug(KWIN_DRM,
-                        "Suspicious pageflip timestamp (sec=%u,usec=%u => %lldns, now=%lldns) on GPU %s",
-                        sec, usec,
-                        static_cast<long long>(timestamp.count()),
-                        static_cast<long long>(now.count()),
-                        qPrintable(gpu->drmDevice()->path()));
-            } else if (count == 10) {
-                qCDebug(KWIN_DRM, "Too many suspicious pageflip timestamps, suppressing further warnings");
+            constexpr std::chrono::nanoseconds kFutureEpsilon{std::chrono::milliseconds{5}};
+            if (timestamp > now + kFutureEpsilon) [[unlikely]] {
+                timestamp = now;
+            } else if (timestamp > now) [[unlikely]] {
+                timestamp = now;
             }
-            timestamp = now;
-        } else if (timestamp > now) [[unlikely]] {
-            timestamp = now;
         }
     }
 
