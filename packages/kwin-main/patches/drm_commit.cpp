@@ -19,16 +19,47 @@
 #include "drm_property.h"
 
 #include <QCoreApplication>
+#include <QMetaObject>
 #include <QThread>
 #include <QVarLengthArray>
+
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <type_traits>
+#include <utility>
+#include <vector>
+#include <unistd.h>
+#include <fcntl.h>
 
 using namespace std::chrono_literals;
 
 namespace KWin
 {
+
+namespace
+{
+
+[[nodiscard]] inline bool isMainThread() noexcept
+{
+    if (auto *app = QCoreApplication::instance()) [[likely]] {
+        return QThread::currentThread() == app->thread();
+    }
+    return true;
+}
+
+template<typename Func>
+inline void invokeOnMainThreadBlocking(Func &&func)
+{
+    auto *app = QCoreApplication::instance();
+    if (!app || isMainThread()) {
+        std::forward<Func>(func)();
+        return;
+    }
+    QMetaObject::invokeMethod(app, std::forward<Func>(func), Qt::BlockingQueuedConnection);
+}
+
+}
 
 DrmCommit::DrmCommit(DrmGpu *gpu)
     : m_gpu(gpu)
@@ -86,14 +117,9 @@ void DrmAtomicCommit::addBuffer(DrmPlane *plane, const std::shared_ptr<DrmFrameb
     m_buffers[plane] = buffer;
     m_frames[plane] = frame;
 
-    if (plane->inFenceFd.isValid()) [[likely]] {
-        if (buffer && !isTearing() && !plane->gpu()->isNVidia()) [[likely]] {
-            const int fd = buffer->syncFd().get();
-            if (fd >= 0) [[likely]] {
-                addProperty(plane->inFenceFd, static_cast<uint64_t>(fd));
-            }
-        }
-    }
+    // Important: IN_FENCE_FD must be resolved as late as possible (right before ioctl),
+    // because commits may be merged/queued and fence fds may change or become stale.
+    // See doCommit().
 
     m_planes.emplace(plane);
 
@@ -148,6 +174,65 @@ bool DrmAtomicCommit::commitModeset()
 
 bool DrmAtomicCommit::doCommit(uint32_t flags)
 {
+    QVarLengthArray<int, 4> ownedInFenceFds;
+    struct FdCloseGuard {
+        QVarLengthArray<int, 4> &fds;
+        ~FdCloseGuard()
+        {
+            for (int fd : fds) {
+                if (fd >= 0) {
+                    ::close(fd);
+                }
+            }
+        }
+    } fdGuard{ownedInFenceFds};
+
+    // Always clear any previously present IN_FENCE_FD (e.g. after merge), then (re-)add it
+    // immediately before the ioctl, using a dup'd fd to guarantee lifetime correctness.
+    const bool allowInFence = !isTearing();
+    if (allowInFence) [[likely]] {
+        ownedInFenceFds.reserve(static_cast<int>(std::min<size_t>(m_buffers.size(), size_t{4})));
+    }
+
+    for (const auto &[plane, buffer] : m_buffers) {
+        if (!plane || !plane->inFenceFd.isValid()) [[unlikely]] {
+            continue;
+        }
+
+        const uint32_t objId = plane->fbId.drmObject()->id();
+        if (auto objIt = m_properties.find(objId); objIt != m_properties.end()) {
+            objIt->second.erase(plane->inFenceFd.propId());
+        }
+
+        if (!allowInFence || !buffer || plane->gpu()->isNVidia()) [[likely]] {
+            continue;
+        }
+
+        // Keep the return value alive until after we dup(), regardless of whether syncFd()
+        // returns by value, by reference, or (unfortunately) as a const prvalue.
+        decltype(auto) syncFdHolder = buffer->syncFd();
+        const int rawFd = syncFdHolder.get();
+        if (rawFd < 0) [[unlikely]] {
+            continue;
+        }
+
+        int dupFd = -1;
+#if defined(F_DUPFD_CLOEXEC)
+        dupFd = ::fcntl(rawFd, F_DUPFD_CLOEXEC, 0);
+#else
+        dupFd = ::dup(rawFd);
+        if (dupFd >= 0) {
+            (void)::fcntl(dupFd, F_SETFD, FD_CLOEXEC);
+        }
+#endif
+        if (dupFd < 0) [[unlikely]] {
+            continue; // Never risk passing a potentially-stale raw fd.
+        }
+
+        ownedInFenceFds.push_back(dupFd);
+        addProperty(plane->inFenceFd, static_cast<uint64_t>(dupFd));
+    }
+
     constexpr size_t kInlineObjectCapacity = 16;
     constexpr size_t kInlinePropertyCapacity = 128;
 
@@ -160,10 +245,17 @@ bool DrmAtomicCommit::doCommit(uint32_t flags)
     objects.reserve(static_cast<int>(objectCount));
     propertyCounts.reserve(static_cast<int>(objectCount));
 
-    for (const auto &[object, properties] : m_properties) {
+    size_t totalPropCount = 0;
+    for (const auto &[object, props] : m_properties) {
+        totalPropCount += props.size();
+    }
+    propertyIds.reserve(static_cast<int>(totalPropCount));
+    values.reserve(static_cast<int>(totalPropCount));
+
+    for (const auto &[object, props] : m_properties) {
         objects.push_back(object);
-        propertyCounts.push_back(static_cast<uint32_t>(properties.size()));
-        for (const auto &[property, value] : properties) {
+        propertyCounts.push_back(static_cast<uint32_t>(props.size()));
+        for (const auto &[property, value] : props) {
             propertyIds.push_back(property);
             values.push_back(value);
         }
@@ -197,47 +289,49 @@ bool DrmAtomicCommit::doCommit(uint32_t flags)
 
 void DrmAtomicCommit::pageFlipped(std::chrono::nanoseconds timestamp)
 {
-    Q_ASSERT(QThread::currentThread() == QCoreApplication::instance()->thread());
+    invokeOnMainThreadBlocking([this, timestamp] {
+        Q_ASSERT(QThread::currentThread() == QCoreApplication::instance()->thread());
 
-    for (const auto &[plane, buffer] : m_buffers) {
-        plane->setCurrentBuffer(buffer);
-    }
-
-    if (m_defunct) {
-        return;
-    }
-
-    const size_t frameCount = m_frames.size();
-
-    if (frameCount == 1) [[likely]] {
-        const auto &frame = m_frames.begin()->second;
-        if (frame) [[likely]] {
-            frame->presented(timestamp, m_mode);
+        for (const auto &[plane, buffer] : m_buffers) {
+            plane->setCurrentBuffer(buffer);
         }
-    } else if (frameCount > 1) {
-        QVarLengthArray<OutputFrame *, 8> frames;
-        frames.reserve(static_cast<int>(std::min(frameCount, size_t{8})));
 
-        for (const auto &[plane, frame] : m_frames) {
-            if (frame) {
-                frames.append(frame.get());
+        if (m_defunct) {
+            return;
+        }
+
+        const size_t frameCount = m_frames.size();
+
+        if (frameCount == 1) [[likely]] {
+            const auto &frame = m_frames.begin()->second;
+            if (frame) [[likely]] {
+                frame->presented(timestamp, m_mode);
+            }
+        } else if (frameCount > 1) {
+            QVarLengthArray<OutputFrame *, 8> frames;
+            frames.reserve(static_cast<int>(std::min(frameCount, size_t{8})));
+
+            for (const auto &[plane, frame] : m_frames) {
+                if (frame) {
+                    frames.append(frame.get());
+                }
+            }
+
+            if (!frames.isEmpty()) {
+                std::sort(frames.begin(), frames.end());
+                const auto last = std::unique(frames.begin(), frames.end());
+                for (auto it = frames.begin(); it != last; ++it) {
+                    (*it)->presented(timestamp, m_mode);
+                }
             }
         }
 
-        if (!frames.isEmpty()) {
-            std::sort(frames.begin(), frames.end());
-            const auto last = std::unique(frames.begin(), frames.end());
-            for (auto it = frames.begin(); it != last; ++it) {
-                (*it)->presented(timestamp, m_mode);
-            }
+        m_frames.clear();
+
+        for (const auto pipeline : std::as_const(m_pipelines)) {
+            pipeline->pageFlipped(timestamp);
         }
-    }
-
-    m_frames.clear();
-
-    for (const auto pipeline : std::as_const(m_pipelines)) {
-        pipeline->pageFlipped(timestamp);
-    }
+    });
 }
 
 bool DrmAtomicCommit::areBuffersReadable() const
@@ -283,7 +377,14 @@ void DrmAtomicCommit::merge(DrmAtomicCommit *onTop)
 
     for (const auto &[plane, buffer] : onTop->m_buffers) {
         m_buffers[plane] = buffer;
-        m_frames[plane] = onTop->m_frames[plane];
+
+        const auto frameIt = onTop->m_frames.find(plane);
+        if (frameIt != onTop->m_frames.end()) {
+            m_frames[plane] = frameIt->second;
+        } else {
+            m_frames.erase(plane);
+        }
+
         m_planes.emplace(plane);
     }
 
@@ -373,16 +474,18 @@ bool DrmLegacyCommit::doPageflip(PresentationMode mode)
 
 void DrmLegacyCommit::pageFlipped(std::chrono::nanoseconds timestamp)
 {
-    Q_ASSERT(QThread::currentThread() == QCoreApplication::instance()->thread());
-    m_crtc->setCurrent(m_buffer);
-    if (m_defunct) {
-        return;
-    }
-    if (m_frame) {
-        m_frame->presented(timestamp, m_mode);
-        m_frame.reset();
-    }
-    m_pipeline->pageFlipped(timestamp);
+    invokeOnMainThreadBlocking([this, timestamp] {
+        Q_ASSERT(QThread::currentThread() == QCoreApplication::instance()->thread());
+        m_crtc->setCurrent(m_buffer);
+        if (m_defunct) {
+            return;
+        }
+        if (m_frame) {
+            m_frame->presented(timestamp, m_mode);
+            m_frame.reset();
+        }
+        m_pipeline->pageFlipped(timestamp);
+    });
 }
 
 }
