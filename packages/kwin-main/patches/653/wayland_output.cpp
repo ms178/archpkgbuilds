@@ -105,7 +105,11 @@ void WaylandCursor::sync()
             wp_viewport_set_destination(m_viewport, m_size.width(), m_size.height());
         }
         m_surface->attachBuffer(m_buffer);
-        m_surface->damageBuffer(QRect(0, 0, INT32_MAX, INT32_MAX));
+        if (m_size.isEmpty()) [[unlikely]] {
+            m_surface->damageBuffer(QRect(0, 0, INT32_MAX, INT32_MAX));
+        } else {
+            m_surface->damageBuffer(QRect(QPoint(0, 0), m_size));
+        }
         m_surface->commit(KWayland::Client::Surface::CommitFlag::None);
     }
 
@@ -115,10 +119,12 @@ void WaylandCursor::sync()
 }
 
 void WaylandOutput::handleFractionalScaleChanged(void *data,
-                                                  struct wp_fractional_scale_v1 *,
-                                                  uint32_t scale120)
+                                                 struct wp_fractional_scale_v1 *,
+                                                 uint32_t scale120)
 {
-    static_cast<WaylandOutput *>(data)->m_pendingScale = scale120 / 120.0;
+    // 120 == 1.0. 0 is invalid; clamp to sane bounds to avoid pathological sizes.
+    const uint32_t clamped120 = std::clamp(scale120, 120u, 120u * 16u);
+    static_cast<WaylandOutput *>(data)->m_pendingScale = clamped120 / 120.0;
 }
 
 const wp_fractional_scale_v1_listener WaylandOutput::s_fractionalScaleListener{
@@ -341,10 +347,11 @@ bool WaylandOutput::present(const QList<OutputLayer *> &layersToUpdate,
         m_cursor->setEnabled(m_cursorLayer->isEnabled());
     }
 
+    wl_buffer *mappingBuffer = nullptr;
     if (!m_mapped) [[unlikely]] {
-        auto buffer = wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer(
+        mappingBuffer = wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer(
             m_backend->display()->singlePixelManager(), 0, 0, 0, 0xFFFFFFFF);
-        m_surface->attachBuffer(buffer);
+        m_surface->attachBuffer(mappingBuffer);
         m_mapped = true;
     }
 
@@ -368,7 +375,12 @@ bool WaylandOutput::present(const QList<OutputLayer *> &layersToUpdate,
     };
     wp_presentation_feedback_add_listener(frameData.presentationFeedback, &s_presentationListener, this);
     wl_callback_add_listener(frameData.frameCallback, &s_frameCallbackListener, this);
+
     m_surface->commit(KWayland::Client::Surface::CommitFlag::None);
+
+    if (mappingBuffer) {
+        wl_buffer_destroy(mappingBuffer);
+    }
 
     m_frames[m_frameTail] = std::move(frameData);
     m_frameTail = (m_frameTail + 1) % FrameQueueCapacity;
@@ -408,10 +420,28 @@ void WaylandOutput::framePresented(std::chrono::nanoseconds timestamp, uint32_t 
     }
 
     const auto &frame = m_frames[m_frameHead];
+
     if (auto t = frame.frameCallbackTime) [[likely]] {
-        const auto difference = timestamp - t->time_since_epoch();
-        m_renderLoop->setPresentationSafetyMargin(difference + std::chrono::milliseconds(1));
+        using namespace std::chrono;
+
+        const nanoseconds callbackNs = duration_cast<nanoseconds>(t->time_since_epoch());
+        nanoseconds diff = timestamp - callbackNs;
+
+        if (diff < 0ns) [[unlikely]] {
+            diff = 0ns;
+        }
+
+        // Cap to avoid poisoning scheduling if clocks jitter or feedback is delayed.
+        nanoseconds cap = 20ms;
+        if (m_refreshRate > 0) {
+            const uint64_t vblank = 1'000'000'000'000ULL / static_cast<uint64_t>(m_refreshRate);
+            cap = nanoseconds{static_cast<int64_t>(vblank * 3)};
+        }
+
+        diff = std::min(diff, cap);
+        m_renderLoop->setPresentationSafetyMargin(diff + 1ms);
     }
+
     frame.outputFrame->presented(timestamp, PresentationMode::VSync);
 
     m_frames[m_frameHead] = FrameData();

@@ -26,6 +26,10 @@
 #include "utils/envvar.h"
 #include "utils/kernel.h"
 
+#include <QCoreApplication>
+#include <QMetaObject>
+#include <QThread>
+
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -40,6 +44,25 @@ namespace KWin
 
 namespace
 {
+
+[[nodiscard]] inline bool isMainThread() noexcept
+{
+    if (auto *app = QCoreApplication::instance()) [[likely]] {
+        return QThread::currentThread() == app->thread();
+    }
+    return true;
+}
+
+template<typename Func>
+inline void invokeOnMainThreadBlocking(Func &&func)
+{
+    auto *app = QCoreApplication::instance();
+    if (!app || isMainThread()) {
+        std::forward<Func>(func)();
+        return;
+    }
+    QMetaObject::invokeMethod(app, std::forward<Func>(func), Qt::BlockingQueuedConnection);
+}
 
 [[nodiscard, gnu::const]]
 constexpr bool isYuvFormat(uint32_t format) noexcept
@@ -800,17 +823,19 @@ DrmGpu *DrmPipeline::gpu() const noexcept
 
 void DrmPipeline::pageFlipped(std::chrono::nanoseconds timestamp)
 {
-    if (m_output) [[likely]] {
-        RenderLoop *loop = m_output->renderLoop();
-        if (loop) [[likely]] {
-            RenderLoopPrivate::get(loop)->notifyVblank(timestamp);
-            loop->setPresentationSafetyMargin(m_commitThread->safetyMargin());
+    invokeOnMainThreadBlocking([this, timestamp] {
+        if (m_output) [[likely]] {
+            RenderLoop *loop = m_output->renderLoop();
+            if (loop) [[likely]] {
+                RenderLoopPrivate::get(loop)->notifyVblank(timestamp);
+                loop->setPresentationSafetyMargin(m_commitThread->safetyMargin());
+            }
         }
-    }
-    m_commitThread->pageFlipped(timestamp);
-    if (gpu()->needsModeset()) [[unlikely]] {
-        gpu()->maybeModeset(nullptr, nullptr);
-    }
+        m_commitThread->pageFlipped(timestamp);
+        if (gpu()->needsModeset()) [[unlikely]] {
+            gpu()->maybeModeset(nullptr, nullptr);
+        }
+    });
 }
 
 void DrmPipeline::setOutput(DrmOutput *output)

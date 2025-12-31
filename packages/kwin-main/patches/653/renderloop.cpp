@@ -546,7 +546,8 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTarget)
         return;
     }
 
-    const int64_t nowNs = std::chrono::steady_clock::now().time_since_epoch().count();
+    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 
     int64_t lastPresNs = lastPresentationTimestamp.count();
     if (Q_UNLIKELY(lastPresNs >= nowNs)) {
@@ -605,8 +606,10 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTarget)
 
     scheduledRenderTimestamp = std::chrono::nanoseconds{nextRenderNs};
 
-    const int delayMs = static_cast<int>(delayNs / kNsPerMs);
-    const int clampedMs = static_cast<int>(branchlessClamp(delayMs, 0, kMaxTimerDelayMs));
+    const int64_t delayMs64 = delayNs / kNsPerMs;
+    const int64_t clampedMs64 = branchlessClamp(delayMs64, int64_t{0}, int64_t{kMaxTimerDelayMs});
+    const int clampedMs = static_cast<int>(clampedMs64);
+
     compositeTimer.start(clampedMs, Qt::PreciseTimer, q);
     scheduledTimerMs = clampedMs;
 }
@@ -724,9 +727,19 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
 
 void RenderLoopPrivate::notifyVblank(std::chrono::nanoseconds timestamp)
 {
-    lastPresentationTimestamp = (timestamp >= lastPresentationTimestamp)
-        ? timestamp
-        : std::chrono::steady_clock::now().time_since_epoch();
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch());
+
+    auto ts = timestamp;
+
+    if (ts > now) [[unlikely]] {
+        ts = now;
+    }
+    if (ts < lastPresentationTimestamp) [[unlikely]] {
+        ts = lastPresentationTimestamp;
+    }
+
+    lastPresentationTimestamp = ts;
 }
 
 void RenderLoop::timerEvent(QTimerEvent *event)
