@@ -99,7 +99,7 @@ inline uint64_t ceilDivU64Reciprocal(uint64_t n, uint64_t d, uint64_t recip, uin
     }
     const auto prod = static_cast<__uint128_t>(n) * recip;
     auto q = static_cast<uint64_t>(prod >> shift);
-    if (q == 0 || q * d < n) {
+    if (q * d < n) {
         ++q;
     }
     return q;
@@ -364,6 +364,13 @@ bool RenderLoopPrivate::shouldSwitchMode(PresentationMode target) noexcept
 
     const bool exitingToVsync = (target == PresentationMode::VSync);
 
+    if (vrrMode == VrrMode::Always && !exitingToVsync) {
+        if (modeDwellCounter_ >= kMinModeDwellFrames) {
+            pendingModeCounter_ = 0;
+            return true;
+        }
+    }
+
     if (exitingToVsync && cadenceStability_ >= kCadenceStableThreshold) {
         pendingModeCounter_ = 0;
         return true;
@@ -429,12 +436,12 @@ PresentationMode RenderLoopPrivate::selectPresentationMode() noexcept
         return PresentationMode::VSync;
     }
 
-    if (cadenceStability_ >= kCadenceStableThreshold) {
-        return PresentationMode::VSync;
-    }
-
     if (vrrMode == VrrMode::Always) {
         return PresentationMode::AdaptiveSync;
+    }
+
+    if (cadenceStability_ >= kCadenceStableThreshold) {
+        return PresentationMode::VSync;
     }
 
     if (!state.valid) {
@@ -738,7 +745,8 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
         --pendingFrameCount;
 
         const int64_t prevPresentationNs = lastPresentationTimestamp.count();
-        notifyVblank(timestamp);
+        const int64_t nowNs = steadyNowNs();
+        notifyVblank(timestamp, nowNs);
         const int64_t intervalNs = lastPresentationTimestamp.count() - prevPresentationNs;
         updatePresentationCadence(intervalNs);
 
@@ -773,9 +781,8 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
     }
 }
 
-void RenderLoopPrivate::notifyVblank(std::chrono::nanoseconds timestamp)
+void RenderLoopPrivate::notifyVblank(std::chrono::nanoseconds timestamp, int64_t nowNs)
 {
-    const int64_t nowNs = steadyNowNs();
     int64_t ts = timestamp.count();
 
     if (ts > nowNs) [[unlikely]] {

@@ -188,7 +188,7 @@ public:
                               std::optional<RenderTimeSpan> renderTime,
                               PresentationMode mode,
                               OutputFrame *frame);
-    void notifyVblank(std::chrono::nanoseconds timestamp);
+    void notifyVblank(std::chrono::nanoseconds timestamp, int64_t nowNs);
 };
 
 }
