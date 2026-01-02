@@ -21,26 +21,6 @@
 #include "radv_pipeline_graphics.h"
 #include "radv_video.h"
 
-/* Vega-specific optimizations (conditional on GFX9 for targeted alignment) */
-#if defined(RADV_GFX_LEVEL) && RADV_GFX_LEVEL == GFX9
-#define RADV_USE_VEGA_ALIGN 1
-#define RADV_VEGA_L1_CACHE_LINE_SIZE 64
-#define RADV_VEGA_L2_CACHE_LINE_SIZE 64
-#define RADV_VEGA_SCALAR_CACHE_SIZE (16 * 1024)
-#else
-#define RADV_USE_VEGA_ALIGN 0
-#define RADV_VEGA_L1_CACHE_LINE_SIZE 16  /* Fallback for non-Vega */
-#define RADV_VEGA_L2_CACHE_LINE_SIZE 16
-#define RADV_VEGA_SCALAR_CACHE_SIZE (16 * 1024)
-#endif
-
-/* Ensure proper alignment for cache optimization (64B on Vega, 16B fallback) */
-#if defined(__GNUC__) || defined(__clang__)
-#define RADV_CACHE_LINE_ALIGN __attribute__((aligned(RADV_USE_VEGA_ALIGN ? RADV_VEGA_L1_CACHE_LINE_SIZE : 16)))
-#else
-#define RADV_CACHE_LINE_ALIGN
-#endif
-
 extern const struct vk_command_buffer_ops radv_cmd_buffer_ops;
 
 enum radv_dynamic_state_bits {
@@ -103,8 +83,9 @@ enum radv_dynamic_state_bits {
    RADV_DYNAMIC_ALL = (1ull << 56) - 1,
 };
 
-/* Compile-time validation */
-static_assert(56 < 64, "Dynamic state bits exceed 64-bit storage");
+/* Compile-time validation: ensure all dynamic state bits fit in uint64_t. */
+static_assert(RADV_DYNAMIC_SCISSOR_WITH_COUNT < (1ull << 63),
+              "Dynamic state bits must fit in 64-bit storage");
 
 enum radv_cmd_dirty_bits {
    RADV_CMD_DIRTY_PIPELINE = 1ull << 0,
@@ -152,7 +133,9 @@ enum radv_cmd_dirty_bits {
    RADV_CMD_DIRTY_SHADER_QUERY = RADV_CMD_DIRTY_NGG_STATE | RADV_CMD_DIRTY_TASK_STATE,
 };
 
-static_assert(39 < 64, "CMD dirty bits exceed 64-bit storage");
+/* Compile-time validation: ensure all dirty bits fit in uint64_t. */
+static_assert(RADV_CMD_DIRTY_FSR_SURFACE_STATE < (1ull << 63),
+              "CMD dirty bits must fit in 64-bit storage");
 
 enum radv_cmd_flush_bits {
    /* Instruction cache. */
@@ -193,154 +176,14 @@ enum radv_cmd_flush_bits {
                                  RADV_CMD_FLAG_INV_L2 | RADV_CMD_FLAG_WB_L2 | RADV_CMD_FLAG_CS_PARTIAL_FLUSH),
 };
 
-/* Compile-time validation for flush bits (fits in 32 bits, enum is int/4B) */
-static_assert(17 < 32, "Flush bits exceed 32-bit storage");
+/* Compile-time validation: ensure all flush bits fit in enum (int). */
+static_assert(RADV_CMD_FLAG_VGT_STREAMOUT_SYNC < (1 << 30),
+              "Flush bits must fit in 32-bit enum");
 
-enum rgp_flush_bits {
-   RGP_FLUSH_WAIT_ON_EOP_TS = 0x1,
-   RGP_FLUSH_VS_PARTIAL_FLUSH = 0x2,
-   RGP_FLUSH_PS_PARTIAL_FLUSH = 0x4,
-   RGP_FLUSH_CS_PARTIAL_FLUSH = 0x8,
-   RGP_FLUSH_PFP_SYNC_ME = 0x10,
-   RGP_FLUSH_SYNC_CP_DMA = 0x20,
-   RGP_FLUSH_INVAL_VMEM_L0 = 0x40,
-   RGP_FLUSH_INVAL_ICACHE = 0x80,
-   RGP_FLUSH_INVAL_SMEM_L0 = 0x100,
-   RGP_FLUSH_FLUSH_L2 = 0x200,
-   RGP_FLUSH_INVAL_L2 = 0x400,
-   RGP_FLUSH_FLUSH_CB = 0x800,
-   RGP_FLUSH_INVAL_CB = 0x1000,
-   RGP_FLUSH_FLUSH_DB = 0x2000,
-   RGP_FLUSH_INVAL_DB = 0x4000,
-   RGP_FLUSH_INVAL_L1 = 0x8000,
-};
-
-enum radv_tracked_reg {
-   RADV_TRACKED_DB_COUNT_CONTROL,
-   RADV_TRACKED_DB_SHADER_CONTROL,
-   RADV_TRACKED_DB_VRS_OVERRIDE_CNTL,
-
-   /* 2 consecutive registers */
-   RADV_TRACKED_DB_DEPTH_BOUNDS_MIN,
-   RADV_TRACKED_DB_DEPTH_BOUNDS_MAX,
-
-   /* 2 consecutive registers */
-   RADV_TRACKED_DB_STENCILREFMASK,    /* GFX6-11.5 */
-   RADV_TRACKED_DB_STENCILREFMASK_BF, /* GFX6-11.5 */
-
-   /* 2 consecutive registers */
-   RADV_TRACKED_DB_STENCIL_READ_MASK,  /* GFX12 */
-   RADV_TRACKED_DB_STENCIL_WRITE_MASK, /* GFX12 */
-
-   RADV_TRACKED_DB_DEPTH_CONTROL,
-   RADV_TRACKED_DB_STENCIL_CONTROL,
-   RADV_TRACKED_DB_STENCIL_REF, /* GFX12 */
-
-   RADV_TRACKED_GE_MAX_OUTPUT_PER_SUBGROUP,
-   RADV_TRACKED_GE_NGG_SUBGRP_CNTL,
-
-   RADV_TRACKED_PA_CL_CLIP_CNTL,
-   RADV_TRACKED_PA_CL_VRS_CNTL,
-   RADV_TRACKED_PA_CL_VS_OUT_CNTL,
-
-   RADV_TRACKED_PA_SC_BINNER_CNTL_0,
-   RADV_TRACKED_PA_SC_SHADER_CONTROL,
-   RADV_TRACKED_PA_SC_HISZ_CONTROL = RADV_TRACKED_PA_SC_SHADER_CONTROL, /* GFX12 (slot reused) */
-   RADV_TRACKED_PA_SC_LINE_CNTL,
-   RADV_TRACKED_PA_SC_LINE_STIPPLE,
-   RADV_TRACKED_PA_SC_LINE_STIPPLE_RESET, /* GFX12 */
-
-   /* 2 consecutive registers */
-   RADV_TRACKED_SPI_PS_INPUT_ENA,
-   RADV_TRACKED_SPI_PS_INPUT_ADDR,
-
-   RADV_TRACKED_SPI_PS_IN_CONTROL,
-
-   /* 2 consecutive registers */
-   RADV_TRACKED_SPI_SHADER_IDX_FORMAT,
-   RADV_TRACKED_SPI_SHADER_POS_FORMAT,
-
-   RADV_TRACKED_SPI_VS_OUT_CONFIG,
-
-   /* 3 consecutive registers */
-   RADV_TRACKED_SX_PS_DOWNCONVERT,
-   RADV_TRACKED_SX_BLEND_OPT_EPSILON,
-   RADV_TRACKED_SX_BLEND_OPT_CONTROL,
-
-   RADV_TRACKED_VGT_DRAW_PAYLOAD_CNTL,
-   RADV_TRACKED_VGT_ESGS_RING_ITEMSIZE, /* GFX6-8 */
-   RADV_TRACKED_VGT_GS_MODE,
-   RADV_TRACKED_VGT_GS_INSTANCE_CNT,
-   RADV_TRACKED_VGT_GS_ONCHIP_CNTL,
-   RADV_TRACKED_VGT_GS_MAX_PRIMS_PER_SUBGROUP,
-   RADV_TRACKED_VGT_GS_MAX_VERT_OUT,
-   RADV_TRACKED_VGT_GS_OUT_PRIM_TYPE,
-
-   /* 4 consecutive registers */
-   RADV_TRACKED_VGT_GS_VERT_ITEMSIZE,
-   RADV_TRACKED_VGT_GS_VERT_ITEMSIZE_1,
-   RADV_TRACKED_VGT_GS_VERT_ITEMSIZE_2,
-   RADV_TRACKED_VGT_GS_VERT_ITEMSIZE_3,
-
-   RADV_TRACKED_VGT_GSVS_RING_ITEMSIZE,
-
-   /* 3 consecutive registers */
-   RADV_TRACKED_VGT_GSVS_RING_OFFSET_1,
-   RADV_TRACKED_VGT_GSVS_RING_OFFSET_2,
-   RADV_TRACKED_VGT_GSVS_RING_OFFSET_3,
-
-   RADV_TRACKED_VGT_MULTI_PRIM_IB_RESET_INDX, /* GFX6-7 */
-   RADV_TRACKED_VGT_PRIMITIVEID_EN,
-   RADV_TRACKED_VGT_REUSE_OFF,
-   RADV_TRACKED_VGT_SHADER_STAGES_EN,
-   RADV_TRACKED_VGT_VERTEX_REUSE_BLOCK_CNTL,
-
-   RADV_TRACKED_PA_SU_LINE_CNTL,
-   RADV_TRACKED_PA_SU_SC_MODE_CNTL,
-
-   /* 2 consecutive registers */
-   RADV_TRACKED_PA_SC_AA_MASK_X0Y0_X1Y0,
-
-   RADV_TRACKED_DB_EQAA,
-   RADV_TRACKED_DB_ALPHA_TO_MASK,
-   RADV_TRACKED_PA_SC_CONSERVATIVE_RASTERIZATION_CNTL, /* GFX9+ */
-   RADV_TRACKED_PA_SC_AA_CONFIG,
-   RADV_TRACKED_PA_SC_MODE_CNTL_0,
-   RADV_TRACKED_PA_SC_SAMPLE_PROPERTIES, /* GFX12+ */
-
-   RADV_TRACKED_DB_RENDER_OVERRIDE, /* GFX12+ */
-
-   /* 2 consecutive registers */
-   RADV_TRACKED_SPI_SHADER_Z_FORMAT,
-   RADV_TRACKED_SPI_SHADER_COL_FORMAT,
-
-   RADV_TRACKED_CB_TARGET_MASK,
-   RADV_TRACKED_CB_COLOR_CONTROL,
-   RADV_TRACKED_CB_SHADER_MASK,
-
-   RADV_NUM_ALL_TRACKED_REGS,
-};
-
-struct radv_tracked_regs {
-   BITSET_DECLARE(reg_saved_mask, RADV_NUM_ALL_TRACKED_REGS);
-   uint32_t reg_value[RADV_NUM_ALL_TRACKED_REGS];
-   uint32_t spi_ps_input_cntl[32];
-   uint32_t cb_blend_control[MAX_RTS];
-   uint32_t sx_mrt_blend_opt[MAX_RTS];
-};
-
-enum radv_depth_clamp_mode {
-   RADV_DEPTH_CLAMP_MODE_VIEWPORT = 0,     /* Clamp to the viewport min/max depth bounds */
-   RADV_DEPTH_CLAMP_MODE_USER_DEFINED = 1, /* Range set using VK_EXT_depth_clamp_control */
-   RADV_DEPTH_CLAMP_MODE_ZERO_TO_ONE = 2,  /* Clamp between 0.0f and 1.0f */
-   RADV_DEPTH_CLAMP_MODE_DISABLED = 3,     /* Disable depth clamping */
-};
-
-/* Optimized vertex binding structure with better alignment */
 struct radv_vertex_binding {
    uint64_t addr;
    VkDeviceSize size;
-} RADV_CACHE_LINE_ALIGN;
+};
 
 struct radv_streamout_binding {
    uint64_t va;
@@ -429,74 +272,74 @@ struct radv_push_constant_state {
    bool need_upload;
 };
 
-/*
- * Cache-Optimized Command State Structure.
- * Fields are ordered from hottest to coldest to improve cache utilization on Raptor Lake L1D (64B lines)
- * and Vega L2 (64B bursts). Alignments conditional on GFX9; pads adjusted to preserve original ABI size
- * (no bloat: use existing pad space, compiler fills holes). Hot fields (dirty_dynamic, active_stages)
- * touched in 90% draw calls; cold (video) rare.
- */
+enum rgp_flush_bits {
+   RGP_FLUSH_WAIT_ON_EOP_TS = 0x1,
+   RGP_FLUSH_VS_PARTIAL_FLUSH = 0x2,
+   RGP_FLUSH_PS_PARTIAL_FLUSH = 0x4,
+   RGP_FLUSH_CS_PARTIAL_FLUSH = 0x8,
+   RGP_FLUSH_PFP_SYNC_ME = 0x10,
+   RGP_FLUSH_SYNC_CP_DMA = 0x20,
+   RGP_FLUSH_INVAL_VMEM_L0 = 0x40,
+   RGP_FLUSH_INVAL_ICACHE = 0x80,
+   RGP_FLUSH_INVAL_SMEM_L0 = 0x100,
+   RGP_FLUSH_FLUSH_L2 = 0x200,
+   RGP_FLUSH_INVAL_L2 = 0x400,
+   RGP_FLUSH_FLUSH_CB = 0x800,
+   RGP_FLUSH_INVAL_CB = 0x1000,
+   RGP_FLUSH_FLUSH_DB = 0x2000,
+   RGP_FLUSH_INVAL_DB = 0x4000,
+   RGP_FLUSH_INVAL_L1 = 0x8000,
+};
+
+enum radv_depth_clamp_mode {
+   RADV_DEPTH_CLAMP_MODE_VIEWPORT = 0,     /* Clamp to the viewport min/max depth bounds */
+   RADV_DEPTH_CLAMP_MODE_USER_DEFINED = 1, /* Range set using VK_EXT_depth_clamp_control */
+   RADV_DEPTH_CLAMP_MODE_ZERO_TO_ONE = 2,  /* Clamp between 0.0f and 1.0f */
+   RADV_DEPTH_CLAMP_MODE_DISABLED = 3,     /* Disable depth clamping */
+};
+
 struct radv_cmd_state {
-   /* ===== Hot cacheline 1 (64 bytes) - Most frequently accessed (dirty bits, stages) ===== */
-   uint64_t dirty_dynamic RADV_CACHE_LINE_ALIGN;
-   uint64_t dirty;
-   VkShaderStageFlags active_stages;
-   uint32_t vbo_bound_mask;
-   uint32_t prefetch_L2_mask;
-   enum radv_cmd_flush_bits flush_bits;
-   uint32_t trace_id;
-   uint32_t _hot_pad1[2];  /* Original 8B pad; fits within 64B line (fields 36B + pad = 44B; compiler pads to 64B) */
+   /* Vertex descriptors */
+   uint64_t vb_va;
+   unsigned vb_size;
 
-   /* ===== Hot cacheline 2 (64 bytes) - Draw state (index, primitives) ===== */
-   uint32_t index_type RADV_CACHE_LINE_ALIGN;
-   uint32_t max_index_count;
-   uint64_t index_va;
-   int32_t last_index_type;
-   int32_t last_primitive_restart_en;
-   uint32_t last_primitive_reset_index;
-   uint32_t last_ia_multi_vgt_param;
-   uint32_t last_ge_cntl;
-   uint32_t last_num_instances;
-   uint32_t last_first_instance;
-   uint32_t last_vertex_offset;
-   bool last_vertex_offset_valid;
    bool predicating;
-   bool mesh_shading;
-   uint8_t _hot_pad2[1];  /* Original 1B pad; total ~52B + compiler pad to 64B */
+   uint64_t dirty_dynamic;
+   uint64_t dirty;
 
-   /* ===== Warm cacheline 3-4 (128 bytes) - Shaders (pointer array for fetches) ===== */
-   struct radv_shader *shaders[MESA_VULKAN_SHADER_STAGES] RADV_CACHE_LINE_ALIGN;
+   VkShaderStageFlags active_stages;
+   struct radv_shader *shaders[MESA_VULKAN_SHADER_STAGES];
    struct radv_shader *gs_copy_shader;
    struct radv_shader *last_vgt_shader;
    struct radv_shader *rt_prolog;
+
    struct radv_shader_object *shader_objs[MESA_VULKAN_SHADER_STAGES];
 
-   /* ===== Vertex descriptors (64 bytes) ===== */
-   uint64_t vb_va RADV_CACHE_LINE_ALIGN;
-   unsigned vb_size;
-   uint32_t vtx_base_sgpr;
-   uint8_t vtx_emit_num;
-   bool uses_drawid;
-   bool uses_baseinstance;
-   bool can_use_simple_vertex_input;
-   uint32_t _vb_pad[10];  /* Original 40B pad; ensures 64B line */
+   uint32_t prefetch_L2_mask;
 
-   /* ===== Pipeline state (64 bytes) ===== */
-   struct radv_graphics_pipeline *graphics_pipeline RADV_CACHE_LINE_ALIGN;
+   struct radv_graphics_pipeline *graphics_pipeline;
    struct radv_graphics_pipeline *emitted_graphics_pipeline;
    struct radv_compute_pipeline *compute_pipeline;
    struct radv_compute_pipeline *emitted_compute_pipeline;
    struct radv_ray_tracing_pipeline *rt_pipeline;
    struct radv_ray_tracing_pipeline *emitted_rt_pipeline;
-   struct radv_shader_part *emitted_vs_prolog;
-   struct radv_shader *emitted_ps;
-   struct radv_shader_part *ps_epilog;
-
-   /* ===== Dynamic state (separate allocation for size) ===== */
    struct radv_dynamic_state dynamic;
+   struct radv_streamout_state streamout;
 
-   /* ===== Query state (64 bytes) ===== */
-   unsigned active_occlusion_queries RADV_CACHE_LINE_ALIGN;
+   struct radv_rendering_state render;
+
+   /* Index buffer */
+   uint32_t index_type;
+   uint32_t max_index_count;
+   uint64_t index_va;
+   int32_t last_index_type;
+
+   /* Primitive restart */
+   int32_t last_primitive_restart_en;
+   uint32_t last_primitive_reset_index;
+
+   enum radv_cmd_flush_bits flush_bits;
+   unsigned active_occlusion_queries;
    bool perfect_occlusion_queries_enabled;
    unsigned active_pipeline_queries;
    unsigned active_emulated_pipeline_queries;
@@ -505,16 +348,21 @@ struct radv_cmd_state {
    unsigned active_prims_xfb_queries;
    unsigned active_emulated_prims_gen_queries;
    unsigned active_emulated_prims_xfb_queries;
-   uint32_t _query_pad[7];  /* Original 28B pad; ensures 64B line */
+   uint32_t trace_id;
+   uint32_t last_ia_multi_vgt_param;
+   uint32_t last_ge_cntl;
 
-   /* ===== Less frequently accessed state ===== */
-   struct radv_streamout_state streamout;
-   struct radv_rendering_state render;
-
+   uint32_t last_num_instances;
+   uint32_t last_first_instance;
+   bool last_vertex_offset_valid;
+   uint32_t last_vertex_offset;
    uint32_t last_drawid;
    uint32_t last_subpass_color_count;
 
+   /* Whether CP DMA is busy/idle. */
    bool dma_is_busy;
+
+   /* Whether any images that are not L2 coherent are dirty from the CB. */
    bool rb_noncoherent_dirty;
 
    /* Conditional rendering info. */
@@ -527,10 +375,12 @@ struct radv_cmd_state {
    bool saved_user_cond_render;
    bool is_user_cond_render_suspended;
 
+   /* Inheritance info. */
    VkQueryPipelineStatisticFlags inherited_pipeline_statistics;
    bool inherited_occlusion_queries;
    VkQueryControlFlags inherited_query_control_flags;
 
+   /* SQTT related state. */
    uint32_t current_event_type;
    uint32_t num_events;
    uint32_t num_layout_transitions;
@@ -538,18 +388,33 @@ struct radv_cmd_state {
    bool pending_sqtt_barrier_end;
    enum rgp_flush_bits sqtt_flush_bits;
 
+   /* Mesh shading state. */
+   bool mesh_shading;
+
    uint8_t cb_mip[MAX_RTS];
    uint8_t ds_mip;
 
+   /* Whether DRAW_{INDEX}_INDIRECT_{MULTI} is emitted. */
    bool uses_draw_indirect;
 
    uint32_t rt_stack_size;
 
+   struct radv_shader_part *emitted_vs_prolog;
+   uint32_t vbo_bound_mask;
+
+   struct radv_shader *emitted_ps;
+
+   struct radv_shader_part *ps_epilog;
+
+   /* Whether to suspend streamout for internal driver operations. */
    bool suspend_streamout;
+
+   /* Whether this commandbuffer uses performance counters. */
    bool uses_perf_counters;
 
    struct radv_ia_multi_vgt_param_helpers ia_multi_vgt_param;
 
+   /* Tessellation info when patch control points is dynamic. */
    unsigned tess_num_patches;
    unsigned tess_lds_size;
 
@@ -560,6 +425,7 @@ struct radv_cmd_state {
    struct radv_multisample_state ms;
    uint32_t num_rast_samples;
 
+   /* Custom blend mode for internal operations. */
    unsigned custom_blend_mode;
    unsigned db_render_control;
 
@@ -567,6 +433,12 @@ struct radv_cmd_state {
 
    VkLineRasterizationModeEXT line_rast_mode;
    unsigned vgt_outprim_type;
+
+   uint32_t vtx_base_sgpr;
+   uint8_t vtx_emit_num;
+   bool uses_drawid;
+   bool uses_baseinstance;
+   bool can_use_simple_vertex_input;
 
    bool uses_out_of_order_rast;
    bool uses_vrs;
@@ -579,9 +451,6 @@ struct radv_cmd_state {
    enum radv_depth_clamp_mode depth_clamp_mode;
    bool depth_clip_enable;
 };
-
-/* ABI stability: Alignments do not change overall sizeof (compiler pads preserved) */
-static_assert(alignof(struct radv_cmd_state) == (RADV_USE_VEGA_ALIGN ? 64 : 16), "Cmd state alignment mismatch");
 
 struct radv_enc_state {
    uint32_t *p_task_size;
@@ -610,9 +479,8 @@ struct radv_cmd_buffer_upload {
 struct radv_cmd_stream {
    struct ac_cmdbuf *b;
 
-   bool context_roll_without_scissor_emitted;
+   struct ac_tracked_regs tracked_regs;
 
-   struct radv_tracked_regs tracked_regs;
    enum amd_ip_type hw_ip;
 
    struct ac_buffered_sh_regs buffered_sh_regs;
@@ -624,10 +492,7 @@ struct radv_cmd_buffer {
    VkCommandBufferUsageFlags usage_flags;
    struct radv_cmd_stream *cs;
    struct radv_cmd_state state;
-
-   /* Vertex bindings with optimized alignment */
-   struct radv_vertex_binding vertex_bindings[MAX_VBS] RADV_CACHE_LINE_ALIGN;
-
+   struct radv_vertex_binding vertex_bindings[MAX_VBS];
    struct radv_streamout_binding streamout_bindings[MAX_SO_BUFFERS];
    enum radv_queue_family qf;
 
@@ -728,46 +593,37 @@ struct radv_cmd_buffer {
 
 VK_DEFINE_HANDLE_CASTS(radv_cmd_buffer, vk.base, VkCommandBuffer, VK_OBJECT_TYPE_COMMAND_BUFFER)
 
-/* Optimized device getter with likely branch prediction */
 static inline struct radv_device *
 radv_cmd_buffer_device(const struct radv_cmd_buffer *cmd_buffer)
 {
-   assert(cmd_buffer != NULL);
    return (struct radv_device *)cmd_buffer->vk.base.device;
 }
 
-/* Optimized streamout check */
 ALWAYS_INLINE static bool
 radv_is_streamout_enabled(struct radv_cmd_buffer *cmd_buffer)
 {
    struct radv_streamout_state *so = &cmd_buffer->state.streamout;
 
-   /* Use likely() for common case optimization */
-   if (likely(!cmd_buffer->state.suspend_streamout)) {
-      return so->streamout_enabled || cmd_buffer->state.active_prims_gen_queries;
-   }
-   return false;
+   /* Streamout must be enabled for the PRIMITIVES_GENERATED query to work. */
+   return (so->streamout_enabled || cmd_buffer->state.active_prims_gen_queries) &&
+          !cmd_buffer->state.suspend_streamout;
 }
 
-/* Optimized bind point conversion */
 ALWAYS_INLINE static unsigned
 vk_to_bind_point(VkPipelineBindPoint bind_point)
 {
-   /* Branchless conversion */
-   return (bind_point == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) ? 2 : bind_point;
+   return bind_point == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR ? 2 : bind_point;
 }
 
 ALWAYS_INLINE static struct radv_descriptor_state *
 radv_get_descriptors_state(struct radv_cmd_buffer *cmd_buffer, VkPipelineBindPoint bind_point)
 {
-   assert(cmd_buffer != NULL);
    return &cmd_buffer->descriptors[vk_to_bind_point(bind_point)];
 }
 
 ALWAYS_INLINE static const struct radv_push_constant_state *
 radv_get_push_constants_state(const struct radv_cmd_buffer *cmd_buffer, VkPipelineBindPoint bind_point)
 {
-   assert(cmd_buffer != NULL);
    return &cmd_buffer->push_constant_state[vk_to_bind_point(bind_point)];
 }
 
@@ -777,30 +633,25 @@ radv_cmdbuf_has_stage(const struct radv_cmd_buffer *cmd_buffer, mesa_shader_stag
    return !!(cmd_buffer->state.active_stages & mesa_to_vk_shader_stage(stage));
 }
 
-/* Optimized pipeline stat query counter */
 static inline uint32_t
 radv_get_num_pipeline_stat_queries(struct radv_cmd_buffer *cmd_buffer)
 {
-   const struct radv_cmd_state *state = &cmd_buffer->state;
-
    /* SAMPLE_STREAMOUTSTATS also requires PIPELINESTAT_START to be enabled. */
-   return state->active_pipeline_queries +
-          state->active_prims_gen_queries +
-          state->active_prims_xfb_queries;
+   return cmd_buffer->state.active_pipeline_queries + cmd_buffer->state.active_prims_gen_queries +
+          cmd_buffer->state.active_prims_xfb_queries;
 }
 
 bool radv_cmd_buffer_uses_mec(struct radv_cmd_buffer *cmd_buffer);
 
 void radv_cmd_buffer_reset_rendering(struct radv_cmd_buffer *cmd_buffer);
 
-bool radv_cmd_buffer_upload_alloc_aligned(struct radv_cmd_buffer *cmd_buffer, unsigned size,
-                                          unsigned alignment, unsigned *out_offset, void **ptr);
+bool radv_cmd_buffer_upload_alloc_aligned(struct radv_cmd_buffer *cmd_buffer, unsigned size, unsigned alignment,
+                                          unsigned *out_offset, void **ptr);
 
-bool radv_cmd_buffer_upload_alloc(struct radv_cmd_buffer *cmd_buffer, unsigned size,
-                                  unsigned *out_offset, void **ptr);
+bool radv_cmd_buffer_upload_alloc(struct radv_cmd_buffer *cmd_buffer, unsigned size, unsigned *out_offset, void **ptr);
 
-bool radv_cmd_buffer_upload_data(struct radv_cmd_buffer *cmd_buffer, unsigned size,
-                                 const void *data, unsigned *out_offset);
+bool radv_cmd_buffer_upload_data(struct radv_cmd_buffer *cmd_buffer, unsigned size, const void *data,
+                                 unsigned *out_offset);
 
 void radv_cmd_buffer_trace_emit(struct radv_cmd_buffer *cmd_buffer);
 
@@ -808,15 +659,21 @@ void radv_cmd_buffer_annotate(struct radv_cmd_buffer *cmd_buffer, const char *an
 
 void radv_gang_cache_flush(struct radv_cmd_buffer *cmd_buffer);
 
+bool radv_flush_gang_leader_semaphore(struct radv_cmd_buffer *cmd_buffer);
+
+bool radv_flush_gang_follower_semaphore(struct radv_cmd_buffer *cmd_buffer);
+
+void radv_wait_gang_leader(struct radv_cmd_buffer *cmd_buffer);
+
+void radv_wait_gang_follower(struct radv_cmd_buffer *cmd_buffer);
+
 bool radv_gang_init(struct radv_cmd_buffer *cmd_buffer);
 
 void radv_set_descriptor_set(struct radv_cmd_buffer *cmd_buffer, VkPipelineBindPoint bind_point,
                              struct radv_descriptor_set *set, unsigned idx);
 
-void radv_update_ds_clear_metadata(struct radv_cmd_buffer *cmd_buffer,
-                                   const struct radv_image_view *iview,
-                                   VkClearDepthStencilValue ds_clear_value,
-                                   VkImageAspectFlags aspects);
+void radv_update_ds_clear_metadata(struct radv_cmd_buffer *cmd_buffer, const struct radv_image_view *iview,
+                                   VkClearDepthStencilValue ds_clear_value, VkImageAspectFlags aspects);
 
 void radv_update_fce_metadata(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image,
                               const VkImageSubresourceRange *range, bool value);
@@ -824,8 +681,7 @@ void radv_update_fce_metadata(struct radv_cmd_buffer *cmd_buffer, struct radv_im
 void radv_update_dcc_metadata(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image,
                               const VkImageSubresourceRange *range, bool value);
 
-void radv_update_color_clear_metadata(struct radv_cmd_buffer *cmd_buffer,
-                                      const struct radv_image_view *iview,
+void radv_update_color_clear_metadata(struct radv_cmd_buffer *cmd_buffer, const struct radv_image_view *iview,
                                       int cb_idx, uint32_t color_values[2]);
 
 void radv_update_hiz_metadata(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image,
@@ -833,19 +689,13 @@ void radv_update_hiz_metadata(struct radv_cmd_buffer *cmd_buffer, struct radv_im
 
 unsigned radv_instance_rate_prolog_index(unsigned num_attributes, uint32_t instance_rate_inputs);
 
-enum radv_cmd_flush_bits radv_src_access_flush(struct radv_cmd_buffer *cmd_buffer,
-                                               VkPipelineStageFlags2 src_stages,
-                                               VkAccessFlags2 src_flags,
-                                               VkAccessFlags3KHR src3_flags,
-                                               const struct radv_image *image,
-                                               const VkImageSubresourceRange *range);
+enum radv_cmd_flush_bits radv_src_access_flush(struct radv_cmd_buffer *cmd_buffer, VkPipelineStageFlags2 src_stages,
+                                               VkAccessFlags2 src_flags, VkAccessFlags3KHR src3_flags,
+                                               const struct radv_image *image, const VkImageSubresourceRange *range);
 
-enum radv_cmd_flush_bits radv_dst_access_flush(struct radv_cmd_buffer *cmd_buffer,
-                                               VkPipelineStageFlags2 dst_stages,
-                                               VkAccessFlags2 dst_flags,
-                                               VkAccessFlags3KHR dst3_flags,
-                                               const struct radv_image *image,
-                                               const VkImageSubresourceRange *range);
+enum radv_cmd_flush_bits radv_dst_access_flush(struct radv_cmd_buffer *cmd_buffer, VkPipelineStageFlags2 dst_stages,
+                                               VkAccessFlags2 dst_flags, VkAccessFlags3KHR dst3_flags,
+                                               const struct radv_image *image, const VkImageSubresourceRange *range);
 
 struct radv_resolve_barrier {
    VkPipelineStageFlags2 src_stage_mask;
@@ -854,8 +704,7 @@ struct radv_resolve_barrier {
    VkAccessFlags2 dst_access_mask;
 };
 
-void radv_emit_resolve_barrier(struct radv_cmd_buffer *cmd_buffer,
-                               const struct radv_resolve_barrier *barrier);
+void radv_emit_resolve_barrier(struct radv_cmd_buffer *cmd_buffer, const struct radv_resolve_barrier *barrier);
 
 struct radv_draw_info {
    /**
@@ -941,11 +790,10 @@ uint32_t radv_init_dcc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *im
 
 void radv_emit_cache_flush(struct radv_cmd_buffer *cmd_buffer);
 
-void radv_emit_set_predication_state(struct radv_cmd_buffer *cmd_buffer, bool draw_visible,
-                                     unsigned pred_op, uint64_t va);
+void radv_emit_set_predication_state(struct radv_cmd_buffer *cmd_buffer, bool draw_visible, unsigned pred_op,
+                                     uint64_t va);
 
-void radv_begin_conditional_rendering(struct radv_cmd_buffer *cmd_buffer, uint64_t va,
-                                      bool draw_visible);
+void radv_begin_conditional_rendering(struct radv_cmd_buffer *cmd_buffer, uint64_t va, bool draw_visible);
 
 void radv_end_conditional_rendering(struct radv_cmd_buffer *cmd_buffer);
 
@@ -963,8 +811,7 @@ struct radv_vbo_info {
    uint32_t non_trivial_format;
 };
 
-void radv_get_vbo_info(const struct radv_cmd_buffer *cmd_buffer, uint32_t vbo_idx,
-                      struct radv_vbo_info *vbo_info);
+void radv_get_vbo_info(const struct radv_cmd_buffer *cmd_buffer, uint32_t vbo_idx, struct radv_vbo_info *vbo_info);
 
 void radv_emit_compute_shader(const struct radv_physical_device *pdev, struct radv_cmd_stream *cs,
                               const struct radv_shader *shader);
