@@ -827,7 +827,9 @@ void DrmPipeline::pageFlipped(std::chrono::nanoseconds timestamp)
         if (m_output) [[likely]] {
             RenderLoop *loop = m_output->renderLoop();
             if (loop) [[likely]] {
-                RenderLoopPrivate::get(loop)->notifyVblank(timestamp);
+                const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                RenderLoopPrivate::get(loop)->notifyVblank(timestamp, nowNs);
                 loop->setPresentationSafetyMargin(m_commitThread->safetyMargin());
             }
         }
