@@ -68,33 +68,28 @@ static pid_t lavd_pid;
 
 static __always_inline u64 calc_avg_smooth(u64 old_val, u64 new_val)
 {
-	s64 delta;
-	u64 abs_delta, adjustment, result;
-	u32 shift;
+	u64 delta, result;
 
+	/*
+	 * Early exit for common case: no change.
+	 * Avoids all arithmetic and branches.
+	 */
 	if (old_val == new_val)
 		return old_val;
 
-	delta = (s64)new_val - (s64)old_val;
-
-	if (delta > 0) {
-		shift = LAVD_SMOOTH_SHIFT_UP;
-		abs_delta = (u64)delta;
-		adjustment = abs_delta >> shift;
-		result = old_val + adjustment;
-		if (unlikely(result < old_val))
-			result = U64_MAX;
+	if (new_val > old_val) {
+		/* Ramp-up: faster response (50% weight) */
+		delta = new_val - old_val;
+		result = old_val + (delta >> LAVD_SMOOTH_SHIFT_UP);
+		/* Saturate at new_val to prevent overshoot */
+		return result > new_val ? new_val : result;
 	} else {
-		shift = LAVD_SMOOTH_SHIFT_DOWN;
-		abs_delta = (u64)(-delta);
-		adjustment = abs_delta >> shift;
-		if (unlikely(adjustment >= old_val))
-			result = 0;
-		else
-			result = old_val - adjustment;
+		/* Ramp-down: slower decay (25% weight) */
+		delta = old_val - new_val;
+		result = old_val - (delta >> LAVD_SMOOTH_SHIFT_DOWN);
+		/* Saturate at new_val to prevent undershoot */
+		return result < new_val ? new_val : result;
 	}
-
-	return result;
 }
 
 /*
@@ -147,35 +142,41 @@ static void advance_cur_logical_clk(struct task_struct *p)
 
 static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 {
-	u64 slice, base_slice, avg_runtime;
+	u64 slice, base_slice, avg_runtime, max_slice;
+	u32 avg_perf_cri;
 
 	if (unlikely(!taskc || !cpuc))
 		return LAVD_SLICE_MAX_NS_DFL;
 
+	/*
+	 * Cache frequently accessed values to avoid repeated volatile reads.
+	 * Per Intel Optimization Manual §3.6.2: Reduces load-store forwarding stalls.
+	 */
 	base_slice = READ_ONCE(sys_stat.slice);
 	avg_runtime = READ_ONCE(taskc->avg_runtime);
+	max_slice = READ_ONCE(slice_max_ns);
+	avg_perf_cri = READ_ONCE(sys_stat.avg_perf_cri);
 
 	/*
-	 * If pinned_slice_ns is enabled and there are pinned tasks waiting
-	 * to run on this CPU, unconditionally reduce the time slice.
+	 * Pinned task fast path: unconditional slice reduction.
 	 */
 	if (unlikely(pinned_slice_ns && cpuc->nr_pinned_tasks)) {
-		taskc->slice = min(pinned_slice_ns, base_slice);
+		slice = pinned_slice_ns < base_slice ? pinned_slice_ns : base_slice;
+		taskc->slice = slice;
 		reset_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
-		return taskc->slice;
+		return slice;
 	}
 
 	/*
-	 * Raptor Lake optimization: Boost time slice for perf-critical
-	 * tasks on big/turbo cores when the system can handle it.
+	 * Short runtime fast path: Most tasks take this branch.
+	 * Raptor Lake turbo boost for perf-critical tasks on P-cores.
 	 */
 	if (likely(avg_runtime < base_slice)) {
 		if (have_turbo_core && cpuc->big_core &&
-		    taskc->perf_cri > READ_ONCE(sys_stat.avg_perf_cri)) {
-			u64 max_slice = READ_ONCE(slice_max_ns);
-
+		    taskc->perf_cri > avg_perf_cri) {
+			/* 25% bonus slice for perf-critical on turbo cores */
 			slice = base_slice + (base_slice >> 2);
-			slice = min(slice, max_slice);
+			slice = slice < max_slice ? slice : max_slice;
 			taskc->slice = slice;
 			set_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
 			return slice;
@@ -186,25 +187,26 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 	}
 
 	/*
-	 * If avg_runtime >= base_slice, consider slice boosting.
+	 * Long runtime path: Consider slice boosting.
 	 */
-	if (!no_slice_boost && !cpuc->nr_pinned_tasks &&
-	    (avg_runtime >= base_slice)) {
+	if (!no_slice_boost && !cpuc->nr_pinned_tasks) {
 		if (can_boost_slice()) {
-			u64 s = avg_runtime + LAVD_SLICE_BOOST_BONUS;
-			taskc->slice = clamp(s, slice_min_ns, LAVD_SLICE_BOOST_MAX);
+			slice = avg_runtime + LAVD_SLICE_BOOST_BONUS;
+			slice = clamp(slice, slice_min_ns, LAVD_SLICE_BOOST_MAX);
+			taskc->slice = slice;
 			set_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
-			return taskc->slice;
+			return slice;
 		}
 
 		if (taskc->lat_cri > sys_stat.avg_lat_cri) {
-			u64 b = (base_slice * taskc->lat_cri) /
-				(sys_stat.avg_lat_cri + 1);
-			u64 s = base_slice + b;
-			taskc->slice = clamp(s, slice_min_ns,
-					     min(avg_runtime, base_slice * 2));
+			u64 lat_bonus = (base_slice * taskc->lat_cri) /
+					(sys_stat.avg_lat_cri + 1);
+			slice = base_slice + lat_bonus;
+			slice = clamp(slice, slice_min_ns,
+				      min(avg_runtime, base_slice << 1));
+			taskc->slice = slice;
 			set_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
-			return taskc->slice;
+			return slice;
 		}
 	}
 
@@ -397,7 +399,7 @@ static __attribute__((noinline)) s32 try_select_idle_sibling(struct pick_ctx *ic
 		return -ENOENT;
 
 	prev_cpu_u = (u32)prev_cpu;
-	if (prev_cpu_u >= 512U)
+	if (prev_cpu_u >= LAVD_CPU_ID_MAX)
 		return -ENOENT;
 
 	cpuc_prev = get_cpu_ctx_id(prev_cpu);
@@ -405,13 +407,14 @@ static __attribute__((noinline)) s32 try_select_idle_sibling(struct pick_ctx *ic
 		return -ENOENT;
 
 	/*
-	 * For P-cores with SMT, prefer the sibling thread.
+	 * Strategy 1: For P-cores with SMT, prefer the sibling thread.
+	 * Shared L1D (48KB) and L2 (2MB) means near-zero migration cost.
 	 */
 	if (is_smt_active && cpuc_prev->big_core) {
 		sibling_ptr = MEMBER_VPTR(cpu_sibling, [prev_cpu_u]);
 		if (sibling_ptr) {
 			sibling_u = *sibling_ptr;
-			if (sibling_u < 512U && sibling_u != prev_cpu_u) {
+			if (sibling_u < LAVD_CPU_ID_MAX && sibling_u != prev_cpu_u) {
 				cpuc_cand = get_cpu_ctx_id((s32)sibling_u);
 				if (cpuc_cand && cpuc_cand->is_online &&
 				    cpuc_cand->idle_start_clk != 0)
@@ -421,11 +424,17 @@ static __attribute__((noinline)) s32 try_select_idle_sibling(struct pick_ctx *ic
 	}
 
 	/*
-	 * For perf-critical tasks, prefer turbo cores (CPUs 0-3 on typical RPL).
+	 * Strategy 2: For perf-critical tasks, prefer turbo cores.
+	 * i7-14700KF: CPUs 0-7 are P-core threads with highest turbo bins.
+	 * Iterate only nr_cpus_big threads (typically 8-16 for P-cores).
 	 */
 	if (have_turbo_core && ictx->taskc &&
 	    ictx->taskc->perf_cri > READ_ONCE(sys_stat.avg_perf_cri)) {
-		bpf_for(cand_cpu_u, 0, 4) {
+		u32 nr_turbo = (u32)nr_cpus_big;
+		if (nr_turbo > 16)
+			nr_turbo = 16; /* Bound for BPF verifier */
+
+		bpf_for(cand_cpu_u, 0, nr_turbo) {
 			if (cand_cpu_u >= nr_cpu_ids)
 				break;
 			cpuc_cand = get_cpu_ctx_id((s32)cand_cpu_u);
@@ -436,14 +445,15 @@ static __attribute__((noinline)) s32 try_select_idle_sibling(struct pick_ctx *ic
 	}
 
 	/*
-	 * For E-cores, try neighbors in the same 4-core cluster.
+	 * Strategy 3: For E-cores, try neighbors in the same 4-core cluster.
+	 * E-core clusters share 4MB L2; staying in cluster reduces latency.
 	 */
 	if (!cpuc_prev->big_core) {
-		cluster_base_u = prev_cpu_u & 0xFFFFFFFCU;
+		cluster_base_u = prev_cpu_u & ~3U; /* Align to 4-core boundary */
 		prev_llc = cpuc_prev->llc_id;
 
 		bpf_for(cand_cpu_u, cluster_base_u, cluster_base_u + 4) {
-			if (cand_cpu_u >= 512U || cand_cpu_u == prev_cpu_u)
+			if (cand_cpu_u >= LAVD_CPU_ID_MAX || cand_cpu_u == prev_cpu_u)
 				continue;
 			cpuc_cand = get_cpu_ctx_id((s32)cand_cpu_u);
 			if (cpuc_cand && cpuc_cand->is_online &&
