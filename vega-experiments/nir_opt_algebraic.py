@@ -2130,6 +2130,10 @@ optimizations.extend([
    (('extract_u8', ('ushr', a, 8), 0), ('extract_u8', a, 1)),
    (('extract_u8', ('ushr', a, 8), 1), ('extract_u8', a, 2)),
    (('extract_u8', ('ushr', a, 8), 2), ('extract_u8', a, 3)),
+   (('extract_u8', ('ushr', 'a@32', 16), 0), ('extract_u8', a, 2)),
+   (('extract_u8', ('ushr', 'a@32', 16), 1), ('extract_u8', a, 3)),
+   (('extract_u16', ('ushr', 'a@64', 32), 0), ('extract_u16', a, 2)),
+   (('extract_u16', ('ushr', 'a@64', 32), 1), ('extract_u16', a, 3)),
 
    (('extract_i8', ('extract_i16', a, 1), 0), ('extract_i8', a, 2)),
    (('extract_i8', ('extract_i16', a, 1), 1), ('extract_i8', a, 3)),
@@ -2737,7 +2741,9 @@ optimizations.extend([
                                                             ('extract_i8', 'v', 3))),
                                            127.0))),
      'options->lower_unpack_snorm_4x8'),
+])
 
+optimizations.extend([
     # A1: pack_unorm_4x8 with fully saturated vec4
     # Example: pack_unorm_4x8(vec4(fsat(r), fsat(g), fsat(b), fsat(a)))
     # Frequency: ~35 occurrences in Cyberpunk shaders
@@ -2774,6 +2780,70 @@ optimizations.extend([
     (('pack_unorm_2x16', ('vec2', 'a', ('fsat', 'b'))),
      ('pack_unorm_2x16', ('vec2', a, b))),
 ])
+
+# --- New: pack_unorm_* redundancy removal beyond per-component fsat ---
+
+def _clamp01_minmax(x):
+    # clamp(x, 0, 1) in the common "min(max(x,0),1)" form
+    return ('fmin', ('fmax', x, 0.0), 1.0)
+
+def _clamp01_maxmin(x):
+    # clamp(x, 0, 1) in the alternative "max(min(x,1),0)" form
+    return ('fmax', ('fmin', x, 1.0), 0.0)
+
+# Vector-wide forms: match when clamp/fsat is applied to the whole vector SSA value.
+# The @32 constrains float bit-size; the opcode constrains component count.
+optimizations.extend([
+    # pack_unorm_2x16(fsat(v)) -> pack_unorm_2x16(v)
+    (('pack_unorm_2x16', ('fsat', 'a@32')),
+     ('pack_unorm_2x16', a)),
+
+    # pack_unorm_4x8(fsat(v)) -> pack_unorm_4x8(v)
+    (('pack_unorm_4x8', ('fsat', 'a@32')),
+     ('pack_unorm_4x8', a)),
+
+    # pack_unorm_2x16(clamp01(v)) -> pack_unorm_2x16(v)
+    (('pack_unorm_2x16', _clamp01_minmax('a@32')),
+     ('pack_unorm_2x16', a)),
+    (('pack_unorm_2x16', _clamp01_maxmin('a@32')),
+     ('pack_unorm_2x16', a)),
+
+    # pack_unorm_4x8(clamp01(v)) -> pack_unorm_4x8(v)
+    (('pack_unorm_4x8', _clamp01_minmax('a@32')),
+     ('pack_unorm_4x8', a)),
+    (('pack_unorm_4x8', _clamp01_maxmin('a@32')),
+     ('pack_unorm_4x8', a)),
+])
+
+# Per-component clamp-chain removal for vec2 (3 non-trivial masks) for both clamp forms.
+for clamp01 in (_clamp01_minmax, _clamp01_maxmin):
+    for mask in range(1, 4):  # 1..3
+        comps = ['a', 'b']
+        search_components = []
+        replace_components = []
+        for i, var in enumerate(comps):
+            search_components.append(clamp01(var) if (mask & (1 << i)) else var)
+            replace_components.append(var)
+
+        optimizations.append(
+            (('pack_unorm_2x16', ('vec2', *search_components)),
+             ('pack_unorm_2x16', ('vec2', *replace_components)))
+        )
+
+# Per-component clamp-chain removal for vec4 (15 non-trivial masks) for both clamp forms.
+for clamp01 in (_clamp01_minmax, _clamp01_maxmin):
+    for mask in range(1, 16):  # 1..15
+        comps = ['a', 'b', 'c', 'd']
+        search_components = []
+        replace_components = []
+        for i, var in enumerate(comps):
+            search_components.append(clamp01(var) if (mask & (1 << i)) else var)
+            replace_components.append(var)
+
+        optimizations.append(
+            (('pack_unorm_4x8', ('vec4', *search_components)),
+             ('pack_unorm_4x8', ('vec4', *replace_components)))
+        )
 
 # -------------------------------------------------------------------------
 # GROUP D: Component-Wise vec4 Patterns (Programmatically Generated)
@@ -2824,19 +2894,11 @@ optimizations.extend([
    (('isign', a), ('imin', ('imax', a, -1), 1), 'options->lower_isign'),
    (('imin', ('imax', a, -1), 1), ('isign', a), '!options->lower_isign'),
    (('imax', ('imin', a, 1), -1), ('isign', a), '!options->lower_isign'),
-   # float(0 < NaN) - float(NaN < 0) = float(False) - float(False) = 0 - 0 = 0
-   # Mark the new comparisons precise to prevent them being changed to 'a !=
-   # 0' or 'a == 0'.
    (('fsign', a), ('fsub', ('b2f', ('!flt', 0.0, a)), ('b2f', ('!flt', a, 0.0))), 'options->lower_fsign'),
    (('fsign', 'a@64'), ('fsub', ('b2f', ('!flt', 0.0, a)), ('b2f', ('!flt', a, 0.0))), 'options->lower_doubles_options & nir_lower_dsign'),
 
-   # Address/offset calculations:
-   # Drivers supporting imul24 should use a pass like nir_lower_amul(), this
-   # rule converts everyone else to imul:
    (('amul', a, b), ('imul', a, b), '!options->has_imul24 && !options->has_amul'),
 
-   # udiv_aligned_4 assumes the source is a multiple of 4 specifically to enable
-   # this identity. Usually this transform would require masking.
    (('amul', ('udiv_aligned_4', a), 4), a),
    (('imul', ('udiv_aligned_4', a), 4), a),
 
@@ -2847,7 +2909,6 @@ optimizations.extend([
     ('iadd', ('imul', ('iand', a, 0xffffff), ('iand', b, 0xffffff)), c),
     '!options->has_umad24'),
 
-   # Relaxed 24bit ops
    (('imul24_relaxed', a, b), ('imul24', a, b), '!options->has_mul24_relaxed && options->has_imul24'),
    (('imul24_relaxed', a, b), ('imul', a, b), '!options->has_mul24_relaxed && !options->has_imul24'),
    (('umad24_relaxed', a, b, c), ('umad24', a, b, c), 'options->has_umad24'),
@@ -2858,15 +2919,8 @@ optimizations.extend([
    (('imad24_ir3', a, b, 0), ('imul24', a, b)),
    (('imad24_ir3', a, 0, c), (c)),
    (('imad24_ir3', a, 1, c), ('iadd', a, c)),
-
-   # if first two srcs are const, crack apart the imad so constant folding
-   # can clean up the imul:
-   # TODO ffma should probably get a similar rule:
    (('imad24_ir3', '#a', '#b', c), ('iadd', ('imul', a, b), c)),
 
-   # These will turn 24b address/offset calc back into 32b shifts, but
-   # it should be safe to get back some of the bits of precision that we
-   # already decided were no necessary:
    (('imul24', a, '#b@32(is_pos_power_of_two)'), ('ishl', a, ('find_lsb', b)), '!options->lower_bitops'),
    (('imul24', a, '#b@32(is_neg_power_of_two)'), ('ineg', ('ishl', a, ('find_lsb', ('iabs', b)))), '!options->lower_bitops'),
    (('imul24', a, 0), (0)),
@@ -2874,7 +2928,6 @@ optimizations.extend([
    (('imul_high@16', a, b), ('i2i16', ('ishr', ('imul24_relaxed', ('i2i32', a), ('i2i32', b)), 16)), 'options->lower_mul_high16'),
    (('umul_high@16', a, b), ('u2u16', ('ushr', ('umul24_relaxed', ('u2u32', a), ('u2u32', b)), 16)), 'options->lower_mul_high16'),
 
-   # Optimize vec2 unsigned comparison predicates to usub_sat with clamp.
    (('b2i16', ('vec2', ('ult', 'a@16', b), ('ult', 'c@16', d))),
     ('umin', 1, ('usub_sat', ('vec2', b, d), ('vec2', a, c))),
     'options->vectorize_vec2_16bit && !options->lower_usub_sat'),
@@ -2885,22 +2938,18 @@ optimizations.extend([
     ('umin', 1, ('usub_sat', ('iadd', ('vec2', a, c), 1), ('vec2', b, d))),
     'options->vectorize_vec2_16bit && !options->lower_usub_sat'),
 
-   # Standard clamp patterns. The ~ prefix marks these as "inexact" transforms
-   # (safe under default FP rules; NaN and signed-zero behavior defined by fsat).
    (('~fmin@32', ('fmax@32(is_used_once)', 'a@32',  0.0),  1.0), ('fsat@32', 'a'), '!options->lower_fsat'),
    (('~fmax@32', ('fmin@32(is_used_once)', 'a@32',  1.0),  0.0), ('fsat@32', 'a'), '!options->lower_fsat'),
    (('~fmin@16', ('fmax@16(is_used_once)', 'a@16',  0.0),  1.0), ('fsat@16', 'a'), '!options->lower_fsat'),
    (('~fmax@16', ('fmin@16(is_used_once)', 'a@16',  1.0),  0.0), ('fsat@16', 'a'), '!options->lower_fsat'),
 
-   # Redundant fsat removal: fsat(fabs(a)) == fsat(a) because fsat clamps [-∞,∞]→[0,1].
    (('fsat', ('fabs(is_used_once)', 'a')), ('fsat', 'a')),
+   (('fabs', ('fsat(is_used_once)', a)), ('fsat', a)),
+   (('fsat', ('fabs', ('fsat', a))), ('fsat', a)),
+   (('fsat', ('fmin', ('fmax', ('fabs', a), 0.0), 1.0)), ('fsat', a)),
 
-   # fabs(fabs(a)) → fabs(a)
    (('fabs', ('fabs', a)), ('fabs', a)),
-
-   # iabs(iabs(a)) → iabs(a)  (integer variant)
    (('iabs', ('iabs', a)), ('iabs', a)),
-
 ])
 
 for bit_size in [8, 16, 32, 64]:
@@ -3068,12 +3117,20 @@ for N, M in itertools.product(type_sizes('uint'), type_sizes('uint')):
       pass
 
 # Downcast operations should be able to see through pack
-for t in ['i', 'u']:
-    for N in [8, 16, 32]:
-        x2xN = '{0}2{0}{1}'.format(t, N)
+for t in ('i', 'u'):
+    for N in (8, 16, 32):
+        x2xN = f'{t}2{t}{N}'
+
         optimizations += [
+            # pack_64_2x32_* returns a 64-bit value with low 32 bits from x and high 32 from y.
+            # Downcasting to <=32 bits depends only on the low 32 bits.
             ((x2xN, ('pack_64_2x32_split', a, b)), (x2xN, a)),
-            ((x2xN, ('pack_64_2x32_split', a, b)), (x2xN, a)),
+            ((x2xN, ('pack_64_2x32', a)),          (x2xN, 'a.x')),
+
+            # pack_32_2x16_* returns a 32-bit value with low 16 bits from x and high 16 from y.
+            # Downcasting to <=16 bits depends only on the low 16 bits.
+            ((x2xN, ('pack_32_2x16_split', a, b)), (x2xN, a)),
+            ((x2xN, ('pack_32_2x16', a)),          (x2xN, 'a.x')),
         ]
 
 # Optimize comparisons with up-casts
@@ -3877,15 +3934,19 @@ for s in [8, 16, 32, 64]:
 
 late_optimizations.extend([
     # fneg_lo / fneg_hi
-   (('vec2(is_only_used_as_float)', ('fneg@16', a), b), ('fmul', ('vec2', a, b), ('vec2', -1.0, 1.0)), 'options->vectorize_vec2_16bit'),
-   (('vec2(is_only_used_as_float)', a, ('fneg@16', b)), ('fmul', ('vec2', a, b), ('vec2', 1.0, -1.0)), 'options->vectorize_vec2_16bit'),
+    (('vec2(is_only_used_as_float)', ('fneg@16', a), b),
+     ('fmul', ('vec2', a, b), ('vec2', -1.0, 1.0)),
+     'options->vectorize_vec2_16bit'),
+    (('vec2(is_only_used_as_float)', a, ('fneg@16', b)),
+     ('fmul', ('vec2', a, b), ('vec2', 1.0, -1.0)),
+     'options->vectorize_vec2_16bit'),
 
     # Standard FMA fusion for f32
     (('fadd@32', ('fmul@32(is_used_once)', 'a@32', 'b@32'), 'c@32'),
      ('ffma@32', 'a', 'b', 'c'),
      'options->fuse_ffma32'),
 
-    # FMA fusion for f16 (GCN has v_fma_f16)
+    # FMA fusion for f16 (GCN has v_fma_f16 / suitable lowering paths)
     (('fadd@16', ('fmul@16(is_used_once)', 'a@16', 'b@16'), 'c@16'),
      ('ffma@16', 'a', 'b', 'c'),
      'options->fuse_ffma16'),
@@ -3899,6 +3960,14 @@ late_optimizations.extend([
      ('ffma@16', 'a', 'b', 'c'),
      'options->fuse_ffma16'),
 
+    (('fadd@32', ('fmulz@32(is_used_once)', 'a@32', 'b@32'), 'c@32'),
+     ('ffmaz@32', 'a', 'b', 'c'),
+     'options->fuse_ffma32 && ' + has_fmulz),
+
+    (('~fadd@32', ('fmulz@32(is_used_once)', 'a@32', 'b@32'), 'c@32'),
+     ('ffmaz@32', 'a', 'b', 'c'),
+     'options->fuse_ffma32 && ' + has_fmulz),
+
     # Subtraction variant: fsub(c, fmul(a, b)) → ffma(-a, b, c)
     (('fsub@32', 'c@32', ('fmul@32(is_used_once)', 'a@32', 'b@32')),
      ('ffma@32', ('fneg', 'a'), 'b', 'c'),
@@ -3907,6 +3976,14 @@ late_optimizations.extend([
     (('~fsub@32', 'c@32', ('fmul@32(is_used_once)', 'a@32', 'b@32')),
      ('ffma@32', ('fneg', 'a'), 'b', 'c'),
      'options->fuse_ffma32'),
+
+    (('fsub@32', 'c@32', ('fmulz@32(is_used_once)', 'a@32', 'b@32')),
+     ('ffmaz@32', ('fneg', 'a'), 'b', 'c'),
+     'options->fuse_ffma32 && ' + has_fmulz),
+
+    (('~fsub@32', 'c@32', ('fmulz@32(is_used_once)', 'a@32', 'b@32')),
+     ('ffmaz@32', ('fneg', 'a'), 'b', 'c'),
+     'options->fuse_ffma32 && ' + has_fmulz),
 
    # These are duplicated from the main optimizations table.  The late
    # patterns that rearrange expressions like x - .5 < 0 to x < .5 can create
@@ -4096,25 +4173,24 @@ late_optimizations.extend([
 ])
 
 # A few more extract cases we'd rather leave late
-for N in [16, 32]:
-    aN = 'a@{0}'.format(N)
-    u2uM = 'u2u{0}'.format(M)
-    i2iM = 'i2i{0}'.format(M)
+for N in (16, 32):
+    aN = f'a@{N}'
 
-    for x in ['u', 'i']:
-        x2xN = '{0}2{0}{1}'.format(x, N)
-        extract_x8 = 'extract_{0}8'.format(x)
-        extract_x16 = 'extract_{0}16'.format(x)
+    for x in ('u', 'i'):
+        x2xN = f'{x}2{x}{N}'
 
-        late_optimizations.extend([
-            ((x2xN, ('u2u8', aN)), (extract_x8, a, 0), '!options->lower_extract_byte'),
-            ((x2xN, ('i2i8', aN)), (extract_x8, a, 0), '!options->lower_extract_byte'),
-        ])
+        for M, lower_opt in ((8, '!options->lower_extract_byte'),
+                             (16, '!options->lower_extract_word')):
+            if M >= N:
+                continue
 
-        if N > 16:
+            extract_xM = f'extract_{x}{M}'
+            u2uM = f'u2u{M}'
+            i2iM = f'i2i{M}'
+
             late_optimizations.extend([
-                ((x2xN, ('u2u16', aN)), (extract_x16, a, 0), '!options->lower_extract_word'),
-                ((x2xN, ('i2i16', aN)), (extract_x16, a, 0), '!options->lower_extract_word'),
+                ((x2xN, (u2uM, aN)), (extract_xM, a, 0), lower_opt),
+                ((x2xN, (i2iM, aN)), (extract_xM, a, 0), lower_opt),
             ])
 
 # Byte insertion
