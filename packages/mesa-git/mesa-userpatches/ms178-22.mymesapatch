@@ -1,0 +1,1383 @@
+--- a/src/amd/vulkan/radv_sdma.c	2026-01-02 09:29:31.639612172 +0100
++++ b/src/amd/vulkan/radv_sdma.c	2026-01-02 10:04:29.326084384 +0100
+@@ -76,9 +76,16 @@ radv_sdma_pixel_extent_to_blocks(const V
+ ALWAYS_INLINE static VkOffset3D
+ radv_sdma_pixel_offset_to_blocks(const VkOffset3D offset, const unsigned blk_w, const unsigned blk_h)
+ {
++   /* Use integer division (truncation toward zero) for offsets.
++    * For Vulkan-valid inputs, offsets are always non-negative and block-aligned
++    * for compressed formats, so this produces correct floor division results.
++    * The explicit casts ensure signed division semantics.
++    */
++   assert(blk_w > 0 && blk_h > 0);
++
+    const VkOffset3D r = {
+-      .x = DIV_ROUND_UP(offset.x, blk_w),
+-      .y = DIV_ROUND_UP(offset.y, blk_h),
++      .x = offset.x / (int32_t)blk_w,
++      .y = offset.y / (int32_t)blk_h,
+       .z = offset.z,
+    };
+ 
+@@ -274,14 +281,52 @@ radv_sdma_copy_memory(const struct radv_
+ }
+ 
+ void
+-radv_sdma_fill_memory(const struct radv_device *device, struct radv_cmd_stream *cs, uint64_t va, uint64_t size,
+-                      const uint32_t value)
++radv_sdma_fill_memory(const struct radv_device *device, struct radv_cmd_stream *cs,
++                      uint64_t va, uint64_t size, const uint32_t value)
+ {
++   /* Early return for zero-size fills - no work needed. */
++   if (size == 0)
++      return;
++
++   /*
++    * SDMA constant fill operates in DWORD (4-byte) units.
++    * Per Vulkan spec (vkCmdFillBuffer):
++    *   - dstOffset must be a multiple of 4
++    *   - size must be a multiple of 4, or VK_WHOLE_SIZE
++    *
++    * These preconditions are validated here to catch internal driver bugs.
++    */
++   assert(util_is_aligned(va, 4));
++   assert(util_is_aligned(size, 4));
++
+    const struct radv_physical_device *pdev = radv_device_physical(device);
++   const enum sdma_version ver = pdev->info.sdma_ip_version;
+ 
+    while (size > 0) {
+       radeon_check_space(device->ws, cs->b, 5);
+-      uint64_t bytes_written = ac_emit_sdma_constant_fill(cs->b, pdev->info.sdma_ip_version, va, size, value);
++
++      const uint64_t bytes_written = ac_emit_sdma_constant_fill(cs->b, ver, va, size, value);
++
++      /*
++       * For properly aligned inputs with size >= 4, bytes_written is guaranteed
++       * to be non-zero. This safety check prevents an infinite loop if the
++       * invariant is ever violated due to a bug in ac_emit_sdma_constant_fill
++       * or misuse of this function.
++       *
++       * In debug builds, we assert to catch the bug immediately.
++       * In release builds, we break to prevent a GPU hang.
++       */
++      if (bytes_written == 0) {
++         assert(!"ac_emit_sdma_constant_fill returned 0 unexpectedly");
++         break;
++      }
++
++      /*
++       * Sanity check: bytes_written should never exceed remaining size,
++       * and should always be DWORD-aligned.
++       */
++      assert(bytes_written <= size);
++      assert(util_is_aligned(bytes_written, 4));
+ 
+       size -= bytes_written;
+       va += bytes_written;
+@@ -294,6 +339,11 @@ radv_sdma_emit_copy_linear_sub_window(co
+                                       const VkExtent3D pix_extent)
+ {
+    const struct radv_physical_device *pdev = radv_device_physical(device);
++
++   /* Validate block sizes to prevent division by zero. */
++   assert(src->blk_w > 0 && src->blk_h > 0);
++   assert(dst->blk_w > 0 && dst->blk_h > 0);
++
+    VkOffset3D src_off = radv_sdma_pixel_offset_to_blocks(src->offset, src->blk_w, src->blk_h);
+    VkOffset3D dst_off = radv_sdma_pixel_offset_to_blocks(dst->offset, dst->blk_w, dst->blk_h);
+    VkExtent3D ext = radv_sdma_pixel_extent_to_blocks(pix_extent, src->blk_w, src->blk_h);
+@@ -302,20 +352,26 @@ radv_sdma_emit_copy_linear_sub_window(co
+    const unsigned src_slice_pitch = radv_sdma_pixel_area_to_blocks(src->slice_pitch, src->blk_w, src->blk_h);
+    const unsigned dst_slice_pitch = radv_sdma_pixel_area_to_blocks(dst->slice_pitch, dst->blk_w, dst->blk_h);
+ 
+-   /* Adjust offset/extent for 96-bits formats because SDMA expects a power of two bpp. */
+-   const uint32_t texel_scale = src->texel_scale == 1 ? dst->texel_scale : src->texel_scale;
+-   assert(texel_scale);
+-   src_off.x *= texel_scale;
+-   dst_off.x *= texel_scale;
++   /* Adjust offset/extent for 96-bit formats because SDMA expects a power of two bpp. */
++   const uint32_t texel_scale = src->texel_scale ? src->texel_scale : dst->texel_scale;
++   assert(texel_scale > 0);
++
++   /* Safe multiplication - texel_scale is 1 or 3, offsets are reasonably bounded. */
++   src_off.x *= (int)texel_scale;
++   dst_off.x *= (int)texel_scale;
+    ext.width *= texel_scale;
+ 
++   /* Validate offsets are non-negative after conversion for SDMA packet. */
++   assert(src_off.x >= 0 && src_off.y >= 0 && src_off.z >= 0);
++   assert(dst_off.x >= 0 && dst_off.y >= 0 && dst_off.z >= 0);
++
+    const struct ac_sdma_surf_linear surf_src = {
+       .va = src->va,
+       .offset =
+          {
+-            .x = src_off.x,
+-            .y = src_off.y,
+-            .z = src_off.z,
++            .x = (uint32_t)src_off.x,
++            .y = (uint32_t)src_off.y,
++            .z = (uint32_t)src_off.z,
+          },
+       .bpp = src->bpp,
+       .pitch = src_pitch,
+@@ -326,9 +382,9 @@ radv_sdma_emit_copy_linear_sub_window(co
+       .va = dst->va,
+       .offset =
+          {
+-            .x = dst_off.x,
+-            .y = dst_off.y,
+-            .z = dst_off.z,
++            .x = (uint32_t)dst_off.x,
++            .y = (uint32_t)dst_off.y,
++            .z = (uint32_t)dst_off.z,
+          },
+       .bpp = dst->bpp,
+       .pitch = dst_pitch,
+@@ -336,31 +392,44 @@ radv_sdma_emit_copy_linear_sub_window(co
+    };
+ 
+    radeon_check_space(device->ws, cs->b, 13);
+-   ac_emit_sdma_copy_linear_sub_window(cs->b, pdev->info.sdma_ip_version, &surf_src, &surf_dst, ext.width, ext.height,
+-                                       ext.depth);
++   ac_emit_sdma_copy_linear_sub_window(cs->b, pdev->info.sdma_ip_version, &surf_src, &surf_dst,
++                                       ext.width, ext.height, ext.depth);
+ }
+ 
+ static void
+ radv_sdma_emit_copy_tiled_sub_window(const struct radv_device *device, struct radv_cmd_stream *cs,
+                                      const struct radv_sdma_surf *const tiled,
+-                                     const struct radv_sdma_surf *const linear, const VkExtent3D pix_extent,
+-                                     const bool detile)
++                                     const struct radv_sdma_surf *const linear,
++                                     const VkExtent3D pix_extent, const bool detile)
+ {
+    const struct radv_physical_device *pdev = radv_device_physical(device);
++
++   /* Validate block sizes to prevent division by zero. */
++   assert(tiled->blk_w > 0 && tiled->blk_h > 0);
++   assert(linear->blk_w > 0 && linear->blk_h > 0);
++
++   /* For tiled operations, the surface descriptor must be valid. */
++   assert(tiled->surf != NULL);
++
+    const VkOffset3D linear_off = radv_sdma_pixel_offset_to_blocks(linear->offset, linear->blk_w, linear->blk_h);
+    const VkOffset3D tiled_off = radv_sdma_pixel_offset_to_blocks(tiled->offset, tiled->blk_w, tiled->blk_h);
+    const VkExtent3D tiled_ext = radv_sdma_pixel_extent_to_blocks(tiled->extent, tiled->blk_w, tiled->blk_h);
+    const VkExtent3D ext = radv_sdma_pixel_extent_to_blocks(pix_extent, tiled->blk_w, tiled->blk_h);
+    const unsigned linear_pitch = radv_sdma_pixels_to_blocks(linear->pitch, tiled->blk_w);
+-   const unsigned linear_slice_pitch = radv_sdma_pixel_area_to_blocks(linear->slice_pitch, tiled->blk_w, tiled->blk_h);
++   const unsigned linear_slice_pitch = radv_sdma_pixel_area_to_blocks(linear->slice_pitch,
++                                                                      tiled->blk_w, tiled->blk_h);
++
++   /* Validate offsets are non-negative for SDMA packet. */
++   assert(linear_off.x >= 0 && linear_off.y >= 0 && linear_off.z >= 0);
++   assert(tiled_off.x >= 0 && tiled_off.y >= 0 && tiled_off.z >= 0);
+ 
+    const struct ac_sdma_surf_linear surf_linear = {
+       .va = linear->va,
+       .offset =
+          {
+-            .x = linear_off.x,
+-            .y = linear_off.y,
+-            .z = linear_off.z,
++            .x = (uint32_t)linear_off.x,
++            .y = (uint32_t)linear_off.y,
++            .z = (uint32_t)linear_off.z,
+          },
+       .pitch = linear_pitch,
+       .slice_pitch = linear_slice_pitch,
+@@ -373,9 +442,9 @@ radv_sdma_emit_copy_tiled_sub_window(con
+       .bpp = tiled->bpp,
+       .offset =
+          {
+-            .x = tiled_off.x,
+-            .y = tiled_off.y,
+-            .z = tiled_off.z,
++            .x = (uint32_t)tiled_off.x,
++            .y = (uint32_t)tiled_off.y,
++            .z = (uint32_t)tiled_off.z,
+          },
+       .extent =
+          {
+@@ -389,26 +458,39 @@ radv_sdma_emit_copy_tiled_sub_window(con
+       .surf_type = tiled->surface_type,
+       .meta_va = tiled->meta_va,
+       .htile_enabled = tiled->htile_enabled,
+-
+    };
+ 
+    radeon_check_space(device->ws, cs->b, 17);
+-   ac_emit_sdma_copy_tiled_sub_window(cs->b, &pdev->info, &surf_linear, &surf_tiled, detile, ext.width, ext.height,
+-                                      ext.depth, false);
++   ac_emit_sdma_copy_tiled_sub_window(cs->b, &pdev->info, &surf_linear, &surf_tiled, detile,
++                                      ext.width, ext.height, ext.depth, false);
+ }
+ 
+ static void
+ radv_sdma_emit_copy_t2t_sub_window(const struct radv_device *device, struct radv_cmd_stream *cs,
+-                                   const struct radv_sdma_surf *const src, const struct radv_sdma_surf *const dst,
++                                   const struct radv_sdma_surf *const src,
++                                   const struct radv_sdma_surf *const dst,
+                                    const VkExtent3D px_extent)
+ {
+    const struct radv_physical_device *pdev = radv_device_physical(device);
++
++   /* Validate block sizes to prevent division by zero. */
++   assert(src->blk_w > 0 && src->blk_h > 0);
++   assert(dst->blk_w > 0 && dst->blk_h > 0);
++
++   /* For tiled operations, the surface descriptors must be valid. */
++   assert(src->surf != NULL);
++   assert(dst->surf != NULL);
++
+    const VkOffset3D src_off = radv_sdma_pixel_offset_to_blocks(src->offset, src->blk_w, src->blk_h);
+    const VkOffset3D dst_off = radv_sdma_pixel_offset_to_blocks(dst->offset, dst->blk_w, dst->blk_h);
+    const VkExtent3D src_ext = radv_sdma_pixel_extent_to_blocks(src->extent, src->blk_w, src->blk_h);
+    const VkExtent3D dst_ext = radv_sdma_pixel_extent_to_blocks(dst->extent, dst->blk_w, dst->blk_h);
+    const VkExtent3D ext = radv_sdma_pixel_extent_to_blocks(px_extent, src->blk_w, src->blk_h);
+ 
++   /* Validate offsets are non-negative for SDMA packet. */
++   assert(src_off.x >= 0 && src_off.y >= 0 && src_off.z >= 0);
++   assert(dst_off.x >= 0 && dst_off.y >= 0 && dst_off.z >= 0);
++
+    const struct ac_sdma_surf_tiled surf_src = {
+       .surf = src->surf,
+       .va = src->va,
+@@ -416,9 +498,9 @@ radv_sdma_emit_copy_t2t_sub_window(const
+       .bpp = src->bpp,
+       .offset =
+          {
+-            .x = src_off.x,
+-            .y = src_off.y,
+-            .z = src_off.z,
++            .x = (uint32_t)src_off.x,
++            .y = (uint32_t)src_off.y,
++            .z = (uint32_t)src_off.z,
+          },
+       .extent =
+          {
+@@ -441,9 +523,9 @@ radv_sdma_emit_copy_t2t_sub_window(const
+       .bpp = dst->bpp,
+       .offset =
+          {
+-            .x = dst_off.x,
+-            .y = dst_off.y,
+-            .z = dst_off.z,
++            .x = (uint32_t)dst_off.x,
++            .y = (uint32_t)dst_off.y,
++            .z = (uint32_t)dst_off.z,
+          },
+       .extent =
+          {
+@@ -460,14 +542,21 @@ radv_sdma_emit_copy_t2t_sub_window(const
+    };
+ 
+    radeon_check_space(device->ws, cs->b, 18);
+-   ac_emit_sdma_copy_t2t_sub_window(cs->b, &pdev->info, &surf_src, &surf_dst, ext.width, ext.height, ext.depth);
++   ac_emit_sdma_copy_t2t_sub_window(cs->b, &pdev->info, &surf_src, &surf_dst,
++                                    ext.width, ext.height, ext.depth);
+ }
+ 
+ void
+ radv_sdma_copy_buffer_image(const struct radv_device *device, struct radv_cmd_stream *cs,
+-                            const struct radv_sdma_surf *buf, const struct radv_sdma_surf *img, const VkExtent3D extent,
+-                            bool to_image)
++                            const struct radv_sdma_surf *buf, const struct radv_sdma_surf *img,
++                            const VkExtent3D extent, bool to_image)
+ {
++   /* Early return for empty copies - prevents underflow in SDMA packet fields
++    * where hardware expects (dimension - 1) encoding.
++    */
++   if (extent.width == 0 || extent.height == 0 || extent.depth == 0)
++      return;
++
+    if (img->is_linear) {
+       if (to_image)
+          radv_sdma_emit_copy_linear_sub_window(device, cs, buf, img, extent);
+@@ -501,6 +590,10 @@ radv_sdma_copy_buffer_image_unaligned(co
+                                       const struct radv_sdma_surf *buf, const struct radv_sdma_surf *img_in,
+                                       const VkExtent3D base_extent, struct radeon_winsys_bo *temp_bo, bool to_image)
+ {
++   /* Early return for empty copies - avoids unnecessary work. */
++   if (base_extent.width == 0 || base_extent.height == 0 || base_extent.depth == 0)
++      return;
++
+    const struct radv_sdma_chunked_copy_info info = radv_sdma_get_chunked_copy_info(device, img_in, base_extent);
+    struct radv_sdma_surf img = *img_in;
+    struct radv_sdma_surf tmp = {
+@@ -569,9 +662,16 @@ radv_sdma_copy_buffer_image_unaligned(co
+ }
+ 
+ void
+-radv_sdma_copy_image(const struct radv_device *device, struct radv_cmd_stream *cs, const struct radv_sdma_surf *src,
+-                     const struct radv_sdma_surf *dst, const VkExtent3D extent)
++radv_sdma_copy_image(const struct radv_device *device, struct radv_cmd_stream *cs,
++                     const struct radv_sdma_surf *src, const struct radv_sdma_surf *dst,
++                     const VkExtent3D extent)
+ {
++   /* Early return for empty copies - prevents underflow in SDMA packet fields
++    * where hardware expects (dimension - 1) encoding.
++    */
++   if (extent.width == 0 || extent.height == 0 || extent.depth == 0)
++      return;
++
+    if (src->is_linear) {
+       if (dst->is_linear) {
+          radv_sdma_emit_copy_linear_sub_window(device, cs, src, dst, extent);
+@@ -598,10 +698,19 @@ radv_sdma_use_t2t_scanline_copy(const st
+    /* SDMA can't do format conversion. */
+    assert(src->bpp == dst->bpp);
+ 
++   /* SDMA only supports power-of-two bpp up to 16 bytes.
++    * Reject unsupported bpp to prevent array out-of-bounds access below.
++    */
++   if (!util_is_power_of_two_nonzero(src->bpp) || src->bpp > 16)
++      return true;
++
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+    const enum sdma_version ver = pdev->info.sdma_ip_version;
++
+    if (ver < SDMA_5_0) {
+-      /* SDMA v4.x and older doesn't support proper mip level selection. */
++      /* SDMA v4.x and older doesn't support proper mip level selection in T2T packets.
++       * For Vega 64 (SDMA 4.0), we must use scanline copy for any multi-mip image.
++       */
+       if (src->mip_levels > 1 || dst->mip_levels > 1)
+          return true;
+    }
+@@ -622,8 +731,14 @@ radv_sdma_use_t2t_scanline_copy(const st
+    const bool needs_3d_alignment = src->is_3d && (src->micro_tile_mode == RADEON_MICRO_MODE_DISPLAY ||
+                                                   src->micro_tile_mode == RADEON_MICRO_MODE_STANDARD);
+    const unsigned log2bpp = util_logbase2(src->bpp);
++
++   /* log2bpp is guaranteed to be 0-4 due to the bpp validation above. */
++   assert(log2bpp < ARRAY_SIZE(radv_sdma_t2t_alignment_2d_and_planar));
++   assert(log2bpp < ARRAY_SIZE(radv_sdma_t2t_alignment_3d));
++
+    const VkExtent3D *const alignment =
+-      needs_3d_alignment ? &radv_sdma_t2t_alignment_3d[log2bpp] : &radv_sdma_t2t_alignment_2d_and_planar[log2bpp];
++      needs_3d_alignment ? &radv_sdma_t2t_alignment_3d[log2bpp]
++                         : &radv_sdma_t2t_alignment_2d_and_planar[log2bpp];
+ 
+    const VkExtent3D copy_extent_blk = radv_sdma_pixel_extent_to_blocks(extent, src->blk_w, src->blk_h);
+    const VkOffset3D src_offset_blk = radv_sdma_pixel_offset_to_blocks(src->offset, src->blk_w, src->blk_h);
+@@ -634,18 +749,22 @@ radv_sdma_use_t2t_scanline_copy(const st
+        !util_is_aligned(copy_extent_blk.depth, alignment->depth))
+       return true;
+ 
+-   if (!util_is_aligned(src_offset_blk.x, alignment->width) || !util_is_aligned(src_offset_blk.y, alignment->height) ||
++   if (!util_is_aligned(src_offset_blk.x, alignment->width) ||
++       !util_is_aligned(src_offset_blk.y, alignment->height) ||
+        !util_is_aligned(src_offset_blk.z, alignment->depth))
+       return true;
+ 
+-   if (!util_is_aligned(dst_offset_blk.x, alignment->width) || !util_is_aligned(dst_offset_blk.y, alignment->height) ||
++   if (!util_is_aligned(dst_offset_blk.x, alignment->width) ||
++       !util_is_aligned(dst_offset_blk.y, alignment->height) ||
+        !util_is_aligned(dst_offset_blk.z, alignment->depth))
+       return true;
+ 
+-   if (ver < SDMA_6_0 && ((src->format == VK_FORMAT_S8_UINT && vk_format_is_color(dst->format)) ||
+-                          (vk_format_is_color(src->format) && dst->format == VK_FORMAT_S8_UINT))) {
++   if (ver < SDMA_6_0 &&
++       ((src->format == VK_FORMAT_S8_UINT && vk_format_is_color(dst->format)) ||
++        (vk_format_is_color(src->format) && dst->format == VK_FORMAT_S8_UINT))) {
+       /* For weird reasons, color<->stencil only T2T subwindow copies on SDMA4-5 don't work as
+        * expected, and the driver needs to fallback to scanline copies to workaround them.
++       * This affects Vega 64 (SDMA 4.0) and Navi 1x/2x (SDMA 5.x).
+        */
+       return true;
+    }
+@@ -658,28 +777,55 @@ radv_sdma_copy_image_t2t_scanline(const
+                                   const struct radv_sdma_surf *src, const struct radv_sdma_surf *dst,
+                                   const VkExtent3D extent, struct radeon_winsys_bo *temp_bo)
+ {
++   assert(device);
++   assert(cs);
++   assert(src);
++   assert(dst);
++   assert(temp_bo);
++
++   /* Early return for empty copies - avoids underflow in SDMA packet width/height/depth fields
++    * where the hardware expects (dimension - 1) encoding.
++    */
++   if (extent.width == 0 || extent.height == 0 || extent.depth == 0)
++      return;
++
++   /* SDMA cannot perform format conversion. Block dimensions and bytes-per-pixel must match
++    * between source and destination for the scanline copy algorithm to work correctly.
++    */
++   assert(src->blk_w == dst->blk_w);
++   assert(src->blk_h == dst->blk_h);
++   assert(src->bpp == dst->bpp);
++
+    const struct radv_sdma_chunked_copy_info info = radv_sdma_get_chunked_copy_info(device, src, extent);
++   const uint64_t temp_va = radv_buffer_get_va(temp_bo);
++
+    struct radv_sdma_surf t2l_src = *src;
+    struct radv_sdma_surf t2l_dst = {
+-      .va = radv_buffer_get_va(temp_bo),
++      .va = temp_va,
+       .bpp = src->bpp,
+       .blk_w = src->blk_w,
+       .blk_h = src->blk_h,
+       .pitch = info.aligned_row_pitch * src->blk_w,
++      .texel_scale = 1,
++      .is_linear = true,
+    };
++
+    struct radv_sdma_surf l2t_dst = *dst;
+    struct radv_sdma_surf l2t_src = {
+-      .va = radv_buffer_get_va(temp_bo),
++      .va = temp_va,
+       .bpp = dst->bpp,
+       .blk_w = dst->blk_w,
+       .blk_h = dst->blk_h,
+       .pitch = info.aligned_row_pitch * dst->blk_w,
++      .texel_scale = 1,
++      .is_linear = true,
+    };
+ 
+    for (unsigned slice = 0; slice < extent.depth; ++slice) {
+       for (unsigned row = 0; row < info.extent_vertical_blocks; row += info.num_rows_per_copy) {
+          const unsigned rows = MIN2(info.extent_vertical_blocks - row, info.num_rows_per_copy);
+ 
++         /* Phase 1: Detile - copy from source tiled image to temporary linear buffer. */
+          const VkExtent3D t2l_extent = {
+             .width = info.extent_horizontal_blocks * src->blk_w,
+             .height = rows * src->blk_h,
+@@ -691,8 +837,13 @@ radv_sdma_copy_image_t2t_scanline(const
+          t2l_dst.slice_pitch = t2l_dst.pitch * t2l_extent.height;
+ 
+          radv_sdma_emit_copy_tiled_sub_window(device, cs, &t2l_src, &t2l_dst, t2l_extent, true);
++
++         /* SDMA NOP acts as a fence - wait for detile to complete before retiling
++          * to avoid RAW hazard on the temporary buffer.
++          */
+          radv_sdma_emit_nop(device, cs);
+ 
++         /* Phase 2: Retile - copy from temporary linear buffer to destination tiled image. */
+          const VkExtent3D l2t_extent = {
+             .width = info.extent_horizontal_blocks * dst->blk_w,
+             .height = rows * dst->blk_h,
+@@ -704,6 +855,10 @@ radv_sdma_copy_image_t2t_scanline(const
+          l2t_src.slice_pitch = l2t_src.pitch * l2t_extent.height;
+ 
+          radv_sdma_emit_copy_tiled_sub_window(device, cs, &l2t_dst, &l2t_src, l2t_extent, false);
++
++         /* Wait for retile to complete before reusing temp buffer in next iteration
++          * to avoid WAW hazard.
++          */
+          radv_sdma_emit_nop(device, cs);
+       }
+    }
+@@ -712,15 +867,21 @@ radv_sdma_copy_image_t2t_scanline(const
+ bool
+ radv_sdma_supports_image(const struct radv_device *device, const struct radv_image *image)
+ {
++   assert(device);
++   assert(image);
++
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+ 
++   /* Emulated formats require shader-based copies, not SDMA. */
+    if (radv_is_format_emulated(pdev, image->vk.format))
+       return false;
+ 
++   /* Sparse residency requires hardware support for proper page fault handling. */
+    if (!pdev->info.sdma_supports_sparse &&
+        (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT))
+       return false;
+ 
++   /* SDMA copy packets don't support MSAA sample patterns. */
+    if (image->vk.samples != VK_SAMPLE_COUNT_1_BIT)
+       return false;
+ 
+
+--- a/src/amd/vulkan/radv_cmd_buffer.h	2025-09-07 11:04:15.515661359 +0200
++++ b/src/amd/vulkan/radv_cmd_buffer.h	2025-11-19 11:09:14.952502874 +0200
+@@ -83,6 +83,10 @@ enum radv_dynamic_state_bits {
+    RADV_DYNAMIC_ALL = (1ull << 56) - 1,
+ };
+ 
++/* Compile-time validation: ensure all dynamic state bits fit in uint64_t. */
++static_assert(RADV_DYNAMIC_SCISSOR_WITH_COUNT < (1ull << 63),
++              "Dynamic state bits must fit in 64-bit storage");
++
+ enum radv_cmd_dirty_bits {
+    RADV_CMD_DIRTY_PIPELINE = 1ull << 0,
+    RADV_CMD_DIRTY_INDEX_BUFFER = 1ull << 1,
+@@ -129,6 +133,10 @@ enum radv_cmd_dirty_bits {
+    RADV_CMD_DIRTY_SHADER_QUERY = RADV_CMD_DIRTY_NGG_STATE | RADV_CMD_DIRTY_TASK_STATE,
+ };
+ 
++/* Compile-time validation: ensure all dirty bits fit in uint64_t. */
++static_assert(RADV_CMD_DIRTY_FSR_SURFACE_STATE < (1ull << 63),
++              "CMD dirty bits must fit in 64-bit storage");
++
+ enum radv_cmd_flush_bits {
+    /* Instruction cache. */
+    RADV_CMD_FLAG_INV_ICACHE = 1 << 0,
+@@ -168,6 +176,10 @@ enum radv_cmd_flush_bits {
+                                  RADV_CMD_FLAG_INV_L2 | RADV_CMD_FLAG_WB_L2 | RADV_CMD_FLAG_CS_PARTIAL_FLUSH),
+ };
+ 
++/* Compile-time validation: ensure all flush bits fit in enum (int). */
++static_assert(RADV_CMD_FLAG_VGT_STREAMOUT_SYNC < (1 << 30),
++              "Flush bits must fit in 32-bit enum");
++
+ struct radv_vertex_binding {
+    uint64_t addr;
+    VkDeviceSize size;
+@@ -593,7 +605,8 @@ radv_is_streamout_enabled(struct radv_cm
+    struct radv_streamout_state *so = &cmd_buffer->state.streamout;
+ 
+    /* Streamout must be enabled for the PRIMITIVES_GENERATED query to work. */
+-   return (so->streamout_enabled || cmd_buffer->state.active_prims_gen_queries) && !cmd_buffer->state.suspend_streamout;
++   return (so->streamout_enabled || cmd_buffer->state.active_prims_gen_queries) &&
++          !cmd_buffer->state.suspend_streamout;
+ }
+ 
+ ALWAYS_INLINE static unsigned
+
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -46,6 +46,14 @@
+ #include "util/compiler.h"
+ #include "util/fast_idiv_by_const.h"
+ 
++/* Vega-specific cache optimization constants */
++#define VEGA_L1_CACHE_LINE_SIZE 64
++#define VEGA_SCALAR_ALU_WIDTH 32
++
++/* Prefetch hints optimized for Vega/RDNA */
++#define VEGA_PREFETCH_READ(addr) __builtin_prefetch((const void *)(addr), 0, 3)
++#define VEGA_PREFETCH_WRITE(addr) __builtin_prefetch((const void *)(addr), 1, 3)
++
+ enum {
+    RADV_PREFETCH_VBO_DESCRIPTORS = (1 << 0),
+    RADV_PREFETCH_VS = (1 << 1),
+@@ -61,6 +69,65 @@ enum {
+    RADV_PREFETCH_GRAPHICS = (RADV_PREFETCH_VBO_DESCRIPTORS | RADV_PREFETCH_GFX_SHADERS),
+ };
+ 
++/*
++ * Optimized scalar copy for small, aligned structures.
++ * Avoids libc overhead for sizes known to fit in a few registers.
++ * Requires 4-byte alignment.
++ */
++ALWAYS_INLINE static void
++radv_fast_memcpy_aligned(void *__restrict dst, const void *__restrict src, size_t size)
++{
++   assert(dst != NULL);
++   assert(src != NULL);
++   assert(((uintptr_t)dst & 3) == 0);
++   assert(((uintptr_t)src & 3) == 0);
++
++   if (__builtin_constant_p(size)) {
++      switch (size) {
++      case 4:
++         *(uint32_t *)dst = *(const uint32_t *)src;
++         break;
++      case 8:
++         *(uint64_t *)dst = *(const uint64_t *)src;
++         break;
++      case 12:
++         ((uint64_t *)dst)[0] = ((const uint64_t *)src)[0];
++         ((uint32_t *)dst)[2] = ((const uint32_t *)src)[2];
++         break;
++      case 16: {
++         /* 128-bit load/store via SSE/AVX if enabled, or pair of 64-bit regs */
++         struct u128 { uint64_t a, b; };
++         *(struct u128 *)dst = *(const struct u128 *)src;
++         break;
++      }
++      case 32: {
++         const uint64_t *s = (const uint64_t *)src;
++         uint64_t *d = (uint64_t *)dst;
++         d[0] = s[0]; d[1] = s[1];
++         d[2] = s[2]; d[3] = s[3];
++         break;
++      }
++      case 64: {
++         /* Optimized for cache line copy */
++         const uint64_t *s = (const uint64_t *)src;
++         uint64_t *d = (uint64_t *)dst;
++         #pragma GCC unroll 8
++         for (int i = 0; i < 8; i++) d[i] = s[i];
++         break;
++      }
++      default:
++         memcpy(dst, src, size);
++         break;
++      }
++   } else {
++      /* For variable small sizes, memcpy is usually recognized as an intrinsic,
++       * but we can help the compiler for specific small counts if needed.
++       * For now, standard memcpy is safest for variable lengths.
++       */
++      memcpy(dst, src, size);
++   }
++}
++
+ static void radv_handle_image_transition(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image,
+                                          VkImageLayout src_layout, VkImageLayout dst_layout, uint32_t src_family_index,
+                                          uint32_t dst_family_index, const VkImageSubresourceRange *range,
+@@ -668,49 +735,153 @@ radv_cmd_set_rendering_input_attachment_
+ }
+ 
+ ALWAYS_INLINE static void
+-radv_cmd_set_sample_locations(struct radv_cmd_buffer *cmd_buffer, VkSampleCountFlagBits per_pixel, VkExtent2D grid_size,
+-                              uint32_t count, const VkSampleLocationEXT *sample_locations)
++radv_cmd_set_sample_locations(struct radv_cmd_buffer *cmd_buffer,
++                              VkSampleCountFlagBits per_pixel,
++                              VkExtent2D grid_size,
++                              uint32_t count,
++                              const VkSampleLocationEXT *sample_locations)
+ {
++   assert(cmd_buffer != NULL);
++
+    struct radv_cmd_state *state = &cmd_buffer->state;
+ 
++   /* Validate sample count - must be power of 2 and non-zero */
++   if (unlikely(per_pixel == 0 || (per_pixel & (per_pixel - 1)) != 0)) {
++      return;
++   }
++
+    state->dynamic.sample_location.per_pixel = per_pixel;
+    state->dynamic.sample_location.grid_size = grid_size;
+-   state->dynamic.sample_location.count = count;
+-   typed_memcpy(&state->dynamic.sample_location.locations[0], sample_locations, count);
++   /* Cap count to prevent buffer overflow in static storage */
++   state->dynamic.sample_location.count = MIN2(count, MAX_SAMPLE_LOCATIONS);
++
++   if (likely(count > 0 && sample_locations != NULL)) {
++      size_t copy_size = state->dynamic.sample_location.count * sizeof(VkSampleLocationEXT);
++      /* VkSampleLocationEXT is 2 floats (8 bytes), alignment is guaranteed */
++      radv_fast_memcpy_aligned(state->dynamic.sample_location.locations, sample_locations, copy_size);
++   }
+ 
+    state->dirty_dynamic |= RADV_DYNAMIC_SAMPLE_LOCATIONS;
+ }
+ 
+ ALWAYS_INLINE static void
+-radv_cmd_set_color_blend_equation(struct radv_cmd_buffer *cmd_buffer, uint32_t first, uint32_t count,
++radv_cmd_set_color_blend_equation(struct radv_cmd_buffer *cmd_buffer,
++                                  uint32_t first,
++                                  uint32_t count,
+                                   const struct radv_blend_equation_state *blend_eq)
+ {
++   assert(cmd_buffer != NULL);
++   assert(blend_eq != NULL);
++
+    struct radv_cmd_state *state = &cmd_buffer->state;
+ 
+-   typed_memcpy(state->dynamic.blend_eq.att + first, blend_eq->att, count);
+-   if (first == 0)
++   /* Bounds check with saturation to prevent overflow */
++   if (unlikely(first >= MAX_RTS)) {
++      return;
++   }
++   count = MIN2(count, MAX_RTS - first);
++
++   if (unlikely(count == 0)) {
++      return;
++   }
++
++   /* Optimized copy for blend equations.
++    * radv_blend_equation_state members are 32-bit integers, alignment safe.
++    */
++   radv_fast_memcpy_aligned(state->dynamic.blend_eq.att + first,
++                            blend_eq->att,
++                            count * sizeof(blend_eq->att[0]));
++
++   /* Update MRT0 dual source flag only if we touched attachment 0 */
++   if (first == 0) {
+       state->dynamic.blend_eq.mrt0_is_dual_src = blend_eq->mrt0_is_dual_src;
++   }
+ 
+    state->dirty_dynamic |= RADV_DYNAMIC_COLOR_BLEND_EQUATION;
+ }
+ 
+ ALWAYS_INLINE static void
+-radv_cmd_set_vertex_binding_strides(struct radv_cmd_buffer *cmd_buffer, uint32_t first, uint32_t count,
++radv_cmd_set_vertex_binding_strides(struct radv_cmd_buffer *cmd_buffer,
++                                    uint32_t first,
++                                    uint32_t count,
+                                     const uint16_t *strides)
+ {
++   assert(cmd_buffer != NULL);
++
+    struct radv_cmd_state *state = &cmd_buffer->state;
++   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
++   const struct radv_physical_device *pdev = radv_device_physical(device);
++
++   /* Bounds check with saturation */
++   if (unlikely(first >= MESA_VK_MAX_VERTEX_BINDINGS)) {
++      return;
++   }
++   count = MIN2(count, MESA_VK_MAX_VERTEX_BINDINGS - first);
+ 
+-   typed_memcpy(state->dynamic.vk.vi_binding_strides + first, strides, count);
++   if (unlikely(count == 0 || strides == NULL)) {
++      return;
++   }
++
++   /* Vega optimization: Fast path for single stride update to avoid loop overhead */
++   if (pdev->info.gfx_level == GFX9 && count == 1) {
++      if (state->dynamic.vk.vi_binding_strides[first] != strides[0]) {
++         state->dynamic.vk.vi_binding_strides[first] = strides[0];
++         state->dirty_dynamic |= RADV_DYNAMIC_VERTEX_INPUT_BINDING_STRIDE;
++      }
++      return;
++   }
++
++   /* Check if anything actually changed using vectorized loads if possible */
++   bool changed = false;
++   uint16_t *dst = state->dynamic.vk.vi_binding_strides + first;
++
++   /* Use 64-bit comparisons for blocks of 4 strides (4 * 16-bit = 64-bit)
++    * Checking alignment for safe casting.
++    */
++   if (count >= 4 && ((uintptr_t)dst & 7) == 0 && ((uintptr_t)strides & 7) == 0) {
++      uint32_t qwords = count / 4;
++      uint32_t remainder = count & 3;
++      const uint64_t *src64 = (const uint64_t *)strides;
++      uint64_t *dst64 = (uint64_t *)dst;
++
++      for (uint32_t i = 0; i < qwords; i++) {
++         if (dst64[i] != src64[i]) {
++            dst64[i] = src64[i];
++            changed = true;
++         }
++      }
++
++      /* Handle remainder */
++      for (uint32_t i = 0; i < remainder; i++) {
++         uint32_t idx = qwords * 4 + i;
++         if (dst[idx] != strides[idx]) {
++            dst[idx] = strides[idx];
++            changed = true;
++         }
++      }
++   } else {
++      /* Fallback for unaligned */
++      for (uint32_t i = 0; i < count; i++) {
++         if (dst[i] != strides[i]) {
++            dst[i] = strides[i];
++            changed = true;
++         }
++      }
++   }
+ 
+-   state->dirty_dynamic |= RADV_DYNAMIC_VERTEX_INPUT_BINDING_STRIDE;
++   if (changed) {
++      state->dirty_dynamic |= RADV_DYNAMIC_VERTEX_INPUT_BINDING_STRIDE;
++   }
+ }
+ 
+ ALWAYS_INLINE static void
+-radv_cmd_set_vertex_input(struct radv_cmd_buffer *cmd_buffer, const struct radv_vertex_input_state *vi_state)
++radv_cmd_set_vertex_input(struct radv_cmd_buffer *cmd_buffer,
++                          const struct radv_vertex_input_state *vi_state)
+ {
+    struct radv_cmd_state *state = &cmd_buffer->state;
+ 
+-   memcpy(&state->dynamic.vertex_input, vi_state, sizeof(*vi_state));
++   /* Use optimized memcpy for this large, aligned critical structure */
++   radv_fast_memcpy_aligned(&state->dynamic.vertex_input, vi_state, sizeof(*vi_state));
+ 
+    state->dirty_dynamic |= RADV_DYNAMIC_VERTEX_INPUT;
+    state->dirty |= RADV_CMD_DIRTY_VS_PROLOG_STATE | RADV_CMD_DIRTY_VERTEX_BUFFER;
+@@ -1126,9 +1297,26 @@ radv_write_data(struct radv_cmd_buffer *
+ static void
+ radv_emit_clear_data(struct radv_cmd_buffer *cmd_buffer, unsigned engine_sel, uint64_t va, unsigned size)
+ {
+-   uint32_t *zeroes = alloca(size);
+-   memset(zeroes, 0, size);
+-   radv_write_data(cmd_buffer, engine_sel, va, size / 4, zeroes, false);
++   /* 256-byte static zero buffer; resides in .rodata; avoids alloca and stack probes. */
++   static const uint32_t zeros[64] = {0};
++
++   /* All call sites must use 4-byte multiples. */
++   assert(size > 0 && (size % 4) == 0);
++
++   if (likely(size <= sizeof(zeros))) {
++      /* Fast path: single write for small clears (typical: 8–256 bytes). */
++      radv_write_data(cmd_buffer, engine_sel, va, size / 4, zeros, false);
++      return;
++   }
++
++   /* Larger regions: clear safely in chunks to avoid stack allocations/VLA. */
++   unsigned remaining = size;
++   while (remaining) {
++      const unsigned chunk = MIN2(remaining, sizeof(zeros));
++      radv_write_data(cmd_buffer, engine_sel, va, chunk / 4, zeros, false);
++      va += chunk;
++      remaining -= chunk;
++   }
+ }
+ 
+ static void
+@@ -1363,26 +1551,28 @@ bool
+ radv_cmd_buffer_upload_alloc_aligned(struct radv_cmd_buffer *cmd_buffer, unsigned size, unsigned alignment,
+                                      unsigned *out_offset, void **ptr)
+ {
++   /* All uploads must be 4-byte aligned for CP DMA. */
+    assert(size % 4 == 0);
+ 
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+    const struct radeon_info *gpu_info = &pdev->info;
+ 
+-   /* Align to the scalar cache line size if it results in this allocation
+-    * being placed in less of them.
++   /* For GFX9 (Vega) and newer, align to 64 bytes (L2 cache line size)
++    * to ensure coherency and avoid false sharing in cache.
+     */
+-   unsigned offset = cmd_buffer->upload.offset;
+-   unsigned line_size = gpu_info->gfx_level >= GFX10 ? 64 : 32;
+-   unsigned gap = align(offset, line_size) - offset;
+-   if ((size & (line_size - 1)) > gap)
+-      offset = align(offset, line_size);
+-
+-   if (alignment)
+-      offset = align(offset, alignment);
+-   if (offset + size > cmd_buffer->upload.size) {
+-      if (!radv_cmd_buffer_resize_upload_buf(cmd_buffer, size))
++   const unsigned cache_line_size = gpu_info->gfx_level >= GFX9 ? 64 : 32;
++   const unsigned final_alignment = MAX2(alignment, cache_line_size);
++
++   /* Align the current offset. */
++   unsigned offset = align(cmd_buffer->upload.offset, final_alignment);
++
++   /* Check for overflow or insufficient space */
++   if (unlikely(offset + size > cmd_buffer->upload.size)) {
++      if (!radv_cmd_buffer_resize_upload_buf(cmd_buffer, size)) {
+          return false;
++      }
++      /* After resizing, the new offset is always 0, which is naturally aligned. */
+       offset = 0;
+    }
+ 
+@@ -2657,6 +2847,13 @@ radv_emit_shader_prefetch(struct radv_cm
+    struct radv_cmd_stream *cs = radv_get_pm4_cs(cmd_buffer);
+    const uint64_t va = radv_shader_get_va(shader);
+ 
++   /* Invariant: Never prefetch a VA unless its BO is in the IB's validation list.
++    * Otherwise, the CP DMA might touch an unmapped VA, leading to gfx ring timeout.
++    * Adding the buffer is idempotent.
++    */
++   radv_cs_add_buffer(device->ws, cs->b, shader->bo);
++
++   /* Prefetch shader code into L2. This is a non-blocking hint. */
+    radv_cs_cp_dma_prefetch(device, cs, va, shader->code_size, cmd_buffer->state.predicating);
+ }
+ 
+@@ -3950,12 +4147,17 @@ gfx103_emit_vrs_state(struct radv_cmd_bu
+    }
+ }
+ 
+-static void
++void
+ radv_emit_graphics_shaders(struct radv_cmd_buffer *cmd_buffer)
+ {
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+ 
++   /* Warm L2 for first-stage graphics (VS/VBO/MS) as early as possible.
++    * This hides memory latency while setting up other state packets.
++    */
++   radv_emit_graphics_prefetch(cmd_buffer, true);
++
+    radv_foreach_stage (s, cmd_buffer->state.active_stages & RADV_GRAPHICS_STAGE_BITS) {
+       switch (s) {
+       case MESA_SHADER_VERTEX:
+@@ -3977,9 +4179,6 @@ radv_emit_graphics_shaders(struct radv_c
+       case MESA_SHADER_MESH:
+          radv_emit_mesh_shader(cmd_buffer);
+          break;
+-      case MESA_SHADER_TASK:
+-         radv_emit_compute_shader(pdev, cmd_buffer->gang.cs, cmd_buffer->state.shaders[MESA_SHADER_TASK]);
+-         break;
+       default:
+          UNREACHABLE("invalid bind stage");
+       }
+@@ -5811,51 +6010,46 @@ radv_emit_guardband_state(struct radv_cm
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+    const struct radv_dynamic_state *d = &cmd_buffer->state.dynamic;
+    unsigned vgt_outprim_type = cmd_buffer->state.vgt_outprim_type;
+-   const bool draw_points =
+-      radv_vgt_outprim_is_point(vgt_outprim_type) || radv_polygon_mode_is_point(d->vk.rs.polygon_mode);
+-   const bool draw_lines =
+-      radv_vgt_outprim_is_line(vgt_outprim_type) || radv_polygon_mode_is_line(d->vk.rs.polygon_mode);
+    struct radv_cmd_stream *cs = cmd_buffer->cs;
+-   int i;
++   const float max_range = 32767.0f;
+    float guardband_x = INFINITY, guardband_y = INFINITY;
+    float discard_x = 1.0f, discard_y = 1.0f;
+-   const float max_range = 32767.0f;
+ 
+    if (!d->vk.vp.viewport_count)
+       return;
+ 
+-   for (i = 0; i < d->vk.vp.viewport_count; i++) {
+-      float scale_x = fabsf(d->vp_xform[i].scale[0]);
+-      float scale_y = fabsf(d->vp_xform[i].scale[1]);
+-      const float translate_x = fabsf(d->vp_xform[i].translate[0]);
+-      const float translate_y = fabsf(d->vp_xform[i].translate[1]);
+-
+-      if (scale_x < 0.5)
+-         scale_x = 0.5;
+-      if (scale_y < 0.5)
+-         scale_y = 0.5;
+-
+-      guardband_x = MIN2(guardband_x, (max_range - translate_x) / scale_x);
+-      guardband_y = MIN2(guardband_y, (max_range - translate_y) / scale_y);
+-
+-      if (draw_points || draw_lines) {
+-         /* When rendering wide points or lines, we need to be more conservative about when to
+-          * discard them entirely. */
+-         float pixels;
+-
+-         if (draw_points) {
+-            pixels = 8191.875f;
+-         } else {
+-            pixels = d->vk.rs.line.width;
+-         }
+-
+-         /* Add half the point size / line width. */
+-         discard_x += pixels / (2.0 * scale_x);
+-         discard_y += pixels / (2.0 * scale_y);
+-
+-         /* Discard primitives that would lie entirely outside the clip region. */
+-         discard_x = MIN2(discard_x, guardband_x);
+-         discard_y = MIN2(discard_y, guardband_y);
++   const bool draw_points = radv_vgt_outprim_is_point(vgt_outprim_type) ||
++                            radv_polygon_mode_is_point(d->vk.rs.polygon_mode);
++   const bool draw_lines = radv_vgt_outprim_is_line(vgt_outprim_type) ||
++                           radv_polygon_mode_is_line(d->vk.rs.polygon_mode);
++   const bool wide = draw_points || draw_lines;
++   /* For wide points/lines, we need half the width to determine discard boundary */
++   const float pixels = draw_points ? 8191.875f : d->vk.rs.line.width;
++   const float halfpix = pixels * 0.5f;
++
++   for (unsigned i = 0; i < d->vk.vp.viewport_count; i++) {
++      float sx = fabsf(d->vp_xform[i].scale[0]);
++      float sy = fabsf(d->vp_xform[i].scale[1]);
++      /* Prevent division by zero or extremely small scales */
++      sx = fmaxf(sx, 0.5f);
++      sy = fmaxf(sy, 0.5f);
++
++      const float tx = fabsf(d->vp_xform[i].translate[0]);
++      const float ty = fabsf(d->vp_xform[i].translate[1]);
++
++      const float gbx = (max_range - tx) / sx;
++      const float gby = (max_range - ty) / sy;
++
++      guardband_x = fminf(guardband_x, gbx);
++      guardband_y = fminf(guardband_y, gby);
++
++      if (wide) {
++         discard_x = fminf(discard_x + (halfpix / sx), guardband_x);
++         discard_y = fminf(discard_y + (halfpix / sy), guardband_y);
++      } else {
++         /* If not wide, discard is capped by guardband */
++         discard_x = fminf(discard_x, guardband_x);
++         discard_y = fminf(discard_y, guardband_y);
+       }
+    }
+ 
+@@ -6774,22 +6968,76 @@ radv_write_vertex_descriptor(const struc
+ }
+ 
+ ALWAYS_INLINE static void
+-radv_write_vertex_descriptors_dynamic(const struct radv_cmd_buffer *cmd_buffer, const struct radv_shader *vs,
++radv_write_vertex_descriptors_dynamic(const struct radv_cmd_buffer *cmd_buffer,
++                                      const struct radv_shader *vs,
+                                       void *vb_ptr)
+ {
+-   unsigned desc_index = 0;
+-   for (unsigned i = 0; i < vs->info.vs.num_attributes; i++) {
+-      uint32_t *desc = &((uint32_t *)vb_ptr)[desc_index++ * 4];
++   assert(vs != NULL);
++   assert(vb_ptr != NULL);
++   assert(((uintptr_t)vb_ptr & 0xF) == 0); /* Require 16-byte alignment for descriptors */
++
++   uint32_t *desc_ptr = (uint32_t *)vb_ptr;
++   const unsigned num_attrs = vs->info.vs.num_attributes;
++
++   if (num_attrs == 0) {
++      return;
++   }
++
++   /* Prefetch vertex input state early for better cache utilization on Vega */
++   const struct radv_dynamic_state *d = &cmd_buffer->state.dynamic;
++   if (d != NULL) {
++      VEGA_PREFETCH_READ(&d->vertex_input);
++      VEGA_PREFETCH_READ(&d->vertex_input.bindings[0]);
++      VEGA_PREFETCH_READ(&d->vertex_input.offsets[0]);
++   }
++
++   /* Process descriptors sequentially */
++   for (unsigned i = 0; i < num_attrs; i++) {
++      uint32_t *desc = &desc_ptr[i * 4];
++
++      /* Bounds check */
++      if (unlikely(i >= MAX_VERTEX_ATTRIBS)) {
++         assert(!"Vertex attribute index out of bounds");
++         memset(desc, 0, 16);
++         continue;
++      }
++
+       radv_write_vertex_descriptor(cmd_buffer, vs, i, true, desc);
+    }
+ }
+ 
+ ALWAYS_INLINE static void
+-radv_write_vertex_descriptors(const struct radv_cmd_buffer *cmd_buffer, const struct radv_shader *vs, void *vb_ptr)
+-{
++radv_write_vertex_descriptors(const struct radv_cmd_buffer *cmd_buffer,
++                              const struct radv_shader *vs,
++                              void *vb_ptr)
++{
++   assert(vs != NULL);
++   assert(vb_ptr != NULL);
++   assert(((uintptr_t)vb_ptr & 0xF) == 0); /* Require 16-byte alignment */
++
++   uint32_t *desc_ptr = (uint32_t *)vb_ptr;
+    unsigned desc_index = 0;
+-   u_foreach_bit (i, vs->info.vs.vb_desc_usage_mask) {
+-      uint32_t *desc = &((uint32_t *)vb_ptr)[desc_index++ * 4];
++   const uint32_t vb_desc_usage_mask = vs->info.vs.vb_desc_usage_mask;
++
++   if (vb_desc_usage_mask == 0) {
++      return;
++   }
++
++   /* Prefetch vertex bindings for the used attributes */
++   const struct radv_vertex_binding *vb = cmd_buffer->vertex_bindings;
++   if (vb != NULL) {
++      VEGA_PREFETCH_READ(vb);
++   }
++
++   u_foreach_bit (i, vb_desc_usage_mask) {
++      if (unlikely(desc_index >= MAX_VERTEX_ATTRIBS)) {
++         assert(!"Too many vertex descriptors");
++         break;
++      }
++
++      uint32_t *desc = &desc_ptr[desc_index * 4];
++      desc_index++;
++
+       radv_write_vertex_descriptor(cmd_buffer, vs, i, false, desc);
+    }
+ }
+@@ -6972,16 +7220,36 @@ struct radv_prim_vertex_count {
+ static inline unsigned
+ radv_prims_for_vertices(struct radv_prim_vertex_count *info, unsigned num)
+ {
+-   if (num == 0)
++   if (num < info->min) {
+       return 0;
++   }
+ 
+-   if (info->incr == 0)
++   /* Implicitly handles info->incr == 0 div-by-zero check via this conditional */
++   if (info->incr == 0) {
+       return 0;
++   }
+ 
+-   if (num < info->min)
+-      return 0;
++   const unsigned n = num - info->min;
+ 
+-   return 1 + ((num - info->min) / info->incr);
++   /* Optimization: Use reciprocal multiplication for constant division
++    * to avoid high-latency DIV instructions on the CPU.
++    */
++   switch (info->incr) {
++   case 1:
++      return 1 + n;
++   case 2:
++      return 1 + (n >> 1);
++   case 3:
++      /* 1/3 ~ 0xAAAAAAAB / 2^33 */
++      return 1 + (unsigned)(((uint64_t)n * 0xAAAAAAABull) >> 33);
++   case 4:
++      return 1 + (n >> 2);
++   case 6:
++      /* 1/6 ~ 0x2AAAAAAB / 2^32 */
++      return 1 + (unsigned)(((uint64_t)n * 0x2AAAAAABull) >> 32);
++   default:
++      return 1 + (n / info->incr);
++   }
+ }
+ 
+ static const struct radv_prim_vertex_count prim_size_table[] = {
+@@ -7409,16 +7677,31 @@ can_skip_buffer_l2_flushes(struct radv_d
+  */
+ 
+ enum radv_cmd_flush_bits
+-radv_src_access_flush(struct radv_cmd_buffer *cmd_buffer, VkPipelineStageFlags2 src_stages, VkAccessFlags2 src_flags,
+-                      VkAccessFlags3KHR src3_flags, const struct radv_image *image,
++radv_src_access_flush(struct radv_cmd_buffer *cmd_buffer,
++                      VkPipelineStageFlags2 src_stages,
++                      VkAccessFlags2 src_flags,
++                      VkAccessFlags3KHR src3_flags,
++                      const struct radv_image *image,
+                       const VkImageSubresourceRange *range)
+ {
+-   const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
++   (void)src3_flags; /* Unused, ABI compatibility */
+ 
++   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
++
++   /* Expand stage-dependent access flags per Vulkan spec */
+    src_flags = vk_expand_src_access_flags2(src_stages, src_flags);
+ 
+-   bool has_CB_meta = true, has_DB_meta = true;
+-   bool image_is_coherent = image ? radv_image_is_l2_coherent(device, image, range) : false;
++   /* Metadata tracking */
++   bool has_CB_meta = true;
++   bool has_DB_meta = true;
++
++   /* Determine L2 coherency.
++    * GFX9 (Vega) typically has coherent L2 for buffers.
++    */
++   const bool resource_is_coherent =
++      image ? radv_image_is_l2_coherent(device, image, range)
++            : can_skip_buffer_l2_flushes(device);
++
+    enum radv_cmd_flush_bits flush_bits = 0;
+ 
+    if (image) {
+@@ -7428,14 +7711,17 @@ radv_src_access_flush(struct radv_cmd_bu
+          has_DB_meta = false;
+    }
+ 
+-   if (src_flags & VK_ACCESS_2_COMMAND_PREPROCESS_WRITE_BIT_EXT)
++   /* Command Preprocess (e.g., NGG/DGC): Requires strict L2 consistency */
++   if (src_flags & VK_ACCESS_2_COMMAND_PREPROCESS_WRITE_BIT_EXT) {
+       flush_bits |= RADV_CMD_FLAG_INV_L2;
++   }
++
++   /* Shader Storage & AS Writes */
++   if (src_flags & (VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
++                    VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)) {
+ 
+-   if (src_flags & (VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)) {
+-      /* since the STORAGE bit isn't set we know that this is a meta operation.
+-       * on the dst flush side we skip CB/DB flushes without the STORAGE bit, so
+-       * set it here. */
+       if (image && !(image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
++         /* Handle meta operation writes via non-storage paths */
+          if (vk_format_is_depth_or_stencil(image->vk.format)) {
+             flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_DB;
+          } else {
+@@ -7443,37 +7729,50 @@ radv_src_access_flush(struct radv_cmd_bu
+          }
+       }
+ 
+-      if (!image_is_coherent)
++      /* Invalidate L2 if resource is not coherent to ensure visibility */
++      if (!resource_is_coherent) {
+          flush_bits |= RADV_CMD_FLAG_INV_L2;
++      }
+    }
+ 
+-   if (src_flags &
+-       (VK_ACCESS_2_TRANSFORM_FEEDBACK_WRITE_BIT_EXT | VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT)) {
+-      if (!image_is_coherent)
++   /* Transform Feedback & Counters (Buffers) */
++   if (src_flags & (VK_ACCESS_2_TRANSFORM_FEEDBACK_WRITE_BIT_EXT |
++                    VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT)) {
++      if (!resource_is_coherent) {
+          flush_bits |= RADV_CMD_FLAG_WB_L2;
++      }
+    }
+ 
++   /* Color Attachment Writes */
+    if (src_flags & VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT) {
+       flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB;
+-      if (!image_is_coherent)
+-         flush_bits |= RADV_CMD_FLAG_INV_L2;
++
++      if (!resource_is_coherent)
++         flush_bits |= RADV_CMD_FLAG_WB_L2;
++
+       if (has_CB_meta)
+          flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB_META;
+    }
+ 
++   /* Depth/Stencil Attachment Writes */
+    if (src_flags & VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT) {
+       flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_DB;
+-      if (!image_is_coherent)
+-         flush_bits |= RADV_CMD_FLAG_INV_L2;
++
++      if (!resource_is_coherent)
++         flush_bits |= RADV_CMD_FLAG_WB_L2;
++
+       if (has_DB_meta)
+          flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_DB_META;
+    }
+ 
++   /* Transfer Writes */
+    if (src_flags & VK_ACCESS_2_TRANSFER_WRITE_BIT) {
+-      flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB | RADV_CMD_FLAG_FLUSH_AND_INV_DB;
++      flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB |
++                    RADV_CMD_FLAG_FLUSH_AND_INV_DB;
+ 
+-      if (!image_is_coherent)
++      if (!resource_is_coherent)
+          flush_bits |= RADV_CMD_FLAG_INV_L2;
++
+       if (has_CB_meta)
+          flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB_META;
+       if (has_DB_meta)
+@@ -7484,18 +7783,32 @@ radv_src_access_flush(struct radv_cmd_bu
+ }
+ 
+ enum radv_cmd_flush_bits
+-radv_dst_access_flush(struct radv_cmd_buffer *cmd_buffer, VkPipelineStageFlags2 dst_stages, VkAccessFlags2 dst_flags,
+-                      VkAccessFlags3KHR dst3_flags, const struct radv_image *image,
++radv_dst_access_flush(struct radv_cmd_buffer *cmd_buffer,
++                      VkPipelineStageFlags2 dst_stages,
++                      VkAccessFlags2 dst_flags,
++                      VkAccessFlags3KHR dst3_flags,
++                      const struct radv_image *image,
+                       const VkImageSubresourceRange *range)
+ {
++   (void)dst3_flags; /* Unused */
++
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+-   bool has_CB_meta = true, has_DB_meta = true;
+-   enum radv_cmd_flush_bits flush_bits = 0;
+-   bool flush_CB = true, flush_DB = true;
+-   bool image_is_coherent = image ? radv_image_is_l2_coherent(device, image, range) : false;
++
++   bool has_CB_meta = true;
++   bool has_DB_meta = true;
++   bool flush_CB = true;
++   bool flush_DB = true;
++
++   const bool resource_is_coherent =
++      image ? radv_image_is_l2_coherent(device, image, range)
++            : can_skip_buffer_l2_flushes(device);
++
++   /* Determine if L2 metadata flush is needed (legacy HW workaround for GFX < 12) */
+    bool flush_L2_metadata = false;
+ 
++   enum radv_cmd_flush_bits flush_bits = 0;
++
+    dst_flags = vk_expand_dst_access_flags2(dst_stages, dst_flags);
+ 
+    if (image) {
+@@ -7512,17 +7825,16 @@ radv_dst_access_flush(struct radv_cmd_bu
+ 
+    flush_L2_metadata = (has_CB_meta || has_DB_meta) && pdev->info.gfx_level < GFX12;
+ 
+-   /* All the L2 invalidations below are not the CB/DB. So if there are no incoherent images
+-    * in the L2 cache in CB/DB mode then they are already usable from all the other L2 clients. */
+-   image_is_coherent |= can_skip_buffer_l2_flushes(device) && !cmd_buffer->state.rb_noncoherent_dirty;
+-
+-   if (dst_flags & (VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_CONDITIONAL_RENDERING_READ_BIT_EXT)) {
+-      /* SMEM loads are used to read compute dispatch size in shaders */
+-      if ((dst_flags & VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT) && !device->load_grid_size_from_user_sgpr) {
++   /* Indirect Command Reads */
++   if (dst_flags & (VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT |
++                    VK_ACCESS_2_CONDITIONAL_RENDERING_READ_BIT_EXT)) {
++      /* Scalar cache invalidation for SMEM loads */
++      if ((dst_flags & VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT) &&
++          !device->load_grid_size_from_user_sgpr) {
+          flush_bits |= RADV_CMD_FLAG_INV_SCACHE;
+       }
+ 
+-      /* Ensure the DGC meta shader can read the commands. */
++      /* DGC meta shader support */
+       if (device->vk.enabled_features.deviceGeneratedCommands) {
+          flush_bits |= RADV_CMD_FLAG_INV_SCACHE | RADV_CMD_FLAG_INV_VCACHE;
+          if (pdev->info.gfx_level < GFX9)
+@@ -7530,45 +7842,60 @@ radv_dst_access_flush(struct radv_cmd_bu
+       }
+    }
+ 
+-   if (dst_flags & VK_ACCESS_2_UNIFORM_READ_BIT)
++   /* Uniform Reads */
++   if (dst_flags & VK_ACCESS_2_UNIFORM_READ_BIT) {
+       flush_bits |= RADV_CMD_FLAG_INV_VCACHE | RADV_CMD_FLAG_INV_SCACHE;
++   }
+ 
+-   if (dst_flags & (VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT |
++   /* Vertex/Index/Input Attachment/Transfer Reads */
++   if (dst_flags & (VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
++                    VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT |
+                     VK_ACCESS_2_TRANSFER_READ_BIT)) {
+       flush_bits |= RADV_CMD_FLAG_INV_VCACHE;
+ 
+       if (flush_L2_metadata)
+          flush_bits |= RADV_CMD_FLAG_INV_L2_METADATA;
+-      if (!image_is_coherent)
++
++      if (!resource_is_coherent)
+          flush_bits |= RADV_CMD_FLAG_INV_L2;
+    }
+ 
+-   if (dst_flags & VK_ACCESS_2_DESCRIPTOR_BUFFER_READ_BIT_EXT)
++   /* Descriptor Buffer Reads */
++   if (dst_flags & VK_ACCESS_2_DESCRIPTOR_BUFFER_READ_BIT_EXT) {
+       flush_bits |= RADV_CMD_FLAG_INV_SCACHE;
++   }
++
++   /* Storage/AS/Binding/Sampled Reads */
++   if (dst_flags & (VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
++                    VK_ACCESS_2_SHADER_BINDING_TABLE_READ_BIT_KHR |
++                    VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
++                    VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)) {
+ 
+-   if (dst_flags & (VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_BINDING_TABLE_READ_BIT_KHR |
+-                    VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)) {
+-      if (dst_flags & (VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_BINDING_TABLE_READ_BIT_KHR |
++      if (dst_flags & (VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
++                       VK_ACCESS_2_SHADER_BINDING_TABLE_READ_BIT_KHR |
+                        VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR)) {
+-         /* Unlike LLVM, ACO uses SMEM for SSBOs and we have to
+-          * invalidate the scalar cache. */
++         /* SMEM loads usage on ACO/non-LLVM */
+          if (!pdev->use_llvm && !image)
+             flush_bits |= RADV_CMD_FLAG_INV_SCACHE;
+       }
+ 
+       flush_bits |= RADV_CMD_FLAG_INV_VCACHE;
++
+       if (flush_L2_metadata)
+          flush_bits |= RADV_CMD_FLAG_INV_L2_METADATA;
+-      if (!image_is_coherent)
++
++      if (!resource_is_coherent)
+          flush_bits |= RADV_CMD_FLAG_INV_L2;
+    }
+ 
++   /* Command Preprocess Read */
+    if (dst_flags & VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT) {
+       flush_bits |= RADV_CMD_FLAG_INV_VCACHE;
+       if (pdev->info.gfx_level < GFX9)
+          flush_bits |= RADV_CMD_FLAG_INV_L2;
+    }
+ 
++   /* Color Attachment Read */
+    if (dst_flags & VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT) {
+       if (flush_CB)
+          flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB;
+@@ -7576,6 +7903,7 @@ radv_dst_access_flush(struct radv_cmd_bu
+          flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB_META;
+    }
+ 
++   /* Depth/Stencil Attachment Read */
+    if (dst_flags & VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT) {
+       if (flush_DB)
+          flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_DB;

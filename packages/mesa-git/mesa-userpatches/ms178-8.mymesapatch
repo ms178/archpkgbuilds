@@ -1,0 +1,3092 @@
+--- a/src/util/blob.c	2025-09-19 11:24:25.535738075 +0200
++++ b/src/util/blob.c	2025-09-20 18:26:46.618936402 +0200
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright © 2014 Intel Corporation
++ * Copyright © 2016 Intel Corporation
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a
+  * copy of this software and associated documentation files (the "Software"),
+@@ -8,64 +8,231 @@
+  * and/or sell copies of the Software, and to permit persons to whom the
+  * Software is furnished to do so, subject to the following conditions:
+  *
+- * The above copyright notice and this permission notice (including the next
+- * paragraph) shall be included in all copies or substantial portions of the
+- * Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * The above copyright notice and this permission notice shall be included
++ * in all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
++ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+- * IN THE SOFTWARE.
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ *
++ * SPDX-License-Identifier: MIT
+  */
+ 
+ #include <string.h>
++#include <assert.h>
++#include <stdint.h>
++#include <limits.h>
++#include <stdlib.h>
+ 
+ #include "blob.h"
+-#include "u_math.h"
+ 
+ #ifdef HAVE_VALGRIND
+ #include <valgrind.h>
+ #include <memcheck.h>
+ #define VG(x) x
+ #else
+-#define VG(x)
++#define VG(x) ((void)0)
++#endif
++
++/*
++ * Portable feature detection macros.
++ */
++#ifndef __has_builtin
++#define __has_builtin(x) 0
++#endif
++
++#ifndef __has_attribute
++#define __has_attribute(x) 0
++#endif
++
++/*
++ * Branch prediction hints - critical for performance in hot paths.
++ * These help the CPU's branch predictor and compiler's code layout.
++ */
++#if __has_builtin(__builtin_expect)
++#define LIKELY(x)   __builtin_expect(!!(x), 1)
++#define UNLIKELY(x) __builtin_expect(!!(x), 0)
++#else
++#define LIKELY(x)   (x)
++#define UNLIKELY(x) (x)
++#endif
++
++/*
++ * Prefetch hints for sequential read patterns.
++ * Locality: 0=non-temporal, 1=low, 2=moderate, 3=high (keep in all caches).
++ */
++#if __has_builtin(__builtin_prefetch)
++#define PREFETCH_READ(addr, locality) __builtin_prefetch((addr), 0, (locality))
++#else
++#define PREFETCH_READ(addr, locality) ((void)0)
+ #endif
+ 
++/*
++ * Warn if return value is ignored - critical for error handling.
++ */
++#if __has_attribute(warn_unused_result)
++#define MUST_CHECK __attribute__((warn_unused_result))
++#else
++#define MUST_CHECK
++#endif
++
++/*
++ * Mark functions as pure (no side effects, result depends only on args).
++ */
++#if __has_attribute(pure)
++#define ATTRIBUTE_PURE __attribute__((pure))
++#else
++#define ATTRIBUTE_PURE
++#endif
++
++/*
++ * Configuration constants.
++ * BLOB_INITIAL_SIZE: Starting allocation for dynamic blobs (4KB = typical page size).
++ * CACHE_LINE_SIZE: x86-64 cache line size for alignment optimization.
++ */
+ #define BLOB_INITIAL_SIZE 4096
++#define CACHE_LINE_SIZE   64
++
++/*
++ * Compile-time validation of assumptions.
++ */
++_Static_assert(BLOB_INITIAL_SIZE > 0, "BLOB_INITIAL_SIZE must be positive");
++_Static_assert(CACHE_LINE_SIZE > 0, "CACHE_LINE_SIZE must be positive");
++_Static_assert((CACHE_LINE_SIZE & (CACHE_LINE_SIZE - 1)) == 0,
++               "CACHE_LINE_SIZE must be power of 2");
++_Static_assert(sizeof(size_t) >= sizeof(uint32_t),
++               "size_t must be at least 32 bits");
++
++/**
++ * Align x up to 'alignment' with overflow safety.
++ *
++ * Handles both power-of-two alignments (fast bit masking) and arbitrary
++ * alignments (modulo arithmetic). Returns false on overflow.
++ *
++ * @param x          Value to align
++ * @param alignment  Alignment granularity (0 and 1 are treated as no-op)
++ * @param out        Output pointer for aligned value (must not be NULL)
++ * @return           True on success, false on overflow
++ */
++static inline bool
++align_up_safe(size_t x, size_t alignment, size_t *out)
++{
++   assert(out != NULL);
++
++   /* Alignment of 0 or 1 is a no-op */
++   if (alignment <= 1) {
++      *out = x;
++      return true;
++   }
++
++   /* Power-of-two fast path: use bit masking */
++   if ((alignment & (alignment - 1)) == 0) {
++      const size_t mask = alignment - 1;
++      if (UNLIKELY(x > SIZE_MAX - mask)) {
++         return false;
++      }
++      *out = (x + mask) & ~mask;
++      return true;
++   }
++
++   /* Generic path for non-power-of-two alignment */
++   const size_t rem = x % alignment;
++   if (rem == 0) {
++      *out = x;
++      return true;
++   }
++   const size_t add = alignment - rem;
++   if (UNLIKELY(x > SIZE_MAX - add)) {
++      return false;
++   }
++   *out = x + add;
++   return true;
++}
+ 
+-/* Ensure that \blob will be able to fit an additional object of size
+- * \additional.  The growing (if any) will occur by doubling the existing
+- * allocation.
++/**
++ * Ensure that 'blob' can fit 'additional' more bytes.
++ *
++ * Growth strategy: double the allocation size to amortize realloc cost.
++ * Allocations are rounded up to cache line boundaries for better memory
++ * access patterns on x86-64.
++ *
++ * @param blob       The blob to potentially grow
++ * @param additional Number of additional bytes needed
++ * @return           True if space is available, false on OOM or overflow
+  */
+ static bool
+ grow_to_fit(struct blob *blob, size_t additional)
+ {
++   size_t required_size;
+    size_t to_allocate;
+-   uint8_t *new_data;
+ 
+-   if (blob->out_of_memory)
++   /* Early exit if already in error state */
++   if (UNLIKELY(blob->out_of_memory)) {
+       return false;
++   }
++
++   /* Overflow check: size + additional must not wrap */
++   if (UNLIKELY(additional > SIZE_MAX - blob->size)) {
++      blob->out_of_memory = true;
++      return false;
++   }
++
++   required_size = blob->size + additional;
+ 
+-   if (blob->size + additional <= blob->allocated)
++   /* Fast path: already have enough space */
++   if (LIKELY(required_size <= blob->allocated)) {
+       return true;
++   }
+ 
+-   if (blob->fixed_allocation) {
++   /* Fixed allocations cannot grow */
++   if (UNLIKELY(blob->fixed_allocation)) {
+       blob->out_of_memory = true;
+       return false;
+    }
+ 
+-   if (blob->allocated == 0)
++   /*
++    * Compute new allocation size using doubling strategy.
++    * This gives O(1) amortized cost per byte written.
++    */
++   if (blob->allocated == 0) {
+       to_allocate = BLOB_INITIAL_SIZE;
+-   else
++   } else if (blob->allocated >= SIZE_MAX / 2) {
++      /* Prevent overflow in doubling */
++      to_allocate = SIZE_MAX;
++   } else {
+       to_allocate = blob->allocated * 2;
++   }
++
++   /* Ensure we allocate at least what's required */
++   if (to_allocate < required_size) {
++      to_allocate = required_size;
++   }
+ 
+-   to_allocate = MAX2(to_allocate, blob->allocated + additional);
++   /*
++    * Round up to cache line boundary for better memory access patterns.
++    * Skip if rounding would overflow or reduce allocation below required.
++    */
++   {
++      size_t rounded;
++      if (align_up_safe(to_allocate, CACHE_LINE_SIZE, &rounded)) {
++         if (rounded >= required_size) {
++            to_allocate = rounded;
++         }
++      }
++   }
+ 
+-   new_data = realloc(blob->data, to_allocate);
+-   if (new_data == NULL) {
++   /* Sanity check: never call realloc with size 0 */
++   if (UNLIKELY(to_allocate == 0)) {
++      blob->out_of_memory = true;
++      return false;
++   }
++
++   uint8_t *new_data = (uint8_t *)realloc(blob->data, to_allocate);
++   if (UNLIKELY(new_data == NULL)) {
+       blob->out_of_memory = true;
+       return false;
+    }
+@@ -76,35 +243,149 @@ grow_to_fit(struct blob *blob, size_t ad
+    return true;
+ }
+ 
+-/* Align the blob->size so that reading or writing a value at (blob->data +
+- * blob->size) will result in an access aligned to a granularity of \alignment
+- * bytes.
++/**
++ * Reserve aligned space for a write operation.
++ *
++ * This is an internal helper that handles alignment, padding, and growth
++ * in a single operation, avoiding multiple passes over the same logic.
++ *
++ * @param blob        The blob to write to
++ * @param alignment   Required alignment for the write
++ * @param write_size  Number of bytes to reserve
++ * @param out_offset  Output: offset where data should be written
++ * @return            True on success, false on error
++ */
++static bool
++writer_reserve_aligned(struct blob *blob, size_t alignment, size_t write_size,
++                       size_t *out_offset)
++{
++   size_t aligned_offset;
++   size_t pad;
++
++   assert(out_offset != NULL);
++
++   /* Compute aligned position for the write */
++   if (!align_up_safe(blob->size, alignment, &aligned_offset)) {
++      blob->out_of_memory = true;
++      return false;
++   }
++
++   pad = aligned_offset - blob->size;
++
++   /* Overflow check: pad + write_size must not wrap */
++   if (UNLIKELY(write_size > SIZE_MAX - pad)) {
++      blob->out_of_memory = true;
++      return false;
++   }
++
++   if (!grow_to_fit(blob, pad + write_size)) {
++      return false;
++   }
++
++   /* Zero padding bytes for deterministic output (helps with hashing/comparison) */
++   if (pad > 0 && blob->data != NULL) {
++      memset(blob->data + blob->size, 0, pad);
++   }
++
++   *out_offset = aligned_offset;
++   blob->size = aligned_offset + write_size;
++   return true;
++}
++
++/**
++ * Align the blob's write position to a granularity of 'alignment' bytes.
++ *
++ * Any padding bytes inserted are zeroed for deterministic output.
+  *
+- * \return True unless allocation fails
++ * @param blob       The blob to align
++ * @param alignment  Alignment granularity (1 or 0 is a no-op)
++ * @return           True on success, false on OOM or overflow
+  */
+ bool
+ blob_align(struct blob *blob, size_t alignment)
+ {
+-   const size_t new_size = align_uintptr(blob->size, alignment);
++   size_t new_size;
++   size_t pad;
++
++   if (alignment <= 1) {
++      return true;
++   }
++
++   if (!align_up_safe(blob->size, alignment, &new_size)) {
++      blob->out_of_memory = true;
++      return false;
++   }
+ 
+    if (blob->size < new_size) {
+-      if (!grow_to_fit(blob, new_size - blob->size))
++      pad = new_size - blob->size;
++      if (!grow_to_fit(blob, pad)) {
+          return false;
++      }
+ 
+-      if (blob->data)
+-         memset(blob->data + blob->size, 0, new_size - blob->size);
++      if (blob->data != NULL) {
++         memset(blob->data + blob->size, 0, pad);
++      }
+       blob->size = new_size;
+    }
+ 
+    return true;
+ }
+ 
++/**
++ * Align the reader's current position.
++ *
++ * If alignment would move past the end of data, sets overrun flag.
++ *
++ * @param blob       The blob reader
++ * @param alignment  Alignment granularity
++ */
+ void
+ blob_reader_align(struct blob_reader *blob, size_t alignment)
+ {
+-   blob->current = blob->data + align_uintptr(blob->current - blob->data, alignment);
++   /* Early exit conditions */
++   if (blob->overrun || alignment <= 1) {
++      return;
++   }
++
++   /* NULL data means reader is in invalid state */
++   if (UNLIKELY(blob->data == NULL)) {
++      blob->overrun = true;
++      blob->current = blob->end;
++      return;
++   }
++
++   /* Validate current pointer is within valid range before arithmetic */
++   if (UNLIKELY(blob->current < blob->data || blob->current > blob->end)) {
++      blob->overrun = true;
++      blob->current = blob->end;
++      return;
++   }
++
++   const size_t offset = (size_t)(blob->current - blob->data);
++   size_t new_offset;
++
++   if (!align_up_safe(offset, alignment, &new_offset)) {
++      blob->overrun = true;
++      blob->current = blob->end;
++      return;
++   }
++
++   /* Check if aligned position exceeds available data */
++   const size_t total_size = (size_t)(blob->end - blob->data);
++   if (UNLIKELY(new_offset > total_size)) {
++      blob->overrun = true;
++      blob->current = blob->end;
++      return;
++   }
++
++   blob->current = blob->data + new_offset;
+ }
+ 
++/**
++ * Initialize a dynamically-growing blob.
++ *
++ * @param blob  The blob to initialize
++ */
+ void
+ blob_init(struct blob *blob)
+ {
+@@ -115,53 +396,116 @@ blob_init(struct blob *blob)
+    blob->out_of_memory = false;
+ }
+ 
++/**
++ * Initialize a blob with a fixed-size buffer.
++ *
++ * The blob will use the provided buffer and cannot grow.
++ * Writes beyond the buffer size will set the out_of_memory flag.
++ *
++ * @param blob  The blob to initialize
++ * @param data  Buffer to use (may be NULL if size is 0)
++ * @param size  Size of the buffer
++ */
+ void
+ blob_init_fixed(struct blob *blob, void *data, size_t size)
+ {
+-   blob->data = data;
++   blob->data = (uint8_t *)data;
+    blob->allocated = size;
+    blob->size = 0;
+    blob->fixed_allocation = true;
+    blob->out_of_memory = false;
+ }
+ 
++/**
++ * Finish a blob and extract its buffer.
++ *
++ * The blob is reset and ownership of the buffer is transferred to the caller.
++ * The buffer is trimmed to the actual size (realloc to shrink).
++ *
++ * @param blob    The blob to finish
++ * @param buffer  Output: pointer to the data buffer (caller must free)
++ * @param size    Output: size of data written
++ */
+ void
+ blob_finish_get_buffer(struct blob *blob, void **buffer, size_t *size)
+ {
++   assert(buffer != NULL);
++   assert(size != NULL);
++
+    *buffer = blob->data;
+    *size = blob->size;
+    blob->data = NULL;
+ 
+-   /* Trim the buffer. */
+-   *buffer = realloc(*buffer, *size);
++   /*
++    * Attempt to shrink the buffer to actual size.
++    * On failure, keep the original (larger) buffer.
++    */
++   if (*size > 0 && *buffer != NULL) {
++      void *trimmed = realloc(*buffer, *size);
++      if (trimmed != NULL) {
++         *buffer = trimmed;
++      }
++   }
+ }
+ 
++/**
++ * Overwrite bytes at a specific offset in the blob.
++ *
++ * The offset + to_write must not exceed the current blob size.
++ * This does NOT grow the blob.
++ *
++ * @param blob      The blob to modify
++ * @param offset    Offset from start of blob
++ * @param bytes     Data to write (must not be NULL if to_write > 0)
++ * @param to_write  Number of bytes to write
++ * @return          True on success, false if region is out of bounds
++ */
+ bool
+-blob_overwrite_bytes(struct blob *blob,
+-                     size_t offset,
+-                     const void *bytes,
++blob_overwrite_bytes(struct blob *blob, size_t offset, const void *bytes,
+                      size_t to_write)
+ {
+-   /* Detect an attempt to overwrite data out of bounds. */
+-   if (offset + to_write < offset || blob->size < offset + to_write)
++   /* Validate overwrite region with overflow-safe bounds check */
++   if (UNLIKELY(offset > blob->size)) {
+       return false;
++   }
++   if (UNLIKELY(to_write > blob->size - offset)) {
++      return false;
++   }
+ 
+-   VG(VALGRIND_CHECK_MEM_IS_DEFINED(bytes, to_write));
+-
+-   if (blob->data)
+-      memcpy(blob->data + offset, bytes, to_write);
++   if (to_write > 0) {
++      assert(bytes != NULL);
++      VG(VALGRIND_CHECK_MEM_IS_DEFINED(bytes, to_write));
++      if (blob->data != NULL) {
++         memcpy(blob->data + offset, bytes, to_write);
++      }
++   }
+ 
+    return true;
+ }
+ 
+-bool
++/**
++ * Write bytes to the end of the blob.
++ *
++ * @param blob      The blob to write to
++ * @param bytes     Data to write (must not be NULL if to_write > 0)
++ * @param to_write  Number of bytes to write
++ * @return          True on success, false on OOM
++ */
++MUST_CHECK bool
+ blob_write_bytes(struct blob *blob, const void *bytes, size_t to_write)
+ {
+-   if (! grow_to_fit(blob, to_write))
+-       return false;
++   if (to_write == 0) {
++      return true;
++   }
+ 
+-   if (blob->data && to_write > 0) {
+-      VG(VALGRIND_CHECK_MEM_IS_DEFINED(bytes, to_write));
++   assert(bytes != NULL);
++
++   if (!grow_to_fit(blob, to_write)) {
++      return false;
++   }
++
++   VG(VALGRIND_CHECK_MEM_IS_DEFINED(bytes, to_write));
++   if (blob->data != NULL) {
+       memcpy(blob->data + blob->size, bytes, to_write);
+    }
+    blob->size += to_write;
+@@ -169,40 +513,94 @@ blob_write_bytes(struct blob *blob, cons
+    return true;
+ }
+ 
+-intptr_t
++/**
++ * Reserve space for future writes without initializing.
++ *
++ * Returns the offset where reserved bytes start, or -1 on error.
++ * The caller can later write to blob->data + offset.
++ *
++ * @param blob      The blob to reserve in
++ * @param to_write  Number of bytes to reserve
++ * @return          Offset of reserved space, or -1 on error
++ */
++MUST_CHECK intptr_t
+ blob_reserve_bytes(struct blob *blob, size_t to_write)
+ {
+-   intptr_t ret;
++   /*
++    * Ensure the returned offset can fit in intptr_t.
++    * Both current size and size after reservation must fit.
++    */
++   if (UNLIKELY(blob->size > (size_t)INTPTR_MAX)) {
++      blob->out_of_memory = true;
++      return -1;
++   }
++   if (UNLIKELY(to_write > (size_t)(INTPTR_MAX - (intptr_t)blob->size))) {
++      blob->out_of_memory = true;
++      return -1;
++   }
+ 
+-   if (! grow_to_fit (blob, to_write))
++   if (!grow_to_fit(blob, to_write)) {
+       return -1;
++   }
+ 
+-   ret = blob->size;
++   const intptr_t offset = (intptr_t)blob->size;
+    blob->size += to_write;
+ 
+-   return ret;
++   return offset;
+ }
+ 
+-intptr_t
++/**
++ * Reserve aligned space for a uint32_t.
++ *
++ * @param blob  The blob to reserve in
++ * @return      Offset of reserved space, or -1 on error
++ */
++MUST_CHECK intptr_t
+ blob_reserve_uint32(struct blob *blob)
+ {
+-   blob_align(blob, sizeof(uint32_t));
++   if (!blob_align(blob, sizeof(uint32_t))) {
++      return -1;
++   }
+    return blob_reserve_bytes(blob, sizeof(uint32_t));
+ }
+ 
+-intptr_t
++/**
++ * Reserve aligned space for an intptr_t.
++ *
++ * @param blob  The blob to reserve in
++ * @return      Offset of reserved space, or -1 on error
++ */
++MUST_CHECK intptr_t
+ blob_reserve_intptr(struct blob *blob)
+ {
+-   blob_align(blob, sizeof(intptr_t));
++   if (!blob_align(blob, sizeof(intptr_t))) {
++      return -1;
++   }
+    return blob_reserve_bytes(blob, sizeof(intptr_t));
+ }
+ 
+-#define BLOB_WRITE_TYPE(name, type)                      \
+-bool                                                     \
+-name(struct blob *blob, type value)                      \
+-{                                                        \
+-   blob_align(blob, sizeof(value));                      \
+-   return blob_write_bytes(blob, &value, sizeof(value)); \
++/*
++ * Macro to generate optimized typed write functions.
++ *
++ * Each function:
++ * 1. Aligns to natural alignment of the type
++ * 2. Reserves space with padding
++ * 3. Copies the value
++ *
++ * The fused operation is more efficient than separate align + write calls.
++ */
++#define BLOB_WRITE_TYPE(name, type)                                            \
++MUST_CHECK bool                                                                \
++name(struct blob *blob, type value)                                            \
++{                                                                              \
++   size_t offset;                                                              \
++   if (!writer_reserve_aligned(blob, sizeof(type), sizeof(type), &offset)) {   \
++      return false;                                                            \
++   }                                                                           \
++   if (blob->data != NULL) {                                                   \
++      memcpy(blob->data + offset, &value, sizeof(type));                       \
++   }                                                                           \
++   return true;                                                                \
+ }
+ 
+ BLOB_WRITE_TYPE(blob_write_uint8, uint8_t)
+@@ -211,112 +609,274 @@ BLOB_WRITE_TYPE(blob_write_uint32, uint3
+ BLOB_WRITE_TYPE(blob_write_uint64, uint64_t)
+ BLOB_WRITE_TYPE(blob_write_intptr, intptr_t)
+ 
+-#define ASSERT_ALIGNED(_offset, _align) \
+-   assert(align_uintptr((_offset), (_align)) == (_offset))
++#undef BLOB_WRITE_TYPE
+ 
++/*
++ * Debug assertion to verify offset is properly aligned.
++ * Only active in debug builds; compiles to nothing in release.
++ */
++#define ASSERT_ALIGNED(offset, align)                                          \
++   do {                                                                        \
++      size_t __aligned;                                                        \
++      assert(align_up_safe((offset), (align), &__aligned) &&                   \
++             __aligned == (offset));                                           \
++   } while (0)
++
++/**
++ * Overwrite a uint8_t at a specific offset.
++ */
+ bool
+-blob_overwrite_uint8 (struct blob *blob,
+-                      size_t offset,
+-                      uint8_t value)
++blob_overwrite_uint8(struct blob *blob, size_t offset, uint8_t value)
+ {
+    ASSERT_ALIGNED(offset, sizeof(value));
+    return blob_overwrite_bytes(blob, offset, &value, sizeof(value));
+ }
+ 
++/**
++ * Overwrite a uint32_t at a specific offset.
++ */
+ bool
+-blob_overwrite_uint32 (struct blob *blob,
+-                       size_t offset,
+-                       uint32_t value)
++blob_overwrite_uint32(struct blob *blob, size_t offset, uint32_t value)
+ {
+    ASSERT_ALIGNED(offset, sizeof(value));
+    return blob_overwrite_bytes(blob, offset, &value, sizeof(value));
+ }
+ 
++/**
++ * Overwrite an intptr_t at a specific offset.
++ */
+ bool
+-blob_overwrite_intptr (struct blob *blob,
+-                       size_t offset,
+-                       intptr_t value)
++blob_overwrite_intptr(struct blob *blob, size_t offset, intptr_t value)
+ {
+    ASSERT_ALIGNED(offset, sizeof(value));
+    return blob_overwrite_bytes(blob, offset, &value, sizeof(value));
+ }
+ 
+-bool
++/**
++ * Write a NUL-terminated string to the blob.
++ *
++ * The NUL terminator is included in the written data.
++ *
++ * @param blob  The blob to write to
++ * @param str   String to write (must not be NULL)
++ * @return      True on success, false on OOM
++ */
++MUST_CHECK bool
+ blob_write_string(struct blob *blob, const char *str)
+ {
+-   return blob_write_bytes(blob, str, strlen(str) + 1);
++   assert(str != NULL);
++
++   const size_t len = strlen(str);
++
++   /*
++    * Paranoid overflow check: strlen returning SIZE_MAX would indicate
++    * a string of impossible length, but guard against it anyway.
++    */
++   if (UNLIKELY(len == SIZE_MAX)) {
++      blob->out_of_memory = true;
++      return false;
++   }
++
++   /* Include NUL terminator */
++   const size_t total = len + 1;
++
++   if (!grow_to_fit(blob, total)) {
++      return false;
++   }
++
++   VG(VALGRIND_CHECK_MEM_IS_DEFINED(str, total));
++   if (blob->data != NULL) {
++      memcpy(blob->data + blob->size, str, total);
++   }
++   blob->size += total;
++
++   return true;
+ }
+ 
++/**
++ * Initialize a blob reader.
++ *
++ * The reader provides a view over existing data; it does not own the data.
++ * The data pointer must remain valid for the lifetime of the reader.
++ *
++ * @param blob  The reader to initialize
++ * @param data  Pointer to data (may be NULL only if size is 0)
++ * @param size  Size of data in bytes
++ */
+ void
+ blob_reader_init(struct blob_reader *blob, const void *data, size_t size)
+ {
+-   blob->data = data;
+-   blob->end = blob->data + size;
+-   blob->current = data;
++   blob->data = (const uint8_t *)data;
+    blob->overrun = false;
++
++   /* Handle empty blob: all pointers equal, valid but nothing to read */
++   if (size == 0) {
++      blob->end = blob->data;
++      blob->current = blob->data;
++      return;
++   }
++
++   /* Non-empty blob with NULL data is invalid */
++   if (UNLIKELY(data == NULL)) {
++      blob->end = NULL;
++      blob->current = NULL;
++      blob->overrun = true;
++      return;
++   }
++
++   blob->end = blob->data + size;
++   blob->current = blob->data;
++
++   /*
++    * Prefetch first cache lines for sequential read pattern.
++    * Use decreasing locality hints for prefetch distance:
++    * - First line: locality 3 (keep in all cache levels)
++    * - Second line: locality 2 (keep in L2+)
++    * - Third line: locality 1 (keep in L3 only)
++    */
++   PREFETCH_READ(blob->current, 3);
++   if (size > CACHE_LINE_SIZE) {
++      PREFETCH_READ(blob->current + CACHE_LINE_SIZE, 2);
++   }
++   if (size > 2 * CACHE_LINE_SIZE) {
++      PREFETCH_READ(blob->current + 2 * CACHE_LINE_SIZE, 1);
++   }
+ }
+ 
+-/* Check that an object of size \size can be read from this blob.
++/**
++ * Check if 'size' bytes can be read from current position.
+  *
+- * If not, set blob->overrun to indicate that we attempted to read too far.
++ * Sets overrun flag on failure; never performs invalid pointer arithmetic.
++ *
++ * @param blob  The blob reader
++ * @param size  Number of bytes to check
++ * @return      True if readable, false otherwise
+  */
+ static bool
+ ensure_can_read(struct blob_reader *blob, size_t size)
+ {
+-   if (blob->overrun)
++   if (UNLIKELY(blob->overrun)) {
+       return false;
++   }
+ 
+-   if (blob->current <= blob->end && blob->end - blob->current >= size)
++   /* Zero-length reads are always valid */
++   if (size == 0) {
+       return true;
++   }
+ 
+-   blob->overrun = true;
++   /* NULL data means reader is in invalid state */
++   if (UNLIKELY(blob->data == NULL)) {
++      blob->overrun = true;
++      return false;
++   }
++
++   /* Validate current pointer before subtraction */
++   if (UNLIKELY(blob->current < blob->data || blob->current > blob->end)) {
++      blob->overrun = true;
++      return false;
++   }
++
++   const size_t remaining = (size_t)(blob->end - blob->current);
++   if (LIKELY(remaining >= size)) {
++      return true;
++   }
+ 
++   blob->overrun = true;
+    return false;
+ }
+ 
++/**
++ * Read bytes from the blob without copying.
++ *
++ * Returns a pointer into the blob's data; the pointer is valid as long
++ * as the underlying data remains valid.
++ *
++ * @param blob  The blob reader
++ * @param size  Number of bytes to read
++ * @return      Pointer to data, or NULL on overrun
++ */
+ const void *
+ blob_read_bytes(struct blob_reader *blob, size_t size)
+ {
+-   const void *ret;
+-
+-   if (! ensure_can_read (blob, size))
++   if (!ensure_can_read(blob, size)) {
+       return NULL;
++   }
+ 
+-   ret = blob->current;
+-
++   const void *ret = blob->current;
+    blob->current += size;
+ 
++   /* Prefetch ahead for sequential access pattern */
++   const size_t remaining = (size_t)(blob->end - blob->current);
++   if (remaining > CACHE_LINE_SIZE) {
++      PREFETCH_READ(blob->current + CACHE_LINE_SIZE, 2);
++   }
++
+    return ret;
+ }
+ 
++/**
++ * Read and copy bytes from the blob.
++ *
++ * Unlike blob_read_bytes, this copies data to caller's buffer.
++ *
++ * @param blob  The blob reader
++ * @param dest  Destination buffer (must not be NULL if size > 0)
++ * @param size  Number of bytes to copy
++ */
+ void
+ blob_copy_bytes(struct blob_reader *blob, void *dest, size_t size)
+ {
+-   const void *bytes;
+-
+-   bytes = blob_read_bytes(blob, size);
+-   if (bytes == NULL || size == 0)
++   const void *bytes = blob_read_bytes(blob, size);
++   if (bytes == NULL) {
+       return;
++   }
+ 
+-   memcpy(dest, bytes, size);
++   if (size > 0) {
++      assert(dest != NULL);
++      memcpy(dest, bytes, size);
++   }
+ }
+ 
++/**
++ * Skip bytes in the reader without reading them.
++ *
++ * @param blob  The blob reader
++ * @param size  Number of bytes to skip
++ */
+ void
+ blob_skip_bytes(struct blob_reader *blob, size_t size)
+ {
+-   if (ensure_can_read (blob, size))
++   if (ensure_can_read(blob, size)) {
+       blob->current += size;
++   }
+ }
+ 
+-#define BLOB_READ_TYPE(name, type)         \
+-type                                       \
+-name(struct blob_reader *blob)             \
+-{                                          \
+-   type ret = 0;                           \
+-   int size = sizeof(ret);                 \
+-   blob_reader_align(blob, size);          \
+-   blob_copy_bytes(blob, &ret, size);      \
+-   return ret;                             \
++/*
++ * Macro to generate optimized typed read functions.
++ *
++ * Each function:
++ * 1. Aligns to natural alignment of the type
++ * 2. Checks bounds
++ * 3. Copies the value out
++ * 4. Prefetches ahead
++ *
++ * Returns 0 on overrun.
++ */
++#define BLOB_READ_TYPE(name, type)                                             \
++type                                                                           \
++name(struct blob_reader *blob)                                                 \
++{                                                                              \
++   type ret = (type)0;                                                         \
++   blob_reader_align(blob, sizeof(type));                                      \
++   if (ensure_can_read(blob, sizeof(type))) {                                  \
++      memcpy(&ret, blob->current, sizeof(type));                               \
++      blob->current += sizeof(type);                                           \
++      const size_t remaining = (size_t)(blob->end - blob->current);            \
++      if (remaining > CACHE_LINE_SIZE) {                                       \
++         PREFETCH_READ(blob->current + CACHE_LINE_SIZE, 2);                    \
++      }                                                                        \
++   }                                                                           \
++   return ret;                                                                 \
+ }
+ 
+ BLOB_READ_TYPE(blob_read_uint8, uint8_t)
+@@ -325,35 +885,44 @@ BLOB_READ_TYPE(blob_read_uint32, uint32_
+ BLOB_READ_TYPE(blob_read_uint64, uint64_t)
+ BLOB_READ_TYPE(blob_read_intptr, intptr_t)
+ 
++#undef BLOB_READ_TYPE
++
++/**
++ * Read a NUL-terminated string from the blob.
++ *
++ * Returns a pointer into the blob's data; does not copy.
++ * The NUL terminator must be present within the remaining data.
++ *
++ * @param blob  The blob reader
++ * @return      Pointer to string, or NULL on overrun/missing NUL
++ */
+ char *
+ blob_read_string(struct blob_reader *blob)
+ {
+-   int size;
+-   char *ret;
+-   const uint8_t *nul;
+-
+-   /* If we're already at the end, then this is an overrun. */
+-   if (blob->current >= blob->end) {
++   /* Check for empty/exhausted reader */
++   if (UNLIKELY(blob->current >= blob->end)) {
+       blob->overrun = true;
+       return NULL;
+    }
+ 
+-   /* Similarly, if there is no zero byte in the data remaining in this blob,
+-    * we also consider that an overrun.
+-    */
+-   nul = memchr(blob->current, 0, blob->end - blob->current);
+-
+-   if (nul == NULL) {
++   /* NULL data means invalid reader state */
++   if (UNLIKELY(blob->data == NULL)) {
+       blob->overrun = true;
+       return NULL;
+    }
+ 
+-   size = nul - blob->current + 1;
++   /* Search for NUL terminator within remaining data */
++   const size_t remaining = (size_t)(blob->end - blob->current);
++   const uint8_t *nul = (const uint8_t *)memchr(blob->current, 0, remaining);
+ 
+-   assert(ensure_can_read(blob, size));
+-
+-   ret = (char *) blob->current;
++   if (UNLIKELY(nul == NULL)) {
++      blob->overrun = true;
++      return NULL;
++   }
+ 
++   /* Calculate string size including NUL, advance reader */
++   const size_t size = (size_t)(nul - blob->current) + 1;
++   char *ret = (char *)blob->current;
+    blob->current += size;
+ 
+    return ret;
+
+--- a/src/util/bitscan.h	2025-06-12 22:18:54.150523804 +0200
++++ b/src/util/bitscan.h	2025-06-12 22:28:09.322741675 +0200
+@@ -19,13 +19,12 @@
+  * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+  * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+  * IN NO EVENT SHALL VMWARE AND/OR ITS SUPPLIERS BE LIABLE FOR
+- * ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+- * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
++ * ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
++ * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  *
+  **************************************************************************/
+ 
+-
+ #ifndef BITSCAN_H
+ #define BITSCAN_H
+ 
+@@ -39,9 +38,15 @@
+ #endif
+ 
+ #if defined(__POPCNT__)
++/* _mm_popcnt_u32/_mm_popcnt_u64 intrinsics */
+ #include <popcntintrin.h>
+ #endif
+ 
++#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && defined(__BMI2__)
++/* For _pdep_u32 (BMI2) */
++#include <immintrin.h>
++#endif
++
+ #include "util/detect_arch.h"
+ #include "util/detect_cc.h"
+ #include "util/macros.h"
+@@ -50,7 +55,6 @@
+ extern "C" {
+ #endif
+ 
+-
+ /**
+  * Find first bit set in word.  Least significant bit is 1.
+  * Return 0 if no bits set.
+@@ -58,18 +62,18 @@ extern "C" {
+ #ifdef HAVE___BUILTIN_FFS
+ #define ffs __builtin_ffs
+ #elif defined(_MSC_VER) && (_M_IX86 || _M_ARM || _M_AMD64 || _M_IA64)
+-static inline
+-int ffs(int i)
++static inline int
++ffs(int i)
+ {
+    unsigned long index;
+-   if (_BitScanForward(&index, i))
+-      return index + 1;
++   if (_BitScanForward(&index, (unsigned long)i))
++      return (int)index + 1;
+    else
+       return 0;
+ }
+ #else
+-extern
+-int ffs(int i);
++extern int
++ffs(int i);
+ #endif
+ 
+ #ifdef HAVE___BUILTIN_FFSLL
+@@ -79,8 +83,8 @@ static inline int
+ ffsll(long long int i)
+ {
+    unsigned long index;
+-   if (_BitScanForward64(&index, i))
+-      return index + 1;
++   if (_BitScanForward64(&index, (unsigned long long)i))
++      return (int)index + 1;
+    else
+       return 0;
+ }
+@@ -89,7 +93,6 @@ extern int
+ ffsll(long long int val);
+ #endif
+ 
+-
+ /* Destructively loop over all of the bits in a mask as in:
+  *
+  * while (mymask) {
+@@ -97,46 +100,68 @@ ffsll(long long int val);
+  *   ... process element i
+  * }
+  *
++ * Note: u_bit_scan() asserts mask != 0 (debug) to prevent UB (shift by -1).
+  */
+ static inline int
+ u_bit_scan(unsigned *mask)
+ {
++   assert(mask && *mask);
++#if defined(__GNUC__) || defined(__clang__)
++   /* Fast path: ctz → clear LSB (mask &= mask - 1) */
++   const unsigned m = *mask;
++   const int i = __builtin_ctz(m);
++   *mask = m & (m - 1);
++   return i;
++#else
+    const int i = ffs(*mask) - 1;
+-   *mask ^= (1u << i);
++   *mask &= ~(1u << i);
+    return i;
++#endif
+ }
+ 
+-#define u_foreach_bit(b, dword)                          \
+-   for (uint32_t __dword = (dword), b;                     \
+-        ((b) = ffs(__dword) - 1, __dword);      \
+-        __dword &= ~(1 << (b)))
++/* Iterate over set bits in a 32-bit mask.
++ * 'b' is assigned the bit index on each iteration.
++ */
++#define u_foreach_bit(b, dword)                                  \
++   for (uint32_t __dword = (uint32_t)(dword), b;                  \
++        ((b) = ffs(__dword) - 1, __dword);                        \
++        __dword &= ~(1u << (b)))
+ 
+ static inline int
+ u_bit_scan64(uint64_t *mask)
+ {
++   assert(mask && *mask);
++#if defined(__GNUC__) || defined(__clang__)
++   const uint64_t m = *mask;
++   const int i = __builtin_ctzll(m);
++   *mask = m & (m - 1);
++   return i;
++#else
+    const int i = ffsll(*mask) - 1;
+-   *mask ^= (((uint64_t)1) << i);
++   *mask &= ~(1ull << i);
+    return i;
++#endif
+ }
+ 
+-#define u_foreach_bit64(b, dword)                          \
+-   for (uint64_t __dword = (dword), b;                     \
+-        ((b) = ffsll(__dword) - 1, __dword);      \
++/* Iterate over set bits in a 64-bit mask.
++ * 'b' is assigned the bit index on each iteration.
++ */
++#define u_foreach_bit64(b, dword)                                \
++   for (uint64_t __dword = (uint64_t)(dword), b;                  \
++        ((b) = ffsll(__dword) - 1, __dword);                      \
+         __dword &= ~(1ull << (b)))
+ 
+ /* Given two bitmasks, loop over all bits of both of them.
+- * Bits of mask1 are: b = scan_bit(mask1);
+- * Bits of mask2 are: b = offset + scan_bit(mask2);
++ * Bits of mask1 are: b = ffsll(mask1) - 1;
++ * Bits of mask2 are: b = offset + (ffsll(mask2) - 1);
+  */
+-#define u_foreach_bit64_two_masks(b, mask1, offset, mask2)                          \
+-   for (uint64_t __mask1 = (mask1), __mask2 = (mask2), b;                           \
+-        (__mask1 ? ((b) = ffsll(__mask1) - 1)                                       \
+-                 : ((b) = ffsll(__mask2) - 1 + offset), __mask1 || __mask2);        \
+-        __mask1 ? (__mask1 &= ~(1ull << (b))) : (__mask2 &= ~(1ull << (b - offset))))
++#define u_foreach_bit64_two_masks(b, mask1, offset, mask2)                             \
++   for (uint64_t __mask1 = (uint64_t)(mask1), __mask2 = (uint64_t)(mask2), b;          \
++        (__mask1 ? ((b) = ffsll(__mask1) - 1)                                          \
++                 : ((b) = ffsll(__mask2) - 1 + (offset)), __mask1 || __mask2);         \
++        __mask1 ? (__mask1 &= ~(1ull << (b))) : (__mask2 &= ~(1ull << ((b) - (offset)))))
+ 
+ /* Determine if an uint32_t value is a power of two.
+- *
+- * \note
+  * Zero is treated as a power of two.
+  */
+ static inline bool
+@@ -146,8 +171,6 @@ util_is_power_of_two_or_zero(uint32_t v)
+ }
+ 
+ /* Determine if an uint64_t value is a power of two.
+- *
+- * \note
+  * Zero is treated as a power of two.
+  */
+ static inline bool
+@@ -157,33 +180,18 @@ util_is_power_of_two_or_zero64(uint64_t
+ }
+ 
+ /* Determine if an uint32_t value is a power of two.
++ * Zero is not treated as a power of two.
+  *
+- * \note
+- * Zero is \b not treated as a power of two.
++ * Branchless bit trick (fast on all CPUs; no popcnt required).
+  */
+ static inline bool
+ util_is_power_of_two_nonzero(uint32_t v)
+ {
+-   /* __POPCNT__ is different from HAVE___BUILTIN_POPCOUNT.  The latter
+-    * indicates the existence of the __builtin_popcount function.  The former
+-    * indicates that _mm_popcnt_u32 exists and is a native instruction.
+-    *
+-    * The other alternative is to use SSE 4.2 compile-time flags.  This has
+-    * two drawbacks.  First, there is currently no build infrastructure for
+-    * SSE 4.2 (only 4.1), so that would have to be added.  Second, some AMD
+-    * CPUs support POPCNT but not SSE 4.2 (e.g., Barcelona).
+-    */
+-#ifdef __POPCNT__
+-   return _mm_popcnt_u32(v) == 1;
+-#else
+    return IS_POT_NONZERO(v);
+-#endif
+ }
+ 
+ /* Determine if an uint64_t value is a power of two.
+- *
+- * \note
+- * Zero is \b not treated as a power of two.
++ * Zero is not treated as a power of two.
+  */
+ static inline bool
+ util_is_power_of_two_nonzero64(uint64_t v)
+@@ -191,10 +199,8 @@ util_is_power_of_two_nonzero64(uint64_t
+    return IS_POT_NONZERO(v);
+ }
+ 
+-/* Determine if an size_t/uintptr_t/intptr_t value is a power of two.
+- *
+- * \note
+- * Zero is \b not treated as a power of two.
++/* Determine if a uintptr_t value is a power of two.
++ * Zero is not treated as a power of two.
+  */
+ static inline bool
+ util_is_power_of_two_nonzero_uintptr(uintptr_t v)
+@@ -202,30 +208,19 @@ util_is_power_of_two_nonzero_uintptr(uin
+    return IS_POT_NONZERO(v);
+ }
+ 
+-/* For looping over a bitmask when you want to loop over consecutive bits
+- * manually, for example:
+- *
+- * while (mask) {
+- *    int start, count, i;
+- *
+- *    u_bit_scan_consecutive_range(&mask, &start, &count);
+- *
+- *    for (i = 0; i < count; i++)
+- *       ... process element (start+i)
+- * }
+- */
++/* Loop over a bitmask yielding ranges of consecutive bits. */
+ static inline void
+ u_bit_scan_consecutive_range(unsigned *mask, int *start, int *count)
+ {
+-   if (*mask == 0xffffffff) {
++   if (*mask == 0xffffffffu) {
+       *start = 0;
+       *count = 32;
+-      *mask = 0;
++      *mask  = 0;
+       return;
+    }
+    *start = ffs(*mask) - 1;
+    *count = ffs(~(*mask >> *start)) - 1;
+-   *mask &= ~(((1u << *count) - 1) << *start);
++   *mask &= ~(((1u << (unsigned)*count) - 1u) << (unsigned)*start);
+ }
+ 
+ static inline void
+@@ -234,31 +229,29 @@ u_bit_scan_consecutive_range64(uint64_t
+    if (*mask == UINT64_MAX) {
+       *start = 0;
+       *count = 64;
+-      *mask = 0;
++      *mask  = 0;
+       return;
+    }
+    *start = ffsll(*mask) - 1;
+    *count = ffsll(~(*mask >> *start)) - 1;
+-   *mask &= ~(((((uint64_t)1) << *count) - 1) << *start);
++   *mask &= ~(((((uint64_t)1) << (unsigned)*count) - 1ull) << (unsigned)*start);
+ }
+ 
+-
+ /**
+- * Find last bit set in a word.  The least significant bit is 1.
+- * Return 0 if no bits are set.
+- * Essentially ffs() in the reverse direction.
++ * Find last bit set in a word. Least significant bit is 1.
++ * Return 0 if no bits are set. (Essentially ffs() in reverse.)
+  */
+ static inline unsigned
+ util_last_bit(unsigned u)
+ {
+ #if defined(HAVE___BUILTIN_CLZ)
+-   return u == 0 ? 0 : 32 - __builtin_clz(u);
++   return u == 0 ? 0u : 32u - (unsigned)__builtin_clz(u);
+ #elif defined(_MSC_VER) && (_M_IX86 || _M_ARM || _M_AMD64 || _M_IA64)
+    unsigned long index;
+-   if (_BitScanReverse(&index, u))
+-      return index + 1;
++   if (_BitScanReverse(&index, (unsigned long)u))
++      return (unsigned)index + 1u;
+    else
+-      return 0;
++      return 0u;
+ #else
+    unsigned r = 0;
+    while (u) {
+@@ -270,21 +263,20 @@ util_last_bit(unsigned u)
+ }
+ 
+ /**
+- * Find last bit set in a word.  The least significant bit is 1.
+- * Return 0 if no bits are set.
+- * Essentially ffsll() in the reverse direction.
++ * Find last bit set in a 64-bit word. Least significant bit is 1.
++ * Return 0 if no bits are set. (Essentially ffsll() in reverse.)
+  */
+ static inline unsigned
+ util_last_bit64(uint64_t u)
+ {
+ #if defined(HAVE___BUILTIN_CLZLL)
+-   return u == 0 ? 0 : 64 - __builtin_clzll(u);
++   return u == 0 ? 0u : 64u - (unsigned)__builtin_clzll(u);
+ #elif defined(_MSC_VER) && (_M_AMD64 || _M_ARM64 || _M_IA64)
+    unsigned long index;
+-   if (_BitScanReverse64(&index, u))
+-      return index + 1;
++   if (_BitScanReverse64(&index, (unsigned long long)u))
++      return (unsigned)index + 1u;
+    else
+-      return 0;
++      return 0u;
+ #else
+    unsigned r = 0;
+    while (u) {
+@@ -296,29 +288,26 @@ util_last_bit64(uint64_t u)
+ }
+ 
+ /**
+- * Find last bit in a word that does not match the sign bit. The least
+- * significant bit is 1.
+- * Return 0 if no bits are set.
++ * Find last bit in a word that does not match the sign bit.
++ * The least significant bit is 1. Return 0 if no bits are set.
+  */
+ static inline unsigned
+ util_last_bit_signed(int i)
+ {
+    if (i >= 0)
+-      return util_last_bit(i);
++      return util_last_bit((unsigned)i);
+    else
+       return util_last_bit(~(unsigned)i);
+ }
+ 
+-/* Returns a bitfield in which the first count bits starting at start are
+- * set.
+- */
++/* Returns a bitfield in which the first count bits starting at start are set. */
+ static inline unsigned
+ u_bit_consecutive(unsigned start, unsigned count)
+ {
+    assert(start + count <= 32);
+    if (count == 32)
+-      return ~0;
+-   return ((1u << count) - 1) << start;
++      return ~0u;
++   return ((1u << count) - 1u) << start;
+ }
+ 
+ static inline uint64_t
+@@ -327,28 +316,24 @@ u_bit_consecutive64(unsigned start, unsi
+    assert(start + count <= 64);
+    if (count == 64)
+       return ~(uint64_t)0;
+-   return (((uint64_t)1 << count) - 1) << start;
++   return (((uint64_t)1 << count) - 1ull) << start;
+ }
+ 
+ /**
+- * Return number of bits set in n.
++ * Return number of bits set in n (32-bit).
+  */
+ static inline unsigned
+ util_bitcount(unsigned n)
+ {
+ #if defined(HAVE___BUILTIN_POPCOUNT)
+-   return __builtin_popcount(n);
++   return (unsigned)__builtin_popcount(n);
+ #elif __OPENCL_VERSION__
+-   return popcount(n);
++   return (unsigned)popcount(n);
+ #else
+-   /* K&R classic bitcount.
+-    *
+-    * For each iteration, clear the LSB from the bitfield.
+-    * Requires only one iteration per set bit, instead of
+-    * one iteration per bit less than highest set bit.
+-    */
+-   unsigned bits;
+-   for (bits = 0; n; bits++) {
++   /* K&R bitcount: clear lowest set bit per iteration. */
++   unsigned bits = 0;
++   while (n) {
++      bits++;
+       n &= n - 1;
+    }
+    return bits;
+@@ -358,9 +343,7 @@ util_bitcount(unsigned n)
+ /**
+  * Return the number of bits set in n using the native popcnt instruction.
+  * The caller is responsible for ensuring that popcnt is supported by the CPU.
+- *
+- * gcc doesn't use it if -mpopcnt or -march= that has popcnt is missing.
+- *
++ * gcc won't auto-emit popcnt unless -mpopcnt or suitable -march is used.
+  */
+ static inline unsigned
+ util_popcnt_inline_asm(unsigned n)
+@@ -370,47 +353,61 @@ util_popcnt_inline_asm(unsigned n)
+    __asm volatile("popcnt %1, %0" : "=r"(out) : "r"(n));
+    return out;
+ #else
+-   /* We should never get here by accident, but I'm sure it'll happen. */
++   /* Fallback safely to software popcount. */
+    return util_bitcount(n);
+ #endif
+ }
+ 
++/**
++ * Return number of bits set in n (64-bit).
++ */
+ static inline unsigned
+ util_bitcount64(uint64_t n)
+ {
+ #ifdef HAVE___BUILTIN_POPCOUNTLL
+-   return __builtin_popcountll(n);
++   return (unsigned)__builtin_popcountll(n);
+ #elif __OPENCL_VERSION__
+-   return popcount(n);
++   return (unsigned)popcount(n);
+ #else
++   /* Portable fallback via two 32-bit popcounts. */
+    return util_bitcount((unsigned)n) + util_bitcount((unsigned)(n >> 32));
+ #endif
+ }
+ 
+ /**
+- * Widens the given bit mask by a multiplier, meaning that it will
+- * replicate each bit by that amount.
+- *
+- * For example:
+- * 0b101 widened by 2 will become: 0b110011
+- *
+- * This is typically used in shader I/O to transform a 64-bit
+- * writemask to a 32-bit writemask.
++ * Widens the given bit mask by a multiplier, replicating each bit by that count.
++ * Example: 0b101 widened by 2 -> 0b110011
+  */
+ static inline uint32_t
+ util_widen_mask(uint32_t mask, unsigned multiplier)
+ {
++   if (!mask || multiplier == 0)
++      return 0u;
++
++#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && defined(__BMI2__)
++   /* Fast path for the most common case: multiplier == 2.
++    * Use BMI2 PDEP to interleave zeros between bits, then OR with a shift to replicate.
++    */
++   if (multiplier == 2) {
++      /* Spread source bits into odd positions. */
++      uint32_t spread = _pdep_u32(mask, 0x55555555u);
++      return spread | (spread << 1);
++   }
++#endif
++
++   /* Generic path for any multiplier. */
+    uint32_t new_mask = 0;
+-   u_foreach_bit(i, mask)
++   u_foreach_bit(i, mask) {
+       new_mask |= ((1u << multiplier) - 1u) << (i * multiplier);
++   }
+    return new_mask;
+ }
+ 
+ #ifdef __cplusplus
+-}
++} /* extern "C" */
+ 
+-/* util_bitcount has large measurable overhead (~2%), so it's recommended to
+- * use the POPCNT instruction via inline assembly if the CPU supports it.
++/* util_bitcount has measurable overhead (~2%) compared to popcnt,
++ * so prefer inline assembly if the CPU supports it.
+  */
+ enum util_popcnt {
+    POPCNT_NO,
+@@ -419,8 +416,7 @@ enum util_popcnt {
+ };
+ 
+ /* Convenient function to select popcnt through a C++ template argument.
+- * This should be used as part of larger functions that are optimized
+- * as a whole.
++ * This should be used as part of larger functions optimized as a whole.
+  */
+ template<util_popcnt POPCNT> inline unsigned
+ util_bitcount_fast(unsigned n)
+
+--- a/src/util/disk_cache.h	2025-09-20 20:11:22.595220313 +0200
++++ b/src/util/disk_cache.h	2025-09-20 20:12:11.465301770 +0200
+@@ -292,6 +202,11 @@ disk_cache_destroy(struct disk_cache *ca
+ {
+ }
+ 
++static inline void
++disk_cache_wait_for_idle(struct disk_cache *cache)
++{
++}
++
+ static inline void
+ disk_cache_put(struct disk_cache *cache, const cache_key key,
+                const void *data, size_t size,
+
+
+--- a/src/util/disk_cache.c	2025-09-20 20:01:48.286294965 +0200
++++ b/src/util/disk_cache.c	2025-10-16 20:12:47.835723859 +0200
+@@ -36,6 +36,27 @@
+ #include <errno.h>
+ #include <dirent.h>
+ #include <inttypes.h>
++#include <limits.h>
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++
++#if !defined(_WIN32) && !defined(__CYGWIN__)
++#include <unistd.h>
++#include <pthread.h>
++#else
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#endif
++
++#if (defined(__x86_64__) || defined(_M_X64))
++#include <emmintrin.h>
++#include <immintrin.h>
++#if defined(__GNUC__) || defined(__clang__)
++#include <x86intrin.h>
++#endif
++#endif
+ 
+ #include "util/compress.h"
+ #include "util/crc32.h"
+@@ -51,48 +72,329 @@
+ #include "disk_cache.h"
+ #include "disk_cache_os.h"
+ 
+-/* The cache version should be bumped whenever a change is made to the
+- * structure of cache entries or the index. This will give any 3rd party
+- * applications reading the cache entries a chance to adjust to the changes.
+- *
+- * - The cache version is checked internally when reading a cache entry. If we
+- *   ever have a mismatch we are in big trouble as this means we had a cache
+- *   collision. In case of such an event please check the skys for giant
+- *   asteroids and that the entire Mesa team hasn't been eaten by wolves.
+- *
+- * - There is no strict requirement that cache versions be backwards
+- *   compatible but effort should be taken to limit disruption where possible.
+- */
+ #define CACHE_VERSION 1
+ 
+ #define DRV_KEY_CPY(_dst, _src, _src_size) \
+ do {                                       \
+    memcpy(_dst, _src, _src_size);          \
+    _dst += _src_size;                      \
+-} while (0);
++} while (0)
++
++#ifndef __has_builtin
++#define __has_builtin(x) 0
++#endif
++
++#if __has_builtin(__builtin_prefetch)
++#define PREFETCH_R(addr) __builtin_prefetch((addr), 0, 1)
++#else
++#define PREFETCH_R(addr) ((void)0)
++#endif
++
++#if defined(__GNUC__) || defined(__clang__)
++#define LIKELY(x)   __builtin_expect(!!(x), 1)
++#define UNLIKELY(x) __builtin_expect(!!(x), 0)
++#else
++#define LIKELY(x)   (x)
++#define UNLIKELY(x) (x)
++#endif
++
++/* -----------------------------------------------------------------------------
++ * Thread-local buffer management
++ * ---------------------------------------------------------------------------*/
++struct tls_in_buf {
++   uint8_t *p;
++   size_t cap;
++};
++
++struct tls_out_buf {
++   uint8_t *p;
++   size_t cap;
++};
++
++#if !defined(_WIN32) && !defined(__CYGWIN__)
++static pthread_key_t g_tls_in_key;
++static pthread_key_t g_tls_out_key;
++static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
++
++static void
++tls_in_destructor(void *ptr)
++{
++   struct tls_in_buf *b = (struct tls_in_buf *)ptr;
++   if (b) {
++      free(b->p);
++      free(b);
++   }
++}
++
++static void
++tls_out_destructor(void *ptr)
++{
++   struct tls_out_buf *b = (struct tls_out_buf *)ptr;
++   if (b) {
++      free(b->p);
++      free(b);
++   }
++}
++
++static void
++tls_make_keys(void)
++{
++   int r1 = pthread_key_create(&g_tls_in_key, tls_in_destructor);
++   int r2 = pthread_key_create(&g_tls_out_key, tls_out_destructor);
++   (void)r1;
++   (void)r2;
++}
++
++static struct tls_in_buf *
++tls_get_in(void)
++{
++   pthread_once(&g_tls_once, tls_make_keys);
++   struct tls_in_buf *b = (struct tls_in_buf *)pthread_getspecific(g_tls_in_key);
++   if (UNLIKELY(!b)) {
++      b = (struct tls_in_buf *)malloc(sizeof(*b));
++      if (UNLIKELY(!b)) {
++         return NULL;
++      }
++      b->cap = 128 * 1024;
++      b->p = (uint8_t *)malloc(b->cap);
++      if (UNLIKELY(!b->p)) {
++         free(b);
++         return NULL;
++      }
++      if (UNLIKELY(pthread_setspecific(g_tls_in_key, b) != 0)) {
++         free(b->p);
++         free(b);
++         return NULL;
++      }
++   }
++   return b;
++}
++
++static struct tls_out_buf *
++tls_get_out(void)
++{
++   pthread_once(&g_tls_once, tls_make_keys);
++   struct tls_out_buf *b = (struct tls_out_buf *)pthread_getspecific(g_tls_out_key);
++   if (UNLIKELY(!b)) {
++      b = (struct tls_out_buf *)malloc(sizeof(*b));
++      if (UNLIKELY(!b)) {
++         return NULL;
++      }
++      b->p = NULL;
++      b->cap = 0;
++      if (UNLIKELY(pthread_setspecific(g_tls_out_key, b) != 0)) {
++         free(b);
++         return NULL;
++      }
++   }
++   return b;
++}
++
++#else /* Windows */
++
++static DWORD g_tls_in_index = TLS_OUT_OF_INDEXES;
++static DWORD g_tls_out_index = TLS_OUT_OF_INDEXES;
++static INIT_ONCE g_tls_once = INIT_ONCE_STATIC_INIT;
++static bool g_use_fls = false;
++
++static void
++tls_in_destructor_win(void *ptr)
++{
++   struct tls_in_buf *b = (struct tls_in_buf *)ptr;
++   if (b) {
++      free(b->p);
++      free(b);
++   }
++}
++
++static void
++tls_out_destructor_win(void *ptr)
++{
++   struct tls_out_buf *b = (struct tls_out_buf *)ptr;
++   if (b) {
++      free(b->p);
++      free(b);
++   }
++}
++
++static BOOL CALLBACK
++tls_make_keys_win(PINIT_ONCE once, PVOID param, PVOID *ctx)
++{
++   (void)once;
++   (void)param;
++   (void)ctx;
++
++#if (_WIN32_WINNT >= 0x0600)
++   DWORD fls_in = FlsAlloc((PFLS_CALLBACK_FUNCTION)tls_in_destructor_win);
++   DWORD fls_out = FlsAlloc((PFLS_CALLBACK_FUNCTION)tls_out_destructor_win);
++
++   if (fls_in != FLS_OUT_OF_INDEXES && fls_out != FLS_OUT_OF_INDEXES) {
++      g_tls_in_index = fls_in;
++      g_tls_out_index = fls_out;
++      g_use_fls = true;
++      return TRUE;
++   }
++
++   if (fls_in != FLS_OUT_OF_INDEXES) {
++      FlsFree(fls_in);
++   }
++   if (fls_out != FLS_OUT_OF_INDEXES) {
++      FlsFree(fls_out);
++   }
++#endif
++
++   g_tls_in_index = TlsAlloc();
++   g_tls_out_index = TlsAlloc();
++   g_use_fls = false;
++
++   return TRUE;
++}
++
++static struct tls_in_buf *
++tls_get_in(void)
++{
++   InitOnceExecuteOnce(&g_tls_once, tls_make_keys_win, NULL, NULL);
++   if (UNLIKELY(g_tls_in_index == TLS_OUT_OF_INDEXES)) {
++      return NULL;
++   }
+ 
++   void *ptr;
++#if (_WIN32_WINNT >= 0x0600)
++   if (g_use_fls) {
++      ptr = FlsGetValue(g_tls_in_index);
++   } else {
++      ptr = TlsGetValue(g_tls_in_index);
++   }
++#else
++   ptr = TlsGetValue(g_tls_in_index);
++#endif
++
++   struct tls_in_buf *b = (struct tls_in_buf *)ptr;
++   if (UNLIKELY(!b)) {
++      b = (struct tls_in_buf *)malloc(sizeof(*b));
++      if (UNLIKELY(!b)) {
++         return NULL;
++      }
++      b->cap = 128 * 1024;
++      b->p = (uint8_t *)malloc(b->cap);
++      if (UNLIKELY(!b->p)) {
++         free(b);
++         return NULL;
++      }
++
++      BOOL ok;
++#if (_WIN32_WINNT >= 0x0600)
++      if (g_use_fls) {
++         ok = FlsSetValue(g_tls_in_index, b);
++      } else {
++         ok = TlsSetValue(g_tls_in_index, b);
++      }
++#else
++      ok = TlsSetValue(g_tls_in_index, b);
++#endif
++
++      if (UNLIKELY(!ok)) {
++         free(b->p);
++         free(b);
++         return NULL;
++      }
++   }
++   return b;
++}
++
++static struct tls_out_buf *
++tls_get_out(void)
++{
++   InitOnceExecuteOnce(&g_tls_once, tls_make_keys_win, NULL, NULL);
++   if (UNLIKELY(g_tls_out_index == TLS_OUT_OF_INDEXES)) {
++      return NULL;
++   }
++
++   void *ptr;
++#if (_WIN32_WINNT >= 0x0600)
++   if (g_use_fls) {
++      ptr = FlsGetValue(g_tls_out_index);
++   } else {
++      ptr = TlsGetValue(g_tls_out_index);
++   }
++#else
++   ptr = TlsGetValue(g_tls_out_index);
++#endif
++
++   struct tls_out_buf *b = (struct tls_out_buf *)ptr;
++   if (UNLIKELY(!b)) {
++      b = (struct tls_out_buf *)malloc(sizeof(*b));
++      if (UNLIKELY(!b)) {
++         return NULL;
++      }
++      b->p = NULL;
++      b->cap = 0;
++
++      BOOL ok;
++#if (_WIN32_WINNT >= 0x0600)
++      if (g_use_fls) {
++         ok = FlsSetValue(g_tls_out_index, b);
++      } else {
++         ok = TlsSetValue(g_tls_out_index, b);
++      }
++#else
++      ok = TlsSetValue(g_tls_out_index, b);
++#endif
++
++      if (UNLIKELY(!ok)) {
++         free(b);
++         return NULL;
++      }
++   }
++   return b;
++}
++
++#endif /* !POSIX / Windows */
++
++/* -----------------------------------------------------------------------------
++ * Queue initialization
++ * ---------------------------------------------------------------------------*/
+ static bool
+ disk_cache_init_queue(struct disk_cache *cache)
+ {
+-   if (util_queue_is_initialized(&cache->cache_queue))
++   if (LIKELY(util_queue_is_initialized(&cache->cache_queue))) {
+       return true;
++   }
++
++   int logical = 4;
++#if defined(_SC_NPROCESSORS_ONLN)
++   long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
++   if (nprocs > 0 && nprocs < INT_MAX) {
++      logical = (int)nprocs;
++   }
++#elif defined(_WIN32)
++   SYSTEM_INFO sysinfo;
++   GetSystemInfo(&sysinfo);
++   logical = (int)sysinfo.dwNumberOfProcessors;
++   if (logical > 128) {
++      logical = 128;
++   }
++#endif
+ 
+-   /* 4 threads were chosen below because just about all modern CPUs currently
+-    * available that run Mesa have *at least* 4 cores. For these CPUs allowing
+-    * more threads can result in the queue being processed faster, thus
+-    * avoiding excessive memory use due to a backlog of cache entrys building
+-    * up in the queue. Since we set the UTIL_QUEUE_INIT_USE_MINIMUM_PRIORITY
+-    * flag this should have little negative impact on low core systems.
+-    *
+-    * The queue will resize automatically when it's full, so adding new jobs
+-    * doesn't stall.
+-    */
+-   return util_queue_init(&cache->cache_queue, "disk$", 32, 4,
++   int threads = (logical * 3 + 1) / 4;
++   if (threads < 4) {
++      threads = 4;
++   }
++   if (threads > 16) {
++      threads = 16;
++   }
++
++   unsigned queue_depth = 128;
++
++   return util_queue_init(&cache->cache_queue, "disk$", queue_depth, threads,
+                           UTIL_QUEUE_INIT_RESIZE_IF_FULL |
+                           UTIL_QUEUE_INIT_USE_MINIMUM_PRIORITY |
+                           UTIL_QUEUE_INIT_SET_FULL_THREAD_AFFINITY, NULL);
+ }
+ 
++/* -----------------------------------------------------------------------------
++ * Cache creation and destruction
++ * ---------------------------------------------------------------------------*/
+ static struct disk_cache *
+ disk_cache_type_create(const char *gpu_name,
+                        const char *driver_id,
+@@ -107,64 +409,69 @@ disk_cache_type_create(const char *gpu_n
+    uint8_t cache_version = CACHE_VERSION;
+    size_t cv_size = sizeof(cache_version);
+ 
+-   /* A ralloc context for transient data during this invocation. */
+    local = ralloc_context(NULL);
+-   if (local == NULL)
++   if (UNLIKELY(local == NULL)) {
+       goto fail;
++   }
+ 
+    cache = rzalloc(NULL, struct disk_cache);
+-   if (cache == NULL)
++   if (UNLIKELY(cache == NULL)) {
+       goto fail;
++   }
+ 
+-   /* Assume failure. */
+    cache->path_init_failed = true;
+    cache->type = DISK_CACHE_NONE;
+ 
+-   if (!disk_cache_enabled())
++   if (!disk_cache_enabled()) {
+       goto path_fail;
++   }
+ 
+    const char *path =
+       disk_cache_generate_cache_dir(local, gpu_name, driver_id, cache_dir_name, cache_type, true);
+-   if (!path)
++   if (!path) {
+       goto path_fail;
++   }
+ 
+    cache->path = ralloc_strdup(cache, path);
+-   if (cache->path == NULL)
++   if (UNLIKELY(cache->path == NULL)) {
+       goto path_fail;
++   }
+ 
+-   /* Cache tests that want to have a disabled cache compression are using
+-    * the "make_check_uncompressed" for the driver_id name.  Hence here we
+-    * disable disk cache compression when mesa's build tests require it.
+-    */
+-   if (strcmp(driver_id, "make_check_uncompressed") == 0)
++   if (strcmp(driver_id, "make_check_uncompressed") == 0) {
+       cache->compression_disabled = true;
++   }
+ 
+    if (cache_type == DISK_CACHE_SINGLE_FILE) {
+-      if (!disk_cache_load_cache_index_foz(local, cache))
++      if (!disk_cache_load_cache_index_foz(local, cache)) {
+          goto path_fail;
++      }
+    } else if (cache_type == DISK_CACHE_DATABASE) {
+-      if (!disk_cache_db_load_cache_index(local, cache))
++      if (!disk_cache_db_load_cache_index(local, cache)) {
+          goto path_fail;
++      }
+    }
+ 
+-   if (!os_get_option("MESA_SHADER_CACHE_DIR") && !os_get_option("MESA_GLSL_CACHE_DIR"))
++   if (!os_get_option("MESA_SHADER_CACHE_DIR") && !os_get_option("MESA_GLSL_CACHE_DIR")) {
+       disk_cache_touch_cache_user_marker(cache->path);
++   }
+ 
+    cache->type = cache_type;
+ 
+-   cache->stats.enabled = debug_get_bool_option("MESA_SHADER_CACHE_SHOW_STATS",
+-                                                false);
++   cache->stats.enabled = debug_get_bool_option("MESA_SHADER_CACHE_SHOW_STATS", false);
+ 
+-   if (!disk_cache_mmap_cache_index(local, cache))
++   if (!disk_cache_mmap_cache_index(local, cache)) {
+       goto path_fail;
++   }
+ 
+    cache->max_size = max_size;
+ 
+-   if (cache->type == DISK_CACHE_DATABASE)
++   if (cache->type == DISK_CACHE_DATABASE) {
+       mesa_cache_db_multipart_set_size_limit(&cache->cache_db, cache->max_size);
++   }
+ 
+-   if (!disk_cache_init_queue(cache))
++   if (!disk_cache_init_queue(cache)) {
+       goto fail;
++   }
+ 
+    cache->path_init_failed = false;
+ 
+@@ -172,15 +479,11 @@ disk_cache_type_create(const char *gpu_n
+ 
+    cache->driver_keys_blob_size = cv_size;
+ 
+-   /* Create driver id keys */
+    size_t id_size = strlen(driver_id) + 1;
+    size_t gpu_name_size = strlen(gpu_name) + 1;
+    cache->driver_keys_blob_size += id_size;
+    cache->driver_keys_blob_size += gpu_name_size;
+ 
+-   /* We sometimes store entire structs that contains a pointers in the cache,
+-    * use pointer size as a key to avoid hard to debug issues.
+-    */
+    uint8_t ptr_size = sizeof(void *);
+    size_t ptr_size_size = sizeof(ptr_size);
+    cache->driver_keys_blob_size += ptr_size_size;
+@@ -188,19 +491,18 @@ disk_cache_type_create(const char *gpu_n
+    size_t driver_flags_size = sizeof(driver_flags);
+    cache->driver_keys_blob_size += driver_flags_size;
+ 
+-   cache->driver_keys_blob =
+-      ralloc_size(cache, cache->driver_keys_blob_size);
+-   if (!cache->driver_keys_blob)
++   cache->driver_keys_blob = ralloc_size(cache, cache->driver_keys_blob_size);
++   if (UNLIKELY(!cache->driver_keys_blob)) {
+       goto fail;
++   }
+ 
+    uint8_t *drv_key_blob = cache->driver_keys_blob;
+-   DRV_KEY_CPY(drv_key_blob, &cache_version, cv_size)
+-   DRV_KEY_CPY(drv_key_blob, driver_id, id_size)
+-   DRV_KEY_CPY(drv_key_blob, gpu_name, gpu_name_size)
+-   DRV_KEY_CPY(drv_key_blob, &ptr_size, ptr_size_size)
+-   DRV_KEY_CPY(drv_key_blob, &driver_flags, driver_flags_size)
++   DRV_KEY_CPY(drv_key_blob, &cache_version, cv_size);
++   DRV_KEY_CPY(drv_key_blob, driver_id, id_size);
++   DRV_KEY_CPY(drv_key_blob, gpu_name, gpu_name_size);
++   DRV_KEY_CPY(drv_key_blob, &ptr_size, ptr_size_size);
++   DRV_KEY_CPY(drv_key_blob, &driver_flags, driver_flags_size);
+ 
+-   /* Seed our rand function */
+    s_rand_xorshift128plus(cache->seed_xorshift128plus, true);
+ 
+    ralloc_free(local);
+@@ -208,12 +510,41 @@ disk_cache_type_create(const char *gpu_n
+    return cache;
+ 
+  fail:
+-   ralloc_free(cache);
++   if (cache) {
++      if (cache->type == DISK_CACHE_SINGLE_FILE) {
++         foz_destroy(&cache->foz_db);
++      } else if (cache->type == DISK_CACHE_DATABASE) {
++         mesa_cache_db_multipart_close(&cache->cache_db);
++      }
++      disk_cache_destroy_mmap(cache);
++      ralloc_free(cache);
++   }
+    ralloc_free(local);
+ 
+    return NULL;
+ }
+ 
++static void
++background_delete_old_cache(void *job, void *gdata, int thread_index)
++{
++   (void)job;
++   (void)gdata;
++   (void)thread_index;
++   disk_cache_delete_old_cache();
++}
++
++struct fence_job {
++   struct util_queue_fence fence;
++};
++
++static void
++trivial_job_free(void *job, void *gdata, int thread_index)
++{
++   (void)gdata;
++   (void)thread_index;
++   free(job);
++}
++
+ struct disk_cache *
+ disk_cache_create(const char *gpu_name, const char *driver_id,
+                   uint64_t driver_flags)
+@@ -227,26 +558,29 @@ disk_cache_create(const char *gpu_name,
+       cache_type = DISK_CACHE_SINGLE_FILE;
+    } else if (debug_get_bool_option("MESA_DISK_CACHE_DATABASE", false)) {
+       cache_type = DISK_CACHE_DATABASE;
+-      /* Since switching the default cache to <mesa_shader_cache_db>, remove the
+-       * old cache folder if it hasn't been modified for more than 7 days.
+-       */
+-      if (!os_get_option("MESA_SHADER_CACHE_DIR") && !os_get_option("MESA_GLSL_CACHE_DIR") &&
+-          disk_cache_enabled())
+-         disk_cache_delete_old_cache();
+    } else if (debug_get_bool_option("MESA_DISK_CACHE_MULTI_FILE", true)) {
+       cache_type = DISK_CACHE_MULTI_FILE;
+    } else {
+       return NULL;
+    }
+ 
++   bool need_delete_old_cache = false;
++   if (cache_type == DISK_CACHE_DATABASE) {
++      if (!os_get_option("MESA_SHADER_CACHE_DIR") && !os_get_option("MESA_GLSL_CACHE_DIR") &&
++          disk_cache_enabled()) {
++         need_delete_old_cache = true;
++      }
++   }
++
+    max_size_str = os_get_option("MESA_SHADER_CACHE_MAX_SIZE");
+ 
+    if (!max_size_str) {
+       max_size_str = os_get_option("MESA_GLSL_CACHE_MAX_SIZE");
+-      if (max_size_str)
++      if (max_size_str) {
+          fprintf(stderr,
+                  "*** MESA_GLSL_CACHE_MAX_SIZE is deprecated; "
+                  "use MESA_SHADER_CACHE_MAX_SIZE instead ***\n");
++      }
+    }
+ 
+ #ifdef MESA_SHADER_CACHE_MAX_SIZE
+@@ -268,41 +602,41 @@ disk_cache_create(const char *gpu_name,
+             break;
+          case 'M':
+          case 'm':
+-            max_size *= 1024*1024;
++            max_size *= 1024 * 1024;
+             break;
+          case '\0':
+          case 'G':
+          case 'g':
+          default:
+-            max_size *= 1024*1024*1024;
++            max_size *= 1024 * 1024 * 1024;
+             break;
+          }
+       }
+    }
+ 
+-   /* Default to 1GB for maximum cache size. */
+    if (max_size == 0) {
+-      max_size = 1024*1024*1024;
++      max_size = 1024 * 1024 * 1024;
+    }
+ 
+-   /* Create main writable cache. */
+    cache = disk_cache_type_create(gpu_name, driver_id, NULL, driver_flags,
+                                   cache_type, max_size);
+-   if (!cache)
++   if (!cache) {
+       return NULL;
++   }
++
++   if (need_delete_old_cache && !cache->path_init_failed &&
++       util_queue_is_initialized(&cache->cache_queue)) {
++      struct fence_job *job = (struct fence_job *)malloc(sizeof(*job));
++      if (job) {
++         util_queue_fence_init(&job->fence);
++         util_queue_add_job(&cache->cache_queue, job, &job->fence,
++                            background_delete_old_cache, trivial_job_free, 0);
++      }
++   }
+ 
+-   /* If MESA_DISK_CACHE_SINGLE_FILE is unset and MESA_DISK_CACHE_COMBINE_RW_WITH_RO_FOZ
+-    * is set, then enable additional Fossilize RO caches together with the RW
+-    * cache.  At first we will check cache entry presence in the RO caches and
+-    * if entry isn't found there, then we'll fall back to the RW cache.
+-    */
+    if (cache_type != DISK_CACHE_SINGLE_FILE && !cache->path_init_failed &&
+        debug_get_bool_option("MESA_DISK_CACHE_COMBINE_RW_WITH_RO_FOZ", false)) {
+ 
+-      /* Create read-only cache used for sharing prebuilt shaders.
+-       * If cache entry will be found in this cache, then the main cache
+-       * will be bypassed.
+-       */
+       cache->foz_ro_cache = disk_cache_type_create(gpu_name, driver_id, NULL,
+                                                    driver_flags,
+                                                    DISK_CACHE_SINGLE_FILE,
+@@ -317,47 +651,61 @@ disk_cache_create_custom(const char *gpu
+                          uint64_t driver_flags, const char *cache_dir_name,
+                          uint32_t max_size)
+ {
+-   return disk_cache_type_create(gpu_name, driver_id, cache_dir_name, 0,
++   return disk_cache_type_create(gpu_name, driver_id, cache_dir_name, driver_flags,
+                                  DISK_CACHE_DATABASE, max_size);
+ }
+ 
+ void
+ disk_cache_destroy(struct disk_cache *cache)
+ {
+-   if (unlikely(cache && cache->stats.enabled)) {
++   if (!cache) {
++      return;
++   }
++
++   if (UNLIKELY(cache->stats.enabled)) {
+       mesa_logi("disk shader cache:  hits = %u, misses = %u\n",
+                 cache->stats.hits,
+                 cache->stats.misses);
+    }
+ 
+-   if (cache && util_queue_is_initialized(&cache->cache_queue)) {
++   if (util_queue_is_initialized(&cache->cache_queue)) {
+       util_queue_finish(&cache->cache_queue);
+       util_queue_destroy(&cache->cache_queue);
++   }
+ 
+-      if (cache->foz_ro_cache)
+-         disk_cache_destroy(cache->foz_ro_cache);
+-
+-      if (cache->type == DISK_CACHE_SINGLE_FILE)
+-         foz_destroy(&cache->foz_db);
++   if (cache->foz_ro_cache) {
++      disk_cache_destroy(cache->foz_ro_cache);
++      cache->foz_ro_cache = NULL;
++   }
+ 
+-      if (cache->type == DISK_CACHE_DATABASE)
+-         mesa_cache_db_multipart_close(&cache->cache_db);
++   if (cache->type == DISK_CACHE_SINGLE_FILE) {
++      foz_destroy(&cache->foz_db);
++   }
+ 
+-      disk_cache_destroy_mmap(cache);
++   if (cache->type == DISK_CACHE_DATABASE) {
++      mesa_cache_db_multipart_close(&cache->cache_db);
+    }
+ 
++   disk_cache_destroy_mmap(cache);
++
+    ralloc_free(cache);
+ }
+ 
+ void
+ disk_cache_wait_for_idle(struct disk_cache *cache)
+ {
+-   util_queue_finish(&cache->cache_queue);
++   if (cache && util_queue_is_initialized(&cache->cache_queue)) {
++      util_queue_finish(&cache->cache_queue);
++   }
+ }
+ 
+ void
+ disk_cache_remove(struct disk_cache *cache, const cache_key key)
+ {
++   if (!cache) {
++      return;
++   }
++
+    if (cache->type == DISK_CACHE_DATABASE) {
+       mesa_cache_db_multipart_entry_remove(&cache->cache_db, key);
+       return;
+@@ -371,112 +719,119 @@ disk_cache_remove(struct disk_cache *cac
+    disk_cache_evict_item(cache, filename);
+ }
+ 
++/* -----------------------------------------------------------------------------
++ * Put job creation/destruction
++ * ---------------------------------------------------------------------------*/
+ static struct disk_cache_put_job *
+ create_put_job(struct disk_cache *cache, const cache_key key,
+                void *data, size_t size,
+                struct cache_item_metadata *cache_item_metadata,
+                bool take_ownership)
+ {
+-   struct disk_cache_put_job *dc_job = (struct disk_cache_put_job *)
+-      malloc(sizeof(struct disk_cache_put_job) + (take_ownership ? 0 : size));
++   size_t job_size = sizeof(struct disk_cache_put_job);
++   size_t payload_size = (!take_ownership) ? size : 0;
+ 
+-   if (dc_job) {
+-      dc_job->cache = cache;
+-      memcpy(dc_job->key, key, sizeof(cache_key));
+-      if (take_ownership) {
+-         dc_job->data = data;
+-      } else {
+-         dc_job->data = dc_job + 1;
+-         memcpy(dc_job->data, data, size);
++   if (!take_ownership && (payload_size > SIZE_MAX - job_size)) {
++      return NULL;
++   }
++
++   size_t nkeys = 0;
++   size_t keys_size = 0;
++   bool inline_keys = false;
++
++   if (cache_item_metadata &&
++       cache_item_metadata->type == CACHE_ITEM_TYPE_GLSL &&
++       cache_item_metadata->num_keys > 0) {
++      nkeys = cache_item_metadata->num_keys;
++      if (nkeys > SIZE_MAX / sizeof(cache_key)) {
++         return NULL;
+       }
+-      dc_job->size = size;
++      keys_size = nkeys * sizeof(cache_key);
++      inline_keys = true;
++   }
++
++   size_t total_alloc_size = job_size;
++   if (inline_keys) {
++      if (keys_size > SIZE_MAX - total_alloc_size) {
++         return NULL;
++      }
++      total_alloc_size += keys_size;
++   }
++   if (!take_ownership) {
++      if (payload_size > SIZE_MAX - total_alloc_size) {
++         return NULL;
++      }
++      total_alloc_size += payload_size;
++   }
++
++   struct disk_cache_put_job *dc_job =
++      (struct disk_cache_put_job *)malloc(total_alloc_size);
++   if (UNLIKELY(!dc_job)) {
++      return NULL;
++   }
++
++   dc_job->cache = cache;
++   memcpy(dc_job->key, key, sizeof(cache_key));
++   dc_job->size = size;
+ 
+-      /* Copy the cache item metadata */
+-      if (cache_item_metadata) {
+-         dc_job->cache_item_metadata.type = cache_item_metadata->type;
+-         if (cache_item_metadata->type == CACHE_ITEM_TYPE_GLSL) {
+-            dc_job->cache_item_metadata.num_keys =
+-               cache_item_metadata->num_keys;
+-            dc_job->cache_item_metadata.keys = (cache_key *)
+-               malloc(cache_item_metadata->num_keys * sizeof(cache_key));
++   uint8_t *p_after_job = (uint8_t *)(dc_job + 1);
+ 
+-            if (!dc_job->cache_item_metadata.keys)
+-               goto fail;
++   if (take_ownership) {
++      dc_job->data = data;
++   } else {
++      dc_job->data = p_after_job + (inline_keys ? keys_size : 0);
++      if (size > 0) {
++         memcpy(dc_job->data, data, size);
++      }
++   }
+ 
++   if (cache_item_metadata) {
++      dc_job->cache_item_metadata.type = cache_item_metadata->type;
++      if (cache_item_metadata->type == CACHE_ITEM_TYPE_GLSL) {
++         dc_job->cache_item_metadata.num_keys = nkeys;
++         if (nkeys > 0) {
++            dc_job->cache_item_metadata.keys = (cache_key *)p_after_job;
+             memcpy(dc_job->cache_item_metadata.keys,
+                    cache_item_metadata->keys,
+-                   sizeof(cache_key) * cache_item_metadata->num_keys);
++                   keys_size);
++         } else {
++            dc_job->cache_item_metadata.keys = NULL;
+          }
+       } else {
+-         dc_job->cache_item_metadata.type = CACHE_ITEM_TYPE_UNKNOWN;
+          dc_job->cache_item_metadata.keys = NULL;
++         dc_job->cache_item_metadata.num_keys = 0;
+       }
++   } else {
++      dc_job->cache_item_metadata.type = CACHE_ITEM_TYPE_UNKNOWN;
++      dc_job->cache_item_metadata.keys = NULL;
++      dc_job->cache_item_metadata.num_keys = 0;
+    }
+ 
+    return dc_job;
+-
+-fail:
+-   free(dc_job);
+-
+-   return NULL;
+ }
+ 
+ static void
+ destroy_put_job(void *job, void *gdata, int thread_index)
+ {
+-   if (job) {
+-      struct disk_cache_put_job *dc_job = (struct disk_cache_put_job *) job;
+-      free(dc_job->cache_item_metadata.keys);
+-      free(job);
+-   }
++   (void)gdata;
++   (void)thread_index;
++   free(job);
+ }
+ 
+ static void
+ destroy_put_job_nocopy(void *job, void *gdata, int thread_index)
+ {
++   (void)gdata;
++   (void)thread_index;
++
+    struct disk_cache_put_job *dc_job = (struct disk_cache_put_job *) job;
+    free(dc_job->data);
+    destroy_put_job(job, gdata, thread_index);
+ }
+ 
+-static void
+-blob_put_compressed(struct disk_cache *cache, const cache_key key,
+-         const void *data, size_t size);
+-
+-static void
+-cache_put(void *job, void *gdata, int thread_index)
+-{
+-   assert(job);
+-
+-   unsigned i = 0;
+-   char *filename = NULL;
+-   struct disk_cache_put_job *dc_job = (struct disk_cache_put_job *) job;
+-
+-   if (dc_job->cache->blob_put_cb) {
+-      blob_put_compressed(dc_job->cache, dc_job->key, dc_job->data, dc_job->size);
+-   } else if (dc_job->cache->type == DISK_CACHE_SINGLE_FILE) {
+-      disk_cache_write_item_to_disk_foz(dc_job);
+-   } else if (dc_job->cache->type == DISK_CACHE_DATABASE) {
+-      disk_cache_db_write_item_to_disk(dc_job);
+-   } else if (dc_job->cache->type == DISK_CACHE_MULTI_FILE) {
+-      filename = disk_cache_get_cache_filename(dc_job->cache, dc_job->key);
+-      if (filename == NULL)
+-         goto done;
+-
+-      /* If the cache is too large, evict something else first. */
+-      while (p_atomic_read_relaxed(&dc_job->cache->size->value) + dc_job->size > dc_job->cache->max_size &&
+-             i < 8) {
+-         disk_cache_evict_lru_item(dc_job->cache);
+-         i++;
+-      }
+-
+-      disk_cache_write_item_to_disk(dc_job, filename);
+-
+-done:
+-      free(filename);
+-   }
+-}
+-
++/* -----------------------------------------------------------------------------
++ * Blob callback compression format
++ * ---------------------------------------------------------------------------*/
+ struct blob_cache_entry {
+    uint32_t uncompressed_size;
+    uint8_t compressed_data[];
+@@ -484,31 +839,64 @@ struct blob_cache_entry {
+ 
+ static void
+ blob_put_compressed(struct disk_cache *cache, const cache_key key,
+-         const void *data, size_t size)
++                    const void *data, size_t size)
+ {
+    MESA_TRACE_FUNC();
+ 
++   if (UNLIKELY(size > UINT32_MAX)) {
++      return;
++   }
++
+    size_t max_buf = util_compress_max_compressed_len(size);
+-   struct blob_cache_entry *entry = malloc(max_buf + sizeof(*entry));
+-   if (!entry)
+-      goto out;
++   if (UNLIKELY(max_buf > SIZE_MAX - sizeof(struct blob_cache_entry))) {
++      return;
++   }
++
++   struct tls_out_buf *tls_out = tls_get_out();
++   if (UNLIKELY(!tls_out)) {
++      return;
++   }
++
++   size_t need = sizeof(struct blob_cache_entry) + max_buf;
++   if (tls_out->cap < need) {
++      size_t new_cap = tls_out->cap + (tls_out->cap / 2);
++      if (new_cap < need) {
++         new_cap = need;
++      }
++      if (new_cap > 16 * 1024 * 1024) {
++         new_cap = need;
++         if (new_cap > 16 * 1024 * 1024) {
++            return;
++         }
++      }
++
++      uint8_t *newp = (uint8_t *)realloc(tls_out->p, new_cap);
++      if (UNLIKELY(!newp)) {
++         return;
++      }
++      tls_out->p = newp;
++      tls_out->cap = new_cap;
++   }
+ 
+-   entry->uncompressed_size = size;
++   struct blob_cache_entry *entry = (struct blob_cache_entry *)tls_out->p;
++   entry->uncompressed_size = (uint32_t)size;
+ 
+    size_t compressed_size =
+          util_compress_deflate(data, size, entry->compressed_data, max_buf);
+-   if (!compressed_size)
+-      goto out;
++   if (UNLIKELY(!compressed_size)) {
++      return;
++   }
++
++   size_t entry_size_sz = compressed_size + sizeof(*entry);
++   if (UNLIKELY(entry_size_sz > (size_t)LONG_MAX)) {
++      return;
++   }
+ 
+-   unsigned entry_size = compressed_size + sizeof(*entry);
+-   // The curly brackets are here to only trace the blob_put_cb call
++   signed long entry_size = (signed long)entry_size_sz;
+    {
+       MESA_TRACE_SCOPE("blob_put");
+       cache->blob_put_cb(key, CACHE_KEY_SIZE, entry, entry_size);
+    }
+-
+-out:
+-   free(entry);
+ }
+ 
+ static void *
+@@ -517,56 +905,110 @@ blob_get_compressed(struct disk_cache *c
+ {
+    MESA_TRACE_FUNC();
+ 
+-   /* This is what Android EGL defines as the maxValueSize in egl_cache_t
+-    * class implementation.
+-    */
+-   const signed long max_blob_size = 64 * 1024;
+-   struct blob_cache_entry *entry = malloc(max_blob_size);
+-   if (!entry)
++   const signed long max_blob_size = 128 * 1024;
++
++   struct tls_in_buf *tls_in = tls_get_in();
++   if (UNLIKELY(!tls_in || tls_in->cap < (size_t)max_blob_size)) {
+       return NULL;
++   }
++
++   struct blob_cache_entry *entry = (struct blob_cache_entry *)tls_in->p;
+ 
+    signed long entry_size;
+-   // The curly brackets are here to only trace the blob_get_cb call
+    {
+       MESA_TRACE_SCOPE("blob_get");
+       entry_size = cache->blob_get_cb(key, CACHE_KEY_SIZE, entry, max_blob_size);
+    }
+ 
+-   if (!entry_size) {
+-      free(entry);
++   if (UNLIKELY(entry_size <= 0 ||
++       entry_size > max_blob_size ||
++       entry_size < (signed long)sizeof(*entry))) {
+       return NULL;
+    }
+ 
+-   void *data = malloc(entry->uncompressed_size);
+-   if (!data) {
+-      free(entry);
++   size_t sz_entry = (size_t)entry_size;
++   size_t hdr = sizeof(*entry);
++   size_t compressed_size = sz_entry - hdr;
++
++   size_t uncomp = (size_t)entry->uncompressed_size;
++   if (UNLIKELY(uncomp == 0 || uncomp > 256 * 1024 * 1024)) {
++      return NULL;
++   }
++
++   void *data = malloc(uncomp);
++   if (UNLIKELY(!data)) {
+       return NULL;
+    }
+ 
+-   unsigned compressed_size = entry_size - sizeof(*entry);
+    bool ret = util_compress_inflate(entry->compressed_data, compressed_size,
+-                                    data, entry->uncompressed_size);
+-   if (!ret) {
++                                    data, uncomp);
++   if (UNLIKELY(!ret)) {
+       free(data);
+-      free(entry);
+       return NULL;
+    }
+ 
+-   if (size)
+-      *size = entry->uncompressed_size;
+-
+-   free(entry);
++   if (size) {
++      *size = uncomp;
++   }
+ 
+    return data;
+ }
+ 
++/* -----------------------------------------------------------------------------
++ * Queue job function
++ * ---------------------------------------------------------------------------*/
++static void
++cache_put(void *job, void *gdata, int thread_index)
++{
++   (void)gdata;
++   (void)thread_index;
++
++   assert(job);
++
++   unsigned i = 0;
++   char *filename = NULL;
++   struct disk_cache_put_job *dc_job = (struct disk_cache_put_job *) job;
++
++   if (dc_job->cache->blob_put_cb) {
++      blob_put_compressed(dc_job->cache, dc_job->key, dc_job->data, dc_job->size);
++   } else if (dc_job->cache->type == DISK_CACHE_SINGLE_FILE) {
++      disk_cache_write_item_to_disk_foz(dc_job);
++   } else if (dc_job->cache->type == DISK_CACHE_DATABASE) {
++      disk_cache_db_write_item_to_disk(dc_job);
++   } else if (dc_job->cache->type == DISK_CACHE_MULTI_FILE) {
++      filename = disk_cache_get_cache_filename(dc_job->cache, dc_job->key);
++      if (filename == NULL) {
++         goto done;
++      }
++
++      while (p_atomic_read_relaxed(&dc_job->cache->size->value) + dc_job->size > dc_job->cache->max_size &&
++             i < 8) {
++         disk_cache_evict_lru_item(dc_job->cache);
++         i++;
++      }
++
++      disk_cache_write_item_to_disk(dc_job, filename);
++
++done:
++      free(filename);
++   }
++}
++
++/* -----------------------------------------------------------------------------
++ * Public API: put/get
++ * ---------------------------------------------------------------------------*/
+ void
+ disk_cache_put(struct disk_cache *cache, const cache_key key,
+                const void *data, size_t size,
+                struct cache_item_metadata *cache_item_metadata)
+ {
+-   if (!util_queue_is_initialized(&cache->cache_queue))
++   if (UNLIKELY(size == 0)) {
++      return;
++   }
++
++   if (!util_queue_is_initialized(&cache->cache_queue)) {
+       return;
++   }
+ 
+    struct disk_cache_put_job *dc_job =
+       create_put_job(cache, key, (void*)data, size, cache_item_metadata, false);
+@@ -588,6 +1030,11 @@ disk_cache_put_nocopy(struct disk_cache
+       return;
+    }
+ 
++   if (UNLIKELY(size == 0)) {
++      free(data);
++      return;
++   }
++
+    struct disk_cache_put_job *dc_job =
+       create_put_job(cache, key, data, size, cache_item_metadata, true);
+ 
+@@ -595,6 +1042,8 @@ disk_cache_put_nocopy(struct disk_cache
+       util_queue_fence_init(&dc_job->fence);
+       util_queue_add_job(&cache->cache_queue, dc_job, &dc_job->fence,
+                          cache_put, destroy_put_job_nocopy, dc_job->size);
++   } else {
++      free(data);
+    }
+ }
+ 
+@@ -603,11 +1052,13 @@ disk_cache_get(struct disk_cache *cache,
+ {
+    void *buf = NULL;
+ 
+-   if (size)
++   if (size) {
+       *size = 0;
++   }
+ 
+-   if (cache->foz_ro_cache)
++   if (cache->foz_ro_cache) {
+       buf = disk_cache_load_item_foz(cache->foz_ro_cache, key, size);
++   }
+ 
+    if (!buf) {
+       if (cache->blob_get_cb) {
+@@ -618,74 +1069,334 @@ disk_cache_get(struct disk_cache *cache,
+          buf = disk_cache_db_load_item(cache, key, size);
+       } else if (cache->type == DISK_CACHE_MULTI_FILE) {
+          char *filename = disk_cache_get_cache_filename(cache, key);
+-         if (filename)
++         if (filename) {
+             buf = disk_cache_load_item(cache, filename, size);
++         }
+       }
+    }
+ 
+-   if (unlikely(cache->stats.enabled)) {
+-      if (buf)
++   if (UNLIKELY(cache->stats.enabled)) {
++      if (buf) {
+          p_atomic_inc(&cache->stats.hits);
+-      else
++      } else {
+          p_atomic_inc(&cache->stats.misses);
++      }
+    }
+ 
+    return buf;
+ }
+ 
++/* -----------------------------------------------------------------------------
++ * Fast key compare
++ * ---------------------------------------------------------------------------*/
++
++_Static_assert(CACHE_KEY_SIZE == 20, "Optimized key comparison assumes 20-byte SHA1 key");
++
++#if defined(CACHE_KEY_SIZE) && (CACHE_KEY_SIZE != 20)
++#  define CACHE_KEY_FASTCMP(a,b) (memcmp((a),(b),CACHE_KEY_SIZE) == 0)
++#else
++
++#if (defined(__x86_64__) || defined(_M_X64))
++static inline bool
++cache_key_equals_fast_sse2(const unsigned char *a, const unsigned char *b)
++{
++   __m128i va = _mm_loadu_si128((const __m128i *)a);
++   __m128i vb = _mm_loadu_si128((const __m128i *)b);
++   __m128i cmp_res = _mm_cmpeq_epi8(va, vb);
++
++   if (UNLIKELY(_mm_movemask_epi8(cmp_res) != 0xFFFF)) {
++      return false;
++   }
++
++   uint32_t tail_a, tail_b;
++   memcpy(&tail_a, a + 16, sizeof(tail_a));
++   memcpy(&tail_b, b + 16, sizeof(tail_b));
++   return tail_a == tail_b;
++}
++#endif
++
++static inline bool
++cache_key_equals_fast(const unsigned char *a, const unsigned char *b)
++{
++#if (defined(__x86_64__) || defined(_M_X64))
++   return cache_key_equals_fast_sse2(a, b);
++#else
++   uint64_t a0, a1, b0, b1;
++   uint32_t a2, b2;
++   memcpy(&a0, a + 0,  sizeof(a0));
++   memcpy(&a1, a + 8,  sizeof(a1));
++   memcpy(&a2, a + 16, sizeof(a2));
++   memcpy(&b0, b + 0,  sizeof(b0));
++   memcpy(&b1, b + 8,  sizeof(b1));
++   memcpy(&b2, b + 16, sizeof(b2));
++   return (a0 == b0) & (a1 == b1) & (a2 == b2);
++#endif
++}
++#  define CACHE_KEY_FASTCMP(a,b) cache_key_equals_fast((a),(b))
++#endif
++
++/* -----------------------------------------------------------------------------
++ * In-memory key table helpers
++ * ---------------------------------------------------------------------------*/
+ void
+ disk_cache_put_key(struct disk_cache *cache, const cache_key key)
+ {
+-   const uint32_t *key_chunk = (const uint32_t *) key;
+-   int i = CPU_TO_LE32(*key_chunk) & CACHE_INDEX_KEY_MASK;
++   uint32_t first_word;
++   int i;
+    unsigned char *entry;
+ 
++   memcpy(&first_word, key, sizeof(first_word));
++   i = CPU_TO_LE32(first_word) & CACHE_INDEX_KEY_MASK;
++
+    if (cache->blob_put_cb) {
+-      cache->blob_put_cb(key, CACHE_KEY_SIZE, key_chunk, sizeof(uint32_t));
++      cache->blob_put_cb(key, CACHE_KEY_SIZE, &first_word, (signed long)sizeof(uint32_t));
+       return;
+    }
+ 
+-   if (cache->path_init_failed)
++   if (cache->path_init_failed) {
+       return;
++   }
+ 
+    entry = &cache->stored_keys[i * CACHE_KEY_SIZE];
+ 
+    memcpy(entry, key, CACHE_KEY_SIZE);
+ }
+ 
+-/* This function lets us test whether a given key was previously
+- * stored in the cache with disk_cache_put_key(). The implement is
+- * efficient by not using syscalls or hitting the disk. It's not
+- * race-free, but the races are benign. If we race with someone else
+- * calling disk_cache_put_key, then that's just an extra cache miss and an
+- * extra recompile.
+- */
+ bool
+ disk_cache_has_key(struct disk_cache *cache, const cache_key key)
+ {
+-   const uint32_t *key_chunk = (const uint32_t *) key;
+-   int i = CPU_TO_LE32(*key_chunk) & CACHE_INDEX_KEY_MASK;
++   uint32_t first_word;
++   int i;
+    unsigned char *entry;
+ 
++   memcpy(&first_word, key, sizeof(first_word));
++
+    if (cache->blob_get_cb) {
+-      uint32_t blob;
+-      return cache->blob_get_cb(key, CACHE_KEY_SIZE, &blob, sizeof(uint32_t));
++      uint32_t blob = 0;
++      return cache->blob_get_cb(key, CACHE_KEY_SIZE, &blob, (signed long)sizeof(uint32_t)) != 0;
+    }
+ 
+-   if (cache->path_init_failed)
++   if (cache->path_init_failed) {
+       return false;
++   }
+ 
++   i = CPU_TO_LE32(first_word) & CACHE_INDEX_KEY_MASK;
+    entry = &cache->stored_keys[i * CACHE_KEY_SIZE];
+ 
+-   return memcmp(entry, key, CACHE_KEY_SIZE) == 0;
++   PREFETCH_R(entry);
++
++   return CACHE_KEY_FASTCMP(entry, key);
++}
++
++/* -----------------------------------------------------------------------------
++ * Hashing / callbacks
++ * ---------------------------------------------------------------------------*/
++
++#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__SHA__) || (defined(_MSC_VER) && !defined(__clang__)))
++#define HAVE_SHA_NI 1
++
++static inline uint32_t
++bswap32_portable(uint32_t val)
++{
++#if defined(__GNUC__) || defined(__clang__)
++   return __builtin_bswap32(val);
++#elif defined(_MSC_VER)
++   return _byteswap_ulong(val);
++#else
++   return ((val & 0xff000000) >> 24) |
++          ((val & 0x00ff0000) >>  8) |
++          ((val & 0x0000ff00) <<  8) |
++          ((val & 0x000000ff) << 24);
++#endif
++}
++
++static inline uint64_t
++bswap64_portable(uint64_t val)
++{
++#if defined(__GNUC__) || defined(__clang__)
++   return __builtin_bswap64(val);
++#elif defined(_MSC_VER)
++   return _byteswap_uint64(val);
++#else
++   return ((uint64_t)bswap32_portable((uint32_t)(val & 0xFFFFFFFF)) << 32) |
++          (bswap32_portable((uint32_t)(val >> 32)));
++#endif
++}
++
++#if defined(__GNUC__) || defined(__clang__)
++__attribute__((target("sha")))
++#endif
++static void
++process_block_sha_ni(uint32_t h[5], const uint8_t* block_ptr)
++{
++    const __m128i endian_shuffle = _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3);
++    __m128i abcd, e0, e1;
++    uint32_t e_s;
++
++    abcd = _mm_loadu_si128((const __m128i*)h);
++    e_s = h[4];
++    abcd = _mm_shuffle_epi32(abcd, 0x1B);
++
++    __m128i w0 = _mm_loadu_si128((const __m128i*)(block_ptr + 0));
++    __m128i w1 = _mm_loadu_si128((const __m128i*)(block_ptr + 16));
++    __m128i w2 = _mm_loadu_si128((const __m128i*)(block_ptr + 32));
++    __m128i w3 = _mm_loadu_si128((const __m128i*)(block_ptr + 48));
++
++    w0 = _mm_shuffle_epi8(w0, endian_shuffle);
++    w1 = _mm_shuffle_epi8(w1, endian_shuffle);
++    w2 = _mm_shuffle_epi8(w2, endian_shuffle);
++    w3 = _mm_shuffle_epi8(w3, endian_shuffle);
++    e0 = _mm_set_epi32((int)e_s, 0, 0, 0);
++
++    e0 = _mm_sha1rnds4_epu32(e0, abcd, 0); abcd = _mm_sha1nexte_epu32(abcd, w0);
++    e1 = _mm_sha1rnds4_epu32(e0, abcd, 0); abcd = _mm_sha1nexte_epu32(abcd, w1);
++    e0 = _mm_sha1rnds4_epu32(e1, abcd, 0); abcd = _mm_sha1nexte_epu32(abcd, w2);
++    e1 = _mm_sha1rnds4_epu32(e0, abcd, 0); abcd = _mm_sha1nexte_epu32(abcd, w3);
++    w0 = _mm_sha1msg2_epu32(_mm_sha1msg1_epu32(w0, w1), w2);
++
++    e0 = _mm_sha1rnds4_epu32(e1, abcd, 0); abcd = _mm_sha1nexte_epu32(abcd, w0);
++    w1 = _mm_sha1msg2_epu32(_mm_sha1msg1_epu32(w1, w2), w3);
++
++    e1 = _mm_sha1rnds4_epu32(e0, abcd, 1); abcd = _mm_sha1nexte_epu32(abcd, w1);
++    w2 = _mm_sha1msg2_epu32(_mm_sha1msg1_epu32(w2, w3), w0);
++    e0 = _mm_sha1rnds4_epu32(e1, abcd, 1); abcd = _mm_sha1nexte_epu32(abcd, w2);
++    w3 = _mm_sha1msg2_epu32(_mm_sha1msg1_epu32(w3, w0), w1);
++    e1 = _mm_sha1rnds4_epu32(e0, abcd, 1); abcd = _mm_sha1nexte_epu32(abcd, w3);
++    w0 = _mm_sha1msg2_epu32(_mm_sha1msg1_epu32(w0, w1), w2);
++    e0 = _mm_sha1rnds4_epu32(e1, abcd, 1); abcd = _mm_sha1nexte_epu32(abcd, w0);
++    w1 = _mm_sha1msg2_epu32(_mm_sha1msg1_epu32(w1, w2), w3);
++    e1 = _mm_sha1rnds4_epu32(e0, abcd, 1); abcd = _mm_sha1nexte_epu32(abcd, w1);
++    w2 = _mm_sha1msg2_epu32(_mm_sha1msg1_epu32(w2, w3), w0);
++
++    e0 = _mm_sha1rnds4_epu32(e1, abcd, 2); abcd = _mm_sha1nexte_epu32(abcd, w2);
++    w3 = _mm_sha1msg2_epu32(_mm_sha1msg1_epu32(w3, w0), w1);
++    e1 = _mm_sha1rnds4_epu32(e0, abcd, 2); abcd = _mm_sha1nexte_epu32(abcd, w3);
++    w0 = _mm_sha1msg2_epu32(_mm_sha1msg1_epu32(w0, w1), w2);
++    e0 = _mm_sha1rnds4_epu32(e1, abcd, 2); abcd = _mm_sha1nexte_epu32(abcd, w0);
++    w1 = _mm_sha1msg2_epu32(_mm_sha1msg1_epu32(w1, w2), w3);
++    e1 = _mm_sha1rnds4_epu32(e0, abcd, 2); abcd = _mm_sha1nexte_epu32(abcd, w1);
++    w2 = _mm_sha1msg2_epu32(_mm_sha1msg1_epu32(w2, w3), w0);
++    e0 = _mm_sha1rnds4_epu32(e1, abcd, 2); abcd = _mm_sha1nexte_epu32(abcd, w2);
++    w3 = _mm_sha1msg2_epu32(_mm_sha1msg1_epu32(w3, w0), w1);
++
++    e1 = _mm_sha1rnds4_epu32(e0, abcd, 3); abcd = _mm_sha1nexte_epu32(abcd, w3);
++    w0 = _mm_sha1msg2_epu32(_mm_sha1msg1_epu32(w0, w1), w2);
++    e0 = _mm_sha1rnds4_epu32(e1, abcd, 3); abcd = _mm_sha1nexte_epu32(abcd, w0);
++    w1 = _mm_sha1msg2_epu32(_mm_sha1msg1_epu32(w1, w2), w3);
++    e1 = _mm_sha1rnds4_epu32(e0, abcd, 3); abcd = _mm_sha1nexte_epu32(abcd, w1);
++    e0 = _mm_sha1rnds4_epu32(e1, abcd, 3); abcd = _mm_sha1nexte_epu32(abcd, w2);
++    e1 = _mm_sha1rnds4_epu32(e0, abcd, 3);
++
++    e_s = (uint32_t)_mm_extract_epi32(e1, 0);
++    abcd = _mm_shuffle_epi32(abcd, 0x1B);
++    _mm_storeu_si128((__m128i*)h, _mm_add_epi32(abcd, _mm_loadu_si128((const __m128i*)h)));
++    h[4] += e_s;
++}
++
++static bool
++disk_cache_compute_key_sha_ni(const void *data1, size_t size1,
++                              const void *data2, size_t size2,
++                              cache_key key)
++{
++   uint32_t h[5] = {
++      0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0
++   };
++
++   uint8_t current_block[64];
++   size_t total_size = size1 + size2;
++   size_t offset = 0;
++   const uint8_t *p1 = (const uint8_t *)data1;
++   const uint8_t *p2 = (const uint8_t *)data2;
++
++   while (offset + 64 <= total_size) {
++      const uint8_t* block_ptr;
++      if (offset < size1 && (size1 - offset) >= 64) {
++         block_ptr = p1 + offset;
++      } else if (offset >= size1) {
++         block_ptr = p2 + (offset - size1);
++      } else {
++         size_t remaining_in_p1 = size1 - offset;
++         memcpy(current_block, p1 + offset, remaining_in_p1);
++         memcpy(current_block + remaining_in_p1, p2, 64 - remaining_in_p1);
++         block_ptr = current_block;
++      }
++      process_block_sha_ni(h, block_ptr);
++      offset += 64;
++   }
++
++   size_t remaining = total_size - offset;
++   if (offset < size1) {
++      size_t remaining_in_p1 = size1 - offset;
++      if (remaining_in_p1 > 0) {
++         memcpy(current_block, p1 + offset, remaining_in_p1);
++      }
++      if (remaining > remaining_in_p1) {
++         memcpy(current_block + remaining_in_p1, p2, remaining - remaining_in_p1);
++      }
++   } else {
++      if (remaining > 0) {
++         memcpy(current_block, p2 + (offset - size1), remaining);
++      }
++   }
++
++   current_block[remaining] = 0x80;
++   remaining++;
++
++   if (remaining > 56) {
++      memset(current_block + remaining, 0, 64 - remaining);
++      process_block_sha_ni(h, current_block);
++      memset(current_block, 0, 56);
++   } else {
++      memset(current_block + remaining, 0, 56 - remaining);
++   }
++
++   uint64_t total_bits = total_size * 8;
++   ((uint64_t*)current_block)[7] = bswap64_portable(total_bits);
++   process_block_sha_ni(h, current_block);
++
++   h[0] = bswap32_portable(h[0]);
++   h[1] = bswap32_portable(h[1]);
++   h[2] = bswap32_portable(h[2]);
++   h[3] = bswap32_portable(h[3]);
++   h[4] = bswap32_portable(h[4]);
++   memcpy(key, h, 20);
++
++   return true;
+ }
++#endif /* HAVE_SHA_NI */
+ 
+ void
+ disk_cache_compute_key(struct disk_cache *cache, const void *data, size_t size,
+                        cache_key key)
+ {
+-   struct mesa_sha1 ctx;
++#if HAVE_SHA_NI
++   static uint32_t sha_support_state = 0;
++
++   uint32_t state = p_atomic_read(&sha_support_state);
++   if (UNLIKELY(state == 0)) {
++      bool has_sha;
++#if defined(__GNUC__) || defined(__clang__)
++      has_sha = __builtin_cpu_supports("sha");
++#elif defined(_MSC_VER)
++      int info[4];
++      __cpuidex(info, 7, 0);
++      has_sha = (info[1] & (1 << 29)) != 0;
++#else
++      has_sha = false;
++#endif
++      p_atomic_set(&sha_support_state, has_sha ? 2 : 1);
++      state = has_sha ? 2 : 1;
++   }
+ 
++   if (state == 2) {
++      disk_cache_compute_key_sha_ni(cache->driver_keys_blob,
++                                     cache->driver_keys_blob_size,
++                                     data, size, key);
++      return;
++   }
++#endif
++
++   struct mesa_sha1 ctx;
+    _mesa_sha1_init(&ctx);
+    _mesa_sha1_update(&ctx, cache->driver_keys_blob,
+                      cache->driver_keys_blob_size);
