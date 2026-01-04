@@ -214,50 +214,92 @@ static isl::map createNextIterationMap(isl::space SetSpace, unsigned Dim) {
 
 /// Add @p BSet to set @p BoundedParts if @p BSet is bounded.
 static isl::set collectBoundedParts(isl::set S) {
+  if (S.is_null())
+    return isl::set();
+
   isl::set BoundedParts = isl::set::empty(S.get_space());
-  for (isl::basic_set BSet : S.get_basic_set_list())
+  if (BoundedParts.is_null())
+    return isl::set();
+
+  for (isl::basic_set BSet : S.get_basic_set_list()) {
+    if (BSet.is_null())
+      continue;
     if (BSet.is_bounded())
       BoundedParts = BoundedParts.unite(isl::set(BSet));
+  }
   return BoundedParts;
 }
 
 /// Compute the (un)bounded parts of @p S wrt. to dimension @p Dim.
 ///
 /// @returns A separation of @p S into first an unbounded then a bounded subset,
-///          both with regards to the dimension @p Dim.
+///          both with regards to the dimension @p Dim. Returns a pair of null
+///          sets if computation fails.
 static std::pair<isl::set, isl::set> partitionSetParts(isl::set S,
                                                        unsigned Dim) {
-  for (unsigned u : rangeIslSize(0, S.tuple_dim()))
-    S = S.lower_bound_si(isl::dim::set, u, 0);
+  if (S.is_null())
+    return std::make_pair(isl::set(), isl::set());
 
-  unsigned NumDimsS = unsignedFromIslSize(S.tuple_dim());
+  for (unsigned u : rangeIslSize(0, S.tuple_dim())) {
+    S = S.lower_bound_si(isl::dim::set, u, 0);
+    if (S.is_null())
+      return std::make_pair(isl::set(), isl::set());
+  }
+
+  isl::size TupleDimSize = S.tuple_dim();
+  if (TupleDimSize.is_error())
+    return std::make_pair(isl::set(), isl::set());
+
+  unsigned NumDimsS = unsignedFromIslSize(TupleDimSize);
   isl::set OnlyDimS = S;
 
   // Remove dimensions that are greater than Dim as they are not interesting.
   assert(NumDimsS >= Dim + 1);
   OnlyDimS = OnlyDimS.project_out(isl::dim::set, Dim + 1, NumDimsS - Dim - 1);
+  if (OnlyDimS.is_null())
+    return std::make_pair(isl::set(), isl::set());
 
   // Create artificial parametric upper bounds for dimensions smaller than Dim
   // as we are not interested in them.
   OnlyDimS = OnlyDimS.insert_dims(isl::dim::param, 0, Dim);
+  if (OnlyDimS.is_null())
+    return std::make_pair(isl::set(), isl::set());
 
   for (unsigned u = 0; u < Dim; u++) {
-    isl::constraint C = isl::constraint::alloc_inequality(
-        isl::local_space(OnlyDimS.get_space()));
+    isl::space Space = OnlyDimS.get_space();
+    if (Space.is_null())
+      return std::make_pair(isl::set(), isl::set());
+
+    isl::local_space LS(Space);
+    if (LS.is_null())
+      return std::make_pair(isl::set(), isl::set());
+
+    isl::constraint C = isl::constraint::alloc_inequality(LS);
+    if (C.is_null())
+      return std::make_pair(isl::set(), isl::set());
+
     C = C.set_coefficient_si(isl::dim::param, u, 1);
     C = C.set_coefficient_si(isl::dim::set, u, -1);
     OnlyDimS = OnlyDimS.add_constraint(C);
+    if (OnlyDimS.is_null())
+      return std::make_pair(isl::set(), isl::set());
   }
 
   // Collect all bounded parts of OnlyDimS.
   isl::set BoundedParts = collectBoundedParts(OnlyDimS);
+  if (BoundedParts.is_null())
+    return std::make_pair(isl::set(), isl::set());
 
   // Create the dimensions greater than Dim again.
   BoundedParts =
       BoundedParts.insert_dims(isl::dim::set, Dim + 1, NumDimsS - Dim - 1);
+  if (BoundedParts.is_null())
+    return std::make_pair(isl::set(), isl::set());
 
   // Remove the artificial upper bound parameters again.
   BoundedParts = BoundedParts.remove_dims(isl::dim::param, 0, Dim);
+  if (BoundedParts.is_null())
+    return std::make_pair(isl::set(), isl::set());
 
   isl::set UnboundedParts = S.subtract(BoundedParts);
   return std::make_pair(UnboundedParts, BoundedParts);
@@ -737,11 +779,21 @@ bool ScopBuilder::addLoopBoundsToHeaderDomain(
   assert(scop->isDomainDefined(HeaderBB));
   isl::set &HeaderBBDom = scop->getOrInitEmptyDomain(HeaderBB);
 
-  isl::map NextIterationMap =
-      createNextIterationMap(HeaderBBDom.get_space(),
-                             static_cast<unsigned>(LoopDepth));
+  if (HeaderBBDom.is_null())
+    return false;
 
-  isl::set UnionBackedgeCondition = HeaderBBDom.empty(HeaderBBDom.get_space());
+  isl::space DomSpace = HeaderBBDom.get_space();
+  if (DomSpace.is_null())
+    return false;
+
+  isl::map NextIterationMap =
+      createNextIterationMap(DomSpace, static_cast<unsigned>(LoopDepth));
+  if (NextIterationMap.is_null())
+    return false;
+
+  isl::set UnionBackedgeCondition = HeaderBBDom.empty(DomSpace);
+  if (UnionBackedgeCondition.is_null())
+    return false;
 
   SmallVector<BasicBlock *, 4> LatchBlocks;
   L->getLoopLatches(LatchBlocks);
@@ -752,6 +804,8 @@ bool ScopBuilder::addLoopBoundsToHeaderDomain(
       continue;
 
     isl::set LatchBBDom = scop->getDomainConditions(LatchBB);
+    if (LatchBBDom.is_null())
+      continue;
 
     isl::set BackedgeCondition;
 
@@ -759,9 +813,9 @@ bool ScopBuilder::addLoopBoundsToHeaderDomain(
     BranchInst *BI = dyn_cast<BranchInst>(TI);
     assert(BI && "Only branch instructions allowed in loop latches");
 
-    if (BI->isUnconditional())
+    if (BI->isUnconditional()) {
       BackedgeCondition = LatchBBDom;
-    else {
+    } else {
       SmallVector<isl_set *, 8> ConditionSets;
       int idx = BI->getSuccessor(0) != HeaderBB;
       if (!buildConditionSets(LatchBB, TI, L, LatchBBDom.get(),
@@ -774,28 +828,59 @@ bool ScopBuilder::addLoopBoundsToHeaderDomain(
       BackedgeCondition = isl::manage(ConditionSets[idx]);
     }
 
+    if (BackedgeCondition.is_null())
+      continue;
+
     int LatchLoopDepth = scop->getRelativeLoopDepth(LI.getLoopFor(LatchBB));
     assert(LatchLoopDepth >= LoopDepth);
     BackedgeCondition = BackedgeCondition.project_out(
         isl::dim::set, LoopDepth + 1, LatchLoopDepth - LoopDepth);
+    if (BackedgeCondition.is_null())
+      continue;
+
     UnionBackedgeCondition = UnionBackedgeCondition.unite(BackedgeCondition);
+    if (UnionBackedgeCondition.is_null())
+      return false;
   }
 
-  isl::map ForwardMap = isl::map::lex_le(HeaderBBDom.get_space());
-  for (int i = 0; i < LoopDepth; i++)
+  isl::map ForwardMap = isl::map::lex_le(DomSpace);
+  if (ForwardMap.is_null())
+    return false;
+
+  for (int i = 0; i < LoopDepth; i++) {
     ForwardMap = ForwardMap.equate(isl::dim::in, i, isl::dim::out, i);
+    if (ForwardMap.is_null())
+      return false;
+  }
 
   isl::set UnionBackedgeConditionComplement =
       UnionBackedgeCondition.complement();
+  if (UnionBackedgeConditionComplement.is_null())
+    return false;
+
   UnionBackedgeConditionComplement =
       UnionBackedgeConditionComplement.lower_bound_si(isl::dim::set, LoopDepth,
                                                       0);
+  if (UnionBackedgeConditionComplement.is_null())
+    return false;
+
   UnionBackedgeConditionComplement =
       UnionBackedgeConditionComplement.apply(ForwardMap);
+  if (UnionBackedgeConditionComplement.is_null())
+    return false;
+
   HeaderBBDom = HeaderBBDom.subtract(UnionBackedgeConditionComplement);
+  if (HeaderBBDom.is_null())
+    return false;
+
   HeaderBBDom = HeaderBBDom.apply(NextIterationMap);
+  if (HeaderBBDom.is_null())
+    return false;
 
   auto Parts = partitionSetParts(HeaderBBDom, static_cast<unsigned>(LoopDepth));
+  if (Parts.first.is_null() || Parts.second.is_null())
+    return false;
+
   HeaderBBDom = Parts.second;
 
   // Check if there is a <nsw> tagged AddRec for this loop and if so do not
@@ -804,9 +889,11 @@ bool ScopBuilder::addLoopBoundsToHeaderDomain(
   bool RequiresRTC = !scop->hasNSWAddRecForLoop(L);
 
   isl::set UnboundedCtx = Parts.first.params();
-  recordAssumption(&RecordedAssumptions, INFINITELOOP, UnboundedCtx,
-                   HeaderBB->getTerminator()->getDebugLoc(), AS_RESTRICTION,
-                   nullptr, RequiresRTC);
+  if (!UnboundedCtx.is_null()) {
+    recordAssumption(&RecordedAssumptions, INFINITELOOP, UnboundedCtx,
+                     HeaderBB->getTerminator()->getDebugLoc(), AS_RESTRICTION,
+                     nullptr, RequiresRTC);
+  }
   return true;
 }
 
@@ -2202,41 +2289,109 @@ static bool isDivisible(const SCEV *Expr, unsigned Size, ScalarEvolution &SE) {
 
 void ScopBuilder::foldSizeConstantsToRight() {
   isl::union_set Accessed = scop->getAccesses().range();
+  if (Accessed.is_null())
+    return;
 
   for (auto Array : scop->arrays()) {
     if (Array->getNumberOfDimensions() <= 1)
       continue;
 
     isl::space Space = Array->getSpace();
-    Space = Space.align_params(Accessed.get_space());
+    if (Space.is_null())
+      continue;
+
+    isl::space AccessedSpace = Accessed.get_space();
+    if (AccessedSpace.is_null())
+      continue;
+
+    Space = Space.align_params(AccessedSpace);
+    if (Space.is_null())
+      continue;
 
     if (!Accessed.contains(Space))
       continue;
 
     isl::set Elements = Accessed.extract_set(Space);
-    isl::map Transform = isl::map::universe(Array->getSpace().map_from_set());
+    if (Elements.is_null())
+      continue;
+
+    isl::space MapSpace = Array->getSpace().map_from_set();
+    if (MapSpace.is_null())
+      continue;
+
+    isl::map Transform = isl::map::universe(MapSpace);
+    if (Transform.is_null())
+      continue;
 
     std::vector<int> Int;
-    unsigned Dims = unsignedFromIslSize(Elements.tuple_dim());
+    isl::size TupleDimSize = Elements.tuple_dim();
+    if (TupleDimSize.is_error())
+      continue;
 
-    for (unsigned i = 0; i < Dims; i++) {
-      isl::set DimOnly = isl::set(Elements).project_out(isl::dim::set, 0, i);
+    unsigned Dims = unsignedFromIslSize(TupleDimSize);
+
+    bool Failed = false;
+    for (unsigned i = 0; i < Dims && !Failed; i++) {
+      isl::set DimOnly = isl::set(Elements);
+      if (DimOnly.is_null()) {
+        Failed = true;
+        break;
+      }
+
+      DimOnly = DimOnly.project_out(isl::dim::set, 0, i);
+      if (DimOnly.is_null()) {
+        Failed = true;
+        break;
+      }
+
       DimOnly = DimOnly.project_out(isl::dim::set, 1, Dims - i - 1);
+      if (DimOnly.is_null()) {
+        Failed = true;
+        break;
+      }
+
       DimOnly = DimOnly.lower_bound_si(isl::dim::set, 0, 0);
+      if (DimOnly.is_null()) {
+        Failed = true;
+        break;
+      }
 
       isl::basic_set DimHull = DimOnly.affine_hull();
+      if (DimHull.is_null()) {
+        Failed = true;
+        break;
+      }
 
       if (i == Dims - 1) {
         Int.push_back(1);
         Transform = Transform.equate(isl::dim::in, i, isl::dim::out, i);
+        if (Transform.is_null()) {
+          Failed = true;
+          break;
+        }
         continue;
       }
 
-      unsigned NumDivs = unsignedFromIslSize(DimHull.dim(isl::dim::div));
+      isl::size NumDivsSize = DimHull.dim(isl::dim::div);
+      if (NumDivsSize.is_error()) {
+        Failed = true;
+        break;
+      }
+
+      unsigned NumDivs = unsignedFromIslSize(NumDivsSize);
 
       if (NumDivs == 1) {
         isl::aff Diff = DimHull.get_div(0);
+        if (Diff.is_null()) {
+          Failed = true;
+          break;
+        }
+
         isl::val Val = Diff.get_denominator_val();
+        if (Val.is_null()) {
+          Failed = true;
+          break;
+        }
 
         int ValInt = 1;
         if (Val.is_int()) {
@@ -2246,27 +2401,66 @@ void ScopBuilder::foldSizeConstantsToRight() {
         }
 
         Int.push_back(ValInt);
-        isl::constraint C = isl::constraint::alloc_equality(
-            isl::local_space(Transform.get_space()));
+
+        isl::space TransformSpace = Transform.get_space();
+        if (TransformSpace.is_null()) {
+          Failed = true;
+          break;
+        }
+
+        isl::local_space LS(TransformSpace);
+        if (LS.is_null()) {
+          Failed = true;
+          break;
+        }
+
+        isl::constraint C = isl::constraint::alloc_equality(LS);
+        if (C.is_null()) {
+          Failed = true;
+          break;
+        }
+
         C = C.set_coefficient_si(isl::dim::out, i, ValInt);
         C = C.set_coefficient_si(isl::dim::in, i, -1);
         Transform = Transform.add_constraint(C);
+        if (Transform.is_null()) {
+          Failed = true;
+          break;
+        }
         continue;
       }
 
       isl::basic_set ZeroSet = isl::basic_set(DimHull);
+      if (ZeroSet.is_null()) {
+        Failed = true;
+        break;
+      }
+
       ZeroSet = ZeroSet.fix_si(isl::dim::set, 0, 0);
+      if (ZeroSet.is_null()) {
+        Failed = true;
+        break;
+      }
 
       int ValInt = 1;
-      if (ZeroSet.is_equal(DimHull)) {
+      if (ZeroSet.is_equal(DimHull))
         ValInt = 0;
-      }
 
       Int.push_back(ValInt);
       Transform = Transform.equate(isl::dim::in, i, isl::dim::out, i);
+      if (Transform.is_null()) {
+        Failed = true;
+        break;
+      }
     }
 
+    if (Failed)
+      continue;
+
     isl::set MappedElements = isl::map(Transform).domain();
+    if (MappedElements.is_null())
+      continue;
+
     if (!Elements.is_subset(MappedElements))
       continue;
 
@@ -2282,10 +2476,18 @@ void ScopBuilder::foldSizeConstantsToRight() {
     if (!CanFold)
       continue;
 
-    for (auto &Access : scop->access_functions())
-      if (Access->getScopArrayInfo() == Array)
-        Access->setAccessRelation(
-            Access->getAccessRelation().apply_range(Transform));
+    for (auto &Access : scop->access_functions()) {
+      if (Access->getScopArrayInfo() != Array)
+        continue;
+
+      isl::map AccessRel = Access->getAccessRelation();
+      if (AccessRel.is_null())
+        continue;
+
+      isl::map NewRel = AccessRel.apply_range(Transform);
+      if (!NewRel.is_null())
+        Access->setAccessRelation(NewRel);
+    }
 
     std::vector<const SCEV *> Sizes;
     for (unsigned i = 0; i < NumDims; i++) {
@@ -2539,39 +2741,58 @@ combineReductionType(MemoryAccess::ReductionType RT0,
 static bool hasIntersectingAccesses(isl::set AllAccs, MemoryAccess *LoadMA,
                                     MemoryAccess *StoreMA, isl::set Domain,
                                     SmallVector<MemoryAccess *, 8> &MemAccs) {
-  bool HasIntersectingAccs = false;
+  if (AllAccs.is_null() || Domain.is_null())
+    return false;
+
   // Cache the projection - avoid recomputing for each MA
   isl::set AllAccsNoParams = AllAccs.project_out_all_params();
+  if (AllAccsNoParams.is_null())
+    return false;
 
   for (MemoryAccess *MA : MemAccs) {
     if (MA == LoadMA || MA == StoreMA)
       continue;
 
-    isl::map AccRel = MA->getAccessRelation().intersect_domain(Domain);
+    isl::map AccRel = MA->getAccessRelation();
+    if (AccRel.is_null())
+      continue;
+
+    AccRel = AccRel.intersect_domain(Domain);
+    if (AccRel.is_null())
+      continue;
+
     isl::set Accs = AccRel.range();
+    if (Accs.is_null())
+      continue;
+
     isl::set AccsNoParams = Accs.project_out_all_params();
+    if (AccsNoParams.is_null())
+      continue;
 
-    bool CompatibleSpace = AllAccsNoParams.has_equal_space(AccsNoParams);
+    if (!AllAccsNoParams.has_equal_space(AccsNoParams))
+      continue;
 
-    if (CompatibleSpace) {
-      isl::set OverlapAccs = Accs.intersect(AllAccs);
-      bool DoesIntersect = !OverlapAccs.is_empty();
-      HasIntersectingAccs |= DoesIntersect;
-      // Early exit optimization - if we found intersection, no need to continue
-      if (HasIntersectingAccs)
-        return true;
-    }
+    isl::set OverlapAccs = Accs.intersect(AllAccs);
+    if (!OverlapAccs.is_null() && !OverlapAccs.is_empty())
+      return true;
   }
-  return HasIntersectingAccs;
+  return false;
 }
 
 /// Test if the accesses of @p LoadMA and @p StoreMA can form a reduction
 static bool checkCandidatePairAccesses(MemoryAccess *LoadMA,
                                        MemoryAccess *StoreMA, isl::set Domain,
                                        SmallVector<MemoryAccess *, 8> &MemAccs) {
+  if (!LoadMA || !StoreMA || Domain.is_null())
+    return false;
+
   // First check if the base value is the same.
   isl::map LoadAccs = LoadMA->getAccessRelation();
   isl::map StoreAccs = StoreMA->getAccessRelation();
+
+  if (LoadAccs.is_null() || StoreAccs.is_null())
+    return false;
+
   bool Valid = LoadAccs.has_equal_space(StoreAccs);
   POLLY_DEBUG(dbgs() << " == The accessed space below is "
                      << (Valid ? "" : "not ") << "equal!\n");
@@ -2580,11 +2801,18 @@ static bool checkCandidatePairAccesses(MemoryAccess *LoadMA,
   if (Valid) {
     isl::map R = LoadAccs.intersect_domain(Domain);
     isl::map W = StoreAccs.intersect_domain(Domain);
+
+    if (R.is_null() || W.is_null())
+      return false;
+
     isl::set RS = R.range();
     isl::set WS = W.range();
 
+    if (RS.is_null() || WS.is_null())
+      return false;
+
     isl::set InterAccs = RS.intersect(WS);
-    Valid = !InterAccs.is_empty();
+    Valid = !InterAccs.is_null() && !InterAccs.is_empty();
     POLLY_DEBUG(dbgs() << " == The accessed memory is " << (Valid ? "" : "not ")
                        << "overlapping!\n");
   }
@@ -2592,8 +2820,17 @@ static bool checkCandidatePairAccesses(MemoryAccess *LoadMA,
   if (Valid) {
     // Finally, check if there are no other instructions accessing this memory
     isl::map AllAccsRel = LoadAccs.unite(StoreAccs);
+    if (AllAccsRel.is_null())
+      return false;
+
     AllAccsRel = AllAccsRel.intersect_domain(Domain);
+    if (AllAccsRel.is_null())
+      return false;
+
     isl::set AllAccs = AllAccsRel.range();
+    if (AllAccs.is_null())
+      return false;
+
     Valid = !hasIntersectingAccesses(AllAccs, LoadMA, StoreMA, Domain, MemAccs);
     POLLY_DEBUG(dbgs() << " == The accessed memory is " << (Valid ? "not " : "")
                        << "accessed by other instructions!\n");
@@ -3256,7 +3493,8 @@ void ScopBuilder::buildAccessRelations(ScopStmt &Stmt) {
 /// Add the minimal/maximal access in @p Set to @p User.
 ///
 /// @return True if more accesses should be added, false if we reached the
-///         maximal number of run-time checks to be generated.
+///         maximal number of run-time checks to be generated or an error
+///         occurred.
 static bool buildMinMaxAccess(isl::set Set,
                               Scop::MinMaxVectorTy &MinMaxAccesses, Scop &S) {
   isl::pw_multi_aff MinPMA, MaxPMA;
@@ -3265,11 +3503,22 @@ static bool buildMinMaxAccess(isl::set Set,
   unsigned Pos;
 
   Set = Set.remove_divs();
-  polly::simplify(Set);
+  if (Set.is_null())
+    return false;
 
-  unsigned NumBasicSets = unsignedFromIslSize(Set.n_basic_set());
-  if (NumBasicSets > RunTimeChecksMaxAccessDisjuncts)
+  polly::simplify(Set);
+  if (Set.is_null())
+    return false;
+
+  isl::size NumBasicSets = Set.n_basic_set();
+  if (NumBasicSets.is_error())
+    return false;
+
+  if (unsignedFromIslSize(NumBasicSets) > RunTimeChecksMaxAccessDisjuncts) {
     Set = Set.simple_hull();
+    if (Set.is_null())
+      return false;
+  }
 
   // Restrict the number of parameters involved in the access as the lexmin/
   // lexmax computation will take too long if this number is high.
@@ -3285,12 +3534,16 @@ static bool buildMinMaxAccess(isl::set Set,
   //           11          |     6.78
   //           12          |    30.38
   //
-  if (isl_set_n_param(Set.get()) >
-      static_cast<isl_size>(RunTimeChecksMaxParameters)) {
+  isl_size NumParams = isl_set_n_param(Set.get());
+  if (NumParams < 0)
+    return false;
+
+  if (NumParams > static_cast<isl_size>(RunTimeChecksMaxParameters)) {
     unsigned InvolvedParams = 0;
-    for (unsigned u = 0, e = isl_set_n_param(Set.get()); u < e; u++)
+    for (unsigned u = 0, e = static_cast<unsigned>(NumParams); u < e; u++) {
       if (Set.involves_dims(isl::dim::param, u, 1))
         InvolvedParams++;
+    }
 
     if (InvolvedParams > RunTimeChecksMaxParameters)
       return false;
@@ -3299,13 +3552,20 @@ static bool buildMinMaxAccess(isl::set Set,
   MinPMA = Set.lexmin_pw_multi_aff();
   MaxPMA = Set.lexmax_pw_multi_aff();
 
+  if (MinPMA.is_null() || MaxPMA.is_null())
+    return false;
+
   MinPMA = MinPMA.coalesce();
   MaxPMA = MaxPMA.coalesce();
 
-  if (MaxPMA.is_null())
+  if (MinPMA.is_null() || MaxPMA.is_null())
     return false;
 
-  unsigned MaxOutputSize = unsignedFromIslSize(MaxPMA.dim(isl::dim::out));
+  isl::size MaxOutputDimSize = MaxPMA.dim(isl::dim::out);
+  if (MaxOutputDimSize.is_error())
+    return false;
+
+  unsigned MaxOutputSize = unsignedFromIslSize(MaxOutputDimSize);
 
   // Adjust the last dimension of the maximal access by one as we want to
   // enclose the accessed memory region by MinPMA and MaxPMA. The pointer
@@ -3315,12 +3575,31 @@ static bool buildMinMaxAccess(isl::set Set,
 
   Pos = MaxOutputSize - 1;
   LastDimAff = MaxPMA.at(Pos);
-  OneAff = isl::aff(isl::local_space(LastDimAff.get_domain_space()));
-  OneAff = OneAff.add_constant_si(1);
-  LastDimAff = LastDimAff.add(OneAff);
-  MaxPMA = MaxPMA.set_pw_aff(Pos, LastDimAff);
+  if (LastDimAff.is_null())
+    return false;
 
-  if (MinPMA.is_null() || MaxPMA.is_null())
+  isl::space DomainSpace = LastDimAff.get_domain_space();
+  if (DomainSpace.is_null())
+    return false;
+
+  isl::local_space LS(DomainSpace);
+  if (LS.is_null())
+    return false;
+
+  OneAff = isl::aff(LS);
+  if (OneAff.is_null())
+    return false;
+
+  OneAff = OneAff.add_constant_si(1);
+  if (OneAff.is_null())
+    return false;
+
+  LastDimAff = LastDimAff.add(OneAff);
+  if (LastDimAff.is_null())
+    return false;
+
+  MaxPMA = MaxPMA.set_pw_aff(Pos, LastDimAff);
+  if (MaxPMA.is_null())
     return false;
 
   MinMaxAccesses.push_back(std::make_pair(MinPMA, MaxPMA));
