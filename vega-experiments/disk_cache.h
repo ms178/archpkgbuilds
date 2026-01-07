@@ -40,8 +40,8 @@
 extern "C" {
 #endif
 
-/* Size of cache keys in bytes. */
-#define CACHE_KEY_SIZE 20
+/* Size of cache keys in bytes - now uses BLAKE3 (32 bytes) via SHA1_DIGEST_LENGTH alias */
+#define CACHE_KEY_SIZE SHA1_DIGEST_LENGTH
 
 #define CACHE_DIR_NAME "mesa_shader_cache"
 #define CACHE_DIR_NAME_SF "mesa_shader_cache_sf"
@@ -98,7 +98,7 @@ disk_cache_get_function_timestamp(void *ptr, uint32_t* timestamp)
       return false;
    }
 
-   *timestamp = st.st_mtime;
+   *timestamp = (uint32_t)st.st_mtime;
 
    return true;
 }
@@ -127,6 +127,8 @@ disk_cache_get_function_identifier(void *ptr, struct mesa_sha1 *ctx);
 static inline bool
 disk_cache_get_function_identifier(void *ptr, struct mesa_sha1 *ctx)
 {
+   (void)ptr;
+   (void)ctx;
    return false;
 }
 #endif
@@ -186,6 +188,9 @@ static inline struct disk_cache *
 disk_cache_create(const char *gpu_name, const char *timestamp,
                   uint64_t driver_flags)
 {
+   (void)gpu_name;
+   (void)timestamp;
+   (void)driver_flags;
    return NULL;
 }
 
@@ -194,17 +199,24 @@ disk_cache_create_custom(const char *gpu_name, const char *driver_id,
                          uint64_t driver_flags, const char *cache_dir_name,
                          uint32_t max_size)
 {
+   (void)gpu_name;
+   (void)driver_id;
+   (void)driver_flags;
+   (void)cache_dir_name;
+   (void)max_size;
    return NULL;
 }
 
 static inline void
 disk_cache_destroy(struct disk_cache *cache)
 {
+   (void)cache;
 }
 
 static inline void
 disk_cache_wait_for_idle(struct disk_cache *cache)
 {
+   (void)cache;
 }
 
 static inline void
@@ -212,6 +224,11 @@ disk_cache_put(struct disk_cache *cache, const cache_key key,
                const void *data, size_t size,
                struct cache_item_metadata *cache_item_metadata)
 {
+   (void)cache;
+   (void)key;
+   (void)data;
+   (void)size;
+   (void)cache_item_metadata;
 }
 
 static inline void
@@ -219,27 +236,41 @@ disk_cache_put_nocopy(struct disk_cache *cache, const cache_key key,
                       void *data, size_t size,
                       struct cache_item_metadata *cache_item_metadata)
 {
+   (void)cache;
+   (void)key;
+   (void)data;
+   (void)size;
+   (void)cache_item_metadata;
 }
 
 static inline void
 disk_cache_remove(struct disk_cache *cache, const cache_key key)
 {
+   (void)cache;
+   (void)key;
 }
 
 static inline uint8_t *
 disk_cache_get(struct disk_cache *cache, const cache_key key, size_t *size)
 {
+   (void)cache;
+   (void)key;
+   (void)size;
    return NULL;
 }
 
 static inline void
 disk_cache_put_key(struct disk_cache *cache, const cache_key key)
 {
+   (void)cache;
+   (void)key;
 }
 
 static inline bool
 disk_cache_has_key(struct disk_cache *cache, const cache_key key)
 {
+   (void)cache;
+   (void)key;
    return false;
 }
 
@@ -247,12 +278,19 @@ static inline void
 disk_cache_compute_key(struct disk_cache *cache, const void *data, size_t size,
                        cache_key key)
 {
+   (void)cache;
+   (void)data;
+   (void)size;
+   (void)key;
 }
 
 static inline void
 disk_cache_set_callbacks(struct disk_cache *cache, disk_cache_put_cb put,
                          disk_cache_get_cb get)
 {
+   (void)cache;
+   (void)put;
+   (void)get;
 }
 
 #endif /* ENABLE_SHADER_CACHE */
@@ -261,4 +299,4 @@ disk_cache_set_callbacks(struct disk_cache *cache, disk_cache_put_cb put,
 }
 #endif
 
-#endif /* CACHE_H */
+#endif /* DISK_CACHE_H */
