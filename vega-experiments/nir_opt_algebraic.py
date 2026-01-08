@@ -4015,6 +4015,8 @@ late_optimizations.extend([
 
    (('~fadd', ('fneg(is_used_once)', ('fsat(is_used_once)', 'a(is_not_fmul)')), 1.0), ('fsat', ('fadd', 1.0, ('fneg', a)))),
 
+   (('fsqrt', ('fsat(is_used_once)', 'a(cannot_add_output_modifier)')), ('fsat', ('fsqrt', a))),
+
    (('fdot2', a, b), ('fdot2_replicated', a, b), 'options->fdot_replicates'),
    (('fdot3', a, b), ('fdot3_replicated', a, b), 'options->fdot_replicates'),
    (('fdot4', a, b), ('fdot4_replicated', a, b), 'options->fdot_replicates'),
