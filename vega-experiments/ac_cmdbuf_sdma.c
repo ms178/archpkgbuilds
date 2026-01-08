@@ -7,6 +7,12 @@
  *
  * This file generates command packets for the System DMA engine,
  * which performs memory transfers independently of GFX/compute pipelines.
+ *
+ * Performance notes for Vega 64 (SDMA 4.0):
+ * - SDMA 4.0 paths are marked likely and checked first
+ * - Small helper functions are force-inlined to eliminate call overhead
+ * - Pitch shift is 13 bits for SDMA 4.0-6.x, 16 bits otherwise
+ * - DCC is not supported in tiled copy packets on SDMA 4.0
  */
 
 #include "ac_cmdbuf.h"
@@ -18,22 +24,36 @@
 #include "util/u_math.h"
 
 /*
- * Helper macro for branch prediction hints.
- * Vega 64 uses SDMA 4.0, which is the most common path in gaming workloads.
+ * Branch prediction hints optimized for Vega 64 (SDMA 4.0) workloads.
+ * SDMA 4.0 is the hot path for gaming on GFX9 hardware.
  */
 #if defined(__GNUC__) || defined(__clang__)
-#define SDMA_LIKELY(x)   __builtin_expect(!!(x), 1)
-#define SDMA_UNLIKELY(x) __builtin_expect(!!(x), 0)
+   #define SDMA_LIKELY(x)        __builtin_expect(!!(x), 1)
+   #define SDMA_UNLIKELY(x)      __builtin_expect(!!(x), 0)
+   #define SDMA_FORCE_INLINE     static inline __attribute__((always_inline))
+   #define SDMA_NOINLINE         __attribute__((noinline))
 #else
-#define SDMA_LIKELY(x)   (x)
-#define SDMA_UNLIKELY(x) (x)
+   #define SDMA_LIKELY(x)        (x)
+   #define SDMA_UNLIKELY(x)      (x)
+   #define SDMA_FORCE_INLINE     static inline
+   #define SDMA_NOINLINE
 #endif
+
+/*
+ * Compile-time validation of critical assumptions.
+ * These ensure the bit manipulation code is correct on all platforms.
+ */
+_Static_assert(sizeof(uint32_t) == 4, "uint32_t must be exactly 4 bytes");
+_Static_assert(sizeof(uint64_t) == 8, "uint64_t must be exactly 8 bytes");
 
 /**
  * Emit an SDMA NOP packet.
  *
  * The NOP acts as a fence command, causing the SDMA engine to wait for
  * all pending copy operations to complete before proceeding.
+ *
+ * Packet size: 1 DW
+ * Supported: All SDMA versions
  *
  * @param cs  Command stream to emit into (must not be NULL)
  */
@@ -51,8 +71,11 @@ ac_emit_sdma_nop(struct ac_cmdbuf *cs)
  * Writes the current GPU global timestamp to the specified virtual address.
  * The timestamp is a 64-bit value written as two consecutive DWORDs.
  *
+ * Packet size: 3 DW
+ * Supported: All SDMA versions
+ *
  * @param cs  Command stream to emit into (must not be NULL)
- * @param va  GPU virtual address to write timestamp (8-byte aligned)
+ * @param va  GPU virtual address to write timestamp (must be 8-byte aligned)
  */
 void
 ac_emit_sdma_write_timestamp(struct ac_cmdbuf *cs, uint64_t va)
@@ -68,10 +91,13 @@ ac_emit_sdma_write_timestamp(struct ac_cmdbuf *cs, uint64_t va)
  * Emit an SDMA fence packet.
  *
  * Writes a 32-bit fence value to the specified virtual address.
- * Used for CPU-GPU synchronization.
+ * Used for CPU-GPU synchronization after SDMA operations complete.
+ *
+ * Packet size: 4 DW
+ * Supported: All SDMA versions
  *
  * @param cs     Command stream to emit into (must not be NULL)
- * @param va     GPU virtual address to write fence (4-byte aligned)
+ * @param va     GPU virtual address to write fence (must be 4-byte aligned)
  * @param fence  32-bit fence value to write
  */
 void
@@ -89,11 +115,16 @@ ac_emit_sdma_fence(struct ac_cmdbuf *cs, uint64_t va, uint32_t fence)
  * Emit an SDMA memory poll/wait packet.
  *
  * Causes the SDMA engine to poll a memory location until the specified
- * condition is met. Useful for GPU-side synchronization.
+ * condition is met. Useful for GPU-side synchronization primitives.
+ *
+ * The comparison performed is: (memory[va] & mask) <op> ref
+ *
+ * Packet size: 6 DW
+ * Supported: All SDMA versions
  *
  * @param cs    Command stream to emit into (must not be NULL)
- * @param op    Comparison operation (must fit in 4 bits: 0-15)
- * @param va    GPU virtual address to poll (4-byte aligned)
+ * @param op    Comparison operation (0-15, see SDMA_POLL_* defines)
+ * @param va    GPU virtual address to poll (must be 4-byte aligned)
  * @param ref   Reference value for comparison
  * @param mask  Mask applied to memory value before comparison
  */
@@ -101,8 +132,8 @@ void
 ac_emit_sdma_wait_mem(struct ac_cmdbuf *cs, uint32_t op, uint64_t va,
                       uint32_t ref, uint32_t mask)
 {
-   /* Validate op fits in its 4-bit field */
-   assert(op <= 0xF);
+   /* op field is 4 bits in the packet header at position [28:31] */
+   assert(op <= 0xFu);
 
    ac_cmdbuf_begin(cs);
    ac_cmdbuf_emit(SDMA_PACKET(SDMA_OPCODE_POLL_REGMEM, 0, 0) |
@@ -118,18 +149,21 @@ ac_emit_sdma_wait_mem(struct ac_cmdbuf *cs, uint32_t op, uint64_t va,
 /**
  * Emit the header for an SDMA linear write packet.
  *
- * After this header, the caller should emit `count` DWORDs of data
- * directly into the command stream.
+ * After this header, the caller must emit exactly `count` DWORDs of data
+ * directly into the command stream using ac_cmdbuf_emit().
+ *
+ * Packet size: 4 DW header + count DW data
+ * Supported: All SDMA versions
  *
  * @param cs     Command stream to emit into (must not be NULL)
- * @param va     GPU virtual address to write data (4-byte aligned)
- * @param count  Number of DWORDs to write (must be > 0)
+ * @param va     GPU virtual address to write data (must be 4-byte aligned)
+ * @param count  Number of DWORDs to write (must be >= 1)
  */
 void
 ac_emit_sdma_write_data_head(struct ac_cmdbuf *cs, uint64_t va, uint32_t count)
 {
-   /* Count must be non-zero to avoid underflow */
-   assert(count > 0);
+   /* Count must be at least 1 to avoid underflow in count-1 encoding */
+   assert(count >= 1);
 
    ac_cmdbuf_begin(cs);
    ac_cmdbuf_emit(SDMA_PACKET(SDMA_OPCODE_WRITE, SDMA_WRITE_SUB_OPCODE_LINEAR, 0));
@@ -143,40 +177,53 @@ ac_emit_sdma_write_data_head(struct ac_cmdbuf *cs, uint64_t va, uint32_t count)
  * Emit an SDMA constant fill packet.
  *
  * Fills memory with a constant 32-bit value. The fill is performed in
- * DWORD units for optimal performance.
+ * DWORD (4-byte) units for optimal throughput. Sub-DWORD fills are not
+ * supported by this packet type.
+ *
+ * Packet size: 5 DW
+ * Supported: SDMA 2.4+
  *
  * @param cs               Command stream to emit into (must not be NULL)
  * @param sdma_ip_version  SDMA IP version (must be >= SDMA_2_4)
- * @param va               GPU virtual address to fill (4-byte aligned)
- * @param size             Number of bytes to fill (must be > 0, will be rounded to DWORD)
- * @param value            32-bit value to fill
+ * @param va               GPU virtual address to fill (must be 4-byte aligned)
+ * @param size             Number of bytes to fill (must be >= 4)
+ * @param value            32-bit value to fill with
  *
- * @return Number of bytes that will be written by this packet
+ * @return Number of bytes that will be written by this packet (DWORD-aligned)
+ *         Returns 0 if size < 4 (caller must handle sub-DWORD fills differently)
  */
 uint64_t
 ac_emit_sdma_constant_fill(struct ac_cmdbuf *cs, enum sdma_version sdma_ip_version,
                            uint64_t va, uint64_t size, uint32_t value)
 {
-   const uint32_t fill_size = 2; /* Count is in DWORDs */
+   /* Fill size field: 2 = count is in DWORDs */
+   const uint32_t fill_size_encoding = 2;
 
    assert(sdma_ip_version >= SDMA_2_4);
    assert(size > 0);
 
-   /* Size must be DWORD-aligned for this packet */
-   if (size < 4) {
-      /* Caller must handle sub-DWORD fills differently */
+   /* SDMA fill packet requires at least 4 bytes (1 DWORD) */
+   if (SDMA_UNLIKELY(size < 4)) {
       return 0;
    }
 
-   const unsigned size_bits = (sdma_ip_version >= SDMA_6_0) ? 30 : 22;
-   const uint64_t max_fill_size = ((UINT64_C(1) << size_bits) - 1) & ~UINT64_C(0x3);
-   const uint64_t bytes_written = MIN2(size & ~UINT64_C(0x3), max_fill_size);
+   /*
+    * Maximum fill size depends on the size field bit width:
+    *   SDMA 2.4 - 5.x: 22 bits → max ~4MB
+    *   SDMA 6.0+:      30 bits → max ~1GB
+    *
+    * Size must be DWORD-aligned (mask off low 2 bits).
+    */
+   const unsigned size_field_bits = SDMA_UNLIKELY(sdma_ip_version >= SDMA_6_0) ? 30 : 22;
+   const uint64_t max_fill_size = (UINT64_C(1) << size_field_bits) - UINT64_C(4);
+   const uint64_t aligned_size = size & ~UINT64_C(3);
+   const uint64_t bytes_written = MIN2(aligned_size, max_fill_size);
 
-   /* Should never be 0 if size >= 4 */
-   assert(bytes_written > 0);
+   /* After alignment and size >= 4, bytes_written must be >= 4 */
+   assert(bytes_written >= 4);
 
    ac_cmdbuf_begin(cs);
-   ac_cmdbuf_emit(SDMA_PACKET(SDMA_OPCODE_CONSTANT_FILL, 0, 0) | (fill_size << 30));
+   ac_cmdbuf_emit(SDMA_PACKET(SDMA_OPCODE_CONSTANT_FILL, 0, 0) | (fill_size_encoding << 30));
    ac_cmdbuf_emit((uint32_t)va);
    ac_cmdbuf_emit((uint32_t)(va >> 32));
    ac_cmdbuf_emit(value);
@@ -189,14 +236,20 @@ ac_emit_sdma_constant_fill(struct ac_cmdbuf *cs, enum sdma_version sdma_ip_versi
 /**
  * Emit an SDMA linear copy packet.
  *
- * Copies memory from source to destination linearly. When addresses and
- * size are DWORD-aligned, the SDMA firmware uses a faster copy mode.
+ * Copies memory from source to destination in linear address order.
+ * The SDMA firmware uses a faster internal DWORD copy mode when both
+ * addresses and the size are DWORD-aligned. When addresses are aligned
+ * but size is not, this function rounds down to maximize the aligned
+ * portion, leaving the remainder for a subsequent copy.
+ *
+ * Packet size: 7 DW
+ * Supported: SDMA 2.0+
  *
  * @param cs               Command stream to emit into (must not be NULL)
  * @param sdma_ip_version  SDMA IP version (must be >= SDMA_2_0)
  * @param src_va           Source GPU virtual address
  * @param dst_va           Destination GPU virtual address
- * @param size             Number of bytes to copy (must be > 0)
+ * @param size             Number of bytes to copy (must be >= 1)
  * @param tmz              Enable Trusted Memory Zone protection
  *
  * @return Number of bytes that will be copied by this packet
@@ -207,36 +260,49 @@ ac_emit_sdma_copy_linear(struct ac_cmdbuf *cs, enum sdma_version sdma_ip_version
                          bool tmz)
 {
    assert(sdma_ip_version >= SDMA_2_0);
-   assert(size > 0);
+   assert(size >= 1);
 
    /*
     * Maximum bytes per packet depends on SDMA version:
-    *   SDMA 2.0 - 5.1: SDMA_V2_0_COPY_MAX_BYTES
-    *   SDMA 5.2+:      SDMA_V5_2_COPY_MAX_BYTES
+    *   SDMA 2.0 - 5.1: SDMA_V2_0_COPY_MAX_BYTES (~256KB typically)
+    *   SDMA 5.2+:      SDMA_V5_2_COPY_MAX_BYTES (~64MB typically)
+    *
+    * SDMA 5.2+ is rare in gaming workloads (RDNA2+), so mark unlikely.
     */
-   const unsigned max_size_per_packet = SDMA_UNLIKELY(sdma_ip_version >= SDMA_5_2)
+   const uint64_t max_size = SDMA_UNLIKELY(sdma_ip_version >= SDMA_5_2)
       ? SDMA_V5_2_COPY_MAX_BYTES
       : SDMA_V2_0_COPY_MAX_BYTES;
 
    /*
-    * SDMA firmware enables a faster DWORD copy mode when source, destination,
-    * and size are all DWORD-aligned. When src/dst are aligned but size isn't,
-    * round down to get DWORD alignment for most of the copy, then handle the
-    * remaining bytes with a subsequent packet.
+    * SDMA firmware optimization: when src, dst, and size are all DWORD-aligned,
+    * the engine uses a faster 4-byte-at-a-time mode internally.
     *
-    * Combined alignment check: (src | dst) & 0x3 == 0 means both are aligned.
+    * When addresses are aligned but size isn't, round down to benefit from
+    * the fast path for most of the transfer. The remaining 1-3 bytes will
+    * need a separate (slower) unaligned copy.
+    *
+    * Combined address alignment check: (src | dst) & 3 == 0 when both aligned.
     */
-   uint64_t effective_size = size;
-   if (((src_va | dst_va) & UINT64_C(0x3)) == 0 && size > 4 && (size & UINT64_C(0x3)) != 0) {
-      effective_size = size & ~UINT64_C(0x3);
+   const uint64_t addr_unaligned_bits = (src_va | dst_va) & UINT64_C(3);
+   const uint64_t size_unaligned_bits = size & UINT64_C(3);
+
+   uint64_t copy_size;
+   if (addr_unaligned_bits == 0 && size_unaligned_bits != 0 && size > 4) {
+      /* Addresses aligned, size not: round down for fast path */
+      copy_size = size & ~UINT64_C(3);
+   } else {
+      /* Either addresses unaligned, or size already aligned, or too small */
+      copy_size = size;
    }
 
-   const uint64_t bytes_written = MIN2(effective_size, max_size_per_packet);
+   const uint64_t bytes_written = MIN2(copy_size, max_size);
 
    /*
-    * Size field encoding differs by SDMA version:
+    * Size field encoding changed in SDMA 4.0:
     *   SDMA 2.0 - 3.x: exact byte count
     *   SDMA 4.0+:      byte count minus one
+    *
+    * SDMA 4.0 (Vega) is the common case, so mark it likely.
     */
    const uint32_t size_field = SDMA_LIKELY(sdma_ip_version >= SDMA_4_0)
       ? (uint32_t)(bytes_written - 1)
@@ -245,7 +311,7 @@ ac_emit_sdma_copy_linear(struct ac_cmdbuf *cs, enum sdma_version sdma_ip_version
    ac_cmdbuf_begin(cs);
    ac_cmdbuf_emit(SDMA_PACKET(SDMA_OPCODE_COPY, SDMA_COPY_SUB_OPCODE_LINEAR, (tmz ? 4 : 0)));
    ac_cmdbuf_emit(size_field);
-   ac_cmdbuf_emit(0); /* Reserved/padding */
+   ac_cmdbuf_emit(0); /* Reserved DW for alignment and future use */
    ac_cmdbuf_emit((uint32_t)src_va);
    ac_cmdbuf_emit((uint32_t)(src_va >> 32));
    ac_cmdbuf_emit((uint32_t)dst_va);
@@ -256,44 +322,55 @@ ac_emit_sdma_copy_linear(struct ac_cmdbuf *cs, enum sdma_version sdma_ip_version
 }
 
 /**
- * Validate pitch and slice_pitch parameters for sub-window copies.
+ * Validate pitch and slice_pitch parameters for sub-window copy packets.
+ *
+ * This performs debug-only validation to catch invalid parameters early,
+ * before they could cause GPU ring timeouts or incorrect copies.
  *
  * @param pitch        Row pitch in elements (must be > 0, <= 16384)
- * @param slice_pitch  Slice pitch in elements (validated only if uses_depth)
+ * @param slice_pitch  Slice pitch in elements (must be > 0, <= 256M if 3D)
  * @param bpp          Bytes per pixel/element (must be 1, 2, 4, 8, or 16)
- * @param uses_depth   Whether Z dimension is used
+ * @param uses_depth   Whether Z dimension is used (enables slice_pitch validation)
  */
-static void
+SDMA_FORCE_INLINE void
 ac_sdma_check_pitches(uint32_t pitch, uint32_t slice_pitch, uint32_t bpp, bool uses_depth)
 {
-   assert(bpp > 0 && util_is_power_of_two_nonzero(bpp));
+   /* bpp must be a power of two in range [1, 16] */
+   assert(bpp >= 1 && bpp <= 16);
+   assert(util_is_power_of_two_nonzero(bpp));
 
-   ASSERTED const uint32_t pitch_alignment = MAX2(1, 4 / bpp);
-   assert(pitch > 0);
+   /* Pitch must be aligned to DWORD boundary when bpp < 4 */
+   ASSERTED const uint32_t pitch_alignment = MAX2(1u, 4u / bpp);
+   assert(pitch >= 1);
    assert(pitch <= (1u << 14)); /* 14-bit field in oldest SDMA versions */
-   assert(util_is_aligned(pitch, pitch_alignment));
+   assert((pitch % pitch_alignment) == 0);
 
    if (uses_depth) {
-      ASSERTED const uint32_t slice_pitch_alignment = 4;
-      assert(slice_pitch > 0);
-      assert(slice_pitch <= (1u << 28));
-      assert(util_is_aligned(slice_pitch, slice_pitch_alignment));
+      /* Slice pitch must be DWORD-aligned for 3D copies */
+      assert(slice_pitch >= 1);
+      assert(slice_pitch <= (1u << 28)); /* 28-bit field */
+      assert((slice_pitch % 4) == 0);
    }
 }
 
 /**
  * Emit an SDMA linear-to-linear sub-window copy packet.
  *
- * Copies a 3D rectangular region between two linear surfaces.
- * Useful for texture uploads/downloads and format conversions.
+ * Copies a 3D rectangular region between two linear (non-tiled) surfaces.
+ * Useful for texture uploads, downloads, and CPU-accessible buffer operations.
+ *
+ * The pitch field encodes (pitch - 1) to maximize the available range.
+ *
+ * Packet size: 13 DW (SDMA 2.0) or 12 DW (SDMA 2.4+)
+ * Supported: SDMA 2.0+
  *
  * @param cs               Command stream to emit into
- * @param sdma_ip_version  SDMA IP version (must be >= SDMA_2_4)
+ * @param sdma_ip_version  SDMA IP version
  * @param src              Source linear surface descriptor
  * @param dst              Destination linear surface descriptor
- * @param width            Copy width in elements (must be > 0)
- * @param height           Copy height in rows (must be > 0)
- * @param depth            Copy depth in slices (must be > 0)
+ * @param width            Copy width in elements (must be >= 1)
+ * @param height           Copy height in rows (must be >= 1)
+ * @param depth            Copy depth in slices (must be >= 1)
  */
 void
 ac_emit_sdma_copy_linear_sub_window(struct ac_cmdbuf *cs, enum sdma_version sdma_ip_version,
@@ -301,52 +378,63 @@ ac_emit_sdma_copy_linear_sub_window(struct ac_cmdbuf *cs, enum sdma_version sdma
                                     const struct ac_sdma_surf_linear *dst,
                                     uint32_t width, uint32_t height, uint32_t depth)
 {
-   /*
-    * Pitch field bit position varies by SDMA version:
-    *
-    *   SDMA 2.0 - 3.x: 14-bit pitch at bit 16, 11-bit rect_z
-    *   SDMA 4.0 - 6.x: 19-bit pitch at bit 13, 11/13-bit rect_z
-    *   SDMA 7.0+:      pitch at bit 16 (larger field)
-    *
-    * For SDMA < 4.0 and SDMA >= 7.0, pitch starts at bit 16.
-    * For SDMA 4.0 - 6.x, pitch starts at bit 13.
-    */
-   const uint32_t pitch_shift =
-      (sdma_ip_version >= SDMA_7_0 || sdma_ip_version < SDMA_4_0) ? 16 : 13;
-
-   assert(width > 0 && height > 0 && depth > 0);
+   assert(width >= 1);
+   assert(height >= 1);
+   assert(depth >= 1);
    assert(src->bpp == dst->bpp);
    assert(util_is_power_of_two_nonzero(src->bpp));
 
    /*
-    * Validate offset.z fits within its bitfield.
-    * For pitch_shift=13: offset.z is in bits [0:12], max 8191
-    * For pitch_shift=16: offset.z is in bits [0:15], max 65535
+    * Pitch field bit position varies by SDMA version:
+    *
+    *   SDMA 2.0 - 3.x: 14-bit pitch starting at bit 16, 11-bit rect_z in [0:10]
+    *   SDMA 4.0 - 6.x: 19-bit pitch starting at bit 13, 13-bit rect_z in [0:12]
+    *   SDMA 7.0+:      larger pitch starting at bit 16
+    *
+    * For Vega (SDMA 4.0): pitch_shift = 13, max_offset_z = 8191
+    *
+    * Fixes: MR 39019 - correct pitch_shift for SDMA < 4.0
     */
-   const uint32_t max_offset_z = (1u << pitch_shift) - 1;
+   const bool use_pitch_shift_16 = (sdma_ip_version >= SDMA_7_0) ||
+                                   (sdma_ip_version < SDMA_4_0);
+   const uint32_t pitch_shift = use_pitch_shift_16 ? 16u : 13u;
+   const uint32_t max_offset_z = (1u << pitch_shift) - 1u;
+
+   /* Validate offset.z fits within the available bits to prevent overflow */
    assert(src->offset.z <= max_offset_z);
    assert(dst->offset.z <= max_offset_z);
+
+   /* Validate offset.x and offset.y fit in their 16-bit fields */
+   assert(src->offset.x <= UINT16_MAX);
+   assert(src->offset.y <= UINT16_MAX);
+   assert(dst->offset.x <= UINT16_MAX);
+   assert(dst->offset.y <= UINT16_MAX);
 
    ac_sdma_check_pitches(src->pitch, src->slice_pitch, src->bpp, false);
    ac_sdma_check_pitches(dst->pitch, dst->slice_pitch, dst->bpp, false);
 
+   /* Pre-compute values to minimize instruction count in emit sequence */
+   const uint32_t log2_bpp = util_logbase2(src->bpp);
+   const uint32_t src_pitch_encoded = (src->pitch - 1) << pitch_shift;
+   const uint32_t dst_pitch_encoded = (dst->pitch - 1) << pitch_shift;
+
    ac_cmdbuf_begin(cs);
    ac_cmdbuf_emit(SDMA_PACKET(SDMA_OPCODE_COPY, SDMA_COPY_SUB_OPCODE_LINEAR_SUB_WINDOW, 0) |
-                  (util_logbase2(src->bpp) << 29));
+                  (log2_bpp << 29));
    ac_cmdbuf_emit((uint32_t)src->va);
    ac_cmdbuf_emit((uint32_t)(src->va >> 32));
    ac_cmdbuf_emit(src->offset.x | (src->offset.y << 16));
-   ac_cmdbuf_emit(src->offset.z | ((src->pitch - 1) << pitch_shift));
+   ac_cmdbuf_emit(src->offset.z | src_pitch_encoded);
    ac_cmdbuf_emit(src->slice_pitch - 1);
    ac_cmdbuf_emit((uint32_t)dst->va);
    ac_cmdbuf_emit((uint32_t)(dst->va >> 32));
    ac_cmdbuf_emit(dst->offset.x | (dst->offset.y << 16));
-   ac_cmdbuf_emit(dst->offset.z | ((dst->pitch - 1) << pitch_shift));
+   ac_cmdbuf_emit(dst->offset.z | dst_pitch_encoded);
    ac_cmdbuf_emit(dst->slice_pitch - 1);
 
    /*
-    * Dimension encoding differs by SDMA version:
-    *   SDMA 2.0: exact width/height/depth
+    * Dimension encoding changed in SDMA 2.4:
+    *   SDMA 2.0:  exact width/height/depth
     *   SDMA 2.4+: width-1, height-1, depth-1
     */
    if (SDMA_UNLIKELY(sdma_ip_version == SDMA_2_0)) {
@@ -363,69 +451,77 @@ ac_emit_sdma_copy_linear_sub_window(struct ac_cmdbuf *cs, enum sdma_version sdma
 /**
  * Compute the header DWORD for tiled copy packets.
  *
- * The header contains mip level information for SDMA 4.0-4.x.
- * SDMA 5.0+ and SDMA < 4.0 use 0 for the header.
+ * For SDMA 4.0-4.x (Vega): header contains mip level information
+ * For all other versions: header is 0
+ *
+ * The mip fields are:
+ *   [20:23] mip_max - 1 (4 bits, max value 15)
+ *   [24:27] mip_id (4 bits, max value 15)
+ *
+ * Fixes: MR 39019 - return 0 for SDMA < 4.0 (was UNREACHABLE)
  *
  * @param sdma_ip_version  SDMA IP version
  * @param tiled            Tiled surface descriptor
  *
- * @return Header DWORD value
+ * @return Header DWORD value to OR into packet header
  */
-static uint32_t
+SDMA_FORCE_INLINE uint32_t
 ac_sdma_get_tiled_header_dword(enum sdma_version sdma_ip_version,
                                const struct ac_sdma_surf_tiled *tiled)
 {
-   if (sdma_ip_version >= SDMA_5_0) {
-      return 0;
-   }
-
-   if (SDMA_LIKELY(sdma_ip_version >= SDMA_4_0)) {
-      const uint32_t mip_max = MAX2(tiled->num_levels, 1);
+   /*
+    * SDMA 4.0-4.x (Vega): encode mip level information in header.
+    * This is the hot path for Vega 64 gaming workloads.
+    */
+   if (SDMA_LIKELY(sdma_ip_version >= SDMA_4_0) &&
+       SDMA_LIKELY(sdma_ip_version < SDMA_5_0)) {
+      const uint32_t mip_max = MAX2(tiled->num_levels, 1u);
       const uint32_t mip_id = tiled->first_level;
 
-      /*
-       * Validate mip fields fit within their bitfields:
-       *   mip_max - 1: 4 bits at position 20 (max value 15)
-       *   mip_id:      4 bits at position 24 (max value 15)
-       */
-      assert(mip_max <= 16);
+      /* Validate mip fields fit in their 4-bit fields */
+      assert(mip_max >= 1 && mip_max <= 16);
       assert(mip_id <= 15);
 
       return ((mip_max - 1) << 20) | (mip_id << 24);
    }
 
    /*
-    * SDMA < 4.0 (e.g., SDMA 2.4): header should be 0.
-    * This fixes DRI_PRIME support for radeonsi.
+    * SDMA 5.0+: mip info moved to info DWORD
+    * SDMA < 4.0: no mip info in header (legacy tiling)
     */
    return 0;
 }
 
 /**
- * Compute the resource dimension for tiled copies.
+ * Compute the effective resource dimension for tiled copies.
  *
- * SDMA 5.0+ requires special handling for rotated/Z swizzle modes,
- * which must use the 2D resource type even for 1D/3D resources.
+ * SDMA 5.0+ requires special handling for certain swizzle modes:
+ * when using rotated or Z micro tile modes on 1D/3D resources,
+ * the packet must specify a 2D resource type.
  *
  * @param sdma_ip_version  SDMA IP version
  * @param tiled            Tiled surface descriptor
  *
- * @return Effective resource dimension
+ * @return Effective resource dimension for packet encoding
  */
-static enum gfx9_resource_type
+SDMA_FORCE_INLINE enum gfx9_resource_type
 ac_sdma_get_tiled_resource_dim(enum sdma_version sdma_ip_version,
                                const struct ac_sdma_surf_tiled *tiled)
 {
-   if (sdma_ip_version >= SDMA_5_0) {
+   if (SDMA_UNLIKELY(sdma_ip_version >= SDMA_5_0)) {
       const enum gfx9_resource_type res_type = tiled->surf->u.gfx9.resource_type;
       const unsigned micro_mode = tiled->surf->micro_tile_mode;
 
       /*
-       * Use 2D resource type for 1D/3D resources with rotated or Z swizzle.
-       * This is a hardware requirement for SDMA 5.0+.
+       * Hardware requirement: rotated and Z micro modes on 1D/3D resources
+       * must use 2D resource type in the SDMA packet.
        */
-      if ((res_type == RADEON_RESOURCE_1D || res_type == RADEON_RESOURCE_3D) &&
-          (micro_mode == RADEON_MICRO_MODE_RENDER || micro_mode == RADEON_MICRO_MODE_DEPTH)) {
+      const bool is_1d_or_3d = (res_type == RADEON_RESOURCE_1D) ||
+                               (res_type == RADEON_RESOURCE_3D);
+      const bool uses_special_mode = (micro_mode == RADEON_MICRO_MODE_RENDER) ||
+                                     (micro_mode == RADEON_MICRO_MODE_DEPTH);
+
+      if (is_1d_or_3d && uses_special_mode) {
          return RADEON_RESOURCE_2D;
       }
    }
@@ -436,13 +532,21 @@ ac_sdma_get_tiled_resource_dim(enum sdma_version sdma_ip_version,
 /**
  * Compute the info DWORD for tiled copy packets.
  *
- * This DWORD encodes surface format, tiling mode, dimensions, and
- * mip level information. The encoding varies significantly by SDMA version.
+ * This encodes surface format, tiling mode, dimensions, and mip level
+ * information. The encoding differs significantly between SDMA generations.
  *
- * @param info   GPU info structure
+ * For SDMA 4.0 (Vega) encoding:
+ *   [0:2]   element_size (log2 of bpp)
+ *   [3:7]   swizzle_mode (5 bits)
+ *   [8]     reserved
+ *   [9:10]  dimension (resource type)
+ *   [11:15] reserved
+ *   [16:31] epitch
+ *
+ * @param info   GPU info structure containing SDMA version
  * @param tiled  Tiled surface descriptor
  *
- * @return Info DWORD value
+ * @return Info DWORD value for the packet
  */
 static uint32_t
 ac_sdma_get_tiled_info_dword(const struct radeon_info *info,
@@ -453,58 +557,61 @@ ac_sdma_get_tiled_info_dword(const struct radeon_info *info,
       ? tiled->surf->u.gfx9.zs.stencil_swizzle_mode
       : tiled->surf->u.gfx9.swizzle_mode;
 
-   assert(element_size <= 4); /* bpp 1-16 -> element_size 0-4 */
+   /* element_size is log2(bpp) where bpp is 1,2,4,8,16 → element_size is 0-4 */
+   assert(element_size <= 4);
 
-   if (SDMA_LIKELY(info->sdma_ip_version >= SDMA_4_0)) {
-      /*
-       * GFX9+ tiled info encoding:
-       *   [0:2]   element_size (log2 of bytes per pixel)
-       *   [3:7]   swizzle_mode (5 bits)
-       *   [8]     reserved
-       *   [9:10]  dimension (2 bits for resource type)
-       *   [11:15] reserved or additional mode bits
-       *   [16:31] version-specific (epitch, mip_max, mip_id)
-       */
-      uint32_t info_dword = element_size | (swizzle_mode << 3);
+   /*
+    * SDMA 4.0-4.x (Vega): most common path for gaming.
+    * Check this first to minimize branch overhead on the hot path.
+    */
+   if (SDMA_LIKELY(info->sdma_ip_version >= SDMA_4_0) &&
+       SDMA_LIKELY(info->sdma_ip_version < SDMA_5_0)) {
+      const enum gfx9_resource_type dimension = tiled->surf->u.gfx9.resource_type;
+      const uint32_t epitch = tiled->surf->u.gfx9.epitch;
 
-      if (info->sdma_ip_version >= SDMA_7_0) {
-         const uint32_t mip_max = MAX2(tiled->num_levels, 1);
-         const uint32_t mip_id = tiled->first_level;
+      /* epitch occupies bits [16:31], must fit in 16 bits */
+      assert(epitch <= UINT16_MAX);
 
-         assert(mip_max <= 16);
-         assert(mip_id <= 255);
+      return element_size |
+             (swizzle_mode << 3) |
+             ((uint32_t)dimension << 9) |
+             (epitch << 16);
+   }
 
-         return info_dword | ((mip_max - 1) << 16) | (mip_id << 24);
+   /* SDMA 7.0+ (RDNA3+) */
+   if (SDMA_UNLIKELY(info->sdma_ip_version >= SDMA_7_0)) {
+      const uint32_t mip_max = MAX2(tiled->num_levels, 1u);
+      const uint32_t mip_id = tiled->first_level;
 
-      } else if (info->sdma_ip_version >= SDMA_5_0) {
-         const enum gfx9_resource_type dimension =
-            ac_sdma_get_tiled_resource_dim(info->sdma_ip_version, tiled);
-         const uint32_t mip_max = MAX2(tiled->num_levels, 1);
-         const uint32_t mip_id = tiled->first_level;
+      assert(mip_max >= 1 && mip_max <= 16);
+      assert(mip_id <= 255); /* 8-bit field in SDMA 7.0 */
 
-         assert(mip_max <= 16);
-         assert(mip_id <= 2048);
+      return element_size |
+             (swizzle_mode << 3) |
+             ((mip_max - 1) << 16) |
+             (mip_id << 24);
+   }
 
-         return info_dword |
-                ((uint32_t)dimension << 9) |
-                ((mip_max - 1) << 16) |
-                (mip_id << 20);
+   /* SDMA 5.0-6.x (RDNA1/RDNA2) */
+   if (SDMA_UNLIKELY(info->sdma_ip_version >= SDMA_5_0)) {
+      const enum gfx9_resource_type dimension =
+         ac_sdma_get_tiled_resource_dim(info->sdma_ip_version, tiled);
+      const uint32_t mip_max = MAX2(tiled->num_levels, 1u);
+      const uint32_t mip_id = tiled->first_level;
 
-      } else {
-         /* SDMA 4.0 - 4.x (Vega) */
-         const enum gfx9_resource_type dimension = tiled->surf->u.gfx9.resource_type;
-         const uint32_t epitch = tiled->surf->u.gfx9.epitch;
+      assert(mip_max >= 1 && mip_max <= 16);
+      assert(mip_id <= 2047); /* 11-bit field: bits [20:30] */
 
-         /* epitch is stored in a 16-bit field */
-         assert(epitch <= UINT16_MAX);
-
-         return info_dword | ((uint32_t)dimension << 9) | (epitch << 16);
-      }
+      return element_size |
+             (swizzle_mode << 3) |
+             ((uint32_t)dimension << 9) |
+             ((mip_max - 1) << 16) |
+             (mip_id << 20);
    }
 
    /*
-    * Legacy path for SDMA < 4.0 (GFX6-8).
-    * Uses completely different tiling mode encoding.
+    * SDMA < 4.0 (GFX6-8 legacy path)
+    * Uses completely different encoding based on tile mode arrays.
     */
    {
       const uint32_t tile_index = tiled->surf->u.legacy.tiling_index[0];
@@ -512,9 +619,13 @@ ac_sdma_get_tiled_info_dword(const struct radeon_info *info,
       const uint32_t tile_mode = info->si_tile_mode_array[tile_index];
       const uint32_t macro_tile_mode = info->cik_macrotile_mode_array[macro_tile_index];
 
-      /* Compute tile_split encoding: log2(tile_split / 64) */
+      /*
+       * tile_split encoding: log2(tile_split / 64)
+       * tile_split values: 64, 128, 256, 512, 1024, 2048, 4096
+       * Encoded as:        0,   1,   2,   3,    4,    5,    6
+       */
       const uint32_t tile_split = tiled->surf->u.legacy.tile_split;
-      const uint32_t tile_split_enc = tile_split > 0 ? util_logbase2(tile_split >> 6) : 0;
+      const uint32_t tile_split_enc = (tile_split > 0) ? util_logbase2(tile_split >> 6) : 0;
 
       return element_size |
              (G_009910_ARRAY_MODE(tile_mode) << 3) |
@@ -531,11 +642,12 @@ ac_sdma_get_tiled_info_dword(const struct radeon_info *info,
 /**
  * Compute the DCC metadata configuration DWORD.
  *
- * This encodes compression settings for DCC-enabled surfaces.
+ * Encodes compression settings for DCC-enabled surfaces.
+ * Only used on SDMA 5.0+ (DCC not supported in tiled copies on SDMA 4.0).
  *
  * @param info    GPU info structure
- * @param tiled   Tiled surface descriptor
- * @param detile  True if reading from tiled (decompressing)
+ * @param tiled   Tiled surface descriptor with DCC enabled
+ * @param detile  True if reading from tiled (decompress), false for compress
  * @param tmz     Enable Trusted Memory Zone protection
  *
  * @return Metadata configuration DWORD
@@ -550,44 +662,51 @@ ac_sdma_get_tiled_metadata_config(const struct radeon_info *info,
    const uint32_t dcc_max_compressed_block_size =
       tiled->surf->u.gfx9.color.dcc.max_compressed_block_size;
 
-   if (info->sdma_ip_version >= SDMA_7_0) {
+   if (SDMA_UNLIKELY(info->sdma_ip_version >= SDMA_7_0)) {
       return SDMA7_DCC_DATA_FORMAT(data_format) |
              SDMA7_DCC_NUM_TYPE(number_type) |
              SDMA7_DCC_MAX_COM(dcc_max_compressed_block_size) |
              SDMA7_DCC_READ_CM(2) |
              SDMA7_DCC_MAX_UCOM(1) |
              SDMA7_DCC_WRITE_CM(detile ? 0 : 1);
-   } else {
-      const bool alpha_is_on_msb = ac_alpha_is_on_msb(info, tiled->format);
-      const bool dcc_pipe_aligned = tiled->htile_enabled ||
-                                    tiled->surf->u.gfx9.color.dcc.pipe_aligned;
-
-      return SDMA5_DCC_DATA_FORMAT(data_format) |
-             SDMA5_DCC_ALPHA_IS_ON_MSB(alpha_is_on_msb ? 1 : 0) |
-             SDMA5_DCC_NUM_TYPE(number_type) |
-             SDMA5_DCC_SURF_TYPE(tiled->surf_type) |
-             SDMA5_DCC_MAX_COM(dcc_max_compressed_block_size) |
-             SDMA5_DCC_PIPE_ALIGNED(dcc_pipe_aligned ? 1 : 0) |
-             SDMA5_DCC_MAX_UCOM(V_028C78_MAX_BLOCK_SIZE_256B) |
-             SDMA5_DCC_WRITE_COMPRESS(detile ? 0 : 1) |
-             SDMA5_DCC_TMZ(tmz ? 1 : 0);
    }
+
+   /* SDMA 5.0 - 6.x */
+   const bool alpha_is_on_msb = ac_alpha_is_on_msb(info, tiled->format);
+   const bool dcc_pipe_aligned = tiled->htile_enabled ||
+                                 tiled->surf->u.gfx9.color.dcc.pipe_aligned;
+
+   return SDMA5_DCC_DATA_FORMAT(data_format) |
+          SDMA5_DCC_ALPHA_IS_ON_MSB(alpha_is_on_msb ? 1 : 0) |
+          SDMA5_DCC_NUM_TYPE(number_type) |
+          SDMA5_DCC_SURF_TYPE(tiled->surf_type) |
+          SDMA5_DCC_MAX_COM(dcc_max_compressed_block_size) |
+          SDMA5_DCC_PIPE_ALIGNED(dcc_pipe_aligned ? 1 : 0) |
+          SDMA5_DCC_MAX_UCOM(V_028C78_MAX_BLOCK_SIZE_256B) |
+          SDMA5_DCC_WRITE_COMPRESS(detile ? 0 : 1) |
+          SDMA5_DCC_TMZ(tmz ? 1 : 0);
 }
 
 /**
  * Emit an SDMA tiled-to-linear or linear-to-tiled sub-window copy packet.
  *
  * Copies a rectangular region between a tiled surface (GPU-optimized layout)
- * and a linear surface (CPU-accessible layout). Supports DCC compression.
+ * and a linear surface (CPU-accessible layout).
+ *
+ * On SDMA 5.0+, DCC compression/decompression is supported.
+ * On SDMA 4.0 (Vega), DCC is NOT supported in this packet type.
+ *
+ * Packet size: 13-16 DW depending on version and DCC usage
+ * Supported: SDMA 2.0+
  *
  * @param cs       Command stream to emit into
  * @param info     GPU info structure
  * @param linear   Linear surface descriptor
  * @param tiled    Tiled surface descriptor
- * @param detile   True for tiled->linear (detile), false for linear->tiled (tile)
- * @param width    Copy width in elements (must be > 0)
- * @param height   Copy height in rows (must be > 0)
- * @param depth    Copy depth in slices (must be > 0)
+ * @param detile   True for tiled→linear, false for linear→tiled
+ * @param width    Copy width in elements (must be >= 1)
+ * @param height   Copy height in rows (must be >= 1)
+ * @param depth    Copy depth in slices (must be >= 1)
  * @param tmz      Enable Trusted Memory Zone protection
  */
 void
@@ -597,26 +716,51 @@ ac_emit_sdma_copy_tiled_sub_window(struct ac_cmdbuf *cs, const struct radeon_inf
                                    bool detile, uint32_t width, uint32_t height,
                                    uint32_t depth, bool tmz)
 {
-   assert(width > 0 && height > 0 && depth > 0);
+   assert(width >= 1);
+   assert(height >= 1);
+   assert(depth >= 1);
+   assert(tiled->bpp >= 1 && tiled->bpp <= 16);
    assert(util_is_power_of_two_nonzero(tiled->bpp));
 
-   const uint32_t header_dword = ac_sdma_get_tiled_header_dword(info->sdma_ip_version, tiled);
-   const uint32_t info_dword = ac_sdma_get_tiled_info_dword(info, tiled);
-   const bool dcc = tiled->is_compressed;
-
-   /* Sanity checks */
-   const bool uses_depth = linear->offset.z != 0 || tiled->offset.z != 0 || depth != 1;
-   ac_sdma_check_pitches(linear->pitch, linear->slice_pitch, tiled->bpp, uses_depth);
-
+   /* DCC is only supported on SDMA 5.0+ */
    if (!info->sdma_supports_compression) {
       assert(!tiled->is_compressed);
    }
 
+   /* Pre-compute packet components */
+   const uint32_t header_dword = ac_sdma_get_tiled_header_dword(info->sdma_ip_version, tiled);
+   const uint32_t info_dword = ac_sdma_get_tiled_info_dword(info, tiled);
+   const bool dcc = tiled->is_compressed;
+
+   /* Validate depth usage for pitch checking */
+   const bool uses_depth = (linear->offset.z != 0) ||
+                           (tiled->offset.z != 0) ||
+                           (depth != 1);
+   ac_sdma_check_pitches(linear->pitch, linear->slice_pitch, tiled->bpp, uses_depth);
+
+   /* Validate linear surface offsets fit in their fields */
+   assert(linear->offset.x <= UINT16_MAX);
+   assert(linear->offset.y <= UINT16_MAX);
+   assert(linear->offset.z <= UINT16_MAX);
+   assert(linear->pitch >= 1 && linear->pitch <= (1u << 14));
+
+   /* Validate tiled surface offsets */
+   assert(tiled->offset.x <= UINT16_MAX);
+   assert(tiled->offset.y <= UINT16_MAX);
+   assert(tiled->offset.z <= UINT16_MAX);
+   assert(tiled->extent.width >= 1);
+   assert(tiled->extent.height >= 1);
+   assert(tiled->extent.depth >= 1);
+
+   /* Build packet header with all control bits */
+   const uint32_t packet_header =
+      SDMA_PACKET(SDMA_OPCODE_COPY, SDMA_COPY_SUB_OPCODE_TILED_SUB_WINDOW, (tmz ? 4 : 0)) |
+      ((uint32_t)dcc << 19) |
+      ((uint32_t)detile << 31) |
+      header_dword;
+
    ac_cmdbuf_begin(cs);
-   ac_cmdbuf_emit(SDMA_PACKET(SDMA_OPCODE_COPY, SDMA_COPY_SUB_OPCODE_TILED_SUB_WINDOW, (tmz ? 4 : 0)) |
-                  ((uint32_t)dcc << 19) |
-                  ((uint32_t)detile << 31) |
-                  header_dword);
+   ac_cmdbuf_emit(packet_header);
    ac_cmdbuf_emit((uint32_t)tiled->va);
    ac_cmdbuf_emit((uint32_t)(tiled->va >> 32));
    ac_cmdbuf_emit(tiled->offset.x | (tiled->offset.y << 16));
@@ -629,6 +773,11 @@ ac_emit_sdma_copy_tiled_sub_window(struct ac_cmdbuf *cs, const struct radeon_inf
    ac_cmdbuf_emit(linear->offset.z | ((linear->pitch - 1) << 16));
    ac_cmdbuf_emit(linear->slice_pitch - 1);
 
+   /*
+    * Dimension fields encoding:
+    *   SDMA 2.0:  exact values
+    *   SDMA 2.4+: value - 1
+    */
    if (SDMA_UNLIKELY(info->sdma_ip_version == SDMA_2_0)) {
       ac_cmdbuf_emit(width | (height << 16));
       ac_cmdbuf_emit(depth);
@@ -637,10 +786,14 @@ ac_emit_sdma_copy_tiled_sub_window(struct ac_cmdbuf *cs, const struct radeon_inf
       ac_cmdbuf_emit(depth - 1);
    }
 
-   if (tiled->is_compressed) {
+   /*
+    * DCC metadata (SDMA 5.0+ only).
+    * On Vega (SDMA 4.0), DCC is not supported so this path is never taken.
+    */
+   if (SDMA_UNLIKELY(dcc)) {
       const uint32_t meta_config = ac_sdma_get_tiled_metadata_config(info, tiled, detile, tmz);
 
-      if (info->sdma_ip_version >= SDMA_7_0) {
+      if (SDMA_UNLIKELY(info->sdma_ip_version >= SDMA_7_0)) {
          ac_cmdbuf_emit(meta_config);
       } else {
          ac_cmdbuf_emit((uint32_t)tiled->meta_va);
@@ -655,16 +808,21 @@ ac_emit_sdma_copy_tiled_sub_window(struct ac_cmdbuf *cs, const struct radeon_inf
 /**
  * Emit an SDMA tiled-to-tiled sub-window copy packet.
  *
- * Copies a rectangular region between two tiled surfaces. Supports
- * DCC compression for one surface (cannot copy compressed to compressed).
+ * Copies a rectangular region between two tiled surfaces. Supports DCC
+ * compression on one surface (source XOR destination, not both).
+ *
+ * On SDMA 4.0 (Vega), neither mip_id selection nor DCC is supported.
+ *
+ * Packet size: 14-17 DW depending on DCC usage
+ * Supported: SDMA 4.0+
  *
  * @param cs      Command stream to emit into
  * @param info    GPU info structure
  * @param src     Source tiled surface descriptor
  * @param dst     Destination tiled surface descriptor
- * @param width   Copy width in elements (must be > 0)
- * @param height  Copy height in rows (must be > 0)
- * @param depth   Copy depth in slices (must be > 0)
+ * @param width   Copy width in elements (must be >= 1)
+ * @param height  Copy height in rows (must be >= 1)
+ * @param depth   Copy depth in slices (must be >= 1)
  */
 void
 ac_emit_sdma_copy_t2t_sub_window(struct ac_cmdbuf *cs, const struct radeon_info *info,
@@ -672,42 +830,62 @@ ac_emit_sdma_copy_t2t_sub_window(struct ac_cmdbuf *cs, const struct radeon_info 
                                  const struct ac_sdma_surf_tiled *dst,
                                  uint32_t width, uint32_t height, uint32_t depth)
 {
-   assert(width > 0 && height > 0 && depth > 0);
+   assert(width >= 1);
+   assert(height >= 1);
+   assert(depth >= 1);
    assert(info->sdma_ip_version >= SDMA_4_0);
+   assert(src->bpp >= 1 && src->bpp <= 16);
+   assert(dst->bpp >= 1 && dst->bpp <= 16);
    assert(util_is_power_of_two_nonzero(src->bpp));
    assert(util_is_power_of_two_nonzero(dst->bpp));
 
-   /* T2T copy cannot have both surfaces DCC-compressed */
-   assert(!src->is_compressed || !dst->is_compressed);
+   /* T2T copy cannot have DCC on both surfaces simultaneously */
+   assert(!(src->is_compressed && dst->is_compressed));
 
+   /* Pre-compute packet components */
    const uint32_t src_header_dword = ac_sdma_get_tiled_header_dword(info->sdma_ip_version, src);
    const uint32_t src_info_dword = ac_sdma_get_tiled_info_dword(info, src);
    const uint32_t dst_info_dword = ac_sdma_get_tiled_info_dword(info, dst);
 
-   if (SDMA_LIKELY(info->sdma_ip_version >= SDMA_4_0 && info->sdma_ip_version < SDMA_5_0)) {
-      /*
-       * SDMA v4 (Vega) limitations:
-       *   - No mip_id selection in T2T copy packet
-       *   - No image metadata (DCC/HTILE) support
-       */
+   /*
+    * SDMA 4.0 (Vega) limitations:
+    *   - No mip_id selection in T2T packet (must be mip 0)
+    *   - No DCC support
+    */
+   if (SDMA_LIKELY(info->sdma_ip_version >= SDMA_4_0) &&
+       SDMA_LIKELY(info->sdma_ip_version < SDMA_5_0)) {
+      /* mip_id is in bits [24:27] of header; must be 0 */
       assert((src_header_dword >> 24) == 0);
       assert(!src->is_compressed);
       assert(!dst->is_compressed);
    }
 
+   /* Validate surface offsets */
+   assert(src->offset.x <= UINT16_MAX);
+   assert(src->offset.y <= UINT16_MAX);
+   assert(src->offset.z <= UINT16_MAX);
+   assert(dst->offset.x <= UINT16_MAX);
+   assert(dst->offset.y <= UINT16_MAX);
+   assert(dst->offset.z <= UINT16_MAX);
+
    /*
-    * DCC handling:
-    *   dcc = 1 if either surface has DCC
-    *   dcc_dir = 1 for decompress (src compressed), 0 for compress (dst compressed)
+    * DCC direction encoding:
+    *   dcc = 1:     at least one surface has DCC
+    *   dcc_dir = 0: compress (dst has DCC)
+    *   dcc_dir = 1: decompress (src has DCC)
     */
-   const uint32_t dcc = (src->is_compressed || dst->is_compressed) ? 1 : 0;
-   const uint32_t dcc_dir = (src->is_compressed && !dst->is_compressed) ? 1 : 0;
+   const uint32_t dcc = (src->is_compressed || dst->is_compressed) ? 1u : 0u;
+   const uint32_t dcc_dir = (src->is_compressed && !dst->is_compressed) ? 1u : 0u;
+
+   /* Build packet header */
+   const uint32_t packet_header =
+      SDMA_PACKET(SDMA_OPCODE_COPY, SDMA_COPY_SUB_OPCODE_T2T_SUB_WINDOW, 0) |
+      (dcc << 19) |
+      (dcc_dir << 31) |
+      src_header_dword;
 
    ac_cmdbuf_begin(cs);
-   ac_cmdbuf_emit(SDMA_PACKET(SDMA_OPCODE_COPY, SDMA_COPY_SUB_OPCODE_T2T_SUB_WINDOW, 0) |
-                  (dcc << 19) |
-                  (dcc_dir << 31) |
-                  src_header_dword);
+   ac_cmdbuf_emit(packet_header);
    ac_cmdbuf_emit((uint32_t)src->va);
    ac_cmdbuf_emit((uint32_t)(src->va >> 32));
    ac_cmdbuf_emit(src->offset.x | (src->offset.y << 16));
@@ -723,25 +901,27 @@ ac_emit_sdma_copy_t2t_sub_window(struct ac_cmdbuf *cs, const struct radeon_info 
    ac_cmdbuf_emit((width - 1) | ((height - 1) << 16));
    ac_cmdbuf_emit(depth - 1);
 
-   if (info->sdma_ip_version >= SDMA_7_0) {
-      /*
-       * SDMA 7.0+: Compress only when dst has DCC. If src has DCC,
-       * it automatically decompresses according to PTE.D (page table bit)
-       * even if we don't enable DCC in the packet.
-       */
+   /*
+    * DCC metadata handling (SDMA 5.0+ only).
+    *
+    * SDMA 7.0+: auto-decompresses src via PTE.D bit, only emit for dst compression.
+    * SDMA 5.0-6.x: explicitly emit metadata for whichever surface has DCC.
+    */
+   if (SDMA_UNLIKELY(info->sdma_ip_version >= SDMA_7_0)) {
       if (dst->is_compressed) {
          const uint32_t dst_meta_config =
             ac_sdma_get_tiled_metadata_config(info, dst, false, false);
          ac_cmdbuf_emit(dst_meta_config);
       }
-   } else {
+   } else if (SDMA_UNLIKELY(dcc)) {
       if (dst->is_compressed) {
          const uint32_t dst_meta_config =
             ac_sdma_get_tiled_metadata_config(info, dst, false, false);
          ac_cmdbuf_emit((uint32_t)dst->meta_va);
          ac_cmdbuf_emit((uint32_t)(dst->meta_va >> 32));
          ac_cmdbuf_emit(dst_meta_config);
-      } else if (src->is_compressed) {
+      } else {
+         /* src->is_compressed must be true since dcc is set */
          const uint32_t src_meta_config =
             ac_sdma_get_tiled_metadata_config(info, src, true, false);
          ac_cmdbuf_emit((uint32_t)src->meta_va);
