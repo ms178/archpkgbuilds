@@ -528,7 +528,7 @@ optimizations.extend([
    (('fdot2', a, 0.0), 0.0),
 
    (('fdot4', ('vec4', a, b,   c,   1.0), d), ('fdph',  ('vec3', a, b, c), d), '!options->lower_fdph'),
-   (('fdot4', ('vec4', a, 0.0, 0.0, 0.0), b), ('fmul', a, b)),
+   (('fdot4', ('vec4', a, 0.0, 0.0, 0.0), b), ('fmul', a, 'b.x')),
    (('fdot4', ('vec4', a, b,   0.0, 0.0), c), ('fdot2', ('vec2', a, b), c)),
    (('fdot4', ('vec4', a, b,   c,   0.0), d), ('fdot3', ('vec3', a, b, c), d)),
    (('fdot4', 'a(w_is_zero)', b), ('fdot3', 'a.xyz', 'b.xyz')),
@@ -536,13 +536,13 @@ optimizations.extend([
    (('fdot4', 'a(y_is_zero)', b), ('fdot3', 'a.xzw', 'b.xzw')),
    (('fdot4', 'a(x_is_zero)', b), ('fdot3', 'a.yzw', 'b.yzw')),
 
-   (('fdot3', ('vec3', a, 0.0, 0.0), b), ('fmul', a, b)),
+   (('fdot3', ('vec3', a, 0.0, 0.0), b), ('fmul', a, 'b.x')),
    (('fdot3', ('vec3', a, b,   0.0), c), ('fdot2', ('vec2', a, b), c)),
    (('fdot3', 'a(x_is_zero)', b), ('fdot2', 'a.yz', 'b.yz')),
    (('fdot3', 'a(y_is_zero)', b), ('fdot2', 'a.xz', 'b.xz')),
    (('fdot3', 'a(z_is_zero)', b), ('fdot2', 'a.xy', 'b.xy')),
 
-   (('fdot2', ('vec2', a, 0.0), b), ('fmul', a, b)),
+   (('fdot2', ('vec2', a, 0.0), b), ('fmul', a, 'b.x')),
    (('fdot2', 'a(x_is_zero)', b), ('fmul', 'a.y', 'b.y')),
    (('fdot2', 'a(y_is_zero)', b), ('fmul', 'a.x', 'b.x')),
    (('fdot2', a, 1.0), ('fadd', 'a.x', 'a.y')),
@@ -1200,8 +1200,6 @@ for s in [16, 32, 64]:
          ('fneg', ('fexp2', ('fmul', ('flog2', ('fabs', a)), b))),
                   ('fexp2', ('fmul', ('flog2', ('fabs', a)), b)))),
 
-       (('bcsel', a, ('b2f(is_used_once)', 'b@{}'.format(s)), ('b2f', 'c@{}'.format(s))), ('b2f', ('bcsel', a, b, c))),
-
        # The C spec says, "If the value of the integral part cannot be represented
        # by the integer type, the behavior is undefined."  "Undefined" can mean
        # "the conversion doesn't happen at all."
@@ -1232,6 +1230,9 @@ for s in [16, 32, 64]:
        # HLSL's sign function returns an integer
        (('i2f{}'.format(s), ('f2i', ('fsign', 'a@{}'.format(s)))), ('fsign', a)),
     ])
+
+    if s < 64:
+        optimizations.extend([(('bcsel', a, ('b2f(is_used_once)', 'b@{}'.format(s)), ('b2f', 'c@{}'.format(s))), ('b2f', ('bcsel', a, b, c)))])
 
     for B in [32, 64]:
         if s < B:
@@ -1349,9 +1350,6 @@ for s in [8, 16, 32, 64]:
        (('bcsel', ('ige', 'a@{}'.format(s), b), b, a), ('imin', a, b), '!'+lower_imin),
        (('bcsel', ('ige', 'b@{}'.format(s), a), b, a), ('imax', a, b), '!'+lower_imax),
 
-       # True/False are ~0 and 0 in NIR.  b2i of True is 1, and -1 is ~0 (True).
-       (('ineg', ('b2i{}'.format(s), 'a@{}'.format(s))), a),
-
        # SM5 32-bit shifts are defined to use the 5 least significant bits (or 4 bits for 16 bits)
        (('ishl', 'a@{}'.format(s), ('iand', s - 1, b)), ('ishl', a, b)),
        (('ishr', 'a@{}'.format(s), ('iand', s - 1, b)), ('ishr', a, b)),
@@ -1376,6 +1374,11 @@ for s in [8, 16, 32, 64]:
        (('iand', ('uge(is_used_once)', f'a@{s}', b), ('uge', a, c)), ('uge', a, ('umax', b, c)), '!'+lower_umax),
        (('iand', ('uge(is_used_once)', f'a@{s}', c), ('uge', b, c)), ('uge', ('umin', a, b), c), '!'+lower_umin),
     ])
+
+    # There are no 64bit booleans in NIR
+    if s < 64:
+        # True/False are ~0 and 0 in NIR.  b2i of True is 1, and -1 is ~0 (True).
+        optimizations.extend([(('ineg', ('b2i{}'.format(s), 'a@{}'.format(s))), a)])
 
 optimizations.extend([
    # Common pattern like 'if (i == 0 || i == 1 || ...)'
@@ -3706,16 +3709,16 @@ for int_sz in (8, 16, 32):
             late_optimizations.extend([
                 # This requires is_a_number because f2i_sat(NaN) is zero, but
                 # fmax(intmin, NaN) is intmin.
-                ((f'f2i{int_sz}', ('fmax', f'a@{float_sz}(is_a_number)', intmin)), ('f2i{int_sz}_sat', a), 'options->has_f2i_sat'),
+                ((f'f2i{int_sz}', ('fmax', f'a@{float_sz}(is_a_number)', intmin)), (f'f2i{int_sz}_sat', a), 'options->has_f2i_sat'),
 
-                ((f'f2i{int_sz}', ('fmin', f'a@{float_sz}(is_a_number)', intmax)), ('f2i{int_sz}_sat', a), 'options->has_f2i_sat'),
+                ((f'f2i{int_sz}', ('fmin', f'a@{float_sz}(is_a_number)', intmax)), (f'f2i{int_sz}_sat', a), 'options->has_f2i_sat'),
                 ((f'f2u{int_sz}', ('fmin', f'a@{float_sz}(is_a_number)', uintmax)), (f'f2u{int_sz}_sat', a), 'options->has_f2u_sat'),
             ])
 
         late_optimizations.extend([
             # This does not require is_a_number because both f2u_sat(NaN) and
             # fmax(NaN, 0) are zero.
-            ((f'f2u{int_sz}', ('fmax', f'a@{float_sz}', 0.0)), ('f2u{int_sz}_sat', a), 'options->has_f2u_sat'),
+            ((f'f2u{int_sz}', ('fmax', f'a@{float_sz}', 0.0)), (f'f2u{int_sz}_sat', a), 'options->has_f2u_sat'),
 
             ((f'f2u{int_sz}', ('ftrunc', f'a@{float_sz}')), (f'f2u{int_sz}_sat', a), 'options->has_f2u_sat'),
 
@@ -3759,7 +3762,6 @@ for sz, mulz in itertools.product([16, 32, 64], [False, True]):
 
 late_optimizations.extend([
    # Subtractions get lowered during optimization, so we need to recombine them
-   (('fadd@8', a, ('fneg', 'b')), ('fsub', 'a', 'b'), 'options->has_fsub'),
    (('fadd@16', a, ('fneg', 'b')), ('fsub', 'a', 'b'), 'options->has_fsub'),
    (('fadd@32', a, ('fneg', 'b')), ('fsub', 'a', 'b'), 'options->has_fsub'),
    (('fadd@64', a, ('fneg', 'b')), ('fsub', 'a', 'b'), 'options->has_fsub && !(options->lower_doubles_options & nir_lower_dsub)'),
@@ -3831,6 +3833,8 @@ late_optimizations.extend([
    (('iand', a, a), a),
 
    (('~fadd', ('fneg(is_used_once)', ('fsat(is_used_once)', 'a(is_not_fmul)')), 1.0), ('fsat', ('fadd', 1.0, ('fneg', a)))),
+
+   (('fsqrt', ('fsat(is_used_once)', 'a(cannot_add_output_modifier)')), ('fsat', ('fsqrt', a))),
 
    (('fdot2', a, b), ('fdot2_replicated', a, b), 'options->fdot_replicates'),
    (('fdot3', a, b), ('fdot3_replicated', a, b), 'options->fdot_replicates'),
