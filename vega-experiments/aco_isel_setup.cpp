@@ -502,8 +502,8 @@ assign_alu_regclass(isel_context* ctx, nir_alu_instr* alu_instr, RegClass* regcl
       case nir_op_bfdot2_bfadd:
       case nir_op_byte_perm_amd:
       case nir_op_alignbyte_amd:
-         type = RegType::vgpr;
-         break;
+      case nir_op_f2f16_ru:
+      case nir_op_f2f16_rd: type = RegType::vgpr; break;
 
       /*
        * Floating-point operations: require VGPR on GFX9 through GFX11.
@@ -1012,8 +1012,7 @@ setup_isel_context(Program* program, unsigned shader_count, struct nir_shader* c
       }
    }
 
-   init_program(program, Stage{info->hw_stage, sw_stage}, info, options->gfx_level, options->family,
-                options->wgp_mode, config);
+   init_program(program, Stage{info->hw_stage, sw_stage}, info, options, config);
 
    isel_context ctx = {};
    ctx.program = program;
