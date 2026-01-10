@@ -25,112 +25,92 @@
 
 char _license[] SEC("license") = "GPL";
 
-/*
- * Logical current clock
- */
 u64 cur_logical_clk = LAVD_DL_COMPETE_WINDOW;
 
-/*
- * Current service time
- */
 static u64 cur_svc_time;
 
-/*
- * The minimum and maximum of time slice
- */
 const volatile u64 slice_min_ns = LAVD_SLICE_MIN_NS_DFL;
 const volatile u64 slice_max_ns = LAVD_SLICE_MAX_NS_DFL;
 
-/*
- * Migration delta threshold percentage (0-100)
- */
 const volatile u8 mig_delta_pct = 0;
 
-/*
- * Slice time for all tasks when pinned tasks are running on the CPU.
- */
 const volatile u64 pinned_slice_ns = 0;
 
 static volatile u64 nr_cpus_big;
 
-/*
- * Scheduler's PID
- */
 static pid_t lavd_pid;
 
-/*
- * Asymmetric smoothing shifts for runtime estimation.
- * Faster ramp-up (shift 1 = 50%) for responsiveness,
- * slower ramp-down (shift 2 = 25%) for stability.
- */
 #define LAVD_SMOOTH_SHIFT_UP	1U
 #define LAVD_SMOOTH_SHIFT_DOWN	2U
 
 static __always_inline u64 calc_avg_smooth(u64 old_val, u64 new_val)
 {
-	u64 delta, result;
+	u64 delta, step, result;
 
-	/*
-	 * Early exit for common case: no change.
-	 * Avoids all arithmetic and branches.
-	 */
 	if (old_val == new_val)
 		return old_val;
 
 	if (new_val > old_val) {
-		/* Ramp-up: faster response (50% weight) */
 		delta = new_val - old_val;
-		result = old_val + (delta >> LAVD_SMOOTH_SHIFT_UP);
-		/* Saturate at new_val to prevent overshoot */
+		step = delta >> LAVD_SMOOTH_SHIFT_UP;
+		if (step == 0)
+			step = 1;
+		result = old_val + step;
 		return result > new_val ? new_val : result;
-	} else {
-		/* Ramp-down: slower decay (25% weight) */
-		delta = old_val - new_val;
-		result = old_val - (delta >> LAVD_SMOOTH_SHIFT_DOWN);
-		/* Saturate at new_val to prevent undershoot */
-		return result < new_val ? new_val : result;
 	}
+
+	delta = old_val - new_val;
+	step = delta >> LAVD_SMOOTH_SHIFT_DOWN;
+	if (step == 0)
+		step = 1;
+	result = old_val - step;
+	return result < new_val ? new_val : result;
 }
 
-/*
- * Prefetch hints for hot path data structures.
- * L1 cache (temporal locality 3) for frequently accessed task/cpu contexts.
- */
 static __always_inline void prefetch_task_hot(task_ctx *taskc)
 {
-	if (taskc)
+	if (likely(taskc != NULL))
 		__builtin_prefetch(taskc, 0, 3);
 }
 
 static __always_inline void prefetch_cpu_hot(struct cpu_ctx *cpuc)
 {
-	if (cpuc)
+	if (likely(cpuc != NULL))
 		__builtin_prefetch(cpuc, 0, 3);
 }
 
-static void advance_cur_logical_clk(struct task_struct *p)
+static __always_inline void advance_cur_logical_clk(struct task_struct *p, u64 now)
 {
-	u64 vlc, clc, ret_clc;
-	u64 nr_queued, delta, new_clk;
+	u64 vlc, clc;
 	int i;
+
+	if (unlikely(!p))
+		return;
 
 	vlc = READ_ONCE(p->scx.dsq_vtime);
 	clc = READ_ONCE(cur_logical_clk);
 
 	bpf_for(i, 0, LAVD_MAX_RETRY) {
-		/*
-		 * The clock should not go backward, so do nothing.
-		 */
+		u64 nr_queued, diff, delta, new_clk, ret_clc;
+
 		if (vlc <= clc)
 			return;
 
-		/*
-		 * Advance the clock up to the task's deadline. When overloaded,
-		 * advance the clock slower so others can jump in the run queue.
-		 */
-		nr_queued = max(sys_stat.nr_queued_task, 1);
-		delta = (vlc - clc) / nr_queued;
+		nr_queued = READ_ONCE(sys_stat.nr_queued_task);
+		nr_queued = nr_queued > 0 ? nr_queued : 1;
+
+		diff = vlc - clc;
+		delta = diff / nr_queued;
+
+		if (delta == 0) {
+			const u64 rl_mask = 0x3fffull;
+			if ((now & rl_mask) != 0)
+				return;
+			delta = 1;
+		}
+
 		new_clk = clc + delta;
+		new_clk = new_clk > vlc ? vlc : new_clk;
 
 		ret_clc = __sync_val_compare_and_swap(&cur_logical_clk, clc, new_clk);
 		if (ret_clc == clc)
@@ -142,77 +122,55 @@ static void advance_cur_logical_clk(struct task_struct *p)
 
 static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 {
-	u64 slice, base_slice, avg_runtime, max_slice;
-	u32 avg_perf_cri;
+	u64 slice, base_slice, avg_runtime, max_slice, min_slice;
+	u32 avg_perf_cri, avg_lat_cri;
+	bool boosted = false;
 
 	if (unlikely(!taskc || !cpuc))
 		return LAVD_SLICE_MAX_NS_DFL;
 
-	/*
-	 * Cache frequently accessed values to avoid repeated volatile reads.
-	 * Per Intel Optimization Manual §3.6.2: Reduces load-store forwarding stalls.
-	 */
 	base_slice = READ_ONCE(sys_stat.slice);
 	avg_runtime = READ_ONCE(taskc->avg_runtime);
 	max_slice = READ_ONCE(slice_max_ns);
+	min_slice = READ_ONCE(slice_min_ns);
 	avg_perf_cri = READ_ONCE(sys_stat.avg_perf_cri);
+	avg_lat_cri = READ_ONCE(sys_stat.avg_lat_cri);
 
-	/*
-	 * Pinned task fast path: unconditional slice reduction.
-	 */
-	if (unlikely(pinned_slice_ns && cpuc->nr_pinned_tasks)) {
-		slice = pinned_slice_ns < base_slice ? pinned_slice_ns : base_slice;
-		taskc->slice = slice;
-		reset_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
-		return slice;
-	}
+	slice = base_slice;
 
-	/*
-	 * Short runtime fast path: Most tasks take this branch.
-	 * Raptor Lake turbo boost for perf-critical tasks on P-cores.
-	 */
-	if (likely(avg_runtime < base_slice)) {
+	if (unlikely(READ_ONCE(pinned_slice_ns) != 0 &&
+		     READ_ONCE(cpuc->nr_pinned_tasks) != 0)) {
+		const u64 ps = READ_ONCE(pinned_slice_ns);
+		slice = ps < base_slice ? ps : base_slice;
+	} else if (likely(avg_runtime < base_slice)) {
 		if (have_turbo_core && cpuc->big_core &&
 		    taskc->perf_cri > avg_perf_cri) {
-			/* 25% bonus slice for perf-critical on turbo cores */
 			slice = base_slice + (base_slice >> 2);
-			slice = slice < max_slice ? slice : max_slice;
-			taskc->slice = slice;
-			set_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
-			return slice;
+			if (slice > max_slice)
+				slice = max_slice;
+			boosted = true;
 		}
-		taskc->slice = base_slice;
-		reset_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
-		return base_slice;
-	}
-
-	/*
-	 * Long runtime path: Consider slice boosting.
-	 */
-	if (!no_slice_boost && !cpuc->nr_pinned_tasks) {
+	} else if (!no_slice_boost && READ_ONCE(cpuc->nr_pinned_tasks) == 0) {
 		if (can_boost_slice()) {
 			slice = avg_runtime + LAVD_SLICE_BOOST_BONUS;
-			slice = clamp(slice, slice_min_ns, LAVD_SLICE_BOOST_MAX);
-			taskc->slice = slice;
-			set_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
-			return slice;
-		}
-
-		if (taskc->lat_cri > sys_stat.avg_lat_cri) {
-			u64 lat_bonus = (base_slice * taskc->lat_cri) /
-					(sys_stat.avg_lat_cri + 1);
+			slice = clamp(slice, min_slice, (u64)LAVD_SLICE_BOOST_MAX);
+			boosted = true;
+		} else if (taskc->lat_cri > avg_lat_cri) {
+			const u64 denom = (u64)avg_lat_cri + 1;
+			const u64 lat_bonus = (base_slice * (u64)taskc->lat_cri) / denom;
 			slice = base_slice + lat_bonus;
-			slice = clamp(slice, slice_min_ns,
-				      min(avg_runtime, base_slice << 1));
-			taskc->slice = slice;
-			set_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
-			return slice;
+			slice = clamp(slice, min_slice, min(avg_runtime, base_slice << 1));
+			boosted = true;
 		}
 	}
 
-	taskc->slice = base_slice;
-	reset_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
-	return base_slice;
+	taskc->slice = slice;
+	if (boosted)
+		set_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
+	else
+		reset_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
+
+	return slice;
 }
 
 static void update_stat_for_running(struct task_struct *p,
@@ -222,9 +180,9 @@ static void update_stat_for_running(struct task_struct *p,
 	u64 wait_period, interval;
 	struct cpu_ctx *prev_cpuc;
 
-	/*
-	 * Update run frequency using exponential weighted moving average.
-	 */
+	if (unlikely(!p || !taskc || !cpuc))
+		return;
+
 	if (have_scheduled(taskc)) {
 		wait_period = time_delta(now, taskc->last_quiescent_clk);
 		interval = taskc->avg_runtime + wait_period;
@@ -232,39 +190,24 @@ static void update_stat_for_running(struct task_struct *p,
 			taskc->run_freq = calc_avg_freq(taskc->run_freq, interval);
 	}
 
-	/*
-	 * Collect additional information when monitored.
-	 */
 	if (unlikely(is_monitored))
 		taskc->resched_interval = time_delta(now, taskc->last_running_clk);
 
 	taskc->prev_cpu_id = taskc->cpu_id;
 	taskc->cpu_id = cpuc->cpu_id;
 
-	/*
-	 * Update task state when starts running.
-	 */
 	reset_task_flag(taskc, LAVD_FLAG_IS_WAKEUP | LAVD_FLAG_IS_SYNC_WAKEUP);
 	taskc->last_running_clk = now;
 	taskc->last_measured_clk = now;
 	taskc->last_sum_exec_clk = task_exec_time(p);
 
-	/*
-	 * Reset task's lock and futex boost count.
-	 */
 	reset_lock_futex_boost(taskc, cpuc);
 
-	/*
-	 * Update per-CPU latency criticality information.
-	 */
 	if (cpuc->max_lat_cri < taskc->lat_cri)
 		cpuc->max_lat_cri = taskc->lat_cri;
 	cpuc->sum_lat_cri += taskc->lat_cri;
 	cpuc->nr_sched++;
 
-	/*
-	 * Update per-CPU performance criticality information.
-	 */
 	if (have_little_core) {
 		if (cpuc->max_perf_cri < taskc->perf_cri)
 			cpuc->max_perf_cri = taskc->perf_cri;
@@ -273,17 +216,11 @@ static void update_stat_for_running(struct task_struct *p,
 		cpuc->sum_perf_cri += taskc->perf_cri;
 	}
 
-	/*
-	 * Update running task's information for preemption.
-	 */
 	cpuc->flags = taskc->flags;
 	cpuc->lat_cri = taskc->lat_cri;
 	cpuc->running_clk = now;
 	cpuc->est_stopping_clk = get_est_stopping_clk(taskc, now);
 
-	/*
-	 * Update statistics.
-	 */
 	if (is_lat_cri(taskc))
 		cpuc->nr_lat_cri++;
 
@@ -303,31 +240,26 @@ static void account_task_runtime(struct task_struct *p,
 				 u64 now)
 {
 	u64 sus_dur, runtime, svc_time, sc_time, task_time, exec_delta;
+	u32 weight;
 
-	/*
-	 * Since task execution can span one or more sys_stat intervals,
-	 * we update task and CPU's statistics at every tick interval and
-	 * update_stat_for_stopping(). We add up only the execution duration
-	 * since the last measured time.
-	 */
+	if (unlikely(!p || !taskc || !cpuc))
+		return;
+
 	sus_dur = get_suspended_duration_and_reset(cpuc);
 	runtime = time_delta(now, taskc->last_measured_clk + sus_dur);
 
-	/*
-	 * p->se.sum_exec_runtime serves as a proxy for rq->clock_task which
-	 * accounts for time consumed by irq_time and steal_time. On the same
-	 * token, runtime - exec_delta must equal to irq_time + steal_time
-	 * barring some imprecision when the time was snapshotted.
-	 *
-	 * We accumulate the delta as cpuc->stolen_time_est to approximate
-	 * the total time CPU spent in stolen time (irq+steal).
-	 */
 	task_time = task_exec_time(p);
 	exec_delta = time_delta(task_time, taskc->last_sum_exec_clk);
-	cpuc->stolen_time_est += time_delta(runtime, exec_delta);
+
+	if (runtime > exec_delta)
+		cpuc->stolen_time_est += runtime - exec_delta;
+
 	runtime = exec_delta;
 
-	svc_time = runtime / p->scx.weight;
+	weight = p->scx.weight;
+	weight = weight > 0 ? weight : 1;
+
+	svc_time = runtime / (u64)weight;
 	sc_time = scale_cap_freq(runtime, cpuc->cpu_id);
 
 	WRITE_ONCE(cpuc->tot_svc_time, cpuc->tot_svc_time + svc_time);
@@ -338,9 +270,6 @@ static void account_task_runtime(struct task_struct *p,
 	taskc->last_measured_clk = now;
 	taskc->last_sum_exec_clk = task_time;
 
-	/*
-	 * Under CPU bandwidth control using cpu.max, report consumed time.
-	 */
 	if (enable_cpu_bw && (p->pid != lavd_pid)) {
 		struct cgroup *cgrp = bpf_cgroup_from_id(taskc->cgrp_id);
 		if (cgrp) {
@@ -354,13 +283,15 @@ static void update_stat_for_stopping(struct task_struct *p,
 				     task_ctx *taskc,
 				     struct cpu_ctx *cpuc)
 {
-	u64 now = scx_bpf_now();
+	u64 now;
+
+	if (unlikely(!p || !taskc || !cpuc))
+		return;
+
+	now = scx_bpf_now();
 
 	account_task_runtime(p, taskc, cpuc, now);
 
-	/*
-	 * Use asymmetric smoothing: faster ramp-up, slower ramp-down.
-	 */
 	taskc->avg_runtime = calc_avg_smooth(taskc->avg_runtime, taskc->acc_runtime);
 	taskc->last_stopping_clk = now;
 
@@ -377,16 +308,17 @@ static void update_stat_for_refill(struct task_struct *p,
 				   task_ctx *taskc,
 				   struct cpu_ctx *cpuc)
 {
-	u64 now = scx_bpf_now();
+	u64 now;
+
+	if (unlikely(!p || !taskc || !cpuc))
+		return;
+
+	now = scx_bpf_now();
 
 	account_task_runtime(p, taskc, cpuc, now);
 	taskc->avg_runtime = calc_avg_smooth(taskc->avg_runtime, taskc->acc_runtime);
 }
 
-/*
- * Raptor Lake optimized sibling selection.
- * Prioritizes: SMT sibling -> turbo cores -> E-core cluster neighbors.
- */
 static __attribute__((noinline)) s32 try_select_idle_sibling(struct pick_ctx *ictx,
 							     s32 prev_cpu)
 {
@@ -395,7 +327,7 @@ static __attribute__((noinline)) s32 try_select_idle_sibling(struct pick_ctx *ic
 	const volatile u32 *sibling_ptr;
 	u8 prev_llc;
 
-	if (prev_cpu < 0)
+	if (prev_cpu < 0 || (u32)prev_cpu >= nr_cpu_ids)
 		return -ENOENT;
 
 	prev_cpu_u = (u32)prev_cpu;
@@ -406,59 +338,50 @@ static __attribute__((noinline)) s32 try_select_idle_sibling(struct pick_ctx *ic
 	if (!cpuc_prev || !cpuc_prev->is_online)
 		return -ENOENT;
 
-	/*
-	 * Strategy 1: For P-cores with SMT, prefer the sibling thread.
-	 * Shared L1D (48KB) and L2 (2MB) means near-zero migration cost.
-	 */
 	if (is_smt_active && cpuc_prev->big_core) {
 		sibling_ptr = MEMBER_VPTR(cpu_sibling, [prev_cpu_u]);
 		if (sibling_ptr) {
-			sibling_u = *sibling_ptr;
-			if (sibling_u < LAVD_CPU_ID_MAX && sibling_u != prev_cpu_u) {
+			sibling_u = READ_ONCE(*sibling_ptr);
+			if (sibling_u < LAVD_CPU_ID_MAX &&
+			    sibling_u < nr_cpu_ids &&
+			    sibling_u != prev_cpu_u) {
 				cpuc_cand = get_cpu_ctx_id((s32)sibling_u);
 				if (cpuc_cand && cpuc_cand->is_online &&
-				    cpuc_cand->idle_start_clk != 0)
+				    READ_ONCE(cpuc_cand->idle_start_clk) != 0)
 					return (s32)sibling_u;
 			}
 		}
 	}
 
-	/*
-	 * Strategy 2: For perf-critical tasks, prefer turbo cores.
-	 * i7-14700KF: CPUs 0-7 are P-core threads with highest turbo bins.
-	 * Iterate only nr_cpus_big threads (typically 8-16 for P-cores).
-	 */
-	if (have_turbo_core && ictx->taskc &&
+	if (have_turbo_core && ictx && ictx->taskc &&
 	    ictx->taskc->perf_cri > READ_ONCE(sys_stat.avg_perf_cri)) {
-		u32 nr_turbo = (u32)nr_cpus_big;
-		if (nr_turbo > 16)
-			nr_turbo = 16; /* Bound for BPF verifier */
+		u64 nr_turbo_raw = READ_ONCE(nr_cpus_big);
+		u32 nr_turbo = (u32)(nr_turbo_raw > 16 ? 16 : nr_turbo_raw);
 
 		bpf_for(cand_cpu_u, 0, nr_turbo) {
-			if (cand_cpu_u >= nr_cpu_ids)
+			if (cand_cpu_u >= nr_cpu_ids || cand_cpu_u >= LAVD_CPU_ID_MAX)
 				break;
 			cpuc_cand = get_cpu_ctx_id((s32)cand_cpu_u);
 			if (cpuc_cand && cpuc_cand->is_online &&
-			    cpuc_cand->turbo_core && cpuc_cand->idle_start_clk != 0)
+			    cpuc_cand->turbo_core &&
+			    READ_ONCE(cpuc_cand->idle_start_clk) != 0)
 				return (s32)cand_cpu_u;
 		}
 	}
 
-	/*
-	 * Strategy 3: For E-cores, try neighbors in the same 4-core cluster.
-	 * E-core clusters share 4MB L2; staying in cluster reduces latency.
-	 */
 	if (!cpuc_prev->big_core) {
-		cluster_base_u = prev_cpu_u & ~3U; /* Align to 4-core boundary */
+		cluster_base_u = prev_cpu_u & ~3U;
 		prev_llc = cpuc_prev->llc_id;
 
 		bpf_for(cand_cpu_u, cluster_base_u, cluster_base_u + 4) {
-			if (cand_cpu_u >= LAVD_CPU_ID_MAX || cand_cpu_u == prev_cpu_u)
+			if (cand_cpu_u >= LAVD_CPU_ID_MAX ||
+			    cand_cpu_u >= nr_cpu_ids ||
+			    cand_cpu_u == prev_cpu_u)
 				continue;
 			cpuc_cand = get_cpu_ctx_id((s32)cand_cpu_u);
 			if (cpuc_cand && cpuc_cand->is_online &&
 			    !cpuc_cand->big_core && cpuc_cand->llc_id == prev_llc &&
-			    cpuc_cand->idle_start_clk != 0)
+			    READ_ONCE(cpuc_cand->idle_start_clk) != 0)
 				return (s32)cand_cpu_u;
 		}
 	}
@@ -471,15 +394,21 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 {
 	struct pick_ctx ictx = {
 		.p = p,
-		.taskc = get_task_ctx(p),
+		.taskc = NULL,
 		.prev_cpu = prev_cpu,
-		.cpuc_cur = get_cpu_ctx(),
+		.cpuc_cur = NULL,
 		.wake_flags = wake_flags,
 	};
 	struct cpu_ctx *cpuc_prev = NULL;
 	struct cpu_ctx *cpuc_new = NULL;
 	bool found_idle = false;
 	s32 cpu_id = -ENOENT;
+
+	if (unlikely(!p))
+		return prev_cpu;
+
+	ictx.taskc = get_task_ctx(p);
+	ictx.cpuc_cur = get_cpu_ctx();
 
 	if (unlikely(!ictx.taskc || !ictx.cpuc_cur))
 		return prev_cpu;
@@ -491,13 +420,11 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 	else
 		reset_task_flag(ictx.taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
 
-	/*
-	 * Fast path: If prev_cpu is idle and task ran recently, reuse it.
-	 */
-	if (prev_cpu >= 0 && prev_cpu < LAVD_CPU_ID_MAX) {
+	if (prev_cpu >= 0 && (u32)prev_cpu < nr_cpu_ids &&
+	    prev_cpu < LAVD_CPU_ID_MAX) {
 		cpuc_prev = get_cpu_ctx_id(prev_cpu);
 		if (cpuc_prev && cpuc_prev->is_online &&
-		    cpuc_prev->idle_start_clk != 0) {
+		    READ_ONCE(cpuc_prev->idle_start_clk) != 0) {
 			u64 now = scx_bpf_now();
 			u64 last_stop = READ_ONCE(ictx.taskc->last_stopping_clk);
 
@@ -509,27 +436,19 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		}
 	}
 
-	/*
-	 * Try Raptor Lake optimized sibling selection.
-	 */
 	cpu_id = try_select_idle_sibling(&ictx, prev_cpu);
-	if (cpu_id >= 0) {
+	if (cpu_id >= 0 && (u32)cpu_id < nr_cpu_ids) {
 		found_idle = true;
 		goto apply_policy;
 	}
 
-	/*
-	 * Fall back to generic idle CPU selection.
-	 */
 	cpu_id = pick_idle_cpu(&ictx, &found_idle);
-	if (cpu_id < 0)
+	if (cpu_id < 0 || (u32)cpu_id >= nr_cpu_ids)
 		cpu_id = prev_cpu;
 
 apply_policy:
-	/*
-	 * Sticky big core policy: Keep perf-sensitive tasks on big cores.
-	 */
-	if (have_little_core && cpu_id >= 0 && cpuc_prev && cpuc_prev->big_core) {
+	if (have_little_core && cpu_id >= 0 && (u32)cpu_id < nr_cpu_ids &&
+	    cpuc_prev && cpuc_prev->big_core) {
 		bool is_perf_sens = ictx.taskc->perf_cri >
 				    READ_ONCE(sys_stat.avg_perf_cri);
 		if (is_perf_sens) {
@@ -537,7 +456,7 @@ apply_policy:
 			if (cpuc_new && !cpuc_new->big_core &&
 			    cpuc_prev->is_online) {
 				cpu_id = prev_cpu;
-				found_idle = (cpuc_prev->idle_start_clk != 0);
+				found_idle = (READ_ONCE(cpuc_prev->idle_start_clk) != 0);
 			}
 		}
 	}
@@ -548,6 +467,9 @@ apply_policy:
 		struct cpu_ctx *cpuc;
 
 		set_task_flag(ictx.taskc, LAVD_FLAG_IDLE_CPU_PICKED);
+
+		if (cpu_id < 0 || cpu_id >= LAVD_CPU_ID_MAX)
+			goto out;
 
 		cpuc = get_cpu_ctx_id(cpu_id);
 		if (!cpuc) {
@@ -574,6 +496,9 @@ static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_asi
 	struct cgroup *cgrp;
 	int ret, ret2;
 
+	if (unlikely(!p || !taskc))
+		return -EINVAL;
+
 	cgrp = bpf_cgroup_from_id(taskc->cgrp_id);
 	if (!cgrp) {
 		debugln("Failed to lookup a cgroup: %llu", taskc->cgrp_id);
@@ -599,6 +524,9 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	bool is_idle = false;
 	task_ctx *taskc;
 	u64 dsq_id;
+
+	if (unlikely(!p))
+		return;
 
 	taskc = get_task_ctx(p);
 	cpuc_cur = get_cpu_ctx();
@@ -629,8 +557,9 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		};
 
 		cpu = pick_idle_cpu(&ictx, &is_idle);
-		if (cpu < 0) {
-			cpu = (task_cpu >= 0) ? task_cpu : cpuc_cur->cpu_id;
+		if (cpu < 0 || (u32)cpu >= nr_cpu_ids) {
+			cpu = (task_cpu >= 0 && (u32)task_cpu < nr_cpu_ids) ?
+			      task_cpu : cpuc_cur->cpu_id;
 			is_idle = false;
 		}
 	} else {
@@ -651,17 +580,13 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	    (cgroup_throttled(p, taskc, true) == -EAGAIN))
 		return;
 
-	/*
-	 * Track pinned tasks using pinned_cpu_id (upstream approach).
-	 */
-	if (is_pinned(p) && (taskc->pinned_cpu_id == -ENOENT)) {
-		taskc->pinned_cpu_id = cpu;
+	if (is_pinned(p) && (READ_ONCE(taskc->pinned_cpu_id) == -ENOENT)) {
+		WRITE_ONCE(taskc->pinned_cpu_id, cpu);
 		__sync_fetch_and_add(&cpuc->nr_pinned_tasks, 1);
 	}
 
 	if (is_idle && !nr_queued_on_cpu(cpuc)) {
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
-				   enq_flags);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)cpu, p->scx.slice, enq_flags);
 	} else {
 		dsq_id = get_target_dsq_id(p, cpuc);
 		scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice,
@@ -684,6 +609,9 @@ static int enqueue_cb(struct task_struct __arg_trusted *p)
 	u64 dsq_id;
 	s32 cpu;
 
+	if (unlikely(!p))
+		return 0;
+
 	taskc = get_task_ctx(p);
 	if (!taskc) {
 		scx_bpf_error("Failed to lookup a task context: %d", p->pid);
@@ -693,14 +621,21 @@ static int enqueue_cb(struct task_struct __arg_trusted *p)
 	p->scx.dsq_vtime = calc_when_to_run(p, taskc);
 
 	cpu = taskc->suggested_cpu_id;
+	if (cpu < 0 || cpu >= LAVD_CPU_ID_MAX) {
+		scx_bpf_error("Invalid suggested_cpu_id %d", cpu);
+		return 0;
+	}
+
 	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
 		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
 		return 0;
 	}
 
-	if (is_pinned(p))
+	if (is_pinned(p) && (READ_ONCE(taskc->pinned_cpu_id) == -ENOENT)) {
+		WRITE_ONCE(taskc->pinned_cpu_id, cpu);
 		__sync_fetch_and_add(&cpuc->nr_pinned_tasks, 1);
+	}
 
 	dsq_id = get_target_dsq_id(p, cpuc);
 	scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice, p->scx.dsq_vtime, 0);
@@ -716,6 +651,9 @@ void BPF_STRUCT_OPS(lavd_dequeue, struct task_struct *p, u64 deq_flags)
 	if (!enable_cpu_bw)
 		return;
 
+	if (unlikely(!p))
+		return;
+
 	taskc = get_task_ctx(p);
 	if (!taskc) {
 		debugln("Failed to lookup task_ctx for task %d", p->pid);
@@ -726,6 +664,34 @@ void BPF_STRUCT_OPS(lavd_dequeue, struct task_struct *p, u64 deq_flags)
 		debugln("Failed to cancel task %d with %d", p->pid, ret);
 }
 
+static __always_inline void consume_prev_task(struct task_struct *prev,
+					      task_ctx *taskc_prev,
+					      struct cpu_ctx *cpuc)
+{
+	if (!prev || !cpuc)
+		return;
+	if (!(prev->scx.flags & SCX_TASK_QUEUED))
+		return;
+
+	if (!taskc_prev)
+		taskc_prev = get_task_ctx(prev);
+	if (!taskc_prev)
+		return;
+
+	update_stat_for_refill(prev, taskc_prev, cpuc);
+
+	if (enable_cpu_bw && (prev->pid != lavd_pid) &&
+	    (cgroup_throttled(prev, taskc_prev, false) == -EAGAIN))
+		return;
+
+	prev->scx.slice = calc_time_slice(taskc_prev, cpuc);
+
+	if (is_lock_holder_running(cpuc))
+		reset_lock_futex_boost(taskc_prev, cpuc);
+
+	cpuc->flags = taskc_prev->flags;
+}
+
 void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 {
 	struct bpf_cpumask *active, *ovrflw;
@@ -733,8 +699,12 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	task_ctx *taskc_prev = NULL;
 	bool try_consume = false;
 	struct cpu_ctx *cpuc;
-	struct task_struct *p;
+	struct task_struct *iter_p;
 	int ret;
+	const bool prev_queued = prev && (prev->scx.flags & SCX_TASK_QUEUED);
+
+	if (cpu < 0 || (u32)cpu >= nr_cpu_ids || cpu >= LAVD_CPU_ID_MAX)
+		return;
 
 	cpuc = get_cpu_ctx_id(cpu);
 	if (unlikely(!cpuc)) {
@@ -750,9 +720,23 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	if (enable_cpu_bw && (ret = scx_cgroup_bw_reenqueue()))
 		scx_bpf_error("Failed to reenqueue backlogged tasks: %d", ret);
 
-	if (prev && (prev->scx.flags & SCX_TASK_QUEUED) &&
-	    is_lock_holder_running(cpuc))
-		goto consume_prev;
+	if (prev_queued) {
+		const u64 cpu_q = scx_bpf_dsq_nr_queued(cpu_dsq_id);
+		u64 dom_q = 0;
+
+		if (use_cpdom_dsq())
+			dom_q = scx_bpf_dsq_nr_queued(cpdom_dsq_id);
+
+		if (cpu_q == 0 && (!use_cpdom_dsq() || dom_q == 0)) {
+			consume_prev_task(prev, NULL, cpuc);
+			return;
+		}
+	}
+
+	if (prev_queued && is_lock_holder_running(cpuc)) {
+		consume_prev_task(prev, NULL, cpuc);
+		return;
+	}
 
 	if (use_full_cpus())
 		goto consume_out;
@@ -763,24 +747,25 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	ovrflw = ovrflw_cpumask;
 	if (unlikely(!active || !ovrflw)) {
 		scx_bpf_error("Failed to prepare cpumasks.");
-		goto unlock_out;
+		bpf_rcu_read_unlock();
+		return;
 	}
 
-	if (bpf_cpumask_test_cpu(cpu, cast_mask(active)) ||
-	    bpf_cpumask_test_cpu(cpu, cast_mask(ovrflw))) {
+	if (bpf_cpumask_test_cpu((u32)cpu, cast_mask(active)) ||
+	    bpf_cpumask_test_cpu((u32)cpu, cast_mask(ovrflw))) {
 		bpf_rcu_read_unlock();
 		goto consume_out;
 	}
 
 	if (use_per_cpu_dsq() && scx_bpf_dsq_nr_queued(cpu_dsq_id)) {
-		bpf_cpumask_set_cpu(cpu, ovrflw);
+		bpf_cpumask_set_cpu((u32)cpu, ovrflw);
 		bpf_rcu_read_unlock();
 		goto consume_out;
 	}
 
 	if (prev) {
 		if (is_pinned(prev)) {
-			bpf_cpumask_set_cpu(cpu, ovrflw);
+			bpf_cpumask_set_cpu((u32)cpu, ovrflw);
 			bpf_rcu_read_unlock();
 			goto consume_out;
 		} else if (is_migration_disabled(prev)) {
@@ -791,78 +776,76 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 		taskc_prev = get_task_ctx(prev);
 		if (taskc_prev &&
 		    test_task_flag(taskc_prev, LAVD_FLAG_IS_AFFINITIZED) &&
-		    bpf_cpumask_test_cpu(cpu, prev->cpus_ptr) &&
+		    bpf_cpumask_test_cpu((u32)cpu, prev->cpus_ptr) &&
 		    !bpf_cpumask_intersects(cast_mask(active), prev->cpus_ptr) &&
 		    !bpf_cpumask_intersects(cast_mask(ovrflw), prev->cpus_ptr)) {
-			bpf_cpumask_set_cpu(cpu, ovrflw);
+			bpf_cpumask_set_cpu((u32)cpu, ovrflw);
 			bpf_rcu_read_unlock();
 			goto consume_out;
 		}
 	}
 
-	if (!use_cpdom_dsq())
-		goto unlock_out;
-
-	/*
-	 * Scan per-domain DSQ for tasks that can run on this CPU.
-	 * Note: bpf_task_from_pid() is a workaround for BPF verifier
-	 * not trusting the pointer from bpf_for_each(scx_dsq, ...).
-	 */
-	bpf_for_each(scx_dsq, p, cpdom_dsq_id, 0) {
-		task_ctx *taskc;
-		s32 new_cpu;
-
-		p = bpf_task_from_pid(p->pid);
-		if (!p)
-			break;
-
-		if (is_pinned(p)) {
-			new_cpu = scx_bpf_task_cpu(p);
-			if (new_cpu == cpu) {
-				bpf_cpumask_set_cpu(new_cpu, ovrflw);
-				bpf_task_release(p);
-				try_consume = true;
-				break;
-			}
-			if (!bpf_cpumask_test_and_set_cpu(new_cpu, ovrflw))
-				scx_bpf_kick_cpu(new_cpu, SCX_KICK_IDLE);
-			bpf_task_release(p);
-			continue;
-		} else if (is_migration_disabled(p)) {
-			new_cpu = scx_bpf_task_cpu(p);
-			if (new_cpu == cpu) {
-				bpf_task_release(p);
-				try_consume = true;
-				break;
-			}
-			bpf_task_release(p);
-			continue;
-		}
-
-		taskc = get_task_ctx(p);
-		if (taskc &&
-		    (!test_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED) ||
-		     bpf_cpumask_intersects(cast_mask(active), p->cpus_ptr) ||
-		     bpf_cpumask_intersects(cast_mask(ovrflw), p->cpus_ptr))) {
-			bpf_task_release(p);
-			continue;
-		}
-
-		new_cpu = find_cpu_in(p->cpus_ptr, cpuc);
-		if (new_cpu >= 0) {
-			if (new_cpu == cpu) {
-				bpf_cpumask_set_cpu(new_cpu, ovrflw);
-				bpf_task_release(p);
-				try_consume = true;
-				break;
-			} else if (!bpf_cpumask_test_and_set_cpu(new_cpu, ovrflw)) {
-				scx_bpf_kick_cpu(new_cpu, SCX_KICK_IDLE);
-			}
-		}
-		bpf_task_release(p);
+	if (!use_cpdom_dsq()) {
+		bpf_rcu_read_unlock();
+		return;
 	}
 
-unlock_out:
+	bpf_for_each(scx_dsq, iter_p, cpdom_dsq_id, 0) {
+		task_ctx *taskc;
+		struct task_struct *task_ref;
+		s32 new_cpu;
+
+		task_ref = bpf_task_from_pid(iter_p->pid);
+		if (!task_ref)
+			break;
+
+		if (is_pinned(task_ref)) {
+			new_cpu = scx_bpf_task_cpu(task_ref);
+			if (new_cpu == cpu) {
+				bpf_cpumask_set_cpu((u32)new_cpu, ovrflw);
+				bpf_task_release(task_ref);
+				try_consume = true;
+				break;
+			}
+			if (new_cpu >= 0 && (u32)new_cpu < nr_cpu_ids &&
+			    !bpf_cpumask_test_and_set_cpu((u32)new_cpu, ovrflw))
+				scx_bpf_kick_cpu(new_cpu, SCX_KICK_IDLE);
+			bpf_task_release(task_ref);
+			continue;
+		} else if (is_migration_disabled(task_ref)) {
+			new_cpu = scx_bpf_task_cpu(task_ref);
+			if (new_cpu == cpu) {
+				bpf_task_release(task_ref);
+				try_consume = true;
+				break;
+			}
+			bpf_task_release(task_ref);
+			continue;
+		}
+
+		taskc = get_task_ctx(task_ref);
+		if (taskc &&
+		    (!test_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED) ||
+		     bpf_cpumask_intersects(cast_mask(active), task_ref->cpus_ptr) ||
+		     bpf_cpumask_intersects(cast_mask(ovrflw), task_ref->cpus_ptr))) {
+			bpf_task_release(task_ref);
+			continue;
+		}
+
+		new_cpu = find_cpu_in(task_ref->cpus_ptr, cpuc);
+		if (new_cpu >= 0 && (u32)new_cpu < nr_cpu_ids) {
+			if (new_cpu == cpu) {
+				bpf_cpumask_set_cpu((u32)new_cpu, ovrflw);
+				bpf_task_release(task_ref);
+				try_consume = true;
+				break;
+			} else if (!bpf_cpumask_test_and_set_cpu((u32)new_cpu, ovrflw)) {
+				scx_bpf_kick_cpu(new_cpu, SCX_KICK_IDLE);
+			}
+		}
+		bpf_task_release(task_ref);
+	}
+
 	bpf_rcu_read_unlock();
 
 	if (!try_consume)
@@ -872,24 +855,7 @@ consume_out:
 	if (consume_task(cpu_dsq_id, cpdom_dsq_id))
 		return;
 
-	if (prev && prev->scx.flags & SCX_TASK_QUEUED) {
-consume_prev:
-		taskc_prev = taskc_prev ?: get_task_ctx(prev);
-		if (taskc_prev) {
-			update_stat_for_refill(prev, taskc_prev, cpuc);
-
-			if (enable_cpu_bw && (prev->pid != lavd_pid) &&
-			    (cgroup_throttled(prev, taskc_prev, false) == -EAGAIN))
-				return;
-
-			prev->scx.slice = calc_time_slice(taskc_prev, cpuc);
-
-			if (is_lock_holder_running(cpuc))
-				reset_lock_futex_boost(taskc_prev, cpuc);
-
-			cpuc->flags = taskc_prev->flags;
-		}
-	}
+	consume_prev_task(prev, taskc_prev, cpuc);
 }
 
 void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
@@ -897,7 +863,9 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 	struct task_struct *waker;
 	task_ctx *p_taskc, *waker_taskc;
 	u64 now, interval;
-	int i;
+
+	if (unlikely(!p))
+		return;
 
 	p_taskc = get_task_ctx(p);
 	if (!p_taskc) {
@@ -913,6 +881,9 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 		return;
 
 	waker = bpf_get_current_task_btf();
+	if (!waker)
+		return;
+
 	if ((p->real_parent != waker->real_parent))
 		return;
 
@@ -934,9 +905,18 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 	p_taskc->lat_cri_waker = waker_taskc->lat_cri;
 
 	if (is_monitored) {
+		char comm_buf[TASK_COMM_LEN];
+		int i;
+
 		p_taskc->waker_pid = waker->pid;
+
+		/* Read comm to stack buffer first to avoid variable offset
+		 * access to task_struct which BPF verifier rejects */
+		bpf_probe_read_kernel(comm_buf, sizeof(comm_buf), waker->comm);
+
+		/* Copy from stack to arena - variable offsets allowed here */
 		for (i = 0; i < TASK_COMM_LEN && can_loop; i++)
-			p_taskc->waker_comm[i] = waker->comm[i];
+			p_taskc->waker_comm[i] = comm_buf[i];
 	}
 }
 
@@ -944,7 +924,12 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 {
 	struct cpu_ctx *cpuc;
 	task_ctx *taskc;
-	u64 now = scx_bpf_now();
+	u64 now;
+
+	if (unlikely(!p))
+		return;
+
+	now = scx_bpf_now();
 
 	cpuc = get_cpu_ctx_task(p);
 	taskc = get_task_ctx(p);
@@ -957,7 +942,8 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 		p->scx.dsq_vtime = READ_ONCE(cur_logical_clk);
 
 	p->scx.slice = calc_time_slice(taskc, cpuc);
-	advance_cur_logical_clk(p);
+	advance_cur_logical_clk(p, now);
+
 	update_stat_for_running(p, taskc, cpuc, now);
 	update_cpuperf_target(cpuc);
 	try_proc_introspec_cmd(p, taskc);
@@ -987,7 +973,7 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
 		return;
 	}
 
-	if (cpuc->nr_pinned_tasks)
+	if (READ_ONCE(cpuc->nr_pinned_tasks) != 0)
 		shrink_slice_at_tick(p, cpuc, now);
 }
 
@@ -995,6 +981,9 @@ void BPF_STRUCT_OPS(lavd_stopping, struct task_struct *p, bool runnable)
 {
 	struct cpu_ctx *cpuc;
 	task_ctx *taskc;
+
+	if (unlikely(!p))
+		return;
 
 	cpuc = get_cpu_ctx_task(p);
 	taskc = get_task_ctx(p);
@@ -1011,6 +1000,10 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
 	struct cpu_ctx *cpuc;
 	task_ctx *taskc;
 	u64 now, interval;
+	s32 pin_cpu;
+
+	if (unlikely(!p))
+		return;
 
 	cpuc = get_cpu_ctx_task(p);
 	taskc = get_task_ctx(p);
@@ -1020,12 +1013,19 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
 	}
 	cpuc->flags = 0;
 
-	/*
-	 * Decrease pinned task count using pinned_cpu_id.
-	 */
-	if (is_pinned(p) && (taskc->pinned_cpu_id != -ENOENT)) {
-		__sync_fetch_and_sub(&cpuc->nr_pinned_tasks, 1);
-		taskc->pinned_cpu_id = -ENOENT;
+	pin_cpu = READ_ONCE(taskc->pinned_cpu_id);
+	if (pin_cpu != -ENOENT) {
+		struct cpu_ctx *pinc = NULL;
+
+		if (pin_cpu >= 0 && pin_cpu < LAVD_CPU_ID_MAX)
+			pinc = get_cpu_ctx_id(pin_cpu);
+
+		if (pinc)
+			__sync_fetch_and_sub(&pinc->nr_pinned_tasks, 1);
+		else
+			__sync_fetch_and_sub(&cpuc->nr_pinned_tasks, 1);
+
+		WRITE_ONCE(taskc->pinned_cpu_id, -ENOENT);
 	}
 
 	if (!(deq_flags & SCX_DEQ_SLEEP))
@@ -1043,10 +1043,15 @@ static void cpu_ctx_init_online(struct cpu_ctx *cpuc, u32 cpu_id, u64 now)
 {
 	struct bpf_cpumask *cd_cpumask;
 
+	if (unlikely(!cpuc))
+		return;
+
 	bpf_rcu_read_lock();
-	cd_cpumask = MEMBER_VPTR(cpdom_cpumask, [cpuc->cpdom_id]);
-	if (cd_cpumask)
-		bpf_cpumask_set_cpu(cpu_id, cd_cpumask);
+	if (cpuc->cpdom_id < LAVD_CPDOM_MAX_NR) {
+		cd_cpumask = MEMBER_VPTR(cpdom_cpumask, [cpuc->cpdom_id]);
+		if (cd_cpumask)
+			bpf_cpumask_set_cpu(cpu_id, cd_cpumask);
+	}
 	bpf_rcu_read_unlock();
 
 	cpuc->flags = 0;
@@ -1064,10 +1069,15 @@ static void cpu_ctx_init_offline(struct cpu_ctx *cpuc, u32 cpu_id, u64 now)
 {
 	struct bpf_cpumask *cd_cpumask;
 
+	if (unlikely(!cpuc))
+		return;
+
 	bpf_rcu_read_lock();
-	cd_cpumask = MEMBER_VPTR(cpdom_cpumask, [cpuc->cpdom_id]);
-	if (cd_cpumask)
-		bpf_cpumask_clear_cpu(cpu_id, cd_cpumask);
+	if (cpuc->cpdom_id < LAVD_CPDOM_MAX_NR) {
+		cd_cpumask = MEMBER_VPTR(cpdom_cpumask, [cpuc->cpdom_id]);
+		if (cd_cpumask)
+			bpf_cpumask_clear_cpu(cpu_id, cd_cpumask);
+	}
 	bpf_rcu_read_unlock();
 
 	cpuc->flags = 0;
@@ -1086,13 +1096,16 @@ void BPF_STRUCT_OPS(lavd_cpu_online, s32 cpu)
 	u64 now = scx_bpf_now();
 	struct cpu_ctx *cpuc;
 
+	if (cpu < 0 || cpu >= LAVD_CPU_ID_MAX)
+		return;
+
 	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
 		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
 		return;
 	}
 
-	cpu_ctx_init_online(cpuc, cpu, now);
+	cpu_ctx_init_online(cpuc, (u32)cpu, now);
 
 	__sync_fetch_and_add(&nr_cpus_onln, 1);
 	__sync_fetch_and_add(&total_capacity, cpuc->capacity);
@@ -1105,13 +1118,16 @@ void BPF_STRUCT_OPS(lavd_cpu_offline, s32 cpu)
 	u64 now = scx_bpf_now();
 	struct cpu_ctx *cpuc;
 
+	if (cpu < 0 || cpu >= LAVD_CPU_ID_MAX)
+		return;
+
 	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
 		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
 		return;
 	}
 
-	cpu_ctx_init_offline(cpuc, cpu, now);
+	cpu_ctx_init_offline(cpuc, (u32)cpu, now);
 
 	__sync_fetch_and_sub(&nr_cpus_onln, 1);
 	__sync_fetch_and_sub(&total_capacity, cpuc->capacity);
@@ -1123,6 +1139,10 @@ void BPF_STRUCT_OPS(lavd_update_idle, s32 cpu, bool idle)
 {
 	struct cpu_ctx *cpuc;
 	u64 now = scx_bpf_now();
+	int i;
+
+	if (cpu < 0 || cpu >= LAVD_CPU_ID_MAX)
+		return;
 
 	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
@@ -1134,20 +1154,19 @@ void BPF_STRUCT_OPS(lavd_update_idle, s32 cpu, bool idle)
 		cpuc->idle_start_clk = now;
 		reset_cpu_preemption_info(cpuc, false);
 	} else {
-		for (int i = 0; i < LAVD_MAX_RETRY; i++) {
-			u64 old_clk = cpuc->idle_start_clk;
+		bpf_for(i, 0, LAVD_MAX_RETRY) {
+			u64 old_clk = READ_ONCE(cpuc->idle_start_clk);
+			bool ret;
 
 			if (old_clk == 0)
 				break;
 
-			bool ret = __sync_bool_compare_and_swap(
-					&cpuc->idle_start_clk, old_clk, 0);
+			ret = __sync_bool_compare_and_swap(&cpuc->idle_start_clk, old_clk, 0);
 			if (ret) {
 				if (time_after(old_clk, now))
 					break;
 
-				u64 duration = time_delta(now, old_clk);
-				__sync_fetch_and_add(&cpuc->idle_total, duration);
+				__sync_fetch_and_add(&cpuc->idle_total, time_delta(now, old_clk));
 				break;
 			}
 		}
@@ -1158,6 +1177,10 @@ void BPF_STRUCT_OPS(lavd_set_cpumask, struct task_struct *p,
 		    const struct cpumask *cpumask)
 {
 	task_ctx *taskc;
+	s32 pin_cpu;
+
+	if (unlikely(!p))
+		return;
 
 	taskc = get_task_ctx(p);
 	if (!taskc) {
@@ -1165,10 +1188,24 @@ void BPF_STRUCT_OPS(lavd_set_cpumask, struct task_struct *p,
 		return;
 	}
 
+	pin_cpu = READ_ONCE(taskc->pinned_cpu_id);
+	if (pin_cpu != -ENOENT && !is_pinned(p)) {
+		struct cpu_ctx *pinc = NULL;
+
+		if (pin_cpu >= 0 && pin_cpu < LAVD_CPU_ID_MAX)
+			pinc = get_cpu_ctx_id(pin_cpu);
+
+		if (pinc)
+			__sync_fetch_and_sub(&pinc->nr_pinned_tasks, 1);
+
+		WRITE_ONCE(taskc->pinned_cpu_id, -ENOENT);
+	}
+
 	if (bpf_cpumask_weight(p->cpus_ptr) != nr_cpu_ids)
 		set_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
 	else
 		reset_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
+
 	set_on_core_type(taskc, cpumask);
 }
 
@@ -1177,6 +1214,9 @@ void BPF_STRUCT_OPS(lavd_cpu_acquire, s32 cpu,
 {
 	struct cpu_ctx *cpuc;
 	u64 dur, scaled_dur;
+
+	if (cpu < 0 || cpu >= LAVD_CPU_ID_MAX)
+		return;
 
 	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
@@ -1195,6 +1235,9 @@ void BPF_STRUCT_OPS(lavd_cpu_release, s32 cpu,
 {
 	struct cpu_ctx *cpuc;
 
+	if (cpu < 0 || cpu >= LAVD_CPU_ID_MAX)
+		return;
+
 	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
 		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
@@ -1211,6 +1254,9 @@ void BPF_STRUCT_OPS(lavd_cpu_release, s32 cpu,
 void BPF_STRUCT_OPS(lavd_enable, struct task_struct *p)
 {
 	task_ctx *taskc;
+
+	if (unlikely(!p))
+		return;
 
 	taskc = get_task_ctx(p);
 	if (!taskc) {
@@ -1239,8 +1285,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 		return -ENOMEM;
 	}
 
-	for (i = 0; i < sizeof(*taskc) && can_loop; i++)
+	bpf_for(i, 0, (int)sizeof(*taskc)) {
+		if (!can_loop)
+			break;
 		((char __arena *)taskc)[i] = 0;
+	}
 
 	bpf_rcu_read_lock();
 	if (bpf_cpumask_weight(p->cpus_ptr) != nr_cpu_ids)
@@ -1277,7 +1326,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 s32 BPF_STRUCT_OPS(lavd_exit_task, struct task_struct *p,
 		   struct scx_exit_task_args *args)
 {
-	scx_task_free(p);
+	if (likely(p))
+		scx_task_free(p);
 	return 0;
 }
 
@@ -1285,8 +1335,9 @@ static s32 init_cpdoms(u64 now)
 {
 	struct cpdom_ctx *cpdomc;
 	int err;
+	int i;
 
-	for (int i = 0; i < LAVD_CPDOM_MAX_NR; i++) {
+	bpf_for(i, 0, LAVD_CPDOM_MAX_NR) {
 		cpdomc = MEMBER_VPTR(cpdom_ctxs, [i]);
 		if (!cpdomc) {
 			scx_bpf_error("Failed to lookup cpdom_ctx for %d", i);
@@ -1314,6 +1365,10 @@ static s32 init_cpdoms(u64 now)
 static int calloc_cpumask(struct bpf_cpumask **p_cpumask)
 {
 	struct bpf_cpumask *cpumask;
+
+	if (unlikely(!p_cpumask))
+		return -EINVAL;
+
 	cpumask = bpf_cpumask_create();
 	if (!cpumask)
 		return -ENOMEM;
@@ -1460,6 +1515,12 @@ static s32 init_per_cpu_ctx(u64 now)
 		if (cpuc->capacity < one_little_capacity)
 			one_little_capacity = cpuc->capacity;
 	}
+
+	if (sum_capacity == 0) {
+		err = -EINVAL;
+		goto unlock_out;
+	}
+
 	default_big_core_scale = (big_capacity << LAVD_SHIFT) / sum_capacity;
 	total_capacity = sum_capacity;
 
@@ -1478,12 +1539,15 @@ static s32 init_per_cpu_ctx(u64 now)
 			continue;
 
 		bpf_for(i, 0, LAVD_CPU_ID_MAX / 64) {
-			u64 cpumask = cpdomc->__cpumask[i];
+			u64 cpumask_val = cpdomc->__cpumask[i];
+
 			bpf_for(k, 0, 64) {
-				j = cpumask_next_set_bit(&cpumask);
+				j = cpumask_next_set_bit(&cpumask_val);
 				if (j < 0)
 					break;
 				cpu = (i * 64) + j;
+				if (cpu >= LAVD_CPU_ID_MAX || (u32)cpu >= nr_cpu_ids)
+					continue;
 				cpuc = get_cpu_ctx_id(cpu);
 				if (!cpuc) {
 					scx_bpf_error("Failed to lookup cpu_ctx: %d", cpu);
@@ -1504,6 +1568,8 @@ static s32 init_per_cpu_ctx(u64 now)
 	}
 
 	bpf_for(cpu, 0, nr_cpu_ids) {
+		if (cpu >= LAVD_CPU_ID_MAX)
+			break;
 		cpuc = get_cpu_ctx_id(cpu);
 		if (!cpuc) {
 			scx_bpf_error("Failed to lookup cpu_ctx: %d", cpu);
@@ -1529,10 +1595,18 @@ static int init_per_cpu_dsqs(void)
 	int cpu, err = 0;
 
 	bpf_for(cpu, 0, nr_cpu_ids) {
+		if (cpu >= LAVD_CPU_ID_MAX)
+			break;
+
 		cpuc = get_cpu_ctx_id(cpu);
 		if (!cpuc) {
 			scx_bpf_error("Failed to lookup cpu_ctx: %d", cpu);
 			return -ESRCH;
+		}
+
+		if (cpuc->cpdom_id >= LAVD_CPDOM_MAX_NR) {
+			scx_bpf_error("Invalid cpdom_id %hhu for cpu %d", cpuc->cpdom_id, cpu);
+			return -EINVAL;
 		}
 
 		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
@@ -1562,6 +1636,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_cgroup_init, struct cgroup *cgrp,
 	if (!enable_cpu_bw)
 		return 0;
 
+	if (unlikely(!cgrp))
+		return -EINVAL;
+
 	ret = scx_cgroup_bw_init(cgrp, args);
 	if (ret)
 		scx_bpf_error("Failed to init a cgroup: %d", ret);
@@ -1575,6 +1652,9 @@ void BPF_STRUCT_OPS(lavd_cgroup_exit, struct cgroup *cgrp)
 	if (!enable_cpu_bw)
 		return;
 
+	if (unlikely(!cgrp))
+		return;
+
 	ret = scx_cgroup_bw_exit(cgrp);
 	if (ret)
 		scx_bpf_error("Failed to exit a cgroup: %d", ret);
@@ -1584,6 +1664,9 @@ void BPF_STRUCT_OPS(lavd_cgroup_move, struct task_struct *p,
 		    struct cgroup *from, struct cgroup *to)
 {
 	task_ctx *taskc;
+
+	if (unlikely(!p))
+		return;
 
 	taskc = get_task_ctx(p);
 	if (!taskc) {
@@ -1605,6 +1688,9 @@ void BPF_STRUCT_OPS(lavd_cgroup_set_bandwidth, struct cgroup *cgrp,
 	if (!enable_cpu_bw)
 		return;
 
+	if (unlikely(!cgrp))
+		return;
+
 	ret = scx_cgroup_bw_set(cgrp, period_us, quota_us, burst_us);
 	if (ret)
 		scx_bpf_error("Failed to set bandwidth of a cgroup: %d", ret);
@@ -1616,6 +1702,9 @@ int lavd_enqueue_cb(u64 ctx)
 	struct task_struct *p;
 
 	if (!enable_cpu_bw)
+		return 0;
+
+	if (unlikely(!taskc))
 		return 0;
 
 	if ((p = bpf_task_from_pid(taskc->pid))) {
