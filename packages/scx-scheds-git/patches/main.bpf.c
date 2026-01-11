@@ -53,16 +53,20 @@ static __always_inline u64 calc_avg_smooth(u64 old_val, u64 new_val)
 	if (new_val > old_val) {
 		delta = new_val - old_val;
 		step = delta >> LAVD_SMOOTH_SHIFT_UP;
-		if (step == 0)
-			step = 1;
+
+		/* Ensure forward progress without a hard-to-predict branch. */
+		step |= (u64)(step == 0);
+
 		result = old_val + step;
 		return result > new_val ? new_val : result;
 	}
 
 	delta = old_val - new_val;
 	step = delta >> LAVD_SMOOTH_SHIFT_DOWN;
-	if (step == 0)
-		step = 1;
+
+	/* Ensure forward progress without a hard-to-predict branch. */
+	step |= (u64)(step == 0);
+
 	result = old_val - step;
 	return result < new_val ? new_val : result;
 }
@@ -438,35 +442,37 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 	};
 	struct cpu_ctx *cpuc_prev = NULL;
 	struct cpu_ctx *cpuc_new = NULL;
+	task_ctx *taskc;
+	struct cpu_ctx *cpuc_cur;
 	bool found_idle = false;
 	s32 cpu_id = -ENOENT;
 
 	if (unlikely(!p))
 		return prev_cpu;
 
-	prefetch_task_hot(get_task_ctx(p));
-
-	ictx.taskc = get_task_ctx(p);
-	ictx.cpuc_cur = get_cpu_ctx();
-
-	if (unlikely(!ictx.taskc || !ictx.cpuc_cur))
+	/* Avoid duplicate lookups; keep hot pointers in locals. */
+	taskc = get_task_ctx(p);
+	cpuc_cur = get_cpu_ctx();
+	if (unlikely(!taskc || !cpuc_cur))
 		return prev_cpu;
 
-	prefetch_cpu_hot(ictx.cpuc_cur);
+	ictx.taskc = taskc;
+	ictx.cpuc_cur = cpuc_cur;
+
+	prefetch_task_hot(taskc);
 
 	if (wake_flags & SCX_WAKE_SYNC)
-		set_task_flag(ictx.taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
+		set_task_flag(taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
 	else
-		reset_task_flag(ictx.taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
+		reset_task_flag(taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
 
-	/* Early exit for sync wakeups on prev_cpu - common in game loops */
 	if (prev_cpu >= 0 && (u32)prev_cpu < nr_cpu_ids &&
 	    prev_cpu < LAVD_CPU_ID_MAX) {
 		cpuc_prev = get_cpu_ctx_id(prev_cpu);
 		if (cpuc_prev && cpuc_prev->is_online &&
 		    READ_ONCE(cpuc_prev->idle_start_clk) != 0) {
 			u64 now = scx_bpf_now();
-			u64 last_stop = READ_ONCE(ictx.taskc->last_stopping_clk);
+			u64 last_stop = READ_ONCE(taskc->last_stopping_clk);
 
 			if (time_delta(now, last_stop) < LAVD_SLICE_MAX_NS_DFL) {
 				cpu_id = prev_cpu;
@@ -489,8 +495,9 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 apply_policy:
 	if (have_little_core && cpu_id >= 0 && (u32)cpu_id < nr_cpu_ids &&
 	    cpuc_prev && cpuc_prev->big_core) {
-		bool is_perf_sens = ictx.taskc->perf_cri >
+		bool is_perf_sens = taskc->perf_cri >
 				    READ_ONCE(sys_stat.avg_perf_cri);
+
 		if (is_perf_sens) {
 			cpuc_new = get_cpu_ctx_id(cpu_id);
 			if (cpuc_new && !cpuc_new->big_core &&
@@ -501,12 +508,12 @@ apply_policy:
 		}
 	}
 
-	ictx.taskc->suggested_cpu_id = cpu_id;
+	taskc->suggested_cpu_id = cpu_id;
 
 	if (found_idle) {
 		struct cpu_ctx *cpuc;
 
-		set_task_flag(ictx.taskc, LAVD_FLAG_IDLE_CPU_PICKED);
+		set_task_flag(taskc, LAVD_FLAG_IDLE_CPU_PICKED);
 
 		if (cpu_id < 0 || cpu_id >= LAVD_CPU_ID_MAX)
 			goto out;
@@ -518,13 +525,13 @@ apply_policy:
 		}
 
 		if (likely(!nr_queued_on_cpu(cpuc))) {
-			p->scx.dsq_vtime = calc_when_to_run(p, ictx.taskc);
+			p->scx.dsq_vtime = calc_when_to_run(p, taskc);
 			p->scx.slice = LAVD_SLICE_MAX_NS_DFL;
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, p->scx.slice, 0);
 			goto out;
 		}
 	} else {
-		reset_task_flag(ictx.taskc, LAVD_FLAG_IDLE_CPU_PICKED);
+		reset_task_flag(taskc, LAVD_FLAG_IDLE_CPU_PICKED);
 	}
 
 out:
