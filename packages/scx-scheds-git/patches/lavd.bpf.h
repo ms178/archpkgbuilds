@@ -494,7 +494,6 @@ u64 get_target_dsq_id(struct task_struct *p, struct cpu_ctx *cpuc);
 
 extern struct bpf_cpumask __kptr *turbo_cpumask;
 extern struct bpf_cpumask __kptr *big_cpumask;
-extern struct bpf_cpumask __kptr *little_cpumask;
 extern struct bpf_cpumask __kptr *active_cpumask;
 extern struct bpf_cpumask __kptr *ovrflw_cpumask;
 

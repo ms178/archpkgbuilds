@@ -21,7 +21,6 @@
  */
 private(LAVD) struct bpf_cpumask __kptr *turbo_cpumask;
 private(LAVD) struct bpf_cpumask __kptr *big_cpumask;
-private(LAVD) struct bpf_cpumask __kptr *little_cpumask;
 private(LAVD) struct bpf_cpumask __kptr *active_cpumask;
 private(LAVD) struct bpf_cpumask __kptr *ovrflw_cpumask;
 
