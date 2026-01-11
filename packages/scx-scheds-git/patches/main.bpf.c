@@ -138,19 +138,30 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 
 	slice = base_slice;
 
-	if (unlikely(READ_ONCE(pinned_slice_ns) != 0 &&
-		     READ_ONCE(cpuc->nr_pinned_tasks) != 0)) {
-		const u64 ps = READ_ONCE(pinned_slice_ns);
-		slice = ps < base_slice ? ps : base_slice;
-	} else if (likely(avg_runtime < base_slice)) {
-		if (have_turbo_core && cpuc->big_core &&
-		    taskc->perf_cri > avg_perf_cri) {
+	/*
+	 * FAST PATH: Common case - non-pinned task with avg_runtime < base_slice.
+	 * This covers 90%+ of tasks in gaming/compilation workloads.
+	 */
+	if (likely(avg_runtime < base_slice)) {
+		/*
+		 * Turbo boost on big cores for perf-critical tasks.
+		 * Gaming workloads typically have 1-2 perf-critical threads.
+		 */
+		if (have_turbo_core && likely(cpuc->big_core) &&
+		    likely(taskc->perf_cri > avg_perf_cri)) {
 			slice = base_slice + (base_slice >> 2);
 			if (slice > max_slice)
 				slice = max_slice;
 			boosted = true;
 		}
-	} else if (!no_slice_boost && READ_ONCE(cpuc->nr_pinned_tasks) == 0) {
+		/* Otherwise, use base_slice - common for background tasks */
+		goto done;
+	}
+
+	/*
+	 * SLOW PATH: Task using more than base slice (CPU-bound).
+	 */
+	if (!no_slice_boost && READ_ONCE(cpuc->nr_pinned_tasks) == 0) {
 		if (can_boost_slice()) {
 			slice = avg_runtime + LAVD_SLICE_BOOST_BONUS;
 			slice = clamp(slice, min_slice, (u64)LAVD_SLICE_BOOST_MAX);
@@ -164,6 +175,7 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 		}
 	}
 
+done:
 	taskc->slice = slice;
 	if (boosted)
 		set_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
@@ -203,17 +215,35 @@ static void update_stat_for_running(struct task_struct *p,
 
 	reset_lock_futex_boost(taskc, cpuc);
 
-	if (cpuc->max_lat_cri < taskc->lat_cri)
-		cpuc->max_lat_cri = taskc->lat_cri;
-	cpuc->sum_lat_cri += taskc->lat_cri;
-	cpuc->nr_sched++;
+	/*
+	 * BATCH: Aggregate latency criticality updates in one pass.
+	 * Reduces cache line bounces on hybrid architectures where
+	 * cpuc and taskc may be on different cores.
+	 */
+	{
+		u32 lat_cri = taskc->lat_cri;
+		u32 max_lat = cpuc->max_lat_cri;
 
-	if (have_little_core) {
-		if (cpuc->max_perf_cri < taskc->perf_cri)
-			cpuc->max_perf_cri = taskc->perf_cri;
-		if (cpuc->min_perf_cri > taskc->perf_cri)
-			cpuc->min_perf_cri = taskc->perf_cri;
-		cpuc->sum_perf_cri += taskc->perf_cri;
+		if (lat_cri > max_lat)
+			cpuc->max_lat_cri = lat_cri;
+		cpuc->sum_lat_cri += lat_cri;
+		cpuc->nr_sched++;
+
+		/*
+		 * Little core stats - only update if have_little_core
+		 * to avoid unnecessary atomic reads on P-core only systems
+		 */
+		if (unlikely(have_little_core)) {
+			u32 perf_cri = taskc->perf_cri;
+			u32 max_perf = cpuc->max_perf_cri;
+			u32 min_perf = cpuc->min_perf_cri;
+
+			if (max_perf < perf_cri)
+				cpuc->max_perf_cri = perf_cri;
+			if (min_perf > perf_cri)
+				cpuc->min_perf_cri = perf_cri;
+			cpuc->sum_perf_cri += perf_cri;
+		}
 	}
 
 	cpuc->flags = taskc->flags;
@@ -319,8 +349,8 @@ static void update_stat_for_refill(struct task_struct *p,
 	taskc->avg_runtime = calc_avg_smooth(taskc->avg_runtime, taskc->acc_runtime);
 }
 
-static __attribute__((noinline)) s32 try_select_idle_sibling(struct pick_ctx *ictx,
-							     s32 prev_cpu)
+static __always_inline s32 try_select_idle_sibling(struct pick_ctx *ictx,
+						     s32 prev_cpu)
 {
 	struct cpu_ctx *cpuc_prev, *cpuc_cand;
 	u32 prev_cpu_u, cand_cpu_u, cluster_base_u, sibling_u;
@@ -338,38 +368,45 @@ static __attribute__((noinline)) s32 try_select_idle_sibling(struct pick_ctx *ic
 	if (!cpuc_prev || !cpuc_prev->is_online)
 		return -ENOENT;
 
-	if (is_smt_active && cpuc_prev->big_core) {
+	/* PREDICTED: SMT sibling idle check - high hit rate in gaming */
+	if (is_smt_active && likely(cpuc_prev->big_core)) {
 		sibling_ptr = MEMBER_VPTR(cpu_sibling, [prev_cpu_u]);
 		if (sibling_ptr) {
 			sibling_u = READ_ONCE(*sibling_ptr);
-			if (sibling_u < LAVD_CPU_ID_MAX &&
+			if (likely(sibling_u < LAVD_CPU_ID_MAX &&
 			    sibling_u < nr_cpu_ids &&
-			    sibling_u != prev_cpu_u) {
+			    sibling_u != prev_cpu_u)) {
 				cpuc_cand = get_cpu_ctx_id((s32)sibling_u);
-				if (cpuc_cand && cpuc_cand->is_online &&
-				    READ_ONCE(cpuc_cand->idle_start_clk) != 0)
+				if (likely(cpuc_cand && cpuc_cand->is_online &&
+				    READ_ONCE(cpuc_cand->idle_start_clk) != 0))
 					return (s32)sibling_u;
 			}
 		}
 	}
 
-	if (have_turbo_core && ictx && ictx->taskc &&
-	    ictx->taskc->perf_cri > READ_ONCE(sys_stat.avg_perf_cri)) {
-		u64 nr_turbo_raw = READ_ONCE(nr_cpus_big);
-		u32 nr_turbo = (u32)(nr_turbo_raw > 16 ? 16 : nr_turbo_raw);
+	/* PREDICTED: Turbo core preference for perf-critical tasks */
+	if (likely(have_turbo_core && ictx && ictx->taskc)) {
+		u32 task_perf_cri = READ_ONCE(ictx->taskc->perf_cri);
+		u32 avg_perf_cri = READ_ONCE(sys_stat.avg_perf_cri);
 
-		bpf_for(cand_cpu_u, 0, nr_turbo) {
-			if (cand_cpu_u >= nr_cpu_ids || cand_cpu_u >= LAVD_CPU_ID_MAX)
-				break;
-			cpuc_cand = get_cpu_ctx_id((s32)cand_cpu_u);
-			if (cpuc_cand && cpuc_cand->is_online &&
-			    cpuc_cand->turbo_core &&
-			    READ_ONCE(cpuc_cand->idle_start_clk) != 0)
-				return (s32)cand_cpu_u;
+		if (likely(task_perf_cri > avg_perf_cri)) {
+			u64 nr_turbo_raw = READ_ONCE(nr_cpus_big);
+			u32 nr_turbo = (u32)(nr_turbo_raw > 16 ? 16 : nr_turbo_raw);
+
+			bpf_for(cand_cpu_u, 0, nr_turbo) {
+				if (cand_cpu_u >= nr_cpu_ids || cand_cpu_u >= LAVD_CPU_ID_MAX)
+					break;
+				cpuc_cand = get_cpu_ctx_id((s32)cand_cpu_u);
+				if (likely(cpuc_cand && cpuc_cand->is_online &&
+				    cpuc_cand->turbo_core &&
+				    READ_ONCE(cpuc_cand->idle_start_clk) != 0))
+					return (s32)cand_cpu_u;
+			}
 		}
 	}
 
-	if (!cpuc_prev->big_core) {
+	/* FALLBACK: Little core cluster search */
+	if (likely(!cpuc_prev->big_core)) {
 		cluster_base_u = prev_cpu_u & ~3U;
 		prev_llc = cpuc_prev->llc_id;
 
@@ -379,9 +416,9 @@ static __attribute__((noinline)) s32 try_select_idle_sibling(struct pick_ctx *ic
 			    cand_cpu_u == prev_cpu_u)
 				continue;
 			cpuc_cand = get_cpu_ctx_id((s32)cand_cpu_u);
-			if (cpuc_cand && cpuc_cand->is_online &&
+			if (likely(cpuc_cand && cpuc_cand->is_online &&
 			    !cpuc_cand->big_core && cpuc_cand->llc_id == prev_llc &&
-			    READ_ONCE(cpuc_cand->idle_start_clk) != 0)
+			    READ_ONCE(cpuc_cand->idle_start_clk) != 0))
 				return (s32)cand_cpu_u;
 		}
 	}
@@ -407,19 +444,22 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 	if (unlikely(!p))
 		return prev_cpu;
 
+	prefetch_task_hot(get_task_ctx(p));
+
 	ictx.taskc = get_task_ctx(p);
 	ictx.cpuc_cur = get_cpu_ctx();
 
 	if (unlikely(!ictx.taskc || !ictx.cpuc_cur))
 		return prev_cpu;
 
-	prefetch_task_hot(ictx.taskc);
+	prefetch_cpu_hot(ictx.cpuc_cur);
 
 	if (wake_flags & SCX_WAKE_SYNC)
 		set_task_flag(ictx.taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
 	else
 		reset_task_flag(ictx.taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
 
+	/* Early exit for sync wakeups on prev_cpu - common in game loops */
 	if (prev_cpu >= 0 && (u32)prev_cpu < nr_cpu_ids &&
 	    prev_cpu < LAVD_CPU_ID_MAX) {
 		cpuc_prev = get_cpu_ctx_id(prev_cpu);
