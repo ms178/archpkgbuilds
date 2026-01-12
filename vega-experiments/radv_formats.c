@@ -674,8 +674,8 @@ radv_get_modifier_flags(struct radv_physical_device *pdev, VkFormat format, uint
    features &= ~VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
 
    if (ac_modifier_has_dcc(modifier)) {
-      /* We don't enable DCC for multi-planar formats. */
-      if (vk_format_get_plane_count(format) > 1)
+      /* We don't enable DCC for multi-planar formats before GFX12 */
+      if (pdev->info.gfx_level < GFX12 && vk_format_get_plane_count(format) > 1)
          return 0;
 
       /* Only disable support for STORAGE_IMAGE on modifiers that
