@@ -1312,6 +1312,7 @@ schedule_program(Program* program)
    for (Block& block : program->blocks)
       demand.update(block.register_demand);
    demand.vgpr += program->config->num_shared_vgprs / 2;
+   demand.update(program->fixed_reg_demand);
 
    sched_ctx ctx;
    ctx.gfx_level = program->gfx_level;
@@ -1353,6 +1354,7 @@ schedule_program(Program* program)
    for (Block& block : program->blocks) {
       new_demand.update(block.register_demand);
    }
+   new_demand.update(program->fixed_reg_demand);
    assert(!new_demand.exceeds(ctx.mv.max_registers) ||
           !new_demand.exceeds(program->max_reg_demand));
    update_vgpr_sgpr_demand(program, new_demand);
