@@ -8,6 +8,7 @@
 #include "aco_builder.h"
 #include "aco_instruction_selection.h"
 #include "aco_ir.h"
+#include "aco_nir_call_attribs.h"
 
 #include "amdgfxregs.h"
 #include <array>
@@ -789,6 +790,141 @@ visit_jump(isel_context* ctx, nir_jump_instr* instr)
 }
 
 void
+visit_call(isel_context* ctx, nir_call_instr* instr)
+{
+   Builder bld(ctx->program, ctx->block);
+
+   ABI abi;
+   /* TODO: callable abi? */
+   switch (instr->callee->driver_attributes & ACO_NIR_FUNCTION_ATTRIB_ABI_MASK) {
+   case ACO_NIR_CALL_ABI_RT_RECURSIVE: abi = rtRaygenABI; break;
+   case ACO_NIR_CALL_ABI_TRAVERSAL: abi = rtTraversalABI; break;
+   case ACO_NIR_CALL_ABI_AHIT_ISEC: abi = rtAnyHitABI; break;
+   default: UNREACHABLE("invalid abi");
+   }
+
+   RegisterDemand limit = get_addr_regs_from_waves(ctx->program, ctx->program->min_waves);
+
+   struct callee_info info =
+      get_callee_info(ctx->program->gfx_level, abi, instr->callee->num_params,
+                      instr->callee->params, nullptr, limit);
+   std::vector<parameter_info> return_infos;
+
+   /* Before setting up the call itself, set up parameters stored in scratch memory.
+    * The stack layout during a call looks something like this:
+    * -------------------------------------------------------------------
+    * | caller stack area | callee's scratch params | callee stack area
+    * -------------------------------------------------------------------
+    * ^ caller's stack ptr                          ^ callee's stack ptr
+    *
+    * Since we don't know how big our own stack area is yet (spilling and register preservation may
+    * add to the stack size), we query the callee's stack pointer using p_callee_stack_ptr and use
+    * negative offsets to index into the scratch parameter area (similar to how the callee will load
+    * the parameters as well).
+    */
+
+   Temp stack_ptr, param_stack_ptr;
+   if (info.stack_ptr.is_reg && ctx->program->gfx_level >= GFX9) {
+      param_stack_ptr = bld.pseudo(aco_opcode::p_callee_stack_ptr, bld.def(s1), bld.def(s1, scc),
+                                   Operand::c32(info.scratch_param_size),
+                                   Operand(ctx->callee_info.stack_ptr.def.getTemp()));
+      stack_ptr = ctx->callee_info.stack_ptr.def.getTemp();
+   } else {
+      param_stack_ptr = bld.pseudo(aco_opcode::p_callee_stack_ptr, bld.def(s1),
+                                   Operand::c32(info.scratch_param_size));
+      stack_ptr = bld.pseudo(aco_opcode::p_parallelcopy, bld.def(s1), Operand::c32(0));
+   }
+
+   for (unsigned i = 0; i < info.param_infos.size(); ++i) {
+      if (info.param_infos[i].is_reg)
+         continue;
+
+      store_scratch_param(ctx, bld, info.param_infos[i], param_stack_ptr, info.scratch_param_size,
+                          get_ssa_temp(ctx, instr->params[i].ssa));
+   }
+
+   unsigned extra_def_count = 1;
+   unsigned extra_param_count = 2;
+
+   unsigned param_size = info.scratch_param_size;
+   if (ctx->program->gfx_level < GFX9)
+      param_size *= ctx->program->wave_size;
+
+   assert(info.param_infos[0].is_reg);
+   Instruction* call_instr = create_instruction(aco_opcode::p_call, Format::PSEUDO_CALL,
+                                                info.reg_param_count + extra_param_count,
+                                                info.reg_discardable_param_count + extra_def_count);
+   call_instr->call().abi = abi;
+   if (ctx->program->gfx_level >= GFX9) {
+      call_instr->operands[0] = Operand(stack_ptr, info.stack_ptr.def.physReg());
+   } else {
+      call_instr->operands[0] = Operand(load_scratch_resource(ctx->program, bld, -1u, false));
+      call_instr->operands[0].setPrecolored(info.stack_ptr.def.physReg());
+   }
+
+   call_instr->operands[1] = Operand::c32(param_size);
+   call_instr->definitions[0] = Definition(bld.tmp(s2), info.return_address.def.physReg());
+
+   /* Set up parameters stored in registers. Every parameter corresponds to an operand,
+    * and parameters that may have their value clobbered (i.e. discardable and return params)
+    * also have a definition.
+    */
+   unsigned reg_param_idx = 0;
+   unsigned reg_discardable_param_idx = 0;
+   for (unsigned i = 0; i < info.param_infos.size(); ++i) {
+      if (!info.param_infos[i].is_reg) {
+         /* While setting up parameters, also capture information about where return parameters
+          * are stored, in order to reload them later.
+          * Since return_infos stores return parameters contiguously, and return parameters in
+          * scratch may be at any position in the parameter list, we need to add information about
+          * returned scratch parameters in the same loop as returned parameters stored in registers.
+          */
+         if (instr->callee->params[i].is_return) {
+            parameter_info return_info = {};
+            return_info.is_reg = false;
+            return_info.scratch_offset = info.param_infos[i].scratch_offset;
+            return_infos.emplace_back(return_info);
+         }
+         continue;
+      }
+
+      Operand& op = call_instr->operands[reg_param_idx + extra_param_count];
+      op.setPrecolored(info.param_infos[i].def.physReg());
+
+      if (instr->callee->params[i].is_uniform)
+         op.setTemp(bld.as_uniform(get_ssa_temp(ctx, instr->params[i].ssa)));
+      else
+         op.setTemp(as_vgpr(ctx, get_ssa_temp(ctx, instr->params[i].ssa)));
+
+      if ((instr->callee->params[i].driver_attributes & ACO_NIR_PARAM_ATTRIB_DISCARDABLE) ||
+          instr->callee->params[i].is_return) {
+         Definition def = bld.def(op.regClass(), op.physReg());
+         call_instr->definitions[extra_def_count + reg_discardable_param_idx++] = def;
+         if (instr->callee->params[i].is_return) {
+            assert(!instr->callee->params[i].is_uniform);
+            parameter_info return_info = {};
+            return_info.is_reg = true;
+            return_info.def = def;
+            return_infos.emplace_back(return_info);
+         }
+      }
+
+      ++reg_param_idx;
+   }
+
+   ctx->block->instructions.emplace_back(static_cast<Instruction*>(call_instr));
+
+   ctx->call_infos.emplace_back(call_info{
+      instr,
+      call_instr,
+      std::move(return_infos),
+      info.scratch_param_size,
+   });
+   ctx->block->kind |= block_kind_contains_call;
+   ctx->program->has_call = true;
+}
+
+void
 visit_debug_info(isel_context* ctx, nir_instr_debug_info* instr_info)
 {
    ac_shader_debug_info info;
@@ -839,6 +975,7 @@ visit_block(isel_context* ctx, nir_block* block)
       case nir_instr_type_undef: visit_undef(ctx, nir_instr_as_undef(instr)); break;
       case nir_instr_type_deref: break;
       case nir_instr_type_jump: visit_jump(ctx, nir_instr_as_jump(instr)); break;
+      case nir_instr_type_call: visit_call(ctx, nir_instr_as_call(instr)); break;
       default: isel_err(instr, "Unknown NIR instr type");
       }
    }
@@ -1152,32 +1289,52 @@ merged_wave_info_to_mask(isel_context* ctx, unsigned i)
 }
 
 void
-insert_rt_jump_next(isel_context& ctx, const struct ac_shader_args* args)
+insert_return(isel_context& ctx)
 {
-   unsigned src_count = 0;
-   for (unsigned i = 0; i < ctx.args->arg_count; i++)
-      src_count += !!BITSET_TEST(ctx.output_args, i);
+   assert(ctx.callee_info.stack_ptr.needs_explicit_preservation);
+   assert(
+      ctx.callee_info.param_infos[ACO_NIR_CALL_SYSTEM_ARG_UNIFORM_PC].needs_explicit_preservation);
+   assert(
+      ctx.callee_info.param_infos[ACO_NIR_CALL_SYSTEM_ARG_DIVERGENT_PC].needs_explicit_preservation);
 
+   /* stack_ptr always needs to be explicitly preserved */
+   unsigned preserved_param_count = 1;
+   if (ctx.callee_info.return_address.needs_explicit_preservation)
+      ++preserved_param_count;
+   for (auto param_info : ctx.callee_info.param_infos) {
+      if (!param_info.is_reg || !param_info.needs_explicit_preservation)
+         continue;
+      ++preserved_param_count;
+   }
+   unsigned src_count = preserved_param_count + 1;
    Instruction* ret = create_instruction(aco_opcode::p_return, Format::PSEUDO, src_count, 0);
    ctx.block->instructions.emplace_back(ret);
 
-   src_count = 0;
-   for (unsigned i = 0; i < ctx.args->arg_count; i++) {
-      if (!BITSET_TEST(ctx.output_args, i))
+   unsigned def_idx = 0;
+   ret->operands[def_idx++] = Operand();
+
+   Operand stack_op = Operand(ctx.callee_info.stack_ptr.def.getTemp());
+   stack_op.setPrecolored(ctx.callee_info.stack_ptr.def.physReg());
+   ret->operands[def_idx++] = stack_op;
+
+   for (unsigned i = 0; i < ctx.callee_info.param_infos.size(); ++i) {
+      const auto& param_info = ctx.callee_info.param_infos[i];
+      if (!param_info.is_reg || !param_info.needs_explicit_preservation)
          continue;
-
-      enum ac_arg_regfile file = ctx.args->args[i].file;
-      unsigned size = ctx.args->args[i].size;
-      unsigned reg = ctx.args->args[i].offset + (file == AC_ARG_SGPR ? 0 : 256);
-      RegClass type = RegClass(file == AC_ARG_SGPR ? RegType::sgpr : RegType::vgpr, size);
-      Operand op = ctx.arg_temps[i].id() ? Operand(ctx.arg_temps[i], PhysReg{reg})
-                                         : Operand(PhysReg{reg}, type);
-      ret->operands[src_count] = op;
-      src_count++;
+      Temp param_temp = param_info.def.getTemp();
+      if (i == ACO_NIR_CALL_SYSTEM_ARG_DIVERGENT_PC)
+         param_temp = ctx.next_divergent_pc;
+      else if (i == ACO_NIR_CALL_SYSTEM_ARG_UNIFORM_PC)
+         param_temp = ctx.next_pc;
+      Operand op = Operand(param_temp);
+      op.setPrecolored(param_info.def.physReg());
+      ret->operands[def_idx++] = op;
    }
-
-   Builder bld(ctx.program, ctx.block);
-   bld.sop1(aco_opcode::s_setpc_b64, get_arg(&ctx, ctx.args->rt.uniform_shader_addr));
+   if (ctx.callee_info.return_address.needs_explicit_preservation) {
+      Operand op = Operand(ctx.callee_info.return_address.def.getTemp());
+      op.setPrecolored(ctx.callee_info.return_address.def.physReg());
+      ret->operands[def_idx++] = op;
+   }
 }
 
 void
@@ -1194,20 +1351,45 @@ select_program_rt(isel_context& ctx, unsigned shader_count, struct nir_shader* c
       init_context(&ctx, nir);
       setup_fp_mode(&ctx, nir);
 
-      Instruction* startpgm = add_startpgm(&ctx);
+      nir_function_impl* impl = NULL;
+      nir_foreach_function_impl (func, nir) {
+         impl = func;
+         break;
+      }
+
+      ABI abi;
+      /* TODO: callable abi? */
+      switch (impl->function->driver_attributes & ACO_NIR_FUNCTION_ATTRIB_ABI_MASK) {
+      case ACO_NIR_CALL_ABI_RT_RECURSIVE: abi = rtRaygenABI; break;
+      case ACO_NIR_CALL_ABI_TRAVERSAL: abi = rtTraversalABI; break;
+      case ACO_NIR_CALL_ABI_AHIT_ISEC: abi = rtAnyHitABI; break;
+      default: UNREACHABLE("invalid abi");
+      }
+
+      RegisterDemand limit = get_addr_regs_from_waves(ctx.program, ctx.program->min_waves);
+
+      ctx.callee_abi = abi;
+      ctx.program->callee_abi = ctx.callee_abi;
+      ctx.callee_info =
+         get_callee_info(ctx.program->gfx_level, ctx.callee_abi, impl->function->num_params,
+                         impl->function->params, ctx.program, limit);
+      ctx.program->is_callee = true;
+
+      Instruction* startpgm = add_startpgm(&ctx, true);
+
       append_logical_start(ctx.block);
       split_arguments(&ctx, startpgm);
-      visit_cf_list(&ctx, &nir_shader_get_entrypoint(nir)->body);
-      append_logical_end(&ctx);
+      visit_cf_list(&ctx, &impl->body);
+      /* This block doesn't need a p_reload_preserved, we add it manually after p_return */
+      append_logical_end(&ctx, false);
       ctx.block->kind |= block_kind_uniform;
 
-      /* Fix output registers and jump to next shader. We can skip this when dealing with a raygen
-       * shader without shader calls.
-       */
-      if (shader_count > 1 || shaders[i]->info.stage != MESA_SHADER_RAYGEN)
-         insert_rt_jump_next(ctx, args);
-      else
+      if (ctx.next_pc != Temp()) {
+         insert_return(ctx);
+         Builder(ctx.program, ctx.block).sop1(aco_opcode::s_setpc_b64, Operand(ctx.next_pc));
+      } else {
          Builder(ctx.program, ctx.block).sopp(aco_opcode::s_endpgm);
+      }
 
       cleanup_context(&ctx);
    }
