@@ -6,6 +6,7 @@
 
 #include "aco_instruction_selection.h"
 #include "aco_interface.h"
+#include "aco_nir_call_attribs.h"
 
 #include "nir_builder.h"
 #include "nir_control_flow.h"
@@ -278,8 +279,11 @@ setup_nir(isel_context* ctx, nir_shader* nir)
       nir_opt_dce(nir);
    }
 
-   nir_function_impl* func = nir_shader_get_entrypoint(nir);
-   nir_index_ssa_defs(func);
+   /* nir_shader_get_entrypoint returns NULL for RT shaders, but there should only be
+    * one impl at this stage.
+    */
+   nir_foreach_function_impl (func, nir)
+      nir_index_ssa_defs(func);
 }
 
 /*
@@ -602,6 +606,13 @@ void
 init_context(isel_context* ctx, nir_shader* shader)
 {
    nir_function_impl* impl = nir_shader_get_entrypoint(shader);
+   if (!impl) {
+     /* RT shaders have no NIR entrypoint, but only one function impl exists at this stage */
+     nir_foreach_function_impl (func, shader) {
+       impl = func;
+       break;
+     }
+   }
    ctx->shader = shader;
 
    /* Ensure wave size constraints are satisfied. */
@@ -760,7 +771,6 @@ init_context(isel_context* ctx, nir_shader* shader)
                case nir_intrinsic_load_push_constant:
                case nir_intrinsic_load_workgroup_id:
                case nir_intrinsic_load_num_workgroups:
-               case nir_intrinsic_load_sbt_base_amd:
                case nir_intrinsic_load_subgroup_id:
                case nir_intrinsic_load_num_subgroups:
                case nir_intrinsic_vote_all:
@@ -849,9 +859,16 @@ init_context(isel_context* ctx, nir_shader* shader)
                case nir_intrinsic_ddy_fine:
                case nir_intrinsic_ddx_coarse:
                case nir_intrinsic_ddy_coarse:
-                  type = RegType::vgpr;
-                  break;
-
+               case nir_intrinsic_load_return_param_amd: {
+                 type = RegType::vgpr;
+                 break;
+               }
+               case nir_intrinsic_load_param: {
+                 nir_parameter* param =
+                 &impl->function->params[nir_intrinsic_param_idx(intrinsic)];
+                 type = param->is_uniform ? RegType::sgpr : RegType::vgpr;
+                 break;
+               }
                default:
                   /* Default: VGPR if any source is VGPR. */
                   for (unsigned i = 0; i < nir_intrinsic_infos[intrinsic->intrinsic].num_srcs;
@@ -1047,7 +1064,15 @@ setup_isel_context(Program* program, unsigned shader_count, struct nir_shader* c
 
    unsigned nir_num_blocks = 0;
    for (unsigned i = 0; i < shader_count; i++) {
-      nir_num_blocks += nir_shader_get_entrypoint(shaders[i])->num_blocks;
+     nir_function_impl* entrypoint = nir_shader_get_entrypoint(shaders[i]);
+     if (!entrypoint) {
+       /* RT shaders have no NIR entrypoint, but only one function impl exists at this stage */
+       nir_foreach_function_impl (func, shaders[i]) {
+         entrypoint = func;
+         break;
+       }
+     }
+     nir_num_blocks += entrypoint->num_blocks;
    }
    ctx.program->blocks.reserve(nir_num_blocks * 2);
    ctx.block = ctx.program->create_and_insert_block();
