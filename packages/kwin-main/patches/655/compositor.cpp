@@ -48,6 +48,7 @@
 #include <optional>
 #include <ranges>
 #include <vector>
+#include <unordered_map>
 #include <cmath>
 #include <algorithm>
 
@@ -73,6 +74,86 @@ constexpr double fastGammaDecode(double x) noexcept
     if (x >= 1.0) return 1.0;
     // x^0.4545 ~ c0 + x(c1 + x(c2 + x*c3))
     return 0.0 + x * (1.0968547 + x * (-0.3578547 + x * 0.2610000));
+}
+
+using SteadyClock = std::chrono::steady_clock;
+using TimePoint = SteadyClock::time_point;
+constexpr auto kMinCursorAsyncInterval = std::chrono::nanoseconds(2'000'000);
+
+static std::unordered_map<RenderLoop *, Output *> s_loopToOutput;
+thread_local std::unordered_map<RenderLoop *, TimePoint> s_lastKmsCommit;
+thread_local bool s_inComposite = false;
+
+static inline void ensureKmsCommitMapInitialized()
+{
+    static thread_local bool initialized = false;
+    if (!initialized) {
+        s_lastKmsCommit.reserve(4);
+        initialized = true;
+    }
+}
+
+static inline void markKmsCommit(RenderLoop *loop, TimePoint now) noexcept
+{
+    s_lastKmsCommit[loop] = now;
+}
+
+static inline bool shouldThrottleCursorPresent(RenderLoop *loop, TimePoint now) noexcept
+{
+    const auto it = s_lastKmsCommit.find(loop);
+    if (it == s_lastKmsCommit.end()) {
+        return false;
+    }
+    return (now - it->second) < kMinCursorAsyncInterval;
+}
+
+struct CompositeGuard
+{
+    bool &flag;
+    bool prev;
+    explicit CompositeGuard(bool &f) noexcept
+        : flag(f)
+        , prev(f)
+    {
+        flag = true;
+    }
+    ~CompositeGuard()
+    {
+        flag = prev;
+    }
+};
+
+static OutputLayer *selectCursorLayer(std::span<OutputLayer *const> layers, int minZpos)
+{
+    OutputLayer *best = nullptr;
+    int bestRank = 3;
+    for (OutputLayer *layer : layers) {
+        if (layer->maxZpos() < minZpos) {
+            continue;
+        }
+        int rank = 3;
+        switch (layer->type()) {
+        case OutputLayerType::CursorOnly:
+            rank = 0;
+            break;
+        case OutputLayerType::EfficientOverlay:
+            rank = 1;
+            break;
+        case OutputLayerType::GenericLayer:
+            rank = 2;
+            break;
+        default:
+            continue;
+        }
+        if (!best || rank < bestRank) {
+            best = layer;
+            bestRank = rank;
+            if (rank == 0) {
+                break;
+            }
+        }
+    }
+    return best;
 }
 }
 
@@ -106,9 +187,13 @@ Compositor::~Compositor()
 
 Output *Compositor::findOutput(RenderLoop *loop) const
 {
+    if (auto it = s_loopToOutput.find(loop); it != s_loopToOutput.end()) {
+        return it->second;
+    }
     const auto &outputs = workspace()->outputs();
     for (Output *output : outputs) {
         if (output->renderLoop() == loop) {
+            s_loopToOutput[loop] = output;
             return output;
         }
     }
@@ -354,14 +439,27 @@ void Compositor::stop()
 
 static bool isTearingRequested(const Item *item)
 {
-    if (item->presentationHint() == PresentationModeHint::Async) {
-        return true;
+    static thread_local std::vector<const Item *> stack;
+    static thread_local bool initialized = false;
+    if (!initialized) {
+        stack.reserve(64);
+        initialized = true;
     }
+    stack.clear();
+    stack.push_back(item);
 
-    const auto childItems = item->childItems();
-    return std::ranges::any_of(childItems, [](const Item *childItem) {
-        return isTearingRequested(childItem);
-    });
+    while (!stack.empty()) {
+        const Item *current = stack.back();
+        stack.pop_back();
+        if (current->presentationHint() == PresentationModeHint::Async) {
+            return true;
+        }
+        const auto childItems = current->childItems();
+        for (Item *childItem : childItems) {
+            stack.push_back(childItem);
+        }
+    }
+    return false;
 }
 
 static bool checkForBlackBackground(SurfaceItem *background)
@@ -586,6 +684,9 @@ void Compositor::composite(RenderLoop *renderLoop)
 
     Output *output = findOutput(renderLoop);
     Q_ASSERT(output);
+    ensureKmsCommitMapInitialized();
+    CompositeGuard compositeGuard(s_inComposite);
+
     const auto primaryView = m_primaryViews[renderLoop].get();
     auto &overlayViewsForLoop = m_overlayViews[renderLoop];
 
@@ -694,13 +795,7 @@ void Compositor::composite(RenderLoop *renderLoop)
         && !m_brokenCursors.contains(renderLoop)
         && cursorItem->isVisible()
         && cursorItem->mapToView(cursorItem->boundingRect(), primaryView).intersects(outputGeometry)) {
-        cursorLayer = findLayer(unusedOutputLayers, OutputLayerType::CursorOnly, primaryView->layer()->zpos() + 1);
-        if (!cursorLayer) {
-            cursorLayer = findLayer(unusedOutputLayers, OutputLayerType::EfficientOverlay, primaryView->layer()->zpos() + 1);
-        }
-        if (!cursorLayer) {
-            cursorLayer = findLayer(unusedOutputLayers, OutputLayerType::GenericLayer, primaryView->layer()->zpos() + 1);
-        }
+        cursorLayer = selectCursorLayer(unusedOutputLayers, primaryView->layer()->zpos() + 1);
         if (cursorLayer) {
             auto &view = overlayViewsForLoop[cursorLayer];
             if (!view || view->item() != cursorItem) {
@@ -717,6 +812,11 @@ void Compositor::composite(RenderLoop *renderLoop)
                         || cursorView->needsRepaint()) {
                         return;
                     }
+                    ensureKmsCommitMapInitialized();
+                    const auto now = SteadyClock::now();
+                    if (s_inComposite || shouldThrottleCursorPresent(renderLoop, now)) {
+                        return;
+                    }
                     std::optional<std::chrono::nanoseconds> maxVrrCursorDelay;
                     if (output->renderLoop()->activeWindowControlsVrrRefreshRate()) {
                         const auto effectiveMinRate = output->minVrrRefreshRateHz().transform([](uint32_t value) {
@@ -730,6 +830,10 @@ void Compositor::composite(RenderLoop *renderLoop)
                     outputLayer->setEnabled(true);
                     if (output->presentAsync(outputLayer, maxVrrCursorDelay)) {
                         outputLayer->resetRepaints();
+                        markKmsCommit(renderLoop, now);
+                    } else {
+                        markKmsCommit(renderLoop, now);
+                        outputLayer->scheduleRepaint(nullptr);
                     }
                 });
             }
@@ -787,7 +891,6 @@ void Compositor::composite(RenderLoop *renderLoop)
     }
 
     for (OutputLayer *layer : unusedOutputLayers) {
-        overlayViewsForLoop.erase(layer);
         layer->setEnabled(false);
         toUpdate.push_back(layer);
     }
@@ -866,44 +969,58 @@ void Compositor::composite(RenderLoop *renderLoop)
 
     totalTimeQuery->end();
     frame->addRenderTimeQuery(std::move(totalTimeQuery));
-    if (result && !output->present(toUpdate, frame)) {
-        result = false;
 
-        bool anyDisabled = false;
-        for (const auto &layer : layers) {
-            if (layer.view->layer()->type() != OutputLayerType::Primary
-                && layer.view->layer()->isEnabled()
-                && layer.directScanout) {
-                layer.view->layer()->setEnabled(false);
-                layer.view->setExclusive(false);
-                anyDisabled = true;
-            }
-        }
+    bool presented = false;
+    if (result) {
+        if (output->present(toUpdate, frame)) {
+            presented = true;
+        } else {
+            result = false;
 
-        auto &primary = layers.front();
-        if (primary.directScanout || anyDisabled) {
-            if (prepareRendering(primary.view, output, primary.requiredAlphaBits, outputGeometry, outputScale, outputTransform, outputPixelSize)
-                && renderLayer(primary.view, output, frame, primary.surfaceDamage)) {
-                result = output->present(toUpdate, frame);
-            } else {
-                qCWarning(KWIN_CORE, "Rendering the primary layer failed!");
-            }
-        }
-
-        if (!result && layers.size() == 2 && layers[1].view->layer()->isEnabled()) {
-            layers[1].view->layer()->setEnabled(false);
-            layers[1].view->setExclusive(false);
-            if (prepareRendering(primary.view, output, primary.requiredAlphaBits, outputGeometry, outputScale, outputTransform, outputPixelSize)
-                && renderLayer(primary.view, output, frame, infiniteRegion())) {
-                result = output->present(toUpdate, frame);
-                if (result) {
-                    qCWarning(KWIN_CORE, "Disabling hardware cursor because of presentation failure");
-                    m_brokenCursors.insert(renderLoop);
+            bool anyDisabled = false;
+            for (const auto &layer : layers) {
+                if (layer.view->layer()->type() != OutputLayerType::Primary
+                    && layer.view->layer()->isEnabled()
+                    && layer.directScanout) {
+                    layer.view->layer()->setEnabled(false);
+                    layer.view->setExclusive(false);
+                    anyDisabled = true;
                 }
-            } else {
-                qCWarning(KWIN_CORE, "Rendering the primary layer failed!");
+            }
+
+            auto &primary = layers.front();
+            if (primary.directScanout || anyDisabled) {
+                if (prepareRendering(primary.view, output, primary.requiredAlphaBits, outputGeometry, outputScale, outputTransform, outputPixelSize)
+                    && renderLayer(primary.view, output, frame, primary.surfaceDamage)) {
+                    result = output->present(toUpdate, frame);
+                    if (result) {
+                        presented = true;
+                    }
+                } else {
+                    qCWarning(KWIN_CORE, "Rendering the primary layer failed!");
+                }
+            }
+
+            if (!result && layers.size() == 2 && layers[1].view->layer()->isEnabled()) {
+                layers[1].view->layer()->setEnabled(false);
+                layers[1].view->setExclusive(false);
+                if (prepareRendering(primary.view, output, primary.requiredAlphaBits, outputGeometry, outputScale, outputTransform, outputPixelSize)
+                    && renderLayer(primary.view, output, frame, infiniteRegion())) {
+                    result = output->present(toUpdate, frame);
+                    if (result) {
+                        presented = true;
+                        qCWarning(KWIN_CORE, "Disabling hardware cursor because of presentation failure");
+                        m_brokenCursors.insert(renderLoop);
+                    }
+                } else {
+                    qCWarning(KWIN_CORE, "Rendering the primary layer failed!");
+                }
             }
         }
+    }
+
+    if (presented) {
+        markKmsCommit(renderLoop, SteadyClock::now());
     }
 
     for (auto &layer : layers) {
@@ -935,6 +1052,7 @@ void Compositor::addOutput(Output *output)
     if (output->isPlaceholder()) {
         return;
     }
+    s_loopToOutput[output->renderLoop()] = output;
     assignOutputLayers(output);
     connect(output->renderLoop(), &RenderLoop::frameRequested, this, &Compositor::handleFrameRequested);
     connect(output, &Output::outputLayersChanged, this, [this, output]() {
@@ -947,6 +1065,7 @@ void Compositor::removeOutput(Output *output)
     if (output->isPlaceholder()) {
         return;
     }
+    s_loopToOutput.erase(output->renderLoop());
     disconnect(output->renderLoop(), &RenderLoop::frameRequested, this, &Compositor::handleFrameRequested);
     disconnect(output, &Output::outputLayersChanged, this, nullptr);
     m_overlayViews.erase(output->renderLoop());
