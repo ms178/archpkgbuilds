@@ -354,6 +354,60 @@ tls_get_out(void)
 /* -----------------------------------------------------------------------------
  * Queue initialization
  * ---------------------------------------------------------------------------*/
+struct driver_keys_blob_pack {
+   struct mesa_sha1 ctx_template;
+   uint8_t data[];
+};
+
+static inline struct driver_keys_blob_pack *
+driver_keys_blob_pack_from_blob(uint8_t *blob_mem)
+{
+   assert(blob_mem != NULL);
+   return (struct driver_keys_blob_pack *)(blob_mem -
+                                           offsetof(struct driver_keys_blob_pack, data));
+}
+
+static inline const struct driver_keys_blob_pack *
+driver_keys_blob_pack_from_blob_const(const uint8_t *blob_mem)
+{
+   assert(blob_mem != NULL);
+   return (const struct driver_keys_blob_pack *)(blob_mem -
+                                                 offsetof(struct driver_keys_blob_pack, data));
+}
+
+static int
+disk_cache_detect_logical_cores(void)
+{
+   static int cached = 0;
+   int val = p_atomic_read_relaxed(&cached);
+   if (val > 0) {
+      return val;
+   }
+
+   int detected = 4;
+#if defined(_SC_NPROCESSORS_ONLN)
+   long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+   if (nprocs > 0 && nprocs < INT_MAX) {
+      detected = (int)nprocs;
+   }
+#elif defined(_WIN32)
+   SYSTEM_INFO sysinfo;
+   GetSystemInfo(&sysinfo);
+   if ((int)sysinfo.dwNumberOfProcessors > 0) {
+      detected = (int)sysinfo.dwNumberOfProcessors;
+   }
+#endif
+   if (detected <= 0) {
+      detected = 4;
+   }
+
+   if (p_atomic_cmpxchg(&cached, 0, detected) == 0) {
+      return detected;
+   }
+
+   return p_atomic_read_relaxed(&cached);
+}
+
 static bool
 disk_cache_init_queue(struct disk_cache *cache)
 {
@@ -361,30 +415,21 @@ disk_cache_init_queue(struct disk_cache *cache)
       return true;
    }
 
-   int logical = 4;
-#if defined(_SC_NPROCESSORS_ONLN)
-   long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
-   if (nprocs > 0 && nprocs < INT_MAX) {
-      logical = (int)nprocs;
-   }
-#elif defined(_WIN32)
-   SYSTEM_INFO sysinfo;
-   GetSystemInfo(&sysinfo);
-   logical = (int)sysinfo.dwNumberOfProcessors;
-   if (logical > 128) {
-      logical = 128;
-   }
-#endif
+   const int logical = disk_cache_detect_logical_cores();
 
-   int threads = (logical * 3 + 1) / 4;
-   if (threads < 4) {
-      threads = 4;
-   }
-   if (threads > 16) {
-      threads = 16;
+   int threads = (logical + 2) / 3;
+   if (threads < 2) {
+      threads = 2;
+   } else if (threads > 8) {
+      threads = 8;
    }
 
-   unsigned queue_depth = 128;
+   unsigned queue_depth = (unsigned)threads * 16u;
+   if (queue_depth < 64u) {
+      queue_depth = 64u;
+   } else if (queue_depth > 256u) {
+      queue_depth = 256u;
+   }
 
    return util_queue_init(&cache->cache_queue, "disk$", queue_depth, threads,
                           UTIL_QUEUE_INIT_RESIZE_IF_FULL |
@@ -406,8 +451,8 @@ disk_cache_type_create(const char *gpu_name,
    void *local;
    struct disk_cache *cache = NULL;
 
-   uint8_t cache_version = CACHE_VERSION;
-   size_t cv_size = sizeof(cache_version);
+   const uint8_t cache_version = CACHE_VERSION;
+   const size_t cv_size = sizeof(cache_version);
 
    local = ralloc_context(NULL);
    if (UNLIKELY(local == NULL)) {
@@ -475,7 +520,7 @@ disk_cache_type_create(const char *gpu_name,
 
    cache->path_init_failed = false;
 
- path_fail:
+path_fail:
 
    cache->driver_keys_blob_size = cv_size;
 
@@ -484,17 +529,23 @@ disk_cache_type_create(const char *gpu_name,
    cache->driver_keys_blob_size += id_size;
    cache->driver_keys_blob_size += gpu_name_size;
 
-   uint8_t ptr_size = sizeof(void *);
-   size_t ptr_size_size = sizeof(ptr_size);
+   const uint8_t ptr_size = sizeof(void *);
+   const size_t ptr_size_size = sizeof(ptr_size);
    cache->driver_keys_blob_size += ptr_size_size;
 
-   size_t driver_flags_size = sizeof(driver_flags);
+   const size_t driver_flags_size = sizeof(driver_flags);
    cache->driver_keys_blob_size += driver_flags_size;
 
-   cache->driver_keys_blob = ralloc_size(cache, cache->driver_keys_blob_size);
-   if (UNLIKELY(!cache->driver_keys_blob)) {
+   const size_t blob_pack_size =
+      sizeof(struct driver_keys_blob_pack) + cache->driver_keys_blob_size;
+
+   struct driver_keys_blob_pack *blob_pack =
+      ralloc_size(cache, blob_pack_size);
+   if (UNLIKELY(!blob_pack)) {
       goto fail;
    }
+
+   cache->driver_keys_blob = blob_pack->data;
 
    uint8_t *drv_key_blob = cache->driver_keys_blob;
    DRV_KEY_CPY(drv_key_blob, &cache_version, cv_size);
@@ -503,13 +554,17 @@ disk_cache_type_create(const char *gpu_name,
    DRV_KEY_CPY(drv_key_blob, &ptr_size, ptr_size_size);
    DRV_KEY_CPY(drv_key_blob, &driver_flags, driver_flags_size);
 
+   _mesa_sha1_init(&blob_pack->ctx_template);
+   _mesa_sha1_update(&blob_pack->ctx_template, blob_pack->data,
+                     cache->driver_keys_blob_size);
+
    s_rand_xorshift128plus(cache->seed_xorshift128plus, true);
 
    ralloc_free(local);
 
    return cache;
 
- fail:
+fail:
    if (cache) {
       if (cache->type == DISK_CACHE_SINGLE_FILE) {
          foz_destroy(&cache->foz_db);
@@ -1002,8 +1057,19 @@ disk_cache_put(struct disk_cache *cache, const cache_key key,
                const void *data, size_t size,
                struct cache_item_metadata *cache_item_metadata)
 {
-   if (UNLIKELY(size == 0)) {
+   if (UNLIKELY(!cache || !data || size == 0)) {
       return;
+   }
+
+   const bool bypass_disk = cache->blob_put_cb != NULL;
+
+   if (!bypass_disk) {
+      if (UNLIKELY(cache->path_init_failed)) {
+         return;
+      }
+      if (cache->max_size != 0 && size > cache->max_size) {
+         return;
+      }
    }
 
    if (!util_queue_is_initialized(&cache->cache_queue)) {
@@ -1011,7 +1077,7 @@ disk_cache_put(struct disk_cache *cache, const cache_key key,
    }
 
    struct disk_cache_put_job *dc_job =
-      create_put_job(cache, key, (void*)data, size, cache_item_metadata, false);
+      create_put_job(cache, key, (void *)data, size, cache_item_metadata, false);
 
    if (dc_job) {
       util_queue_fence_init(&dc_job->fence);
@@ -1025,12 +1091,30 @@ disk_cache_put_nocopy(struct disk_cache *cache, const cache_key key,
                       void *data, size_t size,
                       struct cache_item_metadata *cache_item_metadata)
 {
-   if (!util_queue_is_initialized(&cache->cache_queue)) {
+   if (UNLIKELY(!cache || !data)) {
       free(data);
       return;
    }
 
    if (UNLIKELY(size == 0)) {
+      free(data);
+      return;
+   }
+
+   const bool bypass_disk = cache->blob_put_cb != NULL;
+
+   if (!bypass_disk) {
+      if (UNLIKELY(cache->path_init_failed)) {
+         free(data);
+         return;
+      }
+      if (cache->max_size != 0 && size > cache->max_size) {
+         free(data);
+         return;
+      }
+   }
+
+   if (!util_queue_is_initialized(&cache->cache_queue)) {
       free(data);
       return;
    }
@@ -1118,30 +1202,28 @@ __attribute__((target("avx2")))
 static inline bool
 cache_key_equals_avx2(const unsigned char *a, const unsigned char *b)
 {
-   __m256i va = _mm256_loadu_si256((const __m256i *)a);
-   __m256i vb = _mm256_loadu_si256((const __m256i *)b);
-   __m256i cmp_res = _mm256_cmpeq_epi8(va, vb);
-   return _mm256_movemask_epi8(cmp_res) == (int)0xFFFFFFFF;
+   const __m256i va = _mm256_loadu_si256((const __m256i *)a);
+   const __m256i vb = _mm256_loadu_si256((const __m256i *)b);
+   const __m256i diff = _mm256_xor_si256(va, vb);
+   const int is_zero = _mm256_testz_si256(diff, diff);
+   _mm256_zeroupper();
+   return is_zero != 0;
 }
 
-/*
- * SSE2 path: two 128-bit comparisons with combined result
- * Uses AND to merge results and single mask check, avoiding branch mispredicts
- * Per Intel SDM: pand has 1 cycle latency, avoids additional branch
- */
 static inline bool
 cache_key_equals_sse2(const unsigned char *a, const unsigned char *b)
 {
-   __m128i va0 = _mm_loadu_si128((const __m128i *)a);
-   __m128i vb0 = _mm_loadu_si128((const __m128i *)b);
-   __m128i va1 = _mm_loadu_si128((const __m128i *)(a + 16));
-   __m128i vb1 = _mm_loadu_si128((const __m128i *)(b + 16));
+   const __m128i va0 = _mm_loadu_si128((const __m128i *)a);
+   const __m128i vb0 = _mm_loadu_si128((const __m128i *)b);
+   const __m128i va1 = _mm_loadu_si128((const __m128i *)(a + 16));
+   const __m128i vb1 = _mm_loadu_si128((const __m128i *)(b + 16));
 
-   __m128i cmp0 = _mm_cmpeq_epi8(va0, vb0);
-   __m128i cmp1 = _mm_cmpeq_epi8(va1, vb1);
-   __m128i cmp_and = _mm_and_si128(cmp0, cmp1);
+   const __m128i diff0 = _mm_xor_si128(va0, vb0);
+   const __m128i diff1 = _mm_xor_si128(va1, vb1);
+   const __m128i diff = _mm_or_si128(diff0, diff1);
+   const __m128i zero = _mm_setzero_si128();
 
-   return _mm_movemask_epi8(cmp_and) == 0xFFFF;
+   return _mm_movemask_epi8(_mm_cmpeq_epi8(diff, zero)) == 0xFFFF;
 }
 
 /*
@@ -1210,7 +1292,7 @@ disk_cache_put_key(struct disk_cache *cache, const cache_key key)
    unsigned char *entry;
 
    memcpy(&first_word, key, sizeof(first_word));
-   int i = (int)(CPU_TO_LE32(first_word) & CACHE_INDEX_KEY_MASK);
+   const int i = (int)(CPU_TO_LE32(first_word) & CACHE_INDEX_KEY_MASK);
 
    if (cache->blob_put_cb) {
       cache->blob_put_cb(key, CACHE_KEY_SIZE, &first_word, (signed long)sizeof(uint32_t));
@@ -1222,6 +1304,10 @@ disk_cache_put_key(struct disk_cache *cache, const cache_key key)
    }
 
    entry = &cache->stored_keys[i * CACHE_KEY_SIZE];
+
+   if (CACHE_KEY_FASTCMP(entry, key)) {
+      return;
+   }
 
    memcpy(entry, key, CACHE_KEY_SIZE);
 }
@@ -1263,9 +1349,18 @@ disk_cache_compute_key(struct disk_cache *cache, const void *data, size_t size,
                        cache_key key)
 {
    struct mesa_sha1 ctx;
-   _mesa_sha1_init(&ctx);
-   _mesa_sha1_update(&ctx, cache->driver_keys_blob,
-                     cache->driver_keys_blob_size);
+
+   if (UNLIKELY(!cache->driver_keys_blob)) {
+      _mesa_sha1_init(&ctx);
+      _mesa_sha1_update(&ctx, data, size);
+      _mesa_sha1_final(&ctx, key);
+      return;
+   }
+
+   const struct driver_keys_blob_pack *pack =
+      driver_keys_blob_pack_from_blob_const(cache->driver_keys_blob);
+
+   ctx = pack->ctx_template;
    _mesa_sha1_update(&ctx, data, size);
    _mesa_sha1_final(&ctx, key);
 }

@@ -108,17 +108,20 @@ disk_cache_get_function_identifier(void *ptr, struct mesa_sha1 *ctx)
 {
    uint32_t timestamp;
 
-#ifdef HAVE_DL_ITERATE_PHDR
-   const struct build_id_note *note = NULL;
-   if ((note = build_id_find_nhdr_for_addr(ptr))) {
+#if defined(HAVE_BUILD_ID) && HAVE_BUILD_ID
+   const struct build_id_note *note = build_id_find_nhdr_for_addr(ptr);
+   if (note) {
       _mesa_sha1_update(ctx, build_id_data(note), build_id_length(note));
-   } else
+      return true;
+   }
 #endif
+
    if (disk_cache_get_function_timestamp(ptr, &timestamp)) {
       _mesa_sha1_update(ctx, &timestamp, sizeof(timestamp));
-   } else
-      return false;
-   return true;
+      return true;
+   }
+
+   return false;
 }
 #elif DETECT_OS_WINDOWS
 bool
