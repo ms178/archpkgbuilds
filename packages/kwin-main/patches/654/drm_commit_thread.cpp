@@ -294,7 +294,12 @@ void DrmCommitThread::submit()
             ++suppressed;
         }
 
-        for (int retry = 0; retry < kMaxSubmitRetries && m_commits.size() > 1; ++retry) {
+        for (int retry = 0; retry < kMaxSubmitRetries && m_commits.size() > 1; ) {
+            if (!m_commits[1]) [[unlikely]] {
+                m_commits.erase(m_commits.begin() + 1);
+                continue;
+            }
+
             auto toMerge = std::move(m_commits[1]);
             m_commits.erase(m_commits.begin() + 1);
             commit->merge(toMerge.get());
@@ -305,6 +310,7 @@ void DrmCommitThread::submit()
                 break;
             }
             savedErrno = errno;
+            ++retry;
         }
 
         if (!testedOk) {

@@ -658,8 +658,11 @@ void RenderLoopPrivate::notifyFrameDropped()
         return;
     }
 
-    Q_ASSERT(pendingFrameCount > 0);
-    --pendingFrameCount;
+    if (pendingFrameCount > 0) {
+        --pendingFrameCount;
+    } else {
+        pendingFrameCount = 0;
+    }
 
     if (consecutiveErrorCount < std::numeric_limits<uint8_t>::max()) {
         ++consecutiveErrorCount;
@@ -741,8 +744,11 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
             writeDebug(this, renderTime, targetFlip, refreshDur, predRender, timestamp, mode);
         }
 
-        Q_ASSERT(pendingFrameCount > 0);
-        --pendingFrameCount;
+        if (pendingFrameCount > 0) {
+            --pendingFrameCount;
+        } else {
+            pendingFrameCount = 0;
+        }
 
         const int64_t prevPresentationNs = lastPresentationTimestamp.count();
         const int64_t nowNs = steadyNowNs();
