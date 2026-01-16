@@ -559,7 +559,7 @@ init_context(isel_context* ctx, nir_shader* shader)
                case nir_intrinsic_ballot_relaxed:
                case nir_intrinsic_bindless_image_samples:
                case nir_intrinsic_load_scalar_arg_amd:
-               case nir_intrinsic_unit_test_uniform_amd: type = RegType::sgpr; break;
+               case nir_intrinsic_unit_test_uniform_input: type = RegType::sgpr; break;
                case nir_intrinsic_load_input:
                case nir_intrinsic_load_per_primitive_input:
                case nir_intrinsic_load_output:
@@ -590,7 +590,7 @@ init_context(isel_context* ctx, nir_shader* shader)
                case nir_intrinsic_load_vector_arg_amd:
                case nir_intrinsic_ordered_xfb_counter_add_gfx11_amd:
                case nir_intrinsic_cmat_muladd_amd:
-               case nir_intrinsic_unit_test_divergent_amd: type = RegType::vgpr; break;
+               case nir_intrinsic_unit_test_divergent_input: type = RegType::vgpr; break;
                case nir_intrinsic_load_shared:
                case nir_intrinsic_load_shared2_amd:
                   /* When the result of these loads is only used by cross-lane instructions,
