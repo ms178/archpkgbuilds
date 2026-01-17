@@ -1110,7 +1110,7 @@ static void*  _mid_memalign(size_t, size_t);
 #if USE_TCACHE
 static void malloc_printerr_tail(const char *str);
 #endif
-static void malloc_printerr(const char *str) __attribute__ ((noreturn));
+static void malloc_printerr (const char *str) __attribute__ ((noreturn, cold));
 
 static void munmap_chunk(mchunkptr p);
 #if HAVE_MREMAP
@@ -2404,13 +2404,11 @@ sysmalloc_mmap (INTERNAL_SIZE_T nb, size_t pagesize, int extra_flags, mstate av)
 {
   long int size;
 
-  /* Calculate size with proper alignment padding */
   if (MALLOC_ALIGNMENT == CHUNK_HDR_SZ)
     size = ALIGN_UP (nb + SIZE_SZ, pagesize);
   else
     size = ALIGN_UP (nb + SIZE_SZ + MALLOC_ALIGN_MASK, pagesize);
 
-  /* Overflow check */
   if ((unsigned long) (size) <= (unsigned long) (nb))
     return MAP_FAILED;
 
@@ -2427,7 +2425,6 @@ sysmalloc_mmap (INTERNAL_SIZE_T nb, size_t pagesize, int extra_flags, mstate av)
 
   __set_vma_name (mm, size, " glibc: malloc");
 
-  /* Calculate alignment offset */
   INTERNAL_SIZE_T front_misalign;
 
   if (MALLOC_ALIGNMENT == CHUNK_HDR_SZ)
@@ -2454,7 +2451,6 @@ sysmalloc_mmap (INTERNAL_SIZE_T nb, size_t pagesize, int extra_flags, mstate av)
       set_head (p, size | IS_MMAPPED);
     }
 
-  /* Update statistics */
   int new = atomic_fetch_add_relaxed (&mp_.n_mmaps, 1) + 1;
   atomic_max (&mp_.max_n_mmaps, new);
 
@@ -2462,7 +2458,8 @@ sysmalloc_mmap (INTERNAL_SIZE_T nb, size_t pagesize, int extra_flags, mstate av)
   sum = atomic_fetch_add_relaxed (&mp_.mmapped_mem, size) + size;
   atomic_max (&mp_.max_mmapped_mem, sum);
 
-  check_chunk (av, p);  /* ← FIXED: av parameter preserved */
+  if (av != NULL)
+    check_chunk (av, p);
 
   return chunk2mem (p);
 }
@@ -3207,11 +3204,16 @@ tcache_location_large (size_t nb, size_t tc_idx, bool *mangled)
 {
   tcache_entry **tep = &(tcache->entries[tc_idx]);
   tcache_entry *te = *tep;
-  while (te != NULL
-         && __glibc_unlikely (chunksize (mem2chunk (te)) < nb))
+  *mangled = false;
+
+  while (te != NULL && __glibc_unlikely (chunksize (mem2chunk (te)) < nb))
     {
+      tcache_entry *next_revealed = REVEAL_PTR (te->next);
+      if (next_revealed)
+        __builtin_prefetch (next_revealed, 0, 3);
+
       tep = & (te->next);
-      te = REVEAL_PTR (te->next);
+      te = next_revealed;
       *mangled = true;
     }
 
@@ -3231,12 +3233,11 @@ tcache_put_large (mchunkptr chunk, size_t tc_idx)
 static __always_inline void *
 tcache_get_large (size_t tc_idx, size_t nb)
 {
-  tcache_entry **entry;
   bool mangled = false;
-  entry = tcache_location_large (nb, tc_idx, &mangled);
+  tcache_entry **entry = tcache_location_large (nb, tc_idx, &mangled);
 
-  if ((mangled && REVEAL_PTR (*entry) == NULL)
-      || (!mangled && *entry == NULL))
+  tcache_entry *head = mangled ? REVEAL_PTR (*entry) : *entry;
+  if (head == NULL)
     return NULL;
 
   return tcache_get_n (tc_idx, entry, mangled);
@@ -3911,8 +3912,6 @@ __libc_calloc (size_t n, size_t elem_size)
 {
   size_t bytes;
 
-  /* Check for multiplication overflow using compiler builtin.
-     This is critical for security (prevents integer overflow attacks). */
   if (__glibc_unlikely (__builtin_mul_overflow (n, elem_size, &bytes)))
     {
        __set_errno (ENOMEM);
@@ -3920,7 +3919,6 @@ __libc_calloc (size_t n, size_t elem_size)
     }
 
 #if USE_TCACHE
-  /* Validate size before conversion */
   if (__glibc_unlikely (bytes > PTRDIFF_MAX))
     {
       __set_errno (ENOMEM);
@@ -3929,8 +3927,8 @@ __libc_calloc (size_t n, size_t elem_size)
 
   size_t nb = checked_request2size (bytes);
 
-  /* Explicit SIZE_MAX check for clarity and safety */
-  if (__glibc_unlikely (nb == SIZE_MAX))
+  /* FIX: checked_request2size returns 0 on failure. */
+  if (__glibc_unlikely (nb == 0))
     {
       __set_errno (ENOMEM);
       return NULL;
@@ -3948,7 +3946,6 @@ __libc_calloc (size_t n, size_t elem_size)
           if (tcache->entries[tc_idx] != NULL)
             {
               void *mem = tcache_get (tc_idx);
-              /* Clear memory before returning. memsize gets actual usable size. */
               if (__glibc_unlikely (mtag_enabled))
                 return tag_new_zero_region (mem, memsize (mem2chunk (mem)));
 
@@ -5909,10 +5906,9 @@ malloc_printerr (const char *str)
 
 static volatile int dummy_var;
 
-static __attribute_noinline__ void
+static __attribute_noinline__ void __attribute__ ((cold))
 malloc_printerr_tail (const char *str)
 {
-  /* Ensure this cannot be a no-return function.  */
   if (dummy_var)
     return;
   malloc_printerr (str);
