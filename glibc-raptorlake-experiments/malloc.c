@@ -909,7 +909,7 @@ libc_hidden_proto (__libc_mallopt)
 #define M_TRIM_THRESHOLD       -1
 
 #ifndef DEFAULT_TRIM_THRESHOLD
-#define DEFAULT_TRIM_THRESHOLD (128 * 1024)
+#define DEFAULT_TRIM_THRESHOLD (512 * 1024)
 #endif
 
 /*
@@ -942,7 +942,7 @@ libc_hidden_proto (__libc_mallopt)
 #define M_TOP_PAD              -2
 
 #ifndef DEFAULT_TOP_PAD
-#define DEFAULT_TOP_PAD        (0)
+#define DEFAULT_TOP_PAD        (256 * 1024)
 #endif
 
 /*
@@ -951,7 +951,7 @@ libc_hidden_proto (__libc_mallopt)
 */
 
 #ifndef DEFAULT_MMAP_THRESHOLD_MIN
-#define DEFAULT_MMAP_THRESHOLD_MIN (128 * 1024)
+#define DEFAULT_MMAP_THRESHOLD_MIN (512 * 1024)
 #endif
 
 #ifndef DEFAULT_MMAP_THRESHOLD_MAX
@@ -2672,6 +2672,9 @@ sysmalloc (INTERNAL_SIZE_T nb, mstate av)
         }
       else
         size = ALIGN_UP (size, GLRO(dl_pagesize));
+
+     if (size < 512 * 1024)
+	 size = 512 * 1024;
 
       /*
          Don't try to call MORECORE if argument is so big as to appear
@@ -5170,7 +5173,7 @@ _int_memalign (mstate av, size_t alignment, size_t bytes)
   INTERNAL_SIZE_T size;
 
   nb = checked_request2size (bytes);
-  if (nb == 0)
+  if (nb == 0 || alignment > PTRDIFF_MAX)
     {
       __set_errno (ENOMEM);
       return NULL;
@@ -5186,7 +5189,10 @@ _int_memalign (mstate av, size_t alignment, size_t bytes)
      we don't find anything in those bins, the common malloc code will
      scan starting at 2x.  */
 
-  /* Call malloc with worst case padding to hit alignment. */
+  /* Call malloc with worst case padding to hit alignment.  ALIGNMENT is a
+     power of 2, so it tops out at (PTRDIFF_MAX >> 1) + 1, leaving plenty of
+     space to add MINSIZE and whatever checked_request2size adds to BYTES to
+     get NB.  Consequently, total below also does not overflow.  */
   m = (char *) (_int_malloc (av, nb + alignment + MINSIZE));
 
   if (m == NULL)
