@@ -21,29 +21,44 @@
 /*
  * Common Macros & Constants
  */
+#ifndef U64_MAX
 #define U64_MAX		((u64)~0ULL)
+#endif
+#ifndef S64_MAX
 #define S64_MAX		((s64)(U64_MAX >> 1))
+#endif
+#ifndef U32_MAX
 #define U32_MAX		((u32)~0U)
+#endif
+#ifndef S32_MAX
 #define S32_MAX		((s32)(U32_MAX >> 1))
+#endif
 
+#ifndef MAX_RT_PRIO
 #define MAX_RT_PRIO	100
+#endif
 
 #define LAVD_SHIFT			10
 #define LAVD_SCALE			(1L << LAVD_SHIFT)
 #define p2s(percent)			(((percent) << LAVD_SHIFT) / 100)
 #define s2p(scale)			(((scale) * 100) >> LAVD_SHIFT)
 
-#define cpdom_to_dsq(cpdom_id)		((cpdom_id) | LAVD_DSQ_TYPE_CPDOM << LAVD_DSQ_TYPE_SHFT)
+#define cpdom_to_dsq(cpdom_id)		(((u64)(cpdom_id)) | ((u64)LAVD_DSQ_TYPE_CPDOM << LAVD_DSQ_TYPE_SHFT))
 #define dsq_to_cpdom(dsq_id)		((dsq_id) & LAVD_DSQ_ID_MASK)
 #define dsq_to_cpu(dsq_id)		((dsq_id) & LAVD_DSQ_ID_MASK)
 #define dsq_type(dsq_id)		(((dsq_id) & LAVD_DSQ_TYPE_MASK) >> LAVD_DSQ_TYPE_SHFT)
+
+#define LAVD_CACHELINE_ALIGNED		__attribute__((aligned(CACHELINE_SIZE)))
 
 /*
  * Safe time delta calculation - handles clock wraparound.
  * Returns 0 if before > after (should not happen in normal operation).
  */
-#define time_delta(after, before) \
-	((after) >= (before) ? (after) - (before) : 0)
+static __always_inline u64 lavd_time_delta(u64 after, u64 before)
+{
+	return (after >= before) ? (after - before) : 0;
+}
+#define time_delta(after, before)	lavd_time_delta((after), (before))
 
 /*
  *  DSQ (dispatch queue) IDs are 64bit of the format:
@@ -59,9 +74,9 @@
  */
 enum {
 	LAVD_DSQ_TYPE_SHFT		= 12,
-	LAVD_DSQ_TYPE_MASK		= 0x3 << LAVD_DSQ_TYPE_SHFT,
+	LAVD_DSQ_TYPE_MASK		= (u64)(0x3ULL << LAVD_DSQ_TYPE_SHFT),
 	LAVD_DSQ_ID_SHFT		= 0,
-	LAVD_DSQ_ID_MASK		= 0xfff << LAVD_DSQ_ID_SHFT,
+	LAVD_DSQ_ID_MASK		= (u64)(0xfffULL << LAVD_DSQ_ID_SHFT),
 	LAVD_DSQ_NR_TYPES		= 2,
 	LAVD_DSQ_TYPE_CPDOM		= 1,
 	LAVD_DSQ_TYPE_CPU		= 0,
@@ -100,6 +115,7 @@ enum consts_internal {
 	LAVD_SLICE_BOOST_BONUS		= LAVD_SLICE_MIN_NS_DFL,
 	LAVD_SLICE_BOOST_MAX		= (500ULL * NSEC_PER_MSEC),
 	LAVD_ACC_RUNTIME_MAX		= LAVD_SLICE_MAX_NS_DFL,
+	LAVD_TASK_LAG_MAX		= (10ULL * LAVD_SLICE_MAX_NS_DFL),
 	LAVD_DL_COMPETE_WINDOW		= (LAVD_SLICE_MAX_NS_DFL >> 16),
 
 	/*
@@ -109,18 +125,20 @@ enum consts_internal {
 	 */
 	LAVD_LC_FREQ_MAX		= 400000,
 	LAVD_LC_RUNTIME_MAX		= LAVD_TIME_ONE_SEC,
-	LAVD_LC_WEIGHT_BOOST		= 128,
+	LAVD_LC_WEIGHT_BOOST_REGULAR	= 128,
+	LAVD_LC_WEIGHT_BOOST_MEDIUM	= (2 * LAVD_LC_WEIGHT_BOOST_REGULAR),
+	LAVD_LC_WEIGHT_BOOST_HIGH	= (2 * LAVD_LC_WEIGHT_BOOST_MEDIUM),
 	LAVD_LC_GREEDY_SHIFT		= 3,
 	LAVD_LC_WAKE_INTERVAL_MIN	= LAVD_SLICE_MIN_NS_DFL,
-	LAVD_LC_INH_WAKEE_SHIFT		= 2,
-	LAVD_LC_INH_WAKER_SHIFT		= 3,
+	LAVD_LC_INH_RECEIVER_SHIFT	= 2,
+	LAVD_LC_INH_GIVER_SHIFT		= 3,
 
 	LAVD_CPU_UTIL_MAX_FOR_CPUPERF	= p2s(85),
 
 	LAVD_SYS_STAT_INTERVAL_NS	= (2 * LAVD_SLICE_MAX_NS_DFL),
 	LAVD_SYS_STAT_DECAY_TIMES	= ((2ULL * LAVD_TIME_ONE_SEC) / LAVD_SYS_STAT_INTERVAL_NS),
 
-	LAVD_CC_PER_CORE_SHIFT		= 1,
+	LAVD_CC_PER_CPU_UTIL		= p2s(40),
 	LAVD_CC_UTIL_SPIKE		= p2s(90),
 	LAVD_CC_CPU_PIN_INTERVAL	= (250ULL * NSEC_PER_MSEC),
 	LAVD_CC_CPU_PIN_INTERVAL_DIV	= (LAVD_CC_CPU_PIN_INTERVAL / LAVD_SYS_STAT_INTERVAL_NS),
@@ -148,6 +166,7 @@ enum consts_flags {
 	LAVD_FLAG_SLICE_BOOST		= (0x1 << 8),
 	LAVD_FLAG_IDLE_CPU_PICKED	= (0x1 << 9),
 	LAVD_FLAG_KSOFTIRQD		= (0x1 << 10),
+	LAVD_FLAG_WOKEN_BY_RT_DL	= (0x1 << 11),
 };
 
 /*
@@ -165,7 +184,7 @@ struct task_ctx {
 	 * Do NOT change the position of atq. It should be at the beginning
 	 * of the task_ctx.
 	 */
-	struct scx_task_common atq __attribute__((aligned(CACHELINE_SIZE)));
+	struct scx_task_common atq LAVD_CACHELINE_ALIGNED;
 
 	/* --- cacheline 1 boundary (64 bytes) --- */
 	volatile u64	flags;		/* LAVD_FLAG_* */
@@ -182,9 +201,10 @@ struct task_ctx {
 	u64	last_running_clk;	/* last time when scheduled in */
 	u64	last_stopping_clk;	/* last time when scheduled out */
 	u64	run_freq;		/* scheduling frequency in a second */
-	u32	lat_cri;		/* final context-aware latency criticality */
-	u32	lat_cri_waker;		/* waker's latency criticality */
-	u32	perf_cri;		/* performance criticality of a task */
+	u16	lat_cri;		/* final context-aware latency criticality */
+	u16	lat_cri_waker;		/* waker's latency criticality */
+	u16	lat_cri_wakee;		/* wakee's latency criticality */
+	u16	perf_cri;		/* performance criticality of a task */
 	u32	cpdom_id;		/* chosen compute domain id at ops.enqueue() */
 	s32	pinned_cpu_id;		/* pinned CPU id. -ENOENT if not pinned or not runnable. */
 	u32	suggested_cpu_id;	/* suggested CPU ID at ops.enqueue() and ops.select_cpu() */
@@ -200,7 +220,7 @@ struct task_ctx {
 	pid_t	pid;			/* pid for this task */
 	pid_t	waker_pid;		/* last waker's PID */
 	char	waker_comm[TASK_COMM_LEN + 1]; /* last waker's comm */
-} __attribute__((aligned(CACHELINE_SIZE)));
+} LAVD_CACHELINE_ALIGNED;
 
 /*
  * Compute domain context
@@ -223,7 +243,7 @@ struct cpdom_ctx {
 	u8	neighbor_ids[LAVD_CPDOM_MAX_DIST * LAVD_CPDOM_MAX_NR]; /* neighbor IDs per distance in circular distance order */
 
 	/* --- cacheline 8 boundary (512 bytes): read-write, read-mostly --- */
-	u8	is_stealer __attribute__((aligned(CACHELINE_SIZE))); /* this domain should steal tasks from others */
+	u8	is_stealer LAVD_CACHELINE_ALIGNED; /* this domain should steal tasks from others */
 	u8	is_stealee;			    /* stealer domain should steal tasks from this domain */
 	u16	nr_active_cpus;			    /* the number of active CPUs in this compute domain */
 	u16	nr_acpus_temp;			    /* temp for nr_active_cpus */
@@ -235,7 +255,7 @@ struct cpdom_ctx {
 	u32	cap_sum_temp;			    /* temp for cap_sum_active_cpus */
 	u32	dsq_consume_lat;		    /* latency to consume from dsq, shows how contended the dsq is */
 
-} __attribute__((aligned(CACHELINE_SIZE)));
+} LAVD_CACHELINE_ALIGNED;
 
 #define get_neighbor_id(cpdomc, d, i) ((cpdomc)->neighbor_ids[((d) * LAVD_CPDOM_MAX_NR) + (i)])
 
@@ -267,7 +287,8 @@ struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p);
 struct cpu_ctx {
 	/* --- cacheline 0 boundary (0 bytes): Hot scheduling state --- */
 	volatile u64	flags;		/* cached copy of task's flags */
-	volatile u64	tot_svc_time;	/* total service time on a CPU scaled by tasks' weights */
+	volatile u64	tot_task_time;	/* total wall-clock time this CPU has spent running scx tasks so far. */
+	volatile u64	tot_svc_time;	/* total scx tasks' service time on a CPU scaled by tasks' weights */
 	volatile u64	tot_sc_time;	/* total scaled CPU time, which is capacity and frequency invariant. */
 	volatile u64	est_stopping_clk; /* estimated stopping time */
 	volatile u64	running_clk;	/* when a task starts running */
@@ -330,10 +351,10 @@ struct cpu_ctx {
 	struct bpf_cpumask __kptr *tmp_t_mask;
 	struct bpf_cpumask __kptr *tmp_t2_mask;
 	struct bpf_cpumask __kptr *tmp_t3_mask;
-} __attribute__((aligned(CACHELINE_SIZE)));
+} LAVD_CACHELINE_ALIGNED;
 
 extern const volatile u64	nr_llcs;
-const extern volatile u32	nr_cpu_ids;
+extern const volatile u32	nr_cpu_ids;
 extern volatile u64		nr_cpus_onln;
 
 extern const volatile u16	cpu_capacity[LAVD_CPU_ID_MAX];
@@ -489,7 +510,7 @@ static __always_inline bool use_cpdom_dsq(void)
 	return likely(!per_cpu_dsq);
 }
 
-s32 nr_queued_on_cpu(struct cpu_ctx *cpuc);
+bool queued_on_cpu(struct cpu_ctx *cpuc);
 u64 get_target_dsq_id(struct task_struct *p, struct cpu_ctx *cpuc);
 
 extern struct bpf_cpumask __kptr *turbo_cpumask;
@@ -515,6 +536,7 @@ extern u32			default_big_core_scale;
 int init_autopilot_caps(void);
 int update_autopilot_high_cap(void);
 u64 scale_cap_freq(u64 dur, s32 cpu);
+u64 scale_cap_max_freq(u64 dur, s32 cpu);
 
 int reset_cpuperf_target(struct cpu_ctx *cpuc);
 int update_cpuperf_target(struct cpu_ctx *cpuc);

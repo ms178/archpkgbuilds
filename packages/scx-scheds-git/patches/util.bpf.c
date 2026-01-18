@@ -93,12 +93,32 @@ __hidden
 struct cpu_ctx *get_cpu_ctx_id(s32 cpu_id)
 {
 	const u32 idx = 0;
-	struct cpu_ctx *cpuc = bpf_map_lookup_percpu_elem(&cpu_ctx_stor, &idx, cpu_id);
+	u32 nr;
 
-	if (cpuc)
-		__builtin_prefetch(cpuc, 0, 3);
+	if (cpu_id < 0)
+		return NULL;
 
-	return cpuc;
+	if ((u32)cpu_id >= LAVD_CPU_ID_MAX)
+		return NULL;
+
+	/*
+	 * nr_cpu_ids is provided by the kernel BPF global and should be
+	 * valid at init. Guard only if it is non-zero to avoid rejecting
+	 * valid CPUs during early init.
+	 */
+	nr = READ_ONCE(nr_cpu_ids);
+	if (nr && (u32)cpu_id >= nr)
+		return NULL;
+
+	{
+		struct cpu_ctx *cpuc =
+			bpf_map_lookup_percpu_elem(&cpu_ctx_stor, &idx, cpu_id);
+
+		if (cpuc)
+			__builtin_prefetch(cpuc, 0, 3);
+
+		return cpuc;
+	}
 }
 
 __hidden
@@ -148,13 +168,10 @@ u64 __attribute__((noinline)) calc_avg_freq(u64 old_freq, u64 interval)
 	/*
 	 * Calculate the exponential weighted moving average (EWMA) of a
 	 * frequency with a new interval measured.
-	 *
-	 * CRITICAL: Protect against division by zero. This can occur when
-	 * timestamps are identical (high-frequency events) or during
-	 * initialization. The branchless fix converts 0 to 1 with minimal
-	 * overhead (single cmov instruction on x86).
 	 */
-	interval = interval | ((interval == 0) ? 1 : 0);
+	if (unlikely(interval == 0))
+		interval = 1;
+
 	new_freq = LAVD_TIME_ONE_SEC / interval;
 	ewma_freq = __calc_avg(old_freq, new_freq, 3);
 	return ewma_freq;
@@ -223,7 +240,7 @@ inline void reset_cpu_flag(struct cpu_ctx *cpuc, u64 flag)
 __hidden
 bool is_lat_cri(task_ctx __arg_arena *taskc)
 {
-	return taskc->lat_cri >= sys_stat.avg_lat_cri;
+	return taskc->lat_cri >= READ_ONCE(sys_stat.avg_lat_cri);
 }
 
 __hidden
@@ -251,46 +268,22 @@ bool have_scheduled(task_ctx __arg_arena *taskc)
 __hidden
 bool can_boost_slice(void)
 {
-	return sys_stat.nr_queued_task <= sys_stat.nr_active;
+	return READ_ONCE(sys_stat.nr_queued_task) <= READ_ONCE(sys_stat.nr_active);
 }
 
 __hidden
 u16 get_nice_prio(struct task_struct __arg_trusted *p)
 {
-	u16 prio = p->static_prio - MAX_RT_PRIO; /* [0, 40) */
-	return prio;
+	s32 prio = (s32)p->static_prio - MAX_RT_PRIO; /* [0, 40) for normal tasks */
+	if (prio < 0)
+		prio = 0;
+	return (u16)prio;
 }
 
 __hidden
 bool use_full_cpus(void)
 {
-	return sys_stat.nr_active >= nr_cpus_onln;
-}
-
-__hidden
-s64 __attribute__((noinline)) pick_any_bit(u64 bitmap, u64 nuance)
-{
-	u64 shift, rotated;
-	int tz;
-
-	if (!bitmap)
-		return -ENOENT;
-
-	/* modulo nuance to [0, 63] */
-	shift = nuance & 63ULL;
-
-	/* Circular rotate the bitmap by 'shift' bits. */
-	rotated = (bitmap >> shift) | (bitmap << (64 - shift));
-
-	/*
-	 * Count trailing zeros in the randomly rotated bitmap.
-	 * Using __builtin_ctzll for explicit compiler intrinsic -
-	 * generates TZCNT on modern x86 (1 cycle on Raptor Lake).
-	 */
-	tz = __builtin_ctzll(rotated);
-
-	/* Add the shift back and wrap around to get the original index. */
-	return (tz + shift) & 63;
+	return READ_ONCE(sys_stat.nr_active) >= READ_ONCE(nr_cpus_onln);
 }
 
 __hidden
@@ -299,9 +292,13 @@ void set_on_core_type(task_ctx __arg_arena *taskc,
 {
 	bool on_big = false, on_little = false;
 	struct cpu_ctx *cpuc;
+	u32 nr = READ_ONCE(nr_cpu_ids);
 	int cpu;
 
-	bpf_for(cpu, 0, __nr_cpu_ids) {
+	if (nr == 0)
+		return;
+
+	bpf_for(cpu, 0, nr) {
 		if (!bpf_cpumask_test_cpu(cpu, cpumask))
 			continue;
 
@@ -337,6 +334,9 @@ bool __attribute__((noinline)) prob_x_out_of_y(u32 x, u32 y)
 {
 	u32 r;
 
+	if (y == 0)
+		return false;
+
 	if (x >= y)
 		return true;
 
@@ -361,6 +361,9 @@ u32 __attribute__((noinline)) get_primary_cpu(u32 cpu)
 	if (!is_smt_active)
 		return cpu;
 
+	if (cpu >= LAVD_CPU_ID_MAX || cpu >= (u32)__nr_cpu_ids)
+		return cpu;
+
 	sibling = MEMBER_VPTR(cpu_sibling, [cpu]);
 	if (!sibling) {
 		debugln("Infeasible CPU id: %d", cpu);
@@ -376,30 +379,38 @@ u32 cpu_to_dsq(u32 cpu)
 	return (get_primary_cpu(cpu)) | LAVD_DSQ_TYPE_CPU << LAVD_DSQ_TYPE_SHFT;
 }
 
+/*
+ * Check if there are any tasks queued for this CPU.
+ * Uses short-circuit evaluation for efficiency - returns true immediately
+ * upon finding any queued task, avoiding unnecessary DSQ queries.
+ * This is optimal for the common case where we only need presence detection.
+ */
 __hidden
-s32 nr_queued_on_cpu(struct cpu_ctx *cpuc)
+bool queued_on_cpu(struct cpu_ctx *cpuc)
 {
-	s32 nr_queued;
+	if (unlikely(!cpuc))
+		return false;
 
 	/*
 	 * Check LOCAL_ON DSQ first - tasks explicitly pinned to this CPU
 	 * via scx_bpf_dsq_insert with SCX_DSQ_LOCAL_ON flag.
 	 */
-	nr_queued = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cpu_id);
+	if (scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cpu_id))
+		return true;
 
-	if (use_per_cpu_dsq())
-		nr_queued += scx_bpf_dsq_nr_queued(cpu_to_dsq(cpuc->cpu_id));
+	if (use_per_cpu_dsq() && scx_bpf_dsq_nr_queued(cpu_to_dsq(cpuc->cpu_id)))
+		return true;
 
-	if (use_cpdom_dsq())
-		nr_queued += scx_bpf_dsq_nr_queued(cpdom_to_dsq(cpuc->cpdom_id));
+	if (use_cpdom_dsq() && scx_bpf_dsq_nr_queued(cpdom_to_dsq(cpuc->cpdom_id)))
+		return true;
 
-	return nr_queued;
+	return false;
 }
 
 __hidden
 u64 get_target_dsq_id(struct task_struct *p, struct cpu_ctx *cpuc)
 {
-	if (per_cpu_dsq || (pinned_slice_ns && is_pinned(p)))
+	if (per_cpu_dsq || (READ_ONCE(pinned_slice_ns) && is_pinned(p)))
 		return cpu_to_dsq(cpuc->cpu_id);
 	return cpdom_to_dsq(cpuc->cpdom_id);
 }
@@ -407,5 +418,5 @@ u64 get_target_dsq_id(struct task_struct *p, struct cpu_ctx *cpuc)
 __hidden
 u64 task_exec_time(struct task_struct __arg_trusted *p)
 {
-	return p->se.sum_exec_runtime;
+	return READ_ONCE(p->se.sum_exec_runtime);
 }

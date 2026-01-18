@@ -128,6 +128,7 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 {
 	u64 slice, base_slice, avg_runtime, max_slice, min_slice;
 	u32 avg_perf_cri, avg_lat_cri;
+	u64 pinned;
 	bool boosted = false;
 
 	if (unlikely(!taskc || !cpuc))
@@ -139,6 +140,18 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 	min_slice = READ_ONCE(slice_min_ns);
 	avg_perf_cri = READ_ONCE(sys_stat.avg_perf_cri);
 	avg_lat_cri = READ_ONCE(sys_stat.avg_lat_cri);
+
+	/*
+	 * If pinned_slice_ns is enabled and there are pinned tasks, reduce
+	 * time slice to ensure pinned tasks can run promptly.
+	 */
+	pinned = READ_ONCE(pinned_slice_ns);
+	if (unlikely(pinned && READ_ONCE(cpuc->nr_pinned_tasks) != 0)) {
+		slice = pinned < base_slice ? pinned : base_slice;
+		taskc->slice = slice;
+		reset_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
+		return slice;
+	}
 
 	slice = base_slice;
 
@@ -296,6 +309,8 @@ static void account_task_runtime(struct task_struct *p,
 	svc_time = runtime / (u64)weight;
 	sc_time = scale_cap_freq(runtime, cpuc->cpu_id);
 
+	/* Accumulate delta runtime to avoid overcounting absolute task_time. */
+	WRITE_ONCE(cpuc->tot_task_time, cpuc->tot_task_time + runtime);
 	WRITE_ONCE(cpuc->tot_svc_time, cpuc->tot_svc_time + svc_time);
 	WRITE_ONCE(cpuc->tot_sc_time, cpuc->tot_sc_time + sc_time);
 
@@ -330,7 +345,6 @@ static void update_stat_for_stopping(struct task_struct *p,
 	taskc->last_stopping_clk = now;
 
 	taskc->last_slice_used = time_delta(now, taskc->last_running_clk);
-	taskc->lat_cri_waker = 0;
 
 	if (READ_ONCE(cur_svc_time) < taskc->svc_time)
 		WRITE_ONCE(cur_svc_time, taskc->svc_time);
@@ -524,7 +538,7 @@ apply_policy:
 			goto out;
 		}
 
-		if (likely(!nr_queued_on_cpu(cpuc))) {
+		if (likely(!queued_on_cpu(cpuc))) {
 			p->scx.dsq_vtime = calc_when_to_run(p, taskc);
 			p->scx.slice = LAVD_SLICE_MAX_NS_DFL;
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, p->scx.slice, 0);
@@ -632,7 +646,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		__sync_fetch_and_add(&cpuc->nr_pinned_tasks, 1);
 	}
 
-	if (is_idle && !nr_queued_on_cpu(cpuc)) {
+	if (is_idle && !queued_on_cpu(cpuc)) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)cpu, p->scx.slice, enq_flags);
 	} else {
 		dsq_id = get_target_dsq_id(p, cpuc);
@@ -937,6 +951,17 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 	if (is_kernel_task(p) != is_kernel_task(waker))
 		return;
 
+	/*
+	 * If the waker is an RT or DL task, set the flag to increase the
+	 * wakee’s latency-criticality. We don’t track the latency-criticality
+	 * of RT/DL tasks, so we can not inherit their latency criticality.
+	 * Instead, we increase wakee’s latency-criticality by a fixed amount.
+	 */
+	if (rt_or_dl_task(waker))
+		set_task_flag(p_taskc, LAVD_FLAG_WOKEN_BY_RT_DL);
+	else
+		reset_task_flag(p_taskc, LAVD_FLAG_WOKEN_BY_RT_DL);
+
 	waker_taskc = get_task_ctx(waker);
 	if (!waker_taskc)
 		return;
@@ -950,6 +975,8 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 	}
 
 	p_taskc->lat_cri_waker = waker_taskc->lat_cri;
+	if (waker_taskc->lat_cri_wakee < p_taskc->lat_cri)
+		waker_taskc->lat_cri_wakee = p_taskc->lat_cri;
 
 	if (is_monitored) {
 		char comm_buf[TASK_COMM_LEN];
@@ -1365,7 +1392,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	else
 		taskc->cgrp_id = 0;
 
+	bpf_rcu_read_lock();
 	set_on_core_type(taskc, p->cpus_ptr);
+	bpf_rcu_read_unlock();
 
 	return 0;
 }
