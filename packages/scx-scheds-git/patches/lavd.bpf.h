@@ -167,6 +167,7 @@ enum consts_flags {
 	LAVD_FLAG_IDLE_CPU_PICKED	= (0x1 << 9),
 	LAVD_FLAG_KSOFTIRQD		= (0x1 << 10),
 	LAVD_FLAG_WOKEN_BY_RT_DL	= (0x1 << 11),
+	LAVD_FLAG_PINNED_WAITING	= (0x1 << 12),
 };
 
 /*
@@ -306,6 +307,7 @@ struct cpu_ctx {
 	volatile u32	nr_perf_cri;	/* performance critical task count */
 	volatile u32	nr_lat_cri;	/* latency critical task count */
 	volatile u32	nr_pinned_tasks; /* the number of pinned tasks waiting for running on this CPU */
+	volatile u32	nr_pinned_waiting; /* the number of pinned tasks actually queued and waiting */
 	volatile s32	futex_op;	/* futex op in futex V1 */
 	volatile u32	avg_util;	/* average of the CPU utilization */
 	volatile u32	cur_util;	/* CPU utilization of the current interval */
@@ -479,9 +481,15 @@ bool is_lat_cri(task_ctx *taskc);
 u16 get_nice_prio(struct task_struct *p);
 u32 cpu_to_dsq(u32 cpu);
 
+bool is_pinned(const struct task_struct *p);
+
 void set_task_flag(task_ctx *taskc, u64 flag);
 void reset_task_flag(task_ctx *taskc, u64 flag);
 bool test_task_flag(task_ctx *taskc, u64 flag);
+
+void maybe_inc_pinned_waiting(task_ctx *taskc, struct cpu_ctx *cpuc,
+			      struct task_struct *p);
+void maybe_dec_pinned_waiting(task_ctx *taskc, struct cpu_ctx *cpuc);
 
 /*
  * DSQ routing helpers with branch prediction hints.
@@ -508,6 +516,11 @@ static __always_inline bool is_per_cpu_dsq_migratable(void)
 static __always_inline bool use_cpdom_dsq(void)
 {
 	return likely(!per_cpu_dsq);
+}
+
+static __always_inline bool pinned_waiting_enabled(void)
+{
+	return unlikely(pinned_slice_ns && !per_cpu_dsq);
 }
 
 bool queued_on_cpu(struct cpu_ctx *cpuc);

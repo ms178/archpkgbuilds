@@ -178,6 +178,69 @@ u64 __attribute__((noinline)) calc_avg_freq(u64 old_freq, u64 interval)
 }
 
 __hidden
+bool is_pinned(const struct task_struct *p)
+{
+	return p->nr_cpus_allowed == 1;
+}
+
+__hidden __always_inline void maybe_inc_pinned_waiting(task_ctx __arg_arena *taskc,
+						       struct cpu_ctx *cpuc,
+						       struct task_struct *p)
+{
+	u32 this_cpu;
+
+	if (unlikely(!taskc || !cpuc || !p))
+		return;
+
+	if (!pinned_waiting_enabled())
+		return;
+
+	if (!is_pinned(p))
+		return;
+
+	if (test_task_flag(taskc, LAVD_FLAG_PINNED_WAITING))
+		return;
+
+	set_task_flag(taskc, LAVD_FLAG_PINNED_WAITING);
+
+	this_cpu = (u32)bpf_get_smp_processor_id();
+	if (likely(this_cpu == (u32)cpuc->cpu_id)) {
+		/*
+		 * Local CPU update: no other CPU can update this per-CPU
+		 * instance simultaneously, so non-atomic is safe and faster.
+		 */
+		cpuc->nr_pinned_waiting++;
+	} else {
+		/* Cross-CPU update must be atomic. */
+		__sync_fetch_and_add(&cpuc->nr_pinned_waiting, 1);
+	}
+}
+
+__hidden __always_inline void maybe_dec_pinned_waiting(task_ctx __arg_arena *taskc,
+						       struct cpu_ctx *cpuc)
+{
+	u32 this_cpu;
+
+	if (unlikely(!taskc || !cpuc))
+		return;
+
+	if (!test_task_flag(taskc, LAVD_FLAG_PINNED_WAITING))
+		return;
+
+	reset_task_flag(taskc, LAVD_FLAG_PINNED_WAITING);
+
+	this_cpu = (u32)bpf_get_smp_processor_id();
+	if (likely(this_cpu == (u32)cpuc->cpu_id)) {
+		/* Local CPU: fast non-atomic decrement. */
+		if (likely(cpuc->nr_pinned_waiting > 0))
+			cpuc->nr_pinned_waiting--;
+	} else {
+		/* Cross-CPU: atomic decrement. */
+		__sync_fetch_and_sub(&cpuc->nr_pinned_waiting, 1);
+	}
+}
+
+__hidden
 bool is_kernel_task(struct task_struct *p)
 {
 	return !!(p->flags & PF_KTHREAD);
@@ -193,12 +256,6 @@ __hidden
 bool is_ksoftirqd(struct task_struct *p)
 {
 	return is_kernel_task(p) && !__builtin_memcmp(p->comm, "ksoftirqd/", 10);
-}
-
-__hidden
-bool is_pinned(const struct task_struct *p)
-{
-	return p->nr_cpus_allowed == 1;
 }
 
 __hidden

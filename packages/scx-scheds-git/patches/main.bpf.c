@@ -142,11 +142,12 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 	avg_lat_cri = READ_ONCE(sys_stat.avg_lat_cri);
 
 	/*
-	 * If pinned_slice_ns is enabled and there are pinned tasks, reduce
-	 * time slice to ensure pinned tasks can run promptly.
+	 * Ultra-perf pinned-slice gating:
+	 * Shrink only if pinned tasks are actually waiting (per-CPU counter).
+	 * Zero DSQ probes in the hot path.
 	 */
 	pinned = READ_ONCE(pinned_slice_ns);
-	if (unlikely(pinned && READ_ONCE(cpuc->nr_pinned_tasks) != 0)) {
+	if (unlikely(pinned && READ_ONCE(cpuc->nr_pinned_waiting) != 0)) {
 		slice = pinned < base_slice ? pinned : base_slice;
 		taskc->slice = slice;
 		reset_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
@@ -155,15 +156,7 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 
 	slice = base_slice;
 
-	/*
-	 * FAST PATH: Common case - non-pinned task with avg_runtime < base_slice.
-	 * This covers 90%+ of tasks in gaming/compilation workloads.
-	 */
 	if (likely(avg_runtime < base_slice)) {
-		/*
-		 * Turbo boost on big cores for perf-critical tasks.
-		 * Gaming workloads typically have 1-2 perf-critical threads.
-		 */
 		if (have_turbo_core && likely(cpuc->big_core) &&
 		    likely(taskc->perf_cri > avg_perf_cri)) {
 			slice = base_slice + (base_slice >> 2);
@@ -171,13 +164,9 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 				slice = max_slice;
 			boosted = true;
 		}
-		/* Otherwise, use base_slice - common for background tasks */
 		goto done;
 	}
 
-	/*
-	 * SLOW PATH: Task using more than base slice (CPU-bound).
-	 */
 	if (!no_slice_boost && READ_ONCE(cpuc->nr_pinned_tasks) == 0) {
 		if (can_boost_slice()) {
 			slice = avg_runtime + LAVD_SLICE_BOOST_BONUS;
@@ -646,6 +635,11 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		__sync_fetch_and_add(&cpuc->nr_pinned_tasks, 1);
 	}
 
+	/*
+	 * Ultra-perf: track pinned waiting without DSQ probes.
+	 */
+	maybe_inc_pinned_waiting(taskc, cpuc, p);
+
 	if (is_idle && !queued_on_cpu(cpuc)) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)cpu, p->scx.slice, enq_flags);
 	} else {
@@ -697,6 +691,11 @@ static int enqueue_cb(struct task_struct __arg_trusted *p)
 		WRITE_ONCE(taskc->pinned_cpu_id, cpu);
 		__sync_fetch_and_add(&cpuc->nr_pinned_tasks, 1);
 	}
+
+	/*
+	 * Ultra-perf: track pinned waiting without DSQ probes.
+	 */
+	maybe_inc_pinned_waiting(taskc, cpuc, p);
 
 	dsq_id = get_target_dsq_id(p, cpuc);
 	scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice, p->scx.dsq_vtime, 0);
@@ -1012,6 +1011,11 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 		return;
 	}
 
+	/*
+	 * If this task was counted as pinned-waiting, it is now running.
+	 */
+	maybe_dec_pinned_waiting(taskc, cpuc);
+
 	if (p->scx.slice == SCX_SLICE_DFL)
 		p->scx.dsq_vtime = READ_ONCE(cur_logical_clk);
 
@@ -1086,6 +1090,11 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
 		return;
 	}
 	cpuc->flags = 0;
+
+	/*
+	 * If task slept before running, clear pinned-waiting state.
+	 */
+	maybe_dec_pinned_waiting(taskc, cpuc);
 
 	pin_cpu = READ_ONCE(taskc->pinned_cpu_id);
 	if (pin_cpu != -ENOENT) {
