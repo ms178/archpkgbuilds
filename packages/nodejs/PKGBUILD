@@ -1,64 +1,189 @@
+# Maintainer: CachyOS Team
 pkgname=nodejs
 pkgver=25.3.0
-pkgrel=3.1
-pkgdesc='Evented I/O for V8 javascript'
+pkgrel=8
+pkgdesc='Evented I/O for V8 JavaScript (PGO optimized)'
 arch=('x86_64')
 url='https://nodejs.org/'
 license=('MIT')
-options=(strip)
+options=('!lto')
 depends=(
-  'brotli'
-  'c-ares'
-  'icu'
-  'libnghttp2'
-  'libnghttp3'
-  'libngtcp2'
-  'libuv'
-  'openssl'
-  'zlib'
-) # 'http-parser' 'v8')
-makedepends=(
-  'git'
-  'procps-ng'
-  'python'
+  brotli
+  c-ares
+  icu
+  libnghttp2
+  libnghttp3
+  libngtcp2
+  libuv
+  openssl
+  zlib
 )
-optdepends=('npm: nodejs package manager')
-source=("git+https://github.com/nodejs/node.git#tag=v$pkgver?signed")
+makedepends=(
+  git
+  procps-ng
+  python
+  clang
+  llvm
+  lld
+)
+source=("node::git+https://github.com/nodejs/node.git#tag=v$pkgver?signed")
 sha512sums=('SKIP')
 
-build() {
-  cd node
+_run_node_workload() {
+  local nodebin="$1"
+  local timeout_sec="${2:-15}"
 
-  ./configure \
-    --prefix=/usr \
-    --with-intl=system-icu \
-    --without-npm \
-    --shared \
-    --shared-openssl \
-    --shared-zlib \
-    --shared-libuv \
-    --experimental-http-parser \
-    --shared-nghttp2 \
-    --shared-nghttp3 \
-    --shared-ngtcp2 \
-    --shared-cares \
-    --shared-brotli
-    # --shared-v8
-    # --shared-http-parser
+  _rt() {
+    timeout -k 5s "${1}s" "$nodebin" -e "$2" >/dev/null 2>&1 || true
+  }
 
-  make
+  # V8 JIT warmup
+  _rt 15 "
+    function hot(x) {
+      let s = 0;
+      for (let i = 0; i < 5e5; i++) s += i % 2 ? x * 1.5 : x * 2;
+      return s;
+    }
+    for (let i = 0; i < 30; i++) { hot(i); hot(i * 1.5); }
+  "
+
+  # Async patterns
+  _rt 20 "
+    const crypto = require('crypto');
+    class Proc {
+      constructor() { this.buf = Buffer.alloc(8192); }
+      async run(id) {
+        return new Promise(r => setImmediate(() => {
+          const h = crypto.createHash('sha256');
+          for (let i = 0; i < 500; i++) h.update(this.buf);
+          r(h.digest('hex'));
+        }));
+      }
+    }
+    (async () => {
+      const p = new Proc();
+      await Promise.all(Array.from({length:50}, (_,i) => p.run(i)));
+    })();
+  "
+
+  # File I/O
+  _rt 25 "
+    const fs = require('fs').promises, os = require('os'), path = require('path');
+    (async () => {
+      const d = path.join(os.tmpdir(), 'pgo_' + process.pid);
+      await fs.mkdir(d, {recursive:true});
+      for (let i = 0; i < 20; i++)
+        await fs.writeFile(path.join(d, i+'.txt'), 'x'.repeat(1024));
+      await fs.rm(d, {recursive:true,force:true});
+    })();
+  "
+
+  # HTTP
+  _rt 30 "
+    const http = require('http'), {once} = require('events');
+    (async () => {
+      const srv = http.createServer((q,s) => { s.end('ok'); });
+      srv.listen(0, '127.0.0.1');
+      await once(srv, 'listening');
+      const {port} = srv.address();
+      await Promise.all(Array.from({length:50}, () =>
+        new Promise(r => http.get({host:'127.0.0.1',port}, res => {
+          res.on('data',()=>{}).on('end',r);
+        }))
+      ));
+      srv.close();
+    })();
+  "
+
+  # Crypto + zlib
+  _rt 20 "
+    const crypto = require('crypto'), zlib = require('zlib');
+    for (let i = 0; i < 2000; i++) crypto.createHash('sha256').update('d'+i).digest();
+    const b = Buffer.alloc(32768, 'x');
+    for (let i = 0; i < 50; i++) zlib.gzipSync(b);
+  "
+
+  # VM
+  _rt 10 "
+    const vm = require('vm');
+    for (let i = 0; i < 200; i++) vm.runInNewContext('a+b', {a:i,b:i*2});
+  "
 }
 
-#check() {
-#  cd node
-#  make test || :
-#}
+build() {
+  cd "$srcdir/node"
+
+  export CC=clang
+  export CXX=clang++
+  export AR=llvm-ar
+  export NM=llvm-nm
+  export RANLIB=llvm-ranlib
+
+  # Save original flags
+  local _orig_cflags="${CFLAGS:-}"
+  local _orig_cxxflags="${CXXFLAGS:-}"
+  local _orig_ldflags="${LDFLAGS:-}"
+
+  local pgo_dir="$srcdir/pgo-data"
+  mkdir -p "$pgo_dir"
+
+  local configure_opts=(
+    --prefix=/usr
+    --with-intl=system-icu
+    --without-npm
+    --shared-openssl
+    --shared-zlib
+    --shared-libuv
+    --shared-nghttp2
+    --shared-nghttp3
+    --shared-ngtcp2
+    --shared-cares
+    --shared-brotli
+  )
+
+  # =============================================
+  # PASS 1: Instrumented build
+  # =============================================
+  echo "==> PASS 1: PGO instrumentation build"
+
+  export CFLAGS="${_orig_cflags} -fprofile-generate=${pgo_dir}"
+  export CXXFLAGS="${_orig_cxxflags} -fprofile-generate=${pgo_dir}"
+  export LDFLAGS="${_orig_ldflags} -fprofile-generate=${pgo_dir} -fuse-ld=lld"
+
+  ./configure "${configure_opts[@]}"
+  make -j"$(nproc)"
+
+  echo "==> Running training workload..."
+  _run_node_workload "$srcdir/node/out/Release/node"
+
+  # Merge profiles
+  echo "==> Merging profiles..."
+  llvm-profdata merge -output="$srcdir/merged.profdata" "$pgo_dir"/*.profraw
+
+  if [[ ! -s "$srcdir/merged.profdata" ]]; then
+    echo "ERROR: Profile generation failed"
+    return 1
+  fi
+
+  # =============================================
+  # PASS 2: Optimized build
+  # =============================================
+  echo "==> PASS 2: PGO-optimized build"
+
+  make clean
+
+  export CFLAGS="${_orig_cflags} -fprofile-use=${srcdir}/merged.profdata"
+  export CXXFLAGS="${_orig_cxxflags} -fprofile-use=${srcdir}/merged.profdata"
+  export LDFLAGS="${_orig_ldflags} -fprofile-use=${srcdir}/merged.profdata -fuse-ld=lld"
+
+  ./configure "${configure_opts[@]}"
+  make -j"$(nproc)"
+
+  echo "==> PGO build complete"
+}
 
 package() {
-  cd node
+  cd "$srcdir/node"
   make DESTDIR="$pkgdir" install
-  install -Dm644 LICENSE -t "$pkgdir"/usr/share/licenses/nodejs/
-
-  cd "$pkgdir"/usr/lib
-  ln -s libnode.so.* libnode.so
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
 }
