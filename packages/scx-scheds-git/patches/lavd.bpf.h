@@ -1,12 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * scx_lavd: Latency-criticality Aware Virtual Deadline (LAVD) scheduler
- *
- * Optimized Header for Intel Raptor Lake (i7-14700KF)
- * - 64-byte Cache Line Alignment for L1/L2 efficiency
- * - False Sharing Mitigation via struct padding
- * - Aggressive timing for low-latency gaming/interactive workloads
- *
  * Copyright (c) 2023, 2024 Valve Corporation.
  * Author: Changwoo Min <changwoo@igalia.com>
  */
@@ -19,24 +12,14 @@
 #include <lib/atq.h>
 
 /*
- * Common Macros & Constants
+ * common macros
  */
-#ifndef U64_MAX
 #define U64_MAX		((u64)~0ULL)
-#endif
-#ifndef S64_MAX
 #define S64_MAX		((s64)(U64_MAX >> 1))
-#endif
-#ifndef U32_MAX
 #define U32_MAX		((u32)~0U)
-#endif
-#ifndef S32_MAX
 #define S32_MAX		((s32)(U32_MAX >> 1))
-#endif
 
-#ifndef MAX_RT_PRIO
 #define MAX_RT_PRIO	100
-#endif
 
 #define LAVD_SHIFT			10
 #define LAVD_SCALE			(1L << LAVD_SHIFT)
@@ -50,10 +33,6 @@
 
 #define LAVD_CACHELINE_ALIGNED		__attribute__((aligned(CACHELINE_SIZE)))
 
-/*
- * Safe time delta calculation - handles clock wraparound.
- * Returns 0 if before > after (should not happen in normal operation).
- */
 static __always_inline u64 lavd_time_delta(u64 after, u64 before)
 {
 	return (after >= before) ? (after - before) : 0;
@@ -83,12 +62,7 @@ enum {
 };
 
 /*
- * Common constants - Tuned for Intel Raptor Lake low-latency workloads
- *
- * Key tuning rationale:
- * - LAVD_TARGETED_LATENCY_NS: 5ms vs upstream 10ms for snappier response
- * - LAVD_SLICE_MAX_NS_DFL: 4ms vs 5ms reduces tail latencies on hybrid arch
- * - LAVD_LC_FREQ_MAX: 400000 vs 100000 for finer granularity (2.5us vs 10us)
+ * common constants
  */
 enum consts_internal {
 	CLOCK_BOOTTIME			= 7,
@@ -101,16 +75,10 @@ enum consts_internal {
 	LAVD_MAX_RETRY			= 3,
 
 	/*
-	 * TUNED: More aggressive latency target for gaming/interactive.
-	 * 5ms vs upstream 10ms - halves worst-case scheduling latency.
+	 * Tuned for low-latency interactive workloads.
 	 */
 	LAVD_TARGETED_LATENCY_NS	= (5ULL * NSEC_PER_MSEC),
 	LAVD_SLICE_MIN_NS_DFL		= (500ULL * NSEC_PER_USEC),
-	/*
-	 * TUNED: Shorter max slice reduces tail latencies for interactive
-	 * workloads on P-core/E-core hybrid architectures.
-	 * 4ms vs upstream 5ms - 20% faster rebalancing decisions.
-	 */
 	LAVD_SLICE_MAX_NS_DFL		= (4ULL * NSEC_PER_MSEC),
 	LAVD_SLICE_BOOST_BONUS		= LAVD_SLICE_MIN_NS_DFL,
 	LAVD_SLICE_BOOST_MAX		= (500ULL * NSEC_PER_MSEC),
@@ -118,11 +86,6 @@ enum consts_internal {
 	LAVD_TASK_LAG_MAX		= (10ULL * LAVD_SLICE_MAX_NS_DFL),
 	LAVD_DL_COMPETE_WINDOW		= (LAVD_SLICE_MAX_NS_DFL >> 16),
 
-	/*
-	 * TUNED: Higher frequency tracking for more accurate latency
-	 * criticality detection. Enables 2.5us minimum interval vs upstream 10us.
-	 * Critical for detecting high-frequency wake patterns in games.
-	 */
 	LAVD_LC_FREQ_MAX		= 400000,
 	LAVD_LC_RUNTIME_MAX		= LAVD_TIME_ONE_SEC,
 	LAVD_LC_WEIGHT_BOOST_REGULAR	= 128,
@@ -133,12 +96,14 @@ enum consts_internal {
 	LAVD_LC_INH_RECEIVER_SHIFT	= 2,
 	LAVD_LC_INH_GIVER_SHIFT		= 3,
 
-	LAVD_CPU_UTIL_MAX_FOR_CPUPERF	= p2s(85),
-
-	LAVD_SYS_STAT_INTERVAL_NS	= (2 * LAVD_SLICE_MAX_NS_DFL),
+	LAVD_SYS_STAT_INTERVAL_NS	= (10ULL * NSEC_PER_MSEC),
 	LAVD_SYS_STAT_DECAY_TIMES	= ((2ULL * LAVD_TIME_ONE_SEC) / LAVD_SYS_STAT_INTERVAL_NS),
 
-	LAVD_CC_PER_CPU_UTIL		= p2s(40),
+	LAVD_CPU_UTIL_MAX_FOR_CPUPERF	= p2s(85),
+	LAVD_CPU_UTIL_THR_FOR_MAX_FREQ	= p2s(80),
+
+	LAVD_CC_REQ_CAPACITY_HEADROOM	= p2s(25),
+	LAVD_CC_PER_CPU_UTIL		= p2s(50),
 	LAVD_CC_UTIL_SPIKE		= p2s(90),
 	LAVD_CC_CPU_PIN_INTERVAL	= (250ULL * NSEC_PER_MSEC),
 	LAVD_CC_CPU_PIN_INTERVAL_DIV	= (LAVD_CC_CPU_PIN_INTERVAL / LAVD_SYS_STAT_INTERVAL_NS),
@@ -167,17 +132,13 @@ enum consts_flags {
 	LAVD_FLAG_IDLE_CPU_PICKED	= (0x1 << 9),
 	LAVD_FLAG_KSOFTIRQD		= (0x1 << 10),
 	LAVD_FLAG_WOKEN_BY_RT_DL	= (0x1 << 11),
+
+	/* Required by util.bpf.c pinned-waiting accounting. */
 	LAVD_FLAG_PINNED_WAITING	= (0x1 << 12),
 };
 
 /*
  * Task context
- *
- * Cache line layout optimized for Intel Raptor Lake:
- * - Line 0: SCX common (must be first per upstream requirement)
- * - Line 1: Hot scheduling flags, slice, runtime stats
- * - Line 2: Clock tracking, criticality, CPU IDs
- * - Line 3: Cold introspection data
  */
 struct task_ctx {
 	/* --- cacheline 0 boundary (0 bytes) --- */
@@ -226,13 +187,9 @@ struct task_ctx {
 /*
  * Compute domain context
  * - system > numa node > llc domain > compute domain per core type (P or E)
- *
- * Layout: Read-only topology data in first cachelines, read-write load data
- * isolated at 512-byte boundary to minimize cache line bouncing during
- * load balancing operations.
  */
 struct cpdom_ctx {
-	/* --- cacheline 0 boundary (0 bytes): read-only topology --- */
+	/* --- cacheline 0 boundary (0 bytes): read-only --- */
 	u64	id;				    /* id of this compute domain */
 	u64	alt_id;				    /* id of the closest compute domain of alternative type */
 	u8	numa_id;			    /* numa domain id */
@@ -276,17 +233,10 @@ struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p);
 /*
  * CPU context
  *
- * Optimized cache line layout for Intel Raptor Lake hybrid architecture:
- * - Line 0: Hot preemption/scheduling state (flags, timing, criticality sums)
- * - Line 1: Per-schedule counters, utilization, futex state
- * - Line 2: Stolen time tracking, idle tracking, topology (read-mostly)
- * - Line 3+: Temporary cpumask pointers (read-only after init)
- *
- * False sharing mitigation: Frequently updated fields grouped in lines 0-1,
- * read-mostly/read-only fields isolated in later cache lines.
+ * Layout is cacheline-aware; frequently updated fields are grouped.
  */
 struct cpu_ctx {
-	/* --- cacheline 0 boundary (0 bytes): Hot scheduling state --- */
+	/* --- cacheline 0 boundary (0 bytes) --- */
 	volatile u64	flags;		/* cached copy of task's flags */
 	volatile u64	tot_task_time;	/* total wall-clock time this CPU has spent running scx tasks so far. */
 	volatile u64	tot_svc_time;	/* total scx tasks' service time on a CPU scaled by tasks' weights */
@@ -294,60 +244,55 @@ struct cpu_ctx {
 	volatile u64	est_stopping_clk; /* estimated stopping time */
 	volatile u64	running_clk;	/* when a task starts running */
 	volatile u16	lat_cri;	/* latency criticality */
+	volatile u16	effective_capacity;/* the capacity that CPU can do right now */
 	volatile u32	max_lat_cri;	/* maximum latency criticality */
 	volatile u64	sum_lat_cri;	/* sum of latency criticality */
-	volatile u64	sum_perf_cri;	/* sum of performance criticality */
 
-	/* --- cacheline 1 boundary (64 bytes): Per-schedule counters --- */
+	/* --- cacheline 1 boundary (64 bytes) --- */
+	volatile u64	sum_perf_cri;	/* sum of performance criticality */
 	volatile u32	min_perf_cri;	/* minimum performance criticality */
 	volatile u32	max_perf_cri;	/* maximum performance criticality */
+	volatile u32	max_freq;	/* maximum CPU frequency averaged across multiple intervals */
 	volatile u32	nr_sched;	/* number of schedules */
-	volatile u32	nr_preempt;	/* preemption count */
-	volatile u32	nr_x_migration;	/* cross-domain migration count */
-	volatile u32	nr_perf_cri;	/* performance critical task count */
-	volatile u32	nr_lat_cri;	/* latency critical task count */
+	volatile u32	nr_preempt;
+	volatile u32	nr_x_migration;
+	volatile u32	nr_perf_cri;
+	volatile u32	nr_lat_cri;
 	volatile u32	nr_pinned_tasks; /* the number of pinned tasks waiting for running on this CPU */
-	volatile u32	nr_pinned_waiting; /* the number of pinned tasks actually queued and waiting */
+	volatile u32	nr_pinned_waiting; /* pinned tasks queued+waiting (fast path; no DSQ probes) */
 	volatile s32	futex_op;	/* futex op in futex V1 */
 	volatile u32	avg_util;	/* average of the CPU utilization */
 	volatile u32	cur_util;	/* CPU utilization of the current interval */
 	u32		cpuperf_cur;	/* CPU's current performance target */
+
+	/* --- cacheline 2 boundary (128 bytes) --- */
+	volatile u32	max_freq_observed; /* maximum CPU frequency observed within an interval scaled to 1024 */
 	volatile u32	avg_sc_util;	/* average of the scaled CPU utilization, which is capacity and frequency invariant. */
 	volatile u32	cur_sc_util;	/* the scaled CPU utilization of the current interval, which is capacity and frequency invariant. */
-
 	volatile u64	cpu_release_clk; /* when the CPU is taken by higher-priority scheduler class */
-
-	/* --- cacheline 2 boundary (128 bytes): Stolen time + idle tracking --- */
 	volatile u32	avg_stolen_est;	/* Average of estimated steal/irq utilization of CPU */
 	volatile u32	cur_stolen_est;	/* Estimated irq/steal utilization of the current interval */
 	volatile u64	stolen_time_est; /* Estimated time stolen by steal/irq time on CPU */
-
-	/*
-	 * Idle tracking (read-mostly)
-	 */
 	volatile u64	idle_total;	/* total idle time so far */
 	volatile u64	idle_start_clk;	/* when the CPU becomes idle */
 	u64		online_clk;	/* when a CPU becomes online */
 	u64		offline_clk;	/* when a CPU becomes offline */
 
 	/*
-	 * Fields for core compaction (read-only after init)
+	 * --- cacheline 3 boundary (192 bytes) ---
+	 * (read-only)
 	 */
 	u16		cpu_id;		/* cpu id */
-	u16		capacity;	/* CPU capacity based on 1024 */
+	u16		max_capacity;	/* the maximum capacity that CPU can do */
 	u8		big_core;	/* is it a big core? */
 	u8		turbo_core;	/* is it a turbo core? */
 	u8		llc_id;		/* llc domain id */
 	u8		cpdom_id;	/* compute domain id */
-	u8		cpdom_alt_id;	/* compute domain id of alternative type */
+	u8		cpdom_alt_id;	/* compute domain id of anternative type */
 	u8		is_online;	/* is this CPU online? */
 
-	/*
-	 * Temporary cpu masks (read-only pointers)
-	 */
 	struct bpf_cpumask __kptr *tmp_a_mask; /* for active set */
 	struct bpf_cpumask __kptr *tmp_o_mask; /* for overflow set */
-	/* --- cacheline 3 boundary (192 bytes) --- */
 	struct bpf_cpumask __kptr *tmp_l_mask; /* for online cpumask */
 	struct bpf_cpumask __kptr *tmp_i_mask; /* for idle cpumask */
 	struct bpf_cpumask __kptr *tmp_t_mask;
@@ -355,15 +300,16 @@ struct cpu_ctx {
 	struct bpf_cpumask __kptr *tmp_t3_mask;
 } LAVD_CACHELINE_ALIGNED;
 
-extern const volatile u64	nr_llcs;
+extern const volatile u64	nr_llcs;	/* number of LLC domains */
 extern const volatile u32	nr_cpu_ids;
-extern volatile u64		nr_cpus_onln;
+extern volatile u64		nr_cpus_onln;	/* current number of online CPUs */
 
 extern const volatile u16	cpu_capacity[LAVD_CPU_ID_MAX];
 extern const volatile u8	cpu_big[LAVD_CPU_ID_MAX];
 extern const volatile u8	cpu_turbo[LAVD_CPU_ID_MAX];
 
-/* Logging & Debugging */
+/* Logging helpers. */
+
 extern const volatile bool	no_wake_sync;
 extern const volatile bool	no_slice_boost;
 extern const volatile u8	verbose;
@@ -382,35 +328,18 @@ extern const volatile u8	verbose;
 					##__VA_ARGS__);			\
 })
 
-/*
- * Arithmetic helpers
- *
- * Using __auto_type for type safety - prevents silent truncation bugs
- * and double-evaluation issues with simple macro expansion.
- */
+/* Arithmetic helpers. */
+
 #ifndef min
-#define min(X, Y) ({				\
-	__auto_type __x = (X);			\
-	__auto_type __y = (Y);			\
-	(__x < __y) ? __x : __y;		\
-})
+#define min(X, Y) (((X) < (Y)) ? (X) : (Y))
 #endif
 
 #ifndef max
-#define max(X, Y) ({				\
-	__auto_type __x = (X);			\
-	__auto_type __y = (Y);			\
-	(__x > __y) ? __x : __y;		\
-})
+#define max(X, Y) (((X) < (Y)) ? (Y) : (X))
 #endif
 
 #ifndef clamp
-#define clamp(val, lo, hi) ({			\
-	__auto_type __v = (val);		\
-	__auto_type __l = (lo);			\
-	__auto_type __h = (hi);			\
-	(__v < __l) ? __l : ((__v > __h) ? __h : __v); \
-})
+#define clamp(val, lo, hi) min(max(val, lo), hi)
 #endif
 
 #ifndef likely
@@ -427,29 +356,15 @@ u64 calc_asym_avg(u64 old_val, u64 new_val);
 /* Bitmask helpers. */
 static __always_inline int cpumask_next_set_bit(u64 *cpumask)
 {
-	/*
-	 * Check the cpumask is not empty. ctzll(x) is only well-defined
-	 * for nonzero x; that's why we check for zero earlier to avoid
-	 * undefined behavior.
-	 */
 	if (!*cpumask)
 		return -ENOENT;
 
-	/* Find the next set bit. */
 	int bit = ctzll(*cpumask);
-
-	/*
-	 * This is equivalent to finding and clearing the least significant set
-	 * bit.  The statement works because subtracting one from a nonzero bit
-	 * flips all bits from the lowest set bit (inclusive) to the rightmost
-	 * position; Then, The logic here ANDing it with the original value
-	 * clears the lowest set bit.
-	 */
 	*cpumask &= *cpumask - 1;
 	return bit;
 }
 
-/* System statistics module. */
+/* System statistics module .*/
 extern struct sys_stat		sys_stat;
 
 s32 init_sys_stat(u64 now);
@@ -491,11 +406,6 @@ void maybe_inc_pinned_waiting(task_ctx *taskc, struct cpu_ctx *cpuc,
 			      struct task_struct *p);
 void maybe_dec_pinned_waiting(task_ctx *taskc, struct cpu_ctx *cpuc);
 
-/*
- * DSQ routing helpers with branch prediction hints.
- * On Raptor Lake gaming/interactive workloads, per_cpu_dsq is typically
- * disabled (cpdom DSQ is the common path).
- */
 static __always_inline bool use_per_cpu_dsq(void)
 {
 	return unlikely(per_cpu_dsq || pinned_slice_ns);
@@ -503,13 +413,6 @@ static __always_inline bool use_per_cpu_dsq(void)
 
 static __always_inline bool is_per_cpu_dsq_migratable(void)
 {
-	/*
-	 * When per_cpu-dsq is on, all tasks go to the per-CPU DSQ.
-	 * So a task on a per-CPU DSQ can be migrated to another CPU.
-	 * However, when pinned_slice_ns is on but per_cpu-dsq is not,
-	 * only pinned tasks go to the per-CPU DSQ.
-	 * Hence, tasks in a per-CPU DSQ are not migratable.
-	 */
 	return per_cpu_dsq;
 }
 
@@ -526,39 +429,10 @@ static __always_inline bool pinned_waiting_enabled(void)
 bool queued_on_cpu(struct cpu_ctx *cpuc);
 u64 get_target_dsq_id(struct task_struct *p, struct cpu_ctx *cpuc);
 
-extern struct bpf_cpumask __kptr *turbo_cpumask;
-extern struct bpf_cpumask __kptr *big_cpumask;
-extern struct bpf_cpumask __kptr *active_cpumask;
-extern struct bpf_cpumask __kptr *ovrflw_cpumask;
-
-/* Power management helpers. */
-int do_core_compaction(void);
-int update_thr_perf_cri(void);
-int reinit_active_cpumask_for_performance(void);
-bool is_perf_cri(task_ctx *taskc);
-
-extern bool			have_little_core;
-extern bool			have_turbo_core;
-extern const volatile bool	is_smt_active;
-
-extern u64			total_capacity;
-extern u64			one_little_capacity;
-extern u32			cur_big_core_scale;
-extern u32			default_big_core_scale;
-
-int init_autopilot_caps(void);
-int update_autopilot_high_cap(void);
-u64 scale_cap_freq(u64 dur, s32 cpu);
-u64 scale_cap_max_freq(u64 dur, s32 cpu);
-
-int reset_cpuperf_target(struct cpu_ctx *cpuc);
-int update_cpuperf_target(struct cpu_ctx *cpuc);
-u16 get_cpuperf_cap(s32 cpu);
-
-int reset_suspended_duration(struct cpu_ctx *cpuc);
-u64 get_suspended_duration_and_reset(struct cpu_ctx *cpuc);
-
-const volatile u16 *get_cpu_order(void);
+extern struct bpf_cpumask __kptr *turbo_cpumask; /* CPU mask for turbo CPUs */
+extern struct bpf_cpumask __kptr *big_cpumask; /* CPU mask for big CPUs */
+extern struct bpf_cpumask __kptr *active_cpumask; /* CPU mask for active CPUs */
+extern struct bpf_cpumask __kptr *ovrflw_cpumask; /* CPU mask for overflow CPUs */
 
 /* Load balancer helpers. */
 int plan_x_cpdom_migration(void);
@@ -583,7 +457,6 @@ void try_find_and_kick_victim_cpu(struct task_struct *p,
 				  u64 dsq_id);
 
 extern volatile bool is_monitored;
-
 
 /* Idle CPU pick helpers */
 
@@ -624,7 +497,7 @@ struct pick_ctx {
 	struct bpf_cpumask *io_mask;
 	struct bpf_cpumask *temp_mask;
 	/*
-	 * Flags - using bitfields for compact representation.
+	 * Flags.
 	 */
 	bool a_empty:1;
 	bool o_empty:1;
@@ -634,7 +507,6 @@ struct pick_ctx {
 	bool iat_empty:1;
 	bool io_empty:1;
 };
-
 
 s32 find_cpu_in(const struct cpumask *src_mask, struct cpu_ctx *cpuc_cur);
 s32 pick_idle_cpu(struct pick_ctx *ctx, bool *is_idle);

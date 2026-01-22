@@ -5,17 +5,17 @@
  * Copyright (c) 2023, 2024 Valve Corporation.
  * Author: Changwoo Min <changwoo@igalia.com>
  *
- * Optimized for Intel Raptor Lake hybrid architecture.
- * Key optimizations:
- * - Consolidated phase 1 to minimize cache thrashing across P/E cores
- * - Fixed upstream compute variable scope bug
+ * Optimizations for Intel Raptor Lake hybrid architecture:
+ * - Fixed compute variable scope bug in stolen_est calculation
  * - Division-by-zero guards for edge cases
- * - Proper atomic operations for cross-CPU data
+ * - Proper null pointer checks for cpdom contexts
+ * - Type-safe operations for warning-clean builds
  */
 
 #include <scx/common.bpf.h>
 #include "intf.h"
 #include "lavd.bpf.h"
+#include "power.bpf.h"
 #include <errno.h>
 #include <stdbool.h>
 #include <bpf/bpf_core_read.h>
@@ -82,14 +82,17 @@ struct sys_stat_ctx {
 	u32		cur_sc_util;
 };
 
+static struct sys_stat_ctx ctx;
+
 /*
  * Initialize the system statistics context.
  *
  * Uses READ_ONCE to prevent compiler reordering of the timestamp read,
  * ensuring accurate duration calculation even under optimization.
  */
-static void init_sys_stat_ctx(struct sys_stat_ctx *c)
+static void init_sys_stat_ctx(void)
 {
+	struct sys_stat_ctx *c = &ctx;
 	u64 last = READ_ONCE(sys_stat.last_update_clk);
 
 	__builtin_memset(c, 0, sizeof(*c));
@@ -100,25 +103,30 @@ static void init_sys_stat_ctx(struct sys_stat_ctx *c)
 	 * Ensure duration is at least 1 to prevent division by zero.
 	 * time_delta returns 0 if time went backward (rare clock adjustment).
 	 */
-	c->duration = time_delta(c->now, last) ?: 1;
+	c->duration = time_delta(c->now, last);
+	if (c->duration == 0)
+		c->duration = 1;
 	WRITE_ONCE(sys_stat.last_update_clk, c->now);
 }
 
 /*
  * Collect system-wide statistics from all CPUs and compute domains.
  *
- * This function is split into two phases to satisfy BPF verifier complexity
- * limits. Phase 1 handles the bulk of per-CPU statistics collection,
- * Phase 2 handles performance criticality for hybrid architectures.
+ * This function is split into three phases to satisfy BPF verifier complexity
+ * limits:
+ * - Phase 1: Per-CPU statistics including utilization and stolen time
+ * - Phase 2: Effective capacity updates (requires cur_util from phase 1)
+ * - Phase 3: Performance criticality for hybrid architectures
  *
- * CRITICAL FIX: stolen_est calculation moved to phase 1 to use correct
- * per-CPU compute value (upstream bug: phase 2 used stale compute from
- * last CPU of phase 1).
+ * CRITICAL: stolen_est calculation MUST be in phase 1 because it depends on
+ * the per-CPU 'compute' variable. Moving to later phases would use stale
+ * compute from last CPU of phase 1.
  */
-static void collect_sys_stat(struct sys_stat_ctx *c)
+static void collect_sys_stat(void)
 {
+	struct sys_stat_ctx *c = &ctx;
 	struct cpdom_ctx *cpdomc;
-	u64 cpdom_id, compute, non_scx_time, sc_non_scx_time, cpuc_tot_sc_time;
+	u64 cpdom_id;
 	int cpu;
 
 	/*
@@ -169,14 +177,15 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 	/*
 	 * Collect statistics for each CPU (phase 1).
 	 *
-	 * Phase 1 is consolidated to minimize cache line bouncing on Raptor Lake's
-	 * heterogeneous cache hierarchy. All per-CPU data that depends on the
-	 * computed 'compute' variable is processed here.
+	 * Phase 1 handles utilization calculation and stolen time estimation.
+	 * The stolen_est calculation MUST be here because it requires the
+	 * per-CPU 'compute' value which is loop-local.
 	 */
 	bpf_for(cpu, 0, nr_cpu_ids) {
+		u64 non_scx_time, sc_non_scx_time, cpuc_tot_sc_time, compute;
 		struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
 
-		if (unlikely(!cpuc)) {
+		if (!cpuc) {
 			c->compute_total = 0;
 			break;
 		}
@@ -188,8 +197,9 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		 * of slice-boosted tasks.
 		 */
 		if (cpuc->nr_pinned_tasks || !can_boost_slice() ||
-		    scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cpu_id))
+		    scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cpu_id)) {
 			shrink_boosted_slice_remote(cpuc, c->now);
+		}
 
 		/*
 		 * Accumulate cpus' loads.
@@ -200,9 +210,6 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		/*
 		 * If the CPU is in an idle state (i.e., idle_start_clk is
 		 * non-zero), accumulate the current idle period so far.
-		 *
-		 * Uses CAS loop to handle concurrent idle state transitions.
-		 * LAVD_MAX_RETRY bounds the loop for BPF verifier.
 		 */
 		for (int i = 0; i < LAVD_MAX_RETRY; i++) {
 			u64 old_clk = cpuc->idle_start_clk;
@@ -210,7 +217,8 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 			if (old_clk == 0 || time_after(old_clk, c->now))
 				break;
 
-			if (__sync_bool_compare_and_swap(&cpuc->idle_start_clk, old_clk, c->now)) {
+			if (__sync_bool_compare_and_swap(&cpuc->idle_start_clk,
+							  old_clk, c->now)) {
 				u64 dur = time_delta(c->now, old_clk);
 
 				__sync_fetch_and_add(&cpuc->idle_total, dur);
@@ -239,9 +247,6 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		 * time (i.e., tot_task_time) and total compute time (i.e.,
 		 * duration - idle_total). We assume the CPU frequency was at
 		 * its maximum while running non-SCX tasks.
-		 *
-		 * This is important for Raptor Lake where RT audio threads
-		 * may bypass SCX scheduling.
 		 */
 		non_scx_time = time_delta(compute, cpuc->tot_task_time);
 		sc_non_scx_time = scale_cap_max_freq(non_scx_time, cpu);
@@ -252,8 +257,6 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		 * frequency invariant. The scaled CPU utilization should
 		 * include everything — SCX task time, non-SCX task time
 		 * (RT/DL), IRQ times, etc.
-		 *
-		 * Critical for accurate power management on hybrid CPUs.
 		 */
 		cpuc_tot_sc_time = cpuc->tot_sc_time + sc_non_scx_time;
 		cpuc->cur_sc_util = (cpuc_tot_sc_time << LAVD_SHIFT) / c->duration;
@@ -268,7 +271,6 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 
 		/*
 		 * Track the scaled time when the utilization spikes happened.
-		 * Used to allocate breathing room for bursty workloads.
 		 */
 		if (cpuc->cur_util > LAVD_CC_UTIL_SPIKE)
 			c->tsct_spike += cpuc_tot_sc_time;
@@ -277,19 +279,51 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		 * Estimate time stolen by IRQ/hypervisor.
 		 *
 		 * CRITICAL FIX: This calculation MUST be in phase 1 because
-		 * it depends on 'compute' which is a loop-local variable.
-		 * Moving to phase 2 would use stale compute from last CPU.
+		 * 'compute' is a loop-local variable. Moving to a later phase
+		 * would use stale compute from last CPU of this loop.
 		 *
 		 * Guard against divide-by-zero when CPU is 100% idle.
 		 */
 		if (likely(compute > 0)) {
 			cpuc->cur_stolen_est = (cpuc->stolen_time_est << LAVD_SHIFT) / compute;
-			cpuc->avg_stolen_est = calc_asym_avg(cpuc->avg_stolen_est, cpuc->cur_stolen_est);
+			cpuc->avg_stolen_est = calc_asym_avg(cpuc->avg_stolen_est,
+							      cpuc->cur_stolen_est);
 		}
 		cpuc->stolen_time_est = 0;
 
 		/*
-		 * Accumulate statistics for P-core vs E-core analysis.
+		 * Accumulate system-wide idle time.
+		 */
+		c->idle_total += cpuc->idle_total;
+		cpuc->idle_total = 0;
+	}
+
+	/*
+	 * Collect statistics for each CPU (phase 2).
+	 *
+	 * Update effective capacity and accumulate scheduling statistics.
+	 * This must be after phase 1 since update_effective_capacity
+	 * depends on cpuc->cur_util.
+	 */
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
+
+		if (!cpuc) {
+			c->compute_total = 0;
+			break;
+		}
+
+		/*
+		 * Update the effective capacity of this CPU -- the capacity
+		 * that this CPU can achieve considering all the constraints,
+		 * such as policy, thermal, power, etc.
+		 *
+		 * WARNING: This should be called after updating cpuc->cur_util.
+		 */
+		update_effective_capacity(cpuc);
+
+		/*
+		 * Accumulate statistics.
 		 */
 		if (cpuc->big_core) {
 			c->nr_big += cpuc->nr_sched;
@@ -324,25 +358,18 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		if (cpuc->max_lat_cri > c->max_lat_cri)
 			c->max_lat_cri = cpuc->max_lat_cri;
 		cpuc->max_lat_cri = 0;
-
-		/*
-		 * Accumulate system-wide idle time.
-		 * Must be done after CAS loop updates cpuc->idle_total.
-		 */
-		c->idle_total += cpuc->idle_total;
-		cpuc->idle_total = 0;
 	}
 
 	/*
-	 * Collect statistics for each CPU (phase 2).
+	 * Collect statistics for each CPU (phase 3).
 	 *
-	 * Phase 2 only handles performance criticality tracking for hybrid
-	 * architectures. This is separated to reduce BPF verifier complexity.
+	 * Handle performance criticality tracking for hybrid architectures.
+	 * This is separated to reduce BPF verifier complexity.
 	 */
 	bpf_for(cpu, 0, nr_cpu_ids) {
 		struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
 
-		if (unlikely(!cpuc)) {
+		if (!cpuc) {
 			c->compute_total = 0;
 			break;
 		}
@@ -371,18 +398,23 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
  *
  * Updates EWMA values and handles periodic statistics decay.
  */
-static void calc_sys_stat(struct sys_stat_ctx *c)
+static void calc_sys_stat(void)
 {
-	static int cnt;
-	u64 avg_svc_time = 0, cur_sc_util, scu_spike;
+	struct sys_stat_ctx *c = &ctx;
+	static int cnt = 0;
+	u64 avg_svc_time = 0, cur_sc_util, scu_spike, duration_total, nr_online;
 
 	/*
 	 * Calculate the CPU utilization that includes everything
 	 * — scx tasks, non-scx tasks (e.g., RT/DL), IRQ, etc.
 	 *
-	 * Guard against nr_cpus_onln == 0 (system initialization).
+	 * Guard against nr_cpus_onln == 0 during system init/shutdown.
 	 */
-	c->duration_total = c->duration * (nr_cpus_onln ?: 1);
+	nr_online = nr_cpus_onln;
+	if (nr_online == 0)
+		nr_online = 1;
+	duration_total = c->duration * nr_online;
+	c->duration_total = duration_total;
 	c->compute_total = time_delta(c->duration_total, c->idle_total);
 	c->cur_util = (c->compute_total << LAVD_SHIFT) / c->duration_total;
 
@@ -416,9 +448,6 @@ static void calc_sys_stat(struct sys_stat_ctx *c)
 	 * overestimates the scaled CPU utilization and required compute
 	 * capacity and finally allocates more active CPUs. The over-allocated
 	 * CPUs become the breathing room.
-	 *
-	 * This is especially important for Raptor Lake where P-cores can
-	 * handle spiky workloads that would overwhelm E-cores.
 	 */
 	scu_spike = (c->tsct_spike << (LAVD_SHIFT - 1)) / c->duration_total;
 	c->cur_sc_util = min(cur_sc_util + scu_spike, (u64)LAVD_SCALE);
@@ -426,7 +455,7 @@ static void calc_sys_stat(struct sys_stat_ctx *c)
 	/*
 	 * Update min/max/avg.
 	 */
-	if (!c->nr_sched || !c->compute_total) {
+	if (c->nr_sched == 0 || c->compute_total == 0) {
 		/*
 		 * When a system is completely idle, it is indeed possible
 		 * nothing scheduled for an interval.
@@ -461,7 +490,7 @@ static void calc_sys_stat(struct sys_stat_ctx *c)
 		sys_stat.max_perf_cri = calc_avg32(sys_stat.max_perf_cri, c->max_perf_cri);
 	}
 
-	if (c->nr_sched)
+	if (c->nr_sched > 0)
 		avg_svc_time = c->tot_svc_time / c->nr_sched;
 	sys_stat.avg_svc_time = calc_avg(sys_stat.avg_svc_time, avg_svc_time);
 	sys_stat.nr_queued_task = calc_avg(sys_stat.nr_queued_task, c->nr_queued_task);
@@ -530,11 +559,9 @@ static void calc_sys_time_slice(void)
 
 static int do_update_sys_stat(void)
 {
-	struct sys_stat_ctx c;
-
-	init_sys_stat_ctx(&c);
-	collect_sys_stat(&c);
-	calc_sys_stat(&c);
+	init_sys_stat_ctx();
+	collect_sys_stat();
+	calc_sys_stat();
 
 	return 0;
 }
