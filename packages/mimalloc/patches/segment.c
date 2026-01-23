@@ -8,141 +8,301 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc/internal.h"
 #include "mimalloc/atomic.h"
 
-#include <string.h>  // memset
+#include <string.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
 
-/* Forward declaration */
+#if defined(__GNUC__) || defined(__clang__)
+#define MI_PREFETCH(addr) __builtin_prefetch((addr), 0, 3)
+#define MI_PREFETCH_W(addr) __builtin_prefetch((addr), 1, 3)
+#else
+#define MI_PREFETCH(addr) ((void)(addr))
+#define MI_PREFETCH_W(addr) ((void)(addr))
+#endif
+
+#if defined(__GNUC__) && __GNUC__ >= 14
+#define MI_NODISCARD [[nodiscard]]
+#elif defined(__clang__) && __clang_major__ >= 17
+#define MI_NODISCARD [[nodiscard]]
+#else
+#define MI_NODISCARD
+#endif
+
+#ifndef MI_COMMIT_MASK_FIELD_COUNT
+#define MI_COMMIT_MASK_FIELD_COUNT 4
+#endif
+
+#ifndef MI_COMMIT_MASK_FIELD_BITS
+#define MI_COMMIT_MASK_FIELD_BITS 64
+#endif
+
+#ifndef MI_COMMIT_MASK_BITS
+#define MI_COMMIT_MASK_BITS (MI_COMMIT_MASK_FIELD_COUNT * MI_COMMIT_MASK_FIELD_BITS)
+#endif
+
 static void mi_segment_try_purge(mi_segment_t* segment, bool force);
 
+static inline size_t mi_ctz_safe(size_t x) {
+  if (x == 0) return MI_COMMIT_MASK_FIELD_BITS;
+  return (size_t)mi_ctz(x);
+}
 
-/* ---------------------------------------------------------------------------
-  Commit Mask Operations
-  Optimized for Raptor Lake using hardware bit manipulation (BMI1/BMI2)
---------------------------------------------------------------------------- */
+static inline size_t mi_clz_safe(size_t x) {
+  if (x == 0) return MI_COMMIT_MASK_FIELD_BITS;
+  return (size_t)mi_clz(x);
+}
 
 static bool mi_commit_mask_all_set(const mi_commit_mask_t* commit, const mi_commit_mask_t* cm) {
+#if MI_COMMIT_MASK_FIELD_COUNT == 4
+  const size_t m0 = commit->mask[0] & cm->mask[0];
+  const size_t m1 = commit->mask[1] & cm->mask[1];
+  const size_t m2 = commit->mask[2] & cm->mask[2];
+  const size_t m3 = commit->mask[3] & cm->mask[3];
+  return (m0 == cm->mask[0]) & (m1 == cm->mask[1]) & (m2 == cm->mask[2]) & (m3 == cm->mask[3]);
+#elif MI_COMMIT_MASK_FIELD_COUNT == 8
+  const size_t m0 = commit->mask[0] & cm->mask[0];
+  const size_t m1 = commit->mask[1] & cm->mask[1];
+  const size_t m2 = commit->mask[2] & cm->mask[2];
+  const size_t m3 = commit->mask[3] & cm->mask[3];
+  const size_t m4 = commit->mask[4] & cm->mask[4];
+  const size_t m5 = commit->mask[5] & cm->mask[5];
+  const size_t m6 = commit->mask[6] & cm->mask[6];
+  const size_t m7 = commit->mask[7] & cm->mask[7];
+  return (m0 == cm->mask[0]) & (m1 == cm->mask[1]) & (m2 == cm->mask[2]) & (m3 == cm->mask[3]) &
+         (m4 == cm->mask[4]) & (m5 == cm->mask[5]) & (m6 == cm->mask[6]) & (m7 == cm->mask[7]);
+#else
   for (size_t i = 0; i < MI_COMMIT_MASK_FIELD_COUNT; i++) {
     if ((commit->mask[i] & cm->mask[i]) != cm->mask[i]) return false;
   }
   return true;
+#endif
 }
 
 static bool mi_commit_mask_any_set(const mi_commit_mask_t* commit, const mi_commit_mask_t* cm) {
+#if MI_COMMIT_MASK_FIELD_COUNT == 4
+  const size_t combined = (commit->mask[0] & cm->mask[0]) |
+                          (commit->mask[1] & cm->mask[1]) |
+                          (commit->mask[2] & cm->mask[2]) |
+                          (commit->mask[3] & cm->mask[3]);
+  return combined != 0;
+#elif MI_COMMIT_MASK_FIELD_COUNT == 8
+  const size_t combined = (commit->mask[0] & cm->mask[0]) |
+                          (commit->mask[1] & cm->mask[1]) |
+                          (commit->mask[2] & cm->mask[2]) |
+                          (commit->mask[3] & cm->mask[3]) |
+                          (commit->mask[4] & cm->mask[4]) |
+                          (commit->mask[5] & cm->mask[5]) |
+                          (commit->mask[6] & cm->mask[6]) |
+                          (commit->mask[7] & cm->mask[7]);
+  return combined != 0;
+#else
   for (size_t i = 0; i < MI_COMMIT_MASK_FIELD_COUNT; i++) {
     if ((commit->mask[i] & cm->mask[i]) != 0) return true;
   }
   return false;
+#endif
 }
 
-static void mi_commit_mask_create_intersect(const mi_commit_mask_t* commit, const mi_commit_mask_t* cm, mi_commit_mask_t* res) {
+static void mi_commit_mask_create_intersect(const mi_commit_mask_t* commit,
+                                            const mi_commit_mask_t* cm,
+                                            mi_commit_mask_t* res) {
+#if MI_COMMIT_MASK_FIELD_COUNT == 4
+  res->mask[0] = commit->mask[0] & cm->mask[0];
+  res->mask[1] = commit->mask[1] & cm->mask[1];
+  res->mask[2] = commit->mask[2] & cm->mask[2];
+  res->mask[3] = commit->mask[3] & cm->mask[3];
+#elif MI_COMMIT_MASK_FIELD_COUNT == 8
+  res->mask[0] = commit->mask[0] & cm->mask[0];
+  res->mask[1] = commit->mask[1] & cm->mask[1];
+  res->mask[2] = commit->mask[2] & cm->mask[2];
+  res->mask[3] = commit->mask[3] & cm->mask[3];
+  res->mask[4] = commit->mask[4] & cm->mask[4];
+  res->mask[5] = commit->mask[5] & cm->mask[5];
+  res->mask[6] = commit->mask[6] & cm->mask[6];
+  res->mask[7] = commit->mask[7] & cm->mask[7];
+#else
   for (size_t i = 0; i < MI_COMMIT_MASK_FIELD_COUNT; i++) {
-    res->mask[i] = (commit->mask[i] & cm->mask[i]);
+    res->mask[i] = commit->mask[i] & cm->mask[i];
   }
+#endif
 }
 
 static void mi_commit_mask_clear(mi_commit_mask_t* res, const mi_commit_mask_t* cm) {
+#if MI_COMMIT_MASK_FIELD_COUNT == 4
+  res->mask[0] &= ~cm->mask[0];
+  res->mask[1] &= ~cm->mask[1];
+  res->mask[2] &= ~cm->mask[2];
+  res->mask[3] &= ~cm->mask[3];
+#elif MI_COMMIT_MASK_FIELD_COUNT == 8
+  res->mask[0] &= ~cm->mask[0];
+  res->mask[1] &= ~cm->mask[1];
+  res->mask[2] &= ~cm->mask[2];
+  res->mask[3] &= ~cm->mask[3];
+  res->mask[4] &= ~cm->mask[4];
+  res->mask[5] &= ~cm->mask[5];
+  res->mask[6] &= ~cm->mask[6];
+  res->mask[7] &= ~cm->mask[7];
+#else
   for (size_t i = 0; i < MI_COMMIT_MASK_FIELD_COUNT; i++) {
-    res->mask[i] &= ~(cm->mask[i]);
+    res->mask[i] &= ~cm->mask[i];
   }
+#endif
 }
 
 static void mi_commit_mask_set(mi_commit_mask_t* res, const mi_commit_mask_t* cm) {
+#if MI_COMMIT_MASK_FIELD_COUNT == 4
+  res->mask[0] |= cm->mask[0];
+  res->mask[1] |= cm->mask[1];
+  res->mask[2] |= cm->mask[2];
+  res->mask[3] |= cm->mask[3];
+#elif MI_COMMIT_MASK_FIELD_COUNT == 8
+  res->mask[0] |= cm->mask[0];
+  res->mask[1] |= cm->mask[1];
+  res->mask[2] |= cm->mask[2];
+  res->mask[3] |= cm->mask[3];
+  res->mask[4] |= cm->mask[4];
+  res->mask[5] |= cm->mask[5];
+  res->mask[6] |= cm->mask[6];
+  res->mask[7] |= cm->mask[7];
+#else
   for (size_t i = 0; i < MI_COMMIT_MASK_FIELD_COUNT; i++) {
     res->mask[i] |= cm->mask[i];
   }
+#endif
 }
 
 static void mi_commit_mask_create(size_t bitidx, size_t bitcount, mi_commit_mask_t* cm) {
   mi_assert_internal(bitidx < MI_COMMIT_MASK_BITS);
   mi_assert_internal((bitidx + bitcount) <= MI_COMMIT_MASK_BITS);
-  if (bitcount == MI_COMMIT_MASK_BITS) {
+
+  if (mi_unlikely(bitcount == MI_COMMIT_MASK_BITS)) {
     mi_assert_internal(bitidx == 0);
     mi_commit_mask_create_full(cm);
+    return;
   }
-  else if (bitcount == 0) {
+
+  if (mi_unlikely(bitcount == 0)) {
     mi_commit_mask_create_empty(cm);
+    return;
   }
-  else {
-    mi_commit_mask_create_empty(cm);
-    size_t i = bitidx / MI_COMMIT_MASK_FIELD_BITS;
-    size_t ofs = bitidx % MI_COMMIT_MASK_FIELD_BITS;
-    while (bitcount > 0) {
-      mi_assert_internal(i < MI_COMMIT_MASK_FIELD_COUNT);
-      const size_t avail = MI_COMMIT_MASK_FIELD_BITS - ofs;
-      const size_t count = (bitcount > avail ? avail : bitcount);
-      const size_t mask = (count >= MI_COMMIT_MASK_FIELD_BITS
-                           ? ~((size_t)0)
-                           : (((size_t)1 << count) - 1) << ofs);
-      cm->mask[i] = mask;
-      bitcount -= count;
-      ofs = 0;
-      i++;
+
+  mi_commit_mask_create_empty(cm);
+
+  size_t i = bitidx / MI_COMMIT_MASK_FIELD_BITS;
+  size_t ofs = bitidx % MI_COMMIT_MASK_FIELD_BITS;
+  size_t remaining = bitcount;
+
+  while (remaining > 0 && i < MI_COMMIT_MASK_FIELD_COUNT) {
+    const size_t avail = MI_COMMIT_MASK_FIELD_BITS - ofs;
+    const size_t count = (remaining > avail) ? avail : remaining;
+    size_t mask;
+
+    if (count >= MI_COMMIT_MASK_FIELD_BITS) {
+      mask = ~((size_t)0);
+    } else {
+      mask = (((size_t)1 << count) - 1) << ofs;
     }
+
+    cm->mask[i] = mask;
+    remaining -= count;
+    ofs = 0;
+    i++;
   }
 }
 
 size_t _mi_commit_mask_committed_size(const mi_commit_mask_t* cm, size_t total) {
   mi_assert_internal((total % MI_COMMIT_MASK_BITS) == 0);
+
   size_t count = 0;
+#if MI_COMMIT_MASK_FIELD_COUNT == 4
+  count = mi_popcount(cm->mask[0]) + mi_popcount(cm->mask[1]) +
+          mi_popcount(cm->mask[2]) + mi_popcount(cm->mask[3]);
+#elif MI_COMMIT_MASK_FIELD_COUNT == 8
+  count = mi_popcount(cm->mask[0]) + mi_popcount(cm->mask[1]) +
+          mi_popcount(cm->mask[2]) + mi_popcount(cm->mask[3]) +
+          mi_popcount(cm->mask[4]) + mi_popcount(cm->mask[5]) +
+          mi_popcount(cm->mask[6]) + mi_popcount(cm->mask[7]);
+#else
   for (size_t i = 0; i < MI_COMMIT_MASK_FIELD_COUNT; i++) {
     count += mi_popcount(cm->mask[i]);
   }
-  return ((total / MI_COMMIT_MASK_BITS) * count);
+#endif
+
+  return (total / MI_COMMIT_MASK_BITS) * count;
 }
 
 size_t _mi_commit_mask_next_run(const mi_commit_mask_t* cm, size_t* idx) {
   size_t i = (*idx) / MI_COMMIT_MASK_FIELD_BITS;
   size_t ofs = (*idx) % MI_COMMIT_MASK_FIELD_BITS;
-  size_t mask = 0;
 
-  // Find first field with set bit
-  while (i < MI_COMMIT_MASK_FIELD_COUNT) {
-    mask = cm->mask[i];
-    mask >>= ofs;
-    if (mask != 0) {
-      const size_t trailing = mi_ctz(mask);
-      mask >>= trailing;
-      ofs += trailing;
-      break;
-    }
-    i++;
-    ofs = 0;
-  }
-
-  if (i >= MI_COMMIT_MASK_FIELD_COUNT) {
+  if (mi_unlikely(i >= MI_COMMIT_MASK_FIELD_COUNT)) {
     *idx = MI_COMMIT_MASK_BITS;
     return 0;
   }
 
-  // Found start bit, count consecutive ones
+  size_t mask = cm->mask[i] >> ofs;
+
+  while (mask == 0) {
+    i++;
+    if (mi_unlikely(i >= MI_COMMIT_MASK_FIELD_COUNT)) {
+      *idx = MI_COMMIT_MASK_BITS;
+      return 0;
+    }
+    mask = cm->mask[i];
+    ofs = 0;
+  }
+
+  const size_t trailing_zeros = mi_ctz_safe(mask);
+  mask >>= trailing_zeros;
+  ofs += trailing_zeros;
+
+  if (mi_unlikely(ofs >= MI_COMMIT_MASK_FIELD_BITS)) {
+    i++;
+    ofs -= MI_COMMIT_MASK_FIELD_BITS;
+    if (i >= MI_COMMIT_MASK_FIELD_COUNT) {
+      *idx = MI_COMMIT_MASK_BITS;
+      return 0;
+    }
+    mask = cm->mask[i] >> ofs;
+    if (mask == 0) {
+      *idx = MI_COMMIT_MASK_BITS;
+      return 0;
+    }
+    const size_t tz = mi_ctz_safe(mask);
+    mask >>= tz;
+    ofs += tz;
+  }
+
   *idx = (i * MI_COMMIT_MASK_FIELD_BITS) + ofs;
-  size_t count = 0;
 
-  // Count trailing ones in the current field
-  // ~mask has 0s where mask has 1s
-  size_t field_ones = mi_ctz(~mask);
-  count += field_ones;
+  size_t field_ones;
+  if (mask == ~((size_t)0)) {
+    field_ones = MI_COMMIT_MASK_FIELD_BITS;
+  } else {
+    field_ones = mi_ctz_safe(~mask);
+  }
 
-  // If we consumed the entire remainder of this field, check next fields
-  if ((ofs + count) == MI_COMMIT_MASK_FIELD_BITS) {
-     i++;
-     while (i < MI_COMMIT_MASK_FIELD_COUNT && cm->mask[i] == ~((size_t)0)) {
-       count += MI_COMMIT_MASK_FIELD_BITS;
-       i++;
-     }
-     if (i < MI_COMMIT_MASK_FIELD_COUNT) {
-       count += mi_ctz(~cm->mask[i]);
-     }
+  size_t count = field_ones;
+
+  if (mi_likely((ofs + field_ones) < MI_COMMIT_MASK_FIELD_BITS)) {
+    mi_assert_internal(count > 0);
+    return count;
+  }
+
+  i++;
+  while (i < MI_COMMIT_MASK_FIELD_COUNT && cm->mask[i] == ~((size_t)0)) {
+    count += MI_COMMIT_MASK_FIELD_BITS;
+    i++;
+  }
+
+  if (i < MI_COMMIT_MASK_FIELD_COUNT) {
+    count += mi_ctz_safe(~cm->mask[i]);
   }
 
   mi_assert_internal(count > 0);
   return count;
 }
-
-
-/* --------------------------------------------------------------------------------
-  Segment Allocation
--------------------------------------------------------------------------------- */
 
 static const mi_slice_t* mi_segment_slices_end(const mi_segment_t* segment) {
   return &segment->slices[segment->slice_entries];
@@ -151,22 +311,16 @@ static const mi_slice_t* mi_segment_slices_end(const mi_segment_t* segment) {
 static uint8_t* mi_slice_start(const mi_slice_t* slice) {
   mi_segment_t* segment = _mi_ptr_segment(slice);
   mi_assert_internal(slice >= segment->slices && slice < mi_segment_slices_end(segment));
-  return ((uint8_t*)segment + ((slice - segment->slices) * MI_SEGMENT_SLICE_SIZE));
+  return (uint8_t*)segment + ((size_t)(slice - segment->slices) * MI_SEGMENT_SLICE_SIZE);
 }
 
-
-/* ---------------------------------------------------------------------------
-  Bins
---------------------------------------------------------------------------- */
-
 static inline size_t mi_slice_bin8(size_t slice_count) {
-  if (slice_count <= 1) return slice_count;
+  if (mi_likely(slice_count <= 1)) return slice_count;
   mi_assert_internal(slice_count <= MI_SLICES_PER_SEGMENT);
   slice_count--;
   const size_t s = mi_bsr(slice_count);
   if (s <= 2) return slice_count + 1;
-  const size_t bin = ((s << 2) | ((slice_count >> (s - 2)) & 0x03)) - 4;
-  return bin;
+  return ((s << 2) | ((slice_count >> (s - 2)) & 0x03)) - 4;
 }
 
 static inline size_t mi_slice_bin(size_t slice_count) {
@@ -184,11 +338,6 @@ static inline size_t mi_slice_index(const mi_slice_t* slice) {
   return (size_t)index;
 }
 
-
-/* ---------------------------------------------------------------------------
-  Slice Span Queues
---------------------------------------------------------------------------- */
-
 static void mi_span_queue_push(mi_span_queue_t* sq, mi_slice_t* slice) {
   mi_assert_internal(slice->prev == NULL && slice->next == NULL);
   slice->prev = NULL;
@@ -196,11 +345,10 @@ static void mi_span_queue_push(mi_span_queue_t* sq, mi_slice_t* slice) {
   sq->first = slice;
   if (slice->next != NULL) {
     slice->next->prev = slice;
-  }
-  else {
+  } else {
     sq->last = slice;
   }
-  slice->block_size = 0;  /* Mark as free */
+  slice->block_size = 0;
 }
 
 static mi_span_queue_t* mi_span_queue_for(size_t slice_count, mi_segments_tld_t* tld) {
@@ -215,19 +363,14 @@ static void mi_span_queue_delete(mi_span_queue_t* sq, mi_slice_t* slice) {
   if (slice->prev != NULL) slice->prev->next = slice->next;
   if (slice == sq->first) sq->first = slice->next;
   if (slice->next != NULL) slice->next->prev = slice->prev;
-  if (slice == sq->last)  sq->last = slice->prev;
+  if (slice == sq->last) sq->last = slice->prev;
   slice->prev = NULL;
   slice->next = NULL;
-  slice->block_size = 1;  /* Mark as no longer free */
+  slice->block_size = 1;
 }
 
-
-/* ---------------------------------------------------------------------------
-  Invariant Checking
---------------------------------------------------------------------------- */
-
 static bool mi_slice_is_used(const mi_slice_t* slice) {
-  return (slice->block_size > 0);
+  return slice->block_size > 0;
 }
 
 #if (MI_DEBUG >= 3)
@@ -254,9 +397,10 @@ static bool mi_segment_is_valid(mi_segment_t* segment, mi_segments_tld_t* tld) {
     mi_assert_internal(slice->slice_count > 0);
     mi_assert_internal(slice->slice_offset == 0);
     const size_t index = mi_slice_index(slice);
-    size_t maxindex = (index + slice->slice_count >= segment->slice_entries
-                       ? segment->slice_entries
-                       : index + slice->slice_count) - 1;
+    size_t maxindex = (index + slice->slice_count >= segment->slice_entries)
+                      ? segment->slice_entries
+                      : index + slice->slice_count;
+    maxindex = maxindex > 0 ? maxindex - 1 : 0;
 
     if (mi_slice_is_used(slice)) {
       used_count++;
@@ -272,8 +416,7 @@ static bool mi_segment_is_valid(mi_segment_t* segment, mi_segments_tld_t* tld) {
         mi_assert_internal(last->slice_count == 0);
         mi_assert_internal(last->block_size == 1);
       }
-    }
-    else {
+    } else {
       mi_slice_t* last = &segment->slices[maxindex];
       if (segment->kind != MI_SEGMENT_HUGE ||
           slice->slice_count <= (segment->slice_entries - segment->segment_info_slices)) {
@@ -295,47 +438,50 @@ static bool mi_segment_is_valid(mi_segment_t* segment, mi_segments_tld_t* tld) {
 }
 #endif
 
-
-/* ---------------------------------------------------------------------------
-  Segment Size Calculations
---------------------------------------------------------------------------- */
-
 static size_t mi_segment_info_size(mi_segment_t* segment) {
   return segment->segment_info_slices * MI_SEGMENT_SLICE_SIZE;
 }
 
 static uint8_t* _mi_segment_page_start_from_slice(const mi_segment_t* segment,
-                                                   const mi_slice_t* slice,
-                                                   size_t block_size,
-                                                   size_t* page_size)
-{
+                                                  const mi_slice_t* slice,
+                                                  size_t block_size,
+                                                  size_t* page_size) {
   const ptrdiff_t idx = slice - segment->slices;
   const size_t psize = (size_t)slice->slice_count * MI_SEGMENT_SLICE_SIZE;
   uint8_t* const pstart = (uint8_t*)segment + ((size_t)idx * MI_SEGMENT_SLICE_SIZE);
 
   size_t start_offset = 0;
+
   if (block_size > 0 && block_size <= MI_MAX_ALIGN_GUARANTEE) {
-    const size_t adjust = block_size - ((uintptr_t)pstart % block_size);
-    if (adjust < block_size && psize >= block_size + adjust) {
-      start_offset += adjust;
+    const size_t misalign = (uintptr_t)pstart % block_size;
+    if (misalign > 0) {
+      const size_t adjust = block_size - misalign;
+      if (psize >= block_size + adjust) {
+        start_offset = adjust;
+      }
     }
   }
+
   if (block_size >= MI_INTPTR_SIZE) {
     if (block_size <= 64) {
       start_offset += 3 * block_size;
-    }
-    else if (block_size <= 512) {
+    } else if (block_size <= 512) {
       start_offset += block_size;
     }
   }
+
   start_offset = _mi_align_up(start_offset, MI_MAX_ALIGN_SIZE);
+
   mi_assert_internal(_mi_is_aligned(pstart + start_offset, MI_MAX_ALIGN_SIZE));
   mi_assert_internal(block_size == 0 || block_size > MI_MAX_ALIGN_GUARANTEE ||
                      _mi_is_aligned(pstart + start_offset, block_size));
+
   if (page_size != NULL) {
+    mi_assert_internal(psize >= start_offset);
     *page_size = psize - start_offset;
   }
-  return (pstart + start_offset);
+
+  return pstart + start_offset;
 }
 
 uint8_t* _mi_segment_page_start(const mi_segment_t* segment, const mi_page_t* page, size_t* page_size) {
@@ -359,33 +505,43 @@ static size_t mi_segment_calculate_slices(size_t required, size_t* info_slices) 
   }
 
   isize = _mi_align_up(isize + guardsize, MI_SEGMENT_SLICE_SIZE);
+
   if (info_slices != NULL) {
     *info_slices = isize / MI_SEGMENT_SLICE_SIZE;
   }
-  const size_t segment_size = (required == 0
-                               ? MI_SEGMENT_SIZE
-                               : _mi_align_up(required + isize + guardsize, MI_SEGMENT_SLICE_SIZE));
+
+  const size_t segment_size = (required == 0)
+                              ? MI_SEGMENT_SIZE
+                              : _mi_align_up(required + isize + guardsize, MI_SEGMENT_SLICE_SIZE);
+
   mi_assert_internal(segment_size % MI_SEGMENT_SLICE_SIZE == 0);
-  return (segment_size / MI_SEGMENT_SLICE_SIZE);
+  return segment_size / MI_SEGMENT_SLICE_SIZE;
 }
-
-
-/* ---------------------------------------------------------------------------
-  Segment Cache and Tracking
---------------------------------------------------------------------------- */
 
 static void mi_segments_track_size(long segment_size, mi_segments_tld_t* tld) {
   if (segment_size >= 0) {
     _mi_stat_increase(&tld->stats->segments, 1);
-  }
-  else {
+    tld->count++;
+  } else {
     _mi_stat_decrease(&tld->stats->segments, 1);
+    if (tld->count > 0) tld->count--;
   }
-  tld->count += (segment_size >= 0 ? 1 : -1);
+
   if (tld->count > tld->peak_count) {
     tld->peak_count = tld->count;
   }
-  tld->current_size += segment_size;
+
+  if (segment_size >= 0) {
+    tld->current_size += (size_t)segment_size;
+  } else {
+    const size_t abs_size = (size_t)(-segment_size);
+    if (tld->current_size >= abs_size) {
+      tld->current_size -= abs_size;
+    } else {
+      tld->current_size = 0;
+    }
+  }
+
   if (tld->current_size > tld->peak_size) {
     tld->peak_size = tld->current_size;
   }
@@ -413,16 +569,10 @@ static void mi_segment_os_free(mi_segment_t* segment, mi_segments_tld_t* tld) {
   _mi_arena_free(segment, mi_segment_size(segment), csize, segment->memid);
 }
 
-
-/* ---------------------------------------------------------------------------
-  Commit/Decommit Ranges
---------------------------------------------------------------------------- */
-
 static void mi_segment_commit_mask(mi_segment_t* segment, bool conservative,
-                                    uint8_t* p, size_t size,
-                                    uint8_t** start_p, size_t* full_size,
-                                    mi_commit_mask_t* cm)
-{
+                                   uint8_t* p, size_t size,
+                                   uint8_t** start_p, size_t* full_size,
+                                   mi_commit_mask_t* cm) {
   mi_assert_internal(_mi_ptr_segment(p + 1) == segment);
   mi_assert_internal(segment->kind != MI_SEGMENT_HUGE);
   mi_commit_mask_create_empty(cm);
@@ -435,6 +585,7 @@ static void mi_segment_commit_mask(mi_segment_t* segment, bool conservative,
 
   const size_t segstart = mi_segment_info_size(segment);
   const size_t segsize = mi_segment_size(segment);
+
   if (p >= (uint8_t*)segment + segsize) {
     *start_p = NULL;
     *full_size = 0;
@@ -446,38 +597,43 @@ static void mi_segment_commit_mask(mi_segment_t* segment, bool conservative,
 
   size_t start;
   size_t end;
+
   if (conservative) {
     start = _mi_align_up(pstart, MI_COMMIT_SIZE);
-    end   = _mi_align_down(pstart + size, MI_COMMIT_SIZE);
+    end = _mi_align_down(pstart + size, MI_COMMIT_SIZE);
     mi_assert_internal(start >= segstart);
     mi_assert_internal(end <= segsize);
-  }
-  else {
+  } else {
     start = _mi_align_down(pstart, MI_MINIMAL_COMMIT_SIZE);
-    end   = _mi_align_up(pstart + size, MI_MINIMAL_COMMIT_SIZE);
+    end = _mi_align_up(pstart + size, MI_MINIMAL_COMMIT_SIZE);
   }
 
   if (pstart >= segstart && start < segstart) {
     start = segstart;
   }
+
   if (end > segsize) {
     end = segsize;
   }
 
   mi_assert_internal(start <= pstart && (pstart + size) <= end);
   mi_assert_internal(start % MI_COMMIT_SIZE == 0 && end % MI_COMMIT_SIZE == 0);
-  *start_p   = (uint8_t*)segment + start;
-  *full_size = (end > start ? end - start : 0);
+
+  *start_p = (uint8_t*)segment + start;
+  *full_size = (end > start) ? (end - start) : 0;
+
   if (*full_size == 0) return;
 
   const size_t bitidx = start / MI_COMMIT_SIZE;
   mi_assert_internal(bitidx < MI_COMMIT_MASK_BITS);
 
   const size_t bitcount = *full_size / MI_COMMIT_SIZE;
-  if (bitidx + bitcount > MI_COMMIT_MASK_BITS) {
+
+  if (mi_unlikely(bitidx + bitcount > MI_COMMIT_MASK_BITS)) {
     _mi_warning_message("commit mask overflow: idx=%zu count=%zu start=%zx end=%zx p=0x%p size=%zu fullsize=%zu\n",
                         bitidx, bitcount, start, end, p, size, *full_size);
   }
+
   mi_assert_internal((bitidx + bitcount) <= MI_COMMIT_MASK_BITS);
   mi_commit_mask_create(bitidx, bitcount, cm);
 }
@@ -486,9 +642,9 @@ static bool mi_segment_commit(mi_segment_t* segment, uint8_t* p, size_t size) {
   mi_assert_internal(mi_commit_mask_all_set(&segment->commit_mask, &segment->purge_mask));
 
   uint8_t* start = NULL;
-  size_t   full_size = 0;
+  size_t full_size = 0;
   mi_commit_mask_t mask;
-  mi_segment_commit_mask(segment, false /* conservative? */, p, size, &start, &full_size, &mask);
+  mi_segment_commit_mask(segment, false, p, size, &start, &full_size, &mask);
 
   if (mi_commit_mask_is_empty(&mask) || full_size == 0) {
     return true;
@@ -516,22 +672,25 @@ static bool mi_segment_commit(mi_segment_t* segment, uint8_t* p, size_t size) {
 
 static bool mi_segment_ensure_committed(mi_segment_t* segment, uint8_t* p, size_t size) {
   mi_assert_internal(mi_commit_mask_all_set(&segment->commit_mask, &segment->purge_mask));
+
   if (mi_likely(mi_commit_mask_is_full(&segment->commit_mask) &&
                 mi_commit_mask_is_empty(&segment->purge_mask))) {
     return true;
   }
+
   mi_assert_internal(segment->kind != MI_SEGMENT_HUGE);
   return mi_segment_commit(segment, p, size);
 }
 
 static bool mi_segment_purge(mi_segment_t* segment, uint8_t* p, size_t size) {
   mi_assert_internal(mi_commit_mask_all_set(&segment->commit_mask, &segment->purge_mask));
+
   if (!segment->allow_purge) return true;
 
   uint8_t* start = NULL;
-  size_t   full_size = 0;
+  size_t full_size = 0;
   mi_commit_mask_t mask;
-  mi_segment_commit_mask(segment, true /* conservative? */, p, size, &start, &full_size, &mask);
+  mi_segment_commit_mask(segment, true, p, size, &start, &full_size, &mask);
 
   if (mi_commit_mask_is_empty(&mask) || full_size == 0) {
     return true;
@@ -559,37 +718,35 @@ static void mi_segment_schedule_purge(mi_segment_t* segment, uint8_t* p, size_t 
 
   if (mi_option_get(mi_option_purge_delay) == 0) {
     mi_segment_purge(segment, p, size);
+    return;
   }
-  else {
-    uint8_t* start = NULL;
-    size_t   full_size = 0;
-    mi_commit_mask_t mask;
-    mi_segment_commit_mask(segment, true /* conservative */, p, size, &start, &full_size, &mask);
 
-    if (mi_commit_mask_is_empty(&mask) || full_size == 0) {
-      return;
-    }
+  uint8_t* start = NULL;
+  size_t full_size = 0;
+  mi_commit_mask_t mask;
+  mi_segment_commit_mask(segment, true, p, size, &start, &full_size, &mask);
 
-    mi_assert_internal(segment->purge_expire > 0 || mi_commit_mask_is_empty(&segment->purge_mask));
-    mi_commit_mask_t cmask;
-    mi_commit_mask_create_intersect(&segment->commit_mask, &mask, &cmask);
-    mi_commit_mask_set(&segment->purge_mask, &cmask);
+  if (mi_commit_mask_is_empty(&mask) || full_size == 0) {
+    return;
+  }
 
-    const mi_msecs_t now = _mi_clock_now();
-    if (segment->purge_expire == 0) {
-      segment->purge_expire = now + mi_option_get(mi_option_purge_delay);
+  mi_assert_internal(segment->purge_expire > 0 || mi_commit_mask_is_empty(&segment->purge_mask));
+  mi_commit_mask_t cmask;
+  mi_commit_mask_create_intersect(&segment->commit_mask, &mask, &cmask);
+  mi_commit_mask_set(&segment->purge_mask, &cmask);
+
+  const mi_msecs_t now = _mi_clock_now();
+
+  if (segment->purge_expire == 0) {
+    segment->purge_expire = now + mi_option_get(mi_option_purge_delay);
+  } else if (segment->purge_expire <= now) {
+    if (segment->purge_expire + mi_option_get(mi_option_purge_extend_delay) <= now) {
+      mi_segment_try_purge(segment, true);
+    } else {
+      segment->purge_expire = now + mi_option_get(mi_option_purge_extend_delay);
     }
-    else if (segment->purge_expire <= now) {
-      if (segment->purge_expire + mi_option_get(mi_option_purge_extend_delay) <= now) {
-        mi_segment_try_purge(segment, true);
-      }
-      else {
-        segment->purge_expire = now + mi_option_get(mi_option_purge_extend_delay);
-      }
-    }
-    else {
-      segment->purge_expire += mi_option_get(mi_option_purge_extend_delay);
-    }
+  } else {
+    segment->purge_expire += mi_option_get(mi_option_purge_extend_delay);
   }
 }
 
@@ -600,6 +757,7 @@ static void mi_segment_try_purge(mi_segment_t* segment, bool force) {
   }
 
   const mi_msecs_t now = _mi_clock_now();
+
   if (!force && now < segment->purge_expire) {
     return;
   }
@@ -618,6 +776,7 @@ static void mi_segment_try_purge(mi_segment_t* segment, bool force) {
     }
   }
   mi_commit_mask_foreach_end()
+
   mi_assert_internal(mi_commit_mask_is_empty(&segment->purge_mask));
 }
 
@@ -625,24 +784,21 @@ void _mi_segment_collect(mi_segment_t* segment, bool force) {
   mi_segment_try_purge(segment, force);
 }
 
-
-/* ---------------------------------------------------------------------------
-  Span Free
---------------------------------------------------------------------------- */
-
 static bool mi_segment_is_abandoned(mi_segment_t* segment) {
-  return (mi_atomic_load_relaxed(&segment->thread_id) == 0);
+  return mi_atomic_load_relaxed(&segment->thread_id) == 0;
 }
 
 static void mi_segment_span_free(mi_segment_t* segment, size_t slice_index, size_t slice_count,
-                                  bool allow_purge, mi_segments_tld_t* tld)
-{
+                                 bool allow_purge, mi_segments_tld_t* tld) {
   mi_assert_internal(slice_index < segment->slice_entries);
-  mi_span_queue_t* sq = (segment->kind == MI_SEGMENT_HUGE || mi_segment_is_abandoned(segment)
-                          ? NULL
-                          : mi_span_queue_for(slice_count, tld));
+
+  mi_span_queue_t* sq = (segment->kind == MI_SEGMENT_HUGE || mi_segment_is_abandoned(segment))
+                        ? NULL
+                        : mi_span_queue_for(slice_count, tld);
+
   if (slice_count == 0) slice_count = 1;
-  mi_assert_internal(slice_index + slice_count - 1 < segment->slice_entries);
+
+  mi_assert_internal(slice_index + slice_count <= segment->slice_entries);
 
   mi_slice_t* slice = &segment->slices[slice_index];
   slice->slice_count = (uint32_t)slice_count;
@@ -650,15 +806,14 @@ static void mi_segment_span_free(mi_segment_t* segment, size_t slice_index, size
   slice->slice_offset = 0;
 
   if (slice_count > 1) {
-    mi_slice_t* last = slice + slice_count - 1;
-    mi_slice_t* end  = (mi_slice_t*)mi_segment_slices_end(segment);
-    if (last > end) {
-      last = end;
-    }
-    if (last > slice) {
-      last->slice_count = 0;
-      last->slice_offset = (uint32_t)(sizeof(mi_page_t) * (slice_count - 1));
-      last->block_size = 0;
+    const size_t last_index = slice_index + slice_count - 1;
+    if (last_index < segment->slice_entries) {
+      mi_slice_t* last = &segment->slices[last_index];
+      if (last > slice) {
+        last->slice_count = 0;
+        last->slice_offset = (uint32_t)(sizeof(mi_slice_t) * (slice_count - 1));
+        last->block_size = 0;
+      }
     }
   }
 
@@ -668,9 +823,8 @@ static void mi_segment_span_free(mi_segment_t* segment, size_t slice_index, size
 
   if (sq != NULL) {
     mi_span_queue_push(sq, slice);
-  }
-  else {
-    slice->block_size = 0;  /* Mark huge page as free */
+  } else {
+    slice->block_size = 0;
   }
 }
 
@@ -691,28 +845,31 @@ static mi_slice_t* mi_segment_span_free_coalesce(mi_slice_t* slice, mi_segments_
     return slice;
   }
 
-  const bool is_abandoned = (segment->thread_id == 0);
+  const bool is_abandoned = mi_unlikely(segment->thread_id == 0);
   size_t slice_count = slice->slice_count;
+  const mi_slice_t* const end_slices = mi_segment_slices_end(segment);
   mi_slice_t* next = slice + slice->slice_count;
-  mi_assert_internal(next <= mi_segment_slices_end(segment));
 
-  if (next < mi_segment_slices_end(segment) && next->block_size == 0) {
-    mi_assert_internal(next->slice_count > 0 && next->slice_offset == 0);
-    slice_count += next->slice_count;
-    if (!is_abandoned) {
-      mi_segment_span_remove_from_queue(next, tld);
+  if (mi_likely(next < end_slices)) {
+    MI_PREFETCH(next);
+    if (mi_unlikely(next->block_size == 0)) {
+      mi_assert_internal(next->slice_count > 0 && next->slice_offset == 0);
+      slice_count += next->slice_count;
+      if (mi_likely(!is_abandoned)) {
+        mi_segment_span_remove_from_queue(next, tld);
+      }
     }
   }
 
-  if (slice > segment->slices) {
-    mi_slice_t* prev = mi_slice_first(slice - 1);
+  if (mi_likely(slice > segment->slices)) {
+    mi_slice_t* const prev = mi_slice_first(slice - 1);
     mi_assert_internal(prev >= segment->slices);
-    if (prev->block_size == 0) {
+    if (mi_unlikely(prev->block_size == 0)) {
       mi_assert_internal(prev->slice_count > 0 && prev->slice_offset == 0);
       slice_count += prev->slice_count;
       slice->slice_count = 0;
       slice->slice_offset = (uint32_t)((uint8_t*)slice - (uint8_t*)prev);
-      if (!is_abandoned) {
+      if (mi_likely(!is_abandoned)) {
         mi_segment_span_remove_from_queue(prev, tld);
       }
       slice = prev;
@@ -723,19 +880,16 @@ static mi_slice_t* mi_segment_span_free_coalesce(mi_slice_t* slice, mi_segments_
   return slice;
 }
 
-
-/* ---------------------------------------------------------------------------
-  Page Allocation
---------------------------------------------------------------------------- */
-
 static mi_page_t* mi_segment_span_allocate(mi_segment_t* segment, size_t slice_index, size_t slice_count) {
   mi_assert_internal(slice_index < segment->slice_entries);
+  mi_assert_internal(slice_index + slice_count <= segment->slice_entries);
+
   mi_slice_t* const slice = &segment->slices[slice_index];
   mi_assert_internal(slice->block_size == 0 || slice->block_size == 1);
 
   if (!mi_segment_ensure_committed(segment,
-                                    _mi_segment_page_start_from_slice(segment, slice, 0, NULL),
-                                    slice_count * MI_SEGMENT_SLICE_SIZE)) {
+                                   _mi_segment_page_start_from_slice(segment, slice, 0, NULL),
+                                   slice_count * MI_SEGMENT_SLICE_SIZE)) {
     return NULL;
   }
 
@@ -762,11 +916,10 @@ static mi_page_t* mi_segment_span_allocate(mi_segment_t* segment, size_t slice_i
     slice_next->block_size = 1;
   }
 
-  mi_slice_t* last = slice + slice_count - 1;
-  mi_slice_t* end = (mi_slice_t*)mi_segment_slices_end(segment);
-  if (last > end) last = end;
-  if (last > slice) {
-    last->slice_offset = (uint32_t)(sizeof(mi_slice_t) * (size_t)(last - slice));
+  const size_t last_index = slice_index + slice_count - 1;
+  if (last_index < segment->slice_entries && last_index > slice_index) {
+    mi_slice_t* last = &segment->slices[last_index];
+    last->slice_offset = (uint32_t)(sizeof(mi_slice_t) * (slice_count - 1));
     last->slice_count = 0;
     last->block_size = 1;
   }
@@ -775,94 +928,103 @@ static mi_page_t* mi_segment_span_allocate(mi_segment_t* segment, size_t slice_i
   page->is_zero_init = segment->free_is_zero;
   page->is_huge = (segment->kind == MI_SEGMENT_HUGE);
   segment->used++;
+
   return page;
 }
 
 static void mi_segment_slice_split(mi_segment_t* segment, mi_slice_t* slice,
-                                    size_t slice_count, mi_segments_tld_t* tld)
-{
+                                   size_t slice_count, mi_segments_tld_t* tld) {
   mi_assert_internal(_mi_ptr_segment(slice) == segment);
   mi_assert_internal(slice->slice_count >= slice_count);
   mi_assert_internal(slice->block_size > 0);
 
   if (slice->slice_count <= slice_count) return;
+
   mi_assert_internal(segment->kind != MI_SEGMENT_HUGE);
 
   const size_t next_index = mi_slice_index(slice) + slice_count;
   const size_t next_count = slice->slice_count - slice_count;
-  mi_segment_span_free(segment, next_index, next_count, false /* don't purge left-over */, tld);
+  mi_segment_span_free(segment, next_index, next_count, false, tld);
   slice->slice_count = (uint32_t)slice_count;
 }
 
 static mi_page_t* mi_segments_page_find_and_allocate(size_t slice_count, mi_arena_id_t req_arena_id,
-                                                      mi_segments_tld_t* tld)
-{
+                                                     mi_segments_tld_t* tld) {
   mi_assert_internal(slice_count * MI_SEGMENT_SLICE_SIZE <= MI_LARGE_OBJ_SIZE_MAX);
 
   mi_span_queue_t* sq = mi_span_queue_for(slice_count, tld);
   if (slice_count == 0) slice_count = 1;
 
   while (sq <= &tld->spans[MI_SEGMENT_BIN_MAX]) {
-    for (mi_slice_t* slice = sq->first; slice != NULL; slice = slice->next) {
+    mi_slice_t* slice = sq->first;
+
+    if (slice != NULL) {
+      MI_PREFETCH(_mi_ptr_segment(slice));
+    }
+
+    while (slice != NULL) {
+      mi_slice_t* const next = slice->next;
+
+      if (next != NULL) {
+        MI_PREFETCH(next);
+        MI_PREFETCH(_mi_ptr_segment(next));
+      }
+
       if (mi_likely(slice->slice_count >= slice_count)) {
         mi_segment_t* segment = _mi_ptr_segment(slice);
+
         if (mi_likely(_mi_arena_memid_is_suitable(segment->memid, req_arena_id))) {
           mi_span_queue_delete(sq, slice);
 
           if (slice->slice_count > slice_count) {
             mi_segment_slice_split(segment, slice, slice_count, tld);
           }
+
           mi_assert_internal(slice != NULL && slice->slice_count == slice_count && slice->block_size > 0);
 
           mi_page_t* page = mi_segment_span_allocate(segment, mi_slice_index(slice), slice->slice_count);
+
           if (mi_unlikely(page == NULL)) {
             mi_segment_span_free_coalesce(slice, tld);
             return NULL;
           }
+
           return page;
         }
       }
+
+      slice = next;
     }
+
     sq++;
   }
+
   return NULL;
 }
 
 static mi_segment_t* mi_segment_os_alloc(size_t required, size_t page_alignment,
-                                          bool eager_delayed, mi_arena_id_t req_arena_id,
-                                          size_t* psegment_slices, size_t* pinfo_slices,
-                                          bool commit, mi_segments_tld_t* tld)
-{
+                                         bool eager_delayed, mi_arena_id_t req_arena_id,
+                                         size_t* psegment_slices, size_t* pinfo_slices,
+                                         bool commit, mi_segments_tld_t* tld) {
   mi_memid_t memid;
   bool allow_large = (!eager_delayed && (MI_SECURE == 0));
   size_t align_offset = 0;
   size_t alignment = MI_SEGMENT_ALIGN;
 
   if (page_alignment > 0) {
-    /*
-      CRITICAL FIX: Force segment alignment to be at least MI_SEGMENT_ALIGN (32 MiB).
-      If the user requests small alignment for a huge allocation (e.g., 8 bytes),
-      we must still align the segment base to 32 MiB for _mi_ptr_segment() to work.
-      But we must NOT set align_offset for small alignments, or the payload will
-      be pushed 32MB into the segment, causing slice index overflow.
-    */
     alignment = (page_alignment > MI_SEGMENT_ALIGN) ? page_alignment : MI_SEGMENT_ALIGN;
 
     if (page_alignment > MI_SEGMENT_ALIGN) {
-        // Large alignment: use OS to align payload via align_offset
-        const size_t info_size = (*pinfo_slices) * MI_SEGMENT_SLICE_SIZE;
-        align_offset = _mi_align_up(info_size, alignment);
-        const size_t extra = align_offset - info_size;
-        *psegment_slices = mi_segment_calculate_slices(required + extra, pinfo_slices);
+      const size_t info_size = (*pinfo_slices) * MI_SEGMENT_SLICE_SIZE;
+      align_offset = _mi_align_up(info_size, alignment);
+      const size_t extra = align_offset - info_size;
+      *psegment_slices = mi_segment_calculate_slices(required + extra, pinfo_slices);
     } else {
-        // Small/Normal alignment (<= 32 MiB):
-        // Ensure segment is 32 MiB aligned (done by alignment = 32MB).
-        // align_offset = 0 keeps the payload close to the header.
-        const size_t info_size = (*pinfo_slices) * MI_SEGMENT_SLICE_SIZE;
-        const size_t aligned_info = _mi_align_up(info_size, page_alignment);
-        const size_t extra = aligned_info - info_size;
-        *psegment_slices = mi_segment_calculate_slices(required + extra, pinfo_slices);
-        align_offset = 0;
+      const size_t info_size = (*pinfo_slices) * MI_SEGMENT_SLICE_SIZE;
+      const size_t aligned_info = _mi_align_up(info_size, page_alignment);
+      const size_t extra = aligned_info - info_size;
+      *psegment_slices = mi_segment_calculate_slices(required + extra, pinfo_slices);
+      align_offset = 0;
     }
 
     mi_assert_internal(*psegment_slices > 0 && *psegment_slices <= UINT32_MAX);
@@ -872,19 +1034,20 @@ static mi_segment_t* mi_segment_os_alloc(size_t required, size_t page_alignment,
   mi_segment_t* segment = (mi_segment_t*)_mi_arena_alloc_aligned(
       segment_size, alignment, align_offset, commit, allow_large, req_arena_id, &memid);
 
-  if (segment == NULL) {
+  if (mi_unlikely(segment == NULL)) {
     return NULL;
   }
 
   mi_commit_mask_t commit_mask;
+
   if (memid.initially_committed) {
     mi_commit_mask_create_full(&commit_mask);
-  }
-  else {
+  } else {
     const size_t commit_needed = _mi_divide_up((*pinfo_slices) * MI_SEGMENT_SLICE_SIZE, MI_COMMIT_SIZE);
     mi_assert_internal(commit_needed > 0);
     mi_commit_mask_create(0, commit_needed, &commit_mask);
     mi_assert_internal(commit_needed * MI_COMMIT_SIZE >= (*pinfo_slices) * MI_SEGMENT_SLICE_SIZE);
+
     if (!_mi_os_commit(segment, commit_needed * MI_COMMIT_SIZE, NULL)) {
       _mi_arena_free(segment, segment_size, 0, memid);
       return NULL;
@@ -905,13 +1068,13 @@ static mi_segment_t* mi_segment_os_alloc(size_t required, size_t page_alignment,
 
   mi_segments_track_size((long)(segment_size), tld);
   _mi_segment_map_allocated_at(segment);
+
   return segment;
 }
 
 static mi_segment_t* mi_segment_alloc(size_t required, size_t page_alignment,
-                                       mi_arena_id_t req_arena_id,
-                                       mi_segments_tld_t* tld, mi_page_t** huge_page)
-{
+                                      mi_arena_id_t req_arena_id,
+                                      mi_segments_tld_t* tld, mi_page_t** huge_page) {
   mi_assert_internal((required == 0 && huge_page == NULL) || (required > 0 && huge_page != NULL));
 
   size_t info_slices;
@@ -924,8 +1087,12 @@ static mi_segment_t* mi_segment_alloc(size_t required, size_t page_alignment,
   bool commit = eager || (required > 0);
 
   mi_segment_t* segment = mi_segment_os_alloc(required, page_alignment, eager_delay, req_arena_id,
-                                               &segment_slices, &info_slices, commit, tld);
-  if (segment == NULL) return NULL;
+                                              &segment_slices, &info_slices, commit, tld);
+  if (mi_unlikely(segment == NULL)) {
+    return NULL;
+  }
+
+  MI_PREFETCH(&segment->slices[0]);
 
   if (!segment->memid.initially_zero) {
     const ptrdiff_t ofs = offsetof(mi_segment_t, next);
@@ -934,19 +1101,21 @@ static mi_segment_t* mi_segment_alloc(size_t required, size_t page_alignment,
     _mi_memzero((uint8_t*)segment + ofs, zsize);
   }
 
-  const size_t slice_entries = (segment_slices > MI_SLICES_PER_SEGMENT
-                                ? MI_SLICES_PER_SEGMENT
-                                : segment_slices);
+  const size_t slice_entries = (segment_slices > MI_SLICES_PER_SEGMENT)
+                               ? MI_SLICES_PER_SEGMENT
+                               : segment_slices;
+
   segment->segment_slices = segment_slices;
   segment->segment_info_slices = info_slices;
   segment->thread_id = _mi_thread_id();
   segment->cookie = _mi_ptr_cookie(segment);
   segment->slice_entries = slice_entries;
-  segment->kind = (required == 0 ? MI_SEGMENT_NORMAL : MI_SEGMENT_HUGE);
+  segment->kind = (required == 0) ? MI_SEGMENT_NORMAL : MI_SEGMENT_HUGE;
 
   _mi_stat_increase(&tld->stats->page_committed, mi_segment_info_size(segment));
 
   size_t guard_slices = 0;
+
   if (MI_SECURE > 0) {
     const size_t os_pagesize = _mi_os_page_size();
     _mi_os_protect((uint8_t*)segment + mi_segment_info_size(segment) - os_pagesize, os_pagesize);
@@ -961,21 +1130,34 @@ static mi_segment_t* mi_segment_alloc(size_t required, size_t page_alignment,
 
   mi_page_t* page0 = mi_segment_span_allocate(segment, 0, info_slices);
   mi_assert_internal(page0 != NULL);
-  if (page0 == NULL) return NULL;
+  if (mi_unlikely(page0 == NULL)) {
+    mi_segment_os_free(segment, tld);
+    return NULL;
+  }
   mi_assert_internal(segment->used == 1);
   segment->used = 0;
 
   if (segment->kind == MI_SEGMENT_NORMAL) {
     mi_assert_internal(huge_page == NULL);
-    mi_segment_span_free(segment, info_slices, segment->slice_entries - info_slices, false, tld);
-  }
-  else {
+    const size_t remaining = segment->slice_entries - info_slices;
+    if (remaining > 0) {
+      mi_segment_span_free(segment, info_slices, remaining, false, tld);
+    }
+  } else {
     mi_assert_internal(huge_page != NULL);
     mi_assert_internal(mi_commit_mask_is_empty(&segment->purge_mask));
     mi_assert_internal(mi_commit_mask_is_full(&segment->commit_mask));
-    *huge_page = mi_segment_span_allocate(segment, info_slices,
-                                           segment_slices - info_slices - guard_slices);
-    mi_assert_internal(*huge_page != NULL);
+    const size_t huge_slices = segment_slices - info_slices - guard_slices;
+    if (huge_slices > 0) {
+      *huge_page = mi_segment_span_allocate(segment, info_slices, huge_slices);
+      mi_assert_internal(*huge_page != NULL);
+      if (mi_unlikely(*huge_page == NULL)) {
+        mi_segment_os_free(segment, tld);
+        return NULL;
+      }
+    } else {
+      *huge_page = NULL;
+    }
   }
 
   mi_assert_expensive(mi_segment_is_valid(segment, tld));
@@ -988,41 +1170,43 @@ static void mi_segment_free(mi_segment_t* segment, bool force, mi_segments_tld_t
   mi_assert_internal(segment->next == NULL);
   mi_assert_internal(segment->used == 0);
 
-  if (segment->dont_free) return;
+  if (segment->dont_free) {
+    return;
+  }
 
   mi_slice_t* slice = &segment->slices[0];
   const mi_slice_t* end = mi_segment_slices_end(segment);
-  #if MI_DEBUG > 1
+
+#if MI_DEBUG > 1
   size_t page_count = 0;
-  #endif
+#endif
 
   while (slice < end) {
     mi_assert_internal(slice->slice_count > 0);
     mi_assert_internal(slice->slice_offset == 0);
     mi_assert_internal(mi_slice_index(slice) == 0 || slice->block_size == 0);
+
     if (slice->block_size == 0 && segment->kind != MI_SEGMENT_HUGE) {
       mi_segment_span_remove_from_queue(slice, tld);
     }
-    #if MI_DEBUG > 1
+
+#if MI_DEBUG > 1
     page_count++;
-    #endif
+#endif
+
     slice = slice + slice->slice_count;
   }
-  mi_assert_internal(page_count == 2);
 
+  mi_assert_internal(page_count == 2);
   mi_segment_os_free(segment, tld);
 }
-
-
-/* ---------------------------------------------------------------------------
-  Page Free
---------------------------------------------------------------------------- */
 
 static void mi_segment_abandon(mi_segment_t* segment, mi_segments_tld_t* tld);
 
 static mi_slice_t* mi_segment_page_clear(mi_page_t* page, mi_segments_tld_t* tld) {
   mi_assert_internal(page->block_size > 0);
   mi_assert_internal(mi_page_all_free(page));
+
   mi_segment_t* segment = _mi_ptr_segment(page);
   mi_assert_internal(segment->used > 0);
 
@@ -1053,6 +1237,7 @@ static mi_slice_t* mi_segment_page_clear(mi_page_t* page, mi_segments_tld_t* tld
 
 void _mi_segment_page_free(mi_page_t* page, bool force, mi_segments_tld_t* tld) {
   mi_assert(page != NULL);
+
   mi_segment_t* segment = _mi_page_segment(page);
   mi_assert_expensive(mi_segment_is_valid(segment, tld));
 
@@ -1061,15 +1246,12 @@ void _mi_segment_page_free(mi_page_t* page, bool force, mi_segments_tld_t* tld) 
 
   if (segment->used == 0) {
     mi_segment_free(segment, force, tld);
-  }
-  else if (segment->used == segment->abandoned) {
+  } else if (segment->used == segment->abandoned) {
     mi_segment_abandon(segment, tld);
-  }
-  else {
+  } else {
     mi_segment_try_purge(segment, false);
   }
 }
-
 
 /* ---------------------------------------------------------------------------
   Abandonment
