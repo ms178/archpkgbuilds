@@ -438,6 +438,8 @@ can_use_DPP(amd_gfx_level gfx_level, const aco_ptr<Instruction>& instr, bool dpp
       return instr->opcode == aco_opcode::v_fma_mix_f32 ||
              instr->opcode == aco_opcode::v_fma_mixlo_f16 ||
              instr->opcode == aco_opcode::v_fma_mixhi_f16 ||
+             instr->opcode == aco_opcode::p_v_fma_mixlo_f16_rtz ||
+             instr->opcode == aco_opcode::p_v_fma_mixhi_f16_rtz ||
              instr->opcode == aco_opcode::v_dot2_f32_f16 ||
              instr->opcode == aco_opcode::v_dot2_f32_bf16;
    }
@@ -644,6 +646,8 @@ instr_is_16bit(amd_gfx_level gfx_level, aco_opcode op)
    case aco_opcode::v_interp_p2_hi_f16:
    case aco_opcode::v_fma_mixlo_f16:
    case aco_opcode::v_fma_mixhi_f16:
+   case aco_opcode::p_v_fma_mixlo_f16_rtz:
+   case aco_opcode::p_v_fma_mixhi_f16_rtz:
    /* VOP2 */
    case aco_opcode::v_mac_f16:
    case aco_opcode::v_madak_f16:
@@ -861,7 +865,9 @@ get_operand_type(aco_ptr<Instruction>& alu, unsigned index)
    aco_type type = instr_info.alu_opcode_infos[(int)alu->opcode].op_types[index];
 
    if (alu->opcode == aco_opcode::v_fma_mix_f32 || alu->opcode == aco_opcode::v_fma_mixlo_f16 ||
-       alu->opcode == aco_opcode::v_fma_mixhi_f16)
+       alu->opcode == aco_opcode::v_fma_mixhi_f16 ||
+       alu->opcode == aco_opcode::p_v_fma_mixlo_f16_rtz ||
+       alu->opcode == aco_opcode::p_v_fma_mixhi_f16_rtz)
       type.bit_size = alu->valu().opsel_hi[index] ? 16 : 32;
 
    return type;
@@ -1154,6 +1160,8 @@ get_swapped_opcode(aco_opcode opcode, unsigned idx0, unsigned idx1)
    case aco_opcode::v_fma_mix_f32:
    case aco_opcode::v_fma_mixlo_f16:
    case aco_opcode::v_fma_mixhi_f16:
+   case aco_opcode::p_v_fma_mixlo_f16_rtz:
+   case aco_opcode::p_v_fma_mixhi_f16_rtz:
    case aco_opcode::v_pk_fmac_f16: {
       if (idx1 == 2)
          return aco_opcode::num_opcodes;
