@@ -474,8 +474,9 @@ radv_image_view_can_fast_clear(const struct radv_device *device, const struct ra
    if (!radv_image_can_fast_clear(device, image))
       return false;
 
-   /* Only fast clear if all layers are bound. */
-   if (iview->vk.base_array_layer > 0 || iview->vk.layer_count != image->vk.array_layers)
+   /* Only fast clear if all layers are bound when comp-to-single isn't supported. */
+   const bool all_slices = iview->vk.base_array_layer == 0 && iview->vk.layer_count == image->vk.array_layers;
+   if (!all_slices && !image->support_comp_to_single)
       return false;
 
    /* Only fast clear if the view covers the whole image. */
