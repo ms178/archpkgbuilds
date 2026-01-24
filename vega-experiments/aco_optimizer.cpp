@@ -14,6 +14,16 @@
 #include <array>
 #include <vector>
 
+#if defined(__clang__) || defined(__GNUC__)
+#define ACO_HOT [[gnu::hot]]
+#define LIKELY(x)   (__builtin_expect(!!(x), 1))
+#define UNLIKELY(x) (__builtin_expect(!!(x), 0))
+#else
+#define ACO_HOT
+#define LIKELY(x)   (x)
+#define UNLIKELY(x) (x)
+#endif
+
 namespace aco {
 
 namespace {
@@ -364,6 +374,7 @@ struct alu_opt_info {
    uint8_t omod = 0;
    bool clamp = false;
    bool f32_to_f16 = false;
+   bool f32_to_f16_rtz = false;
    SubdwordSel insert = SubdwordSel::dword;
 
    bool try_swap_operands(unsigned idx0, unsigned idx1)
@@ -600,7 +611,8 @@ format_is(Format f1, Format f2)
 bool
 try_vinterp_inreg(opt_ctx& ctx, alu_opt_info& info)
 {
-   if (ctx.program->gfx_level < GFX11 || info.opcode != aco_opcode::v_fma_f32 || info.omod)
+   if (ctx.program->gfx_level < GFX11 || info.opcode != aco_opcode::v_fma_f32 || info.omod ||
+       info.f32_to_f16_rtz)
       return false;
 
    bool fp16 = info.f32_to_f16;
@@ -691,8 +703,6 @@ alu_opt_info_is_valid(opt_ctx& ctx, alu_opt_info& info)
    case aco_opcode::v_fma_legacy_f32:
    case aco_opcode::v_fma_f16:
    case aco_opcode::v_fma_legacy_f16:
-   case aco_opcode::v_fma_mix_f32:
-   case aco_opcode::v_fma_mixlo_f16:
    case aco_opcode::v_pk_mul_f16:
    case aco_opcode::v_pk_fma_f16:
    case aco_opcode::s_mul_f32:
@@ -834,6 +844,10 @@ alu_opt_info_is_valid(opt_ctx& ctx, alu_opt_info& info)
       }
    }
 
+   assert(!info.f32_to_f16_rtz || info.f32_to_f16);
+   if (info.f32_to_f16_rtz && ctx.fp_mode.round16_64 == fp_round_tz)
+      info.f32_to_f16_rtz = false;
+
    /* convert to VINTERP_INREG */
    try_vinterp_inreg(ctx, info);
 
@@ -871,8 +885,13 @@ alu_opt_info_is_valid(opt_ctx& ctx, alu_opt_info& info)
       default: return false;
       }
 
-      info.opcode = info.f32_to_f16 ? aco_opcode::v_fma_mixlo_f16 : aco_opcode::v_fma_mix_f32;
       info.format = Format::VOP3P;
+      if (info.f32_to_f16_rtz)
+         info.opcode = aco_opcode::p_v_fma_mixlo_f16_rtz;
+      else if (info.f32_to_f16)
+         info.opcode = aco_opcode::v_fma_mixlo_f16;
+      else
+         info.opcode = aco_opcode::v_fma_mix_f32;
    }
 
    /* remove negate modifiers by converting to subtract */
@@ -1126,8 +1145,9 @@ alu_opt_info_is_valid(opt_ctx& ctx, alu_opt_info& info)
             info.defs[0].setPrecolored(vcc);
       }
    } else if (format_is(info.format, Format::VOP3P)) {
-      bool fmamix =
-         info.opcode == aco_opcode::v_fma_mix_f32 || info.opcode == aco_opcode::v_fma_mixlo_f16;
+      bool fmamix = info.opcode == aco_opcode::v_fma_mix_f32 ||
+                    info.opcode == aco_opcode::v_fma_mixlo_f16 ||
+                    info.opcode == aco_opcode::p_v_fma_mixlo_f16_rtz;
       bool dot2_f32 =
          info.opcode == aco_opcode::v_dot2_f32_f16 || info.opcode == aco_opcode::v_dot2_f32_bf16;
       bool supports_dpp = (fmamix || dot2_f32) && ctx.program->gfx_level >= GFX11;
@@ -1253,9 +1273,11 @@ alu_opt_gather_info(opt_ctx& ctx, Instruction* instr, alu_opt_info& info)
       opsel = 0;
    }
 
-   if (instr->opcode == aco_opcode::v_fma_mix_f32 || instr->opcode == aco_opcode::v_fma_mixlo_f16) {
+   if (instr->opcode == aco_opcode::v_fma_mix_f32 || instr->opcode == aco_opcode::v_fma_mixlo_f16 ||
+       instr->opcode == aco_opcode::p_v_fma_mixlo_f16_rtz) {
       info.opcode = ctx.program->dev.fused_mad_mix ? aco_opcode::v_fma_f32 : aco_opcode::v_mad_f32;
-      info.f32_to_f16 = instr->opcode == aco_opcode::v_fma_mixlo_f16;
+      info.f32_to_f16_rtz = instr->opcode == aco_opcode::p_v_fma_mixlo_f16_rtz;
+      info.f32_to_f16 = info.f32_to_f16_rtz || instr->opcode == aco_opcode::v_fma_mixlo_f16;
    }
 
    if (instr->isSDWA())
@@ -1268,7 +1290,8 @@ alu_opt_gather_info(opt_ctx& ctx, Instruction* instr, alu_opt_info& info)
       alu_opt_op op_info = {};
       op_info.op = instr->operands[i];
       if (instr->opcode == aco_opcode::v_fma_mix_f32 ||
-          instr->opcode == aco_opcode::v_fma_mixlo_f16) {
+          instr->opcode == aco_opcode::v_fma_mixlo_f16 ||
+          instr->opcode == aco_opcode::p_v_fma_mixlo_f16_rtz) {
          op_info.neg[0] = instr->valu().neg[i];
          op_info.abs[0] = instr->valu().abs[i];
          if (instr->valu().opsel_hi[i]) {
@@ -1490,7 +1513,8 @@ alu_opt_info_to_instr(opt_ctx& ctx, alu_opt_info& info, Instruction* old_instr)
    for (unsigned i = 0; i < info.operands.size(); i++) {
       instr->operands[i] = info.operands[i].op;
       if (instr->opcode == aco_opcode::v_fma_mix_f32 ||
-          instr->opcode == aco_opcode::v_fma_mixlo_f16) {
+          instr->opcode == aco_opcode::v_fma_mixlo_f16 ||
+          instr->opcode == aco_opcode::p_v_fma_mixlo_f16_rtz) {
          instr->valu().neg[i] = info.operands[i].neg[0];
          instr->valu().abs[i] = info.operands[i].abs[0];
          instr->valu().opsel_hi[i] = info.operands[i].f16_to_f32;
@@ -3929,7 +3953,7 @@ apply_output(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    int temp_idx = -1;
    for (unsigned i = 0; i < instr->operands.size(); i++) {
       if (temp_idx < 0 && instr->operands[i].isTemp())
-         temp_idx = (int)i;
+         temp_idx = i;
       else if (instr->operands[i].isConstant())
          continue;
       else
@@ -3939,22 +3963,18 @@ apply_output(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    if (temp_idx < 0)
       return false;
 
-   const unsigned tmpid = instr->operands[(unsigned)temp_idx].tempId();
+   unsigned tmpid = instr->operands[temp_idx].tempId();
    Instruction* parent = ctx.info[tmpid].parent_instr;
-   if (ctx.uses[tmpid] != 1 || !parent || parent->definitions[0].tempId() != tmpid)
+   if (ctx.uses[tmpid] != 1 || parent->definitions[0].tempId() != tmpid)
       return false;
 
-   const int64_t alt_idx = ctx.info[tmpid].is_combined() ? (int64_t)ctx.info[tmpid].val : -1;
-
-   /* Snapshot only temp operands (including duplicates) for correct use accounting. */
-   aco::small_vec<Temp, 4> pre_opt_temps;
-   pre_opt_temps.reserve(parent->operands.size());
-   for (const Operand& op : parent->operands) {
-      if (op.isTemp())
-         pre_opt_temps.push_back(op.getTemp());
-   }
+   int64_t alt_idx = ctx.info[tmpid].is_combined() ? ctx.info[tmpid].val : -1;
+   aco::small_vec<Operand, 4> pre_opt_ops;
+   for (const Operand& op : parent->operands)
+      pre_opt_ops.push_back(op);
 
    Instruction* new_instr = apply_output_impl(ctx, instr, parent);
+
    if (new_instr == nullptr)
       return false;
 
@@ -3962,8 +3982,10 @@ apply_output(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       if (op.isTemp())
          ctx.uses[op.tempId()]++;
    }
-   for (Temp t : pre_opt_temps)
-      decrease_and_dce(ctx, t);
+   for (const Operand& op : pre_opt_ops) {
+      if (op.isTemp())
+         decrease_and_dce(ctx, op.getTemp());
+   }
 
    ctx.uses[tmpid] = 0;
    ctx.info[tmpid].parent_instr = nullptr;
@@ -3973,13 +3995,13 @@ apply_output(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 
    if (alt_idx >= 0) {
       Instruction* new_pre_combine =
-         apply_output_impl(ctx, instr, ctx.pre_combine_instrs[(size_t)alt_idx].get());
+         apply_output_impl(ctx, instr, ctx.pre_combine_instrs[alt_idx].get());
 
-      if (new_pre_combine != ctx.pre_combine_instrs[(size_t)alt_idx].get())
-         ctx.pre_combine_instrs[(size_t)alt_idx].reset(new_pre_combine);
+      if (new_pre_combine != ctx.pre_combine_instrs[alt_idx].get())
+         ctx.pre_combine_instrs[alt_idx].reset(new_pre_combine);
 
       if (new_pre_combine)
-         ctx.info[new_instr->definitions[0].tempId()].set_combined((uint32_t)alt_idx);
+         ctx.info[new_instr->definitions[0].tempId()].set_combined(alt_idx);
    }
 
    for (Definition& def : new_instr->definitions) {
@@ -4220,9 +4242,7 @@ and_cb(opt_ctx& ctx, alu_opt_info& info)
  * Helper Callbacks for Peephole Optimizations
  * ============================================================================= */
 
-/* Helper to safely compare operands accounting for constants and temps.
- * Must be defined before any callback that uses it.
- */
+/* Helper to safely compare operands accounting for constants and temps. */
 static inline bool operands_equal(const Operand& a, const Operand& b)
 {
    if (a.isTemp() && b.isTemp())
@@ -4504,6 +4524,8 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    }
 
    if (instr->isVALU() || instr->isSALU()) {
+      /* Apply SDWA. Do this after label_instruction() so it can remove
+       * label_extract if not all instructions can take SDWA. */
       alu_propagate_temp_const(ctx, instr, true);
    }
 
@@ -4793,8 +4815,13 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          add_opt(v_and_b32, v_and_or_b32, 0x3, "120", nullptr, true);
          add_opt(s_and_b32, v_and_or_b32, 0x3, "120", nullptr, true);
 
-         add_opt(v_lshlrev_b32, v_alignbit_b32, 0x3, "201", funnel_shift_lshl_cb, true);
-         add_opt(v_lshrrev_b32, v_alignbit_b32, 0x3, "021", funnel_shift_lshr_cb, true);
+         /* Custom Funnel Shift Optimization:
+          * v_or(v_lshlrev(a, 32-k), v_lshrrev(b, k)) -> v_alignbit(a, b, k)
+          */
+         add_opt(v_lshlrev_b32, v_alignbyte_b32, 0x3, "201", funnel_shift_lshl_cb, true);
+         add_opt(v_lshrrev_b32, v_alignbyte_b32, 0x3, "021", funnel_shift_lshr_cb, true);
+
+         /* Custom s_bitset optimization */
          add_opt(s_lshl_b32, s_bitset1_b32, 0x1, "1", s_bitset_cb);
       }
 
@@ -4860,6 +4887,7 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    } else if (info.opcode == aco_opcode::v_sub_u32 && !info.clamp) {
       assert(ctx.program->gfx_level >= GFX9);
 
+      /* Custom SAD optimization */
       add_opt(v_max_u32, v_sad_u32, 0x3, "012", sad_pattern_cb, true);
 
       add_opt(v_cndmask_b32, v_cndmask_b32, 0x2, "0312",
@@ -4899,6 +4927,7 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          add_opt(v_mul_u32_u24, v_mad_i32_i24, 0x2, "120", and_cb<neg_mul_to_i24_cb, pop_def_cb>);
          add_opt(s_mul_i32, v_mad_i32_i24, 0x2, "120", and_cb<neg_mul_to_i24_cb, pop_def_cb>);
 
+         /* Custom SAD optimization for carry-out version if carry is unused */
          if (ctx.program->gfx_level >= GFX9)
              add_opt(v_max_u32, v_sad_u32, 0x3, "012",
                      and_cb<sad_pattern_cb, pop_def_cb>, true);
@@ -4920,7 +4949,7 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    } else if (info.opcode == aco_opcode::s_and_b32) {
       add_opt(s_not_b32, s_andn2_b32, 0x3, "01");
       if (ctx.program->gfx_level >= GFX9)
-         add_opt(s_lshl_b32, s_bitcmp1_b32, 0x3, "120", s_bitcmp1_cb, true);
+         add_opt(s_lshl_b32, s_bitcmp1_b32, 0x3, "02", s_bitcmp1_cb, true);
    } else if (info.opcode == aco_opcode::s_andn2_b32) {
       if (ctx.program->gfx_level >= GFX9)
          add_opt(s_lshl_b32, s_bitset0_b32, 0x3, "120", s_bitset_cb, true);
@@ -4942,6 +4971,7 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       add_opt(s_max_i32, s_mov_b32, 0x2, "001", scalar_min_max_redundant_cb, true);
    } else if ((info.opcode == aco_opcode::s_sub_u32 || info.opcode == aco_opcode::s_sub_i32) &&
               !ctx.uses[info.defs[1].tempId()]) {
+      /* Custom Scalar SAD optimization */
       if (ctx.program->gfx_level >= GFX9 && info.opcode == aco_opcode::s_sub_i32)
          add_opt(s_max_i32, s_absdiff_i32, 0x3, "012", scalar_sad_pattern_cb, true);
 
@@ -5023,9 +5053,17 @@ remat_constants_instr(opt_ctx& ctx, aco::map<Temp, remat_entry>& constants, Inst
    }
 }
 
+/**
+ * This pass implements a simple constant rematerialization.
+ * As common subexpression elimination (CSE) might increase the live-ranges
+ * of loaded constants over large distances, this pass splits the live-ranges
+ * again by re-emitting constants in every basic block.
+ */
 void
 rematerialize_constants(opt_ctx& ctx)
 {
+   /* Use a generation-based dense map for O(1) lookups and cache locality.
+    * This avoids expensive map/hash map allocations in hot paths. */
    struct dense_remat_table {
       std::vector<remat_entry> entry;
       std::vector<uint32_t> gen;
@@ -5033,11 +5071,10 @@ rematerialize_constants(opt_ctx& ctx)
 
       void ensure_size(size_t n)
       {
-         if (entry.size() >= n) {
-             // Zero initialize new elements if resize happens?
-             // std::vector handles initialization.
-             return;
-         }
+         if (entry.size() >= n)
+            return;
+         /* Resize value-initializes new elements (ptr=nullptr, block=0, gen=0).
+          * cur_gen starts at 1, so 0 is safely "invalid". */
          entry.resize(n);
          gen.resize(n, 0);
       }
@@ -5050,8 +5087,8 @@ rematerialize_constants(opt_ctx& ctx)
       void clear_scope()
       {
          cur_gen++;
-         /* Extremely unlikely, but make wrap safe and deterministic. */
-         if (cur_gen == 0) {
+         /* Handle overflow deterministically, though extremely unlikely. */
+         if (UNLIKELY(cur_gen == 0)) {
             std::fill(gen.begin(), gen.end(), 0);
             cur_gen = 1;
          }
@@ -5060,7 +5097,7 @@ rematerialize_constants(opt_ctx& ctx)
       bool contains(Temp t) const
       {
          const uint32_t id = t.id();
-         return (size_t)id < gen.size() && gen[id] == cur_gen;
+         return id < gen.size() && gen[id] == cur_gen;
       }
 
       remat_entry& get(Temp t)
@@ -5087,6 +5124,7 @@ rematerialize_constants(opt_ctx& ctx)
       if (block.logical_idom == (int)block.index)
          constants.clear_scope();
 
+      /* Ensure table can hold any new temps created in previous blocks */
       constants.ensure_program(ctx.program);
 
       ctx.instructions.reserve(block.instructions.size());
@@ -5111,36 +5149,31 @@ rematerialize_constants(opt_ctx& ctx)
                if (!constants.contains(key))
                   continue;
 
-               /* Vital Fix: Do not hold reference 'e' across ensure_program/allocations. */
+               /* Check if we need to rematerialize (different block) */
                if (constants.get(key).block != block.index) {
-                  /* Copy by value to persist across potential vector resize */
+                  /* Copy entry by value to persist across potential vector resize */
                   remat_entry entry = constants.get(key);
 
                   Builder bld(ctx.program, &ctx.instructions);
                   Operand const_op = entry.instr->operands[0];
                   Instruction* new_instr = bld.copy(bld.def(op.regClass()), const_op);
 
-                  /* Account for new temp ids created by Builder.
-                   * This increases program->peekAllocationId(). */
+                  /* Update analysis context for the new instruction */
                   ctx.uses.push_back(0);
                   ctx.info.push_back(ctx.info[op.tempId()]);
 
-                  /* Resize constants table to accommodate new temps if necessary.
-                   * This invalidates any pointers/references to 'entry' vector. */
+                  /* Table resize invalidates references, so we re-acquire/set safely */
                   constants.ensure_program(ctx.program);
-
-                  /* Update table with new instruction for this block */
                   constants.set(key, {new_instr, block.index});
 
                   ctx.info[new_instr->definitions[0].tempId()].parent_instr = new_instr;
                }
 
-               /* Re-acquire reference/pointer after potential resize */
+               /* Apply the constant (re-acquire reference after potential resize) */
                Instruction* current_instr = constants.get(key).instr;
                Temp new_tmp = current_instr->definitions[0].getTemp();
                if (op.getTemp() != new_tmp) {
-                  Temp old_tmp = op.getTemp();
-                  ctx.uses[old_tmp.id()]--;
+                  ctx.uses[op.tempId()]--;
                   op.setTemp(new_tmp);
                   ctx.uses[new_tmp.id()]++;
                }
@@ -5273,9 +5306,9 @@ select_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       }
    }
 
-   /* Optimization: Dead Carry Elimination
-    * GFX9+ supports v_add_u32/v_sub_u32 which do not write VCC.
-    * If the carry-out of v_add_co_u32 is dead, demote it to improve scheduling.
+   /* Optimization: Dead Carry Elimination (GFX9+)
+    * If the carry-out of v_add_co_u32 is dead, demote it to v_add_u32.
+    * This breaks dependency chains on VCC, improving scheduling.
     */
    if (ctx.program->gfx_level >= GFX9 && !instr->definitions.empty() &&
        ctx.uses[instr->definitions[0].tempId()] != 0) {
@@ -5288,8 +5321,8 @@ select_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       }
    }
 
-   /* Optimization: Scalar Min/Max
-    * s_cselect with conditions from s_cmp can be folded into s_min/s_max (GFX9+).
+   /* Optimization: Scalar Min/Max (GFX9+)
+    * s_cselect with conditions from s_cmp can be folded into s_min/s_max.
     * s_min/s_max write SCC identically to s_cmp, preserving semantics.
     */
    if (ctx.program->gfx_level >= GFX9 &&
@@ -5298,29 +5331,33 @@ select_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
        instr->operands[2].isTemp()) {
 
       Instruction* cmp = ctx.info[instr->operands[2].tempId()].parent_instr;
-      /* Check if the comparison matches the select operands perfectly.
+      /* Check if the comparison matches the select operands.
        * s_min/s_max are SOP2 and support literals just like s_cselect.
        */
-      if (cmp && cmp->isSOPC() && cmp->operands.size() == 2 &&
-          cmp->operands[0] == instr->operands[0] &&
-          cmp->operands[1] == instr->operands[1]) {
+      if (cmp && cmp->isSOPC() && cmp->operands.size() == 2) {
+         bool match = cmp->operands[0] == instr->operands[0] && cmp->operands[1] == instr->operands[1];
+         bool swap = !match && cmp->operands[0] == instr->operands[1] && cmp->operands[1] == instr->operands[0];
 
-          aco_opcode new_op = aco_opcode::num_opcodes;
-          switch(cmp->opcode) {
-              case aco_opcode::s_cmp_gt_i32: new_op = aco_opcode::s_max_i32; break;
-              case aco_opcode::s_cmp_lt_i32: new_op = aco_opcode::s_min_i32; break;
-              case aco_opcode::s_cmp_gt_u32: new_op = aco_opcode::s_max_u32; break;
-              case aco_opcode::s_cmp_lt_u32: new_op = aco_opcode::s_min_u32; break;
-              default: break;
-          }
+         if (match || swap) {
+            aco_opcode new_op = aco_opcode::num_opcodes;
+            /* Map cmp to min/max. For 'gt', we select operand 0 if op0 > op1.
+             * Direct match: cselect(a, b, a > b) -> max(a, b)
+             * Swapped match: cselect(b, a, a > b) -> min(a, b) */
+            switch(cmp->opcode) {
+               case aco_opcode::s_cmp_gt_i32: new_op = match ? aco_opcode::s_max_i32 : aco_opcode::s_min_i32; break;
+               case aco_opcode::s_cmp_lt_i32: new_op = match ? aco_opcode::s_min_i32 : aco_opcode::s_max_i32; break;
+               case aco_opcode::s_cmp_gt_u32: new_op = match ? aco_opcode::s_max_u32 : aco_opcode::s_min_u32; break;
+               case aco_opcode::s_cmp_lt_u32: new_op = match ? aco_opcode::s_min_u32 : aco_opcode::s_max_u32; break;
+               default: break;
+            }
 
-          if (new_op != aco_opcode::num_opcodes) {
-              instr->opcode = new_op;
-              /* s_min/s_max are SOP2 like cselect, but take 2 ops instead of 3.
-               * Remove SCC/Condition operand.
-               */
-              instr->operands.pop_back();
-          }
+            if (new_op != aco_opcode::num_opcodes) {
+               instr->opcode = new_op;
+               /* s_min/s_max are SOP2 like cselect, but take 2 ops instead of 3.
+                * Remove SCC/Condition operand. Operand order is already correct from cselect. */
+               instr->operands.pop_back();
+            }
+         }
       }
    }
 
@@ -5748,10 +5785,88 @@ try_convert_sopc_to_sopk(aco_ptr<Instruction>& instr)
 }
 
 static void
+opt_split_cvt_pkrtz(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+{
+   if (instr->isDPP() || instr->isSDWA())
+      return;
+
+   if (instr->definitions[0].regClass() != v1 && instr->definitions[0].regClass() != v2b)
+      return;
+
+   bool packed_cvt = instr->definitions[0].bytes() > 2;
+   if (!instr->operands[0].isTemp() || (packed_cvt && !instr->operands[1].isTemp()))
+      return;
+
+   /* Instruction selection emits two uses for scalar f2f16_rtz to avoid using VOP3. */
+   bool replicate =
+      instr->operands[1].isTemp() && instr->operands[0].getTemp() == instr->operands[1].getTemp();
+   if (replicate && packed_cvt)
+      return;
+
+   alu_opt_info info;
+   if (!alu_opt_gather_info(ctx, instr.get(), info))
+      return;
+   aco_type type = {aco_base_type_float, 1, 32};
+
+   Instruction* parent[2];
+   alu_opt_info parent_info[2];
+   for (unsigned i = 0; i < (packed_cvt ? 2 : 1); i++) {
+      unsigned tmpid = instr->operands[i].tempId();
+      parent[i] = ctx.info[tmpid].parent_instr;
+      if (ctx.uses[tmpid] != (replicate ? 2 : 1) || parent[i]->definitions[0].tempId() != tmpid)
+         return;
+      if (!alu_opt_gather_info(ctx, parent[i], parent_info[i]))
+         return;
+
+      if (parent_info[i].uses_insert() || parent_info[i].f32_to_f16)
+         return;
+
+      if (!backpropagate_input_modifiers(ctx, parent_info[i], info.operands[i], type))
+         return;
+
+      parent_info[i].f32_to_f16 = true;
+      parent_info[i].f32_to_f16_rtz = true;
+      if (!alu_opt_info_is_valid(ctx, parent_info[i]))
+         return;
+   }
+
+   ctx.program->needs_fp_mode_insertion = true;
+
+   for (unsigned i = 0; i < (packed_cvt ? 2 : 1); i++) {
+      if (packed_cvt) {
+         parent_info[i].defs[0].setTemp(Temp(parent_info[i].defs[0].tempId(), v2b));
+         ctx.program->temp_rc[parent_info[i].defs[0].tempId()] = v2b;
+      } else {
+         ctx.uses[parent_info[i].defs[0].tempId()] = 0;
+         ctx.info[parent_info[i].defs[0].tempId()].parent_instr = nullptr;
+         parent_info[i].defs[0].setTemp(instr->definitions[0].getTemp());
+      }
+      Instruction* new_instr = alu_opt_info_to_instr(ctx, parent_info[i], parent[i]);
+
+      if (parent[i] != new_instr)
+         ctx.replacement_instr.emplace(parent[i], new_instr);
+
+      parent[i] = new_instr;
+   }
+
+   if (packed_cvt) {
+      static_assert(sizeof(Pseudo_instruction) <= sizeof(VALU_instruction), "invalid direct cast");
+      instr->operands[0] = Operand(parent[0]->definitions[0].getTemp());
+      instr->operands[1] = Operand(parent[1]->definitions[0].getTemp());
+      instr->format = Format::PSEUDO;
+      instr->opcode = aco_opcode::p_create_vector;
+      instr->pseudo().needs_scratch_reg = false;
+   } else {
+      instr.reset();
+   }
+}
+
+static void
 opt_fma_mix_acc(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 {
    /* fma_mix is only dual issued on gfx11 if dst and acc type match */
-   bool f2f16 = instr->opcode == aco_opcode::v_fma_mixlo_f16;
+   bool f2f16 = instr->opcode == aco_opcode::v_fma_mixlo_f16 ||
+                instr->opcode == aco_opcode::p_v_fma_mixlo_f16_rtz;
 
    if (instr->valu().opsel_hi[2] == f2f16 || instr->isDPP())
       return;
@@ -5916,8 +6031,12 @@ apply_literals(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    if (instr->isSOPC() && ctx.program->gfx_level < GFX12)
       try_convert_sopc_to_sopk(instr);
 
-   if (instr->opcode == aco_opcode::v_fma_mixlo_f16 || instr->opcode == aco_opcode::v_fma_mix_f32)
-      opt_fma_mix_acc(ctx, instr);
+   if (instr->opcode == aco_opcode::v_cvt_pkrtz_f16_f32 ||
+       instr->opcode == aco_opcode::v_cvt_pkrtz_f16_f32_e64) {
+      opt_split_cvt_pkrtz(ctx, instr);
+      if (!instr)
+         return;
+   }
 
    if (instr->opcode == aco_opcode::v_mul_f64 || instr->opcode == aco_opcode::v_mul_f64_e64)
       opt_neg_abs_fp64(ctx, instr);
@@ -6018,13 +6137,12 @@ optimize(Program* program)
    ctx.program = program;
    ctx.info = std::vector<ssa_info>(program->peekAllocationId());
 
+   /* Heuristic: Reserve memory to avoid reallocations.
+    * Estimate based on total instruction count. */
    size_t total_instr = 0;
    for (const Block& block : program->blocks)
       total_instr += block.instructions.size();
 
-   /* Heuristic headroom: optimizer can create additional instructions/temps.
-    * Keep it conservative to avoid over-reserving in tiny shaders.
-    */
    const size_t reserve_hint = total_instr / 4u + 16u;
    ctx.pre_combine_instrs.reserve(reserve_hint);
    ctx.replacement_instr.reserve(total_instr / 8u + 16u);
@@ -6040,7 +6158,7 @@ optimize(Program* program)
 
    ctx.uses = dead_code_analysis(program);
 
-   /* We will push_back into uses/info in later passes (e.g., add_lm_def_cb, remat). */
+   /* Ensure vectors have space for new temps created during optimization */
    ctx.uses.reserve(ctx.uses.size() + reserve_hint);
    ctx.info.reserve(ctx.info.size() + reserve_hint);
 
@@ -6087,6 +6205,17 @@ optimize(Program* program)
       for (aco_ptr<Instruction>& instr : block.instructions)
          apply_literals(ctx, instr);
       block.instructions = std::move(ctx.instructions);
+   }
+
+   for (Block& block : program->blocks) {
+      ctx.fp_mode = block.fp_mode;
+      for (aco_ptr<Instruction>& instr : block.instructions) {
+         insert_replacement_instr(ctx, instr);
+         if (instr->opcode == aco_opcode::v_fma_mixlo_f16 ||
+             instr->opcode == aco_opcode::p_v_fma_mixlo_f16_rtz ||
+             instr->opcode == aco_opcode::v_fma_mix_f32)
+            opt_fma_mix_acc(ctx, instr);
+      }
    }
 
    validate_opt_ctx(ctx, true);
