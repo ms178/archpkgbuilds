@@ -1311,8 +1311,10 @@ schedule_program(Program* program)
    RegisterDemand demand;
    for (Block& block : program->blocks)
       demand.update(block.register_demand);
-   demand.vgpr += program->config->num_shared_vgprs / 2;
-   demand.update(program->fixed_reg_demand);
+
+   RegisterDemand usage = demand;
+   usage.vgpr += program->config->num_shared_vgprs / 2;
+   usage.update(program->fixed_reg_demand);
 
    sched_ctx ctx;
    ctx.gfx_level = program->gfx_level;
@@ -1326,13 +1328,21 @@ schedule_program(Program* program)
    /* If we already have less waves than the minimum, don't reduce them further.
     * Otherwise, sacrifice some waves and use more VGPRs, in order to improve scheduling.
     */
-   int vgpr_demand = std::max<int>(24, demand.vgpr) + 12 * reg_file_multiple;
+   int vgpr_demand = std::max<int>(24, usage.vgpr) + 12 * reg_file_multiple;
    int target_waves = std::max(wave_minimum, program->dev.physical_vgprs / vgpr_demand);
    target_waves = max_suitable_waves(program, std::min<int>(program->num_waves, target_waves));
    assert(target_waves >= program->min_waves);
 
    ctx.mv.max_registers = get_addr_regs_from_waves(program, target_waves);
    ctx.mv.max_registers.vgpr -= 2;
+
+   /* If this is a callee, don't use unneeded preserved VGPRs. */
+   if (program->is_callee) {
+      RegisterDemand limit = get_addr_regs_from_waves(program, program->min_waves);
+      RegisterDemand max_clobbered_regs = program->callee_abi.numClobbered(limit);
+      ctx.mv.max_registers.vgpr = std::min(ctx.mv.max_registers.vgpr, max_clobbered_regs.vgpr);
+      ctx.mv.max_registers.update(demand);
+   }
 
    /* VMEM_MAX_MOVES and such assume pre-GFX10 wave count */
    ctx.occupancy_factor = target_waves / wave_factor;
@@ -1354,7 +1364,6 @@ schedule_program(Program* program)
    for (Block& block : program->blocks) {
       new_demand.update(block.register_demand);
    }
-   new_demand.update(program->fixed_reg_demand);
    assert(!new_demand.exceeds(ctx.mv.max_registers) ||
           !new_demand.exceeds(program->max_reg_demand));
    update_vgpr_sgpr_demand(program, new_demand);
