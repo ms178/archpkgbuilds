@@ -39,6 +39,7 @@
 #include "vk_sync_dummy.h"
 #include "vk_util.h"
 
+#include <assert.h>
 #include <time.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -158,14 +159,14 @@ wsi_device_init(struct wsi_device *wsi,
       &vk_physical_device_from_handle(pdevice)->supported_extensions;
    wsi->has_import_memory_host =
       supported_extensions->EXT_external_memory_host;
-   wsi->khr_present_wait =
-      supported_extensions->KHR_present_id &&
-      supported_extensions->KHR_present_wait;
+   wsi->has_present_wait = supported_extensions->KHR_present_wait ||
+                           supported_extensions->KHR_present_wait2;
+
    wsi->has_timeline_semaphore =
       supported_extensions->KHR_timeline_semaphore;
 
    /* We cannot expose KHR_present_wait without timeline semaphores. */
-   assert(!wsi->khr_present_wait || supported_extensions->KHR_timeline_semaphore);
+   assert(!wsi->has_present_wait || wsi->has_timeline_semaphore);
 
    list_inithead(&wsi->hotplug_fences);
 
@@ -209,7 +210,7 @@ wsi_device_init(struct wsi_device *wsi,
    WSI_GET_CB(WaitForFences);
    WSI_GET_CB(MapMemory);
    WSI_GET_CB(UnmapMemory);
-   if (wsi->khr_present_wait)
+   if (wsi->has_present_wait)
       WSI_GET_CB(WaitSemaphores);
 #undef WSI_GET_CB
 
@@ -281,6 +282,12 @@ wsi_device_init(struct wsi_device *wsi,
          wsi->force_swapchain_to_currentExtent =
             driQueryOptionb(dri_options, "vk_wsi_force_swapchain_to_current_extent");
       }
+
+      if (driCheckOption(dri_options, "vk_wsi_disable_unordered_submits",  DRI_BOOL)) {
+         wsi->disable_unordered_submits =
+            driQueryOptionb(dri_options, "vk_wsi_disable_unordered_submits");
+      }
+
    }
 
    /* can_present_on_device is a function pointer used to determine if images
@@ -472,6 +479,9 @@ wsi_swapchain_init(const struct wsi_device *wsi,
    chain->device = _device;
    chain->alloc = *pAllocator;
    chain->blit.type = get_blit_type(wsi, image_params, _device);
+   chain->present_wait_enabled =
+      device->enabled_features.presentWait ||
+      (pCreateInfo->flags & VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR);
 
    chain->blit.queue = NULL;
    if (chain->blit.type != WSI_SWAPCHAIN_NO_BLIT) {
@@ -1044,7 +1054,13 @@ wsi_CreateSwapchainKHR(VkDevice _device,
          .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR,
       };
       iface->get_capabilities2(surface, wsi_device, NULL, &caps2);
-      info.imageExtent = caps2.surfaceCapabilities.currentExtent;
+
+      /* 0xffffffff (UINT32_MAX) indicates that the surface has no intrinsic extent, so the size of the
+       * surface will be the size of the swapchain. In this case, overriding the swapchain size makes
+       * no sense.
+       */
+      if (caps2.surfaceCapabilities.currentExtent.width != UINT32_MAX)
+         info.imageExtent = caps2.surfaceCapabilities.currentExtent;
    }
 
    /* Ignore DEFERRED_MEMORY_ALLOCATION_BIT. Would require deep plumbing to be able to take advantage of it.
@@ -1066,7 +1082,8 @@ wsi_CreateSwapchainKHR(VkDevice _device,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
 
-   if (wsi_device->khr_present_wait) {
+   if (swapchain->present_wait_enabled) {
+      assert(wsi_device->has_present_wait);
       const VkSemaphoreTypeCreateInfo type_info = {
          .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
          .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
@@ -1092,7 +1109,6 @@ wsi_CreateSwapchainKHR(VkDevice _device,
                                          sizeof (*swapchain->blit.semaphores),
                                          VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
       if (!swapchain->blit.semaphores) {
-         wsi_device->DestroySemaphore(_device, swapchain->present_id_timeline, alloc);
          swapchain->destroy(swapchain, alloc);
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
@@ -1125,8 +1141,8 @@ wsi_DestroySwapchainKHR(VkDevice _device,
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
-wsi_ReleaseSwapchainImagesEXT(VkDevice _device,
-                              const VkReleaseSwapchainImagesInfoEXT *pReleaseInfo)
+wsi_ReleaseSwapchainImagesKHR(VkDevice _device,
+                              const VkReleaseSwapchainImagesInfoKHR *pReleaseInfo)
 {
    VK_FROM_HANDLE(wsi_swapchain, swapchain, pReleaseInfo->swapchain);
 
@@ -1366,7 +1382,8 @@ wsi_queue_submit2_unordered(const struct wsi_device *wsi,
                             uint32_t fence_count,
                             const VkFence *fences)
 {
-   if (info->commandBufferInfoCount == 0 &&
+   if (!wsi->disable_unordered_submits &&
+       info->commandBufferInfoCount == 0 &&
        queue->base.device->copy_sync_payloads != NULL) {
       /* This helper is unordered so if there are no command buffers, we can
        * just signal the signal semaphores and fences with the wait semaphores
@@ -1506,8 +1523,8 @@ wsi_common_queue_present(const struct wsi_device *wsi,
       vk_find_struct_const(pPresentInfo->pNext, PRESENT_ID_KHR);
    const VkPresentId2KHR *present_ids2 =
       vk_find_struct_const(pPresentInfo->pNext, PRESENT_ID_2_KHR);
-   const VkSwapchainPresentFenceInfoEXT *present_fence_info =
-      vk_find_struct_const(pPresentInfo->pNext, SWAPCHAIN_PRESENT_FENCE_INFO_EXT);
+   const VkSwapchainPresentFenceInfoKHR *present_fence_info =
+      vk_find_struct_const(pPresentInfo->pNext, SWAPCHAIN_PRESENT_FENCE_INFO_KHR);
 
    /* Gather up all the semaphores and fences we need to signal per-image */
    STACK_ARRAY(struct wsi_image_signal_info, image_signal_infos,
@@ -1554,13 +1571,17 @@ wsi_common_queue_present(const struct wsi_device *wsi,
       }
       if (present_id > 0) {
          image_signal_infos[i].present_id = present_id;
-         const VkSemaphoreSubmitInfo sem_info = {
-            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-            .semaphore = swapchain->present_id_timeline,
-            .value = present_id,
-            .stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-         };
-         wsi_image_signal_info_add_semaphore(&image_signal_infos[i], sem_info);
+
+         if (swapchain->present_wait_enabled) {
+            const VkSemaphoreSubmitInfo sem_info = {
+               .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+               .semaphore = swapchain->present_id_timeline,
+               .value = present_id,
+               .stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            };
+            wsi_image_signal_info_add_semaphore(&image_signal_infos[i],
+                                                sem_info);
+         }
       }
 
       /* The present fence guards all client-allocated resources and GPU
@@ -1713,8 +1734,8 @@ wsi_common_queue_present(const struct wsi_device *wsi,
    /* Finally, we can present */
    const VkPresentRegionsKHR *regions =
       vk_find_struct_const(pPresentInfo->pNext, PRESENT_REGIONS_KHR);
-   const VkSwapchainPresentModeInfoEXT *present_mode_info =
-      vk_find_struct_const(pPresentInfo->pNext, SWAPCHAIN_PRESENT_MODE_INFO_EXT);
+   const VkSwapchainPresentModeInfoKHR *present_mode_info =
+      vk_find_struct_const(pPresentInfo->pNext, SWAPCHAIN_PRESENT_MODE_INFO_KHR);
 
    for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
       VK_FROM_HANDLE(wsi_swapchain, swapchain, pPresentInfo->pSwapchains[i]);
@@ -1826,10 +1847,13 @@ wsi_GetDeviceGroupSurfacePresentModesKHR(VkDevice device,
 VkResult
 wsi_common_create_swapchain_image(const struct wsi_device *wsi,
                                   const VkImageCreateInfo *pCreateInfo,
-                                  VkSwapchainKHR _swapchain,
                                   VkImage *pImage)
 {
-   VK_FROM_HANDLE(wsi_swapchain, chain, _swapchain);
+   const VkImageSwapchainCreateInfoKHR *swapchain_info =
+      vk_find_struct_const(pCreateInfo->pNext, IMAGE_SWAPCHAIN_CREATE_INFO_KHR);
+   assert(swapchain_info);
+
+   VK_FROM_HANDLE(wsi_swapchain, chain, swapchain_info->swapchain);
 
 #ifndef NDEBUG
    const VkImageCreateInfo *swcInfo = &chain->image_info.create;
@@ -2164,7 +2188,9 @@ wsi_cmd_blit_image_to_buffer(VkCommandBuffer cmd_buffer,
    };
    wsi->CmdPipelineBarrier(cmd_buffer,
                            VK_PIPELINE_STAGE_TRANSFER_BIT,
-                           VK_PIPELINE_STAGE_HOST_BIT,
+                           image->blit.to_foreign_queue
+                              ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
+                              : VK_PIPELINE_STAGE_HOST_BIT,
                            0,
                            0, NULL,
                            1, &buf_mem_barrier,
