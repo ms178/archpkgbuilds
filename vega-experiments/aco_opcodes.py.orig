@@ -1228,6 +1228,8 @@ VOPP = {
    ("v_fma_mix_f32",    dst(F32), src(F32, F32, F32), op(gfx9=0x20)), # v_mad_mix_f32 in VEGA ISA, v_fma_mix_f32 in RDNA ISA
    ("v_fma_mixlo_f16",  dst(F16), src(F32, F32, F32), op(gfx9=0x21)), # v_mad_mixlo_f16 in VEGA ISA, v_fma_mixlo_f16 in RDNA ISA
    ("v_fma_mixhi_f16",  dst(F16), src(F32, F32, F32), op(gfx9=0x22)), # v_mad_mixhi_f16 in VEGA ISA, v_fma_mixhi_f16 in RDNA ISA
+   ("p_v_fma_mixlo_f16_rtz", dst(F16), src(F32, F32, F32), op(-1)), # v_fma_mixlo_f16 with fp16 rtz rounding
+   ("p_v_fma_mixhi_f16_rtz", dst(F16), src(F32, F32, F32), op(-1)), # v_fma_mixhi_f16 with fp16 rtz rounding
    ("v_dot2_i32_i16",      dst(U32), src(PkU16, PkU16, U32), op(gfx9=0x26, gfx10=0x14, gfx11=-1)),
    ("v_dot2_u32_u16",      dst(U32), src(PkU16, PkU16, U32), op(gfx9=0x27, gfx10=0x15, gfx11=-1)),
    ("v_dot4_i32_iu8",      dst(U32), src(PkU16, PkU16, U32), op(gfx11=0x16)),
