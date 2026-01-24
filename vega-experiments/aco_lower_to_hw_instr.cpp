@@ -1561,6 +1561,11 @@ do_swap(lower_context* ctx, Builder& bld, const copy_operation& copy, bool prese
             bld.sop2(aco_opcode::s_xor_b32, def, Definition(scc, s1), op, def_as_op);
             bld.sop2(aco_opcode::s_xor_b32, op_as_def, Definition(scc, s1), op, def_as_op);
          }
+      } else if (def.regClass() == s2 && ctx->program->gfx_level >= GFX12) {
+         /* 64bit add/sub do not write SCC. */
+         bld.sop2(aco_opcode::s_add_u64, op_as_def, op, def_as_op);
+         bld.sop2(aco_opcode::s_sub_u64, def, op, def_as_op);
+         bld.sop2(aco_opcode::s_sub_u64, op_as_def, op, def_as_op);
       } else if (def.regClass() == s2) {
          if (preserve_scc)
             bld.sop1(aco_opcode::s_mov_b32, Definition(pi->scratch_sgpr, s1), Operand(scc, s1));

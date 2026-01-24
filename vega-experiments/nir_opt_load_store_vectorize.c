@@ -1571,10 +1571,6 @@ try_vectorize_shared2(struct vectorize_ctx *ctx,
                       struct entry *low, struct entry *high,
                       struct entry *first, struct entry *second)
 {
-   if (!can_vectorize(ctx, first, second) || first->deref) {
-      return false;
-   }
-
    unsigned low_bit_size = get_bit_size(low);
    unsigned high_bit_size = get_bit_size(high);
    unsigned low_size = low->num_components * low_bit_size / 8;
@@ -1591,6 +1587,9 @@ try_vectorize_shared2(struct vectorize_ctx *ctx,
    if (high->align_mul % low_size || high->align_offset % low_size) {
       return false;
    }
+
+   if (!can_vectorize(ctx, first, second) || first->deref)
+      return false;
 
    int64_t diff_signed = get_offset_diff(low, high);
    if (diff_signed < 0 || diff_signed > UINT32_MAX) {
