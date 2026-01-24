@@ -794,20 +794,19 @@ visit_call(isel_context* ctx, nir_call_instr* instr)
 {
    Builder bld(ctx->program, ctx->block);
 
-   ABI abi;
-   /* TODO: callable abi? */
-   switch (instr->callee->driver_attributes & ACO_NIR_FUNCTION_ATTRIB_ABI_MASK) {
-   case ACO_NIR_CALL_ABI_RT_RECURSIVE: abi = rtRaygenABI; break;
-   case ACO_NIR_CALL_ABI_TRAVERSAL: abi = rtTraversalABI; break;
-   case ACO_NIR_CALL_ABI_AHIT_ISEC: abi = rtAnyHitABI; break;
-   default: UNREACHABLE("invalid abi");
-   }
+   unsigned nir_abi = instr->callee->driver_attributes & ACO_NIR_FUNCTION_ATTRIB_ABI_MASK;
+   param_assignment_hints hints;
+
+   if (nir_abi == ACO_NIR_CALL_ABI_AHIT_ISEC)
+      hints = get_ahit_isec_param_hints(ctx->callee_info);
+
+   ABI abi = nir_abi_to_aco(instr->callee->driver_attributes);
 
    RegisterDemand limit = get_addr_regs_from_waves(ctx->program, ctx->program->min_waves);
 
    struct callee_info info =
-      get_callee_info(ctx->program->gfx_level, abi, instr->callee->num_params,
-                      instr->callee->params, nullptr, limit);
+      get_callee_info(ctx->program->gfx_level, ctx->program->wave_size, abi,
+                      instr->callee->num_params, instr->callee->params, nullptr, limit, hints);
    std::vector<parameter_info> return_infos;
 
    /* Before setting up the call itself, set up parameters stored in scratch memory.
@@ -891,7 +890,7 @@ visit_call(isel_context* ctx, nir_call_instr* instr)
       Operand& op = call_instr->operands[reg_param_idx + extra_param_count];
       op.setPrecolored(info.param_infos[i].def.physReg());
 
-      if (instr->callee->params[i].is_uniform)
+      if (instr->callee->params[i].is_uniform || instr->callee->params[i].bit_size == 1)
          op.setTemp(bld.as_uniform(get_ssa_temp(ctx, instr->params[i].ssa)));
       else
          op.setTemp(as_vgpr(ctx, get_ssa_temp(ctx, instr->params[i].ssa)));
@@ -1351,28 +1350,40 @@ select_program_rt(isel_context& ctx, unsigned shader_count, struct nir_shader* c
       init_context(&ctx, nir);
       setup_fp_mode(&ctx, nir);
 
-      nir_function_impl* impl = NULL;
-      nir_foreach_function_impl (func, nir) {
-         impl = func;
-         break;
-      }
-
-      ABI abi;
-      /* TODO: callable abi? */
-      switch (impl->function->driver_attributes & ACO_NIR_FUNCTION_ATTRIB_ABI_MASK) {
-      case ACO_NIR_CALL_ABI_RT_RECURSIVE: abi = rtRaygenABI; break;
-      case ACO_NIR_CALL_ABI_TRAVERSAL: abi = rtTraversalABI; break;
-      case ACO_NIR_CALL_ABI_AHIT_ISEC: abi = rtAnyHitABI; break;
-      default: UNREACHABLE("invalid abi");
-      }
-
       RegisterDemand limit = get_addr_regs_from_waves(ctx.program, ctx.program->min_waves);
 
-      ctx.callee_abi = abi;
+      nir_function_impl* impl = NULL;
+      nir_function* traversal_function = NULL;
+      nir_function* ahit_isec_function = NULL;
+      nir_foreach_function (func, nir) {
+         unsigned func_nir_abi = (func->driver_attributes & ACO_NIR_FUNCTION_ATTRIB_ABI_MASK);
+
+         if (func->impl)
+            impl = func->impl;
+         if (func_nir_abi == ACO_NIR_CALL_ABI_TRAVERSAL)
+            traversal_function = func;
+         if (func_nir_abi == ACO_NIR_CALL_ABI_AHIT_ISEC)
+            ahit_isec_function = func;
+         if (impl && traversal_function && ahit_isec_function)
+            break;
+      }
+
+      unsigned nir_abi = (impl->function->driver_attributes & ACO_NIR_FUNCTION_ATTRIB_ABI_MASK);
+      param_assignment_hints callee_hints;
+      if (nir_abi == ACO_NIR_CALL_ABI_AHIT_ISEC) {
+         assert(traversal_function);
+         callee_info traversal_info = get_callee_info(
+            ctx.program->gfx_level, ctx.program->wave_size, rtTraversalABI,
+            traversal_function->num_params, traversal_function->params, NULL, limit);
+         callee_hints = get_ahit_isec_param_hints(traversal_info);
+      }
+
+      /* TODO: callable abi? */
+      ctx.callee_abi = nir_abi_to_aco(impl->function->driver_attributes);
       ctx.program->callee_abi = ctx.callee_abi;
-      ctx.callee_info =
-         get_callee_info(ctx.program->gfx_level, ctx.callee_abi, impl->function->num_params,
-                         impl->function->params, ctx.program, limit);
+      ctx.callee_info = get_callee_info(ctx.program->gfx_level, ctx.program->wave_size,
+                                        ctx.callee_abi, impl->function->num_params,
+                                        impl->function->params, ctx.program, limit, callee_hints);
       ctx.program->is_callee = true;
 
       Instruction* startpgm = add_startpgm(&ctx, true);
