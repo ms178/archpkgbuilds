@@ -173,6 +173,14 @@ struct task_ctx {
 	u32	prev_cpu_id;		/* where a task ran last time */
 	u32	cpu_id;			/* where a task is running now */
 
+	/*
+	 * BBRv3-inspired stability tracking for fast path optimization.
+	 * These fields fit in the 4-byte padding at end of cacheline 2.
+	 */
+	u8	stable_rounds;		/* consecutive stable scheduling rounds */
+	u8	try_fast_path;		/* fast path eligible flag (BBRv3 style) */
+	u16	prev_lat_cri;		/* lat_cri from previous run for delta check */
+
 	/* --- cacheline 3 boundary (192 bytes) --- */
 	u64	last_quiescent_clk;	/* last time when a task became asleep */
 	u64	last_sum_exec_clk;	/* last time when sum exec time was measured */

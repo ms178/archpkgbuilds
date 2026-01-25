@@ -1,15 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  * scx_lavd: Latency-criticality Aware Virtual Deadline (LAVD) scheduler
- *
- * Enhanced with concepts from:
- * - CAKE: Anti-starvation, DRR++ ideas
- * - BORE: Logarithmic burst penalty, asymmetric smoothing, LUT acceleration
- * - BBRv3: Fast path for stable tasks, round-based stability
- *
  * Copyright (c) 2023, 2024 Valve Corporation.
  * Author: Changwoo Min <changwoo@igalia.com>
- * Optimizations: CAKE/BORE/BBRv3 integration
  */
 #include <scx/common.bpf.h>
 #include <scx/bpf_arena_common.bpf.h>
@@ -26,69 +19,21 @@
 
 char _license[] SEC("license") = "GPL";
 
-/*
- * Logical current clock
- */
 u64 cur_logical_clk = LAVD_DL_COMPETE_WINDOW;
 
-/*
- * Current service time
- */
 static u64 cur_svc_time;
 
-/*
- * The minimum and maximum of time slice
- */
 const volatile u64 slice_min_ns = LAVD_SLICE_MIN_NS_DFL;
 const volatile u64 slice_max_ns = LAVD_SLICE_MAX_NS_DFL;
-
-/*
- * Migration delta threshold percentage (0-100)
- */
 const volatile u8 mig_delta_pct = 0;
-
-/*
- * Slice time for all tasks when pinned tasks are running on the CPU.
- */
 const volatile u64 pinned_slice_ns = 0;
 
 static volatile u64 nr_cpus_big;
-
-/*
- * Scheduler's PID
- */
 static pid_t lavd_pid;
 
-/* ================================================================== */
-/*              BORE-inspired: Asymmetric Smoothing Constants         */
-/* ================================================================== */
-/*
- * BORE's key insight: different adaptation rates for increase vs decrease.
- *
- * For avg_runtime (higher = heavier task):
- * - Runtime INCREASING → task becoming heavier → SLOW adaptation (protect gaming)
- * - Runtime DECREASING → task becoming lighter → FAST adaptation (quick promotion)
- *
- * Original LAVD: UP=1, DOWN=2 (slow up, medium down)
- * BORE-tuned:    UP=1, DOWN=0 (slow up, immediate down)
- *
- * This protects gaming threads from occasional long frames while allowing
- * quick recovery to sparse status.
- */
-#define LAVD_SMOOTH_SHIFT_UP	1U   /* Slow penalty increase (÷2) */
-#define LAVD_SMOOTH_SHIFT_DOWN	0U   /* Fast penalty decrease (immediate) - BORE style */
+#define LAVD_SMOOTH_SHIFT_UP	1U
+#define LAVD_SMOOTH_SHIFT_DOWN	0U
 
-/* ================================================================== */
-/*              BORE-inspired: Logarithmic Burst Penalty              */
-/* ================================================================== */
-/*
- * BORE's log2 LUT for O(1) burst classification.
- *
- * Pre-computed: log2(1 + i/256) * 256, for i=0..255
- * Used to get fractional part of log2 after CLZ gives integer part.
- *
- * Source: BORE bore.c log2_lookup[]
- */
 static const u8 bore_log2_lut[256] = {
       0,   1,   3,   4,   6,   7,   9,  10,  11,  13,  14,  16,  17,  18,  20,  21,
      22,  24,  25,  26,  28,  29,  30,  32,  33,  34,  35,  37,  38,  39,  40,  42,
@@ -108,28 +53,10 @@ static const u8 bore_log2_lut[256] = {
     237, 238, 239, 239, 240, 241, 241, 242, 243, 244, 244, 245, 246, 247, 247, 248
 };
 
-/*
- * BORE burst penalty constants (tuned for LAVD integration)
- *
- * penalty = max(0, (log2_q8 - offset_q8) * scale >> 16)
- *
- * offset=20 means bursts < ~1ms get zero penalty
- * scale=1280 maps log range to 0-100 (BORE default)
- */
 #define BORE_BURST_OFFSET     20
 #define BORE_BURST_SCALE      1280
 #define BORE_MAX_PENALTY      100
 
-/*
- * BORE: Calculate burst penalty using LUT-accelerated log2
- *
- * Maps runtime (ns) to penalty (0-100) using logarithmic compression.
- * Gaming bursts (10-100µs) → 0 penalty
- * Batch bursts (1-10ms) → moderate penalty
- * Heavy bursts (>10ms) → high penalty
- *
- * Performance: ~10 cycles (CLZ + LUT lookup + arithmetic)
- */
 static __always_inline u32 bore_calc_burst_penalty(u64 runtime_ns)
 {
 	u32 exp, frac_idx, log2_q8, delta_q8, penalty;
@@ -148,30 +75,15 @@ static __always_inline u32 bore_calc_burst_penalty(u64 runtime_ns)
 	frac_idx = (u32)(frac >> 56) & 0xFF;
 
 	log2_q8 = (exp << 8) | bore_log2_lut[frac_idx];
-
 	delta_q8 = log2_q8 - (BORE_BURST_OFFSET << 8);
 	penalty = (delta_q8 * BORE_BURST_SCALE) >> 16;
 
 	return (penalty > BORE_MAX_PENALTY) ? BORE_MAX_PENALTY : penalty;
 }
 
-/* ================================================================== */
-/*              CAKE-inspired: Anti-Starvation Counter                */
-/* ================================================================== */
-/*
- * CAKE's anti-starvation: periodically service lower priority work.
- *
- * Every CAKE_STARVATION_PERIOD dispatches, we check if there's pending
- * work in less critical queues to prevent starvation.
- *
- * This is crucial for games like Total War: Troy where background
- * asset streaming competes with render threads.
- */
-#define CAKE_STARVATION_PERIOD     16   /* Check every 16 dispatches */
+#define CAKE_STARVATION_PERIOD     16
 #define CAKE_STARVATION_MASK       (CAKE_STARVATION_PERIOD - 1)
 
-/* Per-CPU starvation counter (embedded in existing cpu_ctx would be better,
- * but we use a simple approach here to avoid header changes) */
 struct cake_starvation_state {
 	u32 dispatch_count;
 	u32 _pad;
@@ -190,34 +102,95 @@ static __always_inline struct cake_starvation_state *get_starvation_state(void)
 	return bpf_map_lookup_elem(&cake_starvation_map, &key);
 }
 
-/* ================================================================== */
-/*              BBRv3-inspired: Fast Path Stability Tracking          */
-/* ================================================================== */
-/*
- * BBRv3's try_fast_path: skip expensive recalculation for stable tasks.
- *
- * A task is "stable" if its latency criticality hasn't changed significantly
- * for BBR_STABLE_THRESHOLD consecutive runs.
- *
- * For stable tasks, we skip the full latency criticality recalculation
- * and just update runtime EMA, saving ~30-50 cycles.
- */
-#define BBR_STABLE_THRESHOLD       4    /* Runs before fast path eligible */
-#define BBR_LAT_CRI_DELTA_THRESH   10   /* Max lat_cri change for fast path */
+#define BBR_STABLE_THRESHOLD       4
+#define BBR_LAT_CRI_DELTA_THRESH   10
 
-/* ================================================================== */
-/*              Core Smoothing Function (BORE-enhanced)               */
-/* ================================================================== */
-/*
- * Asymmetric exponential moving average (BORE's binary_smooth)
- *
- * Different adaptation rates for increase vs decrease:
- * - Increasing (new > old): slow adaptation to protect against spikes
- * - Decreasing (new < old): fast adaptation for quick recovery
- *
- * This is critical for gaming: one long frame shouldn't demote a thread,
- * but becoming sparse should quickly promote it.
- */
+static __always_inline bool bbr_is_lat_cri_stable(u16 cur, u16 prev)
+{
+	u16 delta = (cur >= prev) ? (cur - prev) : (prev - cur);
+	return delta <= BBR_LAT_CRI_DELTA_THRESH;
+}
+
+static __always_inline bool bbr_is_runtime_stable(u64 cur, u64 avg)
+{
+	u64 delta, threshold;
+
+	if (unlikely(avg == 0))
+		return false;
+
+	threshold = avg >> 2;
+	delta = (cur >= avg) ? (cur - avg) : (avg - cur);
+	return delta <= threshold;
+}
+
+static __always_inline void bbr_update_stability(task_ctx *taskc)
+{
+	u16 cur_lat_cri, prev_lat_cri;
+	u8 rounds;
+	bool lat_stable, runtime_stable;
+
+	if (unlikely(!taskc))
+		return;
+
+	cur_lat_cri = taskc->lat_cri;
+	prev_lat_cri = taskc->prev_lat_cri;
+
+	if (prev_lat_cri == 0 && taskc->stable_rounds == 0) {
+		taskc->prev_lat_cri = cur_lat_cri ? cur_lat_cri : 1;
+		return;
+	}
+
+	lat_stable = bbr_is_lat_cri_stable(cur_lat_cri, prev_lat_cri);
+	runtime_stable = bbr_is_runtime_stable(taskc->acc_runtime, taskc->avg_runtime);
+
+	if (lat_stable && runtime_stable) {
+		rounds = taskc->stable_rounds;
+		if (rounds < 255)
+			rounds++;
+		taskc->stable_rounds = rounds;
+
+		if (rounds >= BBR_STABLE_THRESHOLD)
+			taskc->try_fast_path = 1;
+	} else {
+		taskc->stable_rounds = 0;
+		taskc->try_fast_path = 0;
+	}
+
+	taskc->prev_lat_cri = cur_lat_cri ? cur_lat_cri : 1;
+}
+
+static __always_inline bool bbr_can_use_fast_path(task_ctx *taskc,
+						  struct cpu_ctx *cpuc)
+{
+	if (unlikely(!taskc || !cpuc))
+		return false;
+
+	if (!taskc->try_fast_path)
+		return false;
+
+	if (taskc->cpu_id != cpuc->cpu_id) {
+		taskc->try_fast_path = 0;
+		taskc->stable_rounds = 0;
+		return false;
+	}
+
+	if ((u32)taskc->cpdom_id != (u32)cpuc->cpdom_id) {
+		taskc->try_fast_path = 0;
+		taskc->stable_rounds = 0;
+		return false;
+	}
+
+	return true;
+}
+
+static __always_inline void bbr_reset_fast_path(task_ctx *taskc)
+{
+	if (likely(taskc)) {
+		taskc->try_fast_path = 0;
+		taskc->stable_rounds = 0;
+	}
+}
+
 static __always_inline u64 calc_avg_smooth(u64 old_val, u64 new_val)
 {
 	u64 delta, step, result;
@@ -229,7 +202,6 @@ static __always_inline u64 calc_avg_smooth(u64 old_val, u64 new_val)
 		delta = new_val - old_val;
 		step = delta >> LAVD_SMOOTH_SHIFT_UP;
 		step |= (u64)(step == 0);
-
 		result = old_val + step;
 		return (result > new_val) ? new_val : result;
 	}
@@ -237,21 +209,15 @@ static __always_inline u64 calc_avg_smooth(u64 old_val, u64 new_val)
 	delta = old_val - new_val;
 	step = delta >> LAVD_SMOOTH_SHIFT_DOWN;
 	step |= (u64)(step == 0);
-
 	result = old_val - step;
 	return (result < new_val) ? new_val : result;
 }
-
-/* ================================================================== */
-/*                    Hot Path Prefetch Helpers                       */
-/* ================================================================== */
 
 static __always_inline void prefetch_task_hot(task_ctx *taskc)
 {
 	if (likely(taskc != NULL)) {
 		__builtin_prefetch(taskc, 0, 3);
-		/* BORE: Prefetch second cache line for larger contexts */
-		__builtin_prefetch((char *)taskc + 64, 0, 2);
+		__builtin_prefetch((const char *)taskc + 64, 0, 2);
 	}
 }
 
@@ -259,14 +225,9 @@ static __always_inline void prefetch_cpu_hot(struct cpu_ctx *cpuc)
 {
 	if (likely(cpuc != NULL)) {
 		__builtin_prefetch(cpuc, 0, 3);
-		/* Prefetch second cache line */
-		__builtin_prefetch((char *)cpuc + 64, 0, 2);
+		__builtin_prefetch((const char *)cpuc + 64, 0, 2);
 	}
 }
-
-/* ================================================================== */
-/*                    Logical Clock Advancement                       */
-/* ================================================================== */
 
 static __always_inline void advance_cur_logical_clk(struct task_struct *p, u64 now)
 {
@@ -297,7 +258,6 @@ static __always_inline void advance_cur_logical_clk(struct task_struct *p, u64 n
 			delta = diff;
 		} else if (diff < nr_queued) {
 			const u64 rl_mask = 0x3fffull;
-
 			if ((now & rl_mask) != 0)
 				return;
 			delta = 1;
@@ -317,12 +277,6 @@ static __always_inline void advance_cur_logical_clk(struct task_struct *p, u64 n
 	}
 }
 
-/* ================================================================== */
-/*                    Time Slice Calculation                          */
-/* ================================================================== */
-/*
- * BORE-enhanced: Uses burst penalty for slice decisions
- */
 static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 {
 	u64 slice, base_slice, avg_runtime, max_slice, min_slice;
@@ -412,10 +366,6 @@ out:
 	return slice;
 }
 
-/* ================================================================== */
-/*                    Statistics Updates                              */
-/* ================================================================== */
-
 static void update_stat_for_running(struct task_struct *p,
 				    task_ctx *taskc,
 				    struct cpu_ctx *cpuc, u64 now)
@@ -446,9 +396,6 @@ static void update_stat_for_running(struct task_struct *p,
 
 	reset_lock_futex_boost(taskc, cpuc);
 
-	/*
-	 * Batch per-schedule accounting to reduce cache traffic.
-	 */
 	{
 		u32 lat_cri = taskc->lat_cri;
 
@@ -538,9 +485,6 @@ static void account_task_runtime(struct task_struct *p,
 	}
 }
 
-/*
- * BBRv3-enhanced: Fast path for stable tasks
- */
 static void update_stat_for_stopping(struct task_struct *p,
 				     task_ctx *taskc,
 				     struct cpu_ctx *cpuc)
@@ -554,18 +498,14 @@ static void update_stat_for_stopping(struct task_struct *p,
 
 	account_task_runtime(p, taskc, cpuc, now);
 
-	/*
-	 * BORE-enhanced smoothing: Use asymmetric adaptation
-	 * The calc_avg_smooth function now uses BORE's binary_smooth logic
-	 * with fast promotion and slow demotion.
-	 */
 	taskc->avg_runtime = calc_avg_smooth(taskc->avg_runtime, taskc->acc_runtime);
 	taskc->last_stopping_clk = now;
-
 	taskc->last_slice_used = time_delta(now, taskc->last_running_clk);
 
 	if (READ_ONCE(cur_svc_time) < taskc->svc_time)
 		WRITE_ONCE(cur_svc_time, taskc->svc_time);
+
+	bbr_update_stability(taskc);
 
 	reset_lock_futex_boost(taskc, cpuc);
 }
@@ -585,13 +525,6 @@ static void update_stat_for_refill(struct task_struct *p,
 	taskc->avg_runtime = calc_avg_smooth(taskc->avg_runtime, taskc->acc_runtime);
 }
 
-/* ================================================================== */
-/*                    CPU Selection                                   */
-/* ================================================================== */
-
-/*
- * CAKE/BORE-enhanced: Idle sibling selection with burst awareness
- */
 static __always_inline s32 try_select_idle_sibling(struct pick_ctx *ictx,
 						   s32 prev_cpu)
 {
@@ -600,6 +533,7 @@ static __always_inline s32 try_select_idle_sibling(struct pick_ctx *ictx,
 	const volatile u32 *sibling_ptr;
 	u8 prev_llc;
 	u32 nr_cpu = READ_ONCE(nr_cpu_ids);
+	bool task_stable = false;
 
 	if (prev_cpu < 0)
 		return -ENOENT;
@@ -611,6 +545,12 @@ static __always_inline s32 try_select_idle_sibling(struct pick_ctx *ictx,
 	cpuc_prev = get_cpu_ctx_id(prev_cpu);
 	if (!cpuc_prev || !cpuc_prev->is_online)
 		return -ENOENT;
+
+	if (ictx && ictx->taskc)
+		task_stable = ictx->taskc->try_fast_path;
+
+	if (task_stable && READ_ONCE(cpuc_prev->idle_start_clk) != 0)
+		return prev_cpu;
 
 	if (is_smt_active && likely(cpuc_prev->big_core)) {
 		sibling_ptr = MEMBER_VPTR(cpu_sibling, [prev_cpu_u]);
@@ -633,7 +573,9 @@ static __always_inline s32 try_select_idle_sibling(struct pick_ctx *ictx,
 		bool is_sparse;
 
 		u64 avg_runtime = READ_ONCE(ictx->taskc->avg_runtime);
-		if (avg_runtime < (1ULL << BORE_BURST_OFFSET)) {
+		if (task_stable) {
+			is_sparse = (avg_runtime < (1ULL << BORE_BURST_OFFSET));
+		} else if (avg_runtime < (1ULL << BORE_BURST_OFFSET)) {
 			is_sparse = true;
 		} else {
 			u32 burst_penalty = bore_calc_burst_penalty(avg_runtime);
@@ -717,10 +659,6 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	nrcpu = READ_ONCE(nr_cpu_ids);
 
-	/*
-	 * CAKE fast path: keep locality if prev_cpu is idle
-	 * and task was recently stopped (cache warmth heuristic).
-	 */
 	if (prev_cpu >= 0 && (u32)prev_cpu < nrcpu && prev_cpu < LAVD_CPU_ID_MAX) {
 		cpuc_prev = get_cpu_ctx_id(prev_cpu);
 		if (cpuc_prev && cpuc_prev->is_online &&
@@ -748,7 +686,6 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		cpu_id = (prev_cpu >= 0 && (u32)prev_cpu < nrcpu) ? prev_cpu : (s32)cpuc_cur->cpu_id;
 
 apply_policy:
-	/* Prevent perf-sensitive tasks from migrating P→E */
 	if (have_little_core && cpu_id >= 0 && (u32)cpu_id < nrcpu &&
 	    cpuc_prev && cpuc_prev->big_core && cpu_id != prev_cpu) {
 		u32 avg_perf_cri = READ_ONCE(sys_stat.avg_perf_cri);
@@ -795,10 +732,6 @@ apply_policy:
 out:
 	return cpu_id;
 }
-
-/* ================================================================== */
-/*                    Enqueue / Dequeue                               */
-/* ================================================================== */
 
 static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_aside)
 {
@@ -983,10 +916,6 @@ void BPF_STRUCT_OPS(lavd_dequeue, struct task_struct *p, u64 deq_flags)
 		debugln("Failed to cancel task %d with %d", p->pid, ret);
 }
 
-/* ================================================================== */
-/*                    Dispatch (CAKE Anti-Starvation)                 */
-/* ================================================================== */
-
 static __always_inline void consume_prev_task(struct task_struct *prev,
 					      task_ctx *taskc_prev,
 					      struct cpu_ctx *cpuc)
@@ -1015,13 +944,6 @@ static __always_inline void consume_prev_task(struct task_struct *prev,
 	cpuc->flags = taskc_prev->flags;
 }
 
-/*
- * CAKE-enhanced dispatch with anti-starvation mechanism
- *
- * Every CAKE_STARVATION_PERIOD dispatches, we check if there's pending
- * work that might be starving. This is crucial for workloads like
- * Total War: Troy where background asset streaming competes with game threads.
- */
 void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 {
 	struct bpf_cpumask *active, *ovrflw;
@@ -1058,10 +980,10 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 
 			if ((cnt & CAKE_STARVATION_MASK) == 0) {
 				if (use_cpdom_dsq() &&
-					scx_bpf_dsq_nr_queued(cpdom_dsq_id) > 0) {
+				    scx_bpf_dsq_nr_queued(cpdom_dsq_id) > 0) {
 					if (scx_bpf_dsq_move_to_local(cpdom_dsq_id))
 						return;
-					}
+				}
 			}
 		}
 	}
@@ -1069,10 +991,6 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	if (enable_cpu_bw && (ret = scx_cgroup_bw_reenqueue()))
 		scx_bpf_error("Failed to reenqueue backlogged tasks: %d", ret);
 
-	/*
-	 * Fast path: if prev is queued and both local queues are empty,
-	 * just continue prev. Avoid additional DSQ/RCU work.
-	 */
 	if (prev_queued) {
 		const u64 cpu_q = scx_bpf_dsq_nr_queued(cpu_dsq_id);
 		u64 dom_q = 0;
@@ -1212,10 +1130,6 @@ consume_out:
 	consume_prev_task(prev, taskc_prev, cpuc);
 }
 
-/* ================================================================== */
-/*                    Runnable / Running / Stopping                   */
-/* ================================================================== */
-
 void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 {
 	struct task_struct *waker;
@@ -1286,6 +1200,7 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 	struct cpu_ctx *cpuc;
 	task_ctx *taskc;
 	u64 now;
+	bool fast_path;
 
 	if (unlikely(!p))
 		return;
@@ -1304,11 +1219,30 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 	if (p->scx.slice == SCX_SLICE_DFL)
 		p->scx.dsq_vtime = READ_ONCE(cur_logical_clk);
 
-	p->scx.slice = calc_time_slice(taskc, cpuc);
+	fast_path = bbr_can_use_fast_path(taskc, cpuc);
+
+	if (fast_path) {
+		u64 cached_slice = taskc->slice;
+		u64 min_slice = READ_ONCE(slice_min_ns);
+		u64 max_slice = READ_ONCE(slice_max_ns);
+
+		if (cached_slice >= min_slice && cached_slice <= max_slice) {
+			p->scx.slice = cached_slice;
+		} else {
+			fast_path = false;
+			p->scx.slice = calc_time_slice(taskc, cpuc);
+		}
+	} else {
+		p->scx.slice = calc_time_slice(taskc, cpuc);
+	}
+
 	advance_cur_logical_clk(p, now);
 
 	update_stat_for_running(p, taskc, cpuc, now);
-	update_cpuperf_target(cpuc);
+
+	if (!fast_path || unlikely((now & 0xFFF) == 0))
+		update_cpuperf_target(cpuc);
+
 	try_proc_introspec_cmd(p, taskc);
 }
 
@@ -1405,10 +1339,6 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
 		taskc->last_quiescent_clk = now;
 	}
 }
-
-/* ================================================================== */
-/*                    CPU State Management                            */
-/* ================================================================== */
 
 static void cpu_ctx_init_online(struct cpu_ctx *cpuc, u32 cpu_id, u64 now)
 {
@@ -1570,6 +1500,8 @@ void BPF_STRUCT_OPS(lavd_set_cpumask, struct task_struct *p,
 		WRITE_ONCE(taskc->pinned_cpu_id, -ENOENT);
 	}
 
+	bbr_reset_fast_path(taskc);
+
 	if (bpf_cpumask_weight(p->cpus_ptr) != nr_cpu_ids)
 		set_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
 	else
@@ -1623,10 +1555,6 @@ void BPF_STRUCT_OPS(lavd_cpu_release, s32 cpu,
 	reset_cpuperf_target(cpuc);
 	cpuc->cpu_release_clk = scx_bpf_now();
 }
-
-/* ================================================================== */
-/*                    Task Lifecycle                                  */
-/* ================================================================== */
 
 void BPF_STRUCT_OPS(lavd_enable, struct task_struct *p)
 {
@@ -1690,6 +1618,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	taskc->pinned_cpu_id = -ENOENT;
 	taskc->pid = p->pid;
 
+	taskc->stable_rounds = 0;
+	taskc->try_fast_path = 0;
+	taskc->prev_lat_cri = 0;
+
 	if (args && args->cgroup && args->cgroup->kn)
 		taskc->cgrp_id = args->cgroup->kn->id;
 	else
@@ -1711,10 +1643,6 @@ s32 BPF_STRUCT_OPS(lavd_exit_task, struct task_struct *p,
 		scx_task_free(p);
 	return 0;
 }
-
-/* ================================================================== */
-/*                    Initialization                                  */
-/* ================================================================== */
 
 static s32 init_cpdoms(u64 now)
 {
