@@ -537,9 +537,7 @@ init_context(isel_context* ctx, nir_shader* shader)
                   break;
                if (intrinsic->intrinsic == nir_intrinsic_strict_wqm_coord_amd) {
                   regclasses[intrinsic->def.index] =
-                     RegClass::get(RegType::vgpr, intrinsic->def.num_components * 4 +
-                                                     nir_intrinsic_base(intrinsic))
-                        .as_linear();
+                     lv1.resize(intrinsic->def.num_components * 4 + nir_intrinsic_base(intrinsic));
                   break;
                }
                RegType type = RegType::sgpr;
