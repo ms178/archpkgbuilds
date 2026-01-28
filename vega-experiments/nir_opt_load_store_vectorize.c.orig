@@ -121,6 +121,10 @@ get_info(nir_intrinsic_op op)
       INFO(nir_var_mem_shared, shared_consume_amd, true, -1, -1, -1, -1, 1)
       LOAD(0, buffer_amd, 0, 1, -1, 1)
       STORE(0, buffer_amd, 1, 2, -1, 0, 1)
+      LOAD(0, urb_lsc_intel, -1, 0, -1, 1)
+      STORE(nir_var_shader_out, urb_lsc_intel, -1, 1, -1, 0, 1)
+      LOAD(0, urb_vec4_intel, 0, 1, -1, 16)
+      STORE(nir_var_shader_out, urb_vec4_intel, 1, 2, -1, 0, 16)
    default:
       break;
 #undef ATOMIC
@@ -196,6 +200,7 @@ struct entry {
 struct vectorize_ctx {
    nir_shader *shader;
    const nir_load_store_vectorize_options *options;
+   unsigned (*round_up_components)(unsigned);
    struct hash_table *numlsb_ht;
    struct list_head entries[nir_num_variable_modes];
    struct hash_table *loads[nir_num_variable_modes];
@@ -309,15 +314,40 @@ get_bit_size(struct entry *entry)
    return size == 1 ? 32u : size;
 }
 
+static bool
+has_write_mask(const nir_intrinsic_instr *intrin)
+{
+   return nir_intrinsic_has_write_mask(intrin) ||
+          intrin->intrinsic == nir_intrinsic_store_urb_vec4_intel;
+}
+
 static unsigned
 get_write_mask(const nir_intrinsic_instr *intrin)
 {
    if (nir_intrinsic_has_write_mask(intrin))
       return nir_intrinsic_write_mask(intrin);
 
+   /* store_urb_vec4_intel allows non-constant writemasks, but the callback
+    * only allows vectorization of those with constant writemasks.
+    */
+   if (intrin->intrinsic == nir_intrinsic_store_urb_vec4_intel)
+      return nir_src_as_uint(intrin->src[3]);
+
    const struct intrinsic_info *info = get_info(intrin->intrinsic);
    assert(info->value_src >= 0);
    return nir_component_mask(intrin->src[info->value_src].ssa->num_components);
+}
+
+static void
+set_write_mask(nir_builder *b,
+               nir_intrinsic_instr *intrin,
+               uint32_t write_mask)
+{
+   if (nir_intrinsic_has_write_mask(intrin))
+      nir_intrinsic_set_write_mask(intrin, write_mask);
+
+   if (intrin->intrinsic == nir_intrinsic_store_urb_vec4_intel)
+      nir_src_rewrite(&intrin->src[3], nir_imm_int(b, write_mask));
 }
 
 static nir_op
@@ -795,6 +825,26 @@ cast_deref(nir_builder *b, unsigned num_components, unsigned bit_size, nir_deref
    return nir_build_deref_cast(b, &deref->def, deref->modes, type, 0);
 }
 
+static unsigned
+calc_new_num_components(const struct vectorize_ctx *ctx,
+                        const struct entry *e,
+                        unsigned new_size,
+                        unsigned new_bit_size)
+{
+   unsigned new_num_components = MAX2(new_size / new_bit_size, 1);
+
+   /* Round up the number of components for loads to the next valid vector
+    * size (effectively overfetching).  Optionally, round up the number of
+    * components for stores which support writemasking as well.
+    */
+   if (!e->is_store ||
+       (ctx->options->round_up_store_components && has_write_mask(e->intrin))) {
+      new_num_components = ctx->round_up_components(new_num_components);
+   }
+
+   return new_num_components;
+}
+
 /* Return true if "new_bit_size" is a usable bit size for a vectorized load/store
  * of "low" and "high". */
 static bool
@@ -804,19 +854,11 @@ new_bitsize_acceptable(struct vectorize_ctx *ctx, unsigned new_bit_size,
    if (size % new_bit_size != 0)
       return false;
 
-   unsigned new_num_components = size / new_bit_size;
+   unsigned new_num_components =
+      calc_new_num_components(ctx, low, size, new_bit_size);
 
-   if (low->is_store) {
-      if (!nir_num_components_valid(new_num_components))
-         return false;
-   } else {
-      /* Invalid component counts must be rejected by the callback, otherwise
-       * the load will overfetch by aligning the number to the next valid
-       * component count.
-       */
-      if (new_num_components > NIR_MAX_VEC_COMPONENTS)
-         return false;
-   }
+   if (!nir_num_components_valid(new_num_components))
+      return false;
 
    unsigned high_offset = get_offset_diff(low, high);
 
@@ -838,7 +880,7 @@ new_bitsize_acceptable(struct vectorize_ctx *ctx, unsigned new_bit_size,
 
    if (!ctx->options->callback(low->align_mul,
                                low->align_offset,
-                               new_bit_size, new_num_components, hole_size,
+                               new_bit_size, size / new_bit_size, hole_size,
                                low->intrin, high->intrin,
                                ctx->options->cb_data))
       return false;
@@ -935,13 +977,6 @@ vectorize_loads(nir_builder *b, struct vectorize_ctx *ctx,
    nir_def *data = &first->intrin->def;
 
    b->cursor = nir_after_instr(first->instr);
-
-   /* Align num_components to a supported vector size, effectively
-    * overfetching. Drivers can reject this in the callback by returning
-    * false for invalid num_components.
-    */
-   new_num_components = nir_round_up_components(new_num_components);
-   new_num_components = MAX2(new_num_components, 1);
 
    /* update the load's destination size and extract data for each of the original loads */
    data->num_components = new_num_components;
@@ -1100,8 +1135,7 @@ vectorize_stores(nir_builder *b, struct vectorize_ctx *ctx,
    nir_def *data = nir_vec(b, data_channels, new_num_components);
 
    /* update the intrinsic */
-   if (nir_intrinsic_has_write_mask(second->intrin))
-      nir_intrinsic_set_write_mask(second->intrin, write_mask);
+   set_write_mask(b, second->intrin, write_mask);
    second->intrin->num_components = data->num_components;
    second->num_components = data->num_components;
 
@@ -1487,7 +1521,8 @@ try_vectorize(nir_function_impl *impl, struct vectorize_ctx *ctx,
    } else {
       return false;
    }
-   unsigned new_num_components = new_size / new_bit_size;
+   unsigned new_num_components =
+      calc_new_num_components(ctx, low, new_size, new_bit_size);
 
    /* vectorize the loads/stores */
    nir_builder b = nir_builder_create(impl);
@@ -1717,6 +1752,10 @@ handle_barrier(struct vectorize_ctx *ctx, bool *progress, nir_function_impl *imp
             break;
          }
          break;
+      case nir_intrinsic_emit_vertex:
+      case nir_intrinsic_emit_vertex_with_counter:
+         modes = nir_var_shader_out;
+         break;
       default:
          return false;
       }
@@ -1835,6 +1874,15 @@ nir_opt_load_store_vectorize(nir_shader *shader, const nir_load_store_vectorize_
    ctx->shader = shader;
    ctx->numlsb_ht = _mesa_pointer_hash_table_create(ctx);
    ctx->options = options;
+
+   /* By default, we round up load/store components to the next valid
+    * NIR vector size, using nir_round_up_components.  However, backends
+    * may supply a callback that allows more control, so they can round
+    * up to their next supported load/store vector width instead.
+    */
+   ctx->round_up_components = nir_round_up_components;
+   if (ctx->options->round_up_components)
+      ctx->round_up_components = ctx->options->round_up_components;
 
    nir_shader_index_vars(shader, options->modes);
 
