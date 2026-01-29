@@ -1824,46 +1824,49 @@ optimizations.extend([
     ('bcsel', ('ieq', ('iand', b, 1), 0), 0, ('u2f', a))),
 
    # Exponential/logarithmic identities
-   (('~fexp2', ('flog2', a)), ('fcanonicalize', a)), # 2^lg2(a) = a
-   (('~flog2', ('fexp2', a)), ('fcanonicalize', a)), # lg2(2^a) = a
+   (('fexp2(contract)', ('flog2', a)), ('fcanonicalize', a)), # 2^lg2(a) = a
+   (('flog2(contract)', ('fexp2', a)), ('fcanonicalize', a)), # lg2(2^a) = a
    # 32-bit fpow should use fmulz to fix https://gitlab.freedesktop.org/mesa/mesa/-/issues/11464 (includes apitrace)
    (('fpow@32', a, b), ('fexp2', ('fmulz', ('flog2', a), b)), 'options->lower_fpow && ' + has_fmulz), # a^b = 2^(lg2(a)*b)
    (('fpow', a, b), ('fexp2', ('fmul', ('flog2', a), b)), 'options->lower_fpow'), # a^b = 2^(lg2(a)*b)
-   (('~fexp2', ('fmul', ('flog2', a), b)), ('fpow', a, b), '!options->lower_fpow'), # 2^(lg2(a)*b) = a^b
+   (('fexp2(contract)', ('fmul', ('flog2', a), b)), ('fpow', a, b), '!options->lower_fpow'), # 2^(lg2(a)*b) = a^b
    (('~fexp2', ('fadd', ('fmul', ('flog2', a), b), ('fmul', ('flog2', c), d))),
     ('~fmul', ('fpow', a, b), ('fpow', c, d)), '!options->lower_fpow'), # 2^(lg2(a) * b + lg2(c) + d) = a^b * c^d
-   (('~fexp2', ('fmul', ('flog2', a), 0.5)), ('fsqrt', a)),
-   (('~fexp2', ('fmul', ('flog2', a), 2.0)), ('fmul', a, a)),
-   (('~fexp2', ('fmul', ('flog2', a), 3.0)), ('fmul', ('fmul', a, a), a)),
-   (('~fexp2', ('fmul', ('flog2', a), 4.0)), ('fmul', ('fmul', a, a), ('fmul', a, a))),
-   (('~fexp2', ('fmul', ('flog2', a), 5.0)), ('fmul', ('fmul', ('fmul', a, a), ('fmul', a, a)), a)),
-   (('~fexp2', ('fmul', ('flog2', a), 6.0)), ('fmul', ('fmul', ('fmul', a, a), ('fmul', a, a)), ('fmul', a, a))),
-   (('~fexp2', ('fmul', ('flog2', a), 8.0)), ('fmul', ('fmul', ('fmul', a, a), ('fmul', a, a)), ('fmul', ('fmul', a, a), ('fmul', a, a)))),
-   (('~fpow', a, 1.0), ('fcanonicalize', a)),
-   (('~fpow', a, 2.0), ('fmul', a, a)),
+   (('fexp2(contract)', ('fmul', ('flog2', a), 0.5)), ('fsqrt', a)),
+   (('fexp2(contract)', ('fmul', ('flog2', a), 2.0)), ('fmul', a, a)),
+   (('fexp2(contract)', ('fmul', ('flog2', a), 3.0)), ('fmul', ('fmul', a, a), a)),
+   (('fexp2(contract)', ('fmul', ('flog2', a), 4.0)), ('fmul', ('fmul', a, a), ('fmul', a, a))),
+   (('fexp2(contract)', ('fmul', ('flog2', a), 5.0)), ('fmul', ('fmul', ('fmul', a, a), ('fmul', a, a)), a)),
+   (('fexp2(contract)', ('fmul', ('flog2', a), 6.0)), ('fmul', ('fmul', ('fmul', a, a), ('fmul', a, a)), ('fmul', a, a))),
+   (('fexp2(contract)', ('fmul', ('flog2', a), 8.0)), ('fmul', ('fmul', ('fmul', a, a), ('fmul', a, a)), ('fmul', ('fmul', a, a), ('fmul', a, a)))),
+   (('fpow(contract)', a, 1.0), ('fcanonicalize', a)),
+   (('fpow(contract)', a, 2.0), ('fmul', a, a)),
    (('~fpow', a, 3.0), ('fmul', ('fmul', a, a), a)),
    (('~fpow', a, 4.0), ('fmul', ('fmul', a, a), ('fmul', a, a))),
-   (('~fpow', 2.0, a), ('fexp2', a)),
+   (('fpow(contract)', 2.0, a), ('fexp2', a)),
    (('~fpow', ('fpow', a, 2.2), 0.454545), ('fcanonicalize', a)),
    (('~fpow', ('fabs', ('fpow', a, 2.2)), 0.454545), ('fabs', a)),
-   (('~fsqrt', ('fexp2', a)), ('fexp2', ('fmul', 0.5, a))),
-   (('~frcp', ('fexp2', a)), ('fexp2', ('fneg', a))),
-   (('~frsq', ('fexp2', a)), ('fexp2', ('fmul', -0.5, a))),
-   (('~flog2', ('fsqrt', a)), ('fmul', 0.5, ('flog2', a))),
-   (('~flog2', ('frcp', a)), ('fneg', ('flog2', a))),
-   (('~flog2', ('frsq', a)), ('fmul', -0.5, ('flog2', a))),
-   (('~flog2', ('fpow', a, b)), ('fmul', b, ('flog2', a))),
+   (('fsqrt(contract)', ('fexp2', a)), ('fexp2', ('fmul', 0.5, a))),
+   (('frcp(contract)', ('fexp2', a)), ('fexp2', ('fneg', a))),
+   (('frsq(contract)', ('fexp2', a)), ('fexp2', ('fmul', -0.5, a))),
+   (('flog2(contract)', ('fsqrt', a)), ('fmul', 0.5, ('flog2', a))),
+   (('flog2(contract)', ('frcp', a)), ('fneg', ('flog2', a))),
+   (('flog2(contract)', ('frsq', a)), ('fmul', -0.5, ('flog2', a))),
+   (('flog2(contract)', ('fpow', a, b)), ('fmul', b, ('flog2', a))),
    (('~fmul', ('fexp2(is_used_once)', a), ('fexp2(is_used_once)', b)), ('fexp2', ('fadd', a, b))),
-   (('bcsel', ('flt', a, 0.0), 0.0, ('fsqrt', a)), ('fsqrt', ('fmax', a, 0.0)), 'true', TestStatus.XFAIL), # XFAIL is that bcsel(flt(NaN, 0), 0, fsqrt(NaN)) produces 0.0 instead of NaN.
-   (('~fmul', ('fsqrt', a), ('fsqrt', a)), ('fabs',a)),
-   (('~fmulz', ('fsqrt', a), ('fsqrt', a)), ('fabs', a)),
+   (('bcsel', ('flt', a, 0.0), 0.0, ('fsqrt(nnan,nsz)', a)), ('fsqrt', ('fmax', a, 0.0))),
+   (('bcsel', ('fge', 0.0, a), 0.0, ('fsqrt(nnan)', a)), ('fsqrt', ('fmax', a, 0.0))),
+   (('bcsel', ('flt', 0.0, a), ('fsqrt', a), 0.0), ('fsqrt', ('fmax', a, 0.0))),
+   (('bcsel', ('fge', a, 0.0), ('fsqrt(nsz)', a), 0.0), ('fsqrt', ('fmax', a, 0.0))),
+   (('fmul(contract)', ('fsqrt', a), ('fsqrt', a)), ('fabs',a)),
+   (('fmulz(contract)', ('fsqrt', a), ('fsqrt', a)), ('fabs', a)),
    # Division and reciprocal
-   (('~fdiv', 1.0, a), ('frcp', a)),
+   (('fdiv(contract)', 1.0, a), ('frcp', a)),
    (('fdiv', a, b), ('fmul', a, ('frcp', b)), 'options->lower_fdiv'),
-   (('~frcp', ('frcp', a)), ('fcanonicalize', a)),
-   (('~frcp', ('fsqrt', a)), ('frsq', a)),
+   (('frcp(contract)', ('frcp', a)), ('fcanonicalize', a)),
+   (('frcp(contract)', ('fsqrt', a)), ('frsq', a)),
    (('fsqrt', a), ('frcp', ('frsq', a)), 'options->lower_fsqrt'),
-   (('~frcp', ('frsq', a)), ('fsqrt', a), '!options->lower_fsqrt'),
+   (('frcp(contract)', ('frsq', a)), ('fsqrt', a), '!options->lower_fsqrt'),
    # Trig
    (('fsin', a), lowered_sincos(0.5), 'options->lower_sincos'),
    (('fcos', a), lowered_sincos(0.75), 'options->lower_sincos'),
@@ -3130,6 +3133,9 @@ optimizations += [
     ('bcsel', a, ('pack_half_2x16_rtz_split', b, d), ('pack_half_2x16_rtz_split', c, e))),
 
    (('pack_half_2x16_rtz_split', ('b2f', 'a@1'), ('b2f', a)), ('bcsel', a, 0x3c003c00, 0)),
+
+   (('pack_half_2x16_rtz_split', ('f2f32', 'a@16'), b), ('pack_32_2x16', ('vec2', ('fcanonicalize', a), ('f2f16_rtz', b)))),
+   (('pack_half_2x16_rtz_split', a, ('f2f32', 'b@16')), ('pack_32_2x16', ('vec2', ('f2f16_rtz', a), ('fcanonicalize', b)))),
 
    (('pack_32_2x16_split', 'a(is_undef)', ('bcsel', b, '#c', d)),
     ('bcsel', b, ('pack_32_2x16_split', 0, c), ('pack_32_2x16_split', a, d)),
