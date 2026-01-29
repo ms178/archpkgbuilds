@@ -23,6 +23,25 @@ struct lower_context {
    std::vector<aco_ptr<Instruction>> instructions;
 };
 
+/* Class for obtaining where s_sendmsg(MSG_ORDERED_PS_DONE) must be done in a Primitive Ordered
+ * Pixel Shader on GFX9-10.3.
+ *
+ * MSG_ORDERED_PS_DONE must be sent once after the ordered section is done along all execution paths
+ * from the POPS packer ID hardware register setting to s_endpgm. It is, however, also okay to send
+ * it if the packer ID is not going to be set at all by the wave, so some conservativeness is fine.
+ *
+ * For simplicity, sending the message from top-level blocks as dominance and post-dominance
+ * checking for any location in the shader is trivial in them. Also, for simplicity, sending it
+ * regardless of whether the POPS packer ID hardware register has already potentially been set up.
+ *
+ * Note that there can be multiple interlock end instructions in the shader.
+ * SPV_EXT_fragment_shader_interlock requires OpEndInvocationInterlockEXT to be executed exactly
+ * once by the invocation. However, there may be, for instance, multiple ordered sections, and which
+ * one will be executed may depend on divergent control flow (some lanes may execute one ordered
+ * section, other lanes may execute another). MSG_ORDERED_PS_DONE, however, is sent via a scalar
+ * instruction, so it must be ensured that the message is sent after the last ordered section in the
+ * entire wave.
+ */
 class gfx9_pops_done_msg_bounds {
 public:
    explicit gfx9_pops_done_msg_bounds() = default;
@@ -150,6 +169,7 @@ copy_constant_sgpr(Builder& bld, Definition dst, uint64_t constant)
                       static_cast<uint32_t>(constant >> 32));
 }
 
+/* used by handle_operands() indirectly through Builder::copy */
 const uint8_t int8_mul_table[512] = {
    0,   20,  1,   1,   1,   2,   1,   3,   1,   4,   1,   5,   1,   6,   1,   7,   1,   8,   1,
    9,   1,   10,  1,   11,  1,   12,  1,   13,  1,   14,  1,   15,  1,   16,  1,   17,  1,   18,
@@ -299,18 +319,13 @@ emit_int64_dpp_op(lower_context* ctx, PhysReg dst_reg, PhysReg src0_reg, PhysReg
                   unsigned bank_mask, bool bound_ctrl, Operand* identity = nullptr)
 {
    Builder bld(ctx->program, &ctx->instructions);
-   Definition dst[] = {Definition(dst_reg, v1.as_linear()),
-                       Definition(PhysReg{dst_reg + 1}, v1.as_linear())};
-   Definition vtmp_def[] = {Definition(vtmp_reg, v1.as_linear()),
-                            Definition(PhysReg{vtmp_reg + 1}, v1.as_linear())};
-   Operand src0[] = {Operand(src0_reg, v1.as_linear()),
-                     Operand(PhysReg{src0_reg + 1}, v1.as_linear())};
-   Operand src1[] = {Operand(src1_reg, v1.as_linear()),
-                     Operand(PhysReg{src1_reg + 1}, v1.as_linear())};
-   Operand src1_64 = Operand(src1_reg, v2.as_linear());
-   Operand vtmp_op[] = {Operand(vtmp_reg, v1.as_linear()),
-                        Operand(PhysReg{vtmp_reg + 1}, v1.as_linear())};
-   Operand vtmp_op64 = Operand(vtmp_reg, v2.as_linear());
+   Definition dst[] = {Definition(dst_reg, lv1), Definition(PhysReg{dst_reg + 1}, lv1)};
+   Definition vtmp_def[] = {Definition(vtmp_reg, lv1), Definition(PhysReg{vtmp_reg + 1}, lv1)};
+   Operand src0[] = {Operand(src0_reg, lv1), Operand(PhysReg{src0_reg + 1}, lv1)};
+   Operand src1[] = {Operand(src1_reg, lv1), Operand(PhysReg{src1_reg + 1}, lv1)};
+   Operand src1_64 = Operand(src1_reg, lv2);
+   Operand vtmp_op[] = {Operand(vtmp_reg, lv1), Operand(PhysReg{vtmp_reg + 1}, lv1)};
+   Operand vtmp_op64 = Operand(vtmp_reg, lv2);
 
    if (op == iadd64) {
       if (ctx->program->gfx_level >= GFX10) {
@@ -394,28 +409,26 @@ emit_int64_op(lower_context* ctx, PhysReg dst_reg, PhysReg src0_reg, PhysReg src
               ReduceOp op)
 {
    Builder bld(ctx->program, &ctx->instructions);
-   Definition dst[] = {Definition(dst_reg, v1.as_linear()),
-                       Definition(PhysReg{dst_reg + 1}, v1.as_linear())};
-   RegClass src0_rc = src0_reg.reg() >= 256 ? v1.as_linear() : s1;
+   Definition dst[] = {Definition(dst_reg, lv1), Definition(PhysReg{dst_reg + 1}, lv1)};
+   RegClass src0_rc = src0_reg.reg() >= 256 ? lv1 : s1;
    Operand src0[] = {Operand(src0_reg, src0_rc), Operand(PhysReg{src0_reg + 1}, src0_rc)};
-   Operand src1[] = {Operand(src1_reg, v1.as_linear()),
-                     Operand(PhysReg{src1_reg + 1}, v1.as_linear())};
-   Operand src0_64 = Operand(src0_reg, src0_reg.reg() >= 256 ? v2.as_linear() : s2);
-   Operand src1_64 = Operand(src1_reg, v2.as_linear());
+   Operand src1[] = {Operand(src1_reg, lv1), Operand(PhysReg{src1_reg + 1}, lv1)};
+   Operand src0_64 = Operand(src0_reg, src0_reg.reg() >= 256 ? lv2 : s2);
+   Operand src1_64 = Operand(src1_reg, lv2);
 
    if (src0_rc == s1 &&
        (op == imul64 || op == umin64 || op == umax64 || op == imin64 || op == imax64)) {
       assert(vtmp.reg() != 0);
-      bld.vop1(aco_opcode::v_mov_b32, Definition(vtmp, v1.as_linear()), src0[0]);
-      bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{vtmp + 1}, v1.as_linear()), src0[1]);
+      bld.vop1(aco_opcode::v_mov_b32, Definition(vtmp, lv1), src0[0]);
+      bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{vtmp + 1}, lv1), src0[1]);
       src0_reg = vtmp;
-      src0[0] = Operand(vtmp, v1.as_linear());
-      src0[1] = Operand(PhysReg{vtmp + 1}, v1.as_linear());
-      src0_64 = Operand(vtmp, v2.as_linear());
+      src0[0] = Operand(vtmp, lv1);
+      src0[1] = Operand(PhysReg{vtmp + 1}, lv1);
+      src0_64 = Operand(vtmp, lv2);
    } else if (src0_rc == s1 && op == iadd64) {
       assert(vtmp.reg() != 0);
-      bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{vtmp + 1}, v1.as_linear()), src0[1]);
-      src0[1] = Operand(PhysReg{vtmp + 1}, v1.as_linear());
+      bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{vtmp + 1}, lv1), src0[1]);
+      src0[1] = Operand(PhysReg{vtmp + 1}, lv1);
    }
 
    if (op == iadd64) {
@@ -469,11 +482,6 @@ emit_int64_op(lower_context* ctx, PhysReg dst_reg, PhysReg src0_reg, PhysReg src
        * Solution: Copy one operand to scratch space. We prefer dst_reg as
        * scratch when possible (since it will be overwritten anyway), falling
        * back to vtmp only when dst aliases src0 (which is the source we keep).
-       *
-       * Register constraints after this block:
-       *   - src0_reg, src1_reg: distinct registers
-       *   - src0_reg+1, src1_reg+1: safe to use as temporaries
-       *   - dst_reg: may alias src0_reg (handled by algorithm)
        */
       if (src0_reg == src1_reg) {
          PhysReg scratch_reg;
@@ -484,20 +492,16 @@ emit_int64_op(lower_context* ctx, PhysReg dst_reg, PhysReg src0_reg, PhysReg src
             scratch_reg = vtmp;
          }
 
-         bld.vop1(aco_opcode::v_mov_b32, Definition(scratch_reg, v1.as_linear()), src1[0]);
-         bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{scratch_reg + 1}, v1.as_linear()),
-                  src1[1]);
+         bld.vop1(aco_opcode::v_mov_b32, Definition(scratch_reg, lv1), src1[0]);
+         bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{scratch_reg + 1}, lv1), src1[1]);
          src1_reg = scratch_reg;
-         src1[0] = Operand(scratch_reg, v1.as_linear());
-         src1[1] = Operand(PhysReg{scratch_reg + 1}, v1.as_linear());
-         src1_64 = Operand(scratch_reg, v2.as_linear());
+         src1[0] = Operand(scratch_reg, lv1);
+         src1[1] = Operand(PhysReg{scratch_reg + 1}, lv1);
+         src1_64 = Operand(scratch_reg, lv2);
       }
 
       /*
        * 64-bit multiplication: (x_hi:x_lo) * (y_hi:y_lo)
-       *
-       * Full 128-bit result would be:
-       *   x_lo*y_lo + (x_lo*y_hi + x_hi*y_lo) << 32 + x_hi*y_hi << 64
        *
        * We only need the low 64 bits:
        *   res_lo = lo32(x_lo * y_lo)
@@ -506,19 +510,11 @@ emit_int64_op(lower_context* ctx, PhysReg dst_reg, PhysReg src0_reg, PhysReg src
        * Temporaries (reusing high dwords of operands):
        *   tmp0 = src0_reg+1 (x_hi, then overwritten)
        *   tmp1 = src1_reg+1 (y_hi, then overwritten)
-       *
-       * Algorithm:
-       *   tmp0 = umul_lo(x_hi, y_lo)           ; x_hi * y_lo (low 32 bits)
-       *   tmp1 = umul_lo(x_lo, y_hi)           ; x_lo * y_hi (low 32 bits)
-       *   tmp0 = tmp0 + tmp1                   ; partial sum for res_hi
-       *   tmp1 = umul_hi(x_lo, y_lo)           ; x_lo * y_lo (high 32 bits)
-       *   res_hi = tmp0 + tmp1                 ; final res_hi
-       *   res_lo = umul_lo(x_lo, y_lo)         ; final res_lo
        */
-      Definition tmp0_def(PhysReg{src0_reg + 1}, v1.as_linear());
-      Definition tmp1_def(PhysReg{src1_reg + 1}, v1.as_linear());
-      Operand tmp0_op = Operand(PhysReg{src0_reg + 1}, v1.as_linear());
-      Operand tmp1_op = Operand(PhysReg{src1_reg + 1}, v1.as_linear());
+      Definition tmp0_def(PhysReg{src0_reg + 1}, lv1);
+      Definition tmp1_def(PhysReg{src1_reg + 1}, lv1);
+      Operand tmp0_op = Operand(PhysReg{src0_reg + 1}, lv1);
+      Operand tmp1_op = Operand(PhysReg{src1_reg + 1}, lv1);
 
       bld.vop3(aco_opcode::v_mul_lo_u32, tmp0_def, src0[1], src1[0]);
       bld.vop3(aco_opcode::v_mul_lo_u32, tmp1_def, src0[0], src1[1]);
@@ -532,10 +528,10 @@ emit_int64_op(lower_context* ctx, PhysReg dst_reg, PhysReg src0_reg, PhysReg src
 void
 emit_dpp_op(lower_context* ctx, PhysReg dst_reg, PhysReg src0_reg, PhysReg src1_reg, PhysReg vtmp,
             ReduceOp op, unsigned size, unsigned dpp_ctrl, unsigned row_mask, unsigned bank_mask,
-            bool bound_ctrl, Operand* identity = nullptr) /* for VOP3 with sparse writes */
+            bool bound_ctrl, Operand* identity = nullptr)
 {
    Builder bld(ctx->program, &ctx->instructions);
-   RegClass rc = RegClass(RegType::vgpr, size).as_linear();
+   RegClass rc = lv1.resize(size * 4);
    Definition dst(dst_reg, rc);
    Operand src0(src0_reg, rc);
    Operand src1(src1_reg, rc);
@@ -560,14 +556,13 @@ emit_dpp_op(lower_context* ctx, PhysReg dst_reg, PhysReg src0_reg, PhysReg src1_
    }
 
    if (identity)
-      bld.vop1(aco_opcode::v_mov_b32, Definition(vtmp, v1.as_linear()), identity[0]);
+      bld.vop1(aco_opcode::v_mov_b32, Definition(vtmp, lv1), identity[0]);
    if (identity && size >= 2)
-      bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{vtmp + 1}, v1.as_linear()), identity[1]);
+      bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{vtmp + 1}, lv1), identity[1]);
 
    for (unsigned i = 0; i < size; i++)
-      bld.vop1_dpp(aco_opcode::v_mov_b32, Definition(PhysReg{vtmp + i}, v1.as_linear()),
-                   Operand(PhysReg{src0_reg + i}, v1.as_linear()), dpp_ctrl, row_mask, bank_mask,
-                   bound_ctrl);
+      bld.vop1_dpp(aco_opcode::v_mov_b32, Definition(PhysReg{vtmp + i}, lv1),
+                   Operand(PhysReg{src0_reg + i}, lv1), dpp_ctrl, row_mask, bank_mask, bound_ctrl);
 
    if (vop3)
       bld.vop3(opcode, dst, Operand(vtmp, rc), src1);
@@ -580,10 +575,9 @@ emit_op(lower_context* ctx, PhysReg dst_reg, PhysReg src0_reg, PhysReg src1_reg,
         ReduceOp op, unsigned size)
 {
    Builder bld(ctx->program, &ctx->instructions);
-   RegClass rc = RegClass(RegType::vgpr, size).as_linear();
+   RegClass rc = lv1.resize(size * 4);
    Definition dst(dst_reg, rc);
-   Operand src0(src0_reg, src0_reg.reg() >= 256 ? RegClass(RegType::vgpr, size).as_linear()
-                                                : RegClass(RegType::sgpr, size));
+   Operand src0(src0_reg, (src0_reg.reg() >= 256 ? lv1 : s1).resize(size * 4));
    Operand src1(src1_reg, rc);
 
    aco_opcode opcode = get_reduce_opcode(ctx->program->gfx_level, op);
@@ -608,9 +602,8 @@ emit_dpp_mov(lower_context* ctx, PhysReg dst, PhysReg src0, unsigned size, unsig
 {
    Builder bld(ctx->program, &ctx->instructions);
    for (unsigned i = 0; i < size; i++) {
-      bld.vop1_dpp(aco_opcode::v_mov_b32, Definition(PhysReg{dst + i}, v1.as_linear()),
-                   Operand(PhysReg{src0 + i}, v1.as_linear()), dpp_ctrl, row_mask, bank_mask,
-                   bound_ctrl);
+      bld.vop1_dpp(aco_opcode::v_mov_b32, Definition(PhysReg{dst + i}, lv1),
+                   Operand(PhysReg{src0 + i}, lv1), dpp_ctrl, row_mask, bank_mask, bound_ctrl);
    }
 }
 
@@ -618,8 +611,8 @@ void
 emit_ds_swizzle(Builder bld, PhysReg dst, PhysReg src, unsigned size, unsigned ds_pattern)
 {
    for (unsigned i = 0; i < size; i++) {
-      bld.ds(aco_opcode::ds_swizzle_b32, Definition(PhysReg{dst + i}, v1.as_linear()),
-             Operand(PhysReg{src + i}, v1.as_linear()), ds_pattern);
+      bld.ds(aco_opcode::ds_swizzle_b32, Definition(PhysReg{dst + i}, lv1),
+             Operand(PhysReg{src + i}, lv1), ds_pattern);
    }
 }
 
@@ -649,19 +642,17 @@ emit_reduction(lower_context* ctx, aco_opcode op, ReduceOp reduce_op, unsigned c
             bld.sop1(aco_opcode::s_mov_b32, Definition(PhysReg{sitmp + i}, s1), identity[i]);
             identity[i] = Operand(PhysReg{sitmp + i}, s1);
 
-            bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{tmp + i}, v1.as_linear()),
-                     identity[i]);
-            vcndmask_identity[i] = Operand(PhysReg{tmp + i}, v1.as_linear());
+            bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{tmp + i}, lv1), identity[i]);
+            vcndmask_identity[i] = Operand(PhysReg{tmp + i}, lv1);
          } else if (identity[i].isLiteral()) {
-            bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{tmp + i}, v1.as_linear()),
-                     identity[i]);
-            vcndmask_identity[i] = Operand(PhysReg{tmp + i}, v1.as_linear());
+            bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{tmp + i}, lv1), identity[i]);
+            vcndmask_identity[i] = Operand(PhysReg{tmp + i}, lv1);
          }
       }
    }
 
    for (unsigned i = 0; i < src.size(); i++) {
-      bld.vop2_e64(aco_opcode::v_cndmask_b32, Definition(PhysReg{tmp + i}, v1.as_linear()),
+      bld.vop2_e64(aco_opcode::v_cndmask_b32, Definition(PhysReg{tmp + i}, lv1),
                    vcndmask_identity[i], Operand(PhysReg{src.physReg() + i}, v1),
                    Operand(stmp, bld.lm));
    }
@@ -672,8 +663,8 @@ emit_reduction(lower_context* ctx, aco_opcode op, ReduceOp reduce_op, unsigned c
       if (ctx->program->gfx_level >= GFX8 && ctx->program->gfx_level < GFX11) {
          aco_ptr<Instruction> sdwa{
             create_instruction(aco_opcode::v_mov_b32, asSDWA(Format::VOP1), 1, 1)};
-         sdwa->operands[0] = Operand(PhysReg{tmp}, v1.as_linear());
-         sdwa->definitions[0] = Definition(PhysReg{tmp}, v1.as_linear());
+         sdwa->operands[0] = Operand(PhysReg{tmp}, lv1);
+         sdwa->definitions[0] = Definition(PhysReg{tmp}, lv1);
          bool sext = reduce_op == imin8 || reduce_op == imax8;
          sdwa->sdwa().sel[0] = SubdwordSel(1, 0, sext);
          sdwa->sdwa().dst_sel = SubdwordSel::dword;
@@ -686,8 +677,8 @@ emit_reduction(lower_context* ctx, aco_opcode op, ReduceOp reduce_op, unsigned c
          else
             opcode = aco_opcode::v_bfe_u32;
 
-         bld.vop3(opcode, Definition(PhysReg{tmp}, v1.as_linear()),
-                  Operand(PhysReg{tmp}, v1.as_linear()), Operand::zero(), Operand::c32(8u));
+         bld.vop3(opcode, Definition(PhysReg{tmp}, lv1), Operand(PhysReg{tmp}, lv1),
+                  Operand::zero(), Operand::c32(8u));
       }
    } else if (reduce_op == iadd16 || reduce_op == imul16 || reduce_op == imax16 ||
               reduce_op == imin16 || reduce_op == umin16 || reduce_op == umax16 ||
@@ -699,8 +690,8 @@ emit_reduction(lower_context* ctx, aco_opcode op, ReduceOp reduce_op, unsigned c
       if (ctx->program->gfx_level >= GFX10 && ctx->program->gfx_level < GFX11 && is_add_cmp) {
          aco_ptr<Instruction> sdwa{
             create_instruction(aco_opcode::v_mov_b32, asSDWA(Format::VOP1), 1, 1)};
-         sdwa->operands[0] = Operand(PhysReg{tmp}, v1.as_linear());
-         sdwa->definitions[0] = Definition(PhysReg{tmp}, v1.as_linear());
+         sdwa->operands[0] = Operand(PhysReg{tmp}, lv1);
+         sdwa->definitions[0] = Definition(PhysReg{tmp}, lv1);
          bool sext = reduce_op == imin16 || reduce_op == imax16 || reduce_op == iadd16;
          sdwa->sdwa().sel[0] = SubdwordSel(2, 0, sext);
          sdwa->sdwa().dst_sel = SubdwordSel::dword;
@@ -714,8 +705,8 @@ emit_reduction(lower_context* ctx, aco_opcode op, ReduceOp reduce_op, unsigned c
          else
             opcode = aco_opcode::v_bfe_u32;
 
-         bld.vop3(opcode, Definition(PhysReg{tmp}, v1.as_linear()),
-                  Operand(PhysReg{tmp}, v1.as_linear()), Operand::zero(), Operand::c32(16u));
+         bld.vop3(opcode, Definition(PhysReg{tmp}, lv1), Operand(PhysReg{tmp}, lv1),
+                  Operand::zero(), Operand::c32(16u));
       }
    }
 
@@ -748,8 +739,8 @@ emit_reduction(lower_context* ctx, aco_opcode op, ReduceOp reduce_op, unsigned c
             break;
          emit_op(ctx, tmp, vtmp, tmp, PhysReg{0}, reduce_op, src.size());
          for (unsigned i = 0; i < src.size(); i++)
-            bld.readlane(Definition(PhysReg{dst.physReg() + i}, s1),
-                         Operand(PhysReg{tmp + i}, v1.as_linear()), Operand::zero());
+            bld.readlane(Definition(PhysReg{dst.physReg() + i}, s1), Operand(PhysReg{tmp + i}, v1),
+                         Operand::zero());
          // TODO: it would be more effective to do the last reduction step on SALU
          emit_op(ctx, tmp, dst.physReg(), tmp, vtmp, reduce_op, src.size());
          reduction_needs_last_op = false;
@@ -768,16 +759,15 @@ emit_reduction(lower_context* ctx, aco_opcode op, ReduceOp reduce_op, unsigned c
                   false);
       if (cluster_size == 8)
          break;
-      emit_dpp_op(ctx, tmp, tmp, tmp, vtmp, reduce_op, src.size(), dpp_row_mirror, 0xf, 0xf,
-                  false);
+      emit_dpp_op(ctx, tmp, tmp, tmp, vtmp, reduce_op, src.size(), dpp_row_mirror, 0xf, 0xf, false);
       if (cluster_size == 16)
          break;
 
       if (ctx->program->gfx_level >= GFX10) {
          /* GFX10+ doesn't support row_bcast15 and row_bcast31 */
          for (unsigned i = 0; i < src.size(); i++)
-            bld.vop3(aco_opcode::v_permlanex16_b32, Definition(PhysReg{vtmp + i}, v1.as_linear()),
-                     Operand(PhysReg{tmp + i}, v1.as_linear()), Operand::zero(), Operand::zero());
+            bld.vop3(aco_opcode::v_permlanex16_b32, Definition(PhysReg{vtmp + i}, lv1),
+                     Operand(PhysReg{tmp + i}, lv1), Operand::zero(), Operand::zero());
 
          if (cluster_size == 32) {
             reduction_needs_last_op = true;
@@ -786,8 +776,8 @@ emit_reduction(lower_context* ctx, aco_opcode op, ReduceOp reduce_op, unsigned c
 
          emit_op(ctx, tmp, tmp, vtmp, PhysReg{0}, reduce_op, src.size());
          for (unsigned i = 0; i < src.size(); i++)
-            bld.readlane(Definition(PhysReg{dst.physReg() + i}, s1),
-                         Operand(PhysReg{tmp + i}, v1.as_linear()), Operand::zero());
+            bld.readlane(Definition(PhysReg{dst.physReg() + i}, s1), Operand(PhysReg{tmp + i}, lv1),
+                         Operand::zero());
          // TODO: it would be more effective to do the last reduction step on SALU
          emit_op(ctx, tmp, dst.physReg(), tmp, vtmp, reduce_op, src.size());
          break;
@@ -812,11 +802,11 @@ emit_reduction(lower_context* ctx, aco_opcode op, ReduceOp reduce_op, unsigned c
          /* fill in the gaps in rows 1 and 3 */
          copy_constant_sgpr(bld, Definition(exec, bld.lm), 0x0001'0000'0001'0000ull);
          for (unsigned i = 0; i < src.size(); i++) {
-            Instruction* perm = bld.vop3(aco_opcode::v_permlanex16_b32,
-                                         Definition(PhysReg{vtmp + i}, v1.as_linear()),
-                                         Operand(PhysReg{tmp + i}, v1.as_linear()),
-                                         Operand::c32(0xffffffffu), Operand::c32(0xffffffffu))
-                                   .instr;
+            Instruction* perm =
+               bld.vop3(aco_opcode::v_permlanex16_b32, Definition(PhysReg{vtmp + i}, lv1),
+                        Operand(PhysReg{tmp + i}, lv1), Operand::c32(0xffffffffu),
+                        Operand::c32(0xffffffffu))
+                  .instr;
             perm->valu().opsel = 1; /* FI (Fetch Inactive) */
          }
          copy_constant_sgpr(bld, Definition(exec, bld.lm), UINT64_MAX);
@@ -824,11 +814,10 @@ emit_reduction(lower_context* ctx, aco_opcode op, ReduceOp reduce_op, unsigned c
          if (ctx->program->wave_size == 64) {
             /* fill in the gap in row 2 */
             for (unsigned i = 0; i < src.size(); i++) {
-               bld.readlane(Definition(PhysReg{sitmp + i}, s1),
-                            Operand(PhysReg{tmp + i}, v1.as_linear()), Operand::c32(31u));
-               bld.writelane(Definition(PhysReg{vtmp + i}, v1.as_linear()),
-                             Operand(PhysReg{sitmp + i}, s1), Operand::c32(32u),
-                             Operand(PhysReg{vtmp + i}, v1.as_linear()));
+               bld.readlane(Definition(PhysReg{sitmp + i}, s1), Operand(PhysReg{tmp + i}, lv1),
+                            Operand::c32(31u));
+               bld.writelane(Definition(PhysReg{vtmp + i}, lv1), Operand(PhysReg{sitmp + i}, s1),
+                             Operand::c32(32u), Operand(PhysReg{vtmp + i}, lv1));
             }
          }
          std::swap(tmp, vtmp);
@@ -842,34 +831,33 @@ emit_reduction(lower_context* ctx, aco_opcode op, ReduceOp reduce_op, unsigned c
                          ds_pattern_bitmode(0x1F, 0x00, 0x07)); /* mirror(8) */
          copy_constant_sgpr(bld, Definition(exec, s2), 0x1010'1010'1010'1010ull);
          for (unsigned i = 0; i < src.size(); i++)
-            bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{vtmp + i}, v1.as_linear()),
-                     Operand(PhysReg{tmp + i}, v1.as_linear()));
+            bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{vtmp + i}, lv1),
+                     Operand(PhysReg{tmp + i}, lv1));
 
          copy_constant_sgpr(bld, Definition(exec, s2), UINT64_MAX);
          emit_ds_swizzle(bld, tmp, tmp, src.size(),
                          ds_pattern_bitmode(0x1F, 0x00, 0x08)); /* swap(8) */
          copy_constant_sgpr(bld, Definition(exec, s2), 0x0100'0100'0100'0100ull);
          for (unsigned i = 0; i < src.size(); i++)
-            bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{vtmp + i}, v1.as_linear()),
-                     Operand(PhysReg{tmp + i}, v1.as_linear()));
+            bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{vtmp + i}, lv1),
+                     Operand(PhysReg{tmp + i}, lv1));
 
          copy_constant_sgpr(bld, Definition(exec, s2), UINT64_MAX);
          emit_ds_swizzle(bld, tmp, tmp, src.size(),
                          ds_pattern_bitmode(0x1F, 0x00, 0x10)); /* swap(16) */
          copy_constant_sgpr(bld, Definition(exec, s2), 0x0001'0000'0001'0000ull);
          for (unsigned i = 0; i < src.size(); i++)
-            bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{vtmp + i}, v1.as_linear()),
-                     Operand(PhysReg{tmp + i}, v1.as_linear()));
+            bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{vtmp + i}, lv1),
+                     Operand(PhysReg{tmp + i}, lv1));
 
          copy_constant_sgpr(bld, Definition(exec, s2), UINT64_MAX);
          for (unsigned i = 0; i < src.size(); i++) {
-            bld.writelane(Definition(PhysReg{vtmp + i}, v1.as_linear()), identity[i],
-                          Operand::zero(), Operand(PhysReg{vtmp + i}, v1.as_linear()));
-            bld.readlane(Definition(PhysReg{sitmp + i}, s1),
-                         Operand(PhysReg{tmp + i}, v1.as_linear()), Operand::zero());
-            bld.writelane(Definition(PhysReg{vtmp + i}, v1.as_linear()),
-                          Operand(PhysReg{sitmp + i}, s1), Operand::c32(32u),
-                          Operand(PhysReg{vtmp + i}, v1.as_linear()));
+            bld.writelane(Definition(PhysReg{vtmp + i}, lv1), identity[i], Operand::zero(),
+                          Operand(PhysReg{vtmp + i}, lv1));
+            bld.readlane(Definition(PhysReg{sitmp + i}, s1), Operand(PhysReg{tmp + i}, lv1),
+                         Operand::zero());
+            bld.writelane(Definition(PhysReg{vtmp + i}, lv1), Operand(PhysReg{sitmp + i}, s1),
+                          Operand::c32(32u), Operand(PhysReg{vtmp + i}, lv1));
             identity[i] = Operand::zero(); /* prevent further uses of identity */
          }
          std::swap(tmp, vtmp);
@@ -881,8 +869,8 @@ emit_reduction(lower_context* ctx, aco_opcode op, ReduceOp reduce_op, unsigned c
             if (ctx->program->gfx_level < GFX10)
                assert((identity[i].isConstant() && !identity[i].isLiteral()) ||
                       identity[i].physReg() == PhysReg{sitmp + i});
-            bld.writelane(Definition(PhysReg{tmp + i}, v1.as_linear()), identity[i],
-                          Operand::zero(), Operand(PhysReg{tmp + i}, v1.as_linear()));
+            bld.writelane(Definition(PhysReg{tmp + i}, lv1), identity[i], Operand::zero(),
+                          Operand(PhysReg{tmp + i}, lv1));
          }
       }
       FALLTHROUGH;
@@ -914,8 +902,8 @@ emit_reduction(lower_context* ctx, aco_opcode op, ReduceOp reduce_op, unsigned c
          emit_op(ctx, tmp, tmp, vtmp, PhysReg{0}, reduce_op, src.size());
 
          for (unsigned i = 0; i < src.size(); i++)
-            bld.readlane(Definition(PhysReg{sitmp + i}, s1),
-                         Operand(PhysReg{tmp + i}, v1.as_linear()), Operand::c32(31u));
+            bld.readlane(Definition(PhysReg{sitmp + i}, s1), Operand(PhysReg{tmp + i}, lv1),
+                         Operand::c32(31u));
          copy_constant_sgpr(bld, Definition(exec, s2), 0xffff'ffff'0000'0000ull);
          emit_op(ctx, tmp, sitmp, tmp, vtmp, reduce_op, src.size());
          break;
@@ -932,11 +920,11 @@ emit_reduction(lower_context* ctx, aco_opcode op, ReduceOp reduce_op, unsigned c
       if (ctx->program->gfx_level >= GFX10) {
          copy_constant_sgpr(bld, Definition(exec, bld.lm), 0xffff'0000'ffff'0000ull);
          for (unsigned i = 0; i < src.size(); i++) {
-            Instruction* perm = bld.vop3(aco_opcode::v_permlanex16_b32,
-                                         Definition(PhysReg{vtmp + i}, v1.as_linear()),
-                                         Operand(PhysReg{tmp + i}, v1.as_linear()),
-                                         Operand::c32(0xffffffffu), Operand::c32(0xffffffffu))
-                                   .instr;
+            Instruction* perm =
+               bld.vop3(aco_opcode::v_permlanex16_b32, Definition(PhysReg{vtmp + i}, lv1),
+                        Operand(PhysReg{tmp + i}, lv1), Operand::c32(0xffffffffu),
+                        Operand::c32(0xffffffffu))
+                  .instr;
             perm->valu().opsel = 1; /* FI (Fetch Inactive) */
          }
          emit_op(ctx, tmp, tmp, vtmp, PhysReg{0}, reduce_op, src.size());
@@ -944,8 +932,8 @@ emit_reduction(lower_context* ctx, aco_opcode op, ReduceOp reduce_op, unsigned c
          if (ctx->program->wave_size == 64) {
             copy_constant_sgpr(bld, Definition(exec, s2), 0xffff'ffff'0000'0000ull);
             for (unsigned i = 0; i < src.size(); i++)
-               bld.readlane(Definition(PhysReg{sitmp + i}, s1),
-                            Operand(PhysReg{tmp + i}, v1.as_linear()), Operand::c32(31u));
+               bld.readlane(Definition(PhysReg{sitmp + i}, s1), Operand(PhysReg{tmp + i}, lv1),
+                            Operand::c32(31u));
             emit_op(ctx, tmp, sitmp, tmp, vtmp, reduce_op, src.size());
          }
       } else {
@@ -974,14 +962,13 @@ emit_reduction(lower_context* ctx, aco_opcode op, ReduceOp reduce_op, unsigned c
 
    if (dst.regClass().type() == RegType::sgpr) {
       for (unsigned k = 0; k < src.size(); k++) {
-         bld.readlane(Definition(PhysReg{dst.physReg() + k}, s1),
-                      Operand(PhysReg{tmp + k}, v1.as_linear()),
+         bld.readlane(Definition(PhysReg{dst.physReg() + k}, s1), Operand(PhysReg{tmp + k}, lv1),
                       Operand::c32(ctx->program->wave_size - 1));
       }
    } else if (dst.physReg() != tmp) {
       for (unsigned k = 0; k < src.size(); k++) {
          bld.vop1(aco_opcode::v_mov_b32, Definition(PhysReg{dst.physReg() + k}, v1),
-                  Operand(PhysReg{tmp + k}, v1.as_linear()));
+                  Operand(PhysReg{tmp + k}, lv1));
       }
    }
 }
@@ -1023,7 +1010,7 @@ emit_bpermute_permlane(Builder& bld, aco_ptr<Instruction>& instr)
    assert(tmp_exec.regClass() == bld.lm);
    assert(clobber_scc.isFixed() && clobber_scc.physReg() == scc);
    assert(same_half.regClass() == bld.lm);
-   assert(tmp_op.regClass() == v1.as_linear());
+   assert(tmp_op.regClass() == lv1);
    assert(index_x4.regClass() == v1);
    assert(input_data.regClass().type() == RegType::vgpr);
    assert(input_data.bytes() <= 4);
@@ -1210,9 +1197,6 @@ struct copy_operation {
    };
 };
 
-// Use a vector instead of a map for copy operations.
-// Parallel copies usually involve few registers, so linear scan is faster
-// and avoids heap allocation overhead.
 using CopyMap = std::vector<std::pair<PhysReg, copy_operation>>;
 
 void
@@ -1284,6 +1268,7 @@ create_bperm(Builder& bld, uint8_t swiz[4], Definition dst, Operand src1,
       src0 = Operand(dst.physReg(), v1);
    else if (!src0.isConstant())
       src0 = Operand(PhysReg(src0.physReg().reg()), v1);
+
    bld.vop3(aco_opcode::v_perm_b32, dst, src0, src1, Operand::c32(swiz_packed));
 }
 
@@ -1627,7 +1612,6 @@ do_pack_2x16(lower_context* ctx, Builder& bld, Definition def, Operand lo, Opera
 
    if (can_use_pack) {
       Instruction* instr = bld.vop3(aco_opcode::v_pack_b32_f16, def, lo, hi);
-      /* opsel: 0 = select low half, 1 = select high half. [0] = src0, [1] = src1 */
       instr->valu().opsel = hi.physReg().byte() | (lo.physReg().byte() >> 1);
       return;
    }
@@ -1717,9 +1701,7 @@ do_pack_2x16(lower_context* ctx, Builder& bld, Definition def, Operand lo, Opera
       bld.vop2(aco_opcode::v_lshlrev_b32, def_hi, Operand::c32(16u), hi);
       hi.setFixed(def.physReg().advance(2));
    } else if (ctx->program->gfx_level >= GFX8) {
-      /* Either lo or hi can be placed with just a v_mov. SDWA is not needed, because
-       * op.physReg().byte()==def.physReg().byte() and the other half will be overwritten.
-       */
+      /* Either lo or hi can be placed with just a v_mov. */
       assert(lo.physReg().byte() == 0 || hi.physReg().byte() == 2);
       Operand& op = lo.physReg().byte() == 0 ? lo : hi;
       PhysReg reg = def.physReg().advance(op.physReg().byte());
@@ -1745,7 +1727,6 @@ void
 try_coalesce_copies(lower_context* ctx, CopyMap& copy_map, size_t& i)
 {
    copy_operation& copy = copy_map[i].second;
-   // TODO try more relaxed alignment for subdword copies
    unsigned next_def_align = util_next_power_of_two(copy.bytes + 1);
    unsigned next_op_align = next_def_align;
    if (copy.def.regClass().type() == RegType::vgpr)
@@ -1793,22 +1774,20 @@ try_coalesce_copies(lower_context* ctx, CopyMap& copy_map, size_t& i)
 
    size_t other_idx = std::distance(copy_map.begin(), other_it);
    copy_map.erase(other_it);
-   if (other_idx < i) i--;
+   if (other_idx < i)
+      i--;
 }
 
 void
-handle_operands(CopyMap& copy_map, lower_context* ctx,
-                amd_gfx_level gfx_level, Pseudo_instruction* pi)
+handle_operands(CopyMap& copy_map, lower_context* ctx, amd_gfx_level gfx_level,
+                Pseudo_instruction* pi)
 {
-   // Sort for deterministic behavior and cycle breaking tie-breakers.
    std::sort(copy_map.begin(), copy_map.end(),
-             [](const std::pair<PhysReg, copy_operation>& a, const std::pair<PhysReg, copy_operation>& b) {
-                 return a.first < b.first;
-             });
+             [](const std::pair<PhysReg, copy_operation>& a,
+                const std::pair<PhysReg, copy_operation>& b) { return a.first < b.first; });
 
    Builder bld(ctx->program, &ctx->instructions);
    unsigned num_instructions_before = ctx->instructions.size();
-   aco_ptr<Instruction> mov;
    bool writes_scc = false;
 
    /* count the number of uses for each dst reg */
@@ -1835,7 +1814,6 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
          Operand hi_op = Operand(PhysReg{copy_map[i].second.op.physReg() + 2}, rc);
          copy_operation copy = {hi_op, hi_def, copy_map[i].second.bytes - 8};
 
-         // Find if high part exists and update, otherwise push back
          auto hi_it = std::find_if(copy_map.begin(), copy_map.end(),
                                    [hi_def](const std::pair<PhysReg, copy_operation>& entry) {
                                       return entry.first == hi_def.physReg();
@@ -1848,10 +1826,10 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
 
          assert(copy_map[i].second.op.physReg().byte() == 0 &&
                 copy_map[i].second.def.physReg().byte() == 0);
-         copy_map[i].second.op = Operand(copy_map[i].second.op.physReg(),
-                                         copy_map[i].second.op.regClass().resize(8));
-         copy_map[i].second.def = Definition(copy_map[i].second.def.physReg(),
-                                             copy_map[i].second.def.regClass().resize(8));
+         copy_map[i].second.op =
+            Operand(copy_map[i].second.op.physReg(), copy_map[i].second.op.regClass().resize(8));
+         copy_map[i].second.def =
+            Definition(copy_map[i].second.def.physReg(), copy_map[i].second.def.regClass().resize(8));
          copy_map[i].second.bytes = 8;
       }
 
@@ -1862,7 +1840,6 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
          if (copy.second.op.isConstant())
             continue;
          for (uint16_t j = 0; j < copy_map[i].second.bytes; j++) {
-            /* distance might underflow */
             unsigned distance = copy_map[i].first.reg_b + j - copy.second.op.physReg().reg_b;
             if (distance < copy.second.bytes)
                copy_map[i].second.uses[j] += 1;
@@ -1895,7 +1872,6 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
                                       return entry.first == reg_hi;
                                    });
          if (other != copy_map.end() && other->second.bytes == 2) {
-            /* check if the target register is otherwise unused */
             bool unused_lo = !copy_map[i].second.is_used ||
                              (copy_map[i].second.is_used == 0x0101 &&
                               other->second.op.physReg() == copy_map[i].first);
@@ -1906,7 +1882,6 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
                Operand hi = other->second.op;
                do_pack_2x16(ctx, bld, Definition(copy_map[i].first, v1), lo, hi);
 
-               // Need to handle erase carefully since 'other' could be before or after 'i'
                size_t other_idx = std::distance(copy_map.begin(), other);
                if (other_idx > i) {
                   copy_map.erase(other);
@@ -1918,7 +1893,6 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
 
                for (auto& other2 : copy_map) {
                   for (uint16_t j = 0; j < other2.second.bytes; j++) {
-                     /* distance might underflow */
                      unsigned distance_lo = other2.first.reg_b + j - lo.physReg().reg_b;
                      unsigned distance_hi = other2.first.reg_b + j - hi.physReg().reg_b;
                      if (distance_lo < 2 || distance_hi < 2)
@@ -1931,7 +1905,7 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
          }
       }
 
-      /* optimize constant copies to aligned sgpr pair that's otherwise unused. */
+      /* optimize constant copies to aligned sgpr pair that's otherwise unused */
       if (copy_map[i].first <= exec && (copy_map[i].first % 2) == 0 &&
           copy_map[i].second.bytes == 4 && copy_map[i].second.op.isConstant() &&
           !copy_map[i].second.is_used) {
@@ -1962,8 +1936,6 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
       /* find portions where the target reg is not used as operand for any other copy */
       if (copy_map[i].second.is_used) {
          if (copy_map[i].second.op.isConstant() || skip_partial_copies) {
-            /* we have to skip constants until is_used=0.
-             * we also skip partial copies at the beginning to help coalescing */
             ++i;
             continue;
          }
@@ -1973,15 +1945,11 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
             has_zero_use_bytes |= (copy_map[i].second.uses[j] == 0) << j;
 
          if (has_zero_use_bytes) {
-            /* Skipping partial copying and doing a v_swap_b32 and then fixup
-             * copies is usually beneficial for sub-dword copies, but if doing
-             * a partial copy allows further copies, it should be done instead. */
             bool partial_copy = (has_zero_use_bytes == 0xf) || (has_zero_use_bytes == 0xf0);
             for (const auto& copy : copy_map) {
                if (partial_copy)
                   break;
                for (uint16_t j = 0; j < copy.second.bytes; j++) {
-                  /* distance might underflow */
                   unsigned distance = copy.first.reg_b + j - copy_map[i].second.op.physReg().reg_b;
                   if (distance < copy_map[i].second.bytes && copy.second.uses[j] == 1 &&
                       !copy_map[i].second.uses[distance])
@@ -1994,7 +1962,6 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
                continue;
             }
          } else {
-            /* full target reg is used: register swapping needed */
             ++i;
             continue;
          }
@@ -2005,14 +1972,10 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
       std::pair<PhysReg, copy_operation> copy = copy_map[i];
 
       if (copy_map[i].second.is_used == 0) {
-         /* the target reg is not used as operand for any other copy, so we
-          * copied to all of it */
          copy_map.erase(copy_map.begin() + i);
          i = 0;
       } else {
-         /* we only performed some portions of this copy, so split it to only
-          * leave the portions that still need to be done */
-         copy_operation original = copy_map[i].second; /* the map insertion below can overwrite this */
+         copy_operation original = copy_map[i].second;
          copy_map.erase(copy_map.begin() + i);
          for (unsigned offset = 0; offset < original.bytes;) {
             if (original.uses[offset] == 0) {
@@ -2027,7 +1990,6 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
             for (unsigned j = 0; j < new_copy.bytes; j++)
                new_copy.uses[j] = original.uses[j + offset];
 
-            // Insert into map
             auto it = std::find_if(copy_map.begin(), copy_map.end(),
                                    [def](const std::pair<PhysReg, copy_operation>& entry) {
                                       return entry.first == def.physReg();
@@ -2044,13 +2006,9 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
          i = 0;
       }
 
-      /* Reduce the number of uses of the operand reg by one. Do this after
-       * splitting the copy or removing it in case the copy writes to it's own
-       * operand (for example, v[7:8] = v[8:9]) */
       if (did_copy && !copy.second.op.isConstant()) {
          for (auto& other : copy_map) {
             for (uint16_t j = 0; j < other.second.bytes; j++) {
-               /* distance might underflow */
                unsigned distance = other.first.reg_b + j - copy.second.op.physReg().reg_b;
                if (distance < copy.second.bytes && !copy.second.uses[distance])
                   other.second.uses[j] -= 1;
@@ -2059,15 +2017,12 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
       }
    }
 
-   /* all target regs are needed as operand somewhere which means, all entries are part of a cycle */
+   /* all target regs are needed as operand somewhere - handle cycles */
    unsigned largest = 0;
    for (const auto& op : copy_map)
       largest = MAX2(largest, op.second.bytes);
 
    while (!copy_map.empty()) {
-
-      /* Perform larger swaps first, because larger swaps swaps can make other
-       * swaps unnecessary. */
       size_t swap_idx = 0;
       for (size_t i = 0; i < copy_map.size(); ++i) {
          if (copy_map[i].second.bytes > copy_map[swap_idx].second.bytes) {
@@ -2077,9 +2032,7 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
          }
       }
 
-      /* should already be done */
       assert(!copy_map[swap_idx].second.op.isConstant());
-
       assert(copy_map[swap_idx].second.op.isFixed());
       assert(copy_map[swap_idx].second.def.regClass() == copy_map[swap_idx].second.op.regClass());
 
@@ -2094,11 +2047,9 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
          assert(!preserve_scc || pi->scratch_sgpr != scc);
       }
 
-      /* to resolve the cycle, we have to swap the src reg with the dst reg */
       copy_operation swap = copy_map[swap_idx].second;
 
-      /* if this is self-intersecting, we have to split it because
-       * self-intersecting swaps don't make sense */
+      /* split self-intersecting swaps */
       PhysReg src = swap.op.physReg(), dst = swap.def.physReg();
       if (abs((int)src.reg_b - (int)dst.reg_b) < (int)swap.bytes) {
          unsigned offset = abs((int)src.reg_b - (int)dst.reg_b);
@@ -2111,7 +2062,6 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
          remaining.op = Operand(src, swap.def.regClass().resize(remaining.bytes));
          remaining.def = Definition(dst, swap.def.regClass().resize(remaining.bytes));
 
-         // Insert/Update
          auto it = std::find_if(copy_map.begin(), copy_map.end(),
                                 [dst](const std::pair<PhysReg, copy_operation>& entry) {
                                    return entry.first == dst;
@@ -2126,26 +2076,19 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
          swap.bytes = offset;
       }
 
-      /* GFX6-7 can only swap full registers */
-      assert (ctx->program->gfx_level > GFX7 || (swap.bytes % 4) == 0);
+      assert(ctx->program->gfx_level > GFX7 || (swap.bytes % 4) == 0);
 
       do_swap(ctx, bld, swap, preserve_scc, pi);
 
-      /* remove from map */
-      // Need to find index again because emplace_back might have invalidated it
-      // Actually we can just find 'swap.def.physReg()' again, or handle index carefully.
-      // Since we might have inserted, the indices might have shifted.
-      // Safest to linear search for the exact element we were processing.
       {
-          auto it = std::find_if(copy_map.begin(), copy_map.end(),
-                                 [swap](const std::pair<PhysReg, copy_operation>& entry) {
-                                     return entry.first == swap.def.physReg();
-                                 });
-          assert(it != copy_map.end());
-          copy_map.erase(it);
+         auto it = std::find_if(copy_map.begin(), copy_map.end(),
+                                [swap](const std::pair<PhysReg, copy_operation>& entry) {
+                                   return entry.first == swap.def.physReg();
+                                });
+         assert(it != copy_map.end());
+         copy_map.erase(it);
       }
 
-      /* change the operand reg of the target's uses and split uses if needed */
       uint32_t bytes_left = u_bit_consecutive(0, swap.bytes);
       for (size_t i = 0; i < copy_map.size(); ++i) {
          if (copy_map[i].second.op.physReg() == swap.def.physReg() &&
@@ -2163,8 +2106,6 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
 
          int offset = (int)copy_map[i].second.op.physReg().reg_b - (int)swap.def.physReg().reg_b;
 
-         /* split and update the middle (the portion that reads the swap's
-          * definition) to read the swap's operand instead */
          int target_op_end = copy_map[i].second.op.physReg().reg_b + copy_map[i].second.bytes;
          int swap_def_end = swap.def.physReg().reg_b + swap.bytes;
          int before_bytes = MAX2(-offset, 0);
@@ -2185,8 +2126,10 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
                                    [copy](const std::pair<PhysReg, copy_operation>& entry) {
                                       return entry.first == copy.def.physReg();
                                    });
-            if (it != copy_map.end()) it->second = copy;
-            else copy_map.emplace_back(copy.def.physReg(), copy);
+            if (it != copy_map.end())
+               it->second = copy;
+            else
+               copy_map.emplace_back(copy.def.physReg(), copy);
          }
 
          if (middle_bytes) {
@@ -2201,21 +2144,21 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
                                    [copy](const std::pair<PhysReg, copy_operation>& entry) {
                                       return entry.first == copy.def.physReg();
                                    });
-            if (it != copy_map.end()) it->second = copy;
-            else copy_map.emplace_back(copy.def.physReg(), copy);
+            if (it != copy_map.end())
+               it->second = copy;
+            else
+               copy_map.emplace_back(copy.def.physReg(), copy);
          }
 
          if (before_bytes) {
-            copy_operation copy;
             copy_map[i].second.bytes = before_bytes;
             RegClass rc = copy_map[i].second.op.regClass().resize(before_bytes);
             copy_map[i].second.op = Operand(copy_map[i].second.op.physReg(), rc);
             copy_map[i].second.def = Definition(copy_map[i].second.def.physReg(), rc);
-            memset(copy_map[i].second.uses + copy_map[i].second.bytes, 0, 8 - copy_map[i].second.bytes);
+            memset(copy_map[i].second.uses + copy_map[i].second.bytes, 0,
+                   8 - copy_map[i].second.bytes);
          }
 
-         /* break early since we know each byte of the swap's definition is used
-          * at most once */
          bytes_left &= ~imask;
          if (!bytes_left)
             break;
@@ -2225,8 +2168,8 @@ handle_operands(CopyMap& copy_map, lower_context* ctx,
 }
 
 void
-handle_operands_linear_vgpr(CopyMap& copy_map, lower_context* ctx,
-                            amd_gfx_level gfx_level, Pseudo_instruction* pi)
+handle_operands_linear_vgpr(CopyMap& copy_map, lower_context* ctx, amd_gfx_level gfx_level,
+                            Pseudo_instruction* pi)
 {
    Builder bld(ctx->program, &ctx->instructions);
 
@@ -2289,9 +2232,9 @@ lower_image_sample(lower_context* ctx, aco_ptr<Instruction>& instr)
       for (unsigned i = 0; i < num_copied_vgprs; i++)
          vaddr[num_vaddr++] = instr->operands[4 + i];
       for (unsigned i = num_copied_vgprs; i < std::min(vaddr_size, nsa_size); i++)
-         vaddr[num_vaddr++] = Operand(linear_vgpr.physReg().advance(i * 4), v1.as_linear());
+         vaddr[num_vaddr++] = Operand(linear_vgpr.physReg().advance(i * 4), lv1);
       if (vaddr_size > nsa_size) {
-         RegClass rc = RegClass::get(RegType::vgpr, (vaddr_size - nsa_size) * 4).as_linear();
+         RegClass rc = lv1.resize((vaddr_size - nsa_size) * 4);
          vaddr[num_vaddr++] = Operand(PhysReg(linear_vgpr.physReg().advance(nsa_size * 4)), rc);
       }
    } else {
@@ -2377,23 +2320,26 @@ lower_to_hw_instr(Program* program)
       pops_done_msg_bounds = gfx9_pops_done_msg_bounds(program);
    }
 
-   Block* discard_exit_block = NULL;
-   Block* discard_pops_done_and_exit_block = NULL;
+   Block* discard_exit_block = nullptr;
+   Block* discard_pops_done_and_exit_block = nullptr;
 
    int end_with_regs_block_index = -1;
 
-   // Hoist allocations out of the loops to reuse capacity
+   /* Hoist allocations outside the loop for better performance.
+    * CopyMap uses vector for cache-friendly iteration on small sets.
+    */
    lower_context ctx;
    ctx.program = program;
    CopyMap copy_operations;
    copy_operations.reserve(64);
 
-   for (int block_idx = program->blocks.size() - 1; block_idx >= 0; block_idx--) {
+   for (int block_idx = static_cast<int>(program->blocks.size()) - 1; block_idx >= 0; block_idx--) {
       Block* block = &program->blocks[block_idx];
       ctx.block = block;
       ctx.instructions.clear();
-      // Heuristic: reserve 20% more than previous instruction count for expansions
-      ctx.instructions.reserve(block->instructions.size() + std::max<size_t>(16, block->instructions.size() / 5));
+      /* Reserve with headroom for instruction expansion */
+      ctx.instructions.reserve(block->instructions.size() +
+                               std::max<size_t>(16, block->instructions.size() / 5));
       Builder bld(program, &ctx.instructions);
 
       for (size_t instr_idx = 0; instr_idx < block->instructions.size(); instr_idx++) {
@@ -2411,24 +2357,21 @@ lower_to_hw_instr(Program* program)
             bld.sopp(aco_opcode::s_sendmsg, sendmsg_ordered_ps_done);
          }
 
-         /* Optimized dispatch: fast-path common formats (VALU/SALU) to avoid branching overhead.
-          * Pseudo instructions are handled in the PSEUDO/PSEUDO_BRANCH/PSEUDO_BARRIER/PSEUDO_REDUCTION cases.
-          * Important: isCall() must be handled separately to emit stack maintenance instructions.
+         /* Fast-path: non-pseudo instructions can be emitted directly without expensive processing.
+          * This is the common case for VALU/SALU instructions and significantly reduces overhead.
+          * Note: Calls must go through slow path for stack maintenance.
           */
          if (instr->format != Format::PSEUDO && instr->format != Format::PSEUDO_BRANCH &&
-             instr->format != Format::PSEUDO_BARRIER && instr->format != Format::PSEUDO_REDUCTION &&
-             !instr->isCall()) {
+             instr->format != Format::PSEUDO_BARRIER &&
+             instr->format != Format::PSEUDO_REDUCTION && !instr->isCall()) {
 
-             if (instr->isMIMG() && instr->mimg().strict_wqm) {
-                lower_image_sample(&ctx, instr);
-                ctx.instructions.emplace_back(std::move(instr));
-             } else {
-                ctx.instructions.emplace_back(std::move(instr));
-             }
-             continue;
+            if (instr->isMIMG() && instr->mimg().strict_wqm) {
+               lower_image_sample(&ctx, instr);
+            }
+            ctx.instructions.emplace_back(std::move(instr));
+            continue;
          }
 
-         // Slow path for pseudo instructions
          if (instr->isPseudo() && instr->opcode != aco_opcode::p_unit_test &&
              instr->opcode != aco_opcode::p_debug_info) {
             Pseudo_instruction* pi = &instr->pseudo();
@@ -2446,7 +2389,8 @@ lower_to_hw_instr(Program* program)
                                    ? def.regClass()
                                    : RegClass(instr->operands[0].getTemp().type(), def.size());
                copy_operations.clear();
-               copy_operations.emplace_back(def.physReg(), copy_operation{Operand(reg, op_rc), def, def.bytes()});
+               copy_operations.emplace_back(def.physReg(),
+                                            copy_operation{Operand(reg, op_rc), def, def.bytes()});
                handle_operands(copy_operations, &ctx, program->gfx_level, pi);
                break;
             }
@@ -2462,50 +2406,19 @@ lower_to_hw_instr(Program* program)
                   RegClass rc = RegClass::get(instr->definitions[0].regClass().type(), op.bytes());
                   if (op.isConstant()) {
                      const Definition def = Definition(reg, rc);
-
-                     auto it = std::find_if(copy_operations.begin(), copy_operations.end(),
-                                            [reg](const std::pair<PhysReg, copy_operation>& entry) {
-                                               return entry.first == reg;
-                                            });
-                     if (it != copy_operations.end()) {
-                        it->second = copy_operation{op, def, op.bytes()};
-                     } else {
-                        copy_operations.emplace_back(reg, copy_operation{op, def, op.bytes()});
-                     }
-
+                     copy_operations.emplace_back(reg, copy_operation{op, def, op.bytes()});
                      reg.reg_b += op.bytes();
                      continue;
                   }
                   if (op.isUndefined()) {
-                     // Optimization: Treat undefined as constant 0 to allow coalescing
-                     const Definition def = Definition(reg, rc);
-                     auto it = std::find_if(copy_operations.begin(), copy_operations.end(),
-                                            [reg](const std::pair<PhysReg, copy_operation>& entry) {
-                                               return entry.first == reg;
-                                            });
-                     Operand zero = Operand::get_const(ctx.program->gfx_level, 0, op.bytes());
-                     if (it != copy_operations.end()) {
-                        it->second = copy_operation{zero, def, op.bytes()};
-                     } else {
-                        copy_operations.emplace_back(reg, copy_operation{zero, def, op.bytes()});
-                     }
                      reg.reg_b += op.bytes();
                      continue;
                   }
 
                   RegClass rc_def = op.regClass().is_subdword() ? op.regClass() : rc;
                   const Definition def = Definition(reg, rc_def);
-
-                  auto it = std::find_if(copy_operations.begin(), copy_operations.end(),
-                                         [def](const std::pair<PhysReg, copy_operation>& entry) {
-                                            return entry.first == def.physReg();
-                                         });
-                  if (it != copy_operations.end()) {
-                     it->second = copy_operation{op, def, op.bytes()};
-                  } else {
-                     copy_operations.emplace_back(def.physReg(), copy_operation{op, def, op.bytes()});
-                  }
-
+                  copy_operations.emplace_back(def.physReg(),
+                                               copy_operation{op, def, op.bytes()});
                   reg.reg_b += op.bytes();
                }
                handle_operands(copy_operations, &ctx, program->gfx_level, pi);
@@ -2520,17 +2433,8 @@ lower_to_hw_instr(Program* program)
                                       ? def.regClass()
                                       : instr->operands[0].getTemp().regClass().resize(def.bytes());
                   const Operand op = Operand(reg, rc_op);
-
-                  auto it = std::find_if(copy_operations.begin(), copy_operations.end(),
-                                         [def](const std::pair<PhysReg, copy_operation>& entry) {
-                                            return entry.first == def.physReg();
-                                         });
-                  if (it != copy_operations.end()) {
-                     it->second = copy_operation{op, def, def.bytes()};
-                  } else {
-                     copy_operations.emplace_back(def.physReg(), copy_operation{op, def, def.bytes()});
-                  }
-
+                  copy_operations.emplace_back(def.physReg(),
+                                               copy_operation{op, def, def.bytes()});
                   reg.reg_b += def.bytes();
                }
                handle_operands(copy_operations, &ctx, program->gfx_level, pi);
@@ -2542,19 +2446,10 @@ lower_to_hw_instr(Program* program)
                bool non_linear_vgpr = false;
                for (unsigned j = 0; j < instr->operands.size(); j++) {
                   assert(instr->definitions[j].bytes() == instr->operands[j].bytes());
-                  PhysReg def_reg = instr->definitions[j].physReg();
-                  copy_operation op = {instr->operands[j], instr->definitions[j], instr->operands[j].bytes()};
-
-                  auto it = std::find_if(copy_operations.begin(), copy_operations.end(),
-                                         [def_reg](const std::pair<PhysReg, copy_operation>& entry) {
-                                            return entry.first == def_reg;
-                                         });
-                  if (it != copy_operations.end()) {
-                     it->second = op;
-                  } else {
-                     copy_operations.emplace_back(def_reg, op);
-                  }
-
+                  copy_operations.emplace_back(
+                     instr->definitions[j].physReg(),
+                     copy_operation{instr->operands[j], instr->definitions[j],
+                                    instr->operands[j].bytes()});
                   linear_vgpr |= instr->definitions[j].regClass().is_linear_vgpr();
                   non_linear_vgpr |= !instr->definitions[j].regClass().is_linear_vgpr();
                }
@@ -2652,11 +2547,12 @@ lower_to_hw_instr(Program* program)
                break;
             }
             case aco_opcode::p_spill: {
-               assert(instr->operands[0].regClass() == v1.as_linear());
+               assert(instr->operands[0].regClass() == lv1);
                for (unsigned i = 0; i < instr->operands[2].size(); i++) {
                   Operand src =
                      instr->operands[2].isConstant()
-                        ? Operand::c32(uint32_t(instr->operands[2].constantValue64() >> (32 * i)))
+                        ? Operand::c32(static_cast<uint32_t>(
+                             instr->operands[2].constantValue64() >> (32 * i)))
                         : Operand(PhysReg{instr->operands[2].physReg() + i}, s1);
                   bld.writelane(Definition(instr->operands[0].physReg(), v1), src,
                                 Operand::c32(instr->operands[1].constantValue() + i),
@@ -2665,7 +2561,7 @@ lower_to_hw_instr(Program* program)
                break;
             }
             case aco_opcode::p_reload: {
-               assert(instr->operands[0].regClass() == v1.as_linear());
+               assert(instr->operands[0].regClass() == lv1);
                for (unsigned i = 0; i < instr->definitions[0].size(); i++)
                   bld.readlane(Definition(PhysReg{instr->definitions[0].physReg() + i}, s1),
                                instr->operands[0],
@@ -2676,8 +2572,10 @@ lower_to_hw_instr(Program* program)
                if (instr->operands[0].isConstant() ||
                    instr->operands[0].regClass().type() == RegType::sgpr) {
                   copy_operations.clear();
-                  PhysReg reg = instr->definitions[0].physReg();
-                  copy_operations.emplace_back(reg, copy_operation{instr->operands[0], instr->definitions[0], instr->definitions[0].bytes()});
+                  copy_operations.emplace_back(
+                     instr->definitions[0].physReg(),
+                     copy_operation{instr->operands[0], instr->definitions[0],
+                                    instr->definitions[0].bytes()});
                   handle_operands(copy_operations, &ctx, program->gfx_level, pi);
                } else {
                   assert(instr->operands[0].regClass().type() == RegType::vgpr);
@@ -2717,7 +2615,8 @@ lower_to_hw_instr(Program* program)
                PhysReg reg = instr->definitions[0].physReg();
                bld.sop1(aco_opcode::p_constaddr_getpc, instr->definitions[0], Operand::c32(id));
                if (ctx.program->gfx_level >= GFX12)
-                  bld.sop1(aco_opcode::s_sext_i32_i16, Definition(reg.advance(4), s1), Operand(reg.advance(4), s1));
+                  bld.sop1(aco_opcode::s_sext_i32_i16, Definition(reg.advance(4), s1),
+                           Operand(reg.advance(4), s1));
                bld.sop2(aco_opcode::p_constaddr_addlo, Definition(reg, s1), instr->definitions[1],
                         Operand(reg, s1), instr->operands[0], Operand::c32(id));
                /* s_addc_u32 not needed because the program is in a 32-bit VA range */
@@ -2741,7 +2640,8 @@ lower_to_hw_instr(Program* program)
                PhysReg reg = instr->definitions[0].physReg();
                bld.sop1(aco_opcode::p_resumeaddr_getpc, instr->definitions[0], Operand::c32(id));
                if (ctx.program->gfx_level >= GFX12)
-                  bld.sop1(aco_opcode::s_sext_i32_i16, Definition(reg.advance(4), s1), Operand(reg.advance(4), s1));
+                  bld.sop1(aco_opcode::s_sext_i32_i16, Definition(reg.advance(4), s1),
+                           Operand(reg.advance(4), s1));
                bld.sop2(aco_opcode::p_resumeaddr_addlo, Definition(reg, s1), instr->definitions[1],
                         Operand(reg, s1), Operand::c32(resume_block_idx), Operand::c32(id));
                /* s_addc_u32 not needed because the program is in a 32-bit VA range */
@@ -2934,7 +2834,7 @@ lower_to_hw_instr(Program* program)
             case aco_opcode::p_interp_gfx11: {
                assert(instr->definitions[0].regClass() == v1 ||
                       instr->definitions[0].regClass() == v2b);
-               assert(instr->operands[0].regClass() == v1.as_linear());
+               assert(instr->operands[0].regClass() == lv1);
                assert(instr->operands[1].isConstant());
                assert(instr->operands[2].isConstant());
                assert(instr->operands.back().physReg() == m0);
@@ -2957,10 +2857,10 @@ lower_to_hw_instr(Program* program)
                   dpp_ctrl = instr->operands[3].constantValue();
                }
 
-               bld.ldsdir(aco_opcode::lds_param_load, Definition(lin_vgpr, v1.as_linear()),
-                          Operand(m0, s1), attribute, component);
+               bld.ldsdir(aco_opcode::lds_param_load, Definition(lin_vgpr, lv1), Operand(m0, s1),
+                          attribute, component);
 
-               Operand p(lin_vgpr, v1.as_linear());
+               Operand p(lin_vgpr, lv1);
                Operand dst_op(dst.physReg(), v1);
                if (instr->operands.size() == 5) {
                   bld.vop1_dpp(aco_opcode::v_mov_b32, Definition(dst), p, dpp_ctrl);
@@ -3102,10 +3002,10 @@ lower_to_hw_instr(Program* program)
          } else if (instr->isReduction()) {
             Pseudo_reduction_instruction& reduce = instr->reduction();
             emit_reduction(&ctx, reduce.opcode, reduce.reduce_op, reduce.cluster_size,
-                           reduce.operands[1].physReg(),    // tmp
-                           reduce.definitions[1].physReg(), // stmp
-                           reduce.operands[2].physReg(),    // vtmp
-                           reduce.definitions[2].physReg(), // sitmp
+                           reduce.operands[1].physReg(),    /* tmp */
+                           reduce.definitions[1].physReg(), /* stmp */
+                           reduce.operands[2].physReg(),    /* vtmp */
+                           reduce.definitions[2].physReg(), /* sitmp */
                            reduce.operands[0], reduce.definitions[0]);
          } else if (instr->isBarrier()) {
             Pseudo_barrier_instruction& barrier = instr->barrier();
@@ -3126,10 +3026,14 @@ lower_to_hw_instr(Program* program)
          } else if (instr->isCall()) {
             unsigned extra_param_count = 2;
             PhysReg stack_reg = instr->operands[0].physReg();
+            unsigned scratch_size = ctx.program->config->scratch_bytes_per_wave;
+            if (ctx.program->gfx_level >= GFX9)
+               scratch_size /= ctx.program->wave_size;
 
-            if (instr->operands[1].constantValue()) {
+            if (instr->operands[1].constantValue() || scratch_size) {
                bld.sop2(aco_opcode::s_add_u32, Definition(stack_reg, s1), Definition(scc, s1),
-                        Operand(stack_reg, s1), instr->operands[1]);
+                        Operand(stack_reg, s1),
+                        Operand::c32(instr->operands[1].constantValue() + scratch_size));
                if (program->gfx_level < GFX9) {
                   /* The callee's VGPR spill buffer resource needs to be based at the
                    * start of callee scratch.
@@ -3143,9 +3047,10 @@ lower_to_hw_instr(Program* program)
             bld.sop1(aco_opcode::s_swappc_b64, Definition(instr->definitions[0].physReg(), s2),
                      Operand(instr->operands[extra_param_count + 1].physReg(), s2));
 
-            if (instr->operands[1].constantValue()) {
+            if (instr->operands[1].constantValue() || scratch_size) {
                bld.sop2(aco_opcode::s_sub_u32, Definition(stack_reg, s1), Definition(scc, s1),
-                        Operand(stack_reg, s1), instr->operands[1]);
+                        Operand(stack_reg, s1),
+                        Operand::c32(instr->operands[1].constantValue() + scratch_size));
                if (program->gfx_level < GFX9) {
                   PhysReg rsrc_dword1 = stack_reg.advance(4);
                   bld.sop2(aco_opcode::s_subb_u32, Definition(rsrc_dword1, s1), Definition(scc, s1),
@@ -3172,7 +3077,7 @@ lower_to_hw_instr(Program* program)
    /* If block with p_end_with_regs is not the last block (i.e. p_exit_early_if_not may append exit
     * block at last), create an exit block for it to branch to.
     */
-   int last_block_index = program->blocks.size() - 1;
+   int last_block_index = static_cast<int>(program->blocks.size()) - 1;
    if (end_with_regs_block_index >= 0 && end_with_regs_block_index != last_block_index) {
       Block* exit_block = program->create_and_insert_block();
       Block* end_with_regs_block = &program->blocks[end_with_regs_block_index];
