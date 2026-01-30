@@ -7,7 +7,7 @@
 #define __LAVD_H
 
 #include <scx/common.bpf.h>
-#include <scx/bpf_arena_common.bpf.h>
+#include <bpf_arena_common.bpf.h>
 #include <lib/sdt_task.h>
 #include <lib/atq.h>
 
@@ -75,7 +75,8 @@ enum consts_internal {
 	LAVD_MAX_RETRY			= 3,
 
 	/*
-	 * Tuned for low-latency interactive workloads.
+	 * Tuned for low-latency interactive workloads (gaming).
+	 * Reduced from upstream 10ms/5ms to 5ms/4ms for snappier response.
 	 */
 	LAVD_TARGETED_LATENCY_NS	= (5ULL * NSEC_PER_MSEC),
 	LAVD_SLICE_MIN_NS_DFL		= (500ULL * NSEC_PER_USEC),
@@ -86,11 +87,16 @@ enum consts_internal {
 	LAVD_TASK_LAG_MAX		= (10ULL * LAVD_SLICE_MAX_NS_DFL),
 	LAVD_DL_COMPETE_WINDOW		= (LAVD_SLICE_MAX_NS_DFL >> 16),
 
+	/*
+	 * Increased from 100000 (10us) to 400000 (2.5us) for finer-grained
+	 * latency criticality tracking on fast-paced gaming workloads.
+	 */
 	LAVD_LC_FREQ_MAX		= 400000,
 	LAVD_LC_RUNTIME_MAX		= LAVD_TIME_ONE_SEC,
 	LAVD_LC_WEIGHT_BOOST_REGULAR	= 128,
 	LAVD_LC_WEIGHT_BOOST_MEDIUM	= (2 * LAVD_LC_WEIGHT_BOOST_REGULAR),
 	LAVD_LC_WEIGHT_BOOST_HIGH	= (2 * LAVD_LC_WEIGHT_BOOST_MEDIUM),
+	LAVD_LC_WEIGHT_BOOST_HIGHEST	= (2 * LAVD_LC_WEIGHT_BOOST_HIGH),
 	LAVD_LC_GREEDY_SHIFT		= 3,
 	LAVD_LC_WAKE_INTERVAL_MIN	= LAVD_SLICE_MIN_NS_DFL,
 	LAVD_LC_INH_RECEIVER_SHIFT	= 2,
@@ -132,9 +138,11 @@ enum consts_flags {
 	LAVD_FLAG_IDLE_CPU_PICKED	= (0x1 << 9),
 	LAVD_FLAG_KSOFTIRQD		= (0x1 << 10),
 	LAVD_FLAG_WOKEN_BY_RT_DL	= (0x1 << 11),
+	LAVD_FLAG_WOKEN_BY_HARDIRQ	= (0x1 << 12),
+	LAVD_FLAG_WOKEN_BY_SOFTIRQ	= (0x1 << 13),
 
-	/* Required by util.bpf.c pinned-waiting accounting. */
-	LAVD_FLAG_PINNED_WAITING	= (0x1 << 12),
+	/* Custom optimization: pinned-waiting accounting (bit 14 avoids upstream conflict) */
+	LAVD_FLAG_PINNED_WAITING	= (0x1 << 14),
 };
 
 /*
@@ -175,7 +183,8 @@ struct task_ctx {
 
 	/*
 	 * BBRv3-inspired stability tracking for fast path optimization.
-	 * These fields fit in the 4-byte padding at end of cacheline 2.
+	 * These fields occupy the 4-byte padding at end of cacheline 2,
+	 * enabling scheduler fast-path when task behavior is stable.
 	 */
 	u8	stable_rounds;		/* consecutive stable scheduling rounds */
 	u8	try_fast_path;		/* fast path eligible flag (BBRv3 style) */
@@ -280,7 +289,7 @@ struct cpu_ctx {
 	volatile u64	cpu_release_clk; /* when the CPU is taken by higher-priority scheduler class */
 	volatile u32	avg_stolen_est;	/* Average of estimated steal/irq utilization of CPU */
 	volatile u32	cur_stolen_est;	/* Estimated irq/steal utilization of the current interval */
-	volatile u64	stolen_time_est; /* Estimated time stolen by steal/irq time on CPU */
+	volatile u64	stolen_time_est; /* Estimated time stolen by steal/irq */
 	volatile u64	idle_total;	/* total idle time so far */
 	volatile u64	idle_start_clk;	/* when the CPU becomes idle */
 	u64		online_clk;	/* when a CPU becomes online */

@@ -5,7 +5,8 @@
  * Author: Changwoo Min <changwoo@igalia.com>
  */
 #include <scx/common.bpf.h>
-#include <scx/bpf_arena_common.bpf.h>
+#include <bpf_arena_common.bpf.h>
+#include <bpf_experimental.h>
 #include "intf.h"
 #include "lavd.bpf.h"
 #include "util.bpf.h"
@@ -633,6 +634,7 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 	};
 	struct cpu_ctx *cpuc_prev = NULL;
 	struct cpu_ctx *cpuc_new = NULL;
+	struct task_struct *waker;
 	task_ctx *taskc;
 	struct cpu_ctx *cpuc_cur;
 	bool found_idle = false;
@@ -656,6 +658,17 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		set_task_flag(taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
 	else
 		reset_task_flag(taskc, LAVD_FLAG_IS_SYNC_WAKEUP);
+
+	if (unlikely((bpf_in_hardirq() || bpf_in_nmi()) &&
+		     !bpf_in_serving_softirq())) {
+		set_task_flag(taskc, LAVD_FLAG_WOKEN_BY_HARDIRQ);
+		reset_task_flag(taskc, LAVD_FLAG_WOKEN_BY_SOFTIRQ);
+	} else if (unlikely(bpf_in_serving_softirq() ||
+			    ((waker = bpf_get_current_task_btf()) &&
+			     is_ksoftirqd(waker)))) {
+		set_task_flag(taskc, LAVD_FLAG_WOKEN_BY_SOFTIRQ);
+		reset_task_flag(taskc, LAVD_FLAG_WOKEN_BY_HARDIRQ);
+	}
 
 	nrcpu = READ_ONCE(nr_cpu_ids);
 
@@ -1152,8 +1165,14 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 	if (enq_flags & (SCX_ENQ_PREEMPT | SCX_ENQ_REENQ | SCX_ENQ_LAST))
 		return;
 
+	if (bpf_in_hardirq() || bpf_in_serving_softirq() || bpf_in_nmi())
+		return;
+
 	waker = bpf_get_current_task_btf();
 	if (!waker)
+		return;
+
+	if (is_ksoftirqd(waker))
 		return;
 
 	if ((p->real_parent != waker->real_parent))
