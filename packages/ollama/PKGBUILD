@@ -1,25 +1,20 @@
 pkgbase=ollama
 pkgname=(ollama ollama-rocm ollama-vulkan)
-pkgver=0.14.3
-pkgrel=3.1
-pkgdesc='Create, run and share large language models (LLMs) with PGO (gfx900 only)'
+pkgver=0.15.2
+pkgrel=4
+pkgdesc='Create, run and share large language models (LLMs) - PGO optimized (gfx900)'
 arch=(x86_64)
 url='https://github.com/ollama/ollama'
 license=(MIT)
-options=('!lto')
-makedepends=(cmake ninja git go rocm-hip-sdk hipblas clblast jq bc)
+options=('!lto' '!debug')
+makedepends=(cmake ninja git go rocm-hip-sdk hipblas clblast jq bc python curl)
 source=(git+https://github.com/ollama/ollama#tag=v$pkgver
         ollama-ld.conf
         ollama.service
         sysusers.conf
         tmpfiles.d
         workload.txt)
-b2sums=('SKIP'
-        'SKIP'
-        'SKIP'
-        'SKIP'
-        'SKIP'
-        'SKIP')
+b2sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
 
 prepare() {
   cd ollama
@@ -28,159 +23,210 @@ prepare() {
 
 build() {
   cd ollama
-  local BUILD_DIR="$(pwd)/build"
-  local PGO_DATA_DIR="$(pwd)/pgo_profiles"
-  mkdir -p "$PGO_DATA_DIR"
-  find . -name "*.profraw" -delete
-  find . -name "*.profdata" -delete
+  local _build="${PWD}/build"
+  local _pgo="${PWD}/pgo_data"
+  local _gpu="gfx900"
 
-  local ORIGINAL_CFLAGS="$CFLAGS"
-  local ORIGINAL_CXXFLAGS="$CXXFLAGS"
-  local ORIGINAL_LDFLAGS="$LDFLAGS"
+  mkdir -p "$_pgo"
+  rm -f "${_pgo}"/*.profraw "${_pgo}"/*.profdata 2>/dev/null || true
 
-  ##################################################
-  msg "=== PHASE 1: Build INSTRUMENTED C++ Libraries ==="
-  ##################################################
+  local _cflags="$CFLAGS"
+  local _cxxflags="$CXXFLAGS"
+  local _ldflags="$LDFLAGS"
 
-  export CFLAGS="${ORIGINAL_CFLAGS} -fprofile-generate"
-  export CXXFLAGS="${ORIGINAL_CXXFLAGS} -fprofile-generate"
-  export LDFLAGS="${ORIGINAL_LDFLAGS} -fprofile-generate"
-  export LLVM_PROFILE_FILE="${PGO_DATA_DIR}/ollama-%p.profraw"
+  local _pgo_inst_flags="-fprofile-generate=${_pgo} -mllvm -vp-counters-per-site=16"
 
-  msg "Configuring C++/HIP components with instrumentation..."
-  rm -rf build
+  msg2 "Phase 1: Instrumented C++ build"
+  export CFLAGS="${_pgo_inst_flags}"
+  export CXXFLAGS="${_pgo_inst_flags}"
+  export LDFLAGS="-fprofile-generate=${_pgo}"
+  export LLVM_PROFILE_FILE="${_pgo}/%p-%m.profraw"
 
-  # Use AMDGPU_TARGETS as it is explicitly required by this version of ollama's CMakeLists.txt
   cmake -B build -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=/usr \
     -DCMAKE_PREFIX_PATH=/opt/rocm \
-    -DAMDGPU_TARGETS="gfx900" \
-    -DGPU_TARGETS="gfx900"
-
-  msg "Building instrumented C++/HIP libraries..."
+    -DCMAKE_C_FLAGS="$CFLAGS" \
+    -DCMAKE_CXX_FLAGS="$CXXFLAGS" \
+    -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS" \
+    -DCMAKE_SHARED_LINKER_FLAGS="$LDFLAGS" \
+    -DCMAKE_MODULE_LINKER_FLAGS="$LDFLAGS" \
+    -DAMDGPU_TARGETS="$_gpu" \
+    -DGPU_TARGETS="$_gpu"
   cmake --build build
 
-  msg "Building Go binary against instrumented libraries..."
+  msg2 "Phase 1b: Instrumented Go binary"
+  export CGO_CFLAGS="$_cflags"
+  export CGO_CXXFLAGS="$_cxxflags"
+  export CGO_LDFLAGS="-L${_build}/lib/ollama"
+  export GOPATH="$srcdir"
+  export GOFLAGS="-buildmode=pie -mod=readonly -modcacherw -trimpath -buildvcs=false"
   unset CFLAGS CXXFLAGS LDFLAGS
-  export CGO_CFLAGS="${ORIGINAL_CFLAGS}"
-  export CGO_CXXFLAGS="${ORIGINAL_CXXFLAGS}"
-  export CGO_LDFLAGS="${ORIGINAL_LDFLAGS} -L${BUILD_DIR}/lib/ollama"
 
-  export GOPATH="${srcdir}"
-  export GOFLAGS="-buildmode=pie -mod=readonly -modcacherw '-ldflags=-linkmode=external -compressdwarf=false -X=github.com/ollama/ollama/version.Version=$pkgver -X=github.com/ollama/ollama/server.mode=release' -trimpath -buildvcs=false"
+  go build -ldflags="-linkmode=external \
+    -X=github.com/ollama/ollama/version.Version=${pkgver} \
+    -X=github.com/ollama/ollama/server.mode=release" \
+    -o ollama-inst .
 
-  go build -o ollama-pgo .
-  msg "Instrumented build completed."
+  msg2 "Phase 2: Profile generation"
+  local _port _host
+  _port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
+  _host="127.0.0.1:${_port}"
 
+  LD_LIBRARY_PATH="${_build}/lib/ollama" OLLAMA_HOST="$_host" ./ollama-inst serve &
+  local _pid=$!
 
-  ##################################################
-  msg "=== PHASE 2: PROFILE GENERATION RUN (GPU & ALL CORES) ==="
-  ##################################################
-
-  local ollama_port
-  ollama_port=$(python -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')
-  local ollama_host="127.0.0.1:$ollama_port"
-  local SERVER_LOG="${PGO_DATA_DIR}/server.log"
-
-  msg "Starting instrumented server with GPU library path..."
-  LD_LIBRARY_PATH="${BUILD_DIR}/lib/ollama" OLLAMA_HOST="$ollama_host" OLLAMA_DEBUG=1 ./ollama-pgo serve > "$SERVER_LOG" 2>&1 &
-  local ollama_pid=$!
-
-  for i in {1..20}; do if curl -s "http://$ollama_host/api/version" >/dev/null; then break; fi; sleep 0.5; done
-  if ! ps -p $ollama_pid >/dev/null; then error "Server process terminated." && cat "$SERVER_LOG" && return 1; fi
-  local MODEL_NAME
-  MODEL_NAME=$(curl -s "http://$ollama_host/api/tags" | jq -r '.models[0].name')
-  if [[ -z "$MODEL_NAME" || "$MODEL_NAME" == "null" ]]; then error "No Ollama models found." && kill -9 $ollama_pid && return 1; fi
-  msg "Using model '$MODEL_NAME' for PGO workload."
-  while IFS= read -r prompt || [[ -n "$prompt" ]]; do
-    [[ "$prompt" =~ ^#.* || -z "$prompt" ]] && continue
-    msg "--> Running prompt: ${prompt:0:80}..."
-    local payload
-    payload=$(jq -n --arg model "$MODEL_NAME" --arg prompt "$prompt" --argjson threads "$(nproc)" '{"model": $model, "prompt": $prompt, "options": {"num_predict": 128, "num_thread": $threads}, "stream": false}')
-    local response
-    response=$(curl -s -X POST "http://$ollama_host/api/generate" -d "$payload")
-    local eval_count eval_duration_ns
-    eval_count=$(echo "$response" | jq '.eval_count')
-    eval_duration_ns=$(echo "$response" | jq '.eval_duration')
-    if [ "$eval_count" != "null" ] && [ "$eval_duration_ns" -gt 0 ]; then
-      local eval_duration_s tps
-      eval_duration_s=$(echo "scale=2; $eval_duration_ns / 1000000000" | bc)
-      tps=$(echo "scale=1; $eval_count / $eval_duration_s" | bc)
-      msg "    OK (${eval_count} tokens, ${tps} t/s)"
+  local _ready=0 _i
+  for _i in {1..60}; do
+    if curl -sf "http://${_host}/api/version" &>/dev/null; then
+      _ready=1
+      break
     fi
-  done < ../workload.txt
-  msg "PGO workload finished."
-  kill $ollama_pid
-  wait $ollama_pid 2>/dev/null
+    sleep 0.5
+  done
 
+  if (( _ready )); then
+    local _model
+    _model=$(curl -sf "http://${_host}/api/tags" | jq -r '.models[0].name // empty')
+    if [[ -n "$_model" ]]; then
+      msg2 "Training with model: $_model"
+      msg2 "─────────────────────────────────────────────"
+      local _total_tokens=0 _total_time=0
+      while IFS= read -r _prompt || [[ -n "$_prompt" ]]; do
+        [[ "$_prompt" =~ ^#.*$ || -z "$_prompt" ]] && continue
+        local _prompt_short="${_prompt:0:60}"
+        [[ ${#_prompt} -gt 60 ]] && _prompt_short="${_prompt_short}..."
 
-  ##################################################
-  msg "=== PHASE 3: MERGE PROFILE DATA ==="
-  ##################################################
+        local _resp
+        _resp=$(curl -sf -X POST "http://${_host}/api/generate" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -nc --arg m "$_model" --arg p "$_prompt" \
+            '{model:$m,prompt:$p,options:{num_predict:256,num_thread:'"$(nproc)"'},stream:false}')" 2>/dev/null)
 
-  local PGO_SUCCESS=false
-  mapfile -t PROFRAW_FILES < <(find . -name "*.profraw")
+        if [[ -n "$_resp" ]]; then
+          local _eval_count _eval_dur _prompt_count _prompt_dur
+          _eval_count=$(echo "$_resp" | jq -r '.eval_count // 0')
+          _eval_dur=$(echo "$_resp" | jq -r '.eval_duration // 0')
+          _prompt_count=$(echo "$_resp" | jq -r '.prompt_eval_count // 0')
+          _prompt_dur=$(echo "$_resp" | jq -r '.prompt_eval_duration // 0')
 
-  if [ ${#PROFRAW_FILES[@]} -gt 0 ]; then
-      msg "Found ${#PROFRAW_FILES[@]} profile files. Merging..."
-      llvm-profdata merge -output="${PGO_DATA_DIR}/ollama.profdata" "${PROFRAW_FILES[@]}" && PGO_SUCCESS=true
-  fi
-  if [ "$PGO_SUCCESS" = false ]; then
-      warning "No profile data generated. Skipping PGO optimizations."
-  fi
+          if (( _eval_dur > 0 )); then
+            local _tps _prompt_tps
+            _tps=$(echo "scale=2; $_eval_count / ($_eval_dur / 1000000000)" | bc)
+            _total_tokens=$(( _total_tokens + _eval_count ))
+            _total_time=$(echo "$_total_time + $_eval_dur" | bc)
 
+            local _prompt_info=""
+            if (( _prompt_dur > 0 )); then
+              _prompt_tps=$(echo "scale=2; $_prompt_count / ($_prompt_dur / 1000000000)" | bc)
+              _prompt_info=" | prompt: ${_prompt_count}t @ ${_prompt_tps} t/s"
+            fi
 
-  ##################################################
-  msg "=== PHASE 4: Build OPTIMIZED Libraries and Final Binary ==="
-  ##################################################
+            msg2 "→ ${_prompt_short}"
+            msg2 "  eval: ${_eval_count} tokens @ ${_tps} t/s${_prompt_info}"
+          fi
+        fi
+      done < "${srcdir}/workload.txt"
 
-  msg "Rebuilding C++/HIP libraries with PGO data..."
-  if [ "$PGO_SUCCESS" = true ]; then
-      export CFLAGS="${ORIGINAL_CFLAGS} -fprofile-use=${PGO_DATA_DIR}/ollama.profdata"
-      export CXXFLAGS="${ORIGINAL_CXXFLAGS} -fprofile-use=${PGO_DATA_DIR}/ollama.profdata"
-      export LDFLAGS="${ORIGINAL_LDFLAGS} -fprofile-use=${PGO_DATA_DIR}/ollama.profdata"
+      msg2 "─────────────────────────────────────────────"
+      if (( _total_time > 0 )); then
+        local _avg_tps
+        _avg_tps=$(echo "scale=2; $_total_tokens / ($_total_time / 1000000000)" | bc)
+        msg2 "PGO workload complete: ${_total_tokens} total tokens @ ${_avg_tps} avg t/s"
+      else
+        msg2 "PGO workload complete"
+      fi
+    else
+      warning "No models found for PGO training"
+    fi
   else
-      export CFLAGS="$ORIGINAL_CFLAGS"; export CXXFLAGS="$ORIGINAL_CXXFLAGS"; export LDFLAGS="$ORIGINAL_LDFLAGS"
-      warning "Building C++/HIP libraries without PGO."
+    warning "Server failed to start"
   fi
 
-  cmake -B build -DAMDGPU_TARGETS="gfx900" -DGPU_TARGETS="gfx900" -DCMAKE_PREFIX_PATH=/opt/rocm
+  if kill -0 $_pid 2>/dev/null; then
+    kill -TERM $_pid 2>/dev/null || true
+    local _t=20
+    while (( _t-- > 0 )) && kill -0 $_pid 2>/dev/null; do sleep 0.5; done
+    kill -9 $_pid 2>/dev/null || true
+  fi
+  wait $_pid 2>/dev/null || true
+  sync
+  sleep 2
+
+  msg2 "Phase 3: Merge profiles"
+  local _pgo_ok=0
+  local _profs=("${_pgo}"/*.profraw)
+  if [[ -e "${_profs[0]}" ]]; then
+    msg2 "Found ${#_profs[@]} profile files"
+    if llvm-profdata merge -output="${_pgo}/merged.profdata" "${_profs[@]}"; then
+      _pgo_ok=1
+      local _pdata_size
+      _pdata_size=$(du -h "${_pgo}/merged.profdata" | cut -f1)
+      msg2 "Profile merge successful (${_pdata_size})"
+    fi
+  fi
+
+  msg2 "Phase 4: Optimized C++ build (PGO+LTO)"
+  rm -rf build
+
+  if (( _pgo_ok )); then
+    export CFLAGS="${_cflags} -fprofile-use=${_pgo}/merged.profdata"
+    export CXXFLAGS="${_cxxflags} -fprofile-use=${_pgo}/merged.profdata"
+    export LDFLAGS="${_ldflags} -fprofile-use=${_pgo}/merged.profdata"
+    msg2 "Applying PGO data to optimized build"
+  else
+    warning "Building without PGO"
+    export CFLAGS="$_cflags"
+    export CXXFLAGS="$_cxxflags"
+    export LDFLAGS="$_ldflags"
+  fi
+
+  cmake -B build -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_PREFIX_PATH=/opt/rocm \
+    -DCMAKE_C_FLAGS="$CFLAGS" \
+    -DCMAKE_CXX_FLAGS="$CXXFLAGS" \
+    -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS" \
+    -DCMAKE_SHARED_LINKER_FLAGS="$LDFLAGS" \
+    -DCMAKE_MODULE_LINKER_FLAGS="$LDFLAGS" \
+    -DAMDGPU_TARGETS="$_gpu" \
+    -DGPU_TARGETS="$_gpu"
   cmake --build build
 
-  msg "Building final Go binary against optimized libraries..."
+  msg2 "Phase 5: Final Go binary"
+  export CGO_CFLAGS="$_cflags"
+  export CGO_CXXFLAGS="$_cxxflags"
+  export CGO_LDFLAGS="-L${_build}/lib/ollama ${_ldflags}"
   unset CFLAGS CXXFLAGS LDFLAGS
-  export CGO_CFLAGS="${ORIGINAL_CFLAGS}"
-  export CGO_CXXFLAGS="${ORIGINAL_CXXFLAGS}"
-  export CGO_LDFLAGS="${ORIGINAL_LDFLAGS} -L${BUILD_DIR}/lib/ollama"
 
-  go build .
-  msg "✓ Optimized build complete."
+  go build -ldflags="-s -w -linkmode=external \
+    -X=github.com/ollama/ollama/version.Version=${pkgver} \
+    -X=github.com/ollama/ollama/server.mode=release" .
+
+  msg2 "Build complete"
 }
 
 package_ollama() {
   DESTDIR="$pkgdir" cmake --install ollama/build --component CPU
-
-  install -Dm755 $pkgname/ollama "$pkgdir/usr/bin/ollama"
+  install -Dm755 ollama/ollama "$pkgdir/usr/bin/ollama"
   install -dm755 "$pkgdir/var/lib/ollama"
   install -Dm644 ollama.service "$pkgdir/usr/lib/systemd/system/ollama.service"
   install -Dm644 sysusers.conf "$pkgdir/usr/lib/sysusers.d/ollama.conf"
   install -Dm644 tmpfiles.d "$pkgdir/usr/lib/tmpfiles.d/ollama.conf"
   install -Dm644 ollama/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-
   ln -s /var/lib/ollama "$pkgdir/usr/share/ollama"
 }
 
 package_ollama-rocm() {
-  pkgdesc='Create, run and share large language models (LLMs) with ROCm'
-  depends+=(ollama hipblas)
-
+  pkgdesc='Ollama ROCm/HIP backend (gfx900)'
+  depends=(ollama hipblas)
   DESTDIR="$pkgdir" cmake --install ollama/build --component HIP
-  rm -rf "$pkgdir"/usr/lib/ollama/rocm/rocblas/library
+  rm -rf "$pkgdir/usr/lib/ollama/rocm/rocblas/library"
 }
 
 package_ollama-vulkan() {
-  pkgdesc='Create, run and share large language models (LLMs) with Vulkan'
+  pkgdesc='Ollama Vulkan backend'
   depends=(ollama vulkan-icd-loader)
-
   DESTDIR="$pkgdir" cmake --install ollama/build --component Vulkan
 }
