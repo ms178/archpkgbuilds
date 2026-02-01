@@ -5629,3 +5629,2114 @@ index 3ea5c092bba7..0430646a3a05 100644
  #define	XHCI_MAX_INTERVAL	16
 --
 2.34.1
+
+From: Ionut Nechita <ionut_n2001@yahoo.com>
+
+When the tick is already stopped and the predicted idle duration is short
+(< TICK_NSEC), the original code uses next_timer_ns directly. This can be
+too conservative on platforms with high C-state exit latencies.
+
+On Intel server platforms (2022+), this causes excessive wakeup latencies
+(~150us) when the actual idle duration is much shorter than next_timer_ns,
+because the governor selects package C-states (PC6) when shallower states
+would be more appropriate.
+
+Add a 25% safety margin to the prediction instead of using next_timer_ns
+directly, while still clamping to next_timer_ns to avoid selecting
+unnecessarily deep states.
+
+Testing shows this reduces qperf latency from 151us to ~30us on affected
+platforms while maintaining good power efficiency. Platforms with fast
+C-state transitions (Ice Lake: 12us, Skylake: 21us) see minimal impact.
+
+Cc: stable@vger.kernel.org
+Signed-off-by: Ionut Nechita <ionut_n2001@yahoo.com>
+---
+ drivers/cpuidle/governors/menu.c | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/cpuidle/governors/menu.c b/drivers/cpuidle/governors/menu.c
+index 64d6f7a1c776..de1dd46fea7a 100644
+--- a/drivers/cpuidle/governors/menu.c
++++ b/drivers/cpuidle/governors/menu.c
+@@ -287,12 +287,20 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
+ 	/*
+ 	 * If the tick is already stopped, the cost of possible short idle
+ 	 * duration misprediction is much higher, because the CPU may be stuck
+-	 * in a shallow idle state for a long time as a result of it.  In that
+-	 * case, say we might mispredict and use the known time till the closest
+-	 * timer event for the idle state selection.
++	 * in a shallow idle state for a long time as a result of it.
++	 *
++	 * Add a 25% safety margin to the prediction to reduce the risk of
++	 * selecting too shallow state, but clamp to next_timer to avoid
++	 * selecting unnecessarily deep states.
++	 *
++	 * This helps on platforms with high C-state exit latencies (e.g.,
++	 * Intel server platforms 2022+ with ~150us) where using next_timer
++	 * directly causes excessive wakeup latency when the actual idle
++	 * duration is much shorter.
+ 	 */
+ 	if (tick_nohz_tick_stopped() && predicted_ns < TICK_NSEC)
+-		predicted_ns = data->next_timer_ns;
++		predicted_ns = min(predicted_ns + (predicted_ns >> 2),
++				   data->next_timer_ns);
+ 
+ 	/*
+ 	 * Find the idle state with the lowest power while satisfying
+-- 
+2.52.0
+
+--- a/drivers/cpuidle/governors/menu.c
++++ b/drivers/cpuidle/governors/menu.c
+@@ -21,56 +22,16 @@
+ 
+ #define BUCKETS 6
+ #define INTERVAL_SHIFT 3
+-#define INTERVALS (1UL << INTERVAL_SHIFT)
+-#define RESOLUTION 1024
+-#define DECAY 8
+-#define MAX_INTERESTING (50000 * NSEC_PER_USEC)
+-
+-/*
+- * Concepts and ideas behind the menu governor
+- *
+- * For the menu governor, there are 2 decision factors for picking a C
+- * state:
+- * 1) Energy break even point
+- * 2) Latency tolerance (from pmqos infrastructure)
+- * These two factors are treated independently.
+- *
+- * Energy break even point
+- * -----------------------
+- * C state entry and exit have an energy cost, and a certain amount of time in
+- * the  C state is required to actually break even on this cost. CPUIDLE
+- * provides us this duration in the "target_residency" field. So all that we
+- * need is a good prediction of how long we'll be idle. Like the traditional
+- * menu governor, we take the actual known "next timer event" time.
+- *
+- * Since there are other source of wakeups (interrupts for example) than
+- * the next timer event, this estimation is rather optimistic. To get a
+- * more realistic estimate, a correction factor is applied to the estimate,
+- * that is based on historic behavior. For example, if in the past the actual
+- * duration always was 50% of the next timer tick, the correction factor will
+- * be 0.5.
+- *
+- * menu uses a running average for this correction factor, but it uses a set of
+- * factors, not just a single factor. This stems from the realization that the
+- * ratio is dependent on the order of magnitude of the expected duration; if we
+- * expect 500 milliseconds of idle time the likelihood of getting an interrupt
+- * very early is much higher than if we expect 50 micro seconds of idle time.
+- * For this reason, menu keeps an array of 6 independent factors, that gets
+- * indexed based on the magnitude of the expected duration.
+- *
+- * Repeatable-interval-detector
+- * ----------------------------
+- * There are some cases where "next timer" is a completely unusable predictor:
+- * Those cases where the interval is fixed, for example due to hardware
+- * interrupt mitigation, but also due to fixed transfer rate devices like mice.
+- * For this, we use a different predictor: We track the duration of the last 8
+- * intervals and use them to estimate the duration of the next one.
+- */
++#define INTERVALS (1U << INTERVAL_SHIFT)
++#define INTERVAL_MASK (INTERVALS - 1U)
++#define RESOLUTION 1024U
++#define DECAY 8U
++#define MAX_INTERESTING (50000ULL * NSEC_PER_USEC)
++#define PREDICTION_FACTOR_DIVISOR (RESOLUTION * DECAY * NSEC_PER_USEC)
+ 
+ struct menu_device {
+-	int             needs_update;
+-	int             tick_wakeup;
+-
++	int		needs_update;
++	int		tick_wakeup;
+ 	u64		next_timer_ns;
+ 	unsigned int	bucket;
+ 	unsigned int	correction_factor[BUCKETS];
+@@ -78,77 +39,62 @@ struct menu_device {
+ 	int		interval_ptr;
+ };
+ 
+-static inline int which_bucket(u64 duration_ns)
+-{
+-	int bucket = 0;
++static DEFINE_PER_CPU(struct menu_device, menu_devices);
+ 
+-	if (duration_ns < 10ULL * NSEC_PER_USEC)
+-		return bucket;
+-	if (duration_ns < 100ULL * NSEC_PER_USEC)
+-		return bucket + 1;
+-	if (duration_ns < 1000ULL * NSEC_PER_USEC)
+-		return bucket + 2;
+-	if (duration_ns < 10000ULL * NSEC_PER_USEC)
+-		return bucket + 3;
+-	if (duration_ns < 100000ULL * NSEC_PER_USEC)
+-		return bucket + 4;
+-	return bucket + 5;
++static __always_inline int which_bucket(u64 duration_ns)
++{
++	return (int)((duration_ns >= 10ULL * NSEC_PER_USEC) +
++		     (duration_ns >= 100ULL * NSEC_PER_USEC) +
++		     (duration_ns >= 1000ULL * NSEC_PER_USEC) +
++		     (duration_ns >= 10000ULL * NSEC_PER_USEC) +
++		     (duration_ns >= 100000ULL * NSEC_PER_USEC));
+ }
+ 
+-static DEFINE_PER_CPU(struct menu_device, menu_devices);
+-
+-static void menu_update_intervals(struct menu_device *data, unsigned int interval_us)
++static __always_inline void menu_update_intervals(struct menu_device *data,
++						  unsigned int interval_us)
+ {
+-	/* Update the repeating-pattern data. */
+-	data->intervals[data->interval_ptr++] = interval_us;
+-	if (data->interval_ptr >= INTERVALS)
+-		data->interval_ptr = 0;
++	unsigned int ptr = (unsigned int)data->interval_ptr;
++
++	data->intervals[ptr] = interval_us;
++	data->interval_ptr = (int)((ptr + 1U) & INTERVAL_MASK);
+ }
+ 
+ static void menu_update(struct cpuidle_driver *drv, struct cpuidle_device *dev);
+ 
+-/*
+- * Try detecting repeating patterns by keeping track of the last 8
+- * intervals, and checking if the standard deviation of that set
+- * of points is below a threshold. If it is... then use the
+- * average of these 8 points as the estimated value.
+- */
+ static unsigned int get_typical_interval(struct menu_device *data)
+ {
+-	s64 value, min_thresh = -1, max_thresh = UINT_MAX;
++	const unsigned int * const intervals = data->intervals;
++	s64 min_thresh = -1;
++	s64 max_thresh = (s64)UINT_MAX;
+ 	unsigned int max, min, divisor;
+ 	u64 avg, variance, avg_sq;
+-	int i;
++	unsigned int i;
+ 
+ again:
+-	/* Compute the average and variance of past intervals. */
+ 	max = 0;
+ 	min = UINT_MAX;
+ 	avg = 0;
+ 	variance = 0;
+ 	divisor = 0;
++
+ 	for (i = 0; i < INTERVALS; i++) {
+-		value = data->intervals[i];
+-		/*
+-		 * Discard the samples outside the interval between the min and
+-		 * max thresholds.
+-		 */
++		unsigned int raw = intervals[i];
++		s64 value = (s64)raw;
++
+ 		if (value <= min_thresh || value >= max_thresh)
+ 			continue;
+ 
+ 		divisor++;
++		avg += raw;
++		variance += (u64)raw * raw;
+ 
+-		avg += value;
+-		variance += value * value;
+-
+-		if (value > max)
+-			max = value;
+-
+-		if (value < min)
+-			min = value;
++		if (raw > max)
++			max = raw;
++		if (raw < min)
++			min = raw;
+ 	}
+ 
+-	if (!max)
++	if (max == 0)
+ 		return UINT_MAX;
+ 
+ 	if (divisor == INTERVALS) {
+@@ -160,152 +106,97 @@ again:
+ 	}
+ 
+ 	avg_sq = avg * avg;
+-	variance -= avg_sq;
++	if (variance >= avg_sq)
++		variance -= avg_sq;
++	else
++		variance = 0;
+ 
+-	/*
+-	 * The typical interval is obtained when standard deviation is
+-	 * small (stddev <= 20 us, variance <= 400 us^2) or standard
+-	 * deviation is small compared to the average interval (avg >
+-	 * 6*stddev, avg^2 > 36*variance). The average is smaller than
+-	 * UINT_MAX aka U32_MAX, so computing its square does not
+-	 * overflow a u64. We simply reject this candidate average if
+-	 * the standard deviation is greater than 715 s (which is
+-	 * rather unlikely).
+-	 *
+-	 * Use this result only if there is no timer to wake us up sooner.
+-	 */
+-	if (likely(variance <= U64_MAX/36)) {
++	if (likely(variance <= U64_MAX / 36)) {
+ 		if ((avg_sq > variance * 36 && divisor * 4 >= INTERVALS * 3) ||
+ 		    variance <= 400)
+-			return avg;
++			return (unsigned int)avg;
+ 	}
+ 
+-	/*
+-	 * If there are outliers, discard them by setting thresholds to exclude
+-	 * data points at a large enough distance from the average, then
+-	 * calculate the average and standard deviation again. Once we get
+-	 * down to the last 3/4 of our samples, stop excluding samples.
+-	 *
+-	 * This can deal with workloads that have long pauses interspersed
+-	 * with sporadic activity with a bunch of short pauses.
+-	 *
+-	 * However, if the number of remaining samples is too small to exclude
+-	 * any more outliers, allow the deepest available idle state to be
+-	 * selected because there are systems where the time spent by CPUs in
+-	 * deep idle states is correlated to the maximum frequency the CPUs
+-	 * can get to.  On those systems, shallow idle states should be avoided
+-	 * unless there is a clear indication that the given CPU is most likley
+-	 * going to be woken up shortly.
+-	 */
+ 	if (divisor * 4 <= INTERVALS * 3)
+ 		return UINT_MAX;
+ 
+-	/* Update the thresholds for the next round. */
+ 	if (avg - min > max - avg)
+-		min_thresh = min;
++		min_thresh = (s64)min;
+ 	else
+-		max_thresh = max;
++		max_thresh = (s64)max;
+ 
+ 	goto again;
+ }
+ 
+-/**
+- * menu_select - selects the next idle state to enter
+- * @drv: cpuidle driver containing state data
+- * @dev: the CPU
+- * @stop_tick: indication on whether or not to stop the tick
+- */
+ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
+ 		       bool *stop_tick)
+ {
+ 	struct menu_device *data = this_cpu_ptr(&menu_devices);
+ 	s64 latency_req = cpuidle_governor_latency_req(dev->cpu);
++	unsigned int typical_us;
++	u64 next_timer_ns;
+ 	u64 predicted_ns;
+-	ktime_t delta, delta_tick;
++	unsigned int bucket;
++	ktime_t delta_tick;
+ 	int i, idx;
+ 
+ 	if (data->needs_update) {
+ 		menu_update(drv, dev);
+ 		data->needs_update = 0;
+-	} else if (!dev->last_residency_ns) {
+-		/*
+-		 * This happens when the driver rejects the previously selected
+-		 * idle state and returns an error, so update the recent
+-		 * intervals table to prevent invalid information from being
+-		 * used going forward.
+-		 */
++	} else if (dev->last_residency_ns == 0) {
+ 		menu_update_intervals(data, UINT_MAX);
+ 	}
+ 
+-	/* Find the shortest expected idle interval. */
+-	predicted_ns = get_typical_interval(data) * NSEC_PER_USEC;
++	typical_us = get_typical_interval(data);
++	predicted_ns = (u64)typical_us * NSEC_PER_USEC;
++
+ 	if (predicted_ns > RESIDENCY_THRESHOLD_NS) {
++		unsigned int correction;
+ 		unsigned int timer_us;
++		u64 numerator;
++		ktime_t delta;
+ 
+-		/* Determine the time till the closest timer. */
+ 		delta = tick_nohz_get_sleep_length(&delta_tick);
+ 		if (unlikely(delta < 0)) {
+ 			delta = 0;
+ 			delta_tick = 0;
+ 		}
+ 
+-		data->next_timer_ns = delta;
+-		data->bucket = which_bucket(data->next_timer_ns);
++		next_timer_ns = (u64)delta;
++		bucket = (unsigned int)which_bucket(next_timer_ns);
++		correction = data->correction_factor[bucket];
++
++		data->next_timer_ns = next_timer_ns;
++		data->bucket = bucket;
++
++		numerator = PREDICTION_FACTOR_DIVISOR / 2 +
++			    next_timer_ns * correction;
++		timer_us = (unsigned int)div_u64(numerator,
++						 PREDICTION_FACTOR_DIVISOR);
+ 
+-		/* Round up the result for half microseconds. */
+-		timer_us = div_u64((RESOLUTION * DECAY * NSEC_PER_USEC) / 2 +
+-					data->next_timer_ns *
+-						data->correction_factor[data->bucket],
+-				   RESOLUTION * DECAY * NSEC_PER_USEC);
+-		/* Use the lowest expected idle interval to pick the idle state. */
+ 		predicted_ns = min((u64)timer_us * NSEC_PER_USEC, predicted_ns);
+ 	} else {
+-		/*
+-		 * Because the next timer event is not going to be determined
+-		 * in this case, assume that without the tick the closest timer
+-		 * will be in distant future and that the closest tick will occur
+-		 * after 1/2 of the tick period.
+-		 */
+-		data->next_timer_ns = KTIME_MAX;
++		next_timer_ns = KTIME_MAX;
+ 		delta_tick = TICK_NSEC / 2;
+-		data->bucket = BUCKETS - 1;
++		bucket = BUCKETS - 1;
++		data->next_timer_ns = next_timer_ns;
++		data->bucket = bucket;
+ 	}
+ 
+ 	if (unlikely(drv->state_count <= 1 || latency_req == 0) ||
+-	    ((data->next_timer_ns < drv->states[1].target_residency_ns ||
++	    ((next_timer_ns < drv->states[1].target_residency_ns ||
+ 	      latency_req < drv->states[1].exit_latency_ns) &&
+ 	     !dev->states_usage[0].disable)) {
+-		/*
+-		 * In this case state[0] will be used no matter what, so return
+-		 * it right away and keep the tick running if state[0] is a
+-		 * polling one.
+-		 */
+ 		*stop_tick = !(drv->states[0].flags & CPUIDLE_FLAG_POLLING);
+ 		return 0;
+ 	}
+ 
+-	/*
+-	 * If the tick is already stopped, the cost of possible short idle
+-	 * duration misprediction is much higher, because the CPU may be stuck
+-	 * in a shallow idle state for a long time as a result of it.
+-	 *
+-	 * Add a 25% safety margin to the prediction to reduce the risk of
+-	 * selecting too shallow state, but clamp to next_timer to avoid
+-	 * selecting unnecessarily deep states.
+-	 *
+-	 * This helps on platforms with high C-state exit latencies (e.g.,
+-	 * Intel server platforms 2022+ with ~150us) where using next_timer
+-	 * directly causes excessive wakeup latency when the actual idle
+-	 * duration is much shorter.
+-	 */
+-	if (tick_nohz_tick_stopped() && predicted_ns < TICK_NSEC)
+-		predicted_ns = min(predicted_ns + (predicted_ns >> 2),
+-				   data->next_timer_ns);
+-
+-	/*
+-	 * Find the idle state with the lowest power while satisfying
+-	 * our constraints.
+-	 */
++	if (tick_nohz_tick_stopped() && predicted_ns < TICK_NSEC) {
++		u64 margin = predicted_ns >> 2;
++
++		predicted_ns = min(predicted_ns + margin, next_timer_ns);
++	}
++
+ 	idx = -1;
+ 	for (i = 0; i < drv->state_count; i++) {
+ 		struct cpuidle_state *s = &drv->states[i];
+@@ -314,7 +205,7 @@ static int menu_select(struct cpuidle_dr
+ 			continue;
+ 
+ 		if (idx == -1)
+-			idx = i; /* first enabled state */
++			idx = i;
+ 
+ 		if (s->exit_latency_ns > latency_req)
+ 			break;
+@@ -324,14 +215,8 @@ static int menu_select(struct cpuidle_dr
+ 			continue;
+ 		}
+ 
+-		/*
+-		 * Use a physical idle state, not busy polling, unless a timer
+-		 * is going to trigger soon enough or the exit latency of the
+-		 * idle state in question is greater than the predicted idle
+-		 * duration.
+-		 */
+ 		if ((drv->states[idx].flags & CPUIDLE_FLAG_POLLING) &&
+-		    s->target_residency_ns <= data->next_timer_ns &&
++		    s->target_residency_ns <= next_timer_ns &&
+ 		    s->exit_latency_ns <= predicted_ns) {
+ 			predicted_ns = s->target_residency_ns;
+ 			idx = i;
+@@ -342,22 +227,10 @@ static int menu_select(struct cpuidle_dr
+ 			break;
+ 
+ 		if (!tick_nohz_tick_stopped()) {
+-			/*
+-			 * If the state selected so far is shallow, waking up
+-			 * early won't hurt, so retain the tick in that case and
+-			 * let the governor run again in the next iteration of
+-			 * the idle loop.
+-			 */
+ 			predicted_ns = drv->states[idx].target_residency_ns;
+ 			break;
+ 		}
+ 
+-		/*
+-		 * If the state selected so far is shallow and this state's
+-		 * target residency matches the time till the closest timer
+-		 * event, select this one to avoid getting stuck in the shallow
+-		 * one for too long.
+-		 */
+ 		if (drv->states[idx].target_residency_ns < TICK_NSEC &&
+ 		    s->target_residency_ns <= delta_tick)
+ 			idx = i;
+@@ -366,29 +239,21 @@ static int menu_select(struct cpuidle_dr
+ 	}
+ 
+ 	if (idx == -1)
+-		idx = 0; /* No states enabled. Must use 0. */
++		idx = 0;
+ 
+-	/*
+-	 * Don't stop the tick if the selected state is a polling one or if the
+-	 * expected idle duration is shorter than the tick period length.
+-	 */
+ 	if (((drv->states[idx].flags & CPUIDLE_FLAG_POLLING) ||
+ 	     predicted_ns < TICK_NSEC) && !tick_nohz_tick_stopped()) {
+ 		*stop_tick = false;
+ 
+-		if (idx > 0 && drv->states[idx].target_residency_ns > delta_tick) {
+-			/*
+-			 * The tick is not going to be stopped and the target
+-			 * residency of the state to be returned is not within
+-			 * the time until the next timer event including the
+-			 * tick, so try to correct that.
+-			 */
++		if (idx > 0 &&
++		    drv->states[idx].target_residency_ns > delta_tick) {
+ 			for (i = idx - 1; i >= 0; i--) {
+ 				if (dev->states_usage[i].disable)
+ 					continue;
+ 
+ 				idx = i;
+-				if (drv->states[i].target_residency_ns <= delta_tick)
++				if (drv->states[i].target_residency_ns <=
++				    delta_tick)
+ 					break;
+ 			}
+ 		}
+@@ -397,14 +262,6 @@ static int menu_select(struct cpuidle_dr
+ 	return idx;
+ }
+ 
+-/**
+- * menu_reflect - records that data structures need update
+- * @dev: the CPU
+- * @index: the index of actual entered state
+- *
+- * NOTE: it's important to be fast here because this operation will add to
+- *       the overall exit latency.
+- */
+ static void menu_reflect(struct cpuidle_device *dev, int index)
+ {
+ 	struct menu_device *data = this_cpu_ptr(&menu_devices);
+@@ -414,132 +271,73 @@ static void menu_reflect(struct cpuidle_
+ 	data->tick_wakeup = tick_nohz_idle_got_tick();
+ }
+ 
+-/**
+- * menu_update - attempts to guess what happened after entry
+- * @drv: cpuidle driver containing state data
+- * @dev: the CPU
+- */
+ static void menu_update(struct cpuidle_driver *drv, struct cpuidle_device *dev)
+ {
+ 	struct menu_device *data = this_cpu_ptr(&menu_devices);
+ 	int last_idx = dev->last_state_idx;
+ 	struct cpuidle_state *target = &drv->states[last_idx];
+-	u64 measured_ns;
++	u64 next_timer_ns = data->next_timer_ns;
++	unsigned int bucket = data->bucket;
+ 	unsigned int new_factor;
++	u64 measured_ns;
+ 
+-	/*
+-	 * Try to figure out how much time passed between entry to low
+-	 * power state and occurrence of the wakeup event.
+-	 *
+-	 * If the entered idle state didn't support residency measurements,
+-	 * we use them anyway if they are short, and if long,
+-	 * truncate to the whole expected time.
+-	 *
+-	 * Any measured amount of time will include the exit latency.
+-	 * Since we are interested in when the wakeup begun, not when it
+-	 * was completed, we must subtract the exit latency. However, if
+-	 * the measured amount of time is less than the exit latency,
+-	 * assume the state was never reached and the exit latency is 0.
+-	 */
+-
+-	if (data->tick_wakeup && data->next_timer_ns > TICK_NSEC) {
+-		/*
+-		 * The nohz code said that there wouldn't be any events within
+-		 * the tick boundary (if the tick was stopped), but the idle
+-		 * duration predictor had a differing opinion.  Since the CPU
+-		 * was woken up by a tick (that wasn't stopped after all), the
+-		 * predictor was not quite right, so assume that the CPU could
+-		 * have been idle long (but not forever) to help the idle
+-		 * duration predictor do a better job next time.
+-		 */
++	if (data->tick_wakeup && next_timer_ns > TICK_NSEC) {
+ 		measured_ns = 9 * MAX_INTERESTING / 10;
+ 	} else if ((drv->states[last_idx].flags & CPUIDLE_FLAG_POLLING) &&
+ 		   dev->poll_time_limit) {
+-		/*
+-		 * The CPU exited the "polling" state due to a time limit, so
+-		 * the idle duration prediction leading to the selection of that
+-		 * state was inaccurate.  If a better prediction had been made,
+-		 * the CPU might have been woken up from idle by the next timer.
+-		 * Assume that to be the case.
+-		 */
+-		measured_ns = data->next_timer_ns;
++		measured_ns = next_timer_ns;
+ 	} else {
+-		/* measured value */
+ 		measured_ns = dev->last_residency_ns;
+ 
+-		/* Deduct exit latency */
+ 		if (measured_ns > 2 * target->exit_latency_ns)
+ 			measured_ns -= target->exit_latency_ns;
+ 		else
+ 			measured_ns /= 2;
+ 	}
+ 
+-	/* Make sure our coefficients do not exceed unity */
+-	if (measured_ns > data->next_timer_ns)
+-		measured_ns = data->next_timer_ns;
++	if (measured_ns > next_timer_ns)
++		measured_ns = next_timer_ns;
+ 
+-	/* Update our correction ratio */
+-	new_factor = data->correction_factor[data->bucket];
++	new_factor = data->correction_factor[bucket];
+ 	new_factor -= new_factor / DECAY;
+ 
+-	if (data->next_timer_ns > 0 && measured_ns < MAX_INTERESTING)
+-		new_factor += div64_u64(RESOLUTION * measured_ns,
+-					data->next_timer_ns);
+-	else
+-		/*
+-		 * we were idle so long that we count it as a perfect
+-		 * prediction
+-		 */
++	if (next_timer_ns > 0 && measured_ns < MAX_INTERESTING) {
++		new_factor += (unsigned int)div64_u64(RESOLUTION * measured_ns,
++						      next_timer_ns);
++	} else {
+ 		new_factor += RESOLUTION;
++	}
+ 
+-	/*
+-	 * We don't want 0 as factor; we always want at least
+-	 * a tiny bit of estimated time. Fortunately, due to rounding,
+-	 * new_factor will stay nonzero regardless of measured_us values
+-	 * and the compiler can eliminate this test as long as DECAY > 1.
+-	 */
+ 	if (DECAY == 1 && unlikely(new_factor == 0))
+ 		new_factor = 1;
+ 
+-	data->correction_factor[data->bucket] = new_factor;
++	data->correction_factor[bucket] = new_factor;
+ 
+-	menu_update_intervals(data, ktime_to_us(measured_ns));
++	menu_update_intervals(data, (unsigned int)ktime_to_us(measured_ns));
+ }
+ 
+-/**
+- * menu_enable_device - scans a CPU's states and does setup
+- * @drv: cpuidle driver
+- * @dev: the CPU
+- */
+ static int menu_enable_device(struct cpuidle_driver *drv,
+-				struct cpuidle_device *dev)
++			      struct cpuidle_device *dev)
+ {
+ 	struct menu_device *data = &per_cpu(menu_devices, dev->cpu);
+-	int i;
++	unsigned int i;
+ 
+-	memset(data, 0, sizeof(struct menu_device));
++	memset(data, 0, sizeof(*data));
+ 
+-	/*
+-	 * if the correction factor is 0 (eg first time init or cpu hotplug
+-	 * etc), we actually want to start out with a unity factor.
+-	 */
+-	for(i = 0; i < BUCKETS; i++)
++	for (i = 0; i < BUCKETS; i++)
+ 		data->correction_factor[i] = RESOLUTION * DECAY;
+ 
+ 	return 0;
+ }
+ 
+ static struct cpuidle_governor menu_governor = {
+-	.name =		"menu",
+-	.rating =	20,
+-	.enable =	menu_enable_device,
+-	.select =	menu_select,
+-	.reflect =	menu_reflect,
++	.name		= "menu",
++	.rating		= 20,
++	.enable		= menu_enable_device,
++	.select		= menu_select,
++	.reflect	= menu_reflect,
+ };
+ 
+-/**
+- * init_menu - initializes the governor
+- */
+ static int __init init_menu(void)
+ {
+ 	return cpuidle_register_governor(&menu_governor);
+
+
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+index 998bd807fc7bad..b83a06739b5118 100644
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -821,8 +821,6 @@ __bad_area_nosemaphore(struct pt_regs *regs, unsigned long error_code,
+ 		force_sig_pkuerr((void __user *)address, pkey);
+ 	else
+ 		force_sig_fault(SIGSEGV, si_code, (void __user *)address);
+-
+-	local_irq_disable();
+ }
+ 
+ static noinline void
+@@ -1474,15 +1472,12 @@ handle_page_fault(struct pt_regs *regs, unsigned long error_code,
+ 		do_kern_addr_fault(regs, error_code, address);
+ 	} else {
+ 		do_user_addr_fault(regs, error_code, address);
+-		/*
+-		 * User address page fault handling might have reenabled
+-		 * interrupts. Fixing up all potential exit points of
+-		 * do_user_addr_fault() and its leaf functions is just not
+-		 * doable w/o creating an unholy mess or turning the code
+-		 * upside down.
+-		 */
+-		local_irq_disable();
+ 	}
++	/*
++	 * page fault handling might have reenabled interrupts,
++	 * make sure to disable them again.
++	 */
++	local_irq_disable();
+ }
+ 
+ DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_fault)
+
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c 
+@@ -4,154 +4,133 @@
+  *  Copyright (C) 2001, 2002 Andi Kleen, SuSE Labs.
+  *  Copyright (C) 2008-2009, Red Hat Inc., Ingo Molnar
+  */
+-#include <linux/sched.h>		/* test_thread_flag(), ...	*/
+-#include <linux/sched/task_stack.h>	/* task_stack_*(), ...		*/
+-#include <linux/kdebug.h>		/* oops_begin/end, ...		*/
+-#include <linux/memblock.h>		/* max_low_pfn			*/
+-#include <linux/kfence.h>		/* kfence_handle_page_fault	*/
+-#include <linux/kprobes.h>		/* NOKPROBE_SYMBOL, ...		*/
+-#include <linux/mmiotrace.h>		/* kmmio_handler, ...		*/
+-#include <linux/perf_event.h>		/* perf_sw_event		*/
+-#include <linux/hugetlb.h>		/* hstate_index_to_shift	*/
+-#include <linux/context_tracking.h>	/* exception_enter(), ...	*/
+-#include <linux/uaccess.h>		/* faulthandler_disabled()	*/
+-#include <linux/efi.h>			/* efi_crash_gracefully_on_page_fault()*/
++#include <linux/sched.h>
++#include <linux/sched/task_stack.h>
++#include <linux/kdebug.h>
++#include <linux/memblock.h>
++#include <linux/kfence.h>
++#include <linux/kprobes.h>
++#include <linux/mmiotrace.h>
++#include <linux/perf_event.h>
++#include <linux/hugetlb.h>
++#include <linux/context_tracking.h>
++#include <linux/uaccess.h>
++#include <linux/efi.h>
+ #include <linux/mm_types.h>
+-#include <linux/mm.h>			/* find_and_lock_vma() */
++#include <linux/mm.h>
+ #include <linux/vmalloc.h>
++#include <linux/jump_label.h>
+ 
+-#include <asm/cpufeature.h>		/* boot_cpu_has, ...		*/
+-#include <asm/traps.h>			/* dotraplinkage, ...		*/
+-#include <asm/fixmap.h>			/* VSYSCALL_ADDR		*/
+-#include <asm/vsyscall.h>		/* emulate_vsyscall		*/
+-#include <asm/vm86.h>			/* struct vm86			*/
+-#include <asm/mmu_context.h>		/* vma_pkey()			*/
+-#include <asm/efi.h>			/* efi_crash_gracefully_on_page_fault()*/
+-#include <asm/desc.h>			/* store_idt(), ...		*/
+-#include <asm/cpu_entry_area.h>		/* exception stack		*/
+-#include <asm/pgtable_areas.h>		/* VMALLOC_START, ...		*/
+-#include <asm/kvm_para.h>		/* kvm_handle_async_pf		*/
+-#include <asm/vdso.h>			/* fixup_vdso_exception()	*/
++#include <asm/cpufeature.h>
++#include <asm/traps.h>
++#include <asm/fixmap.h>
++#include <asm/vsyscall.h>
++#include <asm/vm86.h>
++#include <asm/mmu_context.h>
++#include <asm/efi.h>
++#include <asm/desc.h>
++#include <asm/cpu_entry_area.h>
++#include <asm/pgtable_areas.h>
++#include <asm/kvm_para.h>
++#include <asm/vdso.h>
+ #include <asm/irq_stack.h>
+ #include <asm/fred.h>
+-#include <asm/sev.h>			/* snp_dump_hva_rmpentry()	*/
++#include <asm/sev.h>
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/exceptions.h>
+ 
+-/*
+- * Returns 0 if mmiotrace is disabled, or if the fault is not
+- * handled by mmiotrace:
+- */
++#ifdef CONFIG_CPU_SUP_AMD
++static DEFINE_STATIC_KEY_FALSE(amd_k8_pre_npt_key);
++
++static int __init init_amd_k8_erratum_key(void)
++{
++	const struct cpuinfo_x86 *c = &boot_cpu_data;
++
++	if (c->x86_vendor == X86_VENDOR_AMD &&
++	    c->x86 == 0xf &&
++	    c->x86_model < 0x40)
++		static_branch_enable(&amd_k8_pre_npt_key);
++
++	return 0;
++}
++early_initcall(init_amd_k8_erratum_key);
++
++static __always_inline bool is_amd_k8_pre_npt(void)
++{
++	return static_branch_unlikely(&amd_k8_pre_npt_key);
++}
++#else
++static __always_inline bool is_amd_k8_pre_npt(void)
++{
++	return false;
++}
++#endif
++
+ static nokprobe_inline int
+ kmmio_fault(struct pt_regs *regs, unsigned long addr)
+ {
+-	if (unlikely(is_kmmio_active()))
++	if (unlikely(is_kmmio_active())) {
+ 		if (kmmio_handler(regs, addr) == 1)
+ 			return -1;
++	}
+ 	return 0;
+ }
+ 
+-/*
+- * Prefetch quirks:
+- *
+- * 32-bit mode:
+- *
+- *   Sometimes AMD Athlon/Opteron CPUs report invalid exceptions on prefetch.
+- *   Check that here and ignore it.  This is AMD erratum #91.
+- *
+- * 64-bit mode:
+- *
+- *   Sometimes the CPU reports invalid exceptions on prefetch.
+- *   Check that here and ignore it.
+- *
+- * Opcode checker based on code by Richard Brunner.
+- */
+-static inline int
++static __always_inline int
+ check_prefetch_opcode(struct pt_regs *regs, unsigned char *instr,
+ 		      unsigned char opcode, int *prefetch)
+ {
+-	unsigned char instr_hi = opcode & 0xf0;
+-	unsigned char instr_lo = opcode & 0x0f;
++	const unsigned char instr_hi = opcode & 0xf0;
++	const unsigned char instr_lo = opcode & 0x0f;
+ 
+ 	switch (instr_hi) {
+ 	case 0x20:
+ 	case 0x30:
+-		/*
+-		 * Values 0x26,0x2E,0x36,0x3E are valid x86 prefixes.
+-		 * In X86_64 long mode, the CPU will signal invalid
+-		 * opcode if some of these prefixes are present so
+-		 * X86_64 will never get here anyway
+-		 */
+-		return ((instr_lo & 7) == 0x6);
++		return (instr_lo & 7) == 0x6;
+ #ifdef CONFIG_X86_64
+ 	case 0x40:
+-		/*
+-		 * In 64-bit mode 0x40..0x4F are valid REX prefixes
+-		 */
+-		return (!user_mode(regs) || user_64bit_mode(regs));
++		return !user_mode(regs) || user_64bit_mode(regs);
+ #endif
+ 	case 0x60:
+-		/* 0x64 thru 0x67 are valid prefixes in all modes. */
+ 		return (instr_lo & 0xC) == 0x4;
+ 	case 0xF0:
+-		/* 0xF0, 0xF2, 0xF3 are valid prefixes in all modes. */
+-		return !instr_lo || (instr_lo>>1) == 1;
++		return !instr_lo || (instr_lo >> 1) == 1;
+ 	case 0x00:
+-		/* Prefetch instruction is 0x0F0D or 0x0F18 */
+-		if (get_kernel_nofault(opcode, instr))
+-			return 0;
++		if (instr_lo == 0xF) {
++			unsigned char next_opcode;
+ 
+-		*prefetch = (instr_lo == 0xF) &&
+-			(opcode == 0x0D || opcode == 0x18);
++			if (get_kernel_nofault(next_opcode, instr))
++				return 0;
++			*prefetch = (next_opcode == 0x0D || next_opcode == 0x18);
++		}
+ 		return 0;
+ 	default:
+ 		return 0;
+ 	}
+ }
+ 
+-static bool is_amd_k8_pre_npt(void)
+-{
+-	struct cpuinfo_x86 *c = &boot_cpu_data;
+-
+-	return unlikely(IS_ENABLED(CONFIG_CPU_SUP_AMD) &&
+-			c->x86_vendor == X86_VENDOR_AMD &&
+-			c->x86 == 0xf && c->x86_model < 0x40);
+-}
+-
+-static int
+-is_prefetch(struct pt_regs *regs, unsigned long error_code, unsigned long addr)
++static noinline int
++__is_prefetch_slowpath(struct pt_regs *regs, unsigned long error_code,
++		       unsigned long addr)
+ {
+-	unsigned char *max_instr;
+ 	unsigned char *instr;
++	unsigned char *max_instr;
+ 	int prefetch = 0;
+ 
+-	/* Erratum #91 affects AMD K8, pre-NPT CPUs */
+-	if (!is_amd_k8_pre_npt())
+-		return 0;
+-
+-	/*
+-	 * If it was a exec (instruction fetch) fault on NX page, then
+-	 * do not ignore the fault:
+-	 */
+ 	if (error_code & X86_PF_INSTR)
+ 		return 0;
+ 
+-	instr = (void *)convert_ip_to_linear(current, regs);
++	instr = (unsigned char *)convert_ip_to_linear(current, regs);
+ 	max_instr = instr + 15;
+ 
+-	/*
+-	 * This code has historically always bailed out if IP points to a
+-	 * not-present page (e.g. due to a race).  No one has ever
+-	 * complained about this.
+-	 */
+ 	pagefault_disable();
+ 
+ 	while (instr < max_instr) {
+ 		unsigned char opcode;
+ 
+ 		if (user_mode(regs)) {
+-			if (get_user(opcode, (unsigned char __user *) instr))
++			if (get_user(opcode, (unsigned char __user *)instr))
+ 				break;
+ 		} else {
+ 			if (get_kernel_nofault(opcode, instr))
+@@ -168,17 +147,29 @@ is_prefetch(struct pt_regs *regs, unsign
+ 	return prefetch;
+ }
+ 
++static __always_inline int
++is_prefetch(struct pt_regs *regs, unsigned long error_code, unsigned long addr)
++{
++	if (!is_amd_k8_pre_npt())
++		return 0;
++
++	return __is_prefetch_slowpath(regs, error_code, addr);
++}
++
+ DEFINE_SPINLOCK(pgd_lock);
+ LIST_HEAD(pgd_list);
+ 
+ #ifdef CONFIG_X86_32
+ static inline pmd_t *vmalloc_sync_one(pgd_t *pgd, unsigned long address)
+ {
+-	unsigned index = pgd_index(address);
++	const unsigned int index = pgd_index(address);
+ 	pgd_t *pgd_k;
+-	p4d_t *p4d, *p4d_k;
+-	pud_t *pud, *pud_k;
+-	pmd_t *pmd, *pmd_k;
++	p4d_t *p4d;
++	p4d_t *p4d_k;
++	pud_t *pud;
++	pud_t *pud_k;
++	pmd_t *pmd;
++	pmd_t *pmd_k;
+ 
+ 	pgd += index;
+ 	pgd_k = init_mm.pgd + index;
+@@ -186,11 +177,6 @@ static inline pmd_t *vmalloc_sync_one(pg
+ 	if (!pgd_present(*pgd_k))
+ 		return NULL;
+ 
+-	/*
+-	 * set_pgd(pgd, *pgd_k); here would be useless on PAE
+-	 * and redundant with the set_pmd() on non-PAE. As would
+-	 * set_p4d/set_pud.
+-	 */
+ 	p4d = p4d_offset(pgd, address);
+ 	p4d_k = p4d_offset(pgd_k, address);
+ 	if (!p4d_present(*p4d_k))
+@@ -209,43 +195,21 @@ static inline pmd_t *vmalloc_sync_one(pg
+ 
+ 	if (!pmd_present(*pmd_k))
+ 		return NULL;
+-	else
+-		BUG_ON(pmd_pfn(*pmd) != pmd_pfn(*pmd_k));
++
++	BUG_ON(pmd_pfn(*pmd) != pmd_pfn(*pmd_k));
+ 
+ 	return pmd_k;
+ }
+ 
+-/*
+- *   Handle a fault on the vmalloc or module mapping area
+- *
+- *   This is needed because there is a race condition between the time
+- *   when the vmalloc mapping code updates the PMD to the point in time
+- *   where it synchronizes this update with the other page-tables in the
+- *   system.
+- *
+- *   In this race window another thread/CPU can map an area on the same
+- *   PMD, finds it already present and does not synchronize it with the
+- *   rest of the system yet. As a result v[mz]alloc might return areas
+- *   which are not mapped in every page-table in the system, causing an
+- *   unhandled page-fault when they are accessed.
+- */
+ static noinline int vmalloc_fault(unsigned long address)
+ {
+ 	unsigned long pgd_paddr;
+ 	pmd_t *pmd_k;
+ 	pte_t *pte_k;
+ 
+-	/* Make sure we are in vmalloc area: */
+-	if (!(address >= VMALLOC_START && address < VMALLOC_END))
++	if (address < VMALLOC_START || address >= VMALLOC_END)
+ 		return -1;
+ 
+-	/*
+-	 * Synchronize this task's top level page-table
+-	 * with the 'reference' page table.
+-	 *
+-	 * Do _not_ use "current" here. We might be inside
+-	 * an interrupt in the middle of a task switch..
+-	 */
+ 	pgd_paddr = read_cr3_pa();
+ 	pmd_k = vmalloc_sync_one(__va(pgd_paddr), address);
+ 	if (!pmd_k)
+@@ -275,7 +239,6 @@ void arch_sync_kernel_mappings(unsigned
+ 		list_for_each_entry(page, &pgd_list, lru) {
+ 			spinlock_t *pgt_lock;
+ 
+-			/* the pgt_lock only for Xen */
+ 			pgt_lock = &pgd_page_get_mm(page)->page_table_lock;
+ 
+ 			spin_lock(pgt_lock);
+@@ -286,7 +249,7 @@ void arch_sync_kernel_mappings(unsigned
+ 	}
+ }
+ 
+-static bool low_pfn(unsigned long pfn)
++static __always_inline bool low_pfn(unsigned long pfn)
+ {
+ 	return pfn < max_low_pfn;
+ }
+@@ -311,36 +274,30 @@ static void dump_pagetable(unsigned long
+ 	p4d = p4d_offset(pgd, address);
+ 	pud = pud_offset(p4d, address);
+ 	pmd = pmd_offset(pud, address);
+-	pr_pde("*pde = %0*Lx ", sizeof(*pmd) * 2, (u64)pmd_val(*pmd));
++	pr_pde("*pde = %0*Lx ", (int)(sizeof(*pmd) * 2), (u64)pmd_val(*pmd));
+ #undef pr_pde
+ 
+-	/*
+-	 * We must not directly access the pte in the highpte
+-	 * case if the page table is located in highmem.
+-	 * And let's rather not kmap-atomic the pte, just in case
+-	 * it's allocated already:
+-	 */
+ 	if (!low_pfn(pmd_pfn(*pmd)) || !pmd_present(*pmd) || pmd_leaf(*pmd))
+ 		goto out;
+ 
+ 	pte = pte_offset_kernel(pmd, address);
+-	pr_cont("*pte = %0*Lx ", sizeof(*pte) * 2, (u64)pte_val(*pte));
++	pr_cont("*pte = %0*Lx ", (int)(sizeof(*pte) * 2), (u64)pte_val(*pte));
+ out:
+ 	pr_cont("\n");
+ }
+ 
+-#else /* CONFIG_X86_64: */
++#else
+ 
+ #ifdef CONFIG_CPU_SUP_AMD
+ static const char errata93_warning[] =
+-KERN_ERR 
++KERN_ERR
+ "******* Your BIOS seems to not contain a fix for K8 errata #93\n"
+ "******* Working around it, but it may cause SEGVs or burn power.\n"
+ "******* Please consider a BIOS update.\n"
+ "******* Disabling USB legacy in the BIOS may also help.\n";
+ #endif
+ 
+-static int bad_address(void *p)
++static __always_inline int bad_address(void *p)
+ {
+ 	unsigned long dummy;
+ 
+@@ -400,27 +357,13 @@ bad:
+ 	pr_info("BAD\n");
+ }
+ 
+-#endif /* CONFIG_X86_64 */
++#endif
+ 
+-/*
+- * Workaround for K8 erratum #93 & buggy BIOS.
+- *
+- * BIOS SMM functions are required to use a specific workaround
+- * to avoid corruption of the 64bit RIP register on C stepping K8.
+- *
+- * A lot of BIOS that didn't get tested properly miss this.
+- *
+- * The OS sees this as a page fault with the upper 32bits of RIP cleared.
+- * Try to work around it here.
+- *
+- * Note we only handle faults in kernel here.
+- * Does nothing on 32-bit.
+- */
+ static int is_errata93(struct pt_regs *regs, unsigned long address)
+ {
+ #if defined(CONFIG_X86_64) && defined(CONFIG_CPU_SUP_AMD)
+-	if (boot_cpu_data.x86_vendor != X86_VENDOR_AMD
+-	    || boot_cpu_data.x86 != 0xf)
++	if (boot_cpu_data.x86_vendor != X86_VENDOR_AMD ||
++	    boot_cpu_data.x86 != 0xf)
+ 		return 0;
+ 
+ 	if (user_mode(regs))
+@@ -443,29 +386,23 @@ static int is_errata93(struct pt_regs *r
+ 	return 0;
+ }
+ 
+-/*
+- * Work around K8 erratum #100 K8 in compat mode occasionally jumps
+- * to illegal addresses >4GB.
+- *
+- * We catch this in the page fault handler because these addresses
+- * are not reachable. Just detect this case and return.  Any code
+- * segment in LDT is compatibility mode.
+- */
+-static int is_errata100(struct pt_regs *regs, unsigned long address)
++static __always_inline int
++is_errata100(struct pt_regs *regs, unsigned long address)
+ {
+ #ifdef CONFIG_X86_64
+-	if ((regs->cs == __USER32_CS || (regs->cs & (1<<2))) && (address >> 32))
++	if ((regs->cs == __USER32_CS || (regs->cs & (1 << 2))) &&
++	    (address >> 32))
+ 		return 1;
+ #endif
+ 	return 0;
+ }
+ 
+-/* Pentium F0 0F C7 C8 bug workaround: */
+ static int is_f00f_bug(struct pt_regs *regs, unsigned long error_code,
+ 		       unsigned long address)
+ {
+ #ifdef CONFIG_X86_F00F_BUG
+-	if (boot_cpu_has_bug(X86_BUG_F00F) && !(error_code & X86_PF_USER) &&
++	if (boot_cpu_has_bug(X86_BUG_F00F) &&
++	    !(error_code & X86_PF_USER) &&
+ 	    idt_is_f00f_address(address)) {
+ 		handle_invalid_op(regs);
+ 		return 1;
+@@ -476,7 +413,7 @@ static int is_f00f_bug(struct pt_regs *r
+ 
+ static void show_ldttss(const struct desc_ptr *gdt, const char *name, u16 index)
+ {
+-	u32 offset = (index >> 3) * sizeof(struct desc_struct);
++	u32 offset = ((u32)index >> 3) * sizeof(struct desc_struct);
+ 	unsigned long addr;
+ 	struct ldttss_desc desc;
+ 
+@@ -491,22 +428,26 @@ static void show_ldttss(const struct des
+ 	}
+ 
+ 	if (copy_from_kernel_nofault(&desc, (void *)(gdt->address + offset),
+-			      sizeof(struct ldttss_desc))) {
++				     sizeof(struct ldttss_desc))) {
+ 		pr_alert("%s: 0x%hx -- GDT entry is not readable\n",
+ 			 name, index);
+ 		return;
+ 	}
+ 
+-	addr = desc.base0 | (desc.base1 << 16) | ((unsigned long)desc.base2 << 24);
++	addr = desc.base0 |
++	       ((unsigned long)desc.base1 << 16) |
++	       ((unsigned long)desc.base2 << 24);
+ #ifdef CONFIG_X86_64
+ 	addr |= ((u64)desc.base3 << 32);
+ #endif
+ 	pr_alert("%s: 0x%hx -- base=0x%lx limit=0x%x\n",
+-		 name, index, addr, (desc.limit0 | (desc.limit1 << 16)));
++		 name, index, addr,
++		 (unsigned int)(desc.limit0 | ((unsigned int)desc.limit1 << 16)));
+ }
+ 
+ static void
+-show_fault_oops(struct pt_regs *regs, unsigned long error_code, unsigned long address)
++show_fault_oops(struct pt_regs *regs, unsigned long error_code,
++		unsigned long address)
+ {
+ 	if (!oops_may_print())
+ 		return;
+@@ -526,25 +467,25 @@ show_fault_oops(struct pt_regs *regs, un
+ 			pr_crit("kernel tried to execute NX-protected page - exploit attempt? (uid: %d)\n",
+ 				from_kuid(&init_user_ns, current_uid()));
+ 		if (pte && pte_present(*pte) && pte_exec(*pte) && !nx &&
+-				(pgd_flags(*pgd) & _PAGE_USER) &&
+-				(__read_cr4() & X86_CR4_SMEP))
++		    (pgd_flags(*pgd) & _PAGE_USER) &&
++		    (__read_cr4() & X86_CR4_SMEP))
+ 			pr_crit("unable to execute userspace code (SMEP?) (uid: %d)\n",
+ 				from_kuid(&init_user_ns, current_uid()));
+ 	}
+ 
+ 	if (address < PAGE_SIZE && !user_mode(regs))
+ 		pr_alert("BUG: kernel NULL pointer dereference, address: %px\n",
+-			(void *)address);
++			 (void *)address);
+ 	else
+ 		pr_alert("BUG: unable to handle page fault for address: %px\n",
+-			(void *)address);
++			 (void *)address);
+ 
+ 	pr_alert("#PF: %s %s in %s mode\n",
+ 		 (error_code & X86_PF_USER)  ? "user" : "supervisor",
+ 		 (error_code & X86_PF_INSTR) ? "instruction fetch" :
+ 		 (error_code & X86_PF_WRITE) ? "write access" :
+ 					       "read access",
+-			     user_mode(regs) ? "user" : "kernel");
++		 user_mode(regs) ? "user" : "kernel");
+ 	pr_alert("#PF: error_code(0x%04lx) - %s\n", error_code,
+ 		 !(error_code & X86_PF_PROT) ? "not-present page" :
+ 		 (error_code & X86_PF_RSVD)  ? "reserved bit violation" :
+@@ -556,19 +497,7 @@ show_fault_oops(struct pt_regs *regs, un
+ 		struct desc_ptr idt, gdt;
+ 		u16 ldtr, tr;
+ 
+-		/*
+-		 * This can happen for quite a few reasons.  The more obvious
+-		 * ones are faults accessing the GDT, or LDT.  Perhaps
+-		 * surprisingly, if the CPU tries to deliver a benign or
+-		 * contributory exception from user code and gets a page fault
+-		 * during delivery, the page fault can be delivered as though
+-		 * it originated directly from user code.  This could happen
+-		 * due to wrong permissions on the IDT, GDT, LDT, TSS, or
+-		 * kernel or IST stack.
+-		 */
+ 		store_idt(&idt);
+-
+-		/* Usable even on Xen PV -- it's just slow. */
+ 		native_store_gdt(&gdt);
+ 
+ 		pr_alert("IDT: 0x%lx (limit=0x%hx) GDT: 0x%lx (limit=0x%hx)\n",
+@@ -609,24 +538,15 @@ pgtable_bad(struct pt_regs *regs, unsign
+ 	oops_end(flags, regs, sig);
+ }
+ 
+-static void sanitize_error_code(unsigned long address,
+-				unsigned long *error_code)
++static __always_inline void
++sanitize_error_code(unsigned long address, unsigned long *error_code)
+ {
+-	/*
+-	 * To avoid leaking information about the kernel page
+-	 * table layout, pretend that user-mode accesses to
+-	 * kernel addresses are always protection faults.
+-	 *
+-	 * NB: This means that failed vsyscalls with vsyscall=none
+-	 * will have the PROT bit.  This doesn't leak any
+-	 * information and does not appear to cause any problems.
+-	 */
+ 	if (address >= TASK_SIZE_MAX)
+ 		*error_code |= X86_PF_PROT;
+ }
+ 
+-static void set_signal_archinfo(unsigned long address,
+-				unsigned long error_code)
++static __always_inline void
++set_signal_archinfo(unsigned long address, unsigned long error_code)
+ {
+ 	struct task_struct *tsk = current;
+ 
+@@ -645,59 +565,29 @@ page_fault_oops(struct pt_regs *regs, un
+ 	unsigned long flags;
+ 	int sig;
+ 
+-	if (user_mode(regs)) {
+-		/*
+-		 * Implicit kernel access from user mode?  Skip the stack
+-		 * overflow and EFI special cases.
+-		 */
++	if (user_mode(regs))
+ 		goto oops;
+-	}
+ 
+ #ifdef CONFIG_VMAP_STACK
+-	/*
+-	 * Stack overflow?  During boot, we can fault near the initial
+-	 * stack in the direct map, but that's not an overflow -- check
+-	 * that we're in vmalloc space to avoid this.
+-	 */
+ 	if (is_vmalloc_addr((void *)address) &&
+ 	    get_stack_guard_info((void *)address, &info)) {
+-		/*
+-		 * We're likely to be running with very little stack space
+-		 * left.  It's plausible that we'd hit this condition but
+-		 * double-fault even before we get this far, in which case
+-		 * we're fine: the double-fault handler will deal with it.
+-		 *
+-		 * We don't want to make it all the way into the oops code
+-		 * and then double-fault, though, because we're likely to
+-		 * break the console driver and lose most of the stack dump.
+-		 */
+-		call_on_stack(__this_cpu_ist_top_va(DF) - sizeof(void*),
++		call_on_stack(__this_cpu_ist_top_va(DF) - sizeof(void *),
+ 			      handle_stack_overflow,
+ 			      ASM_CALL_ARG3,
+ 			      , [arg1] "r" (regs), [arg2] "r" (address), [arg3] "r" (&info));
+ 
+-		BUG();
++		unreachable();
+ 	}
+ #endif
+ 
+-	/*
+-	 * Buggy firmware could access regions which might page fault.  If
+-	 * this happens, EFI has a special OOPS path that will try to
+-	 * avoid hanging the system.
+-	 */
+ 	if (IS_ENABLED(CONFIG_EFI))
+ 		efi_crash_gracefully_on_page_fault(address);
+ 
+-	/* Only not-present faults should be handled by KFENCE. */
+ 	if (!(error_code & X86_PF_PROT) &&
+ 	    kfence_handle_page_fault(address, error_code & X86_PF_WRITE, regs))
+ 		return;
+ 
+ oops:
+-	/*
+-	 * Oops. The kernel tried to access some bad page. We'll have to
+-	 * terminate things with extreme prejudice:
+-	 */
+ 	flags = oops_begin();
+ 
+ 	show_fault_oops(regs, error_code, address);
+@@ -709,7 +599,6 @@ oops:
+ 	if (__die("Oops", regs, error_code))
+ 		sig = 0;
+ 
+-	/* Executive summary in case the body of the oops scrolled away */
+ 	printk(KERN_DEFAULT "CR2: %016lx\n", address);
+ 
+ 	oops_end(flags, regs, sig);
+@@ -722,30 +611,20 @@ kernelmode_fixup_or_oops(struct pt_regs
+ {
+ 	WARN_ON_ONCE(user_mode(regs));
+ 
+-	/* Are we prepared to handle this kernel fault? */
+ 	if (fixup_exception(regs, X86_TRAP_PF, error_code, address))
+ 		return;
+ 
+-	/*
+-	 * AMD erratum #91 manifests as a spurious page fault on a PREFETCH
+-	 * instruction.
+-	 */
+ 	if (is_prefetch(regs, error_code, address))
+ 		return;
+ 
+ 	page_fault_oops(regs, error_code, address);
+ }
+ 
+-/*
+- * Print out info about fatal segfaults, if the show_unhandled_signals
+- * sysctl is set:
+- */
+ static inline void
+ show_signal_msg(struct pt_regs *regs, unsigned long error_code,
+ 		unsigned long address, struct task_struct *tsk)
+ {
+ 	const char *loglvl = task_pid_nr(tsk) > 1 ? KERN_INFO : KERN_EMERG;
+-	/* This is a racy snapshot, but it's better than nothing. */
+ 	int cpu = raw_smp_processor_id();
+ 
+ 	if (!unhandled_signal(tsk, SIGSEGV))
+@@ -755,18 +634,13 @@ show_signal_msg(struct pt_regs *regs, un
+ 		return;
+ 
+ 	printk("%s%s[%d]: segfault at %lx ip %px sp %px error %lx",
+-		loglvl, tsk->comm, task_pid_nr(tsk), address,
+-		(void *)regs->ip, (void *)regs->sp, error_code);
++	       loglvl, tsk->comm, task_pid_nr(tsk), address,
++	       (void *)regs->ip, (void *)regs->sp, error_code);
+ 
+ 	print_vma_addr(KERN_CONT " in ", regs->ip);
+ 
+-	/*
+-	 * Dump the likely CPU where the fatal segfault happened.
+-	 * This can help identify faulty hardware.
+-	 */
+-	printk(KERN_CONT " likely on CPU %d (core %d, socket %d)", cpu,
+-	       topology_core_id(cpu), topology_physical_package_id(cpu));
+-
++	printk(KERN_CONT " likely on CPU %d (core %d, socket %d)",
++	       cpu, topology_core_id(cpu), topology_physical_package_id(cpu));
+ 
+ 	printk(KERN_CONT "\n");
+ 
+@@ -786,21 +660,12 @@ __bad_area_nosemaphore(struct pt_regs *r
+ 	}
+ 
+ 	if (!(error_code & X86_PF_USER)) {
+-		/* Implicit user access to kernel memory -- just oops */
+ 		page_fault_oops(regs, error_code, address);
+ 		return;
+ 	}
+ 
+-	/*
+-	 * User mode accesses just cause a SIGSEGV.
+-	 * It's possible to have interrupts off here:
+-	 */
+ 	local_irq_enable();
+ 
+-	/*
+-	 * Valid to do another page fault here because this one came
+-	 * from user space:
+-	 */
+ 	if (is_prefetch(regs, error_code, address))
+ 		return;
+ 
+@@ -835,10 +700,6 @@ __bad_area(struct pt_regs *regs, unsigne
+ 	   unsigned long address, struct mm_struct *mm,
+ 	   struct vm_area_struct *vma, u32 pkey, int si_code)
+ {
+-	/*
+-	 * Something tried to access memory that isn't in our memory map..
+-	 * Fix it, but check if it's kernel or user first..
+-	 */
+ 	if (mm)
+ 		mmap_read_unlock(mm);
+ 	else
+@@ -847,20 +708,23 @@ __bad_area(struct pt_regs *regs, unsigne
+ 	__bad_area_nosemaphore(regs, error_code, address, pkey, si_code);
+ }
+ 
+-static inline bool bad_area_access_from_pkeys(unsigned long error_code,
+-		struct vm_area_struct *vma)
++static __always_inline bool
++bad_area_access_from_pkeys(unsigned long error_code, struct vm_area_struct *vma)
+ {
+-	/* This code is always called on the current mm */
+-	bool foreign = false;
++	const bool foreign = false;
+ 
+ 	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
+ 		return false;
++
+ 	if (error_code & X86_PF_PK)
+ 		return true;
+-	/* this checks permission keys on the VMA: */
+-	if (!arch_vma_access_permitted(vma, (error_code & X86_PF_WRITE),
+-				       (error_code & X86_PF_INSTR), foreign))
++
++	if (!arch_vma_access_permitted(vma,
++				       (error_code & X86_PF_WRITE) != 0,
++				       (error_code & X86_PF_INSTR) != 0,
++				       foreign))
+ 		return true;
++
+ 	return false;
+ }
+ 
+@@ -869,32 +733,7 @@ bad_area_access_error(struct pt_regs *re
+ 		      unsigned long address, struct mm_struct *mm,
+ 		      struct vm_area_struct *vma)
+ {
+-	/*
+-	 * This OSPKE check is not strictly necessary at runtime.
+-	 * But, doing it this way allows compiler optimizations
+-	 * if pkeys are compiled out.
+-	 */
+ 	if (bad_area_access_from_pkeys(error_code, vma)) {
+-		/*
+-		 * A protection key fault means that the PKRU value did not allow
+-		 * access to some PTE.  Userspace can figure out what PKRU was
+-		 * from the XSAVE state.  This function captures the pkey from
+-		 * the vma and passes it to userspace so userspace can discover
+-		 * which protection key was set on the PTE.
+-		 *
+-		 * If we get here, we know that the hardware signaled a X86_PF_PK
+-		 * fault and that there was a VMA once we got in the fault
+-		 * handler.  It does *not* guarantee that the VMA we find here
+-		 * was the one that we faulted on.
+-		 *
+-		 * 1. T1   : mprotect_key(foo, PAGE_SIZE, pkey=4);
+-		 * 2. T1   : set PKRU to deny access to pkey=4, touches page
+-		 * 3. T1   : faults...
+-		 * 4.    T2: mprotect_key(foo, PAGE_SIZE, pkey=5);
+-		 * 5. T1   : enters fault handler, takes mmap_lock, etc...
+-		 * 6. T1   : reaches here, sees vma_pkey(vma)=5, when we really
+-		 *	     faulted on a pte with its pkey=4.
+-		 */
+ 		u32 pkey = vma_pkey(vma);
+ 
+ 		__bad_area(regs, error_code, address, mm, vma, pkey, SEGV_PKUERR);
+@@ -907,14 +746,12 @@ static void
+ do_sigbus(struct pt_regs *regs, unsigned long error_code, unsigned long address,
+ 	  vm_fault_t fault)
+ {
+-	/* Kernel mode? Handle exceptions or die: */
+ 	if (!user_mode(regs)) {
+ 		kernelmode_fixup_or_oops(regs, error_code, address,
+ 					 SIGBUS, BUS_ADRERR, ARCH_DEFAULT_PKEY);
+ 		return;
+ 	}
+ 
+-	/* User-space => ok to do another page fault: */
+ 	if (is_prefetch(regs, error_code, address))
+ 		return;
+ 
+@@ -926,25 +763,27 @@ do_sigbus(struct pt_regs *regs, unsigned
+ 	set_signal_archinfo(address, error_code);
+ 
+ #ifdef CONFIG_MEMORY_FAILURE
+-	if (fault & (VM_FAULT_HWPOISON|VM_FAULT_HWPOISON_LARGE)) {
++	if (fault & (VM_FAULT_HWPOISON | VM_FAULT_HWPOISON_LARGE)) {
+ 		struct task_struct *tsk = current;
+-		unsigned lsb = 0;
++		unsigned int lsb = 0;
++
++		pr_err("MCE: Killing %s:%d due to hardware memory corruption fault at %lx\n",
++		       tsk->comm, tsk->pid, address);
+ 
+-		pr_err(
+-	"MCE: Killing %s:%d due to hardware memory corruption fault at %lx\n",
+-			tsk->comm, tsk->pid, address);
+ 		if (fault & VM_FAULT_HWPOISON_LARGE)
+ 			lsb = hstate_index_to_shift(VM_FAULT_GET_HINDEX(fault));
+ 		if (fault & VM_FAULT_HWPOISON)
+ 			lsb = PAGE_SHIFT;
+-		force_sig_mceerr(BUS_MCEERR_AR, (void __user *)address, lsb);
++
++		force_sig_mceerr(BUS_MCEERR_AR, (void __user *)address, (short)lsb);
+ 		return;
+ 	}
+ #endif
+ 	force_sig_fault(SIGBUS, BUS_ADRERR, (void __user *)address);
+ }
+ 
+-static int spurious_kernel_fault_check(unsigned long error_code, pte_t *pte)
++static __always_inline int
++spurious_kernel_fault_check(unsigned long error_code, pte_t *pte)
+ {
+ 	if ((error_code & X86_PF_WRITE) && !pte_write(*pte))
+ 		return 0;
+@@ -955,27 +794,6 @@ static int spurious_kernel_fault_check(u
+ 	return 1;
+ }
+ 
+-/*
+- * Handle a spurious fault caused by a stale TLB entry.
+- *
+- * This allows us to lazily refresh the TLB when increasing the
+- * permissions of a kernel page (RO -> RW or NX -> X).  Doing it
+- * eagerly is very expensive since that implies doing a full
+- * cross-processor TLB flush, even if no stale TLB entries exist
+- * on other processors.
+- *
+- * Spurious faults may only occur if the TLB contains an entry with
+- * fewer permission than the page table entry.  Non-present (P = 0)
+- * and reserved bit (R = 1) faults are never spurious.
+- *
+- * There are no security implications to leaving a stale TLB when
+- * increasing the permissions on a page.
+- *
+- * Returns non-zero if a spurious fault was handled, zero otherwise.
+- *
+- * See Intel Developer's Manual Vol 3 Section 4.10.4.3, bullet 3
+- * (Optional Invalidation).
+- */
+ static noinline int
+ spurious_kernel_fault(unsigned long error_code, unsigned long address)
+ {
+@@ -986,15 +804,6 @@ spurious_kernel_fault(unsigned long erro
+ 	pte_t *pte;
+ 	int ret;
+ 
+-	/*
+-	 * Only writes to RO or instruction fetches from NX may cause
+-	 * spurious faults.
+-	 *
+-	 * These could be from user or supervisor accesses but the TLB
+-	 * is only lazily flushed after a kernel mapping protection
+-	 * change, so user accesses are not expected to cause spurious
+-	 * faults.
+-	 */
+ 	if (error_code != (X86_PF_WRITE | X86_PF_PROT) &&
+ 	    error_code != (X86_PF_INSTR | X86_PF_PROT))
+ 		return 0;
+@@ -1008,21 +817,21 @@ spurious_kernel_fault(unsigned long erro
+ 		return 0;
+ 
+ 	if (p4d_leaf(*p4d))
+-		return spurious_kernel_fault_check(error_code, (pte_t *) p4d);
++		return spurious_kernel_fault_check(error_code, (pte_t *)p4d);
+ 
+ 	pud = pud_offset(p4d, address);
+ 	if (!pud_present(*pud))
+ 		return 0;
+ 
+ 	if (pud_leaf(*pud))
+-		return spurious_kernel_fault_check(error_code, (pte_t *) pud);
++		return spurious_kernel_fault_check(error_code, (pte_t *)pud);
+ 
+ 	pmd = pmd_offset(pud, address);
+ 	if (!pmd_present(*pmd))
+ 		return 0;
+ 
+ 	if (pmd_leaf(*pmd))
+-		return spurious_kernel_fault_check(error_code, (pte_t *) pmd);
++		return spurious_kernel_fault_check(error_code, (pte_t *)pmd);
+ 
+ 	pte = pte_offset_kernel(pmd, address);
+ 	if (!pte_present(*pte))
+@@ -1032,11 +841,7 @@ spurious_kernel_fault(unsigned long erro
+ 	if (!ret)
+ 		return 0;
+ 
+-	/*
+-	 * Make sure we have permissions in PMD.
+-	 * If not, then there's a bug in the page tables:
+-	 */
+-	ret = spurious_kernel_fault_check(error_code, (pte_t *) pmd);
++	ret = spurious_kernel_fault_check(error_code, (pte_t *)pmd);
+ 	WARN_ONCE(!ret, "PMD has incorrect permission bits\n");
+ 
+ 	return ret;
+@@ -1045,67 +850,43 @@ NOKPROBE_SYMBOL(spurious_kernel_fault);
+ 
+ int show_unhandled_signals = 1;
+ 
+-static inline int
++static __always_inline int
+ access_error(unsigned long error_code, struct vm_area_struct *vma)
+ {
+-	/* This is only called for the current mm, so: */
+-	bool foreign = false;
++	const bool foreign = false;
++	const unsigned long vm_flags = READ_ONCE(vma->vm_flags);
+ 
+-	/*
+-	 * Read or write was blocked by protection keys.  This is
+-	 * always an unconditional error and can never result in
+-	 * a follow-up action to resolve the fault, like a COW.
+-	 */
+ 	if (error_code & X86_PF_PK)
+ 		return 1;
+ 
+-	/*
+-	 * SGX hardware blocked the access.  This usually happens
+-	 * when the enclave memory contents have been destroyed, like
+-	 * after a suspend/resume cycle. In any case, the kernel can't
+-	 * fix the cause of the fault.  Handle the fault as an access
+-	 * error even in cases where no actual access violation
+-	 * occurred.  This allows userspace to rebuild the enclave in
+-	 * response to the signal.
+-	 */
+ 	if (unlikely(error_code & X86_PF_SGX))
+ 		return 1;
+ 
+-	/*
+-	 * Make sure to check the VMA so that we do not perform
+-	 * faults just to hit a X86_PF_PK as soon as we fill in a
+-	 * page.
+-	 */
+-	if (!arch_vma_access_permitted(vma, (error_code & X86_PF_WRITE),
+-				       (error_code & X86_PF_INSTR), foreign))
++	if (!arch_vma_access_permitted(vma,
++				       (error_code & X86_PF_WRITE) != 0,
++				       (error_code & X86_PF_INSTR) != 0,
++				       foreign))
+ 		return 1;
+ 
+-	/*
+-	 * Shadow stack accesses (PF_SHSTK=1) are only permitted to
+-	 * shadow stack VMAs. All other accesses result in an error.
+-	 */
+ 	if (error_code & X86_PF_SHSTK) {
+-		if (unlikely(!(vma->vm_flags & VM_SHADOW_STACK)))
++		if (unlikely(!(vm_flags & VM_SHADOW_STACK)))
+ 			return 1;
+-		if (unlikely(!(vma->vm_flags & VM_WRITE)))
++		if (unlikely(!(vm_flags & VM_WRITE)))
+ 			return 1;
+ 		return 0;
+ 	}
+ 
+ 	if (error_code & X86_PF_WRITE) {
+-		/* write, present and write, not present: */
+-		if (unlikely(vma->vm_flags & VM_SHADOW_STACK))
++		if (unlikely(vm_flags & VM_SHADOW_STACK))
+ 			return 1;
+-		if (unlikely(!(vma->vm_flags & VM_WRITE)))
++		if (unlikely(!(vm_flags & VM_WRITE)))
+ 			return 1;
+ 		return 0;
+ 	}
+ 
+-	/* read, present: */
+ 	if (unlikely(error_code & X86_PF_PROT))
+ 		return 1;
+ 
+-	/* read, not present: */
+ 	if (unlikely(!vma_is_accessible(vma)))
+ 		return 1;
+ 
+@@ -1114,58 +895,19 @@ access_error(unsigned long error_code, s
+ 
+ bool fault_in_kernel_space(unsigned long address)
+ {
+-	/*
+-	 * On 64-bit systems, the vsyscall page is at an address above
+-	 * TASK_SIZE_MAX, but is not considered part of the kernel
+-	 * address space.
+-	 */
+ 	if (IS_ENABLED(CONFIG_X86_64) && is_vsyscall_vaddr(address))
+ 		return false;
+ 
+ 	return address >= TASK_SIZE_MAX;
+ }
+ 
+-/*
+- * Called for all faults where 'address' is part of the kernel address
+- * space.  Might get called for faults that originate from *code* that
+- * ran in userspace or the kernel.
+- */
+ static void
+ do_kern_addr_fault(struct pt_regs *regs, unsigned long hw_error_code,
+ 		   unsigned long address)
+ {
+-	/*
+-	 * Protection keys exceptions only happen on user pages.  We
+-	 * have no user pages in the kernel portion of the address
+-	 * space, so do not expect them here.
+-	 */
+ 	WARN_ON_ONCE(hw_error_code & X86_PF_PK);
+ 
+ #ifdef CONFIG_X86_32
+-	/*
+-	 * We can fault-in kernel-space virtual memory on-demand. The
+-	 * 'reference' page table is init_mm.pgd.
+-	 *
+-	 * NOTE! We MUST NOT take any locks for this case. We may
+-	 * be in an interrupt or a critical region, and should
+-	 * only copy the information from the master page table,
+-	 * nothing more.
+-	 *
+-	 * Before doing this on-demand faulting, ensure that the
+-	 * fault is not any of the following:
+-	 * 1. A fault on a PTE with a reserved bit set.
+-	 * 2. A fault caused by a user-mode access.  (Do not demand-
+-	 *    fault kernel memory due to user-mode accesses).
+-	 * 3. A fault caused by a page-level protection violation.
+-	 *    (A demand fault would be on a non-present page which
+-	 *     would have X86_PF_PROT==0).
+-	 *
+-	 * This is only needed to close a race condition on x86-32 in
+-	 * the vmalloc mapping/unmapping code. See the comment above
+-	 * vmalloc_fault() for details. On x86-64 the race does not
+-	 * exist as the vmalloc mappings don't need to be synchronized
+-	 * there.
+-	 */
+ 	if (!(hw_error_code & (X86_PF_RSVD | X86_PF_USER | X86_PF_PROT))) {
+ 		if (vmalloc_fault(address) >= 0)
+ 			return;
+@@ -1175,38 +917,20 @@ do_kern_addr_fault(struct pt_regs *regs,
+ 	if (is_f00f_bug(regs, hw_error_code, address))
+ 		return;
+ 
+-	/* Was the fault spurious, caused by lazy TLB invalidation? */
+ 	if (spurious_kernel_fault(hw_error_code, address))
+ 		return;
+ 
+-	/* kprobes don't want to hook the spurious faults: */
+ 	if (WARN_ON_ONCE(kprobe_page_fault(regs, X86_TRAP_PF)))
+ 		return;
+ 
+-	/*
+-	 * Note, despite being a "bad area", there are quite a few
+-	 * acceptable reasons to get here, such as erratum fixups
+-	 * and handling kernel code that can fault, like get_user().
+-	 *
+-	 * Don't take the mm semaphore here. If we fixup a prefetch
+-	 * fault we could otherwise deadlock:
+-	 */
+ 	bad_area_nosemaphore(regs, hw_error_code, address);
+ }
+ NOKPROBE_SYMBOL(do_kern_addr_fault);
+ 
+-/*
+- * Handle faults in the user portion of the address space.  Nothing in here
+- * should check X86_PF_USER without a specific justification: for almost
+- * all purposes, we should treat a normal kernel access to user memory
+- * (e.g. get_user(), put_user(), etc.) the same as the WRUSS instruction.
+- * The one exception is AC flag handling, which is, per the x86
+- * architecture, special for WRUSS.
+- */
+-static inline
+-void do_user_addr_fault(struct pt_regs *regs,
+-			unsigned long error_code,
+-			unsigned long address)
++static inline void
++do_user_addr_fault(struct pt_regs *regs,
++		   unsigned long error_code,
++		   unsigned long address)
+ {
+ 	struct vm_area_struct *vma;
+ 	struct task_struct *tsk;
+@@ -1218,13 +942,6 @@ void do_user_addr_fault(struct pt_regs *
+ 	mm = tsk->mm;
+ 
+ 	if (unlikely((error_code & (X86_PF_USER | X86_PF_INSTR)) == X86_PF_INSTR)) {
+-		/*
+-		 * Whoops, this is kernel mode code trying to execute from
+-		 * user memory.  Unless this is AMD erratum #93, which
+-		 * corrupts RIP such that it looks like a user address,
+-		 * this is unrecoverable.  Don't even try to look up the
+-		 * VMA or look for extable entries.
+-		 */
+ 		if (is_errata93(regs, address))
+ 			return;
+ 
+@@ -1232,45 +949,24 @@ void do_user_addr_fault(struct pt_regs *
+ 		return;
+ 	}
+ 
+-	/* kprobes don't want to hook the spurious faults: */
+ 	if (WARN_ON_ONCE(kprobe_page_fault(regs, X86_TRAP_PF)))
+ 		return;
+ 
+-	/*
+-	 * Reserved bits are never expected to be set on
+-	 * entries in the user portion of the page tables.
+-	 */
+ 	if (unlikely(error_code & X86_PF_RSVD))
+ 		pgtable_bad(regs, error_code, address);
+ 
+-	/*
+-	 * If SMAP is on, check for invalid kernel (supervisor) access to user
+-	 * pages in the user address space.  The odd case here is WRUSS,
+-	 * which, according to the preliminary documentation, does not respect
+-	 * SMAP and will have the USER bit set so, in all cases, SMAP
+-	 * enforcement appears to be consistent with the USER bit.
+-	 */
+ 	if (unlikely(cpu_feature_enabled(X86_FEATURE_SMAP) &&
+ 		     !(error_code & X86_PF_USER) &&
+ 		     !(regs->flags & X86_EFLAGS_AC))) {
+-		/*
+-		 * No extable entry here.  This was a kernel access to an
+-		 * invalid pointer.  get_kernel_nofault() will not get here.
+-		 */
+ 		page_fault_oops(regs, error_code, address);
+ 		return;
+ 	}
+ 
+-	/*
+-	 * If we're in an interrupt, have no user context or are running
+-	 * in a region with pagefaults disabled then we must not take the fault
+-	 */
+ 	if (unlikely(faulthandler_disabled() || !mm)) {
+ 		bad_area_nosemaphore(regs, error_code, address);
+ 		return;
+ 	}
+ 
+-	/* Legacy check - remove this after verifying that it doesn't trigger */
+ 	if (WARN_ON_ONCE(!(regs->flags & X86_EFLAGS_IF))) {
+ 		bad_area_nosemaphore(regs, error_code, address);
+ 		return;
+@@ -1280,12 +976,6 @@ void do_user_addr_fault(struct pt_regs *
+ 
+ 	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, address);
+ 
+-	/*
+-	 * Read-only permissions can not be expressed in shadow stack PTEs.
+-	 * Treat all shadow stack accesses as WRITE faults. This ensures
+-	 * that the MM will prepare everything (e.g., break COW) such that
+-	 * maybe_mkwrite() can create a proper shadow stack PTE.
+-	 */
+ 	if (error_code & X86_PF_SHSTK)
+ 		flags |= FAULT_FLAG_WRITE;
+ 	if (error_code & X86_PF_WRITE)
+@@ -1293,26 +983,10 @@ void do_user_addr_fault(struct pt_regs *
+ 	if (error_code & X86_PF_INSTR)
+ 		flags |= FAULT_FLAG_INSTRUCTION;
+ 
+-	/*
+-	 * We set FAULT_FLAG_USER based on the register state, not
+-	 * based on X86_PF_USER. User space accesses that cause
+-	 * system page faults are still user accesses.
+-	 */
+ 	if (user_mode(regs))
+ 		flags |= FAULT_FLAG_USER;
+ 
+ #ifdef CONFIG_X86_64
+-	/*
+-	 * Faults in the vsyscall page might need emulation.  The
+-	 * vsyscall page is at a high address (>PAGE_OFFSET), but is
+-	 * considered to be part of the user address space.
+-	 *
+-	 * The vsyscall page does not have a "real" VMA, so do this
+-	 * emulation before we go searching for VMAs.
+-	 *
+-	 * PKRU never rejects instruction fetches, so we don't need
+-	 * to consider the PF_PK bit.
+-	 */
+ 	if (is_vsyscall_vaddr(address)) {
+ 		if (emulate_vsyscall(error_code, regs, address))
+ 			return;
+@@ -1331,6 +1005,7 @@ void do_user_addr_fault(struct pt_regs *
+ 		count_vm_vma_lock_event(VMA_LOCK_SUCCESS);
+ 		return;
+ 	}
++
+ 	fault = handle_mm_fault(vma, address, flags | FAULT_FLAG_VMA_LOCK, regs);
+ 	if (!(fault & (VM_FAULT_RETRY | VM_FAULT_COMPLETED)))
+ 		vma_end_read(vma);
+@@ -1339,11 +1014,12 @@ void do_user_addr_fault(struct pt_regs *
+ 		count_vm_vma_lock_event(VMA_LOCK_SUCCESS);
+ 		goto done;
+ 	}
++
+ 	count_vm_vma_lock_event(VMA_LOCK_RETRY);
++
+ 	if (fault & VM_FAULT_MAJOR)
+ 		flags |= FAULT_FLAG_TRIED;
+ 
+-	/* Quick path to respond to signals */
+ 	if (fault_signal_pending(fault, regs)) {
+ 		if (!user_mode(regs))
+ 			kernelmode_fixup_or_oops(regs, error_code, address,
+@@ -1351,8 +1027,8 @@ void do_user_addr_fault(struct pt_regs *
+ 						 ARCH_DEFAULT_PKEY);
+ 		return;
+ 	}
+-lock_mmap:
+ 
++lock_mmap:
+ retry:
+ 	vma = lock_mm_and_find_vma(mm, address, regs);
+ 	if (unlikely(!vma)) {
+@@ -1360,35 +1036,14 @@ retry:
+ 		return;
+ 	}
+ 
+-	/*
+-	 * Ok, we have a good vm_area for this memory access, so
+-	 * we can handle it..
+-	 */
+ 	if (unlikely(access_error(error_code, vma))) {
+ 		bad_area_access_error(regs, error_code, address, mm, vma);
+ 		return;
+ 	}
+ 
+-	/*
+-	 * If for any reason at all we couldn't handle the fault,
+-	 * make sure we exit gracefully rather than endlessly redo
+-	 * the fault.  Since we never set FAULT_FLAG_RETRY_NOWAIT, if
+-	 * we get VM_FAULT_RETRY back, the mmap_lock has been unlocked.
+-	 *
+-	 * Note that handle_userfault() may also release and reacquire mmap_lock
+-	 * (and not return with VM_FAULT_RETRY), when returning to userland to
+-	 * repeat the page fault later with a VM_FAULT_NOPAGE retval
+-	 * (potentially after handling any pending signal during the return to
+-	 * userland). The return to userland is identified whenever
+-	 * FAULT_FLAG_USER|FAULT_FLAG_KILLABLE are both set in flags.
+-	 */
+ 	fault = handle_mm_fault(vma, address, flags, regs);
+ 
+ 	if (fault_signal_pending(fault, regs)) {
+-		/*
+-		 * Quick path to respond to signals.  The core mm code
+-		 * has unlocked the mm for us if we get here.
+-		 */
+ 		if (!user_mode(regs))
+ 			kernelmode_fixup_or_oops(regs, error_code, address,
+ 						 SIGBUS, BUS_ADRERR,
+@@ -1396,21 +1051,16 @@ retry:
+ 		return;
+ 	}
+ 
+-	/* The fault is fully completed (including releasing mmap lock) */
+ 	if (fault & VM_FAULT_COMPLETED)
+ 		return;
+ 
+-	/*
+-	 * If we need to retry the mmap_lock has already been released,
+-	 * and if there is a fatal signal pending there is no guarantee
+-	 * that we made any progress. Handle this case first.
+-	 */
+ 	if (unlikely(fault & VM_FAULT_RETRY)) {
+ 		flags |= FAULT_FLAG_TRIED;
+ 		goto retry;
+ 	}
+ 
+ 	mmap_read_unlock(mm);
++
+ done:
+ 	if (likely(!(fault & VM_FAULT_ERROR)))
+ 		return;
+@@ -1422,7 +1072,6 @@ done:
+ 	}
+ 
+ 	if (fault & VM_FAULT_OOM) {
+-		/* Kernel mode? Handle exceptions or die: */
+ 		if (!user_mode(regs)) {
+ 			kernelmode_fixup_or_oops(regs, error_code, address,
+ 						 SIGSEGV, SEGV_MAPERR,
+@@ -1430,14 +1079,9 @@ done:
+ 			return;
+ 		}
+ 
+-		/*
+-		 * We ran out of memory, call the OOM killer, and return the
+-		 * userspace (which will retry the fault, or kill us if we got
+-		 * oom-killed):
+-		 */
+ 		pagefault_out_of_memory();
+ 	} else {
+-		if (fault & (VM_FAULT_SIGBUS|VM_FAULT_HWPOISON|
++		if (fault & (VM_FAULT_SIGBUS | VM_FAULT_HWPOISON |
+ 			     VM_FAULT_HWPOISON_LARGE))
+ 			do_sigbus(regs, error_code, address, fault);
+ 		else if (fault & VM_FAULT_SIGSEGV)
+@@ -1460,23 +1104,18 @@ trace_page_fault_entries(struct pt_regs
+ 
+ static __always_inline void
+ handle_page_fault(struct pt_regs *regs, unsigned long error_code,
+-			      unsigned long address)
++		  unsigned long address)
+ {
+ 	trace_page_fault_entries(regs, error_code, address);
+ 
+ 	if (unlikely(kmmio_fault(regs, address)))
+ 		return;
+ 
+-	/* Was the fault on kernel-controlled part of the address space? */
+-	if (unlikely(fault_in_kernel_space(address))) {
++	if (unlikely(fault_in_kernel_space(address)))
+ 		do_kern_addr_fault(regs, error_code, address);
+-	} else {
++	else
+ 		do_user_addr_fault(regs, error_code, address);
+-	}
+-	/*
+-	 * page fault handling might have reenabled interrupts,
+-	 * make sure to disable them again.
+-	 */
++
+ 	local_irq_disable();
+ }
+ 
+@@ -1485,42 +1124,12 @@ DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_f
+ 	irqentry_state_t state;
+ 	unsigned long address;
+ 
+-	address = cpu_feature_enabled(X86_FEATURE_FRED) ? fred_event_data(regs) : read_cr2();
++	address = cpu_feature_enabled(X86_FEATURE_FRED) ?
++		  fred_event_data(regs) : read_cr2();
+ 
+-	/*
+-	 * KVM uses #PF vector to deliver 'page not present' events to guests
+-	 * (asynchronous page fault mechanism). The event happens when a
+-	 * userspace task is trying to access some valid (from guest's point of
+-	 * view) memory which is not currently mapped by the host (e.g. the
+-	 * memory is swapped out). Note, the corresponding "page ready" event
+-	 * which is injected when the memory becomes available, is delivered via
+-	 * an interrupt mechanism and not a #PF exception
+-	 * (see arch/x86/kernel/kvm.c: sysvec_kvm_asyncpf_interrupt()).
+-	 *
+-	 * We are relying on the interrupted context being sane (valid RSP,
+-	 * relevant locks not held, etc.), which is fine as long as the
+-	 * interrupted context had IF=1.  We are also relying on the KVM
+-	 * async pf type field and CR2 being read consistently instead of
+-	 * getting values from real and async page faults mixed up.
+-	 *
+-	 * Fingers crossed.
+-	 *
+-	 * The async #PF handling code takes care of idtentry handling
+-	 * itself.
+-	 */
+ 	if (kvm_handle_async_pf(regs, (u32)address))
+ 		return;
+ 
+-	/*
+-	 * Entry handling for valid #PF from kernel mode is slightly
+-	 * different: RCU is already watching and ct_irq_enter() must not
+-	 * be invoked because a kernel fault on a user space address might
+-	 * sleep.
+-	 *
+-	 * In case the fault hit a RCU idle region the conditional entry
+-	 * code reenabled RCU to avoid subsequent wreckage which helps
+-	 * debuggability.
+-	 */
+ 	state = irqentry_enter(regs);
+ 
+ 	instrumentation_begin();
