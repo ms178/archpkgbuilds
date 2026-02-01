@@ -24,9 +24,6 @@ denorm_ftz_16 = 'nir_is_denorm_flush_to_zero(info->float_controls_execution_mode
 denorm_ftz_32 = 'nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, 32)'
 denorm_ftz_64 = 'nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, 64)'
 
-ignore_exact = nir_algebraic.ignore_exact
-
-
 def lowered_sincos(c):
     """
     Fast sine/cosine approximation using parabolic curve fitting.
@@ -296,28 +293,28 @@ optimizations = [
     (('sdot_2x16_iadd_sat', '#a', '#b', 'c(is_not_const)'), ('iadd_sat', ('sdot_2x16_iadd', a, b, 0), c), '!options->lower_iadd_sat'),
     (('udot_2x16_uadd_sat', '#a', '#b', 'c(is_not_const)'), ('uadd_sat', ('udot_2x16_uadd', a, b, 0), c), '!options->lower_uadd_sat'),
 
-    *add_fabs_fneg((('fmul@32(nsz)', ('bcsel', ignore_exact('feq', b, 0.0), 0.0, 'ma'), ('bcsel', ignore_exact('feq', a, 0.0), 0.0, 'mb')),
+    *add_fabs_fneg((('fmul@32(nsz)', ('bcsel', ('feq(ignore_exact)', b, 0.0), 0.0, 'ma'), ('bcsel', ('feq(ignore_exact)', a, 0.0), 0.0, 'mb')),
      ('fmulz', 'ma', 'mb'), has_fmulz), {'ma': a, 'mb': b}),
-    *add_fabs_fneg((('fmul@32(nsz)', ('bcsel', ignore_exact('fneu', b, 0.0), 'ma', 0.0), ('bcsel', ignore_exact('feq', a, 0.0), 0.0, 'mb')),
+    *add_fabs_fneg((('fmul@32(nsz)', ('bcsel', ('fneu(ignore_exact)', b, 0.0), 'ma', 0.0), ('bcsel', ('feq(ignore_exact)', a, 0.0), 0.0, 'mb')),
      ('fmulz', 'ma', 'mb'), has_fmulz), {'ma': a, 'mb': b}),
-    *add_fabs_fneg((('fmul@32(nsz)', ('bcsel', ignore_exact('fneu', b, 0.0), 'ma', 0.0), ('bcsel', ignore_exact('fneu', a, 0.0), 'mb', 0.0)),
+    *add_fabs_fneg((('fmul@32(nsz)', ('bcsel', ('fneu(ignore_exact)', b, 0.0), 'ma', 0.0), ('bcsel', ('fneu(ignore_exact)', a, 0.0), 'mb', 0.0)),
      ('fmulz', 'ma', 'mb'), has_fmulz), {'ma': a, 'mb': b}),
 
     *add_fabs_fneg((('bcsel', ('feq', ('fmin', ('fabs', a), ('fabs', b)), 0.0), 0.0, ('fmul@32', 'ma', 'mb')),
      ('fmulz', 'ma', 'mb'), has_fmulz), {'ma': a, 'mb': b}),
 
-    *add_fabs_fneg((('fmul@32(nsz)', 'ma', ('bcsel', ignore_exact('feq', a, 0.0), 0.0, '#b(is_not_const_zero)')),
+    *add_fabs_fneg((('fmul@32(nsz)', 'ma', ('bcsel', ('feq(ignore_exact)', a, 0.0), 0.0, '#b(is_not_const_zero)')),
      ('fmulz', 'ma', b), has_fmulz), {'ma': a}),
 
-    *add_fabs_fneg((('ffma@32(nsz)', ('bcsel', ignore_exact('feq', b, 0.0), 0.0, 'ma'), ('bcsel', ignore_exact('feq', a, 0.0), 0.0, 'mb'), c),
+    *add_fabs_fneg((('ffma@32(nsz)', ('bcsel', ('feq(ignore_exact)', b, 0.0), 0.0, 'ma'), ('bcsel', ('feq(ignore_exact)', a, 0.0), 0.0, 'mb'), c),
      ('ffmaz', 'ma', 'mb', c), has_fmulz), {'ma': a, 'mb': b}),
-    *add_fabs_fneg((('ffma@32(nsz)', 'ma', ('bcsel', ignore_exact('feq', a, 0.0), 0.0, '#b(is_not_const_zero)'), c),
+    *add_fabs_fneg((('ffma@32(nsz)', 'ma', ('bcsel', ('feq(ignore_exact)', a, 0.0), 0.0, '#b(is_not_const_zero)'), c),
      ('ffmaz', 'ma', b, c), has_fmulz), {'ma': a}),
 
-    *add_fabs_fneg((('bcsel(nsz,nnan,ninf)', ignore_exact('feq', b, 0.0), 1.0, ('fexp2', ('fmul@32', a, 'mb'))),
+    *add_fabs_fneg((('bcsel(nsz,nnan,ninf)', ('feq(ignore_exact)', b, 0.0), 1.0, ('fexp2', ('fmul@32', a, 'mb'))),
      ('fexp2', ('fmulz', a, 'mb')),
      has_fmulz), {'mb': b}),
-    *add_fabs_fneg((('bcsel', ignore_exact('feq', b, 0.0), 1.0, ('fexp2', ('fmulz', a, 'mb'))),
+    *add_fabs_fneg((('bcsel', ('feq(ignore_exact)', b, 0.0), 1.0, ('fexp2', ('fmulz', a, 'mb'))),
      ('fexp2', ('fmulz', a, 'mb'))), {'mb': b}),
 ]
 
@@ -660,10 +657,10 @@ optimizations.extend([
    (('bcsel(is_only_used_as_float)', ('feq', a, 'b(is_not_zero)'), b, a), a),
    (('bcsel(is_only_used_as_float)', ('fneu', a, 'b(is_not_zero)'), a, b), a),
 
-   (('bcsel', ignore_exact('feq', a, 0), 0, ('fsat', ('fmul', a, 'b(is_a_number)'))), ('!fsat', ('fmul', a, b))),
-   (('bcsel', ignore_exact('fneu', a, 0), ('fsat', ('fmul', a, 'b(is_a_number)')), 0), ('!fsat', ('fmul', a, b))),
-   (('bcsel', ignore_exact('feq', a, 0), b, ('fadd', a, 'b(is_not_zero)')), ('fadd', a, b)),
-   (('bcsel', ignore_exact('fneu', a, 0), ('fadd', a, 'b(is_not_zero)'), b), ('fadd', a, b)),
+   (('bcsel', ('feq(ignore_exact)', a, 0), 0, ('fsat', ('fmul', a, 'b(is_a_number)'))), ('!fsat', ('fmul', a, b))),
+   (('bcsel', ('fneu(ignore_exact)', a, 0), ('fsat', ('fmul', a, 'b(is_a_number)')), 0), ('!fsat', ('fmul', a, b))),
+   (('bcsel', ('feq(ignore_exact)', a, 0), b, ('fadd', a, 'b(is_not_zero)')), ('fadd', a, b)),
+   (('bcsel', ('fneu(ignore_exact)', a, 0), ('fadd', a, 'b(is_not_zero)'), b), ('fadd', a, b)),
 
    (('fge', 0.0, ('b2f', 'a@1')), ('inot', a)),
    (('fge', ('fneg', ('b2f', 'a@1')), 0.0), ('inot', a)),
