@@ -226,31 +226,29 @@ get_offset_scale(struct entry *entry)
    return entry->info->offset_scale;
 }
 
-/*
- * Optimized hash function for entry keys.
- * Uses FNV-1a for small key counts to avoid XXH32 call overhead.
- * Falls back to XXH32 for larger keys where its SIMD optimizations help.
- */
 static uint32_t
 hash_entry_key(const void *key_)
 {
-   /* This is careful to not include pointers in the hash calculation so that
-    * the order of the hash table walk is deterministic */
    const struct entry_key *key = (const struct entry_key *)key_;
 
-   /* Fast path for empty offset defs - simple multiplicative hash */
+   /* Fast path for empty offset defs - simple multiplicative hash.
+    * Uses golden ratio multiplier (2654435761) for better distribution.
+    */
    if (key->offset_def_count == 0) {
       uint32_t hash = (key->resource ? key->resource->index : 0u);
-      hash = hash * 31u + (key->var ? key->var->index : 0u);
-      hash = hash * 31u + (key->var ? (uint32_t)key->var->data.mode : 0u);
+      hash = hash * 2654435761u + (key->var ? key->var->index : 0u);
+      hash = hash * 2654435761u + (key->var ? (uint32_t)key->var->data.mode : 0u);
       return hash;
    }
 
-   /* Fast path for 1-2 offset defs - use FNV-1a inline */
+   /* Fast path for 1-2 offset defs using FNV-1a.
+    * FNV-1a has good avalanche properties for small inputs.
+    */
    if (key->offset_def_count <= 2) {
       uint32_t hash = 2166136261u; /* FNV offset basis */
+
       hash ^= (key->resource ? key->resource->index : 0u);
-      hash *= 16777619u; /* FNV prime */
+      hash *= 16777619u;
       hash ^= (key->var ? key->var->index : 0u);
       hash *= 16777619u;
       hash ^= (key->var ? (uint32_t)key->var->data.mode : 0u);
@@ -261,6 +259,7 @@ hash_entry_key(const void *key_)
          hash *= 16777619u;
          hash ^= key->offset_defs[i].comp;
          hash *= 16777619u;
+         /* Hash mul in two 32-bit chunks to avoid endianness issues */
          hash ^= (uint32_t)key->offset_defs_mul[i];
          hash *= 16777619u;
          hash ^= (uint32_t)(key->offset_defs_mul[i] >> 32);
@@ -269,53 +268,25 @@ hash_entry_key(const void *key_)
       return hash;
    }
 
-   /* Medium path for 3-4 offset defs - batch into struct for single XXH32 call */
-   if (key->offset_def_count <= MAX_INLINE_OFFSET_DEFS) {
-      struct {
-         uint32_t resource_index;
-         uint32_t var_index;
-         uint32_t var_mode;
-         uint32_t offset_def_count;
-         struct {
-            uint32_t def_index;
-            uint32_t comp;
-            uint64_t mul;
-         } defs[MAX_INLINE_OFFSET_DEFS];
-      } hash_data;
+   /* Medium path: build packed buffer to avoid padding in XXH32 input.
+    * Ensures deterministic hashing regardless of struct layout.
+    */
+   uint32_t buffer[4 + MAX_INLINE_OFFSET_DEFS * 4];
+   buffer[0] = key->resource ? key->resource->index : 0u;
+   buffer[1] = key->var ? key->var->index : 0u;
+   buffer[2] = key->var ? (uint32_t)key->var->data.mode : 0u;
+   buffer[3] = key->offset_def_count;
 
-      hash_data.resource_index = key->resource ? key->resource->index : 0u;
-      hash_data.var_index = key->var ? key->var->index : 0u;
-      hash_data.var_mode = key->var ? (uint32_t)key->var->data.mode : 0u;
-      hash_data.offset_def_count = key->offset_def_count;
-
-      for (unsigned i = 0; i < key->offset_def_count; i++) {
-         hash_data.defs[i].def_index = key->offset_defs[i].def->index;
-         hash_data.defs[i].comp = key->offset_defs[i].comp;
-         hash_data.defs[i].mul = key->offset_defs_mul[i];
-      }
-
-      size_t total_size = 16u + key->offset_def_count * sizeof(hash_data.defs[0]);
-      return XXH32(&hash_data, total_size, 0);
+   unsigned buf_idx = 4;
+   unsigned count = MIN2(key->offset_def_count, MAX_INLINE_OFFSET_DEFS);
+   for (unsigned i = 0; i < count; i++) {
+      buffer[buf_idx++] = key->offset_defs[i].def->index;
+      buffer[buf_idx++] = key->offset_defs[i].comp;
+      buffer[buf_idx++] = (uint32_t)key->offset_defs_mul[i];
+      buffer[buf_idx++] = (uint32_t)(key->offset_defs_mul[i] >> 32);
    }
 
-   /* Slow path for large offset def counts - sequential XXH32 */
-   uint32_t header[4];
-   header[0] = key->resource ? key->resource->index : 0u;
-   header[1] = key->var ? key->var->index : 0u;
-   header[2] = key->var ? (uint32_t)key->var->data.mode : 0u;
-   header[3] = key->offset_def_count;
-
-   uint32_t hash = XXH32(header, sizeof(header), 0);
-
-   for (unsigned i = 0; i < key->offset_def_count; i++) {
-      uint32_t def_data[2];
-      def_data[0] = key->offset_defs[i].def->index;
-      def_data[1] = key->offset_defs[i].comp;
-      hash = XXH32(def_data, sizeof(def_data), hash);
-      hash = XXH32(&key->offset_defs_mul[i], sizeof(uint64_t), hash);
-   }
-
-   return hash;
+   return XXH32(buffer, buf_idx * sizeof(uint32_t), 0);
 }
 
 static bool
@@ -324,10 +295,20 @@ entry_key_equals(const void *a_, const void *b_)
    const struct entry_key *a = (const struct entry_key *)a_;
    const struct entry_key *b = (const struct entry_key *)b_;
 
-   /* Fast rejection: check count and pointers first */
-   if (a->offset_def_count != b->offset_def_count ||
-       a->resource != b->resource ||
-       a->var != b->var) {
+   /* Fast rejection order optimized by likelihood of difference:
+    * 1. resource differs most often (different descriptor indices)
+    * 2. var differs next (different variable bindings)
+    * 3. offset_def_count is usually similar for same access pattern
+    */
+   if (unlikely(a->resource != b->resource)) {
+      return false;
+   }
+
+   if (unlikely(a->var != b->var)) {
+      return false;
+   }
+
+   if (a->offset_def_count != b->offset_def_count) {
       return false;
    }
 
@@ -335,27 +316,34 @@ entry_key_equals(const void *a_, const void *b_)
       return true;
    }
 
-   /* For small counts, unrolled comparison is faster */
-   if (a->offset_def_count <= 2) {
-      for (unsigned i = 0; i < a->offset_def_count; i++) {
-         if (!nir_scalar_equal(a->offset_defs[i], b->offset_defs[i]) ||
-             a->offset_defs_mul[i] != b->offset_defs_mul[i]) {
-            return false;
-         }
+   /* Compare scalars first (cheaper than 64-bit multiplier compare) */
+   unsigned count = a->offset_def_count;
+
+   /* Unrolled loop for small counts - avoids loop overhead */
+   switch (count) {
+   case 1:
+      return nir_scalar_equal(a->offset_defs[0], b->offset_defs[0]) &&
+             a->offset_defs_mul[0] == b->offset_defs_mul[0];
+   case 2:
+      if (!nir_scalar_equal(a->offset_defs[0], b->offset_defs[0]) ||
+          !nir_scalar_equal(a->offset_defs[1], b->offset_defs[1])) {
+         return false;
       }
-      return true;
+      return a->offset_defs_mul[0] == b->offset_defs_mul[0] &&
+             a->offset_defs_mul[1] == b->offset_defs_mul[1];
+   default:
+      break;
    }
 
-   /* For larger counts, check scalars first (more likely to differ) */
-   for (unsigned i = 0; i < a->offset_def_count; i++) {
+   /* For larger counts, batch compare with memcmp where possible */
+   for (unsigned i = 0; i < count; i++) {
       if (!nir_scalar_equal(a->offset_defs[i], b->offset_defs[i])) {
          return false;
       }
    }
 
-   /* Then check multipliers with memcmp */
    return memcmp(a->offset_defs_mul, b->offset_defs_mul,
-                 a->offset_def_count * sizeof(uint64_t)) == 0;
+                 count * sizeof(uint64_t)) == 0;
 }
 
 static void
