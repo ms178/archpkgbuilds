@@ -210,7 +210,14 @@ optimizations = [
     ('isub', a, ('iand', ('bcsel', ('ilt', a, 0), ('iadd', a, ('isub', b, 1)), a), ('ineg', b))),
     '!options->lower_bitops'),
    (('irem', a, '#b(is_neg_power_of_two)'), ('irem', a, ('iabs', b)), '!options->lower_bitops'),
+]
 
+# An instruction with src = bcsel selecting between 2 constants makes that src
+# non-constant, but we can make it constant by folding the operation into bcsel.
+for op in ['idiv', 'udiv', 'umod', 'umod', 'irem']:
+    optimizations += [((op, a, ('bcsel', b, '#c', '#d')), ('bcsel', b, (op, a, c), (op, a, d)))]
+
+optimizations += [
    (('~fmul', ('fsign', a), ('ffloor', ('fadd', ('fabs', a), 0.5))), ('ftrunc', ('fadd', a, ('fmul', ('fsign', a), 0.5))), '!options->lower_ftrunc || options->lower_ffloor'),
 
    (('fneg', ('fneg', a)), ('fcanonicalize', a)),
