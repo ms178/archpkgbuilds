@@ -42,6 +42,7 @@
  * This probably doesn't handle big-endian GPUs correctly.
  */
 
+#include "util/ralloc.h"
 #include "util/u_dynarray.h"
 #include "nir.h"
 #include "nir_builder.h"
@@ -171,7 +172,7 @@ struct entry_key {
 /* Information on a single memory operation. */
 struct entry {
    struct list_head head;
-   unsigned index;
+   int index;
 
    struct entry_key *key;
    /* The constant offset is sign-extended to 64 bits. */
@@ -197,7 +198,12 @@ struct entry {
    nir_deref_instr *deref;
 };
 
+struct block_ctx {
+   struct entry *last_entry[nir_num_variable_modes];
+};
+
 struct vectorize_ctx {
+   linear_ctx *linear_mem_ctx;
    nir_shader *shader;
    const nir_load_store_vectorize_options *options;
    unsigned (*round_up_components)(unsigned);
@@ -205,6 +211,7 @@ struct vectorize_ctx {
    struct list_head entries[nir_num_variable_modes];
    struct hash_table *loads[nir_num_variable_modes];
    struct hash_table *stores[nir_num_variable_modes];
+   struct block_ctx *per_block_ctx;
 };
 
 static unsigned
@@ -267,13 +274,6 @@ entry_key_equals(const void *a_, const void *b_)
       return false;
 
    return true;
-}
-
-static void
-delete_entry_dynarray(struct hash_entry *entry)
-{
-   struct util_dynarray *arr = (struct util_dynarray *)entry->data;
-   ralloc_free(arr);
 }
 
 static int64_t
@@ -535,9 +535,9 @@ fill_in_offset_defs(struct vectorize_ctx *ctx, struct entry *entry,
 {
    struct entry_key *key = entry->key;
    key->offset_def_count = count;
-   key->offset_defs = ralloc_array(entry, nir_scalar, count);
-   key->offset_defs_mul = ralloc_array(entry, uint64_t, count);
-   key->offset_def_num_lsbz = ralloc_array(entry, uint8_t, count);
+   key->offset_defs = linear_alloc_array(ctx->linear_mem_ctx, nir_scalar, count);
+   key->offset_defs_mul = linear_alloc_array(ctx->linear_mem_ctx, uint64_t, count);
+   key->offset_def_num_lsbz = linear_alloc_array(ctx->linear_mem_ctx, uint8_t, count);
    for (unsigned i = 0; i < count; i++) {
       key->offset_defs[i] = terms[i].s;
       key->offset_defs_mul[i] = terms[i].mul;
@@ -565,7 +565,7 @@ create_entry_key_from_deref(struct vectorize_ctx *ctx, struct entry *entry,
       terms = malloc(path_len * sizeof(struct offset_term));
    unsigned term_count = 0;
 
-   struct entry_key *key = ralloc(entry, struct entry_key);
+   struct entry_key *key = linear_alloc(ctx->linear_mem_ctx, struct entry_key);
    key->resource = NULL;
    key->var = NULL;
 
@@ -653,7 +653,7 @@ static void
 create_entry_key_from_offset(struct vectorize_ctx *ctx, struct entry *entry,
                              nir_def *base, uint64_t base_mul)
 {
-   struct entry_key *key = ralloc(entry, struct entry_key);
+   struct entry_key *key = linear_alloc(ctx->linear_mem_ctx, struct entry_key);
    key->resource = NULL;
    key->var = NULL;
    key->offset_defs = NULL;
@@ -741,7 +741,7 @@ calc_alignment(struct entry *entry)
 }
 
 static struct entry *
-create_entry(void *mem_ctx, struct vectorize_ctx *ctx,
+create_entry(struct vectorize_ctx *ctx,
              const struct intrinsic_info *info,
              nir_intrinsic_instr *intrin)
 {
@@ -751,7 +751,7 @@ create_entry(void *mem_ctx, struct vectorize_ctx *ctx,
    bool is_shared_append = intrin->intrinsic == nir_intrinsic_shared_append_amd ||
                            intrin->intrinsic == nir_intrinsic_shared_consume_amd;
 
-   struct entry *entry = rzalloc(mem_ctx, struct entry);
+   struct entry *entry = linear_zalloc(ctx->linear_mem_ctx, struct entry);
    entry->intrin = intrin;
    entry->instr = &intrin->instr;
    entry->info = info;
@@ -940,7 +940,9 @@ static void
 hoist_base_addr(nir_instr *instr, nir_instr *to_hoist)
 {
    /* Return if this instruction already dominates the first load. */
-   if (to_hoist->block != instr->block || to_hoist->index <= instr->index)
+   if (to_hoist->block->index < instr->block->index)
+      return;
+   if (to_hoist->block->index == instr->block->index && to_hoist->index <= instr->index)
       return;
 
    /* Only the offset calculation (consisting of ALU and load_const)
@@ -1081,6 +1083,7 @@ vectorize_loads(nir_builder *b, struct vectorize_ctx *ctx,
    first->align_mul = low->align_mul;
    first->align_offset = low->align_offset;
 
+   list_del(&second->head);
    nir_instr_remove(second->instr);
 }
 
@@ -1387,10 +1390,6 @@ addition_wraps(uint64_t a, uint64_t b, unsigned bits)
 static bool
 check_for_robustness(struct vectorize_ctx *ctx, struct entry *low, uint64_t high_offset)
 {
-   nir_variable_mode mode = get_variable_mode(low);
-   if (!(mode & ctx->options->robust_modes))
-      return false;
-
    /* First, try to use alignment information in case the application provided some. If the addition
     * of the maximum offset of the low load and "high_offset" wraps around, we can't combine the low
     * and high loads.
@@ -1446,6 +1445,15 @@ can_vectorize(struct vectorize_ctx *ctx, struct entry *first, struct entry *seco
    if (check_for_aliasing(ctx, first, second))
       return false;
 
+   if (first->index == -1 && !(get_variable_mode(first) & ctx->options->bounds_checked_modes)) {
+      /* For non bounds-checked modes, only allow to vectorize with entries
+       * which can speculate. We could do better if we check alignment or
+       * if the second entry's block post-dominates the first's block.
+       */
+      if (!nir_instr_can_speculate(second->instr))
+         return false;
+   }
+
    /* we can only vectorize non-volatile loads/stores of the same type and with
     * the same access */
    if (first->info != second->info || first->access != second->access ||
@@ -1482,8 +1490,12 @@ try_vectorize(nir_function_impl *impl, struct vectorize_ctx *ctx,
       return false;
 
    uint64_t diff = get_offset_diff(low, high);
-   if (check_for_robustness(ctx, low, diff))
-      return false;
+   nir_variable_mode mode = get_variable_mode(low);
+   if ((mode & ctx->options->robust_modes) || high->index == -1) {
+      /* Only vectorize robust modes or hoist low entries, if robustness is ensured. */
+      if (check_for_robustness(ctx, low, diff))
+         return false;
+   }
 
    /* don't attempt to vectorize accesses of row-major matrix columns */
    if (first->deref) {
@@ -1580,12 +1592,15 @@ try_vectorize_shared2(struct vectorize_ctx *ctx,
 
    /* vectorize the accesses */
    uint32_t access = nir_intrinsic_access(first->intrin);
+   struct entry *new_entry;
    if (first->is_store) {
       nir_def *low_val = low->intrin->src[low->info->value_src].ssa;
       nir_def *high_val = high->intrin->src[high->info->value_src].ssa;
       nir_def *val = nir_vec2(&b, nir_bitcast_vector(&b, low_val, low_size * 8u),
                               nir_bitcast_vector(&b, high_val, low_size * 8u));
-      nir_store_shared2_amd(&b, val, offset, .offset1 = diff / stride, .st64 = st64, .access = access);
+      nir_intrinsic_instr *intrin =
+         nir_store_shared2_amd(&b, val, offset, .offset1 = diff / stride, .st64 = st64, .access = access);
+      new_entry = create_entry(ctx, get_info(nir_intrinsic_store_shared2_amd), intrin);
    } else {
       nir_def *new_def = nir_load_shared2_amd(&b, low_size * 8u, offset, .offset1 = diff / stride,
                                               .st64 = st64, .access = access);
@@ -1593,8 +1608,15 @@ try_vectorize_shared2(struct vectorize_ctx *ctx,
                            nir_bitcast_vector(&b, nir_channel(&b, new_def, 0), low_bit_size));
       nir_def_rewrite_uses(&high->intrin->def,
                            nir_bitcast_vector(&b, nir_channel(&b, new_def, 1), high_bit_size));
+      new_entry = create_entry(ctx, get_info(nir_intrinsic_load_shared2_amd), nir_def_as_intrinsic(new_def));                     
    }
 
+   /* Add a new entry, so that alias checks stay intact. Remove the old entries,
+    * so that they can't accidentally be vectorized any further.
+    */
+   list_add(&new_entry->head, &(first->is_store ? second : first)->head);
+   list_del(&first->head);
+   list_del(&second->head);
    nir_instr_remove(first->instr);
    nir_instr_remove(second->instr);
 
@@ -1708,7 +1730,7 @@ vectorize_entries(struct vectorize_ctx *ctx, nir_function_impl *impl, struct has
       }
    }
 
-   _mesa_hash_table_clear(ht, delete_entry_dynarray);
+   _mesa_hash_table_clear(ht, NULL);
 
    return progress;
 }
@@ -1784,6 +1806,77 @@ handle_barrier(struct vectorize_ctx *ctx, bool *progress, nir_function_impl *imp
    return true;
 }
 
+static void
+add_entry_to_hash_table(struct vectorize_ctx *ctx, struct entry *entry)
+{
+   struct hash_table *adj_ht = NULL;
+   unsigned mode_index = mode_to_index(get_variable_mode(entry));
+
+   if (entry->is_store) {
+      if (!ctx->stores[mode_index])
+         ctx->stores[mode_index] = _mesa_hash_table_create(ctx, &hash_entry_key, &entry_key_equals);
+      adj_ht = ctx->stores[mode_index];
+   } else {
+      if (!ctx->loads[mode_index])
+         ctx->loads[mode_index] = _mesa_hash_table_create(ctx, &hash_entry_key, &entry_key_equals);
+      adj_ht = ctx->loads[mode_index];
+   }
+
+   uint32_t key_hash = hash_entry_key(entry->key);
+   struct hash_entry *adj_entry = _mesa_hash_table_search_pre_hashed(adj_ht, key_hash, entry->key);
+   struct util_dynarray *arr;
+   if (adj_entry && adj_entry->data) {
+      arr = (struct util_dynarray *)adj_entry->data;
+   } else {
+      arr = linear_alloc(ctx->linear_mem_ctx, struct util_dynarray);
+      util_dynarray_init(arr, ctx);
+      _mesa_hash_table_insert_pre_hashed(adj_ht, key_hash, entry->key, arr);
+   }
+   util_dynarray_append(arr, entry);
+}
+
+static void
+add_entries_from_predecessor(struct vectorize_ctx *ctx, nir_block *block)
+{
+   nir_cf_node *parent = block->cf_node.parent;
+   bool is_loop_header = false;
+   if (parent->type == nir_cf_node_loop) {
+      nir_loop *loop = nir_cf_node_as_loop(parent);
+      if (block == nir_loop_first_block(loop))
+         is_loop_header = true;
+   }
+
+   for (unsigned i = 0; i < nir_num_variable_modes; i++) {
+      struct entry *entry = NULL;
+
+      if (is_loop_header) {
+         /* If this is a loop header, just take the last entries of the preheader. */
+         nir_block *preheader = nir_block_cf_tree_prev(block);
+         entry = ctx->per_block_ctx[preheader->index].last_entry[i];
+      } else {
+         /* If all predecessor entries are the same, the entry dominates the block. */
+         bool first_entry = true;
+         set_foreach(&block->predecessors, set_entry) {
+            nir_block *pred = (nir_block *)set_entry->key;
+            if (!first_entry && entry != ctx->per_block_ctx[pred->index].last_entry[i]) {
+               entry = NULL;
+               break;
+            }
+            entry = ctx->per_block_ctx[pred->index].last_entry[i];
+            first_entry = false;
+         }
+      }
+
+      /* Insert into list and hash table. */
+      if (entry) {
+         /* Ensure that the predecessor entry is always considered as first. */
+         entry->index = -1;
+         list_addtail(&entry->head, &ctx->entries[i]);
+         add_entry_to_hash_table(ctx, entry);
+      }
+   }
+}
+
 static bool
 process_block(nir_function_impl *impl, struct vectorize_ctx *ctx, nir_block *block)
 {
@@ -1792,10 +1885,12 @@ process_block(nir_function_impl *impl, struct vectorize_ctx *ctx, nir_block *blo
    for (unsigned i = 0; i < nir_num_variable_modes; i++) {
       list_inithead(&ctx->entries[i]);
       if (ctx->loads[i])
-         _mesa_hash_table_clear(ctx->loads[i], delete_entry_dynarray);
+         _mesa_hash_table_clear(ctx->loads[i], NULL);
       if (ctx->stores[i])
-         _mesa_hash_table_clear(ctx->stores[i], delete_entry_dynarray);
+         _mesa_hash_table_clear(ctx->stores[i], NULL);
    }
+
+   add_entries_from_predecessor(ctx, block);
 
    /* create entries */
    unsigned next_index = 0;
@@ -1825,41 +1920,26 @@ process_block(nir_function_impl *impl, struct vectorize_ctx *ctx, nir_block *blo
       unsigned mode_index = mode_to_index(mode);
 
       /* create entry */
-      struct entry *entry = create_entry(ctx, ctx, info, intrin);
+      struct entry *entry = create_entry(ctx, info, intrin);
       entry->index = next_index;
 
       list_addtail(&entry->head, &ctx->entries[mode_index]);
-
-      /* add the entry to a hash table */
-
-      struct hash_table *adj_ht = NULL;
-      if (entry->is_store) {
-         if (!ctx->stores[mode_index])
-            ctx->stores[mode_index] = _mesa_hash_table_create(ctx, &hash_entry_key, &entry_key_equals);
-         adj_ht = ctx->stores[mode_index];
-      } else {
-         if (!ctx->loads[mode_index])
-            ctx->loads[mode_index] = _mesa_hash_table_create(ctx, &hash_entry_key, &entry_key_equals);
-         adj_ht = ctx->loads[mode_index];
-      }
-
-      uint32_t key_hash = hash_entry_key(entry->key);
-      struct hash_entry *adj_entry = _mesa_hash_table_search_pre_hashed(adj_ht, key_hash, entry->key);
-      struct util_dynarray *arr;
-      if (adj_entry && adj_entry->data) {
-         arr = (struct util_dynarray *)adj_entry->data;
-      } else {
-         arr = ralloc(ctx, struct util_dynarray);
-         util_dynarray_init(arr, arr);
-         _mesa_hash_table_insert_pre_hashed(adj_ht, key_hash, entry->key, arr);
-      }
-      util_dynarray_append(arr, entry);
+      add_entry_to_hash_table(ctx, entry);
    }
 
    /* sort and combine entries */
    for (unsigned i = 0; i < nir_num_variable_modes; i++) {
       progress |= vectorize_entries(ctx, impl, ctx->loads[i]);
       progress |= vectorize_entries(ctx, impl, ctx->stores[i]);
+
+      /* Remember the last load-entry of each type:
+       * We are allowing to vectorize at most one entry across blocks.
+       */
+      if (!list_is_empty(&ctx->entries[i])) {
+         struct entry *entry = list_entry(ctx->entries[i].prev, struct entry, head);
+         if (!entry->is_store)
+            ctx->per_block_ctx[block->index].last_entry[i] = entry;
+      }
    }
 
    return progress;
@@ -1871,6 +1951,7 @@ nir_opt_load_store_vectorize(nir_shader *shader, const nir_load_store_vectorize_
    bool progress = false;
 
    struct vectorize_ctx *ctx = rzalloc(NULL, struct vectorize_ctx);
+   ctx->linear_mem_ctx = linear_context(ctx);
    ctx->shader = shader;
    ctx->numlsb_ht = _mesa_pointer_hash_table_create(ctx);
    ctx->options = options;
@@ -1887,6 +1968,9 @@ nir_opt_load_store_vectorize(nir_shader *shader, const nir_load_store_vectorize_
    nir_shader_index_vars(shader, options->modes);
 
    nir_foreach_function_impl(impl, shader) {
+      nir_metadata_require(impl, nir_metadata_block_index);
+      ctx->per_block_ctx = rzalloc_array(ctx, struct block_ctx, impl->num_blocks);
+
       if (options->modes & nir_var_function_temp)
          nir_function_impl_index_vars(impl);
 
@@ -1913,9 +1997,8 @@ opt_load_store_update_alignments_callback(struct nir_builder *b,
    if (!info)
       return false;
 
-   struct entry *entry = create_entry(NULL, s, info, intrin);
+   struct entry *entry = create_entry(s, info, intrin);
    const bool progress = update_align(entry);
-   ralloc_free(entry);
 
    return progress;
 }
@@ -1925,6 +2008,8 @@ nir_opt_load_store_update_alignments(nir_shader *shader)
 {
    struct vectorize_ctx ctx;
    ctx.numlsb_ht = _mesa_pointer_hash_table_create(NULL);
+   ctx.linear_mem_ctx = linear_context(ctx.numlsb_ht);
+
    bool progress = nir_shader_intrinsics_pass(shader,
                                               opt_load_store_update_alignments_callback,
                                               nir_metadata_control_flow |
