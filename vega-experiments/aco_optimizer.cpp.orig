@@ -1359,6 +1359,21 @@ alu_opt_gather_info(opt_ctx& ctx, Instruction* instr, alu_opt_info& info)
          info.operands[1].extract[0] = SubdwordSel::uword1;
       info.opcode = aco_opcode::s_pack_ll_b32_b16;
       break;
+   case aco_opcode::v_cvt_f32_ubyte0:
+   case aco_opcode::v_cvt_f32_ubyte1:
+   case aco_opcode::v_cvt_f32_ubyte2:
+   case aco_opcode::v_cvt_f32_ubyte3:
+      if (info.operands[0].extract[0] != SubdwordSel::dword)
+         break;
+      switch (info.opcode) {
+      case aco_opcode::v_cvt_f32_ubyte0: info.operands[0].extract[0] = SubdwordSel::ubyte0; break;
+      case aco_opcode::v_cvt_f32_ubyte1: info.operands[0].extract[0] = SubdwordSel::ubyte1; break;
+      case aco_opcode::v_cvt_f32_ubyte2: info.operands[0].extract[0] = SubdwordSel::ubyte2; break;
+      case aco_opcode::v_cvt_f32_ubyte3: info.operands[0].extract[0] = SubdwordSel::ubyte3; break;
+      default: UNREACHABLE("invalid op");
+      }
+      info.opcode = aco_opcode::v_cvt_f32_u32;
+      break;
    case aco_opcode::v_sub_f32:
    case aco_opcode::v_subrev_f32:
       info.operands[info.opcode == aco_opcode::v_sub_f32].neg[0] ^= true;
@@ -1954,7 +1969,7 @@ fixed_to_exec(Operand op)
 }
 
 SubdwordSel
-parse_extract(Instruction* instr)
+parse_extract(Instruction* instr, Temp tmp)
 {
    if (instr->opcode == aco_opcode::p_extract) {
       unsigned size = instr->operands[2].constantValue() / 8;
@@ -1969,8 +1984,12 @@ parse_extract(Instruction* instr)
       if (size <= 2)
          return SubdwordSel(size, offset, false);
    } else if (instr->opcode == aco_opcode::p_split_vector) {
-      assert(instr->operands[0].bytes() == 4 && instr->definitions[1].bytes() == 2);
-      return SubdwordSel(2, 2, false);
+      unsigned offset = 0;
+      for (const Definition& def : instr->definitions) {
+         if (def.getTemp() == tmp)
+            return SubdwordSel(tmp.bytes(), offset, false);
+         offset += def.bytes();
+      }
    }
 
    return SubdwordSel();
@@ -1996,6 +2015,10 @@ remove_operand_extract(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 {
    /* We checked these earlier in alu_propagate_temp_const */
    if (instr->isSALU() || instr->isVALU())
+      return;
+
+   /* There might be dead splits created by emit_split_vector. */
+   if (instr->opcode == aco_opcode::p_split_vector)
       return;
 
    for (unsigned i = 0; i < instr->operands.size(); i++) {
@@ -2154,7 +2177,7 @@ parse_operand(opt_ctx& ctx, Temp tmp, unsigned exec_id, alu_opt_op& op_info, aco
    }
 
    if (info.is_extract()) {
-      op_info.extract[0] = parse_extract(info.parent_instr);
+      op_info.extract[0] = parse_extract(info.parent_instr, tmp);
       op_info.op = info.parent_instr->operands[0];
       if (exec_id != info.parent_instr->pass_flags && op_info.op.isFixed() &&
           (op_info.op.physReg() == exec || op_info.op.physReg() == exec_hi))
@@ -2442,7 +2465,7 @@ extract_apply_extract(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 
    alu_opt_op inner = {};
    inner.op = instr->operands[0];
-   inner.extract[0] = parse_extract(instr.get());
+   inner.extract[0] = parse_extract(instr.get(), instr->definitions[0].getTemp());
    if (!inner.extract[0])
       return;
 
@@ -2677,36 +2700,41 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          }
       }
 
-      offset = 0;
-      for (unsigned i = 0; i < ops.size(); i++) {
-         if (ops[i].isTemp()) {
-            if (ctx.info[ops[i].tempId()].is_temp() &&
-                ops[i].regClass() == ctx.info[ops[i].tempId()].temp.regClass()) {
-               ops[i].setTemp(ctx.info[ops[i].tempId()].temp);
-            }
-
-            /* If this and the following operands make up all definitions of a `p_split_vector`,
-             * replace them with the operand of the `p_split_vector` instruction.
-             */
-            Instruction* parent = ctx.info[ops[i].tempId()].parent_instr;
-            if (parent->opcode == aco_opcode::p_split_vector &&
-                (offset % 4 == 0 || parent->operands[0].bytes() < 4) &&
-                parent->definitions.size() <= ops.size() - i) {
-               copy_prop = true;
-               for (unsigned j = 0; copy_prop && j < parent->definitions.size(); j++) {
-                  copy_prop &= ops[i + j].isTemp() &&
-                               ops[i + j].getTemp() == parent->definitions[j].getTemp();
+      bool progress;
+      do {
+         progress = false;
+         offset = 0;
+         for (unsigned i = 0; i < ops.size(); i++) {
+            if (ops[i].isTemp()) {
+               if (ctx.info[ops[i].tempId()].is_temp() &&
+                   ops[i].regClass() == ctx.info[ops[i].tempId()].temp.regClass()) {
+                  ops[i].setTemp(ctx.info[ops[i].tempId()].temp);
                }
 
-               if (copy_prop) {
-                  ops.erase(ops.begin() + i + 1, ops.begin() + i + parent->definitions.size());
-                  ops[i] = parent->operands[0];
+               /* If this and the following operands make up all definitions of a `p_split_vector`,
+                * replace them with the operand of the `p_split_vector` instruction.
+                */
+               Instruction* parent = ctx.info[ops[i].tempId()].parent_instr;
+               if (parent->opcode == aco_opcode::p_split_vector &&
+                   (offset % 4 == 0 || parent->operands[0].bytes() < 4) &&
+                   parent->definitions.size() <= ops.size() - i) {
+                  copy_prop = true;
+                  for (unsigned j = 0; copy_prop && j < parent->definitions.size(); j++) {
+                     copy_prop &= ops[i + j].isTemp() &&
+                                  ops[i + j].getTemp() == parent->definitions[j].getTemp();
+                  }
+
+                  if (copy_prop) {
+                     ops.erase(ops.begin() + i + 1, ops.begin() + i + parent->definitions.size());
+                     ops[i] = parent->operands[0];
+                     progress = true;
+                  }
                }
             }
+
+            offset += ops[i].bytes();
          }
-
-         offset += ops[i].bytes();
-      }
+      } while (progress);
 
       /* combine expanded operands to new vector */
       if (ops.size() <= instr->operands.size()) {
@@ -2750,12 +2778,13 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
                   ctx.info[def.tempId()].set_phys_reg(reg);
                reg = reg.advance(def.bytes());
             }
-         } else if (instr->definitions.size() == 2 && instr->operands[0].isTemp() &&
-                    instr->definitions[0].bytes() == instr->definitions[1].bytes()) {
-            if (instr->operands[0].bytes() == 4) {
-               /* D16 subdword split */
-               ctx.info[instr->definitions[0].tempId()].set_temp(instr->operands[0].getTemp());
-               ctx.info[instr->definitions[1].tempId()].set_extract();
+         } else if (instr->operands[0].isTemp() && instr->operands[0].size() == 1) {
+            /* Subdword split */
+            unsigned offset = 0;
+            for (const Definition& def : instr->definitions) {
+               if (offset && offset % def.bytes() == 0)
+                  ctx.info[def.tempId()].set_extract();
+               offset += def.bytes();
             }
          }
          break;
@@ -3029,7 +3058,7 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       break;
    }
    case aco_opcode::p_insert: {
-      if (parse_extract(instr.get()))
+      if (parse_extract(instr.get(), instr->definitions[0].getTemp()))
          ctx.info[instr->definitions[0].tempId()].set_extract();
       break;
    }
@@ -4176,16 +4205,41 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    if (instr->definitions.empty() || is_dead(ctx.uses, instr.get()))
       return;
 
-   for (const Definition& def : instr->definitions) {
-      ssa_info& info = ctx.info[def.tempId()];
-      if (info.is_extract() && ctx.uses[def.tempId()] > 4)
-         info.label &= ~label_extract;
+   if (instr->opcode == aco_opcode::p_split_vector && instr->operands[0].size() == 1) {
+      /* If all except the first definition still have their extract label, we will likely
+       * eliminate the whole split instruction after copy propagating the first one.
+       * Unconditional copy propagation would mean we end up with more splits
+       * that don't kill their operands.
+       */
+      bool will_be_removed = true;
+      for (unsigned i = 1; i < instr->definitions.size(); i++)
+         will_be_removed &= ctx.info[instr->definitions[i].tempId()].is_extract();
+
+      if (will_be_removed)
+         ctx.info[instr->definitions[0].tempId()].set_temp(instr->operands[0].getTemp());
    }
 
    if (instr->isVALU() || instr->isSALU()) {
       /* Apply SDWA. Do this after label_instruction() so it can remove
        * label_extract if not all instructions can take SDWA. */
       alu_propagate_temp_const(ctx, instr, true);
+   } else if (instr->isPseudo()) {
+      /* PSEUDO: propagate temporaries/constants */
+      for (unsigned i = 0; i < instr->operands.size(); i++) {
+         Operand op = instr->operands[i];
+         if (!op.isTemp())
+            continue;
+
+         ssa_info info = ctx.info[op.tempId()];
+         while (info.is_temp()) {
+            if (pseudo_propagate_temp(ctx, instr, info.temp, i)) {
+               ctx.uses[info.temp.id()]++;
+               decrease_and_dce(ctx, op.getTemp());
+               op = instr->operands[i];
+            }
+            info = ctx.info[info.temp.id()];
+         }
+      }
    }
 
    if (instr->isDPP())
