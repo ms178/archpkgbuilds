@@ -290,20 +290,16 @@ visit_tex(isel_context* ctx, nir_tex_instr* instr)
       has_derivs = true;
    }
 
-   unsigned dim = 0;
-   bool da = false;
-   if (instr->sampler_dim != GLSL_SAMPLER_DIM_BUF) {
-      dim = ac_get_sampler_dim(ctx->options->gfx_level, instr->sampler_dim, instr->is_array);
-      da = should_declare_array((ac_image_dim)dim);
-   }
+   assert(instr->sampler_dim != GLSL_SAMPLER_DIM_BUF);
+
+   unsigned dim = ac_get_sampler_dim(ctx->options->gfx_level, instr->sampler_dim, instr->is_array);
+   bool da = should_declare_array((ac_image_dim)dim);
 
    /* Build tex instruction */
    unsigned dmask = nir_def_components_read(&instr->def);
    /* Mask out the bit set for the sparse info. */
    if (instr->is_sparse)
       dmask &= ~(1u << (instr->def.num_components - 1));
-   if (instr->sampler_dim == GLSL_SAMPLER_DIM_BUF)
-      dmask = u_bit_consecutive(0, util_last_bit(dmask));
    /* Set the 5th bit for the sparse code. */
    if (instr->is_sparse)
       dmask = MAX2(dmask, 1) | 0x10;
@@ -428,47 +424,6 @@ visit_tex(isel_context* ctx, nir_tex_instr* instr)
       }
       coords[0] = new_coords[0];
       coords[1] = new_coords[1];
-   }
-
-   if (instr->sampler_dim == GLSL_SAMPLER_DIM_BUF) {
-      // FIXME: if (ctx->abi->gfx9_stride_size_workaround) return
-      // ac_build_buffer_load_format_gfx9_safe()
-
-      assert(coords.size() == 1);
-      aco_opcode op;
-      if (d16) {
-         switch (util_last_bit(dmask & 0xf)) {
-         case 1: op = aco_opcode::buffer_load_format_d16_x; break;
-         case 2: op = aco_opcode::buffer_load_format_d16_xy; break;
-         case 3: op = aco_opcode::buffer_load_format_d16_xyz; break;
-         case 4: op = aco_opcode::buffer_load_format_d16_xyzw; break;
-         default: UNREACHABLE("Tex instruction loads more than 4 components.");
-         }
-      } else {
-         switch (util_last_bit(dmask & 0xf)) {
-         case 1: op = aco_opcode::buffer_load_format_x; break;
-         case 2: op = aco_opcode::buffer_load_format_xy; break;
-         case 3: op = aco_opcode::buffer_load_format_xyz; break;
-         case 4: op = aco_opcode::buffer_load_format_xyzw; break;
-         default: UNREACHABLE("Tex instruction loads more than 4 components.");
-         }
-      }
-
-      aco_ptr<Instruction> mubuf{
-         create_instruction(op, Format::MUBUF, 3 + instr->is_sparse + 2 * disable_wqm, 1)};
-      mubuf->operands[0] = Operand(resource);
-      mubuf->operands[1] = Operand(coords[0]);
-      mubuf->operands[2] = Operand::c32(0);
-      mubuf->definitions[0] = Definition(tmp_dst);
-      mubuf->mubuf().idxen = true;
-      mubuf->mubuf().tfe = instr->is_sparse;
-      if (mubuf->mubuf().tfe)
-         mubuf->operands[3] = emit_tfe_init(bld, tmp_dst);
-      init_disable_wqm(bld, mubuf->mubuf(), disable_wqm);
-      ctx->block->instructions.emplace_back(std::move(mubuf));
-
-      expand_vector(ctx, tmp_dst, dst, instr->def.num_components, dmask);
-      return;
    }
 
    /* gather MIMG address components */
