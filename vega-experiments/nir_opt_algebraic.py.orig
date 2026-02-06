@@ -2217,16 +2217,11 @@ optimizations.extend([
    (('u2u32', ('ushr', 'a@64', 32)), ('unpack_64_2x32_split_y', a), '!options->lower_unpack_64_2x32_split'),
 
    # Useless masking before unpacking
-   (('unpack_half_2x16_split_x', ('iand', a, 0xffff)), ('unpack_half_2x16_split_x', a)),
    (('unpack_32_2x16_split_x', ('iand', a, 0xffff)), ('unpack_32_2x16_split_x', a)),
    (('unpack_64_2x32_split_x', ('iand', a, 0xffffffff)), ('unpack_64_2x32_split_x', a)),
-   (('unpack_half_2x16_split_y', ('iand', a, 0xffff0000)), ('unpack_half_2x16_split_y', a)),
    (('unpack_32_2x16_split_y', ('iand', a, 0xffff0000)), ('unpack_32_2x16_split_y', a)),
    (('unpack_64_2x32_split_y', ('iand', a, 0xffffffff00000000)), ('unpack_64_2x32_split_y', a)),
 
-   (('unpack_half_2x16_split_x', ('extract_u16', a, 0)), ('unpack_half_2x16_split_x', a)),
-   (('unpack_half_2x16_split_x', ('extract_u16', a, 1)), ('unpack_half_2x16_split_y', a)),
-   (('unpack_half_2x16_split_x', ('ushr', a, 16)), ('unpack_half_2x16_split_y', a)),
    (('unpack_32_2x16_split_x', ('extract_u16', a, 0)), ('unpack_32_2x16_split_x', a)),
    (('unpack_32_2x16_split_x', ('extract_u16', a, 1)), ('unpack_32_2x16_split_y', a)),
 
@@ -2275,6 +2270,9 @@ optimizations.extend([
    (('extract_u8', ('pack_32_4x8_split', a, b, c, d), 1), ('u2u', b)),
    (('extract_u8', ('pack_32_4x8_split', a, b, c, d), 2), ('u2u', c)),
    (('extract_u8', ('pack_32_4x8_split', a, b, c, d), 3), ('u2u', d)),
+
+   (('unpack_32_2x16', ('extract_u16', a, 0)), ('vec2', ('unpack_32_2x16.x', a), 0)),
+   (('unpack_32_2x16', ('extract_u16', a, 1)), ('vec2', ('unpack_32_2x16.y', a), 0)),
 
    # Reduce intermediate precision with int64.
    (('u2u32', ('iadd(is_used_once)', 'a@64', b)),
@@ -2760,22 +2758,6 @@ optimizations.extend([
    (('pack_half_2x16_split', 'a@32', 'b@32'),
     ('ior', ('ishl', ('u2u32', ('f2f16', b)), 16), ('u2u32', ('f2f16', a))),
     'options->lower_pack_split'),
-
-   (('unpack_half_2x16_split_x', 'a@32'),
-    ('f2f32', ('u2u16', a)),
-    'options->lower_pack_split && !nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, 16)'),
-
-   (('unpack_half_2x16_split_x', 'a@32'),
-    ('f2f32', ('fmul', 1.0, ('u2u16', a))),
-    'options->lower_pack_split && nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, 16)'),
-
-   (('unpack_half_2x16_split_y', 'a@32'),
-    ('f2f32', ('u2u16', ('ushr', a, 16))),
-    'options->lower_pack_split && !nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, 16)'),
-
-   (('unpack_half_2x16_split_y', 'a@32'),
-    ('f2f32', ('fmul', 1.0, ('u2u16', ('ushr', a, 16)))),
-    'options->lower_pack_split && nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, 16)'),
 
    (('isign', a), ('imin', ('imax', a, -1), 1), 'options->lower_isign'),
    (('imin', ('imax', a, -1), 1), ('isign', a), '!options->lower_isign'),
