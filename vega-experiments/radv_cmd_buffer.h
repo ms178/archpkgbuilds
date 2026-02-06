@@ -100,41 +100,39 @@ enum radv_cmd_dirty_bits {
    RADV_CMD_DIRTY_STREAMOUT_ENABLE = 1ull << 9,
    RADV_CMD_DIRTY_GRAPHICS_SHADERS = 1ull << 10,
    RADV_CMD_DIRTY_FRAGMENT_OUTPUT = 1ull << 11,
-   RADV_CMD_DIRTY_FBFETCH_OUTPUT = 1ull << 12,
-   RADV_CMD_DIRTY_PS_STATE = 1ull << 13,
-   RADV_CMD_DIRTY_NGG_STATE = 1ull << 14,
-   RADV_CMD_DIRTY_TASK_STATE = 1ull << 15,
-   RADV_CMD_DIRTY_DEPTH_STENCIL_STATE = 1ull << 16,
-   RADV_CMD_DIRTY_RASTER_STATE = 1ull << 17,
-   RADV_CMD_DIRTY_MSAA_STATE = 1ull << 18,
-   RADV_CMD_DIRTY_CLIP_RECTS_STATE = 1ull << 19,
-   RADV_CMD_DIRTY_TCS_TES_STATE = 1ull << 20,
-   RADV_CMD_DIRTY_CB_RENDER_STATE = 1ull << 21,
-   RADV_CMD_DIRTY_VIEWPORT_STATE = 1ull << 22,
-   RADV_CMD_DIRTY_BINNING_STATE = 1ull << 23,
-   RADV_CMD_DIRTY_FSR_STATE = 1ull << 24,
-   RADV_CMD_DIRTY_RAST_SAMPLES_STATE = 1ull << 25,
-   RADV_CMD_DIRTY_DEPTH_BIAS_STATE = 1ull << 26,
-   RADV_CMD_DIRTY_VS_PROLOG_STATE = 1ull << 27,
-   RADV_CMD_DIRTY_BLEND_CONSTANTS_STATE = 1ull << 28,
-   RADV_CMD_DIRTY_SAMPLE_LOCATIONS_STATE = 1ull << 29,
-   RADV_CMD_DIRTY_SCISSOR_STATE = 1ull << 30,
-   RADV_CMD_DIRTY_TESS_DOMAIN_ORIGIN_STATE = 1ull << 31,
-   RADV_CMD_DIRTY_LS_HS_CONFIG = 1ull << 32,
-   RADV_CMD_DIRTY_VGT_PRIM_STATE = 1ull << 33,
-   RADV_CMD_DIRTY_FORCE_VRS_STATE = 1ull << 34,
-   RADV_CMD_DIRTY_NGGC_VIEWPORT = 1ull << 35,
-   RADV_CMD_DIRTY_NGGC_SETTINGS = 1ull << 36,
-   RADV_CMD_DIRTY_PS_EPILOG_SHADER = 1ull << 37,
-   RADV_CMD_DIRTY_PS_EPILOG_STATE = 1ull << 38,
-   RADV_CMD_DIRTY_FSR_SURFACE_STATE = 1ull << 39,
-   RADV_CMD_DIRTY_ALL = (1ull << 40) - 1,
+   RADV_CMD_DIRTY_PS_STATE = 1ull << 12,
+   RADV_CMD_DIRTY_NGG_STATE = 1ull << 13,
+   RADV_CMD_DIRTY_TASK_STATE = 1ull << 14,
+   RADV_CMD_DIRTY_DEPTH_STENCIL_STATE = 1ull << 15,
+   RADV_CMD_DIRTY_RASTER_STATE = 1ull << 16,
+   RADV_CMD_DIRTY_MSAA_STATE = 1ull << 17,
+   RADV_CMD_DIRTY_CLIP_RECTS_STATE = 1ull << 18,
+   RADV_CMD_DIRTY_TCS_TES_STATE = 1ull << 19,
+   RADV_CMD_DIRTY_CB_RENDER_STATE = 1ull << 20,
+   RADV_CMD_DIRTY_VIEWPORT_STATE = 1ull << 21,
+   RADV_CMD_DIRTY_BINNING_STATE = 1ull << 22,
+   RADV_CMD_DIRTY_FSR_STATE = 1ull << 23,
+   RADV_CMD_DIRTY_RAST_SAMPLES_STATE = 1ull << 24,
+   RADV_CMD_DIRTY_DEPTH_BIAS_STATE = 1ull << 25,
+   RADV_CMD_DIRTY_VS_PROLOG_STATE = 1ull << 26,
+   RADV_CMD_DIRTY_BLEND_CONSTANTS_STATE = 1ull << 27,
+   RADV_CMD_DIRTY_SAMPLE_LOCATIONS_STATE = 1ull << 28,
+   RADV_CMD_DIRTY_SCISSOR_STATE = 1ull << 29,
+   RADV_CMD_DIRTY_TESS_DOMAIN_ORIGIN_STATE = 1ull << 30,
+   RADV_CMD_DIRTY_LS_HS_CONFIG = 1ull << 31,
+   RADV_CMD_DIRTY_VGT_PRIM_STATE = 1ull << 32,
+   RADV_CMD_DIRTY_FORCE_VRS_STATE = 1ull << 33,
+   RADV_CMD_DIRTY_NGGC_VIEWPORT = 1ull << 34,
+   RADV_CMD_DIRTY_NGGC_SETTINGS = 1ull << 35,
+   RADV_CMD_DIRTY_PS_EPILOG_SHADER = 1ull << 36,
+   RADV_CMD_DIRTY_PS_EPILOG_STATE = 1ull << 37,
+   RADV_CMD_DIRTY_ALL = (1ull << 38) - 1,
 
    RADV_CMD_DIRTY_SHADER_QUERY = RADV_CMD_DIRTY_NGG_STATE | RADV_CMD_DIRTY_TASK_STATE,
 };
 
 /* Compile-time validation: ensure all dirty bits fit in uint64_t. */
-static_assert(RADV_CMD_DIRTY_FSR_SURFACE_STATE < (1ull << 63),
+static_assert(RADV_CMD_DIRTY_PS_EPILOG_STATE < (1ull << 63),
               "CMD dirty bits must fit in 64-bit storage");
 
 enum radv_cmd_flush_bits {
@@ -191,17 +189,17 @@ struct radv_streamout_binding {
 };
 
 struct radv_streamout_state {
-   /* Mask of bound streamout buffers. */
-   uint8_t enabled_mask;
+   /* VA of the streamout state (GFX12+). */
+   uint64_t state_va;
 
    /* State of VGT_STRMOUT_BUFFER_(CONFIG|END) */
    uint32_t hw_enabled_mask;
 
+   /* Mask of bound streamout buffers. */
+   uint8_t enabled_mask;
+
    /* State of VGT_STRMOUT_(CONFIG|EN) */
    bool streamout_enabled;
-
-   /* VA of the streamout state (GFX12+). */
-   uint64_t state_va;
 };
 
 /**
@@ -231,7 +229,6 @@ struct radv_attachment {
 struct radv_rendering_state {
    bool active;
    bool has_image_views;
-   bool has_input_attachment_concurrent_writes;
    bool has_custom_resolves;
    VkRect2D area;
    uint32_t layer_count;
@@ -244,7 +241,7 @@ struct radv_rendering_state {
    struct radv_attachment color_att[MAX_RTS];
    struct radv_attachment ds_att;
    VkImageAspectFlags ds_att_aspects;
-   bool has_hiz_his; /* GFX12+ */
+   bool gfx12_has_hiz;
    struct radv_attachment vrs_att;
    VkExtent2D vrs_texel_size;
 };
@@ -444,7 +441,6 @@ struct radv_cmd_state {
    bool uses_vrs;
    bool uses_vrs_attachment;
    bool uses_vrs_coarse_shading;
-   bool uses_fbfetch_output;
 
    uint64_t shader_query_buf_va; /* GFX12+ */
 
@@ -466,6 +462,8 @@ struct radv_enc_state {
    uint32_t *copy_start;
    VkVideoEncodeRateControlModeFlagBitsKHR rate_control_mode;
    uint32_t rate_control_num_layers;
+   uint32_t coded_width;
+   uint32_t coded_height;
 };
 
 struct radv_cmd_buffer_upload {
@@ -634,7 +632,7 @@ radv_cmdbuf_has_stage(const struct radv_cmd_buffer *cmd_buffer, mesa_shader_stag
 }
 
 static inline uint32_t
-radv_get_num_pipeline_stat_queries(struct radv_cmd_buffer *cmd_buffer)
+radv_get_num_pipeline_stat_queries(const struct radv_cmd_buffer *cmd_buffer)
 {
    /* SAMPLE_STREAMOUTSTATS also requires PIPELINESTAT_START to be enabled. */
    return cmd_buffer->state.active_pipeline_queries + cmd_buffer->state.active_prims_gen_queries +

@@ -583,6 +583,7 @@ assign_alu_regclass(isel_context* ctx, nir_alu_instr* alu_instr, RegClass* regcl
          }
          break;
       }
+      }
    }
 
    const RegClass rc = get_reg_class(ctx, type, num_components, bitsize);
