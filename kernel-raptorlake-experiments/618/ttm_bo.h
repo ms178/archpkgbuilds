@@ -52,7 +52,8 @@
  * Benchmarks show this improves 1GB buffer mapping by 4-10x compared to
  * single-page faulting.
  */
-#if defined(CONFIG_PGTABLE_LEVELS) && (CONFIG_PGTABLE_LEVELS > 2)
+#if defined(CONFIG_PGTABLE_LEVELS) && (CONFIG_PGTABLE_LEVELS > 2) && \
+	defined(PMD_SHIFT)
 #define TTM_BO_VM_NUM_PREFAULT	((pgoff_t)1 << (PMD_SHIFT - PAGE_SHIFT))
 #else
 #define TTM_BO_VM_NUM_PREFAULT	((pgoff_t)16)
