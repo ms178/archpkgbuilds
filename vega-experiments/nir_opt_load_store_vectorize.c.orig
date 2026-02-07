@@ -1554,6 +1554,10 @@ try_vectorize_shared2(struct vectorize_ctx *ctx,
                       struct entry *low, struct entry *high,
                       struct entry *first, struct entry *second)
 {
+   /* Don't use shared2 for vectorization across blocks. */
+   if (first->index == -1)
+      return false;
+
    unsigned low_bit_size = get_bit_size(low);
    unsigned high_bit_size = get_bit_size(high);
    unsigned low_size = low->num_components * low_bit_size / 8;
