@@ -255,6 +255,8 @@ struct ssa_info {
          return false;
       if (phys_reg != exec && phys_reg != exec_hi)
          return true;
+      if (UNLIKELY(!parent_instr))
+         return false;
       return exec_id == parent_instr->pass_flags;
    }
 };

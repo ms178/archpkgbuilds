@@ -14,6 +14,7 @@
 #include "ac_nir.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <limits>
 #include <vector>
 
@@ -127,8 +128,10 @@ sanitize_if(nir_function_impl *impl, nir_if *nif)
     * or dead control-flow passes and are perfectly legal. Run a quick phi
     * removal on the block after the if to clean up any such phis.
     */
-   nir_block *const next_block = nir_cf_node_as_block(nir_cf_node_next(&nif->cf_node));
-   nir_remove_single_src_phis_block(next_block);
+   nir_cf_node *const next_cf = nir_cf_node_next(&nif->cf_node);
+   if (next_cf && next_cf->type == nir_cf_node_block) {
+      nir_remove_single_src_phis_block(nir_cf_node_as_block(next_cf));
+   }
 
    /* Finally, move the continue-from branch after the if-statement. */
    nir_block *const last_continue_from_blk = then_jump ? else_block : then_block;
@@ -184,7 +187,7 @@ sanitize_cf_list(nir_function_impl *impl, struct exec_list *cf_list)
           * field.
           */
          nir_block *const next_block = nir_cf_node_cf_tree_next(&loop->cf_node);
-         if (next_block->predecessors.entries == 0) {
+         if (next_block && next_block->predecessors.entries == 0) {
             nir_builder b = nir_builder_create(impl);
             b.cursor = nir_after_block_before_jump(nir_loop_last_block(loop));
 
@@ -347,18 +350,20 @@ skip_uniformize_merge_phi(const nir_def *ssa, unsigned depth)
 
       case nir_instr_type_intrinsic: {
          const nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(parent);
-         const unsigned num_srcs = nir_intrinsic_infos[intrin->intrinsic].num_srcs;
+         const int num_srcs = nir_intrinsic_infos[intrin->intrinsic].num_srcs;
 
          /*
-          * Calculate source index safely.
-          * The src pointer should be within the intrin->src array.
+          * Compute source index with strict bounds checking.
+          * If the use isn't one of the intrinsic's fixed sources,
+          * conservatively reject skipping uniformization.
           */
-         unsigned src_idx = 0;
-         for (unsigned i = 0; i < num_srcs; i++) {
-            if (&intrin->src[i] == src) {
-               src_idx = i;
-               break;
-            }
+         if (num_srcs <= 0) {
+            return false;
+         }
+
+         const ptrdiff_t src_idx = src - &intrin->src[0];
+         if (src_idx < 0 || src_idx >= num_srcs) {
+            return false;
          }
 
          /*

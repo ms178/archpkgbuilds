@@ -1040,9 +1040,12 @@ new_bitsize_acceptable(struct vectorize_ctx *ctx, unsigned new_bit_size,
    /* check nir_extract_bits limitations */
    unsigned common_bit_size = MIN2(get_bit_size(low), get_bit_size(high));
    common_bit_size = MIN2(common_bit_size, new_bit_size);
-   if (high_offset > 0)
-      common_bit_size = MIN2(common_bit_size,
-                             (1u << (ffs((int)(high_offset * 8u)) - 1)));
+   if (high_offset > 0) {
+      int lsb = ffsll((long long)(high_offset * 8u));
+      if (lsb <= 0)
+         return false;
+      common_bit_size = MIN2(common_bit_size, (1u << (lsb - 1)));
+   }
    if (new_bit_size / common_bit_size > NIR_MAX_VEC_COMPONENTS)
       return false;
 
