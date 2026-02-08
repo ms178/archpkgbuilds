@@ -213,6 +213,28 @@ static int ixgbe_build_pcore_mask(struct ixgbe_adapter *adapter,
 	return 0;
 }
 
+static unsigned int ixgbe_pick_interrupt_cpu(const struct cpumask *pcore_mask,
+					     unsigned int vector)
+{
+	unsigned int cpu, selected = nr_cpu_ids;
+	unsigned int idx = 0;
+
+	for_each_cpu(cpu, pcore_mask) {
+		if (idx++ == vector) {
+			selected = cpu;
+			break;
+		}
+	}
+
+	if (selected < nr_cpu_ids)
+		return selected;
+
+	if (!cpumask_empty(pcore_mask))
+		return cpumask_first(pcore_mask);
+
+	return cpumask_first(cpu_online_mask);
+}
+
 static int ixgbe_parse_gaming_ports(const char *ranges, u16 *ports, int max_ports)
 {
 	char *dup, *cur, *tok;
@@ -313,6 +335,8 @@ static void ixgbe_gaming_atr_clear_filters(struct ixgbe_adapter *adapter)
 
 	if (!old_count) return;
 
+	spin_lock(&adapter->fdir_perfect_lock);
+
 	/* Erase filters from hardware.
 	 * Note: We rely on the fact that we've cleared the SW state,
 	 * so race conditions on re-programming are minimized.
@@ -333,6 +357,8 @@ static void ixgbe_gaming_atr_clear_filters(struct ixgbe_adapter *adapter)
 
 		ixgbe_fdir_erase_perfect_filter_82599(hw, &input, gf->soft_id);
 	}
+
+	spin_unlock(&adapter->fdir_perfect_lock);
 }
 
 static int ixgbe_gaming_atr_program_filters(struct ixgbe_adapter *adapter)
@@ -343,6 +369,7 @@ static int ixgbe_gaming_atr_program_filters(struct ixgbe_adapter *adapter)
 	u8 ipv4_count = 0, ipv6_count = 0;
 	union ixgbe_atr_input mask;
 	u8 queue = 0;
+	int queue_found = -ENOENT;
 
 	if (hw->mac.type < ixgbe_mac_82599EB)
 		return 0;
@@ -382,8 +409,18 @@ static int ixgbe_gaming_atr_program_filters(struct ixgbe_adapter *adapter)
 	if (ret)
 		return ret;
 
-	if (adapter->rx_ring[0])
-		queue = adapter->rx_ring[0]->reg_idx;
+	for (i = 0; i < adapter->num_rx_queues; i++) {
+		if (!adapter->rx_ring[i])
+			continue;
+		queue = adapter->rx_ring[i]->reg_idx;
+		queue_found = 0;
+		break;
+	}
+
+	if (queue_found)
+		return queue_found;
+
+	spin_lock(&adapter->fdir_perfect_lock);
 
 	spin_lock_bh(&adapter->gaming_fdir_lock);
 	for (i = 0; i < num_ports; i++) {
@@ -426,6 +463,7 @@ static int ixgbe_gaming_atr_program_filters(struct ixgbe_adapter *adapter)
 	}
 	adapter->gaming_atr_enabled = (adapter->gaming_filter_count > 0);
 	spin_unlock_bh(&adapter->gaming_fdir_lock);
+	spin_unlock(&adapter->fdir_perfect_lock);
 
 	e_info(drv, "Gaming ATR: Programmed %d filters (v4:%d v6:%d)\n",
 	       adapter->gaming_filter_count, ipv4_count, ipv6_count);
@@ -2290,6 +2328,8 @@ void ixgbe_process_skb_fields(struct ixgbe_ring *rx_ring,
 static __always_inline bool ixgbe_is_tiny_udp(const struct sk_buff *skb)
 {
 	/* Ethernet header is already pulled by eth_type_trans, so skb->data points to L3 */
+	struct iphdr _iph;
+	struct ipv6hdr _ip6h;
 	const struct iphdr *iph;
 	const struct ipv6hdr *ip6h;
 
@@ -2301,7 +2341,13 @@ static __always_inline bool ixgbe_is_tiny_udp(const struct sk_buff *skb)
 		if (unlikely(skb->len < sizeof(struct iphdr)))
 			return false;
 
-		iph = (const struct iphdr *)skb->data;
+		iph = skb_header_pointer(skb, 0, sizeof(_iph), &_iph);
+		if (unlikely(!iph))
+			return false;
+
+		if (unlikely(iph->version != 4 || iph->ihl < 5))
+			return false;
+
 		return iph->protocol == IPPROTO_UDP;
 	}
 
@@ -2311,7 +2357,10 @@ static __always_inline bool ixgbe_is_tiny_udp(const struct sk_buff *skb)
 		if (unlikely(skb->len < sizeof(struct ipv6hdr)))
 			return false;
 
-		ip6h = (const struct ipv6hdr *)skb->data;
+		ip6h = skb_header_pointer(skb, 0, sizeof(_ip6h), &_ip6h);
+		if (unlikely(!ip6h))
+			return false;
+
 		return ip6h->nexthdr == IPPROTO_UDP;
 	}
 #endif
@@ -2321,34 +2370,9 @@ static __always_inline bool ixgbe_is_tiny_udp(const struct sk_buff *skb)
 
 void ixgbe_rx_skb(struct ixgbe_q_vector *q_vector, struct sk_buff *skb)
 {
-	if (gaming_mode && skb->len <= 256) {
-		if (skb->protocol == htons(ETH_P_IP)) {
-			const struct iphdr *iph;
-
-			if (likely(pskb_may_pull(skb, sizeof(*iph)))) {
-				iph = (const struct iphdr *)skb->data;
-				if (likely(iph->version == 4 &&
-					   iph->ihl >= 5 &&
-					   pskb_may_pull(skb, iph->ihl * 4) &&
-					   iph->protocol == IPPROTO_UDP)) {
-					netif_receive_skb(skb);
-					return;
-				}
-			}
-		}
-#if IS_ENABLED(CONFIG_IPV6)
-		if (skb->protocol == htons(ETH_P_IPV6)) {
-			const struct ipv6hdr *ip6h;
-
-			if (likely(pskb_may_pull(skb, sizeof(*ip6h)))) {
-				ip6h = (const struct ipv6hdr *)skb->data;
-				if (likely(ip6h->nexthdr == IPPROTO_UDP)) {
-					netif_receive_skb(skb);
-					return;
-				}
-			}
-		}
-#endif
+	if (gaming_mode && ixgbe_is_tiny_udp(skb)) {
+		netif_receive_skb(skb);
+		return;
 	}
 
 	napi_gro_receive(&q_vector->napi, skb);
@@ -3260,7 +3284,8 @@ adjust_by_size:
 
 out_commit:
 	if ((itr & ~IXGBE_ITR_ADAPTIVE_LATENCY) < IXGBE_GAMING_ITR_MIN)
-		itr = IXGBE_GAMING_ITR_MIN |
+		itr = (gaming_mode ? IXGBE_GAMING_ITR_MIN :
+		       IXGBE_ITR_ADAPTIVE_MIN_USECS) |
 		      (itr & IXGBE_ITR_ADAPTIVE_LATENCY);
 
 	ring_container->itr = itr;
@@ -4032,6 +4057,7 @@ static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
 	for (vector = 0; vector < adapter->num_q_vectors; vector++) {
 		struct ixgbe_q_vector *q_vector = adapter->q_vector[vector];
 		struct msix_entry *entry = &adapter->msix_entries[vector];
+		unsigned int cpu;
 
 		if (q_vector->tx.ring && q_vector->rx.ring) {
 			snprintf(q_vector->name, sizeof(q_vector->name),
@@ -4055,7 +4081,12 @@ static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
 			goto free_queue_irqs;
 		}
 
-		cpumask_copy(&q_vector->affinity_mask, pcore_mask);
+		cpu = ixgbe_pick_interrupt_cpu(pcore_mask, vector);
+		cpumask_clear(&q_vector->affinity_mask);
+		if (cpu < nr_cpu_ids)
+			cpumask_set_cpu(cpu, &q_vector->affinity_mask);
+		if (cpumask_empty(&q_vector->affinity_mask))
+			cpumask_copy(&q_vector->affinity_mask, pcore_mask);
 		irq_update_affinity_hint(entry->vector, &q_vector->affinity_mask);
 	}
 
@@ -6972,10 +7003,10 @@ static void ixgbe_clean_tx_ring(struct ixgbe_ring *tx_ring)
 			dev_kfree_skb_any(tx_buffer->skb);
 
 		/* unmap skb header data */
-		dma_unmap_single(tx_ring->dev,
-				 dma_unmap_addr(tx_buffer, dma),
-				 dma_unmap_len(tx_buffer, len),
-				 DMA_TO_DEVICE);
+		ixgbe_dma_unmap_single(tx_ring->dev,
+				      dma_unmap_addr(tx_buffer, dma),
+				      dma_unmap_len(tx_buffer, len),
+				      DMA_TO_DEVICE);
 
 		/* check for eop_desc to determine the end of the packet */
 		eop_desc = tx_buffer->next_to_watch;
@@ -6994,10 +7025,10 @@ static void ixgbe_clean_tx_ring(struct ixgbe_ring *tx_ring)
 
 			/* unmap any remaining paged data */
 			if (dma_unmap_len(tx_buffer, len))
-				dma_unmap_page(tx_ring->dev,
-					       dma_unmap_addr(tx_buffer, dma),
-					       dma_unmap_len(tx_buffer, len),
-					       DMA_TO_DEVICE);
+				ixgbe_dma_unmap_page(tx_ring->dev,
+				     dma_unmap_addr(tx_buffer, dma),
+				     dma_unmap_len(tx_buffer, len),
+				     DMA_TO_DEVICE);
 		}
 
 		/* move us one more past the eop_desc for start of next pkt */
