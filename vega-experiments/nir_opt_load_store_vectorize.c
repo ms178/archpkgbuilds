@@ -1034,7 +1034,7 @@ new_bitsize_acceptable(struct vectorize_ctx *ctx, unsigned new_bit_size,
    uint64_t high_offset = (uint64_t)high_offset_signed;
 
    /* This can cause issues when combining store data. */
-   if (high_offset % (new_bit_size / 8u) != 0)
+   if (low->is_store && (high_offset % (new_bit_size / 8) != 0))
       return false;
 
    /* check nir_extract_bits limitations */
