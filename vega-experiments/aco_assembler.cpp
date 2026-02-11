@@ -14,6 +14,7 @@
 #include "ac_shader_util.h"
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 
@@ -44,14 +45,6 @@ struct asm_context {
    asm_context(Program* program_, std::vector<struct aco_symbol>* symbols_)
        : program(program_), gfx_level(program_->gfx_level), symbols(symbols_)
    {
-      /* Pre-size hash maps to avoid rehashing during assembly.
-       * Values chosen based on typical shader complexity. */
-      constaddrs.reserve(256);
-      resumeaddrs.reserve(32);
-      branches.reserve(512);
-
-      /* Select opcode table based on GFX level.
-       * GFX9 (Vega) uses opcode_gfx9. */
       if (gfx_level <= GFX7)
          opcode = &instr_info.opcode_gfx7[0];
       else if (gfx_level <= GFX9)
@@ -63,17 +56,19 @@ struct asm_context {
       else
          opcode = &instr_info.opcode_gfx12[0];
    }
+
+   void reserve_counts(size_t branch_reserve, size_t constaddr_reserve, size_t resumeaddr_reserve)
+   {
+      const size_t branch_cap = branch_reserve + branch_reserve / 2u + 8u;
+      branches.reserve(branch_cap);
+      constaddrs.reserve(constaddr_reserve + 8u);
+      resumeaddrs.reserve(resumeaddr_reserve + 4u);
+   }
 };
 
 unsigned
 get_mimg_nsa_dwords(const Instruction* instr)
 {
-   /* MIMG instructions require at least 4 operands:
-    * [0] = resource descriptor
-    * [1] = sampler descriptor
-    * [2] = vdata
-    * [3+] = address components
-    * Guard against malformed instructions. */
    if (instr->operands.size() < 4) [[unlikely]]
       return 0;
 
@@ -88,7 +83,7 @@ get_mimg_nsa_dwords(const Instruction* instr)
       const PhysReg expected = instr->operands[i - 1].physReg().advance(
          instr->operands[i - 1].bytes());
       if (instr->operands[i].physReg() != expected)
-         return DIV_ROUND_UP(addr_dwords - 1, 4);
+         return addr_dwords ? DIV_ROUND_UP(addr_dwords - 1, 4) : 0;
    }
    return 0;
 }
@@ -322,10 +317,10 @@ emit_smem_instruction(asm_context& ctx, std::vector<uint32_t>& out, const Instru
 
    if (gfx <= GFX9) [[likely]] {
       if (instr->operands.size() >= 2)
-         encoding |= instr->operands[1].isConstant() ? 1u << 17 : 0;
+         encoding |= instr->operands[1].isConstant() ? 1u << 17 : 0u;
    }
    if (gfx == GFX9) [[likely]] {
-      encoding |= soe ? 1u << 14 : 0;
+      encoding |= soe ? 1u << 14 : 0u;
    }
 
    if (is_load || instr->operands.size() >= 3) {
@@ -882,9 +877,15 @@ emit_mimg_instruction_gfx12(asm_context& ctx, std::vector<uint32_t>& out, const 
          continue;
       vaddr[k++] = reg(ctx, instr->operands[i], 8);
    }
-   int num_vaddr = instr->operands.size() - 3;
-   for (int i = 0; i < (int)MIN2(instr->operands.back().size() - 1, ARRAY_SIZE(vaddr) - num_vaddr); i++)
-      vaddr[num_vaddr + i] = reg(ctx, instr->operands.back(), 8) + i + 1;
+
+   const unsigned num_vaddr = instr->operands.size() - 3;
+   const unsigned back_size = instr->operands.back().size();
+   if (back_size > 1 && num_vaddr < ARRAY_SIZE(vaddr)) {
+      const unsigned max_fill = ARRAY_SIZE(vaddr) - num_vaddr;
+      const unsigned fill = MIN2(back_size - 1, max_fill);
+      for (unsigned i = 0; i < fill; i++)
+         vaddr[num_vaddr + i] = reg(ctx, instr->operands.back(), 8) + i + 1;
+   }
 
    encoding = 0;
    if (!instr->definitions.empty())
@@ -1031,9 +1032,6 @@ emit_exp_instruction(asm_context& ctx, std::vector<uint32_t>& out, const Instruc
    encoding |= exp.dest << 4;
    encoding |= exp.enabled_mask;
 
-   /* GFX6 (except OLAND and HAINAN) has a bug that it only looks at the X
-    * writemask component.
-    */
    if (ctx.program->dev.has_gfx6_mrt_export_bug && exp.enabled_mask && exp.dest <= V_008DFC_SQ_EXP_MRTZ) {
       encoding |= 0x1;
    }
@@ -1101,7 +1099,6 @@ emit_vop3_instruction(asm_context& ctx, std::vector<uint32_t>& out, const Instru
    const VALU_instruction& vop3 = instr->valu();
    const enum amd_gfx_level gfx = ctx.gfx_level;
 
-   /* Adjust opcode based on original instruction format */
    if (instr->isVOP2()) {
       opcode += 0x100;
    } else if (instr->isVOP1()) {
@@ -1109,7 +1106,6 @@ emit_vop3_instruction(asm_context& ctx, std::vector<uint32_t>& out, const Instru
    } else if (instr->isVINTRP()) {
       opcode += 0x270;
    }
-   /* VOPC: no adjustment needed (offset is 0) */
 
    uint32_t encoding;
    if (gfx <= GFX9) {
@@ -1145,8 +1141,6 @@ emit_vop3_instruction(asm_context& ctx, std::vector<uint32_t>& out, const Instru
    for (unsigned i = 0; i < num_ops; i++)
       encoding |= reg(ctx, instr->operands[i]) << (i * 9);
 
-   /* RDNA (GFX10+): encode unused operand slots as inline constant 0 (encoding 128)
-    * for decoder performance. GFX9 and earlier leave unused slots as zero. */
    if (gfx >= GFX10) [[unlikely]] {
       for (unsigned i = num_ops; i < 3; i++)
          encoding |= 128u << (i * 9);
@@ -1188,8 +1182,6 @@ emit_vop3p_instruction(asm_context& ctx, std::vector<uint32_t>& out, const Instr
    for (unsigned i = 0; i < num_ops; i++)
       encoding |= reg(ctx, instr->operands[i]) << (i * 9);
 
-   /* RDNA (GFX10+): encode unused operand slots as inline constant 0 (encoding 128)
-    * for decoder performance. GFX9 and earlier leave unused slots as zero. */
    if (gfx >= GFX10) [[unlikely]] {
       for (unsigned i = num_ops; i < 3; i++)
          encoding |= 128u << (i * 9);
@@ -1804,6 +1796,8 @@ emit_program(Program* program, std::vector<uint32_t>& code, std::vector<struct a
    size_t estimated_insn_count = 0;
    size_t loop_count = 0;
    size_t branch_count = 0;
+   size_t constaddr_count = 0;
+   size_t resumeaddr_count = 0;
 
    for (const Block& block : program->blocks) {
       estimated_insn_count += block.instructions.size();
@@ -1812,8 +1806,22 @@ emit_program(Program* program, std::vector<uint32_t>& code, std::vector<struct a
       for (const aco_ptr<Instruction>& instr : block.instructions) {
          if (instr_info.classes[(int)instr->opcode] == instr_class::branch)
             branch_count++;
+         switch (instr->opcode) {
+         case aco_opcode::p_constaddr_getpc:
+         case aco_opcode::p_constaddr_addlo:
+            constaddr_count++;
+            break;
+         case aco_opcode::p_resumeaddr_getpc:
+         case aco_opcode::p_resumeaddr_addlo:
+            resumeaddr_count++;
+            break;
+         default:
+            break;
+         }
       }
    }
+
+   ctx.reserve_counts(branch_count, constaddr_count, resumeaddr_count);
 
    const size_t base = (estimated_insn_count <= UINT32_MAX / 3)
                         ? (estimated_insn_count * 5) / 2
@@ -1827,7 +1835,7 @@ emit_program(Program* program, std::vector<uint32_t>& code, std::vector<struct a
    const size_t cascade_depth = 3;
    const size_t chains_per_branch = (1u << cascade_depth);
    const size_t dwords_per_chain = 10u;
-   const size_t branch_chaining = (branch_count / 10) * chains_per_branch * dwords_per_chain;
+   const size_t branch_chaining = (branch_count / 10u) * chains_per_branch * dwords_per_chain;
 
    const size_t constant_dwords     = (program->constant_data.size() + 3u) / 4u;
    const size_t endpgm_padding      = append_endpgm ? 5u : 0u;
@@ -1867,8 +1875,13 @@ emit_program(Program* program, std::vector<uint32_t>& code, std::vector<struct a
 
    while (program->constant_data.size() % 4u)
       program->constant_data.push_back(0);
-   code.insert(code.end(), (uint32_t*)program->constant_data.data(),
-               (uint32_t*)(program->constant_data.data() + program->constant_data.size()));
+
+   const size_t const_bytes = program->constant_data.size();
+   const size_t const_words = const_bytes / 4u;
+   const size_t old_size = code.size();
+   code.resize(old_size + const_words);
+   if (const_bytes)
+      std::memcpy(code.data() + old_size, program->constant_data.data(), const_bytes);
 
    program->config->scratch_bytes_per_wave =
       align(program->config->scratch_bytes_per_wave + program->scratch_arg_size,
@@ -1878,4 +1891,4 @@ emit_program(Program* program, std::vector<uint32_t>& code, std::vector<struct a
    return exec_size;
 }
 
-}
+} // namespace aco
