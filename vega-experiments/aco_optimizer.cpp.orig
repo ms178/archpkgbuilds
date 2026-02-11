@@ -3440,6 +3440,10 @@ match_and_apply_patterns(opt_ctx& ctx, alu_opt_info& info,
 
          if (op_instr.defs[0].isPrecise())
             new_info.defs[0].setPrecise(true);
+         if (op_instr.defs[0].isNaNPreserve())
+            new_info.defs[0].setNaNPreserve(true);
+         if (op_instr.defs[0].isInfPreserve())
+            new_info.defs[0].setInfPreserve(true);
 
          if (pattern.callback && !pattern.callback(ctx, new_info))
             continue;
@@ -4001,7 +4005,7 @@ create_med3_cb(opt_ctx& ctx, alu_opt_info& info)
    aco_type type = instr_info.alu_opcode_infos[(int)info.opcode].def_types[0];
 
    /* NaN correctness needs max first, then min. */
-   if (!max_first && type.base_type == aco_base_type_float && info.defs[0].isPrecise())
+   if (!max_first && type.base_type == aco_base_type_float && info.defs[0].isNaNPreserve())
       return false;
 
    uint64_t upper = 0;
