@@ -1008,7 +1008,17 @@ visit_if(isel_context* ctx, nir_if* if_stmt)
        *                        \    /
        *                        BB_ENDIF
        *
-       * *) Exceptions may be due to break and continue statements within loops
+       *
+       * Exceptions may be due to break and continue statements within loops:
+       *
+       * The linear CFG:
+       *                        BB_IF
+       *                        /    \
+       *       BB_THEN (logical)      \
+       *           /    \              \
+       *    BB_JUMP    BB_CONTINUE    BB_ELSE     (all linear)
+       *                        \      /
+       *                        BB_ENDIF
        **/
 
       begin_divergent_if_then(ctx, &ic, cond, if_stmt->control);
