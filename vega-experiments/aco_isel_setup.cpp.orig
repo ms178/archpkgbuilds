@@ -65,7 +65,8 @@ only_used_by_cross_lane_instrs(nir_def* ssa, bool follow_phis = true)
  * block instead. This is so that we can use any SGPR live-out of the side
  * without the branch without creating a linear phi in the invert or merge block.
  *
- * This also removes any unreachable merge blocks.
+ * This also removes any unreachable merge blocks and ensures that branches are
+ * in THEN side.
  */
 bool
 sanitize_if(nir_function_impl* impl, nir_if* nif)
@@ -77,11 +78,11 @@ sanitize_if(nir_function_impl* impl, nir_if* nif)
    if (!then_jump && !else_jump)
       return false;
 
-   /* If the continue from block is empty then return as there is nothing to
-    * move.
-    */
-   if (nir_cf_list_is_empty_block(then_jump ? &nif->else_list : &nif->then_list))
+   /* If the else block is empty then return as there is nothing to move. */
+   if (nir_cf_list_is_empty_block(&nif->else_list)) {
+      assert(then_jump);
       return false;
+   }
 
    /* Even though this if statement has a jump on one side, we may still have
     * phis afterwards.  Single-source phis can be produced by loop unrolling
@@ -90,19 +91,29 @@ sanitize_if(nir_function_impl* impl, nir_if* nif)
     */
    nir_remove_single_src_phis_block(nir_cf_node_as_block(nir_cf_node_next(&nif->cf_node)));
 
-   /* Finally, move the continue from branch after the if-statement. */
-   nir_block* last_continue_from_blk = then_jump ? else_block : then_block;
-   nir_block* first_continue_from_blk =
-      then_jump ? nir_if_first_else_block(nif) : nir_if_first_then_block(nif);
-
    /* We don't need to repair SSA. nir_remove_after_cf_node() replaces any uses with undef. */
    if (then_jump && else_jump)
       nir_remove_after_cf_node(&nif->cf_node);
 
-   nir_cf_list tmp;
-   nir_cf_extract(&tmp, nir_before_block(first_continue_from_blk),
-                  nir_after_block(last_continue_from_blk));
-   nir_cf_reinsert(&tmp, nir_after_cf_node(&nif->cf_node));
+   nir_cf_list else_list;
+   nir_cf_extract(&else_list, nir_before_cf_list(&nif->else_list), nir_after_block(else_block));
+
+   if (then_jump) {
+      /* Move the else block from branch after the if-statement. */
+      nir_cf_reinsert(&else_list, nir_after_cf_node(&nif->cf_node));
+   } else if (else_jump) {
+      /* If the jump is in the else block, move the then block after the if-statement. */
+      nir_cf_list then_list;
+      nir_cf_extract(&then_list, nir_before_cf_list(&nif->then_list), nir_after_block(then_block));
+      nir_cf_reinsert(&then_list, nir_after_cf_node(&nif->cf_node));
+
+      /* Move the previous then block to the else list and invert the condition. */
+      nir_cf_reinsert(&else_list, nir_before_cf_list(&nif->then_list));
+      nir_builder b = nir_builder_create(impl);
+      b.cursor = nir_before_src(&nif->condition);
+      nir_def* cond = nir_inot(&b, nif->condition.ssa);
+      nir_src_rewrite(&nif->condition, cond);
+   }
 
    return true;
 }
@@ -542,9 +553,6 @@ init_context(isel_context* ctx, nir_shader* shader)
                RegType type = RegType::sgpr;
                switch (intrinsic->intrinsic) {
                case nir_intrinsic_load_push_constant:
-               case nir_intrinsic_load_workgroup_id:
-               case nir_intrinsic_load_num_workgroups:
-               case nir_intrinsic_load_subgroup_id:
                case nir_intrinsic_load_num_subgroups:
                case nir_intrinsic_vote_all:
                case nir_intrinsic_vote_any:
