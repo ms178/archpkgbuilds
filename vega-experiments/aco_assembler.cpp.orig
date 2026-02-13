@@ -36,8 +36,8 @@ struct asm_context {
    std::map<unsigned, constaddr_info> constaddrs;
    std::map<unsigned, constaddr_info> resumeaddrs;
    std::vector<struct aco_symbol>* symbols;
-   uint32_t loop_header = -1u;
-   uint32_t loop_exit = 0u;
+   uint32_t loop_latch = -1u;
+   uint32_t loop_exit = -1u;
    const int16_t* opcode;
    // TODO: keep track of branch instructions referring blocks
    // and, when emitting the block, correct the offset in instr
@@ -1421,6 +1421,8 @@ emit_instruction(asm_context& ctx, std::vector<uint32_t>& out, Instruction* inst
 void
 emit_block(asm_context& ctx, std::vector<uint32_t>& out, Block& block)
 {
+   block.offset = out.size();
+
    for (aco_ptr<Instruction>& instr : block.instructions) {
 #if 0
       int start_idx = out.size();
@@ -1714,16 +1716,16 @@ void
 align_block(asm_context& ctx, std::vector<uint32_t>& code, Block& block)
 {
    /* Align the previous loop. */
-   if (ctx.loop_header != -1u &&
-       block.loop_nest_depth < ctx.program->blocks[ctx.loop_header].loop_nest_depth) {
+   if (ctx.loop_latch != -1u &&
+       block.loop_nest_depth < ctx.program->blocks[ctx.loop_latch].loop_nest_depth) {
       assert(ctx.loop_exit != -1u);
-      Block& loop_header = ctx.program->blocks[ctx.loop_header];
+      Block& loop_latch = ctx.program->blocks[ctx.loop_latch];
       Block& loop_exit = ctx.program->blocks[ctx.loop_exit];
-      ctx.loop_header = -1u;
+      ctx.loop_latch = -1u;
       ctx.loop_exit = -1u;
       std::vector<uint32_t> nops;
 
-      const unsigned loop_num_cl = DIV_ROUND_UP(block.offset - loop_header.offset, 16);
+      const unsigned loop_num_cl = DIV_ROUND_UP(code.size() - loop_latch.offset, 16);
 
       /* On GFX10.3+, change the prefetch mode if the loop fits into 2 or 3 cache lines.
        * Don't use the s_inst_prefetch instruction on GFX10 as it might cause hangs.
@@ -1733,11 +1735,11 @@ align_block(asm_context& ctx, std::vector<uint32_t>& code, Block& block)
                                    loop_num_cl <= 3;
 
       if (change_prefetch) {
-         Builder bld(ctx.program, &ctx.program->blocks[loop_header.linear_preds[0]]);
+         Builder bld(ctx.program, &ctx.program->blocks[loop_latch.linear_preds[0]]);
          int16_t prefetch_mode = loop_num_cl == 3 ? 0x1 : 0x2;
          Instruction* instr = bld.sopp(aco_opcode::s_inst_prefetch, prefetch_mode);
          emit_instruction(ctx, nops, instr);
-         insert_code(ctx, code, loop_header.offset, nops.size(), nops.data());
+         insert_code(ctx, code, loop_latch.offset, nops.size(), nops.data());
 
          /* Change prefetch mode back to default (0x3) at the loop exit. */
          bld.reset(&loop_exit.instructions, loop_exit.instructions.begin());
@@ -1749,19 +1751,19 @@ align_block(asm_context& ctx, std::vector<uint32_t>& code, Block& block)
          }
       }
 
-      const unsigned loop_start_cl = loop_header.offset >> 4;
-      const unsigned loop_end_cl = (block.offset - 1) >> 4;
+      const unsigned loop_start_cl = loop_latch.offset >> 4;
+      const unsigned loop_end_cl = (code.size() - 1) >> 4;
 
       /* Align the loop if it fits into the fetched cache lines or if we can
        * reduce the number of cache lines with less than 8 NOPs.
        */
       const bool align_loop = loop_end_cl - loop_start_cl >= loop_num_cl &&
-                              (loop_num_cl == 1 || change_prefetch || loop_header.offset % 16 > 8);
+                              (loop_num_cl == 1 || change_prefetch || loop_latch.offset % 16 > 8);
 
       if (align_loop) {
          nops.clear();
-         nops.resize(16 - (loop_header.offset % 16), 0xbf800000u);
-         insert_code(ctx, code, loop_header.offset, nops.size(), nops.data());
+         nops.resize(16 - (loop_latch.offset % 16), 0xbf800000u);
+         insert_code(ctx, code, loop_latch.offset, nops.size(), nops.data());
       }
    }
 
@@ -1771,19 +1773,27 @@ align_block(asm_context& ctx, std::vector<uint32_t>& code, Block& block)
        * Also ignore loops without back-edge.
        */
       if (block.linear_preds.size() > 1) {
-         ctx.loop_header = block.index;
+         ctx.loop_latch = block.index;
          ctx.loop_exit = -1u;
       }
+   }
+
+   if (ctx.loop_latch != -1u && (block.kind & block_kind_loop_latch)) {
+      /* The loop latch is the block where where the loop re-enters.
+       * It might be the loop header or a block from the end of the loop.
+       */
+      if (ctx.program->blocks[ctx.loop_latch].loop_nest_depth == block.loop_nest_depth)
+         ctx.loop_latch = block.index;
    }
 
    /* Blocks with block_kind_loop_exit might be eliminated after jump threading,
     * so we instead find loop exits using the successors when in loop_nest_depth.
     * This works, because control flow always re-converges after loops.
     */
-   if (ctx.loop_header != -1u && ctx.loop_exit == -1u) {
+   if (ctx.loop_latch != -1u && ctx.loop_exit == -1u) {
       for (uint32_t succ_idx : block.linear_succs) {
          Block& succ = ctx.program->blocks[succ_idx];
-         if (succ.loop_nest_depth < ctx.program->blocks[ctx.loop_header].loop_nest_depth)
+         if (succ.loop_nest_depth < ctx.program->blocks[ctx.loop_latch].loop_nest_depth)
             ctx.loop_exit = succ_idx;
       }
    }
@@ -1793,6 +1803,28 @@ align_block(asm_context& ctx, std::vector<uint32_t>& code, Block& block)
       size_t cache_aligned = align(code.size(), 16);
       code.resize(cache_aligned, 0xbf800000u); /* s_nop 0 */
       block.offset = code.size();
+   }
+}
+
+void
+emit_loop_latch(asm_context& ctx, std::vector<uint32_t>& code, Block& block)
+{
+   /* No actual loop. */
+   if (block.linear_preds.size() == 1)
+      return;
+
+   /* The loop header is also the loop latch. */
+   if (block.kind & block_kind_loop_latch)
+      return;
+
+   unsigned i = block.index;
+   while (ctx.program->blocks[i].loop_nest_depth >= block.loop_nest_depth) {
+      Block& latch_block = ctx.program->blocks[i++];
+      if (latch_block.loop_nest_depth == block.loop_nest_depth &&
+          (latch_block.kind & block_kind_loop_latch)) {
+         emit_block(ctx, code, latch_block);
+         break;
+      }
    }
 }
 
@@ -1815,8 +1847,13 @@ emit_program(Program* program, std::vector<uint32_t>& code, std::vector<struct a
       fix_exports(ctx, code, program);
 
    for (Block& block : program->blocks) {
-      block.offset = code.size();
       align_block(ctx, code, block);
+
+      if (block.kind & block_kind_loop_header)
+         emit_loop_latch(ctx, code, block);
+      else if (block.kind & block_kind_loop_latch)
+         continue;
+
       emit_block(ctx, code, block);
    }
 
