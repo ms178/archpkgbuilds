@@ -316,16 +316,23 @@ struct alu_opt_op {
    };
    uint32_t dpp_ctrl = 0;
 
-   alu_opt_op& operator=(const alu_opt_op& other)
-   {
-      memmove((void*)this, &other, sizeof(*this));
-
-      return *this;
-   }
-
    alu_opt_op() = default;
    alu_opt_op(Operand _op) : op(_op) {};
-   alu_opt_op(const alu_opt_op& other) { *this = other; }
+
+   alu_opt_op(const alu_opt_op& other)
+       : op(other.op), extract{other.extract[0], other.extract[1]}, _modifiers(other._modifiers),
+         dpp_ctrl(other.dpp_ctrl)
+   {}
+
+   alu_opt_op& operator=(const alu_opt_op& other)
+   {
+      op = other.op;
+      extract[0] = other.extract[0];
+      extract[1] = other.extract[1];
+      _modifiers = other._modifiers;
+      dpp_ctrl = other.dpp_ctrl;
+      return *this;
+   }
 
    uint64_t constant_after_mods(opt_ctx& ctx, aco_type type) const
    {
