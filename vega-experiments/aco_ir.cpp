@@ -79,6 +79,7 @@ init_program(Program* program, Stage stage, const struct aco_shader_info* info,
    program->gfx_level = options->gfx_level;
    program->wave_size = info->wave_size;
    program->lane_mask = program->wave_size == 32 ? s1 : s2;
+   program->preserve_s2 = info->vs.preserve_s2;
 
    /* GFX6: There is 64KB LDS per CU, but a single workgroup can only use 32KB. */
    program->dev.lds_limit = program->gfx_level >= GFX7 ? 65536 : 32768;
@@ -92,6 +93,11 @@ init_program(Program* program, Stage stage, const struct aco_shader_info* info,
    program->dev.physical_vgprs = options->cu_info->num_physical_wave64_vgprs_per_simd;
    program->dev.vgpr_alloc_granule = options->cu_info->wave64_vgpr_alloc_granularity;
    program->dev.vgpr_limit = options->cu_info->max_vgpr_alloc;
+
+   /* preserve_s2 works by removing the first 4 SGPRs from use, unless they're a precolored
+    * definition/operand. */
+   if (program->preserve_s2)
+      program->dev.sgpr_limit -= 4;
 
    if (program->wave_size == 32) {
       program->dev.physical_vgprs *= 2;
