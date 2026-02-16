@@ -1462,6 +1462,7 @@ optimizations.extend([
     (('ior',  ('b2i', 'a@1'), ('b2i', 'b@1')), ('b2i', ('ior', a, b))),
     (('fmul', ('b2f', 'a@1'), ('b2f', 'b@1')), ('b2f', ('iand', a, b))),
     (('ffma', ('b2f', 'a@1'), ('b2f', 'b@1'), c), ('fadd', ('b2f', ('iand', a, b)), c)),
+    (('fadd', 1.0, ('fneg', ('b2f', a))), ('b2f', ('inot', a))),
     (('fmul', ('b2f', ('fneu', a, 0)), a), ('fmul', 1.0, a)),
     (('ffma', ('b2f', ('fneu', a, 0)), a, b), ('fadd', a, b)),
     (('fsat', ('fadd', ('b2f', 'a@1'), ('b2f', 'b@1'))), ('b2f', ('ior', a, b))),
