@@ -573,8 +573,12 @@ remove_entry(SchedILPContext& ctx, const Instruction* const instr, const uint32_
          if (ctx.regs[reg].has_direct_dependency && ctx.regs[reg].direct_dependency == idx) {
             ctx.regs[reg].has_direct_dependency = false;
             if (!ctx.is_vopd) {
+               /* Do MAX2() so that the latency from both predecessors of a merge block are considered. */
+               if (BITSET_TEST(ctx.reg_has_latency, reg))
+                  ctx.regs[reg].latency = MAX2(ctx.regs[reg].latency, latency);
+               else
+                  ctx.regs[reg].latency = latency;
                BITSET_SET(ctx.reg_has_latency, reg);
-               ctx.regs[reg].latency = latency;
             }
          }
       }
