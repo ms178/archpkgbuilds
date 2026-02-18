@@ -9,9 +9,19 @@
 #include "util/bitset.h"
 #include "util/macros.h"
 
-#include <limits>
 #include <algorithm>
 #include <cassert>
+#include <limits>
+
+/*
+ * This pass implements a simple forward list-scheduler which works on a small
+ * partial DAG of 16 nodes at any time. Only ALU instructions are scheduled
+ * entirely freely. Memory load instructions must be kept in-order and any other
+ * instruction must not be re-scheduled at all.
+ *
+ * The main goal of this scheduler is to create more memory clauses, schedule
+ * memory loads early, and to improve ALU instruction level parallelism.
+ */
 
 namespace aco {
 namespace {
@@ -76,9 +86,9 @@ bool
 can_reorder(const Instruction* const instr)
 {
    if (instr->isVALU() || instr->isVINTRP())
-      return true;
+      return likely(true);
    if (!instr->isSALU() || instr->isSOPP())
-      return false;
+      return unlikely(false);
 
    switch (instr->opcode) {
    /* SOP2 */
@@ -112,11 +122,11 @@ can_reorder(const Instruction* const instr)
    case aco_opcode::s_subvector_loop_end:
    /* SOPC */
    case aco_opcode::s_setvskip:
-   case aco_opcode::s_set_gpr_idx_on: return false;
+   case aco_opcode::s_set_gpr_idx_on: return unlikely(false);
    default: break;
    }
 
-   return true;
+   return likely(true);
 }
 
 VOPDInfo
@@ -595,11 +605,11 @@ remove_entry(SchedILPContext& ctx, const Instruction* const instr, const uint32_
    }
 
    for (unsigned i = 0; i < num_nodes; i++) {
-     ctx.nodes[i].dependency_mask &= mask;
-     ctx.nodes[i].wait_cycles -= stall;
-     if ((ctx.nodes[idx].write_for_read_mask & BITFIELD_BIT(i)) && !ctx.is_vopd) {
-        ctx.nodes[i].wait_cycles = MAX2(ctx.nodes[i].wait_cycles, (int16_t)latency);
-     }
+      ctx.nodes[i].dependency_mask &= mask;
+      ctx.nodes[i].wait_cycles -= stall;
+      if ((ctx.nodes[idx].write_for_read_mask & BITFIELD_BIT(i)) && !ctx.is_vopd) {
+         ctx.nodes[i].wait_cycles = MAX2(ctx.nodes[i].wait_cycles, (int16_t)latency);
+      }
    }
 
    if (ctx.next_non_reorderable == idx) {

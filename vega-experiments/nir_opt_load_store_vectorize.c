@@ -218,6 +218,7 @@ struct vectorize_ctx {
    struct list_head entries[nir_num_variable_modes];
    struct hash_table *loads[nir_num_variable_modes];
    struct hash_table *stores[nir_num_variable_modes];
+   int prev_load_barrier[nir_num_variable_modes];
    struct block_ctx *per_block_ctx;
 };
 
@@ -2088,8 +2089,10 @@ handle_barrier(struct vectorize_ctx *ctx, bool *progress,
          continue;
       }
 
-      if (acquire)
+      if (acquire) {
          *progress |= vectorize_entries(ctx, impl, ctx->loads[mode_index]);
+         ctx->prev_load_barrier[mode_index] = instr->index;
+      }
       if (release)
          *progress |= vectorize_entries(ctx, impl, ctx->stores[mode_index]);
    }
@@ -2149,6 +2152,13 @@ add_entries_from_predecessor(struct vectorize_ctx *ctx, nir_block *block)
           * preheader. */
          nir_block *preheader = nir_block_cf_tree_prev(block);
          entry = ctx->per_block_ctx[preheader->index].last_entry[i];
+
+         /* If this isn't reorderable, we would have to consider the loop back-edges to safely use
+          * it, in case there is an interfering store in the loop. */
+         bool has_continue = block->predecessors.entries > 1 ||
+                             _mesa_set_next_entry(&block->predecessors, NULL)->key != preheader;
+         if (entry && !(entry->access & ACCESS_CAN_REORDER) && has_continue)
+            entry = NULL;
       } else {
          /* If all predecessor entries are the same, the entry dominates
           * the block. */
@@ -2189,6 +2199,7 @@ process_block(nir_function_impl *impl, struct vectorize_ctx *ctx,
          _mesa_hash_table_clear(ctx->loads[i], NULL);
       if (ctx->stores[i])
          _mesa_hash_table_clear(ctx->stores[i], NULL);
+      ctx->prev_load_barrier[i] = INT_MIN;
    }
 
    add_entries_from_predecessor(ctx, block);
@@ -2239,7 +2250,7 @@ process_block(nir_function_impl *impl, struct vectorize_ctx *ctx,
       if (!list_is_empty(&ctx->entries[i])) {
          struct entry *entry =
             list_entry(ctx->entries[i].prev, struct entry, head);
-         if (!entry->is_store)
+         if (!entry->is_store && entry->index > ctx->prev_load_barrier[i])
             ctx->per_block_ctx[block->index].last_entry[i] = entry;
       }
    }
