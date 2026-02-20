@@ -1731,21 +1731,6 @@ optimizations.extend([
    (('bcsel', True, b, c), b),
    (('bcsel', False, b, c), c),
 
-   (('bcsel@16', a, 1.0, 0.0), ('b2f', a)),
-   (('bcsel@16', a, 0.0, 1.0), ('b2f', ('inot', a))),
-   (('bcsel@16', a, -1.0, -0.0), ('fneg', ('b2f', a))),
-   (('bcsel@16', a, -0.0, -1.0), ('fneg', ('b2f', ('inot', a)))),
-
-   (('bcsel@32', a, 1.0, 0.0), ('b2f', a)),
-   (('bcsel@32', a, 0.0, 1.0), ('b2f', ('inot', a))),
-   (('bcsel@32', a, -1.0, -0.0), ('fneg', ('b2f', a))),
-   (('bcsel@32', a, -0.0, -1.0), ('fneg', ('b2f', ('inot', a)))),
-
-   (('bcsel@64', a, 1.0, 0.0), ('b2f', a), '!(options->lower_doubles_options & nir_lower_fp64_full_software)'),
-   (('bcsel@64', a, 0.0, 1.0), ('b2f', ('inot', a)), '!(options->lower_doubles_options & nir_lower_fp64_full_software)'),
-   (('bcsel@64', a, -1.0, -0.0), ('fneg', ('b2f', a)), '!(options->lower_doubles_options & nir_lower_fp64_full_software)'),
-   (('bcsel@64', a, -0.0, -1.0), ('fneg', ('b2f', ('inot', a))), '!(options->lower_doubles_options & nir_lower_fp64_full_software)'),
-
    (('bcsel', a, b, b), b),
    (('fcsel', a, b, b), ('fcanonicalize', b)),
 ])
@@ -1842,6 +1827,21 @@ optimizations.extend([
 
    (('ult', a, 0), False),
 ])
+
+for bits in [16, 32, 64]:
+    cond = '!(options->lower_doubles_options & nir_lower_fp64_full_software)' if bits == 64 else 'true'
+    bcsel = 'bcsel@{}'.format(bits)
+    bcsel_nsz = bcsel + '(is_only_used_as_float_nsz)'
+    optimizations += [
+        ((bcsel, a, 1.0, 0.0), ('b2f(preserve_sz)', a), cond),
+        ((bcsel, a, 0.0, 1.0), ('b2f(preserve_sz)', ('inot', a)), cond),
+        ((bcsel, a, -1.0, -0.0), ('fneg(preserve_sz)', ('b2f(preserve_sz)', a)), cond),
+        ((bcsel, a, -0.0, -1.0), ('fneg(preserve_sz)', ('b2f(preserve_sz)', ('inot', a))), cond),
+        ((bcsel_nsz, a, 1.0, -0.0), ('b2f', a), cond),
+        ((bcsel_nsz, a, -0.0, 1.0), ('b2f', ('inot', a)), cond),
+        ((bcsel_nsz, a, -1.0, 0.0), ('fneg', ('b2f', a)), cond),
+        ((bcsel_nsz, a, 0.0, -1.0), ('fneg', ('b2f', ('inot', a))), cond),
+    ]
 
 # pack/unpack identities
 for pack, bits, compbits in (('pack_64_2x32', 64, 32), ('pack_32_2x16', 32, 16)):

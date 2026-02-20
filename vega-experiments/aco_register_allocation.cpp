@@ -2184,7 +2184,7 @@ get_reg_affinity(ra_ctx& ctx, const RegisterFile& reg_file, Temp temp,
       /* create parallelcopy to move blocking vars */
       std::vector<parallelcopy> pc;
       if (get_reg_specified(ctx, tmp_file, temp.regClass(), instr, affinity.reg, operand_index) &&
-          get_regs_for_copies(ctx, tmp_file, parallelcopies, vars, instr, def_regs)) {
+          get_regs_for_copies(ctx, tmp_file, pc, vars, instr, def_regs)) {
          parallelcopies.insert(parallelcopies.end(), pc.begin(), pc.end());
          return affinity.reg;
       }
