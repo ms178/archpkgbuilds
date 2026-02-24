@@ -1237,6 +1237,9 @@ VOPP = {
    ("v_fma_mixlo_f16",  dst(F16), src(F32, F32, F32), op(gfx9=0x21), InstrClass.ValuFma),
    ("v_fma_mixhi_f16",  dst(F16), src(F32, F32, F32), op(gfx9=0x22), InstrClass.ValuFma),
 
+   ("p_v_fma_mixlo_f16_rtz", dst(F16), src(F32, F32, F32), op(-1)), # v_fma_mixlo_f16 with fp16 rtz rounding
+   ("p_v_fma_mixhi_f16_rtz", dst(F16), src(F32, F32, F32), op(-1)), # v_fma_mixhi_f16 with fp16 rtz rounding
+
    # Dot products - quarter rate
    ("v_dot2_i32_i16",      dst(U32), src(PkU16, PkU16, U32), op(gfx9=0x26, gfx10=0x14, gfx11=-1), InstrClass.ValuQuarterRate32),
    ("v_dot2_u32_u16",      dst(U32), src(PkU16, PkU16, U32), op(gfx9=0x27, gfx10=0x15, gfx11=-1), InstrClass.ValuQuarterRate32),
@@ -1246,7 +1249,7 @@ VOPP = {
    ("v_dot8_i32_iu4",      dst(U32), src(PkU16, PkU16, U32), op(gfx11=0x18), InstrClass.ValuQuarterRate32),
    ("v_dot8_i32_i4",       dst(U32), src(PkU16, PkU16, U32), op(gfx9=0x2a, gfx10=0x18, gfx11=-1), InstrClass.ValuQuarterRate32),
    ("v_dot8_u32_u4",       dst(U32), src(PkU16, PkU16, U32), op(gfx9=0x2b, gfx10=0x19), InstrClass.ValuQuarterRate32),
-   ("v_dot2_f32_f16",      dst(noMods(F32)), noMods(src(PkF16, PkF16, F32)), op(gfx9=0x23, gfx10=0x13), InstrClass.ValuQuarterRate32),
+   ("v_dot2_f32_f16",      dst(noMods(F32)), src(PkF16, PkF16, F32), op(gfx9=0x23, gfx10=0x13)),
    ("v_dot2_f32_bf16",     dst(noMods(F32)), noMods(src(PkBF16, PkBF16, F32)), op(gfx11=0x1a), InstrClass.ValuQuarterRate32),
 
    # GFX12+ (not applicable to Vega 10)
@@ -1450,7 +1453,7 @@ VOP3 = {
    ("v_minmax_u32",            dst(U32), src(U32, U32, U32), op(gfx11=0x263)),
    ("v_maxmin_i32",            dst(U32), src(U32, U32, U32), op(gfx11=0x264)),
    ("v_minmax_i32",            dst(U32), src(U32, U32, U32), op(gfx11=0x265)),
-   ("v_dot2_f16_f16",          dst(noMods(F16)), noMods(src(PkF16, PkF16, F16)), op(gfx11=0x266)),
+   ("v_dot2_f16_f16",          dst(noMods(F16)), src(PkF16, PkF16, F16), op(gfx11=0x266)),
    ("v_dot2_bf16_bf16",        dst(noMods(BF16)), noMods(src(PkBF16, PkBF16, BF16)), op(gfx11=0x267)),
    ("v_cvt_pk_i16_f32",        dst(PkU16), src(F32, F32), op(gfx11=0x306)),
    ("v_cvt_pk_u16_f32",        dst(PkU16), src(F32, F32), op(gfx11=0x307)),

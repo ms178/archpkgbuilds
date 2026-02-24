@@ -525,6 +525,10 @@ opcode_supports_dpp(amd_gfx_level gfx_level, aco_opcode opcode, bool vop3p)
    case aco_opcode::v_fma_mixhi_f16:
    case aco_opcode::p_v_fma_mixlo_f16_rtz:
    case aco_opcode::p_v_fma_mixhi_f16_rtz:
+   case aco_opcode::v_dot4_f32_fp8_fp8:
+   case aco_opcode::v_dot4_f32_fp8_bf8:
+   case aco_opcode::v_dot4_f32_bf8_fp8:
+   case aco_opcode::v_dot4_f32_bf8_bf8:
    case aco_opcode::v_dot2_f32_f16:
    case aco_opcode::v_dot2_f32_bf16: return gfx_level >= GFX11;
    default: return !vop3p;
@@ -1303,6 +1307,8 @@ get_swapped_opcode(aco_opcode opcode, unsigned idx0, unsigned idx1)
    case aco_opcode::v_dot2_f32_bf16:
    case aco_opcode::v_dot2_f16_f16:
    case aco_opcode::v_dot2_bf16_bf16:
+   case aco_opcode::v_dot4_f32_fp8_fp8:
+   case aco_opcode::v_dot4_f32_bf8_bf8:
    case aco_opcode::v_fma_mix_f32:
    case aco_opcode::v_fma_mixlo_f16:
    case aco_opcode::v_fma_mixhi_f16:
@@ -1322,6 +1328,16 @@ get_swapped_opcode(aco_opcode opcode, unsigned idx0, unsigned idx1)
       if (idx1 == 2)
          return aco_opcode::num_opcodes;
       return aco_opcode::v_subb_co_u32;
+   }
+   case aco_opcode::v_dot4_f32_fp8_bf8: {
+      if (idx1 == 2)
+         return aco_opcode::num_opcodes;
+      return aco_opcode::v_dot4_f32_bf8_fp8;
+   }
+   case aco_opcode::v_dot4_f32_bf8_fp8: {
+      if (idx1 == 2)
+         return aco_opcode::num_opcodes;
+      return aco_opcode::v_dot4_f32_fp8_bf8;
    }
    case aco_opcode::v_med3_f32: /* order matters for clamp+GFX8+denorm ftz. */
    default: return aco_opcode::num_opcodes;
@@ -1639,7 +1655,8 @@ get_tied_defs(Instruction* instr)
             instr->opcode == aco_opcode::v_fmac_legacy_f32 ||
             instr->opcode == aco_opcode::v_pk_fmac_f16 || instr->opcode == aco_opcode::v_writelane_b32 ||
             instr->opcode == aco_opcode::v_writelane_b32_e64 ||
-            instr->opcode == aco_opcode::v_dot4c_i32_i8 || instr->opcode == aco_opcode::s_fmac_f32 ||
+            instr->opcode == aco_opcode::v_dot4c_i32_i8 ||
+            instr->opcode == aco_opcode::v_dot2c_f32_f16 || instr->opcode == aco_opcode::s_fmac_f32 ||
             instr->opcode == aco_opcode::s_fmac_f16) {
             ops.push_back(2);
       } else if (instr->opcode == aco_opcode::s_addk_i32 || instr->opcode == aco_opcode::s_mulk_i32 ||
