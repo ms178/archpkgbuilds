@@ -474,7 +474,12 @@ init_context(isel_context* ctx, nir_shader* shader)
                case nir_op_sdot_2x16_iadd:
                case nir_op_udot_2x16_uadd_sat:
                case nir_op_sdot_2x16_iadd_sat:
+               case nir_op_bfdot2_fadd:
                case nir_op_bfdot2_bfadd:
+               case nir_op_f16dot2_fadd:
+               case nir_op_e4m3fn_dot4_fadd:
+               case nir_op_e5m2_dot4_fadd:
+               case nir_op_e4m3fn_e5m2_dot4_fadd:
                case nir_op_byte_perm_amd:
                case nir_op_alignbyte_amd:
                case nir_op_f2f16_ru:
