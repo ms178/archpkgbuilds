@@ -48,6 +48,7 @@ struct hash_table {
    struct hash_entry *table;
    uint32_t (*key_hash_function)(const void *key);
    bool (*key_equals_function)(const void *a, const void *b);
+   void (*table_destructor)(void *data);
    const void *deleted_key;
    uint32_t size;
    uint32_t rehash;
