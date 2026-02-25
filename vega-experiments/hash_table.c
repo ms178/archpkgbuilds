@@ -36,7 +36,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
-#include <immintrin.h>
 
 #include "hash_table.h"
 #include "ralloc.h"
@@ -189,6 +188,36 @@ _mesa_hash_table_create(void *mem_ctx,
    return ht;
 }
 
+static uint32_t
+key_u32_hash(const void *key)
+{
+   uint32_t x = (uint32_t)(uintptr_t)key;
+   x ^= x >> 16;
+   x *= 0x85ebca6bU;
+   x ^= x >> 13;
+   x *= 0xc2b2ae35U;
+   x ^= x >> 16;
+   return x;
+}
+
+static bool
+key_u32_equals(const void *a, const void *b)
+{
+   return (uint32_t)(uintptr_t)a == (uint32_t)(uintptr_t)b;
+}
+
+struct hash_table *
+_mesa_hash_table_create_u32_keys(void *mem_ctx)
+{
+   return _mesa_hash_table_create(mem_ctx, key_u32_hash, key_u32_equals);
+}
+
+void
+_mesa_hash_table_init_u32_keys(struct hash_table *ht, void *mem_ctx)
+{
+   _mesa_hash_table_init(ht, mem_ctx, key_u32_hash, key_u32_equals);
+}
+
 static inline struct hash_entry *
 hash_table_search_pointer(const struct hash_table *ht, uint32_t hash, const void *key)
 {
@@ -196,6 +225,7 @@ hash_table_search_pointer(const struct hash_table *ht, uint32_t hash, const void
    const uint32_t start = util_fast_urem32(hash, size, ht->size_magic);
    const uint32_t step = 1 + util_fast_urem32(hash, ht->rehash, ht->rehash_magic);
    struct hash_entry * const table = ht->table;
+   const void * const deleted_key = ht->deleted_key;
    uint32_t addr = start;
 
    do {
@@ -212,7 +242,7 @@ hash_table_search_pointer(const struct hash_table *ht, uint32_t hash, const void
       if (likely(entry->key == NULL))
          return NULL;
 
-      if (entry->hash == hash && entry->key != ht->deleted_key && entry->key == key)
+      if (entry->hash == hash && entry->key != deleted_key && entry->key == key)
          return entry;
 
       addr = next1;
@@ -305,18 +335,7 @@ hash_table_insert_rehash(struct hash_table *ht, uint32_t hash,
 static void
 hash_table_clear_fast(struct hash_table *ht)
 {
-   size_t bytes = (size_t)ht->size * sizeof(struct hash_entry);
-   if (bytes >= 256 && __builtin_cpu_supports("avx2")) {
-      __m256i zero = _mm256_setzero_si256();
-      char *p = (char *)ht->table;
-      size_t i;
-      for (i = 0; i + 32 <= bytes; i += 32)
-         _mm256_storeu_si256((__m256i *)(p + i), zero);
-      if (i < bytes)
-         memset(p + i, 0, bytes - i);
-   } else {
-      memset(ht->table, 0, bytes);
-   }
+   memset(ht->table, 0, (size_t)ht->size * sizeof(struct hash_entry));
    ht->entries = 0;
    ht->deleted_entries = 0;
 }
@@ -624,16 +643,6 @@ _mesa_hash_pointer(const void *pointer)
 {
    uintptr_t num = (uintptr_t)pointer;
 #if UINTPTR_MAX == UINT64_MAX
-   if (__builtin_cpu_supports("bmi2")) {
-      uint64_t x = _pext_u64(num, 0xAAAAAAAAAAAAAAAAULL);
-      x ^= x >> 30;
-      x *= 0xbf58476d1ce4e5b9ULL;
-      x ^= x >> 27;
-      x *= 0x94d049bb133111ebULL;
-      x ^= x >> 31;
-      return (uint32_t)(x ^ (x >> 32));
-   }
-#endif
    uint64_t x = (uint64_t)num;
    x ^= x >> 30;
    x *= 0xbf58476d1ce4e5b9ULL;
@@ -641,6 +650,15 @@ _mesa_hash_pointer(const void *pointer)
    x *= 0x94d049bb133111ebULL;
    x ^= x >> 31;
    return (uint32_t)(x ^ (x >> 32));
+#else
+   uint32_t x = (uint32_t)num;
+   x ^= x >> 16;
+   x *= 0x85ebca6bU;
+   x ^= x >> 13;
+   x *= 0xc2b2ae35U;
+   x ^= x >> 16;
+   return x;
+#endif
 }
 
 bool _mesa_key_int_equal(const void *a, const void *b) { return *((const int *)a) == *((const int *)b); }
@@ -687,8 +705,6 @@ _mesa_hash_table_reserve(struct hash_table *ht, unsigned size)
    }
    return ht->max_entries >= size;
 }
-
-/* === MISSING FUNCTIONS RESTORED (fixes linker error) === */
 
 bool
 _mesa_hash_table_copy(struct hash_table *dst, struct hash_table *src,
