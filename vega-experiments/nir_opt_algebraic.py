@@ -1462,9 +1462,12 @@ optimizations.extend([
     (('fmul', ('b2f', 'a@1'), ('b2f', 'b@1')), ('b2f', ('iand', a, b))),
     (('ffma', ('b2f', 'a@1'), ('b2f', 'b@1'), c), ('fadd', ('b2f', ('iand', a, b)), c)),
     (('fadd', 1.0, ('fneg', ('b2f', a))), ('b2f', ('inot', a))),
+    (('fadd(nsz)', -1.0, ('b2f', a)), ('fneg', ('b2f', ('inot', a)))),
     (('fmul', ('b2f', ('fneu', a, 0)), a), ('fmul', 1.0, a)),
     (('ffma', ('b2f', ('fneu', a, 0)), a, b), ('fadd', a, b)),
     (('fsat', ('fadd', ('b2f', 'a@1'), ('b2f', 'b@1'))), ('b2f', ('ior', a, b))),
+    (('fsat', ('fadd', ('b2f', 'a@1'), ('fneg', ('b2f', 'b@1')))), ('b2f', ('iand', a, ('inot', b)))),
+    (('fmax', ('fadd', ('b2f', 'a@1'), ('fneg', ('b2f', 'b@1'))), 0.0), ('b2f', ('iand', a, ('inot', b)))),
 
     (('iand', 'a@bool16', 1.0), ('b2f', a)),
     (('iand', 'a@bool32', 1.0), ('b2f', a)),
@@ -1984,6 +1987,9 @@ optimizations.extend([
    (('ubfe', a, 16, 16), ('extract_u16', a, 1), '!options->lower_extract_word'),
    (('ibfe', a, 0, 16), ('extract_i16', a, 0), '!options->lower_extract_word'),
    (('ibfe', a, 16, 16), ('extract_i16', a, 1), '!options->lower_extract_word'),
+
+   (('u2u32', ('unpack_32_2x16_split_x', a)), ('extract_u16', a, 0), '!options->lower_extract_word'),
+   (('u2u32', ('unpack_32_2x16_split_y', a)), ('extract_u16', a, 1), '!options->lower_extract_word'),
 
    (('ior',
      ('ishl', ('u2u32', 'a@8'), 24),
