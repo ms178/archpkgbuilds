@@ -1,0 +1,124 @@
+--- a/scheds/rust/scx_beerland/src/bpf/main.bpf.c	2025-10-22 21:17:42.274261405 +0200
++++ b/scheds/rust/scx_beerland/src/bpf/main.bpf.c	2026-02-26 21:20:20.365435857 +0200
+@@ -212,10 +212,13 @@ static u64 calc_avg(u64 old_val, u64 new
+  */
+ static u64 update_freq(u64 freq, u64 interval)
+ {
+-        u64 new_freq;
++	u64 new_freq;
+ 
+-        new_freq = (100 * NSEC_PER_MSEC) / interval;
+-        return calc_avg(freq, new_freq);
++	if (interval == 0)
++		interval = 1;
++
++	new_freq = (100 * NSEC_PER_MSEC) / interval;
++	return calc_avg(freq, new_freq);
+ }
+ 
+ /*
+@@ -243,7 +246,8 @@ static u64 task_slice(struct task_struct
+ static u64 task_dl(struct task_struct *p, struct task_ctx *tctx)
+ {
+ 	u64 lag_scale = MAX(tctx->wakeup_freq, 1);
+-	u64 vtime_min = vtime_now - scale_by_task_weight(p, slice_lag * lag_scale);
++	u64 lag = scale_by_task_weight(p, slice_lag * lag_scale);
++	u64 vtime_min = vtime_now > lag ? vtime_now - lag : 0;
+ 	u64 awake_max = scale_by_task_weight_inverse(p, slice_lag);
+ 
+ 	if (time_before(p->scx.dsq_vtime, vtime_min))
+@@ -310,18 +314,19 @@ static s32 smt_sibling(s32 cpu)
+ static bool is_smt_contended(s32 cpu)
+ {
+ 	const struct cpumask *idle_mask;
++	const struct cpumask *idle_smt_mask;
+ 	bool is_contended;
+ 
+ 	if (!smt_enabled)
+ 		return false;
+ 
+-	/*
+-	 * If the sibling SMT CPU is not idle and there are other full-idle
+-	 * SMT cores available, consider the current CPU as contended.
+-	 */
+ 	idle_mask = scx_bpf_get_idle_cpumask();
++	idle_smt_mask = scx_bpf_get_idle_smtmask();
++
+ 	is_contended = !bpf_cpumask_test_cpu(smt_sibling(cpu), idle_mask) &&
+-		       !bpf_cpumask_empty(idle_mask);
++		       !bpf_cpumask_empty(idle_smt_mask);
++
++	scx_bpf_put_cpumask(idle_smt_mask);
+ 	scx_bpf_put_cpumask(idle_mask);
+ 
+ 	return is_contended;
+@@ -464,13 +469,18 @@ static s32 pick_idle_cpu_pref_smt(struct
+ 				  const struct cpumask *primary, const struct cpumask *smt)
+ {
+ 	u64 max_cpus = MIN(nr_cpu_ids, MAX_CPUS);
++	const struct cpumask *idle_mask = scx_bpf_get_idle_cpumask();
+ 	int i;
++	s32 target_cpu = -EBUSY;
+ 
+ 	if (is_prev_allowed &&
+ 	    (!primary || bpf_cpumask_test_cpu(prev_cpu, primary)) &&
+ 	    (!smt || bpf_cpumask_test_cpu(prev_cpu, smt)) &&
+-	    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+-		return prev_cpu;
++	    bpf_cpumask_test_cpu(prev_cpu, idle_mask) &&
++	    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
++		target_cpu = prev_cpu;
++		goto out;
++	}
+ 
+ 	bpf_for(i, 0, max_cpus) {
+ 		s32 cpu = preferred_cpus[i];
+@@ -480,11 +490,16 @@ static s32 pick_idle_cpu_pref_smt(struct
+ 
+ 		if ((!primary || bpf_cpumask_test_cpu(cpu, primary)) &&
+ 		    (!smt || bpf_cpumask_test_cpu(cpu, smt)) &&
+-		    scx_bpf_test_and_clear_cpu_idle(cpu))
+-			return cpu;
++		    bpf_cpumask_test_cpu(cpu, idle_mask) &&
++		    scx_bpf_test_and_clear_cpu_idle(cpu)) {
++			target_cpu = cpu;
++			goto out;
++		}
+ 	}
+ 
+-	return -EBUSY;
++out:
++	scx_bpf_put_cpumask(idle_mask);
++	return target_cpu;
+ }
+ 
+ /*
+@@ -713,7 +728,7 @@ void BPF_STRUCT_OPS(beerland_enqueue, st
+ 				cpu = pick_idle_cpu(p, prev_cpu, -ENOENT, 0);
+ 
+ 			if (cpu >= 0) {
+-				struct task_struct *q = __COMPAT_scx_bpf_dsq_peek(cpu);
++				q = __COMPAT_scx_bpf_dsq_peek(cpu);
+ 
+ 				if (!q || p->scx.dsq_vtime < q->scx.dsq_vtime) {
+ 					scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu,
+@@ -747,7 +762,8 @@ void BPF_STRUCT_OPS(beerland_enqueue, st
+  */
+ static bool dispatch_from_any_cpu(s32 from_cpu)
+ {
+-	u64 min_vtime = ULLONG_MAX, cpu, min_cpu;
++	u64 min_vtime = ULLONG_MAX;
++	s32 cpu, min_cpu = -1;
+ 
+ 	/*
+ 	 * Pick the task with the lowest vruntime within the same LLC.
+@@ -758,6 +774,9 @@ static bool dispatch_from_any_cpu(s32 fr
+ 	bpf_for(cpu, 0, nr_cpu_ids) {
+ 		struct task_struct *p;
+ 
++		if (!cpus_share_cache(from_cpu, cpu))
++			continue;
++
+ 		p = __COMPAT_scx_bpf_dsq_peek(cpu);
+ 		if (p && bpf_cpumask_test_cpu(from_cpu, p->cpus_ptr) &&
+ 		    p->scx.dsq_vtime < min_vtime) {
