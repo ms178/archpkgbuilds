@@ -12,6 +12,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <QBasicTimer>
 #include <QMetaObject>
+#include <QPointer>
 
 #include <array>
 #include <bit>
@@ -75,6 +76,7 @@ public:
     int32_t maxPendingFrameCount{1};
     int16_t cadenceStability_{128};
     int16_t scheduledTimerMs{-1};
+    int16_t vrrControlDelayMs{-1};
     int16_t doubleBufferingCounter{0};
     uint16_t starvationRecoveryCounter{0};
     uint16_t modeDwellCounter_{0};
@@ -101,7 +103,7 @@ public:
     std::chrono::steady_clock::time_point lastModeSwitch{};
     std::array<std::chrono::steady_clock::time_point, kModeSwitchHistorySize> modeSwitchHistory_{};
     RenderJournal renderJournal;
-    Window *trackedWindow_{nullptr};
+    QPointer<Window> trackedWindow_{nullptr};
     std::array<QMetaObject::Connection, 4> vrrConnections_{};
     std::optional<std::fstream> m_debugOutput;
 

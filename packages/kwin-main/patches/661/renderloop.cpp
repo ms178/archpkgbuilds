@@ -117,6 +117,7 @@ void RenderLoopPrivate::updateReciprocal() noexcept {
         reciprocalShift64 = 0;
         tripleBufferEnterThresholdNs = 0;
         tripleBufferExitThresholdNs = 0;
+        vrrControlDelayMs = 0;
         return;
     }
     constexpr uint8_t shift = 63;
@@ -125,6 +126,12 @@ void RenderLoopPrivate::updateReciprocal() noexcept {
     reciprocalShift64 = shift;
     tripleBufferEnterThresholdNs = static_cast<int64_t>((interval * kTripleBufferEnterPct) / 100);
     tripleBufferExitThresholdNs = static_cast<int64_t>((interval * kTripleBufferExitPct) / 100);
+
+    vrrControlDelayMs = static_cast<int16_t>(std::clamp(
+        interval / static_cast<uint64_t>(kNsPerMs),
+        uint64_t{1},
+        static_cast<uint64_t>(kMaxTimerDelayMs)
+    ));
 }
 
 void RenderLoopPrivate::initializeVrrCapabilities() {
@@ -158,7 +165,7 @@ void RenderLoopPrivate::connectVrrSignals(Window *window) {
     auto store = [this](QMetaObject::Connection c) {
         if (c && vrrConnectionCount_ < vrrConnections_.size()) vrrConnections_[vrrConnectionCount_++] = c;
     };
-    store(QObject::connect(window, &QObject::destroyed, q, [this]() { trackedWindow_ = nullptr; vrrStateDirty_ = true; }));
+    store(QObject::connect(window, &QObject::destroyed, q, [this]() { vrrStateDirty_ = true; }));
     store(QObject::connect(window, &Window::fullScreenChanged, q, [this]() { vrrStateDirty_ = true; }));
     store(QObject::connect(window, &Window::outputChanged, q, [this]() { vrrStateDirty_ = true; }));
     SurfaceItem *surf = window->surfaceItem();
@@ -231,7 +238,7 @@ bool RenderLoopPrivate::detectVrrOscillation() noexcept {
     const auto cutoff = now - kOscillationWindow;
     uint8_t recentCount = 0;
     for (uint8_t i = 0; i < modeSwitchHistoryCount_ && recentCount < kOscillationThreshold; ++i) {
-        const uint8_t idx = static_cast<uint8_t>((modeSwitchHistoryHead_ + kModeSwitchHistorySize - 1 - i) % kModeSwitchHistorySize);
+        const uint8_t idx = (modeSwitchHistoryHead_ - 1 - i) & (kModeSwitchHistorySize - 1);
         if (modeSwitchHistory_[idx] >= cutoff) ++recentCount;
     }
     if (recentCount >= kOscillationThreshold) [[unlikely]] {
@@ -251,9 +258,11 @@ void RenderLoopPrivate::updatePresentationCadence(int64_t intervalNs) noexcept {
     const int64_t prev = lastIntervalNs_;
     lastIntervalNs_ = intervalNs;
     if (prev < kMinReasonableIntervalNs) [[unlikely]] return;
-    const int64_t diff = intervalNs > prev ? intervalNs - prev : prev - intervalNs;
+
+    const int64_t diff = safeAbs64(intervalNs - prev);
     const int64_t relativeDeviation = (diff << 8) / prev;
-    const int64_t sample = std::clamp(256 - relativeDeviation, int64_t{0}, int64_t{256});
+    const int64_t sample = std::max(int64_t{0}, 256 - relativeDeviation);
+
     const int16_t current = cadenceStability_;
     int16_t next = sample > current ? static_cast<int16_t>((current * 7 + sample) >> 3) : static_cast<int16_t>((current + sample) >> 1);
     cadenceStability_ = next;
@@ -334,7 +343,11 @@ void RenderLoopPrivate::updateFramePrediction(std::chrono::nanoseconds measured)
     }
     const int shift = 1 + ((cadenceStability_ * 3) >> 8);
     const int64_t diff = m - cur;
-    int64_t updated = diff > 0 ? cur + ((diff + 1) >> (shift > 2 ? 2 : 1)) : cur + (diff >> shift);
+
+    const int64_t isPos = diff > 0 ? 1 : 0;
+    const int actualShift = isPos ? std::min(shift, 2) : shift;
+    int64_t updated = cur + ((diff + isPos) >> actualShift);
+
     const int64_t vblank = static_cast<int64_t>(cachedVblankIntervalNs);
     const int64_t lo = std::max(vblank >> 5, int64_t{100'000});
     const int64_t hi = vblank << 2;
@@ -553,20 +566,12 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer *layer) {
     }
     const bool vrrActive = isVrrMode(d->presentationMode);
     if (vrrActive && item && d->pendingFrameCount > 0) {
-        Workspace *ws = workspace();
-        Window *active = ws ? ws->activeWindow() : nullptr;
-        if (active && d->output) {
-            LogicalOutput *logical = ws->findOutput(d->output);
-            if (logical && active->isOnOutput(logical)) {
-                SurfaceItem *surface = active->surfaceItem();
-                if (surface && (item != surface) && !surface->isAncestorOf(item)) {
-                    if (surface->recursiveFrameTimeEstimation() <= kVrrControlThreshold) {
-                        const uint64_t vblankNs = d->cachedVblankIntervalNs;
-                        const auto delayMsU = std::clamp(vblankNs / static_cast<uint64_t>(kNsPerMs), uint64_t{1}, static_cast<uint64_t>(kMaxTimerDelayMs));
-                        const int delayMs = static_cast<int>(delayMsU);
-                        d->delayedVrrTimer.start(delayMs, Qt::PreciseTimer, this);
-                        return;
-                    }
+        if (d->vrrStateCache_.getState().isOnOutput && d->trackedWindow_) {
+            SurfaceItem *surface = d->trackedWindow_->surfaceItem();
+            if (surface && (item != surface) && !surface->isAncestorOf(item)) {
+                if (surface->recursiveFrameTimeEstimation() <= kVrrControlThreshold) {
+                    d->delayedVrrTimer.start(d->vrrControlDelayMs, Qt::PreciseTimer, this);
+                    return;
                 }
             }
         }
