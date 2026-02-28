@@ -5,6 +5,7 @@
 */
 
 #include "renderloop.h"
+#include "backendoutput.h"
 #include "options.h"
 #include "renderloop_p.h"
 #include "scene/surfaceitem.h"
@@ -26,7 +27,7 @@ RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop *loop)
 
 static const bool s_printDebugInfo = qEnvironmentVariableIntValue("KWIN_LOG_PERFORMANCE_DATA") != 0;
 
-RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, Output *output)
+RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, BackendOutput *output)
     : q(q)
     , output(output)
 {
@@ -190,7 +191,7 @@ void RenderLoopPrivate::dispatch()
     Q_EMIT q->frameRequested(q);
 }
 
-RenderLoop::RenderLoop(Output *output)
+RenderLoop::RenderLoop(BackendOutput *output)
     : d(std::make_unique<RenderLoopPrivate>(this, output))
 {
 }
@@ -241,6 +242,10 @@ void RenderLoop::setRefreshRate(int refreshRate)
     }
     d->refreshRate = refreshRate;
     Q_EMIT refreshRateChanged();
+
+    if (d->compositeTimer.isActive()) {
+        d->scheduleRepaint(d->lastPresentationTimestamp);
+    }
 }
 
 void RenderLoop::setPresentationSafetyMargin(std::chrono::nanoseconds safetyMargin)
@@ -272,10 +277,16 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer *outputLayer)
 bool RenderLoop::activeWindowControlsVrrRefreshRate() const
 {
     Window *const activeWindow = workspace()->activeWindow();
+    LogicalOutput *logical = workspace()->findOutput(d->output);
+    if (!logical) {
+        return false;
+    }
     return activeWindow
-        && activeWindow->isOnOutput(d->output)
+        && activeWindow->frameGeometry().intersects(logical->geometryF())
         && activeWindow->surfaceItem()
-        && activeWindow->surfaceItem()->recursiveFrameTimeEstimation() <= std::chrono::nanoseconds(1'000'000'000) / 30;
+        && activeWindow->surfaceItem()->recursiveFrameTimeEstimation().transform([](const auto t) {
+        return t <= std::chrono::nanoseconds(1'000'000'000) / 30;
+    }).value_or(false);
 }
 
 std::chrono::nanoseconds RenderLoop::lastPresentationTimestamp() const
