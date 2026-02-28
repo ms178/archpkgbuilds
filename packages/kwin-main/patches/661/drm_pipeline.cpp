@@ -314,7 +314,7 @@ DrmPipeline::Error DrmPipeline::prepareAtomicCommit(DrmAtomicCommit *commit, Com
             ColorPipeline pipeline;
             int priority = 0;
         };
-        auto layerPriority =[](DrmPlane *plane) noexcept -> int {
+        auto layerPriority = [](DrmPlane *plane) noexcept -> int {
             if (!plane || !plane->type.isValid()) {
                 return 1;
             }
@@ -328,7 +328,9 @@ DrmPipeline::Error DrmPipeline::prepareAtomicCommit(DrmAtomicCommit *commit, Com
             }
             return 1;
         };
-        QVector<LayerInfo> enabled;
+
+        // Stack-allocated array avoids heap churn
+        QVarLengthArray<LayerInfo, 16> enabled;
         enabled.reserve(m_pending.layers.size());
         for (DrmPipelineLayer *layer : std::as_const(m_pending.layers)) {
             if (!layer) [[unlikely]] {
@@ -352,9 +354,12 @@ DrmPipeline::Error DrmPipeline::prepareAtomicCommit(DrmAtomicCommit *commit, Com
         if (enabled.isEmpty()) [[unlikely]] {
             return Error::InvalidArguments;
         }
-        QSet<DrmPipelineLayer *> disable;
+
+        // Stack-allocated boolean array avoids arbitrary bitmask limits and heap allocations
+        QVarLengthArray<bool, 16> disabled(enabled.size(), false);
         if (gpu()->isAmdgpu()) {
             const int n = enabled.size();
+            int disabledCount = 0;
             for (int i = 0; i < n; ++i) {
                 for (int j = i + 1; j < n; ++j) {
                     if (enabled[i].pipeline == enabled[j].pipeline) {
@@ -363,20 +368,24 @@ DrmPipeline::Error DrmPipeline::prepareAtomicCommit(DrmAtomicCommit *commit, Com
                     if (!enabled[i].rect.intersects(enabled[j].rect)) {
                         continue;
                     }
-                    LayerInfo &drop = (enabled[i].priority < enabled[j].priority) ? enabled[i] : enabled[j];
-                    disable.insert(drop.layer);
+                    if (enabled[i].priority < enabled[j].priority) {
+                        if (!disabled[i]) { disabled[i] = true; disabledCount++; }
+                    } else {
+                        if (!disabled[j]) { disabled[j] = true; disabledCount++; }
+                    }
                 }
             }
-            if (disable.size() == enabled.size()) {
+            if (disabledCount == n) {
                 int best = 0;
-                for (int i = 1; i < enabled.size(); ++i) {
+                for (int i = 1; i < n; ++i) {
                     if (enabled[i].priority > enabled[best].priority) {
                         best = i;
                     }
                 }
-                disable.remove(enabled[best].layer);
+                disabled[best] = false;
             }
         }
+
         for (DrmPipelineLayer *layer : std::as_const(m_pending.layers)) {
             if (!layer) [[unlikely]] {
                 return Error::InvalidArguments;
@@ -385,7 +394,16 @@ DrmPipeline::Error DrmPipeline::prepareAtomicCommit(DrmAtomicCommit *commit, Com
             if (!plane) [[unlikely]] {
                 return Error::InvalidArguments;
             }
-            if (disable.contains(layer)) {
+
+            bool isDisabled = false;
+            for (int i = 0; i < enabled.size(); ++i) {
+                if (enabled[i].layer == layer && disabled[i]) {
+                    isDisabled = true;
+                    break;
+                }
+            }
+
+            if (isDisabled) {
                 plane->disable(commit);
                 continue;
             }
@@ -393,6 +411,7 @@ DrmPipeline::Error DrmPipeline::prepareAtomicCommit(DrmAtomicCommit *commit, Com
                 return err;
             }
         }
+
         const bool needsModesetCommit = (mode != CommitMode::Test) &&
                                         (mode == CommitMode::CommitModeset || m_pending.needsModesetProperties);
         if (needsModesetCommit) [[unlikely]] {
@@ -437,7 +456,13 @@ DrmPipeline::Error DrmPipeline::prepareAtomicPresentation(DrmAtomicCommit *commi
     if (!referenceLayer) [[unlikely]] {
         return Error::InvalidArguments;
     }
-    const ColorPipeline mergedPipeline = referenceLayer->colorPipeline().merged(m_pending.crtcColorPipeline);
+
+    const ColorPipeline &layerPipeline = referenceLayer->colorPipeline();
+    const ColorPipeline &crtcPipeline = m_pending.crtcColorPipeline;
+
+    const ColorPipeline mergedPipeline = layerPipeline.isIdentity() ? crtcPipeline :
+                                         (crtcPipeline.isIdentity() ? layerPipeline : layerPipeline.merged(crtcPipeline));
+
     if (!m_pending.crtc->postBlendingPipeline) {
         if (!mergedPipeline.isIdentity()) [[unlikely]] {
             return Error::InvalidArguments;

@@ -74,13 +74,28 @@ void DrmAtomicCommit::addProperty(const DrmProperty &prop, uint64_t value)
 #ifndef NDEBUG
     prop.checkValueInRange(value);
 #endif
-    m_properties[prop.drmObject()->id()][prop.propId()] = value;
+    const uint32_t objId = prop.drmObject()->id();
+    const uint32_t propId = prop.propId();
+
+    for (auto &p : m_properties) {
+        if (p.objectId == objId && p.propertyId == propId) {
+            p.value = value;
+            return;
+        }
+    }
+    m_properties.push_back({objId, propId, value});
 }
 
 void DrmAtomicCommit::addBlob(const DrmProperty &prop, const std::shared_ptr<DrmBlob> &blob)
 {
     addProperty(prop, blob ? blob->blobId() : 0);
-    m_blobs[&prop] = blob;
+    for (auto &p : m_blobs) {
+        if (p.first == &prop) {
+            p.second = blob;
+            return;
+        }
+    }
+    m_blobs.emplace_back(&prop, blob);
 }
 
 void DrmAtomicCommit::addBuffer(DrmPlane *plane, const std::shared_ptr<DrmFramebuffer> &buffer, const std::shared_ptr<OutputFrame> &frame)
@@ -88,8 +103,20 @@ void DrmAtomicCommit::addBuffer(DrmPlane *plane, const std::shared_ptr<DrmFrameb
     const uint32_t fbId = buffer ? buffer->framebufferId() : 0;
     addProperty(plane->fbId, fbId);
 
-    m_buffers[plane] = buffer;
-    m_frames[plane] = frame;
+    auto itBuf = std::find_if(m_buffers.begin(), m_buffers.end(), [plane](const auto &p) { return p.first == plane; });
+    if (itBuf != m_buffers.end()) {
+        itBuf->second = buffer;
+    } else {
+        m_buffers.emplace_back(plane, buffer);
+    }
+
+    auto itFrame = std::find_if(m_frames.begin(), m_frames.end(), [plane](const auto &p) { return p.first == plane; });
+    if (itFrame != m_frames.end()) {
+        itFrame->second = frame;
+    } else {
+        m_frames.emplace_back(plane, frame);
+    }
+
     m_planes.emplace(plane);
 
     if (frame) [[likely]] {
@@ -145,16 +172,23 @@ bool DrmAtomicCommit::doCommit(uint32_t flags)
 {
     const bool allowInFence = !isTearing();
 
-    for (const auto &[plane, buffer] : m_buffers) {
+    for (const auto &pair : m_buffers) {
+        DrmPlane *plane = pair.first;
+        const auto &buffer = pair.second;
+
         if (!plane || !plane->inFenceFd.isValid()) [[unlikely]] {
             continue;
         }
 
         const uint32_t objId = plane->fbId.drmObject()->id();
-        auto objIt = m_properties.find(objId);
-        if (objIt != m_properties.end()) {
-            objIt->second.erase(plane->inFenceFd.propId());
-        }
+        const uint32_t propId = plane->inFenceFd.propId();
+
+        // Fast contiguous erasure
+        auto it = std::remove_if(m_properties.begin(), m_properties.end(),
+            [objId, propId](const PropertyValue &p) {
+                return p.objectId == objId && p.propertyId == propId;
+            });
+        m_properties.erase(it, m_properties.end());
 
         if (!allowInFence || !buffer || plane->gpu()->isNVidia()) [[unlikely]] {
             continue;
@@ -166,6 +200,12 @@ bool DrmAtomicCommit::doCommit(uint32_t flags)
         }
     }
 
+    // Sort properties by object ID then property ID for the kernel
+    std::sort(m_properties.begin(), m_properties.end(), [](const PropertyValue &a, const PropertyValue &b) {
+        if (a.objectId != b.objectId) return a.objectId < b.objectId;
+        return a.propertyId < b.propertyId;
+    });
+
     constexpr size_t kInlineObjectCapacity = 16;
     constexpr size_t kInlinePropertyCapacity = 128;
 
@@ -174,24 +214,30 @@ bool DrmAtomicCommit::doCommit(uint32_t flags)
     QVarLengthArray<uint32_t, kInlinePropertyCapacity> propertyIds;
     QVarLengthArray<uint64_t, kInlinePropertyCapacity> values;
 
-    const size_t objectCount = m_properties.size();
-    objects.reserve(static_cast<int>(objectCount));
-    propertyCounts.reserve(static_cast<int>(objectCount));
+    const size_t propCount = m_properties.size();
+    propertyIds.reserve(static_cast<int>(propCount));
+    values.reserve(static_cast<int>(propCount));
 
-    size_t totalPropCount = 0;
-    for (const auto &[object, props] : m_properties) {
-        totalPropCount += props.size();
-    }
-    propertyIds.reserve(static_cast<int>(totalPropCount));
-    values.reserve(static_cast<int>(totalPropCount));
+    uint32_t currentObj = 0;
+    uint32_t currentPropCount = 0;
 
-    for (const auto &[object, props] : m_properties) {
-        objects.push_back(object);
-        propertyCounts.push_back(static_cast<uint32_t>(props.size()));
-        for (const auto &[property, value] : props) {
-            propertyIds.push_back(property);
-            values.push_back(value);
+    for (size_t i = 0; i < propCount; ++i) {
+        const auto &p = m_properties[i];
+        if (p.objectId != currentObj) {
+            if (currentObj != 0) {
+                objects.push_back(currentObj);
+                propertyCounts.push_back(currentPropCount);
+            }
+            currentObj = p.objectId;
+            currentPropCount = 0;
         }
+        propertyIds.push_back(p.propertyId);
+        values.push_back(p.value);
+        currentPropCount++;
+    }
+    if (currentObj != 0) {
+        objects.push_back(currentObj);
+        propertyCounts.push_back(currentPropCount);
     }
 
     drm_mode_atomic commitData{
@@ -220,8 +266,8 @@ void DrmAtomicCommit::pageFlipped(std::chrono::nanoseconds timestamp)
 {
     Q_ASSERT(!QCoreApplication::instance() || QThread::currentThread() == QCoreApplication::instance()->thread());
 
-    for (const auto &[plane, buffer] : m_buffers) {
-        plane->setCurrentBuffer(buffer);
+    for (const auto &pair : m_buffers) {
+        pair.first->setCurrentBuffer(pair.second);
     }
 
     if (m_defunct) {
@@ -231,7 +277,7 @@ void DrmAtomicCommit::pageFlipped(std::chrono::nanoseconds timestamp)
     const size_t frameCount = m_frames.size();
 
     if (frameCount == 1) [[likely]] {
-        const auto &frame = m_frames.begin()->second;
+        const auto &frame = m_frames.front().second;
         if (frame) [[likely]] {
             frame->presented(timestamp, m_mode);
         }
@@ -239,9 +285,9 @@ void DrmAtomicCommit::pageFlipped(std::chrono::nanoseconds timestamp)
         QVarLengthArray<OutputFrame *, 8> frames;
         frames.reserve(static_cast<int>(frameCount));
 
-        for (const auto &[plane, frame] : m_frames) {
-            if (frame) {
-                frames.append(frame.get());
+        for (const auto &pair : m_frames) {
+            if (pair.second) {
+                frames.append(pair.second.get());
             }
         }
 
@@ -264,16 +310,15 @@ void DrmAtomicCommit::pageFlipped(std::chrono::nanoseconds timestamp)
 bool DrmAtomicCommit::areBuffersReadable() const
 {
     return std::ranges::all_of(m_buffers, [](const auto &pair) {
-        const auto &[plane, buffer] = pair;
-        return !buffer || buffer->isReadable();
+        return !pair.second || pair.second->isReadable();
     });
 }
 
 void DrmAtomicCommit::setDeadline(std::chrono::steady_clock::time_point deadline)
 {
-    for (const auto &[plane, buffer] : m_buffers) {
-        if (buffer) {
-            buffer->setDeadline(deadline);
+    for (const auto &pair : m_buffers) {
+        if (pair.second) {
+            pair.second->setDeadline(deadline);
         }
     }
 }
@@ -294,29 +339,49 @@ void DrmAtomicCommit::merge(DrmAtomicCommit *onTop)
         return;
     }
 
-    for (const auto &[obj, properties] : onTop->m_properties) {
-        auto [it, inserted] = m_properties.try_emplace(obj);
-        auto &ownProperties = it->second;
-        for (const auto &[prop, value] : properties) {
-            ownProperties.insert_or_assign(prop, value);
+    for (const auto &p : onTop->m_properties) {
+        auto it = std::find_if(m_properties.begin(), m_properties.end(), [&](const PropertyValue &ownP) {
+            return ownP.objectId == p.objectId && ownP.propertyId == p.propertyId;
+        });
+        if (it != m_properties.end()) {
+            it->value = p.value;
+        } else {
+            m_properties.push_back(p);
         }
     }
 
-    for (const auto &[plane, buffer] : onTop->m_buffers) {
-        m_buffers[plane] = buffer;
-
-        const auto frameIt = onTop->m_frames.find(plane);
-        if (frameIt != onTop->m_frames.end()) {
-            m_frames[plane] = frameIt->second;
+    for (const auto &pair : onTop->m_buffers) {
+        DrmPlane *plane = pair.first;
+        auto itBuf = std::find_if(m_buffers.begin(), m_buffers.end(), [plane](const auto &p) { return p.first == plane; });
+        if (itBuf != m_buffers.end()) {
+            itBuf->second = pair.second;
         } else {
-            m_frames.erase(plane);
+            m_buffers.push_back(pair);
+        }
+
+        auto frameIt = std::find_if(onTop->m_frames.begin(), onTop->m_frames.end(), [plane](const auto &p) { return p.first == plane; });
+        auto ownFrameIt = std::find_if(m_frames.begin(), m_frames.end(), [plane](const auto &p) { return p.first == plane; });
+
+        if (frameIt != onTop->m_frames.end()) {
+            if (ownFrameIt != m_frames.end()) {
+                ownFrameIt->second = frameIt->second;
+            } else {
+                m_frames.push_back(*frameIt);
+            }
+        } else if (ownFrameIt != m_frames.end()) {
+            m_frames.erase(ownFrameIt);
         }
 
         m_planes.emplace(plane);
     }
 
-    for (const auto &[prop, blob] : onTop->m_blobs) {
-        m_blobs[prop] = blob;
+    for (const auto &pair : onTop->m_blobs) {
+        auto itBlob = std::find_if(m_blobs.begin(), m_blobs.end(), [&](const auto &p) { return p.first == pair.first; });
+        if (itBlob != m_blobs.end()) {
+            itBlob->second = pair.second;
+        } else {
+            m_blobs.push_back(pair);
+        }
     }
 
     if (onTop->m_vrr) {

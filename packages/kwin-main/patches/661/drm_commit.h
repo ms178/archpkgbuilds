@@ -95,15 +95,23 @@ public:
 private:
     [[nodiscard]] bool doCommit(uint32_t flags);
 
+    struct PropertyValue {
+        uint32_t objectId;
+        uint32_t propertyId;
+        uint64_t value;
+    };
+
     QList<DrmPipeline *> m_pipelines;
     std::optional<std::chrono::steady_clock::time_point> m_targetPageflipTime;
     std::optional<std::chrono::nanoseconds> m_allowedVrrDelay;
-    std::unordered_map<const DrmProperty *, std::shared_ptr<DrmBlob>> m_blobs;
-    std::unordered_map<DrmPlane *, std::shared_ptr<DrmFramebuffer>> m_buffers;
-    std::unordered_map<DrmPlane *, std::shared_ptr<OutputFrame>> m_frames;
+
+    std::vector<std::pair<const DrmProperty *, std::shared_ptr<DrmBlob>>> m_blobs;
+    std::vector<std::pair<DrmPlane *, std::shared_ptr<DrmFramebuffer>>> m_buffers;
+    std::vector<std::pair<DrmPlane *, std::shared_ptr<OutputFrame>>> m_frames;
     std::unordered_set<DrmPlane *> m_planes;
+    std::vector<PropertyValue> m_properties;
+
     std::optional<bool> m_vrr;
-    std::unordered_map<uint32_t /* object */, std::unordered_map<uint32_t /* property */, uint64_t /* value */>> m_properties;
     bool m_modeset = false;
     PresentationMode m_mode = PresentationMode::VSync;
 };
