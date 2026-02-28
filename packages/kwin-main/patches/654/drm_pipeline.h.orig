@@ -49,6 +49,7 @@ public:
         FramePending,
         TestBufferFailed,
         NotEnoughCrtcs,
+        Timeout,
         Unknown,
     };
     Q_ENUM(Error)
@@ -90,7 +91,7 @@ public:
     bool enabled() const;
     PresentationMode presentationMode() const;
     uint32_t overscan() const;
-    Output::RgbRange rgbRange() const;
+    BackendOutput::RgbRange rgbRange() const;
     DrmConnector::DrmContentType contentType() const;
     const std::shared_ptr<IccProfile> &iccProfile() const;
 
@@ -100,7 +101,7 @@ public:
     void setEnable(bool enable);
     void setPresentationMode(PresentationMode mode);
     void setOverscan(uint32_t overscan);
-    void setRgbRange(Output::RgbRange range);
+    void setRgbRange(BackendOutput::RgbRange range);
     void setCrtcColorPipeline(const ColorPipeline &pipeline);
     void setContentType(DrmConnector::DrmContentType type);
     void setIccProfile(const std::shared_ptr<IccProfile> &profile);
@@ -153,7 +154,7 @@ private:
         bool needsModesetProperties = false;
         std::shared_ptr<DrmConnectorMode> mode;
         uint32_t overscan = 0;
-        Output::RgbRange rgbRange = Output::RgbRange::Automatic;
+        BackendOutput::RgbRange rgbRange = BackendOutput::RgbRange::Automatic;
         PresentationMode presentationMode = PresentationMode::VSync;
         ColorPipeline crtcColorPipeline;
         DrmConnector::DrmContentType contentType = DrmConnector::DrmContentType::Graphics;
