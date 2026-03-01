@@ -90,8 +90,9 @@ size_t encodeChar(
 /**
  * \brief Computes length of a null-terminated string
  *
- * Fixed: nullptr guard (original UB on length(nullptr)).
- * Uses std::strlen for char* (SIMD-accelerated on Raptor Lake).
+ * \param [in] string Start of input string
+ * \returns Number of characters in input string,
+ *    excluding the terminating null character
  */
 template<typename S>
 size_t length(const S* string) {
@@ -113,9 +114,19 @@ inline size_t length(const char* string) {
 /**
  * \brief Converts string from one encoding to another
  *
- * Perfected: running dstPtr eliminates repeated (dstBegin + totalLength) AGU ops
- * per character → massive ILP / register-pressure win on Golden Cove P-cores.
- * No semantic change, exact original behavior preserved.
+ * The output string arguments may be \c nullptr. In that case, the
+ * total length of the transcoded string will be returned, in units
+ * of the output character type. The output string will only be
+ * null-terminated if the input string is also null-terminated.
+ * \tparam D Output character type
+ * \tparam S Input character type
+ * \param [in] dstBegin Start of output string
+ * \param [in] dstLength Length of output string
+ * \param [in] srcBegin Start of input string
+ * \param [in] srcLength Length of input string
+ * \returns If \c dstBegin is \c nullptr , the total number of output
+ *    characters required to store the output string. Otherwise, the
+ *    total number of characters written to the output string.
  */
 template<typename D, typename S>
 size_t transcodeString(
@@ -193,7 +204,9 @@ inline void strlcpy(char* dst, const char* src, size_t count) {
 /**
  * \brief Split string at one or more delimiter characters
  *
- * Perfected: reserve(16) eliminates reallocs in all realistic DXVK usage.
+ * \param [in] string String to split
+ * \param [in] delims Delimiter characters
+ * \returns Vector of substring views
  */
 inline std::vector<std::string_view> split(std::string_view string, std::string_view delims = " ") {
   std::vector<std::string_view> tokens;
@@ -217,7 +230,6 @@ inline std::vector<std::string_view> split(std::string_view string, std::string_
 inline bool compareCharsCaseInsensitive(char a, char b) {
   unsigned char ua = static_cast<unsigned char>(a);
   unsigned char ub = static_cast<unsigned char>(b);
-  // Branchless-friendly ASCII tolower (cmov on Golden Cove, fixes signed-char UB in original)
   if (ua >= 'A' && ua <= 'Z') ua |= 0x20u;
   if (ub >= 'A' && ub <= 'Z') ub |= 0x20u;
   return ua == ub;

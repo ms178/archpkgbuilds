@@ -4,22 +4,40 @@ namespace dxvk::str {
 
 namespace {
 
-constexpr uint8_t s_utf8LengthTable[256] = {
-  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, // 0x00-0x7F
-  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // 0x80-0xBF
-  2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
-  2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2, // 0xC0-0xDF
-  3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3, // 0xE0-0xEF
-  4,4,4,4,4,4,4,4,5,5,5,5,6,6,7,32  // 0xF0-0xFF (exact match to original lzcnt semantics)
+// Lookup table replacing bit::lzcnt((~first) << 24).
+// Indexed by the raw byte value (0x00-0xFF).
+// Only entries 0xC0-0xFF are accessed at runtime; lower entries are
+// never reached because the if/else-if chain handles them first.
+// Using [] (no explicit size) so the static_assert below catches
+// any accidental insertion or deletion of initializers.
+constexpr uint8_t s_utf8LengthTable[] = {
+  // 0x00-0x7F: ASCII single-byte (128 entries, never accessed via table)
+  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  // 0x00-0x0F
+  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  // 0x10-0x1F
+  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  // 0x20-0x2F
+  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  // 0x30-0x3F
+  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  // 0x40-0x4F
+  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  // 0x50-0x5F
+  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  // 0x60-0x6F
+  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  // 0x70-0x7F
+  // 0x80-0xBF: Continuation bytes, invalid as lead (64 entries, never accessed)
+  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  // 0x80-0x8F
+  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  // 0x90-0x9F
+  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  // 0xA0-0xAF
+  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  // 0xB0-0xBF
+  // 0xC0-0xDF: 2-byte sequence leads (32 entries)
+  2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,  // 0xC0-0xCF
+  2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,  // 0xD0-0xDF
+  // 0xE0-0xEF: 3-byte sequence leads (16 entries)
+  3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,  // 0xE0-0xEF
+  // 0xF0-0xFF: 4+ byte leads, matches lzcnt(~first << 24u) (16 entries)
+  4,4,4,4,4,4,4,4,5,5,5,5,6,6,7,32  // 0xF0-0xFF
 };
+static_assert(sizeof(s_utf8LengthTable) == 256,
+  "UTF-8 length table must have exactly 256 entries");
 
 } // anonymous namespace
+
 
 const uint8_t* decodeTypedChar(
   const uint8_t* begin,
@@ -64,6 +82,7 @@ const uint8_t* decodeTypedChar(
   }
 }
 
+
 const uint16_t* decodeTypedChar(
   const uint16_t* begin,
   const uint16_t* end,
@@ -92,6 +111,7 @@ const uint16_t* decodeTypedChar(
   }
 }
 
+
 const uint32_t* decodeTypedChar(
   const uint32_t* begin,
   const uint32_t* end,
@@ -99,6 +119,7 @@ const uint32_t* decodeTypedChar(
   ch = begin[0];
   return begin + 1;
 }
+
 
 size_t encodeTypedChar(
   uint8_t* begin,
@@ -147,6 +168,7 @@ size_t encodeTypedChar(
   }
 }
 
+
 size_t encodeTypedChar(
   uint16_t* begin,
   uint16_t* end,
@@ -184,6 +206,7 @@ size_t encodeTypedChar(
   }
 }
 
+
 size_t encodeTypedChar(
   uint32_t* begin,
   uint32_t* end,
@@ -197,6 +220,7 @@ size_t encodeTypedChar(
   return 1;
 }
 
+
 std::string fromws(const WCHAR* ws) {
   size_t srcLen = length(ws);
   size_t dstLen = transcodeString<char>(nullptr, 0, ws, srcLen);
@@ -207,6 +231,7 @@ std::string fromws(const WCHAR* ws) {
   transcodeString(result.data(), dstLen, ws, srcLen);
   return result;
 }
+
 
 std::wstring tows(const char* mbs) {
   size_t srcLen = length(mbs);
