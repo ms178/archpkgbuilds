@@ -864,7 +864,7 @@
  	/*
 
 --- a/drivers/gpu/drm/drm_syncobj.c	2025-03-21 21:05:19.110778019 +0100
-+++ b/drivers/gpu/drm/drm_syncobj.c	2026-02-03 09:37:49.753951575 +0100
++++ b/drivers/gpu/drm/drm_syncobj.c	2026-02-20 09:37:49.753951575 +0100
 @@ -252,9 +252,8 @@ struct drm_syncobj *drm_syncobj_find(str
  
  	spin_lock(&file_private->syncobj_table_lock);
@@ -1135,41 +1135,54 @@
  
  	return timeout;
  }
-@@ -1294,8 +1304,13 @@ static int drm_syncobj_array_find(struct
- 	struct drm_syncobj **syncobjs;
+@@ -1290,13 +1300,26 @@ static int drm_syncobj_array_find(struct
+ 				  uint32_t count_handles,
+ 				  struct drm_syncobj ***syncobjs_out)
+ {
+-	uint32_t i, *handles;
+-	struct drm_syncobj **syncobjs;
++	uint32_t i;
  	int ret;
  
+-	handles = kmalloc_array(count_handles, sizeof(*handles), GFP_KERNEL);
+-	if (handles == NULL)
+-		return -ENOMEM;
 +	if (count_handles == 0) {
 +		*syncobjs_out = NULL;
 +		return 0;
 +	}
 +
- 	handles = kmalloc_array(count_handles, sizeof(*handles), GFP_KERNEL);
--	if (handles == NULL)
-+	if (!handles)
- 		return -ENOMEM;
++#define MAX_STACK_HANDLES 8
++	uint32_t stack_handles[MAX_STACK_HANDLES];
++	uint32_t *handles;
++	struct drm_syncobj **syncobjs;
++
++	if (count_handles <= MAX_STACK_HANDLES) {
++		handles = stack_handles;
++	} else {
++		handles = kmalloc_array(count_handles, sizeof(*handles), GFP_KERNEL);
++		if (unlikely(!handles))
++			return -ENOMEM;
++	}
  
  	if (copy_from_user(handles, user_handles,
-@@ -1305,18 +1320,27 @@ static int drm_syncobj_array_find(struct
+ 			   sizeof(uint32_t) * count_handles)) {
+@@ -1305,20 +1328,26 @@ static int drm_syncobj_array_find(struct
  	}
  
  	syncobjs = kmalloc_array(count_handles, sizeof(*syncobjs), GFP_KERNEL);
 -	if (syncobjs == NULL) {
-+	if (!syncobjs) {
++	if (unlikely(!syncobjs)) {
  		ret = -ENOMEM;
  		goto err_free_handles;
  	}
  
-+	/*
-+	 * Batch all IDR lookups under a single lock acquisition.
-+	 * Reduces lock round-trips from N to 1, critical for multi-semaphore
-+	 * Vulkan submits where N=4-8 is common.
-+	 */
 +	spin_lock(&file_private->syncobj_table_lock);
  	for (i = 0; i < count_handles; i++) {
 -		syncobjs[i] = drm_syncobj_find(file_private, handles[i]);
+-		if (!syncobjs[i]) {
 +		syncobjs[i] = idr_find(&file_private->syncobj_idr, handles[i]);
- 		if (!syncobjs[i]) {
++		if (unlikely(!syncobjs[i])) {
 +			spin_unlock(&file_private->syncobj_table_lock);
  			ret = -ENOENT;
  			goto err_put_syncobjs;
@@ -1177,11 +1190,112 @@
 +		drm_syncobj_get(syncobjs[i]);
  	}
 +	spin_unlock(&file_private->syncobj_table_lock);
++
++	if (handles != stack_handles)
++		kfree(handles);
  
- 	kfree(handles);
+-	kfree(handles);
  	*syncobjs_out = syncobjs;
-
-
+ 	return 0;
+ 
+@@ -1327,8 +1356,8 @@ err_put_syncobjs:
+ 		drm_syncobj_put(syncobjs[i]);
+ 	kfree(syncobjs);
+ err_free_handles:
+-	kfree(handles);
+-
++	if (handles != stack_handles)
++		kfree(handles);
+ 	return ret;
+ }
+ 
+@@ -1628,32 +1657,42 @@ drm_syncobj_timeline_signal_ioctl(struct
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	points = kmalloc_array(args->count_handles, sizeof(*points),
+-			       GFP_KERNEL);
+-	if (!points) {
+-		ret = -ENOMEM;
+-		goto out;
++#define MAX_STACK_TIMELINE 8
++	uint64_t stack_points[MAX_STACK_TIMELINE];
++	struct dma_fence_chain *stack_chains[MAX_STACK_TIMELINE];
++	bool use_stack = args->count_handles <= MAX_STACK_TIMELINE;
++
++	if (use_stack) {
++		points = stack_points;
++		chains = stack_chains;
++	} else {
++		points = kmalloc_array(args->count_handles, sizeof(*points),
++				       GFP_KERNEL);
++		if (!points) {
++			ret = -ENOMEM;
++			goto out;
++		}
++		chains = kmalloc_array(args->count_handles, sizeof(*chains),
++				       GFP_KERNEL);
++		if (!chains) {
++			ret = -ENOMEM;
++			goto err_points;
++		}
+ 	}
++
+ 	if (!u64_to_user_ptr(args->points)) {
+ 		memset(points, 0, args->count_handles * sizeof(uint64_t));
+ 	} else if (copy_from_user(points, u64_to_user_ptr(args->points),
+ 				  sizeof(uint64_t) * args->count_handles)) {
+ 		ret = -EFAULT;
+-		goto err_points;
++		goto err_chains;
+ 	}
+ 
+-	chains = kmalloc_array(args->count_handles, sizeof(void *), GFP_KERNEL);
+-	if (!chains) {
+-		ret = -ENOMEM;
+-		goto err_points;
+-	}
+ 	for (i = 0; i < args->count_handles; i++) {
+ 		chains[i] = dma_fence_chain_alloc();
+ 		if (!chains[i]) {
+-			for (j = 0; j < i; j++)
+-				dma_fence_chain_free(chains[j]);
+ 			ret = -ENOMEM;
+-			goto err_chains;
++			goto err_free_chains;
+ 		}
+ 	}
+ 
+@@ -1664,13 +1703,26 @@ drm_syncobj_timeline_signal_ioctl(struct
+ 				      fence, points[i]);
+ 		dma_fence_put(fence);
+ 	}
++
++	ret = 0;
++	goto out_free;
++
++err_free_chains:
++	while (i-- > 0)
++		dma_fence_chain_free(chains[i]);
+ err_chains:
+-	kfree(chains);
++	if (!use_stack)
++		kfree(chains);
+ err_points:
+-	kfree(points);
++	if (!use_stack)
++		kfree(points);
++out_free:
++	if (!use_stack) {
++		kfree(chains);
++		kfree(points);
++	}
+ out:
+ 	drm_syncobj_array_free(syncobjs, args->count_handles);
+-
+ 	return ret;
+ }
+ 
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c	2025-09-18 01:33:05.056495913 +0200
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c	2025-10-06 02:04:26.382110242 +0200
 
@@ -1368,7 +1482,7 @@
  		start = drm_buddy_block_offset(mm->roots[i]);
  		__force_merge(mm, start, start + size, order);
  
-@@ -426,28 +448,54 @@ EXPORT_SYMBOL(drm_buddy_fini);
+@@ -427,28 +449,54 @@ EXPORT_SYMBOL(drm_buddy_fini);
  static int split_block(struct drm_buddy *mm,
  		       struct drm_buddy_block *block)
  {
@@ -1433,7 +1547,7 @@
  		clear_reset(block);
  	}
  
-@@ -492,7 +540,7 @@ void drm_buddy_reset_clear(struct drm_bu
+@@ -493,7 +541,7 @@ void drm_buddy_reset_clear(struct drm_bu
  
  	size = mm->size;
  	for (i = 0; i < mm->n_roots; ++i) {
@@ -1442,7 +1556,7 @@
  		start = drm_buddy_block_offset(mm->roots[i]);
  		__force_merge(mm, start, start + size, order);
  
-@@ -503,8 +551,8 @@ void drm_buddy_reset_clear(struct drm_bu
+@@ -504,8 +552,8 @@ void drm_buddy_reset_clear(struct drm_bu
  	src_tree = is_clear ? DRM_BUDDY_DIRTY_TREE : DRM_BUDDY_CLEAR_TREE;
  	dst_tree = is_clear ? DRM_BUDDY_CLEAR_TREE : DRM_BUDDY_DIRTY_TREE;
  
@@ -1453,7 +1567,7 @@
  		struct drm_buddy_block *block, *tmp;
  
  		rbtree_postorder_for_each_entry_safe(block, tmp, root, rb) {
-@@ -532,10 +580,12 @@ EXPORT_SYMBOL(drm_buddy_reset_clear);
+@@ -533,10 +581,12 @@ EXPORT_SYMBOL(drm_buddy_reset_clear);
  void drm_buddy_free_block(struct drm_buddy *mm,
  			  struct drm_buddy_block *block)
  {
@@ -1468,7 +1582,7 @@
  
  	__drm_buddy_free(mm, block, false);
  }
-@@ -603,7 +653,8 @@ __alloc_range_bias(struct drm_buddy *mm,
+@@ -604,7 +654,8 @@ __alloc_range_bias(struct drm_buddy *mm,
  		   unsigned long flags,
  		   bool fallback)
  {
@@ -1478,7 +1592,7 @@
  	struct drm_buddy_block *block;
  	struct drm_buddy_block *buddy;
  	LIST_HEAD(dfs);
-@@ -618,6 +669,8 @@ __alloc_range_bias(struct drm_buddy *mm,
+@@ -619,6 +670,8 @@ __alloc_range_bias(struct drm_buddy *mm,
  	do {
  		u64 block_start;
  		u64 block_end;
@@ -1487,7 +1601,7 @@
  
  		block = list_first_entry_or_null(&dfs,
  						 struct drm_buddy_block,
-@@ -627,11 +680,13 @@ __alloc_range_bias(struct drm_buddy *mm,
+@@ -628,11 +681,13 @@ __alloc_range_bias(struct drm_buddy *mm,
  
  		list_del(&block->tmp_link);
  
@@ -1503,7 +1617,7 @@
  
  		if (!overlaps(start, end, block_start, block_end))
  			continue;
-@@ -652,7 +707,7 @@ __alloc_range_bias(struct drm_buddy *mm,
+@@ -653,7 +708,7 @@ __alloc_range_bias(struct drm_buddy *mm,
  			continue;
  
  		if (contains(start, end, block_start, block_end) &&
@@ -1512,7 +1626,7 @@
  			/*
  			 * Find the free block within the range.
  			 */
-@@ -806,6 +861,7 @@ static int __alloc_range(struct drm_budd
+@@ -807,6 +862,7 @@ static int __alloc_range(struct drm_budd
  {
  	struct drm_buddy_block *block;
  	struct drm_buddy_block *buddy;
@@ -1520,7 +1634,7 @@
  	u64 total_allocated = 0;
  	LIST_HEAD(allocated);
  	u64 end;
-@@ -816,6 +872,8 @@ static int __alloc_range(struct drm_budd
+@@ -817,6 +873,8 @@ static int __alloc_range(struct drm_budd
  	do {
  		u64 block_start;
  		u64 block_end;
@@ -1529,7 +1643,7 @@
  
  		block = list_first_entry_or_null(dfs,
  						 struct drm_buddy_block,
-@@ -825,8 +883,10 @@ static int __alloc_range(struct drm_budd
+@@ -826,8 +884,10 @@ static int __alloc_range(struct drm_budd
  
  		list_del(&block->tmp_link);
  
@@ -1541,7 +1655,7 @@
  
  		if (!overlaps(start, end, block_start, block_end))
  			continue;
-@@ -839,10 +899,10 @@ static int __alloc_range(struct drm_budd
+@@ -840,10 +900,10 @@ static int __alloc_range(struct drm_budd
  		if (contains(start, end, block_start, block_end)) {
  			if (drm_buddy_block_is_free(block)) {
  				mark_allocated(mm, block);
@@ -1555,7 +1669,7 @@
  				list_add_tail(&block->link, &allocated);
  				continue;
  			} else if (!mm->clear_avail) {
-@@ -918,13 +978,14 @@ static int __alloc_contig_try_harder(str
+@@ -919,13 +979,14 @@ static int __alloc_contig_try_harder(str
  	struct drm_buddy_block *block;
  	unsigned int tree, order;
  	LIST_HEAD(blocks_lhs);
@@ -1573,7 +1687,7 @@
  	if (order == 0)
  		return -ENOSPC;
  
-@@ -1108,20 +1169,22 @@ int drm_buddy_alloc_blocks(struct drm_bu
+@@ -1109,20 +1170,22 @@ int drm_buddy_alloc_blocks(struct drm_bu
  	struct drm_buddy_block *block = NULL;
  	u64 original_size, original_min_size;
  	unsigned int min_order, order;
@@ -1600,7 +1714,7 @@
  		return -EINVAL;
  
  	if (end > mm->size)
-@@ -1150,12 +1213,14 @@ int drm_buddy_alloc_blocks(struct drm_bu
+@@ -1151,12 +1214,14 @@ int drm_buddy_alloc_blocks(struct drm_bu
  		size = round_up(size, min_block_size);
  	}
  
@@ -1619,7 +1733,7 @@
  		BUG_ON(order > mm->max_order);
  		BUG_ON(order < min_order);
  
-@@ -1196,14 +1261,17 @@ int drm_buddy_alloc_blocks(struct drm_bu
+@@ -1197,14 +1262,17 @@ int drm_buddy_alloc_blocks(struct drm_bu
  			}
  		} while (1);
  
@@ -1644,7 +1758,7 @@
  
  		if (!pages)
  			break;
-@@ -1276,14 +1344,14 @@ void drm_buddy_print(struct drm_buddy *m
+@@ -1277,14 +1345,14 @@ void drm_buddy_print(struct drm_buddy *m
  	drm_printf(p, "chunk_size: %lluKiB, total: %lluMiB, free: %lluMiB, clear_free: %lluMiB\n",
  		   mm->chunk_size >> 10, mm->size >> 20, mm->avail >> 20, mm->clear_avail >> 20);
  
@@ -1661,7 +1775,7 @@
  
  			rbtree_postorder_for_each_entry_safe(block, tmp, root, rb) {
  				BUG_ON(!drm_buddy_block_is_free(block));
-@@ -1293,7 +1361,7 @@ void drm_buddy_print(struct drm_buddy *m
+@@ -1294,7 +1362,7 @@ void drm_buddy_print(struct drm_buddy *m
  
  		drm_printf(p, "order-%2d ", order);
  
