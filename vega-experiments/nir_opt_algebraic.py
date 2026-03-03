@@ -278,22 +278,21 @@ optimizations += [
     (('iadd', ('sdot_2x16_iadd(is_used_once)', a, b, '#c'), '#d'), ('sdot_2x16_iadd', a, b, ('iadd', c, d))),
     (('iadd', ('udot_2x16_uadd(is_used_once)', a, b, '#c'), '#d'), ('udot_2x16_uadd', a, b, ('iadd', c, d))),
 
-    (('iadd', ('sdot_4x8_iadd', 'a(is_not_const)', b, 0), c), ('sdot_4x8_iadd', a, b, c)),
-    (('iadd', ('udot_4x8_uadd', 'a(is_not_const)', b, 0), c), ('udot_4x8_uadd', a, b, c)),
-    (('iadd', ('sudot_4x8_iadd', 'a(is_not_const)', b, 0), c), ('sudot_4x8_iadd', a, b, c)),
-    (('iadd', ('sudot_4x8_iadd', a, 'b(is_not_const)', 0), c), ('sudot_4x8_iadd', a, b, c)),
-    (('iadd', ('sdot_2x16_iadd', 'a(is_not_const)', b, 0), c), ('sdot_2x16_iadd', a, b, c)),
-    (('iadd', ('udot_2x16_uadd', 'a(is_not_const)', b, 0), c), ('udot_2x16_uadd', a, b, c)),
-    (('sdot_4x8_iadd', '#a', '#b', 'c(is_not_const)'), ('iadd', ('sdot_4x8_iadd', a, b, 0), c)),
-    (('udot_4x8_uadd', '#a', '#b', 'c(is_not_const)'), ('iadd', ('udot_4x8_uadd', a, b, 0), c)),
-    (('sudot_4x8_iadd', '#a', '#b', 'c(is_not_const)'), ('iadd', ('sudot_4x8_iadd', a, b, 0), c)),
-    (('sdot_2x16_iadd', '#a', '#b', 'c(is_not_const)'), ('iadd', ('sdot_2x16_iadd', a, b, 0), c)),
-    (('udot_2x16_uadd', '#a', '#b', 'c(is_not_const)'), ('iadd', ('udot_2x16_uadd', a, b, 0), c)),
-    (('sdot_4x8_iadd_sat', '#a', '#b', 'c(is_not_const)'), ('iadd_sat', ('sdot_4x8_iadd', a, b, 0), c), '!options->lower_iadd_sat'),
-    (('udot_4x8_uadd_sat', '#a', '#b', 'c(is_not_const)'), ('uadd_sat', ('udot_4x8_uadd', a, b, 0), c), '!options->lower_uadd_sat'),
-    (('sudot_4x8_iadd_sat', '#a', '#b', 'c(is_not_const)'), ('iadd_sat', ('sudot_4x8_iadd', a, b, 0), c), '!options->lower_iadd_sat'),
-    (('sdot_2x16_iadd_sat', '#a', '#b', 'c(is_not_const)'), ('iadd_sat', ('sdot_2x16_iadd', a, b, 0), c), '!options->lower_iadd_sat'),
-    (('udot_2x16_uadd_sat', '#a', '#b', 'c(is_not_const)'), ('uadd_sat', ('udot_2x16_uadd', a, b, 0), c), '!options->lower_uadd_sat'),
+    (('iadd', ('sdot_4x8_iadd', a, b, 0), c), ('sdot_4x8_iadd', a, b, c)),
+    (('iadd', ('udot_4x8_uadd', a, b, 0), c), ('udot_4x8_uadd', a, b, c)),
+    (('iadd', ('sudot_4x8_iadd', a, b, 0), c), ('sudot_4x8_iadd', a, b, c)),
+    (('iadd', ('sdot_2x16_iadd', a, b, 0), c), ('sdot_2x16_iadd', a, b, c)),
+    (('iadd', ('udot_2x16_uadd', a, b, 0), c), ('udot_2x16_uadd', a, b, c)),
+    (('sdot_4x8_iadd', '#a', '#b', c), ('iadd', ('sdot_4x8_iadd', a, b, 0), c)),
+    (('udot_4x8_uadd', '#a', '#b', c), ('iadd', ('udot_4x8_uadd', a, b, 0), c)),
+    (('sudot_4x8_iadd', '#a', '#b', c), ('iadd', ('sudot_4x8_iadd', a, b, 0), c)),
+    (('sdot_2x16_iadd', '#a', '#b', c), ('iadd', ('sdot_2x16_iadd', a, b, 0), c)),
+    (('udot_2x16_uadd', '#a', '#b', c), ('iadd', ('udot_2x16_uadd', a, b, 0), c)),
+    (('sdot_4x8_iadd_sat', '#a', '#b', c), ('iadd_sat', ('sdot_4x8_iadd', a, b, 0), c), '!options->lower_iadd_sat'),
+    (('udot_4x8_uadd_sat', '#a', '#b', c), ('uadd_sat', ('udot_4x8_uadd', a, b, 0), c), '!options->lower_uadd_sat'),
+    (('sudot_4x8_iadd_sat', '#a', '#b', c), ('iadd_sat', ('sudot_4x8_iadd', a, b, 0), c), '!options->lower_iadd_sat'),
+    (('sdot_2x16_iadd_sat', '#a', '#b', c), ('iadd_sat', ('sdot_2x16_iadd', a, b, 0), c), '!options->lower_iadd_sat'),
+    (('udot_2x16_uadd_sat', '#a', '#b', c), ('uadd_sat', ('udot_2x16_uadd', a, b, 0), c), '!options->lower_uadd_sat'),
 
     *add_fabs_fneg((('fmul@32(nsz)', ('bcsel', ('feq', b, 0.0), 0.0, 'ma'), ('bcsel', ('feq', a, 0.0), 0.0, 'mb')),
      ('fmulz', 'ma', 'mb'), has_fmulz), {'ma': a, 'mb': b}),
@@ -615,12 +614,12 @@ optimizations.extend([
    (('fge', ('fneg', a), ('fneg', b)), ('fge', b, a)),
    (('feq', ('fneg', a), ('fneg', b)), ('feq', b, a)),
    (('fneu', ('fneg', a), ('fneg', b)), ('fneu', b, a)),
-   (('flt', ('fneg', 'a(is_not_const)'), '#b'), ('flt', ('fneg', b), a)),
-   (('flt', '#b', ('fneg', 'a(is_not_const)')), ('flt', a, ('fneg', b))),
-   (('fge', ('fneg', 'a(is_not_const)'), '#b'), ('fge', ('fneg', b), a)),
-   (('fge', '#b', ('fneg', 'a(is_not_const)')), ('fge', a, ('fneg', b))),
-   (('fneu', ('fneg', 'a(is_not_const)'), '#b'), ('fneu', ('fneg', b), a)),
-   (('feq', '#b', ('fneg', 'a(is_not_const)')), ('feq', a, ('fneg', b))),
+   (('flt', ('fneg', a), '#b'), ('flt', ('fneg', b), a)),
+   (('flt', '#b', ('fneg', a)), ('flt', a, ('fneg', b))),
+   (('fge', ('fneg', a), '#b'), ('fge', ('fneg', b), a)),
+   (('fge', '#b', ('fneg', a)), ('fge', a, ('fneg', b))),
+   (('fneu', ('fneg', a), '#b'), ('fneu', ('fneg', b), a)),
+   (('feq', '#b', ('fneg', a)), ('feq', a, ('fneg', b))),
 
    (('flt', a, -0.0), ('flt', a, 0.0)),
    (('flt', -0.0, a), ('flt', 0.0, a)),
@@ -629,10 +628,10 @@ optimizations.extend([
    (('fneu', a, -0.0), ('fneu', 0.0, a)),
    (('feq', -0.0, a), ('feq', a, 0.0)),
 
-   (('ieq', ('ineg', 'a(is_not_const)'), '#b'),  ('ieq', a, ('ineg', b))),
-   (('ine', ('ineg', 'a(is_not_const)'), '#b'),  ('ine', a, ('ineg', b))),
-   (('ieq', ('inot', 'a(is_not_const)'), '#b'),  ('ieq', a, ('inot', b))),
-   (('ine', ('inot', 'a(is_not_const)'), '#b'),  ('ine', a, ('inot', b))),
+   (('ieq', ('ineg', a), '#b'),  ('ieq', a, ('ineg', b))),
+   (('ine', ('ineg', a), '#b'),  ('ine', a, ('ineg', b))),
+   (('ieq', ('inot', a), '#b'),  ('ieq', a, ('inot', b))),
+   (('ine', ('inot', a), '#b'),  ('ine', a, ('inot', b))),
    (('ieq', ('iabs', a), 0),  ('ieq', a, 0)),
    (('ine', ('iabs', a), 0),  ('ine', a, 0)),
 
@@ -664,24 +663,17 @@ optimizations.extend([
    (('bcsel', ('feq', a, 0), b, ('fadd', a, 'b(is_not_zero)')), ('fadd', a, b)),
    (('bcsel', ('fneu', a, 0), ('fadd', a, 'b(is_not_zero)'), b), ('fadd', a, b)),
 
-   (('fge', 0.0, ('b2f', 'a@1')), ('inot', a)),
-   (('fge', ('fneg', ('b2f', 'a@1')), 0.0), ('inot', a)),
-
    (('fneu', ('fadd', ('b2f', 'a@1'), ('b2f', 'b@1')), 0.0), ('ior', a, b)),
    (('fneu', ('b2f', 'a@1'), ('fneg', ('b2f', 'b@1'))),      ('ior', a, b)),
    (('fneu', ('fadd', ('b2f', 'a@1'), ('fneg', ('b2f', 'b@1'))), 0.0), ('ixor', a, b)),
    (('fneu',          ('b2f', 'a@1'),           ('b2f', 'b@1')),      ('ixor', a, b)),
-   (('fneu', ('fneg', ('b2f', 'a@1')), ('fneg', ('b2f', 'b@1'))),     ('ixor', a, b)),
    (('feq',  ('fadd', ('b2f', 'a@1'), ('b2f', 'b@1')), 0.0),          ('inot', ('ior', a, b))),
    (('feq',  ('b2f', 'a@1'), ('fneg', ('b2f', 'b@1'))),               ('inot', ('ior', a, b))),
    (('feq',  ('fadd', ('b2f', 'a@1'), ('fneg', ('b2f', 'b@1'))), 0.0), ('ieq', a, b)),
    (('feq',           ('b2f', 'a@1'),           ('b2f', 'b@1')),       ('ieq', a, b)),
-   (('feq',  ('fneg', ('b2f', 'a@1')), ('fneg', ('b2f', 'b@1'))),      ('ieq', a, b)),
 
-   (('flt', ('fneg', ('fadd', ('b2f', 'a@1'), ('b2f', 'b@1'))), 0.0), ('ior', a, b)),
    (('flt', 0.0, ('fadd', ('b2f', 'a@1'), ('b2f', 'b@1'))), ('ior', a, b)),
 
-   (('fge', ('fneg', ('fadd', ('b2f', 'a@1'), ('b2f', 'b@1'))), 0.0), ('inot', ('ior', a, b))),
    (('fge', 0.0, ('fadd', ('b2f', 'a@1'), ('b2f', 'b@1'))), ('inot', ('ior', a, b))),
 
    (('flt', a, ('fneg', a)), ('flt', a, 0.0)),
@@ -704,11 +696,12 @@ optimizations.extend([
    (('ieq', ('iadd', a, b), a), ('ieq', b, 0)),
    (('ine', ('iadd', a, b), a), ('ine', b, 0)),
 
-   (('flt',  0.0, ('b2f', 'a@1')), a),
    (('ieq', 'a@1', False), ('inot', a)),
    (('ieq', 'a@1', True), a),
+   (('ieq', ('b2i', 'a@1'), ('b2i', 'b@1')), ('ieq', a, b)),
    (('ine', 'a@1', False), a),
    (('ine', 'a@1', True), ('inot', a)),
+   (('ine', ('b2i', 'a@1'), ('b2i', 'b@1')), ('ixor', a, b)),
 
    (('fneu', ('u2f', a), 0.0), ('ine', a, 0)),
    (('feq', ('u2f', a), 0.0), ('ieq', a, 0)),
@@ -742,8 +735,6 @@ optimizations.extend([
    (('fmin', ('b2f', 'a@1'), '#b'), ('bcsel', a, ('fmin', b, 1.0), ('fmin', b, 0.0))),
 
    (('flt', ('fadd(is_used_once)', a, ('fneg', b)), 0.0), ('flt', a, b)),
-
-   (('fge', ('fneg', ('fabs', a)), 0.0), ('feq', a, 0.0)),
 
    (('bcsel(is_only_used_as_float_nsz)', ('flt(nnan)', b, a), b, a), ('fmin(preserve_nan_inf)', a, b)),
    (('bcsel(is_only_used_as_float_nsz)', ('flt(nnan)', a, b), b, a), ('fmax(preserve_nan_inf)', a, b)),
@@ -819,33 +810,35 @@ optimizations.extend([
 
 for op in ('ine', 'ieq', 'ilt', 'ige', 'ult', 'uge', 'bitz', 'bitnz',
            'fneu', 'feq', 'flt', 'fge', 'fneo', 'fequ'):
+    commutative = op in ['feq', 'fneu', 'fequ', 'fneo', 'ine', 'ieq']
+
     optimizations.extend([
         ((op, ('bcsel(is_used_once)', a, b, '#c'), '#d'),
          ('bcsel', a, (op, b, d), (op, c, d))),
         ((op, ('bcsel(is_used_once)', a, '#b', c), '#d'),
          ('bcsel', a, (op, b, d), (op, c, d))),
-        ((op, '#d', ('bcsel(is_used_once)', a, b, '#c')),
-         ('bcsel', a, (op, d, b), (op, d, c))),
-        ((op, '#d', ('bcsel(is_used_once)', a, '#b', c)),
-         ('bcsel', a, (op, d, b), (op, d, c))),
+        ((op, ('bcsel', a, '#b', '#c'), '#d'), ('bcsel', a, (op, b, d), (op, c, d))),
     ])
 
+    if not commutative:
+        optimizations.extend([
+            ((op, '#d', ('bcsel(is_used_once)', a, b, '#c')), ('bcsel', a, (op, d, b), (op, d, c))),
+            ((op, '#d', ('bcsel(is_used_once)', a, '#b', c)), ('bcsel', a, (op, d, b), (op, d, c))),
+            ((op, '#d', ('bcsel', a, '#b', '#c')), ('bcsel', a, (op, d, b), (op, d, c))),
+        ])
 
-for N in (8, 16, 32, 64):
-    b2iN = f'b2i{N}'
-    optimizations.extend([
-        (('ieq', (b2iN, 'a@1'), (b2iN, 'b@1')), ('ieq', a, b)),
-        (('ine', (b2iN, 'a@1'), (b2iN, 'b@1')), ('ine', a, b)),
-    ])
 
+    if not op in ['bitz', 'bitnz']:
+        optimizations.extend([
+            ((op, ('b2f', 'a@1'), '#b'), ('bcsel', a, (op, 1.0, b), (op, 0.0, b))),
+            ((op, ('b2i', 'a@1'), '#b'), ('bcsel', a, (op, 1, b), (op, 0, b))),
+        ])
 
-for N in (16, 32, 64):
-    b2fN = f'b2f{N}'
-    optimizations.extend([
-        (('feq', (b2fN, 'a@1'), (b2fN, 'b@1')), ('ieq', a, b)),
-        (('fneu', (b2fN, 'a@1'), (b2fN, 'b@1')), ('ine', a, b)),
-    ])
-
+    if not op in ['bitz', 'bitnz'] and not commutative:
+        optimizations.extend([
+            ((op, '#b', ('b2f', 'a@1')), ('bcsel', a, (op, b, 1.0), (op, b, 0.0))),
+            ((op, '#b', ('b2i', 'a@1')), ('bcsel', a, (op, b, 1), (op, b, 0))),
+        ])
 
 for s in (8, 16, 32, 64):
     optimizations.extend([
@@ -1420,6 +1413,12 @@ optimizations.extend([
 
     (('ine', ('b2i', 'a@1'), ('ineg', ('b2i', 'b@1'))), ('ior', a, b)),
     (('ieq', ('b2i', 'a@1'), ('ineg', ('b2i', 'b@1'))), ('inot', ('ior', a, b))),
+
+    (('imul', ('b2i', 'a@1'), b), ('bcsel', a, b, 0)),
+    (('imul', ('ineg', ('b2i', 'a@1')), b), ('ineg', ('bcsel', a, b, 0))),
+
+    (('ishl', ('b2i', 'a@1'), '#b'), ('bcsel', a, ('ishl', 1, b), 0)),
+    (('ishl', ('ineg', ('b2i', 'a@1')), '#b'), ('bcsel', a, ('ishl', -1, b), 0)),
 ])
 
 
@@ -1471,8 +1470,6 @@ optimizations.extend([
 
     (('iand', 'a@bool16', 1.0), ('b2f', a)),
     (('iand', 'a@bool32', 1.0), ('b2f', a)),
-
-    (('flt', ('fneg', ('b2f', 'a@1')), 0), a),
 
     (('ilt', a, a), False),
     (('ige', a, a), True),
@@ -2174,14 +2171,10 @@ optimizations.extend([
    (('ffmaz', ('fneg', a), ('fneg', b), c), ('ffmaz', a, b, c)),
    (('imul', ('ineg', a), b), ('ineg', ('imul', a, b))),
 
-   (('~fmul(is_used_once)', ('fmul(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), '#c'),
-    ('fmul', ('fmul', a, c), b)),
-   (('~fmulz(is_used_once)', ('fmulz(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), '#c'),
-    ('fmulz', ('fmulz', a, c), b)),
-   (('~fmul(is_used_once)', ('fmulz(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), '#c(is_finite_not_zero)'),
-    ('fmulz', ('fmul', a, c), b)),
-   (('imul(is_used_once)', ('imul(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), '#c'),
-    ('imul', ('imul', a, c), b)),
+   (('~fmul', ('fmul(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), '#c'), ('fmul', ('fmul', a, c), b)),
+   (('~fmulz', ('fmulz(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), '#c'), ('fmulz', ('fmulz', a, c), b)),
+   (('~fmul', ('fmulz(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), '#c(is_finite_not_zero)'), ('fmulz', ('fmul', a, c), b)),
+   (('imul', ('imul(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), '#c'), ('imul', ('imul', a, c), b)),
    (('~ffma', ('fmul(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), '#c', d),
     ('ffma', ('fmul', a, c), b, d)),
    (('~ffmaz', ('fmulz(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), '#c', d),
@@ -2189,36 +2182,29 @@ optimizations.extend([
    (('~ffma', ('fmulz(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), '#c(is_finite_not_zero)', d),
     ('ffmaz', ('fmul', a, c), b, d)),
 
-   (('~fadd(is_used_once)', ('fadd(is_used_once)', 'a(is_not_const)', 'b(is_fmul)'), '#c'),
-    ('fadd', ('fadd', a, c), b)),
-   (('~fadd(is_used_once)', ('fadd(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), '#c'),
-    ('fadd', ('fadd', a, c), b)),
-   (('~fadd(is_used_once)', ('ffma(is_used_once)', 'a(is_not_const)', b, 'c(is_not_const)'), '#d'),
-    ('fadd', ('ffma', a, b, d), c)),
-   (('~fadd(is_used_once)', ('ffmaz(is_used_once)', 'a(is_not_const)', b, 'c(is_not_const)'), '#d'),
-    ('fadd', ('ffmaz', a, b, d), c)),
-   (('iadd(is_used_once)', ('iadd(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), '#c'),
-    ('iadd', ('iadd', a, c), b)),
+   (('~fadd', ('fadd(is_used_once)', 'a(is_not_const)', 'b(is_fmul)'), '#c'), ('fadd', ('fadd', a, c), b)),
+   (('~fadd', ('fadd(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), '#c'), ('fadd', ('fadd', a, c), b)),
+   (('~fadd', ('ffma(is_used_once)', 'a(is_not_const)', b, 'c(is_not_const)'), '#d'), ('fadd', ('ffma', a, b, d), c)),
+   (('~fadd', ('ffmaz(is_used_once)', 'a(is_not_const)', b, 'c(is_not_const)'), '#d'), ('fadd', ('ffmaz', a, b, d), c)),
+   (('iadd', ('iadd(is_used_once)', 'a(is_not_const)', 'b(is_not_const)'), '#c'), ('iadd', ('iadd', a, c), b)),
 
-   (('~fmul', '#a', ('fmul', 'b(is_not_const)', '#c')), ('fmul', ('fmul', a, c), b)),
-   (('~fmulz', '#a', ('fmulz', 'b(is_not_const)', '#c')), ('fmulz', ('fmulz', a, c), b)),
-   (('~fmul', '#a(is_finite_not_zero)', ('fmulz', 'b(is_not_const)', '#c')), ('fmulz', ('fmul', a, c), b)),
-   (('~ffma', '#a', ('fmul', 'b(is_not_const)', '#c'), d), ('ffma', ('fmul', a, c), b, d)),
-   (('~ffmaz', '#a', ('fmulz', 'b(is_not_const)', '#c'), d), ('ffmaz', ('fmulz', a, c), b, d)),
-   (('~ffmaz', '#a(is_finite_not_zero)', ('fmulz', 'b(is_not_const)', '#c'), d), ('ffmaz', ('fmul', a, c), b, d)),
-   (('imul', '#a', ('imul', 'b(is_not_const)', '#c')), ('imul', ('imul', a, c), b)),
-
-   (('~fadd', '#a',          ('fadd', 'b(is_not_const)', '#c')),  ('fadd', ('fadd', a,          c),           b)),
-   (('~fadd', '#a', ('fneg', ('fadd', 'b(is_not_const)', '#c'))), ('fadd', ('fadd', a, ('fneg', c)), ('fneg', b))),
-   (('~fadd', '#a',          ('ffma', 'b(is_not_const)', 'c(is_not_const)', '#d')),  ('ffma',          b,  c, ('fadd', a,          d))),
-   (('~fadd', '#a', ('fneg', ('ffma', 'b(is_not_const)', 'c(is_not_const)', '#d'))), ('ffma', ('fneg', b), c, ('fadd', a, ('fneg', d)))),
-   (('~fadd', '#a',          ('ffmaz', 'b(is_not_const)', 'c(is_not_const)', '#d')),  ('ffmaz',          b,  c, ('fadd', a,          d))),
-   (('~fadd', '#a', ('fneg', ('ffmaz', 'b(is_not_const)', 'c(is_not_const)', '#d'))), ('ffmaz', ('fneg', b), c, ('fadd', a, ('fneg', d)))),
-
-   (('iadd', '#a', ('iadd', 'b(is_not_const)', '#c')), ('iadd', ('iadd', a, c), b)),
-   (('iand', '#a', ('iand', 'b(is_not_const)', '#c')), ('iand', ('iand', a, c), b)),
-   (('ior',  '#a', ('ior',  'b(is_not_const)', '#c')), ('ior',  ('ior',  a, c), b)),
-   (('ixor', '#a', ('ixor', 'b(is_not_const)', '#c')), ('ixor', ('ixor', a, c), b)),
+   (('~fmul', '#a', ('fmul', b, '#c')), ('fmul', ('fmul', a, c), b)),
+   (('~fmulz', '#a', ('fmulz', b, '#c')), ('fmulz', ('fmulz', a, c), b)),
+   (('~fmul', '#a(is_finite_not_zero)', ('fmulz', b, '#c')), ('fmulz', ('fmul', a, c), b)),
+   (('~ffma', '#a', ('fmul', b, '#c'), d), ('ffma', ('fmul', a, c), b, d)),
+   (('~ffmaz', '#a', ('fmulz', b, '#c'), d), ('ffmaz', ('fmulz', a, c), b, d)),
+   (('~ffmaz', '#a(is_finite_not_zero)', ('fmulz', b, '#c'), d), ('ffmaz', ('fmul', a, c), b, d)),
+   (('imul', '#a', ('imul', b, '#c')), ('imul', ('imul', a, c), b)),
+   (('~fadd', '#a',          ('fadd', b, '#c')),  ('fadd', ('fadd', a,          c),           b)),
+   (('~fadd', '#a', ('fneg', ('fadd', b, '#c'))), ('fadd', ('fadd', a, ('fneg', c)), ('fneg', b))),
+   (('~fadd', '#a',          ('ffma', b, c, '#d')),  ('ffma',          b,  c, ('fadd', a,          d))),
+   (('~fadd', '#a', ('fneg', ('ffma', b, c, '#d'))), ('ffma', ('fneg', b), c, ('fadd', a, ('fneg', d)))),
+   (('~fadd', '#a',          ('ffmaz', b, c, '#d')),  ('ffmaz',          b,  c, ('fadd', a,          d))),
+   (('~fadd', '#a', ('fneg', ('ffmaz', b, c, '#d'))), ('ffmaz', ('fneg', b), c, ('fadd', a, ('fneg', d)))),
+   (('iadd', '#a', ('iadd', b, '#c')), ('iadd', ('iadd', a, c), b)),
+   (('iand', '#a', ('iand', b, '#c')), ('iand', ('iand', a, c), b)),
+   (('ior',  '#a', ('ior',  b, '#c')), ('ior',  ('ior',  a, c), b)),
+   (('ixor', '#a', ('ixor', b, '#c')), ('ixor', ('ixor', a, c), b)),
 
    (('ior', ('iand', a, '#c'), ('ior', b, ('iand', a, '#d'))), ('ior', b, ('iand', a, ('ior', c, d)))),
 
@@ -3215,22 +3201,6 @@ for op in ('flt', 'fge', 'feq'):
     ]
 
 
-for op in ('feq', 'fneu', 'ieq', 'ine'):
-    optimizations += [
-        ((op, ('bcsel', 'a', '#b', '#c'), '#d'),
-         ('bcsel', 'a', (op, 'b', 'd'), (op, 'c', 'd'))),
-    ]
-
-
-for op in ('flt', 'fge', 'ilt', 'ige', 'ult', 'uge'):
-    optimizations += [
-        ((op, ('bcsel', 'a', '#b', '#c'), '#d'),
-         ('bcsel', 'a', (op, 'b', 'd'), (op, 'c', 'd'))),
-        ((op, '#d', ('bcsel', a, '#b', '#c')),
-         ('bcsel', 'a', (op, 'd', 'b'), (op, 'd', 'c'))),
-    ]
-
-
 for op in ('fadd', 'fmul', 'fmulz', 'iadd', 'imul'):
     optimizations += [
         ((op, ('bcsel(is_used_once)', a, '#b', c), '#d'),
@@ -3374,25 +3344,11 @@ for i in range(2, 5):
                 ((to_mp, vec_inst + suffix_in), vec_inst + out_mp, '!options->vectorize_vec2_16bit', TestStatus.UNSUPPORTED),
             ]
 
-
-for b2t, xne, xeq, zero, one in (('b2i', 'ine', 'ieq', 0, 1), ('b2f', 'fneu', 'feq', 0.0, 1.0)):
-    optimizations += [
-        ((xeq, (b2t, 'a@1'), zero), ('inot', a)),
-        ((xeq, (b2t, 'a@1'), one), a),
-        ((xne, (b2t, 'a@1'), zero), a),
-        ((xne, (b2t, 'a@1'), one), ('inot', a)),
-        ((xeq, (b2t, 'a@1'), '#b'),
-         ('bcsel', (xeq, b, zero), ('inot', a), ('bcsel', (xeq, b, one), a, False))),
-        ((xne, (b2t, 'a@1'), '#b'),
-         ('bcsel', (xeq, b, zero), a, ('bcsel', (xeq, b, one), ('inot', a), True))),
-    ]
-
-
 before_ffma_optimizations = [
-    (('~fmul(is_used_once)', ('fmul(is_used_once)', 'a(is_not_const)', '#b'), 'c(is_not_const)'), ('fmul', ('fmul', a, c), b)),
-    (('imul(is_used_once)', ('imul(is_used_once)', 'a(is_not_const)', '#b'), 'c(is_not_const)'), ('imul', ('imul', a, c), b)),
-    (('~fadd(is_used_once)', ('fadd(is_used_once)', 'a(is_not_const)', '#b'), 'c(is_not_const)'), ('fadd', ('fadd', a, c), b)),
-    (('iadd(is_used_once)', ('iadd(is_used_once)', 'a(is_not_const)', '#b'), 'c(is_not_const)'), ('iadd', ('iadd', a, c), b)),
+    (('~fmul', ('fmul(is_used_once)', 'a(is_not_const)', '#b'), 'c(is_not_const)'), ('fmul', ('fmul', a, c), b)),
+    (('imul', ('imul(is_used_once)', 'a(is_not_const)', '#b'), 'c(is_not_const)'), ('imul', ('imul', a, c), b)),
+    (('~fadd', ('fadd(is_used_once)', 'a(is_not_const)', '#b'), 'c(is_not_const)'), ('fadd', ('fadd', a, c), b)),
+    (('iadd', ('iadd(is_used_once)', 'a(is_not_const)', '#b'), 'c(is_not_const)'), ('iadd', ('iadd', a, c), b)),
 
     (('~fadd', ('fmul', a, b), ('fmul', a, c)), ('fmul', a, ('fadd', b, c))),
     (('iadd', ('imul', a, b), ('imul', a, c)), ('imul', a, ('iadd', b, c))),
@@ -3593,12 +3549,12 @@ late_optimizations.extend([
     (('fge', ('fneg', a), ('fneg', b)), ('fge', b, a)),
     (('feq', ('fneg', a), ('fneg', b)), ('feq', b, a)),
     (('fneu', ('fneg', a), ('fneg', b)), ('fneu', b, a)),
-    (('flt', ('fneg', a), -1.0), ('flt', 1.0, a)),
-    (('flt', -1.0, ('fneg', a)), ('flt', a, 1.0)),
-    (('fge', ('fneg', a), -1.0), ('fge', 1.0, a)),
-    (('fge', -1.0, ('fneg', a)), ('fge', a, 1.0)),
-    (('fneu', ('fneg', a), -1.0), ('fneu', 1.0, a)),
-    (('feq', -1.0, ('fneg', a)), ('feq', a, 1.0)),
+    (('flt', ('fneg', a), '#b'), ('flt', ('fneg', b), a)),
+    (('flt', '#b', ('fneg', a)), ('flt', a, ('fneg', b))),
+    (('fge', ('fneg', a), '#b'), ('fge', ('fneg', b), a)),
+    (('fge', '#b', ('fneg', a)), ('fge', a, ('fneg', b))),
+    (('fneu', ('fneg', a), '#b'), ('fneu', ('fneg', b), a)),
+    (('feq', '#b', ('fneg', a)), ('feq', a, ('fneg', b))),
 
     (('ior', a, a), a),
     (('iand', a, a), a),
