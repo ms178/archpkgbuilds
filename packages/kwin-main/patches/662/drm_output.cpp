@@ -118,12 +118,10 @@ bool DrmOutput::shouldDisableNonPrimaryPlanes() const
 
 bool DrmOutput::presentAsync(OutputLayer *layer, std::optional<std::chrono::nanoseconds> allowedVrrDelay)
 {
-    if (!m_pipeline) {
-        // this can happen when the output gets hot-unplugged
-        // FIXME fix output lifetimes so that this doesn't happen anymore...
+    if (!m_pipeline) [[unlikely]] {
         return false;
     }
-    if (m_pipeline->gpu()->atomicModeSetting() && shouldDisableNonPrimaryPlanes() && layer->isEnabled()) {
+    if (m_gpu->atomicModeSetting() && shouldDisableNonPrimaryPlanes() && layer->isEnabled()) {
         return false;
     }
     return m_pipeline->presentAsync(layer, allowedVrrDelay);
@@ -174,14 +172,24 @@ void DrmOutput::populateModes(State *next) const
     }
 
     for (const auto &custom : next->customModes) {
-        next->modes.append(m_pipeline->connector()->generateMode(custom.size, custom.refreshRate / 1000.0f, custom.flags | OutputMode::Flag::Custom));
+        next->modes.append(m_pipeline->connector()->generateMode(
+            custom.size, custom.refreshRate / 1000.0f,
+            custom.flags | OutputMode::Flag::Custom));
     }
 
     if (!next->currentMode) {
         next->currentMode = next->modes.constFirst();
     } else if (!next->modes.contains(next->currentMode)) {
-        next->currentMode->setRemoved();
-        next->modes.push_front(next->currentMode);
+        const auto it = std::ranges::find_if(next->modes, [&](const auto &mode) {
+            return *static_cast<DrmConnectorMode *>(next->currentMode.get())
+                == *static_cast<DrmConnectorMode *>(mode.get());
+        });
+        if (it != next->modes.end()) {
+            next->currentMode = *it;
+        } else {
+            next->currentMode->setRemoved();
+            next->modes.push_front(next->currentMode);
+        }
     }
 }
 
@@ -281,7 +289,7 @@ bool DrmOutput::testPresentation(const std::shared_ptr<OutputFrame> &frame)
     const PresentationMode frameMode = frame->presentationMode();
     m_desiredPresentationMode = frameMode;
 
-    const QList<DrmPipelineLayer *> layers = m_pipeline->layers();
+    const auto &layers = m_pipeline->layers();
     bool nonPrimaryEnabled = false;
     for (const auto *layer : layers) {
         if (layer->isEnabled() && layer->type() != OutputLayerType::Primary) {
@@ -290,15 +298,12 @@ bool DrmOutput::testPresentation(const std::shared_ptr<OutputFrame> &frame)
         }
     }
 
-    if (m_gpu->needsModeset()) {
-        // modesets should be done with only the primary plane
-        // as additional planes may mean we can't power all outputs
+    if (m_gpu->needsModeset()) [[unlikely]] {
         return !nonPrimaryEnabled;
     }
 
     PresentationMode testMode = frameMode;
     if (nonPrimaryEnabled) {
-        // the cursor plane needs to be disabled before we enable tearing; see DrmOutput::presentAsync
         if (testMode == PresentationMode::AdaptiveAsync) {
             testMode = PresentationMode::AdaptiveSync;
         } else if (testMode == PresentationMode::Async) {
@@ -309,15 +314,13 @@ bool DrmOutput::testPresentation(const std::shared_ptr<OutputFrame> &frame)
     m_pipeline->setPresentationMode(testMode);
     DrmPipeline::Error err = m_pipeline->testPresent(frame);
 
-    if (err != DrmPipeline::Error::None && testMode == PresentationMode::AdaptiveAsync) {
-        // tearing can fail in various circumstances, but vrr shouldn't
+    if (err != DrmPipeline::Error::None && testMode == PresentationMode::AdaptiveAsync) [[unlikely]] {
         testMode = PresentationMode::AdaptiveSync;
         m_pipeline->setPresentationMode(testMode);
         err = m_pipeline->testPresent(frame);
     }
 
-    if (err != DrmPipeline::Error::None && testMode != PresentationMode::VSync) {
-        // retry with the most basic presentation mode
+    if (err != DrmPipeline::Error::None && testMode != PresentationMode::VSync) [[unlikely]] {
         m_pipeline->setPresentationMode(PresentationMode::VSync);
         err = m_pipeline->testPresent(frame);
     }
@@ -330,17 +333,16 @@ bool DrmOutput::present(const QList<OutputLayer *> &layersToUpdate, const std::s
     m_desiredPresentationMode = frame->presentationMode();
     const bool needsModeset = m_gpu->needsModeset();
     bool success;
-    if (needsModeset) {
+    if (needsModeset) [[unlikely]] {
         m_pipeline->setPresentationMode(PresentationMode::VSync);
         m_pipeline->setContentType(DrmConnector::DrmContentType::Graphics);
         m_pipeline->maybeModeset(frame);
         success = true;
     } else {
-        // the presentation mode of the pipeline is already set in testPresentation
         success = m_pipeline->present(layersToUpdate, frame) == DrmPipeline::Error::None;
     }
     m_renderLoop->setPresentationMode(m_pipeline->presentationMode());
-    if (!success) {
+    if (!success) [[unlikely]] {
         return false;
     }
     updateBrightness(frame->brightness().value_or(m_state.currentBrightness.value_or(m_state.brightnessSetting)),
@@ -770,12 +772,16 @@ void DrmOutput::tryKmsColorOffloading(State &next)
 
 void DrmOutput::maybeScheduleRepaints(const State &next)
 {
-    // TODO move the output layers to BackendOutput, and have it take care of this when updating State
-    if (next.blendingColor != m_state.blendingColor || next.layerBlendingColor != m_state.layerBlendingColor) {
-        const auto layers = m_pipeline->layers();
-        for (const auto &layer : layers) {
-            layer->addDeviceRepaint(Region::infinite());
-        }
+    if (!m_pipeline) [[unlikely]] {
+        return;
+    }
+    if (next.blendingColor == m_state.blendingColor
+        && next.layerBlendingColor == m_state.layerBlendingColor) {
+        return;
+    }
+    const auto &layers = m_pipeline->layers();
+    for (const auto &layer : layers) {
+        layer->addDeviceRepaint(Region::infinite());
     }
 }
 
