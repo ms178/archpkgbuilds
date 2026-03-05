@@ -202,9 +202,10 @@ static u32 amdgpu_vram_usage_pct_fast(struct amdgpu_device *adev)
 {
 	struct ttm_resource_manager *mgr;
 	struct vega_recip_cache *cache;
-	unsigned long now_j, win_j, refresh_j;
-	u64 used_bytes;
-	u32 pct;
+	unsigned long now_j, win_j, refresh_j, pct_last_j;
+	u64 used_bytes, recip_q38, vram_b;
+	u32 pct_last, pct;
+	bool need_init = false;
 
 	if (unlikely(!adev))
 		return 0;
@@ -213,43 +214,67 @@ static u32 amdgpu_vram_usage_pct_fast(struct amdgpu_device *adev)
 	if (unlikely(!mgr))
 		return 0;
 
-	cache = this_cpu_ptr(&vega_recip_cache_pc);
-
-	if (unlikely(cache->adev_key != adev)) {
-		u64 vram_b = max_t(u64, adev->gmc.mc_vram_size, 1ULL);
-
-		cache->recip_q38 = div64_u64(100ULL << 38, vram_b);
-		cache->adev_key = adev;
-		cache->pct_last_j = 0UL;
-		cache->pct_last = 0U;
-	}
-
 	now_j = jiffies;
 	win_j = READ_ONCE(vega_pf_streak_window_jiffies);
 	win_j = clamp_t(unsigned long, win_j, 1UL,
 			max_t(unsigned long, HZ / 20, 1UL));
+
+	preempt_disable();
+	cache = this_cpu_ptr(&vega_recip_cache_pc);
+	if (likely(cache->adev_key == adev)) {
+		recip_q38 = cache->recip_q38;
+		pct_last_j = cache->pct_last_j;
+		pct_last = cache->pct_last;
+	} else {
+		recip_q38 = 0ULL;
+		pct_last_j = 0UL;
+		pct_last = 0U;
+		need_init = true;
+	}
+	preempt_enable();
+
+	if (unlikely(need_init)) {
+		vram_b = max_t(u64, adev->gmc.mc_vram_size, 1ULL);
+		recip_q38 = div64_u64(100ULL << 38, vram_b);
+
+		preempt_disable();
+		cache = this_cpu_ptr(&vega_recip_cache_pc);
+		cache->recip_q38 = recip_q38;
+		cache->adev_key = adev;
+		cache->pct_last_j = 0UL;
+		cache->pct_last = 0U;
+		preempt_enable();
+	}
 
 	/*
 	 * Keep high-pressure paths responsive, but do not force a full
 	 * ttm_resource_manager_usage() refresh on every single fault.
 	 */
 	refresh_j = win_j;
-	if (cache->pct_last >= 97U)
+	if (pct_last >= 97U)
 		refresh_j = 1UL;
-	else if (cache->pct_last >= 90U)
+	else if (pct_last >= 90U)
 		refresh_j = max_t(unsigned long, 1UL, win_j >> 2);
 
-	if (cache->pct_last_j != 0UL &&
-	    time_before(now_j, cache->pct_last_j + refresh_j))
-		return cache->pct_last;
+	if (pct_last_j != 0UL &&
+	    time_before(now_j, pct_last_j + refresh_j))
+		return pct_last;
 
 	used_bytes = ttm_resource_manager_usage(mgr);
 	pct = min_t(u32,
-		    (u32)mul_u64_u64_shr(used_bytes, cache->recip_q38, 38),
+		    (u32)mul_u64_u64_shr(used_bytes, recip_q38, 38),
 		    100U);
 
+	preempt_disable();
+	cache = this_cpu_ptr(&vega_recip_cache_pc);
+	if (unlikely(cache->adev_key != adev)) {
+		cache->recip_q38 = recip_q38;
+		cache->adev_key = adev;
+	}
 	cache->pct_last = pct;
 	cache->pct_last_j = now_j;
+	preempt_enable();
+
 	return pct;
 }
 
@@ -477,13 +502,14 @@ amdgpu_vega_optimal_prefetch(struct amdgpu_device *adev,
 	is_vram = (abo->preferred_domains & AMDGPU_GEM_DOMAIN_VRAM) != 0;
 	is_compute = (abo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0;
 
+	vram_pct = amdgpu_vram_usage_pct_fast(adev);
+
 	/*
-	 * local_clock() is a fast per-CPU timestamp source and is sufficient
-	 * here because we only compare short deltas in a per-CPU heuristic.
+	 * Keep local_clock() paired with the per-CPU streak state snapshot,
+	 * but keep the preempt-disabled section as short as possible.
 	 */
 	preempt_disable();
 	now_ns = local_clock();
-	vram_pct = amdgpu_vram_usage_pct_fast(adev);
 	pcs = this_cpu_ptr(&vega_pf_pc);
 	local_state = *pcs;
 	preempt_enable();

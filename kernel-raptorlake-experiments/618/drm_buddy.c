@@ -611,6 +611,7 @@ static void __drm_buddy_free_list(struct drm_buddy *mm,
 				  bool mark_dirty)
 {
 	struct drm_buddy_block *block, *on;
+	u32 nr_freed = 0U;
 
 	WARN_ON(mark_dirty && mark_clear);
 
@@ -619,9 +620,19 @@ static void __drm_buddy_free_list(struct drm_buddy *mm,
 			mark_cleared(block);
 		else if (mark_dirty)
 			clear_reset(block);
+
 		drm_buddy_free_block(mm, block);
-		cond_resched();
+
+		/*
+		 * Rescheduling every block is unnecessarily expensive in large
+		 * teardown/unwind paths. Batch it to reduce overhead while still
+		 * keeping long frees preemptible.
+		 */
+		nr_freed++;
+		if (unlikely((nr_freed & 31U) == 0U))
+			cond_resched();
 	}
+
 	INIT_LIST_HEAD(objects);
 }
 
