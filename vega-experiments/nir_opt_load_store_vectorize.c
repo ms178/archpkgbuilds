@@ -131,6 +131,7 @@ get_info(nir_intrinsic_op op)
       STORE(nir_var_shader_out, urb_lsc_intel, -1, 1, -1, 0, 1)
       LOAD(0, urb_vec4_intel, 0, 1, -1, 16)
       STORE(nir_var_shader_out, urb_vec4_intel, 1, 2, -1, 0, 16)
+      LOAD(nir_var_mem_ubo, shader_indirect_data_intel, -1, 0, -1, 1)
    default:
       break;
 #undef ATOMIC
@@ -2074,7 +2075,8 @@ handle_barrier(struct vectorize_ctx *ctx, bool *progress,
       default:
          return false;
       }
-   } else if (instr->type == nir_instr_type_call) {
+   } else if (instr->type == nir_instr_type_call ||
+              instr->type == nir_instr_type_cmat_call) {
       modes = nir_var_all;
    } else {
       return false;

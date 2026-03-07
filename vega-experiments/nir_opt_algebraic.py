@@ -648,10 +648,10 @@ optimizations.extend([
    (('fneu', ('fabs', a), ('fabs', a)), ('fneu', a, a)),
    (('feq', ('fabs', a), ('fabs', a)), ('feq', a, a)),
 
-   (('flt', '#b(is_gt_0_and_lt_1)', ('fsat(is_used_once)', a)), ('flt', b, a)),
-   (('fge', ('fsat(is_used_once)', a), '#b(is_gt_0_and_lt_1)'), ('fge', a, b)),
-   (('feq', ('fsat(is_used_once)', a), '#b(is_gt_0_and_lt_1)'), ('feq', a, b)),
-   (('fneu', ('fsat(is_used_once)', a), '#b(is_gt_0_and_lt_1)'), ('fneu', a, b)),
+   (('flt', '#b(is_a_number_gt_0_and_lt_1)', ('fsat(is_used_once)', a)), ('flt', b, a)),
+   (('fge', ('fsat(is_used_once)', a), '#b(is_a_number_gt_0_and_lt_1)'), ('fge', a, b)),
+   (('feq', ('fsat(is_used_once)', a), '#b(is_a_number_gt_0_and_lt_1)'), ('feq', a, b)),
+   (('fneu', ('fsat(is_used_once)', a), '#b(is_a_number_gt_0_and_lt_1)'), ('fneu', a, b)),
    (('fge', ('fsat(is_used_once)', a), 1.0), ('fge', a, 1.0)),
    (('flt', 0.0, ('fsat(is_used_once)', a)), ('flt', 0.0, a)),
 
@@ -899,8 +899,11 @@ optimizations.extend([
    (('fmax', ('fsat(is_used_once)', a), ('fsat(is_used_once)', b)), ('fsat', ('fmax', a, b))),
    (('fmin(nsz)', ('fsat(nnan)', a), '#b(is_zero_to_one)'), ('fsat', ('fmin', a, b))),
 
-   (('fsat(nnan)', ('fadd', 1.0, 'a(is_not_negative)')), 1.0),
-   (('fsat', ('fadd', 1.0, 'a(is_a_number_not_negative)')), 1.0),
+   (('fsat(nnan)', 'a(is_ge_pos_one)'), 1.0),
+   (('fsat', 'a(is_a_number_ge_pos_one)'), 1.0),
+
+   (('fsat(nnan,nsz)', 'a(is_zero_to_one)'), ('fcanonicalize', a)),
+   (('fsat(nsz)', 'a(is_a_number_zero_to_one)'), ('fcanonicalize', a)),
 
    (('fneg', ('bcsel(is_used_once)', a, '#b', '#c')), ('bcsel', a, ('fneg', b), ('fneg', c))),
 
@@ -1333,47 +1336,9 @@ optimizations.extend([
    (('sne', ('slt', a, b), 1.0), ('sge', a, b), 'true', TestStatus.XFAIL),
    (('sne', ('sge', a, b), 1.0), ('slt', a, b), 'true', TestStatus.XFAIL),
 
-   (('fall_equal2', a, b), ('fmin', ('seq', 'a.x', 'b.x'), ('seq', 'a.y', 'b.y')), 'options->lower_vector_cmp'),
-   (('fall_equal3', a, b), ('seq', ('fany_nequal3', a, b), 0.0), 'options->lower_vector_cmp'),
-   (('fall_equal4', a, b), ('seq', ('fany_nequal4', a, b), 0.0), 'options->lower_vector_cmp'),
-   (('fall_equal8', a, b), ('seq', ('fany_nequal8', a, b), 0.0), 'options->lower_vector_cmp'),
-   (('fall_equal16', a, b), ('seq', ('fany_nequal16', a, b), 0.0), 'options->lower_vector_cmp', TestStatus.UNSUPPORTED),
-
-   (('fany_nequal2', a, b), ('fmax', ('sne', 'a.x', 'b.x'), ('sne', 'a.y', 'b.y')), 'options->lower_vector_cmp'),
-   (('fany_nequal3', a, b), ('fsat', ('fdot3', ('sne', a, b), ('sne', a, b))), 'options->lower_vector_cmp'),
-   (('fany_nequal4', a, b), ('fsat', ('fdot4', ('sne', a, b), ('sne', a, b))), 'options->lower_vector_cmp'),
-   (('fany_nequal8', a, b), ('fsat', ('fdot8', ('sne', a, b), ('sne', a, b))), 'options->lower_vector_cmp'),
-   (('fany_nequal16', a, b), ('fsat', ('fdot16', ('sne', a, b), ('sne', a, b))), 'options->lower_vector_cmp', TestStatus.UNSUPPORTED),
-
    (('f2bf', a), ('bcsel', ('fneu(preserve_nan_inf)', a, a), -1, ('unpack_32_2x16_split_y', a)), 'options->lower_bfloat16_conversions', TestStatus.UNSUPPORTED),
    (('bf2f', a), ('pack_32_2x16', ('vec2', 0, a)), 'options->lower_bfloat16_conversions'),
 ])
-
-
-def vector_cmp(reduce_op, cmp_op, comps):
-    if len(comps) == 1:
-        c0 = comps[0]
-        return (cmp_op, 'a.' + c0, 'b.' + c0)
-    mid = len(comps) // 2
-    return (reduce_op,
-            vector_cmp(reduce_op, cmp_op, comps[:mid]),
-            vector_cmp(reduce_op, cmp_op, comps[mid:]))
-
-
-for op0, op1, op2 in (
-    ('ball_iequal', 'ieq', 'iand'),
-    ('ball_fequal', 'feq', 'iand'),
-    ('bany_inequal', 'ine', 'ior'),
-    ('bany_fnequal', 'fneu', 'ior'),
-):
-    optimizations.extend([
-        ((op0 + '2', a, b), vector_cmp(op2, op1, 'xy'), 'options->lower_vector_cmp'),
-        ((op0 + '3', a, b), vector_cmp(op2, op1, 'xyz'), 'options->lower_vector_cmp'),
-        ((op0 + '4', a, b), vector_cmp(op2, op1, 'xyzw'), 'options->lower_vector_cmp', TestStatus.UNSUPPORTED),
-        ((op0 + '8', a, b), vector_cmp(op2, op1, 'abcdefgh'), 'options->lower_vector_cmp', TestStatus.UNSUPPORTED),
-        ((op0 + '16', a, b), vector_cmp(op2, op1, 'abcdefghijklmnop'), 'options->lower_vector_cmp', TestStatus.UNSUPPORTED),
-    ])
-
 
 for s in (8, 16, 32, 64):
     cond = 'true'
@@ -1801,7 +1766,6 @@ optimizations.extend([
    (('ffract', ('ffract', a)), ('ffract', a)),
 
    (('fabs', 'a(is_not_negative)'), ('fcanonicalize', a)),
-   (('iabs', 'a(is_not_negative)'), a),
    (('fsat', 'a(is_not_positive)'), 0.0),
 
    (('fmin(nnan,nsz)', 'a(is_not_negative)', 1.0), ('fsat', a), '!options->lower_fsat'),
@@ -2318,7 +2282,7 @@ optimizations.extend([
       ('ior', ('ior', ('ilt', a, 0), ('ilt', b, 0)), ('ige', ('iadd', a, b), 0)),
       ('iadd', a, b),
       0x7fffffffffffffff)),
-    '(options->lower_int64_options & nir_lower_iadd_sat64) != 0', TestStatus.XFAIL),
+    '(options->lower_int64_options & nir_lower_iadd_sat64) != 0'),
 
    (('isub_sat@64', a, b),
     ('bcsel',
@@ -2650,7 +2614,7 @@ optimizations.extend([
    (('b2i16', ('vec2', ('ult', 'a@16', b), ('ult', 'c@16', d))),
     ('umin', 1, ('usub_sat', ('vec2', b, d), ('vec2', a, c))),
     'options->vectorize_vec2_16bit && !options->lower_usub_sat'),
-   (('b2i16', ('vec2', ('uge', 'a@16', '#b(is_not_zero)'), ('uge', 'c@16', '#d(is_not_zero)'))),
+   (('b2i16', ('vec2', ('uge', 'a@16', '#b(is_not_uint_zero)'), ('uge', 'c@16', '#d(is_not_uint_zero)'))),
     ('umin', 1, ('usub_sat', ('vec2', a, c), ('iadd', ('vec2', b, d), -1))),
     'options->vectorize_vec2_16bit && !options->lower_usub_sat'),
    (('b2i16', ('vec2', ('uge', '#a(is_not_uint_max)', 'b@16'), ('uge', '#c(is_not_uint_max)', 'd@16'))),
@@ -2765,9 +2729,7 @@ for bit_size in (8, 16, 32, 64):
          ('bcsel',
           ('ige', b, 1),
           ('bcsel', ('ilt', ('iadd', a, b), a), intmax, ('iadd', a, b)),
-          ('bcsel', ('ilt', a, ('iadd', a, b)), intmin, ('iadd', a, b))),
-         'options->lower_iadd_sat',
-         TestStatus.XFAIL if bit_size in (8, 64) else TestStatus.PASS),
+          ('bcsel', ('ilt', a, ('iadd', a, b)), intmin, ('iadd', a, b))), 'options->lower_iadd_sat'),
 
         (('isub_sat@' + str(bit_size), a, b),
          ('bcsel',
@@ -3537,10 +3499,10 @@ late_optimizations.extend([
      ('ffma@16', ('fneg', 'a'), 'b', 'c'),
      'options->fuse_ffma16'),
 
-    (('flt', '#b(is_gt_0_and_lt_1)', ('fsat(is_used_once)', a)), ('flt', b, a)),
-    (('fge', ('fsat(is_used_once)', a), '#b(is_gt_0_and_lt_1)'), ('fge', a, b)),
-    (('feq', ('fsat(is_used_once)', a), '#b(is_gt_0_and_lt_1)'), ('feq', a, b)),
-    (('fneu', ('fsat(is_used_once)', a), '#b(is_gt_0_and_lt_1)'), ('fneu', a, b)),
+    (('flt', '#b(is_a_number_gt_0_and_lt_1)', ('fsat(is_used_once)', a)), ('flt', b, a)),
+    (('fge', ('fsat(is_used_once)', a), '#b(is_a_number_gt_0_and_lt_1)'), ('fge', a, b)),
+    (('feq', ('fsat(is_used_once)', a), '#b(is_a_number_gt_0_and_lt_1)'), ('feq', a, b)),
+    (('fneu', ('fsat(is_used_once)', a), '#b(is_a_number_gt_0_and_lt_1)'), ('fneu', a, b)),
     (('fge', ('fsat(is_used_once)', a), 1.0), ('fge', a, 1.0)),
 
     (('fge', ('fmin(is_used_once,nnan)', ('fadd(is_used_once)', a, b), ('fadd', c, d)), 0.0), ('iand', ('fge', a, ('fneg', b)), ('fge', c, ('fneg', d)))),
@@ -3596,7 +3558,7 @@ late_optimizations.extend([
     (('fmin', ('fadd(is_used_once)', '#c', a), ('fadd(is_used_once)', '#c', b)), ('fadd', c, ('fmin', a, b)), 'true', TestStatus.XFAIL),
     (('fmax', ('fadd(is_used_once)', '#c', a), ('fadd(is_used_once)', '#c', b)), ('fadd', c, ('fmax', a, b)), 'true', TestStatus.XFAIL),
 
-    (('bcsel', ('feq', ('fsqrt', 'a(is_not_negative)'), 0.0), intBitsToFloat(0x7f7fffff), ('frsq', a)),
+    (('bcsel@32', ('feq', ('fsqrt', 'a(is_a_number_not_negative)'), 0.0), intBitsToFloat(0x7f7fffff), ('frsq', a)),
      ('fmin', ('frsq', a), intBitsToFloat(0x7f7fffff))),
 
     (('~fadd',

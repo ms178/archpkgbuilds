@@ -209,13 +209,16 @@ key_u32_equals(const void *a, const void *b)
 struct hash_table *
 _mesa_hash_table_create_u32_keys(void *mem_ctx)
 {
-   return _mesa_hash_table_create(mem_ctx, key_u32_hash, key_u32_equals);
+   struct hash_table *ht = _mesa_hash_table_create(mem_ctx, key_u32_hash, key_u32_equals);
+   _mesa_hash_table_set_deleted_key(ht, (void *)(uintptr_t)UINT32_MAX);
+   return ht;
 }
 
 void
 _mesa_hash_table_init_u32_keys(struct hash_table *ht, void *mem_ctx)
 {
    _mesa_hash_table_init(ht, mem_ctx, key_u32_hash, key_u32_equals);
+   _mesa_hash_table_set_deleted_key(ht, (void *)(uintptr_t)UINT32_MAX);
 }
 
 static inline struct hash_entry *
