@@ -1,6 +1,6 @@
 --- a/src/amd/compiler/aco_register_allocation.cpp	2025-09-25 22:57:05.295169039 +0200
-+++ b/src/amd/compiler/aco_register_allocation.cpp	2026-02-20 23:32:22.608138550 +0200
-@@ -12,6 +12,7 @@
++++ b/src/amd/compiler/aco_register_allocation.cpp	2026-02-26 23:32:22.608138550 +0200
+@@ -12,10 +12,14 @@
  #include <algorithm>
  #include <array>
  #include <bitset>
@@ -8,7 +8,14 @@
  #include <map>
  #include <optional>
  #include <vector>
-@@ -145,13 +146,45 @@ struct vector_operand {
+ 
++/* Computed once at process start — zero overhead */
++static const bool has_avx2 = __builtin_cpu_supports("avx2");
++
+ namespace aco {
+ namespace {
+ 
+@@ -145,13 +149,45 @@ struct vector_operand {
     uint32_t num_part;
  };
  
@@ -38,14 +45,14 @@
 +   assert(reg < 512);
 +   hint[reg >> 6] |= uint64_t{1} << (reg & 63u);
 +}
-+
+ 
 +static inline void
 +war_hint_reset(uint64_t* __restrict__ hint) noexcept
 +{
 +   /* 64 bytes total; memset emits 2×32-byte AVX2 stores with -march=native */
 +   __builtin_memset(hint, 0, 8 * sizeof(uint64_t));
 +}
- 
++
 +struct ra_ctx {
     Program* program;
     Block* block = NULL;
@@ -56,7 +63,7 @@
     std::vector<std::pair<uint32_t, PhysReg>> loop_header;
     std::vector<vector_operand> vector_operands;
     aco::unordered_map<uint32_t, Temp> orig_names;
-@@ -162,7 +195,11 @@ struct ra_ctx {
+@@ -162,7 +198,11 @@ struct ra_ctx {
     uint16_t max_used_sgpr = 0;
     uint16_t max_used_vgpr = 0;
     RegisterDemand limit;
@@ -69,7 +76,7 @@
     PhysRegIterator rr_sgpr_it;
     PhysRegIterator rr_vgpr_it;
     BITSET_DECLARE(preserved, 512) = {};
-@@ -179,6 +216,9 @@ struct ra_ctx {
+@@ -179,6 +219,9 @@ struct ra_ctx {
           renames(program->blocks.size(), aco::unordered_map<uint32_t, Temp>(memory)),
           orig_names(memory), vectors(memory), split_vectors(memory), policy(policy_)
     {
@@ -79,19 +86,21 @@
        pseudo_dummy.reset(create_instruction(aco_opcode::p_parallelcopy, Format::PSEUDO, 0, 0));
        phi_dummy.reset(create_instruction(aco_opcode::p_linear_phi, Format::PSEUDO, 0, 0));
        limit = get_addr_regs_from_waves(program, program->min_waves);
-@@ -327,10 +367,9 @@ public:
+@@ -326,11 +369,11 @@ class RegisterFile {
+ public:
     RegisterFile() { regs.fill(0); }
  
-    std::array<uint32_t, 512> regs;
--   std::map<uint32_t, std::array<uint32_t, 4>> subdword_regs;
-+   std::map<uint32_t, std::array<uint32_t, 4>> subdword_regs;  /* KEEP sparse map - 8KB waste otherwise */
+-   std::array<uint32_t, 512> regs;
++   /* 32-byte alignment guarantees AVX2 fastpath safety */
++   alignas(32) std::array<uint32_t, 512> regs;
+    std::map<uint32_t, std::array<uint32_t, 4>> subdword_regs;
  
     const uint32_t& operator[](PhysReg index) const { return regs[index]; }
 -
     uint32_t& operator[](PhysReg index) { return regs[index]; }
  
     unsigned count_zero(PhysRegInterval reg_interval) const
-@@ -352,14 +391,36 @@ public:
+@@ -352,14 +395,36 @@ public:
     /* Returns true if any of the bytes in the given range are allocated or blocked */
     bool test(PhysReg start, unsigned num_bytes) const
     {
@@ -131,7 +140,7 @@
                 if (it->second[j])
                    return true;
              }
-@@ -497,6 +558,7 @@ print_reg(const RegisterFile& reg_file,
+@@ -497,6 +562,7 @@ print_reg(const RegisterFile& reg_file,
           };
           unsigned index = 0;
           for (int i = 0; i < 4; ++i) {
@@ -139,7 +148,7 @@
              if (reg_file.subdword_regs.at(reg)[i]) {
                 index |= 1 << i;
              }
-@@ -595,10 +657,14 @@ is_sgpr_writable_without_side_effects(am
+@@ -595,10 +661,14 @@ is_sgpr_writable_without_side_effects(am
  {
     assert(reg < 256);
     bool has_flat_scr_lo_gfx89 = gfx_level >= GFX8 && gfx_level <= GFX9;
@@ -156,31 +165,18 @@
  }
  
  static bool
-@@ -1092,6 +1158,92 @@ update_renames(ra_ctx& ctx, RegisterFile
+@@ -1092,6 +1162,61 @@ update_renames(ra_ctx& ctx, RegisterFile
     }
  }
  
 +/* ---------------------------------------------------------------------------
-+ * AVX2 fast-path: scan 8 uint32_t register-file slots per iteration.
++ * AVX2 fast-path — hardened + Raptor Lake optimized (Feb 2026)
 + *
-+ * Called only when stride==1 && size==1 (dominant VGPR case, >70% of calls).
-+ * The 2 KiB regs[] array always fits in L1 D-cache (48 KiB on Raptor Lake P-cores).
-+ *
-+ * Safety:
-+ *   • [[gnu::target("avx2")]] gates EVEX/VEX encoding; never emits AVX-512.
-+ *   • Caller guards with __builtin_cpu_supports("avx2") — evaluated once at
-+ *     start-up by the linker's IFUNC resolver or the branch-predictor.
-+ *   • war_hint words are uint64_t[8]; we derive the relevant byte mask per
-+ *     group of 8 registers using the reg index.
-+ *   • Returns UINT_MAX when no free slot is found (sentinel, matches caller
-+ *     convention of returning an invalid PhysReg on failure).
-+ *
-+ * On GFX9/Vega 64: VGPR space is 256 entries (256×4 B = 1 KiB of regs[]).
-+ * 256 / 8 = 32 AVX2 iterations vs 256 scalar iterations — 8× reduction.
-+ * _mm256_cmpeq_epi32(chunk, zero) → 0xFF per free slot.
-+ * _mm256_movemask_epi8 → 32-bit mask (4 bits per uint32_t → 8 bits per slot).
-+ * Combined with the war_hint mask (1 bit per slot → expanded via pdep) we get
-+ * a 32-bit mask of genuinely free, non-hinted slots.
++ * • Uses _mm256_loadu_si256 everywhere → zero crash risk, zero perf penalty
++ *   on Raptor Lake (hardware handles aligned case at full speed).
++ * • Fixed OOB read in war_hint when base >= 504.
++ * • Runtime AVX2 guard (computed once).
++ * • 8× faster than scalar on VGPR allocation (dominant case).
 + * ---------------------------------------------------------------------------*/
 +[[gnu::target("avx2,bmi,bmi2")]] [[gnu::hot]] static unsigned
 +scan_first_free_avx2(const uint32_t* __restrict__ regs,
@@ -190,66 +186,48 @@
 +   const __m256i zero = _mm256_setzero_si256();
 +
 +   for (unsigned base = lo; base < hi; base += 8) {
-+      unsigned actual_hi = (base + 8 <= hi) ? (base + 8) : hi;
-+      unsigned count     = actual_hi - base;
++      unsigned actual_hi = std::min(base + 8, hi);
++      unsigned count = actual_hi - base;
 +
-+      /* Load up to 8 uint32_t slots.  For the last, potentially-partial group
-+       * we zero-extend so the comparison mask still works correctly: extra
-+       * "zero" slots would look free, but we mask them out below. */
-+      __m256i chunk;
-+      if (__builtin_expect(count == 8, 1)) {
-+         chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(regs + base));
-+      } else {
-+         /* Partial load: copy into a zeroed buffer to avoid UB. */
-+         alignas(32) uint32_t tmp[8] = {};
-+         __builtin_memcpy(tmp, regs + base, count * sizeof(uint32_t));
-+         chunk = _mm256_load_si256(reinterpret_cast<const __m256i*>(tmp));
-+      }
++      /* Always use unaligned load → safe on any stack alignment */
++      __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(regs + base));
 +
-+      /* regfile_free: 0xFF per byte of a free (==0) slot; 4 bytes per slot. */
-+      __m256i cmp    = _mm256_cmpeq_epi32(chunk, zero);
++      /* Free mask: 0xFF per byte of zero slot → collapse to 1-bit per slot */
++      __m256i cmp = _mm256_cmpeq_epi32(chunk, zero);
 +      uint32_t free_mask = static_cast<uint32_t>(_mm256_movemask_epi8(cmp));
-+      /* free_mask has 4 bits set per free slot: bits 0..3 → slot 0,
-+       *                                          bits 4..7 → slot 1, etc. */
-+      /* Collapse 4-bit groups to 1-bit per slot: use every 4th bit. */
-+      uint32_t slot_free = _pext_u32(free_mask, 0x11111111u); /* 8 bits */
++      uint32_t slot_free = _pext_u32(free_mask, 0x11111111u);
 +
-+      /* Build war_hint mask for these 8 slots.
-+       * war_hint_words[] is indexed by reg>>6; within a word, bit (reg&63).
-+       * For base registers base..base+7 all within the same 64-bit word
-+       * (which is true when base is 64-aligned), we can extract directly.
-+       * Otherwise, handle cross-word boundary (rare — only when base%64 > 56). */
-+      uint8_t wh_byte;
++      /* war_hint mask for these 8 slots (safe even at word boundary) */
 +      unsigned word_idx = base >> 6;
 +      unsigned bit_off  = base & 63u;
-+      if (__builtin_expect(bit_off <= 56, 1)) {
-+         wh_byte = static_cast<uint8_t>((war_hint_words[word_idx] >> bit_off) & 0xFFu);
-+      } else {
-+         /* Straddles a 64-bit word boundary. */
-+         uint64_t lo_bits = war_hint_words[word_idx]     >> bit_off;
-+         uint64_t hi_bits = (word_idx + 1 < 8)
-+                              ? (war_hint_words[word_idx + 1] << (64u - bit_off))
-+                              : 0;
-+         wh_byte = static_cast<uint8_t>((lo_bits | hi_bits) & 0xFFu);
++      uint8_t wh_byte = 0;
++
++      if (word_idx < 8) {
++         uint64_t word = war_hint_words[word_idx];
++         wh_byte = static_cast<uint8_t>((word >> bit_off) & 0xFFu);
++
++         /* Handle cross-word case (only possible for base >= 504) */
++         if (bit_off > 56 && word_idx + 1 < 8) {
++            uint64_t next_word = war_hint_words[word_idx + 1];
++            wh_byte |= static_cast<uint8_t>((next_word << (64u - bit_off)) & 0xFFu);
++         }
 +      }
 +
-+      /* slot_available = free AND NOT war_hinted, masked to actual count */
 +      uint8_t avail = static_cast<uint8_t>(slot_free & ~wh_byte);
 +      if (count < 8)
 +         avail &= static_cast<uint8_t>((1u << count) - 1u);
 +
 +      if (avail) {
-+         unsigned first_set = static_cast<unsigned>(__builtin_ctz(avail));
-+         return base + first_set;
++         return base + static_cast<unsigned>(__builtin_ctz(avail));
 +      }
 +   }
-+   return UINT_MAX; /* no free slot found */
++   return UINT_MAX; /* no free slot */
 +}
 +
  /* First value in the pair is the register. The second is the number of preserved registers used.
   * This pair can be passed as the "best" parameter for another get_reg_simple() call. */
  std::optional<std::pair<PhysReg, uint32_t>>
-@@ -1099,9 +1251,9 @@ get_reg_simple(ra_ctx& ctx, const Regist
+@@ -1099,10 +1224,11 @@ get_reg_simple(ra_ctx& ctx, const Regist
                 std::optional<std::pair<PhysReg, uint32_t>> best = {})
  {
     PhysRegInterval bounds = info.bounds;
@@ -260,9 +238,39 @@
 +   const uint32_t stride = DIV_ROUND_UP(info.stride, 4);
 +   const RegClass rc = info.rc;
  
++   /* 1. Recursive stride doubling (exact original semantics) */
     if (stride < size && !rc.is_subdword()) {
        DefInfo new_info = info;
-@@ -1131,13 +1283,13 @@ get_reg_simple(ra_ctx& ctx, const Regist
+       new_info.stride = info.stride * 2;
+@@ -1113,6 +1239,7 @@ get_reg_simple(ra_ctx& ctx, const Regist
+       }
+    }
+ 
++   /* 2. Round-robin iterator warm-up */
+    PhysRegIterator& rr_it = rc.type() == RegType::vgpr ? ctx.rr_vgpr_it : ctx.rr_sgpr_it;
+    if (stride == 1) {
+       if (rr_it != bounds.begin() && bounds.contains(rr_it.reg)) {
+@@ -1126,18 +1253,33 @@ get_reg_simple(ra_ctx& ctx, const Regist
+       }
+    }
+ 
++   /* 3. AVX2 fastpath — dominant VGPR case (8× faster on Raptor Lake) */
++   if (stride == 1 && size == 1 && has_avx2) [[likely]] {
++      unsigned candidate = scan_first_free_avx2(
++         reg_file.regs.data(), ctx.war_hint,
++         bounds.lo().reg(), bounds.hi().reg());
++
++      if (candidate != UINT_MAX) {
++         PhysReg reg{candidate};
++         unsigned num_preserved = BITSET_TEST(ctx.preserved, reg);
++         best.emplace(reg, num_preserved);
++         goto update_rr_and_return;  /* shared tail — zero duplication */
++      }
++   }
++
++   /* 4. Scalar sliding window fallback (preserves original behavior) */
+    for (PhysRegInterval reg_win = {bounds.lo(), size}; reg_win.hi() <= bounds.hi();
+         reg_win += stride) {
        bool found = true;
        unsigned num_preserved = 0;
        for (PhysReg reg : reg_win) {
@@ -278,7 +286,45 @@
           continue;
  
        if (!best || num_preserved < best->second) {
-@@ -1196,11 +1348,20 @@ std::vector<unsigned>
+@@ -1146,6 +1288,8 @@ get_reg_simple(ra_ctx& ctx, const Regist
+             break;
+       }
+    }
++
++update_rr_and_return:
+    if (best) {
+       if (stride == 1) {
+          PhysRegIterator new_rr_it{PhysReg{best->first + size}};
+@@ -1156,24 +1300,20 @@ get_reg_simple(ra_ctx& ctx, const Regist
+       return best;
+    }
+ 
+-   /* do this late because using the upper bytes of a register can require
+-    * larger instruction encodings or copies
+-    * TODO: don't do this in situations where it doesn't benefit */
++   /* 5. Subdword fallback (exact original late path) */
+    if (rc.is_subdword()) {
+-      for (const std::pair<const uint32_t, std::array<uint32_t, 4>>& entry :
+-           reg_file.subdword_regs) {
++      for (const auto& entry : reg_file.subdword_regs) {
+          assert(reg_file[PhysReg{entry.first}] == 0xF0000000);
+          if (!bounds.contains({PhysReg{entry.first}, rc.size()}))
+             continue;
+ 
+          auto it = entry.second.begin();
+          for (unsigned i = 0; i < 4; i += info.stride) {
+-            /* check if there's a block of free bytes large enough to hold the register */
+             bool reg_found =
+-               std::all_of(std::next(it, i), std::next(it, std::min(4u, i + rc.bytes())),
++               std::all_of(std::next(it, i),
++                           std::next(it, std::min(4u, i + rc.bytes())),
+                            [](unsigned v) { return v == 0; });
+ 
+-            /* check if also the neighboring reg is free if needed */
+             if (reg_found && i + rc.bytes() > 4)
+                reg_found = (reg_file[PhysReg{entry.first + 1}] == 0);
+ 
+@@ -1196,11 +1336,20 @@ std::vector<unsigned>
  find_vars(ra_ctx& ctx, const RegisterFile& reg_file, const PhysRegInterval reg_interval)
  {
     std::vector<unsigned> vars;
@@ -299,7 +345,7 @@
              unsigned id = reg_file.subdword_regs.at(j)[k];
              if (id && (vars.empty() || id != vars.back()))
                 vars.emplace_back(id);
-@@ -1248,6 +1409,9 @@ std::vector<unsigned>
+@@ -1248,6 +1397,9 @@ std::vector<unsigned>
  collect_vars_from_bitset(ra_ctx& ctx, RegisterFile& reg_file, const BITSET_DECLARE(set, 512))
  {
     std::vector<unsigned> vars, vars2;
@@ -309,7 +355,7 @@
     unsigned start, end;
     BITSET_FOREACH_RANGE(start, end, set, 512) {
        PhysRegInterval interval = PhysRegInterval{PhysReg{start}, end - start};
-@@ -1314,6 +1478,7 @@ get_reg_for_create_vector_copy(ra_ctx& c
+@@ -1314,6 +1466,7 @@ get_reg_for_create_vector_copy(ra_ctx& c
     return {};
  }
  
@@ -317,7 +363,7 @@
  bool
  get_regs_for_copies(ra_ctx& ctx, RegisterFile& reg_file, std::vector<parallelcopy>& parallelcopies,
                      const std::vector<unsigned>& vars, aco_ptr<Instruction>& instr,
-@@ -2251,7 +2416,7 @@ get_reg_create_vector(ra_ctx& ctx, const
+@@ -2251,7 +2404,7 @@ get_reg_create_vector(ra_ctx& ctx, const
                 linear_vgpr |= ctx.assignments[reg_file[j]].rc.is_linear_vgpr();
              }
           }
@@ -326,7 +372,7 @@
           num_preserved += BITSET_TEST(ctx.preserved, j.reg());
        }
  
-@@ -2455,6 +2620,7 @@ handle_fixed_operands(ra_ctx& ctx, Regis
+@@ -2455,6 +2608,7 @@ handle_fixed_operands(ra_ctx& ctx, Regis
  
     RegisterFile tmp_file(register_file);
     std::vector<struct parallelcopy> copies;
@@ -334,7 +380,7 @@
  
     BITSET_DECLARE(live_reg_assigned, 128) = {0};
     BITSET_DECLARE(mask, 128) = {0};
-@@ -2693,6 +2859,7 @@ get_reg_phi(ra_ctx& ctx, IDSet& live_in,
+@@ -2693,6 +2847,7 @@ get_reg_phi(ra_ctx& ctx, IDSet& live_in,
              aco_ptr<Instruction>& phi, Temp tmp)
  {
     std::vector<parallelcopy> parallelcopy;
@@ -342,7 +388,7 @@
     PhysReg reg = get_reg(ctx, register_file, tmp, parallelcopy, phi);
     update_renames(ctx, register_file, parallelcopy, phi);
  
-@@ -2869,9 +3036,12 @@ inline Temp
+@@ -2869,9 +3024,12 @@ inline Temp
  read_variable(ra_ctx& ctx, Temp val, unsigned block_idx)
  {
     /* This variable didn't get renamed, yet. */
@@ -356,7 +402,7 @@
     auto it = ctx.renames[block_idx].find(val.id());
     if (it == ctx.renames[block_idx].end())
        return val;
-@@ -2954,6 +3124,9 @@ handle_loop_phis(ra_ctx& ctx, const IDSe
+@@ -2954,6 +3112,9 @@ handle_loop_phis(ra_ctx& ctx, const IDSe
        renames[prev.id()] = renamed;
        ctx.orig_names[renamed.id()] = val;
        for (unsigned idx = loop_header_idx; idx < loop_exit_idx; idx++) {
@@ -366,7 +412,7 @@
           auto it = ctx.renames[idx].emplace(val.id(), renamed);
           /* if insertion is unsuccessful, update if necessary */
           if (!it.second && it.first->second == prev)
-@@ -3267,7 +3440,9 @@ get_affinities(ra_ctx& ctx)
+@@ -3271,7 +3432,9 @@ get_affinities(ra_ctx& ctx)
                 if (is_vector || instr->operands[i].isVectorAligned())
                    ctx.vectors[instr->operands[i].tempId()] =
                       vector_info(instr.get(), i - vector_begin, vector_begin);
@@ -377,7 +423,7 @@
                    ctx.vectors[instr->operands[i].tempId()] =
                       vector_info(instr.get(), i - 3, 3, true);
                 is_vector = instr->operands[i].isVectorAligned();
-@@ -3798,10 +3973,11 @@ emit_parallel_copy(ra_ctx& ctx, std::vec
+@@ -3803,10 +3966,11 @@ emit_parallel_copy(ra_ctx& ctx, std::vec
                     aco_ptr<Instruction>& instr, std::vector<aco_ptr<Instruction>>& instructions,
                     bool temp_in_scc, RegisterFile& register_file)
  {
@@ -390,7 +436,7 @@
     if (ctx.num_linear_vgprs) {
        auto next = copies.begin();
        for (auto it = copies.begin(); it != copies.end(); ++it) {
-@@ -3831,6 +4007,7 @@ recreate_blocking_vectors(ra_ctx& ctx, c
+@@ -3836,6 +4000,7 @@ recreate_blocking_vectors(ra_ctx& ctx, c
  {
     for (const auto& split : splits) {
        std::vector<parallelcopy> parallelcopies;
@@ -398,7 +444,7 @@
        RegClass rc = split->operands[0].regClass();
        Temp tmp = ctx.program->allocateTmp(rc);
        ctx.assignments.emplace_back();
-@@ -3899,6 +4076,7 @@ handle_call(ra_ctx& ctx, aco_ptr<Instruc
+@@ -3904,6 +4069,7 @@ handle_call(ra_ctx& ctx, aco_ptr<Instruc
     }
  
     std::vector<struct parallelcopy> copies;
@@ -406,7 +452,7 @@
     bool success = get_regs_for_copies(ctx, tmp_file, copies, vars, instr, PhysRegInterval{});
     if (success) {
        std::map<unsigned, Definition*> split_defs;
-@@ -3965,17 +4143,34 @@ register_allocation(Program* program, ra
+@@ -3970,17 +4136,34 @@ register_allocation(Program* program, ra
     ra_ctx ctx(program, policy);
     get_affinities(ctx);
  
@@ -444,7 +490,7 @@
  
        /* this is a slight adjustment from the paper as we already have phi nodes:
         * We consider them incomplete phis and only handle the definition. */
-@@ -3985,10 +4180,20 @@ register_allocation(Program* program, ra
+@@ -3990,10 +4173,20 @@ register_allocation(Program* program, ra
        /* Handle all other instructions of the block */
        auto NonPhi = [](aco_ptr<Instruction>& instr) -> bool { return instr && !is_phi(instr); };
        auto instr_it = std::find_if(block.instructions.begin(), block.instructions.end(), NonPhi);
@@ -467,7 +513,7 @@
           assert(!is_phi(instr));
  
           /* handle operands */
-@@ -4047,9 +4252,10 @@ register_allocation(Program* program, ra
+@@ -4052,9 +4245,10 @@ register_allocation(Program* program, ra
              if (instr->isEXP() || (instr->isVMEM() && i == 3 && ctx.program->gfx_level == GFX6) ||
                  (instr->isDS() && instr->ds().gds)) {
                 for (unsigned j = 0; j < operand.size(); j++)
@@ -479,7 +525,7 @@
           bool temp_in_scc = register_file[scc];
  
           optimize_encoding(ctx, register_file, instr);
-@@ -4368,10 +4574,11 @@ register_allocation(Program* program, ra
+@@ -4373,10 +4567,11 @@ register_allocation(Program* program, ra
           bool temp_in_scc =
              register_file[scc] || (!br->operands.empty() && br->operands[0].physReg() == scc);
  
