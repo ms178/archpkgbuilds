@@ -1,8 +1,7 @@
 /*
-KWin - the KDE window manager
-SPDX-FileCopyrightText: 2020 Vlad Zahorodnii <vlad.zahorodnii@kde.org>
-SPDX-FileCopyrightText: 2025 Performance Engineering Team
-SPDX-License-Identifier: GPL-2.0-or-later
+    KWin - the KDE window manager
+    SPDX-FileCopyrightText: 2025 Performance Engineering Team
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 #pragma once
 
@@ -27,6 +26,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 namespace KWin {
 
 class SurfaceItem;
+class SurfaceInterface;
 class OutputFrame;
 class Window;
 
@@ -55,7 +55,21 @@ private:
 class KWIN_EXPORT RenderLoopPrivate final {
 public:
     static constexpr size_t kModeSwitchHistorySize = 8;
+    static constexpr size_t kPresentHistorySize = 16;
+    static_assert((kModeSwitchHistorySize & (kModeSwitchHistorySize - 1U)) == 0U, "Must be power of two");
+    static_assert((kPresentHistorySize & (kPresentHistorySize - 1U)) == 0U, "Must be power of two");
+    static constexpr uint16_t kStarvationRecoveryFrames = 4;
+
     enum class VrrMode : uint8_t { Automatic = 0, Always = 1, Never = 2 };
+
+    struct PresentSample {
+        std::chrono::nanoseconds timestamp{0};
+        std::chrono::nanoseconds refresh{0};
+        bool deadlineMissed{false};
+        bool directScanout{false};
+        bool valid{false};
+    };
+
     RenderLoop *const q;
     BackendOutput *const output;
     std::chrono::nanoseconds lastPresentationTimestamp{0};
@@ -63,6 +77,7 @@ public:
     std::chrono::nanoseconds scheduledRenderTimestamp{0};
     std::chrono::nanoseconds framePrediction{0};
     std::chrono::nanoseconds safetyMargin{0};
+    std::chrono::nanoseconds nominalContentFrameInterval{0};
     uint64_t cachedVblankIntervalNs{16666667ULL};
     uint64_t vblankIntervalReciprocal64{0};
     int64_t lastIntervalNs_{0};
@@ -82,12 +97,15 @@ public:
     uint16_t modeDwellCounter_{0};
     uint16_t pendingModeCounter_{0};
     uint16_t oscillationCooldownCounter_{0};
+    uint16_t interactiveGraceFrames_{0};
     uint8_t reciprocalShift64{0};
     uint8_t consecutiveErrorCount{0};
     uint8_t vrrConnectionCount_{0};
     uint8_t modeSwitchHistoryHead_{0};
     uint8_t modeSwitchHistoryCount_{0};
     uint8_t tripleBufferHysteresisCounter{0};
+    uint8_t presentHistoryHead_{0};
+    uint8_t presentHistoryCount_{0};
     bool preparingNewFrame{false};
     bool pendingReschedule{false};
     bool wasTripleBuffering{false};
@@ -95,15 +113,23 @@ public:
     bool vrrEnabled{false};
     bool vrrCapable{false};
     bool vrrStateDirty_{true};
+    bool lfcCapable_{false};
     PresentationMode presentationMode{PresentationMode::VSync};
     PresentationMode lastStableMode{PresentationMode::VSync};
     PresentationMode pendingTargetMode_{PresentationMode::VSync};
     VrrMode vrrMode{VrrMode::Automatic};
+    VrrContentHint activeContentHint_{VrrContentHint::Unknown};
+    VrrDecisionReason lastDecisionReason_{VrrDecisionReason::None};
+    VrrCapabilities vrrCaps_{};
     VrrStateCache vrrStateCache_{};
     std::chrono::steady_clock::time_point lastModeSwitch{};
     std::array<std::chrono::steady_clock::time_point, kModeSwitchHistorySize> modeSwitchHistory_{};
+    std::array<PresentSample, kPresentHistorySize> presentHistory_{};
     RenderJournal renderJournal;
+
     QPointer<Window> trackedWindow_{nullptr};
+    QPointer<SurfaceInterface> trackedSurface_{nullptr};
+
     std::array<QMetaObject::Connection, 4> vrrConnections_{};
     std::optional<std::fstream> m_debugOutput;
 
@@ -121,6 +147,12 @@ public:
     void disconnectVrrSignals() noexcept;
     void invalidateVrrState() noexcept;
     void updateVrrState() noexcept;
+    void setVrrCapabilities(const VrrCapabilities &caps) noexcept;
+    void setActiveContentHint(VrrContentHint hint,
+                              std::optional<std::chrono::nanoseconds> nominalFrameInterval) noexcept;
+    void addPresentFeedback(const PresentFeedback &feedback) noexcept;
+    [[nodiscard]] bool cadenceMatchesNominal() const noexcept;
+    [[nodiscard]] bool isBelowVrrFloor() const noexcept;
     [[nodiscard]] PresentationMode selectPresentationMode() noexcept;
     [[nodiscard]] bool shouldSwitchMode(PresentationMode target) noexcept;
     void recordModeSwitch() noexcept;

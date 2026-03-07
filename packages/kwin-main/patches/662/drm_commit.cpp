@@ -1,0 +1,485 @@
+/*
+ *  KWin - the KDE window manager
+ *  SPDX-FileCopyrightText: 2023 Xaver Hugl <xaver.hugl@gmail.com>
+ *  SPDX-FileCopyrightText: 2025 Performance Engineering Team
+ *  SPDX-License-Identifier: GPL-2.0-or-later
+ */
+#include "drm_commit.h"
+#include "core/renderbackend.h"
+#include "drm_blob.h"
+#include "drm_buffer.h"
+#include "drm_connector.h"
+#include "drm_crtc.h"
+#include "drm_gpu.h"
+#include "drm_logging.h"
+#include "drm_object.h"
+#include "drm_pipeline.h"
+#include "drm_property.h"
+
+#include <QCoreApplication>
+#include <QThread>
+#include <QVarLengthArray>
+
+#include <algorithm>
+#include <cerrno>
+#include <cstring>
+#include <type_traits>
+#include <utility>
+#include <vector>
+#include <unistd.h>
+
+using namespace std::chrono_literals;
+
+namespace KWin
+{
+
+DrmCommit::DrmCommit(DrmGpu *gpu)
+    : m_gpu(gpu)
+{
+}
+
+DrmCommit::~DrmCommit()
+{
+    Q_ASSERT(!QCoreApplication::instance() || QThread::currentThread() == QCoreApplication::instance()->thread());
+}
+
+DrmGpu *DrmCommit::gpu() const noexcept
+{
+    return m_gpu;
+}
+
+void DrmCommit::setDefunct() noexcept
+{
+    m_defunct = true;
+}
+
+DrmAtomicCommit::DrmAtomicCommit(DrmGpu *gpu)
+    : DrmCommit(gpu)
+{
+}
+
+DrmAtomicCommit::DrmAtomicCommit(const QList<DrmPipeline *> &pipelines)
+    : DrmCommit(pipelines.front()->gpu())
+    , m_pipelines(pipelines)
+{
+}
+
+void DrmAtomicCommit::addProperty(const DrmProperty &prop, uint64_t value)
+{
+    if (!prop.isValid() || value == uint64_t(-1)) [[unlikely]] {
+        return;
+    }
+#ifndef NDEBUG
+    prop.checkValueInRange(value);
+#endif
+    const uint32_t objId = prop.drmObject()->id();
+    const uint32_t propId = prop.propId();
+
+    auto it = std::find_if(m_properties.begin(), m_properties.end(), [objId, propId](const PropertyValue &p) {
+        return p.objectId == objId && p.propertyId == propId;
+    });
+
+    if (it != m_properties.end()) {
+        it->value = value;
+    } else {
+        m_properties.push_back({objId, propId, value});
+    }
+}
+
+void DrmAtomicCommit::addBlob(const DrmProperty &prop, const std::shared_ptr<DrmBlob> &blob)
+{
+    addProperty(prop, blob ? blob->blobId() : 0);
+
+    auto it = std::find_if(m_blobs.begin(), m_blobs.end(), [&prop](const auto &p) { return p.first == &prop; });
+    if (it != m_blobs.end()) {
+        it->second = blob;
+    } else {
+        m_blobs.emplace_back(&prop, blob);
+    }
+}
+
+void DrmAtomicCommit::addBuffer(DrmPlane *plane, const std::shared_ptr<DrmFramebuffer> &buffer, const std::shared_ptr<OutputFrame> &frame)
+{
+    const uint32_t fbId = buffer ? buffer->framebufferId() : 0;
+    addProperty(plane->fbId, fbId);
+
+    auto itBuf = std::find_if(m_buffers.begin(), m_buffers.end(),[plane](const auto &p) { return p.first == plane; });
+    if (itBuf != m_buffers.end()) {
+        itBuf->second = buffer;
+    } else {
+        m_buffers.emplace_back(plane, buffer);
+    }
+
+    auto itFrame = std::find_if(m_frames.begin(), m_frames.end(), [plane](const auto &p) { return p.first == plane; });
+    if (itFrame != m_frames.end()) {
+        itFrame->second = frame;
+    } else {
+        m_frames.emplace_back(plane, frame);
+    }
+
+    m_planes.emplace(plane);
+
+    if (frame) [[likely]] {
+        if (m_targetPageflipTime) {
+            m_targetPageflipTime = std::min(*m_targetPageflipTime, frame->targetPageflipTime());
+        } else {
+            m_targetPageflipTime = frame->targetPageflipTime();
+        }
+    }
+}
+
+void DrmAtomicCommit::setVrr(DrmCrtc *crtc, bool vrr)
+{
+    addProperty(crtc->vrrEnabled, vrr ? 1 : 0);
+    m_vrr = vrr;
+}
+
+void DrmAtomicCommit::setPresentationMode(PresentationMode mode) noexcept
+{
+    m_mode = mode;
+}
+
+bool DrmAtomicCommit::test()
+{
+    uint32_t flags = DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_NONBLOCK;
+    if (isTearing()) {
+        flags |= DRM_MODE_PAGE_FLIP_ASYNC;
+    }
+    return doCommit(flags);
+}
+
+bool DrmAtomicCommit::testAllowModeset()
+{
+    return doCommit(DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_ALLOW_MODESET);
+}
+
+bool DrmAtomicCommit::commit()
+{
+    uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT;
+    if (isTearing()) {
+        flags |= DRM_MODE_PAGE_FLIP_ASYNC;
+    }
+    return doCommit(flags);
+}
+
+bool DrmAtomicCommit::commitModeset()
+{
+    m_modeset = true;
+    return doCommit(DRM_MODE_ATOMIC_ALLOW_MODESET);
+}
+
+bool DrmAtomicCommit::doCommit(uint32_t flags)
+{
+    const bool allowInFence = !isTearing();
+
+    for (const auto &pair : m_buffers) {
+        DrmPlane *plane = pair.first;
+        const auto &buffer = pair.second;
+
+        if (!plane || !plane->inFenceFd.isValid()) [[unlikely]] {
+            continue;
+        }
+
+        const uint32_t objId = plane->fbId.drmObject()->id();
+        const uint32_t propId = plane->inFenceFd.propId();
+
+        auto it = std::remove_if(m_properties.begin(), m_properties.end(),
+                                 [objId, propId](const PropertyValue &p) {
+                                     return p.objectId == objId && p.propertyId == propId;
+                                 });
+        m_properties.erase(it, m_properties.end());
+
+        if (!allowInFence || !buffer || plane->gpu()->isNVidia()) [[unlikely]] {
+            continue;
+        }
+
+        const int rawFd = buffer->syncFd().get();
+        if (rawFd >= 0) {
+            addProperty(plane->inFenceFd, static_cast<uint64_t>(rawFd));
+        }
+    }
+
+    std::sort(m_properties.begin(), m_properties.end(),[](const PropertyValue &a, const PropertyValue &b) {
+        if (a.objectId != b.objectId) {
+            return a.objectId < b.objectId;
+        }
+        return a.propertyId < b.propertyId;
+    });
+
+    constexpr size_t kInlineObjectCapacity = 16;
+    constexpr size_t kInlinePropertyCapacity = 128;
+
+    QVarLengthArray<uint32_t, kInlineObjectCapacity> objects;
+    QVarLengthArray<uint32_t, kInlineObjectCapacity> propertyCounts;
+    QVarLengthArray<uint32_t, kInlinePropertyCapacity> propertyIds;
+    QVarLengthArray<uint64_t, kInlinePropertyCapacity> values;
+
+    const size_t propCount = m_properties.size();
+    propertyIds.reserve(static_cast<int>(propCount));
+    values.reserve(static_cast<int>(propCount));
+
+    uint32_t currentObj = 0;
+    uint32_t currentPropCount = 0;
+
+    for (size_t i = 0; i < propCount; ++i) {
+        const auto &p = m_properties[i];
+        if (p.objectId != currentObj) {
+            if (currentObj != 0) {
+                objects.push_back(currentObj);
+                propertyCounts.push_back(currentPropCount);
+            }
+            currentObj = p.objectId;
+            currentPropCount = 0;
+        }
+        propertyIds.push_back(p.propertyId);
+        values.push_back(p.value);
+        ++currentPropCount;
+    }
+
+    if (currentObj != 0) {
+        objects.push_back(currentObj);
+        propertyCounts.push_back(currentPropCount);
+    }
+
+    drm_mode_atomic commitData{
+        .flags = flags,
+        .count_objs = static_cast<uint32_t>(objects.size()),
+        .objs_ptr = reinterpret_cast<uint64_t>(objects.data()),
+        .count_props_ptr = reinterpret_cast<uint64_t>(propertyCounts.data()),
+        .props_ptr = reinterpret_cast<uint64_t>(propertyIds.data()),
+        .prop_values_ptr = reinterpret_cast<uint64_t>(values.data()),
+        .reserved = 0,
+        .user_data = reinterpret_cast<uint64_t>(this),
+    };
+
+    return drmIoctl(m_gpu->fd(), DRM_IOCTL_MODE_ATOMIC, &commitData) == 0;
+}
+
+void DrmAtomicCommit::pageFlipped(std::chrono::nanoseconds timestamp)
+{
+    Q_ASSERT(!QCoreApplication::instance() || QThread::currentThread() == QCoreApplication::instance()->thread());
+
+    for (const auto &pair : m_buffers) {
+        pair.first->setCurrentBuffer(pair.second);
+    }
+
+    if (m_defunct) {
+        return;
+    }
+
+    const size_t frameCount = m_frames.size();
+
+    if (frameCount == 1) [[likely]] {
+        const auto &frame = m_frames.front().second;
+        if (frame) [[likely]] {
+            frame->presented(timestamp, m_mode);
+        }
+    } else if (frameCount > 1) {
+        QVarLengthArray<OutputFrame *, 8> frames;
+        frames.reserve(static_cast<int>(frameCount));
+
+        for (const auto &pair : m_frames) {
+            if (pair.second) {
+                frames.append(pair.second.get());
+            }
+        }
+
+        if (!frames.isEmpty()) {
+            std::sort(frames.begin(), frames.end());
+            const auto last = std::unique(frames.begin(), frames.end());
+            for (auto it = frames.begin(); it != last; ++it) {
+                (*it)->presented(timestamp, m_mode);
+            }
+        }
+    }
+
+    m_frames.clear();
+
+    for (const auto pipeline : std::as_const(m_pipelines)) {
+        pipeline->pageFlipped(timestamp);
+    }
+}
+
+bool DrmAtomicCommit::areBuffersReadable() const
+{
+    return std::ranges::all_of(m_buffers,[](const auto &pair) {
+        return !pair.second || pair.second->isReadable();
+    });
+}
+
+void DrmAtomicCommit::setDeadline(std::chrono::steady_clock::time_point deadline)
+{
+    for (const auto &pair : m_buffers) {
+        if (pair.second) {
+            pair.second->setDeadline(deadline);
+        }
+    }
+}
+
+std::optional<bool> DrmAtomicCommit::isVrr() const noexcept
+{
+    return m_vrr;
+}
+
+const std::unordered_set<DrmPlane *> &DrmAtomicCommit::modifiedPlanes() const noexcept
+{
+    return m_planes;
+}
+
+void DrmAtomicCommit::merge(DrmAtomicCommit *onTop)
+{
+    if (!onTop) [[unlikely]] {
+        return;
+    }
+
+    for (const auto &p : onTop->m_properties) {
+        auto it = std::find_if(m_properties.begin(), m_properties.end(), [&](const PropertyValue &ownP) {
+            return ownP.objectId == p.objectId && ownP.propertyId == p.propertyId;
+        });
+        if (it != m_properties.end()) {
+            it->value = p.value;
+        } else {
+            m_properties.push_back(p);
+        }
+    }
+
+    for (const auto &pair : onTop->m_buffers) {
+        DrmPlane *plane = pair.first;
+        auto itBuf = std::find_if(m_buffers.begin(), m_buffers.end(), [plane](const auto &p) {
+            return p.first == plane;
+        });
+        if (itBuf != m_buffers.end()) {
+            itBuf->second = pair.second;
+        } else {
+            m_buffers.push_back(pair);
+        }
+
+        auto frameIt = std::find_if(onTop->m_frames.begin(), onTop->m_frames.end(), [plane](const auto &p) {
+            return p.first == plane;
+        });
+        auto ownFrameIt = std::find_if(m_frames.begin(), m_frames.end(), [plane](const auto &p) {
+            return p.first == plane;
+        });
+
+        if (frameIt != onTop->m_frames.end()) {
+            if (ownFrameIt != m_frames.end()) {
+                ownFrameIt->second = frameIt->second;
+            } else {
+                m_frames.push_back(*frameIt);
+            }
+        } else if (ownFrameIt != m_frames.end()) {
+            m_frames.erase(ownFrameIt);
+        }
+
+        m_planes.emplace(plane);
+    }
+
+    for (const auto &pair : onTop->m_blobs) {
+        auto itBlob = std::find_if(m_blobs.begin(), m_blobs.end(), [&](const auto &p) {
+            return p.first == pair.first;
+        });
+        if (itBlob != m_blobs.end()) {
+            itBlob->second = pair.second;
+        } else {
+            m_blobs.push_back(pair);
+        }
+    }
+
+    if (onTop->m_vrr.has_value()) {
+        m_vrr = onTop->m_vrr;
+    }
+
+    m_mode = onTop->m_mode;
+
+    for (DrmPipeline *pipeline : std::as_const(onTop->m_pipelines)) {
+        if (!m_pipelines.contains(pipeline)) {
+            m_pipelines.append(pipeline);
+        }
+    }
+
+    if (!m_targetPageflipTime) {
+        m_targetPageflipTime = onTop->m_targetPageflipTime;
+    } else if (onTop->m_targetPageflipTime) {
+        *m_targetPageflipTime = std::min(*m_targetPageflipTime, *onTop->m_targetPageflipTime);
+    }
+
+    if (m_allowedVrrDelay && onTop->m_allowedVrrDelay) {
+        *m_allowedVrrDelay = std::min(*m_allowedVrrDelay, *onTop->m_allowedVrrDelay);
+    } else {
+        m_allowedVrrDelay.reset();
+    }
+}
+
+void DrmAtomicCommit::setAllowedVrrDelay(std::optional<std::chrono::nanoseconds> allowedDelay) noexcept
+{
+    m_allowedVrrDelay = allowedDelay;
+}
+
+std::optional<std::chrono::nanoseconds> DrmAtomicCommit::allowedVrrDelay() const noexcept
+{
+    return m_allowedVrrDelay;
+}
+
+std::optional<std::chrono::steady_clock::time_point> DrmAtomicCommit::targetPageflipTime() const noexcept
+{
+    return m_targetPageflipTime;
+}
+
+bool DrmAtomicCommit::isReadyFor(std::chrono::steady_clock::time_point pageflipTarget) const
+{
+    static constexpr auto s_pageflipSlop = 500us;
+    return (!m_targetPageflipTime || pageflipTarget + s_pageflipSlop >= *m_targetPageflipTime) && areBuffersReadable();
+}
+
+bool DrmAtomicCommit::isTearing() const noexcept
+{
+    return m_mode == PresentationMode::Async || m_mode == PresentationMode::AdaptiveAsync;
+}
+
+DrmLegacyCommit::DrmLegacyCommit(DrmPipeline *pipeline, const std::shared_ptr<DrmFramebuffer> &buffer, const std::shared_ptr<OutputFrame> &frame)
+    : DrmCommit(pipeline->gpu())
+    , m_pipeline(pipeline)
+    , m_crtc(m_pipeline->crtc())
+    , m_buffer(buffer)
+    , m_frame(frame)
+{
+}
+
+bool DrmLegacyCommit::doModeset(DrmConnector *connector, DrmConnectorMode *mode)
+{
+    uint32_t connectorId = connector->id();
+    if (drmModeSetCrtc(gpu()->fd(), m_crtc->id(), m_buffer->framebufferId(), 0, 0, &connectorId, 1, mode->nativeMode()) == 0) {
+        m_crtc->setCurrent(m_buffer);
+        return true;
+    }
+    return false;
+}
+
+bool DrmLegacyCommit::doPageflip(PresentationMode mode)
+{
+    m_mode = mode;
+    uint32_t flags = DRM_MODE_PAGE_FLIP_EVENT;
+    if (mode == PresentationMode::Async || mode == PresentationMode::AdaptiveAsync) {
+        flags |= DRM_MODE_PAGE_FLIP_ASYNC;
+    }
+    return drmModePageFlip(gpu()->fd(), m_crtc->id(), m_buffer->framebufferId(), flags, this) == 0;
+}
+
+void DrmLegacyCommit::pageFlipped(std::chrono::nanoseconds timestamp)
+{
+    Q_ASSERT(!QCoreApplication::instance() || QThread::currentThread() == QCoreApplication::instance()->thread());
+
+    m_crtc->setCurrent(m_buffer);
+    if (m_defunct) {
+        return;
+    }
+    if (m_frame) {
+        m_frame->presented(timestamp, m_mode);
+        m_frame.reset();
+    }
+    m_pipeline->pageFlipped(timestamp);
+}
+
+}
+
+#include "moc_drm_commit.cpp"
