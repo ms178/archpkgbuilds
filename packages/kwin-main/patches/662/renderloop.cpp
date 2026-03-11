@@ -59,7 +59,7 @@ constexpr int kTripleBufferExitPct = 70;
 constexpr uint8_t kTripleBufferHysteresisLimit = 5;
 constexpr uint8_t kMaxConsecutiveErrors = 3;
 constexpr int kMaxErrorBackoffMs = 50;
-constexpr int64_t kTimerJitterFilterNs = 50'000;
+constexpr int64_t kTimerJitterFilterNs = 250'000;
 constexpr int64_t kCadenceNoiseFloorNs = 125'000;
 constexpr int64_t kFilm24Ns = 41'666'666;
 constexpr int64_t kFilm25Ns = 40'000'000;
@@ -102,20 +102,14 @@ inline int64_t steadyNowNs() noexcept
 }
 
 [[gnu::always_inline, gnu::const]]
-inline uint64_t ceilDivU64Reciprocal(uint64_t n, uint64_t d, uint64_t recip, uint8_t shift) noexcept
+inline constexpr uint64_t ceilDivU64Reciprocal(uint64_t n, uint64_t d, uint64_t recip, uint8_t shift) noexcept
 {
-    if (n == 0 || d == 0) [[unlikely]] {
-        return 0;
-    }
     if (recip == 0 || shift == 0) [[unlikely]] {
-        return (n + d - 1) / d;
+        return d == 0 ? 0 : (n + d - 1) / d;
     }
     const auto prod = static_cast<__uint128_t>(n) * recip;
-    auto q = static_cast<uint64_t>(prod >> shift);
-    if (q * d < n) {
-        ++q;
-    }
-    return q;
+    const auto q = static_cast<uint64_t>(prod >> shift);
+    return q + static_cast<uint64_t>(q * d < n);
 }
 
 [[nodiscard]] consteval uint64_t reciprocalForInterval(uint64_t interval) noexcept
@@ -138,31 +132,39 @@ inline bool durationEstimateAtMost(const Estimate &estimate, std::chrono::nanose
 }
 
 [[gnu::always_inline, gnu::const]]
-inline bool nearIntervalNs(int64_t value, int64_t target, int64_t minToleranceNs) noexcept
+inline constexpr bool nearIntervalNs(int64_t value, int64_t target, int64_t minToleranceNs) noexcept
 {
     const int64_t tolerance = std::max<int64_t>(target / 64, minToleranceNs);
     return safeAbs64(value - target) <= tolerance;
 }
 
+template <int64_t Target, int64_t MinToleranceNs>
 [[gnu::always_inline, gnu::const]]
-inline bool isExplicitVsyncHint(uint8_t hintRaw, bool valid) noexcept
+inline constexpr bool nearIntervalNs(int64_t value) noexcept
+{
+    constexpr int64_t tolerance = (Target / 64) > MinToleranceNs ? (Target / 64) : MinToleranceNs;
+    return safeAbs64(value - Target) <= tolerance;
+}
+
+[[gnu::always_inline, gnu::const]]
+inline constexpr bool isExplicitVsyncHint(uint8_t hintRaw, bool valid) noexcept
 {
     return valid && static_cast<KWin::PresentationModeHint>(hintRaw) == KWin::PresentationModeHint::VSync;
 }
 
 [[gnu::always_inline, gnu::const]]
-inline bool isExplicitAsyncHint(uint8_t hintRaw, bool valid) noexcept
+inline constexpr bool isExplicitAsyncHint(uint8_t hintRaw, bool valid) noexcept
 {
     return valid && static_cast<KWin::PresentationModeHint>(hintRaw) == KWin::PresentationModeHint::Async;
 }
 
 [[gnu::always_inline, gnu::const]]
-inline bool isUnhintedFilmCadenceNs(int64_t intervalNs, int16_t stability) noexcept
+inline constexpr bool isUnhintedFilmCadenceNs(int64_t intervalNs, int16_t stability) noexcept
 {
     if (intervalNs <= 0 || stability < kCadenceStableThreshold) {
         return false;
     }
-    return nearIntervalNs(intervalNs, kFilm24Ns, 350'000) || nearIntervalNs(intervalNs, kFilm25Ns, 300'000);
+    return nearIntervalNs<kFilm24Ns, 350'000>(intervalNs) || nearIntervalNs<kFilm25Ns, 300'000>(intervalNs);
 }
 
 [[gnu::always_inline, gnu::const]]
@@ -175,13 +177,13 @@ inline KWin::PresentationMode adaptiveModeForState(const KWin::VrrStateCache::St
 }
 
 [[gnu::always_inline, gnu::const]]
-inline bool contentIsInteractive(KWin::VrrContentHint hint) noexcept
+inline constexpr bool contentIsInteractive(KWin::VrrContentHint hint) noexcept
 {
     return hint == KWin::VrrContentHint::Interactive || hint == KWin::VrrContentHint::ForceVrr;
 }
 
 [[gnu::always_inline, gnu::const]]
-inline bool contentIsVideoLike(KWin::VrrContentHint hint) noexcept
+inline constexpr bool contentIsVideoLike(KWin::VrrContentHint hint) noexcept
 {
     return hint == KWin::VrrContentHint::Video || hint == KWin::VrrContentHint::Film || hint == KWin::VrrContentHint::ForceVsync;
 }
@@ -217,7 +219,7 @@ inline int effectiveMaxPendingFrames(const KWin::RenderLoopPrivate *d, bool vrrA
     }
 
     const bool overlapHelps =
-        predictedNs >= ((vblankNs * 2) / 5) ||
+        (predictedNs * 5) >= (vblankNs * 2) ||
         d->pendingReschedule ||
         d->starvationRecoveryCounter >= KWin::RenderLoopPrivate::kStarvationRecoveryFrames ||
         d->consecutiveErrorCount != 0U ||
@@ -356,13 +358,13 @@ void RenderLoopPrivate::connectVrrSignals(Window *window)
     vrrConnectionCount_ = 0;
 
     const uint8_t capacity = static_cast<uint8_t>(vrrConnections_.size());
-    auto store =[this, capacity](QMetaObject::Connection c) {
+    auto store = [this, capacity](QMetaObject::Connection c) {
         if (c && vrrConnectionCount_ < capacity) {
             vrrConnections_[vrrConnectionCount_++] = c;
         }
     };
 
-    store(QObject::connect(window, &QObject::destroyed, q, [this]() {
+    store(QObject::connect(window, &QObject::destroyed, q,[this]() {
         vrrStateDirty_ = true;
     }));
     store(QObject::connect(window, &Window::fullScreenChanged, q, [this]() {
@@ -663,7 +665,6 @@ void RenderLoopPrivate::updatePresentationCadence(int64_t intervalNs) noexcept
     const int64_t hi = std::min<int64_t>(prev + maxStepNs, kMaxReasonableIntervalNs);
     const int64_t filtered = std::clamp(intervalNs, lo, hi);
 
-    constexpr int64_t kCadenceNoiseFloorNs = 125'000LL;
     const int64_t rawDiff = safeAbs64(filtered - prev);
     const int64_t diff = rawDiff > kCadenceNoiseFloorNs ? (rawDiff - kCadenceNoiseFloorNs) : 0LL;
 
@@ -689,18 +690,18 @@ PresentationMode RenderLoopPrivate::selectPresentationMode() noexcept
 {
     lastDecisionReason_ = VrrDecisionReason::None;
 
-    if (!vrrEnabled || !vrrCapable) [[likely]] {
+    if (!vrrEnabled || !vrrCapable) [[unlikely]] {
         lastDecisionReason_ = VrrDecisionReason::UserPolicy;
         return PresentationMode::VSync;
     }
 
-    if (vrrMode == VrrMode::Never) {
+    if (vrrMode == VrrMode::Never) [[unlikely]] {
         lastDecisionReason_ = VrrDecisionReason::UserPolicy;
         return PresentationMode::VSync;
     }
 
     const VrrStateCache::State state = vrrStateCache_.getState();
-    if (state.isOnOutput == 0U || state.isFullScreen == 0U) {
+    if (state.isOnOutput == 0U || state.isFullScreen == 0U) [[unlikely]] {
         lastDecisionReason_ = VrrDecisionReason::UserPolicy;
         return PresentationMode::VSync;
     }
@@ -713,17 +714,17 @@ PresentationMode RenderLoopPrivate::selectPresentationMode() noexcept
         return adaptive;
     }
 
-    if (activeContentHint_ == VrrContentHint::ForceVsync) {
+    if (activeContentHint_ == VrrContentHint::ForceVsync) [[unlikely]] {
         lastDecisionReason_ = VrrDecisionReason::ExplicitHint;
         return PresentationMode::VSync;
     }
 
-    if (activeContentHint_ == VrrContentHint::ForceVrr) {
+    if (activeContentHint_ == VrrContentHint::ForceVrr) [[likely]] {
         lastDecisionReason_ = VrrDecisionReason::ExplicitHint;
         return adaptive;
     }
 
-    if (isExplicitVsyncHint(state.hint, validHint)) {
+    if (isExplicitVsyncHint(state.hint, validHint)) [[unlikely]] {
         lastDecisionReason_ = VrrDecisionReason::ExplicitHint;
         return PresentationMode::VSync;
     }
@@ -733,17 +734,17 @@ PresentationMode RenderLoopPrivate::selectPresentationMode() noexcept
         return PresentationMode::AdaptiveAsync;
     }
 
-    if (activeContentHint_ == VrrContentHint::Video || activeContentHint_ == VrrContentHint::Film) {
+    if (activeContentHint_ == VrrContentHint::Video || activeContentHint_ == VrrContentHint::Film) [[unlikely]] {
         lastDecisionReason_ = VrrDecisionReason::ExplicitHint;
         return PresentationMode::VSync;
     }
 
-    if (activeContentHint_ == VrrContentHint::Interactive || interactiveGraceFrames_ > 0U) {
+    if (activeContentHint_ == VrrContentHint::Interactive || interactiveGraceFrames_ > 0U) [[likely]] {
         lastDecisionReason_ = VrrDecisionReason::InteractiveGrace;
         return adaptive;
     }
 
-    if (vrrOscillationLockout && oscillationCooldownCounter_ > 0U) {
+    if (vrrOscillationLockout && oscillationCooldownCounter_ > 0U) [[unlikely]] {
         lastDecisionReason_ = VrrDecisionReason::OscillationGuard;
         return PresentationMode::VSync;
     }
@@ -754,7 +755,7 @@ PresentationMode RenderLoopPrivate::selectPresentationMode() noexcept
         return presentationMode;
     }
 
-    if (!validHint && isUnhintedFilmCadenceNs(lastIntervalNs_, cadenceStability_) && isBelowVrrFloor()) {
+    if (!validHint && isUnhintedFilmCadenceNs(lastIntervalNs_, cadenceStability_) && isBelowVrrFloor()) [[unlikely]] {
         lastDecisionReason_ = VrrDecisionReason::FilmCadence;
         return PresentationMode::VSync;
     }
@@ -961,7 +962,7 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTarget)
     const int64_t vblankI64 = static_cast<int64_t>(vblankNs);
     int64_t nextPresNs = nowNs + compositeNs;
 
-    if (presentationMode == PresentationMode::VSync) [[likely]] {
+    if (presentationMode == PresentationMode::VSync) [[unlikely]] {
         const int64_t earliestReadyNs = nowNs + compositeNs;
         const int64_t nsFromLastPres = std::max(earliestReadyNs - lastPresNs, int64_t{1});
         int64_t targetVblank = static_cast<int64_t>(
