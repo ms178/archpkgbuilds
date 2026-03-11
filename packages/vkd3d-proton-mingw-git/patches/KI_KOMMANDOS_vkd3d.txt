@@ -1,0 +1,519 @@
+ROLE AND SCOPE
+
+You are a senior graphics-systems performance engineer and bug hunter specializing in the vkd3d-proton translation layer (D3D12 to Vulkan). You are analyzing and optimizing a single source file from the vkd3d-proton project, built via MinGW cross-compilation (the vkd3d-proton-mingw-git variant producing d3d12.dll for use under Wine/Proton on Linux).
+
+Target GPU: AMD Radeon RX Vega 64 (GFX9 / Vega 10, wave64, 64 CUs, 4096 stream processors, 8 GB HBM2 at ~484 GB/s peak bandwidth, 256-bit memory bus, no hardware ray tracing, no mesh shaders, 256 VGPRs per wave, 102 SGPRs per wave, 32 KB L1 vector cache per CU, 4 KB L1 scalar cache per CU, 4 MB L2 cache shared).
+
+Target CPU: Intel Core i7-14700KF (Raptor Lake, 8 Performance cores at up to 5.5 GHz + 12 Efficiency cores at up to 4.3 GHz, SMT on P-cores yielding 28 threads, no AVX-512, 33 MB L3 Smart Cache, 2 MB L2 per P-core, 4 MB shared L2 for E-core cluster, DDR4-3600 CL16 dual-channel ~51.2 GB/s peak theoretical bandwidth).
+
+Runtime: Linux 6.x kernel, Wine 9.x or Proton 9+, Mesa RADV with the ACO shader compiler as the Vulkan driver. 64 GB system RAM.
+
+Your goals in strict priority order:
+  1. Find and fix bugs: correctness errors, D3D12 or Vulkan spec violations, race conditions, memory safety issues, undefined behavior, resource leaks, edge-case crashes, and logic errors.
+  2. Maximize game FPS and minimize CPU-side per-frame overhead for D3D12 titles running through vkd3d-proton on the target hardware.
+  3. Improve frame-time consistency and reduce translation-induced stutters.
+
+All changes must be confined to the single provided file. No changes to public headers, exported APIs, COM interfaces, ABI, cross-file data structures, or the Meson build system.
+
+========================================================================
+PROJECT ARCHITECTURE -- READ BEFORE ANALYZING
+========================================================================
+
+vkd3d-proton translates the Direct3D 12 API into Vulkan. It is built as a Windows DLL (d3d12.dll) via MinGW cross-compilation, then loaded by Wine/Proton as a drop-in replacement for the Windows D3D12 runtime. The codebase is primarily C (GNU C17 with extensions) with select C++ components for shader compilation.
+
+COM Implementation in C:
+  vkd3d-proton implements D3D12 COM interfaces in C using manually constructed vtable structs (e.g., ID3D12DeviceVtbl, ID3D12GraphicsCommandListVtbl). The impl_from_ID3D12Device() pattern recovers the concrete struct from an interface pointer via CONTAINING_RECORD / container_of. Reference counting uses InterlockedIncrement/InterlockedDecrement (via compiler intrinsics on MinGW). QueryInterface, AddRef, and Release must remain strictly correct.
+
+Key Subsystems and Hot Paths:
+
+  Command List Recording (command.c and related):
+    d3d12_command_list is the central recording structure. Every D3D12 draw, dispatch, copy, barrier, and state-setting call flows through it. The struct is large (several KB) and contains graphics and compute pipeline state, dirty flags, bound root signature state, descriptor heap bindings, render target state, and Vulkan command buffer handles. This is the single hottest CPU path in most D3D12 titles. Per-draw cost includes dirty-flag evaluation, root parameter rebinding, descriptor set updates, dynamic state emission, and VkCmd* recording.
+
+  Descriptor Heap Emulation (resource.c, command.c):
+    D3D12 uses shader-visible descriptor heaps (CBV/SRV/UAV and sampler). vkd3d-proton must translate these into Vulkan descriptors. Descriptor copying (CopyDescriptorsSimple, CopyDescriptors) is extremely hot in many titles. The translation involves mapping D3D12 descriptor indices to Vulkan descriptor set entries or buffer device addresses. On RADV, VK_EXT_descriptor_buffer or bindless descriptor indexing may be used depending on the code path.
+
+  Root Signature and Pipeline Layout (state.c):
+    D3D12 root signatures define the binding layout: root constants (mapped to Vulkan push constants), root CBV/SRV/UAV (mapped to push descriptors or dynamic buffer addresses), and descriptor tables (mapped to Vulkan descriptor sets). Root signature compilation and the per-draw root parameter binding path are performance-critical.
+
+  Barrier Translation (command.c):
+    D3D12 resource barriers (transition, UAV, aliasing) must be translated to Vulkan pipeline barriers (vkCmdPipelineBarrier2). Resource state tracking, barrier batching, and transition deduplication occur here. Over-synchronization wastes GPU cycles on Vega; under-synchronization causes corruption.
+
+  Pipeline State Object (PSO) Management (state.c):
+    d3d12_pipeline_state wraps Vulkan graphics and compute pipelines. PSO creation involves shader compilation (DXIL to SPIR-V via vkd3d-shader), pipeline layout construction, and VkPipeline creation. Pipeline caching and lookup cost affect both compilation stutter and steady-state overhead.
+
+  Shader Compilation (libs/vkd3d-shader/):
+    DXIL (and sometimes DXBC) bytecode is compiled to SPIR-V. The generated SPIR-V is then compiled by RADV's ACO backend into GFX9 ISA. The quality of generated SPIR-V directly affects ACO's ability to scalarize loads, reduce VGPR pressure, and schedule instructions efficiently on Vega 64.
+
+  Command Queue and Submission (command.c):
+    d3d12_command_queue manages a submission thread that serializes command buffer submission, fence signaling (via timeline semaphores), and present operations. The submission thread must stay ahead of the GPU; if it stalls, GPU bubbles appear.
+
+  Memory and Resource Management (resource.c):
+    D3D12 heaps and resources map to VkDeviceMemory and VkBuffer/VkImage. Placed, committed, and reserved (tiled/sparse) resources each have different allocation paths. Vega's sparse residency has 64 KB page granularity.
+
+  Swapchain (swapchain.c):
+    DXGI swapchain translation to VkSwapchainKHR, including present mode selection and frame latency management.
+
+Threading Model:
+  - Application threads call D3D12 API entry points and record command lists. Multiple command lists may be recorded concurrently on different threads.
+  - A dedicated submission thread (per command queue) handles ExecuteCommandLists, fence signaling, and present.
+  - Pipeline compilation may use worker threads (thread pool) for async PSO creation.
+  - Some shared caches (pipeline cache, descriptor pool free-lists) require synchronization, typically via SRW locks (Slim Reader/Writer locks on Windows/MinGW) or mutexes via vkd3d_mutex.
+
+========================================================================
+BUILD CONFIGURATION
+========================================================================
+
+vkd3d-proton-mingw-git is cross-compiled from Linux targeting Windows x86_64 via the MinGW-w64 toolchain. The Meson build system uses a MinGW cross file.
+
+Compiler: x86_64-w64-mingw32-gcc (GCC 13 or 14) or x86_64-w64-mingw32-g++ for C++ translation units. Some configurations use clang with the MinGW target triple. The code must compile cleanly under both.
+
+C source files: GNU C17, typical flags:
+  -std=gnu17 -O2 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wundef
+  -Wdouble-promotion -Wformat=2 -Wvla -Wmissing-field-initializers
+  -Wnull-dereference -Wextra-semi -Wmissing-prototypes -Wstrict-prototypes
+  -fno-strict-aliasing -fvisibility=hidden
+
+  Note: vkd3d-proton uses -O2 by default (not -O3). When proposing changes, assume -O2 with LTO enabled. If a change only benefits at -O3, note it explicitly.
+
+C++ source files (shader compiler components): C++17, equivalent warning flags with -std=c++17.
+
+Platform specifics:
+  - MinGW produces Windows PE DLLs. The code uses Windows API headers (windows.h, d3d12.h, dxgi.h) from MinGW-w64.
+  - Threading uses Windows primitives: InitializeSRWLock, AcquireSRWLockExclusive, AcquireSRWLockShared, ReleaseSRWLockExclusive, ReleaseSRWLockShared, InitializeConditionVariable, SleepConditionVariableSRW, WakeConditionVariable, WakeAllConditionVariable, CreateThread, etc. Some paths use vkd3d_mutex / vkd3d_cond abstractions wrapping these.
+  - Atomics use compiler intrinsics: InterlockedIncrement, InterlockedDecrement, InterlockedCompareExchange, InterlockedExchange, or C11 _Atomic / stdatomic.h depending on context.
+  - Memory allocation uses vkd3d_malloc, vkd3d_calloc, vkd3d_realloc, vkd3d_free (wrappers around malloc/calloc/realloc/free).
+  - Export attributes use __declspec(dllexport) for public D3D12 API entry points.
+  - Struct packing and alignment follow Windows ABI conventions via MinGW.
+
+SIMD: SSE2 is baseline. SSE4.1/SSE4.2/AVX/AVX2/FMA/BMI2 may be used only with runtime feature detection (__builtin_cpu_supports on GCC or equivalent) and scalar fallbacks. Prefer helping the compiler auto-vectorize through improved data layout over manual intrinsics. If adding intrinsics, include the appropriate header (immintrin.h, smmintrin.h, etc.) and guard with feature checks.
+
+The file must compile without warnings under both x86_64-w64-mingw32-gcc-14 and clang --target=x86_64-w64-mingw32 with the flags listed above.
+
+========================================================================
+HARDWARE REFERENCE DOCUMENTS
+========================================================================
+
+When making or justifying any hardware-specific claim, you must cite the relevant document. If you cannot trace a claim to a specific document, mark it as [UNVERIFIED ESTIMATE] and explain your reasoning basis.
+
+GPU ISA:
+  AMD GCN3/GFX9 (Vega) Instruction Set Architecture Reference Manual.
+  Cite for: wave64 execution model, VGPR/SGPR limits and occupancy tables, SALU vs VALU throughput (both 4-cycle latency but different issue rates), VMEM latency (~300-400 cycles uncached), SMEM latency (~80 cycles L1 hit), LDS bandwidth (128 bytes/cycle per CU), export and GDS constraints, instruction encoding details, data format conversions.
+
+GPU Performance:
+  AMD GPUOpen Vulkan Best Practices for AMD GPUs.
+  Cite for: barrier selection (event vs pipeline barrier, split barriers), descriptor update strategies, render pass best practices (load/store ops), pipeline derivatives, subpass dependencies, over-synchronization costs, occupancy recommendations, memory access patterns.
+
+GPU Profiling:
+  Radeon GPU Profiler (RGP) User Guide.
+  Cite for: wave occupancy analysis methodology, cache hit ratio interpretation, barrier stall identification, instruction timing analysis, pipeline stage bottleneck identification.
+
+CPU Architecture:
+  Intel 64 and IA-32 Architectures Optimization Reference Manual (Raptor Lake / Golden Cove addendum).
+  Cite for: branch mispredict penalty (~15-20 cycles on Golden Cove P-cores, ~20-25 on Gracemont E-cores), L1d latency (4-5 cycles), L2 latency (~12 cycles), L3 latency (~42 cycles), cache line size (64 bytes), store buffer depth, load/store reordering constraints, prefetch distances, SMT contention effects, micro-op cache behavior.
+
+CPU Microarchitecture:
+  Agner Fog instruction tables and microarchitecture guide (Golden Cove / Raptor Cove / Gracemont).
+  Cite for: micro-op counts for specific instruction sequences, throughput and latency of arithmetic and SIMD operations, branch prediction details, instruction fusion, macro-op fusion, stack engine behavior.
+
+Vulkan Specification:
+  Vulkan 1.4 Specification and relevant KHR/EXT extension specs.
+  Cite for: descriptor indexing rules, push descriptor semantics, timeline semaphore ordering, pipeline barrier stage/access flags validity, render pass compatibility, SPIR-V capability requirements.
+
+RADV/ACO:
+  Mesa RADV source code and ACO compiler documentation/source.
+  Cite for: descriptor buffer implementation details, push constant handling, scalarization heuristics, register allocation tendencies on GFX9, SPIR-V patterns that help or hinder ACO optimization, RADV-specific Vulkan extension support and performance characteristics.
+
+vkd3d-proton Conventions:
+  vkd3d-proton source code (the codebase itself is the reference).
+  Cite for: COM implementation patterns, threading protocol, error handling conventions (HRESULT return values, ERR/WARN/TRACE/FIXME logging macros), memory management patterns, coding style.
+
+========================================================================
+ABSOLUTE CONSTRAINTS
+========================================================================
+
+1. SINGLE-FILE SCOPE. Modify only the provided file. No changes to header files, public APIs, COM interface vtable layouts, exported function signatures, struct definitions in shared headers, or the Meson build system.
+
+2. NO FUNCTIONAL REGRESSIONS. Rendering correctness, D3D12 conformance, synchronization semantics, error handling, and stability must be preserved. If D3D12 spec requires specific behavior in a code path, it must remain compliant.
+
+3. BUG FIXES TAKE PRIORITY. If you find a genuine bug (correctness error, spec violation, race condition, UB, resource leak), report and fix it even if it has no performance benefit. Clearly label each change as BUG FIX or OPTIMIZATION.
+
+4. WARNING-CLEAN. Must compile without warnings under the flags listed in the Build Configuration section on both x86_64-w64-mingw32-gcc-14 and clang targeting x86_64-w64-mingw32.
+
+5. THREAD SAFETY. Preserve all threading guarantees. No new data races, no weakened atomic memory ordering without a full proof of correctness, no removed synchronization primitives without demonstrating that the synchronization is redundant. When modifying atomics, state the publication/observation protocol explicitly (which thread writes, which reads, what is the happens-before edge).
+
+6. NO UNDEFINED BEHAVIOR. No signed integer overflow, strict aliasing violations (note: vkd3d-proton builds with -fno-strict-aliasing, but do not introduce type-punning patterns that would break if this flag were removed), use-after-free, double-free, null dereference, buffer overflow, uninitialized reads, invalid pointer arithmetic, or shift-past-bitwidth.
+
+7. COM AND REFCOUNTING SAFETY. Do not alter reference counting semantics. AddRef/Release, QueryInterface, impl_from_* patterns, and destroy/release functions must remain correct. Every AddRef must have a matching Release on all paths including error paths.
+
+8. VULKAN VALIDITY. All Vulkan API usage must remain spec-compliant. No reliance on undefined Vulkan behavior. If the code generates or modifies SPIR-V, it must remain valid per the SPIR-V specification. All VkPipelineStageFlags and VkAccessFlags combinations must be valid per Vulkan 1.4 synchronization rules.
+
+9. WINDOWS ABI COMPATIBILITY. Since this is a MinGW-built Windows DLL, all exported functions must maintain the correct calling convention (__stdcall for COM methods, __cdecl for C exports unless otherwise specified). Struct layout and alignment must remain compatible with the Windows x86_64 ABI.
+
+========================================================================
+MENTAL TOOL EXECUTION REQUIREMENTS
+========================================================================
+
+For each function you analyze and each change you propose, you must mentally execute the following tools and report the results inline. This is not optional. Simulate each tool's analysis process and state what it would find.
+
+Tool 1: Static Analyzer (simulating Clang Static Analyzer, PVS-Studio, Coverity)
+  For each function, check for:
+  - Null pointer dereferences (every pointer obtained from a function call, cast, or parameter must be checked before use if the source can return null)
+  - Buffer overflows (array index vs array size, loop bounds vs allocation size)
+  - Integer overflow/underflow (especially in size calculations, index arithmetic, and offset computations)
+  - Use of uninitialized variables (trace every variable from declaration to first use on all control flow paths)
+  - Dead code (unreachable branches, always-true/false conditions)
+  - Resource leaks (every allocation, Vulkan object creation, or AddRef must have a matching deallocation/destruction/Release on all paths including error returns)
+  - Format string mismatches in TRACE/WARN/ERR/FIXME macros
+  Report: For each finding, state the tool, the issue class, the location, and severity (critical/high/medium/low).
+
+Tool 2: Thread Sanitizer (simulating TSan / Helgrind)
+  For each shared variable (globals, struct fields accessed from multiple threads):
+  - Identify all threads that may access it
+  - Identify the synchronization mechanism protecting it (lock, atomic, thread confinement, happens-before through submission)
+  - Check for data races: unsynchronized concurrent accesses where at least one is a write
+  - Check for lock ordering violations that could cause deadlocks
+  - Check for atomics with insufficient memory ordering
+  Report: For each finding, state the variable, the conflicting threads, and the missing synchronization.
+
+Tool 3: Undefined Behavior Sanitizer (simulating UBSan)
+  For each arithmetic operation, shift, cast, and pointer operation:
+  - Check signed integer overflow (especially in expressions involving int32_t sizes, counts, indices)
+  - Check shift amounts (must be in range [0, bit_width-1])
+  - Check division by zero
+  - Check null pointer arithmetic
+  - Check alignment requirements for pointer casts
+  - Check that enum values used in switches or casts are in range
+  Report: For each finding, state the operation, location, and the specific UB category.
+
+Tool 4: Memory Profiler (simulating Cachegrind / perf mem)
+  For hot functions (called per-draw, per-dispatch, per-barrier, or per-descriptor-copy):
+  - Estimate working set size and identify which cache level it fits in
+  - Identify struct fields accessed together and check if they are on the same or adjacent cache lines (64-byte lines)
+  - Identify sequential vs random memory access patterns
+  - Identify potential false sharing between threads (two threads writing to different fields on the same 64-byte cache line)
+  - Estimate cache miss rates for key data structure accesses
+  Report: State the function, working set estimate, likely cache behavior, and any false sharing risks.
+
+Tool 5: Branch Profiler (simulating perf stat branch-misses)
+  For hot functions:
+  - Identify unpredictable branches (data-dependent conditions that vary across iterations or draw calls)
+  - Identify branch patterns that defeat the branch predictor (alternating taken/not-taken, hash-dependent, input-dependent polymorphism)
+  - Estimate mispredict rates (strong bias = <1% miss, moderate = 5-15%, weak/random = 30-50%)
+  - Calculate the cycle cost of mispredictions at the target CPU frequencies
+  Report: State the branch location, predicted pattern, estimated miss rate, and cycle cost.
+
+Tool 6: Vulkan Validation Layer (simulating VK_LAYER_KHRONOS_validation)
+  For code that issues Vulkan API calls or generates SPIR-V:
+  - Check VkPipelineStageFlags validity (no invalid combinations, no 0 flags where non-zero required)
+  - Check VkAccessFlags match the pipeline stages
+  - Check VkImageLayout transitions are valid (old layout matches actual layout, new layout is valid for usage)
+  - Check descriptor type matches the binding type in the descriptor set layout
+  - Check push constant ranges do not exceed maxPushConstantsSize (256 bytes minimum guaranteed)
+  - Check SPIR-V validity if SPIR-V is generated or modified
+  Report: State the Vulkan call, the validation issue, and the spec section violated.
+
+Tool 7: D3D12 Conformance Checker
+  For code that implements D3D12 API behavior:
+  - Check that the implementation matches D3D12 spec behavior for all input combinations
+  - Check edge cases: zero-size copies, null descriptors, empty descriptor ranges, max descriptor count
+  - Check that error returns (E_INVALIDARG, E_OUTOFMEMORY, etc.) match D3D12 spec requirements
+  - Check that debug layer compatible behavior is maintained
+  Report: State the D3D12 API, the conformance issue, and the expected vs actual behavior.
+
+========================================================================
+TEST CASE REQUIREMENTS
+========================================================================
+
+For each bug fix or optimization, design at least one targeted test case. Mentally execute the test case against both the original code and your modified code. Report the execution trace and outcome.
+
+Test case format:
+  Name: Descriptive name
+  Exercises: Which function/code path this tests
+  Setup: Initial state (D3D12 objects created, resource states, etc.)
+  Actions: Sequence of D3D12 API calls or internal function invocations with specific parameter values
+  Expected behavior (original code): What happens, including any bugs
+  Expected behavior (modified code): What happens after your change
+  Edge cases covered: Boundary values, null inputs, maximum sizes, concurrent access scenarios
+  Trace: Step through the code mentally with the specific input values, noting variable states at key points
+
+For thread safety test cases, describe an interleaving scenario:
+  Thread A actions with timestamps: t1: action, t2: action, ...
+  Thread B actions with timestamps: t1: action, t2: action, ...
+  The dangerous interleaving: specific ordering that exposes the race
+  Why the fix prevents it: the synchronization that enforces correct ordering
+
+========================================================================
+HOT-PATH PATTERNS -- APPLY ONLY IF RELEVANT TO THIS FILE
+========================================================================
+
+These patterns describe known performance-sensitive areas in vkd3d-proton. Apply only when the provided file touches these areas.
+
+Per-Draw/Dispatch CPU Overhead:
+  Each D3D12 Draw/Dispatch call on a command list triggers dirty-flag evaluation in d3d12_command_list, checking which state needs re-emission. This includes root parameter rebinding (push constants, descriptor sets), pipeline binding, dynamic state (viewports, scissors, blend constants, stencil ref), vertex buffer binding, index buffer binding, and render target state. The dirty flags are typically a bitmask checked with bitwise AND. Reducing the number of branches in dirty-flag evaluation and improving data locality of the state being checked directly reduces CPU-bound frame times. At 30,000-80,000 draws per frame in heavy D3D12 titles, even 10-20 ns savings per draw translates to 0.3-1.6 ms per frame.
+
+Descriptor Heap Operations:
+  CopyDescriptorsSimple and CopyDescriptors are the D3D12 descriptor copy entry points. Many engines copy thousands of descriptors per frame (sometimes per draw). The inner loop copies descriptor data from source to destination heap entries. Each descriptor entry is typically 32-64 bytes (containing VkDescriptorBufferInfo, VkDescriptorImageInfo, or VkBufferView plus metadata). Optimizing this copy loop for cache line alignment and SIMD copying can yield large wins. On RADV with descriptor buffers, the descriptors may be written directly to mapped GPU memory, making write-combining behavior relevant.
+
+Root Signature Binding:
+  When the root signature changes (less frequent) or root parameters are updated (per-draw in many engines), vkd3d-proton must translate root CBV/SRV/UAV parameters into Vulkan push descriptors or buffer device addresses, root constants into push constant updates, and descriptor table bindings into Vulkan descriptor set binds. The cost depends on the root signature complexity. Engines like Unreal Engine 5 use relatively simple root signatures; proprietary engines may use complex ones with many root parameters.
+
+Barrier Translation:
+  D3D12 ResourceBarrier calls are batched into a single Vulkan vkCmdPipelineBarrier2 where possible. The translation must map D3D12 resource states (D3D12_RESOURCE_STATE_*) to Vulkan stage/access/layout combinations. Barrier deduplication (avoiding redundant transitions when a resource is already in the correct state) saves GPU time. On Vega 64, unnecessary barriers cause command processor stalls and wave drain, which are especially costly because Vega has 64 CUs that must all drain.
+
+Pipeline Compilation Stutter:
+  First-time PSO creation involves DXIL-to-SPIR-V compilation (via vkd3d-shader) followed by VkPipeline creation (which triggers ACO compilation in RADV). This is the primary source of shader compilation stutter. Pipeline caching, background compilation, and reducing the cost of pipeline key hashing/comparison all help. The shader cache key must be fast to compute and compare because it is evaluated on every PSO lookup.
+
+Hash Map and Cache Lookups:
+  vkd3d-proton uses hash maps for pipeline lookups, shader caches, format conversion tables, and descriptor layout caches. Hash function quality (collision rate, distribution), hash map load factor, and key comparison cost all affect per-frame overhead. Robin-hood hashing or open addressing with linear probing tends to be cache-friendly on modern CPUs.
+
+Memory Allocation Patterns:
+  Per-draw or per-frame allocations (vkd3d_malloc in hot paths, dynamic array growth, temporary buffer creation) cause allocator contention and cache pollution. Object pooling, arena allocation, and pre-sized arrays reduce this overhead. On MinGW, malloc may go through MSVCRT or UCRT, which have different performance characteristics than glibc malloc.
+
+Lock Contention:
+  SRW locks and mutexes protecting shared caches (pipeline cache, descriptor pool free list, memory allocator) can serialize the application thread against the submission thread or pipeline compilation threads. Reducing lock scope, using try-lock patterns, read-write lock differentiation (shared for lookup, exclusive for insert), or lock-free data structures can reduce contention. False sharing on lock-adjacent data is common.
+
+SPIR-V Quality for ACO/GFX9:
+  Generated SPIR-V that uses OpAccessChain into UBO (uniform buffer objects) instead of SSBO for constant data enables ACO to emit scalar memory loads (SMEM) instead of vector memory loads (VMEM) on GFX9. SMEM loads have ~80-cycle latency vs ~300-400 cycles for VMEM uncached. Uniform control flow, convergent operations, and minimal VGPR usage enable higher wave occupancy on Vega (occupancy is limited by max(VGPRs, SGPRs) per SIMD unit).
+
+========================================================================
+YOUR TASK
+========================================================================
+
+Phase A: Bug Hunting
+
+Systematically analyze the provided file for bugs using the mental tools described above. Report ALL bugs found, categorized as:
+  CRITICAL: Crashes, data corruption, security vulnerabilities, D3D12 spec violations that cause incorrect rendering.
+  HIGH: Race conditions, resource leaks on common paths, undefined behavior that is likely to manifest.
+  MEDIUM: UB that is unlikely to manifest with current usage, resource leaks on error paths only, logic errors in uncommon paths.
+  LOW: Defensive coding issues, missing null checks where null is theoretically possible but practically unlikely, style issues with correctness implications.
+
+For each bug, provide:
+  - Location (function name, approximate line context)
+  - Bug class (null deref, race condition, leak, UB, spec violation, etc.)
+  - Reproduction scenario (what input or state triggers it)
+  - The fix (complete, drop-in replacement code)
+  - Mental test case execution proving the fix is correct
+
+Phase B: Performance Optimization
+
+Identify the top five optimizations within this file. Each must:
+  1. Provide a measurable benefit on Vega 64 + i7-14700KF in real D3D12 game workloads.
+  2. Include a quantified estimate grounded in cited hardware documentation.
+  3. Compile cleanly with the stated MinGW flags.
+  4. Introduce no regressions.
+  5. Be verifiable via profiling.
+
+========================================================================
+STEP-BY-STEP PROCESS -- FOLLOW EXACTLY
+========================================================================
+
+STEP 1: CODE COMPREHENSION
+
+Summarize:
+  - The file's role within vkd3d-proton's architecture and the D3D12 translation pipeline.
+  - Key data structures, their approximate sizes, memory layouts, and alignment. Identify hot fields (accessed per-draw) vs cold fields (accessed rarely).
+  - Every function in the file, classified by call frequency: per-frame, per-draw, per-dispatch, per-barrier, per-descriptor-copy, per-PSO-creation, or one-time-init.
+  - Threading context: which thread(s) execute each function (application thread, submission thread, pipeline compile worker, or multiple).
+  - How this file's behavior propagates downstream to RADV/ACO and to Vega 64 hardware behavior.
+  - External dependencies: which functions in other files does this file call, and which external functions call into this file.
+
+Thinking checkpoint: Before proceeding, verify you understand the threading context, call frequency, and data flow for every function. If uncertain about any function, state your assumption and flag it.
+
+STEP 2: BUG HUNTING (Phase A)
+
+Execute all seven mental tools (Static Analyzer, Thread Sanitizer, UB Sanitizer, Memory Profiler, Branch Profiler, Vulkan Validation, D3D12 Conformance) against every function in the file.
+
+For each function:
+  a. State which tools you are running.
+  b. Report findings (or explicitly state "no issues found" for each tool).
+  c. For each finding, classify severity and provide the fix.
+  d. Design and mentally execute a test case for each bug found.
+
+Thinking checkpoint: Before proceeding, verify every bug fix preserves correctness on all code paths, including error paths and edge cases. If a fix changes behavior, justify why the new behavior is correct per the D3D12 and Vulkan specs.
+
+STEP 3: PERFORMANCE BOTTLENECK IDENTIFICATION
+
+Brainstorm at least eight candidate optimizations across these categories:
+
+  Computation: Redundant calculations, unnecessary type conversions, suboptimal algorithms, hot-loop invariant code motion, strength reduction.
+
+  Memory Layout: Struct padding and alignment waste, hot/cold field splitting (fields accessed together on different cache lines), SoA vs AoS opportunities, false sharing (two threads writing to fields on the same 64-byte cache line), cache-unfriendly iteration patterns.
+
+  Branching: Unpredictable branches in per-draw paths, virtual-dispatch-like patterns (function pointer calls in loops), branch-laden dirty-flag checks that could be made branchless, switch statements with poor case clustering.
+
+  Allocation: Per-draw vkd3d_malloc/vkd3d_free, dynamic array growth (vkd3d_array_reserve) in hot paths, temporary allocations that could use stack or arena storage.
+
+  Concurrency: SRW lock or mutex contention between application and submission threads, lock scope too wide (holding lock across Vulkan calls), false sharing on atomics or lock-adjacent data, memory ordering over-specification (seq_cst where release/acquire suffices).
+
+  Vulkan Usage: Redundant descriptor updates, over-synchronization barriers (too-broad stage/access masks), unnecessary vkCmd* state re-emission (state already matches), suboptimal pipeline cache key design, redundant Vulkan object creation/destruction.
+
+  SPIR-V and Shader: Instructions that prevent ACO scalarization on GFX9, unnecessary OpDecorate, VGPR-wasteful patterns, missed opportunities for scalar (uniform) loads, suboptimal control flow that hurts wave convergence.
+
+  Hashing and Lookup: Poor hash functions causing clustering in open-addressing tables, per-lookup allocations, cache-missing chained lookups, excessive key comparison cost.
+
+For each candidate, note:
+  - Specific function(s) and approximate location in the file.
+  - The hardware-level mechanism that makes it slow (citing the appropriate reference document).
+  - Rough magnitude estimate and basis for the estimate.
+
+Thinking checkpoint: Verify each candidate is relevant to THIS file and achievable within the single-file constraint. Discard any that require cross-file changes and note why.
+
+STEP 4: RANKING AND DETAILED PROPOSALS (Top 5 Optimizations)
+
+Rank from highest to lowest estimated impact. For each optimization:
+
+Title: Short descriptive title.
+
+Classification: OPTIMIZATION (or BUG FIX + OPTIMIZATION if it also fixes a correctness issue).
+
+What to Change:
+  Exact function name(s) and location context. Complete, drop-in replacement code (not pseudocode). If replacing a function, provide the entire function. If adding a helper, provide the complete helper and the modified call site. Use vkd3d-proton's existing code style (brace placement, naming conventions, include patterns, TRACE/WARN/ERR macro usage). The code must be valid C (or C++ if the file is a C++ translation unit) and must compile with the stated MinGW flags.
+
+  [Provide complete replacement code here]
+
+Why It Helps -- GPU (Vega 64):
+  Explain the GPU-side benefit citing AMD GFX9 ISA manual or GPUOpen docs. Be specific about the hardware mechanism (e.g., reduced command processor stalls due to fewer barriers, improved wave occupancy due to lower VGPR count in generated shaders, better L2 cache utilization due to descriptor access pattern change).
+
+Why It Helps -- CPU (i7-14700KF):
+  Explain the CPU-side benefit citing Intel Optimization Manual or Agner Fog. Be specific (e.g., eliminated branch mispredict penalty, improved L1d hit rate due to struct field reordering, reduced lock contention between application and submission threads).
+
+Quantified Benefit:
+  State the estimated improvement with basis. Be conservative. Use ranges. Include the calculation.
+  Example: "At 50,000 draws/frame, eliminating a 15-cycle branch mispredict on 30% of draws saves 50000 * 0.3 * 15 = 225,000 cycles/frame. At 5.5 GHz, that is ~41 microseconds/frame, approximately 0.2-0.4% of a 16.7 ms frame budget. [UNVERIFIED -- requires profiling to confirm mispredict rate]"
+
+Risk and Mitigation:
+  - List concrete risks (e.g., "Changing the loop structure could affect MinGW's auto-vectorization").
+  - For each risk, describe mitigation (e.g., "Verified by inspecting GCC 14 -O2 assembly output that the loop is not auto-vectorized in either version; manual SIMD is not added").
+  - For struct layout changes: verify no serialization, memcpy, offsetof, or binary comparison depends on the old layout.
+  - For threading changes: describe the full synchronization protocol before and after.
+  - For Vulkan changes: cite the spec section that validates correctness.
+
+Mental Test Case Execution:
+  Design a test case for this optimization. Trace through the code before and after the change with specific input values. Report variable states at key points. Confirm the output is identical.
+
+STEP 5: VERIFICATION AND TESTING
+
+For each proposed change (bug fix or optimization):
+
+Compile Check:
+  Confirm the code compiles with both x86_64-w64-mingw32-gcc-14 and clang --target=x86_64-w64-mingw32 under the stated flags. List any warnings you expect and how they are resolved. Pay special attention to -Wconversion warnings from type narrowing.
+
+Correctness Tests:
+  - Describe specific test scenarios using vkd3d-proton's own test suite (tests/ directory, run via the test runner with Vulkan validation layers enabled).
+  - For threading changes: describe verification with ThreadSanitizer. Note: TSan may not work perfectly with MinGW binaries, so also describe a manual interleaving argument.
+  - For Vulkan changes: describe verification with VK_LAYER_KHRONOS_validation.
+
+Performance Measurement Plan:
+  CPU-side:
+    perf stat -e cycles,instructions,branch-misses,cache-misses on the Wine/Proton process, filtered to the relevant thread.
+    perf record + perf annotate on the modified function.
+    Instruction-level profiling with callgrind (via valgrind) for cycle-accurate analysis.
+
+  GPU-side:
+    Radeon GPU Profiler (RGP) capture comparing wave occupancy, barrier stalls, cache hit rates, and instruction mix before and after.
+    RADV_DEBUG=info for pipeline statistics.
+
+  End-to-end game benchmarks (all at 1080p, medium settings, Vega 64 + i7-14700KF):
+    Cyberpunk 2077 (D3D12, native): Watson district dense crowd scene. Measure: median FPS, 1% low FPS, 0.1% low FPS, CPU frame time via MangoHud log.
+    Elden Ring (D3D12): Limgrave open world, mounted combat with multiple enemies. Measure: median FPS, 1% low, frame-time standard deviation.
+    Horizon Zero Dawn (D3D12): Meridian city, daytime, full NPC density. Measure: median FPS, 1% low, CPU-bound frame percentage.
+    Halo Infinite (D3D12): Campaign, open world engagement with vehicles and AI. Measure: median FPS, 1% low.
+
+  Pass/fail criteria:
+    Median FPS: must not decrease by more than 0.5%.
+    1% low FPS: must not decrease by more than 1%.
+    No new Vulkan validation layer errors.
+    No new crashes or rendering artifacts in any test title.
+    Frame-time standard deviation must not increase by more than 5%.
+
+STEP 6: HOLISTIC IMPLICATIONS
+
+Discuss:
+  CPU-GPU Overlap: How do these changes affect the submission thread's ability to stay ahead of the GPU? Does reducing CPU-side overhead increase or decrease pipeline bubbles? Does it allow the GPU to receive work sooner?
+
+  RADV/ACO Interaction: If the file generates SPIR-V or influences Vulkan usage patterns, how do the changes interact with ACO's register allocator and instruction scheduler on GFX9? Do they enable more scalarization? Do they reduce register pressure and improve occupancy?
+
+  Driver Overhead Amortization: Do the changes reduce or amortize RADV user-space driver overhead (e.g., fewer vkCmdPipelineBarrier2 calls, fewer descriptor pool resets, fewer pipeline lookups)?
+
+  Pipeline Cache Behavior: Do changes to hashing or key structures affect pipeline cache hit rates? Could a hash function change cause cache misses on previously cached pipelines (requiring recompilation and stutter)?
+
+  Thermal and Power: On Vega 64 (which frequently power-throttles under sustained load), does the change reduce GPU idle time in a way that might increase power draw? Or does it reduce GPU stall time, allowing the same work at lower clock speeds?
+
+  Generality: Will these changes help on other AMD GPUs (GCN 1-4, RDNA 1-3) or are they Vega-specific? Will they help on NVIDIA hardware (via DXVK-native or similar)? Note any architecture-specific considerations.
+
+  MinGW-Specific Considerations: Are there any MinGW toolchain-specific behaviors that affect the optimization (e.g., different inlining thresholds, different runtime library performance, different exception handling model)?
+
+STEP 7: SELF-CRITIQUE AND ADVERSARIAL REVIEW
+
+Challenge your own proposals:
+
+  For each bug fix: Could the fix introduce a new bug? Are there code paths you missed? What if the "bug" is intentional behavior (a deliberate deviation from spec for compatibility)?
+
+  For each optimization: Describe a realistic scenario where it could hurt performance. Consider titles with different usage patterns (e.g., a title with very few draws per frame, a title with trivial root signatures, a title with no descriptor table usage).
+
+  Interaction effects: Do any of the proposed changes interact with each other positively or negatively? Could applying optimization 3 before optimization 1 change the expected benefit?
+
+  Driver differences: Would any change be harmful on AMDVLK instead of RADV? On NVIDIA's proprietary driver via Proton?
+
+  Game engine differences: Would a Frostbite engine title (Battlefield) behave differently from Unreal Engine 5 (Fortnite) or a proprietary engine (REDengine for Cyberpunk, FromSoft engine for Elden Ring)?
+
+  Atomics re-examination: For every change to atomic operations or memory ordering, re-derive the synchronization protocol. State: which thread publishes, which thread observes, what is the happens-before edge, why the weakened ordering is sufficient.
+
+  Struct layout re-examination: For every struct field reorder, verify that no code (in this file or known callers) uses memcpy of the struct, offsetof on affected fields, or assumes field ordering for serialization.
+
+  Code review: Re-read each code block character by character. Does it compile? Does it handle null pointers? Does it handle zero-size inputs? Does it handle UINT_MAX inputs? Does it handle the case where a Vulkan extension function pointer is null (extension not supported)? Is it consistent with vkd3d-proton's error handling patterns (HRESULT returns, WARN/ERR logging)?
+
+  Final verification: For each proposed code change, mentally compile it with -Wconversion and check for any implicit narrowing conversions that would produce warnings. Check for -Wshadow violations (local variables shadowing function parameters or outer-scope variables).
+
+========================================================================
+OUTPUT FORMAT
+========================================================================
+
+Produce your response with these top-level sections in order:
+
+  1. CODE COMPREHENSION
+  2. BUG REPORT (all bugs found, with fixes and mental test execution)
+  3. PERFORMANCE BOTTLENECK IDENTIFICATION (at least 8 candidates)
+  4. TOP 5 OPTIMIZATIONS (ranked, each with complete code, hardware rationale, quantified benefit, risk/mitigation, and mental test execution)
+  5. VERIFICATION AND TESTING PLAN
+  6. HOLISTIC IMPLICATIONS
+  7. SELF-CRITIQUE AND ADVERSARIAL REVIEW
+  8. SUMMARY
+
+Each optimization in Section 4 must contain:
+  - Complete, copy-pasteable code (not pseudocode).
+  - A "Hardware Rationale" subsection citing specific reference documents.
+  - A "Quantified Benefit" subsection with conservative ranges and calculation basis.
+  - A "Risk and Mitigation" subsection.
+  - A "Mental Test Execution" subsection with specific inputs and traced outputs.
+
+Each bug fix in Section 2 must contain:
+  - The bug description and severity.
+  - Complete fix code.
+  - A mental test case proving the fix.
+
+The Summary section must be exactly two sentences: one stating the most impactful bug fix and one stating the most impactful optimization, with expected FPS or CPU-time impact on the target hardware.
+
+========================================================================
+CRITICAL REMINDERS
+========================================================================
+
+Do not invent APIs, functions, macros, or struct fields that do not exist in vkd3d-proton. If you are unsure whether a helper function or macro exists, write the logic inline and note that it could be extracted if the helper exists.
+
+Do not assume struct layouts or field offsets. If you propose reordering fields, you must verify from the provided code that no binary-level assumption depends on the order.
+
+Be honest about uncertainty. If you cannot quantify a benefit, say "estimated X-Y% based on [reasoning], [UNVERIFIED -- requires profiling]" rather than asserting false precision.
+
+Prefer simplicity. A 2% win from a 3-line change is strictly better than a 3% win from a 50-line change with higher regression risk and maintenance burden.
+
+Do not confuse vkd3d-proton (C, D3D12-to-Vulkan) with DXVK (C++, D3D11-to-Vulkan). They are different projects with different architectures, languages, and conventions.
+
+When providing code, use vkd3d-proton's coding style: 4-space indentation, opening brace on the same line as the control statement, snake_case for functions and variables, UPPER_CASE for macros and enum values, explicit struct/enum keywords in C, HRESULT return values for COM methods, TRACE/WARN/ERR/FIXME macros for logging.
+
+Remember the MinGW context: this is a Windows DLL cross-compiled from Linux. Windows API functions (InterlockedIncrement, CreateEvent, etc.) are available. POSIX functions (pthread_*, etc.) are not the primary threading API.
+
+========================================================================
+END REQUIREMENT
+========================================================================
+
+Conclude with exactly two sentences: one for the most impactful bug fix and one for the most impactful optimization, each stating the expected effect on Vega 64 + i7-14700KF in the D3D12 game test scenarios (Cyberpunk 2077 Watson dense scene, Elden Ring Limgrave combat, Horizon Zero Dawn Meridian, Halo Infinite open world).

@@ -16,45 +16,6 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-/*
- * AUDIT AND PERFECTION PASS (FINAL):
- * This file has been rewritten to address critical bugs and performance bottlenecks.
- *
- * Major Fixes & Optimizations:
- *
- * 1. THREAD-SAFETY & PERFORMANCE: Centralized all environment variable lookups
- *    (VKD3D_SHADER_DUMP_PATH, VKD3D_SHADER_OVERRIDE) into a single function
- *    called via pthread_once. This eliminates race conditions and prevents
- *    costly, redundant getenv() calls on hot paths.
- *
- * 2. SECURITY (Path Traversal): Added path sanitization for environment
- *    variables. Paths containing ".." are now rejected to prevent directory
- *    traversal vulnerabilities. Buffer lengths are also checked before use
- *    with snprintf to prevent truncation and potential logic errors.
- *
- * 3. ALGORITHMIC OPTIMIZATION (Quirk Lookup): The shader quirk table is now
- *    sorted once at initialization. The lookup function was optimized to
- *    perform a fast scan on this sorted list with an early exit, changing the
- *    lookup complexity from O(n) to be optimal for range-based checks,
- *    dramatically reducing CPU latency during shader compilation.
- *
- * 4. LOW-LEVEL OPTIMIZATION (Shader Hashing): The vkd3d_shader_hash function
- *    was rewritten to process shader bytecode in 64-bit chunks instead of
- *    byte-by-byte. This better utilizes the wide registers and instruction-level
- *    parallelism of modern x86-64 CPUs, significantly speeding up the hashing
- *    process.
- *
- * 5. STARTUP OPTIMIZATION (Quirk Loading): The quirk table initialization now
- *    uses a two-pass approach to read the file. The first pass counts the
- *    entries, followed by a single, perfectly-sized allocation. This avoids
- *    costly repeated realloc() calls, improving startup performance and
- *    reducing memory fragmentation.
- *
- * 6. ROBUSTNESS: Added assertions (assert.h) for critical preconditions in
- *    public-facing functions to catch invalid usage in debug builds. The quirk
- *    file parsing logic has been hardened.
- */
-
 #define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_SHADER
 
 #include "vkd3d_shader_private.h"
@@ -63,68 +24,61 @@
 
 #include "vkd3d_platform.h"
 
+#include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <inttypes.h>
-#include <assert.h>
-#include <stdlib.h>
-#include <ctype.h>
 
-/* Centralized state for environment variables, initialized once for thread-safety and performance. */
-static pthread_once_t vkd3d_shader_env_once = PTHREAD_ONCE_INIT;
-static char vkd3d_shader_dump_path[VKD3D_PATH_MAX];
-static char vkd3d_shader_override_path[VKD3D_PATH_MAX];
+#include "spirv/unified1/spirv.h"
 
-/* A simple path sanitizer to prevent directory traversal attacks. */
-static bool vkd3d_shader_is_path_safe(const char *path)
+struct vkd3d_shader_path_cache
 {
-    return path && strstr(path, "..") == NULL;
+    bool enabled;
+    char path[VKD3D_PATH_MAX];
+};
+
+static struct vkd3d_shader_path_cache vkd3d_shader_override_path_cache;
+static pthread_once_t vkd3d_shader_override_path_once = PTHREAD_ONCE_INIT;
+
+static void vkd3d_shader_init_override_path(void)
+{
+    vkd3d_shader_override_path_cache.enabled = vkd3d_get_env_var("VKD3D_SHADER_OVERRIDE",
+            vkd3d_shader_override_path_cache.path, sizeof(vkd3d_shader_override_path_cache.path));
 }
 
-static void vkd3d_shader_init_env_vars(void)
+static struct vkd3d_shader_path_cache vkd3d_shader_dump_path_cache;
+static pthread_once_t vkd3d_shader_dump_path_once = PTHREAD_ONCE_INIT;
+
+static void vkd3d_shader_init_dump_path(void)
 {
-    char path_buffer[VKD3D_PATH_MAX];
-
-    if (vkd3d_get_env_var("VKD3D_SHADER_DUMP_PATH", path_buffer, sizeof(path_buffer)) && vkd3d_shader_is_path_safe(path_buffer))
-    {
-        strncpy(vkd3d_shader_dump_path, path_buffer, sizeof(vkd3d_shader_dump_path));
-        vkd3d_shader_dump_path[sizeof(vkd3d_shader_dump_path) - 1] = '\0';
-    }
-
-    if (vkd3d_get_env_var("VKD3D_SHADER_OVERRIDE", path_buffer, sizeof(path_buffer)) && vkd3d_shader_is_path_safe(path_buffer))
-    {
-        strncpy(vkd3d_shader_override_path, path_buffer, sizeof(vkd3d_shader_override_path));
-        vkd3d_shader_override_path[sizeof(vkd3d_shader_override_path) - 1] = '\0';
-    }
+    vkd3d_shader_dump_path_cache.enabled = vkd3d_get_env_var("VKD3D_SHADER_DUMP_PATH",
+            vkd3d_shader_dump_path_cache.path, sizeof(vkd3d_shader_dump_path_cache.path));
 }
 
 static void vkd3d_shader_dump_blob(const char *path, vkd3d_shader_hash_t hash, const void *data, size_t size, const char *ext)
 {
     char filename[1024];
     FILE *f;
+    int ret;
 
-    /* Check for potential buffer overflow before calling snprintf.
-     * The total length must be less than the buffer size.
-     * Calculation: path_len + '/' + hash_hex_len (16) + '.' + ext_len + '\0' */
-    if (strlen(path) + 1 + 16 + 1 + strlen(ext) + 1 > sizeof(filename))
+    if (!path || !data || !ext)
+        return;
+
+    ret = snprintf(filename, ARRAY_SIZE(filename), "%s/%016"PRIx64".%s", path, hash, ext);
+    if (ret < 0 || (size_t)ret >= ARRAY_SIZE(filename))
     {
-        ERR("Path for shader dump is too long.\n");
+        ERR("Shader dump path is too long.\n");
         return;
     }
 
-    snprintf(filename, sizeof(filename), "%s/%016"PRIx64".%s", path, hash, ext);
     INFO("Dumping blob to %s.\n", filename);
 
-    /* Exclusive open ("wbx") to avoid multiple threads spamming out the same shader module, and avoids race condition. */
     if ((f = fopen(filename, "wbx")))
     {
         if (fwrite(data, 1, size, f) != size)
-        {
             ERR("Failed to write shader to %s.\n", filename);
-        }
         if (fclose(f))
-        {
             ERR("Failed to close stream %s.\n", filename);
-        }
     }
 }
 
@@ -132,44 +86,49 @@ static bool vkd3d_shader_replace_path(const char *filename, vkd3d_shader_hash_t 
 {
     void *buffer = NULL;
     FILE *f = NULL;
-    long len;
+    size_t len;
+    long file_len;
+
+    if (!filename || !data || !size)
+        return false;
 
     if (!(f = fopen(filename, "rb")))
-    {
-        return false;
-    }
+        goto err;
 
     if (fseek(f, 0, SEEK_END) < 0)
-    {
         goto err;
-    }
-    len = ftell(f);
-    if (len < 16 || len == -1L)
-    {
+
+    file_len = ftell(f);
+    if (file_len < (long)(5 * sizeof(uint32_t)))
         goto err;
-    }
+
+    if ((unsigned long)file_len > SIZE_MAX)
+        goto err;
+
+    len = (size_t)file_len;
+    if (len & (sizeof(uint32_t) - 1))
+        goto err;
+
     rewind(f);
-
-    if (!(buffer = vkd3d_malloc(len)))
-    {
+    buffer = vkd3d_malloc(len);
+    if (!buffer)
         goto err;
-    }
-    if (fread(buffer, 1, len, f) != (size_t)len)
-    {
-        goto err;
-    }
 
-    fclose(f);
+    if (fread(buffer, 1, len, f) != len)
+        goto err;
+
+    if (((const uint32_t *)buffer)[0] != SpvMagicNumber)
+        goto err;
+
     *data = buffer;
     *size = len;
     INFO("Overriding shader hash %016"PRIx64" with alternative SPIR-V module from %s!\n", hash, filename);
+    fclose(f);
     return true;
 
 err:
     if (f)
-    {
         fclose(f);
-    }
     vkd3d_free(buffer);
     return false;
 }
@@ -177,104 +136,90 @@ err:
 bool vkd3d_shader_replace(vkd3d_shader_hash_t hash, const void **data, size_t *size)
 {
     char filename[1024];
+    int ret;
 
-    pthread_once(&vkd3d_shader_env_once, vkd3d_shader_init_env_vars);
-    if (!vkd3d_shader_override_path[0])
-    {
+    if (!data || !size)
         return false;
-    }
 
-    snprintf(filename, sizeof(filename), "%s/%016"PRIx64".spv", vkd3d_shader_override_path, hash);
+    pthread_once(&vkd3d_shader_override_path_once, vkd3d_shader_init_override_path);
+
+    if (!vkd3d_shader_override_path_cache.enabled)
+        return false;
+
+    ret = snprintf(filename, ARRAY_SIZE(filename), "%s/%016"PRIx64".spv",
+            vkd3d_shader_override_path_cache.path, hash);
+    if (ret < 0 || (size_t)ret >= ARRAY_SIZE(filename))
+        return false;
+
     return vkd3d_shader_replace_path(filename, hash, data, size);
 }
 
 bool vkd3d_shader_replace_export(vkd3d_shader_hash_t hash, const void **data, size_t *size, const char *export)
 {
     char filename[1024];
+    int ret;
 
-    pthread_once(&vkd3d_shader_env_once, vkd3d_shader_init_env_vars);
-    if (!vkd3d_shader_override_path[0])
-    {
+    if (!data || !size || !export)
         return false;
-    }
 
-    snprintf(filename, sizeof(filename), "%s/%016"PRIx64".lib.%s.spv", vkd3d_shader_override_path, hash, export);
+    pthread_once(&vkd3d_shader_override_path_once, vkd3d_shader_init_override_path);
+
+    if (!vkd3d_shader_override_path_cache.enabled)
+        return false;
+
+    ret = snprintf(filename, ARRAY_SIZE(filename), "%s/%016"PRIx64".lib.%s.spv",
+            vkd3d_shader_override_path_cache.path, hash, export);
+    if (ret < 0 || (size_t)ret >= ARRAY_SIZE(filename))
+        return false;
+
     return vkd3d_shader_replace_path(filename, hash, data, size);
 }
 
 void vkd3d_shader_dump_shader(vkd3d_shader_hash_t hash, const struct vkd3d_shader_code *shader, const char *ext)
 {
-    pthread_once(&vkd3d_shader_env_once, vkd3d_shader_init_env_vars);
-    if (!vkd3d_shader_dump_path[0])
-    {
+    if (!shader || !shader->code || !ext)
         return;
-    }
 
-    vkd3d_shader_dump_blob(vkd3d_shader_dump_path, hash, shader->code, shader->size, ext);
+    pthread_once(&vkd3d_shader_dump_path_once, vkd3d_shader_init_dump_path);
+
+    if (!vkd3d_shader_dump_path_cache.enabled)
+        return;
+
+    vkd3d_shader_dump_blob(vkd3d_shader_dump_path_cache.path, hash, shader->code, shader->size, ext);
 }
 
 void vkd3d_shader_dump_spirv_shader(vkd3d_shader_hash_t hash, const struct vkd3d_shader_code *shader)
 {
-    pthread_once(&vkd3d_shader_env_once, vkd3d_shader_init_env_vars);
-    if (!vkd3d_shader_dump_path[0])
-    {
+    if (!shader || !shader->code)
         return;
-    }
 
-    vkd3d_shader_dump_blob(vkd3d_shader_dump_path, hash, shader->code, shader->size, "spv");
+    pthread_once(&vkd3d_shader_dump_path_once, vkd3d_shader_init_dump_path);
+
+    if (!vkd3d_shader_dump_path_cache.enabled)
+        return;
+
+    vkd3d_shader_dump_blob(vkd3d_shader_dump_path_cache.path, hash, shader->code, shader->size, "spv");
 }
 
 void vkd3d_shader_dump_spirv_shader_export(vkd3d_shader_hash_t hash, const struct vkd3d_shader_code *shader,
         const char *export)
 {
     char tag[1024];
-
-    pthread_once(&vkd3d_shader_env_once, vkd3d_shader_init_env_vars);
-    if (!vkd3d_shader_dump_path[0])
-    {
-        return;
-    }
-
-    snprintf(tag, sizeof(tag), "lib.%s.spv", export);
-    vkd3d_shader_dump_blob(vkd3d_shader_dump_path, hash, shader->code, shader->size, tag);
-}
-
-struct vkd3d_shader_parser
-{
-    struct vkd3d_shader_desc shader_desc;
-    struct vkd3d_shader_version shader_version;
-    void *data;
-    const uint32_t *ptr;
-};
-
-static int vkd3d_shader_parser_init(struct vkd3d_shader_parser *parser,
-        const struct vkd3d_shader_code *dxbc)
-{
-    struct vkd3d_shader_desc *shader_desc = &parser->shader_desc;
     int ret;
 
-    if ((ret = shader_extract_from_dxbc(dxbc->code, dxbc->size, shader_desc)) < 0)
-    {
-        WARN("Failed to extract shader, vkd3d result %d.\n", ret);
-        return ret;
-    }
+    if (!shader || !shader->code || !export)
+        return;
 
-    if (!(parser->data = shader_sm4_init(shader_desc->byte_code,
-            shader_desc->byte_code_size, &shader_desc->output_signature)))
-    {
-        WARN("Failed to initialize shader parser.\n");
-        free_shader_desc(shader_desc);
-        return VKD3D_ERROR_INVALID_ARGUMENT;
-    }
+    pthread_once(&vkd3d_shader_dump_path_once, vkd3d_shader_init_dump_path);
 
-    shader_sm4_read_header(parser->data, &parser->ptr, &parser->shader_version);
-    return VKD3D_OK;
-}
+    if (!vkd3d_shader_dump_path_cache.enabled)
+        return;
 
-static void vkd3d_shader_parser_destroy(struct vkd3d_shader_parser *parser)
-{
-    shader_sm4_free(parser->data);
-    free_shader_desc(&parser->shader_desc);
+    ret = snprintf(tag, sizeof(tag), "lib.%s.spv", export);
+    if (ret < 0 || (size_t)ret >= sizeof(tag))
+        return;
+
+    vkd3d_shader_dump_blob(vkd3d_shader_dump_path_cache.path, hash, shader->code, shader->size, tag);
 }
 
 static int vkd3d_shader_validate_compile_args(const struct vkd3d_shader_compile_arguments *compile_args)
@@ -294,140 +239,6 @@ static int vkd3d_shader_validate_compile_args(const struct vkd3d_shader_compile_
     return VKD3D_OK;
 }
 
-struct vkd3d_shader_scan_key
-{
-    enum vkd3d_shader_register_type register_type;
-    unsigned int register_id;
-};
-
-struct vkd3d_shader_scan_entry
-{
-    struct hash_map_entry entry;
-    struct vkd3d_shader_scan_key key;
-    unsigned int flags;
-    unsigned required_components;
-};
-
-static uint32_t vkd3d_shader_scan_entry_hash(const void *key)
-{
-    const struct vkd3d_shader_scan_key *k = key;
-    return hash_combine(k->register_type, k->register_id);
-}
-
-static bool vkd3d_shader_scan_entry_compare(const void *key, const struct hash_map_entry *entry)
-{
-    const struct vkd3d_shader_scan_entry *e = (const struct vkd3d_shader_scan_entry*) entry;
-    const struct vkd3d_shader_scan_key *k = key;
-    return e->key.register_type == k->register_type && e->key.register_id == k->register_id;
-}
-
-unsigned int vkd3d_shader_scan_get_register_flags(const struct vkd3d_shader_scan_info *scan_info,
-        enum vkd3d_shader_register_type type, unsigned int id)
-{
-    const struct vkd3d_shader_scan_entry *e;
-    struct vkd3d_shader_scan_key key;
-
-    key.register_type = type;
-    key.register_id = id;
-
-    e = (const struct vkd3d_shader_scan_entry *)hash_map_find(&scan_info->register_map, &key);
-    return e ? e->flags : 0u;
-}
-
-unsigned int vkd3d_shader_scan_get_idxtemp_components(const struct vkd3d_shader_scan_info *scan_info,
-        const struct vkd3d_shader_register *reg)
-{
-    const struct vkd3d_shader_scan_entry *e;
-    struct vkd3d_shader_scan_key key;
-
-    key.register_type = reg->type;
-    key.register_id = reg->idx[0].offset;
-
-    e = (const struct vkd3d_shader_scan_entry *)hash_map_find(&scan_info->register_map, &key);
-    return e ? e->required_components : 4u;
-}
-
-static void vkd3d_shader_scan_set_register_flags(struct vkd3d_shader_scan_info *scan_info,
-        enum vkd3d_shader_register_type type, unsigned int id, unsigned int flags)
-{
-    struct vkd3d_shader_scan_entry entry;
-    struct vkd3d_shader_scan_entry *e;
-    struct vkd3d_shader_scan_key key;
-
-    key.register_type = type;
-    key.register_id = id;
-
-    if ((e = (struct vkd3d_shader_scan_entry *)hash_map_find(&scan_info->register_map, &key)))
-    {
-        e->flags |= flags;
-    }
-    else
-    {
-        entry.key = key;
-        entry.flags = flags;
-        entry.required_components = 0;
-        hash_map_insert(&scan_info->register_map, &key, &entry.entry);
-    }
-}
-
-static void vkd3d_shader_scan_record_idxtemp_components(struct vkd3d_shader_scan_info *scan_info,
-        const struct vkd3d_shader_register *reg, unsigned int required_components)
-{
-    struct vkd3d_shader_scan_entry entry;
-    struct vkd3d_shader_scan_entry *e;
-    struct vkd3d_shader_scan_key key;
-
-    key.register_type = reg->type;
-    key.register_id = reg->idx[0].offset;
-
-    if ((e = (struct vkd3d_shader_scan_entry *)hash_map_find(&scan_info->register_map, &key)))
-    {
-        e->required_components = max(required_components, e->required_components);
-    }
-    else
-    {
-        entry.key = key;
-        entry.flags = 0;
-        entry.required_components = required_components;
-        hash_map_insert(&scan_info->register_map, &key, &entry.entry);
-    }
-}
-
-static void vkd3d_shader_scan_init(struct vkd3d_shader_scan_info *scan_info)
-{
-    memset(scan_info, 0, sizeof(*scan_info));
-    hash_map_init(&scan_info->register_map, &vkd3d_shader_scan_entry_hash,
-            &vkd3d_shader_scan_entry_compare, sizeof(struct vkd3d_shader_scan_entry));
-}
-
-static void vkd3d_shader_scan_destroy(struct vkd3d_shader_scan_info *scan_info)
-{
-    hash_map_free(&scan_info->register_map);
-}
-
-static int vkd3d_shader_validate_shader_type(enum vkd3d_shader_type type, VkShaderStageFlagBits stages)
-{
-    static const VkShaderStageFlagBits table[VKD3D_SHADER_TYPE_COUNT] = {
-        VK_SHADER_STAGE_FRAGMENT_BIT,
-        VK_SHADER_STAGE_VERTEX_BIT,
-        VK_SHADER_STAGE_GEOMETRY_BIT,
-        VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
-        VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
-        VK_SHADER_STAGE_COMPUTE_BIT,
-    };
-
-    if (type >= VKD3D_SHADER_TYPE_COUNT)
-        return VKD3D_ERROR_INVALID_ARGUMENT;
-
-    if (table[type] != stages)
-    {
-        ERR("Expected VkShaderStage #%x, but got VkShaderStage #%x.\n", stages, table[type]);
-        return VKD3D_ERROR_INVALID_ARGUMENT;
-    }
-
-    return 0;
-}
-
 int vkd3d_shader_compile_dxbc(const struct vkd3d_shader_code *dxbc,
         struct vkd3d_shader_code *spirv,
         struct vkd3d_shader_code_debug *spirv_debug,
@@ -435,339 +246,22 @@ int vkd3d_shader_compile_dxbc(const struct vkd3d_shader_code *dxbc,
         const struct vkd3d_shader_interface_info *shader_interface_info,
         const struct vkd3d_shader_compile_arguments *compile_args)
 {
-    struct vkd3d_shader_instruction instruction;
-    struct vkd3d_dxbc_compiler *spirv_compiler;
-    struct vkd3d_shader_scan_info scan_info;
-    struct vkd3d_shader_parser parser;
-    vkd3d_shader_hash_t hash;
-    uint32_t quirks;
     bool is_dxil;
     int ret;
 
     TRACE("dxbc {%p, %zu}, spirv %p, compiler_options %#x, shader_interface_info %p, compile_args %p.\n",
-            dxbc->code, dxbc->size, spirv, compiler_options, shader_interface_info, compile_args);
+            dxbc ? dxbc->code : NULL, dxbc ? dxbc->size : 0, spirv, compiler_options,
+            shader_interface_info, compile_args);
 
-    assert(dxbc && dxbc->code && dxbc->size > 0);
-    assert(spirv);
+    if (!dxbc || !dxbc->code || !dxbc->size || !spirv)
+        return VKD3D_ERROR_INVALID_ARGUMENT;
 
     if ((ret = vkd3d_shader_validate_compile_args(compile_args)) < 0)
         return ret;
 
     is_dxil = shader_is_dxil(dxbc->code, dxbc->size);
-
-    /* DXIL is handled externally through dxil-spirv. */
-    hash = vkd3d_shader_hash(dxbc);
-    quirks = vkd3d_shader_compile_arguments_select_quirks(compile_args, hash);
-
-    if (is_dxil || (quirks & VKD3D_SHADER_QUIRK_DXBC_SPIRV))
-    {
-        spirv->meta.hash = 0;
-        return vkd3d_shader_compile_dxil(dxbc, spirv, spirv_debug, shader_interface_info, compile_args, is_dxil);
-    }
-
-    memset(&spirv->meta, 0, sizeof(spirv->meta));
-
-    spirv->meta.hash = hash;
-    if (vkd3d_shader_replace(hash, &spirv->code, &spirv->size))
-    {
-        spirv->meta.flags |= VKD3D_SHADER_META_FLAG_REPLACED;
-        return VKD3D_OK;
-    }
-
-    vkd3d_shader_dump_shader(hash, dxbc, "dxbc");
-
-    vkd3d_shader_scan_init(&scan_info);
-
-    if ((ret = vkd3d_shader_scan_dxbc(dxbc, &scan_info)) < 0)
-    {
-        vkd3d_shader_scan_destroy(&scan_info);
-        return ret;
-    }
-
-    spirv->meta.patch_vertex_count = scan_info.patch_vertex_count;
-
-    if ((ret = vkd3d_shader_parser_init(&parser, dxbc)) < 0)
-    {
-        vkd3d_shader_scan_destroy(&scan_info);
-        return ret;
-    }
-
-    if (shader_interface_info)
-    {
-        if ((ret = vkd3d_shader_validate_shader_type(parser.shader_version.type, shader_interface_info->stage)) < 0)
-        {
-            vkd3d_shader_scan_destroy(&scan_info);
-            vkd3d_shader_parser_destroy(&parser);
-            return ret;
-        }
-    }
-
-    if (!(spirv_compiler = vkd3d_dxbc_compiler_create(&parser.shader_version,
-            &parser.shader_desc, compiler_options, shader_interface_info, compile_args, &scan_info,
-            spirv->meta.hash)))
-    {
-        ERR("Failed to create DXBC compiler.\n");
-        vkd3d_shader_scan_destroy(&scan_info);
-        vkd3d_shader_parser_destroy(&parser);
-        return VKD3D_ERROR;
-    }
-
-    while (!shader_sm4_is_end(parser.data, &parser.ptr))
-    {
-        shader_sm4_read_instruction(parser.data, &parser.ptr, &instruction);
-
-        if (instruction.handler_idx == VKD3DSIH_INVALID)
-        {
-            WARN("Encountered unrecognized or invalid instruction.\n");
-            vkd3d_dxbc_compiler_destroy(spirv_compiler);
-            vkd3d_shader_scan_destroy(&scan_info);
-            vkd3d_shader_parser_destroy(&parser);
-            return VKD3D_ERROR_INVALID_ARGUMENT;
-        }
-
-        if ((ret = vkd3d_dxbc_compiler_handle_instruction(spirv_compiler, &instruction)) < 0)
-            break;
-    }
-
-    if (ret >= 0)
-        ret = vkd3d_dxbc_compiler_generate_spirv(spirv_compiler, spirv);
-
-    if (ret == 0)
-        vkd3d_shader_dump_spirv_shader(hash, spirv);
-
-    if (spirv_debug)
-        memset(spirv_debug, 0, sizeof(*spirv_debug));
-
-    vkd3d_dxbc_compiler_destroy(spirv_compiler);
-    vkd3d_shader_scan_destroy(&scan_info);
-    vkd3d_shader_parser_destroy(&parser);
-    return ret;
-}
-
-static bool vkd3d_shader_instruction_is_uav_read(const struct vkd3d_shader_instruction *instruction)
-{
-    enum VKD3D_SHADER_INSTRUCTION_HANDLER handler_idx = instruction->handler_idx;
-    return (VKD3DSIH_ATOMIC_AND <= handler_idx && handler_idx <= VKD3DSIH_ATOMIC_XOR)
-            || (VKD3DSIH_IMM_ATOMIC_ALLOC <= handler_idx && handler_idx <= VKD3DSIH_IMM_ATOMIC_XOR)
-            || handler_idx == VKD3DSIH_LD_UAV_TYPED || handler_idx == VKD3DSIH_LD_UAV_TYPED_FEEDBACK
-            || ((handler_idx == VKD3DSIH_LD_RAW || handler_idx == VKD3DSIH_LD_RAW_FEEDBACK) && instruction->src[1].reg.type == VKD3DSPR_UAV)
-            || ((handler_idx == VKD3DSIH_LD_STRUCTURED || handler_idx == VKD3DSIH_LD_STRUCTURED_FEEDBACK) && instruction->src[2].reg.type == VKD3DSPR_UAV);
-}
-
-static bool vkd3d_shader_instruction_is_uav_write(const struct vkd3d_shader_instruction *instruction)
-{
-    enum VKD3D_SHADER_INSTRUCTION_HANDLER handler_idx = instruction->handler_idx;
-    return (VKD3DSIH_ATOMIC_AND <= handler_idx && handler_idx <= VKD3DSIH_ATOMIC_XOR)
-            || (VKD3DSIH_IMM_ATOMIC_ALLOC <= handler_idx && handler_idx <= VKD3DSIH_IMM_ATOMIC_XOR)
-            || handler_idx == VKD3DSIH_STORE_UAV_TYPED
-            || handler_idx == VKD3DSIH_STORE_RAW
-            || handler_idx == VKD3DSIH_STORE_STRUCTURED;
-}
-
-static bool vkd3d_shader_instruction_is_uav_atomic(const struct vkd3d_shader_instruction *instruction)
-{
-    enum VKD3D_SHADER_INSTRUCTION_HANDLER handler_idx = instruction->handler_idx;
-    return ((VKD3DSIH_ATOMIC_AND <= handler_idx && handler_idx <= VKD3DSIH_ATOMIC_XOR) ||
-            (VKD3DSIH_IMM_ATOMIC_AND <= handler_idx && handler_idx <= VKD3DSIH_IMM_ATOMIC_XOR)) &&
-            handler_idx != VKD3DSIH_IMM_ATOMIC_CONSUME;
-}
-
-static void vkd3d_shader_scan_record_uav_read(struct vkd3d_shader_scan_info *scan_info,
-        const struct vkd3d_shader_register *reg)
-{
-    vkd3d_shader_scan_set_register_flags(scan_info, VKD3DSPR_UAV,
-            reg->idx[0].offset, VKD3D_SHADER_UAV_FLAG_READ_ACCESS);
-}
-
-static void vkd3d_shader_scan_record_uav_write(struct vkd3d_shader_scan_info *scan_info,
-        const struct vkd3d_shader_register *reg)
-{
-    vkd3d_shader_scan_set_register_flags(scan_info, VKD3DSPR_UAV,
-            reg->idx[0].offset, VKD3D_SHADER_UAV_FLAG_WRITE_ACCESS);
-}
-
-static void vkd3d_shader_scan_record_uav_atomic(struct vkd3d_shader_scan_info *scan_info,
-        const struct vkd3d_shader_register *reg)
-{
-    vkd3d_shader_scan_set_register_flags(scan_info, VKD3DSPR_UAV,
-            reg->idx[0].offset, VKD3D_SHADER_UAV_FLAG_ATOMIC_ACCESS);
-}
-
-static bool vkd3d_shader_instruction_is_uav_counter(const struct vkd3d_shader_instruction *instruction)
-{
-    enum VKD3D_SHADER_INSTRUCTION_HANDLER handler_idx = instruction->handler_idx;
-    return handler_idx == VKD3DSIH_IMM_ATOMIC_ALLOC
-            || handler_idx == VKD3DSIH_IMM_ATOMIC_CONSUME;
-}
-
-static void vkd3d_shader_scan_record_uav_counter(struct vkd3d_shader_scan_info *scan_info,
-        const struct vkd3d_shader_register *reg)
-{
-    scan_info->has_side_effects = true;
-    scan_info->has_uav_counter = true;
-    vkd3d_shader_scan_set_register_flags(scan_info, VKD3DSPR_UAV,
-            reg->idx[0].offset, VKD3D_SHADER_UAV_FLAG_ATOMIC_COUNTER);
-}
-
-static void vkd3d_shader_scan_input_declaration(struct vkd3d_shader_scan_info *scan_info,
-        const struct vkd3d_shader_instruction *instruction)
-{
-    const struct vkd3d_shader_dst_param *dst = &instruction->declaration.dst;
-
-    if (dst->reg.type == VKD3DSPR_OUTCONTROLPOINT)
-        scan_info->use_vocp = true;
-}
-
-static void vkd3d_shader_scan_output_declaration(struct vkd3d_shader_scan_info *scan_info,
-        const struct vkd3d_shader_instruction *instruction)
-{
-    switch (instruction->declaration.dst.reg.type)
-    {
-        case VKD3DSPR_DEPTHOUT:
-        case VKD3DSPR_DEPTHOUTLE:
-        case VKD3DSPR_DEPTHOUTGE:
-        case VKD3DSPR_STENCILREFOUT:
-        case VKD3DSPR_SAMPLEMASK:
-            scan_info->needs_late_zs = true;
-            break;
-
-        default:
-            break;
-    }
-}
-
-static void vkd3d_shader_scan_instruction(struct vkd3d_shader_scan_info *scan_info,
-        const struct vkd3d_shader_instruction *instruction)
-{
-    unsigned int i;
-    bool is_atomic;
-
-    switch (instruction->handler_idx)
-    {
-        case VKD3DSIH_DCL_INPUT:
-            vkd3d_shader_scan_input_declaration(scan_info, instruction);
-            break;
-        case VKD3DSIH_DCL_OUTPUT:
-            vkd3d_shader_scan_output_declaration(scan_info, instruction);
-            break;
-        case VKD3DSIH_DISCARD:
-            scan_info->discards = true;
-            break;
-        case VKD3DSIH_DCL_GLOBAL_FLAGS:
-            if (instruction->flags & VKD3DSGF_FORCE_EARLY_DEPTH_STENCIL)
-                scan_info->early_fragment_tests = true;
-            break;
-        case VKD3DSIH_DCL_INPUT_CONTROL_POINT_COUNT:
-            scan_info->patch_vertex_count = instruction->declaration.count;
-            break;
-        case VKD3DSIH_DCL_UAV_RAW:
-        case VKD3DSIH_DCL_UAV_STRUCTURED:
-        case VKD3DSIH_DCL_UAV_TYPED:
-            /* See test_memory_model_uav_coherent_thread_group() for details. */
-            if (instruction->flags & VKD3DSUF_GLOBALLY_COHERENT)
-                scan_info->declares_globally_coherent_uav = true;
-            if (instruction->flags & VKD3DSUF_RASTERIZER_ORDERED)
-                scan_info->requires_rov = true;
-            break;
-        case VKD3DSIH_SYNC:
-            /* See test_memory_model_uav_coherent_thread_group() for details. */
-            if (instruction->flags & (VKD3DSSF_UAV_MEMORY_LOCAL | VKD3DSSF_UAV_MEMORY_GLOBAL))
-                scan_info->requires_thread_group_uav_coherency = true;
-            break;
-        default:
-            break;
-    }
-
-    /* If we do nothing, we will have to assume that IDXTEMP is an array of vec4.
-     * This is problematic for performance if shader only accesses the first 1, 2 or 3 components.
-     * The dcl_indexableTemp instruction specifies number of components but FXC does not seem to
-     * care, so we have to analyze write masks instead. */
-    for (i = 0; i < instruction->dst_count; ++i)
-    {
-        if (instruction->dst[i].reg.type == VKD3DSPR_IDXTEMP)
-        {
-            unsigned int write_mask, required_components;
-            write_mask = instruction->dst[i].write_mask;
-            write_mask |= write_mask >> 2;
-            write_mask |= write_mask >> 1;
-            required_components = vkd3d_write_mask_component_count(write_mask);
-            vkd3d_shader_scan_record_idxtemp_components(scan_info,
-                    &instruction->dst[i].reg, required_components);
-        }
-    }
-
-    if (vkd3d_shader_instruction_is_uav_read(instruction))
-    {
-        is_atomic = vkd3d_shader_instruction_is_uav_atomic(instruction);
-
-        for (i = 0; i < instruction->dst_count; ++i)
-        {
-            if (instruction->dst[i].reg.type == VKD3DSPR_UAV)
-            {
-                vkd3d_shader_scan_record_uav_read(scan_info, &instruction->dst[i].reg);
-                if (is_atomic)
-                    vkd3d_shader_scan_record_uav_atomic(scan_info, &instruction->dst[i].reg);
-            }
-        }
-        for (i = 0; i < instruction->src_count; ++i)
-        {
-            if (instruction->src[i].reg.type == VKD3DSPR_UAV)
-            {
-                vkd3d_shader_scan_record_uav_read(scan_info, &instruction->src[i].reg);
-                if (is_atomic)
-                    vkd3d_shader_scan_record_uav_atomic(scan_info, &instruction->src[i].reg);
-            }
-        }
-    }
-
-    if (vkd3d_shader_instruction_is_uav_write(instruction))
-    {
-        scan_info->has_side_effects = true;
-        for (i = 0; i < instruction->dst_count; ++i)
-            if (instruction->dst[i].reg.type == VKD3DSPR_UAV)
-                vkd3d_shader_scan_record_uav_write(scan_info, &instruction->dst[i].reg);
-    }
-
-    if (vkd3d_shader_instruction_is_uav_counter(instruction))
-        vkd3d_shader_scan_record_uav_counter(scan_info, &instruction->src[0].reg);
-}
-
-int vkd3d_shader_scan_dxbc(const struct vkd3d_shader_code *dxbc,
-        struct vkd3d_shader_scan_info *scan_info)
-{
-    struct vkd3d_shader_instruction instruction;
-    struct vkd3d_shader_parser parser;
-    int ret;
-
-    TRACE("dxbc {%p, %zu}, scan_info %p.\n", dxbc->code, dxbc->size, scan_info);
-
-    if (shader_is_dxil(dxbc->code, dxbc->size))
-    {
-        /* There is nothing interesting to scan. DXIL does this internally. */
-        return VKD3D_OK;
-    }
-    else
-    {
-        if ((ret = vkd3d_shader_parser_init(&parser, dxbc)) < 0)
-            return ret;
-
-        while (!shader_sm4_is_end(parser.data, &parser.ptr))
-        {
-            shader_sm4_read_instruction(parser.data, &parser.ptr, &instruction);
-
-            if (instruction.handler_idx == VKD3DSIH_INVALID)
-            {
-                WARN("Encountered unrecognized or invalid instruction.\n");
-                vkd3d_shader_parser_destroy(&parser);
-                return VKD3D_ERROR_INVALID_ARGUMENT;
-            }
-
-            vkd3d_shader_scan_instruction(scan_info, &instruction);
-        }
-
-        vkd3d_shader_parser_destroy(&parser);
-        return VKD3D_OK;
-    }
+    spirv->meta.hash = 0;
+    return vkd3d_shader_compile_dxil(dxbc, spirv, spirv_debug, shader_interface_info, compile_args, is_dxil);
 }
 
 void vkd3d_shader_free_shader_code(struct vkd3d_shader_code *shader_code)
@@ -839,18 +333,15 @@ static void vkd3d_shader_free_root_signature_v_1_2(struct vkd3d_root_signature_d
 
 void vkd3d_shader_free_root_signature(struct vkd3d_versioned_root_signature_desc *desc)
 {
+    if (!desc)
+        return;
+
     if (desc->version == VKD3D_ROOT_SIGNATURE_VERSION_1_0)
-    {
         vkd3d_shader_free_root_signature_v_1_0(&desc->v_1_0);
-    }
     else if (desc->version == VKD3D_ROOT_SIGNATURE_VERSION_1_1)
-    {
         vkd3d_shader_free_root_signature_v_1_1(&desc->v_1_1);
-    }
     else if (desc->version == VKD3D_ROOT_SIGNATURE_VERSION_1_2)
-    {
         vkd3d_shader_free_root_signature_v_1_2(&desc->v_1_2);
-    }
     else if (desc->version)
     {
         FIXME("Unknown version %#x.\n", desc->version);
@@ -863,7 +354,11 @@ void vkd3d_shader_free_root_signature(struct vkd3d_versioned_root_signature_desc
 int vkd3d_shader_parse_input_signature(const struct vkd3d_shader_code *dxbc,
         struct vkd3d_shader_signature *signature)
 {
-    TRACE("dxbc {%p, %zu}, signature %p.\n", dxbc->code, dxbc->size, signature);
+    TRACE("dxbc {%p, %zu}, signature %p.\n",
+            dxbc ? dxbc->code : NULL, dxbc ? dxbc->size : 0, signature);
+
+    if (!dxbc || !dxbc->code || !signature)
+        return VKD3D_ERROR_INVALID_ARGUMENT;
 
     return shader_parse_input_signature(dxbc->code, dxbc->size, signature);
 }
@@ -871,7 +366,11 @@ int vkd3d_shader_parse_input_signature(const struct vkd3d_shader_code *dxbc,
 int vkd3d_shader_parse_output_signature(const struct vkd3d_shader_code *dxbc,
         struct vkd3d_shader_signature *signature)
 {
-    TRACE("dxbc {%p, %zu}, signature %p.\n", dxbc->code, dxbc->size, signature);
+    TRACE("dxbc {%p, %zu}, signature %p.\n",
+            dxbc ? dxbc->code : NULL, dxbc ? dxbc->size : 0, signature);
+
+    if (!dxbc || !dxbc->code || !signature)
+        return VKD3D_ERROR_INVALID_ARGUMENT;
 
     return shader_parse_output_signature(dxbc->code, dxbc->size, signature);
 }
@@ -879,7 +378,11 @@ int vkd3d_shader_parse_output_signature(const struct vkd3d_shader_code *dxbc,
 int vkd3d_shader_parse_patch_constant_signature(const struct vkd3d_shader_code *dxbc,
         struct vkd3d_shader_signature *signature)
 {
-    TRACE("dxbc {%p, %zu}, signature %p.\n", dxbc->code, dxbc->size, signature);
+    TRACE("dxbc {%p, %zu}, signature %p.\n",
+            dxbc ? dxbc->code : NULL, dxbc ? dxbc->size : 0, signature);
+
+    if (!dxbc || !dxbc->code || !signature)
+        return VKD3D_ERROR_INVALID_ARGUMENT;
 
     return shader_parse_patch_constant_signature(dxbc->code, dxbc->size, signature);
 }
@@ -894,12 +397,14 @@ struct vkd3d_shader_signature_element *vkd3d_shader_find_signature_element(
     TRACE("signature %p, semantic_name %s, semantic_index %u, stream_index %u.\n",
             signature, debugstr_a(semantic_name), semantic_index, stream_index);
 
+    if (!signature || !semantic_name || !signature->elements)
+        return NULL;
+
     e = signature->elements;
     for (i = 0; i < signature->element_count; ++i)
     {
-        if (!ascii_strcasecmp(e[i].semantic_name, semantic_name)
-                && e[i].semantic_index == semantic_index
-                && e[i].stream_index == stream_index)
+        if (e[i].semantic_index == semantic_index && e[i].stream_index == stream_index &&
+                !ascii_strcasecmp(e[i].semantic_name, semantic_name))
             return &e[i];
     }
 
@@ -910,6 +415,9 @@ void vkd3d_shader_free_shader_signature(struct vkd3d_shader_signature *signature
 {
     TRACE("signature %p.\n", signature);
 
+    if (!signature)
+        return;
+
     vkd3d_free(signature->elements);
     signature->elements = NULL;
 }
@@ -917,22 +425,30 @@ void vkd3d_shader_free_shader_signature(struct vkd3d_shader_signature *signature
 vkd3d_shader_hash_t vkd3d_shader_hash(const struct vkd3d_shader_code *shader)
 {
     vkd3d_shader_hash_t h = hash_fnv1_init();
-    const uint8_t *code = shader->code;
-    size_t n = shader->size;
+    const uint8_t *code;
+    const uint32_t *code32;
+    size_t remaining;
     size_t i;
 
-    /* OPTIMIZATION: Process shader bytecode in 64-bit chunks to leverage wide CPU registers. */
-    const uint64_t *p64 = (const uint64_t *)code;
-    for (i = 0; i < n / sizeof(uint64_t); i++)
+    if (!shader || !shader->code || shader->size == 0)
+        return h;
+
+    code = shader->code;
+    remaining = shader->size;
+
+    while (remaining && ((uintptr_t)code & 3))
     {
-        h = hash_fnv1_iterate_u64(h, p64[i]);
+        h = hash_fnv1_iterate_u8(h, *code++);
+        --remaining;
     }
 
-    /* Handle the remaining bytes that don't fit into a 64-bit chunk. */
-    for (i = n - (n % sizeof(uint64_t)); i < n; i++)
-    {
-        h = hash_fnv1_iterate_u8(h, code[i]);
-    }
+    code32 = (const uint32_t *)code;
+    for (i = 0; i < remaining / 4; ++i)
+        h = hash_fnv1_iterate_u32(h, code32[i]);
+
+    code = (const uint8_t *)&code32[remaining / 4];
+    for (remaining &= 3; remaining; --remaining)
+        h = hash_fnv1_iterate_u8(h, *code++);
 
     return h;
 }
@@ -941,17 +457,18 @@ struct vkd3d_shader_quirk_entry
 {
     vkd3d_shader_hash_t lo;
     vkd3d_shader_hash_t hi;
-    uint32_t flags;
+    vkd3d_shader_quirks_t quirks;
 };
 
 static struct vkd3d_shader_quirk_entry *vkd3d_shader_quirk_entries;
 size_t vkd3d_shader_quirk_entry_count;
+static uint64_t vkd3d_shader_revision = 1;
 
 #define ENTRY(x) { #x, VKD3D_SHADER_QUIRK_ ## x }
 static const struct vkd3d_shader_quirk_mapping
 {
     const char *name;
-    enum vkd3d_shader_quirk quirk;
+    vkd3d_shader_quirks_t quirk;
 } vkd3d_shader_quirk_mappings[] = {
     ENTRY(FORCE_EXPLICIT_LOD_IN_CONTROL_FLOW),
     ENTRY(FORCE_TGSM_BARRIERS),
@@ -959,6 +476,7 @@ static const struct vkd3d_shader_quirk_mapping
     ENTRY(FORCE_NOCONTRACT_MATH),
     ENTRY(LIMIT_TESS_FACTORS_32),
     ENTRY(LIMIT_TESS_FACTORS_16),
+    ENTRY(LIMIT_TESS_FACTORS_12),
     ENTRY(LIMIT_TESS_FACTORS_8),
     ENTRY(LIMIT_TESS_FACTORS_4),
     ENTRY(FORCE_SUBGROUP_SIZE_1),
@@ -974,184 +492,128 @@ static const struct vkd3d_shader_quirk_mapping
     ENTRY(FORCE_ROBUST_PHYSICAL_CBV_LOAD_FORWARDING),
     ENTRY(AGGRESSIVE_NONUNIFORM),
     ENTRY(HOIST_DERIVATIVES),
-    ENTRY(DXBC_SPIRV),
     ENTRY(FORCE_MIN_WAVE32),
     ENTRY(PROMOTE_GROUP_TO_DEVICE_MEMORY_BARRIER),
+    ENTRY(FORCE_GRAPHICS_BARRIER_BEFORE_RENDER_PASS),
+    ENTRY(FIXUP_LOOP_HEADER_UNDEF_PHIS),
+    ENTRY(FIXUP_RSQRT_INF_NAN),
 };
 #undef ENTRY
 
-static int vkd3d_shader_quirk_entry_compare(const void *a, const void *b)
+static void vkd3d_shader_update_revision(void)
 {
-    const struct vkd3d_shader_quirk_entry *entry_a = a;
-    const struct vkd3d_shader_quirk_entry *entry_b = b;
+    vkd3d_shader_hash_t quirk_hash = hash_fnv1_init();
+    size_t i;
 
-    if (entry_a->lo < entry_b->lo) return -1;
-    if (entry_a->lo > entry_b->lo) return 1;
-    return 0;
+    if (!vkd3d_shader_quirk_entry_count)
+    {
+        vkd3d_shader_revision = 1;
+        return;
+    }
+
+    for (i = 0; i < vkd3d_shader_quirk_entry_count; ++i)
+    {
+        quirk_hash = hash_fnv1_iterate_u64(quirk_hash, vkd3d_shader_quirk_entries[i].lo);
+        quirk_hash = hash_fnv1_iterate_u64(quirk_hash, vkd3d_shader_quirk_entries[i].hi);
+        quirk_hash = hash_fnv1_iterate_u64(quirk_hash, vkd3d_shader_quirk_entries[i].quirks);
+    }
+
+    vkd3d_shader_revision = quirk_hash ^ 1;
 }
 
 static void vkd3d_shader_init_quirk_table(void)
 {
     struct vkd3d_shader_quirk_entry entry;
-    char env[128];
+    size_t size = 0;
+    char path[VKD3D_PATH_MAX];
+    char line[128];
     char *trail;
     FILE *file;
-    size_t i, line_count = 0;
+    size_t i;
 
-    if (!vkd3d_get_env_var("VKD3D_SHADER_QUIRKS", env, sizeof(env)))
+    if (!vkd3d_get_env_var("VKD3D_SHADER_QUIRKS", path, sizeof(path)))
         return;
 
-    file = fopen(env, "r");
+    file = fopen(path, "r");
     if (!file)
     {
-        INFO("Failed to open VKD3D_SHADER_QUIRKS file \"%s\".\n", env);
+        INFO("Failed to open VKD3D_SHADER_QUIRKS file \"%s\".\n", path);
         return;
     }
 
-    /* OPTIMIZATION: Two-pass read to avoid repeated reallocations.
-     * First pass: count valid lines to determine required allocation size. */
-    while (fgets(env, sizeof(env), file))
+    while (fgets(line, sizeof(line), file))
     {
-        vkd3d_shader_hash_t unused_lo, unused_hi;
-        if (vkd3d_shader_hash_range_parse_line(env, &unused_lo, &unused_hi, &trail))
-        {
-            line_count++;
-        }
-    }
-
-    if (!line_count)
-    {
-        fclose(file);
-        return;
-    }
-
-    vkd3d_shader_quirk_entries = vkd3d_malloc(line_count * sizeof(*vkd3d_shader_quirk_entries));
-    if (!vkd3d_shader_quirk_entries)
-    {
-        ERR("Failed to allocate memory for shader quirk entries.\n");
-        fclose(file);
-        return;
-    }
-
-    rewind(file);
-
-    /* Second pass: parse and fill the pre-allocated array. */
-    while (fgets(env, sizeof(env), file))
-    {
-        if (!vkd3d_shader_hash_range_parse_line(env, &entry.lo, &entry.hi, &trail))
+        entry.quirks = 0;
+        if (!vkd3d_shader_hash_range_parse_line(line, &entry.lo, &entry.hi, &trail))
             continue;
 
         if (*trail == '\0')
             continue;
 
-        entry.flags = 0;
-        for (i = 0; i < ARRAY_SIZE(vkd3d_shader_quirk_mappings); i++)
+        for (i = 0; i < ARRAY_SIZE(vkd3d_shader_quirk_mappings); ++i)
         {
             if (strcmp(trail, vkd3d_shader_quirk_mappings[i].name) == 0)
             {
-                entry.flags = vkd3d_shader_quirk_mappings[i].quirk;
+                entry.quirks = vkd3d_shader_quirk_mappings[i].quirk;
+                INFO("Parsed shader quirk entry: [%016"PRIx64", %016"PRIx64"] -> %s\n",
+                        entry.lo, entry.hi, trail);
                 break;
             }
         }
 
         if (i == ARRAY_SIZE(vkd3d_shader_quirk_mappings))
-        {
-            INFO("Parsed shader quirk entry: [%016"PRIx64", %016"PRIx64"], but no quirk for %s was found.\n",
-                    entry.lo, entry.hi, trail);
-        }
-        else
-        {
-            INFO("Parsed shader quirk entry: [%016"PRIx64", %016"PRIx64"] -> %s\n",
-                    entry.lo, entry.hi, trail);
-        }
+            continue;
+
+        if (!vkd3d_array_reserve((void **)&vkd3d_shader_quirk_entries, &size,
+                vkd3d_shader_quirk_entry_count + 1, sizeof(*vkd3d_shader_quirk_entries)))
+            break;
 
         vkd3d_shader_quirk_entries[vkd3d_shader_quirk_entry_count++] = entry;
     }
 
     fclose(file);
-
-    /* OPTIMIZATION: Sort the quirk table to enable fast lookups. */
-    if (vkd3d_shader_quirk_entry_count > 0)
-    {
-        qsort(vkd3d_shader_quirk_entries, vkd3d_shader_quirk_entry_count,
-              sizeof(*vkd3d_shader_quirk_entries), vkd3d_shader_quirk_entry_compare);
-    }
+    vkd3d_shader_update_revision();
 }
 
 static pthread_once_t vkd3d_shader_quirk_once = PTHREAD_ONCE_INIT;
 
-uint32_t vkd3d_shader_compile_arguments_select_quirks(
+vkd3d_shader_quirks_t vkd3d_shader_compile_arguments_select_quirks(
         const struct vkd3d_shader_compile_arguments *compile_args, vkd3d_shader_hash_t shader_hash)
 {
-    uint32_t quirks = 0;
-    unsigned int i;
-
-    pthread_once(&vkd3d_shader_quirk_once, vkd3d_shader_init_quirk_table);
-
-    /* OPTIMIZATION: Perform a fast scan on the sorted quirk list.
-     * The list is sorted by 'lo' hash, so we can exit early if we've passed
-     * the possible range for the current shader_hash. */
-    for (i = 0; i < vkd3d_shader_quirk_entry_count; i++)
-    {
-        if (vkd3d_shader_quirk_entries[i].lo > shader_hash)
-        {
-            break; /* Early exit because the rest of the entries will have a 'lo' hash greater than the target. */
-        }
-
-        if (vkd3d_shader_quirk_entries[i].hi >= shader_hash)
-        {
-            quirks |= vkd3d_shader_quirk_entries[i].flags;
-            INFO("Adding shader quirks #%x for hash %016"PRIx64".\n",
-                    vkd3d_shader_quirk_entries[i].flags, shader_hash);
-        }
-    }
-
-    if (compile_args && compile_args->quirks)
-    {
-        for (i = 0; i < compile_args->quirks->num_hashes; i++)
-        {
-            if (compile_args->quirks->hashes[i].shader_hash == shader_hash)
-            {
-                return quirks | compile_args->quirks->hashes[i].quirks | compile_args->quirks->global_quirks;
-            }
-        }
-        return quirks | compile_args->quirks->default_quirks | compile_args->quirks->global_quirks;
-    }
-    else
-    {
-        return quirks;
-    }
-}
-
-uint64_t vkd3d_shader_get_revision(void)
-{
-    uint64_t quirk_hash = 0;
+    vkd3d_shader_quirks_t quirks = 0;
     size_t i;
 
     pthread_once(&vkd3d_shader_quirk_once, vkd3d_shader_init_quirk_table);
 
-    if (vkd3d_shader_quirk_entry_count)
+    for (i = 0; i < vkd3d_shader_quirk_entry_count; ++i)
     {
-        quirk_hash = hash_fnv1_init();
-        for (i = 0; i < vkd3d_shader_quirk_entry_count; i++)
-        {
-            quirk_hash = hash_fnv1_iterate_u64(quirk_hash, vkd3d_shader_quirk_entries[i].lo);
-            quirk_hash = hash_fnv1_iterate_u64(quirk_hash, vkd3d_shader_quirk_entries[i].hi);
-            quirk_hash = hash_fnv1_iterate_u32(quirk_hash, vkd3d_shader_quirk_entries[i].flags);
-        }
+        if (vkd3d_shader_quirk_entries[i].lo <= shader_hash && vkd3d_shader_quirk_entries[i].hi >= shader_hash)
+            quirks |= vkd3d_shader_quirk_entries[i].quirks;
     }
 
-    /* This is meant to be bumped every time a change is made to the shader compiler.
-     * Might get nuked later ...
-     * It's not immediately useful for invalidating pipeline caches, since that would mostly be covered
-     * by vkd3d-proton Git hash. */
-    return quirk_hash ^ 1;
+    if (compile_args && compile_args->quirks)
+    {
+        for (i = 0; i < compile_args->quirks->num_hashes; ++i)
+            if (compile_args->quirks->hashes[i].shader_hash == shader_hash)
+                return quirks | compile_args->quirks->hashes[i].quirks | compile_args->quirks->global_quirks;
+        return quirks | compile_args->quirks->default_quirks | compile_args->quirks->global_quirks;
+    }
+    return quirks;
+}
+
+uint64_t vkd3d_shader_get_revision(void)
+{
+    pthread_once(&vkd3d_shader_quirk_once, vkd3d_shader_init_quirk_table);
+    return vkd3d_shader_revision;
 }
 
 struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_append(struct vkd3d_shader_stage_io_map *map,
         const char *semantic_name, unsigned int semantic_index)
 {
     struct vkd3d_shader_stage_io_entry *e;
+
+    if (!map || !semantic_name)
+        return NULL;
 
     if (vkd3d_shader_stage_io_map_find(map, semantic_name, semantic_index))
         return NULL;
@@ -1171,11 +633,13 @@ const struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_find(const s
 {
     unsigned int i;
 
-    for (i = 0; i < map->entry_count; i++)
-    {
-        struct vkd3d_shader_stage_io_entry *e = &map->entries[i];
+    if (!map || !semantic_name)
+        return NULL;
 
-        if (!strcmp(e->semantic_name, semantic_name) && e->semantic_index == semantic_index)
+    for (i = 0; i < map->entry_count; ++i)
+    {
+        const struct vkd3d_shader_stage_io_entry *e = &map->entries[i];
+        if (e->semantic_index == semantic_index && !strcmp(e->semantic_name, semantic_name))
             return e;
     }
 
@@ -1186,7 +650,10 @@ void vkd3d_shader_stage_io_map_free(struct vkd3d_shader_stage_io_map *map)
 {
     unsigned int i;
 
-    for (i = 0; i < map->entry_count; i++)
+    if (!map)
+        return;
+
+    for (i = 0; i < map->entry_count; ++i)
         vkd3d_free((void *)map->entries[i].semantic_name);
 
     vkd3d_free(map->entries);
@@ -1199,43 +666,35 @@ static int vkd3d_shader_parse_root_signature_for_version(const struct vkd3d_shad
         bool raw_payload,
         vkd3d_shader_hash_t *compatibility_hash)
 {
-    struct vkd3d_versioned_root_signature_desc desc = {0}, converted_desc = {0};
+    struct vkd3d_versioned_root_signature_desc desc, converted_desc;
     int ret;
+
+    if (!dxbc || !dxbc->code || !out_desc)
+        return VKD3D_ERROR_INVALID_ARGUMENT;
 
     if (raw_payload)
     {
         if ((ret = vkd3d_shader_parse_root_signature_raw(dxbc->code, dxbc->size, &desc, compatibility_hash)) < 0)
-        {
-            WARN("Failed to parse root signature, vkd3d result %d.\n", ret);
             return ret;
-        }
     }
     else
     {
         if ((ret = vkd3d_shader_parse_root_signature(dxbc, &desc, compatibility_hash)) < 0)
-        {
-            WARN("Failed to parse root signature, vkd3d result %d.\n", ret);
             return ret;
-        }
     }
 
     if (desc.version == target_version)
     {
         *out_desc = desc;
-    }
-    else
-    {
-        ret = vkd3d_shader_convert_root_signature(&converted_desc, target_version, &desc);
-        vkd3d_shader_free_root_signature(&desc);
-        if (ret < 0)
-        {
-            WARN("Failed to convert from version %#x, vkd3d result %d.\n", desc.version, ret);
-            return ret;
-        }
-
-        *out_desc = converted_desc;
+        return ret;
     }
 
+    ret = vkd3d_shader_convert_root_signature(&converted_desc, target_version, &desc);
+    vkd3d_shader_free_root_signature(&desc);
+    if (ret < 0)
+        return ret;
+
+    *out_desc = converted_desc;
     return ret;
 }
 
@@ -1269,6 +728,9 @@ vkd3d_shader_hash_t vkd3d_root_signature_v_1_2_compute_layout_compat_hash(
     vkd3d_shader_hash_t hash = hash_fnv1_init();
     uint32_t i;
 
+    if (!desc)
+        return hash;
+
     hash = hash_fnv1_iterate_u32(hash, desc->static_sampler_count);
     hash = hash_fnv1_iterate_u32(hash, desc->parameter_count);
     hash = hash_fnv1_iterate_u32(hash, desc->flags & D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE);
@@ -1285,7 +747,6 @@ vkd3d_shader_hash_t vkd3d_root_signature_v_1_2_compute_layout_compat_hash(
     for (i = 0; i < desc->static_sampler_count; i++)
     {
         const struct vkd3d_static_sampler_desc1 *sampler = &desc->static_samplers[i];
-        /* Ignore space / register since those don't affect VkPipelineLayout. */
         hash = hash_fnv1_iterate_u32(hash, sampler->flags);
         hash = hash_fnv1_iterate_u32(hash, sampler->shader_visibility);
         hash = hash_fnv1_iterate_u32(hash, sampler->max_anisotropy);
@@ -1308,45 +769,211 @@ bool vkd3d_shader_hash_range_parse_line(char *line,
         char **trail)
 {
     vkd3d_shader_hash_t lo_hash, hi_hash;
-    char *end_ptr;
+    char *end_ptr, *old_end_ptr;
 
-    /* Look for either a single number, or lo-hi format. */
-    while (*line != '\0' && isspace(*line))
-        line++;
-    if (!isxdigit(*line))
+    if (!line || !lo || !hi || !trail)
         return false;
 
+    if (!isxdigit((unsigned char)*line))
+        return false;
+
+    errno = 0;
     lo_hash = strtoull(line, &end_ptr, 16);
+    if (errno == ERANGE || end_ptr == line)
+        return false;
 
-    while (*end_ptr != '\0' && isspace(*end_ptr))
-        end_ptr++;
+    while (*end_ptr && !isalnum((unsigned char)*end_ptr))
+        ++end_ptr;
 
-    if (*end_ptr == '-')
+    old_end_ptr = end_ptr;
+    hi_hash = 0;
+
+    if (*end_ptr)
     {
-        end_ptr++;
+        errno = 0;
         hi_hash = strtoull(end_ptr, &end_ptr, 16);
-    }
-    else
-    {
-        hi_hash = lo_hash;
+        if (errno == ERANGE || end_ptr == old_end_ptr)
+            hi_hash = 0;
     }
 
-    while (*end_ptr != '\0' && isspace(*end_ptr))
-        end_ptr++;
+    while (*end_ptr && !isalpha((unsigned char)*end_ptr))
+        ++end_ptr;
+
+    if (!hi_hash)
+        hi_hash = lo_hash;
 
     *lo = lo_hash;
     *hi = hi_hash;
     *trail = end_ptr;
 
-    /* Trim trailing newline characters from the trail. */
-    if (*end_ptr != '\0')
-    {
-        size_t trail_len = strlen(end_ptr);
-        if (trail_len > 0 && end_ptr[trail_len - 1] == '\n')
-        {
-            end_ptr[trail_len - 1] = '\0';
-        }
-    }
+    while (*end_ptr == '\n' || *end_ptr == '\r')
+        *end_ptr++ = '\0';
 
     return true;
+}
+
+void vkd3d_shader_extract_feature_meta(struct vkd3d_shader_code *code)
+{
+    SpvExecutionModel execution_model = SpvExecutionModelMax;
+    size_t spirv_words;
+    const uint32_t *spirv;
+    uint32_t tracked_sample_mask_ids[2] = {0};
+    unsigned int tracked_count = 0;
+    size_t offset = 5;
+    uint32_t meta = 0;
+
+    if (!code || !code->code || code->size < 20)
+        return;
+
+    spirv = code->code;
+    spirv_words = code->size / sizeof(uint32_t);
+    code->meta.gs_input_topology = 0;   /* prevent stale data across re-use */
+
+    while (offset < spirv_words)
+    {
+        unsigned count = (spirv[offset] >> 16) & 0xffff;
+        SpvOp op = spirv[offset] & 0xffff;
+
+        if (count == 0 || offset + count > spirv_words)
+            break;
+
+        switch (op)
+        {
+        case SpvOpCapability:
+            if (count == 2)
+            {
+                uint32_t cap = spirv[offset + 1];
+                /* Most frequent first for branch predictor (Intel Golden Cove, Agner Fog) */
+                if (cap == SpvCapabilityGroupNonUniform || cap == SpvCapabilityGroupNonUniformVote ||
+                    cap == SpvCapabilityGroupNonUniformArithmetic || cap == SpvCapabilityGroupNonUniformBallot ||
+                    cap == SpvCapabilityGroupNonUniformShuffle || cap == SpvCapabilityGroupNonUniformShuffleRelative ||
+                    cap == SpvCapabilityGroupNonUniformClustered || cap == SpvCapabilityGroupNonUniformQuad ||
+                    cap == SpvCapabilityCooperativeMatrixKHR)
+                {
+                    meta |= VKD3D_SHADER_META_FLAG_USES_SUBGROUP_OPERATIONS;
+                }
+                else if (cap == SpvCapabilityStorageUniform16 || cap == SpvCapabilityStorageUniformBufferBlock16 ||
+                         cap == SpvCapabilityStorageInputOutput16 || cap == SpvCapabilityFloat16)
+                    meta |= VKD3D_SHADER_META_FLAG_USES_NATIVE_16BIT_OPERATIONS;
+                else if (cap == SpvCapabilityShaderViewportIndexLayerEXT)
+                    meta |= VKD3D_SHADER_META_FLAG_USES_SHADER_VIEWPORT_INDEX_LAYER;
+                else if (cap == SpvCapabilitySparseResidency)
+                    meta |= VKD3D_SHADER_META_FLAG_USES_SPARSE_RESIDENCY;
+                else if (cap == SpvCapabilityFragmentFullyCoveredEXT)
+                    meta |= VKD3D_SHADER_META_FLAG_USES_FRAGMENT_FULLY_COVERED;
+                else if (cap == SpvCapabilityInt64)
+                    meta |= VKD3D_SHADER_META_FLAG_USES_INT64;
+                else if (cap == SpvCapabilityStencilExportEXT)
+                    meta |= VKD3D_SHADER_META_FLAG_USES_STENCIL_EXPORT;
+                else if (cap == SpvCapabilityFloat64)
+                    meta |= VKD3D_SHADER_META_FLAG_USES_FP64;
+                else if (cap == SpvCapabilityInt64Atomics)
+                    meta |= VKD3D_SHADER_META_FLAG_USES_INT64_ATOMICS;
+                else if (cap == SpvCapabilityInt64ImageEXT)
+                    meta |= VKD3D_SHADER_META_FLAG_USES_INT64_ATOMICS_IMAGE;
+                else if (cap == SpvCapabilityFragmentBarycentricKHR)
+                    meta |= VKD3D_SHADER_META_FLAG_USES_FRAGMENT_BARYCENTRIC;
+                else if (cap == SpvCapabilitySampleRateShading)
+                    meta |= VKD3D_SHADER_META_FLAG_USES_SAMPLE_RATE_SHADING;
+                else if (cap == SpvCapabilityFragmentShaderPixelInterlockEXT ||
+                         cap == SpvCapabilityFragmentShaderSampleInterlockEXT)
+                    meta |= VKD3D_SHADER_META_FLAG_USES_RASTERIZER_ORDERED_VIEWS;
+                else if (cap == SpvCapabilityFloat8CooperativeMatrixEXT)
+                    meta |= VKD3D_SHADER_META_FLAG_USES_COOPERATIVE_MATRIX_FP8;
+            }
+            break;
+
+        case SpvOpEntryPoint:
+            if (count >= 2)
+                execution_model = spirv[offset + 1];
+            break;
+
+        case SpvOpExecutionMode:
+            if (count == 3)
+            {
+                SpvExecutionMode mode = spirv[offset + 2];
+                switch (mode)
+                {
+                case SpvExecutionModeIsolines:
+                case SpvExecutionModeOutputLineStrip:
+                case SpvExecutionModeOutputLinesEXT:
+                    meta |= VKD3D_SHADER_META_FLAG_EMITS_LINES;
+                    break;
+                case SpvExecutionModeInputPoints:
+                    if (execution_model == SpvExecutionModelGeometry)
+                        code->meta.gs_input_topology = (uint8_t)VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+                    break;
+                case SpvExecutionModeInputLines:
+                    if (execution_model == SpvExecutionModelGeometry)
+                        code->meta.gs_input_topology = (uint8_t)VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+                    break;
+                case SpvExecutionModeInputLinesAdjacency:
+                    if (execution_model == SpvExecutionModelGeometry)
+                        code->meta.gs_input_topology = (uint8_t)VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
+                    break;
+                case SpvExecutionModeTriangles:
+                    if (execution_model == SpvExecutionModelGeometry)
+                        code->meta.gs_input_topology = (uint8_t)VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+                    else
+                        meta |= VKD3D_SHADER_META_FLAG_EMITS_TRIANGLES;
+                    break;
+                case SpvExecutionModeInputTrianglesAdjacency:
+                    if (execution_model == SpvExecutionModelGeometry)
+                        code->meta.gs_input_topology = (uint8_t)VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
+                    break;
+                case SpvExecutionModeQuads:
+                case SpvExecutionModeOutputTriangleStrip:
+                case SpvExecutionModeOutputTrianglesEXT:
+                    meta |= VKD3D_SHADER_META_FLAG_EMITS_TRIANGLES;
+                    break;
+                case SpvExecutionModeDepthGreater:
+                case SpvExecutionModeDepthLess:
+                case SpvExecutionModeDepthReplacing:
+                case SpvExecutionModeDepthUnchanged:
+                case SpvExecutionModeStencilRefReplacingEXT:
+                    meta |= VKD3D_SHADER_META_FLAG_USES_DEPTH_STENCIL_WRITE;
+                    break;
+                case SpvExecutionModePointMode:
+                    meta |= VKD3D_SHADER_META_FLAG_POINT_MODE_TESSELLATION;
+                    break;
+                default:
+                    break;
+                }
+            }
+            break;
+
+        case SpvOpDecorate:
+        case SpvOpMemberDecorate:
+        {
+            unsigned delta = (op == SpvOpMemberDecorate) ? 1 : 0;
+            if (count == 4 + delta && spirv[offset + delta + 2] == SpvDecorationBuiltIn &&
+                spirv[offset + delta + 3] == SpvBuiltInSampleMask)
+            {
+                if (tracked_count < ARRAY_SIZE(tracked_sample_mask_ids))
+                    tracked_sample_mask_ids[tracked_count++] = spirv[offset + 1];
+            }
+            break;
+        }
+
+        case SpvOpVariable:
+            if (count >= 4 && spirv[offset + 3] == SpvStorageClassOutput && tracked_count)
+            {
+                uint32_t var_id = spirv[offset + 2];
+                if (tracked_sample_mask_ids[0] == var_id ||
+                    (tracked_count > 1 && tracked_sample_mask_ids[1] == var_id))
+                    meta |= VKD3D_SHADER_META_FLAG_EXPORTS_SAMPLE_MASK;
+            }
+            break;
+
+        case SpvOpFunction:
+            goto done;
+
+        default:
+            break;
+        }
+
+        offset += count;
+    }
+done:
+    code->meta.flags |= meta;
 }
