@@ -104,6 +104,7 @@ struct wsi_wl_display {
    /* Actually a proxy wrapper around the event queue */
    struct wl_display *wl_display_wrapper;
    struct wl_event_queue *queue;
+   struct wl_fixes *wl_fixes;
 
    struct wl_shm *wl_shm;
    struct zwp_linux_dmabuf_v1 *wl_dmabuf;
@@ -1458,6 +1459,11 @@ registry_handle_global(void *data, struct wl_registry *registry,
       } else if (strcmp(interface, wp_linux_drm_syncobj_manager_v1_interface.name) == 0) {
          display->wl_syncobj =
             wl_registry_bind(registry, name, &wp_linux_drm_syncobj_manager_v1_interface, 1);
+#ifdef WL_FIXES_INTERFACE
+      } else if (strcmp(interface, wl_fixes_interface.name) == 0) {
+         display->wl_fixes =
+            wl_registry_bind(registry, name, &wl_fixes_interface, 1);
+#endif
       }
    }
 
@@ -1516,6 +1522,10 @@ wsi_wl_display_finish(struct wsi_wl_display *display)
    u_vector_finish(&display->color_primaries);
    u_vector_finish(&display->color_transfer_funcs);
 
+#ifdef WL_FIXES_INTERFACE
+   if (display->wl_fixes)
+      wl_fixes_destroy(display->wl_fixes);
+#endif
    if (display->wl_shm)
       wl_shm_destroy(display->wl_shm);
    if (display->wl_syncobj)
@@ -1647,6 +1657,10 @@ wsi_wl_display_init(struct wsi_wayland *wsi_wl,
 
 out:
    /* We don't need this anymore */
+#ifdef WL_FIXES_INTERFACE
+   if (display->wl_fixes)
+      wl_fixes_destroy_registry(display->wl_fixes, registry);
+#endif
    wl_registry_destroy(registry);
 
    /* Destroy default dma-buf feedback object and format table */
@@ -1659,8 +1673,13 @@ out:
    return VK_SUCCESS;
 
 fail_registry:
-   if (registry)
+   if (registry) {
+#ifdef WL_FIXES_INTERFACE
+      if (display->wl_fixes)
+         wl_fixes_destroy_registry(display->wl_fixes, registry);
+#endif
       wl_registry_destroy(registry);
+   }
 
 fail:
    wsi_wl_display_finish(display);
