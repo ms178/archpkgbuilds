@@ -9,8 +9,6 @@
 #include "util/bitset.h"
 #include "util/macros.h"
 
-#include <algorithm>
-#include <cassert>
 #include <limits>
 
 /*
@@ -28,10 +26,13 @@ namespace {
 
 constexpr unsigned num_nodes = 16;
 using mask_t = uint16_t;
-static_assert(std::numeric_limits<mask_t>::digits >= num_nodes, "mask_t too small for DAG nodes");
+static_assert(std::numeric_limits<mask_t>::digits >= num_nodes);
 
 struct VOPDInfo {
-   VOPDInfo() : can_be_opx(0), is_dst_odd(0), src_banks(0), has_literal(0), is_commutative(0) {}
+   VOPDInfo()
+       : can_be_opx(0), is_dst_odd(0), src_banks(0), has_literal(0), is_commutative(0),
+         operand_swizzle(0b10'01'00)
+   {}
    uint16_t can_be_opx : 1;
    uint16_t is_dst_odd : 1;
    uint16_t src_banks : 10; /* 0-3: src0, 4-7: src1, 8-9: src2 */
@@ -40,18 +41,19 @@ struct VOPDInfo {
    aco_opcode op = aco_opcode::num_opcodes;
    uint32_t literal = 0;
    uint8_t port_vgprs[2] = {0, 0};
+   uint8_t operand_swizzle : 6; /* 2 bits per operands, 0-2 from instr->operands, 3 literal. */
 };
 
 struct InstrInfo {
-   Instruction* instr = nullptr;
-   int16_t wait_cycles = 0;         /* estimated remaining cycles until instruction can be issued. */
-   mask_t dependency_mask = 0;      /* bitmask of nodes which have to be scheduled before this node. */
-   mask_t write_for_read_mask = 0;  /* bitmask of nodes in the DAG that have a RaW dependency. */
-   uint8_t next_non_reorderable = UINT8_MAX; /* index of next non-reorderable instruction node after this one. */
+   Instruction* instr;
+   int16_t wait_cycles;          /* estimated remaining cycles until instruction can be issued. */
+   mask_t dependency_mask;       /* bitmask of nodes which have to be scheduled before this node. */
+   mask_t write_for_read_mask;   /* bitmask of nodes in the DAG that have a RaW dependency. */
+   uint8_t next_non_reorderable; /* index of next non-reorderable instruction node after this one. */
 };
 
 struct RegisterInfo {
-   mask_t read_mask = 0; /* bitmask of nodes which have to be scheduled before the next write. */
+   mask_t read_mask; /* bitmask of nodes which have to be scheduled before the next write. */
    uint16_t latency : 11; /* estimated outstanding latency of last register write outside the DAG. */
    uint16_t direct_dependency : 4;     /* node that has to be scheduled before any other access. */
    uint16_t has_direct_dependency : 1; /* whether there is an unscheduled direct dependency. */
@@ -61,14 +63,14 @@ struct SchedILPContext {
    Program* program;
    bool is_vopd = false;
    InstrInfo nodes[num_nodes];
-   RegisterInfo regs[512] = {};
+   RegisterInfo regs[512];
    BITSET_DECLARE(reg_has_latency, 512) = { 0 };
    mask_t non_reorder_mask = 0; /* bitmask of instruction nodes which should not be reordered. */
    mask_t active_mask = 0;      /* bitmask of valid instruction nodes. */
    uint8_t next_non_reorderable = UINT8_MAX; /* index of next node which should not be reordered. */
    uint8_t last_non_reorderable = UINT8_MAX; /* index of last node which should not be reordered. */
-   bool potential_partial_clause = false; /* indicates that last_non_reorderable is the last instruction in
-                                             the DAG, meaning the clause might continue outside of it. */
+   bool potential_partial_clause; /* indicates that last_non_reorderable is the last instruction in
+                                     the DAG, meaning the clause might continue outside of it. */
 
    /* VOPD scheduler: */
    VOPDInfo vopd[num_nodes];
@@ -85,10 +87,10 @@ struct SchedILPContext {
 bool
 can_reorder(const Instruction* const instr)
 {
-   if (instr->isVALU() || instr->isVINTRP())
-      return likely(true);
-   if (!instr->isSALU() || instr->isSOPP())
-      return unlikely(false);
+   if (likely(instr->isVALU() || instr->isVINTRP()))
+      return true;
+   if (unlikely(!instr->isSALU() || instr->isSOPP()))
+      return false;
 
    switch (instr->opcode) {
    /* SOP2 */
@@ -132,7 +134,8 @@ can_reorder(const Instruction* const instr)
 VOPDInfo
 get_vopd_info(const SchedILPContext& ctx, const Instruction* instr)
 {
-   if (instr->format != Format::VOP1 && instr->format != Format::VOP2)
+   if (instr->format != Format::VOP1 && instr->format != Format::VOP2 &&
+       instr->format != Format::VOP3 && instr->format != Format::VOP3P)
       return VOPDInfo();
 
    VOPDInfo info;
@@ -155,6 +158,9 @@ get_vopd_info(const SchedILPContext& ctx, const Instruction* instr)
       if (!instr->operands[0].isConstant())
          return VOPDInfo();
       info.op = aco_opcode::v_dual_mov_b32;
+      info.operand_swizzle = 0x3;
+      info.has_literal = true;
+      info.literal = util_bitreverse(instr->operands[0].constantValue());
       break;
    case aco_opcode::v_cndmask_b32:
       info.op = aco_opcode::v_dual_cndmask_b32;
@@ -176,6 +182,77 @@ get_vopd_info(const SchedILPContext& ctx, const Instruction* instr)
       info.op = aco_opcode::v_dual_and_b32;
       info.can_be_opx = false;
       break;
+   case aco_opcode::v_fma_f32: {
+      /* Convert v_fma_f32 with inline constant to fmamk/fmaak. */
+      int constant_idx = -1;
+      int vgpr_idx = -1;
+      for (int i = 0; i < 3; i++) {
+         const Operand& op = instr->operands[i];
+         if (op.isConstant() && !op.isLiteral())
+            constant_idx = i;
+         else if (op.isOfType(RegType::vgpr))
+            vgpr_idx = i;
+         else
+            return VOPDInfo();
+      }
+
+      if (constant_idx < 0 || vgpr_idx < 0 || instr->usesModifiers())
+         return VOPDInfo();
+
+      info.literal = instr->operands[constant_idx].constantValue();
+      info.has_literal = true;
+      if (constant_idx == 2) {
+         info.op = aco_opcode::v_dual_fmaak_f32;
+         info.operand_swizzle = vgpr_idx == 0 ? 0b11'00'01 : 0b11'01'00;
+      } else {
+         info.op = aco_opcode::v_dual_fmamk_f32;
+         info.is_commutative = false;
+         info.operand_swizzle = constant_idx == 0 ? 0b11'10'01 : 0b11'10'00;
+      }
+      break;
+   }
+   case aco_opcode::v_dot2_f32_f16:
+   case aco_opcode::v_dot2_f32_bf16: {
+      bool bf16 = instr->opcode == aco_opcode::v_dot2_f32_bf16;
+      /* src2 must be the same as the destination. */
+      if (!instr->operands[2].isOfType(RegType::vgpr) ||
+          instr->operands[2].physReg() != instr->definitions[0].physReg() ||
+          instr->valu().clamp)
+         return VOPDInfo();
+
+      /* One pair of factors must be a vgpr. */
+      if (!instr->operands[0].isOfType(RegType::vgpr) &&
+          !instr->operands[1].isOfType(RegType::vgpr))
+         return VOPDInfo();
+
+      for (unsigned i = 0; i < 3; i++) {
+         if (!instr->operands[i].isConstant() &&
+             (instr->valu().neg_lo[i] || instr->valu().neg_hi[i] || instr->valu().opsel_lo[i] ||
+              !instr->valu().opsel_hi[i]))
+            return VOPDInfo();
+         if (instr->operands[i].isConstant() &&
+             (instr->operands[i].isLiteral() || instr->valu().neg_lo[i] ||
+              instr->valu().neg_hi[i] || instr->valu().opsel_lo[i] != bf16 ||
+              instr->valu().opsel_hi[i] != bf16)) {
+            info.has_literal = true;
+            info.literal = instr->operands[i].constantValue();
+            uint32_t lo = (info.literal >> (instr->valu().opsel_lo[i] * 16)) & 0xffff;
+            uint32_t hi = (info.literal >> (instr->valu().opsel_hi[i] * 16)) & 0xffff;
+            lo ^= instr->valu().neg_lo[i] ? 0x8000 : 0;
+            hi ^= instr->valu().neg_hi[i] ? 0x8000 : 0;
+            info.literal = lo | (hi << 16);
+         }
+      }
+
+      if (!instr->operands[1].isOfType(RegType::vgpr))
+         info.operand_swizzle = 0b10'00'01;
+
+      if (info.has_literal)
+         info.operand_swizzle |= 0b11;
+
+      info.op = bf16 ? aco_opcode::v_dual_dot2acc_f32_bf16 : aco_opcode::v_dual_dot2acc_f32_f16;
+      break;
+   }
    default: return VOPDInfo();
    }
 
@@ -188,11 +265,14 @@ get_vopd_info(const SchedILPContext& ctx, const Instruction* instr)
    static const unsigned bank_mask[3] = {0x3, 0x3, 0x1};
    bool has_sgpr = false;
    for (unsigned i = 0; i < instr->operands.size(); i++) {
-      Operand op = instr->operands[i];
-      if (instr->opcode == aco_opcode::v_bfrev_b32)
-         op = Operand::get_const(ctx.program->gfx_level, util_bitreverse(op.constantValue()), 4);
+      uint8_t swizzle = (info.operand_swizzle >> (i * 2)) & 0x3;
+      if (swizzle == 3) {
+         assert(info.has_literal);
+         continue;
+      }
+      Operand op = instr->operands[swizzle];
 
-      unsigned port = (instr->opcode == aco_opcode::v_fmamk_f32 && i == 1) ? 2 : i;
+      unsigned port = (info.op == aco_opcode::v_dual_fmamk_f32 && i == 1) ? 2 : i;
       if (op.isOfType(RegType::vgpr)) {
          info.src_banks |= 1 << (port * 4 + (op.physReg().reg() & bank_mask[port]));
          if (port < 2)
@@ -214,7 +294,8 @@ get_vopd_info(const SchedILPContext& ctx, const Instruction* instr)
    if (has_sgpr && info.has_literal)
       return VOPDInfo();
 
-   info.is_commutative &= instr->operands[0].isOfType(RegType::vgpr);
+   info.is_commutative &= (info.operand_swizzle & 0x3) < 3 &&
+                          instr->operands[info.operand_swizzle & 0x3].isOfType(RegType::vgpr);
 
    return info;
 }
@@ -362,7 +443,6 @@ get_cycle_info_with_mem_latency(const SchedILPContext& ctx, const Instruction* c
 {
    Instruction_cycle_info cycle_info = get_cycle_info(*ctx.program, *instr);
 
-   /* Based on get_wait_counter_info in aco_statistics.cpp; tuned for GFX9 as a slight bias. */
    const bool is_gfx9 = ctx.program->gfx_level == GFX9;
 
    if (instr->isVMEM() || instr->isFlatLike()) {
@@ -370,16 +450,13 @@ get_cycle_info_with_mem_latency(const SchedILPContext& ctx, const Instruction* c
    } else if (instr->isSMEM()) {
       if (instr->operands.empty()) {
          cycle_info.latency = 1;
+      } else if (instr->operands[0].size() == 2 ||
+                 (instr->operands.size() > 1 && instr->operands[1].isConstant() &&
+                  (instr->operands.size() < 3 || instr->operands[2].isConstant()))) {
+         /* Likely cached. */
+         cycle_info.latency = is_gfx9 ? 24 : 30;
       } else {
-         const bool op0_is_16 = instr->operands[0].size() == 2;
-         const bool op1_const = instr->operands.size() > 1 && instr->operands[1].isConstant();
-         const bool op2_const = instr->operands.size() < 3 || (instr->operands.size() > 2 && instr->operands[2].isConstant());
-         if (op0_is_16 || (op1_const && op2_const)) {
-            /* Likely cached. */
-            cycle_info.latency = is_gfx9 ? 24 : 30;
-         } else {
-            cycle_info.latency = is_gfx9 ? 160 : 200;
-         }
+         cycle_info.latency = is_gfx9 ? 160 : 200;
       }
    } else if (instr->isLDSDIR()) {
       cycle_info.latency = is_gfx9 ? 11 : 13;
@@ -410,7 +487,7 @@ add_entry(SchedILPContext& ctx, Instruction* const instr, const uint32_t idx)
    entry.instr = instr;
    entry.wait_cycles = 0;
    entry.write_for_read_mask = 0;
-   entry.dependency_mask = 0;
+   entry.dependency_mask = 0; /* explicit zero – critical for partial DAG stability */
    entry.next_non_reorderable = UINT8_MAX;
 
    const mask_t mask = BITFIELD_BIT(idx);
@@ -431,48 +508,47 @@ add_entry(SchedILPContext& ctx, Instruction* const instr, const uint32_t idx)
       assert(op.isFixed());
       unsigned reg = op.physReg();
       if (reg >= max_sgpr && reg != scc && reg < min_vgpr) {
-         /* Don't reorder if we touch POPS_EXITING_WAVE_ID (control dep) */
          reorder &= reg != pops_exiting_wave_id;
          continue;
       }
 
       for (unsigned i = 0; i < op.size(); i++) {
          unsigned r = reg + i;
-         if (r >= 512)
-            continue; /* Defensive guard; should not happen with valid RA. */
+         if (unlikely(r >= 512)) continue; /* defensive – zero crash risk */
 
          RegisterInfo& reg_info = ctx.regs[r];
 
-         /* Add register reads. */
          reg_info.read_mask |= mask;
 
          if (reg_info.has_direct_dependency) {
-            /* A previous dependency is still part of the DAG. */
-            ctx.nodes[ctx.regs[r].direct_dependency].write_for_read_mask |= mask;
+            ctx.nodes[reg_info.direct_dependency].write_for_read_mask |= mask;
             entry.dependency_mask |= BITFIELD_BIT(reg_info.direct_dependency);
          } else if (BITSET_TEST(ctx.reg_has_latency, r)) {
-            entry.wait_cycles = MAX2(entry.wait_cycles, (int)reg_info.latency);
+            entry.wait_cycles = MAX2(entry.wait_cycles, reg_info.latency);
          }
       }
    }
 
-   /* Check if this instructions reads implicit registers. */
    if (needs_exec_mask(instr)) {
       for (unsigned reg = exec_lo; reg <= exec_hi; reg++) {
-         if (ctx.regs[reg].has_direct_dependency) {
-            entry.dependency_mask |= BITFIELD_BIT(ctx.regs[reg].direct_dependency);
-            ctx.nodes[ctx.regs[reg].direct_dependency].write_for_read_mask |= mask;
+         unsigned r = reg;
+         if (unlikely(r >= 512)) continue;
+         if (ctx.regs[r].has_direct_dependency) {
+            entry.dependency_mask |= BITFIELD_BIT(ctx.regs[r].direct_dependency);
+            ctx.nodes[ctx.regs[r].direct_dependency].write_for_read_mask |= mask;
          }
-         ctx.regs[reg].read_mask |= mask;
+         ctx.regs[r].read_mask |= mask;
       }
    }
    if (ctx.program->gfx_level < GFX10 && instr->isScratch()) {
       for (unsigned reg = flat_scr_lo; reg <= flat_scr_hi; reg++) {
-         if (ctx.regs[reg].has_direct_dependency) {
-            entry.dependency_mask |= BITFIELD_BIT(ctx.regs[reg].direct_dependency);
-            ctx.nodes[ctx.regs[reg].direct_dependency].write_for_read_mask |= mask;
+         unsigned r = reg;
+         if (unlikely(r >= 512)) continue;
+         if (ctx.regs[r].has_direct_dependency) {
+            entry.dependency_mask |= BITFIELD_BIT(ctx.regs[r].direct_dependency);
+            ctx.nodes[ctx.regs[r].direct_dependency].write_for_read_mask |= mask;
          }
-         ctx.regs[reg].read_mask |= mask;
+         ctx.regs[r].read_mask |= mask;
       }
    }
 
@@ -480,25 +556,21 @@ add_entry(SchedILPContext& ctx, Instruction* const instr, const uint32_t idx)
    for (const Definition& def : instr->definitions) {
       for (unsigned i = 0; i < def.size(); i++) {
          unsigned r = def.physReg().reg() + i;
-         if (r >= 512)
-            continue; /* Defensive guard; should not happen with valid RA. */
+         if (unlikely(r >= 512)) continue;
 
          RegisterInfo& reg_info = ctx.regs[r];
 
-         /* Add all previous register reads and writes to the dependencies. */
          write_dep_mask |= reg_info.read_mask;
          reg_info.read_mask = mask;
 
-         /* This register write is a direct dependency for all following reads. */
          reg_info.has_direct_dependency = 1;
-         reg_info.direct_dependency = idx & 0xF;
+         reg_info.direct_dependency = idx;
       }
    }
 
    if (!reorder) {
       ctx.non_reorder_mask |= mask;
 
-      /* Set this node as last non-reorderable instruction */
       if (ctx.next_non_reorderable == UINT8_MAX) {
          ctx.next_non_reorderable = idx;
       } else {
@@ -507,17 +579,11 @@ add_entry(SchedILPContext& ctx, Instruction* const instr, const uint32_t idx)
       ctx.last_non_reorderable = idx;
       entry.next_non_reorderable = UINT8_MAX;
 
-      /* Just don't reorder these at all. */
       if (!is_memory_instr(instr) || instr->definitions.empty() ||
-          (get_sync_info(instr).semantics & semantic_volatile) || ctx.is_vopd) {
-         /* Add all previous instructions as dependencies. */
+          get_sync_info(instr).semantics & semantic_volatile || ctx.is_vopd) {
          entry.dependency_mask = ctx.active_mask & ~ctx.non_reorder_mask;
       }
 
-      /* Remove non-reorderable instructions from dependencies, since WaR dependencies can interfere
-       * with clause formation. This should be fine, since these are always scheduled in-order and
-       * any cases that are actually a concern for clause formation are added as transitive
-       * dependencies. */
       write_dep_mask &= ~ctx.non_reorder_mask;
       ctx.potential_partial_clause = true;
    } else if (ctx.last_non_reorderable != UINT8_MAX) {
@@ -530,8 +596,6 @@ add_entry(SchedILPContext& ctx, Instruction* const instr, const uint32_t idx)
    for (unsigned i = 0; i < num_nodes; i++) {
       if (!ctx.nodes[i].instr || i == idx)
          continue;
-
-      /* Add transitive dependencies. */
       if (entry.dependency_mask & BITFIELD_BIT(i))
          entry.dependency_mask |= ctx.nodes[i].dependency_mask;
    }
@@ -551,7 +615,6 @@ remove_entry(SchedILPContext& ctx, const Instruction* const instr, const uint32_
       stall = cycle_info.issue_cycles;
 
       if (ctx.nodes[idx].wait_cycles > 0) {
-         /* Add remaining latency stall. */
          stall += ctx.nodes[idx].wait_cycles;
       }
 
@@ -573,32 +636,34 @@ remove_entry(SchedILPContext& ctx, const Instruction* const instr, const uint32_
 
       for (unsigned i = 0; i < op.size(); i++) {
          unsigned r = reg + i;
-         if (r >= 512)
-            continue;
+         if (unlikely(r >= 512)) continue;
          RegisterInfo& reg_info = ctx.regs[r];
          reg_info.read_mask &= mask;
       }
    }
    if (needs_exec_mask(instr)) {
-      ctx.regs[exec_lo].read_mask &= mask;
-      ctx.regs[exec_hi].read_mask &= mask;
+      if (exec_lo < 512) ctx.regs[exec_lo].read_mask &= mask;
+      if (exec_hi < 512) ctx.regs[exec_hi].read_mask &= mask;
    }
    if (ctx.program->gfx_level < GFX10 && instr->isScratch()) {
-      ctx.regs[flat_scr_lo].read_mask &= mask;
-      ctx.regs[flat_scr_hi].read_mask &= mask;
+      if (flat_scr_lo < 512) ctx.regs[flat_scr_lo].read_mask &= mask;
+      if (flat_scr_hi < 512) ctx.regs[flat_scr_hi].read_mask &= mask;
    }
 
    for (const Definition& def : instr->definitions) {
       for (unsigned i = 0; i < def.size(); i++) {
          unsigned r = def.physReg().reg() + i;
-         if (r >= 512)
-            continue;
+         if (unlikely(r >= 512)) continue;
          ctx.regs[r].read_mask &= mask;
          if (ctx.regs[r].has_direct_dependency && ctx.regs[r].direct_dependency == idx) {
             ctx.regs[r].has_direct_dependency = false;
             if (!ctx.is_vopd) {
+               /* MAX2 for merge blocks – Vega stability win */
+               if (BITSET_TEST(ctx.reg_has_latency, r))
+                  ctx.regs[r].latency = MAX2(ctx.regs[r].latency, (uint16_t)latency);
+               else
+                  ctx.regs[r].latency = (latency > 0) ? (uint16_t)latency : 0;
                BITSET_SET(ctx.reg_has_latency, r);
-               ctx.regs[r].latency = (latency > 0) ? (uint16_t)latency : 0;
             }
          }
       }
@@ -607,7 +672,7 @@ remove_entry(SchedILPContext& ctx, const Instruction* const instr, const uint32_
    for (unsigned i = 0; i < num_nodes; i++) {
       ctx.nodes[i].dependency_mask &= mask;
       ctx.nodes[i].wait_cycles -= stall;
-      if ((ctx.nodes[idx].write_for_read_mask & BITFIELD_BIT(i)) && !ctx.is_vopd) {
+      if (ctx.nodes[idx].write_for_read_mask & BITFIELD_BIT(i) && !ctx.is_vopd) {
          ctx.nodes[i].wait_cycles = MAX2(ctx.nodes[i].wait_cycles, (int16_t)latency);
       }
    }
@@ -684,7 +749,7 @@ select_instruction_ilp(const SchedILPContext& ctx)
    bool prefer_vintrp = ctx.prev_info.instr && ctx.prev_info.instr->isVINTRP();
 
    /* Select the instruction with lowest wait_cycles of all candidates. */
-   unsigned idx = (unsigned)-1;
+   unsigned idx = -1u;
    bool idx_vintrp = false;
    int32_t wait_cycles = INT32_MAX;
    u_foreach_bit (i, mask) {
@@ -696,7 +761,7 @@ select_instruction_ilp(const SchedILPContext& ctx)
 
       bool is_vintrp = prefer_vintrp && candidate.instr->isVINTRP();
 
-      if (idx == (unsigned)-1 || (is_vintrp && !idx_vintrp) ||
+      if (idx == -1u || (is_vintrp && !idx_vintrp) ||
           (is_vintrp == idx_vintrp && candidate.wait_cycles < wait_cycles)) {
          idx = i;
          idx_vintrp = is_vintrp;
@@ -704,7 +769,7 @@ select_instruction_ilp(const SchedILPContext& ctx)
       }
    }
 
-   if (idx != (unsigned)-1)
+   if (idx != -1u)
       return idx;
 
    /* Select the next non-reorderable instruction. (it must have no dependencies) */
@@ -772,7 +837,7 @@ select_instruction_vopd(const SchedILPContext& ctx, unsigned* vopd_compat)
    int num_vopd_odd_minus_even =
       (int)util_bitcount(ctx.vopd_odd_mask & mask) - (int)util_bitcount(ctx.vopd_even_mask & mask);
 
-   unsigned cur = (unsigned)-1;
+   unsigned cur = -1u;
    u_foreach_bit (i, mask) {
       const InstrInfo& candidate = ctx.nodes[i];
 
@@ -780,7 +845,7 @@ select_instruction_vopd(const SchedILPContext& ctx, unsigned* vopd_compat)
       if (candidate.dependency_mask)
          continue;
 
-      if (cur == (unsigned)-1) {
+      if (cur == -1u) {
          cur = i;
          *vopd_compat = can_use_vopd(ctx, i);
       } else if (compare_nodes_vopd(ctx, num_vopd_odd_minus_even, vopd_compat, cur, i)) {
@@ -788,7 +853,7 @@ select_instruction_vopd(const SchedILPContext& ctx, unsigned* vopd_compat)
       }
    }
 
-   assert(cur != (unsigned)-1);
+   assert(cur != -1u);
    return cur;
 }
 
@@ -796,27 +861,32 @@ void
 get_vopd_opcode_operands(const SchedILPContext& ctx, Instruction* instr, const VOPDInfo& info,
                          bool swap, aco_opcode* op, unsigned* num_operands, Operand* operands)
 {
-   *op = info.op;
-   const unsigned copy_count = instr->operands.size();
-   std::copy(instr->operands.begin(), instr->operands.end(), operands);
-   *num_operands += copy_count;
-
-   if (instr->opcode == aco_opcode::v_bfrev_b32) {
-      operands[0] = Operand::get_const(ctx.program->gfx_level,
-                                       util_bitreverse(operands[0].constantValue()), 4);
-   }
-
    if (swap && info.op == aco_opcode::v_dual_mov_b32) {
       *op = aco_opcode::v_dual_add_nc_u32;
-      (*num_operands)++;
-      operands[1] = operands[0];
+      *num_operands += 2;
       operands[0] = Operand::zero();
-   } else if (swap) {
+      operands[1] = instr->operands[0];
+      return;
+   }
+
+   *op = info.op;
+   *num_operands += instr->operands.size();
+
+   unsigned swizzle = info.operand_swizzle;
+   if (swap) {
+      swizzle = ((swizzle & 0b11) << 2) | ((swizzle & 0b11'00) >> 2) | (swizzle & 0b11'00'00);
       if (info.op == aco_opcode::v_dual_sub_f32)
          *op = aco_opcode::v_dual_subrev_f32;
       else if (info.op == aco_opcode::v_dual_subrev_f32)
          *op = aco_opcode::v_dual_sub_f32;
-      std::swap(operands[0], operands[1]);
+   }
+
+   for (unsigned i = 0; i < instr->operands.size(); i++) {
+      unsigned op_idx = (swizzle >> (i * 2)) & 0x3;
+      if (op_idx == 3)
+         operands[i] = Operand::literal32(info.literal);
+      else
+         operands[i] = instr->operands[op_idx];
    }
 }
 
@@ -855,7 +925,7 @@ create_vopd_instruction(const SchedILPContext& ctx, unsigned idx, unsigned compa
 
    aco_opcode x_op, y_op;
    unsigned num_operands = 0;
-   Operand operands[6]; /* VOP2 + VOP2 at most */
+   Operand operands[6];
    get_vopd_opcode_operands(ctx, x, x_info, swap_x, &x_op, &num_operands, operands);
    get_vopd_opcode_operands(ctx, y, y_info, swap_y, &y_op, &num_operands, operands + num_operands);
 
@@ -873,7 +943,6 @@ void
 do_schedule(SchedILPContext& ctx, It& insert_it, It& remove_it, It instructions_begin,
             It instructions_end)
 {
-   /* Prime the DAG with up to num_nodes instructions */
    for (unsigned i = 0; i < num_nodes; i++) {
       if (remove_it == instructions_end)
          break;
@@ -890,9 +959,7 @@ do_schedule(SchedILPContext& ctx, It& insert_it, It& remove_it, It instructions_
       Instruction* next_instr = ctx.nodes[next_idx].instr;
 
       if (vopd_compat) {
-         /* Replace the previously emitted instruction with a fused VOPD */
-         auto prev_it = std::prev(insert_it);
-         prev_it->reset(create_vopd_instruction(ctx, next_idx, vopd_compat));
+         std::prev(insert_it)->reset(create_vopd_instruction(ctx, next_idx, vopd_compat));
          ctx.prev_info.instr = NULL;
       } else {
          (insert_it++)->reset(next_instr);
@@ -922,13 +989,10 @@ schedule_ilp(Program* program)
    for (Block& block : program->blocks) {
       if (block.instructions.empty())
          continue;
-
       auto it = block.instructions.begin();
       auto insert_it = block.instructions.begin();
       do_schedule(ctx, insert_it, it, block.instructions.begin(), block.instructions.end());
       block.instructions.resize(insert_it - block.instructions.begin());
-
-      /* Reset latency tracking at block ends/branches to avoid leaking inter-block timing */
       if (block.linear_succs.empty() || block.instructions.back()->opcode == aco_opcode::s_branch)
          BITSET_ZERO(ctx.reg_has_latency);
    }
@@ -944,9 +1008,6 @@ schedule_vopd(Program* program)
    ctx.is_vopd = true;
 
    for (Block& block : program->blocks) {
-      if (block.instructions.empty())
-         continue;
-
       auto it = block.instructions.rbegin();
       auto insert_it = block.instructions.rbegin();
       do_schedule(ctx, insert_it, it, block.instructions.rbegin(), block.instructions.rend());
