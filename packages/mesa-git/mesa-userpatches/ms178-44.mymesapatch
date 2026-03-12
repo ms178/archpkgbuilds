@@ -1,0 +1,331 @@
+--- a/src/vulkan/wsi/wsi_common_wayland.c	2026-03-12 15:10:15.861129753 +0100
++++ b/src/vulkan/wsi/wsi_common_wayland.c	2026-03-12 15:32:22.050720193 +0100
+@@ -32,6 +32,7 @@
+ #include <poll.h>
+ #include <sys/mman.h>
+ #include <sys/types.h>
++#include <math.h>
+ 
+ #include "drm-uapi/drm_fourcc.h"
+ 
+@@ -138,6 +139,7 @@ struct wsi_wl_display {
+ 
+    dev_t main_device;
+    bool same_gpu;
++   bool has_tearing;
+ 
+    clockid_t presentation_clock_id;
+ 
+@@ -196,6 +198,18 @@ struct wsi_wl_surface {
+       VkHdrMetadataEXT hdr_metadata;
+       bool has_hdr_metadata;
+    } color;
++
++   struct {
++      /* Cached structures, for eg. GetPhysicalDeviceSurfaceFormatsKHR to avoid
++       * round-trips every single time they are called, which is slow
++       * and leaks wl_registries on the server side[1].
++       *
++       * [1]: https://gitlab.freedesktop.org/wayland/wayland/-/merge_requests/388
++       */
++      mtx_t lock;
++      struct wsi_device *last_device;
++      struct wsi_wl_display cached_display;
++   } query_cache;
+ };
+ 
+ struct wsi_wl_swapchain {
+@@ -329,7 +343,7 @@ next_phase_locked_time(uint64_t base, ui
+     * well away from rounding up too far, but to also avoid
+     * scheduling too soon if the time values are imprecise.
+     */
+-   cycles = (from - base + period / 4) / period;
++   cycles = (from - base + (period >> 2)) / period;
+    target = base + (cycles + 1) * period;
+    return target;
+ }
+@@ -1474,6 +1488,7 @@ registry_handle_global(void *data, struc
+    } else if (strcmp(interface, wp_tearing_control_manager_v1_interface.name) == 0) {
+       display->tearing_control_manager =
+          wl_registry_bind(registry, name, &wp_tearing_control_manager_v1_interface, 1);
++      display->has_tearing = display->tearing_control_manager != NULL;
+    } else if (strcmp(interface, wp_fifo_manager_v1_interface.name) == 0) {
+       display->fifo_manager =
+          wl_registry_bind(registry, name, &wp_fifo_manager_v1_interface, 1);
+@@ -1506,36 +1521,62 @@ static const struct wl_registry_listener
+ };
+ 
+ static void
+-wsi_wl_display_finish(struct wsi_wl_display *display)
++wsi_wl_display_finish_objects(struct wsi_wl_display *display)
+ {
+-   struct wsi_wl_format *f;
+-   u_vector_foreach(f, &display->formats)
+-      u_vector_finish(&f->modifiers);
+-   u_vector_finish(&display->formats);
+-   u_vector_finish(&display->colorspaces);
+-   u_vector_finish(&display->color_primaries);
+-   u_vector_finish(&display->color_transfer_funcs);
+-
+-   if (display->wl_shm)
++   if (display->wl_shm) {
+       wl_shm_destroy(display->wl_shm);
+-   if (display->wl_syncobj)
++      display->wl_shm = NULL;
++   }
++   if (display->wl_syncobj) {
+       wp_linux_drm_syncobj_manager_v1_destroy(display->wl_syncobj);
+-   if (display->wl_dmabuf)
++      display->wl_syncobj = NULL;
++   }
++   if (display->wl_dmabuf) {
+       zwp_linux_dmabuf_v1_destroy(display->wl_dmabuf);
+-   if (display->wp_presentation_notwrapped)
++      display->wl_dmabuf = NULL;
++   }
++   if (display->wp_presentation_notwrapped) {
+       wp_presentation_destroy(display->wp_presentation_notwrapped);
+-   if (display->fifo_manager)
++      display->wp_presentation_notwrapped = NULL;
++   }
++   if (display->fifo_manager) {
+       wp_fifo_manager_v1_destroy(display->fifo_manager);
+-   if (display->commit_timing_manager)
++      display->fifo_manager = NULL;
++   }
++   if (display->commit_timing_manager) {
+       wp_commit_timing_manager_v1_destroy(display->commit_timing_manager);
+-   if (display->tearing_control_manager)
++      display->commit_timing_manager = NULL;
++   }
++   if (display->tearing_control_manager) {
+       wp_tearing_control_manager_v1_destroy(display->tearing_control_manager);
+-   if (display->color_manager)
++      display->tearing_control_manager = NULL;
++   }
++   if (display->color_manager) {
+       wp_color_manager_v1_destroy(display->color_manager);
+-   if (display->wl_display_wrapper)
++      display->color_manager = NULL;
++   }
++   if (display->wl_display_wrapper) {
+       wl_proxy_wrapper_destroy(display->wl_display_wrapper);
+-   if (display->queue)
++      display->wl_display_wrapper = NULL;
++   }
++   if (display->queue) {
+       wl_event_queue_destroy(display->queue);
++      display->queue = NULL;
++   }
++}
++
++static void
++wsi_wl_display_finish(struct wsi_wl_display *display)
++{
++   struct wsi_wl_format *f;
++   u_vector_foreach(f, &display->formats)
++      u_vector_finish(&f->modifiers);
++   u_vector_finish(&display->formats);
++   u_vector_finish(&display->colorspaces);
++   u_vector_finish(&display->color_primaries);
++   u_vector_finish(&display->color_transfer_funcs);
++
++   wsi_wl_display_finish_objects(display);
+ }
+ 
+ static VkResult
+@@ -1866,6 +1907,52 @@ wsi_wl_surface_check_presentation(VkIcdS
+    return VK_SUCCESS;
+ }
+ 
++static struct wsi_wl_display *
++wsi_wl_surface_get_query_display(struct wsi_wl_surface *wsi_wl_surface,
++                                 struct wsi_device *wsi_device)
++{
++   struct wsi_wayland *wsi =
++      (struct wsi_wayland *)wsi_device->wsi[VK_ICD_WSI_PLATFORM_WAYLAND];
++   int err;
++
++   err = mtx_lock(&wsi_wl_surface->query_cache.lock);
++   if (err != thrd_success)
++      return NULL;
++
++   /* Fast path: same device */
++   if (wsi_wl_surface->query_cache.last_device == wsi_device)
++      return &wsi_wl_surface->query_cache.cached_display;
++
++   /* Cleanup old cache */
++   if (wsi_wl_surface->query_cache.last_device) {
++      wsi_wl_display_finish(&wsi_wl_surface->query_cache.cached_display);
++      wsi_wl_surface->query_cache.last_device = NULL;
++   }
++
++   /* Zero everything first - prevents any garbage fields */
++   memset(&wsi_wl_surface->query_cache.cached_display, 0,
++          sizeof(struct wsi_wl_display));
++
++   /* Initialize display in query mode (fast, no round-trips) */
++   if (wsi_wl_display_init(wsi, &wsi_wl_surface->query_cache.cached_display,
++                           wsi_wl_surface->base.display, true,
++                           wsi_device->sw, "mesa display query cache")) {
++      mtx_unlock(&wsi_wl_surface->query_cache.lock);
++      return NULL;
++   }
++
++   /* Destroy objects we don't need (keeps it lightweight) */
++   wsi_wl_display_finish_objects(&wsi_wl_surface->query_cache.cached_display);
++   wsi_wl_surface->query_cache.last_device = wsi_device;
++   return &wsi_wl_surface->query_cache.cached_display;
++}
++
++static void
++wsi_wl_surface_release_query_display(struct wsi_wl_surface *wsi_wl_surface)
++{
++   mtx_unlock(&wsi_wl_surface->query_cache.lock);
++}
++
+ static VkResult
+ wsi_wl_surface_get_capabilities2(VkIcdSurfaceBase *surface,
+                                  struct wsi_device *wsi_device,
+@@ -2032,24 +2119,20 @@ wsi_wl_surface_get_formats(VkIcdSurfaceB
+                            uint32_t* pSurfaceFormatCount,
+                            VkSurfaceFormatKHR* pSurfaceFormats)
+ {
+-   VkIcdSurfaceWayland *surface = (VkIcdSurfaceWayland *)icd_surface;
+    struct wsi_wl_surface *wsi_wl_surface =
+       wl_container_of((VkIcdSurfaceWayland *)icd_surface, wsi_wl_surface, base);
+-   struct wsi_wayland *wsi =
+-      (struct wsi_wayland *)wsi_device->wsi[VK_ICD_WSI_PLATFORM_WAYLAND];
+ 
+-   struct wsi_wl_display display;
+-   if (wsi_wl_display_init(wsi, &display, surface->display, true,
+-                           wsi_device->sw, "mesa formats query"))
++   struct wsi_wl_display *display = wsi_wl_surface_get_query_display(wsi_wl_surface, wsi_device);
++   if (!display)
+       return VK_ERROR_SURFACE_LOST_KHR;
+ 
+    VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormatKHR, out,
+                           pSurfaceFormats, pSurfaceFormatCount);
+ 
+    VkColorSpaceKHR *cs;
+-   u_vector_foreach(cs, &display.colorspaces) {
++   u_vector_foreach(cs, &display->colorspaces) {
+       struct wsi_wl_format *disp_fmt;
+-      u_vector_foreach(disp_fmt, &display.formats) {
++      u_vector_foreach(disp_fmt, &display->formats) {
+          /* Skip formats for which we can't support both alpha & opaque
+           * formats.
+           */
+@@ -2065,7 +2148,7 @@ wsi_wl_surface_get_formats(VkIcdSurfaceB
+       }
+    }
+ 
+-   wsi_wl_display_finish(&display);
++   wsi_wl_surface_release_query_display(wsi_wl_surface);
+ 
+    return vk_outarray_status(&out);
+ }
+@@ -2077,24 +2160,20 @@ wsi_wl_surface_get_formats2(VkIcdSurface
+                             uint32_t* pSurfaceFormatCount,
+                             VkSurfaceFormat2KHR* pSurfaceFormats)
+ {
+-   VkIcdSurfaceWayland *surface = (VkIcdSurfaceWayland *)icd_surface;
+    struct wsi_wl_surface *wsi_wl_surface =
+       wl_container_of((VkIcdSurfaceWayland *)icd_surface, wsi_wl_surface, base);
+-   struct wsi_wayland *wsi =
+-      (struct wsi_wayland *)wsi_device->wsi[VK_ICD_WSI_PLATFORM_WAYLAND];
+ 
+-   struct wsi_wl_display display;
+-   if (wsi_wl_display_init(wsi, &display, surface->display, true,
+-                           wsi_device->sw, "mesa formats2 query"))
++   struct wsi_wl_display *display = wsi_wl_surface_get_query_display(wsi_wl_surface, wsi_device);
++   if (!display)
+       return VK_ERROR_SURFACE_LOST_KHR;
+ 
+    VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormat2KHR, out,
+                           pSurfaceFormats, pSurfaceFormatCount);
+ 
+    VkColorSpaceKHR *cs;
+-   u_vector_foreach(cs, &display.colorspaces) {
++   u_vector_foreach(cs, &display->colorspaces) {
+       struct wsi_wl_format *disp_fmt;
+-      u_vector_foreach(disp_fmt, &display.formats) {
++      u_vector_foreach(disp_fmt, &display->formats) {
+          /* Skip formats for which we can't support both alpha & opaque
+           * formats.
+           */
+@@ -2110,7 +2189,7 @@ wsi_wl_surface_get_formats2(VkIcdSurface
+       }
+    }
+ 
+-   wsi_wl_display_finish(&display);
++   wsi_wl_surface_release_query_display(wsi_wl_surface);
+ 
+    return vk_outarray_status(&out);
+ }
+@@ -2121,13 +2200,11 @@ wsi_wl_surface_get_present_modes(VkIcdSu
+                                  uint32_t* pPresentModeCount,
+                                  VkPresentModeKHR* pPresentModes)
+ {
+-   VkIcdSurfaceWayland *surface = (VkIcdSurfaceWayland *)icd_surface;
+-   struct wsi_wayland *wsi =
+-      (struct wsi_wayland *)wsi_device->wsi[VK_ICD_WSI_PLATFORM_WAYLAND];
++   struct wsi_wl_surface *wsi_wl_surface =
++      wl_container_of((VkIcdSurfaceWayland *)icd_surface, wsi_wl_surface, base);
+ 
+-   struct wsi_wl_display display;
+-   if (wsi_wl_display_init(wsi, &display, surface->display, true,
+-                           wsi_device->sw, "mesa present modes query"))
++   struct wsi_wl_display *display = wsi_wl_surface_get_query_display(wsi_wl_surface, wsi_device);
++   if (!display)
+       return VK_ERROR_SURFACE_LOST_KHR;
+ 
+    VkPresentModeKHR present_modes[3];
+@@ -2137,11 +2214,11 @@ wsi_wl_surface_get_present_modes(VkIcdSu
+    present_modes[present_modes_count++] = VK_PRESENT_MODE_MAILBOX_KHR;
+    present_modes[present_modes_count++] = VK_PRESENT_MODE_FIFO_KHR;
+ 
+-   if (display.tearing_control_manager)
++   if (display->has_tearing)
+       present_modes[present_modes_count++] = VK_PRESENT_MODE_IMMEDIATE_KHR;
+ 
+    assert(present_modes_count <= ARRAY_SIZE(present_modes));
+-   wsi_wl_display_finish(&display);
++   wsi_wl_surface_release_query_display(wsi_wl_surface);
+ 
+    if (pPresentModes == NULL) {
+       *pPresentModeCount = present_modes_count;
+@@ -2201,6 +2278,10 @@ wsi_wl_surface_destroy(VkIcdSurfaceBase
+    if (wsi_wl_surface->display)
+       wsi_wl_display_destroy(wsi_wl_surface->display);
+ 
++   if (wsi_wl_surface->query_cache.last_device)
++      wsi_wl_display_finish(&wsi_wl_surface->query_cache.cached_display);
++   mtx_destroy(&wsi_wl_surface->query_cache.lock);
++
+    vk_free2(&instance->alloc, pAllocator, wsi_wl_surface);
+ }
+ 
+@@ -2494,6 +2575,13 @@ wsi_CreateWaylandSurfaceKHR(VkInstance _
+    wsi_wl_surface->instance = instance;
+    wsi_wl_surface->color.colorspace = VK_COLOR_SPACE_PASS_THROUGH_EXT;
+ 
++   if (mtx_init(&wsi_wl_surface->query_cache.lock, mtx_plain) != thrd_success) {
++      vk_free2(&instance->alloc, pAllocator, wsi_wl_surface);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++   wsi_wl_surface->query_cache.last_device = NULL;
++   memset(&wsi_wl_surface->query_cache.cached_display, 0, sizeof(wsi_wl_surface->query_cache.cached_display));
++
+    *pSurface = VkIcdSurfaceBase_to_handle(&surface->base);
+ 
+    return VK_SUCCESS;
+@@ -2836,7 +2924,7 @@ wsi_wl_swapchain_acquire_next_image_expl
+       return VK_ERROR_OUT_OF_DATE_KHR;
+ 
+    STACK_ARRAY(struct wsi_image*, images, wsi_chain->image_count);
+-   for (uint32_t i = 0; i < chain->base.image_count; i++)
++   for (uint32_t i = 0; i < wsi_chain->image_count; i++)
+       images[i] = &chain->images[i].base;
+ 
+    VkResult result;
