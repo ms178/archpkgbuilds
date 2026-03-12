@@ -733,7 +733,7 @@ calc_alignment(struct entry *entry)
    }
 
    entry->align_mul = 1u << (align_mul - 1);
-   bool has_align = nir_intrinsic_infos[entry->intrin->intrinsic].index_map[NIR_INTRINSIC_ALIGN_MUL];
+   bool has_align = nir_intrinsic_has_align_mul(entry->intrin);
    if (!has_align || entry->align_mul >= nir_intrinsic_align_mul(entry->intrin)) {
       entry->align_offset = entry->offset % entry->align_mul;
    } else {
