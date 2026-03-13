@@ -1,3 +1,358 @@
+--- a/drivers/block/zram/backend_lz4.c
++++ b/drivers/block/zram/backend_lz4.c
+@@ -1,25 +1,78 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
+ #include <linux/kernel.h>
+ #include <linux/lz4.h>
+ #include <linux/slab.h>
++#include <linux/string.h>
+ #include <linux/vmalloc.h>
+ 
+ #include "backend_lz4.h"
+ 
+ struct lz4_ctx {
+ 	void *mem;
+-
+ 	LZ4_streamDecode_t *dstrm;
+ 	LZ4_stream_t *cstrm;
+ };
+ 
++struct lz4_drv {
++	LZ4_stream_t base_cstream;
++	const char *dict;
++	int dict_sz;
++};
++
++static inline bool lz4_has_dict(const struct zcomp_params *params)
++{
++	return params->dict_sz != 0;
++}
++
++static void *lz4_alloc_large(size_t size)
++{
++	void *p;
++
++	p = kzalloc(size, GFP_KERNEL | __GFP_NOWARN);
++	if (p)
++		return p;
++
++	return kvzalloc(size, GFP_KERNEL | __GFP_NOWARN);
++}
++
+ static void lz4_release_params(struct zcomp_params *params)
+ {
++	kvfree(params->drv_data);
++	params->drv_data = NULL;
+ }
+ 
+ static int lz4_setup_params(struct zcomp_params *params)
+ {
++	struct lz4_drv *drv;
++	int ret;
++
+ 	if (params->level == ZCOMP_PARAM_NOT_SET)
+ 		params->level = LZ4_ACCELERATION_DEFAULT;
++	else if (params->level < 1)
++		return -EINVAL;
++
++	if (!lz4_has_dict(params))
++		return 0;
++	if (!params->dict)
++		return -EINVAL;
++	if (params->dict_sz > INT_MAX)
++		return -EINVAL;
++
++	drv = lz4_alloc_large(sizeof(*drv));
++	if (!drv)
++		return -ENOMEM;
++
++	ret = LZ4_loadDict(&drv->base_cstream, params->dict,
++			   (int)params->dict_sz);
++	if (ret <= 0) {
++		kvfree(drv);
++		return -EINVAL;
++	}
++
++	drv->dict = (const char *)params->dict + params->dict_sz - ret;
++	drv->dict_sz = ret;
++	params->drv_data = drv;
+ 
+ 	return 0;
+ }
+@@ -31,40 +84,53 @@ static void lz4_destroy(struct zcomp_ctx
+ 	if (!zctx)
+ 		return;
+ 
+-	vfree(zctx->mem);
++	kvfree(zctx->mem);
+ 	kfree(zctx->dstrm);
+-	kfree(zctx->cstrm);
++	kvfree(zctx->cstrm);
+ 	kfree(zctx);
++	ctx->context = NULL;
+ }
+ 
+ static int lz4_create(struct zcomp_params *params, struct zcomp_ctx *ctx)
+ {
+ 	struct lz4_ctx *zctx;
++	bool use_dict = lz4_has_dict(params);
+ 
+ 	zctx = kzalloc(sizeof(*zctx), GFP_KERNEL);
+ 	if (!zctx)
+ 		return -ENOMEM;
+ 
+ 	ctx->context = zctx;
+-	if (params->dict_sz == 0) {
+-		zctx->mem = vmalloc(LZ4_MEM_COMPRESS);
++
++	if (!use_dict) {
++		zctx->mem = kvmalloc(LZ4_MEM_COMPRESS,
++				     GFP_KERNEL | __GFP_NOWARN);
+ 		if (!zctx->mem)
+-			goto error;
+-	} else {
+-		zctx->dstrm = kzalloc(sizeof(*zctx->dstrm), GFP_KERNEL);
+-		if (!zctx->dstrm)
+-			goto error;
+-
+-		zctx->cstrm = kzalloc(sizeof(*zctx->cstrm), GFP_KERNEL);
+-		if (!zctx->cstrm)
+-			goto error;
++			goto err_nomem;
++
++		return 0;
+ 	}
+ 
++	if (!params->drv_data)
++		goto err_inval;
++
++	zctx->dstrm = kzalloc(sizeof(*zctx->dstrm), GFP_KERNEL);
++	if (!zctx->dstrm)
++		goto err_nomem;
++
++	zctx->cstrm = lz4_alloc_large(sizeof(*zctx->cstrm));
++	if (!zctx->cstrm)
++		goto err_nomem;
++
+ 	return 0;
+ 
+-error:
++err_nomem:
+ 	lz4_destroy(ctx);
+ 	return -ENOMEM;
++
++err_inval:
++	lz4_destroy(ctx);
++	return -EINVAL;
+ }
+ 
+ static int lz4_compress(struct zcomp_params *params, struct zcomp_ctx *ctx,
+@@ -73,21 +139,26 @@ static int lz4_compress(struct zcomp_par
+ 	struct lz4_ctx *zctx = ctx->context;
+ 	int ret;
+ 
+-	if (!zctx->cstrm) {
++	if (likely(!zctx->cstrm)) {
+ 		ret = LZ4_compress_fast(req->src, req->dst, req->src_len,
+ 					req->dst_len, params->level,
+ 					zctx->mem);
+ 	} else {
+-		/* Cstrm needs to be reset */
+-		ret = LZ4_loadDict(zctx->cstrm, params->dict, params->dict_sz);
+-		if (ret != params->dict_sz)
++		const struct lz4_drv *drv = params->drv_data;
++
++		if (unlikely(!drv))
+ 			return -EINVAL;
++
++		memcpy(zctx->cstrm, &drv->base_cstream,
++		       sizeof(*zctx->cstrm));
+ 		ret = LZ4_compress_fast_continue(zctx->cstrm, req->src,
+ 						 req->dst, req->src_len,
+ 						 req->dst_len, params->level);
+ 	}
+-	if (!ret)
++
++	if (unlikely(ret <= 0))
+ 		return -EINVAL;
++
+ 	req->dst_len = ret;
+ 	return 0;
+ }
+@@ -98,21 +169,28 @@ static int lz4_decompress(struct zcomp_p
+ 	struct lz4_ctx *zctx = ctx->context;
+ 	int ret;
+ 
+-	if (!zctx->dstrm) {
++	if (likely(!zctx->dstrm)) {
+ 		ret = LZ4_decompress_safe(req->src, req->dst, req->src_len,
+ 					  req->dst_len);
+ 	} else {
+-		/* Dstrm needs to be reset */
+-		ret = LZ4_setStreamDecode(zctx->dstrm, params->dict,
+-					  params->dict_sz);
++		const struct lz4_drv *drv = params->drv_data;
++
++		if (unlikely(!drv))
++			return -EINVAL;
++
++		ret = LZ4_setStreamDecode(zctx->dstrm, drv->dict,
++					  drv->dict_sz);
+ 		if (!ret)
+ 			return -EINVAL;
++
+ 		ret = LZ4_decompress_safe_continue(zctx->dstrm, req->src,
+ 						   req->dst, req->src_len,
+ 						   req->dst_len);
+ 	}
++
+ 	if (ret < 0)
+ 		return -EINVAL;
++
+ 	return 0;
+ }
+ 
+--- a/drivers/block/zram/zcomp.h
++++ b/drivers/block/zram/zcomp.h
+@@ -21,6 +21,7 @@ struct zcomp_params {
+ 	void *dict;
+ 	size_t dict_sz;
+ 	s32 level;
++	u32 dict_gen;
+ 	union {
+ 		struct deflate_params deflate;
+ 	};
+
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -1269,30 +1269,80 @@ static void comp_params_reset(struct zra
+ 	params->deflate.winbits = ZCOMP_PARAM_NOT_SET;
+ 	params->dict_sz = 0;
+ 	params->dict = NULL;
++	params->dict_gen = 0;
+ }
+ 
+-static int comp_params_store(struct zram *zram, u32 prio, s32 level,
+-			     const char *dict_path,
+-			     struct deflate_params *deflate_params)
++static int comp_params_store(struct zram *zram, s32 prio, const char *algo,
++			     s32 level, const char *dict_path,
++			     const struct deflate_params *deflate_params)
+ {
+-	ssize_t sz = 0;
++	void *dict = NULL;
++	ssize_t dict_sz = 0;
++	struct zcomp_params *params;
++	int ret;
++
++	if (!algo &&
++	    (prio < ZRAM_PRIMARY_COMP || prio >= ZRAM_MAX_COMPS))
++		return -EINVAL;
+ 
+-	comp_params_reset(zram, prio);
++	down_read(&zram->init_lock);
++	if (init_done(zram)) {
++		up_read(&zram->init_lock);
++		pr_info("Can't change algorithm params for initialized device\n");
++		return -EBUSY;
++	}
++	up_read(&zram->init_lock);
+ 
+ 	if (dict_path) {
+-		sz = kernel_read_file_from_path(dict_path, 0,
+-						&zram->params[prio].dict,
+-						INT_MAX,
+-						NULL,
+-						READING_POLICY);
+-		if (sz < 0)
+-			return -EINVAL;
++		dict_sz = kernel_read_file_from_path(dict_path, 0, &dict,
++						     INT_MAX, NULL,
++						     READING_POLICY);
++		if (dict_sz < 0)
++			return dict_sz;
++	}
++
++	down_write(&zram->init_lock);
++
++	if (init_done(zram)) {
++		pr_info("Can't change algorithm params for initialized device\n");
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++
++	if (algo) {
++		s32 p;
++
++		prio = -EINVAL;
++		for (p = ZRAM_PRIMARY_COMP; p < ZRAM_MAX_COMPS; p++) {
++			if (!zram->comp_algs[p])
++				continue;
++			if (!strcmp(zram->comp_algs[p], algo)) {
++				prio = p;
++				break;
++			}
++		}
++	}
++
++	if (prio < ZRAM_PRIMARY_COMP || prio >= ZRAM_MAX_COMPS) {
++		ret = -EINVAL;
++		goto out_unlock;
+ 	}
+ 
+-	zram->params[prio].dict_sz = sz;
+-	zram->params[prio].level = level;
+-	zram->params[prio].deflate.winbits = deflate_params->winbits;
+-	return 0;
++	params = &zram->params[prio];
++	vfree(params->dict);
++	params->dict = dict;
++	params->dict_sz = (size_t)dict_sz;
++	params->level = level;
++	params->deflate.winbits = deflate_params->winbits;
++	params->dict_gen++;
++	dict = NULL;
++	ret = 0;
++
++out_unlock:
++	up_write(&zram->init_lock);
++	vfree(dict);
++
++	return ret;
+ }
+ 
+ static ssize_t algorithm_params_store(struct device *dev,
+@@ -1347,26 +1397,8 @@ static ssize_t algorithm_params_store(st
+ 		}
+ 	}
+ 
+-	/* Lookup priority by algorithm name */
+-	if (algo) {
+-		s32 p;
+-
+-		prio = -EINVAL;
+-		for (p = ZRAM_PRIMARY_COMP; p < ZRAM_MAX_COMPS; p++) {
+-			if (!zram->comp_algs[p])
+-				continue;
+-
+-			if (!strcmp(zram->comp_algs[p], algo)) {
+-				prio = p;
+-				break;
+-			}
+-		}
+-	}
+-
+-	if (prio < ZRAM_PRIMARY_COMP || prio >= ZRAM_MAX_COMPS)
+-		return -EINVAL;
+-
+-	ret = comp_params_store(zram, prio, level, dict_path, &deflate_params);
++	ret = comp_params_store(zram, prio, algo, level, dict_path,
++				&deflate_params);
+ 	return ret ? ret : len;
+ }
+ 
+
 --- a/arch/x86/entry/Makefile	2025-12-18 14:00:17.000000000 +0100
 +++ b/arch/x86/entry/Makefile	2025-12-30 00:07:07.373276574 +0100
 @@ -13,6 +13,15 @@ CFLAGS_REMOVE_syscall_64.o	= $(CC_FLAGS_
