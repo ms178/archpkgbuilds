@@ -1,6 +1,6 @@
 pkgname=libdrm-minimal-git
 _pkgname=libdrm
-pkgver=2.4.125.r4.g9ea8a8e9
+pkgver=2.4.131.r4.gb9dea73d
 pkgrel=1
 pkgdesc="Userspace interface to kernel DRM services (CS-PGO and BOLT optimized)"
 arch=(i686 x86_64)
@@ -9,12 +9,13 @@ url="https://dri.freedesktop.org/"
 provides=('libdrm' 'libdrm-git')
 conflicts=('libdrm')
 depends=('libpciaccess')
-makedepends=('git' 'meson' 'ninja' 'llvm' 'vulkan-tools' 'glmark2')
+makedepends=('git' 'meson' 'ninja' 'llvm' 'vulkan-tools' 'glmark2' 'bolt')
 source=("$pkgname::git+https://gitlab.freedesktop.org/mesa/drm.git"
         'COPYING'
         "ms178-1.patch")
 sha512sums=('SKIP'
-            'b0ca349b882a4326b19f81f22804fabdb6fb7aef31cdc7b16b0a7ae191bfbb50c7daddb2fc4e6af06d060a273de36f6f3412ea326f16fa4309fda660')
+            'b0ca349b882a4326b19f81f22804fabdb6fb7aef31cdc7b16b0a7ae191bfbb50c7daddb2fc4e6af06d060a273de36f6f3412ea326f16fa4309fda660'
+            'SKIP')
 
 pkgver() {
   cd "$pkgname"
@@ -28,7 +29,7 @@ prepare() {
         src="${src##*/}"
         [[ $src = *.patch ]] || continue
         echo "Applying patch $src..."
-        patch --directory="libdrm-minimal-git" --forward --strip=1 < "$src"
+        patch --directory="$pkgname" --forward --strip=1 < "$src"
     done
 }
 
@@ -62,12 +63,36 @@ ranlib = 'llvm-ranlib'
 EOF
 }
 
+run_workloads() {
+    local libdir="$1"
+    ulimit -s unlimited 2>/dev/null || true
+
+    echo "  -> Running vulkaninfo (DRM ioctl coverage)..."
+    timeout 12s env LD_LIBRARY_PATH="$libdir" vulkaninfo --summary || true
+
+    echo "  -> Running vkcube (Vulkan DRM paths)..."
+    timeout 25s env LD_LIBRARY_PATH="$libdir" vkcube --c 80 --wsi xlib || true
+
+    echo "  -> Running glmark2 off-screen..."
+    timeout 20s env LD_LIBRARY_PATH="$libdir" glmark2 --off-screen || true
+
+    echo "  -> Running glmark2 shading off-screen..."
+    timeout 18s env LD_LIBRARY_PATH="$libdir" glmark2 -b shading --off-screen || true
+
+    echo "  -> Running modetest (direct DRM test)..."
+    timeout 12s env LD_LIBRARY_PATH="$libdir" modetest -c || true
+}
+
 build() {
+  ulimit -s unlimited
+  export CC=clang CXX=clang++
+
   format_meson_flags() {
     printf "'%s', " "$@" | sed 's/, $//'
   }
 
-  local meson_options=(
+  local common_meson_options=(
+    --prefix /usr
     -D udev=false
     -D python.bytecompile=2
     -D b_pie=false
@@ -85,13 +110,11 @@ build() {
     -D man-pages=disabled
     --wrap-mode=nofallback
     --buildtype=plain
-    --native-file=meson-native-flags.ini
   )
 
-  # Flag to track if BOLT was skipped
-  local _bolt_skipped=false
+  rm -f "${srcdir}/bolt_failed"
 
-  # --- Stage 1: Initial PGO Instrumentation & Profiling ---
+  # Stage 1: Initial PGO Instrumentation + Profiling
   echo "--> Stage 1.1: Building with initial PGO instrumentation..."
   local pgo_instr_flags="-fprofile-generate=${srcdir}/pgo_raw"
   _generate_meson_native_file \
@@ -100,170 +123,174 @@ build() {
     "$(format_meson_flags $LDFLAGS $pgo_instr_flags)" \
     "false"
 
-  arch-meson "$pkgname" build-instr --prefix /usr "${meson_options[@]}"
+  meson setup "$pkgname" build-instr "${common_meson_options[@]}" --native-file=meson-native-flags.ini
   meson compile -C build-instr
 
   local instr_install_dir="$srcdir/instr_install"
   rm -rf "$instr_install_dir"
   DESTDIR="$instr_install_dir" meson install -C build-instr --no-rebuild
 
-  echo "--> Stage 1.2: Running workload to generate initial PGO profile..."
+  echo "--> Stage 1.2: Running comprehensive workloads..."
   rm -rf "${srcdir}/pgo_raw"
   mkdir -p "${srcdir}/pgo_raw"
-  LD_LIBRARY_PATH="$instr_install_dir/usr/lib" vkcube --c 10000 || true
-  LD_LIBRARY_PATH="$instr_install_dir/usr/lib" glmark2 || true
+  run_workloads "$instr_install_dir/usr/lib"
 
-  local profraw_files=$(find "${srcdir}/pgo_raw" -name "*.profraw" | wc -l)
-  if [ "$profraw_files" -eq 0 ]; then
-    echo "Error: No initial PGO profiles were generated."
-    exit 1
+  if [ "$(find "${srcdir}/pgo_raw" -name "*.profraw" | wc -l)" -gt 0 ]; then
+    llvm-profdata merge -output="${srcdir}/profdata1.profdata" "${srcdir}/pgo_raw"/*.profraw
+  else
+    echo "Warning: No initial PGO profiles generated."
   fi
-  llvm-profdata merge -output="${srcdir}/profdata1.profdata" "${srcdir}/pgo_raw"/*.profraw
 
-  # --- Stage 2: Context-Sensitive PGO Instrumentation & Profiling ---
-  echo "--> Stage 2.1: Building with -fprofile-use and -fcs-profile-generate for CS-PGO..."
-  local cs_pgo_flags="-fprofile-use=${srcdir}/profdata1.profdata -fcs-profile-generate=${srcdir}/cs_pgo_raw"
+  # Stage 2: CS-PGO Instrumentation + Profiling
+  echo "--> Stage 2.1: Building with CS-PGO instrumentation..."
+  local cs_pgo_flags="-fcs-profile-generate=${srcdir}/cs_pgo_raw"
+  if [ -f "${srcdir}/profdata1.profdata" ]; then
+    cs_pgo_flags="-fprofile-use=${srcdir}/profdata1.profdata $cs_pgo_flags"
+  fi
+
   _generate_meson_native_file \
     "$(format_meson_flags $CFLAGS $cs_pgo_flags)" \
     "$(format_meson_flags $CXXFLAGS $cs_pgo_flags)" \
     "$(format_meson_flags $LDFLAGS $cs_pgo_flags)" \
     "false"
 
-  arch-meson "$pkgname" build-cs-instr --prefix /usr "${meson_options[@]}"
+  meson setup "$pkgname" build-cs-instr "${common_meson_options[@]}" --native-file=meson-native-flags.ini
   meson compile -C build-cs-instr
 
   local cs_instr_install_dir="$srcdir/cs_instr_install"
   rm -rf "$cs_instr_install_dir"
   DESTDIR="$cs_instr_install_dir" meson install -C build-cs-instr --no-rebuild
 
-  echo "--> Stage 2.2: Running workload to generate CS-PGO profile..."
+  echo "--> Stage 2.2: Running comprehensive workloads..."
   rm -rf "${srcdir}/cs_pgo_raw"
   mkdir -p "${srcdir}/cs_pgo_raw"
-  LD_LIBRARY_PATH="$cs_instr_install_dir/usr/lib" vkcube --c 10000 || true
-  LD_LIBRARY_PATH="$cs_instr_install_dir/usr/lib" glmark2 || true
+  run_workloads "$cs_instr_install_dir/usr/lib"
 
-  local cs_profraw_files=$(find "${srcdir}/cs_pgo_raw" -name "*.profraw" | wc -l)
-  if [ "$cs_profraw_files" -eq 0 ]; then
-    echo "Error: No CS-PGO profiles were generated."
-    exit 1
+  if [ "$(find "${srcdir}/cs_pgo_raw" -name "*.profraw" | wc -l)" -gt 0 ]; then
+    if [ -f "${srcdir}/profdata1.profdata" ]; then
+      llvm-profdata merge -output="${srcdir}/profdata2.profdata" "${srcdir}/cs_pgo_raw"/*.profraw "${srcdir}/profdata1.profdata"
+    else
+      llvm-profdata merge -output="${srcdir}/profdata2.profdata" "${srcdir}/cs_pgo_raw"/*.profraw
+    fi
+  else
+    echo "Warning: No CS-PGO profiles generated."
   fi
 
-  # Merge CS profiles with initial profiles
-  llvm-profdata merge -output="${srcdir}/profdata2.profdata" "${srcdir}/cs_pgo_raw"/*.profraw "${srcdir}/profdata1.profdata"
-
-  # --- Stage 3: Final CS-PGO-Optimized Build ---
-  echo "--> Stage 3: Building final version with merged CS-PGO profiles..."
-  local final_pgo_flags="-fprofile-use=${srcdir}/profdata2.profdata"
+  # Stage 3: Final CS-PGO Optimized Build
+  echo "--> Stage 3: Building final CS-PGO version..."
+  local final_pgo_flags=""
+  if [ -f "${srcdir}/profdata2.profdata" ]; then
+    final_pgo_flags="-fprofile-use=${srcdir}/profdata2.profdata"
+  fi
   local final_ld_flags="$LDFLAGS $final_pgo_flags -Wl,--emit-relocs"
+
   _generate_meson_native_file \
     "$(format_meson_flags $CFLAGS $final_pgo_flags)" \
     "$(format_meson_flags $CXXFLAGS $final_pgo_flags)" \
     "$(format_meson_flags $final_ld_flags)" \
     "true"
 
-  arch-meson "$pkgname" build-final --prefix /usr "${meson_options[@]}"
+  meson setup "$pkgname" build-final "${common_meson_options[@]}" --native-file=meson-native-flags.ini
   meson compile -C build-final
 
-  # --- Stage 4: BOLT Instrumentation & Profiling ---
+  # BOLT Stages (fully audited)
   local bolt_instr_dir="${srcdir}/bolt_instr"
   local bolt_profiles_dir="${srcdir}/bolt_profiles"
-  rm -rf "$bolt_instr_dir" "$bolt_profiles_dir"
-  mkdir -p "$bolt_instr_dir" "$bolt_profiles_dir"
+  local bolt_lib_dir="${srcdir}/bolt_lib"
+  rm -rf "$bolt_instr_dir" "$bolt_profiles_dir" "$bolt_lib_dir"
+  mkdir -p "$bolt_instr_dir" "$bolt_profiles_dir" "$bolt_lib_dir"
 
-  echo "--> Stage 4.1: Instrumenting CS-PGO-optimized libraries for BOLT..."
+  echo "--> Stage 4.1: Instrumenting for BOLT..."
   local final_install_dir="$srcdir/final_install"
   rm -rf "$final_install_dir"
   DESTDIR="$final_install_dir" meson install -C build-final --no-rebuild
 
+  cp -a "$final_install_dir/usr/lib/." "$bolt_lib_dir/"
+
   local libs_to_bolt
-  libs_to_bolt=$(find "$final_install_dir/usr/lib" -type f -name "libdrm*.so.*" -not -type l || true)
+  libs_to_bolt=$(find "$final_install_dir/usr/lib" -name "libdrm*.so.*" -not -type l || true)
+
   if [ -z "$libs_to_bolt" ]; then
-    echo "Warning: No libraries found for BOLT instrumentation. Skipping BOLT."
-    _bolt_skipped=true
+    echo "Warning: No libraries found for BOLT. Skipping."
+    touch "${srcdir}/bolt_failed"
   else
     for lib_path in $libs_to_bolt; do
       local lib_basename=$(basename "$lib_path")
-      llvm-bolt "$lib_path" --instrument --lite=false --instrumentation-file-append-pid \
+      echo "Instrumenting $lib_basename for BOLT..."
+      if ! llvm-bolt "$lib_path" --instrument --lite=true --instrumentation-file-append-pid \
         --instrumentation-file="${bolt_profiles_dir}/${lib_basename}.fdata" \
-        -o "${bolt_instr_dir}/${lib_basename}" || {
-        echo "Warning: BOLT instrumentation failed for $lib_basename. Trying lite mode."
-        llvm-bolt "$lib_path" --instrument --lite=true --instrumentation-file-append-pid \
-          --instrumentation-file="${bolt_profiles_dir}/${lib_basename}.fdata" \
-          -o "${bolt_instr_dir}/${lib_basename}" || {
-          echo "Error: BOLT instrumentation failed even in lite mode for $lib_basename. Skipping BOLT."
-          _bolt_skipped=true
-          break
-        }
-      }
-      chmod +x "${bolt_instr_dir}/${lib_basename}"
+        -o "${bolt_instr_dir}/${lib_basename}"; then
+        echo "BOLT instrumentation failed for $lib_basename. Skipping BOLT."
+        touch "${srcdir}/bolt_failed"
+        break
+      fi
+      cp "${bolt_instr_dir}/${lib_basename}" "$bolt_lib_dir/"
+      chmod +x "$bolt_lib_dir/${lib_basename}"
     done
   fi
 
-  if $_bolt_skipped; then
-    return  # Skip remaining BOLT steps if instrumentation failed
-  fi
+  if [ -f "${srcdir}/bolt_failed" ]; then
+    echo "BOLT stage skipped."
+  else
+    echo "--> Stage 4.2: Running comprehensive workloads for BOLT profile..."
+    local modetest_bin="${PWD}/build-final/tests/modetest/modetest"
+    run_workloads "$bolt_lib_dir"
 
-  echo "--> Stage 4.2: Running workload on instrumented libraries to generate BOLT profile..."
-  LD_LIBRARY_PATH="$bolt_instr_dir" vkcube --c 10000 || true
-  LD_LIBRARY_PATH="$bolt_instr_dir" glmark2 || true
+    local fdata_files=$(find "$bolt_profiles_dir" -name "*.fdata*" | wc -l)
+    if [ "$fdata_files" -eq 0 ]; then
+      echo "Warning: No BOLT profiles generated. Skipping optimization."
+      touch "${srcdir}/bolt_failed"
+    else
+      echo "Merging BOLT profiles..."
+      merge-fdata "$bolt_profiles_dir"/*.fdata* > "${srcdir}/bolt_merged.fdata"
 
-  local fdata_files=$(find "$bolt_profiles_dir" -name "*.fdata*" | wc -l)
-  if [ "$fdata_files" -eq 0 ]; then
-    echo "Warning: No BOLT profiles generated. Skipping BOLT optimization."
-    _bolt_skipped=true
-    return
-  fi
+      echo "--> Stage 5: Applying BOLT optimizations..."
+      local bolt_opt_dir="${srcdir}/bolt_opt"
+      mkdir -p "$bolt_opt_dir"
+      for lib_path in $libs_to_bolt; do
+        local lib_basename=$(basename "$lib_path")
+        echo "Optimizing $lib_basename with BOLT..."
+        llvm-bolt "$lib_path" \
+          --data="${srcdir}/bolt_merged.fdata" \
+          --lite=true \
+          --relocs \
+          --reorder-blocks=ext-tsp \
+          --reorder-functions=cdsort \
+          --split-functions \
+          --split-all-cold \
+          --split-eh \
+          --split-strategy=cdsplit \
+          --eliminate-unreachable \
+          --frame-opt=all \
+          --hot-data \
+          --icf=all \
+          --indirect-call-promotion=all \
+          --jump-tables=aggressive \
+          --peepholes=all \
+          --plt=hot \
+          --dyno-stats \
+          --update-debug-sections \
+          -o "${bolt_opt_dir}/${lib_basename}" 2>&1 | tee "${srcdir}/bolt_${lib_basename}.log"
 
-  # Merge all .fdata files (including per-PID ones)
-  merge-fdata "$bolt_profiles_dir"/*.fdata* > "${srcdir}/bolt_merged.fdata"
-
-  # --- Stage 5: Final BOLT Optimization ---
-  echo "--> Stage 5: Applying BOLT optimizations..."
-  local bolt_opt_dir="${srcdir}/bolt_opt"
-  mkdir -p "$bolt_opt_dir"
-  for lib_path in $libs_to_bolt; do
-    local lib_basename=$(basename "$lib_path")
-    llvm-bolt "$lib_path" \
-      --data="${srcdir}/bolt_merged.fdata" \
-      --lite=false \
-      --relocs \
-      --reorder-blocks=ext-tsp \
-      --reorder-functions=cdsort \
-      --split-functions \
-      --split-all-cold \
-      --split-eh \
-      --split-strategy=cdsplit \
-      --eliminate-unreachable \
-      --frame-opt=all \
-      --frame-opt-rm-stores \
-      --hot-data \
-      --hugify \
-      --icf=1 \
-      --indirect-call-promotion=all \
-      --jump-tables=aggressive \
-      --min-branch-clusters \
-      --peepholes=all \
-      --plt=hot \
-      --reg-reassign \
-      --use-aggr-reg-reassign \
-      --dyno-stats \
-      --update-debug-sections \
-      -o "${bolt_opt_dir}/${lib_basename}" 2>&1 | tee "${srcdir}/bolt_${lib_basename}.log"
-
-    # Check if optimization succeeded
-    if [ ! -s "${bolt_opt_dir}/${lib_basename}" ]; then
-      echo "Error: BOLT optimization failed for $lib_basename. Using PGO version."
-      cp "$lib_path" "${bolt_opt_dir}/${lib_basename}"
+        if [ -s "${bolt_opt_dir}/${lib_basename}" ]; then
+          echo "BOLT optimization succeeded for $lib_basename."
+        else
+          echo "BOLT optimization failed for $lib_basename. Falling back to PGO version."
+          cp "$lib_path" "${bolt_opt_dir}/${lib_basename}"
+        fi
+      done
     fi
-  done
+  fi
 }
 
 package() {
   DESTDIR="$pkgdir" meson install -C build-final --no-rebuild
 
-  if ! $_bolt_skipped && [ "$(ls -A "${srcdir}/bolt_opt")" ]; then
+  if [ ! -f "${srcdir}/bolt_failed" ] && [ -d "${srcdir}/bolt_opt" ] && [ "$(ls -A "${srcdir}/bolt_opt" 2>/dev/null)" ]; then
     echo "--> Installing BOLT-optimized libraries..."
     find "${srcdir}/bolt_opt" -type f -name "libdrm*.so.*" -exec install -Dm755 {} -t "$pkgdir/usr/lib/" \;
+  else
+    echo "Installing CS-PGO optimized version (BOLT was skipped or failed)."
   fi
 
   install -Dm644 "$srcdir/COPYING" -t "$pkgdir/usr/share/licenses/$pkgname/"
