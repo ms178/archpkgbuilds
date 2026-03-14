@@ -684,12 +684,12 @@ optimizations.extend([
    (('fge(nnan,ninf)', ('fadd', a, b), a), ('fge', b, 0.0)),
    (('feq(nnan,ninf)', ('fadd', a, b), a), ('feq', b, 0.0)),
    (('fneu(nnan,ninf)', ('fadd', a, b), a), ('fneu', b, 0.0)),
-   (('flt',  ('~fadd(is_used_once)', a, '#b(is_finite)'), '#c'), ('flt', a,  ('fadd', c, ('fneg', b)))),
-   (('fge',  ('~fadd(is_used_once)', a, '#b(is_finite)'), '#c'), ('fge', a,  ('fadd', c, ('fneg', b)))),
-   (('feq',  ('~fadd(is_used_once)', a, '#b(is_finite)'), '#c'), ('feq', a,  ('fadd', c, ('fneg', b)))),
-   (('fneu', ('~fadd(is_used_once)', a, '#b(is_finite)'), '#c'), ('fneu', a, ('fadd', c, ('fneg', b)))),
-   (('flt',  '#c', ('~fadd(is_used_once)', a, '#b(is_finite)')), ('flt', ('fadd', c, ('fneg', b)), a)),
-   (('fge',  '#c', ('~fadd(is_used_once)', a, '#b(is_finite)')), ('fge', ('fadd', c, ('fneg', b)), a)),
+   (('flt',  ('~fadd(is_used_once)', a, '#b(is_finite)'), '#c(is_finite)'), ('flt', a,  ('fadd', c, ('fneg', b)))),
+   (('fge',  ('~fadd(is_used_once)', a, '#b(is_finite)'), '#c(is_finite)'), ('fge', a,  ('fadd', c, ('fneg', b)))),
+   (('feq',  ('~fadd(is_used_once)', a, '#b(is_finite)'), '#c(is_finite)'), ('feq', a,  ('fadd', c, ('fneg', b)))),
+   (('fneu', ('~fadd(is_used_once)', a, '#b(is_finite)'), '#c(is_finite)'), ('fneu', a, ('fadd', c, ('fneg', b)))),
+   (('flt',  '#c(is_finite)', ('~fadd(is_used_once)', a, '#b(is_finite)')), ('flt', ('fadd', c, ('fneg', b)), a)),
+   (('fge',  '#c(is_finite)', ('~fadd(is_used_once)', a, '#b(is_finite)')), ('fge', ('fadd', c, ('fneg', b)), a)),
 
    (('ieq', ('iadd', a, b), a), ('ieq', b, 0)),
    (('ine', ('iadd', a, b), a), ('ine', b, 0)),
@@ -3763,6 +3763,7 @@ late_optimizations += [
     (('i2imp', a), ('u2u16', a), '!options->preserve_mediump', TestStatus.UNSUPPORTED),
     (('u2fmp', a), ('u2f16', a), '!options->preserve_mediump', TestStatus.UNSUPPORTED),
 
+    (('fisfinite(ninf)', a), ('feq', a, a)),
     (('fisfinite', a), ('flt', ('fabs', a), float('inf'))),
 
     (('f2f16', a), ('f2f16_rtz', a),
