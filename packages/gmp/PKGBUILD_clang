@@ -1,26 +1,24 @@
 pkgname=gmp
 pkgver=6.3.0
-pkgrel=3.1
+pkgrel=4.1
 pkgdesc='A free library for arbitrary precision arithmetic'
 arch=(x86_64)
 url='https://gmplib.org/'
 depends=(gcc-libs sh)
-makedepends=(clang llvm lld git)
-license=(LGPL3 GPL)
+makedepends=(clang llvm lld)
+license=(LGPL-3.0-or-later GPL-2.0-or-later)
 source=(https://gmplib.org/download/gmp/gmp-$pkgver.tar.lz{,.sig})
 sha256sums=('2c7f4f0d370801b2849c48c9ef3f59553b5f1d3791d070cffb04599f9fc67b41'
             'SKIP')
-validpgpkeys=('343C2FF0FBEE5EC2EDBEF399F3599FF828C67298')   # Niels Möller
-options=(strip)
+validpgpkeys=('343C2FF0FBEE5EC2EDBEF399F3599FF828C67298')
+options=(!lto strip)
 
 prepare() {
-  cd $pkgname-$pkgver
-  # Ensure we use clang for compilation
-  export CC=clang
-  export CXX=clang++
-  export CC_LD=lld
-  export CXX_LD=lld
-  export LDFLAGS="-fuse-ld=lld"
+  cd "$pkgname-$pkgver"
+
+  # Embed -fuse-ld=lld into CC/CXX so libtool cannot mangle it.
+  export CC="clang -fuse-ld=lld"
+  export CXX="clang++ -fuse-ld=lld"
   export AR=llvm-ar
   export NM=llvm-nm
   export STRIP=llvm-strip
@@ -28,109 +26,222 @@ prepare() {
   export OBJDUMP=llvm-objdump
   export READELF=llvm-readelf
   export RANLIB=llvm-ranlib
-  export HOSTCC=clang
-  export HOSTCXX=clang++
+  export HOSTCC="clang -fuse-ld=lld"
+  export HOSTCXX="clang++ -fuse-ld=lld"
   export HOSTAR=llvm-ar
 }
 
 build() {
-  cd $pkgname-$pkgver
+  cd "$pkgname-$pkgver"
 
-  # Setup cleanup trap (exclude $srcdir/cspgo to preserve cs.profdata)
-  trap 'rm -rf "$srcdir/pgo"' EXIT
+  local _orig_cflags="$CFLAGS"
+  local _orig_cxxflags="$CXXFLAGS"
+  local _orig_ldflags="$LDFLAGS"
 
-  # Create directory for PGO profiles
-  mkdir -p "$srcdir/pgo"
+  local _pgo_dir="$srcdir/pgo"
+  local _cspgo_dir="$srcdir/cspgo"
+  local _bolt_dir="$srcdir/bolt"
 
-  # Create directory for CS-PGO profiles
-  mkdir -p "$srcdir/cspgo"
+  rm -rf "$_pgo_dir" "$_cspgo_dir" "$_bolt_dir"
+  mkdir -p "$_pgo_dir" "$_cspgo_dir" "$_bolt_dir"
 
-  # Common additional flags for both instrumentation phases (compiler flags only)
-  local _common_instrument_flags=" -g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=50 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling"
+  local _instr_flags=(
+    -g3
+    -fno-omit-frame-pointer
+    -Xclang -mllvm -Xclang -vp-counters-per-site=50
+    -Xclang -mllvm -Xclang -runtime-counter-relocation
+    -Xclang -mllvm -Xclang -enable-value-profiling
+  )
 
-  # --- Stage 1: Build with PGO instrumentation ---
-  local _pgo_instrument_flags=" -fprofile-generate=$srcdir/pgo $_common_instrument_flags"
-  local _original_cflags="$CFLAGS"
-  local _original_cxxflags="$CXXFLAGS"
-  local _original_ldflags="$LDFLAGS"
-  # Apply PGO flags only to CFLAGS and CXXFLAGS, not LDFLAGS
-  CFLAGS+=" $_pgo_instrument_flags"
-  CXXFLAGS+=" $_pgo_instrument_flags"
+  local _pgo_silence=(
+    -Wno-profile-instr-out-of-date
+    -Wno-profile-instr-unprofiled
+  )
 
-  echo "CFLAGS for PGO instrumentation: $CFLAGS"
-  echo "CXXFLAGS for PGO instrumentation: $CXXFLAGS"
-  echo "LDFLAGS for PGO instrumentation: $LDFLAGS"
-
-  ./configure --build=${CHOST} \
-    --prefix=/usr \
+  local _common_configure=(
+    --build="$CHOST"
+    --prefix=/usr
     --enable-cxx
+  )
 
+  # ── Stage 1: PGO instrumented build ──────────────────────────────
+  echo "→ Stage 1: PGO instrumented build..."
+  CFLAGS="$_orig_cflags -fprofile-generate=$_pgo_dir ${_instr_flags[*]}"
+  CXXFLAGS="$_orig_cxxflags -fprofile-generate=$_pgo_dir ${_instr_flags[*]}"
+  LDFLAGS="$_orig_ldflags -fprofile-generate=$_pgo_dir"
+
+  ./configure "${_common_configure[@]}"
   make
 
-  # Run tests to generate PGO profile data
-  echo "Running tests to generate PGO profile data..."
-  make check
+  echo "→ Stage 1: Training workload (make check)..."
+  make check || true
 
-  # Merge PGO profiles
-  echo "Merging PGO profiles..."
-  llvm-profdata merge -output="$srcdir/pgo/default.profdata" "$srcdir"/pgo/*.profraw
+  echo "→ Stage 1: Merging profiles..."
+  local -a pgo_raws=()
+  shopt -s nullglob
+  pgo_raws=("$_pgo_dir"/*.profraw)
+  shopt -u nullglob
 
-  # Clean up build directory for the next stage
+  if (( ${#pgo_raws[@]} )); then
+    llvm-profdata merge -sparse -output="$_pgo_dir/merged.profdata" "${pgo_raws[@]}"
+  else
+    echo "Error: Stage 1 produced no .profraw files." >&2
+    return 1
+  fi
+
   make distclean
 
-  # --- Stage 2: Build with CS-PGO instrumentation ---
-  local _cspgo_instrument_flags=" -fprofile-use=$srcdir/pgo/default.profdata -fcs-profile-generate=$srcdir/cspgo $_common_instrument_flags"
-  # Apply CS-PGO flags only to CFLAGS and CXXFLAGS, not LDFLAGS
-  CFLAGS="$_original_cflags $_cspgo_instrument_flags"
-  CXXFLAGS="$_original_cxxflags $_cspgo_instrument_flags"
-  LDFLAGS="$_original_ldflags"
+  # ── Stage 2: CS-PGO instrumented build ───────────────────────────
+  echo "→ Stage 2: CS-PGO instrumented build..."
+  CFLAGS="$_orig_cflags -fprofile-use=$_pgo_dir/merged.profdata -fcs-profile-generate=$_cspgo_dir ${_pgo_silence[*]} ${_instr_flags[*]}"
+  CXXFLAGS="$_orig_cxxflags -fprofile-use=$_pgo_dir/merged.profdata -fcs-profile-generate=$_cspgo_dir ${_pgo_silence[*]} ${_instr_flags[*]}"
+  LDFLAGS="$_orig_ldflags -fprofile-use=$_pgo_dir/merged.profdata -fcs-profile-generate=$_cspgo_dir"
 
-  echo "CFLAGS for CS-PGO instrumentation: $CFLAGS"
-  echo "CXXFLAGS for CS-PGO instrumentation: $CXXFLAGS"
-  echo "LDFLAGS for CS-PGO instrumentation: $LDFLAGS"
-
-  ./configure --build=${CHOST} \
-    --prefix=/usr \
-    --enable-cxx
-
+  ./configure "${_common_configure[@]}"
   make
 
-  # Run tests to generate CS-PGO profile data
-  echo "Running tests to generate CS-PGO profile data..."
-  make check
+  echo "→ Stage 2: Training workload (make check)..."
+  make check || true
 
-  # Merge CS-PGO profiles with PGO profiles
-  echo "Merging CS-PGO profiles with PGO profiles..."
-  llvm-profdata merge -output="$srcdir/cspgo/cs.profdata" "$srcdir/cspgo"/*.profraw "$srcdir/pgo/default.profdata"
+  echo "→ Stage 2: Merging profiles..."
+  local -a cs_raws=()
+  shopt -s nullglob
+  cs_raws=("$_cspgo_dir"/*.profraw)
+  shopt -u nullglob
 
-  # Clean up build directory for the final stage
+  if (( ${#cs_raws[@]} )); then
+    llvm-profdata merge -sparse -output="$_cspgo_dir/final.profdata" \
+      "$_pgo_dir/merged.profdata" "${cs_raws[@]}"
+  else
+    echo "Error: Stage 2 produced no CS-PGO .profraw files." >&2
+    return 1
+  fi
+
   make distclean
 
-  # --- Stage 3: Build with merged CS-PGO data ---
-  # Apply CS-PGO optimization flags only to CFLAGS and CXXFLAGS, not LDFLAGS
-  CFLAGS="$_original_cflags -fprofile-use=$srcdir/cspgo/cs.profdata"
-  CXXFLAGS="$_original_cxxflags -fprofile-use=$srcdir/cspgo/cs.profdata"
-  LDFLAGS="$_original_ldflags"
+  # ── Stage 3: Final optimized build (with --emit-relocs for BOLT) ─
+  echo "→ Stage 3: Final optimized build..."
+  CFLAGS="$_orig_cflags -fprofile-use=$_cspgo_dir/final.profdata ${_pgo_silence[*]}"
+  CXXFLAGS="$_orig_cxxflags -fprofile-use=$_cspgo_dir/final.profdata ${_pgo_silence[*]}"
+  LDFLAGS="$_orig_ldflags -fprofile-use=$_cspgo_dir/final.profdata -Wl,--emit-relocs"
 
-  echo "CFLAGS for CS-PGO optimization: $CFLAGS"
-  echo "CXXFLAGS for CS-PGO optimization: $CXXFLAGS"
-  echo "LDFLAGS for CS-PGO optimization: $LDFLAGS"
-
-  ./configure --build=${CHOST} \
-    --prefix=/usr \
-    --enable-cxx
-
+  ./configure "${_common_configure[@]}"
   make
+
+  # ── Stage 4: BOLT optimization of shared libraries ──────────────
+  if ! command -v llvm-bolt >/dev/null 2>&1; then
+    echo "→ Stage 4: llvm-bolt not found; skipping BOLT."
+  else
+    echo "→ Stage 4: BOLT optimization..."
+
+    local _so_file _so_name _bolt_any=0
+
+    for _so_file in .libs/libgmp.so.*.*.* .libs/libgmpxx.so.*.*.*; do
+      [[ -f "$_so_file" && ! -L "$_so_file" ]] || continue
+      _so_name=$(basename "$_so_file")
+
+      echo "  -> Instrumenting ${_so_name}..."
+      cp -f "$_so_file" "$_bolt_dir/${_so_name}.orig"
+
+      if llvm-bolt "$_bolt_dir/${_so_name}.orig" \
+        --instrument \
+        --lite=true \
+        --instrumentation-file-append-pid \
+        --instrumentation-file="$_bolt_dir/${_so_name}.fdata" \
+        -o "$_bolt_dir/${_so_name}.instr"; then
+
+        cp -f "$_bolt_dir/${_so_name}.instr" "$_so_file"
+        _bolt_any=1
+      else
+        echo "  -> BOLT instrumentation failed for ${_so_name}; skipping."
+        cp -f "$_bolt_dir/${_so_name}.orig" "$_so_file"
+      fi
+    done
+
+    if (( _bolt_any )); then
+      ldconfig -n .libs 2>/dev/null || true
+
+      echo "  -> BOLT training workload (make check)..."
+      make check || true
+
+      for _so_file in .libs/libgmp.so.*.*.* .libs/libgmpxx.so.*.*.*; do
+        [[ -f "$_so_file" && ! -L "$_so_file" ]] || continue
+        _so_name=$(basename "$_so_file")
+
+        [[ -f "$_bolt_dir/${_so_name}.orig" ]] || continue
+
+        local -a _fdata_files=()
+        shopt -s nullglob
+        _fdata_files=("$_bolt_dir/${_so_name}".fdata*)
+        shopt -u nullglob
+
+        if (( ! ${#_fdata_files[@]} )); then
+          echo "  -> No BOLT fdata for ${_so_name}; restoring original."
+          cp -f "$_bolt_dir/${_so_name}.orig" "$_so_file"
+          continue
+        fi
+
+        local _merged="$_bolt_dir/${_so_name}.merged.fdata"
+        if command -v merge-fdata >/dev/null 2>&1; then
+          merge-fdata "${_fdata_files[@]}" > "$_merged" 2>/dev/null || \
+            cat "${_fdata_files[@]}" > "$_merged"
+        else
+          cat "${_fdata_files[@]}" > "$_merged"
+        fi
+
+        if [[ ! -s "$_merged" ]]; then
+          echo "  -> Empty BOLT data for ${_so_name}; restoring original."
+          cp -f "$_bolt_dir/${_so_name}.orig" "$_so_file"
+          continue
+        fi
+
+        echo "  -> Applying BOLT to ${_so_name}..."
+        if llvm-bolt "$_bolt_dir/${_so_name}.orig" \
+          --data="$_merged" \
+          --lite=true \
+          --relocs \
+          --reorder-blocks=ext-tsp \
+          --reorder-functions=cdsort \
+          --split-functions \
+          --split-all-cold \
+          --split-strategy=cdsplit \
+          --icf=all \
+          --plt=all \
+          --peepholes=all \
+          --indirect-call-promotion=all \
+          --jump-tables=aggressive \
+          --peepholes=all \
+          --x86-strip-redundant-address-size \
+          --plt=hot \
+          --dyno-stats \
+          -o "$_bolt_dir/${_so_name}.bolt"; then
+
+          if [[ -s "$_bolt_dir/${_so_name}.bolt" ]]; then
+            install -m755 "$_bolt_dir/${_so_name}.bolt" "$_so_file"
+            echo "  -> BOLT applied to ${_so_name}."
+          fi
+        else
+          echo "  -> BOLT optimization failed for ${_so_name}; restoring original."
+          cp -f "$_bolt_dir/${_so_name}.orig" "$_so_file"
+        fi
+      done
+    else
+      echo "  -> No libraries were successfully instrumented; skipping BOLT."
+    fi
+  fi
+
+  # DO NOT delete profile data here.
+  # Libtool relinks during `make install` and needs the profile data
+  # path to still exist, because -fprofile-use is baked into the
+  # recorded link command in .la files.
 }
 
 check() {
-  # Run tests on the final optimized build
   cd "$srcdir/$pkgname-$pkgver"
   make check
 }
 
 package() {
-  # Install from the source directory (final build)
   cd "$srcdir/$pkgname-$pkgver"
-  make DESTDIR="${pkgdir}" install
+  make DESTDIR="$pkgdir" install
 }
