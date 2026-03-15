@@ -550,7 +550,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, s32 this_cpu, u64 
 	if (preferred_idle_scan && !is_system_busy())
 		return pick_idle_cpu_scan(p, prev_cpu);
 
-	if (!bpf_ksym_exists(scx_bpf_select_cpu_and)) {
+	if (!__COMPAT_HAS_scx_bpf_select_cpu_and) {
 		bool is_idle = false;
 
 		if (this_cpu < 0)
