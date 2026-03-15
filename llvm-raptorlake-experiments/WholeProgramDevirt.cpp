@@ -254,6 +254,78 @@ struct PatternList {
     return false;
   }
 };
+
+using TypeMemberList = SmallVector<TypeMemberInfo, 4>;
+
+static void dedupTypeMembers(TypeMemberList &Members) {
+  TypeMemberList UniqueMembers;
+  UniqueMembers.reserve(Members.size());
+
+  for (const TypeMemberInfo &TM : Members) {
+    bool Seen = false;
+    for (const TypeMemberInfo &Existing : UniqueMembers) {
+      if (Existing.Bits == TM.Bits && Existing.Offset == TM.Offset) {
+        Seen = true;
+        break;
+      }
+    }
+    if (!Seen)
+      UniqueMembers.push_back(TM);
+  }
+
+  Members.swap(UniqueMembers);
+}
+
+static unsigned saturatingAddToUnsigned(unsigned Accum, size_t Delta) {
+  const size_t MaxAdditional = static_cast<size_t>(~0u - Accum);
+  if (Delta > MaxAdditional)
+    return ~0u;
+  return Accum + static_cast<unsigned>(Delta);
+}
+
+static unsigned estimateCallSlotCount(Function *PublicTypeTestFunc,
+                                      Function *TypeTestFunc,
+                                      Function *TypeCheckedLoadFunc,
+                                      Function *TypeCheckedLoadRelativeFunc) {
+  unsigned Estimated = 0;
+
+  if (PublicTypeTestFunc)
+    Estimated =
+        saturatingAddToUnsigned(Estimated, PublicTypeTestFunc->getNumUses());
+  if (TypeTestFunc)
+    Estimated = saturatingAddToUnsigned(Estimated, TypeTestFunc->getNumUses());
+  if (TypeCheckedLoadFunc)
+    Estimated =
+        saturatingAddToUnsigned(Estimated, TypeCheckedLoadFunc->getNumUses());
+  if (TypeCheckedLoadRelativeFunc)
+    Estimated = saturatingAddToUnsigned(
+        Estimated, TypeCheckedLoadRelativeFunc->getNumUses());
+
+  return Estimated != 0 ? Estimated : 8u;
+}
+
+static unsigned estimateSummaryCallSlotCount(const ModuleSummaryIndex &Index) {
+  unsigned Estimated = 0;
+
+  for (const auto &P : Index) {
+    for (const auto &S : P.second.getSummaryList()) {
+      auto *FS = dyn_cast<FunctionSummary>(S.get());
+      if (!FS)
+        continue;
+
+      Estimated = saturatingAddToUnsigned(
+          Estimated, FS->type_test_assume_vcalls().size());
+      Estimated = saturatingAddToUnsigned(
+          Estimated, FS->type_checked_load_vcalls().size());
+      Estimated = saturatingAddToUnsigned(
+          Estimated, FS->type_test_assume_const_vcalls().size());
+      Estimated = saturatingAddToUnsigned(
+          Estimated, FS->type_checked_load_const_vcalls().size());
+    }
+  }
+
+  return Estimated != 0 ? Estimated : 8u;
+}
 } // namespace
 
 // Find the minimum offset that we may store a value of size Size bits at. If
@@ -319,29 +391,29 @@ wholeprogramdevirt::findLowestOffset(ArrayRef<VirtualCallTarget> Targets,
       if (BitsUsed != 0xff)
         return (MinByte + I) * 8 + llvm::countr_zero(uint8_t(~BitsUsed));
     }
-  } else {
-    // Find a free (Size/8) byte region in each member of Used.
-    // FIXME: see if alignment helps.
-    uint64_t BytesNeeded = Size / 8;
-    for (unsigned I = 0;; ++I) {
-      bool Free = true;
-      for (auto &&B : Used) {
-        unsigned Byte = 0;
-        while ((I + Byte) < B.size() && Byte < BytesNeeded) {
-          if (B[I + Byte]) {
-            Free = false;
-            break;
-          }
-          ++Byte;
-        }
-        if (!Free)
+  }
+
+  // Find a free (Size/8) byte region in each member of Used.
+  // FIXME: see if alignment helps.
+  const uint64_t BytesNeeded = Size / 8;
+  for (unsigned I = 0;; ++I) {
+    bool Free = true;
+    for (auto &&B : Used) {
+      unsigned Byte = 0;
+      while ((I + Byte) < B.size() && Byte < BytesNeeded) {
+        if (B[I + Byte]) {
+          Free = false;
           break;
+        }
+        ++Byte;
       }
-      if (Free)
-        // Rounding up ensures the constant is always stored at address we
-        // can directly load from without misalignment.
-        return alignTo((MinByte + I) * 8, Size);
+      if (!Free)
+        break;
     }
+    if (Free)
+      // Rounding up ensures the constant is always stored at address we
+      // can directly load from without misalignment.
+      return alignTo((MinByte + I) * 8, Size);
   }
 }
 
@@ -381,8 +453,7 @@ void wholeprogramdevirt::setAfterReturnValues(
 }
 
 VirtualCallTarget::VirtualCallTarget(GlobalValue *Fn, const TypeMemberInfo *TM)
-    : Fn(Fn), TM(TM),
-      IsBigEndian(Fn->getDataLayout().isBigEndian()),
+    : Fn(Fn), TM(TM), IsBigEndian(Fn->getDataLayout().isBigEndian()),
       WasDevirt(false) {}
 
 namespace {
@@ -392,6 +463,16 @@ namespace {
 // the virtual function pointer.
 struct VTableSlot {
   Metadata *TypeID;
+  uint64_t ByteOffset;
+};
+
+struct VTableEntryKey {
+  GlobalVariable *GV;
+  uint64_t ByteOffset;
+};
+
+struct SummaryVTableEntryKey {
+  const GlobalVarSummary *VS;
   uint64_t ByteOffset;
 };
 
@@ -410,8 +491,7 @@ template <> struct llvm::DenseMapInfo<VTableSlot> {
     return DenseMapInfo<Metadata *>::getHashValue(I.TypeID) ^
            DenseMapInfo<uint64_t>::getHashValue(I.ByteOffset);
   }
-  static bool isEqual(const VTableSlot &LHS,
-                      const VTableSlot &RHS) {
+  static bool isEqual(const VTableSlot &LHS, const VTableSlot &RHS) {
     return LHS.TypeID == RHS.TypeID && LHS.ByteOffset == RHS.ByteOffset;
   }
 };
@@ -432,6 +512,43 @@ template <> struct llvm::DenseMapInfo<VTableSlotSummary> {
   static bool isEqual(const VTableSlotSummary &LHS,
                       const VTableSlotSummary &RHS) {
     return LHS.TypeID == RHS.TypeID && LHS.ByteOffset == RHS.ByteOffset;
+  }
+};
+
+template <> struct llvm::DenseMapInfo<VTableEntryKey> {
+  static VTableEntryKey getEmptyKey() {
+    return {DenseMapInfo<GlobalVariable *>::getEmptyKey(),
+            DenseMapInfo<uint64_t>::getEmptyKey()};
+  }
+  static VTableEntryKey getTombstoneKey() {
+    return {DenseMapInfo<GlobalVariable *>::getTombstoneKey(),
+            DenseMapInfo<uint64_t>::getTombstoneKey()};
+  }
+  static unsigned getHashValue(const VTableEntryKey &I) {
+    return DenseMapInfo<GlobalVariable *>::getHashValue(I.GV) ^
+           DenseMapInfo<uint64_t>::getHashValue(I.ByteOffset);
+  }
+  static bool isEqual(const VTableEntryKey &LHS, const VTableEntryKey &RHS) {
+    return LHS.GV == RHS.GV && LHS.ByteOffset == RHS.ByteOffset;
+  }
+};
+
+template <> struct llvm::DenseMapInfo<SummaryVTableEntryKey> {
+  static SummaryVTableEntryKey getEmptyKey() {
+    return {DenseMapInfo<const GlobalVarSummary *>::getEmptyKey(),
+            DenseMapInfo<uint64_t>::getEmptyKey()};
+  }
+  static SummaryVTableEntryKey getTombstoneKey() {
+    return {DenseMapInfo<const GlobalVarSummary *>::getTombstoneKey(),
+            DenseMapInfo<uint64_t>::getTombstoneKey()};
+  }
+  static unsigned getHashValue(const SummaryVTableEntryKey &I) {
+    return DenseMapInfo<const GlobalVarSummary *>::getHashValue(I.VS) ^
+           DenseMapInfo<uint64_t>::getHashValue(I.ByteOffset);
+  }
+  static bool isEqual(const SummaryVTableEntryKey &LHS,
+                      const SummaryVTableEntryKey &RHS) {
+    return LHS.VS == RHS.VS && LHS.ByteOffset == RHS.ByteOffset;
   }
 };
 
@@ -462,8 +579,9 @@ static bool mustBeUnreachableFunction(ValueInfo TheFnVI) {
         return false;
     }
     // Be conservative if a non-function has the same GUID (which is rare).
-    else
+    else {
       return false;
+    }
   }
   // All function summaries are live and all of them agree that the function is
   // unreachble.
@@ -471,7 +589,7 @@ static bool mustBeUnreachableFunction(ValueInfo TheFnVI) {
 }
 
 namespace {
-// A virtual call site. VTable is the loaded virtual table pointer, and CS is
+// A virtual call site. VTable is the loaded virtual table pointer, and CB is
 // the indirect virtual call.
 struct VirtualCallSite {
   Value *VTable = nullptr;
@@ -482,9 +600,9 @@ struct VirtualCallSite {
   // of that field for details.
   unsigned *NumUnsafeUses = nullptr;
 
-  void
-  emitRemark(const StringRef OptName, const StringRef TargetName,
-             function_ref<OptimizationRemarkEmitter &(Function &)> OREGetter) {
+  void emitRemark(const StringRef OptName, const StringRef TargetName,
+                  function_ref<OptimizationRemarkEmitter &(Function &)>
+                      OREGetter) {
     Function *F = CB->getCaller();
     DebugLoc DLoc = CB->getDebugLoc();
     BasicBlock *Block = CB->getParent();
@@ -497,18 +615,17 @@ struct VirtualCallSite {
   }
 
   void replaceAndErase(
-      const StringRef OptName, const StringRef TargetName, bool RemarksEnabled,
-      function_ref<OptimizationRemarkEmitter &(Function &)> OREGetter,
-      Value *New) {
+    const StringRef OptName, const StringRef TargetName, bool RemarksEnabled,
+    function_ref<OptimizationRemarkEmitter &(Function &)> OREGetter,
+                       Value *New) {
     if (RemarksEnabled)
       emitRemark(OptName, TargetName, OREGetter);
     CB->replaceAllUsesWith(New);
     if (auto *II = dyn_cast<InvokeInst>(CB)) {
-      BranchInst::Create(II->getNormalDest(), CB->getIterator());
+      UncondBrInst::Create(II->getNormalDest(), CB->getIterator());
       II->getUnwindDest()->removePredecessor(II->getParent());
     }
     CB->eraseFromParent();
-    // This use is no longer unsafe.
     if (NumUnsafeUses)
       --*NumUnsafeUses;
   }
@@ -581,17 +698,20 @@ private:
 };
 
 CallSiteInfo &VTableSlotInfo::findCallSiteInfo(CallBase &CB) {
-  std::vector<uint64_t> Args;
+  SmallVector<uint64_t, 4> Args;
   auto *CBType = dyn_cast<IntegerType>(CB.getType());
   if (!CBType || CBType->getBitWidth() > 64 || CB.arg_empty())
     return CSInfo;
+
+  Args.reserve(CB.arg_size() - 1);
   for (auto &&Arg : drop_begin(CB.args())) {
     auto *CI = dyn_cast<ConstantInt>(Arg);
     if (!CI || CI->getBitWidth() > 64)
       return CSInfo;
     Args.push_back(CI->getZExtValue());
   }
-  return ConstCSInfo[Args];
+
+  return ConstCSInfo[std::vector<uint64_t>(Args.begin(), Args.end())];
 }
 
 void VTableSlotInfo::addCallSite(Value *VTable, CallBase &CB,
@@ -643,6 +763,10 @@ struct DevirtModule {
   std::map<CallInst *, unsigned> NumUnsafeUsesForTypeTest;
   PatternList FunctionsToSkip;
 
+  DenseMap<VTableEntryKey, std::pair<Function *, Constant *>> VTableEntryCache;
+  DenseMap<Function *, bool> MustBeUnreachableCache;
+  DenseMap<Function *, DominatorTree *> DTCache;
+
   const bool DevirtSpeculatively;
   DevirtModule(Module &M, ModuleAnalysisManager &MAM,
                ModuleSummaryIndex *ExportSummary,
@@ -664,24 +788,28 @@ struct DevirtModule {
         DevirtSpeculatively(DevirtSpeculatively) {
     assert(!(ExportSummary && ImportSummary));
     FunctionsToSkip.init(SkipFunctionNames);
+    VTableEntryCache.reserve(static_cast<unsigned>(M.global_size()));
+    MustBeUnreachableCache.reserve(static_cast<unsigned>(M.size()));
+    DTCache.reserve(static_cast<unsigned>(M.size()));
   }
 
   bool areRemarksEnabled();
 
-  void
-  scanTypeTestUsers(Function *TypeTestFunc,
-                    DenseMap<Metadata *, std::set<TypeMemberInfo>> &TypeIdMap);
+  void scanTypeTestUsers(Function *TypeTestFunc,
+                         DenseMap<Metadata *, TypeMemberList> &TypeIdMap);
   void scanTypeCheckedLoadUsers(Function *TypeCheckedLoadFunc);
 
-  void buildTypeIdentifierMap(
-      std::vector<VTableBits> &Bits,
-      DenseMap<Metadata *, std::set<TypeMemberInfo>> &TypeIdMap);
+  void buildTypeIdentifierMap(std::vector<VTableBits> &Bits,
+                              DenseMap<Metadata *, TypeMemberList> &TypeIdMap);
 
-  bool
-  tryFindVirtualCallTargets(std::vector<VirtualCallTarget> &TargetsForSlot,
-                            const std::set<TypeMemberInfo> &TypeMemberInfos,
-                            uint64_t ByteOffset,
-                            ModuleSummaryIndex *ExportSummary);
+  bool tryFindVirtualCallTargets(std::vector<VirtualCallTarget> &TargetsForSlot,
+                                 ArrayRef<TypeMemberInfo> TypeMemberInfos,
+                                 uint64_t ByteOffset);
+
+  std::pair<Function *, Constant *>
+  getCachedFunctionAtVTableOffset(GlobalVariable *GV, uint64_t ByteOffset);
+  bool mustBeUnreachableCached(Function *Fn);
+  DominatorTree &getDT(Function &F);
 
   void applySingleImplDevirt(VTableSlotInfo &SlotInfo, Constant *TheFn,
                              bool &IsExported);
@@ -795,6 +923,8 @@ struct DevirtIndex {
   DenseSet<StringRef> *ExternallyVisibleSymbolNamesPtr;
 
   MapVector<VTableSlotSummary, VTableSlotInfo> CallSlots;
+  DenseMap<SummaryVTableEntryKey, SmallVector<ValueInfo, 1>>
+      VTableFuncsAtOffsetCache;
 
   PatternList FunctionsToSkip;
 
@@ -812,6 +942,10 @@ struct DevirtIndex {
   bool tryFindVirtualCallTargets(std::vector<ValueInfo> &TargetsForSlot,
                                  const TypeIdCompatibleVtableInfo TIdInfo,
                                  uint64_t ByteOffset);
+
+  const SmallVector<ValueInfo, 1> &
+  getOrBuildVTableFuncsAtOffset(const GlobalVarSummary *VS,
+                                uint64_t VTableOffset);
 
   bool trySingleImplDevirt(MutableArrayRef<ValueInfo> TargetsForSlot,
                            VTableSlotSummary &SlotSummary,
@@ -1100,7 +1234,7 @@ bool DevirtModule::runForTesting(Module &M, ModuleAnalysisManager &MAM,
 
 void DevirtModule::buildTypeIdentifierMap(
     std::vector<VTableBits> &Bits,
-    DenseMap<Metadata *, std::set<TypeMemberInfo>> &TypeIdMap) {
+    DenseMap<Metadata *, TypeMemberList> &TypeIdMap) {
   DenseMap<GlobalVariable *, VTableBits *> GVToBits;
   Bits.reserve(M.global_size());
   GVToBits.reserve(M.global_size());
@@ -1128,29 +1262,68 @@ void DevirtModule::buildTypeIdentifierMap(
               cast<ConstantAsMetadata>(Type->getOperand(0))->getValue())
               ->getZExtValue();
 
-      TypeIdMap[TypeID].insert({BitsPtr, Offset});
+      TypeIdMap[TypeID].push_back({BitsPtr, Offset});
     }
   }
+
+  for (auto &KV : TypeIdMap)
+    dedupTypeMembers(KV.second);
+}
+
+std::pair<Function *, Constant *>
+DevirtModule::getCachedFunctionAtVTableOffset(GlobalVariable *GV,
+                                              uint64_t ByteOffset) {
+  VTableEntryKey Key{GV, ByteOffset};
+  auto It = VTableEntryCache.find(Key);
+  if (It != VTableEntryCache.end())
+    return It->second;
+
+  std::pair<Function *, Constant *> Result =
+      getFunctionAtVTableOffset(GV, ByteOffset, M);
+  auto [InsertedIt, Inserted] = VTableEntryCache.try_emplace(Key, Result);
+  (void)Inserted;
+  return InsertedIt->second;
+}
+
+bool DevirtModule::mustBeUnreachableCached(Function *Fn) {
+  auto It = MustBeUnreachableCache.find(Fn);
+  if (It != MustBeUnreachableCache.end())
+    return It->second;
+
+  const bool MustBeUnreachable = mustBeUnreachableFunction(Fn, ExportSummary);
+  auto [InsertedIt, Inserted] =
+      MustBeUnreachableCache.try_emplace(Fn, MustBeUnreachable);
+  (void)Inserted;
+  return InsertedIt->second;
+}
+
+DominatorTree &DevirtModule::getDT(Function &F) {
+  DominatorTree *&Entry = DTCache[&F];
+  if (!Entry)
+    Entry = &FAM.getResult<DominatorTreeAnalysis>(F);
+  return *Entry;
 }
 
 bool DevirtModule::tryFindVirtualCallTargets(
     std::vector<VirtualCallTarget> &TargetsForSlot,
-    const std::set<TypeMemberInfo> &TypeMemberInfos, uint64_t ByteOffset,
-    ModuleSummaryIndex *ExportSummary) {
+    ArrayRef<TypeMemberInfo> TypeMemberInfos, uint64_t ByteOffset) {
+  TargetsForSlot.reserve(TargetsForSlot.size() + TypeMemberInfos.size());
+
   for (const TypeMemberInfo &TM : TypeMemberInfos) {
-    if (!TM.Bits->GV->isConstant())
+    GlobalVariable *GV = TM.Bits->GV;
+    if (!GV->isConstant())
       return false;
 
     // Without DevirtSpeculatively, we cannot perform whole program
     // devirtualization analysis on a vtable with public LTO visibility.
-    if (!DevirtSpeculatively && TM.Bits->GV->getVCallVisibility() ==
-                                    GlobalObject::VCallVisibilityPublic)
+    if (!DevirtSpeculatively &&
+        GV->getVCallVisibility() == GlobalObject::VCallVisibilityPublic)
       return false;
 
     Function *Fn = nullptr;
     Constant *C = nullptr;
     std::tie(Fn, C) =
-        getFunctionAtVTableOffset(TM.Bits->GV, TM.Offset + ByteOffset, M);
+        getCachedFunctionAtVTableOffset(GV, TM.Offset + ByteOffset);
 
     if (!Fn)
       return false;
@@ -1171,14 +1344,14 @@ bool DevirtModule::tryFindVirtualCallTargets(
 
     // We can disregard unreachable functions as possible call targets, as
     // unreachable functions shouldn't be called.
-    if (mustBeUnreachableFunction(Fn, ExportSummary))
+    if (mustBeUnreachableCached(Fn))
       continue;
 
     // Save the symbol used in the vtable to use as the devirtualization
     // target.
-    auto *GV = dyn_cast<GlobalValue>(C);
-    assert(GV);
-    TargetsForSlot.push_back({GV, &TM});
+    auto *TargetGV = dyn_cast<GlobalValue>(C);
+    assert(TargetGV);
+    TargetsForSlot.push_back({TargetGV, &TM});
   }
 
   // Give up if we couldn't find any targets.
@@ -1188,6 +1361,8 @@ bool DevirtModule::tryFindVirtualCallTargets(
 bool DevirtIndex::tryFindVirtualCallTargets(
     std::vector<ValueInfo> &TargetsForSlot,
     const TypeIdCompatibleVtableInfo TIdInfo, uint64_t ByteOffset) {
+  TargetsForSlot.reserve(TargetsForSlot.size() + TIdInfo.size());
+
   for (const TypeIdOffsetVtableInfo &P : TIdInfo) {
     // Find a representative copy of the vtable initializer.
     // We can have multiple available_externally, linkonce_odr and weak_odr
@@ -1227,19 +1402,34 @@ bool DevirtIndex::tryFindVirtualCallTargets(
       return false;
     if (!VS->isLive())
       continue;
-    for (auto VTP : VS->vTableFuncs()) {
-      if (VTP.VTableOffset != P.AddressPointOffset + ByteOffset)
-        continue;
 
-      if (mustBeUnreachableFunction(VTP.FuncVI))
-        continue;
-
-      TargetsForSlot.push_back(VTP.FuncVI);
-    }
+    append_range(TargetsForSlot, getOrBuildVTableFuncsAtOffset(
+                                     VS, P.AddressPointOffset + ByteOffset));
   }
 
   // Give up if we couldn't find any targets.
   return !TargetsForSlot.empty();
+}
+
+const SmallVector<ValueInfo, 1> &
+DevirtIndex::getOrBuildVTableFuncsAtOffset(const GlobalVarSummary *VS,
+                                           uint64_t VTableOffset) {
+  SummaryVTableEntryKey Key{VS, VTableOffset};
+  auto It = VTableFuncsAtOffsetCache.find(Key);
+  if (It != VTableFuncsAtOffsetCache.end())
+    return It->second;
+
+  SmallVector<ValueInfo, 1> Matches;
+  for (auto VTP : VS->vTableFuncs()) {
+    if (VTP.VTableOffset == VTableOffset &&
+        !mustBeUnreachableFunction(VTP.FuncVI))
+      Matches.push_back(VTP.FuncVI);
+  }
+
+  auto [InsertedIt, Inserted] =
+      VTableFuncsAtOffsetCache.try_emplace(Key, std::move(Matches));
+  (void)Inserted;
+  return InsertedIt->second;
 }
 
 void DevirtModule::applySingleImplDevirt(VTableSlotInfo &SlotInfo,
@@ -1470,8 +1660,9 @@ bool DevirtIndex::trySingleImplDevirt(MutableArrayRef<ValueInfo> TargetsForSlot,
       LocalWPDTargetsMap[TheFn].push_back(SlotSummary);
       Res->SingleImplName = std::string(TheFn.name());
     }
-  } else
+  } else {
     Res->SingleImplName = std::string(TheFn.name());
+  }
 
   // Name will be empty if this thin link driven off of serialized combined
   // index (e.g. llvm-lto). However, WPD is not supported/invoked for the
@@ -1513,8 +1704,8 @@ void DevirtModule::tryICallBranchFunnel(
   // buildBitSetsFromDisjointSet. But still report_fatal_error in Verifier
   // or SelectionDAGBuilder later, because operands linkage type consistency
   // check of icall.branch.funnel can not pass.
-  for (auto &T : TargetsForSlot) {
-    if (T.TM->Bits->GV->hasAvailableExternallyLinkage())
+  for (auto &Target : TargetsForSlot) {
+    if (Target.TM->Bits->GV->hasAvailableExternallyLinkage())
       return;
   }
 
@@ -1535,9 +1726,9 @@ void DevirtModule::tryICallBranchFunnel(
 
   std::vector<Value *> JTArgs;
   JTArgs.push_back(JT->arg_begin());
-  for (auto &T : TargetsForSlot) {
-    JTArgs.push_back(getMemberAddr(T.TM));
-    JTArgs.push_back(T.Fn);
+  for (auto &Target : TargetsForSlot) {
+    JTArgs.push_back(getMemberAddr(Target.TM));
+    JTArgs.push_back(Target.Fn);
   }
 
   BasicBlock *BB = BasicBlock::Create(M.getContext(), "", JT, nullptr);
@@ -2004,7 +2195,8 @@ bool DevirtModule::tryVirtualConstProp(
 
     // Calculate the total amount of padding needed to store a value at both
     // ends of the object.
-    uint64_t TotalPaddingBefore = 0, TotalPaddingAfter = 0;
+    uint64_t TotalPaddingBefore = 0;
+    uint64_t TotalPaddingAfter = 0;
     for (auto &&Target : TargetsForSlot) {
       TotalPaddingBefore += std::max<int64_t>(
           (AllocBefore + 7) / 8 - Target.allocatedBeforeBytes() - 1, 0);
@@ -2039,7 +2231,6 @@ bool DevirtModule::tryVirtualConstProp(
     if (RemarksEnabled || AreStatisticsEnabled())
       for (auto &&Target : TargetsForSlot)
         Target.WasDevirt = true;
-
 
     if (CSByConstantArg.second.isExported()) {
       ResByArg->TheKind = WholeProgramDevirtResolution::ByArg::VirtualConstProp;
@@ -2117,8 +2308,7 @@ bool DevirtModule::areRemarksEnabled() {
 }
 
 void DevirtModule::scanTypeTestUsers(
-    Function *TypeTestFunc,
-    DenseMap<Metadata *, std::set<TypeMemberInfo>> &TypeIdMap) {
+    Function *TypeTestFunc, DenseMap<Metadata *, TypeMemberList> &TypeIdMap) {
   // Find all virtual calls via a virtual table pointer %p under an assumption
   // of the form llvm.assume(llvm.type.test(%p, %md)) or
   // llvm.assume(llvm.public.type.test(%p, %md)).
@@ -2132,7 +2322,7 @@ void DevirtModule::scanTypeTestUsers(
     // Search for virtual calls based on %p and add them to DevirtCalls.
     SmallVector<DevirtCallSite, 1> DevirtCalls;
     SmallVector<CallInst *, 1> Assumes;
-    auto &DT = FAM.getResult<DominatorTreeAnalysis>(*CI->getFunction());
+    DominatorTree &DT = getDT(*CI->getFunction());
     findDevirtualizableCallsForTypeTest(DevirtCalls, Assumes, CI, DT);
 
     Metadata *TypeId =
@@ -2209,7 +2399,7 @@ void DevirtModule::scanTypeCheckedLoadUsers(Function *TypeCheckedLoadFunc) {
     SmallVector<Instruction *, 1> LoadedPtrs;
     SmallVector<Instruction *, 1> Preds;
     bool HasNonCallUses = false;
-    auto &DT = FAM.getResult<DominatorTreeAnalysis>(*CI->getFunction());
+    DominatorTree &DT = getDT(*CI->getFunction());
     findDevirtualizableCallsForTypeCheckedLoad(DevirtCalls, LoadedPtrs, Preds,
                                                HasNonCallUses, CI, DT);
 
@@ -2261,16 +2451,16 @@ void DevirtModule::scanTypeCheckedLoadUsers(Function *TypeCheckedLoadFunc) {
 
     // The number of unsafe uses is initially the number of uses.
     auto &NumUnsafeUses = NumUnsafeUsesForTypeTest[TypeTestCall];
-    NumUnsafeUses = DevirtCalls.size();
+    NumUnsafeUses = static_cast<unsigned>(DevirtCalls.size());
 
     // If the function pointer has a non-call user, we cannot eliminate the type
     // check, as one of those users may eventually call the pointer. Increment
     // the unsafe use count to make sure it cannot reach zero.
     if (HasNonCallUses)
       ++NumUnsafeUses;
-    for (DevirtCallSite Call : DevirtCalls) {
-      CallSlots[{TypeId, Call.Offset}].addCallSite(Ptr, Call.CB, &NumUnsafeUses);
-    }
+    for (DevirtCallSite Call : DevirtCalls)
+      CallSlots[{TypeId, Call.Offset}].addCallSite(Ptr, Call.CB,
+                                                   &NumUnsafeUses);
 
     CI->eraseFromParent();
   }
@@ -2440,9 +2630,13 @@ bool DevirtModule::run() {
        TypeCheckedLoadRelativeFunc->use_empty()))
     return false;
 
+  CallSlots.reserve(estimateCallSlotCount(PublicTypeTestFunc, TypeTestFunc,
+                                          TypeCheckedLoadFunc,
+                                          TypeCheckedLoadRelativeFunc));
+
   // Rebuild type metadata into a map for easy lookup.
   std::vector<VTableBits> Bits;
-  DenseMap<Metadata *, std::set<TypeMemberInfo>> TypeIdMap;
+  DenseMap<Metadata *, TypeMemberList> TypeIdMap;
   buildTypeIdentifierMap(Bits, TypeIdMap);
 
   if (PublicTypeTestFunc && AssumeFunc)
@@ -2480,6 +2674,7 @@ bool DevirtModule::run() {
   // Collect information from summary about which calls to try to devirtualize.
   if (ExportSummary) {
     DenseMap<GlobalValue::GUID, TinyPtrVector<Metadata *>> MetadataByGUID;
+    MetadataByGUID.reserve(static_cast<unsigned>(TypeIdMap.size()));
     for (auto &P : TypeIdMap) {
       if (auto *TypeId = dyn_cast<MDString>(P.first))
         MetadataByGUID[GlobalValue::getGUIDAssumingExternalLinkage(
@@ -2500,7 +2695,8 @@ bool DevirtModule::run() {
         }
         for (FunctionSummary::VFuncId VF : FS->type_checked_load_vcalls()) {
           for (Metadata *MD : MetadataByGUID[VF.GUID]) {
-            CallSlots[{MD, VF.Offset}].CSInfo.addSummaryTypeCheckedLoadUser(FS);
+            CallSlots[{MD, VF.Offset}]
+                .CSInfo.addSummaryTypeCheckedLoadUser(FS);
           }
         }
         for (const FunctionSummary::ConstVCall &VC :
@@ -2532,7 +2728,7 @@ bool DevirtModule::run() {
     // TargetsForSlot.
     std::vector<VirtualCallTarget> TargetsForSlot;
     WholeProgramDevirtResolution *Res = nullptr;
-    const std::set<TypeMemberInfo> &TypeMemberInfos = TypeIdMap[S.first.TypeID];
+    const TypeMemberList &TypeMemberInfos = TypeIdMap[S.first.TypeID];
     if (ExportSummary && isa<MDString>(S.first.TypeID) &&
         TypeMemberInfos.size())
       // For any type id used on a global's type metadata, create the type id
@@ -2546,7 +2742,7 @@ bool DevirtModule::run() {
                      cast<MDString>(S.first.TypeID)->getString())
                  .WPDRes[S.first.ByteOffset];
     if (tryFindVirtualCallTargets(TargetsForSlot, TypeMemberInfos,
-                                  S.first.ByteOffset, ExportSummary)) {
+                                  S.first.ByteOffset)) {
       bool SingleImplDevirt =
           trySingleImplDevirt(ExportSummary, TargetsForSlot, S.second, Res);
       // Out of speculative devirtualization mode, Try to apply virtual constant
@@ -2633,7 +2829,13 @@ void DevirtIndex::run() {
   assert(!ExportSummary.withInternalizeAndPromote() &&
          "Expect index-based WPD to run before internalization and promotion");
 
+  const unsigned EstimatedCallSlots = estimateSummaryCallSlotCount(ExportSummary);
+  CallSlots.reserve(EstimatedCallSlots);
+  VTableFuncsAtOffsetCache.reserve(EstimatedCallSlots);
+
   DenseMap<GlobalValue::GUID, std::vector<StringRef>> NameByGUID;
+  NameByGUID.reserve(static_cast<unsigned>(
+      ExportSummary.typeIdCompatibleVtableMap().size()));
   for (const auto &P : ExportSummary.typeIdCompatibleVtableMap()) {
     NameByGUID[GlobalValue::getGUIDAssumingExternalLinkage(P.first)].push_back(
         P.first);
@@ -2660,7 +2862,8 @@ void DevirtIndex::run() {
       }
       for (FunctionSummary::VFuncId VF : FS->type_checked_load_vcalls()) {
         for (StringRef Name : NameByGUID[VF.GUID]) {
-          CallSlots[{Name, VF.Offset}].CSInfo.addSummaryTypeCheckedLoadUser(FS);
+          CallSlots[{Name, VF.Offset}]
+              .CSInfo.addSummaryTypeCheckedLoadUser(FS);
         }
       }
       for (const FunctionSummary::ConstVCall &VC :
@@ -2689,7 +2892,8 @@ void DevirtIndex::run() {
     // function implementation at offset S.first.ByteOffset, and add to
     // TargetsForSlot.
     std::vector<ValueInfo> TargetsForSlot;
-    auto TidSummary = ExportSummary.getTypeIdCompatibleVtableSummary(S.first.TypeID);
+    auto TidSummary =
+        ExportSummary.getTypeIdCompatibleVtableSummary(S.first.TypeID);
     assert(TidSummary);
     // The type id summary would have been created while building the NameByGUID
     // map earlier.
