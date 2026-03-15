@@ -1,11 +1,11 @@
 pkgname=alsa-lib
 _pkgver=1.2.15.3
 pkgver=$_pkgver
-pkgrel=3.8
-pkgdesc="An alternative implementation of Linux sound support (PGO+CS-PGO optimized)"
+pkgrel=14.1
+pkgdesc='An alternative implementation of Linux sound support (custom desktop/gaming CS-PGO + selective BOLT optimized)'
 arch=(x86_64)
-url="https://www.alsa-project.org"
-license=(LGPL2.1)
+url='https://www.alsa-project.org'
+license=(LGPL-2.1-or-later)
 depends=(
   alsa-topology-conf
   alsa-ucm-conf
@@ -19,177 +19,1186 @@ makedepends=(
   git
   clang
   llvm
-  autoconf automake libtool
-)
-checkdepends=(
-  # Add any check-only dependencies if applicable
+  lld
+  autoconf
+  automake
+  libtool
+  alsa-topology-conf
 )
 install=${pkgname}.install
-options=(strip)
+options=(!lto strip)
 source=(
   "$pkgname-$_pkgver::git+https://github.com/alsa-project/alsa-lib.git#tag=v$_pkgver"
 )
-sha512sums=('SKIP')
-b2sums=('SKIP')
-validpgpkeys=('F04DF50737AC1A884C4B3D718380596DA6E59C91') # ALSA project
+sha256sums=('SKIP')
+
+_setup_llvm_toolchain() {
+  export CC="clang -fuse-ld=lld"
+  export CXX="clang++ -fuse-ld=lld"
+  export AR=llvm-ar
+  export NM=llvm-nm
+  export STRIP=llvm-strip
+  export RANLIB=llvm-ranlib
+  export READELF=llvm-readelf
+  export OBJCOPY=llvm-objcopy
+  export OBJDUMP=llvm-objdump
+}
+
+_stage_slug() {
+  printf '%s' "$1" | tr ' /' '__'
+}
+
+_detect_topology_api() {
+  local srcroot="$1"
+  local outvar="$2"
+  local have_build_file=0
+  local header="$srcroot/include/topology.h"
+
+  [[ -f "$header" ]] || {
+    printf -v "$outvar" '%d' 0
+    return 0
+  }
+
+  grep -q 'snd_tplg_build_file' "$header" && have_build_file=1
+  printf -v "$outvar" '%d' "$have_build_file"
+}
+
+_collect_topology_candidates() {
+  local srcroot="$1"
+  local -n _out_ref="$2"
+  _out_ref=()
+
+  local -A seen=()
+  local f
+
+  # Only collect real topology DSL-style files.
+  # We intentionally avoid generic ALSA config files in src/conf/cards/pcm/etc,
+  # because they validated but did not improve libatopology coverage meaningfully.
+  while IFS= read -r -d '' f; do
+    [[ -n "${seen[$f]:-}" ]] && continue
+    seen["$f"]=1
+
+    # Require topology-like sections in the text file.
+    if grep -IqE '^[[:space:]]*Section(Manifest|VendorTokens|Data|PCM|Widget|Graph|Control|Mixer|Enum|Bytes|DAPM|Text)' "$f" 2>/dev/null; then
+      _out_ref+=("$f")
+    fi
+  done < <(
+    {
+      [[ -d /usr/share/alsa/topology ]] && \
+        find /usr/share/alsa/topology -type f \
+          \( -name '*.conf' -o -name '*.conf.in' -o -name '*.tplgconf' -o -name '*.txt' -o -name '*.topology' \) \
+          -print0 2>/dev/null
+      find "$srcroot" -type f -path '*/topology/*' \
+        \( -name '*.conf' -o -name '*.conf.in' -o -name '*.tplgconf' -o -name '*.txt' -o -name '*.topology' \) \
+        -print0 2>/dev/null
+    }
+  )
+
+  # Cap candidate count to keep probing/training bounded.
+  if (( ${#_out_ref[@]} > 64 )); then
+    _out_ref=("${_out_ref[@]:0:64}")
+  fi
+
+  echo "→ Topology candidate discovery: found ${#_out_ref[@]} topology-like candidate file(s)."
+  local x
+  for x in "${_out_ref[@]}"; do
+    echo "  -> candidate: $x"
+  done
+}
+
+_reverse_array() {
+  local -n _in_ref="$1"
+  local -n _out_ref="$2"
+  _out_ref=()
+
+  local i
+  for (( i=${#_in_ref[@]}-1; i>=0; i-- )); do
+    _out_ref+=("${_in_ref[i]}")
+  done
+}
+
+_rotate_array_half() {
+  local -n _in_ref="$1"
+  local -n _out_ref="$2"
+  _out_ref=()
+
+  local n=${#_in_ref[@]}
+  (( n == 0 )) && return 0
+
+  local start=$(( n / 2 ))
+  local i
+  for (( i=0; i<n; i++ )); do
+    _out_ref+=("${_in_ref[(start + i) % n]}")
+  done
+}
+
+_create_pgo_training_source() {
+  local have_tplg_build_file="$1"
+
+  cat > "$srcdir/alsa_pgo_training.c" <<EOF
+#define _GNU_SOURCE
+#define HAVE_TPLG_BUILD_FILE $have_tplg_build_file
+
+#include <alsa/asoundlib.h>
+#include <alsa/topology.h>
+#include <dlfcn.h>
+#include <math.h>
+#include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define WR_PERIODS         4096
+#define MMAP_PERIODS       2048
+#define STAT_PERIODS       1024
+#define CAP_PERIODS        1024
+#define OC_CYCLES           256
+#define XRUN_CYCLES          64
+#define CFG_ITERS            64
+#define TPLG_BUILD_ITERS     96
+#define TPLG_BOLT_ITERS     384
+#define TPLG_NEWFREE_ITERS 20000
+
+static const char *LOCAL_CFG =
+  "pcm.pgo_null {\\n"
+  "  type null\\n"
+  "}\\n"
+  "pcm.pgo_plug {\\n"
+  "  type plug\\n"
+  "  slave.pcm pgo_null\\n"
+  "}\\n"
+  "pcm.pgo_rate {\\n"
+  "  type rate\\n"
+  "  slave {\\n"
+  "    pcm pgo_null\\n"
+  "    rate 48000\\n"
+  "  }\\n"
+  "}\\n"
+  "pcm.pgo_route {\\n"
+  "  type route\\n"
+  "  slave {\\n"
+  "    pcm pgo_null\\n"
+  "    channels 2\\n"
+  "  }\\n"
+  "  ttable.0.0 1\\n"
+  "  ttable.1.1 1\\n"
+  "}\\n";
+
+static void print_loaded_libs(void) {
+  Dl_info info;
+
+  if (dladdr((void *)&snd_pcm_open_lconf, &info) && info.dli_fname)
+    printf("  libasound path: %s\\n", info.dli_fname);
+
+  if (dladdr((void *)&snd_tplg_new, &info) && info.dli_fname)
+    printf("  libatopology path: %s\\n", info.dli_fname);
+}
+
+static snd_config_t *make_lconf(void) {
+  snd_config_t *c = NULL;
+  snd_input_t *in = NULL;
+
+  if (snd_config_top(&c) < 0)
+    return NULL;
+  if (snd_input_buffer_open(&in, LOCAL_CFG, strlen(LOCAL_CFG)) < 0) {
+    snd_config_delete(c);
+    return NULL;
+  }
+  if (snd_config_load(c, in) < 0) {
+    snd_input_close(in);
+    snd_config_delete(c);
+    return NULL;
+  }
+  snd_input_close(in);
+  return c;
+}
+
+static void gen_s16(short *b, int frames, int ch, float freq, float rate, float *ph) {
+  for (int i = 0; i < frames; i++) {
+    short v = (short)(32000.0f * sinf(*ph));
+    for (int c = 0; c < ch; c++)
+      b[i * ch + c] = v;
+    *ph += 2.0f * (float)M_PI * freq / rate;
+    if (*ph >= 2.0f * (float)M_PI)
+      *ph -= 2.0f * (float)M_PI;
+  }
+}
+
+static void gen_s32(int *b, int frames, int ch, float freq, float rate, float *ph) {
+  for (int i = 0; i < frames; i++) {
+    int v = (int)(2000000000.0f * sinf(*ph));
+    for (int c = 0; c < ch; c++)
+      b[i * ch + c] = v;
+    *ph += 2.0f * (float)M_PI * freq / rate;
+    if (*ph >= 2.0f * (float)M_PI)
+      *ph -= 2.0f * (float)M_PI;
+  }
+}
+
+static void gen_flt(float *b, int frames, int ch, float freq, float rate, float *ph) {
+  for (int i = 0; i < frames; i++) {
+    float v = 0.8f * sinf(*ph);
+    for (int c = 0; c < ch; c++)
+      b[i * ch + c] = v;
+    *ph += 2.0f * (float)M_PI * freq / rate;
+    if (*ph >= 2.0f * (float)M_PI)
+      *ph -= 2.0f * (float)M_PI;
+  }
+}
+
+static void fill_buf(void *buf, snd_pcm_format_t fmt, int frames, int ch, float rate, float *ph) {
+  switch (fmt) {
+    case SND_PCM_FORMAT_S16_LE:
+    case SND_PCM_FORMAT_S16_BE:
+      gen_s16((short *)buf, frames, ch, 440.f, rate, ph);
+      break;
+    case SND_PCM_FORMAT_S32_LE:
+    case SND_PCM_FORMAT_S32_BE:
+      gen_s32((int *)buf, frames, ch, 440.f, rate, ph);
+      break;
+    case SND_PCM_FORMAT_FLOAT_LE:
+    case SND_PCM_FORMAT_FLOAT_BE:
+      gen_flt((float *)buf, frames, ch, 440.f, rate, ph);
+      break;
+    default:
+      memset(buf, 0, frames * ch * (snd_pcm_format_physical_width(fmt) / 8));
+      break;
+  }
+}
+
+static snd_pcm_t *setup_pcm(
+  snd_config_t *lc,
+  const char *dev,
+  snd_pcm_stream_t dir,
+  int mode,
+  snd_pcm_access_t acc,
+  snd_pcm_format_t fmt,
+  unsigned *rate,
+  unsigned ch,
+  snd_pcm_uframes_t *period
+) {
+  snd_pcm_t *p = NULL;
+  snd_pcm_hw_params_t *hw;
+  snd_pcm_sw_params_t *sw;
+
+  if (snd_pcm_open_lconf(&p, dev, dir, mode, lc) < 0)
+    return NULL;
+
+  snd_pcm_hw_params_alloca(&hw);
+  snd_pcm_sw_params_alloca(&sw);
+
+  if (snd_pcm_hw_params_any(p, hw) < 0)
+    goto fail;
+  if (snd_pcm_hw_params_set_access(p, hw, acc) < 0)
+    goto fail;
+  if (snd_pcm_hw_params_set_format(p, hw, fmt) < 0)
+    goto fail;
+  if (snd_pcm_hw_params_set_rate_near(p, hw, rate, NULL) < 0)
+    goto fail;
+  if (snd_pcm_hw_params_set_channels(p, hw, ch) < 0)
+    goto fail;
+  if (snd_pcm_hw_params_set_period_size_near(p, hw, period, NULL) < 0)
+    goto fail;
+
+  unsigned periods = 4;
+  snd_pcm_hw_params_set_periods_near(p, hw, &periods, NULL);
+
+  if (snd_pcm_hw_params(p, hw) < 0)
+    goto fail;
+  if (snd_pcm_sw_params_current(p, sw) < 0)
+    goto fail;
+
+  snd_pcm_sw_params_set_start_threshold(p, sw, *period);
+  snd_pcm_sw_params_set_avail_min(p, sw, *period);
+
+  if (snd_pcm_sw_params(p, sw) < 0)
+    goto fail;
+
+  return p;
+
+fail:
+  snd_pcm_close(p);
+  return NULL;
+}
+
+static void ex_config(void) {
+  printf("  config: %d parse/copy/search cycles\\n", CFG_ITERS);
+  for (int i = 0; i < CFG_ITERS; i++) {
+    snd_config_t *c = make_lconf();
+    if (!c)
+      continue;
+
+    snd_config_t *node = NULL;
+    snd_config_search(c, "pcm", &node);
+
+    snd_config_t *copy = NULL;
+    snd_config_copy(&copy, c);
+    if (copy)
+      snd_config_delete(copy);
+
+    snd_config_delete(c);
+  }
+}
+
+static void ex_format_utils(void) {
+  snd_pcm_format_t fmts[] = {
+    SND_PCM_FORMAT_S16_LE,
+    SND_PCM_FORMAT_S32_LE,
+    SND_PCM_FORMAT_FLOAT_LE,
+    SND_PCM_FORMAT_U8
+  };
+
+  for (unsigned i = 0; i < sizeof(fmts) / sizeof(fmts[0]); i++) {
+    (void)snd_pcm_format_name(fmts[i]);
+    (void)snd_pcm_format_description(fmts[i]);
+    (void)snd_pcm_format_physical_width(fmts[i]);
+    (void)snd_pcm_format_width(fmts[i]);
+    (void)snd_pcm_format_signed(fmts[i]);
+    (void)snd_pcm_format_unsigned(fmts[i]);
+    (void)snd_pcm_format_linear(fmts[i]);
+    (void)snd_pcm_format_float(fmts[i]);
+    (void)snd_pcm_format_little_endian(fmts[i]);
+    (void)snd_pcm_format_big_endian(fmts[i]);
+  }
+}
+
+static void ex_writei(snd_config_t *lc) {
+  struct cfg {
+    const char *dev;
+    snd_pcm_format_t fmt;
+    unsigned rate, ch;
+    snd_pcm_uframes_t period;
+  } cfgs[] = {
+    {"pgo_null",  SND_PCM_FORMAT_S16_LE,   48000, 2, 128},
+    {"pgo_null",  SND_PCM_FORMAT_S16_LE,   48000, 2, 256},
+    {"pgo_null",  SND_PCM_FORMAT_S16_LE,   48000, 2, 512},
+    {"pgo_null",  SND_PCM_FORMAT_S16_LE,   44100, 2, 256},
+    {"pgo_null",  SND_PCM_FORMAT_S32_LE,   48000, 2, 256},
+    {"pgo_null",  SND_PCM_FORMAT_FLOAT_LE, 48000, 2, 256},
+    {"pgo_null",  SND_PCM_FORMAT_S16_LE,   48000, 6, 256},
+    {"pgo_null",  SND_PCM_FORMAT_S16_LE,   48000, 8, 256},
+    {"pgo_plug",  SND_PCM_FORMAT_S16_LE,   48000, 2, 256},
+    {"pgo_plug",  SND_PCM_FORMAT_S32_LE,   44100, 2, 256},
+    {"pgo_rate",  SND_PCM_FORMAT_S16_LE,   44100, 2, 256},
+    {"pgo_route", SND_PCM_FORMAT_S16_LE,   48000, 2, 256},
+  };
+
+  int n = (int)(sizeof(cfgs) / sizeof(cfgs[0]));
+  printf("  writei: %d configs x %d periods\\n", n, WR_PERIODS);
+
+  for (int i = 0; i < n; i++) {
+    unsigned rate = cfgs[i].rate;
+    snd_pcm_uframes_t period = cfgs[i].period;
+    snd_pcm_t *p = setup_pcm(lc, cfgs[i].dev, SND_PCM_STREAM_PLAYBACK, 0,
+                             SND_PCM_ACCESS_RW_INTERLEAVED, cfgs[i].fmt,
+                             &rate, cfgs[i].ch, &period);
+    if (!p)
+      continue;
+
+    int bytes = snd_pcm_frames_to_bytes(p, period);
+    void *buf = calloc(1, bytes);
+    if (!buf) {
+      snd_pcm_close(p);
+      continue;
+    }
+
+    float ph = 0.f;
+    for (int j = 0; j < WR_PERIODS; j++) {
+      fill_buf(buf, cfgs[i].fmt, (int)period, cfgs[i].ch, (float)rate, &ph);
+      snd_pcm_sframes_t w = snd_pcm_writei(p, buf, period);
+      if (w < 0)
+        snd_pcm_recover(p, (int)w, 1);
+    }
+
+    snd_pcm_drain(p);
+    free(buf);
+    snd_pcm_close(p);
+  }
+}
+
+static void ex_mmap(snd_config_t *lc) {
+  struct cfg {
+    snd_pcm_format_t fmt;
+    unsigned rate, ch;
+    snd_pcm_uframes_t period;
+  } cfgs[] = {
+    {SND_PCM_FORMAT_S16_LE,   48000, 2, 256},
+    {SND_PCM_FORMAT_S32_LE,   48000, 2, 256},
+    {SND_PCM_FORMAT_FLOAT_LE, 48000, 2, 256},
+    {SND_PCM_FORMAT_S16_LE,   48000, 6, 256},
+    {SND_PCM_FORMAT_S16_LE,   48000, 8, 256},
+  };
+
+  int n = (int)(sizeof(cfgs) / sizeof(cfgs[0]));
+  printf("  mmap:   %d configs x %d periods\\n", n, MMAP_PERIODS);
+
+  for (int i = 0; i < n; i++) {
+    unsigned rate = cfgs[i].rate;
+    snd_pcm_uframes_t period = cfgs[i].period;
+    snd_pcm_t *p = setup_pcm(lc, "pgo_null", SND_PCM_STREAM_PLAYBACK, 0,
+                             SND_PCM_ACCESS_MMAP_INTERLEAVED, cfgs[i].fmt,
+                             &rate, cfgs[i].ch, &period);
+    if (!p)
+      continue;
+
+    for (int j = 0; j < MMAP_PERIODS; j++) {
+      const snd_pcm_channel_area_t *areas = NULL;
+      snd_pcm_uframes_t off = 0, frames = period;
+      int err = snd_pcm_mmap_begin(p, &areas, &off, &frames);
+      if (err < 0) {
+        if (snd_pcm_recover(p, err, 1) < 0)
+          break;
+        continue;
+      }
+
+      if (frames > 0 && areas && areas[0].addr) {
+        char *dst = (char *)areas[0].addr + areas[0].first / 8 + off * (areas[0].step / 8);
+        memset(dst, 0, frames * (areas[0].step / 8));
+      }
+
+      snd_pcm_sframes_t c = snd_pcm_mmap_commit(p, off, frames);
+      if (c < 0)
+        snd_pcm_recover(p, (int)c, 1);
+    }
+
+    snd_pcm_drain(p);
+    snd_pcm_close(p);
+  }
+}
+
+static void ex_status(snd_config_t *lc) {
+  unsigned rate = 48000;
+  snd_pcm_uframes_t period = 256;
+  snd_pcm_t *p = setup_pcm(lc, "pgo_null", SND_PCM_STREAM_PLAYBACK, 0,
+                           SND_PCM_ACCESS_RW_INTERLEAVED, SND_PCM_FORMAT_S16_LE,
+                           &rate, 2, &period);
+  if (!p)
+    return;
+
+  snd_pcm_status_t *st;
+  snd_pcm_status_alloca(&st);
+
+  short buf[256 * 2];
+  struct pollfd pfds[8];
+  float ph = 0.f;
+
+  printf("  status: %d periods with queries/poll/dump\\n", STAT_PERIODS);
+  for (int i = 0; i < STAT_PERIODS; i++) {
+    gen_s16(buf, 256, 2, 440.f, 48000.f, &ph);
+    snd_pcm_sframes_t w = snd_pcm_writei(p, buf, 256);
+    if (w < 0)
+      snd_pcm_recover(p, (int)w, 1);
+
+    if ((i & 3) == 0) {
+      snd_pcm_status(p, st);
+      (void)snd_pcm_status_get_state(st);
+      (void)snd_pcm_status_get_delay(st);
+      (void)snd_pcm_status_get_avail(st);
+      (void)snd_pcm_status_get_avail_max(st);
+      (void)snd_pcm_avail_update(p);
+
+      snd_pcm_sframes_t delay = 0;
+      snd_pcm_delay(p, &delay);
+
+      int count = snd_pcm_poll_descriptors_count(p);
+      if (count > 0 && count <= (int)(sizeof(pfds) / sizeof(pfds[0]))) {
+        unsigned short rev = 0;
+        snd_pcm_poll_descriptors(p, pfds, count);
+        snd_pcm_poll_descriptors_revents(p, pfds, count, &rev);
+      }
+
+      snd_output_t *out = NULL;
+      if (snd_output_buffer_open(&out) >= 0) {
+        snd_pcm_dump(p, out);
+        char *tmp = NULL;
+        (void)snd_output_buffer_string(out, &tmp);
+        snd_output_close(out);
+      }
+    }
+  }
+
+  snd_pcm_drain(p);
+  snd_pcm_close(p);
+}
+
+static void ex_capture(snd_config_t *lc) {
+  unsigned rate = 48000;
+  snd_pcm_uframes_t period = 256;
+  snd_pcm_t *p = setup_pcm(lc, "pgo_null", SND_PCM_STREAM_CAPTURE, 0,
+                           SND_PCM_ACCESS_RW_INTERLEAVED, SND_PCM_FORMAT_S16_LE,
+                           &rate, 1, &period);
+  if (!p)
+    return;
+
+  short buf[256];
+  printf("  capture: %d periods mono 48kHz\\n", CAP_PERIODS);
+  for (int i = 0; i < CAP_PERIODS; i++) {
+    snd_pcm_sframes_t rd = snd_pcm_readi(p, buf, 256);
+    if (rd < 0)
+      snd_pcm_recover(p, (int)rd, 1);
+  }
+
+  snd_pcm_close(p);
+}
+
+static void ex_open_close(snd_config_t *lc) {
+  printf("  open/close: %d cycles\\n", OC_CYCLES);
+  for (int i = 0; i < OC_CYCLES; i++) {
+    unsigned rate = 48000;
+    snd_pcm_uframes_t period = 256;
+    snd_pcm_t *p = setup_pcm(lc, "pgo_plug", SND_PCM_STREAM_PLAYBACK, 0,
+                             SND_PCM_ACCESS_RW_INTERLEAVED, SND_PCM_FORMAT_S16_LE,
+                             &rate, 2, &period);
+    if (p) {
+      short buf[256 * 2];
+      float ph = 0.f;
+      gen_s16(buf, 256, 2, 440.f, 48000.f, &ph);
+      snd_pcm_writei(p, buf, 256);
+      snd_pcm_close(p);
+    }
+  }
+}
+
+static void ex_xrun(snd_config_t *lc) {
+  unsigned rate = 48000;
+  snd_pcm_uframes_t period = 256;
+  snd_pcm_t *p = setup_pcm(lc, "pgo_null", SND_PCM_STREAM_PLAYBACK, 0,
+                           SND_PCM_ACCESS_RW_INTERLEAVED, SND_PCM_FORMAT_S16_LE,
+                           &rate, 2, &period);
+  if (!p)
+    return;
+
+  short buf[256 * 2];
+  float ph = 0.f;
+  printf("  xrun:   %d recovery cycles\\n", XRUN_CYCLES);
+
+  for (int cy = 0; cy < XRUN_CYCLES; cy++) {
+    for (int j = 0; j < 64; j++) {
+      gen_s16(buf, 256, 2, 440.f, 48000.f, &ph);
+      snd_pcm_sframes_t w = snd_pcm_writei(p, buf, 256);
+      if (w < 0)
+        snd_pcm_recover(p, (int)w, 1);
+    }
+    snd_pcm_drop(p);
+    snd_pcm_prepare(p);
+  }
+
+  snd_pcm_close(p);
+}
+
+static void ex_info_queries(snd_config_t *lc) {
+  snd_pcm_t *p = NULL;
+  if (snd_pcm_open_lconf(&p, "pgo_null", SND_PCM_STREAM_PLAYBACK, 0, lc) < 0)
+    return;
+
+  snd_pcm_info_t *inf;
+  snd_pcm_info_alloca(&inf);
+  snd_pcm_info(p, inf);
+
+  (void)snd_pcm_info_get_device(inf);
+  (void)snd_pcm_info_get_subdevice(inf);
+  (void)snd_pcm_info_get_stream(inf);
+  (void)snd_pcm_info_get_card(inf);
+  (void)snd_pcm_info_get_id(inf);
+  (void)snd_pcm_info_get_name(inf);
+  (void)snd_pcm_info_get_subdevice_name(inf);
+
+  snd_pcm_nonblock(p, 1);
+  snd_pcm_nonblock(p, 0);
+
+  snd_pcm_chmap_query_t **maps = snd_pcm_query_chmaps(p);
+  if (maps)
+    snd_pcm_free_chmaps(maps);
+
+  snd_pcm_close(p);
+}
+
+static void ex_linking(snd_config_t *lc) {
+  unsigned rate = 48000;
+  snd_pcm_uframes_t period = 256;
+  snd_pcm_t *a = setup_pcm(lc, "pgo_null", SND_PCM_STREAM_PLAYBACK, 0,
+                           SND_PCM_ACCESS_RW_INTERLEAVED, SND_PCM_FORMAT_S16_LE,
+                           &rate, 2, &period);
+  if (!a)
+    return;
+
+  rate = 48000;
+  period = 256;
+  snd_pcm_t *b = setup_pcm(lc, "pgo_null", SND_PCM_STREAM_PLAYBACK, 0,
+                           SND_PCM_ACCESS_RW_INTERLEAVED, SND_PCM_FORMAT_S16_LE,
+                           &rate, 2, &period);
+  if (!b) {
+    snd_pcm_close(a);
+    return;
+  }
+
+  snd_pcm_link(a, b);
+  snd_pcm_unlink(a);
+
+  snd_pcm_close(a);
+  snd_pcm_close(b);
+}
+
+static void quiet_alsa_errors(const char *file, int line,
+                              const char *function, int err,
+                              const char *fmt, ...) {
+  (void)file; (void)line; (void)function; (void)err; (void)fmt;
+}
+
+static void ex_topology_new_free(long cycles) {
+  printf("  topology-new/free: %ld cycles\\n", cycles);
+  for (long i = 0; i < cycles; i++) {
+    snd_tplg_t *t = snd_tplg_new();
+    if (t)
+      snd_tplg_free(t);
+  }
+}
+
+#if HAVE_TPLG_BUILD_FILE
+static int do_one_topology_build(const char *infile, long iter, int idx, int quiet) {
+  snd_tplg_t *t = snd_tplg_new();
+  if (!t)
+    return -1;
+
+  char out[4096];
+  snprintf(out, sizeof(out), "/tmp/alsa-tplg-%ld-%ld-%d.tplg",
+           (long)getpid(), iter, idx);
+
+  if (quiet)
+    snd_lib_error_set_handler(quiet_alsa_errors);
+
+  int rc = snd_tplg_build_file(t, infile, out);
+
+  if (quiet)
+    snd_lib_error_set_handler(NULL);
+
+  unlink(out);
+  snd_tplg_free(t);
+  return rc;
+}
+
+static void ex_topology_probe(int argc, char **argv, int start_idx) {
+  int topo_files = argc - start_idx;
+  long ok = 0, fail = 0;
+
+  printf("  topology-probe: %d candidate file(s)\\n", topo_files);
+  for (int i = start_idx; i < argc; i++) {
+    int rc = do_one_topology_build(argv[i], 0, i, 1);
+    if (rc >= 0) {
+      ok++;
+      printf("PROBE_OK %s\\n", argv[i]);
+    } else {
+      fail++;
+      printf("PROBE_FAIL %s rc=%d\\n", argv[i], rc);
+    }
+  }
+  printf("  topology-probe summary: success=%ld fail=%ld\\n", ok, fail);
+}
+
+static void ex_topology_build_files(int argc, char **argv, int start_idx, long iters) {
+  int topo_files = argc - start_idx;
+  if (topo_files <= 0) {
+    printf("  topology-build: no input files supplied; skipping build_file path\\n");
+    return;
+  }
+
+  long ok = 0, fail = 0;
+  printf("  topology-build: %d validated file(s) x %ld build cycle(s)\\n", topo_files, iters);
+
+  for (long iter = 0; iter < iters; iter++) {
+    for (int i = start_idx; i < argc; i++) {
+      int rc = do_one_topology_build(argv[i], iter, i, 1);
+      if (rc >= 0)
+        ok++;
+      else
+        fail++;
+    }
+  }
+
+  printf("  topology-build summary: success=%ld fail=%ld\\n", ok, fail);
+}
+#endif
+
+int main(int argc, char **argv) {
+  setvbuf(stdout, NULL, _IONBF, 0);
+  setvbuf(stderr, NULL, _IONBF, 0);
+
+  int topology_only = 0;
+  int topology_probe = 0;
+  int arg0 = 1;
+
+  if (argc > 1 && strcmp(argv[1], "--probe-topology") == 0) {
+    topology_probe = 1;
+    arg0 = 2;
+  } else if (argc > 1 && strcmp(argv[1], "--topology-only") == 0) {
+    topology_only = 1;
+    arg0 = 2;
+  }
+
+  printf("ALSA PGO helper start\\n");
+  printf("  mode: %s\\n",
+         topology_probe ? "probe-topology" :
+         topology_only ? "topology-only" : "full");
+  print_loaded_libs();
+  printf("  topology inputs passed to helper: %d\\n", argc - arg0);
+  for (int i = arg0; i < argc; i++)
+    printf("    topology input[%d]: %s\\n", i - arg0, argv[i]);
+
+  if (topology_probe) {
+#if HAVE_TPLG_BUILD_FILE
+    ex_topology_probe(argc, argv, arg0);
+#else
+    printf("  topology-build API unavailable; cannot probe topology inputs\\n");
+#endif
+    printf("ALSA PGO helper end\\n");
+    return 0;
+  }
+
+  if (!topology_only) {
+    snd_config_t *lc = make_lconf();
+    if (!lc) {
+      fprintf(stderr, "failed to create local ALSA config\\n");
+      return 1;
+    }
+
+    ex_config();
+    ex_format_utils();
+    ex_writei(lc);
+    ex_mmap(lc);
+    ex_status(lc);
+    ex_capture(lc);
+    ex_open_close(lc);
+    ex_xrun(lc);
+    ex_info_queries(lc);
+    ex_linking(lc);
+
+#if HAVE_TPLG_BUILD_FILE
+    ex_topology_build_files(argc, argv, arg0, TPLG_BUILD_ITERS);
+#else
+    printf("  topology-build API unavailable; skipping build_file path\\n");
+#endif
+
+    ex_topology_new_free(TPLG_NEWFREE_ITERS);
+    snd_config_delete(lc);
+  } else {
+#if HAVE_TPLG_BUILD_FILE
+    ex_topology_build_files(argc, argv, arg0, TPLG_BOLT_ITERS);
+#else
+    printf("  topology-build API unavailable; skipping build_file path\\n");
+#endif
+    ex_topology_new_free(TPLG_NEWFREE_ITERS * 4L);
+  }
+
+  printf("ALSA PGO helper end\\n");
+  return 0;
+}
+EOF
+}
+
+_build_training_helper() {
+  local builddir="$1"
+  local srcroot="$2"
+
+  echo "  -> Building custom training helper: $builddir/alsa-pgo-training"
+  clang -std=gnu17 -O2 -pipe \
+    -I"$srcroot/include" \
+    -I"$builddir/include" \
+    "$srcdir/alsa_pgo_training.c" \
+    -L"$builddir/src/.libs" \
+    -L"$builddir/src/topology/.libs" \
+    -Wl,-rpath-link,"$builddir/src/.libs" \
+    -Wl,-rpath-link,"$builddir/src/topology/.libs" \
+    -latopology -lasound -lm -ldl -lpthread \
+    -o "$builddir/alsa-pgo-training"
+}
+
+_show_generated_profiles() {
+  local profdir="$1"
+  local label="$2"
+  local count=0
+
+  count=$(find "$profdir" -maxdepth 1 -name '*.profraw' 2>/dev/null | wc -l)
+  echo "  -> ${label}: generated ${count} raw profile file(s)"
+  find "$profdir" -maxdepth 1 -name '*.profraw' -printf '     %f\n' 2>/dev/null | head -20 || true
+}
+
+_show_bolt_fdata() {
+  local bolt_dir="$1"
+  local so_name="$2"
+
+  echo "  -> BOLT fdata files for ${so_name}:"
+  if compgen -G "${bolt_dir}/${so_name}.fdata*" >/dev/null; then
+    ls -lh "${bolt_dir}/${so_name}.fdata"* 2>/dev/null || true
+  else
+    echo "     (none)"
+  fi
+}
+
+_probe_valid_topology_inputs() {
+  local builddir="$1"
+  local srcroot="$2"
+  local -n _cand_ref="$3"
+  local -n _valid_ref="$4"
+  _valid_ref=()
+
+  if (( ! ${#_cand_ref[@]} )); then
+    echo "→ Topology probe: no candidate inputs available."
+    return 0
+  fi
+
+  _build_training_helper "$builddir" "$srcroot"
+
+  local _ld_path="$builddir/src/.libs:$builddir/src/topology/.libs"
+  local _logfile="$srcdir/alsa-training-topology-probe.log"
+
+  echo "→ Topology probe: validating ${#_cand_ref[@]} candidate file(s)..."
+  echo "  -> helper: $builddir/alsa-pgo-training"
+  echo "  -> logfile: $_logfile"
+  echo "  -> LD_LIBRARY_PATH=${_ld_path}"
+
+  while IFS= read -r line; do
+    printf '%s\n' "$line"
+    case "$line" in
+      PROBE_OK\ *)
+        _valid_ref+=("${line#PROBE_OK }")
+        ;;
+    esac
+  done < <(
+    export LD_LIBRARY_PATH="${_ld_path}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    "$builddir/alsa-pgo-training" --probe-topology "${_cand_ref[@]}" 2>&1 | tee "$_logfile"
+  )
+
+  echo "→ Topology probe: validated ${#_valid_ref[@]} file(s)."
+  local x
+  for x in "${_valid_ref[@]}"; do
+    echo "  -> valid topology: $x"
+  done
+}
+
+_run_training_workload() {
+  local builddir="$1"
+  local stage="$2"
+  local srcroot="$3"
+  local mode="$4"
+  shift 4
+  local -a tplg_inputs=("$@")
+
+  _build_training_helper "$builddir" "$srcroot"
+
+  local _ld_path="$builddir/src/.libs:$builddir/src/topology/.libs"
+  local _logfile="$srcdir/alsa-training-$(_stage_slug "$stage").log"
+
+  echo "→ ${stage}: Running custom ALSA training helper..."
+  echo "  -> helper: $builddir/alsa-pgo-training"
+  echo "  -> mode: $mode"
+  echo "  -> logfile: $_logfile"
+  echo "  -> LD_LIBRARY_PATH=${_ld_path}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+  (
+    export LD_LIBRARY_PATH="${_ld_path}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    set -o pipefail
+    if [[ "$mode" == topology-only ]]; then
+      "$builddir/alsa-pgo-training" --topology-only "${tplg_inputs[@]}" 2>&1 | tee "$_logfile"
+    else
+      "$builddir/alsa-pgo-training" "${tplg_inputs[@]}" 2>&1 | tee "$_logfile"
+    fi
+  ) || {
+    echo "Error: custom ALSA training workload failed during ${stage}." >&2
+    return 1
+  }
+
+  if [[ "$mode" != topology-only ]]; then
+    echo "→ ${stage}: Running supplemental upstream tests..."
+    (
+      export LD_LIBRARY_PATH="${_ld_path}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      make -C "$builddir" -k check 2>&1 | tee -a "$_logfile" || true
+    )
+  fi
+}
+
+_find_real_shared_object() {
+  local search_dir="$1"
+  local pattern="$2"
+  local outvar="$3"
+  local f=''
+
+  while IFS= read -r -d '' f; do
+    [[ -L "$f" ]] && continue
+    [[ -f "$f" ]] || continue
+    "${READELF:-readelf}" -h "$f" >/dev/null 2>&1 || continue
+    printf -v "$outvar" '%s' "$f"
+    return 0
+  done < <(find "$search_dir" -maxdepth 1 -type f -name "$pattern" -print0 2>/dev/null)
+
+  return 1
+}
 
 prepare() {
   cd "$pkgname-$_pkgver"
   autoreconf -fiv
+
+  local _srcroot="$srcdir/$pkgname-$_pkgver"
+  local _have_tplg_build_file=0
+  _detect_topology_api "$_srcroot" _have_tplg_build_file
+  _create_pgo_training_source "$_have_tplg_build_file"
 }
 
 build() {
-  cd "$pkgname-$_pkgver"
+  local _srcroot="$srcdir/$pkgname-$_pkgver"
 
-  export CC="clang"
-  export CXX="clang++"
+  _setup_llvm_toolchain
 
-  local _original_cflags="$CFLAGS"
-  local _original_cxxflags="$CXXFLAGS"
-  local _original_ldflags="$LDFLAGS"
-  local PGO_DATA_DIR="${srcdir}/pgo_data"
-  local CS_PGO_DATA_DIR="${srcdir}/cspgo_data"
-  mkdir -p "$PGO_DATA_DIR" "$CS_PGO_DATA_DIR"
+  local _orig_cflags="$CFLAGS"
+  local _orig_cxxflags="$CXXFLAGS"
+  local _orig_ldflags="$LDFLAGS"
 
-  local _configure_opts=(
+  local _pgo_dir="$srcdir/pgo"
+  local _cspgo_dir="$srcdir/cspgo"
+  local _bolt_dir="$srcdir/bolt"
+
+  local _build_pgo="$srcdir/build-pgo"
+  local _build_cspgo="$srcdir/build-cspgo"
+  local _build_final="$srcdir/build-final"
+
+  rm -rf "$_pgo_dir" "$_cspgo_dir" "$_bolt_dir"
+  rm -rf "$_build_pgo" "$_build_cspgo" "$_build_final"
+  mkdir -p "$_pgo_dir" "$_cspgo_dir" "$_bolt_dir"
+  mkdir -p "$_build_pgo" "$_build_cspgo" "$_build_final"
+
+  local -a _tplg_candidates=()
+  local -a _tplg_valid=()
+  local -a _tplg_valid_rev=()
+  local -a _tplg_valid_rot=()
+
+  _collect_topology_candidates "$_srcroot" _tplg_candidates
+
+  local _instr_flags=(
+    -g3
+    -fno-omit-frame-pointer
+    -Xclang -mllvm -Xclang -vp-counters-per-site=50
+    -Xclang -mllvm -Xclang -runtime-counter-relocation
+    -Xclang -mllvm -Xclang -enable-value-profiling
+  )
+
+  local _profile_warnings=(
+    -Wno-profile-instr-out-of-date
+    -Wno-profile-instr-unprofiled
+  )
+
+  local _prefix_maps=(
+    "-ffile-prefix-map=$srcdir=/usr/src/debug/$pkgname"
+    "-fdebug-prefix-map=$srcdir=/usr/src/debug/$pkgname"
+    "-fmacro-prefix-map=$srcdir=/usr/src/debug/$pkgname"
+  )
+
+  local _common_configure=(
     --prefix=/usr
     --without-debug
   )
 
-  # --- Stage 1: PGO Instrumentation Build ---
-  msg "Stage 1: Building PGO instrumented build..."
-  export CFLAGS="$_original_cflags -fprofile-generate=$PGO_DATA_DIR -g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=50 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling"
-  export CXXFLAGS="$_original_cxxflags -fprofile-generate=$PGO_DATA_DIR -g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=50 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling"
-  export LDFLAGS="$_original_ldflags -fprofile-generate=$PGO_DATA_DIR -g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=50 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling"
+  # Stage 1
+  echo "→ Stage 1: Building PGO instrumented build..."
+  cd "$_build_pgo"
 
-  ./configure "${_configure_opts[@]}" || { error "Configure failed (Stage 1)"; return 1; }
-  make -j"$(nproc)" || { error "Make failed (Stage 1)"; return 1; }
+  CFLAGS="$_orig_cflags ${_prefix_maps[*]} -fprofile-generate=$_pgo_dir ${_instr_flags[*]}"
+  CXXFLAGS="$_orig_cxxflags ${_prefix_maps[*]} -fprofile-generate=$_pgo_dir ${_instr_flags[*]}"
+  LDFLAGS="$_orig_ldflags -fprofile-generate=$_pgo_dir"
 
-  # --- Stage 1: PGO Training Run ---
-  msg "Stage 1: Running PGO training (make check)..."
-  export LLVM_PROFILE_FILE="${PGO_DATA_DIR}/alsa-%p_%m.profraw"
-  (
-    export LD_LIBRARY_PATH="${PWD}/.libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    msg2 "Running 'make check' with LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
-    if ! make -k check; then
-      warning "Some tests failed during PGO training (Stage 1), but proceeding."
-    fi
-  )
+  "$_srcroot/configure" "${_common_configure[@]}"
+  make
+
+  _probe_valid_topology_inputs "$_build_pgo" "$_srcroot" _tplg_candidates _tplg_valid
+  _reverse_array _tplg_valid _tplg_valid_rev
+  _rotate_array_half _tplg_valid _tplg_valid_rot
+
+  export LLVM_PROFILE_FILE="$_pgo_dir/alsa-%m-%p.profraw"
+  _run_training_workload "$_build_pgo" "Stage 1" "$_srcroot" full "${_tplg_valid[@]}"
   unset LLVM_PROFILE_FILE
 
-  # --- Merge PGO profiles ---
-  msg "Stage 1: Merging PGO profiles..."
-  if ! find "$PGO_DATA_DIR" -name '*.profraw' -print -quit | grep -q .; then
-    error "No raw PGO profile data (*.profraw) generated. Aborting."
-    return 1
-  fi
-  if ! llvm-profdata merge -output="${PGO_DATA_DIR}/default.profdata" "${PGO_DATA_DIR}"/*.profraw; then
-    error "llvm-profdata merge failed (Stage 1). Aborting."
-    return 1
-  fi
-  if [ ! -s "${PGO_DATA_DIR}/default.profdata" ]; then
-    error "Merged PGO profile data is empty or missing (Stage 1). Aborting."
-    return 1
-  fi
-  rm -f "${PGO_DATA_DIR}"/*.profraw
+  _show_generated_profiles "$_pgo_dir" "Stage 1"
 
-  # --- Stage 2: CS-PGO Instrumentation Build ---
-  msg "Stage 2: Building CS-PGO instrumented build..."
-  make distclean || warning "make distclean failed before Stage 2 configure"
-  if [ ! -f configure ]; then
-    msg2 "Configure script missing after distclean, running autoreconf..."
-    autoreconf -fiv || { error "autoreconf failed before Stage 2 configure"; return 1; }
-  fi
+  echo "→ Stage 1: Merging profiles..."
+  local -a _pgo_raws=()
+  shopt -s nullglob
+  _pgo_raws=("$_pgo_dir"/*.profraw)
+  shopt -u nullglob
 
-  export CFLAGS="$_original_cflags -fprofile-use=${PGO_DATA_DIR}/default.profdata -fcs-profile-generate=$CS_PGO_DATA_DIR -g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=50 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling"
-  export CXXFLAGS="$_original_cxxflags -fprofile-use=${PGO_DATA_DIR}/default.profdata -fcs-profile-generate=$CS_PGO_DATA_DIR -g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=50 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling"
-  export LDFLAGS="$_original_ldflags -fprofile-use=${PGO_DATA_DIR}/default.profdata -fcs-profile-generate=$CS_PGO_DATA_DIR -g3 -fno-omit-frame-pointer -Xclang -mllvm -Xclang -vp-counters-per-site=50 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-value-profiling"
-
-  ./configure "${_configure_opts[@]}" || { error "Configure failed (Stage 2)"; return 1; }
-  make -j"$(nproc)" || { error "Make failed (Stage 2)"; return 1; }
-
-  # --- Stage 2: CS-PGO Training Run ---
-  msg "Stage 2: Running CS-PGO training (make check)..."
-  export LLVM_PROFILE_FILE="${CS_PGO_DATA_DIR}/alsa-cs-%p_%m.profraw"
-  (
-    export LD_LIBRARY_PATH="${PWD}/.libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    msg2 "Running 'make check' with LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
-    if ! make -k check; then
-      warning "Some tests failed during CS-PGO training (Stage 2), but proceeding."
-    fi
-  )
-  unset LLVM_PROFILE_FILE
-
-  # --- Merge CS-PGO profiles ---
-  msg "Stage 2: Merging CS-PGO profiles..."
-  if ! find "$CS_PGO_DATA_DIR" -name '*.profraw' -print -quit | grep -q .; then
-    warning "No raw CS-PGO profile data (*.profraw) generated. Final build will use only Stage 1 PGO data."
-    cp "${PGO_DATA_DIR}/default.profdata" "${CS_PGO_DATA_DIR}/cs.profdata" || { error "Failed to copy fallback profile data."; return 1; }
+  if (( ${#_pgo_raws[@]} )); then
+    llvm-profdata merge -sparse -output="$_pgo_dir/merged.profdata" "${_pgo_raws[@]}"
   else
-    if ! llvm-profdata merge -output="${CS_PGO_DATA_DIR}/cs.profdata" "${CS_PGO_DATA_DIR}"/*.profraw "${PGO_DATA_DIR}/default.profdata"; then
-      error "llvm-profdata merge failed (Stage 2). Aborting."
-      return 1
-    fi
-    rm -f "${CS_PGO_DATA_DIR}"/*.profraw
-  fi
-  if [ ! -s "${CS_PGO_DATA_DIR}/cs.profdata" ]; then
-    error "Final merged CS-PGO profile data is empty or missing (Stage 2). Aborting."
+    echo "Error: Stage 1 produced no .profraw files." >&2
     return 1
   fi
 
-  # --- Stage 3: Final Optimized Build ---
-  msg "Stage 3: Building final CS-PGO optimized build..."
-  make distclean || warning "make distclean failed before Stage 3 configure"
-  if [ ! -f configure ]; then
-      msg2 "Configure script missing after distclean, running autoreconf..."
-      autoreconf -fiv || { error "autoreconf failed before Stage 3 configure"; return 1; }
+  # Stage 2
+  echo "→ Stage 2: Building CS-PGO instrumented build..."
+  cd "$_build_cspgo"
+
+  CFLAGS="$_orig_cflags ${_prefix_maps[*]} -fprofile-use=$_pgo_dir/merged.profdata -fcs-profile-generate=$_cspgo_dir ${_profile_warnings[*]} ${_instr_flags[*]}"
+  CXXFLAGS="$_orig_cxxflags ${_prefix_maps[*]} -fprofile-use=$_pgo_dir/merged.profdata -fcs-profile-generate=$_cspgo_dir ${_profile_warnings[*]} ${_instr_flags[*]}"
+  LDFLAGS="$_orig_ldflags -fprofile-use=$_pgo_dir/merged.profdata -fcs-profile-generate=$_cspgo_dir"
+
+  "$_srcroot/configure" "${_common_configure[@]}"
+  make
+
+  export LLVM_PROFILE_FILE="$_cspgo_dir/alsa-cs-%m-%p.profraw"
+  _run_training_workload "$_build_cspgo" "Stage 2" "$_srcroot" full "${_tplg_valid[@]}"
+  unset LLVM_PROFILE_FILE
+
+  _show_generated_profiles "$_cspgo_dir" "Stage 2"
+
+  echo "→ Stage 2: Merging profiles..."
+  local -a _cs_raws=()
+  shopt -s nullglob
+  _cs_raws=("$_cspgo_dir"/*.profraw)
+  shopt -u nullglob
+
+  if (( ${#_cs_raws[@]} )); then
+    llvm-profdata merge -sparse \
+      -output="$_cspgo_dir/final.profdata" \
+      "$_pgo_dir/merged.profdata" "${_cs_raws[@]}"
+  else
+    echo "Error: Stage 2 produced no CS-PGO .profraw files." >&2
+    return 1
   fi
 
-  export CFLAGS="$_original_cflags -fprofile-use=${CS_PGO_DATA_DIR}/cs.profdata"
-  export CXXFLAGS="$_original_cxxflags -fprofile-use=${CS_PGO_DATA_DIR}/cs.profdata"
-  export LDFLAGS="$_original_ldflags -fprofile-use=${CS_PGO_DATA_DIR}/cs.profdata"
+  # Stage 3
+  echo "→ Stage 3: Building final optimized build..."
+  cd "$_build_final"
 
-  ./configure "${_configure_opts[@]}" || { error "Configure failed (Stage 3)"; return 1; }
-  make -j"$(nproc)" || { error "Make failed (Stage 3)"; return 1; }
+  CFLAGS="$_orig_cflags ${_prefix_maps[*]} -fprofile-use=$_cspgo_dir/final.profdata ${_profile_warnings[*]}"
+  CXXFLAGS="$_orig_cxxflags ${_prefix_maps[*]} -fprofile-use=$_cspgo_dir/final.profdata ${_profile_warnings[*]}"
+  LDFLAGS="$_orig_ldflags -fprofile-use=$_cspgo_dir/final.profdata -Wl,--emit-relocs"
 
-  msg "CS-PGO build process completed successfully."
+  "$_srcroot/configure" "${_common_configure[@]}"
+  make
+
+  echo "  -> Stage 3 built libraries:"
+  find . -path '*/.libs/*.so*' -type f ! -name '*.la' ! -name '*.lai' 2>/dev/null | sort
+  echo "  -> End of library listing."
+
+  # Stage 4
+  if ! command -v llvm-bolt >/dev/null 2>&1; then
+    echo "→ Stage 4: llvm-bolt not found; skipping BOLT."
+    return 0
+  fi
+
+  echo "→ Stage 4: Selective BOLT optimization..."
+
+  local _libasound=""
+  if _find_real_shared_object "$_build_final/src/.libs" 'libasound.so.*' _libasound; then
+    echo "  -> Skipping $(basename "$_libasound") for BOLT: duplicate versioned global symbols are incompatible with current llvm-bolt."
+  fi
+
+  local _libatopology=""
+  if ! _find_real_shared_object "$_build_final/src/topology/.libs" 'libatopology.so.*' _libatopology; then
+    echo "  -> No real libatopology shared object found; skipping BOLT."
+    return 0
+  fi
+
+  local _topo_name
+  _topo_name=$(basename "$_libatopology")
+
+  if (( ! ${#_tplg_valid[@]} )); then
+    echo "  -> No validated topology corpus available."
+    echo "  -> Skipping BOLT for ${_topo_name} because profile quality would be poor."
+    return 0
+  fi
+
+  echo "  -> Instrumenting ${_topo_name}..."
+  cp -f "$_libatopology" "$_bolt_dir/${_topo_name}.orig"
+
+  if llvm-bolt "$_bolt_dir/${_topo_name}.orig" \
+      --instrument \
+      --lite=true \
+      --instrumentation-file-append-pid \
+      --instrumentation-file="$_bolt_dir/${_topo_name}.fdata" \
+      -o "$_bolt_dir/${_topo_name}.instr"; then
+    install -m755 "$_bolt_dir/${_topo_name}.instr" "$_libatopology"
+    ldconfig -n "$_build_final/src/topology/.libs" 2>/dev/null || true
+    echo "  -> Instrumented ${_topo_name} successfully."
+  else
+    echo "  -> BOLT instrumentation failed for ${_topo_name}; skipping BOLT."
+    cp -f "$_bolt_dir/${_topo_name}.orig" "$_libatopology"
+    return 0
+  fi
+
+  _run_training_workload "$_build_final" "Stage 4 BOLT pass1" "$_srcroot" topology-only "${_tplg_valid[@]}"
+  _run_training_workload "$_build_final" "Stage 4 BOLT pass2" "$_srcroot" topology-only "${_tplg_valid_rev[@]}"
+  _run_training_workload "$_build_final" "Stage 4 BOLT pass3" "$_srcroot" topology-only "${_tplg_valid_rot[@]}"
+
+  _show_bolt_fdata "$_bolt_dir" "$_topo_name"
+
+  local -a _fdata_files=()
+  shopt -s nullglob
+  _fdata_files=("$_bolt_dir/${_topo_name}".fdata*)
+  shopt -u nullglob
+
+  if (( ! ${#_fdata_files[@]} )); then
+    echo "  -> No BOLT fdata for ${_topo_name}; restoring original."
+    cp -f "$_bolt_dir/${_topo_name}.orig" "$_libatopology"
+    return 0
+  fi
+
+  local _merged_fdata="$_bolt_dir/${_topo_name}.merged.fdata"
+  if command -v merge-fdata >/dev/null 2>&1; then
+    merge-fdata "${_fdata_files[@]}" > "$_merged_fdata" 2>/dev/null || \
+      cat "${_fdata_files[@]}" > "$_merged_fdata"
+  else
+    cat "${_fdata_files[@]}" > "$_merged_fdata"
+  fi
+
+  if [[ ! -s "$_merged_fdata" ]]; then
+    echo "  -> Empty BOLT data for ${_topo_name}; restoring original."
+    cp -f "$_bolt_dir/${_topo_name}.orig" "$_libatopology"
+    return 0
+  fi
+
+  echo "  -> Applying BOLT to ${_topo_name}..."
+  if llvm-bolt "$_bolt_dir/${_topo_name}.orig" \
+      --data="$_merged_fdata" \
+      --lite=true \
+      --relocs \
+      --reorder-blocks=ext-tsp \
+      --reorder-functions=cdsort \
+      --split-functions \
+      --split-all-cold \
+      --split-strategy=cdsplit \
+      --icf=all \
+      --indirect-call-promotion=all \
+      --jump-tables=aggressive \
+      --peepholes=all \
+      --plt=hot \
+      --dyno-stats \
+      -o "$_bolt_dir/${_topo_name}.bolt"; then
+    if [[ -s "$_bolt_dir/${_topo_name}.bolt" ]]; then
+      install -m755 "$_bolt_dir/${_topo_name}.bolt" "$_libatopology"
+      echo "  -> BOLT applied to ${_topo_name}."
+    fi
+  else
+    echo "  -> BOLT optimization failed for ${_topo_name}; restoring original."
+    cp -f "$_bolt_dir/${_topo_name}.orig" "$_libatopology"
+  fi
+
+  # Keep profile data alive through package(); libtool relinks on install.
 }
 
-#check() {
-#  cd "$pkgname-$_pkgver"
-#  msg "Running final checks on optimized build..."
-#  (
-#    export LD_LIBRARY_PATH="${PWD}/.libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-#    msg2 "Running final 'make check' with LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
-#    if ! make -k check; then
-#      error "Final 'make check' reported failures. Review test output."
-#      return 1
-#    fi
-#  )
-#}
+check() {
+  cd "$srcdir/build-final"
+  make -k check
+}
 
 package() {
-  cd "$pkgname-$_pkgver"
-  msg "Installing package..."
-  make DESTDIR="${pkgdir}" install || error "make install failed"
+  cd "$srcdir/build-final"
+  make DESTDIR="$pkgdir" install
 
-  # Install documentation, if available
-  install -d "${pkgdir}/usr/share/doc/${pkgname}/"
+  cd "$srcdir/$pkgname-$_pkgver"
+  install -d "$pkgdir/usr/share/doc/$pkgname/"
+  local docfile
   for docfile in MEMORY-LEAK TODO NOTES ChangeLog doc/asoundrc.txt; do
-    [ -e "$docfile" ] && install -m644 "$docfile" "${pkgdir}/usr/share/doc/${pkgname}/"
+    [[ -e "$docfile" ]] && install -m644 "$docfile" "$pkgdir/usr/share/doc/$pkgname/"
   done
 
-  if [[ ! " ${options[@]} " =~ " !strip " ]]; then
-    msg "Stripping binaries..."
-    find "${pkgdir}" -type f -print0 | while IFS= read -r -d '' file; do
-      if file -b --mime-type "$file" | grep -qE 'application/(x-executable|x-sharedlib)'; then
-        msg2 "Stripping: $file"
-        if ! llvm-strip --strip-unneeded "$file" 2>/dev/null; then
-          warning "llvm-strip --strip-unneeded failed on $file"
-        fi
-      fi
-    done
-  else
-    msg "Skipping stripping due to !strip option."
-  fi
+  rm -rf "$srcdir/pgo" "$srcdir/cspgo" "$srcdir/bolt"
 }
