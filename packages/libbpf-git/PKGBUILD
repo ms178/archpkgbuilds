@@ -1,225 +1,1069 @@
 # Maintainer: CachyOS Team <team@cachyos.org>
+
 pkgname=libbpf-git
-pkgver=1.6.0.r122.6ddc03d4
+pkgver=1.6.0.r138.f5dcbae7
 pkgrel=1
-pkgdesc='BPF library (PGO + ThinLTO + BOLT optimized for scx-scheds)'
+pkgdesc='BPF library (custom libbpf/scx-style CS-PGO + BOLT optimized)'
 arch=('x86_64')
 url='https://github.com/libbpf/libbpf'
 license=('LGPL-2.1-only' 'BSD-2-Clause')
-depends=('libelf' 'zlib' 'zstd' 'linux-api-headers>=6.2')
-makedepends=('clang' 'llvm')
-provides=("libbpf=${pkgver}" 'libbpf.so=1-64')
+depends=(
+  'libelf'
+  'zlib'
+  'zstd'
+  'linux-api-headers>=6.2'
+)
+makedepends=(
+  'git'
+  'clang'
+  'llvm'
+  'lld'
+  'libelf'
+  'zlib'
+  'zstd'
+  'linux-api-headers'
+)
+provides=(
+  "libbpf=${pkgver}"
+  'libbpf.so=1-64'
+)
 conflicts=('libbpf')
-source=("git+https://github.com/libbpf/libbpf.git")
+source=('git+https://github.com/libbpf/libbpf.git')
 sha256sums=('SKIP')
+options=(!lto strip)
 
 pkgver() {
   cd "${srcdir}/libbpf"
-  printf "%s" "$(git describe --long --tags | sed 's/\([^-]*-\)g/r\1/;s/-/./g;s/^v//')"
+  git describe --long --tags --abbrev=8 | sed 's/^v//;s/\([^-]*-\)g/r\1/;s/-/./g'
 }
 
-run_heavy_workload() {
-  local ld_path="$1"
-  echo "=== Running HEAVY comprehensive libbpf workload (1200× BTF + full API hammer - scx-scheds hot paths) ==="
+_setup_llvm_toolchain() {
+  export CC="clang -fuse-ld=lld"
+  export CXX="clang++ -fuse-ld=lld"
+  export AR=llvm-ar
+  export NM=llvm-nm
+  export STRIP=llvm-strip
+  export RANLIB=llvm-ranlib
+  export READELF=llvm-readelf
+  export OBJCOPY=llvm-objcopy
+  export OBJDUMP=llvm-objdump
+}
 
-  cat > "${srcdir}/heavy_libbpf_workload.c" << 'EOF'
+_stage_slug() {
+  printf '%s' "$1" | tr ' /' '__'
+}
+
+_copy_stage_tree() {
+  local srcroot="$1"
+  local dstroot="$2"
+  rm -rf "$dstroot"
+  cp -a --reflink=auto "$srcroot" "$dstroot"
+}
+
+_stage_install() {
+  local stageroot="$1"
+  local destdir="$2"
+
+  rm -rf "$destdir"
+  mkdir -p "$destdir"
+
+  make -C "$stageroot/src" \
+    DESTDIR="$destdir" \
+    prefix=/usr \
+    LIBDIR=/usr/lib \
+    install install_headers
+
+  if [[ -d "$destdir/usr/lib64" ]]; then
+    mkdir -p "$destdir/usr/lib"
+    cp -a "$destdir/usr/lib64"/. "$destdir/usr/lib"/
+    rm -rf "$destdir/usr/lib64"
+  fi
+}
+
+_get_stage_libdir() {
+  local instroot="$1"
+  local outvar="$2"
+
+  if [[ -d "$instroot/usr/lib" ]]; then
+    printf -v "$outvar" '%s' "$instroot/usr/lib"
+    return 0
+  elif [[ -d "$instroot/usr/lib64" ]]; then
+    printf -v "$outvar" '%s' "$instroot/usr/lib64"
+    return 0
+  fi
+
+  return 1
+}
+
+_find_real_shared_object() {
+  local search_dir="$1"
+  local pattern="$2"
+  local outvar="$3"
+  local f=''
+
+  while IFS= read -r -d '' f; do
+    [[ -L "$f" ]] && continue
+    [[ -f "$f" ]] || continue
+    "${READELF:-readelf}" -h "$f" >/dev/null 2>&1 || continue
+    printf -v "$outvar" '%s' "$f"
+    return 0
+  done < <(find "$search_dir" -maxdepth 1 -type f -name "$pattern" -print0 2>/dev/null)
+
+  return 1
+}
+
+_reverse_array() {
+  local -n _in_ref="$1"
+  local -n _out_ref="$2"
+  _out_ref=()
+
+  local i
+  for (( i=${#_in_ref[@]}-1; i>=0; i-- )); do
+    _out_ref+=("${_in_ref[i]}")
+  done
+}
+
+_rotate_array_half() {
+  local -n _in_ref="$1"
+  local -n _out_ref="$2"
+  _out_ref=()
+
+  local n=${#_in_ref[@]}
+  (( n == 0 )) && return 0
+
+  local start=$(( n / 2 ))
+  local i
+  for (( i=0; i<n; i++ )); do
+    _out_ref+=("${_in_ref[(start + i) % n]}")
+  done
+}
+
+_create_workload_sources() {
+  cat > "${srcdir}/libbpf_pgo_workload.c" <<'EOF'
+#define _GNU_SOURCE
 #include <bpf/libbpf.h>
 #include <bpf/btf.h>
-#include <unistd.h>
-#include <stdio.h>
-#include <pthread.h>
 #include <bpf/bpf.h>
+#include <dlfcn.h>
+#include <linux/bpf.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
-#define BTF_LOOPS 1200
-#define NUM_MAPS 8
-#define NUM_THREADS 4
+#define VMLINUX_BTF_LOOPS       1000
+#define VMLINUX_TYPE_SCAN_MAX    768
+#define OBJ_OPEN_FILE_LOOPS      320
+#define OBJ_OPEN_MEM_LOOPS       240
+#define OBJ_BTF_PARSE_LOOPS      200
+#define OBJ_LOAD_LOOPS           128
+#define MAP_API_LOOPS            384
 
-static int map_fds[NUM_MAPS];
-
-static void* map_thread(void* arg) {
-  long tid = (long)arg;
-  for (int i = 0; i < 300; i++) {
-    int map_idx = (tid + i) % NUM_MAPS;
-    int fd = map_fds[map_idx];
-    if (fd < 0) continue;
-    int key = tid * 1000 + i;
-    long value = key * 2;
-    bpf_map_update_elem(fd, &key, &value, BPF_ANY);
-    bpf_map_lookup_elem(fd, &key, &value);
-    if (i % 5 == 0) bpf_map_delete_elem(fd, &key);
-  }
-  return NULL;
+static int quiet_libbpf(enum libbpf_print_level level, const char *fmt, va_list args) {
+  (void)level;
+  (void)fmt;
+  (void)args;
+  return 0;
 }
 
-int main() {
-  // Heavy BTF parsing (the #1 hot path in scx-scheds)
-  for (int i = 0; i < BTF_LOOPS; i++) {
-    struct btf *btf = btf__parse("/sys/kernel/btf/vmlinux", NULL);
-    if (btf) {
+static void print_loaded_libs(void) {
+  Dl_info info;
+
+  if (dladdr((void *)&bpf_object__open_file, &info) && info.dli_fname)
+    printf("  libbpf path: %s\n", info.dli_fname);
+
+  if (dladdr((void *)&btf__parse, &info) && info.dli_fname)
+    printf("  libbpf/btf path: %s\n", info.dli_fname);
+}
+
+static unsigned char *read_file(const char *path, size_t *sz) {
+  FILE *f = fopen(path, "rb");
+  unsigned char *buf = NULL;
+  long size;
+
+  if (!f)
+    return NULL;
+  if (fseek(f, 0, SEEK_END) != 0) {
+    fclose(f);
+    return NULL;
+  }
+  size = ftell(f);
+  if (size < 0) {
+    fclose(f);
+    return NULL;
+  }
+  rewind(f);
+
+  buf = malloc((size_t)size);
+  if (!buf) {
+    fclose(f);
+    return NULL;
+  }
+  if (fread(buf, 1, (size_t)size, f) != (size_t)size) {
+    free(buf);
+    fclose(f);
+    return NULL;
+  }
+  fclose(f);
+  *sz = (size_t)size;
+  return buf;
+}
+
+static void ex_kernel_btf(const char *path) {
+  if (!path || access(path, R_OK) != 0) {
+    printf("  kernel-btf: unavailable\n");
+    return;
+  }
+
+  printf("  kernel-btf: %d parses of %s\n", VMLINUX_BTF_LOOPS, path);
+  for (int i = 0; i < VMLINUX_BTF_LOOPS; i++) {
+    struct btf *btf = btf__parse(path, NULL);
+    if (libbpf_get_error(btf))
+      continue;
+
+    int cnt = btf__type_cnt(btf);
+    int lim = cnt < VMLINUX_TYPE_SCAN_MAX ? cnt : VMLINUX_TYPE_SCAN_MAX;
+    for (int id = 1; id < lim; id++) {
+      const struct btf_type *t = btf__type_by_id(btf, id);
+      if (!t)
+        continue;
+      if (t->name_off)
+        (void)btf__name_by_offset(btf, t->name_off);
+      (void)btf_kind(t);
+      (void)btf_vlen(t);
+    }
+
+    (void)btf__find_by_name_kind(btf, "task_struct", BTF_KIND_STRUCT);
+    (void)btf__find_by_name_kind(btf, "file", BTF_KIND_STRUCT);
+    (void)btf__find_by_name_kind(btf, "sock", BTF_KIND_STRUCT);
+
+    btf__free(btf);
+  }
+}
+
+static void ex_object_open_file(char **fixtures, int nfixtures) {
+  printf("  object-open-file: %d fixtures x %d loops\n", nfixtures, OBJ_OPEN_FILE_LOOPS);
+  for (int i = 0; i < OBJ_OPEN_FILE_LOOPS; i++) {
+    for (int f = 0; f < nfixtures; f++) {
+      struct bpf_object *obj = bpf_object__open_file(fixtures[f], NULL);
+      if (libbpf_get_error(obj))
+        continue;
+
+      struct bpf_program *prog;
+      bpf_object__for_each_program(prog, obj) {
+        (void)bpf_program__name(prog);
+        (void)bpf_program__section_name(prog);
+        (void)bpf_program__insn_cnt(prog);
+        (void)bpf_program__type(prog);
+        (void)bpf_program__expected_attach_type(prog);
+        bpf_program__set_autoload(prog, false);
+        bpf_program__set_autoload(prog, true);
+      }
+
+      struct bpf_map *map;
+      bpf_object__for_each_map(map, obj) {
+        (void)bpf_map__name(map);
+        (void)bpf_map__type(map);
+        (void)bpf_map__key_size(map);
+        (void)bpf_map__value_size(map);
+        (void)bpf_map__max_entries(map);
+        (void)bpf_map__map_flags(map);
+      }
+
+      (void)bpf_object__find_map_by_name(obj, "arr");
+      (void)bpf_object__find_map_by_name(obj, "hash_map");
+      (void)bpf_object__find_map_by_name(obj, "rb");
+      bpf_object__close(obj);
+    }
+  }
+}
+
+static void ex_object_open_mem(char **fixtures, int nfixtures) {
+  printf("  object-open-mem: %d fixtures x %d loops\n", nfixtures, OBJ_OPEN_MEM_LOOPS);
+  for (int f = 0; f < nfixtures; f++) {
+    size_t sz = 0;
+    unsigned char *buf = read_file(fixtures[f], &sz);
+    if (!buf)
+      continue;
+
+    for (int i = 0; i < OBJ_OPEN_MEM_LOOPS; i++) {
+      struct bpf_object *obj = bpf_object__open_mem(buf, sz, NULL);
+      if (libbpf_get_error(obj))
+        continue;
+
+      struct bpf_program *prog;
+      bpf_object__for_each_program(prog, obj) {
+        (void)bpf_program__name(prog);
+        (void)bpf_program__section_name(prog);
+        (void)bpf_program__insn_cnt(prog);
+      }
+
+      struct bpf_map *map;
+      bpf_object__for_each_map(map, obj) {
+        (void)bpf_map__name(map);
+        (void)bpf_map__type(map);
+      }
+
+      bpf_object__close(obj);
+    }
+
+    free(buf);
+  }
+}
+
+static void ex_object_btf_parse(char **fixtures, int nfixtures) {
+  printf("  object-btf-parse: %d fixtures x %d loops\n", nfixtures, OBJ_BTF_PARSE_LOOPS);
+  for (int f = 0; f < nfixtures; f++) {
+    for (int i = 0; i < OBJ_BTF_PARSE_LOOPS; i++) {
+      struct btf_ext *btf_ext = NULL;
+      struct btf *btf = btf__parse_elf(fixtures[f], &btf_ext);
+      if (libbpf_get_error(btf))
+        continue;
+
+      int cnt = btf__type_cnt(btf);
+      int lim = cnt < 256 ? cnt : 256;
+      for (int id = 1; id < lim; id++) {
+        const struct btf_type *t = btf__type_by_id(btf, id);
+        if (!t)
+          continue;
+        if (t->name_off)
+          (void)btf__name_by_offset(btf, t->name_off);
+      }
+
+      if (btf_ext)
+        btf_ext__free(btf_ext);
       btf__free(btf);
     }
-    if (i % 100 == 0) usleep(500);
   }
+}
 
-  // Basic API hammering
-  libbpf_major_version();
-  libbpf_minor_version();
-  libbpf_set_print(NULL);
+static void maybe_attach_prog(struct bpf_program *prog) {
+  struct bpf_link *link = NULL;
 
-  // Safe map operations (graceful fallback if no privileges)
-  for (int i = 0; i < NUM_MAPS; i++) {
-    map_fds[i] = bpf_map_create(BPF_MAP_TYPE_HASH, NULL, 4, 8, 64, NULL);
+  if (bpf_program__fd(prog) < 0)
+    return;
+
+  link = bpf_program__attach(prog);
+  if (!libbpf_get_error(link) && link)
+    bpf_link__destroy(link);
+}
+
+static void ex_object_load_best_effort(char **fixtures, int nfixtures) {
+  printf("  object-load: %d fixtures x %d loops\n", nfixtures, OBJ_LOAD_LOOPS);
+  for (int i = 0; i < OBJ_LOAD_LOOPS; i++) {
+    for (int f = 0; f < nfixtures; f++) {
+      struct bpf_object *obj = bpf_object__open_file(fixtures[f], NULL);
+      if (libbpf_get_error(obj))
+        continue;
+
+      struct bpf_program *prog;
+      bpf_object__for_each_program(prog, obj) {
+        bpf_program__set_autoload(prog, true);
+      }
+
+      (void)bpf_object__load(obj);
+
+      bpf_object__for_each_program(prog, obj) {
+        (void)bpf_program__fd(prog);
+        maybe_attach_prog(prog);
+      }
+
+      struct bpf_map *map;
+      bpf_object__for_each_map(map, obj) {
+        int fd = bpf_map__fd(map);
+        if (fd >= 0) {
+          int key = 0;
+          long value = 123;
+          (void)bpf_map_lookup_elem(fd, &key, &value);
+        }
+      }
+
+      bpf_object__close(obj);
+    }
   }
+}
 
-  pthread_t threads[NUM_THREADS];
-  for (long i = 0; i < NUM_THREADS; i++) {
-    pthread_create(&threads[i], NULL, map_thread, (void*)i);
-  }
-  for (int i = 0; i < NUM_THREADS; i++) {
-    pthread_join(threads[i], NULL);
-  }
+static int try_map_create(enum bpf_map_type t, const char *name, __u32 key_sz, __u32 val_sz, __u32 max_entries) {
+  return bpf_map_create(t, name, key_sz, val_sz, max_entries, NULL);
+}
 
-  // Cleanup
-  for (int i = 0; i < NUM_MAPS; i++) {
-    if (map_fds[i] >= 0) close(map_fds[i]);
-  }
+static void ex_map_api(void) {
+  printf("  map-api: %d best-effort syscall cycles\n", MAP_API_LOOPS);
+  for (int i = 0; i < MAP_API_LOOPS; i++) {
+    int fd1 = try_map_create(BPF_MAP_TYPE_HASH, "hash", sizeof(int), sizeof(long), 64);
+    int fd2 = try_map_create(BPF_MAP_TYPE_ARRAY, "array", sizeof(int), sizeof(long), 64);
+    int fd3 = try_map_create(BPF_MAP_TYPE_PERCPU_ARRAY, "percpu", sizeof(int), sizeof(long), 32);
+    int fd4 = try_map_create(BPF_MAP_TYPE_QUEUE, "queue", 0, sizeof(long), 16);
 
-  printf("Heavy libbpf workload completed\n");
+    int key = i;
+    long value = i * 3L;
+
+    if (fd1 >= 0) {
+      (void)bpf_map_update_elem(fd1, &key, &value, BPF_ANY);
+      (void)bpf_map_lookup_elem(fd1, &key, &value);
+      if ((i & 7) == 0)
+        (void)bpf_map_delete_elem(fd1, &key);
+      close(fd1);
+    }
+
+    if (fd2 >= 0) {
+      (void)bpf_map_update_elem(fd2, &key, &value, BPF_ANY);
+      (void)bpf_map_lookup_elem(fd2, &key, &value);
+      close(fd2);
+    }
+
+    if (fd3 >= 0)
+      close(fd3);
+    if (fd4 >= 0)
+      close(fd4);
+  }
+}
+
+int main(int argc, char **argv) {
+  setvbuf(stdout, NULL, _IONBF, 0);
+  setvbuf(stderr, NULL, _IONBF, 0);
+
+  libbpf_set_print(quiet_libbpf);
+
+  const char *vmlinux_btf = getenv("LIBBPF_PGO_VMLINUX_BTF");
+  if (!vmlinux_btf || !*vmlinux_btf)
+    vmlinux_btf = "/sys/kernel/btf/vmlinux";
+
+  int nfixtures = argc - 1;
+  char **fixtures = argv + 1;
+
+  printf("libbpf PGO helper start\n");
+  print_loaded_libs();
+  printf("  kernel BTF path: %s\n", vmlinux_btf);
+  printf("  libbpf version: %d.%d\n", libbpf_major_version(), libbpf_minor_version());
+  printf("  fixtures passed: %d\n", nfixtures);
+  for (int i = 0; i < nfixtures; i++)
+    printf("    fixture[%d]: %s\n", i, fixtures[i]);
+
+  ex_kernel_btf(vmlinux_btf);
+  ex_object_open_file(fixtures, nfixtures);
+  ex_object_open_mem(fixtures, nfixtures);
+  ex_object_btf_parse(fixtures, nfixtures);
+  ex_object_load_best_effort(fixtures, nfixtures);
+  ex_map_api();
+
+  printf("libbpf PGO helper end\n");
   return 0;
 }
 EOF
 
-  clang -O2 -I"${srcdir}/libbpf/include" "${srcdir}/heavy_libbpf_workload.c" \
-    -o "${srcdir}/heavy_libbpf_workload" ${ld_path:+-L"$ld_path"} -lbpf -lelf -lz -pthread
+  cat > "${srcdir}/fixture_core.bpf.c" <<'EOF'
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
 
-  if [ -n "$ld_path" ]; then
-    LD_LIBRARY_PATH="$ld_path" "${srcdir}/heavy_libbpf_workload" || true
-  else
-    "${srcdir}/heavy_libbpf_workload" || true
-  fi
-  sleep 3  # Guarantee profile flush for PGO/BOLT runtime
+const volatile __u32 cfg = 1;
+__u64 hit_cnt = 0;
+__u64 hot_bss;
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 64);
+  __type(key, __u32);
+  __type(value, __u64);
+} hash_map SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 16);
+  __type(key, __u32);
+  __type(value, __u64);
+} arr SEC(".maps");
+
+static __always_inline int subprog(__u32 k)
+{
+  __u64 *v = bpf_map_lookup_elem(&arr, &k);
+  if (v)
+    __sync_fetch_and_add(v, 1);
+  return 0;
 }
 
-build() {
-  cd "${srcdir}/libbpf/src"
+SEC("tracepoint/syscalls/sys_enter_nanosleep")
+int tp_prog(void *ctx)
+{
+  __u32 k = 0;
+  subprog(k);
+  hot_bss++;
+  return 0;
+}
 
-  local pgo_dir="${srcdir}/pgo_profiles"
-  local cs_pgo_dir="${srcdir}/cs_pgo_profiles"
-  mkdir -p "$pgo_dir" "$cs_pgo_dir"
+SEC("raw_tp/sys_enter")
+int rawtp_prog(void *ctx)
+{
+  __u32 k = 0;
+  subprog(k);
+  return 0;
+}
 
-  local instrument_flags="-g3 -fno-omit-frame-pointer -mllvm -vp-counters-per-site=10 -mllvm -enable-value-profiling"
+SEC("kprobe/do_sys_openat2")
+int kp_prog(void *ctx)
+{
+  __u32 k = cfg;
+  __u64 v = hit_cnt + 1;
+  bpf_map_update_elem(&hash_map, &k, &v, BPF_ANY);
+  return 0;
+}
 
-  # Phase 1: Standard PGO instrumentation + HEAVY workload
-  echo "=== Phase 1: Standard PGO instrumentation ==="
-  make clean
-  make CC=clang \
-    EXTRA_CFLAGS="-fprofile-generate=${pgo_dir} ${instrument_flags}" \
-    EXTRA_LDFLAGS="-fprofile-generate=${pgo_dir}"
+char LICENSE[] SEC("license") = "GPL";
+EOF
 
-  rm -rf "${srcdir}/inst_pgo"
-  make DESTDIR="${srcdir}/inst_pgo" prefix=/usr LIBDIR=/usr/lib install
+  cat > "${srcdir}/fixture_net.bpf.c" <<'EOF'
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
 
-  export LD_LIBRARY_PATH="${srcdir}/inst_pgo/usr/lib"
-  export LLVM_PROFILE_FILE="${pgo_dir}/libbpf-%m.profraw"
-  run_heavy_workload "${srcdir}/inst_pgo/usr/lib"
-  unset LD_LIBRARY_PATH
+struct {
+  __uint(type, BPF_MAP_TYPE_RINGBUF);
+  __uint(max_entries, 4096);
+} rb SEC(".maps");
 
-  if ls "${pgo_dir}"/*.profraw &>/dev/null; then
-    llvm-profdata merge -sparse -output="${srcdir}/libbpf.profdata" "${pgo_dir}"/*.profraw
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 8);
+  __type(key, __u32);
+  __type(value, __u64);
+} percpu_arr SEC(".maps");
+
+SEC("xdp")
+int xdp_prog(struct xdp_md *ctx)
+{
+  return XDP_PASS;
+}
+
+SEC("tc")
+int tc_prog(struct __sk_buff *skb)
+{
+  return 0;
+}
+
+SEC("socket")
+int sock_prog(struct __sk_buff *skb)
+{
+  return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+EOF
+
+  cat > "${srcdir}/fixture_misc.bpf.c" <<'EOF'
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+  __uint(max_entries, 8);
+  __type(key, __u32);
+  __type(value, __u32);
+} events SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_QUEUE);
+  __uint(max_entries, 16);
+  __type(value, __u64);
+} q SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_STACK);
+  __uint(max_entries, 16);
+  __type(value, __u64);
+} s SEC(".maps");
+
+SEC("uprobe//proc/self/exe:main")
+int up_prog(void *ctx)
+{
+  return 0;
+}
+
+SEC("uretprobe//proc/self/exe:main")
+int urp_prog(void *ctx)
+{
+  return 0;
+}
+
+SEC("perf_event")
+int pe_prog(struct bpf_perf_event_data *ctx)
+{
+  return 0;
+}
+
+SEC("fentry/__x64_sys_nanosleep")
+int fentry_prog(void *ctx)
+{
+  return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+EOF
+
+  cat > "${srcdir}/fixture_sections.bpf.c" <<'EOF'
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+
+SEC("fexit/__x64_sys_nanosleep")
+int fexit_prog(void *ctx)
+{
+  return 0;
+}
+
+SEC("cgroup_skb/ingress")
+int cgroup_ingress(void *ctx)
+{
+  return 1;
+}
+
+SEC("lsm/file_open")
+int lsm_file_open(void *ctx)
+{
+  return 0;
+}
+
+SEC("tracepoint/sched/sched_switch")
+int sched_switch_prog(void *ctx)
+{
+  return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+EOF
+
+  cat > "${srcdir}/fixture_maps.bpf.c" <<'EOF'
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 128);
+  __type(key, __u32);
+  __type(value, __u64);
+} lru SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __array(values, int);
+} map_of_maps SEC(".maps");
+
+SEC("tracepoint/syscalls/sys_enter_getpid")
+int tiny_prog(void *ctx)
+{
+  return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+EOF
+}
+
+_build_one_fixture() {
+  local incdir="$1"
+  local src="$2"
+  local out="$3"
+
+  echo "  -> Building synthetic BPF fixture: $out"
+  if ! clang -target bpf -O2 -g \
+      -D__TARGET_ARCH_x86 \
+      -I"$incdir" -I/usr/include \
+      -c "$src" \
+      -o "$out"; then
+    echo "  -> WARNING: Failed to build fixture $(basename "$src")"
+    rm -f "$out"
+    return 1
   fi
+  return 0
+}
 
-  # Phase 2: Context-Sensitive PGO + SAME HEAVY workload
-  echo "=== Phase 2: Context-Sensitive PGO ==="
-  make clean
-  make CC=clang \
-    EXTRA_CFLAGS="-fprofile-use=${srcdir}/libbpf.profdata -fcs-profile-generate=${cs_pgo_dir} ${instrument_flags}" \
-    EXTRA_LDFLAGS="-fcs-profile-generate=${cs_pgo_dir}"
+_build_all_fixtures() {
+  local incdir="$1"
+  local outdir="$2"
+  local -n _out_ref="$3"
+  _out_ref=()
 
-  rm -rf "${srcdir}/inst_cs"
-  make DESTDIR="${srcdir}/inst_cs" prefix=/usr LIBDIR=/usr/lib install
+  mkdir -p "$outdir"
 
-  export LD_LIBRARY_PATH="${srcdir}/inst_cs/usr/lib"
-  export LLVM_PROFILE_FILE="${cs_pgo_dir}/libbpf-cs-%m.profraw"
-  run_heavy_workload "${srcdir}/inst_cs/usr/lib"
-  unset LD_LIBRARY_PATH
-
-  if ls "${cs_pgo_dir}"/*.profraw &>/dev/null; then
-    llvm-profdata merge -sparse -output="${srcdir}/cs_libbpf.profdata" "${cs_pgo_dir}"/*.profraw "${srcdir}/libbpf.profdata"
-  fi
-
-  # Phase 3: Final PGO build
-  echo "=== Phase 3: Final PGO build ==="
-  make clean
-  make CC=clang \
-    EXTRA_CFLAGS="-fprofile-use=${srcdir}/cs_libbpf.profdata" \
-    EXTRA_LDFLAGS="-fprofile-use=${srcdir}/cs_libbpf.profdata -Wl,--emit-relocs"
-
-  # Phase 4: BOLT (instrumented library + SAME HEAVY workload)
-  echo "=== Phase 4: BOLT post-link optimization ==="
-  local libname=$(find . -maxdepth 1 -name 'libbpf.so.1.*' | head -n1)
-  if [ -n "$libname" ] && command -v llvm-bolt >/dev/null 2>&1; then
-    local prebolt="${srcdir}/libbpf.prebolt.so"
-    local bolt_inst_dir="${srcdir}/bolt_inst"
-    local bolted="${srcdir}/libbpf.bolted.so"
-    local fdata="${srcdir}/bolt.fdata"
-
-    mkdir -p "$bolt_inst_dir"
-    cp "$libname" "$prebolt"
-
-    llvm-bolt "$prebolt" -instrument -o "${srcdir}/libbpf.bolt-inst.so" \
-      --instrumentation-file="$fdata" \
-      --instrumentation-sleep-time=3 \
-      --instrumentation-no-counters-clear || echo "BOLT instrumentation failed (non-fatal)"
-
-    if [ -f "${srcdir}/libbpf.bolt-inst.so" ]; then
-      cp "${srcdir}/libbpf.bolt-inst.so" "$bolt_inst_dir/$(basename "$libname")"
-      ln -sf "$(basename "$libname")" "$bolt_inst_dir/libbpf.so.1"
-      ln -sf libbpf.so.1 "$bolt_inst_dir/libbpf.so"
+  local f out
+  for f in \
+    "${srcdir}/fixture_core.bpf.c" \
+    "${srcdir}/fixture_net.bpf.c" \
+    "${srcdir}/fixture_misc.bpf.c" \
+    "${srcdir}/fixture_sections.bpf.c" \
+    "${srcdir}/fixture_maps.bpf.c"
+  do
+    out="${outdir}/$(basename "${f%.c}").o"
+    if _build_one_fixture "$incdir" "$f" "$out"; then
+      _out_ref+=("$out")
     fi
+  done
 
-    if [ -d "$bolt_inst_dir" ]; then
-      run_heavy_workload "$bolt_inst_dir"
-    fi
+  echo "  -> Built ${#_out_ref[@]} synthetic fixture object(s)."
+  local x
+  for x in "${_out_ref[@]}"; do
+    echo "     $x"
+  done
+}
 
-    if [ -s "$fdata" ]; then
-      local prof_size=$(wc -c < "$fdata")
-      echo "BOLT profile collected successfully (${prof_size} bytes)"
-      llvm-bolt "$prebolt" -o "$bolted" -data="$fdata" \
-        -reorder-blocks=ext-tsp \
-        -reorder-functions=hfsort+ \
-        -split-functions \
-        -split-all-cold \
-        -split-eh \
-        -dyno-stats && {
-          echo "BOLT optimization successful!"
-          cp "$bolted" "$libname"
-          ln -sf "$(basename "$libname")" libbpf.so.1
-          ln -sf libbpf.so.1 libbpf.so
-        } || echo "BOLT optimization failed"
-    else
-      echo "WARNING: No BOLT profile data collected"
-    fi
+_build_workload_helper() {
+  local stage="$1"
+  local incdir="$2"
+  local libdir="$3"
+  local outpath="$4"
+
+  echo "  -> Building libbpf workload helper: $outpath"
+  clang -std=gnu17 -O2 -pipe \
+    -I"$incdir" -I/usr/include \
+    "${srcdir}/libbpf_pgo_workload.c" \
+    -L"$libdir" \
+    -Wl,-rpath-link,"$libdir" \
+    -lbpf -lelf -lz -lzstd -ldl -lpthread \
+    -o "$outpath"
+}
+
+_run_libbpf_workload() {
+  local stage="$1"
+  local libdir="$2"
+  local profdir="$3"
+  local helper="$4"
+  shift 4
+  local -a fixtures=("$@")
+  local logfile="${srcdir}/libbpf-training-$(_stage_slug "$stage").log"
+
+  echo "→ ${stage}: Running custom libbpf workload..."
+  echo "  -> helper: $helper"
+  echo "  -> logfile: $logfile"
+  echo "  -> LD_LIBRARY_PATH=$libdir"
+
+  (
+    export LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export LIBBPF_PGO_VMLINUX_BTF="/sys/kernel/btf/vmlinux"
+    set -o pipefail
+    "$helper" "${fixtures[@]}" 2>&1 | tee "$logfile"
+  ) || {
+    echo "Error: custom libbpf workload failed during ${stage}." >&2
+    return 1
+  }
+
+  _show_generated_profiles "$profdir" "$stage"
+}
+
+_show_generated_profiles() {
+  local profdir="$1"
+  local label="$2"
+  local count=0
+
+  count=$(find "$profdir" -maxdepth 1 -name '*.profraw' 2>/dev/null | wc -l)
+  echo "  -> ${label}: generated ${count} raw profile file(s)"
+  find "$profdir" -maxdepth 1 -name '*.profraw' -printf '     %f\n' 2>/dev/null | head -20 || true
+}
+
+_show_bolt_fdata() {
+  local bolt_dir="$1"
+  local so_name="$2"
+
+  echo "  -> BOLT fdata files for ${so_name}:"
+  if compgen -G "${bolt_dir}/${so_name}.fdata*" >/dev/null; then
+    ls -lh "${bolt_dir}/${so_name}.fdata"* 2>/dev/null || true
   else
-    echo "BOLT skipped."
+    echo "     (none)"
   fi
 }
 
 check() {
-  cd "${srcdir}/libbpf/src"
+  local finalroot="${srcdir}/libbpf-final"
+  local so=""
+
+  [[ -d "$finalroot/src" ]] || return 0
+  cd "$finalroot/src"
+
   echo "=== libbpf sanity check ==="
-  if ls libbpf.so.1.* >/dev/null 2>&1 && nm -D libbpf.so.1.* 2>/dev/null | grep -q libbpf_major_version; then
-    echo "✓ Core symbols verified"
+  if _find_real_shared_object "$PWD" 'libbpf.so.*' so; then
+    echo "  -> shared object: $so"
+    if nm -D "$so" 2>/dev/null | grep -q 'libbpf_major_version'; then
+      echo "  -> core symbol check: ok"
+    else
+      echo "  -> core symbol check: FAILED" >&2
+      return 1
+    fi
+  fi
+}
+
+prepare() {
+  _create_workload_sources
+}
+
+build() {
+  _setup_llvm_toolchain
+
+  local srcroot="${srcdir}/libbpf"
+  local stage_pgo="${srcdir}/libbpf-pgo"
+  local stage_cs="${srcdir}/libbpf-cs"
+  local stage_final="${srcdir}/libbpf-final"
+
+  local inst_pgo="${srcdir}/inst_pgo"
+  local inst_cs="${srcdir}/inst_cs"
+  local inst_final="${srcdir}/inst_final"
+  local inst_bolt="${srcdir}/inst_bolt"
+
+  local pgo_dir="${srcdir}/pgo_profiles"
+  local cs_dir="${srcdir}/cs_pgo_profiles"
+  local bolt_dir="${srcdir}/bolt"
+
+  rm -rf "$stage_pgo" "$stage_cs" "$stage_final"
+  rm -rf "$inst_pgo" "$inst_cs" "$inst_final" "$inst_bolt"
+  rm -rf "$pgo_dir" "$cs_dir" "$bolt_dir"
+  mkdir -p "$pgo_dir" "$cs_dir" "$bolt_dir"
+
+  local _orig_cflags="$CFLAGS"
+  local _orig_ldflags="$LDFLAGS"
+
+  local _instr_flags=(
+    -g3
+    -fno-omit-frame-pointer
+    -Xclang -mllvm -Xclang -vp-counters-per-site=50
+    -Xclang -mllvm -Xclang -runtime-counter-relocation
+    -Xclang -mllvm -Xclang -enable-value-profiling
+  )
+
+  local _profile_warnings=(
+    -Wno-profile-instr-out-of-date
+    -Wno-profile-instr-unprofiled
+  )
+
+  local _prefix_maps=(
+    "-ffile-prefix-map=$srcdir=/usr/src/debug/$pkgname"
+    "-fdebug-prefix-map=$srcdir=/usr/src/debug/$pkgname"
+    "-fmacro-prefix-map=$srcdir=/usr/src/debug/$pkgname"
+  )
+
+  # Stage 1
+  echo "=== Stage 1: Standard PGO instrumentation ==="
+  _copy_stage_tree "$srcroot" "$stage_pgo"
+
+  cd "$stage_pgo/src"
+  make clean >/dev/null 2>&1 || true
+  make \
+    CC="$CC" \
+    EXTRA_CFLAGS="${_orig_cflags} ${_prefix_maps[*]} -fprofile-generate=${pgo_dir} ${_instr_flags[*]}" \
+    EXTRA_LDFLAGS="${_orig_ldflags} -fprofile-generate=${pgo_dir}"
+
+  _stage_install "$stage_pgo" "$inst_pgo"
+
+  local pgo_incdir pgo_libdir
+  pgo_incdir="$inst_pgo/usr/include"
+  _get_stage_libdir "$inst_pgo" pgo_libdir || {
+    echo "Error: could not determine staged lib dir for Stage 1." >&2
+    return 1
+  }
+
+  local helper_pgo="${srcdir}/libbpf-workload-stage1"
+  _build_workload_helper stage1 "$pgo_incdir" "$pgo_libdir" "$helper_pgo"
+
+  local -a fixtures_pgo=()
+  _build_all_fixtures "$pgo_incdir" "${srcdir}/fixtures-stage1" fixtures_pgo
+
+  export LLVM_PROFILE_FILE="${pgo_dir}/libbpf-%m-%p.profraw"
+  _run_libbpf_workload "Stage 1" "$pgo_libdir" "$pgo_dir" "$helper_pgo" "${fixtures_pgo[@]}"
+  unset LLVM_PROFILE_FILE
+
+  local -a pgo_raws=()
+  shopt -s nullglob
+  pgo_raws=("${pgo_dir}"/*.profraw)
+  shopt -u nullglob
+
+  if (( ${#pgo_raws[@]} )); then
+    llvm-profdata merge -sparse -output="${srcdir}/libbpf.profdata" "${pgo_raws[@]}"
+  else
+    echo "Error: no Stage 1 PGO profile data generated." >&2
+    return 1
+  fi
+
+  # Stage 2
+  echo "=== Stage 2: Context-Sensitive PGO instrumentation ==="
+  _copy_stage_tree "$srcroot" "$stage_cs"
+
+  cd "$stage_cs/src"
+  make clean >/dev/null 2>&1 || true
+  make \
+    CC="$CC" \
+    EXTRA_CFLAGS="${_orig_cflags} ${_prefix_maps[*]} -fprofile-use=${srcdir}/libbpf.profdata -fcs-profile-generate=${cs_dir} ${_profile_warnings[*]} ${_instr_flags[*]}" \
+    EXTRA_LDFLAGS="${_orig_ldflags} -fprofile-use=${srcdir}/libbpf.profdata -fcs-profile-generate=${cs_dir}"
+
+  _stage_install "$stage_cs" "$inst_cs"
+
+  local cs_incdir cs_libdir
+  cs_incdir="$inst_cs/usr/include"
+  _get_stage_libdir "$inst_cs" cs_libdir || {
+    echo "Error: could not determine staged lib dir for Stage 2." >&2
+    return 1
+  }
+
+  local helper_cs="${srcdir}/libbpf-workload-stage2"
+  _build_workload_helper stage2 "$cs_incdir" "$cs_libdir" "$helper_cs"
+
+  local -a fixtures_cs=()
+  _build_all_fixtures "$cs_incdir" "${srcdir}/fixtures-stage2" fixtures_cs
+
+  export LLVM_PROFILE_FILE="${cs_dir}/libbpf-cs-%m-%p.profraw"
+  _run_libbpf_workload "Stage 2" "$cs_libdir" "$cs_dir" "$helper_cs" "${fixtures_cs[@]}"
+  unset LLVM_PROFILE_FILE
+
+  local -a cs_raws=()
+  shopt -s nullglob
+  cs_raws=("${cs_dir}"/*.profraw)
+  shopt -u nullglob
+
+  if (( ${#cs_raws[@]} )); then
+    llvm-profdata merge -sparse \
+      -output="${srcdir}/cs_libbpf.profdata" \
+      "${srcdir}/libbpf.profdata" "${cs_raws[@]}"
+  else
+    echo "Error: no Stage 2 CS-PGO profile data generated." >&2
+    return 1
+  fi
+
+  # Stage 3
+  echo "=== Stage 3: Final PGO build ==="
+  _copy_stage_tree "$srcroot" "$stage_final"
+
+  cd "$stage_final/src"
+  make clean >/dev/null 2>&1 || true
+  make \
+    CC="$CC" \
+    EXTRA_CFLAGS="${_orig_cflags} ${_prefix_maps[*]} -fprofile-use=${srcdir}/cs_libbpf.profdata ${_profile_warnings[*]}" \
+    EXTRA_LDFLAGS="${_orig_ldflags} -fprofile-use=${srcdir}/cs_libbpf.profdata -Wl,--emit-relocs"
+
+  _stage_install "$stage_final" "$inst_final"
+
+  local final_incdir final_libdir
+  final_incdir="$inst_final/usr/include"
+  _get_stage_libdir "$inst_final" final_libdir || {
+    echo "Error: could not determine staged lib dir for Stage 3." >&2
+    return 1
+  }
+
+  echo "=== Stage 3: Built shared libraries ==="
+  find "$stage_final/src" -maxdepth 1 -type f -name 'libbpf.so*' -print
+
+  # Stage 4
+  if ! command -v llvm-bolt >/dev/null 2>&1; then
+    echo "=== Stage 4: llvm-bolt not found; skipping BOLT ==="
+    return 0
+  fi
+
+  echo "=== Stage 4: BOLT post-link optimization ==="
+
+  local final_so=""
+  _find_real_shared_object "$stage_final/src" 'libbpf.so.*' final_so || {
+    echo "No real libbpf shared object found for BOLT; skipping." >&2
+    return 0
+  }
+
+  local so_name
+  so_name="$(basename "$final_so")"
+  local prebolt="${bolt_dir}/${so_name}.orig"
+  local inst_bolt_libdir="${inst_bolt}/usr/lib"
+
+  mkdir -p "$inst_bolt_libdir"
+  cp -f "$final_so" "$prebolt"
+
+  echo "  -> Instrumenting ${so_name}..."
+  if llvm-bolt "$prebolt" \
+      --instrument \
+      --lite=true \
+      --instrumentation-file-append-pid \
+      --instrumentation-file="${bolt_dir}/${so_name}.fdata" \
+      -o "${bolt_dir}/${so_name}.instr"; then
+
+    cp -f "${bolt_dir}/${so_name}.instr" "${inst_bolt_libdir}/${so_name}"
+
+    if [[ "$so_name" =~ ^(libbpf\.so\.[0-9]+)\..* ]]; then
+      ln -sf "$so_name" "${inst_bolt_libdir}/${BASH_REMATCH[1]}"
+      ln -sf "${BASH_REMATCH[1]}" "${inst_bolt_libdir}/libbpf.so"
+    else
+      ln -sf "$so_name" "${inst_bolt_libdir}/libbpf.so"
+    fi
+
+    local helper_bolt="${srcdir}/libbpf-workload-bolt"
+    _build_workload_helper bolt "$final_incdir" "$inst_bolt_libdir" "$helper_bolt"
+
+    local -a fixtures_bolt=()
+    local -a fixtures_bolt_rev=()
+    local -a fixtures_bolt_rot=()
+
+    _build_all_fixtures "$final_incdir" "${srcdir}/fixtures-bolt" fixtures_bolt
+    _reverse_array fixtures_bolt fixtures_bolt_rev
+    _rotate_array_half fixtures_bolt fixtures_bolt_rot
+
+    _run_libbpf_workload "Stage 4 BOLT pass1" "$inst_bolt_libdir" "$bolt_dir" "$helper_bolt" "${fixtures_bolt[@]}"
+    _run_libbpf_workload "Stage 4 BOLT pass2" "$inst_bolt_libdir" "$bolt_dir" "$helper_bolt" "${fixtures_bolt_rev[@]}"
+    _run_libbpf_workload "Stage 4 BOLT pass3" "$inst_bolt_libdir" "$bolt_dir" "$helper_bolt" "${fixtures_bolt_rot[@]}"
+
+    _show_bolt_fdata "$bolt_dir" "$so_name"
+
+    local -a fdata_files=()
+    shopt -s nullglob
+    fdata_files=("${bolt_dir}/${so_name}".fdata*)
+    shopt -u nullglob
+
+    if (( ${#fdata_files[@]} )); then
+      local merged_fdata="${bolt_dir}/${so_name}.merged.fdata"
+      if command -v merge-fdata >/dev/null 2>&1; then
+        merge-fdata "${fdata_files[@]}" > "$merged_fdata" 2>/dev/null || \
+          cat "${fdata_files[@]}" > "$merged_fdata"
+      else
+        cat "${fdata_files[@]}" > "$merged_fdata"
+      fi
+
+      if [[ -s "$merged_fdata" ]]; then
+        echo "  -> Applying BOLT to ${so_name}..."
+        if llvm-bolt "$prebolt" \
+            --data="$merged_fdata" \
+            --lite=true \
+            --relocs \
+            --reorder-blocks=ext-tsp \
+            --reorder-functions=cdsort \
+            --split-functions --split-all-cold --split-eh \
+            --x86-strip-redundant-address-size \
+            --split-strategy=cdsplit \
+            --icf=all \
+            --indirect-call-promotion=all \
+            --jump-tables=aggressive \
+            --peepholes=all \
+            --plt=hot \
+            --dyno-stats \
+            -o "${bolt_dir}/${so_name}.bolt"; then
+          if [[ -s "${bolt_dir}/${so_name}.bolt" ]]; then
+            cp -f "${bolt_dir}/${so_name}.bolt" "$final_so"
+            echo "  -> BOLT optimization successful."
+          fi
+        else
+          echo "  -> BOLT optimization failed; keeping non-BOLT final shared library."
+        fi
+      else
+        echo "  -> Empty BOLT fdata; keeping non-BOLT final shared library."
+      fi
+    else
+      echo "  -> No BOLT fdata collected; keeping non-BOLT final shared library."
+    fi
+  else
+    echo "  -> BOLT instrumentation failed; skipping BOLT."
   fi
 }
 
 package() {
-  cd "${srcdir}/libbpf/src"
+  cd "${srcdir}/libbpf-final/src"
   DESTDIR="${pkgdir}" make prefix=/usr LIBDIR=/usr/lib install install_headers
 
-  install -Dm644 -t "${pkgdir}/usr/share/licenses/${pkgname}" \
-    "${srcdir}/libbpf/LICENSE" "${srcdir}/libbpf/LICENSE.BSD-2-Clause"
+  install -Dm644 "${srcdir}/libbpf/LICENSE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 "${srcdir}/libbpf/LICENSE.BSD-2-Clause" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE.BSD-2-Clause"
 
-  if [ -d "${pkgdir}/usr/lib64" ]; then
-    mv "${pkgdir}/usr/lib64" "${pkgdir}/usr/lib"
+  if [[ -d "${pkgdir}/usr/lib64" ]]; then
+    mkdir -p "${pkgdir}/usr/lib"
+    cp -a "${pkgdir}/usr/lib64"/. "${pkgdir}/usr/lib"/
+    rm -rf "${pkgdir}/usr/lib64"
   fi
 }
