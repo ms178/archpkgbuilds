@@ -1,398 +1,1303 @@
+# Maintainer: CachyOS Team <team@cachyos.org>
+
 _pkgname=libglvnd
-pkgname=$_pkgname-git
-pkgver=1.7.0.12.g606f662
+pkgname=${_pkgname}-git
+pkgver=1.7.0.r12.606f6627
 pkgrel=1
-pkgdesc="The GL Vendor-Neutral Dispatch library (CS-PGO optimized)"
+pkgdesc='The GL Vendor-Neutral Dispatch library (custom desktop/gaming CS-PGO + BOLT optimized)'
 arch=('x86_64')
-url="https://github.com/NVIDIA/libglvnd"
-license=('custom:BSD-like')
-makedepends=(
-  'libxext'
+url='https://gitlab.freedesktop.org/glvnd/libglvnd'
+license=('custom')
+depends=(
+  'glibc'
   'libx11'
-  'xorgproto'
-  'python'
-  'meson'
+  'libxext'
+)
+makedepends=(
   'git'
   'clang'
   'llvm'
-  'mesa-demos'  # for glxgears, glxinfo
-  'glmark2'     # for GL benchmarking
+  'lld'
+  'meson'
+  'ninja'
+  'python'
+  'pkgconf'
+  'libx11'
+  'libxext'
+  'xorgproto'
+  'mesa'
+  'mesa-demos'
+  'glmark2'
 )
 provides=('libgl' 'libegl' 'libgles' "$_pkgname=$pkgver")
 conflicts=("$_pkgname")
-source=("git+https://gitlab.freedesktop.org/glvnd/libglvnd.git"
-        LICENSE)
-sha512sums=('SKIP'
-            'bf0f4a7e04220a407400f89226ecc1f798cc43035f2538cc8860e5088e1f84140baf0d4b0b28f66e4b802d4d6925769a1297c24e1ba39c1c093902b2931781a5')
+source=("git+https://gitlab.freedesktop.org/glvnd/libglvnd.git")
+sha256sums=('SKIP')
+options=(!lto strip)
 
 pkgver() {
-  cd $_pkgname
-  git describe --long --tags | sed 's/^v//;s/-/./g'
+  cd "${srcdir}/${_pkgname}"
+  git describe --long --tags --abbrev=8 | sed 's/^v//;s/\([^-]*-\)g/r\1/;s/-/./g'
 }
 
-# FAST and FOCUSED GL training using real GPU (Vega 64)
-_run_gl_training_workload() {
-  local build_dir="$1"
-  local workload_name="$2"
+_setup_llvm_toolchain() {
+  export CC="clang -fuse-ld=lld"
+  export CXX="clang++ -fuse-ld=lld"
+  export AR=llvm-ar
+  export NM=llvm-nm
+  export STRIP=llvm-strip
+  export RANLIB=llvm-ranlib
+  export READELF=llvm-readelf
+  export OBJCOPY=llvm-objcopy
+  export OBJDUMP=llvm-objdump
+}
 
-  echo "==> Running FAST GL training on real hardware: $workload_name"
+_stage_slug() {
+  printf '%s' "$1" | tr ' /' '__'
+}
 
-  # Use our instrumented libraries
-  export LD_LIBRARY_PATH="${build_dir}/src/GLX:${build_dir}/src/EGL:${build_dir}/src/OpenGL:${build_dir}/src/GLdispatch:${build_dir}/src/GLESv1:${build_dir}/src/GLESv2:${LD_LIBRARY_PATH}"
+_stage_install() {
+  local builddir="$1"
+  local destdir="$2"
 
-  # Force AMD GPU usage (not llvmpipe)
-  export GALLIUM_DRIVER=radeonsi
-  export MESA_LOADER_DRIVER_OVERRIDE=radeonsi
+  rm -rf "$destdir"
+  mkdir -p "$destdir"
+  DESTDIR="$destdir" meson install -C "$builddir" --no-rebuild
 
-  # Use real X display
-  if [ -z "$DISPLAY" ]; then
-    export DISPLAY=:0
+  if [[ -d "$destdir/usr/lib64" ]]; then
+    mkdir -p "$destdir/usr/lib"
+    cp -a "$destdir/usr/lib64"/. "$destdir/usr/lib"/
+    rm -rf "$destdir/usr/lib64"
   fi
+}
 
-  # Verify we're using hardware rendering
-  echo "  --> GPU: $(glxinfo 2>/dev/null | grep 'OpenGL renderer' | cut -d: -f2 | xargs)"
+_get_stage_libdir() {
+  local instroot="$1"
+  local outvar="$2"
 
-  # Phase 1: GLX queries (dispatch-heavy, ~10 seconds)
-  echo "  --> Phase 1: GLX queries (10x glxinfo)..."
-  for i in {1..10}; do
-    timeout 3 glxinfo >/dev/null 2>&1 || true
+  if [[ -d "$instroot/usr/lib" ]]; then
+    printf -v "$outvar" '%s' "$instroot/usr/lib"
+    return 0
+  elif [[ -d "$instroot/usr/lib64" ]]; then
+    printf -v "$outvar" '%s' "$instroot/usr/lib64"
+    return 0
+  fi
+  return 1
+}
+
+_find_real_shared_object() {
+  local search_root="$1"
+  local pattern="$2"
+  local outvar="$3"
+  local f=''
+
+  while IFS= read -r -d '' f; do
+    [[ -L "$f" ]] && continue
+    [[ -f "$f" ]] || continue
+    "${READELF:-readelf}" -h "$f" >/dev/null 2>&1 || continue
+    printf -v "$outvar" '%s' "$f"
+    return 0
+  done < <(find "$search_root" -type f -name "$pattern" -print0 2>/dev/null)
+
+  return 1
+}
+
+_collect_bolt_targets() {
+  local buildroot="$1"
+  local -n _out_ref="$2"
+  _out_ref=()
+
+  local -a patterns=(
+    'libGLdispatch.so.*'
+    'libGLX.so.*'
+    'libOpenGL.so.*'
+    'libEGL.so.*'
+    'libGLESv1_CM.so.*'
+    'libGLESv2.so.*'
+    'libGL.so.*'
+  )
+
+  local -A seen=()
+  local p f
+  for p in "${patterns[@]}"; do
+    while IFS= read -r -d '' f; do
+      [[ -L "$f" ]] && continue
+      [[ -f "$f" ]] || continue
+      "${READELF:-readelf}" -h "$f" >/dev/null 2>&1 || continue
+      [[ -n "${seen[$f]:-}" ]] && continue
+      seen["$f"]=1
+      _out_ref+=("$f")
+    done < <(find "$buildroot" -type f -name "$p" -print0 2>/dev/null)
   done
 
-  # Phase 2: glmark2 quick test (~25 seconds)
-  echo "  --> Phase 2: glmark2 rendering stress..."
-  if command -v glmark2 &>/dev/null; then
-    # Run multiple scenarios in sequence
-    timeout 10 glmark2 --benchmark build --size 800x600 --run-forever 2>/dev/null || true
-    timeout 10 glmark2 --benchmark texture --size 800x600 --run-forever 2>/dev/null || true
-    timeout 10 glmark2 --benchmark shading --size 800x600 --run-forever 2>/dev/null || true
-  fi
-
-  # Phase 3: Custom GL dispatch test (~40 seconds)
-  echo "  --> Phase 3: Custom GL dispatch stress..."
-
-  cat > "${srcdir}/gl_fast_${workload_name}.c" <<'EOF'
-#include <stdio.h>
-#include <stdlib.h>
-#include <GL/gl.h>
-#include <GL/glx.h>
-#include <GL/glext.h>
-#include <X11/Xlib.h>
-
-void stress_dispatch(int iters) {
-    for (int i = 0; i < iters; i++) {
-        // Critical dispatch paths: string queries
-        glGetString(GL_VENDOR);
-        glGetString(GL_RENDERER);
-        glGetString(GL_VERSION);
-        glGetString(GL_EXTENSIONS);
-
-        // Integer queries
-        GLint params[8];
-        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &params[0]);
-        glGetIntegerv(GL_MAX_LIGHTS, &params[1]);
-        glGetIntegerv(GL_VIEWPORT, &params[2]);
-        glGetIntegerv(GL_MAX_TEXTURE_UNITS, &params[3]);
-
-        // Boolean queries
-        GLboolean bools[4];
-        glGetBooleanv(GL_DEPTH_TEST, &bools[0]);
-        glGetBooleanv(GL_BLEND, &bools[1]);
-
-        // State changes (heavy dispatch)
-        glEnable(GL_DEPTH_TEST);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-        // Rendering
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-        glBegin(GL_TRIANGLES);
-        glColor3f(1.0f, 0.0f, 0.0f);
-        glVertex3f(0.0f, 1.0f, 0.0f);
-        glColor3f(0.0f, 1.0f, 0.0f);
-        glVertex3f(-1.0f, -1.0f, 0.0f);
-        glColor3f(0.0f, 0.0f, 1.0f);
-        glVertex3f(1.0f, -1.0f, 0.0f);
-        glEnd();
-
-        // Matrix operations
-        glMatrixMode(GL_PROJECTION);
-        glLoadIdentity();
-        glMatrixMode(GL_MODELVIEW);
-        glLoadIdentity();
-        glRotatef((float)(i % 360), 0.0f, 0.0f, 1.0f);
-
-        // Texture operations
-        GLuint tex;
-        glGenTextures(1, &tex);
-        glBindTexture(GL_TEXTURE_2D, tex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glDeleteTextures(1, &tex);
-
-        glFlush();
-        if (i % 200 == 0) glFinish();
-
-        glDisable(GL_DEPTH_TEST);
-        glDisable(GL_BLEND);
-    }
+  echo "=== BOLT target discovery ==="
+  local x
+  for x in "${_out_ref[@]}"; do
+    echo "  -> $x"
+  done
+  echo "=== End BOLT target discovery ==="
 }
 
-int main() {
-    Display *dpy = XOpenDisplay(NULL);
-    if (!dpy) return 1;
+_reverse_array() {
+  local -n _in_ref="$1"
+  local -n _out_ref="$2"
+  _out_ref=()
 
-    int screen = DefaultScreen(dpy);
-    int attribs[] = { GLX_RGBA, GLX_DEPTH_SIZE, 24, GLX_DOUBLEBUFFER, None };
+  local i
+  for (( i=${#_in_ref[@]}-1; i>=0; i-- )); do
+    _out_ref+=("${_in_ref[i]}")
+  done
+}
 
-    XVisualInfo *vi = glXChooseVisual(dpy, screen, attribs);
-    if (!vi) { XCloseDisplay(dpy); return 1; }
+_rotate_array_half() {
+  local -n _in_ref="$1"
+  local -n _out_ref="$2"
+  _out_ref=()
 
-    GLXContext ctx = glXCreateContext(dpy, vi, NULL, GL_TRUE);
-    if (!ctx) { XFree(vi); XCloseDisplay(dpy); return 1; }
+  local n=${#_in_ref[@]}
+  (( n == 0 )) && return 0
 
-    Window root = RootWindow(dpy, screen);
-    Colormap cmap = XCreateColormap(dpy, root, vi->visual, AllocNone);
+  local start=$(( n / 2 ))
+  local i
+  for (( i=0; i<n; i++ )); do
+    _out_ref+=("${_in_ref[(start + i) % n]}")
+  done
+}
 
-    XSetWindowAttributes swa;
-    swa.colormap = cmap;
-    swa.event_mask = 0;
+_interleave_array() {
+  local -n _in_ref="$1"
+  local -n _out_ref="$2"
+  _out_ref=()
 
-    Window win = XCreateWindow(dpy, root, 0, 0, 640, 480, 0,
-                               vi->depth, InputOutput, vi->visual,
-                               CWColormap | CWEventMask, &swa);
+  local n=${#_in_ref[@]}
+  (( n == 0 )) && return 0
 
-    XMapWindow(dpy, win);
+  local left=0
+  local right=$(( n - 1 ))
+  while (( left <= right )); do
+    _out_ref+=("${_in_ref[left]}")
+    if (( left == right )); then
+      break
+    fi
+    _out_ref+=("${_in_ref[right]}")
+    left=$(( left + 1 ))
+    right=$(( right - 1 ))
+  done
+}
 
-    if (!glXMakeCurrent(dpy, win, ctx)) {
-        glXDestroyContext(dpy, ctx);
-        XDestroyWindow(dpy, win);
-        XFreeColormap(dpy, cmap);
-        XFree(vi);
-        XCloseDisplay(dpy);
-        return 1;
+_probe_c_feature() {
+  local incdir="$1"
+  local code="$2"
+
+  printf '%s\n' "$code" | \
+    clang -std=gnu17 -fsyntax-only -x c - \
+      -I"$incdir" -I/usr/include \
+      >/dev/null 2>&1
+}
+
+_detect_glvnd_optional_apis() {
+  local incdir="$1"
+  local libdir="$2"
+  local out_gles1="$3"
+
+  local have_gles1=0
+
+  if _probe_c_feature "$incdir" '
+    #include <GLES/gl.h>
+    int main(void) { glClear(GL_COLOR_BUFFER_BIT); return 0; }
+  '; then
+    if find "$libdir" -maxdepth 1 -type f -name 'libGLESv1_CM.so*' | grep -q .; then
+      have_gles1=1
+    fi
+  fi
+
+  printf -v "$out_gles1" '%d' "$have_gles1"
+}
+
+_show_generated_profiles() {
+  local profdir="$1"
+  local label="$2"
+  local count=0
+
+  count=$(find "$profdir" -maxdepth 1 -name '*.profraw' 2>/dev/null | wc -l)
+  echo "  -> ${label}: generated ${count} raw profile file(s)"
+  find "$profdir" -maxdepth 1 -name '*.profraw' -printf '     %f\n' 2>/dev/null | head -20 || true
+}
+
+_show_bolt_fdata() {
+  local bolt_dir="$1"
+  local so_name="$2"
+  echo "  -> BOLT fdata files for ${so_name}:"
+  if compgen -G "${bolt_dir}/${so_name}.fdata*" >/dev/null; then
+    ls -lh "${bolt_dir}/${so_name}.fdata"* 2>/dev/null || true
+  else
+    echo "     (none)"
+  fi
+}
+
+_create_glvnd_workload_source() {
+  cat > "${srcdir}/glvnd_pgo_workload.c" <<'EOF'
+#define _GNU_SOURCE
+#ifndef HAVE_GLES1_API
+#define HAVE_GLES1_API 0
+#endif
+
+#include <stdbool.h>
+#include <pthread.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <GL/gl.h>
+#include <GL/glx.h>
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
+#if HAVE_GLES1_API
+#include <GLES/gl.h>
+#endif
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifndef EGL_PLATFORM_SURFACELESS_MESA
+#define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
+#endif
+
+typedef EGLDisplay (*PFNEGLGETPLATFORMDISPLAYEXTPROC)(EGLenum platform, void *native_display, const EGLint *attrib_list);
+
+static void print_loaded_libs(void) {
+  Dl_info info;
+
+  if (dladdr((void *)&glXQueryVersion, &info) && info.dli_fname)
+    printf("  libGLX path: %s\n", info.dli_fname);
+  if (dladdr((void *)&eglInitialize, &info) && info.dli_fname)
+    printf("  libEGL path: %s\n", info.dli_fname);
+  if (dladdr((void *)&glGetString, &info) && info.dli_fname)
+    printf("  libOpenGL/dispatch path: %s\n", info.dli_fname);
+  if (dladdr((void *)&glCreateShader, &info) && info.dli_fname)
+    printf("  libGLESv2 path: %s\n", info.dli_fname);
+#if HAVE_GLES1_API
+  if (dladdr((void *)&glClearColorx, &info) && info.dli_fname)
+    printf("  libGLESv1 path: %s\n", info.dli_fname);
+#endif
+}
+
+static void ex_dlopen_queries(int loops) {
+  const char *libs[] = {
+    "libGL.so.1",
+    "libOpenGL.so.0",
+    "libGLX.so.0",
+    "libEGL.so.1",
+    "libGLESv2.so.2",
+    "libGLdispatch.so.0",
+#if HAVE_GLES1_API
+    "libGLESv1_CM.so.1",
+#endif
+  };
+
+  const char *syms[] = {
+    "glXQueryVersion",
+    "glXGetProcAddressARB",
+    "glGetString",
+    "eglInitialize",
+    "eglGetProcAddress",
+    "glCreateShader",
+#if HAVE_GLES1_API
+    "glClearColorx",
+#endif
+  };
+
+  printf("  dlopen-symbols: %d loops\n", loops);
+  for (int i = 0; i < loops; i++) {
+    for (unsigned l = 0; l < sizeof(libs) / sizeof(libs[0]); l++) {
+      void *h = dlopen(libs[l], RTLD_LAZY | RTLD_LOCAL);
+      if (!h)
+        continue;
+      for (unsigned s = 0; s < sizeof(syms) / sizeof(syms[0]); s++)
+        (void)dlsym(h, syms[s]);
+      dlclose(h);
     }
+  }
+}
 
-    // 1500 iterations of dispatch-heavy operations
-    stress_dispatch(1500);
+struct procaddr_arg {
+  int loops;
+};
 
-    // Extension queries (critical for libglvnd)
-    for (int i = 0; i < 100; i++) {
-        glXQueryExtensionsString(dpy, screen);
-        glXGetClientString(dpy, GLX_VENDOR);
-        glXGetClientString(dpy, GLX_VERSION);
-    }
+static void *procaddr_thread(void *arg) {
+  struct procaddr_arg *a = (struct procaddr_arg *)arg;
+  const char *glx_syms[] = {
+    "glBindTexture",
+    "glFenceSync",
+    "glCreateShader",
+    "glBufferData",
+    "glVertexAttribPointer"
+  };
+  const char *egl_syms[] = {
+    "eglCreateImage",
+    "eglGetPlatformDisplayEXT",
+    "glBindTexture",
+    "glFenceSync"
+  };
 
-    glXMakeCurrent(dpy, None, NULL);
+  for (int i = 0; i < a->loops; i++) {
+    for (unsigned s = 0; s < sizeof(glx_syms) / sizeof(glx_syms[0]); s++)
+      (void)glXGetProcAddressARB((const GLubyte *)glx_syms[s]);
+    for (unsigned s = 0; s < sizeof(egl_syms) / sizeof(egl_syms[0]); s++)
+      (void)eglGetProcAddress(egl_syms[s]);
+  }
+  return NULL;
+}
+
+static void ex_procaddr_stress(bool bolt_mode) {
+  pthread_t th[4];
+  struct procaddr_arg arg = { .loops = bolt_mode ? 900 : 300 };
+
+  printf("  procaddr-stress: 4 threads x %d loops\n", arg.loops);
+  for (int i = 0; i < 4; i++)
+    pthread_create(&th[i], NULL, procaddr_thread, &arg);
+  for (int i = 0; i < 4; i++)
+    pthread_join(th[i], NULL);
+}
+
+static void ex_glx_legacy(bool bolt_mode) {
+  Display *dpy = XOpenDisplay(NULL);
+  if (!dpy) {
+    printf("  glx-legacy: no X display, skipping\n");
+    return;
+  }
+
+  int loops = bolt_mode ? 700 : 280;
+  int screen = DefaultScreen(dpy);
+  int major = 0, minor = 0;
+  glXQueryVersion(dpy, &major, &minor);
+
+  int attribs[] = { GLX_RGBA, GLX_DEPTH_SIZE, 24, GLX_DOUBLEBUFFER, None };
+  XVisualInfo *vi = glXChooseVisual(dpy, screen, attribs);
+  if (!vi) {
+    XCloseDisplay(dpy);
+    printf("  glx-legacy: no visual\n");
+    return;
+  }
+
+  GLXContext ctx = glXCreateContext(dpy, vi, NULL, True);
+  if (!ctx) {
+    XFree(vi);
+    XCloseDisplay(dpy);
+    printf("  glx-legacy: no context\n");
+    return;
+  }
+
+  Window root = RootWindow(dpy, screen);
+  Colormap cmap = XCreateColormap(dpy, root, vi->visual, AllocNone);
+
+  XSetWindowAttributes swa;
+  memset(&swa, 0, sizeof(swa));
+  swa.colormap = cmap;
+  swa.event_mask = 0;
+
+  Window win = XCreateWindow(dpy, root, 0, 0, 320, 240, 0,
+                             vi->depth, InputOutput, vi->visual,
+                             CWColormap | CWEventMask, &swa);
+  XMapWindow(dpy, win);
+
+  if (!glXMakeCurrent(dpy, win, ctx)) {
     glXDestroyContext(dpy, ctx);
     XDestroyWindow(dpy, win);
     XFreeColormap(dpy, cmap);
     XFree(vi);
     XCloseDisplay(dpy);
+    printf("  glx-legacy: make current failed\n");
+    return;
+  }
 
-    return 0;
+  printf("  glx-legacy: %d loops\n", loops);
+  for (int i = 0; i < loops; i++) {
+    (void)glXQueryExtensionsString(dpy, screen);
+    (void)glXGetClientString(dpy, GLX_VENDOR);
+    (void)glXGetClientString(dpy, GLX_VERSION);
+    (void)glXQueryServerString(dpy, screen, GLX_VENDOR);
+    (void)glXGetProcAddressARB((const GLubyte *)"glBindTexture");
+    (void)glXGetProcAddressARB((const GLubyte *)"glFenceSync");
+
+    (void)glGetString(GL_VENDOR);
+    (void)glGetString(GL_RENDERER);
+    (void)glGetString(GL_VERSION);
+
+    GLint v = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &v);
+    glGetIntegerv(GL_VIEWPORT, &v);
+
+    glViewport(0, 0, 320, 240);
+    glClearColor((float)(i & 1), 0.2f, 0.3f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    glBegin(GL_TRIANGLES);
+    glColor3f(1.f, 0.f, 0.f); glVertex2f(-0.5f, -0.5f);
+    glColor3f(0.f, 1.f, 0.f); glVertex2f( 0.5f, -0.5f);
+    glColor3f(0.f, 0.f, 1.f); glVertex2f( 0.0f,  0.5f);
+    glEnd();
+
+    glXSwapBuffers(dpy, win);
+    if ((i & 63) == 0)
+      glFinish();
+  }
+
+  glXMakeCurrent(dpy, None, NULL);
+  glXDestroyContext(dpy, ctx);
+  XDestroyWindow(dpy, win);
+  XFreeColormap(dpy, cmap);
+  XFree(vi);
+  XCloseDisplay(dpy);
+}
+
+static void ex_glx_fbconfig(bool bolt_mode) {
+  Display *dpy = XOpenDisplay(NULL);
+  if (!dpy) {
+    printf("  glx-fbconfig: no X display, skipping\n");
+    return;
+  }
+
+  int screen = DefaultScreen(dpy);
+  int loops = bolt_mode ? 500 : 180;
+  int attrs[] = {
+    GLX_RENDER_TYPE, GLX_RGBA_BIT,
+    GLX_DRAWABLE_TYPE, GLX_PBUFFER_BIT,
+    GLX_DOUBLEBUFFER, False,
+    None
+  };
+
+  int ncfg = 0;
+  GLXFBConfig *cfgs = glXChooseFBConfig(dpy, screen, attrs, &ncfg);
+  if (!cfgs || ncfg < 1) {
+    if (cfgs) XFree(cfgs);
+    XCloseDisplay(dpy);
+    printf("  glx-fbconfig: no fbconfig\n");
+    return;
+  }
+
+  int pb_attrs[] = {
+    GLX_PBUFFER_WIDTH, 320,
+    GLX_PBUFFER_HEIGHT, 240,
+    None
+  };
+  GLXPbuffer pbuf = glXCreatePbuffer(dpy, cfgs[0], pb_attrs);
+  GLXContext ctx = glXCreateNewContext(dpy, cfgs[0], GLX_RGBA_TYPE, NULL, True);
+
+  if (!ctx || !pbuf) {
+    if (ctx) glXDestroyContext(dpy, ctx);
+    if (pbuf) glXDestroyPbuffer(dpy, pbuf);
+    XFree(cfgs);
+    XCloseDisplay(dpy);
+    printf("  glx-fbconfig: setup failed\n");
+    return;
+  }
+
+  glXMakeContextCurrent(dpy, pbuf, pbuf, ctx);
+
+  printf("  glx-fbconfig: %d loops\n", loops);
+  for (int i = 0; i < loops; i++) {
+    (void)glXGetProcAddressARB((const GLubyte *)"glBindFramebuffer");
+    (void)glXGetProcAddressARB((const GLubyte *)"glBlitFramebuffer");
+    (void)glXQueryExtensionsString(dpy, screen);
+
+    glViewport(0, 0, 320, 240);
+    glClearColor(0.4f, 0.2f, (float)(i & 1), 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    if ((i & 31) == 0)
+      glFinish();
+  }
+
+  glXMakeContextCurrent(dpy, None, None, NULL);
+  glXDestroyContext(dpy, ctx);
+  glXDestroyPbuffer(dpy, pbuf);
+  XFree(cfgs);
+  XCloseDisplay(dpy);
+}
+
+static EGLDisplay open_egl_display(Display *x11_dpy) {
+  EGLDisplay edpy = EGL_NO_DISPLAY;
+
+  if (x11_dpy)
+    edpy = eglGetDisplay((EGLNativeDisplayType)x11_dpy);
+
+  if (edpy == EGL_NO_DISPLAY) {
+    PFNEGLGETPLATFORMDISPLAYEXTPROC getpd =
+      (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+    if (getpd)
+      edpy = getpd(EGL_PLATFORM_SURFACELESS_MESA, NULL, NULL);
+  }
+
+  if (edpy == EGL_NO_DISPLAY)
+    edpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+
+  return edpy;
+}
+
+static void ex_egl_queries(void) {
+  printf("  egl-queries: client/platform queries\n");
+  (void)eglGetDisplay(EGL_DEFAULT_DISPLAY);
+  (void)eglGetProcAddress("eglCreateImage");
+  (void)eglGetProcAddress("eglGetPlatformDisplayEXT");
+  (void)eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+}
+
+static void ex_egl_opengl(bool bolt_mode) {
+  Display *dpy = XOpenDisplay(NULL);
+  EGLDisplay edpy = open_egl_display(dpy);
+  if (edpy == EGL_NO_DISPLAY) {
+    if (dpy) XCloseDisplay(dpy);
+    printf("  egl-opengl: no display\n");
+    return;
+  }
+
+  EGLint maj = 0, min = 0;
+  if (!eglInitialize(edpy, &maj, &min)) {
+    if (dpy) XCloseDisplay(dpy);
+    printf("  egl-opengl: init failed\n");
+    return;
+  }
+
+  int loops = bolt_mode ? 500 : 180;
+  (void)eglQueryString(edpy, EGL_VENDOR);
+  (void)eglQueryString(edpy, EGL_VERSION);
+  (void)eglQueryString(edpy, EGL_EXTENSIONS);
+  (void)eglGetProcAddress("eglCreateImage");
+  (void)eglGetProcAddress("glFenceSync");
+
+  EGLConfig cfg;
+  EGLint num = 0;
+  EGLint attrs[] = {
+    EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+    EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+    EGL_NONE
+  };
+
+  if (!eglChooseConfig(edpy, attrs, &cfg, 1, &num) || num < 1) {
+    eglTerminate(edpy);
+    if (dpy) XCloseDisplay(dpy);
+    printf("  egl-opengl: no config\n");
+    return;
+  }
+
+  eglBindAPI(EGL_OPENGL_API);
+
+  EGLint pb_attrs[] = {
+    EGL_WIDTH, 320,
+    EGL_HEIGHT, 240,
+    EGL_NONE
+  };
+  EGLSurface surf = eglCreatePbufferSurface(edpy, cfg, pb_attrs);
+  if (surf == EGL_NO_SURFACE) {
+    eglTerminate(edpy);
+    if (dpy) XCloseDisplay(dpy);
+    printf("  egl-opengl: no pbuffer\n");
+    return;
+  }
+
+  EGLContext ctx = eglCreateContext(edpy, cfg, EGL_NO_CONTEXT, NULL);
+  if (ctx == EGL_NO_CONTEXT) {
+    eglDestroySurface(edpy, surf);
+    eglTerminate(edpy);
+    if (dpy) XCloseDisplay(dpy);
+    printf("  egl-opengl: no context\n");
+    return;
+  }
+
+  eglMakeCurrent(edpy, surf, surf, ctx);
+
+  printf("  egl-opengl: %d loops\n", loops);
+  for (int i = 0; i < loops; i++) {
+    GLint v = 0;
+    (void)glGetString(GL_VENDOR);
+    (void)glGetString(GL_RENDERER);
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &v);
+
+    glViewport(0, 0, 320, 240);
+    glClearColor(0.1f, (float)(i & 1), 0.4f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    if ((i & 31) == 0) {
+      eglWaitGL();
+      eglWaitNative(EGL_CORE_NATIVE_ENGINE);
+      glFinish();
+    }
+  }
+
+  eglMakeCurrent(edpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  eglDestroyContext(edpy, ctx);
+  eglDestroySurface(edpy, surf);
+  eglTerminate(edpy);
+  if (dpy) XCloseDisplay(dpy);
+}
+
+static GLuint compile_shader(GLenum type, const char *src) {
+  GLuint s = glCreateShader(type);
+  glShaderSource(s, 1, &src, NULL);
+  glCompileShader(s);
+  return s;
+}
+
+static void ex_egl_gles2(bool bolt_mode) {
+  Display *dpy = XOpenDisplay(NULL);
+  EGLDisplay edpy = open_egl_display(dpy);
+  if (edpy == EGL_NO_DISPLAY) {
+    if (dpy) XCloseDisplay(dpy);
+    printf("  egl-gles2: no display\n");
+    return;
+  }
+
+  EGLint maj = 0, min = 0;
+  if (!eglInitialize(edpy, &maj, &min)) {
+    if (dpy) XCloseDisplay(dpy);
+    printf("  egl-gles2: init failed\n");
+    return;
+  }
+
+  int loops = bolt_mode ? 700 : 280;
+  EGLConfig cfg;
+  EGLint num = 0;
+  EGLint attrs[] = {
+    EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+    EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+    EGL_NONE
+  };
+
+  if (!eglChooseConfig(edpy, attrs, &cfg, 1, &num) || num < 1) {
+    eglTerminate(edpy);
+    if (dpy) XCloseDisplay(dpy);
+    printf("  egl-gles2: no config\n");
+    return;
+  }
+
+  eglBindAPI(EGL_OPENGL_ES_API);
+
+  EGLint pb_attrs[] = {
+    EGL_WIDTH, 320,
+    EGL_HEIGHT, 240,
+    EGL_NONE
+  };
+  EGLSurface surf = eglCreatePbufferSurface(edpy, cfg, pb_attrs);
+  if (surf == EGL_NO_SURFACE) {
+    eglTerminate(edpy);
+    if (dpy) XCloseDisplay(dpy);
+    printf("  egl-gles2: no pbuffer\n");
+    return;
+  }
+
+  EGLint ctx_attrs[] = {
+    EGL_CONTEXT_CLIENT_VERSION, 2,
+    EGL_NONE
+  };
+  EGLContext ctx = eglCreateContext(edpy, cfg, EGL_NO_CONTEXT, ctx_attrs);
+  if (ctx == EGL_NO_CONTEXT) {
+    eglDestroySurface(edpy, surf);
+    eglTerminate(edpy);
+    if (dpy) XCloseDisplay(dpy);
+    printf("  egl-gles2: no context\n");
+    return;
+  }
+
+  eglMakeCurrent(edpy, surf, surf, ctx);
+
+  const char *vs_src =
+    "attribute vec2 aPos; void main() { gl_Position = vec4(aPos, 0.0, 1.0); }";
+  const char *fs_src =
+    "precision mediump float; void main() { gl_FragColor = vec4(0.2,0.8,0.4,1.0); }";
+
+  GLuint vs = compile_shader(GL_VERTEX_SHADER, vs_src);
+  GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fs_src);
+  GLuint prog = glCreateProgram();
+  glAttachShader(prog, vs);
+  glAttachShader(prog, fs);
+  glBindAttribLocation(prog, 0, "aPos");
+  glLinkProgram(prog);
+  glUseProgram(prog);
+
+  GLfloat tri[] = { -0.5f, -0.5f, 0.5f, -0.5f, 0.0f, 0.5f };
+
+  printf("  egl-gles2: %d loops\n", loops);
+  for (int i = 0; i < loops; i++) {
+    glViewport(0, 0, 320, 240);
+    glClearColor(0.3f, 0.1f, (float)(i & 1), 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, tri);
+    glEnableVertexAttribArray(0);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glDisableVertexAttribArray(0);
+
+    (void)glGetString(GL_VENDOR);
+    (void)glGetString(GL_RENDERER);
+    (void)glGetString(GL_VERSION);
+
+    if ((i & 31) == 0)
+      glFinish();
+  }
+
+  glDeleteProgram(prog);
+  glDeleteShader(vs);
+  glDeleteShader(fs);
+
+  eglMakeCurrent(edpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  eglDestroyContext(edpy, ctx);
+  eglDestroySurface(edpy, surf);
+  eglTerminate(edpy);
+  if (dpy) XCloseDisplay(dpy);
+}
+
+#if HAVE_GLES1_API
+static void ex_egl_gles1(bool bolt_mode) {
+  Display *dpy = XOpenDisplay(NULL);
+  EGLDisplay edpy = open_egl_display(dpy);
+  if (edpy == EGL_NO_DISPLAY) {
+    if (dpy) XCloseDisplay(dpy);
+    printf("  egl-gles1: no display\n");
+    return;
+  }
+
+  EGLint maj = 0, min = 0;
+  if (!eglInitialize(edpy, &maj, &min)) {
+    if (dpy) XCloseDisplay(dpy);
+    printf("  egl-gles1: init failed\n");
+    return;
+  }
+
+  int loops = bolt_mode ? 480 : 160;
+  EGLConfig cfg;
+  EGLint num = 0;
+  EGLint attrs[] = {
+    EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+    EGL_RENDERABLE_TYPE, EGL_OPENGL_ES_BIT,
+    EGL_NONE
+  };
+
+  if (!eglChooseConfig(edpy, attrs, &cfg, 1, &num) || num < 1) {
+    eglTerminate(edpy);
+    if (dpy) XCloseDisplay(dpy);
+    printf("  egl-gles1: no config\n");
+    return;
+  }
+
+  eglBindAPI(EGL_OPENGL_ES_API);
+
+  EGLint pb_attrs[] = {
+    EGL_WIDTH, 320,
+    EGL_HEIGHT, 240,
+    EGL_NONE
+  };
+  EGLSurface surf = eglCreatePbufferSurface(edpy, cfg, pb_attrs);
+  if (surf == EGL_NO_SURFACE) {
+    eglTerminate(edpy);
+    if (dpy) XCloseDisplay(dpy);
+    printf("  egl-gles1: no pbuffer\n");
+    return;
+  }
+
+  EGLint ctx_attrs[] = {
+    EGL_CONTEXT_CLIENT_VERSION, 1,
+    EGL_NONE
+  };
+  EGLContext ctx = eglCreateContext(edpy, cfg, EGL_NO_CONTEXT, ctx_attrs);
+  if (ctx == EGL_NO_CONTEXT) {
+    eglDestroySurface(edpy, surf);
+    eglTerminate(edpy);
+    if (dpy) XCloseDisplay(dpy);
+    printf("  egl-gles1: no context\n");
+    return;
+  }
+
+  eglMakeCurrent(edpy, surf, surf, ctx);
+
+  GLfixed tri[] = {
+    -32768, -32768,
+     32768, -32768,
+         0,  32768
+  };
+
+  printf("  egl-gles1: %d loops\n", loops);
+  for (int i = 0; i < loops; i++) {
+    glViewport(0, 0, 320, 240);
+    glClearColorx(0x1000, 0x2000, 0x3000, 0x10000);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glVertexPointer(2, GL_FIXED, 0, tri);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glDisableClientState(GL_VERTEX_ARRAY);
+
+    if ((i & 31) == 0)
+      glFinish();
+  }
+
+  eglMakeCurrent(edpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  eglDestroyContext(edpy, ctx);
+  eglDestroySurface(edpy, surf);
+  eglTerminate(edpy);
+  if (dpy) XCloseDisplay(dpy);
+}
+#endif
+
+int main(int argc, char **argv) {
+  setvbuf(stdout, NULL, _IONBF, 0);
+  setvbuf(stderr, NULL, _IONBF, 0);
+
+  bool bolt_mode = false;
+  if (argc > 1 && strcmp(argv[1], "--bolt-mode") == 0)
+    bolt_mode = true;
+
+  printf("glvnd PGO helper start\n");
+  printf("  mode: %s\n", bolt_mode ? "bolt" : "normal");
+  printf("  DISPLAY=%s\n", getenv("DISPLAY") ? getenv("DISPLAY") : "(unset)");
+  print_loaded_libs();
+
+  ex_dlopen_queries(bolt_mode ? 600 : 220);
+  ex_procaddr_stress(bolt_mode);
+  ex_egl_queries();
+  ex_glx_legacy(bolt_mode);
+  ex_glx_fbconfig(bolt_mode);
+  ex_egl_opengl(bolt_mode);
+  ex_egl_gles2(bolt_mode);
+#if HAVE_GLES1_API
+  ex_egl_gles1(bolt_mode);
+#else
+  printf("  egl-gles1: unavailable at build time\n");
+#endif
+
+  printf("glvnd PGO helper end\n");
+  return 0;
 }
 EOF
+}
 
-  if gcc -o "${srcdir}/gl_fast_${workload_name}" \
-     "${srcdir}/gl_fast_${workload_name}.c" \
-     -lGL -lX11 \
-     -L"${build_dir}/src/GLX" \
-     -L"${build_dir}/src/OpenGL" \
-     -L"${build_dir}/src/GLdispatch" \
-     -Wl,-rpath,"${build_dir}/src/GLX:${build_dir}/src/OpenGL:${build_dir}/src/GLdispatch" \
-     2>/dev/null; then
+_build_workload_helper() {
+  local stage="$1"
+  local incdir="$2"
+  local libdir="$3"
+  local outpath="$4"
 
-    echo "     Running 10 iterations..."
-    for i in {1..10}; do
-      timeout 5 "${srcdir}/gl_fast_${workload_name}" >/dev/null 2>&1 || true
-    done
+  local have_gles1=0
+  _detect_glvnd_optional_apis "$incdir" "$libdir" have_gles1
+
+  echo "  -> Building libglvnd workload helper: $outpath"
+  echo "     optional APIs: gles1=$have_gles1"
+
+  local -a link_libs=(
+    -lGL
+    -lGLX
+    -lOpenGL
+    -lEGL
+    -lGLESv2
+    -lX11
+    -lXext
+    -ldl
+    -lpthread
+    -lm
+  )
+
+  (( have_gles1 )) && link_libs+=(-lGLESv1_CM)
+
+  clang -std=gnu17 -O2 -pipe \
+    -DHAVE_GLES1_API="$have_gles1" \
+    -I"$incdir" -I/usr/include \
+    "${srcdir}/glvnd_pgo_workload.c" \
+    -L"$libdir" \
+    -Wl,-rpath-link,"$libdir" \
+    "${link_libs[@]}" \
+    -o "$outpath"
+}
+
+_run_tool_supplement() {
+  local stage="$1"
+  local libdir="$2"
+  local mode="$3"
+
+  export LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  export LD_BIND_NOW=1
+
+  if [[ -n "${DISPLAY:-}" ]]; then
+    if command -v glxinfo >/dev/null 2>&1; then
+      echo "  -> ${stage}: supplemental glxinfo"
+      timeout 6s glxinfo -B >/dev/null 2>&1 || true
+      timeout 6s glxinfo >/dev/null 2>&1 || true
+    fi
+
+    if command -v glxgears >/dev/null 2>&1; then
+      echo "  -> ${stage}: supplemental glxgears"
+      timeout 3s glxgears >/dev/null 2>&1 || true
+      [[ "$mode" == bolt ]] && timeout 3s glxgears >/dev/null 2>&1 || true
+    fi
+
+    if command -v glmark2 >/dev/null 2>&1; then
+      echo "  -> ${stage}: supplemental glmark2"
+      timeout 8s glmark2 --size 800x600 -b "build:duration=2000" >/dev/null 2>&1 || true
+      [[ "$mode" == bolt ]] && timeout 8s glmark2 --size 800x600 -b "texture:duration=2000" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if command -v eglinfo >/dev/null 2>&1; then
+    echo "  -> ${stage}: supplemental eglinfo"
+    timeout 6s eglinfo >/dev/null 2>&1 || true
+  fi
+}
+
+_run_glvnd_workload() {
+  local stage="$1"
+  local libdir="$2"
+  local profdir="$3"
+  local helper="$4"
+  local mode="$5"
+  local logfile="${srcdir}/glvnd-training-$(_stage_slug "$stage").log"
+
+  echo "→ ${stage}: Running custom libglvnd workload..."
+  echo "  -> helper: $helper"
+  echo "  -> mode: $mode"
+  echo "  -> logfile: $logfile"
+  echo "  -> LD_LIBRARY_PATH=$libdir"
+
+  (
+    export LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export LD_BIND_NOW=1
+    set -o pipefail
+    if [[ "$mode" == bolt ]]; then
+      "$helper" --bolt-mode 2>&1 | tee "$logfile"
+    else
+      "$helper" 2>&1 | tee "$logfile"
+    fi
+  ) || {
+    echo "Error: custom libglvnd workload failed during ${stage}." >&2
+    return 1
+  }
+
+  _run_tool_supplement "$stage" "$libdir" "$mode" 2>&1 | tee -a "$logfile" || true
+
+  if [[ -n "$profdir" ]]; then
+    _show_generated_profiles "$profdir" "$stage"
+  fi
+}
+
+_show_generated_profiles() {
+  local profdir="$1"
+  local label="$2"
+  local count=0
+
+  count=$(find "$profdir" -maxdepth 1 -name '*.profraw' 2>/dev/null | wc -l)
+  echo "  -> ${label}: generated ${count} raw profile file(s)"
+  find "$profdir" -maxdepth 1 -name '*.profraw' -printf '     %f\n' 2>/dev/null | head -20 || true
+}
+
+_show_bolt_fdata() {
+  local bolt_dir="$1"
+  local so_name="$2"
+  echo "  -> BOLT fdata files for ${so_name}:"
+  if compgen -G "${bolt_dir}/${so_name}.fdata*" >/dev/null; then
+    ls -lh "${bolt_dir}/${so_name}.fdata"* 2>/dev/null || true
   else
-    echo "     Custom test compilation failed, skipping"
+    echo "     (none)"
   fi
+}
 
-  # Phase 4: glxgears quick test (~15 seconds)
-  echo "  --> Phase 4: GLX rendering (5x glxgears)..."
-  if command -v glxgears &>/dev/null; then
-    for i in {1..5}; do
-      timeout 3 glxgears >/dev/null 2>&1 || true
-    done
-  fi
-
-  local profile_count=$(find "${srcdir}" -name "*.profraw" -type f 2>/dev/null | wc -l)
-  echo "  --> Complete! Generated $profile_count profile files"
+prepare() {
+  _create_glvnd_workload_source
 }
 
 build() {
-  export CC=clang
-  export CXX=clang++
-  export AR=llvm-ar
-  export NM=llvm-nm
-  export RANLIB=llvm-ranlib
+  _setup_llvm_toolchain
 
-  format_meson_flags() {
-    local flags_str=""
-    for flag in "$@"; do
-      flag_escaped="${flag//\'/\'\\\'\'}"
-      flags_str+="'$flag_escaped', "
-    done
-    echo "[${flags_str%, }]"
-  }
+  local srcroot="${srcdir}/${_pkgname}"
+  local build_pgo="${srcdir}/build-pgo"
+  local build_cs="${srcdir}/build-cs"
+  local build_final="${srcdir}/build-final"
 
-  local meson_options=(
-    -D asm=enabled
-    -D c_std=gnu2x
-    -D cpp_std=gnu++2a
-    -D gles1=false
-    --buildtype=plain
-    --wrap-mode=nofallback
-    --native-file=meson-native-flags.ini
+  local inst_pgo="${srcdir}/inst-pgo"
+  local inst_cs="${srcdir}/inst-cs"
+  local inst_final="${srcdir}/inst-final"
+  local inst_bolt="${srcdir}/inst-bolt"
+
+  local pgo_dir="${srcdir}/pgo"
+  local cs_dir="${srcdir}/cspgo"
+  local bolt_dir="${srcdir}/bolt"
+
+  rm -rf "$build_pgo" "$build_cs" "$build_final"
+  rm -rf "$inst_pgo" "$inst_cs" "$inst_final" "$inst_bolt"
+  rm -rf "$pgo_dir" "$cs_dir" "$bolt_dir"
+  mkdir -p "$pgo_dir" "$cs_dir" "$bolt_dir"
+
+  local _orig_cflags="$CFLAGS"
+  local _orig_cxxflags="$CXXFLAGS"
+  local _orig_ldflags="$LDFLAGS"
+
+  local _instr_flags=(
+    -g3
+    -fno-omit-frame-pointer
+    -Xclang -mllvm -Xclang -vp-counters-per-site=64
+    -Xclang -mllvm -Xclang -runtime-counter-relocation
+    -Xclang -mllvm -Xclang -enable-value-profiling
   )
 
-  mkdir -p "$srcdir"/{pgo_raw,pgo_cs}
+  local _profile_warnings=(
+    -Wno-profile-instr-out-of-date
+    -Wno-profile-instr-unprofiled
+  )
 
-  local pgo_instr_flags="-fno-omit-frame-pointer -mllvm -vp-counters-per-site=128 -mllvm -enable-value-profiling"
+  local _prefix_maps=(
+    "-ffile-prefix-map=$srcdir=/usr/src/debug/$pkgname"
+    "-fdebug-prefix-map=$srcdir=/usr/src/debug/$pkgname"
+    "-fmacro-prefix-map=$srcdir=/usr/src/debug/$pkgname"
+  )
 
-  # === Stage 1: Standard PGO ===
-  echo "==> Stage 1.1: Building with standard PGO instrumentation..."
+  _meson_stage_setup() {
+    local srcroot_local="$1"
+    local builddir_local="$2"
+    local cflags_local="$3"
+    local cxxflags_local="$4"
+    local ldflags_local="$5"
 
-  local cflags_array=$(format_meson_flags $CFLAGS "-fprofile-generate=${srcdir}/pgo_raw" $pgo_instr_flags)
-  local cxxflags_array=$(format_meson_flags $CXXFLAGS "-fprofile-generate=${srcdir}/pgo_raw" $pgo_instr_flags)
-  local ldflags_array=$(format_meson_flags $LDFLAGS "-fprofile-generate=${srcdir}/pgo_raw" "-fuse-ld=lld")
+    rm -rf "$builddir_local"
 
-  cat > meson-native-flags.ini <<EOF
-[built-in options]
-c_args = $cflags_array
-cpp_args = $cxxflags_array
-c_link_args = $ldflags_array
-cpp_link_args = $ldflags_array
-b_pie = 'false'
-b_ndebug = 'false'
+    env \
+      CC="$CC" \
+      CXX="$CXX" \
+      AR="$AR" \
+      NM="$NM" \
+      RANLIB="$RANLIB" \
+      STRIP="$STRIP" \
+      CFLAGS="$cflags_local" \
+      CXXFLAGS="$cxxflags_local" \
+      LDFLAGS="$ldflags_local" \
+      meson setup "$builddir_local" "$srcroot_local" \
+        --prefix=/usr \
+        --libdir=lib \
+        --buildtype=plain \
+        --wrap-mode=nofallback \
+        -Db_ndebug=true \
+        -Db_pie=false
+  }
 
-[binaries]
-c = 'clang'
-cpp = 'clang++'
-ar = 'llvm-ar'
-nm = 'llvm-nm'
-ranlib = 'llvm-ranlib'
-EOF
+  # Stage 1
+  echo "=== Stage 1: Standard PGO instrumentation ==="
+  local cflags_stage1="${_orig_cflags} ${_prefix_maps[*]} -fprofile-generate=${pgo_dir} ${_instr_flags[*]}"
+  local cxxflags_stage1="${_orig_cxxflags} ${_prefix_maps[*]} -fprofile-generate=${pgo_dir} ${_instr_flags[*]}"
+  local ldflags_stage1="${_orig_ldflags} -fprofile-generate=${pgo_dir}"
 
-  arch-meson $_pkgname build-pgo1 "${meson_options[@]}"
-  meson compile -C build-pgo1
+  _meson_stage_setup "$srcroot" "$build_pgo" "$cflags_stage1" "$cxxflags_stage1" "$ldflags_stage1"
+  meson compile -C "$build_pgo"
+  _stage_install "$build_pgo" "$inst_pgo"
 
-  echo "==> Stage 1.2: Running training for standard PGO..."
-  export LLVM_PROFILE_FILE="${srcdir}/pgo_raw/glvnd-%p-%m.profraw"
+  local pgo_incdir pgo_libdir
+  pgo_incdir="${inst_pgo}/usr/include"
+  _get_stage_libdir "$inst_pgo" pgo_libdir || {
+    echo "Error: could not determine Stage 1 staged lib dir." >&2
+    return 1
+  }
 
-  _run_gl_training_workload "${srcdir}/build-pgo1" "standard"
+  local helper_pgo="${srcdir}/glvnd-workload-stage1"
+  _build_workload_helper stage1 "$pgo_incdir" "$pgo_libdir" "$helper_pgo"
 
-  local raw_count=$(find "${srcdir}/pgo_raw" -name "*.profraw" 2>/dev/null | wc -l)
-  if [ "$raw_count" -eq 0 ]; then
-    echo "WARNING: No PGO profiles generated, building without PGO" >&2
+  export LLVM_PROFILE_FILE="${pgo_dir}/glvnd-%m-%p.profraw"
+  _run_glvnd_workload "Stage 1" "$pgo_libdir" "$pgo_dir" "$helper_pgo" normal || return 1
+  unset LLVM_PROFILE_FILE
 
-    cat > meson-native-flags.ini <<EOF
-[built-in options]
-b_pie = 'false'
-b_ndebug = 'true'
+  local -a pgo_raws=()
+  shopt -s nullglob
+  pgo_raws=("${pgo_dir}"/*.profraw)
+  shopt -u nullglob
+  if (( ! ${#pgo_raws[@]} )); then
+    echo "Error: no Stage 1 PGO profile data generated." >&2
+    return 1
+  fi
+  llvm-profdata merge -sparse -output="${srcdir}/standard.profdata" "${pgo_raws[@]}"
 
-[binaries]
-c = 'clang'
-cpp = 'clang++'
-ar = 'llvm-ar'
-nm = 'llvm-nm'
-ranlib = 'llvm-ranlib'
-EOF
+  # Stage 2
+  echo "=== Stage 2: Context-Sensitive PGO instrumentation ==="
+  local cflags_stage2="${_orig_cflags} ${_prefix_maps[*]} -fprofile-use=${srcdir}/standard.profdata -fcs-profile-generate=${cs_dir} ${_profile_warnings[*]} ${_instr_flags[*]}"
+  local cxxflags_stage2="${_orig_cxxflags} ${_prefix_maps[*]} -fprofile-use=${srcdir}/standard.profdata -fcs-profile-generate=${cs_dir} ${_profile_warnings[*]} ${_instr_flags[*]}"
+  local ldflags_stage2="${_orig_ldflags} -fprofile-use=${srcdir}/standard.profdata -fcs-profile-generate=${cs_dir}"
 
-    arch-meson $_pkgname build "${meson_options[@]}"
-    meson compile -C build
+  _meson_stage_setup "$srcroot" "$build_cs" "$cflags_stage2" "$cxxflags_stage2" "$ldflags_stage2"
+  meson compile -C "$build_cs"
+  _stage_install "$build_cs" "$inst_cs"
+
+  local cs_incdir cs_libdir
+  cs_incdir="${inst_cs}/usr/include"
+  _get_stage_libdir "$inst_cs" cs_libdir || {
+    echo "Error: could not determine Stage 2 staged lib dir." >&2
+    return 1
+  }
+
+  local helper_cs="${srcdir}/glvnd-workload-stage2"
+  _build_workload_helper stage2 "$cs_incdir" "$cs_libdir" "$helper_cs"
+
+  export LLVM_PROFILE_FILE="${cs_dir}/glvnd-cs-%m-%p.profraw"
+  _run_glvnd_workload "Stage 2" "$cs_libdir" "$cs_dir" "$helper_cs" normal || return 1
+  unset LLVM_PROFILE_FILE
+
+  local -a cs_raws=()
+  shopt -s nullglob
+  cs_raws=("${cs_dir}"/*.profraw)
+  shopt -u nullglob
+  if (( ! ${#cs_raws[@]} )); then
+    echo "Error: no Stage 2 CS-PGO profile data generated." >&2
+    return 1
+  fi
+  llvm-profdata merge -sparse \
+    -output="${srcdir}/merged.profdata" \
+    "${srcdir}/standard.profdata" "${cs_raws[@]}"
+
+  # Stage 3
+  echo "=== Stage 3: Final optimized build ==="
+  local cflags_stage3="${_orig_cflags} ${_prefix_maps[*]} -fprofile-use=${srcdir}/merged.profdata ${_profile_warnings[*]}"
+  local cxxflags_stage3="${_orig_cxxflags} ${_prefix_maps[*]} -fprofile-use=${srcdir}/merged.profdata ${_profile_warnings[*]}"
+  local ldflags_stage3="${_orig_ldflags} -fprofile-use=${srcdir}/merged.profdata -Wl,--emit-relocs"
+
+  _meson_stage_setup "$srcroot" "$build_final" "$cflags_stage3" "$cxxflags_stage3" "$ldflags_stage3"
+  meson compile -C "$build_final"
+  _stage_install "$build_final" "$inst_final"
+
+  local final_incdir final_libdir
+  final_incdir="${inst_final}/usr/include"
+  _get_stage_libdir "$inst_final" final_libdir || {
+    echo "Error: could not determine Stage 3 staged lib dir." >&2
+    return 1
+  }
+
+  echo "=== Stage 3: Built shared libraries ==="
+  find "$build_final" -type f -name '*.so*' | sort
+
+  # Stage 4
+  if ! command -v llvm-bolt >/dev/null 2>&1; then
+    echo "=== Stage 4: llvm-bolt not found; skipping BOLT ==="
     return 0
   fi
 
-  echo "==> Merging $raw_count standard PGO profiles..."
-  llvm-profdata merge -output="${srcdir}/standard.profdata" "${srcdir}/pgo_raw"/*.profraw
+  echo "=== Stage 4: BOLT post-link optimization ==="
 
-  echo "==> Standard PGO profile statistics:"
-  llvm-profdata show --detailed-summary "${srcdir}/standard.profdata" 2>&1 | head -15
+  local -a bolt_targets=()
+  _collect_bolt_targets "$build_final" bolt_targets
 
-  # === Stage 2: Context-Sensitive PGO ===
-  echo "==> Stage 2.1: Building with CS-PGO instrumentation..."
-
-  local cs_pgo_flags="-fprofile-use=${srcdir}/standard.profdata -fcs-profile-generate=${srcdir}/pgo_cs"
-  cflags_array=$(format_meson_flags $CFLAGS $cs_pgo_flags $pgo_instr_flags)
-  cxxflags_array=$(format_meson_flags $CXXFLAGS $cs_pgo_flags $pgo_instr_flags)
-  ldflags_array=$(format_meson_flags $LDFLAGS $cs_pgo_flags "-fuse-ld=lld")
-
-  cat > meson-native-flags.ini <<EOF
-[built-in options]
-c_args = $cflags_array
-cpp_args = $cxxflags_array
-c_link_args = $ldflags_array
-cpp_link_args = $ldflags_array
-b_pie = 'false'
-b_ndebug = 'false'
-
-[binaries]
-c = 'clang'
-cpp = 'clang++'
-ar = 'llvm-ar'
-nm = 'llvm-nm'
-ranlib = 'llvm-ranlib'
-EOF
-
-  arch-meson $_pkgname build-pgo2 "${meson_options[@]}"
-  meson compile -C build-pgo2
-
-  echo "==> Stage 2.2: Running training for CS-PGO..."
-  export LLVM_PROFILE_FILE="${srcdir}/pgo_cs/glvnd-%p-%m.cs.profraw"
-
-  _run_gl_training_workload "${srcdir}/build-pgo2" "cs"
-
-  local cs_count=$(find "${srcdir}/pgo_cs" -name "*.profraw" 2>/dev/null | wc -l)
-  if [ "$cs_count" -gt 0 ]; then
-    echo "==> Merging CS-PGO with standard PGO..."
-    llvm-profdata merge -output="${srcdir}/merged.profdata" \
-      "${srcdir}/pgo_cs"/*.profraw \
-      "${srcdir}/standard.profdata"
-  else
-    echo "==> No CS profiles, using standard PGO"
-    cp "${srcdir}/standard.profdata" "${srcdir}/merged.profdata"
+  if (( ! ${#bolt_targets[@]} )); then
+    echo "No BOLT targets found; skipping." >&2
+    return 0
   fi
 
-  echo "==> Merged PGO profile statistics:"
-  llvm-profdata show --detailed-summary "${srcdir}/merged.profdata" 2>&1 | head -10
+  local target so_name bolt_any=0
 
-  # === Stage 3: Final PGO-Optimized Build ===
-  echo "==> Stage 3: Building final PGO-optimized version..."
+  for target in "${bolt_targets[@]}"; do
+    so_name="$(basename "$target")"
+    echo "  -> Instrumenting ${so_name}..."
+    cp -f "$target" "${bolt_dir}/${so_name}.orig"
 
-  local cflags_pgo_use=$(format_meson_flags $CFLAGS "-fprofile-use=${srcdir}/merged.profdata" "-fprofile-sample-accurate")
-  local cxxflags_pgo_use=$(format_meson_flags $CXXFLAGS "-fprofile-use=${srcdir}/merged.profdata" "-fprofile-sample-accurate")
-  local ldflags_pgo_use=$(format_meson_flags $LDFLAGS "-fprofile-use=${srcdir}/merged.profdata" "-fuse-ld=lld")
+    if llvm-bolt "${bolt_dir}/${so_name}.orig" \
+        --instrument \
+        --lite=true \
+        --instrumentation-file-append-pid \
+        --instrumentation-file="${bolt_dir}/${so_name}.fdata" \
+        -o "${bolt_dir}/${so_name}.instr"; then
+      cp -f "${bolt_dir}/${so_name}.instr" "$target"
+      bolt_any=1
+    else
+      echo "  -> BOLT instrumentation failed for ${so_name}; restoring original."
+      cp -f "${bolt_dir}/${so_name}.orig" "$target"
+    fi
+  done
 
-  cat > meson-native-flags.ini <<EOF
-[built-in options]
-c_args = $cflags_pgo_use
-cpp_args = $cxxflags_pgo_use
-c_link_args = $ldflags_pgo_use
-cpp_link_args = $ldflags_pgo_use
-b_pie = 'false'
-b_ndebug = 'true'
+  if (( ! bolt_any )); then
+    echo "  -> No libraries were successfully instrumented; skipping BOLT."
+    return 0
+  fi
 
-[binaries]
-c = 'clang'
-cpp = 'clang++'
-ar = 'llvm-ar'
-nm = 'llvm-nm'
-ranlib = 'llvm-ranlib'
-EOF
+  _stage_install "$build_final" "$inst_bolt"
 
-  arch-meson $_pkgname build "${meson_options[@]}"
-  meson compile -C build
+  local bolt_incdir bolt_libdir
+  bolt_incdir="${inst_bolt}/usr/include"
+  _get_stage_libdir "$inst_bolt" bolt_libdir || {
+    echo "Error: could not determine BOLT staged lib dir." >&2
+    return 1
+  }
 
-  echo "==> Build complete: CS-PGO optimized libglvnd"
+  local helper_bolt="${srcdir}/glvnd-workload-bolt"
+  _build_workload_helper bolt "$bolt_incdir" "$bolt_libdir" "$helper_bolt"
+
+  _run_glvnd_workload "Stage 4 BOLT pass1" "$bolt_libdir" "" "$helper_bolt" bolt || return 1
+  _run_glvnd_workload "Stage 4 BOLT pass2" "$bolt_libdir" "" "$helper_bolt" bolt || return 1
+  _run_glvnd_workload "Stage 4 BOLT pass3" "$bolt_libdir" "" "$helper_bolt" bolt || return 1
+
+  for target in "${bolt_targets[@]}"; do
+    so_name="$(basename "$target")"
+    _show_bolt_fdata "$bolt_dir" "$so_name"
+
+    local -a fdata_files=()
+    shopt -s nullglob
+    fdata_files=("${bolt_dir}/${so_name}".fdata*)
+    shopt -u nullglob
+
+    if (( ! ${#fdata_files[@]} )); then
+      echo "  -> No BOLT fdata for ${so_name}; restoring original."
+      cp -f "${bolt_dir}/${so_name}.orig" "$target"
+      continue
+    fi
+
+    local merged_fdata="${bolt_dir}/${so_name}.merged.fdata"
+    if command -v merge-fdata >/dev/null 2>&1; then
+      merge-fdata "${fdata_files[@]}" > "$merged_fdata" 2>/dev/null || \
+        cat "${fdata_files[@]}" > "$merged_fdata"
+    else
+      cat "${fdata_files[@]}" > "$merged_fdata"
+    fi
+
+    if [[ ! -s "$merged_fdata" ]]; then
+      echo "  -> Empty BOLT fdata for ${so_name}; restoring original."
+      cp -f "${bolt_dir}/${so_name}.orig" "$target"
+      continue
+    fi
+
+    echo "  -> Applying BOLT to ${so_name}..."
+    if llvm-bolt "${bolt_dir}/${so_name}.orig" \
+        --data="$merged_fdata" \
+        --lite=true \
+        --relocs \
+        --reorder-blocks=ext-tsp \
+        --reorder-functions=cdsort \
+        --split-functions --split-all-cold --split-eh \
+        --x86-strip-redundant-address-size \
+        --split-strategy=cdsplit \
+        --icf=all \
+        --indirect-call-promotion=all \
+        --jump-tables=aggressive \
+        --peepholes=all \
+        --plt=hot \
+        --dyno-stats \
+        -o "${bolt_dir}/${so_name}.bolt"; then
+      if [[ -s "${bolt_dir}/${so_name}.bolt" ]]; then
+        cp -f "${bolt_dir}/${so_name}.bolt" "$target"
+        echo "  -> BOLT optimization successful for ${so_name}."
+      else
+        cp -f "${bolt_dir}/${so_name}.orig" "$target"
+      fi
+    else
+      echo "  -> BOLT optimization failed for ${so_name}; restoring original."
+      cp -f "${bolt_dir}/${so_name}.orig" "$target"
+    fi
+  done
 }
 
 package() {
-  depends=('libxext' 'mesa' 'opengl-driver')
+  DESTDIR="$pkgdir" meson install -C "${srcdir}/build-final" --no-rebuild
 
-  DESTDIR="$pkgdir" meson install -C build --no-rebuild
+  # Robust upstream license install.
+  # Try LICENSE first, then fallback to COPYING, then fallback to a readme.
+  local lic_src
+  for licfile in LICENSE COPYING NOTICE README.md; do
+    if [[ -f "${srcdir}/${_pkgname}/${licfile}" ]]; then
+      lic_src="${srcdir}/${_pkgname}/${licfile}"
+      break
+    fi
+  done
 
-  install -Dm644 LICENSE "$pkgdir"/usr/share/licenses/$pkgname/LICENSE
+  if [[ -z "$lic_src" ]]; then
+    echo "WARNING: No upstream license file found!" >&2
+    return 1
+  fi
+
+  install -Dm644 "$lic_src" "$pkgdir/usr/share/licenses/${pkgname}/LICENSE"
 }
