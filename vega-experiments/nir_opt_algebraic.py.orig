@@ -899,10 +899,6 @@ optimizations.extend([
 
    (('flt', ('fadd(is_used_once)', a, ('fneg', b)), 0.0), ('flt', a, b)),
 
-   (('bcsel(is_only_used_as_float_nsz)', ('flt(nnan)', b, a), b, a), ('fmin(preserve_nan_inf)', a, b)),
-   (('bcsel(is_only_used_as_float_nsz)', ('flt(nnan)', a, b), b, a), ('fmax(preserve_nan_inf)', a, b)),
-   (('bcsel(is_only_used_as_float_nsz)', ('fge(nnan)', a, b), b, a), ('fmin(preserve_nan_inf)', a, b)),
-   (('bcsel(is_only_used_as_float_nsz)', ('fge(nnan)', b, a), b, a), ('fmax(preserve_nan_inf)', a, b)),
    (('bcsel(is_only_used_as_float_nsz)', ('flt', b, 'a(is_a_number)'), b, a), ('fmin(preserve_nan_inf)', a, b)),
    (('bcsel(is_only_used_as_float_nsz)', ('flt', 'a(is_a_number)', b), b, a), ('fmax(preserve_nan_inf)', a, b)),
    (('bcsel(is_only_used_as_float_nsz)', ('fge', 'a(is_a_number)', b), b, a), ('fmin(preserve_nan_inf)', a, b)),
@@ -1054,10 +1050,9 @@ optimizations.extend([
    # fmin(0.0, b)) while the right one is "b", so this optimization is not NaN correct.
    (('fmin(nsz)', ('fsat(nnan)', a), '#b(is_zero_to_one)'), ('fsat', ('fmin', a, b))),
 
-   (('fsat(nnan)', 'a(is_ge_pos_one)'), 1.0),
    (('fsat', 'a(is_a_number_ge_pos_one)'), 1.0),
+   (('fsat', 'a(is_not_positive)'), 0.0),
 
-   (('fsat(nnan,nsz)', 'a(is_zero_to_one)'), ('fcanonicalize', a)),
    (('fsat(nsz)', 'a(is_a_number_zero_to_one)'), ('fcanonicalize', a)),
 
    # Let constant folding do its job. This can have emergent behaviour.
@@ -1071,8 +1066,9 @@ optimizations.extend([
    # This should be NaN safe since max(NaN, 0) = fsat(NaN) = 0.
    (('fmax', 'a(is_le_pos_one)', 0.0), ('fsat', a), '!options->lower_fsat'),
 
+   (('fmin(nsz)', 'a(is_a_number_not_negative)', 1.0), ('fsat', a), '!options->lower_fsat'),
+
    (('fsat', ('fmax', a, 'b(is_not_positive)')), ('fsat', a)),
-   (('fsat', ('fmin(nnan)', a, 'b(is_ge_pos_one)')), ('fsat', a)),
    (('fsat', ('fmin', 'a(is_a_number)', 'b(is_ge_pos_one)')), ('fsat', a)),
 
    (('fsat', ('bcsel(is_used_once)', a, b, '#c')), ('bcsel', a, ('fsat', b), ('fsat', c))),
@@ -1913,21 +1909,11 @@ optimizations.extend([
    (('ftrunc', 'a(is_integral)'), a),
    (('fround_even', 'a(is_integral)'), a),
 
-   # fract(x) = x - floor(x), so fract(NaN) = NaN
+   # fract(x) = x - floor(x), so fract(NaN/Inf) = NaN
    (('ffract(nnan)', 'a(is_integral)'), 0.0),
    (('ffract', ('ffract', a)), ('ffract', a)),
    (('fabs', 'a(is_not_negative)'), ('fcanonicalize', a)),
-   (('fsat', 'a(is_not_positive)'), 0.0),
-
-   (('fmin(nnan,nsz)', 'a(is_not_negative)', 1.0), ('fsat', a), '!options->lower_fsat'),
-   (('fmin(nsz)', 'a(is_a_number_not_negative)', 1.0), ('fsat', a), '!options->lower_fsat'),
-
-   # The result of the multiply must be in [-1, 0], so the result of the ffma
-   # must be in [0, 1].
-   (('flt', ('fadd', ('fmul', ('fsat', a), ('fneg', ('fsat', a))), 1.0), 0.0), False),
-   (('flt', ('fadd', ('fneg', ('fmul', ('fsat', a), ('fsat', a))), 1.0), 0.0), False),
-   (('fmax', ('fadd', ('fmul', ('fsat', a), ('fneg', ('fsat', a))), 1.0), 0.0), ('fadd', ('fmul', ('fsat', a), ('fneg', ('fsat', a))), 1.0)),
-   (('fmax', ('fadd', ('fneg', ('fmul', ('fsat', a), ('fsat', a))), 1.0), 0.0), ('fadd', ('fneg', ('fmul', ('fsat', a), ('fsat', a))), 1.0)),
+   (('fabs(nsz)', 'a(is_not_positive)'), ('fneg', a)),
 
    (('fneu', 'a(is_not_zero)', 0.0), True),
    (('feq', 'a(is_not_zero)', 0.0), False),
