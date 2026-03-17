@@ -734,10 +734,6 @@ optimizations.extend([
 
    (('flt', ('fadd(is_used_once)', a, ('fneg', b)), 0.0), ('flt', a, b)),
 
-   (('bcsel(is_only_used_as_float_nsz)', ('flt(nnan)', b, a), b, a), ('fmin(preserve_nan_inf)', a, b)),
-   (('bcsel(is_only_used_as_float_nsz)', ('flt(nnan)', a, b), b, a), ('fmax(preserve_nan_inf)', a, b)),
-   (('bcsel(is_only_used_as_float_nsz)', ('fge(nnan)', a, b), b, a), ('fmin(preserve_nan_inf)', a, b)),
-   (('bcsel(is_only_used_as_float_nsz)', ('fge(nnan)', b, a), b, a), ('fmax(preserve_nan_inf)', a, b)),
    (('bcsel(is_only_used_as_float_nsz)', ('flt', b, 'a(is_a_number)'), b, a), ('fmin(preserve_nan_inf)', a, b)),
    (('bcsel(is_only_used_as_float_nsz)', ('flt', 'a(is_a_number)', b), b, a), ('fmax(preserve_nan_inf)', a, b)),
    (('bcsel(is_only_used_as_float_nsz)', ('fge', 'a(is_a_number)', b), b, a), ('fmin(preserve_nan_inf)', a, b)),
@@ -897,10 +893,9 @@ optimizations.extend([
    (('fmax', ('fsat(is_used_once)', a), ('fsat(is_used_once)', b)), ('fsat', ('fmax', a, b))),
    (('fmin(nsz)', ('fsat(nnan)', a), '#b(is_zero_to_one)'), ('fsat', ('fmin', a, b))),
 
-   (('fsat(nnan)', 'a(is_ge_pos_one)'), 1.0),
    (('fsat', 'a(is_a_number_ge_pos_one)'), 1.0),
+   (('fsat', 'a(is_not_positive)'), 0.0),
 
-   (('fsat(nnan,nsz)', 'a(is_zero_to_one)'), ('fcanonicalize', a)),
    (('fsat(nsz)', 'a(is_a_number_zero_to_one)'), ('fcanonicalize', a)),
 
    (('fneg', ('bcsel(is_used_once)', a, '#b', '#c')), ('bcsel', a, ('fneg', b), ('fneg', c))),
@@ -910,8 +905,9 @@ optimizations.extend([
 
    (('fmax', 'a(is_le_pos_one)', 0.0), ('fsat', a), '!options->lower_fsat'),
 
+   (('fmin(nsz)', 'a(is_a_number_not_negative)', 1.0), ('fsat', a), '!options->lower_fsat'),
+
    (('fsat', ('fmax', a, 'b(is_not_positive)')), ('fsat', a)),
-   (('fsat', ('fmin(nnan)', a, 'b(is_ge_pos_one)')), ('fsat', a)),
    (('fsat', ('fmin', 'a(is_a_number)', 'b(is_ge_pos_one)')), ('fsat', a)),
    (('fsat', ('bcsel(is_used_once)', a, b, '#c')), ('bcsel', a, ('fsat', b), ('fsat', c))),
    (('fsat', ('bcsel(is_used_once)', a, '#b', c)), ('bcsel', a, ('fsat', b), ('fsat', c))),
@@ -1759,17 +1755,7 @@ optimizations.extend([
    (('ffract', ('ffract', a)), ('ffract', a)),
 
    (('fabs', 'a(is_not_negative)'), ('fcanonicalize', a)),
-   (('fsat', 'a(is_not_positive)'), 0.0),
-
-   (('fmin(nnan,nsz)', 'a(is_not_negative)', 1.0), ('fsat', a), '!options->lower_fsat'),
-   (('fmin(nsz)', 'a(is_a_number_not_negative)', 1.0), ('fsat', a), '!options->lower_fsat'),
-
-   (('flt', ('fadd', ('fmul', ('fsat', a), ('fneg', ('fsat', a))), 1.0), 0.0), False),
-   (('flt', ('fadd', ('fneg', ('fmul', ('fsat', a), ('fsat', a))), 1.0), 0.0), False),
-   (('fmax', ('fadd', ('fmul', ('fsat', a), ('fneg', ('fsat', a))), 1.0), 0.0),
-    ('fadd', ('fmul', ('fsat', a), ('fneg', ('fsat', a))), 1.0)),
-   (('fmax', ('fadd', ('fneg', ('fmul', ('fsat', a), ('fsat', a))), 1.0), 0.0),
-    ('fadd', ('fneg', ('fmul', ('fsat', a), ('fsat', a))), 1.0)),
+   (('fabs(nsz)', 'a(is_not_positive)'), ('fneg', a)),
 
    (('fneu', 'a(is_not_zero)', 0.0), True),
    (('feq',  'a(is_not_zero)', 0.0), False),
