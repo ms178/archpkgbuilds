@@ -1,85 +1,549 @@
 pkgname=libpciaccess
-pkgver=0.18.1
-pkgrel=3.5
+pkgver=0.19
+pkgrel=5.1
 pkgdesc="X11 PCI access library"
 arch=(x86_64)
-license=('LicenseRef-libpciaccess')
 url="https://gitlab.freedesktop.org/xorg/lib/libpciaccess"
-depends=('glibc' 'zlib')
-makedepends=('xorg-util-macros' 'meson' 'llvm' 'clang' 'lld' 'ninja' 'python' 'bolt')
-source=(https://xorg.freedesktop.org/releases/individual/lib/${pkgname}-${pkgver}.tar.xz{,.sig}
-        ms178.patch)
-sha512sums=('ef27999446e735df2331e94219ee3dafe9198a2472bb452f63ef9c9c446d5431f9e231e224cfabdeba1402974a5a0064546f9abced4d1770f994f5fc0c2b3310'
-            'SKIP'
-            'SKIP')
+license=('LicenseRef-libpciaccess')
+depends=(glibc zlib)
+makedepends=(xorg-util-macros meson llvm clang lld ninja python bolt)
+source=(
+  "https://xorg.freedesktop.org/releases/individual/lib/${pkgname}-${pkgver}.tar.xz"{,.sig}
+  ms178.patch
+)
+sha512sums=(
+  'ef27999446e735df2331e94219ee3dafe9198a2472bb452f63ef9c9c446d5431f9e231e224cfabdeba1402974a5a0064546f9abced4d1770f994f5fc0c2b3310'
+  'SKIP'
+  'SKIP'
+)
 validpgpkeys=('4A193C06D35E7C670FA4EF0BA2FB9E081F2D130E')
 
-_create_test_program() {
-    cat > "${1}" << 'EOF'
+_create_trainer_source() {
+  cat > "${1}" << 'EOF'
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pciaccess.h>
 #include <time.h>
-#include <unistd.h>
+#include <pciaccess.h>
 
 #ifndef PCI_NUM_REGIONS
 #define PCI_NUM_REGIONS 6
 #endif
 
-void dump_device_info(struct pci_device *dev) {
-    printf("PCI Device: %04x:%04x (rev %02x)\n",
-        dev->vendor_id, dev->device_id, dev->revision);
-    printf("  Class:    %06x\n", dev->device_class);
-    printf("  Regions:  %d\n", PCI_NUM_REGIONS);
+#define MAX_DEVS 512
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
-    for (int i = 0; i < PCI_NUM_REGIONS; i++) {
-        if (dev->regions[i].size > 0) {
-            printf("    Region %d: base=%llx size=%llx is_IO=%d is_prefetchable=%d\n",
-                i, (unsigned long long)dev->regions[i].base_addr,
-                (unsigned long long)dev->regions[i].size,
-                dev->regions[i].is_IO, dev->regions[i].is_prefetchable);
-        }
+struct train_dev {
+    unsigned domain;
+    unsigned bus;
+    unsigned slot;
+    unsigned func;
+    uint16_t vendor_id;
+    uint16_t device_id;
+    uint16_t subvendor_id;
+    uint16_t subdevice_id;
+    uint32_t class_code;
+    unsigned weight;
+};
+
+static uint32_t xs32(uint32_t *state) {
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x ? x : 0x9e3779b9u;
+    return *state;
+}
+
+static unsigned class_weight(uint32_t class_code) {
+    switch ((class_code >> 16) & 0xffu) {
+        case 0x03: return 32; /* display / GPU */
+        case 0x06: return 16; /* bridges / root ports */
+        case 0x01: return 12; /* storage */
+        case 0x04: return 10; /* audio */
+        case 0x0c: return 10; /* USB / serial bus */
+        case 0x02: return 8;  /* network */
+        default:   return 3;
     }
 }
 
-int test_config_access_patterns(struct pci_device *dev) {
-    int ret;
-    uint32_t value;
+static int cmp_train_dev(const void *lhs, const void *rhs) {
+    const struct train_dev *a = (const struct train_dev *)lhs;
+    const struct train_dev *b = (const struct train_dev *)rhs;
 
-    for (int offset = 0; offset < 256; offset += 4) {
-        ret = pci_device_cfg_read_u32(dev, &value, offset);
-        if (ret != 0) return ret;
-    }
-
-    for (int i = 0; i < 50; i++) {
-        int offset = (rand() % 64) * 4;
-        ret = pci_device_cfg_read_u32(dev, &value, offset);
-        if (ret != 0) return ret;
-    }
-
-    uint8_t byte_val;
-    for (int offset = 0; offset < 64; offset++) {
-        ret = pci_device_cfg_read_u8(dev, &byte_val, offset);
-        if (ret != 0) return ret;
-    }
-
-    uint16_t word_val;
-    for (int offset = 0; offset < 64; offset += 2) {
-        ret = pci_device_cfg_read_u16(dev, &word_val, offset);
-        if (ret != 0) return ret;
-    }
-
+    if (a->weight != b->weight)
+        return (a->weight < b->weight) ? 1 : -1;
+    if (a->class_code != b->class_code)
+        return (a->class_code < b->class_code) ? -1 : 1;
+    if (a->domain != b->domain)
+        return (a->domain < b->domain) ? -1 : 1;
+    if (a->bus != b->bus)
+        return (a->bus < b->bus) ? -1 : 1;
+    if (a->slot != b->slot)
+        return (a->slot < b->slot) ? -1 : 1;
+    if (a->func != b->func)
+        return (a->func < b->func) ? -1 : 1;
     return 0;
 }
 
-int main(int argc, char **argv) {
-    int ret, i;
-    uint32_t value;
+static void do_hot_cfg_reads(struct pci_device *dev, unsigned rounds) {
+    static const uint16_t dwords[] = {
+        0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c,
+        0x20, 0x24, 0x2c, 0x30, 0x34, 0x3c
+    };
+    static const uint16_t words[] = {
+        0x00, 0x02, 0x04, 0x06, 0x0a, 0x2c, 0x2e, 0x3c, 0x3e
+    };
+    static const uint16_t bytes[] = {
+        0x08, 0x09, 0x0a, 0x0b, 0x0e, 0x0f, 0x34, 0x3c, 0x3d
+    };
+
+    uint32_t v32;
+    uint16_t v16;
+    uint8_t v8;
+    unsigned r;
+    size_t i;
+
+    for (r = 0; r < rounds; ++r) {
+        for (i = 0; i < ARRAY_SIZE(dwords); ++i)
+            (void)pci_device_cfg_read_u32(dev, &v32, dwords[i]);
+        for (i = 0; i < ARRAY_SIZE(words); ++i)
+            (void)pci_device_cfg_read_u16(dev, &v16, words[i]);
+        for (i = 0; i < ARRAY_SIZE(bytes); ++i)
+            (void)pci_device_cfg_read_u8(dev, &v8, bytes[i]);
+    }
+}
+
+static void do_linear_cfg_reads(struct pci_device *dev, unsigned rounds) {
+    uint32_t v32;
+    uint16_t v16;
+    uint8_t v8;
+    unsigned r;
+    int off;
+
+    for (r = 0; r < rounds; ++r) {
+        for (off = 0; off < 0x100; off += 4)
+            (void)pci_device_cfg_read_u32(dev, &v32, off);
+        for (off = 0; off < 0x80; off += 2)
+            (void)pci_device_cfg_read_u16(dev, &v16, off);
+        for (off = 0; off < 0x40; ++off)
+            (void)pci_device_cfg_read_u8(dev, &v8, off);
+    }
+}
+
+static void do_random_cfg_reads(struct pci_device *dev, uint32_t seed, unsigned count) {
+    uint32_t v32;
+    unsigned i;
+
+    for (i = 0; i < count; ++i) {
+        uint32_t off = (xs32(&seed) & 0x3fu) << 2;
+        (void)pci_device_cfg_read_u32(dev, &v32, off);
+    }
+}
+
+static void do_map_attempts(struct pci_device *dev) {
+    unsigned i;
+
+    for (i = 0; i < PCI_NUM_REGIONS; ++i) {
+        void *map = NULL;
+        pciaddr_t len;
+
+        if (dev->regions[i].is_IO)
+            continue;
+        if (dev->regions[i].base_addr == 0 || dev->regions[i].size == 0)
+            continue;
+
+        len = dev->regions[i].size > 4096 ? 4096 : dev->regions[i].size;
+        if (pci_device_map_range(dev, dev->regions[i].base_addr, len, 0, &map) == 0 && map != NULL)
+            (void)pci_device_unmap_range(dev, map, len);
+    }
+}
+
+static void do_rom_attempt(struct pci_device *dev) {
+    void *rom;
+
+    if (((dev->device_class >> 16) & 0xffu) != 0x03u)
+        return;
+    if (dev->rom_size == 0 || dev->rom_size > (1u << 20))
+        return;
+
+    rom = malloc((size_t)dev->rom_size);
+    if (!rom)
+        return;
+
+    (void)pci_device_read_rom(dev, rom);
+    free(rom);
+}
+
+static void exercise_device(struct pci_device *dev, unsigned weight, int with_maps) {
+    uint32_t seed;
+    unsigned hot_rounds;
+    unsigned linear_rounds;
+    unsigned major_class;
+
+    if (!dev)
+        return;
+    if (pci_device_probe(dev) != 0)
+        return;
+
+    major_class = (dev->device_class >> 16) & 0xffu;
+    seed = 0x9e3779b9u
+        ^ ((uint32_t)dev->vendor_id << 16)
+        ^ (uint32_t)dev->device_id
+        ^ (uint32_t)dev->device_class
+        ^ ((uint32_t)dev->bus << 8)
+        ^ ((uint32_t)dev->dev << 3)
+        ^ (uint32_t)dev->func;
+
+    hot_rounds = 3u + (weight / 4u);
+    linear_rounds = 1u + (weight >= 10u ? 1u : 0u);
+
+    if (major_class == 0x03u)
+        hot_rounds += 3u;
+    else if (major_class == 0x06u)
+        hot_rounds += 2u;
+
+    do_hot_cfg_reads(dev, hot_rounds);
+    do_linear_cfg_reads(dev, linear_rounds);
+    do_random_cfg_reads(dev, seed, 64u + (weight * 8u));
+
+    if (with_maps) {
+        do_map_attempts(dev);
+        do_rom_attempt(dev);
+    }
+
+    do_hot_cfg_reads(dev, 1);
+}
+
+static size_t collect_devices(struct train_dev *out, size_t cap) {
+    struct pci_device_iterator *iter;
+    struct pci_device *dev;
+    size_t n = 0;
+
+    iter = pci_slot_match_iterator_create(NULL);
+    if (!iter)
+        return 0;
+
+    while ((dev = pci_device_next(iter)) != NULL && n < cap) {
+        out[n].domain = dev->domain;
+        out[n].bus = dev->bus;
+        out[n].slot = dev->dev;
+        out[n].func = dev->func;
+        out[n].vendor_id = dev->vendor_id;
+        out[n].device_id = dev->device_id;
+        out[n].subvendor_id = dev->subvendor_id;
+        out[n].subdevice_id = dev->subdevice_id;
+        out[n].class_code = dev->device_class;
+        out[n].weight = class_weight(dev->device_class);
+        ++n;
+    }
+
+    pci_iterator_destroy(iter);
+    qsort(out, n, sizeof(out[0]), cmp_train_dev);
+    return n;
+}
+
+static void exercise_bdf(const struct train_dev *t, unsigned weight, int with_maps) {
+    struct pci_slot_match match;
     struct pci_device_iterator *iter;
     struct pci_device *dev;
 
-    srand(time(NULL));
+    memset(&match, 0, sizeof(match));
+    match.domain = t->domain;
+    match.bus = t->bus;
+    match.dev = t->slot;
+    match.func = t->func;
+
+    iter = pci_slot_match_iterator_create(&match);
+    if (!iter)
+        return;
+
+    while ((dev = pci_device_next(iter)) != NULL)
+        exercise_device(dev, weight, with_maps);
+
+    pci_iterator_destroy(iter);
+}
+
+static void do_exact_match_sweep(const struct train_dev *t) {
+    unsigned rounds = 1u + (t->weight >= 12u ? 1u : 0u);
+    unsigned r;
+
+    for (r = 0; r < rounds; ++r)
+        exercise_bdf(t, (t->weight / 2u) + 2u, 0);
+}
+
+static void do_id_match_sweep(const struct train_dev *t) {
+    struct pci_id_match match;
+    struct pci_device_iterator *iter;
+    struct pci_device *dev;
+    unsigned seen = 0;
+
+    memset(&match, 0, sizeof(match));
+    match.vendor_id = t->vendor_id;
+    match.device_id = t->device_id;
+    match.subvendor_id = PCI_MATCH_ANY;
+    match.subdevice_id = PCI_MATCH_ANY;
+    match.device_class = t->class_code & 0xff0000u;
+    match.device_class_mask = 0xff0000u;
+    match.match_data = 0;
+
+    iter = pci_id_match_iterator_create(&match);
+    if (!iter)
+        return;
+
+    while ((dev = pci_device_next(iter)) != NULL && seen < 6u) {
+        exercise_device(dev, (t->weight / 2u) + 2u, 0);
+        ++seen;
+    }
+
+    pci_iterator_destroy(iter);
+}
+
+static void do_vendor_class_sweep(const struct train_dev *t, unsigned limit) {
+    struct pci_id_match match;
+    struct pci_device_iterator *iter;
+    struct pci_device *dev;
+    unsigned seen = 0;
+
+    memset(&match, 0, sizeof(match));
+    match.vendor_id = t->vendor_id;
+    match.device_id = PCI_MATCH_ANY;
+    match.subvendor_id = PCI_MATCH_ANY;
+    match.subdevice_id = PCI_MATCH_ANY;
+    match.device_class = t->class_code & 0xff0000u;
+    match.device_class_mask = 0xff0000u;
+    match.match_data = 0;
+
+    iter = pci_id_match_iterator_create(&match);
+    if (!iter)
+        return;
+
+    while ((dev = pci_device_next(iter)) != NULL && seen < limit) {
+        exercise_device(dev, (t->weight / 2u) + 3u, 0);
+        ++seen;
+    }
+
+    pci_iterator_destroy(iter);
+}
+
+static void do_class_sweep(unsigned class_base, unsigned rounds) {
+    struct pci_id_match match;
+    struct pci_device_iterator *iter;
+    struct pci_device *dev;
+    unsigned r;
+
+    memset(&match, 0, sizeof(match));
+    match.vendor_id = PCI_MATCH_ANY;
+    match.device_id = PCI_MATCH_ANY;
+    match.subvendor_id = PCI_MATCH_ANY;
+    match.subdevice_id = PCI_MATCH_ANY;
+    match.device_class = (class_base & 0xffu) << 16;
+    match.device_class_mask = 0xff0000u;
+    match.match_data = 0;
+
+    for (r = 0; r < rounds; ++r) {
+        iter = pci_id_match_iterator_create(&match);
+        if (!iter)
+            return;
+
+        while ((dev = pci_device_next(iter)) != NULL)
+            exercise_device(dev, class_weight(dev->device_class), r == 0u);
+
+        pci_iterator_destroy(iter);
+    }
+}
+
+static void do_enumeration_stress(unsigned rounds) {
+    unsigned r;
+
+    for (r = 0; r < rounds; ++r) {
+        struct pci_device_iterator *iter = pci_slot_match_iterator_create(NULL);
+        struct pci_device *dev;
+
+        if (!iter)
+            return;
+
+        while ((dev = pci_device_next(iter)) != NULL) {
+            if (pci_device_probe(dev) == 0)
+                do_hot_cfg_reads(dev, 1);
+        }
+
+        pci_iterator_destroy(iter);
+    }
+}
+
+static void do_negative_match_sweeps(void) {
+    struct pci_slot_match smatch;
+    struct pci_id_match imatch;
+    struct pci_device_iterator *iter;
+
+    memset(&smatch, 0, sizeof(smatch));
+    smatch.domain = 0xfffffffeu;
+    smatch.bus = 0xffu;
+    smatch.dev = 0x1fu;
+    smatch.func = 0x7u;
+
+    iter = pci_slot_match_iterator_create(&smatch);
+    if (iter) {
+        while (pci_device_next(iter) != NULL) {
+        }
+        pci_iterator_destroy(iter);
+    }
+
+    memset(&imatch, 0, sizeof(imatch));
+    imatch.vendor_id = 0xffff;
+    imatch.device_id = 0xffff;
+    imatch.subvendor_id = PCI_MATCH_ANY;
+    imatch.subdevice_id = PCI_MATCH_ANY;
+    imatch.device_class = 0xff0000u;
+    imatch.device_class_mask = 0xff0000u;
+    imatch.match_data = 0;
+
+    iter = pci_id_match_iterator_create(&imatch);
+    if (iter) {
+        while (pci_device_next(iter) != NULL) {
+        }
+        pci_iterator_destroy(iter);
+    }
+}
+
+static int parse_bdf(const char *s, unsigned *domain, unsigned *bus, unsigned *slot, unsigned *func) {
+    if (sscanf(s, "%x:%x:%x.%x", domain, bus, slot, func) == 4)
+        return 0;
+
+    *domain = 0;
+    if (sscanf(s, "%x:%x.%x", bus, slot, func) == 3)
+        return 0;
+
+    return -1;
+}
+
+static void do_slot_sweep(const char *slot_str, unsigned rounds) {
+    struct train_dev t;
+    unsigned r;
+
+    memset(&t, 0, sizeof(t));
+    if (parse_bdf(slot_str, &t.domain, &t.bus, &t.slot, &t.func) != 0)
+        return;
+
+    t.weight = 8u;
+    for (r = 0; r < rounds; ++r)
+        exercise_bdf(&t, t.weight + 8u, r == 0u);
+}
+
+static void print_inventory(void) {
+    struct train_dev devs[MAX_DEVS];
+    size_t n;
+    size_t i;
+
+    n = collect_devices(devs, ARRAY_SIZE(devs));
+    for (i = 0; i < n; ++i) {
+        printf("%08x:%02x:%02x.%u %06x %04x %04x %u\n",
+               devs[i].domain,
+               devs[i].bus,
+               devs[i].slot,
+               devs[i].func,
+               devs[i].class_code,
+               devs[i].vendor_id,
+               devs[i].device_id,
+               devs[i].weight);
+    }
+}
+
+static void train_desktop(void) {
+    static const struct {
+        unsigned class_base;
+        unsigned rounds;
+    } hot_classes[] = {
+        { 0x03u, 4u },
+        { 0x06u, 3u },
+        { 0x01u, 3u },
+        { 0x04u, 2u },
+        { 0x0cu, 2u },
+        { 0x02u, 2u }
+    };
+
+    struct train_dev devs[MAX_DEVS];
+    size_t n;
+    size_t i;
+    unsigned r;
+
+    n = collect_devices(devs, ARRAY_SIZE(devs));
+
+    do_negative_match_sweeps();
+    do_enumeration_stress(8);
+
+    for (i = 0; i < n; ++i) {
+        do_exact_match_sweep(&devs[i]);
+        do_id_match_sweep(&devs[i]);
+    }
+
+    for (i = 0; i < n && i < 8u; ++i)
+        do_vendor_class_sweep(&devs[i], 8u);
+
+    for (i = 0; i < ARRAY_SIZE(hot_classes); ++i)
+        do_class_sweep(hot_classes[i].class_base, hot_classes[i].rounds);
+
+    for (i = 0; i < n; ++i)
+        exercise_bdf(&devs[i], devs[i].weight, 1);
+
+    for (i = 0; i < n && i < 8u; ++i) {
+        for (r = 0; r < 3u; ++r)
+            exercise_bdf(&devs[i], devs[i].weight + 10u, r == 0u);
+    }
+
+    do_negative_match_sweeps();
+    do_enumeration_stress(4);
+}
+
+static void do_stress(void) {
+    struct train_dev devs[MAX_DEVS];
+    size_t n;
+    size_t i;
+    unsigned r;
+
+    n = collect_devices(devs, ARRAY_SIZE(devs));
+
+    do_negative_match_sweeps();
+    do_enumeration_stress(16);
+
+    for (r = 0; r < 8u; ++r) {
+        for (i = 0; i < n && i < 12u; ++i)
+            exercise_bdf(&devs[i], devs[i].weight + 14u, (r == 0u) || ((r & 3u) == 0u));
+    }
+
+    for (i = 0; i < n && i < 6u; ++i)
+        do_vendor_class_sweep(&devs[i], 8u);
+
+    do_negative_match_sweeps();
+}
+
+static void do_benchmark(void) {
+    struct train_dev devs[MAX_DEVS];
+    size_t n;
+    size_t i;
+    unsigned r;
+    clock_t start;
+    clock_t end;
+
+    n = collect_devices(devs, ARRAY_SIZE(devs));
+
+    start = clock();
+    for (r = 0; r < 64u; ++r) {
+        for (i = 0; i < n && i < 4u; ++i)
+            exercise_bdf(&devs[i], devs[i].weight + 10u, 0);
+        do_enumeration_stress(1);
+    }
+    end = clock();
+
+    printf("trainer benchmark: %zu devices in %.6f seconds\n",
+           n,
+           (double)(end - start) / (double)CLOCKS_PER_SEC);
+}
+
+int main(int argc, char **argv) {
+    int ret;
 
     ret = pci_system_init();
     if (ret != 0) {
@@ -87,442 +551,496 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <command>\n", argv[0]);
-        pci_system_cleanup();
-        return 1;
-    }
-
-    const char *cmd = argv[1];
-
-    iter = pci_slot_match_iterator_create(NULL);
-    if (iter == NULL) {
-        fprintf(stderr, "Failed to create iterator\n");
-        pci_system_cleanup();
-        return 1;
-    }
-
-    if (strcmp(cmd, "--list") == 0) {
-        while ((dev = pci_device_next(iter)) != NULL) {
-            printf("%04x:%04x [%04x:%04x] class %06x\n",
-                dev->vendor_id, dev->device_id,
-                dev->subvendor_id, dev->subdevice_id,
-                dev->device_class);
-        }
-    } else if (strcmp(cmd, "--scan") == 0) {
-        while ((dev = pci_device_next(iter)) != NULL) {
-            ret = pci_device_probe(dev);
-            if (ret == 0) {
-                dump_device_info(dev);
-            }
-        }
-    } else if (strcmp(cmd, "--read") == 0 && argc > 3) {
-        unsigned int bus = 0, dev_id = 0, func = 0;
-        int offset = 0;
-
-        sscanf(argv[2], "%x:%x.%x", &bus, &dev_id, &func);
-        offset = strtol(argv[3], NULL, 0);
-
-        struct pci_id_match match = {
-            .vendor_id = PCI_MATCH_ANY,
-            .device_id = PCI_MATCH_ANY,
-            .subvendor_id = PCI_MATCH_ANY,
-            .subdevice_id = PCI_MATCH_ANY,
-            .device_class = 0,
-            .device_class_mask = 0,
-            .match_data = 0
-        };
-
-        pci_iterator_destroy(iter);
-        iter = pci_id_match_iterator_create(&match);
-        while ((dev = pci_device_next(iter)) != NULL) {
-            if (dev->bus == bus && dev->dev == dev_id && dev->func == func) {
-                ret = pci_device_probe(dev);
-                if (ret != 0) continue;
-
-                ret = pci_device_cfg_read_u32(dev, &value, offset);
-                if (ret == 0) {
-                    printf("Value at offset 0x%x: 0x%08x\n", offset, value);
-                } else {
-                    printf("Failed to read: %d\n", ret);
-                }
-                break;
-            }
-        }
-    } else if (strcmp(cmd, "--loop") == 0) {
-        for (i = 0; i < 100; i++) {
-            pci_iterator_destroy(iter);
-            iter = pci_slot_match_iterator_create(NULL);
-
-            while ((dev = pci_device_next(iter)) != NULL) {
-                pci_device_probe(dev);
-                for (int offset = 0; offset < 64; offset += 4) {
-                    pci_device_cfg_read_u32(dev, &value, offset);
-                }
-            }
-        }
-    } else if (strcmp(cmd, "--vga") == 0) {
-        while ((dev = pci_device_next(iter)) != NULL) {
-            if ((dev->device_class >> 16) == 0x03) {
-                pci_device_probe(dev);
-                dump_device_info(dev);
-                test_config_access_patterns(dev);
-            }
-        }
-    } else if (strcmp(cmd, "--network") == 0) {
-        while ((dev = pci_device_next(iter)) != NULL) {
-            if ((dev->device_class >> 16) == 0x02) {
-                pci_device_probe(dev);
-                dump_device_info(dev);
-                test_config_access_patterns(dev);
-            }
-        }
-    } else if (strcmp(cmd, "--stress") == 0) {
-        for (int run = 0; run < 5; run++) {
-            pci_iterator_destroy(iter);
-            iter = pci_slot_match_iterator_create(NULL);
-
-            while ((dev = pci_device_next(iter)) != NULL) {
-                pci_device_probe(dev);
-                test_config_access_patterns(dev);
-            }
-        }
-    } else if (strcmp(cmd, "--benchmark") == 0) {
-        clock_t start = clock();
-        int iterations = 1000;
-
-        for (i = 0; i < iterations; i++) {
-            pci_iterator_destroy(iter);
-            iter = pci_slot_match_iterator_create(NULL);
-            dev = pci_device_next(iter);
-
-            if (dev) {
-                pci_device_probe(dev);
-                for (int offset = 0; offset < 64; offset += 4) {
-                    pci_device_cfg_read_u32(dev, &value, offset);
-                }
-            }
-        }
-
-        clock_t end = clock();
-        double cpu_time = ((double) (end - start)) / CLOCKS_PER_SEC;
-        printf("PCI benchmark: %d iterations in %.6f seconds (%.0f iterations/sec)\n",
-               iterations, cpu_time, iterations / cpu_time);
+    if (argc < 2 || strcmp(argv[1], "--train-desktop") == 0) {
+        train_desktop();
+    } else if (strcmp(argv[1], "--inventory") == 0 || strcmp(argv[1], "--list") == 0) {
+        print_inventory();
+    } else if (strcmp(argv[1], "--class") == 0 && argc >= 3) {
+        unsigned klass = (unsigned)strtoul(argv[2], NULL, 0) & 0xffu;
+        unsigned rounds = (argc >= 4) ? (unsigned)strtoul(argv[3], NULL, 0) : 2u;
+        do_class_sweep(klass, rounds);
+    } else if (strcmp(argv[1], "--slot") == 0 && argc >= 3) {
+        unsigned rounds = (argc >= 4) ? (unsigned)strtoul(argv[3], NULL, 0) : 4u;
+        do_slot_sweep(argv[2], rounds);
+    } else if (strcmp(argv[1], "--stress") == 0) {
+        do_stress();
+    } else if (strcmp(argv[1], "--benchmark") == 0) {
+        do_benchmark();
     } else {
-        while ((dev = pci_device_next(iter)) != NULL) {
-            printf("%04x:%04x [%02x:%02x.%d]\n",
-                dev->vendor_id, dev->device_id,
-                dev->bus, dev->dev, dev->func);
-        }
+        train_desktop();
     }
 
-    pci_iterator_destroy(iter);
     pci_system_cleanup();
     return 0;
 }
 EOF
 }
 
-run_pgo_training() {
-    local lib_dir="$1"
-    local pgo_dir="$2"
-    local scanpci_dir="$3"
+_apply_patch_auto() {
+  local patchfile="$1"
+  local root p
+  local roots=(
+    "${srcdir}/${pkgname}-${pkgver}"
+    "${srcdir}"
+  )
 
-    if [[ -z "${scanpci_dir}" ]]; then
-        scanpci_dir="${lib_dir}/../scanpci"
-    fi
+  [[ -f "${patchfile}" ]] || {
+    error "Patch file not found: ${patchfile}"
+    return 1
+  }
 
-    echo "Running PCI training workload..."
+  for root in "${roots[@]}"; do
+    [[ -d "${root}" ]] || continue
 
-    if [[ -x "${scanpci_dir}/scanpci" ]]; then
-        echo "  -> Running native scanpci"
-        LD_LIBRARY_PATH="${lib_dir}" "${scanpci_dir}/scanpci" || true
-    fi
+    for p in 0 1 2 3 4 5 6 7 8; do
+      if patch \
+        --batch \
+        --forward \
+        --silent \
+        --dry-run \
+        -d "${root}" \
+        -p"${p}" \
+        -i "${patchfile}" >/dev/null 2>&1; then
+        msg2 "Applying patch: $(basename "${patchfile}") (root=$(basename "${root}"), -p${p})"
+        patch \
+          --batch \
+          --forward \
+          -d "${root}" \
+          -p"${p}" \
+          -i "${patchfile}"
+        return 0
+      fi
+    done
+  done
 
-    if [[ -x "${pgo_dir}/pci_test" ]]; then
-        local commands=("--list" "--scan" "--vga" "--network" "--loop" "--stress" "--benchmark")
-        for cmd in "${commands[@]}"; do
-            echo "  -> Running test ${cmd}"
-            LD_LIBRARY_PATH="${lib_dir}" "${pgo_dir}/pci_test" "${cmd}" >/dev/null 2>&1 || true
-        done
+  error "Failed to determine patch strip level for ${patchfile}"
+  return 1
+}
 
-        for i in {1..10}; do
-            LD_LIBRARY_PATH="${lib_dir}" "${pgo_dir}/pci_test" --list >/dev/null 2>&1 || true
-            LD_LIBRARY_PATH="${lib_dir}" "${pgo_dir}/pci_test" --scan >/dev/null 2>&1 || true
-            LD_LIBRARY_PATH="${lib_dir}" "${pgo_dir}/pci_test" --stress >/dev/null 2>&1 || true
-        done
-    fi
+_meson_setup() {
+  local builddir="$1"
 
-    echo "Training workload complete"
+  rm -rf "${builddir}"
+  meson setup "${builddir}" "${srcdir}/${pkgname}-${pkgver}" \
+    --prefix=/usr \
+    --buildtype=plain \
+    --wrap-mode=nofallback
+}
+
+_compile_trainer() {
+  local out="$1"
+  local builddir="$2"
+
+  "${CC:-clang}" ${_orig_cppflags} ${_orig_cflags} ${_orig_ldflags} \
+    -I"${srcdir}/${pkgname}-${pkgver}/include" \
+    -L"${builddir}/src" \
+    -Wl,-rpath,"${builddir}/src" \
+    -o "${out}" "${_pgo_dir}/pci_train.c" \
+    -lpciaccess
+}
+
+_merge_profraw_dir() {
+  local out="$1"
+  local dir="$2"
+  local profraws=()
+
+  shopt -s nullglob
+  profraws=("${dir}"/*.profraw)
+  shopt -u nullglob
+
+  (( ${#profraws[@]} > 0 )) || return 1
+  llvm-profdata merge -output="${out}" "${profraws[@]}"
+}
+
+_run_profiled() {
+  local profile_dir="$1"
+  shift
+
+  if [[ -n "${profile_dir}" ]]; then
+    LLVM_PROFILE_FILE="${profile_dir}/%p-%m.profraw" "$@" || true
+  else
+    "$@" || true
+  fi
+}
+
+_run_scanpci_matrix() {
+  local lib_dir="$1"
+  local scanpci_dir="$2"
+  local profile_dir="$3"
+  local scanpci="${scanpci_dir}/scanpci"
+
+  [[ -x "${scanpci}" ]] || return 0
+
+  _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${scanpci}" >/dev/null 2>&1
+  _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${scanpci}" -v >/dev/null 2>&1
+  _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${scanpci}" -1 >/dev/null 2>&1
+  _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${scanpci}" -2 >/dev/null 2>&1
+  _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${scanpci}" -f >/dev/null 2>&1
+  _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${scanpci}" -v -1 >/dev/null 2>&1
+  _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${scanpci}" -v -2 >/dev/null 2>&1
+  _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${scanpci}" -v -f >/dev/null 2>&1
+}
+
+_resolve_built_library() {
+  local lib_dir="$1"
+  local resolved
+
+  resolved="$(readlink -f "${lib_dir}/libpciaccess.so" 2>/dev/null || true)"
+  if [[ -n "${resolved}" && -f "${resolved}" ]]; then
+    printf '%s\n' "${resolved}"
+    return 0
+  fi
+
+  resolved="$(find "${lib_dir}" -maxdepth 1 -type f -name 'libpciaccess.so*' | LC_ALL=C sort | tail -n 1)"
+  if [[ -n "${resolved}" && -f "${resolved}" ]]; then
+    printf '%s\n' "${resolved}"
+    return 0
+  fi
+
+  return 1
+}
+
+run_profile_training() {
+  local lib_dir="$1"
+  local trainer="$2"
+  local scanpci_dir="$3"
+  local mode="$4"
+  local profile_dir="$5"
+  local manifest="${_pgo_dir}/inventory.${mode}.txt"
+  local macro_passes=1
+  local gpu_rounds=4
+  local bridge_rounds=3
+  local storage_rounds=3
+  local audio_rounds=2
+  local usb_rounds=2
+  local net_rounds=2
+  local idx=0
+  local pass
+  local slot class _vendor _device _weight reps
+
+  [[ -x "${trainer}" ]] || return 0
+
+  if [[ -n "${profile_dir}" ]]; then
+    mkdir -p "${profile_dir}"
+    rm -f "${profile_dir}"/*.profraw
+  fi
+
+  rm -f "${manifest}"
+
+  if [[ "${mode}" == "bolt" ]]; then
+    macro_passes=2
+    gpu_rounds=6
+    bridge_rounds=5
+    storage_rounds=4
+    audio_rounds=3
+    usb_rounds=3
+    net_rounds=3
+  fi
+
+  msg2 "Collecting PCI inventory (${mode})..."
+  _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${trainer}" --inventory > "${manifest}" 2>/dev/null
+
+  msg2 "Running scanpci matrix (${mode})..."
+  _run_scanpci_matrix "${lib_dir}" "${scanpci_dir}" "${profile_dir}"
+
+  msg2 "Running macro trainer workload (${mode})..."
+  for ((pass = 0; pass < macro_passes; ++pass)); do
+    _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${trainer}" --train-desktop >/dev/null 2>&1
+    _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${trainer}" --stress >/dev/null 2>&1
+    _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${trainer}" --benchmark >/dev/null 2>&1
+  done
+
+  _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${trainer}" --class 0x03 "${gpu_rounds}" >/dev/null 2>&1
+  _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${trainer}" --class 0x06 "${bridge_rounds}" >/dev/null 2>&1
+  _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${trainer}" --class 0x01 "${storage_rounds}" >/dev/null 2>&1
+  _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${trainer}" --class 0x04 "${audio_rounds}" >/dev/null 2>&1
+  _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${trainer}" --class 0x0c "${usb_rounds}" >/dev/null 2>&1
+  _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${trainer}" --class 0x02 "${net_rounds}" >/dev/null 2>&1
+
+  if [[ -s "${manifest}" ]]; then
+    msg2 "Running weighted per-device passes (${mode})..."
+    while read -r slot class _vendor _device _weight; do
+      reps=4
+
+      case "${class:0:2}" in
+        03) reps=20 ;;
+        06) reps=14 ;;
+        01) reps=10 ;;
+        04|0c) reps=9 ;;
+        02) reps=8 ;;
+        *) reps=4 ;;
+      esac
+
+      if [[ "${mode}" == "bolt" ]]; then
+        reps=$((reps + 4))
+      fi
+
+      _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${trainer}" --slot "${slot}" "${reps}" >/dev/null 2>&1
+
+      if (( idx < 4 )); then
+        _run_profiled "${profile_dir}" env LD_LIBRARY_PATH="${lib_dir}" "${trainer}" --slot "${slot}" "$(( reps + 8 ))" >/dev/null 2>&1
+      fi
+
+      idx=$((idx + 1))
+    done < <(LC_ALL=C sort -k5,5nr "${manifest}" | head -n 16)
+  fi
 }
 
 prepare() {
-    cd "${srcdir}"
+  local src patchfile
 
-    for src in "${source[@]}"; do
-        src="${src%%::*}"
-        src="${src##*/}"
-        [[ $src = *.patch ]] || continue
-        echo "Applying patch: ${src}"
-        patch -Np1 -i "${src}"
-    done
+  for src in "${source[@]}"; do
+    src="${src%%::*}"
+    src="${src##*/}"
+    [[ "${src}" = *.patch ]] || continue
+
+    patchfile="${srcdir}/${src}"
+    _apply_patch_auto "${patchfile}" || return 1
+  done
 }
 
 build() {
-    cd "${srcdir}/${pkgname}-${pkgver}"
+  export CC=clang
+  export CXX=clang++
+  export AR=llvm-ar
+  export NM=llvm-nm
+  export RANLIB=llvm-ranlib
 
-    export CC=clang
-    export CXX=clang++
-    export AR=llvm-ar
-    export NM=llvm-nm
-    export RANLIB=llvm-ranlib
+  _orig_cppflags="${CPPFLAGS}"
+  _orig_cflags="${CFLAGS}"
+  _orig_cxxflags="${CXXFLAGS}"
+  _orig_ldflags="${LDFLAGS}"
 
-    local PGO_DIR="${srcdir}/${pkgname}-pgo"
-    local STANDARD_PROFILE_DIR="${PGO_DIR}/standard"
-    local CS_PROFILE_DIR="${PGO_DIR}/cs"
-    local MERGED_PROFDATA="${PGO_DIR}/merged.profdata"
-    local BOLT_PROFILE_DIR="${PGO_DIR}/bolt_profiles"
-    local BOLT_FDATA_PCIACCESS="${BOLT_PROFILE_DIR}/libpciaccess.fdata"
+  _pgo_dir="${srcdir}/${pkgname}-pgo"
+  _standard_profile_dir="${_pgo_dir}/standard"
+  _cs_profile_dir="${_pgo_dir}/cs"
+  _standard_profdata="${_pgo_dir}/standard.profdata"
+  _cs_profdata="${_pgo_dir}/cs.profdata"
+  _merged_profdata="${_pgo_dir}/merged.profdata"
+  _bolt_profile_dir="${_pgo_dir}/bolt_profiles"
+  _bolt_fdata="${_bolt_profile_dir}/libpciaccess.fdata"
 
-    local orig_cflags="${CFLAGS}"
-    local orig_cxxflags="${CXXFLAGS}"
-    local orig_ldflags="${LDFLAGS}"
+  local have_standard_profile=0
+  local have_cs_profile=0
+  local final_profdata=''
+  local use_pgo=0
 
-    rm -rf "${PGO_DIR}"
-    mkdir -p "${STANDARD_PROFILE_DIR}" "${CS_PROFILE_DIR}" "${BOLT_PROFILE_DIR}"
+  rm -rf "${_pgo_dir}" "${srcdir}/build_std_pgo" "${srcdir}/build_cs_pgo" "${srcdir}/build_opt"
+  mkdir -p "${_standard_profile_dir}" "${_cs_profile_dir}" "${_bolt_profile_dir}"
 
-    ###########################################################################
-    # Phase 1: Standard PGO Instrumentation Build
-    ###########################################################################
-    msg2 "Phase 1: Building with standard PGO instrumentation..."
+  _create_trainer_source "${_pgo_dir}/pci_train.c"
 
-    export CFLAGS="${orig_cflags} -fprofile-generate=${STANDARD_PROFILE_DIR} -fno-omit-frame-pointer -mllvm -vp-counters-per-site=2000"
-    export CXXFLAGS="${orig_cxxflags} -fprofile-generate=${STANDARD_PROFILE_DIR} -fno-omit-frame-pointer -mllvm -vp-counters-per-site=2000"
-    export LDFLAGS="${orig_ldflags} -fprofile-generate=${STANDARD_PROFILE_DIR}"
+  ###########################################################################
+  # Phase 1: Standard instrumentation PGO
+  ###########################################################################
+  msg2 "Phase 1: Building with standard PGO instrumentation..."
 
-    rm -rf "${srcdir}/build_std_pgo"
-    meson setup "${srcdir}/build_std_pgo" \
-        --prefix=/usr \
-        -D b_ndebug=false \
-        -D b_pie=false \
-        -D c_std=gnu2x \
-        -D cpp_std=gnu++2a \
-        -D b_lto=true \
-        --buildtype=debug \
-        --wrap-mode=nofallback
+  export CPPFLAGS="${_orig_cppflags}"
+  export CFLAGS="${_orig_cflags} -fprofile-generate=${_standard_profile_dir} -fno-omit-frame-pointer"
+  export CXXFLAGS="${_orig_cxxflags} -fprofile-generate=${_standard_profile_dir} -fno-omit-frame-pointer"
+  export LDFLAGS="${_orig_ldflags} -fprofile-generate=${_standard_profile_dir}"
 
-    ninja -C "${srcdir}/build_std_pgo"
+  _meson_setup "${srcdir}/build_std_pgo"
+  ninja -C "${srcdir}/build_std_pgo"
 
-    ###########################################################################
-    # Phase 1: Standard PGO Training
-    ###########################################################################
-    msg2 "Phase 1: Running standard PGO training..."
+  _compile_trainer "${_pgo_dir}/pci_train_std" "${srcdir}/build_std_pgo"
+  run_profile_training "${srcdir}/build_std_pgo/src" "${_pgo_dir}/pci_train_std" "${srcdir}/build_std_pgo/scanpci" "pgo-std" "${_standard_profile_dir}"
 
-    _create_test_program "${PGO_DIR}/pci_test.c"
-
-    gcc -O2 -o "${PGO_DIR}/pci_test" "${PGO_DIR}/pci_test.c" \
-        -I"${srcdir}/${pkgname}-${pkgver}/include" \
-        -L"${srcdir}/build_std_pgo/src" \
-        -Wl,-rpath,"${srcdir}/build_std_pgo/src" \
-        -lpciaccess
-
-    run_pgo_training "${srcdir}/build_std_pgo/src" "${PGO_DIR}" "${srcdir}/build_std_pgo/scanpci"
-
+  LLVM_PROFILE_FILE="${_standard_profile_dir}/%p-%m.profraw" \
     meson test -C "${srcdir}/build_std_pgo" --print-errorlogs || true
 
-    msg2 "Phase 1: Merging standard PGO profiles..."
-    if ! llvm-profdata merge -output="${PGO_DIR}/standard.profdata" "${STANDARD_PROFILE_DIR}"/*.profraw; then
-        error "Standard PGO profile merge failed"
-        return 1
-    fi
+  if _merge_profraw_dir "${_standard_profdata}" "${_standard_profile_dir}"; then
+    have_standard_profile=1
+  else
+    warning "No standard PGO profile data collected; continuing without standard PGO."
+  fi
 
-    ###########################################################################
-    # Phase 2: Context-sensitive PGO Instrumentation Build
-    ###########################################################################
+  ###########################################################################
+  # Phase 2: Context-sensitive PGO
+  ###########################################################################
+  if (( have_standard_profile )); then
     msg2 "Phase 2: Building with context-sensitive PGO instrumentation..."
 
-    export CFLAGS="${orig_cflags} -fprofile-use=${PGO_DIR}/standard.profdata -fprofile-correction -fcs-profile-generate=${CS_PROFILE_DIR} -fno-omit-frame-pointer -mllvm -vp-counters-per-site=2000"
-    export CXXFLAGS="${orig_cxxflags} -fprofile-use=${PGO_DIR}/standard.profdata -fprofile-correction -fcs-profile-generate=${CS_PROFILE_DIR} -fno-omit-frame-pointer -mllvm -vp-counters-per-site=2000"
-    export LDFLAGS="${orig_ldflags} -fprofile-use=${PGO_DIR}/standard.profdata -fcs-profile-generate=${CS_PROFILE_DIR}"
+    export CPPFLAGS="${_orig_cppflags}"
+    export CFLAGS="${_orig_cflags} -fprofile-use=${_standard_profdata} -fprofile-correction -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -fcs-profile-generate=${_cs_profile_dir} -fno-omit-frame-pointer"
+    export CXXFLAGS="${_orig_cxxflags} -fprofile-use=${_standard_profdata} -fprofile-correction -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -fcs-profile-generate=${_cs_profile_dir} -fno-omit-frame-pointer"
+    export LDFLAGS="${_orig_ldflags} -fcs-profile-generate=${_cs_profile_dir}"
 
-    rm -rf "${srcdir}/build_cs_pgo"
-    meson setup "${srcdir}/build_cs_pgo" \
-        --prefix=/usr \
-        -D b_ndebug=false \
-        -D b_pie=false \
-        -D c_std=gnu2x \
-        -D cpp_std=gnu++2a \
-        -D b_lto=true \
-        --buildtype=debug \
-        --wrap-mode=nofallback
-
+    _meson_setup "${srcdir}/build_cs_pgo"
     ninja -C "${srcdir}/build_cs_pgo"
 
-    ###########################################################################
-    # Phase 2: Context-sensitive PGO Training
-    ###########################################################################
-    msg2 "Phase 2: Running context-sensitive PGO training..."
+    _compile_trainer "${_pgo_dir}/pci_train_cs" "${srcdir}/build_cs_pgo"
+    run_profile_training "${srcdir}/build_cs_pgo/src" "${_pgo_dir}/pci_train_cs" "${srcdir}/build_cs_pgo/scanpci" "pgo-cs" "${_cs_profile_dir}"
 
-    gcc -O2 -o "${PGO_DIR}/pci_test_cs" "${PGO_DIR}/pci_test.c" \
-        -I"${srcdir}/${pkgname}-${pkgver}/include" \
-        -L"${srcdir}/build_cs_pgo/src" \
-        -Wl,-rpath,"${srcdir}/build_cs_pgo/src" \
-        -lpciaccess
+    LLVM_PROFILE_FILE="${_cs_profile_dir}/%p-%m.profraw" \
+      meson test -C "${srcdir}/build_cs_pgo" --print-errorlogs || true
 
-    run_pgo_training "${srcdir}/build_cs_pgo/src" "${PGO_DIR}" "${srcdir}/build_cs_pgo/scanpci"
-
-    meson test -C "${srcdir}/build_cs_pgo" --print-errorlogs || true
-
-    msg2 "Phase 2: Merging CS-PGO and standard profiles..."
-    if ! llvm-profdata merge -output="${MERGED_PROFDATA}" "${CS_PROFILE_DIR}"/*.profraw "${PGO_DIR}/standard.profdata"; then
-        error "CS-PGO profile merge failed"
-        return 1
-    fi
-
-    ###########################################################################
-    # Phase 3: Final optimized build with merged profiles
-    ###########################################################################
-    msg2 "Phase 3: Building final optimized libraries with merged profiles..."
-
-    export CFLAGS="${orig_cflags} -fprofile-use=${MERGED_PROFDATA} -fprofile-correction -fno-common -ffunction-sections -fdata-sections"
-    export CXXFLAGS="${orig_cxxflags} -fprofile-use=${MERGED_PROFDATA} -fprofile-correction -fno-common -ffunction-sections -fdata-sections"
-    export LDFLAGS="${orig_ldflags} -fprofile-use=${MERGED_PROFDATA} -Wl,--emit-relocs"
-
-    rm -rf "${srcdir}/build_opt"
-    meson setup "${srcdir}/build_opt" \
-        --prefix=/usr \
-        -D b_ndebug=true \
-        -D b_pie=false \
-        -D c_std=gnu2x \
-        -D cpp_std=gnu++2a \
-        -D b_lto=true \
-        --buildtype=release \
-        --wrap-mode=nofallback
-
-    ninja -C "${srcdir}/build_opt"
-
-    ###########################################################################
-    # Phase 4: BOLT instrumentation and training (zlib-ng style)
-    ###########################################################################
-    msg2 "Phase 4: BOLT instrumentation and training..."
-
-    local lib_dir="${srcdir}/build_opt/src"
-    local scanpci_dir="${srcdir}/build_opt/scanpci"
-    local lib_file
-    lib_file=$(readlink -f "${lib_dir}/libpciaccess.so")
-
-    if [[ -z "${lib_file}" || ! -f "${lib_file}" ]]; then
-        error "Could not resolve libpciaccess.so in ${lib_dir}"
-        return 1
-    fi
-
-    cp "${lib_file}" "${lib_file}.cspgo"
-
-    llvm-bolt "${lib_file}.cspgo" \
-        --instrument \
-        --instrumentation-file-append-pid \
-        --instrumentation-file="${BOLT_FDATA_PCIACCESS}" \
-        -o "${lib_file}.bolt.inst"
-
-    mv "${lib_file}.bolt.inst" "${lib_file}"
-
-    ln -sf "$(basename "${lib_file}")" "${lib_dir}/libpciaccess.so.0"
-    ln -sf "libpciaccess.so.0" "${lib_dir}/libpciaccess.so"
-
-    gcc -O2 -o "${PGO_DIR}/pci_test_bolt" "${PGO_DIR}/pci_test.c" \
-        -I"${srcdir}/${pkgname}-${pkgver}/include" \
-        -L"${lib_dir}" \
-        -Wl,-rpath,"${lib_dir}" \
-        -lpciaccess
-
-    BOLT_PROFILE_FILE="${BOLT_FDATA_PCIACCESS}" \
-      run_pgo_training "${lib_dir}" "${PGO_DIR}" "${scanpci_dir}"
-
-    if ! compgen -G "${BOLT_FDATA_PCIACCESS}.*" >/dev/null; then
-        error "No BOLT .fdata.* profiles found in ${BOLT_PROFILE_DIR}"
-        return 1
-    fi
-
-    ###########################################################################
-    # Phase 5: Merging and applying BOLT profiles (stable flag set)
-    ###########################################################################
-    msg2 "Phase 5: Merging BOLT profiles..."
-
-    if ! command -v merge-fdata >/dev/null 2>&1; then
-        warning "merge-fdata not found, skipping BOLT optimization"
-        mv "${lib_file}.cspgo" "${lib_file}"
+    if _merge_profraw_dir "${_cs_profdata}" "${_cs_profile_dir}"; then
+      have_cs_profile=1
     else
-        local merged_bolt="${PGO_DIR}/bolt_pciaccess_merged.fdata"
+      warning "No CS-PGO profile data collected; falling back to standard PGO profile."
+    fi
 
-        merge-fdata "${BOLT_FDATA_PCIACCESS}".* -o "${merged_bolt}"
+    if (( have_cs_profile )); then
+      if llvm-profdata merge -output="${_merged_profdata}" "${_standard_profdata}" "${_cs_profdata}"; then
+        final_profdata="${_merged_profdata}"
+      else
+        warning "Merged PGO profile creation failed; falling back to standard PGO profile."
+        final_profdata="${_standard_profdata}"
+      fi
+    else
+      final_profdata="${_standard_profdata}"
+    fi
+  else
+    msg2 "Phase 2: Skipping CS-PGO because no standard profile data is available."
+  fi
 
-        if [[ ! -s "${merged_bolt}" ]]; then
-            warning "BOLT profile merge failed for libpciaccess, skipping optimization"
-            mv "${lib_file}.cspgo" "${lib_file}"
-        else
-            msg2 "Phase 5: Applying BOLT optimizations to libpciaccess..." #--hugify causes segfaults
+  if [[ -n "${final_profdata}" && -f "${final_profdata}" ]]; then
+    use_pgo=1
+  fi
 
-            if llvm-bolt "${lib_file}.cspgo" \
-                --data "${merged_bolt}" \
-                -o "${lib_file}.bolt" \
-                --dyno-stats \
-                --lite=false \
-                --split-functions \
-                --split-strategy=cdsplit \
-                --icf=all \
-                --plt=all \
-                --peepholes=all \
-                --indirect-call-promotion=all \
-                --reorder-blocks=ext-tsp \
-                --reorder-functions=cdsort \
-                --x86-strip-redundant-address-size; then
-                mv "${lib_file}.bolt" "${lib_file}"
+  ###########################################################################
+  # Phase 3: Final build
+  ###########################################################################
+  msg2 "Phase 3: Building final library..."
+
+  export CPPFLAGS="${_orig_cppflags}"
+  if (( use_pgo )); then
+    export CFLAGS="${_orig_cflags} -fprofile-use=${final_profdata} -fprofile-correction -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled"
+    export CXXFLAGS="${_orig_cxxflags} -fprofile-use=${final_profdata} -fprofile-correction -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled"
+  else
+    export CFLAGS="${_orig_cflags}"
+    export CXXFLAGS="${_orig_cxxflags}"
+  fi
+  export LDFLAGS="${_orig_ldflags} -Wl,--emit-relocs"
+
+  _meson_setup "${srcdir}/build_opt"
+  ninja -C "${srcdir}/build_opt"
+
+  _compile_trainer "${_pgo_dir}/pci_train_opt" "${srcdir}/build_opt"
+
+  ###########################################################################
+  # Phase 4: BOLT instrumentation + training
+  ###########################################################################
+  msg2 "Phase 4: BOLT instrumentation and training..."
+
+  local lib_dir="${srcdir}/build_opt/src"
+  local scanpci_dir="${srcdir}/build_opt/scanpci"
+  local lib_file
+  local bolt_backup
+  local bolt_inst
+  local bolt_output
+  local merged_bolt="${_pgo_dir}/bolt_pciaccess_merged.fdata"
+
+  lib_file="$(_resolve_built_library "${lib_dir}")" || {
+    error "Could not resolve built libpciaccess shared object in ${lib_dir}"
+    return 1
+  }
+
+  bolt_backup="${lib_file}.cspgo"
+  bolt_inst="${lib_file}.bolt.inst"
+  bolt_output="${lib_file}.bolt"
+
+  rm -f "${bolt_backup}" "${bolt_inst}" "${bolt_output}" "${merged_bolt}" "${_bolt_fdata}" "${_bolt_fdata}".*
+
+  if command -v llvm-bolt >/dev/null 2>&1 && command -v merge-fdata >/dev/null 2>&1; then
+    cp "${lib_file}" "${bolt_backup}"
+
+    if llvm-bolt "${bolt_backup}" \
+      --instrument \
+      --instrumentation-file="${_bolt_fdata}" \
+      --instrumentation-file-append-pid \
+      -o "${bolt_inst}"; then
+
+      mv "${bolt_inst}" "${lib_file}"
+
+      run_profile_training "${lib_dir}" "${_pgo_dir}/pci_train_opt" "${scanpci_dir}" "bolt" ""
+
+      if compgen -G "${_bolt_fdata}.*" >/dev/null; then
+        if merge-fdata "${_bolt_fdata}".* -o "${merged_bolt}"; then
+          if [[ -s "${merged_bolt}" ]]; then
+            if llvm-bolt "${bolt_backup}" \
+              --data="${merged_bolt}" \
+              -o "${bolt_output}" \
+              --dyno-stats \
+              --lite=false \
+              --split-functions --split-all-cold --split-eh \
+              --x86-strip-redundant-address-size \
+              --split-strategy=cdsplit \
+              --icf=all \
+              --plt=all \
+              --peepholes=all \
+              --indirect-call-promotion=all \
+              --reorder-blocks=ext-tsp \
+              --reorder-functions=cdsort \
+              --x86-strip-redundant-address-size; then
+              mv "${bolt_output}" "${lib_file}"
+              rm -f "${bolt_backup}"
             else
-                warning "BOLT optimization failed for libpciaccess, restoring CS-PGO binary"
-                mv "${lib_file}.cspgo" "${lib_file}"
+              warning "BOLT optimization failed; restoring non-BOLT final library."
+              mv "${bolt_backup}" "${lib_file}"
+              rm -f "${bolt_output}"
             fi
+          else
+            warning "Merged BOLT profile is empty; restoring non-BOLT final library."
+            mv "${bolt_backup}" "${lib_file}"
+          fi
+        else
+          warning "merge-fdata failed; restoring non-BOLT final library."
+          mv "${bolt_backup}" "${lib_file}"
         fi
+      else
+        warning "No BOLT profile data collected; restoring non-BOLT final library."
+        mv "${bolt_backup}" "${lib_file}"
+      fi
+    else
+      warning "BOLT instrumentation failed; keeping non-BOLT final library."
+      rm -f "${bolt_backup}" "${bolt_inst}"
     fi
+  else
+    warning "llvm-bolt/merge-fdata not available; skipping BOLT optimization."
+  fi
 
-    ###########################################################################
-    # Phase 6: Verification (runtime smoke checks)
-    ###########################################################################
-    msg2 "Phase 6: Verifying BOLT output..."
+  rm -f "${bolt_inst}" "${bolt_output}"
 
-    if ! file "${lib_file}" | grep -q 'ELF 64-bit'; then
-        error "Final library is not a valid ELF binary"
-        return 1
-    fi
+  ###########################################################################
+  # Phase 5: Verification
+  ###########################################################################
+  msg2 "Phase 5: Verifying final output..."
 
-    LD_LIBRARY_PATH="${lib_dir}" "${PGO_DIR}/pci_test_bolt" --list >/dev/null 2>&1
-    local rc=$?
-    if (( rc >= 128 )); then
-        error "BOLT-optimized library crashed during verification (exit ${rc})"
-        return 1
-    fi
+  if ! readelf -h "${lib_file}" >/dev/null 2>&1; then
+    error "Final library is not a valid ELF object"
+    return 1
+  fi
 
-    ln -sf "$(basename "${lib_file}")" "${lib_dir}/libpciaccess.so.0"
-    ln -sf "libpciaccess.so.0" "${lib_dir}/libpciaccess.so"
+  env LD_LIBRARY_PATH="${lib_dir}" "${_pgo_dir}/pci_train_opt" --inventory >/dev/null 2>&1
+  local trainer_rc=$?
+  if (( trainer_rc >= 128 )); then
+    error "Final library crashed during trainer verification (exit ${trainer_rc})"
+    return 1
+  fi
 
-    export CFLAGS="${orig_cflags}"
-    export CXXFLAGS="${orig_cxxflags}"
-    export LDFLAGS="${orig_ldflags}"
+  if [[ -x "${scanpci_dir}/scanpci" ]]; then
+    env LD_LIBRARY_PATH="${lib_dir}" "${scanpci_dir}/scanpci" >/dev/null 2>&1 || true
+  fi
+
+  export CPPFLAGS="${_orig_cppflags}"
+  export CFLAGS="${_orig_cflags}"
+  export CXXFLAGS="${_orig_cxxflags}"
+  export LDFLAGS="${_orig_ldflags}"
+
+  unset _orig_cppflags _orig_cflags _orig_cxxflags _orig_ldflags
+  unset _pgo_dir _standard_profile_dir _cs_profile_dir _standard_profdata _cs_profdata _merged_profdata _bolt_profile_dir _bolt_fdata
 }
 
 check() {
-    meson test -C "${srcdir}/build_opt" --print-errorlogs || true
+  [[ -d "${srcdir}/build_opt" ]] || return 0
+  meson test -C "${srcdir}/build_opt" --print-errorlogs || true
 }
 
 package() {
-    DESTDIR="${pkgdir}" ninja -C "${srcdir}/build_opt" install
+  meson install -C "${srcdir}/build_opt" --destdir "${pkgdir}"
 
-    find "${pkgdir}" -type f \( -name '*.so*' -o -name '*.a' -o -executable \) -print0 | \
-    while IFS= read -r -d '' file; do
-        if file "${file}" | grep -q 'ELF'; then
-            llvm-strip --strip-unneeded "${file}" 2>/dev/null || true
-        fi
-    done
-
-    install -Dm644 "${srcdir}/${pkgname}-${pkgver}/COPYING" \
-        -t "${pkgdir}/usr/share/licenses/${pkgname}/"
+  install -Dm644 "${srcdir}/${pkgname}-${pkgver}/COPYING" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/COPYING"
 }
