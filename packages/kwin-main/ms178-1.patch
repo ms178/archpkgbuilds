@@ -2858,7 +2858,7 @@
  }
 
 --- a/src/core/renderloop_p.h	2025-10-06 01:22:20.420848975 +0200
-+++ b/src/core/renderloop_p.h	2026-02-28 01:34:39.090533060 +0200
++++ b/src/core/renderloop_p.h	2026-03-18 01:34:39.090533060 +0200
 @@ -1,9 +1,8 @@
  /*
 -    SPDX-FileCopyrightText: 2020 Vlad Zahorodnii <vlad.zahorodnii@kde.org>
@@ -2871,7 +2871,7 @@
  #pragma once
  
  #include "renderbackend.h"
-@@ -11,52 +10,163 @@
+@@ -11,52 +10,161 @@
  #include "renderloop.h"
  
  #include <QBasicTimer>
@@ -2977,7 +2977,6 @@
 +    int16_t cadenceStability_{128};
 +    int16_t scheduledTimerMs{-1};
 +    int16_t vrrControlDelayMs{-1};
-+    int16_t doubleBufferingCounter{0};
 +    uint16_t starvationRecoveryCounter{0};
 +    uint16_t modeDwellCounter_{0};
 +    uint16_t pendingModeCounter_{0};
@@ -3053,11 +3052,10 @@
 +    [[nodiscard]] bool detectVrrOscillation() noexcept;
 +    void updateFramePrediction(std::chrono::nanoseconds measured) noexcept;
 +    void updatePresentationCadence(int64_t intervalNs) noexcept;
-+    [[nodiscard]] bool isFrameTimeStable() const noexcept;
 +    void dispatch();
 +    void delayScheduleRepaint() noexcept;
 +    void scheduleNextRepaint();
-+    void scheduleRepaint(std::chrono::nanoseconds lastTargetTimestamp);
++    void scheduleRepaint();
 +    void notifyFrameDropped();
 +    void notifyFrameCompleted(std::chrono::nanoseconds timestamp, std::optional<RenderTimeSpan> renderTime, PresentationMode mode, OutputFrame *frame);
 +    void notifyVblank(std::chrono::nanoseconds timestamp, int64_t nowNs);
@@ -3257,7 +3255,7 @@
 +Q_DECLARE_METATYPE(KWin::PresentFeedback)
 
 --- a/src/core/renderloop.cpp	2025-10-06 01:22:20.420848975 +0200
-+++ b/src/core/renderloop.cpp	2026-03-14 01:34:39.090533060 +0200
++++ b/src/core/renderloop.cpp	2026-03-18 01:34:39.090533060 +0200
 @@ -1,7 +1,8 @@
  /*
 -    SPDX-FileCopyrightText: 2020 Vlad Zahorodnii <vlad.zahorodnii@kde.org>
@@ -3270,7 +3268,7 @@
  */
  
  #include "renderloop.h"
-@@ -9,28 +10,873 @@
+@@ -9,28 +10,869 @@
  #include "options.h"
  #include "renderloop_p.h"
  #include "scene/surfaceitem.h"
@@ -3824,7 +3822,8 @@
 +                sum += delta;
 +                minValue = std::min(minValue, delta);
 +                maxValue = std::max(maxValue, delta);
-+                matches += static_cast<size_t>(safeAbs64(delta - nominalNs) <= doubleTolerance);
++                // God-mode direct-scanout boost: if any sample was direct-scanned, treat cadence as locked (fixes AMD/sway stutter)
++                matches += static_cast<size_t>(sample.directScanout || safeAbs64(delta - nominalNs) <= doubleTolerance);
 +            }
 +        }
 +
@@ -3934,11 +3933,6 @@
 +    const int32_t weight = 1 + (isGreater * 6);
 +
 +    cadenceStability_ = static_cast<int16_t>((current * weight + sample) >> shift);
-+}
-+
-+bool RenderLoopPrivate::isFrameTimeStable() const noexcept
-+{
-+    return cadenceStability_ >= kCadenceStableThreshold;
 +}
 +
 +PresentationMode RenderLoopPrivate::selectPresentationMode() noexcept
@@ -4093,7 +4087,7 @@
 +            return false;
 +        }
 +    } else {
-+        if (activeContentHint_ == VrrContentHint::ForceVrr) {
++        if (activeContentHint_ == VrrContentHint::ForceVrr) {  // instant switch for games
 +            threshold = 1U;
 +        } else if (activeContentHint_ == VrrContentHint::Interactive || interactiveGraceFrames_ > 0U) {
 +            threshold = 1U;
@@ -4149,18 +4143,20 @@
  }
  
  void RenderLoopPrivate::scheduleNextRepaint()
-@@ -41,144 +887,313 @@ void RenderLoopPrivate::scheduleNextRepa
-     scheduleRepaint(nextPresentationTimestamp);
+@@ -38,147 +880,327 @@ void RenderLoopPrivate::scheduleNextRepa
+     if (kwinApp()->isTerminating() || compositeTimer.isActive() || preparingNewFrame) {
+         return;
+     }
+-    scheduleRepaint(nextPresentationTimestamp);
++    scheduleRepaint();
  }
  
 -void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimestamp)
-+void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTarget)
++void RenderLoopPrivate::scheduleRepaint()
  {
-+    Q_UNUSED(lastTarget)
-+
 +    if (q->thread() != QThread::currentThread()) [[unlikely]] {
-+        QMetaObject::invokeMethod(q, [this, lastTarget]() {
-+            scheduleRepaint(lastTarget);
++        QMetaObject::invokeMethod(q, [this]() {
++            scheduleRepaint();
 +        }, Qt::QueuedConnection);
 +        return;
 +    }
@@ -4386,13 +4382,7 @@
 +{
 +    if (!s_debugEnabled) [[likely]] {
 +        return;
-     }
--    if (m_debugOutput) {
--        auto times = renderTime.value_or(RenderTimeSpan{});
--        const bool vrr = mode == PresentationMode::AdaptiveSync || mode == PresentationMode::AdaptiveAsync;
--        const bool tearing = mode == PresentationMode::Async || mode == PresentationMode::AdaptiveAsync;
--        *m_debugOutput << frame->targetPageflipTime().time_since_epoch().count() << "," << timestamp.count() << "," << times.start.time_since_epoch().count() << "," << times.end.time_since_epoch().count()
--                       << "," << safetyMargin.count() << "," << frame->refreshDuration().count() << "," << (vrr ? 1 : 0) << "," << (tearing ? 1 : 0) << "," << frame->predictedRenderTime().count() << "\n";
++    }
 +
 +    if (!d->m_debugOutput) {
 +        if (!d->output) {
@@ -4409,9 +4399,13 @@
 +            *d->m_debugOutput << "target,flip,start,end,margin,dur,vrr,pred,cadence\n";
 +        }
      }
- 
--    Q_ASSERT(pendingFrameCount > 0);
--    pendingFrameCount--;
+-    if (m_debugOutput) {
+-        auto times = renderTime.value_or(RenderTimeSpan{});
+-        const bool vrr = mode == PresentationMode::AdaptiveSync || mode == PresentationMode::AdaptiveAsync;
+-        const bool tearing = mode == PresentationMode::Async || mode == PresentationMode::AdaptiveAsync;
+-        *m_debugOutput << frame->targetPageflipTime().time_since_epoch().count() << "," << timestamp.count() << "," << times.start.time_since_epoch().count() << "," << times.end.time_since_epoch().count()
+-                       << "," << safetyMargin.count() << "," << frame->refreshDuration().count() << "," << (vrr ? 1 : 0) << "," << (tearing ? 1 : 0) << "," << frame->predictedRenderTime().count() << "\n";
++
 +    if (d->m_debugOutput && d->m_debugOutput->is_open()) {
 +        const auto times = rt.value_or(RenderTimeSpan{});
 +        *d->m_debugOutput << targetFlip.count() << ','
@@ -4427,18 +4421,16 @@
 +}
 +
 +} // namespace
- 
--    notifyVblank(timestamp);
++
 +void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
 +                                             std::optional<RenderTimeSpan> renderTime,
 +                                             PresentationMode mode,
 +                                             OutputFrame *frame)
 +{
 +    if (q->thread() != QThread::currentThread()) [[unlikely]] {
-+        QMetaObject::invokeMethod(q,[this, timestamp, renderTime, mode, frame]() {
-+                                      notifyFrameCompleted(timestamp, renderTime, mode, frame);
-+                                  },
-+                                  Qt::QueuedConnection);
++        QMetaObject::invokeMethod(q, [this, timestamp, renderTime, mode, frame]() {
++            notifyFrameCompleted(timestamp, renderTime, mode, frame);
++        }, Qt::QueuedConnection);
 +        return;
 +    }
 +
@@ -4456,11 +4448,14 @@
 +
 +    if (pendingFrameCount > 0) {
 +        --pendingFrameCount;
-+    }
-+
+     }
+ 
+-    Q_ASSERT(pendingFrameCount > 0);
+-    pendingFrameCount--;
 +    const int64_t prevPresentationNs = lastPresentationTimestamp.count();
 +    const int64_t nowNs = steadyNowNs();
-+
+ 
+-    notifyVblank(timestamp);
 +    int64_t tsNs = timestamp.count();
 +    if (tsNs > nowNs) [[unlikely]] {
 +        tsNs = nowNs;
@@ -4484,7 +4479,8 @@
 +
 +    if (interactiveGraceFrames_ > 0U) {
 +        --interactiveGraceFrames_;
-+    }
+     }
+-    if (!inhibitCount && pendingReschedule) {
 +
 +    if (isVrrMode(mode)) {
 +        if (starvationRecoveryCounter < kStarvationRecoveryFrames) {
@@ -4500,13 +4496,26 @@
 +        feedback.targetPresentationTimestamp =
 +            std::chrono::duration_cast<std::chrono::nanoseconds>(frame->targetPageflipTime().time_since_epoch());
 +        feedback.refreshDuration = frame->refreshDuration();
-+        feedback.deadlineMissed = feedback.targetPresentationTimestamp.count() > 0
-+            && timestamp > (feedback.targetPresentationTimestamp + 500us);
++
++        const int64_t vblankNs = static_cast<int64_t>(cachedVblankIntervalNs);
++        int64_t graceNs = vblankNs / 8;
++        if (graceNs < 700'000) {
++            graceNs = 700'000;
++        } else if (graceNs > 2'500'000) {
++            graceNs = 2'500'000;
++        }
++
++        if (!isVrrMode(mode) && feedback.targetPresentationTimestamp.count() > 0) {
++            feedback.deadlineMissed =
++                timestamp > (feedback.targetPresentationTimestamp + std::chrono::nanoseconds{graceNs});
++        } else {
++            feedback.deadlineMissed = false;
++        }
++
 +        feedback.directScanout = false;
 +        feedback.valid = true;
 +        addPresentFeedback(feedback);
-     }
--    if (!inhibitCount && pendingReschedule) {
++    }
 +
 +    if (inhibitCount == 0 && (pendingReschedule || pendingFrameCount == 0)) {
 +        pendingReschedule = false;
@@ -4555,7 +4564,7 @@
          d->delayedVrrTimer.stop();
          scheduleRepaint(nullptr, nullptr);
      } else {
-@@ -186,42 +1201,33 @@ void RenderLoop::timerEvent(QTimerEvent
+@@ -186,42 +1208,33 @@ void RenderLoop::timerEvent(QTimerEvent
      }
  }
  
@@ -4604,7 +4613,7 @@
      d->preparingNewFrame = true;
  }
  
-@@ -235,58 +1241,187 @@ int RenderLoop::refreshRate() const
+@@ -235,58 +1248,187 @@ int RenderLoop::refreshRate() const
      return d->refreshRate;
  }
  
@@ -4823,7 +4832,7 @@
  }
  
  std::chrono::nanoseconds RenderLoop::lastPresentationTimestamp() const
-@@ -301,15 +1436,17 @@ std::chrono::nanoseconds RenderLoop::nex
+@@ -301,15 +1443,17 @@ std::chrono::nanoseconds RenderLoop::nex
  
  void RenderLoop::setPresentationMode(PresentationMode mode)
  {
