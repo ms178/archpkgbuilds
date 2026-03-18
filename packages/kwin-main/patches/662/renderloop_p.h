@@ -92,7 +92,6 @@ public:
     int16_t cadenceStability_{128};
     int16_t scheduledTimerMs{-1};
     int16_t vrrControlDelayMs{-1};
-    int16_t doubleBufferingCounter{0};
     uint16_t starvationRecoveryCounter{0};
     uint16_t modeDwellCounter_{0};
     uint16_t pendingModeCounter_{0};
@@ -159,11 +158,10 @@ public:
     [[nodiscard]] bool detectVrrOscillation() noexcept;
     void updateFramePrediction(std::chrono::nanoseconds measured) noexcept;
     void updatePresentationCadence(int64_t intervalNs) noexcept;
-    [[nodiscard]] bool isFrameTimeStable() const noexcept;
     void dispatch();
     void delayScheduleRepaint() noexcept;
     void scheduleNextRepaint();
-    void scheduleRepaint(std::chrono::nanoseconds lastTargetTimestamp);
+    void scheduleRepaint();
     void notifyFrameDropped();
     void notifyFrameCompleted(std::chrono::nanoseconds timestamp, std::optional<RenderTimeSpan> renderTime, PresentationMode mode, OutputFrame *frame);
     void notifyVblank(std::chrono::nanoseconds timestamp, int64_t nowNs);

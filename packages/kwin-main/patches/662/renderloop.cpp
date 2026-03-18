@@ -555,7 +555,8 @@ bool RenderLoopPrivate::cadenceMatchesNominal() const noexcept
                 sum += delta;
                 minValue = std::min(minValue, delta);
                 maxValue = std::max(maxValue, delta);
-                matches += static_cast<size_t>(safeAbs64(delta - nominalNs) <= doubleTolerance);
+                // God-mode direct-scanout boost: if any sample was direct-scanned, treat cadence as locked (fixes AMD/sway stutter)
+                matches += static_cast<size_t>(sample.directScanout || safeAbs64(delta - nominalNs) <= doubleTolerance);
             }
         }
 
@@ -665,11 +666,6 @@ void RenderLoopPrivate::updatePresentationCadence(int64_t intervalNs) noexcept
     const int32_t weight = 1 + (isGreater * 6);
 
     cadenceStability_ = static_cast<int16_t>((current * weight + sample) >> shift);
-}
-
-bool RenderLoopPrivate::isFrameTimeStable() const noexcept
-{
-    return cadenceStability_ >= kCadenceStableThreshold;
 }
 
 PresentationMode RenderLoopPrivate::selectPresentationMode() noexcept
@@ -824,7 +820,7 @@ bool RenderLoopPrivate::shouldSwitchMode(PresentationMode target) noexcept
             return false;
         }
     } else {
-        if (activeContentHint_ == VrrContentHint::ForceVrr) {
+        if (activeContentHint_ == VrrContentHint::ForceVrr) {  // instant switch for games
             threshold = 1U;
         } else if (activeContentHint_ == VrrContentHint::Interactive || interactiveGraceFrames_ > 0U) {
             threshold = 1U;
@@ -884,16 +880,14 @@ void RenderLoopPrivate::scheduleNextRepaint()
     if (kwinApp()->isTerminating() || compositeTimer.isActive() || preparingNewFrame) {
         return;
     }
-    scheduleRepaint(nextPresentationTimestamp);
+    scheduleRepaint();
 }
 
-void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTarget)
+void RenderLoopPrivate::scheduleRepaint()
 {
-    Q_UNUSED(lastTarget)
-
     if (q->thread() != QThread::currentThread()) [[unlikely]] {
-        QMetaObject::invokeMethod(q, [this, lastTarget]() {
-            scheduleRepaint(lastTarget);
+        QMetaObject::invokeMethod(q, [this]() {
+            scheduleRepaint();
         }, Qt::QueuedConnection);
         return;
     }
@@ -1093,10 +1087,9 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
                                              OutputFrame *frame)
 {
     if (q->thread() != QThread::currentThread()) [[unlikely]] {
-        QMetaObject::invokeMethod(q,[this, timestamp, renderTime, mode, frame]() {
-                                      notifyFrameCompleted(timestamp, renderTime, mode, frame);
-                                  },
-                                  Qt::QueuedConnection);
+        QMetaObject::invokeMethod(q, [this, timestamp, renderTime, mode, frame]() {
+            notifyFrameCompleted(timestamp, renderTime, mode, frame);
+        }, Qt::QueuedConnection);
         return;
     }
 
@@ -1154,8 +1147,22 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
         feedback.targetPresentationTimestamp =
             std::chrono::duration_cast<std::chrono::nanoseconds>(frame->targetPageflipTime().time_since_epoch());
         feedback.refreshDuration = frame->refreshDuration();
-        feedback.deadlineMissed = feedback.targetPresentationTimestamp.count() > 0
-            && timestamp > (feedback.targetPresentationTimestamp + 500us);
+
+        const int64_t vblankNs = static_cast<int64_t>(cachedVblankIntervalNs);
+        int64_t graceNs = vblankNs / 8;
+        if (graceNs < 700'000) {
+            graceNs = 700'000;
+        } else if (graceNs > 2'500'000) {
+            graceNs = 2'500'000;
+        }
+
+        if (!isVrrMode(mode) && feedback.targetPresentationTimestamp.count() > 0) {
+            feedback.deadlineMissed =
+                timestamp > (feedback.targetPresentationTimestamp + std::chrono::nanoseconds{graceNs});
+        } else {
+            feedback.deadlineMissed = false;
+        }
+
         feedback.directScanout = false;
         feedback.valid = true;
         addPresentFeedback(feedback);
