@@ -474,7 +474,7 @@ amdgpu_cs_set_pstate(struct radeon_cmdbuf *rcs, enum radeon_ctx_pstate pstate)
 static bool
 are_file_descriptions_equal(int fd1, int fd2)
 {
-   static atomic_bool logged = ATOMIC_VAR_INIT(false);
+   static atomic_flag logged = ATOMIC_FLAG_INIT;
 
    if (fd1 < 0 || fd2 < 0)
       return false;
@@ -488,17 +488,14 @@ are_file_descriptions_equal(int fd1, int fd2)
       return true;
 
    if (r < 0) {
-      bool expected = false;
-
-      if (atomic_compare_exchange_strong_explicit(&logged, &expected, true,
-                                                  memory_order_relaxed,
-                                                  memory_order_relaxed)) {
+      if (!atomic_flag_test_and_set_explicit(&logged, memory_order_relaxed)) {
          os_log_message("amdgpu: os_same_file_description couldn't "
                         "determine if two DRM fds reference the same "
                         "file description.\n"
                         "If they do, bad things may happen!\n");
       }
    }
+
    return false;
 }
 
