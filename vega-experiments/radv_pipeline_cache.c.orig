@@ -135,11 +135,11 @@ radv_is_cache_disabled(const struct radv_device *device, const struct vk_pipelin
    const struct radv_instance *instance = radv_physical_device_instance(pdev);
 
    /* The buffer address used for debug printf is hardcoded. */
-   if (device->printf.buffer_addr)
+   if (device->debug_nir.printf.buffer_addr)
       return true;
 
    /* The buffer address used for validating VAs is hardcoded. */
-   if (device->valid_vas_addr)
+   if (device->debug_nir.valid_va.buffer_addr)
       return true;
 
    /* Pipeline caches can be disabled with RADV_DEBUG=nocache, with MESA_GLSL_CACHE_DISABLE=1 and
