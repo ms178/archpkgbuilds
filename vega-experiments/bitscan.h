@@ -107,14 +107,15 @@ u_bit_scan(unsigned *mask)
 {
    assert(mask && *mask);
 #if defined(__GNUC__) || defined(__clang__)
-   /* Fast path: ctz → clear LSB (mask &= mask - 1) */
+   /* Fast path: ctz → clear LSB (mask &= mask - 1). */
    const unsigned m = *mask;
    const int i = __builtin_ctz(m);
-   *mask = m & (m - 1);
+   *mask = m & (m - 1u);
    return i;
 #else
-   const int i = ffs(*mask) - 1;
-   *mask &= ~(1u << i);
+   const unsigned m = *mask;
+   const int i = ffs(m) - 1;
+   *mask = m & (m - 1u);
    return i;
 #endif
 }
@@ -123,9 +124,10 @@ u_bit_scan(unsigned *mask)
  * 'b' is assigned the bit index on each iteration.
  */
 #define u_foreach_bit(b, dword)                                  \
-   for (uint32_t __dword = (uint32_t)(dword), b;                  \
-        ((b) = ffs(__dword) - 1, __dword);                        \
-        __dword &= ~(1u << (b)))
+   for (uint32_t __dword = (uint32_t)(dword), b;                 \
+        ((b) = ffs(__dword) - 1, __dword);                       \
+        /* See util_bitcount below. */                           \
+        __dword &= __dword - 1)
 
 static inline int
 u_bit_scan64(uint64_t *mask)
@@ -134,11 +136,12 @@ u_bit_scan64(uint64_t *mask)
 #if defined(__GNUC__) || defined(__clang__)
    const uint64_t m = *mask;
    const int i = __builtin_ctzll(m);
-   *mask = m & (m - 1);
+   *mask = m & (m - 1ull);
    return i;
 #else
-   const int i = ffsll(*mask) - 1;
-   *mask &= ~(1ull << i);
+   const uint64_t m = *mask;
+   const int i = ffsll(m) - 1;
+   *mask = m & (m - 1ull);
    return i;
 #endif
 }
@@ -147,19 +150,20 @@ u_bit_scan64(uint64_t *mask)
  * 'b' is assigned the bit index on each iteration.
  */
 #define u_foreach_bit64(b, dword)                                \
-   for (uint64_t __dword = (uint64_t)(dword), b;                  \
-        ((b) = ffsll(__dword) - 1, __dword);                      \
-        __dword &= ~(1ull << (b)))
+   for (uint64_t __dword = (uint64_t)(dword), b;                 \
+        ((b) = ffsll(__dword) - 1, __dword);                     \
+        /* See util_bitcount below. */                           \
+        __dword &= __dword - 1)
 
 /* Given two bitmasks, loop over all bits of both of them.
  * Bits of mask1 are: b = ffsll(mask1) - 1;
  * Bits of mask2 are: b = offset + (ffsll(mask2) - 1);
  */
-#define u_foreach_bit64_two_masks(b, mask1, offset, mask2)                             \
-   for (uint64_t __mask1 = (uint64_t)(mask1), __mask2 = (uint64_t)(mask2), b;          \
-        (__mask1 ? ((b) = ffsll(__mask1) - 1)                                          \
-                 : ((b) = ffsll(__mask2) - 1 + (offset)), __mask1 || __mask2);         \
-        __mask1 ? (__mask1 &= ~(1ull << (b))) : (__mask2 &= ~(1ull << ((b) - (offset)))))
+#define u_foreach_bit64_two_masks(b, mask1, offset, mask2)                         \
+   for (uint64_t __mask1 = (uint64_t)(mask1), __mask2 = (uint64_t)(mask2), b;      \
+        (__mask1 ? ((b) = ffsll(__mask1) - 1)                                       \
+                 : ((b) = ffsll(__mask2) - 1 + (offset)), __mask1 || __mask2);     \
+        __mask1 ? (__mask1 &= __mask1 - 1) : (__mask2 &= __mask2 - 1))
 
 /* Determine if an uint32_t value is a power of two.
  * Zero is treated as a power of two.
@@ -212,28 +216,34 @@ util_is_power_of_two_nonzero_uintptr(uintptr_t v)
 static inline void
 u_bit_scan_consecutive_range(unsigned *mask, int *start, int *count)
 {
+   assert(mask && start && count && *mask);
+
    if (*mask == 0xffffffffu) {
       *start = 0;
       *count = 32;
-      *mask  = 0;
+      *mask = 0;
       return;
    }
+
    *start = ffs(*mask) - 1;
-   *count = ffs(~(*mask >> *start)) - 1;
+   *count = ffs(~(*mask >> (unsigned)*start)) - 1;
    *mask &= ~(((1u << (unsigned)*count) - 1u) << (unsigned)*start);
 }
 
 static inline void
 u_bit_scan_consecutive_range64(uint64_t *mask, int *start, int *count)
 {
+   assert(mask && start && count && *mask);
+
    if (*mask == UINT64_MAX) {
       *start = 0;
       *count = 64;
-      *mask  = 0;
+      *mask = 0;
       return;
    }
+
    *start = ffsll(*mask) - 1;
-   *count = ffsll(~(*mask >> *start)) - 1;
+   *count = ffsll(~(*mask >> (unsigned)*start)) - 1;
    *mask &= ~(((((uint64_t)1) << (unsigned)*count) - 1ull) << (unsigned)*start);
 }
 
@@ -389,17 +399,32 @@ util_widen_mask(uint32_t mask, unsigned multiplier)
     * Use BMI2 PDEP to interleave zeros between bits, then OR with a shift to replicate.
     */
    if (multiplier == 2) {
-      /* Spread source bits into odd positions. */
-      uint32_t spread = _pdep_u32(mask, 0x55555555u);
+      const uint32_t spread = _pdep_u32(mask, 0x55555555u);
       return spread | (spread << 1);
    }
 #endif
 
-   /* Generic path for any multiplier. */
-   uint32_t new_mask = 0;
+   /* Avoid undefined shifts for pathological callers.
+    * For multiplier >= 32, only bit 0 can contribute to the low 32 bits.
+    */
+   if (multiplier >= 32)
+      return (mask & 1u) ? UINT32_MAX : 0u;
+
+   const uint32_t bit_run = (1u << multiplier) - 1u;
+   uint32_t new_mask = 0u;
+
    u_foreach_bit(i, mask) {
-      new_mask |= ((1u << multiplier) - 1u) << (i * multiplier);
+      const unsigned shift = i * multiplier;
+
+      /* Bits are visited in ascending order, so once the shift reaches 32,
+       * all remaining widened bits are out of range for the 32-bit result.
+       */
+      if (shift >= 32)
+         break;
+
+      new_mask |= bit_run << shift;
    }
+
    return new_mask;
 }
 
