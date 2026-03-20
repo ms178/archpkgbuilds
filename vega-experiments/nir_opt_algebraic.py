@@ -3023,9 +3023,13 @@ def ldexp(f, exp, bits):
 
 
 optimizations += [
-    (('ldexp@16', 'x', 'exp'), ldexp('x', 'exp', 16), 'options->lower_ldexp', TestStatus.UNSUPPORTED),
-    (('ldexp@32', 'x', 'exp'), ldexp('x', 'exp', 32), 'options->lower_ldexp', TestStatus.UNSUPPORTED),
-    (('ldexp@64', 'x', 'exp'), ldexp('x', 'exp', 64), 'options->lower_ldexp', TestStatus.UNSUPPORTED),
+   (('ldexp@16', 'x', 'exp'), ldexp('x', 'exp', 16), '!options->has_ldexp', TestStatus.UNSUPPORTED),
+   (('ldexp@32', 'x', 'exp'), ldexp('x', 'exp', 32), '!options->has_ldexp', TestStatus.UNSUPPORTED),
+   (('ldexp@64', 'x', 'exp'), ldexp('x', 'exp', 64), '!options->has_ldexp', TestStatus.UNSUPPORTED),
+   (('fexp2(contract)', ('i2f', 'a@8')), ('ldexp', 1.0, ('i2i32', a)), 'options->has_ldexp'),
+   (('fexp2(contract)', ('i2f', 'a@16')), ('ldexp', 1.0, ('i2i32', a)), 'options->has_ldexp'),
+   (('fexp2(contract)', ('i2f', 'a@32')), ('ldexp', 1.0, a), 'options->has_ldexp'),
+   (('fexp2(contract,ninf)', ('u2f', a)), ('ldexp', 1.0, ('u2u32', a)), 'options->has_ldexp'),
 ]
 
 
@@ -3594,6 +3598,11 @@ late_optimizations.extend([
       'g(is_not_const)'),
      ('ffmaz', ('fneg', a), b, ('ffmaz', ('fneg', c), d, ('ffmaz', ('fneg', e), 'f', 'g'))),
      '(info->stage != MESA_SHADER_VERTEX && info->stage != MESA_SHADER_GEOMETRY) && !options->intel_vec4'),
+
+    (('fmul(contract)', a, ('ldexp(is_used_once)', 1.0, b)), ('ldexp', a, b), 'options->has_ldexp'),
+    (('frcp(contract,ninf)', ('ldexp', 1.0, b)), ('ldexp', 1.0, ('ineg', b)), 'options->has_ldexp'),
+
+
 
     (('ubfe', a, b, 0), 0),
     (('ibfe', a, b, 0), 0),
