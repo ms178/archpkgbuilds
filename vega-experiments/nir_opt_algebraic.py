@@ -653,9 +653,12 @@ optimizations.extend([
    (('fge', ('fsat(is_used_once)', a), 1.0), ('fge', a, 1.0)),
    (('flt', 0.0, ('fsat(is_used_once)', a)), ('flt', 0.0, a)),
 
-   (('bcsel(is_only_used_as_float)', ('feq', a, 'b(is_not_zero)'), b, a), a),
-   (('bcsel(is_only_used_as_float)', ('fneu', a, 'b(is_not_zero)'), a, b), a),
-
+   (('bcsel', ('feq', a, 'b(is_a_number_not_zero)'), b, a), a),
+   (('bcsel', ('fneu', a, 'b(is_a_number_not_zero)'), a, b), a),
+   (('bcsel(is_only_used_as_float_nsz)', ('feq', a, 0.0), 0.0, a),  a),
+   (('bcsel(is_only_used_as_float_nsz)', ('fneu', a, 0.0), a, 0.0), a),
+   (('bcsel(is_only_used_as_float_nsz)', ('feq', a, 0.0), -0.0, a),  a),
+   (('bcsel(is_only_used_as_float_nsz)', ('fneu', a, 0.0), a, -0.0), a),
    (('bcsel', ('feq', a, 0), 0, ('fsat', ('fmul', a, 'b(is_a_number)'))), ('fsat(preserve_sz)', ('fmul', a, b))),
    (('bcsel', ('fneu', a, 0), ('fsat', ('fmul', a, 'b(is_a_number)')), 0), ('fsat(preserve_sz)', ('fmul', a, b))),
    (('bcsel', ('feq', a, 0), b, ('fadd', a, 'b(is_not_zero)')), ('fadd', a, b)),
@@ -1385,6 +1388,23 @@ for op in ('ior', 'iand', 'ixor'):
     ])
 
 
+for compare in [('fneu', a, 0.0), ('inot', ('feq', a, 0.0))]:
+    mod = [a, ('fneg', a), ('fabs', a), ('fneg', ('fabs', a))]
+
+    for i in range(len(mod)):
+        for neg_b2f in [False, True]:
+
+            search_mod = mod[i]
+            replace_mod = mod[i ^ int(neg_b2f)];
+            search_b2f = ('fneg', ('b2f', compare)) if neg_b2f else ('b2f', compare)
+
+            replace_mod_mul = ('fcanonicalize', a) if replace_mod == a else replace_mod
+
+            optimizations.extend([
+                (('fmul', search_b2f, search_mod), replace_mod_mul),
+                (('ffma', search_b2f, search_mod, b), ('fadd', replace_mod, b)),
+            ])
+
 optimizations.extend([
     (('feq', ('seq', a, b), 1.0), ('feq', a, b)),
     (('feq', ('sne', a, b), 1.0), ('fneu', a, b)),
@@ -1416,14 +1436,17 @@ optimizations.extend([
     (('ffma', ('b2f', 'a@1'), ('b2f', 'b@1'), c), ('fadd', ('b2f', ('iand', a, b)), c)),
     (('fadd', 1.0, ('fneg', ('b2f', a))), ('b2f', ('inot', a))),
     (('fadd(nsz)', -1.0, ('b2f', a)), ('fneg', ('b2f', ('inot', a)))),
-    (('fmul', ('b2f', ('fneu', a, 0)), a), ('fmul', 1.0, a)),
-    (('ffma', ('b2f', ('fneu', a, 0)), a, b), ('fadd', a, b)),
     (('fsat', ('fadd', ('b2f', 'a@1'), ('b2f', 'b@1'))), ('b2f', ('ior', a, b))),
     (('fsat', ('fadd', ('b2f', 'a@1'), ('fneg', ('b2f', 'b@1')))), ('b2f', ('iand', a, ('inot', b)))),
     (('fmax', ('fadd', ('b2f', 'a@1'), ('fneg', ('b2f', 'b@1'))), 0.0), ('b2f', ('iand', a, ('inot', b)))),
 
     (('iand', 'a@bool16', 1.0), ('b2f', a)),
     (('iand', 'a@bool32', 1.0), ('b2f', a)),
+
+    (('fmul(nsz,is_not_only_used_by_fadd)',  ('b2f', 'a@1'), 'b(is_finite)'),           ('bcsel', a, ('fcanonicalize', b), 0.0)),
+    (('fmul(nsz,is_not_only_used_by_fadd)',  ('fneg', ('b2f', 'a@1')), 'b(is_finite)'), ('bcsel', a, ('fneg', b), 0.0)),
+    (('fmulz(nsz,is_not_only_used_by_fadd)', ('b2f', 'a@1'), b),           ('bcsel', a, ('fcanonicalize', b), 0.0)),
+    (('fmulz(nsz,is_not_only_used_by_fadd)', ('fneg', ('b2f', 'a@1')), b), ('bcsel', a, ('fneg', b), 0.0)),
 
     (('ilt', a, a), False),
     (('ige', a, a), True),
