@@ -401,7 +401,15 @@ void RenderLoopPrivate::invalidateVrrState() noexcept
 void RenderLoopPrivate::updateVrrState() noexcept
 {
     if (!vrrStateDirty_) {
-        return;
+        if (trackedWindow_ != nullptr) {
+            SurfaceInterface *const live = resolvePresentationSurface(trackedWindow_.data());
+            if (live != trackedSurface_.data()) {
+                vrrStateDirty_ = true;
+            }
+        }
+        if (!vrrStateDirty_) {
+            return;
+        }
     }
     vrrStateDirty_ = false;
 
@@ -899,10 +907,6 @@ void RenderLoopPrivate::scheduleRepaint()
         return;
     }
 
-    if (trackedWindow_ != nullptr && resolvePresentationSurface(trackedWindow_.data()) != trackedSurface_.data()) {
-        vrrStateDirty_ = true;
-    }
-
     const int64_t nowNs = steadyNowNs();
     int64_t lastPresNs = lastPresentationTimestamp.count();
     if (lastPresNs <= 0 || lastPresNs > nowNs) [[unlikely]] {
@@ -942,7 +946,7 @@ void RenderLoopPrivate::scheduleRepaint()
     const int64_t vblankI64 = static_cast<int64_t>(vblankNs);
     int64_t nextPresNs = nowNs + compositeNs;
 
-    if (presentationMode == PresentationMode::VSync) [[unlikely]] {
+    if (presentationMode == PresentationMode::VSync) [[likely]] {
         const int64_t earliestReadyNs = nowNs + compositeNs;
         const int64_t nsFromLastPres = std::max(earliestReadyNs - lastPresNs, int64_t{1});
         int64_t targetVblank = static_cast<int64_t>(
@@ -1087,8 +1091,8 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
                                              OutputFrame *frame)
 {
     if (q->thread() != QThread::currentThread()) [[unlikely]] {
-        QMetaObject::invokeMethod(q, [this, timestamp, renderTime, mode, frame]() {
-            notifyFrameCompleted(timestamp, renderTime, mode, frame);
+        QMetaObject::invokeMethod(q, [this, timestamp, renderTime, mode]() {
+            notifyFrameCompleted(timestamp, renderTime, mode, nullptr);
         }, Qt::QueuedConnection);
         return;
     }
@@ -1321,8 +1325,8 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer *layer)
     (void)layer;
 
     if (thread() != QThread::currentThread()) [[unlikely]] {
-        QMetaObject::invokeMethod(this, [this, item, layer]() {
-            scheduleRepaint(item, layer);
+        QMetaObject::invokeMethod(this, [this]() {
+            scheduleRepaint(nullptr, nullptr);
         }, Qt::QueuedConnection);
         return;
     }
@@ -1337,10 +1341,6 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer *layer)
         return;
     }
 
-    if (d->trackedWindow_ != nullptr &&
-        resolvePresentationSurface(d->trackedWindow_.data()) != d->trackedSurface_.data()) {
-        d->vrrStateDirty_ = true;
-    }
     if (d->vrrStateDirty_) {
         d->updateVrrState();
     }
@@ -1358,11 +1358,12 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer *layer)
 
     const bool allowDelayedVrrControl =
         vrrActive &&
+        item != nullptr &&
         d->activeContentHint_ == VrrContentHint::Unknown &&
         d->interactiveGraceFrames_ == 0U &&
         d->cadenceStability_ < kCadenceStableThreshold;
 
-    if (allowDelayedVrrControl && item != nullptr && d->pendingFrameCount > 0) {
+    if (allowDelayedVrrControl && d->pendingFrameCount > 0) {
         const VrrStateCache::State state = d->vrrStateCache_.getState();
         if (state.isOnOutput != 0U) {
             Window *const tracked = d->trackedWindow_.data();
