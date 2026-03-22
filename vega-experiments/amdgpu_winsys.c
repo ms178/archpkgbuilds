@@ -44,7 +44,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(all_bos, "RADEON_ALL_BOS", false)
 static void
 amdgpu_destroy_kms_handles(struct amdgpu_screen_winsys *sws)
 {
-   if (!sws->kms_handles)
+   if (!sws || !sws->kms_handles)
       return;
 
    if (sws->fd >= 0) {
@@ -81,7 +81,10 @@ amdgpu_device_initialize_preferred_fd(int fd, bool is_virtio,
                                       uint32_t *drm_major, uint32_t *drm_minor,
                                       ac_drm_device **dev)
 {
-   int r;
+   int init_result;
+
+   if (fd < 0 || !drm_major || !drm_minor || !dev)
+      return false;
 
    *dev = NULL;
 
@@ -94,14 +97,16 @@ amdgpu_device_initialize_preferred_fd(int fd, bool is_virtio,
          free(render_device);
 
          if (render_fd >= 0) {
-            r = ac_drm_device_initialize(render_fd, is_virtio,
-                                         drm_major, drm_minor, dev);
-            if (r == 0) {
+            init_result = ac_drm_device_initialize(render_fd, is_virtio,
+                                                   drm_major, drm_minor, dev);
+            if (init_result == 0) {
+               const int device_fd = ac_drm_device_get_fd(*dev);
+
                /* If libdrm reused an existing device handle whose internal FD
                 * is not our temporary render-node FD, we still own render_fd
                 * and must close it here.
                 */
-               if (ac_drm_device_get_fd(*dev) != render_fd)
+               if (device_fd != render_fd)
                   close(render_fd);
 
                return true;
@@ -114,8 +119,8 @@ amdgpu_device_initialize_preferred_fd(int fd, bool is_virtio,
       }
    }
 
-   r = ac_drm_device_initialize(fd, is_virtio, drm_major, drm_minor, dev);
-   if (r) {
+   init_result = ac_drm_device_initialize(fd, is_virtio, drm_major, drm_minor, dev);
+   if (init_result != 0) {
       mesa_loge("amdgpu: amd%s_device_initialize failed.\n",
                 is_virtio ? "vgpu" : "gpu");
       return false;
@@ -133,8 +138,15 @@ amdgpu_winsys_early_cleanup(struct amdgpu_winsys *aws)
    if (aws->vm_timeline_syncobj && aws->dev)
       ac_drm_cs_destroy_syncobj(aws->dev, aws->vm_timeline_syncobj);
 
-   if (aws->bo_export_table)
+   if (aws->addrlib) {
+      ac_addrlib_destroy(aws->addrlib);
+      aws->addrlib = NULL;
+   }
+
+   if (aws->bo_export_table) {
       _mesa_hash_table_destroy(aws->bo_export_table, NULL);
+      aws->bo_export_table = NULL;
+   }
 
    simple_mtx_destroy(&aws->sws_list_lock);
 #if MESA_DEBUG
@@ -145,19 +157,22 @@ amdgpu_winsys_early_cleanup(struct amdgpu_winsys *aws)
    simple_mtx_destroy(&aws->bo_export_table_lock);
    simple_mtx_destroy(&aws->vm_ioctl_lock);
 
-   if (aws->dev)
+   if (aws->dev) {
       ac_drm_device_deinitialize(aws->dev);
+      aws->dev = NULL;
+   }
 
    FREE(aws);
 }
 
 /* Helper function to do the ioctls needed for setup and init. */
-static bool do_winsys_init(struct amdgpu_winsys *aws,
-                           const struct pipe_screen_config *config,
-                           int fd)
+static bool
+do_winsys_init(struct amdgpu_winsys *aws,
+               const struct pipe_screen_config *config,
+               int fd)
 {
-   const char * const r600_debug = debug_get_option("R600_DEBUG", "");
-   const char * const amd_debug = debug_get_option("AMD_DEBUG", "");
+   const char *const r600_debug = debug_get_option("R600_DEBUG", "");
+   const char *const amd_debug = debug_get_option("AMD_DEBUG", "");
 
    if (ac_query_gpu_info(fd, aws->dev, &aws->info, false) != AC_QUERY_GPU_INFO_SUCCESS) {
       mesa_loge("amdgpu: ac_query_gpu_info failed.\n");
@@ -197,14 +212,18 @@ static bool do_winsys_init(struct amdgpu_winsys *aws,
    return true;
 
 fail:
-   ac_drm_device_deinitialize(aws->dev);
-   aws->dev = NULL;
+   if (aws->addrlib) {
+      ac_addrlib_destroy(aws->addrlib);
+      aws->addrlib = NULL;
+   }
+
    return false;
 }
 
-static void do_winsys_deinit(struct amdgpu_winsys *aws)
+static void
+do_winsys_deinit(struct amdgpu_winsys *aws)
 {
-   if (aws->reserve_vmid)
+   if (aws->reserve_vmid && aws->dev)
       ac_drm_vm_unreserve_vmid(aws->dev, 0);
 
    if (aws->userq_job_log) {
@@ -254,7 +273,8 @@ static void do_winsys_deinit(struct amdgpu_winsys *aws)
    FREE(aws);
 }
 
-static void amdgpu_winsys_destroy_locked(struct radeon_winsys *rws, bool locked)
+static void
+amdgpu_winsys_destroy_locked(struct radeon_winsys *rws, bool locked)
 {
    struct amdgpu_screen_winsys *sws = amdgpu_screen_winsys(rws);
    struct amdgpu_winsys *aws = sws->aws;
@@ -271,8 +291,10 @@ static void amdgpu_winsys_destroy_locked(struct radeon_winsys *rws, bool locked)
 
    destroy = pipe_reference(&aws->reference, NULL);
    if (destroy && dev_tab) {
-      _mesa_hash_table_remove_key(dev_tab,
-                                  (void *)ac_drm_device_get_cookie(aws->dev));
+      if (aws->dev)
+         _mesa_hash_table_remove_key(dev_tab,
+                                     (void *)ac_drm_device_get_cookie(aws->dev));
+
       if (_mesa_hash_table_num_entries(dev_tab) == 0) {
          _mesa_hash_table_destroy(dev_tab, NULL);
          dev_tab = NULL;
@@ -722,10 +744,23 @@ amdgpu_winsys_create(int fd, const struct pipe_screen_config *config,
     * and link all drivers into one binary blob. */
    sws->base.screen = screen_create(&sws->base, config);
    if (!sws->base.screen) {
-      if (amdgpu_winsys_unref(&sws->base))
+      const bool last_sws_ref = amdgpu_winsys_unref(&sws->base);
+
+      if (last_sws_ref) {
          amdgpu_winsys_destroy_locked(&sws->base, true);
-      else
-         UNREACHABLE("screen_create failed with an unexpected extra winsys reference");
+      } else {
+         /* This should never happen, but don't abort the process in production.
+          * Detach the broken winsys so it can't be reused, then leak it rather
+          * than crashing the game.
+          */
+         simple_mtx_lock(&aws->sws_list_lock);
+         amdgpu_screen_winsys_remove_locked(sws);
+         simple_mtx_unlock(&aws->sws_list_lock);
+
+         os_log_message("amdgpu: screen_create failed while winsys still had "
+                        "unexpected extra references; detached leaked winsys "
+                        "instance.\n");
+      }
 
       simple_mtx_unlock(&dev_tab_mutex);
       return NULL;
@@ -746,7 +781,8 @@ fail_locked_new_aws:
    goto fail_locked_sws;
 
 fail_locked_dev:
-   ac_drm_device_deinitialize((void *)dev);
+   if (dev)
+      ac_drm_device_deinitialize((void *)dev);
 
 fail_locked_sws:
    if (dev_tab && _mesa_hash_table_num_entries(dev_tab) == 0) {
