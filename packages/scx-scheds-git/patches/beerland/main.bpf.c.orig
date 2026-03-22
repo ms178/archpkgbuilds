@@ -576,7 +576,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, s32 this_cpu, u64 
 	 *
 	 * This is required to support kernels <= 6.16.
 	 */
-	if (!bpf_ksym_exists(scx_bpf_select_cpu_and)) {
+	if (!__COMPAT_HAS_scx_bpf_select_cpu_and) {
 		bool is_idle = false;
 
 		/*
@@ -766,7 +766,7 @@ static bool dispatch_from_any_cpu(s32 from_cpu)
 		}
 	}
 
-	return min_vtime < ULLONG_MAX && scx_bpf_dsq_move_to_local(min_cpu);
+	return min_vtime < ULLONG_MAX && scx_bpf_dsq_move_to_local(min_cpu, 0);
 }
 
 /*
@@ -786,7 +786,7 @@ void BPF_STRUCT_OPS(beerland_dispatch, s32 cpu, struct task_struct *prev)
 	/*
 	 * Consume from the local DSQ.
 	 */
-	if (scx_bpf_dsq_move_to_local(cpu)) {
+	if (scx_bpf_dsq_move_to_local(cpu, 0)) {
 		__sync_fetch_and_add(&nr_local_dispatch, 1);
 		return;
 	}
