@@ -613,17 +613,12 @@ bool ScopBuilder::buildConditionSets(
     return buildConditionSets(BB, SI, L, Domain, InvalidDomainMap,
                               ConditionSets);
 
-  auto *BI = dyn_cast<BranchInst>(TI);
-  assert(BI && "Terminator was neither branch nor switch.");
-
-  if (BI->isUnconditional()) {
+  if (isa<UncondBrInst>(TI)) {
     ConditionSets.push_back(isl_set_copy(Domain));
     return true;
   }
 
-  Value *Condition = BI->getCondition();
-  assert(Condition && "No condition for Terminator");
-
+  Value *Condition = cast<CondBrInst>(TI)->getCondition();
   return buildConditionSets(BB, Condition, TI, L, Domain, InvalidDomainMap,
                             ConditionSets);
 }
@@ -810,22 +805,21 @@ bool ScopBuilder::addLoopBoundsToHeaderDomain(
     isl::set BackedgeCondition;
 
     Instruction *TI = LatchBB->getTerminator();
-    auto *BI = dyn_cast<BranchInst>(TI);
-    assert(BI && "Only branch instructions allowed in loop latches");
-
-    if (BI->isUnconditional()) {
+    if (isa<UncondBrInst>(TI)) {
       BackedgeCondition = LatchBBDom;
-    } else {
+    } else if (auto *BI = dyn_cast<CondBrInst>(TI)) {
       SmallVector<isl_set *, 8> ConditionSets;
-      unsigned Idx = BI->getSuccessor(0) != HeaderBB ? 1U : 0U;
+      int idx = BI->getSuccessor(0) != HeaderBB;
       if (!buildConditionSets(LatchBB, TI, L, LatchBBDom.get(),
                               InvalidDomainMap, ConditionSets))
         return false;
 
-      // Free the non backedge condition set as we do not need it.
-      isl_set_free(ConditionSets[1U - Idx]);
+      // Free the non back edge condition set as we do not need it.
+      isl_set_free(ConditionSets[1 - idx]);
 
-      BackedgeCondition = isl::manage(ConditionSets[Idx]);
+      BackedgeCondition = isl::manage(ConditionSets[idx]);
+    } else {
+      llvm_unreachable("Only branch instructions allowed in loop latches");
     }
 
     if (BackedgeCondition.is_null())
