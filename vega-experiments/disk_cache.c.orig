@@ -42,7 +42,7 @@
 #include "util/u_debug.h"
 #include "util/rand_xor.h"
 #include "util/u_atomic.h"
-#include "util/mesa-sha1.h"
+#include "util/mesa-blake3.h"
 #include "util/perf/cpu_trace.h"
 #include "util/ralloc.h"
 #include "util/compiler.h"
@@ -684,13 +684,13 @@ void
 disk_cache_compute_key(struct disk_cache *cache, const void *data, size_t size,
                        cache_key key)
 {
-   struct mesa_sha1 ctx;
+   blake3_hasher ctx;
 
-   _mesa_sha1_init(&ctx);
-   _mesa_sha1_update(&ctx, cache->driver_keys_blob,
+   _mesa_blake3_init(&ctx);
+   _mesa_blake3_update(&ctx, cache->driver_keys_blob,
                      cache->driver_keys_blob_size);
-   _mesa_sha1_update(&ctx, data, size);
-   _mesa_sha1_final(&ctx, key);
+   _mesa_blake3_update(&ctx, data, size);
+   _mesa_blake3_final(&ctx, key);
 }
 
 void
