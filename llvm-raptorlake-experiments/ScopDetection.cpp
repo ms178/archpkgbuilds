@@ -646,7 +646,7 @@ bool ScopDetection::isValidSwitch(BasicBlock &BB, SwitchInst *SI,
                                      ConditionSCEV, ConditionSCEV, SI);
 }
 
-bool ScopDetection::isValidBranch(BasicBlock &BB, BranchInst *BI,
+bool ScopDetection::isValidBranch(BasicBlock &BB, CondBrInst *BI,
                                   Value *Condition, bool IsLoopBranch,
                                   DetectionContext &Context) {
   // Constant integer conditions are always affine.
@@ -745,43 +745,31 @@ bool ScopDetection::isValidCFG(BasicBlock &BB, bool IsLoopBranch,
   Instruction *TI = BB.getTerminator();
   assert(TI && "BasicBlock must have a terminator");
 
-  // If unreachable blocks are explicitly allowed, accept an unreachable
-  // terminator without further checks.
   if (AllowUnreachable && isa<UnreachableInst>(TI)) {
     return true;
   }
 
-  // Return instructions are only valid if the region is the top-level region.
   if (isa<ReturnInst>(TI) && CurRegion.isTopLevelRegion()) {
     return true;
   }
 
-  // Extract the condition from the terminator, if any.
-  // For unconditional branches and other terminators this may be null.
-  Value *Condition = getConditionFromTerminator(TI);
+  if (isa<UncondBrInst>(TI))
+    return true;
 
-  if (!Condition) {
-    // Any terminator we cannot model via a condition is considered invalid
-    // for SCoP formation.
-    return invalid<ReportInvalidTerminator>(Context, /*Assert=*/true, &BB);
-  }
-
-  // UndefValue is not allowed as a condition.
-  if (isa<UndefValue>(Condition)) {
-    return invalid<ReportUndefCond>(Context, /*Assert=*/true, TI, &BB);
-  }
-
-  if (auto *BI = dyn_cast<BranchInst>(TI)) {
+  if (auto *BI = dyn_cast<CondBrInst>(TI)) {
+    Value *Condition = BI->getCondition();
+    if (isa<UndefValue>(Condition))
+      return invalid<ReportUndefCond>(Context, /*Assert=*/true, TI, &BB);
     return isValidBranch(BB, BI, Condition, IsLoopBranch, Context);
   }
 
   if (auto *SI = dyn_cast<SwitchInst>(TI)) {
+    Value *Condition = SI->getCondition();
+    if (isa<UndefValue>(Condition))
+      return invalid<ReportUndefCond>(Context, /*Assert=*/true, TI, &BB);
     return isValidSwitch(BB, SI, Condition, IsLoopBranch, Context);
   }
 
-  // Any other terminator (invoke, indirectbr, callbr, etc.) is not supported
-  // by the current SCoP detection logic. Instead of asserting, we gracefully
-  // reject the CFG at this point.
   return invalid<ReportInvalidTerminator>(Context, /*Assert=*/true, &BB);
 }
 
@@ -1006,7 +994,7 @@ ScopDetection::getDelinearizationTerms(DetectionContext &Context,
           collectParametricTerms(SE, AF2, Terms);
         }
         if (auto *AF2 = dyn_cast<SCEVMulExpr>(Op)) {
-          SmallVector<const SCEV *, 0> Operands;
+          SmallVector<SCEVUse, 0> Operands;
 
           for (const SCEV *MulOp : AF2->operands()) {
             if (auto *Const = dyn_cast<SCEVConstant>(MulOp)) {
