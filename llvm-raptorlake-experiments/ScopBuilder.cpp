@@ -437,9 +437,9 @@ bool ScopBuilder::buildConditionSets(
     DenseMap<BasicBlock *, isl::set> &InvalidDomainMap,
     SmallVectorImpl<__isl_give isl_set *> &ConditionSets) {
   Value *Condition = SI->getCondition();
+  assert(Condition && "No condition for switch");
 
-  isl_pw_aff *LHS, *RHS;
-  LHS = getPwAff(BB, InvalidDomainMap, SE.getSCEVAtScope(Condition, L));
+  isl_pw_aff *LHS = getPwAff(BB, InvalidDomainMap, SE.getSCEVAtScope(Condition, L));
 
   unsigned NumSuccessors = SI->getNumSuccessors();
   ConditionSets.resize(NumSuccessors);
@@ -447,7 +447,7 @@ bool ScopBuilder::buildConditionSets(
     unsigned Idx = Case.getSuccessorIndex();
     ConstantInt *CaseValue = Case.getCaseValue();
 
-    RHS = getPwAff(BB, InvalidDomainMap, SE.getSCEV(CaseValue));
+    isl_pw_aff *RHS = getPwAff(BB, InvalidDomainMap, SE.getSCEV(CaseValue));
     isl_set *CaseConditionSet =
         buildConditionSet(ICmpInst::ICMP_EQ, isl::manage_copy(LHS),
                           isl::manage(RHS))
@@ -458,13 +458,12 @@ bool ScopBuilder::buildConditionSets(
 
   assert(ConditionSets[0] == nullptr && "Default condition set was set");
   isl_set *ConditionSetUnion = isl_set_copy(ConditionSets[1]);
-  for (unsigned u = 2; u < NumSuccessors; u++)
+  for (unsigned U = 2; U < NumSuccessors; ++U)
     ConditionSetUnion =
-        isl_set_union(ConditionSetUnion, isl_set_copy(ConditionSets[u]));
+        isl_set_union(ConditionSetUnion, isl_set_copy(ConditionSets[U]));
   ConditionSets[0] = isl_set_subtract(isl_set_copy(Domain), ConditionSetUnion);
 
   isl_pw_aff_free(LHS);
-
   return true;
 }
 
@@ -475,7 +474,7 @@ bool ScopBuilder::buildConditionSets(
     SmallVectorImpl<__isl_give isl_set *> &ConditionSets) {
   isl_set *ConsequenceCondSet = nullptr;
 
-  if (auto Load = dyn_cast<LoadInst>(Condition)) {
+  if (auto *Load = dyn_cast<LoadInst>(Condition)) {
     const SCEV *LHSSCEV = SE.getSCEVAtScope(Load, L);
     const SCEV *RHSSCEV = SE.getZero(LHSSCEV->getType());
     bool NonNeg = false;
@@ -500,7 +499,7 @@ bool ScopBuilder::buildConditionSets(
       ConsequenceCondSet = isl_set_empty(isl_set_get_space(Domain));
     else
       ConsequenceCondSet = isl_set_universe(isl_set_get_space(Domain));
-  } else if (BinaryOperator *BinOp = dyn_cast<BinaryOperator>(Condition)) {
+  } else if (auto *BinOp = dyn_cast<BinaryOperator>(Condition)) {
     auto Opcode = BinOp->getOpcode();
     assert(Opcode == Instruction::And || Opcode == Instruction::Or);
 
@@ -530,13 +529,12 @@ bool ScopBuilder::buildConditionSets(
 
     Region &R = scop->getRegion();
 
-    isl_pw_aff *LHS, *RHS;
     // For unsigned comparisons we assumed the signed bit of neither operand
     // to be set. The comparison is equal to a signed comparison under this
     // assumption.
     bool NonNeg = ICond->isUnsigned();
-    const SCEV *LeftOperand = SE.getSCEVAtScope(ICond->getOperand(0), L),
-               *RightOperand = SE.getSCEVAtScope(ICond->getOperand(1), L);
+    const SCEV *LeftOperand = SE.getSCEVAtScope(ICond->getOperand(0), L);
+    const SCEV *RightOperand = SE.getSCEVAtScope(ICond->getOperand(1), L);
 
     LeftOperand = tryForwardThroughPHI(LeftOperand, R, SE, &SD);
     RightOperand = tryForwardThroughPHI(RightOperand, R, SE, &SD);
@@ -562,13 +560,15 @@ bool ScopBuilder::buildConditionSets(
           buildUnsignedConditionSets(BB, Condition, Domain, RightOperand,
                                      LeftOperand, InvalidDomainMap, false);
       break;
-    default:
-      LHS = getPwAff(BB, InvalidDomainMap, LeftOperand, NonNeg);
-      RHS = getPwAff(BB, InvalidDomainMap, RightOperand, NonNeg);
-      ConsequenceCondSet = buildConditionSet(ICond->getPredicate(),
-                                             isl::manage(LHS), isl::manage(RHS))
-                               .release();
+    default: {
+      isl_pw_aff *LHS = getPwAff(BB, InvalidDomainMap, LeftOperand, NonNeg);
+      isl_pw_aff *RHS = getPwAff(BB, InvalidDomainMap, RightOperand, NonNeg);
+      ConsequenceCondSet =
+          buildConditionSet(ICond->getPredicate(), isl::manage(LHS),
+                            isl::manage(RHS))
+              .release();
       break;
+    }
     }
   }
 
@@ -609,16 +609,21 @@ bool ScopBuilder::buildConditionSets(
     BasicBlock *BB, Instruction *TI, Loop *L, __isl_keep isl_set *Domain,
     DenseMap<BasicBlock *, isl::set> &InvalidDomainMap,
     SmallVectorImpl<__isl_give isl_set *> &ConditionSets) {
-  if (SwitchInst *SI = dyn_cast<SwitchInst>(TI))
+  if (auto *SI = dyn_cast<SwitchInst>(TI))
     return buildConditionSets(BB, SI, L, Domain, InvalidDomainMap,
                               ConditionSets);
 
-  if (isa<UncondBrInst>(TI)) {
+  auto *BI = dyn_cast<BranchInst>(TI);
+  assert(BI && "Terminator was neither branch nor switch.");
+
+  if (BI->isUnconditional()) {
     ConditionSets.push_back(isl_set_copy(Domain));
     return true;
   }
 
-  Value *Condition = cast<CondBrInst>(TI)->getCondition();
+  Value *Condition = BI->getCondition();
+  assert(Condition && "No condition for Terminator");
+
   return buildConditionSets(BB, Condition, TI, L, Domain, InvalidDomainMap,
                             ConditionSets);
 }
@@ -805,22 +810,23 @@ bool ScopBuilder::addLoopBoundsToHeaderDomain(
     isl::set BackedgeCondition;
 
     Instruction *TI = LatchBB->getTerminator();
+    auto *BI = dyn_cast<BranchInst>(TI);
+    assert(BI && "Only branch instructions allowed in loop latches");
 
-    if (isa<UncondBrInst>(TI))
+    if (BI->isUnconditional()) {
       BackedgeCondition = LatchBBDom;
-    } else if (auto *BI = dyn_cast<CondBrInst>(TI)) {
+    } else {
       SmallVector<isl_set *, 8> ConditionSets;
-      int idx = BI->getSuccessor(0) != HeaderBB;
+      unsigned Idx = BI->getSuccessor(0) != HeaderBB ? 1U : 0U;
       if (!buildConditionSets(LatchBB, TI, L, LatchBBDom.get(),
                               InvalidDomainMap, ConditionSets))
         return false;
 
-      // Free the non back edge condition set as we do not need it.
-      isl_set_free(ConditionSets[1 - idx]);
+      // Free the non backedge condition set as we do not need it.
+      isl_set_free(ConditionSets[1U - Idx]);
 
-      BackedgeCondition = isl::manage(ConditionSets[idx]);
-    } else
-      llvm_unreachable("Only branch instructions allowed in loop latches");
+      BackedgeCondition = isl::manage(ConditionSets[Idx]);
+    }
 
     if (BackedgeCondition.is_null())
       continue;
@@ -841,8 +847,8 @@ bool ScopBuilder::addLoopBoundsToHeaderDomain(
   if (ForwardMap.is_null())
     return false;
 
-  for (int i = 0; i < LoopDepth; i++) {
-    ForwardMap = ForwardMap.equate(isl::dim::in, i, isl::dim::out, i);
+  for (int I = 0; I < LoopDepth; ++I) {
+    ForwardMap = ForwardMap.equate(isl::dim::in, I, isl::dim::out, I);
     if (ForwardMap.is_null())
       return false;
   }
