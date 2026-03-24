@@ -3170,6 +3170,30 @@ vop3_can_use_vop2acc(ra_ctx& ctx, Instruction* instr)
 }
 
 bool
+dot2_can_use_vopd(ra_ctx& ctx, Instruction* instr)
+{
+   if (instr->opcode != aco_opcode::v_dot2_f32_f16 && instr->opcode != aco_opcode::v_dot2_f32_bf16)
+      return false;
+   if (instr->format != Format::VOP3P || ctx.program->wave_size == 64 ||
+       ctx.program->gfx_level < GFX11 || instr->valu().clamp)
+      return false;
+
+   if (!instr->operands[2].isOfType(RegType::vgpr) || !instr->operands[2].isKillBeforeDef() ||
+       (!instr->operands[0].isOfType(RegType::vgpr) && !instr->operands[1].isOfType(RegType::vgpr)))
+      return false;
+
+   for (unsigned i = 0; i < 3; i++) {
+      if (instr->operands[i].isConstant())
+         continue;
+      if (instr->valu().neg_lo[i] || instr->valu().neg_hi[i] || instr->valu().opsel_lo[i] ||
+          !instr->valu().opsel_hi[i])
+         return false;
+   }
+
+   return true;
+}
+
+bool
 sop2_can_use_sopk(ra_ctx& ctx, Instruction* instr)
 {
    if (instr->opcode != aco_opcode::s_add_i32 && instr->opcode != aco_opcode::s_add_u32 &&
@@ -3341,7 +3365,8 @@ get_affinities(ra_ctx& ctx)
                op = instr->operands[i];
             } else if (i < tied_defs.size()) {
                op = instr->operands[tied_defs[i]];
-            } else if (vop3_can_use_vop2acc(ctx, instr.get())) {
+            } else if (vop3_can_use_vop2acc(ctx, instr.get()) ||
+                       dot2_can_use_vopd(ctx, instr.get())) {
                op = instr->operands[2];
             } else if (i == 0 && sop2_can_use_sopk(ctx, instr.get())) {
                op = instr->operands[instr->operands[0].isLiteral()];
@@ -3493,6 +3518,27 @@ get_affinities(ra_ctx& ctx)
    }
 }
 
+bool
+affinity_blocks_tied_def0(const ra_ctx& ctx, const RegisterFile& register_file,
+                          const Instruction* instr, unsigned op_idx)
+{
+   unsigned def_id = instr->definitions[0].tempId();
+   if (ctx.assignments[def_id].affinity) {
+      const assignment& affinity = ctx.assignments[ctx.assignments[def_id].affinity];
+      if (affinity.assigned && affinity.reg != instr->operands[op_idx].physReg() &&
+          (!register_file.test(affinity.reg, instr->operands[op_idx].bytes()) ||
+           std::any_of(instr->operands.begin(), instr->operands.end(), [&](Operand op)
+                       { return op.isKillBeforeDef() && op.physReg() == affinity.reg; })))
+         return true;
+   } else if (ctx.assignments[def_id].precolor_affinity) {
+      if (ctx.assignments[def_id].reg != instr->operands[op_idx].physReg())
+         return true;
+   } else if (BITSET_TEST(ctx.preserved, instr->operands[op_idx].physReg())) {
+      return true;
+   }
+   return false;
+}
+
 void
 optimize_encoding_vop2(ra_ctx& ctx, RegisterFile& register_file, aco_ptr<Instruction>& instr)
 {
@@ -3504,18 +3550,8 @@ optimize_encoding_vop2(ra_ctx& ctx, RegisterFile& register_file, aco_ptr<Instruc
          return;
    }
 
-   unsigned def_id = instr->definitions[0].tempId();
-   if (ctx.assignments[def_id].affinity) {
-      assignment& affinity = ctx.assignments[ctx.assignments[def_id].affinity];
-      if (affinity.assigned && affinity.reg != instr->operands[2].physReg() &&
-          (!register_file.test(affinity.reg, instr->operands[2].bytes()) ||
-           std::any_of(instr->operands.begin(), instr->operands.end(), [&](Operand op)
-                       { return op.isKillBeforeDef() && op.physReg() == affinity.reg; })))
-         return;
-   } else if (ctx.assignments[def_id].precolor_affinity) {
-      if (ctx.assignments[def_id].reg != instr->operands[2].physReg())
-         return;
-   }
+   if (affinity_blocks_tied_def0(ctx, register_file, instr.get(), 2))
+      return;
 
    if (!instr->operands[1].isOfType(RegType::vgpr))
       instr->valu().swapOperands(0, 1);
@@ -3558,18 +3594,8 @@ optimize_encoding_sopk(ra_ctx& ctx, RegisterFile& register_file, aco_ptr<Instruc
    if (!is_sgpr_writable_without_side_effects(ctx.program->gfx_level, op_reg))
       return;
 
-   unsigned def_id = instr->definitions[0].tempId();
-   if (ctx.assignments[def_id].affinity) {
-      assignment& affinity = ctx.assignments[ctx.assignments[def_id].affinity];
-      if (affinity.assigned && affinity.reg != op_reg &&
-          (!register_file.test(affinity.reg, instr->operands[!literal_idx].bytes()) ||
-           std::any_of(instr->operands.begin(), instr->operands.end(), [&](Operand op)
-                       { return op.isKillBeforeDef() && op.physReg() == affinity.reg; })))
-         return;
-   } else if (ctx.assignments[def_id].precolor_affinity) {
-      if (ctx.assignments[def_id].reg != op_reg)
-         return;
-   }
+   if (affinity_blocks_tied_def0(ctx, register_file, instr.get(), !literal_idx))
+      return;
 
    instr->format = Format::SOPK;
    instr->salu().imm = instr->operands[literal_idx].constantValue() & 0xffff;
@@ -4224,6 +4250,9 @@ register_allocation(Program* program, ra_test_policy policy)
                 * Here we set a policy of forcing them the same if operands[2] gets killed (and
                 * otherwise they don't overlap). This may not be optimal if RA would select a
                 * different location due to affinity, but that gets complicated very quickly. */
+               definition->setFixed(instr->operands[2].physReg());
+            } else if (dot2_can_use_vopd(ctx, instr.get()) &&
+                       !affinity_blocks_tied_def0(ctx, register_file, instr.get(), 2)) {
                definition->setFixed(instr->operands[2].physReg());
             }
 
