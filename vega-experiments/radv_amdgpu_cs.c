@@ -63,12 +63,8 @@
 
 /* Thresholds/tuning knobs. */
 #define RADV_MAX_IBS_PER_SUBMIT 192
-#define BUFFER_HASH_TABLE_SIZE 1024
-#define VIRTUAL_BUFFER_HASH_TABLE_SIZE 1024
 /* Optimized: Lower threshold for hash-based BO dedup (cache-friendly for small lists). */
 #define RADV_SMALL_BO_DEDUP_THRESHOLD 128u
-/* Only use AVX2 non-temporal streaming for big copies where it pays off. */
-#define RADV_NT_STREAM_THRESHOLD_BYTES 32768u /* 32 KiB */
 
 /* Maximum hash table size to prevent excessive memory usage. */
 #define RADV_MAX_HASH_TABLE_SIZE 8192u
@@ -126,37 +122,26 @@ _Static_assert((sizeof(struct radv_buffer_hash_entry) * 4) == 64,
                "4 entries must fit exactly in 64-byte cache line");
 
 /*
- * OPTIMIZATION 3: Cache-Optimized `radv_amdgpu_cs` Struct Layout
+ * OPTIMIZATION: Cache-Optimized `radv_amdgpu_cs` Struct Layout
  *
- * The fields of this struct have been meticulously reordered to improve cache
- * performance on modern CPUs (e.g., Intel Raptor Lake).
+ * The fields of this struct have been reordered to improve cache
+ * performance on modern CPUs.
  *
  * - Hot data used in every command emission or buffer addition is packed into
  *   the first one or two cache lines (64/128 bytes).
  * - Warm data is grouped next.
- * - Cold data, used only for debugging or rare paths, is placed at the end
- *   to avoid polluting the cache.
- *
- * This minimizes cache misses in performance-critical paths.
+ * - Cold data, used only for debugging or rare paths, is placed at the end.
  */
 struct radv_amdgpu_cs {
    /* --- CACHE LINE 1: Hottest data --- */
-   /* `base` must be first for ABI compatibility. It contains the most frequently
-    * modified fields: `buf` (destination pointer) and `cdw` (dword cursor).
-    */
    struct ac_cmdbuf base;
 
-   /* `ws` is needed for growing, `status` is checked frequently.
-    * `num_buffers` is incremented on every unique buffer addition.
-    * `ib_buffer` points to the current command buffer BO.
-    */
    struct radv_amdgpu_winsys *ws;
    VkResult status;
    unsigned num_buffers;
    struct radeon_winsys_bo *ib_buffer;
 
    /* --- CACHE LINE 2: Warm data --- */
-   /* These fields are used frequently, but less so than the `cdw` cursor. */
    unsigned max_num_buffers;
    struct drm_amdgpu_bo_list_entry *handles;
    uint32_t *ib_size_ptr;
@@ -167,7 +152,6 @@ struct radv_amdgpu_cs {
    uint32_t buffer_hash_table_size;
 
    /* --- COLD DATA: Infrequently accessed --- */
-   /* This data is not on the critical path of command emission. */
    uint8_t *ib_mapped;
    struct radv_amdgpu_cs_ib_info ib;
 
@@ -177,11 +161,6 @@ struct radv_amdgpu_cs {
 
    bool is_secondary;
    struct radv_amdgpu_cs *chained_to;
-
-   unsigned num_virtual_buffers;
-   unsigned max_num_virtual_buffers;
-   struct radeon_winsys_bo **virtual_buffers;
-   int *virtual_buffer_hash_table;
 
    /* The buffer hash table is large and placed at the end. */
    struct radv_buffer_hash_entry *buffer_hash_table;
@@ -308,8 +287,6 @@ radv_amdgpu_cs_destroy(struct ac_cmdbuf *rcs)
    }
 
    free(cs->ib_buffers);
-   free(cs->virtual_buffers);
-   free(cs->virtual_buffer_hash_table);
    free(cs->handles);
    free(cs->buffer_hash_table);
    free(cs);
@@ -655,8 +632,13 @@ radv_amdgpu_cs_finalize(struct ac_cmdbuf *_cs)
    assert(cs->base.cdw <= cs->base.reserved_dw);
 
    if (cs->chain_ib) {
+      /* Pad with NOPs but leave 4 dwords for INDIRECT_BUFFER. */
       radv_amdgpu_winsys_cs_pad(_cs, 4);
+
+      /* Emit 4 dwords of NOP, these will be replaced by the chaining INDIRECT_BUFFER. */
       radv_amdgpu_cs_emit_nops(cs, 4);
+
+      assert(cs->base.cdw <= ~C_3F2_IB_SIZE);
       *cs->ib_size_ptr |= cs->base.cdw;
    } else {
       radv_amdgpu_winsys_cs_pad(_cs, 0);
@@ -689,16 +671,7 @@ radv_amdgpu_cs_reset(struct ac_cmdbuf *_cs)
       memset(cs->buffer_hash_table, 0, sizeof(struct radv_buffer_hash_entry) * cs->buffer_hash_table_size);
    }
 
-   /* FIX: Add null check before accessing virtual buffer hash table. */
-   if (cs->virtual_buffer_hash_table) {
-      for (unsigned i = 0; i < cs->num_virtual_buffers; ++i) {
-         unsigned hash = ((uintptr_t)cs->virtual_buffers[i] >> 6) & (VIRTUAL_BUFFER_HASH_TABLE_SIZE - 1);
-         cs->virtual_buffer_hash_table[hash] = -1;
-      }
-   }
-
    cs->num_buffers = 0;
-   cs->num_virtual_buffers = 0;
 
    /* When the CS is finalized and IBs are not allowed, use last IB. */
    assert(cs->ib_buffer || cs->num_ib_buffers);
@@ -825,10 +798,9 @@ radv_amdgpu_cs_find_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle)
       struct radv_buffer_hash_entry *entry = &cs->buffer_hash_table[pos];
 
       /*
-       * CRITICAL: Prefetch 2 entries ahead.
-       * Raptor Lake L1 latency is ~5 cycles. At ~2 cycles per iteration,
+       * Prefetch 2 entries ahead.
+       * L1 latency is ~5 cycles. At ~2 cycles per iteration,
        * prefetching 2 ahead ensures data arrives just when needed.
-       * Prefetching more wastes cache bandwidth; less causes stalls.
        */
       if (dist < 32u) {
          __builtin_prefetch(&cs->buffer_hash_table[(hash + dist + 2u) & mask], 0, 2);
@@ -849,7 +821,6 @@ radv_amdgpu_cs_find_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle)
           * Robin Hood invariant check:
           * If our probe distance exceeds this entry's distance,
           * the element cannot exist (would have displaced this entry).
-          * This is the key property that makes Robin Hood O(1) average.
           */
          const uint32_t entry_hash = entry->hash_cached;
          const uint32_t entry_dist = (pos - (entry_hash & mask) + cs->buffer_hash_table_size) & mask;
@@ -867,7 +838,6 @@ radv_amdgpu_cs_find_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle)
       /*
        * Failsafe: table should never be full with proper load factor.
        * If we've probed all slots, fall back to linear search.
-       * This handles pathological hash collisions gracefully.
        */
       if (unlikely(dist >= cs->buffer_hash_table_size)) {
          for (unsigned i = 0; i < cs->num_buffers; ++i) {
@@ -938,7 +908,6 @@ radv_amdgpu_cs_insert_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle, int 
        * Robin Hood displacement:
        * If new entry has traveled farther than existing entry,
        * swap them and continue inserting the displaced entry.
-       * This minimizes maximum probe distance across all entries.
        */
       const uint32_t entry_hash = entry->hash_cached;
       const uint32_t entry_dist = (pos - (entry_hash & mask) + cs->buffer_hash_table_size) & mask;
@@ -949,7 +918,6 @@ radv_amdgpu_cs_insert_buffer(struct radv_amdgpu_cs *cs, uint32_t bo_handle, int 
          *entry = new_entry;
          new_entry = tmp;
          dist = entry_dist;
-         /* hash already correct in new_entry.hash_cached */
       }
 
       dist++;
@@ -1005,7 +973,7 @@ radv_amdgpu_cs_resize_buffer_hash_table(struct radv_amdgpu_cs *cs)
 
          /* Check for insertion failure during rehash */
          if (unlikely(cs->status != VK_SUCCESS)) {
-            /* CRITICAL: Restore old table on failure */
+            /* Restore old table on failure */
             free(new_table);
             cs->buffer_hash_table = old_table;
             cs->buffer_hash_table_size = old_size;
@@ -1035,7 +1003,6 @@ radv_amdgpu_cs_add_buffer_internal(struct radv_amdgpu_cs *cs, uint32_t bo, uint8
    /*
     * Resize hash table at 50% load factor.
     * This is optimal for Robin Hood hashing (minimizes probe distance).
-    * All overflow checks use C23 __builtin_mul_overflow.
     */
    if (cs->buffer_hash_table != NULL && cs->num_buffers > 0) {
       uint32_t doubled;
@@ -1098,135 +1065,6 @@ radv_amdgpu_cs_add_buffer_internal(struct radv_amdgpu_cs *cs, uint32_t bo, uint8
    __atomic_thread_fence(__ATOMIC_RELEASE);
 }
 
-static void *
-radv_aligned_alloc_portable(size_t alignment, size_t size)
-{
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__ANDROID__)
-   /* C11 aligned_alloc - requires size be multiple of alignment */
-   const size_t aligned_size = (size + alignment - 1u) & ~(alignment - 1u);
-   return aligned_alloc(alignment, aligned_size);
-#elif defined(_GNU_SOURCE) || defined(__USE_POSIX199506)
-   /* POSIX posix_memalign */
-   void *ptr = NULL;
-   const int ret = posix_memalign(&ptr, alignment, size);
-   return (ret == 0) ? ptr : NULL;
-#else
-   /* Manual alignment with original pointer tracking */
-   void *raw = malloc(size + alignment - 1u + sizeof(void *));
-   if (unlikely(raw == NULL)) {
-      return NULL;
-   }
-
-   /* Calculate aligned address */
-   void **ptr = (void **)(((uintptr_t)raw + sizeof(void *) + alignment - 1u) & ~(alignment - 1u));
-   ptr[-1] = raw; /* Store original pointer for free() */
-   return ptr;
-#endif
-}
-
-static void
-radv_aligned_free_portable(void *ptr)
-{
-   if (unlikely(ptr == NULL)) {
-      return;
-   }
-
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__ANDROID__)
-   free(ptr);
-#elif defined(_GNU_SOURCE) || defined(__USE_POSIX199506)
-   free(ptr);
-#else
-   /* Retrieve original pointer for manual alignment case */
-   void **p = (void **)ptr;
-   free(p[-1]);
-#endif
-}
-
-static void
-radv_amdgpu_cs_add_virtual_buffer(struct ac_cmdbuf *_cs, struct radeon_winsys_bo *bo)
-{
-   struct radv_amdgpu_cs *cs = radv_amdgpu_cs(_cs);
-
-   /* Null check */
-   if (unlikely(bo == NULL)) {
-      return;
-   }
-
-   /* Hash from aligned pointer (shift right 6 for 64-byte alignment) */
-   const unsigned hash = ((uintptr_t)bo >> 6) & (VIRTUAL_BUFFER_HASH_TABLE_SIZE - 1u);
-
-   /* Lazy initialization of hash table */
-   if (unlikely(cs->virtual_buffer_hash_table == NULL)) {
-      const size_t alignment = 64u; /* Cache line size */
-      const size_t size = VIRTUAL_BUFFER_HASH_TABLE_SIZE * sizeof(int);
-
-      int *table = radv_aligned_alloc_portable(alignment, size);
-      if (unlikely(table == NULL)) {
-         cs->status = VK_ERROR_OUT_OF_HOST_MEMORY;
-         return;
-      }
-
-      /* Initialize all slots to -1 (empty) */
-      for (int i = 0; i < VIRTUAL_BUFFER_HASH_TABLE_SIZE; ++i) {
-         table[i] = -1;
-      }
-
-      cs->virtual_buffer_hash_table = table;
-   }
-
-   /* Fast path: check cached hash slot */
-   const int cached_idx = cs->virtual_buffer_hash_table[hash];
-   if (cached_idx >= 0 && (unsigned)cached_idx < cs->num_virtual_buffers) {
-      if (cs->virtual_buffers[cached_idx] == bo) {
-         return; /* Already present */
-      }
-   }
-
-   /* Linear search for collision or verification */
-   for (unsigned i = 0; i < cs->num_virtual_buffers; ++i) {
-      if (cs->virtual_buffers[i] == bo) {
-         /* Update cache to point to correct index */
-         cs->virtual_buffer_hash_table[hash] = (int)i;
-         return;
-      }
-   }
-
-   /* Not found - add new entry */
-   if (cs->num_virtual_buffers >= cs->max_num_virtual_buffers) {
-      uint32_t new_max;
-
-      if (cs->max_num_virtual_buffers == 0) {
-         new_max = 8u;
-      } else if (__builtin_mul_overflow(cs->max_num_virtual_buffers, 2u, &new_max)) {
-         cs->status = VK_ERROR_OUT_OF_HOST_MEMORY;
-         return;
-      }
-
-      size_t alloc_size;
-      if (__builtin_mul_overflow((size_t)new_max, sizeof(struct radeon_winsys_bo *), &alloc_size)) {
-         cs->status = VK_ERROR_OUT_OF_HOST_MEMORY;
-         return;
-      }
-
-      struct radeon_winsys_bo **new_array = realloc(cs->virtual_buffers, alloc_size);
-      if (unlikely(new_array == NULL)) {
-         cs->status = VK_ERROR_OUT_OF_HOST_MEMORY;
-         return;
-      }
-
-      cs->virtual_buffers = new_array;
-      cs->max_num_virtual_buffers = new_max;
-   }
-
-   /* Add new virtual buffer */
-   const unsigned idx = cs->num_virtual_buffers++;
-   cs->virtual_buffers[idx] = bo;
-   cs->virtual_buffer_hash_table[hash] = (int)idx;
-
-   /* Memory barrier for visibility */
-   __atomic_thread_fence(__ATOMIC_RELEASE);
-}
-
 static void
 radv_amdgpu_cs_add_buffer(struct ac_cmdbuf *_cs, struct radeon_winsys_bo *_bo)
 {
@@ -1243,15 +1081,8 @@ radv_amdgpu_cs_add_buffer(struct ac_cmdbuf *_cs, struct radeon_winsys_bo *_bo)
       return;
    }
 
-   /*
-    * Branch hint: virtual buffers are rare compared to regular buffers.
-    * This hint is based on profiling DXVK/VKD3D workloads.
-    * Typical ratio: 95% regular, 5% virtual.
-    */
-   if (unlikely(bo->base.is_virtual)) {
-      radv_amdgpu_cs_add_virtual_buffer(_cs, _bo);
+   if (unlikely(bo->base.is_virtual))
       return;
-   }
 
    /* Common path: regular buffer addition */
    radv_amdgpu_cs_add_buffer_internal(cs, bo->bo_handle, bo->priority);
@@ -1306,10 +1137,6 @@ radv_amdgpu_cs_execute_secondary(struct ac_cmdbuf *_parent, struct ac_cmdbuf *_c
 
    for (unsigned i = 0; i < child->num_buffers; ++i) {
       radv_amdgpu_cs_add_buffer_internal(parent, child->handles[i].bo_handle, child->handles[i].bo_priority);
-   }
-
-   for (unsigned i = 0; i < child->num_virtual_buffers; ++i) {
-      radv_amdgpu_cs_add_buffer(&parent->base, child->virtual_buffers[i]);
    }
 
    if (use_ib2) {
@@ -1469,9 +1296,6 @@ radv_amdgpu_count_cs_bo(struct radv_amdgpu_cs *start_cs)
 
    for (struct radv_amdgpu_cs *cs = start_cs; cs; cs = cs->chained_to) {
       num_bo += cs->num_buffers;
-      for (unsigned j = 0; j < cs->num_virtual_buffers; ++j) {
-         num_bo += radv_amdgpu_winsys_bo(cs->virtual_buffers[j])->bo_count;
-      }
    }
 
    return num_bo;
@@ -1609,24 +1433,14 @@ radv_amdgpu_add_cs_to_bo_list(struct radv_amdgpu_cs *cs,
       return num_handles;
    }
 
-   /* Fast path: first CS with no virtual buffers - direct copy */
-   if (num_handles == 0 && cs->num_virtual_buffers == 0) {
-      /* Validate no overflow */
-      if (unlikely(cs->num_buffers > UINT32_MAX - num_handles)) {
-         return num_handles;
-      }
-
+   /* Fast path: first CS - direct copy */
+   if (num_handles == 0) {
       memcpy(handles, cs->handles, cs->num_buffers * sizeof(struct drm_amdgpu_bo_list_entry));
       return cs->num_buffers;
    }
 
    /* Add regular buffers with AVX2-accelerated deduplication */
    for (unsigned j = 0; j < cs->num_buffers; ++j) {
-      /* Overflow check */
-      if (unlikely(num_handles >= UINT32_MAX)) {
-         break;
-      }
-
       /* Use AVX2 search for deduplication */
       const int idx = radv_linear_search_bo_avx2(handles, num_handles, cs->handles[j].bo_handle);
 
@@ -1634,36 +1448,6 @@ radv_amdgpu_add_cs_to_bo_list(struct radv_amdgpu_cs *cs,
          /* New buffer - add it */
          handles[num_handles++] = cs->handles[j];
       }
-      /* If idx >= 0, buffer already exists - skip duplicate */
-   }
-
-   /* Add virtual buffers (expanded to constituent BOs) */
-   for (unsigned j = 0; j < cs->num_virtual_buffers; ++j) {
-      struct radv_amdgpu_winsys_bo *virtual_bo = radv_amdgpu_winsys_bo(cs->virtual_buffers[j]);
-
-      /* Acquire read lock for concurrent access safety */
-      u_rwlock_rdlock(&virtual_bo->lock);
-
-      for (unsigned k = 0; k < virtual_bo->bo_count; ++k) {
-         /* Overflow check */
-         if (unlikely(num_handles >= UINT32_MAX)) {
-            u_rwlock_rdunlock(&virtual_bo->lock);
-            return num_handles;
-         }
-
-         struct radv_amdgpu_winsys_bo *bo = virtual_bo->bos[k];
-
-         /* Dedup check with AVX2 search */
-         const int idx = radv_linear_search_bo_avx2(handles, num_handles, bo->bo_handle);
-
-         if (idx < 0) {
-            handles[num_handles].bo_handle = bo->bo_handle;
-            handles[num_handles].bo_priority = bo->priority;
-            num_handles++;
-         }
-      }
-
-      u_rwlock_rdunlock(&virtual_bo->lock);
    }
 
    return num_handles;
@@ -1805,29 +1589,12 @@ radv_append_cs_bos_dedup(struct radv_amdgpu_cs *cs,
                          unsigned *p_num_handles,
                          struct radv_bo_set *present)
 {
-   if (cs->num_buffers) {
-      for (unsigned j = 0; j < cs->num_buffers; ++j) {
-         uint32_t h = cs->handles[j].bo_handle;
-         if (radv_bo_set_insert(present, h)) {
-            unsigned idx = (*p_num_handles)++;
-            handles[idx] = cs->handles[j];
-         }
+   for (unsigned j = 0; j < cs->num_buffers; ++j) {
+      uint32_t h = cs->handles[j].bo_handle;
+      if (radv_bo_set_insert(present, h)) {
+         unsigned idx = (*p_num_handles)++;
+         handles[idx] = cs->handles[j];
       }
-   }
-
-   for (unsigned j = 0; j < cs->num_virtual_buffers; ++j) {
-      struct radv_amdgpu_winsys_bo *vbo = radv_amdgpu_winsys_bo(cs->virtual_buffers[j]);
-      u_rwlock_rdlock(&vbo->lock);
-      for (unsigned k = 0; k < vbo->bo_count; ++k) {
-         struct radv_amdgpu_winsys_bo *bo = vbo->bos[k];
-         uint32_t h = bo->bo_handle;
-         if (radv_bo_set_insert(present, h)) {
-            unsigned idx = (*p_num_handles)++;
-            handles[idx].bo_handle = h;
-            handles[idx].bo_priority = bo->priority;
-         }
-      }
-      u_rwlock_rdunlock(&vbo->lock);
    }
 }
 
@@ -1871,9 +1638,8 @@ radv_amdgpu_get_bo_list(struct radv_amdgpu_winsys *ws, struct ac_cmdbuf **cs_arr
       num_handles = global_bo_count;
       free(global_bos_snapshot);
    } else if (count == 1 && !num_initial_preambles && !num_continue_preambles && !num_postambles &&
-              !radv_amdgpu_cs(cs_array[0])->num_virtual_buffers && !radv_amdgpu_cs(cs_array[0])->chained_to &&
-              global_bo_count == 0) {
-      /* Fast path: single CS, no virtual BOs, no global BOs. */
+              !radv_amdgpu_cs(cs_array[0])->chained_to && global_bo_count == 0) {
+      /* Fast path: single CS, no global BOs. */
       struct radv_amdgpu_cs *cs = radv_amdgpu_cs(cs_array[0]);
       free(global_bos_snapshot);
       if (cs->num_buffers == 0) {

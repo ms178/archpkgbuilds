@@ -63,7 +63,7 @@
 #include "util/u_debug.h"
 #include "util/rand_xor.h"
 #include "util/u_atomic.h"
-#include "util/mesa-sha1.h"
+#include "util/mesa-blake3.h"
 #include "util/perf/cpu_trace.h"
 #include "util/ralloc.h"
 #include "util/compiler.h"
@@ -355,7 +355,7 @@ tls_get_out(void)
  * Queue initialization
  * ---------------------------------------------------------------------------*/
 struct driver_keys_blob_pack {
-   struct mesa_sha1 ctx_template;
+   blake3_hasher ctx_template;
    uint8_t data[];
 };
 
@@ -554,8 +554,8 @@ path_fail:
    DRV_KEY_CPY(drv_key_blob, &ptr_size, ptr_size_size);
    DRV_KEY_CPY(drv_key_blob, &driver_flags, driver_flags_size);
 
-   _mesa_sha1_init(&blob_pack->ctx_template);
-   _mesa_sha1_update(&blob_pack->ctx_template, blob_pack->data,
+   _mesa_blake3_init(&blob_pack->ctx_template);
+   _mesa_blake3_update(&blob_pack->ctx_template, blob_pack->data,
                      cache->driver_keys_blob_size);
 
    s_rand_xorshift128plus(cache->seed_xorshift128plus, true);
@@ -1348,12 +1348,12 @@ void
 disk_cache_compute_key(struct disk_cache *cache, const void *data, size_t size,
                        cache_key key)
 {
-   struct mesa_sha1 ctx;
+   blake3_hasher ctx;
 
    if (UNLIKELY(!cache->driver_keys_blob)) {
-      _mesa_sha1_init(&ctx);
-      _mesa_sha1_update(&ctx, data, size);
-      _mesa_sha1_final(&ctx, key);
+      _mesa_blake3_init(&ctx);
+      _mesa_blake3_update(&ctx, data, size);
+      _mesa_blake3_final(&ctx, key);
       return;
    }
 
@@ -1361,8 +1361,8 @@ disk_cache_compute_key(struct disk_cache *cache, const void *data, size_t size,
       driver_keys_blob_pack_from_blob_const(cache->driver_keys_blob);
 
    ctx = pack->ctx_template;
-   _mesa_sha1_update(&ctx, data, size);
-   _mesa_sha1_final(&ctx, key);
+   _mesa_blake3_update(&ctx, data, size);
+   _mesa_blake3_final(&ctx, key);
 }
 
 void

@@ -33,7 +33,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <sys/stat.h>
-#include "util/mesa-sha1.h"
+#include "util/mesa-blake3.h"
 #include "util/detect_os.h"
 
 #ifdef __cplusplus
@@ -41,7 +41,7 @@ extern "C" {
 #endif
 
 /* Size of cache keys in bytes - now uses BLAKE3 (32 bytes) via SHA1_DIGEST_LENGTH alias */
-#define CACHE_KEY_SIZE SHA1_DIGEST_LENGTH
+#define CACHE_KEY_SIZE BLAKE3_KEY_LEN
 
 #define CACHE_DIR_NAME "mesa_shader_cache"
 #define CACHE_DIR_NAME_SF "mesa_shader_cache_sf"
@@ -104,20 +104,20 @@ disk_cache_get_function_timestamp(void *ptr, uint32_t* timestamp)
 }
 
 static inline bool
-disk_cache_get_function_identifier(void *ptr, struct mesa_sha1 *ctx)
+disk_cache_get_function_identifier(void *ptr, blake3_hasher *ctx)
 {
    uint32_t timestamp;
 
 #if defined(HAVE_BUILD_ID) && HAVE_BUILD_ID
    const struct build_id_note *note = build_id_find_nhdr_for_addr(ptr);
    if (note) {
-      _mesa_sha1_update(ctx, build_id_data(note), build_id_length(note));
+      _mesa_blake3_update(ctx, build_id_data(note), build_id_length(note));
       return true;
    }
 #endif
 
    if (disk_cache_get_function_timestamp(ptr, &timestamp)) {
-      _mesa_sha1_update(ctx, &timestamp, sizeof(timestamp));
+      _mesa_blake3_update(ctx, &timestamp, sizeof(timestamp));
       return true;
    }
 
@@ -125,10 +125,10 @@ disk_cache_get_function_identifier(void *ptr, struct mesa_sha1 *ctx)
 }
 #elif DETECT_OS_WINDOWS
 bool
-disk_cache_get_function_identifier(void *ptr, struct mesa_sha1 *ctx);
+disk_cache_get_function_identifier(void *ptr, blake3_hasher *ctx);
 #else
 static inline bool
-disk_cache_get_function_identifier(void *ptr, struct mesa_sha1 *ctx)
+disk_cache_get_function_identifier(void *ptr, blake3_hasher *ctx)
 {
    (void)ptr;
    (void)ctx;
