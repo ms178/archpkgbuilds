@@ -997,9 +997,32 @@ alu_opt_info_is_valid(opt_ctx& ctx, alu_opt_info& info)
    if (is_dpp_or_sdwa && !format_is(info.format, Format::VOPC) && info.defs[0].size() != 1)
       return false;
 
-   if (is_dpp && !opcode_supports_dpp(ctx.program->gfx_level, info.opcode,
-                                      format_is(info.format, Format::VOP3P)))
-      return false;
+   if (is_dpp) {
+      if ((info.opcode == aco_opcode::v_dot2_f32_f16 || info.opcode == aco_opcode::v_dot4_i32_i8) &&
+          ctx.program->gfx_level >= GFX10 && ctx.program->gfx_level <= GFX10_3) {
+         /* DPP only supports v_dotc for GFX10(.3), but it's really important it gets applied.
+          * So already do the transformation before RA.
+          */
+         if (neg || abs || vmask != 0x7 || opsel || !info.operands[0].extract[1].offset() ||
+             !info.operands[1].extract[1].offset())
+            return false;
+
+         if (info.opcode == aco_opcode::v_dot2_f32_f16)
+            info.opcode = aco_opcode::v_dot2c_f32_f16;
+         else
+            info.opcode = aco_opcode::v_dot4c_i32_i8;
+
+         if (info.operands[0].dpp16)
+            info.format = format_combine(Format::VOP2, Format::DPP16);
+         else if (info.operands[0].dpp8)
+            info.format = format_combine(Format::VOP2, Format::DPP8);
+
+         return true;
+      } else if (!opcode_supports_dpp(ctx.program->gfx_level, info.opcode,
+                                      format_is(info.format, Format::VOP3P))) {
+         return false;
+      }
+   }
 
    if (format_is(info.format, Format::VOP1) || format_is(info.format, Format::VOP2) ||
        format_is(info.format, Format::VOPC) || format_is(info.format, Format::VOP3)) {
@@ -1222,11 +1245,11 @@ alu_opt_gather_info(opt_ctx& ctx, Instruction* instr, alu_opt_info& info)
       return false;
 
    switch (instr->opcode) {
+   case aco_opcode::v_dot2c_f32_f16:
+   case aco_opcode::v_dot4c_i32_i8: assert(instr->isDPP()); return false;
    case aco_opcode::s_addk_i32:
    case aco_opcode::s_cmovk_i32:
    case aco_opcode::s_mulk_i32:
-   case aco_opcode::v_dot2c_f32_f16:
-   case aco_opcode::v_dot4c_i32_i8:
    case aco_opcode::v_fmac_f32:
    case aco_opcode::v_fmac_f16:
    case aco_opcode::v_fmac_legacy_f32:
@@ -5074,6 +5097,12 @@ select_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          alu_opt_info candidate = input_info;
          candidate.operands[i] = inner;
          if (!alu_opt_info_is_valid(ctx, candidate))
+            continue;
+
+         /* Don't use dotc if it might need to mov the accumulator. */
+         if ((candidate.opcode == aco_opcode::v_dot2c_f32_f16 ||
+              candidate.opcode == aco_opcode::v_dot4c_i32_i8) &&
+             ctx.uses[candidate.operands[2].op.tempId()] > 1)
             continue;
 
          if (--ctx.uses[parent->definitions[0].tempId()])
