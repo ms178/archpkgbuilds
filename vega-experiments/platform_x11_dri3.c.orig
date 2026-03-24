@@ -30,7 +30,9 @@
 #include <xcb/present.h>
 #include <xcb/xcb.h>
 
+#if defined(HAVE_WAYLAND_PLATFORM)
 #include <xf86drm.h>
+#endif
 #include "drm-uapi/drm_fourcc.h"
 #include "util/macros.h"
 
