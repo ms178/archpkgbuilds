@@ -487,13 +487,8 @@ radv_cmd_set_blend_constants(struct radv_cmd_buffer *cmd_buffer, const float ble
 {
    struct radv_cmd_state *state = &cmd_buffer->state;
 
-   if (unlikely(!blend_constants))
-      return;
+   memcpy(state->dynamic.vk.cb.blend_constants, blend_constants, sizeof(float) * 4);
 
-   if (__builtin_memcmp(state->dynamic.vk.cb.blend_constants, blend_constants, sizeof(float) * 4) == 0)
-      return;
-
-   __builtin_memcpy(state->dynamic.vk.cb.blend_constants, blend_constants, sizeof(float) * 4);
    state->dirty_dynamic |= RADV_DYNAMIC_BLEND_CONSTANTS;
 }
 
@@ -619,22 +614,8 @@ radv_cmd_set_viewport(struct radv_cmd_buffer *cmd_buffer, uint32_t first, uint32
 {
    struct radv_cmd_state *state = &cmd_buffer->state;
 
-   if (unlikely(first >= MAX_VIEWPORTS))
-      return;
-
-   count = MIN2(count, MAX_VIEWPORTS - first);
-   if (unlikely(count == 0 || !viewports || !vp_xform))
-      return;
-
-   const size_t vp_size = (size_t)count * sizeof(*viewports);
-   const size_t xform_size = (size_t)count * sizeof(*vp_xform);
-
-   if (__builtin_memcmp(state->dynamic.vk.vp.viewports + first, viewports, vp_size) == 0 &&
-       __builtin_memcmp(state->dynamic.vp_xform + first, vp_xform, xform_size) == 0)
-      return;
-
-   __builtin_memcpy(state->dynamic.vk.vp.viewports + first, viewports, vp_size);
-   __builtin_memcpy(state->dynamic.vp_xform + first, vp_xform, xform_size);
+   memcpy(state->dynamic.vk.vp.viewports + first, viewports, count * sizeof(*viewports));
+   memcpy(state->dynamic.vp_xform + first, vp_xform, count * sizeof(*vp_xform));
 
    state->dirty_dynamic |= RADV_DYNAMIC_VIEWPORT;
    state->dirty |= RADV_CMD_DIRTY_GUARDBAND;
@@ -655,19 +636,7 @@ radv_cmd_set_scissor(struct radv_cmd_buffer *cmd_buffer, uint32_t first, uint32_
 {
    struct radv_cmd_state *state = &cmd_buffer->state;
 
-   if (unlikely(first >= MAX_VIEWPORTS))
-      return;
-
-   count = MIN2(count, MAX_VIEWPORTS - first);
-   if (unlikely(count == 0 || !scissors))
-      return;
-
-   const size_t copy_size = (size_t)count * sizeof(*scissors);
-
-   if (__builtin_memcmp(state->dynamic.vk.vp.scissors + first, scissors, copy_size) == 0)
-      return;
-
-   __builtin_memcpy(state->dynamic.vk.vp.scissors + first, scissors, copy_size);
+   memcpy(state->dynamic.vk.vp.scissors + first, scissors, count * sizeof(*scissors));
 
    state->dirty_dynamic |= RADV_DYNAMIC_SCISSOR;
 }
@@ -755,6 +724,22 @@ radv_bind_dynamic_state(struct radv_cmd_buffer *cmd_buffer, const struct radv_dy
    /* Special case for setting the number of rectangles from the pipeline. */
    dest->vk.dr.rectangle_count = src->vk.dr.rectangle_count;
 
+   /* These attachment-map comparisons are always needed regardless of copy_mask.
+    * Hoisting them before the copy_mask check enables an early return for fully
+    * dynamic pipelines (copy_mask == 0), skipping ~50 branch-heavy comparisons.
+    */
+   if (memcmp(&dest->vk.cal.color_map, &src->vk.cal.color_map, sizeof(src->vk.cal.color_map))) {
+      radv_cmd_set_rendering_attachment_locations(cmd_buffer, MAX_RTS, src->vk.cal.color_map);
+   }
+
+   if (memcmp(&dest->vk.ial, &src->vk.ial, sizeof(src->vk.ial))) {
+      radv_cmd_set_rendering_input_attachment_indices(cmd_buffer, MAX_RTS, src->vk.ial.color_map, src->vk.ial.depth_att,
+                                                      src->vk.ial.stencil_att);
+   }
+
+   if (!copy_mask)
+      return;
+
    if (copy_mask & RADV_DYNAMIC_VIEWPORT) {
       if (memcmp(&dest->vk.vp.viewports, &src->vk.vp.viewports, src->vk.vp.viewport_count * sizeof(VkViewport))) {
          radv_cmd_set_viewport(cmd_buffer, 0, src->vk.vp.viewport_count, src->vk.vp.viewports, src->vp_xform);
@@ -814,14 +799,7 @@ radv_bind_dynamic_state(struct radv_cmd_buffer *cmd_buffer, const struct radv_dy
       }
    }
 
-   if (memcmp(&dest->vk.cal.color_map, &src->vk.cal.color_map, sizeof(src->vk.cal.color_map))) {
-      radv_cmd_set_rendering_attachment_locations(cmd_buffer, MAX_RTS, src->vk.cal.color_map);
-   }
-
-   if (memcmp(&dest->vk.ial, &src->vk.ial, sizeof(src->vk.ial))) {
-      radv_cmd_set_rendering_input_attachment_indices(cmd_buffer, MAX_RTS, src->vk.ial.color_map, src->vk.ial.depth_att,
-                                                      src->vk.ial.stencil_att);
-   }
+   /* NOTE: The two attachment-map memcmp blocks were moved above the early return. */
 
    if (copy_mask & RADV_DYNAMIC_PRIMITIVE_TOPOLOGY) {
       if (dest->vk.ia.primitive_topology != src->vk.ia.primitive_topology) {
@@ -993,64 +971,49 @@ radv_bind_dynamic_state(struct radv_cmd_buffer *cmd_buffer, const struct radv_dy
    }
 
    if (copy_mask & RADV_DYNAMIC_STENCIL_COMPARE_MASK) {
-      if (dest->vk.ds.stencil.front.compare_mask != src->vk.ds.stencil.front.compare_mask) {
-         radv_cmd_set_stencil_compare_mask(cmd_buffer, VK_STENCIL_FACE_FRONT_BIT,
-                                           src->vk.ds.stencil.front.compare_mask);
-      }
-
-      if (dest->vk.ds.stencil.back.compare_mask != src->vk.ds.stencil.back.compare_mask) {
+      if (dest->vk.ds.stencil.front.compare_mask != src->vk.ds.stencil.front.compare_mask)
+         radv_cmd_set_stencil_compare_mask(cmd_buffer, VK_STENCIL_FACE_FRONT_BIT, src->vk.ds.stencil.front.compare_mask);
+      if (dest->vk.ds.stencil.back.compare_mask != src->vk.ds.stencil.back.compare_mask)
          radv_cmd_set_stencil_compare_mask(cmd_buffer, VK_STENCIL_FACE_BACK_BIT, src->vk.ds.stencil.back.compare_mask);
-      }
    }
 
    if (copy_mask & RADV_DYNAMIC_STENCIL_WRITE_MASK) {
-      if (dest->vk.ds.stencil.front.write_mask != src->vk.ds.stencil.front.write_mask) {
+      if (dest->vk.ds.stencil.front.write_mask != src->vk.ds.stencil.front.write_mask)
          radv_cmd_set_stencil_write_mask(cmd_buffer, VK_STENCIL_FACE_FRONT_BIT, src->vk.ds.stencil.front.write_mask);
-      }
-
-      if (dest->vk.ds.stencil.back.write_mask != src->vk.ds.stencil.back.write_mask) {
+      if (dest->vk.ds.stencil.back.write_mask != src->vk.ds.stencil.back.write_mask)
          radv_cmd_set_stencil_write_mask(cmd_buffer, VK_STENCIL_FACE_BACK_BIT, src->vk.ds.stencil.back.write_mask);
-      }
    }
 
    if (copy_mask & RADV_DYNAMIC_STENCIL_REFERENCE) {
-      if (dest->vk.ds.stencil.front.reference != src->vk.ds.stencil.front.reference) {
+      if (dest->vk.ds.stencil.front.reference != src->vk.ds.stencil.front.reference)
          radv_cmd_set_stencil_reference(cmd_buffer, VK_STENCIL_FACE_FRONT_BIT, src->vk.ds.stencil.front.reference);
-      }
-
-      if (dest->vk.ds.stencil.back.reference != src->vk.ds.stencil.back.reference) {
+      if (dest->vk.ds.stencil.back.reference != src->vk.ds.stencil.back.reference)
          radv_cmd_set_stencil_reference(cmd_buffer, VK_STENCIL_FACE_BACK_BIT, src->vk.ds.stencil.back.reference);
-      }
    }
 
    if (copy_mask & RADV_DYNAMIC_DEPTH_TEST_ENABLE) {
-      if (dest->vk.ds.depth.test_enable != src->vk.ds.depth.test_enable) {
+      if (dest->vk.ds.depth.test_enable != src->vk.ds.depth.test_enable)
          radv_cmd_set_depth_test_enable(cmd_buffer, src->vk.ds.depth.test_enable);
-      }
    }
 
    if (copy_mask & RADV_DYNAMIC_DEPTH_WRITE_ENABLE) {
-      if (dest->vk.ds.depth.write_enable != src->vk.ds.depth.write_enable) {
+      if (dest->vk.ds.depth.write_enable != src->vk.ds.depth.write_enable)
          radv_cmd_set_depth_write_enable(cmd_buffer, src->vk.ds.depth.write_enable);
-      }
    }
 
    if (copy_mask & RADV_DYNAMIC_DEPTH_COMPARE_OP) {
-      if (dest->vk.ds.depth.compare_op != src->vk.ds.depth.compare_op) {
+      if (dest->vk.ds.depth.compare_op != src->vk.ds.depth.compare_op)
          radv_cmd_set_depth_compare_op(cmd_buffer, src->vk.ds.depth.compare_op);
-      }
    }
 
    if (copy_mask & RADV_DYNAMIC_DEPTH_BOUNDS_TEST_ENABLE) {
-      if (dest->vk.ds.depth.bounds_test.enable != src->vk.ds.depth.bounds_test.enable) {
+      if (dest->vk.ds.depth.bounds_test.enable != src->vk.ds.depth.bounds_test.enable)
          radv_cmd_set_depth_bounds_test_enable(cmd_buffer, src->vk.ds.depth.bounds_test.enable);
-      }
    }
 
    if (copy_mask & RADV_DYNAMIC_STENCIL_TEST_ENABLE) {
-      if (dest->vk.ds.stencil.test_enable != src->vk.ds.stencil.test_enable) {
+      if (dest->vk.ds.stencil.test_enable != src->vk.ds.stencil.test_enable)
          radv_cmd_set_stencil_test_enable(cmd_buffer, src->vk.ds.stencil.test_enable);
-      }
    }
 
    if (copy_mask & RADV_DYNAMIC_STENCIL_OP) {
@@ -1073,27 +1036,23 @@ radv_bind_dynamic_state(struct radv_cmd_buffer *cmd_buffer, const struct radv_dy
    }
 
    if (copy_mask & RADV_DYNAMIC_LOGIC_OP) {
-      if (dest->vk.cb.logic_op != src->vk.cb.logic_op) {
+      if (dest->vk.cb.logic_op != src->vk.cb.logic_op)
          radv_cmd_set_logic_op(cmd_buffer, src->vk.cb.logic_op);
-      }
    }
 
    if (copy_mask & RADV_DYNAMIC_COLOR_WRITE_ENABLE) {
-      if (dest->color_write_enable != src->color_write_enable) {
+      if (dest->color_write_enable != src->color_write_enable)
          radv_cmd_set_color_write_enable(cmd_buffer, src->color_write_enable);
-      }
    }
 
    if (copy_mask & RADV_DYNAMIC_COLOR_WRITE_MASK) {
-      if (dest->color_write_mask != src->color_write_mask) {
+      if (dest->color_write_mask != src->color_write_mask)
          radv_cmd_set_color_write_mask(cmd_buffer, src->color_write_mask);
-      }
    }
 
    if (copy_mask & RADV_DYNAMIC_LOGIC_OP_ENABLE) {
-      if (dest->vk.cb.logic_op_enable != src->vk.cb.logic_op_enable) {
+      if (dest->vk.cb.logic_op_enable != src->vk.cb.logic_op_enable)
          radv_cmd_set_logic_op_enable(cmd_buffer, src->vk.cb.logic_op_enable);
-      }
    }
 
    if (copy_mask & RADV_DYNAMIC_FRAGMENT_SHADING_RATE) {
@@ -1106,33 +1065,28 @@ radv_bind_dynamic_state(struct radv_cmd_buffer *cmd_buffer, const struct radv_dy
    }
 
    if (copy_mask & RADV_DYNAMIC_DISCARD_RECTANGLE_ENABLE) {
-      if (dest->vk.dr.enable != src->vk.dr.enable) {
+      if (dest->vk.dr.enable != src->vk.dr.enable)
          radv_cmd_set_discard_rectangle_enable(cmd_buffer, src->vk.dr.enable);
-      }
    }
 
    if (copy_mask & RADV_DYNAMIC_DISCARD_RECTANGLE_MODE) {
-      if (dest->vk.dr.mode != src->vk.dr.mode) {
+      if (dest->vk.dr.mode != src->vk.dr.mode)
          radv_cmd_set_discard_rectangle_mode(cmd_buffer, src->vk.dr.mode);
-      }
    }
 
    if (copy_mask & RADV_DYNAMIC_ATTACHMENT_FEEDBACK_LOOP_ENABLE) {
-      if (dest->feedback_loop_aspects != src->feedback_loop_aspects) {
+      if (dest->feedback_loop_aspects != src->feedback_loop_aspects)
          radv_cmd_set_attachment_feedback_loop_enable(cmd_buffer, src->feedback_loop_aspects);
-      }
    }
 
    if (copy_mask & RADV_DYNAMIC_VERTEX_INPUT_BINDING_STRIDE) {
-      if (memcmp(dest->vk.vi_binding_strides, src->vk.vi_binding_strides, sizeof(src->vk.vi_binding_strides))) {
+      if (memcmp(dest->vk.vi_binding_strides, src->vk.vi_binding_strides, sizeof(src->vk.vi_binding_strides)))
          radv_cmd_set_vertex_binding_strides(cmd_buffer, 0, MESA_VK_MAX_VERTEX_BINDINGS, src->vk.vi_binding_strides);
-      }
    }
 
    if (copy_mask & RADV_DYNAMIC_VERTEX_INPUT) {
-      if (memcmp(&dest->vertex_input, &src->vertex_input, sizeof(src->vertex_input))) {
+      if (memcmp(&dest->vertex_input, &src->vertex_input, sizeof(src->vertex_input)))
          radv_cmd_set_vertex_input(cmd_buffer, &src->vertex_input);
-      }
    }
 }
 
@@ -1156,24 +1110,14 @@ radv_write_data(struct radv_cmd_buffer *cmd_buffer, const unsigned engine_sel, c
 static void
 radv_emit_clear_data(struct radv_cmd_buffer *cmd_buffer, unsigned engine_sel, uint64_t va, unsigned size)
 {
-   /* 256-byte static zero buffer in .rodata - zero stack usage, Vega friendly */
-   constexpr uint32_t zeros[64] = {0};
+   /* Max caller: 16 render backends × 16 bytes = 256 bytes for GFX9 EOP bug workaround.
+    * Static .rodata buffer eliminates per-call alloca + memset.
+    */
+   static const uint32_t zeroes[64] = {0};
 
-   assert(size > 0 && (size % 4) == 0);
+   assert(size > 0 && (size % 4) == 0 && size <= sizeof(zeroes));
 
-   if (likely(size <= sizeof(zeros))) {
-      radv_write_data(cmd_buffer, engine_sel, va, size / 4, zeros, false);
-      return;
-   }
-
-   /* Chunked for huge clears (never happens in games) */
-   unsigned remaining = size;
-   while (remaining) {
-      const unsigned chunk = MIN2(remaining, (unsigned)sizeof(zeros));
-      radv_write_data(cmd_buffer, engine_sel, va, chunk / 4, zeros, false);
-      va += chunk;
-      remaining -= chunk;
-   }
+   radv_write_data(cmd_buffer, engine_sel, va, size / 4, zeroes, false);
 }
 
 static void
@@ -2107,34 +2051,38 @@ static uint64_t
 radv_compute_centroid_priority(struct radv_cmd_buffer *cmd_buffer, VkOffset2D *sample_locs, uint32_t num_samples)
 {
    (void)cmd_buffer;
-   assert(sample_locs != NULL);
-
-   if (unlikely(num_samples != 1 && num_samples != 2 && num_samples != 4 && num_samples != 8))
-      return 0;
 
    uint32_t centroid_priorities[8];
    uint32_t distances[8];
    const uint32_t sample_mask = num_samples - 1;
    uint64_t centroid_priority = 0;
 
+   assert(num_samples <= 8);
+
+   /* Compute the distances from center for each sample. */
    for (uint32_t i = 0; i < num_samples; i++) {
       const int32_t x = sample_locs[i].x;
       const int32_t y = sample_locs[i].y;
       distances[i] = (uint32_t)(x * x + y * y);
    }
 
+   /* Compute the centroid priorities by looking at the distances array. */
    for (uint32_t i = 0; i < num_samples; i++) {
       uint32_t min_idx = 0;
+
       for (uint32_t j = 1; j < num_samples; j++) {
          if (distances[j] < distances[min_idx])
             min_idx = j;
       }
+
       centroid_priorities[i] = min_idx;
       distances[min_idx] = UINT32_MAX;
    }
 
-   for (uint32_t i = 0; i < 8; i++)
+   /* Compute the final centroid priority. */
+   for (uint32_t i = 0; i < 8; i++) {
       centroid_priority |= (uint64_t)centroid_priorities[i & sample_mask] << (i * 4);
+   }
 
    return centroid_priority | (centroid_priority << 32);
 }
@@ -2731,21 +2679,13 @@ radv_emit_binning_state(struct radv_cmd_buffer *cmd_buffer)
 static void
 radv_emit_shader_prefetch(struct radv_cmd_buffer *cmd_buffer, struct radv_shader *shader)
 {
-   /* Vega-64 critical: warm shader code in L2 as early as possible.
-    * Must guard bo because Dawn hits partial shader binds during
-    * pipeline creation / shader objects / secondary cmd buffers.
-    */
-   if (unlikely(!shader || !shader->bo))
+   if (!shader)
       return;
 
-   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   struct radv_device *const device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_cmd_stream *cs = radv_get_pm4_cs(cmd_buffer);
    const uint64_t va = radv_shader_get_va(shader);
 
-   /* Must be in IB validation list or CP DMA faults on Vega */
-   radv_cs_add_buffer(device->ws, cs->b, shader->bo);
-
-   /* Non-blocking L2 prefetch - hides latency on first draw */
    radv_cs_cp_dma_prefetch(device, cs, va, shader->code_size, cmd_buffer->state.predicating);
 }
 
@@ -4189,75 +4129,27 @@ radv_emit_viewport_state(struct radv_cmd_buffer *cmd_buffer)
    radeon_end();
 }
 
-ALWAYS_INLINE static int32_t
-radv_i64_to_i32_sat(int64_t v)
-{
-   if (v < (int64_t)INT32_MIN) return INT32_MIN;
-   if (v > (int64_t)INT32_MAX) return INT32_MAX;
-   return (int32_t)v;
-}
-
-ALWAYS_INLINE static int32_t
-radv_floorf_to_i32_sat(float v)
-{
-   const double d = __builtin_floor((double)v);
-   if (d <= (double)INT32_MIN) return INT32_MIN;
-   if (d >= (double)INT32_MAX) return INT32_MAX;
-   return (int32_t)d;
-}
-
-ALWAYS_INLINE static int32_t
-radv_ceilf_to_i32_sat(float v)
-{
-   const double d = __builtin_ceil((double)v);
-   if (d <= (double)INT32_MIN) return INT32_MIN;
-   if (d >= (double)INT32_MAX) return INT32_MAX;
-   return (int32_t)d;
-}
-
 static VkRect2D
 radv_scissor_from_viewport(const float scale[3], const float translate[3])
 {
-   const float abs_scale_x = __builtin_fabsf(scale[0]);
-   const float abs_scale_y = __builtin_fabsf(scale[1]);
+   VkRect2D rect;
 
-   const int32_t min_x = radv_floorf_to_i32_sat(translate[0] - abs_scale_x);
-   const int32_t min_y = radv_floorf_to_i32_sat(translate[1] - abs_scale_y);
-   const int32_t max_x = radv_ceilf_to_i32_sat(translate[0] + abs_scale_x);
-   const int32_t max_y = radv_ceilf_to_i32_sat(translate[1] + abs_scale_y);
+   rect.offset.x = translate[0] - fabsf(scale[0]);
+   rect.offset.y = translate[1] - fabsf(scale[1]);
+   rect.extent.width = ceilf(translate[0] + fabsf(scale[0])) - rect.offset.x;
+   rect.extent.height = ceilf(translate[1] + fabsf(scale[1])) - rect.offset.y;
 
-   return (VkRect2D){
-      .offset = { .x = min_x, .y = min_y },
-      .extent = {
-         .width = (uint32_t)MAX2(0, max_x - min_x),
-         .height = (uint32_t)MAX2(0, max_y - min_y),
-      },
-   };
+   return rect;
 }
 
 static VkRect2D
 radv_intersect_scissor(const VkRect2D *a, const VkRect2D *b)
 {
-   assert(a != NULL && b != NULL);
-
-   const int64_t a_br_x = (int64_t)a->offset.x + (int64_t)a->extent.width;
-   const int64_t a_br_y = (int64_t)a->offset.y + (int64_t)a->extent.height;
-   const int64_t b_br_x = (int64_t)b->offset.x + (int64_t)b->extent.width;
-   const int64_t b_br_y = (int64_t)b->offset.y + (int64_t)b->extent.height;
-
-   const int64_t tl_x = MAX2((int64_t)a->offset.x, (int64_t)b->offset.x);
-   const int64_t tl_y = MAX2((int64_t)a->offset.y, (int64_t)b->offset.y);
-   const int64_t br_x = MIN2(a_br_x, b_br_x);
-   const int64_t br_y = MIN2(a_br_y, b_br_y);
-
-   VkRect2D ret = {
-      .offset = { .x = radv_i64_to_i32_sat(tl_x), .y = radv_i64_to_i32_sat(tl_y) },
-      .extent = { .width = 0, .height = 0 },
-   };
-
-   if (br_x > tl_x) ret.extent.width = (uint32_t)(br_x - tl_x);
-   if (br_y > tl_y) ret.extent.height = (uint32_t)(br_y - tl_y);
-
+   VkRect2D ret;
+   ret.offset.x = MAX2(a->offset.x, b->offset.x);
+   ret.offset.y = MAX2(a->offset.y, b->offset.y);
+   ret.extent.width = MIN2(a->offset.x + a->extent.width, b->offset.x + b->extent.width) - ret.offset.x;
+   ret.extent.height = MIN2(a->offset.y + a->extent.height, b->offset.y + b->extent.height) - ret.offset.y;
    return ret;
 }
 
@@ -8088,6 +7980,9 @@ radv_CmdBindVertexBuffers3KHR(VkCommandBuffer commandBuffer, uint32_t firstBindi
    struct radv_vertex_binding *vb = cmd_buffer->vertex_bindings;
    struct radv_dynamic_state *d = &cmd_buffer->state.dynamic;
 
+   /* We have to defer setting up vertex buffer since we need the buffer
+    * stride from the pipeline. */
+
    assert(firstBinding + bindingCount <= MAX_VBS);
 
    uint32_t misaligned_mask_invalid = 0;
@@ -8105,7 +8000,7 @@ radv_CmdBindVertexBuffers3KHR(VkCommandBuffer commandBuffer, uint32_t firstBindi
 
       if (!!vb[idx].addr != !!addr ||
           (addr && (((vb[idx].addr & 0x3u) != (addr & 0x3u)) ||
-                    ((uint64_t)d->vk.vi_binding_strides[idx] & 0x3u) != ((uint64_t)stride & 0x3u)))) {
+                    ((uint32_t)d->vk.vi_binding_strides[idx] & 0x3u) != ((uint32_t)stride & 0x3u)))) {
          misaligned_mask_invalid |= d->vertex_input.bindings_match_attrib ? BITFIELD_BIT(idx) : 0xffffffffu;
       }
 
@@ -11553,17 +11448,16 @@ radv_need_late_scissor_emission(struct radv_cmd_buffer *cmd_buffer, const struct
    if (cmd_buffer->cs->b->context_roll || info->strmout_va)
       return true;
 
-   uint64_t used_dynamic_states = radv_get_needed_dynamic_states(cmd_buffer);
+   if (cmd_buffer->state.dirty_dynamic) {
+      uint64_t used_dynamic_states = radv_get_needed_dynamic_states(cmd_buffer);
 
-   used_dynamic_states &= ~RADV_DYNAMIC_VERTEX_INPUT;
-   used_dynamic_states &= ~RADV_DYNAMIC_VERTEX_INPUT_BINDING_STRIDE;
+      used_dynamic_states &= ~RADV_DYNAMIC_VERTEX_INPUT;
+      used_dynamic_states &= ~RADV_DYNAMIC_VERTEX_INPUT_BINDING_STRIDE;
 
-   if (cmd_buffer->state.dirty_dynamic & used_dynamic_states)
-      return true;
+      if (cmd_buffer->state.dirty_dynamic & used_dynamic_states)
+         return true;
+   }
 
-   /* Index, vertex and streamout buffers don't change context regs.
-    * We assume that any other dirty flag causes context rolls.
-    */
    uint64_t used_states = RADV_CMD_DIRTY_ALL;
    used_states &= ~(RADV_CMD_DIRTY_INDEX_BUFFER | RADV_CMD_DIRTY_VERTEX_BUFFER | RADV_CMD_DIRTY_STREAMOUT_BUFFER);
 
@@ -12689,41 +12583,47 @@ radv_validate_dynamic_states(struct radv_cmd_buffer *cmd_buffer, uint64_t dynami
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
 
+   /* Accumulate into a register-local to avoid ~29 load-OR-store sequences
+    * against cmd_buffer->state.dirty (Intel Optimization Manual §2.4.4.3:
+    * store-forwarding adds ~4-5 cycles per dependent load).
+    */
+   uint64_t dirty = 0;
+
    if (dynamic_states &
        (RADV_DYNAMIC_DEPTH_CLAMP_ENABLE | RADV_DYNAMIC_DEPTH_CLAMP_RANGE | RADV_DYNAMIC_DEPTH_CLIP_ENABLE)) {
       const bool depth_clip_enable = radv_get_depth_clip_enable(cmd_buffer);
 
       if (cmd_buffer->state.depth_clip_enable != depth_clip_enable) {
          cmd_buffer->state.depth_clip_enable = depth_clip_enable;
-         cmd_buffer->state.dirty |= RADV_CMD_DIRTY_RASTER_STATE;
+         dirty |= RADV_CMD_DIRTY_RASTER_STATE;
       }
 
       const enum radv_depth_clamp_mode depth_clamp_mode = radv_get_depth_clamp_mode(cmd_buffer);
 
       if (cmd_buffer->state.depth_clamp_mode != depth_clamp_mode) {
          cmd_buffer->state.depth_clamp_mode = depth_clamp_mode;
-         cmd_buffer->state.dirty |= RADV_CMD_DIRTY_VIEWPORT_STATE;
+         dirty |= RADV_CMD_DIRTY_VIEWPORT_STATE;
       }
 
       if ((dynamic_states & RADV_DYNAMIC_DEPTH_CLAMP_RANGE) && depth_clamp_mode == RADV_DEPTH_CLAMP_MODE_USER_DEFINED)
-         cmd_buffer->state.dirty |= RADV_CMD_DIRTY_VIEWPORT_STATE;
+         dirty |= RADV_CMD_DIRTY_VIEWPORT_STATE;
    }
 
    if (dynamic_states & RADV_DYNAMIC_PROVOKING_VERTEX_MODE)
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_NGG_STATE;
+      dirty |= RADV_CMD_DIRTY_NGG_STATE;
 
    if (dynamic_states & (RADV_DYNAMIC_CULL_MODE | RADV_DYNAMIC_FRONT_FACE | RADV_DYNAMIC_RASTERIZER_DISCARD_ENABLE |
                          RADV_DYNAMIC_VIEWPORT | RADV_DYNAMIC_VIEWPORT_WITH_COUNT |
                          RADV_DYNAMIC_CONSERVATIVE_RAST_MODE | RADV_DYNAMIC_SAMPLE_LOCATIONS_ENABLE))
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_NGGC_SETTINGS;
+      dirty |= RADV_CMD_DIRTY_NGGC_SETTINGS;
 
    if (dynamic_states & (RADV_DYNAMIC_VIEWPORT | RADV_DYNAMIC_VIEWPORT_WITH_COUNT | RADV_DYNAMIC_RASTERIZATION_SAMPLES))
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_NGGC_VIEWPORT;
+      dirty |= RADV_CMD_DIRTY_NGGC_VIEWPORT;
 
    if (dynamic_states & RADV_DYNAMIC_PATCH_CONTROL_POINTS) {
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_TCS_TES_STATE;
+      dirty |= RADV_CMD_DIRTY_TCS_TES_STATE;
       if (pdev->info.gfx_level < GFX12)
-         cmd_buffer->state.dirty |= RADV_CMD_DIRTY_LS_HS_CONFIG;
+         dirty |= RADV_CMD_DIRTY_LS_HS_CONFIG;
    }
 
    if (dynamic_states &
@@ -12731,77 +12631,82 @@ radv_validate_dynamic_states(struct radv_cmd_buffer *cmd_buffer, uint64_t dynami
         RADV_DYNAMIC_DEPTH_BOUNDS_TEST_ENABLE | RADV_DYNAMIC_STENCIL_TEST_ENABLE | RADV_DYNAMIC_STENCIL_OP |
         RADV_DYNAMIC_DEPTH_BOUNDS | RADV_DYNAMIC_STENCIL_REFERENCE | RADV_DYNAMIC_STENCIL_WRITE_MASK |
         RADV_DYNAMIC_STENCIL_COMPARE_MASK)) {
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_DEPTH_STENCIL_STATE;
+      dirty |= RADV_CMD_DIRTY_DEPTH_STENCIL_STATE;
       if (pdev->info.gfx_level >= GFX12)
-         cmd_buffer->state.dirty |= RADV_CMD_DIRTY_GFX12_HIZ_WA_STATE;
+         dirty |= RADV_CMD_DIRTY_GFX12_HIZ_WA_STATE;
    }
 
    if (dynamic_states &
        (RADV_DYNAMIC_LINE_WIDTH | RADV_DYNAMIC_LINE_STIPPLE | RADV_DYNAMIC_CULL_MODE | RADV_DYNAMIC_FRONT_FACE |
         RADV_DYNAMIC_DEPTH_BIAS_ENABLE | RADV_DYNAMIC_POLYGON_MODE | RADV_DYNAMIC_PROVOKING_VERTEX_MODE |
         RADV_DYNAMIC_RASTERIZER_DISCARD_ENABLE | RADV_DYNAMIC_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE))
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_RASTER_STATE;
+      dirty |= RADV_CMD_DIRTY_RASTER_STATE;
 
    if (dynamic_states &
        (RADV_DYNAMIC_LINE_STIPPLE_ENABLE | RADV_DYNAMIC_CONSERVATIVE_RAST_MODE | RADV_DYNAMIC_SAMPLE_LOCATIONS |
         RADV_DYNAMIC_SAMPLE_LOCATIONS_ENABLE | RADV_DYNAMIC_ALPHA_TO_COVERAGE_ENABLE | RADV_DYNAMIC_SAMPLE_MASK))
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_MSAA_STATE;
+      dirty |= RADV_CMD_DIRTY_MSAA_STATE;
 
    if (dynamic_states &
        (RADV_DYNAMIC_DISCARD_RECTANGLE | RADV_DYNAMIC_DISCARD_RECTANGLE_ENABLE | RADV_DYNAMIC_DISCARD_RECTANGLE_MODE))
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_CLIP_RECTS_STATE;
+      dirty |= RADV_CMD_DIRTY_CLIP_RECTS_STATE;
 
    if (dynamic_states & (RADV_DYNAMIC_COLOR_WRITE_ENABLE | RADV_DYNAMIC_COLOR_WRITE_MASK | RADV_DYNAMIC_LOGIC_OP |
                          RADV_DYNAMIC_LOGIC_OP_ENABLE | RADV_DYNAMIC_COLOR_BLEND_ENABLE |
                          RADV_DYNAMIC_COLOR_BLEND_EQUATION | RADV_DYNAMIC_ALPHA_TO_COVERAGE_ENABLE))
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_CB_RENDER_STATE;
+      dirty |= RADV_CMD_DIRTY_CB_RENDER_STATE;
 
    if (dynamic_states &
        (RADV_DYNAMIC_VIEWPORT | RADV_DYNAMIC_VIEWPORT_WITH_COUNT | RADV_DYNAMIC_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE))
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_VIEWPORT_STATE;
+      dirty |= RADV_CMD_DIRTY_VIEWPORT_STATE;
 
    if (dynamic_states & RADV_DYNAMIC_COLOR_WRITE_MASK)
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_BINNING_STATE;
+      dirty |= RADV_CMD_DIRTY_BINNING_STATE;
 
    if (dynamic_states &
        (RADV_DYNAMIC_COLOR_WRITE_MASK | RADV_DYNAMIC_COLOR_BLEND_ENABLE | RADV_DYNAMIC_ATTACHMENT_FEEDBACK_LOOP_ENABLE |
         RADV_DYNAMIC_ALPHA_TO_COVERAGE_ENABLE | RADV_DYNAMIC_ALPHA_TO_ONE_ENABLE))
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_DB_SHADER_CONTROL;
+      dirty |= RADV_CMD_DIRTY_DB_SHADER_CONTROL;
 
    if (dynamic_states & RADV_DYNAMIC_FRAGMENT_SHADING_RATE)
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_FSR_STATE;
+      dirty |= RADV_CMD_DIRTY_FSR_STATE;
 
    if (dynamic_states & RADV_DYNAMIC_SAMPLE_LOCATIONS_ENABLE)
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_RAST_SAMPLES_STATE;
+      dirty |= RADV_CMD_DIRTY_RAST_SAMPLES_STATE;
 
    if (dynamic_states & RADV_DYNAMIC_DEPTH_BIAS)
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_DEPTH_BIAS_STATE;
+      dirty |= RADV_CMD_DIRTY_DEPTH_BIAS_STATE;
 
    if (dynamic_states & RADV_DYNAMIC_VERTEX_INPUT)
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_VS_PROLOG_STATE;
+      dirty |= RADV_CMD_DIRTY_VS_PROLOG_STATE;
 
    if (dynamic_states & RADV_DYNAMIC_BLEND_CONSTANTS)
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_BLEND_CONSTANTS_STATE;
+      dirty |= RADV_CMD_DIRTY_BLEND_CONSTANTS_STATE;
 
    if (dynamic_states & (RADV_DYNAMIC_SAMPLE_LOCATIONS | RADV_DYNAMIC_SAMPLE_LOCATIONS_ENABLE))
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_SAMPLE_LOCATIONS_STATE;
+      dirty |= RADV_CMD_DIRTY_SAMPLE_LOCATIONS_STATE;
 
    if (dynamic_states & (RADV_DYNAMIC_SCISSOR | RADV_DYNAMIC_SCISSOR_WITH_COUNT | RADV_DYNAMIC_VIEWPORT |
                          RADV_DYNAMIC_VIEWPORT_WITH_COUNT) &&
        !pdev->info.has_gfx9_scissor_bug)
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_SCISSOR_STATE;
+      dirty |= RADV_CMD_DIRTY_SCISSOR_STATE;
 
    if (dynamic_states & RADV_DYNAMIC_TESS_DOMAIN_ORIGIN)
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_TESS_DOMAIN_ORIGIN_STATE;
+      dirty |= RADV_CMD_DIRTY_TESS_DOMAIN_ORIGIN_STATE;
 
    if ((dynamic_states & RADV_DYNAMIC_PRIMITIVE_TOPOLOGY) ||
        (pdev->info.gfx_level >= GFX12 && dynamic_states & RADV_DYNAMIC_PATCH_CONTROL_POINTS))
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_VGT_PRIM_STATE;
+      dirty |= RADV_CMD_DIRTY_VGT_PRIM_STATE;
 
    if (dynamic_states &
        (RADV_DYNAMIC_COLOR_WRITE_MASK | RADV_DYNAMIC_COLOR_BLEND_ENABLE | RADV_DYNAMIC_ALPHA_TO_COVERAGE_ENABLE |
         RADV_DYNAMIC_COLOR_BLEND_EQUATION | RADV_DYNAMIC_ALPHA_TO_ONE_ENABLE | RADV_DYNAMIC_COLOR_ATTACHMENT_MAP))
-      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_PS_EPILOG_SHADER;
+      dirty |= RADV_CMD_DIRTY_PS_EPILOG_SHADER;
+
+   /* Single store instead of ~29 individual |= to cmd_buffer->state.dirty.
+    * No function called above reads state.dirty, so accumulating locally is safe.
+    */
+   cmd_buffer->state.dirty |= dirty;
 }
 
 static void
