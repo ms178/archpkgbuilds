@@ -171,7 +171,8 @@ gather_vars_written(struct copy_prop_var_state *state,
 
       nir_block *block = nir_cf_node_as_block(cf_node);
       nir_foreach_instr(instr, block) {
-         if (instr->type == nir_instr_type_call) {
+         if (instr->type == nir_instr_type_call ||
+             instr->type == nir_instr_type_cmat_call) {
             written->modes |= nir_var_shader_out |
                               nir_var_shader_temp |
                               nir_var_function_temp |
@@ -1011,7 +1012,8 @@ copy_prop_vars_block(struct copy_prop_var_state *state,
       if (debug && instr->type == nir_instr_type_deref)
          dump_instr(instr);
 
-      if (instr->type == nir_instr_type_call) {
+      if (instr->type == nir_instr_type_call ||
+          instr->type == nir_instr_type_cmat_call) {
          if (debug)
             dump_instr(instr);
          apply_barrier_for_modes(state, copies, nir_var_shader_out | nir_var_shader_temp | nir_var_function_temp | nir_var_mem_ssbo | nir_var_mem_shared | nir_var_mem_global);
