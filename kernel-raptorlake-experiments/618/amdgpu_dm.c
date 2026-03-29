@@ -264,16 +264,16 @@ is_timing_unchanged_for_freesync(struct drm_crtc_state *old_crtc_state,
  */
 static u32 dm_vblank_get_counter(struct amdgpu_device *adev, int crtc)
 {
-	struct amdgpu_crtc *acrtc = NULL;
+	struct amdgpu_crtc *acrtc;
 
-	if (crtc >= adev->mode_info.num_crtc)
+	if (crtc < 0 || crtc >= adev->mode_info.num_crtc)
 		return 0;
 
 	acrtc = adev->mode_info.crtcs[crtc];
 
 	if (!acrtc->dm_irq_params.stream) {
-		drm_err(adev_to_drm(adev), "dc_stream_state is NULL for crtc '%d'!\n",
-			  crtc);
+		drm_err(adev_to_drm(adev),
+			"dc_stream_state is NULL for crtc '%d'!\n", crtc);
 		return 0;
 	}
 
@@ -341,9 +341,31 @@ static int dm_soft_reset(struct amdgpu_ip_block *ip_block)
 }
 
 struct dm_vmin_vmax_work_item {
-	struct vupdate_offload_work base;
+	struct work_struct work;
+	struct list_head node;
+	struct amdgpu_device *adev;
+	struct dc_stream_state *stream;
 	struct dc_crtc_timing_adjust adjust;
+	bool running;
+	bool rerun;
 };
+
+static LIST_HEAD(dm_vmin_vmax_work_items);
+static DEFINE_SPINLOCK(dm_vmin_vmax_work_lock);
+
+static struct dm_vmin_vmax_work_item *
+dm_find_vmin_vmax_work_locked(struct amdgpu_device *adev,
+			      struct dc_stream_state *stream)
+{
+	struct dm_vmin_vmax_work_item *item;
+
+	list_for_each_entry(item, &dm_vmin_vmax_work_items, node) {
+		if (item->adev == adev && item->stream == stream)
+			return item;
+	}
+
+	return NULL;
+}
 
 static struct amdgpu_crtc *
 get_crtc_by_otg_inst(struct amdgpu_device *adev, int otg_inst)
@@ -562,19 +584,43 @@ static void dm_pflip_high_irq(void *interrupt_params)
 		      amdgpu_crtc->crtc_id, amdgpu_crtc, vrr_active, (int)!e);
 }
 
-static void dm_handle_vmin_vmax_update(struct work_struct *offload_work)
+static void dm_handle_vmin_vmax_update(struct work_struct *work)
 {
-	struct vupdate_offload_work *work =
-		container_of(offload_work, struct vupdate_offload_work, work);
 	struct dm_vmin_vmax_work_item *item =
-		container_of(work, struct dm_vmin_vmax_work_item, base);
-	struct amdgpu_device *adev = work->adev;
+		container_of(work, struct dm_vmin_vmax_work_item, work);
+	struct amdgpu_device *adev = item->adev;
+	unsigned long flags;
 
-	mutex_lock(&adev->dm.dc_lock);
-	dc_stream_adjust_vmin_vmax(adev->dm.dc, work->stream, &item->adjust);
-	mutex_unlock(&adev->dm.dc_lock);
+	for (;;) {
+		struct dc_crtc_timing_adjust adjust;
+		bool rerun;
 
-	dc_stream_release(work->stream);
+		spin_lock_irqsave(&dm_vmin_vmax_work_lock, flags);
+		item->running = true;
+		adjust = item->adjust;
+		item->rerun = false;
+		spin_unlock_irqrestore(&dm_vmin_vmax_work_lock, flags);
+
+		mutex_lock(&adev->dm.dc_lock);
+		if (adev->dm.dc)
+			dc_stream_adjust_vmin_vmax(adev->dm.dc,
+						   item->stream,
+						   &adjust);
+		mutex_unlock(&adev->dm.dc_lock);
+
+		spin_lock_irqsave(&dm_vmin_vmax_work_lock, flags);
+		rerun = item->rerun;
+		if (!rerun) {
+			item->running = false;
+			list_del_init(&item->node);
+		}
+		spin_unlock_irqrestore(&dm_vmin_vmax_work_lock, flags);
+
+		if (!rerun)
+			break;
+	}
+
+	dc_stream_release(item->stream);
 	kfree(item);
 }
 
@@ -582,27 +628,89 @@ static void schedule_dc_vmin_vmax(struct amdgpu_device *adev,
 				  struct dc_stream_state *stream,
 				  struct dc_crtc_timing_adjust *adjust)
 {
+	struct workqueue_struct *wq;
 	struct dm_vmin_vmax_work_item *item;
+	struct dm_vmin_vmax_work_item *new_item = NULL;
+	unsigned long flags;
 
-	if (!stream || !adjust)
+	if (!adev || !stream || !adjust)
 		return;
 
-	item = kzalloc(sizeof(*item), GFP_NOWAIT);
-	if (!item) {
+	/*
+	 * Tie lifetime to the device-owned workqueue so destroy_workqueue()
+	 * flushes pending VRR work during teardown.
+	 */
+	wq = READ_ONCE(adev->dm.vblank_control_workqueue);
+	if (unlikely(!wq)) {
+		drm_dbg_driver(adev_to_drm(adev),
+			       "Skipping vmin/vmax update without vblank workqueue\n");
+		return;
+	}
+
+	spin_lock_irqsave(&dm_vmin_vmax_work_lock, flags);
+	item = dm_find_vmin_vmax_work_locked(adev, stream);
+	if (item) {
+		/*
+		 * Latest-only semantics:
+		 * - if work is pending but not yet running, just overwrite adjust
+		 * - if it is running, request one more pass with the newest adjust
+		 */
+		item->adjust = *adjust;
+		if (item->running)
+			item->rerun = true;
+		spin_unlock_irqrestore(&dm_vmin_vmax_work_lock, flags);
+		return;
+	}
+	spin_unlock_irqrestore(&dm_vmin_vmax_work_lock, flags);
+
+	new_item = kzalloc(sizeof(*new_item), GFP_ATOMIC);
+	if (!new_item) {
 		drm_dbg_driver(adev_to_drm(adev),
 			       "Failed to allocate vupdate_offload_work\n");
 		return;
 	}
 
+	INIT_WORK(&new_item->work, dm_handle_vmin_vmax_update);
+	INIT_LIST_HEAD(&new_item->node);
+	new_item->adev = adev;
+	new_item->stream = stream;
+	new_item->adjust = *adjust;
+	new_item->running = false;
+	new_item->rerun = false;
+
 	dc_stream_retain(stream);
 
-	item->adjust = *adjust;
-	INIT_WORK(&item->base.work, dm_handle_vmin_vmax_update);
-	item->base.adev = adev;
-	item->base.stream = stream;
-	item->base.adjust = &item->adjust;
+	/*
+	 * Recheck under the lock in case another CPU inserted the same
+	 * (adev, stream) item while we were allocating.
+	 */
+	spin_lock_irqsave(&dm_vmin_vmax_work_lock, flags);
+	item = dm_find_vmin_vmax_work_locked(adev, stream);
+	if (item) {
+		item->adjust = *adjust;
+		if (item->running)
+			item->rerun = true;
+		spin_unlock_irqrestore(&dm_vmin_vmax_work_lock, flags);
 
-	queue_work(system_wq, &item->base.work);
+		dc_stream_release(stream);
+		kfree(new_item);
+		return;
+	}
+
+	list_add_tail(&new_item->node, &dm_vmin_vmax_work_items);
+	spin_unlock_irqrestore(&dm_vmin_vmax_work_lock, flags);
+
+	if (unlikely(!queue_work(wq, &new_item->work))) {
+		spin_lock_irqsave(&dm_vmin_vmax_work_lock, flags);
+		list_del_init(&new_item->node);
+		spin_unlock_irqrestore(&dm_vmin_vmax_work_lock, flags);
+
+		dc_stream_release(stream);
+		kfree(new_item);
+
+		drm_dbg_driver(adev_to_drm(adev),
+			       "Failed to queue vupdate_offload_work\n");
+	}
 }
 
 static void dm_vupdate_high_irq(void *interrupt_params)
@@ -691,11 +799,10 @@ static void dm_crtc_high_irq(void *interrupt_params)
 
 	if (acrtc->wb_conn) {
 		spin_lock_irqsave(&acrtc->wb_conn->job_lock, flags);
-
 		if (acrtc->wb_pending) {
 			job = list_first_entry_or_null(&acrtc->wb_conn->job_queue,
-						       struct drm_writeback_job,
-						       list_entry);
+						      struct drm_writeback_job,
+						      list_entry);
 			acrtc->wb_pending = false;
 			spin_unlock_irqrestore(&acrtc->wb_conn->job_lock, flags);
 
@@ -704,17 +811,41 @@ static void dm_crtc_high_irq(void *interrupt_params)
 				struct dc_stream_state *stream = acrtc->dm_irq_params.stream;
 
 				v_total = stream->adjust.v_total_max ?
-					  stream->adjust.v_total_max : stream->timing.v_total;
-				refresh_hz = div_u64((uint64_t) stream->timing.pix_clk_100hz *
-					     100LL, (v_total * stream->timing.h_total));
-				mdelay(1000 / refresh_hz);
+					stream->adjust.v_total_max : stream->timing.v_total;
+
+				/*
+				 * Guard against division by zero if timing
+				 * parameters are uninitialized or corrupt.
+				 */
+				if (v_total && stream->timing.h_total) {
+					refresh_hz = div_u64((uint64_t)stream->timing.pix_clk_100hz *
+							     100LL,
+							     (unsigned long long)v_total *
+							     stream->timing.h_total);
+				} else {
+					refresh_hz = 0;
+				}
+
+				/*
+				 * FIXME: mdelay() in IRQ context is
+				 * unacceptable. This blocks the CPU for up
+				 * to ~16ms at 60Hz, starving all other
+				 * interrupts. Should be replaced with a
+				 * deferred completion via hrtimer or
+				 * delayed workqueue. Safe for now since
+				 * writeback is only enabled on DCN 3.0+
+				 * and this path is unreachable on pre-DCN.
+				 */
+				if (refresh_hz)
+					mdelay(1000 / refresh_hz);
 
 				drm_writeback_signal_completion(acrtc->wb_conn, 0);
 				dc_stream_fc_disable_writeback(adev->dm.dc,
-							       acrtc->dm_irq_params.stream, 0);
+							      acrtc->dm_irq_params.stream, 0);
 			}
-		} else
+		} else {
 			spin_unlock_irqrestore(&acrtc->wb_conn->job_lock, flags);
+		}
 	}
 
 	vrr_active = amdgpu_dm_crtc_vrr_active_irq(acrtc);
@@ -745,19 +876,22 @@ static void dm_crtc_high_irq(void *interrupt_params)
 	spin_lock_irqsave(&adev_to_drm(adev)->event_lock, flags);
 
 	if (acrtc->dm_irq_params.stream &&
-		acrtc->dm_irq_params.vrr_params.supported) {
-		bool replay_en = acrtc->dm_irq_params.stream->link->replay_settings.replay_feature_enabled;
-		bool psr_en = acrtc->dm_irq_params.stream->link->psr_settings.psr_feature_enabled;
-		bool fs_active_var_en = acrtc->dm_irq_params.freesync_config.state == VRR_STATE_ACTIVE_VARIABLE;
+	    acrtc->dm_irq_params.vrr_params.supported) {
+		bool replay_en =
+			acrtc->dm_irq_params.stream->link->replay_settings.replay_feature_enabled;
+		bool psr_en =
+			acrtc->dm_irq_params.stream->link->psr_settings.psr_feature_enabled;
+		bool fs_active_var_en =
+			acrtc->dm_irq_params.freesync_config.state == VRR_STATE_ACTIVE_VARIABLE;
 
 		mod_freesync_handle_v_update(adev->dm.freesync_module,
-					     acrtc->dm_irq_params.stream,
-					     &acrtc->dm_irq_params.vrr_params);
+					    acrtc->dm_irq_params.stream,
+					    &acrtc->dm_irq_params.vrr_params);
 
 		/* update vmin_vmax only if freesync is enabled, or only if PSR and REPLAY are disabled */
 		if (fs_active_var_en || (!fs_active_var_en && !replay_en && !psr_en)) {
 			schedule_dc_vmin_vmax(adev, acrtc->dm_irq_params.stream,
-					&acrtc->dm_irq_params.vrr_params.adjust);
+					     &acrtc->dm_irq_params.vrr_params.adjust);
 		}
 	}
 
@@ -876,8 +1010,15 @@ static void dmub_hpd_callback(struct amdgpu_device *adev,
 		return;
 	}
 
-	if (notify->link_index > adev->dm.dc->link_count) {
-		drm_err(adev_to_drm(adev), "DMUB HPD index (%u)is abnormal", notify->link_index);
+	/*
+	 * Fix: use >= instead of > for bounds check.
+	 * link_count is the number of links (1-based count),
+	 * valid indices are 0..link_count-1.
+	 */
+	if (notify->link_index >= adev->dm.dc->link_count) {
+		drm_err(adev_to_drm(adev),
+			"DMUB HPD index (%u) is abnormal (link_count=%u)",
+			notify->link_index, adev->dm.dc->link_count);
 		return;
 	}
 
@@ -893,19 +1034,21 @@ static void dmub_hpd_callback(struct amdgpu_device *adev,
 
 	drm_connector_list_iter_begin(dev, &iter);
 	drm_for_each_connector_iter(connector, &iter) {
-
 		if (connector->connector_type == DRM_MODE_CONNECTOR_WRITEBACK)
 			continue;
 
 		aconnector = to_amdgpu_dm_connector(connector);
 		if (link && aconnector->dc_link == link) {
 			if (notify->type == DMUB_NOTIFICATION_HPD)
-				drm_info(adev_to_drm(adev), "DMUB HPD IRQ callback: link_index=%u\n", link_index);
+				drm_info(adev_to_drm(adev), "DMUB HPD IRQ callback: link_index=%u\n",
+					 link_index);
 			else if (notify->type == DMUB_NOTIFICATION_HPD_IRQ)
-				drm_info(adev_to_drm(adev), "DMUB HPD RX IRQ callback: link_index=%u\n", link_index);
+				drm_info(adev_to_drm(adev), "DMUB HPD RX IRQ callback: link_index=%u\n",
+					 link_index);
 			else
-				drm_warn(adev_to_drm(adev), "DMUB Unknown HPD callback type %d, link_index=%u\n",
-						notify->type, link_index);
+				drm_warn(adev_to_drm(adev),
+					 "DMUB Unknown HPD callback type %d, link_index=%u\n",
+					 notify->type, link_index);
 
 			hpd_aconnector = aconnector;
 			break;
@@ -915,8 +1058,11 @@ static void dmub_hpd_callback(struct amdgpu_device *adev,
 
 	if (hpd_aconnector) {
 		if (notify->type == DMUB_NOTIFICATION_HPD) {
-			if (hpd_aconnector->dc_link->hpd_status == (notify->hpd_status == DP_HPD_PLUG))
-				drm_warn(adev_to_drm(adev), "DMUB reported hpd status unchanged. link_index=%u\n", link_index);
+			if (hpd_aconnector->dc_link->hpd_status ==
+			    (notify->hpd_status == DP_HPD_PLUG))
+				drm_warn(adev_to_drm(adev),
+					 "DMUB reported hpd status unchanged. link_index=%u\n",
+					 link_index);
 			handle_hpd_irq_helper(hpd_aconnector);
 		} else if (notify->type == DMUB_NOTIFICATION_HPD_IRQ) {
 			handle_hpd_rx_irq(hpd_aconnector);
@@ -4983,18 +5129,28 @@ static int get_brightness_range(const struct amdgpu_dm_backlight_caps *caps,
 /* Rescale from [min..max] to [0..AMDGPU_MAX_BL_LEVEL] */
 static inline u32 scale_input_to_fw(int min, int max, u64 input)
 {
-	return DIV_ROUND_CLOSEST_ULL(input * AMDGPU_MAX_BL_LEVEL, max - min);
+	int range = max - min;
+
+	if (range <= 0)
+		return (u32)input;
+
+	return DIV_ROUND_CLOSEST_ULL(input * AMDGPU_MAX_BL_LEVEL, range);
 }
 
 /* Rescale from [0..AMDGPU_MAX_BL_LEVEL] to [min..max] */
 static inline u32 scale_fw_to_input(int min, int max, u64 input)
 {
-	return min + DIV_ROUND_CLOSEST_ULL(input * (max - min), AMDGPU_MAX_BL_LEVEL);
+	int range = max - min;
+
+	if (range <= 0)
+		return min;
+
+	return min + DIV_ROUND_CLOSEST_ULL(input * range, AMDGPU_MAX_BL_LEVEL);
 }
 
 static void convert_custom_brightness(const struct amdgpu_dm_backlight_caps *caps,
-				      unsigned int min, unsigned int max,
-				      uint32_t *user_brightness)
+				       unsigned int min, unsigned int max,
+				       uint32_t *user_brightness)
 {
 	u32 brightness = scale_input_to_fw(min, max, *user_brightness);
 	u8 lower_signal, upper_signal, upper_lum, lower_lum, lum;
@@ -5007,17 +5163,22 @@ static void convert_custom_brightness(const struct amdgpu_dm_backlight_caps *cap
 		return;
 
 	/*
-	 * Handle the case where brightness is below the first data point
-	 * Interpolate between (0,0) and (first_signal, first_lum)
+	 * Handle the case where brightness is below the first data point.
+	 * Interpolate between (0,0) and (first_signal, first_lum).
 	 */
 	if (brightness < caps->luminance_data[0].input_signal) {
-		lum = DIV_ROUND_CLOSEST(caps->luminance_data[0].luminance * brightness,
-					caps->luminance_data[0].input_signal);
+		if (caps->luminance_data[0].input_signal)
+			lum = DIV_ROUND_CLOSEST(
+				caps->luminance_data[0].luminance * brightness,
+				caps->luminance_data[0].input_signal);
+		else
+			lum = 0;
 		goto scale;
 	}
 
 	left = 0;
 	right = caps->data_points - 1;
+
 	while (left <= right) {
 		int mid = left + (right - left) / 2;
 		u8 signal = caps->luminance_data[mid].input_signal;
@@ -5034,7 +5195,7 @@ static void convert_custom_brightness(const struct amdgpu_dm_backlight_caps *cap
 			right = mid - 1;
 	}
 
-	/* verify bound */
+	/* Clamp left to valid range */
 	if (left >= caps->data_points)
 		left = caps->data_points - 1;
 
@@ -5044,13 +5205,14 @@ static void convert_custom_brightness(const struct amdgpu_dm_backlight_caps *cap
 	lower_lum = caps->luminance_data[right].luminance;
 	upper_lum = caps->luminance_data[left].luminance;
 
-	/* interpolate */
-	if (right == left || !lower_lum)
+	/* Interpolate with division-by-zero guard */
+	if (right == left || !lower_lum || upper_signal == lower_signal)
 		lum = upper_lum;
 	else
-		lum = lower_lum + DIV_ROUND_CLOSEST((upper_lum - lower_lum) *
-						    (brightness - lower_signal),
-						    upper_signal - lower_signal);
+		lum = lower_lum + DIV_ROUND_CLOSEST(
+			(upper_lum - lower_lum) * (brightness - lower_signal),
+			upper_signal - lower_signal);
+
 scale:
 	*user_brightness = scale_fw_to_input(min, max,
 					     DIV_ROUND_CLOSEST(lum * brightness, 101));
@@ -12894,14 +13056,14 @@ static void parse_edid_displayid_vrr(struct drm_connector *connector,
 				     const struct edid *edid)
 {
 	const u8 *edid_ext = NULL;
-	int i;
-	int j;
-	u16 min_vfreq;
-	u16 max_vfreq;
+	int i, j;
+	u8 data_length;
+	int data_end;
 
-	if (!edid || edid->extensions == 0)
+	if (!edid || !edid->extensions)
 		return;
 
+	/* Locate the first DisplayID extension block */
 	for (i = 0; i < edid->extensions; i++) {
 		const u8 *ext = (const u8 *)(edid + (i + 1));
 
@@ -12914,23 +13076,66 @@ static void parse_edid_displayid_vrr(struct drm_connector *connector,
 	if (!edid_ext)
 		return;
 
-	for (j = 0; j <= EDID_LENGTH - 12; j++) {
-		if (edid_ext[j] == 0x25 &&
-		    (edid_ext[j + 1] & 0xFE) == 0 &&
-		    edid_ext[j + 2] == 9) {
-			min_vfreq = edid_ext[j + 9];
-			if (edid_ext[j + 1] & 7)
-				max_vfreq = (u16)edid_ext[j + 10] |
-					    (u16)((edid_ext[j + 11] & 3) << 8);
-			else
-				max_vfreq = edid_ext[j + 10];
+	/*
+	 * DisplayID extension layout within a 128-byte EDID block:
+	 *   [0]       EDID extension tag (0x70)
+	 *   [1]       DisplayID version
+	 *   [2]       Data section length
+	 *   [3]       Product type
+	 *   [4]       Extension count
+	 *   [5..126]  Data blocks
+	 *   [127]     Checksum
+	 *
+	 * Each data block: [tag][revision][payload_len][payload...]
+	 */
+	data_length = edid_ext[2];
+	data_end = 5 + (int)data_length;
+	if (data_end > EDID_LENGTH - 1)
+		data_end = EDID_LENGTH - 1;
 
-			if (max_vfreq && min_vfreq) {
-				connector->display_info.monitor_range.max_vfreq = max_vfreq;
+	j = 5;
+	while (j + 3 <= data_end) {
+		u8 tag = edid_ext[j];
+		u8 rev = edid_ext[j + 1];
+		u8 payload_len = edid_ext[j + 2];
+
+		/* Null terminator sentinel */
+		if (!tag && !payload_len)
+			break;
+
+		/* Bounds check: payload must fit within data section */
+		if (j + 3 + payload_len > data_end)
+			break;
+
+		/*
+		 * Dynamic Video Timing Range Descriptor (tag 0x25):
+		 *   revision 0 or 1 ((rev & 0xFE) == 0)
+		 *   payload length must be exactly 9
+		 *
+		 * Payload layout (offsets relative to payload start):
+		 *   [6] = min vertical refresh rate
+		 *   [7] = max vertical refresh rate (low byte)
+		 *   [8] = max vertical refresh rate (high bits 1:0)
+		 */
+		if (tag == 0x25 &&
+		    (rev & 0xFE) == 0 &&
+		    payload_len == 9) {
+			const u8 *p = &edid_ext[j + 3];
+			u16 min_vfreq = p[6];
+			u16 max_vfreq = p[7];
+
+			if (rev & 0x01)
+				max_vfreq |= (u16)(p[8] & 0x03) << 8;
+
+			if (min_vfreq && max_vfreq) {
 				connector->display_info.monitor_range.min_vfreq = min_vfreq;
+				connector->display_info.monitor_range.max_vfreq = max_vfreq;
 				return;
 			}
 		}
+
+		/* Advance to the next data block */
+		j += 3 + payload_len;
 	}
 }
 
