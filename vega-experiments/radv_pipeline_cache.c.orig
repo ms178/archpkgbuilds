@@ -52,12 +52,12 @@ radv_shader_destroy(struct vk_device *_device, struct vk_pipeline_cache_object *
    radv_free_shader_memory(device, shader->alloc);
 
    free(shader->code);
-   free(shader->spirv);
-   free(shader->nir_string);
-   free(shader->disasm_string);
-   free(shader->ir_string);
-   free(shader->statistics);
-   free(shader->debug_info);
+   free(shader->dbg.spirv);
+   free(shader->dbg.nir_string);
+   free(shader->dbg.disasm_string);
+   free(shader->dbg.ir_string);
+   free(shader->dbg.statistics);
+   free(shader->dbg.debug_info);
 
    vk_pipeline_cache_object_finish(&shader->base);
    free(shader);
@@ -95,7 +95,7 @@ radv_shader_cache_deserialize(struct vk_pipeline_cache *cache, const void *key_d
 void
 radv_shader_serialize(struct radv_shader *shader, struct blob *blob)
 {
-   size_t stats_size = shader->statistics ? sizeof(struct amd_stats) : 0;
+   size_t stats_size = shader->dbg.statistics ? sizeof(struct amd_stats) : 0;
    size_t code_size = shader->code_size;
    uint32_t total_size = sizeof(struct radv_shader_binary_legacy) + code_size + stats_size;
 
@@ -115,7 +115,7 @@ radv_shader_serialize(struct radv_shader *shader, struct blob *blob)
    };
 
    blob_write_bytes(blob, &binary, sizeof(struct radv_shader_binary_legacy));
-   blob_write_bytes(blob, shader->statistics, stats_size);
+   blob_write_bytes(blob, shader->dbg.statistics, stats_size);
    blob_write_bytes(blob, shader->code, code_size);
 }
 
@@ -162,11 +162,16 @@ radv_is_cache_disabled(const struct radv_device *device, const struct vk_pipelin
 
 struct radv_shader *
 radv_shader_create(struct radv_device *device, struct vk_pipeline_cache *cache, const struct radv_shader_binary *binary,
-                   bool skip_cache)
+                   bool skip_cache, struct radv_shader_debug_info *dbg)
 {
-   if (radv_is_cache_disabled(device, cache) || skip_cache) {
+   if (radv_is_cache_disabled(device, cache) || skip_cache || (dbg && dbg->dump_shader)) {
       struct radv_shader *shader;
       radv_shader_create_uncached(device, binary, false, NULL, &shader);
+      if (dbg) {
+         struct amd_stats *stats = shader->dbg.statistics;
+         shader->dbg = *dbg;
+         shader->dbg.statistics = stats;
+      }
       return shader;
    }
 
