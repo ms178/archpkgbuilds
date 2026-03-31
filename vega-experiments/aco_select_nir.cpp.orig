@@ -747,6 +747,8 @@ visit_jump(isel_context* ctx, nir_jump_instr* instr)
 void
 visit_call(isel_context* ctx, nir_call_instr* instr)
 {
+   assert(!ctx->program->preserve_s2);
+
    Builder bld(ctx->program, ctx->block);
 
    unsigned nir_abi = instr->callee->driver_attributes & ACO_NIR_FUNCTION_ATTRIB_ABI_MASK;
