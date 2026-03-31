@@ -458,8 +458,8 @@ assign_alu_regclass(isel_context* ctx, nir_alu_instr* alu_instr, RegClass* regcl
    case nir_op_fsqrt:
    case nir_op_fexp2:
    case nir_op_flog2:
-   case nir_op_fsin_amd:
-   case nir_op_fcos_amd:
+   case nir_op_fsin_normalized_2_pi:
+   case nir_op_fcos_normalized_2_pi:
    case nir_op_pack_half_2x16_rtz_split:
    case nir_op_pack_half_2x16_split: {
       if (ctx->program->gfx_level < GFX11_5 || alu_instr->src[0].src.ssa->bit_size > 32) {
@@ -507,6 +507,7 @@ init_context(isel_context* ctx, nir_shader* shader)
    /* Init NIR range analysis. */
    ctx->range_ht = _mesa_pointer_hash_table_create(NULL);
    ctx->numlsb_ht = _mesa_pointer_hash_table_create(NULL);
+   ctx->fp_class_ht = nir_create_fp_analysis_state(impl);
 
    uint32_t options =
       shader->options->divergence_analysis_options | nir_divergence_ignore_undef_if_phi_srcs;
@@ -781,6 +782,7 @@ cleanup_context(isel_context* ctx)
 {
    _mesa_hash_table_destroy(ctx->numlsb_ht, NULL);
    _mesa_hash_table_destroy(ctx->range_ht, NULL);
+   nir_free_fp_analysis_state(&ctx->fp_class_ht);
 }
 
 isel_context

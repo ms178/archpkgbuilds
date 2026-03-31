@@ -3215,7 +3215,7 @@ for op in ('fpow',):
 for op in (
     'frcp', 'frsq', 'fsqrt', 'fexp2', 'flog2',
     'fsign', 'fsin', 'fcos',
-    'fsin_amd', 'fcos_amd',
+    'fsin_normalized_2_pi', 'fcos_normalized_2_pi',
     'fneg', 'fabs', 'fcanonicalize',
 ):
     optimizations += [
