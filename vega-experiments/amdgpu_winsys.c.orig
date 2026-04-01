@@ -353,9 +353,6 @@ amdgpu_cs_set_pstate(struct radeon_cmdbuf *rcs, enum radeon_ctx_pstate pstate)
 {
    struct amdgpu_cs *acs = amdgpu_cs(rcs);
 
-   if (!acs->aws->info.has_stable_pstate)
-      return false;
-
    uint32_t amdgpu_pstate = radeon_to_amdgpu_pstate(pstate);
    return ac_drm_cs_ctx_stable_pstate(acs->aws->dev, acs->ctx->ctx_handle,
       AMDGPU_CTX_OP_SET_STABLE_PSTATE, amdgpu_pstate, NULL) == 0;
