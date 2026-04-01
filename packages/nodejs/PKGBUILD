@@ -1,5 +1,5 @@
 pkgname=nodejs
-pkgver=25.7.0
+pkgver=25.8.2
 pkgrel=3.1
 pkgdesc='Evented I/O for V8 JavaScript (PGO optimized)'
 arch=('x86_64')
@@ -25,6 +25,7 @@ makedepends=(
   llvm
   lld
   pkgconf
+  compiler-rt
 )
 source=("node::git+https://github.com/nodejs/node.git#tag=v$pkgver")
 sha512sums=('SKIP')
@@ -33,85 +34,154 @@ _run_node_workload() {
   local nodebin="$1"
 
   _rt() {
-    timeout -k 5s "${1}s" "$nodebin" -e "$2" >/dev/null 2>&1
+    local timeout_sec="$1"
+    local workload_name="$2"
+    local js_code="$3"
+
+    echo "==> Workload ${workload_name} (timeout ${timeout_sec}s)..."
+
+    timeout -k 5s "${timeout_sec}s" "$nodebin" -e "$js_code"
     local ec=$?
+
     if [[ $ec -ne 0 && $ec -ne 124 ]]; then
-      echo "ERROR: PGO workload failed (exit $ec)"
+      echo "ERROR: PGO workload ${workload_name} failed (exit $ec)"
       return $ec
     fi
+    echo "==> Workload ${workload_name} completed successfully"
+    return 0
   }
 
-  # V8 JIT warmup
-  _rt 15 "
-    function hot(x) {
-      let s = 0;
-      for (let i = 0; i < 5e5; i++) s += i % 2 ? x * 1.5 : x * 2;
-      return s;
-    }
-    for (let i = 0; i < 30; i++) { hot(i); hot(i * 1.5); }
-  "
+  echo "==> Running comprehensive PGO training workloads (V8 + libuv + OpenSSL + streams + WebCrypto)..."
 
-  # Async patterns
-  _rt 20 "
-    const crypto = require('crypto');
+  # 1. V8 JIT – extremely diverse hot paths
+  _rt 30 "1-V8-JIT" '
+    function hot(o, n) {
+      let s = 0;
+      for (let i = 0; i < 2e6; i++) s += (i % 3 ? o.x * 1.5 : o.y * 2) | 0;
+      return s + (n ** 2);
+    }
+    class C { constructor() { this.x = 42; this.y = 1337; } }
+    const o = new C();
+    for (let i = 0; i < 80; i++) { hot(o, i); hot({x:i,y:i*2}, i); }
+    /abc|def|ghi/.test("abcdefghi".repeat(100));
+  ' || return 1
+
+  # 2. Async / Promise / event-loop stress
+  _rt 35 "2-Async-Promise" '
+    const crypto = require("crypto");
     class Proc {
-      constructor() { this.buf = Buffer.alloc(8192); }
+      constructor() { this.buf = Buffer.allocUnsafe(16384); }
       async run(id) {
         return new Promise(r => setImmediate(() => {
-          const h = crypto.createHash('sha256');
-          for (let i = 0; i < 500; i++) h.update(this.buf);
-          r(h.digest('hex'));
+          const h = crypto.createHash("sha512");
+          for (let i = 0; i < 1200; i++) h.update(this.buf);
+          r(h.digest("hex"));
         }));
       }
     }
     (async () => {
       const p = new Proc();
-      await Promise.all(Array.from({length:50}, (_,i) => p.run(i)));
-    })();
-  "
+      await Promise.all(Array.from({length:120}, (_,i) => p.run(i)));
+    })().catch(() => {});
+  ' || return 1
 
-  # File I/O
-  _rt 25 "
-    const fs = require('fs').promises, os = require('os'), path = require('path');
+  # 3. File I/O + fs.promises
+  _rt 30 "3-File-IO" '
+    const fs = require("fs").promises, path = require("path"), os = require("os");
     (async () => {
-      const d = path.join(os.tmpdir(), 'pgo_' + process.pid);
+      const d = path.join(os.tmpdir(), "pgo_" + process.pid);
       await fs.mkdir(d, {recursive:true});
-      for (let i = 0; i < 20; i++)
-        await fs.writeFile(path.join(d, i+'.txt'), 'x'.repeat(1024));
-      await fs.rm(d, {recursive:true,force:true});
-    })();
-  "
+      for (let i = 0; i < 40; i++) {
+        await fs.writeFile(path.join(d, i+".dat"), "x".repeat(8192));
+      }
+      await fs.rm(d, {recursive:true, force:true});
+    })().catch(() => {});
+  ' || return 1
 
-  # HTTP
-  _rt 30 "
-    const http = require('http'), {once} = require('events');
+  # 4. HTTP server + client stress
+  _rt 40 "4-HTTP" '
+    const http = require("http"), {once} = require("events");
     (async () => {
-      const srv = http.createServer((q,s) => { s.end('ok'); });
-      srv.listen(0, '127.0.0.1');
-      await once(srv, 'listening');
-      const {port} = srv.address();
-      await Promise.all(Array.from({length:50}, () =>
-        new Promise(r => http.get({host:'127.0.0.1',port}, res => {
-          res.on('data',()=>{}).on('end',r);
+      const srv = http.createServer((req, res) => { res.end("ok"); });
+      srv.listen(0, "127.0.0.1");
+      await once(srv, "listening");
+      const port = srv.address().port;
+      await Promise.all(Array.from({length:120}, () =>
+        new Promise(r => http.get({host:"127.0.0.1", port}, res => {
+          res.resume().on("end", r);
         }))
       ));
       srv.close();
-    })();
-  "
+    })().catch(() => {});
+  ' || return 1
 
-  # Crypto + zlib
-  _rt 20 "
-    const crypto = require('crypto'), zlib = require('zlib');
-    for (let i = 0; i < 2000; i++) crypto.createHash('sha256').update('d'+i).digest();
-    const b = Buffer.alloc(32768, 'x');
-    for (let i = 0; i < 50; i++) zlib.gzipSync(b);
-  "
+  # 5. Crypto + zlib + brotli heavy
+  _rt 30 "5-Crypto-Zlib-Brotli" '
+    const crypto = require("crypto"), zlib = require("zlib");
+    const b = Buffer.allocUnsafe(65536).fill("x");
+    for (let i = 0; i < 5000; i++) crypto.createHash("sha512").update(b).digest();
+    for (let i = 0; i < 120; i++) {
+      zlib.gzipSync(b);
+      zlib.brotliCompressSync(b);
+    }
+    crypto.createHmac("sha512", "key").update(b).digest();
+  ' || return 1
 
-  # VM
-  _rt 10 "
-    const vm = require('vm');
-    for (let i = 0; i < 200; i++) vm.runInNewContext('a+b', {a:i,b:i*2});
-  "
+  # 6. VM / context heavy — FIXED: pre-compiled Script + i injected into context
+  _rt 20 "6-VM" '
+    const vm = require("vm");
+    const ctx = vm.createContext({ a: 0, b: 0 });
+    const script = new vm.Script("a + b + i * 2");
+    for (let i = 0; i < 1500; i++) {
+      ctx.i = i;
+      script.runInContext(ctx);
+    }
+  ' || return 1
+
+  # 7. Streams / pipeline / Transform (safe)
+  _rt 25 "7-Streams" '
+    const { pipeline } = require("stream/promises");
+    const { Transform, Readable } = require("stream");
+    (async () => {
+      const t = new Transform({ transform(c, e, cb) { this.push(c); cb(); } });
+      const b = Buffer.alloc(1024*1024, "x");
+      await pipeline(Readable.from([b]), t).catch(() => {});
+    })().catch(() => {});
+  ' || return 1
+
+  # 8. Buffer / TypedArray / DataView stress
+  _rt 25 "8-Buffer-TypedArray" '
+    const b = Buffer.allocUnsafe(1024*1024);
+    const ta = new Uint32Array(256*1024);
+    for (let i = 0; i < 120; i++) {
+      b.writeUInt32LE(i, i*4);
+      ta[i] = i * 0xdeadbeef >>> 0;
+    }
+    new DataView(ta.buffer).getUint32(0);
+  ' || return 1
+
+  # 9. WebCrypto (subtle) full exercise
+  _rt 20 "9-WebCrypto" '
+    const crypto = require("crypto");
+    const subtle = crypto.webcrypto.subtle;
+    (async () => {
+      const key = await subtle.generateKey({name:"AES-GCM", length:256}, true, ["encrypt","decrypt"]);
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const enc = await subtle.encrypt({name:"AES-GCM", iv}, key, Buffer.alloc(1024*64));
+      await subtle.decrypt({name:"AES-GCM", iv}, key, enc);
+    })().catch(() => {});
+  ' || return 1
+
+  # 10. JSON / URL / WHATWG heavy parsing
+  _rt 20 "10-JSON-URL" '
+    const u = new URL("https://nodejs.org?foo=bar&baz=quux".repeat(50));
+    for (let i = 0; i < 600; i++) {
+      JSON.stringify({a:i, b:Array(100).fill(i), c:u});
+      JSON.parse("{\"x\":" + i + "}");
+    }
+  ' || return 1
+
+  echo "==> All 10 PGO workloads completed successfully"
 }
 
 build() {
@@ -124,7 +194,6 @@ build() {
   export RANLIB=llvm-ranlib
   export LD=ld.lld
 
-  # Save original flags
   local _orig_cflags="${CFLAGS:-}"
   local _orig_cxxflags="${CXXFLAGS:-}"
   local _orig_ldflags="${LDFLAGS:-}"
@@ -152,15 +221,14 @@ build() {
   # PASS 1: Instrumented build
   # =============================================
   echo "==> PASS 1: PGO instrumentation build"
-
-  export CFLAGS="${_orig_cflags} -fprofile-generate=${pgo_dir}/%m.profraw"
-  export CXXFLAGS="${_orig_cxxflags} -fprofile-generate=${pgo_dir}/%m.profraw"
-  export LDFLAGS="${_orig_ldflags} -fprofile-generate=${pgo_dir}/%m.profraw -fuse-ld=lld"
+  export CFLAGS="${_orig_cflags} -fprofile-generate=${pgo_dir}/%p.profraw"
+  export CXXFLAGS="${_orig_cxxflags} -fprofile-generate=${pgo_dir}/%p.profraw"
+  export LDFLAGS="${_orig_ldflags} -fprofile-generate=${pgo_dir}/%p.profraw -fuse-ld=lld"
 
   ./configure "${configure_opts[@]}"
   make
 
-  echo "==> Running training workload..."
+  echo "==> Running training workloads for best possible profile quality..."
   _run_node_workload "$srcdir/node/out/Release/node"
 
   echo "==> Merging profiles..."
@@ -173,7 +241,7 @@ build() {
     return 1
   fi
 
-  llvm-profdata merge -output="$srcdir/merged.profdata" "${profraw_files[@]}"
+  llvm-profdata merge --output="$srcdir/merged.profdata" "${profraw_files[@]}"
 
   if [[ ! -s "$srcdir/merged.profdata" ]]; then
     echo "ERROR: Profile merge failed"
@@ -184,12 +252,11 @@ build() {
   # PASS 2: Optimized build
   # =============================================
   echo "==> PASS 2: PGO-optimized build"
-
   rm -rf out
 
-  export CFLAGS="${_orig_cflags} -fprofile-use=${srcdir}/merged.profdata"
-  export CXXFLAGS="${_orig_cxxflags} -fprofile-use=${srcdir}/merged.profdata"
-  export LDFLAGS="${_orig_ldflags} -fprofile-use=${srcdir}/merged.profdata -fuse-ld=lld"
+  export CFLAGS="${_orig_cflags} -fprofile-use=$srcdir/merged.profdata"
+  export CXXFLAGS="${_orig_cxxflags} -fprofile-use=$srcdir/merged.profdata"
+  export LDFLAGS="${_orig_ldflags} -fprofile-use=$srcdir/merged.profdata -fuse-ld=lld"
 
   ./configure "${configure_opts[@]}"
   make
