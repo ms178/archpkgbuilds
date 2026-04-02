@@ -1440,9 +1440,6 @@ optimizations.extend([
     (('fsat', ('fadd', ('b2f', 'a@1'), ('fneg', ('b2f', 'b@1')))), ('b2f', ('iand', a, ('inot', b)))),
     (('fmax', ('fadd', ('b2f', 'a@1'), ('fneg', ('b2f', 'b@1'))), 0.0), ('b2f', ('iand', a, ('inot', b)))),
 
-    (('iand', 'a@bool16', 1.0), ('b2f', a)),
-    (('iand', 'a@bool32', 1.0), ('b2f', a)),
-
     (('fmul(nsz,is_not_only_used_by_fadd)',  ('b2f', 'a@1'), 'b(is_finite)'),           ('bcsel', a, ('fcanonicalize', b), 0.0)),
     (('fmul(nsz,is_not_only_used_by_fadd)',  ('fneg', ('b2f', 'a@1')), 'b(is_finite)'), ('bcsel', a, ('fneg', b), 0.0)),
     (('fmulz(nsz,is_not_only_used_by_fadd)', ('b2f', 'a@1'), b),           ('bcsel', a, ('fcanonicalize', b), 0.0)),
@@ -3713,7 +3710,6 @@ for s in (16, 32, 64):
     late_optimizations.extend([
         (('~fadd@{}'.format(s), 1.0, ('fmul(is_used_once)', c, ('fadd', b, -1.0))),
          ('fadd', ('fadd', 1.0, ('fneg', c)), ('fmul', b, c)), f'options->lower_flrp{s}'),
-        (('bcsel', a, 0, ('b2f{}'.format(s), ('inot', 'b@bool'))), ('b2f{}'.format(s), ('inot', ('ior', a, b)))),
     ])
 
 
