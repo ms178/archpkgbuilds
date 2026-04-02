@@ -72,8 +72,8 @@ denorm_ftz_64 = 'nir_is_denorm_flush_to_zero(info->float_controls_execution_mode
 # opcodes.
 #
 # All expression types can have a bit-size specified.  For opcodes, this
-# looks like "op@32", for variables it is "a@32" or "a@uint32" to specify a
-# type and size.  In the search half of the expression this indicates that it
+# looks like "op@32", for variables it is "a@32" to specify a size.
+# In the search half of the expression this indicates that it
 # should only match that particular bit-size.  In the replace half of the
 # expression this indicates that the constructed value should have that
 # bit-size.
@@ -1620,8 +1620,6 @@ optimizations.extend([
    (('fsat', ('fadd', ('b2f', 'a@1'), ('b2f', 'b@1'))), ('b2f', ('ior', a, b))),
    (('fsat', ('fadd', ('b2f', 'a@1'), ('fneg', ('b2f', 'b@1')))), ('b2f', ('iand', a, ('inot', b)))),
    (('fmax', ('fadd', ('b2f', 'a@1'), ('fneg', ('b2f', 'b@1'))), 0.0), ('b2f', ('iand', a, ('inot', b)))),
-   (('iand', 'a@bool16', 1.0), ('b2f', a)),
-   (('iand', 'a@bool32', 1.0), ('b2f', a)),
 
    # For this optimization, there are a few things to consider:
    # The replacement must flush denorms, fcanonicalize/fneg takes care of that.
@@ -3976,7 +3974,6 @@ late_optimizations += [
 for s in [16, 32, 64]:
     late_optimizations.extend([
        (('~fadd@{}'.format(s), 1.0, ('fmul(is_used_once)', c , ('fadd', b, -1.0 ))), ('fadd', ('fadd', 1.0, ('fneg', c)), ('fmul', b, c)), 'options->lower_flrp{}'.format(s)),
-       (('bcsel', a, 0, ('b2f{}'.format(s), ('inot', 'b@bool'))), ('b2f{}'.format(s), ('inot', ('ior', a, b)))),
     ])
 
 for op in ['fadd']:
