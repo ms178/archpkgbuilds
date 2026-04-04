@@ -1,0 +1,221 @@
+# Maintainer: Felix Yan <felixonmars@archlinux.org>
+# Contributor: Deon Spengler <deon@spengler.co.za>
+# PGO/CS-PGO: Clang IR-based instrumentation + context-sensitive profiling
+
+pkgname=ddcutil
+pkgver=2.2.6
+pkgrel=4.1
+pkgdesc='Query and change Linux monitor settings using DDC/CI and USB.'
+url='http://ddcutil.com/'
+arch=('x86_64')
+license=('GPL-2.0-or-later')
+depends=('gcc-libs' 'glibc' 'glib2' 'i2c-tools' 'libusb' 'libdrm' 'jansson' 'libx11' 'libxext' 'libxrandr' 'systemd-libs')
+makedepends=('git' 'systemd' 'clang' 'llvm')
+source=(git+https://github.com/rockowitz/ddcutil.git#tag=v$pkgver)
+sha512sums=('9b610790a8fba7273c1f9870b6f494de5b3b45be9b189667df5d20e3224119db1177f844af6a108ee2b17dbc752861500ddfdd7ed445e5296286771a36adaa07')
+
+prepare() {
+  cd ddcutil
+
+  autoreconf -fiv
+}
+
+# ──────────────────────────────────────────────────────────────
+# PGO training workload for ddcutil
+#
+# ddcutil is a hardware-interfacing tool — most real functionality
+# requires an actual monitor connected via DDC/CI. However, a
+# significant portion of the code executes on every invocation
+# regardless of hardware presence:
+#
+#   • CLI argument parsing & dispatch
+#   • VCP feature table lookups (pure in-memory data structures)
+#   • Environment/sysfs/DRM probing
+#   • I2C bus enumeration & capability detection
+#   • Error handling & diagnostic formatting
+#   • libddcutil initialization & teardown
+#
+# This workload exercises all of those paths comprehensively.
+# The || true on every command ensures the workload completes
+# even when commands fail due to absent hardware.
+# ──────────────────────────────────────────────────────────────
+_pgo_training() {
+  msg2 "Executing PGO training workload..."
+
+  # Locate the ddcutil binary in the build tree.
+  # autotools+libtool creates a wrapper script that sets up
+  # LD_LIBRARY_PATH to find the not-yet-installed libddcutil.
+  # We prefer the wrapper (not .libs/) for correct library resolution.
+  local _bin
+  _bin="$(find . -maxdepth 5 -name ddcutil -executable \
+    -not -path '*/.libs/*' -not -path '*/test*' 2>/dev/null | head -1)"
+
+  if [[ -z "${_bin}" ]]; then
+    _bin="$(find . -maxdepth 5 -name ddcutil -executable 2>/dev/null | head -1)"
+  fi
+
+  if [[ -z "${_bin}" ]]; then
+    warning "ddcutil binary not found — falling back to make check"
+    make check -j1 &>/dev/null || true
+    return
+  fi
+
+  msg2 "Training binary: ${_bin}"
+
+  # ── Test suite (most comprehensive coverage) ──
+  make check -j1 &>/dev/null || true
+
+  # ── CLI infrastructure ──
+  "${_bin}" --help &>/dev/null || true
+  "${_bin}" --version &>/dev/null || true
+
+  # ── Subcommand help dispatchers ──
+  for _cmd in detect capabilities getvcp setvcp scs dumpvcp loadvcp \
+              environment vcpinfo probe chkusbmon; do
+    "${_bin}" "${_cmd}" --help &>/dev/null || true
+  done
+
+  # ── VCP feature table: exhaustive lookup (0x00–0xFF) ──
+  # Pure in-memory: looks up feature definitions, names, version-specific
+  # support flags, and value formatting for every possible VCP code.
+  "${_bin}" vcpinfo &>/dev/null || true
+  "${_bin}" vcpinfo --verbose &>/dev/null || true
+  for _code in $(seq 0 255); do
+    printf -v _hex '0x%02X' "${_code}"
+    "${_bin}" vcpinfo "${_hex}" &>/dev/null || true
+  done
+
+  # ── Environment probing ──
+  # Exercises sysfs, /dev enumeration, DRM connectors, udev queries,
+  # display adapter detection, driver identification.
+  "${_bin}" environment &>/dev/null || true
+  "${_bin}" environment --verbose &>/dev/null || true
+
+  # ── Monitor detection ──
+  # Full detection pipeline: I2C bus enumeration, /dev/i2c-* open
+  # attempts, EDID reading infrastructure, DRM lease checking.
+  "${_bin}" detect &>/dev/null || true
+  "${_bin}" detect --verbose &>/dev/null || true
+
+  # ── Error handling paths ──
+  # These fail (no hardware / invalid args) but exercise error
+  # codepaths that are hit frequently in normal usage.
+  "${_bin}" getvcp 0x10 --display 1 &>/dev/null || true
+  "${_bin}" getvcp 0x10 --bus 0 &>/dev/null || true
+  "${_bin}" capabilities --display 1 &>/dev/null || true
+  "${_bin}" setvcp 0x10 50 --display 1 --noverify &>/dev/null || true
+  "${_bin}" probe --display 1 &>/dev/null || true
+  "${_bin}" dumpvcp --display 1 &>/dev/null || true
+  "${_bin}" --nonexistent-option &>/dev/null || true
+  "${_bin}" getvcp INVALID &>/dev/null || true
+
+  # ── Repeat hot paths for statistical significance ──
+  # Real-world pattern: detect → getvcp/setvcp → repeat.
+  # 30 iterations builds representative branch probability counters.
+  for _iter in $(seq 1 30); do
+    "${_bin}" detect &>/dev/null || true
+    "${_bin}" vcpinfo 0x10 &>/dev/null || true
+    "${_bin}" environment &>/dev/null || true
+  done
+}
+
+build() {
+  cd ddcutil
+
+  export CC=clang
+  export CXX=clang++
+
+  # Suppress expected PGO/Clang warnings:
+  #   profile-instr-*:  not all code paths reachable without monitor hardware
+  #   unused-command-line-argument:  user CFLAGS may contain GCC-only flags
+  local _nowarn="-Wno-profile-instr-out-of-date \
+    -Wno-profile-instr-unprofiled \
+    -Wno-profile-instr-missing \
+    -Wno-unused-command-line-argument"
+
+  local _pgo_dir="${srcdir}/pgo-standard"
+  local _cspgo_dir="${srcdir}/pgo-cs"
+  mkdir -p "${_pgo_dir}" "${_cspgo_dir}"
+
+  # ═══════════════════════════════════════════════════════════════
+  # Stage 1: Build with IR-based PGO instrumentation
+  #
+  # -fprofile-generate inserts counters at every edge in the CFG.
+  # The =<dir> form enables automatic raw profile merging (%m)
+  # so concurrent/repeated runs don't clobber each other.
+  # ═══════════════════════════════════════════════════════════════
+  msg "PGO Stage 1/5: Building instrumented binary..."
+  ./configure --prefix=/usr --disable-build-timestamp \
+    CFLAGS="${CFLAGS} ${_nowarn} -fprofile-generate=${_pgo_dir}" \
+    LDFLAGS="${LDFLAGS} -fprofile-generate=${_pgo_dir}"
+  make
+
+  # ═══════════════════════════════════════════════════════════════
+  # Stage 2: Collect standard profiles
+  # ═══════════════════════════════════════════════════════════════
+  msg "PGO Stage 2/5: Training (standard instrumentation)..."
+  _pgo_training
+
+  msg2 "Merging standard profiles..."
+  llvm-profdata merge -output="${srcdir}/standard.profdata" "${_pgo_dir}/"
+  msg2 "Standard profile: $(llvm-profdata show "${srcdir}/standard.profdata" 2>/dev/null \
+    | grep -c 'Hash:' || echo '?') functions profiled"
+
+  make clean
+
+  # ═══════════════════════════════════════════════════════════════
+  # Stage 3: Build with standard profile + CS-PGO instrumentation
+  #
+  # -fprofile-use applies the standard profile for optimization.
+  # -fcs-profile-generate adds a SECOND instrumentation pass that
+  # runs AFTER inlining. This captures call-site context that
+  # standard PGO cannot — e.g., the same function inlined at
+  # different call sites may have different branch probabilities.
+  # ═══════════════════════════════════════════════════════════════
+  msg "PGO Stage 3/5: Building CS-PGO instrumented binary..."
+  ./configure --prefix=/usr --disable-build-timestamp \
+    CFLAGS="${CFLAGS} ${_nowarn} -fprofile-use=${srcdir}/standard.profdata -fcs-profile-generate=${_cspgo_dir}" \
+    LDFLAGS="${LDFLAGS} -fprofile-use=${srcdir}/standard.profdata -fcs-profile-generate=${_cspgo_dir}"
+  make
+
+  # ═══════════════════════════════════════════════════════════════
+  # Stage 4: Collect context-sensitive profiles
+  # ═══════════════════════════════════════════════════════════════
+  msg "PGO Stage 4/5: Training (context-sensitive instrumentation)..."
+  _pgo_training
+
+  # Merge CS profiles WITH the standard profiles. The combined
+  # profile contains data at both instrumentation points, which
+  # -fprofile-use reads at their respective locations in the pipeline.
+  msg2 "Merging combined (standard + CS) profiles..."
+  llvm-profdata merge -output="${srcdir}/combined.profdata" \
+    "${_cspgo_dir}/" "${srcdir}/standard.profdata"
+  msg2 "Combined profile: $(llvm-profdata show "${srcdir}/combined.profdata" 2>/dev/null \
+    | grep -c 'Hash:' || echo '?') functions profiled"
+
+  make clean
+
+  # ═══════════════════════════════════════════════════════════════
+  # Stage 5: Final optimized build
+  #
+  # -fprofile-use with the combined profile applies both standard
+  # and context-sensitive data. The compiler uses this to:
+  #   • Reorder basic blocks for fall-through on hot paths
+  #   • Make better inlining decisions (context-sensitive costs)
+  #   • Optimize branch prediction hints
+  #   • Improve register allocation on hot paths
+  #   • Size-optimize cold functions
+  # ═══════════════════════════════════════════════════════════════
+  msg "PGO Stage 5/5: Building final optimized binary..."
+  ./configure --prefix=/usr --disable-build-timestamp \
+    CFLAGS="${CFLAGS} ${_nowarn} -fprofile-use=${srcdir}/combined.profdata" \
+    LDFLAGS="${LDFLAGS} -fprofile-use=${srcdir}/combined.profdata"
+  make
+}
+
+package() {
+  cd ddcutil
+  make DESTDIR="$pkgdir" install
+}
+
+# vim: ft=sh ts=2 sw=2 et
