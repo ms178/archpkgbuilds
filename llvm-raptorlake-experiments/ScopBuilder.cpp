@@ -375,14 +375,14 @@ isl::set ScopBuilder::adjustDomainDimensions(isl::set Dom, Loop *OldL,
   return Dom;
 }
 
-__isl_give isl_pw_aff *
+isl::pw_aff
 ScopBuilder::getPwAff(BasicBlock *BB,
                       DenseMap<BasicBlock *, isl::set> &InvalidDomainMap,
                       const SCEV *E, bool NonNegative, bool IsInsideDomain) {
   PWACtx PWAC =
-  scop->getPwAff(E, BB, NonNegative, &RecordedAssumptions, IsInsideDomain);
+      scop->getPwAff(E, BB, NonNegative, &RecordedAssumptions, IsInsideDomain);
   InvalidDomainMap[BB] = InvalidDomainMap[BB].unite(PWAC.second);
-  return PWAC.first.release();
+  return std::move(PWAC.first);
 }
 
 /// Build condition sets for unsigned ICmpInst(s).
@@ -401,10 +401,12 @@ __isl_give isl_set *ScopBuilder::buildUnsignedConditionSets(
   // Do not take NonNeg assumption on TestVal
   // as it might have MSB (Sign bit) set.
   isl_pw_aff *TestVal = getPwAff(BB, InvalidDomainMap, SCEV_TestVal,
-                                 /*NonNegative=*/false, IsInsideDomain);
+                                 /*NonNegative=*/false, IsInsideDomain)
+                            .release();
   // Take NonNeg assumption on UpperBound.
   isl_pw_aff *UpperBound = getPwAff(BB, InvalidDomainMap, SCEV_UpperBound,
-                                    /*NonNegative=*/true, IsInsideDomain);
+                                    /*NonNegative=*/true, IsInsideDomain)
+                               .release();
 
   // 0 <= TestVal
   isl_set *First =
@@ -431,8 +433,10 @@ bool ScopBuilder::buildConditionSets(
   Value *Condition = SI->getCondition();
   assert(Condition && "No condition for switch");
 
-  isl_pw_aff *LHS = getPwAff(BB, InvalidDomainMap, SE.getSCEVAtScope(Condition, L),
-                             /*NonNegative=*/false, IsInsideDomain);
+  isl_pw_aff *LHS =
+      getPwAff(BB, InvalidDomainMap, SE.getSCEVAtScope(Condition, L),
+               /*NonNegative=*/false, IsInsideDomain)
+          .release();
 
   unsigned NumSuccessors = SI->getNumSuccessors();
   ConditionSets.resize(NumSuccessors);
@@ -440,8 +444,10 @@ bool ScopBuilder::buildConditionSets(
     unsigned Idx = Case.getSuccessorIndex();
     ConstantInt *CaseValue = Case.getCaseValue();
 
-    isl_pw_aff *RHS = getPwAff(BB, InvalidDomainMap, SE.getSCEV(CaseValue),
-                                /*NonNegative=*/false, IsInsideDomain);
+    isl_pw_aff *RHS =
+        getPwAff(BB, InvalidDomainMap, SE.getSCEV(CaseValue),
+                 /*NonNegative=*/false, IsInsideDomain)
+            .release();
     isl_set *CaseConditionSet =
         buildConditionSet(ICmpInst::ICMP_EQ, isl::manage_copy(LHS),
                           isl::manage(RHS))
@@ -473,9 +479,11 @@ bool ScopBuilder::buildConditionSets(
     const SCEV *RHSSCEV = SE.getZero(LHSSCEV->getType());
     bool NonNeg = false;
     isl_pw_aff *LHS =
-        getPwAff(BB, InvalidDomainMap, LHSSCEV, NonNeg, IsInsideDomain);
+        getPwAff(BB, InvalidDomainMap, LHSSCEV, NonNeg, IsInsideDomain)
+            .release();
     isl_pw_aff *RHS =
-        getPwAff(BB, InvalidDomainMap, RHSSCEV, NonNeg, IsInsideDomain);
+        getPwAff(BB, InvalidDomainMap, RHSSCEV, NonNeg, IsInsideDomain)
+            .release();
     ConsequenceCondSet = buildConditionSet(ICmpInst::ICMP_SLE, isl::manage(LHS),
                                            isl::manage(RHS))
                              .release();
@@ -559,9 +567,11 @@ bool ScopBuilder::buildConditionSets(
       break;
     default: {
       isl_pw_aff *LHS =
-          getPwAff(BB, InvalidDomainMap, LeftOperand, NonNeg, IsInsideDomain);
+          getPwAff(BB, InvalidDomainMap, LeftOperand, NonNeg, IsInsideDomain)
+              .release();
       isl_pw_aff *RHS =
-          getPwAff(BB, InvalidDomainMap, RightOperand, NonNeg, IsInsideDomain);
+          getPwAff(BB, InvalidDomainMap, RightOperand, NonNeg, IsInsideDomain)
+              .release();
       ConsequenceCondSet =
           buildConditionSet(ICond->getPredicate(), isl::manage(LHS),
                             isl::manage(RHS))
@@ -3958,8 +3968,8 @@ static void verifyUses(Scop *S, LoopInfo &LI, DominatorTree &DT) {
 #endif
 
 void ScopBuilder::buildScop(Region &R, AssumptionCache &AC) {
-  scop.reset(new Scop(R, SE, LI, DT, *SD.getDetectionContext(&R), ORE,
-                      SD.getNextID()));
+  scop = Scop::makeScop(R, SE, LI, DT, *SD.getDetectionContext(&R), ORE,
+                        SD.getNextID());
 
   buildStmts(R);
 
