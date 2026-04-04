@@ -368,16 +368,20 @@ for s in [16, 32, 64]:
         (('~fadd@{}'.format(s), ('fmul', a, ('fadd', 1.0, ('fneg', c))), ('fmul', b, c)), ('flrp', a, b, c), '!options->lower_flrp{}'.format(s)),
         (('~fadd@{}'.format(s), ('fmul', a, ('fsat', ('fadd', 1.0, ('fneg', c)))), ('fmul', b, ('fsat', c))), ('flrp', a, b, ('fsat', c)), '!options->lower_flrp{}'.format(s)),
         (('~fadd@{}'.format(s), a, ('fmul', c, ('fadd', b, ('fneg', a)))), ('flrp', a, b, c), '!options->lower_flrp{}'.format(s)),
-        (('~fadd@{}'.format(s), ('fmul', a, ('fadd', 1.0, ('fneg', ('b2f', 'c@1')))), ('fmul', b, ('b2f', c))), ('bcsel', c, b, a), 'options->lower_flrp{}'.format(s)),
-        (('~fadd@{}'.format(s), a, ('fmul', ('b2f', 'c@1'), ('fadd', b, ('fneg', a)))), ('bcsel', c, ('fcanonicalize', b), ('fcanonicalize', a)), 'options->lower_flrp{}'.format(s)),
-        (('~ffma@{}'.format(s), a, ('fadd', 1.0, ('fneg', ('b2f', 'c@1'))), ('fmul', b, ('b2f', 'c@1'))), ('bcsel', c, ('fcanonicalize', b), ('fcanonicalize', a))),
-        (('~ffma@{}'.format(s), b, ('b2f', 'c@1'), ('ffma', ('fneg', a), ('b2f', 'c@1'), a)), ('bcsel', c, ('fcanonicalize', b), ('fcanonicalize', a))),
-        (('~ffma@{}'.format(s), ('b2f', 'c@1'), ('fadd', b, ('fneg', a)), a), ('bcsel', c, ('fcanonicalize', b), ('fcanonicalize', a))),
-        (('~ffma@{}'.format(s), ('b2f', 'c@1'), ('ffma', ('fneg', a), b, d), ('fmul', a, b)), ('bcsel', c, ('fcanonicalize', d), ('fmul', a, b))),
         (('~fadd@{}'.format(s), 1.0, ('fneg', ('fmul', ('fadd', 1.0, ('fneg', a)), ('fadd', 1.0, ('fneg', b))))), ('flrp', b, 1.0, a), '!options->lower_flrp{}'.format(s)),
     ])
 
 optimizations.extend([
+
+    (('~fadd', ('fmul', a, ('b2f', ('inot', 'c@1'))), ('fmul', b, ('b2f',  c))), ('bcsel', c, ('fcanonicalize', b), ('fcanonicalize', a))),
+    (('~fadd', a, ('fmul', ('b2f', 'c@1'), ('fadd', b, ('fneg', a)))), ('bcsel', c, ('fcanonicalize', b), ('fcanonicalize', a))),
+
+    (('~ffma', a, ('b2f', ('inot', 'c@1')), ('fmul', b, ('b2f', 'c@1'))), ('bcsel', c, ('fcanonicalize', b), ('fcanonicalize', a))),
+    (('~ffma', b, ('b2f', 'c@1'), ('ffma', ('fneg', a), ('b2f', 'c@1'), a)), ('bcsel', c, ('fcanonicalize', b), ('fcanonicalize', a))),
+
+    (('~ffma', ('b2f', 'c@1'), ('fadd', b, ('fneg', a)), a), ('bcsel', c, ('fcanonicalize', b), ('fcanonicalize', a))),
+    (('~ffma', ('b2f', 'c@1'), ('ffma', ('fneg', a), b, d), ('fmul', a, b)), ('bcsel', c, ('fcanonicalize', d), ('fmul', a, b))),
+
     (('~flrp', ('fmul(is_used_once)', a, b), ('fmul(is_used_once)', a, c), d), ('fmul', ('flrp', b, c, d), a)),
     (('~flrp', a, 0.0, c), ('fadd', ('fmul', ('fneg', a), c), a)),
 
@@ -697,12 +701,66 @@ optimizations.extend([
    (('ieq', ('iadd', a, b), a), ('ieq', b, 0)),
    (('ine', ('iadd', a, b), a), ('ine', b, 0)),
 
+   # Cancel subtraction-shaped integer compare patterns exactly.
+   # These are common after isub -> iadd + ineg canonicalization.
+   (('ieq', ('iadd', a, ('ineg', b)), 0), ('ieq', a, b)),
+   (('ieq', 0, ('iadd', a, ('ineg', b))), ('ieq', a, b)),
+   (('ine', ('iadd', a, ('ineg', b)), 0), ('ine', a, b)),
+   (('ine', 0, ('iadd', a, ('ineg', b))), ('ine', a, b)),
+
+   (('ieq', ('iadd', a, ('ineg', c)), ('iadd', b, ('ineg', c))), ('ieq', a, b)),
+   (('ine', ('iadd', a, ('ineg', c)), ('iadd', b, ('ineg', c))), ('ine', a, b)),
+   (('ieq', ('iadd', c, ('ineg', a)), ('iadd', c, ('ineg', b))), ('ieq', a, b)),
+   (('ine', ('iadd', c, ('ineg', a)), ('iadd', c, ('ineg', b))), ('ine', a, b)),
+
+   # Cancel common addends in integer equality/inequality tests
+   (('ieq', ('iadd', a, b), ('iadd', c, b)), ('ieq', a, c)),
+   (('ine', ('iadd', a, b), ('iadd', c, b)), ('ine', a, c)),
+   (('ieq', ('iadd', a, b), ('iadd', a, c)), ('ieq', b, c)),
+   (('ine', ('iadd', a, b), ('iadd', a, c)), ('ine', b, c)),
+
+   # Fold subtraction-like compare-to-zero patterns into direct integer compares
+   (('ieq', ('iadd', a, ('ineg', b)), 0), ('ieq', a, b)),
+   (('ieq', 0, ('iadd', a, ('ineg', b))), ('ieq', a, b)),
+   (('ine', ('iadd', a, ('ineg', b)), 0), ('ine', a, b)),
+   (('ine', 0, ('iadd', a, ('ineg', b))), ('ine', a, b)),
+
+   # Cancel common xor masks in integer equality/inequality tests
+   (('ieq', ('ixor', a, b), ('ixor', c, b)), ('ieq', a, c)),
+   (('ine', ('ixor', a, b), ('ixor', c, b)), ('ine', a, c)),
+   (('ieq', ('ixor', a, b), ('ixor', a, c)), ('ieq', b, c)),
+   (('ine', ('ixor', a, b), ('ixor', a, c)), ('ine', b, c)),
+
    (('ieq', 'a@1', False), ('inot', a)),
    (('ieq', 'a@1', True), a),
    (('ieq', ('b2i', 'a@1'), ('b2i', 'b@1')), ('ieq', a, b)),
    (('ine', 'a@1', False), a),
    (('ine', 'a@1', True), ('inot', a)),
    (('ine', ('b2i', 'a@1'), ('b2i', 'b@1')), ('ixor', a, b)),
+
+   # Fold compares on boolean casts back to pure boolean logic.
+   # This helps scalarization and removes pointless b2i/b2f materialization.
+   (('ieq', ('b2i', 'a@1'), 0), ('inot', a)),
+   (('ieq', 0, ('b2i', 'a@1')), ('inot', a)),
+   (('ine', ('b2i', 'a@1'), 0), a),
+   (('ine', 0, ('b2i', 'a@1')), a),
+   (('ieq', ('b2i', 'a@1'), 1), a),
+   (('ine', ('b2i', 'a@1'), 1), ('inot', a)),
+   (('ult', ('b2i', 'a@1'), 1), ('inot', a)),
+   (('uge', ('b2i', 'a@1'), 1), a),
+   (('uge', 0, ('b2i', 'a@1')), ('inot', a)),
+   (('ult', 0, ('b2i', 'a@1')), a),
+
+   (('feq', ('b2f', 'a@1'), 0.0), ('inot', a)),
+   (('feq', 0.0, ('b2f', 'a@1')), ('inot', a)),
+   (('fneu', ('b2f', 'a@1'), 0.0), a),
+   (('fneu', 0.0, ('b2f', 'a@1')), a),
+   (('feq', ('b2f', 'a@1'), 1.0), a),
+   (('fneu', ('b2f', 'a@1'), 1.0), ('inot', a)),
+   (('flt', 0.0, ('b2f', 'a@1')), a),
+   (('fge', 0.0, ('b2f', 'a@1')), ('inot', a)),
+   (('flt', ('b2f', 'a@1'), 1.0), ('inot', a)),
+   (('fge', ('b2f', 'a@1'), 1.0), a),
 
    (('fneu', ('u2f', a), 0.0), ('ine', a, 0)),
    (('feq', ('u2f', a), 0.0), ('ieq', a, 0)),
@@ -1245,6 +1303,29 @@ optimizations.extend([
 
     (('ult', a, ('umax', b, a)), ('ult', a, b)),
     (('ult', ('umin', a, b), a), ('ult', b, a)),
+
+    # Collapse integer min/max compared against one of their operands into direct compares.
+    # This is exact and exposes simpler SALU-friendly compare structure for ACO/GFX9.
+    (('ieq', ('umin', a, b), a), ('uge', b, a)),
+    (('ieq', ('umin', a, b), b), ('uge', a, b)),
+    (('ine', ('umin', a, b), a), ('ult', b, a)),
+    (('ine', ('umin', a, b), b), ('ult', a, b)),
+
+    (('ieq', ('umax', a, b), a), ('uge', a, b)),
+    (('ieq', ('umax', a, b), b), ('uge', b, a)),
+    (('ine', ('umax', a, b), a), ('ult', a, b)),
+    (('ine', ('umax', a, b), b), ('ult', b, a)),
+
+    (('ieq', ('imin', a, b), a), ('ige', b, a)),
+    (('ieq', ('imin', a, b), b), ('ige', a, b)),
+    (('ine', ('imin', a, b), a), ('ilt', b, a)),
+    (('ine', ('imin', a, b), b), ('ilt', a, b)),
+
+    (('ieq', ('imax', a, b), a), ('ige', a, b)),
+    (('ieq', ('imax', a, b), b), ('ige', b, a)),
+    (('ine', ('imax', a, b), a), ('ilt', a, b)),
+    (('ine', ('imax', a, b), b), ('ilt', b, a)),
+
     (('uge', a, ('umin', b, a)), True),
     (('uge', ('umax', a, b), a), True),
     (('ilt', a, ('imin', b, a)), False),
@@ -3321,6 +3402,12 @@ before_ffma_optimizations = [
     (('iadd', ('ineg', a), a), 0),
     (('iadd', ('ineg', a), ('iadd', a, b)), b),
     (('iadd', a, ('iadd', ('ineg', a), b)), b),
+    # Exact modular integer cancellation after reassociation
+    (('iadd', ('iadd(is_used_once)', a, b), ('ineg', a)), b),
+    (('iadd', ('iadd(is_used_once)', a, b), ('ineg', b)), a),
+    (('iadd', ('iadd(is_used_once)', a, ('ineg', b)), b), a),
+    (('iadd', ('iadd(is_used_once)', ('ineg', a), b), a), b),
+
     (('~fadd', ('fneg', a), ('fadd', a, b)), ('fcanonicalize', b)),
     (('~fadd', a, ('fadd', ('fneg', a), b)), ('fcanonicalize', b)),
 
