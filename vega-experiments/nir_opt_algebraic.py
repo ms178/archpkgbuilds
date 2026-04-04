@@ -2302,6 +2302,19 @@ optimizations.extend([
    (('find_lsb', ('bitfield_reverse', 'a@32')), ('ufind_msb_rev', a), 'options->has_find_msb_rev'),
    (('ufind_msb_rev', ('bitfield_reverse', 'a@32')), ('find_lsb', a), '!options->lower_find_lsb'),
 
+   # x & -x isolates the lowest set bit exactly.
+   # Collapse lowbit idioms back to direct bit-scan / zero-test forms.
+   (('find_lsb', ('iand', a, ('ineg', a))), ('find_lsb', a)),
+   (('find_lsb', ('iand', ('ineg', a), a)), ('find_lsb', a)),
+
+   (('ufind_msb', ('iand', 'a@32', ('ineg', 'a@32'))), ('find_lsb', a)),
+   (('ufind_msb', ('iand', ('ineg', 'a@32'), 'a@32')), ('find_lsb', a)),
+
+   (('ieq', ('iand', a, ('ineg', a)), 0), ('ieq', a, 0)),
+   (('ieq', 0, ('iand', a, ('ineg', a))), ('ieq', a, 0)),
+   (('ine', ('iand', a, ('ineg', a)), 0), ('ine', a, 0)),
+   (('ine', 0, ('iand', a, ('ineg', a))), ('ine', a, 0)),
+
    (('ifind_msb', ('f2i32(is_used_once)', a)), ('ufind_msb', ('f2i32', ('fabs', a))), 'true', TestStatus.XFAIL),
    (('ifind_msb', ('extract_u8', a, b)),       ('ufind_msb', ('extract_u8', a, b))),
    (('ifind_msb', ('extract_u16', a, b)),      ('ufind_msb', ('extract_u16', a, b))),
@@ -2476,6 +2489,25 @@ optimizations.extend([
    (('ine', ('iand(is_used_once)', ('ishl', a, '#b'), '#c'), 0), ('ine', ('iand', a, ('ushr', c, b)), 0)),
    (('ieq', ('iand(is_used_once)', ('ushr', a, '#b'), '#c'), 0), ('ieq', ('iand', a, ('ishl', c, b)), 0)),
    (('ieq', ('iand(is_used_once)', ('ishl', a, '#b'), '#c'), 0), ('ieq', ('iand', a, ('ushr', c, b)), 0)),
+])
+
+optimizations.extend([
+   # Sentinel-result compares on bit scans are just zero-tests on the source.
+   # This often removes the bit-scan entirely and exposes scalar-friendly logic.
+   (('ieq', ('find_lsb', a), -1), ('ieq', a, 0)),
+   (('ine', ('find_lsb', a), -1), ('ine', a, 0)),
+   (('ilt', ('find_lsb', a), 0), ('ieq', a, 0)),
+   (('ige', ('find_lsb', a), 0), ('ine', a, 0)),
+
+   (('ieq', ('ufind_msb', 'a@32'), -1), ('ieq', a, 0)),
+   (('ine', ('ufind_msb', 'a@32'), -1), ('ine', a, 0)),
+   (('ilt', ('ufind_msb', 'a@32'), 0), ('ieq', a, 0)),
+   (('ige', ('ufind_msb', 'a@32'), 0), ('ine', a, 0)),
+
+   (('ieq', ('ufind_msb_rev', 'a@32'), -1), ('ieq', a, 0)),
+   (('ine', ('ufind_msb_rev', 'a@32'), -1), ('ine', a, 0)),
+   (('ilt', ('ufind_msb_rev', 'a@32'), 0), ('ieq', a, 0)),
+   (('ige', ('ufind_msb_rev', 'a@32'), 0), ('ine', a, 0)),
 ])
 
 optimizations.extend([
@@ -3167,6 +3199,16 @@ optimizations += [
     (bitfield_reverse_cp2077('x@32'), ('bitfield_reverse', 'x'), '!options->lower_bitfield_reverse'),
 ]
 
+optimizations += [
+    # bitfield_reverse is an involution; popcount and zero/all-ones tests are invariant.
+    # This removes whole reverse trees before lowering, which is excellent for GFX9.
+    (('bitfield_reverse', ('bitfield_reverse', 'a@32')), a),
+    (('bit_count', ('bitfield_reverse', 'a@32')), ('bit_count', a)),
+    (('ieq', ('bitfield_reverse', 'a@32'), 0), ('ieq', a, 0)),
+    (('ine', ('bitfield_reverse', 'a@32'), 0), ('ine', a, 0)),
+    (('ieq', ('bitfield_reverse', 'a@32'), -1), ('ieq', a, -1)),
+    (('ine', ('bitfield_reverse', 'a@32'), -1), ('ine', a, -1)),
+]
 
 def vkd3d_proton_packed_f2f16_rtz_lo(a, abs_a):
     packed_half = ('pack_half_2x16_rtz_split', a, 0)
