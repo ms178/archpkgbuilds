@@ -15,10 +15,13 @@ depends=(
   "${_name}=${pkgver}"
 )
 makedepends=(
+  clang
   cmake
+  compiler-rt
   lib32-expat
-  ninja
+  llvm
   nasm
+  ninja
 )
 provides=(
   libjpeg.so
@@ -37,42 +40,144 @@ b2sums=(
 )
 validpgpkeys=('0338C8D8D9FDA62CF9C421BD7EC2DBB6F4DBF434') # The libjpeg-turbo Project <information@libjpeg-turbo.org>
 
+_cmake_common_options=(
+  -G Ninja
+  -W no-dev
+  -S "${_name}-${pkgver}"
+  -D CMAKE_INSTALL_PREFIX=/usr
+  -D CMAKE_INSTALL_LIBDIR=/usr/lib32
+  -D CMAKE_C_STANDARD=23
+  -D CMAKE_CXX_STANDARD=23
+  -D ENABLE_STATIC=OFF
+  -D BUILD_TESTING=ON
+  -D WITH_JAVA=OFF
+  -D WITH_JPEG8=ON
+  -D WITH_TURBOJPEG=ON
+  -D REQUIRE_SIMD=ON
+)
+
+_pgo_compile_tuning_flags=(
+  -g3
+  -fno-omit-frame-pointer
+  -Xclang -mllvm -Xclang -vp-counters-per-site=50
+  -Xclang -mllvm -Xclang -runtime-counter-relocation
+  -Xclang -mllvm -Xclang -enable-value-profiling
+)
+
+_configure_build() {
+  local builddir=$1
+  local buildtype=$2
+  local compile_flags_extra=$3
+  local linker_flags_extra=$4
+
+  cmake \
+    "${_cmake_common_options[@]}" \
+    -B "${builddir}" \
+    -D CMAKE_BUILD_TYPE="${buildtype}" \
+    -D CMAKE_C_FLAGS="${CFLAGS} ${compile_flags_extra}" \
+    -D CMAKE_CXX_FLAGS="${CXXFLAGS} ${compile_flags_extra}" \
+    -D CMAKE_EXE_LINKER_FLAGS="${LDFLAGS} ${linker_flags_extra}" \
+    -D CMAKE_SHARED_LINKER_FLAGS="${LDFLAGS} ${linker_flags_extra}" \
+    -D CMAKE_MODULE_LINKER_FLAGS="${LDFLAGS} ${linker_flags_extra}"
+}
+
+_run_profiled_tests() {
+  local builddir=$1
+  local profdir=$2
+
+  rm -rf "${profdir}"
+  mkdir -p "${profdir}"
+
+  LLVM_PROFILE_FILE="${profdir}/%m-%p.profraw" \
+    ctest --test-dir "${builddir}" --output-on-failure --stop-on-failure -j"$(nproc)"
+}
+
+_merge_profdata() {
+  local profdir=$1
+  local outfile=$2
+  local -a profraw_files
+
+  mapfile -d '' -t profraw_files < <(find "${profdir}" -type f -name '*.profraw' -print0)
+
+  if (( ${#profraw_files[@]} == 0 )); then
+    printf 'ERROR: no raw profile data was generated in %s\n' "${profdir}" >&2
+    return 1
+  fi
+
+  llvm-profdata merge -output="${outfile}" "${profraw_files[@]}"
+}
+
 build() {
-  local cmake_options=(
-    -B build
-    -S "${_name}-${pkgver}"
-    -G Ninja
-    -W no-dev
-    -D CMAKE_INSTALL_PREFIX=/usr
-    -D CMAKE_INSTALL_LIBDIR=/usr/lib32
-    -D CMAKE_BUILD_TYPE=Release
-    -D CMAKE_C_STANDARD=23
-    -D CMAKE_CXX_STANDARD=23
-    -D ENABLE_STATIC=OFF
-    -D WITH_JAVA=OFF
-    -D WITH_JPEG8=ON
-    -D WITH_TURBOJPEG=ON
-    -D REQUIRE_SIMD=ON
-  )
+  local pgo_profdir="${srcdir}/pgo-data"
+  local cs_pgo_profdir="${srcdir}/cs-pgo-data"
+  local pgo_profdata="${srcdir}/code.profdata"
+  local cs_pgo_profdata="${srcdir}/cs_code.profdata"
+  local cs_pgo_tmp_profdata="${srcdir}/cs_code.tmp.profdata"
+
+  local tuning_flags="${_pgo_compile_tuning_flags[*]}"
+  local pgo_compile_flags="${tuning_flags} -fprofile-generate=${pgo_profdir}"
+  local pgo_link_flags="-fprofile-generate=${pgo_profdir}"
+  local cs_pgo_compile_flags="${tuning_flags} -fprofile-use=${pgo_profdata} -fcs-profile-generate=${cs_pgo_profdir}"
+  local cs_pgo_link_flags="-fprofile-use=${pgo_profdata} -fcs-profile-generate=${cs_pgo_profdir}"
+  local final_compile_flags="-fprofile-use=${cs_pgo_profdata} -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled"
+  local final_link_flags="-fprofile-use=${cs_pgo_profdata}"
 
   export CC="clang -m32"
   export CXX="clang++ -m32"
+  export AR=llvm-ar
+  export NM=llvm-nm
+  export RANLIB=llvm-ranlib
   export PKG_CONFIG="i686-pc-linux-gnu-pkg-config"
 
-  cmake "${cmake_options[@]}"
-  cmake --build build -v
+  rm -rf \
+    build-pgo \
+    build-cs-pgo \
+    build-final \
+    "${pgo_profdir}" \
+    "${cs_pgo_profdir}" \
+    "${pgo_profdata}" \
+    "${cs_pgo_profdata}" \
+    "${cs_pgo_tmp_profdata}"
+
+  echo '==> Building Clang 32-bit PGO-instrumented build...'
+  _configure_build build-pgo None "${pgo_compile_flags}" "${pgo_link_flags}"
+  cmake --build build-pgo -v
+
+  echo '==> Running instrumented test suite to generate initial profile data...'
+  _run_profiled_tests build-pgo "${pgo_profdir}"
+
+  echo '==> Merging initial profile data...'
+  _merge_profdata "${pgo_profdir}" "${pgo_profdata}"
+
+  echo '==> Building Clang 32-bit context-sensitive PGO-instrumented build...'
+  _configure_build build-cs-pgo None "${cs_pgo_compile_flags}" "${cs_pgo_link_flags}"
+  cmake --build build-cs-pgo -v
+
+  echo '==> Running context-sensitive instrumented test suite...'
+  _run_profiled_tests build-cs-pgo "${cs_pgo_profdir}"
+
+  echo '==> Merging context-sensitive profile data...'
+  _merge_profdata "${cs_pgo_profdir}" "${cs_pgo_tmp_profdata}"
+  llvm-profdata merge \
+    -output="${cs_pgo_profdata}" \
+    "${pgo_profdata}" \
+    "${cs_pgo_tmp_profdata}"
+
+  echo '==> Building final Clang 32-bit optimized PGO/CS-PGO build...'
+  _configure_build build-final Release "${final_compile_flags}" "${final_link_flags}"
+  cmake --build build-final -v
 }
 
 check() {
-  ctest --test-dir build --output-on-failure --stop-on-failure -j"$(nproc)"
+  ctest --test-dir build-final --output-on-failure --stop-on-failure -j"$(nproc)"
 }
 
 package() {
-  DESTDIR="${pkgdir}" cmake --install build -v
+  DESTDIR="${pkgdir}" cmake --install build-final -v
 
-  # These are provided by the native libjpeg-turbo package.
+  # Provided by the native libjpeg-turbo package
   rm -rf "${pkgdir}"/usr/{include,share,bin}
 
-  install -vDm 644 "${_name}-${pkgver}"/LICENSE.md -t "${pkgdir}/usr/share/licenses/${pkgname}/"
-  install -vDm 644 "${_name}-${pkgver}"/README.ijg -t "${pkgdir}/usr/share/licenses/${pkgname}/"
+  install -vDm 644 "${_name}-${pkgver}/LICENSE.md" -t "${pkgdir}/usr/share/licenses/${pkgname}/"
+  install -vDm 644 "${_name}-${pkgver}/README.ijg" -t "${pkgdir}/usr/share/licenses/${pkgname}/"
 }
