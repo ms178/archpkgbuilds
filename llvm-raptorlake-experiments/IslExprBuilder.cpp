@@ -795,7 +795,7 @@ Value *IslExprBuilder::create(__isl_take isl_ast_expr *Expr) {
 llvm::Value *IslExprBuilder::createBool(__isl_take isl_ast_expr *Expr) {
   Value *Result = create(Expr);
   if (!Result->getType()->isIntegerTy(1))
-    Result = Builder.CreateICmpNE(Result,
-                                  Constant::getNullValue(Result->getType()));
+    Result =
+        Builder.CreateICmpNE(Result, Constant::getNullValue(Result->getType()));
   return Result;
 }
