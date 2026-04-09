@@ -1409,7 +1409,7 @@ optimizations.extend([
    (('sne', ('slt', a, b), 1.0), ('sge', a, b), 'true', TestStatus.XFAIL),
    (('sne', ('sge', a, b), 1.0), ('slt', a, b), 'true', TestStatus.XFAIL),
 
-   (('f2bf', a), ('bcsel', ('fneu(preserve_nan_inf)', a, a), -1, ('unpack_32_2x16_split_y', a)), 'options->lower_bfloat16_conversions', TestStatus.UNSUPPORTED),
+   (('f2bf', a), ('bcsel', ('fneu(preserve_nan_inf)', a, a), -1, ('unpack_32_2x16_split_y', a)), 'options->lower_bfloat16_conversions'),
    (('bf2f', a), ('pack_32_2x16', ('vec2', 0, a)), 'options->lower_bfloat16_conversions'),
 ])
 
@@ -2612,6 +2612,18 @@ optimizations.extend([
                       ('extract_i8', 'v', 3))),
         127.0))),
      'options->lower_unpack_snorm_4x8'),
+
+    (('f2u32', ('fmul', ('fmul', ('u2f32', ('extract_u16', 'a@32', b)), 0x37800080), 65535.0)),
+     ('extract_u8', a, b),
+     '!nir_is_rounding_mode_rtz(info->float_controls_execution_mode, 32)'),
+    (('f2u32', ('fmul', ('fmul', ('u2f32', ('extract_u8', 'a@32', b)), 0x3b808081), 255.0)),
+     ('extract_u8', a, b)),
+    (('f2u32', ('fmul', ('fmin', 1.0, ('fmax', -1.0, ('fmul', ('u2f32', ('extract_i16', 'a@32', b)), 0x38000100))), 32767.0)),
+     ('imax', ('extract_i16', a, b), -32767),
+     '!nir_is_rounding_mode_rtz(info->float_controls_execution_mode, 32)'),
+    (('f2u32', ('fmul', ('fmin', 1.0, ('fmax', -1.0, ('fmul', ('u2f32', ('extract_i8', 'a@32', b)), 0x3c010204))), 127.0)),
+     ('imax', ('extract_i8', a, b), -127),
+     '!nir_is_rounding_mode_rtz(info->float_controls_execution_mode, 32)'),
 ])
 
 
@@ -3156,9 +3168,9 @@ def ldexp(f, exp, bits):
 
 
 optimizations += [
-   (('ldexp@16', 'x', 'exp'), ldexp('x', 'exp', 16), '!options->has_ldexp', TestStatus.UNSUPPORTED),
-   (('ldexp@32', 'x', 'exp'), ldexp('x', 'exp', 32), '!options->has_ldexp', TestStatus.UNSUPPORTED),
-   (('ldexp@64', 'x', 'exp'), ldexp('x', 'exp', 64), '!options->has_ldexp', TestStatus.UNSUPPORTED),
+   (('ldexp@16', 'x', 'exp'), ldexp('x', 'exp', 16), '!options->has_ldexp'),
+   (('ldexp@32', 'x', 'exp'), ldexp('x', 'exp', 32), '!options->has_ldexp'),
+   (('ldexp@64', 'x', 'exp'), ldexp('x', 'exp', 64), '!options->has_ldexp'),
    (('fexp2(contract)', ('i2f', 'a@8')), ('ldexp', 1.0, ('i2i32', a)), 'options->has_ldexp'),
    (('fexp2(contract)', ('i2f', 'a@16')), ('ldexp', 1.0, ('i2i32', a)), 'options->has_ldexp'),
    (('fexp2(contract)', ('i2f', 'a@32')), ('ldexp', 1.0, a), 'options->has_ldexp'),
@@ -3787,6 +3799,10 @@ late_optimizations.extend([
     (('bitz', ('ishr', a, b), 0), ('bitz', a, b)),
     (('bitnz', ('ushr', a, b), 0), ('bitnz', a, b)),
     (('bitnz', ('ishr', a, b), 0), ('bitnz', a, b)),
+    (('bitz', ('unpack_64_2x32_split_x', ('ushr', a, b)), 0), ('bitz', a, b)),
+    (('bitz', ('unpack_64_2x32_split_x', ('ishr', a, b)), 0), ('bitz', a, b)),
+    (('bitnz', ('unpack_64_2x32_split_x', ('ushr', a, b)), 0), ('bitnz', a, b)),
+    (('bitnz', ('unpack_64_2x32_split_x', ('ishr', a, b)), 0), ('bitnz', a, b)),
     (('ine', ('ubfe', a, b, 1), 0), ('bitnz', a, b), 'options->has_bit_test'),
     (('ieq', ('ubfe', a, b, 1), 0), ('bitz', a, b), 'options->has_bit_test'),
     (('ine', ('ubfe', a, b, 1), 1), ('bitz', a, b), 'options->has_bit_test'),
