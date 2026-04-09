@@ -1792,6 +1792,8 @@ pseudo_can_accept_constant(const aco_ptr<Instruction>& instr, unsigned operand)
    assert(instr->operands.size() > operand);
    if (instr->operands[operand].isFixed())
       return false;
+   if (!util_is_power_of_two_nonzero(instr->operands[operand].bytes()))
+      return false;
 
    switch (instr->opcode) {
    case aco_opcode::p_extract_vector:
@@ -2857,7 +2859,8 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
                instr->operands[0] = op;
                break;
             }
-         } else if (info.is_constant()) {
+         } else if (info.is_constant() &&
+                    util_is_power_of_two_nonzero(instr->definitions[0].bytes())) {
             /* propagate constants */
             uint64_t mask = u_bit_consecutive64(0, instr->definitions[0].bytes() * 8u);
             uint64_t val = (info.val >> (dst_offset * 8u)) & mask;
