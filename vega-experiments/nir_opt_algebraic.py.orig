@@ -1507,7 +1507,7 @@ optimizations.extend([
 
    # Vulkan allows us to use any rounding mode, so choose rtz because it's simple.
    # Avoid some NaNs being converted to Inf if the lsb are cut off.
-   (('f2bf', a), ('bcsel', ('fneu(preserve_nan_inf)', a, a), -1, ('unpack_32_2x16_split_y', a)), 'options->lower_bfloat16_conversions', TestStatus.UNSUPPORTED), # all test inputs skipped
+   (('f2bf', a), ('bcsel', ('fneu(preserve_nan_inf)', a, a), -1, ('unpack_32_2x16_split_y', a)), 'options->lower_bfloat16_conversions'),
    (('bf2f', a), ('pack_32_2x16', ('vec2', 0, a)), 'options->lower_bfloat16_conversions'),
 ])
 
@@ -2708,6 +2708,23 @@ optimizations.extend([
                                            127.0))),
      'options->lower_unpack_snorm_4x8'),
 
+    # f2u32(fmul(unpack_*norm_*)). These are exact replacements.
+    # 0x37800080 = 1.0 / 65535.0
+    # 0x3b808081 = 1.0 / 255.0
+    # 0x38000100 = 1.0 / 32767.0
+    # 0x3c010204 = 1.0 / 127.0
+    (('f2u32', ('fmul', ('fmul', ('u2f32', ('extract_u16', 'a@32', b)), 0x37800080), 65535.0)),
+     ('extract_u8', a, b),
+     '!nir_is_rounding_mode_rtz(info->float_controls_execution_mode, 32)'),
+    (('f2u32', ('fmul', ('fmul', ('u2f32', ('extract_u8', 'a@32', b)), 0x3b808081), 255.0)),
+     ('extract_u8', a, b)),
+    (('f2u32', ('fmul', ('fmin', 1.0, ('fmax', -1.0, ('fmul', ('u2f32', ('extract_i16', 'a@32', b)), 0x38000100))), 32767.0)),
+     ('imax', ('extract_i16', a, b), -32767),
+     '!nir_is_rounding_mode_rtz(info->float_controls_execution_mode, 32)'),
+    (('f2u32', ('fmul', ('fmin', 1.0, ('fmax', -1.0, ('fmul', ('u2f32', ('extract_i8', 'a@32', b)), 0x3c010204))), 127.0)),
+     ('imax', ('extract_i8', a, b), -127),
+     '!nir_is_rounding_mode_rtz(info->float_controls_execution_mode, 32)'),
+
    (('pack_half_2x16_split', 'a@32', 'b@32'),
     ('ior', ('ishl', ('u2u32', ('f2f16', b)), 16), ('u2u32', ('f2f16', a))),
     'options->lower_pack_split'),
@@ -3195,9 +3212,9 @@ def ldexp(f, exp, bits):
    return ('!fmul', ('!fmul', f, pow2_1), pow2_2)
 
 optimizations += [
-   (('ldexp@16', 'x', 'exp'), ldexp('x', 'exp', 16), '!options->has_ldexp', TestStatus.UNSUPPORTED), # All test inputs skipped.
-   (('ldexp@32', 'x', 'exp'), ldexp('x', 'exp', 32), '!options->has_ldexp', TestStatus.UNSUPPORTED), # All test inputs skipped.
-   (('ldexp@64', 'x', 'exp'), ldexp('x', 'exp', 64), '!options->has_ldexp', TestStatus.UNSUPPORTED), # All test inputs skipped.
+   (('ldexp@16', 'x', 'exp'), ldexp('x', 'exp', 16), '!options->has_ldexp'),
+   (('ldexp@32', 'x', 'exp'), ldexp('x', 'exp', 32), '!options->has_ldexp'),
+   (('ldexp@64', 'x', 'exp'), ldexp('x', 'exp', 64), '!options->has_ldexp'),
    (('fexp2(contract)', ('i2f', 'a@8')), ('ldexp', 1.0, ('i2i32', a)), 'options->has_ldexp'),
    (('fexp2(contract)', ('i2f', 'a@16')), ('ldexp', 1.0, ('i2i32', a)), 'options->has_ldexp'),
    (('fexp2(contract)', ('i2f', 'a@32')), ('ldexp', 1.0, a), 'options->has_ldexp'),
@@ -3913,6 +3930,10 @@ late_optimizations.extend([
    (('bitz', ('ishr', a, b), 0), ('bitz', a, b)),
    (('bitnz', ('ushr', a, b), 0), ('bitnz', a, b)),
    (('bitnz', ('ishr', a, b), 0), ('bitnz', a, b)),
+   (('bitz', ('unpack_64_2x32_split_x', ('ushr', a, b)), 0), ('bitz', a, b)),
+   (('bitz', ('unpack_64_2x32_split_x', ('ishr', a, b)), 0), ('bitz', a, b)),
+   (('bitnz', ('unpack_64_2x32_split_x', ('ushr', a, b)), 0), ('bitnz', a, b)),
+   (('bitnz', ('unpack_64_2x32_split_x', ('ishr', a, b)), 0), ('bitnz', a, b)),
    (('ine', ('ubfe', a, b, 1), 0), ('bitnz', a, b), 'options->has_bit_test'),
    (('ieq', ('ubfe', a, b, 1), 0), ('bitz', a, b), 'options->has_bit_test'),
    (('ine', ('ubfe', a, b, 1), 1), ('bitz', a, b), 'options->has_bit_test'),
