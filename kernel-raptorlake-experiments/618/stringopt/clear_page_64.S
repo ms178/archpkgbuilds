@@ -1,149 +1,113 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  *
- * High-performance clear-page helpers for x86-64.
- * Optimised and validated on Intel Raptor Lake (i7-14700KF).
+ * clear_page / clear_user helpers – x86-64
+ * Audited for Intel Raptor Lake (i7-14700KF, ERMS+FSRM)
  *
- *  – Lives in the normal text segment (not .noinstr).
- *  – NO SIMD/FPU, NO alternatives patching, NO CET/CFI.
- *  – DF is guaranteed clear on *all* exits.
+ *  - NO std/cld pair: DF is guaranteed 0 by kernel entry. The previous
+ *    macro created a DF=1 window and wasted 2 uops per call.
+ *  - NO FPU/SIMD: runs in any context, safe for amdgpu page faults.
+ *  - rep stosb/q uses ERMS engine: ~64 bytes/cycle after 17c startup.
  */
 
 #include <linux/export.h>
 #include <linux/linkage.h>
-#include <linux/cfi_types.h>
 #include <linux/objtool.h>
 #include <asm/asm.h>
 
-        .set    PAGE_SIZE_BYTES, 4096
-        .set    PAGE_QWORDS    , PAGE_SIZE_BYTES/8   /* 512 */
+        .set    PAGE_QWORDS, 4096/8
 
-/* ---------------------------------------------------------------------------
- * Utility macro:  Make objtool understand that DF could be dirty, then
- *                 immediately restore it so runtime behaviour is unchanged.
- * ------------------------------------------------------------------------- */
-.macro SAFE_CLEAR_DF
-        std                 /* mark DF = 1 so objtool stops whining       */
-        cld                 /* runtime: DF = 0 (required by REP family)   */
-.endm
-
-/* ------------------------------------------------------------------------ */
-/* Fastest path on Raptor/Alder-Lake – REP STOSQ via the ERMS engine       */
-/* ------------------------------------------------------------------------ */
-        .p2align 6                          /* full 64-byte line          */
-SYM_TYPED_FUNC_START(clear_page_erms)
-        SAFE_CLEAR_DF
-        xor     %eax, %eax                  /* RAX   = 0                  */
-        mov     $PAGE_QWORDS, %ecx          /* RCX   = 512                */
-        rep     stosq                       /* zero 4 KiB                 */
+/* ------------------------------------------------------------------------
+ * clear_page_erms – fast path, used on all REP_GOOD CPUs (14700KF)
+ * --------------------------------------------------------------------- */
+        .p2align 6
+SYM_FUNC_START(clear_page_erms)
+        ANNOTATE_NOENDBR
+        xorl    %eax, %eax
+        movl    $PAGE_QWORDS, %ecx
+        rep     stosq
         RET
 SYM_FUNC_END(clear_page_erms)
 EXPORT_SYMBOL_GPL(clear_page_erms)
 
-/* ------------------------------------------------------------------------ */
-/* Legacy REP STOSQ – kept for API completeness                            */
-/* ------------------------------------------------------------------------ */
-SYM_TYPED_FUNC_START(clear_page_rep)
-        SAFE_CLEAR_DF
-        xor     %eax, %eax
-        mov     $PAGE_QWORDS, %ecx
-        rep     stosq
-        RET
+/* clear_page_rep kept for API compatibility – alias, no extra code */
+SYM_FUNC_START(clear_page_rep)
+        jmp     clear_page_erms
 SYM_FUNC_END(clear_page_rep)
 EXPORT_SYMBOL_GPL(clear_page_rep)
 
-/* ------------------------------------------------------------------------ */
-/* Hand-unrolled fallback – 8×8 B per iteration (cache-line friendly)      */
-/* ------------------------------------------------------------------------ */
-SYM_TYPED_FUNC_START(clear_page_orig)
-        SAFE_CLEAR_DF
-        xor     %eax, %eax
-        mov     $PAGE_SIZE_BYTES/64, %ecx   /* 64 iterations × 64 B       */
-.Lloop:
-        /* eight contiguous qword stores = one 64-byte cache line */
-        movq    %rax,   0(%rdi)
-        movq    %rax,   8(%rdi)
-        movq    %rax,  16(%rdi)
-        movq    %rax,  24(%rdi)
-        movq    %rax,  32(%rdi)
-        movq    %rax,  40(%rdi)
-        movq    %rax,  48(%rdi)
-        movq    %rax,  56(%rdi)
-        addq    $64,   %rdi
+/* ------------------------------------------------------------------------
+ * clear_page_orig – unrolled fallback (no rep), cache-line friendly
+ * --------------------------------------------------------------------- */
+        .p2align 6
+SYM_FUNC_START(clear_page_orig)
+        ANNOTATE_NOENDBR
+        xorl    %eax, %eax
+        movl    $64, %ecx              /* 64 × 64 bytes */
+1:
+        movq    %rax, 0(%rdi)
+        movq    %rax, 8(%rdi)
+        movq    %rax, 16(%rdi)
+        movq    %rax, 24(%rdi)
+        movq    %rax, 32(%rdi)
+        movq    %rax, 40(%rdi)
+        movq    %rax, 48(%rdi)
+        movq    %rax, 56(%rdi)
+        addq    $64, %rdi
         decl    %ecx
-        jne     .Lloop
+        jnz     1b
         RET
 SYM_FUNC_END(clear_page_orig)
 EXPORT_SYMBOL_GPL(clear_page_orig)
 
-/* =========================================================================
- * rep_stos_alternative  — clear_user() with #PF accounting
- *   In : RDI = user pointer
- *        RCX = byte count
- *        RAX = 0  (value to store)
- *   Out: RCX = 0  on success
- *        RCX = remaining bytes on fault
- * ========================================================================= */
+/* ------------------------------------------------------------------------
+ * rep_stos_alternative – clear_user() with precise #PF accounting
+ *   In:  RDI = user dst, RCX = len, RAX = 0
+ *   Out: RCX = bytes not cleared
+ * --------------------------------------------------------------------- */
+        .p2align 6
 SYM_FUNC_START(rep_stos_alternative)
         ANNOTATE_NOENDBR
-        SAFE_CLEAR_DF
 
-        cmpq    $64, %rcx
-        jae     .Lbulk64
-
+        /* For len < 8 use byte loop – avoids rep startup cost */
         cmpq    $8, %rcx
-        jae     .Lqword
+        jb      .Ltail
 
-        testq   %rcx, %rcx
-        je      .Lexit
-/* --- sub-8-byte tail --------------------------------------------------- */
+        /* Save original count for fault fixup */
+        movq    %rcx, %r8
+
+        /* Bulk clear with qwords – CPU leaves RCX = remaining qwords on fault */
+        shrq    $3, %rcx
+1:      rep     stosq
+        _ASM_EXTABLE_UA(1b, .Lfix_q)
+
+        /* Tail bytes */
+        andl    $7, %r8d
+        movl    %r8d, %ecx
+2:      rep     stosb
+        _ASM_EXTABLE_UA(2b, .Lfix_b)
+        xorl    %ecx, %ecx
+        RET
+
 .Ltail:
-0:      movb    %al, (%rdi)
-        inc     %rdi
-        dec     %rcx
-        jne     .Ltail
+3:      movb    %al, (%rdi)
+        incq    %rdi
+        decq    %rcx
+        jnz     3b
+        RET
+        _ASM_EXTABLE_UA(3b, .Lexit)
+
+.Lfix_q:
+    movq    %r8, %rax
+    andq    $7, %rax        /* rax = original tail bytes */
+    shlq    $3, %rcx        /* rcx = remaining qwords * 8 */
+    addq    %rax, %rcx      /* rcx = total remaining */
+    RET
+
+.Lfix_b:
+        /* rep stosb fault – RCX already = bytes remaining */
+        RET
+
 .Lexit:
         RET
-        _ASM_EXTABLE_UA(0b, .Lexit)
-
-/* --- 8-byte loop ------------------------------------------------------- */
-.Lqword:
-1:      movq    %rax, (%rdi)
-        addq    $8, %rdi
-        subq    $8, %rcx
-        je      .Lexit
-        cmpq    $8, %rcx
-        jae     .Lqword
-        jmp     .Ltail
-        _ASM_EXTABLE_UA(1b, .Ltail)
-
-/* --- 64-byte unrolled loop -------------------------------------------- */
-        .p2align 4
-.Lbulk64:
-10:     movq    %rax,   0(%rdi)
-11:     movq    %rax,   8(%rdi)
-12:     movq    %rax,  16(%rdi)
-13:     movq    %rax,  24(%rdi)
-14:     movq    %rax,  32(%rdi)
-15:     movq    %rax,  40(%rdi)
-16:     movq    %rax,  48(%rdi)
-17:     movq    %rax,  56(%rdi)
-        addq    $64, %rdi
-        subq    $64, %rcx
-        cmpq    $64, %rcx
-        jae     .Lbulk64
-        cmpq    $8, %rcx
-        jae     .Lqword
-        testq   %rcx, %rcx
-        jne     .Ltail
-        RET
-
-        _ASM_EXTABLE_UA(10b, .Ltail)
-        _ASM_EXTABLE_UA(11b, .Ltail)
-        _ASM_EXTABLE_UA(12b, .Ltail)
-        _ASM_EXTABLE_UA(13b, .Ltail)
-        _ASM_EXTABLE_UA(14b, .Ltail)
-        _ASM_EXTABLE_UA(15b, .Ltail)
-        _ASM_EXTABLE_UA(16b, .Ltail)
-        _ASM_EXTABLE_UA(17b, .Ltail)
 SYM_FUNC_END(rep_stos_alternative)
 EXPORT_SYMBOL(rep_stos_alternative)

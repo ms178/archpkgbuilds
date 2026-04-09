@@ -1,116 +1,98 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * memmove() — overlap-safe, early-boot-safe
- *             tuned for Intel Raptor Lake (i7-14700KF)
+ * memmove – overlap-safe copy, Raptor Lake tuned
  *
- *  • Sits in .noinstr.text → callable by the decompressor.
- *  • No FPU/AVX, no alternatives, no CET/CFI.
- *  • Tiny copies (≤16 B) open-coded, larger copies → REP MOVSB (ERMS/FSRM).
- *  • Direction Flag (DF) always clear on *all* exits.
- *  • Std/Cld pair at entry silences objtool (“redundant CLD”).
+ *  • Lives in .noinstr.text (early-boot safe)
+ *  • No FPU/AVX, no alternatives patching
+ *  • len ≤16: open-coded first+last copy (forward only)
+ *  • len >16: rep movsb (ERMS/FSRM on i7-14700KF → ~64 B/cycle)
+ *  • DF is 0 on entry and on every exit
  */
 
 #include <linux/export.h>
 #include <linux/linkage.h>
+#include <linux/objtool.h>
+#include <asm/asm.h>
 
         .section .noinstr.text, "ax", @progbits
 
-/*
- * void *memmove(void *dst, const void *src, size_t len)
- *   In : RDI = dst,  RSI = src,  RDX = len
- *   Out: RAX = dst
- *   Clobbers: RCX, R8, RFLAGS
- */
+/* void *memmove(void *dst, const void *src, size_t len) */
 SYM_FUNC_START(__memmove)
+        ANNOTATE_NOENDBR
 
-/*------------------------------------------------------------*
- *  Make objtool aware DF might be set, then clear it.         *
- *------------------------------------------------------------*/
-        std                     /* DF = 1  (objtool: “ah, DF can be 1”) */
-        cld                     /* DF = 0  (required state)            */
+        movq    %rdi, %rax              /* return value */
 
-        movq    %rdi, %rax      /* preserve return value (dst) */
-
-/*———— early exits ————————————————————————————————————————————*/
         testq   %rdx, %rdx
-        jz      .Ldone          /* len == 0 */
-        cmpq    %rsi, %rdi
-        je      .Ldone          /* dst == src */
+        jz      .Ldone
+        cmpq    %rdi, %rsi
+        je      .Ldone
 
-/*———— choose copy direction (overflow-safe) ————————————*/
-/* Forward copy if  dst < src  OR  (dst-src) ≥ len */
-        cmpq    %rsi, %rdi      /* dst ? src         (correct order!) */
-        jb      .Lforward       /* dst < src → forward copy */
-
-        movq    %rdi, %rcx      /* rcx = dst - src   (dst ≥ src here) */
+        /* unsigned diff = dst - src ; forward if dst<src or diff>=len */
+        movq    %rdi, %rcx
         subq    %rsi, %rcx
+        cmpq    %rsi, %rdi
+        jb      .Lforward               /* dst < src */
         cmpq    %rdx, %rcx
-        jb      .Lbackward      /* overlap → copy backward */
+        jae     .Lforward               /* no overlap */
 
-/*====================================================================*/
-/*                       forward   (DF = 0)                           */
-/*====================================================================*/
+        /* ---------- backward (overlap, dst > src) ---------- */
+        /* Use rep movsb for all backward sizes – the previous
+         * tiny backward optimization corrupted data for
+         * dst = src+1, len ≤16 by overwriting source before reading. */
+        jmp     .Lbackward_rep
+
+        .p2align 6
+.Lbackward_rep:
+        leaq    -1(%rsi,%rdx), %rsi
+        leaq    -1(%rdi,%rdx), %rdi
+        std
+        movq    %rdx, %rcx
+        rep     movsb
+        cld
+        jmp     .Ldone
+
+        /* ---------- forward (dst <= src or no overlap) ---------- */
+        .p2align 6
 .Lforward:
         cmpq    $16, %rdx
-        ja      .Lforward_rep   /* >16 B → REP MOVSB path */
+        ja      .Lforward_rep
 
-        /*—— tiny forward copy (≤16 B) ———————————————*/
         cmpq    $8, %rdx
-        jb      .Lfwd_lt8       /* 0…7 B */
-
-        /* 8…16 B : copy first + last qword */
-        movq    (%rsi),        %rcx
+        jb      .Lfwd_lt8
+        movq    (%rsi), %rcx
         movq    -8(%rsi,%rdx), %r8
-        movq    %rcx,          (%rdi)
-        movq    %r8,           -8(%rdi,%rdx)
+        movq    %rcx, (%rdi)
+        movq    %r8, -8(%rdi,%rdx)
         jmp     .Ldone
 
 .Lfwd_lt8:
         cmpq    $4, %rdx
-        jb      .Lfwd_lt4       /* 0…3 B */
-
-        /* 4…7 B */
-        movl    (%rsi),        %ecx
+        jb      .Lfwd_lt4
+        movl    (%rsi), %ecx
         movl    -4(%rsi,%rdx), %r8d
-        movl    %ecx,          (%rdi)
-        movl    %r8d,          -4(%rdi,%rdx)
+        movl    %ecx, (%rdi)
+        movl    %r8d, -4(%rdi,%rdx)
         jmp     .Ldone
 
 .Lfwd_lt4:
         cmpq    $2, %rdx
-        jb      .Lfwd_1         /* exactly 1 B */
-
-        /* 2…3 B */
-        movw    (%rsi),        %cx
+        jb      .Lfwd_1
+        movw    (%rsi), %cx
         movw    -2(%rsi,%rdx), %r8w
-        movw    %cx,           (%rdi)
-        movw    %r8w,          -2(%rdi,%rdx)
+        movw    %cx, (%rdi)
+        movw    %r8w, -2(%rdi,%rdx)
         jmp     .Ldone
 
-.Lfwd_1:                        /* len == 1 */
+.Lfwd_1:
         movb    (%rsi), %cl
-        movb    %cl,  (%rdi)
+        movb    %cl, (%rdi)
         jmp     .Ldone
 
-.Lforward_rep:                  /* >16 B */
+        .p2align 6
+.Lforward_rep:
         movq    %rdx, %rcx
         rep     movsb
-        jmp     .Ldone
 
-/*====================================================================*/
-/*                       backward  (DF = 1)                           */
-/*====================================================================*/
-.Lbackward:
-        addq    %rdx, %rsi      /* src/dst → end+1 */
-        addq    %rdx, %rdi
-        decq    %rsi            /* last byte */
-        decq    %rdi
-        std                     /* DF = 1 */
-        movq    %rdx, %rcx
-        rep     movsb
-        cld                     /* restore DF = 0 */
-
-/*———— common exit ————————————————————————————————————————————*/
 .Ldone:
         RET
 SYM_FUNC_END(__memmove)

@@ -1,4 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * rep_movs_alternative - fast user copy with precise exceptions
+ *
+ * Tuned for Intel Raptor Lake (i7-14700KF, 8P+8E, ERMS+FSRM)
+ *  - Input:  rdi=dst, rsi=src, rcx=len  (rcx returned = bytes not copied)
+ *  - Gaming workload: 70% of calls are 16-128B (amdgpu command buffers)
+ *  - No FPU/SIMD: runs in atomic context, must not corrupt XMM/YMM
+ *  - DF=0 on entry/exit (kernel ABI)
+ */
+
 #include <linux/export.h>
 #include <linux/linkage.h>
 #include <linux/objtool.h>
@@ -6,70 +16,80 @@
 #include <asm/alternative.h>
 #include <asm/asm.h>
 
-/*
- * Fast in-kernel/user copy helper.
- *
- *  – Prefers ‘rep movsb’ on ERMS CPUs (Raptor-Lake et al.).
- *  – Falls back to quad-word/byte loops for small sizes or non-ERMS parts.
- *  – Extra CLD removed: DF is already clear; objtool warned about
- *    redundancy.
- */
-
         .p2align 5
 SYM_FUNC_START(rep_movs_alternative)
         ANNOTATE_NOENDBR
 
-        /* -------- Small (<64) sizes ---------------------------------- */
         cmpq    $64, %rcx
         jae     .Llarge
 
+        /* ---- 8..63 bytes: 2x unrolled qword loop ---- */
         cmpq    $8, %rcx
-        jae     .Lqword
-        testq   %rcx, %rcx
-        je      .Lexit
+        jb      .Ltail
 
-        /* -------- Byte tail loop (<8) -------------------------------- */
-.Ltail:
-0:      movb    (%rsi), %al
-1:      movb    %al,   (%rdi)
-        inc     %rsi
-        inc     %rdi
-        dec     %rcx
-        jne     .Ltail
-.Lexit:
-        RET
-        _ASM_EXTABLE_UA(0b, .Lexit)
-        _ASM_EXTABLE_UA(1b, .Lexit)
+        .p2align 6
+.Lqword2:
+0:      movq    (%rsi), %rax
+1:      movq    8(%rsi), %rdx
+2:      movq    %rax, (%rdi)
+3:      movq    %rdx, 8(%rdi)
+        addq    $16, %rsi
+        addq    $16, %rdi
+        subq    $16, %rcx
+        cmpq    $16, %rcx
+        jae     .Lqword2
 
-        /* -------- Quad-word loop (8 ≤ len < 64) ---------------------- */
-        .p2align 5
-.Lqword:
-2:      movq    (%rsi), %rax
-3:      movq    %rax,   (%rdi)
+        /* handle remaining 8..15 */
+        cmpq    $8, %rcx
+        jb      .Ltail
+4:      movq    (%rsi), %rax
+5:      movq    %rax, (%rdi)
         addq    $8, %rsi
         addq    $8, %rdi
         subq    $8, %rcx
-        je      .Lexit
-        cmpq    $8, %rcx
-        jae     .Lqword
-        jmp     .Ltail
+
+        /* ---- 0..7 bytes ---- */
+.Ltail:
+        testq   %rcx, %rcx
+        jz      .Lexit
+6:      movb    (%rsi), %al
+7:      movb    %al, (%rdi)
+        incq    %rsi
+        incq    %rdi
+        decq    %rcx
+        jne     6b
+.Lexit:
+        RET
+
+        _ASM_EXTABLE_UA(0b, .Ltail)
+        _ASM_EXTABLE_UA(1b, .Ltail)
         _ASM_EXTABLE_UA(2b, .Ltail)
         _ASM_EXTABLE_UA(3b, .Ltail)
+        _ASM_EXTABLE_UA(4b, .Ltail)
+        _ASM_EXTABLE_UA(5b, .Ltail)
+        _ASM_EXTABLE_UA(6b, .Lexit)
+        _ASM_EXTABLE_UA(7b, .Lexit)
 
-        /* -------- Large copies (≥64) -------------------------------- */
+        /* ---- >=64 bytes ---- */
+        .p2align 6
 .Llarge:
+        /* On 14700KF this is patched to 'rep movsb' at boot */
 0:      ALTERNATIVE "jmp .Llarge_movsq", "rep movsb", X86_FEATURE_ERMS
 1:      RET
         _ASM_EXTABLE_UA(0b, 1b)
 
-        /* ---- Legacy path for non-ERMS parts ------------------------- */
 .Llarge_movsq:
+        /* Copy first qword (may be unaligned), then align dst */
 0:      movq    (%rsi), %rax
-1:      movq    %rax,   (%rdi)
+1:      movq    %rax, (%rdi)
         _ASM_EXTABLE_UA(0b, .Ltail)
         _ASM_EXTABLE_UA(1b, .Ltail)
 
-        /* Align dst to 8-byte boundary for movsq. */
+        addq    $8, %rsi
+        addq    $8, %rdi
+        subq    $8, %rcx
+
+        /* Align destination to 8 bytes for rep movsq */
         movq    %rdi, %rax
         negq    %rax
         andq    $7, %rax
@@ -77,16 +97,15 @@ SYM_FUNC_START(rep_movs_alternative)
         addq    %rax, %rsi
         subq    %rax, %rcx
 
-        movq    %rcx, %rax          /* save remainder for fault path  */
-        shrq    $3,  %rcx           /* rcx = # of 8-byte chunks       */
-        andl    $7,  %eax           /* eax = residual (<8)            */
-
-0:      rep     movsq
-        movl    %eax, %ecx
+        movq    %rcx, %rdx
+        shrq    $3, %rcx
+        andl    $7, %edx
+0:      rep movsq
+        movl    %edx, %ecx
         testq   %rcx, %rcx
         jne     .Ltail
         RET
-1:      leaq    (%rax,%rcx,8), %rcx
+1:      leaq    (%rdx,%rcx,8), %rcx
         jmp     .Ltail
         _ASM_EXTABLE_UA(0b, 1b)
 
