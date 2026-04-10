@@ -264,18 +264,17 @@ is_timing_unchanged_for_freesync(struct drm_crtc_state *old_crtc_state,
  */
 static u32 dm_vblank_get_counter(struct amdgpu_device *adev, int crtc)
 {
-	struct amdgpu_crtc *acrtc;
+	struct amdgpu_crtc *acrtc = NULL;
 
 	if (crtc < 0 || crtc >= adev->mode_info.num_crtc)
 		return 0;
 
 	acrtc = adev->mode_info.crtcs[crtc];
-
-	if (!acrtc->dm_irq_params.stream) {
-		drm_err(adev_to_drm(adev),
-			"dc_stream_state is NULL for crtc '%d'!\n", crtc);
+	if (!acrtc)
 		return 0;
-	}
+
+	if (!acrtc->dm_irq_params.stream)
+		return 0;
 
 	return dc_stream_get_vblank_counter(acrtc->dm_irq_params.stream);
 }
@@ -373,7 +372,7 @@ get_crtc_by_otg_inst(struct amdgpu_device *adev, int otg_inst)
 	int i;
 
 	if (WARN_ON(otg_inst == -1))
-		return (adev->mode_info.num_crtc > 0) ?
+		return (adev->mode_info.num_crtc > 0)?
 			adev->mode_info.crtcs[0] : NULL;
 
 	for (i = 0; i < adev->mode_info.num_crtc; ++i) {
@@ -1017,8 +1016,8 @@ static void dmub_hpd_callback(struct amdgpu_device *adev,
 	 */
 	if (notify->link_index >= adev->dm.dc->link_count) {
 		drm_err(adev_to_drm(adev),
-			"DMUB HPD index (%u) is abnormal (link_count=%u)",
-			notify->link_index, adev->dm.dc->link_count);
+				"DMUB HPD index (%u) is abnormal (link_count=%u)",
+				notify->link_index, adev->dm.dc->link_count);
 		return;
 	}
 
