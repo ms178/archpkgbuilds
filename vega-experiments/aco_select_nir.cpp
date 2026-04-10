@@ -19,7 +19,7 @@
 namespace aco {
 namespace {
 
-void
+[[gnu::hot]] void
 visit_load_const(isel_context* ctx, nir_load_const_instr* instr)
 {
    Temp dst = get_ssa_temp(ctx, &instr->def);
@@ -30,19 +30,19 @@ visit_load_const(isel_context* ctx, nir_load_const_instr* instr)
    assert(instr->def.num_components == 1 && "Vector load_const should be lowered to scalar.");
    assert(dst.type() == RegType::sgpr);
 
-   Builder bld(ctx->program, ctx->block);
+   Builder bld{ctx->program, ctx->block};
 
-   if (instr->def.bit_size == 1) {
+   if (instr->def.bit_size == 1) [[unlikely]] {
       assert(dst.regClass() == bld.lm);
-      int val = instr->value[0].b ? -1 : 0;
-      Operand op = bld.lm.size() == 1 ? Operand::c32(val) : Operand::c64(val);
+      const int32_t val = instr->value[0].b ? -1 : 0;
+      const Operand op = bld.lm.size() == 1 ? Operand::c32(val) : Operand::c64(static_cast<int64_t>(val));
       bld.copy(Definition(dst), op);
-   } else if (instr->def.bit_size == 8) {
+   } else if (instr->def.bit_size == 8) [[unlikely]] {
       bld.copy(Definition(dst), Operand::c32(instr->value[0].u8));
-   } else if (instr->def.bit_size == 16) {
+   } else if (instr->def.bit_size == 16) [[likely]] {
       /* sign-extend to use s_movk_i32 instead of a literal */
       bld.copy(Definition(dst), Operand::c32(instr->value[0].i16));
-   } else if (dst.size() == 1) {
+   } else if (dst.size() == 1) [[likely]] {
       bld.copy(Definition(dst), Operand::c32(instr->value[0].u32));
    } else {
       assert(dst.size() != 1);
@@ -50,7 +50,7 @@ visit_load_const(isel_context* ctx, nir_load_const_instr* instr)
          create_instruction(aco_opcode::p_create_vector, Format::PSEUDO, dst.size(), 1)};
       if (instr->def.bit_size == 64)
          for (unsigned i = 0; i < dst.size(); i++)
-            vec->operands[i] = Operand::c32(instr->value[0].u64 >> i * 32);
+            vec->operands[i] = Operand::c32(static_cast<uint32_t>(instr->value[0].u64 >> (i * 32u)));
       else {
          for (unsigned i = 0; i < dst.size(); i++)
             vec->operands[i] = Operand::c32(instr->value[i].u32);
@@ -62,25 +62,25 @@ visit_load_const(isel_context* ctx, nir_load_const_instr* instr)
 
 Temp merged_wave_info_to_mask(isel_context* ctx, unsigned i);
 
-void
-get_const_vec(nir_def* vec, nir_const_value* cv[4])
+[[gnu::always_inline]] inline void
+get_const_vec(nir_def* const vec, nir_const_value ** const cv)
 {
    nir_alu_instr* vec_instr = nir_def_as_alu_or_null(vec);
    if (!vec_instr || vec_instr->op != nir_op_vec(vec->num_components))
       return;
 
-   for (unsigned i = 0; i < vec->num_components; i++) {
+   for (unsigned i = 0; i < vec->num_components && i < 4u; i++) {
       cv[i] =
-         vec_instr->src[i].swizzle[0] == 0 ? nir_src_as_const_value(vec_instr->src[i].src) : NULL;
+         vec_instr->src[i].swizzle[0] == 0 ? nir_src_as_const_value(vec_instr->src[i].src) : nullptr;
    }
 }
 
-void
+[[gnu::hot]] void
 visit_tex(isel_context* ctx, nir_tex_instr* instr)
 {
    assert(instr->op != nir_texop_samples_identical);
 
-   Builder bld(ctx->program, ctx->block);
+   Builder bld{ctx->program, ctx->block};
    bool disable_wqm = instr->skip_helpers;
    bool has_bias = false, has_lod = false, level_zero = false, has_compare = false,
         has_offset = false, has_ddx = false, has_ddy = false, has_derivs = false,
@@ -88,9 +88,9 @@ visit_tex(isel_context* ctx, nir_tex_instr* instr)
    Temp resource, sampler, bias = Temp(), compare = Temp(), sample_index = Temp(), lod = Temp(),
                            offset = Temp(), ddx = Temp(), ddy = Temp(), clamped_lod = Temp(),
                            coord = Temp(), wqm_coord = Temp();
-   std::vector<Temp> coords;
-   std::vector<Temp> derivs;
-   nir_const_value* const_offset[4] = {NULL, NULL, NULL, NULL};
+   std::vector<Temp> coords; coords.reserve(4);
+   std::vector<Temp> derivs; derivs.reserve(4);
+   std::array<nir_const_value*,4> const_offset{};
 
    for (unsigned i = 0; i < instr->num_srcs; i++) {
       switch (instr->src[i].src_type) {
@@ -164,7 +164,7 @@ visit_tex(isel_context* ctx, nir_tex_instr* instr)
       case nir_tex_src_backend2:
          assert(instr->src[i].src.ssa->bit_size == 32);
          offset = get_ssa_temp(ctx, instr->src[i].src.ssa);
-         get_const_vec(instr->src[i].src.ssa, const_offset);
+         get_const_vec(instr->src[i].src.ssa, const_offset.data());
          has_offset = true;
          break;
       case nir_tex_src_ddx:
@@ -793,7 +793,7 @@ visit_call(isel_context* ctx, nir_call_instr* instr)
 {
    assert(!ctx->program->preserve_s2);
 
-   Builder bld(ctx->program, ctx->block);
+   Builder bld{ctx->program, ctx->block};
 
    unsigned nir_abi = instr->callee->driver_attributes & ACO_NIR_FUNCTION_ATTRIB_ABI_MASK;
    param_assignment_hints hints;
@@ -937,7 +937,7 @@ visit_debug_info(isel_context* ctx, nir_instr_debug_info* instr_info)
    info.src_loc.column = instr_info->column;
    info.src_loc.spirv_offset = instr_info->spirv_offset;
 
-   Builder bld(ctx->program, ctx->block);
+   Builder bld{ctx->program, ctx->block};
    bld.pseudo(aco_opcode::p_debug_info, Operand::c32(ctx->program->debug_info.size()));
 
    ctx->program->debug_info.push_back(info);
@@ -985,7 +985,7 @@ void
 visit_block(isel_context* ctx, nir_block* block)
 {
    if (ctx->block->kind & block_kind_top_level) {
-      Builder bld(ctx->program, ctx->block);
+      Builder bld{ctx->program, ctx->block};
       for (Temp tmp : ctx->unended_linear_vgprs) {
          bld.pseudo(aco_opcode::p_end_linear_vgpr, tmp);
       }
@@ -996,7 +996,7 @@ visit_block(isel_context* ctx, nir_block* block)
       visit_phi(ctx, instr);
 
    nir_phi_instr* last_phi = nir_block_last_phi_instr(block);
-   begin_empty_exec_skip(ctx, last_phi ? &last_phi->instr : NULL, block);
+   begin_empty_exec_skip(ctx, last_phi ? &last_phi->instr : nullptr, block);
 
    /*
     * Reserve space for instructions to reduce vector reallocations.
@@ -1111,7 +1111,7 @@ visit_function_impl(isel_context* ctx, struct nir_function_impl* impl)
 void
 create_fs_jump_to_epilog(isel_context* ctx)
 {
-   Builder bld(ctx->program, ctx->block);
+   Builder bld{ctx->program, ctx->block};
    std::vector<Operand> exports;
    unsigned vgpr = 256; /* VGPR 0 */
 
@@ -1179,7 +1179,7 @@ get_arg_for_end(isel_context* ctx, struct ac_arg arg)
 void
 create_fs_end_for_epilog(isel_context* ctx)
 {
-   Builder bld(ctx->program, ctx->block);
+   Builder bld{ctx->program, ctx->block};
 
    std::vector<Operand> regs;
 
@@ -1372,9 +1372,9 @@ select_program_rt(isel_context& ctx, unsigned shader_count, struct nir_shader* c
 
       RegisterDemand limit = get_addr_regs_from_waves(ctx.program, ctx.program->min_waves);
 
-      nir_function_impl* impl = NULL;
-      nir_function* traversal_function = NULL;
-      nir_function* ahit_isec_function = NULL;
+      nir_function_impl* impl = nullptr;
+      nir_function* traversal_function = nullptr;
+      nir_function* ahit_isec_function = nullptr;
       nir_foreach_function (func, nir) {
          unsigned func_nir_abi = (func->driver_attributes & ACO_NIR_FUNCTION_ATTRIB_ABI_MASK);
 
@@ -1394,7 +1394,7 @@ select_program_rt(isel_context& ctx, unsigned shader_count, struct nir_shader* c
          assert(traversal_function);
          callee_info traversal_info = get_callee_info(
             ctx.program->gfx_level, ctx.program->wave_size, rtTraversalABI,
-            traversal_function->num_params, traversal_function->params, NULL, limit);
+            traversal_function->num_params, traversal_function->params, nullptr, limit);
          callee_hints = get_ahit_isec_param_hints(traversal_info);
       }
 
@@ -1432,7 +1432,7 @@ select_program_rt(isel_context& ctx, unsigned shader_count, struct nir_shader* c
 static void
 create_merged_jump_to_epilog(isel_context* ctx)
 {
-   Builder bld(ctx->program, ctx->block);
+   Builder bld{ctx->program, ctx->block};
    std::vector<Operand> regs;
 
    for (unsigned i = 0; i < ctx->args->arg_count; i++) {
