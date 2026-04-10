@@ -77,7 +77,7 @@ static const std::chrono::microseconds s_safetyMarginMinimum{
 
 DrmCommitThread::DrmCommitThread(DrmGpu *gpu, const QString &name)
     : m_targetPageflipTime(std::chrono::steady_clock::now())
-    , m_gpu(gpu)
+   , m_gpu(gpu)
 {
     if (!gpu->atomicModeSetting()) {
         return;
@@ -104,7 +104,7 @@ DrmCommitThread::DrmCommitThread(DrmGpu *gpu, const QString &name)
                 timeout = m_commitPending.wait_for(lock, DrmGpu::s_pageflipTimeout) == std::cv_status::timeout;
             } else if (m_commits.empty()) {
                 m_commitPending.wait(lock, [this, thread] {
-                    return thread->isInterruptionRequested() || m_committed || !m_commits.empty();
+                    return thread->isInterruptionRequested() || m_committed ||!m_commits.empty();
                 });
                 if (thread->isInterruptionRequested()) [[unlikely]] {
                     return;
@@ -159,7 +159,7 @@ DrmCommitThread::DrmCommitThread(DrmGpu *gpu, const QString &name)
                     const auto coarseTarget = wakeTarget - kFinalSleepWindow;
 
                     const bool wokeForReason = m_commitPending.wait_until(lock, coarseTarget, [this, thread, scheduledTarget] {
-                        return thread->isInterruptionRequested() || m_committed || m_commits.empty() || m_targetPageflipTime != scheduledTarget;
+                        return thread->isInterruptionRequested() || m_committed || m_commits.empty() || m_targetPageflipTime!= scheduledTarget;
                     });
 
                     if (thread->isInterruptionRequested()) [[unlikely]] {
@@ -189,15 +189,17 @@ DrmCommitThread::DrmCommitThread(DrmGpu *gpu, const QString &name)
                 continue;
             }
 
+            const bool vrrCached = m_vrr.load(std::memory_order_acquire);
+            const bool tearingCached = m_tearing.load(std::memory_order_acquire);
+
             if (!frontCommit->isReadyFor(m_targetPageflipTime)) {
-                const bool vrrOrTearing = m_vrr.load(std::memory_order_acquire) ||
-                                          m_tearing.load(std::memory_order_acquire);
-                m_targetPageflipTime += vrrOrTearing ? kVrrPollIntervalFine : m_minVblankInterval;
+                const bool vrrOrTearing = vrrCached || tearingCached;
+                m_targetPageflipTime += vrrOrTearing? kVrrPollIntervalFine : m_minVblankInterval;
                 continue;
             }
 
             const auto frontDelay = frontCommit->allowedVrrDelay();
-            if (frontDelay && m_vrr.load(std::memory_order_acquire)) {
+            if (frontDelay && vrrCached) {
                 std::chrono::nanoseconds lowestDelay = *frontDelay;
                 bool allDelay = true;
 
@@ -228,9 +230,9 @@ DrmCommitThread::DrmCommitThread(DrmGpu *gpu, const QString &name)
                         const auto remainingDelay = delayedTarget - loopNow;
                         const auto waitTime =
                             (remainingDelay > kVrrPollFineWindow)
-                            ? ((remainingDelay < kVrrPollIntervalCoarse) ? remainingDelay
+                           ? ((remainingDelay < kVrrPollIntervalCoarse)? remainingDelay
                                                                          : std::chrono::duration_cast<std::chrono::nanoseconds>(kVrrPollIntervalCoarse))
-                            : ((remainingDelay < kVrrPollIntervalFine) ? remainingDelay
+                            : ((remainingDelay < kVrrPollIntervalFine)? remainingDelay
                                                                        : std::chrono::duration_cast<std::chrono::nanoseconds>(kVrrPollIntervalFine));
 
                         const auto waitResult = m_commitPending.wait_for(lock, waitTime);
@@ -288,7 +290,7 @@ void DrmCommitThread::submit()
     }
 
     bool testedOk = commit->test();
-    int savedErrno = testedOk ? 0 : errno;
+    int savedErrno = testedOk? 0 : errno;
 
     if (!testedOk) [[unlikely]] {
         thread_local std::chrono::steady_clock::time_point lastWarnTime{};
@@ -309,24 +311,20 @@ void DrmCommitThread::submit()
             ++suppressed;
         }
 
-        for (int retry = 0; retry < kMaxSubmitRetries && m_commits.size() > 1; ) {
+        size_t merges = 0;
+        while (merges < static_cast<size_t>(kMaxSubmitRetries) && m_commits.size() > 1) {
             if (!m_commits[1]) [[unlikely]] {
                 m_commits.erase(m_commits.begin() + 1);
                 continue;
             }
-
             auto toMerge = std::move(m_commits[1]);
             m_commits.erase(m_commits.begin() + 1);
             commit->merge(toMerge.get());
             m_commitsToDelete.push_back(std::move(toMerge));
-
-            testedOk = commit->test();
-            if (testedOk) {
-                break;
-            }
-            savedErrno = errno;
-            ++retry;
+            ++merges;
         }
+        testedOk = commit->test();
+        savedErrno = testedOk? 0 : errno;
 
         if (!testedOk) {
             m_commitsToDelete.push_back(std::move(m_commits.front()));
@@ -359,12 +357,14 @@ void DrmCommitThread::submit()
                 m_additionalSafetyMargin = penalty;
             }
         } else {
-            m_additionalSafetyMargin = m_additionalSafetyMargin - (m_additionalSafetyMargin / 200);
+            const int64_t count = m_additionalSafetyMargin.count();
+            const int64_t decay = (count * 41) >> 13;
+            m_additionalSafetyMargin = std::chrono::nanoseconds(count - decay);
         }
 
         const auto halfVblank = m_minVblankInterval / 2;
-        const auto maximumReasonableMargin = (3ms < halfVblank) ? 3ms : halfVblank;
-        m_additionalSafetyMargin = clampNs(m_additionalSafetyMargin, 0ns, maximumReasonableMargin);
+        const auto maximumReasonableMargin = (3ms < halfVblank)? 3ms : halfVblank;
+        m_additionalSafetyMargin = std::clamp(m_additionalSafetyMargin, 0ns, maximumReasonableMargin);
         m_safetyMargin = m_baseSafetyMargin + m_additionalSafetyMargin;
     } else {
         const int commitErrno = errno;
@@ -488,10 +488,10 @@ void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
                 if (!m_commits[next]->isReadyFor(pageflipTarget)) {
                     break;
                 }
-                if (m_commits[next]->isTearing() != startTearing) {
+                if (m_commits[next]->isTearing()!= startTearing) {
                     break;
                 }
-                if (startPlanes != m_commits[next]->modifiedPlanes()) {
+                if (startPlanes!= m_commits[next]->modifiedPlanes()) {
                     break;
                 }
                 ++next;
@@ -511,7 +511,7 @@ void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
             }
         }
 
-        if (write != read) {
+        if (write!= read) {
             m_commits[write] = std::move(m_commits[read]);
         }
         ++write;
@@ -522,7 +522,7 @@ void DrmCommitThread::optimizeCommits(TimePoint pageflipTarget)
         m_commits.erase(m_commits.begin() + static_cast<ptrdiff_t>(write), m_commits.end());
     }
 
-    if (optimized && !m_commitsToDelete.empty()) {
+    if (optimized &&!m_commitsToDelete.empty()) {
         QMetaObject::invokeMethod(this, &DrmCommitThread::clearDroppedCommits, Qt::QueuedConnection);
     }
 }
@@ -552,6 +552,7 @@ void DrmCommitThread::addCommit(std::unique_ptr<DrmAtomicCommit> &&commit)
     }
 
     std::unique_lock<std::mutex> lock(m_mutex);
+    __builtin_prefetch(m_commits.data(), 1, 3);
 
     const auto now = std::chrono::steady_clock::now();
     TimePoint newTarget;
@@ -578,7 +579,7 @@ void DrmCommitThread::addCommit(std::unique_ptr<DrmAtomicCommit> &&commit)
 
     const size_t cap = m_commits.capacity();
     if (m_commits.size() == cap) [[unlikely]] {
-        const size_t newCap = (cap > 0) ? (cap * 2) : kInitialCommitCapacity;
+        const size_t newCap = (cap > 0)? (cap * 2) : kInitialCommitCapacity;
         m_commits.reserve(newCap);
     }
     m_commits.push_back(std::move(commit));
@@ -632,7 +633,7 @@ void DrmCommitThread::setModeInfo(uint32_t maximum, std::chrono::nanoseconds vbl
 
     m_baseSafetyMargin = vblankTime + s_safetyMarginMinimum;
     const auto halfVblank = m_minVblankInterval / 2;
-    const auto maximumReasonableMargin = (3ms < halfVblank) ? 3ms : halfVblank;
+    const auto maximumReasonableMargin = (3ms < halfVblank)? 3ms : halfVblank;
     m_additionalSafetyMargin = clampNs(m_additionalSafetyMargin, 0ns, maximumReasonableMargin);
     m_safetyMargin = m_baseSafetyMargin + m_additionalSafetyMargin;
 }
@@ -651,7 +652,7 @@ void DrmCommitThread::pageFlipped(std::chrono::nanoseconds timestamp)
 
     auto resyncOffset = [&]() {
         timespec monoNowTs = {};
-        if (clock_gettime(CLOCK_MONOTONIC, &monoNowTs) != 0) {
+        if (clock_gettime(CLOCK_MONOTONIC, &monoNowTs)!= 0) {
             return;
         }
         const int64_t monoNowNs =
@@ -666,15 +667,15 @@ void DrmCommitThread::pageFlipped(std::chrono::nanoseconds timestamp)
         }
     };
 
-    if (Q_UNLIKELY(!cache.valid || cache.countdown == 0)) {
+    if (!cache.valid || cache.countdown == 0) [[unlikely]] {
         resyncOffset();
-        cache.countdown = 1024;
+        cache.countdown = 4096;
     } else {
         --cache.countdown;
     }
 
     int64_t mappedNs = 0;
-    if (Q_UNLIKELY(__builtin_add_overflow(timestamp.count(), cache.offsetNs, &mappedNs))) {
+    if (__builtin_add_overflow(timestamp.count(), cache.offsetNs, &mappedNs)) [[unlikely]] {
         mappedNs = steadyNowNs;
     }
 
@@ -705,7 +706,7 @@ void DrmCommitThread::pageFlipped(std::chrono::nanoseconds timestamp)
 
     m_committed.reset();
 
-    const bool hasQueuedCommits = !m_commits.empty();
+    const bool hasQueuedCommits =!m_commits.empty();
     if (hasQueuedCommits) {
         m_targetPageflipTime = estimateNextVblank(steadyNow);
     }
@@ -720,7 +721,7 @@ void DrmCommitThread::pageFlipped(std::chrono::nanoseconds timestamp)
 bool DrmCommitThread::pageflipsPending()
 {
     std::unique_lock<std::mutex> lock(m_mutex);
-    return !m_commits.empty() || static_cast<bool>(m_committed);
+    return!m_commits.empty() || static_cast<bool>(m_committed);
 }
 
 TimePoint DrmCommitThread::estimateNextVblank(TimePoint now) const
@@ -729,7 +730,7 @@ TimePoint DrmCommitThread::estimateNextVblank(TimePoint now) const
         return now + kDefaultFrameInterval;
     }
 
-    const auto elapsed = (now >= m_lastPageflip) ? (now - m_lastPageflip) : std::chrono::nanoseconds::zero();
+    const auto elapsed = (now >= m_lastPageflip)? (now - m_lastPageflip) : std::chrono::nanoseconds::zero();
     const uint64_t elapsedNs = static_cast<uint64_t>(elapsed.count());
     const uint64_t vblankNs = static_cast<uint64_t>(m_minVblankInterval.count());
 
