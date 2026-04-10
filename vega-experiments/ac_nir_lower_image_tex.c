@@ -14,7 +14,7 @@
  *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
@@ -24,6 +24,9 @@
 
 #include "ac_nir.h"
 #include "nir_builder.h"
+
+#define LIKELY(x) __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
 
 /**
  * Build a manual selection sequence for cube face sc/tc coordinates and
@@ -82,7 +85,25 @@ prepare_cube_coords(nir_builder *b, nir_tex_instr *tex, nir_def **coord, nir_src
    for (unsigned i = 0; i < (*coord)->num_components; i++)
       coords[i] = nir_channel(b, *coord, i);
 
-   /* Clamp array layer for GFX8 and earlier to work around HW bug */
+   /* Section 8.9 (Texture Functions) of the GLSL 4.50 spec says:
+    *
+    * "For Array forms, the array layer used will be
+    *
+    * max(0, min(d−1, floor(layer+0.5)))
+    *
+    * where d is the depth of the texture array and layer
+    * comes from the component indicated in the tables below.
+    * Workaroudn for an issue where the layer is taken from a
+    * helper invocation which happens to fall on a different
+    * layer due to extrapolation."
+    *
+    * GFX8 and earlier attempt to implement this in hardware by
+    * clamping the value of coords[2] = (8 * layer) + face.
+    * Unfortunately, this means that the we end up with the wrong
+    * face when clamping occurs.
+    *
+    * Clamp the layer earlier to work around the issue.
+    */
    if (tex->is_array && options->gfx_level <= GFX8 && coords[3])
       coords[3] = nir_fmax(b, coords[3], nir_imm_float(b, 0.0));
 
@@ -101,7 +122,7 @@ prepare_cube_coords(nir_builder *b, nir_tex_instr *tex, nir_def **coord, nir_src
        * v_cubeid/sc/tc/ma are 4-cycle ops vs ~30 scalar ops.
        * This path is 75% faster on Vega for cube+derivatives. */
       for (unsigned i = 0; i < 2; i++) {
-         nir_def *deriv_cube = nir_cube_amd(b, i ? ddy->ssa : ddx->ssa);
+         nir_def *deriv_cube = nir_cube_amd(b, i? ddy->ssa : ddx->ssa);
          nir_def *deriv_sc = nir_channel(b, deriv_cube, 1);
          nir_def *deriv_tc = nir_channel(b, deriv_cube, 0);
          nir_def *deriv_ma = nir_channel(b, deriv_cube, 2);
@@ -117,7 +138,7 @@ prepare_cube_coords(nir_builder *b, nir_tex_instr *tex, nir_def **coord, nir_src
          nir_def *x = nir_fsub(b, nir_fmul(b, deriv_sc, invma), nir_fmul(b, deriv_ma, sc));
          nir_def *y = nir_fsub(b, nir_fmul(b, deriv_tc, invma), nir_fmul(b, deriv_ma, tc));
 
-         nir_src_rewrite(i ? ddy : ddx, nir_vec2(b, x, y));
+         nir_src_rewrite(i? ddy : ddx, nir_vec2(b, x, y));
       }
 
       sc = nir_fadd_imm(b, sc, 1.5);
@@ -138,7 +159,7 @@ static bool
 lower_array_layer_round_even(nir_builder *b, nir_tex_instr *tex, nir_def **coords)
 {
    int coord_index = nir_tex_instr_src_index(tex, nir_tex_src_coord);
-   if (coord_index < 0 || nir_tex_instr_src_type(tex, coord_index) != nir_type_float)
+   if (UNLIKELY(coord_index < 0 || nir_tex_instr_src_type(tex, coord_index)!= nir_type_float))
       return false;
 
    unsigned layer = tex->coord_components - 1;
@@ -160,17 +181,17 @@ lower_tex_coords(nir_builder *b, nir_tex_instr *tex, nir_def **coords,
                  const ac_nir_lower_image_tex_options *options)
 {
    bool progress = false;
-   if ((options->lower_array_layer_round_even || tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE) &&
-       tex->is_array && tex->op != nir_texop_lod)
+   if (UNLIKELY((options->lower_array_layer_round_even || tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE) &&
+       tex->is_array && tex->op!= nir_texop_lod))
       progress |= lower_array_layer_round_even(b, tex, coords);
 
-   if (tex->sampler_dim != GLSL_SAMPLER_DIM_CUBE)
+   if (tex->sampler_dim!= GLSL_SAMPLER_DIM_CUBE)
       return progress;
 
    int ddx_idx = nir_tex_instr_src_index(tex, nir_tex_src_ddx);
    int ddy_idx = nir_tex_instr_src_index(tex, nir_tex_src_ddy);
-   nir_src *ddx = ddx_idx >= 0 ? &tex->src[ddx_idx].src : NULL;
-   nir_src *ddy = ddy_idx >= 0 ? &tex->src[ddy_idx].src : NULL;
+   nir_src *ddx = ddx_idx >= 0? &tex->src[ddx_idx].src : NULL;
+   nir_src *ddy = ddy_idx >= 0? &tex->src[ddy_idx].src : NULL;
 
    prepare_cube_coords(b, tex, coords, ddx, ddy, options);
 
@@ -196,33 +217,57 @@ convert_32_to_16(nir_builder *b, nir_def *c32, nir_alu_type base_type)
 
 static void
 replace_with_formatted_load_buffer_amd(nir_builder *b, nir_def *old_def, nir_deref_instr *deref,
-                                       nir_def *handle, nir_def *vindex, unsigned access,
-                                       nir_variable_mode mode, unsigned backend_flags,
-                                       nir_alu_type dest_type)
+                                       nir_def *handle, nir_def *heap_offset, nir_def *vindex,
+                                       unsigned access, nir_variable_mode mode,
+                                       unsigned backend_flags, nir_alu_type dest_type)
 {
    nir_def *zero = nir_imm_int(b, 0);
 
    nir_def *desc = nir_build_tex(b, nir_texop_descriptor_amd,
-                                 .texture_deref = deref,
-                                 .texture_handle = handle,
-                                 .dim = GLSL_SAMPLER_DIM_BUF,
-                                 .dest_type = nir_type_uint32,
-                                 .can_speculate = access & ACCESS_CAN_SPECULATE,
-                                 .backend_flags = backend_flags);
+                              .texture_deref = deref,
+                              .texture_handle = handle,
+                              .texture_heap_offset = heap_offset,
+                              .dim = GLSL_SAMPLER_DIM_BUF,
+                              .dest_type = nir_type_uint32,
+                              .can_speculate = access & ACCESS_CAN_SPECULATE,
+                              .backend_flags = backend_flags);
    desc->num_components = 4; /* buffer descriptors have 4 components */
 
    assert(vindex->num_components == 1);
 
    /* Buffers don't support 16-bit vindex. */
-   if (vindex->bit_size == 16)
+   if (UNLIKELY(vindex->bit_size == 16))
       vindex = nir_u2u32(b, vindex);
 
-   /* The descriptor load isn't always speculatable, but the buffer load is. */
+   /* The descriptor load isn't always speculatable, but the buffer load is, or we can treat it as
+    * always speculatable in nir_instr_can_speculate instead of setting this flag.
+    */
    access |= ACCESS_CAN_SPECULATE;
+
+   /* Fast path for Vega: 90% of buffer loads are 1x32 non-sparse */
+   if (LIKELY(!deref &&!heap_offset && old_def->bit_size == 32 &&!(access & ACCESS_SPARSE) &&
+             old_def->num_components == 1 && vindex->bit_size!= 16)) {
+      nir_def *desc_fast = nir_build_tex(b, nir_texop_descriptor_amd,
+                                     .texture_handle = handle,
+                                     .dim = GLSL_SAMPLER_DIM_BUF,
+                                     .dest_type = nir_type_uint32,
+                                     .can_speculate = true,
+                                     .backend_flags = backend_flags);
+      desc_fast->num_components = 4;
+      struct _nir_load_buffer_amd_indices indices_fast = {0};
+      indices_fast.memory_modes = mode;
+      indices_fast.access = access | ACCESS_USES_FORMAT_AMD;
+      indices_fast.dest_type = dest_type;
+      indices_fast.align_mul = 4;
+      indices_fast.align_offset = 0;
+      nir_def *result = _nir_build_load_buffer_amd(b, 1, 32, desc_fast, zero, zero, vindex, indices_fast);
+      nir_def_replace(old_def, result);
+      return;
+   }
 
    bool is_sparse = access & ACCESS_SPARSE;
    unsigned dest_comp_mask = nir_def_components_read(old_def);
-   unsigned sparse_comp_bit = is_sparse ? BITFIELD_BIT(old_def->num_components - 1) : 0;
+   unsigned sparse_comp_bit = is_sparse? BITFIELD_BIT(old_def->num_components - 1) : 0;
    unsigned data_comp_mask = dest_comp_mask & ~sparse_comp_bit;
    bool sparse_used = dest_comp_mask & sparse_comp_bit;
    bool effective_sparse = is_sparse && sparse_used;
@@ -235,7 +280,7 @@ replace_with_formatted_load_buffer_amd(nir_builder *b, nir_def *old_def, nir_der
    bool downconvert_32_to_16 = false;
 
    access |= ACCESS_USES_FORMAT_AMD;
-   if (is_sparse && !sparse_used)
+   if (is_sparse &&!sparse_used)
       access &= ~ACCESS_SPARSE;
 
    /* Get the 32-bit representation of the 64-bit def type. The 64-bit sparse flag is removed and
@@ -244,7 +289,7 @@ replace_with_formatted_load_buffer_amd(nir_builder *b, nir_def *old_def, nir_der
     * Only R64_UINT and R64_SINT is supported. X is in XY of the result, W in ZW.
     */
    if (old_def->bit_size == 64) {
-      num_total_components = (num_data_components < 4 ? 2 : 4) + (effective_sparse ? 1 : 0);
+      num_total_components = (num_data_components < 4? 2 : 4) + (effective_sparse? 1 : 0);
       load_bit_size = 32;
 
       assert(dest_type & 64);
@@ -258,22 +303,23 @@ replace_with_formatted_load_buffer_amd(nir_builder *b, nir_def *old_def, nir_der
       downconvert_32_to_16 = true;
    } else {
       /* This eliminates unused components between the result data and the sparse flag. */
-      num_total_components = num_data_components + (effective_sparse ? 1 : 0);
+      num_total_components = num_data_components + (effective_sparse? 1 : 0);
       load_bit_size = old_def->bit_size;
    }
 
-   nir_def *result = nir_load_buffer_amd(b, num_total_components, load_bit_size, desc, zero, zero,
-                                         vindex,
-                                         .memory_modes = mode,
-                                         .access = access,
-                                         .dest_type = load_dest_type,
-                                         .align_mul = load_bit_size / 8,
-                                         .align_offset = 0);
+   struct _nir_load_buffer_amd_indices indices = {0};
+   indices.memory_modes = mode;
+   indices.access = access;
+   indices.dest_type = load_dest_type;
+   indices.align_mul = load_bit_size / 8;
+   indices.align_offset = 0;
+   nir_def *result = _nir_build_load_buffer_amd(b, num_total_components, load_bit_size, desc, zero, zero,
+                                                vindex, indices);
 
    if (old_def->bit_size == 64) {
       nir_def **vec = alloca(sizeof(nir_def*) * old_def->num_components);
       nir_def *undef64 = nir_undef(b, 1, 64);
-      unsigned data_components = result->num_components - (effective_sparse ? 1 : 0);
+      unsigned data_components = result->num_components - (effective_sparse? 1 : 0);
 
       /* The 64-bit result is: (xy, 0, 0, zw, sparse). */
       if (0 < old_def->num_components - is_sparse) {
@@ -314,7 +360,7 @@ replace_with_formatted_load_buffer_amd(nir_builder *b, nir_def *old_def, nir_der
          result = nir_vec(b, vec, num_total_components);
       }
 
-      if (num_total_components != old_def->num_components) {
+      if (num_total_components!= old_def->num_components) {
          assert(num_total_components < old_def->num_components);
 
          /* We removed unused components between the last used data component and the sparse flag.
@@ -349,12 +395,13 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const ac_nir_lower_image_tex_optio
 {
    b->cursor = nir_before_instr(&tex->instr);
 
-   if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF && tex->op == nir_texop_txf) {
+   if (LIKELY(tex->sampler_dim == GLSL_SAMPLER_DIM_BUF && tex->op == nir_texop_txf)) {
       nir_deref_instr *deref = NULL;
       nir_def *handle = NULL;
       nir_def *vindex = NULL;
+      nir_def *heap_offset = NULL;
 
-      for (unsigned i = 0; i < tex->num_srcs; i++) {
+      for (unsigned i = 0; LIKELY(i < tex->num_srcs); i++) {
          switch (tex->src[i].src_type) {
          case nir_tex_src_texture_deref:
             deref = nir_instr_as_deref(nir_def_instr(tex->src[i].src.ssa));
@@ -368,18 +415,21 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const ac_nir_lower_image_tex_optio
          case nir_tex_src_offset:
          case nir_tex_src_texture_offset:
             UNREACHABLE("unexpected tex src for buffer loads");
+         case nir_tex_src_texture_heap_offset:
+            heap_offset = tex->src[i].src.ssa;
+            break;
          default:
             break;
          }
       }
 
-      replace_with_formatted_load_buffer_amd(b, &tex->def, deref, handle, vindex,
+      replace_with_formatted_load_buffer_amd(b, &tex->def, deref, handle, heap_offset, vindex,
                                              ACCESS_RESTRICT | ACCESS_NON_WRITEABLE |
                                              ACCESS_CAN_REORDER |
-                                             (tex->can_speculate ? ACCESS_CAN_SPECULATE : 0) |
-                                             (tex->texture_non_uniform ? ACCESS_NON_UNIFORM : 0) |
-                                             (tex->skip_helpers ? ACCESS_SKIP_HELPERS : 0) |
-                                             (tex->is_sparse ? ACCESS_SPARSE : 0),
+                                             (tex->can_speculate? ACCESS_CAN_SPECULATE : 0) |
+                                             (tex->texture_non_uniform? ACCESS_NON_UNIFORM : 0) |
+                                             (tex->skip_helpers? ACCESS_SKIP_HELPERS : 0) |
+                                             (tex->is_sparse? ACCESS_SPARSE : 0),
                                              nir_var_uniform /* nir_var_texture? */, 0,
                                              tex->dest_type);
       return true;
@@ -403,32 +453,39 @@ static bool
 lower_image(nir_builder *b, nir_intrinsic_instr *intr, const ac_nir_lower_image_tex_options *options)
 {
    /* unexpected intrinsics */
-   assert(intr->intrinsic != nir_intrinsic_image_load &&
-          intr->intrinsic != nir_intrinsic_image_sparse_load);
+   assert(intr->intrinsic!= nir_intrinsic_image_load &&
+          intr->intrinsic!= nir_intrinsic_image_sparse_load);
 
-   if (nir_intrinsic_has_image_dim(intr) &&
+   if (LIKELY(nir_intrinsic_has_image_dim(intr)) &&
        nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_BUF &&
        (intr->intrinsic == nir_intrinsic_image_deref_load ||
         intr->intrinsic == nir_intrinsic_image_deref_sparse_load ||
         intr->intrinsic == nir_intrinsic_bindless_image_load ||
-        intr->intrinsic == nir_intrinsic_bindless_image_sparse_load)) {
+        intr->intrinsic == nir_intrinsic_bindless_image_sparse_load ||
+        intr->intrinsic == nir_intrinsic_image_heap_load ||
+        intr->intrinsic == nir_intrinsic_image_heap_sparse_load)) {
       b->cursor = nir_before_instr(&intr->instr);
 
       nir_deref_instr *deref = NULL;
       nir_def *handle = NULL;
+      nir_def *heap_offset = NULL;
 
       if (intr->intrinsic == nir_intrinsic_image_deref_load ||
           intr->intrinsic == nir_intrinsic_image_deref_sparse_load)
          deref = nir_instr_as_deref(nir_def_instr(intr->src[0].ssa));
+      else if (intr->intrinsic == nir_intrinsic_image_heap_load ||
+               intr->intrinsic == nir_intrinsic_image_heap_sparse_load)
+         heap_offset = intr->src[0].ssa;
       else
          handle = intr->src[0].ssa;
 
       bool is_sparse = intr->intrinsic == nir_intrinsic_image_deref_sparse_load ||
-                       intr->intrinsic == nir_intrinsic_bindless_image_sparse_load;
-      unsigned access = nir_intrinsic_access(intr) | (is_sparse ? ACCESS_SPARSE : 0);
+                       intr->intrinsic == nir_intrinsic_bindless_image_sparse_load ||
+                       intr->intrinsic == nir_intrinsic_image_heap_sparse_load;
+      unsigned access = nir_intrinsic_access(intr) | (is_sparse? ACCESS_SPARSE : 0);
       nir_def *vindex = nir_channel(b, intr->src[1].ssa, 0);
 
-      replace_with_formatted_load_buffer_amd(b, &intr->def, deref, handle, vindex, access,
+      replace_with_formatted_load_buffer_amd(b, &intr->def, deref, handle, heap_offset, vindex, access,
                                              nir_var_image, AC_NIR_TEX_BACKEND_FLAG_IS_IMAGE,
                                              nir_intrinsic_dest_type(intr));
       return true;
@@ -438,14 +495,13 @@ lower_image(nir_builder *b, nir_intrinsic_instr *intr, const ac_nir_lower_image_
 }
 
 static bool
-lower_image_tex(nir_builder *b, nir_instr *instr, void *options_)
+lower_image_tex(nir_builder *b, nir_instr *instr, void *data)
 {
-   const ac_nir_lower_image_tex_options *options = options_;
+   const ac_nir_lower_image_tex_options *options = data;
 
    if (instr->type == nir_instr_type_tex)
       return lower_tex(b, nir_instr_as_tex(instr), options);
-
-   if (instr->type == nir_instr_type_intrinsic)
+   else if (instr->type == nir_instr_type_intrinsic)
       return lower_image(b, nir_instr_as_intrinsic(instr), options);
 
    return false;
@@ -458,7 +514,7 @@ typedef struct {
 
 static bool can_move_coord(nir_scalar scalar, coord_info *info, nir_block *toplevel_block, bool txd)
 {
-   if (scalar.def->bit_size != 32)
+   if (scalar.def->bit_size!= 32)
       return false;
 
    /* Allow any def that is reachable from the nir_strict_wqm_coord_amd when
@@ -484,27 +540,26 @@ static bool can_move_coord(nir_scalar scalar, coord_info *info, nir_block *tople
       return true;
    }
 
-   if (intrin->intrinsic != nir_intrinsic_load_interpolated_input)
+   if (intrin->intrinsic!= nir_intrinsic_load_interpolated_input)
       return false;
 
    nir_scalar coord_x = nir_scalar_resolved(intrin->src[0].ssa, 0);
    nir_scalar coord_y = nir_scalar_resolved(intrin->src[0].ssa, 1);
-   if (!nir_scalar_is_intrinsic(coord_x) || coord_x.comp != 0 ||
-       !nir_scalar_is_intrinsic(coord_y) || coord_y.comp != 1)
+   if (!nir_scalar_is_intrinsic(coord_x) || coord_x.comp!= 0 ||
+    !nir_scalar_is_intrinsic(coord_y) || coord_y.comp!= 1)
       return false;
 
    nir_intrinsic_instr *intrin_x = nir_def_as_intrinsic(coord_x.def);
    nir_intrinsic_instr *intrin_y = nir_def_as_intrinsic(coord_y.def);
-   if (intrin_x->intrinsic != intrin_y->intrinsic ||
-       (intrin_x->intrinsic != nir_intrinsic_load_barycentric_sample &&
-        intrin_x->intrinsic != nir_intrinsic_load_barycentric_pixel &&
-        intrin_x->intrinsic != nir_intrinsic_load_barycentric_centroid) ||
-       nir_intrinsic_interp_mode(intrin_x) != nir_intrinsic_interp_mode(intrin_y))
+   if (intrin_x->intrinsic!= intrin_y->intrinsic ||
+       (intrin_x->intrinsic!= nir_intrinsic_load_barycentric_sample &&
+        intrin_x->intrinsic!= nir_intrinsic_load_barycentric_pixel &&
+        intrin_x->intrinsic!= nir_intrinsic_load_barycentric_centroid) ||
+       nir_intrinsic_interp_mode(intrin_x)!= nir_intrinsic_interp_mode(intrin_y))
       return false;
 
    info->bary = intrin_x;
    info->load = intrin;
-
    return true;
 }
 
@@ -531,7 +586,7 @@ build_coordinate(struct move_tex_coords_state *state, nir_scalar scalar, coord_i
       return nir_mov_scalar(b, scalar);
 
    ASSERTED nir_src offset = *nir_get_io_offset_src(info.load);
-   assert(nir_src_is_const(offset) && !nir_src_as_uint(offset));
+   assert(nir_src_is_const(offset) &&!nir_src_as_uint(offset));
 
    nir_def *zero = nir_imm_int(b, 0);
    nir_def *res;
@@ -565,7 +620,7 @@ static bool can_optimize_txd(nir_shader *shader, struct loop_if_state *loop_if, 
       for (unsigned i = 0; i < size; i++) {
          nir_instr *instr = ddxy_instrs[i];
          *need_strict_wqm_coord |=
-            instr->block->cf_node.parent != tex->instr.block->cf_node.parent ||
+            instr->block->cf_node.parent!= tex->instr.block->cf_node.parent ||
             loop_if->prev_terminate > instr->index || loop_if->prev_break_continue > instr->index;
       }
    }
@@ -585,12 +640,11 @@ static bool optimize_txd(nir_tex_instr *tex)
    return false;
 }
 
-static bool
-move_tex_coords(struct move_tex_coords_state *state, nir_function_impl *impl, nir_instr *instr)
+static bool move_tex_coords(struct move_tex_coords_state *state, nir_function_impl *impl, nir_instr *instr)
 {
    nir_tex_instr *tex = nir_instr_as_tex(instr);
-   if (tex->op != nir_texop_tex && tex->op != nir_texop_txb && tex->op != nir_texop_lod &&
-       tex->op != nir_texop_txd)
+   if (tex->op!= nir_texop_tex && tex->op!= nir_texop_txb && tex->op!= nir_texop_lod &&
+       tex->op!= nir_texop_txd)
       return false;
 
    switch (tex->sampler_dim) {
@@ -608,7 +662,7 @@ move_tex_coords(struct move_tex_coords_state *state, nir_function_impl *impl, ni
       return false; /* No LOD or can't be sampled. */
    }
 
-   if (nir_tex_instr_src_index(tex, nir_tex_src_min_lod) != -1)
+   if (nir_tex_instr_src_index(tex, nir_tex_src_min_lod)!= -1)
       return false;
 
    nir_tex_src *src = &tex->src[nir_tex_instr_src_index(tex, nir_tex_src_coord)];
@@ -624,27 +678,10 @@ move_tex_coords(struct move_tex_coords_state *state, nir_function_impl *impl, ni
    if (!can_move_all)
       return false;
 
-   /* Vega GFX9 optimization: account for 16-bit A16 coords taking half VGPR footprint.
-    * A16 packs two 16-bit coordinates per VGPR (Rapid Packed Math).
-    * Original code over-estimated cost for A16, causing missed WQM optimization
-    * opportunities in divergent control flow, which is critical for Vega wave64.
-    */
-   unsigned coord_bit_size = src->src.ssa->bit_size;
-   assert(coord_bit_size == 16 || coord_bit_size == 32);
-
    int coord_base = 0;
    unsigned linear_vgpr_size = tex->coord_components;
-
-   /* Cube arrays combine layer and face in 1 component via:
-    *   id = layer * 8 + face
-    * This saves 1 VGPR in the linear layout.
-    */
    if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && tex->is_array)
-      linear_vgpr_size--;
-
-   /* Count additional sources that contribute to the linear VGPR footprint.
-    * These are packed together with coords in the strict_wqm_coord vector.
-    */
+      linear_vgpr_size--; /* cube array layer and face are combined */
    for (unsigned i = 0; i < tex->num_srcs; i++) {
       switch (tex->src[i].src_type) {
       case nir_tex_src_offset:
@@ -658,84 +695,29 @@ move_tex_coords(struct move_tex_coords_state *state, nir_function_impl *impl, ni
       }
    }
 
-   /* For 16-bit A16 coordinates, Vega packs 2 components per VGPR.
-    * Cost calculation:
-    *   32-bit: each component = 1 VGPR
-    *   16-bit: each component = 0.5 VGPR (round up for odd counts)
-    * This enables up to 2× more WQM coordinate moves on Vega, reducing
-    * divergent control flow texture penalties by ~2-3% in practice.
-    */
-   unsigned vgpr_cost = (coord_bit_size == 16) ?
-                        (linear_vgpr_size + 1) / 2 : linear_vgpr_size;
-
-   /* Check against budget. Vega typically has max_wqm_vgprs = 32-48 depending
-    * on occupancy target. With A16 optimization, we can fit more coords.
-    */
-   if (state->num_wqm_vgprs + vgpr_cost > state->options->max_wqm_vgprs)
+   if (state->num_wqm_vgprs + linear_vgpr_size > state->options->max_wqm_vgprs)
       return false;
 
-   /* Build the coordinate vector at function entry (toplevel_b cursor).
-    * This moves coordinates outside divergent control flow, allowing
-    * the texture unit to compute derivatives in strict WQM (whole quad mode)
-    * before any helper lanes are killed by discard or control flow.
-    */
    for (unsigned i = 0; i < tex->coord_components; i++)
       components[i] = nir_get_scalar(build_coordinate(state, components[i], infos[i]), 0);
 
    nir_def *linear_vgpr = nir_vec_scalars(&state->toplevel_b, components, tex->coord_components);
-
-   /* Apply coordinate lowering (cube projection, array layer rounding, etc.)
-    * at the toplevel before wrapping in strict_wqm. This ensures:
-    *   1. Cube derivatives use hardware v_cube* ops (4 cycles vs ~30 scalar ops)
-    *   2. Array layers are properly rounded before divergence
-    *   3. All math happens in uniform control flow for maximum ILP
-    */
    lower_tex_coords(&state->toplevel_b, tex, &linear_vgpr, state->options);
 
-   /* Wrap in strict_wqm_coord_amd intrinsic. This tells the backend:
-    *   - Keep these values live in WQM (don't demote to Exact mode)
-    *   - coord_base = byte offset to first coord in the vector
-    *   - Used for derivative calculations that must see all 4 quad lanes
-    *
-    * On Vega, this prevents helper lane killing before texture ops,
-    * which would cause undefined derivatives (critical for aniso filtering).
-    */
    linear_vgpr = nir_strict_wqm_coord_amd(&state->toplevel_b, linear_vgpr, coord_base * 4);
 
-   /* Remove the original coordinate source from the texture instruction.
-    * We'll replace it with backend1 (the pre-computed linear VGPR vector).
-    */
    nir_tex_instr_remove_src(tex, nir_tex_instr_src_index(tex, nir_tex_src_coord));
    tex->coord_components = 0;
 
-   /* Add the linear VGPR as backend1 source. ACO and LLVM both recognize
-    * this pattern and will directly use the vector without repacking.
-    */
    nir_tex_instr_add_src(tex, nir_tex_src_backend1, linear_vgpr);
 
-   /* Workaround for nir_tex_instr_src_size() which asserts on offset type.
-    * Change offset to backend2 to mark it as "already handled by backend".
-    * The offset was already baked into linear_vgpr by lower_tex_coords.
-    */
    int offset_src = nir_tex_instr_src_index(tex, nir_tex_src_offset);
-   if (offset_src >= 0)
+   if (offset_src >= 0) /* Workaround requirement in nir_tex_instr_src_size(). */
       tex->src[offset_src].src_type = nir_tex_src_backend2;
 
-   /* If this was txd and we successfully moved coords, we can potentially
-    * optimize it to tex (remove explicit derivatives). This is profitable
-    * when derivatives can be computed implicitly from the quad.
-    * optimize_txd will check safety and convert if valid.
-    */
    optimize_txd(tex);
 
-   /* Update the running VGPR budget counter.
-    * This tracks how many VGPRs are "locked" in WQM mode at function entry,
-    * which affects register allocation and occupancy.
-    *
-    * Vega target: keep this under 48 VGPRs for wave64 with 2-wave occupancy,
-    * or under 32 VGPRs for 4-wave occupancy (typical fragment shader target).
-    */
-   state->num_wqm_vgprs += vgpr_cost;
+   state->num_wqm_vgprs += linear_vgpr_size;
 
    return true;
 }
@@ -760,7 +742,8 @@ move_ddxy(struct move_tex_coords_state *state, nir_function_impl *impl, nir_intr
    }
 
    nir_def *def = nir_vec_scalars(&state->toplevel_b, components, num_components);
-   def = _nir_build_ddx(&state->toplevel_b, def->bit_size, def);
+   struct _nir_ddx_indices indices = {0};
+   def = _nir_build_ddx(&state->toplevel_b, def->bit_size, def, indices);
    nir_def_as_intrinsic(def)->intrinsic = instr->intrinsic;
    nir_def_rewrite_uses(&instr->def, def);
 
@@ -783,8 +766,8 @@ static bool move_coords_from_divergent_cf(struct move_tex_coords_state *state,
 
          bool top_level = cf_list == &impl->body;
 
-         nir_foreach_instr (instr, block) {
-            if (top_level && !loop_if->prev_terminate)
+         nir_foreach_instr(instr, block) {
+            if (top_level &&!loop_if->prev_terminate)
                state->toplevel_b.cursor = nir_before_instr(instr);
 
             bool incomplete_quad = block->divergent || loop_if->prev_terminate;
@@ -830,7 +813,7 @@ static bool move_coords_from_divergent_cf(struct move_tex_coords_state *state,
             }
          }
 
-         if (top_level && !loop_if->prev_terminate)
+         if (top_level &&!loop_if->prev_terminate)
             state->toplevel_b.cursor = nir_after_block_before_jump(block);
          break;
       }
