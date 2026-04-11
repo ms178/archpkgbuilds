@@ -79,6 +79,7 @@ DrmCommitThread::DrmCommitThread(DrmGpu *gpu, const QString &name)
         return;
     }
 
+    m_lastPageflip = std::chrono::steady_clock::now();
     m_commits.reserve(kInitialCommitCapacity);
     m_commitsToDelete.reserve(kInitialDeleteCapacity);
 
@@ -637,6 +638,9 @@ bool DrmCommitThread::pageflipsPending()
 TimePoint DrmCommitThread::estimateNextVblank(TimePoint now) const
 {
     if (m_minVblankInterval <= std::chrono::nanoseconds::zero()) [[unlikely]] {
+        return now + kDefaultFrameInterval;
+    }
+    if (m_lastPageflip.time_since_epoch().count() == 0) [[unlikely]] {
         return now + kDefaultFrameInterval;
     }
 
