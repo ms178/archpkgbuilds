@@ -268,9 +268,11 @@ static __always_inline struct io_apic __iomem *io_apic_base(int idx)
 {
 	void __iomem *base = READ_ONCE(ioapics[idx].base);
 
-	if (unlikely(!base))
+	if (unlikely(!base)) {
 		base = (void __iomem *)__fix_to_virt(FIX_IO_APIC_BASE_0 + idx) +
-		(mpc_ioapic_addr(idx) & ~PAGE_MASK);
+		       (mpc_ioapic_addr(idx) & ~PAGE_MASK);
+		WRITE_ONCE(ioapics[idx].base, base);
+	}
 
 	return (struct io_apic __iomem *)base;
 }
@@ -356,15 +358,30 @@ static bool add_pin_to_irq_node(struct mp_chip_data *data, int node, int apic, i
 {
 	struct irq_pin_list *entry;
 
-	/* Don't allow duplicates */
+	/* Fast path: no mappings yet. */
+	if (list_empty(&data->irq_2_pin)) {
+		entry = kzalloc_node(sizeof(*entry), GFP_ATOMIC, node);
+		if (!entry) {
+			pr_err("Cannot allocate irq_pin_list (%d,%d,%d)\n",
+			       node, apic, pin);
+			return false;
+		}
+		entry->apic = apic;
+		entry->pin = pin;
+		list_add_tail(&entry->list, &data->irq_2_pin);
+		return true;
+	}
+
+	/* Duplicate guard for shared-IRQ setups. */
 	for_each_irq_pin(entry, data->irq_2_pin) {
 		if (entry->apic == apic && entry->pin == pin)
 			return true;
 	}
 
-	entry = kzalloc_node(sizeof(struct irq_pin_list), GFP_ATOMIC, node);
+	entry = kzalloc_node(sizeof(*entry), GFP_ATOMIC, node);
 	if (!entry) {
-		pr_err("Cannot allocate irq_pin_list (%d,%d,%d)\n", node, apic, pin);
+		pr_err("Cannot allocate irq_pin_list (%d,%d,%d)\n",
+		       node, apic, pin);
 		return false;
 	}
 
@@ -429,17 +446,70 @@ static void io_apic_sync(struct irq_pin_list *entry)
 	readl(&io_apic->data);
 }
 
+static __always_inline void io_apic_write_pin_low(struct irq_pin_list *entry, u32 w1)
+{
+	io_apic_write(entry->apic, 0x10 + 2 * entry->pin, w1);
+}
+
+static __always_inline void io_apic_sync_pin(struct irq_pin_list *entry)
+{
+	struct io_apic __iomem *io_apic = io_apic_base(entry->apic);
+
+	readl(&io_apic->data);
+}
+
+static void io_apic_mask_irq(struct mp_chip_data *data)
+{
+	struct irq_pin_list *entry;
+
+	data->entry.masked = true;
+
+	if (list_empty(&data->irq_2_pin))
+		return;
+
+	if (likely(list_is_singular(&data->irq_2_pin))) {
+		entry = list_first_entry(&data->irq_2_pin, struct irq_pin_list, list);
+		io_apic_write_pin_low(entry, data->entry.w1);
+		io_apic_sync_pin(entry);
+		return;
+	}
+
+	for_each_irq_pin(entry, data->irq_2_pin) {
+		io_apic_write_pin_low(entry, data->entry.w1);
+		io_apic_sync_pin(entry);
+	}
+}
+
+static void io_apic_unmask_irq(struct mp_chip_data *data)
+{
+	struct irq_pin_list *entry;
+
+	data->entry.masked = false;
+
+	if (list_empty(&data->irq_2_pin))
+		return;
+
+	if (likely(list_is_singular(&data->irq_2_pin))) {
+		entry = list_first_entry(&data->irq_2_pin, struct irq_pin_list, list);
+		io_apic_write_pin_low(entry, data->entry.w1);
+		return;
+	}
+
+	for_each_irq_pin(entry, data->irq_2_pin)
+		io_apic_write_pin_low(entry, data->entry.w1);
+}
+
 static void mask_ioapic_irq(struct irq_data *irq_data)
 {
 	struct mp_chip_data *data = irq_data->chip_data;
 
 	guard(raw_spinlock_irqsave)(&ioapic_lock);
-	io_apic_modify_irq(data, true, &io_apic_sync);
+	io_apic_mask_irq(data);
 }
 
 static void __unmask_ioapic(struct mp_chip_data *data)
 {
-	io_apic_modify_irq(data, false, NULL);
+	io_apic_unmask_irq(data);
 }
 
 static void unmask_ioapic_irq(struct irq_data *irq_data)
@@ -490,6 +560,16 @@ static void eoi_ioapic_pin(int vector, struct mp_chip_data *data)
 	struct irq_pin_list *entry;
 
 	guard(raw_spinlock_irqsave)(&ioapic_lock);
+
+	if (unlikely(list_empty(&data->irq_2_pin)))
+		return;
+
+	if (likely(list_is_singular(&data->irq_2_pin))) {
+		entry = list_first_entry(&data->irq_2_pin, struct irq_pin_list, list);
+		__eoi_ioapic_pin(entry->apic, entry->pin, vector);
+		return;
+	}
+
 	for_each_irq_pin(entry, data->irq_2_pin)
 		__eoi_ioapic_pin(entry->apic, entry->pin, vector);
 }
@@ -981,7 +1061,7 @@ static int mp_map_pin_to_irq(u32 gsi, int idx, int ioapic, int pin,
 	struct irq_alloc_info tmp;
 	struct mp_chip_data *data;
 	bool legacy = false;
-	int irq;
+	int irq = -ENOENT;
 
 	if (!domain)
 		return -ENOSYS;
@@ -989,39 +1069,35 @@ static int mp_map_pin_to_irq(u32 gsi, int idx, int ioapic, int pin,
 	if (idx >= 0 && test_bit(mp_irqs[idx].srcbus, mp_bus_not_pci)) {
 		irq = mp_irqs[idx].srcbusirq;
 		legacy = mp_is_legacy_irq(irq);
-		/*
-		 * IRQ2 is unusable for historical reasons on systems which
-		 * have a legacy PIC. See the comment vs. IRQ2 further down.
-		 *
-		 * If this gets removed at some point then the related code
-		 * in lapic_assign_system_vectors() needs to be adjusted as
-		 * well.
-		 */
 		if (legacy && irq == PIC_CASCADE_IR)
 			return -EINVAL;
 	}
 
 	guard(mutex)(&ioapic_mutex);
+
 	if (!(flags & IOAPIC_MAP_ALLOC)) {
-		if (!legacy) {
-			irq = irq_find_mapping(domain, pin);
-			if (irq == 0)
-				irq = -ENOENT;
-		}
-	} else {
-		ioapic_copy_alloc_attr(&tmp, info, gsi, ioapic, pin);
 		if (legacy)
-			irq = alloc_isa_irq_from_domain(domain, irq,
-							ioapic, pin, &tmp);
-		else if ((irq = irq_find_mapping(domain, pin)) == 0)
-			irq = alloc_irq_from_domain(domain, ioapic, gsi, &tmp);
-		else if (!mp_check_pin_attr(irq, &tmp))
-			irq = -EBUSY;
-		if (irq >= 0) {
-			data = irq_get_chip_data(irq);
-			data->count++;
-		}
+			return irq;
+
+		irq = irq_find_mapping(domain, pin);
+		return irq ? irq : -ENOENT;
 	}
+
+	ioapic_copy_alloc_attr(&tmp, info, gsi, ioapic, pin);
+
+	if (legacy) {
+		irq = alloc_isa_irq_from_domain(domain, irq, ioapic, pin, &tmp);
+	} else if ((irq = irq_find_mapping(domain, pin)) == 0) {
+		irq = alloc_irq_from_domain(domain, ioapic, gsi, &tmp);
+	} else if (!mp_check_pin_attr(irq, &tmp)) {
+		irq = -EBUSY;
+	}
+
+	if (irq >= 0) {
+		data = irq_get_chip_data(irq);
+		data->count++;
+	}
+
 	return irq;
 }
 
@@ -2317,14 +2393,18 @@ static int mp_irqdomain_create(int ioapic)
 static void ioapic_destroy_irqdomain(int idx)
 {
 	struct ioapic_domain_cfg *cfg = &ioapics[idx].irqdomain_cfg;
-	struct fwnode_handle *fn = ioapics[idx].irqdomain->fwnode;
+	struct irq_domain *domain = ioapics[idx].irqdomain;
+	struct fwnode_handle *fn;
 
-	if (ioapics[idx].irqdomain) {
-		irq_domain_remove(ioapics[idx].irqdomain);
-		if (!cfg->dev)
-			irq_domain_free_fwnode(fn);
-		ioapics[idx].irqdomain = NULL;
-	}
+	if (!domain)
+		return;
+
+	fn = domain->fwnode;
+	irq_domain_remove(domain);
+	if (!cfg->dev)
+		irq_domain_free_fwnode(fn);
+
+	ioapics[idx].irqdomain = NULL;
 }
 
 void __init setup_IO_APIC(void)
@@ -2737,11 +2817,11 @@ static int find_free_ioapic_entry(void)
  * @cfg:	configuration information for the IOAPIC
  */
 int mp_register_ioapic(int id, u32 address, u32 gsi_base,
-					   struct ioapic_domain_cfg *cfg)
+		       struct ioapic_domain_cfg *cfg)
 {
 	bool hotplug = !!ioapic_initialized;
 	struct mp_ioapic_gsi *gsi_cfg;
-	int idx, ioapic, entries;
+	int idx, ioapic, entries, ret = 0;
 	u32 gsi_end;
 
 	if (!address) {
@@ -2749,70 +2829,62 @@ int mp_register_ioapic(int id, u32 address, u32 gsi_base,
 		return -EINVAL;
 	}
 
-	for_each_ioapic(ioapic)
+	for_each_ioapic(ioapic) {
 		if (ioapics[ioapic].mp_config.apicaddr == address) {
 			pr_warn("address 0x%x conflicts with IOAPIC%d\n",
-					address, ioapic);
+				address, ioapic);
 			return -EEXIST;
 		}
+	}
 
-		idx = find_free_ioapic_entry();
+	idx = find_free_ioapic_entry();
 	if (unlikely(idx >= MAX_IO_APICS)) {
 		pr_warn("Max IOAPICs exceeded (found %d)\n", idx);
 		return -ENOSPC;
 	}
 
-	ioapics[idx].mp_config.type     = MP_IOAPIC;
-	ioapics[idx].mp_config.flags    = MPC_APIC_USABLE;
+	ioapics[idx].mp_config.type = MP_IOAPIC;
+	ioapics[idx].mp_config.flags = MPC_APIC_USABLE;
 	ioapics[idx].mp_config.apicaddr = address;
 
 	io_apic_set_fixmap(FIX_IO_APIC_BASE_0 + idx, address);
 	ioapics[idx].base = (void __iomem *)
-	(__fix_to_virt(FIX_IO_APIC_BASE_0 + idx) +
-	(address & ~PAGE_MASK));
+		(__fix_to_virt(FIX_IO_APIC_BASE_0 + idx) + (address & ~PAGE_MASK));
 
 	if (bad_ioapic_register(idx)) {
-		clear_fixmap(FIX_IO_APIC_BASE_0 + idx);
-		ioapics[idx].base = NULL;
-		return -ENODEV;
+		ret = -ENODEV;
+		goto fail_slot;
 	}
 
-	ioapics[idx].mp_config.apicid  = io_apic_unique_id(idx, id);
+	ioapics[idx].mp_config.apicid = io_apic_unique_id(idx, id);
 	ioapics[idx].mp_config.apicver = io_apic_get_version(idx);
-	ioapics[idx].has_eoi           =
-	(ioapics[idx].mp_config.apicver >= 0x20);
+	ioapics[idx].has_eoi = (ioapics[idx].mp_config.apicver >= 0x20);
 
-	/* ---- original GSI-range / irqdomain setup code unchanged ---- */
-	entries  = io_apic_get_redir_entries(idx);
-	gsi_end  = gsi_base + entries - 1;
+	entries = io_apic_get_redir_entries(idx);
+	gsi_end = gsi_base + (u32)entries - 1U;
 
 	for_each_ioapic(ioapic) {
 		gsi_cfg = mp_ioapic_gsi_routing(ioapic);
-		if ((gsi_base >= gsi_cfg->gsi_base &&
-			gsi_base <= gsi_cfg->gsi_end) ||
-			(gsi_end >= gsi_cfg->gsi_base &&
-			gsi_end <= gsi_cfg->gsi_end)) {
+		if ((gsi_base >= gsi_cfg->gsi_base && gsi_base <= gsi_cfg->gsi_end) ||
+		    (gsi_end >= gsi_cfg->gsi_base && gsi_end <= gsi_cfg->gsi_end)) {
 			pr_warn("GSI %u-%u overlaps existing IOAPIC range\n",
-					gsi_base, gsi_end);
-			clear_fixmap(FIX_IO_APIC_BASE_0 + idx);
-		ioapics[idx].base = NULL;
-		return -ENOSPC;
-			}
+				gsi_base, gsi_end);
+			ret = -ENOSPC;
+			goto fail_slot;
+		}
 	}
 
 	gsi_cfg = mp_ioapic_gsi_routing(idx);
 	gsi_cfg->gsi_base = gsi_base;
-	gsi_cfg->gsi_end  = gsi_end;
+	gsi_cfg->gsi_end = gsi_end;
 
 	ioapics[idx].irqdomain_cfg = *cfg;
-	ioapics[idx].nr_registers  = entries;	/* mark present */
+	ioapics[idx].nr_registers = entries;
 
 	if (hotplug) {
-		if (mp_irqdomain_create(idx)) {
-			clear_fixmap(FIX_IO_APIC_BASE_0 + idx);
-			ioapics[idx].base = NULL;
-			return -ENOMEM;
-		}
+		ret = mp_irqdomain_create(idx);
+		if (ret)
+			goto fail_slot;
 		alloc_ioapic_saved_registers(idx);
 	}
 
@@ -2822,10 +2894,17 @@ int mp_register_ioapic(int id, u32 address, u32 gsi_base,
 		nr_ioapics = idx + 1;
 
 	pr_info("IOAPIC[%d]: id %d, ver 0x%x, addr 0x%x, GSIs %u-%u\n",
-			idx, mpc_ioapic_id(idx), mpc_ioapic_ver(idx), address,
-			gsi_base, gsi_end);
+		idx, mpc_ioapic_id(idx), mpc_ioapic_ver(idx), address,
+		gsi_base, gsi_end);
 
 	return 0;
+
+fail_slot:
+	if (ioapics[idx].irqdomain)
+		ioapic_destroy_irqdomain(idx);
+	clear_fixmap(FIX_IO_APIC_BASE_0 + idx);
+	memset(&ioapics[idx], 0, sizeof(ioapics[idx]));
+	return ret;
 }
 
 int mp_unregister_ioapic(u32 gsi_base)

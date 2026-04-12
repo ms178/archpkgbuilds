@@ -610,26 +610,39 @@ static inline bool rwsem_try_write_lock(struct rw_semaphore *sem,
 
 	count = atomic_long_read(&sem->count);
 	for (;;) {
-		/* Fast path: unlocked and no handoff request. */
+		/* Fast path: unlocked and no handoff in progress. */
 		if (likely(!(count & (RWSEM_LOCK_MASK | RWSEM_FLAG_HANDOFF)))) {
 			new = count | RWSEM_WRITER_LOCKED;
 			if (list_is_singular(&sem->wait_list))
 				new &= ~RWSEM_FLAG_WAITERS;
 		} else {
-			const bool has_handoff = !!(count & RWSEM_FLAG_HANDOFF);
+			bool has_handoff = !!(count & RWSEM_FLAG_HANDOFF);
 
-			if (has_handoff && first->handoff_set && (waiter != first))
-				return false;
+			if (has_handoff) {
+				/*
+				 * Honor handoff only for the first waiter that
+				 * requested it.
+				 */
+				if (first->handoff_set && (waiter != first))
+					return false;
+			}
 
 			new = count;
+
 			if (count & RWSEM_LOCK_MASK) {
+				/*
+				 * Allow setting HANDOFF only for RT/DL waiters
+				 * or waiters that exceeded timeout.
+				 */
 				if (has_handoff || (!rt_or_dl_task(waiter->task) &&
-				    !time_after(jiffies, waiter->timeout)))
+						    !time_after(jiffies, waiter->timeout)))
 					return false;
+
 				new |= RWSEM_FLAG_HANDOFF;
 			} else {
 				new |= RWSEM_WRITER_LOCKED;
 				new &= ~RWSEM_FLAG_HANDOFF;
+
 				if (list_is_singular(&sem->wait_list))
 					new &= ~RWSEM_FLAG_WAITERS;
 			}
@@ -645,6 +658,7 @@ static inline bool rwsem_try_write_lock(struct rw_semaphore *sem,
 		return false;
 	}
 
+	/* Success fully implies rwsem_del_waiter() for this waiter. */
 	list_del(&waiter->list);
 	rwsem_set_owner(sem);
 	return true;
@@ -689,7 +703,7 @@ static inline bool rwsem_try_write_lock_unqueued(struct rw_semaphore *sem)
 
 static inline bool rwsem_can_spin_on_owner(struct rw_semaphore *sem)
 {
-	unsigned long ownerv;
+	unsigned long owner_val;
 	struct task_struct *owner;
 	bool ret = true;
 
@@ -699,16 +713,17 @@ static inline bool rwsem_can_spin_on_owner(struct rw_semaphore *sem)
 	}
 
 	/*
-	 * Preemption is disabled by caller in write slowpath context where this
-	 * is used, so owner task pointer remains safe for owner_on_cpu().
+	 * Caller enters this path with preemption disabled in write lock
+	 * slowpath contexts where optimistic spinning is considered.
 	 */
-	ownerv = atomic_long_read(&sem->owner);
+	owner_val = atomic_long_read(&sem->owner);
 
-	if (ownerv & RWSEM_NONSPINNABLE) {
+	if (owner_val & RWSEM_NONSPINNABLE) {
 		ret = false;
 	} else {
-		owner = (struct task_struct *)(ownerv & ~RWSEM_OWNER_FLAGS_MASK);
-		if (owner && !(ownerv & RWSEM_READER_OWNED) && !owner_on_cpu(owner))
+		owner = (struct task_struct *)(owner_val & ~RWSEM_OWNER_FLAGS_MASK);
+		if (owner && !(owner_val & RWSEM_READER_OWNED) &&
+		    !owner_on_cpu(owner))
 			ret = false;
 	}
 
@@ -734,7 +749,7 @@ rwsem_spin_on_owner(struct rw_semaphore *sem)
 	struct task_struct *new, *owner;
 	unsigned long flags, new_flags;
 	enum owner_state state;
-	unsigned int spins = 0;
+	int i = 0;
 
 	lockdep_assert_preemption_disabled();
 
@@ -751,22 +766,21 @@ rwsem_spin_on_owner(struct rw_semaphore *sem)
 		}
 
 		/*
-		 * Keep pointer validity ordering constraints as in original code.
+		 * Keep dereference ordering safety identical to original logic.
 		 */
 		barrier();
 
-		/*
-		 * Poll expensive owner/task state periodically; always relax to
-		 * reduce SMT sibling interference while spinning.
-		 */
-		if (unlikely((spins++ & 0x7U) == 0U)) {
-			if (need_resched() || !owner_on_cpu(owner)) {
-				state = OWNER_NONSPINNABLE;
-				break;
-			}
+		if (need_resched() || !owner_on_cpu(owner)) {
+			state = OWNER_NONSPINNABLE;
+			break;
 		}
 
-		cpu_relax();
+		/*
+		 * Preserve original low-latency spin behavior, while still
+		 * yielding execution resources in longer spins.
+		 */
+		if (i++ > 1000)
+			cpu_relax();
 	}
 
 	return state;
@@ -805,6 +819,7 @@ static bool rwsem_optimistic_spin(struct rw_semaphore *sem)
 	u64 rspin_threshold = 0;
 	const bool curr_is_rt = rt_or_dl_task(current);
 
+	/* sem->wait_lock should not be held when doing optimistic spinning */
 	if (!osq_lock(&sem->osq))
 		goto done;
 
@@ -822,8 +837,8 @@ static bool rwsem_optimistic_spin(struct rw_semaphore *sem)
 		if (owner_state == OWNER_READER) {
 			if (prev_owner_state != OWNER_READER) {
 				/*
-				 * owner_state already excludes NONSPINNABLE.
-				 * Re-checking owner flags here is redundant.
+				 * owner_state already excludes NONSPINNABLE
+				 * via rwsem_owner_state().
 				 */
 				rspin_threshold = rwsem_rspin_threshold(sem);
 				loop = 0;
@@ -844,7 +859,9 @@ static bool rwsem_optimistic_spin(struct rw_semaphore *sem)
 		prev_owner_state = owner_state;
 		cpu_relax();
 	}
+
 	osq_unlock(&sem->osq);
+
 done:
 	lockevent_cond_inc(rwsem_opt_fail, !taken);
 	return taken;
@@ -1205,23 +1222,21 @@ static __always_inline int __down_read_killable(struct rw_semaphore *sem)
 
 static inline int __down_read_trylock(struct rw_semaphore *sem)
 {
-	long cnt;
 	int ret = 0;
+	long tmp;
 
 	DEBUG_RWSEMS_WARN_ON(sem->magic != sem, sem);
 
 	preempt_disable();
-
-	cnt = atomic_long_add_return_acquire(RWSEM_READER_BIAS, &sem->count);
-	if (likely(!(cnt & RWSEM_READ_FAILED_MASK))) {
-		rwsem_set_reader_owned(sem);
-		ret = 1;
-	} else {
-		atomic_long_add(-RWSEM_READER_BIAS, &sem->count);
-		if (WARN_ON_ONCE(cnt < 0))
-			rwsem_set_nonspinnable(sem);
+	tmp = atomic_long_read(&sem->count);
+	while (!(tmp & RWSEM_READ_FAILED_MASK)) {
+		if (atomic_long_try_cmpxchg_acquire(&sem->count, &tmp,
+						    tmp + RWSEM_READER_BIAS)) {
+			rwsem_set_reader_owned(sem);
+			ret = 1;
+			break;
+		}
 	}
-
 	preempt_enable();
 	return ret;
 }
