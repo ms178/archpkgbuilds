@@ -219,10 +219,11 @@ radv_device_init_vs_prologs(struct radv_device *device)
 
    unsigned idx = 0;
    for (unsigned num_attributes = 1; num_attributes <= 16; num_attributes++) {
+      key.num_attributes = num_attributes;
       for (unsigned count = 1; count <= num_attributes; count++) {
-         for (unsigned start = 0; start <= (num_attributes - count); start++) {
+         const unsigned last_start = num_attributes - count;
+         for (unsigned start = 0; start <= last_start; start++) {
             key.instance_rate_inputs = BITFIELD_RANGE(start, count);
-            key.num_attributes = num_attributes;
 
             struct radv_shader_part *prolog = radv_create_vs_prolog(device, &key);
             if (!prolog)
@@ -393,14 +394,15 @@ radv_device_finish_vrs_image(struct radv_device *device)
 static enum radv_force_vrs
 radv_parse_vrs_rates(const char *str)
 {
-   if (!strcmp(str, "2x2")) {
-      return RADV_FORCE_VRS_2x2;
-   } else if (!strcmp(str, "2x1")) {
-      return RADV_FORCE_VRS_2x1;
-   } else if (!strcmp(str, "1x2")) {
-      return RADV_FORCE_VRS_1x2;
-   } else if (!strcmp(str, "1x1")) {
-      return RADV_FORCE_VRS_1x1;
+   if (str && str[0] && str[1] == 'x' && str[3] == '\0') {
+      if (str[0] == '2' && str[2] == '2')
+         return RADV_FORCE_VRS_2x2;
+      if (str[0] == '2' && str[2] == '1')
+         return RADV_FORCE_VRS_2x1;
+      if (str[0] == '1' && str[2] == '2')
+         return RADV_FORCE_VRS_1x2;
+      if (str[0] == '1' && str[2] == '1')
+         return RADV_FORCE_VRS_1x1;
    }
 
    fprintf(stderr, "radv: Invalid VRS rates specified (valid values are 2x2, 2x1, 1x2 and 1x1)\n");
@@ -1007,64 +1009,60 @@ radv_get_default_max_sample_dist(int log_samples)
 void
 radv_emit_default_sample_locations(const struct radv_physical_device *pdev, struct radv_cmd_stream *cs, int nr_samples)
 {
+   static const uint32_t regs_1x4[] = {
+      R_028BF8_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0,
+      R_028C08_PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y0_0,
+      R_028C18_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_0,
+      R_028C28_PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y1_0,
+   };
+
    uint64_t centroid_priority;
+   uint32_t packed_locs = sample_locs_1x;
 
    radeon_begin(cs);
 
    switch (nr_samples) {
-   default:
-   case 1:
-      centroid_priority = centroid_priority_1x;
-
-      radeon_set_context_reg(R_028BF8_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0, sample_locs_1x);
-      radeon_set_context_reg(R_028C08_PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y0_0, sample_locs_1x);
-      radeon_set_context_reg(R_028C18_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_0, sample_locs_1x);
-      radeon_set_context_reg(R_028C28_PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y1_0, sample_locs_1x);
-      break;
    case 2:
       centroid_priority = centroid_priority_2x;
-
-      radeon_set_context_reg(R_028BF8_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0, sample_locs_2x);
-      radeon_set_context_reg(R_028C08_PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y0_0, sample_locs_2x);
-      radeon_set_context_reg(R_028C18_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_0, sample_locs_2x);
-      radeon_set_context_reg(R_028C28_PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y1_0, sample_locs_2x);
+      packed_locs = sample_locs_2x;
+      for (unsigned i = 0; i < 4; ++i)
+         radeon_set_context_reg(regs_1x4[i], packed_locs);
       break;
    case 4:
       centroid_priority = centroid_priority_4x;
-
-      radeon_set_context_reg(R_028BF8_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0, sample_locs_4x);
-      radeon_set_context_reg(R_028C08_PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y0_0, sample_locs_4x);
-      radeon_set_context_reg(R_028C18_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_0, sample_locs_4x);
-      radeon_set_context_reg(R_028C28_PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y1_0, sample_locs_4x);
+      packed_locs = sample_locs_4x;
+      for (unsigned i = 0; i < 4; ++i)
+         radeon_set_context_reg(regs_1x4[i], packed_locs);
       break;
    case 8:
       centroid_priority = centroid_priority_8x;
-
       radeon_set_context_reg_seq(R_028BF8_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0, 14);
       radeon_emit_array(sample_locs_8x, 4);
       radeon_emit_array(sample_locs_8x, 4);
       radeon_emit_array(sample_locs_8x, 4);
       radeon_emit_array(sample_locs_8x, 2);
       break;
+   case 1:
+   default:
+      centroid_priority = centroid_priority_1x;
+      packed_locs = sample_locs_1x;
+      for (unsigned i = 0; i < 4; ++i)
+         radeon_set_context_reg(regs_1x4[i], packed_locs);
+      break;
    }
 
-   /* The exclusion bits can be set to improve rasterization efficiency if no sample lies on the
-    * pixel boundary (-8 sample offset). It's currently always TRUE because the driver doesn't
-    * support 16 samples.
-    */
    if (pdev->info.gfx_level >= GFX7 && pdev->info.gfx_level < GFX12) {
       radeon_set_context_reg(R_02882C_PA_SU_PRIM_FILTER_CNTL,
                              S_02882C_XMAX_RIGHT_EXCLUSION(1) | S_02882C_YMAX_BOTTOM_EXCLUSION(1));
    }
 
-   if (pdev->info.gfx_level >= GFX12) {
+   if (pdev->info.gfx_level >= GFX12)
       radeon_set_context_reg_seq(R_028BF0_PA_SC_CENTROID_PRIORITY_0, 2);
-   } else {
+   else
       radeon_set_context_reg_seq(R_028BD4_PA_SC_CENTROID_PRIORITY_0, 2);
-   }
+
    radeon_emit(centroid_priority);
    radeon_emit(centroid_priority >> 32);
-
    radeon_end();
 }
 
@@ -1471,30 +1469,33 @@ radv_GetImageMemoryRequirements2(VkDevice _device, const VkImageMemoryRequiremen
    VK_FROM_HANDLE(radv_device, device, _device);
    VK_FROM_HANDLE(radv_image, image, pInfo->image);
    const struct radv_physical_device *pdev = radv_device_physical(device);
-   uint32_t alignment;
-   uint64_t size;
 
    const VkImagePlaneMemoryRequirementsInfo *plane_info =
       vk_find_struct_const(pInfo->pNext, IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO);
 
+   uint64_t size;
+   uint32_t alignment;
+
    if (plane_info) {
       const uint32_t plane = radv_plane_from_aspect(plane_info->planeAspect);
-
       size = image->planes[plane].surface.total_size;
-      alignment = 1 << image->planes[plane].surface.alignment_log2;
+      alignment = 1u << image->planes[plane].surface.alignment_log2;
    } else {
       size = image->size;
       alignment = image->alignment;
    }
 
-   pMemoryRequirements->memoryRequirements.memoryTypeBits =
-      ((1u << pdev->memory_properties.memoryTypeCount) - 1u) & ~pdev->memory_types_32bit;
+   const uint32_t type_count = pdev->memory_properties.memoryTypeCount;
+   const uint32_t all_types_mask = (type_count >= 32u) ? 0xffffffffu : ((1u << type_count) - 1u);
+
+   uint32_t memory_type_bits = all_types_mask & ~pdev->memory_types_32bit;
 
    if (image->vk.usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT) {
-      /* Only expose host visible memory types for images that need to be mapped on the CPU. */
-      pMemoryRequirements->memoryRequirements.memoryTypeBits &= pdev->memory_types_host_visible;
+      /* Only expose host visible memory types for images that need CPU mapping. */
+      memory_type_bits &= pdev->memory_types_host_visible;
    }
 
+   pMemoryRequirements->memoryRequirements.memoryTypeBits = memory_type_bits;
    pMemoryRequirements->memoryRequirements.size = size;
    pMemoryRequirements->memoryRequirements.alignment = alignment;
 
@@ -1599,12 +1600,19 @@ radv_compute_valid_memory_types_attempt(struct radv_physical_device *pdev, enum 
     * - Sometimes VRAM gets VRAM|GTT.
     */
    const enum radeon_bo_domain relevant_domains = RADEON_DOMAIN_VRAM | RADEON_DOMAIN_GDS | RADEON_DOMAIN_OA;
+   const enum radeon_bo_domain wanted_domains = domains & relevant_domains;
+   const enum radeon_bo_flag wanted_flags = flags & ~ignore_flags;
+
    uint32_t bits = 0;
-   for (unsigned i = 0; i < pdev->memory_properties.memoryTypeCount; ++i) {
-      if ((domains & relevant_domains) != (pdev->memory_domains[i] & relevant_domains))
+   const uint32_t count = pdev->memory_properties.memoryTypeCount;
+
+   for (uint32_t i = 0; i < count; ++i) {
+      const enum radeon_bo_domain type_domains = pdev->memory_domains[i] & relevant_domains;
+      if (type_domains != wanted_domains)
          continue;
 
-      if ((flags & ~ignore_flags) != (pdev->memory_flags[i] & ~ignore_flags))
+      const enum radeon_bo_flag type_flags = pdev->memory_flags[i] & ~ignore_flags;
+      if (type_flags != wanted_flags)
          continue;
 
       bits |= 1u << i;
