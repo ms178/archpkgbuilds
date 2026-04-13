@@ -3771,32 +3771,50 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
 
    chain->images[image_index].busy = true;
 
-   if (mode_fifo && !chain->fifo) {
-      /* If we don't have FIFO protocol, we must fall back to legacy mechanism for throttling. */
-      chain->frame = wl_surface_frame(wsi_wl_surface->wayland_surface.wrapper);
-      if (!chain->frame)
-         return VK_ERROR_OUT_OF_HOST_MEMORY;
-      wl_callback_add_listener(chain->frame, &frame_listener, chain);
-      chain->legacy_fifo_ready = false;
+   const bool use_legacy_fifo = mode_fifo &&!chain->fifo;
+
+   if (use_legacy_fifo) {
+         chain->frame = wl_surface_frame(wsi_wl_surface->wayland_surface.wrapper);
+         if (!chain->frame)
+               return VK_ERROR_OUT_OF_HOST_MEMORY;
+         wl_callback_add_listener(chain->frame, &frame_listener, chain);
+         chain->legacy_fifo_ready = false;
    } else {
-      /* If we present MAILBOX, any subsequent presentation in FIFO can replace this image. */
-      chain->legacy_fifo_ready = true;
+         chain->legacy_fifo_ready = true;
    }
 
    if (mode_fifo && chain->fifo) {
-      wp_fifo_v1_set_barrier(chain->fifo);
-      wp_fifo_v1_wait_barrier(chain->fifo);
+         wp_fifo_v1_set_barrier(chain->fifo);
 
-      if (timestamped) {
-         wl_surface_commit(wsi_wl_surface->wayland_surface.wrapper);
-         wp_fifo_v1_wait_barrier(chain->fifo);
-      }
-
-      chain->next_present_force_wait_barrier = !timestamped;
-   } else if (chain->fifo && chain->next_present_force_wait_barrier) {
-      wp_fifo_v1_wait_barrier(chain->fifo);
-      chain->next_present_force_wait_barrier = false;
+         if (timestamped) {
+               wl_surface_commit(wsi_wl_surface->wayland_surface.wrapper);
+               wp_fifo_v1_wait_barrier(chain->fifo);
+               chain->next_present_force_wait_barrier = false;
+         } else {
+               /* Defer wait to next present to avoid blocking this thread.
+                * This is safe because FIFO guarantees order.
+                */
+               chain->next_present_force_wait_barrier = true;
+         }
+   } else {
+         /* Not in FIFO mode – ensure no stale barrier state */
+         if (chain->fifo && chain->next_present_force_wait_barrier) {
+               /* We were in FIFO last frame but are now in MAILBOX/IMMEDIATE.
+                * The barrier is no longer valid – drop it.
+                */
+               chain->next_present_force_wait_barrier = false;
+         }
+         /* For MAILBOX/IMMEDIATE, never wait */
    }
+
+   /* If we deferred a barrier from previous FIFO present, consume it now
+    * only if we are still in FIFO mode.
+    */
+   if (chain->fifo && chain->next_present_force_wait_barrier && mode_fifo) {
+         wp_fifo_v1_wait_barrier(chain->fifo);
+         chain->next_present_force_wait_barrier = false;
+   }
+
    wl_surface_commit(wsi_wl_surface->wayland_surface.wrapper);
    wl_display_flush(wsi_wl_surface->display->wl_display);
 
