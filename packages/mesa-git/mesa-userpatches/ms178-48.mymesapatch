@@ -1,0 +1,2124 @@
+--- a/src/amd/vulkan/radv_descriptor_set.c	2026-04-13 18:26:51.711394558 +0200
++++ b/src/amd/vulkan/radv_descriptor_set.c	2026-04-13 21:11:57.582645900 +0200
+@@ -14,6 +14,31 @@
+ #include "sid.h"
+ #include "vk_descriptors.h"
+ 
++static inline void
++radv_build_layout_binding_meta(const VkDescriptorSetLayoutCreateInfo *create_info,
++                               const VkDescriptorSetLayoutBindingFlagsCreateInfo *flags_info,
++                               const VkMutableDescriptorTypeCreateInfoEXT *mutable_info,
++                               VkDescriptorBindingFlags *binding_flags_by_binding,
++                               const VkMutableDescriptorTypeListEXT **mutable_list_by_binding,
++                               uint32_t num_bindings)
++{
++   for (uint32_t i = 0; i < num_bindings; i++) {
++      binding_flags_by_binding[i] = 0;
++      mutable_list_by_binding[i] = NULL;
++   }
++
++   for (uint32_t i = 0; i < create_info->bindingCount; i++) {
++      const uint32_t b = create_info->pBindings[i].binding;
++
++      if (flags_info && i < flags_info->bindingCount && flags_info->pBindingFlags)
++         binding_flags_by_binding[b] = flags_info->pBindingFlags[i];
++
++      if (mutable_info && i < mutable_info->mutableDescriptorTypeListCount &&
++          mutable_info->pMutableDescriptorTypeLists)
++         mutable_list_by_binding[b] = &mutable_info->pMutableDescriptorTypeLists[i];
++   }
++}
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ radv_CreateDescriptorSetLayout(VkDevice _device, const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                                const VkAllocationCallbacks *pAllocator, VkDescriptorSetLayout *pSetLayout)
+@@ -22,7 +47,9 @@ radv_CreateDescriptorSetLayout(VkDevice
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+    struct radv_descriptor_set_layout *set_layout;
+ 
++   (void)pAllocator;
+    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO);
++
+    const VkDescriptorSetLayoutBindingFlagsCreateInfo *variable_flags =
+       vk_find_struct_const(pCreateInfo->pNext, DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO);
+    const VkMutableDescriptorTypeCreateInfoEXT *mutable_info =
+@@ -31,105 +58,136 @@ radv_CreateDescriptorSetLayout(VkDevice
+    uint32_t num_bindings = 0;
+    uint32_t immutable_sampler_count = 0;
+    uint32_t ycbcr_sampler_count = 0;
++
+    for (uint32_t j = 0; j < pCreateInfo->bindingCount; j++) {
+-      num_bindings = MAX2(num_bindings, pCreateInfo->pBindings[j].binding + 1);
+-      if ((pCreateInfo->pBindings[j].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+-           pCreateInfo->pBindings[j].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER) &&
+-          pCreateInfo->pBindings[j].pImmutableSamplers) {
+-         immutable_sampler_count += pCreateInfo->pBindings[j].descriptorCount;
++      const VkDescriptorSetLayoutBinding *b = &pCreateInfo->pBindings[j];
++      num_bindings = MAX2(num_bindings, b->binding + 1);
++
++      if ((b->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
++           b->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER) &&
++          b->pImmutableSamplers) {
++         immutable_sampler_count += b->descriptorCount;
+ 
+          bool has_ycbcr_sampler = false;
+-         for (unsigned i = 0; i < pCreateInfo->pBindings[j].descriptorCount; ++i) {
+-            if (radv_sampler_from_handle(pCreateInfo->pBindings[j].pImmutableSamplers[i])->vk.ycbcr_conversion)
++         for (uint32_t i = 0; i < b->descriptorCount; i++) {
++            struct radv_sampler *sampler = radv_sampler_from_handle(b->pImmutableSamplers[i]);
++            if (sampler && sampler->vk.ycbcr_conversion) {
+                has_ycbcr_sampler = true;
++               break;
++            }
+          }
+ 
+          if (has_ycbcr_sampler)
+-            ycbcr_sampler_count += pCreateInfo->pBindings[j].descriptorCount;
++            ycbcr_sampler_count += b->descriptorCount;
+       }
+    }
+ 
+    uint32_t samplers_offset = offsetof(struct radv_descriptor_set_layout, binding[num_bindings]);
+-   size_t size = samplers_offset + immutable_sampler_count * 4 * sizeof(uint32_t);
++   size_t size = samplers_offset + (size_t)immutable_sampler_count * 4u * sizeof(uint32_t);
++
+    if (ycbcr_sampler_count > 0) {
+-      /* Store block of offsets first, followed by the conversion descriptors (padded to the struct
+-       * alignment) */
+-      size += num_bindings * sizeof(uint32_t);
++      size += (size_t)num_bindings * sizeof(uint32_t);
+       size = align_uintptr(size, alignof(struct vk_ycbcr_conversion_state));
+-      size += ycbcr_sampler_count * sizeof(struct vk_ycbcr_conversion_state);
++      size += (size_t)ycbcr_sampler_count * sizeof(struct vk_ycbcr_conversion_state);
+    }
+ 
+-   /* We need to allocate descriptor set layouts off the device allocator with DEVICE scope because
+-    * they are reference counted and may not be destroyed when vkDestroyDescriptorSetLayout is
+-    * called.
+-    */
+    set_layout = vk_descriptor_set_layout_zalloc(&device->vk, size, pCreateInfo);
+    if (!set_layout)
+       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
++   VkDescriptorSetLayoutBinding *bindings = NULL;
++   VkResult result =
++      vk_create_sorted_bindings(pCreateInfo->pBindings, pCreateInfo->bindingCount, &bindings, NULL, NULL);
++   if (result != VK_SUCCESS) {
++      vk_descriptor_set_layout_unref(&device->vk, &set_layout->vk);
++      return vk_error(device, result);
++   }
++
++   VkDescriptorBindingFlags *binding_flags_by_binding = NULL;
++   const VkMutableDescriptorTypeListEXT **mutable_list_by_binding = NULL;
++   if (num_bindings) {
++      binding_flags_by_binding = calloc(num_bindings, sizeof(*binding_flags_by_binding));
++      mutable_list_by_binding = calloc(num_bindings, sizeof(*mutable_list_by_binding));
++      if (!binding_flags_by_binding || !mutable_list_by_binding) {
++         free(mutable_list_by_binding);
++         free(binding_flags_by_binding);
++         free(bindings);
++         vk_descriptor_set_layout_unref(&device->vk, &set_layout->vk);
++         return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
++      }
++
++      radv_build_layout_binding_meta(pCreateInfo, variable_flags, mutable_info,
++                                     binding_flags_by_binding, mutable_list_by_binding, num_bindings);
++   }
++
+    set_layout->flags = pCreateInfo->flags;
++   set_layout->binding_count = num_bindings;
++   set_layout->dynamic_shader_stages = 0;
++   set_layout->has_immutable_samplers = false;
++   set_layout->has_variable_descriptors = false;
++   set_layout->size = 0;
+ 
+-   /* We just allocate all the samplers at the end of the struct */
+    uint32_t *samplers = (uint32_t *)&set_layout->binding[num_bindings];
+    struct vk_ycbcr_conversion_state *ycbcr_samplers = NULL;
+    uint32_t *ycbcr_sampler_offsets = NULL;
+ 
+    if (ycbcr_sampler_count > 0) {
+       ycbcr_sampler_offsets = samplers + 4 * immutable_sampler_count;
+-      set_layout->ycbcr_sampler_offsets_offset = (char *)ycbcr_sampler_offsets - (char *)set_layout;
++      set_layout->ycbcr_sampler_offsets_offset = (uint32_t)((char *)ycbcr_sampler_offsets - (char *)set_layout);
+ 
+-      uintptr_t first_ycbcr_sampler_offset = (uintptr_t)ycbcr_sampler_offsets + sizeof(uint32_t) * num_bindings;
+-      first_ycbcr_sampler_offset = align_uintptr(first_ycbcr_sampler_offset, alignof(struct vk_ycbcr_conversion_state));
++      uintptr_t first_ycbcr_sampler_offset =
++         (uintptr_t)ycbcr_sampler_offsets + (size_t)num_bindings * sizeof(uint32_t);
++      first_ycbcr_sampler_offset =
++         align_uintptr(first_ycbcr_sampler_offset, alignof(struct vk_ycbcr_conversion_state));
+       ycbcr_samplers = (struct vk_ycbcr_conversion_state *)first_ycbcr_sampler_offset;
+-   } else
++   } else {
+       set_layout->ycbcr_sampler_offsets_offset = 0;
+-
+-   VkDescriptorSetLayoutBinding *bindings = NULL;
+-   VkResult result = vk_create_sorted_bindings(pCreateInfo->pBindings, pCreateInfo->bindingCount, &bindings, NULL, NULL);
+-   if (result != VK_SUCCESS) {
+-      vk_descriptor_set_layout_unref(&device->vk, &set_layout->vk);
+-      return vk_error(device, result);
+    }
+ 
+-   set_layout->binding_count = num_bindings;
+-   set_layout->dynamic_shader_stages = 0;
+-   set_layout->has_immutable_samplers = false;
+-   set_layout->size = 0;
+-
+    uint32_t dynamic_offset_count = 0;
+-
+    uint32_t first_alignment = 32;
++
+    if (pCreateInfo->bindingCount > 0) {
+-      uint32_t last_alignment = radv_descriptor_alignment(bindings[pCreateInfo->bindingCount - 1].descriptorType);
+-      if (bindings[pCreateInfo->bindingCount - 1].descriptorType == VK_DESCRIPTOR_TYPE_MUTABLE_EXT) {
++      const VkDescriptorSetLayoutBinding *last = &bindings[pCreateInfo->bindingCount - 1];
++      uint32_t last_alignment = radv_descriptor_alignment(last->descriptorType);
++
++      if (last->descriptorType == VK_DESCRIPTOR_TYPE_MUTABLE_EXT) {
+          uint64_t mutable_size = 0, mutable_align = 0;
+-         radv_mutable_descriptor_type_size_alignment(
+-            device, &mutable_info->pMutableDescriptorTypeLists[pCreateInfo->bindingCount - 1], &mutable_size,
+-            &mutable_align);
+-         last_alignment = mutable_align;
++         const VkMutableDescriptorTypeListEXT *list =
++            (last->binding < num_bindings) ? mutable_list_by_binding[last->binding] : NULL;
++
++         if (!list || !radv_mutable_descriptor_type_size_alignment(device, list, &mutable_size, &mutable_align)) {
++            free(mutable_list_by_binding);
++            free(binding_flags_by_binding);
++            free(bindings);
++            vk_descriptor_set_layout_unref(&device->vk, &set_layout->vk);
++            return vk_error(device, VK_ERROR_UNKNOWN);
++         }
++         last_alignment = (uint32_t)mutable_align;
+       }
+ 
+-      first_alignment = last_alignment == 32 ? 16 : 32;
++      first_alignment = (last_alignment == 32) ? 16 : 32;
+    }
+ 
+-   for (unsigned pass = 0; pass < 2; ++pass) {
++   for (unsigned pass = 0; pass < 2; pass++) {
+       for (uint32_t j = 0; j < pCreateInfo->bindingCount; j++) {
+-         const VkDescriptorSetLayoutBinding *binding = bindings + j;
+-         uint32_t b = binding->binding;
++         const VkDescriptorSetLayoutBinding *binding = &bindings[j];
++         const uint32_t b = binding->binding;
+          uint32_t alignment = radv_descriptor_alignment(binding->descriptorType);
+          uint32_t descriptor_count = binding->descriptorCount;
+          uint32_t max_sampled_image_descriptors = 1;
+          bool has_ycbcr_sampler = false;
+ 
+-         if (binding->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && binding->pImmutableSamplers) {
+-            for (unsigned i = 0; i < binding->descriptorCount; ++i) {
+-               struct vk_ycbcr_conversion *conversion =
+-                  radv_sampler_from_handle(binding->pImmutableSamplers[i])->vk.ycbcr_conversion;
+-
++         if (binding->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
++             binding->pImmutableSamplers) {
++            for (uint32_t i = 0; i < binding->descriptorCount; i++) {
++               struct radv_sampler *sampler = radv_sampler_from_handle(binding->pImmutableSamplers[i]);
++               struct vk_ycbcr_conversion *conversion = sampler ? sampler->vk.ycbcr_conversion : NULL;
+                if (conversion) {
+                   has_ycbcr_sampler = true;
+                   max_sampled_image_descriptors =
+-                     MAX2(max_sampled_image_descriptors, vk_format_get_plane_count(conversion->state.format));
++                     MAX2(max_sampled_image_descriptors,
++                          vk_format_get_plane_count(conversion->state.format));
+                }
+             }
+          }
+@@ -166,11 +224,19 @@ radv_CreateDescriptorSetLayout(VkDevice
+             break;
+          case VK_DESCRIPTOR_TYPE_MUTABLE_EXT: {
+             uint64_t mutable_size = 0, mutable_align = 0;
+-            radv_mutable_descriptor_type_size_alignment(device, &mutable_info->pMutableDescriptorTypeLists[j],
+-                                                        &mutable_size, &mutable_align);
+-            assert(mutable_size && mutable_align);
+-            set_layout->binding[b].size = mutable_size;
+-            alignment = mutable_align;
++            const VkMutableDescriptorTypeListEXT *list =
++               (b < num_bindings) ? mutable_list_by_binding[b] : NULL;
++
++            if (!list || !radv_mutable_descriptor_type_size_alignment(device, list, &mutable_size, &mutable_align)) {
++               free(mutable_list_by_binding);
++               free(binding_flags_by_binding);
++               free(bindings);
++               vk_descriptor_set_layout_unref(&device->vk, &set_layout->vk);
++               return vk_error(device, VK_ERROR_UNKNOWN);
++            }
++
++            set_layout->binding[b].size = (uint32_t)mutable_size;
++            alignment = (uint32_t)mutable_align;
+             break;
+          }
+          case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
+@@ -184,7 +250,8 @@ radv_CreateDescriptorSetLayout(VkDevice
+             break;
+          }
+ 
+-         if ((pass == 0 && alignment != first_alignment) || (pass == 1 && alignment == first_alignment))
++         if ((pass == 0 && alignment != first_alignment) ||
++             (pass == 1 && alignment == first_alignment))
+             continue;
+ 
+          set_layout->size = align(set_layout->size, alignment);
+@@ -194,11 +261,11 @@ radv_CreateDescriptorSetLayout(VkDevice
+          set_layout->binding[b].dynamic_offset_offset = dynamic_offset_count;
+          set_layout->binding[b].has_ycbcr_sampler = has_ycbcr_sampler;
+ 
+-         if (variable_flags && j < variable_flags->bindingCount &&
+-             (variable_flags->pBindingFlags[j] & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT)) {
+-            assert(!binding->pImmutableSamplers); /* Terribly ill defined  how many samplers are valid */
++         const VkDescriptorBindingFlags bflags =
++            (b < num_bindings) ? binding_flags_by_binding[b] : 0;
++         if (bflags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) {
++            assert(!binding->pImmutableSamplers);
+             assert(binding->binding == num_bindings - 1);
+-
+             set_layout->has_variable_descriptors = true;
+          }
+ 
+@@ -208,19 +275,20 @@ radv_CreateDescriptorSetLayout(VkDevice
+             set_layout->binding[b].immutable_samplers_offset = samplers_offset;
+             set_layout->has_immutable_samplers = true;
+ 
+-            for (uint32_t i = 0; i < binding->descriptorCount; i++)
+-               memcpy(samplers + 4 * i, &radv_sampler_from_handle(binding->pImmutableSamplers[i])->state,
+-                      RADV_SAMPLER_DESC_SIZE);
++            for (uint32_t i = 0; i < binding->descriptorCount; i++) {
++               struct radv_sampler *sampler = radv_sampler_from_handle(binding->pImmutableSamplers[i]);
++               memcpy(samplers + 4 * i, &sampler->state, RADV_SAMPLER_DESC_SIZE);
++            }
+ 
+             samplers += 4 * binding->descriptorCount;
+             samplers_offset += 4 * sizeof(uint32_t) * binding->descriptorCount;
+ 
+             if (has_ycbcr_sampler) {
+-               ycbcr_sampler_offsets[b] = (const char *)ycbcr_samplers - (const char *)set_layout;
++               ycbcr_sampler_offsets[b] = (uint32_t)((const char *)ycbcr_samplers - (const char *)set_layout);
+                for (uint32_t i = 0; i < binding->descriptorCount; i++) {
+-                  if (radv_sampler_from_handle(binding->pImmutableSamplers[i])->vk.ycbcr_conversion)
+-                     ycbcr_samplers[i] =
+-                        radv_sampler_from_handle(binding->pImmutableSamplers[i])->vk.ycbcr_conversion->state;
++                  struct radv_sampler *sampler = radv_sampler_from_handle(binding->pImmutableSamplers[i]);
++                  if (sampler && sampler->vk.ycbcr_conversion)
++                     ycbcr_samplers[i] = sampler->vk.ycbcr_conversion->state;
+                   else
+                      ycbcr_samplers[i].format = VK_FORMAT_UNDEFINED;
+                }
+@@ -233,19 +301,16 @@ radv_CreateDescriptorSetLayout(VkDevice
+       }
+    }
+ 
+-   free(bindings);
+-
+    set_layout->dynamic_offset_count = dynamic_offset_count;
+ 
+-   /* Hash the entire set layout except vk_descriptor_set_layout. The rest of the set layout is
+-    * carefully constructed to not have pointers so a full hash instead of a per-field hash
+-    * should be ok.
+-    */
+-   uint32_t hash_offset = offsetof(struct radv_descriptor_set_layout, hash) + sizeof(set_layout->hash);
++   const uint32_t hash_offset = offsetof(struct radv_descriptor_set_layout, hash) + sizeof(set_layout->hash);
+    _mesa_blake3_compute((const char *)set_layout + hash_offset, size - hash_offset, set_layout->hash);
+ 
+-   *pSetLayout = radv_descriptor_set_layout_to_handle(set_layout);
++   free(mutable_list_by_binding);
++   free(binding_flags_by_binding);
++   free(bindings);
+ 
++   *pSetLayout = radv_descriptor_set_layout_to_handle(set_layout);
+    return VK_SUCCESS;
+ }
+ 
+@@ -257,7 +322,8 @@ radv_GetDescriptorSetLayoutSupport(VkDev
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+ 
+    VkDescriptorSetLayoutBinding *bindings = NULL;
+-   VkResult result = vk_create_sorted_bindings(pCreateInfo->pBindings, pCreateInfo->bindingCount, &bindings, NULL, NULL);
++   VkResult result =
++      vk_create_sorted_bindings(pCreateInfo->pBindings, pCreateInfo->bindingCount, &bindings, NULL, NULL);
+    if (result != VK_SUCCESS) {
+       pSupport->supported = false;
+       return;
+@@ -265,37 +331,69 @@ radv_GetDescriptorSetLayoutSupport(VkDev
+ 
+    const VkDescriptorSetLayoutBindingFlagsCreateInfo *variable_flags =
+       vk_find_struct_const(pCreateInfo->pNext, DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO);
+-   VkDescriptorSetVariableDescriptorCountLayoutSupport *variable_count =
+-      vk_find_struct(pSupport->pNext, DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT);
+    const VkMutableDescriptorTypeCreateInfoEXT *mutable_info =
+       vk_find_struct_const(pCreateInfo->pNext, MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT);
+-   if (variable_count) {
++
++   VkDescriptorSetVariableDescriptorCountLayoutSupport *variable_count =
++      vk_find_struct(pSupport->pNext, DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT);
++   if (variable_count)
+       variable_count->maxVariableDescriptorCount = 0;
++
++   uint32_t num_bindings = 0;
++   for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++)
++      num_bindings = MAX2(num_bindings, pCreateInfo->pBindings[i].binding + 1);
++
++   VkDescriptorBindingFlags *binding_flags_by_binding = NULL;
++   const VkMutableDescriptorTypeListEXT **mutable_list_by_binding = NULL;
++
++   if (num_bindings) {
++      binding_flags_by_binding = calloc(num_bindings, sizeof(*binding_flags_by_binding));
++      mutable_list_by_binding = calloc(num_bindings, sizeof(*mutable_list_by_binding));
++      if (!binding_flags_by_binding || !mutable_list_by_binding) {
++         free(mutable_list_by_binding);
++         free(binding_flags_by_binding);
++         free(bindings);
++         pSupport->supported = false;
++         return;
++      }
++
++      radv_build_layout_binding_meta(pCreateInfo, variable_flags, mutable_info,
++                                     binding_flags_by_binding, mutable_list_by_binding, num_bindings);
+    }
+ 
+    uint32_t first_alignment = 32;
+    if (pCreateInfo->bindingCount > 0) {
+-      uint32_t last_alignment = radv_descriptor_alignment(bindings[pCreateInfo->bindingCount - 1].descriptorType);
+-      if (bindings[pCreateInfo->bindingCount - 1].descriptorType == VK_DESCRIPTOR_TYPE_MUTABLE_EXT) {
++      const VkDescriptorSetLayoutBinding *last = &bindings[pCreateInfo->bindingCount - 1];
++      uint32_t last_alignment = radv_descriptor_alignment(last->descriptorType);
++
++      if (last->descriptorType == VK_DESCRIPTOR_TYPE_MUTABLE_EXT) {
+          uint64_t mutable_size = 0, mutable_align = 0;
+-         radv_mutable_descriptor_type_size_alignment(
+-            device, &mutable_info->pMutableDescriptorTypeLists[pCreateInfo->bindingCount - 1], &mutable_size,
+-            &mutable_align);
+-         last_alignment = mutable_align;
++         const VkMutableDescriptorTypeListEXT *list =
++            (last->binding < num_bindings) ? mutable_list_by_binding[last->binding] : NULL;
++         if (!list || !radv_mutable_descriptor_type_size_alignment(device, list, &mutable_size, &mutable_align)) {
++            free(mutable_list_by_binding);
++            free(binding_flags_by_binding);
++            free(bindings);
++            pSupport->supported = false;
++            return;
++         }
++         last_alignment = (uint32_t)mutable_align;
+       }
+ 
+-      first_alignment = last_alignment == 32 ? 16 : 32;
++      first_alignment = (last_alignment == 32) ? 16 : 32;
+    }
+ 
+    bool supported = true;
+    uint64_t size = 0;
+-   for (unsigned pass = 0; pass < 2; ++pass) {
++
++   for (unsigned pass = 0; pass < 2; pass++) {
+       for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
+-         const VkDescriptorSetLayoutBinding *binding = bindings + i;
++         const VkDescriptorSetLayoutBinding *binding = &bindings[i];
+ 
+          uint64_t descriptor_size = 0;
+          uint64_t descriptor_alignment = radv_descriptor_alignment(binding->descriptorType);
+          uint32_t descriptor_count = binding->descriptorCount;
++
+          switch (binding->descriptorType) {
+          case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+          case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+@@ -323,12 +421,14 @@ radv_GetDescriptorSetLayoutSupport(VkDev
+             descriptor_size = descriptor_count;
+             descriptor_count = 1;
+             break;
+-         case VK_DESCRIPTOR_TYPE_MUTABLE_EXT:
+-            if (!radv_mutable_descriptor_type_size_alignment(device, &mutable_info->pMutableDescriptorTypeLists[i],
+-                                                             &descriptor_size, &descriptor_alignment)) {
++         case VK_DESCRIPTOR_TYPE_MUTABLE_EXT: {
++            const VkMutableDescriptorTypeListEXT *list =
++               (binding->binding < num_bindings) ? mutable_list_by_binding[binding->binding] : NULL;
++            if (!list ||
++                !radv_mutable_descriptor_type_size_alignment(device, list, &descriptor_size, &descriptor_alignment))
+                supported = false;
+-            }
+             break;
++         }
+          case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+             descriptor_size = RADV_ACCEL_STRUCT_DESC_SIZE;
+             break;
+@@ -340,9 +440,8 @@ radv_GetDescriptorSetLayoutSupport(VkDev
+              (pass == 1 && descriptor_alignment == first_alignment))
+             continue;
+ 
+-         if (size && !align64(size, descriptor_alignment)) {
++         if (size && !align64(size, descriptor_alignment))
+             supported = false;
+-         }
+          size = align64(size, descriptor_alignment);
+ 
+          uint64_t max_count = INT32_MAX;
+@@ -351,17 +450,21 @@ radv_GetDescriptorSetLayoutSupport(VkDev
+          else if (descriptor_size)
+             max_count = (INT32_MAX - size) / descriptor_size;
+ 
+-         if (max_count < descriptor_count) {
++         if (max_count < descriptor_count)
+             supported = false;
+-         }
+-         if (variable_flags && i < variable_flags->bindingCount && variable_count &&
+-             (variable_flags->pBindingFlags[i] & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT)) {
++
++         const VkDescriptorBindingFlags bflags =
++            (binding->binding < num_bindings) ? binding_flags_by_binding[binding->binding] : 0;
++
++         if ((bflags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) && variable_count)
+             variable_count->maxVariableDescriptorCount = MIN2(UINT32_MAX, max_count);
+-         }
++
+          size += descriptor_count * descriptor_size;
+       }
+    }
+ 
++   free(mutable_list_by_binding);
++   free(binding_flags_by_binding);
+    free(bindings);
+ 
+    pSupport->supported = supported;
+@@ -556,23 +659,21 @@ radv_update_descriptor_sets_impl(struct
+                                  const VkCopyDescriptorSet *pDescriptorCopies)
+ {
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+-   uint32_t i, j;
+-   for (i = 0; i < descriptorWriteCount; i++) {
++   const uint32_t sampled_desc_size = radv_get_sampled_image_desc_size(pdev);
++   const uint32_t combined_sampler_offset = radv_get_combined_image_sampler_offset(pdev);
++
++   for (uint32_t i = 0; i < descriptorWriteCount; i++) {
+       const VkWriteDescriptorSet *writeset = &pDescriptorWrites[i];
+       VK_FROM_HANDLE(radv_descriptor_set, set, dstSetOverride ? dstSetOverride : writeset->dstSet);
+       const struct radv_descriptor_set_binding_layout *binding_layout =
+          set->header.layout->binding + writeset->dstBinding;
+-      uint32_t *ptr = set->header.mapped_ptr;
+-      /* Immutable samplers are not copied into push descriptors when they are
+-       * allocated, so if we are writing push descriptors we have to copy the
+-       * immutable samplers into them now.
+-       */
++      const uint32_t desc_size_dw = binding_layout->size / 4;
++
++      uint32_t *ptr = set->header.mapped_ptr + binding_layout->offset / 4;
+       const bool copy_immutable_samplers = cmd_buffer && binding_layout->immutable_samplers_offset;
+       const uint32_t *samplers = radv_immutable_samplers(set->header.layout, binding_layout);
+       const VkWriteDescriptorSetAccelerationStructureKHR *accel_structs = NULL;
+ 
+-      ptr += binding_layout->offset / 4;
+-
+       if (writeset->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+          radv_write_block_descriptor((uint8_t *)ptr + writeset->dstArrayElement, writeset);
+          continue;
+@@ -580,13 +681,14 @@ radv_update_descriptor_sets_impl(struct
+          accel_structs = vk_find_struct_const(writeset->pNext, WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR);
+       }
+ 
+-      ptr += binding_layout->size * writeset->dstArrayElement / 4;
+-      for (j = 0; j < writeset->descriptorCount; ++j) {
++      ptr += desc_size_dw * writeset->dstArrayElement;
++
++      for (uint32_t j = 0; j < writeset->descriptorCount; j++) {
+          switch (writeset->descriptorType) {
+          case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+          case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: {
+-            unsigned idx = writeset->dstArrayElement + j;
+-            idx += binding_layout->dynamic_offset_offset;
++            const unsigned idx =
++               binding_layout->dynamic_offset_offset + writeset->dstArrayElement + j;
+             assert(!(set->header.layout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT));
+             radv_write_dynamic_buffer_descriptor(set->header.dynamic_descriptors + idx, writeset->pBufferInfo + j);
+             break;
+@@ -605,10 +707,10 @@ radv_update_descriptor_sets_impl(struct
+             break;
+          case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+          case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+-            radv_write_image_descriptor(ptr, radv_get_sampled_image_desc_size(pdev), writeset->descriptorType,
++            radv_write_image_descriptor(ptr, sampled_desc_size, writeset->descriptorType,
+                                         writeset->pImageInfo + j);
+             break;
+-         case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: {
++         case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+             if (binding_layout->has_ycbcr_sampler) {
+                radv_write_image_descriptor_ycbcr(device, ptr, writeset->pImageInfo + j);
+             } else {
+@@ -618,25 +720,21 @@ radv_update_descriptor_sets_impl(struct
+             }
+ 
+             if (copy_immutable_samplers) {
+-               const uint32_t sampler_offset = radv_get_combined_image_sampler_offset(pdev);
+                const unsigned idx = writeset->dstArrayElement + j;
+-
+-               memcpy((char *)ptr + sampler_offset, samplers + 4 * idx, RADV_SAMPLER_DESC_SIZE);
++               memcpy((char *)ptr + combined_sampler_offset, samplers + 4 * idx, RADV_SAMPLER_DESC_SIZE);
+             }
+             break;
+-         }
+          case VK_DESCRIPTOR_TYPE_SAMPLER:
+             if (!binding_layout->immutable_samplers_offset) {
+-               const VkDescriptorImageInfo *pImageInfo = writeset->pImageInfo + j;
+-               radv_write_sampler_descriptor(ptr, pImageInfo->sampler);
++               radv_write_sampler_descriptor(ptr, writeset->pImageInfo[j].sampler);
+             } else if (copy_immutable_samplers) {
+-               unsigned idx = writeset->dstArrayElement + j;
++               const unsigned idx = writeset->dstArrayElement + j;
+                memcpy(ptr, samplers + 4 * idx, RADV_SAMPLER_DESC_SIZE);
+             }
+             break;
+          case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: {
+-            VK_FROM_HANDLE(vk_acceleration_structure, accel_struct, accel_structs->pAccelerationStructures[j]);
+-
++            VK_FROM_HANDLE(vk_acceleration_structure, accel_struct,
++                           accel_structs->pAccelerationStructures[j]);
+             radv_write_accel_struct_descriptor(device, ptr,
+                                                accel_struct ? vk_acceleration_structure_get_va(accel_struct) : 0);
+             break;
+@@ -644,55 +742,54 @@ radv_update_descriptor_sets_impl(struct
+          default:
+             break;
+          }
+-         ptr += binding_layout->size / 4;
++
++         ptr += desc_size_dw;
+       }
+    }
+ 
+-   for (i = 0; i < descriptorCopyCount; i++) {
++   for (uint32_t i = 0; i < descriptorCopyCount; i++) {
+       const VkCopyDescriptorSet *copyset = &pDescriptorCopies[i];
+       VK_FROM_HANDLE(radv_descriptor_set, src_set, copyset->srcSet);
+       VK_FROM_HANDLE(radv_descriptor_set, dst_set, copyset->dstSet);
++
+       const struct radv_descriptor_set_binding_layout *src_binding_layout =
+          src_set->header.layout->binding + copyset->srcBinding;
+       const struct radv_descriptor_set_binding_layout *dst_binding_layout =
+          dst_set->header.layout->binding + copyset->dstBinding;
+-      uint32_t *src_ptr = src_set->header.mapped_ptr;
+-      uint32_t *dst_ptr = dst_set->header.mapped_ptr;
+-
+-      src_ptr += src_binding_layout->offset / 4;
+-      dst_ptr += dst_binding_layout->offset / 4;
+ 
+       if (src_binding_layout->type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+-         src_ptr += copyset->srcArrayElement / 4;
+-         dst_ptr += copyset->dstArrayElement / 4;
+-
+-         memcpy(dst_ptr, src_ptr, copyset->descriptorCount);
++         uint8_t *src_bytes = (uint8_t *)src_set->header.mapped_ptr +
++                              src_binding_layout->offset + copyset->srcArrayElement;
++         uint8_t *dst_bytes = (uint8_t *)dst_set->header.mapped_ptr +
++                              dst_binding_layout->offset + copyset->dstArrayElement;
++         memcpy(dst_bytes, src_bytes, copyset->descriptorCount);
+          continue;
+       }
+ 
+-      src_ptr += src_binding_layout->size * copyset->srcArrayElement / 4;
+-      dst_ptr += dst_binding_layout->size * copyset->dstArrayElement / 4;
+-
+-      /* In case of copies between mutable descriptor types
+-       * and non-mutable descriptor types. */
+-      size_t copy_size = MIN2(src_binding_layout->size, dst_binding_layout->size);
+-
+-      for (j = 0; j < copyset->descriptorCount; ++j) {
+-         if (vk_descriptor_type_is_dynamic(src_binding_layout->type)) {
+-            unsigned src_idx = copyset->srcArrayElement + j;
+-            unsigned dst_idx = copyset->dstArrayElement + j;
+-            struct radv_descriptor_range *src_range, *dst_range;
+-            src_idx += src_binding_layout->dynamic_offset_offset;
+-            dst_idx += dst_binding_layout->dynamic_offset_offset;
+-
+-            src_range = src_set->header.dynamic_descriptors + src_idx;
+-            dst_range = dst_set->header.dynamic_descriptors + dst_idx;
+-            *dst_range = *src_range;
+-         } else
++      const uint32_t src_desc_dw = src_binding_layout->size / 4;
++      const uint32_t dst_desc_dw = dst_binding_layout->size / 4;
++      uint32_t *src_ptr = src_set->header.mapped_ptr + src_binding_layout->offset / 4 +
++                          src_desc_dw * copyset->srcArrayElement;
++      uint32_t *dst_ptr = dst_set->header.mapped_ptr + dst_binding_layout->offset / 4 +
++                          dst_desc_dw * copyset->dstArrayElement;
++
++      const bool src_is_dynamic = vk_descriptor_type_is_dynamic(src_binding_layout->type);
++      const size_t copy_size = MIN2(src_binding_layout->size, dst_binding_layout->size);
++
++      for (uint32_t j = 0; j < copyset->descriptorCount; j++) {
++         if (src_is_dynamic) {
++            const unsigned src_idx =
++               src_binding_layout->dynamic_offset_offset + copyset->srcArrayElement + j;
++            const unsigned dst_idx =
++               dst_binding_layout->dynamic_offset_offset + copyset->dstArrayElement + j;
++            dst_set->header.dynamic_descriptors[dst_idx] =
++               src_set->header.dynamic_descriptors[src_idx];
++         } else {
+             memcpy(dst_ptr, src_ptr, copy_size);
++         }
+ 
+-         src_ptr += src_binding_layout->size / 4;
+-         dst_ptr += dst_binding_layout->size / 4;
++         src_ptr += src_desc_dw;
++         dst_ptr += dst_desc_dw;
+       }
+    }
+ }
+
+--- a/src/amd/common/ac_gpu_info.c	2026-04-13 18:28:57.747999422 +0200
++++ b/src/amd/common/ac_gpu_info.c	2026-04-13 20:57:43.387393332 +0200
+@@ -61,12 +61,11 @@ drmGetFormatModifierName(uint64_t modifi
+ 
+ #define CIK_TILE_MODE_COLOR_2D 14
+ 
+-static bool has_modifiers(int fd)
++static bool
++has_modifiers(int fd)
+ {
+-   uint64_t value;
+-   if (drmGetCap(fd, DRM_CAP_ADDFB2_MODIFIERS, &value))
+-      return false;
+-   return value ? true : false;
++   uint64_t value = 0;
++   return drmGetCap(fd, DRM_CAP_ADDFB2_MODIFIERS, &value) == 0 && value != 0;
+ }
+ 
+ static uint64_t fix_vram_size(uint64_t size)
+@@ -77,103 +76,148 @@ static uint64_t fix_vram_size(uint64_t s
+    return align64(size, 256 * 1024 * 1024);
+ }
+ 
+-static void set_custom_cu_en_mask(struct radeon_info *info)
++static void
++set_custom_cu_en_mask(struct radeon_info *info)
+ {
+-   info->spi_cu_en = ~0;
++   info->spi_cu_en = ~0u;
+ 
+    const char *cu_env_var = os_get_option("AMD_CU_MASK");
+    if (!cu_env_var)
+       return;
+ 
+-   int size = strlen(cu_env_var);
+-   char *str = alloca(size + 1);
+-   memset(str, 0, size + 1);
++   const size_t env_len = strlen(cu_env_var);
++   if (env_len == 0) {
++      fprintf(stderr, "amd: invalid AMD_CU_MASK: empty value\n");
++      return;
++   }
+ 
+-   size = 0;
++   /* Avoid unbounded stack growth from environment data. */
++   if (env_len > 4096) {
++      fprintf(stderr, "amd: invalid AMD_CU_MASK: value too long\n");
++      return;
++   }
+ 
+-   /* Strip whitespace. */
+-   for (unsigned src = 0; cu_env_var[src]; src++) {
+-      if (cu_env_var[src] != ' ' && cu_env_var[src] != '\t' &&
+-          cu_env_var[src] != '\n' && cu_env_var[src] != '\r') {
+-         str[size++] = cu_env_var[src];
+-      }
++   char *str = malloc(env_len + 1);
++   if (!str) {
++      fprintf(stderr, "amd: invalid AMD_CU_MASK: out of memory\n");
++      return;
++   }
++
++   size_t n = 0;
++   for (size_t i = 0; i < env_len; i++) {
++      const unsigned char c = (unsigned char)cu_env_var[i];
++      if (!isspace(c))
++         str[n++] = (char)c;
++   }
++   str[n] = '\0';
++
++   if (n == 0) {
++      fprintf(stderr, "amd: invalid AMD_CU_MASK: empty value\n");
++      free(str);
++      return;
+    }
+ 
+-   /* The following syntax is used, all whitespace is ignored:
+-    *   ID = [0-9][0-9]*                         ex. base 10 numbers
+-    *   ID_list = (ID | ID-ID)[, (ID | ID-ID)]*  ex. 0,2-4,7
+-    *   CU_list = 0x[0-F]* | ID_list             ex. 0x337F OR 0,2-4,7
+-    *   AMD_CU_MASK = CU_list
+-    *
+-    * It's a CU mask within a shader array. It's applied to all shader arrays.
+-    */
+    bool is_good_form = true;
+    uint32_t spi_cu_en = 0;
+ 
+-   if (size > 2 && str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
+-      str += 2;
+-      size -= 2;
+-
+-      for (unsigned i = 0; i < size; i++)
+-         is_good_form &= isxdigit(str[i]) != 0;
+-
+-      if (!is_good_form) {
+-         fprintf(stderr, "amd: invalid AMD_CU_MASK: ill-formed hex value\n");
++   if (n > 2 && str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
++      const char *hex = str + 2;
++      if (*hex == '\0') {
++         fprintf(stderr, "amd: invalid AMD_CU_MASK: empty hex value\n");
++         is_good_form = false;
+       } else {
+-         spi_cu_en = strtol(str, NULL, 16);
++         for (const char *p = hex; *p; p++) {
++            if (!isxdigit((unsigned char)*p)) {
++               is_good_form = false;
++               break;
++            }
++         }
++
++         if (!is_good_form) {
++            fprintf(stderr, "amd: invalid AMD_CU_MASK: ill-formed hex value\n");
++         } else {
++            char *end = NULL;
++            errno = 0;
++            const unsigned long v = strtoul(hex, &end, 16);
++            if (errno || !end || *end != '\0' || v > UINT32_MAX) {
++               fprintf(stderr, "amd: invalid AMD_CU_MASK: hex value out of range\n");
++               is_good_form = false;
++            } else {
++               spi_cu_en = (uint32_t)v;
++            }
++         }
+       }
+    } else {
+-      /* Parse ID_list. */
+-      long first = 0, last = -1;
++      const char *p = str;
+ 
+-      if (!isdigit(*str)) {
+-         is_good_form = false;
+-      } else {
+-         while (*str) {
+-            bool comma = false;
++      while (*p && is_good_form) {
++         if (!isdigit((unsigned char)*p)) {
++            fprintf(stderr, "amd: invalid AMD_CU_MASK: expected a digit\n");
++            is_good_form = false;
++            break;
++         }
+ 
+-            if (isdigit(*str)) {
+-               first = last = strtol(str, &str, 10);
+-            } else if (*str == '-') {
+-               str++;
+-               /* Parse a digit after a dash. */
+-               if (isdigit(*str)) {
+-                  last = strtol(str, &str, 10);
+-               } else {
+-                  fprintf(stderr, "amd: invalid AMD_CU_MASK: expected a digit after -\n");
+-                  is_good_form = false;
+-                  break;
+-               }
+-            } else if (*str == ',') {
+-               comma = true;
+-               str++;
+-               if (!isdigit(*str)) {
+-                  fprintf(stderr, "amd: invalid AMD_CU_MASK: expected a digit after ,\n");
+-                  is_good_form = false;
+-                  break;
+-               }
+-            }
++         char *end = NULL;
++         errno = 0;
++         const unsigned long first_ul = strtoul(p, &end, 10);
++         if (errno || !end || end == p || first_ul > 31) {
++            fprintf(stderr, "amd: invalid AMD_CU_MASK: index too large (%lu)\n", first_ul);
++            is_good_form = false;
++            break;
++         }
++
++         unsigned long last_ul = first_ul;
++         p = end;
+ 
+-            if (comma || !*str) {
+-               if (first > last) {
+-                  fprintf(stderr, "amd: invalid AMD_CU_MASK: range not increasing (%li, %li)\n", first, last);
+-                  is_good_form = false;
+-                  break;
+-               }
+-               if (last > 31) {
+-                  fprintf(stderr, "amd: invalid AMD_CU_MASK: index too large (%li)\n", last);
+-                  is_good_form = false;
+-                  break;
+-               }
++         if (*p == '-') {
++            p++;
++            if (!isdigit((unsigned char)*p)) {
++               fprintf(stderr, "amd: invalid AMD_CU_MASK: expected a digit after -\n");
++               is_good_form = false;
++               break;
++            }
+ 
+-               spi_cu_en |= BITFIELD_RANGE(first, last - first + 1);
+-               last = -1;
++            errno = 0;
++            last_ul = strtoul(p, &end, 10);
++            if (errno || !end || end == p || last_ul > 31) {
++               fprintf(stderr, "amd: invalid AMD_CU_MASK: index too large (%lu)\n", last_ul);
++               is_good_form = false;
++               break;
+             }
++            p = end;
++         }
++
++         if (first_ul > last_ul) {
++            fprintf(stderr, "amd: invalid AMD_CU_MASK: range not increasing (%lu, %lu)\n", first_ul, last_ul);
++            is_good_form = false;
++            break;
++         }
++
++         const uint32_t first = (uint32_t)first_ul;
++         const uint32_t last = (uint32_t)last_ul;
++         const uint32_t range_mask =
++            (last == 31u) ? (~0u << first)
++                          : (((1u << (last - first + 1u)) - 1u) << first);
++         spi_cu_en |= range_mask;
++
++         if (*p == '\0')
++            break;
++
++         if (*p != ',') {
++            fprintf(stderr, "amd: invalid AMD_CU_MASK: expected ',' between entries\n");
++            is_good_form = false;
++            break;
++         }
++
++         p++;
++         if (!isdigit((unsigned char)*p)) {
++            fprintf(stderr, "amd: invalid AMD_CU_MASK: expected a digit after ,\n");
++            is_good_form = false;
++            break;
+          }
+       }
+    }
+ 
+-   /* The mask is parsed. Now assign bits to CUs. */
+    if (is_good_form) {
+       bool error = false;
+ 
+@@ -186,31 +230,26 @@ static void set_custom_cu_en_mask(struct
+       }
+ 
+       if (info->has_graphics) {
+-         uint32_t min_full_cu_mask = BITFIELD_MASK(info->min_good_cu_per_sa);
++         const uint32_t min_full_cu_mask = BITFIELD_MASK(info->min_good_cu_per_sa);
+ 
+-         /* The hw ignores all non-compute CU masks if any of them is 0. Disallow that. */
+          if ((spi_cu_en & min_full_cu_mask) == 0) {
+-            fprintf(stderr, "amd: invalid AMD_CU_MASK: at least 1 CU from 0x%x per SA must be "
+-                            "enabled (SPI limitation)\n", min_full_cu_mask);
++            fprintf(stderr, "amd: invalid AMD_CU_MASK: at least 1 CU from 0x%x per SA must be enabled (SPI limitation)\n",
++                    min_full_cu_mask);
+             error = true;
+          }
+ 
+-         /* We usually disable 1 or 2 CUs for VS and GS, which means at last 1 other CU
+-          * must be enabled.
+-          */
+          uint32_t cu_mask_ge, unused;
+          ac_compute_late_alloc(info, false, false, false, &unused, &cu_mask_ge);
+          cu_mask_ge &= min_full_cu_mask;
+ 
+          if ((spi_cu_en & cu_mask_ge) == 0) {
+-            fprintf(stderr, "amd: invalid AMD_CU_MASK: at least 1 CU from 0x%x per SA must be "
+-                            "enabled (late alloc constraint for GE)\n", cu_mask_ge);
++            fprintf(stderr, "amd: invalid AMD_CU_MASK: at least 1 CU from 0x%x per SA must be enabled (late alloc constraint for GE)\n",
++                    cu_mask_ge);
+             error = true;
+          }
+ 
+          if ((min_full_cu_mask & spi_cu_en & ~cu_mask_ge) == 0) {
+-            fprintf(stderr, "amd: invalid AMD_CU_MASK: at least 1 CU from 0x%x per SA must be "
+-                            "enabled (late alloc constraint for PS)\n",
++            fprintf(stderr, "amd: invalid AMD_CU_MASK: at least 1 CU from 0x%x per SA must be enabled (late alloc constraint for PS)\n",
+                     min_full_cu_mask & ~cu_mask_ge);
+             error = true;
+          }
+@@ -221,6 +260,8 @@ static void set_custom_cu_en_mask(struct
+          info->spi_cu_en_has_effect = spi_cu_en & BITFIELD_MASK(info->max_good_cu_per_sa);
+       }
+    }
++
++   free(str);
+ }
+ 
+ static bool handle_env_var_force_family(struct radeon_info *info)
+@@ -397,6 +438,80 @@ ac_fill_compiler_info(struct radeon_info
+    out->has_primid_instancing_bug = info->gfx_level == GFX6 && info->max_se == 1;
+ }
+ 
++static inline void
++ac_set_marketing_name(struct radeon_info *info, const char *marketing_name)
++{
++   snprintf(info->marketing_name, sizeof(info->marketing_name), "%s",
++            marketing_name ? marketing_name : "AMD Unknown");
++}
++
++static void
++ac_maybe_parse_ib_and_exit(const struct radeon_info *info)
++{
++   const char *ib_filename = debug_get_option("AMD_PARSE_IB", NULL);
++   if (!ib_filename)
++      return;
++
++   FILE *f = fopen(ib_filename, "rb");
++   if (!f)
++      return;
++
++   if (fseek(f, 0, SEEK_END) != 0) {
++      fclose(f);
++      fprintf(stderr, "failed to seek '%s'\n", ib_filename);
++      exit(1);
++   }
++
++   const long file_len = ftell(f);
++   if (file_len < 0) {
++      fclose(f);
++      fprintf(stderr, "failed to determine size of '%s'\n", ib_filename);
++      exit(1);
++   }
++
++   if ((file_len & 3L) != 0) {
++      fclose(f);
++      fprintf(stderr, "invalid IB size in '%s': %ld (must be dword-aligned)\n", ib_filename, file_len);
++      exit(1);
++   }
++
++   if (fseek(f, 0, SEEK_SET) != 0) {
++      fclose(f);
++      fprintf(stderr, "failed to rewind '%s'\n", ib_filename);
++      exit(1);
++   }
++
++   const size_t size = (size_t)file_len;
++   uint32_t *ib = malloc(size);
++   if (!ib) {
++      fclose(f);
++      fprintf(stderr, "failed to allocate %zu bytes for '%s'\n", size, ib_filename);
++      exit(1);
++   }
++
++   const size_t n_read = fread(ib, 1, size, f);
++   fclose(f);
++
++   if (n_read != size) {
++      free(ib);
++      fprintf(stderr, "failed to read %zu bytes from '%s'\n", size, ib_filename);
++      exit(1);
++   }
++
++   struct ac_ib_parser ib_parser = {
++      .f = stdout,
++      .ib = ib,
++      .num_dw = size / 4,
++      .gfx_level = info->gfx_level,
++      .family = info->family,
++      .ip_type = AMD_IP_GFX,
++   };
++
++   ac_parse_ib(&ib_parser, "IB");
++   free(ib);
++   exit(0);
++}
++
+ enum ac_query_gpu_info_result
+ ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
+                   bool require_pci_bus_info)
+@@ -405,7 +520,8 @@ ac_query_gpu_info(int fd, void *dev_p, s
+    struct drm_amdgpu_info_device device_info = {0};
+    uint32_t vidip_fw_version = 0, vidip_fw_feature = 0;
+    uint32_t num_instances = 0;
+-   int r, i, j;
++   int r;
++   unsigned i, j;
+    ac_drm_device *dev = dev_p;
+ 
+    STATIC_ASSERT(AMDGPU_HW_IP_GFX == AMD_IP_GFX);
+@@ -576,8 +692,9 @@ ac_query_gpu_info(int fd, void *dev_p, s
+          if (r) {
+             fprintf(stderr, "amdgpu: ac_drm_query_firmware_version(vce) failed.\n");
+             return AC_QUERY_GPU_INFO_FAIL;
+-         } else
++         } else {
+             info->vce_fw_version = vidip_fw_version;
++         }
+       }
+ 
+       if (info->ip[AMD_IP_UVD].num_queues) {
+@@ -585,8 +702,9 @@ ac_query_gpu_info(int fd, void *dev_p, s
+          if (r) {
+             fprintf(stderr, "amdgpu: ac_drm_query_firmware_version(uvd) failed.\n");
+             return AC_QUERY_GPU_INFO_FAIL;
+-         } else
++         } else {
+             info->uvd_fw_version = vidip_fw_version;
++         }
+       }
+    }
+ 
+@@ -627,7 +745,7 @@ ac_query_gpu_info(int fd, void *dev_p, s
+    info->family = CHIP_UNKNOWN;
+ 
+ #define identify_chip2(asic, chipname)                                                             \
+-   if (ASICREV_IS(device_info.external_rev, asic)) {                                             \
++   if (ASICREV_IS(device_info.external_rev, asic)) {                                               \
+       info->family = CHIP_##chipname;                                                              \
+    }
+ #define identify_chip(chipname) identify_chip2(chipname, chipname)
+@@ -724,7 +842,7 @@ ac_query_gpu_info(int fd, void *dev_p, s
+ 
+       if (info->family == CHIP_UNKNOWN) {
+          fprintf(stderr, "amdgpu: unknown (family_id, chip_external_rev): (%u, %u)\n",
+-               device_info.family, device_info.external_rev);
++                 device_info.family, device_info.external_rev);
+          return AC_QUERY_GPU_INFO_UNIMPLEMENTED_HW;
+       }
+ 
+@@ -756,18 +874,18 @@ ac_query_gpu_info(int fd, void *dev_p, s
+       info->chip_external_rev = device_info.external_rev;
+       info->chip_rev = device_info.chip_rev;
+       const char *marketing_name = ac_drm_get_marketing_name(dev);
+-      strncpy(info->marketing_name, marketing_name ? marketing_name : "AMD Unknown", sizeof(info->marketing_name));
++      ac_set_marketing_name(info, marketing_name);
+    }
+ 
+ #define VCN_IP_VERSION(mj, mn, rv) (((mj) << 16) | ((mn) << 8) | (rv))
+ 
+-   for (unsigned i = AMD_IP_VCN_DEC; i <= AMD_IP_VCN_JPEG; ++i) {
+-      if (!info->ip[i].num_queues)
++   for (unsigned ip = AMD_IP_VCN_DEC; ip <= AMD_IP_VCN_JPEG; ++ip) {
++      if (!info->ip[ip].num_queues)
+          continue;
+ 
+-      switch(VCN_IP_VERSION(info->ip[i].ver_major,
+-                            info->ip[i].ver_minor,
+-                            info->ip[i].ver_rev)) {
++      switch (VCN_IP_VERSION(info->ip[ip].ver_major,
++                             info->ip[ip].ver_minor,
++                             info->ip[ip].ver_rev)) {
+       case VCN_IP_VERSION(1, 0, 0):
+          info->vcn_ip_version = VCN_1_0_0;
+          break;
+@@ -794,8 +912,8 @@ ac_query_gpu_info(int fd, void *dev_p, s
+          break;
+       case VCN_IP_VERSION(3, 0, 0):
+          /* Navi24 version need to be revised if it fallbacks to the older way
+-	  * with default version as 3.0.0, since Navi24 has different feature
+-	  * sets from other VCN3 family */
++          * with default version as 3.0.0, since Navi24 has different feature
++          * sets from other VCN3 family */
+          info->vcn_ip_version = (info->family != CHIP_NAVI24) ? VCN_3_0_0 : VCN_3_0_33;
+          break;
+       case VCN_IP_VERSION(3, 0, 2):
+@@ -843,11 +961,12 @@ ac_query_gpu_info(int fd, void *dev_p, s
+       break;
+    }
+ 
+-    if (info->ip[AMD_IP_VPE].num_queues)
++   if (info->ip[AMD_IP_VPE].num_queues) {
+       info->vpe_ip_version = (enum vpe_version)VPE_VERSION_VALUE(
+-                                                info->ip[AMD_IP_VPE].ver_major,
+-                                                info->ip[AMD_IP_VPE].ver_minor,
+-                                                info->ip[AMD_IP_VPE].ver_rev);
++         info->ip[AMD_IP_VPE].ver_major,
++         info->ip[AMD_IP_VPE].ver_minor,
++         info->ip[AMD_IP_VPE].ver_rev);
++   }
+ 
+    /* Set which chips have dedicated VRAM. */
+    info->has_dedicated_vram = !(device_info.ids_flags & AMDGPU_IDS_FLAGS_FUSION);
+@@ -989,13 +1108,13 @@ ac_query_gpu_info(int fd, void *dev_p, s
+       case CHIP_RAPHAEL_MENDOCINO:
+          info->l2_cache_size = info->num_tcc_blocks * 128 * 1024;
+          break;
+-      default:
+-         info->l2_cache_size = info->num_tcc_blocks * 256 * 1024;
+-         break;
+       case CHIP_REMBRANDT:
+       case CHIP_PHOENIX:
+          info->l2_cache_size = info->num_tcc_blocks * 512 * 1024;
+          break;
++      default:
++         info->l2_cache_size = info->num_tcc_blocks * 256 * 1024;
++         break;
+       }
+    }
+ 
+@@ -1072,145 +1191,69 @@ ac_query_gpu_info(int fd, void *dev_p, s
+    /* Stencil texturing with HTILE doesn't work with mipmapping on Navi10-14. */
+    info->has_htile_stencil_mipmap_bug = info->gfx_level == GFX10;
+ 
+-   /* When drawing, if all samples covered in a cleared tile in HTILE are discarded (by the fragment
+-    * shader, alpha to coverage, etc.), the tile stays cleared, but on the chips with this bug, the
+-    * Z range in the tile still gets expanded by the depth test, and that may flip the upper bit of
+-    * the HTILE encoding (of the maximum Z without stencil, or the base Z with stencil), inverting
+-    * the clear value that texture reads will use for the tile.
+-    *
+-    * has_htile_tc_z_clear_bug_without/with_stencil indicate whether the TILE_STENCIL_DISABLE =
+-    * 1 and 0 HTILE encodings respectively are subject to this bug.
+-    *
+-    * One possible workaround is to use the depth/stencil HTILE that encodes the Z range as base and
+-    * delta, setting ZRANGE_PRECISION to 0 (base Z is min Z) when the depth is cleared to 0, and to
+-    * 1 (base Z is max Z) when it's cleared to 1, so the Z delta gets expanded, but the base Z,
+-    * which contains the TC clear value bit, stays the same.
+-    * See DepthStencilView::UpdateZRangePrecision in PAL.
+-    *
+-    * Affects dEQP-VK.dynamic_state.*.discard.depth on has_htile_tc_z_clear_bug_without_stencil = 1
+-    * chips as of the CTS commit 698abf5f6b7073562cc951617a58e5803c7ead3f (clearing a depth-only
+-    * image to 0, drawing geometry with Z = 1 to it discarding all fragments in the shader, then
+-    * reading it in vkCmdCopyImageToBuffer fetching 1 where 0 is supposed to be).
+-    */
+    info->has_htile_tc_z_clear_bug_without_stencil = info->gfx_level == GFX8 ||
+-                                                    info->family == CHIP_GFX1013;
++                                                     info->family == CHIP_GFX1013;
+    info->has_htile_tc_z_clear_bug_with_stencil = info->has_htile_tc_z_clear_bug_without_stencil ||
+-                                                 info->gfx_level == GFX9;
++                                                  info->gfx_level == GFX9;
+ 
+    info->has_small_prim_filter_sample_loc_bug =
+       (info->family >= CHIP_POLARIS10 && info->family <= CHIP_POLARIS12) ||
+       info->family == CHIP_VEGA10 || info->family == CHIP_RAVEN;
+ 
+-   /* DB_DFSM_CONTROL.POPS_DRAIN_PS_ON_OVERLAP must be enabled for 8 or more coverage or
+-    * depth/stencil samples with POPS (PAL waMiscPopsMissedOverlap).
+-    */
+    info->has_pops_missed_overlap_bug = info->family == CHIP_VEGA10 || info->family == CHIP_RAVEN;
+ 
+-   /* Whether FORCE_STENCIL_VALID must be forced to 1 when a MSAA
+-    * depth/stencil image is bound and that ZPASS/ZFAIL differs.
+-    */
+    info->has_db_force_stencil_valid_bug = info->gfx_level == GFX12;
+ 
+-   /* GFX6 hw bug when the IBO addr is 0 which causes invalid clamping (underflow).
+-    * Setting the IB addr to 2 or higher solves this issue.
+-    * See waMiscNullIb in PAL.
+-    *
+-    * Drawing from 0-sized index buffers causes hangs on gfx10.
+-    */
+    info->has_zero_index_buffer_bug = info->gfx_level == GFX6 || info->gfx_level == GFX10;
+ 
+-   /* DB has a bug when ITERATE_256 is set to 1 that can cause a hang. The
+-    * workaround is to set DECOMPRESS_ON_Z_PLANES to 2 for 4X MSAA D/S images.
+-    */
+    info->has_two_planes_iterate256_bug = info->gfx_level == GFX10;
+ 
+-   /* GFX10+Navi21: NGG->legacy transitions require VGT_FLUSH. */
+    info->has_vgt_flush_ngg_legacy_bug = info->gfx_level == GFX10 ||
+                                         info->family == CHIP_NAVI21;
+ 
+-   /* GFX10-GFX10.3 (tested on NAVI10, NAVI21 and NAVI24 but likely all) are
+-    * affected by a hw bug when primitive restart is updated and no context
+-    * registers are written between draws. One workaround is to emit
+-    * SQ_NON_EVENT(0) which is a NOP packet that adds a small delay and seems
+-    * to fix it reliably.
+-    */
+    info->has_prim_restart_sync_bug = info->gfx_level == GFX10 ||
+                                      info->gfx_level == GFX10_3;
+ 
+-   /* First Navi2x chips have a hw bug that doesn't allow to write
+-    * depth/stencil from a FS for multi-pixel fragments.
+-    */
+    info->has_vrs_ds_export_bug = info->family == CHIP_NAVI21 ||
+                                  info->family == CHIP_NAVI22 ||
+                                  info->family == CHIP_VANGOGH;
+ 
+-   /* GFX12 is affected by random GPU hangs when VRS rates are exported by the
+-    * last VGT stage under some conditions that are unclear. One possible
+-    * workaround is to emit BOP events after every draw that exports VRS
+-    * rates.
+-    */
+    info->has_vrs_export_bug = info->gfx_level == GFX12;
+ 
+-   /* HW bug workaround when CS threadgroups > 256 threads and async compute
+-    * isn't used, i.e. only one compute job can run at a time.  If async
+-    * compute is possible, the threadgroup size must be limited to 256 threads
+-    * on all queues to avoid the bug.
+-    * Only GFX6 and certain GFX7 chips are affected.
+-    */
+    info->has_cs_regalloc_hang_bug = info->gfx_level == GFX6 ||
+                                     info->family == CHIP_BONAIRE ||
+                                     info->family == CHIP_KABINI;
+ 
+-   /* HW bug workaround with async compute dispatches when threadgroup > 4096.
+-    * The workaround is to change the "threadgroup" dimension mode to "thread"
+-    * dimension mode.
+-    */
+    info->has_async_compute_threadgroup_bug = info->family == CHIP_ICELAND ||
+                                              info->family == CHIP_TONGA;
+ 
+-   /* GFX7 CP requires 32 bytes alignment for the indirect buffer arguments on
+-    * the compute queue.
+-    */
+    info->has_async_compute_align32_bug = info->gfx_level == GFX7;
+ 
+-   /* Support for GFX10.3 was added with F32_ME_FEATURE_VERSION_31 but the
+-    * feature version wasn't bumped.
+-    */
+    info->has_32bit_predication = info->gfx_level >= GFX11 ||
+                                  (info->gfx_level >= GFX10 &&
+                                   info->me_fw_feature >= 32) ||
+                                  (info->gfx_level == GFX9 &&
+                                   info->me_fw_feature >= 52);
+ 
+-   /* Firmware bug with DISPATCH_TASKMESH_INDIRECT_MULTI_ACE packets.
+-    * On old MEC FW versions, it hangs the GPU when indirect count is zero.
+-    */
+    info->has_taskmesh_indirect0_bug = info->gfx_level == GFX10_3 &&
+                                       info->mec_fw_version < 100;
+ 
+    info->has_export_conflict_bug = info->gfx_level == GFX11;
+ 
+-   /* On GFX8-9, CP DMA doesn't support NULL PRT pages:
+-    * it doesn't read 0 and doesn't discard writes, causing GPU hangs.
+-    */
+    info->cp_dma_supports_sparse = info->gfx_level >= GFX10;
+ 
+-   /* When LLVM is fixed to handle multiparts shaders, this value will depend
+-    * on the known good versions of LLVM. Until then, enable the equivalent WA
+-    * in the nir -> llvm backend.
+-    */
+    info->needs_llvm_wait_wa = info->gfx_level == GFX11;
+ 
+-   /* Convert the SDMA version in the current GPU to an enum. */
+    info->sdma_ip_version =
+       (enum sdma_version)SDMA_VERSION_VALUE(info->ip[AMD_IP_SDMA].ver_major,
+                                             info->ip[AMD_IP_SDMA].ver_minor);
+ 
+-   /* SDMA v1.0-3.x (GFX6-8) can't ignore page faults on unmapped sparse resources. */
+    info->sdma_supports_sparse = info->sdma_ip_version >= SDMA_4_0;
+ 
+-   /* SDMA v5.0+ (GFX10+) supports DCC and HTILE, but Navi 10 has issues with it according to PAL. */
+-   info->sdma_supports_compression = info->sdma_ip_version >= SDMA_5_0 && info->family != CHIP_NAVI10 && info->family != CHIP_GFX1013;
++   info->sdma_supports_compression =
++      info->sdma_ip_version >= SDMA_5_0 &&
++      info->family != CHIP_NAVI10 &&
++      info->family != CHIP_GFX1013;
+ 
+    /* Get the number of good compute units. */
+    info->num_cu = 0;
+@@ -1220,17 +1263,6 @@ ac_query_gpu_info(int fd, void *dev_p, s
+             assert(info->max_sa_per_se <= 2);
+             info->cu_mask[i][j] = device_info.cu_bitmap[i % 4][(i / 4) * 2 + j];
+          } else if (info->family == CHIP_MI100) {
+-            /* The CU bitmap in amd gpu info structure is
+-             * 4x4 size array, and it's usually suitable for Vega
+-             * ASICs which has 4*2 SE/SA layout.
+-             * But for MI100, SE/SA layout is changed to 8*1.
+-             * To mostly reduce the impact, we make it compatible
+-             * with current bitmap array as below:
+-             *    SE4 --> cu_bitmap[0][1]
+-             *    SE5 --> cu_bitmap[1][1]
+-             *    SE6 --> cu_bitmap[2][1]
+-             *    SE7 --> cu_bitmap[3][1]
+-             */
+             assert(info->max_sa_per_se == 1);
+             info->cu_mask[i][0] = device_info.cu_bitmap[i % 4][i / 4];
+          } else {
+@@ -1243,7 +1275,6 @@ ac_query_gpu_info(int fd, void *dev_p, s
+    if (info->gfx_level >= GFX10_3 && info->max_se > 1) {
+       uint32_t enabled_se_mask = 0;
+ 
+-      /* Derive the enabled SE mask from the CU mask. */
+       for (unsigned se = 0; se < info->max_se; se++) {
+          for (unsigned sa = 0; sa < info->max_sa_per_se; sa++) {
+             if (info->cu_mask[se][sa]) {
+@@ -1254,9 +1285,6 @@ ac_query_gpu_info(int fd, void *dev_p, s
+       }
+       info->num_se = util_bitcount(enabled_se_mask);
+ 
+-      /* Trim the number of enabled RBs based on the number of enabled SEs because the RB mask
+-       * might include disabled SEs.
+-       */
+       if (info->gfx_level >= GFX12) {
+          unsigned num_rb_per_se = info->max_render_backends / info->max_se;
+ 
+@@ -1266,15 +1294,11 @@ ac_query_gpu_info(int fd, void *dev_p, s
+          }
+       }
+    } else {
+-      /* GFX10 and older always enable all SEs because they don't support SE harvesting. */
+       info->num_se = info->max_se;
+    }
+ 
+    info->num_rb = util_bitcount64(info->enabled_rb_mask);
+ 
+-   /* On GFX10, only whole WGPs (in units of 2 CUs) can be disabled,
+-    * and max - min <= 2.
+-    */
+    unsigned cu_group = info->gfx_level >= GFX10 ? 2 : 1;
+    info->max_good_cu_per_sa =
+       DIV_ROUND_UP(info->num_cu, (info->num_se * info->max_sa_per_se * cu_group)) *
+@@ -1293,50 +1317,30 @@ ac_query_gpu_info(int fd, void *dev_p, s
+ 
+    info->gfx_ib_pad_with_type2 = info->gfx_level == GFX6;
+ 
+-   /* GFX6 supports IB2, but not chaining inside IB2. See waCpIb2ChainingUnsupported in PAL */
+    info->can_chain_ib2 = info->gfx_level >= GFX7;
+ 
+-   /* CDNA starting with GFX940 shouldn't use CP DMA. */
+    info->has_cp_dma = info->has_graphics || info->family < CHIP_GFX940;
+ 
+    if (info->gfx_level >= GFX11 && info->gfx_level < GFX12) {
+-      /* With num_cu = 4 in gfx11 measured power for idle, video playback and observed
+-       * power savings, hence enable dcc with retile for gfx11 with num_cu >= 4.
+-       */
+-       info->use_display_dcc_with_retile_blit = info->num_cu >= 4;
++      info->use_display_dcc_with_retile_blit = info->num_cu >= 4;
+    } else if (info->gfx_level == GFX10_3) {
+-      /* Displayable DCC with retiling is known to increase power consumption on Raphael
+-       * and Mendocino, so disable it on the smallest APUs. We need a proof that
+-       * displayable DCC doesn't regress bigger chips in the same way.
+-       */
+       info->use_display_dcc_with_retile_blit = info->num_cu > 4;
+    } else if (info->gfx_level == GFX9 && !info->has_dedicated_vram) {
+-      if (info->max_render_backends == 1) {
++      if (info->max_render_backends == 1)
+          info->use_display_dcc_unaligned = true;
+-      } else {
+-         /* there may be power increase for small APUs with less num_cu. */
++      else
+          info->use_display_dcc_with_retile_blit = info->num_cu > 4;
+-      }
+    }
+ 
+-   /* The kernel code translating tiling flags into a modifier was wrong
+-    * until .58.
+-    */
+    info->gfx12_supports_display_dcc = info->gfx_level >= GFX12 && info->drm_minor >= 58;
+-
+-   /* AMDGPU always enables DCC compressed writes when a BO is moved back to
+-    * VRAM until .60.
+-    */
+    info->gfx12_supports_dcc_write_compress_disable = info->gfx_level >= GFX12 && info->drm_minor >= 60;
+-
+-   /* AMDGPU 3.59+ clears VRAM on allocations by default. */
+    info->has_default_zerovram_support = info->drm_minor >= 59;
+ 
+    if (info->gfx_level >= GFX12) {
+       /* Gfx12 doesn't use pc_lines and pbb_max_alloc_count. */
+    } else if (info->gfx_level >= GFX11) {
+       info->pc_lines = 1024;
+-      info->pbb_max_alloc_count = 16; /* minimum is 2, maximum is 256 */
++      info->pbb_max_alloc_count = 16;
+    } else if (info->gfx_level >= GFX9 && info->has_graphics) {
+       unsigned pc_lines = 0;
+ 
+@@ -1372,15 +1376,14 @@ ac_query_gpu_info(int fd, void *dev_p, s
+ 
+       info->pc_lines = pc_lines;
+ 
+-      if (info->gfx_level >= GFX10) {
++      if (info->gfx_level >= GFX10)
+          info->pbb_max_alloc_count = pc_lines / 3;
+-      } else {
++      else
+          info->pbb_max_alloc_count = MIN2(128, pc_lines / (4 * info->max_se));
+-      }
+    }
+ 
+    info->has_image_opcodes = debug_get_bool_option("AMD_IMAGE_OPCODES",
+-                                                   info->has_graphics || info->family < CHIP_GFX940);
++                                                    info->has_graphics || info->family < CHIP_GFX940);
+    info->never_stop_sq_perf_counters = info->gfx_level == GFX10 ||
+                                        info->gfx_level == GFX10_3;
+    info->never_send_perfcounter_stop = info->gfx_level == GFX11;
+@@ -1391,14 +1394,10 @@ ac_query_gpu_info(int fd, void *dev_p, s
+                                    util_bitcount64(info->enabled_rb_mask) !=
+                                    info->max_render_backends;
+ 
+-   /* On GFX10.3, the polarity of AUTO_FLUSH_MODE is inverted. */
+    info->has_sqtt_auto_flush_mode_bug = info->gfx_level == GFX10_3;
+ 
+    info->mesh_fast_launch_2 = info->gfx_level >= GFX11;
+ 
+-   /* This is the size of all TCS outputs in memory per workgroup.
+-    * Hawaii can't handle num_workgroups > 256 with 8K per workgroup, so use 4K.
+-    */
+    unsigned max_hs_out_vram_dwords_per_wg = info->family == CHIP_HAWAII ? 4096 : 8192;
+    unsigned max_hs_out_vram_dwords_enum;
+    unsigned max_workgroups_per_se;
+@@ -1420,10 +1419,6 @@ ac_query_gpu_info(int fd, void *dev_p, s
+       UNREACHABLE("invalid TCS workgroup size");
+    }
+ 
+-   /* Vega10 should limit num_workgroups to 508 (127 per SE)
+-    * Gfx7 should limit num_workgroups to 508 (127 per SE)
+-    * Gfx6 should limit num_workgroups to 126 (63 per SE)
+-    */
+    if (info->gfx_level >= GFX11) {
+       max_workgroups_per_se = 256;
+    } else if (info->gfx_level >= GFX10 ||
+@@ -1435,16 +1430,12 @@ ac_query_gpu_info(int fd, void *dev_p, s
+       max_workgroups_per_se = 63;
+    }
+ 
+-   /* Limit to 4 workgroups per CU for TCS, which exhausts LDS if each workgroup occupies 16KB.
+-    * Note that the offchip allocation isn't deallocated until the corresponding TES waves finish.
+-    */
+    unsigned num_offchip_wg_per_cu = 4;
+    unsigned num_workgroups_per_se = MIN2(num_offchip_wg_per_cu * info->max_good_cu_per_sa *
+                                          info->max_sa_per_se, max_workgroups_per_se);
+    unsigned num_workgroups = num_workgroups_per_se * info->max_se;
+ 
+    if (info->gfx_level >= GFX11) {
+-      /* OFFCHIP_BUFFERING is per SE. */
+       info->hs_offchip_param = S_03093C_OFFCHIP_BUFFERING_GFX103(num_workgroups_per_se - 1) |
+                                S_03093C_OFFCHIP_GRANULARITY_GFX103(max_hs_out_vram_dwords_enum);
+    } else if (info->gfx_level >= GFX10_3) {
+@@ -1459,7 +1450,6 @@ ac_query_gpu_info(int fd, void *dev_p, s
+                                S_0089B0_OFFCHIP_GRANULARITY(max_hs_out_vram_dwords_enum);
+    }
+ 
+-   /* The typical size of tess factors of 1 TCS workgroup if all patches are triangles. */
+    unsigned typical_tess_factor_size_per_wg = (192 / 3) * 16;
+    unsigned num_tess_factor_wg_per_cu = 3;
+ 
+@@ -1471,22 +1461,13 @@ ac_query_gpu_info(int fd, void *dev_p, s
+ 
+    ac_fill_compiler_info(info, &device_info);
+ 
+-   /* BIG_PAGE is supported since gfx10.3 and requires VRAM. VRAM is only guaranteed
+-    * with AMDGPU_GEM_CREATE_DISCARDABLE.
+-    */
+    info->discardable_allows_big_page = info->gfx_level >= GFX10_3 && info->gfx_level < GFX12 &&
+                                        info->has_dedicated_vram;
+ 
+-   /* Compute the scratch WAVESIZE granularity in bytes. */
+    info->scratch_wavesize_granularity_shift = info->gfx_level >= GFX11 ? 8 : 10;
+    info->scratch_wavesize_granularity = BITFIELD_BIT(info->scratch_wavesize_granularity_shift);
+ 
+-   /* The maximum number of scratch waves. The number is only a function of the number of CUs.
+-    * It should be large enough to hold at least 1 threadgroup. Use the minimum per-SA CU count.
+-    *
+-    * We can decrease the number to make it fit into the infinity cache.
+-    */
+-   const unsigned max_waves_per_tg = 32; /* 1024 threads in Wave32 */
++   const unsigned max_waves_per_tg = 32;
+    info->max_scratch_waves = MAX2(32 * info->max_good_cu_per_sa * info->max_sa_per_se * info->num_se,
+                                   max_waves_per_tg);
+    info->has_scratch_base_registers = info->gfx_level >= GFX11 ||
+@@ -1497,7 +1478,6 @@ ac_query_gpu_info(int fd, void *dev_p, s
+    info->pcie_gen = device_info.pcie_gen;
+    info->pcie_num_lanes = device_info.pcie_num_lanes;
+ 
+-   /* Source: https://en.wikipedia.org/wiki/PCI_Express#History_and_revisions */
+    switch (info->pcie_gen) {
+    case 1:
+       info->pcie_bandwidth_mbps = info->pcie_num_lanes * 0.25 * 1024;
+@@ -1520,29 +1500,23 @@ ac_query_gpu_info(int fd, void *dev_p, s
+    case 7:
+       info->pcie_bandwidth_mbps = info->pcie_num_lanes * 15.125 * 1024;
+       break;
++   default:
++      info->pcie_bandwidth_mbps = 0;
++      break;
+    }
+ 
+-   /* The number of IBs per submit isn't infinite, it depends on the IP type
+-    * (ie. some initial setup needed for a submit) and the packet size.
+-    * It can be calculated according to the kernel source code as:
+-    * (ring->max_dw - emit_frame_size) / emit_ib_size
+-    */
+    r = ac_drm_query_info(dev, AMDGPU_INFO_MAX_IBS,
+                          sizeof(info->max_submitted_ibs), info->max_submitted_ibs);
+    if (r) {
+-      /* When the number of IBs can't be queried from the kernel, we choose a
+-       * rough estimate that should work well (as of kernel 6.3).
+-       */
+-      for (unsigned i = 0; i < AMD_NUM_IP_TYPES; ++i)
+-         info->max_submitted_ibs[i] = 50;
++      for (unsigned ip = 0; ip < AMD_NUM_IP_TYPES; ++ip)
++         info->max_submitted_ibs[ip] = 50;
+ 
+       info->max_submitted_ibs[AMD_IP_GFX] = info->gfx_level >= GFX7 ? 192 : 144;
+       info->max_submitted_ibs[AMD_IP_COMPUTE] = 124;
+       info->max_submitted_ibs[AMD_IP_VCN_JPEG] = 16;
+-      for (unsigned i = 0; i < AMD_NUM_IP_TYPES; ++i) {
+-         /* Clear out max submitted IB count for IPs that have no queues. */
+-         if (!info->ip[i].num_queues)
+-            info->max_submitted_ibs[i] = 0;
++      for (unsigned ip = 0; ip < AMD_NUM_IP_TYPES; ++ip) {
++         if (!info->ip[ip].num_queues)
++            info->max_submitted_ibs[ip] = 0;
+       }
+    }
+ 
+@@ -1550,22 +1524,8 @@ ac_query_gpu_info(int fd, void *dev_p, s
+       unsigned num_prim_exports = 0, num_pos_exports = 0;
+ 
+       if (info->gfx_level >= GFX12) {
+-         /* Navi48 results:
+-          *
+-          * Without NGG culling:
+-          * - 1024 is the best for <=4 varyings, though longer GS waves may need more (see below).
+-          * - 1400 is in between (a tiny bit slower for <=4 varyings, faster for >=6 varyings).
+-          * - 1900 is the best for >=6 varyings because smaller sizes are throttled by not enough space.
+-          *
+-          * With NGG culling:
+-          * - 1024 is the worst because NGG culling has longer GS waves, so it needs more space to
+-          *   prevent getting throttled even if it doesn't end up using it. gs_alloc_req doesn't
+-          *   deallocate the unused portion.
+-          * - 1400 is the best for <=4 varyings.
+-          * - 1900 is the best for >=6 varyings.
+-          */
+          info->attribute_ring_size_per_se = 1400 * 1024;
+-         num_prim_exports = 16368; /* also includes gs_alloc_req */
++         num_prim_exports = 16368;
+          num_pos_exports = 16384;
+       } else if (info->l3_cache_size_mb || info->family_overridden) {
+          info->attribute_ring_size_per_se = 1400 * 1024;
+@@ -1578,11 +1538,9 @@ ac_query_gpu_info(int fd, void *dev_p, s
+             info->attribute_ring_size_per_se = info->l2_cache_size / 2;
+       }
+ 
+-      /* The size must be aligned to 64K per SE and must be at most 16M in total. */
+       info->attribute_ring_size_per_se = align(info->attribute_ring_size_per_se, 64 * 1024);
+       assert(info->attribute_ring_size_per_se * info->max_se <= 16 * 1024 * 1024);
+ 
+-      /* Compute the pos and prim ring sizes and offsets. */
+       info->pos_ring_size_per_se = align(num_pos_exports * 16, 32);
+       info->prim_ring_size_per_se = align(num_prim_exports * 4, 32);
+       assert(info->gfx_level >= GFX12 ||
+@@ -1612,6 +1570,7 @@ ac_query_gpu_info(int fd, void *dev_p, s
+       info->fw_based_mcbp.csa_size = fw_info.gfx.csa_size;
+       info->fw_based_mcbp.csa_alignment = fw_info.gfx.csa_alignment;
+    }
++
+    if (info->gfx_level >= GFX11 && (info->userq_ip_mask & (1 << AMD_IP_COMPUTE))) {
+       struct drm_amdgpu_info_uq_metadata fw_info;
+ 
+@@ -1624,6 +1583,7 @@ ac_query_gpu_info(int fd, void *dev_p, s
+       info->fw_based_mcbp.eop_size = fw_info.compute.eop_size;
+       info->fw_based_mcbp.eop_alignment = fw_info.compute.eop_alignment;
+    }
++
+    if (info->gfx_level >= GFX11 && (info->userq_ip_mask & (1 << AMD_IP_SDMA))) {
+       struct drm_amdgpu_info_uq_metadata fw_info;
+ 
+@@ -1637,7 +1597,6 @@ ac_query_gpu_info(int fd, void *dev_p, s
+       info->fw_based_mcbp.sdma_csa_alignment = fw_info.sdma.csa_alignment;
+    }
+ 
+-   /* WARNING: Register shadowing decreases performance by up to 50% on GFX11 with current FW. */
+    info->has_kernelq_reg_shadowing = device_info.ids_flags & AMDGPU_IDS_FLAGS_PREEMPTION &&
+                                      info->gfx_level < GFX11 &&
+                                      !(info->userq_ip_mask & (1 << AMD_IP_GFX));
+@@ -1667,69 +1626,41 @@ ac_query_gpu_info(int fd, void *dev_p, s
+                            &info->pa_sc_raster_config_1, &info->se_tile_repeat);
+    }
+ 
+-   const char *ib_filename = debug_get_option("AMD_PARSE_IB", NULL);
+-   if (ib_filename) {
+-      FILE *f = fopen(ib_filename, "r");
+-      if (f) {
+-         fseek(f, 0, SEEK_END);
+-         size_t size = ftell(f);
+-         uint32_t *ib = (uint32_t *)malloc(size);
+-         fseek(f, 0, SEEK_SET);
+-         size_t n_read = fread(ib, 1, size, f);
+-         fclose(f);
+-
+-         if (n_read != size) {
+-            fprintf(stderr, "failed to read %zu bytes from '%s'\n", size, ib_filename);
+-            exit(1);
+-         }
++   ac_maybe_parse_ib_and_exit(info);
+ 
+-         struct ac_ib_parser ib_parser = {
+-            .f = stdout,
+-            .ib = ib,
+-            .num_dw = size / 4,
+-            .gfx_level = info->gfx_level,
+-            .family = info->family,
+-            .ip_type = AMD_IP_GFX,
+-         };
+-
+-         ac_parse_ib(&ib_parser, "IB");
+-         free(ib);
+-         exit(0);
+-      }
+-   }
+    return AC_QUERY_GPU_INFO_SUCCESS;
+ }
+ 
+-void ac_compute_driver_uuid(char *uuid, size_t size)
++void
++ac_compute_driver_uuid(char *uuid, size_t size)
+ {
+-   char amd_uuid[] = "AMD-MESA-DRV";
++   static const char amd_uuid[] = "AMD-MESA-DRV";
+ 
+    assert(size >= sizeof(amd_uuid));
+ 
+    memset(uuid, 0, size);
+-   strncpy(uuid, amd_uuid, size);
++   memcpy(uuid, amd_uuid, sizeof(amd_uuid) - 1);
+ }
+ 
+-void ac_compute_device_uuid(const struct radeon_info *info, char *uuid, size_t size)
++void
++ac_compute_device_uuid(const struct radeon_info *info, char *uuid, size_t size)
+ {
+-   uint32_t *uint_uuid = (uint32_t *)uuid;
+-
+    assert(size >= sizeof(uint32_t) * 4);
+ 
+-   /**
+-    * Use the device info directly instead of using a hash. GL/VK UUIDs
+-    * are 16 byte vs N bytes for a hash, and the truncation that would be
+-    * required would get rid of part of the little entropy we have.
+-    * */
+    memset(uuid, 0, size);
++
+    if (!info->pci.valid) {
+-      fprintf(stderr,
+-              "ac_compute_device_uuid's output is based on invalid pci bus info.\n");
++      fprintf(stderr, "ac_compute_device_uuid's output is based on invalid pci bus info.\n");
+    }
+-   uint_uuid[0] = info->pci.domain;
+-   uint_uuid[1] = info->pci.bus;
+-   uint_uuid[2] = info->pci.dev;
+-   uint_uuid[3] = info->pci.func;
++
++   const uint32_t words[4] = {
++      info->pci.domain,
++      info->pci.bus,
++      info->pci.dev,
++      info->pci.func,
++   };
++
++   memcpy(uuid, words, sizeof(words));
+ }
+ 
+ void ac_print_gpu_info(FILE *f, const struct radeon_info *info, int fd)
+
+
+--- a/src/amd/vulkan/radv_wsi.c	2026-04-13 18:27:26.110152126 +0200
++++ b/src/amd/vulkan/radv_wsi.c	2026-04-13 20:15:14.365673094 +0200
+@@ -29,6 +29,9 @@ radv_wsi_set_memory_ownership(VkDevice _
+    VK_FROM_HANDLE(radv_device, device, _device);
+    VK_FROM_HANDLE(radv_device_memory, mem, _mem);
+ 
++   if (!device || !mem || !mem->bo)
++      return;
++
+    device->ws->buffer_make_resident(device->ws, mem->bo, ownership);
+ }
+ 
+@@ -46,26 +49,45 @@ radv_wsi_get_prime_blit_queue(VkDevice _
+       return &device->private_sdma_queue->vk;
+    }
+ 
+-   if (pdev->info.gfx_level >= GFX9 && !(instance->debug_flags & RADV_DEBUG_NO_DMA_BLIT)) {
++   if (pdev->info.gfx_level >= GFX9 &&
++       !(instance->debug_flags & RADV_DEBUG_NO_DMA_BLIT)) {
++      if (pdev->num_queues >= ARRAY_SIZE(pdev->vk_queue_to_radv)) {
++         simple_mtx_unlock(&device->blit_queue_mtx);
++         return NULL;
++      }
++
++      const uint32_t queue_family_index = pdev->num_queues;
++      const float queue_priority = 1.0f;
++
++      pdev->vk_queue_to_radv[queue_family_index] = RADV_QUEUE_TRANSFER;
++      pdev->num_queues++;
+ 
+-      pdev->vk_queue_to_radv[pdev->num_queues++] = RADV_QUEUE_TRANSFER;
+       const VkDeviceQueueCreateInfo queue_create = {
+          .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+-         .queueFamilyIndex = pdev->num_queues - 1,
++         .queueFamilyIndex = queue_family_index,
+          .queueCount = 1,
++         .pQueuePriorities = &queue_priority,
+       };
+ 
+       device->private_sdma_queue =
+-         vk_zalloc(&device->vk.alloc, sizeof(struct radv_queue), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++         vk_zalloc(&device->vk.alloc, sizeof(struct radv_queue), 8,
++                   VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++      if (!device->private_sdma_queue) {
++         pdev->num_queues = queue_family_index;
++         simple_mtx_unlock(&device->blit_queue_mtx);
++         return NULL;
++      }
+ 
+-      VkResult result = radv_queue_init(device, device->private_sdma_queue, 0, &queue_create, NULL);
++      VkResult result =
++         radv_queue_init(device, device->private_sdma_queue, 0, &queue_create, NULL);
+       if (result == VK_SUCCESS) {
+          simple_mtx_unlock(&device->blit_queue_mtx);
+          return &device->private_sdma_queue->vk;
+-      } else {
+-         vk_free(&device->vk.alloc, device->private_sdma_queue);
+-         device->private_sdma_queue = VK_NULL_HANDLE;
+       }
++
++      vk_free(&device->vk.alloc, device->private_sdma_queue);
++      device->private_sdma_queue = VK_NULL_HANDLE;
++      pdev->num_queues = queue_family_index;
+    }
+ 
+    simple_mtx_unlock(&device->blit_queue_mtx);
+@@ -78,8 +100,10 @@ radv_init_wsi(struct radv_physical_devic
+    const struct radv_instance *instance = radv_physical_device_instance(pdev);
+ 
+    VkResult result =
+-      wsi_device_init(&pdev->wsi_device, radv_physical_device_to_handle(pdev), radv_wsi_proc_addr, &instance->vk.alloc,
+-                      pdev->master_fd, &instance->drirc.options, &(struct wsi_device_options){.sw_device = false});
++      wsi_device_init(&pdev->wsi_device, radv_physical_device_to_handle(pdev),
++                      radv_wsi_proc_addr, &instance->vk.alloc, pdev->master_fd,
++                      &instance->drirc.options,
++                      &(struct wsi_device_options){ .sw_device = false });
+    if (result != VK_SUCCESS)
+       return result;
+ 
+
+
+--- a/src/amd/vulkan/radv_device.c	2026-04-13 18:25:39.843623375 +0200
++++ b/src/amd/vulkan/radv_device.c	2026-04-13 18:36:42.063788632 +0200
+@@ -81,8 +81,20 @@ radv_device_should_clear_vram(const stru
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+    const struct radv_instance *instance = radv_physical_device_instance(pdev);
+ 
+-   /* Ignore drirc radv_zero_vram=true if the feature is enabled to let applications take control. */
+-   return instance->drirc.debug.zero_vram && !device->vk.enabled_features.zeroInitializeDeviceMemory;
++   /* Application explicitly requested zero-init – honor it */
++   if (device->vk.enabled_features.zeroInitializeDeviceMemory)
++      return false;
++
++   if (!instance->drirc.debug.zero_vram)
++      return false;
++
++   const bool is_vega_hbm = (pdev->info.gfx_level == GFX9) &&
++                            (pdev->info.vram_type == AMDGPU_VRAM_TYPE_HBM);
++
++   if (is_vega_hbm)
++      return false;
++
++   return true;
+ }
+ 
+ VKAPI_ATTR VkResult VKAPI_CALL
+@@ -207,10 +219,11 @@ radv_device_init_vs_prologs(struct radv_
+ 
+    unsigned idx = 0;
+    for (unsigned num_attributes = 1; num_attributes <= 16; num_attributes++) {
++      key.num_attributes = num_attributes;
+       for (unsigned count = 1; count <= num_attributes; count++) {
+-         for (unsigned start = 0; start <= (num_attributes - count); start++) {
++         const unsigned last_start = num_attributes - count;
++         for (unsigned start = 0; start <= last_start; start++) {
+             key.instance_rate_inputs = BITFIELD_RANGE(start, count);
+-            key.num_attributes = num_attributes;
+ 
+             struct radv_shader_part *prolog = radv_create_vs_prolog(device, &key);
+             if (!prolog)
+@@ -381,14 +394,15 @@ radv_device_finish_vrs_image(struct radv
+ static enum radv_force_vrs
+ radv_parse_vrs_rates(const char *str)
+ {
+-   if (!strcmp(str, "2x2")) {
+-      return RADV_FORCE_VRS_2x2;
+-   } else if (!strcmp(str, "2x1")) {
+-      return RADV_FORCE_VRS_2x1;
+-   } else if (!strcmp(str, "1x2")) {
+-      return RADV_FORCE_VRS_1x2;
+-   } else if (!strcmp(str, "1x1")) {
+-      return RADV_FORCE_VRS_1x1;
++   if (str && str[0] && str[1] == 'x' && str[3] == '\0') {
++      if (str[0] == '2' && str[2] == '2')
++         return RADV_FORCE_VRS_2x2;
++      if (str[0] == '2' && str[2] == '1')
++         return RADV_FORCE_VRS_2x1;
++      if (str[0] == '1' && str[2] == '2')
++         return RADV_FORCE_VRS_1x2;
++      if (str[0] == '1' && str[2] == '1')
++         return RADV_FORCE_VRS_1x1;
+    }
+ 
+    fprintf(stderr, "radv: Invalid VRS rates specified (valid values are 2x2, 2x1, 1x2 and 1x1)\n");
+@@ -995,64 +1009,60 @@ radv_get_default_max_sample_dist(int log
+ void
+ radv_emit_default_sample_locations(const struct radv_physical_device *pdev, struct radv_cmd_stream *cs, int nr_samples)
+ {
++   static const uint32_t regs_1x4[] = {
++      R_028BF8_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0,
++      R_028C08_PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y0_0,
++      R_028C18_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_0,
++      R_028C28_PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y1_0,
++   };
++
+    uint64_t centroid_priority;
++   uint32_t packed_locs = sample_locs_1x;
+ 
+    radeon_begin(cs);
+ 
+    switch (nr_samples) {
+-   default:
+-   case 1:
+-      centroid_priority = centroid_priority_1x;
+-
+-      radeon_set_context_reg(R_028BF8_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0, sample_locs_1x);
+-      radeon_set_context_reg(R_028C08_PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y0_0, sample_locs_1x);
+-      radeon_set_context_reg(R_028C18_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_0, sample_locs_1x);
+-      radeon_set_context_reg(R_028C28_PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y1_0, sample_locs_1x);
+-      break;
+    case 2:
+       centroid_priority = centroid_priority_2x;
+-
+-      radeon_set_context_reg(R_028BF8_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0, sample_locs_2x);
+-      radeon_set_context_reg(R_028C08_PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y0_0, sample_locs_2x);
+-      radeon_set_context_reg(R_028C18_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_0, sample_locs_2x);
+-      radeon_set_context_reg(R_028C28_PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y1_0, sample_locs_2x);
++      packed_locs = sample_locs_2x;
++      for (unsigned i = 0; i < 4; ++i)
++         radeon_set_context_reg(regs_1x4[i], packed_locs);
+       break;
+    case 4:
+       centroid_priority = centroid_priority_4x;
+-
+-      radeon_set_context_reg(R_028BF8_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0, sample_locs_4x);
+-      radeon_set_context_reg(R_028C08_PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y0_0, sample_locs_4x);
+-      radeon_set_context_reg(R_028C18_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_0, sample_locs_4x);
+-      radeon_set_context_reg(R_028C28_PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y1_0, sample_locs_4x);
++      packed_locs = sample_locs_4x;
++      for (unsigned i = 0; i < 4; ++i)
++         radeon_set_context_reg(regs_1x4[i], packed_locs);
+       break;
+    case 8:
+       centroid_priority = centroid_priority_8x;
+-
+       radeon_set_context_reg_seq(R_028BF8_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0, 14);
+       radeon_emit_array(sample_locs_8x, 4);
+       radeon_emit_array(sample_locs_8x, 4);
+       radeon_emit_array(sample_locs_8x, 4);
+       radeon_emit_array(sample_locs_8x, 2);
+       break;
++   case 1:
++   default:
++      centroid_priority = centroid_priority_1x;
++      packed_locs = sample_locs_1x;
++      for (unsigned i = 0; i < 4; ++i)
++         radeon_set_context_reg(regs_1x4[i], packed_locs);
++      break;
+    }
+ 
+-   /* The exclusion bits can be set to improve rasterization efficiency if no sample lies on the
+-    * pixel boundary (-8 sample offset). It's currently always TRUE because the driver doesn't
+-    * support 16 samples.
+-    */
+    if (pdev->info.gfx_level >= GFX7 && pdev->info.gfx_level < GFX12) {
+       radeon_set_context_reg(R_02882C_PA_SU_PRIM_FILTER_CNTL,
+                              S_02882C_XMAX_RIGHT_EXCLUSION(1) | S_02882C_YMAX_BOTTOM_EXCLUSION(1));
+    }
+ 
+-   if (pdev->info.gfx_level >= GFX12) {
++   if (pdev->info.gfx_level >= GFX12)
+       radeon_set_context_reg_seq(R_028BF0_PA_SC_CENTROID_PRIORITY_0, 2);
+-   } else {
++   else
+       radeon_set_context_reg_seq(R_028BD4_PA_SC_CENTROID_PRIORITY_0, 2);
+-   }
++
+    radeon_emit(centroid_priority);
+    radeon_emit(centroid_priority >> 32);
+-
+    radeon_end();
+ }
+ 
+@@ -1459,30 +1469,33 @@ radv_GetImageMemoryRequirements2(VkDevic
+    VK_FROM_HANDLE(radv_device, device, _device);
+    VK_FROM_HANDLE(radv_image, image, pInfo->image);
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+-   uint32_t alignment;
+-   uint64_t size;
+ 
+    const VkImagePlaneMemoryRequirementsInfo *plane_info =
+       vk_find_struct_const(pInfo->pNext, IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO);
+ 
++   uint64_t size;
++   uint32_t alignment;
++
+    if (plane_info) {
+       const uint32_t plane = radv_plane_from_aspect(plane_info->planeAspect);
+-
+       size = image->planes[plane].surface.total_size;
+-      alignment = 1 << image->planes[plane].surface.alignment_log2;
++      alignment = 1u << image->planes[plane].surface.alignment_log2;
+    } else {
+       size = image->size;
+       alignment = image->alignment;
+    }
+ 
+-   pMemoryRequirements->memoryRequirements.memoryTypeBits =
+-      ((1u << pdev->memory_properties.memoryTypeCount) - 1u) & ~pdev->memory_types_32bit;
++   const uint32_t type_count = pdev->memory_properties.memoryTypeCount;
++   const uint32_t all_types_mask = (type_count >= 32u) ? 0xffffffffu : ((1u << type_count) - 1u);
++
++   uint32_t memory_type_bits = all_types_mask & ~pdev->memory_types_32bit;
+ 
+    if (image->vk.usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT) {
+-      /* Only expose host visible memory types for images that need to be mapped on the CPU. */
+-      pMemoryRequirements->memoryRequirements.memoryTypeBits &= pdev->memory_types_host_visible;
++      /* Only expose host visible memory types for images that need CPU mapping. */
++      memory_type_bits &= pdev->memory_types_host_visible;
+    }
+ 
++   pMemoryRequirements->memoryRequirements.memoryTypeBits = memory_type_bits;
+    pMemoryRequirements->memoryRequirements.size = size;
+    pMemoryRequirements->memoryRequirements.alignment = alignment;
+ 
+@@ -1587,12 +1600,19 @@ radv_compute_valid_memory_types_attempt(
+     * - Sometimes VRAM gets VRAM|GTT.
+     */
+    const enum radeon_bo_domain relevant_domains = RADEON_DOMAIN_VRAM | RADEON_DOMAIN_GDS | RADEON_DOMAIN_OA;
++   const enum radeon_bo_domain wanted_domains = domains & relevant_domains;
++   const enum radeon_bo_flag wanted_flags = flags & ~ignore_flags;
++
+    uint32_t bits = 0;
+-   for (unsigned i = 0; i < pdev->memory_properties.memoryTypeCount; ++i) {
+-      if ((domains & relevant_domains) != (pdev->memory_domains[i] & relevant_domains))
++   const uint32_t count = pdev->memory_properties.memoryTypeCount;
++
++   for (uint32_t i = 0; i < count; ++i) {
++      const enum radeon_bo_domain type_domains = pdev->memory_domains[i] & relevant_domains;
++      if (type_domains != wanted_domains)
+          continue;
+ 
+-      if ((flags & ~ignore_flags) != (pdev->memory_flags[i] & ~ignore_flags))
++      const enum radeon_bo_flag type_flags = pdev->memory_flags[i] & ~ignore_flags;
++      if (type_flags != wanted_flags)
+          continue;
+ 
+       bits |= 1u << i;
+
+--- a/src/amd/vulkan/radv_descriptors.c	2026-04-13 18:26:25.834790911 +0200
++++ b/src/amd/vulkan/radv_descriptors.c	2026-04-13 18:40:05.556951922 +0200
+@@ -13,9 +13,36 @@
+ #include "radv_image_view.h"
+ #include "radv_sampler.h"
+ 
++#include <string.h>
++
+ static_assert(RADV_SAMPLER_DESC_SIZE == 16 && RADV_BUFFER_DESC_SIZE == 16 && RADV_ACCEL_STRUCT_DESC_SIZE == 16,
+               "Sampler/buffer/acceleration structure descriptor sizes must match.");
+ 
++static inline uint32_t
++radv_descriptor_size_for_type(const struct radv_physical_device *pdev, VkDescriptorType type)
++{
++   switch (type) {
++   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
++   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
++   case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
++   case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
++      return RADV_BUFFER_DESC_SIZE;
++   case VK_DESCRIPTOR_TYPE_SAMPLER:
++      return RADV_SAMPLER_DESC_SIZE;
++   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
++      return RADV_STORAGE_IMAGE_DESC_SIZE;
++   case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
++   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
++      return radv_get_sampled_image_desc_size(pdev);
++   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
++      return radv_get_combined_image_sampler_desc_size(pdev);
++   case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
++      return RADV_ACCEL_STRUCT_DESC_SIZE;
++   default:
++      return 0;
++   }
++}
++
+ uint32_t
+ radv_descriptor_alignment(VkDescriptorType type)
+ {
+@@ -48,6 +75,9 @@ radv_mutable_descriptor_type_size_alignm
+    uint32_t max_size = 0;
+    uint32_t max_align = 0;
+ 
++   if (!list || !out_size || !out_align || (list->descriptorTypeCount && !list->pDescriptorTypes))
++      return false;
++
+    for (uint32_t i = 0; i < list->descriptorTypeCount; i++) {
+       uint32_t size = 0;
+       uint32_t align = radv_descriptor_alignment(list->pDescriptorTypes[i]);
+@@ -85,6 +115,7 @@ radv_mutable_descriptor_type_size_alignm
+ VKAPI_ATTR void VKAPI_CALL
+ radv_GetDescriptorSetLayoutSizeEXT(VkDevice device, VkDescriptorSetLayout layout, VkDeviceSize *pLayoutSizeInBytes)
+ {
++   (void)device;
+    VK_FROM_HANDLE(radv_descriptor_set_layout, set_layout, layout);
+    *pLayoutSizeInBytes = set_layout->size;
+ }
+@@ -93,6 +124,7 @@ VKAPI_ATTR void VKAPI_CALL
+ radv_GetDescriptorSetLayoutBindingOffsetEXT(VkDevice device, VkDescriptorSetLayout layout, uint32_t binding,
+                                             VkDeviceSize *pOffset)
+ {
++   (void)device;
+    VK_FROM_HANDLE(radv_descriptor_set_layout, set_layout, layout);
+    *pOffset = set_layout->binding[binding].offset;
+ }
+@@ -104,10 +136,13 @@ radv_GetDescriptorEXT(VkDevice _device,
+    VK_FROM_HANDLE(radv_device, device, _device);
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+ 
++   (void)dataSize;
++
+    switch (pDescriptorInfo->type) {
+-   case VK_DESCRIPTOR_TYPE_SAMPLER: {
++   case VK_DESCRIPTOR_TYPE_SAMPLER:
+       radv_write_sampler_descriptor(pDescriptor, *pDescriptorInfo->data.pSampler);
+       break;
++
+    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: {
+       if (pDescriptorInfo->data.pCombinedImageSampler) {
+          VK_FROM_HANDLE(radv_sampler, sampler, pDescriptorInfo->data.pCombinedImageSampler->sampler);
+@@ -125,6 +160,7 @@ radv_GetDescriptorEXT(VkDevice _device,
+       }
+       break;
+    }
++
+    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: {
+       const VkDescriptorImageInfo *image_info = pDescriptorInfo->type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT
+@@ -135,10 +171,12 @@ radv_GetDescriptorEXT(VkDevice _device,
+                                   image_info);
+       break;
+    }
++
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+       radv_write_image_descriptor(pDescriptor, RADV_STORAGE_IMAGE_DESC_SIZE, pDescriptorInfo->type,
+                                   pDescriptorInfo->data.pStorageImage);
+       break;
++
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
+       const VkDescriptorAddressInfoEXT *addr_info = pDescriptorInfo->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+@@ -149,6 +187,7 @@ radv_GetDescriptorEXT(VkDevice _device,
+                                    addr_info ? addr_info->range : 0);
+       break;
+    }
++
+    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
+       const VkDescriptorAddressInfoEXT *addr_info = pDescriptorInfo->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER
+@@ -163,10 +202,11 @@ radv_GetDescriptorEXT(VkDevice _device,
+       }
+       break;
+    }
++
+    case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+       radv_write_accel_struct_descriptor(device, pDescriptor, pDescriptorInfo->data.accelerationStructure);
+       break;
+-   }
++
+    default:
+       UNREACHABLE("invalid descriptor type");
+    }
