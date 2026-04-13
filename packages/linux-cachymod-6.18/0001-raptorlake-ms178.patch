@@ -1,3 +1,224 @@
+--- a/drivers/usb/host/xhci.c	2026-04-11 14:26:52.000000000 +0200
++++ b/drivers/usb/host/xhci.c	2026-04-13 16:03:14.567835031 +0200
+@@ -44,15 +44,27 @@ MODULE_PARM_DESC(quirks, "Bit flags for
+ static bool td_on_ring(struct xhci_td *td, struct xhci_ring *ring)
+ {
+ 	struct xhci_segment *seg;
++	struct xhci_segment *first;
+ 
+-	if (!td || !td->start_seg)
++	if (unlikely(!td))
++		return false;
++	seg = READ_ONCE(td->start_seg);
++	if (unlikely(!seg))
+ 		return false;
+ 
+-	xhci_for_each_ring_seg(ring->first_seg, seg) {
+-		if (seg == td->start_seg)
++	first = READ_ONCE(ring->first_seg);
++	if (unlikely(!first))
++		return false;
++
++	if (likely(seg == first))
++		return true;
++
++	/* Prefetch hides ~14-cycle L2 latency on Raptor Lake P-core */
++	prefetch(first->next);
++	xhci_for_each_ring_seg(first->next, seg) {
++		if (seg == READ_ONCE(td->start_seg))
+ 			return true;
+ 	}
+-
+ 	return false;
+ }
+ 
+@@ -71,14 +83,14 @@ static bool td_on_ring(struct xhci_td *t
+  */
+ int xhci_handshake(void __iomem *ptr, u32 mask, u32 done, u64 timeout_us)
+ {
+-	u32	result;
+-	int	ret;
++	u32 result;
++	int ret;
+ 
+ 	ret = readl_poll_timeout_atomic(ptr, result,
+-					(result & mask) == done ||
+-					result == U32_MAX,
+-					1, timeout_us);
+-	if (result == U32_MAX)		/* card removed */
++					((result & mask) == done) ||
++					(result == U32_MAX),
++					0, (unsigned long)timeout_us);
++	if (unlikely(result == U32_MAX)) /* card removed */
+ 		return -ENODEV;
+ 
+ 	return ret;
+@@ -1619,28 +1631,51 @@ static int xhci_urb_enqueue(struct usb_h
+ 	int ret = 0;
+ 	unsigned int slot_id, ep_index;
+ 	unsigned int *ep_state;
+-	struct urb_priv	*urb_priv;
++	struct urb_priv *urb_priv;
+ 	int num_tds;
++	int i;
+ 
+ 	ep_index = xhci_get_endpoint_index(&urb->ep->desc);
+ 
+ 	if (usb_endpoint_xfer_isoc(&urb->ep->desc))
+ 		num_tds = urb->number_of_packets;
+ 	else if (usb_endpoint_is_bulk_out(&urb->ep->desc) &&
+-	    urb->transfer_buffer_length > 0 &&
+-	    urb->transfer_flags & URB_ZERO_PACKET &&
+-	    !(urb->transfer_buffer_length % usb_endpoint_maxp(&urb->ep->desc)))
++		 urb->transfer_buffer_length > 0 &&
++		 (urb->transfer_flags & URB_ZERO_PACKET) &&
++		!(urb->transfer_buffer_length %
++		   usb_endpoint_maxp(&urb->ep->desc)))
+ 		num_tds = 2;
+ 	else
+ 		num_tds = 1;
+ 
+-	urb_priv = kzalloc(struct_size(urb_priv, td, num_tds), mem_flags);
++	/* Fast-path: avoid cache-line bounce on xhci->lock for dying host */
++	if (unlikely(READ_ONCE(xhci->xhc_state) & XHCI_STATE_DYING))
++		return -ESHUTDOWN;
++	if (unlikely(!HCD_HW_ACCESSIBLE(hcd)))
++		return -ESHUTDOWN;
++
++	urb_priv = kmalloc(struct_size(urb_priv, td, num_tds), mem_flags);
+ 	if (!urb_priv)
+ 		return -ENOMEM;
+ 
+ 	urb_priv->num_tds = num_tds;
+ 	urb_priv->num_tds_done = 0;
+-	urb->hcpriv = urb_priv;
++	/* kmalloc avoids kzalloc's rep stos – init only what queue code expects */
++	for (i = 0; i < num_tds; i++) {
++		INIT_LIST_HEAD(&urb_priv->td[i].td_list);
++		INIT_LIST_HEAD(&urb_priv->td[i].cancelled_td_list);
++		urb_priv->td[i].status = 0;
++		urb_priv->td[i].cancel_status = 0;
++		urb_priv->td[i].urb = urb;
++		urb_priv->td[i].start_seg = NULL;
++		urb_priv->td[i].start_trb = NULL;
++		urb_priv->td[i].end_seg = NULL;
++		urb_priv->td[i].end_trb = NULL;
++		urb_priv->td[i].bounce_seg = NULL;
++		urb_priv->td[i].urb_length_set = false;
++		urb_priv->td[i].error_mid_td = false;
++	}
++	WRITE_ONCE(urb->hcpriv, urb_priv);
+ 
+ 	trace_xhci_urb_enqueue(urb);
+ 
+@@ -1649,24 +1684,25 @@ static int xhci_urb_enqueue(struct usb_h
+ 	ret = xhci_check_args(hcd, urb->dev, urb->ep,
+ 			      true, true, __func__);
+ 	if (ret <= 0) {
+-		ret = ret ? ret : -EINVAL;
++		ret = ret? ret : -EINVAL;
+ 		goto free_priv;
+ 	}
+ 
+-	slot_id = urb->dev->slot_id;
++	slot_id = READ_ONCE(urb->dev->slot_id);
+ 
+ 	if (!HCD_HW_ACCESSIBLE(hcd)) {
+ 		ret = -ESHUTDOWN;
+ 		goto free_priv;
+ 	}
+ 
+-	if (xhci->devs[slot_id]->flags & VDEV_PORT_ERROR) {
++	if (unlikely(!xhci->devs[slot_id] ||
++		     (xhci->devs[slot_id]->flags & VDEV_PORT_ERROR))) {
+ 		xhci_dbg(xhci, "Can't queue urb, port error, link inactive\n");
+ 		ret = -ENODEV;
+ 		goto free_priv;
+ 	}
+ 
+-	if (xhci->xhc_state & XHCI_STATE_DYING) {
++	if (unlikely(READ_ONCE(xhci->xhc_state) & XHCI_STATE_DYING)) {
+ 		xhci_dbg(xhci, "Ep 0x%x: URB %p submitted for non-responsive xHCI host.\n",
+ 			 urb->ep->desc.bEndpointAddress, urb);
+ 		ret = -ESHUTDOWN;
+@@ -1675,20 +1711,19 @@ static int xhci_urb_enqueue(struct usb_h
+ 
+ 	ep_state = &xhci->devs[slot_id]->eps[ep_index].ep_state;
+ 
+-	if (*ep_state & (EP_GETTING_STREAMS | EP_GETTING_NO_STREAMS)) {
++	if (unlikely(*ep_state & (EP_GETTING_STREAMS | EP_GETTING_NO_STREAMS))) {
+ 		xhci_warn(xhci, "WARN: Can't enqueue URB, ep in streams transition state %x\n",
+ 			  *ep_state);
+ 		ret = -EINVAL;
+ 		goto free_priv;
+ 	}
+-	if (*ep_state & EP_SOFT_CLEAR_TOGGLE) {
++	if (unlikely(*ep_state & EP_SOFT_CLEAR_TOGGLE)) {
+ 		xhci_warn(xhci, "Can't enqueue URB while manually clearing toggle\n");
+ 		ret = -EINVAL;
+ 		goto free_priv;
+ 	}
+ 
+ 	switch (usb_endpoint_type(&urb->ep->desc)) {
+-
+ 	case USB_ENDPOINT_XFER_CONTROL:
+ 		ret = xhci_queue_ctrl_tx(xhci, GFP_ATOMIC, urb,
+ 					 slot_id, ep_index);
+@@ -1699,17 +1734,18 @@ static int xhci_urb_enqueue(struct usb_h
+ 		break;
+ 	case USB_ENDPOINT_XFER_INT:
+ 		ret = xhci_queue_intr_tx(xhci, GFP_ATOMIC, urb,
+-				slot_id, ep_index);
++					slot_id, ep_index);
+ 		break;
+ 	case USB_ENDPOINT_XFER_ISOC:
+ 		ret = xhci_queue_isoc_tx_prepare(xhci, GFP_ATOMIC, urb,
+-				slot_id, ep_index);
++						 slot_id, ep_index);
++		break;
+ 	}
+ 
+ 	if (ret) {
+ free_priv:
+ 		xhci_urb_free_priv(urb_priv);
+-		urb->hcpriv = NULL;
++		WRITE_ONCE(urb->hcpriv, NULL);
+ 	}
+ 	spin_unlock_irqrestore(&xhci->lock, flags);
+ 	return ret;
+@@ -5535,7 +5571,7 @@ int xhci_gen_setup(struct usb_hcd *hcd,
+ EXPORT_SYMBOL_GPL(xhci_gen_setup);
+ 
+ static void xhci_clear_tt_buffer_complete(struct usb_hcd *hcd,
+-		struct usb_host_endpoint *ep)
++					  struct usb_host_endpoint *ep)
+ {
+ 	struct xhci_hcd *xhci;
+ 	struct usb_device *udev;
+@@ -5546,12 +5582,20 @@ static void xhci_clear_tt_buffer_complet
+ 	xhci = hcd_to_xhci(hcd);
+ 
+ 	spin_lock_irqsave(&xhci->lock, flags);
+-	udev = (struct usb_device *)ep->hcpriv;
+-	slot_id = udev->slot_id;
++	udev = READ_ONCE(ep->hcpriv);
++	if (unlikely(!udev))
++		goto unlock;
++	slot_id = READ_ONCE(udev->slot_id);
++	if (unlikely(slot_id == 0 || slot_id >= MAX_HC_SLOTS))
++		goto unlock;
++	if (unlikely(!xhci->devs[slot_id]))
++		goto unlock;
++
+ 	ep_index = xhci_get_endpoint_index(&ep->desc);
+ 
+ 	xhci->devs[slot_id]->eps[ep_index].ep_state &= ~EP_CLEARING_TT;
+ 	xhci_ring_doorbell_for_active_rings(xhci, slot_id, ep_index);
++unlock:
+ 	spin_unlock_irqrestore(&xhci->lock, flags);
+ }
+ 
+
 --- a/sound/hda/codecs/realtek/realtek.c	2026-04-11 14:26:52.000000000 +0200
 +++ b/sound/hda/codecs/realtek/realtek.c	2026-04-12 22:28:25.375324726 +0200
 @@ -112,12 +112,17 @@ void alc_update_gpio_data(struct hda_cod
