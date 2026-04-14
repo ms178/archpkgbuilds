@@ -5172,6 +5172,93 @@ bfi_complementary_cb(opt_ctx& ctx, alu_opt_info& info)
    return true;
 }
 
+static bool
+opcode_has_combine_patterns(aco_opcode op)
+{
+   switch (op) {
+   /* v_not: double-NOT elimination */
+   case aco_opcode::v_not_b32:
+   case aco_opcode::s_not_b32:
+   case aco_opcode::s_not_b64:
+   /* Float MAD/FMA combines */
+   case aco_opcode::v_add_f32:
+   case aco_opcode::v_add_f16:
+   case aco_opcode::v_add_f64:
+   case aco_opcode::v_add_f64_e64:
+   case aco_opcode::s_add_f32:
+   case aco_opcode::s_add_f16:
+   case aco_opcode::v_pk_add_f16:
+   /* Min/Max combines */
+   case aco_opcode::v_max_f32:
+   case aco_opcode::v_min_f32:
+   case aco_opcode::v_max_u32:
+   case aco_opcode::v_min_u32:
+   case aco_opcode::v_max_i32:
+   case aco_opcode::v_min_i32:
+   case aco_opcode::v_max_f16:
+   case aco_opcode::v_min_f16:
+   case aco_opcode::v_max_u16:
+   case aco_opcode::v_min_u16:
+   case aco_opcode::v_max_i16:
+   case aco_opcode::v_min_i16:
+   case aco_opcode::v_max_u16_e64:
+   case aco_opcode::v_min_u16_e64:
+   case aco_opcode::v_max_i16_e64:
+   case aco_opcode::v_min_i16_e64:
+   /* Multiply combines */
+   case aco_opcode::v_mul_f32:
+   case aco_opcode::v_mul_legacy_f32:
+   case aco_opcode::v_mul_f16:
+   case aco_opcode::v_mul_f64:
+   case aco_opcode::v_mul_f64_e64:
+   /* RCP combines */
+   case aco_opcode::v_rcp_f32:
+   case aco_opcode::v_s_rcp_f32:
+   case aco_opcode::v_rcp_f16:
+   case aco_opcode::v_s_rcp_f16:
+   case aco_opcode::v_rcp_f64:
+   /* 16-bit integer MAD */
+   case aco_opcode::v_add_u16:
+   case aco_opcode::v_add_u16_e64:
+   case aco_opcode::v_pk_add_u16:
+   /* Bitwise/integer combines */
+   case aco_opcode::v_or_b32:
+   case aco_opcode::v_xor_b32:
+   case aco_opcode::v_add_u32:
+   case aco_opcode::v_add_co_u32:
+   case aco_opcode::v_add_co_u32_e64:
+   case aco_opcode::v_sub_u32:
+   case aco_opcode::v_sub_co_u32:
+   case aco_opcode::v_sub_co_u32_e64:
+   case aco_opcode::v_ashrrev_i32:
+   case aco_opcode::s_add_u32:
+   case aco_opcode::s_add_i32:
+   case aco_opcode::s_sub_u32:
+   case aco_opcode::s_sub_i32:
+   case aco_opcode::v_lshlrev_b32:
+   case aco_opcode::v_and_b32:
+   case aco_opcode::s_and_b32:
+   case aco_opcode::s_and_b64:
+   case aco_opcode::s_or_b32:
+   case aco_opcode::s_or_b64:
+   case aco_opcode::s_xor_b32:
+   case aco_opcode::s_xor_b64:
+   case aco_opcode::s_lshl_b32:
+   /* Counter/bit tricks */
+   case aco_opcode::s_bcnt1_i32_b32:
+   case aco_opcode::s_bcnt1_i32_b64:
+   case aco_opcode::s_ff1_i32_b32:
+   case aco_opcode::s_ff1_i32_b64:
+   /* Conditional mask */
+   case aco_opcode::v_cndmask_b32:
+   /* Pack/convert */
+   case aco_opcode::v_alignbyte_b32:
+      return true;
+   default:
+      return false;
+   }
+}
+
 ACO_HOT void
 combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 {
@@ -5226,9 +5313,6 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    if (!alu_opt_gather_info(ctx, instr.get(), info))
       return;
 
-   /* Local commit helper for pure-rewrite peepholes that don't
-    * call decrease_and_dce internally.
-    */
    auto commit_local_rewrite = [&](alu_opt_info& new_info) -> bool {
       if (!alu_opt_info_is_valid(ctx, new_info))
          return false;
@@ -5249,7 +5333,7 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    };
 
    /* Safe local peepholes: integer identity folding + carry-in zero.
-    * These are pure rewrites with no internal side effects.
+    * Pure rewrites with no internal side effects on use counts.
     */
    {
       alu_opt_info candidate = info;
@@ -5309,6 +5393,9 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          }
       }
    }
+
+   if (!opcode_has_combine_patterns(info.opcode))
+      return;
 
    aco::small_vec<combine_instr_pattern, 24> patterns;
 #define add_opt(src_op, res_op, mask, swizzle, ...) \
