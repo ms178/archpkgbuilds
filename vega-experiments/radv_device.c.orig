@@ -1248,12 +1248,6 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
    /* PKT3_LOAD_SH_REG_INDEX is supported on GFX8+, but it hangs with compute queues until GFX10.3. */
    device->load_grid_size_from_user_sgpr = pdev->info.gfx_level >= GFX10_3;
 
-   /* If this is a NULL device, we are done here. */
-   if (pdev->info.family_overridden) {
-      *pDevice = radv_device_to_handle(device);
-      return VK_SUCCESS;
-   }
-
    device->ws = pdev->ws;
    device->vk.sync = device->ws->get_sync_provider(device->ws);
 
