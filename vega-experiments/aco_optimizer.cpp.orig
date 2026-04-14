@@ -1180,6 +1180,12 @@ alu_opt_info_is_valid(opt_ctx& ctx, alu_opt_info& info)
             lmask[2] = true;
             info.opcode = aco_opcode::s_fmaak_f32;
          }
+      } else if ((info.opcode == aco_opcode::s_bitset0_b32 ||
+                  info.opcode == aco_opcode::s_bitset1_b32 ||
+                  info.opcode == aco_opcode::s_bitset0_b64 ||
+                  info.opcode == aco_opcode::s_bitset1_b64) &&
+                 !smask[1]) {
+         return false;
       }
 
       if ((info.opcode == aco_opcode::s_fmac_f16 || info.opcode == aco_opcode::s_fmac_f32) &&
