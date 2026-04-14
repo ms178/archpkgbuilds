@@ -187,8 +187,7 @@ do_winsys_init(struct amdgpu_winsys *aws,
 
    aws->check_vm = strstr(r600_debug, "check_vm") != NULL ||
                    strstr(amd_debug, "check_vm") != NULL;
-   aws->noop_cs = aws->info.family_overridden ||
-                  debug_get_bool_option("RADEON_NOOP", false);
+   aws->noop_cs = debug_get_bool_option("RADEON_NOOP", false);
 #if MESA_DEBUG
    aws->debug_all_bos = debug_get_option_all_bos();
 #endif
