@@ -637,7 +637,7 @@ bool RenderLoopPrivate::cadenceMatchesNominal() const noexcept
     int64_t minValue = std::numeric_limits<int64_t>::max();
     int64_t maxValue = 0;
 
-    const int64_t toleranceNs = std::max<int64_t>(nominalNs >> 6, 300'000);
+    const int64_t toleranceNs = std::max<int64_t>(nominalNs >> 6, 300'000LL);
     const int64_t doubleTolerance = toleranceNs << 1;
 
     for (uint8_t offset = 0; offset < presentHistoryCount_ && found < kMaxIntervals; ++offset) {
@@ -660,7 +660,10 @@ bool RenderLoopPrivate::cadenceMatchesNominal() const noexcept
                 sum += delta;
                 minValue = std::min(minValue, delta);
                 maxValue = std::max(maxValue, delta);
-                matches += static_cast<size_t>(sample.directScanout || safeAbs64(delta - nominalNs) <= doubleTolerance);
+
+                const bool match =
+                    sample.directScanout || safeAbs64(delta - nominalNs) <= doubleTolerance;
+                matches += static_cast<size_t>(match);
             }
         }
 
@@ -1062,7 +1065,7 @@ void RenderLoopPrivate::scheduleRepaint()
 
     if (presentationMode == PresentationMode::VSync) [[likely]] {
         const int64_t earliestReadyNs = nowNs + compositeNs;
-        const int64_t nsFromLastPres = std::max(earliestReadyNs - lastPresNs, int64_t{1});
+        const int64_t nsFromLastPres = std::max<int64_t>(earliestReadyNs - lastPresNs, 1LL);
         int64_t targetVblank = static_cast<int64_t>(
             ceilDivU64Reciprocal(static_cast<uint64_t>(nsFromLastPres),
                                  vblankNs,
@@ -1098,10 +1101,10 @@ void RenderLoopPrivate::scheduleRepaint()
     nextPresentationTimestamp = std::chrono::nanoseconds{nextPresNs};
     const int64_t nextRenderNs = nextPresNs - compositeNs;
 
-    const int64_t delayNs = std::max(nextRenderNs - nowNs, int64_t{0});
+    const int64_t delayNs = std::max<int64_t>(nextRenderNs - nowNs, 0LL);
     const int timerMs = delayNs < kNsPerMs
         ? 0
-        : static_cast<int>(std::clamp(delayNs / kNsPerMs, int64_t{1}, int64_t{kMaxTimerDelayMs}));
+        : static_cast<int>(std::clamp<int64_t>(delayNs / kNsPerMs, 1LL, static_cast<int64_t>(kMaxTimerDelayMs)));
 
     if (compositeTimer.isActive()) {
         const int64_t scheduledNs = scheduledRenderTimestamp.count();
@@ -1321,9 +1324,13 @@ void RenderLoopPrivate::notifyVblank(std::chrono::nanoseconds timestamp, int64_t
     if (ts > nowNs) [[unlikely]] {
         ts = nowNs;
     }
-    if (ts < lastPresentationTimestamp.count()) [[unlikely]] {
-        ts = lastPresentationTimestamp.count();
+
+    const int64_t prev = lastPresentationTimestamp.count();
+    if (ts < prev) [[unlikely]] {
+        // Avoid backward jumps that can destabilize interval estimation and trigger mode oscillation.
+        ts = prev;
     }
+
     lastPresentationTimestamp = std::chrono::nanoseconds{ts};
 }
 
@@ -1503,8 +1510,9 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer *layer)
 
     const bool vrrActive = isVrrMode(d->presentationMode);
     const int maxPending = effectiveMaxPendingFrames(d.get(), vrrActive);
+    const bool blockedByQueue = d->pendingFrameCount >= maxPending;
 
-    if (d->pendingFrameCount >= maxPending) {
+    if (blockedByQueue) {
         if (!vrrActive && d->delayedVrrTimer.isActive()) {
             d->delayedVrrTimer.stop();
         }
@@ -1513,14 +1521,14 @@ void RenderLoop::scheduleRepaint(Item *item, OutputLayer *layer)
         return;
     }
 
-    const bool allowDelayedVrrControl =
-        vrrActive &&
+    const bool maybeDelayControl = vrrActive &&
         item != nullptr &&
         d->activeContentHint_ == VrrContentHint::Unknown &&
         d->interactiveGraceFrames_ == 0U &&
-        d->cadenceStability_ < kCadenceStableThreshold;
+        d->cadenceStability_ < kCadenceStableThreshold &&
+        d->pendingFrameCount > 0;
 
-    if (allowDelayedVrrControl && d->pendingFrameCount > 0) {
+    if (maybeDelayControl) {
         const VrrStateCache::State state = d->vrrStateCache_.getState();
         if (state.isOnOutput != 0U) {
             Window *const tracked = d->trackedWindow_.data();
