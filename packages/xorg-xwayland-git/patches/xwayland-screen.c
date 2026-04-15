@@ -107,8 +107,10 @@ xwl_screen_get(ScreenPtr screen)
 Bool
 xwl_screen_has_viewport_support(struct xwl_screen *xwl_screen)
 {
-    return wl_compositor_get_version(xwl_screen->compositor) >=
-                            WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION &&
+    /* Defensive: during early init compositor may still be NULL */
+    return xwl_screen->compositor &&
+           wl_compositor_get_version(xwl_screen->compositor) >=
+               WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION &&
            xwl_screen->viewporter != NULL;
 }
 
@@ -181,6 +183,7 @@ xwl_property_callback(CallbackListPtr *pcbl, void *closure,
         xwl_window_update_property(xwl_window, rec);
 }
 
+#ifdef XACE
 #define readOnlyPropertyAccessMask (DixReadAccess |\
                                     DixGetAttrAccess |\
                                     DixListPropAccess |\
@@ -198,15 +201,17 @@ xwl_access_property_callback(CallbackListPtr *pcbl, void *closure,
     struct xwl_screen *xwl_screen = xwl_screen_get(pScreen);
 
     if (prop->propertyName == xwl_screen->allow_commits_prop) {
-        /* Only the WM and the Xserver itself */
         if (client != serverClient &&
             client->index != xwl_screen->wm_client_id &&
             (access_mode & ~readOnlyPropertyAccessMask) != 0)
             rec->status = BadAccess;
     }
+
+    (void)pcbl;
 }
 
 #undef readOnlyPropertyAccessMask
+#endif /* XACE */
 
 static void
 xwl_root_window_finalized_callback(CallbackListPtr *pcbl,
@@ -237,7 +242,9 @@ xwl_close_screen(ScreenPtr screen)
     xwl_dmabuf_feedback_destroy(&xwl_screen->default_feedback);
 #endif
     DeleteCallback(&PropertyStateCallback, xwl_property_callback, screen);
+#ifdef XACE
     XaceDeleteCallback(XACE_PROPERTY_ACCESS, xwl_access_property_callback, screen);
+#endif
 
     xorg_list_for_each_entry_safe(xwl_output, next_xwl_output,
                                   &xwl_screen->output_list, link)
@@ -296,9 +303,14 @@ xwl_cursor_warped_to(DeviceIntPtr device,
     struct xwl_seat *xwl_seat = device->public.devicePrivate;
     struct xwl_window *xwl_window;
     WindowPtr focus;
+    int fx, fy, fw, fh;
 
     if (!xwl_seat)
         xwl_seat = xwl_screen_get_default_seat(xwl_screen);
+
+    /* Seat can still be absent during early startup */
+    if (!xwl_seat)
+        return;
 
     if (!window)
         window = XYToWindow(sprite, x, y);
@@ -306,14 +318,16 @@ xwl_cursor_warped_to(DeviceIntPtr device,
     xwl_window = xwl_window_from_window(window);
     if (!xwl_window && xwl_seat->focus_window) {
         focus = xwl_seat->focus_window->toplevel;
+        fx = focus->drawable.x;
+        fy = focus->drawable.y;
+        fw = focus->drawable.width;
+        fh = focus->drawable.height;
 
-        /* Warps on non wl_surface backed Windows are only allowed
+        /* Warps on non wl_surface backed windows are only allowed
          * as long as the pointer stays within the focus window.
          */
-        if (x >= focus->drawable.x &&
-            y >= focus->drawable.y &&
-            x < focus->drawable.x + focus->drawable.width &&
-            y < focus->drawable.y + focus->drawable.height) {
+        if (x >= fx && y >= fy &&
+            x < fx + fw && y < fy + fh) {
             if (!window) {
                 DebugF("Warp relative to pointer, assuming pointer focus\n");
                 xwl_window = xwl_seat->focus_window;
@@ -323,10 +337,12 @@ xwl_cursor_warped_to(DeviceIntPtr device,
             }
         }
     }
+
     if (!xwl_window)
         return;
 
     xwl_seat_emulate_pointer_warp(xwl_seat, xwl_window, sprite, x, y);
+    (void)client;
 }
 
 static void
@@ -435,113 +451,38 @@ xwl_screen_post_damage(struct xwl_screen *xwl_screen)
     struct xwl_window *xwl_window, *next_xwl_window;
     struct xorg_list commit_window_list;
 
-    /*
-     * Early exit optimization: If no windows are damaged, skip all processing.
-     * This is common during idle frames (e.g., static game menus).
-     * Saves ~30 cycles (list init + glamor check + dispatch overhead).
-     */
-    if (__builtin_expect(xorg_list_is_empty(&xwl_screen->damage_window_list), 0))
+    if (xorg_list_is_empty(&xwl_screen->damage_window_list))
         return;
 
     xorg_list_init(&commit_window_list);
 
-    /*
-     * Iterate damaged windows and prepare for commit.
-     * Optimization: Prefetch next window to hide L1D cache miss latency.
-     *
-     * Intel Raptor Lake: L1D miss = ~10 cycles (L2 hit). Prefetching with
-     * locality hint 3 (temporal, keep in L1/L2) hides 70% of latency.
-     * Per Intel Optimization Manual Vol. 1 §3.7.1.4.
-     */
     xorg_list_for_each_entry_safe(xwl_window, next_xwl_window,
                                   &xwl_screen->damage_window_list, link_damage) {
-        /*
-         * Prefetch next window structure (read-only, high temporal locality).
-         * Guard: Ensure next_xwl_window is valid (not list head sentinel).
-         * The list_entry macro computes container_of on the list head when
-         * at the last real entry, yielding an invalid xwl_window pointer.
-         */
-        if (__builtin_expect(&next_xwl_window->link_damage != &xwl_screen->damage_window_list, 1))
-            __builtin_prefetch(next_xwl_window, 0, 3);
-
-        /*
-         * Skip windows waiting for frame callback (compositor hasn't displayed
-         * previous buffer yet). This is uncommon (~5% of windows) due to VRR/async.
-         * Mark unlikely to optimize branch predictor.
-         */
+        /* Hot reject path: waiting frame callback means no new attach yet */
         if (__builtin_expect(xwl_window->frame_callback != NULL, 0))
             continue;
 
-        /*
-         * Skip windows where commits are disabled (e.g., unmapped windows).
-         * Also uncommon in the damage list (typically only mapped windows are damaged).
-         */
         if (__builtin_expect(!xwl_window->allow_commits, 0))
             continue;
 
-        /*
-         * Post damage to pixmap/buffer (updates window contents).
-         * This may attach a new buffer or mark damage regions.
-         */
         xwl_window_post_damage(xwl_window);
-
-        /*
-         * Move window from damage list to commit list (batching for later commit).
-         * This avoids committing immediately, allowing glamor_block_handler to
-         * flush all GL commands first (ensures buffers are ready).
-         */
         xorg_list_del(&xwl_window->link_damage);
         xorg_list_append(&xwl_window->link_damage, &commit_window_list);
     }
 
-    /*
-     * If no windows ready to commit (all skipped due to frame_callback/allow_commits),
-     * exit early. Avoids unnecessary glamor flush and commit loop.
-     */
     if (xorg_list_is_empty(&commit_window_list))
         return;
 
 #ifdef XWL_HAS_GLAMOR
-    /*
-     * Flush pending GL commands to ensure buffers are ready for commit.
-     * For AMD Vega 64: This submits command buffers to GPU, minimizing
-     * CPU-GPU sync stalls when committing surfaces.
-     */
     if (xwl_screen->glamor)
         glamor_block_handler(xwl_screen->screen);
 #endif
 
-    /*
-     * Batch commit all ready windows to compositor.
-     * Optimization: Prefetch next window in commit loop to hide cache misses.
-     *
-     * For Vega 64: Batching commits reduces per-commit overhead (validation,
-     * IPC round-trips). Each commit triggers compositor-side state updates.
-     */
     xorg_list_for_each_entry_safe(xwl_window, next_xwl_window,
                                   &commit_window_list, link_damage) {
-        /* Prefetch next window for commit (same prefetch strategy as damage loop) */
-        if (__builtin_expect(&next_xwl_window->link_damage != &commit_window_list, 1))
-            __builtin_prefetch(next_xwl_window, 0, 3);
-
-        /*
-         * Defensive check: Ensure surface is valid before committing.
-         * Corruption fix: Tooltips/popups may destroy surfaces while on commit list.
-         * Committing NULL surface triggers Wayland protocol error, causing compositor
-         * to potentially display garbage or disconnect client.
-         *
-         * This check prevents the corruption issue reported with tooltip windows.
-         */
-        if (__builtin_expect(xwl_window->surface != NULL, 1)) {
+        /* Teardown race mitigation: skip stale surfaces instead of crashing */
+        if (xwl_window->surface)
             wl_surface_commit(xwl_window->surface);
-        }
-
-        /*
-         * Remove window from commit list. Window is now on NO list until next damage.
-         * Note: link_damage.next/prev are NOT reinitialized (for performance).
-         * This is safe because xwl_window_add_damage() (in xwayland-window.c)
-         * uses xorg_list_append unconditionally, which overwrites next/prev.
-         */
         xorg_list_del(&xwl_window->link_damage);
     }
 }
@@ -564,14 +505,10 @@ registry_global(void *data, struct wl_registry *registry, uint32_t id,
     struct xwl_screen *xwl_screen = data;
 
     if (strcmp(interface, wl_compositor_interface.name) == 0) {
-        uint32_t request_version = 1;
+        uint32_t request_version = WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION;
 
-        if (version >= WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION) {
+        if (version >= WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION)
             request_version = WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION;
-            xwl_screen->use_damage_buffer = TRUE;
-        } else {
-            xwl_screen->use_damage_buffer = FALSE;
-        }
 
         xwl_screen->compositor =
             wl_registry_bind(registry, id, &wl_compositor_interface, request_version);
@@ -591,7 +528,6 @@ registry_global(void *data, struct wl_registry *registry, uint32_t id,
             xwl_screen->expecting_event++;
     }
     else if (strcmp(interface, zxdg_output_manager_v1_interface.name) == 0) {
-        /* We support xdg-output from version 1 to version 3 */
         version = min(version, 3);
         xwl_screen->xdg_output_manager =
             wl_registry_bind(registry, id, &zxdg_output_manager_v1_interface, version);
@@ -599,7 +535,10 @@ registry_global(void *data, struct wl_registry *registry, uint32_t id,
     }
     else if (strcmp(interface, wp_drm_lease_device_v1_interface.name) == 0) {
         if (xwl_screen->screen->root == NULL) {
-            struct xwl_queued_drm_lease_device *queued = malloc(sizeof(struct xwl_queued_drm_lease_device));
+            struct xwl_queued_drm_lease_device *queued =
+                malloc(sizeof(struct xwl_queued_drm_lease_device));
+            if (!queued)
+                return;
             queued->id = id;
             xorg_list_append(&queued->link, &xwl_screen->queued_drm_lease_devices);
         } else {
@@ -623,8 +562,7 @@ registry_global(void *data, struct wl_registry *registry, uint32_t id,
     }
 #ifdef XWL_HAS_GLAMOR
     else if (xwl_screen->glamor) {
-        xwl_glamor_init_wl_registry(xwl_screen, registry, id, interface,
-                                    version);
+        xwl_glamor_init_wl_registry(xwl_screen, registry, id, interface, version);
     }
 #endif
 }
@@ -718,35 +656,12 @@ static struct libdecor_interface libdecor_iface = {
 static void
 xwl_dispatch_events(struct xwl_screen *xwl_screen)
 {
-    int ret;
+    int ret = 0;
     int ready;
 
-    /*
-     * Event dispatch state machine:
-     * 1. If wait_flush=1 (previous flush failed), skip prepare_read and retry flush.
-     * 2. Otherwise, prepare to read events (may spin if another thread reading).
-     * 3. Poll for output buffer space (timeout=5ms).
-     * 4. Flush output buffer if ready.
-     * 5. Update wait_flush state for next iteration.
-     */
-
-    /*
-     * Fast path: If not waiting to flush, prepare for reading events.
-     * Most calls (>95%) take this path in normal operation.
-     */
     if (__builtin_expect(!xwl_screen->wait_flush, 1)) {
-        /*
-         * Spin until prepare_read succeeds or we dispatch pending events.
-         * wl_display_prepare_read() fails if another thread is reading.
-         * In Xwayland (single-threaded), this loop typically executes once.
-         */
         while (xwl_screen->prepare_read == 0 &&
                __builtin_expect(wl_display_prepare_read(xwl_screen->display) == -1, 0)) {
-            /*
-             * Prepare failed → events pending. Dispatch them and retry.
-             * wl_display_dispatch_pending() processes events already read by another
-             * thread (not applicable in single-threaded Xwayland, but handles libdecor).
-             */
             ret = wl_display_dispatch_pending(xwl_screen->display);
             if (__builtin_expect(ret == -1, 0))
                 xwl_give_up("failed to dispatch Wayland events: %s\n", strerror(errno));
@@ -755,56 +670,21 @@ xwl_dispatch_events(struct xwl_screen *xwl_screen)
         xwl_screen->prepare_read = 1;
     }
 
-    /*
-     * Poll for output buffer availability (wait up to 5ms).
-     * This blocks if the compositor isn't reading (buffer full).
-     * Timeout ensures we don't stall the X server indefinitely.
-     */
     ready = xwl_display_pollout(xwl_screen, 5);
-
-    /*
-     * Handle poll errors (rare: only on fd closure or signal interruption).
-     */
     if (__builtin_expect(ready == -1, 0)) {
-        /*
-         * EINTR (signal interruption) is benign → retry next iteration.
-         * Other errors (EBADF, etc.) are fatal → abort.
-         */
-        if (__builtin_expect(errno != EINTR, 1))
+        if (errno != EINTR)
             xwl_give_up("error polling on Xwayland fd: %s\n", strerror(errno));
-
-        /*
-         * Ensure wait_flush is set (poll failed, so we couldn't flush).
-         * This forces retry on next dispatch_events call.
-         */
         xwl_screen->wait_flush = 1;
         return;
     }
 
-    /*
-     * Flush output buffer if poll indicated ready (ready > 0).
-     * Most calls (>90%) succeed immediately (compositor is reading).
-     */
-    ret = 0;
-    if (__builtin_expect(ready > 0, 1)) {
+    if (__builtin_expect(ready > 0, 1))
         ret = wl_display_flush(xwl_screen->display);
 
-        /*
-         * Flush failures (rare):
-         * - EAGAIN: Buffer full despite poll (race condition) → retry.
-         * - Other errors: Fatal protocol/connection error → abort.
-         */
-        if (__builtin_expect(ret == -1 && errno != EAGAIN, 0))
-            xwl_give_up("failed to write to Xwayland fd: %s\n", strerror(errno));
-    }
+    if (__builtin_expect(ret == -1 && errno != EAGAIN, 0))
+        xwl_give_up("failed to write to Xwayland fd: %s\n", strerror(errno));
 
-    /*
-     * Update wait_flush state:
-     * - ready <= 0: Poll timeout or error → need to retry.
-     * - ret == -1: Flush failed (EAGAIN) → need to retry.
-     * Otherwise, flush succeeded → clear wait_flush.
-     */
-    xwl_screen->wait_flush = (ready <= 0 || ret == -1);
+    xwl_screen->wait_flush = (ready == 0 || ret == -1);
 }
 
 static void
@@ -859,10 +739,14 @@ xwl_surface_damage(struct xwl_screen *xwl_screen,
                    struct wl_surface *surface,
                    int32_t x, int32_t y, int32_t width, int32_t height)
 {
-    if (__builtin_expect(xwl_screen->use_damage_buffer, 1))
+    const uint32_t v = wl_surface_get_version(surface);
+
+    if (__builtin_expect(v >= WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION, 1))
         wl_surface_damage_buffer(surface, x, y, width, height);
     else
         wl_surface_damage(surface, x, y, width, height);
+
+    (void)xwl_screen;
 }
 
 void
@@ -1011,10 +895,6 @@ xwl_screen_init(ScreenPtr pScreen, int argc, char **argv)
         return FALSE;
     if (!xwl_window_init())
         return FALSE;
-    /* There are no easy to use new / delete client hooks, we could use a
-     * ClientStateCallback, but it is easier to let the dix code manage the
-     * memory for us. This will zero fill the initial xwl_client data.
-     */
     if (!dixRegisterPrivateKey(&xwl_client_private_key, PRIVATE_CLIENT,
                                sizeof(struct xwl_client)))
         return FALSE;
@@ -1038,12 +918,6 @@ xwl_screen_init(ScreenPtr pScreen, int argc, char **argv)
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-rootless") == 0) {
             xwl_screen->rootless = 1;
-
-            /* Disable the XSS extension on Xwayland rootless.
-             *
-             * Xwayland is just a Wayland client, no X11 screensaver
-             * should be expected to work reliably on Xwayland rootless.
-             */
 #ifdef SCREENSAVER
             noScreenSaverExtension = TRUE;
 #endif
@@ -1057,11 +931,19 @@ xwl_screen_init(ScreenPtr pScreen, int argc, char **argv)
         }
 #ifdef XWL_HAS_GLAMOR
         else if (strcmp(argv[i], "-glamor") == 0) {
-            if (strncmp(argv[i + 1], "es", 2) == 0)
+            const char *api;
+
+            if (i + 1 >= argc) {
+                ErrorF("missing argument for -glamor\n");
+                return FALSE;
+            }
+
+            api = argv[++i];
+            if (strncmp(api, "es", 2) == 0)
                 xwl_screen->glamor = XWL_GLAMOR_GLES;
-            else if (strncmp(argv[i + 1], "gl", 2) == 0)
+            else if (strncmp(api, "gl", 2) == 0)
                 xwl_screen->glamor = XWL_GLAMOR_GL;
-            else if (strncmp(argv[i + 1], "off", 3) == 0)
+            else if (strncmp(api, "off", 3) == 0)
                 xwl_screen->glamor = XWL_GLAMOR_NONE;
             else
                 ErrorF("Xwayland glamor: unknown rendering API selected\n");
@@ -1071,11 +953,17 @@ xwl_screen_init(ScreenPtr pScreen, int argc, char **argv)
             xwl_screen->force_xrandr_emulation = 1;
         }
         else if (strcmp(argv[i], "-geometry") == 0) {
-            sscanf(argv[i + 1], "%ix%i", &xwl_width, &xwl_height);
-            if (xwl_width == 0 || xwl_height == 0) {
-                ErrorF("invalid argument for -geometry %s\n", argv[i + 1]);
+            if (i + 1 >= argc) {
+                ErrorF("missing argument for -geometry\n");
                 return FALSE;
             }
+
+            if (sscanf(argv[++i], "%ix%i", &xwl_width, &xwl_height) != 2 ||
+                xwl_width == 0 || xwl_height == 0) {
+                ErrorF("invalid argument for -geometry %s\n", argv[i]);
+                return FALSE;
+            }
+
             use_fixed_size = 1;
         }
         else if (strcmp(argv[i], "-fullscreen") == 0) {
@@ -1083,7 +971,11 @@ xwl_screen_init(ScreenPtr pScreen, int argc, char **argv)
             xwl_screen->fullscreen = 1;
         }
         else if (strcmp(argv[i], "-output") == 0) {
-            xwl_screen->output_name = argv[i + 1];
+            if (i + 1 >= argc) {
+                ErrorF("missing argument for -output\n");
+                return FALSE;
+            }
+            xwl_screen->output_name = argv[++i];
         }
         else if (strcmp(argv[i], "-host-grab") == 0) {
             xwl_screen->host_grab = 1;
@@ -1134,8 +1026,6 @@ xwl_screen_init(ScreenPtr pScreen, int argc, char **argv)
     }
 #endif
 
-    /* In rootless mode, we don't have any screen storage, and the only
-     * rendering should be to redirected mode. */
     if (xwl_screen->rootless)
         xwl_screen->root_clip_mode = ROOT_CLIP_INPUT_ONLY;
     else
@@ -1165,10 +1055,8 @@ xwl_screen_init(ScreenPtr pScreen, int argc, char **argv)
 
     xwl_screen->expecting_event = 0;
     xwl_screen->registry = wl_display_get_registry(xwl_screen->display);
-    wl_registry_add_listener(xwl_screen->registry,
-                             &registry_listener, xwl_screen);
+    wl_registry_add_listener(xwl_screen->registry, &registry_listener, xwl_screen);
     xwl_screen_roundtrip(xwl_screen);
-
 
     if (xwl_screen->fullscreen && xwl_screen->rootless) {
         ErrorF("error, cannot set fullscreen when running rootless\n");
@@ -1237,6 +1125,7 @@ xwl_screen_init(ScreenPtr pScreen, int argc, char **argv)
     {
         xwl_screen->wayland_fd = wl_display_get_fd(xwl_screen->display);
     }
+
     SetNotifyFd(xwl_screen->wayland_fd, socket_handler, X_NOTIFY_READ, xwl_screen);
     RegisterBlockAndWakeupHandlers(block_handler, wakeup_handler, xwl_screen);
 
@@ -1250,8 +1139,8 @@ xwl_screen_init(ScreenPtr pScreen, int argc, char **argv)
 
 #ifdef XWL_HAS_GLAMOR
     if (xwl_screen->glamor && !xwl_glamor_init(xwl_screen)) {
-       ErrorF("Failed to initialize glamor, falling back to sw\n");
-       xwl_screen->glamor = XWL_GLAMOR_NONE;
+        ErrorF("Failed to initialize glamor, falling back to sw\n");
+        xwl_screen->glamor = XWL_GLAMOR_NONE;
     }
 #endif
 
@@ -1285,6 +1174,9 @@ xwl_screen_init(ScreenPtr pScreen, int argc, char **argv)
     xwl_screen->ConfigNotify = pScreen->ConfigNotify;
     pScreen->ConfigNotify = xwl_config_notify;
 
+    xwl_screen->ReparentWindow = pScreen->ReparentWindow;
+    pScreen->ReparentWindow = xwl_reparent_window;
+
     xwl_screen->ResizeWindow = pScreen->ResizeWindow;
     pScreen->ResizeWindow = xwl_resize_window;
 
@@ -1308,7 +1200,9 @@ xwl_screen_init(ScreenPtr pScreen, int argc, char **argv)
 
     AddCallback(&PropertyStateCallback, xwl_property_callback, pScreen);
     AddCallback(&RootWindowFinalizeCallback, xwl_root_window_finalized_callback, pScreen);
+#ifdef XACE
     XaceRegisterCallback(XACE_PROPERTY_ACCESS, xwl_access_property_callback, pScreen);
+#endif
 
     xwl_screen_setup_custom_vector(xwl_screen);
 
