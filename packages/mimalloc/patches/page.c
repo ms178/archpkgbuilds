@@ -51,10 +51,12 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page);
 
 #if (MI_DEBUG>=3)
 static size_t mi_page_list_count(mi_page_t* page, mi_block_t* head) {
-  mi_assert_internal(_mi_ptr_page(page) == page);
+  mi_assert_internal(_mi_ptr_page(page->page_start) == page);
+  const uint8_t* slice_start = mi_page_slice_start(page);
+  mi_assert_internal(_mi_is_aligned(slice_start,MI_PAGE_ALIGN));
   size_t count = 0;
   while (head != NULL) {
-    mi_assert_internal((uint8_t*)head - (uint8_t*)page > (ptrdiff_t)MI_LARGE_PAGE_SIZE || page == _mi_ptr_page(head));
+    mi_assert_internal((uint8_t*)head - slice_start > (ptrdiff_t)MI_LARGE_PAGE_SIZE || page == _mi_ptr_page(head));
     count++;
     head = mi_block_next(page, head);
   }
@@ -77,7 +79,7 @@ static bool mi_page_list_is_valid(mi_page_t* page, mi_block_t* p) {
     if (p < start || p >= end) return false;
     p = mi_block_next(page, p);
   }
-#if MI_DEBUG>3 // generally too expensive to check this
+#if MI_DEBUG>3
   if (page->free_is_zero) {
     const size_t ubsize = mi_page_usable_block_size(page);
     for (mi_block_t* block = page->free; block != NULL; block = mi_block_next(page, block)) {
@@ -93,14 +95,10 @@ static bool mi_page_is_valid_init(mi_page_t* page) {
   mi_assert_internal(page->used <= page->capacity);
   mi_assert_internal(page->capacity <= page->reserved);
 
-  // const size_t bsize = mi_page_block_size(page);
-  // uint8_t* start = mi_page_start(page);
-  //mi_assert_internal(start + page->capacity*page->block_size == page->top);
-
   mi_assert_internal(mi_page_list_is_valid(page,page->free));
   mi_assert_internal(mi_page_list_is_valid(page,page->local_free));
 
-  #if MI_DEBUG>3 // generally too expensive to check this
+  #if MI_DEBUG>3
   if (page->free_is_zero) {
     const size_t ubsize = mi_page_usable_block_size(page);
     for(mi_block_t* block = page->free; block != NULL; block = mi_block_next(page,block)) {
@@ -112,8 +110,6 @@ static bool mi_page_is_valid_init(mi_page_t* page) {
   #if !MI_TRACK_ENABLED && !MI_TSAN
   mi_block_t* tfree = mi_page_thread_free(page);
   mi_assert_internal(mi_page_list_is_valid(page, tfree));
-  //size_t tfree_count = mi_page_list_count(page, tfree);
-  //mi_assert_internal(tfree_count <= page->thread_freed + 1);
   #endif
 
   size_t free_count = mi_page_list_count(page, page->free) + mi_page_list_count(page, page->local_free);
@@ -122,7 +118,7 @@ static bool mi_page_is_valid_init(mi_page_t* page) {
   return true;
 }
 
-extern mi_decl_hidden bool _mi_process_is_initialized;             // has mi_process_init been called?
+extern mi_decl_hidden bool _mi_process_is_initialized;
 
 bool _mi_page_is_valid(mi_page_t* page) {
   mi_assert_internal(mi_page_is_valid_init(page));
@@ -130,12 +126,10 @@ bool _mi_page_is_valid(mi_page_t* page) {
   mi_assert_internal(page->keys[0] != 0);
   #endif
   if (!mi_page_is_abandoned(page)) {
-    //mi_assert_internal(!_mi_process_is_initialized);
     {
       mi_page_queue_t* pq = mi_page_queue_of(page);
       mi_assert_internal(mi_page_queue_contains(pq, page));
       mi_assert_internal(pq->block_size==mi_page_block_size(page) || mi_page_is_huge(page) || mi_page_is_in_full(page));
-      // mi_assert_internal(mi_theap_contains_queue(mi_page_theap(page),pq));
     }
   }
   return true;
@@ -227,12 +221,6 @@ void _mi_page_free_collect(mi_page_t* page, bool force) {
   mi_assert_internal(!force || page->local_free == NULL);
 }
 
-// Collect elements in the thread-free list starting at `head`. This is an optimized
-// version of `_mi_page_free_collect` to be used from `free.c:_mi_free_collect_mt` that avoids atomic access to `xthread_free`.
-//
-// `head` must be in the `xthread_free` list. It will not collect `head` itself
-// so the `used` count is not fully updated in general. However, if the `head` is
-// the last remaining element, it will be collected and the used count will become `0` (so `mi_page_all_free` becomes true).
 void _mi_page_free_collect_partly(mi_page_t* page, mi_block_t* head) {
   if (head == NULL) return;
   mi_block_t* next = mi_block_next(page,head);
@@ -257,29 +245,10 @@ void _mi_page_free_collect_partly(mi_page_t* page, mi_block_t* head) {
   Page fresh and retire
 ----------------------------------------------------------- */
 
-/*
-// called from segments when reclaiming abandoned pages
-void _mi_page_reclaim(mi_theap_t* theap, mi_page_t* page) {
-  // mi_page_set_theap(page, theap);
-  // _mi_page_use_delayed_free(page, MI_USE_DELAYED_FREE, true); // override never (after theap is set)
-  _mi_page_free_collect(page, false); // ensure used count is up to date
-
-  mi_assert_expensive(mi_page_is_valid_init(page));
-  // mi_assert_internal(mi_page_theap(page) == theap);
-  // mi_assert_internal(mi_page_thread_free_flag(page) != MI_NEVER_DELAYED_FREE);
-
-  // TODO: push on full queue immediately if it is full?
-  mi_page_queue_t* pq = mi_theap_page_queue_of(theap, page);
-  mi_page_queue_push(theap, pq, page);
-  mi_assert_expensive(_mi_page_is_valid(page));
-}
-*/
-
-// called from `mi_free` on a reclaim, and fresh_alloc if we get an abandoned page
 void _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page)
 {
-  mi_assert_internal(_mi_is_aligned(page, MI_PAGE_ALIGN));
-  mi_assert_internal(_mi_ptr_page(page)==page);
+  mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
+  mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_is_abandoned(page));
 
@@ -406,13 +375,6 @@ void _mi_page_free(mi_page_t* page, mi_page_queue_t* pq) {
 #define MI_MAX_RETIRE_SIZE    MI_LARGE_OBJ_SIZE_MAX
 #define MI_RETIRE_CYCLES      (16)
 
-// Retire a page with no more used blocks
-// Important to not retire too quickly though as new
-// allocations might coming.
-//
-// Note: called from `mi_free` and benchmarks often
-// trigger this due to freeing everything and then
-// allocating again so careful when changing this.
 void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
   mi_assert_internal(page != NULL);
   mi_assert_expensive(_mi_page_is_valid(page));
@@ -471,29 +433,6 @@ void _mi_theap_collect_retired(mi_theap_t* theap, bool force) {
   theap->page_retired_min = min;
   theap->page_retired_max = max;
 }
-
-/*
-static void mi_theap_collect_full_pages(mi_theap_t* theap) {
-  // note: normally full pages get immediately abandoned and the full queue is always empty
-  // this path is only used if abandoning is disabled due to a destroy-able theap or options
-  // set by the user.
-  mi_page_queue_t* pq = &theap->pages[MI_BIN_FULL];
-  for (mi_page_t* page = pq->first; page != NULL; ) {
-    mi_page_t* next = page->next;         // get next in case we free the page
-    _mi_page_free_collect(page, false);   // register concurrent free's
-    // no longer full?
-    if (!mi_page_is_full(page)) {
-      if (mi_page_all_free(page)) {
-        _mi_page_free(page, pq);
-      }
-      else {
-        _mi_page_unfull(page);
-      }
-    }
-    page = next;
-  }
-}
-*/
 
 
 /* -----------------------------------------------------------
@@ -589,11 +528,6 @@ static mi_decl_noinline void mi_page_free_list_extend(mi_page_t* const page, con
 #define MI_MIN_EXTEND         (1)
 #endif
 
-// Extend the capacity (up to reserved) by initializing a free list
-// We do at most `MI_MAX_EXTEND` to avoid touching too much memory
-// Note: we also experimented with "bump" allocation on the first
-// allocations but this did not speed up any benchmark (due to an
-// extra test in malloc? or cache effects?)
 static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
   mi_assert_expensive(mi_page_is_valid_init(page));
   #if (MI_SECURE<3)
@@ -656,7 +590,7 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
 mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   mi_assert(page != NULL);
   mi_assert(theap!=NULL);
-  page->heap = (_mi_is_heap_main(theap->heap) ? NULL : theap->heap);
+  page->heap = (_mi_is_heap_main(_mi_theap_heap(theap)) ? NULL : _mi_theap_heap(theap));
   mi_page_set_theap(page, theap);
 
   size_t page_size;
@@ -943,8 +877,8 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
 
   mi_assert_internal(mi_page_immediate_available(page));
   mi_assert_internal(mi_page_block_size(page) >= size);
-  mi_assert_internal(_mi_is_aligned(page, MI_PAGE_ALIGN));
-  mi_assert_internal(_mi_ptr_page(page)==page);
+  mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
+  mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
 
   if (usable!=NULL) { *usable = mi_page_usable_block_size(page); }
   mi_prefetch_read(page->free);
