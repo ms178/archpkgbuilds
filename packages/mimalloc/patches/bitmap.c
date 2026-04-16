@@ -127,25 +127,18 @@ static inline void mi_bfield_atomic_clear_once_set(_Atomic(mi_bfield_t)*b, size_
   mi_assert_internal((old&mask)==mask);  // we should only clear when it was set
 }
 
-// Set a mask set of bits atomically, and return true of the mask bits transitioned from all 0's to 1's.
-// `already_set` contains the count of bits that were already set (used when committing ranges to account
-// statistics correctly).
-static inline bool mi_bfield_atomic_set_mask(_Atomic(mi_bfield_t)*b, mi_bfield_t mask, size_t* already_set) {
+static inline bool mi_bfield_atomic_set_mask(_Atomic(mi_bfield_t)* b, mi_bfield_t mask, size_t* already_set) {
   mi_assert_internal(mask != 0);
-  mi_bfield_t old = mi_atomic_load_relaxed(b);
-  while (!mi_atomic_cas_weak_acq_rel(b, &old, old|mask)) {}  // try to atomically set the mask bits until success
-  if (already_set!=NULL) { *already_set = mi_bfield_popcount(old&mask); }
-  return ((old&mask) == 0);
+  const mi_bfield_t old = mi_atomic_or_acq_rel(b, mask);
+  if (already_set != NULL) { *already_set = mi_bfield_popcount(old & mask); }
+  return ((old & mask) == 0);
 }
 
-// Clear a mask set of bits atomically, and return true of the mask bits transitioned from all 1's to 0's
-// `all_clear` is set to `true` if the new bfield became zero.
-static inline bool mi_bfield_atomic_clear_mask(_Atomic(mi_bfield_t)*b, mi_bfield_t mask, bool* all_clear) {
+static inline bool mi_bfield_atomic_clear_mask(_Atomic(mi_bfield_t)* b, mi_bfield_t mask, bool* all_clear) {
   mi_assert_internal(mask != 0);
-  mi_bfield_t old = mi_atomic_load_relaxed(b);
-  while (!mi_atomic_cas_weak_acq_rel(b, &old, old&~mask)) {}  // try to atomically clear the mask bits until success
-  if (all_clear != NULL) { *all_clear = ((old&~mask)==0); }
-  return ((old&mask) == mask);
+  const mi_bfield_t old = mi_atomic_and_acq_rel(b, ~mask);
+  if (all_clear != NULL) { *all_clear = ((old & ~mask) == 0); }
+  return ((old & mask) == mask);
 }
 
 static inline bool mi_bfield_atomic_setX(_Atomic(mi_bfield_t)*b, size_t* already_set) {
