@@ -27,6 +27,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <inttypes.h>
 
 #include "spirv/unified1/spirv.h"
@@ -100,9 +101,6 @@ static bool vkd3d_shader_replace_path(const char *filename, vkd3d_shader_hash_t 
 
     file_len = ftell(f);
     if (file_len < (long)(5 * sizeof(uint32_t)))
-        goto err;
-
-    if ((unsigned long)file_len > SIZE_MAX)
         goto err;
 
     len = (size_t)file_len;
@@ -500,6 +498,26 @@ static const struct vkd3d_shader_quirk_mapping
 };
 #undef ENTRY
 
+static int vkd3d_shader_quirk_entry_compare(const void *a, const void *b)
+{
+    const struct vkd3d_shader_quirk_entry *ea = a;
+    const struct vkd3d_shader_quirk_entry *eb = b;
+
+    if (ea->lo < eb->lo)
+        return -1;
+    if (ea->lo > eb->lo)
+        return 1;
+    if (ea->hi < eb->hi)
+        return -1;
+    if (ea->hi > eb->hi)
+        return 1;
+    if (ea->quirks < eb->quirks)
+        return -1;
+    if (ea->quirks > eb->quirks)
+        return 1;
+    return 0;
+}
+
 static void vkd3d_shader_update_revision(void)
 {
     vkd3d_shader_hash_t quirk_hash = hash_fnv1_init();
@@ -566,19 +584,31 @@ static void vkd3d_shader_init_quirk_table(void)
 
         if (!vkd3d_array_reserve((void **)&vkd3d_shader_quirk_entries, &size,
                 vkd3d_shader_quirk_entry_count + 1, sizeof(*vkd3d_shader_quirk_entries)))
+        {
+            ERR("Out of memory while growing shader quirk table, parsed %zu entries.\n",
+                    vkd3d_shader_quirk_entry_count);
             break;
+        }
 
         vkd3d_shader_quirk_entries[vkd3d_shader_quirk_entry_count++] = entry;
     }
 
     fclose(file);
+
+    if (vkd3d_shader_quirk_entry_count > 1)
+    {
+        qsort(vkd3d_shader_quirk_entries, vkd3d_shader_quirk_entry_count,
+                sizeof(*vkd3d_shader_quirk_entries), vkd3d_shader_quirk_entry_compare);
+    }
+
     vkd3d_shader_update_revision();
 }
 
 static pthread_once_t vkd3d_shader_quirk_once = PTHREAD_ONCE_INIT;
 
 vkd3d_shader_quirks_t vkd3d_shader_compile_arguments_select_quirks(
-        const struct vkd3d_shader_compile_arguments *compile_args, vkd3d_shader_hash_t shader_hash)
+        const struct vkd3d_shader_compile_arguments *compile_args,
+        vkd3d_shader_hash_t shader_hash, const char *entry)
 {
     vkd3d_shader_quirks_t quirks = 0;
     size_t i;
@@ -587,18 +617,43 @@ vkd3d_shader_quirks_t vkd3d_shader_compile_arguments_select_quirks(
 
     for (i = 0; i < vkd3d_shader_quirk_entry_count; ++i)
     {
-        if (vkd3d_shader_quirk_entries[i].lo <= shader_hash && vkd3d_shader_quirk_entries[i].hi >= shader_hash)
-            quirks |= vkd3d_shader_quirk_entries[i].quirks;
+        const struct vkd3d_shader_quirk_entry *quirk_entry = &vkd3d_shader_quirk_entries[i];
+
+        if (quirk_entry->lo > shader_hash)
+            break;
+
+        if (quirk_entry->hi >= shader_hash)
+            quirks |= quirk_entry->quirks;
     }
 
-    if (compile_args && compile_args->quirks)
+    if (!compile_args || !compile_args->quirks)
+        return quirks;
+
+    quirks |= compile_args->quirks->global_quirks;
+
+    if (compile_args->quirks->num_entry_points && !compile_args->quirks->entry_points)
     {
-        for (i = 0; i < compile_args->quirks->num_hashes; ++i)
-            if (compile_args->quirks->hashes[i].shader_hash == shader_hash)
-                return quirks | compile_args->quirks->hashes[i].quirks | compile_args->quirks->global_quirks;
-        return quirks | compile_args->quirks->default_quirks | compile_args->quirks->global_quirks;
+        WARN("compile_args->quirks has num_entry_points=%zu but entry_points is NULL.\n",
+                compile_args->quirks->num_entry_points);
+        return quirks | compile_args->quirks->default_quirks;
     }
-    return quirks;
+
+    for (i = 0; i < compile_args->quirks->num_entry_points; ++i)
+    {
+        vkd3d_shader_hash_t entry_hash = compile_args->quirks->entry_points[i].shader_hash;
+        const char *quirk_entry_name = compile_args->quirks->entry_points[i].entry;
+
+        if (entry_hash == shader_hash)
+            return quirks | compile_args->quirks->entry_points[i].quirks;
+
+        if (entry && quirk_entry_name && !strcmp(entry, quirk_entry_name))
+        {
+            if (!entry_hash || entry_hash == shader_hash)
+                return quirks | compile_args->quirks->entry_points[i].quirks;
+        }
+    }
+
+    return quirks | compile_args->quirks->default_quirks;
 }
 
 uint64_t vkd3d_shader_get_revision(void)
@@ -611,6 +666,7 @@ struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_append(struct vkd3
         const char *semantic_name, unsigned int semantic_index)
 {
     struct vkd3d_shader_stage_io_entry *e;
+    char *semantic_name_copy;
 
     if (!map || !semantic_name)
         return NULL;
@@ -618,12 +674,19 @@ struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_append(struct vkd3
     if (vkd3d_shader_stage_io_map_find(map, semantic_name, semantic_index))
         return NULL;
 
-    if (!vkd3d_array_reserve((void **)&map->entries, &map->entries_size,
-            map->entry_count + 1, sizeof(*map->entries)))
+    semantic_name_copy = vkd3d_strdup(semantic_name);
+    if (!semantic_name_copy)
         return NULL;
 
+    if (!vkd3d_array_reserve((void **)&map->entries, &map->entries_size,
+            map->entry_count + 1, sizeof(*map->entries)))
+    {
+        vkd3d_free(semantic_name_copy);
+        return NULL;
+    }
+
     e = &map->entries[map->entry_count++];
-    e->semantic_name = vkd3d_strdup(semantic_name);
+    e->semantic_name = semantic_name_copy;
     e->semantic_index = semantic_index;
     return e;
 }
@@ -639,6 +702,10 @@ const struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_find(const s
     for (i = 0; i < map->entry_count; ++i)
     {
         const struct vkd3d_shader_stage_io_entry *e = &map->entries[i];
+
+        if (!e->semantic_name)
+            continue;
+
         if (e->semantic_index == semantic_index && !strcmp(e->semantic_name, semantic_name))
             return e;
     }
@@ -827,7 +894,7 @@ void vkd3d_shader_extract_feature_meta(struct vkd3d_shader_code *code)
 
     spirv = code->code;
     spirv_words = code->size / sizeof(uint32_t);
-    code->meta.gs_input_topology = 0;   /* prevent stale data across re-use */
+    code->meta.gs_input_topology = 0;
 
     while (offset < spirv_words)
     {
@@ -843,7 +910,6 @@ void vkd3d_shader_extract_feature_meta(struct vkd3d_shader_code *code)
             if (count == 2)
             {
                 uint32_t cap = spirv[offset + 1];
-                /* Most frequent first for branch predictor (Intel Golden Cove, Agner Fog) */
                 if (cap == SpvCapabilityGroupNonUniform || cap == SpvCapabilityGroupNonUniformVote ||
                     cap == SpvCapabilityGroupNonUniformArithmetic || cap == SpvCapabilityGroupNonUniformBallot ||
                     cap == SpvCapabilityGroupNonUniformShuffle || cap == SpvCapabilityGroupNonUniformShuffleRelative ||
@@ -974,6 +1040,7 @@ void vkd3d_shader_extract_feature_meta(struct vkd3d_shader_code *code)
 
         offset += count;
     }
+
 done:
     code->meta.flags |= meta;
 }
