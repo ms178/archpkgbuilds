@@ -394,7 +394,7 @@ amdgpu_winsys_create(int fd, const struct pipe_screen_config *config,
 {
    struct amdgpu_screen_winsys *sws;
    struct amdgpu_winsys *aws;
-   ac_drm_device *dev = NULL;
+   ac_drm_device *dev;
    uint32_t drm_major, drm_minor;
    int r;
 
@@ -412,7 +412,8 @@ amdgpu_winsys_create(int fd, const struct pipe_screen_config *config,
 
    /* Initialize the amdgpu device. This should always return the same pointer
     * for the same fd. */
-   if (drmGetNodeTypeFromFd(fd) != DRM_NODE_RENDER) {
+   r = ac_drm_device_initialize(fd, is_virtio, &drm_major, &drm_minor, &dev);
+   if (r == -EACCES && drmGetNodeTypeFromFd(fd) != DRM_NODE_RENDER) {
       char *render_device = drmGetRenderDeviceNameFromFd(fd);
 
       if (render_device) {
@@ -431,12 +432,9 @@ amdgpu_winsys_create(int fd, const struct pipe_screen_config *config,
       }
    }
 
-   if (!dev) {
-      r = ac_drm_device_initialize(fd, is_virtio, &drm_major, &drm_minor, &dev);
-      if (r) {
-         mesa_loge("amdgpu: amd%s_device_initialize failed.\n", is_virtio ? "vgpu" : "gpu");
-         goto fail;
-      }
+   if (r) {
+      mesa_loge("amdgpu: amd%s_device_initialize failed.\n", is_virtio ? "vgpu" : "gpu");
+      goto fail;
    }
 
    /* Lookup a winsys if we have already created one for this device. */
