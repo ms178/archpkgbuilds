@@ -259,10 +259,15 @@ struct radv_descriptor_state {
    struct radv_push_descriptor_set push_set;
    uint32_t dynamic_buffers[4 * MAX_DYNAMIC_BUFFERS];
    uint32_t dynamic_offset_count;
+   bool need_dynamic_descriptors_offset_addr;
+   uint32_t dynamic_descriptors_offsets[MAX_SETS];
    bool dirty_dynamic;
    uint64_t descriptor_buffers[MAX_SETS];
    bool need_indirect_descriptors;
    uint64_t indirect_descriptor_sets_va;
+
+   uint8_t dirty_heaps;
+   uint8_t valid_heaps;
 };
 
 struct radv_push_constant_state {
@@ -296,6 +301,37 @@ enum radv_depth_clamp_mode {
    RADV_DEPTH_CLAMP_MODE_DISABLED = 3,     /* Disable depth clamping */
 };
 
+struct radv_meta_saved_descriptor_state {
+   struct radv_descriptor_set *old_descriptor_set0;
+   bool old_descriptor_set0_valid;
+   uint64_t old_descriptor_buffer0;
+   uint8_t old_descriptor_heaps_dirty;
+};
+
+struct radv_meta_saved_state {
+   uint32_t flags;
+
+   struct radv_meta_saved_descriptor_state graphics_descriptors;
+   struct radv_meta_saved_descriptor_state compute_descriptors;
+
+   uint64_t old_descriptor_buffer_addr0;
+
+   struct radv_graphics_pipeline *old_graphics_pipeline;
+   struct radv_compute_pipeline *old_compute_pipeline;
+   struct radv_dynamic_state dynamic;
+
+   struct radv_shader_object *old_shader_objs[MESA_VULKAN_SHADER_STAGES];
+
+   char push_constants[MAX_PUSH_CONSTANTS_SIZE];
+
+   unsigned active_emulated_pipeline_queries;
+   unsigned active_emulated_prims_gen_queries;
+   unsigned active_emulated_prims_xfb_queries;
+   unsigned active_occlusion_queries;
+
+   bool inside_meta_op;
+};
+
 struct radv_cmd_state {
    /* Vertex descriptors */
    uint64_t vb_va;
@@ -326,6 +362,8 @@ struct radv_cmd_state {
 
    struct radv_rendering_state render;
 
+   struct radv_meta_saved_state meta;
+
    /* Index buffer */
    uint32_t index_type;
    uint32_t max_index_count;
@@ -334,7 +372,8 @@ struct radv_cmd_state {
 
    /* Primitive restart */
    int32_t last_primitive_restart_en;
-   uint32_t last_primitive_reset_index;
+   uint32_t primitive_restart_index;
+   uint32_t last_primitive_restart_index;
 
    enum radv_cmd_flush_bits flush_bits;
    unsigned active_occlusion_queries;
@@ -502,6 +541,7 @@ struct radv_cmd_buffer {
    struct radv_push_constant_state push_constant_state[MAX_BIND_POINTS];
 
    uint64_t descriptor_buffers[MAX_SETS];
+   uint64_t descriptor_heaps[RADV_MAX_HEAPS];
 
    struct radv_cmd_buffer_upload upload;
 
