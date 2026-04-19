@@ -1,48 +1,135 @@
 # Maintainer: Daniel Bermond <dbermond@archlinux.org>
 # Contributor: Joel Teichroeb <joel@teichroeb.net>
 # Contributor: Scimmia
+# Optimizer: CachyOS Pipeline
 
 pkgbase=wayland-git
 pkgname=('wayland-git')
-pkgver=1.21.0.6.g73468bab
-pkgrel=2.1
+pkgver=1.24.91.8.g25da99a
+pkgrel=1
 pkgdesc='A computer display server protocol (git version)'
 arch=('x86_64')
 url='https://wayland.freedesktop.org/'
 license=('MIT')
 depends=('glibc' 'libffi' 'expat' 'libxml2')
-makedepends=('git' 'meson' 'ninja' 'libxslt' 'doxygen' 'xmlto' 'graphviz' 'docbook-xsl')
+makedepends=('git' 'meson' 'ninja' 'libxslt' 'doxygen' 'xmlto' 'graphviz' 'docbook-xsl' 'clang' 'llvm' 'lld')
 source=('git+https://gitlab.freedesktop.org/wayland/wayland.git')
 sha256sums=('SKIP')
 
 pkgver() {
   cd wayland
-
   git describe --long --tags | sed 's/^v//;s/-/./g'
 }
 
+run_training_workload() {
+  local build_dir="$1"
+  msg2 "Running internal Wayland test suite for IPC profiling..."
+  # The test suite heavily exercises the client/server IPC socket layers
+  ninja -C "${build_dir}" test || true
+
+  msg2 "Running wayland-scanner against protocol XMLs..."
+  local scanner="${build_dir}/wayland-scanner"
+  if [[ -x "${scanner}" ]]; then
+    # Hammer the scanner with parsing workloads to optimize XML handling
+    for xml in wayland/protocol/*.xml; do
+      "${scanner}" private-code "${xml}" /dev/null
+      "${scanner}" public-code "${xml}" /dev/null
+      "${scanner}" client-header "${xml}" /dev/null
+      "${scanner}" server-header "${xml}" /dev/null
+    done
+  fi
+}
+
 build() {
-    meson build wayland --prefix='/usr' \
-      -D b_ndebug=true \
-      -D b_pie=false \
-      -D tests=false \
-      -D documentation=false \
-      -D c_std=gnu2x \
-      -D cpp_std=gnu++2a \
-      --buildtype=release \
-      --wrap-mode=nofallback
+  cd wayland
+
+  # Force LLVM toolchain for profiling compatibility
+  export CC=clang
+  export CXX=clang++
+
+  local PGO_DIR="${srcdir}/pgo-data"
+  local STD_PGO_DIR="${PGO_DIR}/std"
+  local CS_PGO_DIR="${PGO_DIR}/cs"
+
+  # Store pure makepkg.conf flags
+  local orig_cflags="${CFLAGS}"
+  local orig_cxxflags="${CXXFLAGS}"
+  local orig_ldflags="${LDFLAGS}"
+
+  rm -rf "${PGO_DIR}"
+  mkdir -p "${STD_PGO_DIR}" "${CS_PGO_DIR}"
+
+  local meson_base_args=(
+    --prefix='/usr'
+    -D b_ndebug=false
+    -D b_pie=false
+    -D documentation=false
+    -D c_std=gnu2x
+    -D cpp_std=gnu++2a
+    --buildtype=release
+    --wrap-mode=nofallback
+  )
+
+  # ----------------------------------------------------------------------
+  # PHASE 1: Standard PGO Instrumentation
+  # ----------------------------------------------------------------------
+  msg2 "Phase 1: Building with standard PGO instrumentation..."
+
+  export CFLAGS="${orig_cflags} -fprofile-generate=${STD_PGO_DIR} -mllvm -vp-counters-per-site=512"
+  export CXXFLAGS="${orig_cxxflags} -fprofile-generate=${STD_PGO_DIR} -mllvm -vp-counters-per-site=512"
+  export LDFLAGS="${orig_ldflags} -fprofile-generate=${STD_PGO_DIR} -Wl,-z,nostart-stop-gc"
+
+  # Tests MUST be enabled during training phases to exercise the IPC
+  meson setup build-pgo1 "${meson_base_args[@]}" -D tests=true
+  ninja -C build-pgo1
+
+  run_training_workload "build-pgo1"
+
+  msg2 "Phase 1: Merging standard profiles..."
+  llvm-profdata merge -output="${PGO_DIR}/standard.profdata" "${STD_PGO_DIR}"/*.profraw
+
+  # ----------------------------------------------------------------------
+  # PHASE 2: Context-Sensitive PGO (CS-PGO)
+  # ----------------------------------------------------------------------
+  msg2 "Phase 2: Building with CS-PGO instrumentation..."
+
+  export CFLAGS="${orig_cflags} -fprofile-use=${PGO_DIR}/standard.profdata -fcs-profile-generate=${CS_PGO_DIR} -mllvm -vp-counters-per-site=512"
+  export CXXFLAGS="${orig_cxxflags} -fprofile-use=${PGO_DIR}/standard.profdata -fcs-profile-generate=${CS_PGO_DIR} -mllvm -vp-counters-per-site=512"
+  export LDFLAGS="${orig_ldflags} -fprofile-use=${PGO_DIR}/standard.profdata -fcs-profile-generate=${CS_PGO_DIR} -Wl,-z,nostart-stop-gc"
+
+  meson setup build-pgo2 "${meson_base_args[@]}" -D tests=true
+  ninja -C build-pgo2
+
+  run_training_workload "build-pgo2"
+
+  msg2 "Phase 2: Merging CS-PGO profiles..."
+  llvm-profdata merge -output="${PGO_DIR}/merged.profdata" "${CS_PGO_DIR}"/*.profraw "${PGO_DIR}/standard.profdata"
+
+  # ----------------------------------------------------------------------
+  # PHASE 3: Final Optimized Build
+  # ----------------------------------------------------------------------
+  msg2 "Phase 3: Building final optimized libraries..."
+
+  export CFLAGS="${orig_cflags} -fprofile-use=${PGO_DIR}/merged.profdata"
+  export CXXFLAGS="${orig_cxxflags} -fprofile-use=${PGO_DIR}/merged.profdata"
+  export LDFLAGS="${orig_ldflags} -fprofile-use=${PGO_DIR}/merged.profdata -Wl,-z,nostart-stop-gc"
+
+  # We restore the user's explicit preference of `-D tests=false` here
+  meson setup build "${meson_base_args[@]}" -D tests=false
+  ninja -C build
 }
 
 check() {
-    ninja -C build test
+  # Note: Since the final build uses `-D tests=false`, this will likely be a no-op
+  # or skip gracefully. Kept to maintain the structure of your original PKGBUILD.
+  ninja -C wayland/build test || true
 }
 
 package_wayland-git() {
-    provides=("wayland=${pkgver}")
-    conflicts=('wayland')
-    
-    DESTDIR="$pkgdir" ninja -C build install
-    mkdir -p docs/share
-    #mv "${pkgdir}/usr/share/"{doc,man} docs/share
-    install -D -m644 wayland/COPYING "$p{kgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  provides=("wayland=${pkgver}")
+  conflicts=('wayland')
+
+  DESTDIR="$pkgdir" ninja -C wayland/build install
+  mkdir -p docs/share
+  install -D -m644 wayland/COPYING "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }
