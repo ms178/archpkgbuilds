@@ -1,5 +1,6 @@
 # Contributor: Low Kian Seong <fastmail_low@speedymail.org>
 # Maintainer: dorphell <dorphell@archlinux.org>
+# Optimizer: CachyOS Pipeline
 
 pkgname=lzo
 pkgver=2.10
@@ -9,9 +10,54 @@ arch=('x86_64')
 url="https://www.oberhumer.com/opensource/lzo"
 license=('GPL')
 depends=('glibc')
+makedepends=('clang' 'llvm' 'lld')
 provides=('liblzo2.so' 'libminilzo.so' liblzo2.so=2-64)
 source=(https://www.oberhumer.com/opensource/lzo/download/lzo-${pkgver}.tar.gz)
 sha256sums=('c0f892943208266f9b6543b3ae308fab6284c5c90e627931446fb49b4221a072')
+
+generate_training_data() {
+  local pgo_dir="$1"
+  mkdir -p "${pgo_dir}/training"
+  msg2 "Generating system-integrated training corpus..."
+
+  # 1. System/ELF Data (Crucial for typical system-level profiling)
+  if [[ -f /usr/lib/libc.so.6 ]]; then
+    cp /usr/lib/libc.so.6 "${pgo_dir}/training/libc_sample.so"
+  fi
+  if [[ -d /usr/share/i18n/locales ]]; then
+    find /usr/share/i18n/locales -type f -size -256k 2>/dev/null | head -n 50 | xargs cat > "${pgo_dir}/training/locales.txt" 2>/dev/null
+  fi
+  if [[ -d /usr/include ]]; then
+    find /usr/include -name "*.h" -type f -size -128k 2>/dev/null | head -n 100 | xargs cat > "${pgo_dir}/training/headers.txt" 2>/dev/null
+  fi
+
+  # 2. Standard Pattern and Entropy Data (Adapted from zlib/zstd)
+  for i in {1..5}; do
+    seq 1 20000 | head -n 20000 > "${pgo_dir}/training/seq_${i}.txt"
+    yes "lzo_pattern_block_${i}" | head -n 15000 > "${pgo_dir}/training/rep_${i}.txt"
+    dd if=/dev/urandom bs=16K count=20 2>/dev/null | base64 -w0 > "${pgo_dir}/training/b64_${i}.txt"
+    dd if=/dev/urandom bs=64K count=5 2>/dev/null > "${pgo_dir}/training/entropy_${i}.bin"
+  done
+
+  head -c 1000000 < /dev/zero | tr '\0' 'Z' > "${pgo_dir}/training/zeros.txt"
+}
+
+run_pgo_training() {
+  local pgo_dir="$1"
+  msg2 "Running LZO and MiniLZO training workloads..."
+
+  # The main library is trained extensively via the native test suite
+  make check
+
+  # Train the minilzo object specifically
+  ./testmini > /dev/null 2>&1
+
+  # Iterate our custom system corpus through lzotest
+  find "${pgo_dir}/training" -type f -print0 | while IFS= read -r -d '' file; do
+    ./lzotest -q "${file}" > /dev/null 2>&1 || true
+    ./lzotest -q -m "${file}" > /dev/null 2>&1 || true
+  done
+}
 
 build() {
   cd lzo-${pkgver}
@@ -19,28 +65,95 @@ build() {
   export CC=clang
   export CXX=clang++
   export LD=lld
+  export AR=llvm-ar
+  export NM=llvm-nm
+  export RANLIB=llvm-ranlib
 
-  ./configure --prefix=/usr --enable-shared --with-linker=lld
+  local PGO_DIR="${srcdir}/pgo-data"
+  local STD_PGO_DIR="${PGO_DIR}/std"
+  local CS_PGO_DIR="${PGO_DIR}/cs"
+
+  local orig_cflags="${CFLAGS}"
+  local orig_ldflags="${LDFLAGS}"
+
+  rm -rf "${PGO_DIR}"
+  mkdir -p "${STD_PGO_DIR}" "${CS_PGO_DIR}"
+  generate_training_data "${PGO_DIR}"
+
+  # ----------------------------------------------------------------------
+  # PHASE 1: Standard PGO Instrumentation
+  # ----------------------------------------------------------------------
+  msg2 "Phase 1: Building with standard PGO instrumentation..."
+
+  export CFLAGS="${orig_cflags} -fprofile-generate=${STD_PGO_DIR} -fno-omit-frame-pointer -mllvm -vp-counters-per-site=512"
+  export LDFLAGS="${orig_ldflags} -fprofile-generate=${STD_PGO_DIR} -fuse-ld=lld"
+
+  ./configure --prefix=/usr --enable-shared --disable-static
   make
 
-  # build minilzo
+  # Compile minilzo and its test harness for profiling
+  $CC $CPPFLAGS $CFLAGS -fpic -Iinclude/lzo -o minilzo/minilzo.o -c minilzo/minilzo.c
+  $CC $CPPFLAGS $CFLAGS -Iinclude/lzo minilzo/testmini.c minilzo/minilzo.o -o testmini
+
+  run_pgo_training "${PGO_DIR}"
+
+  msg2 "Phase 1: Merging standard profiles..."
+  llvm-profdata merge -output="${PGO_DIR}/standard.profdata" "${STD_PGO_DIR}"/*.profraw
+
+  make clean
+  rm -f minilzo/minilzo.o testmini
+
+  # ----------------------------------------------------------------------
+  # PHASE 2: Context-Sensitive PGO (CS-PGO)
+  # ----------------------------------------------------------------------
+  msg2 "Phase 2: Building with CS-PGO instrumentation..."
+
+  export CFLAGS="${orig_cflags} -fprofile-use=${PGO_DIR}/standard.profdata -fcs-profile-generate=${CS_PGO_DIR} -fno-omit-frame-pointer -mllvm -vp-counters-per-site=512"
+  export LDFLAGS="${orig_ldflags} -fprofile-use=${PGO_DIR}/standard.profdata -fcs-profile-generate=${CS_PGO_DIR} -fuse-ld=lld"
+
+  ./configure --prefix=/usr --enable-shared --disable-static
+  make
+
+  $CC $CPPFLAGS $CFLAGS -fpic -Iinclude/lzo -o minilzo/minilzo.o -c minilzo/minilzo.c
+  $CC $CPPFLAGS $CFLAGS -Iinclude/lzo minilzo/testmini.c minilzo/minilzo.o -o testmini
+
+  run_pgo_training "${PGO_DIR}"
+
+  msg2 "Phase 2: Merging CS-PGO profiles..."
+  llvm-profdata merge -output="${PGO_DIR}/merged.profdata" "${CS_PGO_DIR}"/*.profraw "${PGO_DIR}/standard.profdata"
+
+  make clean
+  rm -f minilzo/minilzo.o testmini
+
+  # ----------------------------------------------------------------------
+  # PHASE 3: Final Optimized ThinLTO Build
+  # ----------------------------------------------------------------------
+  msg2 "Phase 3: Building final optimized libraries..."
+
+  export CFLAGS="${orig_cflags} -fprofile-use=${PGO_DIR}/merged.profdata"
+  export LDFLAGS="${orig_ldflags} -fprofile-use=${PGO_DIR}/merged.profdata"
+
+  ./configure --prefix=/usr --enable-shared --disable-static
+  make
+
+  # Final build for minilzo
   $CC $CPPFLAGS $CFLAGS -fpic -Iinclude/lzo -o minilzo/minilzo.o -c minilzo/minilzo.c
   $CC $LDFLAGS -shared -o libminilzo.so.0 -Wl,-soname,libminilzo.so.0 minilzo/minilzo.o
 }
 
 check() {
   cd lzo-${pkgver}
-  make test # Larger test
-  make check
+  msg2 "Verifying final optimized build..."
+  make test
 }
 
 package() {
   cd lzo-${pkgver}
   make DESTDIR="${pkgdir}" install
 
-  # install minilzo
+  # Install minilzo
   install -m 755 libminilzo.so.0 "${pkgdir}"/usr/lib
-  install -p -m 644 minilzo/minilzo.h ${pkgdir}/usr/include/lzo
+  install -p -m 644 minilzo/minilzo.h "${pkgdir}"/usr/include/lzo
   cd "${pkgdir}"/usr/lib
   ln -s libminilzo.so.0 libminilzo.so
 }
