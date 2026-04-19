@@ -37,8 +37,11 @@ struct asm_context {
    std::unordered_map<unsigned, constaddr_info> constaddrs;
    std::unordered_map<unsigned, constaddr_info> resumeaddrs;
    std::vector<struct aco_symbol>* symbols;
-   uint32_t loop_header = UINT32_MAX;
+
+   /* Keep proven loop-tracking semantics used by align_block()/emit_loop_latch() */
+   uint32_t loop_latch = UINT32_MAX;
    uint32_t loop_exit = UINT32_MAX;
+
    const int16_t* opcode;
    int subvector_begin_pos = -1;
 
@@ -59,7 +62,8 @@ struct asm_context {
          opcode = &instr_info.opcode_gfx12[0];
    }
 
-   void reserve_counts(size_t branch_reserve, size_t constaddr_reserve, size_t resumeaddr_reserve)
+   ALWAYS_INLINE void reserve_counts(size_t branch_reserve, size_t constaddr_reserve,
+                                     size_t resumeaddr_reserve)
    {
       const size_t branch_cap = branch_reserve + branch_reserve / 2u + 8u;
       branches.reserve(branch_cap);
@@ -301,20 +305,20 @@ emit_smem_instruction(asm_context& ctx, std::vector<uint32_t>& out, const Instru
 
    /* GFX8/GFX9 encoding - this is the hot path for Vega 64 */
    if (gfx <= GFX9) [[likely]] {
-      encoding = (0b110000u << 26);
-      assert(!dlc); /* DLC not supported on GFX8/9 */
+         encoding = (0b110000u << 26);
+         assert(!dlc); /* DLC not supported on GFX8/9 */
    } else {
-      encoding = (0b111101u << 26);
-      if (gfx < GFX12)
-         encoding |= dlc ? 1u << (gfx >= GFX11 ? 13 : 14) : 0;
+         encoding = (0b111101u << 26);
+         if (gfx < GFX12)
+               encoding |= dlc ? 1u << (gfx >= GFX11 ? 13 : 14) : 0;
    }
 
    if (gfx < GFX12) [[likely]] {
-      encoding |= opcode << 18;
-      encoding |= glc ? 1u << (gfx >= GFX11 ? 14 : 16) : 0;
+         encoding |= opcode << 18;
+         encoding |= glc ? 1u << (gfx >= GFX11 ? 14 : 16) : 0;
    } else {
-      encoding |= opcode << 13;
-      encoding |= get_gfx12_cpol(smem) << 21;
+         encoding |= opcode << 13;
+         encoding |= get_gfx12_cpol(smem) << 21;
    }
 
    if (gfx <= GFX9) [[likely]] {
@@ -1449,6 +1453,8 @@ emit_instruction(asm_context& ctx, std::vector<uint32_t>& out, Instruction* inst
 void
 emit_block(asm_context& ctx, std::vector<uint32_t>& out, Block& block)
 {
+   block.offset = out.size();
+
    for (aco_ptr<Instruction>& instr : block.instructions) {
 #if 0
       int start_idx = out.size();
@@ -1459,8 +1465,30 @@ emit_block(asm_context& ctx, std::vector<uint32_t>& out, Block& block)
       emit_instruction(ctx, out, instr.get());
 #if 0
       for (int i = start_idx; i < out.size(); i++)
-         std::cerr << "encoding: " << "0x" << std::setfill('0') << std::setw(8) << std::hex << out[i] << std::endl;
+         std::cerr << "encoding: "
+                   << "0x" << std::setfill('0') << std::setw(8) << std::hex << out[i]
+                   << std::endl;
 #endif
+   }
+}
+
+void
+emit_loop_latch(asm_context& ctx, std::vector<uint32_t>& code, Block& block)
+{
+   if (block.linear_preds.size() == 1)
+      return;
+
+   if (block.kind & block_kind_loop_latch)
+      return;
+
+   unsigned i = block.index;
+   while (ctx.program->blocks[i].loop_nest_depth >= block.loop_nest_depth) {
+      Block& latch_block = ctx.program->blocks[i++];
+      if (latch_block.loop_nest_depth == block.loop_nest_depth &&
+          (latch_block.kind & block_kind_loop_latch)) {
+         emit_block(ctx, code, latch_block);
+         break;
+      }
    }
 }
 
@@ -1723,27 +1751,27 @@ fix_constaddrs(asm_context& ctx, std::vector<uint32_t>& out)
 void
 align_block(asm_context& ctx, std::vector<uint32_t>& code, Block& block)
 {
-   if (ctx.loop_header != -1u &&
-       block.loop_nest_depth < ctx.program->blocks[ctx.loop_header].loop_nest_depth) {
-      assert(ctx.loop_exit != -1u);
-      Block& loop_header = ctx.program->blocks[ctx.loop_header];
+   if (ctx.loop_latch != UINT32_MAX &&
+       block.loop_nest_depth < ctx.program->blocks[ctx.loop_latch].loop_nest_depth) {
+      assert(ctx.loop_exit != UINT32_MAX);
+      Block& loop_latch = ctx.program->blocks[ctx.loop_latch];
       Block& loop_exit = ctx.program->blocks[ctx.loop_exit];
-      ctx.loop_header = -1u;
-      ctx.loop_exit = -1u;
+      ctx.loop_latch = UINT32_MAX;
+      ctx.loop_exit = UINT32_MAX;
       std::vector<uint32_t> nops;
 
-      const unsigned loop_num_cl = DIV_ROUND_UP(block.offset - loop_header.offset, 16);
+      const unsigned loop_num_cl = DIV_ROUND_UP(code.size() - loop_latch.offset, 16);
 
       const bool change_prefetch = ctx.program->gfx_level >= GFX10_3 &&
-                                   ctx.program->gfx_level <= GFX11 && loop_num_cl > 1 &&
-                                   loop_num_cl <= 3;
+                                   ctx.program->gfx_level <= GFX11 &&
+                                   loop_num_cl > 1 && loop_num_cl <= 3;
 
       if (change_prefetch) {
-         Builder bld(ctx.program, &ctx.program->blocks[loop_header.linear_preds[0]]);
+         Builder bld(ctx.program, &ctx.program->blocks[loop_latch.linear_preds[0]]);
          int16_t prefetch_mode = loop_num_cl == 3 ? 0x1 : 0x2;
          Instruction* instr = bld.sopp(aco_opcode::s_inst_prefetch, prefetch_mode);
          emit_instruction(ctx, nops, instr);
-         insert_code(ctx, code, loop_header.offset, nops.size(), nops.data());
+         insert_code(ctx, code, loop_latch.offset, nops.size(), nops.data());
 
          bld.reset(&loop_exit.instructions, loop_exit.instructions.begin());
          instr = bld.sopp(aco_opcode::s_inst_prefetch, 0x3);
@@ -1751,33 +1779,41 @@ align_block(asm_context& ctx, std::vector<uint32_t>& code, Block& block)
             nops.clear();
             emit_instruction(ctx, nops, instr);
             insert_code(ctx, code, loop_exit.offset, nops.size(), nops.data());
+         } else {
+            nops.clear();
+            emit_instruction(ctx, nops, instr);
          }
       }
 
-      const unsigned loop_start_cl = loop_header.offset >> 4;
-      const unsigned loop_end_cl = (block.offset - 1) >> 4;
+      const unsigned loop_start_cl = loop_latch.offset >> 4;
+      const unsigned loop_end_cl = (code.size() - 1) >> 4;
 
       const bool align_loop = loop_end_cl - loop_start_cl >= loop_num_cl &&
-                              (loop_num_cl == 1 || change_prefetch || loop_header.offset % 16 > 8);
+                              (loop_num_cl == 1 || change_prefetch || loop_latch.offset % 16 > 8);
 
       if (align_loop) {
          nops.clear();
-         nops.resize(16 - (loop_header.offset % 16), 0xbf800000u);
-         insert_code(ctx, code, loop_header.offset, nops.size(), nops.data());
+         nops.resize(16 - (loop_latch.offset % 16), 0xbf800000u);
+         insert_code(ctx, code, loop_latch.offset, nops.size(), nops.data());
       }
    }
 
    if (block.kind & block_kind_loop_header) {
       if (block.linear_preds.size() > 1) {
-         ctx.loop_header = block.index;
-         ctx.loop_exit = -1u;
+         ctx.loop_latch = block.index;
+         ctx.loop_exit = UINT32_MAX;
       }
    }
 
-   if (ctx.loop_header != -1u && ctx.loop_exit == -1u) {
+   if (ctx.loop_latch != UINT32_MAX && (block.kind & block_kind_loop_latch)) {
+      if (ctx.program->blocks[ctx.loop_latch].loop_nest_depth == block.loop_nest_depth)
+         ctx.loop_latch = block.index;
+   }
+
+   if (ctx.loop_latch != UINT32_MAX && ctx.loop_exit == UINT32_MAX) {
       for (uint32_t succ_idx : block.linear_succs) {
          Block& succ = ctx.program->blocks[succ_idx];
-         if (succ.loop_nest_depth < ctx.program->blocks[ctx.loop_header].loop_nest_depth)
+         if (succ.loop_nest_depth < ctx.program->blocks[ctx.loop_latch].loop_nest_depth)
             ctx.loop_exit = succ_idx;
       }
    }
@@ -1826,27 +1862,27 @@ emit_program(Program* program, std::vector<uint32_t>& code, std::vector<struct a
    ctx.reserve_counts(branch_count, constaddr_count, resumeaddr_count);
 
    const size_t base = (estimated_insn_count <= UINT32_MAX / 3)
-                        ? (estimated_insn_count * 5) / 2
-                        : (estimated_insn_count / 2) * 5;
+                         ? (estimated_insn_count * 5) / 2
+                         : (estimated_insn_count / 2) * 5;
 
-   const size_t literal_overhead    = base / 5;
-   const size_t modifier_overhead   = base / 20;
-   const size_t nsa_overhead        = (base * 3) / 100;
-   const size_t alignment_padding   = loop_count * 15u;
+   const size_t literal_overhead  = base / 5;
+   const size_t modifier_overhead = base / 20;
+   const size_t nsa_overhead      = (base * 3) / 100;
+   const size_t alignment_padding = loop_count * 15u;
 
-   const size_t cascade_depth = 3;
+   const size_t cascade_depth     = 3;
    const size_t chains_per_branch = (1u << cascade_depth);
-   const size_t dwords_per_chain = 10u;
-   const size_t branch_chaining = (branch_count / 10u) * chains_per_branch * dwords_per_chain;
+   const size_t dwords_per_chain  = 10u;
+   const size_t branch_chaining   = (branch_count / 10u) * chains_per_branch * dwords_per_chain;
 
-   const size_t constant_dwords     = (program->constant_data.size() + 3u) / 4u;
-   const size_t endpgm_padding      = append_endpgm ? 5u : 0u;
+   const size_t constant_dwords = (program->constant_data.size() + 3u) / 4u;
+   const size_t endpgm_padding  = append_endpgm ? 5u : 0u;
 
    const size_t total_estimate = base + literal_overhead + modifier_overhead + nsa_overhead +
-                                  alignment_padding + branch_chaining + constant_dwords + endpgm_padding;
+                                 alignment_padding + branch_chaining +
+                                 constant_dwords + endpgm_padding;
 
    const size_t reserve_size = total_estimate + (total_estimate * 20u) / 100u;
-
    code.reserve(reserve_size);
 
    bool is_separately_compiled_ngg_vs_or_es =
@@ -1861,8 +1897,13 @@ emit_program(Program* program, std::vector<uint32_t>& code, std::vector<struct a
       fix_exports(ctx, code, program);
 
    for (Block& block : program->blocks) {
-      block.offset = code.size();
       align_block(ctx, code, block);
+
+      if (block.kind & block_kind_loop_header)
+         emit_loop_latch(ctx, code, block);
+      else if (block.kind & block_kind_loop_latch)
+         continue;
+
       emit_block(ctx, code, block);
    }
 
