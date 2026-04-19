@@ -363,7 +363,7 @@ ac_fill_compiler_info(struct radeon_info *info, const struct drm_amdgpu_info_dev
    out->has_sram_ecc_enabled = info->family == CHIP_VEGA20 || info->family == CHIP_MI100 ||
                                info->family == CHIP_MI200 || info->family == CHIP_GFX940;
    out->has_point_sample_accel = info->family == CHIP_STRIX1 || info->family == CHIP_STRIX_HALO ||
-                                 info->family == CHIP_KRACKAN1;
+                                 info->family == CHIP_KRACKAN1 || info->gfx_level == GFX11_7;
    out->has_fast_fma32 = info->gfx_level >= GFX9 || info->family == CHIP_TAHITI ||
                          info->family == CHIP_HAWAII || info->family == CHIP_CARRIZO;
    out->has_fma_mix = info->gfx_level >= GFX10 || info->family == CHIP_VEGA12 ||
@@ -445,7 +445,7 @@ ac_fill_compiler_info(struct radeon_info *info, const struct drm_amdgpu_info_dev
     * attributes may be corrupted.
     * The workaround is to issue and wait for attribute stores before the last export.
     */
-   out->has_attr_ring_wait_bug = info->gfx_level == GFX11 || info->gfx_level == GFX11_5;
+   out->has_attr_ring_wait_bug = info->gfx_level >= GFX11 && info->gfx_level < GFX12;
 
    out->has_primid_instancing_bug = info->gfx_level == GFX6 && info->max_se == 1;
 }
@@ -745,6 +745,9 @@ ac_identify_chip(struct radeon_info *info, const struct drm_amdgpu_info_device *
       identify_chip(KRACKAN1);
       identify_chip(GFX1153);
       break;
+   case FAMILY_GFX1170:
+      identify_chip(GFX1170);
+      break;
    case FAMILY_NV4:
       identify_chip(GFX1200);
       identify_chip(GFX1201);
@@ -759,6 +762,8 @@ ac_identify_chip(struct radeon_info *info, const struct drm_amdgpu_info_device *
 
    if (info->ip[AMD_IP_GFX].ver_major == 12 && info->ip[AMD_IP_GFX].ver_minor == 0)
       info->gfx_level = GFX12;
+   else if (info->ip[AMD_IP_GFX].ver_major == 11 && info->ip[AMD_IP_GFX].ver_minor == 7)
+      info->gfx_level = GFX11_7;
    else if (info->ip[AMD_IP_GFX].ver_major == 11 && info->ip[AMD_IP_GFX].ver_minor == 5)
       info->gfx_level = GFX11_5;
    else if (info->ip[AMD_IP_GFX].ver_major == 11 && info->ip[AMD_IP_GFX].ver_minor == 0)

@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <errno.h>
 #include "sid.h"
 
 char amdgpu_userq_str[AMDGPU_MAX_QUEUES][8] = {
@@ -88,7 +89,13 @@ amdgpu_device_initialize_preferred_fd(int fd, bool is_virtio,
 
    *dev = NULL;
 
-   if (drmGetNodeTypeFromFd(fd) != DRM_NODE_RENDER) {
+   /* Fast path: initialize from the caller-provided FD first. */
+   init_result = ac_drm_device_initialize(fd, is_virtio, drm_major, drm_minor, dev);
+   if (init_result == 0)
+      return true;
+
+   /* Fallback path: permission-denied card-node FD can be recovered via render-node. */
+   if (init_result == -EACCES && drmGetNodeTypeFromFd(fd) != DRM_NODE_RENDER) {
       char *render_device = drmGetRenderDeviceNameFromFd(fd);
 
       if (render_device) {
@@ -119,14 +126,9 @@ amdgpu_device_initialize_preferred_fd(int fd, bool is_virtio,
       }
    }
 
-   init_result = ac_drm_device_initialize(fd, is_virtio, drm_major, drm_minor, dev);
-   if (init_result != 0) {
-      mesa_loge("amdgpu: amd%s_device_initialize failed.\n",
-                is_virtio ? "vgpu" : "gpu");
-      return false;
-   }
-
-   return true;
+   mesa_loge("amdgpu: amd%s_device_initialize failed.\n",
+             is_virtio ? "vgpu" : "gpu");
+   return false;
 }
 
 static void
@@ -552,8 +554,7 @@ amdgpu_winsys_create(int fd, const struct pipe_screen_config *config,
    }
 
    /* Initialize the amdgpu device. This should always return the same pointer
-    * for the same fd. Prefer a render node when possible to avoid issues with
-    * unauthenticated card-node FDs.
+    * for the same fd. Prefer a render node fallback on EACCES.
     */
    if (!amdgpu_device_initialize_preferred_fd(fd, is_virtio,
                                               &drm_major, &drm_minor, &dev))

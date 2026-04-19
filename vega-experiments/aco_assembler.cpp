@@ -53,6 +53,8 @@ struct asm_context {
          opcode = &instr_info.opcode_gfx10[0];
       else if (gfx_level <= GFX11_5)
          opcode = &instr_info.opcode_gfx11[0];
+      else if (gfx_level <= GFX11_7)
+         opcode = &instr_info.opcode_gfx11_7[0];
       else
          opcode = &instr_info.opcode_gfx12[0];
    }
@@ -303,11 +305,11 @@ emit_smem_instruction(asm_context& ctx, std::vector<uint32_t>& out, const Instru
       assert(!dlc); /* DLC not supported on GFX8/9 */
    } else {
       encoding = (0b111101u << 26);
-      if (gfx <= GFX11_5)
+      if (gfx < GFX12)
          encoding |= dlc ? 1u << (gfx >= GFX11 ? 13 : 14) : 0;
    }
 
-   if (gfx <= GFX11_5) [[likely]] {
+   if (gfx < GFX12) [[likely]] {
       encoding |= opcode << 18;
       encoding |= glc ? 1u << (gfx >= GFX11 ? 14 : 16) : 0;
    } else {

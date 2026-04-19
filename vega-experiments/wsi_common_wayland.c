@@ -201,8 +201,6 @@ struct wsi_wl_surface {
    struct zwp_linux_dmabuf_feedback_v1 *wl_dmabuf_feedback;
    struct dmabuf_feedback dmabuf_feedback, pending_dmabuf_feedback;
 
-   struct wp_linux_drm_syncobj_surface_v1 *wl_syncobj_surface;
-
    struct vk_instance *instance;
 
    struct {
@@ -214,12 +212,6 @@ struct wsi_wl_surface {
    } color;
 
    struct {
-      /* Cached structures, for eg. GetPhysicalDeviceSurfaceFormatsKHR to avoid
-       * round-trips every single time they are called, which is slow
-       * and leaks wl_registries on the server side[1].
-       *
-       * [1]: https://gitlab.freedesktop.org/wayland/wayland/-/merge_requests/388
-       */
       mtx_t lock;
       struct wsi_device *last_device;
       struct wsi_wl_display cached_display;
@@ -233,6 +225,7 @@ struct wsi_wl_swapchain {
    struct wp_tearing_control_v1 *tearing_control;
    struct wp_fifo_v1 *fifo;
    struct wp_commit_timer_v1 *commit_timer;
+   struct wp_linux_drm_syncobj_surface_v1 *wl_syncobj_surface;
 
    struct wl_callback *frame;
 
@@ -252,7 +245,7 @@ struct wsi_wl_swapchain {
    bool next_present_force_wait_barrier;
 
    struct {
-      mtx_t lock; /* protects all members */
+      mtx_t lock;
       uint64_t max_completed;
       uint64_t max_forward_progress_present_id;
       uint64_t max_present_id;
@@ -263,7 +256,6 @@ struct wsi_wl_swapchain {
       struct u_cnd_monotonic list_advanced;
       struct wl_event_queue *queue;
       struct loader_wayland_presentation wayland_presentation;
-      /* Fallback when wp_presentation is not supported */
       struct wl_surface *surface;
       bool dispatch_in_progress;
 
@@ -2548,9 +2540,6 @@ wsi_wl_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
       wl_container_of((VkIcdSurfaceWayland *)icd_surface, wsi_wl_surface, base);
    int err;
 
-   if (wsi_wl_surface->wl_syncobj_surface)
-      wp_linux_drm_syncobj_surface_v1_destroy(wsi_wl_surface->wl_syncobj_surface);
-
    if (wsi_wl_surface->wl_dmabuf_feedback) {
       zwp_linux_dmabuf_feedback_v1_destroy(wsi_wl_surface->wl_dmabuf_feedback);
       dmabuf_feedback_fini(&wsi_wl_surface->dmabuf_feedback);
@@ -2832,15 +2821,17 @@ fail:
    return VK_ERROR_OUT_OF_HOST_MEMORY;
 }
 
-static VkResult wsi_wl_surface_init(struct wsi_wl_surface *wsi_wl_surface,
-                                    struct wsi_device *wsi_device,
-                                    const VkAllocationCallbacks *pAllocator)
+static VkResult
+wsi_wl_surface_init(struct wsi_wl_surface *wsi_wl_surface,
+                    struct wsi_device *wsi_device,
+                    const VkAllocationCallbacks *pAllocator)
 {
    struct wsi_wayland *wsi =
       (struct wsi_wayland *)wsi_device->wsi[VK_ICD_WSI_PLATFORM_WAYLAND];
    VkResult result;
 
-   /* wsi_wl_surface has already been initialized. */
+   (void)pAllocator;
+
    if (wsi_wl_surface->display)
       return VK_SUCCESS;
 
@@ -2856,7 +2847,6 @@ static VkResult wsi_wl_surface_init(struct wsi_wl_surface *wsi_wl_surface,
       goto fail;
    }
 
-   /* Bind wsi_wl_surface to dma-buf feedback. */
    if (wsi_wl_surface->display->wl_dmabuf &&
        zwp_linux_dmabuf_v1_get_version(wsi_wl_surface->display->wl_dmabuf) >=
        ZWP_LINUX_DMABUF_V1_GET_SURFACE_FEEDBACK_SINCE_VERSION) {
@@ -2864,17 +2854,9 @@ static VkResult wsi_wl_surface_init(struct wsi_wl_surface *wsi_wl_surface,
       if (result != VK_SUCCESS)
          goto fail;
 
-      wl_display_roundtrip_queue(wsi_wl_surface->display->wl_display,
-                                 wsi_wl_surface->display->queue);
-   }
-
-   if (wsi_wl_use_explicit_sync(wsi_wl_surface->display, wsi_device)) {
-      wsi_wl_surface->wl_syncobj_surface =
-         wp_linux_drm_syncobj_manager_v1_get_surface(wsi_wl_surface->display->wl_syncobj,
-                                                     wsi_wl_surface->wayland_surface.wrapper);
-
-      if (!wsi_wl_surface->wl_syncobj_surface) {
-         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      if (wl_display_roundtrip_queue(wsi_wl_surface->display->wl_display,
+                                     wsi_wl_surface->display->queue) < 0) {
+         result = VK_ERROR_SURFACE_LOST_KHR;
          goto fail;
       }
    }
@@ -2882,11 +2864,6 @@ static VkResult wsi_wl_surface_init(struct wsi_wl_surface *wsi_wl_surface,
    return VK_SUCCESS;
 
 fail:
-   if (wsi_wl_surface->wl_syncobj_surface) {
-      wp_linux_drm_syncobj_surface_v1_destroy(wsi_wl_surface->wl_syncobj_surface);
-      wsi_wl_surface->wl_syncobj_surface = NULL;
-   }
-
    if (wsi_wl_surface->wl_dmabuf_feedback) {
       zwp_linux_dmabuf_feedback_v1_destroy(wsi_wl_surface->wl_dmabuf_feedback);
       wsi_wl_surface->wl_dmabuf_feedback = NULL;
@@ -2960,6 +2937,7 @@ struct wsi_wl_present_id {
    struct wl_list link;
    struct wsi_image *img;
    bool user_target_time;
+   struct wl_list free_link;
 };
 
 static struct wsi_image *
@@ -3002,27 +2980,14 @@ static VkResult
 dispatch_present_id_queue(struct wsi_swapchain *wsi_chain, struct timespec *end_time)
 {
    struct wsi_wl_swapchain *chain = (struct wsi_wl_swapchain *)wsi_chain;
-
-   /* We might not own this surface if we're retired, but it is only used here to
-    * read events from the present ID queue. This queue is private to a given VkSwapchainKHR,
-    * so calling present wait on a retired swapchain cannot interfere with a non-retired swapchain. */
    struct wl_display *wl_display = chain->wsi_wl_surface->display->wl_display;
-
    VkResult ret;
    int err;
 
-   /* PresentWait can be called concurrently.
-    * If there is contention on this mutex, it means there is currently a dispatcher in flight holding the lock.
-    * The lock is only held while there is forward progress processing events from Wayland,
-    * so there should be no problem locking without timeout.
-    * We would like to be able to support timeout = 0 to query the current max_completed count.
-    * A timedlock with no timeout can be problematic in that scenario. */
    err = mtx_lock(&chain->present_ids.lock);
    if (err != thrd_success)
       return VK_ERROR_OUT_OF_DATE_KHR;
 
-   /* Someone else is dispatching events; wait for them to update the chain
-    * status and wake us up. */
    if (chain->present_ids.dispatch_in_progress) {
       err = u_cnd_monotonic_timedwait(&chain->present_ids.list_advanced,
                                       &chain->present_ids.lock, end_time);
@@ -3030,37 +2995,21 @@ dispatch_present_id_queue(struct wsi_swapchain *wsi_chain, struct timespec *end_
 
       if (err == thrd_timedout)
          return VK_TIMEOUT;
-      else if (err != thrd_success)
+      if (err != thrd_success)
          return VK_ERROR_OUT_OF_DATE_KHR;
-
       return VK_SUCCESS;
    }
 
-   /* Whether or not we were dispatching the events before, we are now. */
-   assert(!chain->present_ids.dispatch_in_progress);
    chain->present_ids.dispatch_in_progress = true;
-
-   /* We drop the lock now - we're still protected by dispatch_in_progress,
-    * and holding the lock while dispatch_queue_timeout waits in poll()
-    * might delay other threads unnecessarily.
-    *
-    * We'll pick up the lock again in the dispatched functions.
-    */
    mtx_unlock(&chain->present_ids.lock);
 
-   ret = loader_wayland_dispatch(wl_display,
-                                 chain->present_ids.queue,
-                                 end_time);
+   ret = loader_wayland_dispatch(wl_display, chain->present_ids.queue, end_time);
 
-   mtx_lock(&chain->present_ids.lock);
+   err = mtx_lock(&chain->present_ids.lock);
+   if (err != thrd_success)
+      return VK_ERROR_OUT_OF_DATE_KHR;
 
-   /* Wake up other waiters who may have been unblocked by the events
-    * we just read. */
-   u_cnd_monotonic_broadcast(&chain->present_ids.list_advanced);
-
-   assert(chain->present_ids.dispatch_in_progress);
    chain->present_ids.dispatch_in_progress = false;
-
    u_cnd_monotonic_broadcast(&chain->present_ids.list_advanced);
    mtx_unlock(&chain->present_ids.lock);
 
@@ -3197,27 +3146,32 @@ wsi_wl_swapchain_ensure_dispatch(struct wsi_wl_swapchain *chain)
    struct wl_display *display = wsi_wl_surface->display->wl_display;
    struct timespec timeout = {0, 0};
    int ret = 0;
+   int err;
 
-   mtx_lock(&chain->present_ids.lock);
-   if (chain->present_ids.dispatch_in_progress)
-      goto already_dispatching;
+   err = mtx_lock(&chain->present_ids.lock);
+   if (err != thrd_success)
+      return -1;
+
+   if (chain->present_ids.dispatch_in_progress) {
+      mtx_unlock(&chain->present_ids.lock);
+      return 0;
+   }
 
    chain->present_ids.dispatch_in_progress = true;
    mtx_unlock(&chain->present_ids.lock);
 
-   /* Use a dispatch with an instant timeout because dispatch_pending
-    * won't read any events in the pipe.
-    */
    ret = wl_display_dispatch_queue_timeout(display,
                                            chain->present_ids.queue,
                                            &timeout);
 
-   mtx_lock(&chain->present_ids.lock);
-   u_cnd_monotonic_broadcast(&chain->present_ids.list_advanced);
-   chain->present_ids.dispatch_in_progress = false;
+   err = mtx_lock(&chain->present_ids.lock);
+   if (err != thrd_success)
+      return -1;
 
-already_dispatching:
+   chain->present_ids.dispatch_in_progress = false;
+   u_cnd_monotonic_broadcast(&chain->present_ids.list_advanced);
    mtx_unlock(&chain->present_ids.lock);
+
    return ret;
 }
 
@@ -3645,11 +3599,14 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
       uint64_t acquire_point = image->base.explicit_sync[WSI_ES_ACQUIRE].timeline;
       uint64_t release_point = image->base.explicit_sync[WSI_ES_RELEASE].timeline;
 
-      wp_linux_drm_syncobj_surface_v1_set_acquire_point(wsi_wl_surface->wl_syncobj_surface,
+      if (unlikely(chain->wl_syncobj_surface == NULL))
+         return VK_ERROR_OUT_OF_DATE_KHR;
+
+      wp_linux_drm_syncobj_surface_v1_set_acquire_point(chain->wl_syncobj_surface,
                                                          image->wl_syncobj_timeline[WSI_ES_ACQUIRE],
                                                          (uint32_t)(acquire_point >> 32),
                                                          (uint32_t)(acquire_point & 0xffffffffu));
-      wp_linux_drm_syncobj_surface_v1_set_release_point(wsi_wl_surface->wl_syncobj_surface,
+      wp_linux_drm_syncobj_surface_v1_set_release_point(chain->wl_syncobj_surface,
                                                          image->wl_syncobj_timeline[WSI_ES_RELEASE],
                                                          (uint32_t)(release_point >> 32),
                                                          (uint32_t)(release_point & 0xffffffffu));
@@ -3959,10 +3916,6 @@ static void
 wsi_wl_swapchain_chain_free(struct wsi_wl_swapchain *chain,
                             const VkAllocationCallbacks *pAllocator)
 {
-   /* Force wayland-client to release fd sent during the swapchain
-    * creation (see MAX_FDS_OUT) to avoid filling up VRAM with
-    * released buffers.
-    */
    struct wsi_wl_surface *wsi_wl_surface = chain->wsi_wl_surface;
    if (!chain->retired)
       wl_display_roundtrip_queue(wsi_wl_surface->display->wl_display,
@@ -3972,22 +3925,20 @@ wsi_wl_swapchain_chain_free(struct wsi_wl_swapchain *chain,
       wl_callback_destroy(chain->frame);
    if (chain->tearing_control)
       wp_tearing_control_v1_destroy(chain->tearing_control);
+   if (chain->wl_syncobj_surface) {
+      wp_linux_drm_syncobj_surface_v1_destroy(chain->wl_syncobj_surface);
+      chain->wl_syncobj_surface = NULL;
+   }
    if (needs_color_surface(wsi_wl_surface->display, chain->color.colorspace) &&
        wsi_wl_surface->color.color_surface) {
       wsi_wl_surface_remove_color_refcount(wsi_wl_surface);
    }
 
-   /* Only unregister if we are the non-retired swapchain, or
-    * we are a retired swapchain and memory allocation failed,
-    * in which case there are only retired swapchains. */
    if (wsi_wl_surface->chain == chain)
       wsi_wl_surface->chain = NULL;
 
    assert(!chain->present_ids.dispatch_in_progress);
 
-   /* In VK_KHR_swapchain_maintenance1 there is no requirement to wait for all present IDs to be complete.
-    * Waiting for the swapchain fence is enough.
-    * Just clean up anything user did not wait for. */
    struct wsi_wl_present_id *id, *tmp;
    wl_list_for_each_safe(id, tmp, &chain->present_ids.fallback_frame_list, link) {
       wl_callback_destroy(id->frame);
@@ -4097,6 +4048,10 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       if (old_chain->commit_timer) {
          wp_commit_timer_v1_destroy(old_chain->commit_timer);
          old_chain->commit_timer = NULL;
+      }
+      if (old_chain->wl_syncobj_surface) {
+         wp_linux_drm_syncobj_surface_v1_destroy(old_chain->wl_syncobj_surface);
+         old_chain->wl_syncobj_surface = NULL;
       }
    }
 
@@ -4271,6 +4226,16 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       wp_tearing_control_v1_set_presentation_hint(
          chain->tearing_control,
          WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC);
+   }
+
+   if (wsi_wl_use_explicit_sync(wsi_wl_surface->display, wsi_device)) {
+      chain->wl_syncobj_surface =
+         wp_linux_drm_syncobj_manager_v1_get_surface(wsi_wl_surface->display->wl_syncobj,
+                                                     wsi_wl_surface->wayland_surface.wrapper);
+      if (!chain->wl_syncobj_surface) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto fail_free_wl_chain;
+      }
    }
 
    const char *queue_label = "mesa vk surface queue";
