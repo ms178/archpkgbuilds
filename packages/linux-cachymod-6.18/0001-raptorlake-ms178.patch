@@ -1,3 +1,195 @@
+--- a/arch/x86/mm/pat/set_memory.c	2026-04-18 10:45:02.000000000 +0200
++++ b/arch/x86/mm/pat/set_memory.c	2026-04-22 00:23:43.873733155 +0200
+@@ -433,11 +433,71 @@ static void cpa_collapse_large_pages(str
+ 	}
+ }
+ 
+-static void cpa_flush(struct cpa_data *cpa, int cache)
++static void cpa_flush_tlb(struct cpa_data *cpa)
+ {
+ 	unsigned long start, end;
+ 	unsigned int i;
+ 
++	start = fix_addr(__cpa_addr(cpa, 0));
++	end = start + cpa->numpages * PAGE_SIZE;
++
++	if (cpa->force_flush_all) {
++		flush_tlb_kernel_range(start, TLB_FLUSH_ALL);
++		return;
++	}
++
++	if (!(cpa->flags & (CPA_ARRAY | CPA_PAGES_ARRAY))) {
++		flush_tlb_kernel_range(start, end);
++		return;
++	}
++
++	/*
++	 * Array entries are not guaranteed contiguous. Flush only exact
++	 * contiguous runs. For very large arrays, full flush tends to be
++	 * cheaper than many range shootdowns.
++	 */
++	if (cpa->numpages > 64) {
++		flush_tlb_kernel_range(start, TLB_FLUSH_ALL);
++		return;
++	}
++
++	i = 0;
++	while (i < cpa->numpages) {
++		unsigned long addr = __cpa_addr(cpa, i);
++		unsigned long run_start, run_end;
++
++		if (!addr) {
++			i++;
++			continue;
++		}
++
++		run_start = fix_addr(addr);
++		run_end = run_start + PAGE_SIZE;
++		i++;
++
++		while (i < cpa->numpages) {
++			unsigned long next_addr = __cpa_addr(cpa, i);
++			unsigned long next;
++
++			if (!next_addr)
++				break;
++
++			next = fix_addr(next_addr);
++			if (next != run_end)
++				break;
++
++			run_end += PAGE_SIZE;
++			i++;
++		}
++
++		flush_tlb_kernel_range(run_start, run_end);
++	}
++}
++
++static void cpa_flush(struct cpa_data *cpa, int cache)
++{
++	unsigned int i;
++
+ 	BUG_ON(irqs_disabled() && !early_boot_irqs_disabled);
+ 
+ 	if (cache && !static_cpu_has(X86_FEATURE_CLFLUSH)) {
+@@ -445,12 +505,7 @@ static void cpa_flush(struct cpa_data *c
+ 		goto collapse_large_pages;
+ 	}
+ 
+-	start = fix_addr(__cpa_addr(cpa, 0));
+-	end =   start + cpa->numpages * PAGE_SIZE;
+-	if (cpa->force_flush_all)
+-		end = TLB_FLUSH_ALL;
+-
+-	flush_tlb_kernel_range(start, end);
++	cpa_flush_tlb(cpa);
+ 
+ 	if (!cache)
+ 		goto collapse_large_pages;
+@@ -459,8 +514,12 @@ static void cpa_flush(struct cpa_data *c
+ 	for (i = 0; i < cpa->numpages; i++) {
+ 		unsigned long addr = __cpa_addr(cpa, i);
+ 		unsigned int level;
++		pte_t *pte;
+ 
+-		pte_t *pte = lookup_address(addr, &level);
++		if (!addr)
++			continue;
++
++		pte = lookup_address(addr, &level);
+ 
+ 		/*
+ 		 * Only flush present addresses:
+@@ -1914,23 +1973,23 @@ static int cpa_process_alias(struct cpa_
+ 	struct cpa_data alias_cpa;
+ 	unsigned long laddr = (unsigned long)__va(cpa->pfn << PAGE_SHIFT);
+ 	unsigned long vaddr;
++	bool alias_changed = false;
+ 	int ret;
+ 
+ 	if (!pfn_range_is_mapped(cpa->pfn, cpa->pfn + 1))
+ 		return 0;
+ 
+ 	/*
+-	 * No need to redo, when the primary call touched the direct
+-	 * mapping already:
++	 * No need to redo when the primary call touched the direct mapping.
+ 	 */
+ 	vaddr = __cpa_addr(cpa, cpa->curpage);
+ 	if (!(within(vaddr, PAGE_OFFSET,
+-		    PAGE_OFFSET + (max_pfn_mapped << PAGE_SHIFT)))) {
+-
++		     PAGE_OFFSET + (max_pfn_mapped << PAGE_SHIFT)))) {
+ 		alias_cpa = *cpa;
+ 		alias_cpa.vaddr = &laddr;
+-		alias_cpa.flags &= ~(CPA_PAGES_ARRAY | CPA_ARRAY);
++		alias_cpa.flags &= ~(CPA_PAGES_ARRAY | CPA_ARRAY | CPA_FLUSHTLB);
+ 		alias_cpa.curpage = 0;
++		alias_cpa.force_flush_all = 0;
+ 
+ 		/* Directmap always has NX set, do not modify. */
+ 		if (__supported_pte_mask & _PAGE_NX) {
+@@ -1938,27 +1997,29 @@ static int cpa_process_alias(struct cpa_
+ 			alias_cpa.mask_set.pgprot &= ~_PAGE_NX;
+ 		}
+ 
+-		cpa->force_flush_all = 1;
+-
+ 		ret = __change_page_attr_set_clr(&alias_cpa, 0);
+ 		if (ret)
+ 			return ret;
++
++		if (alias_cpa.flags & CPA_FLUSHTLB)
++			alias_changed = true;
+ 	}
+ 
+ #ifdef CONFIG_X86_64
+ 	/*
+-	 * If the primary call didn't touch the high mapping already
+-	 * and the physical address is inside the kernel map, we need
+-	 * to touch the high mapped kernel as well:
++	 * If the primary call didn't touch the high mapping already and
++	 * the physical address is inside the kernel map, update highmap too.
+ 	 */
+ 	if (!within(vaddr, (unsigned long)_text, _brk_end) &&
+ 	    __cpa_pfn_in_highmap(cpa->pfn)) {
+ 		unsigned long temp_cpa_vaddr = (cpa->pfn << PAGE_SHIFT) +
+ 					       __START_KERNEL_map - phys_base;
++
+ 		alias_cpa = *cpa;
+ 		alias_cpa.vaddr = &temp_cpa_vaddr;
+-		alias_cpa.flags &= ~(CPA_PAGES_ARRAY | CPA_ARRAY);
++		alias_cpa.flags &= ~(CPA_PAGES_ARRAY | CPA_ARRAY | CPA_FLUSHTLB);
+ 		alias_cpa.curpage = 0;
++		alias_cpa.force_flush_all = 0;
+ 
+ 		/*
+ 		 * [_text, _brk_end) also covers data, do not modify NX except
+@@ -1969,15 +2030,18 @@ static int cpa_process_alias(struct cpa_
+ 			alias_cpa.mask_set.pgprot &= ~_PAGE_NX;
+ 		}
+ 
+-		cpa->force_flush_all = 1;
+ 		/*
+-		 * The high mapping range is imprecise, so ignore the
+-		 * return value.
++		 * The high mapping range is imprecise, so ignore the return value.
+ 		 */
+ 		__change_page_attr_set_clr(&alias_cpa, 0);
++		if (alias_cpa.flags & CPA_FLUSHTLB)
++			alias_changed = true;
+ 	}
+ #endif
+ 
++	if (alias_changed)
++		cpa->force_flush_all = 1;
++
+ 	return 0;
+ }
+ 
+
+
 --- a/drivers/usb/host/xhci.c	2026-04-11 14:26:52.000000000 +0200
 +++ b/drivers/usb/host/xhci.c	2026-04-13 16:03:14.567835031 +0200
 @@ -44,15 +44,27 @@ MODULE_PARM_DESC(quirks, "Bit flags for
