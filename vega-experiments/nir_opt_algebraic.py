@@ -1855,7 +1855,8 @@ optimizations.extend([
    (('ffract(nnan)', 'a(is_integral)'), 0.0),
    (('ffract', ('ffract', a)), ('ffract', a)),
 
-   (('fabs', 'a(is_not_negative)'), ('fcanonicalize', a)),
+   (('fabs(nsz)', 'a(is_not_negative)'), ('fcanonicalize', a)),
+   (('fabs', 'a(is_not_negative_or_negative_zero)'), ('fcanonicalize', a)),
    (('fabs(nsz)', 'a(is_not_positive)'), ('fneg', a)),
 
    (('fneu', 'a(is_not_zero)', 0.0), True),
