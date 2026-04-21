@@ -145,26 +145,30 @@ static void mi_page_thread_collect_to_local(mi_page_t* page, mi_block_t* head)
 {
   if (head == NULL) return;
 
-  size_t max_count = page->capacity;
+  size_t max_count = page->capacity; // cannot collect more than capacity
   size_t count = 1;
   mi_block_t* last = head;
-  for (;;) {
-    mi_block_t* const next = mi_block_next(page, last);
-    if (next == NULL) break;
+  mi_block_t* next;
+  while ((next = mi_block_next(page, last)) != NULL && count <= max_count) {
     count++;
-    if mi_unlikely(count > max_count) {
-      _mi_error_message(EFAULT, "corrupted thread-free list\n");
-      return;
-    }
     last = next;
-    mi_prefetch_read(mi_block_next(page, last));
+  }
+
+  // if `count > max_count` there was a memory corruption (possibly infinite list due to double multi-threaded free)
+  if mi_unlikely(count > max_count) {
+    _mi_error_message(EFAULT, "corrupted thread-free list\n");
+    return; // the thread-free items cannot be freed
+  }
+  // if `count > page->used` there was another kind memory corruption
+  else if mi_unlikely(count > page->used) {
+    _mi_error_message(EFAULT, "corrupted meta-data in thread-free list\n");
+    return;
   }
 
   mi_block_set_next(page, last, page->local_free);
   page->local_free = head;
 
   mi_assert_internal(count <= UINT16_MAX);
-  mi_assert_internal(page->used >= (uint16_t)count);
   page->used = (uint16_t)(page->used - (uint16_t)count);
 }
 
@@ -528,9 +532,9 @@ static mi_decl_noinline void mi_page_free_list_extend(mi_page_t* const page, con
   Page initialize and extend the capacity
 ----------------------------------------------------------- */
 
-#define MI_MAX_EXTEND_SIZE    (4*1024)
-#if (MI_SECURE>=3)
-#define MI_MIN_EXTEND         (8*MI_SECURE)
+#define MI_MAX_EXTEND_SIZE    (4*1024)      // heuristic, one OS page seems to work well.
+#if (MI_SECURE>=2)
+#define MI_MIN_EXTEND         (8*MI_SECURE) // extend at least by this many
 #else
 #define MI_MIN_EXTEND         (1)
 #endif
@@ -548,16 +552,16 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
   size_t page_size;
   mi_page_area(page, &page_size);
   MI_UNUSED(page_size);
+
   #if MI_STAT>0
   mi_theap_stat_counter_increase(theap, pages_extended, 1);
   #endif
 
-  // calculate the extend count
   const size_t bsize = mi_page_block_size(page);
   size_t extend = (size_t)page->reserved - page->capacity;
   mi_assert_internal(extend > 0);
 
-  size_t max_extend = (bsize >= MI_MAX_EXTEND_SIZE ? MI_MIN_EXTEND : MI_MAX_EXTEND_SIZE/bsize);
+  size_t max_extend = (bsize >= MI_MAX_EXTEND_SIZE ? MI_MIN_EXTEND : MI_MAX_EXTEND_SIZE / bsize);
   if (max_extend < MI_MIN_EXTEND) { max_extend = MI_MIN_EXTEND; }
   mi_assert_internal(max_extend > 0);
 
@@ -566,11 +570,11 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
   }
 
   mi_assert_internal(extend > 0 && extend + page->capacity <= page->reserved);
-  mi_assert_internal(extend < (1UL<<16));
+  mi_assert_internal(extend < (1UL << 16));
 
-  // commit on demand?
+  // commit on demand
   if (page->slice_committed > 0) {
-    const size_t needed_size = (page->capacity + extend)*bsize;
+    const size_t needed_size = (page->capacity + extend) * bsize;
     const size_t needed_commit = _mi_align_up(mi_page_slice_offset_of(page, needed_size), MI_PAGE_MIN_COMMIT_SIZE);
     if (needed_commit > page->slice_committed) {
       mi_assert_internal(((needed_commit - page->slice_committed) % _mi_os_page_size()) == 0);
@@ -581,19 +585,20 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
     }
   }
 
-  // and append the extend the free list
-  if (extend < MI_MIN_SLICES || MI_SECURE<3) {
-    mi_page_free_list_extend(page, bsize, extend );
+  // append an initialized free list range
+  if (extend < MI_MIN_SLICES || MI_SECURE < 2) {
+    mi_page_free_list_extend(page, bsize, extend);
   }
   else {
     mi_page_free_list_extend_secure(theap, page, bsize, extend);
   }
 
-  // enable the new free list
   page->capacity = (uint16_t)(page->capacity + (uint16_t)extend);
+
   #if MI_STAT>0
   mi_theap_stat_increase(theap, page_committed, extend * bsize);
   #endif
+
   mi_assert_expensive(mi_page_is_valid_init(page));
   return true;
 }
@@ -751,23 +756,24 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
 static mi_page_t* mi_find_free_page(mi_theap_t* theap, mi_page_queue_t* pq) {
   mi_assert_internal(!mi_page_queue_is_huge(pq));
 
-  // check the first page: fast path
+  // Fast path: reuse the queue head if it has immediate availability after cheap local collect.
   mi_page_t* page = pq->first;
   if mi_likely(page != NULL && mi_page_free_quick_collect(page)) {
     mi_prefetch_read(page->free);
-    #if (MI_SECURE>=3)
-    // in secure mode, extend half the time to increase randomness
+
+    #if (MI_SECURE>=2)
+    // In secure mode, extend half the time to improve free-list randomization.
     if (page->capacity < page->reserved && ((_mi_theap_random_next(theap) & 1) == 1)) {
-      (void)mi_page_extend_free(theap, page);  // ok if this fails
+      (void)mi_page_extend_free(theap, page);  // best effort
       mi_assert_internal(mi_page_immediate_available(page));
     }
     #endif
+
     page->retire_expire = 0;
     return page;
   }
-  else {
-    return mi_page_queue_find_free_ex(theap, pq, true);
-  }
+
+  return mi_page_queue_find_free_ex(theap, pq, true);
 }
 
 

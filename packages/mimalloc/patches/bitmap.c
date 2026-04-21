@@ -12,6 +12,7 @@ Concurrent bitmap that can set/reset sequences of bits atomically
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
 #include "mimalloc/bits.h"
+#include "mimalloc/prim.h"  // _mi_prim_thread_yield
 #include "bitmap.h"
 
 #ifndef MI_OPT_SIMD
@@ -164,8 +165,8 @@ static inline void mi_bfield_atomic_clear_once_set(_Atomic(mi_bfield_t)*b, size_
       if ((old&mask)==0) {
         mi_subproc_stat_counter_increase(_mi_subproc(), pages_unabandon_busy_wait, 1);
       }
-      while ((old&mask)==0) {
-        mi_atomic_yield();
+      while ((old&mask)==0) { // busy wait
+        _mi_prim_thread_yield();
         old = mi_atomic_load_acquire(b);
       }
     }
@@ -952,7 +953,7 @@ size_t mi_bitmap_init(mi_bitmap_t* bitmap, size_t bit_count, bool already_zero) 
 }
 
 static void mi_bchunks_unsafe_setN(mi_bchunk_t* chunks, mi_bchunkmap_t* cmap, size_t idx, size_t n) {
-  mi_assert_internal(n > 0);
+  mi_assert_internal(n>0);
 
   size_t chunk_idx = idx / MI_BCHUNK_BITS;
   const size_t cidx = idx % MI_BCHUNK_BITS;
@@ -1263,14 +1264,32 @@ bool _mi_bitmap_forall_setc_ranges(mi_bitmap_t* bitmap, mi_forall_set_fun_t* vis
       mi_bchunk_t* const chunk = &bitmap->chunks[chunk_idx];
       for (size_t j = 0; j < MI_BCHUNK_FIELDS; j++) {
         const size_t base_idx = (chunk_idx*MI_BCHUNK_BITS) + (j*MI_BFIELD_BITS);
-        mi_bfield_t b = mi_atomic_exchange_relaxed(&chunk->bfields[j], 0);
+        mi_bfield_t b = mi_atomic_exchange_relaxed(&chunk->bfields[j], (mi_bfield_t)0);
+        #if MI_DEBUG > 1
+        const size_t bpopcount = mi_popcount(b);
+        size_t rngcount = 0;
+        #endif
         size_t bidx;
         while (mi_bfield_find_least_bit(b, &bidx)) {
-          const size_t rng = mi_ctz(~(b>>bidx));
+          size_t rng = mi_ctz(~(b>>bidx));
+          #if MI_DEBUG > 1
+          rngcount += rng;
+          #endif
           const size_t idx = base_idx + bidx;
-          if (!visit(idx, rng, arena, arg)) return false;
+          mi_assert_internal(rng>=1 && rng<=MI_BFIELD_BITS);
+          mi_assert_internal((idx % MI_BFIELD_BITS) + rng <= MI_BFIELD_BITS);
+          mi_assert_internal((idx / MI_BCHUNK_BITS) < mi_bitmap_chunk_count(bitmap));
+          if (!visit(idx, rng, arena, arg)) {
+            if (b != 0) {
+              mi_atomic_or_relaxed(&chunk->bfields[j], b);
+            }
+            return false;
+          }
           b = b & ~mi_bfield_mask(rng, bidx);
         }
+        #if MI_DEBUG > 1
+        mi_assert_internal(rngcount == bpopcount);
+        #endif
       }
     }
   }
@@ -1293,15 +1312,20 @@ bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_fo
       mi_bchunk_t* const chunk = &bitmap->chunks[chunk_idx];
       for (size_t j = 0; j < MI_BCHUNK_FIELDS; j++) {
         const size_t base_idx = (chunk_idx*MI_BCHUNK_BITS) + (j*MI_BFIELD_BITS);
-        const mi_bfield_t b = mi_atomic_exchange_relaxed(&chunk->bfields[j], 0);
+        const mi_bfield_t b = mi_atomic_exchange_relaxed(&chunk->bfields[j], (mi_bfield_t)0);
         mi_bfield_t skipped = 0;
-        for(size_t shift = 0; rngslices + shift <= MI_BFIELD_BITS; shift += rngslices) {
+        for (size_t shift = 0; rngslices + shift <= MI_BFIELD_BITS; shift += rngslices) {
           const mi_bfield_t rngmask = mi_bfield_mask(rngslices, shift);
           if ((b & rngmask) == rngmask) {
             const size_t idx = base_idx + shift;
             if (!visit(idx, rngslices, arena, arg)) {
-              if (skipped != 0) {
-                mi_atomic_or_relaxed(&chunk->bfields[j], skipped);
+              mi_bfield_t notyet_visited = 0;
+              if (shift + rngslices < MI_BFIELD_BITS) {
+                notyet_visited = (b & (~(mi_bfield_t)0 << (shift + rngslices)));
+              }
+              mi_assert_internal((notyet_visited & skipped) == 0);
+              if ((notyet_visited | skipped) != 0) {
+                mi_atomic_or_relaxed(&chunk->bfields[j], notyet_visited | skipped);
               }
               return false;
             }
@@ -1310,6 +1334,7 @@ bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_fo
             skipped |= (b & rngmask);
           }
         }
+
         if (skipped != 0) {
           mi_atomic_or_relaxed(&chunk->bfields[j], skipped);
         }
@@ -1631,13 +1656,29 @@ bool mi_bbitmap_try_find_and_clearN_(mi_bbitmap_t* bbitmap, size_t tseq, size_t 
 // Returns false if there is no clear bit.
 bool mi_bbitmap_bsr_inv(mi_bbitmap_t* bbitmap, size_t* idx) {
   const size_t chunk_count = mi_bbitmap_chunk_count(bbitmap);
-  for (size_t chunk_idx = chunk_count; chunk_idx > 0; ) {
-    chunk_idx--;
-    size_t cidx;
-    if (mi_bchunk_bsr_inv(&bbitmap->chunks[chunk_idx], &cidx)) {
-      *idx = (chunk_idx * MI_BCHUNK_BITS) + cidx;
-      mi_assert_internal(*idx < mi_bbitmap_max_bits(bbitmap));
-      return true;
+  const size_t chunkmap_max = _mi_divide_up(chunk_count, MI_BFIELD_BITS);
+  const size_t valid_top_bits = (chunk_count % MI_BFIELD_BITS); // valid low bits in top map entry if non-zero
+
+  for (size_t i = chunkmap_max; i > 0; ) {
+    i--;
+    mi_bfield_t cmap = mi_atomic_load_relaxed(&bbitmap->chunkmap.bfields[i]);
+
+    // In the top entry, bits >= valid_top_bits are out-of-range chunks: force them to 1
+    // so `mi_bsr(~cmap,...)` cannot select them.
+    if (i == (chunkmap_max - 1) && valid_top_bits != 0) {
+      const mi_bfield_t invalid_mask = ~mi_bfield_mask(valid_top_bits, 0);
+      cmap |= invalid_mask;
+    }
+
+    size_t cmap_idx;
+    if (mi_bsr(~cmap, &cmap_idx)) {
+      const size_t chunk_idx = i*MI_BFIELD_BITS + cmap_idx;
+      if (chunk_idx >= chunk_count) continue; // extra hardening
+      size_t cidx;
+      if (mi_bchunk_bsr_inv(&bbitmap->chunks[chunk_idx], &cidx)) {
+        *idx = (chunk_idx * MI_BCHUNK_BITS) + cidx;
+        return true;
+      }
     }
   }
   return false;

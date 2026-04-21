@@ -99,16 +99,35 @@ static mi_thread_locals_t* mi_thread_locals_expand(size_t least_idx) {
 
   mi_thread_locals_t* tls_old = mi_thread_locals;
   const size_t count_old = tls_old->count;
-  const size_t count = mi_thread_locals_next_count(count_old, least_idx);
-
-  if (count_old != 0 && count <= count_old) return NULL;
-
-  size_t alloc_size = 0;
-  if (!mi_thread_locals_alloc_size(count, &alloc_size)) return NULL;
+  size_t count;
 
   if (count_old == 0) {
     tls_old = NULL;
+    count = 16;
   }
+  else if (count_old >= MI_TLS_IDX_MASK - 1024) {
+    return NULL;  // too large to grow safely
+  }
+  else if (count_old >= 1024) {
+    count = count_old + 1024;
+  }
+  else {
+    count = 2 * count_old;
+  }
+
+  if (count <= least_idx) {
+    count = least_idx + 1;
+  }
+
+  if (count > (MI_TLS_IDX_MASK + 1)) {
+    return NULL;
+  }
+
+  const size_t base = offsetof(mi_thread_locals_t, slots);
+  if (count > ((SIZE_MAX - base) / sizeof(mi_tls_slot_t))) {
+    return NULL;
+  }
+  const size_t alloc_size = base + count * sizeof(mi_tls_slot_t);
 
   mi_thread_locals_t* tls = (mi_thread_locals_t*)mi_rezalloc(tls_old, alloc_size);
   if mi_unlikely(tls == NULL) return NULL;
