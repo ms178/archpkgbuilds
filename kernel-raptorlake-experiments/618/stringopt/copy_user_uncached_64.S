@@ -14,7 +14,7 @@
 #include <linux/objtool.h>
 #include <asm/asm.h>
 
-SYM_FUNC_START(__copy_user_nocache)
+SYM_FUNC_START(copy_to_nontemporal)
         ANNOTATE_NOENDBR
 
         testb   $7, %dil
@@ -179,5 +179,5 @@ _ASM_EXTABLE_UA(95b, .Ldone)
 _ASM_EXTABLE_UA(52b, .Ldone0)
 _ASM_EXTABLE_UA(53b, .Ldone0)
 
-SYM_FUNC_END(__copy_user_nocache)
-EXPORT_SYMBOL(__copy_user_nocache)
+SYM_FUNC_END(copy_to_nontemporal)
+EXPORT_SYMBOL(copy_to_nontemporal)
