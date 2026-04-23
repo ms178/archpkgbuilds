@@ -85,7 +85,6 @@ inline KWin::SurfaceInterface *resolvePresentationSurface(KWin::Window *window) 
 }
 
 [[gnu::always_inline, gnu::const]]
-[[gnu::always_inline, gnu::const]]
 inline constexpr int64_t safeAbs64(int64_t v) noexcept
 {
     if (v == std::numeric_limits<int64_t>::min()) [[unlikely]] {
@@ -197,7 +196,6 @@ inline constexpr bool contentIsVideoLike(KWin::VrrContentHint hint) noexcept
     return hint == KWin::VrrContentHint::Video || hint == KWin::VrrContentHint::Film || hint == KWin::VrrContentHint::ForceVsync;
 }
 
-[[gnu::always_inline]]
 [[gnu::always_inline]]
 inline int effectiveMaxPendingFrames(const KWin::RenderLoopPrivate *d, bool vrrActive) noexcept
 {
