@@ -85,13 +85,16 @@ inline KWin::SurfaceInterface *resolvePresentationSurface(KWin::Window *window) 
 }
 
 [[gnu::always_inline, gnu::const]]
+[[gnu::always_inline, gnu::const]]
 inline constexpr int64_t safeAbs64(int64_t v) noexcept
 {
     if (v == std::numeric_limits<int64_t>::min()) [[unlikely]] {
         return std::numeric_limits<int64_t>::max();
     }
-    return v < 0 ? -v : v;
+    const int64_t mask = v >> 63;
+    return (v ^ mask) - mask;
 }
+
 
 [[gnu::always_inline, gnu::const]]
 inline constexpr bool isVrrMode(KWin::PresentationMode mode) noexcept
@@ -195,10 +198,14 @@ inline constexpr bool contentIsVideoLike(KWin::VrrContentHint hint) noexcept
 }
 
 [[gnu::always_inline]]
+[[gnu::always_inline]]
 inline int effectiveMaxPendingFrames(const KWin::RenderLoopPrivate *d, bool vrrActive) noexcept
 {
     const int configuredMax = d->maxPendingFrameCount;
-    if (!vrrActive || configuredMax <= 1) {
+    if (!vrrActive) [[likely]] {
+        return configuredMax;
+    }
+    if (configuredMax <= 1) {
         return configuredMax;
     }
 
@@ -235,6 +242,7 @@ inline int effectiveMaxPendingFrames(const KWin::RenderLoopPrivate *d, bool vrrA
 
     return (predictedNs * 5) >= (vblankNs * 2) ? maxPending : 1;
 }
+
 
 } // namespace
 
@@ -497,6 +505,17 @@ void RenderLoopPrivate::invalidateVrrState() noexcept
 
 void RenderLoopPrivate::updateVrrState() noexcept
 {
+    if (!vrrEnabled || !vrrCapable || output == nullptr) {
+        if (trackedWindow_ != nullptr) {
+            disconnectVrrSignals();
+        }
+        if (vrrStateCache_.raw() != 0U) {
+            vrrStateCache_.setRaw(0U);
+        }
+        vrrStateDirty_ = false;
+        return;
+    }
+
     if (!vrrStateDirty_) {
         if (trackedWindow_ != nullptr) {
             SurfaceInterface *const live = resolvePresentationSurface(trackedWindow_.data());
@@ -516,13 +535,11 @@ void RenderLoopPrivate::updateVrrState() noexcept
     Window *active = nullptr;
     bool eligible = false;
 
-    if (vrrEnabled && vrrCapable && output != nullptr) {
-        if (Workspace *const ws = workspace()) {
-            active = ws->activeWindow();
-            if (active != nullptr && active->isFullScreen()) {
-                if (LogicalOutput *const logical = ws->findOutput(output)) {
-                    eligible = active->isOnOutput(logical);
-                }
+    if (Workspace *const ws = workspace()) {
+        active = ws->activeWindow();
+        if (active != nullptr && active->isFullScreen()) {
+            if (LogicalOutput *const logical = ws->findOutput(output)) {
+                eligible = active->isOnOutput(logical);
             }
         }
     }
@@ -551,6 +568,7 @@ void RenderLoopPrivate::updateVrrState() noexcept
         vrrStateCache_.setState(state);
     }
 }
+
 
 void RenderLoopPrivate::setVrrCapabilities(const VrrCapabilities &caps) noexcept
 {
@@ -722,23 +740,18 @@ bool RenderLoopPrivate::detectVrrOscillation() noexcept
     }
 
     const auto cutoff = std::chrono::steady_clock::now() - kOscillationWindow;
-    uint8_t recentCount = 0;
+    const uint8_t idx = static_cast<uint8_t>(
+        (modeSwitchHistoryHead_ + kModeSwitchHistorySize - required) & (kModeSwitchHistorySize - 1U));
 
-    for (uint8_t i = 0; i < modeSwitchHistoryCount_; ++i) {
-        const uint8_t idx = static_cast<uint8_t>((modeSwitchHistoryHead_ - 1U - i) & (kModeSwitchHistorySize - 1U));
-        if (modeSwitchHistory_[idx] < cutoff) {
-            break;
-        }
-        ++recentCount;
-        if (recentCount >= required) [[unlikely]] {
-            vrrOscillationLockout = true;
-            oscillationCooldownCounter_ = kOscillationCooldownFrames;
-            return true;
-        }
+    if (modeSwitchHistory_[idx] >= cutoff) [[unlikely]] {
+        vrrOscillationLockout = true;
+        oscillationCooldownCounter_ = kOscillationCooldownFrames;
+        return true;
     }
 
     return false;
 }
+
 
 void RenderLoopPrivate::updatePresentationCadence(int64_t intervalNs) noexcept
 {
