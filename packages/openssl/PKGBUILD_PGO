@@ -1,25 +1,24 @@
+# Maintainer: Pierre Schmitz <pierre@archlinux.de>
+
 pkgname=openssl
-pkgver=3.6.1
-pkgrel=3
+pkgver=3.6.2
+pkgrel=19
 pkgdesc='The Open Source toolkit for Secure Sockets Layer and Transport Layer Security'
 arch=('x86_64')
 url='https://www.openssl.org'
 license=('Apache-2.0')
-depends=('glibc')
+depends=('brotli' 'glibc' 'zlib' 'zstd')
 makedepends=('perl' 'clang' 'llvm' 'lld')
 optdepends=('ca-certificates: trusted CA bundle'
             'perl: c_rehash and some OpenSSL utilities')
 replaces=('openssl-perl' 'openssl-doc')
-provides=('libcrypto.so=3-64' 'libssl.so=3-64')
+provides=('libcrypto.so' 'libssl.so')
 backup=('etc/ssl/openssl.cnf')
-source=("https://github.com/${pkgname}/${pkgname}/releases/download/${pkgname}-${pkgver}/${pkgname}-${pkgver}.tar.gz"{,.asc}
-        'ca-dir.patch')
-sha256sums=('83049d042a260e696f62406ac5c08bf706fd84383f945cf21bd61e9ed95c396e'
-            'SKIP'
-            '0a32d9ca68e8d985ce0bfef6a4c20b46675e06178cc2d0bf6d91bd6865d648b7')
-validpgpkeys=('8657ABB260F056B1E5190839D9C4D26D0E604491'
-              '7953AC1FBC3DC8B3B292393ED5E9E43F7DF9EE8C'
-              'A21FAB74B0088AA361152586B8EF1A6BA9DA2D5C')
+source=("https://github.com/${pkgname}/${pkgname}/releases/download/${pkgname}-${pkgver}/${pkgname}-${pkgver}.tar.gz"{,.asc})
+sha256sums=('aaf51a1fe064384f811daeaeb4ec4dce7340ec8bd893027eee676af31e83a04f'
+            'SKIP')
+validpgpkeys=('EFC0A467D613CB83C7ED6D30D894E2CE8B3D79F5'
+              'BA5473A2B0587B07FB27CF2D216094DFD0CB81EF')
 
 _set_llvm_toolchain() {
   export CC=clang
@@ -31,105 +30,219 @@ _set_llvm_toolchain() {
   export OBJCOPY=llvm-objcopy
   export OBJDUMP=llvm-objdump
   export READELF=llvm-readelf
-  export LDFLAGS+=" -fuse-ld=lld"
+  [[ " $LDFLAGS " == *" -fuse-ld=lld "* ]] || export LDFLAGS+=" -fuse-ld=lld"
 }
 
-prepare() {
-  cd "$srcdir/$pkgname-$pkgver"
+_get_platform() {
+  local _platform="linux-$CARCH"
+  case "$CARCH" in
+    riscv64) _platform="linux64-$CARCH" ;;
+  esac
+  printf '%s\n' "$_platform"
+}
 
-  # set ca dir to /etc/ssl by default
-  patch -Np1 -i "$srcdir/ca-dir.patch"
+_configure_and_build() {
+  local platform
+  platform="$(_get_platform)"
+
+  ./Configure \
+    --prefix=/usr \
+    --openssldir=/etc/ssl \
+    --libdir=lib \
+    shared \
+    enable-ktls \
+    enable-brotli \
+    enable-zlib \
+    enable-zstd \
+    enable-ec_nistp_64_gcc_128 \
+    "$platform"
+
+  make depend
+  make
+}
+
+_run_make_test_strict() {
+  local -a test_cmd=(make HARNESS_JOBS="$(nproc)" test)
+
+  if [[ "$CARCH" == "riscv64" || "$CARCH" == "aarch64" ]]; then
+    test_cmd=(make HARNESS_JOBS="$(nproc)" TESTS=-test_afalg test)
+  fi
+
+  "${test_cmd[@]}"
+}
+
+_run_make_test_profile() {
+  if ! _run_make_test_strict; then
+    msg2 "warning: make test returned non-zero during profile collection; continuing with partial profile"
+  fi
+}
+
+_merge_profraw_dir() {
+  local raw_dir="$1"
+  local out_file="$2"
+
+  if ! find "$raw_dir" -maxdepth 1 -type f -name '*.profraw' | grep -q .; then
+    echo "ERROR: no .profraw files found in $raw_dir" >&2
+    return 1
+  fi
+
+  llvm-profdata merge \
+    -num-threads="$(nproc)" \
+    --failure-mode=all \
+    -output="$out_file" \
+    "$raw_dir"
+
+  [[ -s "$out_file" ]] || {
+    echo "ERROR: failed to create $out_file" >&2
+    return 1
+  }
+}
+
+_run_pgo_workload() {
+  local openssl_bin="$srcdir/$pkgname-$pkgver/apps/openssl"
+  local workdir="$srcdir/openssl-pgo-work"
+  local tls_port=$((20000 + RANDOM % 20000))
+  local server_pid=""
+
+  export LD_LIBRARY_PATH="$srcdir/$pkgname-$pkgver${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  export OPENSSL_MODULES="$srcdir/$pkgname-$pkgver/providers"
+  export OPENSSL_CONF="$srcdir/$pkgname-$pkgver/apps/openssl.cnf"
+
+  _run_make_test_profile
+
+  rm -rf "$workdir"
+  mkdir -p "$workdir"
+  pushd "$workdir" >/dev/null
+
+  "$openssl_bin" version -a >/dev/null 2>&1 || true
+  "$openssl_bin" list -providers >/dev/null 2>&1 || true
+  "$openssl_bin" list -cipher-algorithms >/dev/null 2>&1 || true
+  "$openssl_bin" list -digest-algorithms >/dev/null 2>&1 || true
+  "$openssl_bin" list -public-key-algorithms >/dev/null 2>&1 || true
+
+  "$openssl_bin" rand -out payload.bin 1048576 >/dev/null 2>&1 || true
+  "$openssl_bin" rand -out small_payload.bin 32 >/dev/null 2>&1 || true
+
+  for alg in md5 sha1 sha256 sha512 sha3-256 sm3; do
+    "$openssl_bin" dgst "-$alg" payload.bin >/dev/null 2>&1 || true
+  done
+
+  "$openssl_bin" genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out rsa-key.pem >/dev/null 2>&1 || true
+  "$openssl_bin" req -config "$OPENSSL_CONF" -new -x509 -key rsa-key.pem -subj '/CN=openssl-pgo/' -days 1 -out cert.pem >/dev/null 2>&1 || true
+  "$openssl_bin" x509 -in cert.pem -noout -text >/dev/null 2>&1 || true
+
+  "$openssl_bin" pkey -in rsa-key.pem -pubout -out rsa-pub.pem >/dev/null 2>&1 || true
+  "$openssl_bin" pkeyutl -sign -inkey rsa-key.pem -in small_payload.bin -out payload.sig >/dev/null 2>&1 || true
+  "$openssl_bin" pkeyutl -verify -pubin -inkey rsa-pub.pem -sigfile payload.sig -in small_payload.bin >/dev/null 2>&1 || true
+
+  "$openssl_bin" genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ec-key-a.pem >/dev/null 2>&1 || true
+  "$openssl_bin" genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ec-key-b.pem >/dev/null 2>&1 || true
+  "$openssl_bin" pkey -in ec-key-b.pem -pubout -out ec-pub-b.pem >/dev/null 2>&1 || true
+  "$openssl_bin" pkeyutl -derive -inkey ec-key-a.pem -peerkey ec-pub-b.pem -out ecdh.bin >/dev/null 2>&1 || true
+
+  "$openssl_bin" genpkey -algorithm ED25519 -out ed-key.pem >/dev/null 2>&1 || true
+  "$openssl_bin" pkey -in ed-key.pem -pubout -out ed-pub.pem >/dev/null 2>&1 || true
+  "$openssl_bin" pkeyutl -sign -inkey ed-key.pem -in small_payload.bin -out ed-payload.sig >/dev/null 2>&1 || true
+
+  "$openssl_bin" enc -aes-256-cbc -pbkdf2 -salt -in payload.bin -out payload.enc -pass pass:arch-pgo >/dev/null 2>&1 || true
+  "$openssl_bin" enc -d -aes-256-cbc -pbkdf2 -in payload.enc -out payload.dec -pass pass:arch-pgo >/dev/null 2>&1 || true
+
+  "$openssl_bin" speed -seconds 1 -elapsed -evp aes-128-cbc aes-256-cbc aes-128-gcm aes-256-gcm chacha20-poly1305 >/dev/null 2>&1 || true
+  "$openssl_bin" speed -seconds 1 -elapsed rsa2048 rsa4096 ecdhp256 ecdhp384 ecdsap256 ecdsap384 >/dev/null 2>&1 || true
+
+  "$openssl_bin" s_server -cert cert.pem -key rsa-key.pem -www -port "$tls_port" > server.log 2>&1 &
+  server_pid=$!
+  sleep 2
+  for cipher in TLS_AES_128_GCM_SHA256 TLS_CHACHA20_POLY1305_SHA256; do
+    echo "Q" | "$openssl_bin" s_client -connect "127.0.0.1:$tls_port" -ciphersuites "$cipher" >/dev/null 2>&1 || true
+  done
+  for cipher in ECDHE-RSA-AES128-GCM-SHA256 ECDHE-RSA-CHACHA20-POLY1305; do
+    echo "Q" | "$openssl_bin" s_client -connect "127.0.0.1:$tls_port" -cipher "$cipher" -tls1_2 >/dev/null 2>&1 || true
+  done
+  kill "$server_pid" 2>/dev/null || true
+  wait "$server_pid" 2>/dev/null || true
+
+  popd >/dev/null
 }
 
 build() {
   cd "$srcdir/$pkgname-$pkgver"
   _set_llvm_toolchain
 
-  local _configure_options=(
-    --prefix=/usr
-    --openssldir=/etc/ssl
-    --libdir=lib
-    shared
-    enable-ktls
-    zlib-dynamic
-    no-ssl3
-    enable-ec_nistp_64_gcc_128
-    linux-x86_64
-  )
-
   local _base_cppflags="${CPPFLAGS}"
   local _base_cflags="${CFLAGS} -Wa,--noexecstack"
   local _base_ldflags="${LDFLAGS}"
 
   local _profdir="$srcdir/llvm-pgo"
-  rm -rf "$_profdir"
-  mkdir -p "$_profdir/raw"
+  local _ir_raw="$_profdir/ir-raw"
+  local _cs_raw="$_profdir/cs-raw"
+  local _ir_profdata="$_profdir/ir.profdata"
+  local _merged_profdata="$_profdir/merged.profdata"
+  local _vp_flags="-mllvm -vp-counters-per-site=16"
 
-  # --- Stage 1: LLVM PGO + CS-PGO instrumentation ---
-  msg "Starting PGO/CS-PGO instrumentation build..."
+  rm -rf "$_profdir" "$srcdir/openssl-pgo-work"
+  mkdir -p "$_ir_raw" "$_cs_raw"
+
+  msg2 "Stage 1: IR PGO instrumentation"
   export CPPFLAGS="$_base_cppflags"
-  export CFLAGS="$_base_cflags -g3 -fno-omit-frame-pointer \
-    -fprofile-instr-generate -fcs-profile-generate -fprofile-correction \
-    -mllvm -vp-counters-per-site=50 -mllvm -runtime-counter-relocation \
-    -mllvm -enable-value-profiling"
-  export LDFLAGS="$_base_ldflags"
-  export LLVM_PROFILE_FILE="$_profdir/raw/openssl-%p-%m.profraw"
+  export CFLAGS="$_base_cflags -fprofile-generate=$_ir_raw -fprofile-update=atomic $_vp_flags"
+  export LDFLAGS="$_base_ldflags -fprofile-generate=$_ir_raw"
+  export LLVM_PROFILE_MERGE_POOL_SIZE=32
+  export LLVM_PROFILE_FILE="$_ir_raw/default_%m.profraw"
 
-  ./Configure "${_configure_options[@]}"
-  make depend
-  make
+  make distclean >/dev/null 2>&1 || true
+  _configure_and_build
+  _run_pgo_workload
+  _merge_profraw_dir "$_ir_raw" "$_ir_profdata"
 
-  msg "Running tests to generate profile data..."
-  make test || echo "WARNING: 'make test' failed during profiling; profile data may be incomplete."
-
-  if ! compgen -G "$_profdir/raw/*.profraw" > /dev/null; then
-    echo "ERROR: No LLVM profraw files were generated; aborting."
-    return 1
-  fi
-
-  msg "Merging LLVM PGO profiles..."
-  llvm-profdata merge -num-threads="$(nproc)" \
-    -output="$_profdir/code.profdata" "$_profdir/raw"/*.profraw
-
-  msg "Merging LLVM CS-PGO profiles..."
-  llvm-profdata merge -num-threads="$(nproc)" --cs \
-    -output="$_profdir/cs.profdata" "$_profdir/raw"/*.profraw
-
-  if [[ ! -s "$_profdir/code.profdata" || ! -s "$_profdir/cs.profdata" ]]; then
-    echo "ERROR: Profile data merge failed; aborting."
-    return 1
-  fi
-
-  make distclean
-
-  # --- Stage 2: Final optimized build ---
-  msg "Starting final optimized build..."
+  msg2 "Stage 2: CS-PGO instrumentation (guided by stage-1 profile)"
   export CPPFLAGS="$_base_cppflags"
-  export CFLAGS="$_base_cflags \
-    -fprofile-instr-use=$_profdir/code.profdata \
-    -fcs-profile-use=$_profdir/cs.profdata \
-    -fprofile-correction"
-  export LDFLAGS="$_base_ldflags"
-  unset LLVM_PROFILE_FILE
+  export CFLAGS="$_base_cflags -fprofile-use=$_ir_profdata -fcs-profile-generate=$_cs_raw -fprofile-update=atomic $_vp_flags -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled"
+  export LDFLAGS="$_base_ldflags -fprofile-use=$_ir_profdata -fcs-profile-generate=$_cs_raw"
+  export LLVM_PROFILE_FILE="$_cs_raw/default_%m.profraw"
 
-  ./Configure "${_configure_options[@]}"
-  make depend
-  make
+  make distclean >/dev/null 2>&1 || true
+  _configure_and_build
+  _run_pgo_workload
 
-  msg "PGO/CS-PGO build complete."
+  llvm-profdata merge \
+    -num-threads="$(nproc)" \
+    --failure-mode=all \
+    -output="$_merged_profdata" \
+    "$_cs_raw" \
+    "$_ir_profdata"
+
+  [[ -s "$_merged_profdata" ]] || {
+    echo "ERROR: failed to create merged CS-PGO profile ($_merged_profdata)" >&2
+    return 1
+  }
+
+  msg2 "Stage 3: final optimized build"
+  export CPPFLAGS="$_base_cppflags"
+  export CFLAGS="$_base_cflags -fprofile-use=$_merged_profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled"
+  export LDFLAGS="$_base_ldflags -fprofile-use=$_merged_profdata"
+  unset LLVM_PROFILE_FILE LLVM_PROFILE_MERGE_POOL_SIZE
+
+  make distclean >/dev/null 2>&1 || true
+  _configure_and_build
 }
 
 check() {
   cd "$srcdir/$pkgname-$pkgver"
   _set_llvm_toolchain
-  msg "Running test suite on the final optimized build..."
-  make test
+  _run_make_test_strict
 }
 
 package() {
   cd "$srcdir/$pkgname-$pkgver"
 
-  make DESTDIR="$pkgdir" MANDIR=/usr/share/man MANSUFFIX=ssl install_sw install_ssldirs
+  # No manpages/docs installed to save package size/time.
+  make DESTDIR="$pkgdir" install_sw install_ssldirs
 
+  sed -i 's|^my \$CATOP = ".*";|my $CATOP = "/etc/ssl";|' "$pkgdir/etc/ssl/misc/CA.pl" 2>/dev/null || true
+  sed -i '/^\[ CA_default \]/,/^\[/{s|^[[:space:]]*dir[[:space:]]*=.*|dir\t\t= /etc/ssl\t\t# Where everything is kept|;}' "$pkgdir/etc/ssl/openssl.cnf"
+  sed -i '/^\[ tsa_config1 \]/,/^\[/{s|^[[:space:]]*dir[[:space:]]*=.*|dir\t\t= /etc/ssl\t\t# TSA root directory|;}' "$pkgdir/etc/ssl/openssl.cnf"
+
+  chmod 700 "$pkgdir/etc/ssl/private"
   install -D -m644 LICENSE.txt "$pkgdir/usr/share/licenses/$pkgname/LICENSE.txt"
 }
