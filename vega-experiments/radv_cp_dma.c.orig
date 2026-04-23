@@ -63,8 +63,8 @@ radv_cs_emit_cp_dma(struct radv_device *device, struct radv_cmd_stream *cs, bool
    else
       command |= S_415_BYTE_COUNT(size);
 
-   /* Sync flags. */
-   if (flags & CP_DMA_SYNC)
+   /* Sync flags. Only present for PFP/ME. MEC always sync. */
+   if ((flags & CP_DMA_SYNC) && cs->hw_ip == AMD_IP_GFX)
       header |= S_501_CP_SYNC(1);
 
    if (flags & CP_DMA_RAW_WAIT)
