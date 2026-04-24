@@ -1,3 +1,1155 @@
+--- a/src/backends/drm/drm_gpu.h	2026-04-24 23:49:00.640069528 +0200
++++ b/src/backends/drm/drm_gpu.h	2026-04-24 23:50:11.762377641 +0200
+@@ -15,6 +16,7 @@
+ #include "utils/filedescriptor.h"
+ #include "utils/version.h"
+ 
++#include <QHash>
+ #include <QList>
+ #include <QPointer>
+ #include <QSize>
+@@ -23,7 +25,11 @@
+ 
+ #include <chrono>
+ #include <epoxy/egl.h>
++#include <memory>
++#include <optional>
+ #include <sys/types.h>
++#include <unordered_map>
++#include <vector>
+ 
+ namespace KWin
+ {
+@@ -67,9 +73,6 @@ class KWIN_EXPORT DrmGpu : public QObjec
+ {
+     Q_OBJECT
+ public:
+-    /**
+-     * This should always be longer than any real pageflip can take, even with PSR and modesets
+-     */
+     static constexpr std::chrono::milliseconds s_pageflipTimeout = std::chrono::seconds(1);
+ 
+     DrmGpu(DrmBackend *backend, int fd, std::unique_ptr<DrmDevice> &&device);
+@@ -98,10 +101,6 @@ public:
+     QString driverName() const;
+     EglDisplay *eglDisplay() const;
+     DrmBackend *platform() const;
+-    /**
+-     * Returns the clock from which presentation timestamps are sourced. The returned value
+-     * can be either CLOCK_MONOTONIC or CLOCK_REALTIME.
+-     */
+     clockid_t presentationClock() const;
+     QSize cursorSize() const;
+ 
+@@ -154,11 +153,11 @@ private:
+     const std::unique_ptr<DrmDevice> m_drmDevice;
+     bool m_atomicModeSetting;
+     bool m_addFB2ModifiersSupported = false;
+-    bool m_isNVidia;
+-    bool m_isI915;
+-    bool m_isAmdgpu;
+-    bool m_isVmwgfx;
+-    bool m_isVirtualMachine;
++    bool m_isNVidia = false;
++    bool m_isI915 = false;
++    bool m_isAmdgpu = false;
++    bool m_isVmwgfx = false;
++    bool m_isVirtualMachine = false;
+     QString m_driverName;
+     bool m_supportsCursorPlaneHotspot = false;
+     bool m_asyncPageflipSupported = false;
+@@ -169,7 +168,7 @@ private:
+     bool m_forceLowBandwidthMode = false;
+     bool m_forceImplicitModifiers = false;
+     bool m_sharpnessSupported = false;
+-    clockid_t m_presentationClock;
++    clockid_t m_presentationClock = CLOCK_REALTIME;
+     std::unique_ptr<EglDisplay> m_eglDisplay;
+     DrmBackend *const m_platform;
+     std::optional<Version> m_nvidiaDriverVersion;
+
+
+--- a/src/backends/drm/drm_gpu.cpp	2026-04-24 23:48:58.151093740 +0200
++++ b/src/backends/drm/drm_gpu.cpp	2026-04-24 23:49:55.496535869 +0200
+@@ -28,8 +28,12 @@
+ #include "utils/envvar.h"
+ 
+ #include <QFile>
++#include <QScopeGuard>
++#include <QSet>
+ #include <algorithm>
+ #include <cstdint>
++#include <cstdlib>
++#include <cstring>
+ #include <drm_fourcc.h>
+ #include <errno.h>
+ #include <fcntl.h>
+@@ -37,6 +41,7 @@
+ #include <libdrm/drm_mode.h>
+ #include <poll.h>
+ #include <ranges>
++#include <span>
+ #include <unistd.h>
+ #include <xf86drm.h>
+ #include <xf86drmMode.h>
+@@ -68,18 +73,18 @@ DrmGpu::DrmGpu(DrmBackend *backend, int
+     uint64_t capability = 0;
+ 
+     if (drmGetCap(fd, DRM_CAP_CURSOR_WIDTH, &capability) == 0) {
+-        m_cursorSize.setWidth(capability);
++        m_cursorSize.setWidth(static_cast<int>(capability));
+     } else {
+         m_cursorSize.setWidth(64);
+     }
+ 
+     if (drmGetCap(fd, DRM_CAP_CURSOR_HEIGHT, &capability) == 0) {
+-        m_cursorSize.setHeight(capability);
++        m_cursorSize.setHeight(static_cast<int>(capability));
+     } else {
+         m_cursorSize.setHeight(64);
+     }
+ 
+-    int ret = drmGetCap(fd, DRM_CAP_TIMESTAMP_MONOTONIC, &capability);
++    const int ret = drmGetCap(fd, DRM_CAP_TIMESTAMP_MONOTONIC, &capability);
+     if (ret == 0 && capability == 1) {
+         m_presentationClock = CLOCK_MONOTONIC;
+     } else {
+@@ -93,28 +98,30 @@ DrmGpu::DrmGpu(DrmBackend *backend, int
+         qCDebug(KWIN_DRM) << "drmModeAddFB2WithModifiers is" << (m_addFB2ModifiersSupported ? "supported" : "not supported") << "on GPU" << this;
+     }
+ 
+-    // find out what driver this kms device is using
+     DrmUniquePtr<drmVersion> version(drmGetVersion(fd));
+-    m_isI915 = strstr(version->name, "i915");
+-    m_isNVidia = strstr(version->name, "nvidia-drm");
+-    m_isAmdgpu = strstr(version->name, "amdgpu");
+-    m_isVmwgfx = strstr(version->name, "vmwgfx");
+-    m_isVirtualMachine = strstr(version->name, "virtio") || strstr(version->name, "qxl")
+-        || strstr(version->name, "vmwgfx") || strstr(version->name, "vboxvideo");
++    const char *driverName = (version && version->name) ? version->name : "";
++    m_isI915 = std::strstr(driverName, "i915") != nullptr;
++    m_isNVidia = std::strstr(driverName, "nvidia-drm") != nullptr;
++    m_isAmdgpu = std::strstr(driverName, "amdgpu") != nullptr;
++    m_isVmwgfx = std::strstr(driverName, "vmwgfx") != nullptr;
++    m_isVirtualMachine = std::strstr(driverName, "virtio") != nullptr
++        || std::strstr(driverName, "qxl") != nullptr
++        || std::strstr(driverName, "vmwgfx") != nullptr
++        || std::strstr(driverName, "vboxvideo") != nullptr;
+     if (m_isNVidia) {
+-        QFile moduleVersion("/sys/module/nvidia_drm/version");
++        QFile moduleVersion(QStringLiteral("/sys/module/nvidia_drm/version"));
+         if (moduleVersion.open(QIODeviceBase::OpenModeFlag::ReadOnly)) {
+             m_nvidiaDriverVersion = Version::parseString(moduleVersion.readLine(100));
+         }
+     }
+-    m_driverName = version->name;
++    m_driverName = QString::fromLatin1(driverName);
+ 
+     m_socketNotifier = std::make_unique<QSocketNotifier>(fd, QSocketNotifier::Read);
+     connect(m_socketNotifier.get(), &QSocketNotifier::activated, this, &DrmGpu::dispatchEvents);
+ 
+     initDrmResources();
+ 
+-    if (m_atomicModeSetting == false) {
++    if (!m_atomicModeSetting) {
+         m_asyncPageflipSupported = drmGetCap(fd, DRM_CAP_ASYNC_PAGE_FLIP, &capability) == 0 && capability == 1;
+     } else {
+         m_asyncPageflipSupported = drmGetCap(fd, DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP, &capability) == 0 && capability == 1;
+@@ -132,7 +139,6 @@ DrmGpu::DrmGpu(DrmBackend *backend, int
+ 
+ DrmGpu::~DrmGpu()
+ {
+-    // clean up all `DrmFramebuffer`s before destroying the egl display
+     removeOutputs();
+     m_planeLayerMap.clear();
+     m_legacyLayerMap.clear();
+@@ -149,17 +155,18 @@ DrmGpu::~DrmGpu()
+ FileDescriptor DrmGpu::createNonMasterFd() const
+ {
+     char *path = drmGetDeviceNameFromFd2(m_fd);
++    if (!path) {
++        qCWarning(KWIN_DRM) << "Could not resolve DRM path for leasing!" << strerror(errno);
++        return FileDescriptor{};
++    }
++
+     FileDescriptor fd{open(path, O_RDWR | O_CLOEXEC)};
+     free(path);
+     if (!fd.isValid()) {
+         qCWarning(KWIN_DRM) << "Could not open DRM fd for leasing!" << strerror(errno);
+-    } else {
+-        if (drmIsMaster(fd.get())) {
+-            if (drmDropMaster(fd.get()) != 0) {
+-                qCWarning(KWIN_DRM) << "Could not create a non-master DRM fd for leasing!" << strerror(errno);
+-                return FileDescriptor{};
+-            }
+-        }
++    } else if (drmIsMaster(fd.get()) && drmDropMaster(fd.get()) != 0) {
++        qCWarning(KWIN_DRM) << "Could not create a non-master DRM fd for leasing!" << strerror(errno);
++        return FileDescriptor{};
+     }
+     return fd;
+ }
+@@ -171,17 +178,13 @@ clockid_t DrmGpu::presentationClock() co
+ 
+ void DrmGpu::initDrmResources()
+ {
+-    // try atomic mode setting
+     bool isEnvVarSet = false;
+     bool noAMS = qEnvironmentVariableIntValue("KWIN_DRM_NO_AMS", &isEnvVarSet) != 0 && isEnvVarSet;
+-    // always set the cap, so autotests can read back properties,
+-    // even when this DrmGpu otherwise only uses legacy modesetting
+     const bool atomicSuccessful = drmSetClientCap(m_fd, DRM_CLIENT_CAP_ATOMIC, 1) == 0;
+     if (noAMS) {
+         qCWarning(KWIN_DRM) << "Atomic Mode Setting requested off via environment variable. Using legacy mode on GPU" << this;
+     } else if (atomicSuccessful) {
+         if (m_isVirtualMachine) {
+-            // ATOMIC must be set before attempting CURSOR_PLANE_HOTSPOT
+             if (drmSetClientCap(m_fd, DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT, 1) != 0) {
+                 qCWarning(KWIN_DRM, "Atomic Mode Setting disabled on GPU %s because of cursor offset issues in virtual machines", qPrintable(m_drmDevice->path()));
+                 drmSetClientCap(m_fd, DRM_CLIENT_CAP_ATOMIC, 0);
+@@ -192,8 +195,8 @@ void DrmGpu::initDrmResources()
+         if (planeResources && !noAMS) {
+             qCDebug(KWIN_DRM) << "Using Atomic Mode Setting on gpu" << this;
+             qCDebug(KWIN_DRM) << "Number of planes on GPU" << this << ":" << planeResources->count_planes;
+-            // create the plane objects
+-            for (unsigned int i = 0; i < planeResources->count_planes; ++i) {
++            m_planes.reserve(planeResources->count_planes);
++            for (uint32_t i = 0; i < planeResources->count_planes; ++i) {
+                 auto plane = std::make_unique<DrmPlane>(this, planeResources->planes[i]);
+                 if (plane->init()) {
+                     m_allObjects << plane.get();
+@@ -217,15 +220,15 @@ void DrmGpu::initDrmResources()
+         qCCritical(KWIN_DRM) << "drmModeGetResources for getting CRTCs failed on GPU" << this;
+         return;
+     }
++    m_crtcs.reserve(resources->count_crtcs);
+     for (int i = 0; i < resources->count_crtcs; ++i) {
+         auto freePrimaryPlanes = m_planes | std::views::filter([this, i](const auto &plane) {
+             return plane->isCrtcSupported(i)
+                 && plane->type.enumValue() == DrmPlane::TypeIndex::Primary
+                 && std::ranges::none_of(m_crtcs, [&plane](const auto &crtc) {
+-                return crtc->primaryPlane() == plane.get();
+-            });
++                    return crtc->primaryPlane() == plane.get();
++                });
+         });
+-        // prefer an already connected plane
+         const uint32_t crtcId = resources->crtcs[i];
+         auto it = std::ranges::find_if(freePrimaryPlanes, [crtcId](const auto &plane) {
+             return plane->crtcId.value() == crtcId;
+@@ -258,8 +261,6 @@ bool DrmGpu::updateOutputs()
+         return false;
+     }
+ 
+-    // In principle these things are supposed to be detected through the wayland protocol.
+-    // In practice SteamVR doesn't always behave correctly
+     if (DrmUniquePtr<drmModeLesseeListRes> lessees{drmModeListLessees(m_fd)}) {
+         for (const DrmOutput *output : std::as_const(m_drmOutputs)) {
+             if (output->lease()) {
+@@ -275,20 +276,18 @@ bool DrmGpu::updateOutputs()
+         qCWarning(KWIN_DRM) << "drmModeListLessees() failed:" << strerror(errno);
+     }
+ 
+-    // update crtc properties
+     for (const auto &crtc : std::as_const(m_crtcs)) {
+         crtc->updateProperties();
+     }
+-    // update plane properties
+     for (const auto &plane : std::as_const(m_planes)) {
+         plane->updateProperties();
+     }
+ 
+-    // check for added and removed connectors
+-    QList<DrmConnector *> existing;
+-    QList<DrmOutput *> addedOutputs;
++    QSet<uint32_t> existingConnectorIds;
++    existingConnectorIds.reserve(resources->count_connectors);
+     for (int i = 0; i < resources->count_connectors; ++i) {
+         const uint32_t currentConnector = resources->connectors[i];
++        existingConnectorIds.insert(currentConnector);
+         const auto it = std::ranges::find_if(m_connectors, [currentConnector](const auto &connector) {
+             return connector->id() == currentConnector;
+         });
+@@ -297,31 +296,34 @@ bool DrmGpu::updateOutputs()
+             if (!conn->init()) {
+                 continue;
+             }
+-            existing.push_back(conn.get());
+             m_allObjects.push_back(conn.get());
+             m_connectors.push_back(std::move(conn));
+         } else {
+             (*it)->updateProperties();
+-            existing.push_back(it->get());
+         }
+     }
++
+     for (auto it = m_connectors.begin(); it != m_connectors.end();) {
+         DrmConnector *conn = it->get();
+         const auto output = findOutput(conn->id());
+-        const bool stillExists = existing.contains(conn);
++        const bool stillExists = existingConnectorIds.contains(conn->id());
+         if (!stillExists || !conn->isConnected()) {
+             if (output) {
+                 removeOutput(output);
+             }
+         } else if (!output) {
++            if (conn->modes().isEmpty()) {
++                qCWarning(KWIN_DRM) << "Ignoring connector without modes:" << conn->connectorName();
++                ++it;
++                continue;
++            }
+             qCDebug(KWIN_DRM, "New %soutput on GPU %s: %s", conn->isNonDesktop() ? "non-desktop " : "", qPrintable(m_drmDevice->path()), qPrintable(conn->modelName()));
+             auto &pipeline = m_pipelineMap[conn];
+             pipeline = std::make_unique<DrmPipeline>(conn);
+             m_pipelines.push_back(pipeline.get());
+-            auto output = new DrmOutput(*it, pipeline.get());
+-            m_drmOutputs << output;
+-            addedOutputs << output;
+-            Q_EMIT outputAdded(output);
++            auto newOutput = new DrmOutput(*it, pipeline.get());
++            m_drmOutputs << newOutput;
++            Q_EMIT outputAdded(newOutput);
+             pipeline->setActive(true);
+             pipeline->setEnable(false);
+             pipeline->setMode(conn->modes().front());
+@@ -329,13 +331,13 @@ bool DrmGpu::updateOutputs()
+         } else {
+             output->updateConnectorProperties();
+         }
++
+         if (stillExists) {
+             if (conn->isConnected() && conn->linkStatus.isValid() && conn->linkStatus.enumValue() == DrmConnector::LinkStatus::Bad) {
+                 qCWarning(KWIN_DRM, "Bad link status detected on connector %s", qPrintable(conn->connectorName()));
+-                // force a modeset, to renegotiate the connection
+                 m_forceModeset = true;
+             }
+-            it++;
++            ++it;
+         } else {
+             m_allObjects.removeOne(it->get());
+             it = m_connectors.erase(it);
+@@ -357,56 +359,97 @@ DrmPipeline::Error DrmGpu::checkCrtcAssi
+     if (std::chrono::steady_clock::now() > deadline) {
+         return DrmPipeline::Error::Timeout;
+     }
+-    if (connectors.isEmpty()) {
+-        const auto result = testPipelines();
+-        return result;
+-    }
+-    auto connector = connectors.takeFirst();
+-    auto pipelineIt = m_pipelineMap.find(connector);
+-    if (pipelineIt == m_pipelineMap.end()) {
+-        // this connector doesn't even have a connected output
+-        return checkCrtcAssignment(connectors, crtcs, deadline);
+-    }
+-    auto pipeline = pipelineIt->second.get();
+-    if (!pipeline->enabled() || !connector->isConnected()) {
+-        // disabled pipelines don't need CRTCs
+-        pipeline->setCrtc(nullptr);
+-        return checkCrtcAssignment(connectors, crtcs, deadline);
++
++    struct ActiveConnector {
++        DrmConnector *connector;
++        DrmPipeline *pipeline;
++    };
++    QList<ActiveConnector> activeConnectors;
++    activeConnectors.reserve(connectors.size());
++    for (DrmConnector *connector : std::as_const(connectors)) {
++        const auto pipelineIt = m_pipelineMap.find(connector);
++        if (pipelineIt == m_pipelineMap.end()) {
++            continue;
++        }
++        DrmPipeline *pipeline = pipelineIt->second.get();
++        if (!pipeline->enabled() || !connector->isConnected()) {
++            pipeline->setCrtc(nullptr);
++            continue;
++        }
++        activeConnectors.push_back({connector, pipeline});
++    }
++
++    if (activeConnectors.isEmpty()) {
++        return testPipelines();
+     }
+     if (crtcs.isEmpty()) {
+-        // we have no crtc left to drive this connector
+         return DrmPipeline::Error::NotEnoughCrtcs;
+     }
+-    DrmCrtc *currentCrtc = nullptr;
+-    if (m_atomicModeSetting) {
+-        // try the crtc that this connector is already connected to first
+-        const uint32_t id = connector->crtcId.value();
+-        auto it = std::ranges::find_if(crtcs, [id](const DrmCrtc *crtc) {
+-            return id == crtc->id();
+-        });
+-        if (it != crtcs.end()) {
+-            currentCrtc = *it;
+-            auto crtcsLeft = crtcs;
+-            crtcsLeft.removeOne(currentCrtc);
+-            pipeline->setCrtc(currentCrtc);
+-            DrmPipeline::Error err = checkCrtcAssignment(connectors, crtcsLeft, deadline);
+-            if (err == DrmPipeline::Error::None || err == DrmPipeline::Error::NoPermission || err == DrmPipeline::Error::FramePending || err == DrmPipeline::Error::Timeout) {
+-                return err;
++
++    std::vector<bool> used(static_cast<size_t>(crtcs.size()), false);
++    const auto isTerminalError = [](DrmPipeline::Error err) {
++        return err == DrmPipeline::Error::None
++            || err == DrmPipeline::Error::NoPermission
++            || err == DrmPipeline::Error::FramePending
++            || err == DrmPipeline::Error::Timeout;
++    };
++
++    const auto recurse = [&](auto &&self, qsizetype connectorIndex) -> DrmPipeline::Error {
++        if (std::chrono::steady_clock::now() > deadline) {
++            return DrmPipeline::Error::Timeout;
++        }
++        if (connectorIndex >= activeConnectors.size()) {
++            return testPipelines();
++        }
++
++        const ActiveConnector active = activeConnectors[connectorIndex];
++        DrmConnector *connector = active.connector;
++        DrmPipeline *pipeline = active.pipeline;
++        qsizetype preferredIndex = -1;
++
++        if (m_atomicModeSetting) {
++            const uint32_t currentId = connector->crtcId.value();
++            for (qsizetype i = 0; i < crtcs.size(); ++i) {
++                if (!used[static_cast<size_t>(i)] && crtcs[i]->id() == currentId) {
++                    preferredIndex = i;
++                    break;
++                }
+             }
+         }
+-    }
+-    for (DrmCrtc *crtc : std::as_const(crtcs)) {
+-        if (connector->isCrtcSupported(crtc) && crtc != currentCrtc) {
+-            auto crtcsLeft = crtcs;
+-            crtcsLeft.removeOne(crtc);
++
++        if (preferredIndex >= 0) {
++            DrmCrtc *crtc = crtcs[preferredIndex];
++            if (connector->isCrtcSupported(crtc)) {
++                used[static_cast<size_t>(preferredIndex)] = true;
++                pipeline->setCrtc(crtc);
++                const DrmPipeline::Error err = self(self, connectorIndex + 1);
++                used[static_cast<size_t>(preferredIndex)] = false;
++                if (isTerminalError(err)) {
++                    return err;
++                }
++            }
++        }
++
++        for (qsizetype i = 0; i < crtcs.size(); ++i) {
++            if (i == preferredIndex || used[static_cast<size_t>(i)]) {
++                continue;
++            }
++            DrmCrtc *crtc = crtcs[i];
++            if (!connector->isCrtcSupported(crtc)) {
++                continue;
++            }
++            used[static_cast<size_t>(i)] = true;
+             pipeline->setCrtc(crtc);
+-            DrmPipeline::Error err = checkCrtcAssignment(connectors, crtcsLeft, deadline);
+-            if (err == DrmPipeline::Error::None || err == DrmPipeline::Error::NoPermission || err == DrmPipeline::Error::FramePending || err == DrmPipeline::Error::Timeout) {
++            const DrmPipeline::Error err = self(self, connectorIndex + 1);
++            used[static_cast<size_t>(i)] = false;
++            if (isTerminalError(err)) {
+                 return err;
+             }
+         }
+-    }
+-    return DrmPipeline::Error::InvalidArguments;
++        return DrmPipeline::Error::InvalidArguments;
++    };
++
++    return recurse(recurse, 0);
+ }
+ 
+ static const std::chrono::milliseconds s_checkCrtcTimeout = environmentVariableIntValue("KWIN_DRM_PENDING_CONFIG_TIMEOUT").transform([](int value) {
+@@ -416,26 +459,37 @@ static const std::chrono::milliseconds s
+ DrmPipeline::Error DrmGpu::testPendingConfiguration()
+ {
+     QList<DrmConnector *> connectors;
++    connectors.reserve(static_cast<qsizetype>(m_connectors.size()));
+     QList<DrmCrtc *> crtcs;
+-    // only change resources that aren't currently leased away
++    crtcs.reserve(static_cast<qsizetype>(m_crtcs.size()));
++
++    QSet<DrmConnector *> leasedConnectors;
++    leasedConnectors.reserve(m_drmOutputs.size());
++    QSet<DrmCrtc *> leasedCrtcs;
++    leasedCrtcs.reserve(m_drmOutputs.size());
++    bool hasPreferAccuracy = false;
++    for (const DrmOutput *output : std::as_const(m_drmOutputs)) {
++        hasPreferAccuracy |= output->colorPowerTradeoff() == BackendOutput::ColorPowerTradeoff::PreferAccuracy;
++        if (!output->lease()) {
++            continue;
++        }
++        leasedConnectors.insert(output->pipeline()->connector());
++        if (DrmCrtc *leasedCrtc = output->pipeline()->crtc()) {
++            leasedCrtcs.insert(leasedCrtc);
++        }
++    }
++
+     for (const auto &conn : m_connectors) {
+-        const bool isLeased = std::ranges::any_of(m_drmOutputs, [&conn](const auto output) {
+-            return output->lease() && output->pipeline()->connector() == conn.get();
+-        });
+-        if (!isLeased) {
++        if (!leasedConnectors.contains(conn.get())) {
+             connectors.push_back(conn.get());
+         }
+     }
+     for (const auto &crtc : m_crtcs) {
+-        const bool isLeased = std::ranges::any_of(m_drmOutputs, [&crtc](const auto output) {
+-            return output->lease() && output->pipeline()->crtc() == crtc.get();
+-        });
+-        if (!isLeased) {
++        if (!leasedCrtcs.contains(crtc.get())) {
+             crtcs.push_back(crtc.get());
+         }
+     }
+     if (m_atomicModeSetting) {
+-        // sort outputs by being already connected (to any CRTC) so that already working outputs get preferred
+         std::sort(connectors.begin(), connectors.end(), [](auto c1, auto c2) {
+             return c1->crtcId.value() > c2->crtcId.value();
+         });
+@@ -445,12 +499,7 @@ DrmPipeline::Error DrmGpu::testPendingCo
+     if (err == DrmPipeline::Error::None || err == DrmPipeline::Error::NoPermission || err == DrmPipeline::Error::FramePending) {
+         return err;
+     }
+-    const bool hasPreferAccuracy = std::ranges::any_of(m_drmOutputs, [](const auto &output) {
+-        return output->colorPowerTradeoff() == BackendOutput::ColorPowerTradeoff::PreferAccuracy;
+-    });
+     if (m_addFB2ModifiersSupported || hasPreferAccuracy) {
+-        // We currently don't have any information about why the output config
+-        // got rejected; one possibility is missing memory bandwidth.
+         m_forceLowBandwidthMode = true;
+         err = checkCrtcAssignment(connectors, crtcs, std::chrono::steady_clock::now() + s_checkCrtcTimeout);
+     }
+@@ -459,23 +508,30 @@ DrmPipeline::Error DrmGpu::testPendingCo
+ 
+ void DrmGpu::releaseUnusedBuffers()
+ {
+-    const auto isLayerUsed = [this](DrmPipelineLayer *layer) {
+-        return std::ranges::any_of(m_pipelines, [layer](const auto &pipeline) {
+-            return pipeline->layers().contains(layer);
+-        });
+-    };
++    QSet<DrmPipelineLayer *> usedLayers;
++    usedLayers.reserve(static_cast<qsizetype>(m_planeLayerMap.size() + m_legacyLayerMap.size() + m_legacyCursorLayerMap.size()));
++    for (DrmPipeline *pipeline : std::as_const(m_pipelines)) {
++        const auto layers = pipeline->layers();
++        for (DrmPipelineLayer *layer : layers) {
++            usedLayers.insert(layer);
++        }
++    }
++
+     for (const auto &[plane, layer] : m_planeLayerMap) {
+-        if (!isLayerUsed(layer.get())) {
++        Q_UNUSED(plane);
++        if (!usedLayers.contains(layer.get())) {
+             layer->releaseBuffers();
+         }
+     }
+     for (const auto &[crtc, layer] : m_legacyLayerMap) {
+-        if (!isLayerUsed(layer.get())) {
++        Q_UNUSED(crtc);
++        if (!usedLayers.contains(layer.get())) {
+             layer->releaseBuffers();
+         }
+     }
+     for (const auto &[crtc, layer] : m_legacyCursorLayerMap) {
+-        if (!isLayerUsed(layer.get())) {
++        Q_UNUSED(crtc);
++        if (!usedLayers.contains(layer.get())) {
+             layer->releaseBuffers();
+         }
+     }
+@@ -484,7 +540,6 @@ void DrmGpu::releaseUnusedBuffers()
+ DrmPipeline::Error DrmGpu::testPipelines()
+ {
+     if (m_pipelines.empty()) {
+-        // nothing to do
+         return DrmPipeline::Error::None;
+     }
+     assignOutputLayers();
+@@ -492,15 +547,12 @@ DrmPipeline::Error DrmGpu::testPipelines
+         if (pipeline->output()->lease() || !pipeline->enabled()) {
+             continue;
+         }
+-        // reset all outputs to their most basic configuration (primary plane without scaling)
+-        // for the test, and set the target rects appropriately
+         const auto layers = pipeline->layers();
+         for (auto layer : layers) {
+             if (layer->type() == OutputLayerType::Primary) {
+                 layer->setTargetRect(Rect(QPoint(0, 0), pipeline->mode()->size()));
+                 layer->setSourceRect(Rect(QPoint(0, 0), pipeline->mode()->size()));
+                 layer->setEnabled(true);
+-                // ensure we have suitable buffers for the test
+                 if (!layer->preparePresentationTest()) {
+                     return DrmPipeline::Error::InvalidArguments;
+                 }
+@@ -535,8 +587,7 @@ static std::chrono::nanoseconds convertT
+     return std::chrono::seconds(timestamp.tv_sec) + std::chrono::nanoseconds(timestamp.tv_nsec);
+ }
+ 
+-static std::chrono::nanoseconds convertTimestamp(clockid_t sourceClock, clockid_t targetClock,
+-                                                 const timespec &timestamp)
++static std::chrono::nanoseconds convertTimestamp(clockid_t sourceClock, clockid_t targetClock, const timespec &timestamp)
+ {
+     if (sourceClock == targetClock) {
+         return convertTimestamp(timestamp);
+@@ -554,32 +605,28 @@ static std::chrono::nanoseconds convertT
+ 
+ void DrmGpu::pageFlipHandler(int fd, unsigned int sequence, unsigned int sec, unsigned int usec, unsigned int crtc_id, void *user_data)
+ {
++    (void)fd;
++    (void)sequence;
++    (void)crtc_id;
++
+     const auto commit = static_cast<DrmCommit *>(user_data);
+     const auto gpu = commit->gpu();
+-    const bool defunct = std::erase_if(gpu->m_defunctCommits, [commit](const auto &defunct) {
+-        return defunct.get() == commit;
++    const bool defunct = std::erase_if(gpu->m_defunctCommits, [commit](const auto &defunctCommit) {
++        return defunctCommit.get() == commit;
+     }) != 0;
+     if (defunct) {
+         return;
+     }
+ 
+-    // The static_cast<> here are for a 32-bit environment where
+-    // sizeof(time_t) == sizeof(unsigned int) == 4 . Putting @p sec
+-    // into a time_t cuts off the most-significant bit (after the
+-    // year 2038), similarly long can't hold all the bits of an
+-    // unsigned multiplication.
+     std::chrono::nanoseconds timestamp = convertTimestamp(gpu->presentationClock(), CLOCK_MONOTONIC,
+-                                                          {static_cast<time_t>(sec), static_cast<long>(usec * 1000)});
++                                                          {static_cast<time_t>(sec), static_cast<long>(usec) * 1000L});
+     if (timestamp == std::chrono::nanoseconds::zero()) {
+-        // in some cases this can happen a lot,
+-        // see https://gitlab.freedesktop.org/drm/amd/-/issues/4359 for example
+         static uint64_t s_warningCounter = 0;
+-        s_warningCounter++;
++        ++s_warningCounter;
+         if (s_warningCounter == 10) {
+             qCDebug(KWIN_DRM, "Too many invalid timestamps received, suppressing future warnings");
+         } else if (s_warningCounter < 10) {
+-            qCDebug(KWIN_DRM, "Got invalid timestamp (sec: %u, usec: %u) on gpu %s",
+-                    sec, usec, qPrintable(gpu->drmDevice()->path()));
++            qCDebug(KWIN_DRM, "Got invalid timestamp (sec: %u, usec: %u) on gpu %s", sec, usec, qPrintable(gpu->drmDevice()->path()));
+         }
+         timestamp = std::chrono::steady_clock::now().time_since_epoch();
+     }
+@@ -608,7 +655,6 @@ void DrmGpu::removeOutput(DrmOutput *out
+     m_pipelineMap.erase(output->connector());
+     output->removePipeline();
+     output->unref();
+-    // force a modeset to make sure unused objects are cleaned up
+     m_forceModeset = true;
+ }
+ 
+@@ -631,7 +677,6 @@ std::unique_ptr<DrmLease> DrmGpu::leaseO
+         return nullptr;
+     }
+ 
+-    // allocate crtcs for the outputss
+     for (DrmOutput *output : outputs) {
+         output->pipeline()->setEnable(true);
+         output->pipeline()->setActive(false);
+@@ -647,7 +692,7 @@ std::unique_ptr<DrmLease> DrmGpu::leaseO
+         }
+     }
+ 
+-    uint32_t lesseeId;
++    uint32_t lesseeId = 0;
+     FileDescriptor fd{drmModeCreateLease(m_fd, objects.constData(), objects.count(), 0, &lesseeId)};
+     if (!fd.isValid()) {
+         qCWarning(KWIN_DRM) << "Could not create DRM lease!" << strerror(errno);
+@@ -656,13 +701,13 @@ std::unique_ptr<DrmLease> DrmGpu::leaseO
+             qCWarning(KWIN_DRM) << res;
+         }
+         return nullptr;
+-    } else {
+-        qCDebug(KWIN_DRM) << "Created lease for" << objects.count() << "resources:";
+-        for (const uint32_t res : std::as_const(objects)) {
+-            qCDebug(KWIN_DRM) << res;
+-        }
+-        return std::make_unique<DrmLease>(this, std::move(fd), lesseeId, outputs);
+     }
++
++    qCDebug(KWIN_DRM) << "Created lease for" << objects.count() << "resources:";
++    for (const uint32_t res : std::as_const(objects)) {
++        qCDebug(KWIN_DRM) << res;
++    }
++    return std::make_unique<DrmLease>(this, std::move(fd), lesseeId, outputs);
+ }
+ 
+ QList<DrmOutput *> DrmGpu::drmOutputs() const
+@@ -769,7 +814,6 @@ void DrmGpu::setActive(bool active)
+                 output->renderLoop()->uninhibit();
+             }
+             for (const DrmOutput *output : std::as_const(m_drmOutputs)) {
+-                // force a modeset with legacy, we can't reliably know if one is needed
+                 if (!atomicModeSetting()) {
+                     output->pipeline()->forceLegacyModeset();
+                 }
+@@ -793,8 +837,8 @@ bool DrmGpu::needsModeset() const
+     return m_forceModeset
+         || !m_pendingModesetFrames.empty()
+         || std::ranges::any_of(m_pipelines, [](DrmPipeline *pipeline) {
+-        return !pipeline->output()->lease() && pipeline->needsModeset();
+-    });
++               return !pipeline->output()->lease() && pipeline->needsModeset();
++           });
+ }
+ 
+ void DrmGpu::maybeModeset(DrmPipeline *pipeline, const std::shared_ptr<OutputFrame> &frame)
+@@ -802,61 +846,55 @@ void DrmGpu::maybeModeset(DrmPipeline *p
+     if (pipeline && frame) {
+         m_pendingModesetFrames.emplace(pipeline, frame);
+     }
+-    auto pipelines = m_pipelines;
+-    for (const DrmOutput *output : std::as_const(m_drmOutputs)) {
+-        if (output->lease()) {
+-            pipelines.removeOne(output->pipeline());
++
++    QList<DrmPipeline *> pipelines;
++    pipelines.reserve(m_pipelines.size());
++    for (DrmPipeline *candidate : std::as_const(m_pipelines)) {
++        if (!candidate->output()->lease()) {
++            pipelines.push_back(candidate);
+         }
+     }
+-    const bool presentPendingForAll = std::ranges::all_of(pipelines, [](const DrmPipeline *pipeline) {
+-        return pipeline->modesetPresentPending() || !pipeline->activePending();
++
++    const bool presentPendingForAll = std::ranges::all_of(pipelines, [](const DrmPipeline *candidate) {
++        return candidate->modesetPresentPending() || !candidate->activePending();
+     });
+-    if (!presentPendingForAll) {
+-        // commit only once all pipelines are ready for presentation
+-        return;
+-    }
+-    if (!isIdle()) {
+-        // doing a modeset with pending pageflips would crash
+-        return;
+-    }
+-    if (m_inModeset) {
++    if (!presentPendingForAll || !isIdle() || m_inModeset) {
+         return;
+     }
+-    // Modesets need to be done asynchronously, to match how presentation
+-    // normally works. This is necessary because the Compositor adds presentation
+-    // time feedbacks to the OutputFrame after calling LogicalOutput::present
+     m_delayedModesetTimer.start();
+ }
+ 
+ void DrmGpu::doModeset()
+ {
+-    auto pipelines = m_pipelines;
+-    for (const DrmOutput *output : std::as_const(m_drmOutputs)) {
+-        if (output->lease()) {
+-            pipelines.removeOne(output->pipeline());
++    QList<DrmPipeline *> pipelines;
++    pipelines.reserve(m_pipelines.size());
++    for (DrmPipeline *candidate : std::as_const(m_pipelines)) {
++        if (!candidate->output()->lease()) {
++            pipelines.push_back(candidate);
+         }
+     }
++
+     if (pipelines.empty()) {
+         m_pendingModesetFrames.clear();
+         m_forceModeset = false;
+         return;
+     }
++
+     m_inModeset = true;
+     const DrmPipeline::Error err = DrmPipeline::commitPipelines(pipelines, DrmPipeline::CommitMode::CommitModeset, unusedModesetObjects());
+-    for (DrmPipeline *pipeline : std::as_const(pipelines)) {
+-        if (pipeline->modesetPresentPending()) {
+-            pipeline->resetModesetPresentPending();
++    for (DrmPipeline *activePipeline : std::as_const(pipelines)) {
++        if (activePipeline->modesetPresentPending()) {
++            activePipeline->resetModesetPresentPending();
+         }
+     }
+     m_forceModeset = false;
+     if (err == DrmPipeline::Error::None) {
+-        for (const auto &[pipeline, frame] : m_pendingModesetFrames) {
+-            frame->presented(std::chrono::steady_clock::now().time_since_epoch(), PresentationMode::VSync);
+-        }
+-    } else {
+-        if (err != DrmPipeline::Error::FramePending) {
+-            QTimer::singleShot(0, m_platform, &DrmBackend::updateOutputs);
++        for (const auto &[pendingPipeline, pendingFrame] : m_pendingModesetFrames) {
++            (void)pendingPipeline;
++            pendingFrame->presented(std::chrono::steady_clock::now().time_since_epoch(), PresentationMode::VSync);
+         }
++    } else if (err != DrmPipeline::Error::FramePending) {
++        QTimer::singleShot(0, m_platform, &DrmBackend::updateOutputs);
+     }
+     m_pendingModesetFrames.clear();
+     m_inModeset = false;
+@@ -869,7 +907,6 @@ QList<DrmObject *> DrmGpu::unusedModeset
+         ret.removeOne(pipeline->connector());
+         if (pipeline->crtc()) {
+             ret.removeOne(pipeline->crtc());
+-            // for modesets, only the primary plane should be enabled
+             ret.removeOne(pipeline->crtc()->primaryPlane());
+         }
+     }
+@@ -901,10 +938,13 @@ void DrmGpu::releaseBuffers()
+ void DrmGpu::createLayers()
+ {
+     if (m_atomicModeSetting) {
++        m_planeLayerMap.reserve(m_planes.size());
+         for (const auto &plane : m_planes) {
+             m_planeLayerMap[plane.get()] = m_platform->renderBackend()->createDrmPlaneLayer(plane.get());
+         }
+     } else {
++        m_legacyLayerMap.reserve(m_crtcs.size());
++        m_legacyCursorLayerMap.reserve(m_crtcs.size());
+         for (const auto &crtc : m_crtcs) {
+             m_legacyLayerMap[crtc.get()] = m_platform->renderBackend()->createDrmPlaneLayer(this, DrmPlane::TypeIndex::Primary);
+             m_legacyCursorLayerMap[crtc.get()] = m_platform->renderBackend()->createDrmPlaneLayer(this, DrmPlane::TypeIndex::Cursor);
+@@ -919,32 +959,56 @@ void DrmGpu::createLayers()
+ void DrmGpu::assignOutputLayers()
+ {
+     if (m_atomicModeSetting) {
+-        QList<DrmPlane *> freePlanes = m_planes | std::views::transform([](const auto &plane) {
+-            return plane.get();
+-        }) | std::ranges::to<QList>();
++        QList<DrmPlane *> freePlanes;
++        freePlanes.reserve(static_cast<qsizetype>(m_planes.size()));
++        for (const auto &plane : m_planes) {
++            freePlanes.push_back(plane.get());
++        }
+         const size_t enabledPipelinesCount = std::ranges::count_if(m_pipelines, &DrmPipeline::enabled);
++
+         for (DrmPipeline *pipeline : std::as_const(m_pipelines)) {
+             if (!pipeline->enabled()) {
+                 pipeline->setLayers({});
+                 continue;
+             }
+-            QList<DrmPipelineLayer *> layers = {m_planeLayerMap[pipeline->crtc()->primaryPlane()].get()};
+-            for (DrmPlane *plane : freePlanes) {
+-                if (plane->isCrtcSupported(pipeline->crtc()->pipeIndex())
++
++            DrmCrtc *const crtc = pipeline->crtc();
++            if (!crtc) {
++                pipeline->setLayers({});
++                continue;
++            }
++
++            QList<DrmPipelineLayer *> layers;
++            layers.reserve(static_cast<qsizetype>(2 + freePlanes.size()));
++            const auto primaryIt = m_planeLayerMap.find(crtc->primaryPlane());
++            if (primaryIt == m_planeLayerMap.end()) {
++                pipeline->setLayers({});
++                continue;
++            }
++            layers.push_back(primaryIt->second.get());
++            const auto pipeIndex = crtc->pipeIndex();
++
++            for (qsizetype i = 0; i < freePlanes.size(); ++i) {
++                DrmPlane *plane = freePlanes[i];
++                if (plane->isCrtcSupported(pipeIndex)
+                     && plane->type.enumValue() == DrmPlane::TypeIndex::Cursor) {
+-                    layers.push_back(m_planeLayerMap[plane].get());
+-                    freePlanes.removeOne(plane);
++                    const auto cursorIt = m_planeLayerMap.find(plane);
++                    if (cursorIt != m_planeLayerMap.end()) {
++                        layers.push_back(cursorIt->second.get());
++                        freePlanes.removeAt(i);
++                    }
+                     break;
+                 }
+             }
++
+             if (enabledPipelinesCount == 1) {
+-                // To avoid having to deal with GPU-wide bandwidth restrictions
+-                // and switching planes between outputs, for now only use overlay
+-                // planes with single-output setups
+-                for (DrmPlane *plane : freePlanes) {
+-                    if (plane->isCrtcSupported(pipeline->crtc()->pipeIndex())
++                for (DrmPlane *plane : std::as_const(freePlanes)) {
++                    if (plane->isCrtcSupported(pipeIndex)
+                         && plane->type.enumValue() == DrmPlane::TypeIndex::Overlay) {
+-                        layers.push_back(m_planeLayerMap[plane].get());
++                        const auto overlayIt = m_planeLayerMap.find(plane);
++                        if (overlayIt != m_planeLayerMap.end()) {
++                            layers.push_back(overlayIt->second.get());
++                        }
+                     }
+                 }
+             }
+@@ -956,7 +1020,18 @@ void DrmGpu::assignOutputLayers()
+                 pipeline->setLayers({});
+                 continue;
+             }
+-            pipeline->setLayers({m_legacyLayerMap[pipeline->crtc()].get(), m_legacyCursorLayerMap[pipeline->crtc()].get()});
++            DrmCrtc *const crtc = pipeline->crtc();
++            if (!crtc) {
++                pipeline->setLayers({});
++                continue;
++            }
++            const auto primaryIt = m_legacyLayerMap.find(crtc);
++            const auto cursorIt = m_legacyCursorLayerMap.find(crtc);
++            if (primaryIt == m_legacyLayerMap.end() || cursorIt == m_legacyCursorLayerMap.end()) {
++                pipeline->setLayers({});
++                continue;
++            }
++            pipeline->setLayers({primaryIt->second.get(), cursorIt->second.get()});
+         }
+     }
+ }
+@@ -967,6 +1042,10 @@ std::shared_ptr<DrmFramebuffer> DrmGpu::
+     if (Q_UNLIKELY(!attributes)) {
+         return nullptr;
+     }
++    if (attributes->planeCount <= 0 || attributes->planeCount > 4) {
++        qCWarning(KWIN_DRM) << "Invalid plane count" << attributes->planeCount;
++        return nullptr;
++    }
+ 
+     const auto it = m_fbCache.constFind(buffer);
+     if (it != m_fbCache.constEnd()) {
+@@ -974,7 +1053,7 @@ std::shared_ptr<DrmFramebuffer> DrmGpu::
+     }
+ 
+     uint32_t handles[] = {0, 0, 0, 0};
+-    auto cleanup = qScopeGuard([this, &handles]() {
++    [[maybe_unused]] const auto cleanup = qScopeGuard([this, &handles]() {
+         for (int i = 0; i < 4; ++i) {
+             if (handles[i] == 0) {
+                 continue;
+@@ -986,12 +1065,12 @@ std::shared_ptr<DrmFramebuffer> DrmGpu::
+                     break;
+                 }
+             }
+-            if (closed) {
+-                continue;
++            if (!closed) {
++                drmCloseBufferHandle(m_fd, handles[i]);
+             }
+-            drmCloseBufferHandle(m_fd, handles[i]);
+         }
+     });
++
+     for (int i = 0; i < attributes->planeCount; ++i) {
+         if (drmPrimeFDToHandle(m_fd, attributes->fd[i].get(), &handles[i]) != 0) {
+             qCWarning(KWIN_DRM) << "drmPrimeFDToHandle() failed";
+@@ -1000,7 +1079,7 @@ std::shared_ptr<DrmFramebuffer> DrmGpu::
+     }
+ 
+     uint32_t framebufferId = 0;
+-    int ret;
++    int ret = 0;
+     if (addFB2ModifiersSupported() && attributes->modifier != DRM_FORMAT_MOD_INVALID) {
+         uint64_t modifier[4] = {0, 0, 0, 0};
+         for (int i = 0; i < attributes->planeCount; ++i) {
+@@ -1026,11 +1105,12 @@ std::shared_ptr<DrmFramebuffer> DrmGpu::
+                             attributes->offset.data(),
+                             &framebufferId,
+                             0);
+-        if (ret == EOPNOTSUPP && attributes->planeCount == 1) {
++        if (ret == -EOPNOTSUPP && attributes->planeCount == 1) {
+             ret = drmModeAddFB(m_fd,
+                                attributes->width,
+                                attributes->height,
+-                               24, 32,
++                               24,
++                               32,
+                                attributes->pitch[0],
+                                handles[0],
+                                &framebufferId);
+@@ -1068,8 +1148,6 @@ QList<OutputLayer *> DrmGpu::compatibleO
+     if (auto virt = qobject_cast<DrmVirtualOutput *>(output)) {
+         return {virt->primaryLayer()};
+     }
+-    // TODO once dynamic ownership of layers is defined somehow,
+-    // additionally return planes that aren't currently in use
+     return static_cast<DrmOutput *>(output)->pipeline()->layers() | std::ranges::to<QList<OutputLayer *>>();
+ }
+ 
+@@ -1079,14 +1157,14 @@ DrmLease::DrmLease(DrmGpu *gpu, FileDesc
+     , m_lesseeId(lesseeId)
+     , m_outputs(outputs)
+ {
+-    for (const auto output : m_outputs) {
++    for (DrmOutput *output : m_outputs) {
+         output->leased(this);
+     }
+ }
+ 
+ DrmLease::~DrmLease()
+ {
+-    qCDebug(KWIN_DRM, "Revoking lease with leaseID %d", m_lesseeId);
++    qCDebug(KWIN_DRM, "Revoking lease with leaseID %u", m_lesseeId);
+     drmModeRevokeLease(m_gpu->fd(), m_lesseeId);
+     for (DrmOutput *output : m_outputs) {
+         output->leaseEnded();
+
+--- a/src/backends/drm/drm_virtual_output.cpp	2026-04-24 23:07:11.804199390 +0200
++++ b/src/backends/drm/drm_virtual_output.cpp	2026-04-24 23:09:26.770952540 +0200
+@@ -17,6 +17,8 @@
+ #include "drm_render_backend.h"
+ #include "utils/softwarevsyncmonitor.h"
+ 
++#include <utility>
++
+ namespace KWin
+ {
+ 
+@@ -45,17 +47,18 @@ DrmVirtualOutput::DrmVirtualOutput(DrmBa
+     recreateSurface();
+ }
+ 
+-DrmVirtualOutput::~DrmVirtualOutput()
+-{
+-}
++DrmVirtualOutput::~DrmVirtualOutput() = default;
+ 
+ bool DrmVirtualOutput::testPresentation(const std::shared_ptr<OutputFrame> &frame)
+ {
++    Q_UNUSED(frame)
+     return true;
+ }
+ 
+ bool DrmVirtualOutput::present(const QList<OutputLayer *> &layersToUpdate, const std::shared_ptr<OutputFrame> &frame)
+ {
++    Q_UNUSED(layersToUpdate)
++
+     m_frame = frame;
+     m_vsyncMonitor->arm();
+     return true;
+@@ -63,9 +66,8 @@ bool DrmVirtualOutput::present(const QLi
+ 
+ void DrmVirtualOutput::vblank(std::chrono::nanoseconds timestamp)
+ {
+-    if (m_frame) {
+-        m_frame->presented(timestamp, PresentationMode::VSync);
+-        m_frame.reset();
++    if (auto frame = std::exchange(m_frame, std::shared_ptr<OutputFrame>{}); frame) {
++        frame->presented(timestamp, PresentationMode::VSync);
+     }
+ }
+ 
+@@ -85,6 +87,24 @@ void DrmVirtualOutput::applyChanges(cons
+     if (!props) {
+         return;
+     }
++
++    const bool hasAnyChange = props->enabled
++        || props->transform
++        || props->pos
++        || props->scale
++        || props->scaleSetting
++        || props->desiredModeSize
++        || props->desiredModeRefreshRate
++        || props->mode
++        || props->uuid
++        || props->replicationSource
++        || props->priority
++        || props->deviceOffset
++        || props->customModes;
++    if (!hasAnyChange) {
++        return;
++    }
++
+     Q_EMIT aboutToChange(props.get());
+ 
+     State next = m_state;
+@@ -97,37 +117,57 @@ void DrmVirtualOutput::applyChanges(cons
+     next.desiredModeRefreshRate = props->desiredModeRefreshRate.value_or(m_state.desiredModeRefreshRate);
+     next.currentMode = props->mode.value_or(m_state.currentMode).lock();
+     if (!next.currentMode) {
++        if (next.modes.isEmpty()) {
++            return;
++        }
+         next.currentMode = next.modes.front();
+     }
+     next.uuid = props->uuid.value_or(m_state.uuid);
+     next.replicationSource = props->replicationSource.value_or(m_state.replicationSource);
+     next.priority = props->priority.value_or(m_state.priority);
+     next.deviceOffset = props->deviceOffset.value_or(m_state.deviceOffset);
++
+     if (props->customModes.has_value()) {
+         next.customModes = *props->customModes;
+ 
+         QList<std::shared_ptr<OutputMode>> newModes;
+-        for (const auto &mode : next.modes) {
++        newModes.reserve(next.modes.size() + next.customModes.size());
++
++        for (const auto &mode : std::as_const(next.modes)) {
+             if (mode->flags() & OutputMode::Flag::Custom) {
+                 continue;
+             }
+             newModes.push_back(mode);
+         }
+-        for (const auto &custom : next.customModes) {
++
++        for (const auto &custom : std::as_const(next.customModes)) {
+             newModes.push_back(std::make_shared<OutputMode>(custom.size, custom.refreshRate, custom.flags | OutputMode::Flag::Custom));
+         }
+-        next.modes = newModes;
++
++        next.modes = std::move(newModes);
+ 
+         if (!next.currentMode) {
++            if (next.modes.isEmpty()) {
++                return;
++            }
+             next.currentMode = next.modes.front();
+         } else if (!next.modes.contains(next.currentMode)) {
+-            const auto it = std::ranges::find_if(next.modes, [&next](const auto &mode) {
+-                return mode->size() == next.currentMode->size()
+-                    && mode->refreshRate() == next.currentMode->refreshRate()
+-                    && mode->flags() == next.currentMode->flags();
+-            });
+-            if (it != next.modes.end()) {
+-                next.currentMode = *it;
++            const auto currentSize = next.currentMode->size();
++            const auto currentRefreshRate = next.currentMode->refreshRate();
++            const auto currentFlags = next.currentMode->flags();
++            std::shared_ptr<OutputMode> matchedMode;
++
++            for (const auto &mode : std::as_const(next.modes)) {
++                if (mode->size() == currentSize
++                    && mode->refreshRate() == currentRefreshRate
++                    && mode->flags() == currentFlags) {
++                    matchedMode = mode;
++                    break;
++                }
++            }
++
++            if (matchedMode) {
++                next.currentMode = std::move(matchedMode);
+             } else {
+                 next.modes.push_front(next.currentMode);
+                 next.currentMode->setRemoved();
+@@ -135,9 +175,15 @@ void DrmVirtualOutput::applyChanges(cons
+         }
+     }
+ 
++    const auto oldRefreshRate = m_state.currentMode ? m_state.currentMode->refreshRate() : 0;
++    const auto newRefreshRate = next.currentMode ? next.currentMode->refreshRate() : 0;
++
+     setState(next);
+-    m_renderLoop->setRefreshRate(next.currentMode->refreshRate());
+-    m_vsyncMonitor->setRefreshRate(next.currentMode->refreshRate());
++
++    if (oldRefreshRate != newRefreshRate) {
++        m_renderLoop->setRefreshRate(newRefreshRate);
++        m_vsyncMonitor->setRefreshRate(newRefreshRate);
++    }
+ 
+     Q_EMIT changed();
+ }
+
 --- a/src/backends/drm/drm_backend.cpp	2026-04-15 17:01:00.167323528 +0200
 +++ b/src/backends/drm/drm_backend.cpp	2026-04-15 17:04:05.314888573 +0200
 @@ -53,19 +53,28 @@ namespace KWin
