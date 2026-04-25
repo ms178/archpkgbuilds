@@ -7,12 +7,18 @@
  */
 
 #include "radv_wsi.h"
-#include "meta/radv_meta.h"
-#include "util/macros.h"
+#include "radv_buffer.h"
+#include "radv_buffer_view.h"
+#include "radv_device.h"
+#include "radv_device_memory.h"
+#include "radv_entrypoints.h"
+#include "radv_physical_device.h"
+#include "radv_pipeline.h"
+#include "radv_pipeline_compute.h"
+#include "radv_queue.h"
+#include "radv_shader.h"
+
 #include "radv_debug.h"
-#include "vk_fence.h"
-#include "vk_semaphore.h"
-#include "vk_util.h"
 #include "wsi_common.h"
 
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
