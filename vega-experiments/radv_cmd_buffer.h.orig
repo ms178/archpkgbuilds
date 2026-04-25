@@ -434,9 +434,6 @@ struct radv_cmd_state {
    /* Whether to suspend streamout for internal driver operations. */
    bool suspend_streamout;
 
-   /* Whether this commandbuffer uses performance counters. */
-   bool uses_perf_counters;
-
    struct radv_ia_multi_vgt_param_helpers ia_multi_vgt_param;
 
    /* Tessellation info when patch control points is dynamic. */
@@ -511,6 +508,23 @@ struct radv_cmd_stream {
    struct ac_buffered_sh_regs buffered_sh_regs;
 };
 
+struct radv_cmd_buffer_queue_state {
+   uint64_t shader_upload_seq;
+   uint32_t scratch_size_per_wave_needed;
+   uint32_t scratch_waves_wanted;
+   uint32_t compute_scratch_size_per_wave_needed;
+   uint32_t compute_scratch_waves_wanted;
+   uint32_t esgs_ring_size_needed;
+   uint32_t gsvs_ring_size_needed;
+   bool tess_rings_needed;
+   bool task_rings_needed;
+   bool mesh_scratch_ring_needed;
+   bool gds_needed;    /* Emulated queries on GFX10-GFX10.3 */
+   bool gds_oa_needed; /* NGG streamout on GFX11-GFX11.5 */
+   bool sample_positions_needed;
+   bool uses_perf_counters;
+};
+
 struct radv_cmd_buffer {
    struct vk_command_buffer vk;
 
@@ -533,18 +547,7 @@ struct radv_cmd_buffer {
 
    struct radv_cmd_buffer_upload upload;
 
-   uint32_t scratch_size_per_wave_needed;
-   uint32_t scratch_waves_wanted;
-   uint32_t compute_scratch_size_per_wave_needed;
-   uint32_t compute_scratch_waves_wanted;
-   uint32_t esgs_ring_size_needed;
-   uint32_t gsvs_ring_size_needed;
-   bool tess_rings_needed;
-   bool task_rings_needed;
-   bool mesh_scratch_ring_needed;
-   bool gds_needed;    /* Emulated queries on GFX10-GFX10.3 */
-   bool gds_oa_needed; /* NGG streamout on GFX11-GFX11.5 */
-   bool sample_positions_needed;
+   struct radv_cmd_buffer_queue_state queue_state;
 
    uint64_t gfx9_fence_va;
    uint32_t gfx9_fence_idx;
@@ -608,8 +611,6 @@ struct radv_cmd_buffer {
       /* Temporary space for some transfer queue copy command workarounds. */
       struct radeon_winsys_bo *copy_temp;
    } transfer;
-
-   uint64_t shader_upload_seq;
 
    uint32_t sqtt_cb_id;
 
