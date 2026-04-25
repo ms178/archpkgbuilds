@@ -2231,8 +2231,12 @@ optimizations.extend([
    # Reduce intermediate precision with int64.
    (('u2u32', ('iadd(is_used_once)', 'a@64', b)),
     ('iadd', ('u2u32', a), ('u2u32', b))),
+   (('unpack_64_2x32_split_x', ('iadd(is_used_once)', 'a@64', b)),
+    ('iadd', ('u2u32', a), ('u2u32', b))),
 
    (('u2u32', ('imul(is_used_once)', 'a@64', b)),
+    ('imul', ('u2u32', a), ('u2u32', b))),
+   (('unpack_64_2x32_split_x', ('imul(is_used_once)', 'a@64', b)),
     ('imul', ('u2u32', a), ('u2u32', b))),
 
    (('u2f32', ('u2u64', 'a@32')), ('u2f32', a)),
