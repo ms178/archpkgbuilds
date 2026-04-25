@@ -342,6 +342,8 @@ damage_report(DamagePtr pDamage, RegionPtr pRegion, void *data)
 static void
 damage_destroy(DamagePtr pDamage, void *data)
 {
+    (void)pDamage;
+    (void)data;
 }
 
 static Bool
@@ -993,11 +995,11 @@ xwl_window_update_libdecor_size(struct xwl_window *xwl_window,
     double scale;
 
     if (xwl_window->libdecor_frame) {
-	scale = xwl_window_get_fractional_scale_factor(xwl_window);
-	state = libdecor_state_new(round((double) width / scale),
-	                           round((double) height / scale));
-	libdecor_frame_commit(xwl_window->libdecor_frame, state, configuration);
-	libdecor_state_free(state);
+        scale = xwl_window_get_fractional_scale_factor(xwl_window);
+        state = libdecor_state_new(round((double) width / scale),
+                                   round((double) height / scale));
+        libdecor_frame_commit(xwl_window->libdecor_frame, state, configuration);
+        libdecor_state_free(state);
     }
 }
 
@@ -1042,6 +1044,8 @@ static void
 handle_libdecor_close(struct libdecor_frame *frame,
                       void *data)
 {
+    (void)frame;
+    (void)data;
     DebugF("Terminating on compositor request");
     GiveUp(0);
 }
@@ -1050,6 +1054,7 @@ static void
 handle_libdecor_commit(struct libdecor_frame *frame,
                        void *data)
 {
+    (void)frame;
     struct xwl_window *xwl_window = data;
     wl_surface_commit(xwl_window->surface);
 }
@@ -1059,6 +1064,9 @@ handle_libdecor_dismiss_popup(struct libdecor_frame *frame,
                               const char *seat_name,
                               void *data)
 {
+    (void)frame;
+    (void)seat_name;
+    (void)data;
 }
 
 static struct libdecor_frame_interface libdecor_frame_iface = {
@@ -1196,6 +1204,8 @@ xwl_window_surface_enter(void *data,
         if (xwl_screen->fullscreen)
             xwl_window_set_fullscreen(xwl_window);
     }
+
+    (void)wl_surface;
 }
 
 static void
@@ -1214,6 +1224,8 @@ xwl_window_surface_leave(void *data,
 
     if (xwl_window->wl_output == wl_output)
         xwl_window->wl_output = NULL;
+
+    (void)wl_surface;
 }
 
 static const struct wl_surface_listener surface_listener = {
@@ -1263,12 +1275,16 @@ xdg_toplevel_handle_configure(void *data,
         if (!xwl_screen->active)
             xwl_screen_lost_focus(xwl_screen);
     }
+
+    (void)xdg_toplevel;
 }
 
 static void
 xdg_toplevel_handle_close(void *data,
                           struct xdg_toplevel *xdg_toplevel)
 {
+    (void)data;
+    (void)xdg_toplevel;
     DebugF("Terminating on compositor request");
     GiveUp(0);
 }
@@ -1324,6 +1340,8 @@ wp_fractional_scale_preferred_scale(void *data,
             xwl_window_update_rootful_scale(xwl_window, previous_scale);
         }
     }
+
+    (void)fractional_scale;
 }
 
 static const struct wp_fractional_scale_v1_listener fractional_scale_listener = {
@@ -1644,8 +1662,10 @@ xwl_realize_window(WindowPtr window)
     }
 
     xwl_window = ensure_surface_for_window(window);
-    if (!xwl_window)
+    if (!xwl_window) {
+        unregister_damage(window);
         return FALSE;
+    }
 
     return TRUE;
 }
@@ -1675,6 +1695,8 @@ xwl_surface_destroy_callback(OsTimerPtr timer, CARD32 now, void *arg)
 
     xwl_window_surface_do_destroy(xwl_wl_surface);
 
+    (void)timer;
+    (void)now;
     return 0;
 }
 
@@ -1919,6 +1941,7 @@ xwl_reparent_window(WindowPtr window, WindowPtr prior_parent)
     ScreenPtr screen = window->drawable.pScreen;
     struct xwl_screen *xwl_screen = xwl_screen_get(screen);
     WindowPtr parent = window->parent;
+    ClientPtr current_client;
     Bool *is_wm_window;
 
     if (xwl_screen->ReparentWindow) {
@@ -1928,8 +1951,10 @@ xwl_reparent_window(WindowPtr window, WindowPtr prior_parent)
         screen->ReparentWindow = xwl_reparent_window;
     }
 
+    current_client = GetCurrentClient();
     if (!parent->parent ||
-        GetCurrentClient()->index != xwl_screen->wm_client_id)
+        !current_client ||
+        current_client->index != xwl_screen->wm_client_id)
         return;
 
     /* If the WM client reparents a window, mark the new parent as a WM window */
@@ -2015,6 +2040,9 @@ frame_callback(void *data,
         if (xwl_window->frame_callback)
             xwl_present_for_each_frame_callback(xwl_window, xwl_present_reset_timer);
     }
+
+    (void)callback;
+    (void)time;
 }
 
 static const struct wl_callback_listener frame_listener = {
