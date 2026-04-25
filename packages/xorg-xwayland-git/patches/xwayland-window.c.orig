@@ -301,8 +301,10 @@ damage_report(DamagePtr pDamage, RegionPtr pRegion, void *data)
     struct xwl_screen *xwl_screen = xwl_screen_get(screen);
     PixmapPtr window_pixmap;
 
-    if (xwl_window &&
-        xwl_window->surface_window_damage &&
+    if (!xwl_window)
+        return;
+
+    if (xwl_window->surface_window_damage &&
         RegionNotEmpty(pRegion)) {
         if (!RegionNotEmpty(xwl_window->surface_window_damage))
             need_source_validate_inc(xwl_screen);
@@ -315,7 +317,7 @@ damage_report(DamagePtr pDamage, RegionPtr pRegion, void *data)
     if (xwl_screen->ignore_damage)
         return;
 
-    if (xwl_window && xorg_list_is_empty(&xwl_window->link_damage))
+    if (xorg_list_is_empty(&xwl_window->link_damage))
         xorg_list_add(&xwl_window->link_damage, &xwl_screen->damage_window_list);
 
     window_pixmap = screen->GetWindowPixmap(xwl_window->surface_window);
@@ -1603,8 +1605,10 @@ xwl_realize_window(WindowPtr window)
     }
 
     xwl_window = ensure_surface_for_window(window);
-    if (!xwl_window)
+    if (!xwl_window) {
+        unregister_damage(window);
         return FALSE;
+    }
 
     return TRUE;
 }
@@ -1878,6 +1882,7 @@ xwl_reparent_window(WindowPtr window, WindowPtr prior_parent)
     ScreenPtr screen = window->drawable.pScreen;
     struct xwl_screen *xwl_screen = xwl_screen_get(screen);
     WindowPtr parent = window->parent;
+    ClientPtr current_client;
     Bool *is_wm_window;
 
     if (xwl_screen->ReparentWindow) {
@@ -1887,8 +1892,10 @@ xwl_reparent_window(WindowPtr window, WindowPtr prior_parent)
         screen->ReparentWindow = xwl_reparent_window;
     }
 
+    current_client = GetCurrentClient();
     if (!parent->parent ||
-        GetCurrentClient()->index != xwl_screen->wm_client_id)
+        !current_client ||
+        current_client->index != xwl_screen->wm_client_id)
         return;
 
     /* If the WM client reparents a window, mark the new parent as a WM window */
