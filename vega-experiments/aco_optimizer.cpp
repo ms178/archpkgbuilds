@@ -113,25 +113,10 @@ struct ssa_info {
 
    ssa_info() : label(0) {}
 
-   void add_label(Label new_label)
-   {
-      if (new_label & temp_labels) {
-         label &= ~temp_labels;
-         label &= ~val_labels; /* temp and val alias */
-         label &= ~label_phys_reg; /* temp and phys_reg alias */
-      }
-
-      if (new_label & val_labels) {
-         label &= ~val_labels;
-         label &= ~temp_labels; /* temp and val alias */
-         label &= ~label_phys_reg; /* phys_reg and val alias */
-      }
-
-      if (new_label & label_phys_reg) {
-         label &= ~temp_labels; /* temp and phys_reg alias */
-         label &= ~val_labels;  /* val and phys_reg alias */
-      }
-
+   void add_label(Label new_label) {
+      constexpr uint64_t clear_mask = temp_labels | val_labels | label_phys_reg;
+      if (UNLIKELY(new_label & clear_mask))
+         label &= ~clear_mask;
       label |= new_label;
    }
 
@@ -5270,6 +5255,26 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
    if (instr->definitions.empty() || is_dead(ctx.uses, instr.get()))
       return;
 
+   if ((instr->opcode == aco_opcode::v_cndmask_b32 ||
+        instr->opcode == aco_opcode::v_cndmask_b16) &&
+       instr->operands.size() == 3 &&
+       !instr->usesModifiers())
+   {
+      const Operand &a = instr->operands[0];
+      const Operand &b = instr->operands[1];
+      if (a.isTemp() && b.isTemp() && a.tempId() == b.tempId()) {
+         aco_opcode mov_op = (instr->opcode == aco_opcode::v_cndmask_b16)
+                             ? aco_opcode::v_mov_b16 : aco_opcode::v_mov_b32;
+         Instruction* raw_mov = create_instruction(mov_op, Format::VOP1, 1, 1);
+         raw_mov->operands[0] = a;
+         raw_mov->definitions[0] = instr->definitions[0];
+         raw_mov->pass_flags = instr->pass_flags;
+         instr.reset(raw_mov);
+         ctx.info[instr->definitions[0].tempId()].parent_instr = instr.get();
+         return;
+      }
+   }
+
    if (instr->opcode == aco_opcode::p_split_vector && instr->operands[0].size() == 1) {
       bool will_be_removed = true;
       for (unsigned i = 1; i < instr->definitions.size(); i++)
@@ -5282,8 +5287,11 @@ combine_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       if (!def.isTemp())
          continue;
       ssa_info& info = ctx.info[def.tempId()];
-      if (info.is_extract() && ctx.uses[def.tempId()] > 4)
-         info.label &= ~label_extract;
+      if (info.is_extract()) {
+         unsigned threshold = ctx.program->gfx_level == GFX9? 8u : 4u;
+         if (ctx.uses[def.tempId()] > threshold)
+            info.label &= ~label_extract;
+      }
    }
 
    if (instr->isVALU() || instr->isSALU()) {
