@@ -19,8 +19,6 @@
 #include "radv_image_view.h"
 
 #include "ac_descriptors.h"
-#include "ac_formats.h"
-#include "gfx10_format_table.h"
 
 /* GFX9 ISA: V_008F1C_SQ_RSRC_IMG_* constants */
 

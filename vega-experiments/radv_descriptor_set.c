@@ -11,7 +11,6 @@
 #include "radv_descriptors.h"
 #include "radv_entrypoints.h"
 #include "radv_sampler.h"
-#include "sid.h"
 #include "vk_descriptors.h"
 
 static inline void

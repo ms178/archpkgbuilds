@@ -5983,7 +5983,7 @@ insert_replacement_instr(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 void
 select_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 {
-   const uint32_t threshold = 4;
+   const uint32_t threshold = (ctx.program->gfx_level == GFX9) ? 2u : 4u;
 
    if (!instr.get() || is_dead(ctx.uses, instr.get())) {
       instr.reset();

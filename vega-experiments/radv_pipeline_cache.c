@@ -6,12 +6,9 @@
 
 #include "radv_pipeline_cache.h"
 
-#include "util/disk_cache.h"
 #include "util/macros.h"
 #include "util/mesa-blake3.h"
 #include "util/u_atomic.h"
-#include "util/u_debug.h"
-
 #include "nir.h"
 #include "nir_serialize.h"
 
@@ -25,7 +22,6 @@
 #include "radv_shader.h"
 
 #include "vk_pipeline.h"
-#include "vk_util.h"
 
 #include "aco_interface.h"
 
