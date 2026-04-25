@@ -28,7 +28,6 @@
 
 #include "layers/radv_app_workarounds.h"
 #include "meta/radv_meta.h"
-#include "util/disk_cache.h"
 #include "util/u_debug.h"
 #include "radv_cs.h"
 #include "radv_debug.h"
@@ -42,32 +41,21 @@
 #include "radv_sqtt.h"
 #include "vk_common_entrypoints.h"
 #include "vk_pipeline_cache.h"
-#include "vk_semaphore.h"
 #include "vk_util.h"
 #ifdef _WIN32
 typedef void *drmDevicePtr;
 #include <io.h>
 #else
 #include <xf86drm.h>
-#include "drm-uapi/amdgpu_drm.h"
-#include "winsys/amdgpu/radv_amdgpu_winsys_public.h"
 #endif
-#include "util/build_id.h"
-#include "util/driconf.h"
 #include "util/mesa-blake3.h"
-#include "util/os_time.h"
-#include "util/timespec.h"
 #include "util/u_atomic.h"
 #include "util/u_process.h"
-#include "vulkan/vk_icd.h"
 #include "git_sha1.h"
 #include "sid.h"
-#include "vk_format.h"
 #include "vk_sync.h"
-#include "vk_sync_dummy.h"
 
-#include "ac_descriptors.h"
-#include "ac_formats.h"
+#include "aco_interface.h"
 
 static bool
 radv_trap_handler_enabled()
@@ -81,17 +69,15 @@ radv_device_should_clear_vram(const struct radv_device *device)
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const struct radv_instance *instance = radv_physical_device_instance(pdev);
 
-   /* Application explicitly requested zero-init – honor it */
+   /* Let applications control initialization behavior if the Vulkan feature is enabled. */
    if (device->vk.enabled_features.zeroInitializeDeviceMemory)
       return false;
 
    if (!instance->drirc.debug.zero_vram)
       return false;
 
-   const bool is_vega_hbm = (pdev->info.gfx_level == GFX9) &&
-                            (pdev->info.vram_type == AMDGPU_VRAM_TYPE_HBM);
-
-   if (is_vega_hbm)
+   /* Avoid expensive driver-side zeroing on Vega 10 class HBM cards (e.g. Vega 64). */
+   if (pdev->info.gfx_level == GFX9 && pdev->info.family == CHIP_VEGA10 && pdev->info.has_dedicated_vram)
       return false;
 
    return true;
@@ -730,7 +716,7 @@ radv_device_init_tools(struct radv_device *device)
    if (result != VK_SUCCESS)
       return result;
 
-   if ((instance->vk.trace_mode & RADV_TRACE_MODE_RRA) && radv_enable_rt(pdev)) {
+   if (radv_bvh_dumping_enabled(instance) && radv_enable_rt(pdev)) {
       result = radv_rra_trace_init(device);
       if (result != VK_SUCCESS)
          return result;
@@ -822,7 +808,7 @@ init_dispatch_tables(struct radv_device *device, struct radv_physical_device *pd
    if (instance->vk.trace_mode & RADV_TRACE_MODE_RGP)
       add_entrypoints(&b, &sqtt_device_entrypoints, RADV_RGP_DISPATCH_TABLE);
 
-   if ((instance->vk.trace_mode & RADV_TRACE_MODE_RRA) && radv_enable_rt(pdev))
+   if (radv_bvh_dumping_enabled(instance) && radv_enable_rt(pdev))
       add_entrypoints(&b, &rra_device_entrypoints, RADV_RRA_DISPATCH_TABLE);
 
 #ifndef _WIN32
@@ -1051,18 +1037,23 @@ radv_emit_default_sample_locations(const struct radv_physical_device *pdev, stru
       break;
    }
 
+   /* The exclusion bits can be set to improve rasterization efficiency if no sample lies on the
+    * pixel boundary (-8 sample offset). It's currently always TRUE because the driver doesn't
+    * support 16 samples.
+    */
    if (pdev->info.gfx_level >= GFX7 && pdev->info.gfx_level < GFX12) {
       radeon_set_context_reg(R_02882C_PA_SU_PRIM_FILTER_CNTL,
                              S_02882C_XMAX_RIGHT_EXCLUSION(1) | S_02882C_YMAX_BOTTOM_EXCLUSION(1));
    }
 
-   if (pdev->info.gfx_level >= GFX12)
+   if (pdev->info.gfx_level >= GFX12) {
       radeon_set_context_reg_seq(R_028BF0_PA_SC_CENTROID_PRIORITY_0, 2);
-   else
+   } else {
       radeon_set_context_reg_seq(R_028BD4_PA_SC_CENTROID_PRIORITY_0, 2);
-
+   }
    radeon_emit(centroid_priority);
    radeon_emit(centroid_priority >> 32);
+
    radeon_end();
 }
 
@@ -1104,6 +1095,144 @@ radv_device_init_msaa(struct radv_device *device)
       radv_get_sample_position(device, 4, i, device->sample_locations_4x[i]);
    for (i = 0; i < 8; i++)
       radv_get_sample_position(device, 8, i, device->sample_locations_8x[i]);
+}
+
+static bool
+radv_device_is_cache_disabled(const struct radv_device *device)
+{
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+   const struct radv_instance *instance = radv_physical_device_instance(pdev);
+
+   /* The buffer address used for debug printf is hardcoded. */
+   if (device->debug_nir.printf.buffer_addr)
+      return true;
+
+   /* The buffer address used for validating VAs is hardcoded. */
+   if (device->debug_nir.valid_va.buffer_addr)
+      return true;
+
+   /* Pipeline caches can be disabled with RADV_DEBUG=nocache, with MESA_GLSL_CACHE_DISABLE=1 and
+    * when ACO_DEBUG is used. MESA_GLSL_CACHE_DISABLE is done elsewhere.
+    */
+   if ((instance->debug_flags & RADV_DEBUG_NO_CACHE) || (pdev->use_llvm ? 0 : aco_get_codegen_flags()))
+      return true;
+
+   return false;
+}
+
+static void
+radv_device_init_compiler_info(struct radv_device *device)
+{
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+   struct radv_instance *instance = radv_physical_device_instance(pdev);
+
+   VkShaderStageFlags dump_shaders = 0;
+
+   if (instance->debug_flags & RADV_DEBUG_DUMP_VS)
+      dump_shaders |= VK_SHADER_STAGE_VERTEX_BIT;
+   if (instance->debug_flags & RADV_DEBUG_DUMP_TCS)
+      dump_shaders |= VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
+   if (instance->debug_flags & RADV_DEBUG_DUMP_TES)
+      dump_shaders |= VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+   if (instance->debug_flags & RADV_DEBUG_DUMP_GS)
+      dump_shaders |= VK_SHADER_STAGE_GEOMETRY_BIT;
+   if (instance->debug_flags & RADV_DEBUG_DUMP_PS)
+      dump_shaders |= VK_SHADER_STAGE_FRAGMENT_BIT;
+   if (instance->debug_flags & RADV_DEBUG_DUMP_TASK)
+      dump_shaders |= VK_SHADER_STAGE_TASK_BIT_EXT;
+   if (instance->debug_flags & RADV_DEBUG_DUMP_MESH)
+      dump_shaders |= VK_SHADER_STAGE_MESH_BIT_EXT;
+   if (instance->debug_flags & RADV_DEBUG_DUMP_CS)
+      dump_shaders |= VK_SHADER_STAGE_COMPUTE_BIT | RADV_RT_STAGE_BITS;
+
+   struct radv_compiler_info info = {
+      /* Hardware info */
+      .ac = &pdev->info.compiler_info,
+      .hw =
+         {
+            .family = pdev->info.family,
+            .address32_hi = pdev->info.address32_hi,
+            .rbplus_allowed = pdev->info.rbplus_allowed,
+            .mesh_fast_launch_2 = pdev->info.mesh_fast_launch_2,
+            .has_dedicated_vram = pdev->info.has_dedicated_vram,
+            .has_cs_regalloc_hang_bug = pdev->info.has_cs_regalloc_hang_bug,
+            .lds_size_per_workgroup = pdev->info.lds_size_per_workgroup,
+         },
+      /* Debug/tracing */
+      .debug =
+         {
+            .dump_spirv = !!(instance->debug_flags & RADV_DEBUG_DUMP_SPIRV),
+            .dump_backend_ir = !!(instance->debug_flags & RADV_DEBUG_DUMP_BACKEND_IR),
+            .dump_preopt_ir = !!(instance->debug_flags & RADV_DEBUG_DUMP_PREOPT_IR),
+            .dump_nir = !!(instance->debug_flags & RADV_DEBUG_DUMP_NIR),
+            .dump_asm = !!(instance->debug_flags & RADV_DEBUG_DUMP_ASM),
+            .dump_meta_shaders = !!(instance->debug_flags & RADV_DEBUG_DUMP_META_SHADERS),
+            .dump_shader_stats = !!(instance->debug_flags & RADV_DEBUG_DUMP_SHADER_STATS),
+            .nir_debug_info = !!(instance->debug_flags & RADV_DEBUG_NIR_DEBUG_INFO),
+            .dump_shaders = dump_shaders,
+            .check_ir = !!(instance->debug_flags & RADV_DEBUG_CHECKIR),
+            .printf_enabled = !!device->debug_nir.printf.buffer_addr,
+            .use_llvm = pdev->use_llvm,
+            .trap_enabled = !!device->trap_handler_shader,
+            .trap_excp_flags = instance->trap_excp_flags,
+            .debug_report = &instance->vk.debug_report,
+            .debug_nir = &device->debug_nir,
+            .shader_dump_mtx = &instance->shader_dump_mtx,
+            .keep_shader_info = device->keep_shader_info,
+            .capture_shaders = (instance->debug_flags & RADV_DEBUG_DUMP_SHADERS) || device->keep_shader_info,
+            /* Capture shader statistics when RGP is enabled to correlate shader hashes with Fossilize. */
+            .capture_shader_stats = (instance->debug_flags & (RADV_DEBUG_DUMP_SHADER_STATS | RADV_DEBUG_PSO_HISTORY)) ||
+                                    device->keep_shader_info || (instance->vk.trace_mode & RADV_TRACE_MODE_RGP),
+         },
+      .rra_trace = &device->rra_trace,
+      /* Cache */
+      .cache_disabled = radv_device_is_cache_disabled(device),
+      .enable_nir_cache = !!(instance->debug_flags & RADV_PERFTEST_NIR_CACHE),
+      .mem_cache = device->mem_cache,
+      .cache_key = &pdev->cache_key,
+      .override_graphics_shader_version = instance->drirc.misc.override_graphics_shader_version,
+      .override_ray_tracing_shader_version = instance->drirc.misc.override_ray_tracing_shader_version,
+      .override_compute_shader_version = instance->drirc.misc.override_compute_shader_version,
+      /* Descriptors */
+      .sampled_image_desc_size = radv_get_sampled_image_desc_size(pdev),
+      .combined_image_sampler_desc_size = radv_get_combined_image_sampler_desc_size(pdev),
+      .combined_image_sampler_offset = radv_get_combined_image_sampler_offset(pdev),
+      .sampler_descriptor_size = pdev->vk.properties.samplerDescriptorSize,
+      .sampler_descriptor_alignment = pdev->vk.properties.samplerDescriptorAlignment,
+      .image_descriptor_size = pdev->vk.properties.imageDescriptorSize,
+      .image_descriptor_alignment = pdev->vk.properties.imageDescriptorAlignment,
+      .buffer_descriptor_size = pdev->vk.properties.bufferDescriptorSize,
+      .buffer_descriptor_alignment = pdev->vk.properties.bufferDescriptorAlignment,
+      /* Shader features */
+      .use_ngg = pdev->use_ngg,
+      .use_ngg_streamout = pdev->use_ngg_streamout,
+      .load_grid_size_from_user_sgpr = device->load_grid_size_from_user_sgpr,
+      .emulate_ngg_gs_query_pipeline_stat = pdev->emulate_ngg_gs_query_pipeline_stat,
+      .primitives_generated_query = device->cache_key.primitives_generated_query,
+      .mesh_shader_queries = device->cache_key.mesh_shader_queries,
+      .image_2d_view_of_3d = device->cache_key.image_2d_view_of_3d,
+      .use_fmask = pdev->use_fmask,
+      .smooth_lines = device->vk.enabled_features.smoothLines,
+      .force_vrs_enabled = device->force_vrs_enabled,
+      .robust_buffer_access =
+         (device->vk.enabled_features.robustBufferAccess2 || device->vk.enabled_features.robustBufferAccess),
+      .force_aniso = device->force_aniso,
+      /* Wave/subgroup sizes */
+      .subgroup_size = device->vk.physical->properties.subgroupSize,
+      .min_subgroup_size = device->vk.physical->properties.minSubgroupSize,
+      .max_subgroup_size = device->vk.physical->properties.maxSubgroupSize,
+      .ge_wave_size = pdev->ge_wave_size,
+      .ps_wave_size = pdev->ps_wave_size,
+      .cs_wave_size = pdev->cs_wave_size,
+      .rt_wave_size = pdev->rt_wave_size,
+      /* NIR/SPIR-V */
+      .spirv_caps = vk_physical_device_get_spirv_capabilities(device->vk.physical),
+   };
+
+   for (uint32_t s = 0; s < MESA_VULKAN_SHADER_STAGES; s++)
+      info.nir_options[s] = pdev->nir_options[s];
+
+   device->compiler_info = info;
 }
 
 static void
@@ -1397,6 +1526,8 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
          goto fail;
    }
 
+   radv_device_init_compiler_info(device);
+
    if (device->vk.enabled_features.vertexInputDynamicState || device->vk.enabled_features.graphicsPipelineLibrary ||
        device->vk.enabled_features.shaderObject) {
       result = radv_device_init_vs_prologs(device);
@@ -1482,14 +1613,13 @@ radv_GetImageMemoryRequirements2(VkDevice _device, const VkImageMemoryRequiremen
    const uint32_t type_count = pdev->memory_properties.memoryTypeCount;
    const uint32_t all_types_mask = (type_count >= 32u) ? 0xffffffffu : ((1u << type_count) - 1u);
 
-   uint32_t memory_type_bits = all_types_mask & ~pdev->memory_types_32bit;
+   pMemoryRequirements->memoryRequirements.memoryTypeBits = all_types_mask & ~pdev->memory_types_32bit;
 
    if (image->vk.usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT) {
-      /* Only expose host visible memory types for images that need CPU mapping. */
-      memory_type_bits &= pdev->memory_types_host_visible;
+      /* Only expose host visible memory types for images that need to be mapped on the CPU. */
+      pMemoryRequirements->memoryRequirements.memoryTypeBits &= pdev->memory_types_host_visible;
    }
 
-   pMemoryRequirements->memoryRequirements.memoryTypeBits = memory_type_bits;
    pMemoryRequirements->memoryRequirements.size = size;
    pMemoryRequirements->memoryRequirements.alignment = alignment;
 

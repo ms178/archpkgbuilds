@@ -11,7 +11,6 @@
 #include "util/memstream.h"
 
 #include <algorithm>
-#include <array>
 #include <vector>
 
 #if defined(__clang__) || defined(__GNUC__)
