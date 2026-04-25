@@ -13,12 +13,10 @@
 
 #include "addrlib/src/amdgpu_asic_addr.h"
 #include "amd_family.h"
-#include "sid.h"
+#include "amdgfxregs.h"
 #include "util/macros.h"
-#include "util/u_cpu_detect.h"
 #include "util/u_math.h"
 #include "util/os_misc.h"
-#include "util/bitset.h"
 
 #include <stdio.h>
 #include <ctype.h>
