@@ -4,7 +4,7 @@ pkgname=(
   ca-certificates-mozilla
 )
 pkgver=3.123.1
-pkgrel=2.2
+pkgrel=2.9
 pkgdesc="Network Security Services"
 url="https://developer.mozilla.org/en-US/docs/Mozilla/Projects/NSS"
 arch=(x86_64)
@@ -46,26 +46,21 @@ prepare() {
   done
   ln -srft certs nss/lib/ckfw/builtins/{certdata.txt,nssckbi.h}
 
-  # NSS 3.123.1 regression fix:
-  # ssl_gtests.sh uses ./ssl_gtest_db.sh and assumes CWD.
-  # Make it path-stable regardless of invocation directory.
+  # NSS 3.123.1 regression: ssl_gtests.sh used cwd-relative helper.
   local gtest_script="nss/tests/ssl_gtests/ssl_gtests.sh"
   [[ -f "$gtest_script" ]] || {
     error "Missing $gtest_script"
     return 1
   }
 
-  # Insert script-dir anchor once.
   if ! grep -q '^SSL_GTESTS_DIR=' "$gtest_script"; then
     sed -i '/^ssl_gtest_certs() {/i SSL_GTESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n' "$gtest_script"
   fi
 
-  # Use absolute helper path relative to script location.
   sed -i \
     's|^\([[:space:]]*\)\./ssl_gtest_db\.sh "\${SSLGTESTDIR}" "\${BINDIR}/certutil" "\${R_NOISE_FILE}"|\1"${SSL_GTESTS_DIR}/ssl_gtest_db.sh" "${SSLGTESTDIR}" "${BINDIR}/certutil" "${R_NOISE_FILE}"|' \
     "$gtest_script"
 
-  # Force startup from anchored script dir.
   sed -i \
     's|^cd "$(dirname "$0")"$|cd "${SSL_GTESTS_DIR}"|' \
     "$gtest_script"
@@ -87,168 +82,272 @@ build() {
   ./bundle.sh
 
   local pgo_dir="$srcdir/pgo-data"
-  mkdir -p "${pgo_dir}/standard" "${pgo_dir}/cs"
+  local raw_ir="$pgo_dir/raw/ir"
+  local raw_cs="$pgo_dir/raw/cs"
+  local prof_dir="$pgo_dir/profdata"
+  local fallback_ir="$pgo_dir/fallback/ir"
+  local fallback_cs="$pgo_dir/fallback/cs"
+
+  mkdir -p "$raw_ir" "$raw_cs" "$prof_dir" "$fallback_ir" "$fallback_cs"
 
   local orig_cflags="${CFLAGS:-}"
   local orig_cxxflags="${CXXFLAGS:-}"
   local orig_ldflags="${LDFLAGS:-}"
 
-  local unwind_ldflags=""
-  if command -v gcc >/dev/null 2>&1; then
-    local gcc_libgcc gcc_libunwind
-    gcc_libgcc="$(gcc -print-file-name=libgcc_s.so 2>/dev/null || true)"
-    if [[ -n "$gcc_libgcc" && -f "$gcc_libgcc" ]]; then
-      unwind_ldflags+=" -lgcc_s"
-    fi
-    gcc_libunwind="$(gcc -print-file-name=libunwind.so 2>/dev/null || true)"
-    if [[ -n "$gcc_libunwind" && -f "$gcc_libunwind" ]]; then
-      unwind_ldflags+=" -lunwind"
-    fi
-  fi
-  if [[ -z "$unwind_ldflags" ]]; then
-    [[ -f /usr/lib/libgcc_s.so || -f /usr/lib64/libgcc_s.so ]] && unwind_ldflags+=" -lgcc_s"
-    [[ -f /usr/lib/libunwind.so || -f /usr/lib64/libunwind.so ]] && unwind_ldflags+=" -lunwind"
-  fi
+  # PGO-only quality tuning.
+  local pgo_quality_flags="-fprofile-update=atomic -mllvm -enable-value-profiling -mllvm -vp-counters-per-site=8"
 
-  run_ssl_gtests() {
-    local stage="$1"
-    msg2 "Running NSS ssl_gtests for ${stage}"
+  pick_free_port_block() {
+    local block_size="${1:-32}"
+    python - "$block_size" <<'PY'
+import random, socket, sys
+b = int(sys.argv[1])
 
-    cd "$srcdir/nss/tests" || return 1
-    export NSS_TESTS="ssl_gtests"
-    export NSS_CYCLES="standard"
-    export NSS_DEFAULT_DB_TYPE="sql"
-    export HOST="localhost"
-    export DOMSUF="localdomain"
+def ok(p):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", p))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
 
-    # Upstream-supported runner for NSS tests.
-    if ! bash ./all.sh; then
-      error "SSL tests failed for ${stage}"
-      return 1
-    fi
-
-    cd "$srcdir/nss" || return 1
+ports = list(range(20000, 55000))
+random.shuffle(ports)
+for base in ports:
+    if base + b >= 65535:
+        continue
+    if all(ok(p) for p in range(base, base + b)):
+        print(base)
+        sys.exit(0)
+sys.exit(1)
+PY
   }
 
-  merge_profraw_dir() {
-    local dir="$1"
-    local out="$2"
-    local profraw_files=()
+  count_profraw() {
+    local d="$1"
+    shopt -s nullglob
+    local f=( "$d"/*.profraw )
+    shopt -u nullglob
+    echo "${#f[@]}"
+  }
+
+  merge_raw_dir() {
+    local raw_dir="$1"
+    local out_prof="$2"
 
     shopt -s nullglob
-    profraw_files=("${dir}"/*.profraw)
+    local raws=( "$raw_dir"/*.profraw )
     shopt -u nullglob
-
-    if (( ${#profraw_files[@]} == 0 )); then
-      error "No .profraw files found in ${dir}"
+    (( ${#raws[@]} > 0 )) || {
+      error "No .profraw files in ${raw_dir}"
       return 1
+    }
+
+    llvm-profdata merge -sparse=true -output="$out_prof" "${raws[@]}" || return 1
+    [[ -s "$out_prof" ]] || {
+      error "Empty profdata generated: $out_prof"
+      return 1
+    }
+  }
+
+  run_fast_gtests_bundle() {
+    # Root cause fix for flaky KeyLogFile*: run it isolated from env and separate from bulk pass.
+    local phase="$1"      # ir|cs|final
+    local raw_dir="$2"    # empty when final validation
+    local need_profile="$3" # 1 or 0
+
+    local port
+    port="$(pick_free_port_block 32)" || {
+      error "Could not allocate test port block"
+      return 1
+    }
+
+    local t_home="$srcdir/nss-test-home/$phase"
+    mkdir -p "$t_home" || return 1
+
+    local before=0 after=0
+    if [[ "$need_profile" -eq 1 ]]; then
+      before="$(count_profraw "$raw_dir")"
     fi
 
-    llvm-profdata merge -output="${out}" "${profraw_files[@]}"
+    cd "$srcdir/nss/tests" || return 1
+
+    # 1) Run almost all ssl_gtests (exclude KeyLogFile* from this pass).
+    (
+      unset SSLKEYLOGFILE NSS_SSLKEYLOGFILE MOZ_SSLKEYLOGFILE SSLKEYLOG_FILE SSLKEYLOGFILE_PATH
+      export HOME="$t_home"
+      export HOST="localhost"
+      export DOMSUF="localdomain"
+      export PORT="$port"
+      export NSS_CYCLES="standard"
+      export NSS_DEFAULT_DB_TYPE="sql"
+      export LANG=C
+      export LC_ALL=C
+      if [[ "$need_profile" -eq 1 ]]; then
+        export LLVM_PROFILE_FILE="$raw_dir/${phase}_bulk_%4m.profraw"
+      fi
+      export GTESTFILTER="-KeyLogFile*"
+      bash ./ssl_gtests/ssl_gtests.sh
+    ) || return 1
+
+    # 2) Run only KeyLogFile* tests isolated (serial by filter path in script).
+    (
+      unset SSLKEYLOGFILE NSS_SSLKEYLOGFILE MOZ_SSLKEYLOGFILE SSLKEYLOG_FILE SSLKEYLOGFILE_PATH
+      export HOME="$t_home"
+      export HOST="localhost"
+      export DOMSUF="localdomain"
+      export PORT="$port"
+      export NSS_CYCLES="standard"
+      export NSS_DEFAULT_DB_TYPE="sql"
+      export LANG=C
+      export LC_ALL=C
+      if [[ "$need_profile" -eq 1 ]]; then
+        export LLVM_PROFILE_FILE="$raw_dir/${phase}_keylog_%4m.profraw"
+      fi
+      export GTESTFILTER="KeyLogFile*"
+      bash ./ssl_gtests/ssl_gtests.sh
+    ) || return 1
+
+    # 3) Run non-SSL gtests.
+    (
+      unset SSLKEYLOGFILE NSS_SSLKEYLOGFILE MOZ_SSLKEYLOGFILE SSLKEYLOG_FILE SSLKEYLOGFILE_PATH
+      export HOME="$t_home"
+      export HOST="localhost"
+      export DOMSUF="localdomain"
+      export PORT="$port"
+      export NSS_CYCLES="standard"
+      export NSS_DEFAULT_DB_TYPE="sql"
+      export LANG=C
+      export LC_ALL=C
+      if [[ "$need_profile" -eq 1 ]]; then
+        export LLVM_PROFILE_FILE="$raw_dir/${phase}_gtests_%4m.profraw"
+      fi
+      bash ./gtests/gtests.sh
+    ) || return 1
+
+    cd "$srcdir/nss" || return 1
+
+    if [[ "$need_profile" -eq 1 ]]; then
+      after="$(count_profraw "$raw_dir")"
+      if (( after <= before )); then
+        error "No new .profraw files generated for phase ${phase} in ${raw_dir}"
+        return 1
+      fi
+    fi
   }
 
   cd nss
 
   #
-  # 1) Standard PGO instrumentation
+  # 1) IR-PGO instrumentation + lightweight training
   #
-  msg2 "== Building NSS with standard PGO instrumentation"
+  msg2 "== Stage 1: IR-PGO instrumented build"
 
-  export CFLAGS="${orig_cflags} -fprofile-generate=${pgo_dir}/standard -g3 -fno-omit-frame-pointer"
-  export CXXFLAGS="${orig_cxxflags} -fprofile-generate=${pgo_dir}/standard -g3 -fno-omit-frame-pointer"
-  export LDFLAGS="${orig_ldflags} -fprofile-generate=${pgo_dir}/standard${unwind_ldflags}"
+  local ir_gen_flag="-fprofile-generate=${fallback_ir}"
+  export CFLAGS="${orig_cflags} ${ir_gen_flag} ${pgo_quality_flags}"
+  export CXXFLAGS="${orig_cxxflags} ${ir_gen_flag} ${pgo_quality_flags}"
+  export LDFLAGS="${orig_ldflags} ${ir_gen_flag}"
 
-  ./build.sh -c "${buildopts[@]}" || {
-    error "Failed to clean before standard PGO build"
-    return 1
-  }
+  ./build.sh -c "${buildopts[@]}" || return 1
   ./build.sh "${buildopts[@]}" || {
-    error "Failed to build NSS with standard PGO instrumentation"
+    error "IR instrumented build failed"
     return 1
   }
 
   [[ -d "$srcdir/dist/Release/bin" ]] || {
-    error "Build output not found, cannot generate standard PGO profile"
+    error "Missing build output after IR stage"
     return 1
   }
 
-  export LLVM_PROFILE_FILE="${pgo_dir}/standard/default_%m.profraw"
-  run_ssl_gtests "standard PGO profile" || return 1
-  unset LLVM_PROFILE_FILE
+  msg2 "== Stage 2: IR training (trimmed)"
+  run_fast_gtests_bundle "ir" "$raw_ir" 1 || {
+    error "IR training failed"
+    return 1
+  }
 
-  merge_profraw_dir "${pgo_dir}/standard" "${pgo_dir}/standard.profdata" || {
-    error "Failed to merge standard PGO profile data"
+  local ir_prof="$prof_dir/ir.profdata"
+  merge_raw_dir "$raw_ir" "$ir_prof" || {
+    error "IR profile merge failed"
     return 1
   }
 
   #
-  # 2) Context-sensitive PGO instrumentation pass
+  # 2) CS-PGO instrumentation + lightweight training
   #
-  msg2 "== Building NSS with context-sensitive PGO instrumentation"
+  msg2 "== Stage 3: CS-PGO instrumented build"
 
-  export CFLAGS="${orig_cflags} -fprofile-use=${pgo_dir}/standard.profdata -fcs-profile-generate=${pgo_dir}/cs -g3 -fno-omit-frame-pointer"
-  export CXXFLAGS="${orig_cxxflags} -fprofile-use=${pgo_dir}/standard.profdata -fcs-profile-generate=${pgo_dir}/cs -g3 -fno-omit-frame-pointer"
-  export LDFLAGS="${orig_ldflags} -fprofile-use=${pgo_dir}/standard.profdata -fcs-profile-generate=${pgo_dir}/cs${unwind_ldflags}"
+  local ir_use_flag="-fprofile-use=${ir_prof}"
+  local cs_gen_flag="-fcs-profile-generate=${fallback_cs}"
+  export CFLAGS="${orig_cflags} ${ir_use_flag} ${cs_gen_flag} ${pgo_quality_flags}"
+  export CXXFLAGS="${orig_cxxflags} ${ir_use_flag} ${cs_gen_flag} ${pgo_quality_flags}"
+  export LDFLAGS="${orig_ldflags} ${ir_use_flag} ${cs_gen_flag}"
 
-  ./build.sh -c "${buildopts[@]}" || {
-    error "Failed to clean before CS-PGO build"
-    return 1
-  }
+  ./build.sh -c "${buildopts[@]}" || return 1
   ./build.sh "${buildopts[@]}" || {
-    error "Failed to build NSS with context-sensitive PGO instrumentation"
+    error "CS instrumented build failed"
     return 1
   }
 
   [[ -d "$srcdir/dist/Release/bin" ]] || {
-    error "Build output not found, cannot generate CS-PGO profile"
+    error "Missing build output after CS stage"
     return 1
   }
 
-  export LLVM_PROFILE_FILE="${pgo_dir}/cs/default_%m.profraw"
-  run_ssl_gtests "context-sensitive PGO profile" || return 1
-  unset LLVM_PROFILE_FILE
-
-  # Per Clang docs: merge pass1 profdata + CS raw profiles into one final profile.
-  shopt -s nullglob
-  local cs_profraw=( "${pgo_dir}"/cs/*.profraw )
-  shopt -u nullglob
-  if (( ${#cs_profraw[@]} == 0 )); then
-    error "No CS-PGO .profraw files found in ${pgo_dir}/cs"
-    return 1
-  fi
-
-  llvm-profdata merge \
-    -output="${pgo_dir}/merged.profdata" \
-    "${cs_profraw[@]}" \
-    "${pgo_dir}/standard.profdata" || {
-      error "Failed to merge context-sensitive PGO profile data"
-      return 1
-    }
-
-  #
-  # 3) Final optimized build using merged profile
-  #
-  msg2 "== Building final optimized NSS with merged PGO data"
-
-  export CFLAGS="${orig_cflags} -fprofile-use=${pgo_dir}/merged.profdata"
-  export CXXFLAGS="${orig_cxxflags} -fprofile-use=${pgo_dir}/merged.profdata"
-  export LDFLAGS="${orig_ldflags} -fprofile-use=${pgo_dir}/merged.profdata"
-
-  ./build.sh -c "${buildopts[@]}" || {
-    error "Failed to clean before final optimized build"
+  msg2 "== Stage 4: CS training (trimmed)"
+  run_fast_gtests_bundle "cs" "$raw_cs" 1 || {
+    error "CS training failed"
     return 1
   }
+
+  local cs_prof="$prof_dir/cs.profdata"
+  local merged_prof="$prof_dir/merged.profdata"
+  merge_raw_dir "$raw_cs" "$cs_prof" || {
+    error "CS profile merge failed"
+    return 1
+  }
+
+  # Proper CS flow: combine baseline IR profile + CS profile.
+  llvm-profdata merge -sparse=true -output="$merged_prof" "$ir_prof" "$cs_prof" || {
+    error "Final merged profile creation failed"
+    return 1
+  }
+  [[ -s "$merged_prof" ]] || {
+    error "Merged profdata is empty"
+    return 1
+  }
+
+  #
+  # 3) Final optimized build
+  #
+  msg2 "== Stage 5: Final optimized build"
+
+  local merged_use_flag="-fprofile-use=${merged_prof}"
+  export CFLAGS="${orig_cflags} ${merged_use_flag}"
+  export CXXFLAGS="${orig_cxxflags} ${merged_use_flag}"
+  export LDFLAGS="${orig_ldflags} ${merged_use_flag}"
+
+  ./build.sh -c "${buildopts[@]}" || return 1
   ./build.sh "${buildopts[@]}" || {
-    error "Failed to build final optimized NSS"
+    error "Final optimized build failed"
     return 1
   }
 
   [[ -d "$srcdir/dist/Release/bin" ]] || {
-    error "Final optimized build output not found"
+    error "Missing final build output"
     return 1
   }
 
-  run_ssl_gtests "final optimized build" || return 1
+  #
+  # 4) Final validation (same anti-flake handling, no profiling)
+  #
+  msg2 "== Stage 6: Final validation"
+  run_fast_gtests_bundle "final" "/dev/null" 0 || {
+    error "Final validation failed"
+    return 1
+  }
 
   export CFLAGS="${orig_cflags}"
   export CXXFLAGS="${orig_cxxflags}"
