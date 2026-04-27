@@ -999,7 +999,8 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
                                       struct ac_cmdbuf **cs_array, unsigned cs_count,
                                       struct ac_cmdbuf **initial_preamble_cs, unsigned initial_preamble_count,
                                       struct ac_cmdbuf **continue_preamble_cs, unsigned continue_preamble_count,
-                                      struct ac_cmdbuf **postamble_cs, unsigned postamble_count, bool uses_shadow_regs)
+                                      struct ac_cmdbuf **postamble_cs, unsigned postamble_count, bool uses_shadow_regs,
+                                      bool secure)
 {
    VkResult result;
 
@@ -1055,6 +1056,9 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
          assert(cs->num_ib_buffers == 1);
          ib = radv_amdgpu_cs_ib_to_info(cs, cs->ib_buffers[0]);
 
+         if (secure && ((ib.ip_type == AMDGPU_HW_IP_GFX) || (ib.ip_type == AMDGPU_HW_IP_DMA)))
+            ib.flags |= AMDGPU_IB_FLAGS_SECURE;
+
          ibs[num_submitted_ibs++] = ib;
          ibs_per_ip[cs->hw_ip]++;
       }
@@ -1106,6 +1110,9 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
 
          if (uses_shadow_regs && ib.ip_type == AMDGPU_HW_IP_GFX)
             ib.flags |= AMDGPU_IB_FLAG_PREEMPT;
+
+         if (secure && ((ib.ip_type == AMDGPU_HW_IP_GFX) || (ib.ip_type == AMDGPU_HW_IP_DMA)))
+            ib.flags |= AMDGPU_IB_FLAGS_SECURE;
 
          assert(num_submitted_ibs < ib_array_size);
          ibs[num_submitted_ibs++] = ib;
@@ -1310,7 +1317,7 @@ radv_amdgpu_winsys_cs_submit(struct radeon_winsys_ctx *_ctx, const struct radv_w
       result = radv_amdgpu_winsys_cs_submit_internal(
          ctx, submit->queue_index, &sem_info, submit->cs_array, submit->cs_count, submit->initial_preamble_cs,
          submit->initial_preamble_count, submit->continue_preamble_cs, submit->continue_preamble_count,
-         submit->postamble_cs, submit->postamble_count, submit->uses_shadow_regs);
+         submit->postamble_cs, submit->postamble_count, submit->uses_shadow_regs, submit->secure);
    }
 
 out:
