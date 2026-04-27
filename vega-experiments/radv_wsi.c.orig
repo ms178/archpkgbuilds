@@ -93,6 +93,10 @@ radv_init_wsi(struct radv_physical_device *pdev)
    pdev->wsi_device.set_memory_ownership = radv_wsi_set_memory_ownership;
    pdev->wsi_device.get_blit_queue = radv_wsi_get_prime_blit_queue;
 
+   for (uint32_t i = 0; i < ARRAY_SIZE(pdev->wsi_device.supports_protected); i++) {
+      pdev->wsi_device.supports_protected[i] = radv_tmz_enabled(pdev);
+   }
+
    wsi_device_setup_syncobj_fd(&pdev->wsi_device, pdev->local_fd);
 
    pdev->vk.wsi_device = &pdev->wsi_device;
