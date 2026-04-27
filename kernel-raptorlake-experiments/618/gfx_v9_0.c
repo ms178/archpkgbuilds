@@ -180,6 +180,7 @@ gfx9_wait_reg_off(struct amdgpu_device *adev, u32 reg_offset,
 {
 	u32 val;
 	ktime_t deadline;
+	const bool atomic_ctx = in_atomic() || irqs_disabled();
 
 	if (unlikely(!adev))
 		return -EINVAL;
@@ -194,7 +195,7 @@ gfx9_wait_reg_off(struct amdgpu_device *adev, u32 reg_offset,
 		if ((val & mask) == val_target)
 			return 0;
 
-		if (in_atomic() || irqs_disabled()) {
+		if (atomic_ctx) {
 			udelay(1);
 			cpu_relax();
 		} else {
@@ -5509,6 +5510,7 @@ static void gfx_v9_0_ring_emit_hdp_flush(struct amdgpu_ring *ring)
 	struct amdgpu_device *adev = ring->adev;
 	u32 ref_and_mask, reg_mem_engine;
 	const struct nbio_hdp_flush_reg *nbio_hf_reg = adev->nbio.hdp_flush_reg;
+	u32 req_off, done_off;
 
 	if (ring->funcs->type == AMDGPU_RING_TYPE_COMPUTE) {
 		switch (ring->me) {
@@ -5527,9 +5529,11 @@ static void gfx_v9_0_ring_emit_hdp_flush(struct amdgpu_ring *ring)
 		reg_mem_engine = 1; /* pfp */
 	}
 
+	req_off = adev->nbio.funcs->get_hdp_flush_req_offset(adev);
+	done_off = adev->nbio.funcs->get_hdp_flush_done_offset(adev);
+
 	gfx_v9_0_wait_reg_mem(ring, reg_mem_engine, 0, 1,
-			      adev->nbio.funcs->get_hdp_flush_req_offset(adev),
-			      adev->nbio.funcs->get_hdp_flush_done_offset(adev),
+			      req_off, done_off,
 			      ref_and_mask, ref_and_mask, 0x20);
 }
 
@@ -5540,25 +5544,29 @@ static void gfx_v9_0_ring_emit_ib_gfx(struct amdgpu_ring *ring,
 {
 	unsigned vmid = AMDGPU_JOB_GET_VMID(job);
 	u32 header, control = 0;
+	const bool preempt = ib->flags & AMDGPU_IB_FLAG_PREEMPT;
+	const bool preempted = flags & AMDGPU_IB_PREEMPTED;
+	const bool use_ce = ib->flags & AMDGPU_IB_FLAG_CE;
+	const u32 ib_addr_lo = lower_32_bits(ib->gpu_addr);
+	const u32 ib_addr_hi = upper_32_bits(ib->gpu_addr);
 
-	if (ib->flags & AMDGPU_IB_FLAG_CE)
+	if (use_ce)
 		header = PACKET3(PACKET3_INDIRECT_BUFFER_CONST, 2);
 	else
 		header = PACKET3(PACKET3_INDIRECT_BUFFER, 2);
 
 	control |= ib->length_dw | (vmid << 24);
 
-	if (ib->flags & AMDGPU_IB_FLAG_PREEMPT) {
+	if (preempt) {
 		control |= INDIRECT_BUFFER_PRE_ENB(1);
 
-		if (flags & AMDGPU_IB_PREEMPTED)
+		if (preempted)
 			control |= INDIRECT_BUFFER_PRE_RESUME(1);
 
-		if (!(ib->flags & AMDGPU_IB_FLAG_CE) && vmid)
+		if (!use_ce && vmid)
 			gfx_v9_0_ring_emit_de_meta(ring,
-						   (!amdgpu_sriov_vf(ring->adev) &&
-						   flags & AMDGPU_IB_PREEMPTED) ?
-						   true : false,
+						   !amdgpu_sriov_vf(ring->adev) &&
+						   preempted,
 						   job->gds_size > 0 && job->gds_base != 0);
 	}
 
@@ -5568,8 +5576,8 @@ static void gfx_v9_0_ring_emit_ib_gfx(struct amdgpu_ring *ring,
 #ifdef __BIG_ENDIAN
 		(2 << 0) |
 #endif
-		lower_32_bits(ib->gpu_addr));
-	amdgpu_ring_write(ring, upper_32_bits(ib->gpu_addr));
+		ib_addr_lo);
+	amdgpu_ring_write(ring, ib_addr_hi);
 	amdgpu_ring_ib_on_emit_cntl(ring);
 	amdgpu_ring_write(ring, control);
 }
@@ -5583,28 +5591,39 @@ static void gfx_v9_0_ring_patch_cntl(struct amdgpu_ring *ring,
 	ring->ring[offset] = control;
 }
 
+static __always_inline void gfx_v9_0_ring_patch_payload(struct amdgpu_ring *ring,
+							 unsigned offset,
+							 const void *payload,
+							 size_t payload_size)
+{
+	size_t ring_bytes = (size_t)(ring->buf_mask + 1) << 2;
+	size_t start_byte = (size_t)offset << 2;
+	size_t first_copy;
+	u8 *ring_u8 = (u8 *)ring->ring;
+
+	if (start_byte + payload_size <= ring_bytes) {
+		memcpy(&ring_u8[start_byte], payload, payload_size);
+		return;
+	}
+
+	first_copy = ring_bytes - start_byte;
+	memcpy(&ring_u8[start_byte], payload, first_copy);
+	memcpy(&ring_u8[0], (const u8 *)payload + first_copy, payload_size - first_copy);
+}
+
 static void gfx_v9_0_ring_patch_ce_meta(struct amdgpu_ring *ring,
 					unsigned offset)
 {
 	struct amdgpu_device *adev = ring->adev;
 	void *ce_payload_cpu_addr;
-	uint64_t payload_offset, payload_size;
+	size_t payload_offset, payload_size;
 
 	payload_size = sizeof(struct v9_ce_ib_state);
 
 	payload_offset = offsetof(struct v9_gfx_meta_data, ce_payload);
-	ce_payload_cpu_addr = adev->virt.csa_cpu_addr + payload_offset;
+	ce_payload_cpu_addr = (u8 *)adev->virt.csa_cpu_addr + payload_offset;
 
-	if (offset + (payload_size >> 2) <= ring->buf_mask + 1) {
-		memcpy((void *)&ring->ring[offset], ce_payload_cpu_addr, payload_size);
-	} else {
-		memcpy((void *)&ring->ring[offset], ce_payload_cpu_addr,
-		       (ring->buf_mask + 1 - offset) << 2);
-		payload_size -= (ring->buf_mask + 1 - offset) << 2;
-		memcpy((void *)&ring->ring[0],
-		       ce_payload_cpu_addr + ((ring->buf_mask + 1 - offset) << 2),
-		       payload_size);
-	}
+	gfx_v9_0_ring_patch_payload(ring, offset, ce_payload_cpu_addr, payload_size);
 }
 
 static void gfx_v9_0_ring_patch_de_meta(struct amdgpu_ring *ring,
@@ -5612,26 +5631,17 @@ static void gfx_v9_0_ring_patch_de_meta(struct amdgpu_ring *ring,
 {
 	struct amdgpu_device *adev = ring->adev;
 	void *de_payload_cpu_addr;
-	uint64_t payload_offset, payload_size;
+	size_t payload_offset, payload_size;
 
 	payload_size = sizeof(struct v9_de_ib_state);
 
 	payload_offset = offsetof(struct v9_gfx_meta_data, de_payload);
-	de_payload_cpu_addr = adev->virt.csa_cpu_addr + payload_offset;
+	de_payload_cpu_addr = (u8 *)adev->virt.csa_cpu_addr + payload_offset;
 
 	((struct v9_de_ib_state *)de_payload_cpu_addr)->ib_completion_status =
 		IB_COMPLETION_STATUS_PREEMPTED;
 
-	if (offset + (payload_size >> 2) <= ring->buf_mask + 1) {
-		memcpy((void *)&ring->ring[offset], de_payload_cpu_addr, payload_size);
-	} else {
-		memcpy((void *)&ring->ring[offset], de_payload_cpu_addr,
-		       (ring->buf_mask + 1 - offset) << 2);
-		payload_size -= (ring->buf_mask + 1 - offset) << 2;
-		memcpy((void *)&ring->ring[0],
-		       de_payload_cpu_addr + ((ring->buf_mask + 1 - offset) << 2),
-		       payload_size);
-	}
+	gfx_v9_0_ring_patch_payload(ring, offset, de_payload_cpu_addr, payload_size);
 }
 
 static void gfx_v9_0_ring_emit_ib_compute(struct amdgpu_ring *ring,
@@ -5641,6 +5651,8 @@ static void gfx_v9_0_ring_emit_ib_compute(struct amdgpu_ring *ring,
 {
 	unsigned vmid = AMDGPU_JOB_GET_VMID(job);
 	u32 control = INDIRECT_BUFFER_VALID | ib->length_dw | (vmid << 24);
+	const u32 ib_addr_lo = lower_32_bits(ib->gpu_addr);
+	const u32 ib_addr_hi = upper_32_bits(ib->gpu_addr);
 
 	/* Currently, there is a high possibility to get wave ID mismatch
 	 * between ME and GDS, leading to a hw deadlock, because ME generates
@@ -5664,8 +5676,8 @@ static void gfx_v9_0_ring_emit_ib_compute(struct amdgpu_ring *ring,
 #ifdef __BIG_ENDIAN
 				(2 << 0) |
 #endif
-				lower_32_bits(ib->gpu_addr));
-	amdgpu_ring_write(ring, upper_32_bits(ib->gpu_addr));
+				ib_addr_lo);
+	amdgpu_ring_write(ring, ib_addr_hi);
 	amdgpu_ring_write(ring, control);
 }
 
