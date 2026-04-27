@@ -246,8 +246,19 @@ static int amdgpu_ttm_map_buffer(struct ttm_buffer_object *bo,
 		while (page_idx < num_pages) {
 			unsigned int chunk = min_t(unsigned int, num_pages - page_idx,
 						   (unsigned int)ARRAY_SIZE(batch));
+			unsigned int batch_limit = chunk & ~3U;
 
-			for (batch_cnt = 0U; batch_cnt < chunk; ++batch_cnt) {
+			for (batch_cnt = 0U; batch_cnt < batch_limit; batch_cnt += 4U) {
+				batch[batch_cnt] = dma_address;
+				dma_address += PAGE_SIZE;
+				batch[batch_cnt + 1U] = dma_address;
+				dma_address += PAGE_SIZE;
+				batch[batch_cnt + 2U] = dma_address;
+				dma_address += PAGE_SIZE;
+				batch[batch_cnt + 3U] = dma_address;
+				dma_address += PAGE_SIZE;
+			}
+			for (; batch_cnt < chunk; ++batch_cnt) {
 				batch[batch_cnt] = dma_address;
 				dma_address += PAGE_SIZE;
 			}

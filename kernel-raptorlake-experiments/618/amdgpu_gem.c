@@ -303,8 +303,9 @@ amdgpu_gem_add_input_fence(struct drm_file *filp,
 	uint32_t *syncobj_handles = NULL;
 	uint32_t __user *user_handles;
 	struct dma_fence *fence;
-	uint32_t recent_handles[8] = { 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U };
-	uint8_t recent_valid = 0U;
+	uint32_t recent_handles[16] = { 0U };
+	uint8_t recent_count = 0U;
+	uint8_t recent_head = 0U;
 	uint32_t last_handle = 0U;
 	uint32_t single_handle;
 	int ret = 0;
@@ -361,7 +362,8 @@ amdgpu_gem_add_input_fence(struct drm_file *filp,
 
 	for (i = 0U; i < num_syncobj_handles; i++) {
 		uint32_t handle = syncobj_handles[i];
-		uint32_t slot;
+		uint32_t j;
+		bool seen = false;
 
 		if (unlikely(handle == 0U)) {
 			ret = -EINVAL;
@@ -371,8 +373,13 @@ amdgpu_gem_add_input_fence(struct drm_file *filp,
 		if (handle == last_handle)
 			continue;
 
-		slot = handle & 7U;
-		if ((recent_valid & (1U << slot)) && recent_handles[slot] == handle) {
+		for (j = 0U; j < recent_count; ++j) {
+			if (recent_handles[j] == handle) {
+				seen = true;
+				break;
+			}
+		}
+		if (seen) {
 			last_handle = handle;
 			continue;
 		}
@@ -389,8 +396,11 @@ amdgpu_gem_add_input_fence(struct drm_file *filp,
 		if (unlikely(ret))
 			break;
 
-		recent_handles[slot] = handle;
-		recent_valid |= (uint8_t)(1U << slot);
+		recent_handles[recent_head] = handle;
+		recent_head = (uint8_t)((recent_head + 1U) &
+					(ARRAY_SIZE(recent_handles) - 1U));
+		if (recent_count < ARRAY_SIZE(recent_handles))
+			recent_count++;
 		last_handle = handle;
 	}
 

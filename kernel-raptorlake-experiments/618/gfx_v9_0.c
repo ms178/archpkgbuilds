@@ -5568,8 +5568,8 @@ static void gfx_v9_0_ring_emit_fence(struct amdgpu_ring *ring,
 	if (wb_only) {
 		event_dw1 |= EOP_TC_NC_ACTION_EN | EOP_TC_WB_ACTION_EN;
 	} else {
-		event_dw1 |= EOP_TCL1_ACTION_EN | EOP_TC_ACTION_EN | EOP_TC_WB_ACTION_EN;
-		/* Leave TC_MD off for fence writeback to plain memory */
+		event_dw1 |= EOP_TCL1_ACTION_EN | EOP_TC_ACTION_EN |
+			     EOP_TC_MD_ACTION_EN | EOP_TC_WB_ACTION_EN;
 	}
 
 	event_dw1 |= EVENT_TYPE(CACHE_FLUSH_AND_INV_TS_EVENT) |
@@ -5586,9 +5586,6 @@ static void gfx_v9_0_ring_emit_fence(struct amdgpu_ring *ring,
 	amdgpu_ring_write(ring, lower_32_bits(seq));
 	amdgpu_ring_write(ring, upper_32_bits(seq));
 	amdgpu_ring_write(ring, 0);
-
-	if (!wb_only)
-		dma_wmb();
 }
 
 static void gfx_v9_0_ring_emit_pipeline_sync(struct amdgpu_ring *ring)
