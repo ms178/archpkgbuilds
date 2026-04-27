@@ -303,9 +303,10 @@ amdgpu_gem_add_input_fence(struct drm_file *filp,
 	uint32_t *syncobj_handles = NULL;
 	uint32_t __user *user_handles;
 	struct dma_fence *fence;
-	uint32_t recent_handles[4] = { 0U, 0U };
-	uint32_t recent_valid = 0U;
-	uint32_t recent_pos = 0U;
+	uint32_t recent_handles[16] = { 0U };
+	uint8_t recent_count = 0U;
+	uint8_t recent_head = 0U;
+	uint32_t last_handle = 0U;
 	uint32_t single_handle;
 	int ret = 0;
 	uint32_t i;
@@ -336,7 +337,7 @@ amdgpu_gem_add_input_fence(struct drm_file *filp,
 		return ret;
 	}
 
-	if (likely(num_syncobj_handles <= 4U)) {
+	if (likely(num_syncobj_handles <= 8U)) {
 		for (i = 0U; i < num_syncobj_handles; i++) {
 			if (unlikely(get_user(syncobj_handles_stack[i],
 					      user_handles + i)))
@@ -361,22 +362,27 @@ amdgpu_gem_add_input_fence(struct drm_file *filp,
 
 	for (i = 0U; i < num_syncobj_handles; i++) {
 		uint32_t handle = syncobj_handles[i];
-		bool seen = false;
 		uint32_t j;
+		bool seen = false;
 
 		if (unlikely(handle == 0U)) {
 			ret = -EINVAL;
 			break;
 		}
 
-		for (j = 0U; j < recent_valid; j++) {
+		if (handle == last_handle)
+			continue;
+
+		for (j = 0U; j < recent_count; ++j) {
 			if (recent_handles[j] == handle) {
 				seen = true;
 				break;
 			}
 		}
-		if (seen)
+		if (seen) {
+			last_handle = handle;
 			continue;
+		}
 
 		ret = drm_syncobj_find_fence(filp, handle, 0, 0, &fence);
 		if (unlikely(ret))
@@ -390,10 +396,11 @@ amdgpu_gem_add_input_fence(struct drm_file *filp,
 		if (unlikely(ret))
 			break;
 
-		recent_handles[recent_pos] = handle;
-		recent_pos = (recent_pos + 1U) & 3U;
-		if (recent_valid < ARRAY_SIZE(recent_handles))
-			recent_valid++;
+		recent_handles[recent_head] = handle;
+		recent_head = (uint8_t)((recent_head + 1U) & (ARRAY_SIZE(recent_handles) - 1U));
+		if (recent_count < ARRAY_SIZE(recent_handles))
+			recent_count++;
+		last_handle = handle;
 	}
 
 	if (syncobj_handles!= syncobj_handles_stack)

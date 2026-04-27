@@ -179,7 +179,6 @@ static int amdgpu_ttm_map_buffer(struct ttm_buffer_object *bo,
 	struct amdgpu_job *job;
 	void *cpu_addr;
 	uint64_t flags;
-	unsigned int i;
 	int r;
 
 	BUG_ON(adev->mman.buffer_funcs->copy_max_bytes <
@@ -232,20 +231,44 @@ static int amdgpu_ttm_map_buffer(struct ttm_buffer_object *bo,
 	} else {
 		dma_addr_t dma_address = mm_cur->start + adev->vm_manager.vram_base_offset;
 		dma_addr_t batch[256];
-		unsigned int page_idx = 0;
-		unsigned int batch_cnt = 0;
+		unsigned int page_idx = 0U;
+		unsigned int batch_cnt;
 
-		for (i = 0; i < num_pages; ++i) {
-			batch[batch_cnt++] = dma_address;
-			dma_address += PAGE_SIZE;
-			if (unlikely(batch_cnt == ARRAY_SIZE(batch) || i == num_pages - 1U)) {
-				amdgpu_gart_map(adev, (uint64_t)page_idx << PAGE_SHIFT,
-						batch_cnt, batch, flags, cpu_addr);
-				page_idx += batch_cnt;
-				batch_cnt = 0;
+		if (likely(num_pages <= ARRAY_SIZE(batch))) {
+			for (batch_cnt = 0U; batch_cnt < num_pages; ++batch_cnt) {
+				batch[batch_cnt] = dma_address;
+				dma_address += PAGE_SIZE;
 			}
+			amdgpu_gart_map(adev, 0, num_pages, batch, flags, cpu_addr);
+			goto out_submit;
+		}
+
+		while (page_idx < num_pages) {
+			unsigned int chunk = min_t(unsigned int, num_pages - page_idx,
+						   (unsigned int)ARRAY_SIZE(batch));
+			unsigned int batch_limit = chunk & ~3U;
+
+			for (batch_cnt = 0U; batch_cnt < batch_limit; batch_cnt += 4U) {
+				batch[batch_cnt] = dma_address;
+				dma_address += PAGE_SIZE;
+				batch[batch_cnt + 1U] = dma_address;
+				dma_address += PAGE_SIZE;
+				batch[batch_cnt + 2U] = dma_address;
+				dma_address += PAGE_SIZE;
+				batch[batch_cnt + 3U] = dma_address;
+				dma_address += PAGE_SIZE;
+			}
+			for (; batch_cnt < chunk; ++batch_cnt) {
+				batch[batch_cnt] = dma_address;
+				dma_address += PAGE_SIZE;
+			}
+
+			amdgpu_gart_map(adev, (uint64_t)page_idx << PAGE_SHIFT,
+					chunk, batch, flags, cpu_addr);
+			page_idx += chunk;
 		}
 	}
+out_submit:
 	dma_fence_put(amdgpu_job_submit(job));
 	return 0;
 }
@@ -331,6 +354,11 @@ int amdgpu_ttm_copy_mem_to_mem(struct amdgpu_device *adev,
 			uint64_t idx = (src_mm.start >> PAGE_SHIFT) + 16;
 			if (idx < src->bo->ttm->num_pages)
 				__builtin_prefetch(&src->bo->ttm->dma_address[idx], 0, 1);
+		}
+		if (dst->mem->mem_type == TTM_PL_TT) {
+			uint64_t idx = (dst_mm.start >> PAGE_SHIFT) + 16;
+			if (idx < dst->bo->ttm->num_pages)
+				__builtin_prefetch(&dst->bo->ttm->dma_address[idx], 1, 1);
 		}
 
 		r = amdgpu_ttm_map_buffer(src->bo, src->mem, &src_mm,
@@ -436,6 +464,7 @@ bool amdgpu_res_cpu_visible(struct amdgpu_device *adev,
 			    struct ttm_resource *res)
 {
 	struct amdgpu_res_cursor cursor;
+	uint64_t visible_vram_size;
 
 	if (!res)
 		return false;
@@ -456,16 +485,18 @@ bool amdgpu_res_cpu_visible(struct amdgpu_device *adev,
 	if (amdgpu_gmc_vram_full_visible(&adev->gmc))
 		return true;
 
+	visible_vram_size = adev->gmc.visible_vram_size;
+
 	/* Contiguous fast path – eliminates cursor walk (2 cache misses) */
 	if (likely(res->placement & TTM_PL_FLAG_CONTIGUOUS)) {
 		uint64_t start = (uint64_t)res->start << PAGE_SHIFT;
 		uint64_t end = start + res->size;
-		return end <= adev->gmc.visible_vram_size;
+		return end <= visible_vram_size;
 	}
 
 	amdgpu_res_first(res, 0, res->size, &cursor);
 	while (cursor.remaining) {
-		if (unlikely((cursor.start + cursor.size) > adev->gmc.visible_vram_size))
+		if (unlikely((cursor.start + cursor.size) > visible_vram_size))
 			return false;
 		amdgpu_res_next(&cursor, cursor.size);
 	}
