@@ -126,7 +126,7 @@ struct ssa_info {
       val = constant;
    }
 
-   bool is_constant() { return label & label_constant; }
+   bool is_constant() const noexcept { return label & label_constant; }
 
    void set_abs(Temp abs_temp, unsigned bit_size)
    {
@@ -135,7 +135,7 @@ struct ssa_info {
       temp = abs_temp;
    }
 
-   bool is_abs(unsigned bit_size)
+   bool is_abs(unsigned bit_size) const noexcept
    {
       assert(bit_size == 16 || bit_size == 32 || bit_size == 64);
       return bit_size == 16 ? label & label_abs_fp16 : label & label_abs_fp32_64;
@@ -148,7 +148,7 @@ struct ssa_info {
       temp = neg_temp;
    }
 
-   bool is_neg(unsigned bit_size)
+   bool is_neg(unsigned bit_size) const noexcept
    {
       assert(bit_size == 16 || bit_size == 32 || bit_size == 64);
       return bit_size == 16 ? label & label_neg_fp16 : label & label_neg_fp32_64;
@@ -170,7 +170,7 @@ struct ssa_info {
       temp = tmp;
    }
 
-   bool is_temp() { return label & label_temp; }
+   bool is_temp() const noexcept { return label & label_temp; }
 
    void set_combined(uint32_t pre_combine_idx)
    {
@@ -178,15 +178,15 @@ struct ssa_info {
       val = pre_combine_idx;
    }
 
-   bool is_combined() { return label & label_combined_instr; }
+   bool is_combined() const noexcept { return label & label_combined_instr; }
 
    void set_uniform_bitwise() { add_label(label_uniform_bitwise); }
 
-   bool is_uniform_bitwise() { return label & label_uniform_bitwise; }
+   bool is_uniform_bitwise() const noexcept { return label & label_uniform_bitwise; }
 
    void set_scc_needed() { add_label(label_scc_needed); }
 
-   bool is_scc_needed() { return label & label_scc_needed; }
+   bool is_scc_needed() const noexcept { return label & label_scc_needed; }
 
    void set_scc_invert(Temp scc_inv)
    {
@@ -194,7 +194,7 @@ struct ssa_info {
       temp = scc_inv;
    }
 
-   bool is_scc_invert() { return label & label_scc_invert; }
+   bool is_scc_invert() const noexcept { return label & label_scc_invert; }
 
    void set_uniform_bool(Temp uniform_bool)
    {
@@ -202,7 +202,7 @@ struct ssa_info {
       temp = uniform_bool;
    }
 
-   bool is_uniform_bool() { return label & label_uniform_bool; }
+   bool is_uniform_bool() const noexcept { return label & label_uniform_bool; }
 
    void set_fcanonicalize(Temp tmp, unsigned bit_size)
    {
@@ -211,7 +211,7 @@ struct ssa_info {
       temp = tmp;
    }
 
-   bool is_fcanonicalize(unsigned bit_size)
+   bool is_fcanonicalize(unsigned bit_size) const noexcept
    {
       assert(bit_size == 16 || bit_size == 32 || bit_size == 64);
       return bit_size == 16 ? label & label_fcanonicalize_fp16
@@ -220,11 +220,14 @@ struct ssa_info {
 
    void set_canonicalized(unsigned bit_size) { add_label(canonicalized_label(bit_size)); }
 
-   bool is_canonicalized(unsigned bit_size) { return label & canonicalized_label(bit_size); }
+   bool is_canonicalized(unsigned bit_size) const noexcept
+   {
+      return label & canonicalized_label(bit_size);
+   }
 
    void set_extract() { add_label(label_extract); }
 
-   bool is_extract() { return label & label_extract; }
+   bool is_extract() const noexcept { return label & label_extract; }
 
    void set_phys_reg(PhysReg reg)
    {
@@ -233,7 +236,7 @@ struct ssa_info {
       phys_reg = reg;
    }
 
-   bool is_phys_reg(uint32_t exec_id)
+   bool is_phys_reg(uint32_t exec_id) const noexcept
    {
       if (!(label & label_phys_reg))
          return false;
@@ -761,9 +764,22 @@ alu_opt_info_is_valid(opt_ctx& ctx, alu_opt_info& info)
          info.opcode = aco_opcode::s_pack_lh_b32_b16;
       } else if (info.operands[0].extract[0].offset() == 2 &&
                  info.operands[1].extract[0].offset() == 0) {
-         if (ctx.program->gfx_level < GFX11) /* TODO try shifting constant */
-            return false;
-         info.opcode = aco_opcode::s_pack_hl_b32_b16;
+         if (ctx.program->gfx_level < GFX11) {
+            /* GFX10 and older don't have s_pack_hl_b32_b16.
+             * If src0 is a constant, fold the high-half extract into the constant and keep ll. */
+            if (!info.operands[0].op.isConstant() || info.operands[0].op.bytes() != 4)
+               return false;
+
+            uint32_t shifted = info.operands[0].op.constantValue() >> 16;
+            Operand shifted_op = Operand::get_const(ctx.program->gfx_level, shifted, 4);
+            if (shifted_op.isLiteral() && !info.operands[0].op.isLiteral())
+               return false;
+
+            info.operands[0].op = shifted_op;
+            info.opcode = aco_opcode::s_pack_ll_b32_b16;
+         } else {
+            info.opcode = aco_opcode::s_pack_hl_b32_b16;
+         }
       }
       info.operands[0].extract[0] = SubdwordSel::dword;
       info.operands[1].extract[0] = SubdwordSel::dword;
@@ -2545,6 +2561,12 @@ extract_apply_extract(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 void
 label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 {
+   auto chase_temp_chain = [&](ssa_info info) {
+      while (info.is_temp())
+         info = ctx.info[info.temp.id()];
+      return info;
+   };
+
    if (instr->isSMEM())
       smem_combine(ctx, instr);
 
@@ -2579,8 +2601,7 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          MUBUF_instruction& mubuf = instr->mubuf();
          Temp base;
          uint32_t offset;
-         while (info.is_temp())
-            info = ctx.info[info.temp.id()];
+         info = chase_temp_chain(info);
 
          bool swizzled = ctx.program->gfx_level >= GFX12 ? mubuf.cache.gfx12.swizzled
                                                          : (mubuf.cache.value & ac_swizzled);
@@ -2633,8 +2654,7 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 
       else if (instr->isMTBUF()) {
          MTBUF_instruction& mtbuf = instr->mtbuf();
-         while (info.is_temp())
-            info = ctx.info[info.temp.id()];
+         info = chase_temp_chain(info);
 
          if (mtbuf.offen && mtbuf.idxen && i == 1 &&
              info.parent_instr->opcode == aco_opcode::p_create_vector &&
@@ -2655,8 +2675,7 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
          FLAT_instruction& scratch = instr->scratch();
          Temp base;
          uint32_t offset;
-         while (info.is_temp())
-            info = ctx.info[info.temp.id()];
+         info = chase_temp_chain(info);
 
          /* The hardware probably does: 'scratch_base + u2u64(saddr) + i2i64(offset)'. This means
           * we can't combine the addition if the unsigned addition overflows and offset is
@@ -2723,6 +2742,7 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
 
       /* expand vector operands */
       std::vector<Operand> ops;
+      ops.reserve(instr->operands.size() * 2);
       unsigned offset = 0;
       for (const Operand& op : instr->operands) {
          /* ensure that any expanded operands are properly aligned */
@@ -2742,35 +2762,42 @@ label_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
       do {
          progress = false;
          offset = 0;
-         for (unsigned i = 0; i < ops.size(); i++) {
-            if (ops[i].isTemp()) {
-               if (ctx.info[ops[i].tempId()].is_temp() &&
-                   ops[i].regClass() == ctx.info[ops[i].tempId()].temp.regClass()) {
-                  ops[i].setTemp(ctx.info[ops[i].tempId()].temp);
+         std::vector<Operand> compacted;
+         compacted.reserve(ops.size());
+         for (unsigned i = 0; i < ops.size();) {
+            Operand current = ops[i];
+            ++i;
+            if (current.isTemp()) {
+               if (ctx.info[current.tempId()].is_temp() &&
+                   current.regClass() == ctx.info[current.tempId()].temp.regClass()) {
+                  current.setTemp(ctx.info[current.tempId()].temp);
                }
 
                /* If this and the following operands make up all definitions of a `p_split_vector`,
                 * replace them with the operand of the `p_split_vector` instruction.
                 */
-               Instruction* parent = ctx.info[ops[i].tempId()].parent_instr;
+               Instruction* parent = ctx.info[current.tempId()].parent_instr;
                if (parent->opcode == aco_opcode::p_split_vector &&
                    (offset % 4 == 0 || parent->operands[0].bytes() < 4) &&
-                   parent->definitions.size() <= ops.size() - i) {
+                   parent->definitions.size() <= ops.size() - (i - 1)) {
                   copy_prop = true;
                   for (unsigned j = 0; copy_prop && j < parent->definitions.size(); j++) {
-                     copy_prop &= ops[i + j].isTemp() &&
-                                  ops[i + j].getTemp() == parent->definitions[j].getTemp();
+                     copy_prop &= (j == 0 ? current : ops[i + j - 1]).isTemp() &&
+                                  (j == 0 ? current : ops[i + j - 1]).getTemp() ==
+                                     parent->definitions[j].getTemp();
                   }
 
                   if (copy_prop) {
-                     ops.erase(ops.begin() + i + 1, ops.begin() + i + parent->definitions.size());
-                     ops[i] = parent->operands[0];
+                     current = parent->operands[0];
+                     i += parent->definitions.size() - 1;
                      progress = true;
                   }
                }
             }
-            offset += ops[i].bytes();
+            offset += current.bytes();
+            compacted.emplace_back(current);
          }
+         ops.swap(compacted);
       } while (progress);
 
       /* combine expanded operands to new vector */
