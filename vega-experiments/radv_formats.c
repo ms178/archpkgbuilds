@@ -646,7 +646,7 @@ radv_format_pack_clear_color(VkFormat format, uint32_t clear_vals[2], VkClearCol
             else
                f -= 0.5f;
 
-            v = (uint64_t)f;
+            v = (uint64_t)(int64_t)f;
          }
       } else if (ch_type == UTIL_FORMAT_TYPE_FLOAT) {
          if (ch_size == 32) {
