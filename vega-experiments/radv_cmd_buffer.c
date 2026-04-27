@@ -1115,9 +1115,15 @@ radv_emit_clear_data(struct radv_cmd_buffer *cmd_buffer, unsigned engine_sel, ui
     */
    static const uint32_t zeroes[64] = {0};
 
-   assert(size > 0 && (size % 4) == 0 && size <= sizeof(zeroes));
+   assert(size > 0 && (size % 4) == 0);
 
-   radv_write_data(cmd_buffer, engine_sel, va, size / 4, zeroes, false);
+   unsigned remaining = size / 4;
+   while (remaining) {
+      const unsigned dw = MIN2(remaining, ARRAY_SIZE(zeroes));
+      radv_write_data(cmd_buffer, engine_sel, va, dw, zeroes, false);
+      va += (uint64_t)dw * 4u;
+      remaining -= dw;
+   }
 }
 
 static void
@@ -1287,6 +1293,8 @@ radv_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer, UNUSED VkCommandB
       cmd_buffer->descriptors[i].dirty = 0;
       cmd_buffer->descriptors[i].valid = 0;
       cmd_buffer->descriptors[i].dirty_dynamic = false;
+      cmd_buffer->descriptors[i].dirty_heaps = 0;
+      cmd_buffer->descriptors[i].valid_heaps = 0;
    }
 
    radv_cmd_buffer_reset_rendering(cmd_buffer);
@@ -2062,23 +2070,26 @@ radv_compute_centroid_priority(struct radv_cmd_buffer *cmd_buffer, VkOffset2D *s
 
    uint32_t centroid_priorities[8];
    uint32_t distances[8];
-   const uint32_t sample_mask = num_samples - 1;
    uint64_t centroid_priority = 0;
+   const uint32_t samples = MIN2(num_samples, 8u);
 
-   assert(num_samples <= 8);
+   if (samples == 0)
+      return 0;
+
+   const uint32_t sample_mask = samples - 1;
 
    /* Compute the distances from center for each sample. */
-   for (uint32_t i = 0; i < num_samples; i++) {
+   for (uint32_t i = 0; i < samples; i++) {
       const int32_t x = sample_locs[i].x;
       const int32_t y = sample_locs[i].y;
       distances[i] = (uint32_t)(x * x + y * y);
    }
 
    /* Compute the centroid priorities by looking at the distances array. */
-   for (uint32_t i = 0; i < num_samples; i++) {
+   for (uint32_t i = 0; i < samples; i++) {
       uint32_t min_idx = 0;
 
-      for (uint32_t j = 1; j < num_samples; j++) {
+      for (uint32_t j = 1; j < samples; j++) {
          if (distances[j] < distances[min_idx])
             min_idx = j;
       }
@@ -16008,6 +16019,23 @@ radv_CmdWriteMarkerToMemoryAMD(VkCommandBuffer commandBuffer, const VkMemoryMark
 }
 
 /* VK_EXT_descriptor_buffer */
+static ALWAYS_INLINE void
+radv_bind_descriptor_heap(struct radv_cmd_buffer *cmd_buffer, uint32_t heap_idx, uint64_t address)
+{
+   if (heap_idx >= RADV_MAX_HEAPS)
+      return;
+
+   if (cmd_buffer->descriptor_heaps[heap_idx] == address)
+      return;
+
+   cmd_buffer->descriptor_heaps[heap_idx] = address;
+
+   for (unsigned i = 0; i < MAX_BIND_POINTS; i++) {
+      cmd_buffer->descriptors[i].dirty_heaps |= 1u << heap_idx;
+      cmd_buffer->descriptors[i].valid_heaps |= 1u << heap_idx;
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 radv_CmdBindDescriptorBuffersEXT(VkCommandBuffer commandBuffer, uint32_t bufferCount,
                                  const VkDescriptorBufferBindingInfoEXT *pBindingInfos)
@@ -16016,6 +16044,11 @@ radv_CmdBindDescriptorBuffersEXT(VkCommandBuffer commandBuffer, uint32_t bufferC
 
    for (uint32_t i = 0; i < bufferCount; i++) {
       cmd_buffer->descriptor_buffers[i] = pBindingInfos[i].address;
+
+      if (pBindingInfos[i].usage & VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT)
+         radv_bind_descriptor_heap(cmd_buffer, 0, pBindingInfos[i].address);
+      if (pBindingInfos[i].usage & VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT)
+         radv_bind_descriptor_heap(cmd_buffer, 1, pBindingInfos[i].address);
    }
 }
 
