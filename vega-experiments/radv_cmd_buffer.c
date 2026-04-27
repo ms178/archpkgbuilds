@@ -16289,3 +16289,27 @@ radv_CmdSetDepthClampRangeEXT(VkCommandBuffer commandBuffer, VkDepthClampModeEXT
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
    radv_cmd_set_depth_clamp_range(cmd_buffer, depthClampMode, pDepthClampRange);
 }
+
+/* VK_EXT_descriptor_heap */
+VKAPI_ATTR void VKAPI_CALL
+radv_CmdBindSamplerHeapEXT(VkCommandBuffer commandBuffer, const VkBindHeapInfoEXT *pBindInfo)
+{
+   VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+   radv_bind_descriptor_heap(cmd_buffer, 1, pBindInfo->heapRange.address);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+radv_CmdBindResourceHeapEXT(VkCommandBuffer commandBuffer, const VkBindHeapInfoEXT *pBindInfo)
+{
+   VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+   radv_bind_descriptor_heap(cmd_buffer, 0, pBindInfo->heapRange.address);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+radv_CmdPushDataEXT(VkCommandBuffer commandBuffer, const VkPushDataInfoEXT *pPushDataInfo)
+{
+   VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+
+   memcpy(cmd_buffer->push_constants + pPushDataInfo->offset, pPushDataInfo->data.address, pPushDataInfo->data.size);
+   cmd_buffer->push_constant_stages |= RADV_GRAPHICS_STAGE_BITS | RADV_RT_STAGE_BITS | VK_SHADER_STAGE_COMPUTE_BIT;
+}
