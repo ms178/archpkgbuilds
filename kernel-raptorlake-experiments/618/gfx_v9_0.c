@@ -132,48 +132,6 @@ MODULE_FIRMWARE("amdgpu/aldebaran_rlc.bin");
 MODULE_FIRMWARE("amdgpu/aldebaran_sjt_mec.bin");
 MODULE_FIRMWARE("amdgpu/aldebaran_sjt_mec2.bin");
 
-/* Helper macro for conditional register writes to reduce MMIO overhead */
-#ifndef GFX_V9_WREG_SOC15_IF_CHANGED_H
-#define GFX_V9_WREG_SOC15_IF_CHANGED_H
-#define WREG32_SOC15_IF_CHANGED(ip, inst, reg, new_val_expr)                      \
-do {                                                                       \
-	u32 __old = RREG32_SOC15(ip, inst, reg);                           \
-	u32 __val = (new_val_expr);                                        \
-	if (unlikely(__old != __val))                                       \
-		WREG32_SOC15(ip, inst, reg, __val);                         \
-} while (0)
-#endif
-
-/* File-scoped state for GRBM index caching to adhere to single-file modification constraint */
-struct grbm_state {
-	spinlock_t lock;
-	bool initialized;
-	bool cache_valid;
-	const struct amdgpu_device *adev_tag;
-	u32 current_idx;
-};
-static struct grbm_state grbm_state_var;
-
-static void gfx_v9_0_grbm_state_init(struct amdgpu_device *adev)
-{
-	spin_lock_init(&grbm_state_var.lock);
-	grbm_state_var.initialized = true;
-	grbm_state_var.cache_valid = false;
-	grbm_state_var.adev_tag = adev;
-	grbm_state_var.current_idx = 0;
-}
-
-static void gfx_v9_0_grbm_state_invalidate(struct amdgpu_device *adev)
-{
-	unsigned long flags;
-	if (unlikely(!READ_ONCE(grbm_state_var.initialized)))
-		return;
-	spin_lock_irqsave(&grbm_state_var.lock, flags);
-	if (grbm_state_var.adev_tag == adev)
-		grbm_state_var.cache_valid = false;
-	spin_unlock_irqrestore(&grbm_state_var.lock, flags);
-}
-
 static __always_inline int
 gfx9_wait_reg_off(struct amdgpu_device *adev, u32 reg_offset,
 		  u32 mask, u32 val_target, unsigned long timeout_us)
@@ -1125,7 +1083,7 @@ static void gfx_v9_0_kiq_reset_hw_queue(struct amdgpu_ring *kiq_ring,
 					u32 xcc_id, u32 vmid)
 {
 	struct amdgpu_device *adev = kiq_ring->adev;
-	const unsigned long tmo_us = max_t(unsigned long, 1, adev->usec_timeout / 5);
+	const unsigned long tmo_us = max_t(unsigned long, 1, adev->usec_timeout);
 	int r;
 
 	amdgpu_gfx_rlc_enter_safe_mode(adev, xcc_id);
@@ -2314,6 +2272,25 @@ static int gfx_v9_0_sw_init(struct amdgpu_ip_block *ip_block)
 	}
 
 	switch (amdgpu_ip_version(adev, GC_HWIP, 0)) {
+	case IP_VERSION(9, 0, 1):
+	case IP_VERSION(9, 2, 1):
+	case IP_VERSION(9, 4, 0):
+	case IP_VERSION(9, 2, 2):
+	case IP_VERSION(9, 1, 0):
+	case IP_VERSION(9, 3, 0):
+		adev->gfx.cleaner_shader_ptr = gfx_9_4_2_cleaner_shader_hex;
+		adev->gfx.cleaner_shader_size = sizeof(gfx_9_4_2_cleaner_shader_hex);
+		if (adev->gfx.me_fw_version  >= 167 &&
+		    adev->gfx.pfp_fw_version >= 196 &&
+		    adev->gfx.mec_fw_version >= 474) {
+			adev->gfx.enable_cleaner_shader = true;
+			r = amdgpu_gfx_cleaner_shader_sw_init(adev, adev->gfx.cleaner_shader_size);
+			if (r) {
+				adev->gfx.enable_cleaner_shader = false;
+				dev_err(adev->dev, "Failed to initialize cleaner shader\n");
+			}
+		}
+		break;
 	case IP_VERSION(9, 4, 2):
 		adev->gfx.cleaner_shader_ptr = gfx_9_4_2_cleaner_shader_hex;
 		adev->gfx.cleaner_shader_size = sizeof(gfx_9_4_2_cleaner_shader_hex);
@@ -2371,7 +2348,10 @@ static int gfx_v9_0_sw_init(struct amdgpu_ip_block *ip_block)
 	for (i = 0; i < adev->gfx.num_gfx_rings; i++) {
 		ring = &adev->gfx.gfx_ring[i];
 		ring->ring_obj = NULL;
-		sprintf(ring->name, "gfx_%d", i);
+		if (!i)
+			sprintf(ring->name, "gfx");
+		else
+			sprintf(ring->name, "gfx_%d", i);
 		ring->use_doorbell = true;
 		ring->doorbell_index = adev->doorbell_index.gfx_ring0 << 1;
 		ring->no_scheduler = adev->gfx.mcbp;
@@ -2466,9 +2446,6 @@ static int gfx_v9_0_sw_init(struct amdgpu_ip_block *ip_block)
 	r = amdgpu_gfx_sysfs_init(adev);
 	if (r) return r;
 
-	/* Initialize GRBM index shadowing state */
-	gfx_v9_0_grbm_state_init(adev);
-
 	return 0;
 }
 
@@ -2539,27 +2516,7 @@ void gfx_v9_0_select_se_sh(struct amdgpu_device *adev, u32 se_num,
 	else
 		data = REG_SET_FIELD(data, GRBM_GFX_INDEX, SH_INDEX, sh_num);
 
-	if (READ_ONCE(grbm_state_var.initialized)) {
-		unsigned long flags;
-		spin_lock_irqsave(&grbm_state_var.lock, flags);
-
-		if (grbm_state_var.adev_tag != adev) {
-			grbm_state_var.adev_tag = adev;
-			grbm_state_var.cache_valid = false;
-		}
-		if (grbm_state_var.cache_valid &&
-		    grbm_state_var.current_idx == data) {
-			spin_unlock_irqrestore(&grbm_state_var.lock, flags);
-			return;
-		}
-
-		WREG32_SOC15_RLC_SHADOW(GC, 0, mmGRBM_GFX_INDEX, data);
-		grbm_state_var.current_idx = data;
-		grbm_state_var.cache_valid = true;
-		spin_unlock_irqrestore(&grbm_state_var.lock, flags);
-	} else {
-		WREG32_SOC15_RLC_SHADOW(GC, 0, mmGRBM_GFX_INDEX, data);
-	}
+	WREG32_SOC15_RLC_SHADOW(GC, 0, mmGRBM_GFX_INDEX, data);
 }
 
 static u32 gfx_v9_0_get_rb_active_bitmap(struct amdgpu_device *adev)
@@ -2701,67 +2658,6 @@ static void gfx_v9_0_init_sq_config(struct amdgpu_device *adev)
 	}
 }
 
-static void gfx_v9_0_optimize_memory_subsystem(struct amdgpu_device *adev)
-{
-	if (adev->gfx.gfx_current_status != AMDGPU_GFX_NORMAL_MODE) {
-		dev_dbg(adev->dev, "GPU not in normal mode, skipping memory optimization\n");
-		return;
-	}
-
-	switch (amdgpu_ip_version(adev, GC_HWIP, 0)) {
-		case IP_VERSION(9, 0, 1):
-		case IP_VERSION(9, 2, 1):
-		case IP_VERSION(9, 4, 0):
-		case IP_VERSION(9, 1, 0):
-		case IP_VERSION(9, 2, 2):
-		case IP_VERSION(9, 3, 0):
-			WREG32_SOC15(GC, 0, mmSQC_CONFIG, 0x020a2000);
-			WREG32_SOC15(GC, 0, mmTA_CNTL_AUX, 0x010b0000);
-			WREG32_SOC15(GC, 0, mmVGT_CACHE_INVALIDATION, 0x19200000);
-			break;
-		default:
-			break;
-	}
-
-	switch (amdgpu_ip_version(adev, GC_HWIP, 0)) {
-		case IP_VERSION(9, 0, 1):
-		case IP_VERSION(9, 4, 0):
-			WREG32_SOC15(GC, 0, mmTCP_CHAN_STEER_HI, 0x4a2c0e68);
-			WREG32_SOC15(GC, 0, mmTCP_CHAN_STEER_LO, 0xb5d3f197);
-			WREG32_SOC15(GC, 0, mmVGT_GS_MAX_WAVE_ID, 0x000003ff);
-			WREG32_SOC15(GC, 0, mmSPI_RESOURCE_RESERVE_CU_0, 0x00000800);
-			WREG32_SOC15(GC, 0, mmSPI_RESOURCE_RESERVE_CU_1, 0x00000800);
-			WREG32_SOC15(GC, 0, mmSPI_RESOURCE_RESERVE_EN_CU_0, 0x00ffff87);
-			WREG32_SOC15(GC, 0, mmSPI_RESOURCE_RESERVE_EN_CU_1, 0x00ffff8f);
-			break;
-		case IP_VERSION(9, 2, 1):
-			WREG32_SOC15(GC, 0, mmTCP_CHAN_STEER_HI, 0x00000000);
-			WREG32_SOC15(GC, 0, mmTCP_CHAN_STEER_LO, 0x76325410);
-			WREG32_SOC15(GC, 0, mmVGT_GS_MAX_WAVE_ID, 0x000003ff);
-			WREG32_SOC15(GC, 0, mmSPI_RESOURCE_RESERVE_CU_0, 0x00000800);
-			WREG32_SOC15(GC, 0, mmSPI_RESOURCE_RESERVE_CU_1, 0x00000800);
-			WREG32_SOC15(GC, 0, mmSPI_RESOURCE_RESERVE_EN_CU_0, 0x0000ff87);
-			WREG32_SOC15(GC, 0, mmSPI_RESOURCE_RESERVE_EN_CU_1, 0x0000ff8f);
-			break;
-		case IP_VERSION(9, 1, 0):
-		case IP_VERSION(9, 2, 2):
-		case IP_VERSION(9, 3, 0):
-			WREG32_SOC15(GC, 0, mmTCP_CHAN_STEER_HI, 0x00000000);
-			WREG32_SOC15(GC, 0, mmTCP_CHAN_STEER_LO, 0x00003120);
-			if (amdgpu_ip_version(adev, GC_HWIP, 0) == IP_VERSION(9, 3, 0))
-				WREG32_SOC15(GC, 0, mmGCEA_PROBE_MAP, 0x0000cccc);
-			WREG32_SOC15(GC, 0, mmVGT_GS_MAX_WAVE_ID, 0x000000ff);
-			break;
-		default:
-			break;
-	}
-
-	dev_dbg(adev->dev, "Memory subsystem optimization applied for IP %d.%d.%d\n",
-			IP_VERSION_MAJ(amdgpu_ip_version(adev, GC_HWIP, 0)),
-			IP_VERSION_MIN(amdgpu_ip_version(adev, GC_HWIP, 0)),
-			IP_VERSION_REV(amdgpu_ip_version(adev, GC_HWIP, 0)));
-}
-
 static void gfx_v9_0_constants_init(struct amdgpu_device *adev)
 {
 	u32 tmp;
@@ -2778,9 +2674,6 @@ static void gfx_v9_0_constants_init(struct amdgpu_device *adev)
 		gfx_v9_0_setup_rb(adev);
 	gfx_v9_0_get_cu_info(adev, &adev->gfx.cu_info);
 	adev->gfx.config.db_debug2 = RREG32_SOC15(GC, 0, mmDB_DEBUG2);
-
-	/* Apply Godlike optimizations */
-	gfx_v9_0_optimize_memory_subsystem(adev);
 
 	mutex_lock(&adev->srbm_mutex);
 	for (i = 0; i < adev->vm_manager.id_mgr[AMDGPU_GFXHUB(0)].num_ids; i++) {
@@ -4203,11 +4096,6 @@ static int gfx_v9_0_hw_fini(struct amdgpu_ip_block *ip_block)
 
 static int gfx_v9_0_suspend(struct amdgpu_ip_block *ip_block)
 {
-	struct amdgpu_device *adev = ip_block->adev;
-
-	/* Invalidate GRBM cache before hardware teardown */
-	gfx_v9_0_grbm_state_invalidate(adev);
-
 	return gfx_v9_0_hw_fini(ip_block);
 }
 
@@ -4242,12 +4130,9 @@ static int gfx_v9_0_wait_for_idle(struct amdgpu_ip_block *ip_block)
 
 static int gfx_v9_0_soft_reset(struct amdgpu_ip_block *ip_block)
 {
-	struct amdgpu_device *adev = ip_block->adev;
 	u32 grbm_soft_reset = 0;
 	u32 tmp;
-
-	/* Invalidate GRBM cache as soft reset may alter internal state */
-	gfx_v9_0_grbm_state_invalidate(adev);
+	struct amdgpu_device *adev = ip_block->adev;
 
 	/* GRBM_STATUS */
 	tmp = RREG32_SOC15(GC, 0, mmGRBM_STATUS);
@@ -5343,15 +5228,12 @@ static int gfx_v9_0_set_powergating_state(struct amdgpu_ip_block *ip_block,
 	struct amdgpu_device *adev = ip_block->adev;
 	bool enable = (state == AMD_PG_STATE_GATE);
 
-	if (amdgpu_sriov_vf(adev))
-		return 0;
-
 	switch (amdgpu_ip_version(adev, GC_HWIP, 0)) {
 	case IP_VERSION(9, 2, 2):
 	case IP_VERSION(9, 1, 0):
 	case IP_VERSION(9, 3, 0):
 		if (!enable)
-			amdgpu_gfx_off_ctrl(adev, false);
+			amdgpu_gfx_off_ctrl_immediate(adev, false);
 
 		if (adev->pg_flags & AMD_PG_SUPPORT_RLC_SMU_HS) {
 			gfx_v9_0_enable_sck_slow_down_on_power_up(adev, true);
@@ -5373,25 +5255,10 @@ static int gfx_v9_0_set_powergating_state(struct amdgpu_ip_block *ip_block,
 		gfx_v9_0_update_gfx_mg_power_gating(adev, enable);
 
 		if (enable)
-			amdgpu_gfx_off_ctrl(adev, true);
-
-		/* Invalidate GRBM cache after any power state change */
-		gfx_v9_0_grbm_state_invalidate(adev);
+			amdgpu_gfx_off_ctrl_immediate(adev, true);
 		break;
 	case IP_VERSION(9, 2, 1):
-		amdgpu_gfx_off_ctrl(adev, enable);
-		break;
-	case IP_VERSION(9, 0, 1):
-	case IP_VERSION(9, 4, 0):
-		if (adev->pg_flags & (AMD_PG_SUPPORT_GFX_PG |
-				      AMD_PG_SUPPORT_GFX_SMG |
-				      AMD_PG_SUPPORT_GFX_DMG)) {
-			gfx_v9_0_update_gfx_cg_power_gating(adev, enable);
-			gfx_v9_0_update_gfx_mg_power_gating(adev, enable);
-
-			/* Invalidate GRBM cache after any power state change */
-			gfx_v9_0_grbm_state_invalidate(adev);
-		}
+		amdgpu_gfx_off_ctrl_immediate(adev, enable);
 		break;
 	default:
 		break;
