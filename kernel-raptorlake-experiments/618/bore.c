@@ -379,9 +379,28 @@ u8 effective_prio_bore(struct task_struct *p)
 	return (u8)prio;
 }
 
+static __always_inline u64 bore_u64_add_sat(u64 a, u64 b)
+{
+	u64 s = a + b;
+
+	if (unlikely(s < a))
+		return U64_MAX;
+	return s;
+}
+
+static __always_inline u8 bore_penalty_to_score(u16 penalty)
+{
+	u32 score = (u32)penalty >> 8;
+
+	if (unlikely(score > 39U))
+		score = 39U;
+	return (u8)score;
+}
+
 static void update_penalty(struct task_struct *p)
 {
 	struct bore_ctx *ctx;
+	u16 new_penalty;
 	u8 old_score;
 	u8 new_score;
 	int base_prio;
@@ -389,15 +408,21 @@ static void update_penalty(struct task_struct *p)
 	int new_prio;
 
 	ctx = &p->bore;
-	old_score = READ_ONCE(ctx->score);
 
-	ctx->penalty = max_t(u16, ctx->curr_penalty, ctx->prev_penalty);
+	new_penalty = max_t(u16, ctx->curr_penalty, ctx->prev_penalty);
 	if (unlikely(p->flags & PF_KTHREAD))
-		ctx->penalty = 0;
+		new_penalty = 0;
 
-	new_score = READ_ONCE(ctx->score);
+	if (READ_ONCE(ctx->penalty) != new_penalty)
+		WRITE_ONCE(ctx->penalty, new_penalty);
+
+	old_score = READ_ONCE(ctx->score);
+	new_score = bore_penalty_to_score(new_penalty);
+
 	if (likely(new_score == old_score))
 		return;
+
+	WRITE_ONCE(ctx->score, new_score);
 
 	base_prio = clamp_t(int, p->static_prio - MAX_RT_PRIO, 0, 39);
 	old_prio = clamp(base_prio + old_score, 0, 39);
@@ -413,16 +438,16 @@ void update_curr_bore(struct task_struct *p, u64 delta_exec)
 	u32 curr_penalty;
 	u16 prev_penalty;
 	u16 old_curr_penalty;
+	u64 burst_time;
 
 	ctx = &p->bore;
 	if (unlikely(ctx->stop_update) || unlikely(!delta_exec))
 		return;
 
-	if (unlikely(U64_MAX - ctx->burst_time < delta_exec))
-		ctx->burst_time = U64_MAX;
-	else
-		ctx->burst_time += delta_exec;
-	curr_penalty = calc_burst_penalty(ctx->burst_time);
+	burst_time = bore_u64_add_sat(ctx->burst_time, delta_exec);
+	ctx->burst_time = burst_time;
+
+	curr_penalty = calc_burst_penalty(burst_time);
 	curr_penalty = bore_apply_itd_bias(curr_penalty);
 	old_curr_penalty = READ_ONCE(ctx->curr_penalty);
 
@@ -516,29 +541,35 @@ static __always_inline u32 count_children_upto2(struct task_struct *p)
 {
 	struct list_head *head;
 	struct list_head *first;
-	struct list_head *second;
 
 	head = &p->children;
 	first = READ_ONCE(head->next);
-	second = READ_ONCE(first->next);
+	if (first == head)
+		return 0;
 
-	return (first != head) + (second != head);
+	return 1U + (READ_ONCE(first->next) != head);
 }
 
-static __always_inline bool burst_cache_expired(struct bore_bc *bc, u64 now)
+static __always_inline bool burst_cache_try_read(struct bore_bc *bc, u64 now, u32 *penalty)
 {
 	struct bore_bc bc_val;
 	u64 timestamp;
+	u64 lifetime;
 
 	bc_val.value = READ_ONCE(bc->value);
 	timestamp = (u64)bc_val.timestamp << BORE_BC_TIMESTAMP_SHIFT;
-	if (unlikely(now <= timestamp))
-		return false;
 
-	return now - timestamp > (u64)READ_ONCE(sched_burst_cache_lifetime);
+	if (unlikely(now > timestamp)) {
+		lifetime = (u64)READ_ONCE(sched_burst_cache_lifetime);
+		if (now - timestamp > lifetime)
+			return false;
+	}
+
+	*penalty = (u32)bc_val.penalty;
+	return true;
 }
 
-static void update_burst_cache(struct bore_bc *bc,
+static u32 update_burst_cache(struct bore_bc *bc,
 			      struct task_struct *owner,
 			      u32 count, u64 total, u64 now)
 {
@@ -557,12 +588,14 @@ static void update_burst_cache(struct bore_bc *bc,
 	new_bc.penalty = max_t(u32, average, owner->bore.penalty);
 	new_bc.timestamp = now >> BORE_BC_TIMESTAMP_SHIFT;
 	WRITE_ONCE(bc->value, new_bc.value);
+
+	return (u32)new_bc.penalty;
 }
 
 static u32 inherit_from_parent(struct task_struct *parent, u64 clone_flags, u64 now)
 {
-	struct bore_bc bc_val;
 	struct bore_bc *bc;
+	u32 cached_penalty;
 
 	if (clone_flags & CLONE_PARENT)
 		parent = rcu_dereference(parent->real_parent);
@@ -571,10 +604,8 @@ static u32 inherit_from_parent(struct task_struct *parent, u64 clone_flags, u64 
 		return 0;
 
 	bc = &parent->bore.subtree;
-	if (likely(!burst_cache_expired(bc, now))) {
-		bc_val.value = READ_ONCE(bc->value);
-		return (u32)bc_val.penalty;
-	}
+	if (likely(burst_cache_try_read(bc, now, &cached_penalty)))
+		return cached_penalty;
 
 	{
 		struct task_struct *child;
@@ -594,18 +625,15 @@ static u32 inherit_from_parent(struct task_struct *parent, u64 clone_flags, u64 
 			total += READ_ONCE(child->bore.penalty);
 		}
 
-		update_burst_cache(bc, parent, count, total, now);
+		return update_burst_cache(bc, parent, count, total, now);
 	}
-
-	bc_val.value = READ_ONCE(bc->value);
-	return (u32)bc_val.penalty;
 }
 
 static u32 inherit_from_ancestor_hub(struct task_struct *parent, u64 clone_flags, u64 now)
 {
-	struct bore_bc bc_val;
 	struct task_struct *ancestor;
 	u32 sole_child_count = 0;
+	u32 cached_penalty;
 
 	ancestor = parent;
 	if (clone_flags & CLONE_PARENT) {
@@ -630,10 +658,8 @@ static u32 inherit_from_ancestor_hub(struct task_struct *parent, u64 clone_flags
 		sole_child_count = 1;
 	}
 
-	if (likely(!burst_cache_expired(&ancestor->bore.subtree, now))) {
-		bc_val.value = READ_ONCE(ancestor->bore.subtree.value);
-		return (u32)bc_val.penalty;
-	}
+	if (likely(burst_cache_try_read(&ancestor->bore.subtree, now, &cached_penalty)))
+		return cached_penalty;
 
 	{
 		struct task_struct *direct_child;
@@ -653,8 +679,8 @@ static u32 inherit_from_ancestor_hub(struct task_struct *parent, u64 clone_flags
 				struct task_struct *next_descendant;
 
 				next_descendant = list_first_or_null_rcu(&descendant->children,
-								 struct task_struct,
-								 sibling);
+									 struct task_struct,
+									 sibling);
 				if (!next_descendant)
 					break;
 				descendant = next_descendant;
@@ -667,28 +693,23 @@ static u32 inherit_from_ancestor_hub(struct task_struct *parent, u64 clone_flags
 			total += READ_ONCE(descendant->bore.penalty);
 		}
 
-		update_burst_cache(&ancestor->bore.subtree, ancestor, count, total, now);
+		return update_burst_cache(&ancestor->bore.subtree, ancestor, count, total, now);
 	}
-
-	bc_val.value = READ_ONCE(ancestor->bore.subtree.value);
-	return (u32)bc_val.penalty;
 }
 
 static u32 inherit_from_thread_group(struct task_struct *p, u64 now)
 {
-	struct bore_bc bc_val;
 	struct task_struct *leader;
 	struct bore_bc *bc;
+	u32 cached_penalty;
 
 	leader = READ_ONCE(p->group_leader);
 	if (unlikely(!leader))
 		return 0;
 
 	bc = &leader->bore.group;
-	if (likely(!burst_cache_expired(bc, now))) {
-		bc_val.value = READ_ONCE(bc->value);
-		return (u32)bc_val.penalty;
-	}
+	if (likely(burst_cache_try_read(bc, now, &cached_penalty)))
+		return cached_penalty;
 
 	{
 		struct task_struct *sibling;
@@ -708,11 +729,8 @@ static u32 inherit_from_thread_group(struct task_struct *p, u64 now)
 			total += READ_ONCE(sibling->bore.penalty);
 		}
 
-		update_burst_cache(bc, leader, count, total, now);
+		return update_burst_cache(bc, leader, count, total, now);
 	}
-
-	bc_val.value = READ_ONCE(bc->value);
-	return (u32)bc_val.penalty;
 }
 
 void task_fork_bore(struct task_struct *p, struct task_struct *parent,
