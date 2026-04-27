@@ -1115,9 +1115,15 @@ radv_emit_clear_data(struct radv_cmd_buffer *cmd_buffer, unsigned engine_sel, ui
     */
    static const uint32_t zeroes[64] = {0};
 
-   assert(size > 0 && (size % 4) == 0 && size <= sizeof(zeroes));
+   assert(size > 0 && (size % 4) == 0);
 
-   radv_write_data(cmd_buffer, engine_sel, va, size / 4, zeroes, false);
+   unsigned remaining = size / 4;
+   while (remaining) {
+      const unsigned dw = MIN2(remaining, ARRAY_SIZE(zeroes));
+      radv_write_data(cmd_buffer, engine_sel, va, dw, zeroes, false);
+      va += (uint64_t)dw * 4u;
+      remaining -= dw;
+   }
 }
 
 static void
@@ -2062,23 +2068,26 @@ radv_compute_centroid_priority(struct radv_cmd_buffer *cmd_buffer, VkOffset2D *s
 
    uint32_t centroid_priorities[8];
    uint32_t distances[8];
-   const uint32_t sample_mask = num_samples - 1;
    uint64_t centroid_priority = 0;
+   const uint32_t samples = MIN2(num_samples, 8u);
 
-   assert(num_samples <= 8);
+   if (samples == 0)
+      return 0;
+
+   const uint32_t sample_mask = samples - 1;
 
    /* Compute the distances from center for each sample. */
-   for (uint32_t i = 0; i < num_samples; i++) {
+   for (uint32_t i = 0; i < samples; i++) {
       const int32_t x = sample_locs[i].x;
       const int32_t y = sample_locs[i].y;
       distances[i] = (uint32_t)(x * x + y * y);
    }
 
    /* Compute the centroid priorities by looking at the distances array. */
-   for (uint32_t i = 0; i < num_samples; i++) {
+   for (uint32_t i = 0; i < samples; i++) {
       uint32_t min_idx = 0;
 
-      for (uint32_t j = 1; j < num_samples; j++) {
+      for (uint32_t j = 1; j < samples; j++) {
          if (distances[j] < distances[min_idx])
             min_idx = j;
       }
