@@ -549,6 +549,8 @@ struct radv_cmd_buffer {
 
    struct radv_cmd_buffer_queue_state queue_state;
 
+   struct radeon_winsys_bo *gfx9_fence_bo_tmz;
+   struct radeon_winsys_bo *gfx9_eop_bug_bo_tmz;
    uint64_t gfx9_fence_va;
    uint32_t gfx9_fence_idx;
    uint64_t gfx9_eop_bug_va;
