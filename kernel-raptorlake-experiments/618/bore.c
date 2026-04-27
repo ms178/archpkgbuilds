@@ -56,6 +56,30 @@ static const u8 bore_log2_lut[256] = {
 
 static u32 bore_reciprocal_lut[BURST_CACHE_SAMPLE_LIMIT + 1];
 
+static const u16 bore_pct_to_q8_lut[101] = {
+	[0 ... 100] = 0,
+	[1] = 2, [2] = 5, [3] = 7, [4] = 10, [5] = 12,
+	[6] = 15, [7] = 17, [8] = 20, [9] = 23, [10] = 25,
+	[11] = 28, [12] = 30, [13] = 33, [14] = 35, [15] = 38,
+	[16] = 40, [17] = 43, [18] = 46, [19] = 48, [20] = 51,
+	[21] = 53, [22] = 56, [23] = 58, [24] = 61, [25] = 64,
+	[26] = 66, [27] = 69, [28] = 71, [29] = 74, [30] = 76,
+	[31] = 79, [32] = 81, [33] = 84, [34] = 87, [35] = 89,
+	[36] = 92, [37] = 94, [38] = 97, [39] = 99, [40] = 102,
+	[41] = 104, [42] = 107, [43] = 110, [44] = 112, [45] = 115,
+	[46] = 117, [47] = 120, [48] = 122, [49] = 125, [50] = 128,
+	[51] = 130, [52] = 133, [53] = 135, [54] = 138, [55] = 140,
+	[56] = 143, [57] = 145, [58] = 148, [59] = 151, [60] = 153,
+	[61] = 156, [62] = 158, [63] = 161, [64] = 163, [65] = 166,
+	[66] = 168, [67] = 171, [68] = 174, [69] = 176, [70] = 179,
+	[71] = 181, [72] = 184, [73] = 186, [74] = 189, [75] = 192,
+	[76] = 194, [77] = 197, [78] = 199, [79] = 202, [80] = 204,
+	[81] = 207, [82] = 209, [83] = 212, [84] = 215, [85] = 217,
+	[86] = 220, [87] = 222, [88] = 225, [89] = 227, [90] = 230,
+	[91] = 232, [92] = 235, [93] = 238, [94] = 240, [95] = 243,
+	[96] = 245, [97] = 248, [98] = 250, [99] = 253, [100] = 256,
+};
+
 DEFINE_STATIC_KEY_TRUE(sched_burst_inherit_key);
 DEFINE_STATIC_KEY_TRUE(sched_burst_ancestor_key);
 
@@ -102,6 +126,8 @@ DEFINE_STATIC_KEY_FALSE(bore_itd_key);
 struct bore_penalty_params {
 	u16 offset_q8;
 	u16 scale;
+	u16 exp_floor_q8;
+	u16 sat_delta;
 	u8 gen;
 };
 
@@ -127,7 +153,11 @@ static __always_inline const struct bore_penalty_params *bore_get_params(void)
 		return pp;
 
 	pp->offset_q8 = (u16)READ_ONCE(sched_burst_penalty_offset) << 8;
-	pp->scale = (u16)READ_ONCE(sched_burst_penalty_scale);
+	pp->scale = max_t(u16, (u16)READ_ONCE(sched_burst_penalty_scale), 1U);
+	pp->exp_floor_q8 = (pp->offset_q8 > 248U) ? (pp->offset_q8 - 248U) : 0U;
+	pp->sat_delta = min_t(u32,
+				DIV_ROUND_UP((u32)MAX_BURST_PENALTY << 10, (u32)pp->scale),
+				U16_MAX);
 	smp_wmb();
 	WRITE_ONCE(pp->gen, gen_now);
 
@@ -183,7 +213,7 @@ static void bore_itd_sample_work_fn(struct work_struct *work)
 				eff_pct = min(cap, pct);
 
 				if (eff_pct) {
-					delta_q8 = (eff_pct * 256U) / 100U;
+					delta_q8 = bore_pct_to_q8_lut[eff_pct];
 					if (READ_ONCE(st->is_pcore)) {
 						q8 = (delta_q8 >= 256U) ? 0U : (u16)(256U - delta_q8);
 					} else {
@@ -284,29 +314,28 @@ static __always_inline u32 calc_burst_penalty(u64 burst_time)
 {
 	const struct bore_penalty_params *pp;
 	u32 offset_q8;
-	u32 clz;
 	u32 exp_q8;
 	u32 frac_idx;
-	u64 norm;
-	u64 frac;
 	u32 greed;
 	u32 delta;
+	u32 scale;
 	u32 scaled_penalty;
+	u32 msb;
+	u64 frac;
 
 	if (unlikely(!burst_time))
 		return 0;
 
 	pp = bore_get_params();
 	offset_q8 = pp->offset_q8;
-	clz = __builtin_clzll(burst_time);
-	exp_q8 = (64U - clz) << 8;
+	scale = pp->scale;
+	msb = fls64(burst_time);
+	exp_q8 = msb << 8;
 
-	/* Even max fractional part cannot cross offset. */
-	if (likely(exp_q8 + 248U <= offset_q8))
+	if (likely(exp_q8 <= pp->exp_floor_q8))
 		return 0;
 
-	norm = burst_time << clz;
-	frac = norm << 1;
+	frac = burst_time << (64U - msb + 1U);
 	frac_idx = (u32)((frac >> 56) & 0xffU);
 	greed = exp_q8 + (u32)bore_log2_lut[frac_idx];
 
@@ -314,8 +343,10 @@ static __always_inline u32 calc_burst_penalty(u64 burst_time)
 		return 0;
 
 	delta = greed - offset_q8;
-	scaled_penalty = (delta * (u32)pp->scale) >> 10;
+	if (unlikely(delta >= pp->sat_delta))
+		return MAX_BURST_PENALTY;
 
+	scaled_penalty = (delta * scale) >> 10;
 	return min_t(u32, scaled_penalty, MAX_BURST_PENALTY);
 }
 
@@ -337,11 +368,12 @@ static __always_inline u32 binary_smooth(u32 new_val, u32 old_val)
 	if (new_val <= old_val)
 		return new_val;
 
-	shift = READ_ONCE(sched_burst_smoothness);
-	shift = min_t(u32, shift, 31U);
+	shift = min_t(u32, READ_ONCE(sched_burst_smoothness), 31U);
+	if (unlikely(!shift))
+		return new_val;
 
 	/* Ceil-divide by 2^shift to keep monotonic growth with small deltas. */
-	return old_val + ((new_val - old_val + (1U << shift) - 1U) >> shift);
+	return old_val + DIV_ROUND_UP(new_val - old_val, 1U << shift);
 }
 
 static void reweight_task_by_prio(struct task_struct *p, int prio)
@@ -455,6 +487,9 @@ void update_curr_bore(struct task_struct *p, u64 delta_exec)
 		return;
 
 	ctx->curr_penalty = (u16)curr_penalty;
+	if (likely(curr_penalty <= old_curr_penalty))
+		return;
+
 	prev_penalty = READ_ONCE(ctx->prev_penalty);
 	if (likely(curr_penalty <= prev_penalty))
 		return;
