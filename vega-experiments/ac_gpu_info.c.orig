@@ -812,6 +812,9 @@ ac_identify_chip(struct radeon_info *info, const struct drm_amdgpu_info_device *
       case VCN_IP_VERSION(5, 0, 1):
          info->vcn_ip_version = VCN_5_0_1;
          break;
+      case VCN_IP_VERSION(5, 3, 0):
+         info->vcn_ip_version = VCN_5_3_0;
+         break;
       default:
          info->vcn_ip_version = VCN_UNKNOWN;
       }
