@@ -1293,6 +1293,8 @@ radv_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer, UNUSED VkCommandB
       cmd_buffer->descriptors[i].dirty = 0;
       cmd_buffer->descriptors[i].valid = 0;
       cmd_buffer->descriptors[i].dirty_dynamic = false;
+      cmd_buffer->descriptors[i].dirty_heaps = 0;
+      cmd_buffer->descriptors[i].valid_heaps = 0;
    }
 
    radv_cmd_buffer_reset_rendering(cmd_buffer);
@@ -16017,6 +16019,23 @@ radv_CmdWriteMarkerToMemoryAMD(VkCommandBuffer commandBuffer, const VkMemoryMark
 }
 
 /* VK_EXT_descriptor_buffer */
+static ALWAYS_INLINE void
+radv_bind_descriptor_heap(struct radv_cmd_buffer *cmd_buffer, uint32_t heap_idx, uint64_t address)
+{
+   if (heap_idx >= RADV_MAX_HEAPS)
+      return;
+
+   if (cmd_buffer->descriptor_heaps[heap_idx] == address)
+      return;
+
+   cmd_buffer->descriptor_heaps[heap_idx] = address;
+
+   for (unsigned i = 0; i < MAX_BIND_POINTS; i++) {
+      cmd_buffer->descriptors[i].dirty_heaps |= 1u << heap_idx;
+      cmd_buffer->descriptors[i].valid_heaps |= 1u << heap_idx;
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 radv_CmdBindDescriptorBuffersEXT(VkCommandBuffer commandBuffer, uint32_t bufferCount,
                                  const VkDescriptorBufferBindingInfoEXT *pBindingInfos)
@@ -16025,6 +16044,11 @@ radv_CmdBindDescriptorBuffersEXT(VkCommandBuffer commandBuffer, uint32_t bufferC
 
    for (uint32_t i = 0; i < bufferCount; i++) {
       cmd_buffer->descriptor_buffers[i] = pBindingInfos[i].address;
+
+      if (pBindingInfos[i].usage & VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT)
+         radv_bind_descriptor_heap(cmd_buffer, 0, pBindingInfos[i].address);
+      if (pBindingInfos[i].usage & VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT)
+         radv_bind_descriptor_heap(cmd_buffer, 1, pBindingInfos[i].address);
    }
 }
 
