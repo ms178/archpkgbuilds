@@ -88,14 +88,12 @@ static constexpr uint64_t canonicalized_labels =
 static Label
 canonicalized_label(unsigned bit_size)
 {
-   if (bit_size == 16)
-      return label_canonicalized_fp16;
-   else if (bit_size == 32)
-      return label_canonicalized_fp32;
-   else if (bit_size == 64)
-      return label_canonicalized_fp64;
-   else
-      UNREACHABLE("unknown canonicalized size");
+   switch (bit_size) {
+   case 16: return label_canonicalized_fp16;
+   case 32: return label_canonicalized_fp32;
+   case 64: return label_canonicalized_fp64;
+   default: UNREACHABLE("unknown canonicalized size");
+   }
 }
 
 static_assert((temp_labels & val_labels) == 0, "labels cannot intersect");
@@ -276,15 +274,11 @@ get_canonical_operand_type(aco_opcode opcode, unsigned idx)
 bool
 dpp16_ctrl_uses_bc(uint16_t dpp_ctrl)
 {
-   if (dpp_ctrl >= dpp_row_sl(1) && dpp_ctrl <= dpp_row_sl(15))
-      return true;
-   if (dpp_ctrl >= dpp_row_sr(1) && dpp_ctrl <= dpp_row_sr(15))
-      return true;
-   if (dpp_ctrl == dpp_wf_sl1 || dpp_ctrl == dpp_wf_sr1)
-      return true;
-   if (dpp_ctrl == dpp_row_bcast15 || dpp_ctrl == dpp_row_bcast31)
-      return true;
-   return false;
+   const bool row_sl = dpp_ctrl >= dpp_row_sl(1) && dpp_ctrl <= dpp_row_sl(15);
+   const bool row_sr = dpp_ctrl >= dpp_row_sr(1) && dpp_ctrl <= dpp_row_sr(15);
+   const bool wf_shift = dpp_ctrl == dpp_wf_sl1 || dpp_ctrl == dpp_wf_sr1;
+   const bool row_bcast = dpp_ctrl == dpp_row_bcast15 || dpp_ctrl == dpp_row_bcast31;
+   return row_sl || row_sr || wf_shift || row_bcast;
 }
 
 struct alu_opt_op {
@@ -6879,6 +6873,8 @@ validate_opt_ctx(opt_ctx& ctx, bool incorrect_uses_lits)
 }
 
 void rename_loop_header_phis(opt_ctx& ctx) {
+   constexpr unsigned max_phi_propagation_depth = 32;
+
    for (Block& block : ctx.program->blocks) {
       if (!(block.kind & block_kind_loop_header))
          continue;
@@ -6887,19 +6883,25 @@ void rename_loop_header_phis(opt_ctx& ctx) {
          if (!is_phi(instr))
             break;
 
-         for (unsigned i = 0; i < instr->operands.size(); i++) {
+         const unsigned num_operands = instr->operands.size();
+         for (unsigned i = 0; i < num_operands; i++) {
             Operand& operand = instr->operands[i];
             if (!operand.isTemp())
                continue;
 
             Temp cur = operand.getTemp();
             const RegClass cls = cur.regClass();
-            while (true) {
+            unsigned depth = 0;
+            while (depth < max_phi_propagation_depth) {
                const ssa_info& info = ctx.info[cur.id()];
                if (!info.is_temp() || info.temp.regClass() != cls)
                   break;
-               pseudo_propagate_temp(ctx, instr, info.temp, i);
-               cur = info.temp;
+               const Temp next = info.temp;
+               if (UNLIKELY(next == cur))
+                  break;
+               pseudo_propagate_temp(ctx, instr, next, i);
+               cur = next;
+               ++depth;
             }
          }
       }
@@ -6917,13 +6919,17 @@ optimize(Program* program)
 
    /* Heuristic: reserve memory to reduce allocator/hash churn. */
    size_t total_instr = 0;
-   for (const Block& block : program->blocks)
+   size_t max_block_instr = 0;
+   for (const Block& block : program->blocks) {
       total_instr += block.instructions.size();
+      max_block_instr = std::max(max_block_instr, block.instructions.size());
+   }
 
-   const size_t reserve_hint = total_instr / 4u + 32u;
+   const size_t reserve_hint = total_instr / 3u + 64u;
    ctx.pre_combine_instrs.reserve(reserve_hint);
    ctx.replacement_instr.reserve(reserve_hint);
    ctx.replacement_instr.max_load_factor(0.7f);
+   ctx.instructions.reserve(max_block_instr);
 
    /* 1. Bottom-Up DAG pass (forward) to label all ssa-defs */
    for (Block& block : program->blocks) {
