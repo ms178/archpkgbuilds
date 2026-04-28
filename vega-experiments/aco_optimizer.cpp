@@ -6891,12 +6891,15 @@ void rename_loop_header_phis(opt_ctx& ctx) {
 
             Temp cur = operand.getTemp();
             const RegClass cls = cur.regClass();
-            for (unsigned depth = 0; depth < max_phi_propagation_depth; depth++) {
+            unsigned depth = 0;
+            while (true) {
                const ssa_info& info = ctx.info[cur.id()];
                if (!info.is_temp() || info.temp.regClass() != cls)
                   break;
                pseudo_propagate_temp(ctx, instr, info.temp, i);
                cur = info.temp;
+               if (UNLIKELY(++depth >= max_phi_propagation_depth))
+                  break;
             }
          }
       }
