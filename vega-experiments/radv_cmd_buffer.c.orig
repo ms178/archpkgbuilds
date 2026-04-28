@@ -15225,6 +15225,21 @@ radv_barrier(struct radv_cmd_buffer *cmd_buffer, uint32_t dep_count, const VkDep
       }
 
       has_image_transitions |= dep_info->imageMemoryBarrierCount > 0;
+
+      const VkMemoryRangeBarriersInfoKHR *mem_barriers_info =
+         vk_find_struct_const(dep_info->pNext, MEMORY_RANGE_BARRIERS_INFO_KHR);
+      if (mem_barriers_info) {
+         for (uint32_t i = 0; i < mem_barriers_info->memoryRangeBarrierCount; i++) {
+            const VkMemoryRangeBarrierKHR *barrier = &mem_barriers_info->pMemoryRangeBarriers[i];
+
+            src_stage_mask |= barrier->srcStageMask;
+            src_flush_bits |= radv_get_src_access_flush(cmd_buffer, barrier->srcStageMask, barrier->srcAccessMask, NULL,
+                                                        NULL, barrier->pNext);
+            dst_stage_mask |= barrier->dstStageMask;
+            dst_flush_bits |= radv_get_dst_access_flush(cmd_buffer, barrier->dstStageMask, barrier->dstAccessMask, NULL,
+                                                        NULL, barrier->pNext);
+         }
+      }
    }
 
    /* Only optimize BOTTOM_OF_PIPE/NONE as dst when there is no image layout transitions because it might
