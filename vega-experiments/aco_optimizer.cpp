@@ -6888,13 +6888,18 @@ void rename_loop_header_phis(opt_ctx& ctx) {
             break;
 
          for (unsigned i = 0; i < instr->operands.size(); i++) {
-            if (!instr->operands[i].isTemp())
+            Operand& operand = instr->operands[i];
+            if (!operand.isTemp())
                continue;
 
-            ssa_info info = ctx.info[instr->operands[i].tempId()];
-            while (info.is_temp()) {
+            Temp cur = operand.getTemp();
+            const RegClass cls = cur.regClass();
+            while (true) {
+               const ssa_info& info = ctx.info[cur.id()];
+               if (!info.is_temp() || info.temp.regClass() != cls)
+                  break;
                pseudo_propagate_temp(ctx, instr, info.temp, i);
-               info = ctx.info[info.temp.id()];
+               cur = info.temp;
             }
          }
       }
