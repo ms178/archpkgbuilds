@@ -342,8 +342,6 @@ ac_fill_compiler_info(struct radeon_info *info, const struct drm_amdgpu_info_dev
 
    out->has_attr_ring = info->gfx_level >= GFX11;
 
-   out->mesh_fast_launch_2 = info->mesh_fast_launch_2;
-
    /* When distributed tessellation is unsupported, switch between SEs
     * at a higher frequency to manually balance the workload between SEs.
     */
@@ -1097,8 +1095,6 @@ void ac_fill_feature_info(struct radeon_info *info, const struct drm_amdgpu_info
 
    info->has_image_opcodes = debug_get_bool_option("AMD_IMAGE_OPCODES",
                                                    info->has_graphics || info->family < CHIP_GFX940);
-
-   info->mesh_fast_launch_2 = info->gfx_level >= GFX11;
 
    /* WARNING: Register shadowing decreases performance by up to 50% on GFX11 with current FW. */
    info->has_kernelq_reg_shadowing = device_info->ids_flags & AMDGPU_IDS_FLAGS_PREEMPTION &&
@@ -1892,7 +1888,6 @@ void ac_print_gpu_info(FILE *f, const struct radeon_info *info, int fd)
    fprintf(f, "    has_set_sh_pairs = %i\n", info->has_set_sh_pairs);
    fprintf(f, "    has_set_sh_pairs_packed = %i\n", info->has_set_sh_pairs_packed);
    fprintf(f, "    has_set_uconfig_pairs = %i\n", info->has_set_uconfig_pairs);
-   fprintf(f, "    mesh_fast_launch_2 = %i\n", info->mesh_fast_launch_2);
 
    if (info->gfx_level < GFX12) {
       fprintf(f, "Display features:\n");
