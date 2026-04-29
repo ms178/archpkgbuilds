@@ -1,5 +1,5 @@
 /*
- * Copyright © 2014 Advanced Micro Devices, Inc.
+ * Copyright 2014 Advanced Micro Devices, Inc.
  * All Rights Reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -35,6 +35,24 @@
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
+static drm_private int amdgpu_align_up_u64(uint64_t value,
+					    uint64_t alignment,
+					    uint64_t *out)
+{
+	uint64_t tmp;
+
+	if (unlikely(!out || !alignment || (alignment & (alignment - 1)))) {
+		return -EINVAL;
+	}
+
+	if (unlikely(__builtin_add_overflow(value, alignment - 1, &tmp))) {
+		return -EOVERFLOW;
+	}
+
+	*out = tmp & ~(alignment - 1);
+	return 0;
+}
+
 drm_public int amdgpu_va_range_query(amdgpu_device_handle dev,
 				     enum amdgpu_gpu_va_range type,
 				     uint64_t *start,
@@ -62,6 +80,10 @@ drm_private void amdgpu_vamgr_init(struct amdgpu_bo_va_mgr *mgr,
 
 	if (unlikely(!mgr)) {
 		return;
+	}
+
+	if (alignment == 0) {
+		alignment = 1;
 	}
 
 	if (unlikely(max <= start)) {
@@ -114,24 +136,21 @@ amdgpu_vamgr_subtract_hole(struct amdgpu_bo_va_hole *hole,
 			   uint64_t end_va)
 {
 	struct amdgpu_bo_va_hole *n;
+	uint64_t hole_end;
 
-	if (unlikely(!hole)) {
+	if (unlikely(!hole || end_va <= start_va)) {
 		return -EINVAL;
 	}
 
-	if (unlikely(end_va <= start_va)) {
+	if (unlikely(__builtin_add_overflow(hole->offset, hole->size, &hole_end))) {
 		return -EINVAL;
 	}
 
-	if (unlikely(start_va >= (hole->offset + hole->size))) {
+	if (unlikely(start_va >= hole_end || end_va <= hole->offset)) {
 		return -EINVAL;
 	}
 
-	if (unlikely(end_va <= hole->offset)) {
-		return -EINVAL;
-	}
-
-	if (start_va > hole->offset && end_va < (hole->offset + hole->size)) {
+	if (start_va > hole->offset && end_va < hole_end) {
 		n = calloc(1, sizeof(struct amdgpu_bo_va_hole));
 		if (unlikely(!n)) {
 			return -ENOMEM;
@@ -145,7 +164,7 @@ amdgpu_vamgr_subtract_hole(struct amdgpu_bo_va_hole *hole,
 		hole->offset = end_va;
 	} else if (start_va > hole->offset) {
 		hole->size = start_va - hole->offset;
-	} else if (end_va < (hole->offset + hole->size)) {
+	} else if (end_va < hole_end) {
 		hole->size -= (end_va - hole->offset);
 		hole->offset = end_va;
 	} else {
@@ -166,18 +185,11 @@ amdgpu_vamgr_find_va(struct amdgpu_bo_va_mgr *mgr,
 {
 	struct amdgpu_bo_va_hole *hole;
 	struct amdgpu_bo_va_hole *n;
+	uint64_t aligned_size;
 	uint64_t offset;
 	int ret;
 
-	if (unlikely(!mgr || !va_out)) {
-		return -EINVAL;
-	}
-
-	if (unlikely(size == 0)) {
-		return -EINVAL;
-	}
-
-	if (unlikely(alignment == 0)) {
+	if (unlikely(!mgr || !va_out || size == 0 || alignment == 0)) {
 		return -EINVAL;
 	}
 
@@ -186,9 +198,12 @@ amdgpu_vamgr_find_va(struct amdgpu_bo_va_mgr *mgr,
 	}
 
 	alignment = MAX2(alignment, mgr->va_alignment);
-	size = ALIGN(size, mgr->va_alignment);
+	ret = amdgpu_align_up_u64(size, mgr->va_alignment, &aligned_size);
+	if (unlikely(ret)) {
+		return ret;
+	}
 
-	if (unlikely(size > mgr->va_max)) {
+	if (unlikely(aligned_size > mgr->va_max)) {
 		return -ENOMEM;
 	}
 
@@ -200,36 +215,39 @@ amdgpu_vamgr_find_va(struct amdgpu_bo_va_mgr *mgr,
 
 	if (!search_from_top) {
 		LIST_FOR_EACH_ENTRY_SAFE_REV(hole, n, &mgr->va_holes, list) {
+			uint64_t hole_end;
+
+			if (unlikely(__builtin_add_overflow(hole->offset, hole->size, &hole_end))) {
+				continue;
+			}
+
 			if (base_required != 0) {
-				if (hole->offset > base_required ||
-				    (hole->offset + hole->size) < (base_required + size)) {
+				uint64_t req_end;
+
+				if (unlikely(__builtin_add_overflow(base_required, aligned_size, &req_end))) {
 					continue;
 				}
+
+				if (hole->offset > base_required || hole_end < req_end) {
+					continue;
+				}
+
 				offset = base_required;
 			} else {
-				uint64_t waste;
+				uint64_t waste = hole->offset & (alignment - 1);
 
-				if (unlikely(__builtin_add_overflow(hole->offset, alignment - 1, &waste))) {
-					continue;
-				}
-
-				waste = hole->offset % alignment;
 				waste = (waste != 0) ? (alignment - waste) : 0;
 
 				if (unlikely(__builtin_add_overflow(hole->offset, waste, &offset))) {
 					continue;
 				}
 
-				if (offset >= (hole->offset + hole->size)) {
-					continue;
-				}
-
-				if (size > (hole->offset + hole->size - offset)) {
+				if (offset >= hole_end || aligned_size > (hole_end - offset)) {
 					continue;
 				}
 			}
 
-			ret = amdgpu_vamgr_subtract_hole(hole, offset, offset + size);
+			ret = amdgpu_vamgr_subtract_hole(hole, offset, offset + aligned_size);
 			pthread_mutex_unlock(&mgr->bo_va_mutex);
 
 			if (unlikely(ret)) {
@@ -241,26 +259,36 @@ amdgpu_vamgr_find_va(struct amdgpu_bo_va_mgr *mgr,
 		}
 	} else {
 		LIST_FOR_EACH_ENTRY_SAFE(hole, n, &mgr->va_holes, list) {
+			uint64_t hole_end;
+
+			if (unlikely(__builtin_add_overflow(hole->offset, hole->size, &hole_end))) {
+				continue;
+			}
+
 			if (base_required != 0) {
-				if (hole->offset > base_required ||
-				    (hole->offset + hole->size) < (base_required + size)) {
+				uint64_t req_end;
+
+				if (unlikely(__builtin_add_overflow(base_required, aligned_size, &req_end))) {
 					continue;
 				}
+
+				if (hole->offset > base_required || hole_end < req_end) {
+					continue;
+				}
+
 				offset = base_required;
 			} else {
-				if (size > hole->size) {
+				if (aligned_size > hole->size) {
 					continue;
 				}
 
-				offset = hole->offset + hole->size - size;
-				offset -= offset % alignment;
-
+				offset = (hole_end - aligned_size) & ~(alignment - 1);
 				if (offset < hole->offset) {
 					continue;
 				}
 			}
 
-			ret = amdgpu_vamgr_subtract_hole(hole, offset, offset + size);
+			ret = amdgpu_vamgr_subtract_hole(hole, offset, offset + aligned_size);
 			pthread_mutex_unlock(&mgr->bo_va_mutex);
 
 			if (unlikely(ret)) {
@@ -284,21 +312,21 @@ amdgpu_vamgr_free_va(struct amdgpu_bo_va_mgr *mgr,
 	struct amdgpu_bo_va_hole *hole;
 	struct amdgpu_bo_va_hole *next;
 	struct amdgpu_bo_va_hole *new_hole;
+	uint64_t aligned_size;
+	uint64_t va_end;
 	bool found_next;
 
-	if (unlikely(!mgr)) {
+	if (unlikely(!mgr || size == 0 || va == AMDGPU_INVALID_VA_ADDRESS)) {
 		return;
 	}
 
-	if (va == AMDGPU_INVALID_VA_ADDRESS) {
+	if (unlikely(amdgpu_align_up_u64(size, mgr->va_alignment, &aligned_size))) {
 		return;
 	}
 
-	if (unlikely(size == 0)) {
+	if (unlikely(__builtin_add_overflow(va, aligned_size, &va_end))) {
 		return;
 	}
-
-	size = ALIGN(size, mgr->va_alignment);
 
 	pthread_mutex_lock(&mgr->bo_va_mutex);
 
@@ -314,29 +342,39 @@ amdgpu_vamgr_free_va(struct amdgpu_bo_va_mgr *mgr,
 		hole = next;
 	}
 
-	if (hole != NULL && hole->offset == va + size) {
+	if (hole != NULL && hole->offset == va_end) {
 		hole->offset = va;
-		hole->size += size;
+		hole->size += aligned_size;
 
-		if (found_next && next->offset + next->size == va) {
-			next->size += hole->size;
-			list_del(&hole->list);
-			free(hole);
+		if (found_next) {
+			uint64_t next_end;
+
+			if (!__builtin_add_overflow(next->offset, next->size, &next_end) &&
+			    next_end == va) {
+				next->size += hole->size;
+				list_del(&hole->list);
+				free(hole);
+			}
 		}
 
 		pthread_mutex_unlock(&mgr->bo_va_mutex);
 		return;
 	}
 
-	if (found_next && next->offset + next->size == va) {
-		next->size += size;
-		pthread_mutex_unlock(&mgr->bo_va_mutex);
-		return;
+	if (found_next) {
+		uint64_t next_end;
+
+		if (!__builtin_add_overflow(next->offset, next->size, &next_end) &&
+		    next_end == va) {
+			next->size += aligned_size;
+			pthread_mutex_unlock(&mgr->bo_va_mutex);
+			return;
+		}
 	}
 
 	new_hole = calloc(1, sizeof(struct amdgpu_bo_va_hole));
 	if (likely(new_hole != NULL)) {
-		new_hole->size = size;
+		new_hole->size = aligned_size;
 		new_hole->offset = va;
 
 		if (hole != NULL) {
@@ -382,15 +420,11 @@ drm_public int amdgpu_va_range_alloc2(amdgpu_va_manager_handle va_mgr,
 	bool search_from_top;
 	int ret;
 
-	if (unlikely(!va_mgr || !va_base_allocated || !va_range_handle)) {
+	if (unlikely(!va_mgr || !va_base_allocated || !va_range_handle || size == 0)) {
 		return -EINVAL;
 	}
 
-	if (unlikely(size == 0)) {
-		return -EINVAL;
-	}
-
-	search_from_top = !!(flags & AMDGPU_VA_RANGE_REPLAYABLE);
+	search_from_top = (flags & AMDGPU_VA_RANGE_REPLAYABLE) != 0;
 
 	if ((flags & AMDGPU_VA_RANGE_HIGH) && !va_mgr->vamgr_high_32.va_max) {
 		flags &= ~AMDGPU_VA_RANGE_HIGH;
@@ -411,7 +445,10 @@ drm_public int amdgpu_va_range_alloc2(amdgpu_va_manager_handle va_mgr,
 	}
 
 	va_base_alignment = MAX2(va_base_alignment, vamgr->va_alignment);
-	size = ALIGN(size, vamgr->va_alignment);
+	ret = amdgpu_align_up_u64(size, vamgr->va_alignment, &size);
+	if (unlikely(ret)) {
+		return ret;
+	}
 
 	ret = amdgpu_vamgr_find_va(vamgr, size, va_base_alignment,
 				   va_base_required, search_from_top,
@@ -496,12 +533,28 @@ drm_public void amdgpu_va_manager_init(struct amdgpu_va_manager *va_mgr,
 				       uint64_t high_va_max,
 				       uint32_t virtual_address_alignment)
 {
+	amdgpu_va_manager_init2(va_mgr, low_va_offset, low_va_max,
+				high_va_offset, high_va_max,
+				virtual_address_alignment, 0);
+}
+
+drm_public void amdgpu_va_manager_init2(struct amdgpu_va_manager *va_mgr,
+					uint64_t low_va_offset,
+					uint64_t low_va_max,
+					uint64_t high_va_offset,
+					uint64_t high_va_max,
+					uint32_t virtual_address_alignment,
+					uint32_t flags)
+{
 	uint64_t start;
 	uint64_t max;
+	uint64_t split_xor;
 
 	if (unlikely(!va_mgr)) {
 		return;
 	}
+
+	va_mgr->address_prt_wa_control_bit = ~0u;
 
 	start = low_va_offset;
 	max = MIN2(low_va_max, 0x100000000ULL);
@@ -509,7 +562,18 @@ drm_public void amdgpu_va_manager_init(struct amdgpu_va_manager *va_mgr,
 			  virtual_address_alignment);
 
 	start = max;
-	max = MAX2(low_va_max, 0x100000000ULL);
+	if ((flags & AMDGPU_VA_MGR_RESERVE_HALF_VA_FOR_PRT) && !high_va_max) {
+		split_xor = low_va_offset ^ low_va_max;
+		if (split_xor) {
+			va_mgr->address_prt_wa_control_bit = util_last_bit64(split_xor) - 1;
+			max = low_va_max ^ (1ull << va_mgr->address_prt_wa_control_bit);
+		} else {
+			max = MAX2(low_va_max, 0x100000000ULL);
+		}
+	} else {
+		max = MAX2(low_va_max, 0x100000000ULL);
+	}
+
 	amdgpu_vamgr_init(&va_mgr->vamgr_low, start, max,
 			  virtual_address_alignment);
 
@@ -519,7 +583,18 @@ drm_public void amdgpu_va_manager_init(struct amdgpu_va_manager *va_mgr,
 			  virtual_address_alignment);
 
 	start = max;
-	max = MAX2(high_va_max, (start & ~0xffffffffULL) + 0x100000000ULL);
+	if ((flags & AMDGPU_VA_MGR_RESERVE_HALF_VA_FOR_PRT) && high_va_max) {
+		split_xor = high_va_offset ^ high_va_max;
+		if (split_xor) {
+			va_mgr->address_prt_wa_control_bit = util_last_bit64(split_xor) - 1;
+			max = high_va_max ^ (1ull << va_mgr->address_prt_wa_control_bit);
+		} else {
+			max = MAX2(high_va_max, (start & ~0xffffffffULL) + 0x100000000ULL);
+		}
+	} else {
+		max = MAX2(high_va_max, (start & ~0xffffffffULL) + 0x100000000ULL);
+	}
+
 	amdgpu_vamgr_init(&va_mgr->vamgr_high, start, max,
 			  virtual_address_alignment);
 }
@@ -534,4 +609,23 @@ drm_public void amdgpu_va_manager_deinit(struct amdgpu_va_manager *va_mgr)
 	amdgpu_vamgr_deinit(&va_mgr->vamgr_low);
 	amdgpu_vamgr_deinit(&va_mgr->vamgr_high_32);
 	amdgpu_vamgr_deinit(&va_mgr->vamgr_high);
+}
+
+drm_public int amdgpu_va_manager_query_sw_info(struct amdgpu_va_manager *va_mgr,
+					       enum amdgpu_va_manager_sw_info info,
+					       void *value)
+{
+	uint32_t *val32 = (uint32_t *)value;
+
+	if (unlikely(!va_mgr || !value)) {
+		return -EINVAL;
+	}
+
+	switch (info) {
+	case amdgpu_va_manager_sw_info_address_prt_wa_control_bit:
+		*val32 = va_mgr->address_prt_wa_control_bit;
+		return 0;
+	default:
+		return -EINVAL;
+	}
 }
