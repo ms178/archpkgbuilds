@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
+/* Latency audit note: this tree carries custom low-latency experiments for X540. */
 /* Copyright(c) 1999 - 2024 Intel Corporation. */
 
 #include <linux/types.h>
@@ -3082,61 +3083,67 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
  **/
 static void ixgbe_configure_msix(struct ixgbe_adapter *adapter)
 {
-    struct ixgbe_q_vector *q_vector;
-    struct ixgbe_hw *hw = &adapter->hw;
-    int v_idx;
-    u32 mask;
-    u16 other_vec;
+	struct ixgbe_q_vector *q_vector;
+	struct ixgbe_hw *hw = &adapter->hw;
+	int v_idx;
+	u32 mask;
+	u16 other_vec;
 
-    if (adapter->num_vfs > 32) {
-        u32 eitrsel = (1U << (adapter->num_vfs - 32)) - 1;
-        IXGBE_WRITE_REG(hw, IXGBE_EITRSEL, eitrsel);
-    }
+	if (adapter->num_vfs > 32) {
+		u32 eitrsel = (1U << (adapter->num_vfs - 32)) - 1;
 
-    for (v_idx = 0; v_idx < adapter->num_q_vectors; v_idx++) {
-        struct ixgbe_ring *ring;
+		IXGBE_WRITE_REG(hw, IXGBE_EITRSEL, eitrsel);
+	}
 
-        q_vector = adapter->q_vector[v_idx];
-        if (unlikely(!q_vector))
-            continue;
+	for (v_idx = 0; v_idx < adapter->num_q_vectors; v_idx++) {
+		struct ixgbe_ring *ring;
 
-        ixgbe_for_each_ring(ring, q_vector->rx)
-            ixgbe_set_ivar(adapter, 0, ring->reg_idx, v_idx);
+		q_vector = adapter->q_vector[v_idx];
+		if (unlikely(!q_vector))
+			continue;
 
-        ixgbe_for_each_ring(ring, q_vector->tx)
-            ixgbe_set_ivar(adapter, 1, ring->reg_idx, v_idx);
+		ixgbe_for_each_ring(ring, q_vector->rx)
+			ixgbe_set_ivar(adapter, 0, ring->reg_idx, v_idx);
 
-        q_vector->itr = gaming_mode? (1 << 2) : 1950;
-        ixgbe_write_eitr(q_vector);
-    }
+		ixgbe_for_each_ring(ring, q_vector->tx)
+			ixgbe_set_ivar(adapter, 1, ring->reg_idx, v_idx);
 
-    other_vec = (u16)adapter->num_q_vectors;
+		/* Program q_vector->itr in native EITR units consumed later. */
+		q_vector->itr = gaming_mode ? 4 : 1950;
+		ixgbe_write_eitr(q_vector);
+	}
 
-    switch (hw->mac.type) {
-    case ixgbe_mac_82598EB:
-        ixgbe_set_ivar(adapter, -1, IXGBE_IVAR_OTHER_CAUSES_INDEX,
-                       other_vec);
-        break;
-    case ixgbe_mac_82599EB:
-    case ixgbe_mac_X540:
-    case ixgbe_mac_X550:
-    case ixgbe_mac_X550EM_x:
-    case ixgbe_mac_x550em_a:
-    case ixgbe_mac_e610:
-        ixgbe_set_ivar(adapter, -1, 1, other_vec);
-        break;
-    default:
-        break;
-    }
+	other_vec = (u16)adapter->num_q_vectors;
 
-    IXGBE_WRITE_REG(hw, IXGBE_EITR(other_vec), gaming_mode? 0 : 1950);
+	switch (hw->mac.type) {
+	case ixgbe_mac_82598EB:
+		ixgbe_set_ivar(adapter, -1, IXGBE_IVAR_OTHER_CAUSES_INDEX,
+			       other_vec);
+		break;
+	case ixgbe_mac_82599EB:
+	case ixgbe_mac_X540:
+	case ixgbe_mac_X550:
+	case ixgbe_mac_X550EM_x:
+	case ixgbe_mac_x550em_a:
+	case ixgbe_mac_e610:
+		ixgbe_set_ivar(adapter, -1, 1, other_vec);
+		break;
+	default:
+		break;
+	}
 
-    mask = IXGBE_EIMS_ENABLE_MASK;
-    mask &= ~(IXGBE_EIMS_OTHER | IXGBE_EIMS_MAILBOX | IXGBE_EIMS_LSC);
-    if (hw->mac.type == ixgbe_mac_e610)
-        mask &= ~IXGBE_EIMS_FW_EVENT;
+	/*
+	 * Avoid zero-delay storming on non-dataplane causes in gaming mode,
+	 * while keeping these events responsive.
+	 */
+	IXGBE_WRITE_REG(hw, IXGBE_EITR(other_vec), gaming_mode ? 64 : 1950);
 
-    IXGBE_WRITE_REG(hw, IXGBE_EIAC, mask);
+	mask = IXGBE_EIMS_ENABLE_MASK;
+	mask &= ~(IXGBE_EIMS_OTHER | IXGBE_EIMS_MAILBOX | IXGBE_EIMS_LSC);
+	if (hw->mac.type == ixgbe_mac_e610)
+		mask &= ~IXGBE_EIMS_FW_EVENT;
+
+	IXGBE_WRITE_REG(hw, IXGBE_EIAC, mask);
 }
 
 /**
@@ -3153,66 +3160,70 @@ static void ixgbe_configure_msix(struct ixgbe_adapter *adapter)
  *      while increasing bulk throughput.
  **/
 static void ixgbe_update_itr(struct ixgbe_q_vector *q_vector,
-                             struct ixgbe_ring_container *ring_container)
+			     struct ixgbe_ring_container *ring_container)
 {
-    unsigned int itr;
-    unsigned int packets, bytes, avg_wire_size;
-    unsigned long now = jiffies;
+	unsigned int itr;
+	unsigned int packets, bytes, avg_wire_size;
+	unsigned long now = jiffies;
 
-    if (unlikely(!ring_container->ring))
-        return;
+	if (unlikely(!ring_container->ring))
+		return;
 
-    if (time_before(now, ring_container->next_update))
-        return;
+	if (time_before(now, ring_container->next_update))
+		return;
 
-    packets = ring_container->total_packets;
-    bytes = ring_container->total_bytes;
-    itr = IXGBE_ITR_ADAPTIVE_MIN_USECS | IXGBE_ITR_ADAPTIVE_LATENCY;
+	packets = ring_container->total_packets;
+	bytes = ring_container->total_bytes;
+	itr = IXGBE_ITR_ADAPTIVE_MIN_USECS | IXGBE_ITR_ADAPTIVE_LATENCY;
 
-    if (unlikely(packets == 0)) {
-        itr = (q_vector->itr >> 2) + IXGBE_ITR_ADAPTIVE_MIN_INC;
-        if (itr > IXGBE_ITR_ADAPTIVE_MAX_USECS)
-            itr = IXGBE_ITR_ADAPTIVE_MAX_USECS;
-        itr |= ring_container->itr & IXGBE_ITR_ADAPTIVE_LATENCY;
-        goto out;
-    }
+	if (unlikely(packets == 0)) {
+		itr = (q_vector->itr >> 2) + IXGBE_ITR_ADAPTIVE_MIN_INC;
+		if (itr > IXGBE_ITR_ADAPTIVE_MAX_USECS)
+			itr = IXGBE_ITR_ADAPTIVE_MAX_USECS;
+		itr |= ring_container->itr & IXGBE_ITR_ADAPTIVE_LATENCY;
+		goto out;
+	}
 
-    avg_wire_size = bytes / packets;
+	avg_wire_size = bytes / packets;
 
-    if (gaming_mode && avg_wire_size <= 256) {
-        if (packets <= 4)
-            itr = 1;
-        else if (packets <= 8)
-            itr = 2;
-        else if (packets <= 32)
-            itr = 3;
-        else
-            itr = 4;
-        itr |= IXGBE_ITR_ADAPTIVE_LATENCY;
-        goto out;
-    }
+	if (gaming_mode && avg_wire_size <= 256) {
+		/*
+		 * Keep adaptive logic in usec-scale units that ixgbe_set_itr()
+		 * later converts to hardware EITR encoding.
+		 */
+		if (packets <= 4)
+			itr = 2;
+		else if (packets <= 8)
+			itr = 4;
+		else if (packets <= 32)
+			itr = 6;
+		else
+			itr = 8;
+		itr |= IXGBE_ITR_ADAPTIVE_LATENCY;
+		goto out;
+	}
 
-    if (packets < 4 && bytes < 9000) {
-        itr = IXGBE_ITR_ADAPTIVE_LATENCY;
-        goto adjust;
-    }
-    if (packets < 48) {
-        itr = (q_vector->itr >> 2) + IXGBE_ITR_ADAPTIVE_MIN_INC;
-        if (itr > IXGBE_ITR_ADAPTIVE_MAX_USECS)
-            itr = IXGBE_ITR_ADAPTIVE_MAX_USECS;
-        goto out;
-    }
-    if (packets < 96) {
-        itr = q_vector->itr >> 2;
-        goto out;
-    }
-    if (packets < 256) {
-        itr = q_vector->itr >> 3;
-        if (itr < IXGBE_ITR_ADAPTIVE_MIN_USECS)
-            itr = IXGBE_ITR_ADAPTIVE_MIN_USECS;
-        goto out;
-    }
-    itr = IXGBE_ITR_ADAPTIVE_BULK;
+	if (packets < 4 && bytes < 9000) {
+		itr = IXGBE_ITR_ADAPTIVE_LATENCY;
+		goto adjust;
+	}
+	if (packets < 48) {
+		itr = (q_vector->itr >> 2) + IXGBE_ITR_ADAPTIVE_MIN_INC;
+		if (itr > IXGBE_ITR_ADAPTIVE_MAX_USECS)
+			itr = IXGBE_ITR_ADAPTIVE_MAX_USECS;
+		goto out;
+	}
+	if (packets < 96) {
+		itr = q_vector->itr >> 2;
+		goto out;
+	}
+	if (packets < 256) {
+		itr = q_vector->itr >> 3;
+		if (itr < IXGBE_ITR_ADAPTIVE_MIN_USECS)
+			itr = IXGBE_ITR_ADAPTIVE_MIN_USECS;
+		goto out;
+	}
+	itr = IXGBE_ITR_ADAPTIVE_BULK;
 
 adjust:
     if (avg_wire_size <= 60)
@@ -3249,17 +3260,18 @@ adjust:
     }
 
 out:
-    if (gaming_mode) {
-        unsigned int base = itr & ~IXGBE_ITR_ADAPTIVE_LATENCY;
-        if (base < 1)
-            itr = 1 | (itr & IXGBE_ITR_ADAPTIVE_LATENCY);
-        else if (base > 4)
-            itr = 4 | (itr & IXGBE_ITR_ADAPTIVE_LATENCY);
-    }
-    ring_container->itr = (u8)itr;
-    ring_container->next_update = now + 1;
-    ring_container->total_bytes = 0;
-    ring_container->total_packets = 0;
+	if (gaming_mode) {
+		unsigned int base = itr & ~IXGBE_ITR_ADAPTIVE_LATENCY;
+
+		if (base < 2)
+			itr = 2 | (itr & IXGBE_ITR_ADAPTIVE_LATENCY);
+		else if (base > 8)
+			itr = 8 | (itr & IXGBE_ITR_ADAPTIVE_LATENCY);
+	}
+	ring_container->itr = (u8)itr;
+	ring_container->next_update = now + 1;
+	ring_container->total_bytes = 0;
+	ring_container->total_packets = 0;
 }
 
 /**
@@ -3272,66 +3284,80 @@ out:
  */
 void ixgbe_write_eitr(struct ixgbe_q_vector *q_vector)
 {
-    struct ixgbe_adapter *adapter;
-    struct ixgbe_hw *hw;
-    u32 itr_reg;
-    u16 v_idx;
+	struct ixgbe_adapter *adapter;
+	struct ixgbe_hw *hw;
+	u32 itr_reg;
+	u16 v_idx;
 
-    if (unlikely(!q_vector))
-        return;
+	if (unlikely(!q_vector))
+		return;
 
-    adapter = q_vector->adapter;
-    if (unlikely(!adapter))
-        return;
+	adapter = q_vector->adapter;
+	if (unlikely(!adapter))
+		return;
 
-    hw = &adapter->hw;
-    v_idx = q_vector->v_idx;
-    itr_reg = q_vector->itr & IXGBE_MAX_EITR;
+	hw = &adapter->hw;
+	v_idx = q_vector->v_idx;
+	itr_reg = q_vector->itr & IXGBE_MAX_EITR;
 
-    switch (hw->mac.type) {
-    case ixgbe_mac_82598EB:
-        itr_reg |= itr_reg << 16;
-        break;
-    case ixgbe_mac_82599EB:
-    case ixgbe_mac_X540:
-    case ixgbe_mac_X550:
-    case ixgbe_mac_X550EM_x:
-    case ixgbe_mac_x550em_a:
-    case ixgbe_mac_e610:
-        if (gaming_mode && itr_reg <= 8) {
-            /* X540 7.3.2.1: clear WDIS to reset timer immediately.
-             * Saves up to 16 us per EITR update on 14700KF P-cores.
-             */
-            itr_reg &= ~IXGBE_EITR_CNT_WDIS;
-        } else {
-            itr_reg |= IXGBE_EITR_CNT_WDIS;
-        }
-        break;
-    default:
-        break;
-    }
+	switch (hw->mac.type) {
+	case ixgbe_mac_82598EB:
+		itr_reg |= itr_reg << 16;
+		break;
+	case ixgbe_mac_82599EB:
+	case ixgbe_mac_X540:
+	case ixgbe_mac_X550:
+	case ixgbe_mac_X550EM_x:
+	case ixgbe_mac_x550em_a:
+	case ixgbe_mac_e610:
+		/*
+		 * For low-latency gaming intervals, allow immediate timer update;
+		 * otherwise keep WDIS set for steady-state batching behavior.
+		 */
+		if (gaming_mode && itr_reg <= 32)
+			itr_reg &= ~IXGBE_EITR_CNT_WDIS;
+		else
+			itr_reg |= IXGBE_EITR_CNT_WDIS;
+		break;
+	default:
+		break;
+	}
 
-    IXGBE_WRITE_REG(hw, IXGBE_EITR(v_idx), itr_reg);
+	IXGBE_WRITE_REG(hw, IXGBE_EITR(v_idx), itr_reg);
 }
 
 static void ixgbe_set_itr(struct ixgbe_q_vector *q_vector)
 {
-    u32 new_itr;
+	u32 new_itr, rx_itr, tx_itr;
 
-    if (unlikely(!q_vector))
-        return;
+	if (unlikely(!q_vector))
+		return;
 
-    ixgbe_update_itr(q_vector, &q_vector->tx);
-    ixgbe_update_itr(q_vector, &q_vector->rx);
+	ixgbe_update_itr(q_vector, &q_vector->tx);
+	ixgbe_update_itr(q_vector, &q_vector->rx);
 
-    new_itr = min_t(u32, q_vector->rx.itr, q_vector->tx.itr);
-    new_itr &= ~IXGBE_ITR_ADAPTIVE_LATENCY;
-    new_itr <<= 2;
+	rx_itr = q_vector->rx.itr & ~IXGBE_ITR_ADAPTIVE_LATENCY;
+	tx_itr = q_vector->tx.itr & ~IXGBE_ITR_ADAPTIVE_LATENCY;
 
-    if (new_itr!= q_vector->itr) {
-        q_vector->itr = (u16)new_itr;
-        ixgbe_write_eitr(q_vector);
-    }
+	/*
+	 * Gaming mode is RX-latency driven: prefer the RX target ITR unless TX
+	 * becomes materially lower, preserving responsiveness under mixed loads.
+	 */
+	if (gaming_mode)
+		new_itr = (tx_itr + 2 < rx_itr) ? tx_itr : rx_itr;
+	else
+		new_itr = min_t(u32, rx_itr, tx_itr);
+
+	new_itr <<= 2;
+
+	/* Keep practical low-latency limits to avoid pathological extremes. */
+	if (gaming_mode)
+		new_itr = clamp_t(u32, new_itr, 8, 32);
+
+	if (new_itr != q_vector->itr) {
+		q_vector->itr = (u16)new_itr;
+		ixgbe_write_eitr(q_vector);
+	}
 }
 
 /**
