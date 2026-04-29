@@ -2800,10 +2800,16 @@ X86TargetLowering::X86TargetLowering(const X86TargetMachine &TM,
 
   // TODO: These control memcmp expansion in CGP and should be balanced with
   // potential use of vector load/store types (PR33329, PR33914).
-  // Keep the default conservative to avoid compile-time memory blowups from
-  // excessive expansion in very large builds (e.g. Linux kernel).
+  // Keep the generic default conservative, then tune by microarchitecture:
+  //  - Atom/E-core style designs: smaller expansion to limit frontend pressure.
+  //  - Big OoO 64-bit cores with SSE2: allow wider inlining before libcalls.
   MaxLoadsPerMemcmp = 2;
   MaxLoadsPerMemcmpOptSize = 2;
+  if (Subtarget.isAtom())
+    MaxLoadsPerMemcmp = 3;
+  else if (Subtarget.is64Bit() && Subtarget.hasSSE2() &&
+           Subtarget.getSchedModel().isOutOfOrder())
+    MaxLoadsPerMemcmp = 4;
 
   // Default loop alignment, which can be overridden by -align-loops.
   setPrefLoopAlignment(Align(16));
