@@ -2800,10 +2800,16 @@ X86TargetLowering::X86TargetLowering(const X86TargetMachine &TM,
 
   // TODO: These control memcmp expansion in CGP and should be balanced with
   // potential use of vector load/store types (PR33329, PR33914).
-  // Keep the default conservative to avoid compile-time memory blowups from
-  // excessive expansion in very large builds (e.g. Linux kernel).
+  // Keep the generic default conservative, then tune by microarchitecture:
+  //  - Atom/E-core style designs: smaller expansion to limit frontend pressure.
+  //  - Big OoO 64-bit cores with SSE2: allow wider inlining before libcalls.
   MaxLoadsPerMemcmp = 2;
   MaxLoadsPerMemcmpOptSize = 2;
+  if (Subtarget.isAtom())
+    MaxLoadsPerMemcmp = 3;
+  else if (Subtarget.is64Bit() && Subtarget.hasSSE2() &&
+           Subtarget.getSchedModel().isOutOfOrder())
+    MaxLoadsPerMemcmp = 4;
 
   // Default loop alignment, which can be overridden by -align-loops.
   setPrefLoopAlignment(Align(16));
@@ -30219,13 +30225,17 @@ static SDValue LowerMUL(SDValue Op, const X86Subtarget &Subtarget,
 
     // Extract the odd parts.
     static const int UnpackMask[] = {1, 1, 3, 3};
+    const bool IsSquare = A == B;
     SDValue Aodds = DAG.getVectorShuffle(VT, dl, A, A, UnpackMask);
-    SDValue Bodds = DAG.getVectorShuffle(VT, dl, B, B, UnpackMask);
+    SDValue Bodds = IsSquare ? Aodds
+                             : DAG.getVectorShuffle(VT, dl, B, B, UnpackMask);
+
+    SDValue AAsV2I64 = DAG.getBitcast(MVT::v2i64, A);
+    SDValue BBsV2I64 = IsSquare ? AAsV2I64 : DAG.getBitcast(MVT::v2i64, B);
 
     // Multiply the even parts.
-    SDValue Evens = DAG.getNode(X86ISD::PMULUDQ, dl, MVT::v2i64,
-                                DAG.getBitcast(MVT::v2i64, A),
-                                DAG.getBitcast(MVT::v2i64, B));
+    SDValue Evens =
+        DAG.getNode(X86ISD::PMULUDQ, dl, MVT::v2i64, AAsV2I64, BBsV2I64);
     // Now multiply odd parts.
     SDValue Odds = DAG.getNode(X86ISD::PMULUDQ, dl, MVT::v2i64,
                                DAG.getBitcast(MVT::v2i64, Aodds),
@@ -30266,26 +30276,39 @@ static SDValue LowerMUL(SDValue Op, const X86Subtarget &Subtarget,
 
   SDValue Zero = DAG.getConstant(0, dl, VT);
 
+  const bool HasAloBlo = !ALoIsZero && !BLoIsZero;
+  const bool HasAloBhi = !ALoIsZero && !BHiIsZero;
+  const bool HasAhiBlo = !AHiIsZero && !BLoIsZero;
+
   // Only multiply lo/hi halves that aren't known to be zero.
-  SDValue AloBlo = Zero;
-  if (!ALoIsZero && !BLoIsZero)
-    AloBlo = DAG.getNode(X86ISD::PMULUDQ, dl, VT, A, B);
+  SDValue AloBlo = HasAloBlo ? DAG.getNode(X86ISD::PMULUDQ, dl, VT, A, B)
+                               : Zero;
+
+  const bool HasCross = HasAloBhi || HasAhiBlo;
+  if (!HasCross)
+    return AloBlo;
 
   SDValue AloBhi = Zero;
-  if (!ALoIsZero && !BHiIsZero) {
+  if (HasAloBhi) {
     SDValue Bhi = getTargetVShiftByConstNode(X86ISD::VSRLI, dl, VT, B, 32, DAG);
     AloBhi = DAG.getNode(X86ISD::PMULUDQ, dl, VT, A, Bhi);
   }
 
   SDValue AhiBlo = Zero;
-  if (!AHiIsZero && !BLoIsZero) {
+  if (HasAhiBlo) {
     SDValue Ahi = getTargetVShiftByConstNode(X86ISD::VSRLI, dl, VT, A, 32, DAG);
     AhiBlo = DAG.getNode(X86ISD::PMULUDQ, dl, VT, Ahi, B);
   }
 
-  SDValue Hi = DAG.getNode(ISD::ADD, dl, VT, AloBhi, AhiBlo);
-  Hi = getTargetVShiftByConstNode(X86ISD::VSHLI, dl, VT, Hi, 32, DAG);
+  SDValue Hi = HasAloBhi ? AloBhi : AhiBlo;
+  if (HasAloBhi && HasAhiBlo)
+    Hi = DAG.getNode(ISD::ADD, dl, VT, AloBhi, AhiBlo);
 
+  if (Hi != Zero)
+    Hi = getTargetVShiftByConstNode(X86ISD::VSHLI, dl, VT, Hi, 32, DAG);
+
+  if (!HasAloBlo)
+    return Hi;
   return DAG.getNode(ISD::ADD, dl, VT, AloBlo, Hi);
 }
 
