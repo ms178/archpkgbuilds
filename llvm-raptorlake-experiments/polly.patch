@@ -1,3 +1,106 @@
+--- a/polly/lib/Analysis/ScopInfo.cpp	2026-04-06 21:16:05.928959098 +0200
++++ b/polly/lib/Analysis/ScopInfo.cpp	2026-04-06 21:58:06.385582211 +0200
+@@ -436,6 +436,34 @@ void MemoryAccess::wrapConstantDimension
+   AccessRelation = Relation;
+ }
+ 
++static bool isUnexpectedlyMultiValued(isl::map Relation) {
++  return Relation.is_single_valued().is_false();
++}
++
++static bool expectsSingleValuedAccessRelation(const MemoryAccess &MA) {
++  if (!MA.isAffine())
++    return false;
++
++  auto *BB = MA.getStatement()->getEntryBlock();
++  const auto &DL = BB->getModule()->getDataLayout();
++  unsigned AccessElemSize = DL.getTypeAllocSize(MA.getElementType());
++  unsigned ArrayElemSize =
++      static_cast<unsigned>(MA.getScopArrayInfo()->getElemSizeInBytes());
++
++  // After updateDimensionality(), accesses wider than the canonical element
++  // size are intentionally widened into a one-to-many relation over the
++  // canonical element type. Those are not expected to remain single-valued.
++  return AccessElemSize == ArrayElemSize;
++}
++
++static isl::map createOverapproximatedAccessRelation(ScopStmt *Statement,
++                                                     const ScopArrayInfo *SAI) {
++  isl::space DomainSpace = Statement->getDomainSpace();
++  isl::space RangeSpace = SAI->getSpace().align_params(DomainSpace);
++  return isl::map::from_domain_and_range(isl::set::universe(DomainSpace),
++                                         isl::set::universe(RangeSpace));
++}
++
+ void MemoryAccess::updateDimensionality() {
+   auto *SAI = getScopArrayInfo();
+   isl::space ArraySpace = SAI->getSpace();
+@@ -486,6 +514,23 @@ void MemoryAccess::updateDimensionality(
+   if (DimsMissing)
+     wrapConstantDimensions();
+ 
++  // Up to this point the relation is still expected to describe one exact base
++  // element per statement instance. If one of the exactness-preserving
++  // rewrites above turned it into a non-function, conservatively fall back to
++  // the existing non-affine overapproximation.
++  //
++  // This check must happen before the widening below, because widening larger
++  // accesses to the canonical element size intentionally creates a one-to-many
++  // relation.
++  if (IsAffine && isUnexpectedlyMultiValued(AccessRelation)) {
++    IsAffine = false;
++    if (AccType == MemoryAccess::MUST_WRITE)
++      AccType = MemoryAccess::MAY_WRITE;
++    AccessRelation = createOverapproximatedAccessRelation(Statement, SAI);
++    computeBoundsOnAccessRelation(ArrayElemSize);
++    return;
++  }
++
+   if (!isAffine())
+     computeBoundsOnAccessRelation(ArrayElemSize);
+ 
+@@ -572,7 +617,14 @@ isl::id MemoryAccess::getLatestArrayId()
+ }
+ 
+ isl::map MemoryAccess::getAddressFunction() const {
+-  return getAccessRelation().lexmin();
++  isl::map Addr = getAccessRelation().lexmin();
++
++  // Even if the full access relation is widened to multiple canonical
++  // elements, the base address itself still needs to be a function.
++  assert(!Addr.is_single_valued().is_false() &&
++         "Address function must be single-valued");
++
++  return Addr;
+ }
+ 
+ isl::pw_multi_aff
+@@ -584,6 +636,10 @@ MemoryAccess::applyScheduleToAccessRelat
+   USchedule = USchedule.intersect_domain(UDomain);
+   Schedule = isl::map::from_union_map(USchedule);
+   ScheduledAccRel = getAddressFunction().apply_domain(Schedule);
++
++  assert(!ScheduledAccRel.is_single_valued().is_false() &&
++         "Scheduled address function must remain single-valued");
++
+   return isl::pw_multi_aff::from_map(ScheduledAccRel);
+ }
+ 
+@@ -801,6 +857,13 @@ void MemoryAccess::foldAccessRelation()
+   NewAccessRelation = NewAccessRelation.set_tuple_id(isl::dim::out, BaseAddrId);
+   NewAccessRelation = NewAccessRelation.gist_domain(Statement->getDomain());
+ 
++  // Folding is a precision enhancement only. If it would destroy the
++  // functional nature of an exact affine single-element access, reject it and
++  // keep the original access relation.
++  if (expectsSingleValuedAccessRelation(*this) &&
++      isUnexpectedlyMultiValued(NewAccessRelation))
++    return;
++
+   // Access dimension folding might in certain cases increase the number of
+   // disjuncts in the memory access, which can possibly complicate the generated
+   // run-time checks and can lead to costly compilation.
+
 --- a/polly/lib/CodeGen/IslExprBuilder.cpp	2026-03-23 20:32:01.200783062 +0100
 +++ b/polly/lib/CodeGen/IslExprBuilder.cpp	2026-04-06 20:35:06.832722647 +0100
 @@ -93,15 +93,15 @@ bool IslExprBuilder::hasLargeInts(isl::a
@@ -77,7 +180,7 @@
  }
 
 --- a/polly/lib/Analysis/ScopBuilder.cpp	2025-09-21 15:28:29.292203509 +0200
-+++ b/polly/lib/Analysis/ScopBuilder.cpp	2026-04-04 15:35:24.476840546 +0200
++++ b/polly/lib/Analysis/ScopBuilder.cpp	2026-04-06 15:35:24.476840546 +0200
 @@ -214,50 +214,92 @@ static isl::map createNextIterationMap(i
  
  /// Add @p BSet to set @p BoundedParts if @p BSet is bounded.
@@ -576,12 +679,29 @@
    if (Size == 1)
      return true;
  
-@@ -2235,74 +2348,183 @@ static bool isDivisible(const SCEV *Expr
+@@ -2233,76 +2346,200 @@ static bool isDivisible(const SCEV *Expr
+   return MulSCEV == Expr;
+ }
  
++static bool expectsSingleValuedAccessRelation(const MemoryAccess &MA,
++                                             const DataLayout &DL) {
++  if (!MA.isAffine())
++    return false;
++
++  unsigned AccessElemSize = DL.getTypeAllocSize(MA.getElementType());
++  unsigned ArrayElemSize =
++      static_cast<unsigned>(MA.getScopArrayInfo()->getElemSizeInBytes());
++
++  // Wider accesses are intentionally widened to multiple canonical elements.
++  return AccessElemSize == ArrayElemSize;
++}
++
  void ScopBuilder::foldSizeConstantsToRight() {
    isl::union_set Accessed = scop->getAccesses().range();
 +  if (Accessed.is_null())
 +    return;
++
++  const DataLayout &DL = scop->getFunction().getDataLayout();
  
    for (auto Array : scop->arrays()) {
      if (Array->getNumberOfDimensions() <= 1)
@@ -772,7 +892,7 @@
        CanFold = false;
  
      unsigned NumDims = Array->getNumberOfDimensions();
-@@ -2313,10 +2535,18 @@ void ScopBuilder::foldSizeConstantsToRig
+@@ -2313,10 +2550,49 @@ void ScopBuilder::foldSizeConstantsToRig
      if (!CanFold)
        continue;
  
@@ -780,6 +900,37 @@
 -      if (Access->getScopArrayInfo() == Array)
 -        Access->setAccessRelation(
 -            Access->getAccessRelation().apply_range(Transform));
++    // This is a canonicalization only. If it would destroy the functional
++    // nature of any exact affine single-element access to this array, skip the
++    // transform for the whole array to keep the Scop representation sound and
++    // the array shape consistent.
++    bool BreaksExactAccess = false;
++    for (auto &Access : scop->access_functions()) {
++      if (Access->getScopArrayInfo() != Array)
++        continue;
++
++      isl::map AccessRel = Access->getAccessRelation();
++      if (AccessRel.is_null()) {
++        BreaksExactAccess = true;
++        break;
++      }
++
++      isl::map NewRel = AccessRel.apply_range(Transform);
++      if (NewRel.is_null()) {
++        BreaksExactAccess = true;
++        break;
++      }
++
++      if (expectsSingleValuedAccessRelation(*Access, DL) &&
++          NewRel.is_single_valued().is_false()) {
++        BreaksExactAccess = true;
++        break;
++      }
++    }
++
++    if (BreaksExactAccess)
++      continue;
++
 +    for (auto &Access : scop->access_functions()) {
 +      if (Access->getScopArrayInfo() != Array)
 +        continue;
@@ -795,7 +946,7 @@
  
      std::vector<const SCEV *> Sizes;
      for (unsigned i = 0; i < NumDims; i++) {
-@@ -2565,65 +2795,101 @@ combineReductionType(MemoryAccess::Reduc
+@@ -2565,65 +2841,101 @@ combineReductionType(MemoryAccess::Reduc
    return MemoryAccess::RT_NONE;
  }
  
@@ -927,7 +1078,7 @@
      Valid = !hasIntersectingAccesses(AllAccs, LoadMA, StoreMA, Domain, MemAccs);
      POLLY_DEBUG(dbgs() << " == The accessed memory is " << (Valid ? "not " : "")
                         << "accessed by other instructions!\n");
-@@ -2877,10 +3143,10 @@ static bool isAccessRangeTooComplex(isl:
+@@ -2877,10 +3189,10 @@ static bool isAccessRangeTooComplex(isl:
    for (isl::basic_set BSet : AccessRange.get_basic_set_list()) {
      NumTotalDims += unsignedFromIslSize(BSet.dim(isl::dim::div));
      NumTotalDims += unsignedFromIslSize(BSet.dim(isl::dim::set));
@@ -941,7 +1092,7 @@
  
    return false;
  }
-@@ -3286,7 +3552,8 @@ void ScopBuilder::buildAccessRelations(S
+@@ -3286,7 +3598,8 @@ void ScopBuilder::buildAccessRelations(S
  /// Add the minimal/maximal access in @p Set to @p User.
  ///
  /// @return True if more accesses should be added, false if we reached the
@@ -951,7 +1102,7 @@
  static bool buildMinMaxAccess(isl::set Set,
                                Scop::MinMaxVectorTy &MinMaxAccesses, Scop &S) {
    isl::pw_multi_aff MinPMA, MaxPMA;
-@@ -3295,13 +3562,22 @@ static bool buildMinMaxAccess(isl::set S
+@@ -3295,13 +3608,22 @@ static bool buildMinMaxAccess(isl::set S
    unsigned Pos;
  
    Set = Set.remove_divs();
@@ -976,7 +1127,7 @@
  
    // Restrict the number of parameters involved in the access as the lexmin/
    // lexmax computation will take too long if this number is high.
-@@ -3317,12 +3593,16 @@ static bool buildMinMaxAccess(isl::set S
+@@ -3317,12 +3639,16 @@ static bool buildMinMaxAccess(isl::set S
    //           11          |     6.78
    //           12          |    30.38
    //
@@ -996,7 +1147,7 @@
  
      if (InvolvedParams > RunTimeChecksMaxParameters)
        return false;
-@@ -3331,13 +3611,20 @@ static bool buildMinMaxAccess(isl::set S
+@@ -3331,13 +3657,20 @@ static bool buildMinMaxAccess(isl::set S
    MinPMA = Set.lexmin_pw_multi_aff();
    MaxPMA = Set.lexmax_pw_multi_aff();
  
@@ -1019,7 +1170,7 @@
  
    // Adjust the last dimension of the maximal access by one as we want to
    // enclose the accessed memory region by MinPMA and MaxPMA. The pointer
-@@ -3347,12 +3634,31 @@ static bool buildMinMaxAccess(isl::set S
+@@ -3347,12 +3680,31 @@ static bool buildMinMaxAccess(isl::set S
  
    Pos = MaxOutputSize - 1;
    LastDimAff = MaxPMA.at(Pos);
@@ -1054,7 +1205,41 @@
      return false;
  
    MinMaxAccesses.push_back(std::make_pair(MinPMA, MaxPMA));
-@@ -3570,11 +3876,20 @@ bool ScopBuilder::buildAliasGroup(
+@@ -3525,12 +3877,24 @@ bool ScopBuilder::buildAliasGroup(
+ 
+   // For non-affine accesses, no alias check can be generated as we cannot
+   // compute a sufficiently tight lower and upper bound: bail out.
++  //
++  // Also reject any exact affine single-element access whose relation has
++  // somehow stopped being single-valued. Alias min/max construction relies on
++  // the exact-access invariant and would otherwise trip later ISL code that
++  // expects functional access descriptions.
+   for (MemoryAccess *MA : AliasGroup) {
+     if (!MA->isAffine()) {
+       scop->invalidate(ALIASING, MA->getAccessInstruction()->getDebugLoc(),
+                        MA->getAccessInstruction()->getParent());
+       return false;
+     }
++
++    if (expectsSingleValuedAccessRelation(*MA, DL) &&
++        MA->getAccessRelation().is_single_valued().is_false()) {
++      scop->invalidate(ALIASING, MA->getAccessInstruction()->getDebugLoc(),
++                       MA->getAccessInstruction()->getParent());
++      return false;
++    }
+   }
+ 
+   // Ensure that for all memory accesses for which we generate alias checks,
+@@ -3541,8 +3905,6 @@ bool ScopBuilder::buildAliasGroup(
+           cast<LoadInst>(BasePtrMA->getAccessInstruction()));
+   }
+ 
+-  //  scop->getAliasGroups().emplace_back();
+-  //  Scop::MinMaxVectorPairTy &pair = scop->getAliasGroups().back();
+   Scop::MinMaxVectorTy MinMaxAccessesReadWrite;
+   Scop::MinMaxVectorTy MinMaxAccessesReadOnly;
+ 
+@@ -3570,11 +3932,20 @@ bool ScopBuilder::buildAliasGroup(
  }
  
  void ScopBuilder::splitAliasGroupsByDomain(AliasGroupVectorTy &AliasGroups) {
@@ -1076,7 +1261,7 @@
      while (AGI != AG.end()) {
        MemoryAccess *MA = *AGI;
        isl::set MADomain = getAccessDomain(MA);
-@@ -3583,9 +3898,10 @@ void ScopBuilder::splitAliasGroupsByDoma
+@@ -3583,9 +3954,10 @@ void ScopBuilder::splitAliasGroupsByDoma
          AGI = AG.erase(AGI);
        } else {
          AGDomain = AGDomain.unite(MADomain);

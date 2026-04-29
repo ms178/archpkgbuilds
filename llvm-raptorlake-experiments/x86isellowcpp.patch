@@ -1,6 +1,6 @@
---- a/llvm/lib/Target/X86/X86ISelLowering.cpp	2025-08-02 20:50:59.772460740 +0200
-+++ b/llvm/lib/Target/X86/X86ISelLowering.cpp	2025-08-14 15:49:20.796623328 +0200
-@@ -71,7 +71,7 @@ using namespace llvm;
+--- a/llvm/lib/Target/X86/X86ISelLowering.cpp	2026-04-29 20:50:59.772460740 +0200
++++ b/llvm/lib/Target/X86/X86ISelLowering.cpp	2026-04-29 15:49:20.796623328 +0200
+@@ -70,7 +70,7 @@ using namespace llvm;
  #define DEBUG_TYPE "x86-isel"
  
  static cl::opt<int> ExperimentalPrefInnermostLoopAlignment(
@@ -9,7 +9,7 @@
      cl::desc(
          "Sets the preferable loop alignment for experiments (as log2 bytes) "
          "for innermost loops only. If specified, this option overrides "
-@@ -79,7 +79,7 @@ static cl::opt<int> ExperimentalPrefInne
+@@ -78,7 +78,7 @@ static cl::opt<int> ExperimentalPrefInne
      cl::Hidden);
  
  static cl::opt<int> BrMergingBaseCostThresh(
@@ -18,7 +18,7 @@
      cl::desc(
          "Sets the cost threshold for when multiple conditionals will be merged "
          "into one branch versus be split in multiple branches. Merging "
-@@ -90,7 +90,7 @@ static cl::opt<int> BrMergingBaseCostThr
+@@ -89,7 +89,7 @@ static cl::opt<int> BrMergingBaseCostThr
      cl::Hidden);
  
  static cl::opt<int> BrMergingCcmpBias(
@@ -27,30 +27,80 @@
      cl::desc("Increases 'x86-br-merging-base-cost' in cases that the target "
               "supports conditional compare instructions."),
      cl::Hidden);
-@@ -20227,9 +20227,19 @@ std::pair<SDValue, SDValue> X86TargetLow
+@@ -2793,9 +2793,9 @@ X86TargetLowering::X86TargetLowering(con
+ 
+   MaxStoresPerMemset = 16; // For @llvm.memset -> sequence of stores
+   MaxStoresPerMemsetOptSize = 8;
+-  MaxStoresPerMemcpy = 8; // For @llvm.memcpy -> sequence of stores
++  MaxStoresPerMemcpy = Subtarget.hasAVX2() ? 16 : 8;
+   MaxStoresPerMemcpyOptSize = 4;
+-  MaxStoresPerMemmove = 8; // For @llvm.memmove -> sequence of stores
++  MaxStoresPerMemmove = Subtarget.hasAVX2() ? 16 : 8;
+   MaxStoresPerMemmoveOptSize = 4;
+ 
+   // TODO: These control memcmp expansion in CGP and could be raised higher, but
+@@ -20917,9 +20917,14 @@ std::pair<SDValue, SDValue> X86TargetLow
  /// implementation, and likely shuffle complexity of the alternate sequence.
  static bool shouldUseHorizontalOp(bool IsSingleSource, SelectionDAG &DAG,
                                    const X86Subtarget &Subtarget) {
 -  bool IsOptimizingSize = DAG.shouldOptForSize();
 -  bool HasFastHOps = Subtarget.hasFastHorizontalOps();
 -  return !IsSingleSource || IsOptimizingSize || HasFastHOps;
-+  // On high-performance cores like Raptor Lake, horizontal operations
-+  // (e.g., HADDPS) are almost always slower than a shuffle-and-add/sub
-+  // sequence due to high latency and low throughput from cross-lane data
-+  // movement. For maximum performance, we should only use them when
-+  // optimizing for code size.
++  if (!IsSingleSource)
++    return true;
++  // Prefer shuffle+arithmetic sequences for throughput unless optimizing for
++  // code size. On modern Intel client cores this usually yields lower latency
++  // and better port balance than horizontal ops.
 +  if (DAG.shouldOptForSize())
 +    return true;
-+
-+  // For Raptor Lake (and most high-performance Intel/AMD cores),
-+  // HasFastHorizontalOps should be false. We will rely on that, but could
-+  // add an explicit check for CPU models if needed. If a future CPU has
-+  // truly fast horizontal ops, its Subtarget feature flag will enable them.
 +  return Subtarget.hasFastHorizontalOps();
  }
  
  /// 64-bit unsigned integer to double expansion.
-@@ -62150,15 +62160,17 @@ X86TargetLowering::getRegForInlineAsmCon
+@@ -63281,13 +63286,37 @@ void X86TargetLowering::LowerAsmOperandF
+     return;
+   }
+   case 'i': {
+-    // Literal immediates are always ok.
++    // Literal immediates are ok if they fit into a 64-bit register.
+     if (auto *CST = dyn_cast<ConstantSDNode>(Op)) {
+-      bool IsBool = CST->getConstantIntValue()->getBitWidth() == 1;
+-      BooleanContent BCont = getBooleanContents(MVT::i64);
+-      ISD::NodeType ExtOpc = IsBool ? getExtendForContent(BCont)
+-                                    : ISD::SIGN_EXTEND;
+       SDLoc DL(Op);
++      unsigned BitWidth = CST->getConstantIntValue()->getBitWidth();
++      if (BitWidth > 64) {
++        // Check if the value would fit into 64 bit by either treating the
++        // value as an unsigned integer (active bits <= 64) or a signed
++        // integer (significant bits <= 64).
++        const APInt &CSTAPInt = CST->getAPIntValue();
++        bool FitsUnsigned = CSTAPInt.getActiveBits() <= 64;
++        bool FitsSigned = CSTAPInt.getSignificantBits() <= 64;
++        if (!FitsUnsigned && !FitsSigned) {
++          DAG.getContext()->diagnose(DiagnosticInfoUnsupported(
++              DAG.getMachineFunction().getFunction(),
++              "unsupported size for integer operand",
++              DiagnosticLocation(DL.getDebugLoc()), DS_Error));
++          return;
++        }
++
++        APInt TruncC = CSTAPInt.trunc(64);
++        if (FitsSigned)
++          Result = DAG.getSignedTargetConstant(TruncC.getSExtValue(), DL,
++                                               MVT::i64);
++        else
++          Result = DAG.getTargetConstant(TruncC.getZExtValue(), DL, MVT::i64);
++        break;
++      }
++      bool IsBool = BitWidth == 1;
++      BooleanContent BCont = getBooleanContents(MVT::i64);
++      ISD::NodeType ExtOpc =
++          IsBool ? getExtendForContent(BCont) : ISD::SIGN_EXTEND;
+       Result =
+           ExtOpc == ISD::ZERO_EXTEND
+               ? DAG.getTargetConstant(CST->getZExtValue(), DL, MVT::i64)
+@@ -63867,15 +63896,13 @@ X86TargetLowering::getRegForInlineAsmCon
  }
  
  bool X86TargetLowering::isIntDivCheap(EVT VT, AttributeList Attr) const {
@@ -61,15 +111,11 @@
 -  // integer division, leaving the division as-is is a loss even in terms of
 -  // size, because it will have to be scalarized, while the alternative code
 -  // sequence can be performed in vector form.
-+  // On modern CPUs like Raptor Lake, the 'idiv' instruction has a very high,
-+  // data-dependent latency (10-26 cycles) and is not well-pipelined, making it
-+  // a performance catastrophe. For performance-critical code, it is
-+  // almost never "cheap". The alternative magic-multiply sequence is much faster.
-+  // We only consider 'idiv' cheap if optimizing for code size, as it is a
-+  // single instruction. Vector division is never cheap as it must be scalarized.
++  // Integer division is expensive, so only treat it as cheap for minsize
++  // scalar code-size tuning. Vector integer division is never cheap because
++  // it must be scalarized on x86.
 +  if (VT.isVector())
 +    return false;
-+
    bool OptSize = Attr.hasFnAttr(Attribute::MinSize);
 -  return OptSize && !VT.isVector();
 +  return OptSize;
