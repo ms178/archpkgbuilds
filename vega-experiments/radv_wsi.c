@@ -35,7 +35,10 @@ radv_wsi_set_memory_ownership(VkDevice _device, VkDeviceMemory _mem, VkBool32 ow
    VK_FROM_HANDLE(radv_device, device, _device);
    VK_FROM_HANDLE(radv_device_memory, mem, _mem);
 
-   if (!device || !mem || !mem->bo)
+   if (!device || !mem)
+      return;
+
+   if (!mem->bo)
       return;
 
    device->ws->buffer_make_resident(device->ws, mem->bo, ownership);
@@ -48,6 +51,9 @@ radv_wsi_get_prime_blit_queue(VkDevice _device)
    struct radv_physical_device *pdev = radv_device_physical(device);
    const struct radv_instance *instance = radv_physical_device_instance(pdev);
 
+   if (pdev->info.gfx_level < GFX9 || (instance->debug_flags & RADV_DEBUG_NO_DMA_BLIT))
+      return NULL;
+
    simple_mtx_lock(&device->blit_queue_mtx);
 
    if (device->private_sdma_queue != VK_NULL_HANDLE) {
@@ -55,46 +61,56 @@ radv_wsi_get_prime_blit_queue(VkDevice _device)
       return &device->private_sdma_queue->vk;
    }
 
-   if (pdev->info.gfx_level >= GFX9 &&
-       !(instance->debug_flags & RADV_DEBUG_NO_DMA_BLIT)) {
+   uint32_t queue_family_index = pdev->num_queues;
+   bool added_family = false;
+
+   for (uint32_t i = 0; i < pdev->num_queues; i++) {
+      if (pdev->vk_queue_to_radv[i] == RADV_QUEUE_TRANSFER) {
+         queue_family_index = i;
+         break;
+      }
+   }
+
+   if (queue_family_index == pdev->num_queues) {
       if (pdev->num_queues >= ARRAY_SIZE(pdev->vk_queue_to_radv)) {
          simple_mtx_unlock(&device->blit_queue_mtx);
          return NULL;
       }
 
-      const uint32_t queue_family_index = pdev->num_queues;
-      const float queue_priority = 1.0f;
-
       pdev->vk_queue_to_radv[queue_family_index] = RADV_QUEUE_TRANSFER;
       pdev->num_queues++;
-
-      const VkDeviceQueueCreateInfo queue_create = {
-         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-         .queueFamilyIndex = queue_family_index,
-         .queueCount = 1,
-         .pQueuePriorities = &queue_priority,
-      };
-
-      device->private_sdma_queue =
-         vk_zalloc(&device->vk.alloc, sizeof(struct radv_queue), 8,
-                   VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
-      if (!device->private_sdma_queue) {
-         pdev->num_queues = queue_family_index;
-         simple_mtx_unlock(&device->blit_queue_mtx);
-         return NULL;
-      }
-
-      VkResult result =
-         radv_queue_init(device, device->private_sdma_queue, 0, &queue_create, NULL);
-      if (result == VK_SUCCESS) {
-         simple_mtx_unlock(&device->blit_queue_mtx);
-         return &device->private_sdma_queue->vk;
-      }
-
-      vk_free(&device->vk.alloc, device->private_sdma_queue);
-      device->private_sdma_queue = VK_NULL_HANDLE;
-      pdev->num_queues = queue_family_index;
+      added_family = true;
    }
+
+   const float queue_priority = 1.0f;
+   const VkDeviceQueueCreateInfo queue_create = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .queueFamilyIndex = queue_family_index,
+      .queueCount = 1,
+      .pQueuePriorities = &queue_priority,
+   };
+
+   device->private_sdma_queue =
+      vk_zalloc(&device->vk.alloc, sizeof(struct radv_queue), 8,
+                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   if (!device->private_sdma_queue) {
+      if (added_family)
+         pdev->num_queues = queue_family_index;
+      simple_mtx_unlock(&device->blit_queue_mtx);
+      return NULL;
+   }
+
+   VkResult result =
+      radv_queue_init(device, device->private_sdma_queue, 0, &queue_create, NULL);
+   if (result == VK_SUCCESS) {
+      simple_mtx_unlock(&device->blit_queue_mtx);
+      return &device->private_sdma_queue->vk;
+   }
+
+   vk_free(&device->vk.alloc, device->private_sdma_queue);
+   device->private_sdma_queue = VK_NULL_HANDLE;
+   if (added_family)
+      pdev->num_queues = queue_family_index;
 
    simple_mtx_unlock(&device->blit_queue_mtx);
    return NULL;
@@ -117,8 +133,9 @@ radv_init_wsi(struct radv_physical_device *pdev)
    pdev->wsi_device.set_memory_ownership = radv_wsi_set_memory_ownership;
    pdev->wsi_device.get_blit_queue = radv_wsi_get_prime_blit_queue;
 
+   const VkBool32 tmz_enabled = radv_tmz_enabled(pdev);
    for (uint32_t i = 0; i < ARRAY_SIZE(pdev->wsi_device.supports_protected); i++) {
-      pdev->wsi_device.supports_protected[i] = radv_tmz_enabled(pdev);
+      pdev->wsi_device.supports_protected[i] = tmz_enabled;
    }
 
    wsi_device_setup_syncobj_fd(&pdev->wsi_device, pdev->local_fd);
