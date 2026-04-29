@@ -70,7 +70,7 @@ using namespace llvm;
 #define DEBUG_TYPE "x86-isel"
 
 static cl::opt<int> ExperimentalPrefInnermostLoopAlignment(
-    "x86-experimental-pref-innermost-loop-alignment", cl::init(4),
+    "x86-experimental-pref-innermost-loop-alignment", cl::init(5),
     cl::desc(
         "Sets the preferable loop alignment for experiments (as log2 bytes) "
         "for innermost loops only. If specified, this option overrides "
@@ -78,7 +78,7 @@ static cl::opt<int> ExperimentalPrefInnermostLoopAlignment(
     cl::Hidden);
 
 static cl::opt<int> BrMergingBaseCostThresh(
-    "x86-br-merging-base-cost", cl::init(2),
+    "x86-br-merging-base-cost", cl::init(4),
     cl::desc(
         "Sets the cost threshold for when multiple conditionals will be merged "
         "into one branch versus be split in multiple branches. Merging "
@@ -89,7 +89,7 @@ static cl::opt<int> BrMergingBaseCostThresh(
     cl::Hidden);
 
 static cl::opt<int> BrMergingCcmpBias(
-    "x86-br-merging-ccmp-bias", cl::init(6),
+    "x86-br-merging-ccmp-bias", cl::init(8),
     cl::desc("Increases 'x86-br-merging-base-cost' in cases that the target "
              "supports conditional compare instructions."),
     cl::Hidden);
@@ -2798,11 +2798,18 @@ X86TargetLowering::X86TargetLowering(const X86TargetMachine &TM,
   MaxStoresPerMemmove = 8; // For @llvm.memmove -> sequence of stores
   MaxStoresPerMemmoveOptSize = 4;
 
-  // TODO: These control memcmp expansion in CGP and could be raised higher, but
-  // that needs to benchmarked and balanced with the potential use of vector
-  // load/store types (PR33329, PR33914).
+  // TODO: These control memcmp expansion in CGP and should be balanced with
+  // potential use of vector load/store types (PR33329, PR33914).
+  // Keep the generic default conservative, then tune by microarchitecture:
+  //  - Atom/E-core style designs: smaller expansion to limit frontend pressure.
+  //  - Big OoO 64-bit cores with SSE2: allow wider inlining before libcalls.
   MaxLoadsPerMemcmp = 2;
   MaxLoadsPerMemcmpOptSize = 2;
+  if (Subtarget.isAtom())
+    MaxLoadsPerMemcmp = 3;
+  else if (Subtarget.is64Bit() && Subtarget.hasSSE2() &&
+           Subtarget.getSchedModel().isOutOfOrder())
+    MaxLoadsPerMemcmp = 4;
 
   // Default loop alignment, which can be overridden by -align-loops.
   setPrefLoopAlignment(Align(16));
@@ -20917,9 +20924,14 @@ std::pair<SDValue, SDValue> X86TargetLowering::BuildFILD(
 /// implementation, and likely shuffle complexity of the alternate sequence.
 static bool shouldUseHorizontalOp(bool IsSingleSource, SelectionDAG &DAG,
                                   const X86Subtarget &Subtarget) {
-  bool IsOptimizingSize = DAG.shouldOptForSize();
-  bool HasFastHOps = Subtarget.hasFastHorizontalOps();
-  return !IsSingleSource || IsOptimizingSize || HasFastHOps;
+  if (!IsSingleSource)
+    return true;
+  // Prefer shuffle+arithmetic sequences for throughput unless optimizing for
+  // code size. On modern Intel client cores this usually yields lower latency
+  // and better port balance than horizontal ops.
+  if (DAG.shouldOptForSize())
+    return true;
+  return Subtarget.hasFastHorizontalOps();
 }
 
 /// 64-bit unsigned integer to double expansion.
@@ -30213,13 +30225,17 @@ static SDValue LowerMUL(SDValue Op, const X86Subtarget &Subtarget,
 
     // Extract the odd parts.
     static const int UnpackMask[] = {1, 1, 3, 3};
+    const bool IsSquare = A == B;
     SDValue Aodds = DAG.getVectorShuffle(VT, dl, A, A, UnpackMask);
-    SDValue Bodds = DAG.getVectorShuffle(VT, dl, B, B, UnpackMask);
+    SDValue Bodds = IsSquare ? Aodds
+                             : DAG.getVectorShuffle(VT, dl, B, B, UnpackMask);
+
+    SDValue AAsV2I64 = DAG.getBitcast(MVT::v2i64, A);
+    SDValue BBsV2I64 = IsSquare ? AAsV2I64 : DAG.getBitcast(MVT::v2i64, B);
 
     // Multiply the even parts.
-    SDValue Evens = DAG.getNode(X86ISD::PMULUDQ, dl, MVT::v2i64,
-                                DAG.getBitcast(MVT::v2i64, A),
-                                DAG.getBitcast(MVT::v2i64, B));
+    SDValue Evens =
+        DAG.getNode(X86ISD::PMULUDQ, dl, MVT::v2i64, AAsV2I64, BBsV2I64);
     // Now multiply odd parts.
     SDValue Odds = DAG.getNode(X86ISD::PMULUDQ, dl, MVT::v2i64,
                                DAG.getBitcast(MVT::v2i64, Aodds),
@@ -30260,26 +30276,39 @@ static SDValue LowerMUL(SDValue Op, const X86Subtarget &Subtarget,
 
   SDValue Zero = DAG.getConstant(0, dl, VT);
 
+  const bool HasAloBlo = !ALoIsZero && !BLoIsZero;
+  const bool HasAloBhi = !ALoIsZero && !BHiIsZero;
+  const bool HasAhiBlo = !AHiIsZero && !BLoIsZero;
+
   // Only multiply lo/hi halves that aren't known to be zero.
-  SDValue AloBlo = Zero;
-  if (!ALoIsZero && !BLoIsZero)
-    AloBlo = DAG.getNode(X86ISD::PMULUDQ, dl, VT, A, B);
+  SDValue AloBlo = HasAloBlo ? DAG.getNode(X86ISD::PMULUDQ, dl, VT, A, B)
+                               : Zero;
+
+  const bool HasCross = HasAloBhi || HasAhiBlo;
+  if (!HasCross)
+    return AloBlo;
 
   SDValue AloBhi = Zero;
-  if (!ALoIsZero && !BHiIsZero) {
+  if (HasAloBhi) {
     SDValue Bhi = getTargetVShiftByConstNode(X86ISD::VSRLI, dl, VT, B, 32, DAG);
     AloBhi = DAG.getNode(X86ISD::PMULUDQ, dl, VT, A, Bhi);
   }
 
   SDValue AhiBlo = Zero;
-  if (!AHiIsZero && !BLoIsZero) {
+  if (HasAhiBlo) {
     SDValue Ahi = getTargetVShiftByConstNode(X86ISD::VSRLI, dl, VT, A, 32, DAG);
     AhiBlo = DAG.getNode(X86ISD::PMULUDQ, dl, VT, Ahi, B);
   }
 
-  SDValue Hi = DAG.getNode(ISD::ADD, dl, VT, AloBhi, AhiBlo);
-  Hi = getTargetVShiftByConstNode(X86ISD::VSHLI, dl, VT, Hi, 32, DAG);
+  SDValue Hi = HasAloBhi ? AloBhi : AhiBlo;
+  if (HasAloBhi && HasAhiBlo)
+    Hi = DAG.getNode(ISD::ADD, dl, VT, AloBhi, AhiBlo);
 
+  if (Hi != Zero)
+    Hi = getTargetVShiftByConstNode(X86ISD::VSHLI, dl, VT, Hi, 32, DAG);
+
+  if (!HasAloBlo)
+    return Hi;
   return DAG.getNode(ISD::ADD, dl, VT, AloBlo, Hi);
 }
 
@@ -63281,13 +63310,37 @@ void X86TargetLowering::LowerAsmOperandForConstraint(SDValue Op,
     return;
   }
   case 'i': {
-    // Literal immediates are always ok.
+    // Literal immediates are ok if they fit into a 64-bit register.
     if (auto *CST = dyn_cast<ConstantSDNode>(Op)) {
-      bool IsBool = CST->getConstantIntValue()->getBitWidth() == 1;
-      BooleanContent BCont = getBooleanContents(MVT::i64);
-      ISD::NodeType ExtOpc = IsBool ? getExtendForContent(BCont)
-                                    : ISD::SIGN_EXTEND;
       SDLoc DL(Op);
+      unsigned BitWidth = CST->getConstantIntValue()->getBitWidth();
+      if (BitWidth > 64) {
+        // Check if the value would fit into 64 bit by either treating the
+        // value as an unsigned integer (active bits <= 64) or a signed
+        // integer (significant bits <= 64).
+        const APInt &CSTAPInt = CST->getAPIntValue();
+        bool FitsUnsigned = CSTAPInt.getActiveBits() <= 64;
+        bool FitsSigned = CSTAPInt.getSignificantBits() <= 64;
+        if (!FitsUnsigned && !FitsSigned) {
+          DAG.getContext()->diagnose(DiagnosticInfoUnsupported(
+              DAG.getMachineFunction().getFunction(),
+              "unsupported size for integer operand",
+              DiagnosticLocation(DL.getDebugLoc()), DS_Error));
+          return;
+        }
+
+        APInt TruncC = CSTAPInt.trunc(64);
+        if (FitsSigned)
+          Result = DAG.getSignedTargetConstant(TruncC.getSExtValue(), DL,
+                                               MVT::i64);
+        else
+          Result = DAG.getTargetConstant(TruncC.getZExtValue(), DL, MVT::i64);
+        break;
+      }
+      bool IsBool = BitWidth == 1;
+      BooleanContent BCont = getBooleanContents(MVT::i64);
+      ISD::NodeType ExtOpc =
+          IsBool ? getExtendForContent(BCont) : ISD::SIGN_EXTEND;
       Result =
           ExtOpc == ISD::ZERO_EXTEND
               ? DAG.getTargetConstant(CST->getZExtValue(), DL, MVT::i64)
@@ -63867,15 +63920,14 @@ X86TargetLowering::getRegForInlineAsmConstraint(const TargetRegisterInfo *TRI,
 }
 
 bool X86TargetLowering::isIntDivCheap(EVT VT, AttributeList Attr) const {
-  // Integer division on x86 is expensive. However, when aggressively optimizing
-  // for code size, we prefer to use a div instruction, as it is usually smaller
-  // than the alternative sequence.
-  // The exception to this is vector division. Since x86 doesn't have vector
-  // integer division, leaving the division as-is is a loss even in terms of
-  // size, because it will have to be scalarized, while the alternative code
-  // sequence can be performed in vector form.
-  bool OptSize = Attr.hasFnAttr(Attribute::MinSize);
-  return OptSize && !VT.isVector();
+  // Integer division is expensive, so only treat it as cheap for minsize
+  // scalar code-size tuning. Vector integer division is never cheap because
+  // it must be scalarized on x86.
+  if (VT.isVector())
+    return false;
+  bool OptSize = Attr.hasFnAttr(Attribute::MinSize) ||
+                 Attr.hasFnAttr(Attribute::OptimizeForSize);
+  return OptSize;
 }
 
 void X86TargetLowering::initializeSplitCSR(MachineBasicBlock *Entry) const {
