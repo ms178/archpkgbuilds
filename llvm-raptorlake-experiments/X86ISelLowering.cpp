@@ -70,7 +70,7 @@ using namespace llvm;
 #define DEBUG_TYPE "x86-isel"
 
 static cl::opt<int> ExperimentalPrefInnermostLoopAlignment(
-    "x86-experimental-pref-innermost-loop-alignment", cl::init(5),
+    "x86-experimental-pref-innermost-loop-alignment", cl::init(4),
     cl::desc(
         "Sets the preferable loop alignment for experiments (as log2 bytes) "
         "for innermost loops only. If specified, this option overrides "
@@ -78,7 +78,7 @@ static cl::opt<int> ExperimentalPrefInnermostLoopAlignment(
     cl::Hidden);
 
 static cl::opt<int> BrMergingBaseCostThresh(
-    "x86-br-merging-base-cost", cl::init(4),
+    "x86-br-merging-base-cost", cl::init(2),
     cl::desc(
         "Sets the cost threshold for when multiple conditionals will be merged "
         "into one branch versus be split in multiple branches. Merging "
@@ -89,7 +89,7 @@ static cl::opt<int> BrMergingBaseCostThresh(
     cl::Hidden);
 
 static cl::opt<int> BrMergingCcmpBias(
-    "x86-br-merging-ccmp-bias", cl::init(8),
+    "x86-br-merging-ccmp-bias", cl::init(6),
     cl::desc("Increases 'x86-br-merging-base-cost' in cases that the target "
              "supports conditional compare instructions."),
     cl::Hidden);
@@ -1159,6 +1159,15 @@ X86TargetLowering::X86TargetLowering(const X86TargetMachine &TM,
       setOperationAction(ISD::SMIN, VT, VT == MVT::v8i16 ? Legal : Custom);
       setOperationAction(ISD::UMAX, VT, VT == MVT::v16i8 ? Legal : Custom);
       setOperationAction(ISD::UMIN, VT, VT == MVT::v16i8 ? Legal : Custom);
+    }
+
+    // SSE2 can use basic vector unrolling.
+    // SSE41 can use PHMINPOS to perform v16i8/v8i16 minmax reductions.
+    for (auto VT : {MVT::v16i8, MVT::v8i16}) {
+      setOperationAction(ISD::VECREDUCE_SMAX, VT, Custom);
+      setOperationAction(ISD::VECREDUCE_SMIN, VT, Custom);
+      setOperationAction(ISD::VECREDUCE_UMAX, VT, Custom);
+      setOperationAction(ISD::VECREDUCE_UMIN, VT, Custom);
     }
 
     setOperationAction(ISD::UADDSAT,            MVT::v16i8, Legal);
@@ -2798,18 +2807,11 @@ X86TargetLowering::X86TargetLowering(const X86TargetMachine &TM,
   MaxStoresPerMemmove = 8; // For @llvm.memmove -> sequence of stores
   MaxStoresPerMemmoveOptSize = 4;
 
-  // TODO: These control memcmp expansion in CGP and should be balanced with
-  // potential use of vector load/store types (PR33329, PR33914).
-  // Keep the generic default conservative, then tune by microarchitecture:
-  //  - Atom/E-core style designs: smaller expansion to limit frontend pressure.
-  //  - Big OoO 64-bit cores with SSE2: allow wider inlining before libcalls.
+  // TODO: These control memcmp expansion in CGP and could be raised higher, but
+  // that needs to benchmarked and balanced with the potential use of vector
+  // load/store types (PR33329, PR33914).
   MaxLoadsPerMemcmp = 2;
   MaxLoadsPerMemcmpOptSize = 2;
-  if (Subtarget.isAtom())
-    MaxLoadsPerMemcmp = 3;
-  else if (Subtarget.is64Bit() && Subtarget.hasSSE2() &&
-           Subtarget.getSchedModel().isOutOfOrder())
-    MaxLoadsPerMemcmp = 4;
 
   // Default loop alignment, which can be overridden by -align-loops.
   setPrefLoopAlignment(Align(16));
@@ -20924,14 +20926,9 @@ std::pair<SDValue, SDValue> X86TargetLowering::BuildFILD(
 /// implementation, and likely shuffle complexity of the alternate sequence.
 static bool shouldUseHorizontalOp(bool IsSingleSource, SelectionDAG &DAG,
                                   const X86Subtarget &Subtarget) {
-  if (!IsSingleSource)
-    return true;
-  // Prefer shuffle+arithmetic sequences for throughput unless optimizing for
-  // code size. On modern Intel client cores this usually yields lower latency
-  // and better port balance than horizontal ops.
-  if (DAG.shouldOptForSize())
-    return true;
-  return Subtarget.hasFastHorizontalOps();
+  bool IsOptimizingSize = DAG.shouldOptForSize();
+  bool HasFastHOps = Subtarget.hasFastHorizontalOps();
+  return !IsSingleSource || IsOptimizingSize || HasFastHOps;
 }
 
 /// 64-bit unsigned integer to double expansion.
@@ -29838,6 +29835,88 @@ static SDValue LowerMINMAX(SDValue Op, const X86Subtarget &Subtarget,
   return SDValue();
 }
 
+// Attempt to replace an min/max v8i16/v16i8 horizontal reduction with
+// PHMINPOSUW.
+static SDValue LowerMINMAX_REDUCE(SDValue Op, const X86Subtarget &Subtarget,
+                                  SelectionDAG &DAG) {
+  EVT ExtractVT = Op.getValueType();
+  if (ExtractVT != MVT::i16 && ExtractVT != MVT::i8)
+    return SDValue();
+
+  // Check for SMAX/SMIN/UMAX/UMIN horizontal reduction patterns.
+  ISD::NodeType BinOp = ISD::getVecReduceBaseOpcode(Op.getOpcode());
+
+  SDValue Src = Op.getOperand(0);
+  EVT SrcVT = Src.getValueType();
+  EVT SrcSVT = SrcVT.getScalarType();
+  if (SrcSVT != ExtractVT || (SrcVT.getSizeInBits() % 128) != 0)
+    return SDValue();
+
+  SDLoc DL(Op);
+  SDValue MinPos = Src;
+
+  // First, reduce the source down to 128-bit, applying BinOp to lo/hi.
+  while (SrcVT.getSizeInBits() > 128) {
+    SDValue Lo, Hi;
+    std::tie(Lo, Hi) = splitVector(MinPos, DAG, DL);
+    SrcVT = Lo.getValueType();
+    MinPos = DAG.getNode(BinOp, DL, SrcVT, Lo, Hi);
+  }
+  assert(((SrcVT == MVT::v8i16 && ExtractVT == MVT::i16) ||
+          (SrcVT == MVT::v16i8 && ExtractVT == MVT::i8)) &&
+         "Unexpected value type");
+
+  // Without SSE41, we need to unroll.
+  if (!Subtarget.hasSSE41()) {
+    unsigned NumSrcElts = SrcVT.getVectorNumElements();
+    for (unsigned NumElts = NumSrcElts; NumElts != 1; NumElts /= 2) {
+      SmallVector<int, 16> Mask(NumSrcElts, -1);
+      std::iota(Mask.begin(), Mask.begin() + (NumElts / 2), NumElts / 2);
+      SDValue Upper =
+          DAG.getVectorShuffle(SrcVT, DL, MinPos, DAG.getUNDEF(SrcVT), Mask);
+      MinPos = DAG.getNode(BinOp, DL, SrcVT, MinPos, Upper);
+    }
+    return DAG.getNode(ISD::EXTRACT_VECTOR_ELT, DL, ExtractVT, MinPos,
+                       DAG.getVectorIdxConstant(0, DL));
+  }
+
+  // PHMINPOSUW applies to UMIN(v8i16), for SMIN/SMAX/UMAX we must apply a mask
+  // to flip the value accordingly.
+  SDValue Mask;
+  unsigned MaskEltsBits = ExtractVT.getSizeInBits();
+  if (BinOp == ISD::SMAX)
+    Mask = DAG.getConstant(APInt::getSignedMaxValue(MaskEltsBits), DL, SrcVT);
+  else if (BinOp == ISD::SMIN)
+    Mask = DAG.getConstant(APInt::getSignedMinValue(MaskEltsBits), DL, SrcVT);
+  else if (BinOp == ISD::UMAX)
+    Mask = DAG.getAllOnesConstant(DL, SrcVT);
+
+  if (Mask)
+    MinPos = DAG.getNode(ISD::XOR, DL, SrcVT, Mask, MinPos);
+
+  // For v16i8 cases we need to perform UMIN on pairs of byte elements,
+  // shuffling each upper element down and insert zeros. This means that the
+  // v16i8 UMIN will leave the upper element as zero, performing zero-extension
+  // ready for the PHMINPOS.
+  if (ExtractVT == MVT::i8) {
+    SDValue Upper = DAG.getVectorShuffle(
+        SrcVT, DL, MinPos, DAG.getConstant(0, DL, MVT::v16i8),
+        {1, 16, 3, 16, 5, 16, 7, 16, 9, 16, 11, 16, 13, 16, 15, 16});
+    MinPos = DAG.getNode(ISD::UMIN, DL, SrcVT, MinPos, Upper);
+  }
+
+  // Perform the PHMINPOS on a v8i16 vector,
+  MinPos = DAG.getBitcast(MVT::v8i16, MinPos);
+  MinPos = DAG.getNode(X86ISD::PHMINPOS, DL, MVT::v8i16, MinPos);
+  MinPos = DAG.getBitcast(SrcVT, MinPos);
+
+  if (Mask)
+    MinPos = DAG.getNode(ISD::XOR, DL, SrcVT, Mask, MinPos);
+
+  return DAG.getNode(ISD::EXTRACT_VECTOR_ELT, DL, ExtractVT, MinPos,
+                     DAG.getVectorIdxConstant(0, DL));
+}
+
 static SDValue LowerFMINIMUM_FMAXIMUM(SDValue Op, const X86Subtarget &Subtarget,
                                       SelectionDAG &DAG) {
   const TargetLowering &TLI = DAG.getTargetLoweringInfo();
@@ -30225,17 +30304,13 @@ static SDValue LowerMUL(SDValue Op, const X86Subtarget &Subtarget,
 
     // Extract the odd parts.
     static const int UnpackMask[] = {1, 1, 3, 3};
-    const bool IsSquare = A == B;
     SDValue Aodds = DAG.getVectorShuffle(VT, dl, A, A, UnpackMask);
-    SDValue Bodds = IsSquare ? Aodds
-                             : DAG.getVectorShuffle(VT, dl, B, B, UnpackMask);
-
-    SDValue AAsV2I64 = DAG.getBitcast(MVT::v2i64, A);
-    SDValue BBsV2I64 = IsSquare ? AAsV2I64 : DAG.getBitcast(MVT::v2i64, B);
+    SDValue Bodds = DAG.getVectorShuffle(VT, dl, B, B, UnpackMask);
 
     // Multiply the even parts.
-    SDValue Evens =
-        DAG.getNode(X86ISD::PMULUDQ, dl, MVT::v2i64, AAsV2I64, BBsV2I64);
+    SDValue Evens = DAG.getNode(X86ISD::PMULUDQ, dl, MVT::v2i64,
+                                DAG.getBitcast(MVT::v2i64, A),
+                                DAG.getBitcast(MVT::v2i64, B));
     // Now multiply odd parts.
     SDValue Odds = DAG.getNode(X86ISD::PMULUDQ, dl, MVT::v2i64,
                                DAG.getBitcast(MVT::v2i64, Aodds),
@@ -30276,39 +30351,26 @@ static SDValue LowerMUL(SDValue Op, const X86Subtarget &Subtarget,
 
   SDValue Zero = DAG.getConstant(0, dl, VT);
 
-  const bool HasAloBlo = !ALoIsZero && !BLoIsZero;
-  const bool HasAloBhi = !ALoIsZero && !BHiIsZero;
-  const bool HasAhiBlo = !AHiIsZero && !BLoIsZero;
-
   // Only multiply lo/hi halves that aren't known to be zero.
-  SDValue AloBlo = HasAloBlo ? DAG.getNode(X86ISD::PMULUDQ, dl, VT, A, B)
-                               : Zero;
-
-  const bool HasCross = HasAloBhi || HasAhiBlo;
-  if (!HasCross)
-    return AloBlo;
+  SDValue AloBlo = Zero;
+  if (!ALoIsZero && !BLoIsZero)
+    AloBlo = DAG.getNode(X86ISD::PMULUDQ, dl, VT, A, B);
 
   SDValue AloBhi = Zero;
-  if (HasAloBhi) {
+  if (!ALoIsZero && !BHiIsZero) {
     SDValue Bhi = getTargetVShiftByConstNode(X86ISD::VSRLI, dl, VT, B, 32, DAG);
     AloBhi = DAG.getNode(X86ISD::PMULUDQ, dl, VT, A, Bhi);
   }
 
   SDValue AhiBlo = Zero;
-  if (HasAhiBlo) {
+  if (!AHiIsZero && !BLoIsZero) {
     SDValue Ahi = getTargetVShiftByConstNode(X86ISD::VSRLI, dl, VT, A, 32, DAG);
     AhiBlo = DAG.getNode(X86ISD::PMULUDQ, dl, VT, Ahi, B);
   }
 
-  SDValue Hi = HasAloBhi ? AloBhi : AhiBlo;
-  if (HasAloBhi && HasAhiBlo)
-    Hi = DAG.getNode(ISD::ADD, dl, VT, AloBhi, AhiBlo);
+  SDValue Hi = DAG.getNode(ISD::ADD, dl, VT, AloBhi, AhiBlo);
+  Hi = getTargetVShiftByConstNode(X86ISD::VSHLI, dl, VT, Hi, 32, DAG);
 
-  if (Hi != Zero)
-    Hi = getTargetVShiftByConstNode(X86ISD::VSHLI, dl, VT, Hi, 32, DAG);
-
-  if (!HasAloBlo)
-    return Hi;
   return DAG.getNode(ISD::ADD, dl, VT, AloBlo, Hi);
 }
 
@@ -34414,6 +34476,10 @@ SDValue X86TargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
   case ISD::SMIN:
   case ISD::UMAX:
   case ISD::UMIN:               return LowerMINMAX(Op, Subtarget, DAG);
+  case ISD::VECREDUCE_SMAX:
+  case ISD::VECREDUCE_SMIN:
+  case ISD::VECREDUCE_UMAX:
+  case ISD::VECREDUCE_UMIN:     return LowerMINMAX_REDUCE(Op, Subtarget, DAG);
   case ISD::FMINIMUM:
   case ISD::FMAXIMUM:
   case ISD::FMINIMUMNUM:
@@ -46984,14 +47050,10 @@ static SDValue createPSADBW(SelectionDAG &DAG, SDValue N0, SDValue N1,
                           PSADBWBuilder);
 }
 
-// Attempt to replace an min/max v8i16/v16i8 horizontal reduction with
-// PHMINPOSUW.
+// Attempt to replace an integer min/max horizontal reduction with
+// ISD::VECREDUCE_SMIN/SMAX/UMIN/UMAX.
 static SDValue combineMinMaxReduction(SDNode *Extract, SelectionDAG &DAG,
                                       const X86Subtarget &Subtarget) {
-  // Bail without SSE41.
-  if (!Subtarget.hasSSE41())
-    return SDValue();
-
   EVT ExtractVT = Extract->getValueType(0);
   if (ExtractVT != MVT::i16 && ExtractVT != MVT::i8)
     return SDValue();
@@ -47008,55 +47070,25 @@ static SDValue combineMinMaxReduction(SDNode *Extract, SelectionDAG &DAG,
   if (SrcSVT != ExtractVT || (SrcVT.getSizeInBits() % 128) != 0)
     return SDValue();
 
-  SDLoc DL(Extract);
-  SDValue MinPos = Src;
-
-  // First, reduce the source down to 128-bit, applying BinOp to lo/hi.
-  while (SrcVT.getSizeInBits() > 128) {
-    SDValue Lo, Hi;
-    std::tie(Lo, Hi) = splitVector(MinPos, DAG, DL);
-    SrcVT = Lo.getValueType();
-    MinPos = DAG.getNode(BinOp, DL, SrcVT, Lo, Hi);
-  }
-  assert(((SrcVT == MVT::v8i16 && ExtractVT == MVT::i16) ||
-          (SrcVT == MVT::v16i8 && ExtractVT == MVT::i8)) &&
-         "Unexpected value type");
-
-  // PHMINPOSUW applies to UMIN(v8i16), for SMIN/SMAX/UMAX we must apply a mask
-  // to flip the value accordingly.
-  SDValue Mask;
-  unsigned MaskEltsBits = ExtractVT.getSizeInBits();
-  if (BinOp == ISD::SMAX)
-    Mask = DAG.getConstant(APInt::getSignedMaxValue(MaskEltsBits), DL, SrcVT);
-  else if (BinOp == ISD::SMIN)
-    Mask = DAG.getConstant(APInt::getSignedMinValue(MaskEltsBits), DL, SrcVT);
-  else if (BinOp == ISD::UMAX)
-    Mask = DAG.getAllOnesConstant(DL, SrcVT);
-
-  if (Mask)
-    MinPos = DAG.getNode(ISD::XOR, DL, SrcVT, Mask, MinPos);
-
-  // For v16i8 cases we need to perform UMIN on pairs of byte elements,
-  // shuffling each upper element down and insert zeros. This means that the
-  // v16i8 UMIN will leave the upper element as zero, performing zero-extension
-  // ready for the PHMINPOS.
-  if (ExtractVT == MVT::i8) {
-    SDValue Upper = DAG.getVectorShuffle(
-        SrcVT, DL, MinPos, DAG.getConstant(0, DL, MVT::v16i8),
-        {1, 16, 3, 16, 5, 16, 7, 16, 9, 16, 11, 16, 13, 16, 15, 16});
-    MinPos = DAG.getNode(ISD::UMIN, DL, SrcVT, MinPos, Upper);
+  ISD::NodeType RdxOp;
+  switch (BinOp) {
+  case ISD::SMAX:
+    RdxOp = ISD::VECREDUCE_SMAX;
+    break;
+  case ISD::SMIN:
+    RdxOp = ISD::VECREDUCE_SMIN;
+    break;
+  case ISD::UMAX:
+    RdxOp = ISD::VECREDUCE_UMAX;
+    break;
+  case ISD::UMIN:
+    RdxOp = ISD::VECREDUCE_UMIN;
+    break;
+  default:
+    llvm_unreachable("Unexpected reduction");
   }
 
-  // Perform the PHMINPOS on a v8i16 vector,
-  MinPos = DAG.getBitcast(MVT::v8i16, MinPos);
-  MinPos = DAG.getNode(X86ISD::PHMINPOS, DL, MVT::v8i16, MinPos);
-  MinPos = DAG.getBitcast(SrcVT, MinPos);
-
-  if (Mask)
-    MinPos = DAG.getNode(ISD::XOR, DL, SrcVT, Mask, MinPos);
-
-  return DAG.getNode(ISD::EXTRACT_VECTOR_ELT, DL, ExtractVT, MinPos,
-                     DAG.getVectorIdxConstant(0, DL));
+  return DAG.getNode(RdxOp, SDLoc(Extract), ExtractVT, Src);
 }
 
 // Attempt to replace an all_of/any_of/parity style horizontal reduction with a MOVMSK.
@@ -48011,9 +48043,10 @@ static SDValue combineExtractVectorElt(SDNode *N, SelectionDAG &DAG,
   if (SDValue Cmp = combinePredicateReduction(N, DAG, Subtarget))
     return Cmp;
 
-  // Attempt to replace min/max v8i16/v16i8 reductions with PHMINPOSUW.
-  if (SDValue MinMax = combineMinMaxReduction(N, DAG, Subtarget))
-    return MinMax;
+  // Attempt to replace min/max v8i16/v16i8 reductions with ISD::VECREDUCE.
+  if (DCI.isBeforeLegalizeOps())
+    if (SDValue MinMax = combineMinMaxReduction(N, DAG, Subtarget))
+      return MinMax;
 
   // Attempt to optimize ADD/FADD/MUL reductions with HADD, promotion etc..
   if (SDValue V = combineArithReduction(N, DAG, Subtarget))
@@ -63310,37 +63343,13 @@ void X86TargetLowering::LowerAsmOperandForConstraint(SDValue Op,
     return;
   }
   case 'i': {
-    // Literal immediates are ok if they fit into a 64-bit register.
+    // Literal immediates are always ok.
     if (auto *CST = dyn_cast<ConstantSDNode>(Op)) {
-      SDLoc DL(Op);
-      unsigned BitWidth = CST->getConstantIntValue()->getBitWidth();
-      if (BitWidth > 64) {
-        // Check if the value would fit into 64 bit by either treating the
-        // value as an unsigned integer (active bits <= 64) or a signed
-        // integer (significant bits <= 64).
-        const APInt &CSTAPInt = CST->getAPIntValue();
-        bool FitsUnsigned = CSTAPInt.getActiveBits() <= 64;
-        bool FitsSigned = CSTAPInt.getSignificantBits() <= 64;
-        if (!FitsUnsigned && !FitsSigned) {
-          DAG.getContext()->diagnose(DiagnosticInfoUnsupported(
-              DAG.getMachineFunction().getFunction(),
-              "unsupported size for integer operand",
-              DiagnosticLocation(DL.getDebugLoc()), DS_Error));
-          return;
-        }
-
-        APInt TruncC = CSTAPInt.trunc(64);
-        if (FitsSigned)
-          Result = DAG.getSignedTargetConstant(TruncC.getSExtValue(), DL,
-                                               MVT::i64);
-        else
-          Result = DAG.getTargetConstant(TruncC.getZExtValue(), DL, MVT::i64);
-        break;
-      }
-      bool IsBool = BitWidth == 1;
+      bool IsBool = CST->getConstantIntValue()->getBitWidth() == 1;
       BooleanContent BCont = getBooleanContents(MVT::i64);
-      ISD::NodeType ExtOpc =
-          IsBool ? getExtendForContent(BCont) : ISD::SIGN_EXTEND;
+      ISD::NodeType ExtOpc = IsBool ? getExtendForContent(BCont)
+                                    : ISD::SIGN_EXTEND;
+      SDLoc DL(Op);
       Result =
           ExtOpc == ISD::ZERO_EXTEND
               ? DAG.getTargetConstant(CST->getZExtValue(), DL, MVT::i64)
@@ -63920,14 +63929,15 @@ X86TargetLowering::getRegForInlineAsmConstraint(const TargetRegisterInfo *TRI,
 }
 
 bool X86TargetLowering::isIntDivCheap(EVT VT, AttributeList Attr) const {
-  // Integer division is expensive, so only treat it as cheap for minsize
-  // scalar code-size tuning. Vector integer division is never cheap because
-  // it must be scalarized on x86.
-  if (VT.isVector())
-    return false;
-  bool OptSize = Attr.hasFnAttr(Attribute::MinSize) ||
-                 Attr.hasFnAttr(Attribute::OptimizeForSize);
-  return OptSize;
+  // Integer division on x86 is expensive. However, when aggressively optimizing
+  // for code size, we prefer to use a div instruction, as it is usually smaller
+  // than the alternative sequence.
+  // The exception to this is vector division. Since x86 doesn't have vector
+  // integer division, leaving the division as-is is a loss even in terms of
+  // size, because it will have to be scalarized, while the alternative code
+  // sequence can be performed in vector form.
+  bool OptSize = Attr.hasFnAttr(Attribute::MinSize);
+  return OptSize && !VT.isVector();
 }
 
 void X86TargetLowering::initializeSplitCSR(MachineBasicBlock *Entry) const {
