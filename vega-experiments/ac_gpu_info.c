@@ -277,6 +277,9 @@ ac_fill_compiler_info(struct radeon_info *info, const struct drm_amdgpu_info_dev
 
    struct ac_compiler_info *out = &info->compiler_info;
 
+   /* Keep cache-key bytes deterministic and robust against future struct growth. */
+   memset(out, 0, sizeof(*out));
+
    out->gfx_level = info->gfx_level;
 
    if (info->gfx_level >= GFX10_3)
@@ -329,15 +332,16 @@ ac_fill_compiler_info(struct radeon_info *info, const struct drm_amdgpu_info_dev
          out->num_physical_wave64_vgprs_per_simd = 256;
       }
    }
+
    if (info->gfx_level >= GFX10_3)
       out->wave64_vgpr_alloc_granularity = out->num_physical_wave64_vgprs_per_simd / 64;
    else if (info->gfx_level == GFX9 && info->family >= CHIP_MI200)
       out->wave64_vgpr_alloc_granularity = 8;
    else
       out->wave64_vgpr_alloc_granularity = 4;
+
    out->min_wave64_vgpr_alloc = out->wave64_vgpr_alloc_granularity;
    out->max_vgpr_alloc = 256;
-
    out->num_simd_per_compute_unit = info->gfx_level >= GFX10 ? 2 : 4;
 
    /* LDS is 64KB per CU (4 SIMDs on GFX6-9, which is 16KB per SIMD).
@@ -370,10 +374,6 @@ ac_fill_compiler_info(struct radeon_info *info, const struct drm_amdgpu_info_dev
    /* GFX1013 is GFX10 plus ray tracing instructions */
    out->has_image_bvh_intersect_ray = info->gfx_level >= GFX10_3 || info->family == CHIP_GFX1013;
 
-   /* On newer chips, it is not necessary for NGG shaders to request
-    * the allocation of GS space in passthrough mode, when they set
-    * PRIMGEN_PASSTHRU_NO_MSG.
-    */
    out->has_ngg_passthru_no_msg = info->family >= CHIP_NAVI23;
 
    out->local_invocation_ids_packed =
@@ -383,68 +383,31 @@ ac_fill_compiler_info(struct radeon_info *info, const struct drm_amdgpu_info_dev
    out->has_3d_cube_border_color_mipmap = info->has_graphics || info->family == CHIP_MI100;
 
    out->conformant_trunc_coord = device_info &&
-                                 device_info->ids_flags & AMDGPU_IDS_FLAGS_CONFORMANT_TRUNC_COORD;
+                                 (device_info->ids_flags & AMDGPU_IDS_FLAGS_CONFORMANT_TRUNC_COORD);
 
    out->has_attr_ring = info->gfx_level >= GFX11;
-
-   /* When distributed tessellation is unsupported, switch between SEs
-    * at a higher frequency to manually balance the workload between SEs.
-    */
    out->smaller_tcs_workgroups = !info->has_distributed_tess && info->max_se > 1;
 
    out->has_gfx6_mrt_export_bug =
       info->family == CHIP_TAHITI || info->family == CHIP_PITCAIRN || info->family == CHIP_VERDE;
    out->has_vtx_format_alpha_adjust_bug = info->gfx_level <= GFX8 && info->family != CHIP_STONEY;
 
-   /* On GFX6-7, SMEM instructions access memory when num_records == 0 or offset >= num_records,
-    * which causes VM faults when reading a page that isn't mapped. To prevent the VM faults:
-    * - Use a mapped VA instead of zeroes for null descriptors
-    * - Make sure the offset stays within mapped VA ranges
-    */
    out->has_smem_oob_access_bug = info->gfx_level <= GFX7;
 
-   /* Whether chips are affected by the image load/sample/gather hw bug when
-    * DCC is enabled (ie. WRITE_COMPRESS_ENABLE should be 0).
-    */
    out->has_image_load_dcc_bug =
       info->family == CHIP_NAVI23 || info->family == CHIP_VANGOGH || info->family == CHIP_REMBRANDT;
 
    out->has_ls_vgpr_init_bug = info->family == CHIP_VEGA10 || info->family == CHIP_RAVEN;
 
-   /* On GFX6 and GFX7 except Hawaii, the CB doesn't clamp outputs
-    * to the range supported by the type if a channel has less
-    * than 16 bits and the export format is 16_ABGR.
-    * See waCbNoLt16BitIntClamp in PAL.
-    */
    out->has_cb_lt16bit_int_clamp_bug = info->gfx_level <= GFX7 && info->family != CHIP_HAWAII;
 
    out->has_vrs_frag_pos_z_bug =
       info->family == CHIP_NAVI21 || info->family == CHIP_NAVI22 || info->family == CHIP_VANGOGH;
 
-   /* Some GFX10 chips can hang when NGG exports zero vertices and primitives.
-    * The workaround is to always export a single degenerate triangle.
-    */
    out->has_ngg_fully_culled_bug = info->gfx_level == GFX10;
-
-   /* The hw starts culling after all exports are finished,
-    * not when all waves in an NGG workgroup are finished,
-    * and if all primitives are culled, the hw deallocates the attribute ring
-    * for the NGG workgroup and reuses it for next one while the previous NGG
-    * workgroup might still be issuing attribute stores.
-    * When there are 2 NGG workgroups in the system with the same attribute ring address,
-    * attributes may be corrupted.
-    * The workaround is to issue and wait for attribute stores before the last export.
-    */
    out->has_attr_ring_wait_bug = info->gfx_level >= GFX11 && info->gfx_level < GFX12;
-
    out->has_primid_instancing_bug = info->gfx_level == GFX6 && info->max_se == 1;
 
-   /* HW bug workaround when CS threadgroups > 256 threads and async compute
-    * isn't used, i.e. only one compute job can run at a time.  If async
-    * compute is possible, the threadgroup size must be limited to 256 threads
-    * on all queues to avoid the bug.
-    * Only GFX6 and certain GFX7 chips are affected.
-    */
    out->has_cs_regalloc_hang_bug = info->gfx_level == GFX6 ||
                                    info->family == CHIP_BONAIRE ||
                                    info->family == CHIP_KABINI;
@@ -1267,7 +1230,7 @@ void ac_fill_hw_info(struct radeon_info *info, const struct drm_amdgpu_info_devi
       /* With num_cu = 4 in gfx11 measured power for idle, video playback and observed
        * power savings, hence enable dcc with retile for gfx11 with num_cu >= 4.
        */
-       info->use_display_dcc_with_retile_blit = info->num_cu >= 4;
+      info->use_display_dcc_with_retile_blit = info->num_cu >= 4;
    } else if (info->gfx_level == GFX10_3) {
       /* Displayable DCC with retiling is known to increase power consumption on Raphael
        * and Mendocino, so disable it on the smallest APUs. We need a proof that
@@ -1598,9 +1561,8 @@ ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
          if (r) {
             fprintf(stderr, "amdgpu: ac_drm_query_firmware_version(vce) failed.\n");
             return AC_QUERY_GPU_INFO_FAIL;
-         } else {
+         } else
             info->vce_fw_version = vidip_fw_version;
-         }
       }
 
       if (info->ip[AMD_IP_UVD].num_queues) {
@@ -1608,9 +1570,8 @@ ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
          if (r) {
             fprintf(stderr, "amdgpu: ac_drm_query_firmware_version(uvd) failed.\n");
             return AC_QUERY_GPU_INFO_FAIL;
-         } else {
+         } else
             info->uvd_fw_version = vidip_fw_version;
-         }
       }
    }
 
@@ -1636,7 +1597,8 @@ ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    if (!ac_identify_chip(info, &device_info))
       return AC_QUERY_GPU_INFO_UNIMPLEMENTED_HW;
 
-   ac_set_marketing_name(info, ac_drm_get_marketing_name(dev));
+   snprintf(info->marketing_name, sizeof(info->marketing_name), "%s",
+            ac_drm_get_marketing_name(dev) ? ac_drm_get_marketing_name(dev) : "AMD Unknown");
 
    ac_fill_memory_info(info, &device_info, &meminfo);
 
@@ -1762,7 +1724,6 @@ ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
       info->fw_based_mcbp.csa_size = fw_info.gfx.csa_size;
       info->fw_based_mcbp.csa_alignment = fw_info.gfx.csa_alignment;
    }
-
    if (info->gfx_level >= GFX11 && (info->userq_ip_mask & (1 << AMD_IP_COMPUTE))) {
       struct drm_amdgpu_info_uq_metadata fw_info;
 
@@ -1775,7 +1736,6 @@ ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
       info->fw_based_mcbp.eop_size = fw_info.compute.eop_size;
       info->fw_based_mcbp.eop_alignment = fw_info.compute.eop_alignment;
    }
-
    if (info->gfx_level >= GFX11 && (info->userq_ip_mask & (1 << AMD_IP_SDMA))) {
       struct drm_amdgpu_info_uq_metadata fw_info;
 
