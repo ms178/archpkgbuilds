@@ -61,7 +61,7 @@ static mi_decl_forceinline void* mi_page_malloc_zero(mi_theap_t* theap, mi_page_
 
   #if MI_DEBUG>3
   if (page->free_is_zero && size > sizeof(*block)) {
-    mi_assert_expensive(mi_mem_is_zero(block+1,size - sizeof(*block)));
+    mi_assert_expensive(mi_mem_is_zero(block+1, size - sizeof(*block)));
   }
   #endif
 
@@ -105,8 +105,8 @@ static mi_decl_forceinline void* mi_page_malloc_zero(mi_theap_t* theap, mi_page_
     #if (MI_DEBUG>=2)
     mi_assert_internal(delta >= 0 && bsize >= (size - MI_PADDING_SIZE + delta));
     #endif
-    mi_track_mem_defined(padding,sizeof(mi_padding_t));
-    padding->canary = mi_ptr_encode_canary(page,block,page->keys);
+    mi_track_mem_defined(padding, sizeof(mi_padding_t));
+    padding->canary = mi_ptr_encode_canary(page, block, page->keys);
     padding->delta  = (uint32_t)(delta);
     #if MI_PADDING_CHECK
     if (!mi_page_is_huge(page)) {
@@ -152,7 +152,7 @@ static mi_decl_forceinline mi_decl_restrict void* mi_theap_malloc_small_zero_non
   const size_t req_size = size + MI_PADDING_SIZE;
   mi_page_t* page = _mi_theap_get_free_small_page(theap, req_size);
   void* const p = mi_page_malloc_zero(theap, page, req_size, zero, usable);
-  mi_track_malloc(p,size,zero);
+  mi_track_malloc(p, size, zero);
 
   #if MI_DEBUG>3
   if (p != NULL && zero) {
@@ -379,13 +379,10 @@ void* _mi_theap_realloc_zero(mi_theap_t* theap, void* p, size_t newsize, bool ze
     size = _mi_usable_size(p,page);
     if (usable_pre!=NULL) { *usable_pre = mi_page_usable_block_size(page); }
   }
-  if mi_unlikely(newsize<=size && newsize>=(size/2) && newsize>0  // note: newsize must be > 0 or otherwise we return NULL for realloc(NULL,0)
-                  && mi_page_heap(page)==_mi_theap_heap(theap))             // and within the same heap
+  if mi_unlikely(newsize<=size && newsize>=(size/2) && newsize>0
+                  && mi_page_heap(page)==_mi_theap_heap(theap))
   {
     mi_assert_internal(p!=NULL);
-    // todo: do not track as the usable size is still the same in the free; adjust potential padding?
-    // mi_track_resize(p,size,newsize)
-    // if (newsize < size) { mi_track_mem_noaccess((uint8_t*)p + newsize, size - newsize); }
     if (usable_post!=NULL) { *usable_post = mi_page_usable_block_size(page); }
     return p;  // reallocation still fits and not more than 50% waste
   }
@@ -407,7 +404,7 @@ void* _mi_theap_realloc_zero(mi_theap_t* theap, void* p, size_t newsize, bool ze
       }
       mi_track_mem_defined(p,copysize);  // _mi_useable_size may be too large for byte precise memory tracking..
       _mi_memcpy(newp, p, copysize);
-      mi_free(p); // only free the original pointer if successful  // todo: optimize since page is known?
+      mi_free(p); // only free the original pointer if successful
     }
   }
   return newp;
@@ -498,8 +495,9 @@ mi_decl_nodiscard void* mi_heap_recalloc(mi_heap_t* heap, void* p, size_t count,
 // `strdup` using mi_malloc
 mi_decl_nodiscard static mi_decl_restrict char* mi_theap_strdup(mi_theap_t* theap, const char* s) mi_attr_noexcept {
   if (s == NULL) return NULL;
-  size_t len = _mi_strlen(s);
-  char* t = (char*)mi_theap_malloc(theap,len+1);
+  const size_t len = _mi_strlen(s);
+  if (len > MI_MAX_ALLOC_SIZE - 1) return NULL;  // prevent overflow on len+1
+  char* t = (char*)mi_theap_malloc(theap, len + 1);
   if (t == NULL) return NULL;
   _mi_memcpy(t, s, len);
   t[len] = 0;
@@ -517,8 +515,9 @@ mi_decl_nodiscard mi_decl_restrict char* mi_heap_strdup(mi_heap_t* heap, const c
 // `strndup` using mi_malloc
 mi_decl_nodiscard static mi_decl_restrict char* mi_theap_strndup(mi_theap_t* theap, const char* s, size_t n) mi_attr_noexcept {
   if (s == NULL) return NULL;
-  const size_t len = _mi_strnlen(s,n);  // len <= n
-  char* t = (char*)mi_theap_malloc(theap, len+1);
+  const size_t len = _mi_strnlen(s, n);  // len <= n
+  if (len > MI_MAX_ALLOC_SIZE - 1) return NULL;  // prevent overflow on len+1
+  char* t = (char*)mi_theap_malloc(theap, len + 1);
   if (t == NULL) return NULL;
   _mi_memcpy(t, s, len);
   t[len] = 0;
@@ -558,16 +557,41 @@ mi_decl_nodiscard static mi_decl_restrict char* mi_theap_realpath(mi_theap_t* th
   }
 }
 #else
+
+#include <unistd.h>  // pathconf
+
+static size_t mi_path_max(void) {
+  static _Atomic(size_t) path_max = 0;
+  size_t pmax = mi_atomic_load_acquire(&path_max);
+  if (pmax == 0) {
+    long m = 0;
+    #ifdef _PC_PATH_MAX
+    m = pathconf("/", _PC_PATH_MAX);
+    #endif
+    if (m <= 0) pmax = 4096;              // guess
+    else if (m < 256) pmax = 256;         // at least 256
+    else if (m > 64L*1024L) pmax = 64*1024; // at most 64 KiB
+    else pmax = (size_t)m;
+    size_t expected = 0;
+    mi_atomic_cas_strong_acq_rel(&path_max, &expected, pmax);
+  }
+  return pmax;
+}
+
 char* mi_theap_realpath(mi_theap_t* theap, const char* fname, char* resolved_name) mi_attr_noexcept {
   if (resolved_name != NULL) {
-    return realpath(fname,resolved_name);
+    return realpath(fname, resolved_name);
   }
   else {
-    char* rname = realpath(fname, NULL);
-    if (rname == NULL) return NULL;
-    char* result = mi_theap_strdup(theap, rname);
-    mi_cfree(rname);  // use checked free (which may be redirected to our free but that's ok)
-    // note: with ASAN realpath is intercepted and mi_cfree may leak the returned pointer :-(
+    const size_t n = mi_path_max();
+    char* const buf = (char*)mi_zalloc(n + 1);
+    if (buf == NULL) {
+      errno = ENOMEM;
+      return NULL;
+    }
+    char* const rname = realpath(fname, buf);
+    char* const result = mi_theap_strndup(theap, rname, n); // ok if `rname==NULL`
+    mi_free(buf);
     return result;
   }
 }
@@ -798,30 +822,34 @@ mi_decl_restrict void* _mi_theap_malloc_guarded(mi_theap_t* theap, size_t size, 
 {
   // allocate multiple of page size ending in a guard page
   // ensure minimal alignment requirement?
+  if mi_unlikely(size >= MI_MAX_ALLOC_SIZE - MI_PADDING_SIZE) {
+    _mi_error_message(EOVERFLOW, "(guarded) allocation request is too large (%zu bytes)\n", size);
+    return NULL;
+  }
   const size_t os_page_size = _mi_os_page_size();
   const size_t obj_size = (mi_option_is_enabled(mi_option_guarded_precise) ? size : _mi_align_up(size, MI_MAX_ALIGN_SIZE));
   const size_t bsize    = _mi_align_up(_mi_align_up(obj_size, MI_MAX_ALIGN_SIZE) + sizeof(mi_block_t), MI_MAX_ALIGN_SIZE);
   const size_t req_size = _mi_align_up(bsize + os_page_size, os_page_size);
   mi_block_t* const block = (mi_block_t*)_mi_malloc_generic(theap, req_size, 0 /* don't zero */, NULL);
-  if (block==NULL) return NULL;
+  if (block == NULL) return NULL;
   void* const p = mi_block_ptr_set_guarded(block, obj_size);
-  if (p != NULL && zero) {
-    _mi_memzero_aligned(p,obj_size);  // we have to zero here as padding might have written here (if the blocksize > reqsize + os_page_size)
+  if (p == NULL) return NULL;
+
+  if (zero) {
+    _mi_memzero_aligned(p, obj_size);  // we have to zero here as padding might have written here
   }
 
   // stats
   mi_track_malloc(p, obj_size, zero);
-  if (p != NULL) {
-    if (!mi_theap_is_initialized(theap)) { theap = _mi_theap_default(); }
-    #if MI_STAT>1
-    // adjust stats to only count the allocated size of the block (and not the guard page)
-    mi_theap_stat_adjust_decrease(theap, malloc_requested, req_size);
-    mi_theap_stat_increase(theap, malloc_requested, size);
-    #endif
-    mi_theap_stat_counter_increase(theap, malloc_guarded_count, 1);
-  }
+  if (!mi_theap_is_initialized(theap)) { theap = _mi_theap_default(); }
+  mi_theap_stat_counter_increase(theap, malloc_guarded_count, 1);
+  #if MI_STAT>1
+  // adjust stats to only count the allocated size of the block (and not the guard page)
+  mi_theap_stat_adjust_decrease(theap, malloc_requested, req_size);
+  mi_theap_stat_increase(theap, malloc_requested, size);
+  #endif
   #if MI_DEBUG>3
-  if (p != NULL && zero) {
+  if (zero) {
     mi_assert_expensive(mi_mem_is_zero(p, obj_size));
   }
   #endif
