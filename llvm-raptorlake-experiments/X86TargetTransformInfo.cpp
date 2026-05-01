@@ -502,29 +502,29 @@ InstructionCost X86TTIImpl::getArithmeticInstrCost(
         ISD == ISD::SREM || ISD == ISD::UREM) {
 
       const MVT &VT = LT.second;
-      unsigned BaseThroughput = 0;
+      InstructionCost BaseCost = 0;   // ← changed to InstructionCost
 
-      // 32-bit vectors (most common and highest impact on Raptor Lake)
+      // 32-bit vectors (highest impact)
       if (VT == MVT::v4i32 || VT == MVT::v8i32 || VT == MVT::v16i32 ||
           (VT.isVector() && VT.getScalarType() == MVT::i32))
-        BaseThroughput = 11;   // reduced from upstream ~15
+        BaseCost = 11;   // reduced from upstream ~15
 
       // 64-bit vectors
       else if (VT == MVT::v2i64 || VT == MVT::v4i64 || VT == MVT::v8i64 ||
                (VT.isVector() && VT.getScalarType() == MVT::i64))
-        BaseThroughput = 13;   // reduced from upstream ~18
+        BaseCost = 13;   // reduced from upstream ~18
 
-      if (BaseThroughput != 0) {
-        unsigned Cost = LT.first * BaseThroughput;
+      if (BaseCost != 0) {
+        InstructionCost Cost = LT.first * BaseCost;   // ← fixed here
 
         switch (CostKind) {
         case TargetTransformInfo::TCK_RecipThroughput:
           return Cost;                     // primary vectorizer path
         case TargetTransformInfo::TCK_Latency:
         case TargetTransformInfo::TCK_SizeAndLatency:
-          return Cost + 2;                 // realistic data-dependency penalty on RL
+          return Cost + 2;                 // realistic data-dependency on RL
         case TargetTransformInfo::TCK_CodeSize:
-          return LT.first * 1;             // div is always a single instruction
+          return LT.first * 1;             // single instruction
         }
       }
     }
@@ -7262,11 +7262,13 @@ bool X86TTIImpl::isVectorShiftByScalarCheap(Type *Ty) const {
 }
 
 unsigned X86TTIImpl::getStoreMinimumVF(unsigned VF, Type *ScalarMemTy,
-                                       Type *ScalarValTy) const {
+                                       Type *ScalarValTy, Align Alignment,
+                                       unsigned AddrSpace) const {
   if (ST->hasF16C() && ScalarMemTy->isHalfTy()) {
     return 4;
   }
-  return BaseT::getStoreMinimumVF(VF, ScalarMemTy, ScalarValTy);
+  return BaseT::getStoreMinimumVF(VF, ScalarMemTy, ScalarValTy, Alignment,
+                                  AddrSpace);
 }
 
 bool X86TTIImpl::isProfitableToSinkOperands(Instruction *I,
