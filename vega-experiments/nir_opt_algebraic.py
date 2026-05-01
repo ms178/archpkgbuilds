@@ -114,6 +114,8 @@ optimizations = [
     (('fequ', 0.0, a), ('inot', ('flt', 0.0, ('fabs', a)))),
 
     (('imul', a, '#b(is_pos_power_of_two)'), ('ishl', a, ('find_lsb', b)), '!options->lower_bitops'),
+    (('imul24_relaxed', a, '#b(is_pos_power_of_two)'), ('ishl', a, ('find_lsb', b)), '!options->lower_bitops'),
+    (('umul24_relaxed', a, '#b(is_pos_power_of_two)'), ('ishl', a, ('find_lsb', b)), '!options->lower_bitops'),
     (('imul', 'a@8', 0x80), ('ishl', a, 7), '!options->lower_bitops'),
     (('imul', 'a@16', 0x8000), ('ishl', a, 15), '!options->lower_bitops'),
     (('imul', 'a@32', 0x80000000), ('ishl', a, 31), '!options->lower_bitops'),
@@ -154,6 +156,8 @@ for op in ['idiv', 'udiv', 'umod', 'umod', 'irem']:
 
 optimizations += [
     (('fmul', ('fsign', a), ('ffloor', ('fadd', ('fabs', a), 0.5))), ('ftrunc', ('fadd', a, ('fmul', ('fsign', a), 0.5))), '!options->lower_ftrunc || options->lower_ffloor'),
+
+    (('fmul_rtz@32', a, b), ('fmul', a, b), 'nir_is_rounding_mode_rtz(info->float_controls_execution_mode, 32)'),
 
     (('fneg', ('fneg', a)), ('fcanonicalize', a)),
     (('ineg', ('ineg', a)), a),
@@ -225,12 +229,17 @@ optimizations += [
     (('ffmaz', a, a, b), ('ffma', a, a, b)),
 
     (('imul', a, 0), 0),
+    (('imul24_relaxed', a, 0), 0),
+    (('umul24_relaxed', a, 0), 0),
     (('umul_unorm_4x8_vc4', a, 0), 0),
     (('umul_unorm_4x8_vc4', a, ~0), a),
     (('fmul', a, 1.0), ('fcanonicalize', a)),
     (('imul', a, 1), a),
+    (('imul24_relaxed', a, 1), a),
+    (('umul24_relaxed', a, 1), a),
     (('fmul', a, -1.0), ('fneg', a)),
     (('imul', a, -1), ('ineg', a)),
+    (('imul24_relaxed', a, -1), ('ineg', a)),
 
     (('fmul', ('fsign', a), ('fmul', a, a)), ('fmul', ('fabs', a), a)),
     (('fmul', ('fmul', ('fsign', a), a), a), ('fmul', ('fabs', a), a)),
@@ -327,22 +336,22 @@ for sz in (16, 32, 64):
         (('ior(is_only_used_as_float)', f'a@{sz}', sign_bit), ('fneg', ('fabs', a))),
     ])
 
-sdot_4x8_a_b = ('iadd', ('iadd', ('imul', ('extract_i8', a, 0), ('extract_i8', b, 0)),
-                                 ('imul', ('extract_i8', a, 1), ('extract_i8', b, 1))),
-                        ('iadd', ('imul', ('extract_i8', a, 2), ('extract_i8', b, 2)),
-                                 ('imul', ('extract_i8', a, 3), ('extract_i8', b, 3))))
-udot_4x8_a_b = ('iadd', ('iadd', ('imul', ('extract_u8', a, 0), ('extract_u8', b, 0)),
-                                 ('imul', ('extract_u8', a, 1), ('extract_u8', b, 1))),
-                        ('iadd', ('imul', ('extract_u8', a, 2), ('extract_u8', b, 2)),
-                                 ('imul', ('extract_u8', a, 3), ('extract_u8', b, 3))))
-sudot_4x8_a_b = ('iadd', ('iadd', ('imul', ('extract_i8', a, 0), ('extract_u8', b, 0)),
-                                  ('imul', ('extract_i8', a, 1), ('extract_u8', b, 1))),
-                         ('iadd', ('imul', ('extract_i8', a, 2), ('extract_u8', b, 2)),
-                                  ('imul', ('extract_i8', a, 3), ('extract_u8', b, 3))))
-sdot_2x16_a_b = ('iadd', ('imul', ('extract_i16', a, 0), ('extract_i16', b, 0)),
-                         ('imul', ('extract_i16', a, 1), ('extract_i16', b, 1)))
-udot_2x16_a_b = ('iadd', ('imul', ('extract_u16', a, 0), ('extract_u16', b, 0)),
-                         ('imul', ('extract_u16', a, 1), ('extract_u16', b, 1)))
+sdot_4x8_a_b = ('iadd', ('iadd', ('imul24_relaxed', ('extract_i8', a, 0), ('extract_i8', b, 0)),
+                                 ('imul24_relaxed', ('extract_i8', a, 1), ('extract_i8', b, 1))),
+                        ('iadd', ('imul24_relaxed', ('extract_i8', a, 2), ('extract_i8', b, 2)),
+                                 ('imul24_relaxed', ('extract_i8', a, 3), ('extract_i8', b, 3))))
+udot_4x8_a_b = ('iadd', ('iadd', ('umul24_relaxed', ('extract_u8', a, 0), ('extract_u8', b, 0)),
+                                 ('umul24_relaxed', ('extract_u8', a, 1), ('extract_u8', b, 1))),
+                        ('iadd', ('umul24_relaxed', ('extract_u8', a, 2), ('extract_u8', b, 2)),
+                                 ('umul24_relaxed', ('extract_u8', a, 3), ('extract_u8', b, 3))))
+sudot_4x8_a_b = ('iadd', ('iadd', ('imul24_relaxed', ('extract_i8', a, 0), ('extract_u8', b, 0)),
+                                  ('imul24_relaxed', ('extract_i8', a, 1), ('extract_u8', b, 1))),
+                         ('iadd', ('imul24_relaxed', ('extract_i8', a, 2), ('extract_u8', b, 2)),
+                                  ('imul24_relaxed', ('extract_i8', a, 3), ('extract_u8', b, 3))))
+sdot_2x16_a_b = ('iadd', ('imul24_relaxed', ('extract_i16', a, 0), ('extract_i16', b, 0)),
+                         ('imul24_relaxed', ('extract_i16', a, 1), ('extract_i16', b, 1)))
+udot_2x16_a_b = ('iadd', ('umul24_relaxed', ('extract_u16', a, 0), ('extract_u16', b, 0)),
+                         ('umul24_relaxed', ('extract_u16', a, 1), ('extract_u16', b, 1)))
 
 optimizations.extend([
     (('sdot_4x8_iadd', a, b, c), ('iadd', sdot_4x8_a_b, c), '!options->has_sdot_4x8'),
@@ -665,6 +674,8 @@ optimizations.extend([
    (('bcsel(is_only_used_as_float_nsz)', ('fneu', a, 0.0), a, -0.0), a),
    (('bcsel', ('feq', a, 0), 0, ('fsat', ('fmul', a, 'b(is_a_number)'))), ('fsat(preserve_sz)', ('fmul', a, b))),
    (('bcsel', ('fneu', a, 0), ('fsat', ('fmul', a, 'b(is_a_number)')), 0), ('fsat(preserve_sz)', ('fmul', a, b))),
+   (('bcsel', ('feq', a, 0), 0, ('fsat', ('fmul_rtz', a, 'b(is_a_number)'))), ('fsat(preserve_sz)', ('fmul_rtz', a, b))),
+   (('bcsel', ('fneu', a, 0), ('fsat', ('fmul_rtz', a, 'b(is_a_number)')), 0), ('fsat(preserve_sz)', ('fmul_rtz', a, b))),
    (('bcsel', ('feq', a, 0), b, ('fadd', a, 'b(is_not_zero)')), ('fadd', a, b)),
    (('bcsel', ('fneu', a, 0), ('fadd', a, 'b(is_not_zero)'), b), ('fadd', a, b)),
 
@@ -943,9 +954,10 @@ optimizations.extend([
 
    (('fsat', ('fneg(is_used_once)', ('fadd(is_used_once)', a, b))), ('fsat', ('fadd', ('fneg', a), ('fneg', b))), '!options->lower_fsat'),
    (('fsat', ('fneg(is_used_once)', ('fmul(is_used_once)', a, b))), ('fsat', ('fmul', ('fneg', a), b)), '!options->lower_fsat'),
+   (('fsat', ('fneg(is_used_once)', ('fmul_rtz(is_used_once)', a, b))), ('fsat', ('fmul_rtz', ('fneg', a), b)), '!options->lower_fsat'),
    (('fsat(nsz)', ('fneg(is_used_once)', ('fmulz(is_used_once)', a, b))), ('fsat', ('fmulz', ('fneg', a), b)), '!options->lower_fsat'),
    (('fsat', ('fabs(is_used_once)', ('fmul(is_used_once)', a, b))), ('fsat', ('fmul', ('fabs', a), ('fabs', b))), '!options->lower_fsat'),
-
+   (('fsat', ('fabs(is_used_once)', ('fmul_rtz(is_used_once)', a, b))), ('fsat', ('fmul_rtz', ('fabs', a), ('fabs', b))), '!options->lower_fsat'),
    (('fmin', ('fmax', ('fmin', ('fmax', a, b), c), b), c), ('fmin', ('fmax', a, b), c)),
    (('imin', ('imax', ('imin', ('imax', a, b), c), b), c), ('imin', ('imax', a, b), c)),
    (('umin', ('umax', ('umin', ('umax', a, b), c), b), c), ('umin', ('umax', a, b), c)),
@@ -1846,6 +1858,9 @@ optimizations.extend([
    (('f2i32', ('f2fmp', 'a@32')), ('f2i32', a), 'true', TestStatus.UNSUPPORTED),
    (('f2u32', ('f2fmp', 'a@32')), ('f2u32', a), 'true', TestStatus.UNSUPPORTED),
    (('i2f32', ('i2imp', 'a@32')), ('i2f32', a), 'true', TestStatus.UNSUPPORTED),
+
+   (('f2fmp', ('fmul(is_used_once,contract)', ('f2f32', 'a@16'), '#b(is_representable_as_f16)')), ('fmul', a, ('f2fmp', b)), 'true', TestStatus.UNSUPPORTED),
+   (('f2fmp', ('fadd(is_used_once,contract)', ('f2f32', 'a@16'), '#b(is_representable_as_f16)')), ('fadd', a, ('f2fmp', b)), 'true', TestStatus.UNSUPPORTED),
 
    (('ffloor', 'a(is_integral)'), a),
    (('fceil', 'a(is_integral)'), a),
@@ -3975,7 +3990,9 @@ distribute_src_mods = [
     (('fneg(is_only_used_as_float)', ('fneg', a)), a),
 
     (('fneg', ('fmul(is_used_once)', a, b)), ('fmul', ('fneg', a), b)),
+    (('fneg', ('fmul_rtz(is_used_once)', a, b)), ('fmul_rtz', ('fneg', a), b)),
     (('fabs', ('fmul(is_used_once)', a, b)), ('fmul', ('fabs', a), ('fabs', b))),
+    (('fabs', ('fmul_rtz(is_used_once)', a, b)), ('fmul_rtz', ('fabs', a), ('fabs', b))),
 
     (('fneg', ('ffma(is_used_once,nsz)', a, b, c)), ('ffma', ('fneg', a), b, ('fneg', c))),
     (('fneg', ('flrp(is_used_once)', a, b, c)), ('flrp', ('fneg', a), ('fneg', b), c), 'true', TestStatus.XFAIL),
