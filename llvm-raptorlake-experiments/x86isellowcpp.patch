@@ -1,3 +1,272 @@
+--- a/llvm/lib/Target/X86/X86ISelDAGToDAG.cpp	2026-05-02 15:05:18.588255013 +0200
++++ b/llvm/lib/Target/X86/X86ISelDAGToDAG.cpp	2026-05-02 15:47:13.633368254 +0200
+@@ -4264,23 +4264,12 @@ bool X86DAGToDAGISel::matchBitExtract(SD
+ // See if this is an (X >> C1) & C2 that we can match to BEXTR/BEXTRI.
+ MachineSDNode *X86DAGToDAGISel::matchBEXTRFromAndImm(SDNode *Node) {
+   MVT NVT = Node->getSimpleValueType(0);
+-  SDLoc dl(Node);
++  SDLoc DL(Node);
+ 
+   SDValue N0 = Node->getOperand(0);
+   SDValue N1 = Node->getOperand(1);
+ 
+-  // If we have TBM we can use an immediate for the control. If we have BMI
+-  // we should only do this if the BEXTR instruction is implemented well.
+-  // Otherwise moving the control into a register makes this more costly.
+-  // TODO: Maybe load folding, greater than 32-bit masks, or a guarantee of LICM
+-  // hoisting the move immediate would make it worthwhile with a less optimal
+-  // BEXTR?
+-  bool PreferBEXTR =
+-      Subtarget->hasTBM() || (Subtarget->hasBMI() && Subtarget->hasFastBEXTR());
+-  if (!PreferBEXTR && !Subtarget->hasBMI2())
+-    return nullptr;
+-
+-  // Must have a shift right.
++  // Must have a right shift.
+   if (N0->getOpcode() != ISD::SRL && N0->getOpcode() != ISD::SRA)
+     return nullptr;
+ 
+@@ -4288,7 +4277,7 @@ MachineSDNode *X86DAGToDAGISel::matchBEX
+   if (!N0->hasOneUse())
+     return nullptr;
+ 
+-  // Only supported for 32 and 64 bits.
++  // Only supported for 32-bit and 64-bit integer scalars.
+   if (NVT != MVT::i32 && NVT != MVT::i64)
+     return nullptr;
+ 
+@@ -4298,7 +4287,7 @@ MachineSDNode *X86DAGToDAGISel::matchBEX
+   if (!MaskCst || !ShiftCst)
+     return nullptr;
+ 
+-  // And RHS must be a mask.
++  // And RHS must be a contiguous low-bit mask.
+   uint64_t Mask = MaskCst->getZExtValue();
+   if (!isMask_64(Mask))
+     return nullptr;
+@@ -4307,83 +4296,98 @@ MachineSDNode *X86DAGToDAGISel::matchBEX
+   uint64_t MaskSize = llvm::popcount(Mask);
+ 
+   // Don't interfere with something that can be handled by extracting AH.
+-  // TODO: If we are able to fold a load, BEXTR might still be better than AH.
+   if (Shift == 8 && MaskSize == 8)
+     return nullptr;
+ 
+-  // Make sure we are only using bits that were in the original value, not
+-  // shifted in.
++  // Make sure we only use bits from the original value, not shifted-in bits.
+   if (Shift + MaskSize > NVT.getSizeInBits())
+     return nullptr;
+ 
+-  // BZHI, if available, is always fast, unlike BEXTR. But even if we decide
+-  // that we can't use BEXTR, it is only worthwhile using BZHI if the mask
+-  // does not fit into 32 bits. Load folding is not a sufficient reason.
+-  if (!PreferBEXTR && MaskSize <= 32)
++  SDValue Input = N0->getOperand(0);
++
++  // Probe load-folding once. This lets us make a better choice for slow-BEXTR
++  // targets and avoid repeating tryFoldLoad.
++  SDValue Tmp0, Tmp1, Tmp2, Tmp3, Tmp4;
++  bool FoldedLoad =
++      tryFoldLoad(Node, N0.getNode(), Input, Tmp0, Tmp1, Tmp2, Tmp3, Tmp4);
++
++  bool HasTBM = Subtarget->hasTBM();
++  bool HasBMI1 = Subtarget->hasBMI();
++  bool HasBMI2 = Subtarget->hasBMI2();
++
++  // Prefer native fast BEXTR where known fast.
++  bool PreferBEXTR = HasTBM || (HasBMI1 && Subtarget->hasFastBEXTR());
++
++  // Even when BEXTR isn't generally "fast", it can still be profitable when
++  // we can fold the load (rm form saves an instruction/register), or for
++  // wide extractions where BMI2 fallback would otherwise need BZHI+SHR.
++  bool UseSlowBEXTR = !PreferBEXTR && HasBMI1 && (FoldedLoad || MaskSize > 32);
++  bool UseBEXTR = PreferBEXTR || UseSlowBEXTR;
++
++  // If we don't use BEXTR, we need BMI2 for BZHI fallback.
++  if (!UseBEXTR && !HasBMI2)
++    return nullptr;
++
++  // BZHI fallback is only worthwhile for masks wider than 32 bits.
++  if (!UseBEXTR && MaskSize <= 32)
+     return nullptr;
+ 
+   SDValue Control;
+   unsigned ROpc, MOpc;
+ 
+ #define GET_EGPR_IF_ENABLED(OPC) (Subtarget->hasEGPR() ? OPC##_EVEX : OPC)
+-  if (!PreferBEXTR) {
+-    assert(Subtarget->hasBMI2() && "We must have BMI2's BZHI then.");
+-    // If we can't make use of BEXTR then we can't fuse shift+mask stages.
+-    // Let's perform the mask first, and apply shift later. Note that we need to
+-    // widen the mask to account for the fact that we'll apply shift afterwards!
+-    Control = CurDAG->getTargetConstant(Shift + MaskSize, dl, NVT);
++  if (!UseBEXTR) {
++    assert(HasBMI2 && "BMI2 is required for BZHI fallback");
++    // If we can't fuse shift+mask via BEXTR, perform mask first, then shift.
++    // The BZHI control is the number of low bits to keep before final SHR.
++    Control = CurDAG->getTargetConstant(Shift + MaskSize, DL, NVT);
+     ROpc = NVT == MVT::i64 ? GET_EGPR_IF_ENABLED(X86::BZHI64rr)
+                            : GET_EGPR_IF_ENABLED(X86::BZHI32rr);
+     MOpc = NVT == MVT::i64 ? GET_EGPR_IF_ENABLED(X86::BZHI64rm)
+                            : GET_EGPR_IF_ENABLED(X86::BZHI32rm);
+-    unsigned NewOpc = NVT == MVT::i64 ? X86::MOV32ri64 : X86::MOV32ri;
+-    Control = SDValue(CurDAG->getMachineNode(NewOpc, dl, NVT, Control), 0);
++    unsigned MovOpc = NVT == MVT::i64 ? X86::MOV32ri64 : X86::MOV32ri;
++    Control = SDValue(CurDAG->getMachineNode(MovOpc, DL, NVT, Control), 0);
+   } else {
+-    // The 'control' of BEXTR has the pattern of:
+-    // [15...8 bit][ 7...0 bit] location
+-    // [ bit count][     shift] name
+-    // I.e. 0b000000011'00000001 means  (x >> 0b1) & 0b11
+-    Control = CurDAG->getTargetConstant(Shift | (MaskSize << 8), dl, NVT);
+-    if (Subtarget->hasTBM()) {
++    // BEXTR control layout:
++    // bits [7:0]   = start position
++    // bits [15:8]  = length
++    Control = CurDAG->getTargetConstant(Shift | (MaskSize << 8), DL, NVT);
++
++    if (HasTBM) {
+       ROpc = NVT == MVT::i64 ? X86::BEXTRI64ri : X86::BEXTRI32ri;
+       MOpc = NVT == MVT::i64 ? X86::BEXTRI64mi : X86::BEXTRI32mi;
+     } else {
+-      assert(Subtarget->hasBMI() && "We must have BMI1's BEXTR then.");
+-      // BMI requires the immediate to placed in a register.
++      assert(HasBMI1 && "BMI1 is required for BEXTR");
+       ROpc = NVT == MVT::i64 ? GET_EGPR_IF_ENABLED(X86::BEXTR64rr)
+                              : GET_EGPR_IF_ENABLED(X86::BEXTR32rr);
+       MOpc = NVT == MVT::i64 ? GET_EGPR_IF_ENABLED(X86::BEXTR64rm)
+                              : GET_EGPR_IF_ENABLED(X86::BEXTR32rm);
+-      unsigned NewOpc = NVT == MVT::i64 ? X86::MOV32ri64 : X86::MOV32ri;
+-      Control = SDValue(CurDAG->getMachineNode(NewOpc, dl, NVT, Control), 0);
++      unsigned MovOpc = NVT == MVT::i64 ? X86::MOV32ri64 : X86::MOV32ri;
++      Control = SDValue(CurDAG->getMachineNode(MovOpc, DL, NVT, Control), 0);
+     }
+   }
+ 
+   MachineSDNode *NewNode;
+-  SDValue Input = N0->getOperand(0);
+-  SDValue Tmp0, Tmp1, Tmp2, Tmp3, Tmp4;
+-  if (tryFoldLoad(Node, N0.getNode(), Input, Tmp0, Tmp1, Tmp2, Tmp3, Tmp4)) {
+-    SDValue Ops[] = {
+-        Tmp0, Tmp1, Tmp2, Tmp3, Tmp4, Control, Input.getOperand(0)};
++  if (FoldedLoad) {
++    SDValue Ops[] = {Tmp0, Tmp1, Tmp2, Tmp3, Tmp4, Control, Input.getOperand(0)};
+     SDVTList VTs = CurDAG->getVTList(NVT, MVT::i32, MVT::Other);
+-    NewNode = CurDAG->getMachineNode(MOpc, dl, VTs, Ops);
+-    // Update the chain.
++    NewNode = CurDAG->getMachineNode(MOpc, DL, VTs, Ops);
+     ReplaceUses(Input.getValue(1), SDValue(NewNode, 2));
+-    // Record the mem-refs
+     CurDAG->setNodeMemRefs(NewNode, {cast<LoadSDNode>(Input)->getMemOperand()});
+   } else {
+-    NewNode = CurDAG->getMachineNode(ROpc, dl, NVT, MVT::i32, Input, Control);
++    NewNode = CurDAG->getMachineNode(ROpc, DL, NVT, MVT::i32, Input, Control);
+   }
+ 
+-  if (!PreferBEXTR) {
+-    // We still need to apply the shift.
+-    SDValue ShAmt = CurDAG->getTargetConstant(Shift, dl, NVT);
+-    unsigned NewOpc = NVT == MVT::i64 ? GET_ND_IF_ENABLED(X86::SHR64ri)
++  if (!UseBEXTR) {
++    // Complete BZHI fallback: final right shift by the original shift amount.
++    SDValue ShAmt = CurDAG->getTargetConstant(Shift, DL, NVT);
++    unsigned ShrOpc = NVT == MVT::i64 ? GET_ND_IF_ENABLED(X86::SHR64ri)
+                                       : GET_ND_IF_ENABLED(X86::SHR32ri);
+     NewNode =
+-        CurDAG->getMachineNode(NewOpc, dl, NVT, SDValue(NewNode, 0), ShAmt);
++        CurDAG->getMachineNode(ShrOpc, DL, NVT, SDValue(NewNode, 0), ShAmt);
+   }
+ 
++#undef GET_EGPR_IF_ENABLED
+   return NewNode;
+ }
+ 
+@@ -5302,6 +5306,8 @@ void X86DAGToDAGISel::Select(SDNode *Nod
+   unsigned Opcode = Node->getOpcode();
+   SDLoc dl(Node);
+ 
++#define GET_EGPR_IF_ENABLED(OPC) (Subtarget->hasEGPR() ? OPC##_EVEX : OPC)
++
+   if (Node->isMachineOpcode()) {
+     LLVM_DEBUG(dbgs() << "== "; Node->dump(CurDAG); dbgs() << '\n');
+     Node->setNodeId(-1);
+@@ -5579,7 +5585,56 @@ void X86DAGToDAGISel::Select(SDNode *Nod
+       return;
+     break;
+ 
+-  case ISD::AND:
++case ISD::AND: {
++    // BMI1 ANDN: (and X, (xor Y, -1)) -> andn Y, X   (computes (~Y) & X)
++    // Match both XOR operand orders and preserve load-folding opportunity.
++    if (Subtarget->hasBMI() && (NVT == MVT::i32 || NVT == MVT::i64)) {
++      auto MatchBitwiseNot = [&](SDValue V, SDValue &Src) -> bool {
++        if (V.getOpcode() != ISD::XOR || V.getValueType() != NVT)
++          return false;
++        if (isAllOnesConstant(V.getOperand(0))) {
++          Src = V.getOperand(1);
++          return true;
++        }
++        if (isAllOnesConstant(V.getOperand(1))) {
++          Src = V.getOperand(0);
++          return true;
++        }
++        return false;
++      };
++
++      SDValue Op0 = Node->getOperand(0);
++      SDValue Op1 = Node->getOperand(1);
++      SDValue X, Y;
++      if (MatchBitwiseNot(Op1, Y))
++        X = Op0;
++      else if (MatchBitwiseNot(Op0, Y))
++        X = Op1;
++
++      if (X.getNode() && Y.getNode()) {
++        unsigned ROpc = (NVT == MVT::i64) ? GET_EGPR_IF_ENABLED(X86::ANDN64rr)
++                                          : GET_EGPR_IF_ENABLED(X86::ANDN32rr);
++        unsigned MOpc = (NVT == MVT::i64) ? GET_EGPR_IF_ENABLED(X86::ANDN64rm)
++                                          : GET_EGPR_IF_ENABLED(X86::ANDN32rm);
++
++        SDValue Tmp0, Tmp1, Tmp2, Tmp3, Tmp4;
++        if (tryFoldLoad(Node, X, Tmp0, Tmp1, Tmp2, Tmp3, Tmp4)) {
++          SDValue Ops[] = {Y, Tmp0, Tmp1, Tmp2, Tmp3, Tmp4, X.getOperand(0)};
++          SDVTList VTs = CurDAG->getVTList(NVT, MVT::i32, MVT::Other);
++          MachineSDNode *CNode = CurDAG->getMachineNode(MOpc, dl, VTs, Ops);
++          ReplaceUses(X.getValue(1), SDValue(CNode, 2));
++          CurDAG->setNodeMemRefs(CNode, {cast<LoadSDNode>(X)->getMemOperand()});
++          ReplaceUses(SDValue(Node, 0), SDValue(CNode, 0));
++          CurDAG->RemoveDeadNode(Node);
++          return;
++        }
++
++        SDNode *AndN = CurDAG->getMachineNode(ROpc, dl, NVT, Y, X);
++        ReplaceNode(Node, AndN);
++        return;
++      }
++    }
++
+     if (NVT.isVector() && NVT.getVectorElementType() == MVT::i1) {
+       // Try to form a masked VPTESTM. Operands can be in either order.
+       SDValue N0 = Node->getOperand(0);
+@@ -5603,6 +5658,7 @@ void X86DAGToDAGISel::Select(SDNode *Nod
+       return;
+ 
+     [[fallthrough]];
++  }
+   case ISD::OR:
+   case ISD::XOR:
+     if (tryShrinkShlLogicImm(Node))
+@@ -6853,6 +6909,8 @@ void X86DAGToDAGISel::Select(SDNode *Nod
+   }
+ 
+   SelectCode(Node);
++
++#undef GET_EGPR_IF_ENABLED
+ }
+ 
+ bool X86DAGToDAGISel::SelectInlineAsmMemoryOperand(
+
 --- a/llvm/lib/Target/X86/X86ISelLowering.cpp	2025-08-02 20:50:59.772460740 +0200
 +++ b/llvm/lib/Target/X86/X86ISelLowering.cpp	2026-05-01 11:49:20.796623328 +0200
 @@ -70,7 +70,7 @@ using namespace llvm;
