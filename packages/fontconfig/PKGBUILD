@@ -61,8 +61,24 @@ _has_pytest_tap() {
   pytest --help 2>/dev/null | grep -q -- '--tap'
 }
 
+_pgo_profraw_count() {
+  local _dir="$1"
+  find "$_dir" -maxdepth 1 -type f -name '*.profraw' 2>/dev/null | wc -l
+}
+
+_pgo_profraw_bytes() {
+  local _dir="$1"
+  find "$_dir" -maxdepth 1 -type f -name '*.profraw' -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}'
+}
+
+_pgo_profraw_diag() {
+  local _label="$1"
+  local _dir="$2"
+  printf '  -> [PGO] %s: profraw files=%s bytes=%s dir=%s\n' \
+    "$_label" "$(_pgo_profraw_count "$_dir")" "$(_pgo_profraw_bytes "$_dir")" "$_dir"
+}
+
 _detect_toolchain() {
-  # Respect user-selected toolchain via CC/CXX/PATH.
   : "${CC:=clang}"
   : "${CXX:=clang++}"
   : "${AR:=llvm-ar}"
@@ -76,19 +92,19 @@ _detect_toolchain() {
   command -v "$RANLIB" >/dev/null || { error "RANLIB not found: $RANLIB"; return 1; }
 
   local _triple
-  _triple="$("$CC" -print-target-triple 2>/dev/null || true)"
+  _triple="$("$CC" -print-target-triple 2>/dev/null || "$CC" -dumpmachine 2>/dev/null || true)"
   [[ "$_triple" == *linux* ]] || {
     error "Active compiler target is not Linux: ${_triple:-unknown}"
     return 1
   }
 
-  msg2 "Using toolchain:"
-  msg2 "  CC=$(command -v "$CC")"
-  msg2 "  CXX=$(command -v "$CXX")"
+  printf '  -> [TOOLCHAIN] CC=%s\n' "$(command -v "$CC")"
+  printf '  -> [TOOLCHAIN] CXX=%s\n' "$(command -v "$CXX")"
 }
 
-_toolchain_supports_pgo_generate() {
-  local _tdir="$srcdir/.pgo-sanity"
+_toolchain_supports_flag() {
+  local _flag="$1"
+  local _tdir="$srcdir/.toolchain-sanity-${_flag//[^[:alnum:]]/_}"
   rm -rf "$_tdir"
   mkdir -p "$_tdir"
 
@@ -96,47 +112,32 @@ _toolchain_supports_pgo_generate() {
 int main(void) { return 0; }
 EOF
 
-  "$CC" ${CFLAGS} "$_tdir/sanity.c" -o "$_tdir/sanity" \
-    ${LDFLAGS} -fprofile-generate >/dev/null 2>&1
+  "$CC" "$_tdir/sanity.c" -o "$_tdir/sanity" ${LDFLAGS} "$_flag" >/dev/null 2>&1
 }
 
-# Comprehensive training workload to drive PGO without modifying host config.
 _training_workload() {
   local _builddir="$1"
   (
-    set -euo pipefail
+    set -eo pipefail
+    : "${QUIET:=}"
 
-    local _sysroot="${_builddir}/fc-sysroot"
+    local _workroot
+    _workroot="$(mktemp -d "${_builddir}/fc-train.XXXXXX")"
+    trap 'rm -rf "$_workroot"' EXIT
+
+    printf '  -> [PGO] custom workload: START builddir=%s workroot=%s\n' "$_builddir" "$_workroot"
+
+    local _sysroot="${_workroot}/sysroot"
     local _cachedir="${_sysroot}/var/cache/fontconfig"
-    mkdir -p "${_cachedir}" "${_sysroot}/etc/fonts"
+    local _etc_fonts="${_sysroot}/etc/fonts"
+    mkdir -p "$_cachedir" "$_etc_fonts"
 
-    if [[ -f /etc/fonts/fonts.conf ]]; then
-      install -m644 /etc/fonts/fonts.conf "${_sysroot}/etc/fonts/"
+    if [[ -d /etc/fonts ]]; then
+      cp -a /etc/fonts/. "$_etc_fonts/"
     fi
 
-    local d
-    for d in conf.d conf.avail; do
-      [[ -d "/etc/fonts/${d}" ]] && cp -a "/etc/fonts/${d}" "${_sysroot}/etc/fonts/" || true
-    done
-
-    export FONTCONFIG_SYSROOT="${_sysroot}"
-    export FONTCONFIG_CACHEDIR="${_cachedir}"
-    export XDG_CACHE_HOME="${_sysroot}/.cache"
-    export HOME="${_sysroot}"
-
-    _fc() { find "${_builddir}" -type f -executable -name "$1" -print -quit; }
-
-    local FC_CACHE FC_LIST FC_MATCH FC_SCAN FC_QUERY FC_PATTERN
-    FC_CACHE="$(_fc fc-cache || true)"
-    FC_LIST="$(_fc fc-list || true)"
-    FC_MATCH="$(_fc fc-match || true)"
-    FC_SCAN="$(_fc fc-scan || true)"
-    FC_QUERY="$(_fc fc-query || true)"
-    FC_PATTERN="$(_fc fc-pattern || true)"
-
-    [[ -z "${FC_CACHE}" || -z "${FC_LIST}" || -z "${FC_MATCH}" ]] && exit 0
-
     local -a font_dirs=()
+    local d
     for d in \
       /usr/share/fonts/TTF \
       /usr/share/fonts/OTF \
@@ -152,12 +153,56 @@ _training_workload() {
       [[ -d "$d" ]] && font_dirs+=("$d")
     done
 
-    (( ${#font_dirs[@]} > 0 )) && "${FC_CACHE}" -fsv "${font_dirs[@]}" || true
+    # Mirror host font dirs into SYSROOT paths so path-rewritten lookups work.
+    for d in "${font_dirs[@]}"; do
+      mkdir -p "${_sysroot}$(dirname "$d")"
+      ln -sfn "$d" "${_sysroot}${d}"
+    done
+
+    export FONTCONFIG_SYSROOT="${_sysroot}"
+    export FONTCONFIG_CACHEDIR="${_cachedir}"
+    export XDG_CACHE_HOME="${_workroot}/xdg-cache"
+    export HOME="${_workroot}/home"
+
+    if [[ -f "${_etc_fonts}/fonts.conf" ]]; then
+      export FONTCONFIG_FILE="${_etc_fonts}/fonts.conf"
+      export FONTCONFIG_PATH="${_etc_fonts}"
+    fi
+
+    _fc() { find "${_builddir}" -type f -executable -name "$1" -print -quit; }
+
+    local FC_CACHE FC_LIST FC_MATCH FC_SCAN FC_QUERY FC_PATTERN FC_CONFLIST FC_VALIDATE FC_CAT
+    FC_CACHE="$(_fc fc-cache || true)"
+    FC_LIST="$(_fc fc-list || true)"
+    FC_MATCH="$(_fc fc-match || true)"
+    FC_SCAN="$(_fc fc-scan || true)"
+    FC_QUERY="$(_fc fc-query || true)"
+    FC_PATTERN="$(_fc fc-pattern || true)"
+    FC_CONFLIST="$(_fc fc-conflist || true)"
+    FC_VALIDATE="$(_fc fc-validate || true)"
+    FC_CAT="$(_fc fc-cat || true)"
+
+    printf '  -> [PGO] custom tools: fc-cache=%s fc-list=%s fc-match=%s\n' \
+      "${FC_CACHE:-missing}" "${FC_LIST:-missing}" "${FC_MATCH:-missing}"
+
+    [[ -z "${FC_CACHE}" || -z "${FC_LIST}" || -z "${FC_MATCH}" ]] && {
+      printf '  -> [PGO] custom workload: required tools missing, skipping\n'
+      exit 0
+    }
+
+    find "${_cachedir}" -type f -name '*.cache-*' -delete 2>/dev/null || true
+    rm -f "${_cachedir}"/CACHEDIR.TAG 2>/dev/null || true
+
+    printf '  -> [PGO] custom workload: host font dirs=%s\n' "${#font_dirs[@]}"
+    # Keep workload but silence fc-cache validation noise in both PGO stages.
+    (( ${#font_dirs[@]} > 0 )) && "${FC_CACHE}" -sv "${font_dirs[@]}" >/dev/null 2>&1 || true
 
     local -a common_fonts=(
       "sans-serif" "serif" "monospace"
       "Arial" "Times New Roman" "Courier New"
-      "DejaVu Sans" "Liberation Mono" "Noto Sans"
+      "DejaVu Sans" "DejaVu Serif" "DejaVu Sans Mono"
+      "Liberation Sans" "Liberation Serif" "Liberation Mono"
+      "Noto Sans" "Noto Serif" "Noto Sans CJK SC"
       "Cantarell" "FreeSans" "FreeMono"
     )
 
@@ -167,45 +212,110 @@ _training_workload() {
       "${FC_MATCH}" "$font:bold" >/dev/null 2>&1 || true
       "${FC_MATCH}" "$font:italic" >/dev/null 2>&1 || true
       "${FC_MATCH}" "$font:weight=200" >/dev/null 2>&1 || true
+      "${FC_MATCH}" "$font:lang=en" >/dev/null 2>&1 || true
+      "${FC_MATCH}" "$font:lang=ja" >/dev/null 2>&1 || true
+      "${FC_MATCH}" "$font:lang=zh-cn" >/dev/null 2>&1 || true
     done
 
-    "${FC_LIST}" : family style | head -n 2000 >/dev/null 2>&1 || true
+    "${FC_LIST}" : family style file | head -n 5000 >/dev/null 2>&1 || true
+    "${FC_LIST}" : family lang spacing outline scalable | head -n 5000 >/dev/null 2>&1 || true
     "${FC_LIST}" : lang | sort -u >/dev/null 2>&1 || true
 
     if [[ -n "${FC_PATTERN}" ]]; then
-      for size in 8 9 10 11 12 14 16 18 20 24 32 48; do
+      for size in 8 9 10 11 12 14 16 18 20 24 32 48 64 72; do
         "${FC_PATTERN}" "Sans-${size}" >/dev/null 2>&1 || true
         "${FC_PATTERN}" "Serif-${size}:weight=bold" >/dev/null 2>&1 || true
+        "${FC_PATTERN}" "Monospace-${size}:slant=italic" >/dev/null 2>&1 || true
       done
     fi
 
-    if [[ -n "${FC_SCAN}" && ${#font_dirs[@]} -gt 0 ]]; then
-      mapfile -t _scan_fonts < <(
-        find "${font_dirs[@]}" -type f \( -name '*.ttf' -o -name '*.otf' \) 2>/dev/null | head -n 20
+    local -a _sample_fonts=()
+    if (( ${#font_dirs[@]} > 0 )); then
+      mapfile -t _sample_fonts < <(
+        find "${font_dirs[@]}" -type f \( -name '*.ttf' -o -name '*.otf' -o -name '*.ttc' \) 2>/dev/null | head -n 100
       )
-      (( ${#_scan_fonts[@]} > 0 )) && "${FC_SCAN}" "${_scan_fonts[@]}" >/dev/null 2>&1 || true
+    fi
+    printf '  -> [PGO] custom workload: sample font files=%s\n' "${#_sample_fonts[@]}"
+
+    local _saved_sysroot="${FONTCONFIG_SYSROOT:-}"
+    unset FONTCONFIG_SYSROOT
+    [[ -n "${FC_SCAN}" && ${#_sample_fonts[@]} -gt 0 ]] && "${FC_SCAN}" "${_sample_fonts[@]}" >/dev/null 2>&1 || true
+    [[ -n "${FC_QUERY}" && ${#_sample_fonts[@]} -gt 0 ]] && "${FC_QUERY}" "${_sample_fonts[@]}" >/dev/null 2>&1 || true
+    [[ -n "${FC_VALIDATE}" && ${#_sample_fonts[@]} -gt 0 ]] && "${FC_VALIDATE}" "${_sample_fonts[@]}" >/dev/null 2>&1 || true
+    export FONTCONFIG_SYSROOT="${_saved_sysroot}"
+
+    [[ -n "${FC_CONFLIST}" ]] && "${FC_CONFLIST}" >/dev/null 2>&1 || true
+    if [[ -n "${FC_CAT}" ]]; then
+      find "${_cachedir}" -type f -name '*.cache-*' 2>/dev/null | head -n 20 | xargs -r "${FC_CAT}" >/dev/null 2>&1 || true
     fi
 
-    if [[ -n "${FC_QUERY}" && ${#font_dirs[@]} -gt 0 ]]; then
-      mapfile -t _query_fonts < <(
-        find "${font_dirs[@]}" -type f \( -name '*.ttf' -o -name '*.otf' \) 2>/dev/null | head -n 20
-      )
-      (( ${#_query_fonts[@]} > 0 )) && "${FC_QUERY}" "${_query_fonts[@]}" >/dev/null 2>&1 || true
-    fi
+    local _cache_files
+    _cache_files="$(find "${_cachedir}" -type f -name '*.cache-*' 2>/dev/null | wc -l)"
+    printf '  -> [PGO] custom workload: cache files=%s cachedir=%s\n' "${_cache_files}" "${_cachedir}"
+    printf '  -> [PGO] custom workload: END\n'
   ) || true
 }
 
 prepare() {
   cd fontconfig
 
-  # Avoid Meson WrapDB v1 deprecation warnings by enforcing system deps only.
   rm -f subprojects/*.wrap
   rm -rf subprojects/packagecache
 
-  # Meson >= 1.11 warns about an empty preprocessor target in this code path.
-  # Force an explicit file object to keep preprocessor target well-defined.
-  sed -i "s|cc.preprocess('fcobjshash.gperf.h', include_directories: incbase)|cc.preprocess(files('fcobjshash.gperf.h'), include_directories: incbase)|" \
-    src/meson.build
+  # Create a real source file so Meson's preprocessor target always has sources.
+  cat > src/fcobjshash-preprocess.c <<'EOF'
+#include "fcobjshash.gperf.h"
+EOF
+
+  # Patch meson.build robustly with Python (avoid fragile sed/perl quoting).
+  python3 - <<'PY'
+from pathlib import Path
+import re
+import sys
+
+p = Path("src/meson.build")
+s = p.read_text(encoding="utf-8")
+
+# Remove previously injected broken experimental blocks if present.
+s = re.sub(
+    r"fcobjshash_preprocess_src\s*=\s*configure_file\([\s\S]*?\)\s*"
+    r"fcobjshash_h\s*=\s*cc\.preprocess\(fcobjshash_preprocess_src,\s*include_directories:\s*incbase\)\s*",
+    "",
+    s,
+    flags=re.S,
+)
+s = re.sub(
+    r"fcobjshash_preprocess_src\s*=\s*custom_target\([\s\S]*?\)\s*"
+    r"fcobjshash_h\s*=\s*cc\.preprocess\(fcobjshash_preprocess_src,\s*include_directories:\s*incbase\)\s*",
+    "",
+    s,
+    flags=re.S,
+)
+
+# Replace any direct preprocess of fcobjshash.gperf.h (string or files()).
+new_line = "fcobjshash_h = cc.preprocess('fcobjshash-preprocess.c', include_directories: incbase)"
+s2, n = re.subn(
+    r"fcobjshash_h\s*=\s*cc\.preprocess\(\s*(?:files\(\s*)?'fcobjshash\.gperf\.h'(?:\s*\))?\s*,\s*include_directories:\s*incbase\s*\)",
+    new_line,
+    s,
+    count=1,
+)
+
+if n == 0:
+    # If already patched, keep as is; otherwise hard-fail.
+    if new_line not in s:
+        print("ERROR: could not find fcobjshash preprocess line to patch", file=sys.stderr)
+        sys.exit(1)
+    s2 = s
+
+p.write_text(s2, encoding="utf-8")
+PY
+
+  # Hard verification: never silently continue.
+  grep -Fq "fcobjshash_h = cc.preprocess('fcobjshash-preprocess.c', include_directories: incbase)" src/meson.build || {
+    error "Meson preprocessor warning fix not applied"
+    return 1
+  }
 }
 
 build() {
@@ -219,57 +329,129 @@ build() {
     -Ddoc-txt=disabled
   )
 
-  local PGO_RAW_DIR="$srcdir/profraw"
-  local PGO_DATA="$srcdir/pgo.profdata"
-  local use_pgo=1
+  local PGO1_RAW_DIR="$srcdir/profraw-pgo1"
+  local PGO1_DATA="$srcdir/pgo1.profdata"
+  local CSPGO_RAW_DIR="$srcdir/profraw-cspgo"
+  local FINAL_PGO_DATA="$srcdir/pgo-final.profdata"
 
-  rm -rf "$PGO_RAW_DIR" "$PGO_DATA"
-  mkdir -p "$PGO_RAW_DIR"
+  rm -rf "$PGO1_RAW_DIR" "$CSPGO_RAW_DIR" "$PGO1_DATA" "$FINAL_PGO_DATA" \
+         "$srcdir/build-pgo-gen" "$srcdir/build-cs-pgo-gen" "$srcdir/build"
+  mkdir -p "$PGO1_RAW_DIR" "$CSPGO_RAW_DIR"
 
-  if ! _toolchain_supports_pgo_generate; then
-    warning "Active toolchain cannot link with -fprofile-generate; falling back to non-PGO build."
-    warning "Compiler: $("$CC" --version | head -n1)"
-    use_pgo=0
+  local can_ir_pgo=1
+  local can_cs_pgo=1
+
+  if ! _toolchain_supports_flag "-fprofile-generate"; then
+    warning "Active toolchain cannot link with -fprofile-generate; building without PGO."
+    can_ir_pgo=0
+    can_cs_pgo=0
   fi
 
-  if (( use_pgo )); then
+  if (( can_ir_pgo )) && ! _toolchain_supports_flag "-fcs-profile-generate"; then
+    warning "Active toolchain does not support -fcs-profile-generate; using regular PGO only."
+    can_cs_pgo=0
+  fi
+
+  if (( can_ir_pgo )); then
     local CFLAGS_GEN="$CFLAGS -fprofile-generate"
     local CXXFLAGS_GEN="$CXXFLAGS -fprofile-generate"
     local LDFLAGS_GEN="$LDFLAGS -fprofile-generate"
 
+    printf '  -> [PGO] Stage 1: -fprofile-generate\n'
     arch-meson fontconfig build-pgo-gen --wrap-mode=nofallback "${meson_options[@]}" \
       -Dc_args="$CFLAGS_GEN" \
       -Dcpp_args="$CXXFLAGS_GEN" \
       -Dc_link_args="$LDFLAGS_GEN" \
       -Dcpp_link_args="$LDFLAGS_GEN"
 
-    LLVM_PROFILE_FILE="$PGO_RAW_DIR/%p-%m.profraw" meson compile -C build-pgo-gen
+    LLVM_PROFILE_FILE="$PGO1_RAW_DIR/%p-%m.profraw" meson compile -C build-pgo-gen
 
     if _has_pytest_tap; then
-      LLVM_PROFILE_FILE="$PGO_RAW_DIR/%p-%m.profraw" \
+      LLVM_PROFILE_FILE="$PGO1_RAW_DIR/%p-%m.profraw" \
         meson test -C build-pgo-gen --print-errorlogs --no-rebuild --num-processes "$(nproc)" || true
     else
       warning "python-pytest-tap missing, skipping stage1 meson test workload"
     fi
+    _pgo_profraw_diag "after stage1 meson test" "$PGO1_RAW_DIR"
 
-    LLVM_PROFILE_FILE="$PGO_RAW_DIR/%p-%m.profraw" _training_workload "$srcdir/build-pgo-gen"
+    local _pre_count _pre_bytes _post_count _post_bytes
+    _pre_count="$(_pgo_profraw_count "$PGO1_RAW_DIR")"
+    _pre_bytes="$(_pgo_profraw_bytes "$PGO1_RAW_DIR")"
 
-    if compgen -G "$PGO_RAW_DIR/*.profraw" >/dev/null; then
-      llvm-profdata merge -use-md5 -compress-all-sections -o "$PGO_DATA" "$PGO_RAW_DIR"/*.profraw
+    LLVM_PROFILE_FILE="$PGO1_RAW_DIR/%p-%m.profraw" _training_workload "$srcdir/build-pgo-gen"
+
+    _post_count="$(_pgo_profraw_count "$PGO1_RAW_DIR")"
+    _post_bytes="$(_pgo_profraw_bytes "$PGO1_RAW_DIR")"
+    printf '  -> [PGO] stage1 custom workload delta: files=%d bytes=%d (before: f=%d b=%d, after: f=%d b=%d)\n' \
+      "$((_post_count - _pre_count))" "$((_post_bytes - _pre_bytes))" \
+      "$_pre_count" "$_pre_bytes" "$_post_count" "$_post_bytes"
+
+    if compgen -G "$PGO1_RAW_DIR/*.profraw" >/dev/null; then
+      llvm-profdata merge -use-md5 -compress-all-sections \
+        -o "$PGO1_DATA" "$PGO1_RAW_DIR"/*.profraw
+      printf '  -> [PGO] Stage 1 profile: %s\n' "$PGO1_DATA"
     else
-      warning "No profile data produced, continuing without -fprofile-use"
-      use_pgo=0
+      warning "No stage1 .profraw produced; falling back to non-PGO build."
+      can_ir_pgo=0
+      can_cs_pgo=0
     fi
+  fi
+
+  if (( can_cs_pgo )); then
+    local CFLAGS_CS_GEN="$CFLAGS -fprofile-use=$PGO1_DATA -fcs-profile-generate"
+    local CXXFLAGS_CS_GEN="$CXXFLAGS -fprofile-use=$PGO1_DATA -fcs-profile-generate"
+    local LDFLAGS_CS_GEN="$LDFLAGS -fprofile-use=$PGO1_DATA -fcs-profile-generate"
+
+    printf '  -> [PGO] Stage 2: -fprofile-use + -fcs-profile-generate\n'
+    arch-meson fontconfig build-cs-pgo-gen --wrap-mode=nofallback "${meson_options[@]}" \
+      -Dc_args="$CFLAGS_CS_GEN" \
+      -Dcpp_args="$CXXFLAGS_CS_GEN" \
+      -Dc_link_args="$LDFLAGS_CS_GEN" \
+      -Dcpp_link_args="$LDFLAGS_CS_GEN"
+
+    LLVM_PROFILE_FILE="$CSPGO_RAW_DIR/%p-%m.profraw" meson compile -C build-cs-pgo-gen
+
+    if _has_pytest_tap; then
+      LLVM_PROFILE_FILE="$CSPGO_RAW_DIR/%p-%m.profraw" \
+        meson test -C build-cs-pgo-gen --print-errorlogs --no-rebuild --num-processes "$(nproc)" || true
+    fi
+    _pgo_profraw_diag "after CS stage meson test" "$CSPGO_RAW_DIR"
+
+    local _cs_pre_count _cs_pre_bytes _cs_post_count _cs_post_bytes
+    _cs_pre_count="$(_pgo_profraw_count "$CSPGO_RAW_DIR")"
+    _cs_pre_bytes="$(_pgo_profraw_bytes "$CSPGO_RAW_DIR")"
+
+    LLVM_PROFILE_FILE="$CSPGO_RAW_DIR/%p-%m.profraw" _training_workload "$srcdir/build-cs-pgo-gen"
+
+    _cs_post_count="$(_pgo_profraw_count "$CSPGO_RAW_DIR")"
+    _cs_post_bytes="$(_pgo_profraw_bytes "$CSPGO_RAW_DIR")"
+    printf '  -> [PGO] CS custom workload delta: files=%d bytes=%d (before: f=%d b=%d, after: f=%d b=%d)\n' \
+      "$((_cs_post_count - _cs_pre_count))" "$((_cs_post_bytes - _cs_pre_bytes))" \
+      "$_cs_pre_count" "$_cs_pre_bytes" "$_cs_post_count" "$_cs_post_bytes"
+
+    if compgen -G "$CSPGO_RAW_DIR/*.profraw" >/dev/null; then
+      llvm-profdata merge -use-md5 -compress-all-sections \
+        -o "$FINAL_PGO_DATA" "$CSPGO_RAW_DIR"/*.profraw "$PGO1_DATA"
+      printf '  -> [PGO] Final merged CS profile: %s\n' "$FINAL_PGO_DATA"
+    else
+      warning "No CS-PGO .profraw produced; using stage1 profile only."
+      cp -f "$PGO1_DATA" "$FINAL_PGO_DATA"
+    fi
+  elif (( can_ir_pgo )) && [[ -f "$PGO1_DATA" ]]; then
+    cp -f "$PGO1_DATA" "$FINAL_PGO_DATA"
   fi
 
   local CFLAGS_USE="$CFLAGS"
   local CXXFLAGS_USE="$CXXFLAGS"
   local LDFLAGS_USE="$LDFLAGS"
 
-  if (( use_pgo )) && [[ -f "$PGO_DATA" ]]; then
-    CFLAGS_USE+=" -fprofile-use=$PGO_DATA"
-    CXXFLAGS_USE+=" -fprofile-use=$PGO_DATA"
-    LDFLAGS_USE+=" -fprofile-use=$PGO_DATA"
+  if [[ -f "$FINAL_PGO_DATA" ]]; then
+    CFLAGS_USE+=" -fprofile-use=$FINAL_PGO_DATA"
+    CXXFLAGS_USE+=" -fprofile-use=$FINAL_PGO_DATA"
+    LDFLAGS_USE+=" -fprofile-use=$FINAL_PGO_DATA"
+    printf '  -> [PGO] Final optimize stage uses profile: %s\n' "$FINAL_PGO_DATA"
+  else
+    warning "[PGO] Final optimize stage has no profile-use."
   fi
 
   arch-meson fontconfig build --wrap-mode=nofallback "${meson_options[@]}" \
@@ -298,7 +480,6 @@ package() {
 
   meson install -C build --destdir "$pkgdir"
 
-  # Keep user-selected conf.d symlinks managed by hook, avoid config drift.
   mkdir -p "$pkgdir/usr/share/fontconfig/conf.default"
   local _f
   for _f in "$pkgdir"/etc/fonts/conf.d/*.conf; do
