@@ -1,5 +1,3 @@
-# Maintainer: CachyOS
-
 pkgbase=networkmanager
 pkgname=(
   networkmanager
@@ -11,6 +9,7 @@ pkgdesc="Network connection manager and user applications"
 url="https://networkmanager.dev/"
 arch=(x86_64)
 license=(LGPL-2.1-or-later)
+
 makedepends=(
   audit
   bash
@@ -51,14 +50,18 @@ makedepends=(
   vala
   wpa_supplicant
 )
+
 checkdepends=(
   libx11
   python-dbus
 )
+
 source=(
   "git+https://gitlab.freedesktop.org/NetworkManager/NetworkManager.git?signed#tag=${pkgver/[a-z]/-&}"
 )
+
 b2sums=('43aee5cce5e92861f89520fbb2174ed54a89adc89d6b903b40feddf3f8ab5b0f97559a90efc83cb2919e3eca01700726b8d2f665621bcf3a491127981625e136')
+
 validpgpkeys=(
   3D10AD045AB4AAFF8E8F36AF9B980AC2FB874FEB
   F07F7C1EABD382F81CBFBA3B998D4828CD7E1656
@@ -80,7 +83,7 @@ _strip_profile_flags() {
   local out=() tok
   for tok in "$@"; do
     case "$tok" in
-      -fprofile-generate|-fprofile-generate=*|-fprofile-use|-fprofile-use=*|-fprofile-sample-use=*|-fauto-profile=*|-fcs-profile-generate=*)
+      -fprofile-generate|-fprofile-generate=*|-fprofile-use|-fprofile-use=*|-fprofile-sample-use=*|-fauto-profile=*|-fcs-profile-generate|-fcs-profile-generate=*)
         ;;
       *)
         out+=("$tok")
@@ -90,232 +93,414 @@ _strip_profile_flags() {
   printf '%s ' "${out[@]}"
 }
 
-prepare() {
-  cd NetworkManager
+_supports_flag() {
+  local _flag="$1"
+  local _tdir="$srcdir/.flagcheck-${_flag//[^[:alnum:]]/_}"
+
+  rm -rf "$_tdir"
+  mkdir -p "$_tdir"
+
+  cat > "${_tdir}/t.c" <<'EOF'
+int main(void) { return 0; }
+EOF
+
+  "$CC" "${_tdir}/t.c" -o "${_tdir}/t" ${LDFLAGS} "$_flag" >/dev/null 2>&1
 }
 
-_env_with_build_libs() {
-  local builddir="$1"
-  echo "LD_LIBRARY_PATH=$builddir/src/libnm:${LD_LIBRARY_PATH:-}"
+_find_elf_shared_object() {
+  local root="$1" soname="$2" cand
+  while IFS= read -r cand; do
+    [[ -f "$cand" ]] || continue
+    readelf -h "$cand" >/dev/null 2>&1 || continue
+    file -Lb "$cand" | grep -Eq 'ELF .* shared object' || continue
+    echo "$cand"
+    return 0
+  done < <(
+    find "$root" -type f \
+      \( -name "${soname}.so" -o -name "${soname}.so.*" \) \
+      ! -name '*.symbols' \
+      ! -name '*.a' \
+      ! -name '*.la' \
+      ! -path '*/subprojects/*' \
+      | sort -V
+  )
+  return 1
+}
+
+_prepare_workload_env() {
+  local bdir="$1" prof_file="$2" preload_lib="$3"
+
+  export LD_LIBRARY_PATH="$bdir/src/libnm${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  [[ -n "$prof_file" ]] && export LLVM_PROFILE_FILE="$prof_file" || unset LLVM_PROFILE_FILE
+  [[ -n "$preload_lib" ]] && export LD_PRELOAD="$preload_lib" || unset LD_PRELOAD
+}
+
+_restore_workload_env() {
+  local old_ld="$1" old_prof="$2" old_preload="$3"
+
+  [[ -n "$old_ld" ]] && export LD_LIBRARY_PATH="$old_ld" || unset LD_LIBRARY_PATH
+  [[ -n "$old_prof" ]] && export LLVM_PROFILE_FILE="$old_prof" || unset LLVM_PROFILE_FILE
+  [[ -n "$old_preload" ]] && export LD_PRELOAD="$old_preload" || unset LD_PRELOAD
 }
 
 _nm_timeout_run() {
   local sec="$1"
   shift
-  timeout -k 2 "$sec" "$@" >/dev/null 2>&1 || true
+  timeout --signal=TERM -k 15 "$sec" "$@" >/dev/null 2>&1 || true
 }
 
 _nm_running() {
-  local nmcli="$1" env_ld="$2" profenv="$3" extraenv="$4"
+  local nmcli="$1"
   local st
-  st="$(env $env_ld $profenv $extraenv "$nmcli" -t -f RUNNING general status 2>/dev/null || true)"
+  st="$("$nmcli" -t -f RUNNING general status 2>/dev/null || true)"
   [[ "$st" == "running" ]]
 }
 
-_nm_train_offline() {
-  local nmcli="$1" nmonline="$2" env_ld="$3" profenv="$4" extraenv="$5"
+_nm_find_bin() {
+  local bdir="$1" name="$2"
+  find "$bdir" -type f -name "$name" -perm -111 -print -quit 2>/dev/null || true
+}
 
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" --help
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" --version
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" help
+_nm_binary_sweep() {
+  local bdir="$1"
+  local bins=(
+    nmcli
+    nm-online
+    NetworkManager
+    nmtui
+    nmtui-connect
+    nmtui-edit
+    nmtui-hostname
+    nm-cloud-setup
+    nm-initrd-generator
+  )
+  local b n
+  for n in "${bins[@]}"; do
+    b="$(_nm_find_bin "$bdir" "$n")"
+    [[ -x "$b" ]] || continue
+    _nm_timeout_run 12 "$b" --help
+    _nm_timeout_run 12 "$b" --version
+  done
+}
+
+_nm_collect_device_matrix() {
+  local nmcli="$1"
+  local line dev typ state
+
+  while IFS= read -r line; do
+    IFS=':' read -r dev typ state <<<"$line"
+    [[ -n "$dev" ]] || continue
+
+    _nm_timeout_run 20 "$nmcli" -f GENERAL,IP4,IP6,WIRED,WIFI device show "$dev"
+    _nm_timeout_run 20 "$nmcli" -m multiline -f GENERAL,IP4,IP6,CAPABILITIES device show "$dev"
+
+    if [[ "$typ" == "wifi" ]]; then
+      _nm_timeout_run 25 "$nmcli" device wifi list ifname "$dev"
+      _nm_timeout_run 25 "$nmcli" -t -f IN-USE,SSID,MODE,CHAN,RATE,SIGNAL,BARS,SECURITY device wifi list ifname "$dev"
+      _nm_timeout_run 25 "$nmcli" -m multiline -f IN-USE,SSID,SIGNAL,SECURITY device wifi list ifname "$dev"
+    fi
+  done < <("$nmcli" -t -f DEVICE,TYPE,STATE device status 2>/dev/null)
+}
+
+_nm_collect_connection_matrix() {
+  local nmcli="$1"
+  local line uuid
+
+  _nm_timeout_run 20 "$nmcli" -t -f NAME,UUID,TYPE,DEVICE,TIMESTAMP-REAL connection show
+  _nm_timeout_run 20 "$nmcli" -m multiline connection show
+  _nm_timeout_run 20 "$nmcli" -f all connection show --active
+
+  while IFS= read -r line; do
+    IFS=':' read -r _ uuid _rest <<<"$line"
+    [[ -n "$uuid" ]] || continue
+    _nm_timeout_run 20 "$nmcli" connection show "$uuid"
+    _nm_timeout_run 20 "$nmcli" -f name,uuid,type,autoconnect,timestamp-real connection show "$uuid"
+    _nm_timeout_run 20 "$nmcli" -m multiline connection show "$uuid"
+    _nm_timeout_run 20 "$nmcli" -g GENERAL.STATE,GENERAL.TYPE connection show "$uuid"
+  done < <("$nmcli" -t -f NAME,UUID,TYPE,DEVICE,TIMESTAMP-REAL connection show 2>/dev/null)
+}
+
+_nm_train_offline() {
+  local nmcli="$1" nmonline="$2"
+
+  _nm_timeout_run 10 "$nmcli" --help
+  _nm_timeout_run 10 "$nmcli" --version
+  _nm_timeout_run 10 "$nmcli" help
 
   local sub
   for sub in general networking radio connection device agent monitor settings; do
-    _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" "$sub" --help
-    _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" help "$sub"
+    _nm_timeout_run 10 "$nmcli" "$sub" --help
+    _nm_timeout_run 10 "$nmcli" help "$sub"
   done
 
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" -m tabular -t -f all general
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" -m multiline general
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" -c no -t general status
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" -g STATE general status
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" general permissions
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" general hostname
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" general logging
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" connection show
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" connection show --active
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" device status
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" device show
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" radio all
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" networking
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" networking connectivity
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" networking connectivity check
-  _nm_timeout_run 6 env $env_ld $profenv $extraenv "$nmcli" monitor
+  _nm_timeout_run 12 "$nmcli" -m tabular -t -f all general
+  _nm_timeout_run 12 "$nmcli" -m multiline general
+  _nm_timeout_run 12 "$nmcli" -c no -t general status
+  _nm_timeout_run 12 "$nmcli" -g STATE general status
+  _nm_timeout_run 12 "$nmcli" general permissions
+  _nm_timeout_run 12 "$nmcli" general hostname
+  _nm_timeout_run 12 "$nmcli" general logging
 
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" connection show id __does_not_exist__
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" connection show uuid 00000000-0000-0000-0000-000000000000
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" connection show uuid invalid-uuid
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" device show __does_not_exist__
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" device wifi list ifname __does_not_exist__
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" -f DOES_NOT_EXIST general
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" this-subcommand-does-not-exist
+  _nm_timeout_run 12 "$nmcli" networking
+  _nm_timeout_run 12 "$nmcli" networking connectivity
+  _nm_timeout_run 12 "$nmcli" networking connectivity check
+  _nm_timeout_run 12 "$nmcli" radio all
 
-  [[ -x "$nmonline" ]] && {
-    _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmonline" --help
-    _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmonline" -t 1
-  }
-}
+  _nm_timeout_run 12 "$nmcli" connection show
+  _nm_timeout_run 12 "$nmcli" connection show --active
+  _nm_timeout_run 12 "$nmcli" device status
+  _nm_timeout_run 12 "$nmcli" device show
 
-_nm_train_online() {
-  local nmcli="$1" nmonline="$2" env_ld="$3" profenv="$4" extraenv="$5"
-  local round line dev typ state uuid
+  _nm_collect_device_matrix "$nmcli"
+  _nm_collect_connection_matrix "$nmcli"
 
-  for round in 1 2 3 4 5 6; do
-    _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" general status
-    _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" general permissions
-    _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" general hostname
-    _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" general logging
-    _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" -f all general
-    _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" -g STATE general status
-    _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" -m multiline general
+  _nm_timeout_run 12 "$nmcli" connection show id __does_not_exist__
+  _nm_timeout_run 12 "$nmcli" connection show uuid 00000000-0000-0000-0000-000000000000
+  _nm_timeout_run 12 "$nmcli" connection show uuid invalid-uuid
+  _nm_timeout_run 12 "$nmcli" device show __does_not_exist__
+  _nm_timeout_run 12 "$nmcli" device wifi list ifname __does_not_exist__
+  _nm_timeout_run 12 "$nmcli" -f DOES_NOT_EXIST general
+  _nm_timeout_run 12 "$nmcli" this-subcommand-does-not-exist
 
-    _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" networking
-    _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" networking connectivity
-    _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" networking connectivity check
-    _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" radio all
-    _nm_timeout_run 6 env $env_ld $profenv $extraenv "$nmcli" monitor
-
-    _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" -t -f DEVICE,TYPE,STATE device status
-    _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" device show
-    _nm_timeout_run 6 env $env_ld $profenv $extraenv "$nmcli" connection show --active
-
-    while IFS= read -r line; do
-      IFS=':' read -r dev typ state <<<"$line"
-      [[ -n "$dev" ]] || continue
-      _nm_timeout_run 10 env $env_ld $profenv $extraenv "$nmcli" -f GENERAL,IP4,IP6,WIRED,WIFI device show "$dev"
-      _nm_timeout_run 10 env $env_ld $profenv $extraenv "$nmcli" -m multiline -f GENERAL,IP4,IP6 device show "$dev"
-      [[ "$typ" == "wifi" ]] && {
-        _nm_timeout_run 12 env $env_ld $profenv $extraenv "$nmcli" device wifi list ifname "$dev"
-        _nm_timeout_run 12 env $env_ld $profenv $extraenv "$nmcli" -t -f IN-USE,SSID,MODE,CHAN,RATE,SIGNAL,BARS,SECURITY device wifi list ifname "$dev"
-      }
-    done < <(env $env_ld $profenv $extraenv "$nmcli" -t -f DEVICE,TYPE,STATE device status 2>/dev/null)
-
-    _nm_timeout_run 10 env $env_ld $profenv $extraenv "$nmcli" -t -f NAME,UUID,TYPE,DEVICE,TIMESTAMP-REAL connection show
-    _nm_timeout_run 10 env $env_ld $profenv $extraenv "$nmcli" -m multiline connection show
-
-    while IFS= read -r line; do
-      IFS=':' read -r _ uuid _rest <<<"$line"
-      [[ -n "$uuid" ]] || continue
-      _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" connection show "$uuid"
-      _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" -f name,uuid,type,autoconnect,timestamp-real connection show "$uuid"
-      _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" -m multiline connection show "$uuid"
-    done < <(env $env_ld $profenv $extraenv "$nmcli" -t -f NAME,UUID,TYPE,DEVICE,TIMESTAMP-REAL connection show 2>/dev/null)
-
-    [[ -x "$nmonline" ]] && _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmonline" -t 5
-  done
-
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" connection show id __does_not_exist__
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" device show __does_not_exist__
-  _nm_timeout_run 8 env $env_ld $profenv $extraenv "$nmcli" -f DOES_NOT_EXIST general
-}
-
-_run_nm_workload() {
-  local nmcli="$1" nmonline="$2" bdir="$3" profenv="$4" extraenv="$5"
-  local env_ld
-  env_ld="$(_env_with_build_libs "$bdir")"
-
-  [[ -x "$nmcli" ]] || return 0
-
-  if _nm_running "$nmcli" "$env_ld" "$profenv" "$extraenv"; then
-    _nm_train_online "$nmcli" "$nmonline" "$env_ld" "$profenv" "$extraenv"
-  else
-    _nm_train_offline "$nmcli" "$nmonline" "$env_ld" "$profenv" "$extraenv"
+  if [[ -x "$nmonline" ]]; then
+    _nm_timeout_run 12 "$nmonline" --help
+    _nm_timeout_run 12 "$nmonline" -t 1
+    _nm_timeout_run 12 "$nmonline" -t 3
   fi
 }
 
+_nm_train_online() {
+  local nmcli="$1" nmonline="$2"
+  local round
+
+  for round in 1 2 3 4 5 6 7 8; do
+    _nm_timeout_run 12 "$nmcli" general status
+    _nm_timeout_run 12 "$nmcli" general permissions
+    _nm_timeout_run 12 "$nmcli" general hostname
+    _nm_timeout_run 12 "$nmcli" general logging
+    _nm_timeout_run 12 "$nmcli" -f all general
+    _nm_timeout_run 12 "$nmcli" -g STATE general status
+    _nm_timeout_run 12 "$nmcli" -m multiline general
+
+    _nm_timeout_run 12 "$nmcli" networking
+    _nm_timeout_run 12 "$nmcli" networking connectivity
+    _nm_timeout_run 12 "$nmcli" networking connectivity check
+    _nm_timeout_run 12 "$nmcli" radio all
+
+    _nm_timeout_run 12 "$nmcli" -t -f DEVICE,TYPE,STATE device status
+    _nm_timeout_run 12 "$nmcli" device show
+    _nm_timeout_run 12 "$nmcli" connection show --active
+    _nm_timeout_run 12 "$nmcli" -f all connection show --active
+
+    _nm_collect_device_matrix "$nmcli"
+    _nm_collect_connection_matrix "$nmcli"
+
+    _nm_timeout_run 12 "$nmcli" -f DOES_NOT_EXIST general
+
+    if [[ -x "$nmonline" ]]; then
+      _nm_timeout_run 12 "$nmonline" -t 3
+      _nm_timeout_run 12 "$nmonline" -t 5
+    fi
+  done
+
+  _nm_timeout_run 12 "$nmcli" connection show id __does_not_exist__
+  _nm_timeout_run 12 "$nmcli" device show __does_not_exist__
+}
+
+_run_stage_tests() {
+  local builddir="$1"
+  _nm_timeout_run 600 meson test -C "$builddir" --no-rebuild --print-errorlogs --num-processes "$(nproc)"
+  _nm_timeout_run 600 meson test -C "$builddir" --no-rebuild --print-errorlogs --num-processes 1
+}
+
+_run_nm_workload() {
+  local nmcli="$1" nmonline="$2"
+
+  [[ -x "$nmcli" ]] || return 0
+
+  if _nm_running "$nmcli"; then
+    _nm_train_online "$nmcli" "$nmonline"
+  else
+    _nm_train_offline "$nmcli" "$nmonline"
+  fi
+}
+
+_run_stage_training() {
+  local builddir="$1" profile_file="$2" preload_lib="$3"
+
+  local nmcli nmonline
+  nmcli="$(_nm_find_bin "$builddir" nmcli)"
+  nmonline="$(_nm_find_bin "$builddir" nm-online)"
+
+  local _old_ld="${LD_LIBRARY_PATH-}"
+  local _old_prof="${LLVM_PROFILE_FILE-}"
+  local _old_preload="${LD_PRELOAD-}"
+
+  _prepare_workload_env "$builddir" "$profile_file" "$preload_lib"
+
+  _nm_binary_sweep "$builddir"
+  _run_stage_tests "$builddir"
+
+  if [[ -n "$nmcli" ]]; then
+    _run_nm_workload "$nmcli" "$nmonline"
+    _run_nm_workload "$nmcli" "$nmonline"
+  else
+    warning "nmcli not found in $builddir; custom CLI workload skipped"
+  fi
+
+  _run_stage_tests "$builddir"
+
+  _restore_workload_env "$_old_ld" "$_old_prof" "$_old_preload"
+}
+
 build() {
+  cd "$srcdir"
+
   export CC=clang
   export CXX=clang++
 
   local BASE_CFLAGS BASE_CXXFLAGS BASE_LDFLAGS
   read -r -a _cflags_arr <<<"$CFLAGS"
   read -r -a _cxxflags_arr <<<"$CXXFLAGS"
+  read -r -a _ldflags_arr <<<"$LDFLAGS"
   BASE_CFLAGS="$(_strip_profile_flags "${_cflags_arr[@]}")"
   BASE_CXXFLAGS="$(_strip_profile_flags "${_cxxflags_arr[@]}")"
-  BASE_LDFLAGS="$LDFLAGS"
+  BASE_LDFLAGS="$(_strip_profile_flags "${_ldflags_arr[@]}")"
 
   local meson_opts=(
     --buildtype=release
     --wrap-mode=nofallback
 
-    -D b_lto=true
-    -D b_ndebug=true
-    -D b_pie=false
-    -D c_std=gnu23
-    -D cpp_std=gnu++20
+    -Db_lto=true
+    -Db_ndebug=true
+    -Db_pie=false
+    -Dc_std=gnu23
+    -Dcpp_std=gnu++20
 
-    -D dist_version="$pkgver-$pkgrel"
-    -D session_tracking_consolekit=false
-    -D suspend_resume=systemd
-    -D modify_system=true
-    -D selinux=false
+    -Ddist_version="$pkgver-$pkgrel"
+    -Dsession_tracking_consolekit=false
+    -Dsuspend_resume=systemd
+    -Dmodify_system=true
+    -Dselinux=false
+    -Dlibaudit=yes
+    -Dsystemd_journal=true
+    -Dconfig_logging_backend_default=journal
+    -Dconfig_wifi_backend_default=wpa_supplicant
 
-    -D iwd=true
-    -D teamdctl=true
-    -D nm_cloud_setup=false
+    -Diwd=true
+    -Dteamdctl=true
+    -Dnm_cloud_setup=false
 
-    -D config_plugins_default=keyfile
-    -D ifupdown=false
+    -Dconfig_plugins_default=keyfile
+    -Difupdown=false
 
-    -D netconfig=no
-    -D config_dns_rc_manager_default=symlink
+    -Dnetconfig=no
+    -Dconfig_dns_rc_manager_default=symlink
+    -Dconfig_dhcp_default=internal
 
-    -D introspection=false
-    -D vapi=false
-    -D docs=false
-    -D man=false
-    -D more_asserts=no
-    -D more_logging=false
-    -D qt=false
-    -D tests=no
-    -D python.bytecompile=2
+    -Dintrospection=false
+    -Dvapi=false
+    -Ddocs=false
+    -Dman=false
+    -Dmore_asserts=no
+    -Dmore_logging=false
+    -Dqt=false
+    -Dtests=yes
+    -Dpython.bytecompile=2
   )
 
-  # ---------------- PASS 1: PGO instrumentation ----------------
-  local gen_dir="$srcdir/pgo-gen"
-  mkdir -p "$gen_dir"
+  local can_ir_pgo=1
+  local can_cs_pgo=1
 
-  local c_args_gen="$BASE_CFLAGS $_pgo_instr -fprofile-generate=$gen_dir"
-  local cxx_args_gen="$BASE_CXXFLAGS $_pgo_instr -fprofile-generate=$gen_dir"
-  local link_args_gen="$BASE_LDFLAGS -fprofile-generate=$gen_dir"
-
-  echo "Stage 1: PGO instrumented build"
-  arch-meson NetworkManager build-gen "${meson_opts[@]}" \
-    -D b_lto=false \
-    -D b_ndebug=false \
-    -Dc_args="$c_args_gen" \
-    -Dcpp_args="$cxx_args_gen" \
-    -Dc_link_args="$link_args_gen" \
-    -Dcpp_link_args="$link_args_gen"
-
-  meson compile -C build-gen
-
-  echo "Stage 2: PGO training"
-  local nmcli_gen nmonline_gen
-  nmcli_gen="$(find "$srcdir/build-gen" -type f -name nmcli -perm -111 -print -quit)"
-  nmonline_gen="$(find "$srcdir/build-gen" -type f -name nm-online -perm -111 -print -quit || true)"
-
-  if [[ -n "$nmcli_gen" ]]; then
-    _run_nm_workload "$nmcli_gen" "$nmonline_gen" "$srcdir/build-gen" "LLVM_PROFILE_FILE=$gen_dir/nm.%p.profraw" ""
-  else
-    echo "Warning: nmcli not found for PGO training; skipping training phase."
+  if ! _supports_flag "-fprofile-generate"; then
+    warning "Toolchain cannot link -fprofile-generate, building without PGO/CS-PGO"
+    can_ir_pgo=0
+    can_cs_pgo=0
   fi
+
+  if (( can_ir_pgo )) && ! _supports_flag "-fcs-profile-generate"; then
+    warning "Toolchain lacks -fcs-profile-generate, falling back to regular PGO"
+    can_cs_pgo=0
+  fi
+
+  local gen_dir="$srcdir/pgo-gen"
+  local cs_dir="$srcdir/pgo-cs"
+  rm -rf "$gen_dir" "$cs_dir" "$srcdir/build-gen" "$srcdir/build-cs" "$srcdir/build-opt" \
+         "$srcdir/pgo-merged.profdata" "$srcdir/pgo-cs-merged.profdata"
+  mkdir -p "$gen_dir" "$cs_dir"
 
   local c_args_use="$BASE_CFLAGS"
   local cxx_args_use="$BASE_CXXFLAGS"
   local link_args_use="$BASE_LDFLAGS -Wl,--emit-relocs"
 
-  if compgen -G "$gen_dir/*.profraw" > /dev/null; then
-    llvm-profdata merge -output="$srcdir/pgo-merged.profdata" "$gen_dir"/*.profraw
+  # ---------------- PASS 1: standard PGO instrumentation ----------------
+  if (( can_ir_pgo )); then
+    local c_args_gen="$BASE_CFLAGS $_pgo_instr -fprofile-generate=$gen_dir"
+    local cxx_args_gen="$BASE_CXXFLAGS $_pgo_instr -fprofile-generate=$gen_dir"
+    local link_args_gen="$BASE_LDFLAGS -fprofile-generate=$gen_dir"
+
+    echo "Stage 1: PGO instrumented build"
+    arch-meson NetworkManager build-gen "${meson_opts[@]}" \
+      -Db_lto=false \
+      -Db_ndebug=false \
+      -Dc_args="$c_args_gen" \
+      -Dcpp_args="$cxx_args_gen" \
+      -Dc_link_args="$link_args_gen" \
+      -Dcpp_link_args="$link_args_gen"
+
+    meson compile -C build-gen
+
+    echo "Stage 2: PGO comprehensive training (tests + custom workload)"
+    _run_stage_training "$srcdir/build-gen" "$gen_dir/nm.%p.profraw" ""
+
+    if compgen -G "$gen_dir/*.profraw" > /dev/null; then
+      llvm-profdata merge -output="$srcdir/pgo-merged.profdata" "$gen_dir"/*.profraw
+    else
+      warning "No stage1 profile data produced; continuing without profile-use"
+      can_ir_pgo=0
+      can_cs_pgo=0
+    fi
+  fi
+
+  # ---------------- PASS 2: CS-PGO instrumentation ----------------
+  if (( can_cs_pgo )) && [[ -f "$srcdir/pgo-merged.profdata" ]]; then
+    local c_args_cs="$BASE_CFLAGS $_pgo_instr -fprofile-use=$srcdir/pgo-merged.profdata -fcs-profile-generate=$cs_dir -Wno-profile-instr-missing -Wno-profile-instr-out-of-date"
+    local cxx_args_cs="$BASE_CXXFLAGS $_pgo_instr -fprofile-use=$srcdir/pgo-merged.profdata -fcs-profile-generate=$cs_dir -Wno-profile-instr-missing -Wno-profile-instr-out-of-date"
+    local link_args_cs="$BASE_LDFLAGS -fprofile-use=$srcdir/pgo-merged.profdata -fcs-profile-generate=$cs_dir"
+
+    echo "Stage 3: CS-PGO instrumented build"
+    arch-meson NetworkManager build-cs "${meson_opts[@]}" \
+      -Db_lto=false \
+      -Db_ndebug=false \
+      -Dc_args="$c_args_cs" \
+      -Dcpp_args="$cxx_args_cs" \
+      -Dc_link_args="$link_args_cs" \
+      -Dcpp_link_args="$link_args_cs"
+
+    meson compile -C build-cs
+
+    echo "Stage 4: CS-PGO comprehensive training (tests + custom workload)"
+    _run_stage_training "$srcdir/build-cs" "$cs_dir/nm.%p.profraw" ""
+
+    if compgen -G "$cs_dir/*.profraw" > /dev/null; then
+      llvm-profdata merge -output="$srcdir/pgo-cs-merged.profdata" "$cs_dir"/*.profraw "$srcdir/pgo-merged.profdata"
+      c_args_use+=" -fprofile-use=$srcdir/pgo-cs-merged.profdata -Wno-profile-instr-missing -Wno-profile-instr-out-of-date"
+      cxx_args_use+=" -fprofile-use=$srcdir/pgo-cs-merged.profdata -Wno-profile-instr-missing -Wno-profile-instr-out-of-date"
+      link_args_use+=" -fprofile-use=$srcdir/pgo-cs-merged.profdata"
+    else
+      warning "No CS-PGO data produced; using stage1 PGO profile"
+      c_args_use+=" -fprofile-use=$srcdir/pgo-merged.profdata -Wno-profile-instr-missing -Wno-profile-instr-out-of-date"
+      cxx_args_use+=" -fprofile-use=$srcdir/pgo-merged.profdata -Wno-profile-instr-missing -Wno-profile-instr-out-of-date"
+      link_args_use+=" -fprofile-use=$srcdir/pgo-merged.profdata"
+    fi
+  elif (( can_ir_pgo )) && [[ -f "$srcdir/pgo-merged.profdata" ]]; then
     c_args_use+=" -fprofile-use=$srcdir/pgo-merged.profdata -Wno-profile-instr-missing -Wno-profile-instr-out-of-date"
     cxx_args_use+=" -fprofile-use=$srcdir/pgo-merged.profdata -Wno-profile-instr-missing -Wno-profile-instr-out-of-date"
     link_args_use+=" -fprofile-use=$srcdir/pgo-merged.profdata"
-  else
-    echo "Warning: no PGO data produced; building without profile-use"
   fi
 
-  # ---------------- PASS 2: final optimized build ----------------
-  echo "Stage 3: Final optimized PGO build"
+  # ---------------- PASS 3: final optimized build ----------------
+  echo "Stage 5: Final optimized build"
   arch-meson NetworkManager build-opt "${meson_opts[@]}" \
     -Dc_args="$c_args_use" \
     -Dcpp_args="$cxx_args_use" \
@@ -324,25 +509,24 @@ build() {
 
   meson compile -C build-opt
 
-  # ---------------- PASS 3: BOLT ----------------
-  if command -v llvm-bolt >/dev/null 2>&1; then
-    echo "Stage 4: BOLT optimization"
+  # ---------------- PASS 4: BOLT ----------------
+  if command -v llvm-bolt >/dev/null 2>&1 && command -v merge-fdata >/dev/null 2>&1; then
+    echo "Stage 6: BOLT optimization"
 
     local bolt_dir="$srcdir/bolt"
+    rm -rf "$bolt_dir"
     mkdir -p "$bolt_dir"
 
     local nmcli_opt nmonline_opt libnm_real
-    nmcli_opt="$(find "$srcdir/build-opt" -type f -name nmcli -perm -111 -print -quit)"
-    nmonline_opt="$(find "$srcdir/build-opt" -type f -name nm-online -perm -111 -print -quit || true)"
-    libnm_real="$(find "$srcdir/build-opt" \
-  -type f \( -name 'libnm.so' -o -name 'libnm.so.*' \) \
-  ! -name '*.a' ! -name '*.la' \
-  ! -path '*/subprojects/*' \
-  -print | head -n1 || true)"
+    nmcli_opt="$(_nm_find_bin "$srcdir/build-opt" nmcli)"
+    nmonline_opt="$(_nm_find_bin "$srcdir/build-opt" nm-online)"
+    libnm_real="$(_find_elf_shared_object "$srcdir/build-opt" "libnm" || true)"
 
     local have_nmcli=0 have_libnm=0
     [[ -n "$nmcli_opt" && -f "$nmcli_opt" ]] && have_nmcli=1
     [[ -n "$libnm_real" && -f "$libnm_real" ]] && have_libnm=1
+
+    [[ -n "$libnm_real" ]] && echo "BOLT: selected libnm target: $libnm_real" || echo "BOLT: no valid ELF libnm shared object found; skipping libnm BOLT"
 
     if (( have_nmcli )); then
       cp -f "$nmcli_opt" "$bolt_dir/nmcli.orig"
@@ -377,28 +561,23 @@ build() {
     fi
 
     if (( have_nmcli )); then
-      local extraenv=""
-      (( have_libnm )) && extraenv="LD_PRELOAD=$libnm_real"
-      _run_nm_workload "$nmcli_opt" "$nmonline_opt" "$srcdir/build-opt" "" "$extraenv"
+      local preload_lib=""
+      (( have_libnm )) && preload_lib="$libnm_real"
+
+      # Same comprehensive training methodology in BOLT instrumentation stage.
+      _run_stage_training "$srcdir/build-opt" "" "$preload_lib"
+      _run_stage_training "$srcdir/build-opt" "" "$preload_lib"
     fi
 
     local merged_cli="$bolt_dir/nmcli.merged.fdata"
     local merged_lib="$bolt_dir/libnm.merged.fdata"
 
     if compgen -G "$bolt_dir/nmcli.fdata*" > /dev/null; then
-      if command -v merge-fdata >/dev/null 2>&1; then
-        merge-fdata "$bolt_dir"/nmcli.fdata* -o "$merged_cli" || true
-      else
-        cat "$bolt_dir"/nmcli.fdata* > "$merged_cli" || true
-      fi
+      merge-fdata "$bolt_dir"/nmcli.fdata* -o "$merged_cli" || true
     fi
 
     if compgen -G "$bolt_dir/libnm.fdata*" > /dev/null; then
-      if command -v merge-fdata >/dev/null 2>&1; then
-        merge-fdata "$bolt_dir"/libnm.fdata* -o "$merged_lib" || true
-      else
-        cat "$bolt_dir"/libnm.fdata* > "$merged_lib" || true
-      fi
+      merge-fdata "$bolt_dir"/libnm.fdata* -o "$merged_lib" || true
     fi
 
     local bolt_help align_flags
@@ -464,7 +643,7 @@ build() {
       fi
     fi
   else
-    echo "llvm-bolt not found; skipping BOLT"
+    echo "llvm-bolt/merge-fdata not found; skipping BOLT"
   fi
 }
 
@@ -481,6 +660,8 @@ _pick() {
 }
 
 package_networkmanager() {
+  cd "$srcdir"
+
   depends=(
     audit
     curl
@@ -550,6 +731,8 @@ END
 }
 
 package_libnm() {
+  cd "$srcdir"
+
   pkgdesc="NetworkManager client library"
   depends=(
     glib2
