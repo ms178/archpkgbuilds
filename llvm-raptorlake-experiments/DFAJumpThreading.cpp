@@ -1421,41 +1421,45 @@ private:
     const BasicBlock *Determinator = Path.getDeterminatorBB();
     const PathType &PathBBs = Path.getPath();
 
-    auto DetIt = llvm::find(PathBBs, Determinator);
-    if (DetIt == PathBBs.end())
+    if (PathBBs.empty())
       return;
 
-    auto BeginIt = DetIt;
-    // Skip placeholder when determinator is the placeholder block itself.
-    if (!PathBBs.empty() && PathBBs.front() == Determinator)
+    // Logical path start: skip placeholder if it is the determinator.
+    auto BeginIt = PathBBs.begin();
+    if (*BeginIt == Determinator)
       ++BeginIt;
 
     if (BeginIt == PathBBs.end())
       return;
 
-    BasicBlock *PrevBB = nullptr;
-    if (std::next(BeginIt) == PathBBs.end()) {
-      PrevBB = *BeginIt;
-    } else if (BeginIt == PathBBs.begin()) {
-      PrevBB = *BeginIt;
-    } else {
-      PrevBB = *std::prev(BeginIt);
-    }
+    // Find determinator in the logical range.
+    auto DetIt = llvm::find(make_range(BeginIt, PathBBs.end()), Determinator);
+    if (DetIt == PathBBs.end())
+      return;
 
-    for (auto BBIt = BeginIt; BBIt != PathBBs.end(); ++BBIt) {
+    // Compute predecessor of first cloned block.
+    // If determinator is at the physical beginning, predecessor is itself.
+    BasicBlock *PrevBB = nullptr;
+    if (DetIt == PathBBs.begin())
+      PrevBB = const_cast<BasicBlock *>(Determinator);
+    else
+      PrevBB = *std::prev(DetIt);
+
+    if (!PrevBB)
+      return;
+
+    for (auto BBIt = DetIt; BBIt != PathBBs.end(); ++BBIt) {
       BasicBlock *BB = *BBIt;
       BlocksToClean.insert(BB);
 
-      // We already cloned BB for this NextState, now just update the branch
-      // and continue.
-      BasicBlock *NextBB = getClonedBB(BB, NextState, DuplicateMap);
-      if (NextBB) {
+      // Reuse existing clone for this state if available.
+      if (BasicBlock *NextBB = getClonedBB(BB, NextState, DuplicateMap)) {
         updatePredecessor(PrevBB, BB, NextBB, DTU);
         PrevBB = NextBB;
         continue;
       }
 
-      // Clone the BB and update the successor of Prev to jump to the new block
+      // Clone and rewire.
       BasicBlock *NewBB = cloneBlockAndUpdatePredecessor(
           BB, PrevBB, NextState, DuplicateMap, NewDefs, DTU);
       DuplicateMap[BB].push_back({NewBB, NextState});
@@ -1638,30 +1642,31 @@ private:
 
   /// Sets the successor of PrevBB to be NewBB instead of OldBB. Note that all
   /// other successors are kept as well.
-  void updatePredecessor(BasicBlock *PrevBB, BasicBlock *OldBB,
-                         BasicBlock *NewBB, DomTreeUpdater *DTU) {
-    Instruction *PrevTerm = PrevBB->getTerminator();
-    bool HasOldSucc = false;
-    for (unsigned Idx = 0, E = PrevTerm->getNumSuccessors(); Idx != E; ++Idx) {
-      if (PrevTerm->getSuccessor(Idx) == OldBB) {
-        HasOldSucc = true;
-        break;
-      }
-    }
-
-    if (!HasOldSucc)
+  void updatePredecessor(BasicBlock *PrevBB, BasicBlock *OldBB, BasicBlock *NewBB,
+                        DomTreeUpdater *DTU) {
+    if (!PrevBB || !OldBB || !NewBB || OldBB == NewBB)
       return;
 
-    // Use the safe CFG API for PHI updates to avoid iterator invalidation and
-    // malformed PHIs.
+    Instruction *PrevTerm = PrevBB->getTerminator();
+
+    SmallVector<unsigned, 4> EdgeIdxs;
+    for (unsigned Idx = 0, E = PrevTerm->getNumSuccessors(); Idx != E; ++Idx) {
+      if (PrevTerm->getSuccessor(Idx) == OldBB)
+        EdgeIdxs.push_back(Idx);
+    }
+
+    if (EdgeIdxs.empty())
+      return;
+
+    // Rewire edges first.
+    for (unsigned Idx : EdgeIdxs)
+      PrevTerm->setSuccessor(Idx, NewBB);
+
+    // Then let CFG utility update PHIs safely.
     OldBB->removePredecessor(PrevBB, /*KeepOneInputPHIs=*/true);
 
-    for (unsigned Idx = 0, E = PrevTerm->getNumSuccessors(); Idx != E; ++Idx)
-      if (PrevTerm->getSuccessor(Idx) == OldBB)
-        PrevTerm->setSuccessor(Idx, NewBB);
-
     DTU->applyUpdates({{DominatorTree::Delete, PrevBB, OldBB},
-                       {DominatorTree::Insert, PrevBB, NewBB}});
+                      {DominatorTree::Insert, PrevBB, NewBB}});
   }
 
   /// Add new value mappings to the DefMap to keep track of all new definitions
@@ -1701,26 +1706,71 @@ private:
   /// Note that this is an optional step and would have been done in later
   /// optimizations, but it makes the CFG significantly easier to work with.
   void updateLastSuccessor(const ThreadingPath &TPath,
-                           DuplicateBlockMap &DuplicateMap,
-                           DomTreeUpdater *DTU) {
+                          DuplicateBlockMap &DuplicateMap,
+                          DomTreeUpdater *DTU) {
     APInt NextState = TPath.getExitValue();
     BasicBlock *BB = TPath.getPath().back();
     BasicBlock *LastBlock = getClonedBB(BB, NextState, DuplicateMap);
     if (!LastBlock)
       return;
 
-    // Note multiple paths can end at the same block so check that it is not
-    // updated yet
+    // Multiple paths can share this tail clone; skip if already rewritten.
     if (!isa<SwitchInst>(LastBlock->getTerminator()))
       return;
-    SwitchInst *Switch = cast<SwitchInst>(LastBlock->getTerminator());
-    BasicBlock *NextCase = getNextCaseSuccessor(NextState);
 
+    SwitchInst *Switch = cast<SwitchInst>(LastBlock->getTerminator());
+
+    // Determine exact chosen successor index for NextState.
+    unsigned SelectedSuccIdx = 0; // default edge
+    for (auto Case : Switch->cases()) {
+      if (Case.getCaseValue()->getValue() == NextState) {
+        SelectedSuccIdx = Case.getSuccessorIndex();
+        break;
+      }
+    }
+
+    BasicBlock *NextCase = Switch->getSuccessor(SelectedSuccIdx);
+
+    // Rank of the chosen edge among all edges from LastBlock to NextCase.
+    // This lets us pick the correct PHI incoming when duplicates exist.
+    unsigned ChosenEdgeRank = 0;
+    for (unsigned I = 0; I <= SelectedSuccIdx; ++I)
+      if (Switch->getSuccessor(I) == NextCase)
+        ++ChosenEdgeRank;
+    assert(ChosenEdgeRank > 0 && "Selected successor edge rank must be valid");
+
+    // Fix PHIs in NextCase to exactly one incoming from LastBlock with the
+    // edge-accurate value selected above.
+    for (PHINode &Phi : NextCase->phis()) {
+      SmallVector<Value *, 4> IncomingValsFromLast;
+      for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I)
+        if (Phi.getIncomingBlock(I) == LastBlock)
+          IncomingValsFromLast.push_back(Phi.getIncomingValue(I));
+
+      if (IncomingValsFromLast.empty())
+        continue;
+
+      unsigned Pick = std::min<unsigned>(ChosenEdgeRank - 1,
+                                        IncomingValsFromLast.size() - 1);
+      Value *ChosenVal = IncomingValsFromLast[Pick];
+
+      Phi.removeIncomingValueIf(
+          [&](unsigned Idx) { return Phi.getIncomingBlock(Idx) == LastBlock; },
+          /*DeletePHIIfEmpty=*/false);
+      Phi.addIncoming(ChosenVal, LastBlock);
+    }
+
+    // Remove LastBlock as predecessor from all other former switch successors.
     std::vector<DominatorTree::UpdateType> DTUpdates;
     SmallPtrSet<BasicBlock *, 4> SuccSet;
     for (BasicBlock *Succ : successors(LastBlock)) {
-      if (Succ != NextCase && SuccSet.insert(Succ).second)
-        DTUpdates.push_back({DominatorTree::Delete, LastBlock, Succ});
+      if (!SuccSet.insert(Succ).second)
+        continue;
+      if (Succ == NextCase)
+        continue;
+
+      Succ->removePredecessor(LastBlock, /*KeepOneInputPHIs=*/true);
+      DTUpdates.push_back({DominatorTree::Delete, LastBlock, Succ});
     }
 
     Switch->eraseFromParent();
