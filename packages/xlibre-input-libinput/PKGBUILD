@@ -1,64 +1,115 @@
 _basename="xf86-input-libinput"
 pkgname="xlibre-xf86-input-libinput"
-pkgver=25.0.0
-pkgrel=11
-pkgdesc="Generic input driver for the XLibre server based on libinput (CS-PGO optimized)"
+pkgver=25.0.1
+pkgrel=15
+pkgdesc="Generic input driver for the XLibre server based on libinput (maximal CS-PGO optimized)"
 arch=('aarch64' 'x86_64')
 url="https://github.com/X11Libre/${_basename}/"
 license=('MIT')
 depends=('glibc' 'libinput')
-makedepends=('libx11' 'libxi' 'libxfont2' 'meson>=0.50' 'xlibre-xserver-devel' 'xorgproto'
-             'X-ABI-XINPUT_VERSION=26.0'
-             'clang' 'llvm' 'lld' 'xorg-server-xvfb' 'xorg-xinput' 'xorg-xdpyinfo'
-             'xdotool' 'xorg-xset' 'xorg-xev' 'xorg-xmodmap')
+makedepends=(
+  'libx11' 'libxi' 'libxfont2' 'meson>=0.50' 'xlibre-xserver-devel' 'xorgproto'
+  'X-ABI-XINPUT_VERSION=26.0'
+  'clang' 'llvm' 'lld' 'xorg-server-xvfb' 'xorg-xdpyinfo'
+  'xdotool' 'xorg-xset'
+)
 provides=('xf86-input-libinput' 'xf86-input-libinput-xlibre' 'xorg-libinput')
 conflicts=("${_basename}" 'xf86-input-libinput-xlibre' 'xorg-server<1.19.0'
            'X-ABI-XINPUT_VERSION<26' 'X-ABI-XINPUT_VERSION>=27')
 replaces=('xf86-input-libinput-xlibre')
 groups=('xlibre-drivers')
+
 _pkgsrc="${_basename}-xlibre-${_basename}-${pkgver}"
 source=("${_pkgsrc}.tar.gz::${url}/archive/refs/tags/xlibre-${_basename}-${pkgver}.tar.gz")
 b2sums=('b4a6061dd310c3e900606a128dc28c83b6e0dce6e6aa92e30c1d5788c5f0b6683b41e0e3e24ae8f4cf5014ba217a720240427c9f835038fe1b2794b58a330059')
 
 prepare() {
-  rm -rf pgo-profiles cspgo-profiles inst-pgo inst-cspgo inst-final
-  mkdir -p "$srcdir"/{pgo-profiles,cspgo-profiles}
-  rm -rf "${_pkgsrc}"/build-{pgo,cspgo,final}
+  rm -rf "${srcdir}"/{pgo-profiles,cspgo-profiles,inst-pgo,inst-cspgo,inst-final}
+  mkdir -p "${srcdir}"/{pgo-profiles,cspgo-profiles}
+  rm -rf "${srcdir}/${_pkgsrc}"/build-{pgo,cspgo,final}
 }
 
-_run_driver_workload() {
-  local inst_dir="$1"
-  local iterations="${2:-2}"
+_strip_profile_flags() {
+  local in="$1"
+  in="$(sed -E \
+    -e 's/(^|[[:space:]])-f(profile|cs-profile)[^[:space:]]*//g' \
+    -e 's/(^|[[:space:]])-W(no-)?profile[^[:space:]]*//g' \
+    -e 's/[[:space:]]+/ /g' <<< "$in")"
+  echo "${in#"${in%%[![:space:]]*}"}"
+}
 
-  command -v Xvfb >/dev/null 2>&1 || { echo "Xvfb not found"; return 0; }
-  command -v xinput >/dev/null 2>&1 || { echo "xinput not found"; return 0; }
+_supports_flags() {
+  local flags="$1"
+  printf 'int main(void){return 0;}\n' | "${CC:-clang}" ${flags} -x c - -o /dev/null >/dev/null 2>&1
+}
 
-  # Find driver - handle XLibre versioned paths (xlibre-25, etc.)
-  local driver_so
-  driver_so=$(find "$inst_dir" -type f -name "*libinput*.so" 2>/dev/null | head -1)
+_validate_profdata() {
+  local prof="$1"
+  [[ -s "${prof}" ]] || return 1
+  if llvm-profdata show --help 2>&1 | grep -q -- '--summary-only'; then
+    llvm-profdata show --summary-only "${prof}" >/dev/null 2>&1
+  else
+    llvm-profdata show "${prof}" >/dev/null 2>&1
+  fi
+}
 
-  if [[ -z "$driver_so" || ! -f "$driver_so" ]]; then
-    echo "==> WARNING: Driver .so not found in $inst_dir"
+_profile_stats() {
+  local dir="$1"
+  local count bytes
+  count="$(find "${dir}" -maxdepth 1 -type f -name '*.profraw' | wc -l)"
+  bytes="$(find "${dir}" -maxdepth 1 -type f -name '*.profraw' -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+  echo "${count} ${bytes}"
+}
+
+_merge_raw_profiles() {
+  local raw_dir="$1"
+  local out_prof="$2"
+
+  mapfile -t _raw < <(find "${raw_dir}" -maxdepth 1 -type f -name '*.profraw' -size +0c | sort)
+  (( ${#_raw[@]} > 0 )) || return 1
+
+  llvm-profdata merge -o "${out_prof}" "${_raw[@]}" || return 1
+  _validate_profdata "${out_prof}" || return 1
+  return 0
+}
+
+_find_xinput_bin() {
+  command -v xinput >/dev/null 2>&1 && command -v xinput && return 0
+  return 1
+}
+
+_check_instrumented_module() {
+  local mod="$1"
+  command -v llvm-readelf >/dev/null 2>&1 || return 0
+  if llvm-readelf -S "${mod}" 2>/dev/null | grep -q '__llvm_prf_'; then
+    msg2 "Instrumentation sections present in $(basename "${mod}")"
     return 0
   fi
+  warning "No __llvm_prf_* sections found in ${mod}; instrumentation may be incomplete."
+  return 1
+}
 
-  local driver_dir modules_dir
-  driver_dir=$(dirname "$driver_so")
-  modules_dir=$(dirname "$driver_dir")
+_run_profiled_meson_tests() {
+  local build_dir="$1"
+  local profile_pattern="$2"
+  local repeat="$3"
 
-  echo "==> Training: Found driver: $driver_so"
-  echo "==> Training: Modules dir: $modules_dir"
+  LLVM_PROFILE_FILE="${profile_pattern}" \
+  LLVM_PROFILE_MERGE_POOL_SIZE=8 \
+  meson test -C "${build_dir}" --repeat "${repeat}" --num-processes 1 --print-errorlogs || true
+}
 
-  local d=":95"
-  local logfile="${srcdir}/xvfb-training.log"
-  local xorg_conf="${srcdir}/xorg-training.conf"
+_make_xorg_training_conf() {
+  local cfg="$1"
+  local modules_dir="$2"
 
-  cat > "$xorg_conf" << EOF
-Section "ServerLayout"
-    Identifier "TrainingLayout"
-    Screen 0 "TrainingScreen" 0 0
-    InputDevice "Keyboard0" "CoreKeyboard"
-    InputDevice "Mouse0" "CorePointer"
+  cat > "${cfg}" << EOF
+Section "ServerFlags"
+    Option "AutoAddDevices" "on"
+    Option "AutoEnableDevices" "on"
+    Option "AllowEmptyInput" "on"
+    Option "DontVTSwitch" "on"
+    Option "DontZap" "on"
 EndSection
 
 Section "Files"
@@ -66,322 +117,344 @@ Section "Files"
     ModulePath "/usr/lib/xorg/modules"
 EndSection
 
-Section "ServerFlags"
-    Option "AutoAddDevices" "on"
-    Option "AutoEnableDevices" "on"
-    Option "AllowEmptyInput" "on"
-    Option "AllowMouseOpenFail" "on"
-    Option "DontVTSwitch" "on"
-    Option "DontZap" "on"
-EndSection
-
 Section "InputDevice"
-    Identifier "Keyboard0"
+    Identifier "kbd0"
     Driver "libinput"
     Option "Device" "/dev/input/event0"
-    Option "Ignore" "off"
 EndSection
 
 Section "InputDevice"
-    Identifier "Mouse0"
+    Identifier "ptr0"
     Driver "libinput"
     Option "Device" "/dev/input/mice"
-    Option "Ignore" "off"
-EndSection
-
-Section "Screen"
-    Identifier "TrainingScreen"
-    Device "Card0"
-    DefaultDepth 24
-    SubSection "Display"
-        Depth 24
-        Modes "1920x1080" "1280x1024" "1024x768"
-    EndSubSection
 EndSection
 
 Section "Device"
-    Identifier "Card0"
+    Identifier "dummygpu"
     Driver "dummy"
     VideoRam 256000
 EndSection
+
+Section "Screen"
+    Identifier "screen0"
+    Device "dummygpu"
+    DefaultDepth 24
+    SubSection "Display"
+        Depth 24
+        Modes "1920x1080" "1600x900" "1280x1024" "1024x768"
+    EndSubSection
+EndSection
+
+Section "ServerLayout"
+    Identifier "layout0"
+    Screen 0 "screen0"
+    InputDevice "kbd0" "CoreKeyboard"
+    InputDevice "ptr0" "CorePointer"
+EndSection
 EOF
+}
 
-  echo "==> Training: Running $iterations iterations..."
+_run_x_workload() {
+  local inst_dir="$1"
+  local iterations="${2:-5}"
+  local profile_pattern="$3"
 
-  for iter in $(seq 1 "$iterations"); do
-    echo "==> Training: Iteration $iter/$iterations"
+  command -v xdpyinfo >/dev/null 2>&1 || { warning "xdpyinfo not found"; return 0; }
 
-    Xvfb "$d" -screen 0 1920x1080x24 -nolisten tcp -config "$xorg_conf" \
-      -modulepath "${modules_dir}:/usr/lib/xorg/modules" \
-      -logfile "$logfile" > /dev/null 2>&1 &
+  local xinput_bin=""
+  xinput_bin="$(_find_xinput_bin || true)"
+
+  local driver_so
+  driver_so="$(find "${inst_dir}" -type f -name "libinput_drv.so" 2>/dev/null | head -1)"
+  [[ -n "${driver_so}" && -f "${driver_so}" ]] || { warning "No libinput_drv.so in ${inst_dir}"; return 0; }
+
+  local input_dir modules_dir
+  input_dir="$(dirname "${driver_so}")"
+  modules_dir="$(dirname "${input_dir}")"
+
+  local conf="${srcdir}/xorg-training.conf"
+  local log="${srcdir}/x-training.log"
+  _make_xorg_training_conf "${conf}" "${modules_dir}"
+
+  local server_bin=""
+  if command -v Xorg >/dev/null 2>&1; then
+    server_bin="$(command -v Xorg)"
+  elif command -v Xvfb >/dev/null 2>&1; then
+    server_bin="$(command -v Xvfb)"
+  else
+    warning "No Xorg/Xvfb available for runtime workload"
+    return 0
+  fi
+
+  local displays=(":95" ":96" ":97")
+  local resolutions=("1920x1080x24" "1600x900x24" "1280x1024x24")
+
+  DRIVER_LOAD_HIT=0
+
+  for iter in $(seq 1 "${iterations}"); do
+    local idx=$(( (iter - 1) % 3 ))
+    local d="${displays[idx]}"
+    local screen="${resolutions[idx]}"
+
+    if [[ "${server_bin##*/}" == "Xorg" ]]; then
+      "${server_bin}" "${d}" \
+        -noreset -nolisten tcp -verbose 7 \
+        -config "${conf}" \
+        -modulepath "${modules_dir}:/usr/lib/xorg/modules" \
+        -logfile "${log}" >/dev/null 2>&1 &
+    else
+      "${server_bin}" "${d}" \
+        -screen 0 "${screen}" -nolisten tcp \
+        -config "${conf}" \
+        -modulepath "${modules_dir}:/usr/lib/xorg/modules" \
+        -logfile "${log}" >/dev/null 2>&1 &
+    fi
     local srv=$!
 
     local ready=0
-    for attempt in {1..80}; do
-      if DISPLAY="$d" xdpyinfo >/dev/null 2>&1; then
+    for _ in {1..140}; do
+      if DISPLAY="${d}" xdpyinfo >/dev/null 2>&1; then
         ready=1
         break
       fi
-      sleep 0.1
+      sleep 0.05
     done
 
     if (( !ready )); then
-      kill "$srv" 2>/dev/null || true
-      wait "$srv" 2>/dev/null || true
+      kill "${srv}" >/dev/null 2>&1 || true
+      wait "${srv}" 2>/dev/null || true
       continue
     fi
 
-    sleep 0.3
-    export DISPLAY="$d"
+    export DISPLAY="${d}"
+    export LLVM_PROFILE_FILE="${profile_pattern}"
+    export LLVM_PROFILE_MERGE_POOL_SIZE=8
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Device Enumeration
-    # ══════════════════════════════════════════════════════════════════════════
-    for _ in {1..5}; do
-      xinput --list 2>/dev/null || true
-      xinput --list --short 2>/dev/null || true
-      xinput --list --long 2>/dev/null || true
+    for _ in {1..8}; do
+      xdpyinfo >/dev/null 2>&1 || true
     done
 
-    local devices
-    devices=$(xinput --list --id-only 2>/dev/null | grep -E '^[0-9]+$' || true)
-
-    for dev in $devices; do
-      for _ in {1..8}; do
-        xinput --list "$dev" 2>/dev/null || true
-        xinput --list-props "$dev" 2>/dev/null || true
-        xinput --query-state "$dev" 2>/dev/null || true
-      done
-
-      local props
-      props=$(xinput --list-props "$dev" 2>/dev/null | grep -oP '(?<=\()[0-9]+(?=\))' | head -20 || true)
-      for prop in $props; do
-        xinput --get-prop "$dev" "$prop" 2>/dev/null || true
-      done
-
-      timeout 0.3 xinput --test "$dev" 2>/dev/null || true
-      timeout 0.3 xinput --test-xi2 "$dev" 2>/dev/null || true
-    done
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Mouse and Keyboard Workload
-    # ══════════════════════════════════════════════════════════════════════════
-    if command -v xdotool >/dev/null 2>&1; then
-      # Mouse movements - linear
-      for x in 100 300 500 700 900 1100 1300 1500 1700 1900; do
-        xdotool mousemove "$x" 540 2>/dev/null || true
-      done
-      for y in 100 200 300 400 500 600 700 800 900 1000; do
-        xdotool mousemove 960 "$y" 2>/dev/null || true
-      done
-
-      # Diagonal movements
-      for i in {1..20}; do
-        xdotool mousemove $((i * 90)) $((i * 50)) 2>/dev/null || true
-      done
-
-      # Rapid relative movements
-      for _ in {1..50}; do
-        xdotool mousemove_relative -- $((RANDOM % 20 - 10)) $((RANDOM % 20 - 10)) 2>/dev/null || true
-      done
-
-      # Edge cases
-      xdotool mousemove 0 0 2>/dev/null || true
-      xdotool mousemove 1919 1079 2>/dev/null || true
-
-      # Mouse buttons
+    if [[ -n "${xinput_bin}" ]]; then
       for _ in {1..10}; do
-        xdotool click 1 2>/dev/null || true
-        xdotool click 2 2>/dev/null || true
-        xdotool click 3 2>/dev/null || true
+        "${xinput_bin}" --list >/dev/null 2>&1 || true
+        "${xinput_bin}" --list --long >/dev/null 2>&1 || true
       done
 
-      # Double clicks
-      for _ in {1..5}; do
-        xdotool click --repeat 2 --delay 50 1 2>/dev/null || true
+      local devices
+      devices=$("${xinput_bin}" --list --id-only 2>/dev/null | grep -E '^[0-9]+$' || true)
+
+      for dev in ${devices}; do
+        for _ in {1..14}; do
+          "${xinput_bin}" --list "${dev}" >/dev/null 2>&1 || true
+          "${xinput_bin}" --list-props "${dev}" >/dev/null 2>&1 || true
+          "${xinput_bin}" --query-state "${dev}" >/dev/null 2>&1 || true
+          "${xinput_bin}" --get-button-map "${dev}" >/dev/null 2>&1 || true
+        done
+        timeout 0.30 "${xinput_bin}" --test "${dev}" >/dev/null 2>&1 || true
+        timeout 0.30 "${xinput_bin}" --test-xi2 "${dev}" >/dev/null 2>&1 || true
       done
+    fi
 
-      # Drag operations
-      for _ in {1..5}; do
-        xdotool mousedown 1 2>/dev/null || true
-        xdotool mousemove_relative 100 50 2>/dev/null || true
-        xdotool mouseup 1 2>/dev/null || true
+    if command -v xdotool >/dev/null 2>&1; then
+      for x in 20 120 260 420 620 840 1080 1320 1560 1820 1910; do
+        xdotool mousemove "${x}" 540 >/dev/null 2>&1 || true
       done
-
-      # Scroll
-      for _ in {1..15}; do
-        xdotool click 4 2>/dev/null || true
-        xdotool click 5 2>/dev/null || true
+      for y in 20 120 220 320 420 520 620 720 820 920 1020; do
+        xdotool mousemove 960 "${y}" >/dev/null 2>&1 || true
       done
-
-      # Keyboard typing
-      xdotool type --delay 10 "The quick brown fox jumps over the lazy dog 1234567890" 2>/dev/null || true
-      xdotool type --delay 5 "ABCDEFGHIJKLMNOPQRSTUVWXYZ" 2>/dev/null || true
-
-      # Special keys
-      for key in Return Tab space BackSpace Delete Home End Page_Up Page_Down \
-                 Left Right Up Down Escape F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12; do
-        xdotool key "$key" 2>/dev/null || true
+      for _ in {1..150}; do
+        xdotool mousemove_relative -- $((RANDOM % 50 - 25)) $((RANDOM % 50 - 25)) >/dev/null 2>&1 || true
       done
-
-      # Modifier combinations
+      for _ in {1..30}; do
+        xdotool click 1 >/dev/null 2>&1 || true
+        xdotool click 2 >/dev/null 2>&1 || true
+        xdotool click 3 >/dev/null 2>&1 || true
+      done
+      for _ in {1..50}; do
+        xdotool click 4 >/dev/null 2>&1 || true
+        xdotool click 5 >/dev/null 2>&1 || true
+      done
+      xdotool type --delay 2 "maximal profile training qwertyuiopasdfghjklzxcvbnm 0123456789" >/dev/null 2>&1 || true
+      for key in Return Tab Escape Left Right Up Down Home End Prior Next Insert Delete F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12; do
+        xdotool key "${key}" >/dev/null 2>&1 || true
+      done
       for mod in shift ctrl alt super; do
-        for key in a b c x z; do
-          xdotool key "${mod}+${key}" 2>/dev/null || true
+        for key in a c v x z y; do
+          xdotool key "${mod}+${key}" >/dev/null 2>&1 || true
         done
       done
     fi
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # XI2 Operations
-    # ══════════════════════════════════════════════════════════════════════════
-    for dev in $devices; do
-      xinput --enable "$dev" 2>/dev/null || true
-      xinput --disable "$dev" 2>/dev/null || true
-      xinput --enable "$dev" 2>/dev/null || true
-      xinput --get-button-map "$dev" 2>/dev/null || true
-    done
-
     if command -v xset >/dev/null 2>&1; then
-      xset q 2>/dev/null || true
-      xset r rate 250 30 2>/dev/null || true
-      xset m 3/1 4 2>/dev/null || true
-      xset m default 2>/dev/null || true
+      xset q >/dev/null 2>&1 || true
+      xset m 1/1 2 >/dev/null 2>&1 || true
+      xset m 3/1 4 >/dev/null 2>&1 || true
+      xset m default >/dev/null 2>&1 || true
+      xset r rate 250 30 >/dev/null 2>&1 || true
+      xset r rate 300 40 >/dev/null 2>&1 || true
     fi
 
-    unset DISPLAY
-    kill -TERM "$srv" 2>/dev/null || kill -KILL "$srv" 2>/dev/null || true
-    wait "$srv" 2>/dev/null || true
-    sleep 0.3
+    unset DISPLAY LLVM_PROFILE_FILE LLVM_PROFILE_MERGE_POOL_SIZE
+    kill -TERM "${srv}" >/dev/null 2>&1 || true
+    wait "${srv}" 2>/dev/null || true
+    sleep 0.2
   done
 
-  echo "==> Training: Workload complete"
+  if grep -Eq 'LoadModule: "libinput"|Loading .*libinput_drv\.so|libinput_drv\.so' "${log}" 2>/dev/null; then
+    DRIVER_LOAD_HIT=1
+    msg2 "Runtime workload log confirms libinput module load attempt."
+  else
+    warning "Runtime log does not clearly confirm libinput module load."
+  fi
+
+  return 0
+}
+
+_assert_profile_quality() {
+  local dir="$1"
+  local stage="$2"
+  local min_files="$3"
+  local min_bytes="$4"
+
+  local count bytes
+  read -r count bytes < <(_profile_stats "${dir}")
+  msg2 "${stage}: profraw files=${count}, total_bytes=${bytes}"
+
+  (( count >= min_files )) || { error "${stage}: too few profraw files"; return 1; }
+  (( bytes >= min_bytes )) || { error "${stage}: profile corpus too small"; return 1; }
+  return 0
 }
 
 build() {
-  # ════════════════════════════════════════════════════════════════════════════
-  # Detect LLVM tools from PATH
-  # ════════════════════════════════════════════════════════════════════════════
   local _clang _clangxx _llvm_profdata
+  _clang="$(command -v clang)" || { error "clang not found"; return 1; }
+  _clangxx="$(command -v clang++)" || { error "clang++ not found"; return 1; }
+  _llvm_profdata="$(command -v llvm-profdata)" || { error "llvm-profdata not found"; return 1; }
 
-  _clang=$(command -v clang) || { error "clang not found in PATH"; return 1; }
-  _clangxx=$(command -v clang++) || { error "clang++ not found in PATH"; return 1; }
-  _llvm_profdata=$(command -v llvm-profdata) || { error "llvm-profdata not found in PATH"; return 1; }
+  export CC="${_clang}"
+  export CXX="${_clangxx}"
 
-  msg2 "LLVM Toolchain detected:"
-  msg2 "  clang:         $_clang ($("$_clang" --version | head -1))"
-  msg2 "  llvm-profdata: $_llvm_profdata"
-
-  export CC="$_clang"
-  export CXX="$_clangxx"
-
-  local SAN_CFLAGS="${CFLAGS/-fno-plt}"
-  local SAN_CXXFLAGS="${CXXFLAGS/-fno-plt}"
-  local SAN_LDFLAGS="${LDFLAGS/-Wl,-z,now}"
+  local SAN_CFLAGS SAN_CXXFLAGS SAN_LDFLAGS
+  SAN_CFLAGS="$(_strip_profile_flags "${CFLAGS}")"
+  SAN_CXXFLAGS="$(_strip_profile_flags "${CXXFLAGS}")"
+  SAN_LDFLAGS="$(_strip_profile_flags "${LDFLAGS}")"
 
   local _lld_flags="-fuse-ld=lld"
 
-  local _pgo_dir="$srcdir/pgo-profiles"
-  local _cspgo_dir="$srcdir/cspgo-profiles"
+  local _pgo_dir="${srcdir}/pgo-profiles"
+  local _cspgo_dir="${srcdir}/cspgo-profiles"
+  local _pgo_profdata="${_pgo_dir}/pgo.profdata"
+  local _cspgo_profdata="${_cspgo_dir}/cspgo.profdata"
 
   local _meson_common_opts=(
     -D xorg-conf-dir=/usr/share/X11/xorg.conf.d/
+    -D b_lto=true
+    --buildtype=release
   )
 
-  # ════════════════════════════════════════════════════════════════════════════
-  # STAGE 1: Standard PGO Instrumented Build
-  # ════════════════════════════════════════════════════════════════════════════
-  msg2 "STAGE 1/3: Building with PGO instrumentation..."
+  # Conservative hard gates. Increased if server module load confirmed.
+  local _stage1_min_files=8
+  local _stage1_min_bytes=16384
+  local _stage2_min_files=5
+  local _stage2_min_bytes=12288
 
-  local _pgo_gen="-fprofile-generate=$_pgo_dir -fprofile-update=atomic"
+  # Stage 1
+  msg2 "Stage 1/3: PGO instrumentation build"
+  local _pgo_gen="-fprofile-generate=${_pgo_dir} -fprofile-update=atomic"
 
   CFLAGS='' CXXFLAGS='' LDFLAGS='' \
   arch-meson "${_pkgsrc}" "${_pkgsrc}/build-pgo" \
     "${_meson_common_opts[@]}" \
-    -Dc_args="$SAN_CFLAGS $_pgo_gen" \
-    -Dcpp_args="$SAN_CXXFLAGS $_pgo_gen" \
-    -Dc_link_args="$SAN_LDFLAGS $_lld_flags $_pgo_gen" \
-    -Dcpp_link_args="$SAN_LDFLAGS $_lld_flags $_pgo_gen" \
-    -Db_lto=true \
-    --buildtype=release
+    -Dc_args="${SAN_CFLAGS} ${_pgo_gen}" \
+    -Dcpp_args="${SAN_CXXFLAGS} ${_pgo_gen}" \
+    -Dc_link_args="${SAN_LDFLAGS} ${_lld_flags} ${_pgo_gen}" \
+    -Dcpp_link_args="${SAN_LDFLAGS} ${_lld_flags} ${_pgo_gen}"
 
   meson compile -C "${_pkgsrc}/build-pgo"
 
-  local inst_pgo="$srcdir/inst-pgo"
-  DESTDIR="$inst_pgo" meson install -C "${_pkgsrc}/build-pgo"
+  local _mod_pgo="${_pkgsrc}/build-pgo/libinput_drv.so"
+  [[ -f "${_mod_pgo}" ]] && _check_instrumented_module "${_mod_pgo}" || true
 
-  msg2 "STAGE 1/3: Running PGO training workload..."
-  _run_driver_workload "$inst_pgo" 2
+  msg2 "Stage 1/3: meson tests under instrumentation"
+  _run_profiled_meson_tests "${_pkgsrc}/build-pgo" "${_pgo_dir}/stage1-test-%h-%p-%m.profraw" 20
 
-  # Merge PGO profiles
-  local _pgo_profdata="$_pgo_dir/pgo.profdata"
-  if compgen -G "$_pgo_dir"/*.profraw >/dev/null 2>&1; then
-    msg2 "STAGE 1/3: Merging PGO profiles..."
-    find "$_pgo_dir" -maxdepth 1 -type f -name '*.profraw' \
-      | "$_llvm_profdata" merge -o "$_pgo_profdata" -input-files=-
-    msg2 "STAGE 1/3: PGO profile: $(du -h "$_pgo_profdata" | cut -f1)"
-  else
-    warning "No PGO profiles generated"
-    touch "$_pgo_profdata"
+  local inst_pgo="${srcdir}/inst-pgo"
+  DESTDIR="${inst_pgo}" meson install -C "${_pkgsrc}/build-pgo"
+
+  msg2 "Stage 1/3: X runtime workload"
+  _run_x_workload "${inst_pgo}" 5 "${_pgo_dir}/stage1-x-%h-%p-%m.profraw"
+
+  if [[ "${DRIVER_LOAD_HIT:-0}" -eq 1 ]]; then
+    _stage1_min_bytes=65536
   fi
 
-  # ════════════════════════════════════════════════════════════════════════════
-  # STAGE 2: Context-Sensitive PGO Instrumented Build
-  # ════════════════════════════════════════════════════════════════════════════
-  msg2 "STAGE 2/3: Building with CS-PGO instrumentation..."
+  _assert_profile_quality "${_pgo_dir}" "Stage 1" "${_stage1_min_files}" "${_stage1_min_bytes}" || return 1
+  _merge_raw_profiles "${_pgo_dir}" "${_pgo_profdata}" || return 1
 
-  local _cspgo_gen="-fprofile-use=$_pgo_profdata -fcs-profile-generate=$_cspgo_dir"
-
-  CFLAGS='' CXXFLAGS='' LDFLAGS='' \
-  arch-meson "${_pkgsrc}" "${_pkgsrc}/build-cspgo" \
-    "${_meson_common_opts[@]}" \
-    -Dc_args="$SAN_CFLAGS $_cspgo_gen" \
-    -Dcpp_args="$SAN_CXXFLAGS $_cspgo_gen" \
-    -Dc_link_args="$SAN_LDFLAGS $_lld_flags $_cspgo_gen" \
-    -Dcpp_link_args="$SAN_LDFLAGS $_lld_flags $_cspgo_gen" \
-    -Db_lto=true \
-    --buildtype=release
-
-  meson compile -C "${_pkgsrc}/build-cspgo"
-
-  local inst_cspgo="$srcdir/inst-cspgo"
-  DESTDIR="$inst_cspgo" meson install -C "${_pkgsrc}/build-cspgo"
-
-  msg2 "STAGE 2/3: Running CS-PGO training workload..."
-  _run_driver_workload "$inst_cspgo" 2
-
-  # Merge CS-PGO profiles with base PGO
-  local _cspgo_profdata="$_cspgo_dir/cspgo.profdata"
-  if compgen -G "$_cspgo_dir"/*.profraw >/dev/null 2>&1; then
-    msg2 "STAGE 2/3: Merging CS-PGO profiles..."
-    find "$_cspgo_dir" -maxdepth 1 -type f -name '*.profraw' \
-      | "$_llvm_profdata" merge -o "$_cspgo_profdata" "$_pgo_profdata" -input-files=-
-    msg2 "STAGE 2/3: CS-PGO profile: $(du -h "$_cspgo_profdata" | cut -f1)"
+  # Stage 2
+  msg2 "Stage 2/3: CS instrumentation build"
+  local _cs_gen=""
+  if _supports_flags "-fprofile-instr-generate -fcs-profile-generate"; then
+    _cs_gen="-fprofile-instr-generate -fcs-profile-generate"
+  elif _supports_flags "-fcs-profile-generate"; then
+    _cs_gen="-fcs-profile-generate"
   else
-    warning "No CS-PGO profiles generated, using standard PGO"
-    cp "$_pgo_profdata" "$_cspgo_profdata"
+    warning "CS-PGO flags unsupported by compiler; fallback to Stage 1 profile."
+    cp -f "${_pgo_profdata}" "${_cspgo_profdata}"
   fi
 
-  # ════════════════════════════════════════════════════════════════════════════
-  # STAGE 3: Final CS-PGO Optimized Build
-  # ════════════════════════════════════════════════════════════════════════════
-  msg2 "STAGE 3/3: Building final CS-PGO optimized binary..."
+  if [[ -n "${_cs_gen}" ]]; then
+    CFLAGS='' CXXFLAGS='' LDFLAGS='' \
+    arch-meson "${_pkgsrc}" "${_pkgsrc}/build-cspgo" \
+      "${_meson_common_opts[@]}" \
+      -Dc_args="${SAN_CFLAGS} ${_cs_gen}" \
+      -Dcpp_args="${SAN_CXXFLAGS} ${_cs_gen}" \
+      -Dc_link_args="${SAN_LDFLAGS} ${_lld_flags} ${_cs_gen}" \
+      -Dcpp_link_args="${SAN_LDFLAGS} ${_lld_flags} ${_cs_gen}"
 
-  local _pgo_use="-fprofile-use=$_cspgo_profdata -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
+    meson compile -C "${_pkgsrc}/build-cspgo"
+
+    local _mod_cs="${_pkgsrc}/build-cspgo/libinput_drv.so"
+    [[ -f "${_mod_cs}" ]] && _check_instrumented_module "${_mod_cs}" || true
+
+    msg2 "Stage 2/3: meson tests under CS instrumentation"
+    _run_profiled_meson_tests "${_pkgsrc}/build-cspgo" "${_cspgo_dir}/stage2-test-%h-%p-%m.profraw" 12
+
+    local inst_cspgo="${srcdir}/inst-cspgo"
+    DESTDIR="${inst_cspgo}" meson install -C "${_pkgsrc}/build-cspgo"
+
+    msg2 "Stage 2/3: X runtime workload"
+    _run_x_workload "${inst_cspgo}" 4 "${_cspgo_dir}/stage2-x-%h-%p-%m.profraw"
+
+    if [[ "${DRIVER_LOAD_HIT:-0}" -eq 1 ]]; then
+      _stage2_min_bytes=49152
+    fi
+
+    _assert_profile_quality "${_cspgo_dir}" "Stage 2" "${_stage2_min_files}" "${_stage2_min_bytes}" || return 1
+
+    mapfile -t _stage2_raw < <(find "${_cspgo_dir}" -maxdepth 1 -type f -name '*.profraw' -size +0c | sort)
+    (( ${#_stage2_raw[@]} > 0 )) || return 1
+
+    "${_llvm_profdata}" merge -o "${_cspgo_profdata}" "${_stage2_raw[@]}" "${_pgo_profdata}" || return 1
+    _validate_profdata "${_cspgo_profdata}" || return 1
+  fi
+
+  # Stage 3
+  msg2 "Stage 3/3: final optimized build"
+  local _use_prof="${_cspgo_profdata}"
+  [[ -s "${_use_prof}" ]] || _use_prof="${_pgo_profdata}"
+
+  local _pgo_use="-fprofile-use=${_use_prof} -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
 
   CFLAGS='' CXXFLAGS='' LDFLAGS='' \
   arch-meson "${_pkgsrc}" "${_pkgsrc}/build-final" \
     "${_meson_common_opts[@]}" \
-    -Dc_args="$SAN_CFLAGS $_pgo_use" \
-    -Dcpp_args="$SAN_CXXFLAGS $_pgo_use" \
-    -Dc_link_args="$SAN_LDFLAGS $_lld_flags $_pgo_use" \
-    -Dcpp_link_args="$SAN_LDFLAGS $_lld_flags $_pgo_use" \
-    -Db_lto=true \
-    --buildtype=release
+    -Dc_args="${SAN_CFLAGS} ${_pgo_use}" \
+    -Dcpp_args="${SAN_CXXFLAGS} ${_pgo_use}" \
+    -Dc_link_args="${SAN_LDFLAGS} ${_lld_flags}" \
+    -Dcpp_link_args="${SAN_LDFLAGS} ${_lld_flags}"
 
   meson compile -C "${_pkgsrc}/build-final"
-
-  msg "Build complete: CS-PGO + LTO optimized"
 }
 
 check() {
@@ -389,52 +462,32 @@ check() {
 }
 
 package() {
-  DESTDIR="$pkgdir" meson install -C "${_pkgsrc}/build-final"
+  DESTDIR="${pkgdir}" meson install -C "${_pkgsrc}/build-final"
 
-  # ════════════════════════════════════════════════════════════════════════════
-  # Install libinput-properties.h header (required by plasma-desktop, etc.)
-  # ════════════════════════════════════════════════════════════════════════════
-  local _incdir="$pkgdir/usr/include/xorg"
-  mkdir -p "$_incdir"
+  local _incdir="${pkgdir}/usr/include/xorg"
+  mkdir -p "${_incdir}"
 
-  local _header_installed
-  _header_installed=$(find "$pkgdir" -name "libinput-properties.h" -type f 2>/dev/null | head -1)
+  local _installed_header
+  _installed_header="$(find "${pkgdir}" -type f -name "libinput-properties.h" 2>/dev/null | head -1)"
 
-  if [[ -n "$_header_installed" && -f "$_header_installed" ]]; then
-    if [[ "$_header_installed" != "$_incdir/libinput-properties.h" ]]; then
-      msg2 "Copying libinput-properties.h to $_incdir/"
-      cp "$_header_installed" "$_incdir/"
-    fi
+  if [[ -n "${_installed_header}" && -f "${_installed_header}" ]]; then
+    [[ "${_installed_header}" == "${_incdir}/libinput-properties.h" ]] || cp "${_installed_header}" "${_incdir}/"
   else
     local _src_header
-    _src_header=$(find "$srcdir/${_pkgsrc}" -name "libinput-properties.h" -type f 2>/dev/null | head -1)
-
-    if [[ -n "$_src_header" && -f "$_src_header" ]]; then
-      msg2 "Installing libinput-properties.h from source tree..."
-      install -Dm644 "$_src_header" "$_incdir/libinput-properties.h"
-    else
-      error "libinput-properties.h not found!"
-      return 1
-    fi
+    _src_header="$(find "${srcdir}/${_pkgsrc}" -type f -name "libinput-properties.h" 2>/dev/null | head -1)"
+    [[ -n "${_src_header}" && -f "${_src_header}" ]] || { error "libinput-properties.h not found"; return 1; }
+    install -Dm644 "${_src_header}" "${_incdir}/libinput-properties.h"
   fi
 
-  # ════════════════════════════════════════════════════════════════════════════
-  # Verify/Create xorg-libinput.pc
-  # ════════════════════════════════════════════════════════════════════════════
-  local _pcfile="$pkgdir/usr/lib/pkgconfig/xorg-libinput.pc"
-
-  if [[ ! -f "$_pcfile" ]]; then
-    if [[ -f "$pkgdir/usr/share/pkgconfig/xorg-libinput.pc" ]]; then
-      mkdir -p "$pkgdir/usr/lib/pkgconfig"
-      mv "$pkgdir/usr/share/pkgconfig/xorg-libinput.pc" "$_pcfile"
-    fi
+  local _pcfile="${pkgdir}/usr/lib/pkgconfig/xorg-libinput.pc"
+  if [[ ! -f "${_pcfile}" && -f "${pkgdir}/usr/share/pkgconfig/xorg-libinput.pc" ]]; then
+    mkdir -p "${pkgdir}/usr/lib/pkgconfig"
+    mv "${pkgdir}/usr/share/pkgconfig/xorg-libinput.pc" "${_pcfile}"
   fi
 
-  if [[ ! -f "$_pcfile" ]]; then
-    msg2 "Creating xorg-libinput.pc..."
-    mkdir -p "$pkgdir/usr/lib/pkgconfig"
-
-    cat > "$_pcfile" << EOF
+  if [[ ! -f "${_pcfile}" ]]; then
+    mkdir -p "${pkgdir}/usr/lib/pkgconfig"
+    cat > "${_pcfile}" << EOF
 prefix=/usr
 exec_prefix=\${prefix}
 libdir=\${exec_prefix}/lib
@@ -442,45 +495,14 @@ includedir=\${prefix}/include/xorg
 moduledir=\${libdir}/xorg/modules/input
 
 Name: xorg-libinput
-Description: X.Org libinput input driver
+Description: XLibre libinput input driver
 Version: ${pkgver}
 Requires.private: libinput
 Cflags: -I\${includedir}
 EOF
   else
-    if ! grep -q "Cflags:" "$_pcfile"; then
-      echo "Cflags: -I\${includedir}" >> "$_pcfile"
-    fi
-    if ! grep -q "includedir=" "$_pcfile"; then
-      sed -i '/^prefix=/a includedir=${prefix}/include/xorg' "$_pcfile"
-    fi
-  fi
-
-  # ════════════════════════════════════════════════════════════════════════════
-  # Verify installation
-  # ════════════════════════════════════════════════════════════════════════════
-  msg2 "Verifying package contents..."
-
-  local _driver
-  _driver=$(find "$pkgdir" -name "libinput_drv.so" -type f 2>/dev/null | head -1)
-  if [[ -f "$_driver" ]]; then
-    msg2 "  Driver: $_driver ($(du -h "$_driver" | cut -f1))"
-  else
-    warning "Driver not found!"
-  fi
-
-  if [[ -f "$_pcfile" ]]; then
-    msg2 "  pkg-config: $_pcfile"
-  else
-    error "xorg-libinput.pc not installed!"
-    return 1
-  fi
-
-  if [[ -f "$_incdir/libinput-properties.h" ]]; then
-    msg2 "  Header: $_incdir/libinput-properties.h"
-  else
-    error "libinput-properties.h not installed!"
-    return 1
+    grep -q '^includedir=' "${_pcfile}" || sed -i '/^prefix=/a includedir=${prefix}/include/xorg' "${_pcfile}"
+    grep -q '^Cflags:' "${_pcfile}" || echo 'Cflags: -I${includedir}' >> "${_pcfile}"
   fi
 
   cd "${_pkgsrc}"
