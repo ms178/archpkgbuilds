@@ -4,27 +4,210 @@
 
 pkgname=libxinerama
 pkgver=1.1.6
-pkgrel=3.1
-pkgdesc="X11 Xinerama extension library"
+pkgrel=3.2
+pkgdesc="X11 Xinerama extension library (PGO/CS-PGO optimized)"
 arch=('x86_64')
 url="https://xorg.freedesktop.org/"
 license=('custom')
 depends=('libxext')
-makedepends=('xorg-util-macros' 'xorgproto')
+makedepends=('xorg-util-macros' 'xorgproto' 'clang' 'llvm' 'xorg-server-xvfb')
 options=('strip')
 source=("${url}"/archive/individual/lib/libXinerama-${pkgver}.tar.xz{,.sig})
 sha512sums=('735b5320de4782005b379e409bf2f976131c17d496b297d33a0e127ca1443034778586b6b25c077b2ad73a4ab34d440d7510475e0041f38202bb40f15fb08ff7'
             'SKIP')
-validpgpkeys=('4A193C06D35E7C670FA4EF0BA2FB9E081F2D130E') # "Alan Coopersmith <alan.coopersmith@oracle.com>"
+validpgpkeys=('4A193C06D35E7C670FA4EF0BA2FB9E081F2D130E') # Alan Coopersmith <alan.coopersmith@oracle.com>
+
+prepare() {
+  cd "libXinerama-${pkgver}"
+
+  cat > "${srcdir}/xinerama_pgo_workload.c" << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <X11/Xlib.h>
+#include <X11/extensions/Xinerama.h>
+
+static void train_xinerama(Display *dpy, int loops) {
+  int event_base = 0, error_base = 0;
+  int major = 0, minor = 0;
+
+  for (int i = 0; i < loops; ++i) {
+    XineramaQueryExtension(dpy, &event_base, &error_base);
+    XineramaQueryVersion(dpy, &major, &minor);
+
+    if (XineramaIsActive(dpy)) {
+      int screens = 0;
+      XineramaScreenInfo *info = XineramaQueryScreens(dpy, &screens);
+      if (info) {
+        volatile int sink = 0;
+        for (int j = 0; j < screens; ++j) {
+          sink += info[j].screen_number;
+          sink += info[j].x_org + info[j].y_org;
+          sink += info[j].width + info[j].height;
+        }
+        (void)sink;
+        XFree(info);
+      }
+    }
+
+    if ((i % 32) == 0) {
+      XSync(dpy, False);
+    }
+  }
+}
+
+int main(int argc, char **argv) {
+  int loops = (argc > 1) ? atoi(argv[1]) : 1200;
+  Display *dpy = XOpenDisplay(NULL);
+  if (!dpy) {
+    fprintf(stderr, "No X display available, skipping Xinerama PGO training.\n");
+    return 0;
+  }
+
+  train_xinerama(dpy, loops / 2);
+  train_xinerama(dpy, loops);
+  train_xinerama(dpy, loops * 2);
+
+  XSync(dpy, False);
+  XCloseDisplay(dpy);
+  return 0;
+}
+EOF
+}
+
+_run_with_display() {
+  if [[ -n "${DISPLAY:-}" ]]; then
+    "$@"
+  elif command -v xvfb-run >/dev/null 2>&1; then
+    xvfb-run -a -s "-screen 0 1920x1080x24" "$@"
+  else
+    "$@"
+  fi
+}
+
+_run_xinerama_workload() {
+  local build_dir="$1"
+  local pgo_flags="$2"
+  local orig_cflags="$3"
+  local orig_ldflags="$4"
+
+  cd "$build_dir" || return 1
+
+  local libtool_la="src/libXinerama.la"
+  local lib_dir="${build_dir}/src/.libs"
+
+  [[ -f "$libtool_la" ]] || return 1
+
+  CC="${CC:-clang}" \
+  CFLAGS="${orig_cflags} ${pgo_flags}" \
+  LDFLAGS="${orig_ldflags} ${pgo_flags}" \
+  ./libtool --tag=CC --mode=link "${CC:-clang}" \
+    "${srcdir}/xinerama_pgo_workload.c" \
+    -o "${srcdir}/xinerama_pgo_runner" \
+    -I"${build_dir}/include" \
+    -I"${srcdir}/libXinerama-${pkgver}/include" \
+    "$libtool_la" \
+    -lX11 -lXext \
+    -Wl,-rpath,"${lib_dir}" || return 1
+
+  _run_with_display "${srcdir}/xinerama_pgo_runner" 900 || true
+  _run_with_display "${srcdir}/xinerama_pgo_runner" 1400 || true
+  _run_with_display "${srcdir}/xinerama_pgo_runner" 2000 || true
+
+  rm -f "${srcdir}/xinerama_pgo_runner"
+  return 0
+}
 
 build() {
-  cd libXinerama-${pkgver}
-  ./configure --prefix=/usr
-  make
+  cd "libXinerama-${pkgver}"
+
+  export CC=clang
+  export CXX=clang++
+
+  local _orig_cflags="${CFLAGS}"
+  local _orig_cxxflags="${CXXFLAGS}"
+  local _orig_ldflags="${LDFLAGS}"
+
+  local _pgo_dir="${srcdir}/pgo-data"
+  local _cspgo_dir="${srcdir}/cspgo-data"
+  local _pgo_failed=false
+  local _jobs="${MAKEFLAGS:-"-j$(nproc)"}"
+
+  mkdir -p "${_pgo_dir}" "${_cspgo_dir}"
+  trap 'rm -rf "${_pgo_dir}" "${_cspgo_dir}" "${srcdir}/xinerama_pgo_runner" "${srcdir}/xinerama_pgo_workload.c"' EXIT
+
+  # Stage 1: PGO generation
+  local _pgo_gen_flags="-fprofile-generate=${_pgo_dir}"
+  export CFLAGS="${_orig_cflags} ${_pgo_gen_flags}"
+  export CXXFLAGS="${_orig_cxxflags} ${_pgo_gen_flags}"
+  export LDFLAGS="${_orig_ldflags} ${_pgo_gen_flags}"
+
+  ./configure --prefix=/usr || return 1
+  make ${_jobs} || return 1
+
+  export LLVM_PROFILE_FILE="${_pgo_dir}/libxinerama-%p-%m.profraw"
+  _run_xinerama_workload "$PWD" "${_pgo_gen_flags}" "${_orig_cflags}" "${_orig_ldflags}" || _pgo_failed=true
+  unset LLVM_PROFILE_FILE
+
+  if ! ${_pgo_failed}; then
+    mapfile -t _raw_profiles < <(find "${_pgo_dir}" -maxdepth 1 -name '*.profraw' -type f)
+    if (( ${#_raw_profiles[@]} == 0 )); then
+      _pgo_failed=true
+    else
+      llvm-profdata merge -output="${_pgo_dir}/default.profdata" "${_raw_profiles[@]}" || _pgo_failed=true
+    fi
+  fi
+
+  # Stage 2: CS-PGO generation
+  if ! ${_pgo_failed}; then
+    make distclean || true
+
+    local _cspgo_gen_flags="-fprofile-use=${_pgo_dir}/default.profdata -fcs-profile-generate=${_cspgo_dir} -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled"
+    export CFLAGS="${_orig_cflags} ${_cspgo_gen_flags}"
+    export CXXFLAGS="${_orig_cxxflags} ${_cspgo_gen_flags}"
+    export LDFLAGS="${_orig_ldflags} ${_cspgo_gen_flags}"
+
+    ./configure --prefix=/usr || _pgo_failed=true
+    if ! ${_pgo_failed}; then
+      make ${_jobs} || _pgo_failed=true
+    fi
+
+    if ! ${_pgo_failed}; then
+      export LLVM_PROFILE_FILE="${_cspgo_dir}/libxinerama-cs-%p-%m.profraw"
+      _run_xinerama_workload "$PWD" "${_cspgo_gen_flags}" "${_orig_cflags}" "${_orig_ldflags}" || _pgo_failed=true
+      unset LLVM_PROFILE_FILE
+    fi
+
+    if ! ${_pgo_failed}; then
+      mapfile -t _cs_raw_profiles < <(find "${_cspgo_dir}" -maxdepth 1 -name '*.profraw' -type f)
+      if (( ${#_cs_raw_profiles[@]} == 0 )); then
+        cp -f "${_pgo_dir}/default.profdata" "${_cspgo_dir}/cs.profdata" || _pgo_failed=true
+      else
+        llvm-profdata merge -output="${_cspgo_dir}/cs.profdata" \
+          "${_cs_raw_profiles[@]}" "${_pgo_dir}/default.profdata" || _pgo_failed=true
+      fi
+    fi
+  fi
+
+  # Stage 3: final optimized build
+  make distclean || true
+
+  local _final_pgo_flags=""
+  if ! ${_pgo_failed} && [[ -s "${_cspgo_dir}/cs.profdata" ]]; then
+    _final_pgo_flags="-fprofile-use=${_cspgo_dir}/cs.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled"
+  elif ! ${_pgo_failed} && [[ -s "${_pgo_dir}/default.profdata" ]]; then
+    _final_pgo_flags="-fprofile-use=${_pgo_dir}/default.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled"
+  fi
+
+  export CFLAGS="${_orig_cflags} ${_final_pgo_flags}"
+  export CXXFLAGS="${_orig_cxxflags} ${_final_pgo_flags}"
+  export LDFLAGS="${_orig_ldflags} ${_final_pgo_flags}"
+
+  ./configure --prefix=/usr || return 1
+  make ${_jobs} || return 1
 }
 
 package() {
-  cd libXinerama-${pkgver}
+  cd "libXinerama-${pkgver}"
   make DESTDIR="${pkgdir}" install
   install -m755 -d "${pkgdir}/usr/share/licenses/${pkgname}"
   install -m644 COPYING "${pkgdir}/usr/share/licenses/${pkgname}/"
