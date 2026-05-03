@@ -1,3 +1,1580 @@
+--- a/llvm/lib/Transforms/Scalar/DFAJumpThreading.cpp	2026-05-03 12:04:14.478843240 +0200
++++ b/llvm/lib/Transforms/Scalar/DFAJumpThreading.cpp	2026-05-03 12:15:36.617542747 +0200
+@@ -18,7 +18,7 @@
+ //       determinator            det.2   det.3  det.1
+ //        br sw.bb                /        |        \
+ //                          sw.bb.2     sw.bb.3     sw.bb.1
+-//                           br case2    br case3    br case1§
++//                           br case2    br case3    br case1
+ //
+ // Definitions and Terminology:
+ //
+@@ -60,9 +60,12 @@
+ #include "llvm/Transforms/Scalar/DFAJumpThreading.h"
+ #include "llvm/ADT/APInt.h"
+ #include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/DenseSet.h"
+ #include "llvm/ADT/Statistic.h"
+ #include "llvm/ADT/StringExtras.h"
+ #include "llvm/Analysis/AssumptionCache.h"
++#include "llvm/Analysis/BlockFrequencyInfo.h"
++#include "llvm/Analysis/BranchProbabilityInfo.h"
+ #include "llvm/Analysis/CodeMetrics.h"
+ #include "llvm/Analysis/DomTreeUpdater.h"
+ #include "llvm/Analysis/LoopInfo.h"
+@@ -76,7 +79,9 @@
+ #include "llvm/Transforms/Utils/Cloning.h"
+ #include "llvm/Transforms/Utils/SSAUpdaterBulk.h"
+ #include "llvm/Transforms/Utils/ValueMapper.h"
++#include <cmath>
+ #include <deque>
++#include <limits>
+ 
+ #ifdef EXPENSIVE_CHECKS
+ #include "llvm/IR/Verifier.h"
+@@ -89,6 +94,8 @@ using namespace llvm;
+ STATISTIC(NumTransforms, "Number of transformations done");
+ STATISTIC(NumCloned, "Number of blocks cloned");
+ STATISTIC(NumPaths, "Number of individual paths threaded");
++STATISTIC(NumHotPathsPruned,
++          "Number of threading paths pruned by hot-path budget");
+ 
+ namespace llvm {
+ static cl::opt<bool>
+@@ -134,8 +141,37 @@ static cl::opt<unsigned>
+                                "accepted for the transformation"),
+                       cl::Hidden, cl::init(40));
+ 
+-extern cl::opt<bool> ProfcheckDisableMetadataFixes;
++static cl::opt<bool> HotPathHeuristic(
++    "dfa-hot-path-heuristic",
++    cl::desc("Prioritize and prune DFA threading paths by block frequency"),
++    cl::Hidden, cl::init(true));
++
++static cl::opt<unsigned> HotPathCloneBudgetInst(
++    "dfa-hot-path-clone-budget-inst",
++    cl::desc("Instruction clone budget used by hot-path pruning (0 = unlimited)"),
++    cl::Hidden, cl::init(250));
++
++static cl::opt<bool> TracePathHeuristic(
++    "dfa-trace-path-heuristic",
++    cl::desc("Prefer trace-like threading paths (fewer side exits/header crossings)"),
++    cl::Hidden, cl::init(true));
+ 
++static cl::opt<bool> EntropyProfitabilityHeuristic(
++    "dfa-entropy-profitability",
++    cl::desc("Adjust DFA profitability threshold by switch branch entropy"),
++    cl::Hidden, cl::init(true));
++
++static cl::opt<unsigned> RegionCloneBudgetInst(
++    "dfa-region-clone-budget-inst",
++    cl::desc("Absolute max instructions cloned per DFA transform (0 = unlimited)"),
++    cl::Hidden, cl::init(1200));
++
++static cl::opt<double> MaxLoopCloneRate(
++    "dfa-max-loop-clone-rate",
++    cl::desc("Max cloned/original instruction ratio within containing loop"),
++    cl::Hidden, cl::init(2.0));
++
++extern cl::opt<bool> ProfcheckDisableMetadataFixes;
+ } // namespace llvm
+ 
+ namespace {
+@@ -155,23 +191,23 @@ public:
+ class DFAJumpThreading {
+ public:
+   DFAJumpThreading(AssumptionCache *AC, DomTreeUpdater *DTU, LoopInfo *LI,
+-                   TargetTransformInfo *TTI, OptimizationRemarkEmitter *ORE)
+-      : AC(AC), DTU(DTU), LI(LI), TTI(TTI), ORE(ORE) {}
++                   TargetTransformInfo *TTI, OptimizationRemarkEmitter *ORE,
++                   BlockFrequencyInfo *BFI, BranchProbabilityInfo *BPI)
++      : AC(AC), DTU(DTU), LI(LI), TTI(TTI), ORE(ORE), BFI(BFI), BPI(BPI) {}
+ 
+   bool run(Function &F);
+   bool LoopInfoBroken;
+ 
+ private:
+-  void
+-  unfoldSelectInstrs(const SmallVector<SelectInstToUnfold, 4> &SelectInsts) {
++  void unfoldSelectInstrs(const SmallVector<SelectInstToUnfold, 4> &SelectInsts) {
+     SmallVector<SelectInstToUnfold, 4> Stack(SelectInsts);
+ 
+     while (!Stack.empty()) {
+       SelectInstToUnfold SIToUnfold = Stack.pop_back_val();
+ 
+-      std::vector<SelectInstToUnfold> NewSIsToUnfold;
+-      std::vector<BasicBlock *> NewBBs;
+-      unfold(DTU, LI, SIToUnfold, &NewSIsToUnfold, &NewBBs);
++      SmallVector<SelectInstToUnfold, 4> NewSIsToUnfold;
++      SmallVector<BasicBlock *, 4> NewBBs;
++      unfold(DTU, LI, SIToUnfold, NewSIsToUnfold, NewBBs);
+ 
+       // Put newly discovered select instructions into the work list.
+       llvm::append_range(Stack, NewSIsToUnfold);
+@@ -180,14 +216,16 @@ private:
+ 
+   static void unfold(DomTreeUpdater *DTU, LoopInfo *LI,
+                      SelectInstToUnfold SIToUnfold,
+-                     std::vector<SelectInstToUnfold> *NewSIsToUnfold,
+-                     std::vector<BasicBlock *> *NewBBs);
++                     SmallVectorImpl<SelectInstToUnfold> &NewSIsToUnfold,
++                     SmallVectorImpl<BasicBlock *> &NewBBs);
+ 
+   AssumptionCache *AC;
+   DomTreeUpdater *DTU;
+   LoopInfo *LI;
+   TargetTransformInfo *TTI;
+   OptimizationRemarkEmitter *ORE;
++  BlockFrequencyInfo *BFI;
++  BranchProbabilityInfo *BPI;
+ };
+ } // namespace
+ 
+@@ -198,10 +236,10 @@ private:
+ /// created basic blocks into \p NewBBs.
+ ///
+ /// TODO: merge it with CodeGenPrepare::optimizeSelectInst() if possible.
+-void DFAJumpThreading::unfold(DomTreeUpdater *DTU, LoopInfo *LI,
+-                              SelectInstToUnfold SIToUnfold,
+-                              std::vector<SelectInstToUnfold> *NewSIsToUnfold,
+-                              std::vector<BasicBlock *> *NewBBs) {
++void DFAJumpThreading::unfold(
++    DomTreeUpdater *DTU, LoopInfo *LI, SelectInstToUnfold SIToUnfold,
++    SmallVectorImpl<SelectInstToUnfold> &NewSIsToUnfold,
++    SmallVectorImpl<BasicBlock *> &NewBBs) {
+   SelectInst *SI = SIToUnfold.getInst();
+   PHINode *SIUse = SIToUnfold.getUse();
+   assert(SI->hasOneUse());
+@@ -215,7 +253,7 @@ void DFAJumpThreading::unfold(DomTreeUpd
+     BasicBlock *NewBlock = BasicBlock::Create(
+         SI->getContext(), Twine(SI->getName(), ".si.unfold.false"),
+         EndBlock->getParent(), EndBlock);
+-    NewBBs->push_back(NewBlock);
++    NewBBs.push_back(NewBlock);
+     UncondBrInst::Create(EndBlock, NewBlock);
+     DTU->applyUpdates({{DominatorTree::Insert, NewBlock, EndBlock}});
+ 
+@@ -259,9 +297,9 @@ void DFAJumpThreading::unfold(DomTreeUpd
+     }
+ 
+     if (auto *OpSi = dyn_cast<SelectInst>(SIOp1))
+-      NewSIsToUnfold->push_back(SelectInstToUnfold(OpSi, SIUse));
++      NewSIsToUnfold.push_back(SelectInstToUnfold(OpSi, SIUse));
+     if (auto *OpSi = dyn_cast<SelectInst>(SIOp2))
+-      NewSIsToUnfold->push_back(SelectInstToUnfold(OpSi, NewPhi));
++      NewSIsToUnfold.push_back(SelectInstToUnfold(OpSi, NewPhi));
+ 
+     // Insert the real conditional branch based on the original condition.
+     StartBlockTerm->eraseFromParent();
+@@ -280,8 +318,8 @@ void DFAJumpThreading::unfold(DomTreeUpd
+         SI->getContext(), Twine(SI->getName(), ".si.unfold.false"),
+         EndBlock->getParent(), EndBlock);
+ 
+-    NewBBs->push_back(NewBlockT);
+-    NewBBs->push_back(NewBlockF);
++    NewBBs.push_back(NewBlockT);
++    NewBBs.push_back(NewBlockF);
+ 
+     // Def only has one use in EndBlock.
+     // Before transformation:
+@@ -325,9 +363,9 @@ void DFAJumpThreading::unfold(DomTreeUpd
+     NewPhiF->addIncoming(FalseVal, NewBlockT);
+ 
+     if (auto *TrueSI = dyn_cast<SelectInst>(TrueVal))
+-      NewSIsToUnfold->push_back(SelectInstToUnfold(TrueSI, NewPhiT));
++      NewSIsToUnfold.push_back(SelectInstToUnfold(TrueSI, NewPhiT));
+     if (auto *FalseSi = dyn_cast<SelectInst>(FalseVal))
+-      NewSIsToUnfold->push_back(SelectInstToUnfold(FalseSi, NewPhiF));
++      NewSIsToUnfold.push_back(SelectInstToUnfold(FalseSi, NewPhiF));
+ 
+     SIUse->addIncoming(NewPhiT, NewBlockT);
+     SIUse->addIncoming(NewPhiF, NewBlockF);
+@@ -353,7 +391,7 @@ void DFAJumpThreading::unfold(DomTreeUpd
+ 
+   // Preserve loop info
+   if (Loop *L = LI->getLoopFor(StartBlock)) {
+-    for (BasicBlock *NewBB : *NewBBs)
++    for (BasicBlock *NewBB : NewBBs)
+       L->addBasicBlockToLoop(NewBB, *LI);
+   }
+ 
+@@ -374,7 +412,7 @@ typedef std::vector<PathType> PathsType;
+ typedef SmallPtrSet<const BasicBlock *, 8> VisitedBlocks;
+ typedef std::vector<ClonedBlock> CloneList;
+ 
+-// This data structure keeps track of all blocks that have been cloned.  If two
++// This data structure keeps track of all blocks that have been cloned. If two
+ // different ThreadingPaths clone the same block for a certain state it should
+ // be reused, and it can be looked up in this map.
+ typedef DenseMap<BasicBlock *, CloneList> DuplicateBlockMap;
+@@ -702,6 +740,13 @@ private:
+     }
+ 
+     Visited.insert(BB);
++
++    struct EraseOnExit {
++      VisitedBlocks &Visited;
++      BasicBlock *BB;
++      ~EraseOnExit() { Visited.erase(BB); }
++    } Guard{Visited, BB};
++
+     if (++NumVisited > MaxNumVisitiedPaths)
+       return Res;
+ 
+@@ -730,6 +775,7 @@ private:
+         continue;
+ 
+       auto *CurrLoop = LI->getLoopFor(BB);
++      assert(CurrLoop && "BB in SwitchOuterLoop must have a containing loop");
+       // Unlikely to be beneficial.
+       if (Succ == CurrLoop->getHeader())
+         continue;
+@@ -745,10 +791,7 @@ private:
+         Res.push_back(Path);
+       }
+     }
+-    // This block could now be visited again from a different predecessor. Note
+-    // that this will result in exponential runtime. Subpaths could possibly be
+-    // cached but it takes a lot of memory to store them.
+-    Visited.erase(BB);
++
+     return Res;
+   }
+ 
+@@ -756,18 +799,22 @@ private:
+   /// PHI nodes in those blocks that define the state.
+   StateDefMap getStateDefMap() const {
+     StateDefMap Res;
++    DenseSet<const BasicBlock *> MultipleDefBBs;
+     PHINode *FirstDef = dyn_cast<PHINode>(Switch->getOperand(0));
+     assert(FirstDef && "The first definition must be a phi.");
+ 
+     SmallVector<PHINode *, 8> Stack;
+     Stack.push_back(FirstDef);
+     SmallPtrSet<Value *, 16> SeenValues;
++    SeenValues.insert(FirstDef);
+ 
+     while (!Stack.empty()) {
+       PHINode *CurPhi = Stack.pop_back_val();
++      BasicBlock *CurDefBlock = CurPhi->getParent();
+ 
+-      Res[CurPhi->getParent()] = CurPhi;
+-      SeenValues.insert(CurPhi);
++      auto [It, Inserted] = Res.try_emplace(CurDefBlock, CurPhi);
++      if (!Inserted && It->second != CurPhi)
++        MultipleDefBBs.insert(CurDefBlock);
+ 
+       for (BasicBlock *IncomingBB : CurPhi->blocks()) {
+         PHINode *IncomingPhi =
+@@ -775,13 +822,20 @@ private:
+         if (!IncomingPhi)
+           continue;
+         bool IsOutsideLoops = !SwitchOuterLoop->contains(IncomingBB);
+-        if (SeenValues.contains(IncomingPhi) || IsOutsideLoops)
++        if (IsOutsideLoops || !SeenValues.insert(IncomingPhi).second)
+           continue;
+ 
+         Stack.push_back(IncomingPhi);
+       }
+     }
+ 
++    // NOTE: If multiple phi definitions exist in a block, we cannot
++    // thread paths with such block by simple cloning.
++    for (const BasicBlock *BB : MultipleDefBBs) {
++      LLVM_DEBUG(dbgs() << "Not a state-defining block: Multiple defs in "
++                        << BB->getNameOrAsOperand() << "\n");
++      Res.erase(BB);
++    }
+     return Res;
+   }
+ 
+@@ -880,11 +934,16 @@ struct TransformDFA {
+   TransformDFA(AllSwitchPaths *SwitchPaths, DomTreeUpdater *DTU,
+                AssumptionCache *AC, TargetTransformInfo *TTI,
+                OptimizationRemarkEmitter *ORE,
+-               SmallPtrSet<const Value *, 32> EphValues)
++               SmallPtrSet<const Value *, 32> EphValues,
++               BlockFrequencyInfo *BFI, BranchProbabilityInfo *BPI, LoopInfo *LI)
+       : SwitchPaths(SwitchPaths), DTU(DTU), AC(AC), TTI(TTI), ORE(ORE),
+-        EphValues(EphValues) {}
++        EphValues(EphValues), BFI(BFI), BPI(BPI), LI(LI) {}
+ 
+   bool run() {
++    prioritizeAndPruneThreadingPaths();
++    if (SwitchPaths->getThreadingPaths().empty())
++      return false;
++
+     if (isLegalAndProfitableToTransform()) {
+       createAllExitPaths();
+       NumTransforms++;
+@@ -894,6 +953,238 @@ struct TransformDFA {
+   }
+ 
+ private:
++  struct PathScore {
++    unsigned Index = 0;
++    uint64_t MinFreq = 0;
++    uint64_t SumFreq = 0;
++    unsigned SideExits = 0;
++    unsigned HeaderCrossings = 0;
++    unsigned Length = 0;
++  };
++
++  void prioritizeAndPruneThreadingPaths() {
++    if (!HotPathHeuristic)
++      return;
++
++    auto &Paths = SwitchPaths->getThreadingPaths();
++    if (Paths.size() <= 1)
++      return;
++
++    BasicBlock *SwitchBlock = SwitchPaths->getSwitchBlock();
++
++    auto stateSeen = [](DenseMap<BasicBlock *, SmallVector<APInt, 4>> &Seen,
++                        BasicBlock *BB, const APInt &State) -> bool {
++      auto It = Seen.find(BB);
++      if (It == Seen.end())
++        return false;
++      return llvm::any_of(It->second, [&](const APInt &S) { return S == State; });
++    };
++
++    auto markStateSeen = [](DenseMap<BasicBlock *, SmallVector<APInt, 4>> &Seen,
++                            BasicBlock *BB, const APInt &State) {
++      Seen[BB].push_back(State);
++    };
++
++    auto computeScore = [&](const ThreadingPath &TPath, unsigned Idx) -> PathScore {
++      PathScore S;
++      S.Index = Idx;
++
++      const PathType &PathBBs = TPath.getPath();
++      const BasicBlock *Determinator = TPath.getDeterminatorBB();
++      auto It = llvm::find(PathBBs, Determinator);
++      if (It == PathBBs.end())
++        return S;
++
++      if (!PathBBs.empty() && PathBBs.front() == Determinator)
++        ++It;
++      if (It == PathBBs.end())
++        return S;
++
++      SmallPtrSet<const BasicBlock *, 32> PathSet(PathBBs.begin(), PathBBs.end());
++
++      uint64_t MinF = std::numeric_limits<uint64_t>::max();
++      uint64_t SumF = 0;
++      unsigned SideExitCount = 0;
++      unsigned HeaderCount = 0;
++      unsigned Len = 0;
++
++      for (auto Cur = It; Cur != PathBBs.end(); ++Cur) {
++        BasicBlock *BB = *Cur;
++        ++Len;
++
++        if (BFI) {
++          uint64_t F = BFI->getBlockFreq(BB).getFrequency();
++          MinF = std::min(MinF, F);
++          SumF += F;
++        }
++
++        if (TracePathHeuristic) {
++          if (LI && LI->isLoopHeader(BB))
++            ++HeaderCount;
++
++          for (BasicBlock *Succ : successors(BB)) {
++            if (!PathSet.contains(Succ))
++              ++SideExitCount;
++          }
++        }
++      }
++
++      if (MinF == std::numeric_limits<uint64_t>::max())
++        MinF = 0;
++
++      S.MinFreq = MinF;
++      S.SumFreq = SumF;
++      S.SideExits = SideExitCount;
++      S.HeaderCrossings = HeaderCount;
++      S.Length = Len;
++      return S;
++    };
++
++    auto estimateIncrementalCloneInsts =
++        [&](const ThreadingPath &TPath,
++            DenseMap<BasicBlock *, SmallVector<APInt, 4>> &Seen) -> uint64_t {
++      uint64_t Cost = 0;
++      APInt State = TPath.getExitValue();
++
++      // Switch block is always cloned per state.
++      if (!stateSeen(Seen, SwitchBlock, State)) {
++        Cost += SwitchBlock->size();
++        markStateSeen(Seen, SwitchBlock, State);
++      }
++
++      const PathType &PathBBs = TPath.getPath();
++      const BasicBlock *Determinator = TPath.getDeterminatorBB();
++
++      auto It = llvm::find(PathBBs, Determinator);
++      if (It == PathBBs.end())
++        return Cost;
++
++      if (!PathBBs.empty() && PathBBs.front() == Determinator)
++        ++It;
++
++      for (; It != PathBBs.end(); ++It) {
++        BasicBlock *BB = *It;
++        if (stateSeen(Seen, BB, State))
++          continue;
++        Cost += BB->size();
++        markStateSeen(Seen, BB, State);
++      }
++
++      return Cost;
++    };
++
++    SmallVector<PathScore, 16> Ranked;
++    Ranked.reserve(Paths.size());
++    for (unsigned I = 0, E = Paths.size(); I != E; ++I)
++      Ranked.push_back(computeScore(Paths[I], I));
++
++    llvm::stable_sort(Ranked, [](const PathScore &A, const PathScore &B) {
++      if (A.MinFreq != B.MinFreq)
++        return A.MinFreq > B.MinFreq;
++      if (A.SideExits != B.SideExits)
++        return A.SideExits < B.SideExits;
++      if (A.HeaderCrossings != B.HeaderCrossings)
++        return A.HeaderCrossings < B.HeaderCrossings;
++      if (A.SumFreq != B.SumFreq)
++        return A.SumFreq > B.SumFreq;
++      if (A.Length != B.Length)
++        return A.Length < B.Length;
++      return A.Index < B.Index;
++    });
++
++    const uint64_t Budget = HotPathCloneBudgetInst.getValue();
++    const bool Unlimited = (Budget == 0);
++
++    DenseMap<BasicBlock *, SmallVector<APInt, 4>> SeenPairs;
++    SmallVector<ThreadingPath, 16> Selected;
++    Selected.reserve(Paths.size());
++
++    uint64_t UsedBudget = 0;
++    unsigned FallbackIdx = Ranked.empty() ? 0 : Ranked.front().Index;
++
++    for (const PathScore &S : Ranked) {
++      ThreadingPath &Path = Paths[S.Index];
++
++      DenseMap<BasicBlock *, SmallVector<APInt, 4>> SeenTmp = SeenPairs;
++      uint64_t Inc = estimateIncrementalCloneInsts(Path, SeenTmp);
++
++      if (!Unlimited && UsedBudget + Inc > Budget)
++        continue;
++
++      estimateIncrementalCloneInsts(Path, SeenPairs);
++      UsedBudget += Inc;
++      Selected.push_back(Path);
++    }
++
++    if (Selected.empty() && !Paths.empty()) {
++      Selected.push_back(Paths[FallbackIdx]);
++      NumHotPathsPruned += Paths.size() - 1;
++      Paths = std::vector<ThreadingPath>(Selected.begin(), Selected.end());
++      return;
++    }
++
++    if (Selected.size() < Paths.size())
++      NumHotPathsPruned += (Paths.size() - Selected.size());
++
++    Paths = std::vector<ThreadingPath>(Selected.begin(), Selected.end());
++  }
++
++  uint64_t getContainingLoopInstCount() const {
++    if (!LI)
++      return 0;
++    BasicBlock *SwitchBB = SwitchPaths->getSwitchBlock();
++    Loop *L = LI->getLoopFor(SwitchBB);
++    if (!L)
++      return 0;
++
++    uint64_t Count = 0;
++    for (BasicBlock *BB : L->blocks())
++      Count += BB->size();
++    return Count;
++  }
++
++  unsigned getEntropyAdjustedThreshold(const SwitchInst *Switch) const {
++    if (!EntropyProfitabilityHeuristic || !BPI)
++      return CostThreshold;
++
++    const BasicBlock *SwitchBB = Switch->getParent();
++    unsigned NSucc = Switch->getNumSuccessors();
++    if (NSucc <= 1)
++      return CostThreshold;
++
++    double Entropy = 0.0;
++    double MaxP = 0.0;
++
++    for (unsigned I = 0; I < NSucc; ++I) {
++      BranchProbability P = BPI->getEdgeProbability(SwitchBB, I);
++      double Pd = static_cast<double>(P.getNumerator()) /
++      static_cast<double>(P.getDenominator());
++      MaxP = std::max(MaxP, Pd);
++      if (Pd > 0.0)
++        Entropy -= Pd * std::log2(Pd);
++    }
++
++    double MaxEntropy = std::log2(static_cast<double>(NSucc));
++    double NormEntropy = (MaxEntropy > 0.0) ? (Entropy / MaxEntropy) : 0.0;
++    NormEntropy = std::max(0.0, std::min(1.0, NormEntropy));
++
++    // Threshold scale:
++    // - high entropy (harder predictability) => larger threshold (accept more)
++    // - high dominance (easy predictability) => smaller threshold
++    int EntropyScale = 900 + static_cast<int>(std::llround(350.0 * NormEntropy));
++    int DominancePenalty = 0;
++    if (MaxP > 0.70)
++      DominancePenalty = static_cast<int>(
++        std::llround(((MaxP - 0.70) / 0.30) * 200.0)); // up to 200 permille
++
++      int ScalePermille = std::max(700, std::min(1300, EntropyScale - DominancePenalty));
++    uint64_t Adjusted =
++    (static_cast<uint64_t>(CostThreshold) * static_cast<uint64_t>(ScalePermille) + 999) /
++    1000;
++
++    return static_cast<unsigned>(std::max<uint64_t>(1, Adjusted));
++  }
++
+   /// This function performs both a legality check and profitability check at
+   /// the same time since it is convenient to do so. It iterates through all
+   /// blocks that will be cloned, and keeps track of the duplication cost. It
+@@ -911,11 +1202,11 @@ private:
+     // just being used to ensure (BB, State) pairs are only counted once.
+     DuplicateBlockMap DuplicateMap;
+     for (ThreadingPath &TPath : SwitchPaths->getThreadingPaths()) {
+-      PathType PathBBs = TPath.getPath();
++      const PathType &PathBBs = TPath.getPath();
+       APInt NextState = TPath.getExitValue();
+       const BasicBlock *Determinator = TPath.getDeterminatorBB();
+ 
+-      // Update Metrics for the Switch block, this is always cloned
++      // Update Metrics for the Switch block, this is always cloned.
+       BasicBlock *BB = SwitchPaths->getSwitchBlock();
+       BasicBlock *VisitedBB = getClonedBB(BB, NextState, DuplicateMap);
+       if (!VisitedBB) {
+@@ -926,13 +1217,13 @@ private:
+ 
+       // If the Switch block is the Determinator, then we can continue since
+       // this is the only block that is cloned and we already counted for it.
+-      if (PathBBs.front() == Determinator)
++      if (!PathBBs.empty() && PathBBs.front() == Determinator)
+         continue;
+ 
+       // Otherwise update Metrics for all blocks that will be cloned. If any
+       // block is already cloned and would be reused, don't double count it.
+       auto DetIt = llvm::find(PathBBs, Determinator);
+-      for (auto BBIt = DetIt; BBIt != PathBBs.end(); BBIt++) {
++      for (auto BBIt = DetIt; BBIt != PathBBs.end(); ++BBIt) {
+         BB = *BBIt;
+         VisitedBB = getClonedBB(BB, NextState, DuplicateMap);
+         if (VisitedBB)
+@@ -968,25 +1259,46 @@ private:
+         LLVM_DEBUG(dbgs() << "DFA Jump Threading: Not jump threading, contains "
+                           << "instructions with invalid cost.\n");
+         ORE->emit([&]() {
+-          return OptimizationRemarkMissed(DEBUG_TYPE, "ConvergentInst", Switch)
++          return OptimizationRemarkMissed(DEBUG_TYPE, "InvalidCost", Switch)
+                  << "Contains instructions with invalid cost.";
+         });
+         return false;
+       }
+     }
+ 
+-    // Too much cloned instructions slow down later optimizations, especially
+-    // SLPVectorizer.
+-    // TODO: Thread the switch partially before reaching the threshold.
+     uint64_t NumOrigInst = 0;
+     uint64_t NumOuterUseBlock = 0;
+-    for (auto *BB : DuplicateMap.keys()) {
++    for (BasicBlock *BB : DuplicateMap.keys()) {
+       NumOrigInst += BB->size();
+       // Only unduplicated blocks with single predecessor require new phi
+       // nodes.
+-      for (auto *Succ : successors(BB))
++      for (BasicBlock *Succ : successors(BB))
+         if (!DuplicateMap.count(Succ) && Succ->getSinglePredecessor())
+-          NumOuterUseBlock++;
++          ++NumOuterUseBlock;
++    }
++
++    if (NumOrigInst == 0)
++      return false;
++
++    if (RegionCloneBudgetInst != 0 && NumClonedInst > RegionCloneBudgetInst) {
++      ORE->emit([&]() {
++        return OptimizationRemarkMissed(DEBUG_TYPE, "NotProfitable", Switch)
++               << "Cloned instructions exceed region budget.";
++      });
++      return false;
++    }
++
++    uint64_t LoopInstCount = getContainingLoopInstCount();
++    if (LoopInstCount > 0) {
++      double LoopCloneRate = static_cast<double>(NumClonedInst) /
++                             static_cast<double>(LoopInstCount);
++      if (LoopCloneRate > MaxLoopCloneRate) {
++        ORE->emit([&]() {
++          return OptimizationRemarkMissed(DEBUG_TYPE, "NotProfitable", Switch)
++                 << "Cloned instructions exceed max loop clone rate.";
++        });
++        return false;
++      }
+     }
+ 
+     if (double(NumClonedInst) / double(NumOrigInst) > MaxClonedRate) {
+@@ -1000,9 +1312,7 @@ private:
+     }
+ 
+     // Too much unduplicated blocks with outer uses may cause too much
+-    // insertions of phi nodes for duplicated definitions. TODO: Drop this
+-    // threshold if we come up with another way to reduce the number of inserted
+-    // phi nodes.
++    // insertions of phi nodes for duplicated definitions.
+     if (NumOuterUseBlock > MaxOuterUseBlocks) {
+       LLVM_DEBUG(dbgs() << "DFA Jump Threading: Not jump threading, too much "
+                            "blocks with outer uses\n");
+@@ -1029,26 +1339,26 @@ private:
+       DuplicationCost = Metrics.NumInsts / CondBranches;
+     } else {
+       // Compared with jump tables, the DFA optimizer removes an indirect branch
+-      // on each loop iteration, thus making branch prediction more precise. The
+-      // more branch targets there are, the more likely it is for the branch
+-      // predictor to make a mistake, and the more benefit there is in the DFA
+-      // optimizer. Thus, the more branch targets there are, the lower is the
+-      // cost of the DFA opt.
++      // on each loop iteration, thus making branch prediction more precise.
+       DuplicationCost = Metrics.NumInsts / JumpTableSize;
+     }
+ 
++    const unsigned EffectiveThreshold = getEntropyAdjustedThreshold(Switch);
++
+     LLVM_DEBUG(dbgs() << "\nDFA Jump Threading: Cost to jump thread block "
+                       << SwitchPaths->getSwitchBlock()->getName()
+-                      << " is: " << DuplicationCost << "\n\n");
++                      << " is: " << DuplicationCost
++                      << ", threshold: " << EffectiveThreshold << "\n\n");
+ 
+-    if (DuplicationCost > CostThreshold) {
++    if (DuplicationCost > EffectiveThreshold) {
+       LLVM_DEBUG(dbgs() << "Not jump threading, duplication cost exceeds the "
+                         << "cost threshold.\n");
+       ORE->emit([&]() {
+         return OptimizationRemarkMissed(DEBUG_TYPE, "NotProfitable", Switch)
+-               << "Duplication cost exceeds the cost threshold (cost="
++               << "Duplication cost exceeds the effective threshold (cost="
+                << ore::NV("Cost", DuplicationCost)
+-               << ", threshold=" << ore::NV("Threshold", CostThreshold) << ").";
++               << ", threshold=" << ore::NV("Threshold", EffectiveThreshold)
++               << ").";
+       });
+       return false;
+     }
+@@ -1109,17 +1419,30 @@ private:
+                       DomTreeUpdater *DTU) {
+     APInt NextState = Path.getExitValue();
+     const BasicBlock *Determinator = Path.getDeterminatorBB();
+-    PathType PathBBs = Path.getPath();
+-
+-    // Don't select the placeholder block in front
+-    if (PathBBs.front() == Determinator)
+-      PathBBs.pop_front();
++    const PathType &PathBBs = Path.getPath();
+ 
+     auto DetIt = llvm::find(PathBBs, Determinator);
+-    // When there is only one BB in PathBBs, the determinator takes itself as a
+-    // direct predecessor.
+-    BasicBlock *PrevBB = PathBBs.size() == 1 ? *DetIt : *std::prev(DetIt);
+-    for (auto BBIt = DetIt; BBIt != PathBBs.end(); BBIt++) {
++    if (DetIt == PathBBs.end())
++      return;
++
++    auto BeginIt = DetIt;
++    // Skip placeholder when determinator is the placeholder block itself.
++    if (!PathBBs.empty() && PathBBs.front() == Determinator)
++      ++BeginIt;
++
++    if (BeginIt == PathBBs.end())
++      return;
++
++    BasicBlock *PrevBB = nullptr;
++    if (std::next(BeginIt) == PathBBs.end()) {
++      PrevBB = *BeginIt;
++    } else if (BeginIt == PathBBs.begin()) {
++      PrevBB = *BeginIt;
++    } else {
++      PrevBB = *std::prev(BeginIt);
++    }
++
++    for (auto BBIt = BeginIt; BBIt != PathBBs.end(); ++BBIt) {
+       BasicBlock *BB = *BBIt;
+       BlocksToClean.insert(BB);
+ 
+@@ -1154,7 +1477,7 @@ private:
+     for (const auto &KV : NewDefs) {
+       Instruction *I = KV.first;
+       BasicBlock *BB = I->getParent();
+-      std::vector<Instruction *> Cloned = KV.second;
++      const std::vector<Instruction *> &Cloned = KV.second;
+ 
+       // Scan all uses of this instruction to see if it is used outside of its
+       // block, and if so, record them in UsesToRename.
+@@ -1177,9 +1500,8 @@ private:
+       LLVM_DEBUG(dbgs() << "DFA-JT: Renaming non-local uses of: " << *I
+                         << "\n");
+ 
+-      // We found a use of I outside of BB.  Rename all uses of I that are
+-      // outside its block to be uses of the appropriate PHI node etc.  See
+-      // ValuesInBlocks with the values we know.
++      // We found a use of I outside of BB. Rename all uses of I that are
++      // outside its block to be uses of the appropriate PHI node etc.
+       unsigned VarNum = SSAUpdate.AddVariable(I->getName(), I->getType());
+       SSAUpdate.AddAvailableValue(VarNum, BB, I);
+       for (Instruction *New : Cloned)
+@@ -1197,20 +1519,17 @@ private:
+ 
+   /// Helper to get the successor corresponding to a particular case value for
+   /// a switch statement.
+-  /// TODO: Unify it with SwitchPaths->getNextCaseSuccessor(SwitchInst *Switch)
+-  /// by updating cached value => successor mapping during threading.
+-  static BasicBlock *getNextCaseSuccessor(SwitchInst *Switch,
+-                                          const APInt &NextState) {
+-    BasicBlock *NextCase = nullptr;
+-    for (auto Case : Switch->cases()) {
+-      if (Case.getCaseValue()->getValue() == NextState) {
+-        NextCase = Case.getCaseSuccessor();
+-        break;
+-      }
++  BasicBlock *getNextCaseSuccessor(const APInt &NextState) {
++    if (CaseValToDestCache.empty()) {
++      SwitchInst *Switch = SwitchPaths->getSwitchInst();
++      for (auto Case : Switch->cases())
++        CaseValToDestCache[Case.getCaseValue()->getValue()] =
++            Case.getCaseSuccessor();
++      DefaultDestCache = Switch->getDefaultDest();
+     }
+-    if (!NextCase)
+-      NextCase = Switch->getDefaultDest();
+-    return NextCase;
++
++    auto It = CaseValToDestCache.find(NextState);
++    return It == CaseValToDestCache.end() ? DefaultDestCache : It->second;
+   }
+ 
+   /// Clones a basic block, and adds it to the CFG.
+@@ -1251,7 +1570,6 @@ private:
+       if (SuccSet.insert(SuccBB).second)
+         DTU->applyUpdates({{DominatorTree::Insert, NewBB, SuccBB}});
+     }
+-    SuccSet.clear();
+     return NewBB;
+   }
+ 
+@@ -1262,46 +1580,55 @@ private:
+   void updateSuccessorPhis(BasicBlock *BB, BasicBlock *ClonedBB,
+                            const APInt &NextState, ValueToValueMapTy &VMap,
+                            DuplicateBlockMap &DuplicateMap) {
+-    std::vector<BasicBlock *> BlocksToUpdate;
++    SmallVector<BasicBlock *, 8> BlocksToUpdate;
++    SmallPtrSet<BasicBlock *, 8> SeenBlocks;
++
++    auto AddBlockIfNew = [&](BasicBlock *Succ) {
++      if (SeenBlocks.insert(Succ).second)
++        BlocksToUpdate.push_back(Succ);
++    };
+ 
+     // If BB is the last block in the path, we can simply update the one case
+     // successor that will be reached.
+     if (BB == SwitchPaths->getSwitchBlock()) {
+-      SwitchInst *Switch = SwitchPaths->getSwitchInst();
+-      BasicBlock *NextCase = getNextCaseSuccessor(Switch, NextState);
+-      BlocksToUpdate.push_back(NextCase);
++      BasicBlock *NextCase = getNextCaseSuccessor(NextState);
++      AddBlockIfNew(NextCase);
+       BasicBlock *ClonedSucc = getClonedBB(NextCase, NextState, DuplicateMap);
+       if (ClonedSucc)
+-        BlocksToUpdate.push_back(ClonedSucc);
++        AddBlockIfNew(ClonedSucc);
+     }
+     // Otherwise update phis in all successors.
+     else {
+       for (BasicBlock *Succ : successors(BB)) {
+-        BlocksToUpdate.push_back(Succ);
++        AddBlockIfNew(Succ);
+ 
+         // Check if a successor has already been cloned for the particular exit
+         // value. In this case if a successor was already cloned, the phi nodes
+         // in the cloned block should be updated directly.
+         BasicBlock *ClonedSucc = getClonedBB(Succ, NextState, DuplicateMap);
+         if (ClonedSucc)
+-          BlocksToUpdate.push_back(ClonedSucc);
++          AddBlockIfNew(ClonedSucc);
+       }
+     }
+ 
+-    // If there is a phi with an incoming value from BB, create a new incoming
+-    // value for the new predecessor ClonedBB. The value will either be the same
+-    // value from BB or a cloned value.
++    // If there is a phi with incoming values from BB, create corresponding new
++    // incoming values for ClonedBB (handles multi-edge CFG).
+     for (BasicBlock *Succ : BlocksToUpdate) {
+       for (PHINode &Phi : Succ->phis()) {
+-        Value *Incoming = Phi.getIncomingValueForBlock(BB);
+-        if (Incoming) {
++        SmallVector<Value *, 4> IncomingVals;
++        for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I) {
++          if (Phi.getIncomingBlock(I) == BB)
++            IncomingVals.push_back(Phi.getIncomingValue(I));
++        }
++
++        for (Value *Incoming : IncomingVals) {
+           if (isa<Constant>(Incoming)) {
+             Phi.addIncoming(Incoming, ClonedBB);
+             continue;
+           }
+-          Value *ClonedVal = VMap[Incoming];
+-          if (ClonedVal)
+-            Phi.addIncoming(ClonedVal, ClonedBB);
++          auto It = VMap.find(Incoming);
++          if (It != VMap.end() && It->second)
++            Phi.addIncoming(It->second, ClonedBB);
+           else
+             Phi.addIncoming(Incoming, ClonedBB);
+         }
+@@ -1313,18 +1640,26 @@ private:
+   /// other successors are kept as well.
+   void updatePredecessor(BasicBlock *PrevBB, BasicBlock *OldBB,
+                          BasicBlock *NewBB, DomTreeUpdater *DTU) {
+-    // When a path is reused, there is a chance that predecessors were already
+-    // updated before. Check if the predecessor needs to be updated first.
+-    if (!isPredecessor(OldBB, PrevBB))
+-      return;
+-
+     Instruction *PrevTerm = PrevBB->getTerminator();
+-    for (unsigned Idx = 0; Idx < PrevTerm->getNumSuccessors(); Idx++) {
++    bool HasOldSucc = false;
++    for (unsigned Idx = 0, E = PrevTerm->getNumSuccessors(); Idx != E; ++Idx) {
+       if (PrevTerm->getSuccessor(Idx) == OldBB) {
+-        OldBB->removePredecessor(PrevBB, /* KeepOneInputPHIs = */ true);
+-        PrevTerm->setSuccessor(Idx, NewBB);
++        HasOldSucc = true;
++        break;
+       }
+     }
++
++    if (!HasOldSucc)
++      return;
++
++    // Use the safe CFG API for PHI updates to avoid iterator invalidation and
++    // malformed PHIs.
++    OldBB->removePredecessor(PrevBB, /*KeepOneInputPHIs=*/true);
++
++    for (unsigned Idx = 0, E = PrevTerm->getNumSuccessors(); Idx != E; ++Idx)
++      if (PrevTerm->getSuccessor(Idx) == OldBB)
++        PrevTerm->setSuccessor(Idx, NewBB);
++
+     DTU->applyUpdates({{DominatorTree::Delete, PrevBB, OldBB},
+                        {DominatorTree::Insert, PrevBB, NewBB}});
+   }
+@@ -1335,7 +1670,7 @@ private:
+     SmallVector<std::pair<Instruction *, Instruction *>> NewDefsVector;
+     NewDefsVector.reserve(VMap.size());
+ 
+-    for (auto Entry : VMap) {
++    for (const auto &Entry : VMap) {
+       Instruction *Inst =
+           dyn_cast<Instruction>(const_cast<Value *>(Entry.first));
+       if (!Inst || !Entry.second ||
+@@ -1371,13 +1706,15 @@ private:
+     APInt NextState = TPath.getExitValue();
+     BasicBlock *BB = TPath.getPath().back();
+     BasicBlock *LastBlock = getClonedBB(BB, NextState, DuplicateMap);
++    if (!LastBlock)
++      return;
+ 
+     // Note multiple paths can end at the same block so check that it is not
+     // updated yet
+     if (!isa<SwitchInst>(LastBlock->getTerminator()))
+       return;
+     SwitchInst *Switch = cast<SwitchInst>(LastBlock->getTerminator());
+-    BasicBlock *NextCase = getNextCaseSuccessor(Switch, NextState);
++    BasicBlock *NextCase = getNextCaseSuccessor(NextState);
+ 
+     std::vector<DominatorTree::UpdateType> DTUpdates;
+     SmallPtrSet<BasicBlock *, 4> SuccSet;
+@@ -1387,7 +1724,7 @@ private:
+     }
+ 
+     Switch->eraseFromParent();
+-    UncondBrInst::Create(NextCase, LastBlock);
++    BranchInst::Create(NextCase, LastBlock);
+ 
+     DTU->applyUpdates(DTUpdates);
+   }
+@@ -1404,31 +1741,47 @@ private:
+       return;
+     }
+ 
+-    // Remove any incoming values that come from an invalid predecessor
+-    for (PHINode &Phi : BB->phis())
+-      Phi.removeIncomingValueIf([&](unsigned Index) {
+-        BasicBlock *IncomingBB = Phi.getIncomingBlock(Index);
+-        return !isPredecessor(BB, IncomingBB);
+-      });
++    DenseMap<BasicBlock *, unsigned> PredEdgeCounts;
++    for (BasicBlock *Pred : predecessors(BB)) {
++      Instruction *TI = Pred->getTerminator();
++      for (unsigned I = 0, E = TI->getNumSuccessors(); I != E; ++I)
++        if (TI->getSuccessor(I) == BB)
++          ++PredEdgeCounts[Pred];
++    }
++
++    // Remove incoming values that come from invalid predecessors or exceed
++    // predecessor edge multiplicity.
++    for (PHINode &Phi : BB->phis()) {
++      DenseMap<BasicBlock *, unsigned> IncomingCounts;
++      for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I)
++        ++IncomingCounts[Phi.getIncomingBlock(I)];
++
++      for (int I = static_cast<int>(Phi.getNumIncomingValues()) - 1; I >= 0;
++           --I) {
++        BasicBlock *IncomingBB = Phi.getIncomingBlock(I);
++        unsigned Allowed = PredEdgeCounts.lookup(IncomingBB);
++        unsigned &Count = IncomingCounts[IncomingBB];
++        if (Allowed == 0 || Count > Allowed) {
++          Phi.removeIncomingValue(I, /*DeletePHIIfEmpty=*/false);
++          --Count;
++        }
++      }
++    }
+   }
+ 
+   /// Checks if BB was already cloned for a particular next state value. If it
+   /// was then it returns this cloned block, and otherwise null.
+   BasicBlock *getClonedBB(BasicBlock *BB, const APInt &NextState,
+                           DuplicateBlockMap &DuplicateMap) {
+-    CloneList ClonedBBs = DuplicateMap[BB];
++    auto MIt = DuplicateMap.find(BB);
++    if (MIt == DuplicateMap.end())
++      return nullptr;
+ 
+-    // Find an entry in the CloneList with this NextState. If it exists then
+-    // return the corresponding BB
+-    auto It = llvm::find_if(ClonedBBs, [NextState](const ClonedBlock &C) {
++    const CloneList &ClonedBBs = MIt->second;
++    auto It = llvm::find_if(ClonedBBs, [&](const ClonedBlock &C) {
+       return C.State == NextState;
+     });
+-    return It != ClonedBBs.end() ? (*It).BB : nullptr;
+-  }
+-
+-  /// Returns true if IncomingBB is a predecessor of BB.
+-  bool isPredecessor(BasicBlock *BB, BasicBlock *IncomingBB) {
+-    return llvm::is_contained(predecessors(BB), IncomingBB);
++    return It != ClonedBBs.end() ? It->BB : nullptr;
+   }
+ 
+   AllSwitchPaths *SwitchPaths;
+@@ -1438,6 +1791,11 @@ private:
+   OptimizationRemarkEmitter *ORE;
+   SmallPtrSet<const Value *, 32> EphValues;
+   std::vector<ThreadingPath> TPaths;
++  DenseMap<APInt, BasicBlock *> CaseValToDestCache;
++  BasicBlock *DefaultDestCache = nullptr;
++  BlockFrequencyInfo *BFI;
++  BranchProbabilityInfo *BPI;
++  LoopInfo *LI;
+ };
+ } // namespace
+ 
+@@ -1484,14 +1842,11 @@ bool DFAJumpThreading::run(Function &F)
+     SwitchPaths.run();
+ 
+     if (SwitchPaths.getNumThreadingPaths() > 0) {
+-      ThreadableLoops.push_back(SwitchPaths);
++      ThreadableLoops.push_back(std::move(SwitchPaths));
+ 
+       // For the time being limit this optimization to occurring once in a
+-      // function since it can change the CFG significantly. This is not a
+-      // strict requirement but it can cause buggy behavior if there is an
+-      // overlap of blocks in different opportunities. There is a lot of room to
+-      // experiment with catching more opportunities here.
+-      // NOTE: To release this contraint, we must handle LoopInfo invalidation
++      // function since it can change the CFG significantly.
++      // NOTE: To release this contraint, we must handle LoopInfo invalidation.
+       break;
+     }
+   }
+@@ -1501,11 +1856,12 @@ bool DFAJumpThreading::run(Function &F)
+ #endif
+ 
+   SmallPtrSet<const Value *, 32> EphValues;
+-  if (ThreadableLoops.size() > 0)
++  if (!ThreadableLoops.empty())
+     CodeMetrics::collectEphemeralValues(&F, AC, EphValues);
+ 
+-  for (AllSwitchPaths SwitchPaths : ThreadableLoops) {
+-    TransformDFA Transform(&SwitchPaths, DTU, AC, TTI, ORE, EphValues);
++  for (AllSwitchPaths &SwitchPaths : ThreadableLoops) {
++    TransformDFA Transform(&SwitchPaths, DTU, AC, TTI, ORE, EphValues,
++                           BFI, BPI, LI);
+     if (Transform.run())
+       MadeChanges = LoopInfoBroken = true;
+   }
+@@ -1530,10 +1886,12 @@ PreservedAnalyses DFAJumpThreadingPass::
+   DominatorTree &DT = AM.getResult<DominatorTreeAnalysis>(F);
+   LoopInfo &LI = AM.getResult<LoopAnalysis>(F);
+   TargetTransformInfo &TTI = AM.getResult<TargetIRAnalysis>(F);
++  BlockFrequencyInfo &BFI = AM.getResult<BlockFrequencyAnalysis>(F);
++  BranchProbabilityInfo &BPI = AM.getResult<BranchProbabilityAnalysis>(F);
+   OptimizationRemarkEmitter ORE(&F);
+ 
+   DomTreeUpdater DTU(DT, DomTreeUpdater::UpdateStrategy::Lazy);
+-  DFAJumpThreading ThreadImpl(&AC, &DTU, &LI, &TTI, &ORE);
++  DFAJumpThreading ThreadImpl(&AC, &DTU, &LI, &TTI, &ORE, &BFI, &BPI);
+   if (!ThreadImpl.run(F))
+     return PreservedAnalyses::all();
+ 
+
+--- a/llvm/lib/Target/X86/X86InstrInfo.cpp	2026-05-03 11:08:44.783579748 +0200
++++ b/llvm/lib/Target/X86/X86InstrInfo.cpp	2026-05-03 11:32:44.535054636 +0200
+@@ -4913,7 +4913,57 @@ bool X86InstrInfo::isRedundantFlagInstr(
+                                         Register SrcReg, Register SrcReg2,
+                                         int64_t ImmMask, int64_t ImmValue,
+                                         const MachineInstr &OI, bool *IsSwapped,
+-                                        int64_t *ImmDelta) const {
++                                        int64_t *ImmDelta,
++                                        FlagEquivalenceKind *EqKind) const {
++  assert(IsSwapped && ImmDelta && EqKind && "out-params must be non-null");
++  if (!IsSwapped || !ImmDelta || !EqKind)
++    return false;
++
++  *IsSwapped = false;
++  *ImmDelta = 0;
++  *EqKind = FlagEquivalenceKind::Full;
++
++  auto getLZTZWidth = [](unsigned Opc) -> unsigned {
++    switch (Opc) {
++    default:
++      return 0;
++    case X86::LZCNT16rr:
++    case X86::TZCNT16rr:
++      return 16;
++    case X86::LZCNT32rr:
++    case X86::TZCNT32rr:
++      return 32;
++    case X86::LZCNT64rr:
++    case X86::TZCNT64rr:
++      return 64;
++    }
++  };
++
++  auto getCmpSubImmWidth = [](unsigned Opc) -> unsigned {
++    switch (Opc) {
++    default:
++      return 0;
++    case X86::CMP8ri:
++    case X86::SUB8ri:
++      return 8;
++    case X86::CMP16ri:
++    case X86::CMP16ri8:
++    case X86::SUB16ri:
++    case X86::SUB16ri8:
++      return 16;
++    case X86::CMP32ri:
++    case X86::CMP32ri8:
++    case X86::SUB32ri:
++    case X86::SUB32ri8:
++      return 32;
++    case X86::CMP64ri32:
++    case X86::CMP64ri8:
++    case X86::SUB64ri32:
++    case X86::SUB64ri8:
++      return 64;
++    }
++  };
++
+   switch (OI.getOpcode()) {
+   case X86::CMP64rr:
+   case X86::CMP32rr:
+@@ -4930,27 +4980,39 @@ bool X86InstrInfo::isRedundantFlagInstr(
+     if (!analyzeCompare(OI, OISrcReg, OISrcReg2, OIMask, OIValue) ||
+         OIMask != ImmMask || OIValue != ImmValue)
+       return false;
++
+     if (SrcReg == OISrcReg && SrcReg2 == OISrcReg2) {
+       *IsSwapped = false;
++      *ImmDelta = 0;
++      *EqKind = FlagEquivalenceKind::Full;
+       return true;
+     }
+     if (SrcReg == OISrcReg2 && SrcReg2 == OISrcReg) {
+       *IsSwapped = true;
++      *ImmDelta = 0;
++      *EqKind = FlagEquivalenceKind::Full;
+       return true;
+     }
+     return false;
+   }
++
+   case X86::CMP64ri32:
++  case X86::CMP64ri8:
+   case X86::CMP32ri:
++  case X86::CMP32ri8:
+   case X86::CMP16ri:
++  case X86::CMP16ri8:
+   case X86::CMP8ri:
+   case X86::TEST64ri32:
+   case X86::TEST32ri:
+   case X86::TEST16ri:
+   case X86::TEST8ri:
+   CASE_ND(SUB64ri32)
++  CASE_ND(SUB64ri8)
+   CASE_ND(SUB32ri)
++  CASE_ND(SUB32ri8)
+   CASE_ND(SUB16ri)
++  CASE_ND(SUB16ri8)
+   CASE_ND(SUB8ri)
+   case X86::TEST64rr:
+   case X86::TEST32rr:
+@@ -4962,25 +5024,66 @@ bool X86InstrInfo::isRedundantFlagInstr(
+       int64_t OIMask;
+       int64_t OIValue;
+       if (analyzeCompare(OI, OISrcReg, OISrcReg2, OIMask, OIValue) &&
+-          SrcReg == OISrcReg && ImmMask == OIMask) {
++          SrcReg == OISrcReg && SrcReg2 == 0 && OISrcReg2 == 0 &&
++          ImmMask == OIMask) {
+         if (OIValue == ImmValue) {
+           *ImmDelta = 0;
++          *EqKind = FlagEquivalenceKind::Full;
+           return true;
+-        } else if (static_cast<uint64_t>(ImmValue) ==
+-                   static_cast<uint64_t>(OIValue) - 1) {
++        }
++
++        const uint64_t UImmValue = static_cast<uint64_t>(ImmValue);
++        const uint64_t UOIValue = static_cast<uint64_t>(OIValue);
++
++        if (UImmValue == UOIValue - 1) {
+           *ImmDelta = -1;
++          *EqKind = FlagEquivalenceKind::Full;
+           return true;
+-        } else if (static_cast<uint64_t>(ImmValue) ==
+-                   static_cast<uint64_t>(OIValue) + 1) {
++        }
++        if (UImmValue == UOIValue + 1) {
+           *ImmDelta = 1;
++          *EqKind = FlagEquivalenceKind::Full;
+           return true;
+-        } else {
+-          return false;
+         }
++        return false;
+       }
+     }
+-    return FlagI.isIdenticalTo(OI);
++
++    if (FlagI.isIdenticalTo(OI)) {
++      *ImmDelta = 0;
++      *EqKind = FlagEquivalenceKind::Full;
++      return true;
++    }
++    return false;
+   }
++
++  // CF-only equivalence for:
++  //   lzcnt/tzcnt src ; cmp/sub src, 1 ; adc/sbb ...
++  // Must be consumed only by CF-reading users in caller.
++  case X86::LZCNT64rr:
++  case X86::LZCNT32rr:
++  case X86::LZCNT16rr:
++  case X86::TZCNT64rr:
++  case X86::TZCNT32rr:
++  case X86::TZCNT16rr: {
++    if (ImmMask == 0 || ImmValue != 1 || SrcReg2 != 0)
++      return false;
++
++    const unsigned OIWidth = getLZTZWidth(OI.getOpcode());
++    const unsigned FlagWidth = getCmpSubImmWidth(FlagI.getOpcode());
++    if (OIWidth == 0 || FlagWidth == 0 || OIWidth != FlagWidth)
++      return false;
++
++    if (OI.getNumOperands() <= 1 || !OI.getOperand(1).isReg() ||
++        OI.getOperand(1).getReg() != SrcReg)
++      return false;
++
++    *IsSwapped = false;
++    *ImmDelta = 0;
++    *EqKind = FlagEquivalenceKind::CFOnly;
++    return true;
++  }
++
+   default:
+     return false;
+   }
+@@ -5280,6 +5383,9 @@ bool X86InstrInfo::optimizeCompareInstr(
+                                         Register SrcReg2, int64_t CmpMask,
+                                         int64_t CmpValue,
+                                         const MachineRegisterInfo *MRI) const {
++  if (!MRI)
++    return false;
++
+   // Check whether we can replace SUB with CMP.
+   switch (CmpInstr.getOpcode()) {
+   default:
+@@ -5334,7 +5440,7 @@ bool X86InstrInfo::optimizeCompareInstr(
+   // The following code tries to remove the comparison by re-using EFLAGS
+   // from earlier instructions.
+ 
+-  bool IsCmpZero = (CmpMask != 0 && CmpValue == 0);
++  const bool IsCmpZero = (CmpMask != 0 && CmpValue == 0);
+ 
+   // Transformation currently requires SSA values.
+   if (SrcReg2.isPhysical())
+@@ -5342,6 +5448,18 @@ bool X86InstrInfo::optimizeCompareInstr(
+   MachineInstr *SrcRegDef = MRI->getVRegDef(SrcReg);
+   assert(SrcRegDef && "Must have a definition (SSA)");
+ 
++  auto condUsesOnlyCF = [](X86::CondCode CC) {
++    return CC == X86::COND_B || CC == X86::COND_AE;
++  };
++
++  auto isCFOnlyEFLAGSUse = [&](const MachineInstr &Instr,
++                               X86::CondCode CC) -> bool {
++    if (CC != X86::COND_INVALID)
++      return condUsesOnlyCF(CC);
++    // ADC/SBB read CF and are safe for CF-only equivalence.
++    return X86::isADC(Instr.getOpcode()) || X86::isSBB(Instr.getOpcode());
++  };
++
+   MachineInstr *MI = nullptr;
+   MachineInstr *Sub = nullptr;
+   MachineInstr *Movr0Inst = nullptr;
+@@ -5354,6 +5472,7 @@ bool X86InstrInfo::optimizeCompareInstr(
+   unsigned OpNo = 0;
+   X86::CondCode NewCC = X86::COND_INVALID;
+   int64_t ImmDelta = 0;
++  FlagEquivalenceKind RedundantEqKind = FlagEquivalenceKind::Full;
+ 
+   // Search backward from CmpInstr for the next instruction defining EFLAGS.
+   const TargetRegisterInfo *TRI = &getRegisterInfo();
+@@ -5421,9 +5540,11 @@ bool X86InstrInfo::optimizeCompareInstr(
+         //     sub x, y  or  cmp x, y
+         //     ...           // EFLAGS not changed
+         //     cmp x, y      // <-- can be removed
++        FlagEquivalenceKind EqKind = FlagEquivalenceKind::Full;
+         if (isRedundantFlagInstr(CmpInstr, SrcReg, SrcReg2, CmpMask, CmpValue,
+-                                 Inst, &IsSwapped, &ImmDelta)) {
++                                 Inst, &IsSwapped, &ImmDelta, &EqKind)) {
+           Sub = &Inst;
++          RedundantEqKind = EqKind;
+           break;
+         }
+ 
+@@ -5438,7 +5559,7 @@ bool X86InstrInfo::optimizeCompareInstr(
+ 
+         // For the instructions are ADDrm/ADDmr with relocation, we'll skip the
+         // optimization for replacing non-NF with NF. This is to keep backward
+-        // compatiblity with old version of linkers without APX relocation type
++        // compatibility with old version of linkers without APX relocation type
+         // support on Linux OS.
+         bool IsWithReloc = X86EnableAPXForRelocation
+                                ? false
+@@ -5470,6 +5591,9 @@ bool X86InstrInfo::optimizeCompareInstr(
+     From = MBB->rbegin();
+   }
+ 
++  const bool IsCFOnlyReuse =
++      (Sub != nullptr && RedundantEqKind == FlagEquivalenceKind::CFOnly);
++
+   // Scan forward from the instruction after CmpInstr for uses of EFLAGS.
+   // It is safe to remove CmpInstr if EFLAGS is redefined or killed.
+   // If we are done with the basic block, we need to check whether EFLAGS is
+@@ -5492,11 +5616,15 @@ bool X86InstrInfo::optimizeCompareInstr(
+ 
+     // EFLAGS is used by this instruction.
+     X86::CondCode OldCC = X86::getCondFromMI(Instr);
+-    if ((MI || IsSwapped || ImmDelta != 0) && OldCC == X86::COND_INVALID)
++    if ((MI || IsSwapped || ImmDelta != 0) && !IsCFOnlyReuse &&
++        OldCC == X86::COND_INVALID)
+       return false;
+ 
+     X86::CondCode ReplacementCC = X86::COND_INVALID;
+-    if (MI) {
++    if (IsCFOnlyReuse) {
++      if (!isCFOnlyEFLAGSUse(Instr, OldCC))
++        return false;
++    } else if (MI) {
+       switch (OldCC) {
+       default:
+         break;
+@@ -5616,8 +5744,9 @@ bool X86InstrInfo::optimizeCompareInstr(
+   }
+ 
+   // If we have to update users but EFLAGS is live-out abort, since we cannot
+-  // easily find all of the users.
+-  if ((MI != nullptr || ShouldUpdateCC) && FlagsMayLiveOut) {
++  // easily find all of the users. Also abort for CF-only reuse because only
++  // CF equivalence is guaranteed in that mode.
++  if ((MI != nullptr || ShouldUpdateCC || IsCFOnlyReuse) && FlagsMayLiveOut) {
+     for (MachineBasicBlock *Successor : CmpMBB.successors())
+       if (Successor->isLiveIn(X86::EFLAGS))
+         return false;
+
+--- a/llvm/lib/Target/X86/X86InstrInfo.h	2026-05-03 11:26:55.176693343 +0200
++++ b/llvm/lib/Target/X86/X86InstrInfo.h	2026-05-03 11:27:56.266716672 +0200
+@@ -18,6 +18,7 @@
+ #include "X86RegisterInfo.h"
+ #include "llvm/CodeGen/ISDOpcodes.h"
+ #include "llvm/CodeGen/TargetInstrInfo.h"
++#include <cstdint>
+ #include <vector>
+ 
+ #define GET_INSTRINFO_HEADER
+@@ -44,7 +45,7 @@ enum AsmComments : MachineInstr::AsmPrin
+ };
+ 
+ /// Return a pair of condition code for the given predicate and whether
+-/// the instruction operands should be swaped to match the condition code.
++/// the instruction operands should be swapped to match the condition code.
+ std::pair<CondCode, bool> getX86ConditionCode(CmpInst::Predicate Predicate);
+ 
+ /// Return a cmov opcode for the given register size in bytes, and operand type.
+@@ -134,7 +135,7 @@ inline static bool isGlobalStubReference
+ }
+ 
+ /// isGlobalRelativeToPICBase - Return true if the specified global value
+-/// reference is relative to a 32-bit PIC base (X86ISD::GlobalBaseReg).  If this
++/// reference is relative to a 32-bit PIC base (X86ISD::GlobalBaseReg). If this
+ /// is true, the addressing mode has the PIC base register added in (e.g. EBX).
+ inline static bool isGlobalRelativeToPICBase(unsigned char TargetFlag) {
+   switch (TargetFlag) {
+@@ -150,14 +151,25 @@ inline static bool isGlobalRelativeToPIC
+ }
+ 
+ inline static bool isScale(const MachineOperand &MO) {
+-  return MO.isImm() && (MO.getImm() == 1 || MO.getImm() == 2 ||
+-                        MO.getImm() == 4 || MO.getImm() == 8);
++  if (!MO.isImm())
++    return false;
++  switch (MO.getImm()) {
++  case 1:
++  case 2:
++  case 4:
++  case 8:
++    return true;
++  default:
++    return false;
++  }
+ }
+ 
+ inline static bool isLeaMem(const MachineInstr &MI, unsigned Op) {
+   if (MI.getOperand(Op).isFI())
+     return true;
+-  return Op + X86::AddrSegmentReg <= MI.getNumOperands() &&
++
++  const unsigned NumOperands = MI.getNumOperands();
++  return Op + X86::AddrSegmentReg < NumOperands &&
+          MI.getOperand(Op + X86::AddrBaseReg).isReg() &&
+          isScale(MI.getOperand(Op + X86::AddrScaleAmt)) &&
+          MI.getOperand(Op + X86::AddrIndexReg).isReg() &&
+@@ -170,7 +182,9 @@ inline static bool isLeaMem(const Machin
+ inline static bool isMem(const MachineInstr &MI, unsigned Op) {
+   if (MI.getOperand(Op).isFI())
+     return true;
+-  return Op + X86::AddrNumOperands <= MI.getNumOperands() &&
++
++  const unsigned NumOperands = MI.getNumOperands();
++  return Op + X86::AddrNumOperands < NumOperands &&
+          MI.getOperand(Op + X86::AddrSegmentReg).isReg() && isLeaMem(MI, Op);
+ }
+ 
+@@ -249,7 +263,7 @@ public:
+   const TargetRegisterClass *getRegClass(const MCInstrDesc &MCID,
+                                          unsigned OpNum) const override;
+ 
+-  /// getRegisterInfo - TargetInstrInfo is a superset of MRegister info.  As
++  /// getRegisterInfo - TargetInstrInfo is a superset of MRegister info. As
+   /// such, whenever a client has an instance of instruction info, it should
+   /// always be able to get register info as well (through this method).
+   ///
+@@ -319,31 +333,28 @@ public:
+ 
+   Register isLoadFromStackSlot(const MachineInstr &MI,
+                                int &FrameIndex) const override;
+-  Register isLoadFromStackSlot(const MachineInstr &MI,
+-                               int &FrameIndex,
++  Register isLoadFromStackSlot(const MachineInstr &MI, int &FrameIndex,
+                                TypeSize &MemBytes) const override;
+   /// isLoadFromStackSlotPostFE - Check for post-frame ptr elimination
+-  /// stack locations as well.  This uses a heuristic so it isn't
++  /// stack locations as well. This uses a heuristic so it isn't
+   /// reliable for correctness.
+   Register isLoadFromStackSlotPostFE(const MachineInstr &MI,
+                                      int &FrameIndex) const override;
+ 
+   Register isStoreToStackSlot(const MachineInstr &MI,
+                               int &FrameIndex) const override;
+-  Register isStoreToStackSlot(const MachineInstr &MI,
+-                              int &FrameIndex,
++  Register isStoreToStackSlot(const MachineInstr &MI, int &FrameIndex,
+                               TypeSize &MemBytes) const override;
+   /// isStoreToStackSlotPostFE - Check for post-frame ptr elimination
+-  /// stack locations as well.  This uses a heuristic so it isn't
++  /// stack locations as well. This uses a heuristic so it isn't
+   /// reliable for correctness.
+   Register isStoreToStackSlotPostFE(const MachineInstr &MI,
+                                     int &FrameIndex) const override;
+ 
+   bool isReMaterializableImpl(const MachineInstr &MI) const override;
+-  void
+-  reMaterialize(MachineBasicBlock &MBB, MachineBasicBlock::iterator MI,
+-                Register DestReg, unsigned SubIdx, const MachineInstr &Orig,
+-                LaneBitmask UsedLanes = LaneBitmask::getAll()) const override;
++  void reMaterialize(MachineBasicBlock &MBB, MachineBasicBlock::iterator MI,
++                     Register DestReg, unsigned SubIdx, const MachineInstr &Orig,
++                     LaneBitmask UsedLanes = LaneBitmask::getAll()) const override;
+ 
+   /// Given an operand within a MachineInstr, insert preceding code to put it
+   /// into the right format for a particular kind of LEA instruction. This may
+@@ -360,9 +371,9 @@ public:
+                       LiveIntervals *LIS) const;
+ 
+   /// convertToThreeAddress - This method must be implemented by targets that
+-  /// set the M_CONVERTIBLE_TO_3_ADDR flag.  When this flag is set, the target
++  /// set the M_CONVERTIBLE_TO_3_ADDR flag. When this flag is set, the target
+   /// may be able to convert a two-address instruction into a true
+-  /// three-address instruction on demand.  This allows the X86 target (for
++  /// three-address instruction on demand. This allows the X86 target (for
+   /// example) to convert ADD and SHL instructions into LEA instructions if they
+   /// would require register copies due to two-addressness.
+   ///
+@@ -409,10 +420,9 @@ public:
+   ///     FMA213 #1, #2, #3
+   /// results into instruction with adjusted opcode:
+   ///     FMA231 #3, #2, #1
+-  unsigned
+-  getFMA3OpcodeToCommuteOperands(const MachineInstr &MI, unsigned SrcOpIdx1,
+-                                 unsigned SrcOpIdx2,
+-                                 const X86InstrFMA3Group &FMA3Group) const;
++  unsigned getFMA3OpcodeToCommuteOperands(const MachineInstr &MI,
++                                          unsigned SrcOpIdx1, unsigned SrcOpIdx2,
++                                          const X86InstrFMA3Group &FMA3Group) const;
+ 
+   // Branch analysis.
+   bool isUnconditionalTailCall(const MachineInstr &MI) const override;
+@@ -436,8 +446,7 @@ public:
+   bool getConstValDefinedInReg(const MachineInstr &MI, const Register Reg,
+                                int64_t &ImmVal) const override;
+ 
+-  bool preservesZeroValueInReg(const MachineInstr *MI,
+-                               const Register NullValueReg,
++  bool preservesZeroValueInReg(const MachineInstr *MI, const Register NullValueReg,
+                                const TargetRegisterInfo *TRI) const override;
+ 
+   bool getMemOperandsWithOffsetWidth(
+@@ -500,23 +509,21 @@ public:
+ 
+   /// Same as the previous version except it allows folding of any load and
+   /// store from / to any address, not just from a specific stack slot.
+-  MachineInstr *
+-  foldMemoryOperandImpl(MachineFunction &MF, MachineInstr &MI,
+-                        ArrayRef<unsigned> Ops, MachineInstr &LoadMI,
+-                        MachineInstr *&CopyMI,
+-                        LiveIntervals *LIS = nullptr) const override;
+-
+-  bool
+-  unfoldMemoryOperand(MachineFunction &MF, MachineInstr &MI, Register Reg,
+-                      bool UnfoldLoad, bool UnfoldStore,
+-                      SmallVectorImpl<MachineInstr *> &NewMIs) const override;
++  MachineInstr *foldMemoryOperandImpl(MachineFunction &MF, MachineInstr &MI,
++                                      ArrayRef<unsigned> Ops, MachineInstr &LoadMI,
++                                      MachineInstr *&CopyMI,
++                                      LiveIntervals *LIS = nullptr) const override;
++
++  bool unfoldMemoryOperand(MachineFunction &MF, MachineInstr &MI, Register Reg,
++                           bool UnfoldLoad, bool UnfoldStore,
++                           SmallVectorImpl<MachineInstr *> &NewMIs) const override;
+ 
+   bool unfoldMemoryOperand(SelectionDAG &DAG, SDNode *N,
+                            SmallVectorImpl<SDNode *> &NewNodes) const override;
+ 
+-  unsigned
+-  getOpcodeAfterMemoryUnfold(unsigned Opc, bool UnfoldLoad, bool UnfoldStore,
+-                             unsigned *LoadRegIndex = nullptr) const override;
++  unsigned getOpcodeAfterMemoryUnfold(unsigned Opc, bool UnfoldLoad,
++                                      bool UnfoldStore,
++                                      unsigned *LoadRegIndex = nullptr) const override;
+ 
+   bool areLoadsFromSameBasePtr(SDNode *Load1, SDNode *Load2, int64_t &Offset1,
+                                int64_t &Offset2) const override;
+@@ -545,8 +552,7 @@ public:
+ 
+   MCInst getNop() const override;
+ 
+-  bool
+-  reverseBranchCondition(SmallVectorImpl<MachineOperand> &Cond) const override;
++  bool reverseBranchCondition(SmallVectorImpl<MachineOperand> &Cond) const override;
+ 
+   bool isSafeToMoveRegClassDefs(const TargetRegisterClass *RC) const override;
+ 
+@@ -569,9 +575,8 @@ public:
+ 
+   bool setExecutionDomainCustom(MachineInstr &MI, unsigned Domain) const;
+ 
+-  unsigned
+-  getPartialRegUpdateClearance(const MachineInstr &MI, unsigned OpNum,
+-                               const TargetRegisterInfo *TRI) const override;
++  unsigned getPartialRegUpdateClearance(const MachineInstr &MI, unsigned OpNum,
++                                        const TargetRegisterInfo *TRI) const override;
+   unsigned getUndefRegClearance(const MachineInstr &MI, unsigned OpNum,
+                                 const TargetRegisterInfo *TRI) const override;
+   void breakPartialRegDependency(MachineInstr &MI, unsigned OpNum,
+@@ -745,11 +750,18 @@ private:
+                                      unsigned &SrcOpIdx2,
+                                      bool IsIntrinsic = false) const;
+ 
+-  /// Returns true when instruction \p FlagI produces the same flags as \p OI.
+-  /// The caller should pass in the results of calling analyzeCompare on \p OI:
++  // Relationship between the flags produced by OI and FlagI.
++  // Full: all relevant flags are equivalent.
++  // CFOnly: only CF is guaranteed equivalent.
++  enum class FlagEquivalenceKind : uint8_t { Full, CFOnly };
++
++  /// Returns true when instruction \p FlagI produces equivalent flags as \p OI.
++  /// The caller should pass in the results of calling analyzeCompare:
+   /// \p SrcReg, \p SrcReg2, \p ImmMask, \p ImmValue.
+-  /// If the flags match \p OI as if it had the input operands swapped then the
+-  /// function succeeds and sets \p IsSwapped to true.
++  /// If the flags match \p OI as if it had the input operands swapped then
++  /// \p IsSwapped is set to true.
++  /// \p ImmDelta is set to {-1,0,+1} when immediate-adjusted equivalence is used.
++  /// \p EqKind describes whether equivalence is full EFLAGS or CF-only.
+   ///
+   /// Examples of OI, FlagI pairs returning true:
+   ///   CMP %1, 42   and  CMP %1, 42
+@@ -757,9 +769,10 @@ private:
+   ///   TEST %1, %1  and  %2 = SUB %1, 0
+   ///   CMP %1, %2   and  %3 = SUB %2, %1  ; IsSwapped=true
+   bool isRedundantFlagInstr(const MachineInstr &FlagI, Register SrcReg,
+-                            Register SrcReg2, int64_t ImmMask, int64_t ImmValue,
+-                            const MachineInstr &OI, bool *IsSwapped,
+-                            int64_t *ImmDelta) const;
++                            Register SrcReg2, int64_t ImmMask,
++                            int64_t ImmValue, const MachineInstr &OI,
++                            bool *IsSwapped, int64_t *ImmDelta,
++                            FlagEquivalenceKind *EqKind) const;
+ 
+   /// Commute operands of \p MI for memory fold.
+   ///
+
 --- a/llvm/lib/Target/X86/X86ISelDAGToDAG.cpp	2026-05-02 15:05:18.588255013 +0200
 +++ b/llvm/lib/Target/X86/X86ISelDAGToDAG.cpp	2026-05-02 15:47:13.633368254 +0200
 @@ -4264,23 +4264,12 @@ bool X86DAGToDAGISel::matchBitExtract(SD
