@@ -74,11 +74,14 @@ static void mi_decl_noinline mi_free_try_collect_mt(mi_page_t* page, mi_block_t*
 // Free a block multi-threaded
 static inline void mi_free_block_mt(mi_page_t* page, mi_block_t* block, bool was_guarded) mi_attr_noexcept
 {
-  // adjust stats (after padding check and potentially recursive `mi_free` above)
+  // adjust stats first (padding may be touched below)
   mi_stat_free(page, block);    // stat_free may access the padding
   mi_track_free_size(block, mi_page_usable_size_of(page, block, was_guarded));
 
-  // _mi_padding_shrink(page, block, sizeof(mi_block_t));
+  // Ensure enough in-block space for delayed-free next pointer storage.
+  // Critical for small/padded blocks in cross-thread free.
+  _mi_padding_shrink(page, block, sizeof(mi_block_t));
+
 #if (MI_DEBUG>0) && !MI_TRACK_ENABLED && !MI_TSAN
   if (!was_guarded) {
     size_t dbgsize = mi_usable_size(block);
