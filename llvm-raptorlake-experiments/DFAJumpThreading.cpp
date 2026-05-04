@@ -242,14 +242,13 @@ void DFAJumpThreading::unfold(
     SmallVectorImpl<BasicBlock *> &NewBBs) {
   SelectInst *SI = SIToUnfold.getInst();
   PHINode *SIUse = SIToUnfold.getUse();
-  assert(SI->hasOneUse());
-  // The select may come indirectly, instead of from where it is defined.
-  BasicBlock *StartBlock = SIUse->getIncomingBlock(*SI->use_begin());
+  assert(SI->hasOneUse() && "Select must have exactly one use");
 
-  if (UncondBrInst *StartBlockTerm =
-          dyn_cast<UncondBrInst>(StartBlock->getTerminator())) {
+  BasicBlock *StartBlock = SIUse->getIncomingBlock(*SI->use_begin());
+  Instruction *StartTerm = StartBlock->getTerminator();
+
+  if (auto *StartBlockTerm = dyn_cast<UncondBrInst>(StartTerm)) {
     BasicBlock *EndBlock = StartBlock->getUniqueSuccessor();
-    // Arbitrarily choose the 'false' side for a new input value to the PHI.
     BasicBlock *NewBlock = BasicBlock::Create(
         SI->getContext(), Twine(SI->getName(), ".si.unfold.false"),
         EndBlock->getParent(), EndBlock);
@@ -257,34 +256,31 @@ void DFAJumpThreading::unfold(
     UncondBrInst::Create(EndBlock, NewBlock);
     DTU->applyUpdates({{DominatorTree::Insert, NewBlock, EndBlock}});
 
-    // StartBlock
-    //   |  \
-    //   |  NewBlock
-    //   |  /
-    // EndBlock
     Value *SIOp1 = SI->getTrueValue();
     Value *SIOp2 = SI->getFalseValue();
 
-    PHINode *NewPhi = PHINode::Create(SIUse->getType(), 1,
-                                      Twine(SIOp2->getName(), ".si.unfold.phi"),
-                                      NewBlock->getFirstInsertionPt());
+    PHINode *NewPhi = PHINode::Create(
+        SIUse->getType(), 1, Twine(SIOp2->getName(), ".si.unfold.phi"),
+        NewBlock->getFirstInsertionPt());
     NewPhi->addIncoming(SIOp2, StartBlock);
 
-    // Update any other PHI nodes in EndBlock.
     for (PHINode &Phi : EndBlock->phis()) {
       if (SIUse == &Phi)
         continue;
-      Phi.addIncoming(Phi.getIncomingValueForBlock(StartBlock), NewBlock);
+      int Idx = Phi.getBasicBlockIndex(StartBlock);
+      if (Idx >= 0)
+        Phi.addIncoming(Phi.getIncomingValue(Idx), NewBlock);
     }
 
-    // Update the phi node of SI, which is its only use.
     if (EndBlock == SIUse->getParent()) {
       SIUse->addIncoming(NewPhi, NewBlock);
       SIUse->replaceUsesOfWith(SI, SIOp1);
     } else {
-      PHINode *EndPhi = PHINode::Create(SIUse->getType(), pred_size(EndBlock),
-                                        Twine(SI->getName(), ".si.unfold.phi"),
-                                        EndBlock->getFirstInsertionPt());
+      PHINode *EndPhi = PHINode::Create(
+          SIUse->getType(), pred_size(EndBlock),
+          Twine(SI->getName(), ".si.unfold.phi"),
+          EndBlock->getFirstInsertionPt());
+
       for (BasicBlock *Pred : predecessors(EndBlock)) {
         if (Pred != StartBlock && Pred != NewBlock)
           EndPhi->addIncoming(EndPhi, Pred);
@@ -301,7 +297,6 @@ void DFAJumpThreading::unfold(
     if (auto *OpSi = dyn_cast<SelectInst>(SIOp2))
       NewSIsToUnfold.push_back(SelectInstToUnfold(OpSi, NewPhi));
 
-    // Insert the real conditional branch based on the original condition.
     StartBlockTerm->eraseFromParent();
     auto *BI =
         CondBrInst::Create(SI->getCondition(), EndBlock, NewBlock, StartBlock);
@@ -309,8 +304,18 @@ void DFAJumpThreading::unfold(
       BI->setMetadata(LLVMContext::MD_prof,
                       SI->getMetadata(LLVMContext::MD_prof));
     DTU->applyUpdates({{DominatorTree::Insert, StartBlock, NewBlock}});
-  } else {
+
+  } else if (auto *CondBr = dyn_cast<CondBrInst>(StartTerm)) {
     BasicBlock *EndBlock = SIUse->getParent();
+
+    unsigned NumEdgesToEndBlock = 0;
+    for (unsigned I = 0, E = CondBr->getNumSuccessors(); I != E; ++I)
+      if (CondBr->getSuccessor(I) == EndBlock)
+        ++NumEdgesToEndBlock;
+
+    if (NumEdgesToEndBlock != 1)
+      return;
+
     BasicBlock *NewBlockT = BasicBlock::Create(
         SI->getContext(), Twine(SI->getName(), ".si.unfold.true"),
         EndBlock->getParent(), EndBlock);
@@ -321,26 +326,7 @@ void DFAJumpThreading::unfold(
     NewBBs.push_back(NewBlockT);
     NewBBs.push_back(NewBlockF);
 
-    // Def only has one use in EndBlock.
-    // Before transformation:
-    // StartBlock(Def)
-    //   |      \
-    // EndBlock  OtherBlock
-    //  (Use)
-    //
-    // After transformation:
-    // StartBlock(Def)
-    //   |      \
-    //   |       OtherBlock
-    // NewBlockT
-    //   |     \
-    //   |   NewBlockF
-    //   |      /
-    //   |     /
-    // EndBlock
-    //  (Use)
     UncondBrInst::Create(EndBlock, NewBlockF);
-    // Insert the real conditional branch based on the original condition.
     auto *BI =
         CondBrInst::Create(SI->getCondition(), EndBlock, NewBlockF, NewBlockT);
     if (!ProfcheckDisableMetadataFixes)
@@ -369,33 +355,35 @@ void DFAJumpThreading::unfold(
 
     SIUse->addIncoming(NewPhiT, NewBlockT);
     SIUse->addIncoming(NewPhiF, NewBlockF);
-    SIUse->removeIncomingValue(StartBlock);
 
-    // Update any other PHI nodes in EndBlock.
+    while (SIUse->getBasicBlockIndex(StartBlock) >= 0)
+      SIUse->removeIncomingValue(StartBlock, /*DeletePHIIfEmpty=*/false);
+
     for (PHINode &Phi : EndBlock->phis()) {
       if (SIUse == &Phi)
         continue;
-      Phi.addIncoming(Phi.getIncomingValueForBlock(StartBlock), NewBlockT);
-      Phi.addIncoming(Phi.getIncomingValueForBlock(StartBlock), NewBlockF);
-      Phi.removeIncomingValue(StartBlock);
+      int Idx = Phi.getBasicBlockIndex(StartBlock);
+      if (Idx >= 0) {
+        Value *OldVal = Phi.getIncomingValue(Idx);
+        Phi.addIncoming(OldVal, NewBlockT);
+        Phi.addIncoming(OldVal, NewBlockF);
+        while (Phi.getBasicBlockIndex(StartBlock) >= 0)
+          Phi.removeIncomingValue(StartBlock, /*DeletePHIIfEmpty=*/false);
+      }
     }
 
-    // Update the appropriate successor of the start block to point to the new
-    // unfolded block.
-    CondBrInst *CondBr = cast<CondBrInst>(StartBlock->getTerminator());
     unsigned SuccNum = CondBr->getSuccessor(1) == EndBlock ? 1 : 0;
     CondBr->setSuccessor(SuccNum, NewBlockT);
     DTU->applyUpdates({{DominatorTree::Delete, StartBlock, EndBlock},
                        {DominatorTree::Insert, StartBlock, NewBlockT}});
+  } else {
+    return;
   }
 
-  // Preserve loop info
-  if (Loop *L = LI->getLoopFor(StartBlock)) {
+  if (Loop *L = LI->getLoopFor(StartBlock))
     for (BasicBlock *NewBB : NewBBs)
       L->addBasicBlockToLoop(NewBB, *LI);
-  }
 
-  // The select is now dead.
   assert(SI->use_empty() && "Select must be dead now");
   SI->eraseFromParent();
 }
@@ -906,17 +894,47 @@ private:
   // Unify the states in different threading path if the states are equivalent.
   void unifyTPaths() {
     SmallDenseMap<BasicBlock *, APInt> DestToState;
+    SmallDenseMap<BasicBlock *, bool> DestDistinguishes;
+
     for (ThreadingPath &Path : TPaths) {
       APInt NextState = Path.getExitValue();
       BasicBlock *Dest = getNextCaseSuccessor(NextState);
+
       auto [StateIt, Inserted] = DestToState.try_emplace(Dest, NextState);
       if (Inserted)
         continue;
-      if (NextState != StateIt->second) {
-        LLVM_DEBUG(dbgs() << "Next state in " << Path << " is equivalent to "
-                          << StateIt->second << "\n");
-        Path.setExitValue(StateIt->second);
+
+      if (NextState == StateIt->second)
+        continue;
+
+      auto [DistIt, DistInserted] = DestDistinguishes.try_emplace(Dest, false);
+      if (DistInserted) {
+        bool Distinguishes = false;
+        for (PHINode &Phi : Dest->phis()) {
+          Value *FirstVal = nullptr;
+          for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I) {
+            if (Phi.getIncomingBlock(I) != SwitchBlock)
+              continue;
+            Value *Incoming = Phi.getIncomingValue(I);
+            if (!FirstVal)
+              FirstVal = Incoming;
+            else if (FirstVal != Incoming) {
+              Distinguishes = true;
+              break;
+            }
+          }
+          if (Distinguishes)
+            break;
+        }
+        DistIt->second = Distinguishes;
       }
+
+      if (DistIt->second)
+        continue;
+
+      LLVM_DEBUG(dbgs() << "Next state in " << Path << " is equivalent to "
+                        << StateIt->second << "\n");
+      Path.setExitValue(StateIt->second);
     }
   }
 
@@ -1371,40 +1389,27 @@ private:
     return true;
   }
 
-  /// Create all exit paths for the selected DFA threading paths.
   void createAllExitPaths() {
     DefMap NewDefs;
     DuplicateBlockMap DuplicateMap;
-
-    LLVM_DEBUG(dbgs() << "\nDFA Jump Threading: Transforming switch block "
-    << SwitchPaths->getSwitchBlock()->getName() << "\n");
 
     BasicBlock *SwitchBlock = SwitchPaths->getSwitchBlock();
 
     SmallPtrSet<BasicBlock *, 32> BlocksToClean;
     BlocksToClean.insert_range(successors(SwitchBlock));
+    BlocksToClean.insert(SwitchBlock);
 
     for (const ThreadingPath &TPath : SwitchPaths->getThreadingPaths()) {
-      LLVM_DEBUG(dbgs() << "\tThreading path: " << TPath << "\n");
       createExitPath(NewDefs, TPath, DuplicateMap, BlocksToClean, DTU);
       ++NumPaths;
     }
 
-    // After all paths are cloned, rewrite the cloned switch terminators into
-    // unconditional branches to the known next state.
     for (const ThreadingPath &TPath : SwitchPaths->getThreadingPaths())
       updateLastSuccessor(TPath, DuplicateMap, DTU);
 
-    // Critical ordering:
-    //
-    // updateLastSuccessor() collapses cloned switch terminators from many edges
-    // to one edge.  PHI nodes in successor blocks may now contain stale incoming
-    // values from cloned switch blocks.  SSAUpdaterBulk assumes structurally
-    // valid IR, so clean PHIs before restoring SSA.
     for (BasicBlock *BB : BlocksToClean)
       cleanPhiNodes(BB);
 
-    // For each instruction that was cloned and used outside, update its uses.
     updateSSA(NewDefs);
   }
 
@@ -1430,17 +1435,9 @@ private:
       return;
 
     auto BeginIt = DetIt;
-
-    // Some paths use the determinator as a placeholder in front of the path.
-    // Skip that placeholder only when there is another block after it.  If the
-    // entire path is just [Determinator], we still have to clone it; this is
-    // the single-block/self-loop case.
     if (PathBBs.front() == Determinator && std::next(BeginIt) != PathBBs.end())
       ++BeginIt;
 
-    // The initial predecessor is the block immediately before the first block
-    // we clone.  If the first cloned block is also the first path block, it is a
-    // single-block/self-loop path and acts as its own predecessor.
     BasicBlock *PrevBB =
         (BeginIt != PathBBs.begin()) ? *std::prev(BeginIt) : *BeginIt;
 
@@ -1448,12 +1445,15 @@ private:
       BasicBlock *BB = *BBIt;
       BlocksToClean.insert(BB);
 
-      // Reuse an existing clone for this state if one was already created.
       if (BasicBlock *NextBB = getClonedBB(BB, NextState, DuplicateMap)) {
-        updatePredecessor(PrevBB, BB, NextBB, DTU);
+        if (llvm::is_contained(predecessors(BB), PrevBB))
+          updatePredecessor(PrevBB, BB, NextBB, DTU);
         PrevBB = NextBB;
         continue;
       }
+
+      if (!llvm::is_contained(predecessors(BB), PrevBB))
+        return;
 
       BasicBlock *NewBB = cloneBlockAndUpdatePredecessor(
           BB, PrevBB, NextState, DuplicateMap, NewDefs, DTU);
@@ -1536,39 +1536,40 @@ private:
   /// This function also includes updating phi nodes in the successors of the
   /// BB, and remapping uses that were defined locally in the cloned BB.
   BasicBlock *cloneBlockAndUpdatePredecessor(BasicBlock *BB, BasicBlock *PrevBB,
-                                             const APInt &NextState,
-                                             DuplicateBlockMap &DuplicateMap,
-                                             DefMap &NewDefs,
-                                             DomTreeUpdater *DTU) {
+                                            const APInt &NextState,
+                                            DuplicateBlockMap &DuplicateMap,
+                                            DefMap &NewDefs,
+                                            DomTreeUpdater *DTU) {
     ValueToValueMapTy VMap;
     BasicBlock *NewBB = CloneBasicBlock(
         BB, VMap, ".jt" + std::to_string(NextState.getLimitedValue()),
         BB->getParent());
     NewBB->moveAfter(BB);
-    NumCloned++;
+    ++NumCloned;
 
     for (Instruction &I : *NewBB) {
-      // Do not remap operands of PHINode in case a definition in BB is an
-      // incoming value to a phi in the same block. This incoming value will
-      // be renamed later while restoring SSA.
       if (isa<PHINode>(&I))
         continue;
       RemapInstruction(&I, VMap,
-                       RF_IgnoreMissingLocals | RF_NoModuleLevelChanges);
-      if (AssumeInst *II = dyn_cast<AssumeInst>(&I))
+                      RF_IgnoreMissingLocals | RF_NoModuleLevelChanges);
+      if (auto *II = dyn_cast<AssumeInst>(&I))
         AC->registerAssumption(II);
     }
 
     updateSuccessorPhis(BB, NewBB, NextState, VMap, DuplicateMap);
     updatePredecessor(PrevBB, BB, NewBB, DTU);
+
+    // Fresh clones inherit PHI entries for all original predecessors.
+    // Trim immediately so the IR is valid after this function returns.
+    cleanPhiNodes(NewBB);
+
     updateDefMap(NewDefs, VMap);
 
-    // Add all successors to the DominatorTree
     SmallPtrSet<BasicBlock *, 4> SuccSet;
-    for (auto *SuccBB : successors(NewBB)) {
+    for (BasicBlock *SuccBB : successors(NewBB))
       if (SuccSet.insert(SuccBB).second)
         DTU->applyUpdates({{DominatorTree::Insert, NewBB, SuccBB}});
-    }
+
     return NewBB;
   }
 
@@ -1577,83 +1578,62 @@ private:
   /// This means creating a new incoming value from ClonedBB with the new
   /// instruction wherever there is an incoming value from BB.
   void updateSuccessorPhis(BasicBlock *BB, BasicBlock *ClonedBB,
-                           const APInt &NextState, ValueToValueMapTy &VMap,
-                           DuplicateBlockMap &DuplicateMap) {
+                          const APInt &NextState, ValueToValueMapTy &VMap,
+                          DuplicateBlockMap &DuplicateMap) {
+    (void)NextState;
+    (void)DuplicateMap;
+
     auto GetMappedValue = [&](Value *Incoming) -> Value * {
       if (isa<Constant>(Incoming))
         return Incoming;
-
       auto It = VMap.find(Incoming);
       if (It != VMap.end() && It->second)
-        return static_cast<Value *>(It->second);
-
+        return cast<Value>(It->second);
       return Incoming;
     };
 
-    auto FindFirstIncomingValueForBlock = [](PHINode &Phi,
-                                             BasicBlock *IncomingBB) -> Value * {
-      for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I)
-        if (Phi.getIncomingBlock(I) == IncomingBB)
-          return Phi.getIncomingValue(I);
-      return nullptr;
-    };
+    SmallVector<BasicBlock *, 8> UniqueSuccs;
+    SmallPtrSet<BasicBlock *, 8> SeenSuccs;
+    for (BasicBlock *Succ : successors(ClonedBB))
+      if (SeenSuccs.insert(Succ).second)
+        UniqueSuccs.push_back(Succ);
 
-    // The switch block is special.  Its clone is not left as a switch.  Later,
-    // updateLastSuccessor() rewrites it to a single unconditional branch to the
-    // chosen destination.  Therefore, successor PHIs need exactly one incoming
-    // value from ClonedBB, not one incoming per original switch case edge.
-    if (BB == SwitchPaths->getSwitchBlock()) {
-      BasicBlock *NextCase = getNextCaseSuccessor(NextState);
+    for (BasicBlock *Succ : UniqueSuccs) {
+      unsigned EdgeCount = 0;
+      Instruction *TI = ClonedBB->getTerminator();
+      for (unsigned I = 0, E = TI->getNumSuccessors(); I != E; ++I)
+        if (TI->getSuccessor(I) == Succ)
+          ++EdgeCount;
 
-      for (PHINode &Phi : NextCase->phis()) {
-        Value *Incoming = FindFirstIncomingValueForBlock(Phi, BB);
-        if (!Incoming)
-          continue;
-
-        Phi.addIncoming(GetMappedValue(Incoming), ClonedBB);
-      }
-
-      return;
-    }
-
-    SmallVector<BasicBlock *, 8> BlocksToUpdate;
-    SmallPtrSet<BasicBlock *, 8> SeenBlocks;
-
-    auto AddBlockIfNew = [&](BasicBlock *Succ) {
-      if (SeenBlocks.insert(Succ).second)
-        BlocksToUpdate.push_back(Succ);
-    };
-
-    for (BasicBlock *Succ : successors(BB)) {
-      AddBlockIfNew(Succ);
-
-      // If the successor has already been cloned for this state, its PHIs also
-      // need the corresponding incoming values from ClonedBB.
-      if (BasicBlock *ClonedSucc = getClonedBB(Succ, NextState, DuplicateMap))
-        AddBlockIfNew(ClonedSucc);
-    }
-
-    // Normal cloned blocks keep the same successor multiplicity as the original
-    // block.  If BB had N edges to Succ, ClonedBB also has N edges to Succ.
-    // Therefore add one incoming value per original incoming edge from BB.
-    for (BasicBlock *Succ : BlocksToUpdate) {
       for (PHINode &Phi : Succ->phis()) {
         SmallVector<Value *, 4> IncomingVals;
-
         for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I)
           if (Phi.getIncomingBlock(I) == BB)
             IncomingVals.push_back(Phi.getIncomingValue(I));
 
-        for (Value *Incoming : IncomingVals)
-          Phi.addIncoming(GetMappedValue(Incoming), ClonedBB);
+  #ifndef NDEBUG
+        assert(IncomingVals.size() >= EdgeCount &&
+              "source PHI must match CFG edge multiplicity");
+  #endif
+
+        unsigned CopyCount = std::min<unsigned>(IncomingVals.size(), EdgeCount);
+        for (unsigned I = 0; I < CopyCount; ++I)
+          Phi.addIncoming(GetMappedValue(IncomingVals[I]), ClonedBB);
+
+        for (unsigned I = CopyCount; I < EdgeCount; ++I)
+          Phi.addIncoming(PoisonValue::get(Phi.getType()), ClonedBB);
       }
     }
   }
 
-  /// Sets the successor of PrevBB to be NewBB instead of OldBB. Note that all
-  /// other successors are kept as well.
+  /// Sets the successor of PrevBB to be NewBB instead of OldBB, redirecting
+  /// every parallel edge PrevBB→OldBB at once, and removing the matching
+  /// number of incoming entries from PHIs in OldBB. Tolerant of PHIs that
+  /// were already partially trimmed by an earlier path (path sharing); a
+  /// downstream `cleanPhiNodes(OldBB)` is the canonical recovery point and
+  /// will trim/extend as needed against the post-redirect edge count.
   void updatePredecessor(BasicBlock *PrevBB, BasicBlock *OldBB,
-                         BasicBlock *NewBB, DomTreeUpdater *DTU) {
+                        BasicBlock *NewBB, DomTreeUpdater *DTU) {
     Instruction *PrevTerm = PrevBB->getTerminator();
     SmallVector<unsigned, 4> EdgeIdxs;
 
@@ -1664,29 +1644,61 @@ private:
     if (EdgeIdxs.empty())
       return;
 
-    const unsigned RemovedEdgeCount = EdgeIdxs.size();
+    const unsigned RedirectedEdges = EdgeIdxs.size();
+
+    {
+      auto OldRange = OldBB->phis();
+      auto NewRange = NewBB->phis();
+      auto OldIt = OldRange.begin();
+      auto NewIt = NewRange.begin();
+
+      for (; OldIt != OldRange.end() && NewIt != NewRange.end();
+          ++OldIt, ++NewIt) {
+        PHINode &OldPhi = *OldIt;
+        PHINode &NewPhi = *NewIt;
+
+        unsigned ExistingInNew = 0;
+        for (unsigned I = 0, E = NewPhi.getNumIncomingValues(); I != E; ++I)
+          if (NewPhi.getIncomingBlock(I) == PrevBB)
+            ++ExistingInNew;
+
+        if (ExistingInNew >= RedirectedEdges)
+          continue;
+
+        SmallVector<Value *, 4> OldVals;
+        for (unsigned I = 0, E = OldPhi.getNumIncomingValues(); I != E; ++I)
+          if (OldPhi.getIncomingBlock(I) == PrevBB)
+            OldVals.push_back(OldPhi.getIncomingValue(I));
+
+        for (unsigned I = ExistingInNew; I < RedirectedEdges; ++I) {
+          Value *Val =
+              I < OldVals.size() ? OldVals[I] : PoisonValue::get(NewPhi.getType());
+          NewPhi.addIncoming(Val, PrevBB);
+        }
+      }
+
+  #ifndef NDEBUG
+      assert(OldIt == OldRange.end() && NewIt == NewRange.end() &&
+            "clone must preserve PHI structure");
+  #endif
+    }
 
     for (unsigned Idx : EdgeIdxs)
       PrevTerm->setSuccessor(Idx, NewBB);
 
     for (PHINode &Phi : OldBB->phis()) {
       unsigned Removed = 0;
-
       for (int I = static_cast<int>(Phi.getNumIncomingValues()) - 1;
-           I >= 0 && Removed != RemovedEdgeCount; --I) {
+          I >= 0 && Removed < RedirectedEdges; --I) {
         if (Phi.getIncomingBlock(I) != PrevBB)
           continue;
-
         Phi.removeIncomingValue(I, /*DeletePHIIfEmpty=*/false);
         ++Removed;
       }
-
-      assert(Removed == RemovedEdgeCount &&
-             "PHI must carry one incoming value per removed CFG edge");
     }
 
     DTU->applyUpdates({{DominatorTree::Delete, PrevBB, OldBB},
-                       {DominatorTree::Insert, PrevBB, NewBB}});
+                      {DominatorTree::Insert, PrevBB, NewBB}});
   }
 
   /// Add new value mappings to the DefMap to keep track of all new definitions
@@ -1759,8 +1771,6 @@ private:
     DTU->applyUpdates(DTUpdates);
   }
 
-  /// After cloning blocks, some of the phi nodes have extra incoming values
-  /// that are no longer used. This function removes them.
   void cleanPhiNodes(BasicBlock *BB) {
     if (pred_empty(BB)) {
       for (PHINode &PN : make_early_inc_range(BB->phis())) {
@@ -1770,24 +1780,46 @@ private:
       return;
     }
 
-    DenseMap<BasicBlock *, unsigned> PredEdgeCounts;
-
-    for (BasicBlock *Pred : predecessors(BB)) {
-      Instruction *TI = Pred->getTerminator();
-      for (unsigned I = 0, E = TI->getNumSuccessors(); I != E; ++I)
-        if (TI->getSuccessor(I) == BB)
-          ++PredEdgeCounts[Pred];
-    }
+    SmallDenseMap<BasicBlock *, unsigned, 8> PredEdgeCounts;
+    for (BasicBlock *Pred : predecessors(BB))
+      ++PredEdgeCounts[Pred];
 
     for (PHINode &Phi : BB->phis()) {
-      DenseMap<BasicBlock *, unsigned> SeenFromBack;
+      SmallDenseMap<BasicBlock *, unsigned, 8> TotalInPhi;
+      for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I)
+        ++TotalInPhi[Phi.getIncomingBlock(I)];
 
-      Phi.removeIncomingValueIf([&](unsigned Index) -> bool {
-        BasicBlock *IncomingBB = Phi.getIncomingBlock(Index);
-        unsigned Allowed = PredEdgeCounts.lookup(IncomingBB);
-        unsigned Seen = ++SeenFromBack[IncomingBB];
-        return Allowed == 0 || Seen > Allowed;
-      }, /*DeletePHIIfEmpty=*/false);
+      SmallDenseMap<BasicBlock *, unsigned, 8> ToRemove;
+      for (auto &KV : TotalInPhi) {
+        unsigned Allowed = PredEdgeCounts.lookup(KV.first);
+        if (KV.second > Allowed)
+          ToRemove[KV.first] = KV.second - Allowed;
+      }
+
+      for (unsigned I = 0; I < Phi.getNumIncomingValues();) {
+        if (Phi.getNumIncomingValues() <= 1)
+          break;
+
+        BasicBlock *IncomingBB = Phi.getIncomingBlock(I);
+        auto It = ToRemove.find(IncomingBB);
+        if (It != ToRemove.end() && It->second > 0) {
+          Phi.removeIncomingValue(I, /*DeletePHIIfEmpty=*/false);
+          --It->second;
+          continue;
+        }
+        ++I;
+      }
+
+  #ifndef NDEBUG
+      SmallDenseMap<BasicBlock *, unsigned, 8> Seen;
+      for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I) {
+        BasicBlock *IncomingBB = Phi.getIncomingBlock(I);
+        assert(PredEdgeCounts.lookup(IncomingBB) > 0 &&
+              "PHI entry from non-predecessor remains after cleanup");
+        assert(++Seen[IncomingBB] <= PredEdgeCounts.lookup(IncomingBB) &&
+              "Too many PHI entries remain for predecessor after cleanup");
+      }
+  #endif
     }
   }
 
