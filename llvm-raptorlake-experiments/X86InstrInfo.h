@@ -514,8 +514,7 @@ public:
                                       MachineBasicBlock::iterator InsertPt,
                                       MachineInstr &LoadMI,
                                       MachineInstr *&CopyMI,
-                                      LiveIntervals *LIS = nullptr,
-                                      VirtRegMap *VRM = nullptr) const override;
+                                      LiveIntervals *LIS = nullptr) const override;
 
   bool unfoldMemoryOperand(MachineFunction &MF, MachineInstr &MI, Register Reg,
                            bool UnfoldLoad, bool UnfoldStore,
