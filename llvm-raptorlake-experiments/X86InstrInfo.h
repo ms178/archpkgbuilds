@@ -511,7 +511,9 @@ public:
   /// store from / to any address, not just from a specific stack slot.
   MachineInstr *foldMemoryOperandImpl(MachineFunction &MF, MachineInstr &MI,
                                       ArrayRef<unsigned> Ops,
+                                      MachineBasicBlock::iterator InsertPt,
                                       MachineInstr &LoadMI,
+                                      MachineInstr *&CopyMI,
                                       LiveIntervals *LIS = nullptr,
                                       VirtRegMap *VRM = nullptr) const override;
 
