@@ -8334,6 +8334,7 @@ MachineInstr *X86InstrInfo::foldMemoryOperandImpl(
       // source element that is masked off.
       if (isNonFoldableWithSameMask(MI.getOpcode()))
         return nullptr;
+
       bool HasSameMask = false;
       for (unsigned I = 1, E = MI.getDesc().getNumOperands(); I < E; ++I) {
         const MachineOperand &Op = MI.getOperand(I);
@@ -8359,8 +8360,8 @@ MachineInstr *X86InstrInfo::foldMemoryOperandImpl(
   if (isLoadFromStackSlot(LoadMI, FrameIndex)) {
     if (isNonFoldablePartialRegisterLoad(LoadMI, MI, MF))
       return nullptr;
-    return foldMemoryOperandImpl(MF, MI, Ops, InsertPt, FrameIndex, CopyMI, LIS,
-                                 VRM);
+    return foldMemoryOperandImpl(MF, MI, Ops, FrameIndex, CopyMI, LIS,
+                                 /*VRM=*/nullptr);
   }
 
   // Check switch flag
@@ -8423,6 +8424,7 @@ MachineInstr *X86InstrInfo::foldMemoryOperandImpl(
     default:
       return nullptr;
     }
+
   if (Ops.size() == 2 && Ops[0] == 0 && Ops[1] == 1) {
     unsigned NewOpc = 0;
     switch (MI.getOpcode()) {
@@ -8444,8 +8446,9 @@ MachineInstr *X86InstrInfo::foldMemoryOperandImpl(
     // Change to CMPXXri r, 0 first.
     MI.setDesc(get(NewOpc));
     MI.getOperand(1).ChangeToImmediate(0);
-  } else if (Ops.size() != 1)
+  } else if (Ops.size() != 1) {
     return nullptr;
+  }
 
   // Make sure the subregisters match.
   // Otherwise we risk changing the size of the load.
@@ -8532,7 +8535,6 @@ MachineInstr *X86InstrInfo::foldMemoryOperandImpl(
     case X86::AVX_SET0:
       Ty = FixedVectorType::get(Type::getInt32Ty(MF.getFunction().getContext()),
                                 8);
-
       break;
     case X86::MMX_SET0:
       Ty = FixedVectorType::get(Type::getInt32Ty(MF.getFunction().getContext()),
@@ -8577,6 +8579,7 @@ MachineInstr *X86InstrInfo::foldMemoryOperandImpl(
              LoadMI.operands_begin() + NumOps);                                \
   return foldMemoryBroadcast(MF, MI, Ops[0], MOs, InsertPt, /*Size=*/SIZE,     \
                              /*AllowCommute=*/true);
+
   case X86::VPBROADCASTWZ128rm:
   case X86::VPBROADCASTWZ256rm:
   case X86::VPBROADCASTWZrm:
@@ -8594,6 +8597,7 @@ MachineInstr *X86InstrInfo::foldMemoryOperandImpl(
   case X86::VBROADCASTSDZ256rm:
   case X86::VBROADCASTSDZrm:
     FOLD_BROADCAST(64);
+
   default: {
     if (isNonFoldablePartialRegisterLoad(LoadMI, MI, MF))
       return nullptr;
@@ -8604,9 +8608,10 @@ MachineInstr *X86InstrInfo::foldMemoryOperandImpl(
     break;
   }
   }
+
   return foldMemoryOperandImpl(MF, MI, Ops[0], MOs, InsertPt,
                                /*Size=*/0, Alignment, /*AllowCommute=*/true,
-                               CopyMI);
+                               CopyMI, /*VRM=*/nullptr);
 }
 
 MachineInstr *
