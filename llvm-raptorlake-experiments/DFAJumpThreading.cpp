@@ -201,16 +201,24 @@ public:
 private:
   void unfoldSelectInstrs(const SmallVector<SelectInstToUnfold, 4> &SelectInsts) {
     SmallVector<SelectInstToUnfold, 4> Stack(SelectInsts);
+    SmallPtrSet<SelectInst *, 16> VisitedSelects;
 
     while (!Stack.empty()) {
       SelectInstToUnfold SIToUnfold = Stack.pop_back_val();
+      SelectInst *SI = SIToUnfold.getInst();
+      if (!SI || !VisitedSelects.insert(SI).second)
+        continue;
 
       SmallVector<SelectInstToUnfold, 4> NewSIsToUnfold;
       SmallVector<BasicBlock *, 4> NewBBs;
       unfold(DTU, LI, SIToUnfold, NewSIsToUnfold, NewBBs);
 
       // Put newly discovered select instructions into the work list.
-      llvm::append_range(Stack, NewSIsToUnfold);
+      for (SelectInstToUnfold NewSI : NewSIsToUnfold) {
+        SelectInst *Inst = NewSI.getInst();
+        if (Inst && !VisitedSelects.contains(Inst))
+          Stack.push_back(NewSI);
+      }
     }
   }
 
@@ -1058,16 +1066,25 @@ private:
       return S;
     };
 
-    auto estimateIncrementalCloneInsts =
-        [&](const ThreadingPath &TPath,
-            DenseMap<BasicBlock *, SmallVector<APInt, 4>> &Seen) -> uint64_t {
+    using SeenStateMap = DenseMap<BasicBlock *, SmallVector<APInt, 4>>;
+    auto estimateIncrementalCloneInsts = [&](const ThreadingPath &TPath,
+                                             SeenStateMap &Seen,
+                                             bool Commit) -> uint64_t {
       uint64_t Cost = 0;
       APInt State = TPath.getExitValue();
+      SmallVector<std::pair<BasicBlock *, unsigned>, 16> Touched;
+      Touched.reserve(8);
+
+      auto markSeen = [&](BasicBlock *BB) {
+        unsigned OldSize = Seen[BB].size();
+        markStateSeen(Seen, BB, State);
+        Touched.push_back({BB, OldSize});
+      };
 
       // Switch block is always cloned per state.
       if (!stateSeen(Seen, SwitchBlock, State)) {
         Cost += SwitchBlock->size();
-        markStateSeen(Seen, SwitchBlock, State);
+        markSeen(SwitchBlock);
       }
 
       const PathType &PathBBs = TPath.getPath();
@@ -1085,7 +1102,20 @@ private:
         if (stateSeen(Seen, BB, State))
           continue;
         Cost += BB->size();
-        markStateSeen(Seen, BB, State);
+        markSeen(BB);
+      }
+
+      if (!Commit) {
+        for (auto RIt = Touched.rbegin(), RE = Touched.rend(); RIt != RE; ++RIt) {
+          BasicBlock *BB = RIt->first;
+          unsigned OldSize = RIt->second;
+          auto ItSeen = Seen.find(BB);
+          if (ItSeen == Seen.end())
+            continue;
+          ItSeen->second.resize(OldSize);
+          if (OldSize == 0)
+            Seen.erase(ItSeen);
+        }
       }
 
       return Cost;
@@ -1113,7 +1143,7 @@ private:
     const uint64_t Budget = HotPathCloneBudgetInst.getValue();
     const bool Unlimited = (Budget == 0);
 
-    DenseMap<BasicBlock *, SmallVector<APInt, 4>> SeenPairs;
+    SeenStateMap SeenPairs;
     SmallVector<ThreadingPath, 16> Selected;
     Selected.reserve(Paths.size());
 
@@ -1123,13 +1153,12 @@ private:
     for (const PathScore &S : Ranked) {
       ThreadingPath &Path = Paths[S.Index];
 
-      DenseMap<BasicBlock *, SmallVector<APInt, 4>> SeenTmp = SeenPairs;
-      uint64_t Inc = estimateIncrementalCloneInsts(Path, SeenTmp);
+      uint64_t Inc = estimateIncrementalCloneInsts(Path, SeenPairs, false);
 
       if (!Unlimited && UsedBudget + Inc > Budget)
         continue;
 
-      estimateIncrementalCloneInsts(Path, SeenPairs);
+      estimateIncrementalCloneInsts(Path, SeenPairs, true);
       UsedBudget += Inc;
       Selected.push_back(Path);
     }
