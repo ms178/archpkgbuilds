@@ -12,6 +12,7 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <utility>
 
@@ -221,6 +222,49 @@ private:
 };
 
 /* --------------------------------------------------------------------- */
+/*  shared_mutex – Upstream SRW-based shared mutex                      */
+/* --------------------------------------------------------------------- */
+class shared_mutex {
+public:
+    using native_handle_type = PSRWLOCK;
+
+    shared_mutex() noexcept = default;
+    shared_mutex(const shared_mutex&) = delete;
+    shared_mutex& operator=(const shared_mutex&) = delete;
+
+    DXVK_FORCE_INLINE void lock() noexcept {
+        ::AcquireSRWLockExclusive(&m_lock);
+    }
+
+    DXVK_FORCE_INLINE void lock_shared() noexcept {
+        ::AcquireSRWLockShared(&m_lock);
+    }
+
+    DXVK_FORCE_INLINE void unlock() noexcept {
+        ::ReleaseSRWLockExclusive(&m_lock);
+    }
+
+    DXVK_FORCE_INLINE void unlock_shared() noexcept {
+        ::ReleaseSRWLockShared(&m_lock);
+    }
+
+    DXVK_FORCE_INLINE bool try_lock() noexcept {
+        return ::TryAcquireSRWLockExclusive(&m_lock) != 0;
+    }
+
+    DXVK_FORCE_INLINE bool try_lock_shared() noexcept {
+        return ::TryAcquireSRWLockShared(&m_lock) != 0;
+    }
+
+    DXVK_FORCE_INLINE native_handle_type native_handle() noexcept {
+        return &m_lock;
+    }
+
+private:
+    SRWLOCK m_lock = SRWLOCK_INIT;
+};
+
+/* --------------------------------------------------------------------- */
 /*  fast_mutex – High-performance, fair, spin-adaptive mutex             */
 /*                                                                       */
 /*  This robust implementation uses a Windows CRITICAL_SECTION           */
@@ -418,6 +462,7 @@ public:
 };
 
 using mutex              = std::mutex;
+using shared_mutex       = std::shared_mutex;
 using recursive_mutex    = std::recursive_mutex;
 using condition_variable = std::condition_variable;
 using fast_mutex         = std::mutex;

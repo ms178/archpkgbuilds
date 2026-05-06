@@ -3,6 +3,7 @@
 #include <cstring>
 #include <string>
 #include <sstream>
+#include <string_view>
 #include <vector>
 
 #include "./com/com_include.h"
@@ -226,7 +227,7 @@ inline std::vector<std::string_view> split(std::string_view string, std::string_
   return tokens;
 }
 
-/** Compares ASCII characters in a case-insensitive way */
+/** Compares ASCII characters in a case-insensitive way, branchless */
 inline bool compareCharsCaseInsensitive(char a, char b) {
   unsigned char ua = static_cast<unsigned char>(a);
   unsigned char ub = static_cast<unsigned char>(b);
@@ -242,6 +243,15 @@ inline bool compareCaseInsensitive(const char* a, const char* b) {
       return false;
   }
   return true;
+}
+
+/** Converts ASCII string to lower case */
+inline std::string tolower(std::string str) {
+  for (size_t i = 0u; i < str.size(); i++) {
+    if (str[i] >= 'A' && str[i] <= 'Z')
+      str[i] += 'a' - 'A';
+  }
+  return str;
 }
 
 } // namespace dxvk::str

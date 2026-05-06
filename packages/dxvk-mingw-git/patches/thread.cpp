@@ -355,7 +355,7 @@ namespace dxvk {
                     buf_ptr = stack_buf;
                 } else {
                     /* Fallback to heap for systems with >64 cores */
-heap_buf.resize(len);
+                    heap_buf.resize(len);
                     buf_ptr = heap_buf.data();
                 }
 
@@ -473,7 +473,7 @@ heap_buf.resize(len);
              * the loader lock is held, and new threads will block trying to
              * initialize TLS for the unloading DLL.
              */
-            using Fn = BOOLEAN (WINAPI*)();
+            using Fn = BOOLEAN (NTAPI*)();
 
             static Fn fn = reinterpret_cast<Fn>(
                 ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"),
