@@ -122,7 +122,7 @@ HRESULT vkd3d_queue_create(struct d3d12_device *device, uint32_t family_index, u
     struct vkd3d_queue *object;
     VkDependencyInfo dep_info;
     VkResult vr;
-    HRESULT hr;
+    HRESULT hr = S_OK;
     int rc;
 
     if (!(object = vkd3d_malloc(sizeof(*object))))
@@ -197,7 +197,11 @@ HRESULT vkd3d_queue_create(struct d3d12_device *device, uint32_t family_index, u
         /* It's not very meaningful to rebuild this command buffer over and over. */
         begin_info.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
         begin_info.pInheritanceInfo = NULL;
-        VK_CALL(vkBeginCommandBuffer(object->barrier_command_buffer, &begin_info));
+        if ((vr = VK_CALL(vkBeginCommandBuffer(object->barrier_command_buffer, &begin_info))) < 0)
+        {
+            hr = hresult_from_vk_result(vr);
+            goto fail_free_barrier_cmd;
+        }
 
         /* To avoid unnecessary tracking, just emit a host barrier on every submit. */
         memset(&memory_barrier, 0, sizeof(memory_barrier));
@@ -213,21 +217,29 @@ HRESULT vkd3d_queue_create(struct d3d12_device *device, uint32_t family_index, u
         dep_info.pMemoryBarriers = &memory_barrier;
 
         VK_CALL(vkCmdPipelineBarrier2(object->barrier_command_buffer, &dep_info));
-        VK_CALL(vkEndCommandBuffer(object->barrier_command_buffer));
+        if ((vr = VK_CALL(vkEndCommandBuffer(object->barrier_command_buffer))) < 0)
+        {
+            hr = hresult_from_vk_result(vr);
+            goto fail_free_barrier_cmd;
+        }
     }
 
     if (FAILED(hr = vkd3d_create_timeline_semaphore(device, 0, false, &object->submission_timeline)))
-        goto fail_free_command_pool;
+        goto fail_free_barrier_cmd;
 
     *queue = object;
-    return hr;
+    return S_OK;
 
+fail_free_barrier_cmd:
+    if (object->barrier_command_buffer)
+        VK_CALL(vkFreeCommandBuffers(device->vk_device, object->barrier_pool, 1, &object->barrier_command_buffer));
 fail_free_command_pool:
     VK_CALL(vkDestroyCommandPool(device->vk_device, object->barrier_pool, NULL));
 fail_destroy_mutex:
     pthread_mutex_destroy(&object->mutex);
     pthread_mutex_destroy(&object->fence_mutex);
     pthread_cond_destroy(&object->fence_cond);
+    vkd3d_free(object);
     return hr;
 }
 
@@ -253,6 +265,7 @@ void vkd3d_queue_drain(struct vkd3d_queue *queue, struct d3d12_device *device)
     VkSemaphoreSubmitInfo signal_semaphore;
     VkSubmitInfo2 submit_desc;
     VkResult vr = VK_SUCCESS;
+    VkResult wait_vr;
     VkQueue vk_queue;
 
     if (!(vk_queue = vkd3d_queue_acquire(queue)))
@@ -283,8 +296,8 @@ void vkd3d_queue_drain(struct vkd3d_queue *queue, struct d3d12_device *device)
 
     if (vr == VK_SUCCESS)
     {
-        if ((VK_CALL(vkQueueWaitIdle(vk_queue))))
-            WARN("Failed to wait for queue, vr %d.\n", vr);
+        if ((wait_vr = VK_CALL(vkQueueWaitIdle(vk_queue))) != VK_SUCCESS)
+            WARN("Failed to wait for queue, vr %d.\n", wait_vr);
     }
 
     queue->wait_count = 0u;
@@ -1776,15 +1789,23 @@ HRESULT d3d12_fence_create(struct d3d12_device *device,
     struct d3d12_fence *object;
     HRESULT hr;
 
+    if (!fence)
+        return E_INVALIDARG;
+
+    *fence = NULL;
+
     if (!(object = vkd3d_malloc(sizeof(*object))))
         return E_OUTOFMEMORY;
 
     if (SUCCEEDED(hr = d3d12_fence_init(object, device, initial_value, flags)))
+    {
         TRACE("Created fence %p.\n", object);
-    else
-        ERR("Failed to create fence.\n");
+        *fence = object;
+        return S_OK;
+    }
 
-    *fence = object;
+    ERR("Failed to create fence.\n");
+    vkd3d_free(object);
     return hr;
 }
 
@@ -3548,7 +3569,13 @@ bool d3d12_command_allocator_allocate_query_from_type_index(
         struct d3d12_command_allocator *allocator,
         uint32_t type_index, VkQueryPool *query_pool, uint32_t *query_index)
 {
-    struct vkd3d_query_pool *pool = d3d12_command_allocator_get_active_query_pool_from_type_index(allocator, type_index);
+    struct vkd3d_query_pool *pool;
+    uint32_t max_type_indices = (uint32_t)ARRAY_SIZE(allocator->active_query_pools);
+
+    if (type_index >= max_type_indices)
+        return false;
+
+    pool = d3d12_command_allocator_get_active_query_pool_from_type_index(allocator, type_index);
     assert(pool);
 
     if (pool->next_index >= pool->query_count)
@@ -3572,6 +3599,10 @@ static bool d3d12_command_allocator_allocate_query_from_heap_type(struct d3d12_c
         D3D12_QUERY_HEAP_TYPE heap_type, VkQueryPool *query_pool, uint32_t *query_index)
 {
     uint32_t type_index = d3d12_query_heap_type_to_type_index(heap_type);
+
+    if (type_index == UINT32_MAX)
+        return false;
+
     return d3d12_command_allocator_allocate_query_from_type_index(allocator, type_index, query_pool, query_index);
 }
 
@@ -5202,20 +5233,31 @@ static void d3d12_command_list_handle_active_queries(struct d3d12_command_list *
     }
 }
 
-int vkd3d_compare_pending_query(const void* query_a, const void* query_b)
+int vkd3d_compare_pending_query(const void *query_a, const void *query_b)
 {
     const struct vkd3d_active_query *a = query_a;
     const struct vkd3d_active_query *b = query_b;
+    uintptr_t a_heap = (uintptr_t)a->heap;
+    uintptr_t b_heap = (uintptr_t)b->heap;
+    uint64_t a_pool = (uint64_t)(uintptr_t)a->vk_pool;
+    uint64_t b_pool = (uint64_t)(uintptr_t)b->vk_pool;
 
-    // Sort by D3D12 heap since we need to do one compute dispatch per buffer
-    if (a->heap < b->heap) return -1;
-    if (a->heap > b->heap) return 1;
+    if (a_heap < b_heap)
+        return -1;
+    if (a_heap > b_heap)
+        return 1;
 
-    // Sort by Vulkan query pool and index to batch query resolves
-    if (a->vk_pool > b->vk_pool) return -1;
-    if (a->vk_pool < b->vk_pool) return 1;
+    if (a_pool > b_pool)
+        return -1;
+    if (a_pool < b_pool)
+        return 1;
 
-    return (int)(a->vk_index - b->vk_index);
+    if (a->vk_index < b->vk_index)
+        return -1;
+    if (a->vk_index > b->vk_index)
+        return 1;
+
+    return 0;
 }
 
 static size_t get_query_heap_stride(D3D12_QUERY_HEAP_TYPE heap_type)
@@ -6256,7 +6298,10 @@ void d3d12_command_list_invalidate_root_parameters(struct d3d12_command_list *li
     if (invalidate_descriptor_heaps)
     {
         struct d3d12_device *device = bindings->root_signature->device;
-        bindings->descriptor_heap_dirty_mask = (1ull << device->bindless_state.set_count) - 1;
+        if (device->bindless_state.set_count >= 64)
+            bindings->descriptor_heap_dirty_mask = UINT64_MAX;
+        else
+            bindings->descriptor_heap_dirty_mask = (1ull << device->bindless_state.set_count) - 1ull;
     }
 }
 
@@ -9250,6 +9295,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_
             "src_offset %#"PRIx64", byte_count %#"PRIx64".\n",
             iface, dst, dst_offset, src, src_offset, byte_count);
 
+    if (!byte_count)
+        return;
+
     d3d12_command_list_check_render_pass_validation(list, "CopyBufferRegion called within a render pass.\n", true);
     d3d12_command_list_flush_dgc_batch(list);
 
@@ -10976,6 +11024,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyTiles(d3d12_command_list_if
             iface, tiled_resource, region_coord, region_size,
             buffer, buffer_offset, flags);
 
+    if (!region_size || !region_size->NumTiles)
+        return;
+
     d3d12_command_list_check_render_pass_validation(list, "CopyTiles called within a render pass.\n", true);
     d3d12_command_list_flush_dgc_batch(list);
 
@@ -11170,7 +11221,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyTiles(d3d12_command_list_if
         copy_info.sType = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2;
         copy_info.pNext = NULL;
         copy_info.srcBuffer = copy_to_buffer ? tiled_res->res.vk_buffer : linear_res->res.vk_buffer;
-        copy_info.dstBuffer = copy_to_buffer ? linear_res->res.vk_buffer : tiled_res->res.vk_buffer,
+        copy_info.dstBuffer = copy_to_buffer ? linear_res->res.vk_buffer : tiled_res->res.vk_buffer;
         copy_info.regionCount = 1;
         copy_info.pRegions = &buffer_copy;
 
@@ -12996,6 +13047,7 @@ static const char *vkd3d_barrier_layout_to_str(D3D12_BARRIER_LAYOUT layout)
 static const char *vkd3d_barrier_sync_to_str(D3D12_BARRIER_SYNC sync)
 {
     char *buffer;
+    size_t len;
 
     if (sync & D3D12_BARRIER_SYNC_ALL)
         return "ALL";
@@ -13007,7 +13059,7 @@ static const char *vkd3d_barrier_sync_to_str(D3D12_BARRIER_SYNC sync)
 
     while (sync)
     {
-        uint32_t state = sync & -sync;
+        D3D12_BARRIER_SYNC state = sync & (~sync + 1);
         const char *str;
 
         switch (state)
@@ -13038,15 +13090,8 @@ static const char *vkd3d_barrier_sync_to_str(D3D12_BARRIER_SYNC sync)
 #undef s
         }
 
-        if (*buffer != '\0')
-        {
-            strncat(buffer, " | ", VKD3D_DEBUG_BUFFER_SIZE);
-            strncat(buffer, str, VKD3D_DEBUG_BUFFER_SIZE);
-        }
-        else
-        {
-            strcpy(buffer, str);
-        }
+        len = strlen(buffer);
+        snprintf(buffer + len, VKD3D_DEBUG_BUFFER_SIZE - len, "%s%s", len ? " | " : "", str);
 
         sync &= ~state;
     }
@@ -13057,6 +13102,7 @@ static const char *vkd3d_barrier_sync_to_str(D3D12_BARRIER_SYNC sync)
 static const char *vkd3d_barrier_access_to_str(D3D12_BARRIER_ACCESS access)
 {
     char *buffer;
+    size_t len;
 
     if (access == D3D12_BARRIER_ACCESS_COMMON)
         return "COMMON";
@@ -13068,7 +13114,7 @@ static const char *vkd3d_barrier_access_to_str(D3D12_BARRIER_ACCESS access)
 
     while (access)
     {
-        uint32_t state = access & -access;
+        D3D12_BARRIER_ACCESS state = access & (~access + 1);
         const char *str;
 
         switch (state)
@@ -13101,15 +13147,8 @@ static const char *vkd3d_barrier_access_to_str(D3D12_BARRIER_ACCESS access)
 #undef s
         }
 
-        if (*buffer != '\0')
-        {
-            strncat(buffer, " | ", VKD3D_DEBUG_BUFFER_SIZE);
-            strncat(buffer, str, VKD3D_DEBUG_BUFFER_SIZE);
-        }
-        else
-        {
-            strcpy(buffer, str);
-        }
+        len = strlen(buffer);
+        snprintf(buffer + len, VKD3D_DEBUG_BUFFER_SIZE - len, "%s%s", len ? " | " : "", str);
 
         access &= ~state;
     }
