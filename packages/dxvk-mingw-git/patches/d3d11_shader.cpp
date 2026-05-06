@@ -24,10 +24,10 @@ namespace dxvk {
     ~D3D11ShaderConverter() { }
 
     void convertShader(dxbc_spv::ir::Builder& builder) {
-      auto debugName = m_key.toString();
+      const std::string shaderName = m_key.toString();
 
       dxbc_spv::dxbc::Converter::Options options = { };
-      options.name = debugName.c_str();
+      options.name = shaderName.c_str();
       options.includeDebugNames = true;
       options.boundCheckShaderIo = true;
       options.lowerIcb = m_lowerIcb;
@@ -44,16 +44,15 @@ namespace dxvk {
 
       dxbc_spv::dxbc::Converter converter(std::move(container), options);
 
-      // Determine whether to create a regular shader or a pass-through GS
-      auto dstIsGs = m_key.stage() == VK_SHADER_STAGE_GEOMETRY_BIT;
-      auto srcIsGs = shaderInfo.getType() == dxbc_spv::dxbc::ShaderType::eGeometry;
+      const bool dstIsGs = m_key.stage() == VK_SHADER_STAGE_GEOMETRY_BIT;
+      const bool srcIsGs = shaderInfo.getType() == dxbc_spv::dxbc::ShaderType::eGeometry;
 
       if (dstIsGs && !srcIsGs) {
         if (!converter.createPassthroughGs(builder))
-          throw DxvkError(str::format("Failed to create pass-through geometry shader: ", m_key.toString()));
+          throw DxvkError(str::format("Failed to create pass-through geometry shader: ", shaderName));
       } else {
         if (!converter.convertShader(builder))
-          throw DxvkError(str::format("Failed to convert shader: ", m_key.toString()));
+          throw DxvkError(str::format("Failed to convert shader: ", shaderName));
       }
     }
 
@@ -62,6 +61,8 @@ namespace dxvk {
             dxbc_spv::ir::ScalarType  type,
             uint32_t                  regSpace,
             uint32_t                  regIndex) const {
+      (void)regSpace;
+
       switch (type) {
         case dxbc_spv::ir::ScalarType::eSampler:
           return D3D11ShaderResourceMapping::computeSamplerBinding(stage, regIndex);
@@ -74,13 +75,15 @@ namespace dxvk {
         case dxbc_spv::ir::ScalarType::eUavCounter:
           return D3D11ShaderResourceMapping::computeUavCounterBinding(stage, regIndex);
         default:
-          return -1u;
+          return 0xffffffffu;
       }
     }
 
     void dumpSource(const std::string& path) const {
-      std::ofstream file(str::topath(str::format(path, "/", m_key.toString(), ".dxbc").c_str()).c_str(),
-                         std::ios_base::trunc | std::ios_base::binary);
+      const auto filePath =
+        str::topath(str::format(path, "/", m_key.toString(), ".dxbc").c_str());
+
+      std::ofstream file(filePath.c_str(), std::ios_base::trunc | std::ios_base::binary);
       file.write(reinterpret_cast<const char*>(m_dxbc.data()), m_dxbc.size());
     }
 
@@ -131,7 +134,7 @@ namespace dxvk {
     const D3D11ShaderIcbInfo&     Icb) {
     constexpr size_t MaxEmbeddedIcbSize = 64u;
 
-    size_t icbSizeInBytes = Icb.size * sizeof(uint32_t);
+    const size_t icbSizeInBytes = Icb.size * sizeof(uint32_t);
 
     if (ModuleInfo.options.flags.test(DxvkShaderCompileFlag::LowerConstantArrays)
      && icbSizeInBytes > MaxEmbeddedIcbSize) {
@@ -152,15 +155,17 @@ namespace dxvk {
       pDevice->InitShaderIcb(this, icbSizeInBytes, Icb.data);
     }
 
+    const std::string shaderName = ShaderKey.toString();
+
     m_shader = pDevice->GetDXVKDevice()->createCachedShader(
-      ShaderKey.toString(), ModuleInfo, nullptr);
+      shaderName, ModuleInfo, nullptr);
 
     if (m_shader == nullptr) {
       Rc<D3D11ShaderConverter> converter = new D3D11ShaderConverter(
         ShaderKey, ModuleInfo, pShaderBytecode, BytecodeLength, m_buffer != nullptr);
 
       m_shader = pDevice->GetDXVKDevice()->createCachedShader(
-        ShaderKey.toString(), ModuleInfo, std::move(converter));
+        shaderName, ModuleInfo, std::move(converter));
     }
   }
 
@@ -226,8 +231,8 @@ namespace dxvk {
     const D3D11ShaderIcbInfo&     Icb,
     const D3D11BindingMask&       BindingMask,
           D3D11CommonShader*      pShader) {
-    // Use the shader's unique key for the lookup
-    { std::unique_lock<dxvk::mutex> lock(m_mutex);
+    // Use the shader's unique key for the lookup.
+    { std::lock_guard<dxvk::mutex> lock(m_mutex);
 
       auto entry = m_modules.find(ShaderKey);
       if (entry != m_modules.end()) {
@@ -251,18 +256,11 @@ namespace dxvk {
     // Insert the new module into the lookup table. If another thread
     // has compiled the same shader in the meantime, we should return
     // that object instead and discard the newly created module.
-    { std::unique_lock<dxvk::mutex> lock(m_mutex);
-
-      auto status = m_modules.insert({ ShaderKey, module });
-
-      if (!status.second) {
-        *pShader = status.first->second;
-        return S_OK;
-      }
+    { std::lock_guard<dxvk::mutex> lock(m_mutex);
+      auto status = m_modules.try_emplace(ShaderKey, std::move(module));
+      *pShader = status.first->second;
+      return S_OK;
     }
-
-    *pShader = std::move(module);
-    return S_OK;
   }
 
 }

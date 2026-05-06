@@ -8,6 +8,16 @@
 
 namespace dxvk {
 
+  namespace {
+
+    std::string getBuiltInName(ir::BuiltIn builtIn) {
+      std::stringstream name;
+      name << builtIn;
+      return name.str();
+    }
+
+  }
+
   DxvkBuiltInResourceMapping::DxvkBuiltInResourceMapping(const DxvkPipelineLayout* layout)
   : m_setIndex(layout->usesSamplerHeap() ? 1u : 0u) {}
 
@@ -17,13 +27,16 @@ namespace dxvk {
         ir::ScalarType          type,
         uint32_t                regSpace,
         uint32_t                regIndex) {
-    dxbc_spv::spirv::DescriptorBinding result = {};
+    (void)regSpace;
+
+    dxbc_spv::spirv::DescriptorBinding result = { };
     result.set = type == ir::ScalarType::eSampler ? 0u : m_setIndex;
     result.binding = regIndex;
     return result;
   }
 
   uint32_t DxvkBuiltInResourceMapping::mapPushData(ir::ShaderStageMask stages) {
+    (void)stages;
     return 0u;
   }
 
@@ -215,13 +228,9 @@ namespace dxvk {
           ir::Builder&          builder,
           uint32_t              pushDataOffset,
     const char*                 name) {
-    // Declare sampler index as regular push data
     ir::SsaDef index = declarePushData(builder, ir::ScalarType::eU32, pushDataOffset, name);
 
-    // Declare actual sampler heap as an unsized descriptor
-    // array, if we don't have one already
     ir::SsaDef samplerHeap = { };
-
     auto decl = builder.getDeclarations();
 
     for (auto i = decl.first; i != decl.second && !samplerHeap; i++) {
@@ -234,7 +243,6 @@ namespace dxvk {
       samplerHeap = builder.add(ir::Op::DclSampler(entry, 0u, 0u, 0u));
     }
 
-    // Emit descriptor load using the loaded index
     return builder.add(ir::Op::DescriptorLoad(ir::ScalarType::eSampler, samplerHeap, index));
   }
 
@@ -289,9 +297,6 @@ namespace dxvk {
     auto entry = builder.getOp(findEntryPoint(builder));
     dxbc_spv_assert(entry);
 
-    std::stringstream name;
-    name << builtIn;
-
     ir::SsaDef inputVar = { };
 
     if (ir::ShaderStage(entry.getOperand(1u)) == ir::ShaderStage::ePixel) {
@@ -303,7 +308,8 @@ namespace dxvk {
       inputVar = builder.add(ir::Op::DclInputBuiltIn(type, entry.getDef(), builtIn));
     }
 
-    builder.add(ir::Op::DebugName(inputVar, name.str().c_str()));
+    const std::string builtInName = getBuiltInName(builtIn);
+    builder.add(ir::Op::DebugName(inputVar, builtInName.c_str()));
     return splitLoad(builder, ir::OpCode::eInputLoad, inputVar);
   }
 
@@ -340,11 +346,9 @@ namespace dxvk {
     auto entry = findEntryPoint(builder);
     auto type = builder.getOp(value).getType();
 
-    std::stringstream name;
-    name << builtIn;
-
     auto outputVar = builder.add(ir::Op::DclOutputBuiltIn(type, entry, builtIn));
-    builder.add(ir::Op::DebugName(outputVar, name.str().c_str()));
+    const std::string builtInName = getBuiltInName(builtIn);
+    builder.add(ir::Op::DebugName(outputVar, builtInName.c_str()));
 
     splitStore(builder, ir::OpCode::eOutputStore, outputVar, value);
   }
@@ -403,7 +407,6 @@ namespace dxvk {
   ir::SsaDef DxvkBuiltInShader::emitConditionalBlock(
           ir::Builder&          builder,
           ir::SsaDef            cond) {
-    // Build everything upside down since it's easier that way
     auto mergeBlock = builder.add(ir::Op::Label());
     auto mergeBranch = builder.addBefore(mergeBlock, ir::Op::Branch(mergeBlock));
 
@@ -411,7 +414,6 @@ namespace dxvk {
     auto condBranch = builder.addBefore(condBlock,
       ir::Op::BranchConditional(cond, condBlock, mergeBlock));
 
-    // Find current label to rewrite it as a structured selection later
     auto currBlock = ir::findContainingBlock(builder, condBranch);
     builder.rewriteOp(currBlock, ir::Op::LabelSelection(mergeBlock));
 
@@ -427,10 +429,13 @@ namespace dxvk {
           uint32_t              count) {
     auto vectorType = builder.getOp(vector).getType().getBaseType(0u);
     auto scalarType = vectorType.getBaseType();
+    const uint32_t vectorSize = vectorType.getVectorSize();
 
-    dxbc_spv_assert(first + count <= vectorType.getVectorSize());
+    dxbc_spv_assert(count != 0u);
+    dxbc_spv_assert(first <= vectorSize);
+    dxbc_spv_assert(count <= vectorSize - first);
 
-    if (count == vectorType.getVectorSize())
+    if (count == vectorSize)
       return vector;
 
     ir::Op compositeOp(ir::Op::CompositeConstruct(ir::BasicType(scalarType, count)));
@@ -527,7 +532,6 @@ namespace dxvk {
     dxbc_spv_assert(type.isBasicType());
     ir::BasicType vectorType = type.getBaseType(0u);
 
-    // Declare input parameter and the actual function
     ir::SsaDef param = builder.add(ir::Op::DclParam(vectorType));
     builder.add(ir::Op::DebugName(param, "lin"));
 
@@ -539,7 +543,6 @@ namespace dxvk {
     ir::SsaDef cursor = builder.setCursor(function);
     builder.add(ir::Op::Label());
 
-    // Extract color and alpha from given parameters
     ir::SsaDef color = builder.add(ir::Op::ParamLoad(vectorType, function, param));
     ir::SsaDef alpha = ir::SsaDef();
 
@@ -699,9 +702,10 @@ namespace dxvk {
 
   ir::SsaDef DxvkBuiltInShader::findEntryPointFunction(
           ir::Builder&          builder) {
-    auto entry = builder.getOp(findEntryPoint(builder));
-    dxbc_spv_assert(entry);
+    auto entryPoint = findEntryPoint(builder);
+    dxbc_spv_assert(entryPoint);
 
+    auto entry = builder.getOp(entryPoint);
     return ir::SsaDef(entry.getOperand(0u));
   }
 
@@ -795,7 +799,10 @@ namespace dxvk {
     if (m_name.empty() || dumpPath.empty())
       return;
 
-    std::ofstream file(str::topath(str::format(dumpPath, "/", m_name, ".spv").c_str()).c_str(), std::ios_base::trunc | std::ios_base::binary);
+    const auto filePath =
+      str::topath(str::format(dumpPath, "/", m_name, ".spv").c_str());
+
+    std::ofstream file(filePath.c_str(), std::ios_base::trunc | std::ios_base::binary);
     file.write(reinterpret_cast<const char*>(dwords), size * sizeof(*dwords));
   }
 

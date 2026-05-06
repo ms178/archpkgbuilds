@@ -1,8 +1,8 @@
 #pragma once
 
 #include <cstring>
-#include <string>
 #include <sstream>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -50,11 +50,6 @@ size_t encodeTypedChar(
   uint32_t* end,
   uint32_t ch);
 
-/**
- * \brief Decodes a single character
- *
- * Note that \c begin and \c end must not be equal.
- */
 template<typename T>
 const T* decodeChar(
   const T* begin,
@@ -70,11 +65,6 @@ const T* decodeChar(
   return reinterpret_cast<const T*>(result);
 }
 
-/**
- * \brief Encodes a character
- *
- * Note that \c begin and \c end may both be \c nullptr or equal.
- */
 template<typename T>
 size_t encodeChar(
   T* begin,
@@ -88,13 +78,6 @@ size_t encodeChar(
     ch);
 }
 
-/**
- * \brief Computes length of a null-terminated string
- *
- * \param [in] string Start of input string
- * \returns Number of characters in input string,
- *    excluding the terminating null character
- */
 template<typename S>
 size_t length(const S* string) {
   if (unlikely(!string))
@@ -112,29 +95,15 @@ inline size_t length(const char* string) {
   return string ? std::strlen(string) : 0;
 }
 
-/**
- * \brief Converts string from one encoding to another
- *
- * The output string arguments may be \c nullptr. In that case, the
- * total length of the transcoded string will be returned, in units
- * of the output character type. The output string will only be
- * null-terminated if the input string is also null-terminated.
- * \tparam D Output character type
- * \tparam S Input character type
- * \param [in] dstBegin Start of output string
- * \param [in] dstLength Length of output string
- * \param [in] srcBegin Start of input string
- * \param [in] srcLength Length of input string
- * \returns If \c dstBegin is \c nullptr , the total number of output
- *    characters required to store the output string. Otherwise, the
- *    total number of characters written to the output string.
- */
 template<typename D, typename S>
 size_t transcodeString(
   D* dstBegin,
   size_t dstLength,
   const S* srcBegin,
   size_t srcLength) {
+  if (unlikely(!srcBegin || !srcLength))
+    return 0;
+
   size_t totalLength = 0;
 
   const S* srcEnd = srcBegin + srcLength;
@@ -142,16 +111,15 @@ size_t transcodeString(
   D* dstEnd = dstBegin ? dstBegin + dstLength : nullptr;
 
   while (srcBegin < srcEnd) {
-    uint32_t ch;
+    uint32_t ch = 0u;
     srcBegin = decodeChar<S>(srcBegin, srcEnd, ch);
 
-    size_t n;
-    if (likely(dstPtr != nullptr)) {
-      n = encodeChar<D>(dstPtr, dstEnd, ch);
+    const size_t n = likely(dstPtr != nullptr)
+      ? encodeChar<D>(dstPtr, dstEnd, ch)
+      : encodeChar<D>(nullptr, nullptr, ch);
+
+    if (likely(dstPtr != nullptr))
       dstPtr += n;
-    } else {
-      n = encodeChar<D>(nullptr, nullptr, ch);
-    }
 
     totalLength += n;
 
@@ -168,16 +136,16 @@ std::wstring tows(const char* mbs);
 
 #ifdef _WIN32
 using path_string = std::wstring;
-inline path_string topath(const char* mbs) { return tows(mbs); }
+inline path_string topath(const char* mbs) { return mbs ? tows(mbs) : path_string(); }
 #else
 using path_string = std::string;
-inline path_string topath(const char* mbs) { return std::string(mbs); }
+inline path_string topath(const char* mbs) { return mbs ? std::string(mbs) : path_string(); }
 #endif
 
 inline void format1(std::stringstream&) { }
 
 template<typename... Tx>
-void format1(std::stringstream& str, const WCHAR *arg, const Tx&... args) {
+void format1(std::stringstream& str, const WCHAR* arg, const Tx&... args) {
   str << fromws(arg);
   format1(str, args...);
 }
@@ -196,61 +164,72 @@ std::string format(const Args&... args) {
 }
 
 inline void strlcpy(char* dst, const char* src, size_t count) {
-  if (count > 0) {
-    std::strncpy(dst, src, count - 1);
-    dst[count - 1] = '\0';
+  if (!count || !dst)
+    return;
+
+  if (!src) {
+    dst[0] = '\0';
+    return;
   }
+
+  size_t i = 0u;
+  for (; i + 1u < count && src[i]; i++)
+    dst[i] = src[i];
+
+  dst[i] = '\0';
 }
 
-/**
- * \brief Split string at one or more delimiter characters
- *
- * \param [in] string String to split
- * \param [in] delims Delimiter characters
- * \returns Vector of substring views
- */
 inline std::vector<std::string_view> split(std::string_view string, std::string_view delims = " ") {
   std::vector<std::string_view> tokens;
   tokens.reserve(16);
 
-  for (size_t start = 0; start < string.size(); ) {
-    const auto end = string.find_first_of(delims, start);
+  size_t start = string.find_first_not_of(delims, 0u);
 
-    if (start != end)
-      tokens.emplace_back(string.substr(start, end - start));
+  while (start != std::string_view::npos) {
+    const size_t end = string.find_first_of(delims, start);
 
-    if (end == std::string_view::npos)
+    if (end == std::string_view::npos) {
+      tokens.emplace_back(string.substr(start));
       break;
+    }
 
-    start = end + 1;
+    tokens.emplace_back(string.substr(start, end - start));
+    start = string.find_first_not_of(delims, end + 1u);
   }
+
   return tokens;
 }
 
-/** Compares ASCII characters in a case-insensitive way, branchless */
 inline bool compareCharsCaseInsensitive(char a, char b) {
-  unsigned char ua = static_cast<unsigned char>(a);
-  unsigned char ub = static_cast<unsigned char>(b);
-  if (ua >= 'A' && ua <= 'Z') ua |= 0x20u;
-  if (ub >= 'A' && ub <= 'Z') ub |= 0x20u;
+  uint32_t ua = static_cast<uint8_t>(a);
+  uint32_t ub = static_cast<uint8_t>(b);
+
+  ua |= (uint32_t(ua - uint32_t('A')) <= uint32_t('Z' - 'A')) ? 0x20u : 0u;
+  ub |= (uint32_t(ub - uint32_t('A')) <= uint32_t('Z' - 'A')) ? 0x20u : 0u;
   return ua == ub;
 }
 
-/** Compare ASCII string in a case-insensitive way */
 inline bool compareCaseInsensitive(const char* a, const char* b) {
+  if (a == b)
+    return true;
+
+  if (!a || !b)
+    return false;
+
   for (size_t i = 0u; a[i] || b[i]; i++) {
     if (!compareCharsCaseInsensitive(a[i], b[i]))
       return false;
   }
+
   return true;
 }
 
-/** Converts ASCII string to lower case */
 inline std::string tolower(std::string str) {
-  for (size_t i = 0u; i < str.size(); i++) {
-    if (str[i] >= 'A' && str[i] <= 'Z')
-      str[i] += 'a' - 'A';
+  for (char& c : str) {
+    if (c >= 'A' && c <= 'Z')
+      c = char(c + ('a' - 'A'));
   }
+
   return str;
 }
 

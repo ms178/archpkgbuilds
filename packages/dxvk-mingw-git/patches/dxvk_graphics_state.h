@@ -3,6 +3,7 @@
 #include "dxvk_format.h"
 #include "dxvk_limits.h"
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <optional>
@@ -10,12 +11,6 @@
 
 namespace dxvk {
 
-  /**
-   * \brief Packed input assembly state
-   *
-   * Stores the primitive topology
-   * and primitive restart info.
-   */
   class DxvkIaInfo {
 
   public:
@@ -55,12 +50,6 @@ namespace dxvk {
   };
 
 
-  /**
-   * \brief Packed input layout metadata
-   *
-   * Stores the number of vertex attributes
-   * and bindings in one byte each.
-   */
   class DxvkIlInfo {
 
   public:
@@ -89,13 +78,6 @@ namespace dxvk {
   };
 
 
-  /**
-   * \brief Packed vertex attribute
-   *
-   * Stores a vertex attribute description. Assumes
-   * that all vertex formats have numerical values
-   * of 127 or less (i.e. fit into 7 bits).
-   */
   class DxvkIlAttribute {
 
   public:
@@ -149,12 +131,6 @@ namespace dxvk {
   };
 
 
-  /**
-   * \brief Packed vertex binding
-   *
-   * Stores a vertex binding description,
-   * including the 32-bit divisor.
-   */
   class DxvkIlBinding {
 
   public:
@@ -209,12 +185,6 @@ namespace dxvk {
   };
 
 
-  /**
-   * \brief Packed rasterizer state
-   *
-   * Stores a bunch of flags and parameters
-   * related to rasterization in four bytes.
-   */
   class DxvkRsInfo {
 
   public:
@@ -261,7 +231,12 @@ namespace dxvk {
     }
 
     bool eq(const DxvkRsInfo& other) const {
-      return !std::memcmp(this, &other, sizeof(*this));
+      return m_depthClipEnable  == other.m_depthClipEnable
+          && m_polygonMode      == other.m_polygonMode
+          && m_sampleCount      == other.m_sampleCount
+          && m_conservativeMode == other.m_conservativeMode
+          && m_flatShading      == other.m_flatShading
+          && m_lineMode         == other.m_lineMode;
     }
 
   private:
@@ -277,12 +252,6 @@ namespace dxvk {
   };
 
 
-  /**
-   * \brief Packed multisample info
-   *
-   * Stores the sample mask, sample count override
-   * and alpha-to-coverage state in four bytes.
-   */
   class DxvkMsInfo {
 
   public:
@@ -324,12 +293,6 @@ namespace dxvk {
   };
 
 
-  /**
-   * \brief Packed output merger metadata
-   *
-   * Stores the logic op state in two bytes.
-   * Blend modes are stored separately.
-   */
   class DxvkOmInfo {
 
   public:
@@ -371,13 +334,6 @@ namespace dxvk {
   };
 
 
-  /**
-   * \brief Packed render target formats
-   *
-   * Compact representation of depth-stencil and color attachments,
-   * as well as the read-only mask for the depth-stencil attachment,
-   * which needs to be known at pipeline compile time.
-   */
   class DxvkRtInfo {
 
   public:
@@ -411,6 +367,17 @@ namespace dxvk {
 
   private:
 
+    static constexpr uint32_t Range0Start = uint32_t(VK_FORMAT_UNDEFINED);
+    static constexpr uint32_t Range0End   = uint32_t(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32);
+    static constexpr uint32_t Range1Start = uint32_t(VK_FORMAT_A4R4G4B4_UNORM_PACK16);
+    static constexpr uint32_t Range1End   = uint32_t(VK_FORMAT_A4B4G4R4_UNORM_PACK16);
+    static constexpr uint32_t Range2Start = uint32_t(VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR);
+    static constexpr uint32_t Range2End   = uint32_t(VK_FORMAT_A8_UNORM_KHR);
+
+    static constexpr uint32_t Range0Size  = Range0End - Range0Start + 1u;
+    static constexpr uint32_t Range1Size  = Range1End - Range1Start + 1u;
+    static constexpr uint32_t Range2Size  = Range2End - Range2Start + 1u;
+
     uint64_t m_packedData;
 
     static uint64_t encodeDepthStencilAspects(VkImageAspectFlags aspects) {
@@ -420,22 +387,23 @@ namespace dxvk {
     static uint64_t encodeDepthStencilFormat(VkFormat format) {
       return format
         ? (uint64_t(format) - uint64_t(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32)) << 56
-        : (uint64_t(0));
+        : uint64_t(0);
     }
 
     static uint64_t encodeColorFormat(VkFormat format, uint32_t index) {
-      uint64_t value = 0u;
+      const uint32_t f = uint32_t(format);
+      uint32_t value = 0u;
 
-      for (const auto& p : s_colorFormatRanges) {
-        if (format >= p.first && format <= p.second) {
-          value += uint32_t(format) - uint32_t(p.first);
-          break;
-        }
+      if (f <= Range0End)
+        value = f - Range0Start;
+      else if (f >= Range1Start && f <= Range1End)
+        value = Range0Size + (f - Range1Start);
+      else if (f >= Range2Start && f <= Range2End)
+        value = Range0Size + Range1Size + (f - Range2Start);
+      else
+        value = 0u;
 
-        value += uint32_t(p.second) - uint32_t(p.first) + 1u;
-      }
-
-      return value << (7 * index);
+      return uint64_t(value) << (7u * index);
     }
 
     static VkImageAspectFlags decodeDepthStencilAspects(uint64_t value) {
@@ -443,7 +411,7 @@ namespace dxvk {
     }
 
     static VkFormat decodeDepthStencilFormat(uint64_t value) {
-      value = (value >> 56) & 0x1F;
+      value = (value >> 56) & 0x1Fu;
 
       return value
         ? VkFormat(value + uint64_t(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32))
@@ -451,35 +419,27 @@ namespace dxvk {
     }
 
     static VkFormat decodeColorFormat(uint64_t value, uint32_t index) {
-      value = (value >> (7 * index)) & 0x7F;
+      uint32_t code = uint32_t((value >> (7u * index)) & 0x7Fu);
 
-      for (const auto& p : s_colorFormatRanges) {
-        uint32_t rangeSize = uint32_t(p.second) - uint32_t(p.first) + 1u;
+      if (code < Range0Size)
+        return VkFormat(Range0Start + code);
 
-        if (value < rangeSize)
-          return VkFormat(uint32_t(p.first) + uint32_t(value));
+      code -= Range0Size;
 
-        value -= rangeSize;
-      }
+      if (code < Range1Size)
+        return VkFormat(Range1Start + code);
+
+      code -= Range1Size;
+
+      if (code < Range2Size)
+        return VkFormat(Range2Start + code);
 
       return VK_FORMAT_UNDEFINED;
     }
 
-    static constexpr std::array<std::pair<VkFormat, VkFormat>, 3> s_colorFormatRanges = {{
-      { VK_FORMAT_UNDEFINED,                  VK_FORMAT_E5B9G9R9_UFLOAT_PACK32  },  /*   0 - 123 */
-      { VK_FORMAT_A4R4G4B4_UNORM_PACK16,      VK_FORMAT_A4B4G4R4_UNORM_PACK16   },  /* 124 - 125 */
-      { VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR,  VK_FORMAT_A8_UNORM_KHR            },  /* 126 - 127 */
-    }};
-
   };
 
 
-  /**
-   * \brief Packed attachment blend mode
-   *
-   * Stores blendig parameters for a single
-   * color attachment in four bytes.
-   */
   class DxvkOmAttachmentBlend {
 
   public:
@@ -565,12 +525,6 @@ namespace dxvk {
   };
 
 
-  /**
-   * \brief Packed attachment swizzle
-   *
-   * Stores the component mapping for one
-   * single color attachment in one byte.
-   */
   class DxvkOmAttachmentSwizzle {
 
   public:
@@ -611,23 +565,11 @@ namespace dxvk {
   };
 
 
-  /**
-   * \brief Specialization constant state
-   *
-   * Stores the raw 32-bit spec constant values.
-   */
   struct DxvkScInfo {
     uint32_t specConstants[DxvkLimits::MaxNumSpecConstants];
   };
 
 
-  /**
-   * \brief Packed graphics pipeline state
-   *
-   * Stores a compressed representation of the full
-   * graphics pipeline state which is optimized for
-   * lookup performance.
-   */
   struct alignas(32) DxvkGraphicsPipelineStateInfo {
     DxvkGraphicsPipelineStateInfo() {
       std::memset(this, 0, sizeof(*this));
@@ -660,34 +602,42 @@ namespace dxvk {
     }
 
     bool useDynamicStencilTest() const {
-      auto format = rt.getDepthStencilFormat();
+      const VkFormat format = rt.getDepthStencilFormat();
       return format && (lookupFormatInfo(format)->aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT);
     }
 
     bool useDynamicVertexStrides() const {
-      if (!il.bindingCount())
+      const uint32_t count = il.bindingCount();
+
+      if (!count)
         return false;
 
-      bool result = true;
+      for (uint32_t i = 0u; i < count; i++) {
+        if (ilBindings[i].stride())
+          return false;
+      }
 
-      for (uint32_t i = 0; i < il.bindingCount() && result; i++)
-        result = !ilBindings[i].stride();
-
-      return result;
+      return true;
     }
 
     bool useDynamicBlendConstants() const {
-      bool result = false;
+      for (uint32_t i = 0u; i < MaxNumRenderTargets; i++) {
+        if (!rt.getColorFormat(i))
+          continue;
 
-      for (uint32_t i = 0; i < MaxNumRenderTargets && !result; i++) {
-        result |= rt.getColorFormat(i) && omBlend[i].blendEnable()
-         && (util::isBlendConstantBlendFactor(omBlend[i].srcColorBlendFactor())
-          || util::isBlendConstantBlendFactor(omBlend[i].dstColorBlendFactor())
-          || util::isBlendConstantBlendFactor(omBlend[i].srcAlphaBlendFactor())
-          || util::isBlendConstantBlendFactor(omBlend[i].dstAlphaBlendFactor()));
+        const auto& blend = omBlend[i];
+
+        if (!blend.blendEnable())
+          continue;
+
+        if (util::isBlendConstantBlendFactor(blend.srcColorBlendFactor())
+         || util::isBlendConstantBlendFactor(blend.dstColorBlendFactor())
+         || util::isBlendConstantBlendFactor(blend.srcAlphaBlendFactor())
+         || util::isBlendConstantBlendFactor(blend.dstAlphaBlendFactor()))
+          return true;
       }
 
-      return result;
+      return false;
     }
 
     bool useDualSourceBlending() const {
@@ -703,13 +653,14 @@ namespace dxvk {
           && rs.sampleCount() == VK_SAMPLE_COUNT_1_BIT;
     }
 
-    bool writesRenderTarget(
-            uint32_t                        target) const {
+    bool writesRenderTarget(uint32_t target) const {
+      if (unlikely(target >= MaxNumRenderTargets))
+        return false;
+
       if (!omBlend[target].colorWriteMask())
         return false;
 
-      VkFormat rtFormat = rt.getColorFormat(target);
-      return rtFormat != VK_FORMAT_UNDEFINED;
+      return rt.getColorFormat(target) != VK_FORMAT_UNDEFINED;
     }
 
 
@@ -727,9 +678,6 @@ namespace dxvk {
   };
 
 
-  /**
-   * \brief Compute pipeline state info
-   */
   struct alignas(32) DxvkComputePipelineStateInfo {
     DxvkComputePipelineStateInfo() {
       std::memset(this, 0, sizeof(*this));
@@ -757,12 +705,6 @@ namespace dxvk {
   };
 
 
-  /**
-   * \brief Pipeline state look-up table
-   *
-   * Provides a thread-safe, adaptive data structure for pipeline variants.
-   * Look-up and insertion are expected to be O(log n).
-   */
   template<typename K, typename V>
   class DxvkPipelineVariantTable {
     static constexpr size_t LayerBits = 5u;
@@ -776,8 +718,6 @@ namespace dxvk {
     }
 
     V* find(const K& k) const {
-      // If the number of variants is small, avoid computing the
-      // state hash since that is somewhat expensive to do
       uint32_t mask = m_table.mask.load(std::memory_order_acquire);
 
       bool useSimple = !(mask & (mask - 1u));
@@ -787,12 +727,13 @@ namespace dxvk {
 
       if (likely(useSimple)) {
         for (auto index : bit::BitMask(mask)) {
-          // If more that one level is present, we need to consider
-          // those as well, but we can only do that on the hash path.
-          auto e = m_table.entries[index].load(std::memory_order_acquire);
+          Entry* e = m_table.entries[index].load(std::memory_order_acquire);
+
+          if (!e)
+            continue;
+
           useSimple = useSimple && !e->table.mask.load(std::memory_order_relaxed);
 
-          // Scan entries with the same hash
           while (e) {
             if (e->key.eq(k))
               return &e->value;
@@ -805,29 +746,25 @@ namespace dxvk {
           return nullptr;
       }
 
-      // Compute hash and traverse entries
-      size_t hash = k.hash();
+      const size_t hash = k.hash();
       size_t shift = 0u;
 
       const Table* table = &m_table;
 
       while (true) {
-        size_t index = computeListIndex(hash, shift);
+        const size_t index = computeListIndex(hash, shift);
         shift += LayerBits;
 
-        auto e = table->entries[index].load(std::memory_order_acquire);
+        Entry* e = table->entries[index].load(std::memory_order_acquire);
 
         if (!e)
           break;
 
-        // Fetch next table from list head
-        // and ensure that the hash matches
         table = &e->table;
 
         if (e->hash != hash)
           continue;
 
-        // Scan entries with the same hash
         while (e) {
           if (e->key.eq(k))
             return &e->value;
@@ -836,32 +773,27 @@ namespace dxvk {
         }
       }
 
-      // No pipeline found
       return nullptr;
     }
 
     template<typename... Args>
     V* add(const K& k, Args&&... args) {
-      size_t hash = k.hash();
+      const size_t hash = k.hash();
 
-      // Try to insert the new entry into the top-level look-up table.
-      // If the given entry is already set, try the next level.
       Entry* entry = new Entry(k, hash, std::forward<Args>(args)...);
       Table* table = &m_table;
       Entry* target = nullptr;
 
-      size_t index = -1;
+      size_t index = 0u;
       size_t shift = 0u;
 
       while (!target) {
         index = computeListIndex(hash, shift);
 
-        // If this succeeds, this is the first entry at the given index
         if (table->entries[index].compare_exchange_strong(target, entry,
             std::memory_order_release, std::memory_order_acquire))
           break;
 
-        // Check if there is a hash collision
         if (target->hash == hash)
           break;
 
@@ -872,8 +804,6 @@ namespace dxvk {
       }
 
       if (target) {
-        // The new entry has the same hash as the target entry, so
-        // just append it to the linked list. This should be rare.
         while (true) {
           Entry* next = nullptr;
 
@@ -884,7 +814,6 @@ namespace dxvk {
           target = next;
         }
       } else {
-        // Update mask now that the corresponding entry is non-null
         table->mask.fetch_or(1u << index, std::memory_order_release);
       }
 
@@ -922,13 +851,14 @@ namespace dxvk {
 
     template<typename Fn>
     static void iter(const Table& table, const Fn& fn) {
-      uint32_t mask = table.mask.load(std::memory_order_acquire);
+      const uint32_t mask = table.mask.load(std::memory_order_acquire);
 
       for (auto index : bit::BitMask(mask)) {
         Entry* e = table.entries[index].load(std::memory_order_relaxed);
 
-        // Recurse first so that the function can be used for destruction.
-        // Only the first entry in each list can have a sub-table.
+        if (!e)
+          continue;
+
         if (e->table.mask.load(std::memory_order_relaxed))
           iter(e->table, fn);
 
@@ -941,30 +871,14 @@ namespace dxvk {
     }
 
     static size_t computeListIndex(size_t hash, size_t shift) {
-      // Swap bytes to ensure that high bits of the hash contribute to the index.
-      // This is useful since hashes often only differ in the high 32 bits.
       if constexpr (sizeof(size_t) == sizeof(uint64_t)) {
-        uint64_t index = hash;
-
-        index = ((index >> 56u) & 0x00000000000000ffull)
-              | ((index >> 40u) & 0x000000000000ff00ull)
-              | ((index >> 24u) & 0x0000000000ff0000ull)
-              | ((index >>  8u) & 0x00000000ff000000ull)
-              | ((index <<  8u) & 0x000000ff00000000ull)
-              | ((index << 24u) & 0x0000ff0000000000ull)
-              | ((index << 40u) & 0x00ff000000000000ull)
-              | ((index << 56u) & 0xff00000000000000ull);
-
-        return size_t((index + hash) >> shift) % LayerSize;
+        const uint64_t x = uint64_t(hash);
+        const uint64_t y = __builtin_bswap64(x) + x;
+        return size_t((y >> shift) & uint64_t(LayerSize - 1u));
       } else {
-        uint32_t index = hash;
-
-        index = ((index >> 24u) & 0x000000ffu)
-              | ((index >>  8u) & 0x0000ff00u)
-              | ((index <<  8u) & 0x00ff0000u)
-              | ((index << 24u) & 0xff000000u);
-
-        return size_t((index + hash) >> shift) % LayerSize;
+        const uint32_t x = uint32_t(hash);
+        const uint32_t y = __builtin_bswap32(x) + x;
+        return size_t((y >> shift) & uint32_t(LayerSize - 1u));
       }
     }
 
