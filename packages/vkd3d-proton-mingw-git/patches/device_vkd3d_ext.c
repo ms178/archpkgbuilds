@@ -1187,6 +1187,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_amd_ext_anti_lag_UpdateAntiLagState(
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     const struct AmdAntiLagAPIData_v1 *v1 = pData;
     const struct AmdAntiLagAPIData_v2 *v2 = pData;
+    uint64_t frame_index;
+    uint32_t max_fps;
+    bool mode;
 
     /* Don't try to use LL2 and AMD anti-lag at the same time. */
     if (!device->device_info.anti_lag_amd.antiLag || device->vk_info.NV_low_latency2)
@@ -1207,19 +1210,25 @@ static HRESULT STDMETHODCALLTYPE d3d12_amd_ext_anti_lag_UpdateAntiLagState(
         memset(&anti_lag, 0, sizeof(anti_lag));
         memset(&present_info, 0, sizeof(present_info));
         anti_lag.sType = VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD;
-        anti_lag.mode = device->swapchain_info.mode ? VK_ANTI_LAG_MODE_ON_AMD : VK_ANTI_LAG_MODE_OFF_AMD;
-        anti_lag.maxFPS = device->swapchain_info.max_fps;
+        spinlock_acquire(&device->low_latency_swapchain_spinlock);
+        mode = device->swapchain_info.mode;
+        max_fps = device->swapchain_info.max_fps;
+        spinlock_release(&device->low_latency_swapchain_spinlock);
+        anti_lag.mode = mode ? VK_ANTI_LAG_MODE_ON_AMD : VK_ANTI_LAG_MODE_OFF_AMD;
+        anti_lag.maxFPS = max_fps;
         anti_lag.pPresentationInfo = &present_info;
 
         present_info.sType = VK_STRUCTURE_TYPE_ANTI_LAG_PRESENTATION_INFO_AMD;
-        present_info.frameIndex = device->frame_markers.present + 1;
+        frame_index = vkd3d_atomic_uint64_load_explicit(&device->frame_markers.present,
+                vkd3d_memory_order_acquire) + 1;
+        present_info.frameIndex = frame_index;
         present_info.stage = VK_ANTI_LAG_STAGE_INPUT_AMD;
 
         TRACE("AntiLag input timeline, frame %"PRIu64".\n", present_info.frameIndex);
-        if (device->swapchain_info.mode)
+        if (mode)
             cookie = vkd3d_queue_timeline_trace_register_low_latency_sleep(&device->queue_timeline_trace, present_info.frameIndex);
         VK_CALL(vkAntiLagUpdateAMD(device->vk_device, &anti_lag));
-        if (device->swapchain_info.mode)
+        if (mode)
             vkd3d_queue_timeline_trace_complete_low_latency_sleep(&device->queue_timeline_trace, cookie);
 
         /* Any present after this point will map to this frameIndex. */
