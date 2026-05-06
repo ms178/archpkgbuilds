@@ -181,14 +181,24 @@ static unsigned int get_spec_version(const VkExtensionProperties *extensions,
     return 0;
 }
 
+static char vkd3d_disabled_extensions[VKD3D_PATH_MAX];
+static bool vkd3d_has_disabled_extensions;
+static pthread_once_t vkd3d_disabled_extensions_once = PTHREAD_ONCE_INIT;
+
+static void vkd3d_init_disabled_extensions_once(void)
+{
+    vkd3d_has_disabled_extensions = vkd3d_get_env_var("VKD3D_DISABLE_EXTENSIONS",
+            vkd3d_disabled_extensions, sizeof(vkd3d_disabled_extensions));
+}
+
 static bool is_extension_disabled(const char *extension_name)
 {
-    char disabled_extensions[VKD3D_PATH_MAX];
+    pthread_once(&vkd3d_disabled_extensions_once, vkd3d_init_disabled_extensions_once);
 
-    if (!vkd3d_get_env_var("VKD3D_DISABLE_EXTENSIONS", disabled_extensions, sizeof(disabled_extensions)))
+    if (!vkd3d_has_disabled_extensions)
         return false;
 
-    return vkd3d_debug_list_has_member(disabled_extensions, extension_name);
+    return vkd3d_debug_list_has_member(vkd3d_disabled_extensions, extension_name);
 }
 
 static bool has_extension(const VkExtensionProperties *extensions,
@@ -196,13 +206,14 @@ static bool has_extension(const VkExtensionProperties *extensions,
 {
     unsigned int i;
 
+    if (is_extension_disabled(extension_name))
+    {
+        WARN("Extension %s is disabled.\n", debugstr_a(extension_name));
+        return false;
+    }
+
     for (i = 0; i < count; ++i)
     {
-        if (is_extension_disabled(extension_name))
-        {
-            WARN("Extension %s is disabled.\n", debugstr_a(extension_name));
-            continue;
-        }
         if (!strcmp(extensions[i].extensionName, extension_name) &&
                 (extensions[i].specVersion >= minimum_spec_version))
             return true;
@@ -329,16 +340,15 @@ static unsigned int vkd3d_enable_extensions(const char *extensions[],
     unsigned int i;
 
     for (i = 0; i < required_extension_count; ++i)
-    {
-        extensions[extension_count++] = required_extensions[i];
-    }
+        extension_count = vkd3d_append_extension(extensions, extension_count, required_extensions[i]);
     for (i = 0; i < optional_extension_count; ++i)
     {
         ptrdiff_t offset = optional_extensions[i].vulkan_info_offset;
         const bool *supported = (void *)((uintptr_t)vulkan_info + offset);
 
         if (*supported)
-            extensions[extension_count++] = optional_extensions[i].extension_name;
+            extension_count = vkd3d_append_extension(extensions, extension_count,
+                    optional_extensions[i].extension_name);
     }
 
     for (i = 0; i < user_extension_count; ++i)
@@ -418,35 +428,45 @@ static HRESULT vkd3d_init_instance_caps(struct vkd3d_instance *instance,
     memset(vulkan_info, 0, sizeof(*vulkan_info));
     *instance_extension_count = 0;
 
-    if ((vr = vk_procs->vkEnumerateInstanceExtensionProperties(NULL, &count, NULL)) < 0)
+    for (;;)
     {
-        ERR("Failed to enumerate instance extensions, vr %d.\n", vr);
-        return hresult_from_vk_result(vr);
-    }
-    if (!count)
-        return S_OK;
+        if ((vr = vk_procs->vkEnumerateInstanceExtensionProperties(NULL, &count, NULL)) < 0)
+        {
+            ERR("Failed to enumerate instance extensions, vr %d.\n", vr);
+            return hresult_from_vk_result(vr);
+        }
+        if (!count)
+            return S_OK;
 
-    if (!(vk_extensions = vkd3d_calloc(count, sizeof(*vk_extensions))))
-        return E_OUTOFMEMORY;
+        if (!(vk_extensions = vkd3d_calloc(count, sizeof(*vk_extensions))))
+            return E_OUTOFMEMORY;
 
-    TRACE("Enumerating %u instance extensions.\n", count);
-    if ((vr = vk_procs->vkEnumerateInstanceExtensionProperties(NULL, &count, vk_extensions)) < 0)
-    {
-        ERR("Failed to enumerate instance extensions, vr %d.\n", vr);
+        TRACE("Enumerating %u instance extensions.\n", count);
+        vr = vk_procs->vkEnumerateInstanceExtensionProperties(NULL, &count, vk_extensions);
+        if (vr == VK_INCOMPLETE)
+        {
+            WARN("Instance extension list changed during enumeration, retrying.\n");
+            vkd3d_free(vk_extensions);
+            continue;
+        }
+        if (vr < 0)
+        {
+            ERR("Failed to enumerate instance extensions, vr %d.\n", vr);
+            vkd3d_free(vk_extensions);
+            return hresult_from_vk_result(vr);
+        }
+
+        *instance_extension_count = vkd3d_check_extensions(vk_extensions, count, NULL, 0,
+                optional_instance_extensions, ARRAY_SIZE(optional_instance_extensions),
+                create_info->instance_extensions,
+                create_info->instance_extension_count,
+                create_info->optional_instance_extensions,
+                create_info->optional_instance_extension_count,
+                user_extension_supported, vulkan_info, "instance");
+
         vkd3d_free(vk_extensions);
-        return hresult_from_vk_result(vr);
+        return S_OK;
     }
-
-    *instance_extension_count = vkd3d_check_extensions(vk_extensions, count, NULL, 0,
-            optional_instance_extensions, ARRAY_SIZE(optional_instance_extensions),
-            create_info->instance_extensions,
-            create_info->instance_extension_count,
-            create_info->optional_instance_extensions,
-            create_info->optional_instance_extension_count,
-            user_extension_supported, vulkan_info, "instance");
-
-    vkd3d_free(vk_extensions);
-    return S_OK;
 }
 
 static HRESULT vkd3d_init_vk_global_procs(struct vkd3d_instance *instance,
@@ -2960,42 +2980,52 @@ static HRESULT vkd3d_init_device_extensions(struct d3d12_device *device,
 
     *device_extension_count = 0;
 
-    if ((vr = VK_CALL(vkEnumerateDeviceExtensionProperties(physical_device, NULL, &count, NULL))) < 0)
+    for (;;)
     {
-        ERR("Failed to enumerate device extensions, vr %d.\n", vr);
-        return hresult_from_vk_result(vr);
-    }
-    if (!count)
-        return S_OK;
+        if ((vr = VK_CALL(vkEnumerateDeviceExtensionProperties(physical_device, NULL, &count, NULL))) < 0)
+        {
+            ERR("Failed to enumerate device extensions, vr %d.\n", vr);
+            return hresult_from_vk_result(vr);
+        }
+        if (!count)
+            return S_OK;
 
-    if (!(vk_extensions = vkd3d_calloc(count, sizeof(*vk_extensions))))
-        return E_OUTOFMEMORY;
+        if (!(vk_extensions = vkd3d_calloc(count, sizeof(*vk_extensions))))
+            return E_OUTOFMEMORY;
 
-    TRACE("Enumerating %u device extensions.\n", count);
-    if ((vr = VK_CALL(vkEnumerateDeviceExtensionProperties(physical_device, NULL, &count, vk_extensions))) < 0)
-    {
-        ERR("Failed to enumerate device extensions, vr %d.\n", vr);
+        TRACE("Enumerating %u device extensions.\n", count);
+        vr = VK_CALL(vkEnumerateDeviceExtensionProperties(physical_device, NULL, &count, vk_extensions));
+        if (vr == VK_INCOMPLETE)
+        {
+            WARN("Device extension list changed during enumeration, retrying.\n");
+            vkd3d_free(vk_extensions);
+            continue;
+        }
+        if (vr < 0)
+        {
+            ERR("Failed to enumerate device extensions, vr %d.\n", vr);
+            vkd3d_free(vk_extensions);
+            return hresult_from_vk_result(vr);
+        }
+
+        *device_extension_count = vkd3d_check_extensions(vk_extensions, count, NULL, 0,
+                optional_device_extensions, ARRAY_SIZE(optional_device_extensions),
+                create_info->device_extensions,
+                create_info->device_extension_count,
+                create_info->optional_device_extensions,
+                create_info->optional_device_extension_count,
+                user_extension_supported, vulkan_info, "device");
+
+        if (get_spec_version(vk_extensions, count, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) < 3)
+            vulkan_info->EXT_vertex_attribute_divisor = false;
+
+        vulkan_info->supports_cubin_64bit = vulkan_info->NVX_binary_import && vulkan_info->NVX_image_view_handle &&
+                get_spec_version(vk_extensions, count, VK_NVX_BINARY_IMPORT_EXTENSION_NAME) >= 2 &&
+                get_spec_version(vk_extensions, count, VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME) >= 3;
+
         vkd3d_free(vk_extensions);
-        return hresult_from_vk_result(vr);
+        return S_OK;
     }
-
-    *device_extension_count = vkd3d_check_extensions(vk_extensions, count, NULL, 0,
-            optional_device_extensions, ARRAY_SIZE(optional_device_extensions),
-            create_info->device_extensions,
-            create_info->device_extension_count,
-            create_info->optional_device_extensions,
-            create_info->optional_device_extension_count,
-            user_extension_supported, vulkan_info, "device");
-
-    if (get_spec_version(vk_extensions, count, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) < 3)
-        vulkan_info->EXT_vertex_attribute_divisor = false;
-
-    vulkan_info->supports_cubin_64bit = vulkan_info->NVX_binary_import && vulkan_info->NVX_image_view_handle &&
-            get_spec_version(vk_extensions, count, VK_NVX_BINARY_IMPORT_EXTENSION_NAME) >= 2 &&
-            get_spec_version(vk_extensions, count, VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME) >= 3;
-
-    vkd3d_free(vk_extensions);
-    return S_OK;
 }
 
 static bool vkd3d_supports_minimum_coopmat_caps(struct d3d12_device *device)
@@ -3021,7 +3051,12 @@ static bool vkd3d_supports_minimum_coopmat_caps(struct d3d12_device *device)
         return false;
     }
 
-    props = vkd3d_calloc(count, sizeof(*props));
+    if (!count)
+        return false;
+
+    if (!(props = vkd3d_calloc(count, sizeof(*props))))
+        return false;
+
     for (i = 0; i < count; i++)
         props[i].sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
 
