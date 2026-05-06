@@ -181,14 +181,24 @@ static unsigned int get_spec_version(const VkExtensionProperties *extensions,
     return 0;
 }
 
+static char vkd3d_disabled_extensions[VKD3D_PATH_MAX];
+static bool vkd3d_has_disabled_extensions;
+static pthread_once_t vkd3d_disabled_extensions_once = PTHREAD_ONCE_INIT;
+
+static void vkd3d_init_disabled_extensions_once(void)
+{
+    vkd3d_has_disabled_extensions = vkd3d_get_env_var("VKD3D_DISABLE_EXTENSIONS",
+            vkd3d_disabled_extensions, sizeof(vkd3d_disabled_extensions));
+}
+
 static bool is_extension_disabled(const char *extension_name)
 {
-    char disabled_extensions[VKD3D_PATH_MAX];
+    pthread_once(&vkd3d_disabled_extensions_once, vkd3d_init_disabled_extensions_once);
 
-    if (!vkd3d_get_env_var("VKD3D_DISABLE_EXTENSIONS", disabled_extensions, sizeof(disabled_extensions)))
+    if (!vkd3d_has_disabled_extensions)
         return false;
 
-    return vkd3d_debug_list_has_member(disabled_extensions, extension_name);
+    return vkd3d_debug_list_has_member(vkd3d_disabled_extensions, extension_name);
 }
 
 static bool has_extension(const VkExtensionProperties *extensions,
@@ -196,13 +206,14 @@ static bool has_extension(const VkExtensionProperties *extensions,
 {
     unsigned int i;
 
+    if (is_extension_disabled(extension_name))
+    {
+        WARN("Extension %s is disabled.\n", debugstr_a(extension_name));
+        return false;
+    }
+
     for (i = 0; i < count; ++i)
     {
-        if (is_extension_disabled(extension_name))
-        {
-            WARN("Extension %s is disabled.\n", debugstr_a(extension_name));
-            continue;
-        }
         if (!strcmp(extensions[i].extensionName, extension_name) &&
                 (extensions[i].specVersion >= minimum_spec_version))
             return true;
