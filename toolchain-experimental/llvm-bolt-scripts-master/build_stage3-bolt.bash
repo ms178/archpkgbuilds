@@ -16,6 +16,10 @@ echo "== Build with stage2-prof-use-tools -- $CPATH"
 cmake -G Ninja \
     -DLLVM_BINUTILS_INCDIR=/usr/include \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_STANDARD=17 \
+    -DCMAKE_C_STANDARD_REQUIRED=ON \
+    -DCMAKE_CXX_STANDARD=17 \
+    -DCMAKE_CXX_STANDARD_REQUIRED=ON \
     -DCMAKE_INSTALL_PREFIX="$(pwd)/install" \
     -DCMAKE_C_COMPILER=${CPATH}/clang \
     -DCMAKE_CXX_COMPILER=${CPATH}/clang++ \

@@ -32,6 +32,10 @@ cmake -G Ninja "${TOPLEV}/llvm-project/llvm" \
     -DLLVM_ENABLE_Z3_SOLVER=ON \
     -DCMAKE_C_COMPILER=clang \
     -DCMAKE_CXX_COMPILER=clang++ \
+    -DCMAKE_C_STANDARD=17 \
+    -DCMAKE_C_STANDARD_REQUIRED=ON \
+    -DCMAKE_CXX_STANDARD=17 \
+    -DCMAKE_CXX_STANDARD_REQUIRED=ON \
     -DLLVM_DEFAULT_TARGET_TRIPLE="x86_64-pc-linux-gnu" \
     -DLLVM_USE_LINKER=lld \
     -DLLVM_USE_PERF=OFF \
@@ -43,11 +47,11 @@ cmake -G Ninja "${TOPLEV}/llvm-project/llvm" \
     -DLLD_BUILD_MINGW=OFF \
     -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
     -DLLVM_TARGETS_TO_BUILD="X86;BPF" \
-    -DCMAKE_C_FLAGS="-O3 -march=native -mtune=native -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -fprofile-use=/home/marcus/Downloads/all2.profdata" \
-    -DCMAKE_CXX_FLAGS="-O3 -march=native -mtune=native -fcf-protection=none -mharden-sls=none -flto=thin -fwhole-program-vtables -fprofile-use=/home/marcus/Downloads/all2.profdata" \
-    -DCMAKE_EXE_LINKER_FLAGS="-Wl,--thinlto-jobs=8 -Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -flto=thin -fwhole-program-vtables -fuse-ld=lld -Wl,-zmax-page-size=0x200000 -Wl,--push-state -Wl,-whole-archive -lmimalloc -Wl,--pop-state -lpthread -lstdc++ -lm -ldl -fprofile-use=/home/marcus/Downloads/all2.profdata" \
-    -DCMAKE_MODULE_LINKER_FLAGS="-Wl,--thinlto-jobs=8 -Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -flto=thin -fwhole-program-vtables -fuse-ld=lld -Wl,-zmax-page-size=0x200000 -Wl,--push-state -Wl,-whole-archive -lmimalloc -Wl,--pop-state -lpthread -lstdc++ -lm -ldl -fprofile-use=/home/marcus/Downloads/all2.profdata" \
-    -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--thinlto-jobs=8 -Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -flto=thin -fwhole-program-vtables -fuse-ld=lld -Wl,-zmax-page-size=0x200000 -Wl,--push-state -Wl,-whole-archive -lmimalloc -Wl,--pop-state -lpthread -lstdc++ -lm -ldl -fprofile-use=/home/marcus/Downloads/all2.profdata" \
+    -DCMAKE_C_FLAGS="-O3 -march=native -mtune=native -fcf-protection=none -mharden-sls=none -flto=thin" \
+    -DCMAKE_CXX_FLAGS="-O3 -march=native -mtune=native -fcf-protection=none -mharden-sls=none -flto=thin" \
+    -DCMAKE_EXE_LINKER_FLAGS="-Wl,--thinlto-jobs=8 -Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -flto=thin -fwhole-program-vtables -fuse-ld=lld -Wl,-zmax-page-size=0x200000 -Wl,--push-state -Wl,-whole-archive -lmimalloc -Wl,--pop-state -lpthread -lstdc++ -lm -ldl" \
+    -DCMAKE_MODULE_LINKER_FLAGS="-Wl,--thinlto-jobs=8 -Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -flto=thin -fwhole-program-vtables -fuse-ld=lld -Wl,-zmax-page-size=0x200000 -Wl,--push-state -Wl,-whole-archive -lmimalloc -Wl,--pop-state -lpthread -lstdc++ -lm -ldl" \
+    -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--thinlto-jobs=8 -Wl,--lto-CGO3 -Wl,--gc-sections -Wl,--icf=all -Wl,--lto-O3,-O3,-Bsymbolic-functions,--as-needed -flto=thin -fwhole-program-vtables -fuse-ld=lld -Wl,-zmax-page-size=0x200000 -Wl,--push-state -Wl,-whole-archive -lmimalloc -Wl,--pop-state -lpthread -lstdc++ -lm -ldl" \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLVM_BUILD_UTILS=OFF \
     -DLLVM_ENABLE_BACKTRACES=OFF \

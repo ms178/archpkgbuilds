@@ -53,6 +53,10 @@ instrument_binary "${CPATH}/lld"
 # Configure build (FIX: Use absolute path)
 cmake -G Ninja "${TOPLEV}/llvm-project/llvm" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_STANDARD=17 \
+    -DCMAKE_C_STANDARD_REQUIRED=ON \
+    -DCMAKE_CXX_STANDARD=17 \
+    -DCMAKE_CXX_STANDARD_REQUIRED=ON \
     -DLLVM_DEFAULT_TARGET_TRIPLE="x86_64-pc-linux-gnu" \
     -DLLVM_TARGETS_TO_BUILD="X86" \
     -DLLVM_ENABLE_PROJECTS="polly;lld;clang" \

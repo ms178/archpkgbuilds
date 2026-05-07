@@ -26,6 +26,10 @@ echo "== Profiles will be written to: ${TOPLEV}/stage2-prof-gen/profiles/"
 cmake -G Ninja "${TOPLEV}/llvm-project/llvm" \
     -DLLVM_BINUTILS_INCDIR=/usr/include \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_STANDARD=17 \
+    -DCMAKE_C_STANDARD_REQUIRED=ON \
+    -DCMAKE_CXX_STANDARD=17 \
+    -DCMAKE_CXX_STANDARD_REQUIRED=ON \
     -DCLANG_PLUGIN_SUPPORT=OFF \
     -DCMAKE_C_COMPILER="${STAGE2_COMPILER_PATH}/clang" \
     -DCMAKE_CXX_COMPILER="${STAGE2_COMPILER_PATH}/clang++" \
